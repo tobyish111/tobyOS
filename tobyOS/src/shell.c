@@ -97,6 +97,18 @@ static int g_getopts_char_index;
 static bool g_getopts_internal_optind_write;
 static struct file *g_shell_fd[SHELL_FD_MAX];
 
+/* Command history, kept so `fc` has something to list and re-run. A ring:
+ * g_hist_base is the history number of slot 0, so numbers keep climbing as
+ * entries are overwritten. */
+#define SHELL_HIST_MAX 128
+static char *g_hist[SHELL_HIST_MAX];
+static int g_hist_count;          /* entries currently held (<= MAX) */
+static unsigned long g_hist_base; /* history number of the oldest entry */
+
+/* $LINENO: line number of the command currently executing, counted within the
+ * script (or from shell start for interactive input). */
+static unsigned long g_shell_lineno;
+
 static char *g_param0;
 static char *g_positional[ARG_MAX];
 static int g_positional_count;
@@ -154,6 +166,9 @@ static void execute_line_text(const char *src);
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
+static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
+static bool shell_word_has(const char *word, char c);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
@@ -745,11 +760,45 @@ static void shell_function_unset(const char *name) {
     g_functions[idx].body = 0;
 }
 
+/* Signal names for `kill -l`, `kill -NAME` and `trap NAME`. Indexed by
+ * number, gaps included so the numbering stays true. */
+struct shell_signal_name { int num; const char *name; };
+
+static const struct shell_signal_name g_shell_signals[] = {
+    { SIGHUP, "HUP" },   { SIGINT, "INT" },   { SIGQUIT, "QUIT" },
+    { SIGILL, "ILL" },   { SIGTRAP, "TRAP" }, { SIGABRT, "ABRT" },
+    { SIGBUS, "BUS" },   { SIGFPE, "FPE" },   { SIGKILL, "KILL" },
+    { SIGUSR1, "USR1" }, { SIGSEGV, "SEGV" }, { SIGUSR2, "USR2" },
+    { SIGPIPE, "PIPE" }, { SIGALRM, "ALRM" }, { SIGTERM, "TERM" },
+    { SIGCHLD, "CHLD" }, { SIGCONT, "CONT" }, { SIGSTOP, "STOP" },
+    { SIGTSTP, "TSTP" }, { SIGTTIN, "TTIN" }, { SIGTTOU, "TTOU" },
+    { SIGURG, "URG" },   { SIGXCPU, "XCPU" }, { SIGXFSZ, "XFSZ" },
+    { SIGVTALRM, "VTALRM" }, { SIGPROF, "PROF" }, { SIGWINCH, "WINCH" },
+    { SIGIO, "IO" },     { SIGSYS, "SYS" },
+};
+
+static int shell_signal_by_name(const char *name) {
+    if (!name || !*name) return -1;
+    if (strncmp(name, "SIG", 3) == 0) name += 3;
+    for (size_t i = 0; i < sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+         i++) {
+        if (strcmp(g_shell_signals[i].name, name) == 0)
+            return g_shell_signals[i].num;
+    }
+    return -1;
+}
+
+static const char *shell_signal_name(int num) {
+    for (size_t i = 0; i < sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+         i++) {
+        if (g_shell_signals[i].num == num) return g_shell_signals[i].name;
+    }
+    return 0;
+}
+
 static const char *shell_trap_name(int sig) {
     if (sig == 0) return "EXIT";
-    if (sig == SIGINT) return "INT";
-    if (sig == SIGTERM) return "TERM";
-    return 0;
+    return shell_signal_name(sig);
 }
 
 static void shell_trap_unset(int sig) {
@@ -4235,10 +4284,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     }
 
     g_script_depth++;
+    unsigned long saved_lineno = g_shell_lineno;
+    g_shell_lineno = 0;
     int last = 0;
     char *p = text;
     bool first_line = true;
     while (*p) {
+        g_shell_lineno++;
         char *line_start = p;
         while (*p && *p != '\n' && *p != '\r') p++;
         char saved = *p;
@@ -4396,6 +4448,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     }
     if (run_exit_trap) last = shell_run_exit_trap(last);
     g_script_depth--;
+    g_shell_lineno = saved_lineno;
     return last;
 }
 
@@ -4793,12 +4846,9 @@ static int shell_trap_parse_condition(const char *s, int *out_sig) {
         *out_sig = 0;
         return 0;
     }
-    if (strcmp(s, "INT") == 0 || strcmp(s, "SIGINT") == 0) {
-        *out_sig = SIGINT;
-        return 0;
-    }
-    if (strcmp(s, "TERM") == 0 || strcmp(s, "SIGTERM") == 0) {
-        *out_sig = SIGTERM;
+    int named = shell_signal_by_name(s);
+    if (named > 0) {
+        *out_sig = named;
         return 0;
     }
     int v = 0;
@@ -5243,6 +5293,213 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     return neg ? -v : v;
 }
 
+/* printf's %f/%e/%g without floating point.
+ *
+ * The kernel is built -mno-sse, so there is no `double` to convert to. There
+ * does not need to be: printf's argument arrives as decimal TEXT, so the
+ * significant digits can be carried straight through as digits and rounded in
+ * base 10. That is both simpler than a soft-float path and exact for the
+ * values a shell script actually prints.
+ *
+ * Representation: value = 0.d[0]d[1]... * 10^exp, sign held separately. */
+#define PF_DIG_MAX 40
+
+struct printf_dec {
+    bool neg;
+    bool zero;
+    char dig[PF_DIG_MAX];
+    int  ndig;
+    int  exp;
+};
+
+static void printf_dec_parse(const char *s, struct printf_dec *d) {
+    memset(d, 0, sizeof(*d));
+    d->zero = true;
+    if (!s) return;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { d->neg = true; s++; }
+    else if (*s == '+') s++;
+
+    int pointexp = 0;      /* digits seen before the '.' */
+    bool seen_point = false;
+    bool leading = true;
+    for (; *s; s++) {
+        if (*s == '.' && !seen_point) { seen_point = true; continue; }
+        if (*s < '0' || *s > '9') break;
+        if (!seen_point) pointexp++;
+        if (leading && *s == '0') {
+            /* A leading zero is not a significant digit: undo the increment
+             * above for one before the point, and push the exponent down for
+             * one after it. Both cases are the same decrement. */
+            pointexp--;
+            continue;
+        }
+        leading = false;
+        d->zero = false;
+        if (d->ndig < PF_DIG_MAX) d->dig[d->ndig++] = *s;
+    }
+    d->exp = pointexp;
+
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        bool eneg = false;
+        if (*s == '-') { eneg = true; s++; }
+        else if (*s == '+') s++;
+        int ev = 0;
+        while (*s >= '0' && *s <= '9' && ev < 100000) {
+            ev = ev * 10 + (*s - '0');
+            s++;
+        }
+        d->exp += eneg ? -ev : ev;
+    }
+    if (d->zero) { d->ndig = 0; d->exp = 0; }
+}
+
+/* Round to `keep` significant digits, half away from zero. `keep` may be <= 0,
+ * meaning the value rounds down to nothing or up to a single 1 a decade
+ * higher. */
+static void printf_dec_round(struct printf_dec *d, int keep) {
+    if (d->zero) return;
+    if (keep >= d->ndig) return;
+    if (keep < 0) {
+        d->zero = true;
+        d->ndig = 0;
+        d->exp = 0;
+        return;
+    }
+    bool round_up = d->dig[keep] >= '5';
+    d->ndig = keep;
+    if (!round_up) {
+        while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
+        if (d->ndig == 0) { d->zero = true; d->exp = 0; }
+        return;
+    }
+    int i = keep - 1;
+    while (i >= 0) {
+        if (d->dig[i] != '9') { d->dig[i]++; break; }
+        d->dig[i] = '0';
+        i--;
+    }
+    if (i < 0) {
+        /* Carried out of the top: 999 -> 1000, one decade higher. */
+        d->dig[0] = '1';
+        d->ndig = 1;
+        d->exp++;
+        d->zero = false;
+        return;
+    }
+    while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
+}
+
+static char printf_dec_at(const struct printf_dec *d, int i) {
+    if (i < 0 || i >= d->ndig) return '0';
+    return d->dig[i];
+}
+
+static void printf_buf_put(char *buf, size_t cap, size_t *n, char c) {
+    if (*n + 1 < cap) buf[(*n)++] = c;
+}
+
+/* Render `d` in %f style with `prec` fraction digits (already rounded). */
+static void printf_dec_fixed(const struct printf_dec *d, int prec,
+                             char *buf, size_t cap, size_t *n) {
+    if (d->exp <= 0) {
+        printf_buf_put(buf, cap, n, '0');
+    } else {
+        for (int i = 0; i < d->exp; i++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, i));
+    }
+    if (prec > 0) {
+        printf_buf_put(buf, cap, n, '.');
+        for (int j = 1; j <= prec; j++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, d->exp + j - 1));
+    }
+}
+
+/* Render `d` in %e style with `prec` fraction digits (already rounded). */
+static void printf_dec_sci(const struct printf_dec *d, int prec, char espec,
+                           char *buf, size_t cap, size_t *n) {
+    printf_buf_put(buf, cap, n, d->zero ? '0' : printf_dec_at(d, 0));
+    if (prec > 0) {
+        printf_buf_put(buf, cap, n, '.');
+        for (int j = 1; j <= prec; j++)
+            printf_buf_put(buf, cap, n, printf_dec_at(d, j));
+    }
+    printf_buf_put(buf, cap, n, espec);
+    int e = d->zero ? 0 : d->exp - 1;
+    printf_buf_put(buf, cap, n, e < 0 ? '-' : '+');
+    if (e < 0) e = -e;
+    if (e >= 100) {
+        printf_buf_put(buf, cap, n, (char)('0' + e / 100));
+        printf_buf_put(buf, cap, n, (char)('0' + (e / 100) % 10));
+    }
+    printf_buf_put(buf, cap, n, (char)('0' + (e / 10) % 10));
+    printf_buf_put(buf, cap, n, (char)('0' + e % 10));
+}
+
+static void printf_strip_trailing_zeros(char *buf, size_t *n) {
+    size_t dot = 0;
+    bool has_dot = false;
+    for (size_t i = 0; i < *n; i++) {
+        if (buf[i] == '.') { dot = i; has_dot = true; }
+        if (buf[i] == 'e' || buf[i] == 'E') return;   /* handled by caller */
+    }
+    if (!has_dot) return;
+    while (*n > dot + 1 && buf[*n - 1] == '0') (*n)--;
+    if (*n == dot + 1) (*n)--;
+}
+
+/* Format one floating conversion into `buf`; returns its length. */
+static size_t printf_format_float(const char *arg, char spec, int prec,
+                                  bool alt, char *buf, size_t cap) {
+    struct printf_dec d;
+    printf_dec_parse(arg, &d);
+    size_t n = 0;
+
+    if (spec == 'f' || spec == 'F') {
+        if (prec < 0) prec = 6;
+        printf_dec_round(&d, d.exp + prec);
+        printf_dec_fixed(&d, prec, buf, cap, &n);
+        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
+    } else if (spec == 'e' || spec == 'E') {
+        if (prec < 0) prec = 6;
+        printf_dec_round(&d, prec + 1);
+        printf_dec_sci(&d, prec, spec == 'E' ? 'E' : 'e', buf, cap, &n);
+        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
+    } else {                                            /* g / G */
+        int P = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
+        printf_dec_round(&d, P);
+        int X = d.zero ? 0 : d.exp - 1;
+        if (X < -4 || X >= P) {
+            printf_dec_sci(&d, P - 1, spec == 'G' ? 'E' : 'e', buf, cap, &n);
+            if (!alt) {
+                /* Strip trailing zeros in the mantissa only. */
+                size_t epos = n;
+                for (size_t i = 0; i < n; i++)
+                    if (buf[i] == 'e' || buf[i] == 'E') { epos = i; break; }
+                size_t mant = epos;
+                bool has_dot = false;
+                size_t dot = 0;
+                for (size_t i = 0; i < mant; i++)
+                    if (buf[i] == '.') { dot = i; has_dot = true; }
+                if (has_dot) {
+                    size_t end = mant;
+                    while (end > dot + 1 && buf[end - 1] == '0') end--;
+                    if (end == dot + 1) end--;
+                    size_t tail = n - epos;
+                    for (size_t i = 0; i < tail; i++) buf[end + i] = buf[epos + i];
+                    n = end + tail;
+                }
+            }
+        } else {
+            printf_dec_fixed(&d, P - 1 - X, buf, cap, &n);
+            if (!alt) printf_strip_trailing_zeros(buf, &n);
+        }
+    }
+    buf[n < cap ? n : cap - 1] = '\0';
+    return n;
+}
+
 static const char *printf_arg_str(int argc, char **argv, int *argi) {
     if (*argi >= argc) return "";
     return argv[(*argi)++];
@@ -5279,23 +5536,51 @@ static void cmd_printf(int argc, char **argv) {
 
             bool left = false;
             bool zero_pad = false;
-            if (*p == '-') { left = true; p++; }
-            if (*p == '0') { zero_pad = true; p++; }
+            bool plus = false;
+            bool space = false;
+            bool alt = false;
+            for (;;) {
+                if (*p == '-')      { left = true; p++; }
+                else if (*p == '0') { zero_pad = true; p++; }
+                else if (*p == '+') { plus = true; p++; }
+                else if (*p == ' ') { space = true; p++; }
+                else if (*p == '#') { alt = true; p++; }
+                else break;
+            }
 
             int width = 0;
-            while (*p >= '0' && *p <= '9') {
-                width = width * 10 + (*p - '0');
+            if (*p == '*') {
+                width = (int)printf_arg_int(argc, argv, &argi);
+                if (width < 0) { left = true; width = -width; }
                 p++;
+            } else {
+                while (*p >= '0' && *p <= '9') {
+                    width = width * 10 + (*p - '0');
+                    p++;
+                }
             }
 
             int prec = -1;
             if (*p == '.') {
                 p++;
-                prec = 0;
-                while (*p >= '0' && *p <= '9') {
-                    prec = prec * 10 + (*p - '0');
+                if (*p == '*') {
+                    prec = (int)printf_arg_int(argc, argv, &argi);
+                    if (prec < 0) prec = -1;
                     p++;
+                } else {
+                    prec = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        prec = prec * 10 + (*p - '0');
+                        p++;
+                    }
                 }
+            }
+
+            /* Length modifiers are accepted and ignored: every integer here is
+             * parsed out of a string into a long already. */
+            while (*p == 'l' || *p == 'h' || *p == 'j' || *p == 'z' ||
+                   *p == 't' || *p == 'L') {
+                p++;
             }
 
             char spec = *p;
@@ -5309,23 +5594,52 @@ static void cmd_printf(int argc, char **argv) {
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
                 for (int i = 0; i < slen; i++) shell_putc(s[i]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
-            } else if (spec == 'd' || spec == 'i') {
+            } else if (spec == 'd' || spec == 'i' || spec == 'u') {
                 long v = printf_arg_int(argc, argv, &argi);
                 char buf[32];
                 int blen = 0;
-                bool neg = v < 0;
-                unsigned long uv = neg ? (unsigned long)(-v) : (unsigned long)v;
+                bool neg = (spec != 'u') && v < 0;
+                unsigned long uv = (v < 0) ? (unsigned long)(-v)
+                                           : (unsigned long)v;
                 if (uv == 0) buf[blen++] = '0';
                 while (uv > 0 && blen < (int)sizeof(buf) - 1) {
                     buf[blen++] = (char)('0' + (uv % 10));
                     uv /= 10;
                 }
-                int numlen = blen + (neg ? 1 : 0);
+                char sign = neg ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
+                if (spec == 'u') sign = '\0';
+                int numlen = blen + (sign ? 1 : 0);
+                /* An explicit precision is a minimum digit count and it
+                 * cancels zero padding. */
+                int zeros = (prec > blen) ? prec - blen : 0;
+                if (prec >= 0) zero_pad = false;
+                numlen += zeros;
                 int pad = width > numlen ? width - numlen : 0;
                 if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
-                if (neg) shell_putc('-');
+                if (sign) shell_putc(sign);
                 if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'f' || spec == 'F' || spec == 'e' ||
+                       spec == 'E' || spec == 'g' || spec == 'G') {
+                const char *s = printf_arg_str(argc, argv, &argi);
+                char buf[PF_DIG_MAX * 2 + 32];
+                size_t blen = printf_format_float(s, spec, prec, alt,
+                                                  buf, sizeof(buf));
+                bool neg = false;
+                for (const char *q = s; *q; q++) {
+                    if (*q == ' ' || *q == '\t') continue;
+                    neg = (*q == '-');
+                    break;
+                }
+                char sign = neg ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
+                int numlen = (int)blen + (sign ? 1 : 0);
+                int pad = width > numlen ? width - numlen : 0;
+                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (sign) shell_putc(sign);
+                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (size_t i = 0; i < blen; i++) shell_putc(buf[i]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'b') {
                 const char *s = printf_arg_str(argc, argv, &argi);
@@ -5340,35 +5654,41 @@ static void cmd_printf(int argc, char **argv) {
                 }
             } else if (spec == 'c') {
                 const char *s = printf_arg_str(argc, argv, &argi);
-                shell_putc(s[0] ? s[0] : '\0');
-            } else if (spec == 'o') {
-                long v = printf_arg_int(argc, argv, &argi);
-                unsigned long uv = (unsigned long)v;
-                char buf[32];
-                int blen = 0;
-                if (uv == 0) buf[blen++] = '0';
-                while (uv > 0 && blen < (int)sizeof(buf) - 1) {
-                    buf[blen++] = (char)('0' + (uv & 7));
-                    uv >>= 3;
-                }
-                int pad = width > blen ? width - blen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
-                while (blen > 0) shell_putc(buf[--blen]);
+                int pad = width > 1 ? width - 1 : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (s[0]) shell_putc(s[0]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
-            } else if (spec == 'x' || spec == 'X') {
+            } else if (spec == 'o' || spec == 'x' || spec == 'X') {
                 long v = printf_arg_int(argc, argv, &argi);
                 unsigned long uv = (unsigned long)v;
                 const char *hex = (spec == 'X') ? "0123456789ABCDEF"
                                                 : "0123456789abcdef";
+                int base = (spec == 'o') ? 8 : 16;
                 char buf[32];
                 int blen = 0;
                 if (uv == 0) buf[blen++] = '0';
                 while (uv > 0 && blen < (int)sizeof(buf) - 1) {
-                    buf[blen++] = hex[uv & 0xF];
-                    uv >>= 4;
+                    buf[blen++] = hex[uv % (unsigned)base];
+                    uv /= (unsigned)base;
                 }
-                int pad = width > blen ? width - blen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(zero_pad ? '0' : ' ');
+                char pre[3];
+                int prelen = 0;
+                if (alt && v != 0) {
+                    if (spec == 'o') {
+                        pre[prelen++] = '0';
+                    } else {
+                        pre[prelen++] = '0';
+                        pre[prelen++] = (spec == 'X') ? 'X' : 'x';
+                    }
+                }
+                int zeros = (prec > blen) ? prec - blen : 0;
+                if (prec >= 0) zero_pad = false;
+                int numlen = blen + zeros + prelen;
+                int pad = width > numlen ? width - numlen : 0;
+                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                for (int i = 0; i < prelen; i++) shell_putc(pre[i]);
+                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else {
@@ -5432,7 +5752,50 @@ static void cmd_kill(int argc, char **argv) {
     }
     int sig = SIGTERM;
     int first = 1;
-    if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+    if (strcmp(argv[1], "-l") == 0) {
+        if (argc == 2) {
+            size_t n = sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
+            for (size_t i = 0; i < n; i++) {
+                kprintf("%2d) SIG%-7s%s", g_shell_signals[i].num,
+                        g_shell_signals[i].name, (i % 4 == 3) ? "\n" : " ");
+            }
+            if (n % 4 != 0) kprintf("\n");
+            return;
+        }
+        for (int i = 2; i < argc; i++) {
+            const char *a = argv[i];
+            bool numeric = true;
+            int v = 0;
+            for (const char *q = a; *q; q++) {
+                if (*q < '0' || *q > '9') { numeric = false; break; }
+                v = v * 10 + (*q - '0');
+            }
+            if (numeric) {
+                /* A status from `wait` encodes the signal in the low bits. */
+                if (v > 128) v -= 128;
+                const char *nm = shell_signal_name(v);
+                if (nm) kprintf("%s\n", nm);
+                else { kprintf("kill: %s: invalid signal number\n", a);
+                       shell_set_status(1); }
+            } else {
+                int num = shell_signal_by_name(a);
+                if (num > 0) kprintf("%d\n", num);
+                else { kprintf("kill: %s: invalid signal name\n", a);
+                       shell_set_status(1); }
+            }
+        }
+        return;
+    }
+    if (strcmp(argv[1], "-s") == 0 && argc > 2) {
+        int num = shell_signal_by_name(argv[2]);
+        if (num < 0) {
+            kprintf("kill: unknown signal '%s'\n", argv[2]);
+            shell_set_status(1);
+            return;
+        }
+        sig = num;
+        first = 3;
+    } else if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
         int v = 0;
         for (const char *p = argv[1] + 1; *p; p++) {
             if (*p < '0' || *p > '9') {
@@ -5444,17 +5807,14 @@ static void cmd_kill(int argc, char **argv) {
         }
         sig = v;
         first = 2;
-    } else if (argv[1][0] == '-') {
-        const char *name = argv[1] + 1;
-        if (strcmp(name, "INT") == 0 || strcmp(name, "SIGINT") == 0)
-            sig = SIGINT;
-        else if (strcmp(name, "TERM") == 0 || strcmp(name, "SIGTERM") == 0)
-            sig = SIGTERM;
-        else {
-            kprintf("kill: unknown signal '%s'\n", name);
+    } else if (argv[1][0] == '-' && argv[1][1] != '\0') {
+        int num = shell_signal_by_name(argv[1] + 1);
+        if (num < 0) {
+            kprintf("kill: unknown signal '%s'\n", argv[1] + 1);
             shell_set_status(1);
             return;
         }
+        sig = num;
         first = 2;
     }
     for (int i = first; i < argc; i++) {
@@ -5474,6 +5834,427 @@ static void cmd_kill(int argc, char **argv) {
         if (neg) pid = -pid;
         signal_send_to_pid(pid, sig);
     }
+}
+
+static bool shell_word_has(const char *word, char c) {
+    for (; *word; word++) {
+        if (*word == c) return true;
+    }
+    return false;
+}
+
+/* POSIX `ulimit [-HS] [-acdfnstv] [value]`.
+ *
+ * The kernel does not police these yet, so nothing here constrains a running
+ * process. What the shell CAN do correctly is be a faithful store: report a
+ * value that was set, keep the soft/hard pair distinct, and enforce the two
+ * rules that make the interface meaningful -- a soft limit may not exceed its
+ * hard limit, and a hard limit may only ever be lowered. A script that reads
+ * back what it set gets the right answer; one that tries to raise a hard
+ * limit is refused, exactly as it would be on a system that did enforce them.
+ */
+#define ULIMIT_INF (-1L)
+
+struct shell_rlimit {
+    char  opt;
+    const char *label;
+    const char *units;
+    long  soft;
+    long  hard;
+};
+
+static struct shell_rlimit g_shell_rlimits[] = {
+    { 'c', "core file size",  "(blocks)", ULIMIT_INF, ULIMIT_INF },
+    { 'd', "data seg size",   "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+    { 'f', "file size",       "(blocks)", ULIMIT_INF, ULIMIT_INF },
+    { 'n', "open files",      "",         ULIMIT_INF, ULIMIT_INF },
+    { 's', "stack size",      "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+    { 't', "cpu time",        "(seconds)",ULIMIT_INF, ULIMIT_INF },
+    { 'v', "virtual memory",  "(kbytes)", ULIMIT_INF, ULIMIT_INF },
+};
+
+static struct shell_rlimit *shell_rlimit_find(char opt) {
+    for (size_t i = 0; i < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]);
+         i++) {
+        if (g_shell_rlimits[i].opt == opt) return &g_shell_rlimits[i];
+    }
+    return 0;
+}
+
+static void shell_rlimit_print(const struct shell_rlimit *r, bool hard,
+                               bool with_label) {
+    long v = hard ? r->hard : r->soft;
+    if (with_label) kprintf("%-24s%-10s", r->label, r->units);
+    if (v == ULIMIT_INF) kprintf("unlimited\n");
+    else kprintf("%ld\n", v);
+}
+
+static void cmd_ulimit(int argc, char **argv) {
+    shell_set_status(0);
+    bool show_all = false;
+    bool want_hard = false, want_soft = false;
+    char which = 'f';                       /* POSIX default resource */
+    int i = 1;
+
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'a') { show_all = true; continue; }
+            if (*f == 'H') { want_hard = true; continue; }
+            if (*f == 'S') { want_soft = true; continue; }
+            if (shell_rlimit_find(*f)) { which = *f; continue; }
+            kprintf("ulimit: bad option '-%c'\n", *f);
+            shell_set_status(2);
+            return;
+        }
+    }
+    /* Neither -H nor -S: report the soft limit, set both. */
+    bool report_hard = want_hard && !want_soft;
+
+    if (show_all) {
+        for (size_t k = 0;
+             k < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]); k++) {
+            shell_rlimit_print(&g_shell_rlimits[k], report_hard, true);
+        }
+        return;
+    }
+
+    struct shell_rlimit *r = shell_rlimit_find(which);
+    if (!r) {
+        kprintf("ulimit: no such resource\n");
+        shell_set_status(2);
+        return;
+    }
+
+    if (i >= argc) {
+        shell_rlimit_print(r, report_hard, false);
+        return;
+    }
+
+    long val;
+    if (strcmp(argv[i], "unlimited") == 0) {
+        val = ULIMIT_INF;
+    } else {
+        int v = 0;
+        if (parse_int(argv[i], &v) < 0 || v < 0) {
+            kprintf("ulimit: %s: invalid number\n", argv[i]);
+            shell_set_status(2);
+            return;
+        }
+        val = v;
+    }
+
+    bool set_hard = want_hard || !want_soft;
+    bool set_soft = want_soft || !want_hard;
+
+    /* A hard limit is a ceiling that only ever comes down. */
+    if (set_hard && r->hard != ULIMIT_INF &&
+        (val == ULIMIT_INF || val > r->hard)) {
+        kprintf("ulimit: cannot raise a hard limit\n");
+        shell_set_status(1);
+        return;
+    }
+    long ceiling = set_hard ? val : r->hard;
+    if (set_soft && ceiling != ULIMIT_INF &&
+        (val == ULIMIT_INF || val > ceiling)) {
+        kprintf("ulimit: soft limit exceeds hard limit\n");
+        shell_set_status(1);
+        return;
+    }
+    if (set_hard) r->hard = val;
+    if (set_soft) r->soft = val;
+}
+
+/* POSIX `logname`: the login name, which for this shell is the identity the
+ * session is running under. */
+static void cmd_logname(int argc, char **argv) {
+    (void)argc; (void)argv;
+    const char *u = env_get("LOGNAME");
+    if (!u) u = env_get("USER");
+    kprintf("%s\n", u ? u : "root");
+    shell_set_status(0);
+}
+
+/* POSIX `getconf NAME`: system configuration values. Only the variables this
+ * kernel can answer for are listed; anything else is an error rather than a
+ * fabricated number. */
+static void cmd_getconf(int argc, char **argv) {
+    static const struct { const char *name; long value; } vars[] = {
+        { "ARG_MAX",         ARG_MAX     },
+        { "LINE_MAX",        LINE_MAX    },
+        { "NAME_MAX",        255         },
+        { "PATH_MAX",        VFS_PATH_MAX},
+        { "OPEN_MAX",        SHELL_FD_MAX},
+        { "_POSIX_VERSION",  200809L     },
+        { "_POSIX_ARG_MAX",  ARG_MAX     },
+        { "_POSIX_OPEN_MAX", SHELL_FD_MAX},
+        { "CHAR_BIT",        8           },
+        { "INT_MAX",         2147483647L },
+    };
+    if (argc < 2) {
+        for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++)
+            kprintf("%s=%ld\n", vars[i].name, vars[i].value);
+        shell_set_status(0);
+        return;
+    }
+    for (size_t i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+        if (strcmp(vars[i].name, argv[1]) == 0) {
+            kprintf("%ld\n", vars[i].value);
+            shell_set_status(0);
+            return;
+        }
+    }
+    if (strcmp(argv[1], "PATH") == 0) {
+        const char *pv = env_get("PATH");
+        kprintf("%s\n", pv ? pv : "/bin");
+        shell_set_status(0);
+        return;
+    }
+    kprintf("getconf: %s: unknown configuration variable\n", argv[1]);
+    shell_set_status(1);
+}
+
+/* POSIX `pathchk [-p] pathname...`: report pathnames that are not usable.
+ * Without -p the check is against this system's actual limits; with -p it is
+ * against the POSIX minimums, which is the portability check. */
+static void cmd_pathchk(int argc, char **argv) {
+    bool portable = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        for (const char *f = argv[i] + 1; *f; f++) {
+            if (*f == 'p') { portable = true; continue; }
+            kprintf("pathchk: bad option '-%c'\n", *f);
+            shell_set_status(2);
+            return;
+        }
+    }
+    if (i >= argc) {
+        kprintf("usage: pathchk [-p] pathname...\n");
+        shell_set_status(2);
+        return;
+    }
+
+    size_t path_max = portable ? 256 : VFS_PATH_MAX;
+    size_t name_max = portable ? 14 : 255;
+    static const char portable_set[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-";
+
+    int rc = 0;
+    for (; i < argc; i++) {
+        const char *path = argv[i];
+        if (strlen(path) >= path_max) {
+            kprintf("pathchk: %s: pathname too long\n", path);
+            rc = 1;
+            continue;
+        }
+        bool bad = false;
+        const char *comp = path;
+        while (*comp == '/') comp++;
+        while (*comp && !bad) {
+            const char *end = comp;
+            while (*end && *end != '/') end++;
+            if ((size_t)(end - comp) > name_max) {
+                kprintf("pathchk: %s: component too long\n", path);
+                bad = true;
+                break;
+            }
+            if (portable) {
+                for (const char *c = comp; c < end; c++) {
+                    if (!shell_word_has(portable_set, *c)) {
+                        kprintf("pathchk: %s: non-portable character '%c'\n",
+                                path, *c);
+                        bad = true;
+                        break;
+                    }
+                }
+                if (!bad && comp < end && *comp == '-') {
+                    kprintf("pathchk: %s: component starts with '-'\n", path);
+                    bad = true;
+                }
+            }
+            comp = end;
+            while (*comp == '/') comp++;
+        }
+        if (bad) rc = 1;
+    }
+    shell_set_status(rc);
+}
+
+/* POSIX `newgrp [group]`: change the real group ID. tobyOS has users but no
+ * supplementary-group database to switch between, so this reports that rather
+ * than pretending to succeed -- a script that relies on the change would
+ * otherwise carry on with the wrong privileges. */
+static void cmd_newgrp(int argc, char **argv) {
+    (void)argv;
+    kprintf("newgrp: no group database on this system%s\n",
+            argc > 1 ? "" : "");
+    shell_set_status(1);
+}
+
+/* Record one command line in the history ring. Called for lines the user (or
+ * the test harness) submitted, not for the pieces they decompose into. */
+static void shell_history_add(const char *cmdline) {
+    if (!cmdline) return;
+    const char *t = shell_skip_blanks(cmdline);
+    if (!*t) return;
+    size_t n = strlen(cmdline);
+    char *copy = (char *)kmalloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, cmdline, n + 1);
+
+    if (g_hist_count == SHELL_HIST_MAX) {
+        kfree(g_hist[0]);
+        for (int i = 1; i < SHELL_HIST_MAX; i++) g_hist[i - 1] = g_hist[i];
+        g_hist[SHELL_HIST_MAX - 1] = copy;
+        g_hist_base++;
+    } else {
+        g_hist[g_hist_count++] = copy;
+    }
+}
+
+/* Drop the newest entry. `fc` uses this to take its own invocation back out
+ * of the history before it looks at it, which is what POSIX means by the
+ * re-executed command replacing the fc command. */
+static void shell_history_pop(void) {
+    if (g_hist_count <= 0) return;
+    kfree(g_hist[--g_hist_count]);
+    g_hist[g_hist_count] = 0;
+}
+
+/* Map a history number (or a negative offset, or a prefix string) to a ring
+ * index; -1 if it names nothing. */
+static int shell_history_resolve(const char *spec, int def_index) {
+    if (!spec || !*spec) return def_index;
+    /* parse_int rejects a leading '-', but a negative offset is exactly how
+     * `fc -l -1` names the previous command, so handle the sign here. */
+    bool neg = (spec[0] == '-');
+    int v = 0;
+    if (parse_int(neg ? spec + 1 : spec, &v) == 0) {
+        long idx = neg ? (long)g_hist_count - v
+                       : (long)v - (long)g_hist_base - 1;
+        if (idx < 0 || idx >= g_hist_count) return -1;
+        return (int)idx;
+    }
+    size_t n = strlen(spec);
+    for (int i = g_hist_count - 1; i >= 0; i--) {
+        if (strncmp(g_hist[i], spec, n) == 0) return i;
+    }
+    return -1;
+}
+
+/* POSIX `fc`:
+ *     fc -l [-nr] [first [last]]   list
+ *     fc -s [old=new] [first]      re-execute, with one substitution
+ *     fc [-e editor] [first [last]]
+ * There is no editor to hand off to, so the editing form is refused rather
+ * than silently behaving like -s, which would run the wrong thing. */
+static void cmd_fc(int argc, char **argv) {
+    /* The fc command itself is not part of the range it operates on. */
+    shell_history_pop();
+
+    bool list = false, no_numbers = false, reverse = false, subst = false;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        /* `fc -l -1` -- a leading `-` followed by digits is a negative
+         * history offset, an operand, not a bundle of option letters. */
+        if (argv[i][1] >= '0' && argv[i][1] <= '9') break;
+        for (const char *f = argv[i] + 1; *f; f++) {
+            switch (*f) {
+            case 'l': list = true; break;
+            case 'n': no_numbers = true; break;
+            case 'r': reverse = true; break;
+            case 's': subst = true; break;
+            case 'e':
+                kprintf("fc: no editor available; use -l or -s\n");
+                shell_set_status(1);
+                return;
+            default:
+                kprintf("fc: bad option '-%c'\n", *f);
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+
+    if (g_hist_count == 0) {
+        if (list) { shell_set_status(0); return; }
+        kprintf("fc: history is empty\n");
+        shell_set_status(1);
+        return;
+    }
+
+    int newest = g_hist_count - 1;
+
+    if (subst) {
+        const char *old_new = 0;
+        const char *first = 0;
+        for (int a = i; a < argc; a++) {
+            if (!old_new && shell_word_has(argv[a], '=')) old_new = argv[a];
+            else if (!first) first = argv[a];
+        }
+        int idx = shell_history_resolve(first, newest);
+        if (idx < 0) {
+            kprintf("fc: no such history entry\n");
+            shell_set_status(1);
+            return;
+        }
+        char buf[LINE_MAX];
+        const char *src = g_hist[idx];
+        if (old_new) {
+            size_t klen = 0;
+            while (old_new[klen] && old_new[klen] != '=') klen++;
+            const char *rep = old_new + klen + 1;
+            size_t pos = 0;
+            bool done = false;
+            for (const char *q = src; *q; ) {
+                if (!done && klen && strncmp(q, old_new, klen) == 0) {
+                    if (shell_append_str(buf, &pos, sizeof(buf), rep) < 0) break;
+                    q += klen;
+                    done = true;
+                    continue;
+                }
+                if (shell_append_char(buf, &pos, sizeof(buf), *q++) < 0) break;
+            }
+            buf[pos] = '\0';
+        } else {
+            size_t n = strlen(src);
+            if (n + 1 > sizeof(buf)) n = sizeof(buf) - 1;
+            memcpy(buf, src, n);
+            buf[n] = '\0';
+        }
+        kprintf("%s\n", buf);
+        shell_history_add(buf);
+        execute_line_text(buf);
+        return;
+    }
+
+    const char *first_s = (i < argc) ? argv[i++] : 0;
+    const char *last_s  = (i < argc) ? argv[i++] : 0;
+    int first = shell_history_resolve(first_s, list ? (newest >= 15 ? newest - 15 : 0)
+                                                    : newest);
+    int last  = shell_history_resolve(last_s, list ? newest : first);
+    if (first < 0 || last < 0) {
+        kprintf("fc: no such history entry\n");
+        shell_set_status(1);
+        return;
+    }
+    if (!list) {
+        kprintf("fc: no editor available; use -l or -s\n");
+        shell_set_status(1);
+        return;
+    }
+    if (first > last) { int t = first; first = last; last = t; }
+    if (reverse) {
+        for (int k = last; k >= first; k--) {
+            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
+            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+        }
+    } else {
+        for (int k = first; k <= last; k++) {
+            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
+            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+        }
+    }
+    shell_set_status(0);
 }
 
 static const struct cmd cmds[] = {
@@ -5533,6 +6314,12 @@ static const struct cmd cmds[] = {
     { "wait",   "wait [pid|%job...]: wait for background jobs", cmd_wait },
     { "kill",   "kill [-SIGNAL] PID...: send signal to process", cmd_kill },
     { "umask",  "umask [MODE]: display or set file creation mask", cmd_umask },
+    { "ulimit", "ulimit [-HS] [-acdfnstv] [value]: resource limits", cmd_ulimit },
+    { "fc",     "fc [-l|-s] [first [last]]: list or re-run history", cmd_fc },
+    { "logname","logname: print the login name",                  cmd_logname },
+    { "getconf","getconf [NAME]: print system configuration values", cmd_getconf },
+    { "pathchk","pathchk [-p] path...: check pathnames are usable", cmd_pathchk },
+    { "newgrp", "newgrp [group]: change the real group ID",        cmd_newgrp },
     { "hash",   "hash [-r]: display or reset command hash table", cmd_hash },
     { "source", "source script: run script in current shell",     cmd_dot  },
     { "ps",     "list processes with cpu/syscalls/pages", cmd_ps },
@@ -6127,6 +6914,8 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
             *is_set = false;
             return 0;
         }
+    } else if (strcmp(name, "LINENO") == 0 && !env_get("LINENO")) {
+        rc = shell_append_uint(out, &pos, cap, g_shell_lineno);
     } else {
         const char *v = env_get(name);
         if (!v) {
@@ -6914,6 +7703,8 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     name[n] = '\0';
     *pp = p;
     const char *val = env_get(name);
+    if (!val && strcmp(name, "LINENO") == 0)
+        return shell_append_uint(buf, pos, cap, g_shell_lineno);
     if (!val && g_opt_nounset) {
         kprintf("%s: unbound variable\n", name);
         return -1;
@@ -10908,6 +11699,7 @@ void shell_run_test_line(const char *in) {
     console_set_color(0x00FFCC66);
     kprintf("[shell-test] $ %s\n", line);
     console_set_color(0x00CCCCCC);
+    shell_history_add(line);
     execute_line();
     line_len = 0;
     line[0]  = '\0';
