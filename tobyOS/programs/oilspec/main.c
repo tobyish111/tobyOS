@@ -270,6 +270,7 @@ static int run_shell(const char *shell, char *const argv[], const char *workdir,
         (char *)"LC_ALL=C",
         (char *)"TMP=" SCRATCH_TMP,
         (char *)"TMPDIR=" SCRATCH_TMP,
+        (char *)"TSH_FDTRACE=1",
         0
     };
 
@@ -697,6 +698,30 @@ int main(void) {
                   CASE_TIMEOUT_MS,
                   rc_a == -106 ? "HUNG" : "ok",
                   rc_b == -106 ? "HUNG" : "ok");
+            /* Whatever it managed before it hung. A timeout used to report
+             * nothing at all, which made a hang the one failure mode with no
+             * evidence attached -- exactly the one that needs it most. */
+            {
+                long pn = read_all(out_b, g_out_b, sizeof g_out_b);
+                if (pn > 0) {
+                    char t[140];
+                    for (int ln = 0; ln < 6; ln++) {
+                        if (line_at(g_out_b, pn, ln, t, sizeof t) != 0) break;
+                        emitf("[oilspec]     tsh partial stdout: %s\n", t);
+                    }
+                }
+                long pe = read_all(err_b, g_err_b, sizeof g_err_b);
+                if (pe > 0) {
+                    char t[140];
+                    for (int ln = 0; ln < 8; ln++) {
+                        if (line_at(g_err_b, pe, ln, t, sizeof t) != 0) break;
+                        if (!t[0]) continue;
+                        if (strstr(t, "kernel-only, not available")) continue;
+                        if (strstr(t, "[_exit] code=")) continue;
+                        emitf("[oilspec]     tsh partial stderr: %s\n", t);
+                    }
+                }
+            }
             continue;
         }
         if (rc_a < -100 || rc_b < -100) {

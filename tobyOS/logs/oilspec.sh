@@ -65,6 +65,14 @@ printf '%s' "$FILTER" > initrd/etc/oilspec/FILTER
 touch src/kernel.c
 make "${MAKE_TMP[@]}" iso EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DOILSPEC_BOOT" \
     >logs/oilspec.build.log 2>&1
+BUILD_RC=$?
+# THE EXIT STATUS, not just "is there an ISO". A previous run leaves tobyOS.iso
+# on disk, so a compile error passed the file test and the gate then measured
+# the LAST build's code while reporting it as this one's -- a whole run's worth
+# of numbers attributed to a change that was never compiled.
+[ $BUILD_RC -eq 0 ] || { echo "BUILD FAILED (rc=$BUILD_RC)";
+                         grep -E 'error|Error' logs/oilspec.build.log | head -20;
+                         exit 1; }
 [ -f tobyOS.iso ] || { echo "ISO BUILD FAIL"; tail -40 logs/oilspec.build.log; exit 1; }
 
 # GATE 0: the flags and the payload must actually be IN the artefacts. A build

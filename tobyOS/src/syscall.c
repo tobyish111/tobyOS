@@ -3262,14 +3262,24 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     free_kvec(kargv);
     free_kvec(kenvp);
 
-    /* If proc_spawn fails, the file_clone'd fds are NOT yet owned by
-     * the child; release them. On success they were transferred. */
-    if (pid < 0) {
-        if (f0) file_close(f0);
-        if (f1) file_close(f1);
-        if (f2) file_close(f2);
-        return -ABI_ENOMEM;
-    }
+    /* RELEASE THESE EITHER WAY. They were never "transferred": proc_spawn ->
+     * install_initial_fds CLONES each one into the child's table, so on the
+     * success path our clone was a second reference that nothing ever dropped.
+     *
+     * Every spawn carrying an explicit descriptor leaked one reference to the
+     * underlying open file. For a regular file that is invisible. For a PIPE
+     * it is not: the write end never reached writers == 0, so the reader never
+     * saw EOF and ANY pipeline of two external programs hung forever --
+     *
+     *     /bin/echo hi | /bin/cat        # data arrives, then hangs
+     *
+     * while `echo hi | /bin/cat` was fine, because a builtin writer means the
+     * shell holds the only write end and closes it itself. The refcount trace
+     * read: create w=1, clone w=2, clone w=3, close w=2, close w=1, stop. */
+    if (f0) file_close(f0);
+    if (f1) file_close(f1);
+    if (f2) file_close(f2);
+    if (pid < 0) return -ABI_ENOMEM;
     return pid;
 }
 
