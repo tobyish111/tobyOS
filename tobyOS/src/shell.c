@@ -2103,9 +2103,12 @@ static bool shell_ifs_has(const char *ifs, char c) {
  * it got -- that is how `while read line` terminates on a file whose last
  * line has no trailing newline instead of processing it twice or not at
  * all. The reader used to return 0 for both and the distinction was lost. */
+/* `delim` is the byte the record ends at -- '\n' normally, whatever `read -d`
+ * was given otherwise. `read -d ''` passes '\0', which no input contains, so
+ * the record runs to end of input; that is exactly what bash does with it. */
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      char *out, size_t cap,
-                                     bool *got_any) {
+                                     bool *got_any, char delim) {
     if (!in || !out || cap == 0 || !got_any) return -1;
     bool hit_eof = false;
     size_t pos = 0;
@@ -2121,7 +2124,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
 
         if (!raw && escaped) {
             escaped = false;
-            if (c == '\n') continue;
+            if (c == delim) continue;
             if (pos + 1 >= cap) return -2;
             out[pos++] = c;
             continue;
@@ -2130,7 +2133,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
             escaped = true;
             continue;
         }
-        if (c == '\n') break;
+        if (c == delim) break;
         if (pos + 1 >= cap) return -2;
         out[pos++] = c;
     }
@@ -2197,6 +2200,7 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
 
 static void cmd_read(int argc, char **argv) {
     bool raw = false;
+    char delim = '\n';
     int first = 1;
     shell_set_status(0);
 
@@ -2205,9 +2209,28 @@ static void cmd_read(int argc, char **argv) {
             first++;
             break;
         }
+        bool consumed_arg = false;
         for (const char *p = argv[first] + 1; *p; p++) {
             if (*p == 'r') {
                 raw = true;
+            } else if (*p == 'd') {
+                /* -d DELIM: end the record at DELIM instead of newline. The
+                 * operand may be glued on (-d:) or separate (-d :), and an
+                 * EMPTY one means NUL -- `read -rd '' var` is the idiom for
+                 * slurping a whole here-document into one variable. */
+                if (p[1]) {
+                    delim = p[1];
+                    break;
+                }
+                if (first + 1 < argc) {
+                    delim = argv[first + 1][0];   /* '' -> '\0': no match, so
+                                                   * the record is everything */
+                    consumed_arg = true;
+                } else {
+                    kprintf("read: -d requires an argument\n");
+                    shell_set_status(2);
+                    return;
+                }
             } else {
                 kprintf("read: bad option '-%c'\n", *p);
                 shell_set_status(2);
@@ -2215,6 +2238,7 @@ static void cmd_read(int argc, char **argv) {
             }
         }
         first++;
+        if (consumed_arg) first++;
     }
     if (first >= argc) {
         kprintf("usage: read [-r] NAME [NAME...]\n");
@@ -2242,7 +2266,7 @@ static void cmd_read(int argc, char **argv) {
     char linebuf[LINE_MAX];
     bool got_any = false;
     int rr = shell_read_line_from_file(in, raw, linebuf, sizeof(linebuf),
-                                       &got_any);
+                                       &got_any, delim);
     if (tmp_console) file_close(tmp_console);
     if (rr < 0) {
         kprintf(rr == -2 ? "read: line too long\n"
@@ -5759,6 +5783,33 @@ static int test_primary(int argc, char **argv, int *pos) {
             if (strcmp(op, "!=") == 0)
                 return strcmp(a, b) != 0 ? 0 : 1;
             return strcmp(a, b) == 0 ? 0 : 1;
+        }
+        /* -nt / -ot / -ef were LISTED as binary operators and never evaluated,
+         * so they fell through to "is the first word non-empty" and
+         * `[ anything -nt anything ]` was simply true.
+         *
+         * -ef compares canonical paths rather than device+inode because this
+         * kernel has no hard links at all, so two paths name the same file
+         * exactly when they resolve to the same path. */
+        if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 ||
+            strcmp(op, "-ef") == 0) {
+            *pos += 3;
+            char pa[VFS_PATH_MAX], pb[VFS_PATH_MAX];
+            if (shell_resolve_path_arg(a, pa, sizeof pa, "test") < 0) return 1;
+            if (shell_resolve_path_arg(b, pb, sizeof pb, "test") < 0) return 1;
+            struct vfs_stat sa, sb;
+            bool oka = (vfs_stat(pa, &sa) == VFS_OK);
+            bool okb = (vfs_stat(pb, &sb) == VFS_OK);
+            if (strcmp(op, "-ef") == 0)
+                return (oka && okb && strcmp(pa, pb) == 0) ? 0 : 1;
+            if (strcmp(op, "-nt") == 0) {
+                if (oka && !okb) return 0;        /* exists, other does not */
+                if (!oka) return 1;
+                return sa.mtime > sb.mtime ? 0 : 1;
+            }
+            if (okb && !oka) return 0;
+            if (!okb) return 1;
+            return sa.mtime < sb.mtime ? 0 : 1;   /* -ot */
         }
         if (is_int_op) {
             *pos += 3;
