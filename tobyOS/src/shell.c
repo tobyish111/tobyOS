@@ -174,9 +174,27 @@ struct shell_alias {
     char *value;
 };
 
+#define SHELL_FUNC_HEREDOC_MAX 4
+
 struct shell_function {
     char *name;
     char *body;
+    /* HERE-DOCUMENT BODIES THE DEFINITION SWALLOWED.
+     *
+     *     f() {
+     *       read head << EOF
+     *     ref: refs/heads/dev/andy
+     *     EOF
+     *     }
+     *
+     * The reader collects a here-document when it reads the line that opens
+     * it -- at DEFINITION time -- and then resets the queue. By the time the
+     * function is CALLED the body is long gone, and the call died with
+     * "here-document body missing". So they are kept here and re-queued for
+     * each call. Heap strings, not the 64 KiB inline buffers the live queue
+     * uses: a function record is permanent and most have none of these. */
+    char *heredoc[SHELL_FUNC_HEREDOC_MAX];
+    int   nheredoc;
 };
 
 struct shell_heredoc {
@@ -866,8 +884,22 @@ static int shell_function_set(const char *name, const char *body) {
 
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
+    for (int i = 0; i < g_functions[idx].nheredoc; i++)
+        kfree(g_functions[idx].heredoc[i]);
+    g_functions[idx].nheredoc = 0;
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
+
+    /* Take over whatever here-documents the definition's own lines consumed.
+     * They are still on the live queue at this moment -- the reader collects
+     * per line and resets after the line is executed, and defining the
+     * function IS that execution. */
+    for (int i = g_heredoc_head; i < g_heredoc_count &&
+                                 g_functions[idx].nheredoc < SHELL_FUNC_HEREDOC_MAX; i++) {
+        char *copy = shell_strdup(g_heredocs[i].body);
+        if (!copy) break;
+        g_functions[idx].heredoc[g_functions[idx].nheredoc++] = copy;
+    }
     return 0;
 }
 
@@ -876,6 +908,9 @@ static void shell_function_unset(const char *name) {
     if (idx < 0) return;
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
+    for (int i = 0; i < g_functions[idx].nheredoc; i++)
+        kfree(g_functions[idx].heredoc[i]);
+    g_functions[idx].nheredoc = 0;
     g_functions[idx].name = 0;
     g_functions[idx].body = 0;
 }
@@ -10963,7 +10998,28 @@ static int shell_run_function(struct shell_simple *cmd) {
     g_script_depth++;
     g_fn_depth++;
     int local_depth = g_script_depth;
+    /* Re-queue the here-documents the definition swallowed, so the body's
+     * `<<EOF` finds its text on THIS call and every later one. Saved and
+     * restored around the call because the caller may have a queue of its own
+     * part-way through. */
+    struct shell_heredoc *saved_hd = 0;
+    int saved_hd_count = g_heredoc_count, saved_hd_head = g_heredoc_head;
+    if (fn->nheredoc > 0) {
+        saved_hd = (struct shell_heredoc *)kmalloc(sizeof(*saved_hd) *
+                                                   SHELL_HEREDOC_MAX);
+        if (saved_hd) memcpy(saved_hd, g_heredocs,
+                             sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
+        shell_heredoc_reset();
+        for (int i = 0; i < fn->nheredoc; i++)
+            (void)shell_heredoc_push(fn->heredoc[i], strlen(fn->heredoc[i]));
+    }
     execute_line_text(fn->body);
+    if (saved_hd) {
+        memcpy(g_heredocs, saved_hd, sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
+        g_heredoc_count = saved_hd_count;
+        g_heredoc_head  = saved_hd_head;
+        kfree(saved_hd);
+    }
     g_fn_depth--;
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_RETURN) {
