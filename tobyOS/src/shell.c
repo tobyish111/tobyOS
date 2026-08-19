@@ -217,6 +217,8 @@ static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
 static void shell_case_unquote(char *pat);
+static char *shell_unquoted_newline(char *s);
+static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
@@ -5588,7 +5590,45 @@ static void cmd_eval(int argc, char **argv) {
         if (i + 1 < argc) cmd[pos++] = ' ';
     }
     cmd[pos] = '\0';
-    execute_line_text(cmd);
+    /* EVAL'S ARGUMENT IS A SCRIPT, NOT A LINE. A newline in it separates
+     * commands:
+     *
+     *     eval "alias sayhi='echo hello'
+     *     sayhi inside"
+     *
+     * Running the whole thing as one line made that `alias` call take three
+     * arguments -- the definition AND `sayhi inside` -- so the alias was never
+     * defined and `inside` was reported as an unknown one. Newlines inside
+     * quotes still belong to the string, which is why this uses the same
+     * quote-aware scan the alias expander does. */
+    char *p = cmd;
+    while (p && *p) {
+        char *nl = shell_unquoted_newline(p);
+        if (nl) *nl = '\0';
+        if (*shell_skip_blanks(p)) {
+            /* ALIASES EXPAND HERE, EXPLICITLY. execute_line_text only rewrites
+             * aliases at depth 0, and eval always runs from inside a line, so
+             * a line of eval'd text never got the pass:
+             *
+             *     eval "alias sayhi='echo hello'
+             *     sayhi inside"
+             *
+             * defined the alias and then failed to find /bin/sayhi. POSIX says
+             * eval's argument is parsed as shell INPUT, which includes alias
+             * substitution. */
+            const char *line = p;
+            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+            if (abuf) {
+                const char *ex = shell_expand_aliases(p, abuf,
+                                                      SHELL_PARSE_BUF_MAX);
+                if (ex) line = ex;
+            }
+            execute_line_text(line);
+            if (abuf) kfree(abuf);
+        }
+        if (g_shell_flow != SHELL_FLOW_NONE) break;
+        p = nl ? nl + 1 : 0;
+    }
 }
 
 static void cmd_exec(int argc, char **argv) {
