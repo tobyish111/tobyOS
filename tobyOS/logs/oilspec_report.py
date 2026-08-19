@@ -112,10 +112,21 @@ def main():
     prev_path = os.path.join(HERE, 'oilspec_prev.json')
     fingerprint = '%d:%d' % (os.path.getsize(LOG), int(os.path.getmtime(LOG)))
     same_log = False
+    prev = None
     if os.path.exists(prev_path):
         blob = json.load(open(prev_path, encoding='utf-8'))
         prev = blob.get('results', blob)
         same_log = blob.get('log') == fingerprint
+        if same_log:
+            # Already archived this exact log, so `prev` IS this run and the
+            # comparison would be a run against itself. Say so and leave the
+            # real diff file from the first invocation alone -- rewriting it
+            # with 0/0 is the last of the four ways this tool found to lose
+            # the answer.
+            print('  (this log is already the archive -- diff unchanged,'
+                  ' see logs/oilspec_diff.txt)')
+            prev = None
+    if prev is not None and os.path.exists(prev_path):
         flipped = [(c, prev[c], results[c]) for c in sorted(results)
                    if c in prev and prev[c] != results[c]]
         gained = [f for f in flipped if f[2] == 'P']

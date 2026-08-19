@@ -8756,24 +8756,26 @@ static bool shell_alias_name_char(char c) {
            c != '(' && c != ')' && c != '\'' && c != '"' && c != '\\';
 }
 
-/* Names already substituted while expanding the current line. POSIX: the
- * replacement text is reprocessed for aliases, but a name already used is
- * not substituted again -- otherwise `alias echo='echo foo'` never
- * terminates. Reset per line by shell_expand_aliases. */
-#define SHELL_ALIAS_SEEN_MAX 32
-static char g_alias_seen[SHELL_ALIAS_SEEN_MAX][64];
-static int  g_alias_seen_n;
+/* Names whose REPLACEMENT TEXT is currently being expanded.
+ *
+ * POSIX: the replacement is reprocessed for aliases, but the name being
+ * replaced is not substituted again -- that is what stops
+ * `alias echo='echo foo'` from recursing for ever. The set is scoped to the
+ * recursion, NOT to the line: a later, separate occurrence of the same name
+ * is an ordinary substitution, so
+ *
+ *     alias e=echo
+ *     e two; e three
+ *
+ * expands both. A per-line set got the second one wrong. */
+#define SHELL_ALIAS_DEPTH_MAX 16
+static char g_alias_active[SHELL_ALIAS_DEPTH_MAX][64];
+static int  g_alias_depth;
 
 static bool shell_alias_already_used(const char *name) {
-    for (int i = 0; i < g_alias_seen_n; i++)
-        if (strcmp(g_alias_seen[i], name) == 0) return true;
+    for (int i = 0; i < g_alias_depth; i++)
+        if (strcmp(g_alias_active[i], name) == 0) return true;
     return false;
-}
-
-static void shell_alias_mark_used(const char *name) {
-    if (g_alias_seen_n >= SHELL_ALIAS_SEEN_MAX) return;
-    ksnprintf(g_alias_seen[g_alias_seen_n], 64, "%s", name);
-    g_alias_seen_n++;
 }
 
 static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
@@ -8836,9 +8838,27 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                                   shell_alias_already_used(name))
                                      ? 0 : shell_alias_value(name);
                 if (av) {
-                    shell_alias_mark_used(name);
                     size_t avlen = strlen(av);
-                    if (shell_append_str(out, &pos, cap, av) < 0) return -1;
+                    /* Expand the replacement NOW, with this name marked
+                     * active, then carry on through the rest of the line with
+                     * the outer set restored. One pass, correct scoping. */
+                    if (g_alias_depth < SHELL_ALIAS_DEPTH_MAX) {
+                        ksnprintf(g_alias_active[g_alias_depth], 64, "%s", name);
+                        g_alias_depth++;
+                        char *sub_buf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+                        if (!sub_buf) { g_alias_depth--; return -1; }
+                        bool sub_changed = false;
+                        int rc = shell_expand_aliases_once(av, sub_buf,
+                                                           SHELL_PARSE_BUF_MAX,
+                                                           &sub_changed);
+                        g_alias_depth--;
+                        if (rc < 0) { kfree(sub_buf); return -1; }
+                        int arc = shell_append_str(out, &pos, cap, sub_buf);
+                        kfree(sub_buf);
+                        if (arc < 0) return -1;
+                    } else if (shell_append_str(out, &pos, cap, av) < 0) {
+                        return -1;
+                    }
                     *changed = true;
                     /* POSIX: a replacement ending in a blank means the NEXT
                      * word is checked for aliases too -- which is what makes
@@ -8884,21 +8904,18 @@ static const char *shell_expand_aliases(const char *src, char *buf,
     const char *cur = src ? src : "";
     bool changed = false;
 
-    g_alias_seen_n = 0;      /* the no-reuse set is per LINE */
 
-    for (int pass = 0; pass < 8; pass++) {
-        char *dst = (pass & 1) ? tmp : buf;
-        if (shell_expand_aliases_once(cur, dst,
-                                      (pass & 1) ? sizeof(tmp) : cap,
-                                      &changed) < 0) {
-            kprintf("alias: expansion too long\n");
-            return 0;
-        }
-        cur = dst;
-        if (!changed) return cur;
+    /* ONE pass. The expander recurses into each replacement itself, carrying
+     * the name it is replacing, so there is nothing left for a second pass to
+     * find -- and no pass counter to run out, which used to be the only
+     * symptom of `alias echo='echo foo'`. */
+    (void)tmp;
+    g_alias_depth = 0;
+    if (shell_expand_aliases_once(cur, buf, cap, &changed) < 0) {
+        kprintf("alias: expansion too long\n");
+        return 0;
     }
-    kprintf("alias: recursive expansion limit reached\n");
-    return 0;
+    return buf;
 }
 
 static bool shell_is_list_sep(enum shell_tok_type t) {
