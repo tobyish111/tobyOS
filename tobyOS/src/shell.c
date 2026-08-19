@@ -10279,8 +10279,18 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                     if (shell_add_redir(cur, SH_RD_CLOSE, fd, 0, 0,
                                         -1) < 0) return -1;
                 } else if (shell_parse_fd_word(tok[*io].text, &target) < 0) {
-                    kprintf("shell: bad file descriptor '%s'\n", tok[*io].text);
-                    return -1;
+                    /* `N>&word` WHERE word IS NOT A DESCRIPTOR IS A FILENAME:
+                     *
+                     *     echo one 1>&$TMP/somefile     bash: writes the file
+                     *                                   tsh : "bad file descriptor"
+                     *
+                     * bash and mksh both treat it that way. Reporting an error
+                     * instead failed a redirect that was meant to succeed. */
+                    enum shell_redir_op fop = (t == SH_TOK_DUP_IN)
+                                                  ? SH_RD_OPEN_IN
+                                                  : SH_RD_OPEN_OUT;
+                    if (shell_add_redir(cur, fop, fd, tok[*io].text, 0,
+                                        -1) < 0) return -1;
                 } else {
                     if (shell_add_redir(cur,
                                         t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
@@ -13452,6 +13462,47 @@ static void execute_line_text_inner(const char *src) {
             g_shell_flow = SHELL_FLOW_EXIT;
             g_shell_flow_status = 2;
             return;
+        }
+
+        /* A COMPOUND KEYWORD CANNOT FOLLOW AN ASSIGNMENT PREFIX. `for` and
+         * friends do start a command, so they are not in the list above -- but
+         *
+         *     FOO=bar for i in a b; do ...      bash: syntax error
+         *     FOO=bar for                       bash: syntax error
+         *
+         * because a prefix introduces a SIMPLE command and a compound is not
+         * one. tsh skipped the prefix and went looking for /bin/for. */
+        const char *a = w;
+        bool saw_prefix = false;
+        for (;;) {
+            const char *n = a;
+            if (!((*n >= 'A' && *n <= 'Z') || (*n >= 'a' && *n <= 'z') ||
+                  *n == '_')) break;
+            while ((*n >= 'A' && *n <= 'Z') || (*n >= 'a' && *n <= 'z') ||
+                   (*n >= '0' && *n <= '9') || *n == '_') n++;
+            if (*n != '=') break;
+            bool sq = false, dq = false;
+            while (*n && (sq || dq || !is_space(*n))) {
+                if (*n == '\'' && !dq) sq = !sq;
+                else if (*n == '"' && !sq) dq = !dq;
+                n++;
+            }
+            saw_prefix = true;
+            a = shell_skip_blanks(n);
+        }
+        if (saw_prefix) {
+            static const char *const compound_kw[] = {
+                "for", "while", "until", "if", "case", 0
+            };
+            for (int m = 0; compound_kw[m]; m++) {
+                if (!shell_starts_with_word(a, compound_kw[m])) continue;
+                kprintf("shell: syntax error near unexpected token `%s'\n",
+                        compound_kw[m]);
+                shell_set_status(2);
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = 2;
+                return;
+            }
         }
     }
 
