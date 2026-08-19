@@ -141,6 +141,13 @@ static bool g_opt_errexit;   /* set -e */
  * than a flag because these nest -- a while condition may contain a pipeline
  * containing an if -- and the innermost scope must not clear the outer one. */
 static int g_errexit_suspend;
+
+/* True when the last non-zero status came from a command errexit is not
+ * allowed to act on -- the left side of && or ||. It exists so the exemption
+ * survives being handed UPWARDS: a brace group returns its last command's
+ * status, and without this the level above would see "a command failed" and
+ * exit, which bash does not do. */
+static bool g_status_exempt;
 static bool g_opt_nounset;   /* set -u */
 static bool g_opt_xtrace;    /* set -x */
 static bool g_opt_noglob;    /* set -f */
@@ -12823,7 +12830,13 @@ static bool shell_try_subshell_command(const char *src) {
 
 static bool shell_try_group_command(const char *src) {
     const char *s = shell_skip_blanks(src);
-    if (*s != '{') return false;
+    /* `{` opens a group only as a SEPARATE TOKEN -- POSIX makes it a reserved
+     * word, not a punctuation character. `{ls;}` is the command `{ls`, which
+     * is not found (127); claiming it as a group produced a parse error
+     * instead, and under `set -e` the shell then exited 2 where bash exits
+     * 127. shell_group_open_at already had this right; this entry test did
+     * not, and the two disagreed. */
+    if (!shell_group_open_at(s)) return false;
 
     const char *body_start = s + 1;
     const char *body_end = 0;
@@ -13085,9 +13098,14 @@ static bool shell_run_list_line(const char *src) {
                  * killing the shell. */
                 bool exempt = (sep != 0) &&
                               (link == SH_LINK_AND || link == SH_LINK_OR);
+                g_status_exempt = false;
                 if (exempt) g_errexit_suspend++;
                 execute_line_text(seg);
                 if (exempt) g_errexit_suspend--;
+                /* Remember that this failure was exempt, so a COMPOUND that
+                 * returns it is not re-judged as a fresh failure one level up:
+                 * `{ test no = yes && echo hi; }` must not exit. */
+                if (exempt && g_last_status != 0) g_status_exempt = true;
                 if (g_shell_flow != SHELL_FLOW_NONE) { kfree(seg); return true; }
             }
         }
@@ -13390,6 +13408,23 @@ static void execute_line_text_inner(const char *src) {
         shell_try_case_command(src) ||
         shell_try_group_command(src) ||
         shell_try_subshell_command(src)) {
+        /* ERREXIT APPLIES TO A COMPOUND COMMAND TOO. These are dispatched
+         * before the token loop, which is where the check lives, so a failing
+         * compound never triggered it:
+         *
+         *     set -e; ( echo one; false; echo two; ); echo three
+         *
+         * bash prints `one` and stops; tsh went on to print `three`. Same for
+         * a group or a `while` whose redirect could not be opened.
+         *
+         * g_status_exempt is what keeps `{ test no = yes && echo hi; }` from
+         * exiting: its non-zero status came from a command that was itself
+         * exempt, and an exemption survives being handed upwards. */
+        if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = g_last_status;
+        }
         return;
     }
 
