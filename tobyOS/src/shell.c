@@ -7945,6 +7945,28 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
     const char *ifs = env_get("IFS");
     if (ifs && *ifs) sep = ifs[0];
     else if (ifs) sep = '\0';
+
+    /* IFS SET AND EMPTY, UNQUOTED: `$*` yields one field per parameter, the
+     * same as `$@`.
+     *
+     *     set -- "1 2" "3  4"; IFS=
+     *     argv.py  $*      ->  ['1 2', '3  4']
+     *     argv.py "$*"     ->  ['1 23  4']
+     *
+     * Joining with no separator and leaving it at that produced the quoted
+     * answer for both. bash and dash agree on this, which is why the corpus
+     * files it as POSIX even though it reads like a quirk. Quoted, the join is
+     * still correct -- g_dq_depth is what tells the two apart. */
+    if (ifs && !*ifs && g_dq_depth == 0) {
+        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        for (int i = 0; i < g_positional_count; i++) {
+            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                return -1;
+            if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+        }
+        return 0;
+    }
+
     for (int i = 0; i < g_positional_count; i++) {
         if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
         if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
