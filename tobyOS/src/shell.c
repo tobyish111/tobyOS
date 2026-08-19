@@ -7648,6 +7648,11 @@ static int g_dq_depth;
 /* Depth of nested substitutions, so each gets its own spill file. */
 static int g_capture_depth;
 
+/* Exit status of the most recent command substitution. A command discards it
+ * -- `echo $(false)` is 0 -- but a bare assignment adopts it, which is how
+ * `x=$(exit 33); echo $?` reports 33. */
+static int g_capture_last_status;
+
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
 
@@ -7713,6 +7718,21 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     g_errexit_suspend++;
     execute_line_text(cmd);
     g_errexit_suspend--;
+
+    /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
+     *
+     *     echo $(echo x; exit 33)     bash: x, and the script carries on
+     *                                 tsh : x, then the whole shell exited 33
+     *
+     * The flow flag is absorbed here and the status kept, because an
+     * ASSIGNMENT adopts it -- `x=$(echo x; exit 33)` leaves $? as 33 while
+     * `echo $(...)` leaves echo's own 0. */
+    g_capture_last_status = g_last_status;
+    if (g_shell_flow == SHELL_FLOW_EXIT) {
+        g_capture_last_status = g_shell_flow_status;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+    }
     g_last_status = saved_status;
 
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
@@ -8966,11 +8986,16 @@ static bool shell_is_digit(char c) {
     return c >= '0' && c <= '9';
 }
 
+/* Reset per tokenization so an assignment-only command sees the status of a
+ * substitution in ITS OWN value and not one from an earlier line. Nested
+ * tokenization is safe: a substitution records its status when it finishes,
+ * which is after every tokenizer it started has already run. */
 static int shell_tokenize(const char *src, struct shell_token *tok,
                           int *out_ntok, char *words, size_t word_cap) {
     int ntok = 0;
     size_t wpos = 0;
     const char *p = src;
+    g_capture_last_status = 0;
 
     while (*p) {
         while (is_space(*p)) p++;
@@ -10782,7 +10807,15 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
             return 1;
         }
         shell_fd_state_close_owned(&fds);
+        /* An assignment-only command takes the status of the LAST COMMAND
+         * SUBSTITUTION in its value, which is what makes
+         *
+         *     x=$(echo x; exit 33); echo $?      ->  33
+         *
+         * while `echo $(echo x; exit 33)` reports echo's own 0. Without this,
+         * an assignment always looked like a success. */
         int rc = shell_apply_assignments(cmd->argv, assignc, "shell");
+        if (rc == 0) rc = g_capture_last_status;
         return rc;
     }
 
