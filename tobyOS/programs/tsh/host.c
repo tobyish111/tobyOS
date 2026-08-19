@@ -393,6 +393,18 @@ int vfs_create(const char *path) {
 int vfs_mkdir(const char *path)  { return mkdir(path, 0755) == 0 ? VFS_OK : errno_to_vfs(); }
 int vfs_unlink(const char *path) { return unlink(path)      == 0 ? VFS_OK : errno_to_vfs(); }
 
+/* Truncate in place. The kernel has a real vfs_truncate; here it is an open
+ * with O_TRUNC, which is the same thing through the syscall layer -- and
+ * critically NOT unlink+create, so redirecting over a device node or a file
+ * someone else holds open keeps the same inode. */
+int vfs_truncate(const char *path, uint64_t len) {
+    if (len != 0) return VFS_ERR_INVAL;      /* the shell only ever wants 0 */
+    int fd = open(path, O_WRONLY | O_TRUNC);
+    if (fd < 0) return errno_to_vfs();
+    close(fd);
+    return VFS_OK;
+}
+
 int vfs_chmod(const char *path, uint32_t mode) { (void)path; (void)mode; return VFS_ERR_ROFS; }
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     (void)path; (void)uid; (void)gid; return VFS_ERR_ROFS;

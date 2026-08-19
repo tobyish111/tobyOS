@@ -6805,12 +6805,16 @@ static struct shell_rlimit *shell_rlimit_find(char opt) {
     return 0;
 }
 
+/* STDOUT. A reported limit is the ANSWER to the question `ulimit -f` asks, so
+ * it belongs on stdout where `x=$(ulimit -f)` can see it -- it was going to
+ * the diagnostic stream, which is also why every one of these cases showed
+ * bash's value on stdout and tsh's on stderr. */
 static void shell_rlimit_print(const struct shell_rlimit *r, bool hard,
                                bool with_label) {
     long v = hard ? r->hard : r->soft;
-    if (with_label) kprintf("%-24s%-10s", r->label, r->units);
-    if (v == ULIMIT_INF) kprintf("unlimited\n");
-    else kprintf("%ld\n", v);
+    if (with_label) shell_printf("%-24s%-10s", r->label, r->units);
+    if (v == ULIMIT_INF) shell_printf("unlimited\n");
+    else shell_printf("%ld\n", v);
 }
 
 static void cmd_ulimit(int argc, char **argv) {
@@ -6858,13 +6862,24 @@ static void cmd_ulimit(int argc, char **argv) {
     if (strcmp(argv[i], "unlimited") == 0) {
         val = ULIMIT_INF;
     } else {
-        int v = 0;
-        if (parse_int(argv[i], &v) < 0 || v < 0) {
+        /* 64-bit, with overflow detected rather than wrapped. parse_int went
+         * through an `int`, so 2**32 came back truncated and a value too big
+         * for 64 bits wrapped into a small positive number and was accepted. */
+        const char *s = argv[i];
+        unsigned long acc = 0;
+        bool any = false, over = false;
+        for (; *s >= '0' && *s <= '9'; s++) {
+            unsigned long d = (unsigned long)(*s - '0');
+            if (acc > (~0ul - d) / 10ul) over = true;
+            else acc = acc * 10ul + d;
+            any = true;
+        }
+        if (!any || *s || over || acc > (unsigned long)(~0ul >> 1)) {
             kprintf("ulimit: %s: invalid number\n", argv[i]);
             shell_set_status(2);
             return;
         }
-        val = v;
+        val = (long)acc;
     }
 
     bool set_hard = want_hard || !want_soft;
@@ -10250,20 +10265,34 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                 return 0;
             }
         } else {
+            /* TRUNCATE IN PLACE. This unlinked the target and recreated it,
+             * which is the same anti-pattern sys_open's O_TRUNC had: it
+             * changes the inode, so anyone else holding the file open is left
+             * pointing at a deleted one -- and it is fatal for anything that
+             * is not an ordinary file. `cmd >/dev/null` tried to DELETE
+             * /dev/null and failed with "read-only filesystem", so the most
+             * common redirect in shell scripting did not work at all.
+             *
+             * A device node or fifo is opened as-is: there is nothing to
+             * truncate. Only a missing file is created. */
             if (sr == VFS_OK) {
-                int ur = vfs_unlink(path);
-                if (ur != VFS_OK) {
-                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(ur));
-                    return 0;
+                if (st.type == VFS_TYPE_FILE) {
+                    int tr = vfs_truncate(path, 0);
+                    if (tr != VFS_OK) {
+                        kprintf("%s: '%s': %s\n", label, path_arg,
+                                vfs_strerror(tr));
+                        return 0;
+                    }
                 }
             } else if (sr != VFS_ERR_NOENT) {
                 kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
                 return 0;
-            }
-            int cr = vfs_create(path);
-            if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
-                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
-                return 0;
+            } else {
+                int cr = vfs_create(path);
+                if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
+                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+                    return 0;
+                }
             }
         }
     }
@@ -10490,14 +10519,26 @@ static void shell_restore_io_frame(struct shell_io_frame *frame) {
     }
 }
 
+/* A write to a builtin's redirected stdout that FAILED.
+ *
+ * POSIX requires a utility to report a write error, and bash does:
+ *
+ *     echo hi > /dev/full ; echo status=$?     ->  status=1
+ *
+ * The error was discarded here, so the builtin reported success having
+ * written nothing. Cleared before each redirected builtin runs and checked
+ * after -- a flag rather than a return value because shell_write_fn_t is void
+ * and every builtin writes through it. */
+static bool g_shell_out_failed;
+
 static void shell_file_output(const char *s, void *ctx) {
     struct file *f = (struct file *)ctx;
-    if (s && f) (void)file_write(f, s, strlen(s));
+    if (s && f && file_write(f, s, strlen(s)) < 0) g_shell_out_failed = true;
 }
 
 static void shell_file_kputc(void *ctx, char c) {
     struct file *f = (struct file *)ctx;
-    if (f) (void)file_write(f, &c, 1);
+    if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
 }
 
 struct shell_printk_bridge {
@@ -10589,6 +10630,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         return 1;
     }
     if (fds.fd[1]) {
+        g_shell_out_failed = false;
         shell_set_output(shell_file_output, fds.fd[1]);
         printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
         printk_set_sink_mode(shell_file_kputc, fds.fd[1], true);
@@ -10615,6 +10657,13 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     }
     if (fds.fd[1]) {
         shell_set_output(old_fn, old_ctx);
+        /* A builtin that could not write what it was asked to write did not
+         * succeed, whatever it thinks -- `echo hi > /dev/full` is status 1. */
+        if (g_shell_out_failed && rc == 0) {
+            rc = 1;
+            shell_set_status(1);
+        }
+        g_shell_out_failed = false;
     }
     shell_fd_state_close_owned(&fds);
     return rc;
