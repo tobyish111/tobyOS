@@ -183,7 +183,15 @@ static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
 static int g_heredoc_count;
 /* How many of them have been consumed. See shell_heredoc_pop. */
 static int g_heredoc_head;
-static char *g_traps[SIG_MAX];
+/* One slot per signal, plus EXIT at 0 and ERR at SHELL_TRAP_ERR. ERR is a
+ * condition, not a signal, so it needs a slot of its own past the end. */
+#define SHELL_TRAP_ERR SIG_MAX
+static char *g_traps[SIG_MAX + 1];
+
+/* Depth of shell-function calls in progress. The ERR trap is NOT inherited by
+ * a function unless `set -o errtrace`, which this shell does not have -- so
+ * inside a function the trap simply does not fire. */
+static int g_fn_depth;
 static bool g_trap_running;
 
 static bool g_heredoc_collecting;
@@ -901,11 +909,12 @@ static const char *shell_signal_name(int num) {
 
 static const char *shell_trap_name(int sig) {
     if (sig == 0) return "EXIT";
+    if (sig == SHELL_TRAP_ERR) return "ERR";
     return shell_signal_name(sig);
 }
 
 static void shell_trap_unset(int sig) {
-    if (sig < 0 || sig >= SIG_MAX) return;
+    if (sig < 0 || sig > SHELL_TRAP_ERR) return;
     if (g_traps[sig]) {
         kfree(g_traps[sig]);
         g_traps[sig] = 0;
@@ -913,7 +922,7 @@ static void shell_trap_unset(int sig) {
 }
 
 static void shell_trap_clear_all(void) {
-    for (int i = 0; i < SIG_MAX; i++) shell_trap_unset(i);
+    for (int i = 0; i <= SHELL_TRAP_ERR; i++) shell_trap_unset(i);
 }
 
 struct shell_trap_frame {
@@ -1000,6 +1009,32 @@ static void shell_check_pending_signals(void) {
             shell_run_trap(i);
         }
     }
+}
+
+/* Run the ERR trap, if one is set, for a command that just failed.
+ *
+ * `$?` inside the handler is the failing command's status, and the handler
+ * must not disturb it for whatever runs next -- an ERR trap that quietly reset
+ * $? would change the meaning of the very failure it reports. g_trap_running
+ * keeps a handler that itself fails from re-entering. */
+static void shell_run_err_trap(int status) {
+    if (g_trap_running) return;
+    /* Not inherited by a shell function. bash only runs it there under
+     * `set -o errtrace`, which this shell does not implement, so inside a
+     * function the trap stays silent. */
+    if (g_fn_depth > 0) return;
+    const char *act = g_traps[SHELL_TRAP_ERR];
+    if (!act || !*act) return;
+
+    char *action = shell_strdup(act);
+    if (!action) return;
+
+    g_trap_running = true;
+    shell_set_status(status);
+    execute_line_text(action);
+    g_trap_running = false;
+    shell_set_status(status);
+    kfree(action);
 }
 
 static int shell_run_exit_trap(int status) {
@@ -5441,6 +5476,10 @@ static int shell_trap_parse_condition(const char *s, int *out_sig) {
         *out_sig = 0;
         return 0;
     }
+    if (strcmp(s, "ERR") == 0) {
+        *out_sig = SHELL_TRAP_ERR;
+        return 0;
+    }
     int named = shell_signal_by_name(s);
     if (named > 0) {
         *out_sig = named;
@@ -5465,8 +5504,15 @@ static void shell_print_quoted_trap_action(const char *action) {
 
 static void cmd_trap(int argc, char **argv) {
     shell_set_status(0);
+    /* `trap -- ACTION COND...`: the separator is accepted and ignored. It was
+     * taken as the ACTION, so the real action became a condition and the
+     * whole call failed with "bad condition 'echo hi'". */
+    if (argc > 1 && strcmp(argv[1], "--") == 0) {
+        argv = &argv[1];
+        argc--;
+    }
     if (argc <= 1) {
-        for (int i = 0; i < SIG_MAX; i++) {
+        for (int i = 0; i <= SHELL_TRAP_ERR; i++) {
             if (!g_traps[i]) continue;
             const char *name = shell_trap_name(i);
             if (!name) continue;
@@ -5479,7 +5525,27 @@ static void cmd_trap(int argc, char **argv) {
 
     const char *action = argv[1];
     bool reset = (strcmp(action, "-") == 0);
-    for (int i = 2; i < argc; i++) {
+    int first_cond = 2;
+
+    /* POSIX: if the first operand is an UNSIGNED INTEGER, every operand is a
+     * condition and the action resets to the default -- `trap 0 2` clears both
+     * EXIT and SIGINT. It was read as action="0" with a single condition. */
+    {
+        int probe = 0;
+        if (!reset && parse_int(action, &probe) == 0 && probe >= 0) {
+            reset = true;
+            first_cond = 1;
+        }
+    }
+
+    /* An action with no condition is an error, not a silent success. */
+    if (first_cond >= argc) {
+        kprintf("trap: usage: trap [-] ACTION CONDITION...\n");
+        shell_set_status(2);
+        return;
+    }
+
+    for (int i = first_cond; i < argc; i++) {
         int sig = -1;
         if (shell_trap_parse_condition(argv[i], &sig) < 0) {
             kprintf("trap: bad condition '%s'\n", argv[i]);
@@ -10817,8 +10883,10 @@ static int shell_run_function(struct shell_simple *cmd) {
     }
 
     g_script_depth++;
+    g_fn_depth++;
     int local_depth = g_script_depth;
     execute_line_text(fn->body);
+    g_fn_depth--;
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_RETURN) {
         rc = g_shell_flow_status;
@@ -13373,6 +13441,11 @@ static void execute_line_text_inner(const char *src) {
             bool in_and_or = (prev_link == SH_TOK_AND_IF ||
                               prev_link == SH_TOK_OR_IF ||
                               sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
+            /* The ERR trap fires in exactly the contexts errexit acts in --
+             * not on a negated command, not on the left of && or ||, not in a
+             * condition -- and independently of whether `set -e` is on. */
+            if (last != 0 && !negate && !in_and_or && g_errexit_suspend == 0)
+                shell_run_err_trap(last);
             if (g_opt_errexit && last != 0 && !negate &&
                 !in_and_or && g_errexit_suspend == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
