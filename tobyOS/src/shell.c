@@ -199,6 +199,8 @@ static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
+static struct file *shell_open_vfs_file(const char *path_arg, bool write,
+                                        bool append, const char *label);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
@@ -539,6 +541,14 @@ static int env_set_kv(const char *kv_in) {
 
 /* Convenience: build "KEY=VALUE" from two NUL-terminated halves and
  * hand it to env_set_kv. */
+/* Mark an existing variable exported. Used by cd for PWD/OLDPWD, which POSIX
+ * puts in the environment rather than merely in the variable table. */
+static void shell_mark_exported(const char *key) {
+    if (!key) return;
+    int idx = env_find(key, strlen(key));
+    if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
+}
+
 static int env_set(const char *key, const char *val) {
     if (!key || !val) return -1;
     size_t klen = strlen(key);
@@ -2295,12 +2305,19 @@ static void cmd_cd(int argc, char **argv) {
 
     const char *old = shell_cwd();
     (void)env_set("OLDPWD", old);
+    /* OLDPWD is in the ENVIRONMENT, not just the variable table -- POSIX says
+     * cd exports it, and `env | grep OLDPWD` shows it in every shell. Since
+     * the export filter started being applied at the spawn boundary, a
+     * variable that is not marked simply does not reach a child. */
+    shell_mark_exported("OLDPWD");
     if (shell_set_cwd(path) < 0) {
         kprintf("cd: failed to enter '%s'\n", path);
         shell_set_status(1);
         return;
     }
-    if (print_new) kprintf("%s\n", path);
+    /* STDOUT. `cd -` reports where it went, and that report is output, not a
+     * diagnostic -- it was going to stderr, where a script cannot capture it. */
+    if (print_new) shell_printf("%s\n", path);
 }
 
 static void cmd_true(int argc, char **argv) {
@@ -7518,6 +7535,27 @@ static void shell_capture_char(struct shell_capture *cap, char c) {
     cap->buf[cap->pos] = '\0';
 }
 
+/* Sink that writes the shell's own output into the same spill file a spawned
+ * child writes to, so builtin and external output interleave in the order
+ * they were produced. */
+struct shell_capture_file {
+    struct file *f;
+    bool failed;
+};
+
+static void shell_capture_file_write(const char *s, void *ctx) {
+    struct shell_capture_file *cf = (struct shell_capture_file *)ctx;
+    if (!s || !cf || !cf->f) return;
+    size_t n = strlen(s);
+    if (n && file_write(cf->f, s, n) < 0) cf->failed = true;
+}
+
+static void shell_capture_file_kputc(void *ctx, char c) {
+    struct shell_capture_file *cf = (struct shell_capture_file *)ctx;
+    if (!cf || !cf->f) return;
+    if (file_write(cf->f, &c, 1) < 0) cf->failed = true;
+}
+
 static void shell_capture_write(const char *s, void *ctx) {
     struct shell_capture *cap = (struct shell_capture *)ctx;
     if (!s) return;
@@ -7541,6 +7579,9 @@ static void shell_capture_kputc(void *ctx, char c) {
  * script with its own quoting context. */
 static int g_dq_depth;
 
+/* Depth of nested substitutions, so each gets its own spill file. */
+static int g_capture_depth;
+
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
 
@@ -7553,9 +7594,41 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     void *old_sink_ctx = 0;
     bool old_sink_suppress = false;
 
+    /* A SPAWNED CHILD DOES NOT WRITE THROUGH ANY OF THESE.
+     *
+     * Redirecting g_shell_out and the printk sink captures what the SHELL
+     * writes -- builtins. An external program writes to its own fd 1, which is
+     * the shell's real stdout, so
+     *
+     *     echo "[$(/bin/echo ext)]"      bash: [ext]
+     *                                    tsh : ext        <- leaked to stdout
+     *                                          []         <- captured nothing
+     *
+     * So fd 1 is pointed at a spill file for the duration, and the shell's own
+     * output goes to the SAME file rather than straight to the buffer -- which
+     * is what keeps `$(echo a; /bin/echo b)` in order. The file is read back
+     * afterwards. A pipe would deadlock instead: the command runs to
+     * completion before anything reads, so output past the pipe buffer would
+     * block the child forever.
+     *
+     * If the spill file cannot be opened, fall back to the old buffer-only
+     * capture: builtins still work, which is strictly better than failing. */
+    char spill[64];
+    ksnprintf(spill, sizeof spill, "/tmp/.tsh-capture-%d", g_capture_depth);
+    struct file *spill_w = shell_open_vfs_file(spill, true, false, "shell");
+    struct file *saved_fd1 = g_shell_fd[1];
+    struct shell_capture_file cf = { .f = spill_w, .failed = false };
+
     printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
-    shell_set_output(shell_capture_write, &cap);
-    printk_set_sink_mode(shell_capture_kputc, &cap, true);
+    if (spill_w) {
+        g_shell_fd[1] = spill_w;
+        g_capture_depth++;
+        shell_set_output(shell_capture_file_write, &cf);
+        printk_set_sink_mode(shell_capture_file_kputc, &cf, true);
+    } else {
+        shell_set_output(shell_capture_write, &cap);
+        printk_set_sink_mode(shell_capture_kputc, &cap, true);
+    }
 
     /* A failure INSIDE the substitution is not the parent's error.
      *
@@ -7578,6 +7651,26 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
 
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
+
+    if (spill_w) {
+        g_capture_depth--;
+        g_shell_fd[1] = saved_fd1;
+        file_close(spill_w);
+        /* Read the spill back into the caller's buffer. Reopening rather than
+         * seeking keeps this working on backends whose write handle has no
+         * independent read cursor. */
+        struct file *spill_r = shell_open_vfs_file(spill, false, false, "shell");
+        if (spill_r) {
+            for (;;) {
+                char chunk[512];
+                long n = file_read(spill_r, chunk, sizeof chunk);
+                if (n <= 0) break;
+                for (long i = 0; i < n; i++) shell_capture_char(&cap, chunk[i]);
+            }
+            file_close(spill_r);
+        }
+        (void)vfs_unlink(spill);
+    }
 
     while (cap.pos > 0 &&
            (cap.buf[cap.pos - 1] == '\n' || cap.buf[cap.pos - 1] == '\r')) {
