@@ -9610,6 +9610,14 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
         for (size_t i = 0; i < ulen && n + 1 < sizeof(ubuf); i++)
             ubuf[n++] = uname[i];
         ubuf[n] = '\0';
+        /* ~name EXPANDS ONLY IF THE USER EXISTS. `echo ~nonexistent` prints
+         * `~nonexistent` in every shell -- an unknown name is not an error and
+         * not a path, it is left exactly as written. tsh handed back
+         * /home/nonexistent, inventing a home directory for a user that has
+         * none. */
+        struct vfs_stat hst;
+        if (vfs_stat(ubuf, &hst) != VFS_OK || hst.type != VFS_TYPE_DIR)
+            return 0;
         home = ubuf;
     }
 
@@ -13175,6 +13183,38 @@ static void execute_line_text_inner(const char *src) {
         return;
     }
     if (shell_run_list_line(src)) return;
+
+    /* `! COMPOUND` -- the negation never reached a group or a subshell.
+     *
+     *     ! { echo 1; echo 2; } || echo FAILED
+     *     ! ( echo 1; echo 2 )  || echo FAILED
+     *
+     * `!` is handled in the token loop below, but a compound is dispatched
+     * BEFORE tokenizing (the tokenizer would reduce `{` and `while` to
+     * ordinary words), so the leading `!` was simply passed through as part of
+     * the command text and lost.
+     *
+     * This sits after shell_run_list_line so the line is already split on
+     * `&&`/`||`/`;` -- `!` binds to its own pipeline, not to the whole list. */
+    {
+        const char *q = shell_skip_blanks(src);
+        if (q[0] == '!' && (q[1] == ' ' || q[1] == '\t')) {
+            const char *rest = shell_skip_blanks(q + 1);
+            if (*rest) {
+                /* A NEGATED command is exempt from errexit -- `set -e; ! false`
+                 * carries on, because the failure is the point. The token loop
+                 * expressed that through its `negate` flag; taking this route
+                 * instead lost the exemption and `! false` killed the script. */
+                g_errexit_suspend++;
+                execute_line_text_inner(rest);
+                g_errexit_suspend--;
+                if (g_shell_flow == SHELL_FLOW_NONE)
+                    shell_set_status(g_last_status == 0 ? 1 : 0);
+                return;
+            }
+        }
+    }
+
     if (shell_try_function_definition(src)) return;
     /* A pipeline with a compound stage must be split while the stages are
      * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
@@ -13208,7 +13248,14 @@ static void execute_line_text_inner(const char *src) {
                           (prev_link == SH_TOK_OR_IF && last != 0);
 
         bool negate = false;
-        while (i < ntok && tok[i].type == SH_TOK_WORD &&
+        /* `!` is the negation KEYWORD only when it was written as one. A `!`
+         * that arrived from an expansion is an ordinary word:
+         *
+         *     v='!'; $v echo hi        bash: /bin/! not found, status 127
+         *
+         * tsh negated instead and ran `echo hi`. tok[].expanded already
+         * records where the word came from. */
+        while (i < ntok && tok[i].type == SH_TOK_WORD && !tok[i].expanded &&
                strcmp(tok[i].text, "!") == 0) {
             negate = !negate;
             i++;
