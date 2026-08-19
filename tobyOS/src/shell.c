@@ -13428,6 +13428,33 @@ static void execute_line_text_inner(const char *src) {
         return;
     }
 
+    /* A RESERVED WORD WHERE A COMMAND BELONGS IS A SYNTAX ERROR, and a syntax
+     * error aborts the script -- it does not run the line and carry on.
+     *
+     *     do echo hi          bash: syntax error, exit 2
+     *     }                   tsh : "/bin/do not found", 127, and kept going
+     *     echo should not get here
+     *
+     * Every legitimate use of these words is consumed by a compound dispatcher
+     * above, so reaching here means the word is misplaced. `}` gets here only
+     * since `{` became a reserved WORD: `{ls; }` is the command `{ls` followed
+     * by a stray `}`. */
+    {
+        static const char *const misplaced[] = {
+            "do", "done", "then", "elif", "else", "fi", "esac", "}", 0
+        };
+        const char *w = shell_skip_blanks(src);
+        for (int m = 0; misplaced[m]; m++) {
+            if (!shell_starts_with_word(w, misplaced[m])) continue;
+            kprintf("shell: syntax error near unexpected token `%s'\n",
+                    misplaced[m]);
+            shell_set_status(2);
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = 2;
+            return;
+        }
+    }
+
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
         shell_set_status(2);
         return;
