@@ -13024,6 +13024,25 @@ static void execute_line_text_inner(const char *src) {
 
 /* See patch note: aliases are a LINE-level rewrite, applied before the line
  * is split or parsed, and never re-applied to the pieces. */
+static bool shell_text_has_newline(const char *s) {
+    for (; s && *s; s++) if (*s == '\n') return true;
+    return false;
+}
+
+/* The first newline that is not inside quotes, or 0. Used to split an alias
+ * replacement into the separate commands it spells out, without cutting a
+ * newline that a quoted string legitimately contains. */
+static char *shell_unquoted_newline(char *s) {
+    bool sq = false, dq = false;
+    for (char *p = s; *p; p++) {
+        if (*p == '\\' && p[1] && !sq) { p++; continue; }
+        if (*p == '\'' && !dq) { sq = !sq; continue; }
+        if (*p == '"'  && !sq) { dq = !dq; continue; }
+        if (*p == '\n' && !sq && !dq) return p;
+    }
+    return 0;
+}
+
 static void execute_line_text(const char *src) {
     if (g_exec_line_depth > 0) {           /* a piece of a line already being run */
         g_exec_line_depth++;
@@ -13049,7 +13068,33 @@ static void execute_line_text(const char *src) {
     }
 
     g_exec_line_depth++;
-    execute_line_text_inner(line_src);
+    /* AN ALIAS WHOSE REPLACEMENT CONTAINS NEWLINES IS MULTIPLE COMMANDS.
+     *
+     *     alias e_='echo 1
+     *     echo 2
+     *     echo 3'
+     *     e_ ${var}          # bash: 1 / 2 / 3 echo foo
+     *
+     * The newlines survive expansion and land in the middle of the line, and
+     * running that as ONE command printed `1 echo 2 echo 3 echo foo`.
+     *
+     * Split only newlines that alias expansion INTRODUCED -- if `src` already
+     * had one it came from the reader joining a multi-line quoted string, and
+     * that newline is part of a string literal. Quotes are tracked for the same
+     * reason: `alias x='echo "a<newline>b"'` is still one command. */
+    if (abuf && line_src == abuf && !shell_text_has_newline(src) &&
+        shell_text_has_newline(abuf)) {
+        char *p = abuf;
+        while (p && *p) {
+            char *nl = shell_unquoted_newline(p);
+            if (nl) *nl = '\0';
+            if (*shell_skip_blanks(p)) execute_line_text_inner(p);
+            if (g_shell_flow != SHELL_FLOW_NONE) break;
+            p = nl ? nl + 1 : 0;
+        }
+    } else {
+        execute_line_text_inner(line_src);
+    }
     g_exec_line_depth--;
     if (abuf) kfree(abuf);
 }
