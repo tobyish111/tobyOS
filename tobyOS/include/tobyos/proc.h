@@ -742,6 +742,14 @@ int proc_create_kernel(void (*entry)(void), const char *name);
  * fd0/fd1/fd2 are inherited via file_clone() -- the caller keeps its
  * own ref and must file_close() it separately. Returns the new pid on
  * success, or -1 on failure. */
+/* A descriptor to install in the child at a CHOSEN number. fd0..fd2 (and the
+ * fd3/fd4 chrome preopens) cover the fixed slots; this covers the rest, which
+ * is what a shell needs for `exec 3>file` and `cmd 8<<EOF`. */
+struct proc_fd_map {
+    int          fd;            /* number in the CHILD */
+    struct file *f;             /* caller keeps ownership; this is cloned */
+};
+
 struct proc_spec {
     const char  *path;
     const char  *name;          /* may be NULL -> derived from path */
@@ -753,6 +761,11 @@ struct proc_spec {
      * commands on fd 3 and writes responses/events on fd 4. */
     struct file *fd3;
     struct file *fd4;
+    /* Descriptors at arbitrary numbers. NULL/0 = none, which is what a
+     * zero-initialised proc_spec gives, so every existing caller is
+     * unaffected. */
+    const struct proc_fd_map *extra_fds;
+    int                       extra_nfds;
     int          argc;
     char       **argv;          /* argc strings, each NUL-terminated */
     /* Milestone 25C: optional environment vector. NULL = inherit from

@@ -337,7 +337,9 @@ static bool install_initial_fds(struct proc *p,
                                 struct file *fd1,
                                 struct file *fd2,
                                 struct file *fd3,
-                                struct file *fd4) {
+                                struct file *fd4,
+                                const struct proc_fd_map *extra,
+                                int nextra) {
     /* fd0..fd2 default to the console; fd3/fd4 are OPTIONAL preopens
      * (slice 39: chrome's --remote-debugging-pipe reads DevTools JSON on
      * fd 3 and writes it on fd 4 -- the browser-window host hands the
@@ -357,6 +359,20 @@ static bool install_initial_fds(struct proc *p,
             return false;
         }
         p->fds[i] = nf;
+    }
+
+    /* Descriptors at chosen numbers, for `exec 3>file` and `cmd 8<<EOF`.
+     * Cloned like the fixed ones, so the caller keeps its own reference. */
+    for (int i = 0; i < nextra; i++) {
+        int fd = extra[i].fd;
+        if (fd < 0 || fd >= PROC_NFDS || !extra[i].f) continue;
+        struct file *nf = file_clone(extra[i].f);
+        if (!nf) {
+            close_all_fds(p);
+            return false;
+        }
+        if (p->fds[fd]) file_close(p->fds[fd]);
+        p->fds[fd] = nf;
     }
     return true;
 }
@@ -610,6 +626,7 @@ static bool build_kstack(struct proc *p) {
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
                           struct file *fd3, struct file *fd4,
+                          const struct proc_fd_map *extra, int nextra,
                           int argc, char **argv,
                           int envc, char **envp,
                           const char *cwd_override) {
@@ -751,7 +768,7 @@ static int spawn_internal(const char *path, const char *name,
     }
 
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
-    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4)) {
+    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4, extra, nextra)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
@@ -1063,7 +1080,7 @@ static int spawn_internal(const char *path, const char *name,
 
 int proc_create_from_elf(const char *path, const char *name) {
     /* Default: console for fd 0/1/2, no argv, no envp, inherit cwd. */
-    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 /* Ring-0 kernel worker: no user half, no ELF, no fds. Same PCB + fake
@@ -1117,6 +1134,7 @@ int proc_spawn(const struct proc_spec *spec) {
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
                              spec->fd3, spec->fd4,
+                             spec->extra_fds, spec->extra_nfds,
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);

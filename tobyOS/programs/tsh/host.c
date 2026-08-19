@@ -66,6 +66,9 @@ extern int kill(pid_t pid, int sig);
 
 extern pid_t toby_spawn(const char *path, char *const argv[],
                         char *const envp[], int fd0, int fd1, int fd2);
+extern pid_t toby_spawn_ex(const char *path, char *const argv[],
+                           char *const envp[], int fd0, int fd1, int fd2,
+                           const struct abi_spawn_fd *extra, unsigned nextra);
 
 /* Caps for the argv/envp copy in proc_spawn. shell.c enforces its own ARG_MAX
  * before it gets here; these only bound the stack arrays. */
@@ -503,8 +506,23 @@ int proc_spawn(const struct proc_spec *spec) {
     for (int i = 0; i < e; i++) envp[i] = spec->envp[i];
     envp[e] = 0;
 
-    return (int)toby_spawn(spec->path, argv, spec->envp ? envp : 0,
-                           fd0, fd1, fd2);
+    /* Descriptors above 2 travel as (child fd, parent fd) pairs. The shell
+     * side holds struct file*; here they are already real descriptors, so the
+     * mapping is just VF_FD. */
+    struct abi_spawn_fd extra[ABI_SPAWN_EXTRA_MAX];
+    unsigned nextra = 0;
+    for (int i = 0; i < spec->extra_nfds && nextra < ABI_SPAWN_EXTRA_MAX; i++) {
+        struct file *f = spec->extra_fds[i].f;
+        if (!f) continue;
+        int pfd = VF_FD(&f->vfs);
+        if (pfd < 0) continue;
+        extra[nextra].child_fd  = spec->extra_fds[i].fd;
+        extra[nextra].parent_fd = pfd;
+        nextra++;
+    }
+
+    return (int)toby_spawn_ex(spec->path, argv, spec->envp ? envp : 0,
+                              fd0, fd1, fd2, nextra ? extra : 0, nextra);
 }
 
 int proc_wait(int pid) {

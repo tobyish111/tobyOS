@@ -1592,6 +1592,15 @@ struct abi_stat {
  * child is enqueued and ready to run. Use SYS_WAITPID to block on
  * the child's exit.
  */
+/* One descriptor above 2, handed to the child at a chosen number. `parent_fd`
+ * names a descriptor in the CALLER's table; the kernel clones it. */
+struct abi_spawn_fd {
+    int child_fd;
+    int parent_fd;
+};
+
+#define ABI_SPAWN_EXTRA_MAX 16      /* bound on nextra, so the copy-in is finite */
+
 struct abi_spawn_req {
     const char         *path;
     char *const        *argv;       /* NULL-terminated */
@@ -1600,6 +1609,12 @@ struct abi_spawn_req {
     int                 fd1;
     int                 fd2;
     uint32_t            flags;
+    /* Descriptors above 2. Appended, and zero means NONE, so a caller that
+     * predates these fields is unaffected -- which is the only reason it is
+     * safe to grow a struct the syscall layer copies in wholesale. A shell
+     * needs them for `exec 3>file` and `cmd 8<<EOF`; nothing else passes any. */
+    uint32_t                    nextra;
+    const struct abi_spawn_fd  *extra;
 };
 
 /* fd0/fd1/fd2 sentinels for spawn_req. */

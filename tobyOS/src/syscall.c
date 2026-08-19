@@ -3246,15 +3246,63 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         return -ABI_EBADF;
     }
 
+    /* Descriptors above 2, if the caller asked for any. Each is cloned like
+     * fd0/1/2 and released below, whatever the outcome -- install_initial_fds
+     * clones again into the child. */
+    struct proc_fd_map kextra[ABI_SPAWN_EXTRA_MAX];
+    int nextra = 0;
+    if (kreq.nextra) {
+        if (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra) {
+            if (f0) file_close(f0);
+            if (f1) file_close(f1);
+            if (f2) file_close(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return -ABI_EINVAL;
+        }
+        struct abi_spawn_fd uex[ABI_SPAWN_EXTRA_MAX];
+        if (copy_from_user(uex, kreq.extra,
+                           sizeof(uex[0]) * kreq.nextra) != 0) {
+            if (f0) file_close(f0);
+            if (f1) file_close(f1);
+            if (f2) file_close(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return -ABI_EFAULT;
+        }
+        for (uint32_t i = 0; i < kreq.nextra; i++) {
+            int cfd = uex[i].child_fd, pfd = uex[i].parent_fd;
+            if (cfd < 0 || cfd >= PROC_NFDS ||
+                pfd < 0 || pfd >= PROC_NFDS || !ptab || !ptab[pfd]) {
+                failed = true;
+                break;
+            }
+            struct file *cl = file_clone(ptab[pfd]);
+            if (!cl) { failed = true; break; }
+            kextra[nextra].fd = cfd;
+            kextra[nextra].f  = cl;
+            nextra++;
+        }
+        if (failed) {
+            for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
+            if (f0) file_close(f0);
+            if (f1) file_close(f1);
+            if (f2) file_close(f2);
+            free_kvec(kargv); free_kvec(kenvp);
+            return -ABI_EBADF;
+        }
+    }
+
     struct proc_spec spec = {
         .path = kpath, .name = 0,
         .fd0 = f0, .fd1 = f1, .fd2 = f2,
+        .extra_fds = nextra ? kextra : 0,
+        .extra_nfds = nextra,
         .argc = kargc, .argv = kargv,
         .envc = kenvc, .envp = kenvp,
         .sandbox_profile = 0,
         .cwd = 0,
     };
     int pid = proc_spawn(&spec);
+    for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
 
     /* Whether spawn succeeded or not, our k-copies of argv/envp have
      * already been deep-copied onto the child's user stack and are no

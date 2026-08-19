@@ -7595,7 +7595,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            struct file *fd0,
                                            struct file *fd1,
                                            struct file *fd2,
-                                           int envc, char **envp) {
+                                           int envc, char **envp,
+                                           const struct proc_fd_map *extra,
+                                           int nextra) {
     char path_buf[64];
     const char *path = resolve_program(path_arg, path_buf, sizeof(path_buf));
 
@@ -7603,6 +7605,8 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         .path = path,
         .name = argv[0],
         .fd0  = fd0, .fd1 = fd1, .fd2 = fd2,
+        .extra_fds = nextra ? extra : 0,
+        .extra_nfds = nextra,
         .argc = argc,
         .argv = argv,
         .envc = envc,
@@ -7644,7 +7648,7 @@ static void shell_spawn_program(const char *path_arg, int argc, char **argv,
                                              /*profile=*/0,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
-                                             g_envc, g_env);
+                                             g_envc, g_env, 0, 0);
     shell_set_status(rc);
 }
 
@@ -7655,7 +7659,7 @@ static void shell_spawn_program_profile(const char *path_arg, int argc,
                                              profile,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
-                                             g_envc, g_env);
+                                             g_envc, g_env, 0, 0);
     shell_set_status(rc);
 }
 
@@ -10595,6 +10599,23 @@ struct shell_fd_state {
     bool owned[SHELL_FD_MAX];
 };
 
+/* Collect the descriptors above 2 that a command has open, as the child-fd
+ * mapping proc_spawn wants. This is what makes `exec 3>file` and `cmd 8<<EOF`
+ * reach the program: fd 3+ were built correctly and then never handed over,
+ * because spawn only ever carried three. */
+static int shell_fd_state_extra(const struct shell_fd_state *st,
+                                struct proc_fd_map *out, int max) {
+    int n = 0;
+    if (!st) return 0;
+    for (int i = 3; i < SHELL_FD_MAX && n < max; i++) {
+        if (!st->fd[i]) continue;
+        out[n].fd = i;
+        out[n].f  = st->fd[i];
+        n++;
+    }
+    return n;
+}
+
 struct shell_io_frame {
     struct file *old_fd[SHELL_FD_MAX];
     bool owned[SHELL_FD_MAX];
@@ -11128,11 +11149,13 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         return 1;
     }
 
+    struct proc_fd_map xfd[SHELL_FD_MAX];
+    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX);
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
                                              fds.fd[0], fds.fd[1], fds.fd[2],
-                                             envc, envp);
+                                             envc, envp, xfd, nxfd);
     shell_fd_state_close_owned(&fds);
     return rc;
 }
@@ -11278,9 +11301,13 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 
     char path_buf[64];
     const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
+    struct proc_fd_map xfd[SHELL_FD_MAX];
+    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX);
     struct proc_spec spec = {
         .path = path, .name = argv[0],
         .fd0 = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
+        .extra_fds = nxfd ? xfd : 0,
+        .extra_nfds = nxfd,
         .argc = argc, .argv = argv,
         .envc = envc, .envp = envp,
         .cwd = shell_cwd(),
