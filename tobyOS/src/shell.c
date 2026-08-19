@@ -201,6 +201,7 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap);
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
+static void shell_case_unquote(char *pat);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
@@ -8245,7 +8246,26 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             char strip_op = *op++;
             bool greedy = (*op == strip_op);
             if (greedy) op++;
-            const char *pattern = op;
+            /* QUOTES IN THE PATTERN MAKE IT LITERAL, and the raw text was
+             * being matched with its quote marks still in it:
+             *
+             *     var='[foo]'
+             *     echo ${var#"["}      bash: foo]     tsh: [foo]
+             *
+             * tsh compared the three characters `"`, `[`, `"` against the
+             * value. `case` already had this right -- shell_case_unquote
+             * removes the quotes and escapes whatever was inside them, so a
+             * quoted `[` reaches the matcher as a literal rather than as the
+             * start of a bracket expression. Same job here. */
+            char patbuf[SHELL_PARSE_BUF_MAX];
+            size_t plen = strlen(op);
+            if (plen + 1 > sizeof patbuf) {
+                kprintf("shell: pattern too long\n");
+                return -1;
+            }
+            memcpy(patbuf, op, plen + 1);
+            shell_case_unquote(patbuf);
+            const char *pattern = patbuf;
 
             char value[SHELL_PARSE_BUF_MAX];
             bool is_set = false;
@@ -9503,6 +9523,38 @@ static bool shell_has_glob(const char *s) {
     return false;
 }
 
+/* The twelve POSIX character classes, matched by name. ASCII only, which is
+ * what this shell's byte-oriented patterns can express. */
+static bool shell_class_match(const char *name, size_t n, char c) {
+    unsigned char u = (unsigned char)c;
+    bool upper = (u >= 'A' && u <= 'Z');
+    bool lower = (u >= 'a' && u <= 'z');
+    bool digit = (u >= '0' && u <= '9');
+    bool space = (c == ' ' || c == '\t' || c == '\n' ||
+                  c == '\v' || c == '\f' || c == '\r');
+    bool print = (u >= 0x20 && u < 0x7F);
+
+    struct { const char *nm; bool val; } t[] = {
+        { "alpha",  upper || lower },
+        { "digit",  digit },
+        { "alnum",  upper || lower || digit },
+        { "upper",  upper },
+        { "lower",  lower },
+        { "space",  space },
+        { "blank",  c == ' ' || c == '\t' },
+        { "print",  print },
+        { "graph",  print && c != ' ' },
+        { "cntrl",  u < 0x20 || u == 0x7F },
+        { "punct",  print && c != ' ' && !upper && !lower && !digit },
+        { "xdigit", digit || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F') },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        if (strlen(t[i].nm) == n && strncmp(t[i].nm, name, n) == 0)
+            return t[i].val;
+    }
+    return false;                       /* unknown class matches nothing */
+}
+
 static bool shell_glob_bracket(const char **pp, char c) {
     const char *p = *pp + 1;   /* skip '[' */
     bool negate = false;
@@ -9523,6 +9575,21 @@ static bool shell_glob_bracket(const char **pp, char c) {
             closed = true;
             p++;
             break;
+        }
+        /* POSIX character class, [:alpha:] and friends. Without this the
+         * whole construct was read as the ordinary characters `[`, `:`, `a`,
+         * ... so `${s%[[:alpha:]]}` stripped nothing and a `case` arm using a
+         * class never matched. */
+        if (p[0] == '[' && p[1] == ':') {
+            const char *cls = p + 2;
+            const char *end = cls;
+            while (*end && *end != ':') end++;
+            if (end[0] == ':' && end[1] == ']') {
+                size_t n = (size_t)(end - cls);
+                if (shell_class_match(cls, n, c)) matched = true;
+                p = end + 2;
+                continue;
+            }
         }
         if (p[1] == '-' && p[2] && p[2] != ']') {
             char lo = p[0];
