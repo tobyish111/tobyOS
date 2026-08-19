@@ -146,7 +146,14 @@ def main():
             print('  gained %s  %-9s %-22s %s'
                   % (c, host.get(c, {}).get('class', '?'), m.get('file', '?'),
                      m.get('name', '')[:44]))
-    if not same_log:
+    # Only archive a COMPLETE run. The gate prints its MAP lines before the
+    # VERDICT, so a report run against a log still being written parses fine,
+    # archives a partial result, and the next comparison is against garbage --
+    # which is what silently ate the diff three times, at 18 minutes a run.
+    complete = 'OILSPEC] VERDICT' in open(LOG, 'rb').read().decode('utf-8', 'replace')
+    if not complete:
+        print('  (run incomplete -- not archiving; diff would be meaningless)')
+    if not same_log and complete:
         with open(prev_path, 'w', encoding='utf-8') as f:
             json.dump({'log': fingerprint, 'results': results}, f)
 

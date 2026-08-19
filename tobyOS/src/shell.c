@@ -10091,6 +10091,39 @@ static int shell_run_function(struct shell_simple *cmd) {
     return rc;
 }
 
+#ifdef SHELL_HOSTED
+/* Run `text` in a forked copy of this shell, in the background.
+ *
+ * This is how a shell backgrounds anything it cannot hand to exec: a builtin,
+ * a function, a brace group. The child inherits the whole shell state by
+ * virtue of being a copy, runs the text, and _exits with its status; the
+ * parent records the job so `wait`, `wait $!` and `wait %1` can find it.
+ *
+ * Hosted only. The kernel shell is a kernel thread and forking it would not
+ * mean the same thing, so it keeps refusing -- loudly, as before. */
+/* pid_t is not in scope here -- this file speaks the kernel headers.
+ * libtoby's pid_t is int, so the declaration is ABI-identical. */
+extern int fork(void);
+extern void _exit(int status);
+
+static int shell_background_forked(const char *text, const char *label) {
+    int pid = fork();
+    if (pid < 0) {
+        kprintf("%s: cannot fork to background\n", label ? label : "shell");
+        return 1;
+    }
+    if (pid == 0) {
+        execute_line_text(text);
+        int st = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+        _exit(st & 0xff);
+    }
+    g_last_bg_pid = (int)pid;
+    jobs_add((int)pid, label ? label : text);
+    return 0;
+}
+#endif
+
 static int shell_run_single(struct shell_simple *cmd, bool background) {
     int assignc = 0;
     while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
@@ -10171,15 +10204,29 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
                                     false);
         if (brc >= 0) return brc;
     } else {
-        if (shell_function_lookup(exec_cmd.argv[0])) {
-            kprintf("'%s': shell functions can't be backgrounded with '&'\n",
-                    exec_cmd.argv[0]);
+        bool is_fn = shell_function_lookup(exec_cmd.argv[0]) != 0;
+        bool is_bi = shell_cmd_lookup(exec_cmd.argv[0]) != 0;
+        if (is_fn || is_bi) {
+#ifdef SHELL_HOSTED
+            /* Fork and run it there -- see shell_background_forked. Rebuild
+             * the command text from argv: the caller has already split it,
+             * and the child re-parses, which keeps this to one mechanism. */
+            char line[SHELL_PARSE_BUF_MAX];
+            size_t o = 0;
+            for (int i = 0; i < exec_cmd.argc; i++) {
+                size_t n = strlen(exec_cmd.argv[i]);
+                if (o + n + 2 >= sizeof line) break;
+                if (o) line[o++] = ' ';
+                memcpy(line + o, exec_cmd.argv[i], n);
+                o += n;
+            }
+            line[o] = '\0';
+            return shell_background_forked(line, exec_cmd.argv[0]);
+#else
+            kprintf("'%s': %s can't be backgrounded with '&'\n",
+                    exec_cmd.argv[0], is_fn ? "shell functions" : "builtins");
             return 1;
-        }
-        if (shell_cmd_lookup(exec_cmd.argv[0])) {
-            kprintf("'%s': builtins can't be backgrounded with '&'\n",
-                    exec_cmd.argv[0]);
-            return 1;
+#endif
         }
     }
 
@@ -11839,6 +11886,27 @@ static bool shell_try_subshell_command(const char *src) {
     struct shell_simple redirs;
     shell_simple_init(&redirs);
     const char *tail = shell_skip_blanks(body_end + 1);
+
+    /* `( ... ) &` -- background the whole compound.
+     *
+     * Only redirections were accepted after `( ... )`, so a trailing `&`
+     * was a syntax error and the compound never ran at all. That is
+     * also why the corpus saw `wait $!` return 127: not a broken
+     * wait, a job that was never created because its command failed
+     * to parse. */
+    if (tail[0] == '&' && tail[1] != '&') {
+        const char *after = shell_skip_blanks(tail + 1);
+        if (!*after || *after == ';') {
+#ifdef SHELL_HOSTED
+            shell_set_status(shell_background_forked(body, "subshell"));
+#else
+            kprintf("subshell: can't be backgrounded in the kernel shell\n");
+            shell_set_status(1);
+#endif
+            return true;
+        }
+    }
+
     if (*tail) {
         struct shell_token tok[SHELL_TOKEN_MAX];
         char words[SHELL_PARSE_BUF_MAX];
@@ -11960,6 +12028,27 @@ static bool shell_try_group_command(const char *src) {
     struct shell_simple redirs;
     shell_simple_init(&redirs);
     const char *tail = shell_skip_blanks(body_end + 1);
+
+    /* `{ ...; } &` -- background the whole compound.
+     *
+     * Only redirections were accepted after `{ ...; }`, so a trailing `&`
+     * was a syntax error and the compound never ran at all. That is
+     * also why the corpus saw `wait $!` return 127: not a broken
+     * wait, a job that was never created because its command failed
+     * to parse. */
+    if (tail[0] == '&' && tail[1] != '&') {
+        const char *after = shell_skip_blanks(tail + 1);
+        if (!*after || *after == ';') {
+#ifdef SHELL_HOSTED
+            shell_set_status(shell_background_forked(body, "group"));
+#else
+            kprintf("group: can't be backgrounded in the kernel shell\n");
+            shell_set_status(1);
+#endif
+            return true;
+        }
+    }
+
     if (*tail) {
         struct shell_token tok[SHELL_TOKEN_MAX];
         char words[SHELL_PARSE_BUF_MAX];
