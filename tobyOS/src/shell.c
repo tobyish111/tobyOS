@@ -4558,10 +4558,16 @@ static int shell_collect_heredoc(char **pp, const char *delim,
             return prc;
         }
 
-        const char *emit = line_start;
+        /* <<- strips leading TABS from the body too, not just from the line
+         * the delimiter is on. Only the delimiter match stripped them, so the
+         * here-document ended in the right place and then emitted the tabs. */
+        const char *raw = line_start;
+        if (strip_tabs) while (*raw == '\t') raw++;
+
+        const char *emit = raw;
         char expanded[LINE_MAX * 2];
         if (!quoted) {
-            if (shell_expand_literal_quotes(line_start, expanded,
+            if (shell_expand_literal_quotes(raw, expanded,
                                             sizeof(expanded)) < 0) {
                 kfree(body);
                 return -1;
@@ -5859,29 +5865,55 @@ static bool g_printf_bad_num;
 
 static bool printf_is_blank(char c) { return c == ' ' || c == '\t'; }
 
+/* The unsigned view of the last operand printf_arg_int parsed. %u wants the
+ * two's complement of the magnitude, which is why
+ * `printf '%u' -18446744073709551615` is 1 rather than an error. */
+static unsigned long g_printf_last_u64;
+
 static long printf_arg_int(int argc, char **argv, int *argi) {
+    g_printf_last_u64 = 0;
     if (*argi >= argc) return 0;
     const char *s = argv[(*argi)++];
 
     /* POSIX XCU: a leading ' or " means "the numeric value of the next
      * character". Extra characters after it are ignored, not an error. */
-    if (*s == '\'' || *s == '"') return (long)(unsigned char)s[1];
+    if (*s == '\'' || *s == '"') {
+        g_printf_last_u64 = (unsigned long)(unsigned char)s[1];
+        return (long)(unsigned char)s[1];
+    }
 
     while (printf_is_blank(*s)) s++;
-    long v = 0;
-    bool neg = false;
-    bool any = false;
+    /* Magnitude in UNSIGNED 64-bit. Accumulating into a signed long overflowed
+     * -- undefined behaviour that happened to print 0 and -1 for the two
+     * extremes the corpus tests -- and never reported a problem. */
+    unsigned long mag = 0;
+    bool neg = false, any = false, over = false;
     if (*s == '-') { neg = true; s++; }
     else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9') {
-        v = v * 10 + (*s - '0');
-        s++;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        unsigned long d = (unsigned long)(*s - '0');
+        if (mag > (~0ul - d) / 10ul) over = true;      /* would wrap */
+        else mag = mag * 10ul + d;
         any = true;
     }
     while (printf_is_blank(*s)) s++;
-    /* Trailing garbage, or no digits at all: print what we have, fail later. */
     if (*s != '\0' || !any) g_printf_bad_num = true;
-    return neg ? -v : v;
+
+    if (over) {
+        /* Beyond 64 bits entirely: saturate and say so. */
+        g_printf_bad_num = true;
+        g_printf_last_u64 = neg ? 1ul : ~0ul;
+        return neg ? (long)(1ul << 63) : (long)(~0ul >> 1);
+    }
+
+    g_printf_last_u64 = neg ? (unsigned long)(0ul - mag) : mag;
+
+    /* %d saturates at the signed bounds and reports failure, which is what
+     * bash does -- the value is still printed. */
+    const unsigned long SMAX = ~0ul >> 1;            /* 2^63 - 1 */
+    if (!neg && mag > SMAX) { g_printf_bad_num = true; return (long)SMAX; }
+    if (neg && mag > SMAX + 1ul) { g_printf_bad_num = true; return (long)(SMAX + 1ul); }
+    return neg ? -(long)mag : (long)mag;
 }
 
 /* printf's %f/%e/%g without floating point.
@@ -6233,9 +6265,11 @@ static void cmd_printf(int argc, char **argv) {
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'u') {
                 /* Two's complement, not "absolute value without a sign":
-                 * `printf '%u' -42` is 18446744073709551574 everywhere. */
-                long sv = printf_arg_int(argc, argv, &argi);
-                unsigned long uv = (unsigned long)sv;
+                 * `printf '%u' -42` is 18446744073709551574 everywhere. Read
+                 * the UNSIGNED view -- the signed return has been saturated
+                 * for %d's benefit and would print the wrong thing here. */
+                (void)printf_arg_int(argc, argv, &argi);
+                unsigned long uv = g_printf_last_u64;
                 char buf[32];
                 int blen = 0;
                 if (uv == 0) buf[blen++] = '0';
@@ -7106,6 +7140,11 @@ struct shell_token {
      * word must survive whatever IFS happens to be, which is why
      * `IFS=o; echo hi` used to try to run /bin/ech. */
     bool expanded;
+    /* True if the word was written as `name=...` in the SOURCE. Only then do
+     * the declaration utilities treat it as an assignment and skip field
+     * splitting -- `export ex=$words` does not split, `export $arg` does,
+     * even when $arg holds the very same `ex=a b c`. */
+    bool assign_src;
     int fd;
 };
 
@@ -7341,6 +7380,19 @@ static void shell_capture_kputc(void *ctx, char c) {
     shell_capture_char((struct shell_capture *)ctx, c);
 }
 
+/* How many double-quote spans enclose the text being expanded right now.
+ *
+ * It decides one thing: whether quotes inside the WORD of ${x:-WORD} are shell
+ * syntax. Unquoted they are, so `echo ${u:-'a'}` prints a; inside double
+ * quotes they are ordinary bytes, so `echo "${u:-'a'}"` prints 'a'. tsh
+ * printed `a` for both.
+ *
+ * A counter rather than a parameter because shell_expand_var has six call
+ * sites that would all have to thread it through, and it is cleared -- not
+ * merely decremented -- across command substitution, whose body is a fresh
+ * script with its own quoting context. */
+static int g_dq_depth;
+
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
 
@@ -7466,7 +7518,11 @@ static int shell_expand_command_subst(const char **pp, char *buf,
         kprintf("shell: bad command substitution\n");
         return -1;
     }
-    if (shell_capture_command(cmd, out, sizeof(out)) < 0) return -1;
+    int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
+    g_dq_depth = 0;
+    int crc = shell_capture_command(cmd, out, sizeof(out));
+    g_dq_depth = saved_dq;
+    if (crc < 0) return -1;
     return shell_append_str(buf, pos, cap, out);
 }
 
@@ -7478,8 +7534,29 @@ static int shell_expand_backtick(const char **pp, char *buf,
 
     char cmd[LINE_MAX];
     size_t cpos = 0;
+    /* POSIX 2.6.3: within `...`, a backslash RETAINS ITS LITERAL MEANING
+     * except when followed by `$`, a backtick, or another backslash. This
+     * dropped every backslash, so `echo \z` inside backticks printed `z`
+     * where every other shell prints `\z` -- and the escaped-backtick form,
+     * the only way to nest backticks at all, never terminated in the right
+     * place. The rule does not change inside double quotes. */
+    /* Inside double quotes `"` joins the removal set, because the
+     * double-quote layer reaches the backslash first. This is the difference
+     * between `echo "x `echo \"hi\"`"` (prints x hi) and the same thing
+     * written with $( ) (prints x "hi"); all shells agree, and unquoted the
+     * backslash is retained. */
+    const bool dq = (g_dq_depth > 0);
     while (*p && *p != '`') {
-        if (*p == '\\' && p[1]) p++;
+        if (*p == '\\' && (p[1] == '$' || p[1] == '`' || p[1] == '\\' ||
+                            (dq && p[1] == '"'))) {
+            p++;                          /* removed: the next byte is data */
+        } else if (*p == '\\' && p[1]) {
+            if (cpos + 2 >= sizeof(cmd)) {
+                kprintf("shell: command substitution too long\n");
+                return -1;
+            }
+            cmd[cpos++] = *p++;           /* retained: BOTH bytes are data */
+        }
         if (cpos + 1 >= sizeof(cmd)) {
             kprintf("shell: command substitution too long\n");
             return -1;
@@ -7495,7 +7572,13 @@ static int shell_expand_backtick(const char **pp, char *buf,
     *pp = p;
 
     char out[SHELL_PARSE_BUF_MAX];
-    if (shell_capture_command(cmd, out, sizeof(out)) < 0) return -1;
+    /* The body is a fresh script. Whatever quotes enclose the backticks do not
+     * enclose the commands inside them. */
+    int saved_dq = g_dq_depth;
+    g_dq_depth = 0;
+    int rc = shell_capture_command(cmd, out, sizeof(out));
+    g_dq_depth = saved_dq;
+    if (rc < 0) return -1;
     return shell_append_str(buf, pos, cap, out);
 }
 
@@ -7641,14 +7724,14 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
  * SHELL_ARG_MARK carries "$@" word boundaries; quote REMOVAL is correct on its
  * own and is what most of these expansions actually need. */
 static int shell_expand_word_ex(const char *word, char *out, size_t cap,
-                               bool quotes_are_syntax) {
+                               bool dq_syntax, bool sq_syntax) {
     const char *p = word ? word : "";
     size_t pos = 0;
     if (!out || cap == 0) return -1;
     out[0] = '\0';
 
     while (*p) {
-        if (quotes_are_syntax && *p == '\'') {   /* literal to next quote */
+        if (sq_syntax && *p == '\'') {           /* literal to next quote */
             p++;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '\'') {
@@ -7658,8 +7741,9 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
             if (*p == '\'') p++;
             continue;
         }
-        if (quotes_are_syntax && *p == '"') {    /* expands, quotes removed */
+        if (dq_syntax && *p == '"') {            /* expands, quotes removed */
             p++;
+            g_dq_depth++;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
                 if (*p == '$') {
@@ -7675,6 +7759,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                                    p[1] == '$'  || p[1] == '`')) p++;
                 if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
             }
+            g_dq_depth--;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '"') p++;
             continue;
@@ -7687,7 +7772,19 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
             if (shell_expand_backtick(&p, out, &pos, cap) < 0) return -1;
             continue;
         }
-        if (*p == '\\' && p[1]) p++;
+        if (*p == '\\' && p[1]) {
+            if (dq_syntax) {
+                p++;              /* unquoted word: escape, next byte literal */
+            } else if (p[1] == '$' || p[1] == '`' ||
+                       p[1] == '\\' || p[1] == '\n') {
+                p++;              /* here-doc body: special only before these */
+            } else {
+                /* here-doc body: an ORDINARY backslash. Both bytes are data,
+                 * so `\"` stays `\"` -- dropping it made every escaped quote
+                 * in a here-document come out bare. */
+                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            }
+        }
         if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
     }
     out[pos] = '\0';
@@ -7696,7 +7793,13 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
 
 /* The WORD of ${name-WORD}: quotes are shell syntax and are removed. */
 static int shell_expand_param_word(const char *word, char *out, size_t cap) {
-    return shell_expand_word_ex(word, out, cap, true);
+    /* The two quote characters get different answers inside double quotes:
+     *
+     *     "${Unset:-'a b c'}"   ->  'a b c'   single quotes are ORDINARY BYTES
+     *     "${Unset:-"a b c"}"   ->   a b c    double quotes are still syntax
+     *
+     * Unquoted, both are syntax. See g_dq_depth. */
+    return shell_expand_word_ex(word, out, cap, true, g_dq_depth == 0);
 }
 
 /* A here-document body line, or the inside of $(( )): $ and ` still expand,
@@ -7705,7 +7808,7 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
  * handed its text with quotes intact. Sharing one expander with the ${...}
  * word above is what briefly made both of those wrong. */
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap) {
-    return shell_expand_word_ex(word, out, cap, false);
+    return shell_expand_word_ex(word, out, cap, false, false);
 }
 
 /* Copy `src` to `dst`, dropping split-protection markers. Called wherever a
@@ -8486,7 +8589,13 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     return shell_append_str(buf, pos, cap, val);
 }
 
-static bool g_tok_word_expanded;   /* set while the current word is built */
+static bool g_tok_word_expanded;
+
+/* True while the tokenizer is building a word that began, in the SOURCE,
+ * with `name=`. Recorded on the token because the splitter sees only the
+ * expanded text, where `ex=a b c` from a variable is indistinguishable
+ * from a literal `ex=a b c` -- and bash splits the first, not the second. */
+static bool g_tok_word_assign_src;
 
 static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
                                enum shell_tok_type type, char *text,
@@ -8499,6 +8608,7 @@ static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
     tok[*ntok].text = text;
     tok[*ntok].quoted = quoted;
     tok[*ntok].expanded = g_tok_word_expanded;
+    tok[*ntok].assign_src = g_tok_word_assign_src;
     tok[*ntok].fd = fd;
     (*ntok)++;
     return 0;
@@ -8590,6 +8700,19 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
         bool got = false;
         bool word_quoted = false;
         g_tok_word_expanded = false;
+        /* Look at the RAW text: a leading `name=` makes this an assignment
+         * word. After expansion the same shape can arrive from a variable's
+         * value, and that is NOT an assignment -- see g_tok_word_assign_src. */
+        g_tok_word_assign_src = false;
+        {
+            const char *a = p;
+            if ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') || *a == '_') {
+                a++;
+                while ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') ||
+                       (*a >= '0' && *a <= '9') || *a == '_') a++;
+                if (*a == '=') g_tok_word_assign_src = true;
+            }
+        }
         while (*p && !is_space(*p) && !shell_operator_char(*p)) {
             got = true;
             if (*p == '$' && p[1] == '\'') {
@@ -8663,6 +8786,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
             if (*p == '"') {
                 word_quoted = true;
                 p++;
+                g_dq_depth++;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
                         /* POSIX 2.2.3: inside double quotes a backslash is
@@ -8698,6 +8822,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                         }
                     }
                 }
+                g_dq_depth--;
                 if (*p != '"') {
                     kprintf("shell: unmatched double quote\n");
                     return -1;
@@ -8911,6 +9036,12 @@ static const char *shell_expand_aliases(const char *src, char *buf,
      * symptom of `alias echo='echo foo'`. */
     (void)tmp;
     g_alias_depth = 0;
+    /* Alias expansion runs once per line, before anything else, so this is the
+     * one place that reliably sees a line boundary. An expansion that failed
+     * mid-way through a double-quoted span -- an unmatched quote, a word that
+     * grew too long -- returns without decrementing, and a leaked depth would
+     * make the NEXT line treat ${x:-'a'} as if it were quoted. */
+    g_dq_depth = 0;
     if (shell_expand_aliases_once(cur, buf, cap, &changed) < 0) {
         kprintf("alias: expansion too long\n");
         return 0;
@@ -9257,6 +9388,16 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     return 0;
 }
 
+/* The utilities whose arguments are variable assignments rather than words.
+ * POSIX names export and readonly; the rest are the bash spellings tsh already
+ * implements, and they follow the same rule. */
+static bool shell_is_declaration_utility(const char *name) {
+    if (!name) return false;
+    return strcmp(name, "export")  == 0 || strcmp(name, "readonly") == 0 ||
+           strcmp(name, "local")   == 0 || strcmp(name, "declare")  == 0 ||
+           strcmp(name, "typeset") == 0;
+}
+
 static bool shell_is_ifs_char(char c) {
     const char *ifs = env_get("IFS");
     if (!ifs) ifs = " \t\n";
@@ -9275,7 +9416,8 @@ static bool shell_is_ifs_white(char c) {
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted);
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
-                            const char *word, bool quoted, bool expanded);
+                            const char *word, bool quoted, bool expanded,
+                            bool assign_src);
 
 /* Split a word on the "$@" word-boundary marker and add each piece. Runs for
  * quoted words too -- that is the whole point, since `"$@"` must yield one
@@ -9339,7 +9481,8 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
 }
 
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
-                            const char *word, bool quoted, bool expanded) {
+                            const char *word, bool quoted, bool expanded,
+                            bool assign_src) {
     int mrc = shell_add_marked_words(pl, cur, word, quoted);
     if (mrc != 0) return mrc < 0 ? -1 : 0;
 
@@ -9350,8 +9493,17 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * this, `IFS=o` turns `echo` into `ech`. */
     if (!expanded) return shell_add_one_arg(pl, cur, word, false);
 
+    /* An assignment's value is expanded but NOT field split -- POSIX 2.9.1.
+     * That covers the prefix form `x=$words cmd` (argc == 0) and, because the
+     * declaration utilities take assignments as ordinary-looking arguments,
+     * `export x=$words` too. Without the second half, `export ex='a b c'`
+     * reached the builtin as three arguments: it assigned the first and then
+     * created two stray variables named after the remaining fields. */
     size_t klen = env_key_len(word);
-    if (cur->argc == 0 && word[klen] == '=' && shell_name_is_valid(word, klen)) {
+    bool assign_shaped = (word[klen] == '=' && shell_name_is_valid(word, klen));
+    if (assign_shaped &&
+        (cur->argc == 0 ||
+         (assign_src && shell_is_declaration_utility(cur->argv[0])))) {
         return shell_add_one_arg(pl, cur, word, false);
     }
 
@@ -9413,7 +9565,7 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
  * re-entry below is one: its words ARE expansion results by construction. */
 static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                          const char *word, bool quoted) {
-    return shell_add_arg_ex(pl, cur, word, quoted, true);
+    return shell_add_arg_ex(pl, cur, word, quoted, true, false);
 }
 
 static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
@@ -9542,7 +9694,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             return -1;
         }
         if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
-                             tok[*io].expanded) < 0) {
+                             tok[*io].expanded, tok[*io].assign_src) < 0) {
             return -1;
         }
         (*io)++;
@@ -11024,7 +11176,7 @@ static bool shell_try_for_command(const char *src) {
         for (int i = 0; i < ntok; i++) {
             if (tok[i].type != SH_TOK_WORD) continue;
             if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
-                                 tok[i].expanded) < 0) {
+                                 tok[i].expanded, tok[i].assign_src) < 0) {
                 kfree(wl); kfree(items);
                 shell_set_status(2);
                 return true;
@@ -12237,7 +12389,23 @@ static bool shell_run_list_line(const char *src) {
                               (prev == SH_LINK_AND && g_last_status == 0) ||
                               (prev == SH_LINK_OR  && g_last_status != 0);
             if (should_run) {
+                /* `set -e` does not act on a command that is followed by && or
+                 * || -- POSIX exempts every command in an AND-OR list except
+                 * the one after the final operator. `link` is the separator
+                 * that FOLLOWS this segment, and is SH_LINK_SEMI for the last
+                 * one, so the final command is judged normally and
+                 * `set -e; false || false` still exits.
+                 *
+                 * This is the only place the rule can live: the line is split
+                 * here, BEFORE tokenizing, so the token-level executor never
+                 * sees an operator to key off. Implementing it there instead
+                 * changed nothing at all, and `set -e; false && echo hi` kept
+                 * killing the shell. */
+                bool exempt = (sep != 0) &&
+                              (link == SH_LINK_AND || link == SH_LINK_OR);
+                if (exempt) g_errexit_suspend++;
                 execute_line_text(seg);
+                if (exempt) g_errexit_suspend--;
                 if (g_shell_flow != SHELL_FLOW_NONE) { kfree(seg); return true; }
             }
         }
@@ -12574,9 +12742,10 @@ static void execute_line_text_inner(const char *src) {
             if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
             if (g_shell_flow != SHELL_FLOW_NONE) return;
-            /* `sep` is the operator FOLLOWING this pipeline, so it is what
-             * says "this is not the last command of an AND-OR list" -- the
-             * `false` in `false && echo`. prev_link covers the other side. */
+            /* A segment reaching here has already been split off any && or ||
+             * by shell_run_list_line, which is where the AND-OR exemption
+             * lives; `sep` is all but always SH_TOK_SEMI. It is still tested
+             * because a `;`-separated list does reach this loop. */
             bool in_and_or = (prev_link == SH_TOK_AND_IF ||
                               prev_link == SH_TOK_OR_IF ||
                               sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
@@ -12710,10 +12879,15 @@ static void execute_line(void) {
             execute_line_text(g_heredoc_cmd);
             shell_heredoc_reset();
         } else {
-            const char *emit = line;
+            /* Same <<- rule as the script reader above -- these are two
+             * separate collectors and have drifted apart before. */
+            const char *raw = line;
+            if (g_heredoc_strip_tabs) while (*raw == '\t') raw++;
+
+            const char *emit = raw;
             char expanded[LINE_MAX * 2];
             if (!g_heredoc_quoted) {
-                if (shell_expand_literal_quotes(line, expanded,
+                if (shell_expand_literal_quotes(raw, expanded,
                                                 sizeof(expanded)) >= 0)
                     emit = expanded;
             }

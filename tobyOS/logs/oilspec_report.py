@@ -52,6 +52,13 @@ def main():
     man = {m['id']: m for m in json.load(
         open(os.path.join(HERE, '..', 'initrd', 'etc', 'oilspec', 'manifest.json'),
              encoding='utf-8'))}
+
+    # A FILTERED run covers a slice of the corpus, and must not be mistaken for
+    # a full one. Archiving 35 cases as "the previous run" silently narrows the
+    # next comparison to those 35 -- every other case looks unchanged because
+    # it is simply absent. That is the fifth distinct way this tool has found to
+    # lose its own diff, and the first one that leaves the numbers looking fine.
+    filtered = len(results) < len(man)
     host = {r['id']: r for r in json.load(
         open(os.path.join(HERE, 'oilspec_host.json'), encoding='utf-8'))}
 
@@ -113,6 +120,10 @@ def main():
     fingerprint = '%d:%d' % (os.path.getsize(LOG), int(os.path.getmtime(LOG)))
     same_log = False
     prev = None
+    if filtered:
+        print()
+        print('  (FILTERED run: %d of %d cases -- not archiving, and not'
+              ' touching the full failure list)' % (len(results), len(man)))
     if os.path.exists(prev_path):
         blob = json.load(open(prev_path, encoding='utf-8'))
         prev = blob.get('results', blob)
@@ -127,6 +138,13 @@ def main():
                   ' see logs/oilspec_diff.txt)')
             prev = None
     if prev is not None and os.path.exists(prev_path):
+        overlap = sum(1 for c in results if c in prev)
+        if overlap < len(results):
+            # Say it rather than let a short diff read as a quiet run.
+            print()
+            print('  WARNING: the archive covers only %d of the %d cases in'
+                  ' this run -- the diff below is PARTIAL'
+                  % (overlap, len(results)))
         flipped = [(c, prev[c], results[c]) for c in sorted(results)
                    if c in prev and prev[c] != results[c]]
         gained = [f for f in flipped if f[2] == 'P']
@@ -164,11 +182,12 @@ def main():
     complete = 'OILSPEC] VERDICT' in open(LOG, 'rb').read().decode('utf-8', 'replace')
     if not complete:
         print('  (run incomplete -- not archiving; diff would be meaningless)')
-    if not same_log and complete:
+    if not same_log and complete and not filtered:
         with open(prev_path, 'w', encoding='utf-8') as f:
             json.dump({'log': fingerprint, 'results': results}, f)
 
-    out = os.path.join(HERE, 'oilspec_failures.txt')
+    out = os.path.join(HERE, 'oilspec_failures_filtered.txt' if filtered
+                       else 'oilspec_failures.txt')
     with open(out, 'w', newline='\n', encoding='utf-8') as f:
         f.write('# id  code  class  file  case name\n')
         for stem, lst in sorted(failures.items()):
