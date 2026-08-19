@@ -12196,6 +12196,35 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
         char pat[128];
         if (shell_copy_segment(pat, sizeof(pat), start, end) == 0) {
             bool was_quoted = (end > start);
+            /* A CASE PATTERN IS EXPANDED, and the pattern is what comes out:
+             *
+             *     pat='[ab].py'
+             *     case b.py    in $pat)   -> matches, glob chars are ACTIVE
+             *     case '[ab].py' in "$pat") -> matches LITERALLY
+             *
+             * tsh matched the text `$pat` itself, so neither did. The expander
+             * marks quoted spans, and those spans become literal here; an
+             * unquoted expansion keeps its metacharacters.
+             *
+             * Only patterns that actually contain an expansion take this
+             * route. A pattern like `\*` relies on shell_case_unquote's
+             * backslash handling, which the expander would consume. */
+            if (shell_word_has(pat, '$') || shell_word_has(pat, '`')) {
+                char xp[SHELL_PARSE_BUF_MAX];
+                if (shell_expand_word_ex(pat, xp, sizeof xp, true, true) == 0) {
+                    size_t o = 0;
+                    bool prot = false;
+                    for (const char *q = xp; *q && o + 2 < sizeof pat; q++) {
+                        if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
+                        if (prot && shell_glob_meta(*q)) pat[o++] = '\\';
+                        pat[o++] = *q;
+                    }
+                    pat[o] = '\0';
+                    if (pat[0] && shell_glob_match(pat, word)) return true;
+                    if (*p == '|') p++;
+                    continue;
+                }
+            }
             shell_case_unquote(pat);
             /* An empty pattern is only meaningful if it came from quotes;
              * a genuinely blank clause is still skipped. */
