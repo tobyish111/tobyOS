@@ -7902,6 +7902,19 @@ static void shell_strip_nosplit(char *dst, size_t cap, const char *src) {
     dst[o] = '\0';
 }
 
+/* Strip the marks where they stand. The words buffer is writable and marks
+ * only ever shorten the text, so a consumer that is not the field splitter can
+ * clean its own token rather than needing a scratch buffer. Redirect targets,
+ * case patterns and `!` comparisons all read a token directly, and a mark left
+ * in one of those is a raw 0x02 byte in a FILENAME. */
+static void shell_strip_nosplit_inplace(char *s) {
+    if (!s) return;
+    char *w = s;
+    for (const char *r = s; *r; r++)
+        if (*r != SHELL_NOSPLIT_MARK) *w++ = *r;
+    *w = ' ';
+}
+
 static bool shell_has_nosplit(const char *s) {
     for (const char *p = s; *p; p++)
         if (*p == SHELL_NOSPLIT_MARK) return true;
@@ -8851,12 +8864,18 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
             if (*p == '\'') {
                 word_quoted = true;
                 p++;
+                /* Mark the span so the splitter can see where quoting starts
+                 * and stops WITHIN the word -- `$a"$b"` splits in the middle. */
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
                 while (*p && *p != '\'') {
                     if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                         kprintf("shell: word too long\n");
                         return -1;
                     }
                 }
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '\'') {
                     kprintf("shell: unmatched single quote\n");
                     return -1;
@@ -8868,6 +8887,8 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 word_quoted = true;
                 p++;
                 g_dq_depth++;
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
                         /* POSIX 2.2.3: inside double quotes a backslash is
@@ -8904,6 +8925,8 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                     }
                 }
                 g_dq_depth--;
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
                     kprintf("shell: unmatched double quote\n");
                     return -1;
@@ -9524,9 +9547,22 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         while (*p && *p != SHELL_ARG_MARK) p++;
         size_t n = (size_t)(p - start);
 
-        /* Exactly one marker with nothing after it is the zero-parameter
-         * encoding, not a parameter that happens to be empty. */
-        if (n == 0 && emitted == 0 && *p == '\0') break;
+        /* Exactly one marker with NO REAL TEXT after it is the zero-parameter
+         * encoding, not a parameter that happens to be empty. "Real" excludes
+         * the tokenizer's quote marks: `"$@"` now arrives wrapped in a pair of
+         * them, so testing the raw length saw one byte of trailing mark and
+         * emitted an empty argument where bash emits none. */
+        size_t real = 0;
+        for (const char *q = start; q < p; q++)
+            if (*q != SHELL_NOSPLIT_MARK) real++;
+        size_t real_prefix = 0;
+        for (size_t q = 0; q < prefix_len; q++)
+            if (word[q] != SHELL_NOSPLIT_MARK) real_prefix++;
+        if (real == 0 && emitted == 0 && real_prefix == 0) {
+            const char *tail = p;
+            while (*tail == SHELL_NOSPLIT_MARK) tail++;
+            if (!*tail) break;
+        }
 
         size_t glue = (emitted == 0) ? prefix_len : 0;
         if (glue + n + 1 > sizeof(tmp)) {
@@ -9537,8 +9573,13 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         memcpy(tmp + glue, start, n);
         tmp[glue + n] = '\0';
 
+        /* The tokenizer's quote marks travel with the text; strip them here or
+         * they reach the program as raw 0x02 bytes in argv. */
+        char clean[SHELL_PARSE_BUF_MAX];
+        shell_strip_nosplit(clean, sizeof clean, tmp);
+
         char *saved = 0;
-        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
+        if (shell_pipeline_save_word(pl, clean, &saved) < 0) return -1;
         /* An unquoted "$@" still field-splits each parameter; a quoted one
          * keeps each parameter whole, spaces and all. */
         if (quoted) {
@@ -9549,14 +9590,21 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         emitted++;
     }
 
-    /* `"pre$@"` with no parameters is still the word `pre`. */
+    /* `"pre$@"` with no parameters is still the word `pre` -- but a prefix
+     * made only of quote marks is not a prefix at all. `"$@"` opens with one,
+     * so this fired for the bare form and contributed an argument where bash
+     * contributes none. */
     if (emitted == 0 && prefix_len > 0) {
         if (prefix_len + 1 > sizeof(tmp)) return -1;
         memcpy(tmp, word, prefix_len);
         tmp[prefix_len] = '\0';
-        char *saved = 0;
-        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
-        if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
+        char pre[SHELL_PARSE_BUF_MAX];
+        shell_strip_nosplit(pre, sizeof pre, tmp);
+        if (pre[0]) {
+            char *saved = 0;
+            if (shell_pipeline_save_word(pl, pre, &saved) < 0) return -1;
+            if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
+        }
     }
     return 1;
 }
@@ -9567,12 +9615,24 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
     int mrc = shell_add_marked_words(pl, cur, word, quoted);
     if (mrc != 0) return mrc < 0 ? -1 : 0;
 
-    if (quoted) return shell_add_one_arg(pl, cur, word, true);
+    /* A word quoted with no marks is `$'...'`, whose span the tokenizer does
+     * not delimit; it keeps the old all-or-nothing behaviour. Everything else
+     * lets the marks say which parts are protected. */
+    if (quoted && !shell_has_nosplit(word))
+        return shell_add_one_arg(pl, cur, word, true);
 
     /* Nothing expanded, so there is nothing to split. POSIX splits the
      * RESULTS of expansion, never the literal text of a word -- without
      * this, `IFS=o` turns `echo` into `ech`. */
-    if (!expanded) return shell_add_one_arg(pl, cur, word, false);
+    if (!expanded) {
+        if (!shell_has_nosplit(word))
+            return shell_add_one_arg(pl, cur, word, false);
+        char lit[SHELL_PARSE_BUF_MAX];
+        shell_strip_nosplit(lit, sizeof lit, word);
+        char *litsaved = 0;
+        if (shell_pipeline_save_word(pl, lit, &litsaved) < 0) return -1;
+        return shell_add_one_arg(pl, cur, litsaved, quoted);
+    }
 
     /* An assignment's value is expanded but NOT field split -- POSIX 2.9.1.
      * That covers the prefix form `x=$words cmd` (argc == 0) and, because the
@@ -9622,7 +9682,9 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
         shell_strip_nosplit(tmp, sizeof tmp, raw);
         char *saved = 0;
         if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
-        if (shell_add_one_arg(pl, cur, saved, false) < 0) return -1;
+        /* The WORD's flag, not the field's: globbing behaviour is left exactly
+         * as it was, so this change is about splitting only. */
+        if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
 
         if (!*p) break;
         /* One delimiter: optional whitespace, at most one non-whitespace
@@ -9727,6 +9789,11 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 kprintf("shell: redirection needs a path\n");
                 return -1;
             }
+            /* A redirect operand is a FILENAME, never a field to split, so the
+             * tokenizer's quote marks have to come off before anyone opens it.
+             * `> "$f"` otherwise tried to create a file whose name began with
+             * a 0x02 byte. */
+            shell_strip_nosplit_inplace(tok[*io].text);
             if (t == SH_TOK_REDIR_IN) {
                 cur->stdin_path = tok[*io].text;
                 if (shell_add_redir(cur, SH_RD_OPEN_IN, fd, tok[*io].text,
@@ -11555,6 +11622,7 @@ static int shell_expand_case_word(const char *src, char *out, size_t cap) {
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
+        shell_strip_nosplit_inplace(tok[i].text);
         size_t n = strlen(tok[i].text);
         if (n + 1 > cap) return -1;
         memcpy(out, tok[i].text, n + 1);
