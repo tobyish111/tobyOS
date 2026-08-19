@@ -1795,6 +1795,16 @@ static void cmd_set(int argc, char **argv) {
     int first = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--") == 0) { first = i + 1; break; }
+        /* POSIX: a lone `-` also ends option processing (it additionally turns
+         * -v and -x off). It was falling through to the `-` flag loop, which
+         * saw no flag letters and left it in place as a positional, so
+         * `set - a b` gave three parameters where every shell gives two. */
+        if (strcmp(argv[i], "-") == 0) {
+            g_opt_verbose = false;
+            g_opt_xtrace  = false;
+            first = i + 1;
+            break;
+        }
         if (argv[i][0] == '-' && argv[i][1] == 'o' && argv[i][2] == '\0') {
             if (i + 1 < argc) {
                 i++;
@@ -10649,17 +10659,19 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         }
     }
 
+    /* ALWAYS build the overlay, even with no assignment prefix: it is what
+     * applies the SHVAR_EXPORTED filter. Falling back to g_env handed the
+     * child the whole VARIABLE TABLE, so `x=1; env | grep x` printed x=1 and
+     * `set +a` could not un-export anything -- the flag was maintained
+     * correctly and then ignored at the one boundary that matters. */
     char *env_overlay[ENV_MAX + ARG_MAX + 1];
-    char **envp = g_env;
-    int envc = g_envc;
-    if (assignc > 0) {
-        if (shell_build_env_overlay(cmd->argv, assignc,
-                                    env_overlay, &envc) < 0) {
-            kprintf("shell: environment too large\n");
-            return 1;
-        }
-        envp = env_overlay;
+    char **envp;
+    int envc = 0;
+    if (shell_build_env_overlay(cmd->argv, assignc, env_overlay, &envc) < 0) {
+        kprintf("shell: environment too large\n");
+        return 1;
     }
+    envp = env_overlay;
 
     struct shell_fd_state fds;
     shell_fd_state_init_from_defaults(&fds);
@@ -10778,8 +10790,8 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
                                       struct file *pipe_out,
                                       int *out_pid) {
     char *env_overlay[ENV_MAX + ARG_MAX + 1];
-    char **envp = g_env;
-    int envc = g_envc;
+    char **envp;
+    int envc = 0;
 
     int assignc = 0;
     while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
@@ -10789,14 +10801,13 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
         kprintf("pipeline: assignment-only stage has no command\n");
         return 1;
     }
-    if (assignc > 0) {
-        if (shell_build_env_overlay(cmd->argv, assignc,
-                                    env_overlay, &envc) < 0) {
-            kprintf("pipeline: environment too large\n");
-            return 1;
-        }
-        envp = env_overlay;
+    /* Always: see the note at the other spawn site. The overlay is what
+     * applies the export filter, not just what merges assignment prefixes. */
+    if (shell_build_env_overlay(cmd->argv, assignc, env_overlay, &envc) < 0) {
+        kprintf("pipeline: environment too large\n");
+        return 1;
     }
+    envp = env_overlay;
 
     char *argv[ARG_MAX];
     int argc = cmd->argc - assignc;
