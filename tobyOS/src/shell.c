@@ -181,6 +181,8 @@ static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
 static struct shell_function g_functions[SHELL_FUNC_MAX];
 static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
 static int g_heredoc_count;
+/* How many of them have been consumed. See shell_heredoc_pop. */
+static int g_heredoc_head;
 static char *g_traps[SIG_MAX];
 static bool g_trap_running;
 
@@ -1020,6 +1022,7 @@ static int shell_run_exit_trap(int status) {
 
 static void shell_heredoc_reset(void) {
     g_heredoc_count = 0;
+    g_heredoc_head = 0;
     for (int i = 0; i < SHELL_HEREDOC_MAX; i++) {
         g_heredocs[i].len = 0;
         g_heredocs[i].body[0] = '\0';
@@ -1038,14 +1041,24 @@ static int shell_heredoc_push(const char *body, size_t len) {
     return 0;
 }
 
+/* Consume the next body. A HEAD INDEX, not a shift.
+ *
+ * Shifting returned `&g_heredocs[0]` and then immediately overwrote slot 0
+ * with slot 1, so the caller was handed the body AFTER the one it asked for:
+ *
+ *     cat <<-EOF; echo --; cat <<EOF2      bash: one / -- / two
+ *     <TAB>one                             tsh : two / -- / two
+ *     EOF
+ *     two
+ *     EOF2
+ *
+ * With a single here-document there is nothing to shift, which is why every
+ * ordinary use looked right. An index also keeps each body at its own address:
+ * `cmd <<EOF 3<<EOF3` pops twice and holds both pointers until the command
+ * runs, so returning a pointer to shared scratch would not do either. */
 static const struct shell_heredoc *shell_heredoc_pop(void) {
-    if (g_heredoc_count <= 0) return 0;
-    const struct shell_heredoc *h = &g_heredocs[0];
-    for (int i = 1; i < g_heredoc_count; i++) {
-        g_heredocs[i - 1] = g_heredocs[i];
-    }
-    g_heredoc_count--;
-    return h;
+    if (g_heredoc_head >= g_heredoc_count) return 0;
+    return &g_heredocs[g_heredoc_head++];
 }
 
 /* ---- cwd/path helpers ------------------------------------------- *
@@ -4530,6 +4543,25 @@ static bool shell_heredoc_line_matches(const char *line, const char *delim,
 }
 
 static int shell_collect_heredoc(char **pp, const char *delim,
+                                 bool strip_tabs, bool quoted);
+
+/* Collect every here-document body that ONE PHYSICAL LINE opens, in the order
+ * its operators appear, appending them to the queue. Returns false on failure.
+ *
+ * Per physical line because that is where the bodies are: they follow the line
+ * that opened them, ahead of any continuation or compound-command text. */
+static bool shell_collect_line_heredocs(const char *line, char **pp) {
+    struct shell_heredoc_spec hd[SHELL_HEREDOC_MAX];
+    int nhd = shell_line_find_heredocs(line, hd, SHELL_HEREDOC_MAX);
+    for (int i = 0; i < nhd; i++) {
+        if (shell_collect_heredoc(pp, hd[i].delim, hd[i].strip_tabs,
+                                  hd[i].quoted) < 0)
+            return false;
+    }
+    return true;
+}
+
+static int shell_collect_heredoc(char **pp, const char *delim,
                                  bool strip_tabs, bool quoted) {
     /* Heap, not stack: SHELL_HEREDOC_BODY_MAX is 64 KiB, and this function
      * inlines into the script reader, which gave that reader a 66 KiB frame
@@ -4790,6 +4822,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * SHELL_PARSE_BUF_MAX buffers on the stack inside execute_line_text. */
         char *accum = 0;
 
+        bool hd_failed = false;
+
         /* First, join physical lines into one LOGICAL line: a trailing
          * backslash continues, and so does an unclosed quote. Done before the
          * compound scan so that a `fi` inside an unterminated string cannot
@@ -4839,8 +4873,37 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             }
         }
 
+        /* HERE-DOCUMENT BODIES START AT THE NEXT REAL NEWLINE -- which is why
+         * this sits between the two joining passes rather than before both.
+         *
+         * A backslash-newline, or a newline inside an open quote, is not a real
+         * newline, so the body follows the LOGICAL line the pass above just
+         * built:
+         *
+         *     cat <<EOF \            cat <<EOF; echo "two
+         *     ; echo two             three"
+         *     one                    one
+         *     EOF                    EOF
+         *
+         * The newline that ends a compound's first line IS real, so the body
+         * comes before `do ... done`, not after it:
+         *
+         *     while cat <<E1 && cat <<E2
+         *     1
+         *     E1
+         *     ...
+         *     do cat <<E3; break; done
+         *
+         * Collecting after the compound scan swallowed `1` and `E1` into the
+         * command text while looking for `done`, and the hunt for E1's
+         * terminator then ran off the end of the script. Each physical line the
+         * compound scan pulls in contributes its own bodies as it is read, so
+         * they queue in the order their operators appear. */
+        shell_heredoc_reset();
+        if (!shell_collect_line_heredocs(line, &p)) hd_failed = true;
+
         int depth = shell_compound_depth(line, 0);
-        if (depth > 0) {
+        if (!hd_failed && depth > 0) {
             /* The continuation pass above may already own this buffer, with
              * `line` pointing into it; reuse it rather than allocating a
              * second one and leaking the first. */
@@ -4877,6 +4940,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 memcpy(accum + alen, sep, seplen); alen += seplen;
                 memcpy(accum + alen, nl, nllen);   alen += nllen;
                 accum[alen] = '\0';
+                /* This physical line may open here-documents of its own --
+                 * `do cat <<E3; break; done` -- whose bodies are the lines
+                 * that follow it, not part of the compound. */
+                if (!shell_collect_line_heredocs(nl, &p)) {
+                    hd_failed = true;
+                    break;
+                }
                 depth = shell_compound_depth(nl, depth);
             }
             if (overflow || depth > 0) {
@@ -4894,20 +4964,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * both writable, and the result is never longer than the input. */
         shell_normalise_separators(line);
 
-        /* Every here-document the line opens, collected in the order the
-         * operators appear -- which is the order their bodies follow, and
-         * the order the redirection code pops them off the queue. */
-        struct shell_heredoc_spec hd[SHELL_HEREDOC_MAX];
-        int nhd = shell_line_find_heredocs(line, hd, SHELL_HEREDOC_MAX);
-        shell_heredoc_reset();
-        bool hd_failed = false;
-        for (int hi = 0; hi < nhd; hi++) {
-            if (shell_collect_heredoc(&p, hd[hi].delim, hd[hi].strip_tabs,
-                                      hd[hi].quoted) < 0) {
-                hd_failed = true;
-                break;
-            }
-        }
+        /* Bodies were collected per physical line, above, as each was read. */
         if (hd_failed) {
             last = 2;
             shell_set_status(2);
@@ -9045,6 +9102,51 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                 if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
             }
             continue;
+        }
+
+        /* NEITHER A REDIRECTION NOR AN ASSIGNMENT PREFIX ENDS THE COMMAND
+         * POSITION. POSIX substitutes an alias for the COMMAND WORD, and
+         *
+         *     >out e_ 1          FOO=2 p_ FOO
+         *
+         * still have `e_` and `p_` as theirs. at_cmd was only reset at `;`,
+         * `&` and `|`, so anything else copied through cleared it and the real
+         * command word was never considered. Both prefixes are copied verbatim
+         * with at_cmd intact.
+         *
+         * A redirection's operand is copied WITH its operator, so a name in it
+         * can never be mistaken for a command word -- `>e_` is a filename. */
+        if (at_cmd) {
+            const char *r = p;
+            while (*r >= '0' && *r <= '9') r++;          /* optional fd */
+            if (*r == '<' || *r == '>') {
+                while (*r == '<' || *r == '>' || *r == '&') r++;
+                while (*r == ' ' || *r == '\t') r++;
+                while (*r && !is_space(*r) && !shell_operator_char(*r)) r++;
+                while (p < r)
+                    if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                continue;                                 /* at_cmd survives */
+            }
+
+            const char *a = p;
+            if ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') || *a == '_') {
+                a++;
+                while ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') ||
+                       (*a >= '0' && *a <= '9') || *a == '_') a++;
+                if (*a == '=') {
+                    /* Copy through the end of the assignment word, minding
+                     * quotes so that `FOO='a b' cmd` keeps its space. */
+                    bool sq = false, dq = false;
+                    while (*a && (sq || dq || !is_space(*a))) {
+                        if (*a == '\'' && !dq) sq = !sq;
+                        else if (*a == '"' && !sq) dq = !dq;
+                        a++;
+                    }
+                    while (p < a)
+                        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                    continue;                             /* at_cmd survives */
+                }
+            }
         }
 
         if (at_cmd && shell_alias_name_char(*p)) {

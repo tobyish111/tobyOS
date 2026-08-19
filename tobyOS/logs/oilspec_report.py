@@ -153,7 +153,13 @@ def main():
         # -- once by re-running the report, once by a grep that did not match --
         # and each loss cost an 18-minute run to recreate. A result that only
         # exists in a pipe is a result you can lose.
-        dpath = os.path.join(HERE, 'oilspec_diff.txt')
+        # A filtered run gets its own file. Blocking it from ARCHIVING was not
+        # enough: it still overwrote the shared diff with a 36-case comparison,
+        # which then read as the result of the full run that had not finished
+        # yet. Sixth variant of the same trap -- every one of them a partial
+        # answer wearing the same filename as the real one.
+        dpath = os.path.join(HERE, 'oilspec_diff_filtered.txt' if filtered
+                             else 'oilspec_diff.txt')
         with open(dpath, 'w', newline='\n', encoding='utf-8') as df:
             df.write('gained %d, lost %d\n' % (len(gained), len(lost)))
             for tag, rows in (('LOST', lost), ('GAINED', gained)):
