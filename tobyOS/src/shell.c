@@ -5822,6 +5822,15 @@ static void cmd_test(int argc, char **argv) {
  * bash prints rather than the one tsh used to print. */
 static bool g_printf_escape_raw;
 
+/* Set by `\c` inside %b: printf stops producing output entirely -- the rest of
+ * the operand AND the rest of the format -- and still exits 0. */
+static bool g_printf_stop;
+
+/* True while expanding a %b operand, which has a different escape dialect from
+ * the format string: an optional leading zero before the three octal digits,
+ * \x, and \c. */
+static bool g_printf_b_mode;
+
 static int printf_parse_escape(const char **pp) {
     const char *p = *pp;
     g_printf_escape_raw = false;
@@ -5829,6 +5838,45 @@ static int printf_parse_escape(const char **pp) {
     p++;
     char c = *p;
     if (!c) { *pp = p; return '\\'; }
+
+    /* Octal. In the FORMAT string it is up to three digits starting here, so
+     * `\377` is one byte 0xFF and `\0377` is \037 then a literal 7. In %b a
+     * leading zero may come first, which is what makes both `\141` and `\0141`
+     * mean `a`. Only the `\0...` spelling used to be recognised, so every
+     * three-digit escape printed its digits. */
+    if (c >= '0' && c <= '7') {
+        if (g_printf_b_mode && c == '0' && p[1] >= '0' && p[1] <= '7') p++;
+        int v = 0;
+        int i = 0;
+        for (; i < 3 && *p >= '0' && *p <= '7'; i++, p++) v = v * 8 + (*p - '0');
+        *pp = p;
+        return v & 0xFF;
+    }
+
+    if (g_printf_b_mode && (c == 'x' || c == 'X') &&
+        (((p[1] >= '0' && p[1] <= '9')) || ((p[1] | 0x20) >= 'a' &&
+                                            (p[1] | 0x20) <= 'f'))) {
+        p++;                                   /* past the x */
+        int v = 0;
+        for (int i = 0; i < 2; i++) {
+            char h = *p;
+            int d;
+            if (h >= '0' && h <= '9')                     d = h - '0';
+            else if ((h | 0x20) >= 'a' && (h | 0x20) <= 'f') d = (h | 0x20) - 'a' + 10;
+            else break;
+            v = v * 16 + d;
+            p++;
+        }
+        *pp = p;
+        return v & 0xFF;
+    }
+
+    if (g_printf_b_mode && c == 'c') {
+        g_printf_stop = true;
+        *pp = p + 1;
+        return -1;                             /* nothing more is emitted */
+    }
+
     p++;
     *pp = p;
     switch (c) {
@@ -5842,16 +5890,6 @@ static int printf_parse_escape(const char **pp) {
     case '\\': return '\\';
     case '\'': return '\'';
     case '"':  return '"';
-    case '0': {
-        /* THREE octal digits including this leading zero, so at most two
-         * more. `\\0377` is \\037 then a literal '7'; reading three digits
-         * after the zero gave 0xff and swallowed the '7'. */
-        int v = 0;
-        for (int i = 0; i < 2 && *p >= '0' && *p <= '7'; i++, p++)
-            v = v * 8 + (*p - '0');
-        *pp = p;
-        return v & 0xFF;
-    }
     default:
         g_printf_escape_raw = true;
         return c;
@@ -5870,6 +5908,10 @@ static bool printf_is_blank(char c) { return c == ' ' || c == '\t'; }
  * `printf '%u' -18446744073709551615` is 1 rather than an error. */
 static unsigned long g_printf_last_u64;
 
+/* The last operand did not fit a SIGNED 64-bit conversion. Only %d and %i care;
+ * %u happily prints values above 2^63. */
+static bool g_printf_signed_over;
+
 static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
     if (*argi >= argc) return 0;
@@ -5882,37 +5924,65 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
         return (long)(unsigned char)s[1];
     }
 
-    while (printf_is_blank(*s)) s++;
-    /* Magnitude in UNSIGNED 64-bit. Accumulating into a signed long overflowed
-     * -- undefined behaviour that happened to print 0 and -1 for the two
-     * extremes the corpus tests -- and never reported a problem. */
+    while (printf_is_blank(*s)) s++;            /* LEADING blanks are fine */
+
     unsigned long mag = 0;
     bool neg = false, any = false, over = false;
     if (*s == '-') { neg = true; s++; }
     else if (*s == '+') s++;
-    for (; *s >= '0' && *s <= '9'; s++) {
-        unsigned long d = (unsigned long)(*s - '0');
-        if (mag > (~0ul - d) / 10ul) over = true;      /* would wrap */
-        else mag = mag * 10ul + d;
-        any = true;
+
+    /* C literal syntax, which is what printf's numeric operands use: `0x55` is
+     * 85 and `055` is 45. Reading decimal only turned every hex operand into 0
+     * and left every octal one off by the value of its leading zero. The sign
+     * comes FIRST, so `+077` is 63. */
+    unsigned long base = 10ul;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+        ((s[2] >= '0' && s[2] <= '9') || (s[2] >= 'a' && s[2] <= 'f') ||
+         (s[2] >= 'A' && s[2] <= 'F'))) {
+        base = 16ul;
+        s += 2;
+    } else if (s[0] == '0' && s[1] >= '0' && s[1] <= '7') {
+        base = 8ul;
+        s += 1;
     }
-    while (printf_is_blank(*s)) s++;
+
+    for (;;) {
+        unsigned long d;
+        char c = *s;
+        if (c >= '0' && c <= '9')                 d = (unsigned long)(c - '0');
+        else if (base == 16ul && c >= 'a' && c <= 'f') d = (unsigned long)(c - 'a' + 10);
+        else if (base == 16ul && c >= 'A' && c <= 'F') d = (unsigned long)(c - 'A' + 10);
+        else break;
+        if (d >= base) break;                      /* `09` is not octal 9 */
+        if (mag > (~0ul - d) / base) over = true;  /* would wrap */
+        else mag = mag * base + d;
+        any = true;
+        s++;
+    }
+
+    /* NO trailing-blank skip. bash accepts ` -123` and rejects ` -123 `, and
+     * skipping them here reported success for both. */
     if (*s != '\0' || !any) g_printf_bad_num = true;
 
     if (over) {
-        /* Beyond 64 bits entirely: saturate and say so. */
+        /* Past 64 bits: saturate to the unsigned maximum for EITHER sign --
+         * `printf '%u' -18446744073709551616` is 18446744073709551615, not the
+         * two's complement of a saturated magnitude (which would be 1). */
         g_printf_bad_num = true;
-        g_printf_last_u64 = neg ? 1ul : ~0ul;
+        g_printf_last_u64 = ~0ul;
         return neg ? (long)(1ul << 63) : (long)(~0ul >> 1);
     }
 
     g_printf_last_u64 = neg ? (unsigned long)(0ul - mag) : mag;
 
-    /* %d saturates at the signed bounds and reports failure, which is what
-     * bash does -- the value is still printed. */
+    /* Out of range for a SIGNED conversion is not out of range for %u:
+     * 18446744073709551615 is a perfectly good %u operand and a saturating %d
+     * one. Flagging it here made %u report failure for a value it had just
+     * printed correctly, so the verdict is recorded and left for the
+     * conversion to act on. */
     const unsigned long SMAX = ~0ul >> 1;            /* 2^63 - 1 */
-    if (!neg && mag > SMAX) { g_printf_bad_num = true; return (long)SMAX; }
-    if (neg && mag > SMAX + 1ul) { g_printf_bad_num = true; return (long)(SMAX + 1ul); }
+    if (!neg && mag > SMAX) { g_printf_signed_over = true; return (long)SMAX; }
+    if (neg && mag > SMAX + 1ul) { g_printf_signed_over = true; return (long)(SMAX + 1ul); }
     return neg ? -(long)mag : (long)mag;
 }
 
@@ -6172,6 +6242,10 @@ static void cmd_printf(int argc, char **argv) {
     }
 
     g_printf_bad_num = false;
+    /* Per CALL, not per process: one `\c` must not silence every later
+     * printf in the script. */
+    g_printf_stop = false;
+    g_printf_b_mode = false;
 
     const char *fmt = argv[base];
     int argi = base + 1;
@@ -6283,7 +6357,10 @@ static void cmd_printf(int argc, char **argv) {
                 while (blen > 0) shell_putc(buf[--blen]);
                 if (left) for (int k = 0; k < pad; k++) shell_putc(' ');
             } else if (spec == 'd' || spec == 'i') {
+                g_printf_signed_over = false;
                 long v = printf_arg_int(argc, argv, &argi);
+                /* A signed conversion DOES fail on a value it had to saturate. */
+                if (g_printf_signed_over) g_printf_bad_num = true;
                 char buf[32];
                 int blen = 0;
                 bool neg = (spec != 'u') && v < 0;
@@ -6332,9 +6409,11 @@ static void cmd_printf(int argc, char **argv) {
             } else if (spec == 'b') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 const char *bp = s;
+                g_printf_b_mode = true;
                 while (*bp) {
                     if (*bp == '\\') {
                         int c = printf_parse_escape(&bp);
+                        if (g_printf_stop) break;      /* \c: emit nothing more */
                         if (c >= 0) {
                             if (g_printf_escape_raw) shell_putc('\\');
                             shell_putc((char)c);
@@ -6343,6 +6422,8 @@ static void cmd_printf(int argc, char **argv) {
                         shell_putc(*bp++);
                     }
                 }
+                g_printf_b_mode = false;
+                if (g_printf_stop) break;              /* and abandon the format */
             } else if (spec == 'c') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int pad = width > 1 ? width - 1 : 0;
