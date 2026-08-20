@@ -5355,7 +5355,21 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         const char *match_line = line_start;
         if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
             *pp = p;
-            int prc = shell_heredoc_push(body, bpos);
+            int prc;
+            if (quoted) {
+                prc = shell_heredoc_push(body, bpos);
+            } else {
+                char *xbody = (char *)kmalloc(SHELL_HEREDOC_BODY_MAX);
+                if (!xbody) { kfree(body); return -1; }
+                if (shell_expand_literal_quotes(body, xbody,
+                                                SHELL_HEREDOC_BODY_MAX) < 0) {
+                    kfree(xbody);
+                    kfree(body);
+                    return -1;
+                }
+                prc = shell_heredoc_push(xbody, strlen(xbody));
+                kfree(xbody);
+            }
             kfree(body);
             return prc;
         }
@@ -5366,16 +5380,21 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         const char *raw = line_start;
         if (strip_tabs) while (*raw == '\t') raw++;
 
+        /* THE BODY IS EXPANDED WHOLE, NOT LINE BY LINE. An expansion may
+         * span the lines of the body:
+         *
+         *     cat <<EOF
+         *     $(cat <<INSIDE
+         *     deep
+         *     INSIDE
+         *     )
+         *     EOF
+         *
+         * Expanding each line as it arrived handed `$(cat <<INSIDE` to the
+         * substitution parser on its own, which is an unterminated `$(` --
+         * "bad command substitution" for a here-document bash reads without
+         * complaint. The expansion moved to the end of the collection loop. */
         const char *emit = raw;
-        char expanded[LINE_MAX * 2];
-        if (!quoted) {
-            if (shell_expand_literal_quotes(raw, expanded,
-                                            sizeof(expanded)) < 0) {
-                kfree(body);
-                return -1;
-            }
-            emit = expanded;
-        }
         size_t n = strlen(emit);
         if (bpos + n + 2 > SHELL_HEREDOC_BODY_MAX) { kfree(body); return -1; }
         memcpy(body + bpos, emit, n);
