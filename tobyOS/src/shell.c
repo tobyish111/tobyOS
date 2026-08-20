@@ -9718,7 +9718,19 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
                 char chunk[512];
                 long n = file_read(spill_r, chunk, sizeof chunk);
                 if (n <= 0) break;
-                for (long i = 0; i < n; i++) shell_capture_char(&cap, chunk[i]);
+                for (long i = 0; i < n; i++) {
+                    /* A NUL IN THE OUTPUT IS DROPPED, NOT KEPT AND NOT
+                     * TERMINATING.
+                     *
+                     *     s=$(printf '.\000.') ; echo ${#s}      bash: 2
+                     *
+                     * bash warns and removes the byte, keeping what follows;
+                     * the result is a string one byte shorter. Storing it
+                     * would truncate the value at the first one, which is a
+                     * different answer (`1` here) and the one tsh gave. */
+                    if (chunk[i] == '\0') continue;
+                    shell_capture_char(&cap, chunk[i]);
+                }
             }
             file_close(spill_r);
         }
