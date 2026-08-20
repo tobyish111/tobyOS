@@ -5407,8 +5407,12 @@ static bool shell_word_boundary_at(const char *start, const char *p,
 }
 
 static bool shell_scan_incomplete(const struct shell_scan *st) {
+    /* AN OPEN `[[` OWNS ITS OWN `&&`. Without it here the list splitter cut
+     * `[[ -n x && -n y ]]` in half at the `&&` and handed the conditional
+     * parser `[[ -n x` -- which is also why the accumulator would not join
+     * `[[ a &&` to the line that finishes it. */
     return st->compound > 0 || st->paren > 0 || st->brace > 0 ||
-           st->func_hdr || st->cont_op || st->nest > 0;
+           st->func_hdr || st->cont_op || st->nest > 0 || st->dbracket;
 }
 
 static bool shell_word_eq(const char *w, size_t n, const char *lit) {
@@ -5509,6 +5513,49 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         return;
     }
     if (c == '(') {
+        /* `(( expr ))` IS ONE TOKEN, AND ITS PARENTHESES ARE NOT THE SHELL'S.
+         *
+         *     (( c = (1 + 2) * 3 ))
+         *
+         * The inner `(` sits where no command may start, so the array-literal
+         * rule below called it a syntax error and the arithmetic command was
+         * rejected before anything could evaluate it. The whole construct is
+         * consumed here instead, the way `[[ ]]` is skipped: what is inside
+         * belongs to the arithmetic grammar. If the closing `))` is not on
+         * this line the construct is left alone, so an ordinary nested
+         * subshell still reaches the rules below. */
+        if (st->cmd_pos && p[1] == '(') {
+            int depth = 0;
+            bool sq = false, dq = false;
+            const char *q = p + 2;
+            const char *close = 0;
+            for (; *q; q++) {
+                if (sq) { if (*q == '\'') sq = false; continue; }
+                if (dq) {
+                    if (*q == '\\' && q[1]) { q++; continue; }
+                    if (*q == '"') dq = false;
+                    continue;
+                }
+                if (*q == '\'') { sq = true; continue; }
+                if (*q == '"')  { dq = true; continue; }
+                if (*q == '(') { depth++; continue; }
+                if (*q == ')') {
+                    if (depth > 0) { depth--; continue; }
+                    if (q[1] == ')') { close = q; }
+                    break;
+                }
+            }
+            if (close) {
+                *pp = close + 2;
+                st->cmd_seen = true;
+                st->cmd_pos = false;
+                st->prev_word_cmd = false;
+                st->prev_word_name = false;
+                st->assign_prefix = false;
+                st->no_sep = false;
+                return;
+            }
+        }
         /* `name (` in command position is a FUNCTION HEADER, not a subshell.
          * Its parentheses are part of the definition and its body may start
          * on the next line, so the header alone leaves the command owed. */
@@ -5745,17 +5792,33 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     }
     *pp = p;
 
-    /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar. */
-    if (n == 2 && w[0] == '[' && w[1] == '[' && !st->dbracket) {
+    /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar.
+     *
+     * ONLY WHERE A COMMAND MAY START. `echo [[` is an argument that happens
+     * to be two brackets, and once an open `[[` counts as an incomplete line
+     * (below), mistaking that for a conditional would swallow the rest of the
+     * script looking for a `]]` that is never coming. */
+    if (n == 2 && w[0] == '[' && w[1] == '[' && !st->dbracket && st->cmd_pos) {
         st->dbracket = true;
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;
         return;
     }
     if (st->dbracket) {
-        if (n == 2 && w[0] == ']' && w[1] == ']') st->dbracket = false;
+        bool closing = (n == 2 && w[0] == ']' && w[1] == ']');
+        if (closing) st->dbracket = false;
         st->cmd_pos = false; st->prev_word_cmd = false;
-        st->no_sep = false;
+        /* INSIDE THE CONDITIONAL THERE IS NO COMMAND BOUNDARY, so joining the
+         * next physical line must not insert a `;`:
+         *
+         *     [[ -n x &&
+         *        -n y ]]
+         *
+         * came out as `[[ -n x &&; -n y ]]`, which is a syntax error. The
+         * `&&` here is the expression's operator, not the shell's, and the
+         * operator branch that would have set no_sep never runs while
+         * dbracket is open. */
+        st->no_sep = !closing;
         return;
     }
     if (st->redir) {                     /* a filename, never a command */
@@ -9966,6 +10029,13 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
 
     size_t name_len = 0;
     if (shell_parse_braced_name(expr, &name_len) < 0) {
+        /* RETRACTION, SECOND ATTEMPT: `${ command }` was briefly made a fatal
+         * status-1 expansion, narrowed to "a blank right after the brace" so
+         * that the array-literal and `${|...}` forms kept the generic 2. The
+         * narrowing was not enough -- `x=${ |REPLY=zz}` has that blank too,
+         * and bash prints an empty result and carries on there while exiting
+         * 1 for `${ echo hi }`. The rule is finer than the syntax, and until
+         * it can be stated the tokenizer's own 2 stays. */
         kprintf("shell: bad substitution\n");
         return -1;
     }
@@ -13223,6 +13293,12 @@ static int shell_run_function(struct shell_simple *cmd) {
 
     g_script_depth++;
     g_fn_depth++;
+    /* RETRACTION: the errexit exemption was briefly cleared here, so that
+     * `! foo` would not carry its suspension into foo's body. It gained the
+     * one case that wants that (1564) and lost two that want the opposite
+     * (1504, 1563 -- the latter is literally named "set -e enabled in
+     * function (regression)"). bash's rule here is finer than "in or out",
+     * and until someone can state it, the suspension stays inherited. */
     int local_depth = g_script_depth;
     /* Re-queue the here-documents the definition swallowed, so the body's
      * `<<EOF` finds its text on THIS call and every later one. Saved and
@@ -14259,6 +14335,404 @@ static void shell_parse_error(void) {
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = 2;
     }
+}
+
+/* ---- `[[ ... ]]`, the conditional command --------------------------- *
+ *
+ * A COMPOUND COMMAND WITH ITS OWN GRAMMAR, which is exactly why it cannot be
+ * a builtin here: `<`, `>`, `&&`, `||`, `(` and `)` mean something different
+ * inside it than they do in the shell around it, so the tokenizer would have
+ * turned `[[ a < b ]]` into a redirection before any builtin saw it. The
+ * structural scanner already skips over the whole construct (st->dbracket),
+ * which is what keeps the list splitter from cutting `[[ x && y ]]` in half;
+ * this is the other half of that -- something to actually evaluate it.
+ *
+ * Until now /bin/tsh spawned `/bin/[[` and reported 127 for every conditional
+ * expression in existence.
+ *
+ * What is NOT here, stated rather than hidden: `=~` needs a POSIX ERE engine,
+ * which this shell does not have. It reports that rather than quietly
+ * answering false.
+ *
+ * The differences from `test` that matter, and are implemented:
+ *   - no field splitting and no pathname expansion on the operands, so
+ *     `[[ -n $x ]]` is safe where `[ -n $x ]` is not;
+ *   - the right-hand side of `==` and `!=` is a PATTERN unless it was quoted;
+ *   - `&&`, `||`, `!` and parentheses are part of the expression.
+ */
+
+#define SH_DBR_MAX 64
+
+struct shell_dbr {
+    char  *w[SH_DBR_MAX];       /* expanded operand / operator text */
+    bool   pat[SH_DBR_MAX];     /* unquoted: the word may be a pattern */
+    int    n;
+    int    pos;
+    bool   err;
+    char   buf[SHELL_PARSE_BUF_MAX];
+    size_t bufpos;
+};
+
+static char *shell_dbr_store(struct shell_dbr *d, const char *s) {
+    size_t n = strlen(s);
+    if (d->bufpos + n + 1 > sizeof d->buf) return 0;
+    char *out = d->buf + d->bufpos;
+    memcpy(out, s, n + 1);
+    d->bufpos += n + 1;
+    return out;
+}
+
+/* Split the expression into words. Blanks separate; quotes are absorbed and
+ * remembered, because a quoted right-hand side of `==` is a literal string
+ * and an unquoted one is a glob pattern. */
+static int shell_dbr_split(struct shell_dbr *d, const char *src) {
+    const char *p = src;
+    d->n = 0;
+    d->pos = 0;
+    d->err = false;
+    d->bufpos = 0;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (!*p) break;
+        if (d->n >= SH_DBR_MAX) return -1;
+
+        char raw[SHELL_PARSE_BUF_MAX];
+        size_t rp = 0;
+        bool quoted = false;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
+            if (*p == '\'') {
+                quoted = true;
+                if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+                while (*p && *p != '\'') {
+                    if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+                }
+                if (*p == '\'') { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; }
+                continue;
+            }
+            if (*p == '"') {
+                quoted = true;
+                if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\' && p[1]) {
+                        if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
+                        else p += 2;
+                        continue;
+                    }
+                    if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+                }
+                if (*p == '"') { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; }
+                continue;
+            }
+            if (*p == '\\' && p[1]) {
+                quoted = true;
+                if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
+                else p += 2;
+                continue;
+            }
+            if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+        }
+        raw[rp] = '\0';
+
+        /* The operators are recognised only as WHOLE words, and only when
+         * they were not quoted -- `[[ "&&" ]]` is a one-word test of a
+         * two-character string. */
+        if (!quoted && (strcmp(raw, "(") == 0 || strcmp(raw, ")") == 0 ||
+                        strcmp(raw, "&&") == 0 || strcmp(raw, "||") == 0 ||
+                        strcmp(raw, "!") == 0)) {
+            char *st = shell_dbr_store(d, raw);
+            if (!st) return -1;
+            d->pat[d->n] = false;
+            d->w[d->n++] = st;
+            continue;
+        }
+
+        char expanded[SHELL_PARSE_BUF_MAX];
+        if (shell_expand_word_ex(raw, expanded, sizeof expanded, true, true) < 0)
+            return -1;
+        shell_strip_nosplit_inplace(expanded);
+        char *st = shell_dbr_store(d, expanded);
+        if (!st) return -1;
+        d->pat[d->n] = !quoted;
+        d->w[d->n++] = st;
+    }
+    return 0;
+}
+
+static const char *shell_dbr_peek(struct shell_dbr *d) {
+    return d->pos < d->n ? d->w[d->pos] : 0;
+}
+
+static int shell_dbr_or(struct shell_dbr *d);
+
+static int shell_dbr_primary(struct shell_dbr *d) {
+    const char *t = shell_dbr_peek(d);
+    if (!t) { d->err = true; return 0; }
+
+    if (strcmp(t, "(") == 0) {
+        d->pos++;
+        int v = shell_dbr_or(d);
+        const char *c = shell_dbr_peek(d);
+        if (!c || strcmp(c, ")") != 0) { d->err = true; return 0; }
+        d->pos++;
+        return v;
+    }
+    /* A `)` where an expression belongs is bash's "unexpected token" -- the
+     * one shape the corpus tests directly. */
+    if (strcmp(t, ")") == 0 || strcmp(t, "&&") == 0 || strcmp(t, "||") == 0) {
+        d->err = true;
+        return 0;
+    }
+
+    /* A unary operator, if a word follows it. `[[ -n ]]` is a one-word test
+     * of the string "-n", which is true. */
+    if (test_is_unary_op(t) && d->pos + 1 < d->n) {
+        const char *nxt = d->w[d->pos + 1];
+        if (strcmp(nxt, ")") != 0 && strcmp(nxt, "&&") != 0 &&
+            strcmp(nxt, "||") != 0) {
+            d->pos += 2;
+            return test_unary(t, nxt) == 0;
+        }
+    }
+
+    /* WORD [ binop WORD ] */
+    const char *a = t;
+    d->pos++;
+    const char *op = shell_dbr_peek(d);
+    if (!op || strcmp(op, ")") == 0 || strcmp(op, "&&") == 0 ||
+        strcmp(op, "||") == 0) {
+        return a[0] != '\0';               /* a bare word: true if non-empty */
+    }
+
+    if (strcmp(op, "=~") == 0) {
+        /* Stated, not faked: an ERE engine is what this needs. */
+        kprintf("tsh: [[: =~ needs a regular-expression engine, "
+                "which this shell does not have\n");
+        d->err = true;
+        return 0;
+    }
+
+    bool patrhs = (strcmp(op, "==") == 0 || strcmp(op, "=") == 0 ||
+                   strcmp(op, "!=") == 0);
+    if (!patrhs && !test_is_binary_op(op)) {
+        d->err = true;
+        return 0;
+    }
+    if (d->pos + 1 >= d->n) { d->err = true; return 0; }
+    int rhs_index = d->pos + 1;
+    const char *b = d->w[rhs_index];
+    d->pos += 2;
+
+    if (patrhs) {
+        bool eq;
+        if (d->pat[rhs_index]) {
+            /* AN UNQUOTED RIGHT-HAND SIDE IS A PATTERN. This is the one thing
+             * `[[ ]]` does that `[` cannot express at all. */
+            eq = shell_glob_match(b, a);
+        } else {
+            eq = (strcmp(a, b) == 0);
+        }
+        if (strcmp(op, "!=") == 0) eq = !eq;
+        return eq;
+    }
+
+    bool err = false;
+    int r = test_binary(a, op, b, &err);
+    if (err) { d->err = true; return 0; }
+    return r == 0;
+}
+
+static int shell_dbr_not(struct shell_dbr *d) {
+    const char *t = shell_dbr_peek(d);
+    if (t && strcmp(t, "!") == 0) {
+        d->pos++;
+        return !shell_dbr_not(d);
+    }
+    return shell_dbr_primary(d);
+}
+
+static int shell_dbr_and(struct shell_dbr *d) {
+    int v = shell_dbr_not(d);
+    for (;;) {
+        const char *t = shell_dbr_peek(d);
+        if (!t || strcmp(t, "&&") != 0) break;
+        d->pos++;
+        /* Both sides are still PARSED even when the left is false, so that a
+         * syntax error on the right is reported either way and d->pos ends
+         * up past the whole expression. */
+        int r = shell_dbr_not(d);
+        v = v && r;
+    }
+    return v;
+}
+
+static int shell_dbr_or(struct shell_dbr *d) {
+    int v = shell_dbr_and(d);
+    for (;;) {
+        const char *t = shell_dbr_peek(d);
+        if (!t || strcmp(t, "||") != 0) break;
+        d->pos++;
+        int r = shell_dbr_and(d);
+        v = v || r;
+    }
+    return v;
+}
+
+static bool shell_try_dbracket_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!(s[0] == '[' && s[1] == '[' &&
+          (s[2] == ' ' || s[2] == '\t' || s[2] == '\n' || s[2] == '\0')))
+        return false;
+    s += 2;
+
+    /* Find the `]]` that closes it, ignoring one inside quotes. */
+    const char *end = 0;
+    {
+        bool sq = false, dq = false;
+        for (const char *q = s; *q; q++) {
+            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (dq) {
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '"') dq = false;
+                continue;
+            }
+            if (*q == '\'') { sq = true; continue; }
+            if (*q == '"')  { dq = true; continue; }
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (q[0] == ']' && q[1] == ']') { end = q; break; }
+        }
+    }
+    if (!end) {
+        kprintf("tsh: [[: expected ']]'\n");
+        shell_parse_error();
+        return true;
+    }
+
+    char expr[SHELL_PARSE_BUF_MAX];
+    if (shell_copy_segment(expr, sizeof expr, s, end) < 0) {
+        kprintf("tsh: [[: expression too long\n");
+        shell_set_status(2);
+        return true;
+    }
+
+    struct shell_dbr *d = (struct shell_dbr *)kmalloc(sizeof *d);
+    if (!d) {
+        kprintf("tsh: [[: out of memory\n");
+        shell_set_status(2);
+        return true;
+    }
+    int value = 0;
+    bool bad = (shell_dbr_split(d, expr) < 0);
+    if (!bad) {
+        if (d->n == 0) bad = true;
+        else {
+            value = shell_dbr_or(d);
+            if (d->err || d->pos != d->n) bad = true;
+        }
+    }
+    kfree(d);
+
+    if (bad) {
+        /* A SYNTAX ERROR IN A CONDITIONAL ABORTS THE SCRIPT AND CHANGES
+         * NOTHING ELSE. Measured against the bash in the initrd: it writes
+         * "unexpected token" to stderr, runs no more of the file, and exits
+         * with the status it already had -- not 2, which is what setting a
+         * status here would produce. */
+        kprintf("tsh: [[: syntax error in conditional expression\n");
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = g_last_status;
+        }
+        return true;
+    }
+
+    /* Anything after `]]` is a redirection or nothing; a `&&` would already
+     * have been split off by the list splitter. */
+    const char *tail = shell_skip_blanks(end + 2);
+    if (*tail && *tail != ';' && *tail != '\n') {
+        struct shell_simple redirs;
+        char paths[256];
+        if (shell_parse_compound_redirs(end + 2, &redirs, paths,
+                                        sizeof paths, "[[") < 0) {
+            shell_set_status(2);
+            return true;
+        }
+    }
+
+    shell_set_status(value ? 0 : 1);
+    return true;
+}
+
+/* ---- `(( expr ))`, the arithmetic command --------------------------- *
+ *
+ * `$(( ))` -- the EXPANSION -- has worked for a long time; the COMMAND form
+ * had nothing behind it, so `(( a = 42 ))` fell through to the subshell
+ * parser, which saw `( ( a = 42 ) )` and tried to run `a = 42` as a program.
+ * It is the idiomatic way to do arithmetic in a script without printing
+ * anything, and `if (( x > 0 ))` is how conditions on numbers are written.
+ *
+ * The status is INVERTED relative to the value, like `test`: a non-zero
+ * result is success. `(( 0 ))` is a false command, which is exactly what
+ * makes `while (( n-- ))` terminate.
+ *
+ * If the expression does not parse this returns false rather than reporting
+ * an error, so a genuine nested subshell -- `( (echo a; echo b) | wc -l )` --
+ * still reaches the subshell parser behind it.
+ */
+static bool shell_try_arith_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!(s[0] == '(' && s[1] == '(')) return false;
+    s += 2;
+
+    /* Find the `))` that closes it. A nested `(` inside the expression is
+     * ordinary grouping and must not be mistaken for the end. */
+    const char *end = 0;
+    {
+        int depth = 0;
+        bool sq = false, dq = false;
+        for (const char *q = s; *q; q++) {
+            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (dq) {
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '"') dq = false;
+                continue;
+            }
+            if (*q == '\'') { sq = true; continue; }
+            if (*q == '"')  { dq = true; continue; }
+            if (*q == '(') { depth++; continue; }
+            if (*q == ')') {
+                if (depth > 0) { depth--; continue; }
+                if (q[1] == ')') { end = q; break; }
+                return false;          /* `( (a) b )` -- a subshell, not this */
+            }
+        }
+    }
+    if (!end) return false;
+
+    /* Anything after `))` other than a separator or a redirection means this
+     * was not an arithmetic command after all. */
+    const char *tail = shell_skip_blanks(end + 2);
+    if (*tail && *tail != ';' && *tail != '\n' && *tail != '<' && *tail != '>')
+        return false;
+
+    char expr[SHELL_PARSE_BUF_MAX];
+    if (shell_copy_segment(expr, sizeof expr, s, end) < 0) return false;
+
+    /* The expression is expanded first, exactly as `$(( ))` is: the evaluator
+     * resolves bare names itself but knows nothing about `$( )` or `${ }`. */
+    char xexpr[SHELL_PARSE_BUF_MAX];
+    if (shell_expand_literal_quotes(expr, xexpr, sizeof xexpr) != 0)
+        return false;
+
+    struct shell_arith a;
+    a.p = xexpr;
+    a.ok = true;
+    long v = shell_arith_expr(&a);
+    if (!a.ok) return false;
+    shell_arith_skip(&a);
+    if (*a.p) return false;                 /* trailing junk: not arithmetic */
+
+    shell_set_status(v != 0 ? 0 : 1);
+    return true;
 }
 
 static bool shell_try_if_command(const char *src) {
@@ -16322,7 +16796,9 @@ static void execute_line_text_inner(const char *src) {
         }
         return;
     }
-    if (shell_try_if_command(src) ||
+    if (shell_try_dbracket_command(src) ||
+        shell_try_arith_command(src) ||
+        shell_try_if_command(src) ||
         shell_try_for_command(src) ||
         shell_try_while_command(src) ||
         shell_try_until_command(src) ||
