@@ -5301,6 +5301,9 @@ struct shell_scan {
     int  nest;          /* open `$( )`, `${ }`, `$(( ))`, backticks */
     char nest_kind[16]; /* per level: c=$( ) v=${ } a=$(( )) p=( ) b=`` */
     bool in_sq, in_dq;  /* a quote left open INSIDE that nesting */
+    int  in_case;       /* open `case ... esac` INSIDE that nesting */
+    bool in_case_in;    /* ...and its `in` is still owed */
+    bool in_case_pat;   /* ...and a pattern may start, so `(`/`)` are its own */
     const char *start;  /* so a token can look at the character before it */
 };
 
@@ -5329,7 +5332,31 @@ static void shell_scan_init(struct shell_scan *st) {
     st->nest = 0;
     st->in_sq = false;
     st->in_dq = false;
+    st->in_case = 0;
+    st->in_case_in = false;
+    st->in_case_pat = false;
     st->start = 0;
+}
+
+/* Is `w` the whole word starting at `p`? Used where a character loop has to
+ * notice the reserved words `case`, `in` and `esac` without tokenising: both
+ * the scanner and the command-substitution reader need to know that the `)`
+ * of `case $x in [0-9]) ...` closes a PATTERN and not their own paren. */
+/* Blank, newline, or one of the operator characters that can stand next to a
+ * reserved word. */
+static bool shell_sep_or_blank(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == ';' || c == '&' || c == '|' || c == '(' || c == ')';
+}
+
+static bool shell_word_boundary_at(const char *start, const char *p,
+                                   const char *word) {
+    size_t n = strlen(word);
+    for (size_t i = 0; i < n; i++)
+        if (p[i] != word[i]) return false;
+    if (p[n] && !shell_sep_or_blank(p[n])) return false;
+    if (p > start && !shell_sep_or_blank(p[-1])) return false;
+    return true;
 }
 
 static bool shell_scan_incomplete(const struct shell_scan *st) {
@@ -5566,8 +5593,14 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     const char *w = p;
     bool sq = st->in_sq, dq = st->in_dq;
     int nest = st->nest;
+    int case_open = st->in_case;
+    bool case_want_in = st->in_case_in;
+    bool case_pat = st->in_case_pat;
     st->in_sq = false;
     st->in_dq = false;
+    st->in_case = 0;
+    st->in_case_in = false;
+    st->in_case_pat = false;
     while (*p) {
         char d = *p;
         if (sq) { if (d == '\'') sq = false; p++; continue; }
@@ -5612,6 +5645,34 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             continue;
         }
         if (nest > 0) {
+            /* A `case` PATTERN'S `)` IS NOT A NESTING PAREN.
+             *
+             *     echo $(case $x in [0-9]) echo n;; [a-z]) echo l;; esac)
+             *
+             * Counting it closed the substitution at the FIRST pattern, and
+             * the rest of the line -- `echo n;; [a-z]) ...` -- was scanned as
+             * ordinary shell, where `;;` outside a case is a syntax error.
+             * That is one of the shapes `$( )` exists for, so the reader
+             * tracks the construct: `case` opens it, `in` and `;;` say a
+             * pattern may start, and while one may, `(` and `)` belong to the
+             * pattern rather than to this loop. */
+            if (shell_word_boundary_at(w, p, "case")) {
+                case_open++; case_want_in = true; p += 4; continue;
+            }
+            if (case_open > 0 && shell_word_boundary_at(w, p, "esac")) {
+                case_open--; case_pat = false; p += 4; continue;
+            }
+            if (case_open > 0 && case_want_in &&
+                shell_word_boundary_at(w, p, "in")) {
+                case_want_in = false; case_pat = true; p += 2; continue;
+            }
+            if (case_open > 0 && d == ';' && p[1] == ';') {
+                case_pat = true; p += 2; continue;
+            }
+            if (case_open > 0 && case_pat && (d == '(' || d == ')')) {
+                if (d == ')') case_pat = false;
+                p++; continue;
+            }
             if (d == '(' || d == '{') {
                 if (nest < (int)sizeof st->nest_kind) st->nest_kind[nest] = 'p';
                 nest++;
@@ -5630,7 +5691,11 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     size_t n = (size_t)(p - w);
     st->cmd_seen = true;
     st->nest = nest < 0 ? 0 : nest;
-    if (st->nest > 0) { st->in_sq = sq; st->in_dq = dq; }
+    if (st->nest > 0) {
+        st->in_sq = sq; st->in_dq = dq;
+        st->in_case = case_open; st->in_case_in = case_want_in;
+        st->in_case_pat = case_pat;
+    }
     *pp = p;
 
     /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar. */
@@ -5672,31 +5737,48 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         (void)was_func_hdr;
         return;
     }
+    /* AFTER AN ASSIGNMENT PREFIX, A RESERVED WORD IS NOT RESERVED.
+     *
+     *     FOO=bar for        bash: for: command not found  (status 127)
+     *
+     * A reserved word is recognised only as the FIRST word of a command, and
+     * the assignment already took that slot. tsh scanned the `for`, opened a
+     * compound, and the accumulator then waited for a `done` the script never
+     * had -- so a one-line command died as "unexpected end of file" instead
+     * of running and failing. A further assignment is still an assignment
+     * (`x=1 y=2 cmd`), so only non-assignment words are affected: the
+     * ordinary-word tail below re-detects that case and keeps the flag.
+     *
+     * `resv` guards the six reserved-word blocks rather than returning early,
+     * so the word still gets the ordinary-word treatment -- decl_util and
+     * prev_word_name are set from it exactly as for any other command name. */
+    bool resv = !st->assign_prefix;
+
     /* In command position: the reserved words mean what they say. `{` and `}`
      * are reserved WORDS like the rest, which is what makes
      * `rbrace() { echo }; }` parse -- the `}` after `echo` is an argument,
      * and only the one after `;` closes the group. */
-    if (n == 1 && w[0] == '{') {
+    if (resv && n == 1 && w[0] == '{') {
         st->brace++;
         st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = true;
         return;
     }
-    if (n == 1 && w[0] == '}') {
+    if (resv && n == 1 && w[0] == '}') {
         if (st->brace > 0) st->brace--;
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;
         return;
     }
-    if (shell_word_eq(w, n, "if")   || shell_word_eq(w, n, "while") ||
-        shell_word_eq(w, n, "until")) {
+    if (resv && (shell_word_eq(w, n, "if")   || shell_word_eq(w, n, "while") ||
+        shell_word_eq(w, n, "until"))) {
         st->compound++;
         st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = true;
         return;
     }
-    if (shell_word_eq(w, n, "for") || shell_word_eq(w, n, "case") ||
-        shell_word_eq(w, n, "select")) {
+    if (resv && (shell_word_eq(w, n, "for") || shell_word_eq(w, n, "case") ||
+        shell_word_eq(w, n, "select"))) {
         st->compound++;
         if (shell_word_eq(w, n, "case")) {
             st->case_depth++;
@@ -5706,8 +5788,8 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->no_sep = true;              /* `for` / `case` want a NAME next */
         return;
     }
-    if (shell_word_eq(w, n, "fi")   || shell_word_eq(w, n, "done") ||
-        shell_word_eq(w, n, "esac")) {
+    if (resv && (shell_word_eq(w, n, "fi")   || shell_word_eq(w, n, "done") ||
+        shell_word_eq(w, n, "esac"))) {
         if (st->compound > 0) st->compound--;
         if (shell_word_eq(w, n, "esac")) {
             if (st->case_depth > 0) st->case_depth--;
@@ -5717,9 +5799,9 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->no_sep = false;             /* fi/done/esac END a command */
         return;
     }
-    if (shell_word_eq(w, n, "then") || shell_word_eq(w, n, "else") ||
+    if (resv && (shell_word_eq(w, n, "then") || shell_word_eq(w, n, "else") ||
         shell_word_eq(w, n, "elif") || shell_word_eq(w, n, "do")   ||
-        shell_word_eq(w, n, "!")    || shell_word_eq(w, n, "time")) {
+        shell_word_eq(w, n, "!")    || shell_word_eq(w, n, "time"))) {
         st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = true;
         return;
@@ -8647,6 +8729,7 @@ enum shell_tok_type {
     SH_TOK_REDIR_CLOBBER,
     SH_TOK_DUP_IN,
     SH_TOK_DUP_OUT,
+    SH_TOK_REDIR_RW,
 };
 
 enum shell_redir_op {
@@ -8655,6 +8738,7 @@ enum shell_redir_op {
     SH_RD_OPEN_OUT,
     SH_RD_OPEN_APPEND,
     SH_RD_OPEN_EXCL,
+    SH_RD_OPEN_RW,
     SH_RD_DUP_IN,
     SH_RD_DUP_OUT,
     SH_RD_CLOSE,
@@ -8861,6 +8945,19 @@ static void shell_spawn_program_profile(const char *path_arg, int argc,
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c) {
     if (*pos + 1 >= cap) return -1;
     buf[(*pos)++] = c;
+    /* KEEP THE BUFFER A C STRING AT EVERY STEP.
+     *
+     *     a=20 ; : $(( a /= -3 )) ; echo $a      -6
+     *     a=-20; : $(( a /= -3 )) ; echo $a      66   (bash: 6)
+     *
+     * Nobody wrote a terminator: the arithmetic evaluator formats into a
+     * fresh `char tmp[32]` and hands it straight to env_set(). The stack slot
+     * still held "-6" from the line before, writing "6" replaced one byte of
+     * it, and the value read back as "66". Dozens of call sites make the same
+     * assumption. The bounds test above already guarantees `*pos < cap` after
+     * the increment, so the NUL always fits; a caller that appends again just
+     * overwrites it. */
+    buf[*pos] = '\0';
     return 0;
 }
 
@@ -8966,6 +9063,43 @@ static int g_capture_depth;
  * `x=$(exit 33); echo $?` reports 33. */
 static int g_capture_last_status;
 
+/* A COMMAND SUBSTITUTION IS A SUBSHELL, so an alias defined inside one is
+ * gone when it ends:
+ *
+ *     shopt -s expand_aliases
+ *     echo $(alias sayhi='echo hello')
+ *     sayhi                             bash: sayhi: command not found
+ *
+ * tsh has no fork for `$( )` -- it runs the text in place -- so the table is
+ * snapshotted and put back instead. Only the POINTERS are copied: a slot the
+ * substitution left alone still holds the same string, and one it changed is
+ * freed and restored. (Variables and functions leak the same way and are not
+ * covered here; this is the case the corpus measures.) */
+struct shell_alias_save {
+    char *name[SHELL_ALIAS_MAX];
+    char *value[SHELL_ALIAS_MAX];
+};
+
+static void shell_alias_save(struct shell_alias_save *sv) {
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        sv->name[i] = g_aliases[i].name;
+        sv->value[i] = g_aliases[i].value;
+    }
+}
+
+static void shell_alias_restore(const struct shell_alias_save *sv) {
+    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        if (g_aliases[i].name != sv->name[i]) {
+            kfree(g_aliases[i].name);
+            g_aliases[i].name = sv->name[i];
+        }
+        if (g_aliases[i].value != sv->value[i]) {
+            kfree(g_aliases[i].value);
+            g_aliases[i].value = sv->value[i];
+        }
+    }
+}
+
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
 
@@ -9030,6 +9164,10 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     int saved_status = g_last_status;
     bool saved_parse_error = g_parse_error;
     g_parse_error = false;
+    /* The alias table is part of the subshell's state -- see
+     * shell_alias_save. It is put back below, after the text has run. */
+    struct shell_alias_save saved_aliases;
+    shell_alias_save(&saved_aliases);
     /* ...unless `shopt -s inherit_errexit` says otherwise, which is exactly
      * what that option means: the substitution's subshell runs WITH errexit
      * and stops at its first failure. The parent still does not inherit the
@@ -9075,6 +9213,7 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
         }
     }
     if (!inherit_ee) g_errexit_suspend--;
+    shell_alias_restore(&saved_aliases);
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
      *
@@ -9138,6 +9277,10 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
 
     size_t pos = 0;
     int depth = 1;
+    const char *sub_start = p;
+    int case_open = 0;
+    bool case_want_in = false;
+    bool case_pat = false;
     while (*p) {
         if (*p == '\'') {
             if (pos + 1 >= cmd_cap) return -1;
@@ -9171,6 +9314,43 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             depth++;
             if (pos + 2 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
+            cmd[pos++] = *p++;
+            continue;
+        }
+        /* THE `)` OF A `case` PATTERN CLOSES THE PATTERN, NOT THIS WORD --
+         * see the same tracking in the scanner. `$(case $x in a) echo A;;
+         * esac)` ended at the `)` after `a`, and the remainder was left in
+         * the enclosing word. `case` opens the construct, `in` and `;;` say a
+         * pattern may start, and while one may, `(` and `)` are the
+         * pattern's. */
+        if (shell_word_boundary_at(sub_start, p, "case")) {
+            case_open++; case_want_in = true;
+            if (pos + 4 >= cmd_cap) return -1;
+            for (int k = 0; k < 4; k++) cmd[pos++] = *p++;
+            continue;
+        }
+        if (case_open > 0 && shell_word_boundary_at(sub_start, p, "esac")) {
+            case_open--; case_pat = false;
+            if (pos + 4 >= cmd_cap) return -1;
+            for (int k = 0; k < 4; k++) cmd[pos++] = *p++;
+            continue;
+        }
+        if (case_open > 0 && case_want_in &&
+            shell_word_boundary_at(sub_start, p, "in")) {
+            case_want_in = false; case_pat = true;
+            if (pos + 2 >= cmd_cap) return -1;
+            cmd[pos++] = *p++; cmd[pos++] = *p++;
+            continue;
+        }
+        if (case_open > 0 && p[0] == ';' && p[1] == ';') {
+            case_pat = true;
+            if (pos + 2 >= cmd_cap) return -1;
+            cmd[pos++] = *p++; cmd[pos++] = *p++;
+            continue;
+        }
+        if (case_open > 0 && case_pat && (*p == '(' || *p == ')')) {
+            if (*p == ')') case_pat = false;
+            if (pos + 1 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
             continue;
         }
@@ -10689,6 +10869,13 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
             } else if (p[1] == '&') {
                 t = SH_TOK_DUP_IN;
                 p++;
+            } else if (p[1] == '>') {
+                /* `<>` OPENS FOR READING AND WRITING, and does not truncate.
+                 * Without it the `<` was taken alone and the `>` became a
+                 * redirection of its own with no filename after it, so
+                 * `exec 8<>file` died as "redirection needs a path". */
+                t = SH_TOK_REDIR_RW;
+                p++;
             }
             if (shell_emit_token_fd(tok, &ntok, t, 0, false, explicit_fd) < 0) return -1;
             /* A HERE-DOCUMENT DELIMITER IS NOT EXPANDED. POSIX 2.7.4: the
@@ -11950,7 +12137,8 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
 static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
     if (explicit_fd >= 0) return explicit_fd;
     if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
-        t == SH_TOK_HEREDOC_TABS || t == SH_TOK_DUP_IN) {
+        t == SH_TOK_HEREDOC_TABS || t == SH_TOK_DUP_IN ||
+        t == SH_TOK_REDIR_RW) {
         return 0;
     }
     return 1;
@@ -12018,8 +12206,10 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
             t == SH_TOK_HEREDOC_TABS || t == SH_TOK_REDIR_OUT ||
             t == SH_TOK_REDIR_APPEND || t == SH_TOK_REDIR_CLOBBER ||
-            t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
+            t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT ||
+            t == SH_TOK_REDIR_RW) {
             int fd = shell_default_redir_fd(t, tok[*io].fd);
+            int expl_fd = tok[*io].fd;
             (*io)++;
             if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
                 kprintf("shell: redirection needs a path\n");
@@ -12033,6 +12223,9 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             if (t == SH_TOK_REDIR_IN) {
                 cur->stdin_path = tok[*io].text;
                 if (shell_add_redir(cur, SH_RD_OPEN_IN, fd, tok[*io].text,
+                                    0, -1) < 0) return -1;
+            } else if (t == SH_TOK_REDIR_RW) {
+                if (shell_add_redir(cur, SH_RD_OPEN_RW, fd, tok[*io].text,
                                     0, -1) < 0) return -1;
             } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
                 const struct shell_heredoc *h = shell_heredoc_pop();
@@ -12061,6 +12254,20 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                                   : SH_RD_OPEN_OUT;
                     if (shell_add_redir(cur, fop, fd, tok[*io].text, 0,
                                         -1) < 0) return -1;
+                    /* AND WITH NO fd IN FRONT OF IT, `>&word` TAKES STDERR
+                     * WITH IT -- it is bash's spelling of `&>word`:
+                     *
+                     *     stdout_stderr.py >&out.txt     both streams land
+                     *
+                     * With only fd 1 redirected, the stderr half went to the
+                     * terminal and the file held half of what it should. An
+                     * explicit `1>&word` is fd 1 alone, so this applies only
+                     * when the operator carried no descriptor. fd 2 DUPS fd 1
+                     * rather than opening the file a second time, so the two
+                     * share one offset and cannot overwrite each other. */
+                    if (t == SH_TOK_DUP_OUT && expl_fd < 0 &&
+                        shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
+                        return -1;
                 } else {
                     if (shell_add_redir(cur,
                                         t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
@@ -12399,6 +12606,33 @@ static void shell_fd_state_init_from_defaults(struct shell_fd_state *st) {
     }
 }
 
+/* `<>` -- OPEN FOR READING AND WRITING, CREATING BUT NOT TRUNCATING.
+ *
+ *     exec 8<>rw.txt ; read line <&8 ; echo second 1>&8
+ *
+ * reads the first line and then overwrites from where the read stopped. The
+ * write half of shell_open_vfs_file() truncates, which is right for `>` and
+ * wrong here, so the file is only brought into existence and then opened by
+ * the read path -- vfs_open() hands back a descriptor good for both. */
+static struct file *shell_open_vfs_file_rw(const char *path_arg,
+                                           const char *label) {
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(path_arg, path, sizeof(path), label) < 0) return 0;
+    struct vfs_stat st;
+    int sr = vfs_stat(path, &st);
+    if (sr == VFS_ERR_NOENT) {
+        int cr = vfs_create(path);
+        if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
+            kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+            return 0;
+        }
+    } else if (sr != VFS_OK) {
+        kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+        return 0;
+    }
+    return shell_open_vfs_file(path_arg, false, false, label);
+}
+
 static int shell_apply_redirs(struct shell_simple *cmd,
                               struct shell_fd_state *st,
                               const char *label) {
@@ -12412,6 +12646,15 @@ static int shell_apply_redirs(struct shell_simple *cmd,
 
         if (r->op == SH_RD_OPEN_IN) {
             struct file *f = shell_open_vfs_file(r->path, false, false, label);
+            if (!f) return -1;
+            if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
+                file_close(f);
+                return -1;
+            }
+            continue;
+        }
+        if (r->op == SH_RD_OPEN_RW) {
+            struct file *f = shell_open_vfs_file_rw(r->path, label);
             if (!f) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
@@ -12780,6 +13023,18 @@ static int shell_background_forked(const char *text, const char *label) {
         return 1;
     }
     if (pid == 0) {
+        /* TRAPS ARE CLEARED IN A SUBSHELL. POSIX 2.11: a subshell resets to
+         * the default every trap the parent had caught.
+         *
+         *     trap 'echo line=$LINENO' ERR
+         *     false & wait                      bash: nothing
+         *
+         * The child re-parses `false` as an ordinary foreground command, so
+         * it ran the parent's ERR trap and printed a line number the parent
+         * never reached. The exemption at the dispatch site only covers the
+         * parent's view of a backgrounded pipeline; the copy inside the fork
+         * needs its own. */
+        shell_trap_clear_all();
         execute_line_text(text);
         int st = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
@@ -12849,8 +13104,18 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
 
         const struct cmd *special = shell_cmd_lookup(exec_cmd.argv[0]);
         if (special && shell_special_builtin_name(special->name)) {
+            /* A PREFIX ON A SPECIAL BUILTIN DOES NOT PERSIST -- in bash.
+             *
+             *     pre=1 readonly x=x
+             *     echo "[$pre]"          bash: []   (POSIX mode: 1)
+             *
+             * POSIX says it survives; bash only does that under `set -o
+             * posix`, and bash is the oracle here. `exec` still hands its
+             * prefix to the program it launches, because the assignment is
+             * live while the builtin runs -- what changes is only whether the
+             * shell keeps it afterwards. */
             return shell_run_builtin(&exec_cmd, special, cmd->argv, assignc,
-                                     true);
+                                     false);
         }
         /* A variable assignment PREFIXED to a command applies to that command
          * only -- `PREF=x show` must be visible inside `show` and gone after.
@@ -15871,6 +16136,19 @@ static void execute_line_text_inner(const char *src) {
             };
             for (int m = 0; compound_kw[m]; m++) {
                 if (!shell_starts_with_word(a, compound_kw[m])) continue;
+                /* ...BUT A KEYWORD WITH NOTHING AFTER IT IS JUST A WORD.
+                 *
+                 *     FOO=bar for          bash: for: command not found (127)
+                 *     FOO=bar for i in 1 2; do echo; done
+                 *                          bash: syntax error near `do'
+                 *
+                 * bash does not reject the keyword -- it rejects the `do` or
+                 * `in` that can only belong to a compound, and neither exists
+                 * when the keyword ends the command. Erroring on the keyword
+                 * itself turned a 127 into a 2. */
+                const char *rest = shell_skip_blanks(
+                    a + strlen(compound_kw[m]));
+                if (!*rest || *rest == ';') break;
                 kprintf("shell: syntax error near unexpected token `%s'\n",
                         compound_kw[m]);
                 shell_set_status(2);
