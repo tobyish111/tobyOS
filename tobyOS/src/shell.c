@@ -129,6 +129,75 @@ static unsigned long g_hist_base; /* history number of the oldest entry */
  * script (or from shell start for interactive input). */
 static unsigned long g_shell_lineno;
 
+/* WHERE EACH PHYSICAL LINE WENT WHEN THEY WERE JOINED.
+ *
+ *     set -- a b c        line 1
+ *     for x; do           line 2
+ *       echo $LINENO      line 3   <- bash says 3
+ *     done                line 4
+ *
+ * The reader joins those four lines into one before anything parses them, so
+ * a counter that ticks once per logical line reported 2 for the echo and was
+ * two behind for everything after the loop. This records the offset at which
+ * each physical line was appended, so a compound can ask which line its body
+ * actually started on. */
+#define SHELL_LMAP_MAX 64
+static const char *g_lmap_base;
+static size_t g_lmap_off[SHELL_LMAP_MAX];
+static unsigned long g_lmap_line[SHELL_LMAP_MAX];
+static int g_lmap_n;
+static size_t g_lmap_len;
+
+static void shell_lmap_reset(const char *base, unsigned long first) {
+    g_lmap_base = base;
+    g_lmap_len = 0;
+    g_lmap_n = 0;
+    if (base) {
+        g_lmap_off[0] = 0;
+        g_lmap_line[0] = first;
+        g_lmap_n = 1;
+    }
+}
+
+static void shell_lmap_add(size_t off, unsigned long line) {
+    g_lmap_len = off;
+    if (g_lmap_n < SHELL_LMAP_MAX) {
+        g_lmap_off[g_lmap_n] = off;
+        g_lmap_line[g_lmap_n] = line;
+        g_lmap_n++;
+    }
+}
+
+/* The physical line a pointer INTO the current logical line came from, or 0
+ * if it did not come from there -- a compound body that was copied out, or a
+ * nested one, keeps whatever line the enclosing construct set. */
+static unsigned long shell_lineno_at(const char *p);
+
+/* The line a BODY starts on. The keyword and the body are joined with a
+ * separator, so the keyword's own end is still on the keyword's line: step
+ * over the separator first, or every command in the body reports the line
+ * the compound opened on. */
+static unsigned long shell_lineno_body(const char *p) {
+    if (!p) return 0;
+    while (*p == ' ' || *p == '\t' || *p == ';' || *p == '\n') p++;
+    return shell_lineno_at(p);
+}
+
+static unsigned long shell_lineno_at(const char *p) {
+    if (!g_lmap_base || !p || p < g_lmap_base || g_lmap_n == 0) return 0;
+    size_t off = (size_t)(p - g_lmap_base);
+    /* A POINTER FROM SOMEWHERE ELSE IS NOT AN OFFSET. Compound bodies are
+     * copied out into their own buffers, and one of those at a higher
+     * address answered the range test and indexed into the wrong end of the
+     * map -- every `$LINENO` in a loop body reported the `done` line. */
+    if (off > g_lmap_len) return 0;
+    unsigned long best = 0;
+    for (int i = 0; i < g_lmap_n; i++)
+        if (g_lmap_off[i] <= off) best = g_lmap_line[i];
+        else break;
+    return best;
+}
+
 static char *g_param0;
 static char *g_positional[ARG_MAX];
 static int g_positional_count;
@@ -458,6 +527,11 @@ static char *g_readonly[SHELL_READONLY_MAX];
  * printed x=1 where POSIX (and bash, and dash) print nothing. */
 #define SHVAR_EXPORTED  0x01u
 #define SHVAR_READONLY  0x02u
+/* A NAMEREF holds the NAME of another variable, and reading it reads that
+ * one. `typeset -n ref=x; echo $ref` prints x's value, not the string "x".
+ * Two of them can point at each other, which is why every read follows the
+ * chain with a hop limit rather than recursing. */
+#define SHVAR_NAMEREF   0x04u
 static unsigned char g_env_flags[ENV_MAX];
 
 /* Length of "KEY" up to (but not including) the '='. Returns the
@@ -543,7 +617,53 @@ static const char *env_get(const char *key) {
     size_t klen = strlen(key);
     int idx = env_find(key, klen);
     if (idx < 0) return 0;
+    /* FOLLOW A NAMEREF, and give up on a cycle rather than on the stack.
+     *
+     *     typeset -n ref1=ref2 ; typeset -n ref2=ref1 ; echo $ref1
+     *
+     * is two variables naming each other; bash prints nothing for it. The
+     * hop limit is what makes that an empty answer instead of a hang. */
+    int hops = 0;
+    while ((g_env_flags[idx] & SHVAR_NAMEREF) && hops++ < 16) {
+        const char *target = g_env[idx] + klen + 1;
+        if (!*target) return "";
+        /* A REFERENCE TO SOMETHING THAT IS NOT A NAME IS NOT A REFERENCE.
+         *
+         *     ref=1 ; typeset -n ref ; echo $ref      bash: 1
+         *
+         * `1` and `#` cannot name a variable, so bash leaves the value
+         * alone rather than resolving to nothing. */
+        if (!shell_name_is_valid(target, strlen(target))) return target;
+        klen = strlen(target);
+        int nx = env_find(target, klen);
+        if (nx < 0) return "";           /* names something that is not set */
+        if (nx == idx) return "";        /* names itself */
+        idx = nx;
+    }
+    if (hops >= 16) return "";
     return g_env[idx] + klen + 1;
+}
+
+/* The name a nameref resolves to, or the name itself when it is not one.
+ * An ASSIGNMENT to a nameref writes THROUGH it. */
+static const char *env_deref_name(const char *key, char *buf, size_t cap) {
+    if (!key) return key;
+    size_t klen = strlen(key);
+    int idx = env_find(key, klen);
+    int hops = 0;
+    while (idx >= 0 && (g_env_flags[idx] & SHVAR_NAMEREF) && hops++ < 16) {
+        const char *target = g_env[idx] + klen + 1;
+        if (!*target) break;
+        size_t n = strlen(target);
+        if (n + 1 > cap) break;
+        memcpy(buf, target, n + 1);
+        key = buf;
+        klen = n;
+        int nx = env_find(target, n);
+        if (nx == idx) break;
+        idx = nx;
+    }
+    return key;
 }
 
 /* Drop entry at index `idx` (free its blob, shift the tail down). */
@@ -562,10 +682,38 @@ static void env_remove_at(int idx) {
 /* Install a fully-formed "KEY=VALUE" string. `kv_in` is COPIED -- the
  * caller retains ownership of its storage. Replaces an existing key
  * in place (frees the previous slot) so the table stays compact. */
+static const char *env_deref_name(const char *key, char *buf, size_t cap);
+
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
+
+    /* AN ASSIGNMENT TO A NAMEREF WRITES THROUGH IT.
+     *
+     *     x=X ; typeset -n ref=x ; ref=Y ; echo $x      ->  Y
+     *
+     * The attribute is put on AFTER the value by `typeset -n` itself, so the
+     * assignment that CREATES the reference does not come through here as a
+     * write to its own target. */
+    {
+        char nm[128], target[128];
+        if (klen + 1 <= sizeof nm) {
+            memcpy(nm, kv_in, klen);
+            nm[klen] = '\0';
+            const char *real = env_deref_name(nm, target, sizeof target);
+            if (real != nm && strcmp(real, nm) != 0) {
+                char rebuilt[256];
+                size_t rl = strlen(real), vl = strlen(kv_in + klen + 1);
+                if (rl + 1 + vl + 1 <= sizeof rebuilt) {
+                    memcpy(rebuilt, real, rl);
+                    rebuilt[rl] = '=';
+                    memcpy(rebuilt + rl + 1, kv_in + klen + 1, vl + 1);
+                    return env_set_kv(rebuilt);
+                }
+            }
+        }
+    }
     if (shell_readonly_key(kv_in, klen)) {
         shell_readonly_print_error(kv_in, klen, "shell");
         return -1;
@@ -1849,6 +1997,7 @@ static void cmd_export(int argc, char **argv) {
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
+    bool set_nameref = false, clear_nameref = false;
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -1859,7 +2008,8 @@ static void cmd_declare(int argc, char **argv) {
             switch (*f) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; break;
-            case 'A': case 'a': case 'i': case 'n': case 'u': case 'l':
+            case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
+            case 'A': case 'a': case 'i': case 'u': case 'l':
             case 'F': case 'f': case 'p': case 'g': case 't': break;
             default:  known = false; break;
             }
@@ -1903,6 +2053,11 @@ static void cmd_declare(int argc, char **argv) {
         if (set_export)   g_env_flags[idx] |= SHVAR_EXPORTED;
         if (clear_export) g_env_flags[idx] &= ~(unsigned)SHVAR_EXPORTED;
         if (set_readonly) (void)shell_readonly_mark(name, klen);
+        /* The attribute goes on AFTER the value, because the value is the
+         * name being referred to and setting it must not go through the
+         * reference that does not exist yet. */
+        if (set_nameref)   g_env_flags[idx] |= SHVAR_NAMEREF;
+        if (clear_nameref) g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
         /* `set -a` exports every variable an assignment creates, and a
          * declaration utility makes assignments like any other. */
         if (g_opt_allexport) g_env_flags[idx] |= SHVAR_EXPORTED;
@@ -6002,6 +6157,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     bool first_line = true;
     while (*p) {
         g_shell_lineno++;
+        unsigned long line_first = g_shell_lineno;
         char *line_start = p;
         while (*p && *p != '\n' && *p != '\r') p++;
         char saved = *p;
@@ -6121,6 +6277,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             }
             size_t alen = (line == accum) ? strlen(accum)
                         : (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
+            /* The offset map is keyed on THIS buffer; see shell_lineno_at. */
+            shell_lmap_reset(accum, g_shell_lineno);
             /* The newline that ended this line's comment is about to be
              * replaced by "; ", so the comment has to go with it. */
             shell_strip_comment(accum);
@@ -6132,6 +6290,11 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 char nsaved = *p;
                 if (*p) *p++ = '\0';
                 if (nsaved == '\r' && *p == '\n') p++;
+                /* A PHYSICAL LINE IS A LINE WHETHER IT IS JOINED OR SKIPPED.
+                 * Counting only the ones that get appended left every
+                 * `$LINENO` after a compound containing a blank or comment
+                 * line short by one for each line skipped. */
+                g_shell_lineno++;
 
                 char *nl = nstart;
                 while (*nl == ' ' || *nl == '\t') nl++;
@@ -6198,6 +6361,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     break;
                 }
                 memcpy(accum + alen, sep, seplen); alen += seplen;
+                /* The counter was advanced where the line was CONSUMED, a
+                 * few lines up: this only records where it landed. */
+                shell_lmap_add(alen, g_shell_lineno);
                 memcpy(accum + alen, nl, nllen);   alen += nllen;
                 accum[alen] = '\0';
                 /* This physical line may open here-documents of its own --
@@ -6243,7 +6409,14 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             if (accum) kfree(accum);
             break;
         }
+        /* TEXT ON THE LINE REPORTS THE LINE IT WAS WRITTEN ON, which is the
+         * FIRST of however many the reader joined: `case $LINENO in` on line 1
+         * of a four-line construct is line 1, not the `esac`. The counter is
+         * put back afterwards so the next line still follows on. */
+        unsigned long line_last = g_shell_lineno;
+        g_shell_lineno = line_first;
         execute_line_text(line);
+        g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
         last = g_last_status;
         shell_heredoc_reset();
@@ -11967,6 +12140,13 @@ static const char *shell_expand_aliases(const char *src, char *buf,
         kprintf("alias: expansion too long\n");
         return 0;
     }
+    /* NOTHING SUBSTITUTED, SO HAND BACK THE ORIGINAL. The rewritten copy is
+     * not byte-identical even when no alias fired -- the expander re-emits
+     * the words -- and anything holding an OFFSET into the line loses its
+     * meaning against the copy. `$LINENO` inside a compound is exactly
+     * that: the reader records where each physical line landed in the
+     * joined buffer, and a silently different buffer threw the map away. */
+    if (!changed) return cur;
     return buf;
 }
 
@@ -15404,7 +15584,13 @@ static bool shell_try_if_command(const char *src) {
                 shell_set_status(2);
                 return true;
             }
-            execute_line_text(yes);
+            {
+                unsigned long ln_save = g_shell_lineno;
+                unsigned long bl = shell_lineno_body(after_then);
+                if (bl) g_shell_lineno = bl;
+                execute_line_text(yes);
+                g_shell_lineno = ln_save;
+            }
             return true;
         }
 
@@ -15421,7 +15607,13 @@ static bool shell_try_if_command(const char *src) {
                 shell_set_status(2);
                 return true;
             }
-            execute_line_text(no);
+            {
+                unsigned long ln_save = g_shell_lineno;
+                unsigned long bl = shell_lineno_body(else_body);
+                if (bl) g_shell_lineno = bl;
+                execute_line_text(no);
+                g_shell_lineno = ln_save;
+            }
             return true;
         }
 
@@ -15514,6 +15706,7 @@ static bool shell_try_for_command(const char *src) {
             return true;
         }
     }
+    unsigned long body_line = shell_lineno_body(do_end);
     if (shell_copy_segment(body, sizeof(body), do_end,
                            done_at) < 0) {
         kprintf("for: command too long\n");
@@ -15632,7 +15825,13 @@ static bool shell_try_for_command(const char *src) {
             last = 1;
             goto done;
         }
+        unsigned long ln_save = g_shell_lineno;
+        if (body_line) g_shell_lineno = body_line;
         execute_line_text(body);
+        /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
+         * line made every line after the compound short by the number
+         * of lines the body spanned. */
+        g_shell_lineno = ln_save;
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
@@ -15698,6 +15897,7 @@ static bool shell_try_while_command(const char *src) {
 
     char cond[LINE_MAX];
     char body[LINE_MAX];
+    unsigned long body_line = shell_lineno_body(do_end);
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
         shell_copy_segment(body, sizeof(body), do_end,
                            done_at) < 0) {
@@ -15731,7 +15931,13 @@ static bool shell_try_while_command(const char *src) {
         if (g_last_status != 0) {
             goto done;
         }
+        unsigned long ln_save = g_shell_lineno;
+        if (body_line) g_shell_lineno = body_line;
         execute_line_text(body);          /* the BODY is not exempt */
+        /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
+         * line made every line after the compound short by the number
+         * of lines the body spanned. */
+        g_shell_lineno = ln_save;
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
@@ -15801,6 +16007,7 @@ static bool shell_try_until_command(const char *src) {
 
     char cond[LINE_MAX];
     char body[LINE_MAX];
+    unsigned long body_line = shell_lineno_body(do_end);
     if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
         shell_copy_segment(body, sizeof(body), do_end,
                            done_at) < 0) {
@@ -15838,7 +16045,13 @@ static bool shell_try_until_command(const char *src) {
         if (g_last_status == 0) {
             goto done;
         }
+        unsigned long ln_save = g_shell_lineno;
+        if (body_line) g_shell_lineno = body_line;
         execute_line_text(body);
+        /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
+         * line made every line after the compound short by the number
+         * of lines the body spanned. */
+        g_shell_lineno = ln_save;
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_EXIT) {
@@ -16612,6 +16825,7 @@ static bool shell_try_subshell_command(const char *src) {
     }
 
     char body[LINE_MAX];
+    unsigned long body_line = shell_lineno_body(body_start);
     if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
         kprintf("subshell: body too long\n");
         shell_set_status(2);
@@ -16691,7 +16905,13 @@ static bool shell_try_subshell_command(const char *src) {
     g_shell_flow_status = 0;
     g_shell_loop_depth = 0;
 
+    unsigned long ln_save = g_shell_lineno;
+    if (body_line) g_shell_lineno = body_line;
     execute_line_text(body);
+    /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
+     * line made every line after the compound short by the number
+     * of lines the body spanned. */
+    g_shell_lineno = ln_save;
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_EXIT) {
         rc = g_shell_flow_status;
@@ -16760,6 +16980,7 @@ static bool shell_try_group_command(const char *src) {
     }
 
     char body[LINE_MAX];
+    unsigned long body_line = shell_lineno_body(body_start);
     if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
         kprintf("group: body too long\n");
         shell_set_status(2);
@@ -16826,7 +17047,13 @@ static bool shell_try_group_command(const char *src) {
         io_active = true;
     }
 
+    unsigned long ln_save = g_shell_lineno;
+    if (body_line) g_shell_lineno = body_line;
     execute_line_text(body);
+    /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
+     * line made every line after the compound short by the number
+     * of lines the body spanned. */
+    g_shell_lineno = ln_save;
     int rc = g_last_status;
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_set_status(rc);
@@ -17705,7 +17932,18 @@ static void execute_line_text(const char *src) {
     if (abuf) {
         const char *expanded = shell_expand_aliases(src ? src : "", abuf,
                                                     SHELL_PARSE_BUF_MAX);
-        if (expanded) line_src = expanded;
+        if (expanded) {
+            /* THE MAP IS KEYED ON A BUFFER, and this is where the buffer
+             * changes. An alias pass that changed nothing produces an
+             * identical copy, so the offsets still mean what they meant; one
+             * that changed something invalidates them, and `$LINENO` falls
+             * back to the line the reader was on. */
+            if (expanded != src && g_lmap_base == src) {
+                if (src && strcmp(expanded, src) == 0) g_lmap_base = expanded;
+                else g_lmap_base = 0;
+            }
+            line_src = expanded;
+        }
         else {
             /* Expansion overflowed. Say so rather than silently running the
              * unexpanded text, which would look like the alias never existed. */
