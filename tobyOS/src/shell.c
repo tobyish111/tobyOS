@@ -10099,6 +10099,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
         if (*p == '$' && p[1] == '\'') {
             p += 2;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            bool stop_nul = false;      /* a NUL ends the word; see below */
             while (*p && *p != '\'') {
                 char c = *p;
                 if (c == '\\' && p[1]) {
@@ -10143,7 +10144,19 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 } else {
                     p++;
                 }
-                if (c && shell_append_char(out, &pos, cap, c) < 0) return -1;
+                /* A NUL ENDS THE WORD. `$'foo\0bar'` is the three characters
+                 * `foo` as far as anything downstream can tell: the word is a
+                 * C string, and so is the filename it becomes.
+                 *
+                 *     touch foo ; test -f $'foo\0bar'      bash: status 0
+                 *
+                 * Dropping the NUL and carrying on spliced the two halves
+                 * into `foobar`, a name that does not exist -- the one answer
+                 * that is wrong either way. Stopping there is what bash's
+                 * execve() does with the same bytes. */
+                if (!c) { stop_nul = true; continue; }
+                if (!stop_nul && shell_append_char(out, &pos, cap, c) < 0)
+                    return -1;
             }
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
@@ -11894,6 +11907,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 SH_LIT_CLOSE();
                 word_quoted = true;
                 p += 2;
+                bool stop_nul = false;      /* a NUL ends the word; see below */
                 while (*p && *p != '\'') {
                     if (*p == '\\' && p[1]) {
                         p++;
@@ -11935,9 +11949,27 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                         }
                         default: c = *p++; break;
                         }
-                        if (c && shell_append_char(words, &wpos, word_cap, c) < 0) return -1;
+                        /* A NUL ENDS THE WORD. `$'foo\0bar'` is the three characters
+                         * `foo` as far as anything downstream can tell: the word is a
+                         * C string, and so is the filename it becomes.
+                         *
+                         *     touch foo ; test -f $'foo\0bar'      bash: status 0
+                         *
+                         * Dropping the NUL and carrying on spliced the two halves
+                         * into `foobar`, a name that does not exist -- the one answer
+                         * that is wrong either way. Stopping there is what bash's
+                         * execve() does with the same bytes. */
+                        if (!c) { stop_nul = true; continue; }
+                        if (!stop_nul &&
+                            shell_append_char(words, &wpos, word_cap, c) < 0)
+                            return -1;
                     } else {
-                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) return -1;
+                        /* Ordinary characters after the NUL are consumed and dropped
+                         * too -- the word ended at the NUL. */
+                        if (!stop_nul &&
+                            shell_append_char(words, &wpos, word_cap, *p) < 0)
+                            return -1;
+                        p++;
                     }
                 }
                 if (*p == '\'') p++;
