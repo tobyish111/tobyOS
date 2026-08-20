@@ -95,6 +95,12 @@ static shell_write_fn_t g_shell_out;
 static void *g_shell_out_ctx;
 static struct file *g_shell_in;
 static int g_last_status;
+/* Set by shell_parse_error. A SYNTAX error is not an `exit`: a command
+ * substitution absorbs the latter (it is a subshell) and must NOT absorb
+ * the former, because a script that cannot be parsed does not run at all.
+ *     echo $(if true)      bash: nothing, exit 2
+ * tsh printed the empty substitution and carried on. */
+static bool g_parse_error;
 static int g_last_bg_pid;
 static int g_getopts_last_optind;
 static int g_getopts_char_index;
@@ -236,6 +242,9 @@ static int g_exec_line_depth;
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static bool shell_word_has_argmark(const char *s);
+static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap);
+
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
@@ -1390,33 +1399,6 @@ static bool shell_special_builtin_name(const char *name) {
  * `env K=V`     -- shortcut for `setenv K V`
  * `setenv K V`  -- create/replace
  * `unsetenv K`  -- remove */
-static void cmd_env(int argc, char **argv) {
-    shell_set_status(0);
-    if (argc <= 1) {
-        /* The ENVIRONMENT, not the variable table -- `env` is defined as what
-         * a child would receive, so it must apply the same export filter
-         * shell_build_env_overlay does. */
-        for (int i = 0; i < g_envc; i++)
-            if (g_env_flags[i] & SHVAR_EXPORTED) shell_printf("%s\n", g_env[i]);
-        return;
-    }
-    /* "env K=V [K=V ...]" -- treat each arg as a literal "KEY=VALUE"
-     * blob and install via env_set_kv. */
-    for (int i = 1; i < argc; i++) {
-        size_t klen = env_key_len(argv[i]);
-        const char *eq = (klen > 0) ? (argv[i] + klen) : 0;
-        if (!eq || *eq != '=') {
-            kprintf("env: '%s' is not KEY=VALUE\n", argv[i]);
-            shell_set_status(1);
-            continue;
-        }
-        if (env_set_kv(argv[i]) < 0) {
-            kprintf("env: set '%s' failed\n", argv[i]);
-            shell_set_status(1);
-        }
-    }
-}
-
 static void cmd_setenv(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 3) {
@@ -2689,12 +2671,55 @@ static void cmd_cd(int argc, char **argv) {
             return;
         }
         print_new = true;
+    } else if (strcmp(argv[1], "-L") == 0 || strcmp(argv[1], "-P") == 0) {
+        /* -L is the default and -P differs only where symlinks exist, which
+         * this VFS does not resolve; both are accepted so a script that says
+         * `cd -P "$dir"` is not left one argument short. */
+        target = (argc > 2) ? argv[2] : env_get("HOME");
+        if (!target || !*target) target = "/";
     } else {
         target = argv[1];
     }
 
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(target, path, sizeof(path), "cd") < 0) return;
+
+    /* CDPATH: a RELATIVE operand that is not `.` or `..` is looked for under
+     * each CDPATH entry first, and when one of those is used the new
+     * directory is echoed on stdout. POSIX XCU cd, step 5. `cd foo` with
+     * CDPATH=/tmp/spam went straight to ./foo and reported "no such file". */
+    if (target[0] != '/' && env_get("CDPATH") &&
+        strcmp(target, ".") != 0 && strcmp(target, "..") != 0 &&
+        strncmp(target, "./", 2) != 0 && strncmp(target, "../", 3) != 0) {
+        struct vfs_stat here;
+        if (vfs_stat(path, &here) != VFS_OK || here.type != VFS_TYPE_DIR) {
+            const char *cp = env_get("CDPATH");
+            while (*cp) {
+                const char *end = cp;
+                while (*end && *end != ':') end++;
+                char cand[VFS_PATH_MAX];
+                size_t dl = (size_t)(end - cp);
+                if (dl == 0) { cand[0] = '.'; cand[1] = ' '; dl = 1; }
+                else if (dl + 1 < sizeof cand) {
+                    memcpy(cand, cp, dl);
+                    cand[dl] = ' ';
+                } else { cp = *end ? end + 1 : end; continue; }
+                char full[VFS_PATH_MAX];
+                if (ksnprintf(full, sizeof full, "%s/%s", cand, target) > 0) {
+                    char res[VFS_PATH_MAX];
+                    struct vfs_stat cst;
+                    if (shell_canonicalize_path(full, res, sizeof res) >= 0 &&
+                        vfs_stat(res, &cst) == VFS_OK &&
+                        cst.type == VFS_TYPE_DIR) {
+                        memcpy(path, res, strlen(res) + 1);
+                        print_new = true;
+                        break;
+                    }
+                }
+                cp = *end ? end + 1 : end;
+            }
+        }
+    }
 
     struct vfs_stat st;
     int rc = vfs_stat(path, &st);
@@ -5436,9 +5461,12 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             bool glued_eq = (prev == '=');
             /* Glued to the end of an ordinary WORD: `echo a(b)`,
              * `foo$identity('z')`. A subshell never starts that way. */
+            /* `!` is a reserved word of its own, so `!(cmd)` is a negated
+             * subshell and not a word with a paren glued onto it -- the shape
+             * `if !($have_a && $have_b); then` uses. */
             bool glued_word = prev && prev != '=' && !is_space(prev) &&
                               prev != ';' && prev != '&' && prev != '|' &&
-                              prev != '(' && prev != ')';
+                              prev != '(' && prev != ')' && prev != '!';
             if (glued_eq) {
                 /* `declare a=(x y)` and `local a=()` are legal: a declaration
                  * utility takes ASSIGNMENTS as its arguments, so its operands
@@ -8437,6 +8465,8 @@ static void cmd_fc(int argc, char **argv) {
     shell_set_status(0);
 }
 
+static void cmd_env(int argc, char **argv);
+
 static const struct cmd cmds[] = {
     { "help",   "list available commands",      cmd_help   },
     { "clear",  "clear the screen",             cmd_clear  },
@@ -8974,6 +9004,8 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
      * ENCLOSING command, and letting the inner status leak out made
      * `echo $?` report the substitution's failure. */
     int saved_status = g_last_status;
+    bool saved_parse_error = g_parse_error;
+    g_parse_error = false;
     /* ...unless `shopt -s inherit_errexit` says otherwise, which is exactly
      * what that option means: the substitution's subshell runs WITH errexit
      * and stops at its first failure. The parent still does not inherit the
@@ -8994,10 +9026,14 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     g_capture_last_status = g_last_status;
     if (g_shell_flow == SHELL_FLOW_EXIT) {
         g_capture_last_status = g_shell_flow_status;
-        g_shell_flow = SHELL_FLOW_NONE;
-        g_shell_flow_status = 0;
+        /* ...but a PARSE error is not an exit -- see g_parse_error. */
+        if (!g_parse_error) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+        }
     }
     g_last_status = saved_status;
+    g_parse_error = saved_parse_error;
 
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
@@ -9344,6 +9380,67 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
     out[0] = '\0';
 
     while (*p) {
+        /* `$'...'` IS ANSI-C QUOTING, and it is recognised inside a `${...}`
+         * word even where a plain `'...'` is not:
+         *
+         *     x=abc ; echo ${x%$'b'*}      bash: a
+         *
+         * Without it the pattern was the six characters `$'b'*`, which match
+         * nothing. The escape set is the tokenizer's; the result is quoted, so
+         * it is wrapped in no-split marks like any other quoted span. */
+        if (*p == '$' && p[1] == '\'') {
+            p += 2;
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            while (*p && *p != '\'') {
+                char c = *p;
+                if (c == '\\' && p[1]) {
+                    p++;
+                    switch (*p) {
+                    case 'a': c = '\a'; p++; break;
+                    case 'b': c = '\b'; p++; break;
+                    case 'e': c = 0x1B; p++; break;
+                    case 'f': c = '\f'; p++; break;
+                    case 'n': c = '\n'; p++; break;
+                    case 'r': c = '\r'; p++; break;
+                    case 't': c = '\t'; p++; break;
+                    case 'v': c = '\v'; p++; break;
+                    case '\\': c = '\\'; p++; break;
+                    case '\'': c = '\''; p++; break;
+                    case '"': c = '"'; p++; break;
+                    case '0': {
+                        p++;
+                        int v = 0, cnt = 0;
+                        while (cnt < 3 && *p >= '0' && *p <= '7') {
+                            v = v * 8 + (*p++ - '0'); cnt++;
+                        }
+                        c = (char)v;
+                        break;
+                    }
+                    case 'x': {
+                        p++;
+                        int v = 0, cnt = 0;
+                        while (cnt < 2) {
+                            int d = -1;
+                            if (*p >= '0' && *p <= '9') d = *p - '0';
+                            else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+                            else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+                            if (d < 0) break;
+                            v = v * 16 + d; p++; cnt++;
+                        }
+                        c = (char)v;
+                        break;
+                    }
+                    default: c = *p++; break;
+                    }
+                } else {
+                    p++;
+                }
+                if (c && shell_append_char(out, &pos, cap, c) < 0) return -1;
+            }
+            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (*p == '\'') p++;
+            continue;
+        }
         if (sq_syntax && *p == '\'') {           /* literal to next quote */
             p++;
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
@@ -9395,8 +9492,9 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                  * The `${...}` word inherits the enclosing quoting, and
                  * sq_syntax is already how this function is told which it is
                  * in (single quotes stop being syntax inside double ones). */
+                if (p[1] == '\n') { p += 2; continue; }   /* continuation */
                 if (p[1] == '$' || p[1] == '`' || p[1] == '"' ||
-                    p[1] == '\\' || p[1] == '\n') {
+                    p[1] == '\\') {
                     p++;
                 } else if (shell_append_char(out, &pos, cap, *p++) < 0) {
                     return -1;
@@ -9671,11 +9769,26 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
      * One empty positional parameter joins to an empty string, but the join
      * carries a SHELL_ARG_MARK to record the field boundary -- so value[0] was
      * 0x01, the parameter looked non-null, and the `:-` branch never ran. */
-    bool is_null = true;
-    for (const char *nz = value; *nz; nz++) {
-        if (*nz == SHELL_ARG_MARK || *nz == SHELL_NOSPLIT_MARK) continue;
-        is_null = false;
-        break;
+    bool is_null;
+    {
+        /* `$@` ARRIVES WITH FIELD MARKERS IN IT, so "is it null?" cannot be a
+         * test on the first byte -- and it cannot simply ignore the markers
+         * either, because the parameters JOIN WITH A SPACE for this question:
+         *
+         *     set -- ""        ${@:-minus}  ->  minus   (null)
+         *     set -- "" ""     ${@:-minus}  ->  (empty) (NOT null: " ")
+         *
+         * One empty parameter is the empty string; two empty parameters are a
+         * single space. The first marker is a boundary rather than a
+         * separator, so it is the SECOND one onwards that stands for a
+         * space -- which is why counting them decides this. */
+        size_t marks = 0, text = 0;
+        for (const char *nz = value; *nz; nz++) {
+            if (*nz == SHELL_ARG_MARK)     { marks++; continue; }
+            if (*nz == SHELL_NOSPLIT_MARK) continue;
+            text++;
+        }
+        is_null = (text == 0 && marks <= 1);
     }
 
     if (length_mode) {
@@ -9694,11 +9807,32 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     char expanded_word[SHELL_PARSE_BUF_MAX];
     expanded_word[0] = '\0';
 
+/* The WORD of `${x-WORD}` is ONE value, so a `"$@"` inside it joins with a
+ * space rather than making fields:
+ *
+ *     set -- '1 2' '3 4'
+ *     argv.py "X${unset=x"$@"x}X"      bash: ['Xx1 2 3 4xX']
+ *
+ * tsh let the field markers out of the substitution and the caller split on
+ * them, giving two arguments. Unquoted the result still splits on IFS -- but
+ * on the SPACES it now contains, which is how bash gets four fields from the
+ * unquoted spelling of the same thing. */
+#define SH_JOIN_WORD_MARKS()                                                  \
+    do {                                                                      \
+        if (shell_word_has_argmark(expanded_word)) {                          \
+            char jw[SHELL_PARSE_BUF_MAX];                                     \
+            if (shell_argmarks_to_spaces(expanded_word, jw, sizeof jw) < 0)   \
+                return -1;                                                    \
+            memcpy(expanded_word, jw, strlen(jw) + 1);                        \
+        }                                                                     \
+    } while (0)
+
     switch (opch) {
     case '-':
         if (!missing) return shell_append_str(buf, pos, cap, value);
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
+        SH_JOIN_WORD_MARKS();
         return shell_append_str(buf, pos, cap, expanded_word);
     case '=':
         if (!missing) return shell_append_str(buf, pos, cap, value);
@@ -9708,6 +9842,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         }
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
+        SH_JOIN_WORD_MARKS();
         if (env_set(name, expanded_word) < 0) {
             kprintf("shell: failed to assign '%s'\n", name);
             return -1;
@@ -9724,10 +9859,12 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         if (missing) return 0;
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
+        SH_JOIN_WORD_MARKS();
         return shell_append_str(buf, pos, cap, expanded_word);
     default:
         return -1;
     }
+#undef SH_JOIN_WORD_MARKS
 }
 
 struct shell_arith {
@@ -10615,6 +10752,11 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                          * character out of every Windows path and regex a
                          * script ever put in double quotes. */
                         char nxt = p[1];
+                        /* BACKSLASH-NEWLINE IS A LINE CONTINUATION EVEN
+                         * INSIDE DOUBLE QUOTES: both bytes go away. Dropping
+                         * only the backslash left the newline in the string,
+                         * so one line of source came out as two of output. */
+                        if (nxt == '\n') { p += 2; continue; }
                         if (nxt != '$' && nxt != '`' && nxt != '"' &&
                             nxt != '\\' && nxt != '\n') {
                             if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
@@ -11393,6 +11535,35 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
  *
  * Returns 1 if the word carried markers (and has been fully handled), 0 if it
  * carried none and should take the normal path, -1 on error. */
+/* Does the word carry `$@` field markers? */
+static bool shell_word_has_argmark(const char *s) {
+    for (; s && *s; s++) if (*s == SHELL_ARG_MARK) return true;
+    return false;
+}
+
+/* Collapse `$@` field markers into the single space that joins the
+ * parameters where no field splitting is going to happen. The FIRST marker is
+ * a boundary, not a separator (see shell_append_positional_join), so it is
+ * dropped rather than turned into a leading space. No-split markers travel
+ * with the text and are removed here too. */
+static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap) {
+    size_t o = 0;
+    bool first = true;
+    for (const char *q = src; *q; q++) {
+        if (*q == SHELL_NOSPLIT_MARK) continue;
+        if (*q == SHELL_ARG_MARK) {
+            if (first) { first = false; continue; }
+            if (o + 1 >= cap) return -1;
+            out[o++] = ' ';
+            continue;
+        }
+        if (o + 1 >= cap) return -1;
+        out[o++] = *q;
+    }
+    out[o] = ' ';
+    return 0;
+}
+
 static int shell_add_marked_words(struct shell_pipeline *pl,
                                   struct shell_simple *cur,
                                   const char *word, bool quoted) {
@@ -11447,6 +11618,23 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
          * keeps each parameter whole, spaces and all. */
         if (quoted) {
             if (shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
+        } else if (!*saved) {
+            /* AN EMPTY PARAMETER IS STILL A FIELD -- UNLESS IT IS THE LAST.
+             *
+             *     set -- one "" two    argv.py $@  ->  ['one', '', 'two']
+             *     set -- 'a b' c ''    argv.py $@  ->  ['a', 'b', 'c']
+             *
+             * The fields of `$@` are already split, so running an empty one
+             * back through the splitter produces nothing and the middle
+             * argument vanished. A TRAILING empty field is a different thing:
+             * field splitting discards it, which is why bash's answers differ
+             * between those two lines. (The ZERO-parameter case never reaches
+             * here -- it is one bare marker with no text, and the check above
+             * breaks out of the loop for it.) */
+            const char *tail = p;
+            while (*tail == SHELL_NOSPLIT_MARK) tail++;
+            if (*tail != ' ' &&
+                shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
         } else {
             if (shell_add_arg(pl, cur, saved, false) < 0) return -1;
         }
@@ -11488,6 +11676,38 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * threading it through the six call sites below would say the same thing
      * more slowly. */
     g_arg_from_expansion = expanded;
+
+    /* `"$@"` MAKES FIELDS ONLY WHERE FIELDS ARE MADE.
+     *
+     *     set -- x y z
+     *     var="[$@]" ; argv.py "$var"      bash: ['[x y z]']
+     *
+     * An assignment is not field split, so the parameters join with a space
+     * there, exactly as `"$*"` would. tsh let the field markers through and
+     * the word became `var=[x`, `y`, `z]` -- a prefix assignment followed by
+     * the command `y`. Decide before shell_add_marked_words runs, because
+     * that is what turns the markers into separate arguments. */
+    {
+        char sh0[80];
+        size_t so = 0;
+        for (const char *q = word; *q && so + 1 < sizeof sh0; q++)
+            if (*q != SHELL_NOSPLIT_MARK) sh0[so++] = *q;
+        sh0[so] = ' ';
+        size_t k0 = env_key_len(sh0);
+        bool assign0 = (sh0[k0] == '=' && shell_name_is_valid(sh0, k0));
+        bool nosplit_ctx = assign0 &&
+            (cur->argc == 0 ||
+             (assign_src && shell_is_declaration_utility(cur->argv[0])));
+        if (nosplit_ctx && shell_word_has_argmark(word)) {
+            char joined[SHELL_PARSE_BUF_MAX];
+            if (shell_argmarks_to_spaces(word, joined, sizeof joined) < 0)
+                return -1;
+            char *jsaved = 0;
+            if (shell_pipeline_save_word(pl, joined, &jsaved) < 0) return -1;
+            return shell_add_one_arg(pl, cur, jsaved, false);
+        }
+    }
+
     int mrc = shell_add_marked_words(pl, cur, word, quoted);
     if (mrc != 0) return mrc < 0 ? -1 : 0;
 
@@ -12359,8 +12579,13 @@ static int shell_run_function(struct shell_simple *cmd) {
         io_active = true;
     }
 
+    /* A FUNCTION DOES NOT CHANGE `$0`. POSIX XCU 2.9.5: the positional
+     * parameters are replaced, `$0` is not -- so `case $0 in *sh)` inside a
+     * function still matches the SCRIPT. tsh set it to the function's name,
+     * and the arm never matched. shell_enter_dot_params is the same frame
+     * with `$0` carried through, which is exactly the rule `.` follows. */
     struct shell_param_frame frame;
-    if (shell_enter_script_params(&frame, cmd->argv[0],
+    if (shell_enter_dot_params(&frame,
                                   cmd->argc - 1, &cmd->argv[1]) < 0) {
         kprintf("%s: failed to set function parameters\n", cmd->argv[0]);
         if (io_active) shell_restore_io_frame(&io_frame);
@@ -12748,6 +12973,66 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     }
     *out_pid = pid;
     return 0;
+}
+
+static void cmd_env(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        /* The ENVIRONMENT, not the variable table -- `env` is defined as what
+         * a child would receive, so it must apply the same export filter
+         * shell_build_env_overlay does. */
+        for (int i = 0; i < g_envc; i++)
+            if (g_env_flags[i] & SHVAR_EXPORTED) shell_printf("%s\n", g_env[i]);
+        return;
+    }
+    /* `env [-i] [NAME=VALUE]... [COMMAND [ARG]...]` RUNS THE COMMAND.
+     *
+     *     env echo 'external ok'      ->  external ok
+     *     env time -f '%e' true       ->  runs time
+     *
+     * tsh only ever did the assignment half, so the first non-assignment
+     * argument was reported as "not KEY=VALUE" and the command never ran --
+     * and `env CMD` is how ./configure-shaped scripts ask for a utility
+     * without the shell's builtin version of it. The assignments scope to the
+     * COMMAND, which is what a command prefix does, so this hands the whole
+     * thing to the prefix path rather than editing the shell's own
+     * environment. */
+    int i = 1;
+    while (i < argc && argv[i][0] == '-' && argv[i][1]) {
+        if (strcmp(argv[i], "-i") == 0 ||
+            strcmp(argv[i], "--ignore-environment") == 0) {
+            i++;                      /* a clean environment is not modelled */
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        kprintf("env: unknown option '%s'\n", argv[i]);
+        shell_set_status(125);
+        return;
+    }
+
+    int first_assign = i;
+    while (i < argc) {
+        size_t klen = env_key_len(argv[i]);
+        if (klen == 0 || argv[i][klen] != '=') break;
+        i++;
+    }
+
+    if (i >= argc) {
+        /* Assignments only -- set them in this shell, as tsh always did. */
+        for (int k = first_assign; k < argc; k++) {
+            if (env_set_kv(argv[k]) < 0) {
+                kprintf("env: set '%s' failed\n", argv[k]);
+                shell_set_status(1);
+            }
+        }
+        return;
+    }
+
+    struct shell_simple cmd;
+    shell_simple_init(&cmd);
+    for (int k = first_assign; k < argc && cmd.argc < ARG_MAX; k++)
+        cmd.argv[cmd.argc++] = argv[k];
+    shell_set_status(shell_run_single(&cmd, false));
 }
 
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
@@ -13311,6 +13596,7 @@ static bool shell_compound_tail_redirs(const char *src, const char *tail,
  * the status by hand. */
 static void shell_parse_error(void) {
     shell_set_status(2);
+    g_parse_error = true;
     if (g_shell_flow == SHELL_FLOW_NONE) {
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = 2;
@@ -14179,6 +14465,27 @@ static bool shell_try_function_definition(const char *src) {
     }
     memcpy(name, name_start, name_len);
     name[name_len] = '\0';
+
+    /* A REDIRECTION AFTER `}` BELONGS TO THE DEFINITION, NOT TO THE CALL.
+     *
+     *     fun() { echo hi; } 1>&2
+     *     fun                        # writes to STDERR, every time
+     *
+     * tsh threw the tail away and `fun` printed on stdout. Storing the body as
+     * the whole group WITH its redirection is enough: the group parser already
+     * applies a trailing redirection to everything inside it, and the text is
+     * what gets re-executed on each call. */
+    {
+        const char *tail = shell_skip_blanks(body_end + 1);
+        if (*tail && *tail != ';' && *tail != '&' && *tail != '|') {
+            char wrapped[LINE_MAX];
+            int wn = ksnprintf(wrapped, sizeof wrapped, "{ %s; } %s",
+                               body, tail);
+            if (wn > 0 && (size_t)wn < sizeof wrapped)
+                memcpy(body, wrapped, (size_t)wn + 1);
+        }
+    }
+
     /* A FUNCTION BODY IS PARSED WHEN IT IS DEFINED, not when it is called.
      *
      *     f() { %foo=(); }        # bash: syntax error, exit 2, f never runs
@@ -15204,7 +15511,12 @@ static void execute_line_text_inner(const char *src) {
      * `&&`/`||`/`;` -- `!` binds to its own pipeline, not to the whole list. */
     {
         const char *q = shell_skip_blanks(src);
-        if (q[0] == '!' && (q[1] == ' ' || q[1] == '\t')) {
+        /* `!(cmd)` and `!{ cmd; }` need no space -- `!` is a reserved word,
+         * and `if !($have_a && $have_b); then` is the shape real configure
+         * scripts use. tsh required a blank and went looking for
+         * `/bin/!(false`. */
+        if (q[0] == '!' && (q[1] == ' ' || q[1] == '\t' ||
+                            q[1] == '(' || q[1] == '{')) {
             const char *rest = shell_skip_blanks(q + 1);
             if (*rest) {
                 /* A NEGATED command is exempt from errexit -- `set -e; ! false`
@@ -15234,9 +15546,12 @@ static void execute_line_text_inner(const char *src) {
      * had this individually; doing it once, before dispatch, covers every
      * compound and cannot drift between them.
      *
-     * The `&` has to be the LAST token at the OUTERMOST level: `for ...; do
-     * a & b; done` has one inside the body, and `2>&1` is not a token at all
-     * (the redirection operator absorbs it). */
+     * The `&` is the FIRST one at the OUTERMOST level; whatever follows it is
+     * a separate command and runs afterwards, which is what makes
+     * `{ false; echo async; } & wait` work -- that used to be "group:
+     * expected only redirections after '}'". `for ...; do a & b; done` has one
+     * inside the body, and `2>&1` is not a token at all (the redirection
+     * operator absorbs it). */
     {
         const char *q = shell_skip_blanks(src);
         bool compound_start =
@@ -15250,7 +15565,7 @@ static void execute_line_text_inner(const char *src) {
             struct shell_scan st;
             shell_scan_init(&st);
             st.start = q;
-            const char *p = q, *amp = 0;
+            const char *p = q, *amp = 0, *rest = 0;
             while (*p) {
                 while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
                 if (!*p) break;
@@ -15259,7 +15574,7 @@ static void execute_line_text_inner(const char *src) {
                 bool top = !shell_scan_incomplete(&st);
                 shell_scan_token(&st, &p);
                 if (p <= tok) p = tok + 1;
-                amp = (lone_amp && top) ? tok : 0;
+                if (lone_amp && top) { amp = tok; rest = p; break; }
             }
             if (amp && amp > q) {
 #ifdef SHELL_HOSTED
@@ -15270,6 +15585,13 @@ static void execute_line_text_inner(const char *src) {
                     body[n] = '\0';
                     shell_set_status(shell_background_forked(body, "compound"));
                     kfree(body);
+                    const char *tail = shell_skip_blanks(rest ? rest : "");
+                    while (*tail == ';') tail = shell_skip_blanks(tail + 1);
+                    if (*tail) {
+                        g_exec_line_depth++;
+                        execute_line_text_inner(tail);
+                        g_exec_line_depth--;
+                    }
                     return;
                 }
                 if (body) kfree(body);
@@ -15286,7 +15608,24 @@ static void execute_line_text_inner(const char *src) {
     if (shell_try_function_definition(src)) return;
     /* A pipeline with a compound stage must be split while the stages are
      * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
-    if (shell_try_compound_pipeline(src)) return;
+    if (shell_try_compound_pipeline(src)) {
+        /* ERREXIT APPLIES TO A PIPELINE WITH COMPOUND STAGES TOO. This
+         * dispatcher returned straight to the caller, skipping the check the
+         * compound dispatchers below all make, so
+         *
+         *     set -e
+         *     { echo three; } | while read l; do echo "[$l]"; false; done
+         *     echo four
+         *
+         * printed `four`: the while stage failed, the pipeline reported 1, and
+         * nothing acted on it. */
+        if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = g_last_status;
+        }
+        return;
+    }
     if (shell_try_if_command(src) ||
         shell_try_for_command(src) ||
         shell_try_while_command(src) ||
@@ -15352,6 +15691,30 @@ static void execute_line_text_inner(const char *src) {
         bool saw_prefix = false;
         for (;;) {
             const char *n = a;
+            /* A REDIRECTION IS A PREFIX TOO, and the same rule applies:
+             *
+             *     >file for i in 1 2; do ...      bash: syntax error
+             *
+             * A compound command takes its redirections AFTER its terminator,
+             * never before the keyword. tsh ran the loop and wrote the file. */
+            if (*n >= '0' && *n <= '9') {
+                const char *d = n;
+                while (*d >= '0' && *d <= '9') d++;
+                if (*d == '<' || *d == '>') n = d;
+            }
+            if (*n == '<' || *n == '>') {
+                while (*n == '<' || *n == '>' || *n == '&' || *n == '-') n++;
+                n = shell_skip_blanks(n);
+                bool rsq = false, rdq = false;
+                while (*n && (rsq || rdq || !is_space(*n))) {
+                    if (*n == '\'' && !rdq) rsq = !rsq;
+                    else if (*n == '"' && !rsq) rdq = !rdq;
+                    n++;
+                }
+                saw_prefix = true;
+                a = shell_skip_blanks(n);
+                continue;
+            }
             if (!((*n >= 'A' && *n <= 'Z') || (*n >= 'a' && *n <= 'z') ||
                   *n == '_')) break;
             while ((*n >= 'A' && *n <= 'Z') || (*n >= 'a' && *n <= 'z') ||
@@ -15461,10 +15824,15 @@ static void execute_line_text_inner(const char *src) {
                               sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
             /* The ERR trap fires in exactly the contexts errexit acts in --
              * not on a negated command, not on the left of && or ||, not in a
-             * condition -- and independently of whether `set -e` is on. */
-            if (last != 0 && !negate && !in_and_or && g_errexit_suspend == 0)
+             * condition -- and independently of whether `set -e` is on.
+             *
+             * A BACKGROUNDED command is not one of them either: `false & wait`
+             * runs no trap, because the failure belongs to the job and not to
+             * this shell. tsh reported `line=3` for it. */
+            if (last != 0 && !negate && !in_and_or && !background &&
+                g_errexit_suspend == 0)
                 shell_run_err_trap(last);
-            if (g_opt_errexit && last != 0 && !negate &&
+            if (g_opt_errexit && last != 0 && !negate && !background &&
                 !in_and_or && g_errexit_suspend == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;

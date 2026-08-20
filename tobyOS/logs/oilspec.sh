@@ -153,6 +153,12 @@ sleep 2
 taskkill //IM qemu-system-x86_64.exe //F >/dev/null 2>&1
 
 # THE ISO CAN CARRY A DIFFERENT INITRD THAN build/initrd.tar.
+#
+# CAUSE, seen twice: running `make` WHILE A GATE IS RUNNING. QEMU holds
+# tobyOS.iso open for the whole run, and a rebuild underneath it leaves a
+# truncated image that the NEXT run then boots (make sees the ISO as newer
+# than its inputs and does not redo it). Do not compile during a run.
+#
 # One run reported "SKIP reason=no-corpus" with gate 0 green: the tar on disk
 # had all 3,877 entries, and the copy inside the ISO stopped after 817 -- a
 # stale/partial artefact from an interrupted build. Gate 0 checks the tar,
