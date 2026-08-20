@@ -11709,7 +11709,25 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
             return nfd;
         }
-        return 0;               /* F_GETFD/F_SETFD/F_SETFL/CLOEXEC: best-effort no-op */
+        /* EVERY OTHER COMMAND STILL HAS TO CHECK THE DESCRIPTOR EXISTS.
+         *
+         * F_GETFD/F_SETFD are no-ops here -- close-on-exec is not tracked --
+         * but "no-op" is not "always succeeds". Answering 0 for a CLOSED fd
+         * told every caller that the descriptor was open, and the real bash
+         * in the initrd uses exactly that to decide whether a redirection
+         * needs saving:
+         *
+         *     exec 6< file        bash: redirection error: cannot duplicate
+         *                               fd: Bad file descriptor
+         *
+         * bash asked whether fd 6 was in use, was told yes, tried to stash it
+         * with F_DUPFD -- which correctly said EBADF -- and gave up. Every
+         * `exec N<file` and `exec N>&1` above the fd the shell happened to
+         * open next failed, which is the shape `./configure` scripts are made
+         * of. It also made the conformance oracle wrong on three cases where
+         * tsh had the right answer all along. */
+        if (!fd_lookup((int)a1)) return -ABI_EBADF;
+        return 0;               /* F_GETFD/F_SETFD/CLOEXEC: best-effort no-op */
     }
     case LX_sendfile:           /* cat/cp fall back to a read/write loop */
         return -ABI_ENOSYS;

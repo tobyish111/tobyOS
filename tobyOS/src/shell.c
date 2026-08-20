@@ -1289,6 +1289,7 @@ static int shell_canonicalize_path(const char *in, char *out, size_t cap) {
 extern int chdir(const char *path);
 /* `test -t FD` has no tty syscall to ask; seekability stands in for one. */
 extern long lseek(int fd, long off, int whence);
+extern char *getcwd(char *buf, unsigned long size);
 #endif
 
 static int shell_set_cwd(const char *path) {
@@ -2671,6 +2672,15 @@ static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
     bool print_new = false;
+    /* `--` ENDS THE OPTIONS. `cd -- /` is how a script says "the next word is
+     * a directory even if it starts with a dash", and tsh took the `--`
+     * itself as the directory and reported "no such file or directory". It
+     * only surfaced once $PWD stopped defaulting to `/`, because before that
+     * the failed cd left PWD reading the same as a successful one. */
+    if (argc > 1 && strcmp(argv[1], "--") == 0) {
+        argv++;
+        argc--;
+    }
     if (argc <= 1) {
         target = env_get("HOME");
         if (!target || !*target) target = "/";
@@ -6478,11 +6488,14 @@ static void cmd_break(int argc, char **argv) {
         /* A bad argument to a SPECIAL BUILTIN aborts the script. Returning 2
          * and carrying on left `while true; do echo hi; break $x; done` with
          * x=oops spinning forever -- the one case in the corpus that could
-         * hang the whole gate rather than merely fail. */
+         * hang the whole gate rather than merely fail.
+         *
+         * The STATUS is 128, not 2. bash treats it as a fatal usage error of
+         * the loop-control kind and exits 128; 2 is what a parse error gets. */
         kprintf("break: %s: numeric argument required\n", argv[1]);
-        shell_set_status(2);
+        shell_set_status(128);
         g_shell_flow = SHELL_FLOW_EXIT;
-        g_shell_flow_status = 2;
+        g_shell_flow_status = 128;
         return;
     }
     if (n > g_shell_loop_depth) n = g_shell_loop_depth;
@@ -6505,9 +6518,9 @@ static void cmd_continue(int argc, char **argv) {
     int n = 1;
     if (argc == 2 && (parse_int(argv[1], &n) < 0 || n <= 0)) {
         kprintf("continue: %s: numeric argument required\n", argv[1]);
-        shell_set_status(2);
+        shell_set_status(128);
         g_shell_flow = SHELL_FLOW_EXIT;
-        g_shell_flow_status = 2;
+        g_shell_flow_status = 128;
         return;
     }
     if (n > g_shell_loop_depth) n = g_shell_loop_depth;
@@ -16928,6 +16941,28 @@ void shell_init_hosted(const char *argv0) {
             size_t klen = env_key_len(*e);
             int idx = env_find(*e, klen);
             if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
+        }
+    }
+#endif
+
+#ifdef SHELL_HOSTED
+    /* $PWD IS WHERE THE PROCESS ACTUALLY IS, not the default the kernel shell
+     * starts with. env_init_defaults() stamps PWD=/ because the kernel shell
+     * has no parent to inherit one from; /bin/tsh is spawned in a directory
+     * its parent chose, and reported `/` for it. Anything that printed $PWD,
+     * or compared it, was wrong from the first line of the script.
+     *
+     * An INHERITED PWD wins if it names this directory -- that is how a
+     * logical path through a symlink survives, which is the whole point of
+     * `cd -L`. Otherwise getcwd() is the truth. */
+    {
+        char cwd[VFS_PATH_MAX];
+        if (getcwd(cwd, sizeof cwd)) {
+            const char *inherited = env_get("PWD");
+            if (!inherited || strcmp(inherited, cwd) != 0) {
+                (void)env_set("PWD", cwd);
+                shell_mark_exported("PWD");
+            }
         }
     }
 #endif

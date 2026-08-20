@@ -228,6 +228,50 @@ size_t strftime(char *s, size_t maxsize, const char *fmt,
             if (p < end) *p++ = ':';
             emit_num(&p, end, tm->tm_sec, 2);
             break;
+        case 'y': emit_num(&p, end, (tm->tm_year + 1900) % 100, 2); break;
+        case 'C': emit_num(&p, end, (tm->tm_year + 1900) / 100, 2); break;
+        case 'w': emit_num(&p, end, tm->tm_wday, 1); break;
+        case 'D': /* %m/%d/%y */
+        case 'x': /* the C locale's date -- the same thing */
+            emit_num(&p, end, tm->tm_mon + 1, 2);
+            if (p < end) *p++ = '/';
+            emit_num(&p, end, tm->tm_mday, 2);
+            if (p < end) *p++ = '/';
+            emit_num(&p, end, (tm->tm_year + 1900) % 100, 2);
+            break;
+        case 'X': /* the C locale's time -- %H:%M:%S */
+            emit_num(&p, end, tm->tm_hour, 2);
+            if (p < end) *p++ = ':';
+            emit_num(&p, end, tm->tm_min, 2);
+            if (p < end) *p++ = ':';
+            emit_num(&p, end, tm->tm_sec, 2);
+            break;
+        case 'R': /* %H:%M */
+            emit_num(&p, end, tm->tm_hour, 2);
+            if (p < end) *p++ = ':';
+            emit_num(&p, end, tm->tm_min, 2);
+            break;
+        case 's': { /* seconds since the epoch */
+            struct tm copy = *tm;
+            emit_num(&p, end, (int)mktime(&copy), 1);
+            break;
+        }
+        case 'c': /* the C locale's date and time */
+            emit_str(&p, end, wday_abbr[tm->tm_wday % 7]);
+            if (p < end) *p++ = ' ';
+            emit_str(&p, end, mon_abbr[tm->tm_mon % 12]);
+            if (p < end) *p++ = ' ';
+            if (tm->tm_mday < 10) { if (p < end) *p++ = ' '; }
+            emit_num(&p, end, tm->tm_mday, 1);
+            if (p < end) *p++ = ' ';
+            emit_num(&p, end, tm->tm_hour, 2);
+            if (p < end) *p++ = ':';
+            emit_num(&p, end, tm->tm_min, 2);
+            if (p < end) *p++ = ':';
+            emit_num(&p, end, tm->tm_sec, 2);
+            if (p < end) *p++ = ' ';
+            emit_num(&p, end, tm->tm_year + 1900, 4);
+            break;
         default:
             if (p < end) *p++ = '%';
             if (p < end && *fmt) *p++ = *fmt;

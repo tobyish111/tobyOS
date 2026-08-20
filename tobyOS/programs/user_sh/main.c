@@ -437,7 +437,15 @@ static int try_builtin(struct token *t) {
     if (strcmp(cmd, "export") == 0) return builtin_export(t->argc, t->argv);
     if (strcmp(cmd, "unset") == 0) return builtin_unset(t->argc, t->argv);
     if (strcmp(cmd, "echo") == 0) return builtin_echo(t->argc, t->argv);
-    if (strcmp(cmd, "exit") == 0) { g_running = 0; return 0; }
+    /* `exit [n]` TAKES A STATUS. It returned 0 no matter what was asked, so
+     * `sh -c 'exit 33'` exited 0 and every caller that checked the status of
+     * a sub-shell got the wrong answer -- including the real bash in the
+     * initrd, which is the oracle the conformance gate compares against. With
+     * no operand the status is that of the last command, as POSIX says. */
+    if (strcmp(cmd, "exit") == 0) {
+        g_running = 0;
+        return (t->argc > 1) ? atoi(t->argv[1]) & 0xff : g_last_status;
+    }
     if (strcmp(cmd, "true") == 0) return 0;
     if (strcmp(cmd, "false") == 0) return 1;
     if (strcmp(cmd, "test") == 0 || strcmp(cmd, "[") == 0)
