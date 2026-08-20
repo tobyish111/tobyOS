@@ -1665,7 +1665,7 @@ static struct shell_shopt g_shopts[] = {
     { "failglob",             &g_shopt_failglob,             false, false },
     { "dotglob",              &g_shopt_dotglob,              false, false },
     { "extglob",              &g_shopt_extglob,              false, false },
-    { "globstar",             &g_shopt_globstar,             false, false },
+    { "globstar",             &g_shopt_globstar,             true,  false },
     { "nocaseglob",           &g_shopt_nocaseglob,           false, false },
     { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
     { "lastpipe",             &g_shopt_lastpipe,             false, false },
@@ -10983,8 +10983,391 @@ static bool shell_glob_meta(char c);
 static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
                                    size_t from);
 
+/* ---- BRACE EXPANSION ------------------------------------------------ *
+ *
+ *     touch {a,b,c}.txt        ->  touch a.txt b.txt c.txt
+ *     echo {1..5}              ->  echo 1 2 3 4 5
+ *     echo {a,b}{c,d}          ->  echo ac ad bc bd
+ *
+ * It is the FIRST expansion, and purely textual: it happens before parameter
+ * expansion, which is why `x={a,b}; echo $x` prints the braces back -- they
+ * arrived from a variable, after the brace pass had already gone by. Doing it
+ * here, on the source text before the tokenizer reads it, is what makes that
+ * ordering fall out for free.
+ *
+ * What is NOT a brace expansion, and each of these bit at some point:
+ *   - `${x}` -- a parameter, not a group. The `$` is what tells them apart.
+ *   - `{ echo a, b; }` -- a GROUP command. bash requires a blank after the
+ *     `{` for a group and forbids one for an expansion, which is the whole
+ *     distinction and is cheap to test.
+ *   - `{a}` -- no comma and no range, so nothing to expand: it stays.
+ *   - a quoted `"{a,b}"`, which is a four-character string.
+ */
+
+#define SH_BRACE_DEPTH_MAX 8
+
+static int shell_brace_word(const char *w, size_t wlen, char *out,
+                            size_t *pos, size_t cap, int depth);
+
+/* Emit one finished word, separated from the previous by a space. */
+static int shell_brace_emit(const char *s, size_t n, char *out, size_t *pos,
+                            size_t cap) {
+    if (*pos > 0 && out[*pos - 1] != ' ') {
+        if (shell_append_char(out, pos, cap, ' ') < 0) return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (shell_append_char(out, pos, cap, s[i]) < 0) return -1;
+    return 0;
+}
+
+/* `{1..5}` / `{5..1}` / `{a..e}`. Returns 1 if it expanded, 0 if the body is
+ * not a range, -1 on overflow. */
+static int shell_brace_range(const char *body, size_t blen,
+                             const char *pre, size_t prelen,
+                             const char *post, size_t postlen,
+                             char *out, size_t *pos, size_t cap, int depth) {
+    /* Find the `..` that separates the endpoints. */
+    size_t dots = 0;
+    bool found = false;
+    for (size_t i = 0; i + 1 < blen; i++) {
+        if (body[i] == '.' && body[i + 1] == '.') { dots = i; found = true; break; }
+    }
+    if (!found || dots == 0 || dots + 2 >= blen) return 0;
+
+    char lo[32], hi[32];
+    size_t lolen = dots, hilen = blen - dots - 2;
+    if (lolen + 1 > sizeof lo || hilen + 1 > sizeof hi) return 0;
+    memcpy(lo, body, lolen); lo[lolen] = '\0';
+    memcpy(hi, body + dots + 2, hilen); hi[hilen] = '\0';
+
+    /* A third `..` is a step; the step itself is not part of the endpoint. */
+    long step = 1;
+    for (size_t i = 0; i + 1 < hilen; i++) {
+        if (hi[i] == '.' && hi[i + 1] == '.') {
+            bool ok = false;
+            long v = shell_parse_long_value(hi + i + 2, &ok);
+            if (!ok || v == 0) return 0;
+            step = v < 0 ? -v : v;
+            hi[i] = '\0';
+            hilen = i;
+            break;
+        }
+    }
+
+    bool lo_ok = false, hi_ok = false;
+    long a = shell_parse_long_value(lo, &lo_ok);
+    long b = shell_parse_long_value(hi, &hi_ok);
+    bool numeric = lo_ok && hi_ok;
+    bool alpha = (lolen == 1 && hilen == 1 &&
+                  ((lo[0] >= 'a' && lo[0] <= 'z') || (lo[0] >= 'A' && lo[0] <= 'Z')) &&
+                  ((hi[0] >= 'a' && hi[0] <= 'z') || (hi[0] >= 'A' && hi[0] <= 'Z')));
+    if (!numeric && !alpha) return 0;
+    if (alpha) { a = lo[0]; b = hi[0]; }
+
+    long dir = (a <= b) ? step : -step;
+    char piece[SHELL_PARSE_BUF_MAX];
+    int guard = 0;
+    for (long v = a; (dir > 0 ? v <= b : v >= b) && guard < 4096; v += dir, guard++) {
+        size_t pp = 0;
+        for (size_t i = 0; i < prelen; i++)
+            if (shell_append_char(piece, &pp, sizeof piece, pre[i]) < 0) return -1;
+        if (alpha) {
+            if (shell_append_char(piece, &pp, sizeof piece, (char)v) < 0) return -1;
+        } else {
+            if (shell_append_long(piece, &pp, sizeof piece, v) < 0) return -1;
+        }
+        for (size_t i = 0; i < postlen; i++)
+            if (shell_append_char(piece, &pp, sizeof piece, post[i]) < 0) return -1;
+        if (shell_brace_word(piece, pp, out, pos, cap, depth + 1) < 0) return -1;
+    }
+    return 1;
+}
+
+/* Expand the FIRST top-level group in `w`; the rest arrive by recursion on
+ * each result, which is what makes `{a,b}{c,d}` produce four words. */
+static int shell_brace_word(const char *w, size_t wlen, char *out,
+                            size_t *pos, size_t cap, int depth) {
+    if (depth >= SH_BRACE_DEPTH_MAX)
+        return shell_brace_emit(w, wlen, out, pos, cap);
+
+    size_t open = 0;
+    size_t close = 0;
+    bool have = false;
+    {
+        bool sq = false, dq = false;
+        for (size_t i = 0; i < wlen; i++) {
+            char c = w[i];
+            if (sq) { if (c == '\'') sq = false; continue; }
+            if (dq) {
+                if (c == '\\' && i + 1 < wlen) { i++; continue; }
+                if (c == '"') dq = false;
+                continue;
+            }
+            if (c == '\'') { sq = true; continue; }
+            if (c == '"')  { dq = true; continue; }
+            if (c == '\\' && i + 1 < wlen) { i++; continue; }
+            /* `${...}` is a parameter. So is `$(...)`; its own braces are
+             * somebody else's problem. */
+            if (c == '$' && i + 1 < wlen && (w[i + 1] == '{' || w[i + 1] == '(')) {
+                int nest = 0;
+                for (size_t j = i + 1; j < wlen; j++) {
+                    if (w[j] == '{' || w[j] == '(') nest++;
+                    else if (w[j] == '}' || w[j] == ')') {
+                        if (--nest == 0) { i = j; break; }
+                    }
+                }
+                continue;
+            }
+            if (c != '{') continue;
+            /* A blank after `{` makes it a GROUP command, never an
+             * expansion -- and an empty `{}` has nothing to expand. */
+            if (i + 1 >= wlen || w[i + 1] == ' ' || w[i + 1] == '\t' ||
+                w[i + 1] == '}')
+                continue;
+            /* Find the matching `}`. */
+            int nest = 0;
+            bool isq = false, idq = false;
+            for (size_t j = i; j < wlen; j++) {
+                char d = w[j];
+                if (isq) { if (d == '\'') isq = false; continue; }
+                if (idq) {
+                    if (d == '\\' && j + 1 < wlen) { j++; continue; }
+                    if (d == '"') idq = false;
+                    continue;
+                }
+                if (d == '\'') { isq = true; continue; }
+                if (d == '"')  { idq = true; continue; }
+                if (d == '\\' && j + 1 < wlen) { j++; continue; }
+                if (d == '{') { nest++; continue; }
+                if (d == '}') {
+                    if (--nest == 0) {
+                        open = i; close = j; have = true;
+                        break;
+                    }
+                }
+            }
+            if (have) break;
+        }
+    }
+    if (!have) return shell_brace_emit(w, wlen, out, pos, cap);
+
+    const char *pre = w;
+    size_t prelen = open;
+    const char *body = w + open + 1;
+    size_t blen = close - open - 1;
+    const char *post = w + close + 1;
+    size_t postlen = wlen - close - 1;
+
+    /* Split the body on TOP-LEVEL commas. */
+    size_t comma[64];
+    int ncomma = 0;
+    {
+        int nest = 0;
+        bool sq = false, dq = false;
+        for (size_t i = 0; i < blen; i++) {
+            char c = body[i];
+            if (sq) { if (c == '\'') sq = false; continue; }
+            if (dq) {
+                if (c == '\\' && i + 1 < blen) { i++; continue; }
+                if (c == '"') dq = false;
+                continue;
+            }
+            if (c == '\'') { sq = true; continue; }
+            if (c == '"')  { dq = true; continue; }
+            if (c == '\\' && i + 1 < blen) { i++; continue; }
+            if (c == '{' || c == '(') { nest++; continue; }
+            if (c == '}' || c == ')') { if (nest > 0) nest--; continue; }
+            if (c == ',' && nest == 0 && ncomma < 64) comma[ncomma++] = i;
+        }
+    }
+
+    if (ncomma == 0) {
+        int r = shell_brace_range(body, blen, pre, prelen, post, postlen,
+                                  out, pos, cap, depth);
+        if (r < 0) return -1;
+        if (r == 1) return 0;
+        /* Neither a list nor a range: the braces are ordinary characters. */
+        return shell_brace_emit(w, wlen, out, pos, cap);
+    }
+
+    char piece[SHELL_PARSE_BUF_MAX];
+    size_t start = 0;
+    for (int k = 0; k <= ncomma; k++) {
+        size_t end = (k == ncomma) ? blen : comma[k];
+        size_t pp = 0;
+        for (size_t i = 0; i < prelen; i++)
+            if (shell_append_char(piece, &pp, sizeof piece, pre[i]) < 0) return -1;
+        for (size_t i = start; i < end; i++)
+            if (shell_append_char(piece, &pp, sizeof piece, body[i]) < 0) return -1;
+        for (size_t i = 0; i < postlen; i++)
+            if (shell_append_char(piece, &pp, sizeof piece, post[i]) < 0) return -1;
+        if (shell_brace_word(piece, pp, out, pos, cap, depth + 1) < 0) return -1;
+        start = end + 1;
+    }
+    return 0;
+}
+
+/* True if `src` has an unquoted `{` worth looking at, so the common line
+ * pays one scan and no allocation. */
+static bool shell_has_brace(const char *src) {
+    bool sq = false, dq = false;
+    for (const char *p = src; *p; p++) {
+        if (sq) { if (*p == '\'') sq = false; continue; }
+        if (dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') dq = false;
+            continue;
+        }
+        if (*p == '\'') { sq = true; continue; }
+        if (*p == '"')  { dq = true; continue; }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '{' && p[1] && p[1] != ' ' && p[1] != '\t' && p[1] != '}' &&
+            (p == src || p[-1] != '$'))
+            return true;
+    }
+    return false;
+}
+
+/* Rewrite a whole line, expanding the braces in each word. Words are split on
+ * unquoted blanks and on the operator characters, so `echo a;echo {x,y}`
+ * keeps its `;` and `> {a,b}` keeps its redirection. */
+static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
+    size_t pos = 0;
+    const char *p = src;
+    /* AN ASSIGNMENT'S VALUE IS NOT BRACE-EXPANDED.
+     *
+     *     x={a,b} ; echo $x       bash: {a,b}
+     *     echo x={a,b}            bash: x=a x=b
+     *
+     * The shell recognises an assignment before word expansion, so the two
+     * identical-looking words get opposite treatment -- and which one it is
+     * depends on POSITION, not on the word. Expanding both turned `x={a,b}`
+     * into `x=a x=b`: an assignment followed by a command called `x=b`. */
+    bool cmd_pos = true;
+    out[0] = '\0';
+    while (*p) {
+        if (*p == ' ' || *p == '\t' || *p == '\n') {
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            continue;
+        }
+        if (*p == ';' || *p == '|' || *p == '&' || *p == '<' || *p == '>' ||
+            *p == '(' || *p == ')') {
+            cmd_pos = true;
+            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            continue;
+        }
+        const char *w = p;
+        bool sq = false, dq = false;
+        while (*p) {
+            if (sq) { if (*p == '\'') sq = false; p++; continue; }
+            if (dq) {
+                if (*p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '"') dq = false;
+                p++;
+                continue;
+            }
+            if (*p == '\'') { sq = true; p++; continue; }
+            if (*p == '"')  { dq = true; p++; continue; }
+            if (*p == '\\' && p[1]) { p += 2; continue; }
+            if (*p == ' ' || *p == '\t' || *p == '\n') break;
+            if (*p == ';' || *p == '|' || *p == '&' || *p == '<' || *p == '>')
+                break;
+            p++;
+        }
+        size_t wlen = (size_t)(p - w);
+
+        /* In command position, a NAME= word is an assignment PREFIX, and one
+         * assignment may follow another. Anything else ends the prefix. */
+        bool is_assign = false;
+        bool was_cmd_pos = cmd_pos;
+        if (cmd_pos) {
+            size_t k = 0;
+            while (k < wlen && ((w[k] >= 'A' && w[k] <= 'Z') ||
+                                (w[k] >= 'a' && w[k] <= 'z') ||
+                                (w[k] >= '0' && w[k] <= '9') || w[k] == '_'))
+                k++;
+            is_assign = (k > 0 && k < wlen && w[k] == '=' &&
+                         !(w[0] >= '0' && w[0] <= '9'));
+            if (!is_assign) cmd_pos = false;
+        }
+        bool cmd_pos_here = was_cmd_pos && !is_assign;
+        /* A word with nothing to expand is copied through untouched, which
+         * keeps the emit function's space-separation out of the common
+         * path -- it must not insert one in the middle of `a;b`. */
+        char tmp[SHELL_PARSE_BUF_MAX];
+        size_t tp = 0;
+        if (is_assign) {
+            for (size_t i = 0; i < wlen && tp + 1 < sizeof tmp; i++)
+                tmp[tp++] = w[i];
+        } else if (shell_brace_word(w, wlen, tmp, &tp, sizeof tmp, 0) < 0) {
+            return -1;
+        } else if (cmd_pos_here &&
+                   (tp != wlen || memcmp(tmp, w, wlen) != 0)) {
+            /* ASSIGNMENT RECOGNITION HAPPENED ALREADY, on the word as
+             * written. `{v,x}=X` is not a NAME= word, so it is a COMMAND --
+             * and the `v=X` that brace expansion then produces is that
+             * command's name, not an assignment. bash reports 127. Marking
+             * the `=` with the same byte the tokenizer uses for a quoted one
+             * carries that decision past the expansion; struct shell_simple
+             * already reads it back as arg_noassign. */
+            char marked[SHELL_PARSE_BUF_MAX];
+            size_t mp = 0;
+            size_t i = 0;
+            while (i < tp) {
+                size_t start = i;
+                while (i < tp && tmp[i] != ' ') i++;
+                size_t k = start;
+                while (k < i && ((tmp[k] >= 'A' && tmp[k] <= 'Z') ||
+                                 (tmp[k] >= 'a' && tmp[k] <= 'z') ||
+                                 (tmp[k] >= '0' && tmp[k] <= '9') ||
+                                 tmp[k] == '_'))
+                    k++;
+                for (size_t q = start; q < i; q++) {
+                    if (q == k && k > start && tmp[k] == '=' &&
+                        mp + 1 < sizeof marked)
+                        marked[mp++] = SHELL_GLOB_ESC;
+                    if (mp + 1 < sizeof marked) marked[mp++] = tmp[q];
+                }
+                while (i < tp && tmp[i] == ' ')
+                    if (mp + 1 < sizeof marked) marked[mp++] = tmp[i++];
+                    else i++;
+            }
+            if (mp < sizeof tmp) { memcpy(tmp, marked, mp); tp = mp; }
+        }
+        for (size_t i = 0; i < tp; i++)
+            if (shell_append_char(out, &pos, cap, tmp[i]) < 0) return -1;
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int shell_tokenize_inner(const char *src, struct shell_token *tok,
+                                int *out_ntok, char *words, size_t word_cap);
+
+/* BRACE EXPANSION HAPPENS BEFORE ANYTHING ELSE READS THE WORD, which is what
+ * makes `x={a,b}; echo $x` print the braces back: by the time `$x` produces
+ * them, this pass has already gone by. */
 static int shell_tokenize(const char *src, struct shell_token *tok,
                           int *out_ntok, char *words, size_t word_cap) {
+    if (src && shell_has_brace(src)) {
+        char *expanded = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+        if (expanded) {
+            int rc = shell_expand_braces_line(src, expanded,
+                                              SHELL_PARSE_BUF_MAX);
+            if (rc == 0) {
+                rc = shell_tokenize_inner(expanded, tok, out_ntok, words,
+                                          word_cap);
+                kfree(expanded);
+                return rc;
+            }
+            kfree(expanded);
+        }
+    }
+    return shell_tokenize_inner(src, tok, out_ntok, words, word_cap);
+}
+
+static int shell_tokenize_inner(const char *src, struct shell_token *tok,
+                                int *out_ntok, char *words, size_t word_cap) {
     int ntok = 0;
     size_t wpos = 0;
     const char *p = src;
@@ -11862,6 +12245,207 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
 
 static void shell_strip_glob_escapes(char *s);
 
+/* ---- `**`, the globstar match --------------------------------------- *
+ *
+ *     shopt -s globstar
+ *     echo ** /*.md          every .md at any depth, this directory included
+ *
+ * A component that is exactly `**` matches ZERO OR MORE directory levels,
+ * which is the one thing the flat single-directory globber cannot express:
+ * it walks one level and matches names, and `**` needs a tree walk with the
+ * remaining components carried along.
+ *
+ * `shopt -s globstar` was accepted and did nothing, so the pattern came back
+ * unexpanded -- the shape a script uses to find its own sources.
+ *
+ * Without globstar, `**` is just two `*`s in a row and means what a single
+ * `*` means, which is what the ordinary path below already does.
+ */
+
+#define SH_GLOB_DEPTH_MAX 24
+
+struct shell_globstar {
+    struct shell_pipeline *pl;
+    struct shell_simple   *cur;
+    int matches;
+    bool overflow;
+};
+
+/* `comps` is the pattern split on `/`; `ci` is the component to match next.
+ * `dirpath` is the real directory being read and `shown` is what to print in
+ * front of a name (they differ: `dirpath` is canonical, `shown` is what the
+ * user wrote). */
+static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
+                               const char *shown, char comps[][VFS_PATH_MAX],
+                               int ncomp, int ci, int depth);
+
+static int shell_globstar_emit(struct shell_globstar *g, const char *path) {
+    if (g->cur->argc >= ARG_MAX) {
+        g->overflow = true;
+        return -1;
+    }
+    if (shell_pipeline_save_word(g->pl, path, &g->cur->argv[g->cur->argc]) < 0)
+        return -1;
+    g->cur->argc++;
+    g->matches++;
+    return 0;
+}
+
+/* Match the remaining components against everything under `dirpath`, at any
+ * depth including zero -- which is what makes `** /x` find `./x` as well as
+ * `a/b/x`. */
+static int shell_globstar_star(struct shell_globstar *g, const char *dirpath,
+                               const char *shown, char comps[][VFS_PATH_MAX],
+                               int ncomp, int ci, int depth) {
+    /* Zero levels: the components after `**` match right here. */
+    if (shell_globstar_walk(g, dirpath, shown, comps, ncomp, ci + 1, depth) < 0)
+        return -1;
+    if (depth >= SH_GLOB_DEPTH_MAX) return 0;
+
+    struct vfs_dir d;
+    if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
+    struct vfs_dirent ent;
+    while (vfs_readdir(&d, &ent) == VFS_OK) {
+        if (ent.name[0] == '.') continue;          /* `**` skips dotfiles */
+        if (ent.type != VFS_TYPE_DIR) continue;
+        char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
+        int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
+        int m = ksnprintf(subshown, sizeof subshown, "%s%s/", shown, ent.name);
+        if (n <= 0 || (size_t)n >= sizeof sub ||
+            m <= 0 || (size_t)m >= sizeof subshown)
+            continue;
+        /* One more level, then `**` again from there. */
+        if (shell_globstar_star(g, sub, subshown, comps, ncomp, ci,
+                                depth + 1) < 0) {
+            vfs_closedir(&d);
+            return -1;
+        }
+    }
+    vfs_closedir(&d);
+    return 0;
+}
+
+static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
+                               const char *shown, char comps[][VFS_PATH_MAX],
+                               int ncomp, int ci, int depth) {
+    if (ci >= ncomp) return 0;
+
+    /* `**` ONLY RECURSES WITH globstar ON. Without it, it is two stars in a
+     * row, which is what one star means -- a single level. */
+    if (g_shopt_globstar && strcmp(comps[ci], "**") == 0)
+        return shell_globstar_star(g, dirpath, shown, comps, ncomp, ci, depth);
+
+    bool last = (ci + 1 >= ncomp);
+    struct vfs_dir d;
+    if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
+    struct vfs_dirent ent;
+    while (vfs_readdir(&d, &ent) == VFS_OK) {
+        if (ent.name[0] == '.' && comps[ci][0] != '.') continue;
+        if (!shell_glob_match(comps[ci], ent.name)) continue;
+        char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
+        int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
+        if (n <= 0 || (size_t)n >= sizeof sub) continue;
+        if (last) {
+            int m = ksnprintf(subshown, sizeof subshown, "%s%s", shown,
+                              ent.name);
+            if (m <= 0 || (size_t)m >= sizeof subshown) continue;
+            if (shell_globstar_emit(g, subshown) < 0) {
+                vfs_closedir(&d);
+                return -1;
+            }
+            continue;
+        }
+        if (ent.type != VFS_TYPE_DIR) continue;
+        int m = ksnprintf(subshown, sizeof subshown, "%s%s/", shown, ent.name);
+        if (m <= 0 || (size_t)m >= sizeof subshown) continue;
+        if (shell_globstar_walk(g, sub, subshown, comps, ncomp, ci + 1,
+                                depth) < 0) {
+            vfs_closedir(&d);
+            return -1;
+        }
+    }
+    vfs_closedir(&d);
+    return 0;
+}
+
+/* Returns the match count, 0 if the pattern has no `**` component (so the
+ * caller falls back to the flat path), or -1 on error. */
+static int shell_expand_globstar_word(struct shell_pipeline *pl,
+                                      struct shell_simple *cur,
+                                      const char *word) {
+    char comps[16][VFS_PATH_MAX];
+    int ncomp = 0;
+    bool have_star = false;
+    {
+        const char *p = word;
+        if (*p == '/') p++;                     /* leading slash: absolute */
+        while (*p && ncomp < 16) {
+            const char *q = p;
+            while (*q && *q != '/') q++;
+            size_t n = (size_t)(q - p);
+            if (n + 1 > VFS_PATH_MAX) return 0;
+            memcpy(comps[ncomp], p, n);
+            comps[ncomp][n] = '\0';
+            if (g_shopt_globstar && strcmp(comps[ncomp], "**") == 0)
+                have_star = true;
+            if (n > 0) ncomp++;
+            p = *q ? q + 1 : q;
+        }
+    }
+    /* A wildcard in any component but the LAST also needs the walker; the
+     * flat path can only glob a basename. */
+    for (int i = 0; i + 1 < ncomp && !have_star; i++)
+        if (shell_has_glob(comps[i])) have_star = true;
+    if (!have_star || ncomp == 0) return 0;
+
+    struct shell_globstar g;
+    g.pl = pl;
+    g.cur = cur;
+    g.matches = 0;
+    g.overflow = false;
+
+    int first_arg = cur->argc;
+    char root[VFS_PATH_MAX];
+    const char *shown = "";
+    if (word[0] == '/') {
+        memcpy(root, "/", 2);
+        shown = "/";
+    } else if (shell_canonicalize_path(".", root, sizeof root) < 0) {
+        return 0;
+    }
+    if (shell_globstar_walk(&g, root, shown, comps, ncomp, 0, 0) < 0) {
+        if (g.overflow)
+            kprintf("shell: too many arguments after expansion (max %d)\n",
+                    ARG_MAX);
+        return -1;
+    }
+    if (g.matches == 0) return 0;
+
+    /* THE SAME NAME CAN BE REACHED TWICE. A pattern with two `**`
+     * components walks the tree once per `**`, so a file two levels down
+     * arrives by more than one route;
+     * bash reports each path once. Sorting first puts the duplicates next to
+     * each other, which is also the order the results have to come out in. */
+    for (int a = first_arg + 1; a < cur->argc; a++) {
+        char *key = cur->argv[a];
+        int b = a - 1;
+        while (b >= first_arg && strcmp(cur->argv[b], key) > 0) {
+            cur->argv[b + 1] = cur->argv[b];
+            b--;
+        }
+        cur->argv[b + 1] = key;
+    }
+    int w = first_arg;
+    for (int a = first_arg; a < cur->argc; a++) {
+        if (a > first_arg && strcmp(cur->argv[a], cur->argv[w - 1]) == 0)
+            continue;
+        cur->argv[w++] = cur->argv[a];
+    }
+    cur->argc = w;
+    return w - first_arg;
+}
+
+
 static int shell_expand_glob_word(struct shell_pipeline *pl,
                                   struct shell_simple *cur,
                                   const char *word) {
@@ -12000,7 +12584,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
      * the escapes the tokenizer added say. Only TILDE expansion below still
      * turns off inside quotes, because a quoted `~` really is data. */
     if (!g_opt_noglob && !assign_word && shell_has_glob(word)) {
-        int n = shell_expand_glob_word(pl, cur, word);
+        int n = shell_expand_globstar_word(pl, cur, word);
+        if (n < 0) return -1;
+        if (n > 0) return 0;
+        n = shell_expand_glob_word(pl, cur, word);
         if (n < 0) return -1;
         if (n > 0) return 0;
     }
@@ -14399,7 +14986,17 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
         char raw[SHELL_PARSE_BUF_MAX];
         size_t rp = 0;
         bool quoted = false;
+        bool bare_paren = false;
         while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
+            /* AN UNQUOTED PARENTHESIS INSIDE A WORD IS A SYNTAX ERROR.
+             *
+             *     [[ '^(a b)$' == ^(a b)$ ]]      bash: parse error
+             *
+             * `(` and `)` are grouping OPERATORS in this grammar, so bash's
+             * lexer will not have them glued into an operand. Treating them
+             * as ordinary pattern characters made that line match and print
+             * where bash refuses to run it at all. A quoted one is data. */
+            if (*p == '(' || *p == ')') bare_paren = true;
             if (*p == '\'') {
                 quoted = true;
                 if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
@@ -14446,6 +15043,10 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
             continue;
         }
 
+        /* A word that is EXACTLY `(` or `)` was handled above as an
+         * operator, so anything reaching here with one in it has it glued. */
+        if (bare_paren) return -1;
+
         char expanded[SHELL_PARSE_BUF_MAX];
         if (shell_expand_word_ex(raw, expanded, sizeof expanded, true, true) < 0)
             return -1;
@@ -14487,8 +15088,24 @@ static int shell_dbr_primary(struct shell_dbr *d) {
      * of the string "-n", which is true. */
     if (test_is_unary_op(t) && d->pos + 1 < d->n) {
         const char *nxt = d->w[d->pos + 1];
-        if (strcmp(nxt, ")") != 0 && strcmp(nxt, "&&") != 0 &&
-            strcmp(nxt, "||") != 0) {
+        /* ...AND WHAT FOLLOWS IT MUST BE AN OPERAND.
+         *
+         *     [[ -f < ]]      bash: parse error
+         *
+         * `<` is a string-comparison OPERATOR in this grammar, not a
+         * filename. tsh asked whether a file called `<` existed, answered
+         * no, and reported a perfectly ordinary false. */
+        /* ...and a QUOTED one is data whatever it spells: `[[ -z '>' ]]`
+         * asks whether the one-character string `>` is empty. d->pat says
+         * the word arrived unquoted, which is the same flag that decides
+         * whether the right-hand side of `==` is a pattern. */
+        bool nxt_is_op = d->pat[d->pos + 1] &&
+                         (strcmp(nxt, ")") == 0 || strcmp(nxt, "&&") == 0 ||
+                          strcmp(nxt, "||") == 0 || strcmp(nxt, "<") == 0 ||
+                          strcmp(nxt, ">") == 0 || strcmp(nxt, "=~") == 0 ||
+                          strcmp(nxt, "==") == 0 || strcmp(nxt, "!=") == 0 ||
+                          strcmp(nxt, "=") == 0 || test_is_binary_op(nxt));
+        if (!nxt_is_op) {
             d->pos += 2;
             return test_unary(t, nxt) == 0;
         }
