@@ -6,10 +6,11 @@ it is not "how the code works" — it is **how to find out what is actually true
 because in this arc reading the source has produced confident wrong answers over
 and over, and measuring has not.
 
-Current state: **POSIX 1235/1280 = 96.5%** (from 711 = 55.5% at the start of
-the arc, 1041 = 81.3% two sessions ago, 1196 = 93.4% one session ago).
-`broken=0`, timeouts 1. Bash-parity gate steady at **52/54**. The number moves
-by about two on its own between runs -- see the flaky cases in section 5.
+Current state: **POSIX 1273/1280 = 99.5%** (711 = 55.5% at the start of the
+arc; 1196 = 93.4% three sessions ago). Bash-parity gate **67/67 -- a full
+pass**, and the corpus has no tsh timeouts left. BASH-ONLY 344/1481, up from
+233: `[[ ]]`, `(( ))`, brace expansion, globstar and namerefs all landed on
+the way through.
 
 ---
 
@@ -216,101 +217,69 @@ or the hosted link fails.
 
 ---
 
-## 5. What is left
+## 5. What is left: SEVEN
 
-Run `python logs/oilspec_detail.py` for all of them with diffs. By kind:
+Run `python logs/oilspec_detail.py` for all of them with diffs.
 
-| kind | n | note |
+| id | what | status |
 |---|---|---|
-| the guest's bash is the one that is wrong | ~9 | 2098 2118 2410 2647 1451 1478 1565 1822 2125 — matching these would mean breaking tsh |
-| needs a kernel feature | 1 | symlinks (`ln -s`) 0738 -- there is no `ln` |
-| `shopt -s globstar` | 2 | 1725 1728 -- `**` recursion; nobody has asked for it |
-| NUL bytes inside a variable | 4 | 1886 1888 1893 1894 — see below |
-| known flaky | 4 | 2271 2272 2273, and 1761 — background/pipeline output racing the exit. The score oscillates by about two because of these; do not chase a single-case move without re-running. |
-| implementable shell work | the rest | see below |
+| 1888 1893 | `s=$(printf '..')` loses the byte | **the marker collision**, below |
+| 1894 | `escape_arg` loop over `${a#?}` produces nothing | not diagnosed; every piece of it passes on its own |
+| 1394 | `[[` inside backticks inside double quotes, with an escaped quote redirected to a file | not diagnosed |
+| 0932 2271 2272 2273 | whether a backgrounded child's output beats the parent | **races**, below |
 
-**100% is not reachable.** About twenty of the remainder are the oracle, the
-kernel, or timing; they are not shell defects and "fixing" them would mean
-making tsh worse. The reachable ceiling is around **1262/1280 = 98.6%**, and
-the last stretch of that is expensive — every remaining item is one case.
+That is 1273/1280 = 99.5%, and the number moves by about two between
+identical runs because of the races.
 
-The implementable ones, by mechanism:
+### The marker collision -- a real bug, deliberately not fixed yet
 
-- **Subshell isolation** (0481 1953, and the already-fixed 0030). A command
-  substitution, a backgrounded command and a non-last pipeline stage are all
-  subshells, and tsh runs them in-process. `$( )` now snapshots the ALIAS
-  table (`shell_alias_save`); variables and functions still leak, and the two
-  open cases need the leak closed for a BACKGROUNDED command and for a
-  PIPELINE stage. The hard part is that the leak happens during EXPANSION —
-  `echo ${bar=2} &` has already assigned `bar` by the time anything knows the
-  command is backgrounded — so the frame has to be taken before
-  `shell_tokenize` sees the line, not at the dispatch site.
-- **Quoting information does not reach the globber** (1693 1694 2692). In
-  `shell_tokenize` a backslash escape and a quote both set `word_quoted` for
-  the whole word, and `shell_add_one_arg` skips pathname expansion on a quoted
-  word entirely. bash globs the word with the quoted parts LITERAL, so
-  `'_t/[bc]'*.mm` matches a file actually named `_t/[bc]ar.mm` and `[\[z]`
-  matches `[`. Measured with a probe: every other bracket form already agrees
-  (`[[z]`, `[]z]`, `[a-z]`, `?`), so the bracket matcher is fine — only the
-  quoting path is missing. The no-split marks cannot carry this: they wrap
-  LITERAL runs as well as quoted ones, so escaping everything inside a mark
-  would break `echo *.txt`. It needs either a third marker byte or a kept
-  backslash plus a strip on the no-match path, and both touch the hottest
-  path in the tokenizer.
-- **Temporary environment ordering** (0416). `FOO=a BAR=[$FOO] cmd` must apply
-  the assignments left to right, each RHS seeing the earlier ones. tsh expands
-  every word at tokenize time, before any of them is applied. (0421 and 1165,
-  the other two of this family, are DONE — prefix assignments are now exported
-  for the duration of the command and no longer persist past a special
-  builtin.)
-- **`$LINENO` is a statement counter, not a source line** (2665). Measured:
-  a body on source line 4 reports 3, on line 7 reports 4. The accumulator
-  joins physical lines into one logical line and nothing carries the original
-  number.
-- **`[[ ]]` is not a builtin at all** (0556 2148 2150). Measured: `[[ -n x ]]`
-  reports `spawn: failed to launch '/bin/[['`. Only ~1 POSIX case turns on it,
-  but the `dbracket` and `regex` spec files are **44 + 32 BASH-ONLY cases** —
-  by far the largest single BASH-ONLY win left. The three POSIX ones also want
-  bash's whole-script parse error, which a line-at-a-time reader cannot give.
-- **traps and signals** (1245 1246) — `kill -URG $$` delivers nothing, and a
-  trap that runs during a spawned child's signal is not isolated.
-- singles: 0422 (an escaped `=` makes the word a command NAME, not an
-  assignment — needs a per-argument "cannot be an assignment" flag threaded
-  from the tokenizer to `shell_run_single`), 0632 (a `case` whose word is a
-  backtick running `eval` with escaped quotes exits 255 — bisected down to
-  needing the `mysed -n "$s" $files` shape; the simpler forms all pass),
-  1010 (printf `%x` of a unicode char), 1135 (`read`'s last field with an
-  IFS that holds both a space and a non-space — the rule was NOT derivable
-  from a seven-row probe table), 1329 1856 (bash arrays/namerefs),
-  1375 1394 1411 1525 1564 1760 2260 2359.
+Measured with a probe, not inferred:
 
-### Structural items — status
+    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
+    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
+    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
+    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 3
 
-- **NUL bytes — NOT WORTH IT, and the reason matters.** The cases need a NUL
-  *inside a variable* (`s=$(printf ' . ')`, `${#s}`). C strings cannot
-  hold that. A length-carrying **output path** — which is what it looks like
-  from the outside — moves almost none of them; it needs a length-carrying
-  **value** representation through the variable table, argv and every
-  expansion. Also `src/tcp_shell.c` installs the string sink with no byte
-  sink, so the obvious surgical fix misroutes the TCP shell.
-- **`case` inside `$( )` — DONE, and this RETRACTS the previous handoff.** It
-  was recorded here as "attempted and reverted, cost five arith cases,
-  mechanism unexplained". It is now implemented and cost nothing (+1 POSIX, 0
-  losses). The earlier attempt's arith losses were almost certainly the
-  unterminated-buffer bug described in section 3, which was live at the time.
-  The rule: inside `$( )`, `case` opens a construct, `in` and `;;` say a
-  pattern may start, and while one may, `(` and `)` belong to the pattern.
-  Both `shell_scan_token` and `shell_parse_command_subst` need it.
-- **`ulimit` reports "unlimited" on purpose.** The kernel discards setrlimit
-  and answers getrlimit with infinity, which is why the real bash in the
-  initrd prints `unlimited` after `ulimit -f 4294967296`. tsh keeps its table
-  for validation and for the hard-limit rule, but reports what is in force.
-  Remove the override in `shell_rlimit_print` the day the kernel grows real
-  per-process limits.
-- **`<>` is DONE** and 2126 (`<>` on a fifo) passes, so mkfifo is no longer a
-  blocker. 2125 (`<>` on a plain file) now fails the other way round: **tsh is
-  right and the guest's bash reads nothing**, which is a kernel-side gap in
-  the oracle, not a shell defect.
+Bytes 0x01, 0x02 and 0x03 arriving from an expansion are silently
+removed, because they are `SHELL_ARG_MARK`, `SHELL_NOSPLIT_MARK` and
+`SHELL_GLOB_ESC` -- the in-band markers the word buffer carries. Any
+command output containing them loses them, which is a data-integrity bug
+well beyond the two corpus cases.
+
+Fixing it means an escaping scheme (double a marker byte that is data,
+collapse it at the strip funnels) audited across the ~59 places that
+mention a marker. The last in-band marker introduced here cost eight
+regressions, and *the two consumers found by reasoning were not the two
+that broke*. Do it with the gate in the loop, one marker at a time, or
+not at all.
+
+### The races
+
+`a & b` and friends turn on whether the backgrounded child writes before
+the parent does. bash wins consistently for a structural reason: its
+child has already parsed the command, while tsh's child re-parses the
+text it was handed, so the parent gets there first. Making the parent
+sleep would "fix" them and would be a lie about what the shell does.
+
+### Everything that used to be on this list
+
+Fourteen cases were written off in this file at one time or another as
+unstatable rules, oracle bugs, or C-string impossibilities. Twelve of
+them were ours:
+
+- "the read/IFS rule cannot be stated" -- it can; see the commit. What
+  was missing was not data but the WHOLE TABLE: the runner printed three
+  diff lines per case, so the rows that discriminate never appeared
+  together. `DIFF_MAX_LINES` is 24 now.
+- "the guest's bash is wrong" (nine cases) -- six were our kernel and our
+  utilities: fcntl answering for closed descriptors, /bin/sh's `exit`
+  ignoring its argument, /bin/date printing the uptime, no /bin/kill.
+- "NUL bytes need a length-carrying value representation" -- two of the
+  four did not: one needed the NUL to TERMINATE (which a C string does
+  for free) and one needed it DROPPED from captured output.
+- "1478 hangs, not diagnosed" -- a forked stage held the read end of the
+  pipe it was writing to, so the writer was waiting for a reader that was
+  itself.
 
 ---
 
