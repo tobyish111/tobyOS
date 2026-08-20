@@ -298,7 +298,7 @@ static int run_shell(const char *shell, char *const argv[], const char *workdir,
 
 /* ---- diffing ------------------------------------------------------------ */
 
-#define DIFF_MAX_LINES 3
+#define DIFF_MAX_LINES 24
 
 static int line_at(const char *buf, long len, int want, char *out, size_t cap) {
     int line = 0;

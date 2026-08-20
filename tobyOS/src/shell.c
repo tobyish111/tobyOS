@@ -14873,6 +14873,13 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             shell_stage_is_builtin(&pl->stage[i])) {
             int fpid = fork();
             if (fpid == 0) {
+                /* Every pipe was created up front, so this child inherited
+                 * ALL of their ends. It needs exactly two -- see the note in
+                 * the compound path about a writer that is its own reader. */
+                for (int j = 0; j + 1 < pl->count; j++) {
+                    if (pipes_r[j] && pipes_r[j] != in)  file_close(pipes_r[j]);
+                    if (pipes_w[j] && pipes_w[j] != out) file_close(pipes_w[j]);
+                }
                 int crc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
                 if (crc < 0) crc = 127;
                 _exit(crc & 0xff);
@@ -17699,7 +17706,16 @@ static bool shell_try_compound_pipeline(const char *src) {
      * knows where the stages are, so `cmd` was already set by the time
      * anything forked. Handing each stage its TEXT to a child moves the
      * expansion where it belongs. */
-    (void)any_compound;
+    /* INSIDE A COMMAND SUBSTITUTION, ONLY A COMPOUND STAGE NEEDS THIS PATH.
+     * The stages cannot be forked there anyway (the capture's spill file has
+     * no second writer), so re-splitting the text gains nothing -- and it
+     * loses: `echo \`\`echo -n e\`cho hi | cat\`` came back as "unmatched
+     * backquote" once the pipeline was cut out of the captured text instead
+     * of being tokenized whole. */
+    if (g_capture_depth > 0 && !any_compound) {
+        kfree(stages);
+        return false;
+    }
     if (overflow || n < 2) {
         kfree(stages);
         return false;
@@ -17783,6 +17799,17 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (!bg_tail && g_heredoc_count == 0 && g_capture_depth == 0 &&
             (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
         if (fpid == 0) {
+            /* A CHILD MUST NOT HOLD THE READ END OF THE PIPE IT WRITES TO.
+             *
+             *     cat /dev/urandom | sleep 0.1
+             *
+             * fork copies every open descriptor, so this stage inherited the
+             * read end its successor is going to use -- and a pipe with a
+             * reader never reports "no readers", so the write blocked instead
+             * of taking the SIGPIPE that ends it. The writer waited for a
+             * reader that was itself. Closing it here is what the fds= dance
+             * in a real shell is for. */
+            if (r) file_close(r);
             execute_line_text(stages[i]);
             int crc = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
@@ -18092,6 +18119,12 @@ static void execute_line_text_inner(const char *src) {
     }
 
     if (shell_try_function_definition(src)) return;
+    /* THE `&` COMES OFF FIRST. `a | b | ( c ) & rest` is a backgrounded
+     * PIPELINE followed by `rest`, and the pipeline splitter cannot see that:
+     * it cuts at the `|` and hands the last stage `( c ) & rest`, so the
+     * `&` -- and `rest`, which is usually what reads `$!` -- happened in the
+     * child. Splitting at the `&` first leaves each half whole. */
+    if (shell_try_background_line(src)) return;
     /* A pipeline with a compound stage must be split while the stages are
      * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
     if (shell_try_compound_pipeline(src)) {
