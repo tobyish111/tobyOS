@@ -5265,6 +5265,7 @@ struct shell_scan {
     bool case_word;     /* between `case` and its `in` */
     bool case_pat;      /* a case PATTERN may start here, so `(` is legal */
     bool after_in;      /* the last token was the `in` of a for/case */
+    bool dbracket;      /* inside `[[ ... ]]`, where none of this applies */
     bool no_sep;        /* the text so far cannot end a command: joining the
                          * next line to it must NOT insert a `;` */
     bool decl_util;     /* the command is export/readonly/local/declare */
@@ -5293,6 +5294,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->case_pat = false;
     st->after_in = false;
     st->no_sep = true;
+    st->dbracket = false;
     st->decl_util = false;
     st->case_depth = 0;
     st->cont_op = false;
@@ -5336,8 +5338,12 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
 
     /* Still inside an unclosed `$( )` / `${ }` / backtick from a previous
      * line: every character belongs to that word, so none of the operator
-     * cases below apply. */
-    if (st->nest == 0) {
+     * cases below apply. INSIDE `[[ ... ]]` the same is true for a different
+     * reason: the conditional expression has its own grammar, where `(`,
+     * `)`, `|` and `&` are operators of that grammar and not of this one.
+     * Judging them by shell rules turned `[[ 'a b' =~ ^)a( ]]` into a shell
+     * syntax error, where bash simply evaluates it. */
+    if (st->nest == 0 && !st->dbracket) {
     if (c == '#') {                      /* a comment runs to end of line */
         while (*p) p++;
         /* A COMMENT IS NOT A TOKEN. `echo abcd |    # input` still ends in a
@@ -5586,6 +5592,19 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     if (st->nest > 0) { st->in_sq = sq; st->in_dq = dq; }
     *pp = p;
 
+    /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar. */
+    if (n == 2 && w[0] == '[' && w[1] == '[' && !st->dbracket) {
+        st->dbracket = true;
+        st->cmd_pos = false; st->prev_word_cmd = false;
+        st->no_sep = false;
+        return;
+    }
+    if (st->dbracket) {
+        if (n == 2 && w[0] == ']' && w[1] == ']') st->dbracket = false;
+        st->cmd_pos = false; st->prev_word_cmd = false;
+        st->no_sep = false;
+        return;
+    }
     if (st->redir) {                     /* a filename, never a command */
         st->redir = false;
         st->prev_word_cmd = false;
@@ -5961,6 +5980,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             }
             line = accum;
         }
+
+        /* A COMMENT ENDS AT THE NEWLINE, AND THE NEWLINE IS GONE by the time
+         * anything downstream looks at this line -- the accumulator joined it
+         * or the reader cut it. The tokenizer stops at `#` on its own, but the
+         * compound parsers do not: `( exit 42 )  # note` searched past the
+         * comment for another `)` and reported "subshell: expected ')'". */
+        shell_strip_comment(line);
 
         /* In place: `line` points either into the script text or into accum,
          * both writable, and the result is never longer than the input. */
@@ -9360,7 +9386,22 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
             continue;
         }
         if (*p == '\\' && p[1]) {
-            if (dq_syntax) {
+            if (dq_syntax && !sq_syntax) {
+                /* INSIDE DOUBLE QUOTES a backslash is special only before
+                 * $ ` " \ and newline; anywhere else BOTH bytes are data:
+                 *
+                 *     echo "${undef-\z}"     bash: \z     tsh: z
+                 *
+                 * The `${...}` word inherits the enclosing quoting, and
+                 * sq_syntax is already how this function is told which it is
+                 * in (single quotes stop being syntax inside double ones). */
+                if (p[1] == '$' || p[1] == '`' || p[1] == '"' ||
+                    p[1] == '\\' || p[1] == '\n') {
+                    p++;
+                } else if (shell_append_char(out, &pos, cap, *p++) < 0) {
+                    return -1;
+                }
+            } else if (dq_syntax) {
                 p++;              /* unquoted word: escape, next byte literal */
             } else if (p[1] == '$' || p[1] == '`' ||
                        p[1] == '\\' || p[1] == '\n') {
@@ -11725,6 +11766,11 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
              * An empty stage in a MULTI-stage pipeline stays an error -- that
              * is `a | | b`, a real syntax error. */
             if (pl->count == 1) continue;
+            /* A LAST STAGE THAT EXPANDED TO NOTHING is a no-op, not a syntax
+             * error: `echo -n '' | $SH` with SH unset is a pipeline whose
+             * second command has no words, and bash runs nothing and reports
+             * 0. A MIDDLE stage with no words is still `a | | b`. */
+            if (i + 1 == pl->count) continue;
             kprintf("shell: empty command in pipeline\n");
             return -1;
         }
@@ -12733,6 +12779,12 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
         struct file *in = (i == 0) ? 0 : pipes_r[i - 1];
         struct file *out = (i + 1 == pl->count) ? 0 : pipes_w[i];
 
+        if (pl->stage[i].argc == 0 && pl->stage[i].redir_count == 0) {
+            stage_status[i] = 0;          /* expanded to nothing: a no-op */
+            if (in)  { file_close(in);  pipes_r[i - 1] = 0; }
+            if (out) { file_close(out); pipes_w[i] = 0; }
+            continue;
+        }
         int shell_rc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
         if (shell_rc >= 0) {
             stage_status[i] = shell_rc;
@@ -14933,6 +14985,7 @@ static bool shell_try_compound_pipeline(const char *src) {
     struct file *saved0 = g_shell_fd[0], *saved1 = g_shell_fd[1];
     struct file *prev_in = 0;
     int last = 0;
+    int failed = 0;                       /* rightmost non-zero, for pipefail */
 
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
@@ -14943,8 +14996,33 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (prev_in) g_shell_fd[0] = prev_in;
         if (w)       g_shell_fd[1] = w;
 
+        /* EVERY PIPELINE STAGE IS A SUBSHELL, so `exit` inside one ends THAT
+         * stage:
+         *
+         *     { sleep 0.01; exit 9; } | { exit 2; } | { true; }
+         *
+         * is status 0 in bash (and 2 with pipefail). tsh ran the stages in
+         * process and the first `exit 9` took the whole shell with it, so the
+         * script produced no output at all. The stage's own loop depth is
+         * reset for the same reason -- `break` inside a stage cannot break a
+         * loop outside it. */
+        enum shell_flow saved_flow = g_shell_flow;
+        int saved_flow_status = g_shell_flow_status;
+        int saved_loop_depth = g_shell_loop_depth;
+        g_subshell_depth++;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        g_shell_loop_depth = 0;
+
         execute_line_text(stages[i]);
         last = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
+        if (last != 0) failed = last;
+
+        g_subshell_depth--;
+        g_shell_flow = saved_flow;
+        g_shell_flow_status = saved_flow_status;
+        g_shell_loop_depth = saved_loop_depth;
 
         g_shell_fd[0] = saved0;
         g_shell_fd[1] = saved1;
@@ -14961,6 +15039,7 @@ static bool shell_try_compound_pipeline(const char *src) {
     g_shell_fd[0] = saved0;
     g_shell_fd[1] = saved1;
     kfree(stages);
+    if (g_opt_pipefail && failed != 0) last = failed;
     shell_set_status(last);
     return true;
 }
@@ -15438,7 +15517,6 @@ static void execute_line_text(const char *src) {
         g_exec_line_depth--;
         return;
     }
-    if (!shell_line_syntax_ok(src)) return;
 
     char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
     const char *line_src = src;
@@ -15454,6 +15532,21 @@ static void execute_line_text(const char *src) {
             kfree(abuf);
             return;
         }
+    }
+
+    /* THE SYNTAX CHECK RUNS ON THE EXPANDED TEXT, not the source.
+     *
+     *     alias LEFT='('
+     *     LEFT echo one; echo two )
+     *
+     * is a subshell once the alias is substituted; before that it is a
+     * command called LEFT and a stray `)`, and checking there rejected a
+     * line every shell accepts. It works the other way too: `alias e_=';;
+     * oops'` produces a `;;` outside any case, which is the syntax error
+     * bash reports and tsh used to run. */
+    if (!shell_line_syntax_ok(line_src)) {
+        if (abuf) kfree(abuf);
+        return;
     }
 
     g_exec_line_depth++;

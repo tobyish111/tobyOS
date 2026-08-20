@@ -152,6 +152,21 @@ done
 sleep 2
 taskkill //IM qemu-system-x86_64.exe //F >/dev/null 2>&1
 
+# THE ISO CAN CARRY A DIFFERENT INITRD THAN build/initrd.tar.
+# One run reported "SKIP reason=no-corpus" with gate 0 green: the tar on disk
+# had all 3,877 entries, and the copy inside the ISO stopped after 817 -- a
+# stale/partial artefact from an interrupted build. Gate 0 checks the tar,
+# which is the wrong end of the pipe. The number the GUEST mounted is the only
+# one that describes what actually ran, and it costs one grep.
+TARENT=$(tar -tf build/initrd.tar 2>/dev/null | wc -l)
+GUESTENT=$(grep -a -o '\[ramfs\] mounted: [0-9]* entries' "$LOG" | head -1 |            grep -o '[0-9]*')
+echo "=== initrd: host tar $TARENT entries, guest mounted ${GUESTENT:-none} ==="
+if [ -n "$GUESTENT" ] && [ "$GUESTENT" -lt $((TARENT - 40)) ]; then
+    echo "  INITRD SHORT IN THE ISO -- the guest mounted $GUESTENT of $TARENT."
+    echo "  The ISO holds a stale or truncated initrd. Fix with:"
+    echo "      rm -f build/initrd.tar build/base.iso tobyOS.iso && re-run"
+fi
+
 echo "=== failures (bounded; full data is in the MAP) ==="
 grep -a '\[oilspec\] \(FAIL\|BROKEN\|WARNING\)' "$LOG" | head -80
 
