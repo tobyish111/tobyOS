@@ -78,6 +78,16 @@ extern volatile struct limine_module_request module_req;
  * shell_append_positional_join for why a marker in the text is the only
  * place this information can live. Stripped before any word reaches argv. */
 #define SHELL_NOSPLIT_MARK '\x02'
+
+/* Marks the byte AFTER it as an ordinary character for pathname expansion.
+ *
+ * A real backslash cannot do this job. `v='*\*.txt'; echo $v` must print the
+ * backslash back -- it is DATA that arrived from a variable, not quoting --
+ * so a pass that removed backslashes before metacharacters ate four
+ * conformance cases as soon as it was added. A byte that cannot appear in
+ * shell text can only have been put there by the tokenizer, and only where
+ * the source really was quoted. */
+#define SHELL_GLOB_ESC '\x03'
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -2700,10 +2710,10 @@ static void cmd_cd(int argc, char **argv) {
                 while (*end && *end != ':') end++;
                 char cand[VFS_PATH_MAX];
                 size_t dl = (size_t)(end - cp);
-                if (dl == 0) { cand[0] = '.'; cand[1] = ' '; dl = 1; }
+                if (dl == 0) { cand[0] = '.'; cand[1] = '\0'; dl = 1; }
                 else if (dl + 1 < sizeof cand) {
                     memcpy(cand, cp, dl);
-                    cand[dl] = ' ';
+                    cand[dl] = '\0';
                 } else { cp = *end ? end + 1 : end; continue; }
                 char full[VFS_PATH_MAX];
                 if (ksnprintf(full, sizeof full, "%s/%s", cand, target) > 0) {
@@ -9821,12 +9831,18 @@ static void shell_strip_nosplit(char *dst, size_t cap, const char *src) {
  * clean its own token rather than needing a scratch buffer. Redirect targets,
  * case patterns and `!` comparisons all read a token directly, and a mark left
  * in one of those is a raw 0x02 byte in a FILENAME. */
+/* A REDIRECT OPERAND AND A `case` WORD are not globbed, so the escapes the
+ * tokenizer puts on quoted metacharacters have to come off here as well --
+ * otherwise `> "*"` creates a file whose name begins with a backslash. */
+static void shell_strip_glob_escapes(char *s);
+
 static void shell_strip_nosplit_inplace(char *s) {
     if (!s) return;
     char *w = s;
     for (const char *r = s; *r; r++)
         if (*r != SHELL_NOSPLIT_MARK) *w++ = *r;
-    *w = ' ';
+    *w = '\0';
+    shell_strip_glob_escapes(s);
 }
 
 static bool shell_has_nosplit(const char *s) {
@@ -10097,7 +10113,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
  * A quoted span arrives wrapped in no-split markers, so a `~` that is still
  * the FIRST byte was unquoted; and g_dq_depth is what says whether the whole
  * substitution sits inside double quotes. tsh expanded none of the four. */
-#define SH_WORD_TILDE()                                                           do {                                                                              if (g_dq_depth == 0 && expanded_word[0] == '~' &&                                 (expanded_word[1] == ' ' || expanded_word[1] == '/')) {                       const char *hm = env_get("HOME");                                             if (!hm || !*hm) hm = "/";                                                    char tw[SHELL_PARSE_BUF_MAX];                                                 int tn = ksnprintf(tw, sizeof tw, "%s%s", hm,                                                    expanded_word + 1);                                        if (tn > 0 && (size_t)tn < sizeof tw)                                             memcpy(expanded_word, tw, (size_t)tn + 1);                            }                                                                         } while (0)
+#define SH_WORD_TILDE()                                                           do {                                                                              if (g_dq_depth == 0 && expanded_word[0] == '~' &&                                 (expanded_word[1] == '\0' || expanded_word[1] == '/')) {                       const char *hm = env_get("HOME");                                             if (!hm || !*hm) hm = "/";                                                    char tw[SHELL_PARSE_BUF_MAX];                                                 int tn = ksnprintf(tw, sizeof tw, "%s%s", hm,                                                    expanded_word + 1);                                        if (tn > 0 && (size_t)tn < sizeof tw)                                             memcpy(expanded_word, tw, (size_t)tn + 1);                            }                                                                         } while (0)
 
 #define SH_JOIN_WORD_MARKS()                                                  \
     do {                                                                      \
@@ -10838,6 +10854,10 @@ static bool shell_is_digit(char c) {
  * substitution in ITS OWN value and not one from an earlier line. Nested
  * tokenization is safe: a substitution records its status when it finishes,
  * which is after every tokenizer it started has already run. */
+static bool shell_glob_meta(char c);
+static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
+                                   size_t from);
+
 static int shell_tokenize(const char *src, struct shell_token *tok,
                           int *out_ntok, char *words, size_t word_cap) {
     int ntok = 0;
@@ -11051,12 +11071,15 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                  * and stops WITHIN the word -- `$a"$b"` splits in the middle. */
                 if (shell_append_char(words, &wpos, word_cap,
                                       SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t sq_start = wpos;
                 while (*p && *p != '\'') {
                     if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
                         kprintf("shell: word too long\n");
                         return -1;
                     }
                 }
+                if (shell_escape_glob_range(words, &wpos, word_cap,
+                                            sq_start) < 0) return -1;
                 if (shell_append_char(words, &wpos, word_cap,
                                       SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '\'') {
@@ -11073,6 +11096,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 g_dq_depth++;
                 if (shell_append_char(words, &wpos, word_cap,
                                       SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t dq_start = wpos;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
                         /* POSIX 2.2.3: inside double quotes a backslash is
@@ -11114,6 +11138,8 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                     }
                 }
                 g_dq_depth--;
+                if (shell_escape_glob_range(words, &wpos, word_cap,
+                                            dq_start) < 0) return -1;
                 if (shell_append_char(words, &wpos, word_cap,
                                       SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
@@ -11129,6 +11155,16 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 p++;
                 if (!*p) {
                     kprintf("shell: trailing escape\n");
+                    return -1;
+                }
+                /* AN ESCAPED METACHARACTER KEEPS ITS BACKSLASH so the globber
+                 * treats it as an ordinary character -- `echo [\\[z]` has to
+                 * match a file actually named `[`. The escape comes off again
+                 * where the word becomes an argument. */
+                if (shell_glob_meta(*p) &&
+                    shell_append_char(words, &wpos, word_cap,
+                                      SHELL_GLOB_ESC) < 0) {
+                    kprintf("shell: word too long\n");
                     return -1;
                 }
                 if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
@@ -11450,9 +11486,56 @@ static int shell_pipeline_save_word(struct shell_pipeline *pl,
     return 0;
 }
 
+/* Backslash-escape every glob metacharacter in buf[from..*pos), in place.
+ *
+ * QUOTING HAS TO REACH THE GLOBBER. bash expands a word whose quoted parts
+ * are LITERAL:
+ *
+ *     touch '_t/[bc]ar.mm' _t/bar.mm
+ *     echo '_t/[bc]'*.mm            bash: _t/[bc]ar.mm
+ *     echo [\[z]                     bash: the file named [
+ *
+ * tsh set one `word_quoted` flag for the whole word and then skipped pathname
+ * expansion entirely, so both printed the pattern back. The no-split marks
+ * cannot carry this -- they wrap unquoted LITERAL runs as well as quoted
+ * spans, so honouring them would stop `echo *.txt` working. The tokenizer
+ * therefore escapes the metacharacters as it leaves a quoted span, exactly as
+ * shell_case_unquote already does for a case pattern, and the escapes are
+ * stripped again at the one place a word becomes an argument. */
+static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
+                                   size_t from) {
+    size_t extra = 0;
+    for (size_t i = from; i < *pos; i++)
+        if (shell_glob_meta(buf[i])) extra++;
+    if (extra == 0) return 0;
+    if (*pos + extra + 1 >= cap) return -1;
+    size_t src = *pos, dst = *pos + extra;
+    while (src > from) {
+        char c = buf[--src];
+        buf[--dst] = c;
+        if (shell_glob_meta(c)) buf[--dst] = SHELL_GLOB_ESC;
+    }
+    *pos += extra;
+    buf[*pos] = '\0';
+    return 0;
+}
+
+/* Undo it: one backslash before a metacharacter goes away. */
+static void shell_strip_glob_escapes(char *s) {
+    if (!s) return;
+    char *w = s;
+    for (const char *r = s; *r; r++) {
+        if (*r == SHELL_GLOB_ESC && r[1]) r++;
+        *w++ = *r;
+    }
+    *w = '\0';
+}
+
+/* A metacharacter that is ESCAPED is not one. */
 static bool shell_has_glob(const char *s) {
     if (!s) return false;
     for (; *s; s++) {
+        if (*s == SHELL_GLOB_ESC && s[1]) { s++; continue; }
         if (*s == '*' || *s == '?' || *s == '[') return true;
     }
     return false;
@@ -11526,6 +11609,16 @@ static bool shell_glob_bracket(const char **pp, char c) {
                 continue;
             }
         }
+        /* AN ESCAPE INSIDE A BRACKET makes the next character ordinary:
+         * `[\\\\[z]` is the set { '[', 'z' }. Both spellings appear -- a case
+         * pattern is escaped with a real backslash by shell_case_unquote, an
+         * ordinary word with SHELL_GLOB_ESC by the tokenizer. */
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC) && p[1]) {
+            p++;
+            if (*p == c) matched = true;
+            p++;
+            continue;
+        }
         if (p[1] == '-' && p[2] && p[2] != ']') {
             char lo = p[0];
             char hi = p[2];
@@ -11553,7 +11646,7 @@ static bool shell_glob_match(const char *pat, const char *name) {
          * string `*`, not everything. shell_case_unquote() strips the quotes
          * and escapes what was inside them, so the distinction between `*` and
          * `"*"` reaches here instead of being lost with the quotes. */
-        if (*pat == '\\' && pat[1]) {
+        if ((*pat == '\\' || *pat == SHELL_GLOB_ESC) && pat[1]) {
             if (*name != pat[1]) return false;
             pat += 2;
             name++;
@@ -11638,6 +11731,8 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
     return shell_pipeline_save_word(pl, tmp, out) < 0 ? -1 : 1;
 }
 
+static void shell_strip_glob_escapes(char *s);
+
 static int shell_expand_glob_word(struct shell_pipeline *pl,
                                   struct shell_simple *cur,
                                   const char *word) {
@@ -11670,6 +11765,14 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
     }
 
     if (!pattern[0]) return 0;
+
+    /* THE DIRECTORY HALF IS A PATH, NOT A PATTERN. `'_q'/*` puts a quoted
+     * span in the leading component, and its escapes would reach opendir()
+     * as literal marker bytes; the same goes for the prefix that is pasted
+     * back in front of every match. Only `pattern` keeps them, because only
+     * `pattern` is matched. */
+    shell_strip_glob_escapes(dir_arg);
+    shell_strip_glob_escapes(display_prefix);
 
     char dir_path[VFS_PATH_MAX];
     if (shell_canonicalize_path(dir_arg, dir_path, sizeof(dir_path)) < 0) {
@@ -11763,13 +11866,17 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     size_t akey = env_key_len(word);
     bool assign_word = (word[akey] == '=' && shell_name_is_valid(word, akey));
 
-    if (!quoted) {
-        if (!g_opt_noglob && !assign_word && shell_has_glob(word)) {
-            int n = shell_expand_glob_word(pl, cur, word);
-            if (n < 0) return -1;
-            if (n > 0) return 0;
-        }
+    /* PATHNAME EXPANSION IS NOT GATED ON `quoted` ANY MORE. A word with a
+     * quoted part is still globbed -- with that part LITERAL, which is what
+     * the escapes the tokenizer added say. Only TILDE expansion below still
+     * turns off inside quotes, because a quoted `~` really is data. */
+    if (!g_opt_noglob && !assign_word && shell_has_glob(word)) {
+        int n = shell_expand_glob_word(pl, cur, word);
+        if (n < 0) return -1;
+        if (n > 0) return 0;
+    }
 
+    if (!quoted) {
         char *expanded = 0;
         int trc = g_arg_from_expansion
                     ? 0
@@ -11832,6 +11939,23 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         }
     }
 
+    /* THE ESCAPES COME OFF HERE. Everything above may have needed them --
+     * the globber reads one as "this metacharacter is data" -- but an
+     * argument must not carry them. */
+    bool has_esc = false;
+    for (const char *e = word; *e; e++)
+        if (*e == SHELL_GLOB_ESC) { has_esc = true; break; }
+    if (has_esc) {
+        char plain[SHELL_PARSE_BUF_MAX];
+        size_t n = strlen(word);
+        if (n + 1 <= sizeof plain) {
+            memcpy(plain, word, n + 1);
+            shell_strip_glob_escapes(plain);
+            char *saved = 0;
+            if (shell_pipeline_save_word(pl, plain, &saved) < 0) return -1;
+            word = saved;
+        }
+    }
     cur->argv[cur->argc++] = (char *)word;
     return 0;
 }
@@ -11899,7 +12023,7 @@ static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap) {
         if (o + 1 >= cap) return -1;
         out[o++] = *q;
     }
-    out[o] = ' ';
+    out[o] = '\0';
     return 0;
 }
 
@@ -11972,7 +12096,7 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
              * breaks out of the loop for it.) */
             const char *tail = p;
             while (*tail == SHELL_NOSPLIT_MARK) tail++;
-            if (*tail != ' ' &&
+            if (*tail != '\0' &&
                 shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
         } else {
             if (shell_add_arg(pl, cur, saved, false) < 0) return -1;
@@ -12031,7 +12155,7 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
         size_t so = 0;
         for (const char *q = word; *q && so + 1 < sizeof sh0; q++)
             if (*q != SHELL_NOSPLIT_MARK) sh0[so++] = *q;
-        sh0[so] = ' ';
+        sh0[so] = '\0';
         size_t k0 = env_key_len(sh0);
         bool assign0 = (sh0[k0] == '=' && shell_name_is_valid(sh0, k0));
         bool nosplit_ctx = assign0 &&
