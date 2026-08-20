@@ -1052,6 +1052,16 @@ static void shell_run_trap(int sig) {
 
     enum shell_flow saved_flow = g_shell_flow;
     int saved_flow_status = g_shell_flow_status;
+    /* A TRAP'S EXIT CODES ARE ISOLATED. The handler runs between two other
+     * commands and must not change what `$?` says about the one before it:
+     *
+     *     trap 'echo hit; ( exit 42 )' USR1
+     *     sh -c "kill -USR1 $$"
+     *     echo after=$?             ->  0, not 42
+     *
+     * The handler still SEES the interrupted command's status in `$?`, which
+     * is why it is set rather than cleared on the way in. */
+    int saved_status = g_last_status;
     g_trap_running = true;
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
@@ -1061,6 +1071,7 @@ static void shell_run_trap(int sig) {
     if (g_shell_flow != SHELL_FLOW_EXIT) {
         g_shell_flow = saved_flow;
         g_shell_flow_status = saved_flow_status;
+        shell_set_status(saved_status);
     }
     g_trap_running = false;
     kfree(action);
@@ -1290,6 +1301,22 @@ extern int chdir(const char *path);
 /* `test -t FD` has no tty syscall to ask; seekability stands in for one. */
 extern long lseek(int fd, long off, int whence);
 extern char *getcwd(char *buf, unsigned long size);
+/* A TRAP IN /bin/tsh HAD NOTHING BEHIND IT. shell_deliver_signal() is called
+ * from src/signal.c -- the KERNEL -- so the in-kernel shell's traps fired and
+ * the hosted shell's did not: a signal sent to /bin/tsh took the default
+ * action instead, which for USR1 means the shell dies. `trap ... INT` in a
+ * script was decoration. The hosted build installs a real handler for every
+ * signal a trap is set on; it does nothing but record the arrival, which is
+ * the same thing the kernel path does. */
+extern void (*signal(int signum, void (*handler)(int)))(int);
+void shell_deliver_signal(int sig);
+static void shell_hosted_sigrelay(int sig) { shell_deliver_signal(sig); }
+#define SHELL_TRAP_ARM(sig) do { \
+        if ((sig) > 0 && (sig) < SIG_MAX) \
+            (void)signal((sig), shell_hosted_sigrelay); \
+    } while (0)
+#else
+#define SHELL_TRAP_ARM(sig) do { } while (0)
 #endif
 
 static int shell_set_cwd(const char *path) {
@@ -6673,6 +6700,8 @@ static void cmd_trap(int argc, char **argv) {
         }
         shell_trap_unset(sig);
         if (reset) continue;
+        /* EXIT/ERR/DEBUG are not signals; SHELL_TRAP_ARM ignores those. */
+        SHELL_TRAP_ARM(sig);
         g_traps[sig] = shell_strdup(action);
         if (!g_traps[sig]) {
             shell_set_status(1);

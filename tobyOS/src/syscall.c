@@ -352,6 +352,16 @@ static long sys_write(int fd, const void *buf, size_t len) {
 #endif
     long rv = file_write(f, k, len);
     kfree(k);
+    /* WRITING TO A PIPE WITH NO READER RAISES SIGPIPE. POSIX: the signal
+     * comes first and EPIPE is what a process that ignores or blocks it
+     * sees. Without it `cat </dev/zero | true` never ended -- cat took the
+     * EPIPE as an ordinary short write and went round again -- and every
+     * program in the "write until the reader goes away" shape ran forever
+     * instead of dying with 141. */
+    if (rv == -3 && f->kind == FILE_KIND_PIPE_W) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+    }
     return file_err_to_abi(f, rv);
 }
 

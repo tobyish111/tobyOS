@@ -495,6 +495,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_df/user_df.elf \
             programs/user_mkdir/user_mkdir.elf \
             programs/user_touch/user_touch.elf \
+            programs/user_kill/user_kill.elf \
             programs/user_tail/user_tail.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
@@ -1646,6 +1647,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_df,user_df))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_kill,user_kill))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
@@ -2907,6 +2909,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
 	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
 	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
+	cp programs/user_kill/user_kill.elf             $(INITRD_STAGE)/bin/kill
 	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
 	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
 	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
@@ -3477,6 +3480,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
+	    bin/kill                                                          \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
@@ -5149,6 +5153,7 @@ clean:
 	       programs/user_df/user_df.o programs/user_df/user_df.elf \
 	       programs/user_mkdir/user_mkdir.o programs/user_mkdir/user_mkdir.elf \
 	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \
+	       programs/user_kill/user_kill.o programs/user_kill/user_kill.elf \
 	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
 	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
 	       programs/user_date/user_date.o programs/user_date/user_date.elf \
