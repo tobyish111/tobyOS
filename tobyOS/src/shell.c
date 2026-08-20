@@ -17560,6 +17560,82 @@ static bool shell_stage_is_compound(const char *s) {
            shell_group_open_at(s) || *s == '(';
 }
 
+/* ---- backgrounding, before the line is expanded --------------------- *
+ *
+ *     echo ${bar=2} &
+ *     wait
+ *     echo "[$bar]"          bash: []
+ *
+ * `${bar=2}` ASSIGNS, and a backgrounded command is a subshell, so the
+ * assignment belongs to the child. tsh expanded the whole line in this
+ * process and only forked afterwards -- by which time `bar` was set here.
+ *
+ * The `&` has to be found in the SOURCE for the same reason: after tokenizing
+ * it is too late. Everything up to it goes to a child; whatever follows is an
+ * ordinary command and runs here.
+ *
+ * Hosted only -- the kernel shell has no fork, and its token-level path still
+ * handles `&` the way it always did.
+ */
+static const char *shell_find_bg_at(const char *s) {
+    struct shell_scan st;
+    shell_scan_init(&st);
+
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        if (!shell_scan_incomplete(&st) && *p == '&' && p[1] != '&' &&
+            p[1] != '>') {
+            /* `a &` and `a & b`, but not `a && b` and not `2>&1`. A `&` that
+             * follows a redirection operator is part of it, and the scanner
+             * has already consumed those as one token. */
+            return p;
+        }
+        const char *before = p;
+        shell_scan_token(&st, &p);
+        if (p <= before) p = before + 1;
+    }
+    return 0;
+}
+
+static bool shell_try_background_line(const char *src) {
+#ifndef SHELL_HOSTED
+    (void)src;
+    return false;
+#else
+    const char *amp = shell_find_bg_at(src);
+    if (!amp) return false;
+
+    /* Nothing in front of it is a syntax error, not a background job -- and
+     * shell_line_syntax_ok has already rejected that shape. */
+    const char *left_end = amp;
+    {
+        const char *q = src;
+        while (q < left_end && (*q == ' ' || *q == '\t')) q++;
+        if (q >= left_end) return false;
+    }
+
+    char *left = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+    if (!left) return false;
+    if (shell_copy_segment(left, SHELL_PARSE_BUF_MAX, src, left_end) < 0) {
+        kfree(left);
+        return false;
+    }
+
+    /* A compound is backgrounded the same way, and this is the one path that
+     * can do it without the token parser seeing the keyword first. */
+    int rc = shell_background_forked(left, left);
+    kfree(left);
+    shell_set_status(rc);
+
+    const char *rest = shell_skip_blanks(amp + 1);
+    while (*rest == ';') rest = shell_skip_blanks(rest + 1);
+    if (*rest) execute_line_text(rest);
+    return true;
+#endif
+}
+
 /* Returns false when this is not a pipeline, or when no stage is compound --
  * in which case the existing token-level path handles it exactly as before. */
 static bool shell_try_compound_pipeline(const char *src) {
@@ -18008,7 +18084,8 @@ static void execute_line_text_inner(const char *src) {
         }
         return;
     }
-    if (shell_try_dbracket_command(src) ||
+    if (shell_try_background_line(src) ||
+        shell_try_dbracket_command(src) ||
         shell_try_arith_command(src) ||
         shell_try_if_command(src) ||
         shell_try_for_command(src) ||
