@@ -17614,7 +17614,21 @@ static const char *shell_find_pipe_at(const char *s) {
             if (*p == '"') in_dq = false;
             continue;
         }
-        if (in_bt) { if (*p == '`') in_bt = false; continue; }
+        if (in_bt) {
+            /* AN ESCAPED BACKTICK DOES NOT CLOSE ONE. `\`...\`` is the only
+             * way to nest backticks, and treating the escaped one as the
+             * terminator ended the region early -- so a `|` that belonged to
+             * the substitution looked top-level, and the pipeline splitter
+             * cut the command in half:
+             *
+             *     echo `\`echo -n l; echo -n s\` $TMP | grep x`
+             *
+             * came back as "unmatched backquote", the second half having
+             * been handed to another stage. */
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '`') in_bt = false;
+            continue;
+        }
         if (*p == '\\' && p[1]) { p++; continue; }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
