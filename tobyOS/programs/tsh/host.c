@@ -120,6 +120,16 @@ void kprintf(const char *fmt, ...) {
     va_end(ap);
     if (n < 0) return;
     if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
+    /* ...THROUGH THE SHELL'S fd 2, when it has one. A redirection replaces an
+     * entry in the shell's own descriptor table, not this process's fd 2, so
+     * `{ cmd ; } 2> err.txt` used to leave the shell's diagnostics going to
+     * the terminal while the script counted the lines it thought it had
+     * captured. shell.c hands back whatever is currently installed. */
+    {
+        extern struct file *shell_current_diag_file(void);
+        struct file *diag = shell_current_diag_file();
+        if (diag) { (void)file_write(diag, buf, (size_t)n); return; }
+    }
     write(2, buf, (size_t)n);           /* diagnostics -> stderr. See header. */
 }
 

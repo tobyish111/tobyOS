@@ -14011,6 +14011,19 @@ static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
     return 0;
 }
 
+#ifdef SHELL_HOSTED
+/* THE SHELL'S OWN DIAGNOSTICS FOLLOW ITS fd 2.
+ *
+ *     { $SH -c 'x' ; } 2> err.txt ; wc -l err.txt
+ *
+ * kprintf() in the hosted build writes to descriptor 2 directly, so a
+ * redirection that only replaced the shell's fd TABLE left "command not
+ * found" going to the terminal while the script counted the lines it thought
+ * it had captured. host.c asks this for the file to write to. */
+struct file *shell_current_diag_file(void);
+struct file *shell_current_diag_file(void) { return g_shell_fd[2]; }
+#endif
+
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
     if (!frame) return;
     for (int i = 0; i < SHELL_FD_MAX; i++) {
@@ -14703,6 +14716,20 @@ static void cmd_env(int argc, char **argv) {
     shell_set_status(shell_run_single(&cmd, false));
 }
 
+/* Would shell_run_pipeline_shell_stage handle this stage in-process? Same
+ * test it makes, asked before the fork rather than after. */
+static bool shell_stage_is_builtin(struct shell_simple *cmd) {
+    int assignc = 0;
+    while (assignc < cmd->argc &&
+           !(cmd->arg_noassign & (1u << assignc)) &&
+           shell_is_assignment_word(cmd->argv[assignc])) {
+        assignc++;
+    }
+    if (assignc == cmd->argc) return false;
+    const char *name = cmd->argv[assignc];
+    return shell_cmd_lookup(name) != 0 || shell_function_lookup(name) != 0;
+}
+
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
 
@@ -14738,6 +14765,43 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             if (out) { file_close(out); pipes_w[i] = 0; }
             continue;
         }
+#ifdef SHELL_HOSTED
+        /* A BUILTIN STAGE THAT IS NOT THE LAST ONE RUNS IN A CHILD.
+         *
+         *     cat </dev/zero | true
+         *
+         * Running the stages in order, in this process, means stage 0 fills
+         * the pipe and then blocks with nobody to drain it -- the reader is
+         * the same process, and it has not started yet. That is a HANG, and
+         * `cat </dev/zero | true` is the shape a script uses to check that a
+         * reader going away kills the writer. Forked, the pipe has a real
+         * reader and a real writer, `true` exits, and the next write gets
+         * SIGPIPE -- 141, which is what bash reports.
+         *
+         * THE LAST STAGE IS A SUBSHELL TOO, unless `shopt -s lastpipe`:
+         *
+         *     v=outer ; echo inner | { read v; } ; echo $v      bash: outer
+         *
+         * Running it here let every `read` in a pipeline write the parent's
+         * variables, which is the thing lastpipe exists to turn ON. */
+        if ((i + 1 < pl->count || !g_shopt_lastpipe) &&
+            shell_stage_is_builtin(&pl->stage[i])) {
+            int fpid = fork();
+            if (fpid == 0) {
+                int crc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
+                if (crc < 0) crc = 127;
+                _exit(crc & 0xff);
+            }
+            if (fpid > 0) {
+                pids[i] = fpid;
+                has_pid[i] = true;
+                if (in)  { file_close(in);  pipes_r[i - 1] = 0; }
+                if (out) { file_close(out); pipes_w[i] = 0; }
+                continue;
+            }
+            /* fork failed: fall through and run it here, as before. */
+        }
+#endif
         int shell_rc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
         if (shell_rc >= 0) {
             stage_status[i] = shell_rc;
@@ -17473,6 +17537,8 @@ static bool shell_try_compound_pipeline(const char *src) {
     struct file *prev_in = 0;
     int last = 0;
     int failed = 0;                       /* rightmost non-zero, for pipefail */
+    int cpids[SHELL_STAGE_MAX];
+    for (int i = 0; i < SHELL_STAGE_MAX; i++) cpids[i] = 0;
 
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
@@ -17501,10 +17567,54 @@ static bool shell_try_compound_pipeline(const char *src) {
         g_shell_flow_status = 0;
         g_shell_loop_depth = 0;
 
+#ifdef SHELL_HOSTED
+        /* AND A SUBSHELL IS A PROCESS, so the stages run AT THE SAME TIME.
+         *
+         * Sequentially, stage N has to finish before stage N+1 starts
+         * reading -- which works only while everything it writes fits in the
+         * pipe buffer, and deadlocks the shell outright when it does not.
+         * It also let a `read` in the last stage write the parent's
+         * variables, which is what `shopt -s lastpipe` exists to turn on.
+         *
+         * The child inherits the descriptors already wired above and leaves
+         * with the stage's status; the parent waits for all of them below. */
+        int fpid = -1;
+        /* ...EXCEPT THE STAGE THAT BACKGROUNDS THE WHOLE PIPELINE.
+         *
+         *     echo hi | { exit 99; } &   ; wait $!
+         *
+         * The trailing `&` belongs to the last stage's text, and running it
+         * is what records `$!`. Forked, that happened in a child and the
+         * parent's `$!` stayed 0 -- `wait $!` then reported "unknown pid". */
+        bool bg_tail = false;
+        {
+            const char *t = stages[i];
+            size_t tl = strlen(t);
+            while (tl > 0 && (t[tl - 1] == ' ' || t[tl - 1] == '	')) tl--;
+            bg_tail = (tl > 0 && t[tl - 1] == '&' &&
+                       !(tl > 1 && t[tl - 2] == '&'));
+        }
+        if (!bg_tail && (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
+        if (fpid == 0) {
+            execute_line_text(stages[i]);
+            int crc = g_last_status;
+            if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
+            _exit(crc & 0xff);
+        }
+        if (fpid > 0) {
+            cpids[i] = fpid;
+        } else {
+            execute_line_text(stages[i]);
+            last = g_last_status;
+            if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
+            if (last != 0) failed = last;
+        }
+#else
         execute_line_text(stages[i]);
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
         if (last != 0) failed = last;
+#endif
 
         g_subshell_depth--;
         g_shell_flow = saved_flow;
@@ -17525,6 +17635,14 @@ static bool shell_try_compound_pipeline(const char *src) {
 
     g_shell_fd[0] = saved0;
     g_shell_fd[1] = saved1;
+    /* Collect the children AFTER every write end is closed, or a stage that
+     * is still writing has nobody to read it and none of them ever finish. */
+    for (int i = 0; i < n; i++) {
+        if (cpids[i] <= 0) continue;
+        int wrc = proc_wait(cpids[i]);
+        if (wrc != 0) failed = wrc;
+        if (i + 1 == n) last = wrc;
+    }
     kfree(stages);
     if (g_opt_pipefail && failed != 0) last = failed;
     shell_set_status(last);
