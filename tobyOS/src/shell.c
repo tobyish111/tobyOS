@@ -11113,7 +11113,15 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                 /* ...and never a name already substituted on this line, or
                  * `alias echo='echo foo'` recurses until the pass counter
                  * gives up and the command produces nothing at all. */
-                const char *av = (*q == '(' || !may_expand ||
+                /* A `(` after the name means a FUNCTION DEFINITION, which
+                 * is not alias-expanded -- but only when it is an EMPTY paren
+                 * pair. `alias a=` followed by `a (( var = 0 ))` is an alias
+                 * in front of an arithmetic command, and refusing to expand it
+                 * left `a` as a command word with `((` glued after it: a
+                 * syntax error where bash prints nothing at all. */
+                bool funcdef = (*q == '(' &&
+                                *shell_skip_blanks(q + 1) == ')');
+                const char *av = (funcdef || !may_expand ||
                                   shell_alias_already_used(name))
                                      ? 0 : shell_alias_value(name);
                 if (av) {
@@ -13905,10 +13913,30 @@ static bool shell_try_for_command(const char *src) {
     kprintf("[fortrace] redir_count=%d\n", tail_redirs.redir_count);
 #endif
 
+    /* THE REDIRECTION IS APPLIED BEFORE THE WORD LIST IS EXPANDED.
+     *
+     *     echo hello > F
+     *     for x in `cat F` world; do echo $x; done > F
+     *
+     * prints `world` and nothing else: `> F` truncates the file when the loop
+     * STARTS, so the `cat` in the list reads an empty file. tsh expanded the
+     * list first and printed `hello` too. Everything between here and the
+     * loop now has to unwind the frame on the way out -- io_active. */
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (tail_redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&tail_redirs, "for", &io_frame) < 0) {
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
     int ntok = 0;
     if (shell_tokenize(list, tok, &ntok, words, sizeof(words)) < 0) {
+        if (io_active) shell_restore_io_frame(&io_frame);
         shell_set_status(2);
         return true;
     }
@@ -13930,6 +13958,7 @@ static bool shell_try_for_command(const char *src) {
     if (!wl || !items) {
         if (wl) kfree(wl);
         if (items) kfree(items);
+        if (io_active) shell_restore_io_frame(&io_frame);
         kprintf("for: out of memory expanding list\n");
         shell_set_status(2);
         return true;
@@ -13948,6 +13977,7 @@ static bool shell_try_for_command(const char *src) {
             if (shell_pipeline_save_word(wl, g_positional[i], &saved) < 0 ||
                 shell_add_one_arg(wl, items, saved, true) < 0) {
                 kfree(wl); kfree(items);
+                if (io_active) shell_restore_io_frame(&io_frame);
                 shell_set_status(2);
                 return true;
             }
@@ -13958,6 +13988,7 @@ static bool shell_try_for_command(const char *src) {
             if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
                                  tok[i].expanded, tok[i].assign_src) < 0) {
                 kfree(wl); kfree(items);
+                if (io_active) shell_restore_io_frame(&io_frame);
                 shell_set_status(2);
                 return true;
             }
@@ -13966,18 +13997,6 @@ static bool shell_try_for_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
-
-    struct shell_io_frame io_frame;
-    bool io_active = false;
-    if (tail_redirs.redir_count > 0) {
-        if (shell_enter_io_frame(&tail_redirs, "for", &io_frame) < 0) {
-            g_shell_loop_depth--;
-            kfree(wl); kfree(items);
-            shell_set_status(1);
-            return true;
-        }
-        io_active = true;
-    }
 
     /* One exit path, so the redirection frame is always unwound. Every
      * `return true` inside the loop became a `goto done` for that reason. */
@@ -15863,6 +15882,13 @@ static void execute_line_text_inner(const char *src) {
     }
 
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+        /* RETRACTION: a malformed expansion was briefly made fatal with status
+         * 1, on the strength of `x=${ echo hi }` (case 1375, which wants 1).
+         * It gained nothing and cost two: `${|REPLY=hi}` is a bad
+         * substitution that bash carries on from with status 0, and an array
+         * literal with a stray `&` wants 2. There is no single status here --
+         * bash's answer depends on which malformed form it is -- so the
+         * tokenizer's own 2 stays until someone measures each form. */
         shell_set_status(2);
         return;
     }
