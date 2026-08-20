@@ -8921,24 +8921,52 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     return rc;
 }
 
+/* THESE TWO HAND THE CHILD ONLY WHAT IS EXPORTED.
+ *
+ *     pre1=pre1 readonly x=x
+ *     exec sh -c 'echo x=$x'          bash: x=      tsh: x=x
+ *
+ * `readonly x=x` sets a shell variable and does NOT export it, but these
+ * wrappers passed g_env whole -- the entire variable table, export bit
+ * ignored -- so every `exec`ed program saw every local the shell had ever
+ * set. shell_run_single's own external path already filtered; these did not.
+ * There is no prefix here (a prefixed command goes through that path), so
+ * the overlay is built with an empty assignment list. */
+static int shell_build_env_overlay(char **assignv, int assignc,
+                                   char **out_env, int *out_envc);
+
 static void shell_spawn_program(const char *path_arg, int argc, char **argv,
                                 bool background) {
+    char *child_env[ENV_MAX + ARG_MAX + 1];
+    int child_envc = 0;
+    if (shell_build_env_overlay(0, 0, child_env, &child_envc) < 0) {
+        child_envc = g_envc;
+        for (int i = 0; i < g_envc; i++) child_env[i] = g_env[i];
+        child_env[child_envc] = 0;
+    }
     int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
                                              /*profile=*/0,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
-                                             g_envc, g_env, 0, 0);
+                                             child_envc, child_env, 0, 0);
     shell_set_status(rc);
 }
 
 static void shell_spawn_program_profile(const char *path_arg, int argc,
                                         char **argv, bool background,
                                         const char *profile) {
+    char *child_env[ENV_MAX + ARG_MAX + 1];
+    int child_envc = 0;
+    if (shell_build_env_overlay(0, 0, child_env, &child_envc) < 0) {
+        child_envc = g_envc;
+        for (int i = 0; i < g_envc; i++) child_env[i] = g_env[i];
+        child_env[child_envc] = 0;
+    }
     int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
                                              profile,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
-                                             g_envc, g_env, 0, 0);
+                                             child_envc, child_env, 0, 0);
     shell_set_status(rc);
 }
 
@@ -12428,17 +12456,42 @@ static void shell_env_frame_restore(struct shell_env_frame *frame) {
     frame->envc = 0;
 }
 
-static int shell_apply_assignments(char **assignv, int assignc,
-                                   const char *label) {
+/* `exported` is what makes a PREFIX assignment different from a standalone
+ * one: `FOO=bar cmd` puts FOO in cmd's ENVIRONMENT, so a program cmd spawns
+ * can see it, while a bare `FOO=bar` only sets a shell variable.
+ *
+ *     f() { printenv.py G; }
+ *     G=[x] f                     bash: ['G']   tsh: None
+ *
+ * Without it the binding existed but was not exported, and every child of
+ * the command -- which is what printenv.py is -- could not see it. */
+static int shell_apply_assignments_ex(char **assignv, int assignc,
+                                      const char *label, bool exported) {
     int rc = 0;
     for (int i = 0; i < assignc; i++) {
         if (env_set_kv(assignv[i]) < 0) {
             kprintf("%s: failed to set '%s'\n",
                     label ? label : "shell", assignv[i]);
             rc = 1;
+            continue;
+        }
+        if (exported) {
+            size_t klen = env_key_len(assignv[i]);
+            char nm[64];
+            if (klen > 0 && klen + 1 <= sizeof nm) {
+                memcpy(nm, assignv[i], klen);
+                nm[klen] = '\0';
+                int idx = env_find(nm, klen);
+                if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
+            }
         }
     }
     return rc;
+}
+
+static int shell_apply_assignments(char **assignv, int assignc,
+                                   const char *label) {
+    return shell_apply_assignments_ex(assignv, assignc, label, false);
 }
 
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
@@ -12820,6 +12873,7 @@ struct shell_prefix_save {
     char  name[SHELL_PREFIX_MAX][64];
     char *prev[SHELL_PREFIX_MAX];   /* strdup of the old value, or NULL */
     bool  had[SHELL_PREFIX_MAX];
+    bool  was_exported[SHELL_PREFIX_MAX];
     int   count;
 };
 
@@ -12835,12 +12889,28 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
         const char *old = env_get(sv->name[k]);
         sv->had[k]  = (old != 0);
         sv->prev[k] = old ? shell_strdup(old) : 0;
+        /* The EXPORT ATTRIBUTE is restored too. A prefix assignment exports
+         * for the duration of the command; putting the value back while
+         * leaving the variable exported would leak it into every later
+         * child. */
+        {
+            int oi = env_find(sv->name[k], klen);
+            sv->was_exported[k] =
+                (oi >= 0) && (g_env_flags[oi] & SHVAR_EXPORTED) != 0;
+        }
     }
 }
 
 static void shell_prefix_restore(struct shell_prefix_save *sv) {
     for (int i = 0; i < sv->count; i++) {
-        if (sv->had[i] && sv->prev[i]) env_set(sv->name[i], sv->prev[i]);
+        if (sv->had[i] && sv->prev[i]) {
+            env_set(sv->name[i], sv->prev[i]);
+            int oi = env_find(sv->name[i], strlen(sv->name[i]));
+            if (oi >= 0) {
+                if (sv->was_exported[i]) g_env_flags[oi] |= SHVAR_EXPORTED;
+                else g_env_flags[oi] &= ~(unsigned char)SHVAR_EXPORTED;
+            }
+        }
         else if (!sv->had[i])          env_unset(sv->name[i]);
         if (sv->prev[i]) kfree(sv->prev[i]);
         sv->prev[i] = 0;
@@ -12877,7 +12947,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         restore_env = true;
     }
     if (assignc > 0 &&
-        shell_apply_assignments(assignv, assignc, cmd->argv[0]) != 0) {
+        shell_apply_assignments_ex(assignv, assignc, cmd->argv[0], true) != 0) {
         if (restore_env) shell_prefix_restore(&prefix_save);
         shell_fd_state_close_owned(&fds);
         return 1;
@@ -13130,7 +13200,8 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
              * around every call would roll that back. */
             if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
                 if (shell_env_frame_capture(&env_frame) == 0) restore = true;
-                if (shell_apply_assignments(cmd->argv, assignc, "shell") != 0) {
+                if (shell_apply_assignments_ex(cmd->argv, assignc, "shell",
+                                               true) != 0) {
                     if (restore) shell_env_frame_restore(&env_frame);
                     return 1;
                 }
