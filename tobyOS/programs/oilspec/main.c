@@ -474,7 +474,23 @@ static int load_id_list(const char *path, char dst[][32], int cap) {
         if (*p && *p != '#' && count < cap) {
             char *sp = strchr(p, ' ');
             if (sp) *sp = '\0';
-            snprintf(dst[count++], 32, "%s", p);
+            /* Trim trailing whitespace, and CR in particular.
+             *
+             * The host writes these two files from Windows Python in text
+             * mode, so every line ends "\r\n". EXCLUDE survived that by pure
+             * luck -- its lines are "NNNN reason", and cutting at the space
+             * took the CR with it. POSIX lines are a bare id, so the CR stayed
+             * on, every id read as "0002\r", is_posix() matched NOTHING, and a
+             * whole-corpus run silently produced ZERO per-case diffs while
+             * still scoring correctly. The score looked healthy and the one
+             * thing the run existed to produce was missing. Trim here rather
+             * than only at the writer: this loader is the last place both
+             * lists pass through. */
+            size_t len = strlen(p);
+            while (len && (p[len - 1] == '\r' || p[len - 1] == '\n' ||
+                           p[len - 1] == '\t' || p[len - 1] == ' '))
+                p[--len] = '\0';
+            if (*p) snprintf(dst[count++], 32, "%s", p);
         }
         if (!eol) break;
         p = eol + 1;
@@ -617,11 +633,22 @@ int main(void) {
         return 0;
     }
 
-    char dir_a[MAX_PATH], dir_b[MAX_PATH];
-    snprintf(dir_a, sizeof dir_a, "%s/a", scratch);
-    snprintf(dir_b, sizeof dir_b, "%s/b", scratch);
-    mkdir(dir_a, 0755);
-    mkdir(dir_b, 0755);
+    /* ONE working directory, not one per shell.
+     *
+     * The two shells used to run in `.../a` and `.../b`, wiped before each
+     * case. That is one directory name too many: a case that PRINTS where it
+     * is could never match.
+     *
+     *     basename $(pwd)      bash: a      tsh: b
+     *
+     * -- a difference manufactured by the harness and reported as a shell
+     * divergence. What actually prevents one shell from seeing the other's
+     * leftovers is the WIPE, and the wipe is unchanged; it simply happens
+     * twice per case now, once before each shell, exactly as it already did
+     * for the shared $TMP. */
+    char dir_w[MAX_PATH];
+    snprintf(dir_w, sizeof dir_w, "%s/w", scratch);
+    mkdir(dir_w, 0755);
     mkdir(SCRATCH_TMP, 0755);        /* the $TMP the cases write into */
 
     char out_a[MAX_PATH], out_b[MAX_PATH], err_a[MAX_PATH], err_b[MAX_PATH];
@@ -630,8 +657,17 @@ int main(void) {
     snprintf(err_a, sizeof err_a, "%s/err.a", scratch);
     snprintf(err_b, sizeof err_b, "%s/err.b", scratch);
 
-    emitf("[oilspec] corpus=%d cases excluded=%d scratch=%s filter='%s'\n",
-          g_ncases, g_nexcl, scratch, filter);
+    emitf("[oilspec] corpus=%d cases excluded=%d posixlist=%d scratch=%s filter='%s'\n",
+          g_ncases, g_nexcl, g_nposix, scratch, filter);
+    /* A whole-corpus run produced ZERO per-case diffs once: the detail budget
+     * is aimed with is_posix(), and if that list is empty the aim silently
+     * excludes everything rather than including everything. The count above
+     * makes the load visible; this makes the consequence loud, and the
+     * fallback below keeps a full run diagnostic instead of merely scored. */
+    if (g_nposix == 0)
+        emit("[oilspec] WARNING: POSIX id list is EMPTY -- per-case detail "
+             "cannot be aimed at the compliance subset; detailing failures "
+             "UNAIMED up to the budget\n");
 
     int pass = 0, fail = 0, skip = 0, broken = 0, detail = 0;
     int diagnosed = 0;
@@ -659,34 +695,30 @@ int main(void) {
         char casepath[MAX_PATH];
         snprintf(casepath, sizeof casepath, "%s/%s.sh", CORPUS_DIR, id);
 
-        /* Fresh directories per shell per case: a case that creates files
-         * would otherwise let the bash run seed state the tsh run reads, and
-         * the second shell would look correct because the first did the work. */
-        wipe_dir(dir_a);
-        wipe_dir(dir_b);
-
-        /* Re-create them if they stopped existing. The corpus was written by
-         * someone else and some cases remove directories -- including, it
-         * turns out, the one they are running in. Losing the scratch directory
-         * used to end the run: every later case reported "could not run",
-         * which reads like the filesystem broke rather than like one case
-         * deleted a directory. The counter keeps that visible instead of
-         * papering over it. */
-        if (mkdir(dir_a, 0755) == 0) recreated_a++;
-        if (mkdir(dir_b, 0755) == 0) recreated_b++;
-
         char *av_bash[] = { (char *)"bash", (char *)"--norc", (char *)"--noprofile",
                             casepath, 0 };
         char *av_tsh[]  = { (char *)"tsh", casepath, 0 };
 
-        /* $TMP is one shared path, so it is wiped between the two shells as
-         * well as between cases -- otherwise bash's leftovers would be
-         * visible to tsh and the second shell could look correct because the
-         * first one did the work. */
+        /* The working directory and $TMP are both shared, so both are wiped
+         * BETWEEN the two shells as well as between cases -- otherwise bash's
+         * leftovers would be visible to tsh and the second shell could look
+         * correct because the first one did the work.
+         *
+         * The re-create counters stay because the corpus was written by
+         * someone else and some cases remove directories, including the one
+         * they are running in. Losing the working directory used to end the
+         * run with every later case reporting "could not run", which reads
+         * like the filesystem broke rather than like one case deleted a
+         * directory. */
+        wipe_dir(dir_w);
+        if (mkdir(dir_w, 0755) == 0) recreated_a++;
         wipe_dir(SCRATCH_TMP); mkdir(SCRATCH_TMP, 0755);
-        int rc_a = run_shell(BASH_PATH, av_bash, dir_a, out_a, err_a, devnull);
+        int rc_a = run_shell(BASH_PATH, av_bash, dir_w, out_a, err_a, devnull);
+
+        wipe_dir(dir_w);
+        if (mkdir(dir_w, 0755) == 0) recreated_b++;
         wipe_dir(SCRATCH_TMP); mkdir(SCRATCH_TMP, 0755);
-        int rc_b = run_shell(TSH_PATH,  av_tsh,  dir_b, out_b, err_b, devnull);
+        int rc_b = run_shell(TSH_PATH,  av_tsh,  dir_w, out_b, err_b, devnull);
 
         /* A timeout is a RESULT, not a broken run: the corpus's own oracle
          * finishes this case, so tsh failing to finish it is a real
@@ -727,7 +759,7 @@ int main(void) {
         if (rc_a < -100 || rc_b < -100) {
             g_result[i] = 'E'; broken++;
             emitf("[oilspec] BROKEN %s could-not-run bash=%d tsh=%d\n", id, rc_a, rc_b);
-            if (!diagnosed) { diagnosed = 1; diagnose_exhaustion(scratch, dir_a, dir_b); }
+            if (!diagnosed) { diagnosed = 1; diagnose_exhaustion(scratch, dir_w, dir_w); }
             continue;
         }
 
@@ -750,7 +782,7 @@ int main(void) {
         /* Diagnose POSIX-class failures first: they are what the compliance
          * number is over, and the serial budget is finite. A filtered run
          * still details everything -- that is the debug path. */
-        if (detail_all || (detail < DETAIL_MAX && is_posix(id))) {
+        if (detail_all || (detail < DETAIL_MAX && (g_nposix == 0 || is_posix(id)))) {
             detail++;
             emitf("[oilspec] FAIL %s  stdout=%s exit bash=%d tsh=%d\n",
                   id, same_out ? "same" : "DIFF", rc_a, rc_b);
@@ -810,7 +842,7 @@ int main(void) {
 
     int decided = pass + fail;
     if (recreated_a || recreated_b)
-        emitf("[oilspec] scratch dirs re-created mid-run: a=%d b=%d "
+        emitf("[oilspec] working dir re-created mid-run: bash=%d tsh=%d "
               "(cases that deleted their own working directory)\n",
               recreated_a, recreated_b);
 
