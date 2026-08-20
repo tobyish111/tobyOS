@@ -235,6 +235,7 @@ static bool g_continuation_active;
 static void prompt(void);
 static void execute_line_text(const char *src);
 static void execute_line_text_inner(const char *src);
+static void shell_parse_error(void);
 
 /* 0 while no line is executing; 1 inside an input line; >1 inside a segment,
  * body or condition re-entering the executor. Only depth 0 is a NEW line. */
@@ -5286,6 +5287,7 @@ struct shell_scan {
     bool bad_paren;     /* a `(` that cannot legally be there -- see below */
     bool bad_semi;      /* a `;;` outside any `case` */
     bool bad_rparen;    /* a `)` that closes nothing and is not a pattern */
+    bool cmd_seen;      /* something has been said since the last separator */
     bool prev_word_name;/* the previous command word is a valid NAME */
     bool case_word;     /* between `case` and its `in` */
     bool case_pat;      /* a case PATTERN may start here, so `(` is legal */
@@ -5314,6 +5316,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->bad_paren = false;
     st->bad_semi = false;
     st->bad_rparen = false;
+    st->cmd_seen = false;
     st->prev_word_name = false;
     st->case_word = false;
     st->case_pat = false;
@@ -5384,6 +5387,12 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         /* `;;` ONLY MEANS SOMETHING INSIDE A CASE. `echo 1 ;; echo 2` is a
          * syntax error in bash; tsh printed both. */
         if (dbl && st->case_depth == 0) st->bad_semi = true;
+        /* A LONE `;` NEEDS A COMMAND IN FRONT OF IT. POSIX's grammar has no
+         * production for an empty command, and bash exits 2 on a line that is
+         * just `;`. `;;` is exempt: an empty case body is legal, and the
+         * pattern's `)` is what precedes it. */
+        if (!dbl && !st->cmd_seen) st->bad_semi = true;
+        st->cmd_seen = false;
         st->case_pat = dbl;              /* a pattern follows `;;` */
         st->no_sep = true;
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
@@ -5405,6 +5414,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->cont_op = (c == '|') || (c == '&' && dbl);
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
+        st->cmd_seen = false;
         *pp = p;
         return;
     }
@@ -5413,6 +5423,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
         st->no_sep = true;
+        st->cmd_seen = false;
         *pp = p;
         return;
     }
@@ -5489,6 +5500,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
         st->no_sep = true;
+        st->cmd_seen = false;          /* `( ; )` needs a command too */
         *pp = p;
         return;
     }
@@ -5616,6 +5628,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     }
     if (p == w) p++;                     /* never stall on an odd byte */
     size_t n = (size_t)(p - w);
+    st->cmd_seen = true;
     st->nest = nest < 0 ? 0 : nest;
     if (st->nest > 0) { st->in_sq = sq; st->in_dq = dq; }
     *pp = p;
@@ -5973,7 +5986,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 const char *sep;
                 if (scan.nest > 0) {
                     char kind = scan.nest_kind[scan.nest - 1];
-                    sep = (kind == 'a' || kind == 'v') ? " " : "; ";
+                    /* Arithmetic and `${ }` hold ONE expression, so their
+                     * lines join with a space. A command substitution holds a
+                     * command LIST and keeps its NEWLINES -- it is run as a
+                     * script, and a here-document inside it needs the lines
+                     * that follow the operator to still be lines. */
+                    sep = (kind == 'a' || kind == 'v') ? " "
+                        : (kind == 'c' || kind == 'b') ? "\n" : "; ";
                 } else if (scan.no_sep) {
                     sep = " ";
                 } else {
@@ -6002,7 +6021,12 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 if (!overflow)
                     kprintf("sh: unexpected end of file (unterminated compound)\n");
                 kfree(accum);
-                shell_set_status(2);
+                /* A SCRIPT THAT DOES NOT PARSE DOES NOT RUN, and a CALLER has
+                 * to be able to tell: `echo $(if true)` is a parse error
+                 * inside a substitution and bash runs no echo. Setting the
+                 * status alone left the substitution looking like an ordinary
+                 * empty result. */
+                shell_parse_error();
                 last = 2;
                 break;
             }
@@ -7228,7 +7252,6 @@ static unsigned long g_printf_last_u64;
 
 /* The last operand did not fit a SIGNED 64-bit conversion. Only %d and %i care;
  * %u happily prints values above 2^63. */
-static bool g_printf_signed_over;
 
 static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
@@ -7285,8 +7308,12 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     if (over) {
         /* Past 64 bits: saturate to the unsigned maximum for EITHER sign --
          * `printf '%u' -18446744073709551616` is 18446744073709551615, not the
-         * two's complement of a saturated magnitude (which would be 1). */
-        g_printf_bad_num = true;
+         * two's complement of a saturated magnitude (which would be 1).
+         *
+         * SATURATION IS NOT A FAILURE. The bash 5.2 in the initrd -- the
+         * oracle here -- prints the saturated value and reports 0; only a
+         * value that is not a NUMBER at all is an error. tsh reported 1 and
+         * three status lines per case disagreed. */
         g_printf_last_u64 = ~0ul;
         return neg ? (long)(1ul << 63) : (long)(~0ul >> 1);
     }
@@ -7299,8 +7326,8 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
      * printed correctly, so the verdict is recorded and left for the
      * conversion to act on. */
     const unsigned long SMAX = ~0ul >> 1;            /* 2^63 - 1 */
-    if (!neg && mag > SMAX) { g_printf_signed_over = true; return (long)SMAX; }
-    if (neg && mag > SMAX + 1ul) { g_printf_signed_over = true; return (long)(SMAX + 1ul); }
+    if (!neg && mag > SMAX) return (long)SMAX;
+    if (neg && mag > SMAX + 1ul) return (long)(SMAX + 1ul);
     return neg ? -(long)mag : (long)mag;
 }
 
@@ -7675,10 +7702,7 @@ static void cmd_printf(int argc, char **argv) {
                 while (blen > 0) shell_putc(buf[--blen]);
                 if (left) for (int k = 0; k < pad; k++) shell_putc(' ');
             } else if (spec == 'd' || spec == 'i') {
-                g_printf_signed_over = false;
                 long v = printf_arg_int(argc, argv, &argi);
-                /* A signed conversion DOES fail on a value it had to saturate. */
-                if (g_printf_signed_over) g_printf_bad_num = true;
                 char buf[32];
                 int blen = 0;
                 bool neg = (spec != 'u') && v < 0;
@@ -9012,7 +9036,44 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
      * failure -- the flow flag is absorbed below. */
     bool inherit_ee = g_shopt_inherit_errexit;
     if (!inherit_ee) g_errexit_suspend++;
-    execute_line_text(cmd);
+    /* A SUBSTITUTION CONTAINS A COMMAND LIST, NOT A LINE.
+     *
+     *     foo=`cat <<EOM
+     *     hello world
+     *     EOM`
+     *
+     *     x=$(find . |
+     *         wc -l
+     *     )
+     *
+     * Running the text as one line meant a here-document inside it had no
+     * lines to take its body from ("here-document body missing") and a
+     * multi-line list had to be flattened into semicolons first. Running it
+     * as a SCRIPT gives it the reader that already knows about here-docs,
+     * compounds and continuations -- which is what the newline join in the
+     * accumulator preserves the newlines for. */
+    {
+        /* Only text that actually SPANS LINES needs the script reader. Running
+         * every substitution through it charged one more level of nesting to
+         * each -- `prev=$(fact $(( $1 - 1 )))` in a recursive function then hit
+         * the depth limit at five, where it used to reach far deeper. That
+         * limit also scopes `local`, so this is not a limit to raise
+         * casually. One-line substitutions keep the path they always had. */
+        bool multiline = false;
+        for (const char *q = cmd; *q; q++)
+            if (*q == '\n') { multiline = true; break; }
+        if (!multiline) {
+            execute_line_text(cmd);
+        } else {
+            char *copy = shell_strdup(cmd);
+            if (copy) {
+                (void)shell_run_script_text(copy, false);
+                kfree(copy);
+            } else {
+                execute_line_text(cmd);
+            }
+        }
+    }
     if (!inherit_ee) g_errexit_suspend--;
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
@@ -9817,6 +9878,19 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
  * them, giving two arguments. Unquoted the result still splits on IFS -- but
  * on the SPACES it now contains, which is how bash gets four fields from the
  * unquoted spelling of the same thing. */
+/* A TILDE IN THE WORD OF `${x-WORD}` EXPANDS -- unless it was quoted.
+ *
+ *     HOME=/home/bar
+ *     echo ${undef:-~}       ->  /home/bar
+ *     echo ${HOME:+~/z}      ->  /home/bar/z
+ *     echo "${undef:-~}"     ->  ~            (inside double quotes)
+ *     echo ${undef:-"~"}     ->  ~            (the tilde itself was quoted)
+ *
+ * A quoted span arrives wrapped in no-split markers, so a `~` that is still
+ * the FIRST byte was unquoted; and g_dq_depth is what says whether the whole
+ * substitution sits inside double quotes. tsh expanded none of the four. */
+#define SH_WORD_TILDE()                                                           do {                                                                              if (g_dq_depth == 0 && expanded_word[0] == '~' &&                                 (expanded_word[1] == ' ' || expanded_word[1] == '/')) {                       const char *hm = env_get("HOME");                                             if (!hm || !*hm) hm = "/";                                                    char tw[SHELL_PARSE_BUF_MAX];                                                 int tn = ksnprintf(tw, sizeof tw, "%s%s", hm,                                                    expanded_word + 1);                                        if (tn > 0 && (size_t)tn < sizeof tw)                                             memcpy(expanded_word, tw, (size_t)tn + 1);                            }                                                                         } while (0)
+
 #define SH_JOIN_WORD_MARKS()                                                  \
     do {                                                                      \
         if (shell_word_has_argmark(expanded_word)) {                          \
@@ -9833,6 +9907,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
         SH_JOIN_WORD_MARKS();
+        SH_WORD_TILDE();
         return shell_append_str(buf, pos, cap, expanded_word);
     case '=':
         if (!missing) return shell_append_str(buf, pos, cap, value);
@@ -9843,6 +9918,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
         SH_JOIN_WORD_MARKS();
+        SH_WORD_TILDE();
         if (env_set(name, expanded_word) < 0) {
             kprintf("shell: failed to assign '%s'\n", name);
             return -1;
@@ -9860,11 +9936,13 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
         SH_JOIN_WORD_MARKS();
+        SH_WORD_TILDE();
         return shell_append_str(buf, pos, cap, expanded_word);
     default:
         return -1;
     }
 #undef SH_JOIN_WORD_MARKS
+#undef SH_WORD_TILDE
 }
 
 struct shell_arith {
@@ -10557,6 +10635,7 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
     int ntok = 0;
     size_t wpos = 0;
     const char *p = src;
+    bool literal_word = false;      /* the next word is a here-doc delimiter */
     g_capture_last_status = 0;
 
     while (*p) {
@@ -10612,6 +10691,14 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                 p++;
             }
             if (shell_emit_token_fd(tok, &ntok, t, 0, false, explicit_fd) < 0) return -1;
+            /* A HERE-DOCUMENT DELIMITER IS NOT EXPANDED. POSIX 2.7.4: the
+             * word after `<<` gets quote removal and nothing else, so
+             * `cat <<$(a)` has a delimiter spelled `$(a)` and does not RUN a.
+             * tsh expanded it like any other redirection operand and reported
+             * "/bin/a: failed to launch" from a line that only names a
+             * terminator. */
+            if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS)
+                literal_word = true;
             p++;
             continue;
         }
@@ -10627,6 +10714,35 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
 
         char *start = words + wpos;
         bool got = false;
+
+        if (literal_word) {
+            literal_word = false;
+            bool lsq = false, ldq = false;
+            while (*p && (lsq || ldq ||
+                          (!is_space(*p) && !shell_operator_char(*p)))) {
+                if (lsq) {
+                    if (*p == '\'') { lsq = false; p++; continue; }
+                } else if (ldq) {
+                    if (*p == '"') { ldq = false; p++; continue; }
+                } else if (*p == '\'') { lsq = true; p++; continue; }
+                else if (*p == '"')  { ldq = true; p++; continue; }
+                else if (*p == '\\' && p[1]) { p++; }
+                got = true;
+                if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                    kprintf("shell: word too long\n");
+                    return -1;
+                }
+            }
+            if (got) {
+                if (shell_append_char(words, &wpos, word_cap, '\0') < 0) {
+                    kprintf("shell: parse buffer full\n");
+                    return -1;
+                }
+                if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, true) < 0)
+                    return -1;
+            }
+            continue;
+        }
         bool word_quoted = false;
         g_tok_word_expanded = false;
         /* Look at the RAW text: a leading `name=` makes this an assignment
@@ -15576,6 +15692,7 @@ static void execute_line_text_inner(const char *src) {
                 if (p <= tok) p = tok + 1;
                 if (lone_amp && top) { amp = tok; rest = p; break; }
             }
+            (void)rest;                  /* unused in the kernel build */
             if (amp && amp > q) {
 #ifdef SHELL_HOSTED
                 size_t n = (size_t)(amp - q);
@@ -15749,6 +15866,11 @@ static void execute_line_text_inner(const char *src) {
         shell_set_status(2);
         return;
     }
+    /* EXPANSION RUNS DURING TOKENIZATION, so a `$( )` inside this line may
+     * have decided the script is over -- `echo $(if true)` is a parse error in
+     * the substitution, and bash runs no echo. Without this the word list was
+     * built and the command ran anyway. */
+    if (g_shell_flow != SHELL_FLOW_NONE) return;
     if (ntok == 0) return;
 
     int i = 0;
