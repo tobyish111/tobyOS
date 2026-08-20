@@ -226,6 +226,17 @@ static bool g_opt_errexit;   /* set -e */
  * than a flag because these nest -- a while condition may contain a pipeline
  * containing an if -- and the innermost scope must not clear the outer one. */
 static int g_errexit_suspend;
+/* A NEGATION'S exemption, kept apart from a CONDITION'S.
+ *
+ *     foo() { set -e; false; echo x; }
+ *     if foo; then ... fi      bash: runs on, the condition is a decision
+ *     ! foo                    bash: EXITS at the `false` inside foo
+ *
+ * Both look like "errexit is off here", and they are not the same: the
+ * condition context extends into whatever the condition calls, and `!`
+ * exempts only the command it negates. One counter for both meant a function
+ * called under `!` ran with errexit disabled all the way down. */
+static int g_errexit_negate;
 /* Set when a malformed expansion is the `${ command }` kind, which bash
  * reports with status 1 and continues from rather than aborting. */
 static bool g_bad_subst_soft;
@@ -535,6 +546,11 @@ static char *g_readonly[SHELL_READONLY_MAX];
  * Two of them can point at each other, which is why every read follows the
  * chain with a hop limit rather than recursing. */
 #define SHVAR_NAMEREF   0x04u
+/* Declared an ARRAY by `typeset -a` / `-A`. This shell has no arrays, but the
+ * attribute still decides one observable thing: an array is NOT put in a
+ * child's environment, so `typeset -A a; export a; printenv.py a` reports it
+ * unset rather than empty. */
+#define SHVAR_ARRAY     0x08u
 static unsigned char g_env_flags[ENV_MAX];
 
 /* Length of "KEY" up to (but not including) the '='. Returns the
@@ -2033,6 +2049,7 @@ static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
     bool set_nameref = false, clear_nameref = false;
+    bool set_array = false;
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -2044,7 +2061,8 @@ static void cmd_declare(int argc, char **argv) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; break;
             case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
-            case 'A': case 'a': case 'i': case 'u': case 'l':
+            case 'A': case 'a': if (on) set_array = true; break;
+            case 'i': case 'u': case 'l':
             case 'F': case 'f': case 'p': case 'g': case 't': break;
             default:  known = false; break;
             }
@@ -2091,6 +2109,7 @@ static void cmd_declare(int argc, char **argv) {
         /* The attribute goes on AFTER the value, because the value is the
          * name being referred to and setting it must not go through the
          * reference that does not exist yet. */
+        if (set_array)     g_env_flags[idx] |= SHVAR_ARRAY;
         if (set_nameref)   g_env_flags[idx] |= SHVAR_NAMEREF;
         if (clear_nameref) g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
         /* `set -a` exports every variable an assignment creates, and a
@@ -13639,6 +13658,10 @@ static int shell_build_env_overlay(char **assignv, int assignc,
     int n = 0;
     for (int i = 0; i < g_envc; i++) {
         if (!(g_env_flags[i] & SHVAR_EXPORTED)) continue;
+        /* AN ARRAY DOES NOT GO INTO THE ENVIRONMENT. bash cannot represent
+         * one there, so `export a` on an array marks it and exports nothing;
+         * printenv reports it unset, not empty. */
+        if (g_env_flags[i] & SHVAR_ARRAY) continue;
         if (!shell_assignment_overrides(g_env[i], assignv, assignc)) {
             if (n >= ENV_MAX + ARG_MAX) return -1;
             out_env[n++] = g_env[i];
@@ -14297,6 +14320,10 @@ static int shell_run_function(struct shell_simple *cmd) {
 
     g_script_depth++;
     g_fn_depth++;
+    /* The CONDITION exemption is inherited (g_errexit_suspend); the NEGATION
+     * one is not -- see g_errexit_negate. */
+    int saved_ee_negate = g_errexit_negate;
+    g_errexit_negate = 0;
     /* RETRACTION: the errexit exemption was briefly cleared here, so that
      * `! foo` would not carry its suspension into foo's body. It gained the
      * one case that wants that (1564) and lost two that want the opposite
@@ -14327,6 +14354,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         kfree(saved_hd);
     }
     g_fn_depth--;
+    g_errexit_negate = saved_ee_negate;
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_RETURN) {
         rc = g_shell_flow_status;
@@ -17980,9 +18008,9 @@ static void execute_line_text_inner(const char *src) {
                  * carries on, because the failure is the point. The token loop
                  * expressed that through its `negate` flag; taking this route
                  * instead lost the exemption and `! false` killed the script. */
-                g_errexit_suspend++;
+                g_errexit_negate++;
                 execute_line_text_inner(rest);
-                g_errexit_suspend--;
+                g_errexit_negate--;
                 if (g_shell_flow == SHELL_FLOW_NONE)
                     shell_set_status(g_last_status == 0 ? 1 : 0);
                 return;
@@ -18078,6 +18106,7 @@ static void execute_line_text_inner(const char *src) {
          * printed `four`: the while stage failed, the pipeline reported 1, and
          * nothing acted on it. */
         if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            g_errexit_negate == 0 &&
             !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
             g_shell_flow_status = g_last_status;
@@ -18107,6 +18136,7 @@ static void execute_line_text_inner(const char *src) {
          * exiting: its non-zero status came from a command that was itself
          * exempt, and an exemption survives being handed upwards. */
         if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            g_errexit_negate == 0 &&
             !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
             g_shell_flow_status = g_last_status;
@@ -18321,10 +18351,11 @@ static void execute_line_text_inner(const char *src) {
              * runs no trap, because the failure belongs to the job and not to
              * this shell. tsh reported `line=3` for it. */
             if (last != 0 && !negate && !in_and_or && !background &&
-                g_errexit_suspend == 0)
+                g_errexit_suspend == 0 && g_errexit_negate == 0)
                 shell_run_err_trap(last);
             if (g_opt_errexit && last != 0 && !negate && !background &&
-                !in_and_or && g_errexit_suspend == 0) {
+                !in_and_or && g_errexit_suspend == 0 &&
+                g_errexit_negate == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
                 return;
