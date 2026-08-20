@@ -615,9 +615,28 @@ static void shell_getopts_note_external_optind_write(const char *key,
 /* Walk the table looking for `key` (NUL-terminated) and return its
  * value pointer (right after '='), or NULL. The pointer aliases into
  * g_env[i], so callers must not retain it across env mutations. */
+/* PREFIX ASSIGNMENTS SEEN SO FAR ON THIS COMMAND, WHILE IT IS BEING READ.
+ *
+ *     FOO=foo BAR="[$FOO][$BAZ]" BAZ=baz printenv.py BAR
+ *     bash: [foo][]
+ *
+ * The bindings are made left to right and each one is in force for the words
+ * after it -- and NOT for the ones before it, which is why BAZ is empty
+ * there. tsh expands every word on the line before any of them is applied,
+ * so `$FOO` was empty too. The values only need to exist for the rest of the
+ * read, so they live here rather than in the variable table: the command's
+ * own frame applies them for real when it runs. */
+#define SHELL_TOKPFX_MAX 8
+static char g_tokpfx[SHELL_TOKPFX_MAX][256];
+static int  g_tokpfx_n;
+
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
+    for (int i = g_tokpfx_n - 1; i >= 0; i--) {
+        if (strncmp(g_tokpfx[i], key, klen) == 0 && g_tokpfx[i][klen] == '=')
+            return g_tokpfx[i] + klen + 1;
+    }
     int idx = env_find(key, klen);
     if (idx < 0) return 0;
     /* FOLLOW A NAMEREF, and give up on a cycle rather than on the stack.
@@ -11608,12 +11627,25 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
 
 static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                                 int *out_ntok, char *words, size_t word_cap);
+static int shell_tokenize_outer(const char *src, struct shell_token *tok,
+                                int *out_ntok, char *words, size_t word_cap);
 
 /* BRACE EXPANSION HAPPENS BEFORE ANYTHING ELSE READS THE WORD, which is what
  * makes `x={a,b}; echo $x` print the braces back: by the time `$x` produces
  * them, this pass has already gone by. */
 static int shell_tokenize(const char *src, struct shell_token *tok,
                           int *out_ntok, char *words, size_t word_cap) {
+    /* Each read gets its own prefix overlay; a command substitution re-enters
+     * here and must not clear the one belonging to the line around it. */
+    int saved_tokpfx = g_tokpfx_n;
+    g_tokpfx_n = 0;
+    int rc_outer = shell_tokenize_outer(src, tok, out_ntok, words, word_cap);
+    g_tokpfx_n = saved_tokpfx;
+    return rc_outer;
+}
+
+static int shell_tokenize_outer(const char *src, struct shell_token *tok,
+                                int *out_ntok, char *words, size_t word_cap) {
     if (src && shell_has_brace(src)) {
         char *expanded = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
         if (expanded) {
@@ -11636,6 +11668,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
     int ntok = 0;
     size_t wpos = 0;
     const char *p = src;
+    bool prefix_ok = true;          /* still in the command's assignment prefix */
     bool literal_word = false;      /* the next word is a here-doc delimiter */
     g_capture_last_status = 0;
 
@@ -11661,6 +11694,9 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
 
         if (*p == ';') {
             if (shell_emit_token(tok, &ntok, SH_TOK_SEMI, 0, false) < 0) return -1;
+            /* A separator starts a new command, and a new prefix with it. */
+            prefix_ok = true;
+            g_tokpfx_n = 0;
             p++;
             continue;
         }
@@ -11668,6 +11704,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             enum shell_tok_type t = SH_TOK_BG;
             if (p[1] == '&') { t = SH_TOK_AND_IF; p++; }
             if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
+            prefix_ok = true;
+            g_tokpfx_n = 0;
             p++;
             continue;
         }
@@ -11675,6 +11713,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             enum shell_tok_type t = SH_TOK_PIPE;
             if (p[1] == '|') { t = SH_TOK_OR_IF; p++; }
             if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
+            prefix_ok = true;
+            g_tokpfx_n = 0;
             p++;
             continue;
         }
@@ -11981,6 +12021,23 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 return -1;
             }
             if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
+            /* A PREFIX ASSIGNMENT IS IN FORCE FOR THE WORDS AFTER IT. See
+             * g_tokpfx. `prefix_ok` is the same command-position rule the
+             * rest of the shell runs on: a word that is not an assignment
+             * ends the prefix, and a separator starts a new one. */
+            if (prefix_ok && g_tok_word_assign_src) {
+                if (g_tokpfx_n < SHELL_TOKPFX_MAX) {
+                    char plain[256];
+                    size_t o = 0;
+                    for (const char *q = start; *q && o + 1 < sizeof plain; q++)
+                        if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC)
+                            plain[o++] = *q;
+                    plain[o] = '\0';
+                    memcpy(g_tokpfx[g_tokpfx_n++], plain, o + 1);
+                }
+            } else {
+                prefix_ok = false;
+            }
         }
     }
 
