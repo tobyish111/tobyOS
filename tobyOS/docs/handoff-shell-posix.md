@@ -6,9 +6,10 @@ it is not "how the code works" — it is **how to find out what is actually true
 because in this arc reading the source has produced confident wrong answers over
 and over, and measuring has not.
 
-Current state: **POSIX 1196/1280 = 93.4%** (from 711 = 55.5% at the start of the
-arc, 1041 = 81.3% at the start of this session). `broken=0`, timeouts 1.
-Bash-parity gate steady at **52/54**.
+Current state: **POSIX 1235/1280 = 96.5%** (from 711 = 55.5% at the start of
+the arc, 1041 = 81.3% two sessions ago, 1196 = 93.4% one session ago).
+`broken=0`, timeouts 1. Bash-parity gate steady at **52/54**. The number moves
+by about two on its own between runs -- see the flaky cases in section 5.
 
 ---
 
@@ -121,7 +122,35 @@ Hard operational rules:
    you predicted means you do not understand it yet.
 5. **Full run → read the diff → shparity → commit.** Only commit measured work.
 
-### Why this discipline exists — new evidence from this session
+### Why this discipline exists — evidence from the 96% session
+
+- **A probe in a BASH-ONLY slot prints NOTHING.** The detail condition is
+  `detail_all || (detail < DETAIL_MAX && is_posix(id))`, so a probe installed
+  over a BASH-ONLY case produces no diff whether it passed or failed — and
+  "no detail in log" reads exactly like "it passed". Five probes were read as
+  five confirmations that way, and every one of them was wrong. **Install
+  probes only over cases the POSIX list contains.** The permanently
+  unreachable POSIX cases are the right slots: `0738` (symlinks), `1725`
+  `1728` (globstar), `1886` `1888` `1893` `1894` (NUL bytes). They already
+  fail, so a probe costs nothing, and the diff always prints. Check the
+  current `logs/oilspec_failures.txt` before picking one -- `2126` was on
+  this list until `<>` landed and it started passing.
+- **`FILTER=NNNN-MMMM bash logs/oilspec.sh` did not take.** The header printed
+  `filter=''` and all 2,776 ran. A full run is ~10 min and answers the probe
+  question as well as re-measuring, so batch several probes into one full run
+  rather than fixing the filter.
+- **The score oscillates by about two.** 1761, 2271, 2272 and 2273 move
+  between runs on their own. A one-case gain or loss in `oilspec_diff.txt` is
+  not evidence until it repeats.
+- **A whole class of bugs was one missing NUL.** `shell_append_char` never
+  terminated the buffer, so every caller that formatted into a fresh
+  `char tmp[32]` and used it as a C string read whatever the stack slot held.
+  It surfaced as `a=-20; : $((a /= -3))` giving **66**: the slot still held
+  `-6` from the line before and writing `6` replaced one byte of it. The fix
+  is one line in `shell_append_char`. Look for this shape whenever a value is
+  *almost* right.
+
+### Why this discipline exists — evidence from the 93% session
 
 - **The gate could not see itself.** The whole-corpus run had produced ZERO
   per-case diffs for as long as the detail code existed, because
@@ -187,67 +216,101 @@ or the hosted link fails.
 
 ---
 
-## 5. What is left: 84 POSIX failures
+## 5. What is left
 
 Run `python logs/oilspec_detail.py` for all of them with diffs. By kind:
 
 | kind | n | note |
 |---|---|---|
-| implementable shell work | 61 | see below |
-| the guest's bash is the one that is wrong | 11 | 2098 2118 2202 2268 2343 2410 2647 1565 2260 1478 1822 — matching these would mean breaking tsh |
-| needs a kernel feature | 5 | symlinks (`ln -s`), mkfifo, `<>` on a fifo, globstar |
-| NUL bytes inside a variable | 4 | see below |
-| known flaky | 3 | 2271 2272 2273 — background output racing the exit |
+| the guest's bash is the one that is wrong | ~9 | 2098 2118 2410 2647 1451 1478 1565 1822 2125 — matching these would mean breaking tsh |
+| needs a kernel feature | 1 | symlinks (`ln -s`) 0738 -- there is no `ln` |
+| `shopt -s globstar` | 2 | 1725 1728 -- `**` recursion; nobody has asked for it |
+| NUL bytes inside a variable | 4 | 1886 1888 1893 1894 — see below |
+| known flaky | 4 | 2271 2272 2273, and 1761 — background/pipeline output racing the exit. The score oscillates by about two because of these; do not chase a single-case move without re-running. |
+| implementable shell work | the rest | see below |
 
-**100% is not reachable.** 18 of the 84 are the oracle, the kernel, or timing;
-they are not shell defects and "fixing" them would mean making tsh worse. The
-reachable ceiling is around **1262/1280 = 98.6%**, and the last stretch of that
-is expensive.
+**100% is not reachable.** About twenty of the remainder are the oracle, the
+kernel, or timing; they are not shell defects and "fixing" them would mean
+making tsh worse. The reachable ceiling is around **1262/1280 = 98.6%**, and
+the last stretch of that is expensive — every remaining item is one case.
 
-The 61 that ARE shell work, by mechanism, largest first:
+The implementable ones, by mechanism:
 
-- **`$@` semantics** (0224 2374 2530 2531 2546 2741). Unquoted `$@` must
-  produce one field per parameter including empty ones, and `"[$@]"` in an
-  assignment joins with spaces. The field markers (`SHELL_ARG_MARK`) already
-  exist; what is missing is that an empty parameter survives them.
-- **temporary environment frames** (0416 0421 1165). `FOO=a BAR=[$FOO] cmd`
-  must apply the assignments left to right, each RHS seeing the earlier ones;
-  tsh expands them all first.
-- **traps** (1245 1246 1209) and **errexit corners** (1557 1564 1518 1525).
-- **here-documents in odd places** (0533 0534 1754 1760) — a here-doc inside
-  backticks is not collected at all.
-- **command substitution corners** (1379 1394 2383) — including the
-  `case` inside `$( )` that is documented below as attempted and reverted.
-- singles: 0158 (`a /= -3`), 0422 (escaped `=` in a command name), 0424,
-  0741 (CDPATH), 1010/1037/1038 (printf), 1135 (read's last field), 1693/1694
-  (glob bracket expressions), 1953, 1970 (bare `;`), 2040, 2058 (a compound's
-  redirection is applied BEFORE its word list expands), 2071 (a redirect on a
-  function definition applies to every call), 2080, 2354/2359 (tilde inside
-  `${ }`), 2623 (`$''` in a VarSub argument), 2629, 2646, 2665 (`$LINENO`
-  after the accumulator joins lines), 2692.
+- **Subshell isolation** (0481 1953, and the already-fixed 0030). A command
+  substitution, a backgrounded command and a non-last pipeline stage are all
+  subshells, and tsh runs them in-process. `$( )` now snapshots the ALIAS
+  table (`shell_alias_save`); variables and functions still leak, and the two
+  open cases need the leak closed for a BACKGROUNDED command and for a
+  PIPELINE stage. The hard part is that the leak happens during EXPANSION —
+  `echo ${bar=2} &` has already assigned `bar` by the time anything knows the
+  command is backgrounded — so the frame has to be taken before
+  `shell_tokenize` sees the line, not at the dispatch site.
+- **Quoting information does not reach the globber** (1693 1694 2692). In
+  `shell_tokenize` a backslash escape and a quote both set `word_quoted` for
+  the whole word, and `shell_add_one_arg` skips pathname expansion on a quoted
+  word entirely. bash globs the word with the quoted parts LITERAL, so
+  `'_t/[bc]'*.mm` matches a file actually named `_t/[bc]ar.mm` and `[\[z]`
+  matches `[`. Measured with a probe: every other bracket form already agrees
+  (`[[z]`, `[]z]`, `[a-z]`, `?`), so the bracket matcher is fine — only the
+  quoting path is missing. The no-split marks cannot carry this: they wrap
+  LITERAL runs as well as quoted ones, so escaping everything inside a mark
+  would break `echo *.txt`. It needs either a third marker byte or a kept
+  backslash plus a strip on the no-match path, and both touch the hottest
+  path in the tokenizer.
+- **Temporary environment ordering** (0416). `FOO=a BAR=[$FOO] cmd` must apply
+  the assignments left to right, each RHS seeing the earlier ones. tsh expands
+  every word at tokenize time, before any of them is applied. (0421 and 1165,
+  the other two of this family, are DONE — prefix assignments are now exported
+  for the duration of the command and no longer persist past a special
+  builtin.)
+- **`$LINENO` is a statement counter, not a source line** (2665). Measured:
+  a body on source line 4 reports 3, on line 7 reports 4. The accumulator
+  joins physical lines into one logical line and nothing carries the original
+  number.
+- **`[[ ]]` is not a builtin at all** (0556 2148 2150). Measured: `[[ -n x ]]`
+  reports `spawn: failed to launch '/bin/[['`. Only ~1 POSIX case turns on it,
+  but the `dbracket` and `regex` spec files are **44 + 32 BASH-ONLY cases** —
+  by far the largest single BASH-ONLY win left. The three POSIX ones also want
+  bash's whole-script parse error, which a line-at-a-time reader cannot give.
+- **traps and signals** (1245 1246) — `kill -URG $$` delivers nothing, and a
+  trap that runs during a spawned child's signal is not isolated.
+- singles: 0422 (an escaped `=` makes the word a command NAME, not an
+  assignment — needs a per-argument "cannot be an assignment" flag threaded
+  from the tokenizer to `shell_run_single`), 0632 (a `case` whose word is a
+  backtick running `eval` with escaped quotes exits 255 — bisected down to
+  needing the `mysed -n "$s" $files` shape; the simpler forms all pass),
+  1010 (printf `%x` of a unicode char), 1135 (`read`'s last field with an
+  IFS that holds both a space and a non-space — the rule was NOT derivable
+  from a seven-row probe table), 1329 1856 (bash arrays/namerefs),
+  1375 1394 1411 1525 1564 1760 2260 2359.
 
 ### Structural items — status
 
 - **NUL bytes — NOT WORTH IT, and the reason matters.** The cases need a NUL
-  *inside a variable* (`s=$(printf '\000.\000')`, `${#s}`). C strings cannot
+  *inside a variable* (`s=$(printf ' . ')`, `${#s}`). C strings cannot
   hold that. A length-carrying **output path** — which is what it looks like
   from the outside — moves almost none of them; it needs a length-carrying
   **value** representation through the variable table, argv and every
   expansion. Also `src/tcp_shell.c` installs the string sink with no byte
   sink, so the obvious surgical fix misroutes the TCP shell.
-- **`case` inside `$( )` — ATTEMPTED AND REVERTED (previous session).** Making
-  the substitution scanner case-aware gained none of its targets and cost five
-  arith cases. The mechanism was never explained. If you retry it, find out
-  why first.
+- **`case` inside `$( )` — DONE, and this RETRACTS the previous handoff.** It
+  was recorded here as "attempted and reverted, cost five arith cases,
+  mechanism unexplained". It is now implemented and cost nothing (+1 POSIX, 0
+  losses). The earlier attempt's arith losses were almost certainly the
+  unterminated-buffer bug described in section 3, which was live at the time.
+  The rule: inside `$( )`, `case` opens a construct, `in` and `;;` say a
+  pattern may start, and while one may, `(` and `)` belong to the pattern.
+  Both `shell_scan_token` and `shell_parse_command_subst` need it.
 - **`ulimit` reports "unlimited" on purpose.** The kernel discards setrlimit
   and answers getrlimit with infinity, which is why the real bash in the
   initrd prints `unlimited` after `ulimit -f 4294967296`. tsh keeps its table
   for validation and for the hard-limit rule, but reports what is in force.
   Remove the override in `shell_rlimit_print` the day the kernel grows real
   per-process limits.
-- **`[[ ]]`** is skipped by the structural scanner (it has its own grammar)
-  but is still not a builtin in the hosted shell, so a malformed one spawns
-  `/bin/[[`. Three cases (0556 2148 2150) want specific statuses there.
+- **`<>` is DONE** and 2126 (`<>` on a fifo) passes, so mkfifo is no longer a
+  blocker. 2125 (`<>` on a plain file) now fails the other way round: **tsh is
+  right and the guest's bash reads nothing**, which is a kernel-side gap in
+  the oracle, not a shell defect.
 
 ---
 
