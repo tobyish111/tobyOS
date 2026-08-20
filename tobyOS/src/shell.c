@@ -259,7 +259,7 @@ static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap);
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
-static void shell_case_unquote(char *pat);
+static void shell_case_unquote(char *pat, size_t cap);
 static char *shell_unquoted_newline(char *s);
 static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
@@ -8782,6 +8782,12 @@ struct shell_redir {
 struct shell_simple {
     int argc;
     char *argv[ARG_MAX];
+    /* Bit i: argv[i] LOOKS like an assignment and is not one, because the
+     * `=` was quoted. `foo\=bar` is a command NAME -- bash reports 127, not
+     * a variable called foo. The quoting is gone by the time argv exists, so
+     * the answer has to be carried alongside it. ARG_MAX is 32, which is
+     * exactly what fits here. */
+    unsigned arg_noassign;
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -8903,7 +8909,14 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
          * program looked to the caller like a typo. */
         struct vfs_stat est;
         int rc127 = 127;
-        if (vfs_stat(path, &est) == VFS_OK && est.type == VFS_TYPE_FILE)
+        int sr = vfs_stat(path, &est);
+        if (sr == VFS_OK && est.type == VFS_TYPE_FILE)
+            rc127 = 126;
+        /* A NAME TOO LONG IS "CANNOT EXECUTE", NOT "NOT FOUND". 127 says the
+         * shell looked and found nothing; here the name could not even be
+         * resolved, which is the 126 case -- bash reports 126 for the
+         * ENAMETOOLONG its execve returns. */
+        else if (sr == VFS_ERR_NAMETOOLONG)
             rc127 = 126;
         kprintf("spawn: failed to launch '%s'\n", path);
         return rc127;
@@ -11157,11 +11170,11 @@ static int shell_tokenize(const char *src, struct shell_token *tok,
                     kprintf("shell: trailing escape\n");
                     return -1;
                 }
-                /* AN ESCAPED METACHARACTER KEEPS ITS BACKSLASH so the globber
+                /* AN ESCAPED METACHARACTER KEEPS ITS MARKER so the globber
                  * treats it as an ordinary character -- `echo [\\[z]` has to
                  * match a file actually named `[`. The escape comes off again
                  * where the word becomes an argument. */
-                if (shell_glob_meta(*p) &&
+                if ((shell_glob_meta(*p) || *p == '=') &&
                     shell_append_char(words, &wpos, word_cap,
                                       SHELL_GLOB_ESC) < 0) {
                     kprintf("shell: word too long\n");
@@ -11506,14 +11519,18 @@ static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
                                    size_t from) {
     size_t extra = 0;
     for (size_t i = from; i < *pos; i++)
-        if (shell_glob_meta(buf[i])) extra++;
+        if (shell_glob_meta(buf[i]) || buf[i] == '=') extra++;
     if (extra == 0) return 0;
     if (*pos + extra + 1 >= cap) return -1;
     size_t src = *pos, dst = *pos + extra;
     while (src > from) {
         char c = buf[--src];
         buf[--dst] = c;
-        if (shell_glob_meta(c)) buf[--dst] = SHELL_GLOB_ESC;
+        /* `=` IS MARKED TOO, for a different reader. It is not a glob
+         * character; it is what tells an assignment from a command name, and
+         * `foo\=bar` is a NAME. The marker is the only thing left that
+         * remembers the `=` was quoted. */
+        if (shell_glob_meta(c) || c == '=') buf[--dst] = SHELL_GLOB_ESC;
     }
     *pos += extra;
     buf[*pos] = '\0';
@@ -11941,10 +11958,19 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
 
     /* THE ESCAPES COME OFF HERE. Everything above may have needed them --
      * the globber reads one as "this metacharacter is data" -- but an
-     * argument must not carry them. */
+     * argument must not carry them. The one fact that must outlive them is
+     * whether a `=` in the NAME position was quoted; see arg_noassign. */
     bool has_esc = false;
     for (const char *e = word; *e; e++)
         if (*e == SHELL_GLOB_ESC) { has_esc = true; break; }
+    if (has_esc && cur->argc < 32) {
+        const char *e = word;
+        while ((*e >= 'A' && *e <= 'Z') || (*e >= 'a' && *e <= 'z') ||
+               (*e >= '0' && *e <= '9') || *e == '_')
+            e++;
+        if (e > word && *e == SHELL_GLOB_ESC && e[1] == '=')
+            cur->arg_noassign |= (1u << cur->argc);
+    }
     if (has_esc) {
         char plain[SHELL_PARSE_BUF_MAX];
         size_t n = strlen(word);
@@ -13242,7 +13268,9 @@ static int shell_background_forked(const char *text, const char *label) {
 
 static int shell_run_single(struct shell_simple *cmd, bool background) {
     int assignc = 0;
-    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+    while (assignc < cmd->argc &&
+           !(cmd->arg_noassign & (1u << assignc)) &&
+           shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
 
@@ -13401,7 +13429,9 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
                                           struct file *pipe_in,
                                           struct file *pipe_out) {
     int assignc = 0;
-    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+    while (assignc < cmd->argc &&
+           !(cmd->arg_noassign & (1u << assignc)) &&
+           shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
     if (assignc == cmd->argc) return -1;
@@ -13502,7 +13532,9 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     int envc = 0;
 
     int assignc = 0;
-    while (assignc < cmd->argc && shell_is_assignment_word(cmd->argv[assignc])) {
+    while (assignc < cmd->argc &&
+           !(cmd->arg_noassign & (1u << assignc)) &&
+           shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
     if (assignc == cmd->argc) {
@@ -14763,29 +14795,55 @@ static bool shell_glob_meta(char c) {
     return c == '*' || c == '?' || c == '[' || c == ']' || c == '\\';
 }
 
-static void shell_case_unquote(char *pat) {
+/* Strip one level of shell quoting from a case pattern, escaping whatever was
+ * inside the quotes so it stays literal for the matcher.
+ *
+ * NOT IN PLACE, AND THAT IS THE WHOLE POINT. The output can be LONGER than
+ * the input -- every quoted metacharacter grows by a backslash -- so a
+ * write cursor walking the same buffer overtakes the read cursor after the
+ * SECOND one, and from then on it is overwriting bytes the reader has not
+ * reached yet. `case x in *'[a]'*)` destroyed its own closing quote and its
+ * own terminator that way, never left the quoted state, and grew two bytes
+ * per byte read until it walked off the top of the user stack: a General
+ * Protection fault at rip in shell_try_case_command, and a shell that exited
+ * 255 in the middle of a script. A quoted metacharacter in a case pattern is
+ * ordinary shell (`case $f in "*.txt")`), so this was reachable from any
+ * script, not just the corpus. */
+static void shell_case_unquote(char *pat, size_t cap) {
+    char out[SHELL_PARSE_BUF_MAX];
+    if (cap > sizeof out) cap = sizeof out;
+    size_t o = 0;
     bool in_sq = false, in_dq = false;
-    char *w = pat;
+
+#define SH_CU_PUT(c) do { if (o + 1 >= cap) goto done; out[o++] = (c); } while (0)
     for (char *r = pat; *r; r++) {
         if (in_sq) {
             if (*r == '\'') { in_sq = false; continue; }
-            if (shell_glob_meta(*r)) *w++ = '\\';
-            *w++ = *r;
+            if (shell_glob_meta(*r)) SH_CU_PUT('\\');
+            SH_CU_PUT(*r);
             continue;
         }
         if (in_dq) {
-            if (*r == '\\' && r[1]) { r++; if (shell_glob_meta(*r)) *w++ = '\\'; *w++ = *r; continue; }
+            if (*r == '\\' && r[1]) {
+                r++;
+                if (shell_glob_meta(*r)) SH_CU_PUT('\\');
+                SH_CU_PUT(*r);
+                continue;
+            }
             if (*r == '"') { in_dq = false; continue; }
-            if (shell_glob_meta(*r)) *w++ = '\\';
-            *w++ = *r;
+            if (shell_glob_meta(*r)) SH_CU_PUT('\\');
+            SH_CU_PUT(*r);
             continue;
         }
         if (*r == '\'') { in_sq = true;  continue; }
         if (*r == '"')  { in_dq = true;  continue; }
-        if (*r == '\\' && r[1]) { *w++ = *++r; continue; }
-        *w++ = *r;
+        if (*r == '\\' && r[1]) { SH_CU_PUT(*++r); continue; }
+        SH_CU_PUT(*r);
     }
-    *w = '\0';
+done:
+#undef SH_CU_PUT
+    out[o] = '\0';
+    memcpy(pat, out, o + 1);
 }
 
 static bool shell_case_pattern_match(const char *patterns, const char *word) {
@@ -14838,7 +14896,7 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
                     continue;
                 }
             }
-            shell_case_unquote(pat);
+            shell_case_unquote(pat, sizeof pat);
             /* An empty pattern is only meaningful if it came from quotes;
              * a genuinely blank clause is still skipped. */
             if ((pat[0] || was_quoted) && shell_glob_match(pat, word)) return true;
