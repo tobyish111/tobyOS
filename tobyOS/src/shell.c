@@ -226,6 +226,9 @@ static bool g_opt_errexit;   /* set -e */
  * than a flag because these nest -- a while condition may contain a pipeline
  * containing an if -- and the innermost scope must not clear the outer one. */
 static int g_errexit_suspend;
+/* Set when a malformed expansion is the `${ command }` kind, which bash
+ * reports with status 1 and continues from rather than aborting. */
+static bool g_bad_subst_soft;
 
 /* True when the last non-zero status came from a command errexit is not
  * allowed to act on -- the left side of && or ||. It exists so the exemption
@@ -654,6 +657,19 @@ static const char *env_deref_name(const char *key, char *buf, size_t cap) {
     while (idx >= 0 && (g_env_flags[idx] & SHVAR_NAMEREF) && hops++ < 16) {
         const char *target = g_env[idx] + klen + 1;
         if (!*target) break;
+        /* ASSIGNING THROUGH A REFERENCE THAT IS NOT ONE DROPS THE ATTRIBUTE.
+         *
+         *     ref=1 ; typeset -n ref ; ref=foo ; echo $ref     bash: foo
+         *
+         * `1` cannot name a variable. bash warns and then treats `ref` as
+         * the ordinary variable it evidently is -- so the assignment lands
+         * on `ref` itself and the reference is gone. Reading one of these is
+         * different and stays put (env_get returns the raw value): only a
+         * WRITE resolves the question. */
+        if (!shell_name_is_valid(target, strlen(target))) {
+            g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
+            break;
+        }
         size_t n = strlen(target);
         if (n + 1 > cap) break;
         memcpy(buf, target, n + 1);
@@ -5642,6 +5658,22 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * before it, and eight perfectly ordinary case constructs became
          * syntax errors. */
         if (!(c == '|' && !dbl)) st->case_pat = false;
+        /* A PIPE NEEDS A COMMAND IN FRONT OF IT, and so does `&&`/`||`.
+         *
+         *     cat <<EOF          *     ...
+         *     EOF
+         *     | tac                     bash: syntax error, exit 2
+         *
+         * This used to be caught when the pipeline was parsed, by rejecting a
+         * stage with no words -- but a stage can also have no words because
+         * it EXPANDED to none (`echo x | $SH | grep y`), which bash runs as a
+         * null command. The two are only distinguishable here, in the source
+         * text, before anything expands. A `|` inside a case pattern is
+         * alternation and has its pattern word in front of it, so cmd_seen
+         * covers that too. */
+        if (!st->cmd_seen && !st->case_pat &&
+            (c == '|' || (c == '&' && dbl)))
+            st->bad_semi = true;
         st->no_sep = true;
         /* A lone `&` TERMINATES a command; `|`, `||` and `&&` do not. */
         st->cont_op = (c == '|') || (c == '&' && dbl);
@@ -5785,6 +5817,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         if (st->paren > 0) {
             st->paren--;
             st->cmd_pos = false;
+            /* A CLOSED SUBSHELL IS A COMMAND, so `( ... ) || echo` has one in
+             * front of its `||`. Without this the leading-operator check
+             * below called every such line a syntax error. */
+            st->cmd_seen = true;
         } else if (st->case_pat) {
             /* An unbalanced `)` ends a CASE PATTERN, and a command follows it:
              * `case $x in a) echo hi;; esac`. */
@@ -6033,6 +6069,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         if (st->brace > 0) st->brace--;
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;
+        st->cmd_seen = true;            /* a closed group is a command */
         return;
     }
     if (resv && (shell_word_eq(w, n, "if")   || shell_word_eq(w, n, "while") ||
@@ -6062,6 +6099,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         }
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;             /* fi/done/esac END a command */
+        st->cmd_seen = true;            /* ...and they ARE one */
         return;
     }
     if (resv && (shell_word_eq(w, n, "then") || shell_word_eq(w, n, "else") ||
@@ -7631,8 +7669,22 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     /* POSIX XCU: a leading ' or " means "the numeric value of the next
      * character". Extra characters after it are ignored, not an error. */
     if (*s == '\'' || *s == '"') {
-        g_printf_last_u64 = (unsigned long)(unsigned char)s[1];
-        return (long)(unsigned char)s[1];
+        unsigned char ch = (unsigned char)s[1];
+        /* A BYTE THAT IS NOT A CHARACTER GETS THE C LIBRARY'S ANSWER.
+         *
+         *     printf '%x' \'μ        ->  dfce      (μ is 0xCE 0xBC in UTF-8)
+         *     printf '%x' \'三        ->  dfe4
+         *
+         * In the C locale a byte >= 0x80 does not decode to a character at
+         * all, and glibc -- which is what the bash in this image is linked
+         * against, and therefore what the conformance oracle reports -- maps
+         * such a byte to the surrogate escape 0xDF80 | (byte & 0x7F) rather
+         * than failing. Reporting the raw byte gave `ce` where every other
+         * shell on the machine says `dfce`. This is the platform's rule, not
+         * a guess: both halves of the corpus case land on it exactly. */
+        unsigned long v = (ch >= 0x80u) ? (0xDF80ul | (ch & 0x7Ful)) : ch;
+        g_printf_last_u64 = v;
+        return (long)v;
     }
 
     while (printf_is_blank(*s)) s++;            /* LEADING blanks are fine */
@@ -10164,6 +10216,35 @@ static int shell_parse_braced_name(const char *expr, size_t *name_len) {
 
 static bool shell_glob_match(const char *pat, const char *name);
 
+/* TILDE EXPANSION INSIDE A `${x-word}` DEFAULT.
+ *
+ *     HOME=/home/bar ; x=~:${undef-~:~} ; echo $x
+ *     bash: /home/bar:/home/bar:/home/bar
+ *
+ * A tilde expands at the START of the word and after each `:`, which is the
+ * same rule an assignment's value follows -- and the word of a `-`/`=`/`+`
+ * expansion is expanded as if it were one. Only `~` alone or `~/...` counts;
+ * `~user` needs a user database this shell does not have. */
+static void shell_word_tilde(char *w, size_t cap) {
+    const char *hm = env_get("HOME");
+    if (!hm || !*hm) hm = "/";
+    char out[SHELL_PARSE_BUF_MAX];
+    size_t o = 0;
+    bool seg_start = true;
+    for (size_t i = 0; w[i]; i++) {
+        if (seg_start && w[i] == '~' &&
+            (w[i + 1] == '\0' || w[i + 1] == '/' || w[i + 1] == ':')) {
+            for (const char *h = hm; *h && o + 1 < sizeof out; h++) out[o++] = *h;
+            seg_start = false;
+            continue;
+        }
+        if (o + 1 < sizeof out) out[o++] = w[i];
+        seg_start = (w[i] == ':');
+    }
+    out[o] = '\0';
+    if (o + 1 <= cap) memcpy(w, out, o + 1);
+}
+
 static int shell_expand_braced_parameter(const char *expr, char *buf,
                                          size_t *pos, size_t cap) {
     if (!expr) return -1;
@@ -10209,6 +10290,17 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
          * and bash prints an empty result and carries on there while exiting
          * 1 for `${ echo hi }`. The rule is finer than the syntax, and until
          * it can be stated the tokenizer's own 2 stays. */
+        /* `${ command }` SETS STATUS 1 AND CARRIES ON. Measured, after two
+         * wrong attempts at this:
+         *
+         *     x=${ echo hi }  ; echo $?     bash: 1, and the script goes on
+         *     x=${|REPLY=hi}                bash: exits 2
+         *
+         * Both earlier attempts made it FATAL, which is the part that was
+         * wrong -- the status was right the second time. A blank right
+         * after the brace separates the two forms; the array-literal and
+         * `${|...}` shapes keep the tokenizer's own 2, which aborts. */
+        if (*expr == ' ' || *expr == '\t') g_bad_subst_soft = true;
         kprintf("shell: bad substitution\n");
         return -1;
     }
@@ -10411,7 +10503,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
  * A quoted span arrives wrapped in no-split markers, so a `~` that is still
  * the FIRST byte was unquoted; and g_dq_depth is what says whether the whole
  * substitution sits inside double quotes. tsh expanded none of the four. */
-#define SH_WORD_TILDE()                                                           do {                                                                              if (g_dq_depth == 0 && expanded_word[0] == '~' &&                                 (expanded_word[1] == '\0' || expanded_word[1] == '/')) {                       const char *hm = env_get("HOME");                                             if (!hm || !*hm) hm = "/";                                                    char tw[SHELL_PARSE_BUF_MAX];                                                 int tn = ksnprintf(tw, sizeof tw, "%s%s", hm,                                                    expanded_word + 1);                                        if (tn > 0 && (size_t)tn < sizeof tw)                                             memcpy(expanded_word, tw, (size_t)tn + 1);                            }                                                                         } while (0)
+#define SH_WORD_TILDE()                                                       do {                                                                          if (g_dq_depth == 0) shell_word_tilde(expanded_word,                                                            sizeof expanded_word);          } while (0)
 
 #define SH_JOIN_WORD_MARKS()                                                  \
     do {                                                                      \
@@ -12739,6 +12831,60 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         return -1;
     }
 
+    /* A TILDE THAT WAS WRITTEN IN THE WORD EXPANDS; ONE THAT ARRIVED FROM AN
+     * EXPANSION IS DATA -- and the no-split marks already say which is which,
+     * because they wrap the LITERAL runs.
+     *
+     *     HOME=/home/bar ; x=~:${undef-y} ; echo $x
+     *     bash: /home/bar:y     tsh: ~:y
+     *
+     * The old test was one flag for the whole word, so as soon as any part of
+     * it expanded, every tilde in it stopped expanding -- including the one
+     * the script typed. This runs BEFORE the marks come off, which is the
+     * only point where the distinction still exists. */
+    char tw[SHELL_PARSE_BUF_MAX];
+    if (shell_has_nosplit(word)) {
+        char shape0[80];
+        size_t so0 = 0;
+        for (const char *q = word; *q && so0 + 1 < sizeof shape0; q++)
+            if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC)
+                shape0[so0++] = *q;
+        shape0[so0] = '\0';
+        size_t k0 = env_key_len(shape0);
+        if (shape0[k0] == '=' && shell_name_is_valid(shape0, k0)) {
+            const char *hm = env_get("HOME");
+            if (!hm || !*hm) hm = "/";
+            size_t o = 0;
+            bool prot = false, seg_start = false, seen_eq = false;
+            bool changed = false;
+            for (const char *q = word; *q; q++) {
+                if (*q == SHELL_NOSPLIT_MARK) {
+                    prot = !prot;
+                    if (o + 1 < sizeof tw) tw[o++] = *q;
+                    continue;
+                }
+                if (prot && seg_start && *q == '~' &&
+                    (q[1] == '\0' || q[1] == '/' || q[1] == ':' ||
+                     q[1] == SHELL_NOSPLIT_MARK)) {
+                    for (const char *h = hm; *h && o + 1 < sizeof tw; h++)
+                        tw[o++] = *h;
+                    seg_start = false;
+                    changed = true;
+                    continue;
+                }
+                if (o + 1 < sizeof tw) tw[o++] = *q;
+                if (!seen_eq && *q == '=') { seen_eq = true; seg_start = true; }
+                else seg_start = (*q == ':') && seen_eq;
+            }
+            tw[o] = '\0';
+            if (changed) {
+                char *saved = 0;
+                if (shell_pipeline_save_word(pl, tw, &saved) < 0) return -1;
+                word = saved;
+            }
+        }
+    }
+
     /* The funnel: every word becomes an argument through here, so this is the
      * one place that has to guarantee no split-protection marker escapes. */
     char unmarked[SHELL_PARSE_BUF_MAX];
@@ -13248,8 +13394,23 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
 
         if (t == SH_TOK_PIPE) {
             if (cur->argc == 0) {
-                kprintf("shell: empty command before '|'\n");
-                return -1;
+                /* AN EMPTY STAGE IS ONLY AN ERROR IF IT WAS WRITTEN EMPTY.
+                 *
+                 *     echo hi | $SH | grep x        with SH unset
+                 *
+                 * parses fine -- `$SH` is a word -- and the emptiness only
+                 * appears after expansion, where bash runs a null command
+                 * with status 0 and lets the pipeline carry on. tsh reported
+                 * a syntax error and exited 2 for a line bash exits 1 on
+                 * (grep's status). A literal `| |` is still caught, by
+                 * shell_line_syntax_ok, before any of this. */
+                (*io)++;
+                if (pl->count >= SHELL_STAGE_MAX) {
+                    kprintf("shell: too many pipeline stages\n");
+                    return -1;
+                }
+                shell_simple_init(&pl->stage[pl->count++]);
+                continue;
             }
             (*io)++;
             if (pl->count >= SHELL_STAGE_MAX) {
@@ -13374,13 +13535,19 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
              * An empty stage in a MULTI-stage pipeline stays an error -- that
              * is `a | | b`, a real syntax error. */
             if (pl->count == 1) continue;
-            /* A LAST STAGE THAT EXPANDED TO NOTHING is a no-op, not a syntax
-             * error: `echo -n '' | $SH` with SH unset is a pipeline whose
-             * second command has no words, and bash runs nothing and reports
-             * 0. A MIDDLE stage with no words is still `a | | b`. */
-            if (i + 1 == pl->count) continue;
-            kprintf("shell: empty command in pipeline\n");
-            return -1;
+            /* A STAGE THAT EXPANDED TO NOTHING is a no-op, not a syntax
+             * error, WHEREVER IT SITS:
+             *
+             *     echo 'echo $0' | $SH | grep -o 'sh$'      with SH unset
+             *
+             * parses fine -- `$SH` is a word -- so the emptiness only shows
+             * up after expansion, and bash runs a null command there and
+             * lets the pipeline carry on (exit 1, from grep finding
+             * nothing). This used to hold only for the LAST stage, which is
+             * the same rule with the middle of the pipeline left out. A
+             * literal `a | | b` never reaches here: shell_line_syntax_ok
+             * rejects it before any expansion happens. */
+            continue;
         }
     }
     return pl->count;
@@ -17775,6 +17942,11 @@ static void execute_line_text_inner(const char *src) {
     }
 
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+        if (g_bad_subst_soft) {
+            g_bad_subst_soft = false;
+            shell_set_status(1);
+            return;
+        }
         /* RETRACTION: a malformed expansion was briefly made fatal with status
          * 1, on the strength of `x=${ echo hi }` (case 1375, which wants 1).
          * It gained nothing and cost two: `${|REPLY=hi}` is a bad
