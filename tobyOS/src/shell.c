@@ -17528,7 +17528,18 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (!sep) break;
         cur = sep + 1;
     }
-    if (overflow || n < 2 || !any_compound) {
+    /* EVERY pipeline, not just one with a compound stage. A stage is a
+     * subshell, and the only way its EXPANSIONS can be isolated too is for
+     * the child to do them:
+     *
+     *     ${cmd=echo} hi | wc -l ; echo "cmd=$cmd"     bash: cmd=
+     *
+     * The token-level path expands the whole line in this process before it
+     * knows where the stages are, so `cmd` was already set by the time
+     * anything forked. Handing each stage its TEXT to a child moves the
+     * expansion where it belongs. */
+    (void)any_compound;
+    if (overflow || n < 2) {
         kfree(stages);
         return false;
     }
@@ -17594,7 +17605,22 @@ static bool shell_try_compound_pipeline(const char *src) {
             bg_tail = (tl > 0 && t[tl - 1] == '&' &&
                        !(tl > 1 && t[tl - 2] == '&'));
         }
-        if (!bg_tail && (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
+        /* ...AND NOT WHILE HERE-DOCUMENTS ARE QUEUED. The bodies were
+         * collected for the whole logical line and are consumed in order as
+         * the stages run; fork gives every child its own COPY of that queue,
+         * so each one would take the FIRST body instead of its own.
+         *
+         *     read_from_fd.py 3 3<<EOF3 | read_from_fd.py 0 5 5<<EOF5
+         *
+         * Sequential is wrong for isolation and right for this, and this is
+         * the case where it can be told. */
+        /* ...NOR INSIDE A COMMAND SUBSTITUTION. The capture redirects this
+         * process's output into a spill file and reads it back afterwards; a
+         * stage in another process writes into that file too, and nothing
+         * coordinates the two. `echo \`a | b\`` came back as "unmatched
+         * backquote" once the stages stopped being this process. */
+        if (!bg_tail && g_heredoc_count == 0 && g_capture_depth == 0 &&
+            (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
         if (fpid == 0) {
             execute_line_text(stages[i]);
             int crc = g_last_status;
