@@ -19266,8 +19266,43 @@ void shell_init_hosted(const char *argv0) {
 }
 
 /* Run a script file to completion; returns its exit status. */
+/* ---- a backgrounded child gets to run before the shell leaves -------- *
+ *
+ *     echo word_a & echo word_b        bash and dash:  word_b
+ *                                                      word_a
+ *
+ * The parent writes first and the child writes after, because the child is
+ * still runnable when the shell exits and Linux reparents it to init. tobyOS
+ * never reparents an orphan in the initial namespace, so a child that had not
+ * been scheduled yet simply never ran: all three shell-grammar cases ending
+ * in `&` printed NOTHING for the backgrounded half.
+ *
+ * So the shell yields until its jobs are done -- BOUNDED, because a script
+ * that backgrounds something long-running has to exit rather than hang, which
+ * is what bash does. A child that is still going after the last round is left
+ * running, exactly as before. */
+#ifndef SHELL_HOSTED
+/* The kernel shell has no fork and no orphans to strand: its background jobs
+ * are kernel processes that outlive the command either way. */
+static void shell_drain_background(void) { }
+#else
+static void shell_drain_background(void) {
+    /* AN INTERACTIVE SHELL NEVER WAITS. `sleep 60 &` at a prompt has to come
+     * straight back, which is the whole point of `&`. This runs only when a
+     * SCRIPT or a `-c` line has finished. */
+    if (g_interactive) return;
+    for (int i = 0; i < JOB_MAX; i++) {
+        if (g_jobs[i].id == 0) continue;
+        (void)proc_wait(g_jobs[i].pid);
+        jobs_remove(&g_jobs[i]);
+    }
+}
+#endif
+
 int shell_run_script_hosted(const char *path) {
-    return shell_run_script_path(path, true);
+    int st = shell_run_script_path(path, true);
+    shell_drain_background();
+    return st;
 }
 
 /* Run one command line (the `-c` form); returns its exit status. */
@@ -19277,6 +19312,7 @@ int shell_run_line_hosted(const char *text) {
     if (!copy) return 2;
     int rc = shell_run_script_text(copy, true);
     kfree(copy);
+    shell_drain_background();
     return rc;
 }
 
