@@ -14,7 +14,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 | gate | command | state | time |
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **91/91** | ~4 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **92/92** | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -127,11 +127,19 @@ with a parity case (`73-umask-symbolic`, `74-set-silent-options`,
 observable), `set -o nolog` (accepted state; bash's manual itself says
 "currently ignored"), and `set -o monitor`/`set -m`.
 
-**Still open from this batch:** monitor is the OPTION only — accepted,
-tracked, in `$-` and both listings. Per-job process groups and prompt-time
-job-status reporting are not implemented; scope them before starting, and
-remember the trap: cases that pin the ORDER of concurrent background children
-flap — assert presence, pin order with `wait`.
+**Monitor is CLOSED (d6f3e40).** The kernel had been lying to every shell:
+setpgid accept-and-return-0, kill(-pgid) a silent success. Now: `pgid` on
+struct proc, one shared setpgid/getpgid body for both ABIs, kill(-pgid)
+fan-out with ESRCH, tty signals delivered to the foreground GROUP, and
+native SYS_SETPGID/GETPGID. Under `set -m` tsh's background jobs lead
+their own group (pipeline stages join the first stage's); foreground jobs
+deliberately stay in the shell's group — tsh cannot tcsetpgrp from
+userspace. Case 91 pins the contract with single-command jobs only (bash
+leads a pipeline's group with the FIRST stage while `$!` names the LAST —
+a `-$!` probe would ask about the wrong group). tsh's `kill` learned `--`
+along the way. Still open on this front: tcsetpgrp/terminal handover,
+prompt-time job-status lines (interactive-only), pgid translation across
+pid namespaces, and SIGTSTP-stop semantics for `fg`/`bg`.
 
 The find was the proof that §3 works: a four-minute probe found four
 mandated behaviours 2,776 third-party cases never exercised. Keep walking
