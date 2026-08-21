@@ -274,6 +274,18 @@ static bool g_opt_allexport; /* set -a */
  * cmd's failure; without it `set -o pipefail` was "unknown option" and the
  * script died on the option rather than on the pipeline. */
 static bool g_opt_pipefail;
+/* POSIX names a shell option for job CONTROL (`set -m` / `set -o monitor`),
+ * on by default only in interactive shells. tsh runs its background-job
+ * machinery unconditionally; the flag records what was asked for and is what
+ * `$-` and `set +o` report. Per-job process groups are still an open item. */
+static bool g_opt_monitor;
+/* `set -o ignoreeof`: an interactive EOF must not exit the shell. Only the
+ * hosted interactive loop can see an EOF; everywhere else the flag is just
+ * settable state, which is all a script can observe. */
+static bool g_opt_ignoreeof;
+/* `set -o nolog`: keep function definitions out of command history. bash's
+ * own man page says "currently ignored"; accepted state, no behaviour. */
+static bool g_opt_nolog;
 static bool g_opt_expand_aliases;
 /* True for a terminal session, false while running a script or `-c`. The
  * kernel shell is always a terminal session, so this defaults true and only
@@ -2296,21 +2308,32 @@ static bool shell_set_opt(char c, bool on) {
     case 'b': g_opt_notify = on; return true;
     case 'n': g_opt_noexec = on; return true;
     case 'a': g_opt_allexport = on; return true;
+    case 'm': g_opt_monitor = on; return true;
     default: return false;
     }
 }
 
-static void shell_print_options(void) {
-    shell_printf("allexport %s\n", g_opt_allexport ? "on" : "off");
-    shell_printf("errexit   %s\n", g_opt_errexit ? "on" : "off");
-    shell_printf("noclobber %s\n", g_opt_noclobber ? "on" : "off");
-    shell_printf("noexec    %s\n", g_opt_noexec ? "on" : "off");
-    shell_printf("noglob    %s\n", g_opt_noglob ? "on" : "off");
-    shell_printf("notify    %s\n", g_opt_notify ? "on" : "off");
-    shell_printf("nounset   %s\n", g_opt_nounset ? "on" : "off");
-    shell_printf("pipefail  %s\n", g_opt_pipefail ? "on" : "off");
-    shell_printf("verbose   %s\n", g_opt_verbose ? "on" : "off");
-    shell_printf("xtrace    %s\n", g_opt_xtrace  ? "on" : "off");
+/* `set -o` (table) and `set +o` (reinput form). Both use bash's exact line
+ * formats -- "%-15s\ton" and "set -o name" -- because the parity gate greps
+ * single lines out of this output against real bash's. The table is shorter
+ * than bash's (tsh carries fewer options); a case must therefore filter to a
+ * named option, never compare the whole listing. */
+static void shell_print_options(bool reinput) {
+    const struct { const char *name; bool on; } t[] = {
+        { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
+        { "ignoreeof", g_opt_ignoreeof }, { "monitor",   g_opt_monitor },
+        { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
+        { "noglob",    g_opt_noglob },    { "nolog",     g_opt_nolog },
+        { "notify",    g_opt_notify },    { "nounset",   g_opt_nounset },
+        { "pipefail",  g_opt_pipefail },  { "verbose",   g_opt_verbose },
+        { "xtrace",    g_opt_xtrace },
+    };
+    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
+        if (reinput)
+            shell_printf("set %co %s\n", t[i].on ? '-' : '+', t[i].name);
+        else
+            shell_printf("%-15s\t%s\n", t[i].name, t[i].on ? "on" : "off");
+    }
 }
 
 static bool shell_set_opt_by_name(const char *name, bool on) {
@@ -2318,8 +2341,11 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         {"errexit", 'e'}, {"nounset", 'u'}, {"xtrace", 'x'},
         {"noglob", 'f'}, {"verbose", 'v'}, {"noclobber", 'C'},
         {"notify", 'b'}, {"noexec", 'n'}, {"allexport", 'a'},
+        {"monitor", 'm'},
     };
-    if (strcmp(name, "pipefail") == 0) { g_opt_pipefail = on; return true; }
+    if (strcmp(name, "pipefail")  == 0) { g_opt_pipefail  = on; return true; }
+    if (strcmp(name, "ignoreeof") == 0) { g_opt_ignoreeof = on; return true; }
+    if (strcmp(name, "nolog")     == 0) { g_opt_nolog     = on; return true; }
     for (size_t i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
         if (strcmp(name, map[i].name) == 0)
             return shell_set_opt(map[i].flag, on);
@@ -2346,6 +2372,9 @@ static bool shell_option_is_set(const char *name) {
     if (strcmp(name, "noexec")    == 0) return g_opt_noexec;
     if (strcmp(name, "allexport") == 0) return g_opt_allexport;
     if (strcmp(name, "pipefail")  == 0) return g_opt_pipefail;
+    if (strcmp(name, "monitor")   == 0) return g_opt_monitor;
+    if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
+    if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
     return false;
 }
 
@@ -2388,7 +2417,7 @@ static void cmd_set(int argc, char **argv) {
                     kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
                 }
             } else {
-                shell_print_options();
+                shell_print_options(false);
             }
             first = i + 1;
             continue;
@@ -2399,6 +2428,10 @@ static void cmd_set(int argc, char **argv) {
                 if (!shell_set_opt_by_name(argv[i], false)) {
                     kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
                 }
+            } else {
+                /* Bare `set +o` is not a no-op: POSIX wants the option state
+                 * in a form the shell can re-read. tsh printed nothing. */
+                shell_print_options(true);
             }
             first = i + 1;
             continue;
@@ -6704,6 +6737,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
 
 struct shell_opt_frame {
     bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
+    bool monitor, ignoreeof, nolog;
 };
 
 static void shell_save_opts(struct shell_opt_frame *f) {
@@ -6716,6 +6750,9 @@ static void shell_save_opts(struct shell_opt_frame *f) {
     f->notify    = g_opt_notify;
     f->noexec    = g_opt_noexec;
     f->allexport = g_opt_allexport;
+    f->monitor   = g_opt_monitor;
+    f->ignoreeof = g_opt_ignoreeof;
+    f->nolog     = g_opt_nolog;
 }
 
 static void shell_restore_opts(const struct shell_opt_frame *f) {
@@ -6728,12 +6765,16 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_notify    = f->notify;
     g_opt_noexec    = f->noexec;
     g_opt_allexport = f->allexport;
+    g_opt_monitor   = f->monitor;
+    g_opt_ignoreeof = f->ignoreeof;
+    g_opt_nolog     = f->nolog;
 }
 
 static void shell_reset_opts(void) {
     g_opt_errexit = g_opt_nounset = g_opt_xtrace = false;
     g_opt_noglob = g_opt_verbose = g_opt_noclobber = false;
     g_opt_notify = g_opt_noexec = g_opt_allexport = false;
+    g_opt_monitor = g_opt_ignoreeof = g_opt_nolog = false;
 }
 
 static void cmd_sh(int argc, char **argv) {
@@ -8462,13 +8503,58 @@ static void cmd_printf(int argc, char **argv) {
 
 static int g_shell_umask = 022;
 
+/* `u=rwx,g=rx,o=rx` for 022: the symbolic form names the permissions the
+ * mask ALLOWS, all three groups always present, letters always in rwx
+ * order. Needs at least 18 bytes. */
+static void shell_umask_symbolic(unsigned mask, char *out) {
+    unsigned perms = (~mask) & 0777u;
+    int n = 0;
+    for (int g = 0; g < 3; g++) {
+        unsigned bits = (perms >> (6 - 3 * g)) & 7u;
+        if (g) out[n++] = ',';
+        out[n++] = "ugo"[g];
+        out[n++] = '=';
+        if (bits & 4u) out[n++] = 'r';
+        if (bits & 2u) out[n++] = 'w';
+        if (bits & 1u) out[n++] = 'x';
+    }
+    out[n] = '\0';
+}
+
 static void cmd_umask(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) {
-        shell_printf("%04o\n", (unsigned)g_shell_umask);
+    /* `-S` symbolic, `-p` reinput form. POSIX mandates -S; nothing in 2,776
+     * third-party cases ever passed it and tsh called it an invalid mode. */
+    bool sym = false, reinput = false;
+    int argi = 1;
+    for (; argi < argc && argv[argi][0] == '-' && argv[argi][1]; argi++) {
+        if (strcmp(argv[argi], "--") == 0) { argi++; break; }
+        for (const char *f = argv[argi] + 1; *f; f++) {
+            if (*f == 'S') sym = true;
+            else if (*f == 'p') reinput = true;
+            else {
+                kprintf("umask: -%c: invalid option\n", *f);
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    char symbuf[24];
+    if (argi >= argc) {
+        if (sym) {
+            shell_umask_symbolic((unsigned)g_shell_umask, symbuf);
+            /* bash: -p prefixes the reinput form onto whichever report the
+             * other flag chose; with an operand (below) it prints nothing. */
+            if (reinput) shell_printf("umask -S %s\n", symbuf);
+            else         shell_printf("%s\n", symbuf);
+        } else if (reinput) {
+            shell_printf("umask %04o\n", (unsigned)g_shell_umask);
+        } else {
+            shell_printf("%04o\n", (unsigned)g_shell_umask);
+        }
         return;
     }
-    const char *s = argv[1];
+    const char *s = argv[argi];
     if (*s >= '0' && *s <= '7') {
         int val = 0;
         while (*s >= '0' && *s <= '7') {
@@ -8476,11 +8562,15 @@ static void cmd_umask(int argc, char **argv) {
             s++;
         }
         if (*s || val > 0777) {
-            kprintf("umask: '%s': invalid octal mask\n", argv[1]);
+            kprintf("umask: '%s': invalid octal mask\n", argv[argi]);
             shell_set_status(1);
             return;
         }
         g_shell_umask = val;
+        if (sym) {
+            shell_umask_symbolic((unsigned)g_shell_umask, symbuf);
+            shell_printf("%s\n", symbuf);
+        }
         return;
     }
 
@@ -8494,7 +8584,7 @@ static void cmd_umask(int argc, char **argv) {
      * and must leave the mask exactly as it was, which a clause-at-a-time
      * update would not do. */
     unsigned perms = (~(unsigned)g_shell_umask) & 0777u;
-    const char *p = argv[1];
+    const char *p = argv[argi];
     for (;;) {
         unsigned who = 0;
         for (; *p; p++) {
@@ -8507,7 +8597,7 @@ static void cmd_umask(int argc, char **argv) {
         if (who == 0) who = 0777u;             /* `who` omitted means all */
         char op = *p;
         if (op != '+' && op != '-' && op != '=') {
-            kprintf("umask: '%s': invalid mode\n", argv[1]);
+            kprintf("umask: '%s': invalid mode\n", argv[argi]);
             shell_set_status(1);
             return;
         }
@@ -8526,7 +8616,7 @@ static void cmd_umask(int argc, char **argv) {
 
         if (*p == '\0') break;
         if (*p != ',') {
-            kprintf("umask: '%s': invalid mode\n", argv[1]);
+            kprintf("umask: '%s': invalid mode\n", argv[argi]);
             shell_set_status(1);
             return;
         }
@@ -8534,12 +8624,16 @@ static void cmd_umask(int argc, char **argv) {
         /* An empty clause is a syntax error, not a no-op: `u+r,,u-r` must
          * fail with the mask untouched. */
         if (*p == '\0' || *p == ',') {
-            kprintf("umask: '%s': invalid mode\n", argv[1]);
+            kprintf("umask: '%s': invalid mode\n", argv[argi]);
             shell_set_status(1);
             return;
         }
     }
     g_shell_umask = (int)((~perms) & 0777u);
+    if (sym) {
+        shell_umask_symbolic((unsigned)g_shell_umask, symbuf);
+        shell_printf("%s\n", symbuf);
+    }
 }
 
 static void cmd_hash(int argc, char **argv) {
@@ -10261,6 +10355,7 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
         if (g_opt_notify)    opts[oi++] = 'b';
         if (g_opt_errexit)   opts[oi++] = 'e';
         if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_monitor)   opts[oi++] = 'm';
         if (g_opt_noexec)    opts[oi++] = 'n';
         if (g_opt_nounset)   opts[oi++] = 'u';
         if (g_opt_verbose)   opts[oi++] = 'v';
@@ -11464,6 +11559,7 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         if (g_opt_notify)    opts[oi++] = 'b';
         if (g_opt_errexit)   opts[oi++] = 'e';
         if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_monitor)   opts[oi++] = 'm';
         if (g_opt_noexec)    opts[oi++] = 'n';
         if (g_opt_nounset)   opts[oi++] = 'u';
         if (g_opt_verbose)   opts[oi++] = 'v';
@@ -19230,6 +19326,10 @@ void shell_poll(void) {
 /* Initialise shell state WITHOUT printing a banner or a prompt: a script run
  * must not emit anything the oracle would not. */
 void shell_set_interactive_hosted(bool on) { g_interactive = on; }
+
+/* `set -o ignoreeof` -- only the hosted interactive read loop can see an
+ * EOF, and it lives in programs/tsh/host.c, outside this translation unit. */
+bool shell_opt_ignoreeof_hosted(void) { return g_opt_ignoreeof; }
 
 void shell_init_hosted(const char *argv0) {
     line_len = 0;

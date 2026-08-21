@@ -617,18 +617,33 @@ int main(int argc, char **argv) {
      * language, and this keeps the hosted path free of terminal state. */
     char line[4096];
     int last = 0;
+    int eofs = 0;
     for (;;) {
         fputs("tsh$ ", stdout);
         size_t n = 0;
         for (;;) {
             char c;
             long r = read(0, &c, 1);
-            if (r <= 0) { if (n == 0) { fputs("\n", stdout); return last; } break; }
+            if (r <= 0) {
+                if (n == 0) {
+                    /* `set -o ignoreeof`: an EOF at the start of a line must
+                     * not exit an interactive shell. bash gives up after ten
+                     * in a row so a closed stdin cannot spin forever. */
+                    if (shell_opt_ignoreeof_hosted() && ++eofs < 10) {
+                        fputs("Use \"exit\" to leave the shell.\n", stderr);
+                        break;
+                    }
+                    fputs("\n", stdout);
+                    return last;
+                }
+                break;
+            }
             if (c == '\n') break;
             if (n + 1 < sizeof line) line[n++] = c;
         }
         line[n] = '\0';
         if (n == 0) continue;
+        eofs = 0;
         last = shell_run_line_hosted(line);
     }
 }

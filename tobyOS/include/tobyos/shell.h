@@ -67,6 +67,9 @@ void shell_set_interactive_hosted(bool on);
 int  shell_run_script_hosted(const char *path);
 int  shell_run_line_hosted(const char *text);
 
+/* Is `set -o ignoreeof` on? The interactive read loop asks at each EOF. */
+bool shell_opt_ignoreeof_hosted(void);
+
 /* Set $1..$n before running. */
 int  shell_set_args_hosted(int argc, char **argv);
 
