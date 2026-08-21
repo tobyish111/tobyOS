@@ -17,10 +17,11 @@ import json, os, re, sys, collections
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG  = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'oilspec.log')
 
-MAP_RE = re.compile(r'\[oilspec\] MAP (\d{4}) ([POXDETS?]+)\s*$')
+MAP_RE = re.compile(r'\[oilspec\] MAP (\d{4}) ([POXDETSN?]+)\s*$')
 
 CODE = {'P': 'pass', 'O': 'stdout-diff', 'X': 'exit-diff', 'D': 'both-diff',
-        'T': 'timeout', 'E': 'broken', 'S': 'skipped', '?': 'never-ran'}
+        'T': 'timeout', 'E': 'broken', 'S': 'skipped', '?': 'never-ran',
+        'N': 'oracle-nondet'}
 
 
 def load_map(path):
@@ -68,9 +69,17 @@ def main():
     per_file = collections.defaultdict(lambda: collections.Counter())
     failures = collections.defaultdict(list)
 
+    # 'N' is a case where the guest's bash disagreed with ITSELF across
+    # repeated runs, so there is no answer for tsh to be right or wrong about.
+    # Excluded from the score and listed separately BY NAME below -- an
+    # exclusion nobody can see is indistinguishable from a cover-up.
+    nondet = []
     for cid, ch in sorted(results.items()):
         cls = host.get(cid, {}).get('class', 'UNKNOWN')
         if ch == 'S':
+            continue
+        if ch == 'N':
+            nondet.append((cid, cls, man.get(cid, {}).get('name', '?')))
             continue
         tally[cls][ch] += 1
         stem = man.get(cid, {}).get('file', '?')
@@ -94,6 +103,15 @@ def main():
                           for k, v in sorted(c.items()) if k != 'P')
         if detail:
             print('  %-52s %s' % ('', detail))
+
+    if nondet:
+        print()
+        print('--- EXCLUDED: the oracle disagreed with itself (%d) ---' % len(nondet))
+        print('    bash gave two different answers to these across repeated runs,')
+        print('    so no shell can match them; they are out of BOTH numerator and')
+        print('    denominator above. Each one is printed in full in the log.')
+        for cid, cls, name in nondet:
+            print('  %s  %-10s %s' % (cid, cls, name))
 
     print()
     print('--- failing spec files, worst first (a file == a feature area) ---')

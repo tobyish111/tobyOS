@@ -90,8 +90,36 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
  * a 66 KiB stack frame has already cost this project one debugging session. */
 static char g_out_a[CAP_OUT];
 static char g_out_b[CAP_OUT];
+static char g_out_a2[CAP_OUT];      /* the oracle, asked a second time */
 static char g_err_a[8192];
 static char g_err_b[8192];
+
+/* ---- THE ORACLE HAS TO BE REPRODUCIBLE ---------------------------------- *
+ *
+ * A differential gate compares tsh against the bash in the initrd. That is
+ * only meaningful where bash gives the SAME ANSWER TWICE. Measured on this
+ * box, `echo word_a & echo word_b` under bash puts word_a first 8 times in 20
+ * and word_b first the other 12 -- and `a & b &` produced NO OUTPUT AT ALL in
+ * 2 runs of 20. bash is racing its own backgrounded child, and no shell can
+ * match a coin flip.
+ *
+ * So a mismatch is re-checked before it counts: bash is run again, and if it
+ * disagrees with ITSELF the case is excluded as undecidable rather than
+ * charged to tsh. This is the same policy the host classifier already applies
+ * (a case whose two host bash runs differ is UNUSABLE); it simply had never
+ * been applied to the GUEST, where the timing is different.
+ *
+ * Two properties keep this from becoming a way to hide failures:
+ *   - it only ever runs on a case that ALREADY MISMATCHED, and only for
+ *     POSIX-classified cases, so it cannot turn a pass into anything;
+ *   - every exclusion is printed with the two differing bash outputs, and the
+ *     verdict line carries the count. An exclusion you cannot see is a lie.
+ *
+ * Eight probes: a 50/50 case survives all eight undetected once in 256 runs.
+ * The budget bounds a broken build, where hundreds of cases mismatch at once
+ * and re-running each eight times would turn a 10-minute gate into an hour. */
+#define NONDET_PROBES  8
+#define NONDET_BUDGET  400
 
 static char g_cases[MAX_CASES][32];     /* case id, e.g. "0123" */
 static char g_result[MAX_CASES + 1];    /* the MAP bitmap */
@@ -330,9 +358,13 @@ static int count_lines(const char *buf, long len) {
 /* Show the differing lines. Bounded twice over -- per case and per run -- so a
  * corpus that goes wholly divergent cannot bury the verdict under its own
  * diagnostics. */
-static void show_diff(const char *a, long na, const char *b, long nb) {
+/* `la_name`/`lb_name` because this is used for bash-vs-tsh AND for
+ * bash-vs-bash, and a bash-vs-bash diff labelled "tsh" reads as a tsh
+ * failure -- the exact misreading the oracle screen exists to prevent. */
+static void show_diff_named(const char *a, long na, const char *b, long nb,
+                            const char *la_name, const char *lb_name) {
     int la = count_lines(a, na), lb = count_lines(b, nb);
-    emitf("[oilspec]     lines bash=%d tsh=%d\n", la, lb);
+    emitf("[oilspec]     lines %s=%d %s=%d\n", la_name, la, lb_name, lb);
     int shown = 0;
     int most = (la > lb) ? la : lb;
     for (int n = 0; n < most && shown < DIFF_MAX_LINES; n++) {
@@ -342,12 +374,16 @@ static void show_diff(const char *a, long na, const char *b, long nb) {
         if (ra < 0) ta[0] = '\0';
         if (rb < 0) tb[0] = '\0';
         if (ra == rb && strcmp(ta, tb) == 0) continue;
-        emitf("[oilspec]     L%-3d bash: %s\n", n + 1, ra < 0 ? "<none>" : ta);
-        emitf("[oilspec]     L%-3d tsh : %s\n", n + 1, rb < 0 ? "<none>" : tb);
+        emitf("[oilspec]     L%-3d %-4s: %s\n", n + 1, la_name, ra < 0 ? "<none>" : ta);
+        emitf("[oilspec]     L%-3d %-4s: %s\n", n + 1, lb_name, rb < 0 ? "<none>" : tb);
         shown++;
     }
     if (shown >= DIFF_MAX_LINES)
         emitf("[oilspec]     ... further differences suppressed\n");
+}
+
+static void show_diff(const char *a, long na, const char *b, long nb) {
+    show_diff_named(a, na, b, nb, "bash", "tsh");
 }
 
 /* Free memory, in MiB, from /proc/meminfo.
@@ -652,6 +688,8 @@ int main(void) {
     mkdir(SCRATCH_TMP, 0755);        /* the $TMP the cases write into */
 
     char out_a[MAX_PATH], out_b[MAX_PATH], err_a[MAX_PATH], err_b[MAX_PATH];
+    char out_a2[MAX_PATH];
+    snprintf(out_a2, sizeof out_a2, "%s/out.a2", scratch);
     snprintf(out_a, sizeof out_a, "%s/out.a", scratch);
     snprintf(out_b, sizeof out_b, "%s/out.b", scratch);
     snprintf(err_a, sizeof err_a, "%s/err.a", scratch);
@@ -670,6 +708,7 @@ int main(void) {
              "UNAIMED up to the budget\n");
 
     int pass = 0, fail = 0, skip = 0, broken = 0, detail = 0;
+    int nondet = 0, nondet_budget = NONDET_BUDGET;
     int diagnosed = 0;
     int recreated_a = 0, recreated_b = 0;
 
@@ -776,6 +815,39 @@ int main(void) {
 
         if (same_out && same_rc) { g_result[i] = 'P'; pass++; continue; }
 
+        /* Ask the oracle again before charging this to tsh -- see the note at
+         * NONDET_PROBES. POSIX-classified only: the compliance number is what
+         * this protects, and a BASH-ONLY case is not scored either way. */
+        if ((g_nposix == 0 || is_posix(id)) && nondet_budget > 0) {
+            int shaky = 0;
+            long na2 = 0;
+            int rc_a2 = 0;
+            for (int k = 0; k < NONDET_PROBES && nondet_budget > 0; k++) {
+                nondet_budget--;
+                wipe_dir(dir_w); mkdir(dir_w, 0755);
+                wipe_dir(SCRATCH_TMP); mkdir(SCRATCH_TMP, 0755);
+                rc_a2 = run_shell(BASH_PATH, av_bash, dir_w, out_a2, err_a,
+                                  devnull);
+                if (rc_a2 < -100) break;      /* harness trouble, not evidence */
+                na2 = read_all(out_a2, g_out_a2, sizeof g_out_a2);
+                if (na2 < 0) break;
+                if (rc_a2 != rc_a || na2 != na ||
+                    memcmp(g_out_a, g_out_a2, (size_t)na) != 0) {
+                    shaky = 1;
+                    break;
+                }
+            }
+            if (shaky) {
+                g_result[i] = 'N';
+                nondet++;
+                emitf("[oilspec] ORACLE-NONDET %s  bash disagrees with ITSELF "
+                      "-- case is undecidable, excluded from the score\n", id);
+                show_diff_named(g_out_a, na, g_out_a2, na2,
+                                "run1", "run2");
+                continue;
+            }
+        }
+
         g_result[i] = same_rc ? 'O' : (same_out ? 'X' : 'D');
         fail++;
 
@@ -828,9 +900,10 @@ int main(void) {
      * script joins against the manifest to produce the per-feature census;
      * the prose above is only for eyeballing a run in progress.
      *   P pass   O stdout differs   X exit differs   D both differ
-     *   E could not run   S excluded by the host oracle */
+     *   E could not run   S excluded by the host oracle
+     *   N the guest's bash disagreed with ITSELF -- undecidable */
     emit("[oilspec] MAP legend P=pass O=stdout-diff X=exit-diff D=both "
-         "T=timeout E=broken S=skipped\n");
+         "T=timeout E=broken S=skipped N=oracle-nondet\n");
     for (int i = 0; i < g_ncases; i += MAP_COLS) {
         char chunk[MAP_COLS + 1];
         int n = g_ncases - i;
@@ -847,8 +920,9 @@ int main(void) {
               recreated_a, recreated_b);
 
     emitf("[OILSPEC] VERDICT: %s %d/%d pass fail=%d skipped=%d broken=%d "
+          "oracle-nondet=%d "
           "(stdout+exit must match GNU bash 5.2 exactly)\n",
           fail == 0 && broken == 0 ? "PASS" : "FAIL",
-          pass, decided, fail, skip, broken);
+          pass, decided, fail, skip, broken, nondet);
     return (fail == 0 && broken == 0) ? 0 : 1;
 }
