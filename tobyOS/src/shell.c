@@ -5605,6 +5605,7 @@ struct shell_scan {
     int  nest;          /* open `$( )`, `${ }`, `$(( ))`, backticks */
     char nest_kind[16]; /* per level: c=$( ) v=${ } a=$(( )) p=( ) b=`` */
     bool in_sq, in_dq;  /* a quote left open INSIDE that nesting */
+    bool nest_sq[16], nest_dq[16];  /* the quote state each nesting suspended */
     int  in_case;       /* open `case ... esac` INSIDE that nesting */
     bool in_case_in;    /* ...and its `in` is still owed */
     bool in_case_pat;   /* ...and a pattern may start, so `(`/`)` are its own */
@@ -5977,6 +5978,27 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         if (sq) { if (d == '\'') sq = false; p++; continue; }
         if (dq) {
             if (d == '\\' && p[1]) { p += 2; continue; }
+            /* A SUBSTITUTION INSIDE DOUBLE QUOTES IS STILL A SUBSTITUTION.
+             *
+             *     echo "[$(esc "that's it")]"
+             *
+             * Walking to the next `"` treated the one before `that's` as the
+             * closing quote, so the apostrophe opened a single-quoted span
+             * that never ended and the reader swallowed the following line.
+             * What is inside `$( )` is parsed as a COMMAND, with its own
+             * quote state -- pushed here and restored when it closes. */
+            if (d == '$' && p[1] == '(') {
+                if (nest < (int)sizeof st->nest_kind) {
+                    st->nest_kind[nest] = 'c';
+                    st->nest_sq[nest] = sq;
+                    st->nest_dq[nest] = dq;
+                }
+                sq = false;
+                dq = false;
+                nest++;
+                p += 2;
+                continue;
+            }
             if (d == '"') dq = false;
             p++;
             continue;
@@ -6009,8 +6031,22 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             continue;
         }
         if (d == '$' && (p[1] == '(' || p[1] == '{')) {
-            if (nest < (int)sizeof st->nest_kind)
+            /* A SUBSTITUTION HAS ITS OWN QUOTE STATE.
+             *
+             *     echo "[$(esc "that's it")]"
+             *
+             * What is inside `$( )` is parsed as a COMMAND, so the `"` before
+             * `that's` opens a string there rather than closing the one
+             * outside -- and the apostrophe is inside it, not the start of a
+             * quote. Carrying one flat quote state across the boundary left a
+             * single quote open, so the reader swallowed the next line
+             * looking for its partner. */
+            if (nest < (int)sizeof st->nest_kind) {
                 st->nest_kind[nest] = (p[1] == '{') ? 'v' : 'c';
+                st->nest_sq[nest] = sq;
+                st->nest_dq[nest] = dq;
+            }
+            if (p[1] == '(') { sq = false; dq = false; }
             nest++;
             p += 2;
             continue;
@@ -6049,6 +6085,13 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 nest++;
             } else if (d == ')' || d == '}') {
                 nest--;
+                /* Leaving the substitution restores the quote state it
+                 * suspended -- see the note where it was pushed. */
+                if (nest >= 0 && nest < (int)sizeof st->nest_kind &&
+                    st->nest_kind[nest] == 'c') {
+                    sq = st->nest_sq[nest];
+                    dq = st->nest_dq[nest];
+                }
             }
             p++;
             continue;
