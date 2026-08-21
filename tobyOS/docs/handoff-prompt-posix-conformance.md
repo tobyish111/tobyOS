@@ -14,7 +14,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 | gate | command | state | time |
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **83/83** | ~4 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **89/89** | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -142,14 +142,25 @@ bash's column.
 readonly/export, wait/kill, cd/CDPATH, trap, introspection) found five more
 divergences, all closed: bare `read`→REPLY, `declare -r`/`-x` reinput forms,
 kill's missing-pid status, the trap listing's SIG prefix, `set -h`/hash.
-getopts' full silent-mode contract and CDPATH were already right. Walked so
-far: set options, umask, read, getopts, readonly, export, wait, kill, cd,
-trap, command, type, hash, times. Still unwalked from the §3 list: `alias`
-reinput printing, `fc`, `ulimit` operands, `newgrp`, and the XCU 2 sections
-beyond what the corpus covers (notably 2.13 pattern classes like
-`[[:alpha:]]`, and `shift n` past `$#`). Two cases print paths: the runner
-gives bash and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case
-may never print an absolute path — strip `$PWD` prefixes the way
+getopts' full silent-mode contract and CDPATH were already right.
+
+**Leg three (cc176b8, cases 83–88):** alias reinput, shift/break/continue
+counts, XCU 2.13.1 character classes (case AND glob), ulimit operands,
+dot-script return, `fc -l` on empty history. Five of six were already
+right; the one fix was ulimit's malformed-value status (1, not 2 — bash
+keeps 2 for unknown flags). Host-oracle trap recorded there: MSYS bash
+refuses `ulimit -f 100` where guest bash accepts it — only the gate's own
+bash column decides ulimit lines.
+
+Walked so far: set options, umask, read, getopts, readonly, export, wait,
+kill, cd, trap, command, type, hash, times, alias/unalias, shift,
+break/continue, pattern classes, dot/return, fc(-l), ulimit. Not walked:
+`newgrp` (external in practice, not in the initrd), interactive-only
+surfaces (fc editing, ignoreeof EOF, monitor's job-control semantics —
+still the one substantial remainder), and the long tail of XCU 2 the
+corpus already covers piecemeal. Case-writing law: the runner gives bash
+and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
+never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
 
 ---
