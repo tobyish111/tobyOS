@@ -215,7 +215,7 @@ static int run_shell(const char *shell, char *const argv[],
  * difference visible: a missing line, an extra line, or a changed one. Bounded,
  * so a wholly divergent case cannot flood the serial log. */
 
-#define DIFF_MAX_LINES 14
+#define DIFF_MAX_LINES 24
 
 /* Copy line `want` (0-based) of `buf` into `out`, escaping control characters.
  * Returns -1 if that line does not exist -- itself information, since it says

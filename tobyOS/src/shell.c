@@ -5559,6 +5559,16 @@ static int shell_line_incomplete(const char *s) {
                 p++;
                 continue;
             }
+            if (*p == '`') {
+                /* the same separate world -- see the scanner */
+                p++;
+                while (*p && *p != '`') {
+                    if (*p == '\\' && p[1]) p++;
+                    p++;
+                }
+                if (!*p) break;
+                continue;
+            }
             if (*p == '"') in_dq = false;
             continue;
         }
@@ -6045,6 +6055,27 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 dq = false;
                 nest++;
                 p += 2;
+                continue;
+            }
+            /* A BACKTICK INSIDE DOUBLE QUOTES IS A SEPARATE LEXICAL WORLD.
+             *
+             *     echo "123 `[[ $(echo \\" > $file) ]]` 456"
+             *
+             * bash removes one layer of backslashes inside `` before parsing
+             * what is left, so the `\\` there is ONE backslash and the `"`
+             * after it is escaped -- it does not close the string. Tracking
+             * quotes through the region reached the opposite conclusion, so
+             * the outer string looked closed, the trailing `"` opened a new
+             * one, and the line was never complete. Skipping to the matching
+             * backtick sidesteps the layering entirely: whatever is in there
+             * is the inner command's business, not this string's. */
+            if (d == '`') {
+                p++;
+                while (*p && *p != '`') {
+                    if (*p == '\\' && p[1]) p++;   /* \` does not close it */
+                    p++;
+                }
+                if (*p == '`') p++;
                 continue;
             }
             if (d == '"') dq = false;
