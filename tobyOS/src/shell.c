@@ -1621,8 +1621,11 @@ static bool shell_hosted_builtin(const char *name) {
         /* Implemented in the table above but absent from this list, so
          * /bin/tsh sent them to a PATH lookup and reported
          * "failed to launch '/bin/ulimit'". They are builtins in bash and in
-         * the kernel shell; the hosted build simply never admitted it. */
-        "ulimit", "fc", "getconf", "logname", "pathchk", "newgrp",
+         * the kernel shell; the hosted build simply never admitted it.
+         * newgrp is NOT here: bash has no newgrp builtin (ksh does), and the
+         * kernel stub shadowing the real /bin/newgrp was exactly the
+         * builtin-shares-a-name-not-a-behaviour sin described above. */
+        "ulimit", "fc", "getconf", "logname", "pathchk",
         /* bash spells these as builtins too, and the corpus uses them for
          * plain `NAME=VALUE` with an export or readonly attribute. */
         "declare", "typeset", "compgen",
@@ -2181,6 +2184,38 @@ static void cmd_compgen(int argc, char **argv) {
         if (argv[i][0] == '-' && argv[i][1]) continue;
         word = argv[i];
     }
+    /* `compgen -A user [WORD]`: the names in /etc/passwd, in file order,
+     * filtered to those beginning with WORD -- what the guest's bash
+     * answers now that a passwd database exists. */
+    if (strcmp(type, "user") == 0) {
+        void *buf = 0;
+        size_t sz = 0;
+        bool printed = false;
+        size_t wl = strlen(word);
+        if (vfs_read_all("/etc/passwd", &buf, &sz) == VFS_OK) {
+            const char *p = (const char *)buf, *end = p + sz;
+            while (p < end) {
+                const char *line = p;
+                while (p < end && *p != '\n') p++;
+                const char *eol = p;
+                if (p < end) p++;
+                const char *c = line;
+                while (c < eol && *c != ':') c++;
+                size_t nl = (size_t)(c - line);
+                char nb[64];
+                if (nl == 0 || nl + 1 > sizeof nb) continue;
+                if (nl < wl || memcmp(line, word, wl) != 0) continue;
+                memcpy(nb, line, nl);
+                nb[nl] = '\0';
+                shell_printf("%s\n", nb);
+                printed = true;
+            }
+            kfree(buf);
+        }
+        shell_set_status(printed ? 0 : 1);
+        return;
+    }
+
     if (strcmp(type, "file") != 0 && strcmp(type, "directory") != 0) {
         shell_set_status(1);
         return;
@@ -7364,8 +7399,13 @@ static void cmd_command(int argc, char **argv) {
                 found = true;
             }
             if (found) continue;
-            for (const struct cmd *c = cmds; c->name; c++) {
-                if (strcmp(argv[i], c->name) == 0) {
+            /* Classify through shell_cmd_lookup, not the raw table: the
+             * hosted build's allow-list is part of what "is a builtin"
+             * MEANS there, and scanning cmds[] made `command -v newgrp`
+             * claim a builtin the hosted shell would never run. */
+            {
+                const struct cmd *c = shell_cmd_lookup(argv[i]);
+                if (c) {
                     if (verbose && shell_special_builtin_name(c->name)) {
                         shell_printf("%s is a special shell builtin\n",
                                      argv[i]);
@@ -7375,14 +7415,17 @@ static void cmd_command(int argc, char **argv) {
                                      argv[i]);
                     }
                     found = true;
-                    break;
                 }
             }
             if (found) continue;
             char path_buf[64];
             const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
             if (path_is_file(path)) {
-                shell_printf(verbose ? "%s is %s\n" : "%s\n", argv[i], path);
+                /* `command -v` answers with the PATH it resolved, not the
+                 * name it was asked about -- `command -v newgrp` is
+                 * /bin/newgrp in every shell. */
+                if (verbose) shell_printf("%s is %s\n", argv[i], path);
+                else         shell_printf("%s\n", path);
             } else {
                 rc = 1;
             }
@@ -7452,15 +7495,17 @@ static void cmd_type(int argc, char **argv) {
         }
         if (found) continue;
 
-        for (const struct cmd *c = cmds; c->name; c++) {
-            if (strcmp(argv[i], c->name) == 0) {
+        /* Same rule as `command -v`: the hosted allow-list decides what
+         * `type` may call a builtin. */
+        {
+            const struct cmd *c = shell_cmd_lookup(argv[i]);
+            if (c) {
                 if (shell_special_builtin_name(c->name)) {
                     shell_printf("%s is a special shell builtin\n", argv[i]);
                 } else {
                     shell_printf("%s is a shell builtin\n", argv[i]);
                 }
                 found = true;
-                break;
             }
         }
         if (found) continue;
@@ -9067,14 +9112,14 @@ static void cmd_pathchk(int argc, char **argv) {
     shell_set_status(rc);
 }
 
-/* POSIX `newgrp [group]`: change the real group ID. tobyOS has users but no
- * supplementary-group database to switch between, so this reports that rather
- * than pretending to succeed -- a script that relies on the change would
- * otherwise carry on with the wrong privileges. */
+/* KERNEL-SHELL `newgrp` stub. The real POSIX newgrp is /bin/newgrp (it
+ * changes the gid and EXECS a fresh shell, which a kernel thread cannot do
+ * to itself); /bin/tsh reaches it through the PATH like bash does. This
+ * stub exists only for the kernel console, where exec-replace is
+ * impossible, and says so instead of pretending. */
 static void cmd_newgrp(int argc, char **argv) {
-    (void)argv;
-    kprintf("newgrp: no group database on this system%s\n",
-            argc > 1 ? "" : "");
+    (void)argc; (void)argv;
+    kprintf("newgrp: cannot replace the kernel shell; use /bin/newgrp from a userspace shell\n");
     shell_set_status(1);
 }
 
@@ -10690,6 +10735,49 @@ static int shell_parse_braced_name(const char *expr, size_t *name_len) {
 
 static bool shell_glob_match(const char *pat, const char *name);
 
+/* `~user` needs the home directory from /etc/passwd -- the SAME FILE the
+ * guest's bash consults, which is what makes the two shells agree. bash
+ * does NOT stat the directory: a passwd entry expands whether or not the
+ * path exists, and a name with no entry stays exactly as written.
+ * Returns 0 with the home in `out`, -1 for an unknown name. */
+static int shell_passwd_home(const char *name, size_t nlen,
+                             char *out, size_t cap) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (nlen == 0 || vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK)
+        return -1;
+    const char *p = (const char *)buf, *end = p + sz;
+    int rc = -1;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        const char *eol = p;
+        if (p < end) p++;
+        /* name:pass:uid:gid:gecos:HOME:shell -- home is field 5 */
+        if ((size_t)(eol - line) <= nlen || line[nlen] != ':' ||
+            memcmp(line, name, nlen) != 0)
+            continue;
+        int field = 0;
+        const char *f = line, *home = 0, *home_end = 0;
+        for (const char *q = line; q <= eol; q++) {
+            if (q == eol || *q == ':') {
+                if (field == 5) { home = f; home_end = q; }
+                field++;
+                f = q + 1;
+            }
+        }
+        if (home && home_end > home &&
+            (size_t)(home_end - home) + 1 <= cap) {
+            memcpy(out, home, (size_t)(home_end - home));
+            out[home_end - home] = '\0';
+            rc = 0;
+        }
+        break;
+    }
+    kfree(buf);
+    return rc;
+}
+
 /* TILDE EXPANSION INSIDE A `${x-word}` DEFAULT.
  *
  *     HOME=/home/bar ; x=~:${undef-~:~} ; echo $x
@@ -10697,8 +10785,8 @@ static bool shell_glob_match(const char *pat, const char *name);
  *
  * A tilde expands at the START of the word and after each `:`, which is the
  * same rule an assignment's value follows -- and the word of a `-`/`=`/`+`
- * expansion is expanded as if it were one. Only `~` alone or `~/...` counts;
- * `~user` needs a user database this shell does not have. */
+ * expansion is expanded as if it were one. `~user` resolves through
+ * /etc/passwd now that the repo ships one; an unknown name stays literal. */
 static void shell_word_tilde(char *w, size_t cap) {
     const char *hm = env_get("HOME");
     if (!hm || !*hm) hm = "/";
@@ -10706,11 +10794,21 @@ static void shell_word_tilde(char *w, size_t cap) {
     size_t o = 0;
     bool seg_start = true;
     for (size_t i = 0; w[i]; i++) {
-        if (seg_start && w[i] == '~' &&
-            (w[i + 1] == '\0' || w[i + 1] == '/' || w[i + 1] == ':')) {
-            for (const char *h = hm; *h && o + 1 < sizeof out; h++) out[o++] = *h;
-            seg_start = false;
-            continue;
+        if (seg_start && w[i] == '~') {
+            size_t j = i + 1;
+            while (w[j] && w[j] != '/' && w[j] != ':') j++;
+            const char *rep = 0;
+            char hb[VFS_PATH_MAX];
+            if (j == i + 1) rep = hm;
+            else if (shell_passwd_home(w + i + 1, j - (i + 1),
+                                       hb, sizeof hb) == 0) rep = hb;
+            if (rep) {
+                for (const char *h = rep; *h && o + 1 < sizeof out; h++)
+                    out[o++] = *h;
+                i = j - 1;
+                seg_start = false;
+                continue;
+            }
         }
         if (o + 1 < sizeof out) out[o++] = w[i];
         seg_start = (w[i] == ':');
@@ -13053,26 +13151,14 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
         home = env_get("HOME");
         if (!home || !*home) home = "/";
     } else {
-        char uname[64];
         size_t ulen = (size_t)(slash - (word + 1));
-        if (ulen + 1 > sizeof(uname)) return 0;
-        memcpy(uname, word + 1, ulen);
-        uname[ulen] = '\0';
-        /* In this kernel, all users live under /home/<user> */
+        /* ~name resolves through /etc/passwd -- the file the guest's bash
+         * reads -- and is NOT stat'ed: a passwd entry expands whether or
+         * not the directory exists. `echo ~nonexistent` stays exactly as
+         * written in every shell; the old /home/<name> guess both invented
+         * homes and missed real ones (root's is /root). */
         static char ubuf[VFS_PATH_MAX];
-        size_t n = 0;
-        const char *pfx = "/home/";
-        while (*pfx && n + 1 < sizeof(ubuf)) ubuf[n++] = *pfx++;
-        for (size_t i = 0; i < ulen && n + 1 < sizeof(ubuf); i++)
-            ubuf[n++] = uname[i];
-        ubuf[n] = '\0';
-        /* ~name EXPANDS ONLY IF THE USER EXISTS. `echo ~nonexistent` prints
-         * `~nonexistent` in every shell -- an unknown name is not an error and
-         * not a path, it is left exactly as written. tsh handed back
-         * /home/nonexistent, inventing a home directory for a user that has
-         * none. */
-        struct vfs_stat hst;
-        if (vfs_stat(ubuf, &hst) != VFS_OK || hst.type != VFS_TYPE_DIR)
+        if (shell_passwd_home(word + 1, ulen, ubuf, sizeof ubuf) != 0)
             return 0;
         home = ubuf;
     }

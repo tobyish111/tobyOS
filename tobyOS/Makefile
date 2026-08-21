@@ -512,6 +512,8 @@ PROGRAMS := programs/awk/awk.elf \
             programs/sh/sh.elf \
             programs/shparity/shparity.elf \
             programs/oilspec/oilspec.elf \
+            programs/id/id.elf \
+            programs/newgrp/newgrp.elf \
             programs/spechelp/spechelp.elf \
             programs/tsh/tsh.elf \
             programs/devmgr/devmgr.elf \
@@ -1590,6 +1592,12 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
 # under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
 # byte-identical stdout plus an identical exit status. See programs/shparity.
 $(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
+
+# /bin/id and /bin/newgrp -- POSIX identity utilities. newgrp changes the
+# real/effective gid (checked against /etc/group membership) and execs a
+# fresh shell; id is its observer. Both read /etc/passwd + /etc/group.
+$(eval $(call LIBTOBY_PROGRAM_RULES,id,id))
+$(eval $(call LIBTOBY_PROGRAM_RULES,newgrp,newgrp))
 # /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
 # as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
 # rather than the 54 cases we wrote ourselves. See programs/oilspec.
@@ -2880,6 +2888,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 # programs/sh/sh.elf here, which had a parser but almost no expansion layer
 # and scored 0/14 against real bash. /bin/sh (programs/user_sh) is untouched.
 	cp programs/tsh/tsh.elf                         $(INITRD_STAGE)/bin/tsh
+	cp programs/id/id.elf                           $(INITRD_STAGE)/bin/id
+	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
+	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
+	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
@@ -3480,7 +3492,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
-	    bin/kill                                                          \
+	    bin/kill bin/id bin/newgrp                                        \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
@@ -3506,6 +3518,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
+	    etc/passwd etc/group \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    etc/shparity/*.sh \
 	    readme.txt
