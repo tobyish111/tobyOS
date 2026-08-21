@@ -14,7 +14,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 | gate | command | state | time |
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **76/76** | ~4 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **83/83** | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -137,6 +137,20 @@ The find was the proof that §3 works: a four-minute probe found four
 mandated behaviours 2,776 third-party cases never exercised. Keep walking
 XCU 2 and the XCU 4 built-ins the same way — one requirement, one case, read
 bash's column.
+
+**Walk progress (9533c92):** seven more probes (cases 76–82: read, getopts,
+readonly/export, wait/kill, cd/CDPATH, trap, introspection) found five more
+divergences, all closed: bare `read`→REPLY, `declare -r`/`-x` reinput forms,
+kill's missing-pid status, the trap listing's SIG prefix, `set -h`/hash.
+getopts' full silent-mode contract and CDPATH were already right. Walked so
+far: set options, umask, read, getopts, readonly, export, wait, kill, cd,
+trap, command, type, hash, times. Still unwalked from the §3 list: `alias`
+reinput printing, `fc`, `ulimit` operands, `newgrp`, and the XCU 2 sections
+beyond what the corpus covers (notably 2.13 pattern classes like
+`[[:alpha:]]`, and `shift n` past `$#`). Two cases print paths: the runner
+gives bash and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case
+may never print an absolute path — strip `$PWD` prefixes the way
+`80-cd-details.sh` does.
 
 ---
 
