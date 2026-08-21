@@ -5531,6 +5531,17 @@ static void shell_normalise_separators(char *s) {
  * caller must also drop), 0 when the line stands on its own. */
 static int shell_line_incomplete(const char *s) {
     bool in_sq = false, in_dq = false, esc = false;
+    /* A SUBSTITUTION HAS ITS OWN QUOTE STATE HERE TOO.
+     *
+     *     echo "[$(printf "that's")]"
+     *
+     * This is the SECOND quote walker -- the structural scanner learned the
+     * rule and this one had not, so the `"` before `that's` read as the
+     * closing quote, the apostrophe opened a span that never ended, and the
+     * reader glued every following line onto this one. What is inside `$( )`
+     * is a COMMAND with its own quotes; they are suspended and restored. */
+    bool sq_at[16], dq_at[16];
+    int nest = 0;
     for (const char *p = s; *p; p++) {
         esc = false;
         if (in_sq) {
@@ -5539,6 +5550,15 @@ static int shell_line_incomplete(const char *s) {
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '$' && p[1] == '(' && nest < 16) {
+                sq_at[nest] = in_sq;
+                dq_at[nest] = in_dq;
+                nest++;
+                in_sq = false;
+                in_dq = false;
+                p++;
+                continue;
+            }
             if (*p == '"') in_dq = false;
             continue;
         }
@@ -5547,11 +5567,30 @@ static int shell_line_incomplete(const char *s) {
             p++;                                /* escapes the next character */
             continue;
         }
+        if (*p == '$' && p[1] == '(' && nest < 16) {
+            sq_at[nest] = in_sq;
+            dq_at[nest] = in_dq;
+            nest++;
+            in_sq = false;
+            in_dq = false;
+            p++;
+            continue;
+        }
+        if (*p == ')' && nest > 0) {
+            nest--;
+            in_sq = sq_at[nest];
+            in_dq = dq_at[nest];
+            continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         if (*p == '#' && (p == s || is_space(p[-1]))) break;   /* comment */
     }
     if (in_sq || in_dq) return 1;
+    /* A substitution left open keeps whatever quote it suspended open too:
+     * `echo "$(foo` is still an unterminated string. */
+    for (int i = 0; i < nest; i++)
+        if (sq_at[i] || dq_at[i]) return 1;
     return esc ? 2 : 0;
 }
 
@@ -9812,36 +9851,75 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
     int case_open = 0;
     bool case_want_in = false;
     bool case_pat = false;
+    /* A NESTED SUBSTITUTION HAS ITS OWN QUOTE STATE -- the third place that
+     * has to know it, after the structural scanner and the line reader.
+     *
+     *     echo "[$(echo "$(printf "it's")")]"
+     *
+     * Walking a double-quoted run to the NEXT `"` left the matcher outside
+     * quotes in the middle of the inner substitution, so the apostrophe read
+     * as an opening single quote and swallowed the rest of the line: the
+     * whole command produced nothing at all. Quotes are tracked a character
+     * at a time now, and each `$(` suspends the pair it was found inside. */
+    bool in_sq = false, in_dq = false;
+    bool sq_at[16], dq_at[16];
     while (*p) {
-        if (*p == '\'') {
+        if (in_sq) {
+            if (*p == '\'') in_sq = false;
             if (pos + 1 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
-            while (*p && *p != '\'') {
-                if (pos + 1 >= cmd_cap) return -1;
+            continue;
+        }
+        if (in_dq) {
+            if (*p == '\\' && p[1]) {
+                if (pos + 2 >= cmd_cap) return -1;
                 cmd[pos++] = *p++;
-            }
-            if (*p == '\'') {
-                if (pos + 1 >= cmd_cap) return -1;
                 cmd[pos++] = *p++;
+                continue;
             }
+            if (p[0] == '$' && p[1] == '(') {
+                if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
+                in_sq = false;
+                in_dq = false;
+                depth++;
+                if (pos + 2 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+                cmd[pos++] = *p++;
+                continue;
+            }
+            if (*p == '"') in_dq = false;
+            if (pos + 1 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            continue;
+        }
+        if (*p == '\\' && p[1]) {
+            /* AN ESCAPED QUOTE DOES NOT OPEN ONE.
+             *
+             *     echo "x $(echo \\"hi\\")"      ->  x "hi"
+             *
+             * Inside `$( )` the text is a command, so `\\"` is a literal
+             * double quote. Copying the backslash and then letting the `"`
+             * set the flag left the matcher inside a string that never ended,
+             * and it ran past the `)` that closes the substitution. */
+            if (pos + 2 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            cmd[pos++] = *p++;
+            continue;
+        }
+        if (*p == '\'') {
+            in_sq = true;
+            if (pos + 1 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
             continue;
         }
         if (*p == '"') {
+            in_dq = true;
             if (pos + 1 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
-            while (*p && *p != '"') {
-                if (p[0] == '$' && p[1] == '(') depth++;
-                if (*p == ')' && depth > 1) depth--;
-                if (pos + 1 >= cmd_cap) return -1;
-                cmd[pos++] = *p++;
-            }
-            if (*p == '"') {
-                if (pos + 1 >= cmd_cap) return -1;
-                cmd[pos++] = *p++;
-            }
             continue;
         }
         if (p[0] == '$' && p[1] == '(') {
+            if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
             depth++;
             if (pos + 2 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
@@ -9889,6 +9967,7 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
          * `$(` was counted, while every `)` decremented, so `$( (echo x) )`
          * ended at the subshell's own paren and left a stray `)` in the word. */
         if (*p == '(') {
+            if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
             depth++;
             if (pos + 1 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
@@ -9896,6 +9975,10 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
         }
         if (*p == ')') {
             depth--;
+            if (depth > 0 && depth < 16) {
+                in_sq = sq_at[depth];        /* back to the quote it suspended */
+                in_dq = dq_at[depth];
+            }
             if (depth == 0) {
                 p++;
                 cmd[pos] = '\0';
