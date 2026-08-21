@@ -6,9 +6,9 @@ it is not "how the code works" — it is **how to find out what is actually true
 because in this arc reading the source has produced confident wrong answers over
 and over, and measuring has not.
 
-Current state: **POSIX 1274/1280 = 99.5%** (711 = 55.5% at the start of the
-arc; 1196 = 93.4% three sessions ago). Bash-parity gate **67/67 -- a full
-pass**, and the corpus has no tsh timeouts left. BASH-ONLY 344/1481, up from
+Current state: **POSIX 1278-1280/1280 = 99.8-100%** (711 = 55.5% at the start of the
+arc; 1196 = 93.4% three sessions ago). Bash-parity gate **73/73 -- a full
+pass**, and the corpus has no tsh timeouts left. BASH-ONLY ~345/1481, up from
 233: `[[ ]]`, `(( ))`, brace expansion, globstar and namerefs all landed on
 the way through.
 
@@ -217,64 +217,38 @@ or the hosted link fails.
 
 ---
 
-## 5. What is left: SIX
+## 5. What is left: ONE FAMILY, and it is a coin flip
 
-| id | what | status |
-|---|---|---|
-| 1888 1893 | `s=$(printf '..')` loses the byte | **the marker collision** -- diagnosed to the byte, fix attempted and reverted, below |
-| 1394 | `echo "123 \`[[ $(echo \\" > $f) ]]\` 456"` | bash's own backtick/quote nesting, below |
-| 1894 | `escape_arg` loop | **not diagnosed**; the last line of the case ends up as an ARGUMENT of the line before it |
-| 2272 2273 | a backgrounded child's output vs the parent's | races, below |
+    2272   echo word_a & echo word_b       bash: word_b   tsh: word_a
+                                                 word_a         word_b
+    2273   echo word_a & echo word_b &
 
-1274/1280 = 99.5%, moving by about two between identical runs because of
-the races.
+Both lines are PRESENT in both shells. What differs is which comes first,
+and that is the scheduler's answer, not the shell's. Three consecutive
+unchanged runs scored 1279, 1278 and 1279 out of 1280, and the only cases
+moving were these two.
 
-### The marker collision -- PROVED, and the obvious fix does not work
+**bash is not a contract here.** Across runs on this box bash produced 2273
+in BOTH orders. Its recorded answer is whatever its child happened to do
+that day.
 
-    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
-    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 3
-    printf '..' > f ; wc -c < f        both: 3
+**The one deterministic story that would match both was tried and reverted.**
+2272 wants the PARENT's line first; 2273 wants the FIRST CHILD's line first.
+bash gets both only because its child has job-control and signal setup to do
+before it reaches the command, so the parent's bare `echo` beats it while the
+parent's second `fork` does not. Making tsh's forked child yield once pinned
+2272 to bash's order and cost 2273 as well as 0488 -- where `kill -HUP $!`
+then lands on a child that has actually started, so `wait` reports 129 where
+bash reports 0. Net loss, measured, reverted.
 
-So printf is fine and the pipe is fine: the byte is lost between the
-CAPTURE and the stored variable, and only for 0x01, 0x02 and 0x03 --
-`SHELL_ARG_MARK`, `SHELL_NOSPLIT_MARK` and `SHELL_GLOB_ESC`, the in-band
-markers the word buffer carries.
+Making the child wait until the parent finished the line WOULD be
+deterministic and would match all three. It also means `sleep 10 & work`
+does not start the sleep until `work` is done, which is the opposite of what
+`&` is for. Not done, deliberately.
 
-**Proof that the collision is the whole cause:** move the three #defines
-to 0x11/0x12/0x13 and the case passes, 68/68 with the probe in. That is a
-diagnostic, NOT a fix -- it relocates the bug to three other bytes.
-
-**What was tried and reverted:** escaping a colliding data byte with
-GLOB_ESC as it enters the word buffer, plus teaching the strip and test
-helpers to skip an escape and the byte after it. Two versions:
-  * the capture path only -- the probe still failed, and the escape never
-    even reached the buffer for `s=$(...)`, which was not chased down;
-  * all nineteen data-append sites -- gained NOTHING and cost 1889, 2545,
-    2546 and 2547, all `$@`-with-empty-parameters and `read`. Escaping
-    interacts with the ARG_MARK boundary logic, where two adjacent marks
-    are meaningful.
-
-Whoever picks this up: the collision is certain, the mechanism is
-certain, and the fix has to handle the boundary semantics of ARG_MARK
-rather than treating all three markers alike. Probe first with
-`printf '..'` under shparity -- four minutes a round.
-
-### 1394 -- bash's parse, not ours
-
-`echo "123 \`[[ $(echo \\" > $file) ]]\` 456"` has a `\` inside double
-quotes (an escaped backslash) followed by a `"` that therefore CLOSES the
-string, mid-backtick, mid-substitution. Reproducing bash's answer means
-reproducing bash's nesting model exactly. Nothing else in the corpus
-depends on it.
-
-### The races
-
-`a & b` turns on whether the backgrounded child writes before the parent
-does. bash wins consistently for a structural reason: its child has
-already parsed the command, while tsh's child re-parses the text it was
-handed. Making the parent sleep would "fix" them and would be a lie.
-
----
+So: 1280/1280 is reachable on a lucky run and 1278 on an unlucky one, and
+the difference is not a shell bug. Everything else in the POSIX subset
+passes.
 
 ## 6. Rules to work by
 
