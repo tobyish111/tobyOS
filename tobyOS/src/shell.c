@@ -286,6 +286,10 @@ static bool g_opt_ignoreeof;
 /* `set -o nolog`: keep function definitions out of command history. bash's
  * own man page says "currently ignored"; accepted state, no behaviour. */
 static bool g_opt_nolog;
+/* POSIX `set -h` (bash: hashall), ON by default like bash. tsh's PATH walk
+ * does not keep a hash table, so the flag's one visible effect is the one
+ * bash shows a script: `hash -r` fails while hashing is off. */
+static bool g_opt_hashall = true;
 static bool g_opt_expand_aliases;
 /* True for a terminal session, false while running a script or `-c`. The
  * kernel shell is always a terminal session, so this defaults true and only
@@ -1698,15 +1702,17 @@ static bool shell_name_is_valid(const char *s, size_t n) {
 }
 
 static void shell_print_export_entry(const char *entry) {
+    /* bash's reinput form is `declare -x`, not `export`, and the gate greps
+     * lines out of this against bash's own output. */
     size_t klen = env_key_len(entry);
     if (entry[klen] == '=') {
         char name[64];
         if (klen + 1 > sizeof(name)) return;
         memcpy(name, entry, klen);
         name[klen] = '\0';
-        shell_printf("export %s=\"%s\"\n", name, entry + klen + 1);
+        shell_printf("declare -x %s=\"%s\"\n", name, entry + klen + 1);
     } else {
-        shell_printf("export %s\n", entry);
+        shell_printf("declare -x %s\n", entry);
     }
 }
 
@@ -2238,7 +2244,8 @@ static void cmd_readonly(int argc, char **argv) {
         for (int i = 0; i < SHELL_READONLY_MAX; i++) {
             if (!g_readonly[i]) continue;
             const char *v = env_get(g_readonly[i]);
-            shell_printf("readonly %s", g_readonly[i]);
+            /* bash's reinput form, same reason as shell_print_export_entry. */
+            shell_printf("declare -r %s", g_readonly[i]);
             if (v) shell_printf("=\"%s\"", v);
             shell_printf("\n");
         }
@@ -2309,6 +2316,7 @@ static bool shell_set_opt(char c, bool on) {
     case 'n': g_opt_noexec = on; return true;
     case 'a': g_opt_allexport = on; return true;
     case 'm': g_opt_monitor = on; return true;
+    case 'h': g_opt_hashall = on; return true;
     default: return false;
     }
 }
@@ -2321,6 +2329,7 @@ static bool shell_set_opt(char c, bool on) {
 static void shell_print_options(bool reinput) {
     const struct { const char *name; bool on; } t[] = {
         { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
+        { "hashall",   g_opt_hashall },
         { "ignoreeof", g_opt_ignoreeof }, { "monitor",   g_opt_monitor },
         { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
         { "noglob",    g_opt_noglob },    { "nolog",     g_opt_nolog },
@@ -2341,7 +2350,7 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         {"errexit", 'e'}, {"nounset", 'u'}, {"xtrace", 'x'},
         {"noglob", 'f'}, {"verbose", 'v'}, {"noclobber", 'C'},
         {"notify", 'b'}, {"noexec", 'n'}, {"allexport", 'a'},
-        {"monitor", 'm'},
+        {"monitor", 'm'}, {"hashall", 'h'},
     };
     if (strcmp(name, "pipefail")  == 0) { g_opt_pipefail  = on; return true; }
     if (strcmp(name, "ignoreeof") == 0) { g_opt_ignoreeof = on; return true; }
@@ -2375,6 +2384,7 @@ static bool shell_option_is_set(const char *name) {
     if (strcmp(name, "monitor")   == 0) return g_opt_monitor;
     if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
     if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
+    if (strcmp(name, "hashall")   == 0) return g_opt_hashall;
     return false;
 }
 
@@ -2920,11 +2930,11 @@ static void cmd_read(int argc, char **argv) {
         first++;
         if (consumed_arg) first++;
     }
-    if (first >= argc) {
-        kprintf("usage: read [-r] NAME [NAME...]\n");
-        shell_set_status(2);
-        return;
-    }
+    /* No NAME operands: the line goes to REPLY, whole -- no field
+     * splitting, no IFS trimming. tsh called it a usage error, which the
+     * standard walk caught: `read` alone is how a script takes a line
+     * verbatim. */
+    bool reply_mode = (first >= argc);
 
     struct file *tmp_console = 0;
     struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
@@ -2957,13 +2967,16 @@ static void cmd_read(int argc, char **argv) {
         return;
     }
     if (!got_any) {
-        (void)shell_read_assign_empty(argc, argv, first);
+        if (reply_mode) (void)env_set("REPLY", "");
+        else (void)shell_read_assign_empty(argc, argv, first);
         shell_set_status(1);
         return;
     }
 
-    int rc = shell_read_assign_fields(argc, argv, first, linebuf,
-                                      raw ? 0 : escmap);
+    int rc = reply_mode
+        ? (env_set("REPLY", linebuf) < 0 ? 1 : 0)
+        : shell_read_assign_fields(argc, argv, first, linebuf,
+                                   raw ? 0 : escmap);
     /* Fields are assigned either way; the status reports that input ran
      * out mid-line, which is what stops a `while read` loop. */
     shell_set_status(rc ? rc : (rr == 1 ? 1 : 0));
@@ -6737,7 +6750,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
 
 struct shell_opt_frame {
     bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
-    bool monitor, ignoreeof, nolog;
+    bool monitor, ignoreeof, nolog, hashall;
 };
 
 static void shell_save_opts(struct shell_opt_frame *f) {
@@ -6753,6 +6766,7 @@ static void shell_save_opts(struct shell_opt_frame *f) {
     f->monitor   = g_opt_monitor;
     f->ignoreeof = g_opt_ignoreeof;
     f->nolog     = g_opt_nolog;
+    f->hashall   = g_opt_hashall;
 }
 
 static void shell_restore_opts(const struct shell_opt_frame *f) {
@@ -6768,6 +6782,7 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_monitor   = f->monitor;
     g_opt_ignoreeof = f->ignoreeof;
     g_opt_nolog     = f->nolog;
+    g_opt_hashall   = f->hashall;
 }
 
 static void shell_reset_opts(void) {
@@ -6775,6 +6790,7 @@ static void shell_reset_opts(void) {
     g_opt_noglob = g_opt_verbose = g_opt_noclobber = false;
     g_opt_notify = g_opt_noexec = g_opt_allexport = false;
     g_opt_monitor = g_opt_ignoreeof = g_opt_nolog = false;
+    g_opt_hashall = true;               /* bash's default state is ON */
 }
 
 static void cmd_sh(int argc, char **argv) {
@@ -7185,9 +7201,12 @@ static void cmd_trap(int argc, char **argv) {
             if (!g_traps[i]) continue;
             const char *name = shell_trap_name(i);
             if (!name) continue;
+            /* bash prints real signals with the SIG prefix (SIGUSR1, not
+             * USR1); the pseudo-conditions EXIT and ERR carry none. */
+            bool pseudo = (i == 0 || i == SHELL_TRAP_ERR);
             shell_printf("trap -- ");
             shell_print_quoted_trap_action(g_traps[i]);
-            shell_printf(" %s\n", name);
+            shell_printf(" %s%s\n", pseudo ? "" : "SIG", name);
         }
         return;
     }
@@ -8648,7 +8667,13 @@ static void cmd_hash(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
-        shell_printf("hash: table cleared\n");
+        /* bash prints NOTHING on a successful clear -- the old "table
+         * cleared" chat landed in the compared stdout -- and refuses the
+         * clear entirely while hashing is off (`set +h`). */
+        if (!g_opt_hashall) {
+            kprintf("hash: hashing disabled\n");
+            shell_set_status(1);
+        }
         return;
     }
     if (argc <= 1) {
@@ -8759,7 +8784,12 @@ static void cmd_kill(int argc, char **argv) {
             continue;
         }
         if (neg) pid = -pid;
-        signal_send_to_pid(pid, sig);
+        /* The send must REPORT a pid that does not exist -- tsh returned 0
+         * for `kill 999999` where every shell answers 1. */
+        if (signal_send_to_pid_checked(pid, sig) != 0) {
+            kprintf("kill: (%d) - No such process\n", pid);
+            shell_set_status(1);
+        }
     }
 }
 
@@ -10355,6 +10385,7 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
         if (g_opt_notify)    opts[oi++] = 'b';
         if (g_opt_errexit)   opts[oi++] = 'e';
         if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_hashall)   opts[oi++] = 'h';
         if (g_opt_monitor)   opts[oi++] = 'm';
         if (g_opt_noexec)    opts[oi++] = 'n';
         if (g_opt_nounset)   opts[oi++] = 'u';
@@ -11559,6 +11590,7 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         if (g_opt_notify)    opts[oi++] = 'b';
         if (g_opt_errexit)   opts[oi++] = 'e';
         if (g_opt_noglob)    opts[oi++] = 'f';
+        if (g_opt_hashall)   opts[oi++] = 'h';
         if (g_opt_monitor)   opts[oi++] = 'm';
         if (g_opt_noexec)    opts[oi++] = 'n';
         if (g_opt_nounset)   opts[oi++] = 'u';

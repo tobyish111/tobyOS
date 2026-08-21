@@ -177,6 +177,9 @@ void signal_set_foreground(int pid);
 /* Send a signal. Safe from IRQ context. */
 void signal_send(struct proc *p, int sig);
 void signal_send_to_pid(int pid, int sig);
+/* Same, but reports a pid that does not exist: 0 on delivery, -1 if there
+ * is no such process. The shell's `kill` needs the answer for its status. */
+int  signal_send_to_pid_checked(int pid, int sig);
 void signal_send_to_foreground(int sig);
 
 /* Check and deliver pending signals from an IRQ (PIT) context, where no

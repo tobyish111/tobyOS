@@ -581,6 +581,7 @@ uint64_t perf_now_ns(void) {
 int kbd_trygetc(void) { return -1; }
 
 void signal_send_to_pid(int pid, int sig) { (void)kill(pid, sig); }
+int signal_send_to_pid_checked(int pid, int sig) { return kill(pid, sig); }
 
 /* ---- main --------------------------------------------------------------- */
 
