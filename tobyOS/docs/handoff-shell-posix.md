@@ -6,7 +6,7 @@ it is not "how the code works" — it is **how to find out what is actually true
 because in this arc reading the source has produced confident wrong answers over
 and over, and measuring has not.
 
-Current state: **POSIX 1278-1280/1280 = 99.8-100%** (711 = 55.5% at the start of the
+Current state: **POSIX 1278/1278 = 100.0%** (711 = 55.5% at the start of the
 arc; 1196 = 93.4% three sessions ago). Bash-parity gate **73/73 -- a full
 pass**, and the corpus has no tsh timeouts left. BASH-ONLY ~345/1481, up from
 233: `[[ ]]`, `(( ))`, brace expansion, globstar and namerefs all landed on
@@ -217,38 +217,59 @@ or the hosted link fails.
 
 ---
 
-## 5. What is left: ONE FAMILY, and it is a coin flip
+## 5. What is left: NOTHING THE GATE CAN DECIDE
 
-    2272   echo word_a & echo word_b       bash: word_b   tsh: word_a
-                                                 word_a         word_b
-    2273   echo word_a & echo word_b &
+**POSIX 1278/1278 = 100.0%**, three consecutive runs, zero failures.
 
-Both lines are PRESENT in both shells. What differs is which comes first,
-and that is the scheduler's answer, not the shell's. Three consecutive
-unchanged runs scored 1279, 1278 and 1279 out of 1280, and the only cases
-moving were these two.
+Two to four cases per run are EXCLUDED, and the reason is measured, not
+assumed. In the guest, 20 runs of each under bash:
 
-**bash is not a contract here.** Across runs on this box bash produced 2273
-in BOTH orders. Its recorded answer is whatever its child happened to do
-that day.
+    bash  `echo word_a & echo word_b`     word_a first 8, word_b first 12
+    bash  `echo word_a & echo word_b &`   word_a 10, word_b 8, NO OUTPUT 2
 
-**The one deterministic story that would match both was tried and reverted.**
-2272 wants the PARENT's line first; 2273 wants the FIRST CHILD's line first.
-bash gets both only because its child has job-control and signal setup to do
-before it reaches the command, so the parent's bare `echo` beats it while the
-parent's second `fork` does not. Making tsh's forked child yield once pinned
-2272 to bash's order and cost 2273 as well as 0488 -- where `kill -HUP $!`
-then lands on a child that has actually started, so `wait` reports 129 where
-bash reports 0. Net loss, measured, reverted.
+bash is racing its own backgrounded child. The order is a coin flip and it
+loses the line entirely about one run in ten. No shell can match that -- bash
+cannot match itself -- so the gate was asking tsh to guess a coin.
 
-Making the child wait until the parent finished the line WOULD be
-deterministic and would match all three. It also means `sleep 10 & work`
-does not start the sleep until `work` is done, which is the opposite of what
-`&` is for. Not done, deliberately.
+The runner now re-asks the oracle before a mismatch counts: on a
+POSIX-classified mismatch it runs bash up to eight more times, and if bash
+disagrees with ITSELF the case is excluded as undecidable. That is the same
+rule the host classifier has always applied (two host bash runs that differ
+make a case UNUSABLE); it had never been applied to the guest.
 
-So: 1280/1280 is reachable on a lucky run and 1278 on an unlucky one, and
-the difference is not a shell bug. Everything else in the POSIX subset
-passes.
+Which cases get excluded MOVES between runs -- 2271, 2272, 2273, 0488 have
+all appeared -- because it depends on which race fires. All four are
+backgrounded-output or signal-delivery timing.
+
+### Do not weaken this screen, and do not widen it
+
+It is deliberately narrow: POSIX-classified cases only, and only ones that
+have ALREADY mismatched, so it can never convert a pass into anything. Every
+exclusion prints both bash outputs and is named in the report.
+
+**It is validated against a KNOWN-BAD build.** With a deliberate `echo`
+corruption a 26-case band scored 6/26 = 23.1% and twenty cases were reported
+as real failures; the screen took only the three background races. If you
+change it, re-run that check -- a gate verified only against a passing run
+has not been verified. (This project has made that exact mistake before, in
+`logs/cwwebgl.sh`.)
+
+### What was tried on the shell side first, and why it is not there
+
+Making tsh deterministic does not help: matching a deterministic tsh against
+a 50/50 bash still fails half the time. And the two cases want opposite
+things -- 2272 wants the PARENT's line first, 2273 wants the FIRST CHILD's.
+A single yield in the forked child pins 2272 and breaks 2273 and 0488.
+Measured, reverted. The only shell-side change that would work is making a
+background child wait for the parent's line to finish, which would stop
+`sleep 10 & work` from starting the sleep until `work` ended. Not done.
+
+The real shell-side bug in this family WAS found and fixed (b918b0e):
+tobyOS never reparents orphans in the initial namespace, so a backgrounded
+child that had not been scheduled when the script ended never ran at all and
+its output was lost outright. A non-interactive shell now waits for its
+background jobs. tsh no longer loses the line that bash still drops 1 run
+in 10.
 
 ## 6. Rules to work by
 
