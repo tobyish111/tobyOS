@@ -13,8 +13,8 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 
 | gate | command | state | time |
 |---|---|---|---|
-| Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 1278/1278 = 100.0%** | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **73/73** | ~4 min |
+| Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **76/76** | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -32,36 +32,47 @@ touched. They are still broken. See §4.
 
 ---
 
-## 2. Your primary task: score against The Open Group's VSC/VSU
+## 2. Your primary task: score against The Open Group's VSC
 
-This is what was asked for. **Do the availability check FIRST and report before
-spending a session on it.**
+This is what was asked for. **The availability check has been done
+(2026-08-21). Do not redo it — act on it.** What was measured, with sources:
 
-What is believed, and what you must verify rather than assume:
+- The suite behind POSIX shell-and-utilities *certification* today is
+  **VSC-PCTS2016** (IEEE Std 1003.1-2017, Shell and Utilities —
+  opengroup.org/testing/testsuites/vscpcts2016.htm). It is not a public
+  download, but it is not fee-gated for this project either: The Open Group
+  grants a **twelve-month free license to open source projects**, requested by
+  emailing `conformance@opengroup.org`. It is also free to organizations
+  submitting for certification (get.posixcertified.ieee.org). VSU — named in
+  an earlier draft of this file — is the UNIX-extensions suite for the UNIX
+  brand, the wrong target for this arc; VSC-PCTS is the one.
+- **The blocking step is human, not research: the user must send that email
+  and accept the license.** You cannot fetch the suite, and you must not fill
+  in license requests or sign anything on the user's behalf. Note that
+  eligibility rides on the project being open source — surface that to the
+  user, offer a draft email once, then get on with §3 while the answer is
+  pending.
+- **VSC 5.1.1L**, a lite subset (77 utilities, POSIX.2-1992), is advertised as
+  a free Open-Source-licensed download at
+  `pubs.opengroup.org/onlinepubs/064999999/` — but the tarball link is
+  **dead**: `VSC511AL.t.Z` 404s live, has 404'd in the Wayback Machine since
+  at least 2024-09 with no archived copy, and no mirror was found. The User's
+  Guide, Release Notes, and licence on that page are live and worth reading
+  for the suite's shape. If a copy ever surfaces it is a real Open Group
+  suite, but a score on it is "VSC 5.1.1L, POSIX.2-1992 subset" — never bare
+  "VSC", never certification.
 
-- The Open Group's verification suites — **VSC** (Verification Suite for
-  Commands), **VSU**, VSX, VSTH — are the suites behind UNIX/POSIX
-  *certification*. They are understood to be **licensed products, not public
-  downloads**: historically a signed agreement and a fee, delivered as source
-  to the licensee.
-- If that is still true, you **cannot** obtain them autonomously, and you must
-  say so plainly rather than substituting something else and calling it VSC.
+If and when the real suite arrives: vendor it under `third_party/` the way
+`oils-spec` is vendored, build a runner in the shape of
+`programs/oilspec/main.c`, and score it. Expect it to assume a full hosted
+UNIX: it will exercise utilities, not just the shell, and it will find kernel
+and libc gaps as readily as shell gaps. Budget for that; do not silently
+narrow the suite to the parts that pass.
 
-So, in order:
-
-1. **Establish obtainability.** Check The Open Group's current distribution
-   terms. Report: obtainable / licensed-only / superseded-by-something. One
-   short answer with a source.
-2. **If obtainable** — vendor it under `third_party/` the way `oils-spec` is
-   vendored, build a runner in the shape of `programs/oilspec/main.c`, and
-   score it. Expect it to assume a full hosted UNIX: it will exercise
-   utilities, not just the shell, and it will find kernel and libc gaps as
-   readily as shell gaps. Budget for that; do not silently narrow the suite to
-   the parts that pass.
-3. **If licensed-only** — say so, do not fake it, and fall back to §3. Do not
-   describe any substitute as "VSC" or as "certification". The user has been
-   explicit that they want the real thing; the honest answer that it is not
-   reachable is worth more than a lookalike.
+Until then, §3 is the work. Do not describe any substitute as "VSC" or as
+"certification". The user has been explicit that they want the real thing; the
+honest answer that it is pending a license grant is worth more than a
+lookalike.
 
 **Never report a score for a suite you did not actually run.** This project has
 a documented history of harnesses that measured the previous build, measured
@@ -71,11 +82,11 @@ all of them.
 
 ---
 
-## 3. The fallback that is actually reachable: walk the standard
+## 3. The path that is reachable today: walk the standard
 
-If VSC/VSU is out of reach, the defensible path to a conformance claim is to
-derive the cases from the specification text rather than from someone else's
-test suite.
+While VSC-PCTS is pending a license grant — or if the grant never comes — the
+defensible path to a conformance claim is to derive the cases from the
+specification text rather than from someone else's test suite.
 
 The source is the **Open Group Base Specifications (IEEE Std 1003.1)**, which
 is publicly readable. The two parts that matter:
@@ -107,24 +118,25 @@ VSC and do not report it as shell conformance.
 
 ---
 
-## 4. Known-broken right now — start here, they are cheap
+## 4. The first four gaps — FIXED (e792650), and what they proved
 
-Measured in the guest, not inferred. All four are POSIX-required and all four
-were invisible to the third-party corpus:
+All four POSIX-required behaviours the corpus never touched are closed, each
+with a parity case (`73-umask-symbolic`, `74-set-silent-options`,
+`75-set-monitor`): `umask -S`/`-p` with bash's full flag/operand matrix,
+`set -o ignoreeof` (wired at the hosted interactive EOF, the one place it is
+observable), `set -o nolog` (accepted state; bash's manual itself says
+"currently ignored"), and `set -o monitor`/`set -m`.
 
-| requirement | tsh today |
-|---|---|
-| `set -o ignoreeof` | rejected |
-| `set -o monitor` | rejected |
-| `set -o nolog` | rejected |
-| `umask -S` | `umask: '-S': invalid mode` |
+**Still open from this batch:** monitor is the OPTION only — accepted,
+tracked, in `$-` and both listings. Per-job process groups and prompt-time
+job-status reporting are not implemented; scope them before starting, and
+remember the trap: cases that pin the ORDER of concurrent background children
+flap — assert presence, pin order with `wait`.
 
-`umask -S` is the sharpest: symbolic output is mandated, it is trivially
-testable, and nothing in 2,776 cases exercised it. `set -o monitor` is the
-substantial one — it implies job control, so scope it before starting.
-
-These are the proof that §3 is worth doing. Fix them with a regression case
-each, then keep walking.
+The find was the proof that §3 works: a four-minute probe found four
+mandated behaviours 2,776 third-party cases never exercised. Keep walking
+XCU 2 and the XCU 4 built-ins the same way — one requirement, one case, read
+bash's column.
 
 ---
 
@@ -182,7 +194,8 @@ Report the claim at the strength the evidence supports, and no higher:
   a hand-written POSIX XCU mapping" — defensible today.
 - "POSIX compliant" — needs the standard walked systematically, and even then
   is a statement about *tested* behaviour.
-- "POSIX certified" — needs VSC/VSU and The Open Group. Do not imply it.
+- "POSIX certified" — needs VSC-PCTS run under The Open Group's certification
+  program. Do not imply it.
 
 If the walk finds gaps you cannot close, list them. A short accurate list of
 what fails is worth more than a percentage that hides it.
