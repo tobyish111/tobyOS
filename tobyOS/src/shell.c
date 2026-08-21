@@ -88,6 +88,13 @@ extern volatile struct limine_module_request module_req;
  * shell text can only have been put there by the tokenizer, and only where
  * the source really was quoted. */
 #define SHELL_GLOB_ESC '\x03'
+/* Escapes a DATA byte that happens to equal one of the three markers above.
+ * A byte value of its own rather than reusing SHELL_GLOB_ESC: the escape has
+ * to be invisible to every scan that reads the markers, and SHELL_GLOB_ESC is
+ * itself all over ordinary words (every quoted metacharacter carries one), so
+ * teaching those scans to step over IT changed the answer for words that had
+ * no collision in them. 0x04 appears only where this puts it. */
+#define SHELL_DATA_ESC '\x04'
 #define ARG_MAX  32
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
@@ -346,6 +353,8 @@ static void shell_case_unquote(char *pat, size_t cap);
 static char *shell_unquoted_newline(char *s);
 static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
+static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
+                                 const char *sv);
 static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
 static bool shell_word_has(const char *word, char c);
 static const char *shell_skip_blanks(const char *s);
@@ -9913,7 +9922,7 @@ static int shell_expand_command_subst(const char **pp, char *buf,
     int crc = shell_capture_command(cmd, out, sizeof(out));
     g_dq_depth = saved_dq;
     if (crc < 0) return -1;
-    return shell_append_str(buf, pos, cap, out);
+    return shell_append_data_str(buf, pos, cap, out);
 }
 
 static int shell_expand_backtick(const char **pp, char *buf,
@@ -9983,6 +9992,53 @@ static bool shell_var_char(char c) {
     return shell_var_start(c) || (c >= '0' && c <= '9');
 }
 
+/* ---- DATA THAT LOOKS LIKE A MARKER --------------------------------- *
+ *
+ *     s=$(printf '.\001.') ; echo ${#s}      bash: 3   tsh: 2
+ *
+ * The word buffer carries three in-band markers -- SHELL_ARG_MARK (0x01),
+ * SHELL_NOSPLIT_MARK (0x02) and SHELL_GLOB_ESC (0x03) -- and a byte that
+ * arrives from an EXPANSION is data, not structure. A captured 0x01 was read
+ * as a `$@` field boundary and eaten by the splitter, so the byte vanished
+ * and the string came out one shorter. Moving the markers out of the way
+ * would only relocate the problem onto three other bytes.
+ *
+ * So the markers keep their values and a data byte that collides is escaped
+ * with SHELL_GLOB_ESC on the way in. That escape is the one the globber
+ * already understands and that shell_strip_glob_escapes already removes at
+ * the end of word processing, so the raw byte comes back out for free -- what
+ * this needs is for every marker SCAN in between to step over an escaped byte
+ * instead of reading it as a mark. Those are marked "escape-aware" below.
+ *
+ * Only expansion OUTPUT goes through here. A marker the tokenizer put in
+ * deliberately is appended with shell_append_str as before. */
+static int shell_append_data_n(char *buf, size_t *pos, size_t cap,
+                               const char *sv, size_t n) {
+    if (!sv) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = sv[i];
+        if (c == SHELL_ARG_MARK || c == SHELL_NOSPLIT_MARK ||
+            c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) {
+            if (shell_append_char(buf, pos, cap, SHELL_DATA_ESC) < 0) return -1;
+        }
+        if (shell_append_char(buf, pos, cap, c) < 0) return -1;
+    }
+    return 0;
+}
+
+static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
+                                 const char *sv) {
+    if (!sv) return 0;
+    for (const char *q = sv; *q; q++) {
+        if (*q == SHELL_ARG_MARK || *q == SHELL_NOSPLIT_MARK ||
+            *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) {
+            if (shell_append_char(buf, pos, cap, SHELL_DATA_ESC) < 0) return -1;
+        }
+        if (shell_append_char(buf, pos, cap, *q) < 0) return -1;
+    }
+    return 0;
+}
+
 /* "$@" has to survive quoting as SEPARATE words -- that is the entire reason
  * it exists, and why `wrapper "$@"` is how every script forwards arguments
  * containing spaces. Expansion produces flat text, though, so there is
@@ -10020,7 +10076,8 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
                 return -1;
-            if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+            if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+                return -1;
         }
         return 0;
     }
@@ -10045,24 +10102,31 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
                 return -1;
-            if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+            if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+                return -1;
         }
         return 0;
     }
 
     for (int i = 0; i < g_positional_count; i++) {
         if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
-        if (shell_append_str(buf, pos, cap, g_positional[i]) < 0) return -1;
+        if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+            return -1;
     }
     return 0;
 }
 
+/* `is_join` reports a `$@`/`$*` value: one whose SHELL_ARG_MARKs are
+ * structure rather than data. Everything else comes back as raw bytes, which
+ * is what the pattern operators and ${#x} want to work on -- so the escaping
+ * happens at the append, and only for the values that are not joins. */
 static int shell_parameter_value(const char *name, char *out, size_t cap,
-                                 bool *is_set) {
+                                 bool *is_set, bool *is_join) {
     size_t pos = 0;
     if (!name || !out || cap == 0 || !is_set) return -1;
     out[0] = '\0';
     *is_set = true;
+    if (is_join) *is_join = false;
 
     int rc = -1;
     if (strcmp(name, "?") == 0) {
@@ -10091,8 +10155,10 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
         opts[oi] = '\0';
         rc = shell_append_str(out, &pos, cap, opts);
     } else if (strcmp(name, "*") == 0) {
+        if (is_join) *is_join = true;
         rc = shell_append_positional_join(out, &pos, cap, true);
     } else if (strcmp(name, "@") == 0) {
+        if (is_join) *is_join = true;
         rc = shell_append_positional_join(out, &pos, cap, false);
     } else if (name[0] >= '0' && name[0] <= '9') {
         int idx = 0;
@@ -10318,8 +10384,15 @@ static int shell_expand_literal_quotes(const char *word, char *out, size_t cap) 
  * in a program's argv. */
 static void shell_strip_nosplit(char *dst, size_t cap, const char *src) {
     size_t o = 0;
-    for (const char *p = src; *p && o + 1 < cap; p++)
+    for (const char *p = src; *p && o + 1 < cap; p++) {
+        /* escape-aware: carry the pair on for shell_strip_glob_escapes */
+        if (*p == SHELL_DATA_ESC && p[1] && o + 2 < cap) {
+            dst[o++] = *p++;
+            dst[o++] = *p;
+            continue;
+        }
         if (*p != SHELL_NOSPLIT_MARK) dst[o++] = *p;
+    }
     dst[o] = '\0';
 }
 
@@ -10336,15 +10409,20 @@ static void shell_strip_glob_escapes(char *s);
 static void shell_strip_nosplit_inplace(char *s) {
     if (!s) return;
     char *w = s;
-    for (const char *r = s; *r; r++)
+    for (const char *r = s; *r; r++) {
+        /* escape-aware: carry the pair through for the escape strip below */
+        if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
         if (*r != SHELL_NOSPLIT_MARK) *w++ = *r;
+    }
     *w = '\0';
     shell_strip_glob_escapes(s);
 }
 
 static bool shell_has_nosplit(const char *s) {
-    for (const char *p = s; *p; p++)
+    for (const char *p = s; *p; p++) {
+        if (*p == SHELL_DATA_ESC && p[1]) { p++; continue; }   /* escape-aware */
         if (*p == SHELL_NOSPLIT_MARK) return true;
+    }
     return false;
 }
 
@@ -10514,6 +10592,11 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                 size_t o = 0;
                 bool prot = false;
                 for (const char *q = patraw; *q && o + 2 < sizeof patbuf; q++) {
+                    if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
+                        patbuf[o++] = *q++;
+                        patbuf[o++] = *q;
+                        continue;
+                    }
                     if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
                     if (prot && (*q == '*' || *q == '?' || *q == '[' ||
                                  *q == ']' || *q == '\\'))
@@ -10526,8 +10609,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
 
             char value[SHELL_PARSE_BUF_MAX];
             bool is_set = false;
-            if (shell_parameter_value(name, value, sizeof(value),
-                                      &is_set) < 0) {
+            bool vjoin = false;
+            if (shell_parameter_value(name, value, sizeof(value), &is_set,
+                                      &vjoin) < 0) {
                 kprintf("shell: parameter expansion too long\n");
                 return -1;
             }
@@ -10543,32 +10627,45 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                         memcpy(tmp, value, i);
                         tmp[i] = '\0';
                         if (shell_glob_match(pattern, tmp))
-                            return shell_append_str(buf, pos, cap, value + i);
+                            return vjoin
+                                ? shell_append_str(buf, pos, cap, value + i)
+                                : shell_append_data_str(buf, pos, cap,
+                                                        value + i);
                     }
                 } else {
                     for (size_t i = 0; i <= vlen; i++) {
                         memcpy(tmp, value, i);
                         tmp[i] = '\0';
                         if (shell_glob_match(pattern, tmp))
-                            return shell_append_str(buf, pos, cap, value + i);
+                            return vjoin
+                                ? shell_append_str(buf, pos, cap, value + i)
+                                : shell_append_data_str(buf, pos, cap,
+                                                        value + i);
                     }
                 }
             } else {
                 if (greedy) {
                     for (size_t i = 0; i <= vlen; i++) {
                         if (shell_glob_match(pattern, value + i))
-                            return shell_append_n(buf, pos, cap, value, i);
+                            return vjoin
+                                ? shell_append_n(buf, pos, cap, value, i)
+                                : shell_append_data_n(buf, pos, cap, value, i);
                     }
                 } else {
                     for (size_t i = vlen; i > 0; i--) {
                         if (shell_glob_match(pattern, value + i))
-                            return shell_append_n(buf, pos, cap, value, i);
+                            return vjoin
+                                ? shell_append_n(buf, pos, cap, value, i)
+                                : shell_append_data_n(buf, pos, cap, value, i);
                     }
                     if (shell_glob_match(pattern, value))
-                        return shell_append_n(buf, pos, cap, value, 0);
+                        return vjoin
+                            ? shell_append_n(buf, pos, cap, value, 0)
+                            : shell_append_data_n(buf, pos, cap, value, 0);
                 }
             }
-            return shell_append_str(buf, pos, cap, value);
+            return vjoin ? shell_append_str(buf, pos, cap, value)
+                         : shell_append_data_str(buf, pos, cap, value);
         }
         if (*op == ':') {
             colon = true;
@@ -10585,7 +10682,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
 
     char value[SHELL_PARSE_BUF_MAX];
     bool is_set = false;
-    if (shell_parameter_value(name, value, sizeof(value), &is_set) < 0) {
+    bool is_join = false;
+    if (shell_parameter_value(name, value, sizeof(value), &is_set,
+                              &is_join) < 0) {
         kprintf("shell: parameter expansion too long\n");
         return -1;
     }
@@ -10613,6 +10712,8 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
          * space -- which is why counting them decides this. */
         size_t marks = 0, text = 0;
         for (const char *nz = value; *nz; nz++) {
+            /* escape-aware: an escaped byte is data however it looks */
+            if (*nz == SHELL_DATA_ESC && nz[1]) { nz++; text++; continue; }
             if (*nz == SHELL_ARG_MARK)     { marks++; continue; }
             if (*nz == SHELL_NOSPLIT_MARK) continue;
             text++;
@@ -10621,7 +10722,15 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     }
 
     if (length_mode) {
-        return shell_append_uint(buf, pos, cap, (unsigned long)strlen(value));
+        /* ${#x} COUNTS CHARACTERS, AND AN ESCAPE IS NOT ONE. A value that
+         * reached here through an expansion may carry SHELL_DATA_ESC in front
+         * of a byte that collides with a marker; strlen would count both. */
+        size_t vlen = 0;
+        for (const char *q = value; *q; q++) {
+            if (*q == SHELL_DATA_ESC && q[1]) q++;
+            vlen++;
+        }
+        return shell_append_uint(buf, pos, cap, (unsigned long)vlen);
     }
 
     if (opch == '\0') {
@@ -10629,7 +10738,8 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             kprintf("%s: unbound variable\n", name);
             return -1;
         }
-        return shell_append_str(buf, pos, cap, value);
+        return is_join ? shell_append_str(buf, pos, cap, value)
+                       : shell_append_data_str(buf, pos, cap, value);
     }
 
     bool missing = !is_set || (colon && is_null);
@@ -10671,14 +10781,18 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
 
     switch (opch) {
     case '-':
-        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (!missing)
+            return is_join ? shell_append_str(buf, pos, cap, value)
+                           : shell_append_data_str(buf, pos, cap, value);
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         return shell_append_str(buf, pos, cap, expanded_word);
     case '=':
-        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (!missing)
+            return is_join ? shell_append_str(buf, pos, cap, value)
+                           : shell_append_data_str(buf, pos, cap, value);
         if (!shell_var_start(name[0])) {
             kprintf("shell: cannot assign to special parameter\n");
             return -1;
@@ -10693,7 +10807,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         }
         return shell_append_str(buf, pos, cap, expanded_word);
     case '?':
-        if (!missing) return shell_append_str(buf, pos, cap, value);
+        if (!missing)
+            return is_join ? shell_append_str(buf, pos, cap, value)
+                           : shell_append_data_str(buf, pos, cap, value);
         if (shell_expand_param_word(word, expanded_word,
                                     sizeof(expanded_word)) < 0) return -1;
         kprintf("shell: %s: %s\n", name,
@@ -11260,7 +11376,8 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
                                     g_param0 ? g_param0 : "tobysh");
         }
         if (idx <= g_positional_count) {
-            return shell_append_str(buf, pos, cap, g_positional[idx - 1]);
+            return shell_append_data_str(buf, pos, cap,
+                                        g_positional[idx - 1]);
         }
         return 0;
     }
@@ -11356,7 +11473,7 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         kprintf("%s: unbound variable\n", name);
         return -1;
     }
-    return shell_append_str(buf, pos, cap, val);
+    return shell_append_data_str(buf, pos, cap, val);
 }
 
 static bool g_tok_word_expanded;
@@ -12520,7 +12637,7 @@ static void shell_strip_glob_escapes(char *s) {
     if (!s) return;
     char *w = s;
     for (const char *r = s; *r; r++) {
-        if (*r == SHELL_GLOB_ESC && r[1]) r++;
+        if ((*r == SHELL_GLOB_ESC || *r == SHELL_DATA_ESC) && r[1]) r++;
         *w++ = *r;
     }
     *w = '\0';
@@ -12530,7 +12647,10 @@ static void shell_strip_glob_escapes(char *s) {
 static bool shell_has_glob(const char *s) {
     if (!s) return false;
     for (; *s; s++) {
-        if (*s == SHELL_GLOB_ESC && s[1]) { s++; continue; }
+        if ((*s == SHELL_GLOB_ESC || *s == SHELL_DATA_ESC) && s[1]) {
+            s++;
+            continue;
+        }
         if (*s == '*' || *s == '?' || *s == '[') return true;
     }
     return false;
@@ -12608,7 +12728,8 @@ static bool shell_glob_bracket(const char **pp, char c) {
          * `[\\\\[z]` is the set { '[', 'z' }. Both spellings appear -- a case
          * pattern is escaped with a real backslash by shell_case_unquote, an
          * ordinary word with SHELL_GLOB_ESC by the tokenizer. */
-        if ((*p == '\\' || *p == SHELL_GLOB_ESC) && p[1]) {
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
+            p[1]) {
             p++;
             if (*p == c) matched = true;
             p++;
@@ -12641,7 +12762,8 @@ static bool shell_glob_match(const char *pat, const char *name) {
          * string `*`, not everything. shell_case_unquote() strips the quotes
          * and escapes what was inside them, so the distinction between `*` and
          * `"*"` reaches here instead of being lost with the quotes. */
-        if ((*pat == '\\' || *pat == SHELL_GLOB_ESC) && pat[1]) {
+        if ((*pat == '\\' || *pat == SHELL_GLOB_ESC ||
+             *pat == SHELL_DATA_ESC) && pat[1]) {
             if (*name != pat[1]) return false;
             pat += 2;
             name++;
@@ -13198,7 +13320,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
      * whether a `=` in the NAME position was quoted; see arg_noassign. */
     bool has_esc = false;
     for (const char *e = word; *e; e++)
-        if (*e == SHELL_GLOB_ESC) { has_esc = true; break; }
+        if (*e == SHELL_GLOB_ESC || *e == SHELL_DATA_ESC) {
+            has_esc = true;
+            break;
+        }
     if (has_esc && cur->argc < 32) {
         const char *e = word;
         while ((*e >= 'A' && *e <= 'Z') || (*e >= 'a' && *e <= 'z') ||
@@ -13262,7 +13387,10 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
  * carried none and should take the normal path, -1 on error. */
 /* Does the word carry `$@` field markers? */
 static bool shell_word_has_argmark(const char *s) {
-    for (; s && *s; s++) if (*s == SHELL_ARG_MARK) return true;
+    for (; s && *s; s++) {
+        if (*s == SHELL_DATA_ESC && s[1]) { s++; continue; }   /* escape-aware */
+        if (*s == SHELL_ARG_MARK) return true;
+    }
     return false;
 }
 
@@ -13275,6 +13403,13 @@ static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap) {
     size_t o = 0;
     bool first = true;
     for (const char *q = src; *q; q++) {
+        /* escape-aware: the pair travels on, to be undone with the rest */
+        if (*q == SHELL_DATA_ESC && q[1]) {
+            if (o + 2 >= cap) return -1;
+            out[o++] = *q++;
+            out[o++] = *q;
+            continue;
+        }
         if (*q == SHELL_NOSPLIT_MARK) continue;
         if (*q == SHELL_ARG_MARK) {
             if (first) { first = false; continue; }
@@ -13293,7 +13428,10 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
                                   struct shell_simple *cur,
                                   const char *word, bool quoted) {
     const char *first = word;
-    while (*first && *first != SHELL_ARG_MARK) first++;
+    while (*first && *first != SHELL_ARG_MARK) {
+        if (*first == SHELL_DATA_ESC && first[1]) first++;     /* escape-aware */
+        first++;
+    }
     if (!*first) return 0;                       /* no marker: normal path */
 
     size_t prefix_len = (size_t)(first - word);
@@ -13303,7 +13441,10 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
     for (const char *p = first; *p == SHELL_ARG_MARK; ) {
         p++;
         const char *start = p;
-        while (*p && *p != SHELL_ARG_MARK) p++;
+        while (*p && *p != SHELL_ARG_MARK) {
+            if (*p == SHELL_DATA_ESC && p[1]) p++;             /* escape-aware */
+            p++;
+        }
         size_t n = (size_t)(p - start);
 
         /* Exactly one marker with NO REAL TEXT after it is the zero-parameter
@@ -13312,8 +13453,10 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
          * them, so testing the raw length saw one byte of trailing mark and
          * emitted an empty argument where bash emits none. */
         size_t real = 0;
-        for (const char *q = start; q < p; q++)
+        for (const char *q = start; q < p; q++) {
+            if (*q == SHELL_DATA_ESC && q + 1 < p) { q++; real++; continue; }
             if (*q != SHELL_NOSPLIT_MARK) real++;
+        }
         size_t real_prefix = 0;
         for (size_t q = 0; q < prefix_len; q++)
             if (word[q] != SHELL_NOSPLIT_MARK) real_prefix++;
@@ -13503,6 +13646,8 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
     while (*p) {
         const char *start = p;
         while (*p) {
+            /* escape-aware: an escaped byte is data, and never a delimiter */
+            if (*p == SHELL_DATA_ESC && p[1]) { p += 2; continue; }
             if (*p == SHELL_NOSPLIT_MARK) { prot = !prot; p++; continue; }
             if (!prot && shell_is_ifs_char(*p)) break;
             p++;
@@ -16725,6 +16870,11 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
                     size_t o = 0;
                     bool prot = false;
                     for (const char *q = xp; *q && o + 2 < sizeof pat; q++) {
+                        if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
+                            pat[o++] = *q++;
+                            pat[o++] = *q;
+                            continue;
+                        }
                         if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
                         if (prot && shell_glob_meta(*q)) pat[o++] = '\\';
                         pat[o++] = *q;
