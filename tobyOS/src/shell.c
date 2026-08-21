@@ -8746,7 +8746,13 @@ static void cmd_kill(int argc, char **argv) {
     }
     int sig = SIGTERM;
     int first = 1;
-    if (strcmp(argv[1], "-l") == 0) {
+    /* `--` ends the options -- `kill -- -123` and `kill -TERM -- -123` are
+     * how a NEGATIVE pid (a process group) gets past option parsing. tsh
+     * fed the literal `--` to the pid parser and errored, which is exactly
+     * what the first monitor-mode case tripped over. */
+    if (strcmp(argv[1], "--") == 0) {
+        first = 2;
+    } else if (strcmp(argv[1], "-l") == 0) {
         if (argc == 2) {
             /* `kill -l` ANSWERS A QUESTION, so its answer belongs on stdout.
              * These went to the diagnostic stream, where `kill -l 134` printed
@@ -8783,7 +8789,7 @@ static void cmd_kill(int argc, char **argv) {
         }
         return;
     }
-    if (strcmp(argv[1], "-s") == 0 && argc > 2) {
+    if (first == 1 && strcmp(argv[1], "-s") == 0 && argc > 2) {
         int num = shell_signal_by_name(argv[2]);
         if (num < 0) {
             kprintf("kill: unknown signal '%s'\n", argv[2]);
@@ -8792,7 +8798,8 @@ static void cmd_kill(int argc, char **argv) {
         }
         sig = num;
         first = 3;
-    } else if (argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+    } else if (first == 1 &&
+               argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
         int v = 0;
         for (const char *p = argv[1] + 1; *p; p++) {
             if (*p < '0' || *p > '9') {
@@ -8804,7 +8811,7 @@ static void cmd_kill(int argc, char **argv) {
         }
         sig = v;
         first = 2;
-    } else if (argv[1][0] == '-' && argv[1][1] != '\0') {
+    } else if (first == 1 && argv[1][0] == '-' && argv[1][1] != '\0') {
         int num = shell_signal_by_name(argv[1] + 1);
         if (num < 0) {
             kprintf("kill: unknown signal '%s'\n", argv[1] + 1);
@@ -8814,6 +8821,8 @@ static void cmd_kill(int argc, char **argv) {
         sig = num;
         first = 2;
     }
+    /* A `--` may also FOLLOW the signal option: `kill -TERM -- -123`. */
+    if (first < argc && strcmp(argv[first], "--") == 0) first++;
     for (int i = first; i < argc; i++) {
         int pid = 0;
         const char *p = argv[i];
@@ -9633,6 +9642,11 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
 
     if (background) {
         g_last_bg_pid = pid;
+        /* `set -m`: a background job leads its own process group, so
+         * `kill -- -$!` reaches the whole job. Foreground jobs stay in the
+         * shell's group -- tsh cannot hand the terminal over (no tcsetpgrp
+         * from userspace), so moving them would detach ^C for nothing. */
+        if (g_opt_monitor) (void)proc_set_pgid(pid, pid);
         int jid = jobs_add(pid, argv[0]);
         if (jid < 0) {
             /* Out of job slots -- still leave the proc running, but warn
@@ -15021,6 +15035,8 @@ static int shell_background_forked(const char *text, const char *label) {
         _exit(st & 0xff);
     }
     g_last_bg_pid = (int)pid;
+    /* `set -m`: same rule as the spawn path -- the job is its own group. */
+    if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
     jobs_add((int)pid, label ? label : text);
     return 0;
 }
@@ -15541,6 +15557,19 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
         int last_pid = 0;
         for (int i = pl->count - 1; i >= 0; i--) {
             if (has_pid[i]) { last_pid = pids[i]; break; }
+        }
+        /* `set -m`: every stage of a background pipeline joins the FIRST
+         * stage's group (the leader), which is what makes kill(-pgid) take
+         * down the whole job. Done after spawn, so there is a short window
+         * where a stage still carries the shell's group -- the same window
+         * a fork+setpgid shell has. */
+        if (g_opt_monitor) {
+            int leader = 0;
+            for (int i = 0; i < pl->count; i++) {
+                if (!has_pid[i]) continue;
+                if (!leader) leader = pids[i];
+                (void)proc_set_pgid(pids[i], leader);
+            }
         }
         if (last_pid) {
             g_last_bg_pid = last_pid;

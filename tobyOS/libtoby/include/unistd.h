@@ -57,6 +57,9 @@ int     link   (const char *oldpath, const char *newpath);
 int     symlink(const char *target, const char *linkpath);
 ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 
+int     setpgid(pid_t pid, pid_t pgid);
+pid_t   getpgid(pid_t pid);
+pid_t   getpgrp(void);
 uid_t   getuid (void);
 int     setuid (uid_t uid);      /* slice 14: real privilege drop */
 int     setgid (gid_t gid);

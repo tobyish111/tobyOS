@@ -376,6 +376,19 @@ int setgid(gid_t gid) {
     return 0;
 }
 
+/* Job control: real process groups (the shell's `set -m`). */
+int setpgid(pid_t pid, pid_t pgid) {
+    long r = toby_sc2(ABI_SYS_SETPGID, (long)pid, (long)pgid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+pid_t getpgid(pid_t pid) {
+    long r = toby_sc1(ABI_SYS_GETPGID, (long)pid);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (pid_t)r;
+}
+pid_t getpgrp(void) { return getpgid(0); }
+
 /* ---- socket API ------------------------------------------------- */
 
 int socket(int domain, int type, int protocol) {

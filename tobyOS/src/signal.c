@@ -230,8 +230,23 @@ void signal_send_to_pid(int pid, int sig) {
 }
 
 void signal_send_to_foreground(int sig) {
-    if (g_foreground_pid > 0) {
+    if (g_foreground_pid <= 0) return;
+    /* A tty signal goes to the foreground JOB, not one pid: ^C must reach
+     * every stage of a foreground pipeline. The single-fg-pid model stays
+     * (nothing else changes who is foreground); delivery just follows the
+     * fg proc's process group when it has one. */
+    struct proc *fg = proc_lookup(g_foreground_pid);
+    int pg = (fg && fg->pgid > 0) ? fg->pgid : 0;
+    if (pg <= 0) {
         signal_send_to_pid(g_foreground_pid, sig);
+        return;
+    }
+    extern struct proc g_proc[];
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pg) signal_send_to_pid(g_proc[i].pid, sig);
     }
 }
 
@@ -920,6 +935,29 @@ int sys_kill(int pid, int sig) {
                 }
             }
         }
+    } else {
+        /* kill(-pgid): the whole process group. This branch DID NOT EXIST
+         * -- a negative pid fell through every arm and returned 0, so
+         * `kill -- -$!` reported success while signalling nobody. ESRCH
+         * when the group has no member the caller can see, like Linux. */
+        int pg = -pid;
+        extern struct proc g_proc[];
+        bool any = false;
+        for (int i = 1; i < PROC_MAX; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+            if (gp != pg) continue;
+            if (!pid_ns_can_see(p, &g_proc[i])) continue;
+            if (sig > 0) {
+                signal_send(&g_proc[i], sig);
+                g_proc[i].sigstate.si_pid[sig] =
+                    pid_vnr_in(g_proc[i].pid_ns, p->pid);
+                g_proc[i].sigstate.si_uid[sig] = p->uid;
+            }
+            any = true;
+        }
+        if (!any) return -3;                        /* ESRCH */
     }
     return 0;
 }

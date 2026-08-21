@@ -582,6 +582,7 @@ int kbd_trygetc(void) { return -1; }
 
 void signal_send_to_pid(int pid, int sig) { (void)kill(pid, sig); }
 int signal_send_to_pid_checked(int pid, int sig) { return kill(pid, sig); }
+int proc_set_pgid(int pid, int pgid) { return setpgid(pid, pgid); }
 
 /* ---- main --------------------------------------------------------------- */
 

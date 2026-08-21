@@ -1025,8 +1025,17 @@ struct abi_vizmap {
 #define ABI_SYS_SETUID          189
 #define ABI_SYS_SETGID          190
 
+/* Job control: real process groups (the shell's `set -m` contract).
+ * SETPGID(pid, pgid) follows POSIX: pid 0 means self, pgid 0 means the
+ * target's own pid. GETPGID(pid), pid 0 for self. Both route into the
+ * same implementation the Linux personality's setpgid/getpgid use --
+ * one process-group model, two ABIs, per the shared-semantics rule
+ * above. */
+#define ABI_SYS_SETPGID         191
+#define ABI_SYS_GETPGID         192
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          191
+#define ABI_SYS_NR_MAX          193
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

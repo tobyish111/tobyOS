@@ -467,6 +467,12 @@ struct proc {
      * the spawn so apps launched from the desktop end up in the
      * correct session. */
     int             session_id;
+    /* POSIX process group (job control). Inherited from the parent at
+     * spawn; a parentless/kernel proc leads its own group. setpgid moves
+     * it, kill(-pgid) fans out over it, and the tty delivers foreground
+     * signals to the whole group. 0 means "never set" and is read as
+     * "own pid" everywhere, so pre-existing code paths stay valid. */
+    int             pgid;
 
     /* User identity (milestone 15). Inherited from the parent in
      * spawn_internal -- so a kernel-spawned proc starts as uid 0/gid 0
@@ -854,6 +860,11 @@ int proc_wait(int pid);
 
 /* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED/EMBRYO. */
 struct proc *proc_lookup(int pid);
+
+/* Assign PID's process group (kernel-trusted; the checked path is the
+ * setpgid syscall). The shell's `set -m` uses this through a host seam:
+ * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
+int proc_set_pgid(int pid, int pgid);
 
 /* Atomically claim a free proc slot (state CAS UNUSED -> EMBRYO). The ONLY
  * way to allocate a slot -- a plain "scan for UNUSED" race is exactly the

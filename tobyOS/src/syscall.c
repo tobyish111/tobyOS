@@ -1576,6 +1576,57 @@ static long sys_getuid(void) {
  * bug rather than a cosmetic inconsistency. */
 static long lx_do_setid(bool is_uid, long id);
 
+/* Process groups, shared by BOTH ABIs for the same drift-avoidance reason
+ * as lx_do_setid. Until this existed LX_setpgid was a stub that RETURNED 0
+ * -- bash's `set -m` was told its process groups existed and none did, and
+ * `kill -- -pgid` succeeded while signalling nobody.
+ *
+ * pgids are kernel-wide ids (the group leader's kpid) and are NOT yet
+ * translated through pid namespaces the way pids are; the initial
+ * namespace -- where every gate and shell runs -- sees identity either
+ * way. A proc whose pgid was never set reads as leading its own group. */
+static int proc_pgid_of(const struct proc *t) {
+    return t->pgid > 0 ? t->pgid : t->pid;
+}
+
+static long lx_do_setpgid(long a1, long a2) {
+    struct proc *me = current_proc();
+    if (!me) return -ABI_ESRCH;
+    int tk = (a1 == 0) ? me->pid : pid_knr((int)a1);
+    if (!tk) return -ABI_ESRCH;
+    struct proc *t = proc_lookup(tk);
+    if (!t) return -ABI_ESRCH;
+    /* Only yourself or your own child, within your session. */
+    if (t != me && t->ppid != me->pid) return -ABI_EPERM;
+    if (t->session_id != me->session_id) return -ABI_EPERM;
+    long pg = (a2 == 0) ? t->pid : a2;
+    if (pg < 0) return -ABI_EINVAL;
+    if (pg != t->pid) {
+        /* Joining a group: it must exist in this session. */
+        extern struct proc g_proc[];
+        bool found = false;
+        for (int i = 0; i < PROC_MAX && !found; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            if (proc_pgid_of(&g_proc[i]) == (int)pg &&
+                g_proc[i].session_id == t->session_id) found = true;
+        }
+        if (!found) return -ABI_EPERM;
+    }
+    t->pgid = (int)pg;
+    return 0;
+}
+
+static long lx_do_getpgid(long a1) {
+    struct proc *me = current_proc();
+    if (!me) return -ABI_ESRCH;
+    if (a1 == 0) return proc_pgid_of(me);
+    int tk = pid_knr((int)a1);
+    struct proc *t = tk ? proc_lookup(tk) : 0;
+    if (!t) return -ABI_ESRCH;
+    return proc_pgid_of(t);
+}
+
 static long sys_getgid(void) {
     struct proc *p = current_proc();
     return p ? (long)userns_cur_gid(p->gid) : 0;
@@ -4257,6 +4308,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return lx_do_setid(true,  a1);
     case SYS_SETGID:
         return lx_do_setid(false, a1);
+    /* Same shared-body rule for process groups: the native shell's
+     * `set -m` and the Linux personality's job control use one model. */
+    case ABI_SYS_SETPGID:
+        return lx_do_setpgid(a1, a2);
+    case ABI_SYS_GETPGID:
+        return lx_do_getpgid(a1);
     case SYS_USERNAME:
         return sys_username((int)a1, (char *)a2, (size_t)a3);
     case SYS_CHMOD:
@@ -10068,13 +10125,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * kill(2). */
         return rvpid;
     }
-    /* Job control: tobyOS has a single global foreground pid, not POSIX
-     * process groups, so accept these as no-ops/identity so the shell's
-     * setup doesn't abort. */
-    case LX_setpgid: return 0;
-    case LX_getpgid:
-    case LX_getpgrp:
-    case LX_setsid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    /* Job control: REAL process groups now (they were accept-and-lie
+     * stubs -- bash's `set -m` was told its groups existed and none did). */
+    case LX_setpgid: return lx_do_setpgid(a1, a2);
+    case LX_getpgid: return lx_do_getpgid(a1);
+    case LX_getpgrp: return lx_do_getpgid(0);
+    case LX_setsid: {
+        /* A new session leads its own group. The session machinery itself
+         * (session_id) is unchanged -- this only stops the pgid lying. */
+        struct proc *me = current_proc();
+        if (me) me->pgid = me->pid;
+        return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    }
 
     /* ---- readlink (B20): backs readlink(/proc/self/exe), realpath, etc. ---- */
     case LX_readlink:                  /* (path, buf, bufsz) */

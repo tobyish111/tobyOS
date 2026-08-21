@@ -623,6 +623,17 @@ static bool build_kstack(struct proc *p) {
  * "fork" -- we always build a fresh PML4 + a fresh user-space image,
  * which keeps the model trivially correct for an MMU-only kernel
  * without a copy-on-write story. */
+/* Kernel-side seam for the shell's `set -m`: assign PID's process group
+ * directly. The kernel shell is trusted context -- the permission checks
+ * live in the syscall path (lx_do_setpgid); the hosted /bin/tsh reaches
+ * the same state through setpgid(2) via its host.c shim. */
+int proc_set_pgid(int pid, int pgid) {
+    struct proc *t = proc_lookup(pid);
+    if (!t) return -1;
+    t->pgid = pgid;
+    return 0;
+}
+
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
                           struct file *fd3, struct file *fd4,
@@ -683,6 +694,11 @@ static int spawn_internal(const char *path, const char *name,
     {
         struct proc *parent = current_proc();
         p->session_id = parent ? parent->session_id : 0;
+        /* Process group: inherited, like the session tag. A parent that
+         * predates the pgid field (or pid 0 itself) reads as leading its
+         * own group. */
+        p->pgid       = (parent && parent->pgid > 0) ? parent->pgid
+                      : (parent ? parent->pid : p->pid);
         p->uid        = parent ? parent->uid        : 0;
         p->gid        = parent ? parent->gid        : 0;
         /* Linux slice 1: umask is inherited, like uid/gid. 0022 for a
