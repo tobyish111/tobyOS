@@ -14,7 +14,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 | gate | command | state | time |
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **89/89** | ~4 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **91/91** | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -152,13 +152,29 @@ keeps 2 for unknown flags). Host-oracle trap recorded there: MSYS bash
 refuses `ulimit -f 100` where guest bash accepts it — only the gate's own
 bash column decides ulimit lines.
 
+**Leg four (35f113a, cases 89–90): newgrp, entirely.** The system now
+ships `/etc/passwd` + `/etc/group`, a real `/bin/newgrp` (membership
+check, setgid, exec of $SHELL; no setgroups in the native ABI so the
+primary gid is the whole story), and `/bin/id` as observer. Shell finds
+along the way: a tsh builtin newgrp stub was SHADOWING the utility (bash
+has no newgrp builtin — dropped from the hosted allow-list);
+`type`/`command -v` now classify through that allow-list; `command -v
+external` answers the resolved path; **shipping /etc/passwd woke `~user`
+up in the guest's bash** — tsh now resolves `~user` through /etc/passwd
+in both tilde sites (no stat, unknown stays literal) and `compgen -A
+user` reads it too. Case 89 documents why parity alone cannot gate an
+external (both columns run the same binary — its expected column and
+byte count are the content check) and why inner shells write to files
+(fd offsets are not shared across the Linux→native exec seam — the
+documented kernel gap, dodged not fixed).
+
 Walked so far: set options, umask, read, getopts, readonly, export, wait,
 kill, cd, trap, command, type, hash, times, alias/unalias, shift,
-break/continue, pattern classes, dot/return, fc(-l), ulimit. Not walked:
-`newgrp` (external in practice, not in the initrd), interactive-only
-surfaces (fc editing, ignoreeof EOF, monitor's job-control semantics —
-still the one substantial remainder), and the long tail of XCU 2 the
-corpus already covers piecemeal. Case-writing law: the runner gives bash
+break/continue, pattern classes, dot/return, fc(-l), ulimit, newgrp, id,
+tilde (~ and ~user). Not walked: interactive-only surfaces (fc editing,
+ignoreeof EOF, monitor's job-control semantics — still the one
+substantial remainder), and the long tail of XCU 2 the corpus already
+covers piecemeal. Case-writing law: the runner gives bash
 and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
 never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
