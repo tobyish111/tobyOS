@@ -8922,8 +8922,10 @@ static void cmd_ulimit(int argc, char **argv) {
             any = true;
         }
         if (!any || *s || over || acc > (unsigned long)(~0ul >> 1)) {
+            /* bash answers 1 for a malformed VALUE (an unknown FLAG is the
+             * usage error that gets 2) -- measured in the guest. */
             kprintf("ulimit: %s: invalid number\n", argv[i]);
-            shell_set_status(2);
+            shell_set_status(1);
             return;
         }
         val = (long)acc;
