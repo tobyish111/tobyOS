@@ -6,7 +6,7 @@ it is not "how the code works" — it is **how to find out what is actually true
 because in this arc reading the source has produced confident wrong answers over
 and over, and measuring has not.
 
-Current state: **POSIX 1273/1280 = 99.5%** (711 = 55.5% at the start of the
+Current state: **POSIX 1274/1280 = 99.5%** (711 = 55.5% at the start of the
 arc; 1196 = 93.4% three sessions ago). Bash-parity gate **67/67 -- a full
 pass**, and the corpus has no tsh timeouts left. BASH-ONLY 344/1481, up from
 233: `[[ ]]`, `(( ))`, brace expansion, globstar and namerefs all landed on
@@ -217,69 +217,62 @@ or the hosted link fails.
 
 ---
 
-## 5. What is left: SEVEN
-
-Run `python logs/oilspec_detail.py` for all of them with diffs.
+## 5. What is left: SIX
 
 | id | what | status |
 |---|---|---|
-| 1888 1893 | `s=$(printf '..')` loses the byte | **the marker collision**, below |
-| 1894 | `escape_arg` loop over `${a#?}` produces nothing | not diagnosed; every piece of it passes on its own |
-| 1394 | `[[` inside backticks inside double quotes, with an escaped quote redirected to a file | not diagnosed |
-| 0932 2271 2272 2273 | whether a backgrounded child's output beats the parent | **races**, below |
+| 1888 1893 | `s=$(printf '..')` loses the byte | **the marker collision** -- diagnosed to the byte, fix attempted and reverted, below |
+| 1394 | `echo "123 \`[[ $(echo \\" > $f) ]]\` 456"` | bash's own backtick/quote nesting, below |
+| 1894 | `escape_arg` loop | **not diagnosed**; the last line of the case ends up as an ARGUMENT of the line before it |
+| 2272 2273 | a backgrounded child's output vs the parent's | races, below |
 
-That is 1273/1280 = 99.5%, and the number moves by about two between
-identical runs because of the races.
+1274/1280 = 99.5%, moving by about two between identical runs because of
+the races.
 
-### The marker collision -- a real bug, deliberately not fixed yet
-
-Measured with a probe, not inferred:
+### The marker collision -- PROVED, and the obvious fix does not work
 
     s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
-    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
-    s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 2
     s=$(printf '..') ; echo ${#s}      bash: 3   tsh: 3
+    printf '..' > f ; wc -c < f        both: 3
 
-Bytes 0x01, 0x02 and 0x03 arriving from an expansion are silently
-removed, because they are `SHELL_ARG_MARK`, `SHELL_NOSPLIT_MARK` and
-`SHELL_GLOB_ESC` -- the in-band markers the word buffer carries. Any
-command output containing them loses them, which is a data-integrity bug
-well beyond the two corpus cases.
+So printf is fine and the pipe is fine: the byte is lost between the
+CAPTURE and the stored variable, and only for 0x01, 0x02 and 0x03 --
+`SHELL_ARG_MARK`, `SHELL_NOSPLIT_MARK` and `SHELL_GLOB_ESC`, the in-band
+markers the word buffer carries.
 
-Fixing it means an escaping scheme (double a marker byte that is data,
-collapse it at the strip funnels) audited across the ~59 places that
-mention a marker. The last in-band marker introduced here cost eight
-regressions, and *the two consumers found by reasoning were not the two
-that broke*. Do it with the gate in the loop, one marker at a time, or
-not at all.
+**Proof that the collision is the whole cause:** move the three #defines
+to 0x11/0x12/0x13 and the case passes, 68/68 with the probe in. That is a
+diagnostic, NOT a fix -- it relocates the bug to three other bytes.
+
+**What was tried and reverted:** escaping a colliding data byte with
+GLOB_ESC as it enters the word buffer, plus teaching the strip and test
+helpers to skip an escape and the byte after it. Two versions:
+  * the capture path only -- the probe still failed, and the escape never
+    even reached the buffer for `s=$(...)`, which was not chased down;
+  * all nineteen data-append sites -- gained NOTHING and cost 1889, 2545,
+    2546 and 2547, all `$@`-with-empty-parameters and `read`. Escaping
+    interacts with the ARG_MARK boundary logic, where two adjacent marks
+    are meaningful.
+
+Whoever picks this up: the collision is certain, the mechanism is
+certain, and the fix has to handle the boundary semantics of ARG_MARK
+rather than treating all three markers alike. Probe first with
+`printf '..'` under shparity -- four minutes a round.
+
+### 1394 -- bash's parse, not ours
+
+`echo "123 \`[[ $(echo \\" > $file) ]]\` 456"` has a `\` inside double
+quotes (an escaped backslash) followed by a `"` that therefore CLOSES the
+string, mid-backtick, mid-substitution. Reproducing bash's answer means
+reproducing bash's nesting model exactly. Nothing else in the corpus
+depends on it.
 
 ### The races
 
-`a & b` and friends turn on whether the backgrounded child writes before
-the parent does. bash wins consistently for a structural reason: its
-child has already parsed the command, while tsh's child re-parses the
-text it was handed, so the parent gets there first. Making the parent
-sleep would "fix" them and would be a lie about what the shell does.
-
-### Everything that used to be on this list
-
-Fourteen cases were written off in this file at one time or another as
-unstatable rules, oracle bugs, or C-string impossibilities. Twelve of
-them were ours:
-
-- "the read/IFS rule cannot be stated" -- it can; see the commit. What
-  was missing was not data but the WHOLE TABLE: the runner printed three
-  diff lines per case, so the rows that discriminate never appeared
-  together. `DIFF_MAX_LINES` is 24 now.
-- "the guest's bash is wrong" (nine cases) -- six were our kernel and our
-  utilities: fcntl answering for closed descriptors, /bin/sh's `exit`
-  ignoring its argument, /bin/date printing the uptime, no /bin/kill.
-- "NUL bytes need a length-carrying value representation" -- two of the
-  four did not: one needed the NUL to TERMINATE (which a C string does
-  for free) and one needed it DROPPED from captured output.
-- "1478 hangs, not diagnosed" -- a forked stage held the read end of the
-  pipe it was writing to, so the writer was waiting for a reader that was
-  itself.
+`a & b` turns on whether the backgrounded child writes before the parent
+does. bash wins consistently for a structural reason: its child has
+already parsed the command, while tsh's child re-parses the text it was
+handed. Making the parent sleep would "fix" them and would be a lie.
 
 ---
 
