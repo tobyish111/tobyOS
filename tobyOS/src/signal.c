@@ -170,8 +170,13 @@ void signal_send(struct proc *p, int sig) {
         p->stop_sig = 0;
         p->stop_reported = false;
         if (p->state == PROC_STOPPED) {
+            p->cont_pending = true;        /* WCONTINUED: report once */
             p->state = PROC_READY;
             sched_enqueue(p);
+            if (p->ppid > 0) {             /* Linux: SIGCHLD on continue */
+                struct proc *par = proc_lookup(p->ppid);
+                if (par) signal_send(par, SIGCHLD);
+            }
         }
     } else if (SIGMASK(sig) & SIGMASK_STOPS) {
         p->pending_signals  &= ~SIGMASK(SIGCONT);
@@ -337,9 +342,14 @@ static void signal_apply_default(struct proc *p, int sig) {
         proc_wake_waiters(p->pid);
     }
     /* Job control: record the stop so a WUNTRACED wait can report it
-     * exactly once. SIGCONT clears both fields. */
+     * exactly once. SIGCONT clears both fields. The parent gets SIGCHLD
+     * for the transition, as Linux sends it. */
     p->stop_sig = sig;
     p->stop_reported = false;
+    if (p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
     p->state = PROC_STOPPED;
     sched_yield();
     /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */

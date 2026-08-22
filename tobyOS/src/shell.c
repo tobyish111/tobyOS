@@ -452,18 +452,26 @@ struct job {
     int  id;                   /* shell-assigned, 1..  -- 0 = empty slot */
     int  pid;                  /* kernel PID of the bg proc */
     bool stopped;              /* job control: ^Z'd, awaiting fg/bg */
+    bool dead;                 /* reaped by `wait`; announce at next prompt
+                                * (bash reports even wait-consumed jobs) */
+    int  code;                 /* exit code when dead */
     char name[JOB_NAME_MAX];   /* command text for display */
 };
 
 static struct job g_jobs[JOB_MAX];
 static int        g_next_job_id = 1;
 
+/* Job-control seams, ONE code path for both hosts now: proc_wait_fg comes
+ * from proc.c (kernel) or host.c (hosted, over waitpid WUNTRACED); the
+ * terminal handover maps to TIOCSPGRP on the pty hosted, and to the
+ * console's foreground slot in the kernel -- whose delivery already
+ * expands to the whole group. */
 #ifdef SHELL_HOSTED
-/* Host-provided job-control seams (programs/tsh/host.c): a WUNTRACED wait
- * that separates "stopped" from "exited", and the tty foreground-group
- * handover (TIOCSPGRP; 0 = back to the shell's own group). */
-extern int  proc_wait_fg(int pid, int *stop_sig);
 extern void shell_tty_set_fg_pgrp(int pgrp);
+#else
+static void shell_tty_set_fg_pgrp(int pgrp) {
+    signal_set_foreground(pgrp);
+}
 #endif
 
 /* bash displays a job by its COMMAND TEXT ("sleep 30"), not argv[0]. */
@@ -480,7 +488,8 @@ static void jobs_join_argv(char **argv, char *out, size_t cap) {
 static struct job *jobs_newest(void) {
     struct job *best = 0;
     for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i].id && (!best || g_jobs[i].id > best->id))
+        if (g_jobs[i].id && !g_jobs[i].dead &&
+            (!best || g_jobs[i].id > best->id))
             best = &g_jobs[i];
     return best;
 }
@@ -491,6 +500,8 @@ static int jobs_add(int pid, const char *name) {
             g_jobs[i].id  = g_next_job_id++;
             g_jobs[i].pid = pid;
             g_jobs[i].stopped = false;
+            g_jobs[i].dead = false;
+            g_jobs[i].code = 0;
             size_t n = 0;
             if (name) {
                 while (n + 1 < JOB_NAME_MAX && name[n]) {
@@ -506,14 +517,15 @@ static int jobs_add(int pid, const char *name) {
 
 static struct job *jobs_find(int id) {
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == id) return &g_jobs[i];
+        if (g_jobs[i].id == id && !g_jobs[i].dead) return &g_jobs[i];
     }
     return 0;
 }
 
 static struct job *jobs_find_pid(int pid) {
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id != 0 && g_jobs[i].pid == pid) return &g_jobs[i];
+        if (g_jobs[i].id != 0 && !g_jobs[i].dead &&
+            g_jobs[i].pid == pid) return &g_jobs[i];
     }
     return 0;
 }
@@ -533,6 +545,57 @@ static void jobs_remove(struct job *j) {
  * We also drop entries whose PCB slot has gone UNUSED out from under us
  * (e.g. somehow reaped elsewhere) -- this should not happen today, but
  * a stale jobs[] entry would be confusing. */
+/* bash's status word for a finished job. NO signal names here: this
+ * kernel reports signal deaths as plain 128+sig exit codes (WIFSIGNALED
+ * is not modelled), so the REAL bash on this kernel prints "Exit 143"
+ * for a TERM'd job -- measured on the interactive gate -- and parity
+ * means matching what bash actually says here, not what it would say on
+ * Linux. */
+static const char *shell_job_status_word(int code, char *buf, size_t cap) {
+    if (code == 0) return "Done";
+    ksnprintf(buf, cap, "Exit %d", code);
+    return buf;
+}
+
+#ifdef SHELL_HOSTED
+/* Prompt-time job notification, bash's format and moment: reap finished
+ * background jobs (host seam: waitpid WNOHANG) and announce each once,
+ * right before a PS1 prints. tsh previously never reaped interactive bg
+ * jobs at all. */
+void shell_notify_jobs_hosted(void) {
+    extern int proc_try_reap(int pid, int *code);
+    for (int i = 0; i < JOB_MAX; i++) {
+        if (g_jobs[i].id == 0) continue;
+        int code = 0;
+        int r;
+        if (g_jobs[i].dead) {
+            /* Reaped by `wait`; bash still announces it here. */
+            r = 1;
+            code = g_jobs[i].code;
+        } else {
+            r = proc_try_reap(g_jobs[i].pid, &code);
+        }
+        if (r == 0) continue;
+        char wb[24];
+        const char *what = (r < 0) ? "Done"
+                         : shell_job_status_word(code, wb, sizeof wb);
+        /* The mark reflects the job's standing WHEN ALIVE, so the newest
+         * scan here includes the corpse being announced (jobs_newest
+         * skips dead entries for every other caller). */
+        char mark = ' ';
+        {
+            int maxid = 0;
+            for (int k = 0; k < JOB_MAX; k++)
+                if (g_jobs[k].id > maxid) maxid = g_jobs[k].id;
+            if (g_jobs[i].id == maxid) mark = '+';
+        }
+        shell_printf("[%d]%c  %-24s%s\n", g_jobs[i].id, mark, what,
+                     g_jobs[i].name);
+        jobs_remove(&g_jobs[i]);
+    }
+}
+#endif
+
 static void jobs_reap_finished(void) {
     for (int i = 0; i < JOB_MAX; i++) {
         if (g_jobs[i].id == 0) continue;
@@ -3416,7 +3479,7 @@ static void cmd_jobs(int argc, char **argv) {
 
     int shown = 0;
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0) continue;
+        if (g_jobs[i].id == 0 || g_jobs[i].dead) continue;
         if (pids_only) {
             shell_printf("%d\n", g_jobs[i].pid);
             shown++;
@@ -3442,7 +3505,10 @@ static void cmd_jobs(int argc, char **argv) {
                 g_jobs[i].id, g_jobs[i].pid, st, g_jobs[i].name);
         shown++;
     }
-    if (shown == 0 && !pids_only) shell_printf("  (no background jobs)\n");
+    /* bash prints NOTHING for an empty table; the friendly line is the
+     * kernel console's, where there is no oracle to diverge from. */
+    if (shown == 0 && !pids_only && !g_opt_monitor)
+        shell_printf("  (no background jobs)\n");
 }
 
 static int parse_int(const char *s, int *out) {
@@ -3456,6 +3522,26 @@ static int parse_int(const char *s, int *out) {
     return 0;
 }
 
+/* bash job specs: %N, %% and %+ (current), %- (previous). NULL on a bad
+ * or unknown spec; callers print their own diagnostic. */
+static struct job *jobs_by_spec(const char *s) {
+    if (!s || s[0] != '%') return 0;
+    if (!s[1] || strcmp(s, "%%") == 0 || strcmp(s, "%+") == 0)
+        return jobs_newest();
+    if (strcmp(s, "%-") == 0) {
+        struct job *newest = jobs_newest(), *second = 0;
+        for (int i = 0; i < JOB_MAX; i++) {
+            if (!g_jobs[i].id) continue;
+            if (newest && g_jobs[i].id == newest->id) continue;
+            if (!second || g_jobs[i].id > second->id) second = &g_jobs[i];
+        }
+        return second;
+    }
+    int id = 0;
+    if (parse_int(s + 1, &id) < 0 || id <= 0) return 0;
+    return jobs_find(id);
+}
+
 static void cmd_fg(int argc, char **argv) {
     struct job *j = 0;
     int jid = 0;
@@ -3464,6 +3550,14 @@ static void cmd_fg(int argc, char **argv) {
         j = jobs_newest();
         if (!j) {
             kprintf("fg: current: no such job\n");
+            shell_set_status(1);
+            return;
+        }
+        jid = j->id;
+    } else if (argv[1][0] == '%') {
+        j = jobs_by_spec(argv[1]);
+        if (!j) {
+            kprintf("fg: %s: no such job\n", argv[1]);
             shell_set_status(1);
             return;
         }
@@ -3489,14 +3583,13 @@ static void cmd_fg(int argc, char **argv) {
     while (n + 1 < JOB_NAME_MAX && j->name[n]) { saved_name[n] = j->name[n]; n++; }
     saved_name[n] = 0;
 
-#ifdef SHELL_HOSTED
     if (g_opt_monitor) {
         /* bash: fg prints the command text, hands the tty to the job's
          * group, SIGCONTs the group, and waits WUNTRACED -- a second ^Z
-         * re-stops it and keeps the job. */
+         * re-stops it and keeps the job. One path, both hosts. */
         shell_printf("%s\n", saved_name);
         shell_tty_set_fg_pgrp(pid);
-        signal_send_to_pid(-pid, SIGCONT);
+        signal_send_to_pgrp(pid, SIGCONT);
         int ssig = 0;
         int frc = proc_wait_fg(pid, &ssig);
         shell_tty_set_fg_pgrp(0);
@@ -3513,7 +3606,6 @@ static void cmd_fg(int argc, char **argv) {
         shell_set_status(frc);
         return;
     }
-#endif
     kprintf("fg: bringing [%d] pid=%d '%s' to foreground\n",
             jid, pid, saved_name);
 
@@ -3541,6 +3633,13 @@ static void cmd_bg(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
+    } else if (argv[1][0] == '%') {
+        j = jobs_by_spec(argv[1]);
+        if (!j) {
+            kprintf("bg: %s: no such job\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
     } else {
         int jid;
         if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
@@ -3560,7 +3659,7 @@ static void cmd_bg(int argc, char **argv) {
      * stayed stopped forever. */
     shell_printf("[%d]+ %s &\n", j->id, j->name);
     if (j->stopped) {
-        signal_send_to_pid(-j->pid, SIGCONT);
+        signal_send_to_pgrp(j->pid, SIGCONT);
         j->stopped = false;
     }
     shell_set_status(0);
@@ -3577,6 +3676,13 @@ static int shell_wait_job(struct job *j) {
         jobs_remove(j);
         return 127;
     }
+    if (g_opt_monitor && g_interactive) {
+        /* bash announces even a wait-consumed job at the next prompt;
+         * leave the corpse for the notifier instead of removing it. */
+        j->dead = true;
+        j->code = rc;
+        return rc;
+    }
     jobs_remove(j);
     return rc;
 }
@@ -3584,10 +3690,7 @@ static int shell_wait_job(struct job *j) {
 static struct job *shell_wait_lookup(const char *arg) {
     if (!arg || !*arg) return 0;
     int n = 0;
-    if (arg[0] == '%') {
-        if (parse_int(arg + 1, &n) < 0 || n <= 0) return 0;
-        return jobs_find(n);
-    }
+    if (arg[0] == '%') return jobs_by_spec(arg);   /* %N, %%, %+, %- */
     if (parse_int(arg, &n) < 0 || n <= 0) return 0;
 
     struct job *j = jobs_find_pid(n);
@@ -3602,7 +3705,7 @@ static void cmd_wait(int argc, char **argv) {
         for (;;) {
             struct job *j = 0;
             for (int i = 0; i < JOB_MAX; i++) {
-                if (g_jobs[i].id != 0) {
+                if (g_jobs[i].id != 0 && !g_jobs[i].dead) {
                     j = &g_jobs[i];
                     break;
                 }
@@ -8919,6 +9022,23 @@ static void cmd_kill(int argc, char **argv) {
     /* A `--` may also FOLLOW the signal option: `kill -TERM -- -123`. */
     if (first < argc && strcmp(argv[first], "--") == 0) first++;
     for (int i = first; i < argc; i++) {
+        /* %jobspec: the signal goes to the job's GROUP. bash also
+         * CONTinues a stopped job it TERMs or HUPs, so the signal can
+         * act on a process that would otherwise sit stopped with it
+         * pending forever. */
+        if (argv[i][0] == '%') {
+            struct job *jb = jobs_by_spec(argv[i]);
+            if (!jb) {
+                kprintf("kill: %s: no such job\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+            bool was_stopped = jb->stopped;
+            signal_send_to_pgrp(jb->pid, sig);
+            if (was_stopped && (sig == SIGTERM || sig == SIGHUP))
+                signal_send_to_pgrp(jb->pid, SIGCONT);
+            continue;
+        }
         int pid = 0;
         const char *p = argv[i];
         bool neg = false;
@@ -9760,12 +9880,11 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         return 0;
     }
 
-#ifdef SHELL_HOSTED
     if (g_opt_monitor && g_interactive && !g_in_pipeline_stage) {
-        /* Real job control: the foreground job leads its own group and
-         * OWNS the terminal while it runs, so ^C/^Z from the tty hit the
-         * JOB and not the shell. On a ^Z the shell takes the tty back,
-         * registers a stopped job, and reports it the way bash does.
+        /* Real job control, BOTH hosts: the foreground job leads its own
+         * group and OWNS the terminal while it runs, so ^C/^Z from the tty
+         * hit the JOB and not the shell. On a ^Z the shell takes the tty
+         * back, registers a stopped job, and reports it the way bash does.
          * $? after a stop is 128+SIGTSTP, like bash. */
         (void)proc_set_pgid(pid, pid);
         shell_tty_set_fg_pgrp(pid);
@@ -9784,7 +9903,6 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         }
         return frc;
     }
-#endif
     signal_set_foreground(pid);
     int rc = proc_wait(pid);
     signal_set_foreground(0);
@@ -17083,7 +17201,7 @@ static bool shell_try_while_command(const char *src) {
             }
             continue;
         }
-        if (iter == 1023) overrun = true;
+        if (iter == 999999) overrun = true;   /* was 1023: bash has NO cap, and real scripts loop past 1k -- the gate timeouts are the runaway net */
     }
 done:
     g_shell_loop_depth--;
@@ -17197,7 +17315,7 @@ static bool shell_try_until_command(const char *src) {
             }
             continue;
         }
-        if (iter == 1023) overrun = true;
+        if (iter == 999999) overrun = true;   /* was 1023: bash has NO cap, and real scripts loop past 1k -- the gate timeouts are the runaway net */
     }
 done:
     g_shell_loop_depth--;

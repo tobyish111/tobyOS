@@ -634,6 +634,24 @@ int proc_set_pgid(int pid, int pgid) {
     return 0;
 }
 
+/* Kernel-side WUNTRACED-style foreground wait (see proc.h). Yield-poll,
+ * the same shape as the syscall arms; the kernel shell runs as a kernel
+ * thread, so there is no syscall boundary to deliver an EINTR across. */
+int proc_wait_fg(int pid, int *stop_sig) {
+    if (stop_sig) *stop_sig = 0;
+    for (;;) {
+        struct proc *c = proc_lookup(pid);
+        if (!c) return -1;
+        if (c->state == PROC_STOPPED && !c->stop_reported) {
+            c->stop_reported = true;
+            if (stop_sig) *stop_sig = c->stop_sig > 0 ? c->stop_sig : 19;
+            return 0;
+        }
+        if (c->state == PROC_TERMINATED) return proc_wait(pid);
+        sched_yield();
+    }
+}
+
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
                           struct file *fd3, struct file *fd4,
@@ -1439,6 +1457,18 @@ __attribute__((noreturn)) void proc_exit(int code) {
                 }
             }
         }
+    }
+
+    /* SIGCHLD to the parent. The header of signal.c has promised this
+     * since M1 and NOTHING ever sent it. bash's job table only updates
+     * through its SIGCHLD handler; without the signal a job killed while
+     * stopped stayed "stopped" in bash's books and an interactive `exit`
+     * refused with "There are stopped jobs." forever. Default disposition
+     * is ignore, so parents that don't care see nothing. Same
+     * before-cli() reasoning as the namespace block above. */
+    if (p && !p->is_thread && p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
     }
 
     cli();

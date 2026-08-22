@@ -19,16 +19,18 @@ extern "C" {
 
 #define WNOHANG     0x1
 #define WUNTRACED   0x2
+#define WCONTINUED  0x4
 
-/* Stop encoding is 0x10000|sig -- NOT the Linux 0x7f low byte, which
- * would collide with a genuine `exit 127` (command-not-found's status).
- * WIFEXITED must exclude the stop bit. */
-#define WIFEXITED(s)    (((s) & 0x10100) == 0)
+/* Stop encoding is 0x10000|sig, continue is 0x20000 -- NOT the Linux low
+ * bytes, which would collide with genuine exit codes (`exit 127` is
+ * command-not-found's status). WIFEXITED must exclude both bits. */
+#define WIFEXITED(s)    (((s) & 0x30100) == 0)
 #define WEXITSTATUS(s)  ((s) & 0xFF)
 #define WIFSIGNALED(s)  (0)
 #define WTERMSIG(s)     (0)
 #define WIFSTOPPED(s)   (((s) & 0x10000) != 0)
 #define WSTOPSIG(s)     ((s) & 0xFF)
+#define WIFCONTINUED(s) (((s) & 0x20000) != 0)
 
 pid_t waitpid(pid_t pid, int *status_out, int flags);
 pid_t wait(int *wstatus);

@@ -1546,6 +1546,7 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_WUNTRACED   0x2   /* also report job-control stops (status
                                * 0x10000|sig -- the Linux 0x7f byte would
                                * collide with a real `exit 127`) */
+#define ABI_WCONTINUED  0x4   /* also report SIGCONT resumes (status 0x20000) */
 
 /* ============================================================
  *  stat structure

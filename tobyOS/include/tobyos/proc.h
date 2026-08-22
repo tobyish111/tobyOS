@@ -478,6 +478,9 @@ struct proc {
      * stop signal's default action runs, cleared by SIGCONT. */
     int             stop_sig;
     bool            stop_reported;
+    /* WCONTINUED: a SIGCONT resumed this proc from a stop and no wait has
+     * reported the continue yet. */
+    bool            cont_pending;
 
     /* User identity (milestone 15). Inherited from the parent in
      * spawn_internal -- so a kernel-spawned proc starts as uid 0/gid 0
@@ -870,6 +873,12 @@ struct proc *proc_lookup(int pid);
  * setpgid syscall). The shell's `set -m` uses this through a host seam:
  * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
 int proc_set_pgid(int pid, int pgid);
+
+/* Kernel-side WUNTRACED-style foreground wait: returns the exit code, or
+ * 0 with *stop_sig set when the child job-control-stopped. The KERNEL
+ * shell's monitor path uses this; /bin/tsh's host.c provides the same
+ * signature over waitpid(WUNTRACED). */
+int proc_wait_fg(int pid, int *stop_sig);
 
 /* Atomically claim a free proc slot (state CAS UNUSED -> EMBRYO). The ONLY
  * way to allocate a slot -- a plain "scan for UNUSED" race is exactly the

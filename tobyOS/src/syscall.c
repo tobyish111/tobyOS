@@ -4239,11 +4239,12 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
      * Native status encoding: 0x10000 | signal (the Linux 0x7f byte would
      * collide with a real `exit 127`, which shells produce constantly).
      * libtoby's WIFSTOPPED/WIFEXITED know the bit. */
-    if (flags & ABI_WUNTRACED) {
+    if (flags & (ABI_WUNTRACED | ABI_WCONTINUED)) {
         for (;;) {
             struct proc *child = proc_lookup(pid);
             if (!child) return -ABI_ENOENT;
-            if (child->state == PROC_STOPPED && !child->stop_reported) {
+            if ((flags & ABI_WUNTRACED) &&
+                child->state == PROC_STOPPED && !child->stop_reported) {
                 child->stop_reported = true;
                 uint32_t st = 0x10000u |
                     (uint32_t)(child->stop_sig > 0 ? child->stop_sig : SIGSTOP);
@@ -4251,10 +4252,17 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
                     return -ABI_EFAULT;
                 return vpid;
             }
+            if ((flags & ABI_WCONTINUED) && child->cont_pending) {
+                child->cont_pending = false;
+                if (status_out && put_user_u32(status_out, 0x20000u) != 0)
+                    return -ABI_EFAULT;
+                return vpid;
+            }
             if (child->state == PROC_TERMINATED) break;
             if (flags & ABI_WNOHANG) return 0;
             struct proc *self = current_proc();
-            if (self && self->pending_signals) return -ABI_EINTR;
+            if (self && (self->pending_signals & ~SLEEP_UNINTERRUPTING))
+                return -ABI_EINTR;
             sched_yield();
         }
     }
@@ -10142,15 +10150,27 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * wakes on termination -- while the child traces itself and parks. Seen
          * exactly that way, with the tracer silent forever after
          * "[ptrace] pid=3 TRACEME". */
-        /* WUNTRACED (0x2): a JOB-CONTROL stop is reported, once, without
-         * reaping -- the yield-poll shape every blocking primitive in this
-         * kernel uses. This is what lets a shell's foreground wait see ^Z. */
-        if (options & 0x2 /* WUNTRACED */) {
+        /* WUNTRACED (0x2) / WCONTINUED (0x8): job-control stops and
+         * continues are reported, once each, without reaping -- the
+         * yield-poll shape every blocking primitive in this kernel uses.
+         * This is what lets a shell's foreground wait see ^Z, and its
+         * notifier see the bg-resume. */
+        if (options & (0x2 | 0x8)) {
             for (;;) {
                 struct proc *c = proc_lookup(pid);
                 if (!c) return -ABI_ECHILD;
-                if (c->state == PROC_STOPPED && !c->stop_reported) {
+                /* DEATH OUTRANKS EVERYTHING: a stale cont_pending on a
+                 * child that has since died must not report "continued"
+                 * for a corpse. */
+                if (c->state == PROC_TERMINATED) {
+                    c->cont_pending = false;
+                    break;                                /* reap below */
+                }
+                if ((options & 0x2) &&
+                    c->state == PROC_STOPPED && !c->stop_reported) {
                     c->stop_reported = true;
+                    kprintf("[wait4] pid=%d report STOP sig=%d\n",
+                            pid, c->stop_sig);
                     if (ustatus) {
                         uint32_t st = ((uint32_t)(c->stop_sig > 0 ?
                                        c->stop_sig : SIGSTOP) << 8) | 0x7fu;
@@ -10158,10 +10178,21 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                     }
                     return rvpid;     /* stopped: report, do NOT reap */
                 }
-                if (c->state == PROC_TERMINATED) break;   /* reap below */
+                if ((options & 0x8) && c->cont_pending) {
+                    c->cont_pending = false;
+                    kprintf("[wait4] pid=%d report CONT\n", pid);
+                    if (ustatus) {
+                        if (put_user_u32(ustatus, 0xffffu) != 0)
+                            return -ABI_EFAULT;   /* Linux WIFCONTINUED */
+                    }
+                    return rvpid;
+                }
                 if (options & 0x1 /* WNOHANG */) return 0;
                 struct proc *self = current_proc();
-                if (self && self->pending_signals) return -ABI_EINTR;
+                /* SIGCHLD (and the rest of the ignorable set) must not
+                 * EINTR the very wait that serves it. */
+                if (self && (self->pending_signals & ~SLEEP_UNINTERRUPTING))
+                    return -ABI_EINTR;
                 sched_yield();
             }
         }

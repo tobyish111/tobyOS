@@ -544,8 +544,12 @@ int proc_spawn(const struct proc_spec *spec) {
 
 int proc_wait(int pid) {
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    return WEXITSTATUS(status);
+    /* Retry EINTR: the parent now receives SIGCHLD, and a wait must not
+     * fail because the signal it exists to consume arrived. */
+    for (int tries = 0; tries < 1000; tries++) {
+        if (waitpid(pid, &status, 0) >= 0) return WEXITSTATUS(status);
+    }
+    return -1;
 }
 
 int proc_wait_info(int pid, struct proc_exit_info *out) {
@@ -595,17 +599,33 @@ int proc_set_pgid(int pid, int pgid) { return setpgid(pid, pgid); }
 int proc_wait_fg(int pid, int *stop_sig) {
     int st = 0;
     if (stop_sig) *stop_sig = 0;
-    if (waitpid(pid, &st, WUNTRACED) < 0) return -1;
-    if (WIFSTOPPED(st)) {
-        if (stop_sig) *stop_sig = WSTOPSIG(st);
-        return 0;
+    for (int tries = 0; tries < 1000; tries++) {
+        if (waitpid(pid, &st, WUNTRACED) < 0) continue;   /* EINTR retry */
+        if (WIFSTOPPED(st)) {
+            if (stop_sig) *stop_sig = WSTOPSIG(st);
+            return 0;
+        }
+        return WEXITSTATUS(st);
     }
-    return WEXITSTATUS(st);
+    return -1;
 }
 
 void shell_tty_set_fg_pgrp(int pgrp) {
     int pg = pgrp > 0 ? pgrp : (int)getpgrp();
     (void)ioctl(0, 0x5410UL /* TIOCSPGRP */, &pg);
+}
+
+void signal_send_to_pgrp(int pgrp, int sig) { (void)kill(-pgrp, sig); }
+
+/* Non-blocking reap for the prompt-time job notifier: 0 = still running,
+ * 1 = reaped (exit code in *code), -1 = no such child. */
+int proc_try_reap(int pid, int *code) {
+    int st = 0;
+    pid_t r = waitpid(pid, &st, WNOHANG);
+    if (r == 0) return 0;
+    if (r < 0) return -1;
+    if (code) *code = WEXITSTATUS(st);
+    return 1;
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -669,6 +689,8 @@ int main(int argc, char **argv) {
     int eofs = 0;
     int cont = 0;
     for (;;) {
+        /* bash announces finished background jobs right before a prompt. */
+        if (!cont) shell_notify_jobs_hosted();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
         write(1, ps, strlen(ps));
