@@ -1145,6 +1145,34 @@ void poll_wake_all(void) {
     }
 }
 
+/* Halt-loop only (sched_yield's halt-in-place arm): if the CURRENT proc is
+ * itself a parked poller, unlink it so the caller can resume it for a
+ * re-scan. poll_wake_all deliberately keeps current parked -- a poller must
+ * not self-wake on the very yield that parks it -- but the proc halting in
+ * place is whoever blocked LAST, and when that is the poller there is no
+ * other proc left to run a sweep FOR it: skipping current there turns
+ * "machine idle" into "machine dead" (the LXPOSIX poll(timerfd) wedge,
+ * 2026-08-22). Caller MUST hold the BKL, same as poll_wake_all. Returns 1
+ * if current was unlinked (caller resumes it), 0 otherwise. */
+int poll_unpark_current(void) {
+    struct proc *cur = current_proc();
+    if (!cur || cur->wait_head != &g_poll_waiters) return 0;
+    struct proc **pp = &g_poll_waiters;
+    while (*pp) {
+        if (*pp == cur) {
+            *pp = cur->next_wait;
+            cur->next_wait = 0;
+            cur->wait_head = 0;
+            return 1;
+        }
+        pp = &(*pp)->next_wait;
+    }
+    /* wait_head said poll but the list disagrees -- clear the stale
+     * back-pointer rather than leave it dangling. */
+    cur->wait_head = 0;
+    return 0;
+}
+
 /* ---- Slice 67 (perf tier 2, final step): EVENT-DRIVEN poll wakeups ----
  *
  * MEASURED (slice 66): epoll_wait held the BKL ~0.77 ms PER CALL --

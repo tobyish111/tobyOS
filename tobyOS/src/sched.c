@@ -792,6 +792,51 @@ int sched_get_prio(int pid) {
     return p ? p->prio : SCHED_PRIO_NONE;
 }
 
+/* Slice 128's sleeper wake, shared between sched_yield's entry and the two
+ * halted-CPU loops below. Wakes every PROC_BLOCKED proc whose nanosleep
+ * deadline has passed. No BKL required: touches only per-proc fields and
+ * sched_enqueue (own ready_lock). O(1) clock read + a proc-table walk. */
+static void sched_sleep_sweep(void) {
+    extern struct proc g_proc[];
+    uint64_t snow = perf_now_ns();
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state != PROC_BLOCKED) continue;
+        uint64_t dl = __atomic_load_n(&p->sleep_deadline_ns,
+                                      __ATOMIC_ACQUIRE);
+        if (!dl || snow < dl) continue;
+        __atomic_store_n(&p->sleep_deadline_ns, 0, __ATOMIC_RELEASE);
+        p->state = PROC_READY;
+        sched_enqueue(p);
+    }
+}
+
+/* Every wake source in this kernel is a SWEEP driven from scheduler entry
+ * points (sched_yield's entry, sched_yield_fast's decline window, pid 0's
+ * idle_loop) -- none is IRQ-driven. A CPU that halts waiting for "something
+ * runnable" without passing those entry points must therefore drive the
+ * sweeps itself, or a fully-parked machine stays parked forever: the timer
+ * IRQ breaks the hlt, the queue is still empty (nothing ever ran a sweep to
+ * refill it), and the CPU halts again. Slice 128 made that shape REACHABLE
+ * for the first time -- sleepers park now, so the system can go all-blocked
+ * -- and the first boot flavour to reach it wedged with every CPU in hlt and
+ * zero heartbeats (LXPOSIX: pid 0 blocked in wait, its child parked in
+ * poll(timerfd); 2026-08-22). Each IRQ that breaks a hlt now doubles as the
+ * sweep tick. Cost is nil in the only state that runs it (the machine is
+ * idle by definition); every sweep is O(1) when nothing is parked.
+ * Caller must NOT hold the BKL. */
+static void sched_halted_wake_sweeps(void) {
+    extern void signal_tick_alarms(void);
+    extern void futex_expire_timeouts(void);
+    extern void poll_tick(void);
+    sched_sleep_sweep();
+    futex_expire_timeouts();          /* g_futex_lock only, never the BKL */
+    bkl_enter();
+    signal_tick_alarms();             /* signal_send touches the run queue */
+    poll_tick();                      /* poll list is BKL-serialised */
+    bkl_exit();
+}
+
 /* ---- Slice 64 (perf tier 2): BKL-FREE sched_yield fast path ----------
  *
  * MEASURED (slice 64 [lx-top]): chrome issues ~401,000 sched_yield per 60s
@@ -880,20 +925,7 @@ void sched_yield(void) {
      * rate limit would quantise every sleep to the sweep period -- which is
      * exactly the latency this slice exists to remove. Waking depends on the
      * scheduler running, never on IRQ delivery. */
-    {
-        extern struct proc g_proc[];
-        uint64_t snow = perf_now_ns();
-        for (int i = 0; i < PROC_MAX; i++) {
-            struct proc *p = &g_proc[i];
-            if (p->state != PROC_BLOCKED) continue;
-            uint64_t dl = __atomic_load_n(&p->sleep_deadline_ns,
-                                          __ATOMIC_ACQUIRE);
-            if (!dl || snow < dl) continue;
-            __atomic_store_n(&p->sleep_deadline_ns, 0, __ATOMIC_RELEASE);
-            p->state = PROC_READY;
-            sched_enqueue(p);
-        }
-    }
+    sched_sleep_sweep();
 
     /* ---- Milestone 19 fast path ----------------------------------
      *
@@ -1061,6 +1093,28 @@ void sched_yield(void) {
                 sti();
                 hlt();
                 __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
+                /* This loop is the one place a CPU waits without passing a
+                 * scheduler entry point, so it must drive the wake sweeps
+                 * itself -- see sched_halted_wake_sweeps. Without this the
+                 * all-parked machine is a wedge, not an idle. */
+                sched_halted_wake_sweeps();
+                /* And the proc halting HERE may itself be the parked poller
+                 * (it is whoever blocked LAST, and on the BSP a blocking
+                 * poller halts in place). poll_wake_all deliberately keeps
+                 * the current proc parked -- correct on the yield that parks
+                 * it, fatal here where there is nobody left to wake it. One
+                 * re-scan per hlt-wake is the pre-slice-43 poll loop at IRQ
+                 * cadence, paid only while the whole machine is idle. */
+                {
+                    extern int poll_unpark_current(void);
+                    bkl_enter();
+                    int self = poll_unpark_current();
+                    bkl_exit();
+                    if (self && cur) {
+                        cur->state = PROC_RUNNING;
+                        YIELD_RETURN();
+                    }
+                }
                 uint64_t f = spin_lock_irqsave(&me->ready_lock);
                 next = queue_pop_locked(me);
                 spin_unlock_irqrestore(&me->ready_lock, f);
@@ -1108,6 +1162,15 @@ void sched_idle(void) {
             sti();
             hlt();
             __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
+            /* Same reasoning as sched_yield's halt-in-place loop: a halted
+             * CPU passes no scheduler entry point, so it must drive the
+             * wake sweeps or an all-parked machine never refills any queue.
+             * The BSP's loop covers the common shape; this covers the one
+             * where the BSP is pinned in a long kernel-mode operation while
+             * every parked proc waits on a sweep only an idle AP can run
+             * (the slice-56 single-point-of-failure, from the other side).
+             * The idle proc never holds the BKL, as required. */
+            sched_halted_wake_sweeps();
         }
     }
 }
