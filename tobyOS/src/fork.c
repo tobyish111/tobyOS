@@ -1805,6 +1805,10 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     memcpy(p->name, base, n);
     p->name[n] = '\0';
 
+    /* /proc/<pid>/cmdline follows the NEW image's argv. */
+    { extern void proc_record_cmdline(struct proc *, int, char **);
+      proc_record_cmdline(p, kargc, kargv_buf); }
+
     /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
     {
         size_t pn = strlen(kpath);

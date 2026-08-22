@@ -3166,6 +3166,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-misc (syscall-tail batch)";            \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-misc";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-procdev/linux-procdev.elf ]; then               \
+	    cp programs/linux-procdev/linux-procdev.elf                        \
+	         $(INITRD_STAGE)/bin/linux-procdev;                            \
+	    echo "[initrd] staged linux-procdev (procfs+dev fidelity)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-procdev";                     \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

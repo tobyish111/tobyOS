@@ -455,12 +455,22 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
 static int gen_pid_cmdline(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
+    /* 2026-08-22: the REAL argv, NUL-separated, exactly as Linux emits it
+     * -- the old name+'\n' fabrication is not the format ps/pgrep/argv
+     * readers parse (they split on NULs and got one token plus a stray
+     * newline). Kernel procs have no recorded argv; fall back to the name
+     * with a terminating NUL, which is at least the right SHAPE. */
+    if (p->cmdline_len) {
+        size_t nl = p->cmdline_len;
+        if (nl > cap) nl = cap;
+        memcpy(buf, p->cmdline, nl);
+        return (int)nl;
+    }
     size_t nl = strlen(p->name);
     if (nl >= cap) nl = cap - 1;
     memcpy(buf, p->name, nl);
-    buf[nl] = '\n'; nl++;
     buf[nl] = '\0';
-    return (int)nl;
+    return (int)(nl + 1);
 }
 
 /* /proc/<pid>/fdinfo/<n>.
@@ -746,6 +756,13 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                 }
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
+                /* 2026-08-22: /proc/self/mounts is what libmount, findmnt,
+                 * systemd and Go's mountinfo actually read -- /proc/mounts
+                 * worked while the per-pid dispatch had no arm, so exactly
+                 * the common consumers got ENOENT. Same generator (it
+                 * already renders the READER's mount namespace). */
+                else if (strcmp(sub, "mounts") == 0)
+                    len = gen_mounts(buf, sizeof(buf));
                 /* Slice 11: the user-namespace id maps. These are the first
                  * WRITABLE files in /proc -- see procfs_write(). The pid is
                  * stashed on the handle because a write has to know which
@@ -1201,6 +1218,7 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are
      * directories, the rest are files. */
     static const char *entries[] = { "status", "cmdline", "maps", "stat",
+                                     "mounts",
                                      "exe", "fd", "ns",
                                      /* slice 11 */
                                      "uid_map", "gid_map", "setgroups",
@@ -1230,11 +1248,14 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
     (void)mnt;
     if (!path || path[0] != '/' || !buf || bufsz == 0) return VFS_ERR_INVAL;
 
-    /* Bare /proc/self -> /proc/<pid> */
+    /* Bare /proc/self -> /proc/<pid> -- the pid in the READER's namespace
+     * (2026-08-22: this was the one site still writing the HOST pid,
+     * against slice 10's rule; inside a pid namespace the link then named
+     * a process the reader cannot even see). */
     if (strcmp(path, "/self") == 0) {
         struct proc *p = current_proc();
         char pidstr[16];
-        int pl = int_to_str(pidstr, sizeof(pidstr), p ? p->pid : 0);
+        int pl = int_to_str(pidstr, sizeof(pidstr), p ? pid_vnr(p) : 0);
         int n = 0;
         const char *pre = "/proc/";
         size_t prelen = strlen(pre);

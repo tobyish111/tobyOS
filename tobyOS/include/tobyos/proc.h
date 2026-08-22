@@ -459,6 +459,14 @@ struct proc {
      * struct file pointer are owning -- close-on-exit drops them. */
     struct file    *fds[PROC_NFDS];
 
+    /* /proc/<pid>/cmdline: the argv recorded at spawn/exec, NUL-separated
+     * exactly as Linux emits it (2026-08-22 -- it was fabricated as
+     * name+'\n', which is not the format ps/pgrep/argv readers parse).
+     * Capped; 0 for kernel procs, and the generator falls back to the
+     * name for those. */
+    char            cmdline[192];
+    uint16_t        cmdline_len;
+
     /* Close-on-exec bitmap, one bit per fd slot (Linux FD_CLOEXEC). A
      * property of the DESCRIPTOR, not the open file description -- dup()
      * clears it on the new fd, fcntl(F_SETFD) flips it, and a successful
@@ -914,6 +922,9 @@ struct file **proc_fds(struct proc *p);
  * leader's bitmap exactly as proc_fds routes to the leader's table. */
 void fd_cloexec_set(struct proc *p, int fd, int on);
 int  fd_cloexec_get(struct proc *p, int fd);
+
+/* Record argv for /proc/<pid>/cmdline (proc.c; spawn + execve call it). */
+void proc_record_cmdline(struct proc *p, int argc, char **argv);
 
 /* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
  * Returns the child pid, or -1 if there are no children. */

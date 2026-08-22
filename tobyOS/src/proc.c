@@ -656,6 +656,24 @@ int proc_wait_fg(int pid, int *stop_sig) {
     }
 }
 
+/* Record argv for /proc/<pid>/cmdline, NUL-separated, capped. Shared by
+ * spawn (below) and execve (fork.c). */
+void proc_record_cmdline(struct proc *p, int argc, char **argv) {
+    size_t off = 0;
+    if (!p) return;
+    for (int i = 0; i < argc && argv && argv[i]; i++) {
+        size_t l = strlen(argv[i]);
+        if (off + l + 1 > sizeof p->cmdline) {
+            if (off + 1 >= sizeof p->cmdline) break;
+            l = sizeof p->cmdline - off - 1;
+        }
+        memcpy(p->cmdline + off, argv[i], l);
+        off += l;
+        p->cmdline[off++] = '\0';
+    }
+    p->cmdline_len = (uint16_t)off;
+}
+
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
                           struct file *fd3, struct file *fd4,
@@ -674,6 +692,7 @@ static int spawn_internal(const char *path, const char *name,
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the very end */
     p->pid       = (int)(p - g_proc);
     p->wait_pid  = -1;
+    proc_record_cmdline(p, argc, argv);   /* /proc/<pid>/cmdline */
     /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
      * is a VALID syscall number -- BKL hold time would be misattributed to
      * read()/native-0 for every proc that never made one. */

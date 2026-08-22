@@ -3992,6 +3992,15 @@ void _start(void) {
         kprintf("[boot] /tmp: %s\n",
                 rc == VFS_OK ? "tmpfs mounted (writable)"
                              : "MOUNT FAILED -- temp files will not work");
+        /* 2026-08-22: /dev/shm too. glibc's shm_open() IS
+         * open("/dev/shm/<name>") -- with no mount there, POSIX shared
+         * memory never existed for Linux binaries (memfd carried chrome
+         * instead). Path resolution is longest-prefix over the mount
+         * table, so this works without /dev being a real directory. */
+        rc = tmpfs_mount_at("/dev/shm", 0);
+        kprintf("[boot] /dev/shm: %s\n",
+                rc == VFS_OK ? "tmpfs mounted (POSIX shm live)"
+                             : "MOUNT FAILED -- shm_open will ENOENT");
     }
     cgroup_mount();          /* ...and cgroupfs at /sys/fs/cgroup (nests in /sys) */
     aslr_init();             /* Phase 7 M7.1: address space layout randomization */
@@ -7756,6 +7765,12 @@ void _start(void) {
              * sigqueue, restart_syscall. */
             { "/bin/linux-misc", "linux-misc", 0, 63,
               "auxv creds + syscall tail" },
+            /* 2026-08-22 procfs+dev fidelity: /proc/self names the reader's
+             * pid, /proc/self/mounts exists, raw stat(2) sees /dev nodes,
+             * /dev is listable, /dev/shm is a real tmpfs (glibc shm_open
+             * works), and cmdline is the real NUL-separated argv. */
+            { "/bin/linux-procdev", "linux-procdev", 0, 63,
+              "/proc + /dev fidelity" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

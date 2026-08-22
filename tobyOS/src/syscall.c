@@ -2451,6 +2451,16 @@ static long sys_open(const char *path, int flags, int mode) {
             if (q != rest && *q == '/') { nspid = v; rest = q + 1; }
         }
         if (nspid >= 0 && strncmp(rest, "ns/", 3) == 0) {
+            /* 2026-08-22: the numeric component is a VPID in the caller's
+             * pid namespace and must translate before proc_lookup -- this
+             * arm was the one /proc consumer that skipped it, so inside a
+             * pid namespace it opened the WRONG process's nsfd (or ENOENT).
+             * self/ carries the host pid already. */
+            if (strncmp(kpath + 6, "self/", 5) != 0) {
+                int kk = pid_knr(nspid);
+                if (!kk) return -ABI_ENOENT;
+                nspid = kk;
+            }
             struct proc *target = proc_lookup(nspid);
             if (!target) return -ABI_ENOENT;
             int kind = ns_kind_from_name(rest + 3);
@@ -2461,6 +2471,24 @@ static long sys_open(const char *path, int flags, int mode) {
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
             return fd;
         }
+    }
+
+    /* 2026-08-22: /dev itself is openable and listable. It has never been
+     * a real directory -- nodes are synthesised in the open path -- so
+     * `ls /dev` answered ENOENT since forever, an inventory every Unix
+     * user types. The listing is the synth table, in getdents64. */
+    if (strcmp(kpath, "/dev") == 0 || strcmp(kpath, "/dev/") == 0) {
+        struct file *f = (struct file *)kmalloc(sizeof(*f));
+        if (!f) return -ABI_ENOMEM;
+        memset(f, 0, sizeof(*f));
+        f->kind    = FILE_KIND_DIR;
+        f->dirpath = (char *)kmalloc(5);      /* heap-owned: close kfrees */
+        if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+        memcpy(f->dirpath, "/dev", 5);
+        f->dir_off = 0;
+        int fd = fd_alloc_into(current_proc(), f);
+        if (fd < 0) { kfree(f->dirpath); kfree(f); return -ABI_EMFILE; }
+        return fd;
     }
 
     /* B23: pseudoterminal device nodes. /dev/ptmx allocates a fresh pair and
@@ -10762,6 +10790,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                               lx_ino_hash(kpath), (void *)a2);
             }
         }
+        /* 2026-08-22: synthesised /dev nodes answer here too. The
+         * dev_synth fix (slice 103/104) covered statx, newfstatat and
+         * access -- and the handoff CLAIMED it covered stat -- but raw
+         * syscalls 4/6 never got the arm, so an assembler-level or
+         * Go-style direct stat("/dev/null") still saw ENOENT. */
+        {   uint32_t dm = dev_synth_mode(kpath);
+            if (dm) return linux_emit_chrdev_stat(1, 3, lx_ino_hash(kpath),
+                                                  (void *)a2);
+        }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
         gputrace("stat", kpath, sr);
@@ -10868,29 +10905,55 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* Slice 102: /dev/dri is synthetic (no VFS directory behind it),
          * so emit its nodes here. libdrm iterates this to name the
          * device's card/render nodes -- see the open path. */
-        if (strcmp(f->dirpath, "/dev/dri") == 0) {
+        /* Synthetic /dev directories (2026-08-22: /dev itself and /dev/snd
+         * join the slice-102 /dev/dri arm; /dev/snd could be OPENED but not
+         * LISTED before -- the fall-through hit vfs_opendir and ENOENT). */
+        {
             static const char *const dri_names[] = { "card0", "renderD128" };
-            size_t written = 0;
-            uint32_t emitted = 0;
-            while (f->dir_off + emitted < 2) {
-                const char *nm = dri_names[f->dir_off + emitted];
-                size_t namelen = strlen(nm);
-                size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
-                if (written + reclen > cap) break;
-                struct lx_dirent64 de;
-                memset(&de, 0, reclen);
-                de.d_ino    = 100 + f->dir_off + emitted;
-                de.d_off    = (int64_t)(f->dir_off + emitted + 1);
-                de.d_reclen = (uint16_t)reclen;
-                de.d_type   = LX_DT_CHR;
-                memcpy(de.d_name, nm, namelen);
-                if (copy_to_user(ubuf + written, &de, reclen) != 0)
-                    return -ABI_EFAULT;
-                written += reclen;
-                emitted++;
+            static const char *const snd_names[] = { "controlC0", "pcmC0D0p" };
+            static const char *const dev_names[] =
+                { "null", "zero", "full", "tty", "console", "random",
+                  "urandom", "ptmx", "pts", "shm", "dri", "snd", "fb0",
+                  "input" };
+            static const uint8_t dev_types[] =
+                { LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_CHR,
+                  LX_DT_CHR, LX_DT_CHR, LX_DT_CHR, LX_DT_DIR, LX_DT_DIR,
+                  LX_DT_DIR, LX_DT_DIR, LX_DT_CHR, LX_DT_DIR };
+            const char *const *names = 0;
+            const uint8_t *types = 0;
+            uint32_t cnt = 0;
+            if (strcmp(f->dirpath, "/dev/dri") == 0) {
+                names = dri_names; cnt = 2;
+            } else if (strcmp(f->dirpath, "/dev/snd") == 0) {
+                names = snd_names; cnt = 2;
+            } else if (strcmp(f->dirpath, "/dev") == 0) {
+                names = dev_names; types = dev_types;
+                cnt = (uint32_t)(sizeof dev_names / sizeof dev_names[0]);
             }
-            f->dir_off += emitted;
-            return (long)written;
+            if (names) {
+                size_t written = 0;
+                uint32_t emitted = 0;
+                while (f->dir_off + emitted < cnt) {
+                    const char *nm = names[f->dir_off + emitted];
+                    size_t namelen = strlen(nm);
+                    size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
+                    if (written + reclen > cap) break;
+                    struct lx_dirent64 de;
+                    memset(&de, 0, reclen);
+                    de.d_ino    = 100 + f->dir_off + emitted;
+                    de.d_off    = (int64_t)(f->dir_off + emitted + 1);
+                    de.d_reclen = (uint16_t)reclen;
+                    de.d_type   = types ? types[f->dir_off + emitted]
+                                        : LX_DT_CHR;
+                    memcpy(de.d_name, nm, namelen);
+                    if (copy_to_user(ubuf + written, &de, reclen) != 0)
+                        return -ABI_EFAULT;
+                    written += reclen;
+                    emitted++;
+                }
+                f->dir_off += emitted;
+                return (long)written;
+            }
         }
         struct vfs_dir d;
         if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;

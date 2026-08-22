@@ -140,6 +140,25 @@ SOCK_NONBLOCK fixed in the same pass. New /bin/linux-cloexec (static glibc,
 6 bits — bit3 asserts survival/closure from INSIDE an exec'd child) rides
 lxposix. GREEN 11/11.
 
+### 2026-08-22 — /proc + /dev fidelity batch (lxposix 17/17)
+readlink(/proc/self) reports the READER's pid (was the host pid — the
+last slice-10 rule violation); open(/proc/PID/ns/…) translates its
+numeric component (was raw — wrong nsfd inside a pid namespace);
+/proc/self/mounts exists (same generator as /proc/mounts — libmount,
+findmnt, systemd and Go read the per-pid path and got ENOENT);
+/proc/PID/cmdline is the REAL argv, NUL-separated, recorded at
+spawn+execve in the PCB (was name+'\n'); raw stat(2)/lstat(2) see the
+synthesised /dev nodes (the dev_synth fix's one missing arm); /dev
+itself is openable + listable (synth-table getdents, /dev/snd included
+— it opened but couldn't list); **/dev/shm is a real tmpfs mounted at
+boot, so glibc's shm_open — literally open("/dev/shm/…") — works: POSIX
+shared memory exists for Linux binaries for the first time** (memfd had
+been carrying chrome instead). Longest-prefix mount resolution means the
+mount works without /dev being a real directory. Test: `linux-procdev`
+(63/63, incl. a full shm_open/ftruncate/MAP_SHARED/shm_unlink
+round-trip). Still open here: real /proc/self/maps (needs the two-VMA-
+system recon), /proc/sys, /proc/net.
+
 ### 2026-08-22 — syscall-tail batch (lxposix 16/16)
 Real auxv credentials: AT_UID/EUID/GID/EGID from the process's actual ids
 (user-namespace-translated, slice-11's boundary rule) instead of
