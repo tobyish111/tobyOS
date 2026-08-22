@@ -15,6 +15,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
 | bash-parity (hand-written) | `bash logs/shparity.sh` | **92/92** | ~4 min |
+| INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **4/4** (+ bash-vs-bash selfcheck every run) | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -179,10 +180,29 @@ documented kernel gap, dodged not fixed).
 Walked so far: set options, umask, read, getopts, readonly, export, wait,
 kill, cd, trap, command, type, hash, times, alias/unalias, shift,
 break/continue, pattern classes, dot/return, fc(-l), ulimit, newgrp, id,
-tilde (~ and ~user). Not walked: interactive-only surfaces (fc editing,
-ignoreeof EOF, monitor's job-control semantics — still the one
-substantial remainder), and the long tail of XCU 2 the corpus already
-covers piecemeal. Case-writing law: the runner gives bash
+tilde (~ and ~user).
+
+**The interactive surface has its own gate now (6fa54b0):**
+`bash logs/ttyparity.sh` runs both shells on real pty pairs and
+byte-compares the terminal streams, paced by prompt sentinels; bash runs
+`--noediting` so the line discipline echoes for both. **The instrument
+validates itself every run** (bash-vs-bash must be byte-identical) and
+its bring-up caught, in order: kill(0) broadcasting to the whole session
+(stopped login the moment pgids were real), libtoby poll's lie + the
+unbounded pty master read, `exit` at a tsh prompt NEVER exiting, the PS2
+continuation gap (`if true` executed instead of prompting), the missing
+"exit" announcements, and two chatter streams ([_exit] trace,
+signal_set_foreground stub) that only a byte-compared tty could see.
+Corpus v1: prompt framing, PS2 (quotes/backslash/compounds), ignoreeof's
+^D contract, interactive defaults + alias. **Case-writing laws:** a
+BROKEN session gets one LOGGED retry (silent-child flake, seen once);
+job-notification cases need pid normalization the runner does not have
+yet; nothing in a case may contain the sentinel bytes.
+
+Still open interactively, now MEASURABLE with this gate: ^Z/SIGTSTP stop
++ fg/bg resume (needs tcsetpgrp handover + WUNTRACED reporting — the
+kernel work sketched in the monitor leg), fc against a real history, and
+the long tail of XCU 2 the corpus already covers piecemeal. Case-writing law: the runner gives bash
 and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
 never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
