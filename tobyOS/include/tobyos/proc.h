@@ -473,6 +473,11 @@ struct proc {
      * signals to the whole group. 0 means "never set" and is read as
      * "own pid" everywhere, so pre-existing code paths stay valid. */
     int             pgid;
+    /* Job-control stop reporting (WUNTRACED): which signal stopped this
+     * proc, and whether a wait has already reported that stop. Set when a
+     * stop signal's default action runs, cleared by SIGCONT. */
+    int             stop_sig;
+    bool            stop_reported;
 
     /* User identity (milestone 15). Inherited from the parent in
      * spawn_internal -- so a kernel-spawned proc starts as uid 0/gid 0

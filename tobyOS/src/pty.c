@@ -24,6 +24,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/klibc.h>
+#include <tobyos/printk.h>
 #include <tobyos/cpu.h>
 
 #define PTY_MAX  8
@@ -195,6 +196,22 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
         uint8_t c = in[put];
         if ((t->tio.c_iflag & TTY_ICRNL) && c == '\r') c = '\n';
         else if ((t->tio.c_iflag & TTY_INLCR) && c == '\n') c = '\r';
+        /* ISIG: ^C and ^Z are SIGNALS to the foreground group, not input
+         * bytes. They echo (^C / ^Z) like every control char, and never
+         * reach the input ring -- exactly n_tty. Nothing acted on these
+         * before this slice; ^Z on a pty was two bytes of data. */
+        if ((t->tio.c_lflag & TTY_ISIG) && t->pgrp > 0) {
+            if (c == t->tio.c_cc[TTY_VINTR]) {
+                echo_to_master(t, c);
+                signal_send_to_pgrp(t->pgrp, SIGINT);
+                continue;
+            }
+            if (c == t->tio.c_cc[TTY_VSUSP]) {
+                echo_to_master(t, c);
+                signal_send_to_pgrp(t->pgrp, SIGTSTP);
+                continue;
+            }
+        }
         ring_push(t->in, &t->in_head, t->in_tail, c);
         echo_to_master(t, c);
     }

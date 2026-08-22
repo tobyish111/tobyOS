@@ -54,6 +54,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <time.h>
 
 extern pid_t toby_spawn(const char *path, char *const argv[],
                         char *const envp[], int fd0, int fd1, int fd2);
@@ -106,7 +107,19 @@ struct session {
     char  *trans;
     size_t tlen;
     int    broken;            /* a wait timed out; everything after is void */
+    int    shell_pg;          /* tty fg group once the shell settled -- the
+                               * interrupt settle waits for it to CHANGE */
 };
+
+/* Every deadline in this file is REAL TIME. The first version counted
+ * spin iterations and guessed their duration; the guess was ~20x off and
+ * every "8 second" deadline was ~0.4s -- slow-but-correct steps (a
+ * post-pipeline prompt, a job handover) were being killed as timeouts. */
+static long now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(0, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000 + (long)(ts.tv_nsec / 1000000);
+}
 
 static int ends_with(const char *buf, size_t len, const char *suf) {
     size_t sl = strlen(suf);
@@ -121,17 +134,17 @@ static int ends_with(const char *buf, size_t len, const char *suf) {
  * FIONREAD asks the master how many bytes actually exist; a read for
  * exactly that many can never block. */
 static void drain(struct session *s, int ms) {
+    long deadline = now_ms() + ms;
     for (;;) {
         int avail = 0;
         if (ioctl(s->mfd, 0x541BUL /* FIONREAD */, &avail) != 0) return;
         if (avail <= 0) {
-            if (ms <= 0) return;
+            if (now_ms() >= deadline) return;
             /* NOT usleep(): sleep syscalls in this kernel have a history of
              * wedging (the TKAPP stall), and one hung sleep here freezes the
-             * whole gate. A bounded re-poll spin cannot wedge; on 4 cpus the
-             * shell keeps running underneath it. */
-            for (volatile int spin = 0; spin < 400000; spin++) { }
-            ms -= STEP_MS;
+             * whole gate. A short bounded spin paces the re-poll; the
+             * DEADLINE is real time above, never an iteration guess. */
+            for (volatile int spin = 0; spin < 100000; spin++) { }
             continue;
         }
         char chunk[512];
@@ -144,7 +157,7 @@ static void drain(struct session *s, int ms) {
             s->tlen += (size_t)n;
             s->trans[s->tlen] = '\0';
         }
-        ms = 0;               /* got some; keep pulling until quiet */
+        deadline = now_ms();  /* got some; keep pulling until quiet */
     }
 }
 
@@ -152,7 +165,8 @@ static void emit_escaped(const char *tag, const char *s, size_t len);
 
 /* Wait until the transcript ends with one of up to two suffixes. */
 static int wait_prompt(struct session *s, const char *a, const char *b) {
-    for (int waited = 0; waited <= WAIT_MS; waited += STEP_MS) {
+    long deadline = now_ms() + WAIT_MS;
+    while (now_ms() < deadline) {
         drain(s, STEP_MS);
         if (ends_with(s->trans, s->tlen, a)) return 0;
         if (b && ends_with(s->trans, s->tlen, b)) return 0;
@@ -227,16 +241,44 @@ static int session_run(struct session *s, char lines[][256], int nlines,
     write(s->mfd, SETUP_LINE, strlen(SETUP_LINE));
     if (wait_prompt(s, SENT_P, 0) != 0) { emit("[ttyparity]   . TIMEOUT sentinel\n"); goto out; }
     *cut = s->tlen - strlen(SENT_P);
+    /* The tty's foreground group with the shell AT ITS PROMPT: the
+     * interrupt settle below waits for this to CHANGE, which is the
+     * event "the shell handed the terminal to the job" -- not a timing
+     * guess that races the fork. */
+    (void)ioctl(s->mfd, 0x540FUL /* TIOCGPGRP */, &s->shell_pg);
 
     for (int i = 0; i < nlines; i++) {
-        if (strcmp(lines[i], "%EOF%") == 0) {
-            char eof = 0x04;
-            write(s->mfd, &eof, 1);
+        /* %CTRLZ%/%CTRLC% interrupt a RUNNING job: no prompt precedes
+         * them, and the settle drain gives the shell time to hand the
+         * terminal over. %EOF% is TYPED AT A PROMPT like any other line --
+         * treating it as an interrupt shifted its timing and made bash's
+         * ignoreeof message land after the next echo. */
+        int is_intr = (strcmp(lines[i], "%CTRLZ%") == 0 ||
+                       strcmp(lines[i], "%CTRLC%") == 0);
+        if (is_intr) {
+            /* Wait for the EVENT, not an interval: the fg group changing
+             * away from the shell's means the job owns the terminal and
+             * the ^C/^Z will hit the job. Bounded in real time. */
+            long dl = now_ms() + 4000;
+            while (now_ms() < dl) {
+                int pg = 0;
+                if (ioctl(s->mfd, 0x540FUL /* TIOCGPGRP */, &pg) != 0) break;
+                if (pg != 0 && pg != s->shell_pg) break;
+                drain(s, STEP_MS);
+            }
+            drain(s, 100);
+            char c = (lines[i][1] == 'C' && lines[i][5] == 'C') ? 0x03 : 0x1a;
+            write(s->mfd, &c, 1);
+        } else if (strcmp(lines[i], "%EOF%") == 0) {
+            char c = 0x04;
+            write(s->mfd, &c, 1);
         } else {
             write(s->mfd, lines[i], strlen(lines[i]));
             write(s->mfd, "\n", 1);
         }
-        if (i + 1 < nlines) {
+        if (i + 1 < nlines &&
+            strcmp(lines[i + 1], "%CTRLZ%") != 0 &&
+            strcmp(lines[i + 1], "%CTRLC%") != 0) {
             if (wait_prompt(s, SENT_P, SENT_C) != 0) goto out;
         }
     }
@@ -246,8 +288,9 @@ out:;
     int rc = 0;
     if (!s->broken) {
         /* Bounded: a shell that survives its own `exit` line must not hang
-         * the gate -- WNOHANG-poll with the same deadline the prompts get. */
-        for (int w = 0; w <= WAIT_MS; w += STEP_MS) {
+         * the gate -- WNOHANG-poll with a REAL-time deadline. */
+        long dl = now_ms() + WAIT_MS;
+        while (now_ms() < dl) {
             rc = (int)waitpid(s->pid, &status, WNOHANG);
             if (rc != 0) break;
             drain(s, STEP_MS);
@@ -381,10 +424,19 @@ static int cmp_names(const void *x, const void *y) {
     return strcmp((const char *)x, (const char *)y);
 }
 
+/* The gate must be UNSTOPPABLE by the signals it injects: a mis-aimed ^Z
+ * once landed on the runner's own group and froze the entire gate until
+ * the host-side timeout (the pty's foreground group was still ours). */
+static void tp_ignore(int sig) { (void)sig; }
+
 int main(void) {
     /* Lead our own process group: a confused child's kill(0, ...) then
      * reaches at most this gate and its shells, never the console session. */
     (void)setpgid(0, 0);
+    signal(SIGTSTP, tp_ignore);
+    signal(SIGTTOU, tp_ignore);
+    signal(SIGTTIN, tp_ignore);
+    signal(SIGINT,  tp_ignore);
 
     emit("[TTYPARITY] ==== interactive bash-parity gate ====\n");
 

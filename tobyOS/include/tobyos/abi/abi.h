@@ -1543,6 +1543,9 @@ _Static_assert(sizeof(struct abi_display_info) ==
  *  waitpid flags
  * ============================================================ */
 #define ABI_WNOHANG     0x1   /* don't block; return 0 if no child ready */
+#define ABI_WUNTRACED   0x2   /* also report job-control stops (status
+                               * 0x10000|sig -- the Linux 0x7f byte would
+                               * collide with a real `exit 127`) */
 
 /* ============================================================
  *  stat structure

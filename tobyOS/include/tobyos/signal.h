@@ -181,6 +181,14 @@ void signal_send_to_pid(int pid, int sig);
  * is no such process. The shell's `kill` needs the answer for its status. */
 int  signal_send_to_pid_checked(int pid, int sig);
 void signal_send_to_foreground(int sig);
+/* Group send for the tty/pty line discipline (^C/^Z to the foreground
+ * group). Kernel-trusted; no permission model. */
+void signal_send_to_pgrp(int pgrp, int sig);
+
+/* Cooperative stop point for long-held syscall loops: applies one pending
+ * default-disposition stop (parks until SIGCONT) and returns true; false
+ * when the pending stop is caught (caller should EINTR instead). */
+bool signal_take_pending_stop(void);
 
 /* Check and deliver pending signals from an IRQ (PIT) context, where no
  * saved syscall trapframe exists. Handles fatal/default dispositions;

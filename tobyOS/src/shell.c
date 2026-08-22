@@ -274,6 +274,12 @@ static bool g_opt_allexport; /* set -a */
  * cmd's failure; without it `set -o pipefail` was "unknown option" and the
  * script died on the option rather than on the pipeline. */
 static bool g_opt_pipefail;
+/* True while executing INSIDE a pipeline stage (forked or lastpipe): a
+ * stage must never run the monitor-mode foreground dance -- the first
+ * interactive pipeline handed the TERMINAL to `cat` from a forked stage
+ * and no prompt ever came back. Fork copies the flag into stage children. */
+static bool g_in_pipeline_stage;
+
 /* POSIX names a shell option for job CONTROL (`set -m` / `set -o monitor`),
  * on by default only in interactive shells. tsh runs its background-job
  * machinery unconditionally; the flag records what was asked for and is what
@@ -445,17 +451,46 @@ void shell_printf(const char *fmt, ...) {
 struct job {
     int  id;                   /* shell-assigned, 1..  -- 0 = empty slot */
     int  pid;                  /* kernel PID of the bg proc */
-    char name[JOB_NAME_MAX];   /* argv[0] copy for display */
+    bool stopped;              /* job control: ^Z'd, awaiting fg/bg */
+    char name[JOB_NAME_MAX];   /* command text for display */
 };
 
 static struct job g_jobs[JOB_MAX];
 static int        g_next_job_id = 1;
+
+#ifdef SHELL_HOSTED
+/* Host-provided job-control seams (programs/tsh/host.c): a WUNTRACED wait
+ * that separates "stopped" from "exited", and the tty foreground-group
+ * handover (TIOCSPGRP; 0 = back to the shell's own group). */
+extern int  proc_wait_fg(int pid, int *stop_sig);
+extern void shell_tty_set_fg_pgrp(int pgrp);
+#endif
+
+/* bash displays a job by its COMMAND TEXT ("sleep 30"), not argv[0]. */
+static void jobs_join_argv(char **argv, char *out, size_t cap) {
+    size_t o = 0;
+    for (int i = 0; argv && argv[i]; i++) {
+        if (i && o + 1 < cap) out[o++] = ' ';
+        for (const char *p = argv[i]; *p && o + 1 < cap; p++) out[o++] = *p;
+    }
+    out[o < cap ? o : cap - 1] = '\0';
+}
+
+/* The most recent job wears bash's `+`. */
+static struct job *jobs_newest(void) {
+    struct job *best = 0;
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i].id && (!best || g_jobs[i].id > best->id))
+            best = &g_jobs[i];
+    return best;
+}
 
 static int jobs_add(int pid, const char *name) {
     for (int i = 0; i < JOB_MAX; i++) {
         if (g_jobs[i].id == 0) {
             g_jobs[i].id  = g_next_job_id++;
             g_jobs[i].pid = pid;
+            g_jobs[i].stopped = false;
             size_t n = 0;
             if (name) {
                 while (n + 1 < JOB_NAME_MAX && name[n]) {
@@ -3387,6 +3422,20 @@ static void cmd_jobs(int argc, char **argv) {
             shown++;
             continue;
         }
+        if (g_opt_monitor) {
+            /* bash's table: no pids (a pid in the line would make every
+             * transcript comparison nondeterministic), `+` on the newest. */
+            struct job *newest = jobs_newest();
+            char mark = (newest && newest->id == g_jobs[i].id) ? '+' : ' ';
+            if (g_jobs[i].stopped)
+                shell_printf("[%d]%c  Stopped                 %s\n",
+                             g_jobs[i].id, mark, g_jobs[i].name);
+            else
+                shell_printf("[%d]%c  Running                 %s &\n",
+                             g_jobs[i].id, mark, g_jobs[i].name);
+            shown++;
+            continue;
+        }
         struct proc *p = proc_lookup(g_jobs[i].pid);
         const char *st = p ? proc_state_name(p->state) : "GONE";
         shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
@@ -3408,22 +3457,29 @@ static int parse_int(const char *s, int *out) {
 }
 
 static void cmd_fg(int argc, char **argv) {
+    struct job *j = 0;
+    int jid = 0;
+    /* bash: `fg` with no operand means the CURRENT job. */
     if (argc < 2) {
-        kprintf("usage: fg <job_id>     (see 'jobs')\n");
-        shell_set_status(1);
-        return;
-    }
-    int jid;
-    if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
-        kprintf("fg: bad job id '%s'\n", argv[1]);
-        shell_set_status(1);
-        return;
-    }
-    struct job *j = jobs_find(jid);
-    if (!j) {
-        kprintf("fg: no such job [%d]\n", jid);
-        shell_set_status(1);
-        return;
+        j = jobs_newest();
+        if (!j) {
+            kprintf("fg: current: no such job\n");
+            shell_set_status(1);
+            return;
+        }
+        jid = j->id;
+    } else {
+        if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
+            kprintf("fg: bad job id '%s'\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
+        j = jobs_find(jid);
+        if (!j) {
+            kprintf("fg: no such job [%d]\n", jid);
+            shell_set_status(1);
+            return;
+        }
     }
     int pid = j->pid;
     /* Snapshot the name into a local buffer because the job slot may
@@ -3433,6 +3489,31 @@ static void cmd_fg(int argc, char **argv) {
     while (n + 1 < JOB_NAME_MAX && j->name[n]) { saved_name[n] = j->name[n]; n++; }
     saved_name[n] = 0;
 
+#ifdef SHELL_HOSTED
+    if (g_opt_monitor) {
+        /* bash: fg prints the command text, hands the tty to the job's
+         * group, SIGCONTs the group, and waits WUNTRACED -- a second ^Z
+         * re-stops it and keeps the job. */
+        shell_printf("%s\n", saved_name);
+        shell_tty_set_fg_pgrp(pid);
+        signal_send_to_pid(-pid, SIGCONT);
+        int ssig = 0;
+        int frc = proc_wait_fg(pid, &ssig);
+        shell_tty_set_fg_pgrp(0);
+        if (ssig > 0) {
+            struct job *js = jobs_find(jid);
+            if (js) js->stopped = true;
+            shell_printf("\n[%d]+  Stopped                 %s\n",
+                         jid, saved_name);
+            shell_set_status(128 + ssig);
+            return;
+        }
+        struct job *j2 = jobs_find(jid);
+        if (j2) jobs_remove(j2);
+        shell_set_status(frc);
+        return;
+    }
+#endif
     kprintf("fg: bringing [%d] pid=%d '%s' to foreground\n",
             jid, pid, saved_name);
 
@@ -3452,24 +3533,36 @@ static void cmd_fg(int argc, char **argv) {
 }
 
 static void cmd_bg(int argc, char **argv) {
+    struct job *j = 0;
     if (argc < 2) {
-        kprintf("usage: bg <job_id>     (see 'jobs')\n");
-        shell_set_status(1);
-        return;
+        j = jobs_newest();               /* bash: bare bg = current job */
+        if (!j) {
+            kprintf("bg: current: no such job\n");
+            shell_set_status(1);
+            return;
+        }
+    } else {
+        int jid;
+        if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
+            kprintf("bg: bad job id '%s'\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
+        j = jobs_find(jid);
+        if (!j) {
+            kprintf("bg: no such job [%d]\n", jid);
+            shell_set_status(1);
+            return;
+        }
     }
-    int jid;
-    if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
-        kprintf("bg: bad job id '%s'\n", argv[1]);
-        shell_set_status(1);
-        return;
+    /* bash prints the reinput form, then CONTINUES the whole group. The
+     * old version printed and sent nothing -- the "backgrounded" job
+     * stayed stopped forever. */
+    shell_printf("[%d]+ %s &\n", j->id, j->name);
+    if (j->stopped) {
+        signal_send_to_pid(-j->pid, SIGCONT);
+        j->stopped = false;
     }
-    struct job *j = jobs_find(jid);
-    if (!j) {
-        kprintf("bg: no such job [%d]\n", jid);
-        shell_set_status(1);
-        return;
-    }
-    kprintf("[%d] %s &\n", j->id, j->name);
     shell_set_status(0);
 }
 
@@ -9287,15 +9380,17 @@ static void cmd_fc(int argc, char **argv) {
         return;
     }
     if (first > last) { int t = first; first = last; last = t; }
+    /* bash's listing byte layout is TAB THEN A SPACE before the text --
+     * measured on the interactive gate's pty, one byte per line of diff. */
     if (reverse) {
         for (int k = last; k >= first; k--) {
-            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
-            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+            if (no_numbers) kprintf("\t %s\n", g_hist[k]);
+            else kprintf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
         }
     } else {
         for (int k = first; k <= last; k++) {
-            if (no_numbers) kprintf("\t%s\n", g_hist[k]);
-            else kprintf("%lu\t%s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+            if (no_numbers) kprintf("\t %s\n", g_hist[k]);
+            else kprintf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
         }
     }
     shell_set_status(0);
@@ -9649,7 +9744,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
          * shell's group -- tsh cannot hand the terminal over (no tcsetpgrp
          * from userspace), so moving them would detach ^C for nothing. */
         if (g_opt_monitor) (void)proc_set_pgid(pid, pid);
-        int jid = jobs_add(pid, argv[0]);
+        char jname[JOB_NAME_MAX];
+        jobs_join_argv(argv, jname, sizeof jname);
+        int jid = jobs_add(pid, jname);
         if (jid < 0) {
             /* Out of job slots -- still leave the proc running, but warn
              * the user. They'll be reaped opportunistically later by
@@ -9663,6 +9760,31 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         return 0;
     }
 
+#ifdef SHELL_HOSTED
+    if (g_opt_monitor && g_interactive && !g_in_pipeline_stage) {
+        /* Real job control: the foreground job leads its own group and
+         * OWNS the terminal while it runs, so ^C/^Z from the tty hit the
+         * JOB and not the shell. On a ^Z the shell takes the tty back,
+         * registers a stopped job, and reports it the way bash does.
+         * $? after a stop is 128+SIGTSTP, like bash. */
+        (void)proc_set_pgid(pid, pid);
+        shell_tty_set_fg_pgrp(pid);
+        int ssig = 0;
+        int frc = proc_wait_fg(pid, &ssig);
+        shell_tty_set_fg_pgrp(0);
+        if (ssig > 0) {
+            char jname[JOB_NAME_MAX];
+            jobs_join_argv(argv, jname, sizeof jname);
+            int jid = jobs_add(pid, jname);
+            struct job *sj = jid > 0 ? jobs_find(jid) : 0;
+            if (sj) sj->stopped = true;
+            shell_printf("\n[%d]+  Stopped                 %s\n",
+                         jid > 0 ? jid : 0, jname);
+            return 128 + ssig;
+        }
+        return frc;
+    }
+#endif
     signal_set_foreground(pid);
     int rc = proc_wait(pid);
     signal_set_foreground(0);
@@ -15501,6 +15623,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             shell_stage_is_builtin(&pl->stage[i])) {
             int fpid = fork();
             if (fpid == 0) {
+                g_in_pipeline_stage = true;
                 /* Every pipe was created up front, so this child inherited
                  * ALL of their ends. It needs exactly two -- see the note in
                  * the compound path about a writer that is its own reader. */
@@ -18494,6 +18617,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (!bg_tail && g_heredoc_count == 0 && g_capture_depth == 0 &&
             (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
         if (fpid == 0) {
+            g_in_pipeline_stage = true;
             /* A CHILD MUST NOT HOLD THE READ END OF THE PIPE IT WRITES TO.
              *
              *     cat /dev/urandom | sleep 0.1
@@ -18513,7 +18637,10 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (fpid > 0) {
             cpids[i] = fpid;
         } else {
+            bool saved_ps = g_in_pipeline_stage;
+            g_in_pipeline_stage = true;      /* lastpipe: parent runs it */
             execute_line_text(stages[i]);
+            g_in_pipeline_stage = saved_ps;
             last = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
             if (last != 0) failed = last;
@@ -19528,6 +19655,11 @@ bool shell_wants_exit_hosted(int *status) {
     if (status) *status = g_shell_flow_status;
     return true;
 }
+
+/* Feed the interactive loop's lines into the history ring `fc` reads.
+ * The ring and fc were both fully built -- and the hosted REPL never
+ * called this, so interactive fc listed an empty history forever. */
+void shell_history_add_hosted(const char *line) { shell_history_add(line); }
 
 void shell_init_hosted(const char *argv0) {
     line_len = 0;

@@ -167,6 +167,8 @@ void signal_send(struct proc *p, int sig) {
     if (sig == SIGCONT) {
         p->pending_signals  &= ~SIGMASK_STOPS;
         p->sigstate.pending &= ~SIGMASK_STOPS;
+        p->stop_sig = 0;
+        p->stop_reported = false;
         if (p->state == PROC_STOPPED) {
             p->state = PROC_READY;
             sched_enqueue(p);
@@ -227,6 +229,25 @@ int signal_send_to_pid_checked(int pid, int sig) {
 
 void signal_send_to_pid(int pid, int sig) {
     (void)signal_send_to_pid_checked(pid, sig);
+}
+
+/* Kernel-internal group send (tty/pty line discipline: ^C/^Z to the
+ * foreground group). No caller-permission model -- the tty IS the
+ * authority on who its foreground group is. */
+void signal_send_to_pgrp(int pgrp, int sig) {
+    if (pgrp <= 0) return;
+    extern struct proc g_proc[];
+    int hits = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pgrp) {
+            signal_send(&g_proc[i], sig);
+            hits++;
+        }
+    }
+    (void)hits;
 }
 
 void signal_send_to_foreground(int sig) {
@@ -315,10 +336,39 @@ static void signal_apply_default(struct proc *p, int sig) {
         p->ptrace_stopped = 1;
         proc_wake_waiters(p->pid);
     }
+    /* Job control: record the stop so a WUNTRACED wait can report it
+     * exactly once. SIGCONT clears both fields. */
+    p->stop_sig = sig;
+    p->stop_reported = false;
     p->state = PROC_STOPPED;
     sched_yield();
     /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */
     p->ptrace_stopped = 0;
+}
+
+/* Cooperative stop point for long-held syscall loops (nanosleep). The IRQ
+ * tick cannot stop a proc that is parked inside a syscall loop -- measured
+ * on the interactive gate, not assumed -- so such loops must offer the stop
+ * themselves. Consumes and applies ONE pending default-disposition stop
+ * signal; returns true if the proc stopped (and has since been continued).
+ * False means the stop signal is CAUGHT -- the caller should EINTR so the
+ * handler can run at syscall exit. */
+bool signal_take_pending_stop(void) {
+    struct proc *p = current_proc();
+    if (!p) return false;
+    uint32_t stops = p->pending_signals & SIGMASK_STOPS;
+    if (!stops) return false;
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++)
+        if (stops & SIGMASK(i)) { sig = i; break; }
+    if (sig != SIGSTOP) {
+        struct sigaction *sa = &p->sigstate.actions[sig];
+        if (sa->sa_handler != SIG_DFL) return false;
+    }
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    signal_apply_default(p, sig);          /* parks here until SIGCONT */
+    return true;
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall

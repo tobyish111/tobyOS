@@ -3108,6 +3108,16 @@ static long sys_getenv(const char *name, char *out, size_t cap) {
 
 /* ---- time ------------------------------------------------------ */
 
+/* Signals whose pendency must NOT abort a sleep: the stop class (the tick
+ * delivery stops the proc in place; SIGCONT resumes it and the sleep runs
+ * on to its deadline, as Linux behaves) and the default-ignored set.
+ * Anything else acts on the process, so it interrupts. */
+#define SIGMASK_STOP_CLASS   (SIGMASK(SIGSTOP) | SIGMASK(SIGTSTP) | \
+                              SIGMASK(SIGTTIN) | SIGMASK(SIGTTOU))
+#define SLEEP_UNINTERRUPTING (SIGMASK_STOP_CLASS | \
+                              SIGMASK(SIGCONT) | SIGMASK(SIGCHLD) | \
+                              SIGMASK(SIGURG)  | SIGMASK(SIGWINCH))
+
 static long sys_nanosleep(uint64_t ns) {
     /* Resolution is set by the timer tick (~10 ms on QEMU) -- good enough
      * for the uses libc has in M25A (sleep, usleep).
@@ -3152,19 +3162,51 @@ static long sys_nanosleep(uint64_t ns) {
         sp->sleep_deadline_ns = end;
         sp->state = PROC_BLOCKED;
         if (had) bkl_exit();
+        /* Signal semantics, all MEASURED on the interactive gate:
+         *  - a signal that ACTS interrupts the sleep (EINTR) -- before
+         *    this, a SIGTERM sat pending for the sleep's full duration;
+         *  - a default STOP parks the proc RIGHT HERE and the remaining
+         *    sleep continues after SIGCONT, like Linux -- the IRQ tick
+         *    cannot stop a proc parked in this loop, so the loop offers
+         *    the stop itself (the deadline is disarmed across the stop so
+         *    the sweep cannot wake a STOPPED proc);
+         *  - a CAUGHT stop signal is an ordinary interruption (EINTR). */
+        bool intr = false;
         while (__atomic_load_n(&sp->sleep_deadline_ns, __ATOMIC_ACQUIRE) &&
                perf_now_ns() < end) {
+            if (sp->pending_signals & SIGMASK_STOP_CLASS) {
+                sp->sleep_deadline_ns = 0;
+                sp->state = PROC_RUNNING;
+                if (!signal_take_pending_stop()) { intr = true; break; }
+                if (perf_now_ns() >= end) break;
+                sp->sleep_deadline_ns = end;
+                sp->state = PROC_BLOCKED;
+                continue;
+            }
+            if (sp->pending_signals & ~SLEEP_UNINTERRUPTING) {
+                intr = true;
+                break;
+            }
             sched_yield();
         }
         sp->sleep_deadline_ns = 0;
         if (sp->state == PROC_BLOCKED) sp->state = PROC_RUNNING;
         if (had) bkl_enter();
+        if ((intr || (sp->pending_signals & ~SLEEP_UNINTERRUPTING)) &&
+            perf_now_ns() < end) return -ABI_EINTR;
         return 0;
     }
 
     bool had_bkl = bkl_held();
     if (had_bkl) bkl_exit();
     while (perf_now_ns() < end) {
+        {
+            struct proc *me = current_proc();
+            if (me && (me->pending_signals & ~SLEEP_UNINTERRUPTING)) {
+                if (had_bkl) bkl_enter();      /* EINTR, same as above */
+                return -ABI_EINTR;
+            }
+        }
         sched_yield();
         if (perf_now_ns() >= end) break;
         /* PAUSE-spin, NOT `sti(); hlt()`.
@@ -4193,6 +4235,29 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
         if (!pid) return -ABI_ENOENT;
     }
 
+    /* ABI_WUNTRACED: report a job-control stop once, without reaping.
+     * Native status encoding: 0x10000 | signal (the Linux 0x7f byte would
+     * collide with a real `exit 127`, which shells produce constantly).
+     * libtoby's WIFSTOPPED/WIFEXITED know the bit. */
+    if (flags & ABI_WUNTRACED) {
+        for (;;) {
+            struct proc *child = proc_lookup(pid);
+            if (!child) return -ABI_ENOENT;
+            if (child->state == PROC_STOPPED && !child->stop_reported) {
+                child->stop_reported = true;
+                uint32_t st = 0x10000u |
+                    (uint32_t)(child->stop_sig > 0 ? child->stop_sig : SIGSTOP);
+                if (status_out && put_user_u32(status_out, st) != 0)
+                    return -ABI_EFAULT;
+                return vpid;
+            }
+            if (child->state == PROC_TERMINATED) break;
+            if (flags & ABI_WNOHANG) return 0;
+            struct proc *self = current_proc();
+            if (self && self->pending_signals) return -ABI_EINTR;
+            sched_yield();
+        }
+    }
     if (flags & ABI_WNOHANG) {
         struct proc *child = proc_lookup(pid);
         if (!child) return -ABI_ENOENT;
@@ -10077,6 +10142,29 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * wakes on termination -- while the child traces itself and parks. Seen
          * exactly that way, with the tracer silent forever after
          * "[ptrace] pid=3 TRACEME". */
+        /* WUNTRACED (0x2): a JOB-CONTROL stop is reported, once, without
+         * reaping -- the yield-poll shape every blocking primitive in this
+         * kernel uses. This is what lets a shell's foreground wait see ^Z. */
+        if (options & 0x2 /* WUNTRACED */) {
+            for (;;) {
+                struct proc *c = proc_lookup(pid);
+                if (!c) return -ABI_ECHILD;
+                if (c->state == PROC_STOPPED && !c->stop_reported) {
+                    c->stop_reported = true;
+                    if (ustatus) {
+                        uint32_t st = ((uint32_t)(c->stop_sig > 0 ?
+                                       c->stop_sig : SIGSTOP) << 8) | 0x7fu;
+                        if (put_user_u32(ustatus, st) != 0) return -ABI_EFAULT;
+                    }
+                    return rvpid;     /* stopped: report, do NOT reap */
+                }
+                if (c->state == PROC_TERMINATED) break;   /* reap below */
+                if (options & 0x1 /* WNOHANG */) return 0;
+                struct proc *self = current_proc();
+                if (self && self->pending_signals) return -ABI_EINTR;
+                sched_yield();
+            }
+        }
         if (!(options & 0x1 /* WNOHANG */)) {
             int pr = proc_wait_or_ptrace(pid);
             if (pr == 1) {

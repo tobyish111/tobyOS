@@ -52,6 +52,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/wait.h>
+
+/* NOT <signal.h>: this file straddles the kernel headers (tobyos/signal.h
+ * arrives via the shell/proc includes) and libtoby's, whose sigaction/
+ * siginfo definitions collide. Declare the one libc entry point needed. */
+typedef void (*tsh_sighandler_fn)(int);
+extern tsh_sighandler_fn signal(int signum, tsh_sighandler_fn handler);
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -584,6 +591,23 @@ void signal_send_to_pid(int pid, int sig) { (void)kill(pid, sig); }
 int signal_send_to_pid_checked(int pid, int sig) { return kill(pid, sig); }
 int proc_set_pgid(int pid, int pgid) { return setpgid(pid, pgid); }
 
+/* Job-control seams for the monitor-mode foreground path. */
+int proc_wait_fg(int pid, int *stop_sig) {
+    int st = 0;
+    if (stop_sig) *stop_sig = 0;
+    if (waitpid(pid, &st, WUNTRACED) < 0) return -1;
+    if (WIFSTOPPED(st)) {
+        if (stop_sig) *stop_sig = WSTOPSIG(st);
+        return 0;
+    }
+    return WEXITSTATUS(st);
+}
+
+void shell_tty_set_fg_pgrp(int pgrp) {
+    int pg = pgrp > 0 ? pgrp : (int)getpgrp();
+    (void)ioctl(0, 0x5410UL /* TIOCSPGRP */, &pg);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 static void usage(void) {
@@ -592,6 +616,10 @@ static void usage(void) {
         "       tsh -c 'command'\n"
         "       tsh              (interactive)\n");
 }
+
+/* Absorb tty job-control signals that reach the shell itself. A handler,
+ * not SIG_IGN -- see the interactive setup below for why. */
+static void tsh_job_signal(int sig) { (void)sig; }
 
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
@@ -617,6 +645,17 @@ int main(int argc, char **argv) {
     /* Interactive: one line at a time. Deliberately not the kernel's raw-mode
      * editor -- history and cursor keys are a separate concern from the
      * language, and this keeps the hosted path free of terminal state. */
+    /* An interactive job-control shell must survive the tty's signals:
+     * ^C/^Z go to the FOREGROUND JOB (which owns the terminal while it
+     * runs), and any that reach the shell are absorbed. No-op HANDLERS,
+     * not SIG_IGN -- exec resets handlers to default in children but
+     * PRESERVES ignores, and an inherited ignore would make fg jobs
+     * immune to the very signals job control exists to route. */
+    signal(SIGINT,  tsh_job_signal);
+    signal(SIGTSTP, tsh_job_signal);
+    signal(SIGTTOU, tsh_job_signal);
+    signal(SIGTTIN, tsh_job_signal);
+
     /* PS1/PS2 come from the SHELL's variable table (they are rarely
      * exported, so getenv cannot see them), and prompts are written with a
      * bare write() so they reach the tty before the blocking read -- the
@@ -677,6 +716,7 @@ int main(int argc, char **argv) {
             cont = 1;
             continue;
         }
+        shell_history_add_hosted(accum);
         last = shell_run_line_hosted(accum);
         alen = 0;
         cont = 0;

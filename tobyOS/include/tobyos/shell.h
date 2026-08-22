@@ -82,6 +82,9 @@ int shell_line_incomplete_hosted(const char *s);
  * the exit status. The interactive loop must check this after every line. */
 bool shell_wants_exit_hosted(int *status);
 
+/* Record one interactive line in the history ring (what `fc` lists). */
+void shell_history_add_hosted(const char *line);
+
 /* Set $1..$n before running. */
 int  shell_set_args_hosted(int argc, char **argv);
 
