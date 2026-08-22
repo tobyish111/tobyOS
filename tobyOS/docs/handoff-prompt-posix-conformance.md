@@ -15,7 +15,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
 | bash-parity (hand-written) | `bash logs/shparity.sh` | **92/92** | ~4 min |
-| INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **6/6** (+ bash-vs-bash selfcheck every run) | ~4 min |
+| INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **7/7** (+ bash-vs-bash selfcheck every run) | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -212,9 +212,25 @@ foreground dance (`g_in_pipeline_stage`); gate deadlines are REAL TIME
 (the spin-count guess was 20× off); the interrupt settle waits for
 TIOCGPGRP to CHANGE, never for an interval.
 
-Still open interactively: SIGTSTP for the KERNEL console shell (the pty
-side is done), WCONTINUED, `%jobspec` arguments to kill/fg/bg beyond the
-defaults, and the long tail of XCU 2 the corpus already covers piecemeal. Case-writing law: the runner gives bash
+**The job-control arc is CLOSED (269963f, case 07).** The headline:
+**nothing had ever sent SIGCHLD** — signal.c promised it since M1; grep
+found the promise and no sender. Now sent at exit/stop/continue (the
+wait arms mask ignorable pendings from their EINTR checks so the signal
+can't interrupt the wait that serves it). WCONTINUED in both wait arms;
+console ^Z reaches the foreground GROUP and the monitor path is one code
+path for both hosts; %jobspec everywhere; prompt-time job notification
+(wait-consumed jobs are announced too — measured); the while/until cap
+went 1023→999999 (bash has no cap). Job words are "Done"/"Exit N" only:
+this kernel reports signal deaths as plain 128+sig, so the real bash
+here says "Exit 143". **Scheduler note (open item): a proc woken from a
+job-control stop STARVES while its waker spins userspace, running at the
+waker's next syscall (29ms vs 1.4s measured) — case 07's
+`kill %1; wait %1` one-liner is designed around it.** Corpus note:
+oilspec exclusion set now sometimes includes here-doc 1762 (guest bash
+disagrees with itself since SIGCHLD landed; screen prints both outputs).
+
+Still open: the long tail of XCU 2 the corpus already covers piecemeal,
+and the VSC-PCTS2016 email (§2). Case-writing law: the runner gives bash
 and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
 never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
