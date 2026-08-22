@@ -146,6 +146,10 @@ enum file_kind {
      * namespace outlives its last member while an fd still names it (the
      * mechanism `ip netns add` pins one with). See nsproxy.c. */
     FILE_KIND_NSFD       = 24,
+    /* 2026-08-22: a REAL inotify fd. sys_inotify_init used to return a
+     * bare instance INDEX -- the first caller got 0 and then read stdin
+     * believing it was watching the filesystem. */
+    FILE_KIND_INOTIFY    = 25,
 };
 
 struct eventfd;
@@ -215,6 +219,8 @@ struct file {
      * O_RDWR via F_GETFL -- a blanket-0 fcntl made it look read-only and
      * ImmediateCrash'd. Copied across dup() in file_clone. */
     int o_accmode;
+    /* For FILE_KIND_INOTIFY: the instance index in inotify.c's table. */
+    int inotify_id;
 };
 
 /* eventfd flags (Linux ABI) */

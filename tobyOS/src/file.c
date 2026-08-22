@@ -20,6 +20,7 @@
 #include <tobyos/socket.h>
 #include <tobyos/tcp.h>
 #include <tobyos/signal.h>   /* EINTR_RET */
+#include <tobyos/inotify.h>  /* real inotify fds (2026-08-22) */
 #include <tobyos/gui.h>
 #include <tobyos/term.h>
 #include <tobyos/heap.h>
@@ -351,6 +352,14 @@ struct file *file_clone(struct file *src) {
         f->pipe = src->pipe;
         f->pipe->writers++;
         break;
+    case FILE_KIND_INOTIFY:
+        /* dup/fork share the INSTANCE; the last close releases it. Found
+         * live: linux-watch bit4 forks, the child exits, and its
+         * close_all_fds released the parent's instance mid-poll -- a dead
+         * instance reads as "ready" (no-block) with nothing to read. */
+        f->inotify_id = src->inotify_id;
+        inotify_ref(f->inotify_id);
+        break;
     case FILE_KIND_VFS:
         /* Milestone 25A: dup()/dup2() of a VFS fd. The two struct file
          * objects MUST refer to the same underlying open description so
@@ -554,6 +563,9 @@ void file_close(struct file *f) {
     case FILE_KIND_NSFD:
         ns_file_close(f);      /* drops the fd's reference on the namespace */
         break;
+    case FILE_KIND_INOTIFY:
+        inotify_release(f->inotify_id);
+        break;
     case FILE_KIND_MEMFD:
         memfd_unref(f->memfd);   /* frees pages+object at the last ref */
         break;
@@ -641,6 +653,20 @@ long file_read(struct file *f, void *buf, size_t n) {
         file_pos_load(f);
         long r = f->vfs.ops->read(&f->vfs, buf, n);
         file_pos_store(f);
+        return r;
+    }
+    case FILE_KIND_INOTIFY: {
+        /* Block until at least one event is queued (pipe-style cooperative
+         * wait, EINTR on signals), unless IN_NONBLOCK. */
+        while (!inotify_readable(f->inotify_id)) {
+            if (inotify_nonblock(f->inotify_id)) return -ABI_EAGAIN;
+            struct proc *self = current_proc();
+            if (self && self->pending_signals) return EINTR_RET;
+            sched_yield();
+        }
+        long r = inotify_read(f->inotify_id, buf, n);
+        if (r < 0) return -1;
+        if (r == 0) return -ABI_EINVAL;   /* buffer < one event: Linux EINVAL */
         return r;
     }
     case FILE_KIND_SOCKET:

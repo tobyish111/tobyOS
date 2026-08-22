@@ -5315,7 +5315,13 @@ enum {
     LX_getpriority = 140, LX_setpriority = 141,
     LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
     LX_clock_getres = 229,
-    LX_time = 201, LX_inotify_add_watch = 253, LX_inotify_rm_watch = 254,
+    /* 2026-08-22: these two were OFF BY ONE for their whole life (x86-64:
+     * inotify_init=253, add_watch=254, rm_watch=255). Nobody noticed while
+     * the arms were argument-ignoring fakes; the first REAL implementation
+     * saw glibc's add_watch land in the rm arm and its rm fall into the
+     * ENOSYS census. */
+    LX_time = 201, LX_inotify_init = 253,
+    LX_inotify_add_watch = 254, LX_inotify_rm_watch = 255,
     LX_fallocate = 285, LX_statx = 332,
     /* B17: real busybox network clients arm an alarm-timeout (setitimer) around
      * each network op and ftruncate the wget output file. */
@@ -5894,6 +5900,9 @@ static int lx_conn_progress(struct sock *s);
 #define LXP_POLLERR  0x008
 #define LXP_POLLHUP  0x010
 #define LXP_POLLNVAL 0x020
+#define LXP_POLLRDHUP 0x2000   /* peer shut its write side; maskable, and
+                                * produced since 2026-08-22 -- an app
+                                * waiting SOLELY on EPOLLRDHUP never woke */
 #define LX_EINTR     4
 
 static short file_poll_ready(struct file *f) {
@@ -5916,12 +5925,17 @@ static short file_poll_ready(struct file *f) {
             else if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
         }
         break;
+    case FILE_KIND_INOTIFY:
+        if (inotify_readable(f->inotify_id)) r |= LXP_POLLIN;
+        break;
     case FILE_KIND_SOCKET:
         /* shutdown(2) readiness: a shut read side, or a peer's SHUT_WR
          * (rx_eof), makes the fd readable -- the read that follows returns
          * EOF without blocking. Kept in lockstep with sock_recv_ready. */
         if (f->sock && (f->sock->shut_rd || f->sock->rx_eof))
             r |= LXP_POLLIN;
+        if (f->sock && f->sock->rx_eof)
+            r |= LXP_POLLRDHUP;        /* the peer's write side is gone */
         if (f->sock && f->sock->kind == SOCK_KIND_NETLINK) {
             r |= LXP_POLLOUT;                          /* requests always accepted */
             if (f->sock->count > 0) r |= LXP_POLLIN;   /* a dump reply is queued */
@@ -5946,7 +5960,7 @@ static short file_poll_ready(struct file *f) {
                 int tf = tcp_poll_flags(c);
                 if (tf & TCP_RDY_RECV) r |= LXP_POLLIN;
                 if (tf & TCP_RDY_SEND) r |= LXP_POLLOUT;
-                if (tf & TCP_RDY_HUP)  r |= LXP_POLLHUP;
+                if (tf & TCP_RDY_HUP)  r |= LXP_POLLHUP | LXP_POLLRDHUP;
                 if (tf & TCP_RDY_ERR)  r |= LXP_POLLERR;
             }
         } else {
@@ -6293,13 +6307,22 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
 }
 
 /* ---- epoll ---- */
-#define EPOLL_MAX 64
-struct epoll_entry { int fd; uint32_t events; uint64_t data; bool used; };
+/* 2026-08-22: 64 -> 512. The 65th EPOLL_CTL_ADD answered ENOMEM, which
+ * capped every epoll-driven server at 64 connections -- an arbitrary wall
+ * nothing advertises. 512 entries is ~12 KiB per instance (kmalloc'd). */
+#define EPOLL_MAX 512
+/* EPOLLONESHOT is real since 2026-08-22 (it used to re-fire forever);
+ * EPOLLET is served as level -- see the comment at the scan for why an
+ * emulated edge would LOSE wakeups where level only adds spurious ones. */
+struct epoll_entry { int fd; uint32_t events; uint64_t data; bool used;
+                     uint32_t last_cond; };
 struct epoll_inst  { struct epoll_entry e[EPOLL_MAX]; };
 struct lx_epoll_event { uint32_t events; uint64_t data; } __attribute__((packed)); /* 12 B */
 #define LX_EPOLL_CTL_ADD 1
 #define LX_EPOLL_CTL_DEL 2
 #define LX_EPOLL_CTL_MOD 3
+#define LX_EPOLLET      0x80000000u
+#define LX_EPOLLONESHOT 0x40000000u
 
 static long lx_epoll_create(void) {
     struct file *f = (struct file *)kmalloc(sizeof(*f));
@@ -6331,7 +6354,7 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
             if (!ei->e[i].used && free_slot < 0) free_slot = i;
         }
         if (free_slot < 0) return -ABI_ENOMEM;
-        ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true };
+        ei->e[free_slot] = (struct epoll_entry){ fd, ev.events, ev.data, true, 0 };
 #ifdef CHROMIUM_BOOT
         /* [epreg] what chrome's IO threads actually poll on. The renderer's
          * IO threads block in epoll_wait forever after the bootstrap thread
@@ -6352,7 +6375,10 @@ static long lx_epoll_ctl(int epfd, int op, int fd, uint64_t uevent) {
     for (int i = 0; i < EPOLL_MAX; i++) {
         if (!ei->e[i].used || ei->e[i].fd != fd) continue;
         if (op == LX_EPOLL_CTL_DEL) { ei->e[i].used = false; return 0; }
-        if (op == LX_EPOLL_CTL_MOD) { ei->e[i].events = ev.events; ei->e[i].data = ev.data; return 0; }
+        if (op == LX_EPOLL_CTL_MOD) { ei->e[i].events = ev.events;
+                                      ei->e[i].data = ev.data;
+                                      ei->e[i].last_cond = 0;  /* re-arm edges */
+                                      return 0; }
     }
     return -2 /* ENOENT */;
 }
@@ -6375,14 +6401,30 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
             struct file *f = fd_lookup(ei->e[i].fd);
             if (f && f->kind == FILE_KIND_SOCKET) saw_sock = true;
             short cond = file_poll_ready(f);
-            uint32_t want = ei->e[i].events | LXP_POLLERR | LXP_POLLHUP;
+            uint32_t evbits = ei->e[i].events & ~(LX_EPOLLET | LX_EPOLLONESHOT);
+            /* A ONESHOT entry that already fired is DISARMED -- it reports
+             * nothing (not even ERR/HUP) until EPOLL_CTL_MOD re-arms it. */
+            if (evbits == 0 && (ei->e[i].events & LX_EPOLLONESHOT)) continue;
+            uint32_t want = evbits | LXP_POLLERR | LXP_POLLHUP;
             uint32_t rev  = (uint32_t)cond & want;
-            if (!rev) continue;
+            /* EPOLLET is served as LEVEL, deliberately. A scan-based
+             * tracker cannot see a drain-and-refill that happens BETWEEN
+             * two epoll_wait calls -- which is precisely every real ET
+             * app's loop (wake, drain, handle, re-wait) -- so honest
+             * edge-tracking here would go silent forever after the first
+             * cycle: a LOST wakeup. Level-triggering only adds spurious
+             * wakeups, which the epoll contract permits and every caller
+             * already tolerates. ONESHOT below is real. */
+            if (!rev) { ei->e[i].last_cond = 0; continue; }
+            ei->e[i].last_cond = rev;
             struct lx_epoll_event out = { rev, ei->e[i].data };
             if (copy_to_user((void *)(uintptr_t)(uevents + (uint64_t)n * sizeof(out)),
                              &out, sizeof(out)) != 0)
                 return -ABI_EFAULT;
             n++;
+            /* ONESHOT: disarm after one report; EPOLL_CTL_MOD re-arms. */
+            if (ei->e[i].events & LX_EPOLLONESHOT)
+                ei->e[i].events &= (LX_EPOLLET | LX_EPOLLONESHOT);
         }
         if (n > 0 || timeout_ms == 0 ||
             (!infinite && perf_now_ns() >= deadline)) {
@@ -10208,8 +10250,29 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * to obtain the fd they operate on -- so the whole subsystem was
      * unreachable. Flags (IN_NONBLOCK/IN_CLOEXEC) are accepted and ignored,
      * matching how pipe2/dup3 treat theirs here. */
-    case LX_inotify_init1:
-        return sys_inotify_init();
+    case LX_inotify_init:              /* legacy form: no flags argument */
+        a1 = 0;
+        /* fall through */
+    case LX_inotify_init1: {
+        /* Real fd since 2026-08-22. The old arm returned sys_inotify_init's
+         * raw instance INDEX: the first caller got 0 == stdin, registered
+         * "watches" that were counter values, and then blocked forever on
+         * a descriptor that was its own terminal. */
+        if (a1 & ~(uint64_t)(LX_O_CLOEXEC | 0x800)) return -ABI_EINVAL;
+        long id = sys_inotify_init();
+        if (id < 0) return id;
+        struct file *nf = (struct file *)kmalloc(sizeof *nf);
+        if (!nf) { inotify_release((int)id); return -ABI_ENOMEM; }
+        memset(nf, 0, sizeof *nf);
+        nf->kind = FILE_KIND_INOTIFY;
+        nf->inotify_id = (int)id;
+        int nfd = fd_alloc_into(current_proc(), nf);
+        if (nfd < 0) { kfree(nf); inotify_release((int)id); return -ABI_EMFILE; }
+        if (a1 & 0x800) inotify_set_nonblock((int)id, true);  /* IN_NONBLOCK */
+        if (a1 & LX_O_CLOEXEC)                                 /* IN_CLOEXEC */
+            fd_cloexec_set(current_proc(), nfd, 1);
+        return nfd;
+    }
 
     /* epoll_pwait2 is epoll_pwait with a timespec instead of an int ms.
      * Convert and delegate to the proven arm. */
@@ -11762,12 +11825,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     }
     case LX_inotify_add_watch: {
-        /* No real file-change events, but hand back a monotonic watch descriptor
-         * so callers (fontconfig, dir watching) proceed rather than erroring. */
-        static int g_lx_inotify_wd;
-        return ++g_lx_inotify_wd;
+        /* Real since 2026-08-22. The previous arm returned a bare counter
+         * and registered NOTHING -- fontconfig, glib file monitors and
+         * every watcher "succeeded" and then waited forever on events no
+         * machinery could produce. */
+        struct file *inf = fd_lookup((int)a1);
+        if (!inf || inf->kind != FILE_KIND_INOTIFY) return -ABI_EINVAL;
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path((const char *)a2, kpath, sizeof kpath) != 0)
+            return -ABI_EFAULT;
+        return sys_inotify_add_watch(inf->inotify_id, kpath, (uint32_t)a3);
     }
-    case LX_inotify_rm_watch:  return 0;
+    case LX_inotify_rm_watch: {
+        struct file *inf = fd_lookup((int)a1);
+        if (!inf || inf->kind != FILE_KIND_INOTIFY) return -ABI_EINVAL;
+        return sys_inotify_rm_watch(inf->inotify_id, (int)a2);
+    }
 
     /* ---- misc ---- */
     case LX_uname: {

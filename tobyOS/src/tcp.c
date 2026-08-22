@@ -1315,10 +1315,19 @@ int tcp_poll_flags(const struct tcp_conn *c) {
     if (c->remote_fin_seen || c->state == TCP_CLOSE_WAIT ||
         c->state == TCP_CLOSED || c->state >= TCP_FIN_WAIT_1)
         f |= TCP_RDY_HUP | TCP_RDY_RECV;
-    /* send() is OK while our send side is open: ESTABLISHED, or CLOSE_WAIT
-     * (peer closed their write half but we may still write). */
-    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT)
-        f |= TCP_RDY_SEND;
+    /* send() is OK while our send side is open (ESTABLISHED, or CLOSE_WAIT:
+     * peer closed their write half but we may still write) AND the window
+     * has room. 2026-08-22: the window half was missing -- POLLOUT was
+     * derived from STATE alone while tcp_send_nb returns 0 exactly when
+     * flight >= min(cwnd, snd_wnd), so under backpressure epoll said
+     * "writable", send said EAGAIN, and the caller busy-spun between the
+     * two answers. Same gate as tcp_send_nb, kept in lockstep. */
+    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) {
+        size_t flight = pend_flight_bytes(c);
+        size_t wnd = c->cwnd_bytes < (size_t)c->snd_wnd
+                       ? c->cwnd_bytes : (size_t)c->snd_wnd;
+        if (flight < wnd) f |= TCP_RDY_SEND;
+    }
     return f;
 }
 

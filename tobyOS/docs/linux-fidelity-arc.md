@@ -140,6 +140,34 @@ SOCK_NONBLOCK fixed in the same pass. New /bin/linux-cloexec (static glibc,
 6 bits — bit3 asserts survival/closure from INSIDE an exec'd child) rides
 lxposix. GREEN 11/11.
 
+### 2026-08-22 — inotify is real; epoll stops lying (lxposix 15/15)
+inotify: a REAL fd (FILE_KIND_INOTIFY, refcounted across dup/fork — the
+test's forked child releasing the parent's instance was found live),
+watches registered for real, and the VFS's four path-addressed mutators
+(create incl. open(O_CREAT), unlink, rename, mkdir) emit events with
+child names; rename FROM/TO pairs share a cookie. The matcher is
+non-recursive (exact or direct-child), as Linux watchers assume.
+fd-addressed vfs_write cannot emit IN_MODIFY — struct vfs_file carries no
+path (the same missing identity behind /proc fd readlink → "/"); one open
+item, not two. **FOUND: LX_inotify_add_watch/rm_watch were OFF BY ONE for
+their entire life** (x86-64: init=253/add=254/rm=255) — invisible while
+the arms were argument-ignoring fakes; the first honest implementation
+surfaced it in one boot (glibc's add landed in the rm arm; its rm fell
+into the ENOSYS census).
+
+epoll: cap 64→512 (the 65th ADD answered ENOMEM); EPOLLONESHOT really
+disarms until EPOLL_CTL_MOD; EPOLLRDHUP is produced (TCP HUP + AF_UNIX
+peer-SHUT_WR); TCP POLLOUT now consults the send window (same gate as
+tcp_send_nb — epoll said writable while send said EAGAIN, a busy-spin).
+**EPOLLET is deliberately served as LEVEL**: a scan-based edge tracker
+cannot see a drain-and-refill between two waits — precisely every real ET
+app's loop — so honest edge-tracking would LOSE wakeups where level only
+adds spurious ones. The test asserts the no-lost-wakeup contract.
+
+Test: `linux-watch` (63/63): real-fd probe, IN_CREATE/DELETE with names,
+rename cookie pair, poll wake from a forked child's create, 80-fd epoll,
+ET no-loss, ONESHOT disarm/rearm.
+
 ### 2026-08-22 — thread-group semantics: NPTL works (lxposix 14/14)
 SIG_MAX 32→64 (sigset_t → u64 end-to-end; ucontext layout unchanged — the
 old u32+pad occupied the same bytes; signals 1..63, Linux's 64 refused).

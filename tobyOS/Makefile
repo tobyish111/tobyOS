@@ -3154,6 +3154,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-nptl (thread-group semantics)";        \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-nptl";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-watch/linux-watch.elf ]; then                   \
+	    cp programs/linux-watch/linux-watch.elf                            \
+	         $(INITRD_STAGE)/bin/linux-watch;                              \
+	    echo "[initrd] staged linux-watch (inotify + epoll honesty)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-watch";                       \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

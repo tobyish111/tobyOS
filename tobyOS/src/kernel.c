@@ -7745,6 +7745,11 @@ void _start(void) {
              * killing the whole group, and getpid()==tgid in threads. */
             { "/bin/linux-nptl", "linux-nptl", 0, 63,
               "thread-group semantics (NPTL)" },
+            /* 2026-08-22: inotify is real (fd, watches, VFS-emitted events
+             * with names + rename cookies) and epoll stops lying (cap 512,
+             * ONESHOT disarms, ET never loses a wakeup). */
+            { "/bin/linux-watch", "linux-watch", 0, 63,
+              "inotify events + epoll honesty" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
