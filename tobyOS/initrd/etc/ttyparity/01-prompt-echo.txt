@@ -1,0 +1,6 @@
+# The basics: prompt, echo, output, next prompt -- the framing everything
+# else stands on. Lines starting with # are comments to the RUNNER.
+echo hello
+echo a b   c
+x=5; echo "x=$x"
+exit 7

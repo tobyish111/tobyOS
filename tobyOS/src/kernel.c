@@ -8728,6 +8728,32 @@ void _start(void) {
     }
 #endif
 
+#ifdef TTYPARITY_BOOT
+    /* The INTERACTIVE bash-parity gate. shparity above measures the script
+     * surface; this one runs both shells on a real pseudoterminal pair and
+     * compares the terminal byte streams -- prompts, PS2 continuation,
+     * ignoreeof, interactive option defaults. The runner validates ITSELF
+     * first (bash vs bash must produce identical transcripts) and aborts
+     * loudly if the pacing protocol is broken. */
+    {
+        char *argv[] = { (char *)"ttyparity", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/ttyparity", .name = "ttyparity",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] TTYPARITY: interactive bash-parity gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[TTYPARITY] VERDICT: SKIP reason=no-binary "
+                    "(/bin/ttyparity not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] TTYPARITY: gate (pid=%d) exit=%d\n", pid, rc);
+        }
+    }
+#endif
+
 #ifdef OILSPEC_BOOT
     /* The THIRD-PARTY shell conformance gate.
      *

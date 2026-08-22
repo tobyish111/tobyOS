@@ -514,6 +514,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/oilspec/oilspec.elf \
             programs/id/id.elf \
             programs/newgrp/newgrp.elf \
+            programs/ttyparity/ttyparity.elf \
             programs/spechelp/spechelp.elf \
             programs/tsh/tsh.elf \
             programs/devmgr/devmgr.elf \
@@ -1598,6 +1599,10 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
 # fresh shell; id is its observer. Both read /etc/passwd + /etc/group.
 $(eval $(call LIBTOBY_PROGRAM_RULES,id,id))
 $(eval $(call LIBTOBY_PROGRAM_RULES,newgrp,newgrp))
+
+# /bin/ttyparity -- the INTERACTIVE bash-parity gate: both shells on real
+# pty pairs, transcripts compared byte-for-byte. See programs/ttyparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,ttyparity,ttyparity))
 # /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
 # as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
 # rather than the 54 cases we wrote ourselves. See programs/oilspec.
@@ -2895,6 +2900,9 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
+	cp programs/ttyparity/ttyparity.elf             $(INITRD_STAGE)/bin/ttyparity
+	mkdir -p $(INITRD_STAGE)/etc/ttyparity
+	cp initrd/etc/ttyparity/*.txt                   $(INITRD_STAGE)/etc/ttyparity/
 	cp programs/oilspec/oilspec.elf                 $(INITRD_STAGE)/bin/oilspec
 	mkdir -p $(INITRD_STAGE)/etc/oilspec/bin
 # 2,776 case files: `cp a/*.sh b/` blows past the command-line limit here, so
@@ -3497,7 +3505,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
 	    bin/bluescreen                                                    \
-	    bin/tsh bin/shparity bin/oilspec                                  \
+	    bin/tsh bin/shparity bin/oilspec bin/ttyparity                    \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=0644 \
@@ -3521,6 +3529,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    etc/passwd etc/group \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    etc/shparity/*.sh \
+	    etc/ttyparity/*.txt \
 	    readme.txt
 # The 2,776 corpus scripts are DATA (run as `bash FILE`), so 0644 is right.
 # Tarred as a TREE, not a glob: 2,776 names is 75 KB of command line. The

@@ -277,8 +277,10 @@ static bool g_opt_pipefail;
 /* POSIX names a shell option for job CONTROL (`set -m` / `set -o monitor`),
  * on by default only in interactive shells. tsh runs its background-job
  * machinery unconditionally; the flag records what was asked for and is what
- * `$-` and `set +o` report. Per-job process groups are still an open item. */
-static bool g_opt_monitor;
+ * `$-` and `set +o` report. Starts ON like bash-at-a-terminal (the kernel
+ * shell is always a terminal session); the hosted script/-c paths clear it
+ * through shell_set_interactive_hosted(false), so no script sees a change. */
+static bool g_opt_monitor = true;
 /* `set -o ignoreeof`: an interactive EOF must not exit the shell. Only the
  * hosted interactive loop can see an EOF; everywhere else the flag is just
  * settable state, which is all a script can observe. */
@@ -19474,11 +19476,58 @@ void shell_poll(void) {
 
 /* Initialise shell state WITHOUT printing a banner or a prompt: a script run
  * must not emit anything the oracle would not. */
-void shell_set_interactive_hosted(bool on) { g_interactive = on; }
+void shell_set_interactive_hosted(bool on) {
+    g_interactive = on;
+    /* bash enables job control only for interactive shells; follow it, so a
+     * script never inherits monitor from the way the binary was invoked. */
+    g_opt_monitor = on;
+}
 
 /* `set -o ignoreeof` -- only the hosted interactive read loop can see an
  * EOF, and it lives in programs/tsh/host.c, outside this translation unit. */
 bool shell_opt_ignoreeof_hosted(void) { return g_opt_ignoreeof; }
+
+/* The interactive loop's prompts: PS1/PS2 are SHELL variables (usually not
+ * exported), so the host loop cannot see them through getenv -- it has to
+ * ask the variable table. NULL when unset. */
+const char *shell_get_var_hosted(const char *name) { return env_get(name); }
+
+/* Is this text a complete command, or does the interactive loop need to
+ * read another line (PS2)? TWO tests, same as the script reader: the
+ * quote/backslash walker, and -- when that says complete -- the structural
+ * scanner for an open compound (`if` without `fi`, `do` without `done`).
+ * The first REPL version ran only the quote walker, so `if true` at a
+ * prompt executed immediately and errored instead of prompting PS2.
+ * 0 complete, 1 join-with-newline, 2 backslash continuation. */
+int shell_line_incomplete_hosted(const char *s) {
+    int inc = shell_line_incomplete(s);
+    if (inc) return inc;
+    struct shell_scan scan;
+    shell_scan_init(&scan);
+    const char *p = s;
+    char lb[SHELL_PARSE_BUF_MAX];
+    while (*p) {
+        size_t n = 0;
+        while (p[n] && p[n] != '\n') n++;
+        if (n < sizeof lb) {
+            memcpy(lb, p, n);
+            lb[n] = '\0';
+            shell_scan_line(&scan, lb);
+        }
+        p += n + (p[n] ? 1 : 0);
+    }
+    return shell_scan_incomplete(&scan) ? 1 : 0;
+}
+
+/* Did the last line ask the shell to EXIT? The interactive loop has to
+ * ask, because `exit` is a builtin that can only set flow state -- and a
+ * REPL that never checks it simply keeps prompting, which is exactly what
+ * the interactive gate's first corpus run caught. */
+bool shell_wants_exit_hosted(int *status) {
+    if (g_shell_flow != SHELL_FLOW_EXIT) return false;
+    if (status) *status = g_shell_flow_status;
+    return true;
+}
 
 void shell_init_hosted(const char *argv0) {
     line_len = 0;

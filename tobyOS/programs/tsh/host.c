@@ -617,17 +617,28 @@ int main(int argc, char **argv) {
     /* Interactive: one line at a time. Deliberately not the kernel's raw-mode
      * editor -- history and cursor keys are a separate concern from the
      * language, and this keeps the hosted path free of terminal state. */
-    char line[4096];
+    /* PS1/PS2 come from the SHELL's variable table (they are rarely
+     * exported, so getenv cannot see them), and prompts are written with a
+     * bare write() so they reach the tty before the blocking read -- the
+     * interactive gate frames its whole protocol on prompt sentinels.
+     * Multi-line commands accumulate under PS2 using the same continuation
+     * test the script accumulator uses. */
+    static char line[4096];
+    static char accum[16384];
+    size_t alen = 0;
     int last = 0;
     int eofs = 0;
+    int cont = 0;
     for (;;) {
-        fputs("tsh$ ", stdout);
+        const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
+        if (!ps) ps = cont ? "> " : "tsh$ ";
+        write(1, ps, strlen(ps));
         size_t n = 0;
         for (;;) {
             char c;
             long r = read(0, &c, 1);
             if (r <= 0) {
-                if (n == 0) {
+                if (n == 0 && !cont) {
                     /* `set -o ignoreeof`: an EOF at the start of a line must
                      * not exit an interactive shell. bash gives up after ten
                      * in a row so a closed stdin cannot spin forever. */
@@ -635,7 +646,10 @@ int main(int argc, char **argv) {
                         fputs("Use \"exit\" to leave the shell.\n", stderr);
                         break;
                     }
-                    fputs("\n", stdout);
+                    /* bash announces an EOF exit -- the "exit" you see
+                     * when ^D ends an interactive shell is printed by the
+                     * shell, not echoed by the terminal. */
+                    write(1, "exit\n", 5);
                     return last;
                 }
                 break;
@@ -644,8 +658,36 @@ int main(int argc, char **argv) {
             if (n + 1 < sizeof line) line[n++] = c;
         }
         line[n] = '\0';
-        if (n == 0) continue;
+        if (n == 0 && !cont) continue;
         eofs = 0;
-        last = shell_run_line_hosted(line);
+        if (alen + n + 2 > sizeof accum) { alen = 0; cont = 0; continue; }
+        memcpy(accum + alen, line, n);
+        alen += n;
+        accum[alen] = '\0';
+        int inc = shell_line_incomplete_hosted(accum);
+        if (inc == 2 && alen > 0 && accum[alen - 1] == '\\') {
+            alen--;                        /* backslash-newline: splice */
+            accum[alen] = '\0';
+            cont = 1;
+            continue;
+        }
+        if (inc) {
+            accum[alen++] = '\n';          /* newline is part of the text */
+            accum[alen] = '\0';
+            cont = 1;
+            continue;
+        }
+        last = shell_run_line_hosted(accum);
+        alen = 0;
+        cont = 0;
+        {
+            int st;
+            if (shell_wants_exit_hosted(&st)) {
+                /* Measured on the gate's pty: interactive bash announces
+                 * "exit" for the exit BUILTIN too, not only for ^D. */
+                write(1, "exit\n", 5);
+                return st;
+            }
+        }
     }
 }

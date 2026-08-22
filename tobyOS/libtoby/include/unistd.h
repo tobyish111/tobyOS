@@ -60,6 +60,9 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 int     setpgid(pid_t pid, pid_t pgid);
 pid_t   getpgid(pid_t pid);
 pid_t   getpgrp(void);
+/* tty/pty control. Declared here rather than a separate <sys/ioctl.h>;
+ * the request constants live with the caller. */
+int     ioctl(int fd, unsigned long req, void *argp);
 uid_t   getuid (void);
 int     setuid (uid_t uid);      /* slice 14: real privilege drop */
 int     setgid (gid_t gid);

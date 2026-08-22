@@ -137,7 +137,12 @@ KSTUB(pmm_used_pages)
 KSTUB(proc_dump_table)
 KSTUB(proc_lookup)
 KSTUB(sectest_run)
-KSTUB(signal_set_foreground)
+/* NOT a complaining stub: the shell calls this for every foreground
+ * pipeline, and hosted tsh legitimately cannot own the console foreground
+ * -- that is the kernel shell's job. The one-line complaint was harmless
+ * noise on captured stderr and a parity-breaking byte stream on a pty,
+ * where fd 2 IS the terminal the gate compares. */
+long signal_set_foreground(void) { return 0; }
 KSTUB(slog_drain)
 KSTUB(slog_level_from_name)
 KSTUB(slog_stats)

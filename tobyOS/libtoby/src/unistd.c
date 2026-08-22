@@ -162,7 +162,14 @@ static void __toby_exit_trace(int code, void *caller) {
 }
 
 void _exit(int code) {
-    __toby_exit_trace(code, __builtin_return_address(0));
+    /* The trace stays for captured streams (harnesses read it), but NOT on
+     * a terminal: a byte-compared pty transcript -- or a human's screen --
+     * should not end with harness chatter. TCGETS succeeding on fd 2 means
+     * stderr is a tty. */
+    char tio_probe[64];
+    if (toby_sc3(ABI_SYS_IOCTL, 2, 0x5401 /* TCGETS */,
+                 (long)(uintptr_t)tio_probe) < 0)
+        __toby_exit_trace(code, __builtin_return_address(0));
     toby_sc1(ABI_SYS_EXIT, code);
     for (;;) { __asm__ volatile ("hlt"); }   /* unreachable */
 }
@@ -388,6 +395,12 @@ pid_t getpgid(pid_t pid) {
     return (pid_t)r;
 }
 pid_t getpgrp(void) { return getpgid(0); }
+
+int ioctl(int fd, unsigned long req, void *argp) {
+    long r = toby_sc3(ABI_SYS_IOCTL, fd, (long)req, (long)argp);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (int)r;
+}
 
 /* ---- socket API ------------------------------------------------- */
 

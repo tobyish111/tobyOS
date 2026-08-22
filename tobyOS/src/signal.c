@@ -901,13 +901,19 @@ int sys_kill(int pid, int sig) {
             target->sigstate.si_uid[sig] = p->uid;
         }
     } else if (pid == 0) {
-        /* Send to all processes in the same process group (simplified:
-         * send to all in same session) */
+        /* kill(0, sig): the CALLER'S PROCESS GROUP. The old "simplified:
+         * whole session" reading was harmless while pgids were lies, and
+         * became a live bug the moment they weren't: interactive bash's
+         * job-control init does kill(0, SIGTTIN) when it is not foreground,
+         * and the session broadcast stopped login and the gate runner
+         * along with bash itself. */
         extern struct proc g_proc[];
+        int mypg = p->pgid > 0 ? p->pgid : p->pid;
         for (int i = 1; i < PROC_MAX; i++) {
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO &&
-                g_proc[i].session_id == p->session_id) {
+                gp == mypg) {
                 /* A broadcast must not escape the caller's pid namespace: a
                  * container that can signal the host is not a container. The
                  * visibility map is the whole check. */

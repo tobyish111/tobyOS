@@ -70,6 +70,18 @@ int  shell_run_line_hosted(const char *text);
 /* Is `set -o ignoreeof` on? The interactive read loop asks at each EOF. */
 bool shell_opt_ignoreeof_hosted(void);
 
+/* Read a shell variable (PS1/PS2 are rarely exported, so getenv cannot see
+ * them). NULL when unset. */
+const char *shell_get_var_hosted(const char *name);
+
+/* Continuation test for the interactive loop: 0 = complete, 1 = incomplete
+ * (join with a newline), 2 = backslash continuation (drop the backslash). */
+int shell_line_incomplete_hosted(const char *s);
+
+/* True after a line whose execution asked the shell to exit; *status gets
+ * the exit status. The interactive loop must check this after every line. */
+bool shell_wants_exit_hosted(int *status);
+
 /* Set $1..$n before running. */
 int  shell_set_args_hosted(int argc, char **argv);
 

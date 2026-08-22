@@ -1033,9 +1033,14 @@ struct abi_vizmap {
  * above. */
 #define ABI_SYS_SETPGID         191
 #define ABI_SYS_GETPGID         192
+/* ioctl(fd, req, argp). Routed through the Linux personality's ioctl arm,
+ * so the tty/pty control surface (TIOC*, TC*) is ONE implementation for
+ * both ABIs. Added for the interactive parity gate, which needs the
+ * openpty handshake (TIOCGPTN) from a native program. */
+#define ABI_SYS_IOCTL           193
 
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          193
+#define ABI_SYS_NR_MAX          194
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

@@ -1575,6 +1575,9 @@ static long sys_getuid(void) {
  * credential models in one kernel drift, and the lenient one would be a privilege
  * bug rather than a cosmetic inconsistency. */
 static long lx_do_setid(bool is_uid, long id);
+/* Declared here (defined with the Linux table below) because the native
+ * dispatcher forwards ABI_SYS_IOCTL into it -- one tty/pty ioctl surface. */
+static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5);
 
 /* Process groups, shared by BOTH ABIs for the same drift-avoidance reason
  * as lx_do_setid. Until this existed LX_setpgid was a stub that RETURNED 0
@@ -4314,6 +4317,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return lx_do_setpgid(a1, a2);
     case ABI_SYS_GETPGID:
         return lx_do_getpgid(a1);
+    case ABI_SYS_IOCTL:
+        /* Forward to the Linux arm (LX_ioctl == 16): the tty/pty control
+         * surface is one implementation for both ABIs. */
+        return linux_syscall_impl(16, a1, a2, a3, 0, 0);
     case SYS_USERNAME:
         return sys_username((int)a1, (char *)a2, (size_t)a3);
     case SYS_CHMOD:
