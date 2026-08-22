@@ -52,6 +52,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
+#include <tobyos/flock.h>     /* POSIX record locks + flock (2026-08-22) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
@@ -301,6 +302,32 @@ struct file **proc_fds(struct proc *p) {
     return p ? p->fds : 0;
 }
 
+/* The close-on-exec bitmap rides with the fd TABLE, so a thread must see the
+ * leader's copy through the same indirection as proc_fds() -- otherwise one
+ * thread's fcntl(F_SETFD) is invisible to its siblings while the fd itself
+ * is shared, which is a divergence no userspace can debug. */
+static uint8_t *proc_cloexec(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->fd_cloexec;
+    }
+    return p ? p->fd_cloexec : 0;
+}
+
+void fd_cloexec_set(struct proc *p, int fd, int on) {
+    if (fd < 0 || fd >= PROC_NFDS) return;
+    uint8_t *m = proc_cloexec(p);
+    if (!m) return;
+    if (on) m[fd >> 3] |=  (uint8_t)(1u << (fd & 7));
+    else    m[fd >> 3] &= (uint8_t)~(1u << (fd & 7));
+}
+
+int fd_cloexec_get(struct proc *p, int fd) {
+    if (fd < 0 || fd >= PROC_NFDS) return 0;
+    uint8_t *m = proc_cloexec(p);
+    return m ? (m[fd >> 3] >> (fd & 7)) & 1 : 0;
+}
+
 static struct file *fd_lookup(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return 0;
     struct file **t = proc_fds(current_proc());
@@ -313,6 +340,10 @@ static int fd_alloc_into(struct proc *p, struct file *f) {
     for (int i = 0; i < PROC_NFDS; i++) {
         if (!t[i]) {
             t[i] = f;
+            /* A fresh slot starts NOT close-on-exec; a stale bit left by a
+             * previous tenant of this slot must not leak onto the new fd.
+             * Creators that want the flag set it after allocation. */
+            fd_cloexec_set(p, i, 0);
             return i;
         }
     }
@@ -359,6 +390,12 @@ static long sys_write(int fd, const void *buf, size_t len) {
      * program in the "write until the reader goes away" shape ran forever
      * instead of dying with 141. */
     if (rv == -3 && f->kind == FILE_KIND_PIPE_W) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+    }
+    /* Same POSIX rule for a socket whose write side was shutdown(2): the
+     * signal comes first, EPIPE is what a process that ignores it sees. */
+    if (rv == -ABI_EPIPE && f->kind == FILE_KIND_SOCKET) {
         struct proc *me = current_proc();
         if (me) signal_send_to_pid(me->pid, SIGPIPE);
     }
@@ -548,10 +585,19 @@ static long sys_pipe(int *user_fds_out) {
 
 static long sys_close(int fd) {
     if (fd < 0 || fd >= PROC_NFDS) return -1;
-    struct file **t = proc_fds(current_proc());
+    struct proc *p = current_proc();
+    struct file **t = proc_fds(p);
     if (!t || !t[fd]) return -1;
+    /* POSIX wart, faithfully kept: closing ANY descriptor for a file drops
+     * the process's fcntl record locks on that file -- even locks placed
+     * through a different, still-open descriptor. Software is written
+     * against this rule (SQLite documents fighting it), so diverging would
+     * change locking semantics underneath ported code. */
+    { extern void fl_release_close(struct file *f, struct proc *p);
+      fl_release_close(t[fd], p); }
     file_close(t[fd]);
     t[fd] = 0;
+    fd_cloexec_set(p, fd, 0);    /* the flag dies with the descriptor */
     return 0;
 }
 
@@ -2955,6 +3001,10 @@ static long sys_dup2(int oldfd, int newfd) {
         t[newfd] = 0;
     }
     t[newfd] = cl;
+    /* POSIX: the duplicate starts with FD_CLOEXEC clear (dup3(O_CLOEXEC)
+     * sets it again after this returns). Also scrubs any stale bit from
+     * newfd's previous tenant. */
+    fd_cloexec_set(current_proc(), newfd, 0);
     return newfd;
 }
 
@@ -5867,6 +5917,11 @@ static short file_poll_ready(struct file *f) {
         }
         break;
     case FILE_KIND_SOCKET:
+        /* shutdown(2) readiness: a shut read side, or a peer's SHUT_WR
+         * (rx_eof), makes the fd readable -- the read that follows returns
+         * EOF without blocking. Kept in lockstep with sock_recv_ready. */
+        if (f->sock && (f->sock->shut_rd || f->sock->rx_eof))
+            r |= LXP_POLLIN;
         if (f->sock && f->sock->kind == SOCK_KIND_NETLINK) {
             r |= LXP_POLLOUT;                          /* requests always accepted */
             if (f->sock->count > 0) r |= LXP_POLLIN;   /* a dump reply is queued */
@@ -6403,6 +6458,15 @@ static inline bool lx_sock_networked(struct sock *s) {
 #define LX_MSG_DONTWAIT  0x40         /* recv/send flag: never block this call */
 #define LX_MSG_PEEK      0x02         /* recv flag: read without dequeuing */
 
+/* Close-on-exec request bits (2026-08-22). Same value, many names: Linux
+ * defines O_CLOEXEC = SOCK_CLOEXEC = EFD_CLOEXEC = SFD_CLOEXEC =
+ * TFD_CLOEXEC = IN_CLOEXEC = EPOLL_CLOEXEC = 02000000 octal. memfd is the
+ * odd one out (MFD_CLOEXEC = 1), and the fcntl F_SETFD bit is FD_CLOEXEC=1. */
+#define LX_O_CLOEXEC     0x80000
+#define LX_FD_CLOEXEC    1
+#define LX_F_DUPFD          0
+#define LX_F_DUPFD_CLOEXEC  1030
+
 #define LX_SOCK_DEF_ACCEPT_MS  3000   /* fallback accept() wait (cooperative) */
 #define LX_SOCK_DEF_CONNECT_MS 5000   /* fallback connect() wait */
 
@@ -6566,8 +6630,11 @@ static long lx_socket(int domain, int type, int proto) {
  * AF_UNIX socketpairs (SOCK_SEQPACKET on Linux). This is in-process IPC, not
  * networking -- NO CAP_NET. Creates a connected pair of in-memory message
  * endpoints (see sock_unix_* in socket.c) and writes the two fds to sv[2].
- * SOCK_STREAM/DGRAM/SEQPACKET are all treated as message channels; the
- * SOCK_CLOEXEC/NONBLOCK type bits are ignored. No SCM_RIGHTS (fd passing) yet. */
+ * SOCK_STREAM/DGRAM/SEQPACKET are all treated as message channels.
+ * 2026-08-22: SOCK_NONBLOCK/SOCK_CLOEXEC used to be parsed and DISCARDED here
+ * -- unlike lx_socket and lx_accept, which honour them -- so a library that
+ * relied on the type bits instead of a follow-up fcntl got BLOCKING endpoints
+ * that leaked across exec. Both bits are honoured now. */
 static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     (void)proto;
     if (domain != AF_UNIX) return -LXE_EAFNOSUPPORT;
@@ -6578,11 +6645,17 @@ static long lx_socketpair(int domain, int type, int proto, uint64_t usv) {
     struct sock *a = 0, *b = 0;
     if (sock_unix_pair(&a, &b) != 0) return -ABI_EMFILE;   /* pool exhausted */
     a->sotype = b->sotype = (uint8_t)t;         /* slice 80: SEQPACKET stays SEQPACKET */
+    a->nonblock = b->nonblock = (type & SOCK_NONBLOCK) != 0;
 
     int fd0 = lx_sock_install(a);
     if (fd0 < 0) { sock_close(a); sock_close(b); return -ABI_EMFILE; }
     int fd1 = lx_sock_install(b);
     if (fd1 < 0) { sock_close(b); return -ABI_EMFILE; }    /* fd0/a leak on rare OOM */
+
+    if (type & LX_O_CLOEXEC) {                  /* SOCK_CLOEXEC, both ends */
+        fd_cloexec_set(current_proc(), fd0, 1);
+        fd_cloexec_set(current_proc(), fd1, 1);
+    }
 
     int fds[2] = { fd0, fd1 };
     if (copy_to_user((void *)usv, fds, sizeof fds) != 0) return -ABI_EFAULT;
@@ -6719,7 +6792,13 @@ static int lx_conn_progress(struct sock *s) {
         s->so_error   = LXE_ECONNREFUSED;
         return -LXE_ECONNREFUSED;
     }
-    if (s->conn_deadline && pit_ticks() >= s->conn_deadline) {
+    /* 2026-08-22: the deadline is in perf_now_ns() NANOSECONDS now. It was
+     * pit_hz()*ms ticks -- and under TCG the guest only RECEIVES ~1/15th of
+     * the programmed 1 kHz PIT IRQs, so every "5 s" connect deadline was
+     * really ~75 s (measured: blocking connect to a silent port classified
+     * at 75651 ms). perf_now_ns is TSC-backed and does not depend on IRQ
+     * delivery -- the same reason the timerfd path uses it. */
+    if (s->conn_deadline && perf_now_ns() >= s->conn_deadline) {
         s->connecting = 0;
         s->so_error   = LXE_ETIMEDOUT;
         return -LXE_ETIMEDOUT;
@@ -6768,9 +6847,24 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     /* Non-blocking listener: report EAGAIN rather than sitting in tcp_accept
      * for the whole timeout when no handshake is queued. */
     if (s->nonblock && !tcp_can_accept(s->tcp)) return -LXE_EAGAIN;
-    uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : LX_SOCK_DEF_ACCEPT_MS;
-    struct tcp_conn *child = tcp_accept(s->tcp, to);
-    if (!child) return -LXE_EAGAIN;
+    struct tcp_conn *child;
+    if (s->recv_timeout_ms) {
+        /* SO_RCVTIMEO applies to accept on Linux; expiry is EAGAIN. */
+        child = tcp_accept(s->tcp, s->recv_timeout_ms);
+        if (!child) return -LXE_EAGAIN;
+    } else {
+        /* A BLOCKING accept waits indefinitely. The 3 s default that used
+         * to sit here (LX_SOCK_DEF_ACCEPT_MS) made every classic server
+         * loop -- Python sock.accept(), sshd, inetd shapes -- take a
+         * spurious EAGAIN, which a blocking socket must never return.
+         * Wait in 500 ms slices so a signal can break in as EINTR. */
+        for (;;) {
+            child = tcp_accept(s->tcp, 500);
+            if (child) break;
+            struct proc *me = current_proc();
+            if (me && me->pending_signals) return -LXE_EINTR;
+        }
+    }
     struct sock *ns = sock_alloc(SOCK_KIND_TCP);
     if (!ns) { tcp_close(child); return -ABI_EMFILE; }
     ns->tcp = child;
@@ -6875,14 +6969,63 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         s->tcp        = nc;
         s->connecting = 1;
         s->so_error   = 0;
-        uint32_t hz = pit_hz(); if (!hz) hz = 100;
-        s->conn_deadline = pit_ticks() + ((uint64_t)hz * to) / 1000u;
+        s->conn_deadline = perf_now_ns() + (uint64_t)to * 1000000ull;
         return -LXE_EINPROGRESS;
     }
 
-    struct tcp_conn *c = tcp_connect(sa.sin_addr, sa.sin_port, to);
-    if (!c) return -LXE_ECONNREFUSED;
-    s->tcp = c;
+    /* BLOCKING connect, via the same machinery as the non-blocking path so
+     * the outcome is CLASSIFIED: an RST is ECONNREFUSED, silence is
+     * ETIMEDOUT. The old tcp_connect() call collapsed both into
+     * ECONNREFUSED after 5 s -- "the peer refused" and "the peer never
+     * answered" are different diagnoses and software acts on the
+     * difference (retry policy, error messages, failover). */
+    if (s->connecting) return -LXE_EALREADY;
+    if (s->tcp) return -LXE_EISCONN;
+    struct tcp_conn *nc = tcp_connect_nb(sa.sin_addr, sa.sin_port);
+    if (!nc) return -LXE_ECONNREFUSED;           /* no slot / no route */
+    s->tcp        = nc;
+    s->connecting = 1;
+    s->so_error   = 0;
+    s->conn_deadline = perf_now_ns() + (uint64_t)to * 1000000ull;
+    for (;;) {
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        net_poll();                              /* pump the SYN-ACK in */
+        int pr = lx_conn_progress(s);
+        if (pr == 1) return 0;
+        if (pr < 0)  return pr;                  /* refused or timed out; the
+                                                  * conn is torn down by close,
+                                                  * same as the nb path */
+        struct proc *me = current_proc();
+        if (me && me->pending_signals) return -LXE_EINTR;
+        sched_yield();
+    }
+}
+
+/* shutdown(2), real since 2026-08-22. how: 0=SHUT_RD 1=SHUT_WR 2=SHUT_RDWR.
+ * The old `return 0` meant no half-close existed at all -- every client in
+ * the "send request, shutdown(SHUT_WR), read to EOF" shape hung forever.
+ * TCP WR: send FIN now, keep receiving (tcp_shutdown_tx). AF_UNIX WR: the
+ * peer reads EOF once its ring drains (rx_eof) but can still SEND to us --
+ * severing the peer link (what full close does) would kill both directions,
+ * which is exactly what half-close is not. */
+static long lx_shutdown(int fd, int how) {
+    struct sock *s = lx_sock_of(fd);
+    if (!s) return -LXE_ENOTSOCK;
+    if (how < 0 || how > 2) return -ABI_EINVAL;
+    bool rd = (how == 0 || how == 2);
+    bool wr = (how == 1 || how == 2);
+    if (s->kind == SOCK_KIND_TCP) {
+        if (!s->tcp || s->tcp_listening) return -LXE_ENOTCONN;
+        if (wr && !s->shut_tx) tcp_shutdown_tx(s->tcp);
+    } else if (s->kind == SOCK_KIND_UNIX) {
+        if (wr && !s->shut_tx) sock_unix_shutdown_tx(s);
+    } else if (s->kind == SOCK_KIND_UDP) {
+        if (!s->peer_port) return -LXE_ENOTCONN;
+    }
+    if (wr) s->shut_tx = 1;
+    if (rd) sock_shutdown_rd(s);
+    poll_event_notify();                       /* pollers re-derive readiness */
     return 0;
 }
 
@@ -6910,6 +7053,14 @@ static bool lx_udp_dest(struct sock *s, uint64_t uaddr,
 static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+
+    /* After shutdown(SHUT_WR) a send is EPIPE, and POSIX raises SIGPIPE
+     * first -- same contract as writing a readerless pipe (sys_write). */
+    if (s->shut_tx) {
+        struct proc *me = current_proc();
+        if (me) signal_send_to_pid(me->pid, SIGPIPE);
+        return -ABI_EPIPE;
+    }
 
     if (s->kind == SOCK_KIND_UDP) {
         uint32_t dip; uint16_t dport;
@@ -7014,6 +7165,9 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
                     uint64_t ualen, int flags) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
+
+    /* shutdown(SHUT_RD): reads report EOF from now on. */
+    if (s->shut_rd) return 0;
 
     /* This call must not block if the socket is in non-blocking mode OR the
      * caller passed MSG_DONTWAIT for this one call. Both matter here: chrome's
@@ -7261,7 +7415,27 @@ static long lx_getsockopt(int fd, int level, int optname,
                           uint64_t uval, uint64_t ulen_ptr) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
-    if (level != SOL_SOCKET || !uval || !ulen_ptr) return 0;
+    if (level != SOL_SOCKET) {
+        /* Options at other levels (SOL_TCP/SOL_IP/...) are not tracked.
+         * This used to `return 0` WITHOUT WRITING optval -- "success" with
+         * the caller's stack garbage as the answer, a plausible
+         * __stack_chk_fail generator. Answer ZERO of the caller's size
+         * instead: every untracked option reads as disabled/default, which
+         * is both defined and true (setsockopt discarded it). */
+        if (uval && ulen_ptr) {
+            uint32_t zl = 0;
+            if (copy_from_user(&zl, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
+                return -ABI_EFAULT;
+            if (zl > 64) zl = 64;
+            uint8_t zeros[64];
+            memset(zeros, 0, sizeof zeros);
+            if (zl && copy_to_user((void *)(uintptr_t)uval, zeros, zl) != 0)
+                return -ABI_EFAULT;
+            (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &zl, 4);
+        }
+        return 0;
+    }
+    if (!uval || !ulen_ptr) return 0;
 
     uint32_t ulen = 0;
     if (copy_from_user(&ulen, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
@@ -8883,10 +9057,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         bool got_kp = (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0);
         if (got_kp) {
             struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
-                return linux_open_dir(kpath);
+            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+                long dfd = linux_open_dir(kpath);
+                if (dfd >= 0 && (a2 & LX_O_CLOEXEC))
+                    fd_cloexec_set(current_proc(), (int)dfd, 1);
+                return dfd;
+            }
         }
         long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
+        if (ofd >= 0 && (a2 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)ofd, 1);
 #ifdef CHROMIUM_BOOT
         /* [lopen] path->fd, so [libmap]'s per-mapping fd can be resolved to a
          * FILE PATH offline (match a [libmap] fd=N line to the most recent
@@ -8917,8 +9097,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                             kpath, sizeof kpath) == 0);
         if (got_kp) {
             struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR)
-                return linux_open_dir(kpath);
+            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+                long dfd = linux_open_dir(kpath);
+                if (dfd >= 0 && (a3 & LX_O_CLOEXEC))
+                    fd_cloexec_set(current_proc(), (int)dfd, 1);
+                return dfd;
+            }
 #ifdef CHROMIUM_BOOT
             /* SQLite WAL -shm: memfd pre-size still busy-loops (mmap/lock).
              * ENOENT forces rollback-journal fallback (ServerCertificate path). */
@@ -8937,6 +9121,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
         }
         long ofd = do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+        if (ofd >= 0 && (a3 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)ofd, 1);
 #ifdef CHROMIUM_BOOT
         if (ofd >= 0 && got_kp) {
             static int lo = 0;
@@ -8969,32 +9155,68 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     case LX_dup:    return do_syscall(SYS_DUP, a1, 0, 0, 0, 0);
     /* B12: shell pipelines wire stage fds with dup2/dup3 and create the pipe
-     * with pipe or pipe2. dup3's flags (O_CLOEXEC) and pipe2's flags
-     * (O_CLOEXEC/O_NONBLOCK) are accepted but not tracked -- short-lived
-     * pipeline stages exec immediately, so CLOEXEC is moot and the blocking
-     * pipe semantics already give correct EOF/EPIPE. dup3 requires
-     * oldfd != newfd (EINVAL otherwise), unlike dup2. */
+     * with pipe or pipe2. dup3 requires oldfd != newfd (EINVAL otherwise),
+     * unlike dup2. CLOEXEC is tracked for real now (2026-08-22): the old
+     * "short-lived pipeline stages exec immediately, so CLOEXEC is moot"
+     * reasoning was exactly backwards -- exec is the moment the flag acts,
+     * and dropping it leaked every marked descriptor into the new image. */
     case LX_dup2:   return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
-    case LX_dup3:
+    case LX_dup3: {
         if (a1 == a2) return -ABI_EINVAL;
-        return do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
+        if (a3 & ~(uint64_t)LX_O_CLOEXEC) return -ABI_EINVAL;
+        long r = do_syscall(SYS_DUP2, a1, a2, 0, 0, 0);
+        if (r >= 0 && (a3 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)r, 1);
+        return r;
+    }
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
-    case LX_pipe2:  return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+    case LX_pipe2: {
+        long r = do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
+        if (r == 0 && (a2 & LX_O_CLOEXEC)) {
+            /* sys_pipe just wrote the two fds into the user's int[2];
+             * read them back to mark them. */
+            int ufds[2];
+            if (copy_from_user(ufds, (const void *)a1, sizeof ufds) == 0) {
+                fd_cloexec_set(current_proc(), ufds[0], 1);
+                fd_cloexec_set(current_proc(), ufds[1], 1);
+            }
+        }
+        return r;
+    }
 
     /* ---- Track C: eventfd/eventfd2 (libcurl multi-handle wakeup fd) ---- */
     case LX_eventfd:   return lx_eventfd((unsigned int)a1, 0);
-    case LX_eventfd2:  return lx_eventfd((unsigned int)a1, (unsigned int)a2);
-    case 319:          /* memfd_create(name, flags) */
-        return lx_memfd_create((const char *)a1, (unsigned int)a2);
+    case LX_eventfd2: {
+        long efd = lx_eventfd((unsigned int)a1, (unsigned int)a2);
+        if (efd >= 0 && (a2 & LX_O_CLOEXEC))     /* EFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)efd, 1);
+        return efd;
+    }
+    case 319: {        /* memfd_create(name, flags) -- MFD_CLOEXEC is bit 0 */
+        long mfd = lx_memfd_create((const char *)a1, (unsigned int)a2);
+        if (mfd >= 0 && (a2 & 1u))
+            fd_cloexec_set(current_proc(), (int)mfd, 1);
+        return mfd;
+    }
 
     /* ---- B14: BSD sockets (FILE_KIND_SOCKET fds; poll/epoll-ready) ---- */
-    case LX_socket:      return lx_socket((int)a1, (int)a2, (int)a3);
+    case LX_socket: {
+        long sfd = lx_socket((int)a1, (int)a2, (int)a3);
+        if (sfd >= 0 && (a2 & LX_O_CLOEXEC))     /* SOCK_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)sfd, 1);
+        return sfd;
+    }
     case LX_bind:        return lx_bind((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_listen:      return lx_listen((int)a1, (int)a2);
     case LX_accept:      return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, 0);
     /* accept4's 4th arg carries SOCK_NONBLOCK/SOCK_CLOEXEC for the NEW fd
      * (they are not inherited from the listener). */
-    case LX_accept4:     return lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
+    case LX_accept4: {
+        long afd = lx_accept((int)a1, (uint64_t)a2, (uint64_t)a3, (int)a4);
+        if (afd >= 0 && (a4 & LX_O_CLOEXEC))     /* SOCK_CLOEXEC */
+            fd_cloexec_set(current_proc(), (int)afd, 1);
+        return afd;
+    }
     case LX_connect:     return lx_connect((int)a1, (uint64_t)a2, (uint32_t)a3);
     case LX_sendto:      return lx_send((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5);
     /* recvfrom(fd, buf, len, flags, src_addr, addrlen). a4 is FLAGS and was
@@ -9008,7 +9230,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_getpeername: return lx_getpeername((int)a1, (uint64_t)a2, (uint64_t)a3);
     case LX_socketpair:  return lx_socketpair((int)a1, (int)a2, (int)a3, (uint64_t)a4);
-    case LX_shutdown:    return 0;       /* half-close not modelled; close() tears down */
+    case LX_shutdown:    return lx_shutdown((int)a1, (int)a2);  /* real half-close (2026-08-22) */
 
     /* gettimeofday(2): fill timeval from the monotonic clock (no RTC epoch; the
      * value increases, which is what chrome's timestamp deltas need). tz ign. */
@@ -9057,8 +9279,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return lx_do_select((int)a1, (uint64_t)a2, (uint64_t)a3, (uint64_t)a4, ms);
     }
     case LX_epoll_create:          /* epoll_create(size) -- size ignored */
-    case LX_epoll_create1:         /* epoll_create1(flags) -- flags ignored */
         return lx_epoll_create();
+    case LX_epoll_create1: {       /* epoll_create1(flags) -- EPOLL_CLOEXEC */
+        long epfd = lx_epoll_create();
+        if (epfd >= 0 && (a1 & LX_O_CLOEXEC))
+            fd_cloexec_set(current_proc(), (int)epfd, 1);
+        return epfd;
+    }
     case LX_epoll_ctl:             /* epoll_ctl(epfd, op, fd, *event) */
         return lx_epoll_ctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
     case LX_epoll_wait:            /* epoll_wait(epfd, *events, maxevents, timeout) */
@@ -9169,6 +9396,35 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                   (long)how.mode, 0);
     }
 
+    case 436: {                        /* close_range(first, last, flags) */
+        /* glibc's closefrom(3) and every "close inherited fds before exec"
+         * loop in modern daemons. CLOSE_RANGE_CLOEXEC (0x4) marks instead
+         * of closing. CLOSE_RANGE_UNSHARE (0x2) detaches the caller's fd
+         * table from other threads first -- honoured as the no-op it is for
+         * a non-thread (its table is already private) and REFUSED for a
+         * thread, whose table here is structurally the leader's: closing
+         * shared fds while claiming to have unshared would be the lie. */
+        unsigned first = (unsigned)a1, last = (unsigned)a2, crf = (unsigned)a3;
+        if (first > last) return -ABI_EINVAL;
+        if (crf & ~0x6u) return -ABI_EINVAL;
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        if ((crf & 0x2u) && me->is_thread) return -ABI_EINVAL;
+        struct file **tab = proc_fds(me);
+        if (!tab) return -ABI_EPERM;
+        unsigned hi = last >= PROC_NFDS ? PROC_NFDS - 1 : last;
+        for (unsigned i = first; i <= hi; i++) {
+            if (!tab[i]) continue;
+            if (crf & 0x4u) {
+                fd_cloexec_set(me, (int)i, 1);
+            } else {
+                file_close(tab[i]);
+                tab[i] = 0;
+                fd_cloexec_set(me, (int)i, 0);
+            }
+        }
+        return 0;
+    }
 
     /* chmod/fchmodat. Slice 86: these used to validate the path and then
      * throw the mode away, on the belief that the VFS did not model
@@ -9837,6 +10093,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!tf) return -ABI_ENOMEM;
         int fd = fd_alloc_into(current_proc(), tf);
         if (fd < 0) { file_close(tf); return -ABI_EMFILE; }
+        if (a2 & LX_O_CLOEXEC)                /* TFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), fd, 1);
         return fd;
     }
     case LX_timerfd_settime: {   /* (fd, flags, new_value, old_value) */
@@ -9891,6 +10149,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!sf) return -ABI_ENOMEM;
         int fd = fd_alloc_into(current_proc(), sf);
         if (fd < 0) { file_close(sf); return -ABI_EMFILE; }
+        if (flags & LX_O_CLOEXEC)             /* SFD_CLOEXEC */
+            fd_cloexec_set(current_proc(), fd, 1);
         return fd;
     }
 
@@ -9985,10 +10245,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                      * write is already durable -- report success. */
     case LX_fdatasync:
         return 0;
-    case LX_flock:                  /* single-process chrome: advisory locks are a
-                                     * no-op that must SUCCEED (leveldb/SQLite hold
-                                     * a LOCK file and bail if locking errors). */
-        return 0;
+    case LX_flock: {                /* real since 2026-08-22 (src/flock.c).
+                                     * The old no-op satisfied leveldb/SQLite's
+                                     * "locking must not error" check while
+                                     * excluding nobody; now a second process
+                                     * really is kept out of the LOCK file. */
+        struct file *lf = fd_lookup((int)a1);
+        if (!lf) return -ABI_EBADF;
+        return fl_flock(lf, current_proc(), (int)a2);
+    }
 
     /* ---- process control (B8): the shell forks, execs, and waits ---- */
     case LX_fork:
@@ -11899,6 +12164,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             struct file *cl = file_clone(ff);
             if (!cl) return -ABI_ENOMEM;
             tab[nfd] = cl;
+            /* The duplicate's own FD_CLOEXEC starts from the command, never
+             * from a stale bit left in this slot by a previous tenant. */
+            fd_cloexec_set(p, nfd, (int)a2 == LX_F_DUPFD_CLOEXEC);
 #ifdef CHROMIUM_BOOT
             { static int c = 0; if (c < 24) { c++;
                 kprintf("[fcntl] F_DUPFD%s fd=%d min=%d -> %d (kind=%d)\n",
@@ -11907,10 +12175,45 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
             return nfd;
         }
+        /* POSIX record locks: real since 2026-08-22 (src/flock.c). The
+         * previous blanket `return 0` told SQLite and every multi-process
+         * database "you hold the lock" with no exclusion behind it --
+         * silent corruption instead of contention, the worst available
+         * failure. OFD variants (36-38) share the handler; their owner is
+         * approximated as the process, which errs toward extra conflicts,
+         * never missing ones. */
+        if ((int)a2 == 5 || (int)a2 == 6 || (int)a2 == 7 ||
+            (int)a2 == 36 /* F_OFD_GETLK */ || (int)a2 == 37 ||
+            (int)a2 == 38) {
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            struct lx_flock kfl;
+            if (!a3 || copy_from_user(&kfl, (const void *)a3, sizeof kfl) != 0)
+                return -ABI_EFAULT;
+            int cmd = (int)a2 >= 36 ? (int)a2 - 31 : (int)a2;  /* 36-38 -> 5-7 */
+            long lr = fl_fcntl(ff, current_proc(), cmd, &kfl);
+            if (lr == 0 && cmd == 5 &&
+                copy_to_user((void *)a3, &kfl, sizeof kfl) != 0)
+                return -ABI_EFAULT;
+            return lr;
+        }
+        /* F_GETFD/F_SETFD: real since 2026-08-22 -- close-on-exec is
+         * tracked per-descriptor (proc.h fd_cloexec) and acted on by
+         * execve. The years of `return 0` here meant every descriptor
+         * leaked into every exec'd image. */
+        if ((int)a2 == 1 /* F_GETFD */) {
+            if (!fd_lookup((int)a1)) return -ABI_EBADF;
+            return fd_cloexec_get(current_proc(), (int)a1) ? LX_FD_CLOEXEC : 0;
+        }
+        if ((int)a2 == 2 /* F_SETFD */) {
+            if (!fd_lookup((int)a1)) return -ABI_EBADF;
+            fd_cloexec_set(current_proc(), (int)a1,
+                           ((unsigned long)a3 & LX_FD_CLOEXEC) != 0);
+            return 0;
+        }
         /* EVERY OTHER COMMAND STILL HAS TO CHECK THE DESCRIPTOR EXISTS.
          *
-         * F_GETFD/F_SETFD are no-ops here -- close-on-exec is not tracked --
-         * but "no-op" is not "always succeeds". Answering 0 for a CLOSED fd
+         * "no-op" is not "always succeeds". Answering 0 for a CLOSED fd
          * told every caller that the descriptor was open, and the real bash
          * in the initrd uses exactly that to decide whether a redirection
          * needs saving:
@@ -11925,7 +12228,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * of. It also made the conformance oracle wrong on three cases where
          * tsh had the right answer all along. */
         if (!fd_lookup((int)a1)) return -ABI_EBADF;
-        return 0;               /* F_GETFD/F_SETFD/CLOEXEC: best-effort no-op */
+        return 0;               /* record locks &c: best-effort no-op */
     }
     case LX_sendfile:           /* cat/cp fall back to a read/write loop */
         return -ABI_ENOSYS;

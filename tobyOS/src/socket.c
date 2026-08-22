@@ -566,6 +566,8 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         if (!self->in_use)       return -1;
         if (self->peer_ip == 0 && !self->x_server)
             return 0;                            /* peer closed + drained -> EOF */
+        if (self->rx_eof || self->shut_rd)
+            return 0;                            /* peer SHUT_WR / own SHUT_RD -> EOF */
         if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
         /* Cooperative wait: drop the BKL so peers/siblings can run. On UP,
          * a bare hlt returns to THIS context after the IRQ — READY clone3
@@ -651,6 +653,26 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
 struct sock *sock_peer_of(struct sock *self) {
     if (!self || self->kind != SOCK_KIND_UNIX) return 0;
     return sock_peer_checked(self);      /* slice 89: generation-validated */
+}
+
+/* shutdown(2) helpers (2026-08-22). Live here because the wait queue is
+ * this file's private machinery. */
+void sock_shutdown_rd(struct sock *s) {
+    if (!s) return;
+    s->shut_rd = 1;
+    wq_wake_all(&s->wq_recv);              /* a blocked read returns EOF */
+}
+
+/* SHUT_WR on an AF_UNIX endpoint: the peer reads EOF once its ring drains,
+ * but its OWN sends keep working -- deliberately NOT sock_unix_peer_close,
+ * which severs the link (peer_ip = 0) and kills both directions. */
+void sock_unix_shutdown_tx(struct sock *self) {
+    if (!self || self->kind != SOCK_KIND_UNIX) return;
+    struct sock *peer = sock_peer_of(self);
+    if (peer && peer->in_use) {
+        peer->rx_eof = 1;
+        wq_wake_all(&peer->wq_recv);
+    }
 }
 
 void sock_unix_peer_close(struct sock *self) {
@@ -974,6 +996,9 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
  * makes recv return without blocking). */
 bool sock_recv_ready(struct sock *s) {
     if (!s || !s->in_use) return true;         /* dead socket: recv returns at once */
+    /* shutdown(2): a shut read side or a peer's SHUT_WR both make recv
+     * return EOF without blocking -- that IS readiness. */
+    if (s->shut_rd || s->rx_eof) return true;
     if (s->kind == SOCK_KIND_TCP) {
         if (!s->tcp) return true;              /* unconnected -> immediate error */
         return (tcp_poll_flags(s->tcp) & (TCP_RDY_RECV | TCP_RDY_ERR)) != 0;

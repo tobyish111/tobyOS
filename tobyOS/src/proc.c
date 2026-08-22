@@ -320,6 +320,10 @@ struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
 /* ---- per-process fd table helpers --------------------------------- */
 
 static void close_all_fds(struct proc *p) {
+    /* Exit sweep: the process's fcntl record locks die with it (flock
+     * locks die with their descriptions inside file_close below). */
+    { extern void fl_release_proc(struct proc *p);
+      fl_release_proc(p); }
     for (int i = 0; i < PROC_NFDS; i++) {
         if (p->fds[i]) {
             file_close(p->fds[i]);

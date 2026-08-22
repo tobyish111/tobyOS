@@ -1539,6 +1539,22 @@ static int pred_closed_basic(const struct tcp_conn *c) {
     return 0;
 }
 
+/* Half-close (shutdown(SHUT_WR)): send our FIN and keep RECEIVING. The
+ * transition pair is tcp_close's opening move, but nothing here waits and
+ * nothing frees -- the connection stays live for inbound data until the
+ * fd's real close runs the rest of the handshake. Idempotent: a connection
+ * already past ESTABLISHED/CLOSE_WAIT has said everything a FIN says. */
+void tcp_shutdown_tx(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+    if (c->state == TCP_ESTABLISHED) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_FIN_WAIT_1;
+    } else if (c->state == TCP_CLOSE_WAIT) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_LAST_ACK;
+    }
+}
+
 void tcp_close(struct tcp_conn *c) {
     if (!c || !c->in_use) return;
 

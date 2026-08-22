@@ -6817,6 +6817,34 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXSOCK_BOOT
+    /* 2026-08-22 socket-semantics gate, peer-required half. Runs
+     * /bin/linux-sockserver, whose peer is the HOST over SLIRP hostfwd
+     * (logs/lxsock.sh -- the b14 pattern). Proves: a blocking accept()
+     * really blocks past the old 3 s EAGAIN cap; a pre-data MSG_DONTWAIT
+     * recv is EAGAIN on the real TCP path; shutdown(SHUT_WR) is a live
+     * half-close ON THE WIRE (the host asserts the FIN arrived and its
+     * post-FIN line still gets through); send-after-shutdown is EPIPE. */
+    {
+        kprintf("[boot] LXSOCK: net_up=%d -- spawning /bin/linux-sockserver\n",
+                (int)net_is_up());
+        char *kargv[] = { (char *)"linux-sockserver", 0 };
+        char *kenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec kspec = {
+            .path = "/bin/linux-sockserver", .name = "linux-sockserver",
+            .argc = 1, .argv = kargv, .envc = 1, .envp = kenvp,
+        };
+        int kpid = proc_spawn(&kspec);
+        if (kpid < 0) {
+            kprintf("[LXSOCKSRV] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int krc = proc_wait(kpid);
+            kprintf("[boot] LXSOCK: exit=%d (bits; 15=all; the [lxsock] lines "
+                    "above say which half failed)\n", krc);
+        }
+    }
+#endif
+
 #ifdef LXNETSRV_BOOT
     /* Track B milestone B14 -- networking capstone. A genuine Linux x86-64
      * ELF (raw syscalls) runs an EVENT-DRIVEN TCP echo server on the Linux
@@ -7687,6 +7715,28 @@ void _start(void) {
             { "/bin/linux-suid",   "linux-suid",   0, 63, "setuid-on-exec" },
             { "/bin/linux-timers", "linux-timers", 0, 63, "timerfd/signalfd/alarm" },
             { "/bin/linux-mount",  "linux-mount",  0, 63, "mount/umount2/chroot" },
+            /* 2026-08-22: close-on-exec exists now. bit3 is the one that
+             * carries it -- a marked fd must be CLOSED in an exec'd child
+             * while an unmarked one survives, asserted from INSIDE the
+             * child. A flag that stores and reads back but never acts is
+             * exactly the accept-and-ignore lie this gate exists to catch. */
+            { "/bin/linux-cloexec", "linux-cloexec", 0, 63,
+              "close-on-exec + close_range" },
+            /* 2026-08-22: record locks exist now (src/flock.c). Every
+             * assertion is made from a SECOND process -- locks only mean
+             * anything between processes -- and every refusal asserts its
+             * errno, because "the lock failed" is also what a no-op or an
+             * EBADF looks like. */
+            { "/bin/linux-flock", "linux-flock", 0, 63,
+              "fcntl record locks + flock(2)" },
+            /* 2026-08-22: the peer-less half of the socket-semantics work
+             * (AF_UNIX half-close, the owed pre-data EAGAIN test, connect
+             * classification against the SLIRP host). The peer-REQUIRED
+             * half -- blocking accept past 3 s, FIN on the wire -- lives in
+             * logs/lxsock.sh, because this stack has no loopback and a test
+             * with no peer cannot prove those. */
+            { "/bin/linux-sock", "linux-sock", 0, 63,
+              "socket semantics (peer-less half)" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

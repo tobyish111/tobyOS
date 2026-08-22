@@ -177,6 +177,7 @@ C_SRCS := src/kernel.c \
           src/ext2.c \
           src/usb_msc.c \
           src/file.c \
+          src/flock.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -3122,6 +3123,30 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
 	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-cloexec/linux-cloexec.elf ]; then               \
+	    cp programs/linux-cloexec/linux-cloexec.elf                        \
+	         $(INITRD_STAGE)/bin/linux-cloexec;                            \
+	    echo "[initrd] staged linux-cloexec (close-on-exec + close_range)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cloexec";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-flock/linux-flock.elf ]; then                   \
+	    cp programs/linux-flock/linux-flock.elf                            \
+	         $(INITRD_STAGE)/bin/linux-flock;                              \
+	    echo "[initrd] staged linux-flock (record locks + flock)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-flock";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-sock/linux-sock.elf ]; then                     \
+	    cp programs/linux-sock/linux-sock.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sock;                               \
+	    echo "[initrd] staged linux-sock (socket semantics, peer-less)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sock";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sockserver/linux-sockserver.elf ]; then         \
+	    cp programs/linux-sockserver/linux-sockserver.elf                  \
+	         $(INITRD_STAGE)/bin/linux-sockserver;                         \
+	    echo "[initrd] staged linux-sockserver (host-peer gate half)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sockserver";                  \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \

@@ -130,6 +130,10 @@ programs/linux-clonestk/*.elf
 programs/linux-ocirun/*.elf
 programs/linux-ctrprobe/*.elf
 programs/linux-gapfill/*.elf
+programs/linux-cloexec/*.elf
+programs/linux-flock/*.elf
+programs/linux-sock/*.elf
+programs/linux-sockserver/*.elf
 programs/linux-tmpfs/*.elf
 programs/linux-ptrace/*.elf
 

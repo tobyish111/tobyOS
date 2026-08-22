@@ -121,6 +121,7 @@ extern "C" {
  * above -- adding new ones is explicitly safe per the stability promise. */
 #define ABI_EINTR            4   /* interrupted system call */
 #define ABI_ENOTEMPTY       39   /* directory not empty (rmdir) */
+#define ABI_ENOLCK          37   /* no record locks available (table full) */
 #define ABI_ENODEV          19   /* no such device / unknown filesystem type */
 
 /* ============================================================

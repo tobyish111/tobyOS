@@ -155,6 +155,17 @@ struct sock {
     uint32_t         recv_timeout_ms;
     uint32_t         send_timeout_ms;
 
+    /* shutdown(2) state (2026-08-22 -- it was a `return 0` no-op before,
+     * so no half-close existed anywhere). shut_tx: we sent our FIN /
+     * promised no more data -- further sends are EPIPE. shut_rd: reads
+     * return EOF. rx_eof: the PEER shut its write side (AF_UNIX) -- reads
+     * return EOF once the ring drains, while OUR sends still work; this is
+     * deliberately distinct from severing the peer link (peer_ip = 0),
+     * which kills both directions and is what full close does. */
+    uint8_t          shut_tx;
+    uint8_t          shut_rd;
+    uint8_t          rx_eof;
+
     /* UDP: connect() peer (network byte order; 0 = not connected). A
      * connected UDP socket lets send()/recv() and read()/write() omit the
      * address, and recvfrom filters to this peer is not enforced (SLIRP is
@@ -218,7 +229,10 @@ struct sock {
      * in SYN_SENT forever and make poll() silent for good. */
     uint8_t          connecting;
     int              so_error;         /* pending errno; 0 = none */
-    uint64_t         conn_deadline;    /* pit ticks; 0 = no deadline */
+    uint64_t         conn_deadline;    /* perf_now_ns() ns; 0 = no deadline.
+                                        * Was pit ticks: under TCG only ~1/15
+                                        * of 1 kHz PIT IRQs arrive, so every
+                                        * tick-based ms deadline ran 15x long. */
 
     /* AF_NETLINK: the nl_pid this socket bound to (unique per socket, as on
      * Linux, where an unbound sendmsg auto-binds to the tid). */
@@ -283,6 +297,8 @@ void sock_ref(struct sock *s);
 long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
                         struct file **files, int nfiles);
 struct sock *sock_peer_of(struct sock *self);   /* slice 81: SO_PEERCRED */
+void sock_shutdown_rd(struct sock *s);          /* shutdown(2): reads -> EOF */
+void sock_unix_shutdown_tx(struct sock *self);  /* peer sees EOF, keeps sending */
 long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
                         uint32_t timeout_ms,
                         struct file **out_files, int max_out, int *out_n);

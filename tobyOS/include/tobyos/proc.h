@@ -458,6 +458,18 @@ struct proc {
      * struct file pointer are owning -- close-on-exit drops them. */
     struct file    *fds[PROC_NFDS];
 
+    /* Close-on-exec bitmap, one bit per fd slot (Linux FD_CLOEXEC). A
+     * property of the DESCRIPTOR, not the open file description -- dup()
+     * clears it on the new fd, fcntl(F_SETFD) flips it, and a successful
+     * execve closes every marked fd before the new image runs. Lives
+     * beside fds[] so fork's whole-PCB memcpy inherits it for free, and
+     * threads reach the LEADER's copy through the same accessor
+     * indirection as proc_fds() -- a per-thread copy would let one
+     * thread's F_SETFD silently diverge from its siblings. Before this
+     * existed every creator dropped O_CLOEXEC/SOCK_CLOEXEC on the floor
+     * and every descriptor leaked across exec (2026-08-22 audit). */
+    uint8_t         fd_cloexec[PROC_NFDS / 8];
+
     /* Session tag (milestone 14). 0 means "no user session" (kernel
      * thread / pre-login boot procs). On every spawn we copy this
      * field from the parent (current_proc()->session_id) so children
@@ -896,6 +908,11 @@ void proc_slot_wipe(struct proc *p);
  * go through here rather than touching p->fds directly -- reading p->fds on a
  * thread silently yields an EMPTY table. Defined in syscall.c. */
 struct file **proc_fds(struct proc *p);
+
+/* Close-on-exec bitmap accessors (syscall.c). Thread-aware: route to the
+ * leader's bitmap exactly as proc_fds routes to the leader's table. */
+void fd_cloexec_set(struct proc *p, int fd, int on);
+int  fd_cloexec_get(struct proc *p, int fd);
 
 /* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
  * Returns the child pid, or -1 if there are no children. */

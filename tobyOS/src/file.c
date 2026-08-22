@@ -499,6 +499,11 @@ void file_close(struct file *f) {
          * close so we don't leak the priv. */
         if (f->vfs_refs) {
             if (--(*f->vfs_refs) == 0) {
+                /* The open file description dies here, and flock(2) locks
+                 * are owned by the DESCRIPTION -- release before the refs
+                 * pointer (their owner identity) is freed. */
+                { extern void fl_release_ofd(void *ofd);
+                  fl_release_ofd(f->vfs_refs); }
                 if (f->vfs.ops) (void)f->vfs.ops->close(&f->vfs);
                 kfree(f->vfs_refs);
             }
@@ -639,6 +644,10 @@ long file_read(struct file *f, void *buf, size_t n) {
         return r;
     }
     case FILE_KIND_SOCKET:
+        /* shutdown(SHUT_RD): reads are EOF from now on -- checked before the
+         * readiness probe because a shut socket is "ready" (ready to say EOF). */
+        if (f->sock && f->sock->shut_rd)
+            return 0;
         /* Non-blocking socket with nothing to read: EAGAIN, never park. Chrome
          * reads its TCP sockets with plain read() (not recv), so the check has
          * to live here as well as in the recv path -- and an optimistic read
@@ -719,6 +728,10 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return w;
     }
     case FILE_KIND_SOCKET:
+        /* shutdown(SHUT_WR): every later send is EPIPE (sys_write raises
+         * the SIGPIPE half, mirroring its pipe rule). */
+        if (f->sock && f->sock->shut_tx)
+            return -ABI_EPIPE;
         /* Connected TCP byte stream: write() == send(). A connect()-ed UDP
          * socket sends a datagram to its peer. */
         if (f->sock && f->sock->kind == SOCK_KIND_TCP && f->sock->tcp &&

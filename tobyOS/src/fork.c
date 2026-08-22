@@ -1200,6 +1200,24 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
  * but a Win32 CRT wants more headroom, so the PE arm maps its own. */
 #define PE_STACK_PAGES  64
 
+/* POSIX: a successful exec closes every descriptor marked FD_CLOEXEC.
+ * Runs at the COMMIT point only -- a failed execve returns -1 with the
+ * caller's descriptors intact, which is what lets shells retry. Only the
+ * Linux personality sets bits, so a native or Win32 image pays one bitmap
+ * walk and closes nothing. Shared by the ELF and PE exec arms: exec is
+ * exec, whichever personality the new image lands in. */
+static void exec_close_cloexec_fds(struct proc *p) {
+    struct file **tab = proc_fds(p);
+    if (!tab) return;
+    for (int i = 0; i < PROC_NFDS; i++) {
+        if (tab[i] && fd_cloexec_get(p, i)) {
+            file_close(tab[i]);
+            tab[i] = 0;
+            fd_cloexec_set(p, i, 0);
+        }
+    }
+}
+
 /* ===================================================================
  * execve_pe -- the Windows-PE arm of sys_execve (Track X / X1).
  *
@@ -1275,6 +1293,9 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     p->win_heap_cur = 0;
     p->win_heap_end = 0;
     p->clear_child_tid = 0;
+
+    /* FD_CLOEXEC acts on ANY successful exec, a .exe included. */
+    exec_close_cloexec_fds(p);
 
     /* Flip to the Win32 personality and install the PE's TEB + resource/TLS
      * metadata -- mirrors the PE arm of proc_spawn (proc.c). */
@@ -1761,6 +1782,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     /* B11: the new image hasn't registered a pthread-exit futex yet; drop any
      * clear_child_tid carried over from the replaced image. */
     p->clear_child_tid = 0;
+
+    /* FD_CLOEXEC acts NOW -- past the commit, before the new image runs. */
+    exec_close_cloexec_fds(p);
 
     /* Update name from the new path. */
     const char *base = kpath;
