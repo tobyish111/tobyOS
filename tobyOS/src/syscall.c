@@ -9267,6 +9267,42 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_recvfrom:    return lx_recv((int)a1, (uint64_t)a2, (size_t)a3, (uint64_t)a5, 0, (int)a4);
     case LX_sendmsg:     return lx_sendmsg((int)a1, (uint64_t)a2, (int)a3);
     case LX_recvmsg:     return lx_recvmsg((int)a1, (uint64_t)a2, (int)a3);
+    /* sendmmsg/recvmmsg (2026-08-22): batched forms glibc's parallel
+     * resolver and several runtimes probe. struct mmsghdr is the 56-byte
+     * msghdr plus u32 msg_len, padded to 64. Loops over the proven
+     * single-message arms; partial success reports the count, as Linux. */
+    case 307: {                        /* sendmmsg(fd, *mmsg, vlen, flags) */
+        unsigned vlen = (unsigned)a3;
+        if (!a2 || vlen == 0) return 0;
+        if (vlen > 64) vlen = 64;
+        unsigned done = 0;
+        for (; done < vlen; done++) {
+            uint64_t mp = a2 + (uint64_t)done * 64;
+            long r = lx_sendmsg((int)a1, mp, (int)a4);
+            if (r < 0) return done ? (long)done : r;
+            uint32_t ml = (uint32_t)r;
+            (void)copy_to_user((void *)(uintptr_t)(mp + 56), &ml, 4);
+        }
+        return (long)done;
+    }
+    case 299: {                        /* recvmmsg(fd, *mmsg, vlen, flags, *ts) */
+        unsigned vlen = (unsigned)a3;
+        if (!a2 || vlen == 0) return 0;
+        if (vlen > 64) vlen = 64;
+        unsigned done = 0;
+        for (; done < vlen; done++) {
+            uint64_t mp = a2 + (uint64_t)done * 64;
+            /* Only the FIRST message may block; the rest are whatever is
+             * already queued (Linux semantics -- a batch never waits to
+             * fill itself). */
+            int fl = (int)a4 | (done ? LX_MSG_DONTWAIT : 0);
+            long r = lx_recvmsg((int)a1, mp, fl);
+            if (r < 0) { if (done) break; return r; }
+            uint32_t ml = (uint32_t)r;
+            (void)copy_to_user((void *)(uintptr_t)(mp + 56), &ml, 4);
+        }
+        return (long)done;
+    }
     case LX_setsockopt:  return lx_setsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint32_t)a5);
     case LX_getsockopt:  return lx_getsockopt((int)a1, (int)a2, (int)a3, (uint64_t)a4, (uint64_t)a5);
     case LX_getsockname: return lx_getsockname((int)a1, (uint64_t)a2, (uint64_t)a3);
@@ -11754,8 +11790,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
                 gputrace("statx", kpath, 0);
-                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, (uint32_t)dmin,
-                                              lx_ino_hash(kpath), (void *)a5);
+                /* 2026-08-22: was linux_emit_chrdev_stat, which writes a
+                 * struct lx_stat -- a DIFFERENT SHAPE from statx -- so a
+                 * 256-byte statx buffer got a stat-sized record and every
+                 * field past st_mode was garbage. The handoff carried it as
+                 * a known latent defect; same emit-then-stamp pattern as
+                 * the fd-based DRM arm above. */
+                struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                        .mode = 0666 };
+                long src = linux_emit_statx(&cvs, lx_ino_hash(kpath),
+                                            (void *)a5);
+                if (src == 0 && a5) {
+                    uint16_t m = (uint16_t)(0x2000u | 0666u);
+                    uint32_t rmaj = DRM_CHR_MAJOR, rmin = (uint32_t)dmin;
+                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
+                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
+                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
+                }
+                return src;
             }
         }
         /* Synthesised /dev nodes -- and THIS is the arm that matters, for the
@@ -12317,6 +12369,33 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
     case LX_sendfile:           /* cat/cp fall back to a read/write loop */
         return -ABI_ENOSYS;
+
+    /* Authoritative refusals (2026-08-22). These four were named by the
+     * census contract comments as "explicit ENOSYS arms" -- and DIDN'T
+     * EXIST, so the first workload to probe io_uring or bpf would have
+     * turned the gate red while the comment a reader consults said that
+     * cannot happen. Answering "no" authoritatively is a supported
+     * answer; falling through the dispatcher is a coverage gap. Both
+     * families have universal userspace fallbacks (liburing probes,
+     * systemd degrades). */
+    case 321:                          /* bpf */
+    case 425: case 426: case 427:      /* io_uring_{setup,enter,register} */
+        return -ABI_ENOSYS;
+
+    case 219:                          /* restart_syscall */
+        /* Re-issued by the kernel after a stop/cont interrupted a
+         * restartable call. There is no restart-block machinery here;
+         * EINTR is the honest degradation -- callers already handle it,
+         * where a census fall-through read as "unknown syscall". */
+        return -ABI_EINTR;
+
+    case 129: {                        /* rt_sigqueueinfo(pid, sig, *info) */
+        /* glibc's sigqueue(3). The sival payload is not carried (there is
+         * no per-signal queue depth in this kernel -- one pending bit per
+         * signal), but delivery, targeting and sender identity are real,
+         * which is what the callers in this tree act on. */
+        return sys_kill((int)a1, (int)a2);
+    }
 
     default: {
         /* First-hit-detailed, deduped gap-list logger (see lx_scname note).

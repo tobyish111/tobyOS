@@ -3160,6 +3160,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-watch (inotify + epoll honesty)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-watch";                       \
 	fi;                                                                   \
+	if [ -f programs/linux-misc/linux-misc.elf ]; then                     \
+	    cp programs/linux-misc/linux-misc.elf                              \
+	         $(INITRD_STAGE)/bin/linux-misc;                               \
+	    echo "[initrd] staged linux-misc (syscall-tail batch)";            \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-misc";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

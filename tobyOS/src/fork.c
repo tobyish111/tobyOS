@@ -1647,13 +1647,24 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry   };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE         };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                 };
+        /* Real credentials at exec (2026-08-22; were hardcoded 0) --
+         * packed AFTER the setuid-on-exec credential update, so a suid
+         * image reports AT_SECURE=1 and glibc enters secure mode (drops
+         * LD_* env), which is the protection suid exists to keep. Same
+         * user-namespace reporting boundary as getuid/stat/procfs. */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100               };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).

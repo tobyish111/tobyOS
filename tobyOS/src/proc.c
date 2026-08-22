@@ -1026,13 +1026,24 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE          };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                  };
+        /* Real credentials (2026-08-22; were hardcoded 0). glibc reads
+         * AT_SECURE to decide secure-mode (ignore LD_* env, etc.) and
+         * compares AT_EUID against geteuid() -- both lie if these do.
+         * Translated at the user-namespace reporting boundary, same as
+         * getuid/stat/procfs (slice 11's rule). */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100                };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u     };
         /* AT_RANDOM: 16 bytes a Linux libc reads for its stack canary.
          * Point at the 16-byte scratch pad pack_user_stack always leaves
          * at the very top of the (zeroed) user stack -- valid + readable.

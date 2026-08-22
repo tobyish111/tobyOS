@@ -7750,6 +7750,12 @@ void _start(void) {
              * ONESHOT disarms, ET never loses a wakeup). */
             { "/bin/linux-watch", "linux-watch", 0, 63,
               "inotify events + epoll honesty" },
+            /* 2026-08-22 syscall-tail batch: real auxv creds (AT_SECURE
+             * included), sendmmsg/recvmmsg, authoritative io_uring/bpf
+             * refusals (the census-contract comments now tell the truth),
+             * sigqueue, restart_syscall. */
+            { "/bin/linux-misc", "linux-misc", 0, 63,
+              "auxv creds + syscall tail" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

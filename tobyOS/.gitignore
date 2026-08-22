@@ -136,6 +136,7 @@ programs/linux-sock/*.elf
 programs/linux-sockserver/*.elf
 programs/linux-nptl/*.elf
 programs/linux-watch/*.elf
+programs/linux-misc/*.elf
 programs/linux-tmpfs/*.elf
 programs/linux-ptrace/*.elf
 

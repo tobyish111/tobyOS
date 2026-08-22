@@ -140,6 +140,24 @@ SOCK_NONBLOCK fixed in the same pass. New /bin/linux-cloexec (static glibc,
 6 bits — bit3 asserts survival/closure from INSIDE an exec'd child) rides
 lxposix. GREEN 11/11.
 
+### 2026-08-22 — syscall-tail batch (lxposix 16/16)
+Real auxv credentials: AT_UID/EUID/GID/EGID from the process's actual ids
+(user-namespace-translated, slice-11's boundary rule) instead of
+hardcoded 0, and AT_SECURE computed from euid!=ruid — packed AFTER the
+setuid-on-exec update, so suid images get glibc's secure mode (LD_* env
+dropped), which is the protection suid exists for. sendmmsg/recvmmsg
+loop over the proven single-message arms (only the first recv may
+block). io_uring_setup/enter/register + bpf answer ENOSYS
+AUTHORITATIVELY — the census-contract comments claimed those arms
+existed and they did not, so the first probing workload would have
+turned the gate red while the comment said it cannot. restart_syscall
+answers EINTR. rt_sigqueueinfo delivers with real sender identity (sival
+payload not carried — one pending bit per signal — documented).
+statx-on-a-DRM-path emits real STATX layout (was a struct lx_stat
+written into a statx buffer — the handoff's known latent defect,
+closed). Test: `linux-misc` (63/63), incl. drop-to-1000-and-reexec so
+the auxv assertion is non-trivial.
+
 ### 2026-08-22 — inotify is real; epoll stops lying (lxposix 15/15)
 inotify: a REAL fd (FILE_KIND_INOTIFY, refcounted across dup/fork — the
 test's forked child releasing the parent's instance was found live),
