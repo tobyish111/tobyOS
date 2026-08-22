@@ -643,6 +643,12 @@ static void tsh_job_signal(int sig) { (void)sig; }
 
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
+    {
+        /* XCU 2.5.3: PPID is set at shell startup. It was simply absent. */
+        char pb[16];
+        snprintf(pb, sizeof pb, "%d", (int)getppid());
+        shell_set_var_hosted("PPID", pb);
+    }
 
     /* `-c` and a script file are NOT terminal sessions. Only the loop at the
      * bottom of this function is, and it leaves the default alone. Getting

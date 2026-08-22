@@ -6186,6 +6186,21 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 return;
             }
         }
+        /* `case x in (pat)` -- the paren belongs to the PATTERN. It must
+         * NOT open a subshell: doing so put the next word at command
+         * position, where `esac` reads as reserved -- so `(esac)`, the
+         * form POSIX provides precisely so esac can be matched, closed the
+         * case early and the real `;;` became "outside any case". The
+         * following `)` takes the unbalanced-rparen-ends-a-pattern branch. */
+        if (st->case_pat) {
+            p++;
+            st->cmd_pos = false;
+            st->prev_word_cmd = false; st->redir = false;
+            st->assign_prefix = false;
+            st->no_sep = true;
+            *pp = p;
+            return;
+        }
         /* THE ARRAY-LITERAL PARENTHESIS.
          *
          *     a=(1 2)        an array assignment -- legal in bash, first word
@@ -6425,7 +6440,16 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 case_open++; case_want_in = true; p += 4; continue;
             }
             if (case_open > 0 && shell_word_boundary_at(w, p, "esac")) {
-                case_open--; case_pat = false; p += 4; continue;
+                /* NOT a close in WORD position (`case esac in ...`) or in
+                 * pattern position behind `(` or `|` (`(esac)` is how POSIX
+                 * lets esac be matched). */
+                const char *b = p;
+                while (b > w && (b[-1] == ' ' || b[-1] == '\t')) b--;
+                bool pat_pos = (b > w && (b[-1] == '(' || b[-1] == '|'));
+                if (!case_want_in && !pat_pos) {
+                    case_open--; case_pat = false;
+                }
+                p += 4; continue;
             }
             if (case_open > 0 && case_want_in &&
                 shell_word_boundary_at(w, p, "in")) {
@@ -10397,7 +10421,14 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             continue;
         }
         if (case_open > 0 && shell_word_boundary_at(sub_start, p, "esac")) {
-            case_open--; case_pat = false;
+            /* Same word/pattern-position guards as the structural scanner:
+             * `case esac in ...` and `(esac)` are not the terminator. */
+            const char *b = p;
+            while (b > sub_start && (b[-1] == ' ' || b[-1] == '\t')) b--;
+            bool pat_pos = (b > sub_start && (b[-1] == '(' || b[-1] == '|'));
+            if (!case_want_in && !pat_pos) {
+                case_open--; case_pat = false;
+            }
             if (pos + 4 >= cmd_cap) return -1;
             for (int k = 0; k < 4; k++) cmd[pos++] = *p++;
             continue;
@@ -11410,6 +11441,15 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                                     sizeof(expanded_word)) < 0) return -1;
         kprintf("shell: %s: %s\n", name,
                 expanded_word[0] ? expanded_word : "parameter null or not set");
+        /* XCU 2.6.2: the failing ?-form EXITS a non-interactive shell with
+         * status 1, and a SUBSHELL exits even under an interactive parent.
+         * tsh carried on with status 2 -- `( echo ${x:?}; echo not-reached )`
+         * printed not-reached. */
+        if (!g_interactive || g_subshell_depth > 0) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = 1;
+        }
+        shell_set_status(1);
         return -1;
     case '+':
         if (missing) return 0;
@@ -17519,6 +17559,13 @@ static bool shell_try_case_command(const char *src) {
             if (!shell_word_boundary_before(in_at + 2, q)) continue;
             if (shell_starts_with_word(q, "case")) { depth++; continue; }
             if (shell_starts_with_word(q, "esac")) {
+                /* `(esac)` is a PATTERN, not the terminator -- the paren
+                 * form is exactly how POSIX lets `esac` be matched. An
+                 * esac whose nearest preceding non-blank is `(` or `|`
+                 * sits in pattern position. */
+                const char *b = q;
+                while (b > in_at + 2 && is_space(b[-1])) b--;
+                if (b > in_at + 2 && (b[-1] == '(' || b[-1] == '|')) continue;
                 if (--depth == 0) { esac_at = q; break; }
             }
         }
@@ -18515,6 +18562,10 @@ static const char *shell_find_pipe_at(const char *s) {
 
         if (*p == '|') {
             if (p[1] == '|') { p++; continue; }   /* an OR, not a pipe */
+            /* `>|` is the noclobber-forcing redirect (XCU 2.7.2), not a
+             * pipe -- splitting here made `echo x >| f` a pipeline whose
+             * second stage was the FILENAME, reported as 127. */
+            if (p > start && p[-1] == '>') continue;
             return p;
         }
     }
@@ -19736,6 +19787,9 @@ bool shell_opt_ignoreeof_hosted(void) { return g_opt_ignoreeof; }
  * exported), so the host loop cannot see them through getenv -- it has to
  * ask the variable table. NULL when unset. */
 const char *shell_get_var_hosted(const char *name) { return env_get(name); }
+void shell_set_var_hosted(const char *name, const char *value) {
+    (void)env_set(name, value);
+}
 
 /* Is this text a complete command, or does the interactive loop need to
  * read another line (PS2)? TWO tests, same as the script reader: the

@@ -74,6 +74,9 @@ bool shell_opt_ignoreeof_hosted(void);
  * them). NULL when unset. */
 const char *shell_get_var_hosted(const char *name);
 
+/* Set a shell variable from the host wrapper (PPID at startup). */
+void shell_set_var_hosted(const char *name, const char *value);
+
 /* Continuation test for the interactive loop: 0 = complete, 1 = incomplete
  * (join with a newline), 2 = backslash continuation (drop the backslash). */
 int shell_line_incomplete_hosted(const char *s);
@@ -84,6 +87,10 @@ bool shell_wants_exit_hosted(int *status);
 
 /* Record one interactive line in the history ring (what `fc` lists). */
 void shell_history_add_hosted(const char *line);
+
+/* Reap + announce finished background jobs, bash-style; the interactive
+ * loop calls this right before each PS1. */
+void shell_notify_jobs_hosted(void);
 
 /* Set $1..$n before running. */
 int  shell_set_args_hosted(int argc, char **argv);
