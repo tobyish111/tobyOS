@@ -7737,6 +7737,14 @@ void _start(void) {
              * with no peer cannot prove those. */
             { "/bin/linux-sock", "linux-sock", 0, 63,
               "socket semantics (peer-less half)" },
+            /* 2026-08-22: thread-group semantics. Real glibc NPTL doing
+             * what it could structurally never do before: pthread_cancel
+             * (SIGCANCEL=32 needed SIG_MAX 64), threaded setuid (SIGSETXID
+             * =33 broadcast), a handler installed after pthread_create
+             * firing in a sibling (shared sighand), a worker's SIGSEGV
+             * killing the whole group, and getpid()==tgid in threads. */
+            { "/bin/linux-nptl", "linux-nptl", 0, 63,
+              "thread-group semantics (NPTL)" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

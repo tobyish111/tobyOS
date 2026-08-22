@@ -277,7 +277,8 @@ struct proc {
      * for any pending signal is proc_exit(128+sig); checked at syscall
      * return, in the PIT IRQ if it interrupted ring 3, and inside
      * blocking primitives that return -EINTR. See signal.h. */
-    uint32_t        pending_signals;
+    uint64_t        pending_signals;   /* one bit per signal 1..63 (SIG_MAX
+                                        * is 64 since 2026-08-22) */
 
     /* Phase 1 M1.3: full POSIX signal state (handlers, mask, restorer) */
     struct signal_state sigstate;

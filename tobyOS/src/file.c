@@ -317,7 +317,7 @@ static long signalfd_read(struct file *f, void *buf, size_t n) {
             int signo = 0;
             for (int i = 0; i < 32; i++)
                 if (hit & (1ull << i)) { signo = i; break; }
-            p->pending_signals   &= ~(1u << signo);
+            p->pending_signals   &= ~(1ull << signo);  /* 64-signal mask */
             p->sigstate.pending  &= ~SIGMASK(signo);
             uint8_t si[128];
             memset(si, 0, sizeof si);

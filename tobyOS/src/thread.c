@@ -23,6 +23,7 @@
 
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
+#include <tobyos/signal.h>   /* SIGMASK: the futex park's lost-wake guard */
 #include <tobyos/heap.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
@@ -529,6 +530,17 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
     int cmd = op & 0x7f;   /* strip FUTEX_PRIVATE_FLAG(128)/CLOCK_REALTIME(256) */
     int priv = op & ~0x7f; /* preserve PRIVATE / CLOCK_REALTIME for recursion */
 
+#ifdef FUTEX_TRACE
+    /* Diagnostic (opt-in -DFUTEX_TRACE): every futex op, capped. Only sane
+     * on low-traffic boots (chrome does ~400k/min); indispensable when a
+     * two-thread handshake (NPTL setxid) dies somewhere between four ops. */
+    { static int fxt = 0;
+      if (fxt < 96) { fxt++;
+          kprintf("[fxt] pid=%d op=%d(cmd=%d) addr=0x%lx val=%u to=%d\n",
+                  caller->pid, op, cmd, (unsigned long)addr, val,
+                  utimeout ? 1 : 0); } }
+#endif
+
     /* Pre-touch the futex word OUTSIDE the spinlock so any CoW/demand #PF
      * resolves with IRQs on; the locked re-read below then can't fault
      * (per-copy uaccess: each read opens its own stac window). */
@@ -628,6 +640,35 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         caller->futex_timed_out   = false;
         caller->next_wait = e->waiters;
         e->waiters = caller;
+        /* LOST-WAKE GUARD (2026-08-22, found live by linux-nptl bit2).
+         * signal_send force-wakes a BLOCKED waiter -- but a signal that
+         * lands while this thread is RUNNING (mid-way through handling a
+         * spurious wake, exactly where glibc's setxid broadcast caught the
+         * barrier waiter) performs no wake at all, and a DEADLINE-LESS park
+         * has no sweep to ever revisit it: the signal sat pending forever,
+         * the broadcaster waited for an ack forever, and the whole machine
+         * went idle-forever. So: never complete a park with a deliverable
+         * signal pending. Checked AFTER the BLOCKED store, with a full
+         * fence ordering that store before the pending load, so the send
+         * side either saw BLOCKED (and woke us) or its pending store is
+         * visible here. Returning 0 is a legal spurious wake -- glibc
+         * re-checks its condition, and the syscall exit path delivers the
+         * handler first, which is the entire point. */
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        {
+            uint64_t pend  = caller->pending_signals;
+            uint64_t deliv = (pend & ~caller->sigstate.mask) |
+                             (pend & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP)));
+            if (deliv) {
+                struct proc **pp = &e->waiters;
+                while (*pp && *pp != caller) pp = &(*pp)->next_wait;
+                if (*pp) { *pp = caller->next_wait; caller->next_wait = 0; }
+                caller->state             = PROC_RUNNING;
+                caller->futex_deadline_ns = 0;
+                spin_unlock_irqrestore(&g_futex_lock, flags);
+                return 0;
+            }
+        }
         spin_unlock_irqrestore(&g_futex_lock, flags);
         sched_yield();     /* woken by FUTEX_WAKE or the timeout sweep */
         /* Slice 92: if we are still on the waiter list, the wake was
@@ -733,6 +774,12 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
         if (!e->waiters) futex_free_entry(e);
 
         spin_unlock_irqrestore(&g_futex_lock, flags);
+#ifdef FUTEX_TRACE
+        { static int fxw = 0;
+          if (fxw < 96) { fxw++;
+              kprintf("[fxt] pid=%d WAKE addr=0x%lx val=%u -> woken=%d\n",
+                      caller->pid, (unsigned long)addr, val, woken); } }
+#endif
         if (handoff) {
             bool had_bkl = bkl_held();
             if (had_bkl) bkl_exit();      /* never yield holding the BKL */

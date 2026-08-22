@@ -1087,6 +1087,8 @@ void sched_yield(void) {
         if (me->idle && cur != me->idle) {
             next = me->idle;
         } else {
+            static uint64_t halt_since;      /* census timer; reset on work */
+            static int      wedge_dumped;    /* once per boot */
             for (;;) {
                 /* Slice 94: kickable while halted in place (see sched_idle). */
                 __atomic_store_n(&me->idle_halted, 1, __ATOMIC_SEQ_CST);
@@ -1098,6 +1100,38 @@ void sched_yield(void) {
                  * itself -- see sched_halted_wake_sweeps. Without this the
                  * all-parked machine is a wedge, not an idle. */
                 sched_halted_wake_sweeps();
+                /* Wedge census: a machine that halts here >5 s with blocked
+                 * procs is either legitimately idle or deadlocked, and the
+                 * serial log cannot tell the two apart -- a wedge is SILENT
+                 * by definition. Print each blocked proc's signal/futex
+                 * state ONCE so the log names what everyone is waiting for
+                 * (found necessary diagnosing the linux-nptl setxid wedge,
+                 * where three theories fit the same silence). */
+                {
+                    uint64_t hn = perf_now_ns();
+                    if (!halt_since) halt_since = hn;
+                    if (!wedge_dumped && hn - halt_since > 5000000000ull) {
+                        wedge_dumped = 1;
+                        extern struct proc g_proc[];
+                        extern const char *proc_state_name(enum proc_state);
+                        kprintf("[idlewedge] BSP halted >5s, nothing runnable; census:\n");
+                        for (int wi = 0; wi < PROC_MAX; wi++) {
+                            struct proc *q = &g_proc[wi];
+                            if (q->state == PROC_UNUSED ||
+                                q->state == PROC_EMBRYO) continue;
+                            kprintf("[idlewedge]  pid=%d '%s' st=%s thr=%d tg=%d "
+                                    "pend=0x%llx mask=0x%llx fxdl=%llu slpdl=%llu "
+                                    "wh=%p\n",
+                                    q->pid, q->name, proc_state_name(q->state),
+                                    (int)q->is_thread, q->tgid,
+                                    (unsigned long long)q->pending_signals,
+                                    (unsigned long long)q->sigstate.mask,
+                                    (unsigned long long)q->futex_deadline_ns,
+                                    (unsigned long long)q->sleep_deadline_ns,
+                                    (void *)q->wait_head);
+                        }
+                    }
+                }
                 /* And the proc halting HERE may itself be the parked poller
                  * (it is whoever blocked LAST, and on the BSP a blocking
                  * poller halts in place). poll_wake_all deliberately keeps
@@ -1112,15 +1146,17 @@ void sched_yield(void) {
                     bkl_exit();
                     if (self && cur) {
                         cur->state = PROC_RUNNING;
+                        halt_since = 0;
                         YIELD_RETURN();
                     }
                 }
                 uint64_t f = spin_lock_irqsave(&me->ready_lock);
                 next = queue_pop_locked(me);
                 spin_unlock_irqrestore(&me->ready_lock, f);
-                if (next) break;
+                if (next) { halt_since = 0; break; }
                 if (cur && cur->state == PROC_READY) {
                     cur->state = PROC_RUNNING;
+                    halt_since = 0;
                     YIELD_RETURN();
                 }
             }

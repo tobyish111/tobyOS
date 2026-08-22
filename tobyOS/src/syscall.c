@@ -10068,8 +10068,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (a1 && copy_from_user(&umask_in, (const void *)a1,
                                  sizeof umask_in) != 0)
             return -ABI_EFAULT;
-        uint32_t newmask = (uint32_t)(umask_in << 1);   /* -> tobyOS numbering */
-        uint32_t saved   = p->sigstate.mask;
+        uint64_t newmask = umask_in << 1;               /* -> tobyOS numbering */
+        uint64_t saved   = p->sigstate.mask;
         p->sigstate.mask = newmask;
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
@@ -10831,7 +10831,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
 
     /* ---- identities ---- */
-    case LX_getpid:  return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    case LX_getpid: {
+        /* Linux: getpid() returns the TGID -- the same number in every
+         * thread. This returned the TID for a thread (the documented
+         * phase-3 open item), which broke any raise()/tgkill(getpid(),
+         * gettid()) pairing and every pid-keyed cache inside a threaded
+         * app. gettid (which really is per-thread) is untouched. */
+        struct proc *gp = current_proc();
+        if (!gp) return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+        struct proc *ld = gp->is_thread ? proc_lookup(gp->tgid) : gp;
+        return pid_vnr(ld ? ld : gp);
+    }
     case LX_getppid: return do_syscall(SYS_GETPPID, 0, 0, 0, 0, 0);
     case LX_gettid:  return do_syscall(ABI_SYS_GETTID, 0, 0, 0, 0, 0);
     case LX_getuid:
@@ -11861,7 +11871,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (sig == SIGKILL || sig == SIGSTOP) return -ABI_EINVAL;
         struct proc *p = current_proc();
         if (!p) return -ABI_EPERM;
-        struct sigaction *cur = &p->sigstate.actions[sig];
+        struct sigaction *cur = &sig_actions_of(p)[sig];   /* thread-group table */
         if (a3) {                       /* report old action in Linux layout */
             struct lx_sigaction old;
             memset(&old, 0, sizeof old);
@@ -11925,8 +11935,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             uint64_t lset = 0;
             if (copy_from_user(&lset, (const void *)a2, sizeof lset) != 0)
                 return -ABI_EFAULT;
-            uint32_t kset = (uint32_t)(lset << 1);   /* Linux -> tobyOS */
-            kset &= ~(uint32_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+            uint64_t kset = lset << 1;               /* Linux -> tobyOS */
+            kset &= ~(uint64_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
             switch ((int)a1) {
             case 0: p->sigstate.mask |= kset; break;   /* SIG_BLOCK   */
             case 1: p->sigstate.mask &= ~kset; break;  /* SIG_UNBLOCK */
@@ -11940,10 +11950,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return sys_sigreturn();
     case LX_kill:                      /* (pid, sig) */
         return sys_kill((int)a1, (int)a2);
-    case LX_tkill:                     /* (tid, sig) */
-        return sys_kill((int)a1, (int)a2);
-    case LX_tgkill:                    /* (tgid, tid, sig) -> signal the tid */
-        return sys_kill((int)a2, (int)a3);
+    case LX_tkill:                     /* (tid, sig): thread-directed */
+        return sys_tgkill(0, (int)a1, (int)a2);
+    case LX_tgkill:                    /* (tgid, tid, sig): thread-directed,
+                                        * and the tgid is CHECKED now -- it
+                                        * was accepted and ignored. */
+        return sys_tgkill((int)a1, (int)a2, (int)a3);
 
     /* Slice 90: the two signal syscalls chrome's crash path needs. Both were
      * -ENOSYS, which is why a faulting thread could never finish reporting:

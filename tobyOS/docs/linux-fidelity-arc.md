@@ -140,6 +140,46 @@ SOCK_NONBLOCK fixed in the same pass. New /bin/linux-cloexec (static glibc,
 6 bits — bit3 asserts survival/closure from INSIDE an exec'd child) rides
 lxposix. GREEN 11/11.
 
+### 2026-08-22 — thread-group semantics: NPTL works (lxposix 14/14)
+SIG_MAX 32→64 (sigset_t → u64 end-to-end; ucontext layout unchanged — the
+old u32+pad occupied the same bytes; signals 1..63, Linux's 64 refused).
+Shared sighand via `sig_actions_of()` leader indirection (the proc_fds
+pattern). Fatal signals are GROUP-fatal (`proc_exit_group` at both signal
+sites AND isr.c's user-fault fatal path, which also stops reporting -1 and
+reports 128+sig). kill() is process-directed (retargets to a group member
+with the signal unblocked); tkill/tgkill get their own thread-directed
+entry point `sys_tgkill` with a REAL tgid check. Linux getpid() returns
+the tgid. The futex WAIT path refuses to park with a deliverable signal
+pending (lost-wake guard).
+
+**Three chained root causes, each found by the previous fix:**
+1. All-parked wedge: futex park vs signal_send's woke-only-if-BLOCKED
+   (guard above).
+2. Then a live hang: **glibc's NPTL handlers (sigcancel_handler,
+   sighandler_setxid) begin with `if (si_pid != getpid() || si_code !=
+   SI_TKILL) return;`** — an anti-spoof check. Our siginfo said SI_USER
+   for tgkill signals, so the setxid handler ran and silently did
+   NOTHING, forever. signal_state now records si_code per signal;
+   sys_tgkill stamps SI_TKILL and the sender's TGID (glibc compares
+   si_pid against ITS getpid). Diagnosed with -DFUTEX_TRACE (new opt-in:
+   every futex op, capped — only sane on low-traffic boots) which showed
+   the handler resume the barrier wait with no setuid and no ack-wake.
+3. Then bit4: the ISR fault path killed only the faulting THREAD
+   (proc_exit(-1)) — group-fatality had to be applied there separately.
+
+`[idlewedge]` census added: the BSP halt loop prints every blocked proc's
+signal/futex state once after 5 s of fruitless halting — a wedge is
+silent by definition, and three theories fit the same silence until the
+kernel names what everyone is waiting for.
+
+Test: `linux-nptl` (real glibc NPTL, 63/63): create/join, **pthread_cancel
+(first time ever possible)**, **threaded setuid observed from the OTHER
+thread**, handler installed post-create fires in a sibling, a worker's
+uncaught fatal signal kills the whole group (abort-flavoured so the gate's
+fault census stays clean; the hardware flavour is the same one-line fix in
+isr.c), getpid()==tgid alongside distinct gettid. Cross-personality gates
++ defboot re-run per the signals/sched law.
+
 ### 2026-08-22 — networking honesty batch (verified: lxposix 13/13 + lxsock GREEN)
 shutdown(2) is real: `tcp_shutdown_tx` (FIN now, keep receiving; factored
 from tcp_close's opening move) + `shut_tx/shut_rd/rx_eof` in struct sock.

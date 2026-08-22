@@ -98,6 +98,7 @@ void signal_init_proc(struct signal_state *ss) {
         ss->actions[i].sa_flags   = 0;
         ss->si_pid[i] = 0;
         ss->si_uid[i] = 0;
+        ss->si_code[i] = 0;
     }
     ss->mask     = 0;
     ss->pending  = 0;
@@ -185,7 +186,7 @@ void signal_send(struct proc *p, int sig) {
 
     /* Check if signal is ignored (SIG_IGN) and not SIGKILL/SIGSTOP */
     if (sig != SIGKILL && sig != SIGSTOP) {
-        struct sigaction *sa = &p->sigstate.actions[sig];
+        struct sigaction *sa = &sig_actions_of(p)[sig];
         if (sa->sa_handler == SIG_IGN) return;
     }
 
@@ -201,6 +202,7 @@ void signal_send(struct proc *p, int sig) {
         bool from_user = snd && snd != p && snd->pid > 0;
         p->sigstate.si_pid[sig] = from_user ? snd->pid : 0;
         p->sigstate.si_uid[sig] = from_user ? snd->uid : 0;
+        p->sigstate.si_code[sig] = SI_USER;   /* tgkill overrides after */
     }
 
     /* Unblock if asleep */
@@ -280,10 +282,21 @@ bool signal_pending_self(void) {
     struct proc *p = current_proc();
     if (!p) return false;
     /* Pending signals not blocked by the mask */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
     /* SIGKILL and SIGSTOP cannot be blocked */
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     return deliverable != 0;
+}
+
+/* See signal.h: the handler table is a THREAD-GROUP property; a thread
+ * reads and writes its leader's copy. Falls back to the proc's own table
+ * when the leader is gone mid-teardown -- a stale snapshot beats a NULL. */
+struct sigaction *sig_actions_of(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->sigstate.actions;
+    }
+    return p ? p->sigstate.actions : 0;
 }
 
 /* Determine default action for a signal */
@@ -313,7 +326,13 @@ static void signal_apply_default(struct proc *p, int sig) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d '%s' killed by signal %d\n",
                 p->pid, p->name, sig);
-        proc_exit(128 + sig);
+        /* GROUP-fatal, as POSIX requires: an uncaught fatal signal kills
+         * the PROCESS. proc_exit killed only the receiving thread -- a
+         * SIGSEGV in a worker left the rest of the process limping, which
+         * no crash handler, supervisor, or shell $? logic expects.
+         * proc_exit_group degenerates to proc_exit for the single-threaded
+         * case and for a leader (whose proc_exit already reaps threads). */
+        proc_exit_group(128 + sig);
     }
 
     /* action == 2: job-control stop. We are running as `p` (delivery happens
@@ -366,13 +385,13 @@ static void signal_apply_default(struct proc *p, int sig) {
 bool signal_take_pending_stop(void) {
     struct proc *p = current_proc();
     if (!p) return false;
-    uint32_t stops = p->pending_signals & SIGMASK_STOPS;
+    uint64_t stops = p->pending_signals & SIGMASK_STOPS;
     if (!stops) return false;
     int sig = 0;
     for (int i = 1; i < SIG_MAX; i++)
         if (stops & SIGMASK(i)) { sig = i; break; }
     if (sig != SIGSTOP) {
-        struct sigaction *sa = &p->sigstate.actions[sig];
+        struct sigaction *sa = &sig_actions_of(p)[sig];
         if (sa->sa_handler != SIG_DFL) return false;
     }
     p->pending_signals  &= ~SIGMASK(sig);
@@ -570,7 +589,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
      * expects (native or Linux ABI layout), and pass their addresses in
      * RSI/RDX. regs->rcx/r11 hold the user's RIP/RFLAGS on the sysret frame. */
     if (siginfo) {
-        if (!sig_emit_info_uctx(p, sig, SI_USER, 0, ctx,
+        if (!sig_emit_info_uctx(p, sig, p->sigstate.si_code[sig], 0, ctx,
                                 regs->rcx, regs->r11,
                                 info_addr, uctx_addr, linux_layout)) {
             kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
@@ -631,7 +650,17 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
 
     /* Lowest-numbered deliverable signal (unblocked, plus the two that can
      * never be blocked). */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    /* RT-signal trace, delivery side (capped). */
+    if (p->pending_signals >> 32) {
+        static int rtd = 0;
+        if (rtd < 16) { rtd++;
+            kprintf("[rtdlv] pid=%d pend=0x%llx mask=0x%llx deliv=0x%llx regs=%d\n",
+                    p->pid, (unsigned long long)p->pending_signals,
+                    (unsigned long long)p->sigstate.mask,
+                    (unsigned long long)deliverable, regs ? 1 : 0);
+        }
+    }
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     if (deliverable == 0) return;
 
@@ -641,7 +670,7 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     }
     if (sig == 0) return;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
 
     /* A caught (user-handler) signal can only be delivered when we have a
      * trapframe to rewrite. On the IRQ path we leave it pending so the next
@@ -654,11 +683,11 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     p->pending_signals  &= ~SIGMASK(sig);
     p->sigstate.pending &= ~SIGMASK(sig);
 
-    /* SIGKILL is always fatal and can never be caught. */
+    /* SIGKILL is always fatal, can never be caught, and kills the GROUP. */
     if (sig == SIGKILL) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d killed by SIGKILL\n", p->pid);
-        proc_exit(128 + sig);
+        proc_exit_group(128 + sig);
     }
 
     if (sa->sa_handler == SIG_IGN) return;
@@ -749,7 +778,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     if (!p || p->pid == 0) return false;
     if (sig <= 0 || sig >= SIG_MAX) return false;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
     if (sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
     if (p->sigstate.restorer == 0) return false;
     /* A fault arriving while its own signal is blocked is undefined in POSIX
@@ -838,7 +867,7 @@ int sys_sigaction(int sig, const void *uact, void *uoldact) {
     if (sig <= 0 || sig >= SIG_MAX) return -22; /* EINVAL */
     if (sig == SIGKILL || sig == SIGSTOP) return -22; /* can't change */
 
-    struct sigaction *cur = &p->sigstate.actions[sig];
+    struct sigaction *cur = &sig_actions_of(p)[sig];
 
     if (uoldact) {
         struct abi_sigaction old = {
@@ -935,6 +964,55 @@ long sys_sigreturn(void) {
     return (long)ctx->rax;          /* becomes user RAX after SYSRETQ */
 }
 
+/* tkill/tgkill: THREAD-directed, so the process-directed retarget in
+ * sys_kill must NOT apply -- glibc's pthread_kill aims at one specific
+ * thread (the NPTL setxid/cancel broadcasts depend on exactly that), and
+ * rerouting it would deliver a cancellation to the wrong sibling. tgid > 0
+ * is verified against the target's real group (ESRCH on mismatch); pass
+ * tgid <= 0 for tkill's unchecked form. */
+int sys_tgkill(int tgid, int tid, int sig) {
+    if (sig < 0 || sig >= SIG_MAX) return -22;
+    struct proc *p = current_proc();
+    if (!p) return -1;
+    int ktid = pid_knr(tid);
+    if (!ktid) return -3;                              /* ESRCH */
+    struct proc *t = proc_lookup(ktid);
+    if (!t) return -3;
+    if (tgid > 0) {
+        int kgid = t->is_thread ? t->tgid : t->pid;
+        struct proc *ld = proc_lookup(kgid);
+        int vgid = ld ? pid_vnr(ld) : kgid;
+        if (vgid != tgid) return -3;                   /* tid not in tgid */
+    }
+    /* RT-signal trace (NPTL setxid/cancel debugging): name each link of
+     * the chain, capped. */
+    if (sig >= 32) {
+        static int tgk = 0;
+        if (tgk < 16) { tgk++;
+            struct sigaction *sa = &sig_actions_of(t)[sig];
+            kprintf("[tgk] %d->tid %d sig=%d tstate=%d hnd=%p mask=0x%llx "
+                    "pend(pre)=0x%llx\n",
+                    p->pid, t->pid, sig, (int)t->state,
+                    (void *)sa->sa_handler,
+                    (unsigned long long)t->sigstate.mask,
+                    (unsigned long long)t->pending_signals);
+        }
+    }
+    signal_send(t, sig);
+    if (sig > 0) {
+        /* Linux stamps the sender's TGID (glibc's handlers compare si_pid
+         * against their getpid(), which is the tgid) -- a thread's own tid
+         * here would make the anti-spoof check reject a legitimate
+         * broadcast sent from any non-main thread. */
+        int spid = p->is_thread ? p->tgid : p->pid;
+        struct proc *sld = proc_lookup(spid);
+        t->sigstate.si_pid[sig] = pid_vnr_in(t->pid_ns, sld ? sld->pid : spid);
+        t->sigstate.si_uid[sig] = p->uid;
+        t->sigstate.si_code[sig] = SI_TKILL;   /* the NPTL anti-spoof check */
+    }
+    return 0;
+}
+
 int sys_kill(int pid, int sig) {
     if (sig < 0 || sig >= SIG_MAX) return -22;
 
@@ -955,6 +1033,26 @@ int sys_kill(int pid, int sig) {
         if (!kpid) return -3;                        /* not visible => ESRCH */
         struct proc *target = proc_lookup(kpid);
         if (!target) return -3; /* ESRCH */
+        /* PROCESS-directed delivery (2026-08-22): kill(pid) targets the
+         * PROCESS, and POSIX says any thread with the signal unblocked may
+         * take it. This used to land on the leader's slot unconditionally,
+         * so a leader that blocked the signal pinned it pending forever
+         * while a sibling sat ready to handle it. SIGKILL/SIGSTOP skip the
+         * scan -- they act regardless of masks. */
+        if (!target->is_thread && sig > 0 &&
+            sig != SIGKILL && sig != SIGSTOP &&
+            (target->sigstate.mask & SIGMASK(sig))) {
+            extern struct proc g_proc[];
+            for (int i = 1; i < PROC_MAX; i++) {
+                struct proc *q = &g_proc[i];
+                if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO)
+                    continue;
+                if (!q->is_thread || q->tgid != target->pid) continue;
+                if (q->sigstate.mask & SIGMASK(sig)) continue;
+                target = q;                          /* it can take it now */
+                break;
+            }
+        }
         signal_send(target, sig);
         if (sig > 0) {
             target->sigstate.si_pid[sig] = pid_vnr_in(target->pid_ns, p->pid);

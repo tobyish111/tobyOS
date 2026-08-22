@@ -3148,6 +3148,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-sockserver (host-peer gate half)";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sockserver";                  \
 	fi;                                                                   \
+	if [ -f programs/linux-nptl/linux-nptl.elf ]; then                     \
+	    cp programs/linux-nptl/linux-nptl.elf                              \
+	         $(INITRD_STAGE)/bin/linux-nptl;                               \
+	    echo "[initrd] staged linux-nptl (thread-group semantics)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-nptl";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
