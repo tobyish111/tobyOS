@@ -15,7 +15,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
 | bash-parity (hand-written) | `bash logs/shparity.sh` | **92/92** | ~4 min |
-| INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **4/4** (+ bash-vs-bash selfcheck every run) | ~4 min |
+| INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **6/6** (+ bash-vs-bash selfcheck every run) | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
 `src/shell.c` is compiled **twice**: into the kernel, and into `/bin/tsh` with
@@ -199,10 +199,22 @@ BROKEN session gets one LOGGED retry (silent-child flake, seen once);
 job-notification cases need pid normalization the runner does not have
 yet; nothing in a case may contain the sentinel bytes.
 
-Still open interactively, now MEASURABLE with this gate: ^Z/SIGTSTP stop
-+ fg/bg resume (needs tcsetpgrp handover + WUNTRACED reporting — the
-kernel work sketched in the monitor leg), fc against a real history, and
-the long tail of XCU 2 the corpus already covers piecemeal. Case-writing law: the runner gives bash
+**The ^Z arc is CLOSED (c4d21c6, cases 05–06):** pty ISIG (^C/^Z were
+input BYTES before), WUNTRACED in both wait arms (native stop encoding
+0x10000|sig — 0x7f collides with `exit 127`), a cooperative stop point in
+nanosleep (which was an UNINTERRUPTIBLE 30-second CPU spin — SIGTERM sat
+pending its whole duration; the IRQ tick cannot stop a proc parked in a
+syscall loop — and after CONT the REMAINING sleep continues), tsh's
+monitor foreground path (tty handover via TIOCSPGRP, bash-format
+Stopped/jobs/fg/bg, `bg` actually SIGCONTs now), interactive fc fed by a
+real history. Traps for case authors: pipeline stages must never run the
+foreground dance (`g_in_pipeline_stage`); gate deadlines are REAL TIME
+(the spin-count guess was 20× off); the interrupt settle waits for
+TIOCGPGRP to CHANGE, never for an interval.
+
+Still open interactively: SIGTSTP for the KERNEL console shell (the pty
+side is done), WCONTINUED, `%jobspec` arguments to kill/fg/bg beyond the
+defaults, and the long tail of XCU 2 the corpus already covers piecemeal. Case-writing law: the runner gives bash
 and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
 never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
