@@ -14,7 +14,7 @@ Branch: `feat/posix-shell`. Head at handoff: `a863b0a`.
 | gate | command | state | time |
 |---|---|---|---|
 | Oils spec suite (third-party) | `bash logs/oilspec.sh` | **POSIX 100.0%** (1278–1280 of same; the denominator moves ±2 with the background-race exclusions) | ~10 min |
-| bash-parity (hand-written) | `bash logs/shparity.sh` | **92/92** | ~4 min |
+| bash-parity (hand-written) | `bash logs/shparity.sh` | **98/98** | ~4 min |
 | INTERACTIVE parity (pty) | `bash logs/ttyparity.sh` | **7/7** (+ bash-vs-bash selfcheck every run) | ~4 min |
 | Linux ABI acceptance | `bash logs/lxposix.sh` | was RED at `linux-timers`, pre-existing — verify before blaming yourself | — |
 
@@ -229,8 +229,19 @@ waker's next syscall (29ms vs 1.4s measured) — case 07's
 oilspec exclusion set now sometimes includes here-doc 1762 (guest bash
 disagrees with itself since SIGCHLD landed; screen prints both outputs).
 
-Still open: the long tail of XCU 2 the corpus already covers piecemeal,
-and the VSC-PCTS2016 email (§2). Case-writing law: the runner gives bash
+**The XCU 2 long tail is walked (b5bd912, cases 93–98):** $$ subshell
+stability + PPID (which didn't exist), noclobber/`>|` (the stage
+splitter cut the clobber redirect's `|` as a pipe — the tokenizer had
+full `>|` support nothing could reach), pipeline negation, case-grammar
+corners (`(esac)` patterns opened a SUBSHELL in the scanner, so `esac`
+read as reserved and the real `;;` errored), compound/function-call
+redirections, and `${x?}` exit semantics (now exits non-interactive
+shells and subshells with status 1). Corpus gains included `>|`,
+noclobber, and fatal-expansion cases.
+
+Still open: the VSC-PCTS2016 email (§2) — the walk itself has no named
+unwalked territory left; further coverage comes from new probe rounds
+over the same map, or from the real suite when the license arrives. Case-writing law: the runner gives bash
 and tsh DIFFERENT scratch dirs (`<scratch>/a` vs `/b`), so a case may
 never print an absolute path — strip `$PWD` prefixes the way
 `80-cd-details.sh` does.
