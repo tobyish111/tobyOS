@@ -13,6 +13,7 @@
 
 #include <tobyos/types.h>
 #include <tobyos/net.h>
+#include <tobyos/ipv6.h>   /* AF_INET6 endpoints (2026-08-23) */
 
 #define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
 #define SOCK_RX_DGRAMS         128     /* per-socket UDP/UNIX ring depth. Was 64
@@ -36,7 +37,7 @@
 /* User-visible "domain"/"type" constants. */
 #define AF_UNIX                1
 #define AF_INET                2
-#define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
+#define AF_INET6               10      /* UDP since 2026-08-23; SOCK_STREAM -> EAFNOSUPPORT */
 #define AF_NETLINK             16      /* rtnetlink (chrome's NetworkChangeNotifier) */
 #define NETLINK_ROUTE          0
 #define SOCK_STREAM            1       /* TCP */
@@ -91,6 +92,10 @@ struct file;
 struct sock_dgram {
     uint32_t  src_ip;          /* network byte order */
     uint16_t  src_port;        /* network byte order */
+    /* AF_INET6 (2026-08-23): when src_is6 is set, src6 carries the
+     * sender and src_ip is meaningless. src_port serves both families. */
+    uint8_t   src_is6;
+    struct ipv6_addr src6;
     /* Slice 56d: uint16_t until 2026-07-28 -- and unix_enqueue_fds SILENTLY
      * TRUNCATED any AF_UNIX message > 65535 bytes while telling the sender it
      * all went out. Chrome's browser->renderer Mojo channel messages cross
@@ -178,6 +183,13 @@ struct sock {
      * the only sender in practice). */
     uint32_t         peer_ip;
     uint16_t         peer_port;
+
+    /* AF_INET6 (2026-08-23). is_v6 marks the socket's family for the
+     * syscall arms; local6 is the bind address (all-zero = ::, any);
+     * peer6 is the connect() peer when is_v6 (peer_port is shared). */
+    uint8_t          is_v6;
+    struct ipv6_addr local6;
+    struct ipv6_addr peer6;
 
     /* ---- Slice 89: SLOT GENERATION (fixes the hazard slice 78 named) ----
      * Pool slots are recycled IMMEDIATELY by sock_alloc, and an AF_UNIX
@@ -333,6 +345,18 @@ void sock_unix_unbind(struct sock *s);
 int sock_bind(struct sock *s, uint16_t port_be);
 
 /* UDP sendto / recvfrom. */
+/* AF_INET6 UDP (2026-08-23). sendto6 checksums with the mandatory v6
+ * pseudo-header and short-circuits ::1/self through the inline loopback;
+ * recvfrom6_to mirrors recvfrom_to with a v6 source out-param; the
+ * deliver hook is called from ipv6_recv's UDP demux. */
+long sock_sendto6(struct sock *s, const void *buf, size_t len,
+                  const struct ipv6_addr *dst, uint16_t dst_port_be);
+long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
+                       struct ipv6_addr *src6_out, uint16_t *src_port_be,
+                       uint32_t timeout_ms);
+void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
+                       uint16_t dport, const void *data, size_t len);
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be);
 long sock_recvfrom(struct sock *s, void *buf, size_t n,

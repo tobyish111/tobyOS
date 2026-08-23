@@ -801,6 +801,12 @@ long file_write(struct file *f, const void *buf, size_t n) {
         }
         if (f->sock && f->sock->kind == SOCK_KIND_NETLINK)
             return sock_netlink_send(f->sock, buf, n);
+        if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->is_v6 &&
+            f->sock->peer_port) {
+            long w = sock_sendto6(f->sock, buf, n,
+                                  &f->sock->peer6, f->sock->peer_port);
+            return (w < 0) ? -1 : w;
+        }
         if (f->sock && f->sock->kind == SOCK_KIND_UDP && f->sock->peer_port) {
             long w = sock_sendto(f->sock, buf, n,
                                  f->sock->peer_ip, f->sock->peer_port);

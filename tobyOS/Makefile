@@ -3257,6 +3257,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    echo "[initrd] staged linux-cont (resume-latency)";                \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cont";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-ipv6/linux-ipv6.elf ]; then                     \
+	    cp programs/linux-ipv6/linux-ipv6.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ipv6;                               \
+	    echo "[initrd] staged linux-ipv6 (AF_INET6 UDP)";                  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ipv6";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

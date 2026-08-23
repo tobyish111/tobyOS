@@ -7959,6 +7959,12 @@ void _start(void) {
              * every core (measured 1.4 s once; want two ticks). */
             { "/bin/linux-cont", "linux-cont", 0, 3,
               "woken-from-stop resume latency" },
+            /* 2026-08-23: AF_INET6 UDP + ::1 loopback (IPv6 slice 1).
+             * The v6 substrate existed for months with no socket layer
+             * to reach it; this proves echo/dual-stack/getsockname by
+             * value. */
+            { "/bin/linux-ipv6", "linux-ipv6", 0, 63,
+              "AF_INET6 UDP: ::1 echo + dual-stack" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

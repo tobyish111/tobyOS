@@ -323,6 +323,9 @@ void sock_deliver(struct sock *s,
 
     struct sock_dgram *d = &s->dgrams[s->head];
     d->src_ip   = src_ip_be;
+    d->src_is6  = 0;      /* ring slots are reused; a stale v6 flag from a
+                           * previous occupant would make recvfrom6 read
+                           * garbage src6 bytes for this v4 datagram */
     d->src_port = src_port_be;
     d->len      = (uint32_t)len;
     d->payload  = copy;
@@ -1018,6 +1021,140 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
     s->count--;
 
+    return (long)copy;
+}
+
+/* ---- AF_INET6 UDP (2026-08-23) ----------------------------------------
+ *
+ * The v6 substrate (ipv6.c: SLAAC + NDP + send/recv, and now an inline
+ * ::1/self loopback) predates this by months; what never existed was a
+ * socket that could USE it -- socket(AF_INET6) was an EAFNOSUPPORT and
+ * every non-DHCPv6 v6 datagram was silently dropped. These three
+ * functions are the missing layer: checksummed sends (mandatory in v6),
+ * a pool demux for inbound, and a recv that reports v6 sources. */
+
+void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
+                       uint16_t dport, const void *data, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP || !s->is_v6) continue;
+        if (ntohs(s->local_port) != dport) continue;
+        if (!net_ns_has_network(s->net_ns)) continue;   /* same rule as v4 */
+
+        if (len > ETH_MTU) len = ETH_MTU;
+        if (s->count == SOCK_RX_DGRAMS) {
+            struct sock_dgram *old = &s->dgrams[s->tail];
+            if (old->payload) { kfree(old->payload); old->payload = 0; }
+            s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+            s->count--;
+            s->dropped++;
+        }
+        uint8_t *copy = (uint8_t *)kmalloc(len ? len : 1);
+        if (!copy) return;
+        if (len) memcpy(copy, data, len);
+        struct sock_dgram *d = &s->dgrams[s->head];
+        d->src_ip   = 0;
+        d->src_is6  = 1;
+        d->src6     = *src;
+        d->src_port = htons(sport);
+        d->len      = (uint32_t)len;
+        d->payload  = copy;
+        s->head = (uint16_t)((s->head + 1) % SOCK_RX_DGRAMS);
+        s->count++;
+        wq_wake_all(&s->wq_recv);
+        poll_event_notify();
+        return;
+    }
+}
+
+long sock_sendto6(struct sock *s, const void *buf, size_t len,
+                  const struct ipv6_addr *dst, uint16_t dst_port_be) {
+    if (!cap_check(current_proc(), CAP_NET, "sock_sendto6")) return -1;
+    if (!s || !s->in_use)  return -1;
+    if (!buf && len)       return -1;
+    if (dst_port_be == 0)  return -1;
+    if (len > ETH_MTU - 48) return -1;   /* v6 hdr(40) + udp hdr(8) */
+    if (s->local_port == 0 && sock_bind_ephemeral(s) != 0) return -1;
+
+    uint8_t pkt[ETH_MTU];
+    size_t tot = 8 + len;
+    pkt[0] = (uint8_t)(ntohs(s->local_port) >> 8);
+    pkt[1] = (uint8_t)(ntohs(s->local_port) & 0xff);
+    pkt[2] = (uint8_t)(ntohs(dst_port_be) >> 8);
+    pkt[3] = (uint8_t)(ntohs(dst_port_be) & 0xff);
+    pkt[4] = (uint8_t)(tot >> 8);
+    pkt[5] = (uint8_t)(tot & 0xff);
+    pkt[6] = 0;
+    pkt[7] = 0;
+    if (len) memcpy(pkt + 8, buf, len);
+    /* Mandatory checksum over the pseudo-header ipv6_send will really
+     * stamp -- ipv6_src_for mirrors its source selection, loopback
+     * (src == dst) included. */
+    uint16_t cs = ipv6_l4_checksum(ipv6_src_for(dst), dst,
+                                   IPV6_NH_UDP, pkt, tot);
+    pkt[6] = (uint8_t)(ntohs(cs) >> 8);
+    pkt[7] = (uint8_t)(ntohs(cs) & 0xff);
+
+    struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
+    int rc = ipv6_send(dst, IPV6_NH_UDP, pkt, tot);
+    net_ctx_leave(nprev);
+    return (rc == 0) ? (long)len : -3;
+}
+
+long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
+                       struct ipv6_addr *src6_out, uint16_t *src_port_be,
+                       uint32_t timeout_ms) {
+    /* Identical wait discipline to sock_recvfrom_to; only the source
+     * reporting differs. A v4-sourced datagram on a v6 socket reports
+     * a v4-mapped address (::ffff:a.b.c.d), the standard dual-stack
+     * spelling. */
+    if (!cap_check(current_proc(), CAP_NET, "sock_recvfrom6")) return -1;
+    if (!s || !s->in_use)  return -1;
+    if (!buf && n)         return -1;
+
+    uint64_t deadline = 0;
+    if (timeout_ms)
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+
+    while (s->count == 0) {
+        struct proc *self = current_proc();
+        if (self->pending_signals) return EINTR_RET;
+        if (!s->in_use)            return -1;
+        if (s->nonblock)           return SOCK_ERR_AGAIN;
+        if (deadline && perf_now_ns() >= deadline) return 0;
+        struct net_dev *nd = net_default();
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+        if (s->count > 0) break;
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        sti();
+        {
+            struct percpu *me = smp_this_cpu();
+            if (me && __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+                sched_yield();
+            else
+                hlt();
+        }
+        if (had_bkl) bkl_enter();
+    }
+
+    struct sock_dgram *d = &s->dgrams[s->tail];
+    size_t copy = d->len < n ? d->len : n;
+    if (copy && d->payload) memcpy(buf, d->payload, copy);
+    if (src6_out) {
+        if (d->src_is6) {
+            *src6_out = d->src6;
+        } else {
+            memset(src6_out, 0, sizeof *src6_out);
+            src6_out->bytes[10] = 0xff;
+            src6_out->bytes[11] = 0xff;
+            memcpy(&src6_out->bytes[12], &d->src_ip, 4);
+        }
+    }
+    if (src_port_be) *src_port_be = d->src_port;
+    if (d->payload) { kfree(d->payload); d->payload = 0; }
+    s->tail = (uint16_t)((s->tail + 1) % SOCK_RX_DGRAMS);
+    s->count--;
     return (long)copy;
 }
 

@@ -6778,10 +6778,23 @@ static long lx_socket(int domain, int type, int proto) {
         if (nfd < 0) { sock_close(ns); return -ABI_EMFILE; }
         return nfd;
     }
-    /* We only implement IPv4. musl's getaddrinfo opens an AF_INET6 DNS socket
-     * first and falls back to AF_INET *only* on EAFNOSUPPORT -- returning
-     * EINVAL there made the fallback never happen (wget: "bad address"). */
-    if (domain == AF_INET6) return -LXE_EAFNOSUPPORT;
+    /* AF_INET6 (2026-08-23): UDP datagrams are real now -- the v6 socket is
+     * the same pool entry as v4 with is_v6 set, and each call site parses
+     * sockaddr_in6 for it. SOCK_STREAM stays EAFNOSUPPORT until the TCP6
+     * slice, and the errno choice is load-bearing: musl/glibc getaddrinfo
+     * falls back to AF_INET *only* on EAFNOSUPPORT -- EINVAL here once made
+     * the fallback never happen (wget: "bad address"). */
+    if (domain == AF_INET6) {
+        if ((type & 0xff) != SOCK_DGRAM) return -LXE_EAFNOSUPPORT;
+        if (!cap_check(current_proc(), CAP_NET, "lx_socket6")) return -ABI_EACCES;
+        struct sock *s6 = sock_alloc(SOCK_KIND_UDP);
+        if (!s6) return -ABI_EMFILE;
+        s6->is_v6    = 1;
+        s6->nonblock = (type & SOCK_NONBLOCK) != 0;
+        int fd6 = lx_sock_install(s6);
+        if (fd6 < 0) { sock_close(s6); return -ABI_EMFILE; }
+        return fd6;
+    }
     if (domain != AF_INET) return -ABI_EINVAL;
     int t = type & 0xff;                /* strip SOCK_NONBLOCK/SOCK_CLOEXEC */
     int kind;
@@ -6889,6 +6902,68 @@ static void lx_addr_writeback(uint64_t uaddr, uint64_t ualen,
     if (ualen) (void)copy_to_user((void *)(uintptr_t)ualen, &len, 4);
 }
 
+/* ---- AF_INET6 address plumbing (2026-08-23) --------------------------
+ *
+ * sockaddr_in6 = { u16 family; u16 port(BE); u32 flowinfo; u8 addr[16];
+ * u32 scope_id } == 28 bytes. flowinfo and scope_id are accepted and
+ * ignored -- one interface, so there is no link-local ambiguity for a
+ * scope id to resolve. */
+struct __attribute__((packed)) lx_sockaddr_in6 {
+    uint16_t fam;
+    uint16_t port_be;
+    uint32_t flowinfo;
+    uint8_t  addr[16];
+    uint32_t scope;
+};
+
+static long lx_sin6_parse(uint64_t uaddr, uint32_t alen,
+                          struct ipv6_addr *ip, uint16_t *port_be) {
+    struct lx_sockaddr_in6 sa;
+    memset(&sa, 0, sizeof sa);
+    if (!uaddr || alen < 24) return -ABI_EFAULT;   /* need through addr[16] */
+    uint32_t rd = alen > sizeof sa ? (uint32_t)sizeof sa : alen;
+    if (copy_from_user(&sa, (const void *)(uintptr_t)uaddr, rd) != 0)
+        return -ABI_EFAULT;
+    if (sa.fam != AF_INET6) return -ABI_EINVAL;
+    memcpy(ip->bytes, sa.addr, 16);
+    *port_be = sa.port_be;
+    return 0;
+}
+
+static bool lx_v6_is_mapped(const struct ipv6_addr *a) {
+    for (int i = 0; i < 10; i++) if (a->bytes[i]) return false;
+    return a->bytes[10] == 0xff && a->bytes[11] == 0xff;
+}
+
+/* Send one datagram from a v6 socket: explicit sockaddr_in6 at uaddr, else
+ * the connect()-ed peer. A v4-mapped destination (::ffff:a.b.c.d) rides the
+ * v4 path -- sock_recvfrom6_to spells v4 sources the same way, so the two
+ * dual-stack directions agree. `k` is already a kernel buffer. */
+static long lx_udp6_sendk(struct sock *s, const void *k, size_t len,
+                          uint64_t uaddr) {
+    struct ipv6_addr d6; uint16_t dp6;
+    if (uaddr) {
+        /* sendto's addrlen is not delivered this deep (same contract as
+         * lx_udp_dest); assume a full sockaddr_in6. */
+        if (lx_sin6_parse(uaddr, sizeof(struct lx_sockaddr_in6),
+                          &d6, &dp6) != 0)
+            return -ABI_EINVAL;
+    } else if (s->peer_port) {
+        d6 = s->peer6; dp6 = s->peer_port;
+    } else {
+        return -ABI_EINVAL;
+    }
+    if (!lx_sock_networked(s)) return -LXE_ENETUNREACH;
+    long n;
+    if (lx_v6_is_mapped(&d6)) {
+        uint32_t v4; memcpy(&v4, &d6.bytes[12], 4);
+        n = sock_sendto(s, k, len, v4, dp6);
+    } else {
+        n = sock_sendto6(s, k, len, &d6, dp6);
+    }
+    return (n < 0) ? -LXE_EAGAIN : n;
+}
+
 static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
@@ -6920,6 +6995,18 @@ static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
         if (nl.fam != AF_NETLINK) return -ABI_EINVAL;
         s->nl_pid = nl.pid ? nl.pid : (uint32_t)(current_proc()->pid);
         return 0;
+    }
+    /* AF_INET6: record the address, claim the port. Same empty-netns rule
+     * as v4 below: :: (any) binds locally, a specific address needs an
+     * interface to be bound to. */
+    if (s->is_v6) {
+        struct ipv6_addr a6; uint16_t p6;
+        long pr = lx_sin6_parse(uaddr, alen, &a6, &p6);
+        if (pr) return pr;
+        if (!lx_sock_networked(s) && !ipv6_addr_is_zero(&a6))
+            return -LXE_EADDRNOTAVAIL;
+        s->local6 = a6;
+        return sock_bind(s, p6) == 0 ? 0 : -LXE_EADDRINUSE;
     }
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
@@ -7090,6 +7177,22 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         return rc == 0 ? 0 : -LXE_ECONNREFUSED;
     }
 
+    /* AF_INET6: connected UDP only for now (socket() refuses AF_INET6
+     * SOCK_STREAM until the TCP6 slice, so a v6 sock here is always UDP).
+     * Remember the peer; send()/recv()/write() then default to it. The
+     * empty-netns denial applies exactly as for v4 -- this kernel has no
+     * per-namespace loopback, so an empty namespace refuses ::1 too. */
+    if (fam == AF_INET6) {
+        if (s->kind != SOCK_KIND_UDP || !s->is_v6) return -ABI_EINVAL;
+        struct ipv6_addr a6; uint16_t p6;
+        long pr = lx_sin6_parse(uaddr, alen, &a6, &p6);
+        if (pr) return pr;
+        if (!lx_sock_networked(s)) return -LXE_ENETUNREACH;
+        s->peer6     = a6;
+        s->peer_port = p6;
+        return 0;
+    }
+
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof sa);
     if (alen < 8 ||
@@ -7235,6 +7338,20 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
         struct proc *me = current_proc();
         if (me) signal_send_to_pid(me->pid, SIGPIPE);
         return -ABI_EPIPE;
+    }
+
+    if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k6 = len ? kmalloc(len) : 0;
+        if (len && !k6) return -ABI_ENOMEM;
+        long rv6;
+        if (len && copy_from_user(k6, (const void *)(uintptr_t)ubuf, len) != 0)
+            rv6 = -ABI_EFAULT;
+        else
+            rv6 = lx_udp6_sendk(s, k6, len, uaddr);
+        if (k6) kfree(k6);
+        return rv6;
     }
 
     if (s->kind == SOCK_KIND_UDP) {
@@ -7385,6 +7502,33 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
         if (nd && nd->rx_drain) nd->rx_drain(nd);
         net_poll();
         if (!sock_recv_ready(s)) return -LXE_EAGAIN;
+    }
+
+    if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
+        if (len == 0) return 0;
+        if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+        void *k6 = kmalloc(len);
+        if (!k6) return -ABI_ENOMEM;
+        struct ipv6_addr s6; uint16_t sp6 = 0;
+        memset(&s6, 0, sizeof s6);
+        uint32_t to6 = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
+        long n = sock_recvfrom6_to(s, k6, len, &s6, &sp6, to6);
+        long rv6;
+        if (n == EINTR_RET) rv6 = -LXE_EINTR;
+        else if (n < 0)     rv6 = -LXE_EAGAIN;
+        else if (n == 0 && to6) rv6 = -LXE_EAGAIN;     /* timeout, no datagram */
+        else if (copy_to_user((void *)(uintptr_t)ubuf, k6, (size_t)n) != 0)
+            rv6 = -ABI_EFAULT;
+        else rv6 = n;
+        kfree(k6);
+        if (rv6 >= 0 && uaddr) {
+            struct lx_sockaddr_in6 sa; memset(&sa, 0, sizeof sa);
+            sa.fam = AF_INET6; sa.port_be = sp6;
+            memcpy(sa.addr, s6.bytes, 16);
+            lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        }
+        return rv6;
     }
 
     if (s->kind == SOCK_KIND_UDP) {
@@ -7555,6 +7699,31 @@ static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
             len = (uint32_t)(2 + n + 1);      /* family + path + NUL */
         }
         lx_addr_writeback(uaddr, ualen, &sun, len);
+        return 0;
+    }
+
+    /* AF_INET6 (UDP only until the TCP6 slice). */
+    if (s->is_v6) {
+        struct lx_sockaddr_in6 sa6;
+        memset(&sa6, 0, sizeof sa6);
+        sa6.fam = AF_INET6;
+        if (peer) {
+            if (!s->peer_port) return -LXE_ENOTCONN;
+            memcpy(sa6.addr, s->peer6.bytes, 16);
+            sa6.port_be = s->peer_port;
+        } else {
+            /* RFC 3484 source discovery: glibc connect()s a UDP socket and
+             * reads the local name to learn which source the route picks.
+             * An explicit bind wins; otherwise answer what ipv6_send would
+             * actually stamp for the connected peer (loopback: the peer
+             * itself), so the sort sees a real address, not ::. */
+            if (ipv6_addr_is_zero(&s->local6) && s->peer_port)
+                memcpy(sa6.addr, ipv6_src_for(&s->peer6)->bytes, 16);
+            else
+                memcpy(sa6.addr, s->local6.bytes, 16);
+            sa6.port_be = s->local_port;
+        }
+        lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
         return 0;
     }
 
@@ -7938,6 +8107,9 @@ static long lx_sendmsg(int fd, uint64_t umsg, int flags) {
          * use either -- answer both). */
         long n = total ? sock_netlink_send(s, k, total) : 0;
         rv = (n < 0) ? -ABI_EINVAL : n;
+    } else if (s->kind == SOCK_KIND_UDP && s->is_v6) {
+        uint64_t naddr = (mh.msg_namelen >= 24) ? mh.msg_name : 0;
+        rv = lx_udp6_sendk(s, k, total, naddr);
     } else if (s->kind == SOCK_KIND_UDP) {
         uint32_t dip; uint16_t dport;
         uint64_t naddr = (mh.msg_namelen >= 8) ? mh.msg_name : 0;
@@ -7998,6 +8170,8 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
 
     long n;
     uint32_t sip = 0; uint16_t sport = 0;
+    struct ipv6_addr s6src;                     /* v6 source, if is_v6 */
+    memset(&s6src, 0, sizeof s6src);
     if (s->kind == SOCK_KIND_NETLINK) {
         /* glibc reads netlink with recvmsg, NOT recv: __check_pf/getifaddrs
          * (sysdeps/unix/sysv/linux/check_pf.c make_request) is the caller, and
@@ -8029,7 +8203,10 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
             if (!sock_recv_ready(s)) { kfree(k); return -LXE_EAGAIN; }
         }
         uint32_t to = s->recv_timeout_ms ? s->recv_timeout_ms : 0;
-        n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
+        if (s->is_v6)
+            n = sock_recvfrom6_to(s, k, total, &s6src, &sport, to);
+        else
+            n = sock_recvfrom_to(s, k, total, &sip, &sport, to);
         if (n == EINTR_RET)        { kfree(k); return -LXE_EINTR; }
         if (n < 0)                 { kfree(k); return -LXE_EAGAIN; }
         if (n == 0 && to)          { kfree(k); return -LXE_EAGAIN; }
@@ -8134,6 +8311,13 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
         namelen_out = sizeof nla;
         if (mh.msg_name && mh.msg_namelen >= sizeof nla)
             (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &nla, sizeof nla);
+    } else if (s->kind == SOCK_KIND_UDP && s->is_v6 && mh.msg_name &&
+               mh.msg_namelen >= sizeof(struct lx_sockaddr_in6)) {
+        struct lx_sockaddr_in6 sa6; memset(&sa6, 0, sizeof sa6);
+        sa6.fam = AF_INET6; sa6.port_be = sport;
+        memcpy(sa6.addr, s6src.bytes, 16);
+        (void)copy_to_user((void *)(uintptr_t)mh.msg_name, &sa6, sizeof sa6);
+        namelen_out = sizeof sa6;
     } else if (mh.msg_name && mh.msg_namelen >= sizeof(struct sockaddr_in)) {
         struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET; sa.sin_addr = sip; sa.sin_port = sport;
