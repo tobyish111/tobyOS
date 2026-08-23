@@ -3269,6 +3269,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    echo "[initrd] staged linux-tcp6 (TCP over IPv6)";                 \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tcp6";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-v6host/linux-v6host.elf ]; then                 \
+	    cp programs/linux-v6host/linux-v6host.elf                          \
+	         $(INITRD_STAGE)/bin/linux-v6host;                             \
+	    echo "[initrd] staged linux-v6host (v6 vs real peer)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-v6host";                      \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

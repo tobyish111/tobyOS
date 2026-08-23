@@ -344,6 +344,13 @@ void ipv6_recv(const void *frame, size_t len) {
         uint16_t sport = ((uint16_t)payload[0] << 8) | payload[1];
         uint16_t dport = ((uint16_t)payload[2] << 8) | payload[3];
         uint16_t ulen  = ((uint16_t)payload[4] << 8) | payload[5];
+        {   /* capped trace while the wire path is young */
+            static int seen;
+            if (seen < 8) { seen++;
+                kprintf("[ipv6] udp in sport=%u dport=%u ulen=%u plen=%u\n",
+                        (unsigned)sport, (unsigned)dport, (unsigned)ulen,
+                        (unsigned)plen);
+            } }
         if (ulen < 8 || (size_t)ulen > plen) break;
         if (dport == 546) {
             dhcpv6_recv(&h->src, payload + 8, (size_t)ulen - 8);
@@ -374,8 +381,8 @@ void ipv6_recv(const void *frame, size_t len) {
 
 /* ---- send -------------------------------------------------------- */
 
-int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
-              const void *payload, size_t payload_len) {
+int ipv6_send_hl(const struct ipv6_addr *dst, uint8_t next_header,
+                 const void *payload, size_t payload_len, uint8_t hop_limit) {
     if (!g_ipv6_up) return -1;
     if (payload_len > ETH_MTU - IPV6_HDR_LEN) return -1;
 
@@ -392,7 +399,7 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
         ((uint8_t *)&h->ver_tc_fl)[0] = 0x60;
         h->payload_len = htons((uint16_t)payload_len);
         h->next_header = next_header;
-        h->hop_limit   = 64;
+        h->hop_limit   = hop_limit;
         h->src = *dst;               /* self-addressed: src == dst */
         h->dst = *dst;
         memcpy(frame + IPV6_HDR_LEN, payload, payload_len);
@@ -431,7 +438,7 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
 
     h->payload_len = htons((uint16_t)payload_len);
     h->next_header = next_header;
-    h->hop_limit   = 64;
+    h->hop_limit   = hop_limit;
     /* Source selection: a link-local/multicast destination uses our
      * link-local; a global destination uses our SLAAC global if we have one
      * (a global source is required for the reply to be routable back). */
@@ -449,4 +456,9 @@ int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
         return -1;
 
     return 0;
+}
+
+int ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
+              const void *payload, size_t payload_len) {
+    return ipv6_send_hl(dst, next_header, payload, payload_len, 64);
 }

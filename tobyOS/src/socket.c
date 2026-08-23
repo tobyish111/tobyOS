@@ -691,6 +691,32 @@ void sock_udp_icmp_error(uint16_t local_port_be, uint32_t peer_ip_be,
     }
 }
 
+/* The v6 twin (2026-08-23). Same Linux semantics -- only a CONNECTED
+ * socket consumes the async error. Codes are RFC 4443 destination-
+ * unreachable: 0 no-route, 1 admin-prohibited, 3 address-unreachable,
+ * 4 port-unreachable. Found live: SLIRP answers a v6 DNS query with
+ * type1/code0 when the HOST has no IPv6 resolver -- an error we used
+ * to throw away, so the recv just timed out and the wire looked dead. */
+void sock_udp6_icmp_error(uint16_t local_port_be,
+                          const struct ipv6_addr *peer,
+                          uint16_t peer_port_be, uint8_t code) {
+    int err = (code == 4) ? 111        /* ECONNREFUSED */
+            : (code == 0) ? 101        /* ENETUNREACH  */
+            : (code == 1) ? 13         /* EACCES       */
+            :               113;       /* EHOSTUNREACH */
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP || !s->is_v6) continue;
+        if (s->local_port != local_port_be) continue;
+        if (!s->peer_port) continue;                    /* not connected */
+        if (!ipv6_addr_equal(&s->peer6, peer) ||
+            s->peer_port != peer_port_be)
+            continue;
+        s->so_error = err;
+        wq_wake_all(&s->wq_recv);
+    }
+}
+
 /* shutdown(2) helpers (2026-08-22). Live here because the wait queue is
  * this file's private machinery. */
 void sock_shutdown_rd(struct sock *s) {
@@ -1040,6 +1066,12 @@ void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
         if (!s->in_use || s->kind != SOCK_KIND_UDP || !s->is_v6) continue;
         if (ntohs(s->local_port) != dport) continue;
         if (!net_ns_has_network(s->net_ns)) continue;   /* same rule as v4 */
+        {   /* capped trace while the wire path is young */
+            static int hits;
+            if (hits < 8) { hits++;
+                kprintf("[udp6] deliver dport=%u len=%u -> sock[%d]\n",
+                        (unsigned)dport, (unsigned)len, i);
+            } }
 
         if (len > ETH_MTU) len = ETH_MTU;
         if (s->count == SOCK_RX_DGRAMS) {
@@ -1065,6 +1097,14 @@ void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
         poll_event_notify();
         return;
     }
+    {   /* capped: an inbound v6 datagram nobody claimed, with the port
+         * it asked for -- the one fact that separates "demux mismatch"
+         * from "socket gone" while the wire path is young */
+        static int misses;
+        if (misses < 8) { misses++;
+            kprintf("[udp6] NO LISTENER dport=%u len=%u\n",
+                    (unsigned)dport, (unsigned)len);
+        } }
 }
 
 long sock_sendto6(struct sock *s, const void *buf, size_t len,
@@ -1121,6 +1161,11 @@ long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
         if (self->pending_signals) return EINTR_RET;
         if (!s->in_use)            return -1;
         if (s->nonblock)           return SOCK_ERR_AGAIN;
+        /* An async ICMPv6 error (sock_udp6_icmp_error) ends the wait NOW
+         * -- the LX layer re-reads so_error and reports the errno. Left
+         * to the v4 shape ("error on the NEXT op") the caller would
+         * sleep out its full timeout first. */
+        if (s->so_error)           return SOCK_ERR_AGAIN;
         if (deadline && perf_now_ns() >= deadline) return 0;
         struct net_dev *nd = net_default();
         if (nd && nd->rx_drain) nd->rx_drain(nd);

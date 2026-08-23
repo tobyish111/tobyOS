@@ -28,6 +28,7 @@
 #include <tobyos/nsproxy.h>   /* net_ns_dev / net_ctx_* (slice 12 cuts 2+5) */
 #include <tobyos/proc.h>
 #include <tobyos/klibc.h>
+#include <tobyos/printk.h>    /* capped v6-arrival diagnostic (2026-08-23) */
 
 bool eth_send(const uint8_t dst_mac[ETH_ADDR_LEN],
               uint16_t      ethertype,
@@ -136,6 +137,16 @@ static void eth_recv_inner(const void *frame, size_t len) {
         ip_recv(pl, pln);
         break;
     case ETH_TYPE_IPV6:
+        /* Capped arrival log (2026-08-23): the one guest-side fact that
+         * separates "SLIRP never sent it" from "we dropped it" -- a
+         * netdev filter-dump turned out to capture only the guest->host
+         * direction, so the wire pcap cannot answer this. */
+        {   static int v6_rx_logged;
+            if (v6_rx_logged < 8) { v6_rx_logged++;
+                kprintf("[eth] v6 frame in len=%u dst=%02x:%02x:%02x:"
+                        "%02x:%02x:%02x\n", (unsigned)pln,
+                        f[0], f[1], f[2], f[3], f[4], f[5]);
+            } }
         ipv6_recv(pl, pln);
         break;
     default:

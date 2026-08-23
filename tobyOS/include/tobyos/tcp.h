@@ -88,6 +88,11 @@ struct tcp_conn *tcp_connect6_nb(const struct ipv6_addr *dst,
                                  uint16_t dst_port_be);
 bool tcp_conn_is6(const struct tcp_conn *c);
 const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c);
+/* Async ICMPv6 verdict on a handshake (LXE errno; 0 = none) and the
+ * inbound hook that sets it (called from icmpv6.c's error handler). */
+int  tcp_icmp_err(const struct tcp_conn *c);
+void tcp6_icmp_error(uint16_t local_port_be, const struct ipv6_addr *peer,
+                     uint16_t peer_port_be, uint8_t code);
 
 /* Send without waiting for ACKs: queues as much as the congestion/receive
  * window allows right now and returns the byte count accepted (0 means the

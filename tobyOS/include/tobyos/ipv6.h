@@ -59,6 +59,12 @@ uint16_t ipv6_l4_checksum(const struct ipv6_addr *src,
                           const void *payload, size_t len);
 int  ipv6_send(const struct ipv6_addr *dst, uint8_t next_header,
                const void *payload, size_t payload_len);
+/* Explicit-hop-limit form. NDP (RS/NS/NA) MUST go out at 255 -- RFC 4861
+ * makes receivers silently discard anything else, which is exactly how
+ * every Router Solicitation this stack ever sent was ignored (hop limit
+ * was a hardwired 64; found 2026-08-23 chasing SLIRP's missing RA). */
+int  ipv6_send_hl(const struct ipv6_addr *dst, uint8_t next_header,
+                  const void *payload, size_t payload_len, uint8_t hop_limit);
 const struct ipv6_addr *ipv6_our_linklocal(void);
 bool ipv6_is_up(void);
 

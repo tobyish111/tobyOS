@@ -75,6 +75,11 @@ struct tcp_conn {
      * family-aware; the whole sequence-space engine is shared. */
     bool         is6;
     struct ipv6_addr remote6;
+    uint8_t      icmp_err;      /* async ICMPv6 verdict (LXE errno), or 0.
+                                 * Set by tcp6_icmp_error on a SYN_SENT
+                                 * conn; read via tcp_icmp_err so connect
+                                 * reports ENETUNREACH and not a made-up
+                                 * ECONNREFUSED. */
     uint16_t     remote_port_be;
     uint16_t     local_port_be;
     uint32_t     snd_una;
@@ -1484,6 +1489,29 @@ bool tcp_conn_is6(const struct tcp_conn *c) {
 }
 const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c) {
     return (c && c->in_use && c->is6) ? &c->remote6 : NULL;
+}
+int tcp_icmp_err(const struct tcp_conn *c) {
+    return (c && c->in_use) ? (int)c->icmp_err : 0;
+}
+
+/* ICMPv6 destination-unreachable naming one of OUR segments (RFC 4443
+ * code in `code`). Linux's tcp_v6_err shape: a connection still in the
+ * handshake dies with the mapped errno; an established one ignores the
+ * soft error. Without this, SLIRP's "no route" verdict on a v6 SYN --
+ * its answer whenever the host side cannot service the destination --
+ * was thrown away and every such connect sat out its full timeout. */
+void tcp6_icmp_error(uint16_t local_port_be, const struct ipv6_addr *peer,
+                     uint16_t peer_port_be, uint8_t code) {
+    uint8_t err = (code == 4) ? 111        /* ECONNREFUSED */
+                : (code == 0) ? 101        /* ENETUNREACH  */
+                : (code == 1) ? 13         /* EACCES       */
+                :               113;       /* EHOSTUNREACH */
+    struct tcp_conn *c = conn_lookup6(peer, peer_port_be, local_port_be);
+    if (!c || c->state != TCP_SYN_SENT) return;
+    kprintf("[tcp] ICMPv6 unreach code=%u kills tcp[%d] in SYN_SENT\n",
+            (unsigned)code, conn_index(c));
+    c->icmp_err = err;
+    c->state    = TCP_CLOSED;
 }
 
 /* SO_REUSEADDR's actual meaning for a listener: conns that are merely

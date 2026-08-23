@@ -7970,6 +7970,13 @@ void _start(void) {
              * connect + endpoint reporting + 48 KiB stream integrity. */
             { "/bin/linux-tcp6", "linux-tcp6", 0, 63,
               "TCP6: ::1 streams + dual-stack listen" },
+            /* 2026-08-23: IPv6 vs a REAL peer (slice 3) -- SLIRP's RA ->
+             * SLAAC, cold-neighbor NDP, DNS relay round trip, off-link
+             * routing, wire RST. Chasing this found the multicast-deaf
+             * e1000 filter and the hop-limit-64 NDP bug. bit2 needs the
+             * host's resolver to answer (LAN router). */
+            { "/bin/linux-v6host", "linux-v6host", 0, 63,
+              "v6 wire: SLAAC + DNS relay + RST" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

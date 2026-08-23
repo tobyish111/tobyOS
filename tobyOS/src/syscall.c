@@ -7053,9 +7053,13 @@ static int lx_conn_progress(struct sock *s) {
     }
     int flags = tcp_poll_flags(s->tcp);
     if ((flags & TCP_RDY_ERR) || st == TCP_CLOSED) {
+        /* An async ICMPv6 verdict (no-route etc.) names the REAL errno;
+         * only a genuine RST-or-teardown defaults to ECONNREFUSED. */
+        int e = tcp_icmp_err(s->tcp);
+        if (!e) e = LXE_ECONNREFUSED;
         s->connecting = 0;
-        s->so_error   = LXE_ECONNREFUSED;
-        return -LXE_ECONNREFUSED;
+        s->so_error   = e;
+        return -e;
     }
     /* 2026-08-22: the deadline is in perf_now_ns() NANOSECONDS now. It was
      * pit_hz()*ms ticks -- and under TCG the guest only RECEIVES ~1/15th of
@@ -7566,6 +7570,12 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
         long n = sock_recvfrom6_to(s, k6, len, &s6, &sp6, to6);
         long rv6;
         if (n == EINTR_RET) rv6 = -LXE_EINTR;
+        else if (n <= 0 && s->so_error) {
+            /* the wait ended because an ICMPv6 error landed */
+            int e = s->so_error; s->so_error = 0;
+            kfree(k6);
+            return -e;
+        }
         else if (n < 0)     rv6 = -LXE_EAGAIN;
         else if (n == 0 && to6) rv6 = -LXE_EAGAIN;     /* timeout, no datagram */
         else if (copy_to_user((void *)(uintptr_t)ubuf, k6, (size_t)n) != 0)
