@@ -334,6 +334,17 @@ static long signalfd_read(struct file *f, void *buf, size_t n) {
     }
 }
 
+/* Stamp the canonical path a handle was opened by (see file.h). Replaces
+ * any prior stamp; a NULL path or OOM leaves the handle anonymous. */
+void file_set_open_path(struct file *f, const char *kpath) {
+    if (!f) return;
+    if (f->open_path) { kfree(f->open_path); f->open_path = 0; }
+    if (!kpath || !kpath[0]) return;
+    size_t n = strlen(kpath) + 1;
+    f->open_path = (char *)kmalloc(n);
+    if (f->open_path) memcpy(f->open_path, kpath, n);
+}
+
 struct file *file_clone(struct file *src) {
     if (!src) return 0;
     struct file *f = (struct file *)kmalloc(sizeof(*f));
@@ -477,6 +488,14 @@ struct file *file_clone(struct file *src) {
         f->dir_off = src->dir_off;
         break;
     }
+    /* Every kind carries its opening path across dup/fork (a clone that
+     * failed above already returned). Allocation failure degrades to an
+     * anonymous handle, never a failed dup. */
+    if (src->open_path) {
+        size_t n = strlen(src->open_path) + 1;
+        f->open_path = (char *)kmalloc(n);
+        if (f->open_path) memcpy(f->open_path, src->open_path, n);
+    }
     return f;
 }
 
@@ -573,6 +592,7 @@ void file_close(struct file *f) {
     case FILE_KIND_NULL:
         break;
     }
+    if (f->open_path) kfree(f->open_path);
     kfree(f);
 }
 
@@ -751,6 +771,13 @@ long file_write(struct file *f, const void *buf, size_t n) {
         file_pos_load(f);
         long w = f->vfs.ops->write(&f->vfs, buf, n);
         file_pos_store(f);
+        /* fd-addressed IN_MODIFY, possible since handles carry their
+         * opening path (2026-08-22) -- watchers of a file see writes
+         * through descriptors, not just path-level create/delete. */
+        if (w > 0 && f->open_path) {
+            extern void vfs_notify_modify(const char *);
+            vfs_notify_modify(f->open_path);
+        }
         return w;
     }
     case FILE_KIND_SOCKET:

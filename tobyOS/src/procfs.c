@@ -39,6 +39,17 @@
  * /dev/console, /dev/pts, anon_inode:...). */
 static void describe_fd_target(struct file *f, char *out, size_t cap) {
     const char *s = "anon_inode:[unknown]";
+    /* The stamped opening path wins for every kind that has one (2026-08-22).
+     * Before open_path existed the VFS arm answered "/", which broke every
+     * consumer that round-trips a descriptor through its /proc link -- most
+     * importantly glibc's fexecve fallback, execve("/proc/self/fd/N"). */
+    if (f->open_path) {
+        size_t sl = strlen(f->open_path);
+        if (sl >= cap) sl = cap - 1;
+        memcpy(out, f->open_path, sl);
+        out[sl] = '\0';
+        return;
+    }
     switch (f->kind) {
     case FILE_KIND_CONSOLE:     s = "/dev/console";          break;
     case FILE_KIND_PTY_MASTER:  s = "/dev/ptmx";             break;

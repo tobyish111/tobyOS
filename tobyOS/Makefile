@@ -179,6 +179,7 @@ C_SRCS := src/kernel.c \
           src/file.c \
           src/flock.c \
           src/ptimer.c \
+          src/xattr.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -3190,6 +3191,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-io;                                 \
 	    echo "[initrd] staged linux-io (POSIX timers + copy family)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-io";                          \
+	fi;                                                                   \
+	if [ -f programs/linux-xattr/linux-xattr.elf ]; then                   \
+	    cp programs/linux-xattr/linux-xattr.elf                            \
+	         $(INITRD_STAGE)/bin/linux-xattr;                              \
+	    echo "[initrd] staged linux-xattr (xattr + fd identity + fexecve)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-xattr";                       \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \

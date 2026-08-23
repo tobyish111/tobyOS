@@ -954,9 +954,9 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
 /* inotify (2026-08-22): path-addressed mutations announce themselves.
  * One helper so the emit sites cannot diverge; the first check is one
  * global load, so a system with no watchers pays nothing. fd-addressed
- * writes (vfs_write) CANNOT emit IN_MODIFY: struct vfs_file carries no
- * path -- the same missing identity behind /proc/<pid>/fd readlink
- * answering "/" -- recorded as one open item, not two. */
+ * writes emit IN_MODIFY through vfs_notify_modify() below, fed by struct
+ * file's open_path -- the identity whose absence was recorded here as one
+ * open item covering both this and /proc/<pid>/fd (closed 2026-08-22). */
 static void vfs_notify(const char *path, uint32_t mask, uint32_t cookie) {
     extern bool inotify_active(void);
     extern void inotify_emit_cookie(const char *, uint32_t,
@@ -972,6 +972,12 @@ static void vfs_notify(const char *path, uint32_t mask, uint32_t cookie) {
 #define VFS_IN_CREATE     0x100u
 #define VFS_IN_DELETE     0x200u
 #define VFS_IN_ISDIR      0x40000000u
+
+/* The fd-addressed emit door: file_write calls this with the handle's
+ * open_path after a successful VFS write. */
+void vfs_notify_modify(const char *path) {
+    vfs_notify(path, VFS_IN_MODIFY, 0);
+}
 
 int vfs_create(const char *path) {
     if (!path) return VFS_ERR_INVAL;
@@ -1035,7 +1041,11 @@ int vfs_unlink(const char *path) {
         if (prc != VFS_OK) return prc;
     }
     int urc = m->ops->unlink(m->data, rel);
-    if (urc == VFS_OK) vfs_notify(path, VFS_IN_DELETE, 0);
+    if (urc == VFS_OK) {
+        vfs_notify(path, VFS_IN_DELETE, 0);
+        { extern void xattr_forget_path(const char *);
+          xattr_forget_path(path); }
+    }
     return urc;
 }
 
@@ -1070,6 +1080,8 @@ int vfs_rename(const char *oldpath, const char *newpath) {
         uint32_t ck = ++g_mv_cookie;
         vfs_notify(oldpath, VFS_IN_MOVED_FROM, ck);
         vfs_notify(newpath, VFS_IN_MOVED_TO,   ck);
+        { extern void xattr_rename_path(const char *, const char *);
+          xattr_rename_path(oldpath, newpath); }
     }
     return rrc;
 }

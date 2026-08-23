@@ -221,6 +221,13 @@ struct file {
     int o_accmode;
     /* For FILE_KIND_INOTIFY: the instance index in inotify.c's table. */
     int inotify_id;
+    /* The canonical path this handle was opened by (2026-08-22), kmalloc'd
+     * at open, cloned on dup/fork, freed at close; NULL for kinds with no
+     * path. The long-missing identity behind three audit findings at once:
+     * /proc/<pid>/fd readlink answered "/", fgetxattr/fsetxattr had no file
+     * to attach to, and glibc's fexecve fallback (/proc/self/fd/N) resolved
+     * to nothing. NOT an inode identity -- unlink/rename do not chase it. */
+    char *open_path;
 };
 
 /* eventfd flags (Linux ABI) */
@@ -317,6 +324,7 @@ void   file_pos_set(struct file *f, size_t pos);
 struct file *file_std_handle(int fd);
 
 struct file *file_clone(struct file *src);
+void file_set_open_path(struct file *f, const char *kpath);
 
 /* Drop one fd-level reference. For pipes, this decrements the pipe's
  * reader/writer count (potentially waking the other end with EOF/EPIPE)

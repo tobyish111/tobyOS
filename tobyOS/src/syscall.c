@@ -53,6 +53,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/flock.h>     /* POSIX record locks + flock (2026-08-22) */
+#include <tobyos/xattr.h>     /* extended attributes, user.* (Phase E) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
@@ -2838,6 +2839,8 @@ static long sys_open(const char *path, int flags, int mode) {
      * requires a full rebuild of every object that includes it. */
     if (want_append) file_pos_set(f, f->vfs.size);
 
+    file_set_open_path(f, kpath);
+
     struct proc *p = current_proc();
     int fd = fd_alloc_into(p, f);
     if (fd < 0) {
@@ -5483,6 +5486,13 @@ enum {
     LX_epoll_pwait2 = 441, LX_sched_setscheduler = 144,
     /* Tier 2.5: SysV shm for MIT-SHM / Ozone */
     LX_shmget = 29, LX_shmat = 30, LX_shmctl = 31, LX_shmdt = 67,
+    /* Phase E (2026-08-22): extended attributes (user.* namespace; the
+     * f* forms ride the new struct file open_path), mknod, execveat. */
+    LX_setxattr = 188, LX_lsetxattr = 189, LX_fsetxattr = 190,
+    LX_getxattr = 191, LX_lgetxattr = 192, LX_fgetxattr = 193,
+    LX_listxattr = 194, LX_llistxattr = 195, LX_flistxattr = 196,
+    LX_removexattr = 197, LX_lremovexattr = 198, LX_fremovexattr = 199,
+    LX_mknod = 133, LX_mknodat = 259, LX_execveat = 322,
 };
 
 /* arch_prctl codes. */
@@ -9763,6 +9773,95 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return (long)old;
     }
 
+    /* ---- extended attributes (Phase E, 2026-08-22) ----------------------
+     * Twelve entry points, one store (src/xattr.c), user.* namespace. The
+     * l* forms behave as the plain ones (the resolver follows symlinks;
+     * symlink-own attributes are not modelled). The f* forms resolve the
+     * descriptor through its stamped open_path -- exactly the calls cp -a
+     * makes (fgetxattr/flistxattr on the source fd, fsetxattr on the
+     * destination fd), which is what forced open_path to exist. */
+    case LX_setxattr: case LX_lsetxattr: case LX_fsetxattr:
+    case LX_getxattr: case LX_lgetxattr: case LX_fgetxattr:
+    case LX_listxattr: case LX_llistxattr: case LX_flistxattr:
+    case LX_removexattr: case LX_lremovexattr: case LX_fremovexattr: {
+        bool fd_form = (n == LX_fsetxattr || n == LX_fgetxattr ||
+                        n == LX_flistxattr || n == LX_fremovexattr);
+        char kpath[ABI_PATH_MAX];
+        if (fd_form) {
+            struct file *xf = fd_lookup((int)a1);
+            if (!xf) return -ABI_EBADF;
+            const char *p = xf->open_path;
+            if (!p && xf->kind == FILE_KIND_DIR) p = xf->dirpath;
+            if (!p) return -ABI_ENOTSUP;    /* pathless kind (pipe, socket) */
+            size_t pl = strlen(p);
+            if (pl >= sizeof kpath) return -ABI_ENAMETOOLONG;
+            memcpy(kpath, p, pl + 1);
+        } else {
+            if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
+                return -ABI_ENOENT;
+            struct vfs_stat xs;
+            if (vfs_stat(kpath, &xs) != VFS_OK) return -ABI_ENOENT;
+        }
+        /* list takes (path, buf, size) -- no name argument. */
+        if (n == LX_listxattr || n == LX_llistxattr || n == LX_flistxattr) {
+            size_t sz = (size_t)a3;
+            if (sz == 0) return xattr_list(kpath, 0, 0);
+            char lbuf[512];
+            if (sz > sizeof lbuf) sz = sizeof lbuf;
+            long lr = xattr_list(kpath, lbuf, sz);
+            if (lr > 0 && copy_to_user((void *)(uintptr_t)a2, lbuf, (size_t)lr))
+                return -ABI_EFAULT;
+            return lr;
+        }
+        char xname[64];
+        long xnl = strncpy_from_user(xname, (const char *)a2, sizeof xname);
+        if (xnl < 0) return -ABI_EFAULT;
+        if ((size_t)xnl >= sizeof xname - 1) return -ABI_ERANGE;
+        if (n == LX_removexattr || n == LX_lremovexattr || n == LX_fremovexattr)
+            return xattr_remove(kpath, xname);
+        if (n == LX_setxattr || n == LX_lsetxattr || n == LX_fsetxattr) {
+            size_t sz = (size_t)a4;
+            uint8_t val[256];
+            if (sz > sizeof val) return -ABI_E2BIG;
+            if (sz && copy_from_user(val, (const void *)(uintptr_t)a3, sz))
+                return -ABI_EFAULT;
+            return xattr_set(kpath, xname, val, sz, (int)a5);
+        }
+        /* the get forms */
+        size_t sz = (size_t)a4;
+        if (sz == 0) return xattr_get(kpath, xname, 0, 0);   /* size probe */
+        uint8_t val[256];
+        if (sz > sizeof val) sz = sizeof val;   /* store caps values at 256 */
+        long gr = xattr_get(kpath, xname, val, sz);
+        if (gr > 0 && copy_to_user((void *)(uintptr_t)a3, val, (size_t)gr))
+            return -ABI_EFAULT;
+        return gr;
+    }
+
+    /* mknod(2)/mknodat(2). S_IFREG (or fmt 0, which POSIX defines as
+     * "regular") really creates the file; FIFOs and device nodes have no
+     * VFS representation, so those return EPERM -- the same errno an
+     * unprivileged caller gets for device nodes on Linux, and the one
+     * tar/rsync already know to downgrade to a warning. mode&~umask is
+     * not applied to the created file (vfs_create fixes 0644); chmod
+     * after create is the documented workaround. */
+    case LX_mknod: case LX_mknodat: {
+        bool at = (n == LX_mknodat);
+        const char *upath = (const char *)(at ? a2 : a1);
+        uint32_t mode = (uint32_t)(at ? a3 : a2);
+        char kpath[ABI_PATH_MAX];
+        long rr = at ? resolve_user_path_at((int)a1, upath, kpath, sizeof kpath)
+                     : resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr != 0) return -ABI_ENOENT;
+        uint32_t fmt = mode & 0170000u;
+        if (fmt != 0 && fmt != 0100000u) return -ABI_EPERM;
+        struct vfs_stat ms;
+        if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
+        int cr = vfs_create(kpath);
+        if (cr != VFS_OK) return vfs_err_to_abi(cr);
+        return 0;
+    }
+
     /* The utime family: utime(132), utimes(235), futimesat(261),
      * utimensat(280). busybox `touch` walks utimensat -> futimesat -> utimes
      * until one does not fail, so implementing a subset just moves the
@@ -12651,6 +12750,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * systemd degrades). */
     case 321:                          /* bpf */
     case 425: case 426: case 427:      /* io_uring_{setup,enter,register} */
+        return -ABI_ENOSYS;
+
+    case LX_execveat:
+        /* Authoritative ENOSYS by DESIGN, not neglect (Phase E). glibc's
+         * fexecve() probes execveat once and permanently falls back to
+         * execve("/proc/self/fd/N") -- and that path genuinely works now:
+         * procfs stats fd links as symlinks, describe_fd_target() answers
+         * with the handle's stamped open_path, and the resolver follows
+         * it to the real binary. Implementing execveat directly would
+         * mean refactoring sys_execve's user-pointer contract for a call
+         * whose only mainstream consumer has a working fallback. */
         return -ABI_ENOSYS;
 
     case 219:                          /* restart_syscall */

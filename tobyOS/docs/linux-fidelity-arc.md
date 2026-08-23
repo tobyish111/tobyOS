@@ -286,4 +286,50 @@ self-deadlock trap). Release: any-close drops the process's record locks on
 that file (the POSIX wart, kept deliberately); flock dies with the open
 file description (vfs_refs pointer identity); exit sweeps both. New
 /bin/linux-flock: every assertion cross-process with pipe handshakes, every
-refusal asserts its errno. Gate pending.
+refusal asserts its errno. (Gate went green in the 12/12 run that followed.)
+
+### 2026-08-22 — the pit-skew purge + ICMP + SO_REUSEADDR (lxposix 18/18, netbatch GREEN)
+Every remaining pit_ticks×pit_hz deadline in the network stack moved to
+perf_now_ns: tcp_tick_one retransmit/RTT, TIME_WAIT, the service tick,
+poll_until, connect/accept/send/recv/close deadlines, CUBIC's epoch. (The
+PIT delivers ~66 of 1000 programmed IRQs under TCG, so every one of those
+was ~15x slow — the "5 s" that measured 75 s.) SO_REUSEADDR is stored,
+honoured by tcp_listen_reuse against TIME_WAIT ghosts, and readable back.
+UDP-to-nobody now answers: icmp_send_port_unreach (rate-limited) + the
+type-3 decode path into sock_udp_icmp_error, so a blocking recvfrom after a
+refused send reports ECONNREFUSED like Linux instead of hanging. sendmmsg/
+recvmmsg pack per-message results in the 64-byte-stride mmsghdr layout.
+
+### 2026-08-22 — loopback exists, and it caught a TCP ordering bug (19fcddb)
+127.0.0.0/8 (and self-addressed) IP delivers INLINE at the top of ip_send —
+no device, no SLIRP round-trip. That immediacy exposed a latent ordering
+bug: tcp_send_data_segment emitted the segment BEFORE accounting snd_nxt,
+so with inline delivery the peer's ACK arrived while snd_nxt still pointed
+at the OLD edge and SYN_RECEIVED rejected valid handshake ACKs (30-75 s
+stalls). Now: account-before-emit, with tcp_emit_at(seq) for retransmits.
+Loopback UDP checksums are elided (h->checksum=0); the ICMP emitter uses
+src-as-orig-dst for 127/8 so refusal matching works on loops. lxsock stays
+green — the restructure held under the host-peer gate.
+
+### 2026-08-22 — procfs tells the truth (19e9b21, lxposix 19/19)
+/proc/<pid>/maps is generated from the REAL vma tables (g_vma_tables, 8192
+entries — mmap_vma_snapshot + brk range + stack, insertion-sorted, with a
+truncation marker so a capped listing never silently reads as complete).
+/proc/sys/{kernel,fs,vm} and /proc/net/{dev,tcp,udp,unix,route} exist with
+live values (tcp from tcp_conn_snapshot in /proc/net/tcp hex format);
+status gains Tgid/VmSize/VmRSS/Threads and the Sig* masks glibc's
+pthread_kill error paths read. /proc/self readlink answers the VIRTUAL pid
+(pid_vnr) — a PID-namespaced process must not see its host pid. cmdline is
+recorded at spawn/exec (proc_record_cmdline, NUL-separated) instead of
+synthesized.
+
+### 2026-08-22 — POSIX timers + the kernel copy family (94477dd, lxposix 20/20)
+timer_create/settime/gettime/getoverrun/delete (src/ptimer.c) fire from the
+same ~10 ms alarm sweep + perf_now_ns clock the alarm machinery trusts;
+catch-up is reported as OVERRUN, not a signal burst. sendfile/
+copy_file_range/splice share one kernel copy loop (lx_copy_fds); offset
+forms position through the CANONICAL lseek path — v1 poked fi->vfs.pos
+directly and the shared-OFD position load silently overwrote it (read 0
+bytes at EOF while claiming to advance the caller's offset). Test lesson in
+linux-io: a wait that must span signal deliveries cannot be one usleep —
+the first delivery returns it early; sleep in slices against the clock.

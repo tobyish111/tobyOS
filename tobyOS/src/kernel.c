@@ -7787,6 +7787,11 @@ void _start(void) {
              * loop, each byte-exact by assertion. */
             { "/bin/linux-io", "linux-io", 0, 63,
               "POSIX timers + kernel copy family" },
+            /* Phase E: the xattr family (user.*), /proc/self/fd links that
+             * answer real paths, mknod(S_IFREG), and glibc fexecve through
+             * its /proc/self/fd execve fallback. */
+            { "/bin/linux-xattr", "linux-xattr", 0, 63,
+              "xattr + fd identity + mknod + fexecve" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
