@@ -181,6 +181,7 @@ C_SRCS := src/kernel.c \
           src/ptimer.c \
           src/xattr.c \
           src/sysvipc.c \
+          src/vdso.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -334,7 +335,8 @@ C_SRCS := src/kernel.c \
 S_SRCS := src/isr_stubs.S \
           src/syscall_entry.S \
           src/ap_trampoline.S \
-          src/proc_switch.S
+          src/proc_switch.S \
+          src/vdso_blob.S
 
 # stage 13H: BearSSL X.509 chain validation (RSA + ECDSA) for TLS cert
 # verification. The decode/verify-only subset of the vendored reference
@@ -568,6 +570,12 @@ MKFS_SRC       := tools/mkfs_tobyfs.c
 MKFS_BIN       := build/mkfs_tobyfs
 LDSOCACHE_SRC  := tools/mkldsocache.c
 LDSOCACHE_BIN  := build/mkldsocache
+# vDSO (2026-08-23): a real Linux shared object built alongside the kernel
+# and embedded via src/vdso_blob.S. Compiled with LINUX-target flags, NOT
+# the freestanding kernel CFLAGS -- it runs in ring 3 of a glibc process.
+VDSO_SRC := tools/vdso/vdso.c
+VDSO_MAP := tools/vdso/vdso.map
+VDSO_SO  := build/vdso_image.so
 MKPKG_SRC      := tools/mkpkg.c
 MKPKG_BIN      := build/mkpkg
 MKDISK_GPT_SRC := tools/mkdisk_gpt.c
@@ -3237,6 +3245,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    echo "[initrd] staged linux-vfork (true vfork)";                   \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vfork";                       \
 	fi;                                                                   \
+	if [ -f programs/linux-vdso/linux-vdso.elf ]; then                     \
+	    cp programs/linux-vdso/linux-vdso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-vdso;                               \
+	    echo "[initrd] staged linux-vdso (userspace clock)";               \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vdso";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
@@ -3788,6 +3802,24 @@ $(MKFS_BIN): $(MKFS_SRC)
 $(LDSOCACHE_BIN): $(LDSOCACHE_SRC)
 	mkdir -p build
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+# The vDSO image. -m elf_x86_64 is REQUIRED: without an explicit flavor
+# this lld build guesses COFF and rejects every GNU flag. The version
+# script is what makes glibc's LINUX_2.6-versioned lookup succeed; the
+# output must contain ZERO relocations (vdso.c's no-GOT discipline) --
+# the kernel maps the raw image and nobody ever relocates it.
+$(VDSO_SO): $(VDSO_SRC) $(VDSO_MAP)
+	mkdir -p build
+	$(CC) --target=x86_64-unknown-linux-gnu -fPIC -O2 \
+	      -fno-stack-protector -fno-asynchronous-unwind-tables \
+	      -c $(VDSO_SRC) -o build/vdso_user.o
+	ld.lld -m elf_x86_64 -shared -o $@ build/vdso_user.o \
+	      --version-script=$(VDSO_MAP) -z noseparate-code \
+	      -z max-page-size=4096 -z rodynamic --no-undefined \
+	      --image-base=0x1000 \
+	      --soname=linux-vdso.so.1 --hash-style=both
+
+src/vdso_blob.o: $(VDSO_SO)
 
 # Only formats if disk.img doesn't already exist -- protects user data
 # across normal `make` invocations. Use `make wipe-disk` to force.

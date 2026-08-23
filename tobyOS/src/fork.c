@@ -1661,7 +1661,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     /* Build auxv + pack argv/envp onto user stack. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int auxc = 0;
     uint64_t user_rsp = USER_STACK_RSP_INIT;
 
@@ -1695,6 +1695,17 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
                                          (p->uid != p->ruid ||
                                           p->gid != p->rgid) ? 1u : 0u    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): map into the NEW image and advertise it.
+         * glibc reads AT_SYSINFO_EHDR at startup and routes
+         * clock_gettime/gettimeofday/time through the mapped code
+         * instead of syscalls. Absent (base 0) => entry omitted and
+         * glibc keeps its syscall fallback -- the pre-vDSO world. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(new_pml4);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).
          * We build a minimal layout: argc, argv[], NULL, envp[], NULL,

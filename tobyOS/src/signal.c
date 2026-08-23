@@ -747,6 +747,10 @@ void signal_tick_alarms(void) {
     }
     /* POSIX interval timers ride the same sweep + clock (ptimer.c). */
     { extern void ptimer_tick(void); ptimer_tick(); }
+    /* vDSO time-constant republish (2026-08-23): compare-and-skip when
+     * nothing changed, so TSC recalibration and the first RTC latch
+     * reach userspace within one ~10 ms tick. */
+    { extern void vdso_refresh(void); vdso_refresh(); }
 }
 
 void signal_deliver_if_pending(void) {

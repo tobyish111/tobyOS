@@ -70,6 +70,7 @@ uint64_t perf_tsc_to_ns(uint64_t dtsc);
 
 /* Measured TSC rate (in kHz). 0 until perf_init completes. */
 uint32_t perf_tsc_khz(void);
+uint64_t perf_boot_tsc(void);   /* vDSO: the base perf_now_ns subtracts */
 
 /* ==== 2. INSTRUMENTATION ZONES ==================================== */
 

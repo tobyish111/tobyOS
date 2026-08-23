@@ -1040,7 +1040,7 @@ static int spawn_internal(const char *path, const char *name,
      * static programs -- the trailing AT_NULL is harmless to libtoby
      * crt0 (which doesn't read auxv at all today) and makes the stack
      * shape uniform across static and dynamic launches. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int             auxc = 0;
     if (ok) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PHDR,   prog_info.phdr_va  };
@@ -1077,6 +1077,15 @@ static int spawn_internal(const char *path, const char *name,
          * at the very top of the (zeroed) user stack -- valid + readable.
          * Slice 87: seed with CSPRNG after packing (was left zero). */
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): same contract as the execve arm (fork.c) --
+         * map into the fresh address space, advertise via auxv, omit the
+         * entry entirely when unavailable. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(p->cr3);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
     }
 
     /* Default RSP if no argv -- pack a canonical

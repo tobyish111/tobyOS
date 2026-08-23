@@ -4007,6 +4007,14 @@ void _start(void) {
     oom_init();              /* Phase 1: OOM killer -- see the idle-loop check */
     hardening_init();        /* Phase 7 M7.2: SMEP/SMAP/NX enforcement */
     page_fault_init();       /* Phase 1: COW + demand paging refcounts + vm_spaces */
+    /* 2026-08-23: the vDSO. MUST follow page_fault_init -- its frame pins
+     * go through the page-refcount array, and a pin taken before that
+     * array exists is a silent no-op. That exact ordering slip made the
+     * first boot-helper's exit teardown free the LIVE GLOBAL vDSO frames
+     * (free_subtree frees refs<=1 leaves), the heap grew into them, and
+     * every ~10 ms vdso_refresh wrote tsc_khz into a kmalloc freelist
+     * node -- a GP in kmalloc two spawns later, 550 ms from the cause. */
+    { extern void vdso_init(void); vdso_init(); }
     aml_interp_init();       /* Phase 4: AML namespace + interpreter */
     clipboard_init();        /* Phase 2 M2.7: system clipboard */
     hidpi_init();            /* Phase 2 M2.6: HiDPI display scaling */
@@ -7822,6 +7830,10 @@ void _start(void) {
              * outlived the racy-suspension bug it worked around). */
             { "/bin/linux-vfork", "linux-vfork", 0, 63,
               "true vfork: shared stack + suspended parent" },
+            /* 2026-08-23: the vDSO. clock_gettime/gettimeofday/time stop
+             * syscalling -- proven by the kernel's own syscall counter. */
+            { "/bin/linux-vdso", "linux-vdso", 0, 63,
+              "vDSO: the userspace clock is real" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

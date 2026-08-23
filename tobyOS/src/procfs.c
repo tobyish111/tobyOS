@@ -452,6 +452,14 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         }
         APPEND_STR("Threads:\t"); APPEND_INT(nth); APPEND_STR("\n");
     }
+    /* tobyOS extension (2026-08-23): the process's kernel-counted syscall
+     * total. Exists so userspace can PROVE a code path stopped syscalling
+     * -- the vDSO gate hammers clock_gettime and asserts this barely
+     * moves. Linux has no equivalent line; the Toby prefix keeps parsers
+     * of standard fields honest. */
+    APPEND_STR("TobySyscalls:\t");
+    APPEND_INT((int64_t)p->syscall_count);
+    APPEND_STR("\n");
     /* Signal masks, 16-digit hex in LINUX numbering (>>1 off the tobyOS
      * bit-per-signal convention). SigIgn/SigCgt are derived by scanning
      * the thread-group action table. */
