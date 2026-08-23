@@ -3178,6 +3178,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-loop (loopback datapath)";             \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-loop";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-proc2/linux-proc2.elf ]; then                   \
+	    cp programs/linux-proc2/linux-proc2.elf                            \
+	         $(INITRD_STAGE)/bin/linux-proc2;                              \
+	    echo "[initrd] staged linux-proc2 (procfs deep fidelity)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-proc2";                       \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

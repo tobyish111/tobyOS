@@ -1359,6 +1359,34 @@ struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
     return tcp_listen_reuse(local_port_be, backlog, false);
 }
 
+/* /proc/net/tcp support (2026-08-22): read-only snapshot of slot idx.
+ * Returns 0 and fills the row for a live conn, -1 for a free slot, -2
+ * past the table. lx_state is Linux's /proc/net/tcp state code. */
+int tcp_conn_snapshot(int idx, uint32_t *lip, uint16_t *lport,
+                      uint32_t *rip, uint16_t *rport, int *lx_state) {
+    if (idx < 0 || idx >= TCP_MAX_CONNS) return -2;
+    struct tcp_conn *c = &g_conns[idx];
+    if (!c->in_use) return -1;
+    *lip   = net_my_ip();
+    *lport = c->local_port_be;
+    *rip   = c->remote_ip_be;
+    *rport = c->remote_port_be;
+    switch (c->state) {
+    case TCP_ESTABLISHED:  *lx_state = 0x01; break;
+    case TCP_SYN_SENT:     *lx_state = 0x02; break;
+    case TCP_SYN_RECEIVED: *lx_state = 0x03; break;
+    case TCP_FIN_WAIT_1:   *lx_state = 0x04; break;
+    case TCP_FIN_WAIT_2:   *lx_state = 0x05; break;
+    case TCP_TIME_WAIT:    *lx_state = 0x06; break;
+    case TCP_CLOSED:       *lx_state = 0x07; break;
+    case TCP_CLOSE_WAIT:   *lx_state = 0x08; break;
+    case TCP_LAST_ACK:     *lx_state = 0x09; break;
+    case TCP_LISTEN:       *lx_state = 0x0A; break;
+    default:               *lx_state = 0x07; break;
+    }
+    return 0;
+}
+
 static int pred_accept(const struct tcp_conn *lsn) {
     return lsn->acc_count > 0 ? 1 : 0;
 }

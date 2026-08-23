@@ -7777,6 +7777,11 @@ void _start(void) {
              * TCP connection in bit1. */
             { "/bin/linux-loop", "linux-loop", 0, 63,
               "loopback datapath (127/8 + own IP)" },
+            /* 2026-08-22: /proc deep fidelity -- the REAL maps table,
+             * /proc/sys, /proc/net (a listener we open must appear), and
+             * status fields including a VmRSS that MOVES. */
+            { "/bin/linux-proc2", "linux-proc2", 0, 63,
+              "/proc maps + sys + net + status" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

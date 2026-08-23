@@ -88,6 +88,34 @@ struct vma_table {
 
 static struct vma_table g_vma_tables[PROC_MAX];
 
+/* /proc/<pid>/maps support (2026-08-22): a read-only snapshot API so
+ * procfs can render the REAL region table instead of the three-line
+ * fabrication it used to serve (which listed no libraries, no anon
+ * mappings, and misled every crash handler and sanitizer that walked
+ * its own address space). idx < 0 returns the count. */
+int mmap_vma_snapshot(struct proc *p, int idx, uint64_t *start,
+                      uint64_t *end, uint32_t *prot, uint32_t *flags) {
+    if (!p) return -1;
+    int pid = proc_mm_pid(p);
+    if (pid < 0 || pid >= PROC_MAX) return -1;
+    struct vma_table *vt = &g_vma_tables[pid];
+    if (idx < 0) return vt->count;
+    if (idx >= vt->count) return -1;
+    *start = vt->entries[idx].start;
+    *end   = vt->entries[idx].end;
+    *prot  = vt->entries[idx].prot;
+    *flags = vt->entries[idx].flags;
+    return 0;
+}
+
+/* The Linux-personality brk range (this table's, not struct proc's). */
+void mmap_brk_range(struct proc *p, uint64_t *base, uint64_t *cur) {
+    int pid = proc_mm_pid(p);
+    if (pid < 0 || pid >= PROC_MAX) { *base = *cur = 0; return; }
+    *base = g_vma_tables[pid].brk_base;
+    *cur  = g_vma_tables[pid].brk_cur;
+}
+
 #ifdef CHROMIUM_BOOT
 /* Permission-transition ring (defined above sys_madvise_dontneed). */
 void mprot_ring_note(uint64_t addr, uint64_t len, int pid, uint32_t prot);

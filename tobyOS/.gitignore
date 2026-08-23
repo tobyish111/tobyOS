@@ -139,6 +139,7 @@ programs/linux-watch/*.elf
 programs/linux-misc/*.elf
 programs/linux-procdev/*.elf
 programs/linux-loop/*.elf
+programs/linux-proc2/*.elf
 programs/linux-tmpfs/*.elf
 programs/linux-ptrace/*.elf
 

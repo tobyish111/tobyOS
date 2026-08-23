@@ -650,6 +650,21 @@ struct sock *sock_peer_of(struct sock *self) {
     return sock_peer_checked(self);      /* slice 89: generation-validated */
 }
 
+/* /proc/net/{udp,unix} support (2026-08-22): read-only pool snapshot.
+ * Returns 0 for a live socket, -1 free, -2 past the pool. */
+int sock_snapshot(int idx, int *kind, uint16_t *lport,
+                  uint32_t *pip, uint16_t *pport, const char **uxname) {
+    if (idx < 0 || idx >= SOCK_MAX) return -2;
+    struct sock *s = &g_socks[idx];
+    if (!s->in_use) return -1;
+    *kind   = s->kind;
+    *lport  = s->local_port;
+    *pip    = s->peer_ip;
+    *pport  = s->peer_port;
+    *uxname = (s->kind == SOCK_KIND_UNIX) ? sock_unix_bound_name(s) : 0;
+    return 0;
+}
+
 /* ICMP destination-unreachable landed for a datagram WE sent (icmp.c
  * decoded the embedded original headers). Latch the error on the matching
  * connected UDP socket and wake its waiters -- the next send/recv returns

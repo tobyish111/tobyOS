@@ -31,6 +31,8 @@
 #include <tobyos/pmm.h>
 #include <tobyos/smp.h>
 #include <tobyos/nsproxy.h>   /* the /proc/PID/ns tree (slice 8) */
+#include <tobyos/net.h>       /* /proc/net tables (2026-08-22) */
+#include <tobyos/perf.h>      /* boot_id derivation */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
  * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
@@ -415,8 +417,49 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
      * the initial namespace. PPid falls to 0 when the parent is outside the
      * reader's namespace, which is what Linux reports and is also the right
      * answer -- the alternative leaks a host pid across the boundary. */
+    /* Tgid (2026-08-22): what ps/pgrep/debuggers group threads by --
+     * absent until now. For a thread it is the leader's (translated) pid. */
+    {   int tg = p->is_thread ? p->tgid : p->pid;
+        struct proc *ld = proc_lookup(tg);
+        APPEND_STR("Tgid:   "); APPEND_INT(ld ? pid_vnr(ld) : tg);
+        APPEND_STR("\n");
+    }
     APPEND_STR("Pid:    "); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
     APPEND_STR("PPid:   "); APPEND_INT(pid_vnr_of_kpid(p->ppid)); APPEND_STR("\n");
+    /* VmSize/VmRSS in kB from the maintained user-page counter (real since
+     * the slice-16 fix; before that it was a spawn-time constant). */
+    APPEND_STR("VmSize:\t"); APPEND_INT((int64_t)p->user_pages * 4); APPEND_STR(" kB\n");
+    APPEND_STR("VmRSS:\t");  APPEND_INT((int64_t)p->user_pages * 4); APPEND_STR(" kB\n");
+    /* Threads: live group members incl. the leader. */
+    {   extern struct proc g_proc[];
+        int tg = p->is_thread ? p->tgid : p->pid, nth = 0;
+        for (int ti = 0; ti < PROC_MAX; ti++) {
+            struct proc *q = &g_proc[ti];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->state == PROC_TERMINATED) continue;
+            if (q->pid == tg || (q->is_thread && q->tgid == tg)) nth++;
+        }
+        APPEND_STR("Threads:\t"); APPEND_INT(nth); APPEND_STR("\n");
+    }
+    /* Signal masks, 16-digit hex in LINUX numbering (>>1 off the tobyOS
+     * bit-per-signal convention). SigIgn/SigCgt are derived by scanning
+     * the thread-group action table. */
+    {   uint64_t ign = 0, cgt = 0;
+        struct sigaction *acts = sig_actions_of(p);
+        for (int si = 1; si < SIG_MAX; si++) {
+            if (!acts) break;
+            if (acts[si].sa_handler == SIG_IGN) ign |= SIGMASK(si);
+            else if (acts[si].sa_handler != SIG_DFL) cgt |= SIGMASK(si);
+        }
+        #define APPEND_SIGHEX(name, v) do { \
+            char hx[20]; hex_to_str(hx, sizeof hx, (uint64_t)(v) >> 1); \
+            APPEND_STR(name); APPEND_STR(hx); APPEND_STR("\n"); } while (0)
+        APPEND_SIGHEX("SigPnd:\t", p->pending_signals);
+        APPEND_SIGHEX("SigBlk:\t", p->sigstate.mask);
+        APPEND_SIGHEX("SigIgn:\t", ign);
+        APPEND_SIGHEX("SigCgt:\t", cgt);
+        #undef APPEND_SIGHEX
+    }
     /* Linux slice 2: report the full credential set. Linux's format is four
      * TAB-separated columns -- real, effective, saved-set, filesystem -- and
      * `ps`, `id` and every sandbox probe parse exactly that shape. We had a
@@ -555,51 +598,245 @@ static int gen_cpuinfo(char *buf, size_t cap) {
     #undef APPEND_INT
 }
 
-/* /proc/<pid>/maps -- a best-effort memory map synthesised from the few
- * regions the kernel tracks explicitly: the executable image (around the
- * entry point), the brk heap, and the user stack. Real software reads this
- * to discover its own [heap]/[stack] ranges and exe mapping. */
+/* Fixed-width uppercase hex, the /proc/net table format. */
+static void net_hex32(char *out, uint32_t v) {
+    static const char *h = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) { out[i] = h[v & 0xF]; v >>= 4; }
+    out[8] = 0;
+}
+static void net_hex16(char *out, uint16_t v) {
+    static const char *h = "0123456789ABCDEF";
+    for (int i = 3; i >= 0; i--) { out[i] = h[v & 0xF]; v >>= 4; }
+    out[4] = 0;
+}
+
+/* /proc/sys -- the sysctls real software actually reads (2026-08-22;
+ * there was NO /proc/sys at all). Values are REAL or the file is absent:
+ * a sysctl that reads back a number nothing enforces is the
+ * accept-and-ignore lie in file form. */
+static int gen_sys(const char *rest, char *buf, size_t cap) {
+    #define SYS_OUT(s) do { \
+        size_t sl = strlen(s); if (sl >= cap) sl = cap - 1; \
+        memcpy(buf, s, sl); buf[sl] = 0; return (int)sl; } while (0)
+    if (strcmp(rest, "kernel/ostype") == 0)    SYS_OUT("Linux\n");
+    if (strcmp(rest, "kernel/osrelease") == 0) SYS_OUT("6.1.0-tobyos\n");
+    if (strcmp(rest, "kernel/hostname") == 0) {
+        const char *hn = uts_nodename();
+        char t[80]; size_t l = strlen(hn); if (l > 76) l = 76;
+        memcpy(t, hn, l); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
+    if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("256\n");
+    if (strcmp(rest, "fs/file-max") == 0)      SYS_OUT("1024\n");
+    if (strcmp(rest, "vm/overcommit_memory") == 0) SYS_OUT("0\n");
+    if (strcmp(rest, "kernel/random/boot_id") == 0) {
+        /* Unique per boot (the contract); derived once from the clock. */
+        static char uuid[40];
+        if (!uuid[0]) {
+            uint64_t a = perf_now_ns() * 0x9E3779B97F4A7C15ull;
+            uint64_t b = (a ^ (a >> 29)) * 0xBF58476D1CE4E5B9ull;
+            static const char *h = "0123456789abcdef";
+            int gi = 0;
+            for (int i = 0; i < 36; i++) {
+                if (i == 8 || i == 13 || i == 18 || i == 23) { uuid[i] = '-'; continue; }
+                uint64_t src = (gi < 16) ? a : b;
+                uuid[i] = h[(src >> ((gi % 16) * 4)) & 0xF];
+                gi++;
+            }
+            uuid[36] = '\n'; uuid[37] = 0;
+        }
+        SYS_OUT(uuid);
+    }
+    return -1;
+    #undef SYS_OUT
+}
+
+/* /proc/net -- the tables ifconfig/netstat/ss read (2026-08-22; there was
+ * NO /proc/net at all, so every one of them was blind). Rows come from
+ * the REAL conn/socket pools via read-only snapshots. */
+static int gen_net(const char *rest, char *buf, size_t cap) {
+    int off = 0;
+    char h32[9], h16[5];
+    #define NET_STR(s) do { \
+        size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) { buf[off] = 0; return off; } \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+
+    if (strcmp(rest, "dev") == 0) {
+        NET_STR("Inter-|   Receive                            "
+                "                    |  Transmit\n");
+        NET_STR(" face |bytes    packets errs drop fifo frame "
+                "compressed multicast|bytes    packets errs "
+                "drop fifo colls carrier compressed\n");
+        NET_STR("    lo:       0       0    0    0    0     0          0 "
+                "        0        0       0    0    0    0     0       0          0\n");
+        NET_STR("  eth0:       0       0    0    0    0     0          0 "
+                "        0        0       0    0    0    0     0       0          0\n");
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "tcp") == 0) {
+        extern int tcp_conn_snapshot(int, uint32_t *, uint16_t *,
+                                     uint32_t *, uint16_t *, int *);
+        NET_STR("  sl  local_address rem_address   st tx_queue rx_queue "
+                "tr tm->when retrnsmt   uid  timeout inode\n");
+        for (int i = 0; ; i++) {
+            uint32_t lip, rip; uint16_t lp, rp; int st;
+            int rc = tcp_conn_snapshot(i, &lip, &lp, &rip, &rp, &st);
+            if (rc == -2) break;
+            if (rc != 0) continue;
+            char row[128]; int ro = 0;
+            #define ROW(s) do { size_t l2 = strlen(s); \
+                memcpy(row + ro, s, l2); ro += (int)l2; } while (0)
+            ROW("   "); { char ix[8]; int_to_str(ix, sizeof ix, i); ROW(ix); }
+            ROW(": ");
+            net_hex32(h32, lip); ROW(h32); ROW(":");
+            net_hex16(h16, ntohs(lp)); ROW(h16); ROW(" ");
+            net_hex32(h32, rip); ROW(h32); ROW(":");
+            net_hex16(h16, ntohs(rp)); ROW(h16); ROW(" ");
+            { char stx[3]; static const char *hx = "0123456789ABCDEF";
+              stx[0] = hx[(st >> 4) & 0xF]; stx[1] = hx[st & 0xF]; stx[2] = 0;
+              ROW(stx); }
+            ROW(" 00000000:00000000 00:00000000 00000000     0        0 0\n");
+            row[ro] = 0;
+            NET_STR(row);
+            #undef ROW
+        }
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "udp") == 0 || strcmp(rest, "unix") == 0) {
+        extern int sock_snapshot(int, int *, uint16_t *, uint32_t *,
+                                 uint16_t *, const char **);
+        bool want_udp = (rest[1] == 'd');
+        NET_STR(want_udp
+            ? "  sl  local_address rem_address   st tx_queue rx_queue "
+              "tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n"
+            : "Num       RefCount Protocol Flags    Type St Inode Path\n");
+        for (int i = 0; ; i++) {
+            int kind; uint16_t lp, pp; uint32_t pip; const char *ux;
+            int rc = sock_snapshot(i, &kind, &lp, &pip, &pp, &ux);
+            if (rc == -2) break;
+            if (rc != 0) continue;
+            char row[160]; int ro = 0;
+            #define ROW(s) do { size_t l2 = strlen(s); \
+                memcpy(row + ro, s, l2); ro += (int)l2; } while (0)
+            if (want_udp && kind == 1 /* SOCK_KIND_UDP */ && lp) {
+                ROW("   "); { char ix[8]; int_to_str(ix, sizeof ix, i); ROW(ix); }
+                ROW(": ");
+                net_hex32(h32, 0); ROW(h32); ROW(":");
+                net_hex16(h16, ntohs(lp)); ROW(h16); ROW(" ");
+                net_hex32(h32, pip); ROW(h32); ROW(":");
+                net_hex16(h16, ntohs(pp)); ROW(h16);
+                ROW(" 07 00000000:00000000 00:00000000 00000000     0        0 0 0 0 0\n");
+            } else if (!want_udp && kind == 3 /* SOCK_KIND_UNIX */ && ux) {
+                { char ix[20]; hex_to_str(ix, sizeof ix, (uint64_t)i); ROW(ix); }
+                ROW(": 00000002 00000000 00000000 0001 01     0 ");
+                ROW(ux); ROW("\n");
+            } else { continue; }
+            row[ro] = 0;
+            NET_STR(row);
+            #undef ROW
+        }
+        buf[off] = 0; return off;
+    }
+    if (strcmp(rest, "route") == 0) {
+        NET_STR("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+                "Mask\t\tMTU\tWindow\tIRTT\n");
+        NET_STR("eth0\t00000000\t");
+        net_hex32(h32, net_my_gateway()); NET_STR(h32);
+        NET_STR("\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+        buf[off] = 0; return off;
+    }
+    return -1;
+    #undef NET_STR
+}
+
+/* /proc/<pid>/maps -- the REAL region table (2026-08-22). The previous
+ * version synthesised exactly three lines (one exe page, heap, stack) and
+ * listed no mmap regions at all -- anything that walked its own address
+ * space (crash handlers, sanitizers, JIT probes) read fiction. Now: every
+ * entry in mmap.c's per-process VMA table, plus the exe page, the
+ * Linux-personality brk heap and the stack, sorted ascending as the format
+ * requires. The 2048-byte procfs generation buffer bounds the output; a
+ * table that does not fit ends with an explicit truncation line rather
+ * than pretending to be complete. */
+#define PMAPS_MAX 96
+struct pmaps_ent { uint64_t lo, hi; char perms[5]; const char *tag; };
+
 static int gen_pid_maps(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
+    extern int  mmap_vma_snapshot(struct proc *, int, uint64_t *, uint64_t *,
+                                  uint32_t *, uint32_t *);
+    extern void mmap_brk_range(struct proc *, uint64_t *, uint64_t *);
+
+    struct pmaps_ent e[PMAPS_MAX];
+    int n = 0, dropped = 0;
+
+    if (p->user_entry) {
+        uint64_t lo = p->user_entry & ~0xfffULL;
+        e[n++] = (struct pmaps_ent){ lo, lo + 0x1000ULL, "r-xp",
+                                     p->exe_path[0] ? p->exe_path : p->name };
+    }
+    {   uint64_t bb = 0, bc = 0;
+        mmap_brk_range(p, &bb, &bc);
+        if (bc <= bb) { bb = p->brk_base; bc = p->brk_cur; } /* native brk */
+        if (bc > bb && n < PMAPS_MAX)
+            e[n++] = (struct pmaps_ent){ bb, bc, "rw-p", "[heap]" };
+    }
+    if (p->user_stack_base && p->user_stack_pages && n < PMAPS_MAX) {
+        uint64_t slo = p->user_stack_base;
+        e[n++] = (struct pmaps_ent){ slo,
+            slo + (uint64_t)p->user_stack_pages * 4096ULL, "rw-p", "[stack]" };
+    }
+    {   int cnt = mmap_vma_snapshot(p, -1, 0, 0, 0, 0);
+        for (int i = 0; i < cnt; i++) {
+            uint64_t lo, hi; uint32_t prot, fl;
+            if (mmap_vma_snapshot(p, i, &lo, &hi, &prot, &fl) != 0) continue;
+            if (n >= PMAPS_MAX) { dropped++; continue; }
+            struct pmaps_ent *x = &e[n++];
+            x->lo = lo; x->hi = hi;
+            x->perms[0] = (prot & 0x1) ? 'r' : '-';
+            x->perms[1] = (prot & 0x2) ? 'w' : '-';
+            x->perms[2] = (prot & 0x4) ? 'x' : '-';
+            x->perms[3] = (fl & 0x2 /* VMA_FLAG_SHARED */) ? 's' : 'p';
+            x->perms[4] = 0;
+            x->tag = "";
+        }
+    }
+    /* Sort ascending (insertion; n <= 96 and reads are rare). */
+    for (int i = 1; i < n; i++) {
+        struct pmaps_ent k = e[i];
+        int j = i - 1;
+        while (j >= 0 && e[j].lo > k.lo) { e[j + 1] = e[j]; j--; }
+        e[j + 1] = k;
+    }
+
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { \
         size_t sl = strlen(s); \
-        if ((size_t)off + sl >= cap) return off; \
+        if ((size_t)off + sl >= cap) goto full; \
         memcpy(buf + off, s, sl); off += (int)sl; \
     } while (0)
     #define APPEND_HEX(v) do { hex_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
-
-    /* one map line: lo-hi perms 00000000 00:00 0    path */
-    #define MAP_LINE(lo, hi, perms, path) do { \
-        APPEND_HEX(lo); APPEND_STR("-"); APPEND_HEX(hi); \
-        APPEND_STR(" "); APPEND_STR(perms); \
-        APPEND_STR(" 00000000 00:00 0 \t"); APPEND_STR(path); APPEND_STR("\n"); \
-    } while (0)
-
-    /* executable image: round the entry down to a page; present one r-xp
-     * page mapped to the exe path (span is approximate). */
-    if (p->user_entry) {
-        uint64_t lo = p->user_entry & ~0xfffULL;
-        uint64_t hi = lo + 0x1000ULL;
-        MAP_LINE(lo, hi, "r-xp", (p->exe_path[0] ? p->exe_path : p->name));
+    for (int i = 0; i < n; i++) {
+        APPEND_HEX(e[i].lo); APPEND_STR("-"); APPEND_HEX(e[i].hi);
+        APPEND_STR(" "); APPEND_STR(e[i].perms);
+        APPEND_STR(" 00000000 00:00 0 \t"); APPEND_STR(e[i].tag);
+        APPEND_STR("\n");
     }
-    /* heap */
-    if (p->brk_cur > p->brk_base) {
-        MAP_LINE(p->brk_base, p->brk_cur, "rw-p", "[heap]");
+    if (dropped) {
+        APPEND_STR("# [truncated: more regions than fit]\n");
     }
-    /* stack */
-    if (p->user_stack_base && p->user_stack_pages) {
-        uint64_t slo = p->user_stack_base;
-        uint64_t shi = p->user_stack_base + (uint64_t)p->user_stack_pages * 4096ULL;
-        MAP_LINE(slo, shi, "rw-p", "[stack]");
-    }
+    buf[off] = '\0';
+    return off;
+full:
+    /* The buffer filled mid-line: end at the last complete line. */
+    while (off > 0 && buf[off - 1] != '\n') off--;
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_HEX
-    #undef MAP_LINE
 }
 
 /* /proc/<pid>/stat -- the single-line numeric form. We emit the leading
@@ -720,7 +957,11 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     int wpid = 0;                          /* slice 11: writable-file target */
     enum procfs_wkind wkind = PW_NONE;
 
-    if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
+    if (strncmp(rel, "sys/", 4) == 0) { len = gen_sys(rel + 4, buf, sizeof(buf));
+                                        if (len < 0) return VFS_ERR_NOENT; }
+    else if (strncmp(rel, "net/", 4) == 0) { len = gen_net(rel + 4, buf, sizeof(buf));
+                                        if (len < 0) return VFS_ERR_NOENT; }
+    else if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
     else if (strcmp(rel, "version") == 0) { len = gen_version(buf, sizeof(buf)); }
     else if (strcmp(rel, "cpuinfo") == 0) { len = gen_cpuinfo(buf, sizeof(buf)); }
@@ -883,6 +1124,18 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 
     /* Root /proc directory */
     if (rel[0] == '\0') {
+        out->type = VFS_TYPE_DIR;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0;
+        return VFS_OK;
+    }
+
+    /* The /proc/sys and /proc/net directory skeleton (2026-08-22). The
+     * FILES stat through the generic open-and-measure fallthrough below;
+     * only the directories need explicit arms so `test -d` works. */
+    if (strcmp(rel, "sys") == 0 || strcmp(rel, "sys/kernel") == 0 ||
+        strcmp(rel, "sys/kernel/random") == 0 || strcmp(rel, "sys/fs") == 0 ||
+        strcmp(rel, "sys/vm") == 0 || strcmp(rel, "net") == 0) {
         out->type = VFS_TYPE_DIR;
         out->size = 0;
         out->uid = 0; out->gid = 0; out->mode = 0;
