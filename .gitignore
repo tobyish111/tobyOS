@@ -16,3 +16,19 @@ tobyOS/**/qemu*.log
 # Ignored rather than deleted -- that is the user's call, not the build's.
 # To reclaim the space: rm -rf tobyOS/tobyOS
 tobyOS/tobyOS/
+
+# Stray capture logs that land in tobyOS/ ITSELF: serial dumps redirected
+# without a logs/ prefix, curl transcripts, tool installer logs, and the
+# occasional mangled filename from a botched redirect. Anchored to the top
+# level ON PURPOSE -- a leading-slash pattern's `*` does not cross `/`, so
+# the 228 tracked gate logs under tobyOS/logs/ are untouched.
+tobyOS/*.log
+tobyOS/FridayBoot.txt
+
+# Python tooling scratch (tobyOS/Python/_cache) -- regenerated on demand.
+tobyOS/Python/
+
+# Claude Code local state: settings.local.json is per-machine, the lock file
+# is runtime, and settings.json is a ~170 KB pile of auto-accumulated
+# per-command permission rules -- workflow state, not project source.
+.claude/
