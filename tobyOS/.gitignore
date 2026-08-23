@@ -138,6 +138,7 @@ programs/linux-nptl/*.elf
 programs/linux-watch/*.elf
 programs/linux-misc/*.elf
 programs/linux-procdev/*.elf
+programs/linux-loop/*.elf
 programs/linux-tmpfs/*.elf
 programs/linux-ptrace/*.elf
 

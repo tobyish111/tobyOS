@@ -137,7 +137,13 @@ void icmp_send_port_unreach(uint32_t orig_src_ip_be,
     oip[8] = 64;                                /* ttl */
     oip[9] = IP_PROTO_UDP;
     memcpy(oip + 12, &orig_src_ip_be, 4);       /* orig src */
-    memcpy(oip + 16, &g_my_ip, 4);              /* orig dst = us */
+    {   /* Loopback datagrams travel src==dst (see ip_send), so the
+         * "original destination" the sender's socket compares its peer
+         * against is the loop address itself, not our eth unicast. */
+        uint32_t odst = ((orig_src_ip_be & 0xFFu) == 127u)
+                        ? orig_src_ip_be : g_my_ip;
+        memcpy(oip + 16, &odst, 4);             /* orig dst */
+    }
     memcpy(oip + 20, orig_udp_hdr, 8);          /* orig UDP header */
     uint16_t cs = net_checksum(buf, sizeof buf);
     memcpy(buf + 2, &cs, 2);

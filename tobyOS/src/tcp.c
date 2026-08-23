@@ -546,18 +546,29 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
  * the host's segments and compute the checksum over it. Same rule cut 1 chose
  * for sockets -- the namespace belongs to the endpoint, not to whoever happens
  * to be running. */
-static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags, uint32_t seq,
                             const void *payload, size_t plen);
 
-static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
-                      const void *payload, size_t plen) {
+/* Emit with an EXPLICIT sequence number. The send path accounts snd_nxt
+ * BEFORE emitting (loopback delivers inline -- see tcp_send_data_segment),
+ * and the retransmit path re-sends old sequence numbers; both used to get
+ * this by temporarily rewinding c->snd_nxt around the emit, which a NESTED
+ * inline delivery (the peer's reply sending on this very conn) would read
+ * or clobber mid-trick. */
+static bool tcp_emit_at(struct tcp_conn *c, uint8_t flags, uint32_t seq,
+                        const void *payload, size_t plen) {
     struct net_ctx nprev = net_ctx_enter(c->net_ns, 0);
-    bool r = tcp_emit_locked(c, flags, payload, plen);
+    bool r = tcp_emit_locked(c, flags, seq, payload, plen);
     net_ctx_leave(nprev);
     return r;
 }
 
-static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
+static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
+                      const void *payload, size_t plen) {
+    return tcp_emit_at(c, flags, c->snd_nxt, payload, plen);
+}
+
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags, uint32_t seq,
                       const void *payload, size_t plen) {
     uint8_t buf[TCP_HDR_LEN + 4 + TCP_DEFAULT_MSS]; /* +4 for options */
     if (plen > TCP_DEFAULT_MSS) return false;
@@ -572,7 +583,7 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
     memset(h, 0, hdr_len);
     h->src_port = c->local_port_be;
     h->dst_port = c->remote_port_be;
-    h->seq      = htonl(c->snd_nxt);
+    h->seq      = htonl(seq);
     h->ack      = htonl(c->rcv_nxt);
     h->data_off = (uint8_t)((hdr_len / 4u) << 4);
     h->flags    = flags;
@@ -645,7 +656,38 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
         flags |= TCP_FLAG_ACK;
     if (plen > 0) flags |= TCP_FLAG_PSH;
 
-    if (!tcp_emit(c, flags, payload, plen)) return false;
+    /* ACCOUNT BEFORE EMIT (2026-08-22). On loopback, ip_send delivers
+     * INLINE: the peer's reply recurses into tcp_recv_packet before this
+     * function's post-emit bookkeeping runs, so every field updated after
+     * the emit is one handshake-step stale when the reply is processed.
+     * Observed: the client's final ACK (= ISS+1) arrived while the
+     * server's snd_nxt still said ISS, failed the SYN_RECEIVED ack check,
+     * and the handshake crawled home on 30 s of retransmits. Wire
+     * behaviour is unchanged -- a wire reply cannot arrive inside the
+     * function. */
+    uint32_t send_seq = c->snd_nxt;
+    {
+        struct tx_pend *pp = &c->pend[pi];
+        pp->used    = true;
+        pp->seq     = send_seq;
+        pp->len     = plen;
+        pp->xflags  = xf;
+        pp->sent_at = perf_now_ns();
+        pp->retries = 0;
+        if (plen) memcpy(pp->buf, payload, plen);
+    }
+    uint32_t consumed = (uint32_t)plen;
+    if (xf & TCP_FLAG_SYN) consumed++;
+    if (xf & TCP_FLAG_FIN) consumed++;
+    c->snd_nxt         += consumed;
+    c->bytes_in_flight += consumed;
+
+    if (!tcp_emit_at(c, flags, send_seq, payload, plen)) {
+        c->pend[pi].used    = false;
+        c->snd_nxt         -= consumed;
+        c->bytes_in_flight -= consumed;
+        return false;
+    }
 #ifdef CHROMIUM_BOOT
     c->dbg_tx_total += plen;
     /* Slice 35: log outbound TLS record headers on port 443. This is the
@@ -662,20 +704,6 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     }
 #endif
 
-    struct tx_pend *p = &c->pend[pi];
-    p->used    = true;
-    p->seq     = c->snd_nxt;
-    p->len     = plen;
-    p->xflags  = xf;
-    p->sent_at = perf_now_ns();
-    p->retries = 0;
-    if (plen) memcpy(p->buf, payload, plen);
-
-    uint32_t consumed = (uint32_t)plen;
-    if (xf & TCP_FLAG_SYN) consumed++;
-    if (xf & TCP_FLAG_FIN) consumed++;
-    c->snd_nxt += consumed;
-    c->bytes_in_flight += consumed;
     c->last_send_tsc = pit_ticks();
     return true;
 }
@@ -688,10 +716,7 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
         flags |= TCP_FLAG_ACK;
     if (p->len > 0) flags |= TCP_FLAG_PSH;
 
-    uint32_t saved = c->snd_nxt;
-    c->snd_nxt     = p->seq;
-    bool ok        = tcp_emit(c, flags, p->len ? p->buf : NULL, p->len);
-    c->snd_nxt     = saved;
+    bool ok = tcp_emit_at(c, flags, p->seq, p->len ? p->buf : NULL, p->len);
     if (ok) {
         p->sent_at = perf_now_ns();
         p->retries++;
@@ -849,7 +874,10 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     if (hlen < TCP_HDR_LEN || hlen > len) return;
 
     uint32_t me_ip = net_my_ip();
-    if (me_ip != 0) {
+    /* Loopback frames arrive with src==dst==127.x (see ip_send), so a
+     * pseudo-header over (src, me_ip) cannot validate -- and cannot be
+     * wrong either: the bytes never left this machine's memory. */
+    if (me_ip != 0 && (src_ip_be & 0xFFu) != 127u) {
         if (net_l4_checksum(IP_PROTO_TCP, src_ip_be, me_ip, tcp_packet,
                              len) != 0)
             return;
@@ -865,6 +893,33 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             !(h->flags & TCP_FLAG_ACK)) {
             passive_syn(lsn, src_ip_be, srcp, dstp, ntohl(h->seq),
                         tcp_packet, hlen);
+            return;
+        }
+        /* CLOSED port: answer RST (2026-08-22; was a silent drop). RFC
+         * 793's rule, and what turns a connect() to a dead local port
+         * into an instant ECONNREFUSED instead of a SYN-retry crawl --
+         * on loopback the RST arrives before connect even returns. Not
+         * for RSTs (never answer a reset with a reset). */
+        if (!(h->flags & TCP_FLAG_RST)) {
+            uint8_t rst[TCP_HDR_LEN];
+            memset(rst, 0, sizeof rst);
+            struct tcp_hdr *r = (struct tcp_hdr *)rst;
+            r->src_port = dstp;
+            r->dst_port = srcp;
+            if (h->flags & TCP_FLAG_ACK) {
+                r->seq   = h->ack;             /* seq = their ack */
+                r->flags = TCP_FLAG_RST;
+            } else {
+                uint32_t extra = (h->flags & TCP_FLAG_SYN) ? 1u : 0u;
+                r->seq   = 0;
+                r->ack   = htonl(ntohl(h->seq) + (uint32_t)(len - hlen) + extra);
+                r->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+            }
+            r->data_off = (uint8_t)((TCP_HDR_LEN / 4) << 4);
+            r->checksum = 0;
+            r->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(),
+                                          src_ip_be, rst, sizeof rst);
+            (void)ip_send(src_ip_be, IP_PROTO_TCP, rst, sizeof rst);
         }
         return;
     }

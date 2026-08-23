@@ -48,6 +48,10 @@ bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
      * wire that every correct receiver drops. */
     h->checksum = net_udp_checksum(net_my_ip(), dst_ip_be, buf, udp_len);
     if (h->checksum == 0) h->checksum = htons(0xFFFF);
+    /* Loopback delivery is src==dst (see ip_send), so a pseudo-header
+     * computed over net_my_ip() cannot validate on the receive side.
+     * RFC 768 lets a sender opt out entirely -- do that for loops. */
+    if ((dst_ip_be & 0xFFu) == 127u) h->checksum = 0;
 
     bool ok = ip_send(dst_ip_be, IP_PROTO_UDP, buf, udp_len);
     if (heap) kfree(buf);

@@ -7771,6 +7771,12 @@ void _start(void) {
              * works), and cmdline is the real NUL-separated argv. */
             { "/bin/linux-procdev", "linux-procdev", 0, 63,
               "/proc + /dev fidelity" },
+            /* 2026-08-22: the loopback datapath exists. Inline delivery
+             * (the veth model), RST for closed ports, and the full ICMP
+             * chain -- a single-threaded process is both ends of its own
+             * TCP connection in bit1. */
+            { "/bin/linux-loop", "linux-loop", 0, 63,
+              "loopback datapath (127/8 + own IP)" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
