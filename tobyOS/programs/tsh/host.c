@@ -363,7 +363,13 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
     memset(out, 0, sizeof *out);
     out->size = (size_t)st.st_size;
     out->type = S_ISDIR(st.st_mode) ? VFS_TYPE_DIR : VFS_TYPE_FILE;
-    out->mode = st.st_mode & 07777;
+    /* Keep the S_IFMT bits (2026-08-23): sys_stat reports /dev nodes as
+     * S_IFCHR, and test_unary's -c/-b/-p/-S read the format from mode.
+     * Masking to 07777 here silently declassed every device node, which
+     * went unnoticed exactly as long as the kernel's own stat did too --
+     * the fidelity arc fixed the kernel side and the oilspec oracle
+     * (in-guest bash) immediately diverged on `test -c /dev/zero`. */
+    out->mode = st.st_mode & 0177777;
     out->uid  = st.st_uid;
     out->gid  = st.st_gid;
     return VFS_OK;

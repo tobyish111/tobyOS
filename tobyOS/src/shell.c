@@ -7878,11 +7878,22 @@ static int test_unary(const char *op, const char *operand) {
         return 1;
     struct vfs_stat st;
     if (vfs_stat(resolved, &st) != VFS_OK) return 1;
-    if (op2 == 'f') return st.type == VFS_TYPE_FILE ? 0 : 1;
+    /* Device/fifo/socket tests read the S_IFMT bits carried in mode
+     * (2026-08-23; they were hardcoded FALSE from the no-devices era.
+     * The hosted /bin/tsh gets real formats via sys_stat's /dev synth;
+     * the kernel console shell's vfs_stat has no synth entry for /dev
+     * nodes and answers false above at the NOENT check -- the gates
+     * measure /bin/tsh, which is the build parity is defined on). */
+    uint32_t fmt = st.mode & 0170000u;
+    if (op2 == 'f') return (st.type == VFS_TYPE_FILE &&
+                            (fmt == 0 || fmt == 0100000u)) ? 0 : 1;
     if (op2 == 'd') return st.type == VFS_TYPE_DIR ? 0 : 1;
     if (op2 == 's') return st.size > 0 ? 0 : 1;
     if (op2 == 'L' || op2 == 'h') return 1;         /* no symlinks in vfs_stat */
-    if (op2 == 'p' || op2 == 'c' || op2 == 'b' || op2 == 'S') return 1;
+    if (op2 == 'c') return fmt == 0020000u ? 0 : 1; /* S_IFCHR */
+    if (op2 == 'b') return fmt == 0060000u ? 0 : 1; /* S_IFBLK */
+    if (op2 == 'p') return fmt == 0010000u ? 0 : 1; /* S_IFIFO */
+    if (op2 == 'S') return fmt == 0140000u ? 0 : 1; /* S_IFSOCK */
     if (op2 == 'g' || op2 == 'u' || op2 == 'k') return 1;
     if (op2 == 'N') return 1;
     if (op2 == 'G' || op2 == 'O') return 0;

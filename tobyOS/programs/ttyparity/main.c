@@ -204,6 +204,15 @@ static int session_start(struct session *s, const char *shell, char *trans) {
         (char *)"HOME=/",
         (char *)"TERM=dumb",
         (char *)"LC_ALL=C",
+        /* Case isolation (2026-08-23). The moment the root became
+         * writable (Phase G), interactive bash started PERSISTING
+         * /.bash_history across this gate's cases -- case 05's `fc -l`
+         * suddenly listed items 16-20 accumulated from cases 1-4, while
+         * a fresh session (tsh, and bash before Phase G) numbers from 1.
+         * The read-only root had been an accidental isolation layer.
+         * Empty HISTFILE = bash neither loads nor saves; each case is a
+         * fresh session again, which is what byte-parity compares. */
+        (char *)"HISTFILE=",
         0
     };
     char *argv_bash[] = { (char *)"bash", (char *)"--norc",
