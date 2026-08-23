@@ -358,9 +358,15 @@ void ipv6_recv(const void *frame, size_t len) {
         }
         break;
     }
-    case IPV6_NH_TCP:
-        /* Future: TCP-over-IPv6 */
+    case IPV6_NH_TCP: {
+        /* TCP6 (2026-08-23): the same engine as v4, demuxed by v6 peer.
+         * Extern to keep tcp.h out of this file's include set. */
+        extern void tcp_recv_packet6(const struct ipv6_addr *src,
+                                     const struct ipv6_addr *dst,
+                                     const void *tcp_packet, size_t len);
+        tcp_recv_packet6(&h->src, &h->dst, payload, plen);
         break;
+    }
     default:
         break;
     }

@@ -22,6 +22,7 @@
 #define TOBYOS_TCP_H
 
 #include <tobyos/types.h>
+#include <tobyos/ipv6.h>   /* TCP6 (2026-08-23): struct ipv6_addr peers */
 
 typedef enum {
     TCP_CLOSED        = 0,
@@ -74,6 +75,19 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
  * Returns NULL only if a slot/port could not be allocated or the SYN failed
  * to go out. */
 struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be);
+
+/* ---- TCP over IPv6 (2026-08-23) ---------------------------------------
+ * The engine is shared; only the prologue (demux/checksum/emit) is
+ * family-aware. A listener is port-scoped and family-blind, so a v6
+ * listener accepts v4 SYNs too -- Linux's dual-stack default. */
+void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
+                      const void *tcp_packet, size_t len);
+struct tcp_conn *tcp_connect6(const struct ipv6_addr *dst,
+                              uint16_t dst_port_be, uint32_t timeout_ms);
+struct tcp_conn *tcp_connect6_nb(const struct ipv6_addr *dst,
+                                 uint16_t dst_port_be);
+bool tcp_conn_is6(const struct tcp_conn *c);
+const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c);
 
 /* Send without waiting for ACKs: queues as much as the congestion/receive
  * window allows right now and returns the byte count accepted (0 means the

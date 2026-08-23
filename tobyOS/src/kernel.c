@@ -7965,6 +7965,11 @@ void _start(void) {
              * value. */
             { "/bin/linux-ipv6", "linux-ipv6", 0, 63,
               "AF_INET6 UDP: ::1 echo + dual-stack" },
+            /* 2026-08-23: TCP over IPv6 (IPv6 slice 2). Same engine as
+             * v4; proves the family-aware prologue + dual-stack listen/
+             * connect + endpoint reporting + 48 KiB stream integrity. */
+            { "/bin/linux-tcp6", "linux-tcp6", 0, 63,
+              "TCP6: ::1 streams + dual-stack listen" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

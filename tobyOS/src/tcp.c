@@ -3,6 +3,7 @@
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
 #include <tobyos/ip.h>
+#include <tobyos/ipv6.h>    /* TCP6 (2026-08-23): v6 peers + checksum/send */
 #include <tobyos/cpu.h>
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
@@ -32,6 +33,13 @@
  * the already-advertised wscale shift=4. 16 conns x 64 KiB = 1 MiB. */
 #define TCP_RX_BUF_BYTES   65536
 #define TCP_DEFAULT_MSS     1460
+/* TCP6 (2026-08-23): the v6 header is 20 bytes bigger than v4's, and v6
+ * has NO on-path fragmentation (RFC 8200) -- ipv6_send refuses anything
+ * over ETH_MTU-40, so a v4-sized 1460-byte segment is 1480 bytes of
+ * TCP and cannot leave the machine. Found by the 48 KiB stream gate:
+ * every full-MSS segment failed to emit while the small echo bits
+ * passed. 1500 - 40 (v6 hdr) - 20 (tcp hdr) = 1440. */
+#define TCP_V6_MSS          1440
 #define TCP_MAX_TX_PENDING  4
 #define TCP_LISTEN_BACKLOG  4
 #define TCP_EPHEMERAL_LO    49152
@@ -62,6 +70,11 @@ struct tcp_conn {
     void        *net_ns;
     tcp_state_t  state;
     uint32_t     remote_ip_be;
+    /* TCP6 (2026-08-23): when is6 is set, remote6 is the peer and
+     * remote_ip_be stays 0. Only the prologue (demux/checksum/emit) is
+     * family-aware; the whole sequence-space engine is shared. */
+    bool         is6;
+    struct ipv6_addr remote6;
     uint16_t     remote_port_be;
     uint16_t     local_port_be;
     uint32_t     snd_una;
@@ -274,10 +287,25 @@ static struct tcp_conn *conn_lookup(uint32_t rip, uint16_t rport,
     void *ns = net_current_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
-        if (!c->in_use) continue;
+        if (!c->in_use || c->is6) continue;
         if (c->net_ns != ns) continue;
         if (c->remote_ip_be != rip || c->remote_port_be != rport ||
             c->local_port_be != lport)
+            continue;
+        return c;
+    }
+    return NULL;
+}
+
+static struct tcp_conn *conn_lookup6(const struct ipv6_addr *rip,
+                                     uint16_t rport, uint16_t lport) {
+    void *ns = net_current_ns();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use || !c->is6) continue;
+        if (c->net_ns != ns) continue;
+        if (!ipv6_addr_equal(&c->remote6, rip) ||
+            c->remote_port_be != rport || c->local_port_be != lport)
             continue;
         return c;
     }
@@ -633,9 +661,19 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags, uint32_t seq,
     }
 
     if (plen) memcpy(buf + hdr_len, payload, plen);
-    h->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(), c->remote_ip_be,
-                                   buf, hdr_len + plen);
-    bool sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    bool sent;
+    if (c->is6) {
+        /* TCP6: checksum over the pseudo-header ipv6_send will really
+         * stamp (loopback: src == dst). Mandatory in v6. */
+        h->checksum = ipv6_l4_checksum(ipv6_src_for(&c->remote6),
+                                       &c->remote6, IPV6_NH_TCP,
+                                       buf, hdr_len + plen);
+        sent = ipv6_send(&c->remote6, IPV6_NH_TCP, buf, hdr_len + plen) == 0;
+    } else {
+        h->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(),
+                                      c->remote_ip_be, buf, hdr_len + plen);
+        sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    }
     /* Slice 56: remember what the peer now believes our window is, so
      * tcp_recv can send a window-update ACK when reality outgrows it. */
     if (sent) c->adv_free_last = free_wnd;
@@ -797,6 +835,7 @@ static void listen_enqueue(struct tcp_conn *lsn, int child_idx) {
 }
 
 static void passive_syn(struct tcp_conn *lsn, uint32_t src_ip,
+    const struct ipv6_addr *src6,       /* non-NULL = v6 peer (TCP6) */
     uint16_t src_port, uint16_t dst_port, uint32_t seq,
     const void *tcp_packet, unsigned hlen) {
 int lidx = conn_index(lsn);
@@ -807,7 +846,8 @@ kprintf("[tcp] listen backlog full lp=%u\n",
 return;
 }
 
-if (conn_lookup(src_ip, src_port, dst_port)) {
+if (src6 ? (conn_lookup6(src6, src_port, dst_port) != NULL)
+         : (conn_lookup(src_ip, src_port, dst_port) != NULL)) {
 kprintf("[tcp] duplicate SYN ignored lp=%u rp=%u\n",
 (unsigned)ntohs(dst_port),
 (unsigned)ntohs(src_port));
@@ -817,7 +857,12 @@ return;
     struct tcp_conn *ch = conn_alloc();
     if (!ch) return;
 
-    ch->remote_ip_be   = src_ip;
+    if (src6) {
+        ch->is6     = true;
+        ch->remote6 = *src6;
+    } else {
+        ch->remote_ip_be = src_ip;
+    }
     ch->remote_port_be = src_port;
     ch->local_port_be  = dst_port;
     ch->parent_lsn     = (int8_t)lidx;
@@ -867,6 +912,10 @@ return;
             (unsigned)ch->rcv_nxt);
 }
 
+static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,
+                             const void *tcp_packet, size_t len,
+                             unsigned hlen);
+
 void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     if (len < TCP_HDR_LEN) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)tcp_packet;
@@ -891,7 +940,7 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         struct tcp_conn *lsn = listen_lookup(dstp);
         if (lsn && (h->flags & TCP_FLAG_SYN) &&
             !(h->flags & TCP_FLAG_ACK)) {
-            passive_syn(lsn, src_ip_be, srcp, dstp, ntohl(h->seq),
+            passive_syn(lsn, src_ip_be, NULL, srcp, dstp, ntohl(h->seq),
                         tcp_packet, hlen);
             return;
         }
@@ -924,6 +973,76 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         return;
     }
 
+    tcp_recv_segment(c, h, tcp_packet, len, hlen);
+}
+
+/* TCP-over-IPv6 entry (2026-08-23), called from ipv6.c's demux with the
+ * packet's real addresses. Only this prologue -- checksum verify, conn
+ * demux, passive open, dead-port RST -- is family-specific; the whole
+ * sequence-space engine below (tcp_recv_segment) is shared verbatim. */
+void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
+                      const void *tcp_packet, size_t len) {
+    if (len < TCP_HDR_LEN) return;
+    const struct tcp_hdr *h = (const struct tcp_hdr *)tcp_packet;
+    unsigned hlen = tcp_hdr_bytes(h->data_off);
+    if (hlen < TCP_HDR_LEN || hlen > len) return;
+
+    /* Loopback frames are SELF-ADDRESSED (src == dst, see ipv6_send) and
+     * never left this machine's memory -- skip verification exactly as the
+     * v4 path does for 127/8. Anything off the wire must checksum
+     * (mandatory in v6). A valid packet's recomputed sum is -0, which
+     * ipv6_l4_checksum's zero rule reports as 0xFFFF. */
+    if (!ipv6_addr_equal(src, dst)) {
+        if (ipv6_l4_checksum(src, dst, IPV6_NH_TCP, tcp_packet, len)
+                != 0xFFFF)
+            return;
+    }
+
+    uint16_t dstp = h->dst_port;
+    uint16_t srcp = h->src_port;
+
+    struct tcp_conn *c = conn_lookup6(src, srcp, dstp);
+    if (!c) {
+        struct tcp_conn *lsn = listen_lookup(dstp);
+        if (lsn && (h->flags & TCP_FLAG_SYN) &&
+            !(h->flags & TCP_FLAG_ACK)) {
+            passive_syn(lsn, 0, src, srcp, dstp, ntohl(h->seq),
+                        tcp_packet, hlen);
+            return;
+        }
+        /* CLOSED port: RST, same rule and shape as v4 -- this is what
+         * makes a v6 connect() to a dead local port an instant
+         * ECONNREFUSED instead of a SYN-retry crawl. */
+        if (!(h->flags & TCP_FLAG_RST)) {
+            uint8_t rst[TCP_HDR_LEN];
+            memset(rst, 0, sizeof rst);
+            struct tcp_hdr *r = (struct tcp_hdr *)rst;
+            r->src_port = dstp;
+            r->dst_port = srcp;
+            if (h->flags & TCP_FLAG_ACK) {
+                r->seq   = h->ack;
+                r->flags = TCP_FLAG_RST;
+            } else {
+                uint32_t extra = (h->flags & TCP_FLAG_SYN) ? 1u : 0u;
+                r->seq   = 0;
+                r->ack   = htonl(ntohl(h->seq) + (uint32_t)(len - hlen) + extra);
+                r->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+            }
+            r->data_off = (uint8_t)((TCP_HDR_LEN / 4) << 4);
+            r->checksum = 0;
+            r->checksum = ipv6_l4_checksum(ipv6_src_for(src), src,
+                                           IPV6_NH_TCP, rst, sizeof rst);
+            (void)ipv6_send(src, IPV6_NH_TCP, rst, sizeof rst);
+        }
+        return;
+    }
+
+    tcp_recv_segment(c, h, tcp_packet, len, hlen);
+}
+
+static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,
+                             const void *tcp_packet, size_t len,
+                             unsigned hlen) {
     uint32_t seq = ntohl(h->seq);
     uint32_t ack = ntohl(h->ack);
     uint8_t  fl  = h->flags;
@@ -1304,6 +1423,53 @@ struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be) {
     return tcp_syn_out(dst_ip_be, dst_port_be);
 }
 
+/* TCP6 active open (2026-08-23). Same shape as tcp_syn_out; the address
+ * gate is ipv6_is_up() rather than net_my_ip() -- a v6 conn's source is
+ * picked per-destination by ipv6_send (loopback: the destination). */
+static struct tcp_conn *tcp_syn_out6(const struct ipv6_addr *dst,
+                                     uint16_t dst_port_be) {
+    if (!dst || ipv6_addr_is_zero(dst) || !ipv6_is_up()) return NULL;
+    struct tcp_conn *c = conn_alloc();
+    if (!c) return NULL;
+    uint16_t lp = alloc_ephemeral_port();
+    if (lp == 0) {
+        conn_free(c);
+        return NULL;
+    }
+    c->local_port_be  = lp;
+    c->is6            = true;
+    c->remote6        = *dst;
+    c->remote_port_be = dst_port_be;
+    c->state          = TCP_SYN_SENT;
+
+    uint64_t mix = (uint64_t)pit_ticks() * 0x9E3779B97F4A7C15ull;
+    mix ^= ((uint64_t)g_my_mac[3] << 16) | ((uint64_t)g_my_mac[5]);
+    c->snd_nxt = c->snd_una = (uint32_t)(mix ^ (mix >> 32));
+
+    if (!tcp_send_data_segment(c, TCP_FLAG_SYN, NULL, 0)) {
+        conn_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+struct tcp_conn *tcp_connect6(const struct ipv6_addr *dst,
+                              uint16_t dst_port_be, uint32_t timeout_ms) {
+    struct tcp_conn *c = tcp_syn_out6(dst, dst_port_be);
+    if (!c) return NULL;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    if (tcp_poll_until(c, dl, pred_est) != 1) {
+        conn_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+struct tcp_conn *tcp_connect6_nb(const struct ipv6_addr *dst,
+                                 uint16_t dst_port_be) {
+    return tcp_syn_out6(dst, dst_port_be);
+}
+
 uint16_t tcp_local_port_be(const struct tcp_conn *c) {
     return (c && c->in_use) ? c->local_port_be : 0;
 }
@@ -1312,6 +1478,12 @@ uint32_t tcp_remote_ip_be(const struct tcp_conn *c) {
 }
 uint16_t tcp_remote_port_be(const struct tcp_conn *c) {
     return (c && c->in_use) ? c->remote_port_be : 0;
+}
+bool tcp_conn_is6(const struct tcp_conn *c) {
+    return c && c->in_use && c->is6;
+}
+const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c) {
+    return (c && c->in_use && c->is6) ? &c->remote6 : NULL;
 }
 
 /* SO_REUSEADDR's actual meaning for a listener: conns that are merely
@@ -1467,7 +1639,8 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
         }
 
         size_t chunk = remaining;
-        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
+        size_t mss   = c->is6 ? TCP_V6_MSS : TCP_DEFAULT_MSS;
+        if (chunk > mss) chunk = mss;
         if (!tcp_send_data_segment(c, 0, p, chunk)) return -1;
         p += chunk;
         remaining -= chunk;
@@ -1509,8 +1682,9 @@ long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len) {
         size_t room = wnd - flight;
 
         size_t chunk = remaining;
-        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
-        if (chunk > room)            chunk = room;
+        size_t mss   = c->is6 ? TCP_V6_MSS : TCP_DEFAULT_MSS;
+        if (chunk > mss)  chunk = mss;
+        if (chunk > room) chunk = room;
         if (chunk == 0) break;
 
         if (!tcp_send_data_segment(c, 0, p, chunk)) break;  /* no pending slot */

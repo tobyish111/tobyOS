@@ -6778,16 +6778,20 @@ static long lx_socket(int domain, int type, int proto) {
         if (nfd < 0) { sock_close(ns); return -ABI_EMFILE; }
         return nfd;
     }
-    /* AF_INET6 (2026-08-23): UDP datagrams are real now -- the v6 socket is
+    /* AF_INET6 (2026-08-23): UDP and TCP are real now -- the v6 socket is
      * the same pool entry as v4 with is_v6 set, and each call site parses
-     * sockaddr_in6 for it. SOCK_STREAM stays EAFNOSUPPORT until the TCP6
-     * slice, and the errno choice is load-bearing: musl/glibc getaddrinfo
-     * falls back to AF_INET *only* on EAFNOSUPPORT -- EINVAL here once made
-     * the fallback never happen (wget: "bad address"). */
+     * sockaddr_in6 for it. Anything else keeps EAFNOSUPPORT, and that
+     * errno choice is load-bearing: musl/glibc getaddrinfo falls back to
+     * AF_INET *only* on EAFNOSUPPORT -- EINVAL here once made the
+     * fallback never happen (wget: "bad address"). */
     if (domain == AF_INET6) {
-        if ((type & 0xff) != SOCK_DGRAM) return -LXE_EAFNOSUPPORT;
+        int t6 = type & 0xff;
+        int k6;
+        if (t6 == SOCK_DGRAM)       k6 = SOCK_KIND_UDP;
+        else if (t6 == SOCK_STREAM) k6 = SOCK_KIND_TCP;
+        else return -LXE_EAFNOSUPPORT;
         if (!cap_check(current_proc(), CAP_NET, "lx_socket6")) return -ABI_EACCES;
-        struct sock *s6 = sock_alloc(SOCK_KIND_UDP);
+        struct sock *s6 = sock_alloc(k6);
         if (!s6) return -ABI_EMFILE;
         s6->is_v6    = 1;
         s6->nonblock = (type & SOCK_NONBLOCK) != 0;
@@ -7132,9 +7136,26 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
     ns->tcp = child;
     ns->local_port = s->local_port;
     ns->nonblock   = (flags & SOCK_NONBLOCK) != 0;
+    /* TCP6 (2026-08-23): the accepted socket inherits the LISTENER's
+     * family, as Linux does -- a v6 listener's children are AF_INET6 even
+     * for a v4 client (whose peer then reports as ::ffff:a.b.c.d). */
+    ns->is_v6      = s->is_v6;
     int nfd = lx_sock_install(ns);
     if (nfd < 0) { tcp_close(child); sock_close(ns); return -ABI_EMFILE; }
-    {
+    if (s->is_v6) {
+        struct lx_sockaddr_in6 sa6;
+        memset(&sa6, 0, sizeof sa6);
+        sa6.fam     = AF_INET6;
+        sa6.port_be = tcp_remote_port_be(child);
+        if (tcp_conn_is6(child)) {
+            memcpy(sa6.addr, tcp_remote6(child)->bytes, 16);
+        } else {                       /* dual-stack v4 client: mapped */
+            uint32_t rip = tcp_remote_ip_be(child);
+            sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+            memcpy(&sa6.addr[12], &rip, 4);
+        }
+        lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
+    } else {
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof sa);
         sa.sin_family = AF_INET;        /* peer ip/port not exposed; family only */
@@ -7147,6 +7168,14 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
     struct sock *s = lx_sock_of(fd);
     if (!s) return -LXE_ENOTSOCK;
     if (!uaddr || alen < 2) return -ABI_EFAULT;
+
+    /* TCP destination, resolved by whichever family arm runs below; the
+     * connect machinery at the bottom is family-free apart from which
+     * starter it calls. */
+    bool dst_use6 = false;
+    struct ipv6_addr dst6;
+    uint32_t dst4 = 0; uint16_t dstp = 0;
+    memset(&dst6, 0, sizeof dst6);
 
     uint16_t fam = 0;
     if (copy_from_user(&fam, (const void *)(uintptr_t)uaddr, sizeof fam) != 0)
@@ -7177,20 +7206,35 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         return rc == 0 ? 0 : -LXE_ECONNREFUSED;
     }
 
-    /* AF_INET6: connected UDP only for now (socket() refuses AF_INET6
-     * SOCK_STREAM until the TCP6 slice, so a v6 sock here is always UDP).
-     * Remember the peer; send()/recv()/write() then default to it. The
-     * empty-netns denial applies exactly as for v4 -- this kernel has no
-     * per-namespace loopback, so an empty namespace refuses ::1 too. */
+    /* AF_INET6 (UDP + TCP since 2026-08-23). UDP: remember the peer;
+     * send()/recv()/write() then default to it. TCP: resolve the
+     * destination and fall into the SAME nonblock/blocking machinery as
+     * v4 -- a v4-mapped destination (::ffff:a.b.c.d) rides the v4 engine
+     * while the socket keeps its v6 reporting. The empty-netns denial
+     * applies exactly as for v4 -- this kernel has no per-namespace
+     * loopback, so an empty namespace refuses ::1 too. */
     if (fam == AF_INET6) {
-        if (s->kind != SOCK_KIND_UDP || !s->is_v6) return -ABI_EINVAL;
+        if (!s->is_v6) return -ABI_EINVAL;
         struct ipv6_addr a6; uint16_t p6;
         long pr = lx_sin6_parse(uaddr, alen, &a6, &p6);
         if (pr) return pr;
         if (!lx_sock_networked(s)) return -LXE_ENETUNREACH;
-        s->peer6     = a6;
+        if (s->kind == SOCK_KIND_UDP) {
+            s->peer6     = a6;
+            s->peer_port = p6;
+            return 0;
+        }
+        if (s->kind != SOCK_KIND_TCP) return -ABI_EINVAL;
+        s->peer6 = a6;                 /* getpeername's mapped spelling */
         s->peer_port = p6;
-        return 0;
+        if (lx_v6_is_mapped(&a6)) {
+            memcpy(&dst4, &a6.bytes[12], 4);
+        } else {
+            dst6 = a6;
+            dst_use6 = true;
+        }
+        dstp = p6;
+        goto tcp_start;
     }
 
     struct sockaddr_in sa;
@@ -7228,6 +7272,10 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         return 0;
     }
 
+    dst4 = sa.sin_addr;
+    dstp = sa.sin_port;
+
+tcp_start:;
     uint32_t to = s->send_timeout_ms ? s->send_timeout_ms : LX_SOCK_DEF_CONNECT_MS;
 
     /* Non-blocking connect: put the SYN on the wire and return EINPROGRESS at
@@ -7242,7 +7290,8 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
             return pr < 0 ? pr : -LXE_EALREADY;
         }
         if (s->tcp) return -LXE_EISCONN;
-        struct tcp_conn *nc = tcp_connect_nb(sa.sin_addr, sa.sin_port);
+        struct tcp_conn *nc = dst_use6 ? tcp_connect6_nb(&dst6, dstp)
+                                       : tcp_connect_nb(dst4, dstp);
         if (!nc) return -LXE_ECONNREFUSED;
         s->tcp        = nc;
         s->connecting = 1;
@@ -7259,7 +7308,8 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
      * difference (retry policy, error messages, failover). */
     if (s->connecting) return -LXE_EALREADY;
     if (s->tcp) return -LXE_EISCONN;
-    struct tcp_conn *nc = tcp_connect_nb(sa.sin_addr, sa.sin_port);
+    struct tcp_conn *nc = dst_use6 ? tcp_connect6_nb(&dst6, dstp)
+                                   : tcp_connect_nb(dst4, dstp);
     if (!nc) return -LXE_ECONNREFUSED;           /* no slot / no route */
     s->tcp        = nc;
     s->connecting = 1;
@@ -7616,8 +7666,14 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
 #endif
     kfree(k);
     if (rv >= 0 && uaddr) {              /* connected: report family only */
-        struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
-        lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        if (s->is_v6) {
+            struct lx_sockaddr_in6 sa6; memset(&sa6, 0, sizeof sa6);
+            sa6.fam = AF_INET6;
+            lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
+        } else {
+            struct sockaddr_in sa; memset(&sa, 0, sizeof sa); sa.sin_family = AF_INET;
+            lx_addr_writeback(uaddr, ualen, &sa, (uint32_t)sizeof sa);
+        }
     }
     return rv;
 }
@@ -7702,26 +7758,56 @@ static long lx_sockaddr_out(struct sock *s, uint64_t uaddr, uint64_t ualen,
         return 0;
     }
 
-    /* AF_INET6 (UDP only until the TCP6 slice). */
+    /* AF_INET6 (UDP + TCP since 2026-08-23). */
     if (s->is_v6) {
         struct lx_sockaddr_in6 sa6;
         memset(&sa6, 0, sizeof sa6);
         sa6.fam = AF_INET6;
         if (peer) {
-            if (!s->peer_port) return -LXE_ENOTCONN;
-            memcpy(sa6.addr, s->peer6.bytes, 16);
-            sa6.port_be = s->peer_port;
+            if (s->kind == SOCK_KIND_TCP) {
+                if (!s->tcp) return -LXE_ENOTCONN;
+                if (tcp_conn_is6(s->tcp)) {
+                    memcpy(sa6.addr, tcp_remote6(s->tcp)->bytes, 16);
+                } else {           /* dual-stack: v4 conn, mapped spelling */
+                    uint32_t rip = tcp_remote_ip_be(s->tcp);
+                    sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+                    memcpy(&sa6.addr[12], &rip, 4);
+                }
+                sa6.port_be = tcp_remote_port_be(s->tcp);
+            } else {
+                if (!s->peer_port) return -LXE_ENOTCONN;
+                memcpy(sa6.addr, s->peer6.bytes, 16);
+                sa6.port_be = s->peer_port;
+            }
         } else {
             /* RFC 3484 source discovery: glibc connect()s a UDP socket and
              * reads the local name to learn which source the route picks.
              * An explicit bind wins; otherwise answer what ipv6_send would
              * actually stamp for the connected peer (loopback: the peer
              * itself), so the sort sees a real address, not ::. */
-            if (ipv6_addr_is_zero(&s->local6) && s->peer_port)
+            bool tcp_conn_up = (s->kind == SOCK_KIND_TCP && s->tcp &&
+                                !s->tcp_listening);
+            bool udp_peered  = (s->kind == SOCK_KIND_UDP && s->peer_port &&
+                                ipv6_addr_is_zero(&s->local6));
+            if (tcp_conn_up && tcp_conn_is6(s->tcp)) {
+                memcpy(sa6.addr, ipv6_src_for(tcp_remote6(s->tcp))->bytes, 16);
+            } else if (tcp_conn_up ||
+                       (udp_peered && lx_v6_is_mapped(&s->peer6))) {
+                /* Riding the v4 engine (mapped peer): our v4 address in
+                 * the mapped spelling, so the probe sees a real source. */
+                sa6.addr[10] = 0xff; sa6.addr[11] = 0xff;
+                memcpy(&sa6.addr[12], &g_my_ip, 4);
+            } else if (udp_peered) {
                 memcpy(sa6.addr, ipv6_src_for(&s->peer6)->bytes, 16);
-            else
+            } else {
                 memcpy(sa6.addr, s->local6.bytes, 16);
-            sa6.port_be = s->local_port;
+            }
+            /* A TCP socket's real local port lives on the connection (the
+             * ephemeral one picked at connect), same rule as v4 below. */
+            sa6.port_be = (s->kind == SOCK_KIND_TCP && s->tcp &&
+                           !s->tcp_listening)
+                            ? tcp_local_port_be(s->tcp)
+                            : s->local_port;
         }
         lx_addr_writeback(uaddr, ualen, &sa6, (uint32_t)sizeof sa6);
         return 0;

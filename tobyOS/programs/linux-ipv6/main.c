@@ -9,8 +9,9 @@
  * directions.
  *
  * Bits (want 63):
- *   bit0  socket(AF_INET6, SOCK_DGRAM) opens; SOCK_STREAM is still the
- *         getaddrinfo-load-bearing EAFNOSUPPORT (TCP6 is the next slice)
+ *   bit0  socket(AF_INET6, SOCK_DGRAM) and SOCK_STREAM both open (TCP6
+ *         landed in the very next slice); SOCK_RAW keeps the
+ *         getaddrinfo-load-bearing EAFNOSUPPORT
  *   bit1  ::1 echo round trip, BOTH directions, payload + source verified
  *   bit2  getsockname: bound port round-trips; a connect()ed socket
  *         reports source ::1, not :: (glibc's RFC 3484 discovery probe)
@@ -70,17 +71,20 @@ static void sin6_lo(struct sockaddr_in6 *sa, uint16_t port) {
 int main(void) {
     printf("linux-ipv6: AF_INET6 UDP + ::1 loopback\n");
 
-    /* bit0: DGRAM opens, STREAM is EAFNOSUPPORT (not EINVAL -- glibc/musl
-     * getaddrinfo only falls back to v4 on exactly that errno). */
+    /* bit0: DGRAM and STREAM both open; an unsupported type (RAW) is
+     * EAFNOSUPPORT, not EINVAL -- glibc/musl getaddrinfo only falls back
+     * to v4 on exactly that errno. */
     {
         int d = socket(AF_INET6, SOCK_DGRAM, 0);
-        errno = 0;
         int t = socket(AF_INET6, SOCK_STREAM, 0);
-        int terr = errno;
-        bit(0, d >= 0 && t < 0 && terr == EAFNOSUPPORT,
-            "socket(): DGRAM opens, STREAM EAFNOSUPPORT");
+        errno = 0;
+        int r = socket(AF_INET6, SOCK_RAW, 0);
+        int rerr = errno;
+        bit(0, d >= 0 && t >= 0 && r < 0 && rerr == EAFNOSUPPORT,
+            "socket(): DGRAM+STREAM open, RAW EAFNOSUPPORT");
         if (d >= 0) close(d);
         if (t >= 0) close(t);
+        if (r >= 0) close(r);
     }
 
     /* bit1: full ::1 echo. srv on 47601; cli sends "ping6-payload", srv
