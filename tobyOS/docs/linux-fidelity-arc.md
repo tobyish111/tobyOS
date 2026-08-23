@@ -474,3 +474,25 @@ Same on real Linux (why glibc vfork pops its RA into a register); raw
 clone tests must keep the child call-free in inline asm.** Full chain
 revalidated (cross-personality + defboot green); a CHROMIUM-flavour
 boot re-validation rides the next browser-arc session.
+
+### 2026-08-23 — the vDSO (e701ded, lxposix 28/28; the Tier-6 perf item falls)
+A real LINUX_2.6-versioned shared object, built at kernel build time,
+staged into pinned shared frames, mapped R+X at 0x7ffff7ffe000 with the
+kernel-written time page one page below, advertised via AT_SYSINFO_EHDR.
+Measured: 10,000 clock_gettime = 10,004 syscalls before, 4 after.
+THREE lessons, each paid for in boots: (1) shared frames need the
+page_ref normalize-then-reference discipline PER MAPPING, and a pin
+taken before page_ref_init exists is a silent no-op — the freed-live-
+vDSO heap corruption named its own writer (the corrupt word equalled
+the boot's printed tsc_khz); (2) PT_DYNAMIC must be READ-ONLY
+(-z rodynamic) or glibc rebases the SHARED .dynamic in place and every
+process after the first double-rebases it into garbage — lookups fail
+SILENTLY into the syscall fallback; (3) the image must link at a
+NONZERO base (--image-base=0x1000): glibc's `if (!l_addr)` idiom takes
+the second LOAD's vaddr when the first is 0, sliding every table low —
+real vDSOs all start nonzero for this exact reason. The empty vaddr-0
+slot IS the data page (__ehdr_start - 4096). /proc/self/status gains
+TobySyscalls so userspace can prove a path stopped syscalling. Full
+chain green. OPEN: one proc_exit "sched_yield returned" panic in ~13
+boots (terminated proc re-enqueued, timer-heavy test in flight) — a
+rare wake-after-death race to hunt.
