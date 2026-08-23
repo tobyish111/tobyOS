@@ -7817,6 +7817,11 @@ void _start(void) {
              * when bytes are written. */
             { "/bin/linux-stat", "linux-stat", 0, 15,
               "statfs tells the truth" },
+            /* 2026-08-23: TRUE vfork -- the child runs on the PARENT's
+             * stack while the parent is suspended (the private-stack shim
+             * outlived the racy-suspension bug it worked around). */
+            { "/bin/linux-vfork", "linux-vfork", 0, 63,
+              "true vfork: shared stack + suspended parent" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

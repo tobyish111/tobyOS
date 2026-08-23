@@ -935,81 +935,49 @@ long sys_fork_share(void) {
            (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
            sizeof(struct syscall_regs));
 
-    /* clone(2) with an EXPLICIT child_stack takes precedence over the private
-     * stack below, and the distinction is the whole reason this is safe.
-     *
-     * Two different callers arrive here:
-     *
-     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL. The
-     *     caller expects the child to run on the PARENT's stack. We give it a
-     *     private one instead -- a documented, pre-existing deviation that the
-     *     comment below explains and that the Chromium launcher path depends
-     *     on. UNCHANGED here.
+    /* Stack selection (TRUE vfork since 2026-08-23):
      *
      *   clone(fn, child_stack, CLONE_VM|CLONE_VFORK|SIGCHLD, arg) -- glibc's
      *     library wrapper. The caller supplied a stack PRECISELY so the child
      *     would not touch the parent's, and __clone's child side pops its entry
      *     function off it (`xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`).
-     *     Handing that child a fresh ZEROED stack makes it pop 0 and `call *0`
-     *     -- an instruction fetch at NULL, which is the rip=0/err=0x14 fault
-     *     already recorded against busybox `unshare -f`. Chromium's
-     *     ChrootToSafeEmptyDir (credentials.cc) is the same call, and it died
-     *     the same way.
+     *     Handing that child anything else makes it pop 0 and `call *0` --
+     *     the rip=0/err=0x14 fault recorded against busybox `unshare -f` and
+     *     Chromium's ChrootToSafeEmptyDir. Honoured, unchanged.
      *
-     * Honouring an explicitly supplied stack cannot disturb the first caller,
-     * because that caller supplies none. CLONE_VM means the address space is
-     * shared, so the pointer is valid in the child by construction. */
+     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL: the
+     *     child runs on the PARENT'S OWN STACK -- the copied syscall_regs
+     *     already carry the parent's rsp, so "do nothing" is the whole
+     *     implementation. This is what vfork MEANS: the parent is suspended
+     *     (the fence-hardened wait loop below), the child pushes only below
+     *     the vfork frame, and every write it makes to locals in that frame
+     *     is visible to the parent when it resumes -- which is exactly the
+     *     channel `err = errno` exec-failure reporting uses.
+     *
+     *     HISTORY, because this replaced a load-bearing-looking shim: the
+     *     child used to get a PRIVATE 512 KiB stack mapped into the shared
+     *     CR3, added in the bring-up era when the parent's suspension was
+     *     racy -- with both sides live on one stack, the child smashed the
+     *     launcher's frame and the parent resumed at rip=0 (the crashpad
+     *     double-fork story). Slice 89's store-BLOCKED -> fence -> load-flag
+     *     protocol fixed the actual bug; the shim outlived its reason and
+     *     quietly broke the CONTRACT: an rsp-relative local written by the
+     *     child (exec errno, the classic) landed on the private stack the
+     *     parent never sees, and rsp-relative ARGUMENT reads in the child
+     *     found zeroed memory -- vfork+exec only survived where values
+     *     happened to sit in callee-saved registers. The deviation was
+     *     recorded as the standing debt "vfork private stack"; this is its
+     *     repayment. vfork_stack_va/pages stay as fields (always 0 now) so
+     *     vfork_child_done's teardown remains a no-op rather than a hazard. */
     uint64_t user_cstk = parent->clone_child_stack;
     parent->clone_child_stack = 0;
+    child->vfork_stack_va    = 0;
+    child->vfork_stack_pages = 0;
     if (user_cstk) {
         struct syscall_regs *cr =
             (struct syscall_regs *)((uint8_t *)child->kstack_top
                                     - sizeof(struct syscall_regs));
         cr->user_rsp = user_cstk;
-        child->vfork_stack_va = 0;      /* nothing for vfork_child_done to free */
-        child->vfork_stack_pages = 0;
-    } else
-    /* Private user stack in the shared CR3. Sharing the parent's RSP lets
-     * the child (crashpad double-fork, glibc) smash the launcher's frame;
-     * parent then resumes at rip=0. Map a fresh 512 KiB stack at a high VA
-     * keyed by child pid (visible to the parent too until vfork_child_done). */
-    {
-        const uint32_t np = 128; /* 512 KiB — glibc/crashpad probes past 32K */
-        uint64_t slot = 0x00007f0000000000ULL +
-                        ((uint64_t)child_pid * 0x200000ULL); /* 2 MiB slots */
-        uint64_t stack_va = slot;
-        uint64_t saved = vmm_set_editor_root(tg->cr3);
-        bool ok = true;
-        for (uint32_t i = 0; i < np; i++) {
-            uint64_t phys = pmm_alloc_page();
-            if (!phys) { ok = false; break; }
-            if (!vmm_map(stack_va + (uint64_t)i * PAGE_SIZE, phys, PAGE_SIZE,
-                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
-                pmm_free_page(phys);
-                ok = false;
-                break;
-            }
-            memset(pmm_phys_to_virt(phys), 0, PAGE_SIZE);
-        }
-        vmm_set_editor_root(saved);
-        if (!ok) {
-            for (int i = 0; i < PROC_NFDS; i++) {
-                if (child->fds[i]) file_close(child->fds[i]);
-                child->fds[i] = NULL;
-            }
-            if (child->kstack_base) kfree(child->kstack_base);
-            nsproxy_release(child);    /* slice 8 */
-            memset(child, 0, sizeof(*child));
-            child->state = PROC_UNUSED;
-            return -ABI_ENOMEM;
-        }
-        child->vfork_stack_va = stack_va;
-        child->vfork_stack_pages = np;
-        struct syscall_regs *cr =
-            (struct syscall_regs *)((uint8_t *)child->kstack_top
-                                    - sizeof(struct syscall_regs));
-        /* SysV ABI red zone is 128 bytes below RSP; leave headroom. */
-        cr->user_rsp = stack_va + (uint64_t)np * PAGE_SIZE - 256;
     }
 
     /* SLICE 16: NO charge here, and that is deliberate.
