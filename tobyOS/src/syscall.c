@@ -250,6 +250,7 @@ static long vfs_err_to_abi(long rv) {
     case VFS_ERR_PERM:        return -ABI_EACCES;
     case VFS_ERR_NOTPERM:     return -ABI_EPERM;    /* slice 11 -- see vfs.h */
     case VFS_ERR_LOOP:        return -ABI_EINVAL;   /* no ABI_ELOOP yet */
+    case VFS_ERR_XDEV:        return -ABI_EXDEV;    /* Phase G: hard links */
     default:                  return rv;            /* already an ABI errno */
     }
 }
@@ -2422,11 +2423,23 @@ static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
 
 /* ---- file open / close / dup ----------------------------------- */
 
+/* Phase G: sys_open split into a user-pointer wrapper and a body that
+ * takes an already-resolved KERNEL path, so openat(dirfd, file, ...) can
+ * finally open its dirfd-resolved path instead of falling through to a
+ * cwd-relative interpretation (the long-documented LIMITATION in the
+ * LX_openat arm -- surfaced live when openat(dfd_of_/data, "x", O_CREAT)
+ * created /x at the root the moment the root became writable). */
+static long sys_open_resolved(const char *kpath, int flags, int mode);
+
 static long sys_open(const char *path, int flags, int mode) {
-    (void)mode;     /* M25A: permissions on creation not honoured yet */
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
+    return sys_open_resolved(kpath, flags, mode);
+}
+
+static long sys_open_resolved(const char *kpath, int flags, int mode) {
+    (void)mode;     /* M25A: permissions on creation not honoured yet */
 
     /* Slice 8: /proc/<pid>/ns/<kind> and /proc/self/ns/<kind>.
      *
@@ -9273,10 +9286,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * openat(proc_fd, "self/fd/", O_DIRECTORY|...) -- proc_util.cc:79 --
          * and PCHECKs the result, which was fatal while we resolved against
          * the cwd.
-         * LIMITATION: only the DIRECTORY arm below opens by resolved kernel
-         * path. A dirfd-relative open of a non-directory still falls through
-         * to SYS_OPEN with the raw user pointer, i.e. cwd-relative. Nothing
-         * exercised needs it; wire a by-kpath file open when something does. */
+         * Phase G: FILES open by the resolved kernel path too
+         * (sys_open_resolved). The old fall-through used the raw user
+         * pointer -- cwd-relative -- which surfaced the moment the root
+         * became writable: openat(dfd_of_/data, "x", O_CREAT) created /x. */
         char kpath[ABI_PATH_MAX];
         bool got_kp = (resolve_user_path_at((int)a1, (const char *)a2,
                                             kpath, sizeof kpath) == 0);
@@ -9305,7 +9318,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
 #endif
         }
-        long ofd = do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
+        long ofd = got_kp ? sys_open_resolved(kpath, (int)a3, (int)a4)
+                          : do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
         if (ofd >= 0 && (a3 & LX_O_CLOEXEC))
             fd_cloexec_set(current_proc(), (int)ofd, 1);
 #ifdef CHROMIUM_BOOT
@@ -9761,8 +9775,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * support it (FAT, and most FUSE mounts) -- so portable callers take
      * their existing copy-instead fallback. -ENOSYS would instead say "this
      * kernel has no link syscall", which is a different and wronger claim. */
-    case LX_link: case LX_linkat:
-        return -ABI_EPERM;
+    /* Phase G: hard links are REAL where the filesystem has inode
+     * indirection (tobyfs: name -> ino dirents + the on-disk nlink that
+     * sat unreported since the format was born). Elsewhere (ramfs/tmpfs
+     * are node-per-path) the honest answer is EPERM -- the errno Linux
+     * itself uses for "filesystem does not support hard links", and the
+     * one tar/coreutils degrade gracefully on. EXDEV for cross-mount. */
+    case LX_link: case LX_linkat: {
+        bool at = (n == LX_linkat);
+        char kold[ABI_PATH_MAX], knew[ABI_PATH_MAX];
+        long orr = at ? resolve_user_path_at((int)a1, (const char *)a2,
+                                             kold, sizeof kold)
+                      : resolve_user_path((const char *)a1, kold, sizeof kold);
+        long nrr = at ? resolve_user_path_at((int)a3, (const char *)a4,
+                                             knew, sizeof knew)
+                      : resolve_user_path((const char *)a2, knew, sizeof knew);
+        if (orr != 0 || nrr != 0) return -ABI_ENOENT;
+        long lr = vfs_link(kold, knew);
+        if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
+        return vfs_err_to_abi(lr);
+    }
 
     /* umask(2). Returns the PREVIOUS mask, always succeeds. The mask is
      * applied at file/directory creation (see sys_open/SYS_MKDIR). */

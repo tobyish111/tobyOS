@@ -1049,6 +1049,21 @@ int vfs_unlink(const char *path) {
     return urc;
 }
 
+/* Phase G: hard links. Cross-mount linking is impossible by construction
+ * (an inode number means nothing outside its filesystem), which is exactly
+ * what EXDEV exists to say -- coreutils' ln/mv fall back to copying on it. */
+int vfs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return VFS_ERR_INVAL;
+    const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
+    const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
+    if (!om || !nm) return VFS_ERR_NOMOUNT;
+    if (om != nm) return VFS_ERR_XDEV;
+    if (!om->ops->link) return VFS_ERR_ROFS;
+    int rc = om->ops->link(om->data, orel, nrel);
+    if (rc == VFS_OK) vfs_notify(newpath, VFS_IN_CREATE, 0);
+    return rc;
+}
+
 int vfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return VFS_ERR_INVAL;
     const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
@@ -1366,6 +1381,7 @@ const char *vfs_strerror(int err) {
     case VFS_ERR_NAMETOOLONG:   return "name too long";
     case VFS_ERR_PERM:          return "permission denied";
     case VFS_ERR_LOOP:          return "too many levels of symbolic links";
+    case VFS_ERR_XDEV:          return "cross-device link";
     default:                    return "unknown error";
     }
 }

@@ -676,6 +676,11 @@ static int tobyfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     out->mtime = node.mtime;      /* slice 6 */
     out->atime = node.mtime;      /* no separate atime on disk */
     out->ctime = node.mtime;
+    /* Phase G: the on-disk nlink has existed since the format was born and
+     * was never reported -- every stat emitter substituted 1. Real counts
+     * matter now that link(2) can raise them. Legacy inodes may carry 0;
+     * the emitters' 0-means-default rule still covers those. */
+    out->nlink = node.nlink;
     return VFS_OK;
 }
 
@@ -709,6 +714,22 @@ static int tobyfs_close(struct vfs_file *f) {
     if (f->priv) kfree(f->priv);
     f->priv = 0;
     return VFS_OK;
+}
+
+/* Phase G: a handle's cached inode must not clobber fields OTHER writers
+ * own -- link(2) bumps nlink and chmod/chown flip mode/uid/gid while this
+ * fd is open, and flushing the open-time copy silently reverted them.
+ * Found live: the test's fd write AFTER link(2) reset nlink to 1, so the
+ * later unlink freed the inode out from under the surviving name. Size,
+ * block pointers and mtime stay the handle's own -- it is the one
+ * mutating them. Call before every write_inode(&h->node). */
+static void handle_refresh_foreign(struct tobyfs *fs, struct tobyfs_handle *h) {
+    struct tfs_inode_disk cur;
+    if (read_inode(fs, h->ino, &cur) != VFS_OK) return;
+    h->node.nlink = cur.nlink;
+    h->node.mode  = cur.mode;
+    h->node.uid   = cur.uid;
+    h->node.gid   = cur.gid;
 }
 
 /* -------- indirect-block helpers -------- */
@@ -880,6 +901,7 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
             size_t cur_end = f->pos + written;
             if (cur_end > h->node.size) h->node.size = (uint32_t)cur_end;
             h->node.mtime = tfs_now_secs();
+            handle_refresh_foreign(fs, h);   /* Phase G: keep nlink/mode */
             int crc = write_inode(fs, h->ino, &h->node);
             if (crc != VFS_OK) { journal_abort(fs); return crc; }
             crc = journal_commit(fs);
@@ -945,6 +967,7 @@ flush:
         size_t newend = f->pos + written;
         if (newend > h->node.size) h->node.size = (uint32_t)newend;
         h->node.mtime = tfs_now_secs();
+        handle_refresh_foreign(fs, h);       /* Phase G: keep nlink/mode */
         int rc = write_inode(fs, h->ino, &h->node);
         if (rc != VFS_OK) { journal_abort(fs); return rc; }
         rc = journal_commit(fs);
@@ -1257,6 +1280,7 @@ static int tobyfs_ftruncate(struct vfs_file *f, uint64_t length) {
     if (length == 0) inode_free_blocks(fs, &h->node);
     h->node.size  = (uint32_t)length;
     h->node.mtime = tfs_now_secs();
+    handle_refresh_foreign(fs, h);           /* Phase G: keep nlink/mode */
     int rc = write_inode(fs, h->ino, &h->node);
     if (rc != VFS_OK) { journal_abort(fs); return rc; }
     return journal_commit(fs);
@@ -1300,7 +1324,18 @@ static int tobyfs_unlink(void *mnt, const char *path) {
 
     struct tfs_inode_disk cnode;
     rc = read_inode(fs, cino, &cnode);
-    if (rc != VFS_OK) return rc;
+    if (rc != VFS_OK) {
+        /* Orphan dirent: the name exists but its inode is freed. Historic
+         * corruption can mint these (the pre-Phase-G handle flush reverted
+         * nlink, so unlink freed an inode that another name still pointed
+         * at). Refusing here made the name UNREMOVABLE -- every later
+         * create at it answered EEXIST forever. Remove the entry, free
+         * nothing. */
+        journal_begin(fs);
+        rc = dir_remove(fs, pino, &pnode, leaf);
+        if (rc != VFS_OK) { journal_abort(fs); return rc; }
+        return journal_commit(fs);
+    }
 
     /* Empty directories are removable; non-empty ones are refused (we
      * don't do recursive rm in this milestone). */
@@ -1310,12 +1345,54 @@ static int tobyfs_unlink(void *mnt, const char *path) {
 
     journal_begin(fs);
 
-    inode_free_blocks(fs, &cnode);
-    cnode.type = TFS_TYPE_FREE;
-    cnode.size = 0;
-    (void)write_inode(fs, cino, &cnode);
-    (void)free_inode(fs, cino);
+    /* Phase G: unlink removes a NAME; the inode dies only with its last
+     * one. Before hard links existed nlink was always 1 and this branch
+     * never mattered -- now `ln a b; rm a` must leave b's data intact. */
+    if (cnode.type != TFS_TYPE_DIR && cnode.nlink > 1) {
+        cnode.nlink--;
+        (void)write_inode(fs, cino, &cnode);
+    } else {
+        inode_free_blocks(fs, &cnode);
+        cnode.type = TFS_TYPE_FREE;
+        cnode.size = 0;
+        (void)write_inode(fs, cino, &cnode);
+        (void)free_inode(fs, cino);
+    }
     rc = dir_remove(fs, pino, &pnode, leaf);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+    return journal_commit(fs);
+}
+
+/* Phase G: hard link -- a second directory entry for oldpath's inode.
+ * Directories are refused (Linux: EPERM; loops in a format with no
+ * d_parent recovery would be unrecoverable). Modelled on tobyfs_create
+ * with the inode allocation replaced by an nlink bump. */
+static int tobyfs_link(void *mnt, const char *oldpath, const char *newpath) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint32_t sino;
+    struct tfs_inode_disk snode;
+    int rc = path_walk(fs, oldpath, &sino, &snode);
+    if (rc != VFS_OK) return rc;
+    if (snode.type == TFS_TYPE_DIR) return VFS_ERR_NOTPERM;
+
+    char parent[VFS_PATH_MAX], leaf[TFS_NAME_MAX + 1];
+    rc = split_parent_leaf(newpath, parent, leaf);
+    if (rc != VFS_OK) return rc;
+    uint32_t pino;
+    struct tfs_inode_disk pnode;
+    rc = path_walk(fs, parent, &pino, &pnode);
+    if (rc != VFS_OK) return rc;
+    if (pnode.type != TFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+
+    uint32_t existing;
+    if (dir_lookup(fs, &pnode, leaf, &existing) == VFS_OK)
+        return VFS_ERR_EXIST;
+
+    journal_begin(fs);
+    snode.nlink = (uint16_t)(snode.nlink ? snode.nlink + 1 : 2);
+    rc = write_inode(fs, sino, &snode);
+    if (rc != VFS_OK) { journal_abort(fs); return rc; }
+    rc = dir_insert(fs, pino, &pnode, sino, leaf);
     if (rc != VFS_OK) { journal_abort(fs); return rc; }
     return journal_commit(fs);
 }
@@ -1370,14 +1447,20 @@ static int tobyfs_rename(void *mnt, const char *oldpath, const char *newpath) {
 
     journal_begin(fs);
 
-    /* Replace: free the old destination inode + drop its dirent. */
+    /* Replace: drop the clobbered destination NAME; its inode dies only if
+     * this was the last link to it (Phase G -- same rule as unlink). */
     if (drc == VFS_OK) {
         struct tfs_inode_disk dnode;
         if (read_inode(fs, dst_ino, &dnode) == VFS_OK) {
-            inode_free_blocks(fs, &dnode);
-            dnode.type = TFS_TYPE_FREE; dnode.size = 0;
-            (void)write_inode(fs, dst_ino, &dnode);
-            (void)free_inode(fs, dst_ino);
+            if (dnode.type != TFS_TYPE_DIR && dnode.nlink > 1) {
+                dnode.nlink--;
+                (void)write_inode(fs, dst_ino, &dnode);
+            } else {
+                inode_free_blocks(fs, &dnode);
+                dnode.type = TFS_TYPE_FREE; dnode.size = 0;
+                (void)write_inode(fs, dst_ino, &dnode);
+                (void)free_inode(fs, dst_ino);
+            }
         }
         rc = dir_remove(fs, new_pino, &new_pnode, np_leaf);
         if (rc != VFS_OK && rc != VFS_ERR_NOENT) { journal_abort(fs); return rc; }
@@ -1497,6 +1580,7 @@ static const struct vfs_ops tobyfs_ops = {
     .utimes   = tobyfs_utimes,   /* slice 6 */
     .truncate = tobyfs_truncate, /* slice 6 */
     .ftruncate= tobyfs_ftruncate,/* slice 6 */
+    .link     = tobyfs_link,     /* Phase G: hard links */
 };
 
 /* M28E: identification helper used by sys_fs_check() to recognise

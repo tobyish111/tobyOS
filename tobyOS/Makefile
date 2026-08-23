@@ -3204,6 +3204,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-thread2 (de_thread + pshared + robust)"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-thread2";                     \
 	fi;                                                                   \
+	if [ -f programs/linux-fs2/linux-fs2.elf ]; then                       \
+	    cp programs/linux-fs2/linux-fs2.elf                                \
+	         $(INITRD_STAGE)/bin/linux-fs2;                                \
+	    echo "[initrd] staged linux-fs2 (writable root + hard links)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fs2";                         \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

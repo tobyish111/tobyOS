@@ -333,3 +333,42 @@ directly and the shared-OFD position load silently overwrote it (read 0
 bytes at EOF while claiming to advance the caller's offset). Test lesson in
 linux-io: a wait that must span signal deliveries cannot be one usleep —
 the first delivery returns it early; sleep in slices against the clock.
+
+### 2026-08-22 — Phase E: xattrs + struct file learns its path (2262f4d, lxposix 21/21)
+`struct file.open_path` (stamped at sys_open's mint, cloned on dup/fork,
+freed at close) turned out to be ONE missing identity behind THREE
+separately-recorded findings, and all closed together: /proc/<pid>/fd
+readlink (answered "/" forever), the f* xattr forms (cp -a's actual
+calls), and glibc fexecve — execveat is an authoritative ENOSYS BY
+DESIGN, which routes glibc onto its execve("/proc/self/fd/N") fallback,
+and that path resolves now (procfs stats fd links as symlinks; exec's
+vfs_follow_link chases the answer). Bonus: fd-addressed IN_MODIFY emits.
+xattrs: src/xattr.c, path-keyed store, user.* only; unlink forgets,
+rename re-keys (directory-prefix aware); honesty contract in the file
+header (tmpfs = real Linux semantics; tobyfs survives rename/unlink
+within a boot, not across — chosen over failing every cp -a). mknod
+creates S_IFREG for real, EPERM for the rest. Test trap recorded: the
+harness spawns with a BARE argv[0]; self-reopening tests need /bin paths.
+
+### 2026-08-22 — Phase F: de_thread + pshared futexes + robust mutexes (926ff61, 22/22)
+proc_reap_group_threads() factored from proc_exit; sys_execve reaps the
+group at its point of no return (image read OK — where the setuid
+transition already sits). PROCESS_SHARED futexes key by (0, physaddr)
+via vmm_translate_root (new explicit-root, BKL-free walk that also
+reports PTE_SHARED_SW); FUTEX_PRIVATE_FLAG ops skip the walk; the
+futex_fast WAKE arm keys identically or cross-process wakes die in the
+fast path. set_robust_list stored NOTHING before; futex_robust_exit
+walks the glibc list at every death site (exit, both group-reap loops,
+exec), stamps FUTEX_OWNER_DIED, wakes one waiter under both keys.
+
+TWO OLDER FORK LIES fell to the test: (1) sys_mmap's EAGER anon commit
+dropped VMM_SHARED — anon-MAP_SHARED pages CoW'd apart at fork (demand
+path was fixed in slice 22; small mappings never take it) — the child's
+mutex lock landed in a private copy; (2) the clone process-fork arm
+dropped CHILD_SETTID/CLEARTID, and glibc fork() IS
+clone(CHILD_SETTID|CHILD_CLEARTID, &THREAD_SELF->tid) — every forked
+child computed with its PARENT's cached tid. Staged like clone_ns_flags,
+consumed at EMBRYO, stamped by fork_child_entry IN THE CHILD'S CONTEXT
+(a parent-side write lands in the CoW-shared frame). Diagnostic method
+that cracked it: a 4-line shared-write probe in the test separated
+"memory not shared" from "futex keys not matching" in one boot.

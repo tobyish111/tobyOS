@@ -112,6 +112,7 @@ enum vfs_type {
 
 #define VFS_SYMLINK_MAX   8   /* max symlink hops before ELOOP */
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
+#define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
 
 struct vfs_stat {
     enum vfs_type type;
@@ -219,6 +220,10 @@ struct vfs_ops {
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops
      * the entry; the underlying state is leaked. */
     int  (*umount)  (void *mnt);
+    /* Phase G (optional): create a HARD link -- a second directory entry
+     * for oldpath's inode, within this mount. NULL => vfs_link answers
+     * VFS_ERR_ROFS (the filesystem has no inode indirection to link). */
+    int  (*link)    (void *mnt, const char *oldpath, const char *newpath);
 };
 
 /* Per-handle state. The driver stuffs whatever it likes into `priv`
@@ -374,6 +379,10 @@ long vfs_read    (struct vfs_file *f, void *buf, size_t n);
 long vfs_write   (struct vfs_file *f, const void *buf, size_t n);
 int  vfs_create  (const char *path);
 int  vfs_unlink  (const char *path);
+/* Phase G: hard link newpath -> oldpath's inode. Both paths must resolve
+ * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the
+ * filesystem has no ->link. */
+int  vfs_link    (const char *oldpath, const char *newpath);
 /* Slice 127: remove a path and, if it is a directory, everything under it.
  * `force` ignores missing paths. `failed` (may be NULL) receives the path of
  * the first entry that could not be removed, so callers can report something

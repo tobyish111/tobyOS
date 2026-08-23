@@ -125,6 +125,7 @@ extern "C" {
 #define ABI_ENODEV          19   /* no such device / unknown filesystem type */
 #define ABI_ENODATA         61   /* no such extended attribute (Linux ENODATA) */
 #define ABI_ENOTSUP         95   /* operation not supported (EOPNOTSUPP) */
+#define ABI_EXDEV           18   /* hard link across filesystems */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)

@@ -7798,6 +7798,11 @@ void _start(void) {
              * silent no-op; EOWNERDEAD never happened). */
             { "/bin/linux-thread2", "linux-thread2", 0, 63,
               "exec de_thread + pshared futex + robust mutexes" },
+            /* Phase G: the root accepts new files/dirs (Linux initramfs
+             * is writable; ours wasn't), and tobyfs hard links -- the
+             * on-disk nlink existed since the format was born, unread. */
+            { "/bin/linux-fs2", "linux-fs2", 0, 63,
+              "writable root + hard links" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
