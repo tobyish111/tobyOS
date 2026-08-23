@@ -1,0 +1,15 @@
+/* glibc resolves vDSO symbols WITH VERSION "LINUX_2.6" -- an unversioned
+ * export is invisible to _dl_vdso_vsym and the fallback syscall path is
+ * silently kept. Everything not named here stays local. */
+LINUX_2.6 {
+    global:
+        __vdso_clock_gettime;
+        __vdso_gettimeofday;
+        __vdso_time;
+        __vdso_getcpu;
+        clock_gettime;
+        gettimeofday;
+        time;
+        getcpu;
+    local: *;
+};
