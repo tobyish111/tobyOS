@@ -7808,6 +7808,10 @@ void _start(void) {
              * with NO LD_LIBRARY_PATH for the first time. */
             { "/bin/linux-ldso", "linux-ldso", 0, 3,
               "ld.so.cache ends the LD_LIBRARY_PATH era" },
+            /* Phase H: SysV sem + msg (shm existed; these were census
+             * gaps). SEM_UNDO asserted by dying-holder release. */
+            { "/bin/linux-sysv", "linux-sysv", 0, 63,
+              "SysV semaphores + message queues" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

@@ -327,6 +327,10 @@ static void close_all_fds(struct proc *p) {
       fl_release_proc(p); }
     { extern void ptimer_release_proc(int pid);
       ptimer_release_proc(p->is_thread ? p->tgid : p->pid); }
+    /* Phase H: apply SEM_UNDO -- a crashed semaphore holder must release
+     * what it held or every sibling deadlocks (the flag's whole point). */
+    { extern void sysv_release_proc(int tgid);
+      sysv_release_proc(p->is_thread ? p->tgid : p->pid); }
     for (int i = 0; i < PROC_NFDS; i++) {
         if (p->fds[i]) {
             file_close(p->fds[i]);

@@ -54,6 +54,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/flock.h>     /* POSIX record locks + flock (2026-08-22) */
 #include <tobyos/xattr.h>     /* extended attributes, user.* (Phase E) */
+#include <tobyos/sysvipc.h>   /* SysV sem + msg (Phase H) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
@@ -5506,6 +5507,9 @@ enum {
     LX_listxattr = 194, LX_llistxattr = 195, LX_flistxattr = 196,
     LX_removexattr = 197, LX_lremovexattr = 198, LX_fremovexattr = 199,
     LX_mknod = 133, LX_mknodat = 259, LX_execveat = 322,
+    /* Phase H: SysV semaphores + message queues (shm was Tier 2.5). */
+    LX_semget = 64, LX_semop = 65, LX_semctl = 66, LX_semtimedop = 220,
+    LX_msgget = 68, LX_msgsnd = 69, LX_msgrcv = 70, LX_msgctl = 71,
 };
 
 /* arch_prctl codes. */
@@ -11437,6 +11441,38 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return sys_shmdt((uint64_t)a1);
     case LX_shmctl:
         return sys_shmctl((int)a1, (int)a2, (void *)(uintptr_t)a3);
+
+    /* Phase H: the other two SysV IPC families (src/sysvipc.c). shm has
+     * existed since MIT-SHM; sem and msg fell through to the census.
+     * PostgreSQL/Apache serialize on semaphore sets with SEM_UNDO. */
+    case LX_semget:
+        return sysv_semget((int)a1, (int)a2, (int)a3);
+    case LX_semop:
+        return sysv_semop((int)a1, (uint64_t)a2, (int)a3, 0);
+    case LX_semtimedop: {
+        uint64_t deadline = 0;
+        if (a4) {
+            struct lx_timespec ts;
+            if (copy_from_user(&ts, (const void *)(uintptr_t)a4,
+                               sizeof ts) != 0)
+                return -ABI_EFAULT;
+            deadline = perf_now_ns() + (uint64_t)ts.tv_sec * 1000000000ull
+                     + (uint64_t)ts.tv_nsec;
+            if (deadline == 0) deadline = 1;
+        }
+        return sysv_semop((int)a1, (uint64_t)a2, (int)a3, deadline);
+    }
+    case LX_semctl:
+        return sysv_semctl((int)a1, (int)a2, (int)a3, (uint64_t)a4);
+    case LX_msgget:
+        return sysv_msgget((int)a1, (int)a2);
+    case LX_msgsnd:
+        return sysv_msgsnd((int)a1, (uint64_t)a2, (size_t)a3, (int)a4);
+    case LX_msgrcv:
+        return sysv_msgrcv((int)a1, (uint64_t)a2, (size_t)a3, (long)a4,
+                           (int)a5);
+    case LX_msgctl:
+        return sysv_msgctl((int)a1, (int)a2, (uint64_t)a3);
 
     /* prlimit64(pid, resource, *new, *old) and the legacy getrlimit/setrlimit.
      * glibc reads RLIMIT_STACK at startup (to size the main+default thread

@@ -126,6 +126,8 @@ extern "C" {
 #define ABI_ENODATA         61   /* no such extended attribute (Linux ENODATA) */
 #define ABI_ENOTSUP         95   /* operation not supported (EOPNOTSUPP) */
 #define ABI_EXDEV           18   /* hard link across filesystems */
+#define ABI_ENOMSG          42   /* no message of desired type (msgrcv) */
+#define ABI_EIDRM           43   /* IPC id was removed */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)

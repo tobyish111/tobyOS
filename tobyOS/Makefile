@@ -180,6 +180,7 @@ C_SRCS := src/kernel.c \
           src/flock.c \
           src/ptimer.c \
           src/xattr.c \
+          src/sysvipc.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -3217,6 +3218,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	         $(INITRD_STAGE)/bin/linux-ldso;                               \
 	    echo "[initrd] staged linux-ldso (ld.so.cache proof)";             \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ldso";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sysv/linux-sysv.elf ]; then                     \
+	    cp programs/linux-sysv/linux-sysv.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sysv;                               \
+	    echo "[initrd] staged linux-sysv (SysV sem + msg)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sysv";                        \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
