@@ -1064,6 +1064,20 @@ int vfs_link(const char *oldpath, const char *newpath) {
     return rc;
 }
 
+/* Phase H: real per-mount statistics. A driver without the op gets
+ * honest zeros -- df shows a filesystem it cannot size, not a
+ * fabricated 4 GiB tmpfs. */
+int vfs_statfs(const char *path, struct vfs_statfs *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    const char *rel; struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return VFS_ERR_NOMOUNT;
+    memset(out, 0, sizeof *out);
+    out->bsize   = 4096;
+    out->namelen = 255;
+    if (m->ops->statfs) return m->ops->statfs(m->data, out);
+    return VFS_OK;
+}
+
 int vfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return VFS_ERR_INVAL;
     const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);

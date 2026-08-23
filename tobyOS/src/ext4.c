@@ -1637,6 +1637,73 @@ static int ext4_unlink(void *mnt, const char *path) {
     return txn_finish(fs, do_unlink(fs, path));
 }
 
+/* Phase H: rename, journalled like every other mutation here. Same
+ * stated scope as ext2's: directories rename only within their parent
+ * (a cross-directory move leaves the child's ".." stale, and silently
+ * corrupting a foreign filesystem is worse than refusing); files move
+ * freely, clobbering a destination file the way rename(2) requires. */
+static int do_rename(struct ext4 *fs, const char *oldpath,
+                     const char *newpath) {
+    uint32_t src_ino; uint8_t src_ft;
+    int rc = path_to_inode(fs, oldpath, &src_ino, &src_ft);
+    if (rc != VFS_OK) return rc;
+    uint32_t op_ino, np_ino;
+    char op_leaf[VFS_NAME_MAX], np_leaf[VFS_NAME_MAX];
+    rc = path_parent(fs, oldpath, &op_ino, op_leaf, sizeof op_leaf);
+    if (rc != VFS_OK) return rc;
+    rc = path_parent(fs, newpath, &np_ino, np_leaf, sizeof np_leaf);
+    if (rc != VFS_OK) return rc;
+    if (src_ft == EXT4_FT_DIR && op_ino != np_ino) return VFS_ERR_INVAL;
+
+    uint32_t dst_ino; uint8_t dst_ft;
+    int drc = path_to_inode(fs, newpath, &dst_ino, &dst_ft);
+    if (drc == VFS_OK) {
+        if (dst_ino == src_ino) return VFS_OK;
+        if (dst_ft == EXT4_FT_DIR) return VFS_ERR_INVAL;
+        rc = do_unlink(fs, newpath);
+        if (rc != VFS_OK) return rc;
+    } else if (drc != VFS_ERR_NOENT) {
+        return drc;
+    }
+    rc = dir_add_entry(fs, np_ino, np_leaf, src_ino, src_ft);
+    if (rc != VFS_OK) return rc;
+    return dir_remove_entry(fs, op_ino, op_leaf);
+}
+
+static int ext4_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    txn_begin(fs);
+    return txn_finish(fs, do_rename(fs, oldpath, newpath));
+}
+
+/* Phase H: real statistics -- sum the group descriptors' free counters
+ * (the same numbers the allocators maintain). */
+static int ext4_statfs(void *mnt, struct vfs_statfs *out) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    uint64_t bfree = 0, ifree = 0;
+    for (uint32_t g = 0; g < fs->group_count; g++) {
+        struct ext4_group_desc_32 *gd = group_desc_mut(fs, g);
+        uint64_t bf = gd->bg_free_blocks_count_lo;
+        uint64_t inf = gd->bg_free_inodes_count_lo;
+        if (fs->desc_64bit && fs->desc_size >= 64) {
+            bf  |= ((uint64_t)((struct ext4_group_desc_64 *)gd)
+                        ->bg_free_blocks_count_hi) << 16;
+            inf |= ((uint64_t)((struct ext4_group_desc_64 *)gd)
+                        ->bg_free_inodes_count_hi) << 16;
+        }
+        bfree += bf;
+        ifree += inf;
+    }
+    out->bsize      = fs->block_size;
+    out->blocks     = fs->total_blocks;
+    out->bfree      = bfree;
+    out->files      = fs->total_inodes;
+    out->ffree      = ifree;
+    out->type_magic = 0xEF53;               /* EXT4_SUPER_MAGIC */
+    out->namelen    = 255;
+    return VFS_OK;
+}
+
 static int do_mkdir(struct ext4 *fs, const char *path,
                     uint32_t uid, uint32_t gid, uint32_t mode) {
     uint32_t parent_ino;
@@ -1845,6 +1912,7 @@ static const struct vfs_ops ext4_ops = {
     .write    = ext4_write,
     .create   = ext4_create,
     .unlink   = ext4_unlink,
+    .rename   = ext4_rename,   /* Phase H */
     .mkdir    = ext4_mkdir,
     .opendir  = ext4_opendir,
     .closedir = ext4_closedir,
@@ -1852,6 +1920,7 @@ static const struct vfs_ops ext4_ops = {
     .stat     = ext4_stat,
     .chmod    = NULL,
     .chown    = NULL,
+    .statfs   = ext4_statfs,   /* Phase H */
 };
 
 /* ---- probe + mount entry points ---- */

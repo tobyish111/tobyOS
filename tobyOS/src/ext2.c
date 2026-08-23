@@ -993,6 +993,42 @@ static int ext2_unlink(void *mnt, const char *path) {
     return VFS_OK;
 }
 
+/* Phase H: rename within the mount, dirent-level -- add the new name
+ * for the same inode, drop the old, unlinking a clobbered destination
+ * the way rename(2) requires. leveldb/SQLite rename a temp file over a
+ * live one constantly; on ext volumes that answered ROFS forever.
+ * SCOPE, stated: a DIRECTORY may only be renamed within its parent --
+ * moving one across directories would leave its ".." entry pointing at
+ * the old parent, and silently corrupting a foreign filesystem's tree
+ * is worse than refusing. Files move freely. */
+static int ext2_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint32_t src_ino; uint8_t src_ft;
+    int rc = path_to_inode(fs, oldpath, &src_ino, &src_ft);
+    if (rc != VFS_OK) return rc;
+    uint32_t op_ino, np_ino;
+    char op_leaf[VFS_NAME_MAX], np_leaf[VFS_NAME_MAX];
+    rc = path_parent(fs, oldpath, &op_ino, op_leaf, sizeof op_leaf);
+    if (rc != VFS_OK) return rc;
+    rc = path_parent(fs, newpath, &np_ino, np_leaf, sizeof np_leaf);
+    if (rc != VFS_OK) return rc;
+    if (src_ft == EXT4_FT_DIR && op_ino != np_ino) return VFS_ERR_INVAL;
+
+    uint32_t dst_ino; uint8_t dst_ft;
+    int drc = path_to_inode(fs, newpath, &dst_ino, &dst_ft);
+    if (drc == VFS_OK) {
+        if (dst_ino == src_ino) return VFS_OK;   /* same file: no-op */
+        if (dst_ft == EXT4_FT_DIR) return VFS_ERR_INVAL;
+        rc = ext2_unlink(mnt, newpath);
+        if (rc != VFS_OK) return rc;
+    } else if (drc != VFS_ERR_NOENT) {
+        return drc;
+    }
+    rc = dir_add_entry(fs, np_ino, np_leaf, src_ino, src_ft);
+    if (rc != VFS_OK) return rc;
+    return dir_remove_entry(fs, op_ino, op_leaf);
+}
+
 static int ext2_mkdir(void *mnt, const char *path,
                       uint32_t uid, uint32_t gid, uint32_t mode) {
     struct ext2 *fs = (struct ext2 *)mnt;
@@ -1253,6 +1289,28 @@ static int ext2_umount(void *mnt) {
     return VFS_OK;
 }
 
+/* Phase H: real numbers from the group descriptors -- the same free
+ * counters the allocators maintain, summed. */
+static int ext2_statfs(void *mnt, struct vfs_statfs *out) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint64_t bfree = 0, ifree = 0;
+    for (uint32_t g = 0; g < fs->group_count; g++) {
+        struct ext4_group_desc_32 *gd =
+            (struct ext4_group_desc_32 *)(fs->gdt_buf +
+                                          (uint64_t)g * fs->desc_size);
+        bfree += gd->bg_free_blocks_count_lo;
+        ifree += gd->bg_free_inodes_count_lo;
+    }
+    out->bsize      = fs->block_size;
+    out->blocks     = fs->total_blocks;
+    out->bfree      = bfree;
+    out->files      = fs->total_inodes;
+    out->ffree      = ifree;
+    out->type_magic = 0xEF53;               /* EXT4_SUPER_MAGIC */
+    out->namelen    = 255;
+    return VFS_OK;
+}
+
 /* ---- vfs_ops table ---- */
 
 const struct vfs_ops ext2_ops = {
@@ -1262,6 +1320,7 @@ const struct vfs_ops ext2_ops = {
     .write    = ext2_write,
     .create   = ext2_create,
     .unlink   = ext2_unlink,
+    .rename   = ext2_rename,   /* Phase H */
     .mkdir    = ext2_mkdir,
     .opendir  = ext2_opendir,
     .closedir = ext2_closedir,
@@ -1270,6 +1329,7 @@ const struct vfs_ops ext2_ops = {
     .chmod    = ext2_chmod,
     .chown    = ext2_chown,
     .umount   = ext2_umount,
+    .statfs   = ext2_statfs,   /* Phase H */
 };
 
 struct blk_dev *ext2_blkdev_of(void *mnt) {

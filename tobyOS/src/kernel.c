@@ -7812,6 +7812,11 @@ void _start(void) {
              * gaps). SEM_UNDO asserted by dying-holder release. */
             { "/bin/linux-sysv", "linux-sysv", 0, 63,
               "SysV semaphores + message queues" },
+            /* Phase H: statfs stops fabricating -- per-fs real numbers
+             * (tobyfs bitmaps, tmpfs budget, ramfs image), and they MOVE
+             * when bytes are written. */
+            { "/bin/linux-stat", "linux-stat", 0, 15,
+              "statfs tells the truth" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

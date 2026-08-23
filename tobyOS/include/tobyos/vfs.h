@@ -161,6 +161,7 @@ struct vfs_dirent {
  * `priv` slot; everything else is bookkeeping the VFS owns. */
 struct vfs_file;
 struct vfs_dir;
+struct vfs_statfs;          /* defined below (Phase H) */
 
 struct vfs_ops {
     int  (*open)    (void *mnt, const char *path, struct vfs_file *out);
@@ -224,6 +225,23 @@ struct vfs_ops {
      * for oldpath's inode, within this mount. NULL => vfs_link answers
      * VFS_ERR_ROFS (the filesystem has no inode indirection to link). */
     int  (*link)    (void *mnt, const char *oldpath, const char *newpath);
+    /* Phase H (optional): real filesystem statistics. NULL => vfs_statfs
+     * reports honest zeros (namelen aside) instead of the fabricated
+     * 4 GiB tmpfs every mount used to claim. */
+    int  (*statfs)  (void *mnt, struct vfs_statfs *out);
+};
+
+/* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
+ * counts in bsize units; a driver reports what it truly knows and
+ * leaves the rest zero. */
+struct vfs_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t files;
+    uint64_t ffree;
+    uint32_t type_magic;    /* Linux f_type value (TMPFS_MAGIC etc.) */
+    uint32_t namelen;
 };
 
 /* Per-handle state. The driver stuffs whatever it likes into `priv`
@@ -383,6 +401,9 @@ int  vfs_unlink  (const char *path);
  * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the
  * filesystem has no ->link. */
 int  vfs_link    (const char *oldpath, const char *newpath);
+/* Phase H: real statfs for the mount containing `path`. Always succeeds
+ * for a resolvable path; drivers without ->statfs report honest zeros. */
+int  vfs_statfs  (const char *path, struct vfs_statfs *out);
 /* Slice 127: remove a path and, if it is a directory, everything under it.
  * `force` ignores missing paths. `failed` (may be NULL) receives the path of
  * the first entry that could not be removed, so callers can report something

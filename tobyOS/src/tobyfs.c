@@ -1560,7 +1560,30 @@ static int tobyfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_OK;
 }
 
-static const struct vfs_ops tobyfs_ops = {
+static /* Phase H: real statistics from the live bitmaps -- what df/statvfs and
+ * every "is there room?" preflight actually wants. Data blocks only
+ * (metadata blocks are not usable space and Linux filesystems exclude
+ * them from f_blocks the same way). */
+static int tobyfs_statfs(void *mnt, struct vfs_statfs *out) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    uint64_t data_total = 0, data_free = 0, ino_free = 0;
+    for (uint32_t b = fs->sb.data_blk_start; b < fs->sb.total_blocks; b++) {
+        data_total++;
+        if (!bit_get(fs->dbitmap, b)) data_free++;
+    }
+    for (uint32_t i = 1; i < fs->sb.inode_count; i++)
+        if (!bit_get(fs->ibitmap, i)) ino_free++;
+    out->bsize      = TFS_BLOCK_SIZE;
+    out->blocks     = data_total;
+    out->bfree      = data_free;
+    out->files      = fs->sb.inode_count;
+    out->ffree      = ino_free;
+    out->type_magic = 0x746f6279;            /* 'toby' */
+    out->namelen    = TFS_NAME_MAX;
+    return VFS_OK;
+}
+
+const struct vfs_ops tobyfs_ops = {
     .open     = tobyfs_open,
     .close    = tobyfs_close,
     .read     = tobyfs_read,
@@ -1581,6 +1604,7 @@ static const struct vfs_ops tobyfs_ops = {
     .truncate = tobyfs_truncate, /* slice 6 */
     .ftruncate= tobyfs_ftruncate,/* slice 6 */
     .link     = tobyfs_link,     /* Phase G: hard links */
+    .statfs   = tobyfs_statfs,   /* Phase H: real numbers for df */
 };
 
 /* M28E: identification helper used by sys_fs_check() to recognise

@@ -814,6 +814,23 @@ static int ramfs_mkdir(void *mnt, const char *path,
     return VFS_OK;
 }
 
+/* Phase H: honest numbers for the initrd view -- the image is the
+ * "disk", the spillover table is the only growth room. */
+static int ramfs_statfs(void *mnt, struct vfs_statfs *out) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    size_t free_slots = RAMFS_EXTRA_MAX - g_extra_count;
+    for (size_t i = 0; i < g_extra_count; i++)
+        if (g_extra[i].dead && g_extra[i].open_refs == 0) free_slots++;
+    out->bsize      = 4096;
+    out->blocks     = (m->image_size + 4095) / 4096;
+    out->bfree      = 0;                     /* the tar itself never grows */
+    out->files      = node_total(m);
+    out->ffree      = free_slots;
+    out->type_magic = 0x858458f6;            /* RAMFS_MAGIC */
+    out->namelen    = VFS_NAME_MAX - 1;
+    return VFS_OK;
+}
+
 const struct vfs_ops ramfs_ops = {
     .open     = ramfs_open,
     .close    = ramfs_close,
@@ -826,4 +843,5 @@ const struct vfs_ops ramfs_ops = {
     .closedir = ramfs_closedir,
     .readdir  = ramfs_readdir,
     .stat     = ramfs_stat,
+    .statfs   = ramfs_statfs,   /* Phase H */
 };

@@ -593,6 +593,25 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     return VFS_OK;
 }
 
+/* Phase H: real numbers -- the mount's byte budget and node table, not
+ * the fabricated 4 GiB every statfs caller used to see. */
+static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
+{
+    struct tmpfs_mount *m = (struct tmpfs_mount *)mnt;
+    size_t files = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
+        if (m->nodes[i].used) files++;
+    out->bsize      = 4096;
+    out->blocks     = (m->max_bytes + 4095) / 4096;
+    out->bfree      = (m->max_bytes > m->bytes)
+                          ? (m->max_bytes - m->bytes) / 4096 : 0;
+    out->files      = TMPFS_MAX_NODES;
+    out->ffree      = TMPFS_MAX_NODES - files;
+    out->type_magic = 0x01021994;           /* TMPFS_MAGIC */
+    out->namelen    = VFS_PATH_MAX - 1;
+    return VFS_OK;
+}
+
 static const struct vfs_ops tmpfs_ops = {
     .open      = tmpfs_open,
     .close     = tmpfs_close,
@@ -613,6 +632,7 @@ static const struct vfs_ops tmpfs_ops = {
     .ftruncate = tmpfs_ftruncate,
     .readlink  = 0,
     .umount    = 0,
+    .statfs    = tmpfs_statfs,   /* Phase H */
 };
 
 /* Parse the `size=` mount option. Accepts a plain byte count or a k/m/g

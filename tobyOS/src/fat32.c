@@ -902,6 +902,25 @@ static int fat32_create(void *mnt, const char *path,
 
 /* ---- unlink ---- */
 
+/* Tombstone a short dirent plus any LFN entries directly before it in
+ * the same cluster (what fsck would do; missing LFNs are tolerated).
+ * Re-reads the cluster itself, so callers need no buffer discipline. */
+static int dirent_mark_free(struct fat32 *fs, uint32_t dc, uint32_t doff) {
+    int rc = read_cluster(fs, dc, fs->clus_buf);
+    if (rc != VFS_OK) return rc;
+    fs->clus_buf[doff] = (uint8_t)FAT_DIR_FREE;
+    int32_t pos = (int32_t)doff - 32;
+    while (pos >= 0) {
+        struct fat_dirent *prev = (struct fat_dirent *)(fs->clus_buf + pos);
+        if ((prev->attr & FAT_ATTR_LFN) != FAT_ATTR_LFN) break;
+        if (prev->name[0] == (uint8_t)FAT_DIR_FREE) break;
+        prev->name[0] = (uint8_t)FAT_DIR_FREE;
+        pos -= 32;
+    }
+    if (write_cluster(fs, dc, fs->clus_buf) != 0) return VFS_ERR_IO;
+    return VFS_OK;
+}
+
 static int fat32_unlink(void *mnt, const char *path) {
     struct fat32 *fs = (struct fat32 *)mnt;
     struct fat_dirent de;
@@ -917,26 +936,83 @@ static int fat32_unlink(void *mnt, const char *path) {
         if (rc != VFS_OK) return rc;
     }
 
-    /* Mark the short entry deleted. We also walk backward across any
-     * preceding LFN entries within the same cluster and mark them too,
-     * which is what fsck would do; missing LFN entries are tolerated.
-     */
-    rc = read_cluster(fs, dc, fs->clus_buf);
+    /* Mark the short entry deleted (factored for rename, Phase H). */
+    rc = dirent_mark_free(fs, dc, doff);
+    if (rc != VFS_OK) return rc;
+    return fat_flush(fs);
+}
+
+/* Phase H: rename within the volume. FAT has no inode indirection --
+ * a rename is "write a fresh dirent carrying the same cluster chain +
+ * size, then tombstone the old one". SCOPE, stated like ext2's: a
+ * DIRECTORY only renames within its parent (its ".." entry names the
+ * parent cluster and moving it would leave that stale); files move
+ * freely. leveldb/SQLite's temp-over-live rename works on FAT now. */
+static int fat32_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct fat32 *fs = (struct fat32 *)mnt;
+    struct fat_dirent sde;
+    uint32_t sdc = 0, sdoff = 0;
+    int rc = path_walk(fs, oldpath, &sde, &sdc, &sdoff);
     if (rc != VFS_OK) return rc;
 
-    fs->clus_buf[doff] = (uint8_t)FAT_DIR_FREE;
+    char *np = 0; const char *nleaf = 0;
+    rc = split_parent_leaf(newpath, &np, &nleaf);
+    if (rc != VFS_OK) return rc;
+    struct fat_dirent pde;
+    rc = path_walk(fs, np, &pde, 0, 0);
+    kfree(np);
+    if (rc != VFS_OK) return rc;
+    if (!(pde.attr & FAT_ATTR_DIRECTORY)) return VFS_ERR_NOTDIR;
+    uint32_t pclus = ((uint32_t)pde.fst_clus_hi << 16) | pde.fst_clus_lo;
+    if (pclus < 2) return VFS_ERR_NOENT;
 
-    /* Walk backward inside the cluster, tagging LFN entries. */
-    int32_t pos = (int32_t)doff - 32;
-    while (pos >= 0) {
-        struct fat_dirent *prev = (struct fat_dirent *)(fs->clus_buf + pos);
-        if ((prev->attr & FAT_ATTR_LFN) != FAT_ATTR_LFN) break;
-        if (prev->name[0] == (uint8_t)FAT_DIR_FREE) break;
-        prev->name[0] = (uint8_t)FAT_DIR_FREE;
-        pos -= 32;
+    char *op = 0; const char *oleaf = 0;
+    rc = split_parent_leaf(oldpath, &op, &oleaf);
+    if (rc != VFS_OK) return rc;
+    struct fat_dirent opde;
+    rc = path_walk(fs, op, &opde, 0, 0);
+    kfree(op);
+    if (rc != VFS_OK) return rc;
+    uint32_t opclus = ((uint32_t)opde.fst_clus_hi << 16) | opde.fst_clus_lo;
+    if ((sde.attr & FAT_ATTR_DIRECTORY) && opclus != pclus)
+        return VFS_ERR_INVAL;
+
+    /* Clobber an existing destination FILE, as rename(2) requires. */
+    {
+        struct fat_dirent dde;
+        uint32_t ddc = 0, ddoff = 0;
+        int drc = path_walk(fs, newpath, &dde, &ddc, &ddoff);
+        if (drc == VFS_OK) {
+            if (ddc == sdc && ddoff == sdoff) return VFS_OK;  /* same entry */
+            if (dde.attr & FAT_ATTR_DIRECTORY) return VFS_ERR_INVAL;
+            rc = fat32_unlink(mnt, newpath);
+            if (rc != VFS_OK) return rc;
+            /* The unlink rewrote directory clusters: re-walk the source
+             * so (cluster, offset) are fresh, not stale-buffer guesses. */
+            rc = path_walk(fs, oldpath, &sde, &sdc, &sdoff);
+            if (rc != VFS_OK) return rc;
+        } else if (drc != VFS_ERR_NOENT) {
+            return drc;
+        }
     }
-    rc = write_cluster(fs, dc, fs->clus_buf);
-    if (rc != 0) return VFS_ERR_IO;
+
+    uint8_t name11[11];
+    bool tilde = false;
+    (void)shortname_encode(nleaf, name11, &tilde);
+    rc = disambiguate_short(fs, pclus, name11);
+    if (rc != VFS_OK) return rc;
+    uint32_t slot_clus, slot_off;
+    rc = dir_find_free_slot(fs, pclus, &slot_clus, &slot_off);
+    if (rc != VFS_OK) return rc;
+    rc = read_cluster(fs, slot_clus, fs->clus_buf);
+    if (rc != VFS_OK) return rc;
+    struct fat_dirent *nde = (struct fat_dirent *)(fs->clus_buf + slot_off);
+    memcpy(nde, &sde, sizeof *nde);    /* same chain, size, attrs, times */
+    memcpy(nde->name, name11, 11);
+    if (write_cluster(fs, slot_clus, fs->clus_buf) != 0) return VFS_ERR_IO;
+
+    rc = dirent_mark_free(fs, sdc, sdoff);   /* re-reads: order-safe */
+    if (rc != VFS_OK) return rc;
     return fat_flush(fs);
 }
 
@@ -1068,6 +1144,26 @@ static int fat32_umount(void *mnt) {
  * FAT32 mount with `mount.ops == &fat32_ops` before reaching into the
  * mount-data via fat32_blkdev_of(). Still const -- nothing outside
  * fat32.c may mutate the table. */
+/* Phase H: real numbers from the FAT itself -- entry 0 means free.
+ * Sector-size clusters as bsize; a full FAT scan is bounded by the
+ * volume size and only runs when someone actually asks. */
+static int fat32_statfs(void *mnt, struct vfs_statfs *out) {
+    struct fat32 *fs = (struct fat32 *)mnt;
+    uint64_t freec = 0;
+    for (uint32_t c = 2; c < fs->cluster_count + 2; c++) {
+        uint32_t v;
+        if (fat_get(fs, c, &v) == VFS_OK && v == 0) freec++;
+    }
+    out->bsize      = 4096;                  /* report in 4K units */
+    out->blocks     = fs->cluster_count;     /* approx: clusters */
+    out->bfree      = freec;
+    out->files      = 0;                     /* FAT has no inode table */
+    out->ffree      = 0;
+    out->type_magic = 0x4d44;                /* MSDOS_SUPER_MAGIC */
+    out->namelen    = 255;
+    return VFS_OK;
+}
+
 const struct vfs_ops fat32_ops = {
     .open     = fat32_open,
     .close    = fat32_close,
@@ -1075,6 +1171,7 @@ const struct vfs_ops fat32_ops = {
     .write    = fat32_write,
     .create   = fat32_create,
     .unlink   = fat32_unlink,
+    .rename   = fat32_rename,   /* Phase H */
     .mkdir    = fat32_mkdir,
     .opendir  = fat32_opendir,
     .closedir = fat32_closedir,

@@ -12104,20 +12104,41 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 
     case LX_statfs:                          /* (path, buf) */
     case LX_fstatfs: {                        /* (fd, buf) -- buf is a2 in both */
+        /* Phase H: REAL numbers. This arm fabricated a 4 GiB tmpfs for
+         * every mount since it was written -- df agreed with nothing,
+         * and "is there room?" preflights (pip, package managers)
+         * happily started writes a full /data could not take. */
         struct lx_statfs {
             long f_type, f_bsize, f_blocks, f_bfree, f_bavail;
             long f_files, f_ffree; unsigned long f_fsid;
             long f_namelen, f_frsize, f_flags, f_spare[4];
         } sf;
+        struct vfs_statfs vs;
+        char kpath[ABI_PATH_MAX];
+        if (n == LX_statfs) {
+            if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
+                return -ABI_ENOENT;
+        } else {
+            struct file *f = fd_lookup((int)a1);
+            if (!f) return -ABI_EBADF;
+            const char *p = f->open_path;
+            if (!p && f->kind == FILE_KIND_DIR) p = f->dirpath;
+            if (!p) p = "/";       /* pathless kind: root numbers */
+            size_t pl = strlen(p);
+            if (pl >= sizeof kpath) return -ABI_ENAMETOOLONG;
+            memcpy(kpath, p, pl + 1);
+        }
+        int rc = vfs_statfs(kpath, &vs);
+        if (rc != VFS_OK) return vfs_err_to_abi(rc);
         memset(&sf, 0, sizeof sf);
-        sf.f_type    = 0x01021994;           /* TMPFS_MAGIC */
-        sf.f_bsize   = 4096;
-        sf.f_frsize  = 4096;
-        sf.f_blocks  = 1L << 20;             /* 4 GiB of 4 KiB blocks */
-        sf.f_bfree   = sf.f_bavail = 3L << 18;
-        sf.f_files   = 1L << 20;
-        sf.f_ffree   = 1L << 19;
-        sf.f_namelen = 255;
+        sf.f_type    = (long)vs.type_magic;
+        sf.f_bsize   = (long)vs.bsize;
+        sf.f_frsize  = (long)vs.bsize;
+        sf.f_blocks  = (long)vs.blocks;
+        sf.f_bfree   = sf.f_bavail = (long)vs.bfree;
+        sf.f_files   = (long)vs.files;
+        sf.f_ffree   = (long)vs.ffree;
+        sf.f_namelen = (long)vs.namelen;
         if (a2 && copy_to_user((void *)a2, &sf, sizeof sf) != 0)
             return -ABI_EFAULT;
         return 0;
