@@ -6883,7 +6883,8 @@ static long lx_listen(int fd, int backlog) {
         return sock_unix_listen(s) == 0 ? 0 : -ABI_EINVAL;
     if (s->kind != SOCK_KIND_TCP) return -LXE_EOPNOTSUPP;
     if (s->local_port == 0)       return -ABI_EINVAL;   /* must bind first */
-    struct tcp_conn *lsn = tcp_listen(s->local_port, backlog);
+    struct tcp_conn *lsn = tcp_listen_reuse(s->local_port, backlog,
+                                            s->reuseaddr != 0);
     if (!lsn) return -LXE_EADDRINUSE;
     s->tcp = lsn;
     s->tcp_listening = true;
@@ -7133,6 +7134,9 @@ static long lx_send(int fd, uint64_t ubuf, size_t len, uint64_t uaddr) {
     }
 
     if (s->kind == SOCK_KIND_UDP) {
+        /* A pending async error (ICMP unreachable for an earlier send)
+         * is delivered on the NEXT operation and cleared, per Linux. */
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
         uint32_t dip; uint16_t dport;
         if (!lx_udp_dest(s, uaddr, &dip, &dport)) return -ABI_EINVAL;
         /* Slice 12: no interface, no route. Checked here rather than only in
@@ -7280,6 +7284,7 @@ static long lx_recv(int fd, uint64_t ubuf, size_t len, uint64_t uaddr,
     }
 
     if (s->kind == SOCK_KIND_UDP) {
+        if (s->so_error) { int e = s->so_error; s->so_error = 0; return -e; }
         if (len == 0) return 0;
         if (len > SYS_MAX_RW) len = SYS_MAX_RW;
         void *k = kmalloc(len);
@@ -7381,6 +7386,14 @@ static long lx_setsockopt(int fd, int level, int optname, uint64_t uval, uint32_
         uint32_t on = 0;
         if (uval && olen >= 4) (void)copy_from_user(&on, (const void *)(uintptr_t)uval, 4);
         s->passcred = (on != 0);
+        return 0;
+    }
+    /* SO_REUSEADDR: stored AND acted on (2026-08-22) -- listen() lets a
+     * reuse socket take a port held only by dying conns. */
+    if (optname == SO_REUSEADDR) {
+        uint32_t on = 0;
+        if (uval && olen >= 4) (void)copy_from_user(&on, (const void *)(uintptr_t)uval, 4);
+        s->reuseaddr = (on != 0);
         return 0;
     }
     if ((optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) && uval && olen >= 16) {
@@ -7511,6 +7524,16 @@ static long lx_getsockopt(int fd, int level, int optname,
     if (copy_from_user(&ulen, (const void *)(uintptr_t)ulen_ptr, 4) != 0)
         return -ABI_EFAULT;
 
+    /* SO_REUSEADDR reads back what setsockopt stored (it read 0 before,
+     * which made set-then-verify code conclude the option was broken). */
+    if (optname == SO_REUSEADDR) {
+        uint32_t v = s->reuseaddr ? 1u : 0u;
+        uint32_t n4 = ulen < 4 ? ulen : 4;
+        if (n4 && copy_to_user((void *)(uintptr_t)uval, &v, n4) != 0)
+            return -ABI_EFAULT;
+        (void)copy_to_user((void *)(uintptr_t)ulen_ptr, &n4, 4);
+        return 0;
+    }
     /* SO_RCVTIMEO/SO_SNDTIMEO answer with a struct timeval {sec, usec}. */
     if (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
         uint32_t ms = (optname == SO_RCVTIMEO) ? s->recv_timeout_ms
@@ -7581,7 +7604,12 @@ static long lx_getsockopt(int fd, int level, int optname,
  * struct iovec { void *iov_base; size_t iov_len; }        (16 bytes)
  * We implement the data path (gather/scatter + msg_name for UDP); ancillary
  * data (msg_control / SCM_RIGHTS) is not supported and is reported cleared. */
-#define LX_MSG_IOV_MAX 16
+/* 2026-08-22: 16 -> 64, and past the cap is a LOUD -EMSGSIZE rather than
+ * a silent truncation. A writev-heavy client (X11 batching, some TLS
+ * stacks) whose extra iovecs were dropped LOST DATA with a success
+ * return, which is unfindable from userspace. 64 covers every observed
+ * real caller; anything larger gets an errno it can act on. */
+#define LX_MSG_IOV_MAX 64
 
 struct lx_msghdr {
     uint64_t msg_name;
@@ -7603,7 +7631,7 @@ static long lx_read_msghdr(uint64_t umsg, struct lx_msghdr *mh,
     if (!umsg || copy_from_user(mh, (const void *)(uintptr_t)umsg, sizeof *mh) != 0)
         return -ABI_EFAULT;
     uint64_t n = mh->msg_iovlen;
-    if (n > LX_MSG_IOV_MAX) n = LX_MSG_IOV_MAX;
+    if (n > LX_MSG_IOV_MAX) return -90;   /* -EMSGSIZE: refuse, never drop */
     if (n && (!mh->msg_iov ||
               copy_from_user(iov, (const void *)(uintptr_t)mh->msg_iov,
                              (size_t)n * sizeof *iov) != 0))

@@ -11,6 +11,7 @@
 #include <tobyos/proc.h>    /* current_proc()->tcp_yield_wait (stage 12D) */
 #include <tobyos/nsproxy.h> /* net_ctx_* -- a connection sends in its own ns (cut 5) */
 #include <tobyos/percpu.h>  /* slice 56: yield-if-ready in tcp_poll_until */
+#include <tobyos/perf.h>    /* perf_now_ns: all timeouts are ns-based (2026-08-22) */
 #include <tobyos/smp.h>
 
 /* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
@@ -94,7 +95,7 @@ struct tcp_conn {
 
     /* CUBIC state */
     uint32_t     w_max;           /* cwnd before last loss (in bytes) */
-    uint64_t     epoch_start;     /* pit_ticks() at last loss event */
+    uint64_t     epoch_start;     /* perf_now_ns() at last loss event */
     uint32_t     origin_point;    /* W_max for CUBIC calculation */
     uint32_t     tcp_friendliness_cwnd; /* TCP-friendly cwnd estimate */
 
@@ -151,7 +152,7 @@ struct tcp_conn {
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
     int8_t       parent_lsn;
-    uint64_t     tw_deadline_tick;
+    uint64_t     tw_deadline_ns;
     /* Owner has abandoned this conn (tcp_close_nowait): it is only
      * running out its FIN handshake / TIME_WAIT timer, and
      * tcp_service_tick may recycle the slot. Never set while a caller
@@ -212,7 +213,7 @@ static struct tcp_conn *conn_alloc(void) {
             struct tcp_conn *v = &g_conns[i];
             if (v->state == TCP_LISTEN) continue;
             if (v->state == TCP_TIME_WAIT &&
-                (!tw || v->tw_deadline_tick < tw->tw_deadline_tick))
+                (!tw || v->tw_deadline_ns < tw->tw_deadline_ns))
                 tw = v;
             else if (v->detached && !det)
                 det = v;
@@ -509,10 +510,11 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
         uint32_t end = p->seq + (uint32_t)p->len + extra;
         if (seq_delta(ack, end) >= 0) {
             if (!sampled) {
-                uint32_t hz = pit_hz();
-                if (hz == 0) hz = 100;
-                uint64_t age_ms =
-                    ((pit_ticks() - p->sent_at) * 1000ull) / (uint64_t)hz;
+                /* 2026-08-22: ns-based. pit ticks under TCG arrive at ~1/15
+                 * of the programmed rate, so tick-derived RTT samples read
+                 * 15x SMALL and every timeout built on them ran 15x long
+                 * (measured: a "5 s" connect classified at 75651 ms). */
+                uint64_t age_ms = (perf_now_ns() - p->sent_at) / 1000000ull;
                 rto_update_on_ack(c, (uint32_t)age_ms);
                 sampled = true;
             }
@@ -665,7 +667,7 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     p->seq     = c->snd_nxt;
     p->len     = plen;
     p->xflags  = xf;
-    p->sent_at = pit_ticks();
+    p->sent_at = perf_now_ns();
     p->retries = 0;
     if (plen) memcpy(p->buf, payload, plen);
 
@@ -691,7 +693,7 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
     bool ok        = tcp_emit(c, flags, p->len ? p->buf : NULL, p->len);
     c->snd_nxt     = saved;
     if (ok) {
-        p->sent_at = pit_ticks();
+        p->sent_at = perf_now_ns();
         p->retries++;
         c->retransmit_count++;
 #ifdef CHROMIUM_BOOT
@@ -710,13 +712,10 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
 static bool tcp_tick_one(struct tcp_conn *c) {
     if (!c || !c->in_use) return true;
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-
     for (int i = 0; i < TCP_MAX_TX_PENDING; i++) {
         struct tx_pend *p = &c->pend[i];
         if (!p->used) continue;
-        uint64_t age_ms = ((pit_ticks() - p->sent_at) * 1000ull) / hz;
+        uint64_t age_ms = (perf_now_ns() - p->sent_at) / 1000000ull;
         if ((uint32_t)age_ms < c->rto_ms) continue;
         if (p->retries >= TCP_RETX_LIMIT) {
             kprintf("[tcp] retx limit (lp=%u)\n",
@@ -754,11 +753,11 @@ static void tcp_tick_all(void) {
  * slot is recycled here a couple of ticks later. */
 void tcp_service_tick(void) {
     tcp_tick_all();
-    uint64_t now = pit_ticks();
+    uint64_t now = perf_now_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
         if (!c->in_use || !c->detached) continue;   /* only orphaned conns */
-        if (c->state == TCP_TIME_WAIT && now >= c->tw_deadline_tick)
+        if (c->state == TCP_TIME_WAIT && now >= c->tw_deadline_ns)
             conn_free(c);
         else if (c->state == TCP_CLOSED)
             conn_free(c);
@@ -1058,13 +1057,8 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                      * the simple hobby-OS fallback.
                      */
                     c->state = TCP_TIME_WAIT;
-                    {
-                        uint32_t hz = pit_hz();
-                        if (hz == 0) hz = 100;
-                        c->tw_deadline_tick =
-                            pit_ticks() +
-                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
-                    }
+                    c->tw_deadline_ns =
+                        perf_now_ns() + (uint64_t)TCP_TW_MSL_MS * 1000000ull;
                     break;
                 
                 case TCP_FIN_WAIT_2:
@@ -1072,13 +1066,8 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                      * Normal active close: our FIN was ACKed, then peer sent FIN.
                      */
                     c->state = TCP_TIME_WAIT;
-                    {
-                        uint32_t hz = pit_hz();
-                        if (hz == 0) hz = 100;
-                        c->tw_deadline_tick =
-                            pit_ticks() +
-                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
-                    }
+                    c->tw_deadline_ns =
+                        perf_now_ns() + (uint64_t)TCP_TW_MSL_MS * 1000000ull;
                     break;
                 
                 default:
@@ -1123,7 +1112,7 @@ static int tcp_poll_until(struct tcp_conn *c, uint64_t deadline,
         int p = pred(c);
         if (p) return p;
         if (!tcp_tick_one(c)) return -1;
-        if (pit_ticks() >= deadline) return 0;
+        if (perf_now_ns() >= deadline) return 0;   /* deadline is NS now */
 
         /* Idle until the next interrupt. CRITICAL: drop the big kernel lock
          * across the wait. This loop backs the blocking TCP syscalls
@@ -1248,9 +1237,7 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
     struct tcp_conn *c = tcp_syn_out(dst_ip_be, dst_port_be);
     if (!c) return NULL;
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     if (tcp_poll_until(c, dl, pred_est) != 1) {
         conn_free(c);
         return NULL;
@@ -1272,9 +1259,29 @@ uint16_t tcp_remote_port_be(const struct tcp_conn *c) {
     return (c && c->in_use) ? c->remote_port_be : 0;
 }
 
-struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
+/* SO_REUSEADDR's actual meaning for a listener: conns that are merely
+ * DYING (TIME_WAIT and the rest of the close ladder) do not hold the port
+ * against a new listen. A LIVE listener or established conn still does --
+ * reuse is not steal. */
+static bool port_blocks_listen(uint16_t port_be, bool reuse) {
+    void *ns = net_current_ns();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use || c->net_ns != ns || c->local_port_be != port_be)
+            continue;
+        if (!reuse) return true;
+        if (c->state == TCP_LISTEN || c->state == TCP_ESTABLISHED ||
+            c->state == TCP_SYN_RECEIVED || c->state == TCP_SYN_SENT)
+            return true;                       /* genuinely alive */
+        /* FIN_WAIT*/ /* CLOSE_WAIT/LAST_ACK/TIME_WAIT/CLOSED: dying */
+    }
+    return false;
+}
+
+struct tcp_conn *tcp_listen_reuse(uint16_t local_port_be, int backlog,
+                                  bool reuse) {
     if (net_my_ip() == 0) return NULL;          /* cut 5: ours, not the host's */
-    if (port_in_use(local_port_be)) return NULL;
+    if (port_blocks_listen(local_port_be, reuse)) return NULL;
     struct tcp_conn *c = conn_alloc();
     if (!c) return NULL;
     c->local_port_be = local_port_be;
@@ -1291,6 +1298,10 @@ struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
             (unsigned)c->backlog_cap);
 
     return c;
+}
+
+struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
+    return tcp_listen_reuse(local_port_be, backlog, false);
 }
 
 static int pred_accept(const struct tcp_conn *lsn) {
@@ -1333,9 +1344,7 @@ int tcp_poll_flags(const struct tcp_conn *c) {
 
 struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms) {
     if (!listener || listener->state != TCP_LISTEN) return NULL;
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     if (tcp_poll_until(listener, dl, pred_accept) != 1) return NULL;
     int idx = listener->acc_q[listener->acc_head];
     listener->acc_head =
@@ -1360,13 +1369,12 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
 
     const uint8_t *p          = (const uint8_t *)buf;
     size_t         remaining  = len;
-    uint32_t       hz         = pit_hz();
-    if (hz == 0) hz = 100;
 
     while (remaining > 0) {
         while (pend_flight_bytes(c) >= c->cwnd_bytes ||
                pend_flight_bytes(c) >= (size_t)c->snd_wnd) {
-            uint64_t dl = pit_ticks() + ((uint64_t)hz * (c->rto_ms + 500u)) / 1000u;
+            uint64_t dl = perf_now_ns() +
+                          (uint64_t)(c->rto_ms + 500u) * 1000000ull;
             int r = tcp_poll_until(c, dl, pred_pend_clear);
             if (r == -1 || r == -2) {
                 if (c->remote_rst_seen) return -2;
@@ -1382,8 +1390,8 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
         remaining -= chunk;
     }
 
-    uint64_t dl =
-        pit_ticks() + ((uint64_t)hz * (TCP_RETX_LIMIT + 2u) * c->rto_ms) / 1000u;
+    uint64_t dl = perf_now_ns() +
+        (uint64_t)(TCP_RETX_LIMIT + 2u) * c->rto_ms * 1000000ull;
     int r = tcp_poll_until(c, dl, pred_pend_clear);
     if (r != 1) {
         if (c->remote_rst_seen) return -2;
@@ -1441,9 +1449,7 @@ static int pred_recv(const struct tcp_conn *c) {
 
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
     if (!c || !c->in_use || cap == 0) return -1;
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     int r = tcp_poll_until(c, dl, pred_recv);
     if (r == -2) return -2;
     if (r == -1) {
@@ -1591,13 +1597,11 @@ void tcp_close(struct tcp_conn *c) {
         return;
     }
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + hz * 5u;
+    uint64_t dl = perf_now_ns() + 5000000000ull;
     (void)tcp_poll_until(c, dl, pred_closed_basic);
 
     if (c->in_use && c->state == TCP_TIME_WAIT) {
-        while (pit_ticks() < c->tw_deadline_tick) {
+        while (perf_now_ns() < c->tw_deadline_ns) {
             struct net_dev *nd = net_default();
             if (nd && nd->rx_drain) nd->rx_drain(nd);
             tcp_tick_all();
@@ -1689,18 +1693,20 @@ void tcp_congestion_on_ack(struct tcp_conn *c, uint32_t bytes_acked) {
         c->cwnd_bytes += bytes_acked;
         if (c->cwnd_bytes >= c->ssthresh) {
             c->in_slow_start = 0;
-            c->epoch_start = pit_ticks();
+            c->epoch_start = perf_now_ns();
         }
         return;
     }
 
     /* CUBIC congestion avoidance */
-    uint64_t now = pit_ticks();
+    uint64_t now = perf_now_ns();
     if (c->epoch_start == 0) c->epoch_start = now;
 
-    /* Time since epoch in milliseconds (PIT at ~1000 Hz) */
-    uint64_t elapsed_ticks = now - c->epoch_start;
-    uint32_t elapsed_ms = (uint32_t)(elapsed_ticks);
+    /* Time since epoch in ms -- ns-clocked (2026-08-22): the old
+     * ticks-as-ms read ~15x slow under TCG, so the cubic window grew at
+     * a fraction of its design rate on exactly the machine the browser
+     * benchmarks run on. */
+    uint32_t elapsed_ms = (uint32_t)((now - c->epoch_start) / 1000000ull);
 
     /* K = cubic_root(w_max * 0.3 / 0.4) in segments, converted to ms */
     uint32_t w_max_segs = c->w_max / TCP_DEFAULT_MSS;
@@ -1742,7 +1748,7 @@ void tcp_congestion_on_loss(struct tcp_conn *c) {
     if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
     c->ssthresh = c->cwnd_bytes;
     c->in_slow_start = 0;
-    c->epoch_start = pit_ticks();
+    c->epoch_start = perf_now_ns();
 }
 
 void tcp_retransmit_check(struct tcp_conn *c) {
@@ -1772,7 +1778,7 @@ void tcp_fast_retransmit(struct tcp_conn *c) {
         if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
         c->ssthresh   = c->cwnd_bytes;
         c->in_slow_start = 0;
-        c->epoch_start = pit_ticks();
+        c->epoch_start = perf_now_ns();
 
         tcp_retransmit_slot(c, oldest);
     }

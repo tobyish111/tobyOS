@@ -7,8 +7,8 @@ set -o pipefail
 cd /c/CustomOS/tobyOS || exit 1
 export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
 
-echo "===== [1/3] make clean (SKIPPED: no layout change since last clean)"
-: # layout unchanged
+echo "===== [1/3] make clean (struct sock grew: reuseaddr)"
+make clean > /dev/null 2>&1
 
 echo "===== [2/3] lxposix gate"
 bash logs/lxposix.sh || { echo "NETBATCH: lxposix RED"; exit 1; }

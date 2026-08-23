@@ -1713,6 +1713,8 @@ struct abi_dirent {
 #define ABI_AT_CLKTCK   17      /* frequency of times() ticks */
 #define ABI_AT_SECURE   23      /* nonzero if this is a secure exec */
 #define ABI_AT_RANDOM   25      /* ptr to 16 random bytes (libc stack canary) */
+#define ABI_AT_HWCAP2   26      /* extended capability mask (0: none claimed) */
+#define ABI_AT_MINSIGSTKSZ 51   /* minimum signal-frame stack (glibc sysconf) */
 /* Minimal x86-64 HWCAP: FPU|VME|DE|PSE|TSC|MSR|PAE|MCE|CX8|APIC|SEP|MTRR|
  * PGE|MCA|CMOV|PAT|PSE36|CLFLUSH|MMX|FXSR|SSE|SSE2 — enough for glibc/GLib
  * feature probes that abort when getauxval(AT_HWCAP) is missing entirely. */

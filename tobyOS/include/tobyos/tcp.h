@@ -91,6 +91,9 @@ uint16_t tcp_remote_port_be(const struct tcp_conn *c);
  * internally (see TCP_LISTEN_BACKLOG in tcp.c). Returns NULL if the port
  * is busy or no slot is free. */
 struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog);
+/* SO_REUSEADDR form: dying conns (TIME_WAIT &c) don't hold the port. */
+struct tcp_conn *tcp_listen_reuse(uint16_t local_port_be, int backlog,
+                                  bool reuse);
 
 /* Block until a completed handshake is queued on `listener`, or timeout.
  * Returns a new connection in ESTABLISHED state, or NULL on timeout. */

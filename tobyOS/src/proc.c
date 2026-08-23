@@ -1059,6 +1059,8 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
                                          userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP2, 0                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_MINSIGSTKSZ, 2048       };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100                };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
                                          (p->uid != p->ruid ||

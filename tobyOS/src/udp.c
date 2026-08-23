@@ -126,7 +126,14 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     }
 
     struct sock *s = sock_lookup_by_port(h->dst_port);
-    if (!s) return;                       /* no listener: silent drop */
+    if (!s) {
+        /* No listener: answer with port-unreachable (2026-08-22) so the
+         * sender's connected socket learns ECONNREFUSED instead of
+         * timing out. Was a silent drop. */
+        extern void icmp_send_port_unreach(uint32_t, const void *, size_t);
+        icmp_send_port_unreach(src_ip_be, udp_packet, udp_n);
+        return;
+    }
 
     const uint8_t *payload = (const uint8_t *)udp_packet + UDP_HDR_LEN;
     size_t         pln     = udp_n - UDP_HDR_LEN;

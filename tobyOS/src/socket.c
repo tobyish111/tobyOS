@@ -24,6 +24,7 @@
 #include <tobyos/cap.h>
 #include <tobyos/pit.h>
 #include <tobyos/percpu.h>   /* slice 56: yield-if-ready in the recv wait loop */
+#include <tobyos/perf.h>     /* perf_now_ns: ns-based deadlines (2026-08-22) */
 #include <tobyos/smp.h>
 #include <tobyos/xserver.h>  /* tier 2.5 fake X protocol */
 
@@ -525,10 +526,8 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
 #endif
 
     uint64_t deadline = 0;
-    if (timeout_ms) {
-        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
-    }
+    if (timeout_ms)   /* ns-based (2026-08-22): pit ticks run ~15x slow under TCG */
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
 #ifdef CHROMIUM_BOOT
     /* Tier 2.5 headed wall: pid 3 sits "READY in recvmsg" for minutes and
      * the [cur] stamp cannot say ON WHICH SOCKET. Name it: log once per
@@ -537,16 +536,12 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
      * between "chromium waits for an X reply we never produced" and
      * "chromium waits on a Mojo channel", which are entirely different
      * bugs. */
-    uint64_t stuck_at = 0;
-    {
-        uint32_t hz2 = pit_hz(); if (hz2 == 0) hz2 = 100;
-        stuck_at = pit_ticks() + (uint64_t)hz2 * 5u;
-    }
+    uint64_t stuck_at = perf_now_ns() + 5000000000ull;
     bool stuck_logged = false;
 #endif
     while (self->count == 0) {
 #ifdef CHROMIUM_BOOT
-        if (!stuck_logged && pit_ticks() >= stuck_at) {
+        if (!stuck_logged && perf_now_ns() >= stuck_at) {
             stuck_logged = true;
             struct proc *sp = current_proc();
             kprintf("[uxstuck] pid=%d sock=%d xsrv=%d count=%u peer=%d "
@@ -568,7 +563,7 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
             return 0;                            /* peer closed + drained -> EOF */
         if (self->rx_eof || self->shut_rd)
             return 0;                            /* peer SHUT_WR / own SHUT_RD -> EOF */
-        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
+        if (deadline && perf_now_ns() >= deadline) return 0;   /* timed out */
         /* Cooperative wait: drop the BKL so peers/siblings can run. On UP,
          * a bare hlt returns to THIS context after the IRQ — READY clone3
          * threads never ran (chrome stuck: pid=3 RUNNING in recvmsg 50s+
@@ -653,6 +648,29 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
 struct sock *sock_peer_of(struct sock *self) {
     if (!self || self->kind != SOCK_KIND_UNIX) return 0;
     return sock_peer_checked(self);      /* slice 89: generation-validated */
+}
+
+/* ICMP destination-unreachable landed for a datagram WE sent (icmp.c
+ * decoded the embedded original headers). Latch the error on the matching
+ * connected UDP socket and wake its waiters -- the next send/recv returns
+ * it, which is how ECONNREFUSED reaches connect()ed-UDP callers. Matching
+ * is (our local port, connected peer); an unconnected socket gets no error
+ * (Linux semantics: only connected sockets consume async errors). */
+void sock_udp_icmp_error(uint16_t local_port_be, uint32_t peer_ip_be,
+                         uint16_t peer_port_be, uint8_t code) {
+    int err = (code == 3) ? 111        /* ECONNREFUSED */
+            : (code == 0) ? 101        /* ENETUNREACH  */
+            :               113;       /* EHOSTUNREACH */
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_UDP) continue;
+        if (s->local_port != local_port_be) continue;
+        if (!s->peer_port) continue;                    /* not connected */
+        if (s->peer_ip != peer_ip_be || s->peer_port != peer_port_be)
+            continue;
+        s->so_error = err;
+        wq_wake_all(&s->wq_recv);
+    }
 }
 
 /* shutdown(2) helpers (2026-08-22). Live here because the wait queue is
@@ -934,16 +952,14 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
     if (!buf && n)         return -1;
 
     uint64_t deadline = 0;
-    if (timeout_ms) {
-        uint32_t hz = pit_hz(); if (hz == 0) hz = 100;
-        deadline = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
-    }
+    if (timeout_ms)   /* ns-based (2026-08-22): pit ticks run ~15x slow under TCG */
+        deadline = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
 
     while (s->count == 0) {
         struct proc *self = current_proc();
         if (self->pending_signals) return EINTR_RET;
         if (!s->in_use)            return -1;
-        if (deadline && pit_ticks() >= deadline) return 0;   /* timed out */
+        if (deadline && perf_now_ns() >= deadline) return 0;   /* timed out */
         /* Actively pull the NIC RX ring so inbound datagrams are delivered
          * (udp_recv -> sock_deliver) while we wait. The e1000 IRQ-driven wake
          * alone does not reliably advance a blocked UDP recv -- every other
@@ -997,8 +1013,9 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
 bool sock_recv_ready(struct sock *s) {
     if (!s || !s->in_use) return true;         /* dead socket: recv returns at once */
     /* shutdown(2): a shut read side or a peer's SHUT_WR both make recv
-     * return EOF without blocking -- that IS readiness. */
-    if (s->shut_rd || s->rx_eof) return true;
+     * return EOF without blocking -- that IS readiness. A latched async
+     * error (ICMP unreachable) likewise: the next op returns instantly. */
+    if (s->shut_rd || s->rx_eof || s->so_error) return true;
     if (s->kind == SOCK_KIND_TCP) {
         if (!s->tcp) return true;              /* unconnected -> immediate error */
         return (tcp_poll_flags(s->tcp) & (TCP_RDY_RECV | TCP_RDY_ERR)) != 0;

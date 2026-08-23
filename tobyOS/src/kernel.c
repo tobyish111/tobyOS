@@ -7744,7 +7744,7 @@ void _start(void) {
              * half -- blocking accept past 3 s, FIN on the wire -- lives in
              * logs/lxsock.sh, because this stack has no loopback and a test
              * with no peer cannot prove those. */
-            { "/bin/linux-sock", "linux-sock", 0, 63,
+            { "/bin/linux-sock", "linux-sock", 0, 255,
               "socket semantics (peer-less half)" },
             /* 2026-08-22: thread-group semantics. Real glibc NPTL doing
              * what it could structurally never do before: pthread_cancel

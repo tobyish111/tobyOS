@@ -173,6 +173,56 @@ int main(void) {
         }
     }
 
-    printf("LXSOCK: VERDICT bits=%d (63=all)\n", bits);
+    /* ---- bit6: SO_REUSEADDR is stored and reads back ---- */
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        int ok = 0;
+        if (fd >= 0) {
+            int one = 1, back = -1; socklen_t bl = sizeof back;
+            if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0 &&
+                getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &back, &bl) == 0)
+                ok = (back == 1);
+            printf("sock: SO_REUSEADDR set->get=%d (want 1; it read 0 before)\n",
+                   back);
+            close(fd);
+        }
+        if (ok) bits |= 64;
+    }
+
+    /* ---- bit7: sendmsg iovec honesty -- 32 iovecs land byte-exact
+     * (they were SILENTLY TRUNCATED at 16), and past the 64 cap the
+     * answer is a loud EMSGSIZE, never a short lie ---- */
+    {
+        int sv[2];
+        int ok = 0;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+            char cells[32];
+            struct iovec iv[80];
+            for (int i = 0; i < 32; i++) {
+                cells[i] = (char)('A' + (i % 26));
+                iv[i].iov_base = &cells[i];
+                iv[i].iov_len  = 1;
+            }
+            struct msghdr mh; memset(&mh, 0, sizeof mh);
+            mh.msg_iov = iv; mh.msg_iovlen = 32;
+            ssize_t sn = sendmsg(sv[0], &mh, 0);
+            char rb[64] = {0};
+            ssize_t rn = read(sv[1], rb, sizeof rb);
+            int exact = (sn == 32 && rn == 32 && memcmp(rb, cells, 32) == 0);
+            for (int i = 0; i < 80; i++) { iv[i].iov_base = cells; iv[i].iov_len = 1; }
+            mh.msg_iovlen = 80;
+            errno = 0;
+            ssize_t bn = sendmsg(sv[0], &mh, 0);
+            int refuse = (bn == -1 && errno == EMSGSIZE);
+            printf("sock: 32-iov sendmsg sn=%zd rn=%zd exact=%d; 80-iov rc=%zd "
+                   "errno=%d (want EMSGSIZE=%d)\n", sn, rn, exact, bn, errno,
+                   EMSGSIZE);
+            ok = exact && refuse;
+            close(sv[0]); close(sv[1]);
+        }
+        if (ok) bits |= 128;
+    }
+
+    printf("LXSOCK: VERDICT bits=%d (255=all)\n", bits);
     return bits;
 }

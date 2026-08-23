@@ -165,6 +165,12 @@ struct sock {
     uint8_t          shut_tx;
     uint8_t          shut_rd;
     uint8_t          rx_eof;
+    /* SO_REUSEADDR (2026-08-22): lets listen() take a port whose only
+     * holders are dying conns (TIME_WAIT &c). It was accept-and-discard
+     * while bind refused in-use ports unconditionally, so a restarted
+     * server hit EADDRINUSE with no escape -- the exact scenario the
+     * option exists for. */
+    uint8_t          reuseaddr;
 
     /* UDP: connect() peer (network byte order; 0 = not connected). A
      * connected UDP socket lets send()/recv() and read()/write() omit the
