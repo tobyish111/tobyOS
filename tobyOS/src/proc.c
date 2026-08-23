@@ -204,8 +204,14 @@ struct proc *proc_slot_claim(void) {
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            /* The wake-after-death tombstone must not outlive the slot's
+             * previous occupant, or the new process is unwakeable. This
+             * is the ONE clearing point every creation path goes through
+             * (fork/vfork/clone/spawn memcpy AFTER claiming). */
+            g_proc[i].dying = false;
             return &g_proc[i];
+        }
     }
     return 0;
 }
@@ -1380,6 +1386,7 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             if (q == p || q->state == PROC_UNUSED ||
                 q->state == PROC_EMBRYO) continue;
             if (!(q->tgid == tgid || q->pid == tgid)) continue;
+            q->dying = true;                 /* tombstone before state */
             q->exit_code = code;
             q->state = PROC_TERMINATED;
             struct proc *w = q->join_waiters;
@@ -1458,6 +1465,7 @@ void proc_reap_group_threads(struct proc *p, int code) {
             q->state == PROC_EMBRYO) continue;
         if (q->tgid == p->pid && q->is_thread) {
             /* Force-terminate the thread */
+            q->dying = true;                 /* tombstone before state */
             q->exit_code = code;
             q->state = PROC_TERMINATED;
             /* Wake any joiners */
@@ -1637,6 +1645,12 @@ __attribute__((noreturn)) void proc_exit(int code) {
         p->join_waiters = 0;
     }
 
+    /* Tombstone at the point of no return (2026-08-23): teardown ABOVE
+     * may legitimately block and be woken (lingering TCP close waits on
+     * the net tick), so the flag arms only HERE -- past this store the
+     * proc does nothing but yield away forever, and any wake is the
+     * wake-after-death bug sched_enqueue now refuses and names. */
+    p->dying       = true;
     p->state       = PROC_TERMINATED;
 
     /* Milestone 19 metric: one more process exited. */

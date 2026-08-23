@@ -237,6 +237,12 @@ struct proc {
      * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
     uint64_t        futex_deadline_ns;
     bool            futex_timed_out;
+    /* Wake-after-death tombstone (2026-08-23): set by every exit path
+     * BEFORE the state changes, never written by wakers, cleared only at
+     * slot claim. sched_enqueue refuses (and names) any wake of a dying
+     * proc -- the `state = PROC_READY` overwrite that used to destroy
+     * the evidence cannot touch this. */
+    bool            dying;
     /* glibc robust-mutex list head (set_robust_list, Phase F): user address
      * of this thread's struct robust_list_head, walked at death by
      * futex_robust_exit so held robust mutexes get FUTEX_OWNER_DIED. */

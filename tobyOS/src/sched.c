@@ -349,6 +349,25 @@ static struct proc *queue_pop_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
+        /* Wake-after-death, second net (2026-08-23): a proc that was
+         * enqueued BEFORE its exit reached the tombstone store can still
+         * sit here -- the sched_enqueue guard cannot see history.
+         * Switching into it resumes a TERMINATED context and proc_exit's
+         * "sched_yield returned" panic fires (observed ~1/13 boots).
+         * Unlink it in place and say so; the stale entry is the crime
+         * scene this line photographs. */
+        if (p->dying) {
+            struct proc *nx = p->next_ready;
+            kprintf("[sched] DROPPED queued dying pid=%d '%s' (state=%d)\n",
+                    p->pid, p->name ? p->name : "?", (int)p->state);
+            if (prev) prev->next_ready = nx;
+            else      cpu->ready_head  = nx;
+            if (cpu->ready_tail == p) cpu->ready_tail = prev;
+            p->next_ready = 0;
+            p->on_rq      = false;
+            p = nx;
+            continue;
+        }
         /* Slice 39: skip procs whose context save hasn't completed (still
          * live on some CPU). They stay queued; the next pop after
          * sched_finish_switch clears on_cpu gets them with a VALID context.
@@ -401,9 +420,12 @@ static struct proc *queue_steal_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
-        /* Skip idle procs (pinned) and on_cpu procs (context not yet saved
-         * -- see queue_pop_locked / ledger slice 39). */
-        if (!p->is_idle && !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+        /* Skip idle procs (pinned), on_cpu procs (context not yet saved
+         * -- see queue_pop_locked / ledger slice 39), and dying procs
+         * (2026-08-23: never steal a corpse; the home queue's pop guard
+         * unlinks and logs it). */
+        if (!p->is_idle && !p->dying &&
+            !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
             int eff = eff_prio(p, now);
             if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
         }
@@ -686,6 +708,25 @@ void sched_enqueue(struct proc *p) {
     if (p->pid != 0 && (!p->kstack_top || p->state == PROC_UNUSED ||
                         p->state == PROC_EMBRYO))
         return;
+    /* Wake-after-death tombstone (2026-08-23). A waker's `state =
+     * PROC_READY; sched_enqueue()` pair destroys the TERMINATED evidence
+     * before this function can see it -- observed live (~1/13 boots) as
+     * proc_exit's "sched_yield returned" panic when a stale waker
+     * re-queued a dying proc. `dying` is set by the exit paths BEFORE
+     * state changes and is never written by any waker, so it survives
+     * the overwrite. Refuse the wake and NAME the caller -- this line is
+     * the tripwire that identifies the racing waker when it next fires. */
+    /* The dying proc CONTINUING ITSELF is legitimate -- teardown yields
+     * cooperatively (BKL bounces, off-CPU waits) and the scheduler must
+     * be able to re-queue it, or every exit hangs. Only a DIFFERENT
+     * context waking the dying proc is the bug being policed. */
+    if (p->dying && p != current_proc()) {
+        struct proc *me = current_proc();
+        kprintf("[sched] REFUSED wake of dying pid=%d '%s' by pid=%d '%s'\n",
+                p->pid, p->name ? p->name : "?",
+                me ? me->pid : -1, (me && me->name) ? me->name : "?");
+        return;
+    }
     if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
         p->state = PROC_BLOCKED;
         p->vm_quiesced = 1;
