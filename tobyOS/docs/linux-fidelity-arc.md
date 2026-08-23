@@ -458,3 +458,19 @@ boot with /ext + /vfat mounted to see the foreign-FS arms live.
 - Scheduler: woken-from-stop procs starve while the waker spins
   (29 ms vs 1.4 s) — perf, tracked in memory.
 - VSC-PCTS2016 conformance email — user action.
+
+### 2026-08-23 — TRUE vfork (4a233f1, lxposix 27/27; standing debt repaid)
+The private-stack shim died: a NULL-child-stack share child now keeps
+the parent's rsp (the copied syscall_regs already carry it — the fix is
+deletion). The shim predated the slice-89 suspension fences and had
+quietly broken the contract: child-written locals (the `err = errno`
+exec channel) were invisible, child argument reads found zeros. Proven:
+shared-frame write visibility, 100 ms suspension, exec with shared-frame
+argv, errno write-back, posix_spawn both ways, raw NULL-stack clone.
+**Test lesson (three "all terms true, AND false" runs): a vfork child's
+function call at the clone call's depth overwrites the RA slot the
+suspended parent RETs through — parent resumes past its own rax store.
+Same on real Linux (why glibc vfork pops its RA into a register); raw
+clone tests must keep the child call-free in inline asm.** Full chain
+revalidated (cross-personality + defboot green); a CHROMIUM-flavour
+boot re-validation rides the next browser-arc session.
