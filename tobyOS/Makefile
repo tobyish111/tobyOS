@@ -3251,6 +3251,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    echo "[initrd] staged linux-vdso (userspace clock)";               \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vdso";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-cont/linux-cont.elf ]; then                     \
+	    cp programs/linux-cont/linux-cont.elf                              \
+	         $(INITRD_STAGE)/bin/linux-cont;                               \
+	    echo "[initrd] staged linux-cont (resume-latency)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cont";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

@@ -7954,6 +7954,11 @@ void _start(void) {
              * syscalling -- proven by the kernel's own syscall counter. */
             { "/bin/linux-vdso", "linux-vdso", 0, 63,
               "vDSO: the userspace clock is real" },
+            /* 2026-08-23: the job-control arc's open scheduler item --
+             * a SIGCONT'd proc must run promptly even with spinners on
+             * every core (measured 1.4 s once; want two ticks). */
+            { "/bin/linux-cont", "linux-cont", 0, 3,
+              "woken-from-stop resume latency" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
