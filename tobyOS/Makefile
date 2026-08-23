@@ -3198,6 +3198,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-xattr (xattr + fd identity + fexecve)"; \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-xattr";                       \
 	fi;                                                                   \
+	if [ -f programs/linux-thread2/linux-thread2.elf ]; then               \
+	    cp programs/linux-thread2/linux-thread2.elf                        \
+	         $(INITRD_STAGE)/bin/linux-thread2;                            \
+	    echo "[initrd] staged linux-thread2 (de_thread + pshared + robust)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-thread2";                     \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \

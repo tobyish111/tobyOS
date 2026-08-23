@@ -492,6 +492,29 @@ static bool futex_unlink_self(uint64_t cr3, uint64_t addr,
     return was_linked;
 }
 
+/* PROCESS_SHARED keying (Phase F, 2026-08-22). A futex word in a
+ * MAP_SHARED page is the same futex in every process that maps it, so
+ * its key must not mention any address space: key = (0, physical addr)
+ * -- cr3 0 can never be a real process root, so the space cannot
+ * collide with private keys. Private mappings keep (cr3, vaddr): CoW
+ * twins share frames until first write, and keying them by phys would
+ * false-match two logically-distinct futexes across fork.
+ *
+ * Gated on the absence of FUTEX_PRIVATE_FLAG -- glibc stamps it on every
+ * process-private op (chrome's ~400k/min all carry it), so the page-walk
+ * cost lands only on genuinely pshared primitives. The walk requires the
+ * page PRESENT; every keyed path either pre-touched the word (WAIT) or
+ * follows a userspace write of it (the futex protocol: change the word,
+ * then wake), and MAP_SHARED frames are mapped eagerly and never CoW'd
+ * or evicted, so a missed translation (fall back to the private key) is
+ * theoretical -- but would only split waiter/waker, never corrupt. */
+static void futex_key_adjust(int op, uint64_t *cr3, uint64_t *addr) {
+    if (op & 0x80) return;               /* FUTEX_PRIVATE_FLAG */
+    int shared = 0;
+    uint64_t phys = vmm_translate_root(*cr3, *addr, &shared);
+    if (phys && shared) { *cr3 = 0; *addr = phys; }
+}
+
 int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     struct proc *caller = current_proc();
     if (!caller) return 0;
@@ -507,6 +530,7 @@ int futex_fast(uint32_t *uaddr, int op, uint32_t val, long *out) {
     }
     if (cmd == FUTEX_WAKE || cmd == FUTEX_WAKE_BITSET) {
         uint64_t cr3 = caller->cr3;
+        futex_key_adjust(op, &cr3, &addr);
         uint64_t flags = spin_lock_irqsave(&g_futex_lock);
         uint32_t idx = futex_hash(cr3, addr);
         struct futex_entry *e = g_futex_hash[idx];
@@ -546,6 +570,11 @@ long futex(uint32_t *uaddr, int op, uint32_t val, const void *utimeout,
      * (per-copy uaccess: each read opens its own stac window). */
     uint32_t cur_val;
     if (copy_from_user(&cur_val, uaddr, sizeof(cur_val)) != 0) return -14;
+
+    /* AFTER the pre-touch, so a first-use word is present for the walk;
+     * every keying below (find/create, unlink, wake, requeue) sees the
+     * adjusted pair and cross-process pshared waiters/wakers meet. */
+    futex_key_adjust(op, &cr3, &addr);
 
     if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
         /* Compute the wake deadline (monotonic ns). NULL => infinite. FUTEX_WAIT
@@ -1062,6 +1091,90 @@ void futex_forget_proc(struct proc *p) {
     }
     p->futex_deadline_ns = 0;
     spin_unlock_irqrestore(&g_futex_lock, flags);
+}
+
+/* ---- glibc robust-mutex death protocol (Phase F, 2026-08-22) ----------
+ *
+ * set_robust_list(2) registers a userspace linked list of the mutexes a
+ * thread currently holds; the KERNEL walks it when the thread dies and
+ * stamps FUTEX_OWNER_DIED into each held word so the next lock() returns
+ * EOWNERDEAD instead of hanging forever. Before this, set_robust_list was
+ * `return 0` -- the exact accept-and-ignore shape this arc hunts: glibc
+ * believed the kernel had its back, and every PTHREAD_MUTEX_ROBUST user
+ * (PostgreSQL shared buffers, SAP, pulseaudio) would deadlock on the
+ * first owner crash.
+ *
+ * Layout (x86-64 glibc): head+0 = list.next (self-pointing when empty),
+ * head+8 = futex_offset (signed! entry -> futex word), head+16 =
+ * list_op_pending (a mutex mid-acquire/release when death struck).
+ *
+ * Must run while the dying proc's USER MEMORY is still mapped: early in
+ * proc_exit, and in the group-reap loop before futex_forget_proc (the
+ * reaper shares the group's cr3, so the copies resolve). A corrupt or
+ * cyclic list just ends the walk -- it is userspace's list, and the
+ * kernel owes it exactly one bounded traversal. */
+
+static void futex_wake_key(uint64_t cr3, uint64_t addr) {
+    uint64_t flags = spin_lock_irqsave(&g_futex_lock);
+    uint32_t idx = futex_hash(cr3, addr);
+    struct futex_entry *e = g_futex_hash[idx];
+    while (e && !(e->key_cr3 == cr3 && e->key_addr == addr)) e = e->next;
+    if (e && e->waiters) {
+        struct proc *w = e->waiters;
+        e->waiters = w->next_wait;
+        w->next_wait = 0;
+        w->futex_deadline_ns = 0;
+        w->state = PROC_READY;
+        sched_enqueue(w);
+        if (!e->waiters) futex_free_entry(e);
+    }
+    spin_unlock_irqrestore(&g_futex_lock, flags);
+}
+
+static void futex_robust_stamp(struct proc *p, uint64_t waddr, uint32_t tid) {
+    if (!waddr || (waddr & 3)) return;
+    uint32_t w = 0;
+    if (copy_from_user(&w, (const void *)(uintptr_t)waddr, sizeof w) != 0)
+        return;
+    if ((w & FUTEX_TID_MASK) != tid) return;   /* not held by the deceased */
+    uint32_t neu = (w & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+    if (copy_to_user((void *)(uintptr_t)waddr, &neu, sizeof neu) != 0)
+        return;
+    /* Wake one waiter under BOTH possible keys: a robust mutex can be
+     * process-private (siblings key by (cr3, vaddr)) or pshared (key by
+     * phys). Waking a key with no entry is a no-op, so trying both is
+     * cheaper than re-deriving which flavour glibc used. */
+    futex_wake_key(p->cr3, waddr);
+    {
+        int shared = 0;
+        uint64_t phys = vmm_translate_root(p->cr3, waddr, &shared);
+        if (phys && shared) futex_wake_key(0, phys);
+    }
+}
+
+void futex_robust_exit(struct proc *p) {
+    if (!p || !p->robust_list_head) return;
+    uint64_t head = p->robust_list_head;
+    p->robust_list_head = 0;
+    uint64_t next = 0, pend = 0;
+    int64_t  off  = 0;
+    if (copy_from_user(&next, (const void *)(uintptr_t)head, 8) != 0) return;
+    if (copy_from_user(&off,  (const void *)(uintptr_t)(head + 8), 8) != 0) return;
+    if (copy_from_user(&pend, (const void *)(uintptr_t)(head + 16), 8) != 0) return;
+    uint32_t tid = 0;
+    { extern int pid_vnr(struct proc *);
+      int v = pid_vnr(p); tid = (uint32_t)(v ? v : p->pid) & FUTEX_TID_MASK; }
+    uint64_t entry = next;
+    for (int guard = 0; entry && entry != head && guard < 64; guard++) {
+        uint64_t nxt = 0;
+        if (copy_from_user(&nxt, (const void *)(uintptr_t)entry, 8) != 0)
+            break;
+        if (entry != pend)         /* op_pending is stamped once, below */
+            futex_robust_stamp(p, (uint64_t)((int64_t)entry + off), tid);
+        entry = nxt;
+    }
+    if (pend)
+        futex_robust_stamp(p, (uint64_t)((int64_t)pend + off), tid);
 }
 
 #ifdef CHROMIUM_BOOT

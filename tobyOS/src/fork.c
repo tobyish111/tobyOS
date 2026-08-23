@@ -157,6 +157,18 @@ static __attribute__((noreturn)) void fork_child_entry(void) {
      * post-switch line -- release the proc this CPU switched away from
      * (see sched_finish_switch), or it stays on_cpu/unschedulable. */
     sched_finish_switch();
+    /* Phase F: the deferred CLONE_CHILD_SETTID stamp -- we are now IN the
+     * child's context, so the write breaks CoW into the child's own frame
+     * (a parent-side write would have changed the shared page under both).
+     * See proc.h set_child_tid for why glibc's fork() depends on this. */
+    if (p->set_child_tid) {
+        extern int pid_vnr(struct proc *);
+        int v = pid_vnr(p);
+        uint32_t vtid = (uint32_t)(v ? v : p->pid);
+        (void)copy_to_user((void *)(uintptr_t)p->set_child_tid,
+                           &vtid, sizeof vtid);
+        p->set_child_tid = 0;
+    }
     /* Load the child's FPU/SSE state (copied from the parent at fork time)
      * -- the switch that landed us here restored the previous proc's state. */
     fpu_restore(p->fpu_state);
@@ -507,6 +519,8 @@ long sys_fork(void) {
      * just did not stop working. */
     child->clone_ns_flags   = 0;
     child->clone_child_stack = 0;
+    child->clone_child_settid   = 0;   /* Phase F: staging, same rule */
+    child->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -685,6 +699,20 @@ long sys_fork(void) {
      * every raw syscall(SYS_clone, flags, NULL, ...) caller wants -- and is why
      * ignoring a2 outright went unnoticed until glibc's clone() wrapper, whose
      * child-side pops its function pointer off this exact stack. */
+    /* Phase F: consume the staged tid addresses while the child is still
+     * EMBRYO (same race rule as the namespace flags above). CLEARTID is
+     * re-staged, never inherited: Linux clears a fork child's
+     * clear_child_tid unless the caller passed CLONE_CHILD_CLEARTID, and
+     * the memcpy above copied the parent's. SETTID is applied by
+     * fork_child_entry in the CHILD's context -- a parent-side write
+     * would land in the CoW-shared frame both sides still see. */
+    {
+        child->set_child_tid    = parent->clone_child_settid;
+        child->clear_child_tid  = parent->clone_child_cleartid;
+        parent->clone_child_settid   = 0;
+        parent->clone_child_cleartid = 0;
+    }
+
     {
         uint64_t cstk = parent->clone_child_stack;
         parent->clone_child_stack = 0;
@@ -838,6 +866,15 @@ long sys_fork_share(void) {
     /* Per-call clone staging must not be inherited -- see sys_fork. */
     child->clone_ns_flags    = 0;
     child->clone_child_stack = 0;
+    /* Phase F: consume the staged tid addresses (share path too -- Linux
+     * honours SETTID/CLEARTID for vfork-style clones; the stamp lands in
+     * the SHARED space, which is the correct semantics there). */
+    child->set_child_tid    = parent->clone_child_settid;
+    child->clear_child_tid  = parent->clone_child_cleartid;
+    child->clone_child_settid   = 0;
+    child->clone_child_cleartid = 0;
+    parent->clone_child_settid   = 0;
+    parent->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -1487,6 +1524,28 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
         return -ABI_ENOENT;
     }
+
+    /* ---- Phase F: POSIX de_thread (2026-08-22) -------------------------
+     * exec from the leader kills every other thread in the group BEFORE the
+     * new image is built. Until now an exec'd image ran with the old
+     * image's threads still scheduled -- on page tables the commit path was
+     * about to destroy. Placed here for the same reason as the setuid
+     * transition below: the image has been read, so the exec can no longer
+     * fail for the common (missing/unreadable file) reasons; Linux's
+     * de_thread sits at the equivalent point (flush_old_exec). A failure
+     * AFTER this point loses the siblings anyway -- exactly as on Linux,
+     * where past the point of no return a failed exec kills the process.
+     * The old image's robust-mutex registration is walked while its memory
+     * is still mapped, then dropped (glibc re-registers in the new image).
+     * exec from a NON-leader thread keeps its documented divergence (no
+     * pid takeover, siblings survive) -- nothing exercised does it. */
+    if (!p->is_thread) {
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        proc_reap_group_threads(p, 0);
+        if (had_bkl) bkl_enter();
+    }
+    { extern void futex_robust_exit(struct proc *); futex_robust_exit(p); }
 
     /* ---- Linux slice 2: the set-user-ID-on-exec transition ----
      *

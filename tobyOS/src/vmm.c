@@ -689,6 +689,32 @@ uint64_t vmm_translate(uint64_t virt) {
     return (pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
 }
 
+/* Translate through an EXPLICIT PML4 root (a process cr3) without touching
+ * the editor borrow -- safe from BKL-free paths, which is what the futex
+ * PROCESS_SHARED keying needs (Phase F, 2026-08-22). Read-only walk,
+ * PRESENT leaves only. *shared_out (optional) reports the PTE_SHARED_SW
+ * software bit: a MAP_SHARED frame, identical in every process mapping it. */
+uint64_t vmm_translate_root(uint64_t cr3, uint64_t virt, int *shared_out) {
+    if (shared_out) *shared_out = 0;
+    if (!cr3) return 0;
+    pte_t *pml4 = phys_to_table(cr3 & PTE_ADDR_MASK);
+    pte_t *pdpt = next_table(pml4, pml4_idx(virt), 0, false);
+    if (!pdpt) return 0;
+    pte_t *pd = next_table(pdpt, pdpt_idx(virt), 0, false);
+    if (!pd) return 0;
+    pte_t pde = pd[pd_idx(virt)];
+    if (!(pde & PTE_P)) return 0;
+    if (pde & PTE_PS) {
+        if (shared_out) *shared_out = (pde & PTE_SHARED_SW) ? 1 : 0;
+        return (pde & ~PAGE_2M_MASK & PTE_ADDR_MASK) | (virt & PAGE_2M_MASK);
+    }
+    pte_t *pt = phys_to_table(pde & PTE_ADDR_MASK);
+    pte_t pte = pt[pt_idx(virt)];
+    if (!(pte & PTE_P)) return 0;
+    if (shared_out) *shared_out = (pte & PTE_SHARED_SW) ? 1 : 0;
+    return (pte & PTE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
+}
+
 static void dump_entry(const char *level, size_t idx, pte_t e) {
     kprintf("  %-5s [%3lu] = 0x%016lx  %c%c%c%c%c%c\n",
             level, (unsigned long)idx, e,

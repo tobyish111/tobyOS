@@ -10698,10 +10698,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             uint64_t cstk = (uint64_t)a2;
             if (nsme && cstk && cstk < UACCESS_USER_END)
                 nsme->clone_child_stack = cstk;
+            /* Phase F: stage CHILD_SETTID/CLEARTID for the process-fork
+             * path -- glibc's fork() itself is clone(CHILD_SETTID|
+             * CHILD_CLEARTID, ..., ctid=&THREAD_SELF->tid) and trusts the
+             * kernel to stamp the CHILD's tid there. This arm dropped
+             * both on the floor, so forked children ran with the parent's
+             * cached tid (see proc.h set_child_tid for the blast radius). */
+            if (nsme) {
+                nsme->clone_child_settid =
+                    (cfl & 0x01000000u /* CLONE_CHILD_SETTID  */) ? (uint64_t)a4 : 0;
+                nsme->clone_child_cleartid =
+                    (cfl & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? (uint64_t)a4 : 0;
+            }
             long cr = share ? sys_fork_share()
                             : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
-            if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0; }
+            if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0;
+                        nsme->clone_child_settid = 0;
+                        nsme->clone_child_cleartid = 0; }
             cr = lx_child_pid_ret(cr);       /* see lx_child_pid_ret */
+            /* CLONE_PARENT_SETTID: the parent-side stamp, written here in
+             * the parent's own address space. */
+            if (cr > 0 && (cfl & 0x00100000u /* CLONE_PARENT_SETTID */) && a3) {
+                uint32_t pv = (uint32_t)cr;
+                (void)copy_to_user((void *)(uintptr_t)a3, &pv, sizeof pv);
+            }
 #ifdef CHROMIUM_BOOT
             { static int crl = 0; if (crl < 200) { crl++;
                 struct proc *me = current_proc();
@@ -11330,8 +11350,30 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (p) p->clear_child_tid = (uint64_t)a1;
         return p ? p->pid : 0;
     }
-    case LX_set_robust_list:
+    case LX_set_robust_list: {        /* (head, len) */
+        /* Real since Phase F (2026-08-22); was `return 0` -- glibc believed
+         * the kernel would stamp FUTEX_OWNER_DIED at death, and no one ever
+         * did. futex_robust_exit (thread.c) is the walk this registers. */
+        if ((size_t)a2 != 24) return -ABI_EINVAL;
+        struct proc *rp = current_proc();
+        if (!rp) return -ABI_EINVAL;
+        rp->robust_list_head = a1;
         return 0;
+    }
+    case 274: {                       /* get_robust_list (pid, head**, len*) */
+        struct proc *rp = current_proc();
+        if ((int)a1 != 0) {
+            int k = pid_knr((int)a1);
+            rp = k ? proc_lookup(k) : 0;
+        }
+        if (!rp) return -ABI_ESRCH;
+        uint64_t h = rp->robust_list_head, len24 = 24;
+        if (copy_to_user((void *)(uintptr_t)a2, &h, sizeof h) != 0)
+            return -ABI_EFAULT;
+        if (copy_to_user((void *)(uintptr_t)a3, &len24, sizeof len24) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
 
     /* B25: glibc 2.41 startup/pthread/malloc gap-fills (previously -ENOSYS).
      *

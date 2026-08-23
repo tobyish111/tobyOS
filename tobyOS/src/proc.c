@@ -1379,6 +1379,8 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             }
             q->join_waiters = 0;
             sched_dequeue(q);
+            /* Phase F: robust-mutex stamps before the futex state is gone. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
             /* Slice 89: a member parked in cow_fork_lock_acquire's quiesce
@@ -1428,6 +1430,67 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
     proc_exit(code);
 }
 
+/* Force-terminate every non-leader thread of leader `p` (Phase F: factored
+ * from proc_exit so sys_execve can reap the group pre-commit -- POSIX says
+ * exec from the leader kills the other threads; before this, an exec'd
+ * image ran with the old image's threads still scheduled on page tables
+ * about to be replaced). The BKL must NOT be held: the off-CPU wait spins
+ * on remote cores that may be stuck in bkl_enter. Runs on the group's live
+ * address space -- each sibling's robust-mutex list is walked before its
+ * futex state is forgotten. */
+void proc_reap_group_threads(struct proc *p, int code) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p || q->state == PROC_UNUSED ||
+            q->state == PROC_EMBRYO) continue;
+        if (q->tgid == p->pid && q->is_thread) {
+            /* Force-terminate the thread */
+            q->exit_code = code;
+            q->state = PROC_TERMINATED;
+            /* Wake any joiners */
+            struct proc *w = q->join_waiters;
+            while (w) {
+                struct proc *nxt = w->next_wait;
+                w->state = PROC_READY;
+                w->next_wait = 0;
+                sched_enqueue(w);
+                w = nxt;
+            }
+            q->join_waiters = 0;
+            /* Remove it from the ready queue BEFORE freeing its stack. A
+             * force-terminated sibling that was PROC_READY is still linked
+             * in a run queue; freeing its kstack and marking the slot
+             * UNUSED without unlinking leaves the scheduler able to pop it
+             * and switch in with kstack_top == NULL -> triple fault in
+             * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
+             * kstack_top=0x0.) */
+            sched_dequeue(q);
+            /* Phase F: the dying sibling's held robust mutexes must be
+             * stamped while the shared address space is still live. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
+            { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
+            { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Slice 88: wait until the sibling is off-CPU before freeing
+             * its kstack -- sched_dequeue does not stop a thread still
+             * running on another core.
+             * Slice 89: release a quiesce-parked spinner first, and bound
+             * the wait (see proc_exit_group -- same hang, same fix). */
+            __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+            if (!proc_wait_off_cpu_bounded(q)) {
+                kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
+                        "kstack NOT freed\n", q->pid);
+                continue;
+            }
+            /* Free the thread's kernel stack */
+            if (q->kstack_base) kfree(q->kstack_base);
+            q->kstack_base = 0;
+            q->kstack_top  = 0;
+            nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
+            q->state = PROC_UNUSED;
+        }
+    }
+}
+
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
 
@@ -1449,6 +1512,15 @@ __attribute__((noreturn)) void proc_exit(int code) {
     /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
      * process's pages are still mapped (before cli()/teardown below). */
     if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);
+
+    /* Phase F: walk this thread's glibc robust-mutex list while its user
+     * memory is still mapped -- held robust mutexes get FUTEX_OWNER_DIED
+     * and one waiter woken, so the next lock() reports EOWNERDEAD instead
+     * of hanging. Same placement constraints as clear_child_tid below. */
+    if (p) {
+        extern void futex_robust_exit(struct proc *);
+        futex_robust_exit(p);
+    }
 
     /* B11: Linux pthread_join. If this thread registered a clear_child_tid
      * (via clone(CLONE_CHILD_CLEARTID) or set_tid_address), write 0 to that
@@ -1526,53 +1598,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
          * bkl_enter would never leave the CPU while we hold the lock. */
         if (bkl_held()) bkl_exit();
         /* Leader exiting -- kill all threads in this group */
-        for (int i = 0; i < PROC_MAX; i++) {
-            struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED ||
-                q->state == PROC_EMBRYO) continue;
-            if (q->tgid == p->pid && q->is_thread) {
-                /* Force-terminate the thread */
-                q->exit_code = code;
-                q->state = PROC_TERMINATED;
-                /* Wake any joiners */
-                struct proc *w = q->join_waiters;
-                while (w) {
-                    struct proc *nxt = w->next_wait;
-                    w->state = PROC_READY;
-                    w->next_wait = 0;
-                    sched_enqueue(w);
-                    w = nxt;
-                }
-                q->join_waiters = 0;
-                /* Remove it from the ready queue BEFORE freeing its stack. A
-                 * force-terminated sibling that was PROC_READY is still linked
-                 * in a run queue; freeing its kstack and marking the slot
-                 * UNUSED without unlinking leaves the scheduler able to pop it
-                 * and switch in with kstack_top == NULL -> triple fault in
-                 * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
-                 * kstack_top=0x0.) */
-                sched_dequeue(q);
-                { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
-                { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
-                /* Slice 88: wait until the sibling is off-CPU before freeing
-                 * its kstack -- sched_dequeue does not stop a thread still
-                 * running on another core.
-                 * Slice 89: release a quiesce-parked spinner first, and bound
-                 * the wait (see proc_exit_group -- same hang, same fix). */
-                __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
-                if (!proc_wait_off_cpu_bounded(q)) {
-                    kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
-                            "kstack NOT freed\n", q->pid);
-                    continue;
-                }
-                /* Free the thread's kernel stack */
-                if (q->kstack_base) kfree(q->kstack_base);
-                q->kstack_base = 0;
-                q->kstack_top  = 0;
-                nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
-                q->state = PROC_UNUSED;
-            }
-        }
+        proc_reap_group_threads(p, code);
         /* Slice 89: close under the BKL -- file_close refcounts are plain
          * ints guarded ONLY by the BKL, and this path runs with it dropped;
          * unlocked closes raced other CPUs' open/close/dup on the shared

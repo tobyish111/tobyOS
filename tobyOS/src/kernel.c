@@ -7792,6 +7792,12 @@ void _start(void) {
              * its /proc/self/fd execve fallback. */
             { "/bin/linux-xattr", "linux-xattr", 0, 63,
               "xattr + fd identity + mknod + fexecve" },
+            /* Phase F: exec kills sibling threads (de_thread), PROCESS_
+             * SHARED futex keying (phys addr for MAP_SHARED words), and
+             * the robust-mutex death protocol (set_robust_list was a
+             * silent no-op; EOWNERDEAD never happened). */
+            { "/bin/linux-thread2", "linux-thread2", 0, 63,
+              "exec de_thread + pshared futex + robust mutexes" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

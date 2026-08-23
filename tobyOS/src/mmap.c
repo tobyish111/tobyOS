@@ -434,6 +434,16 @@ long sys_mmap(uint64_t addr, uint64_t len, uint32_t prot,
      * while still PROT_NONE correctly can't be satisfied -> SIGSEGV). */
     if ((flags & VMA_FLAG_ANON) && prot != VMA_PROT_NONE) {
         uint32_t vmm_f = prot_to_vmm_flags(prot);
+        /* Phase F (2026-08-22): anonymous MAP_SHARED pages must carry
+         * PTE_SHARED_SW or fork CoWs them apart -- the demand-fault path
+         * (mmap_handle_page_fault) got this in slice 22, but THIS eager
+         * path is the one small anon mappings actually take, so every
+         * anon-shared page committed here silently diverged at the first
+         * post-fork write. Found live: a PROCESS_SHARED pthread mutex in
+         * anon-shared memory -- the child's lock landed in a private copy
+         * and the parent saw the mutex pristine (linux-thread2 shm-probe
+         * printed DIVERGED). Same bit the futex phys-keying reads. */
+        if (flags & VMA_FLAG_SHARED) vmm_f |= VMM_SHARED;
         /* Slice 95: chunk the commit. This loop (alloc + 4K memset + map,
          * per page, whole range) was the #1 residual BKL customer after the
          * mprotect fixes -- [lx-hold] mmap=28-48k Mcyc/min with single holds

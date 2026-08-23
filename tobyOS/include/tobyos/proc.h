@@ -237,6 +237,10 @@ struct proc {
      * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
     uint64_t        futex_deadline_ns;
     bool            futex_timed_out;
+    /* glibc robust-mutex list head (set_robust_list, Phase F): user address
+     * of this thread's struct robust_list_head, walked at death by
+     * futex_robust_exit so held robust mutexes get FUTEX_OWNER_DIED. */
+    uint64_t        robust_list_head;
     /* Wake-latency instruments (slice 56): when this proc PARKED on a futex,
      * when the wake was DELIVERED (state->READY, by FUTEX_WAKE or the timeout
      * sweep), and which Linux syscall it is currently inside (cursys, -1 =
@@ -422,6 +426,19 @@ struct proc {
      *      credentials.cc, which is why its child died at cr2 = -0x28 (the
      *      stack-canary reload `cmp -0x28(%rbp),%rcx`) with syscalls=0. */
     uint64_t        clone_child_stack;
+    /* Phase F: clone(2) tid plumbing for PROCESS forks (the thread path
+     * handles its own inline). clone_child_settid/cleartid are per-call
+     * STAGING on the parent, consumed by sys_fork while the child is
+     * EMBRYO (post-fork fixup = SMP race, see clone_ns_flags above).
+     * set_child_tid is the CHILD-side result: fork_child_entry writes the
+     * child's own vtid there on first entry -- the write must happen in
+     * the child's context or it lands in the CoW-shared frame. glibc's
+     * fork() passes &THREAD_SELF->tid here; without the stamp every
+     * forked child computed with its PARENT's cached tid, and robust-
+     * mutex words carried an owner the death walk could never match. */
+    uint64_t        clone_child_settid;
+    uint64_t        clone_child_cleartid;
+    uint64_t        set_child_tid;
 
     /* ---- ptrace(2) ------------------------------------------------------
      * tracer_pid == 0 means untraced, the zero-init default.
@@ -838,6 +855,10 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk);
  * returns. Closes every open fd before yielding so any pipe ends drop
  * their reader/writer count immediately (rather than at reap time). */
 __attribute__((noreturn)) void proc_exit(int code);
+/* Phase F: force-terminate every non-leader thread of leader p (factored
+ * from proc_exit; sys_execve reaps the group pre-commit). BKL must NOT be
+ * held -- the off-CPU wait spins on remote cores. */
+void proc_reap_group_threads(struct proc *p, int code);
 
 /* Spin until `p` is no longer live-on-CPU (on_cpu cleared). Call after
  * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
