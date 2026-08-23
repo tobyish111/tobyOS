@@ -7803,6 +7803,11 @@ void _start(void) {
              * on-disk nlink existed since the format was born, unread. */
             { "/bin/linux-fs2", "linux-fs2", 0, 63,
               "writable root + hard links" },
+            /* Phase G: /etc/ld.so.cache generated at initrd build (real
+             * glibc-ld.so.cache1.1 format) -- a dynamic glibc PIE starts
+             * with NO LD_LIBRARY_PATH for the first time. */
+            { "/bin/linux-ldso", "linux-ldso", 0, 3,
+              "ld.so.cache ends the LD_LIBRARY_PATH era" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

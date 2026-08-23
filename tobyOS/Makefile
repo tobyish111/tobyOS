@@ -565,6 +565,8 @@ SHPARITY_CASES := $(wildcard initrd/etc/shparity/*.sh)
 DISK_IMG       := disk.img
 MKFS_SRC       := tools/mkfs_tobyfs.c
 MKFS_BIN       := build/mkfs_tobyfs
+LDSOCACHE_SRC  := tools/mkldsocache.c
+LDSOCACHE_BIN  := build/mkldsocache
 MKPKG_SRC      := tools/mkpkg.c
 MKPKG_BIN      := build/mkpkg
 MKDISK_GPT_SRC := tools/mkdisk_gpt.c
@@ -2621,7 +2623,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 # (bin/, lib/, etc/, repo/, ...) are exact -- this caveat is only the
 # opt-in third-party trees.
 
-$(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
+$(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
                programs/linux-crashpad/linux-crashpad.elf \
                programs/linux-sigtest/linux-sigtest.elf \
@@ -3210,6 +3212,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    echo "[initrd] staged linux-fs2 (writable root + hard links)";     \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fs2";                         \
 	fi;                                                                   \
+	if [ -f programs/linux-ldso/linux-ldso.elf ]; then                     \
+	    cp programs/linux-ldso/linux-ldso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ldso;                               \
+	    echo "[initrd] staged linux-ldso (ld.so.cache proof)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ldso";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
 	         $(INITRD_STAGE)/bin/linux-tmpfs;                              \
@@ -3536,6 +3544,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    done; \
 	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
+	if $(LDSOCACHE_BIN) $(INITRD_STAGE)                                    \
+	       $(INITRD_STAGE)/etc/ld.so.cache; then                           \
+	    EXTRA_FILES="$$EXTRA_FILES etc/ld.so.cache";                       \
+	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
@@ -3751,6 +3763,10 @@ $(ISO): $(KERNEL) limine.conf $(LIMINE_FILES) $(INITRD_TAR) $(INSTALL_IMG)
 # ---------- Build host mkfs tool + format disk ----------
 
 $(MKFS_BIN): $(MKFS_SRC)
+	mkdir -p build
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+$(LDSOCACHE_BIN): $(LDSOCACHE_SRC)
 	mkdir -p build
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
 
