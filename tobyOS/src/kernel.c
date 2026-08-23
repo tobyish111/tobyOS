@@ -3839,6 +3839,39 @@ void _start(void) {
             if (!ext_mounted) {
                 kprintf("[boot] no ext4 partition discovered -- /ext unmounted\n");
             }
+            /* Phase H (2026-08-23): SELF-PROVISION when nothing was found.
+             * The in-kernel formatter exists precisely so this self-test
+             * needs no host mke2fs -- format a provably BLANK spare disk
+             * (no partitions, no boot sector, no ext/tobyfs magic; the
+             * live /data disk can never match) and mount it RW. This is
+             * what lets the ext4 rename/statfs arms run LIVE. Dev flavour
+             * only: this whole block compiles out without
+             * FS_BOOT_SELFTESTS, which is the real-hardware data-safety
+             * boundary. */
+            if (!ext_mounted) {
+                size_t it = 0;
+                struct blk_dev *d;
+                while (!ext_mounted &&
+                       (d = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
+                    uint8_t s0[512], s2x2[1024];
+                    if (blk_read(d, 0, 1, s0) != 0) continue;
+                    if (blk_read(d, 2, 2, s2x2) != 0) continue;
+                    bool blank = true;
+                    for (int bi = 0; bi < 512 && blank; bi++)
+                        if (s0[bi]) blank = false;
+                    for (int bi = 0; bi < 1024 && blank; bi++)
+                        if (s2x2[bi]) blank = false;
+                    if (!blank) continue;
+                    kprintf("[boot] blank disk '%s' -- self-provisioning "
+                            "ext4 for the Phase H live test\n", d->name);
+                    if (ext4_format_ex(d, 1) != VFS_OK) continue;
+                    if (ext4_mount("/ext", d) == VFS_OK) {
+                        kprintf("[boot] mounted /ext on self-provisioned "
+                                "'%s' (RW)\n", d->name);
+                        ext_mounted = true;
+                    }
+                }
+            }
         }
 
         /* Milestone 23D self-test: read-only smoke test over /ext.
@@ -3902,17 +3935,104 @@ void _start(void) {
                         vfs_strerror(rc));
             }
 
-            /* Confirm read-only enforcement: write/create/unlink MUST
-             * each return VFS_ERR_ROFS. Anything else means the driver
-             * accidentally surfaced a write path. */
-            rc = vfs_write_all("/ext/SHOULD_FAIL.TXT", "x", 1);
-            kprintf("[ext4-test]   write_all /ext/... -> %s "
-                    "(want ROFS / -9)\n", vfs_strerror(rc));
-            rc = vfs_unlink("/ext/HELLO.TXT");
-            kprintf("[ext4-test]   unlink /ext/HELLO.TXT -> %s "
-                    "(want ROFS / -9)\n", vfs_strerror(rc));
+            /* The ROFS assertions that used to live here were STALE: the
+             * driver gained real write paths in the ext4-rw slice and
+             * this text still claimed read-only-ness nobody enforced.
+             * Replaced (2026-08-23) by the write/rename round-trip the
+             * Phase H arms need: create -> rename -> read through the
+             * new name -> old name gone -> unlink. */
+            rc = vfs_write_all("/ext/RENAME_A.TXT", "phaseH", 6);
+            kprintf("[ext4-test]   create RENAME_A.TXT -> %s\n",
+                    vfs_strerror(rc));
+            if (rc == VFS_OK) {
+                rc = vfs_rename("/ext/RENAME_A.TXT", "/ext/RENAME_B.TXT");
+                void *rb = 0; size_t rl = 0;
+                int rr = vfs_read_all("/ext/RENAME_B.TXT", &rb, &rl);
+                struct vfs_stat gone;
+                int gr = vfs_stat("/ext/RENAME_A.TXT", &gone);
+                kprintf("[ext4-test]   rename A->B -> %s, read B -> %s "
+                        "(%u bytes%s), A -> %s (want NOENT) => %s\n",
+                        vfs_strerror(rc), vfs_strerror(rr), (unsigned)rl,
+                        (rr == VFS_OK && rl == 6 &&
+                         memcmp(rb, "phaseH", 6) == 0) ? ", content OK" : "",
+                        vfs_strerror(gr),
+                        (rc == VFS_OK && rr == VFS_OK && rl == 6 &&
+                         gr == VFS_ERR_NOENT) ? "RENAME OK" : "** FAIL **");
+                if (rr == VFS_OK && rb) kfree(rb);
+                (void)vfs_unlink("/ext/RENAME_B.TXT");
+            }
+
+            /* Phase H live check: statfs is a READ, so it works on the
+             * RO mount -- the group-descriptor sums must be nonzero and
+             * self-consistent, not the fabricated 4 GiB of old. (The
+             * ext4 rename arm stays untested here: /ext mounts RO by
+             * data-safety policy, and relaxing that for a smoke test is
+             * exactly the wrong trade. It shares its ext2 twin's shape,
+             * which the FAT check below exercises structurally.) */
+            {
+                struct vfs_statfs sf;
+                if (vfs_statfs("/ext", &sf) == VFS_OK)
+                    kprintf("[ext4-test]   statfs: bsize=%lu blocks=%lu "
+                            "bfree=%lu files=%lu ffree=%lu magic=0x%x %s\n",
+                            (unsigned long)sf.bsize,
+                            (unsigned long)sf.blocks,
+                            (unsigned long)sf.bfree,
+                            (unsigned long)sf.files,
+                            (unsigned long)sf.ffree,
+                            (unsigned)sf.type_magic,
+                            (sf.blocks > 0 && sf.bfree <= sf.blocks &&
+                             sf.type_magic == 0xEF53)
+                                ? "SANE" : "** BOGUS **");
+                else
+                    kprintf("[ext4-test]   statfs FAILED\n");
+            }
 
             kprintf("[ext4-test] <<< end smoke test on /ext\n");
+        }
+
+        /* Phase H live check on the WRITABLE FAT mount: the new rename
+         * arm end-to-end (create -> rename -> read through the new name
+         * -> old name gone) plus real statfs numbers from the FAT scan. */
+        if (fat_mounted) {
+            kprintf("[fat32-test] >>> Phase H rename + statfs on /fat\n");
+            int rc = vfs_write_all("/fat/RENAME_A.TXT", "phaseH", 6);
+            kprintf("[fat32-test]   create RENAME_A.TXT -> %s\n",
+                    vfs_strerror(rc));
+            if (rc == VFS_OK) {
+                rc = vfs_rename("/fat/RENAME_A.TXT", "/fat/RENAME_B.TXT");
+                kprintf("[fat32-test]   rename A->B -> %s\n",
+                        vfs_strerror(rc));
+                void *body = 0; size_t blen = 0;
+                int rr = vfs_read_all("/fat/RENAME_B.TXT", &body, &blen);
+                struct vfs_stat gone;
+                int gr = vfs_stat("/fat/RENAME_A.TXT", &gone);
+                kprintf("[fat32-test]   read B -> %s (%u bytes%s), "
+                        "A stat -> %s (want NOENT) => %s\n",
+                        vfs_strerror(rr), (unsigned)blen,
+                        (rr == VFS_OK && blen == 6 &&
+                         memcmp(body, "phaseH", 6) == 0)
+                            ? ", content OK" : "",
+                        vfs_strerror(gr),
+                        (rc == VFS_OK && rr == VFS_OK && blen == 6 &&
+                         gr == VFS_ERR_NOENT) ? "RENAME OK" : "** FAIL **");
+                if (rr == VFS_OK && body) kfree(body);
+                (void)vfs_unlink("/fat/RENAME_B.TXT");
+            }
+            {
+                struct vfs_statfs sf;
+                if (vfs_statfs("/fat", &sf) == VFS_OK)
+                    kprintf("[fat32-test]   statfs: blocks=%lu bfree=%lu "
+                            "magic=0x%x %s\n",
+                            (unsigned long)sf.blocks,
+                            (unsigned long)sf.bfree,
+                            (unsigned)sf.type_magic,
+                            (sf.blocks > 0 && sf.bfree <= sf.blocks &&
+                             sf.type_magic == 0x4d44)
+                                ? "SANE" : "** BOGUS **");
+                else
+                    kprintf("[fat32-test]   statfs FAILED\n");
+            }
+            kprintf("[fat32-test] <<< end\n");
         }
 #endif /* FS_BOOT_SELFTESTS -- foreign-FS auto-mount + smoke tests */
 
