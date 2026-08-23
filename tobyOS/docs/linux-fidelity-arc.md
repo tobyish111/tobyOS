@@ -372,3 +372,89 @@ consumed at EMBRYO, stamped by fork_child_entry IN THE CHILD'S CONTEXT
 (a parent-side write lands in the CoW-shared frame). Diagnostic method
 that cracked it: a 4-line shared-write probe in the test separated
 "memory not shared" from "futex keys not matching" in one boot.
+
+### 2026-08-22 — Phase G: writable root + hard links (fb140ef, 23/23)
+ramfs create/unlink/mkdir via an address-stable spillover table (open
+handles hold raw node pointers — growth must never move slots); 256
+created names, dead slots reused when their open refs drain;
+unlink-while-open keeps bytes readable. tobyfs hard links: the on-disk
+nlink existed unread since the format was born; vfs_link + ->link,
+EXDEV across mounts, EPERM where no inode indirection exists. TWO MORE
+LATENT BUGS fell: tobyfs handles flushed their OPEN-TIME inode copy on
+every write (reverting nlink/mode/uid/gid changed while the fd was
+open — handle_refresh_foreign re-reads them), and openat(dirfd, FILE)
+was cwd-relative (sys_open split into resolve wrapper +
+sys_open_resolved). Plus: orphan dirents (name → freed inode) are now
+removable instead of poisoning their name with EEXIST forever. Test
+discipline: /data persists across runs — tests sweep their own names.
+
+### 2026-08-22 — Phase G: ld.so.cache (15e90f4, 24/24)
+tools/mkldsocache.c (HOST tool; a python version silently never ran —
+no python on the gate's PATH) writes a real glibc-ld.so.cache1.1 at
+initrd build over every staged lib dir (294 libraries). Format traps:
+string offsets are file-relative, the flag byte says little-endian (3),
+and ld.so BINARY-SEARCHES under _dl_cache_libcmp in ldconfig's
+DESCENDING order — an unsorted cache resolves only lucky names. Proof:
+a real glibc-2.41 dynamic PIE (dlopen included) exits 127/127 with NO
+LD_* in its environment.
+
+### 2026-08-22 — Phase H: SysV sem + msg (f77d48f, 25/25)
+src/sysvipc.c: semop with an atomic-or-nothing trial pass, cooperative
+blocking, semtimedop on the perf clock, REAL SEM_UNDO applied at exit
+(the Apache/PostgreSQL crashed-worker case, asserted live: a child dies
+holding the semaphore and the parent's blocked P() proceeds). Message
+queues with Linux's type selection. Ids carry a sequence number so
+post-RMID operations answer EIDRM instead of landing on a recycled
+slot (the slice-89 discipline).
+
+### 2026-08-22 — Phase H: statfs truth + foreign-FS rename (8e114cb, 26/26)
+vfs_statfs op per filesystem (tobyfs bitmaps, tmpfs budget, ramfs
+image, ext group descriptors, fat32 FAT scan); the old arm fabricated
+one 4 GiB tmpfs for EVERY mount since it was written. Asserted live:
+64 KiB written to /data drops bfree by exactly 16×4 KiB blocks.
+ext2/ext4/fat32 gain dirent-level rename (ext4 journalled; directories
+same-parent only — a cross-dir move leaves ".." stale, and refusing
+beats corrupting a foreign volume; FAT re-walks the source after a
+clobber-unlink rewrites clusters). OWED: a manual FS_BOOT_SELFTESTS
+boot with /ext + /vfat mounted to see the foreign-FS arms live.
+
+## Arc close-out (2026-08-23)
+
+**Final validation over HEAD 8e114cb, all green:**
+- lxposix: 26/26 subtests, skipped=0, enosys_gaps=0, 0 faults
+- cross-personality XPIPE/X2/3W: GREEN (Track C untouched by eight
+  commits of kernel surgery)
+- defboot: 3/3 alive, 0 faults
+- lxsock host-peer: 15/15 GREEN
+
+**The audit's six tiers, disposition:**
+- Tier 1 (fake-success lies): CLOSED — cloexec, locks, shutdown/accept/
+  connect, inotify, epoll.
+- Tier 2 (thread groups): CLOSED — SIG_MAX 64, shared sighand,
+  group-fatal, tgkill, exec de_thread, robust futexes, PROCESS_SHARED
+  futexes. (exec-from-non-leader pid takeover remains a documented
+  divergence; nothing exercised does it.)
+- Tier 3 (networking): CLOSED for what QEMU can prove — loopback,
+  SO_REUSEADDR, ICMP errors, half-close on the wire, pit-skew purge.
+  HONEST SCOPE: AF_INET6/raw/AF_PACKET sockets do not exist; a caller
+  gets a clean refusal at socket(), which is a truthful "no stack"
+  answer, not a lie. Implementing IPv6 is a future arc, not a gap
+  hidden behind a fake success.
+- Tier 4 (/proc //sys //dev): CLOSED — real maps, /proc/sys, /proc/net,
+  status fields, ns-correct identities, /dev listable, /dev/shm.
+- Tier 5 (syscall families): CLOSED — xattr, POSIX timers,
+  copy_file_range/sendfile/splice, sendmmsg/recvmmsg, SysV sem/msg,
+  mknod, statfs truth; execveat/io_uring/bpf are authoritative-ENOSYS
+  BY DESIGN with working fallbacks.
+- Tier 6 (loader/auxv): CLOSED — real auxv creds, /etc/ld.so.cache.
+  HONEST SCOPE: no vDSO; every clock_gettime is a real syscall. That is
+  a PERFORMANCE item with a correct slow path, not a fidelity gap.
+
+**Still owed, and why:**
+- FS_BOOT_SELFTESTS boot with /ext + /vfat mounted (sees the new
+  foreign-FS rename/statfs arms live) — one manual boot.
+- EliteDesk hardware batch (CW_SANDBOX flip, xHCI EP0 re-test, slice-7
+  non-root, real-HW resolv.conf rewrite) — needs the machine.
+- Scheduler: woken-from-stop procs starve while the waker spins
+  (29 ms vs 1.4 s) — perf, tracked in memory.
+- VSC-PCTS2016 conformance email — user action.
