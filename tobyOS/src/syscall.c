@@ -3000,6 +3000,83 @@ static long sys_fstat(int fd, struct abi_stat *out) {
     return 0;
 }
 
+static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5);
+
+/* The kernel copy loop behind sendfile/copy_file_range/splice
+ * (2026-08-22). Offset-pointer arguments demand a seekable (VFS) side --
+ * ESPIPE otherwise, as Linux answers -- and are implemented by save/
+ * position/restore around each chunk, updating the user's offset word at
+ * the end. The natural-position forms just stream. Partial progress
+ * returns the count moved so far; only a first-chunk failure surfaces
+ * the errno. */
+static long lx_copy_fds(int in_fd, uint64_t uoff_in, int out_fd,
+                        uint64_t uoff_out, size_t count) {
+    struct file *fi = fd_lookup(in_fd), *fo = fd_lookup(out_fd);
+    if (!fi || !fo) return -ABI_EBADF;
+    uint64_t off_in = 0, off_out = 0;
+    bool has_oin = uoff_in != 0, has_oout = uoff_out != 0;
+    if (has_oin &&
+        copy_from_user(&off_in, (const void *)(uintptr_t)uoff_in, 8) != 0)
+        return -ABI_EFAULT;
+    if (has_oout &&
+        copy_from_user(&off_out, (const void *)(uintptr_t)uoff_out, 8) != 0)
+        return -ABI_EFAULT;
+    if ((has_oin && fi->kind != FILE_KIND_VFS) ||
+        (has_oout && fo->kind != FILE_KIND_VFS))
+        return -ABI_ESPIPE;
+
+    /* Offset forms position through the CANONICAL lseek path -- poking
+     * fi->vfs.pos directly is overwritten by file_read's shared-OFD
+     * position load (file_pos_load), which is exactly how v1 of this loop
+     * read 0 bytes at EOF while claiming to have advanced the offset. */
+    long cur_in = 0, cur_out = 0;
+    if (has_oin) {
+        cur_in = do_syscall(SYS_LSEEK, (uint64_t)in_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)in_fd, off_in, 0, 0, 0);
+    }
+    if (has_oout) {
+        cur_out = do_syscall(SYS_LSEEK, (uint64_t)out_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)out_fd, off_out, 0, 0, 0);
+    }
+
+    enum { CFR_CHUNK = 16384 };
+    void *kb = kmalloc(CFR_CHUNK);
+    if (!kb) return -ABI_ENOMEM;
+    size_t done = 0;
+    long   err  = 0;
+    while (done < count) {
+        size_t chunk = count - done > CFR_CHUNK ? CFR_CHUNK : count - done;
+        long r = file_read(fi, kb, chunk);
+        if (r <= 0) {
+            if (!done && r != 0) err = file_err_to_abi(fi, r);
+            break;
+        }
+        long w = file_write(fo, kb, (size_t)r);
+        if (w <= 0) {
+            if (!done) err = file_err_to_abi(fo, w);
+            break;
+        }
+        done += (size_t)w;
+        if (w < r || r < (long)chunk) break;      /* short write or EOF */
+    }
+    kfree(kb);
+
+    if (has_oin) {
+        long newo = do_syscall(SYS_LSEEK, (uint64_t)in_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)in_fd, (uint64_t)cur_in, 0, 0, 0);
+        off_in = (uint64_t)newo;
+        (void)copy_to_user((void *)(uintptr_t)uoff_in, &off_in, 8);
+    }
+    if (has_oout) {
+        long newo = do_syscall(SYS_LSEEK, (uint64_t)out_fd, 0, 1, 0, 0);
+        do_syscall(SYS_LSEEK, (uint64_t)out_fd, (uint64_t)cur_out, 0, 0, 0);
+        off_out = (uint64_t)newo;
+        (void)copy_to_user((void *)(uintptr_t)uoff_out, &off_out, 8);
+    }
+    if (err && !done) return err;
+    return (long)done;
+}
+
 static long sys_dup(int oldfd) {
     struct file *f = fd_lookup(oldfd);
     if (!f) return -ABI_EBADF;
@@ -12458,8 +12535,111 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!fd_lookup((int)a1)) return -ABI_EBADF;
         return 0;               /* record locks &c: best-effort no-op */
     }
-    case LX_sendfile:           /* cat/cp fall back to a read/write loop */
-        return -ABI_ENOSYS;
+    /* ---- the kernel copy family (2026-08-22): sendfile was an honest
+     * ENOSYS and copy_file_range/splice were census gaps -- but coreutils
+     * 9.x cp and Go use copy_file_range UNCONDITIONALLY, and nginx-shaped
+     * servers treat sendfile as the primary path. One shared loop serves
+     * all three; offset-form arguments require a seekable (VFS) side. ---- */
+    case LX_sendfile:                  /* sendfile(out_fd, in_fd, *off, count) */
+        return lx_copy_fds((int)a2, (uint64_t)a3, (int)a1, 0, (size_t)a4);
+    case 326:                          /* copy_file_range(fin,*offin,fout,*offout,len,fl) */
+        return lx_copy_fds((int)a1, (uint64_t)a2, (int)a3, (uint64_t)a4,
+                           (size_t)a5);
+    case 275: {                        /* splice(fin,*offin,fout,*offout,len,fl) */
+        struct file *sfi = fd_lookup((int)a1), *sfo = fd_lookup((int)a3);
+        if (!sfi || !sfo) return -ABI_EBADF;
+        bool in_pipe  = (sfi->kind == FILE_KIND_PIPE_R);
+        bool out_pipe = (sfo->kind == FILE_KIND_PIPE_W);
+        if (!in_pipe && !out_pipe) return -ABI_EINVAL;  /* one side MUST be a pipe */
+        return lx_copy_fds((int)a1, (uint64_t)a2, (int)a3, (uint64_t)a4,
+                           (size_t)a5);
+    }
+
+    /* ---- POSIX interval timers (222-226): timer_create(2) family.
+     * glibc's librt wrappers had nothing to land on. ptimer.c fires them
+     * from the alarm sweep on the same perf_now_ns clock. ---- */
+    case 222: {                        /* timer_create(clockid, *sevp, *timerid) */
+        int signo = SIGALRM;
+        if (a2) {
+            struct { uint64_t sival; int32_t signo; int32_t notify; } sev;
+            if (copy_from_user(&sev, (const void *)a2, sizeof sev) != 0)
+                return -ABI_EFAULT;
+            if (sev.notify == 1 /* SIGEV_NONE */) signo = 0;
+            else if (sev.signo > 0 && sev.signo < SIG_MAX) signo = sev.signo;
+            else return -ABI_EINVAL;
+        }
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_create(int, int);
+        long tid = ptimer_create(tp->is_thread ? tp->tgid : tp->pid, signo);
+        if (tid < 0) return tid;
+        int tid32 = (int)tid;          /* kernel timer_t is an int */
+        if (!a3 || copy_to_user((void *)a3, &tid32, sizeof tid32) != 0) {
+            extern long ptimer_delete(int, int);
+            (void)ptimer_delete((int)tid, tp->is_thread ? tp->tgid : tp->pid);
+            return -ABI_EFAULT;
+        }
+        return 0;
+    }
+    case 223: {                        /* timer_settime(id, flags, *new, *old) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        int owner = tp->is_thread ? tp->tgid : tp->pid;
+        int64_t its[4];                /* interval.s, interval.ns, value.s, value.ns */
+        if (!a3 || copy_from_user(its, (const void *)a3, sizeof its) != 0)
+            return -ABI_EFAULT;
+        uint64_t iv = (uint64_t)its[0] * 1000000000ull + (uint64_t)its[1];
+        uint64_t vv = (uint64_t)its[2] * 1000000000ull + (uint64_t)its[3];
+        if (vv && (a2 & 1) /* TIMER_ABSTIME */) {
+            /* Absolute CLOCK_REALTIME deadline -> relative, the same rebase
+             * the futex path does. */
+            extern uint64_t lx_realtime_ns(uint64_t);
+            uint64_t now_rt = lx_realtime_ns(perf_now_ns());
+            vv = (vv > now_rt) ? vv - now_rt : 1;
+        }
+        uint64_t orem = 0, oiv = 0;
+        extern long ptimer_settime(int, int, uint64_t, uint64_t,
+                                   uint64_t *, uint64_t *);
+        long rc = ptimer_settime((int)a1, owner, vv, iv, &orem, &oiv);
+        if (rc < 0) return rc;
+        if (a4) {
+            int64_t old[4] = { (int64_t)(oiv / 1000000000ull),
+                               (int64_t)(oiv % 1000000000ull),
+                               (int64_t)(orem / 1000000000ull),
+                               (int64_t)(orem % 1000000000ull) };
+            if (copy_to_user((void *)a4, old, sizeof old) != 0)
+                return -ABI_EFAULT;
+        }
+        return 0;
+    }
+    case 224: {                        /* timer_gettime(id, *curr) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        uint64_t rem = 0, iv = 0;
+        extern long ptimer_gettime(int, int, uint64_t *, uint64_t *);
+        long rc = ptimer_gettime((int)a1,
+                                 tp->is_thread ? tp->tgid : tp->pid, &rem, &iv);
+        if (rc < 0) return rc;
+        int64_t its[4] = { (int64_t)(iv / 1000000000ull),
+                           (int64_t)(iv % 1000000000ull),
+                           (int64_t)(rem / 1000000000ull),
+                           (int64_t)(rem % 1000000000ull) };
+        if (!a2 || copy_to_user((void *)a2, its, sizeof its) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+    case 225: {                        /* timer_getoverrun(id) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_overrun(int, int);
+        return ptimer_overrun((int)a1, tp->is_thread ? tp->tgid : tp->pid);
+    }
+    case 226: {                        /* timer_delete(id) */
+        struct proc *tp = current_proc();
+        if (!tp) return -ABI_EPERM;
+        extern long ptimer_delete(int, int);
+        return ptimer_delete((int)a1, tp->is_thread ? tp->tgid : tp->pid);
+    }
 
     /* Authoritative refusals (2026-08-22). These four were named by the
      * census contract comments as "explicit ENOSYS arms" -- and DIDN'T

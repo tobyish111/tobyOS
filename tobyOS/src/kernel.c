@@ -7782,6 +7782,11 @@ void _start(void) {
              * status fields including a VmRSS that MOVES. */
             { "/bin/linux-proc2", "linux-proc2", 0, 63,
               "/proc maps + sys + net + status" },
+            /* 2026-08-22: timer_create family (librt lands somewhere now)
+             * + sendfile/copy_file_range/splice through one kernel copy
+             * loop, each byte-exact by assertion. */
+            { "/bin/linux-io", "linux-io", 0, 63,
+              "POSIX timers + kernel copy family" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write

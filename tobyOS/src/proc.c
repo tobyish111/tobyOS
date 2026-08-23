@@ -321,9 +321,12 @@ struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
 
 static void close_all_fds(struct proc *p) {
     /* Exit sweep: the process's fcntl record locks die with it (flock
-     * locks die with their descriptions inside file_close below). */
+     * locks die with their descriptions inside file_close below), and so
+     * do its POSIX interval timers. */
     { extern void fl_release_proc(struct proc *p);
       fl_release_proc(p); }
+    { extern void ptimer_release_proc(int pid);
+      ptimer_release_proc(p->is_thread ? p->tgid : p->pid); }
     for (int i = 0; i < PROC_NFDS; i++) {
         if (p->fds[i]) {
             file_close(p->fds[i]);

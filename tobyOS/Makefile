@@ -178,6 +178,7 @@ C_SRCS := src/kernel.c \
           src/usb_msc.c \
           src/file.c \
           src/flock.c \
+          src/ptimer.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -3183,6 +3184,12 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-proc2;                              \
 	    echo "[initrd] staged linux-proc2 (procfs deep fidelity)";         \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-proc2";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-io/linux-io.elf ]; then                         \
+	    cp programs/linux-io/linux-io.elf                                  \
+	         $(INITRD_STAGE)/bin/linux-io;                                 \
+	    echo "[initrd] staged linux-io (POSIX timers + copy family)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-io";                          \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \

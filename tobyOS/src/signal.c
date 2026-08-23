@@ -745,6 +745,8 @@ void signal_tick_alarms(void) {
         p->alarm_deadline_ns = 0;         /* clear BEFORE raising: one-shot */
         signal_send(p, SIGALRM);          /* full send: also WAKES a blocked proc */
     }
+    /* POSIX interval timers ride the same sweep + clock (ptimer.c). */
+    { extern void ptimer_tick(void); ptimer_tick(); }
 }
 
 void signal_deliver_if_pending(void) {
