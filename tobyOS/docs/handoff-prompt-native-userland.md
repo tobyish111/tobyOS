@@ -58,8 +58,12 @@ tobyOS programs**, and to add the kernel data sources they need. The user's dire
 - **`EXTRA_CFLAGS` reaches KERNEL objects only.** User programs need
   `PROG_EXTRA_CFLAGS`.
 - **`EXTRA_CFLAGS` changes rebuild NOTHING.** `touch src/kernel.c`, or `rm -f src/*.o`
-  on a flavour switch. **Struct growth ⇒ full `make clean`** — there is no header
-  dependency tracking, and program objects will silently keep an old layout.
+  on a flavour switch. On struct growth a full `make clean` is still the cheap safe
+  habit — but **the "there is no header dependency tracking" clause this line used to
+  carry is STALE** (2026-08-24): every object compiles with `-MMD -MP` and
+  `Makefile:5433` does `-include $(ALL_DEPS)`, so editing a header does rebuild its
+  dependents. `$(wildcard)` only picks up `.d` files that already exist, so a
+  brand-new object is unprotected on its first build.
 - **Never hide a build behind a grep.** A failed build leaves the PREVIOUS iso in
   place and you will test stale bits. Gate on the binary: assert the new marker is
   present **and the old one is gone**.
@@ -112,6 +116,27 @@ Gate state at handoff: lxposix **32/32** skipped=0 enosys_gaps=0 faults=0; lxsoc
 - `/proc/cpuinfo` now reports real CPUID vendor/brand/family/model/stepping.
 - `struct sysfs_node` gained a `fixed` field (pre-rendered content) because sysfs
   generators take no context and one function cannot serve N devices.
+- **SLICE 1 IS DONE (`e98e3de`).** `/sys/bus/usb/devices` + native `lsusb`, with
+  real `GET_DESCRIPTOR(STRING)` manufacturer/product/serial. Gate:
+  `bash logs/usbsysfs.sh` (11/11). **It exists because every other gate boots QEMU
+  with NO USB controller at all** — lxposix/shparity/oilspec would all stay green
+  with the whole USB tree broken. Add a similar attach-the-hardware gate for any
+  slice below whose data source the standard harnesses do not exercise.
+  Known limit, stated in the code: the tree is a boot SNAPSHOT, so a hot-plugged
+  device reaches `usbreg` but not `/sys`.
+
+**Two things this handoff previously told you that turned out to be wrong** — the
+build-law fix above, and:
+- **`bash logs/oilspec.sh` has no committed baseline.** `oilspec_report.py` diffs
+  against `logs/oilspec_prev.json`, which is *the last run's* archive, and
+  `logs/oilspec_failures.txt` is gitignored. A stale archive framed slice 1 as a
+  25-case regression (11 POSIX) when its failure set was byte-identical to HEAD's.
+  To clear yourself: copy `oilspec_failures.txt` aside, `git stash`, `make clean`,
+  re-run, and compare the two failure SETS — two empty symmetric differences means
+  zero regressions. Cases 2272/2273 flip on their own and are noise.
+  **The true baseline as of 2026-08-24 is POSIX 1271/1280 = 99.30%, not the 100%
+  on record**; the nine failures are named in the `shell-oilspec-third-party-gate`
+  memory. They are pre-existing and were not chased.
 
 ## What "all of them" honestly means — read before scoping
 
@@ -137,7 +162,7 @@ gates → commit**. Do not skip the surface and have the tool read kernel memory
 directly; publishing the standard path is most of the value, because it makes every
 *other* Linux tool work too.
 
-### 1. `/sys/bus/usb/devices` + native `lsusb`
+### 1. `/sys/bus/usb/devices` + native `lsusb` — **DONE (e98e3de)**
 
 Closest to what already works, so do it first and reuse `lspci` wholesale.
 `usbreg.c` already holds everything needed — the boot log prints
