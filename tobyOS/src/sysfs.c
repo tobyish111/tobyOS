@@ -20,6 +20,7 @@
 #include <tobyos/pci.h>    /* /sys/bus/pci/devices population */
 #include <tobyos/usbreg.h> /* /sys/bus/usb/devices population */
 #include <tobyos/smbios.h> /* /sys/firmware/dmi + /sys/class/dmi/id  */
+#include <tobyos/cputelem.h> /* /sys/class/hwmon + cpuN/cpufreq        */
 #include <tobyos/types.h>
 
 extern uint64_t pit_ticks(void);
@@ -245,6 +246,15 @@ static void sysfs_populate_pci(void);
 
 static void sysfs_add_dir(const char *path) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    /* Idempotent (2026-08-24). Several populators now need the same
+     * ancestor -- /class is wanted by both the DMI id tree and hwmon --
+     * and adding it twice put two nodes with one path in the table, which
+     * readdir would then list twice. Lookup would not have noticed, so
+     * this would have shown up only as a duplicated directory entry. */
+    for (int i = 0; i < g_sysfs_count; i++) {
+        if (g_sysfs_nodes[i].type == VFS_TYPE_DIR &&
+            strcmp(g_sysfs_nodes[i].path, path) == 0) return;
+    }
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
     size_t len = strlen(path);
     if (len >= VFS_PATH_MAX) len = VFS_PATH_MAX - 1;
@@ -662,6 +672,98 @@ static void sysfs_populate_dmi(void) {
             (unsigned long)si->table_len, (unsigned long)published);
 }
 
+/* ---- /sys/class/hwmon + /sys/devices/system/cpu/cpuN/cpufreq (2026-08-24)
+ *
+ * temp1_input is a GENERATOR, not a pre-rendered value: a temperature
+ * that was true at boot is a lie by the time anything reads it. The
+ * frequency files are the opposite -- MSR_PLATFORM_INFO describes fixed
+ * operating points, so those are rendered once.
+ *
+ * Both publish NOTHING when their MSR gate said no. See cputelem.h: a
+ * per-core register cannot be filed under a named CPU without a
+ * cross-CPU read, and this kernel has none.
+ */
+static int gen_temp1_input(char *buf, size_t sz) {
+    int32_t mc = 0;
+    if (!cputherm_read_mc(&mc)) {
+        /* The sensor exists but says its reading is not valid right now.
+         * An empty file is how that is said; a stale number is not. */
+        if (sz) buf[0] = '\0';
+        return 0;
+    }
+    return ksnprintf(buf, sz, "%d\n", mc);
+}
+
+static void sysfs_populate_hwmon(void) {
+    const struct cputherm_info *ti = cputherm_get();
+    if (!ti->present) {
+        kprintf("[sysfs] /sys/class/hwmon: no sensor -- nothing published\n");
+        return;
+    }
+    char val[64];
+    sysfs_add_dir("/class");                 /* idempotent-ish: see note */
+    sysfs_add_dir("/class/hwmon");
+    sysfs_add_dir("/class/hwmon/hwmon0");
+    /* `name` identifies the sensor interface to userspace; "coretemp" is
+     * the standard identifier for Intel's package/core thermal MSRs,
+     * which is exactly what this is. */
+    sysfs_add_fixed("/class/hwmon/hwmon0/name", "coretemp\n");
+    sysfs_add_file ("/class/hwmon/hwmon0/temp1_input", gen_temp1_input);
+    ksnprintf(val, sizeof val, "%s\n", ti->label);
+    sysfs_add_fixed("/class/hwmon/hwmon0/temp1_label", val);
+    ksnprintf(val, sizeof val, "%u\n", ti->tjmax_c * 1000u);
+    sysfs_add_fixed("/class/hwmon/hwmon0/temp1_crit", val);
+    kprintf("[sysfs] /sys/class/hwmon/hwmon0: coretemp, TjMax %u C\n",
+            ti->tjmax_c);
+}
+
+static void sysfs_populate_cpufreq(void) {
+    const struct cpufreq_msr_info *fi = cpufreq_msr_get();
+    if (!fi->present) {
+        kprintf("[sysfs] /sys/devices/system/cpu/*/cpufreq: no P-state info "
+                "-- nothing published\n");
+        return;
+    }
+    uint32_t ncpu = smp_cpu_count();
+    if (ncpu == 0) ncpu = 1;
+    char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
+    uint32_t made = 0;
+    for (uint32_t i = 0; i < ncpu; i++) {
+        if (g_sysfs_count + 10 >= SYSFS_MAX_NODES) break;
+        ksnprintf(dir, sizeof dir, "/devices/system/cpu/cpu%u", i);
+        sysfs_add_dir(dir);
+        ksnprintf(dir, sizeof dir, "/devices/system/cpu/cpu%u/cpufreq", i);
+        sysfs_add_dir(dir);
+
+        /* Every value below is PACKAGE-WIDE, which is why publishing it
+         * under each cpu<N> is honest even though we never read a
+         * per-core register. */
+        ksnprintf(path, sizeof path, "%s/cpuinfo_max_freq", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->max_khz);
+        sysfs_add_fixed(path, val);
+        ksnprintf(path, sizeof path, "%s/scaling_max_freq", dir);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/cpuinfo_min_freq", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->min_khz);
+        sysfs_add_fixed(path, val);
+        ksnprintf(path, sizeof path, "%s/scaling_min_freq", dir);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/base_frequency", dir);
+        ksnprintf(val, sizeof val, "%u\n", fi->base_khz);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/scaling_driver", dir);
+        ksnprintf(val, sizeof val, "%s\n", fi->driver);
+        sysfs_add_fixed(path, val);
+        made++;
+    }
+    kprintf("[sysfs] /sys/devices/system/cpu/*/cpufreq: %u cpu(s), "
+            "base %u kHz (no scaling_cur_freq/governor -- see cpufreq.c)\n",
+            made, fi->base_khz);
+}
+
 static void sysfs_add_link(const char *path, const char *target) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
@@ -921,6 +1023,8 @@ void sysfs_init(void) {
     sysfs_populate_pci();
     sysfs_populate_usb();
     sysfs_populate_dmi();
+    sysfs_populate_hwmon();
+    sysfs_populate_cpufreq();
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {

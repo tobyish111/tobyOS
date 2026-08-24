@@ -48,6 +48,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/acpi.h>
 #include <tobyos/smbios.h>
+#include <tobyos/cputelem.h>
 #include <tobyos/apic.h>
 #include <tobyos/smp.h>
 #include <tobyos/initrd.h>
@@ -715,6 +716,12 @@ static void smp_init_bsp(void) {
      * firmware-table discovery. */
     smbios_init(smbios_req.response ? smbios_req.response->entry_32 : 0,
                 smbios_req.response ? smbios_req.response->entry_64 : 0);
+    /* CPU telemetry read from MSRs. Both gate themselves on CPUID before
+     * touching a register (there is no exception-fixup table, so a
+     * speculative rdmsr is a fault waiting for the wrong machine) and
+     * publish nothing when the gate says no. */
+    cputherm_init();
+    cpufreq_msr_init();
     /* Recalibrate the TSC rate against the FADT's PM timer now that we
      * know its port. perf_init's PIT-IRQ-based estimate can be inflated
      * many-fold under loaded QEMU TCG (observed 15x: the whole OS clock
@@ -7822,6 +7829,22 @@ void _start(void) {
     }
 #endif
 
+#ifdef CPUTELEM_SELFTEST
+    /* Slices 3+4: the MSR decoders, tested against known bit patterns.
+     * This exists because QEMU advertises neither a thermal sensor nor
+     * EIST, so a QEMU run can only ever watch those modules DECLINE to
+     * publish -- which leaves the arithmetic (a TjMax subtraction and two
+     * ratio fields) completely unexercised on the only machine we can
+     * boot on demand. Nothing here is published; these are inputs to
+     * pure functions with spec-defined outputs. */
+    {
+        extern int cputherm_selftest(void);
+        extern int cpufreq_msr_selftest(void);
+        int bad = cputherm_selftest() + cpufreq_msr_selftest();
+        kprintf("[CPUTELEM] VERDICT: %s\n", bad == 0 ? "PASS" : "FAIL");
+    }
+#endif
+
 #ifdef PKGPROBE_BOOT
     /* ==================================================================
      * 2026-08-23: do the newly-exposed Linux commands actually RUN?
@@ -7882,6 +7905,20 @@ void _start(void) {
              * boot log. */
             { "dmidecode full",       "echo \"dmidecode-lines=$(dmidecode "
                                       "| wc -l | tr -d ' ')\"" },
+            /* Slices 3+4. On QEMU the EXPECTED result is that neither
+             * tree exists: no thermal sensor and no EIST are advertised,
+             * so both modules decline to publish. These probes therefore
+             * gate the HONEST-ABSENCE path -- the tools must say so
+             * plainly and exit non-zero, not print a nominal number.
+             * The positive path is covered by CPUTELEM_SELFTEST, which
+             * tests the decoders against known MSR bit patterns. */
+            { "hwmon tree",           "ls /sys/class/hwmon 2>&1; "
+                                      "echo hwmon-rc=$?" },
+            { "cpufreq tree",         "ls /sys/devices/system/cpu/cpu0 2>&1; "
+                                      "echo cpufreq-rc=$?" },
+            { "sensors",              "sensors; echo sensors-rc=$?" },
+            { "cpupower",             "cpupower frequency-info; "
+                                      "echo cpupower-rc=$?" },
         };
         kprintf("[PKGPROBE] ==== newly exposed Linux commands ====\n");
         int n = (int)(sizeof(probes) / sizeof(probes[0]));
