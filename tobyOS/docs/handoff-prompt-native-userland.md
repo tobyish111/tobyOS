@@ -153,6 +153,24 @@ Gate state at handoff: lxposix **32/32** skipped=0 enosys_gaps=0 faults=0; lxsoc
     callers**, which is exactly why it survived. Now gated. If you find more dead
     code touching MSRs or hardware, fix it BEFORE wiring it.
 
+- **SLICE 5 IS DONE (`798fb86`), AND THE ARC IS CLOSED.** Native POSIX vi at
+  `programs/tvi` (~1200 lines, VT100, modal, full command set). Gate
+  `bash logs/tvi.sh` — 53/53, driving it over a real pty and comparing the
+  **resulting FILE BYTES**. Shipped as `tvi`; busybox still owns `vi` (taking the
+  name is a one-line Makefile change, left to the user).
+  - **This handoff advised asking before building it, the agent recommended
+    against it, and the user said build it. The user was right, for a reason
+    worth carrying forward: A NATIVE TOOL EXERCISES LIBRARY SURFACE THAT PORTED
+    BINARIES REACH THROUGH THEIR OWN BUNDLED CODE.** busybox vi has its own regex
+    engine, so it could never have found what tvi's `:s` did —
+    **libtoby's `regexec()` returned `rm_eo = strlen(string)` for EVERY match**
+    (`6291f43`), wrong since the engine was written and latent because nothing in
+    the tree had ever read `rm_eo`. A latent library bug needs a CONSUMER.
+  - **Gate pacing must be REAL TIME, never an iteration count** — a busy-spin
+    starves the process it is waiting for. Two harness bugs, and their signatures
+    are the reusable part: failure correlated with LENGTH = flow control; failure
+    that SHUFFLES between runs with the same pass count = timing.
+
 **Two things this handoff previously told you that turned out to be wrong** — the
 build-law fix above, and:
 - **`bash logs/oilspec.sh` has no committed baseline.** `oilspec_report.py` diffs
@@ -233,7 +251,7 @@ non-turbo ratio). Publish `/sys/devices/system/cpu/cpu<N>/cpufreq/` with
 **Read-only first.** Setting P-states (`IA32_PERF_CTL` `0x199`) is a separate,
 riskier change and must not ride along with the reporting work.
 
-### 5. Editors — decide, don't assume
+### 5. Editors — **DONE (798fb86)**, and the user decided: build it
 
 `nano` (real GNU nano + libncursesw) and `vi` (busybox) both already resolve. A native
 terminal editor is a large piece of work with no data-source justification. Before
