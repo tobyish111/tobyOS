@@ -7829,6 +7829,26 @@ void _start(void) {
     }
 #endif
 
+#ifdef TVI_BOOT
+    /* Slice 5: the native vi conformance gate. /bin/tvitest drives
+     * /bin/tvi over a real pty and compares the RESULTING FILE BYTES --
+     * an editor's contract is what it leaves on disk, not that it exited
+     * 0. It needs a pty and a writable /tmp, so it runs here rather than
+     * as a PKGPROBE one-liner. */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=vt100", (char *)"LANG=C", 0 };
+        char *argv[] = { (char *)"tvitest", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/tvitest", .name = "tvitest",
+            .argc = 1, .argv = argv, .envc = 4, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) kprintf("[TVI] SPAWN FAILED\n");
+        else kprintf("[TVI] harness exit=%d\n", proc_wait(pid));
+    }
+#endif
+
 #ifdef CPUTELEM_SELFTEST
     /* Slices 3+4: the MSR decoders, tested against known bit patterns.
      * This exists because QEMU advertises neither a thermal sensor nor
