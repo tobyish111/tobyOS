@@ -135,6 +135,24 @@ Gate state at handoff: lxposix **32/32** skipped=0 enosys_gaps=0 faults=0; lxsoc
   can supply the table. Also: sysfs grew blob nodes (binary, no copy) and a
   per-node mode, so an MSR-derived hwmon file has somewhere to live.
 
+- **SLICES 3 AND 4 ARE DONE (`8069a3a`).** MSR telemetry: `/sys/class/hwmon` +
+  `/sys/devices/system/cpu/cpuN/cpufreq`, native `sensors` and `cpupower`. Gate
+  `bash logs/cputelem.sh` (15/15). **REAL-HARDWARE RUN IS OWED — the positive
+  path has NEVER executed**, because QEMU advertises neither a thermal sensor nor
+  EIST (its default model even reports an AMD vendor). Do not describe them as
+  working on real hardware until the EliteDesk run exists.
+  - **The MSR rule, which slice 5 and anything after must keep:** an unimplemented
+    MSR raises #GP and this kernel has **no exception-fixup table**, so gate every
+    `rdmsr` on a documented CPUID bit FIRST, then sanity-check the value.
+  - **When the positive path needs hardware you do not have, split the pure decode
+    function out and unit-test it** against known bit patterns (`-DCPUTELEM_SELFTEST`,
+    12/12). That is the half worth having; the other half is asserting the
+    honest-absence path explicitly, because "no output" reads as "nothing to report".
+  - **Found en route: an UNGATED `wrmsr` to IA32_PERF_CTL with invented ratios** in
+    `src/acpi_sleep.c` (`0x1D00` = "typical max ratio for QEMU"). It had **no
+    callers**, which is exactly why it survived. Now gated. If you find more dead
+    code touching MSRs or hardware, fix it BEFORE wiring it.
+
 **Two things this handoff previously told you that turned out to be wrong** — the
 build-law fix above, and:
 - **`bash logs/oilspec.sh` has no committed baseline.** `oilspec_report.py` diffs
@@ -194,7 +212,7 @@ walks the structure table: type 0 (BIOS), 1 (system), 2 (baseboard), 4 (processo
 17 (memory device) covers the useful output. **Real-HW value is high here** — this is
 how the EliteDesk will report its actual board and DIMMs.
 
-### 3. hwmon + native `sensors`
+### 3. hwmon + native `sensors` — **DONE (8069a3a)**
 
 Intel core temperature is `IA32_THERM_STATUS` (MSR `0x19C`): bits 22:16 are degrees
 *below* `TjMax`, and `TjMax` comes from `MSR_TEMPERATURE_TARGET` (`0x1A2`) bits 23:16.
@@ -205,7 +223,7 @@ Per-core is `0x19C` on each CPU; package is `0x1B1`. Publish
 return 0 or fault. Feature-detect (CPUID.06H:EAX bit 0 = DTS) and print nothing rather
 than a fabricated temperature if unavailable. Test on the EliteDesk before claiming it.
 
-### 4. cpufreq + native `cpupower`
+### 4. cpufreq + native `cpupower` — **DONE (8069a3a)**
 
 `IA32_PERF_STATUS` (`0x198`) bits 15:8 give the current ratio; multiply by the bus
 clock (100 MHz on Haswell, from `MSR_PLATFORM_INFO` `0xCE` bits 15:8 for the max
