@@ -456,6 +456,8 @@ PROGRAMS := programs/awk/awk.elf \
             programs/c_alloctest/c_alloctest.elf \
             programs/c_envtest/c_envtest.elf \
             programs/c_dynhello/c_dynhello.elf \
+            programs/lscpu/lscpu.elf \
+            programs/lspci/lspci.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -1489,6 +1491,8 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_envtest,c_envtest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,init,init))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lspci,lspci))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lscpu,lscpu))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -2869,6 +2873,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
+	cp programs/lscpu/lscpu.elf                       $(INITRD_STAGE)/bin/lscpu
+	cp programs/lspci/lspci.elf                       $(INITRD_STAGE)/bin/lspci
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -3646,6 +3652,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
+	    bin/lspci bin/lscpu \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
@@ -3701,6 +3708,41 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
 	    etc/oilspec/bin
+# busybox applets on PATH. Runs LAST, and both halves of that matter:
+#   - AFTER every other bin/ has been staged, so the "already taken"
+#     test sees the real binaries. Done earlier it reported 0 collisions
+#     and would then have had `cp` write the real awk THROUGH the hard
+#     link into the shared inode -- corrupting busybox and all 400 names
+#     with it.
+#   - appended with `-T`, not on the command line: 400 names is the same
+#     75 KB-of-argv problem the oilspec corpus above documents.
+# HARD links (tar typeflag '1'), which ramfs resolves by sharing the
+# target's bytes; it deliberately skips symlinks. busybox picks its
+# applet from argv[0], exactly as it does on a real system.
+	@if [ -f $(INITRD_STAGE)/bin/busybox ] && \
+	    [ -f programs/busybox/applets.txt ]; then \
+	    : > $(INITRD_STAGE)/.applets.list; \
+	    bb_n=0; bb_skip=0; \
+	    while read -r ap; do \
+	        ap=$${ap%$$(printf '\r')}; \
+	        case "$$ap" in ''|\#*) continue;; esac; \
+	        if [ -e "$(INITRD_STAGE)/bin/$$ap" ]; then \
+	            bb_skip=$$((bb_skip+1)); continue; \
+	        fi; \
+	        if ln $(INITRD_STAGE)/bin/busybox \
+	              "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null; then \
+	            echo "bin/$$ap" >> $(INITRD_STAGE)/.applets.list; \
+	            bb_n=$$((bb_n+1)); \
+	        fi; \
+	    done < programs/busybox/applets.txt; \
+	    if [ "$$bb_n" -gt 0 ]; then \
+	        (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	            --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	            -T .applets.list); \
+	    fi; \
+	    rm -f $(INITRD_STAGE)/.applets.list; \
+	    echo "[initrd] busybox applets: $$bb_n linked onto PATH, $$bb_skip skipped (a real binary owns the name)"; \
+	fi
 
 # ---------- Build ISO ----------
 #

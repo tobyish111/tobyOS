@@ -17,13 +17,17 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pmm.h>
+#include <tobyos/pci.h>    /* /sys/bus/pci/devices population */
 #include <tobyos/types.h>
 
 extern uint64_t pit_ticks(void);
 extern uint32_t pit_hz(void);
 extern uint32_t smp_cpu_count(void);
 
-#define SYSFS_MAX_NODES 96   /* slice 100: + the DRM device tree */
+/* 96 -> 320 (2026-08-23): the PCI tree costs 1 dir + 7 files per
+ * function, and a desktop board enumerates a dozen or more. The table is
+ * static, so this is ~320 * (VFS_PATH_MAX + a few words) of BSS. */
+#define SYSFS_MAX_NODES 320
 #define SYSFS_BUF_SIZE  256
 
 struct sysfs_node {
@@ -36,6 +40,13 @@ struct sysfs_node {
      * /sys/dev/char/<maj>:<min>/device/subsystem and keys the bus type on
      * the target's basename -- a regular file cannot answer that. */
     const char *link;
+    /* 2026-08-23: PRE-RENDERED file content, owned by this node. The
+     * generator signature carries no context, so one function cannot
+     * serve N per-device files (every PCI device needs its own vendor,
+     * device, class, ...). PCI topology is fixed once pci_init has run,
+     * so those files are rendered once at mount and stored here. NULL
+     * for every generator-backed or directory node. */
+    char *fixed;
 };
 
 static struct sysfs_node g_sysfs_nodes[SYSFS_MAX_NODES];
@@ -210,6 +221,8 @@ static int gen_drm_uevent(char *b, size_t s) {
 
 /* ---- registration ---- */
 
+static void sysfs_populate_pci(void);
+
 static void sysfs_add_dir(const char *path) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
@@ -230,6 +243,124 @@ static void sysfs_add_file(const char *path, int (*gen)(char *, size_t)) {
     n->path[len] = '\0';
     n->type = VFS_TYPE_FILE;
     n->generate = gen;
+}
+
+/* Add a file whose bytes are computed NOW and remembered. `text` is
+ * copied; the caller keeps ownership of its buffer. */
+static void sysfs_add_fixed(const char *path, const char *text) {
+    if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    size_t tlen = strlen(text);
+    char *copy = (char *)kmalloc(tlen + 1);
+    if (!copy) return;
+    memcpy(copy, text, tlen);
+    copy[tlen] = '\0';
+    struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
+    size_t len = strlen(path);
+    if (len >= VFS_PATH_MAX) len = VFS_PATH_MAX - 1;
+    memcpy(n->path, path, len);
+    n->path[len] = '\0';
+    n->type = VFS_TYPE_FILE;
+    n->generate = 0;
+    n->fixed = copy;
+}
+
+/* ---- /sys/bus/pci/devices (2026-08-23) ----------------------------
+ *
+ * The layout pciutils' lspci and busybox's lspci both walk: one
+ * directory per function named <domain:bus:dev.fn>, each holding the
+ * identity as lowercase 0x-prefixed text. `class` is the full 24-bit
+ * class/subclass/prog-if word, which is what tools decode into "VGA
+ * compatible controller" and friends.
+ *
+ * Until now /sys/bus/pci existed but was EMPTY -- it was created only so
+ * the DRM subsystem symlink had somewhere to point -- so every
+ * sysfs-walking tool saw a machine with no PCI devices at all. */
+static void sysfs_populate_pci(void) {
+    sysfs_add_dir("/bus/pci/devices");
+
+    size_t n = pci_device_count();
+    size_t made = 0;
+    for (size_t i = 0; i < n; i++) {
+        struct pci_dev *d = pci_device_at(i);
+        if (!d) continue;
+        /* Leave headroom: each device costs 1 dir + 8 files. */
+        if (g_sysfs_count + 10 >= SYSFS_MAX_NODES) {
+            kprintf("[sysfs] WARN: node table full -- %lu of %lu PCI "
+                    "device(s) exposed\n",
+                    (unsigned long)made, (unsigned long)n);
+            break;
+        }
+
+        char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
+        ksnprintf(dir, sizeof dir, "/bus/pci/devices/0000:%02x:%02x.%u",
+                  (unsigned)d->bus, (unsigned)d->slot, (unsigned)d->fn);
+        sysfs_add_dir(dir);
+
+        ksnprintf(path, sizeof path, "%s/vendor", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->vendor);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/device", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->device);
+        sysfs_add_fixed(path, val);
+
+        /* class/subclass/prog-if packed exactly as PCI config space has
+         * it -- lspci reads this one word, not three files. */
+        ksnprintf(path, sizeof path, "%s/class", dir);
+        ksnprintf(val, sizeof val, "0x%02x%02x%02x\n",
+                  (unsigned)d->class_code, (unsigned)d->subclass,
+                  (unsigned)d->prog_if);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/revision", dir);
+        ksnprintf(val, sizeof val, "0x%02x\n", (unsigned)d->revision);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/irq", dir);
+        ksnprintf(val, sizeof val, "%u\n",
+                  d->irq_line == 0xFF ? 0u : (unsigned)d->irq_line);
+        sysfs_add_fixed(path, val);
+
+        /* We do not track subsystem ids per device; report the device's
+         * own ids rather than inventing a different vendor, which is what
+         * a device with no subsystem header reads as anyway. */
+        ksnprintf(path, sizeof path, "%s/subsystem_vendor", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->vendor);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/subsystem_device", dir);
+        ksnprintf(val, sizeof val, "0x%04x\n", (unsigned)d->device);
+        sysfs_add_fixed(path, val);
+
+        /* uevent -- THE file busybox's lspci actually parses. It ignores
+         * vendor/device/class entirely and pulls PCI_SLOT_NAME, PCI_CLASS
+         * and PCI_ID out of here; with the file absent it printed one
+         * "(null) Class 0000: 0000:0000" per device. Keys are Linux's
+         * spelling: class is the bare 24-bit hex with no 0x, ids are
+         * uppercase VVVV:DDDD. */
+        {
+            char ue[SYSFS_BUF_SIZE];
+            ksnprintf(ue, sizeof ue,
+                      "DRIVER=%s\n"
+                      "PCI_CLASS=%X\n"
+                      "PCI_ID=%04X:%04X\n"
+                      "PCI_SUBSYS_ID=%04X:%04X\n"
+                      "PCI_SLOT_NAME=0000:%02x:%02x.%u\n",
+                      (d->driver && d->driver->name) ? d->driver->name
+                                                     : "(none)",
+                      ((unsigned)d->class_code << 16) |
+                      ((unsigned)d->subclass << 8) | (unsigned)d->prog_if,
+                      (unsigned)d->vendor, (unsigned)d->device,
+                      (unsigned)d->vendor, (unsigned)d->device,
+                      (unsigned)d->bus, (unsigned)d->slot, (unsigned)d->fn);
+            ksnprintf(path, sizeof path, "%s/uevent", dir);
+            sysfs_add_fixed(path, ue);
+        }
+
+        made++;
+    }
+    kprintf("[sysfs] /sys/bus/pci/devices: %lu device(s) exposed\n",
+            (unsigned long)made);
 }
 
 static void sysfs_add_link(const char *path, const char *target) {
@@ -273,6 +404,11 @@ static int sysfs_open(void *mnt, const char *path, struct vfs_file *out) {
     if (n->generate) {
         int len = n->generate(priv->buf, SYSFS_BUF_SIZE);
         priv->len = (size_t)(len > 0 ? len : 0);
+    } else if (n->fixed) {
+        size_t len = strlen(n->fixed);
+        if (len > SYSFS_BUF_SIZE) len = SYSFS_BUF_SIZE;
+        memcpy(priv->buf, n->fixed, len);
+        priv->len = len;
     }
     priv->pos = 0;
     out->priv = priv;
@@ -310,6 +446,8 @@ static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         char tmp[SYSFS_BUF_SIZE];
         int len = n->generate(tmp, SYSFS_BUF_SIZE);
         out->size = (size_t)(len > 0 ? len : 0);
+    } else if (n->type == VFS_TYPE_FILE && n->fixed) {
+        out->size = strlen(n->fixed);
     }
     return VFS_OK;
 }
@@ -469,6 +607,7 @@ void sysfs_init(void) {
      * follows it finds something rather than dangling. */
     sysfs_add_dir("/bus");
     sysfs_add_dir("/bus/pci");
+    sysfs_populate_pci();
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {

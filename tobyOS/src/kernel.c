@@ -7805,6 +7805,50 @@ void _start(void) {
     }
 #endif
 
+#ifdef PKGPROBE_BOOT
+    /* ==================================================================
+     * 2026-08-23: do the newly-exposed Linux commands actually RUN?
+     *
+     * Two separate claims, and a green here needs both:
+     *   1. the busybox applets are reachable BY NAME on PATH (the initrd
+     *      hard-links them), not just as `busybox <applet>`, and
+     *   2. the ones that read /sys have something to read -- lspci was
+     *      the motivating case, and it printed nothing for as long as
+     *      /sys/bus/pci existed but was empty.
+     * ================================================================== */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=linux", (char *)"LANG=C", 0 };
+        struct { const char *what; const char *cmd; } probes[] = {
+            { "applet by name",       "which vi nproc lspci" },
+            { "sysfs pci tree",       "ls /sys/bus/pci/devices" },
+            { "read one vendor file", "cat /sys/bus/pci/devices/0000:00:00.0/vendor" },
+            { "lscpu",                "lscpu" },
+            { "editors present",      "which vi nano less" },
+            { "lspci raw",            "lspci; echo lspci-rc=$?" },
+            { "lspci -m",             "lspci -m; echo rc=$?" },
+            { "free/uptime/nproc",    "nproc; uptime; free" },
+            { "seq + hexdump",        "seq 3 | hexdump -C" },
+        };
+        kprintf("[PKGPROBE] ==== newly exposed Linux commands ====\n");
+        int n = (int)(sizeof(probes) / sizeof(probes[0]));
+        for (int i = 0; i < n; i++) {
+            kprintf("[PKGPROBE] --- %s: %s\n", probes[i].what, probes[i].cmd);
+            char *argv[] = { (char *)"sh", (char *)"-c",
+                             (char *)probes[i].cmd, 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = argv, .envc = 4, .envp = envp,
+            };
+            int pid = proc_spawn(&spec);
+            if (pid < 0) { kprintf("[PKGPROBE]   SPAWN FAILED\n"); continue; }
+            int rc = proc_wait(pid);
+            kprintf("[PKGPROBE]   exit=%d\n", rc);
+        }
+        kprintf("[PKGPROBE] ==== done ====\n");
+    }
+#endif
+
 #ifdef LXPOSIX_BOOT
     /* ==================================================================
      * Linux slice 4: THE STANDING POSIX ACCEPTANCE GATE.

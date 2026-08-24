@@ -32,6 +32,7 @@
 #include <tobyos/smp.h>
 #include <tobyos/nsproxy.h>   /* the /proc/PID/ns tree (slice 8) */
 #include <tobyos/net.h>       /* /proc/net tables (2026-08-22) */
+#include <tobyos/hwinfo.h>    /* real CPUID vendor/brand for cpuinfo */
 #include <tobyos/perf.h>      /* boot_id derivation */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
@@ -600,14 +601,33 @@ static int gen_cpuinfo(char *buf, size_t cap) {
         int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); \
     } while (0)
 
+    /* Report the REAL CPU (2026-08-23). This used to answer
+     * "GenuineTobyOS" / "tobyOS virtual x86-64 CPU" for every core --
+     * invented strings, while hwinfo had the genuine CPUID vendor and
+     * brand cached since boot. Anything that identifies the machine from
+     * /proc/cpuinfo (lscpu, build scripts, JIT feature probes) was being
+     * told a fiction it could not act on. */
+    const struct abi_hwinfo_summary *hw = hwinfo_current();
+    const char *vendor = (hw && hw->cpu_vendor[0]) ? hw->cpu_vendor
+                                                   : "Unknown";
+    const char *brand  = (hw && hw->cpu_brand[0])  ? hw->cpu_brand
+                                                   : "x86-64";
+
     uint32_t ncpu = smp_cpu_count();
     if (ncpu == 0) ncpu = 1;
     for (uint32_t i = 0; i < ncpu; i++) {
         APPEND_STR("processor\t: "); APPEND_INT(i); APPEND_STR("\n");
-        APPEND_STR("vendor_id\t: GenuineTobyOS\n");
-        APPEND_STR("cpu family\t: 6\n");
-        APPEND_STR("model\t\t: 1\n");
-        APPEND_STR("model name\t: tobyOS virtual x86-64 CPU\n");
+        APPEND_STR("vendor_id\t: "); APPEND_STR(vendor); APPEND_STR("\n");
+        APPEND_STR("cpu family\t: "); APPEND_INT(hw ? hw->cpu_family : 6);
+        APPEND_STR("\n");
+        APPEND_STR("model\t\t: "); APPEND_INT(hw ? hw->cpu_model : 0);
+        APPEND_STR("\n");
+        APPEND_STR("model name\t: "); APPEND_STR(brand); APPEND_STR("\n");
+        APPEND_STR("stepping\t: "); APPEND_INT(hw ? hw->cpu_stepping : 0);
+        APPEND_STR("\n");
+        APPEND_STR("siblings\t: "); APPEND_INT(ncpu); APPEND_STR("\n");
+        APPEND_STR("core id\t\t: "); APPEND_INT(i); APPEND_STR("\n");
+        APPEND_STR("cpu cores\t: "); APPEND_INT(ncpu); APPEND_STR("\n");
         APPEND_STR("flags\t\t: fpu tsc msr sse sse2 syscall\n");
         APPEND_STR("\n");
     }
