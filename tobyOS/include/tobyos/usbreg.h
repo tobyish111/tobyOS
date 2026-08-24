@@ -55,6 +55,11 @@ enum usbreg_status {
     USBREG_STATUS_GONE         = 6, /* device was detached recently      */
 };
 
+/* Longest string-descriptor text kept per device. Matches USB_STRING_MAX
+ * in usb.h; declared separately so usbreg.h stays independent of the HCI
+ * headers. */
+#define USBREG_STRING_MAX     40
+
 struct usbreg_entry {
     enum usbreg_status status;
     uint8_t  slot_id;
@@ -68,6 +73,25 @@ struct usbreg_entry {
     uint8_t  dev_protocol;
     char     driver[USBREG_DRIVER_MAX];      /* "(none)" if unsupported */
     char     friendly[USBREG_FRIENDLY_MAX];  /* drvdb-derived name      */
+
+    /* 2026-08-24: the rest of the device descriptor, so /sys/bus/usb can
+     * publish a Linux-shaped device directory. Filled by
+     * usbreg_record_details() after the attach is recorded; `have_details`
+     * distinguishes "not fetched" from "genuinely zero", which matters
+     * because sysfs OMITS an attribute it has no value for rather than
+     * printing a plausible default. The three strings are empty when the
+     * device exposes no such string index. */
+    bool     have_details;
+    uint8_t  bus_address;      /* USB address == Linux's devnum          */
+    uint32_t route_string;     /* xHCI 20-bit route, 4 bits per hub tier */
+    uint16_t bcd_usb;
+    uint16_t bcd_device;
+    uint16_t max_packet0;
+    uint8_t  num_configs;
+    char     manufacturer[USBREG_STRING_MAX];
+    char     prod_name[USBREG_STRING_MAX];   /* iProduct; `product` above
+                                              * is already idProduct     */
+    char     serial[USBREG_STRING_MAX];
 };
 
 void usbreg_init(void);
@@ -86,6 +110,25 @@ void usbreg_record_attach(uint8_t slot_id,
                           uint8_t dev_subclass,
                           uint8_t dev_protocol,
                           const char *driver);
+
+/* Called by the HCI once enumeration has finished, to attach the rest of
+ * the device descriptor to an entry that already exists. A NO-OP when
+ * the slot has no entry, so a device that failed enumeration before any
+ * attach was recorded stays absent from the registry exactly as before.
+ *
+ * The three string arguments may be empty (the device exposed no such
+ * string index, or the fetch failed); they are stored as-is, and every
+ * consumer must treat empty as "unknown", never substitute a default. */
+void usbreg_record_details(uint8_t slot_id,
+                           uint8_t bus_address,
+                           uint32_t route_string,
+                           uint16_t bcd_usb,
+                           uint16_t bcd_device,
+                           uint16_t max_packet0,
+                           uint8_t num_configs,
+                           const char *manufacturer,
+                           const char *prod_name,
+                           const char *serial);
 
 /* Called by xhci when a port goes Disconnected (or a hub reports a
  * downstream port-status change to disconnected). Marks the entry

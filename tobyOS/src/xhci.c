@@ -1258,6 +1258,77 @@ static bool set_configuration(struct usb_device *dev, uint8_t cfg) {
                               (uint16_t)cfg, 0, 0, 0);
 }
 
+/* ---- string descriptors (2026-08-24) ---------------------------------
+ *
+ * Fetched so /sys/bus/usb/devices can carry manufacturer/product/serial,
+ * which is what makes `lsusb` print a device NAME rather than bare ids.
+ * We had the indices in the device descriptor all along and threw them
+ * away.
+ *
+ * The DMA target is g_xhci.desc_buf, the same scratch page the device
+ * and config descriptors use -- a stack buffer would be wrong here,
+ * since a >4 KiB-straddling kernel stack allocation has no guarantee of
+ * physically contiguous frames and the Data Stage TRB carries one
+ * address.  Callers must therefore have snapshotted anything they still
+ * need out of that page first.
+ */
+static bool fetch_string_raw(struct usb_device *dev, uint8_t index,
+                             uint16_t langid, uint16_t want) {
+    return xhci_control_class(dev,
+                              USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_DEVICE,
+                              USB_REQ_GET_DESCRIPTOR,
+                              (uint16_t)((USB_DESC_STRING << 8) | index),
+                              langid,
+                              g_xhci.desc_buf, want);
+}
+
+/* String index 0 is the LANGID array. Returns 0 when the device has no
+ * string support at all, which is the signal to skip the other three
+ * fetches entirely -- a device that NAKs costs a full control-transfer
+ * timeout each time, and that is boot latency on real hardware. */
+static uint16_t fetch_langid(struct usb_device *dev) {
+    memset(g_xhci.desc_buf, 0, 256);
+    if (!fetch_string_raw(dev, 0, 0, 255)) return 0;
+    const uint8_t *b = g_xhci.desc_buf;
+    if (b[1] != USB_DESC_STRING || b[0] < 4) return 0;
+    return (uint16_t)(b[2] | ((uint16_t)b[3] << 8));
+}
+
+/* UTF-16LE -> ASCII, non-representable code units become '?'. `out` is
+ * left EMPTY on any failure; callers must not substitute anything. */
+static void fetch_string(struct usb_device *dev, uint8_t index,
+                         uint16_t langid, char *out, size_t cap) {
+    if (cap == 0) return;
+    out[0] = '\0';
+    if (index == 0 || langid == 0) return;
+
+    memset(g_xhci.desc_buf, 0, 256);
+    /* Ask for the maximum first (what Linux does): one round trip for
+     * every well-behaved device, and TRB_ISP means the short packet
+     * that comes back is a success, not an error. */
+    if (!fetch_string_raw(dev, index, langid, 255)) {
+        /* Quirk path: some devices reject an over-long wLength. Learn
+         * bLength from a 2-byte header read, then ask for exactly it. */
+        memset(g_xhci.desc_buf, 0, 256);
+        if (!fetch_string_raw(dev, index, langid, 2)) return;
+        uint8_t blen = g_xhci.desc_buf[0];
+        if (blen < 4 || blen > 254) return;
+        memset(g_xhci.desc_buf, 0, 256);
+        if (!fetch_string_raw(dev, index, langid, blen)) return;
+    }
+
+    const uint8_t *b = g_xhci.desc_buf;
+    if (b[1] != USB_DESC_STRING || b[0] < 4) return;
+    size_t units = (size_t)(b[0] - 2) / 2;
+    size_t o = 0;
+    for (size_t i = 0; i < units && o + 1 < cap; i++) {
+        uint16_t u = (uint16_t)(b[2 + i * 2] | ((uint16_t)b[3 + i * 2] << 8));
+        out[o++] = (u >= 0x20 && u < 0x7f) ? (char)u : '?';
+    }
+    while (o > 0 && out[o - 1] == ' ') o--;   /* devices pad with blanks */
+    out[o] = '\0';
+}
+
 /* Forward decl: defined further down (M26B). enumerate_port + the
  * downstream-hub path xhci_attach_via_hub both call it after Address
  * Device succeeds, so the body lives between them. */
@@ -1359,7 +1430,7 @@ fail:
  * Returns true on success, false on any descriptor / SET_CONFIG /
  * class-probe failure. The caller is responsible for slot teardown
  * on a false return. */
-static bool xhci_finalize_device(struct xhci_dev_state *st) {
+static bool xhci_finalize_device_inner(struct xhci_dev_state *st) {
     uint8_t slot_id = st->usb.slot_id;
 
     /* Probe descriptor in two passes: first 8 bytes to learn the real
@@ -1438,6 +1509,29 @@ static bool xhci_finalize_device(struct xhci_dev_state *st) {
     uint8_t dev_protocol = dev_desc->bDeviceProtocol;
     uint16_t dev_vid     = dev_desc->idVendor;
     uint16_t dev_pid     = dev_desc->idProduct;
+
+    /* 2026-08-24: keep the rest of the descriptor too, so /sys/bus/usb
+     * can publish it. These four scalars plus the three string indices
+     * were being read and discarded on every enumeration. */
+    st->usb.bcd_usb     = dev_desc->bcdUSB;
+    st->usb.bcd_device  = dev_desc->bcdDevice;
+    st->usb.num_configs = dev_desc->bNumConfigurations;
+    uint8_t i_manuf  = dev_desc->iManufacturer;
+    uint8_t i_prod   = dev_desc->iProduct;
+    uint8_t i_serial = dev_desc->iSerialNumber;
+
+    /* Strings, if the device has any. This CLOBBERS g_xhci.desc_buf,
+     * which is why it happens after the snapshot above and before the
+     * config-descriptor fetch below re-uses the same page. */
+    if (i_manuf || i_prod || i_serial) {
+        uint16_t langid = fetch_langid(&st->usb);
+        fetch_string(&st->usb, i_manuf,  langid,
+                     st->usb.manufacturer, sizeof st->usb.manufacturer);
+        fetch_string(&st->usb, i_prod,   langid,
+                     st->usb.product,      sizeof st->usb.product);
+        fetch_string(&st->usb, i_serial, langid,
+                     st->usb.serial,       sizeof st->usb.serial);
+    }
 
     /* Read 9-byte config header to learn wTotalLength, then the full
      * config descriptor (which contains all interface + endpoint +
@@ -1717,6 +1811,27 @@ static bool xhci_finalize_device(struct xhci_dev_state *st) {
      * driver we know about (e.g. a printer). Return success either
      * way -- the slot stays in_use so it shows up in devlist. */
     return true;
+}
+
+/* The inner function records the usbreg attach at nine different exits
+ * (hub / HID / MSC / safe-mode / unclaimed / ...). Rather than thread
+ * the descriptor detail through every one of them, attach it here, once,
+ * after whichever exit ran. usbreg_record_details() is a no-op when the
+ * slot has no entry, so an enumeration that failed before recording an
+ * attach still leaves the registry exactly as it did before. */
+static bool xhci_finalize_device(struct xhci_dev_state *st) {
+    bool ok = xhci_finalize_device_inner(st);
+    usbreg_record_details(st->usb.slot_id,
+                          st->usb.bus_address,
+                          st->usb.route_string,
+                          st->usb.bcd_usb,
+                          st->usb.bcd_device,
+                          st->usb.mps0,
+                          st->usb.num_configs,
+                          st->usb.manufacturer,
+                          st->usb.product,
+                          st->usb.serial);
+    return ok;
 }
 
 /* ============================================================== */

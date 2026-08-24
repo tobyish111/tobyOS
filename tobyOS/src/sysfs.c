@@ -18,6 +18,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/pmm.h>
 #include <tobyos/pci.h>    /* /sys/bus/pci/devices population */
+#include <tobyos/usbreg.h> /* /sys/bus/usb/devices population */
 #include <tobyos/types.h>
 
 extern uint64_t pit_ticks(void);
@@ -26,8 +27,15 @@ extern uint32_t smp_cpu_count(void);
 
 /* 96 -> 320 (2026-08-23): the PCI tree costs 1 dir + 7 files per
  * function, and a desktop board enumerates a dozen or more. The table is
- * static, so this is ~320 * (VFS_PATH_MAX + a few words) of BSS. */
-#define SYSFS_MAX_NODES 320
+ * static, so this is ~320 * (VFS_PATH_MAX + a few words) of BSS.
+ *
+ * 320 -> 640 (2026-08-24): the USB tree costs 1 dir + up to 16 files per
+ * device (USBREG_MAX = 16 of them), and 320 was ALREADY within reach on a
+ * real board -- an EliteDesk enumerates ~25 PCI functions, which is 225
+ * nodes of PCI alone against a base of 33. The headroom checks below
+ * degrade gracefully, but a machine that silently exposes only some of
+ * its devices is the kind of half-truth this arc exists to avoid. */
+#define SYSFS_MAX_NODES 640
 #define SYSFS_BUF_SIZE  256
 
 struct sysfs_node {
@@ -363,6 +371,187 @@ static void sysfs_populate_pci(void) {
             (unsigned long)made);
 }
 
+/* ---- /sys/bus/usb/devices (2026-08-24) ----------------------------
+ *
+ * The layout usbutils' lsusb walks: one directory per device, named
+ * <busnum>-<rootport>[.<hubport>...], holding the device descriptor as
+ * text attributes. Linux additionally synthesises a root-hub device per
+ * host controller (with its OWN 1d6b:0002/0003 ids, which no silicon
+ * ever reported); tobyOS does not, so nothing here is a device that
+ * did not answer GET_DESCRIPTOR.
+ *
+ * Bus number: tobyOS binds exactly ONE xHC (xhci_probe refuses a second
+ * with "already bound"), and it is the only host controller that records
+ * into usbreg -- usb_legacy.c drives UHCI/OHCI/EHCI for diagnostics and
+ * legacy input without registering devices. So bus 1 is a fact here, not
+ * a placeholder. If a second controller ever registers, this must carry
+ * a real controller index instead.
+ *
+ * Port numbers are the xHC's OWN root-port indices, which is NOT what
+ * Linux would print for the same machine: Linux's xhci driver registers
+ * two HCDs per controller (USB2 primary + USB3 shared) and renumbers
+ * ports within each, so a hub on qemu-xhci's USB2 port 1 -- xHCI root
+ * port 5, because ports 1-4 are the SuperSpeed set -- is "1-1" there and
+ * "1-5" here. tobyOS drives one flat bus, so it reports the port number
+ * it actually used. Faking Linux's split would mean inventing a second
+ * bus that does not exist.
+ *
+ * SNAPSHOT, not a live view: nodes are built once at sysfs_init, which
+ * runs long after pci_bind_drivers has enumerated the boot-time USB
+ * topology. A device hot-plugged later attaches to usbreg but does NOT
+ * appear here -- the node table is append-only. Same limitation the PCI
+ * tree has; called out because for USB it is much easier to hit.
+ */
+static const char *usb_speed_mbps(uint8_t code) {
+    /* Linux's `speed` attribute is the signalling rate in Mbit/s as a
+     * decimal string. Anything we do not recognise gets NO attribute
+     * rather than a guessed rate. */
+    switch (code) {
+        case 1: return "12";      /* full  */
+        case 2: return "1.5";     /* low   */
+        case 3: return "480";     /* high  */
+        case 4: return "5000";    /* super */
+        default: return NULL;
+    }
+}
+
+static void sysfs_populate_usb(void) {
+    sysfs_add_dir("/bus/usb");
+    sysfs_add_dir("/bus/usb/devices");
+
+    size_t made = 0, skipped_full = 0;
+    for (size_t i = 0; i < USBREG_MAX; i++) {
+        const struct usbreg_entry *e = usbreg_get(i);
+        if (!e) continue;                        /* FREE row */
+        if (e->status == USBREG_STATUS_GONE) continue;  /* detached */
+
+        /* Each device costs 1 dir + up to 16 files. */
+        if (g_sysfs_count + 18 >= SYSFS_MAX_NODES) { skipped_full++; continue; }
+
+        /* Linux port-path name. hub_depth nibbles of the xHCI route
+         * string spell the port taken at each tier below the root. */
+        char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
+        int dl = ksnprintf(dir, sizeof dir, "/bus/usb/devices/1-%u",
+                           (unsigned)e->port_id);
+        for (unsigned t = 0; t < e->hub_depth && dl > 0 &&
+                             (size_t)dl < sizeof dir; t++) {
+            dl += ksnprintf(dir + dl, sizeof dir - (size_t)dl, ".%u",
+                            (unsigned)((e->route_string >> (t * 4)) & 0xFu));
+        }
+        sysfs_add_dir(dir);
+
+        ksnprintf(path, sizeof path, "%s/idVendor", dir);
+        ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->vendor);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/idProduct", dir);
+        ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->product);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/bDeviceClass", dir);
+        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_class);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/bDeviceSubClass", dir);
+        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_subclass);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/bDeviceProtocol", dir);
+        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_protocol);
+        sysfs_add_fixed(path, val);
+
+        ksnprintf(path, sizeof path, "%s/busnum", dir);
+        sysfs_add_fixed(path, "1\n");
+
+        const char *spd = usb_speed_mbps(e->speed);
+        if (spd) {
+            ksnprintf(path, sizeof path, "%s/speed", dir);
+            ksnprintf(val, sizeof val, "%s\n", spd);
+            sysfs_add_fixed(path, val);
+        }
+
+        /* Everything below comes from the full device descriptor, which
+         * only exists once usbreg_record_details has run. Without it the
+         * fields would all read zero, and a bcdUSB of 0.00 is a lie
+         * where an absent file is the truth. */
+        if (e->have_details) {
+            ksnprintf(path, sizeof path, "%s/devnum", dir);
+            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->bus_address);
+            sysfs_add_fixed(path, val);
+
+            /* Linux renders bcdUSB space-padded to width 2: " 2.00". */
+            ksnprintf(path, sizeof path, "%s/version", dir);
+            ksnprintf(val, sizeof val, "%s%x.%02x\n",
+                      (e->bcd_usb >> 8) < 0x10 ? " " : "",
+                      (unsigned)(e->bcd_usb >> 8),
+                      (unsigned)(e->bcd_usb & 0xFFu));
+            sysfs_add_fixed(path, val);
+
+            ksnprintf(path, sizeof path, "%s/bcdDevice", dir);
+            ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->bcd_device);
+            sysfs_add_fixed(path, val);
+
+            ksnprintf(path, sizeof path, "%s/bMaxPacketSize0", dir);
+            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->max_packet0);
+            sysfs_add_fixed(path, val);
+
+            ksnprintf(path, sizeof path, "%s/bNumConfigurations", dir);
+            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->num_configs);
+            sysfs_add_fixed(path, val);
+
+            /* String descriptors. An empty string means the device has
+             * no such index (or the fetch failed) -- Linux omits the
+             * attribute in exactly that case, and so do we. */
+            if (e->manufacturer[0]) {
+                ksnprintf(path, sizeof path, "%s/manufacturer", dir);
+                ksnprintf(val, sizeof val, "%s\n", e->manufacturer);
+                sysfs_add_fixed(path, val);
+            }
+            if (e->prod_name[0]) {
+                ksnprintf(path, sizeof path, "%s/product", dir);
+                ksnprintf(val, sizeof val, "%s\n", e->prod_name);
+                sysfs_add_fixed(path, val);
+            }
+            if (e->serial[0]) {
+                ksnprintf(path, sizeof path, "%s/serial", dir);
+                ksnprintf(val, sizeof val, "%s\n", e->serial);
+                sysfs_add_fixed(path, val);
+            }
+        }
+
+        /* uevent, in Linux's spelling for a usb_device. MAJOR/MINOR/
+         * DEVNAME are deliberately absent: there is no /dev/bus/usb node
+         * to name. PRODUCT is vid/pid/bcdDevice, TYPE is the class
+         * triple in DECIMAL. */
+        {
+            char ue[SYSFS_BUF_SIZE];
+            ksnprintf(ue, sizeof ue,
+                      "DEVTYPE=usb_device\n"
+                      "DRIVER=%s\n"
+                      "PRODUCT=%x/%x/%x\n"
+                      "TYPE=%u/%u/%u\n"
+                      "BUSNUM=001\n"
+                      "DEVNUM=%03u\n",
+                      e->driver[0] ? e->driver : "(none)",
+                      (unsigned)e->vendor, (unsigned)e->product,
+                      (unsigned)e->bcd_device,
+                      (unsigned)e->dev_class, (unsigned)e->dev_subclass,
+                      (unsigned)e->dev_protocol,
+                      (unsigned)e->bus_address);
+            ksnprintf(path, sizeof path, "%s/uevent", dir);
+            sysfs_add_fixed(path, ue);
+        }
+
+        made++;
+    }
+    if (skipped_full) {
+        kprintf("[sysfs] WARN: node table full -- %lu USB device(s) NOT "
+                "exposed\n", (unsigned long)skipped_full);
+    }
+    kprintf("[sysfs] /sys/bus/usb/devices: %lu device(s) exposed\n",
+            (unsigned long)made);
+}
+
 static void sysfs_add_link(const char *path, const char *target) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
@@ -608,6 +797,7 @@ void sysfs_init(void) {
     sysfs_add_dir("/bus");
     sysfs_add_dir("/bus/pci");
     sysfs_populate_pci();
+    sysfs_populate_usb();
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {

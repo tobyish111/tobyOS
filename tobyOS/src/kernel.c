@@ -7829,6 +7829,23 @@ void _start(void) {
             { "lspci -m",             "lspci -m; echo rc=$?" },
             { "free/uptime/nproc",    "nproc; uptime; free" },
             { "seq + hexdump",        "seq 3 | hexdump -C" },
+            /* 2026-08-24 -- slice 1 of the native-userland arc: does the
+             * USB tree carry real values, and does lsusb read them? The
+             * probe prints the FILES as well as the tool, so a wrong
+             * number is attributable to the kernel or the tool and not
+             * to "something went wrong somewhere". */
+            { "which lsusb",          "which lsusb" },
+            { "sysfs usb tree",       "ls /sys/bus/usb/devices" },
+            { "usb attrs (raw)",      "for d in /sys/bus/usb/devices/*/; do "
+                                      "echo \"== $d\"; cat $d/uevent; "
+                                      "for a in idVendor idProduct speed "
+                                      "version busnum devnum manufacturer "
+                                      "product serial; do "
+                                      "[ -f $d$a ] && echo \"$a=$(cat $d$a)\"; "
+                                      "done; done" },
+            { "lsusb",                "lsusb; echo lsusb-rc=$?" },
+            { "lsusb -t",             "lsusb -t; echo rc=$?" },
+            { "lsusb -v",             "lsusb -v; echo rc=$?" },
         };
         kprintf("[PKGPROBE] ==== newly exposed Linux commands ====\n");
         int n = (int)(sizeof(probes) / sizeof(probes[0]));
