@@ -19,6 +19,7 @@
 #include <tobyos/pmm.h>
 #include <tobyos/pci.h>    /* /sys/bus/pci/devices population */
 #include <tobyos/usbreg.h> /* /sys/bus/usb/devices population */
+#include <tobyos/smbios.h> /* /sys/firmware/dmi + /sys/class/dmi/id  */
 #include <tobyos/types.h>
 
 extern uint64_t pit_ticks(void);
@@ -55,6 +56,17 @@ struct sysfs_node {
      * so those files are rendered once at mount and stored here. NULL
      * for every generator-backed or directory node. */
     char *fixed;
+    /* 2026-08-24: BINARY content, served straight from kernel memory.
+     * `fixed` cannot carry it for two reasons -- it is NUL-terminated
+     * (the DMI table is full of NULs) and the read path copies it into a
+     * 256-byte scratch buffer, while an SMBIOS table is kilobytes. A blob
+     * node points at memory the kernel already owns for the life of the
+     * system, so nothing is copied at all. */
+    const uint8_t *blob;
+    size_t         blob_len;
+    /* Linux keeps the DMI serial numbers root-only; every other sysfs
+     * node here is 0444. 0 means "use the default". */
+    uint32_t mode;
 };
 
 static struct sysfs_node g_sysfs_nodes[SYSFS_MAX_NODES];
@@ -552,6 +564,104 @@ static void sysfs_populate_usb(void) {
             (unsigned long)made);
 }
 
+/* Add a file whose bytes are BINARY kernel memory, served in place. The
+ * caller must guarantee the pointer outlives the mount (SMBIOS's does --
+ * it is firmware memory mapped into the HHDM for the life of the
+ * system). */
+static void sysfs_add_blob(const char *path, const uint8_t *data, size_t len,
+                           uint32_t mode) {
+    if (g_sysfs_count >= SYSFS_MAX_NODES) return;
+    if (!data || !len) return;
+    struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
+    size_t plen = strlen(path);
+    if (plen >= VFS_PATH_MAX) plen = VFS_PATH_MAX - 1;
+    memcpy(n->path, path, plen);
+    n->path[plen] = '\0';
+    n->type     = VFS_TYPE_FILE;
+    n->generate = 0;
+    n->blob     = data;
+    n->blob_len = len;
+    n->mode     = mode;
+}
+
+static void sysfs_add_fixed_mode(const char *path, const char *text,
+                                 uint32_t mode) {
+    int before = g_sysfs_count;
+    sysfs_add_fixed(path, text);
+    if (g_sysfs_count > before) g_sysfs_nodes[before].mode = mode;
+}
+
+/* ---- /sys/firmware/dmi + /sys/class/dmi/id (2026-08-24) -------------
+ *
+ * Two surfaces over one table, because Linux software reads two:
+ *   - dmidecode(8) opens /sys/firmware/dmi/tables/{smbios_entry_point,DMI}
+ *     and decodes the raw structures itself.
+ *   - almost everything else (systemd, hwinfo, lots of shell scripts)
+ *     reads the pre-parsed one-line files under /sys/class/dmi/id.
+ *
+ * If the firmware reported no SMBIOS at all, NOTHING is published -- not
+ * empty files, not "unknown". An absent attribute is how Linux says "this
+ * machine did not tell me", and a tool can act on that; a file containing
+ * a guess it cannot distinguish from a fact is worse than no file.
+ */
+static void sysfs_populate_dmi(void) {
+    const struct smbios_info *si = smbios_get();
+    if (!si->present) {
+        kprintf("[sysfs] /sys/firmware/dmi: no SMBIOS -- nothing published\n");
+        return;
+    }
+
+    sysfs_add_dir("/firmware");
+    sysfs_add_dir("/firmware/dmi");
+    sysfs_add_dir("/firmware/dmi/tables");
+    sysfs_add_blob("/firmware/dmi/tables/smbios_entry_point",
+                   si->entry, si->entry_len, 00400u);
+    sysfs_add_blob("/firmware/dmi/tables/DMI",
+                   si->table, si->table_len, 00400u);
+
+    /* The identity files. Each is one line, and each is present only if
+     * the firmware actually reported it. */
+    static const struct { const char *name; int id; bool secret; } ids[] = {
+        { "bios_vendor",      SMBIOS_ID_BIOS_VENDOR,      false },
+        { "bios_version",     SMBIOS_ID_BIOS_VERSION,     false },
+        { "bios_date",        SMBIOS_ID_BIOS_DATE,        false },
+        { "sys_vendor",       SMBIOS_ID_SYS_VENDOR,       false },
+        { "product_name",     SMBIOS_ID_PRODUCT_NAME,     false },
+        { "product_version",  SMBIOS_ID_PRODUCT_VERSION,  false },
+        { "product_serial",   SMBIOS_ID_PRODUCT_SERIAL,   true  },
+        { "board_vendor",     SMBIOS_ID_BOARD_VENDOR,     false },
+        { "board_name",       SMBIOS_ID_BOARD_NAME,       false },
+        { "board_version",    SMBIOS_ID_BOARD_VERSION,    false },
+        { "board_serial",     SMBIOS_ID_BOARD_SERIAL,     true  },
+        { "chassis_vendor",   SMBIOS_ID_CHASSIS_VENDOR,   false },
+    };
+
+    bool made_dir = false;
+    size_t published = 0;
+    char path[VFS_PATH_MAX], val[96];
+    for (size_t i = 0; i < sizeof(ids) / sizeof(ids[0]); i++) {
+        const char *s = smbios_id_string(ids[i].id);
+        if (!s) continue;
+        if (!made_dir) {
+            sysfs_add_dir("/class");
+            sysfs_add_dir("/class/dmi");
+            sysfs_add_dir("/class/dmi/id");
+            made_dir = true;
+        }
+        ksnprintf(path, sizeof path, "/class/dmi/id/%s", ids[i].name);
+        ksnprintf(val, sizeof val, "%s\n", s);
+        /* Serial numbers are 0400 on Linux; match that rather than
+         * publishing a machine's serial world-readable. */
+        sysfs_add_fixed_mode(path, val, ids[i].secret ? 00400u : 00444u);
+        published++;
+    }
+
+    kprintf("[sysfs] /sys/firmware/dmi: SMBIOS %u.%u via %s, "
+            "%lu-byte table, %lu id file(s)\n",
+            si->major, si->minor, si->source,
+            (unsigned long)si->table_len, (unsigned long)published);
+}
+
 static void sysfs_add_link(const char *path, const char *target) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
     struct sysfs_node *n = &g_sysfs_nodes[g_sysfs_count++];
@@ -567,7 +677,8 @@ static void sysfs_add_link(const char *path, const char *target) {
 /* ---- VFS ops ---- */
 
 struct sysfs_file_priv {
-    char buf[SYSFS_BUF_SIZE];
+    char buf[SYSFS_BUF_SIZE];   /* backing store for generated content   */
+    const uint8_t *src;         /* what read() serves: buf, fixed, blob  */
     size_t len;
     size_t pos;
 };
@@ -593,11 +704,19 @@ static int sysfs_open(void *mnt, const char *path, struct vfs_file *out) {
     if (n->generate) {
         int len = n->generate(priv->buf, SYSFS_BUF_SIZE);
         priv->len = (size_t)(len > 0 ? len : 0);
+        priv->src = (const uint8_t *)priv->buf;
+    } else if (n->blob) {
+        /* No copy: the blob is kernel memory that outlives every handle. */
+        priv->src = n->blob;
+        priv->len = n->blob_len;
     } else if (n->fixed) {
-        size_t len = strlen(n->fixed);
-        if (len > SYSFS_BUF_SIZE) len = SYSFS_BUF_SIZE;
-        memcpy(priv->buf, n->fixed, len);
-        priv->len = len;
+        /* Served in place rather than copied into the 256-byte scratch
+         * buffer, which used to silently truncate anything longer. */
+        priv->src = (const uint8_t *)n->fixed;
+        priv->len = strlen(n->fixed);
+    } else {
+        priv->src = (const uint8_t *)priv->buf;
+        priv->len = 0;
     }
     priv->pos = 0;
     out->priv = priv;
@@ -612,11 +731,11 @@ static int sysfs_close(struct vfs_file *f) {
 
 static long sysfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct sysfs_file_priv *priv = f->priv;
-    if (!priv) return 0;
+    if (!priv || !priv->src) return 0;
     if (priv->pos >= priv->len) return 0;
     size_t avail = priv->len - priv->pos;
     if (n > avail) n = avail;
-    memcpy(buf, priv->buf + priv->pos, n);
+    memcpy(buf, priv->src + priv->pos, n);
     priv->pos += n;
     f->pos = priv->pos;
     return (long)n;
@@ -630,11 +749,13 @@ static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     out->size = 0;
     out->uid = 0;
     out->gid = 0;
-    out->mode = 00444u | VFS_MODE_VALID;
+    out->mode = (n->mode ? n->mode : 00444u) | VFS_MODE_VALID;
     if (n->type == VFS_TYPE_FILE && n->generate) {
         char tmp[SYSFS_BUF_SIZE];
         int len = n->generate(tmp, SYSFS_BUF_SIZE);
         out->size = (size_t)(len > 0 ? len : 0);
+    } else if (n->type == VFS_TYPE_FILE && n->blob) {
+        out->size = n->blob_len;
     } else if (n->type == VFS_TYPE_FILE && n->fixed) {
         out->size = strlen(n->fixed);
     }
@@ -687,7 +808,8 @@ static int sysfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             out->size = 0;
             out->uid = 0;
             out->gid = 0;
-            out->mode = 00444u | VFS_MODE_VALID;
+            out->mode = (g_sysfs_nodes[i].mode ? g_sysfs_nodes[i].mode
+                                               : 00444u) | VFS_MODE_VALID;
             d->index++;
             return VFS_OK;
         }
@@ -798,6 +920,7 @@ void sysfs_init(void) {
     sysfs_add_dir("/bus/pci");
     sysfs_populate_pci();
     sysfs_populate_usb();
+    sysfs_populate_dmi();
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {

@@ -47,6 +47,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/acpi.h>
+#include <tobyos/smbios.h>
 #include <tobyos/apic.h>
 #include <tobyos/smp.h>
 #include <tobyos/initrd.h>
@@ -395,6 +396,17 @@ static volatile struct limine_rsdp_request rsdp_req = {
     .response = 0
 };
 
+/* SMBIOS/DMI entry point -- the firmware's description of the physical
+ * machine (board, BIOS, chassis, DIMMs). src/smbios.c falls back to
+ * scanning the BIOS F-segment if this response is absent, so a NULL here
+ * is not fatal on a legacy boot. */
+__attribute__((used, section(".limine_reqs")))
+static volatile struct limine_smbios_request smbios_req = {
+    .id       = LIMINE_SMBIOS_REQUEST,
+    .revision = 0,
+    .response = 0
+};
+
 __attribute__((used, section(".limine_reqs")))
 static volatile uint64_t requests_end[] = {
     0xadc0e0531bb10d03, 0x9572709f31764c62
@@ -698,6 +710,11 @@ static void smp_init_bsp(void) {
                      ? normalise_rsdp_pointer(rsdp_req.response->address)
                      : 0;
     acpi_init(rsdp);
+    /* SMBIOS/DMI. Needs the VMM (it maps the firmware's table into the
+     * HHDM) and nothing else, so it rides here next to the other
+     * firmware-table discovery. */
+    smbios_init(smbios_req.response ? smbios_req.response->entry_32 : 0,
+                smbios_req.response ? smbios_req.response->entry_64 : 0);
     /* Recalibrate the TSC rate against the FADT's PM timer now that we
      * know its port. perf_init's PIT-IRQ-based estimate can be inflated
      * many-fold under loaded QEMU TCG (observed 15x: the whole OS clock
@@ -7846,6 +7863,25 @@ void _start(void) {
             { "lsusb",                "lsusb; echo lsusb-rc=$?" },
             { "lsusb -t",             "lsusb -t; echo rc=$?" },
             { "lsusb -v",             "lsusb -v; echo rc=$?" },
+            /* Slice 2: SMBIOS. Print the FILES and the tool separately so
+             * a wrong value is attributable to the kernel or the decoder,
+             * and dump /sys/class/dmi/id so a missing attribute (firmware
+             * said nothing) is visible as absent rather than as blank. */
+            { "dmi tables present",   "ls -l /sys/firmware/dmi/tables" },
+            { "dmi id attributes",    "for f in /sys/class/dmi/id/*; do "
+                                      "echo \"$(basename $f)=$(cat $f)\"; done" },
+            { "dmidecode -t 0",       "dmidecode -t 0; echo rc=$?" },
+            { "dmidecode -t 1 -t 2",  "dmidecode -t 1 -t 2; echo rc=$?" },
+            { "dmidecode -t 17",      "dmidecode -t 17; echo rc=$?" },
+            { "dmidecode -s",         "dmidecode -s system-manufacturer; "
+                                      "dmidecode -s bios-version; "
+                                      "echo rc=$?" },
+            /* Labelled, and whitespace-stripped: `wc -l` pads its output,
+             * so a bare count cannot be asserted with an anchored regex
+             * and an unanchored one matches every other number in the
+             * boot log. */
+            { "dmidecode full",       "echo \"dmidecode-lines=$(dmidecode "
+                                      "| wc -l | tr -d ' ')\"" },
         };
         kprintf("[PKGPROBE] ==== newly exposed Linux commands ====\n");
         int n = (int)(sizeof(probes) / sizeof(probes[0]));

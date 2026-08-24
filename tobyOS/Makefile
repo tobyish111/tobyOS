@@ -124,6 +124,7 @@ C_SRCS := src/kernel.c \
           src/tss.c \
           src/syscall.c \
           src/acpi.c \
+          src/smbios.c \
           src/apic.c \
           src/smp.c \
           src/vfs.c \
@@ -459,6 +460,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/lscpu/lscpu.elf \
             programs/lspci/lspci.elf \
             programs/lsusb/lsusb.elf \
+            programs/dmidecode/dmidecode.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -1495,6 +1497,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,init,init))
 $(eval $(call LIBTOBY_PROGRAM_RULES,lspci,lspci))
 $(eval $(call LIBTOBY_PROGRAM_RULES,lscpu,lscpu))
 $(eval $(call LIBTOBY_PROGRAM_RULES,lsusb,lsusb))
+$(eval $(call LIBTOBY_PROGRAM_RULES,dmidecode,dmidecode))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -2878,6 +2881,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/lscpu/lscpu.elf                       $(INITRD_STAGE)/bin/lscpu
 	cp programs/lspci/lspci.elf                       $(INITRD_STAGE)/bin/lspci
 	cp programs/lsusb/lsusb.elf                       $(INITRD_STAGE)/bin/lsusb
+	cp programs/dmidecode/dmidecode.elf               $(INITRD_STAGE)/bin/dmidecode
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -3655,7 +3659,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
-	    bin/lspci bin/lscpu bin/lsusb \
+	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
