@@ -124,6 +124,16 @@ Gate state at handoff: lxposix **32/32** skipped=0 enosys_gaps=0 faults=0; lxsoc
   slice below whose data source the standard harnesses do not exercise.
   Known limit, stated in the code: the tree is a boot SNAPSHOT, so a hot-plugged
   device reaches `usbreg` but not `/sys`.
+- **SLICE 2 IS DONE (`e0a5156`).** SMBIOS/DMI discovery (`src/smbios.c`),
+  `/sys/firmware/dmi/tables/{smbios_entry_point,DMI}` + `/sys/class/dmi/id/*`,
+  native `dmidecode`. Gate: `bash logs/dmi.sh` (17/17). **Its three-boot shape
+  is the transferable lesson for slices 3-4: when a feature has a FALLBACK
+  path, one gate run cannot tell you the primary path works.** [A] BIOS default
+  exercises the F-segment scan, which succeeds alone; [B] injects control
+  strings via `-smbios type=1,manufacturer=…` so a decoder returning constants
+  fails; [C] boots UEFI, where there is no F-segment, so only Limine's response
+  can supply the table. Also: sysfs grew blob nodes (binary, no copy) and a
+  per-node mode, so an MSR-derived hwmon file has somewhere to live.
 
 **Two things this handoff previously told you that turned out to be wrong** — the
 build-law fix above, and:
@@ -173,7 +183,7 @@ printing `Bus %03d Device %03d: ID %04x:%04x %s`.
 Note busybox's `lsusb` applet is linked and will take the name until you ship a real
 binary — the staging rule skips names a real binary owns, so shipping yours wins.
 
-### 2. SMBIOS + native `dmidecode`
+### 2. SMBIOS + native `dmidecode` — **DONE (e0a5156)**
 
 Limine provides an SMBIOS entry-point response; plumb it through the boot info the
 way the framebuffer/memmap responses already are. Expose
