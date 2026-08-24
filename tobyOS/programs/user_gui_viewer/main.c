@@ -164,6 +164,13 @@ static int toolbar_hit(int x,int y){ if(y<0||y>=TOOLBAR_H)return 0; if(x>=4&&x<4
 
 static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
     (void)c;
+    if(ev->type==TK_EV_WHEEL){
+        if(!ev->wheel)return;
+        if(ev->wheel>0)scroll_up((int)ev->wheel*TK_WHEEL_LINES);
+        else           scroll_down((int)-ev->wheel*TK_WHEEL_LINES);
+        tk_redraw(w);
+        return;
+    }
     if(ev->type!=TK_EV_MOUSE_DOWN)return;
     int hit=toolbar_hit(ev->x,ev->y);
     if(hit==1&&g_mode!=MODE_TEXT){ g_mode=MODE_TEXT; g_top_line=0; tk_redraw(w); }

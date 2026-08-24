@@ -51,13 +51,17 @@ struct http_fetch {
     uint8_t       reserved[64];
 };
 
+/* Local mirror of the kernel struct gui_event -- keep in step with
+ * include/tobyos/gui.h AND toby/tk.h (the wheel field replaced one of
+ * the two old pad bytes; size is unchanged). */
 struct gui_event {
     int     type;
     int     x;
     int     y;
     uint8_t button;
     uint8_t key;
-    uint8_t _pad[2];
+    signed char wheel;   /* int8_t is not in this program's type set */
+    uint8_t _pad[1];
 };
 #define GUI_EV_MOUSE_MOVE 1
 #define GUI_EV_MOUSE_DOWN 2
@@ -16967,6 +16971,14 @@ static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *
     (void)w; (void)c;
     if (ev->type == TK_EV_MOUSE_DOWN) handle_mouse_down(0, ev->x, ev->y);
     else if (ev->type == TK_EV_MOUSE_MOVE) handle_mouse_move(0, ev->x, ev->y);
+    else if (ev->type == TK_EV_WHEEL && ev->wheel) {
+        /* Same travel per notch as j/k, times the standard 3 lines --
+         * and through the same clamp, so the document end still stops
+         * dead rather than scrolling into blank space. */
+        int px = ev->wheel * TK_WHEEL_LINES * TK_WHEEL_STEP_PX;
+        if (px > 0) scroll_up(px); else scroll_down(-px);
+        redraw(0);
+    }
 }
 
 static void on_key(struct tk_window *w, struct tk_event *ev) {

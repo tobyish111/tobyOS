@@ -3103,6 +3103,22 @@ static void on_event(struct tk_window *w, struct tk_widget *cv,
         if (g_omni_active) { g_omni_active = 0; tk_redraw(&win); }
         send_mouse("mousePressed",  ev->x, py, ev->button, 1); break;
     case TK_EV_MOUSE_UP:   send_mouse("mouseReleased", ev->x, py, ev->button, 1); break;
+    case TK_EV_WHEEL: {
+        /* Real user scrolling, over the same CDP verb the scripted tour
+         * already drives. CDP deltaY is in PIXELS and its sign is the
+         * opposite of ours: positive deltaY scrolls the page DOWN (the
+         * content moves up), while a positive detent means away-from-user
+         * = up. Hence the negation. */
+        if (!ev->wheel) break;
+        char sp[160];
+        int dy = -(int)ev->wheel * TK_WHEEL_LINES * TK_WHEEL_STEP_PX;
+        snprintf(sp, sizeof sp,
+                 "{\"type\":\"mouseWheel\",\"x\":%d,\"y\":%d,"
+                 "\"deltaX\":0,\"deltaY\":%d,\"modifiers\":0}",
+                 ev->x, py, dy);
+        cdp_send("Input.dispatchMouseEvent", sp, 1);
+        break;
+    }
     default: break;
     }
 }

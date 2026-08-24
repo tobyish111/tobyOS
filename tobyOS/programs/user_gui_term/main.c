@@ -165,6 +165,19 @@ static void paint(struct tk_window *w,struct tk_widget *c){
     }
 }
 
+/* Wheel over the terminal walks the scrollback, same axis as PgUp/PgDn.
+ * g_scroll_offset counts lines BACK from the live tail, so a positive
+ * detent (away from the user) increases it. */
+static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
+    (void)c;
+    if(ev->type!=TK_EV_WHEEL||!ev->wheel)return;
+    g_scroll_offset+=(int)ev->wheel*TK_WHEEL_LINES;
+    int mo=g_ring_count-ROWS; if(mo<0)mo=0;
+    if(g_scroll_offset>mo)g_scroll_offset=mo;
+    if(g_scroll_offset<0)g_scroll_offset=0;
+    g_need_redraw=1; tk_redraw(w);
+}
+
 static void on_key(struct tk_window *w,struct tk_event *ev){
     uint8_t k=ev->key; if(k==0)return;
     if(k==KEY_PGUP){ g_scroll_offset+=ROWS/2; int mo=g_ring_count-ROWS; if(mo<0)mo=0; if(g_scroll_offset>mo)g_scroll_offset=mo; g_need_redraw=1; tk_redraw(w); }
@@ -179,6 +192,7 @@ int main(int argc,char **argv){
     tk_on_key(&win,on_key);
     struct tk_widget *root=tk_root(&win); tk_pad(root,0);
     struct tk_widget *cv=tk_canvas(&win,root,paint); tk_grow(cv,1);
+    tk_on_event(cv,on_event);
 
     init_ring();
     g_last_blink=sys_clock_ms();

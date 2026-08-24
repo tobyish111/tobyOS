@@ -2876,7 +2876,7 @@ static void winpe8_move_cursor_to(int tx, int ty) {
         if (sx == 0 && ex) sx = (ex > 0) ? 1 : -1;
         int sy = ey / 6; if (sy > 40) sy = 40; if (sy < -40) sy = -40;
         if (sy == 0 && ey) sy = (ey > 0) ? 1 : -1;
-        mouse_inject_event(sx, sy, 0);
+        mouse_inject_event(sx, sy, 0, 0);
         winpe8_pump_ms(15);
     }
 }
@@ -4367,6 +4367,12 @@ void _start(void) {
         }
 
         mouse_init();
+#ifdef WHEEL_SELFTEST
+        /* Wheel decode proof: runs right after init so it can report what
+         * the IntelliMouse knock actually got, before the GUI starts
+         * consuming events. */
+        { extern void mouse_wheel_selftest(void); mouse_wheel_selftest(); }
+#endif
         gui_init();
 
         /* Auto-enable GPU-accelerated compositor if VirtIO-GPU is active.
@@ -4756,10 +4762,10 @@ void _start(void) {
         const int ty[3] = { 300, 400, 560 };
         evdev_reset();
         for (int i = 0; i < 3; i++) {
-            mouse_inject_event(tx[i] - curx, ty[i] - cury, 0);  /* move */
+            mouse_inject_event(tx[i] - curx, ty[i] - cury, 0, 0);  /* move */
             curx = tx[i]; cury = ty[i];
-            mouse_inject_event(0, 0, MOUSE_BTN_LEFT);           /* press  */
-            mouse_inject_event(0, 0, 0);                        /* release */
+            mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);           /* press  */
+            mouse_inject_event(0, 0, 0, 0);                        /* release */
         }
         char *argv[] = { (char *)"linux-paint", 0 };
         char *envp[] = { (char *)"PATH=/bin", 0 };
@@ -5432,9 +5438,9 @@ void _start(void) {
                 if (gui_focused_window_client_center(&cx, &cy)) {
                     kprintf("[boot] WINPE8: real mouse click at screen (%d,%d)\n", cx, cy);
                     winpe8_move_cursor_to(cx, cy);
-                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);  /* button down */
+                    mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);  /* button down */
                     winpe8_pump_ms(250);
-                    mouse_inject_event(0, 0, 0);               /* button up   */
+                    mouse_inject_event(0, 0, 0, 0);               /* button up   */
                     winpe8_pump_ms(400);
                 }
                 uint32_t after_real = win32_gui_fill_color();
@@ -5512,9 +5518,9 @@ void _start(void) {
                     kprintf("[boot] WINPE10: real mouse click into focused window at (%d,%d)\n",
                             cx, cy);
                     winpe8_move_cursor_to(cx, cy);
-                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);
+                    mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);
                     winpe8_pump_ms(250);
-                    mouse_inject_event(0, 0, 0);
+                    mouse_inject_event(0, 0, 0, 0);
                     winpe8_pump_ms(500);
                 }
 

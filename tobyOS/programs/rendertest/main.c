@@ -49,7 +49,9 @@ struct gui_event {
     int           y;
     unsigned char button;
     unsigned char key;
-    unsigned char _pad[2];
+    signed char   wheel;
+
+    unsigned char _pad[1];
 };
 
 static inline void sys_yield(void) {

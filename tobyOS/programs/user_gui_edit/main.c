@@ -114,6 +114,19 @@ static void ensure_cursor_visible(void){
     if(g_cursor_row>=g_scroll_row+VISIBLE_ROWS)g_scroll_row=g_cursor_row-VISIBLE_ROWS+1;
     if(g_scroll_row<0)g_scroll_row=0;
 }
+/* Wheel scrolls the view WITHOUT moving the caret -- ensure_cursor_visible
+ * only runs on cursor motion, so the view stays where the wheel left it
+ * until you actually type or arrow somewhere. */
+static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
+    (void)c;
+    if(ev->type!=TK_EV_WHEEL||!ev->wheel)return;
+    g_scroll_row-=(int)ev->wheel*TK_WHEEL_LINES;
+    int maxs=g_line_count-VISIBLE_ROWS; if(maxs<0)maxs=0;
+    if(g_scroll_row>maxs)g_scroll_row=maxs;
+    if(g_scroll_row<0)g_scroll_row=0;
+    tk_redraw(w);
+}
+
 static void insert_char(char ch){ int len=line_len(g_cursor_row); if(len>=MAX_COLS-2)return; for(int i=len;i>=g_cursor_col;i--)g_lines[g_cursor_row][i+1]=g_lines[g_cursor_row][i]; g_lines[g_cursor_row][g_cursor_col]=ch; g_cursor_col++; g_modified=1; }
 static void delete_back(void){
     if(g_cursor_col>0){ int len=line_len(g_cursor_row); for(int i=g_cursor_col-1;i<len;i++)g_lines[g_cursor_row][i]=g_lines[g_cursor_row][i+1]; g_cursor_col--; g_modified=1; }
@@ -215,7 +228,8 @@ int main(int argc,char **argv){
     if(tk_window_open(&win,WIN_W,WIN_H,"TobyEdit")!=0)return 1;
     tk_on_key(&win,on_key);
     struct tk_widget *root=tk_root(&win); tk_pad(root,0);
-    tk_grow(tk_canvas(&win,root,paint),1);
+    { struct tk_widget *cv=tk_canvas(&win,root,paint); tk_grow(cv,1);
+      tk_on_event(cv,on_event); }
 
     for(;;){
         if(tk_pump(&win))break;

@@ -83,6 +83,7 @@ enum compositor_mode {
 #define GUI_EV_KEY           4
 #define GUI_EV_CLOSE         5
 #define GUI_EV_RESIZE        6
+#define GUI_EV_WHEEL         7   /* 2026-08-23; wheel detents in .wheel */
 
 /* Window states for minimize/maximize/restore */
 #define GUI_WIN_NORMAL       0
@@ -105,7 +106,14 @@ struct gui_event {
     int     y;           /* mouse: client-area y; key: 0 */
     uint8_t button;      /* mouse buttons bitmask (LEFT/RIGHT/MIDDLE) */
     uint8_t key;         /* key event: ASCII code, 0 otherwise */
-    uint8_t _pad[2];
+    /* GUI_EV_WHEEL: signed detents, + = away from the user (scroll up).
+     * Deliberately carved out of the existing _pad rather than appended:
+     * this struct is copied verbatim to userspace by SYS_GUI_POLL_EVENT,
+     * so growing it would break every already-built program. x/y still
+     * carry the pointer position, so a handler can scroll whatever is
+     * under the cursor. */
+    int8_t  wheel;
+    uint8_t _pad[1];
 };
 
 /* ---- forward declarations ----------------------------------------- */

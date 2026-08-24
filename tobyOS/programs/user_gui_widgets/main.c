@@ -283,6 +283,14 @@ static void editor_event(struct tk_window *w,struct tk_widget *c,struct tk_event
         update_status(); tk_redraw(w);
     } else if(ev->type==TK_EV_KEY){
         editor_key(ev->key); update_status(); tk_redraw(w);
+    } else if(ev->type==TK_EV_WHEEL&&ev->wheel){
+        /* View-only scroll; the caret stays put until a key moves it
+         * (which then calls ensure_visible and snaps back, as expected). */
+        g_scroll_y-=(int)ev->wheel*TK_WHEEL_LINES;
+        int maxs=g_total_lines-g_vis_rows; if(maxs<0)maxs=0;
+        if(g_scroll_y>maxs)g_scroll_y=maxs;
+        if(g_scroll_y<0)g_scroll_y=0;
+        tk_redraw(w);
     }
 }
 

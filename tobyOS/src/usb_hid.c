@@ -18,8 +18,8 @@
  *     state is still tracked in software so case folding works).
  *   - no Set_Report / Get_Report calls -- we only listen on the
  *     interrupt-IN endpoint.
- *   - mouse Z (wheel) byte parsed for completeness but not forwarded
- *     (mouse.h has no wheel concept yet).
+ *   - mouse Z (wheel) byte is parsed AND forwarded (2026-08-23) as the
+ *     dz argument of mouse_inject_event; it becomes GUI_EV_WHEEL.
  *
  *   - Many real USB mice send a leading Report ID byte before the
  *     boot-style [Buttons][X][Y] fields (especially when SET_PROTOCOL
@@ -71,6 +71,7 @@ struct hid_dev_state {
     uint8_t   last_buttons;           /* mouse: last button bitmap */
     int8_t    last_dx;                /* mouse: last raw dx (signed) */
     int8_t    last_dy;                /* mouse: last raw dy (signed) */
+    int8_t    last_dz;                /* mouse: last wheel detents (signed) */
     uint64_t  last_seen_ms;           /* perf_now_ns()/1e6 at last frame */
     /* Mouse only: interrupt report layout (0 = unknown, learn on wire). */
     uint8_t   mouse_parse;          /* HID_MOUSE_PARSE_* */
@@ -364,17 +365,24 @@ static void hid_mouse_handle(struct hid_dev_state *st,
     hid_mouse_learn_layout(st, report, len);
 
     uint8_t buttons;
-    int     dx, dy;
+    int     dx, dy, dz = 0;
 
+    /* The wheel byte follows Y in both layouts and is a plain signed
+     * count of detents. It is only present when the report is long
+     * enough -- a 3-byte boot report from a wheelless mouse must not
+     * have a byte read past its end, which is why each arm tests its
+     * own length rather than the 3 checked at entry. */
     if (st->mouse_parse == HID_MOUSE_PARSE_RID && len >= 4) {
         buttons = report[1] & 0x07u;
         dx        = (int8_t)report[2];
         dy        = (int8_t)report[3];
+        if (len >= 5) dz = (int8_t)report[4];
     } else {
         /* UNKNOWN, NORID, or short report: classic boot layout. */
         buttons = report[0] & 0x07u;
         dx        = (int8_t)report[1];
         dy        = (int8_t)report[2];
+        if (len >= 4) dz = (int8_t)report[3];
     }
 
     /* Count low-to-high transitions on any of the 3 buttons. */
@@ -386,13 +394,14 @@ static void hid_mouse_handle(struct hid_dev_state *st,
     st->last_buttons = buttons;
     st->last_dx      = (int8_t)dx;
     st->last_dy      = (int8_t)dy;
+    st->last_dz      = (int8_t)dz;
     /* Saturate at 1<<32 -- never going to overflow within a session,
      * but the cast back to uint64_t happily wraps so we accumulate as
      * unsigned and just cast on read. */
     st->mouse_dx_abs_total += (uint64_t)(dx < 0 ? -dx : dx);
     st->mouse_dy_abs_total += (uint64_t)(dy < 0 ? -dy : dy);
 
-    mouse_inject_event(dx, dy, buttons);
+    mouse_inject_event(dx, dy, dz, buttons);
 }
 
 /* ============================================================== */

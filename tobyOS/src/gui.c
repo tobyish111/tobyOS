@@ -1838,8 +1838,8 @@ static struct window *window_at(int px, int py) {
  * windowed Linux app's input straight from the event-producer path. */
 void fbdev_window_event(struct window *w, const struct gui_event *e);
 
-static void enqueue_event(struct window *w, int type, int x, int y,
-                          uint8_t button, uint8_t key) {
+static void enqueue_event_w(struct window *w, int type, int x, int y,
+                            uint8_t button, uint8_t key, int8_t wheel) {
     uint8_t next = (uint8_t)((w->ev_head + 1u) % GUI_EVENT_RING);
     if (next == w->ev_tail) {
         /* full -- drop oldest */
@@ -1851,12 +1851,20 @@ static void enqueue_event(struct window *w, int type, int x, int y,
     e->y      = y;
     e->button = button;
     e->key    = key;
-    e->_pad[0] = e->_pad[1] = 0;
+    e->wheel  = wheel;
+    e->_pad[0] = 0;
     w->ev_head = next;
 
     /* If this window is a windowed Linux app, mirror the event to its evdev
      * rings (focus-routed input; no-op for every other window). */
     fbdev_window_event(w, e);
+}
+
+/* The pre-wheel spelling, kept so the ~40 existing call sites read the
+ * same as they always did. */
+static void enqueue_event(struct window *w, int type, int x, int y,
+                          uint8_t button, uint8_t key) {
+    enqueue_event_w(w, type, x, y, button, key, 0);
 }
 
 /* Forward decls -- needed because on_mouse_event() (below) calls
@@ -1866,7 +1874,7 @@ static void recompute_active(void);
 
 /* ---- mouse callback (IRQ) ----------------------------------------- */
 
-static void on_mouse_event(int dx, int dy, uint8_t buttons) {
+static void on_mouse_event(int dx, int dy, int dz, uint8_t buttons) {
     if (!g.ready) return;
 
     int W = (int)gfx_width(), H = (int)gfx_height();
@@ -2481,6 +2489,25 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         int cx = nx - (under->x + GUI_BORDER);
         int cy = ny - (under->y + GUI_TITLE_BAR_H);
         enqueue_event(under, GUI_EV_MOUSE_MOVE, cx, cy, buttons, 0);
+    }
+
+    /* ---- wheel (2026-08-23) ----------------------------------------
+     *
+     * Routed to the window UNDER THE CURSOR, not the focused one. That
+     * is the rule every desktop uses and it is deliberately different
+     * from the keyboard path (gui_post_key -> g.z_top): scrolling the
+     * list you are pointing at, without having to click it first, is
+     * the whole ergonomic point of a wheel.
+     *
+     * Outside the `else if` ladder above on purpose -- a notch usually
+     * arrives with dx=dy=0 and no button change, so it would fall
+     * through every branch there and be dropped. */
+    if (dz && under && point_in_client(under, nx, ny)) {
+        int cx = nx - (under->x + GUI_BORDER);
+        int cy = ny - (under->y + GUI_TITLE_BAR_H);
+        int8_t wz = (int8_t)(dz < -127 ? -127 : (dz > 127 ? 127 : dz));
+        enqueue_event_w(under, GUI_EV_WHEEL, cx, cy, buttons, 0, wz);
+        gui_trace_logf("wheel=(%d,%d) dz=%d -> win", cx, cy, dz);
     }
 
     /* Context menu hover tracking. */
@@ -5945,8 +5972,8 @@ void gui_post_shell_click(int x, int y) {
     if (!g.ready) return;
     g.cur_x = x;
     g.cur_y = y;
-    on_mouse_event(0, 0, 1);     /* left button DOWN at (x, y) */
-    on_mouse_event(0, 0, 0);     /* release */
+    on_mouse_event(0, 0, 0, 1);  /* left button DOWN at (x, y) */
+    on_mouse_event(0, 0, 0, 0);  /* release */
 }
 #endif
 
@@ -5967,7 +5994,7 @@ void gui_toggle_search(void) {
 void gui_post_mouse(int type, int x, int y, uint8_t button) {
     if (!g.ready || !g.active || !g.z_top) return;
     if (type != GUI_EV_MOUSE_MOVE && type != GUI_EV_MOUSE_DOWN &&
-        type != GUI_EV_MOUSE_UP)
+        type != GUI_EV_MOUSE_UP && type != GUI_EV_WHEEL)
         return;
     struct window *w = g.z_top;
     if (w->state == GUI_WIN_MINIMIZED) return;
@@ -5975,7 +6002,13 @@ void gui_post_mouse(int type, int x, int y, uint8_t button) {
         gui_trace_logf("post_mouse type=%d xy=(%d,%d) btn=0x%02x -> wid=%d owner_pid=%d",
                        type, x, y, (unsigned)button, w->wid, w->owner_pid);
     }
-    enqueue_event(w, type, x, y, button, 0);
+    /* GUI_EV_WHEEL carries its detents in `button` here: this harness
+     * entry point has no wheel parameter of its own and widening it
+     * would break its callers. One notch up is the useful default. */
+    if (type == GUI_EV_WHEEL)
+        enqueue_event_w(w, type, x, y, 0, 0, button ? (int8_t)button : 1);
+    else
+        enqueue_event(w, type, x, y, button, 0);
     g.input_boost_pid = w->owner_pid;
 }
 

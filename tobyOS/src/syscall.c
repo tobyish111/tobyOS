@@ -2199,6 +2199,8 @@ void fbdev_proc_exit(int pid) {
 #define SYN_REPORT      0x00
 #define REL_X           0x00
 #define REL_Y           0x01
+#define REL_HWHEEL      0x06
+#define REL_WHEEL       0x08           /* detents, + = away from user */
 #define BTN_LEFT        0x110
 #define BTN_RIGHT       0x111
 #define BTN_MIDDLE      0x112
@@ -2254,15 +2256,16 @@ void evdev_feed_key(uint8_t code, int value) {
  * exactly the packet shape a real PS/2 evdev mouse emits. `prev` is the button
  * bitmask before this report so we can emit press/release edges. The button
  * masks are the PS/2 driver's MOUSE_BTN_* bits (1=left,2=right,4=middle). */
-void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev) {
+void evdev_feed_mouse(int dx, int dy, int dz, uint8_t buttons, uint8_t prev) {
     if (g_fbdev.win) return;        /* M3: windowed -> focus-routed feed instead */
     if (dx) evdev_push(EVDEV_MOUSE, EV_REL, REL_X, dx);
     if (dy) evdev_push(EVDEV_MOUSE, EV_REL, REL_Y, dy);
+    if (dz) evdev_push(EVDEV_MOUSE, EV_REL, REL_WHEEL, dz);
     uint8_t changed = (uint8_t)(buttons ^ prev);
     if (changed & 0x01) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_LEFT,   (buttons & 0x01) ? 1 : 0);
     if (changed & 0x02) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_RIGHT,  (buttons & 0x02) ? 1 : 0);
     if (changed & 0x04) evdev_push(EVDEV_MOUSE, EV_KEY, BTN_MIDDLE, (buttons & 0x04) ? 1 : 0);
-    if (dx || dy || changed)
+    if (dx || dy || dz || changed)
         evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
 }
 
@@ -2296,6 +2299,15 @@ void fbdev_window_event(struct window *w, const struct gui_event *e) {
         evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
         break;
     }
+    case GUI_EV_WHEEL:
+        /* Focus-routed wheel: same REL_WHEEL record the global feed emits,
+         * so a windowed Linux app scrolls identically to a fullscreen one. */
+        g_fbdev.last_mx = e->x; g_fbdev.last_my = e->y;
+        if (e->wheel) {
+            evdev_push(EVDEV_MOUSE, EV_REL, REL_WHEEL, e->wheel);
+            evdev_push(EVDEV_MOUSE, EV_SYN, SYN_REPORT, 0);
+        }
+        break;
     case GUI_EV_KEY:
         /* deliver a press+release pair (the compositor has no key-up event) */
         evdev_push(EVDEV_KBD, EV_KEY, e->key, 1);
@@ -2401,7 +2413,12 @@ static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
     }
     case 0x22: {                                   /* EVIOCGBIT(EV_REL): rel axes */
         uint8_t relbits[4] = { 0 };
-        if (is_mouse) relbits[0] = (1u << REL_X) | (1u << REL_Y);  /* 0x03 */
+        /* 0x103: X | Y | WHEEL. A Linux app checks this bitmap to decide
+         * whether the device HAS a wheel -- advertising motion only, as
+         * this did before 2026-08-23, made toolkits ignore REL_WHEEL
+         * records even when we emitted them. */
+        if (is_mouse) relbits[0] = (1u << REL_X) | (1u << REL_Y) |
+                                   (1u << REL_WHEEL);
         return evdev_copy_bits(arg, size, relbits, sizeof(relbits));
     }
     case 0x21: {                                   /* EVIOCGBIT(EV_KEY): key map */
@@ -14614,6 +14631,10 @@ static void win32_stash_wndproc(const struct win32_win *w) {
 #define WM_LBUTTONUP    0x0202
 #define WM_RBUTTONDOWN  0x0204
 #define WM_RBUTTONUP    0x0205
+#define WM_MOUSEWHEEL   0x020A
+/* Win32's quantum of wheel travel; a detent is exactly one of these and
+ * apps divide by it, so it must be 120 and not our own step size. */
+#define WHEEL_DELTA     120
 
 /* MK_* wParam button-state bits for mouse messages. */
 #define MK_LBUTTON      0x0001
@@ -15049,6 +15070,18 @@ static bool win32_event_to_msg(int fd, const struct gui_event *ev,
         m->message = WM_KEYDOWN;
         m->wParam  = (uint64_t)ev->key;
         m->lParam  = 1;
+        return true;
+    case GUI_EV_WHEEL:
+        /* WM_MOUSEWHEEL: the delta is the HIGH word of wParam, in
+         * multiples of WHEEL_DELTA (120) -- one detent == 120, sign
+         * matching ours (+ = away from the user). lParam carries SCREEN
+         * coordinates for this message, but the compositor only hands us
+         * client ones; passing them through is the same approximation the
+         * other mouse arms above already make. */
+        m->message = WM_MOUSEWHEEL;
+        m->wParam  = ((uint64_t)(uint16_t)(int16_t)(ev->wheel * WHEEL_DELTA) << 16)
+                   | (uint64_t)(ev->button & 0x07);
+        m->lParam  = ((uint64_t)(uint16_t)ev->x) | ((uint64_t)(uint16_t)ev->y << 16);
         return true;
     case GUI_EV_CLOSE:
         m->message = WM_CLOSE;
