@@ -171,6 +171,32 @@ Gate state at handoff: lxposix **32/32** skipped=0 enosys_gaps=0 faults=0; lxsoc
     are the reusable part: failure correlated with LENGTH = flow control; failure
     that SHUFFLES between runs with the same pass count = timing.
 
+- **SLICE 5b (`21597be` + `a288627`): a SECOND native editor, `tedit`** — modeless,
+  nano-shaped, at the user's request. Gate is now `bash logs/edit.sh` (11/11),
+  covering BOTH editors (tvi 53/53 + tedit 25/25, 78 cases, all comparing FILE
+  BYTES). `logs/tvi.sh` was renamed to it.
+  - **THE MOST IMPORTANT THING IN THIS WHOLE ARC: a latent LIBRARY bug needs a
+    CONSUMER, and a NATIVE tool is how you get one.** Ported binaries (nano,
+    bash, busybox) carry their own regex engines and use musl's real syscalls,
+    so they can never surface these. Two were found this way:
+    `regexec()` returned `rm_eo = strlen(string)` for every match, and
+    **`tcsetattr()` never reached the kernel at all** — a dead `#ifdef` on a
+    macro defined nowhere, a `struct termios` missing `c_line`, and invented
+    flag values. Programs asking for raw mode got a CANONICAL terminal.
+  - **Recognise a not-in-raw-mode failure on sight:** input line-buffered so
+    anything after `\n` never arrives; `^U` (VKILL) killing the pending line and
+    taking earlier keys with it; DEL (VERASE) erasing; `^D` (VEOF) exiting
+    cleanly without saving; CR arriving as LF.
+  - **RETRACTION: tvi's earlier 53/53 ran in canonical mode** and passed only
+    because every script ends `:wq\n`. Still 53/53 with the fix — green for the
+    wrong reason, right answer.
+  - Harness signatures worth memorising: fails-by-LENGTH = flow control;
+    fails-that-SHUFFLE-between-runs = timing; line-discipline-shaped corruption
+    = raw mode not set yet. Pace by REAL TIME, never iterations. Send ESC
+    contiguously with its companion byte. **Instrument on the FIRST hang.**
+  - **Open user decision:** whether `tedit` takes the `nano` name and `tvi` the
+    `vi` name (one Makefile line each). Left deliberately.
+
 **Two things this handoff previously told you that turned out to be wrong** — the
 build-law fix above, and:
 - **`bash logs/oilspec.sh` has no committed baseline.** `oilspec_report.py` diffs
