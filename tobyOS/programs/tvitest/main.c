@@ -42,6 +42,7 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 #define WORK "/tmp/tvitest.txt"
 
 static int g_pass, g_fail;
+static char g_wrote[512];
 
 /* Drain until the master has been quiet for `ms` REAL milliseconds.
  *
@@ -115,7 +116,7 @@ static void show(const char *s) {
 }
 
 /* Drive one editing session. `keys` may contain \033 for ESC. */
-static int run_tvi(const char *file, const char *keys) {
+static int run_prog(const char *prog, const char *file, const char *keys) {
     int mfd = open("/dev/ptmx", O_RDWR);
     if (mfd < 0) return -1;
     int unlock = 0;
@@ -127,25 +128,73 @@ static int run_tvi(const char *file, const char *keys) {
     int sfd = open(spath, O_RDWR);
     if (sfd < 0) { close(mfd); return -3; }
 
+    /* TEDIT_TRACE makes the editor log every key it actually received to
+     * a FILE. Reading the source gave three confident wrong answers about
+     * where it was blocking; the trace answered it in one run. Harmless
+     * for tvi, which ignores the variable. */
     static char *const envp[] = {
         (char *)"PATH=/bin", (char *)"HOME=/", (char *)"TERM=vt100",
-        (char *)"LC_ALL=C", 0
+        (char *)"LC_ALL=C", (char *)"TEDIT_TRACE=/tmp/tedit.trace", 0
     };
-    char *argv[] = { (char *)"tvi", (char *)file, 0 };
+    const char *base = strrchr(prog, '/');
+    char *argv[] = { (char *)(base ? base + 1 : prog), (char *)file, 0 };
 
     pid_t self_pg = getpgrp();
     (void)ioctl(sfd, TIOCSPGRP, &self_pg);
 
-    pid_t pid = toby_spawn("/bin/tvi", argv, envp, sfd, sfd, sfd);
+    pid_t pid = toby_spawn(prog, argv, envp, sfd, sfd, sfd);
     close(sfd);
     if (pid < 0) { close(mfd); return -4; }
 
-    /* Let the editor paint its first screen before typing at it. */
-    drain_ms(mfd, 300);
+    /* WAIT FOR THE FIRST PAINT before typing anything.
+     *
+     * Not a quiet-period wait -- an editor that has not started yet is
+     * perfectly quiet, so drain_ms() returned instantly and the whole
+     * script was written while the pty was still in CANONICAL mode. The
+     * line discipline then ate it: \r became \n (ICRNL), DEL (127) was
+     * VERASE and ERASED the preceding keystroke, ^D (4) was VEOF and
+     * delivered end-of-file so the editor exited cleanly without saving,
+     * and everything after the first \n stayed line-buffered forever --
+     * which is what "editor never exited" actually meant.
+     *
+     * Output on the master is positive evidence the editor has painted,
+     * which it can only do after tcsetattr() put the tty in raw mode. */
+    {
+        long deadline = now_ms() + 8000;
+        for (;;) {
+            int avail = 0;
+            if (ioctl(mfd, FIONREAD, &avail) == 0 && avail > 0) break;
+            if (now_ms() >= deadline) break;   /* fall through; the case
+                                                * will fail loudly rather
+                                                * than hang the run */
+            for (volatile int s = 0; s < 20000; s++) { }
+        }
+        drain_ms(mfd, 120);
+    }
 
-    /* One byte at a time, draining to quiet between each. */
+    /* One byte at a time, draining to quiet between each. Every write is
+     * accounted for: without the harness's own half of the story, a byte
+     * the editor never received is indistinguishable from a byte the
+     * harness never sent. */
+    g_wrote[0] = '\0';
+    int wn = 0;
     for (const char *p = keys; *p; p++) {
-        if (write(mfd, p, 1) != 1) break;
+        /* An ESC and the byte after it go out TOGETHER.
+         *
+         * A real terminal emits Alt-U and the arrow keys as one
+         * contiguous burst, and that contiguity is exactly how a program
+         * tells "Meta" from "the user pressed Escape". Writing them a
+         * byte apart with a 60 ms drain in between is a faithful
+         * rendering of pressing Escape, waiting, then pressing U -- so
+         * the editor was right to read it that way and the harness was
+         * wrong to send it that way. */
+        int nb = (*p == 27 && p[1]) ? 2 : 1;
+        long w = write(mfd, p, (size_t)nb);
+        wn += snprintf(g_wrote + wn, sizeof g_wrote - (size_t)wn, "%d%s%s ",
+                       (unsigned char)*p, nb == 2 ? "+meta" : "",
+                       w == nb ? "" : "!FAIL");
+        if (w != nb) break;
+        if (nb == 2) p++;
         drain_ms(mfd, 60);
     }
 
@@ -164,30 +213,41 @@ static int run_tvi(const char *file, const char *keys) {
     return -5;
 }
 
+static const char *g_prog = "/bin/tvi";
+static const char *g_tag  = "TVI";
+
 static void tcase(const char *name, const char *initial,
                   const char *keys, const char *expect) {
     char got[8192];
     if (write_file(WORK, initial) != 0) {
-        printf("[TVI]   FAIL %-28s (cannot write fixture)\n", name);
+        printf("[%s]   FAIL %-28s (cannot write fixture)\n", g_tag, name);
         g_fail++; return;
     }
-    int rc = run_tvi(WORK, keys);
+    int rc = run_prog(g_prog, WORK, keys);
     if (rc == -5) {
-        printf("[TVI]   FAIL %-28s (editor never exited)\n", name);
+        printf("[%s]   FAIL %-28s (editor never exited)\n", g_tag, name);
+        printf("[%s]        harness wrote: %s\n", g_tag, g_wrote);
+        /* Say WHICH key it stopped on rather than only that it hung. */
+        char tr[1024];
+        if (read_file("/tmp/tedit.trace", tr, sizeof tr) > 0) {
+            printf("[%s]        trace: ", g_tag);
+            for (char *p = tr; *p; p++) putchar(*p == '\n' ? ' ' : *p);
+            printf("\n");
+        }
         g_fail++; return;
     }
     if (rc < 0) {
-        printf("[TVI]   FAIL %-28s (spawn/pty error %d)\n", name, rc);
+        printf("[%s]   FAIL %-28s (spawn/pty error %d)\n", g_tag, name, rc);
         g_fail++; return;
     }
     read_file(WORK, got, sizeof got);
     if (strcmp(got, expect) == 0) {
-        printf("[TVI]   ok   %-28s -> \"", name); show(got); printf("\"\n");
+        printf("[%s]   ok   %-28s -> \"", g_tag, name); show(got); printf("\"\n");
         g_pass++;
     } else {
-        printf("[TVI]   FAIL %-28s\n", name);
-        printf("[TVI]        want \""); show(expect); printf("\"\n");
-        printf("[TVI]        got  \""); show(got);    printf("\"\n");
+        printf("[%s]   FAIL %-28s\n", g_tag, name);
+        printf("[%s]        want \"", g_tag); show(expect); printf("\"\n");
+        printf("[%s]        got  \"", g_tag); show(got);    printf("\"\n");
         g_fail++;
     }
 }
@@ -268,7 +328,79 @@ int main(void) {
     tcase("missing final newline added", "a\nb",      ":wq\n",         "a\nb\n");
     tcase("empty file stays empty",   "",             ":wq\n",         "\n");
 
+    int vi_pass = g_pass, vi_fail = g_fail;
     printf("[TVI] VERDICT: %s pass=%d fail=%d\n",
+           vi_fail == 0 ? "PASS" : "FAIL", vi_pass, vi_fail);
+
+    /* ============ tedit: the modeless (nano-shaped) editor =============
+     * Same discipline: keystrokes in, FILE BYTES out. The escapes below
+     * are nano's bindings as raw control codes --
+     *   \017 ^O write out   \030 ^X exit      \013 ^K cut
+     *   \025 ^U uncut       \027 ^W where-is  \034 ^\ replace
+     *   \036 ^6 set mark    \037 ^_ goto      \033 ESC (the Meta prefix)
+     *   \004 ^D delete      \005 ^E end       \006 ^F right  \016 ^N down
+     * ================================================================== */
+    g_prog = "/bin/tedit"; g_tag = "TED";
+    g_pass = 0; g_fail = 0;
+    printf("[TED] ==== native modeless editor (nano-shaped) ====\n");
+
+    /* ---- modeless: typing just types, no mode to enter first ---- */
+    tcase("types without a mode",      "abc\n",      "XY\017\n\030",   "XYabc\n");
+    tcase("Enter splits a line",       "ab\n",       "\r\017\n\030",   "\nab\n");
+    tcase("backspace joins lines",     "ab\ncd\n",   "\016\177\017\n\030", "abcd\n");
+    tcase("^D deletes forward",        "abc\n",      "\004\017\n\030", "bc\n");
+    tcase("^E goes to end of line",    "abc\n",      "\005Z\017\n\030","abcZ\n");
+
+    /* ---- cut/uncut, incl. nano's accumulate-on-consecutive-^K rule ---- */
+    tcase("^K cuts a line",            "a\nb\nc\n",  "\013\017\n\030", "b\nc\n");
+    tcase("^K^K accumulates",          "a\nb\nc\n",  "\013\013\017\n\030", "c\n");
+    tcase("^K then ^U round-trips",    "a\nb\n",     "\013\025\017\n\030", "a\nb\n");
+    tcase("^U pastes both cut lines",  "a\nb\nc\n",  "\013\013\025\017\n\030", "a\nb\nc\n");
+
+    /* ---- undo/redo, incl. the typing-run coalescing improvement ---- */
+    tcase("M-U undoes a cut",          "a\nb\n",     "\013\033u\017\n\030", "a\nb\n");
+    tcase("a typed RUN undoes as one", "abc\n",      "XYZ\033u\017\n\030",  "abc\n");
+    tcase("M-E redoes",                "a\nb\n",     "\013\033u\033e\017\n\030", "b\n");
+
+    /* ---- search then edit at the match ---- */
+    tcase("^W finds and moves there",  "aa\nbb\ncc\n", "\027bb\r\013\017\n\030", "aa\ncc\n");
+
+    /* ---- replace, incl. the regex + backreference improvements ---- */
+    tcase("^\\ replace all",           "aaa\n",      "\034a\rb\rA\017\n\030", "bbb\n");
+    /* ^C to stop, not a bare ESC. An ESC sent immediately before another
+     * key IS Meta by universal terminal convention -- which is exactly
+     * what the harness now (correctly) reproduces -- so "\033\017" reads
+     * as M-^O, not as cancel. nano documents ^C for this anyway, and it
+     * is unambiguous. That ^C arrives as DATA rather than as SIGINT is
+     * itself only true because raw mode finally reaches the kernel. */
+    tcase("^\\ replace one then stop", "aaa\n",      "\034a\rb\ry\003\017\n\030", "baa\n");
+    tcase("replace with a regex",      "a1b22c\n",   "\034[0-9][0-9]\r#\rA\017\n\030", "a1b#c\n");
+    tcase("replace with a backref",    "ab\n",       "\034\\(a\\)\\(b\\)\r\\2\\1\rA\017\n\030", "ba\n");
+    tcase("& is the whole match",      "ab\n",       "\034a\r[&]\rA\017\n\030", "[a]b\n");
+
+    /* ---- mark + region; M-6 copy-without-cutting is the improvement ---- */
+    tcase("^6 mark then ^K cuts it",   "abcdef\n",   "\036\006\006\006\013\017\n\030", "def\n");
+
+    /* ---- go to line, and line,column ---- */
+    tcase("^_ goes to a line",         "a\nb\nc\n",  "\037" "2\r\013\017\n\030", "a\nc\n");
+    /* Column is 1-BASED, so 1,3 puts the cursor ON the third character
+     * and ^D removes it: "abcd" -> "abd". The first version of this case
+     * expected "abc", which would have meant deleting the FOURTH -- the
+     * test was wrong, not the editor. */
+    tcase("^_ takes line,column",      "abcd\nx\n",  "\037" "1,3\r\004\017\n\030", "abd\nx\n");
+
+    /* ---- file handling ---- */
+    tcase("^O writes then ^X exits",   "hello\n",    "\017\n\030",     "hello\n");
+    tcase("^X on a clean buffer",      "keep\n",     "\030",           "keep\n");
+    tcase("^X answering N discards",   "a\nb\n",     "\013\030n",      "a\nb\n");
+    tcase("missing final newline added","a\nb",      "\017\n\030",     "a\nb\n");
+
+    printf("[TED] VERDICT: %s pass=%d fail=%d\n",
            g_fail == 0 ? "PASS" : "FAIL", g_pass, g_fail);
-    return g_fail == 0 ? 0 : 1;
+
+    int total_fail = vi_fail + g_fail;
+    printf("[EDIT] VERDICT: %s tvi=%d/%d tedit=%d/%d\n",
+           total_fail == 0 ? "PASS" : "FAIL",
+           vi_pass, vi_pass + vi_fail, g_pass, g_pass + g_fail);
+    return total_fail == 0 ? 0 : 1;
 }

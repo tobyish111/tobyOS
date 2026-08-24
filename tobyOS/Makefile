@@ -467,6 +467,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/cpupower/cpupower.elf \
             programs/tvi/tvi.elf \
             programs/tvitest/tvitest.elf \
+            programs/tedit/tedit.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -1508,6 +1509,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,sensors,sensors))
 $(eval $(call LIBTOBY_PROGRAM_RULES,cpupower,cpupower))
 $(eval $(call LIBTOBY_PROGRAM_RULES,tvi,tvi))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tvitest,tvitest))
+$(eval $(call LIBTOBY_PROGRAM_RULES,tedit,tedit))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -2896,6 +2898,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/cpupower/cpupower.elf                 $(INITRD_STAGE)/bin/cpupower
 	cp programs/tvi/tvi.elf                           $(INITRD_STAGE)/bin/tvi
 	cp programs/tvitest/tvitest.elf                   $(INITRD_STAGE)/bin/tvitest
+	cp programs/tedit/tedit.elf                       $(INITRD_STAGE)/bin/tedit
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -3673,7 +3676,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
-	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest \
+	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

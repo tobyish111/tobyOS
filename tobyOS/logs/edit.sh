@@ -1,5 +1,7 @@
 #!/bin/bash
-# tvi.sh -- the conformance gate for the native vi, /bin/tvi.
+# edit.sh -- the conformance gate for BOTH native editors:
+#   /bin/tvi   -- modal, POSIX vi(1)
+#   /bin/tedit -- modeless, nano-shaped
 #
 #   bash logs/tvi.sh
 #
@@ -51,7 +53,7 @@ import sys
 d=open('tobyos.bin','rb').read()
 sys.exit(0 if b'[TVI] harness exit=' in d else 1)" \
     || { echo "FAIL: TVI_BOOT harness not compiled into the kernel"; exit 1; }
-for b in bin/tvi bin/tvitest; do
+for b in bin/tvi bin/tvitest bin/tedit; do
     tar -tf build/initrd.tar | grep -qx "$b" || { echo "FAIL: $b not in initrd"; exit 1; }
 done
 
@@ -84,10 +86,13 @@ nck () {
     else echo "  ok   $1"; fi
 }
 
-ck  "harness ran"                  '\[TVI\] ==== native vi conformance'
-ck  "every case passed"            '\[TVI\] VERDICT: PASS pass=[0-9]+ fail=0'
-ck  "a meaningful number of cases" '\[TVI\] VERDICT: PASS pass=(5[0-9]|[6-9][0-9])'
-nck "no case failed"               '\[TVI\]   FAIL'
+ck  "vi harness ran"               '\[TVI\] ==== native vi conformance'
+ck  "tedit harness ran"            '\[TED\] ==== native modeless editor'
+ck  "every vi case passed"         '\[TVI\] VERDICT: PASS pass=[0-9]+ fail=0'
+ck  "every tedit case passed"      '\[TED\] VERDICT: PASS pass=[0-9]+ fail=0'
+ck  "combined verdict PASS"        '\[EDIT\] VERDICT: PASS'
+ck  "a meaningful case count"      '\[EDIT\] VERDICT: PASS tvi=5[0-9]/5[0-9] tedit=2[0-9]/2[0-9]'
+nck "no case failed"               '(\[TVI\]|\[TED\])   FAIL'
 nck "no case timed out"            'editor never exited'
 nck "no pty/spawn error"           'spawn/pty error'
 ck  "harness exited 0"             '\[TVI\] harness exit=0'
