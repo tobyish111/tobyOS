@@ -7,8 +7,10 @@
  *         one are seen through the other, st_nlink == 2 on both
  *   bit3  unlink removes a NAME: the other name survives with its data,
  *         st_nlink drops back to 1
- *   bit4  honesty of refusals: cross-mount link is EXDEV; link on tmpfs
- *         (no inode indirection) is EPERM
+ *   bit4  cross-mount link is EXDEV -- and, since 2026-08-25, a link
+ *         WITHIN tmpfs works: tmpfs grew the same inode indirection
+ *         tobyfs has, so the old "EPERM, no indirection here" expectation
+ *         encoded a limitation rather than a rule
  *   bit5  linkat(2) resolves both names against directory fds
  */
 #define _GNU_SOURCE
@@ -27,6 +29,7 @@ int main(void) {
     /* /data persists between runs (the known disk.img trap): sweep every
      * name this test mints so a crashed or buggy earlier run can't turn
      * a fresh one red with EEXIST. */
+    unlink("/tmp/fs2-t");   unlink("/tmp/fs2-u");
     unlink("/data/fs2-a");  unlink("/data/fs2-b");
     unlink("/data/fs2-x");  unlink("/data/fs2-la");
     unlink("/data/fs2-lb");
@@ -125,23 +128,36 @@ int main(void) {
         if (ok) bits |= 8;
     }
 
-    /* ---- bit4: EXDEV across mounts; EPERM where links can't exist ---- */
+    /* ---- bit4: EXDEV across mounts; a link WITHIN tmpfs now works ---- */
     {
         int fd = open("/data/fs2-x", O_CREAT | O_RDWR, 0644);
         if (fd >= 0) close(fd);
         errno = 0;
         int xr = link("/data/fs2-x", "/tmp/fs2-y");
         int xdev = (xr < 0 && errno == EXDEV);
+
+        /* This used to assert EPERM. It was a true statement about tmpfs
+         * at the time and a false one about hard links, so asserting the
+         * behaviour (two names, one set of bytes) rather than the refusal
+         * is what keeps it honest either way. */
         int tf = open("/tmp/fs2-t", O_CREAT | O_RDWR, 0644);
-        if (tf >= 0) close(tf);
+        int wrote = 0;
+        if (tf >= 0) { wrote = (write(tf, "hi", 2) == 2); close(tf); }
         errno = 0;
         int pr = link("/tmp/fs2-t", "/tmp/fs2-u");
-        int eperm = (pr < 0 && errno == EPERM);
-        printf("fs2: xdev-errno=%d eperm-errno=%d\n",
-               xdev ? EXDEV : errno, eperm ? EPERM : errno);
+        struct stat sa, sb;
+        int shared = (pr == 0 &&
+                      stat("/tmp/fs2-t", &sa) == 0 &&
+                      stat("/tmp/fs2-u", &sb) == 0 &&
+                      sa.st_nlink == 2 && sb.st_size == 2);
+        printf("fs2: xdev-errno=%d tmpfs-link=%d nlink=%u size=%ld\n",
+               xdev ? EXDEV : errno, pr,
+               (unsigned)(pr == 0 ? sa.st_nlink : 0u),
+               (long)(pr == 0 ? (long)sb.st_size : -1L));
         unlink("/data/fs2-x");
         unlink("/tmp/fs2-t");
-        if (xdev && eperm) bits |= 16;
+        unlink("/tmp/fs2-u");
+        if (xdev && wrote && shared) bits |= 16;
     }
 
     /* ---- bit5: linkat against directory fds ---- */

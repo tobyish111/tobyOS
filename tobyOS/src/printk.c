@@ -87,7 +87,8 @@ static void emit_pad(char pad, int n) {
 }
 
 /* Format an unsigned 64-bit value into `buf` (little-endian digits) and
- * return the number of digits written. base must be 10 or 16. */
+ * return the number of digits written. Any base up to 16 works (8, 10, 16
+ * are the ones used). */
 static int u64_to_buf(uint64_t v, unsigned base, bool upper, char *buf) {
     static const char digits_lo[] = "0123456789abcdef";
     static const char digits_up[] = "0123456789ABCDEF";
@@ -221,6 +222,15 @@ static void kvprintf_unlocked(const char *fmt, va_list ap) {
             uint64_t v = is_long ? va_arg(ap, unsigned long)
                                  : va_arg(ap, unsigned int);
             emit_uint(v, 10, false, width, zero_pad, left_align);
+            break;
+        }
+        case 'o': {
+            /* File modes are octal everywhere in this kernel and there was
+             * no way to print one: %o silently emitted the literal text,
+             * so a mode assertion printed "mode=%o" and read as noise. */
+            uint64_t v = is_long ? va_arg(ap, unsigned long)
+                                 : va_arg(ap, unsigned int);
+            emit_uint(v, 8, false, width, zero_pad, left_align);
             break;
         }
         case 'x': {

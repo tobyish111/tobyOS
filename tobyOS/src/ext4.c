@@ -192,6 +192,37 @@ static uint64_t group_inode_table(const struct ext4 *fs, uint32_t g) {
 /* Read inode number `ino` (1-based) into `out`. Reads exactly the
  * first 128 bytes -- the extra ext4 fields beyond that aren't needed
  * for read-only operation. */
+/* uid/gid are split: the low 16 bits sit in the inode proper, the high 16
+ * in the Linux osd2 area. Reading only the low half silently aliases every
+ * uid above 65535 onto a different user -- and user namespaces hand out
+ * exactly those (the standard 100000+ ranges). */
+#define EXT4_OSD2_UID_HIGH 4
+#define EXT4_OSD2_GID_HIGH 6
+
+static uint32_t osd2_half(const struct ext4_inode *in, int off) {
+    return (uint32_t)in->i_osd2[off] | ((uint32_t)in->i_osd2[off + 1] << 8);
+}
+static void osd2_set_half(struct ext4_inode *in, int off, uint32_t v) {
+    in->i_osd2[off]     = (uint8_t)(v & 0xFF);
+    in->i_osd2[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+}
+static uint32_t ext4_inode_uid(const struct ext4_inode *in) {
+    return (uint32_t)in->i_uid | (osd2_half(in, EXT4_OSD2_UID_HIGH) << 16);
+}
+static uint32_t ext4_inode_gid(const struct ext4_inode *in) {
+    return (uint32_t)in->i_gid | (osd2_half(in, EXT4_OSD2_GID_HIGH) << 16);
+}
+static void ext4_inode_set_uid(struct ext4_inode *in, uint32_t uid) {
+    in->i_uid = (uint16_t)(uid & 0xFFFF);
+    osd2_set_half(in, EXT4_OSD2_UID_HIGH, uid >> 16);
+}
+static void ext4_inode_set_gid(struct ext4_inode *in, uint32_t gid) {
+    in->i_gid = (uint16_t)(gid & 0xFFFF);
+    osd2_set_half(in, EXT4_OSD2_GID_HIGH, gid >> 16);
+}
+
+static uint64_t ext4_now_secs(void);
+
 static int read_inode(struct ext4 *fs, uint32_t ino, struct ext4_inode *out) {
     if (ino == 0) return VFS_ERR_INVAL;
     uint32_t group = (ino - 1) / fs->inodes_per_group;
@@ -1475,8 +1506,8 @@ static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
     out->pos  = 0;
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
-    out->uid  = in.i_uid;
-    out->gid  = in.i_gid;
+    out->uid  = ext4_inode_uid(&in);
+    out->gid  = ext4_inode_gid(&in);
     return VFS_OK;
 }
 
@@ -1551,6 +1582,12 @@ static long ext4_write(struct vfs_file *f, const void *buf, size_t n) {
                 fp->in.i_size_hi = (uint32_t)(fp->file_size >> 32);
                 f->size          = (size_t)fp->file_size;
             }
+            /* A write is a modification, and this driver never said so:
+             * every file on an ext4 volume kept mtime 0 no matter how
+             * often it changed. */
+            uint32_t now = (uint32_t)ext4_now_secs();
+            fp->in.i_mtime = now;
+            fp->in.i_ctime = now;
             rc = write_inode(fs, fp->inode_no, &fp->in);
         }
         rc = txn_finish(fs, rc);
@@ -1579,8 +1616,11 @@ static int do_create(struct ext4 *fs, const char *path,
     struct ext4_inode in;
     memset(&in, 0, sizeof(in));
     in.i_mode  = EXT4_S_IFREG | (uint16_t)(mode & 0xFFF);
-    in.i_uid   = (uint16_t)uid;
-    in.i_gid   = (uint16_t)gid;
+    ext4_inode_set_uid(&in, uid);
+    ext4_inode_set_gid(&in, gid);
+    /* Born now, not at the epoch. */
+    in.i_atime = in.i_ctime = in.i_mtime =
+        (uint32_t)ext4_now_secs();
     in.i_links_count = 1;
     in.i_flags = EXT4_EXTENTS_FL;
     init_extent_header(&in);
@@ -1635,6 +1675,47 @@ static int ext4_unlink(void *mnt, const char *path) {
     struct ext4 *fs = (struct ext4 *)mnt;
     txn_begin(fs);
     return txn_finish(fs, do_unlink(fs, path));
+}
+
+/* Hard links. do_unlink() above already did the hard half -- it decrements
+ * i_links_count and only releases the blocks when the count reaches zero --
+ * so the inode side of this has been correct all along and only the
+ * second-directory-entry half was missing. */
+static int do_link(struct ext4 *fs, const char *oldpath,
+                   const char *newpath) {
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, oldpath, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    /* POSIX forbids hard links to directories: they make the tree cyclic
+     * and fsck has to clean up after every walker that trusted it. */
+    if (ftype == EXT4_FT_DIR ||
+        (in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) return VFS_ERR_ISDIR;
+
+    uint32_t np_ino;
+    char np_leaf[VFS_NAME_MAX];
+    rc = path_parent(fs, newpath, &np_ino, np_leaf, sizeof np_leaf);
+    if (rc != VFS_OK) return rc;
+
+    uint32_t clash; uint8_t clash_ft;
+    if (path_to_inode(fs, newpath, &clash, &clash_ft) == VFS_OK)
+        return VFS_ERR_EXIST;
+
+    rc = dir_add_entry(fs, np_ino, np_leaf, ino, ftype);
+    if (rc != VFS_OK) return rc;
+
+    in.i_links_count++;
+    in.i_ctime = (uint32_t)ext4_now_secs();
+    return write_inode(fs, ino, &in);
+}
+
+static int ext4_link(void *mnt, const char *oldpath, const char *newpath) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    txn_begin(fs);
+    return txn_finish(fs, do_link(fs, oldpath, newpath));
 }
 
 /* Phase H: rename, journalled like every other mutation here. Same
@@ -1723,8 +1804,11 @@ static int do_mkdir(struct ext4 *fs, const char *path,
     struct ext4_inode in;
     memset(&in, 0, sizeof(in));
     in.i_mode  = EXT4_S_IFDIR | (uint16_t)(mode & 0xFFF);
-    in.i_uid   = (uint16_t)uid;
-    in.i_gid   = (uint16_t)gid;
+    ext4_inode_set_uid(&in, uid);
+    ext4_inode_set_gid(&in, gid);
+    /* Born now, not at the epoch. */
+    in.i_atime = in.i_ctime = in.i_mtime =
+        (uint32_t)ext4_now_secs();
     in.i_links_count = 2;            /* self + "." */
     in.i_flags = EXT4_EXTENTS_FL;
     init_extent_header(&in);
@@ -1880,6 +1964,258 @@ static int ext4_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_OK;
 }
 
+/* ================================================================
+ * Metadata + truncate.
+ *
+ * These five ops were NULL, and a NULL vfs op is not a stub: vfs.c turns
+ * it into VFS_ERR_ROFS. So every chmod, chown, utimes and truncate on an
+ * ext4 volume failed with "read-only filesystem" on a volume that was
+ * plainly writable, and nothing in the tree tested it. `make` compares
+ * mtimes, `tar -p` restores modes, `cp -p` does both -- all of them
+ * quietly misbehave against a filesystem that drops the metadata.
+ * ================================================================ */
+
+static uint64_t ext4_now_secs(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+}
+
+
+/* ee_len carries an "uninitialised" flag in its top bit; the length is the
+ * remainder. Written once here so the +/-32768 dance is not repeated. */
+static uint32_t extent_len_of(const struct ext4_extent *e) {
+    uint16_t l = e->ee_len;
+    return (l > 32768) ? (uint32_t)(l - 32768) : (uint32_t)l;
+}
+static void extent_len_set(struct ext4_extent *e, uint32_t len) {
+    bool uninit = e->ee_len > 32768;
+    e->ee_len = (uint16_t)(uninit ? len + 32768 : len);
+}
+
+/* Release every block from logical block `from` onward, keeping everything
+ * below it. inode_free_data() is the `from == 0` case of this and stays as
+ * it is -- unlink has no partial extents to think about. */
+static int inode_trim_from(struct ext4 *fs, struct ext4_inode *in,
+                           uint32_t from) {
+    uint64_t kept = 0;                        /* data blocks still in use */
+
+    if (in->i_flags & EXT4_EXTENTS_FL) {
+        struct ext4_extent_header *eh =
+            (struct ext4_extent_header *)&in->i_block[0];
+        if (eh->eh_magic != EXT4_EXT_MAGIC) return VFS_ERR_INVAL;
+        /* An index tree would need the leaf blocks walked and possibly
+         * freed. We never build one (extent_append_block refuses), so
+         * refuse here too rather than trim a tree we cannot navigate. */
+        if (eh->eh_depth != 0) return VFS_ERR_NOSPC;
+
+        struct ext4_extent *e = (struct ext4_extent *)(eh + 1);
+        uint16_t keep = 0;
+        for (uint16_t i = 0; i < eh->eh_entries; i++) {
+            uint32_t len   = extent_len_of(&e[i]);
+            uint32_t first = e[i].ee_block;
+            uint64_t start = ((uint64_t)e[i].ee_start_hi << 32) |
+                             e[i].ee_start_lo;
+            if (len == 0) continue;
+
+            if (first >= from) {              /* wholly past the cut */
+                for (uint32_t j = 0; j < len; j++)
+                    ext4_free_block(fs, (uint32_t)(start + j));
+                continue;                     /* entry disappears */
+            }
+            if (first + len > from) {         /* straddles it */
+                uint32_t keep_len = from - first;
+                for (uint32_t j = keep_len; j < len; j++)
+                    ext4_free_block(fs, (uint32_t)(start + j));
+                extent_len_set(&e[i], keep_len);
+                len = keep_len;
+            }
+            if (keep != i) e[keep] = e[i];    /* compact in place */
+            keep++;
+            kept += len;
+        }
+        eh->eh_entries = keep;
+    } else {
+        for (uint32_t i = 0; i < 12; i++) {
+            if (!in->i_block[i]) continue;
+            if (i >= from) {
+                ext4_free_block(fs, in->i_block[i]);
+                in->i_block[i] = 0;
+            } else {
+                kept++;
+            }
+        }
+        uint32_t per_block = fs->block_size / 4;
+        if (in->i_block[12]) {
+            uint8_t *ind = kmalloc(fs->block_size);
+            if (!ind) return VFS_ERR_NOMEM;
+            if (read_block(fs, in->i_block[12], ind) == VFS_OK) {
+                uint32_t *tbl = (uint32_t *)ind;
+                uint32_t still = 0;
+                bool dirty = false;
+                for (uint32_t i = 0; i < per_block; i++) {
+                    if (!tbl[i]) continue;
+                    if (12u + i >= from) {
+                        ext4_free_block(fs, tbl[i]);
+                        tbl[i] = 0;
+                        dirty  = true;
+                    } else {
+                        still++;
+                    }
+                }
+                if (still == 0) {             /* the table itself is dead */
+                    ext4_free_block(fs, in->i_block[12]);
+                    in->i_block[12] = 0;
+                } else {
+                    kept += still + 1;        /* +1: the indirect block */
+                    if (dirty) (void)write_block(fs, in->i_block[12], ind);
+                }
+            }
+            kfree(ind);
+        }
+    }
+
+    in->i_blocks_lo = (uint32_t)(kept * (fs->block_size / 512));
+    return VFS_OK;
+}
+
+/* The shared core of truncate(2) and ftruncate(2). `in` is updated in
+ * place so an open handle's cached copy stays true. */
+static int ext4_do_truncate(struct ext4 *fs, uint32_t ino,
+                            struct ext4_inode *in, uint64_t len) {
+    if ((in->i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) return VFS_ERR_ISDIR;
+    uint64_t old = ((uint64_t)in->i_size_hi << 32) | in->i_size_lo;
+
+    txn_begin(fs);
+    int rc = VFS_OK;
+
+    if (len < old) {
+        /* Zero the tail of the last SURVIVING block before releasing the
+         * rest. Without this the bytes past `len` stay on disk inside a
+         * block we keep, and truncating back UP later would hand them
+         * straight back to the reader -- the file would grow with its own
+         * old contents where POSIX promises zeroes. */
+        uint32_t off = (uint32_t)(len % fs->block_size);
+        if (off) {
+            uint64_t phys = 0;
+            rc = inode_block_map(fs, in,
+                                 (uint32_t)(len / fs->block_size), &phys);
+            if (rc == VFS_OK && phys) {
+                uint8_t *tmp = kmalloc(fs->block_size);
+                if (!tmp) {
+                    rc = VFS_ERR_NOMEM;
+                } else {
+                    rc = read_block(fs, phys, tmp);
+                    if (rc == VFS_OK) {
+                        memset(tmp + off, 0, fs->block_size - off);
+                        rc = write_block(fs, phys, tmp);
+                    }
+                    kfree(tmp);
+                }
+            }
+        }
+        if (rc == VFS_OK) {
+            uint32_t first_free =
+                (uint32_t)((len + fs->block_size - 1) / fs->block_size);
+            rc = inode_trim_from(fs, in, first_free);
+        }
+    }
+    /* Growing allocates nothing. An unmapped block is a hole and
+     * inode_read() already returns zeroes for one, so a larger i_size is
+     * the entire job -- the file just becomes sparse, as it would on
+     * Linux. */
+
+    if (rc == VFS_OK) {
+        in->i_size_lo = (uint32_t)(len & 0xFFFFFFFFu);
+        in->i_size_hi = (uint32_t)(len >> 32);
+        uint32_t now  = (uint32_t)ext4_now_secs();
+        in->i_mtime = now;
+        in->i_ctime = now;
+        rc = write_inode(fs, ino, in);
+    }
+    return txn_finish(fs, rc);
+}
+
+static int ext4_truncate(void *mnt, const char *path, uint64_t length) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    return ext4_do_truncate(fs, ino, &in, length);
+}
+
+static int ext4_ftruncate(struct vfs_file *f, uint64_t length) {
+    struct ext4 *fs = (struct ext4 *)f->mnt;
+    struct ext4_filepriv *fp = (struct ext4_filepriv *)f->priv;
+    if (!fp) return VFS_ERR_INVAL;
+    int rc = ext4_do_truncate(fs, fp->inode_no, &fp->in, length);
+    if (rc == VFS_OK) {
+        fp->file_size = length;
+        f->size       = (size_t)length;
+        /* The offset deliberately does NOT move: POSIX says ftruncate
+         * leaves it alone, and a read past EOF already returns 0. */
+    }
+    return rc;
+}
+
+/* A small shared prologue: fetch the inode, apply the change, stamp ctime
+ * where POSIX says to, and write it back inside one transaction. */
+typedef void (*ext4_meta_fn)(struct ext4_inode *, uint64_t, uint64_t);
+
+static int ext4_meta_update(struct ext4 *fs, const char *path,
+                            ext4_meta_fn apply, uint64_t a, uint64_t b,
+                            bool stamp_ctime) {
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+
+    apply(&in, a, b);
+    if (stamp_ctime) in.i_ctime = (uint32_t)ext4_now_secs();
+
+    txn_begin(fs);
+    rc = write_inode(fs, ino, &in);
+    return txn_finish(fs, rc);
+}
+
+static void apply_chmod(struct ext4_inode *in, uint64_t mode, uint64_t un) {
+    (void)un;
+    /* Keep the format bits (S_IFREG/S_IFDIR); replace only the 12
+     * permission bits, setuid/setgid/sticky included. */
+    in->i_mode = (uint16_t)((in->i_mode & EXT4_S_IFMT) | (mode & 07777u));
+}
+static void apply_chown(struct ext4_inode *in, uint64_t uid, uint64_t gid) {
+    if ((uint32_t)uid != (uint32_t)-1) ext4_inode_set_uid(in, (uint32_t)uid);
+    if ((uint32_t)gid != (uint32_t)-1) ext4_inode_set_gid(in, (uint32_t)gid);
+}
+static void apply_utimes(struct ext4_inode *in, uint64_t mtime,
+                         uint64_t atime) {
+    in->i_mtime = (uint32_t)mtime;
+    in->i_atime = (uint32_t)atime;
+}
+
+static int ext4_chmod(void *mnt, const char *path, uint32_t mode) {
+    return ext4_meta_update((struct ext4 *)mnt, path, apply_chmod,
+                            mode, 0, true);
+}
+static int ext4_chown(void *mnt, const char *path, uint32_t uid,
+                      uint32_t gid) {
+    return ext4_meta_update((struct ext4 *)mnt, path, apply_chown,
+                            uid, gid, true);
+}
+static int ext4_utimes(void *mnt, const char *path, uint64_t mtime,
+                       uint64_t atime) {
+    /* utimes sets the two times the caller named; ctime is not one of
+     * them, so it is deliberately left alone. */
+    return ext4_meta_update((struct ext4 *)mnt, path, apply_utimes,
+                            mtime, atime, false);
+}
+
 static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     struct ext4 *fs = (struct ext4 *)mnt;
     uint32_t ino; uint8_t ftype;
@@ -1898,8 +2234,14 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
         out->type = VFS_TYPE_FILE;
         out->size = (size_t)(((uint64_t)in.i_size_hi << 32) | in.i_size_lo);
     }
-    out->uid  = in.i_uid;
-    out->gid  = in.i_gid;
+    out->uid  = ext4_inode_uid(&in);
+    out->gid  = ext4_inode_gid(&in);
+    /* The timestamps were never reported, so every file on an ext4 volume
+     * looked like it was last modified at the epoch -- which makes `make`
+     * rebuild everything, every time, and `find -newer` useless. */
+    out->mtime = in.i_mtime;
+    out->atime = in.i_atime;
+    out->nlink = in.i_links_count;
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
     return VFS_OK;
@@ -1917,10 +2259,14 @@ static const struct vfs_ops ext4_ops = {
     .opendir  = ext4_opendir,
     .closedir = ext4_closedir,
     .readdir  = ext4_readdir,
-    .stat     = ext4_stat,
-    .chmod    = NULL,
-    .chown    = NULL,
-    .statfs   = ext4_statfs,   /* Phase H */
+    .stat      = ext4_stat,
+    .chmod     = ext4_chmod,
+    .chown     = ext4_chown,
+    .utimes    = ext4_utimes,
+    .truncate  = ext4_truncate,
+    .ftruncate = ext4_ftruncate,
+    .link      = ext4_link,
+    .statfs    = ext4_statfs,   /* Phase H */
 };
 
 /* ---- probe + mount entry points ---- */

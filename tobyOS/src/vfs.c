@@ -1065,7 +1065,34 @@ int vfs_link(const char *oldpath, const char *newpath) {
     const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
     if (!om || !nm) return VFS_ERR_NOMOUNT;
     if (om != nm) return VFS_ERR_XDEV;
+    /* This op used to go straight to the driver with no checks at all --
+     * no read-only test, no capability test, no directory permission. It
+     * was survivable only because tobyfs was the one filesystem with a
+     * .link op; once tmpfs, ramfs, ext2 and ext4 grew one (2026-08-25) the
+     * same unchecked path covered every mount in the tree. A hard link
+     * creates a name and bumps a link count -- it is a mutation, and it
+     * has to answer to the same rules as unlink and rename.
+     *
+     * The read-only mount check in particular: a flag that is accepted
+     * and ignored is the same class of lie as a no-op syscall that
+     * reports success. */
+    if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
     if (!om->ops->link) return VFS_ERR_ROFS;
+    if (!cap_check_path(current_proc(), newpath, CAP_FILE_WRITE, "vfs_link"))
+        return VFS_ERR_PERM;
+    {
+        int sp = sysprot_check_write(current_proc(), newpath, "vfs_link");
+        if (sp != VFS_OK) return sp;
+    }
+    /* Need W+X on the directory the NEW name lands in -- creating a name
+     * there is exactly what unlink needs permission to undo. Reading the
+     * old name needs nothing extra: a hard link copies no bytes, and the
+     * caller could already stat the path to get here. */
+    char par[VFS_PATH_MAX];
+    if (parent_path(newpath, par, sizeof(par)) == VFS_OK) {
+        int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+        if (prc != VFS_OK) return prc;
+    }
     int rc = om->ops->link(om->data, orel, nrel);
     if (rc == VFS_OK) vfs_notify(newpath, VFS_IN_CREATE, 0);
     return rc;

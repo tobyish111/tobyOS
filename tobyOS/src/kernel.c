@@ -7866,6 +7866,28 @@ void _start(void) {
     }
 #endif
 
+#ifdef FATDISK_SELFTEST
+    /* 2026-08-25: format an attached BLANK scratch disk as FAT32 and leave
+     * real content on it, so an implementation that is not ours can be
+     * asked whether the volume is actually readable. Refuses any disk that
+     * is not already blank -- see fsmatrix_format_scratch(). */
+    {
+        extern void fsmatrix_format_scratch(void);
+        fsmatrix_format_scratch();
+    }
+#endif
+
+#ifdef FSMATRIX_SELFTEST
+    /* 2026-08-25: the CRUD contract, asked of every filesystem driver
+     * rather than only the three that userspace happens to mount. Formats
+     * RAM-backed ext4 and FAT32 volumes and runs the same matrix over
+     * those, tmpfs and ramfs. See src/fsmatrix.c for why. */
+    {
+        extern void fsmatrix_selftest(void);
+        fsmatrix_selftest();
+    }
+#endif
+
 #ifdef SCHEDGUARD_SELFTEST
     /* 2026-08-25: the do_switch context guard, against the open
      * wake-after-death flake. The guard itself fires perhaps once in

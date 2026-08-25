@@ -147,3 +147,6 @@ programs/linux-ptrace/*.elf
 # Build scratch left by ad-hoc debugging sessions
 .tmp_*/
 .tmp_*.sh
+
+# logs/fatinterop.sh recreates this blank scratch disk every run.
+fatscratch.img
