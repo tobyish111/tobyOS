@@ -1391,6 +1391,12 @@ _Static_assert(sizeof(struct abi_dev_info) == 16 + ABI_DEVT_NAME_MAX +
 #define ABI_BLK_F_TOBYFS   0x10u  /* tobyfs superblock found             */
 #define ABI_BLK_F_RAM      0x20u  /* RAM-backed (contents lost on boot)  */
 #define ABI_BLK_F_GONE     0x40u  /* hardware removed                    */
+/* Removable media (USB mass storage). The one flag ABI_PROV_F_ERASE is
+ * gated on, so a listing must show it: it is the difference between "this
+ * stick is yours to reformat" and "this is a fixed disk and no flag will
+ * touch it". Reported in `flags` rather than a new struct field because
+ * abi_blk_info's layout is frozen at 160 bytes. */
+#define ABI_BLK_F_REMOVABLE 0x80u
 
 #define ABI_BLK_NAME_MAX   32
 #define ABI_BLK_MODEL_MAX  44
@@ -1431,6 +1437,23 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * does NOT unlock foreign filesystems / partition tables -- those are
  * refused unconditionally in the kernel. */
 #define ABI_PROV_F_FORCE   0x1u
+
+/* ERASE: reformat a REMOVABLE device that carries a foreign filesystem.
+ *
+ * 2026-08-25. Strictly stronger than FORCE and deliberately a separate
+ * bit, because it authorises DESTROYING SOMEBODY ELSE'S DATA. The guard's
+ * blanket "foreign is never writable" is right for anything automatic, and
+ * wrong as an absolute: an owner must be able to reformat their own USB
+ * stick, which is all `mkfs` has ever been.
+ *
+ * What it does NOT unlock, in the kernel, regardless of the flag:
+ *   - anything not marked blk_dev.removable -- an internal disk holding
+ *     someone's Windows install can never be reached this way;
+ *   - an iso9660 volume, i.e. the live boot medium we are running from;
+ *   - a device backing a live mount.
+ * The userspace caller is expected to name the device and confirm; the
+ * kernel re-checks all of the above regardless of what it was told. */
+#define ABI_PROV_F_ERASE   0x2u
 
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */

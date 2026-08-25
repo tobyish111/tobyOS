@@ -4016,8 +4016,11 @@ static long sys_data_provision(const struct abi_provision_req *ureq) {
 
     struct blk_dev *d = blk_find(req.dev);
     if (!d) return -ABI_ENOENT;
+    /* Pass the flags through verbatim: the guard re-validates every one of
+     * them against the device it actually finds, so masking here would only
+     * hide what userspace asked for. */
     return provision_create_data_volume(d,
-        (req.flags & ABI_PROV_F_FORCE) != 0);
+        req.flags & (ABI_PROV_F_FORCE | ABI_PROV_F_ERASE));
 }
 
 /* ---- Milestone 28E: filesystem check ------------------------ */

@@ -226,6 +226,7 @@ uint8_t provision_classify(struct blk_dev *d, uint32_t *flags,
 
     bool mounted = provision_dev_mounted(d, 0);
     if (mounted) fl |= ABI_BLK_F_MOUNTED;
+    if (d->removable) fl |= ABI_BLK_F_REMOVABLE;
 
     /* MBR / protective-MBR probe. */
     uint8_t b0[BLK_SECTOR_SIZE];
@@ -418,8 +419,10 @@ io_fail:
 
 /* ---- end-to-end create ------------------------------------------- */
 
-long provision_create_data_volume(struct blk_dev *d, bool force) {
+long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
     if (!d) return -ABI_EINVAL;
+    bool force = (flags & ABI_PROV_F_FORCE) != 0;
+    bool erase = (flags & ABI_PROV_F_ERASE) != 0;
 
     char fs[ABI_BLK_FS_MAX];
     uint32_t fl = 0;
@@ -443,10 +446,45 @@ long provision_create_data_volume(struct blk_dev *d, bool force) {
         return -ABI_EBUSY;
     }
     case ABI_BLKV_FOREIGN:
-        kprintf("[prov] REFUSED '%s': foreign filesystem/partition table "
-                "(%s) -- never writable through provisioning\n",
-                d->name, fs[0] ? fs : "partition table");
-        return -ABI_EPERM;
+        /* THE OWNER MAY REFORMAT THEIR OWN REMOVABLE MEDIA -- and nothing
+         * else. Every condition below is re-checked HERE, in the kernel,
+         * whatever userspace claims to have confirmed.
+         *
+         * The blanket refusal this replaces was right about the danger and
+         * wrong as an absolute: it also meant a user with a FAT32 stick had
+         * no way to hand it to tobyOS, which is all `mkfs` has ever been.
+         * What stays refused is everything the owner cannot plausibly mean:
+         * a fixed disk (so the drive holding a Windows install is
+         * unreachable by ANY flag), the live boot medium we are running
+         * from, and anything currently mounted. */
+        if (!erase) {
+            kprintf("[prov] REFUSED '%s': foreign filesystem/partition table "
+                    "(%s) -- ERASE is required to reformat removable media\n",
+                    d->name, fs[0] ? fs : "partition table");
+            return -ABI_EPERM;
+        }
+        if (!d->removable) {
+            kprintf("[prov] REFUSED '%s': ERASE covers REMOVABLE media only; "
+                    "this is a fixed disk carrying %s\n",
+                    d->name, fs[0] ? fs : "a partition table");
+            return -ABI_EPERM;
+        }
+        if (fs[0] && strcmp(fs, "iso9660") == 0) {
+            kprintf("[prov] REFUSED '%s': iso9660 -- this is the live boot "
+                    "medium; erasing it would destroy the running system\n",
+                    d->name);
+            return -ABI_EPERM;
+        }
+        if (provision_dev_mounted(d, 0)) {
+            kprintf("[prov] REFUSED '%s': backs a live mount\n", d->name);
+            return -ABI_EBUSY;
+        }
+        kprintf("[prov] ERASE '%s' (%s, %lu MiB): destroying %s at the "
+                "owner's explicit request\n",
+                d->name, d->model[0] ? d->model : "unknown model",
+                (unsigned long)(d->sector_count / 2048u),
+                fs[0] ? fs : "an existing partition table");
+        break;
     default:
         kprintf("[prov] REFUSED '%s': not a provisionable whole disk "
                 "(verdict %u)\n", d->name, (unsigned)v);
@@ -669,7 +707,7 @@ void provision_selftest(void) {
     prov_expect("t1 classify blank", provision_classify(d1, &fl, fs),
                 ABI_BLKV_BLANK);
     prov_expect("t1 provision blank",
-                provision_create_data_volume(d1, false),
+                provision_create_data_volume(d1, 0u),
                 ABI_PROV_OK_MOUNTED);
     {
         struct vfs_file f;
@@ -688,14 +726,14 @@ void provision_selftest(void) {
     prov_expect("t2 classify while /data mounted",
                 provision_classify(d1, &fl, fs), ABI_BLKV_MOUNTED);
     prov_expect("t2 re-provision mounted (FORCE)",
-                provision_create_data_volume(d1, true), -ABI_EBUSY);
+                provision_create_data_volume(d1, ABI_PROV_F_FORCE), -ABI_EBUSY);
     (void)vfs_unmount("/data");
     prov_expect("t2 classify unmounted", provision_classify(d1, &fl, fs),
                 ABI_BLKV_TOBYOS);
     prov_expect("t2 re-provision without FORCE",
-                provision_create_data_volume(d1, false), -ABI_EEXIST);
+                provision_create_data_volume(d1, 0u), -ABI_EEXIST);
     prov_expect("t2 re-provision unmounted (FORCE)",
-                provision_create_data_volume(d1, true),
+                provision_create_data_volume(d1, ABI_PROV_F_FORCE),
                 ABI_PROV_OK_MOUNTED);
     (void)vfs_unmount("/data");
 
@@ -708,7 +746,7 @@ void provision_selftest(void) {
         prov_expect("t3 classify foreign GPT",
                     provision_classify(d2, &fl, fs), ABI_BLKV_FOREIGN);
         prov_expect("t3 provision foreign GPT (FORCE)",
-                    provision_create_data_volume(d2, true), -ABI_EPERM);
+                    provision_create_data_volume(d2, ABI_PROV_F_FORCE), -ABI_EPERM);
     } else {
         kprintf("[PROV] FAIL t3 setup\n");
         g_prov_st_fail++;
@@ -726,7 +764,7 @@ void provision_selftest(void) {
         prov_expect("t4 classify NTFS", provision_classify(d3, &fl, fs),
                     ABI_BLKV_FOREIGN);
         prov_expect("t4 provision NTFS (FORCE)",
-                    provision_create_data_volume(d3, true), -ABI_EPERM);
+                    provision_create_data_volume(d3, ABI_PROV_F_FORCE), -ABI_EPERM);
 
         /* t5: same disk, rewritten as an MBR with one Linux (0x83)
          * partition entry -> FOREIGN. */
@@ -741,12 +779,95 @@ void provision_selftest(void) {
         prov_expect("t5 classify MBR table", provision_classify(d3, &fl, fs),
                     ABI_BLKV_FOREIGN);
         prov_expect("t5 provision MBR table (FORCE)",
-                    provision_create_data_volume(d3, true), -ABI_EPERM);
+                    provision_create_data_volume(d3, ABI_PROV_F_FORCE), -ABI_EPERM);
     } else {
         kprintf("[PROV] FAIL t4/t5 setup\n");
         g_prov_st_fail++;
     }
     prd_free(2);
+
+    /* ---- t5b: THE EXPLICIT-ERASE PATH, in all four directions -------
+     *
+     * ABI_PROV_F_ERASE is the one flag that authorises destroying somebody
+     * else's data, so the interesting assertions are the REFUSALS. A
+     * permission model is only proven by what it says no to.
+     *
+     * The disk is rebuilt as FAT for each case; `removable` is toggled by
+     * hand, which is the whole point -- an internal disk carrying the same
+     * bytes must be unreachable by the same flag. */
+    /* 12288 sectors, matching t1/t3: a provisionable volume needs
+     * PROV_PART_START_LBA + TFS_TOTAL_BLOCKS*TFS_SECTORS_PER_BLOCK +
+     * PROV_ARRAY_SECTORS + 2 = 10274 sectors. At 8192 the ALLOW case
+     * returned EINVAL ("too small") and looked like a guard failure. */
+    struct blk_dev *d5 = prd_make(2, "prov2e", 12288);  /* 6 MiB */
+    if (d5) {
+        uint8_t s[BLK_SECTOR_SIZE];
+
+        /* THE REFUSALS RUN FIRST, and the ALLOW case last, because a
+         * successful provision MOUNTS the disk as /data -- after which it
+         * classifies MOUNTED and every later assertion here would be
+         * testing the mounted path wearing another name. The first draft
+         * had the allow case in the middle and the iso9660 refusal after
+         * it: the refusal "passed" for the wrong reason (EBUSY, not
+         * EPERM), which the expected-value check caught. */
+
+        /* iso9660 + removable + ERASE -> REFUSED. The live boot medium;
+         * erasing it destroys the system that is running. */
+        memset(s, 0, sizeof(s));
+        (void)blk_write(d5, 0, 1, s);
+        {
+            uint8_t iso[BLK_SECTOR_SIZE];
+            memset(iso, 0, sizeof(iso));
+            memcpy(iso + 1, "CD001", 5);
+            (void)blk_write(d5, 64, 1, iso);
+        }
+        bcache_invalidate(d5);
+        d5->removable = true;
+        prov_expect("t5b iso9660 + removable + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    -ABI_EPERM);
+
+        /* Now a FAT32 boot sector: the everyday factory-formatted stick.
+         * Sector 64 is cleared too, or the iso9660 probe still matches and
+         * the next three cases test the wrong signature. */
+        {
+            uint8_t zero[BLK_SECTOR_SIZE];
+            memset(zero, 0, sizeof(zero));
+            (void)blk_write(d5, 64, 1, zero);
+        }
+        memset(s, 0, sizeof(s));
+        memcpy(s + 82, "FAT32   ", 8);
+        s[510] = 0x55; s[511] = 0xAA;
+        (void)blk_write(d5, 0, 1, s);
+        bcache_invalidate(d5);
+
+        /* Fixed disk + ERASE -> refused. The assertion that keeps this
+         * flag away from the drive holding someone's Windows. */
+        d5->removable = false;
+        prov_expect("t5b FAT on FIXED disk + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    -ABI_EPERM);
+
+        /* Removable, but WITHOUT the flag -> refused. */
+        d5->removable = true;
+        prov_expect("t5b FAT on removable, no ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_FORCE),
+                    -ABI_EPERM);
+
+        /* Removable + ERASE -> ALLOWED. The stick is the owner's. /data is
+         * unmounted by now (t2 left it that way), so the new volume becomes
+         * the live /data: OK_MOUNTED, not OK_NEXT_BOOT. */
+        prov_expect("t5b FAT on removable + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    ABI_PROV_OK_MOUNTED);
+        (void)vfs_unmount("/data");
+    } else {
+        kprintf("[PROV] FAIL t5b setup\n");
+        g_prov_st_fail++;
+    }
+    /* NOT prd_free(2): a provisioned disk owns a partition record that
+     * holds a parent pointer forever (see prd_free's own comment), so the
+     * slot leaks by design -- exactly as slot 0 does after t1. */
 
     /* t6: a mounted tobyfs volume refuses provisioning (BUSY), then
      * accepts it once unmounted (with FORCE -- it carries tobyfs). */
@@ -757,7 +878,7 @@ void provision_selftest(void) {
             prov_expect("t6 classify mounted",
                         provision_classify(d4, &fl, fs), ABI_BLKV_MOUNTED);
             prov_expect("t6 provision mounted (FORCE)",
-                        provision_create_data_volume(d4, true), -ABI_EBUSY);
+                        provision_create_data_volume(d4, ABI_PROV_F_FORCE), -ABI_EBUSY);
             (void)vfs_unmount("/ptest");
             prov_expect("t6 classify unmounted tobyfs",
                         provision_classify(d4, &fl, fs), ABI_BLKV_TOBYOS);

@@ -45,6 +45,7 @@
 #include <tobyos/perf.h>
 #include <tobyos/percpu.h>
 #include <tobyos/smp.h>
+#include <tobyos/klibc.h>    /* memset -- sched_guard_selftest's fake proc */
 #include <tobyos/spinlock.h>
 #include <tobyos/watchdog.h>
 #include <tobyos/pit.h>
@@ -496,8 +497,168 @@ static struct proc *steal_one(struct percpu *me) {
  * SYSCALL stack/TLS/FPU, then the register switch. `reacquire_bkl` re-takes
  * the BKL when `from` resumes (the caller released it before switching away).
  * Shared by sched_yield and the AP idle loop. */
+/* Is `to`'s saved context plausible enough to LOAD?
+ *
+ * 2026-08-25, against the open wake-after-death flake. Every validation
+ * do_switch had was behind #ifdef CHROMIUM_BOOT, so the SHIPPED kernel
+ * switched into whatever the proc table said without looking -- and the
+ * recorded mechanism of that flake is precisely "do_switch loads a garbage
+ * saved context and jumps to a wild rip". The two archived corpses agree:
+ * one had rip=0xb2f64d1bef, the other a user stack address arriving as a
+ * syscall number. Both are what you get after restoring a saved_rsp that
+ * does not point at a real kernel stack.
+ *
+ * THE RSP RANGE CHECK IS THE NEW ONE. proc_context_switch restores rsp from
+ * this field and returns through it; if it does not point INSIDE this
+ * proc's own kernel stack, the `ret` goes wherever the garbage says. Two
+ * compares to find that out.
+ *
+ * DELIBERATELY CHEAP -- this is on every context switch. vmm_pml4_is_live()
+ * walks 256 PML4 entries and stays behind CHROMIUM_BOOT; what is left here
+ * is a handful of compares, next to nothing beside the fpu_save, CR3 reload
+ * and three MSR writes this function already does.
+ *
+ * This is a NET, not a cure: the flake is still not root-caused. But it
+ * turns a wild jump into a logged, survivable skip, and the log finally
+ * names WHICH proc and WHAT was wrong -- which is the evidence every
+ * previous fire lacked. */
+static bool sched_ctx_plausible(struct proc *to, const char **why) {
+    if (!to) { *why = "null proc"; return false; }
+    if (to->pid == 0 || to->is_idle) return true;   /* idle: kernel-owned */
+    if (to->state == PROC_UNUSED)  { *why = "state=UNUSED";  return false; }
+    if (to->state == PROC_EMBRYO)  { *why = "state=EMBRYO";  return false; }
+    /* NOT `dying`. It was in this list for one battery run and cost
+     * ttyparity's 07-jobspec case: a killed job reported "[1]+ Exit 143"
+     * where bash says "[1]  Exit 143" -- one character, and the sign of a
+     * job whose teardown had been stranded.
+     *
+     * The tombstone is set just before PROC_TERMINATED precisely BECAUSE
+     * teardown may block (see the flake notes), so a proc can legitimately
+     * be marked dying and still owe one more scheduling to finish. The
+     * enqueue side already refuses to WAKE dying procs; refusing to RESUME
+     * one is a different and wrong thing. It also buys nothing against the
+     * corruption this guard is for -- proc_slot_claim clears the flag, so a
+     * recycled slot reads dying=false anyway. */
+    uint64_t top = (uint64_t)to->kstack_top;
+    if (!top)                      { *why = "no kstack";     return false; }
+    if (!to->saved_rsp)            { *why = "saved_rsp=0";   return false; }
+    if (to->saved_rsp > top || to->saved_rsp < top - PROC_KSTACK_SZ) {
+        *why = "saved_rsp outside its own kstack";
+        return false;
+    }
+    return true;
+}
+
+/* Prove the predicate above, case by case.
+ *
+ * A guard against a ~1-in-15-boot flake will almost never fire on demand,
+ * so "it did not crash" is no evidence that it works. sched_ctx_plausible
+ * is a pure function of a struct proc, which means it can be asked
+ * directly -- including the corpse shapes the archived fingerprints
+ * describe. Compiled unconditionally, called from kernel.c only under
+ * -DSCHEDGUARD_SELFTEST (the pattern provision_selftest uses, and for the
+ * same reason: EXTRA_CFLAGS does not trigger recompiles, so a definition
+ * behind the flag link-fails when only kernel.c is touched). */
+int sched_guard_selftest(void) {
+    static uint8_t fake_stack[PROC_KSTACK_SZ] __attribute__((aligned(16)));
+    uint64_t top = (uint64_t)(uintptr_t)(fake_stack + PROC_KSTACK_SZ);
+    int fails = 0;
+    const char *why;
+
+    struct proc p;
+    memset(&p, 0, sizeof p);
+    p.pid        = 42;
+    p.state      = PROC_READY;
+    p.kstack_top = (void *)(uintptr_t)top;
+    p.saved_rsp  = top - 512;              /* a plausible mid-stack rsp */
+
+#define GCHECK(expect, label) do {                                            \
+        why = "?";                                                            \
+        bool got = sched_ctx_plausible(&p, &why);                             \
+        if (got != (expect)) {                                                \
+            kprintf("[SCHEDGUARD] FAIL %-34s got=%d want=%d (%s)\n",           \
+                    (label), got ? 1 : 0, (expect) ? 1 : 0, why);             \
+            fails++;                                                          \
+        } else {                                                              \
+            kprintf("[SCHEDGUARD]   ok  %-34s %s\n", (label),                 \
+                    (expect) ? "accepted" : why);                             \
+        }                                                                     \
+    } while (0)
+
+    GCHECK(true, "a healthy runnable proc");
+
+    /* The shapes a dead/recycled slot leaves behind. */
+    p.state = PROC_UNUSED;  GCHECK(false, "slot recycled (UNUSED)");
+    p.state = PROC_EMBRYO;  GCHECK(false, "half-built (EMBRYO)");
+    p.state = PROC_READY;
+    /* dying is deliberately NOT a refusal -- see sched_ctx_plausible.
+     * Asserted as ACCEPTED so nobody re-adds it without this failing. */
+    p.dying = true;         GCHECK(true,  "dying is still resumable");
+    p.dying = false;
+
+    /* The wake-after-death corpse itself: a saved_rsp that does not point
+     * into this proc's own kernel stack. proc_context_switch restores rsp
+     * from it and RETURNS through it, so a wild value here is exactly the
+     * "jumps to a wild rip" the fingerprints record. */
+    p.saved_rsp = top + 8;          GCHECK(false, "saved_rsp above its stack");
+    p.saved_rsp = top - PROC_KSTACK_SZ - 8;
+                                    GCHECK(false, "saved_rsp below its stack");
+    p.saved_rsp = 0xb2f64d1befULL;  GCHECK(false, "saved_rsp = archived garbage");
+    p.saved_rsp = 0x7ffffffffe00ULL;
+                                    GCHECK(false, "saved_rsp = a USER address");
+    p.saved_rsp = 0;                GCHECK(false, "saved_rsp = 0");
+
+    p.saved_rsp  = top - 512;
+    p.kstack_top = 0;               GCHECK(false, "kstack freed underneath it");
+    p.kstack_top = (void *)(uintptr_t)top;
+
+    /* The boundaries themselves are legal -- an off-by-one here would
+     * refuse healthy switches, which is a worse bug than the one being
+     * guarded against. */
+    p.saved_rsp = top;                    GCHECK(true, "rsp exactly at the top");
+    p.saved_rsp = top - PROC_KSTACK_SZ;   GCHECK(true, "rsp exactly at the base");
+
+    /* pid 0 / idle are kernel-owned and exempt by design. */
+    p.pid = 0; p.state = PROC_UNUSED; p.saved_rsp = 0; p.kstack_top = 0;
+    GCHECK(true, "pid 0 is exempt");
+#undef GCHECK
+
+    kprintf("[SCHEDGUARD] VERDICT: %s fails=%d\n",
+            fails ? "FAIL" : "PASS", fails);
+    return fails;
+}
+
 static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                       bool reacquire_bkl) {
+    /* The net described above. Capped logging: a repeating fault must not
+     * bury the serial log it is the only evidence in. */
+    {
+        extern struct proc g_proc[];      /* for the slot index in the log */
+        const char *why = "?";
+        if (!sched_ctx_plausible(to, &why)) {
+            static int logged;
+            if (logged < 16) {
+                logged++;
+                kprintf("[sched] REFUSED switch into pid=%d '%s' slot=%ld "
+                        "state=%d dying=%d: %s "
+                        "(saved_rsp=0x%lx kstack_top=0x%lx cr3=0x%lx) "
+                        "from pid=%d cpu%u\n",
+                        to ? to->pid : -1, to ? to->name : "?",
+                        to ? (long)(to - g_proc) : -1L,
+                        to ? (int)to->state : -1, (to && to->dying) ? 1 : 0,
+                        why,
+                        to ? (unsigned long)to->saved_rsp : 0UL,
+                        to ? (unsigned long)(uintptr_t)to->kstack_top : 0UL,
+                        to ? (unsigned long)to->cr3 : 0UL,
+                        from ? from->pid : -1, me->cpu_idx);
+            }
+            /* Fall back to this CPU's idle proc. Returning without
+             * switching would leave `from` running, which is also correct
+             * but hides the event from the run queue's accounting. */
+            if (me->idle && from != me->idle) to = me->idle;
+            else return;
+        }
+    }
 #ifdef CHROMIUM_BOOT
     /* Validate BEFORE latching on_cpu / current. Slice 88: a reaper may have
      * freed this PML4 after we popped the proc; skip to idle instead of panic. */

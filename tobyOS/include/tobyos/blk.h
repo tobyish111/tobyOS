@@ -110,6 +110,21 @@ struct blk_dev {
      * by the disk-manager confirm flow so "which physical drive am I
      * about to format" is never a guess. */
     char                model[41];
+
+    /* 2026-08-25: is this device REMOVABLE media (a USB stick), as opposed
+     * to an internal disk? Set true by usb_msc at registration; false
+     * everywhere else, which is the safe default for a field older drivers
+     * never touch.
+     *
+     * This exists for exactly one decision. The provisioning guard refuses
+     * any disk carrying a foreign filesystem, with no override -- correct
+     * for automatic behaviour, and wrong when the OWNER says "reformat my
+     * USB stick", which is a thing every operating system lets its owner
+     * do. The explicit-erase path (ABI_PROV_F_ERASE) is gated on this so
+     * that permission can never extend to an internal disk: the one that
+     * holds somebody's Windows install is not removable, and no flag the
+     * user can pass will make it so. */
+    bool                removable;
 };
 
 /* ---- block-device registry (milestone 21, expanded in 23A) -------

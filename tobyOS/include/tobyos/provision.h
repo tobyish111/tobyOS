@@ -32,7 +32,7 @@ bool provision_dev_mounted(struct blk_dev *dev, const char **mount_point);
  * tobyOS-data partition, tobyfs format, mount as /data when /data is
  * RAM-backed or absent. Returns ABI_PROV_OK_* or -ABI_E* (see abi.h).
  * `force` = ABI_PROV_F_FORCE semantics. */
-long provision_create_data_volume(struct blk_dev *d, bool force);
+long provision_create_data_volume(struct blk_dev *d, uint32_t flags);
 
 /* Fill a KERNEL staging buffer with up to `cap` abi_blk_info records
  * (one per registry entry, verdicts included). Returns the count.

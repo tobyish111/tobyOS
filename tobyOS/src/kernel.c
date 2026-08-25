@@ -3414,7 +3414,7 @@ void _start(void) {
                 uint32_t pfl = 0;
                 if (provision_classify(pd, &pfl, pfs) != ABI_BLKV_BLANK)
                     continue;
-                long prc = provision_create_data_volume(pd, false);
+                long prc = provision_create_data_volume(pd, 0u);
                 kprintf("[PROVBOOT] provision '%s' -> rc=%ld (%s)\n",
                         pd->name, prc,
                         prc >= 0 ? "OK" : "FAILED");
@@ -7853,6 +7853,17 @@ void _start(void) {
         int pid = proc_spawn(&spec);
         if (pid < 0) kprintf("[TVI] SPAWN FAILED\n");
         else kprintf("[TVI] harness exit=%d\n", proc_wait(pid));
+    }
+#endif
+
+#ifdef SCHEDGUARD_SELFTEST
+    /* 2026-08-25: the do_switch context guard, against the open
+     * wake-after-death flake. The guard itself fires perhaps once in
+     * fifteen boots, so the predicate is asked directly -- including the
+     * two archived corpse shapes. */
+    {
+        extern int sched_guard_selftest(void);
+        (void)sched_guard_selftest();
     }
 #endif
 
