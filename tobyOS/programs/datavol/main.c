@@ -126,6 +126,99 @@ static int cmd_list(void) {
     return 0;
 }
 
+/* Shared by `create` and `format`: name what is about to be destroyed and
+ * make the user type the device back. Guards against a TYPO -- the kernel
+ * guard is what actually decides. Returns 0 to proceed. */
+static int confirm_destroy(const struct abi_blk_info *t, const char *verb,
+                           const char *sz) {
+    printf("\n  ABOUT TO %s  %s  (%s%s%s)\n", verb, t->name, sz,
+           t->model[0] ? ", " : "", t->model[0] ? t->model : "");
+    printf("  It currently holds: %s\n",
+           t->fs[0] ? t->fs : "an unrecognised partition table");
+    printf("  EVERYTHING ON IT WILL BE LOST.\n\n");
+    printf("  Type the device name to confirm: ");
+    fflush(stdout);
+    char answer[64];
+    if (!fgets(answer, sizeof answer, stdin)) { printf("\naborted\n"); return 1; }
+    size_t a = strlen(answer);
+    while (a && (answer[a-1] == '\n' || answer[a-1] == '\r')) answer[--a] = 0;
+    if (strcmp(answer, t->name) != 0) {
+        printf("\n  not confirmed ('%s' != '%s') -- nothing was written\n",
+               answer, t->name);
+        return 1;
+    }
+    return 0;
+}
+
+/* Report the kernel's REASON. The whole point of the guard is that its
+ * refusals are informative; "failed" would throw that away. */
+static void explain_failure(long rc, const char *dev) {
+    long e = -rc;
+    if      (e == ABI_EPERM)  fprintf(stderr,
+        "datavol: refused -- '%s' carries data tobyOS will not overwrite.\n"
+        "  A fixed disk with a foreign filesystem, or the live boot medium,\n"
+        "  cannot be written by any flag. Removable media with a foreign\n"
+        "  filesystem need --erase.\n", dev);
+    else if (e == ABI_EBUSY)  fprintf(stderr,
+        "datavol: refused -- '%s' backs a live mount. Unmount it first.\n", dev);
+    else if (e == ABI_EEXIST) fprintf(stderr,
+        "datavol: '%s' already holds tobyOS data. Add --force to redo it.\n", dev);
+    else if (e == ABI_EINVAL) fprintf(stderr,
+        "datavol: '%s' is not a usable whole disk (too small, or RAM-backed).\n",
+        dev);
+    else if (e == ABI_EIO)    fprintf(stderr,
+        "datavol: '%s' failed while writing/formatting -- the device may be "
+        "faulty.\n", dev);
+    else fprintf(stderr, "datavol: failed (%ld)\n", rc);
+}
+
+/* `datavol format DEV` -- a plain tobyfs across the whole stick, which is
+ * what "format this USB" means. /data is untouched. */
+static int cmd_format(const char *dev, unsigned flags) {
+    struct abi_blk_info v[MAX_DEVS];
+    int n = 0;
+    if (list_devices(v, &n) != 0) return 1;
+
+    const struct abi_blk_info *t = 0;
+    for (int i = 0; i < n; i++)
+        if (strcmp(v[i].name, dev) == 0) { t = &v[i]; break; }
+    if (!t) {
+        fprintf(stderr, "datavol: no such device '%s' -- run `datavol list`\n",
+                dev);
+        return 1;
+    }
+    if (t->class != 1) {
+        fprintf(stderr, "datavol: '%s' is a partition; format the whole "
+                        "disk instead\n", dev);
+        return 1;
+    }
+
+    char sz[24];
+    human_size(t->sector_count, sz, sizeof sz);
+
+    /* Formatting always destroys, so always confirm -- not only under
+     * --erase the way `create` does for a blank disk. */
+    if (confirm_destroy(t, "FORMAT", sz) != 0) return 1;
+
+    struct abi_provision_req req;
+    memset(&req, 0, sizeof req);
+    snprintf(req.dev, sizeof req.dev, "%s", dev);
+    req.flags = flags | ABI_PROV_F_FORMAT_ONLY;
+
+    long rc = sc1(ABI_SYS_DATA_PROVISION, (long)(uintptr_t)&req);
+    if (rc == ABI_PROV_OK_MOUNTED || rc == ABI_PROV_OK_NEXT_BOOT) {
+        printf("\n'%s' (%s) is formatted. To use it:\n\n"
+               "    mkdir -p /mnt/usb\n"
+               "    mount -t tobyfs %s /mnt/usb\n\n"
+               "/data was not touched. Note that a tobyfs volume can be\n"
+               "adopted as /data on a later boot if nothing else claims it.\n",
+               dev, sz, dev);
+        return 0;
+    }
+    explain_failure(rc, dev);
+    return 1;
+}
+
 static int cmd_create(const char *dev, unsigned flags) {
     struct abi_blk_info v[MAX_DEVS];
     int n = 0;
@@ -148,27 +241,10 @@ static int cmd_create(const char *dev, unsigned flags) {
     char sz[24];
     human_size(t->sector_count, sz, sizeof sz);
 
-    /* Say EXACTLY what is about to be destroyed, then make the user type
-     * the name back. This guards against a typo, not against malice -- the
-     * kernel guard is what actually decides. */
+    /* Only --erase destroys somebody else's filesystem; a blank or
+     * already-tobyOS target does not need the typed confirmation. */
     if (flags & ABI_PROV_F_ERASE) {
-        printf("\n  ABOUT TO ERASE  %s  (%s%s%s)\n",
-               t->name, sz,
-               t->model[0] ? ", " : "", t->model[0] ? t->model : "");
-        printf("  It currently holds: %s\n",
-               t->fs[0] ? t->fs : "an unrecognised partition table");
-        printf("  EVERYTHING ON IT WILL BE LOST.\n\n");
-        printf("  Type the device name to confirm: ");
-        fflush(stdout);
-        char answer[64];
-        if (!fgets(answer, sizeof answer, stdin)) { printf("\naborted\n"); return 1; }
-        size_t a = strlen(answer);
-        while (a && (answer[a-1] == '\n' || answer[a-1] == '\r')) answer[--a] = 0;
-        if (strcmp(answer, t->name) != 0) {
-            printf("\n  not confirmed ('%s' != '%s') -- nothing was written\n",
-                   answer, t->name);
-            return 1;
-        }
+        if (confirm_destroy(t, "ERASE", sz) != 0) return 1;
     }
 
     struct abi_provision_req req;
@@ -190,38 +266,29 @@ static int cmd_create(const char *dev, unsigned flags) {
     default: break;
     }
 
-    /* Report the kernel's reason rather than a generic failure -- the whole
-     * point of the guard is that its refusals are informative. */
-    long e = -rc;
-    if      (e == ABI_EPERM)  fprintf(stderr,
-        "datavol: refused -- '%s' carries data tobyOS will not overwrite.\n"
-        "  A fixed disk with a foreign filesystem, or the live boot medium,\n"
-        "  cannot be provisioned by any flag. Removable media with a foreign\n"
-        "  filesystem need --erase.\n", dev);
-    else if (e == ABI_EBUSY)  fprintf(stderr,
-        "datavol: refused -- '%s' backs a live mount. Unmount it first.\n", dev);
-    else if (e == ABI_EEXIST) fprintf(stderr,
-        "datavol: '%s' already holds tobyOS data. Add --force to redo it.\n", dev);
-    else if (e == ABI_EINVAL) fprintf(stderr,
-        "datavol: '%s' is not a usable whole disk (too small, or RAM-backed).\n",
-        dev);
-    else if (e == ABI_EIO)    fprintf(stderr,
-        "datavol: '%s' failed while writing/formatting -- the device may be "
-        "faulty.\n", dev);
-    else fprintf(stderr, "datavol: failed (%ld)\n", rc);
+    explain_failure(rc, dev);
     return 1;
 }
 
 static void usage(FILE *out) {
     fprintf(out,
         "usage: datavol [list]\n"
+        "       datavol format DEV [--erase]        format a USB stick\n"
         "       datavol create DEV [--force] [--erase]\n"
         "\n"
         "  list          show every block device and what can be done with it\n"
-        "  create DEV    make DEV the persistent /data volume\n"
+        "\n"
+        "  format DEV    lay a plain tobyfs across DEV and stop. This is\n"
+        "                \"format my USB stick\": /data is NOT touched, and\n"
+        "                the result is mounted with\n"
+        "                    mount -t tobyfs DEV /mnt/usb\n"
+        "                Always asks you to type the device name.\n"
+        "\n"
+        "  create DEV    make DEV the persistent /data volume instead\n"
         "    --force     DEV already holds tobyOS data; redo it\n"
-        "    --erase     DEV holds a FOREIGN filesystem and is REMOVABLE;\n"
-        "                destroy it. Asks you to type the device name.\n"
+        "\n"
+        "  --erase       DEV holds a FOREIGN filesystem and is REMOVABLE;\n"
+        "                destroy it. Required for either command.\n"
         "\n"
         "The kernel refuses fixed disks with foreign data, the live boot\n"
         "medium, and anything mounted -- no flag here overrides that.\n");
@@ -233,7 +300,8 @@ int main(int argc, char **argv) {
         usage(stdout);
         return 0;
     }
-    if (strcmp(argv[1], "create") == 0) {
+    int is_format = (strcmp(argv[1], "format") == 0);
+    if (is_format || strcmp(argv[1], "create") == 0) {
         if (argc < 3) { usage(stderr); return 2; }
         unsigned flags = 0;
         for (int i = 3; i < argc; i++) {
@@ -242,7 +310,8 @@ int main(int argc, char **argv) {
             else { fprintf(stderr, "datavol: unknown option '%s'\n", argv[i]);
                    usage(stderr); return 2; }
         }
-        return cmd_create(argv[2], flags);
+        return is_format ? cmd_format(argv[2], flags)
+                         : cmd_create(argv[2], flags);
     }
     fprintf(stderr, "datavol: unknown command '%s'\n", argv[1]);
     usage(stderr);

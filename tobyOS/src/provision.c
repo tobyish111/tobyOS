@@ -492,6 +492,32 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
         return -ABI_EINVAL;
     }
 
+    /* FORMAT_ONLY: a plain whole-disk tobyfs, and nothing else.
+     *
+     * Placed HERE, after the verdict switch, so it inherits the guard
+     * unchanged -- the flag decides what gets written, never who may be
+     * written to. No GPT (a transfer stick does not need a partition
+     * table), and /data is deliberately left alone: "format this USB" and
+     * "make this my system volume" are different requests. */
+    if (flags & ABI_PROV_F_FORMAT_ONLY) {
+        kprintf("[prov] formatting '%s' (%s, %lu MiB) as whole-disk tobyfs\n",
+                d->name, d->model[0] ? d->model : "unknown model",
+                (unsigned long)(d->sector_count / 2048u));
+        int fmt = tobyfs_format(d);
+        if (fmt != VFS_OK) {
+            kprintf("[prov] format of '%s' FAILED: %s\n",
+                    d->name, vfs_strerror(fmt));
+            return -ABI_EIO;
+        }
+        /* The failed probes above cached this device's pre-format sectors;
+         * drop them or a following mount re-reads the old bytes. Exactly
+         * the trap the GPT path documents a few lines further down. */
+        bcache_invalidate(d);
+        kprintf("[prov] '%s' formatted -- mount it with: "
+                "mount -t tobyfs %s /mnt/usb\n", d->name, d->name);
+        return ABI_PROV_OK_NEXT_BOOT;
+    }
+
     /* Geometry: partition @ 1 MiB .. last usable LBA. tobyfs needs at
      * least TFS_TOTAL_BLOCKS 4-KiB blocks. */
     uint64_t min_part = (uint64_t)TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK;
@@ -869,6 +895,71 @@ void provision_selftest(void) {
     /* NOT prd_free(2): a provisioned disk owns a partition record that
      * holds a parent pointer forever (see prd_free's own comment), so the
      * slot leaks by design -- exactly as slot 0 does after t1. */
+
+    /* ---- t5c: FORMAT_ONLY -- "format my USB stick" ------------------
+     *
+     * A different question from provisioning, and the assertions say so:
+     * the same guard applies (the flag changes WHAT is written, not WHO
+     * may be written to), the result is a real tobyfs, and /data IS LEFT
+     * ALONE. That last one is the whole distinction -- a format that
+     * quietly stole the system volume would be a worse surprise than the
+     * missing feature. */
+    {
+        struct blk_dev *d7 = prd_make(1, "prov1f", 12288);
+        struct blk_dev *data_before_fmt = data_backing_dev();
+        if (d7) {
+            uint8_t s[BLK_SECTOR_SIZE];
+            memset(s, 0, sizeof(s));
+            memcpy(s + 82, "FAT32   ", 8);
+            s[510] = 0x55; s[511] = 0xAA;
+            (void)blk_write(d7, 0, 1, s);
+            bcache_invalidate(d7);
+
+            /* Fixed disk -- refused, exactly as for provisioning. */
+            d7->removable = false;
+            prov_expect("t5c format FIXED disk + ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE),
+                        -ABI_EPERM);
+
+            /* Removable but no ERASE over a foreign fs -- refused. */
+            d7->removable = true;
+            prov_expect("t5c format removable, no ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY),
+                        -ABI_EPERM);
+
+            /* Removable + ERASE -- formatted. */
+            prov_expect("t5c format removable + ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE),
+                        ABI_PROV_OK_NEXT_BOOT);
+
+            /* It is a REAL tobyfs: mountable, and round-trips a file.
+             * "returned OK" is not evidence that a filesystem exists. */
+            {
+                long ok = -1;
+                if (tobyfs_mount("/fmttest", d7) == VFS_OK) {
+                    struct vfs_file f;
+                    if (vfs_create("/fmttest/hello.txt") == VFS_OK &&
+                        vfs_open("/fmttest/hello.txt", &f) == VFS_OK) {
+                        if (vfs_write(&f, "usb", 3) == 3) ok = 0;
+                        vfs_close(&f);
+                    }
+                    (void)vfs_unmount("/fmttest");
+                }
+                prov_expect("t5c formatted stick mounts + writes", ok, 0);
+            }
+
+            /* AND /data was not touched. */
+            prov_expect("t5c format left /data alone",
+                        (long)(data_backing_dev() == data_before_fmt), 1L);
+        } else {
+            kprintf("[PROV] FAIL t5c setup\n");
+            g_prov_st_fail++;
+        }
+        prd_free(1);
+    }
 
     /* t6: a mounted tobyfs volume refuses provisioning (BUSY), then
      * accepts it once unmounted (with FORCE -- it carries tobyfs). */

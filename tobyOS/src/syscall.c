@@ -4020,7 +4020,8 @@ static long sys_data_provision(const struct abi_provision_req *ureq) {
      * them against the device it actually finds, so masking here would only
      * hide what userspace asked for. */
     return provision_create_data_volume(d,
-        req.flags & (ABI_PROV_F_FORCE | ABI_PROV_F_ERASE));
+        req.flags & (ABI_PROV_F_FORCE | ABI_PROV_F_ERASE |
+                     ABI_PROV_F_FORMAT_ONLY));
 }
 
 /* ---- Milestone 28E: filesystem check ------------------------ */

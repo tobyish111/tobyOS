@@ -2572,7 +2572,11 @@ programs/user_gui_about/user_gui_about.elf: \
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_term,user_gui_term))
 
 # File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
+# KABI variant: the Format action speaks the real <tobyos/abi/abi.h>
+# (abi_blk_info / abi_provision_req / the ABI_PROV_F_* flags) rather than
+# hand-mirroring a 160-byte struct whose layout is frozen by a static
+# assert the mirror would not be subject to.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_files,user_gui_files))
 
 # File viewer (text/hex) -- migrated to TobyTK; monospace via tk_draw_text_mono.
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_viewer,user_gui_viewer))

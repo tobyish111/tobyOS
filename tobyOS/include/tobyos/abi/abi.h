@@ -1455,6 +1455,25 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * kernel re-checks all of the above regardless of what it was told. */
 #define ABI_PROV_F_ERASE   0x2u
 
+/* FORMAT_ONLY: lay a tobyfs filesystem across the WHOLE device and stop.
+ * No partition table, no /data takeover.
+ *
+ * 2026-08-25. Provisioning answers "make this my persistent /data", which
+ * is not the same question as "format this USB stick so I can put files on
+ * it" -- the second stick in a machine wants a filesystem and a mount
+ * point, not to become the system volume. A whole-disk tobyfs is what
+ * `mount -t tobyfs <dev> /mnt/usb` wants, and busybox's mount applet
+ * already ships.
+ *
+ * The guard is identical -- this flag changes WHAT IS WRITTEN, never WHO
+ * MAY BE WRITTEN TO. ERASE is still required for a foreign filesystem, and
+ * a fixed disk / the live boot medium / a mounted volume are still refused.
+ *
+ * Note the volume is a valid tobyfs, so a later boot with no other
+ * candidate can adopt it as /data through the existing whole-disk sweep.
+ * The CLI says so rather than letting that be a surprise. */
+#define ABI_PROV_F_FORMAT_ONLY 0x4u
+
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
     uint32_t flags;                      /* ABI_PROV_F_*                 */
