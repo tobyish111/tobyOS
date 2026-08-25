@@ -59,6 +59,10 @@
  * siginfo definitions collide. Declare the one libc entry point needed. */
 typedef void (*tsh_sighandler_fn)(int);
 extern tsh_sighandler_fn signal(int signum, tsh_sighandler_fn handler);
+/* Same reason as signal() above: declared rather than included. This one
+ * arms a handler WITHOUT SA_RESTART, which is what makes ^C at the prompt
+ * observable -- see the comment at tsh_arm_sigint(). */
+extern tsh_sighandler_fn signal_norestart(int signum, tsh_sighandler_fn handler);
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -647,6 +651,32 @@ static void usage(void) {
  * not SIG_IGN -- see the interactive setup below for why. */
 static void tsh_job_signal(int sig) { (void)sig; }
 
+/* ^C. Records the interrupt for the interpreter (which unwinds every
+ * enclosing loop/function back to the prompt) and for the read loop
+ * below. Nothing else happens in here -- a signal handler that tried to
+ * reprint the prompt would be writing to the tty from inside whatever
+ * the shell was doing. */
+extern void shell_note_interrupt(void);
+extern int  shell_take_interrupt(void);
+static volatile int g_tsh_sigint;
+static void tsh_sigint(int sig) {
+    (void)sig;
+    g_tsh_sigint = 1;
+    shell_note_interrupt();
+}
+
+/* SIGINT MUST NOT RESTART THE READ.
+ *
+ * libtoby's signal() sets SA_RESTART, which is right for almost every
+ * handler and exactly wrong for this one: with it, ^C at the prompt ran
+ * the handler and then RESUMED the blocked read(), so the half-typed line
+ * stayed put, no newline appeared, and no new prompt was drawn. The key
+ * did nothing observable, which is the bug. sigaction without SA_RESTART
+ * makes the read return EINTR so the loop can react. */
+static void tsh_arm_sigint(void) {
+    (void)signal_norestart(SIGINT, tsh_sigint);
+}
+
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
     {
@@ -683,7 +713,7 @@ int main(int argc, char **argv) {
      * not SIG_IGN -- exec resets handlers to default in children but
      * PRESERVES ignores, and an inherited ignore would make fg jobs
      * immune to the very signals job control exists to route. */
-    signal(SIGINT,  tsh_job_signal);
+    tsh_arm_sigint();                   /* ^C: no SA_RESTART -- see above */
     signal(SIGTSTP, tsh_job_signal);
     signal(SIGTTOU, tsh_job_signal);
     signal(SIGTTIN, tsh_job_signal);
@@ -707,9 +737,17 @@ int main(int argc, char **argv) {
         if (!ps) ps = cont ? "> " : "tsh$ ";
         write(1, ps, strlen(ps));
         size_t n = 0;
+        g_tsh_sigint = 0;
+        int interrupted = 0;
         for (;;) {
             char c;
             long r = read(0, &c, 1);
+            /* ^C while waiting for input: throw the half-typed line away
+             * and start a fresh prompt, which is what every shell does.
+             * Checked BEFORE the r<=0 EOF arm -- an interrupted read also
+             * returns <= 0, and treating it as end-of-input would exit the
+             * shell on ^C instead of interrupting it. */
+            if (g_tsh_sigint) { interrupted = 1; break; }
             if (r <= 0) {
                 if (n == 0 && !cont) {
                     /* `set -o ignoreeof`: an EOF at the start of a line must
@@ -731,6 +769,21 @@ int main(int argc, char **argv) {
             if (n + 1 < sizeof line) line[n++] = c;
         }
         line[n] = '\0';
+        if (interrupted) {
+            /* The tty already echoed "^C" with no newline, so the next
+             * prompt would run on from it. bash prints the newline; so do
+             * we. Everything accumulated (including a half-finished PS2
+             * continuation) is discarded, and $? becomes 130. */
+            write(1, "\n", 1);
+            alen = 0;
+            cont = 0;
+            /* Consume it HERE. Leaving the flag set for the interpreter to
+             * find would make the next command the user types unwind
+             * instead of run -- one ^C silently eating one command. */
+            (void)shell_take_interrupt();
+            last = 130;
+            continue;
+        }
         if (n == 0 && !cont) continue;
         eofs = 0;
         if (alen + n + 2 > sizeof accum) { alen = 0; cont = 0; continue; }
@@ -752,6 +805,14 @@ int main(int argc, char **argv) {
         }
         shell_history_add_hosted(accum);
         last = shell_run_line_hosted(accum);
+        /* ^C that landed DURING the command, rather than at the prompt.
+         * The tty echoed "^C" with no newline of its own and the read loop
+         * never saw it (it was not blocked -- the command was running), so
+         * the newline bash prints has to come from here or the next prompt
+         * runs on from the "^C". Measured against bash on the gate's pty:
+         * two bytes, and the only thing between a passing case and a
+         * failing one. */
+        if (g_tsh_sigint) { write(1, "\n", 1); g_tsh_sigint = 0; }
         alen = 0;
         cont = 0;
         {

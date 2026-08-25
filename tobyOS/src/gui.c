@@ -5740,7 +5740,14 @@ int gui_window_text_mono(struct window *w, int x, int y, const char *s,
     return 0;
 }
 
-#ifdef GUITEXT_SELFTEST
+/* COMPILED UNCONDITIONALLY, called from kernel.c only under
+ * -DGUITEXT_SELFTEST -- the same pattern as provision_selftest and
+ * blk_nvme_selftest, and for a concrete reason: EXTRA_CFLAGS changes do NOT
+ * trigger a recompile in this build, and the gates only `touch src/kernel.c`.
+ * With the definition behind the flag, kernel.c was rebuilt WITH it while
+ * gui.o kept an object built WITHOUT it by the preceding gate -- an
+ * undefined-symbol link failure that has nothing to do with the code.
+ * A few KiB in the shipped kernel is the right price for that. */
 /* Prove the fixed-cell contract PIXEL BY PIXEL, against the font table
  * itself. A terminal is a GUI window, so no userspace harness can see
  * whether its columns line up -- but the property that was actually
@@ -5852,7 +5859,6 @@ int gui_text_mono_selftest(void) {
     kprintf("[GUITEXT] VERDICT: %s fails=%d\n", fails ? "FAIL" : "PASS", fails);
     return fails;
 }
-#endif /* GUITEXT_SELFTEST */
 
 /* C18c: pixel height for native/desktop window text when rendered as TrueType.
  * Sized to sit within roughly the same vertical band the 8x8 bitmap font used so

@@ -96,5 +96,10 @@ int sigismember(const sigset_t *set, int signum);
 
 typedef void (*sighandler_t)(int);
 sighandler_t signal(int signum, sighandler_t handler);
+/* signal() WITHOUT SA_RESTART: a blocked syscall returns EINTR instead of
+ * resuming. For anything that must REACT to a signal mid-read -- a shell
+ * at its prompt, a pager, an editor. plain signal() sets SA_RESTART, which
+ * makes ^C during a blocking read do nothing observable at all. */
+sighandler_t signal_norestart(int signum, sighandler_t handler);
 
 #endif

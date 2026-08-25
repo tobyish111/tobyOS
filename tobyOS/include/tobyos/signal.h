@@ -225,6 +225,12 @@ bool signal_take_pending_stop(void);
  * caught (user-handler) signals are left pending for the next syscall
  * return to deliver. */
 void signal_deliver_if_pending(void);
+/* Deliver a CAUGHT signal from the timer IRQ by rewriting the ring-3
+ * trapframe. Without this, a process that installs a handler and then spins
+ * in userspace never receives the signal at all -- signal_deliver_if_pending
+ * defers caught signals to "the next syscall return", which a pure userspace
+ * loop never reaches. Returns true if a handler was entered. */
+bool signal_deliver_irq(struct regs *r);
 
 /* Check and deliver pending signals from the SYSCALL return path. `rv` is
  * the syscall's return value and `num` its number (for SA_RESTART: an

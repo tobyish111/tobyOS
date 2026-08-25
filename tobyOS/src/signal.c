@@ -757,6 +757,60 @@ void signal_deliver_if_pending(void) {
     signal_deliver(0, 0, -1);
 }
 
+/* CAUGHT signals, delivered from the TIMER IRQ.
+ *
+ * 2026-08-25. signal_deliver() refuses a caught signal when it has no
+ * trapframe to rewrite ("on the IRQ path we leave it pending so the next
+ * syscall return delivers it"), and the PIT calls it with regs = NULL. That
+ * reasoning has a hole: A PROCESS SPINNING IN USERSPACE MAKES NO SYSCALLS,
+ * so "the next syscall return" never comes and the signal stays pending
+ * forever. pit.c's comment claims this path is "what makes a CPU-bound user
+ * loop killable by Ctrl+C" -- true only while the process takes the DEFAULT
+ * action. Install a handler, as every shell must, and the same loop becomes
+ * uninterruptible.
+ *
+ * Found via /bin/tsh: `while :; do :; done` runs entirely in builtins, so
+ * there is no child for the tty to signal AND no syscall for the shell's
+ * own SIGINT to ride home on. ^C did nothing at all.
+ *
+ * The frame-building is signal_deliver_fault()'s, unchanged -- it already
+ * turns a `struct regs` into a handler entry, and an IRQ trapframe has the
+ * same shape as the exception one. si_code is SI_USER (a tty/kill-generated
+ * signal, not a fault) and there is no fault address.
+ *
+ * Returns true if a handler was entered; false leaves everything pending so
+ * the caller's default-disposition path runs exactly as before. Takes NO
+ * locks: signal_send() must never be called from here (see the deadlock
+ * recorded above signal_tick_alarms) and this does not. */
+bool signal_deliver_irq(struct regs *r) {
+    struct proc *p = current_proc();
+    if (!r || !p || p->pid == 0 || p->pending_signals == 0) return false;
+
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (deliverable == 0) return false;
+
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++) {
+        if (deliverable & SIGMASK(i)) { sig = i; break; }
+    }
+    if (sig == 0) return false;
+
+    /* SIGKILL/SIGSTOP and the default/ignore dispositions are the existing
+     * path's business -- it can already act on them without a trapframe. */
+    struct sigaction *sa = &sig_actions_of(p)[sig];
+    if (sig == SIGKILL || sig == SIGSTOP ||
+        sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
+
+    if (!signal_deliver_fault(r, sig, SI_USER, 0)) return false;
+
+    /* Consumed only once the frame is really built: a failed setup must
+     * leave the signal pending rather than swallow it. */
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    return true;
+}
+
 /* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
  * caught handlers by pushing a signal frame and redirecting the return. */
 void signal_deliver_syscall(long rv, long num) {

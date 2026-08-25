@@ -209,12 +209,29 @@ static char *g_param0;
 static char *g_positional[ARG_MAX];
 static int g_positional_count;
 
+/* Runaway-loop cap. bash has NO cap at all; this exists only so a
+ * buggy script cannot wedge the in-kernel shell forever. High enough that
+ * real scripts never reach it, and when they do the shell SAYS SO (see
+ * the bound/check pairing in the while and until drivers). */
+/* 1e6, not 1e7: this is a RUNAWAY NET, and the in-kernel shell has no ^C
+ * to escape with -- a gate that trips it must stop in seconds, not minutes.
+ * Still ~1000x the old 1024 and far past anything a real script does. */
+#define SHELL_LOOP_ITER_MAX 1000000
+
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
     SHELL_FLOW_BREAK,
     SHELL_FLOW_CONTINUE,
     SHELL_FLOW_RETURN,
     SHELL_FLOW_EXIT,
+    /* 2026-08-25: ^C unwinds EVERYTHING back to the prompt.
+     *
+     * BREAK/CONTINUE leave one loop and RETURN leaves one function; an
+     * interrupt has to leave all of them at once, including a `while true;
+     * do :; done` that never runs a child and so can never be reached by
+     * the tty's signal to the foreground group. Distinct from EXIT because
+     * the shell survives: the prompt loop clears it and carries on. */
+    SHELL_FLOW_INTERRUPT,
 };
 
 static enum shell_flow g_shell_flow;
@@ -1419,6 +1436,35 @@ bool shell_owns_pid(int pid) {
 
 void shell_deliver_signal(int sig) {
     if (sig > 0 && sig < SIG_MAX) g_pending_signals[sig] = 1;
+}
+
+/* ---- ^C: the interrupt flag ----------------------------------------
+ *
+ * Set from the tsh signal handler (programs/tsh/host.c) and consumed at
+ * the per-command choke point below, so an interrupt lands between
+ * commands rather than in the middle of one. `volatile` because the
+ * writer is a signal handler and the reader is the main flow. */
+static volatile int g_sigint_flag;
+
+void shell_note_interrupt(void) { g_sigint_flag = 1; }
+
+/* Consume a pending ^C. Returns 1 if there was one.
+ *
+ * THE FLAG MUST BE CLEARED BY WHOEVER ACTS ON IT. When the prompt loop
+ * handled the interrupt itself (^C typed at an idle prompt) and left the
+ * flag set, the NEXT command entered was swallowed by the check in
+ * execute_line_text_inner -- the ttyparity diff showed tsh's ^C, newline
+ * and fresh prompt matching bash exactly, and then `echo "after=$?"`
+ * producing no output at all.
+ *
+ * Setting $? here rather than at the call sites keeps the two halves of
+ * "an interrupt happened" together: bash reports 130 for the command that
+ * was interrupted AND after a bare ^C at the prompt. */
+int shell_take_interrupt(void) {
+    if (!g_sigint_flag) return 0;
+    g_sigint_flag = 0;
+    shell_set_status(130);            /* 128 + SIGINT, like bash */
+    return 1;
 }
 
 static void shell_check_pending_signals(void) {
@@ -17124,7 +17170,13 @@ static bool shell_try_for_command(const char *src) {
          * of lines the body spanned. */
         g_shell_lineno = ln_save;
         last = g_last_status;
+        /* INTERRUPT propagates like EXIT: a loop that only tested
+         * RETURN/EXIT/BREAK/CONTINUE would fall through and KEEP
+         * ITERATING while every command inside it returned early --
+         * turning ^C on `while true; do :; done` into a silent spin
+         * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_INTERRUPT ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -17215,7 +17267,18 @@ static bool shell_try_while_command(const char *src) {
 
     bool set_last = true;
     bool overrun = false;
-    for (int iter = 0; iter < 1024; iter++) {
+    /* THE BOUND AND ITS OVERRUN CHECK MUST BE THE SAME NUMBER.
+     *
+     * This read `iter < 1024` while the check below tested `iter ==
+     * 999999`, whose comment records the intent: "was 1023: bash has NO
+     * cap, and real scripts loop past 1k". The CHECK was raised and the
+     * BOUND was not, so the cap stayed at 1024 AND the message announcing
+     * it became unreachable -- every loop in the shell stopped dead after
+     * 1024 iterations and said nothing, reporting the body's last status
+     * as if it had finished normally. Found on 2026-08-25 by a ^C parity
+     * case: `while :; do :; done` returned to a prompt on its own, before
+     * the interrupt it was supposed to be testing ever arrived. */
+    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         g_errexit_suspend++;              /* the condition is a decision */
         execute_line_text(cond);
         g_errexit_suspend--;
@@ -17230,7 +17293,13 @@ static bool shell_try_while_command(const char *src) {
          * of lines the body spanned. */
         g_shell_lineno = ln_save;
         last = g_last_status;
+        /* INTERRUPT propagates like EXIT: a loop that only tested
+         * RETURN/EXIT/BREAK/CONTINUE would fall through and KEEP
+         * ITERATING while every command inside it returned early --
+         * turning ^C on `while true; do :; done` into a silent spin
+         * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_INTERRUPT ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -17252,7 +17321,9 @@ static bool shell_try_while_command(const char *src) {
             }
             continue;
         }
-        if (iter == 999999) overrun = true;   /* was 1023: bash has NO cap, and real scripts loop past 1k -- the gate timeouts are the runaway net */
+        /* Last permitted iteration -- keyed to the SAME constant as the
+         * bound so the two can never drift apart again. */
+        if (iter == SHELL_LOOP_ITER_MAX - 1) overrun = true;
     }
 done:
     g_shell_loop_depth--;
@@ -17325,7 +17396,18 @@ static bool shell_try_until_command(const char *src) {
 
     bool set_last = true;
     bool overrun = false;
-    for (int iter = 0; iter < 1024; iter++) {
+    /* THE BOUND AND ITS OVERRUN CHECK MUST BE THE SAME NUMBER.
+     *
+     * This read `iter < 1024` while the check below tested `iter ==
+     * 999999`, whose comment records the intent: "was 1023: bash has NO
+     * cap, and real scripts loop past 1k". The CHECK was raised and the
+     * BOUND was not, so the cap stayed at 1024 AND the message announcing
+     * it became unreachable -- every loop in the shell stopped dead after
+     * 1024 iterations and said nothing, reporting the body's last status
+     * as if it had finished normally. Found on 2026-08-25 by a ^C parity
+     * case: `while :; do :; done` returned to a prompt on its own, before
+     * the interrupt it was supposed to be testing ever arrived. */
+    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         /* THE CONDITION IS A DECISION, NOT A FAILURE -- and `until` is the
          * loop whose condition is EXPECTED to fail. `set -e; until false; do
          * ...; done` exited the shell before the body ever ran. `while` had
@@ -17344,7 +17426,13 @@ static bool shell_try_until_command(const char *src) {
          * of lines the body spanned. */
         g_shell_lineno = ln_save;
         last = g_last_status;
+        /* INTERRUPT propagates like EXIT: a loop that only tested
+         * RETURN/EXIT/BREAK/CONTINUE would fall through and KEEP
+         * ITERATING while every command inside it returned early --
+         * turning ^C on `while true; do :; done` into a silent spin
+         * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_INTERRUPT ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -17366,7 +17454,9 @@ static bool shell_try_until_command(const char *src) {
             }
             continue;
         }
-        if (iter == 999999) overrun = true;   /* was 1023: bash has NO cap, and real scripts loop past 1k -- the gate timeouts are the runaway net */
+        /* Last permitted iteration -- keyed to the SAME constant as the
+         * bound so the two can never drift apart again. */
+        if (iter == SHELL_LOOP_ITER_MAX - 1) overrun = true;
     }
 done:
     g_shell_loop_depth--;
@@ -18956,6 +19046,17 @@ static void execute_line_text_inner(const char *src) {
     src = src ? src : "";
     if (g_shell_flow != SHELL_FLOW_NONE) return;
     if (g_opt_verbose) kprintf("%s\n", src);
+    /* ^C ABORTS THE WHOLE CONSTRUCT, not just the current command. Checked
+     * here because this is the one point every command in every nesting
+     * level passes through -- a loop body, a function call, a `&&` chain.
+     * Setting the flow makes each enclosing construct unwind on its own
+     * existing test, so no loop needs its own interrupt check. $? is 130
+     * (128 + SIGINT), which is what bash reports. */
+    if (g_sigint_flag) {
+        g_shell_flow = SHELL_FLOW_INTERRUPT;
+        shell_set_status(130);
+        return;
+    }
     shell_check_pending_signals();
     if (g_shell_flow != SHELL_FLOW_NONE) return;
     /* Before tokenizing (which expands): split `;` / `&&` / `||` and run each
@@ -19956,6 +20057,18 @@ int shell_run_line_hosted(const char *text) {
     if (!copy) return 2;
     int rc = shell_run_script_text(copy, true);
     kfree(copy);
+    /* An interrupt unwound the whole construct to get here. Clear BOTH the
+     * flow and the flag, or the shell arrives at its next prompt already
+     * refusing to run anything -- a ^C that permanently bricks the session
+     * is worse than one that does nothing. The flag is the source of truth
+     * (a subshell frame restores the saved flow on the way out and would
+     * otherwise swallow the interrupt), so it is cleared last and here. */
+    if (g_shell_flow == SHELL_FLOW_INTERRUPT) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        rc = 130;
+    }
+    (void)shell_take_interrupt();
     shell_drain_background();
     return rc;
 }

@@ -262,6 +262,21 @@ static int session_run(struct session *s, char lines[][256], int nlines,
          * terminal over. %EOF% is TYPED AT A PROMPT like any other line --
          * treating it as an interrupt shifted its timing and made bash's
          * ignoreeof message land after the next echo. */
+        /* %CTRLC@% is ^C TYPED AT A PROMPT -- no job is running, so the
+         * foreground group never moves and the interrupt wait below would
+         * simply burn its whole deadline before firing. Sent like an
+         * ordinary line except that it is one 0x03 byte with NO newline,
+         * which is exactly what the key does. */
+        if (strcmp(lines[i], "%CTRLC@%") == 0) {
+            char c = 0x03;
+            write(s->mfd, &c, 1);
+            if (i + 1 < nlines &&
+                strcmp(lines[i + 1], "%CTRLZ%") != 0 &&
+                strcmp(lines[i + 1], "%CTRLC%") != 0) {
+                if (wait_prompt(s, SENT_P, SENT_C) != 0) goto out;
+            }
+            continue;
+        }
         int is_intr = (strcmp(lines[i], "%CTRLZ%") == 0 ||
                        strcmp(lines[i], "%CTRLC%") == 0);
         if (is_intr) {
