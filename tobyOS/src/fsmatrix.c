@@ -384,6 +384,94 @@ static void fsm_coherence(const char *fs, const char *mp) {
     (void)vfs_unlink(f);
 }
 
+
+static void fsm_note(const char *fs, const char *what, const char *detail) {
+    kprintf("[FSMATRIX]  note  %-7s %-28s %s\n", fs, what, detail ? detail : "");
+}
+
+/* ---- unlink removes the NAME, not the file --------------------------
+ *
+ * POSIX: the bytes stay readable through every handle already open, and
+ * the space comes back at the LAST close. This is not a corner case --
+ * it is how mkstemp() and tmpfile() make a private temp file, and how
+ * every bash here-document works: open, unlink immediately, keep using
+ * the fd.
+ *
+ * The first version of this check PASSED on fat32 while fat32 was still
+ * freeing the chain inside unlink(): the clusters had been returned to
+ * the allocator but nothing had overwritten them yet, so the old bytes
+ * were still lying there to be read. So the check now allocates a second
+ * file of the same size in between -- if the space really was released,
+ * that file takes it and the handle starts reading somebody else's
+ * bytes. Reading 'U' back afterwards is then a result rather than luck.
+ */
+static void fsm_unlink_open(const char *fs, const char *mp) {
+    char f[128], g[128], msg[192];
+    ksnprintf(f, sizeof f, "%s/unlopen.dat", mp);
+    ksnprintf(g, sizeof g, "%s/unlgrab.dat", mp);
+    (void)vfs_unlink(f);
+    (void)vfs_unlink(g);
+
+    const size_t BIG = 64u * 1024u;
+    uint8_t *buf = kmalloc(BIG);
+    if (!buf) { fsm_bad(fs, "unlink-while-open", "out of memory"); return; }
+
+    struct vfs_statfs before, after;
+    memset(&before, 0, sizeof before);
+    (void)vfs_statfs(mp, &before);
+
+    memset(buf, 'U', BIG);
+    int cr = vfs_write_all(f, buf, BIG);
+
+    struct vfs_file h;
+    int oh = vfs_open(f, &h);
+    int un = vfs_unlink(f);
+    long named = fsm_size(f);            /* the NAME must be gone */
+
+    /* Take the space, if it was in fact released. */
+    memset(buf, 'X', BIG);
+    int gr = vfs_write_all(g, buf, BIG);
+
+    long got = -1;
+    int  intact = 0;
+    if (oh == VFS_OK) {
+        uint8_t probe[64];
+        got = vfs_read(&h, probe, sizeof probe);
+        intact = (got == (long)sizeof probe);
+        for (size_t i = 0; intact && i < sizeof probe; i++)
+            if (probe[i] != 'U') intact = 0;      /* 'X' here = freed early */
+    }
+    if (oh == VFS_OK) vfs_close(&h);
+    (void)vfs_unlink(g);
+
+    memset(&after, 0, sizeof after);
+    (void)vfs_statfs(mp, &after);
+    kfree(buf);
+
+    ksnprintf(msg, sizeof msg,
+              "unlink rc=%d name=%ld want -1, reused rc=%d, read %ld bytes "
+              "still-ours=%d", un, named, gr, got, intact);
+    fsm_chk(cr == VFS_OK && oh == VFS_OK && un == VFS_OK && named < 0 &&
+            gr == VFS_OK && intact, fs,
+            "bytes survive unlink-while-open", msg);
+
+    /* ...and the space must come back at the last close, or the deferred
+     * release is just a leak wearing a POSIX costume. */
+    if (before.bfree == 0 && after.bfree == 0) {
+        /* ramfs reports bfree = 0 by design (the tar never grows), so
+         * this would be a comparison of 0 with 0 -- which passes without
+         * meaning anything. Said out loud instead of counted. */
+        fsm_note(fs, "leak check N/A", "driver does not report free space");
+    } else {
+        ksnprintf(msg, sizeof msg, "bfree before=%lu after=%lu",
+                  (unsigned long)before.bfree, (unsigned long)after.bfree);
+        fsm_chk(after.bfree == before.bfree, fs,
+                "space fully returned, no leak", msg);
+    }
+    (void)vfs_unlink(f);
+    (void)vfs_unlink(g);
+}
+
 /* ---- formatting a REAL device, for host-side verification ------------
  *
  * fsm_run above proves the driver can read what the formatter wrote --
@@ -465,6 +553,7 @@ void fsmatrix_selftest(void) {
     /* tmpfs and the initrd root are already mounted and need no fixture. */
     fsm_run("tmpfs", "/tmp", true, true);
     fsm_coherence("tmpfs", "/tmp");
+    fsm_unlink_open("tmpfs", "/tmp");
 
     /* ramfs IS the root every session starts in, and nothing had ever run
      * the matrix against it. Work inside a subdirectory so a failed run
@@ -480,6 +569,7 @@ void fsmatrix_selftest(void) {
         } else {
             fsm_run("ramfs", dir, true, true);
             fsm_coherence("ramfs", dir);
+            fsm_unlink_open("ramfs", dir);
             (void)vfs_unlink(dir);
         }
     }
@@ -502,6 +592,7 @@ void fsmatrix_selftest(void) {
             } else {
                 fsm_run("ext4", "/fsm4", true, true);
                 fsm_coherence("ext4", "/fsm4");
+                fsm_unlink_open("ext4", "/fsm4");
                 (void)vfs_unmount("/fsm4");
             }
         }
@@ -535,6 +626,7 @@ void fsmatrix_selftest(void) {
                      * properties of FAT, not gaps in the driver. */
                     fsm_run("fat32", "/fsmfat", false, false);
                     fsm_coherence("fat32", "/fsmfat");
+                    fsm_unlink_open("fat32", "/fsmfat");
                     (void)vfs_unmount("/fsmfat");
                 }
             }

@@ -86,6 +86,10 @@ static int g_jbd_crash_phase = JBD2_CRASH_NONE;
 
 /* ---- in-memory state ---- */
 
+/* Concurrent open handles tracked per mount. Sized for "plenty";
+ * exceeding it is reported, never silently ignored. */
+#define EXT4_MAX_OPEN_INODES 64
+
 struct ext4 {
     struct blk_dev *dev;
 
@@ -119,12 +123,24 @@ struct ext4 {
     uint32_t j_first;             /* first usable log block (s_first, usually 1) */
     uint32_t j_sequence;          /* sequence to stamp on the next transaction */
     struct ext4_txn *txn;         /* active transaction, or NULL (writes direct) */
+
+    /* Open handles per inode, so unlink() can defer the release to the
+     * last close the way POSIX requires. See oref_get() below. */
+    struct ext4_openref {
+        uint32_t ino;             /* 0 = free slot */
+        int      refs;
+        bool     orphan;          /* the last NAME went away while open */
+    } openrefs[EXT4_MAX_OPEN_INODES];
 };
 
-/* Per-handle state for an open file. We snapshot the inode at open
- * time so subsequent reads don't have to chase the GDT/inode table
- * again on every byte. The driver is RO so the inode contents can't
- * change underneath us. */
+/* Per-handle state for an open file. The inode is snapshotted at open
+ * time so reads don't chase the GDT/inode table on every byte.
+ *
+ * The original note here said "the driver is RO so the inode contents
+ * can't change underneath us" -- that stopped being true the moment the
+ * driver could write, and the snapshot then went stale whenever anyone
+ * else touched the file. fp_refresh() below re-reads it; this struct is
+ * a cache, not a source of truth. */
 struct ext4_filepriv {
     uint32_t          inode_no;
     struct ext4_inode in;
@@ -1482,6 +1498,74 @@ static bool journal_locate(struct ext4 *fs, uint32_t jinum) {
 
 /* ---- vfs_ops ---- */
 
+/* ---- open-handle references, so unlink can defer the release --------
+ *
+ * POSIX: unlink() removes the NAME. The file itself survives until the
+ * last descriptor on it closes, and THAT is when the blocks come back.
+ * This driver freed the blocks and the inode the moment i_links_count
+ * hit zero, so an open handle was left reading blocks that had been
+ * returned to the allocator -- and once the inode number was reissued,
+ * reading a different file entirely.
+ *
+ * It is not a corner case: mkstemp() and tmpfile() both open-then-unlink
+ * to get a private temp file, and so does every bash here-document.
+ *
+ * A fixed table rather than a list: mounts are few, this costs under a
+ * kilobyte, and running out is reported rather than silently degrading
+ * back to the behaviour above.
+ */
+static struct ext4_openref *oref_find(struct ext4 *fs, uint32_t ino) {
+    for (size_t i = 0; i < EXT4_MAX_OPEN_INODES; i++)
+        if (fs->openrefs[i].ino == ino && fs->openrefs[i].refs > 0)
+            return &fs->openrefs[i];
+    return 0;
+}
+
+static int oref_get(struct ext4 *fs, uint32_t ino) {
+    struct ext4_openref *r = oref_find(fs, ino);
+    if (r) { r->refs++; return VFS_OK; }
+    for (size_t i = 0; i < EXT4_MAX_OPEN_INODES; i++) {
+        if (fs->openrefs[i].refs == 0) {
+            fs->openrefs[i].ino    = ino;
+            fs->openrefs[i].refs   = 1;
+            fs->openrefs[i].orphan = false;
+            return VFS_OK;
+        }
+    }
+    /* Refuse the open rather than proceed untracked: an untracked handle
+     * is exactly the bug this table exists to prevent, and it would come
+     * back only under load, where it is hardest to see. */
+    kprintf("[ext4] open-inode table full (%d) -- refusing to open ino %u "
+            "untracked\n", EXT4_MAX_OPEN_INODES, (unsigned)ino);
+    return VFS_ERR_NOMEM;
+}
+
+/* Release the inode for real: blocks, then the inode itself. */
+static void ext4_release_inode(struct ext4 *fs, uint32_t ino) {
+    struct ext4_inode in;
+    if (read_inode(fs, ino, &in) != VFS_OK) return;
+    if (in.i_links_count != 0) return;         /* re-linked in the meantime */
+    txn_begin(fs);
+    inode_free_data(fs, &in);
+    in.i_size_lo = 0;
+    in.i_size_hi = 0;
+    in.i_dtime   = (uint32_t)ext4_now_secs();
+    int rc = write_inode(fs, ino, &in);
+    if (rc == VFS_OK) rc = ext4_free_inode(fs, ino);
+    (void)txn_finish(fs, rc);
+}
+
+static void oref_put(struct ext4 *fs, uint32_t ino) {
+    struct ext4_openref *r = oref_find(fs, ino);
+    if (!r) return;
+    if (--r->refs > 0) return;
+    bool orphan = r->orphan;
+    r->ino    = 0;
+    r->orphan = false;
+    /* Last close of a name-less inode: NOW the space comes back. */
+    if (orphan) ext4_release_inode(fs, ino);
+}
+
 static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
     struct ext4 *fs = (struct ext4 *)mnt;
     uint32_t ino; uint8_t ftype;
@@ -1497,6 +1581,10 @@ static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
 
     struct ext4_filepriv *fp = kcalloc(1, sizeof(*fp));
     if (!fp) return VFS_ERR_NOMEM;
+    /* Count this handle BEFORE anyone can unlink the name out from under
+     * it -- that count is what makes the deferred release possible. */
+    int orc = oref_get(fs, ino);
+    if (orc != VFS_OK) { kfree(fp); return orc; }
     fp->inode_no  = ino;
     fp->in        = in;
     fp->file_size = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
@@ -1512,7 +1600,16 @@ static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
 }
 
 static int ext4_close(struct vfs_file *f) {
-    if (f && f->priv) { kfree(f->priv); f->priv = NULL; }
+    if (f && f->priv) {
+        struct ext4 *fs = (struct ext4 *)f->mnt;
+        struct ext4_filepriv *fp = (struct ext4_filepriv *)f->priv;
+        uint32_t ino = fp->inode_no;
+        kfree(fp);
+        f->priv = NULL;
+        /* Last close of an already-unlinked file is where its blocks
+         * actually go back. */
+        if (fs) oref_put(fs, ino);
+    }
     return VFS_OK;
 }
 
@@ -1689,10 +1786,20 @@ static int do_unlink(struct ext4 *fs, const char *path) {
 
     if (in.i_links_count > 0) in.i_links_count--;
     if (in.i_links_count == 0) {
+        struct ext4_openref *r = oref_find(fs, ino);
+        if (r) {
+            /* Somebody still has it open. The NAME is gone -- that part
+             * already happened above -- but the bytes belong to those
+             * handles until the last of them closes. Persist the zero
+             * link count and leave the data alone; oref_put() finishes
+             * the job. */
+            r->orphan = true;
+            return write_inode(fs, ino, &in);
+        }
         inode_free_data(fs, &in);
         in.i_size_lo = 0;
         in.i_size_hi = 0;
-        in.i_dtime   = 1;
+        in.i_dtime   = (uint32_t)ext4_now_secs();
         write_inode(fs, ino, &in);
         ext4_free_inode(fs, ino);
     } else {

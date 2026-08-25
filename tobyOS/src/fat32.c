@@ -32,6 +32,10 @@
 
 /* ---- in-memory state ---- */
 
+/* Concurrent open files tracked per mount. Sized for "plenty";
+ * exceeding it is reported, never silently ignored. */
+#define FAT32_MAX_OPEN 64
+
 struct fat32 {
     struct blk_dev *dev;
 
@@ -61,6 +65,18 @@ struct fat32 {
     /* Cluster-sized scratch buffers (allocated once at mount). */
     uint8_t *clus_buf;            /* cluster_bytes */
     uint8_t *clus_buf2;           /* second scratch (used during pack) */
+
+    /* Open handles per FILE, keyed by its directory entry, so unlink()
+     * can defer the release to the last close. See foref_get(). */
+    struct fat32_openref {
+        uint32_t id;                  /* unique; 0 = free slot */
+        uint32_t dir_clus, dir_off;   /* the entry that names the file */
+        int      refs;
+        bool     orphan;              /* the name went away while open */
+        uint32_t head;                /* chain to free at the last close */
+        uint32_t size;                /* size, once the entry is gone */
+    } openrefs[FAT32_MAX_OPEN];
+    uint32_t oref_next_id;
 };
 
 #define FAT32_INVALID_SEC  0xFFFFFFFFu
@@ -75,6 +91,10 @@ struct fat32_filepriv {
     uint32_t dir_clus;            /* parent directory cluster */
     uint32_t dir_off;             /* byte offset within dir cluster of the SHORT entry */
     uint32_t cluster_in_dir;      /* which cluster inside the chain dir_off lives in */
+    /* Which openref is OURS. Looking the record up by (dir_clus,dir_off)
+     * instead would find whichever file now owns that slot once ours has
+     * been unlinked. */
+    uint32_t oref_id;
 };
 
 /* Per-handle state for an open dir (we materialise all entries up
@@ -207,6 +227,83 @@ static int free_chain(struct fat32 *fs, uint32_t head) {
         c = next;
     }
     return fat_flush(fs);
+}
+
+/* ---- open-handle references, so unlink can defer the release --------
+ *
+ * POSIX: unlink() removes the NAME; the bytes survive until the last
+ * descriptor closes. fat32_unlink() freed the cluster chain before it
+ * even tombstoned the entry, so an open handle was reading clusters the
+ * allocator had already handed back -- and the very next file created
+ * took them.
+ *
+ * FAT has no inode, so the identity of an open file is its directory
+ * ENTRY (cluster + offset). That slot is stable while the file exists,
+ * but unlink tombstones it and a later create can reuse it -- which is
+ * why an orphaned handle must stop consulting the entry entirely and
+ * work from what this table remembers instead.
+ */
+/* Find the record for a file that still HAS this name.
+ *
+ * The orphan check is the whole point. unlink() tombstones the entry and
+ * dir_find_free_slot() hands that very slot to the next create, so
+ * (dir_clus, dir_off) stops identifying one file the moment a name is
+ * removed -- the new file would otherwise join the dead file's record,
+ * inherit its refcount, and overwrite the chain the old handles are
+ * still reading. Hence the id: a handle finds ITS OWN record, not
+ * whatever now occupies the slot it was opened from. */
+static struct fat32_openref *foref_find_live(struct fat32 *fs, uint32_t dc,
+                                             uint32_t doff) {
+    for (size_t i = 0; i < FAT32_MAX_OPEN; i++)
+        if (fs->openrefs[i].refs > 0 && !fs->openrefs[i].orphan &&
+            fs->openrefs[i].dir_clus == dc && fs->openrefs[i].dir_off == doff)
+            return &fs->openrefs[i];
+    return 0;
+}
+
+static struct fat32_openref *foref_by_id(struct fat32 *fs, uint32_t id) {
+    if (!id) return 0;
+    for (size_t i = 0; i < FAT32_MAX_OPEN; i++)
+        if (fs->openrefs[i].refs > 0 && fs->openrefs[i].id == id)
+            return &fs->openrefs[i];
+    return 0;
+}
+
+static int foref_get(struct fat32 *fs, uint32_t dc, uint32_t doff,
+                     uint32_t *out_id) {
+    struct fat32_openref *r = foref_find_live(fs, dc, doff);
+    if (r) { r->refs++; *out_id = r->id; return VFS_OK; }
+    for (size_t i = 0; i < FAT32_MAX_OPEN; i++) {
+        if (fs->openrefs[i].refs == 0) {
+            fs->openrefs[i].id       = ++fs->oref_next_id;
+            fs->openrefs[i].dir_clus = dc;
+            fs->openrefs[i].dir_off  = doff;
+            fs->openrefs[i].refs     = 1;
+            fs->openrefs[i].orphan   = false;
+            fs->openrefs[i].head     = 0;
+            fs->openrefs[i].size     = 0;
+            *out_id = fs->openrefs[i].id;
+            return VFS_OK;
+        }
+    }
+    kprintf("[fat32] open-file table full (%d) -- refusing to open "
+            "untracked\n", FAT32_MAX_OPEN);
+    return VFS_ERR_NOMEM;
+}
+
+static void foref_put(struct fat32 *fs, uint32_t id) {
+    struct fat32_openref *r = foref_by_id(fs, id);
+    if (!r) return;
+    if (--r->refs > 0) return;
+    bool     orphan = r->orphan;
+    uint32_t head   = r->head;
+    r->id = 0; r->dir_clus = 0; r->dir_off = 0; r->orphan = false;
+    r->head = 0;
+    /* Last close of a name-less file: NOW the clusters go back. */
+    if (orphan && head >= 2) {
+        (void)free_chain(fs, head);
+        (void)fat_flush(fs);
+    }
 }
 
 /* Get cluster N of a chain (0-based), allocating + linking new clusters
@@ -814,6 +911,22 @@ static int fat32_ftruncate(struct vfs_file *f, uint64_t length) {
     if (!fp) return VFS_ERR_INVAL;
     if (length > 0xFFFFFFFFull) return VFS_ERR_INVAL;
 
+    struct fat32_openref *r = foref_by_id(fs, fp->oref_id);
+    if (r && r->orphan) {
+        /* Unlinked but still open: work from the table, and leave the
+         * tombstoned entry alone. */
+        uint32_t ofirst = r->head;
+        int orc = fat_resize_chain(fs, &ofirst, r->size, length);
+        if (orc != VFS_OK) return orc;
+        r->head = ofirst;
+        r->size = (uint32_t)length;
+        fp->first_clus   = ofirst;
+        fp->cur_clus     = ofirst;
+        fp->cur_clus_idx = 0;
+        f->size          = (size_t)length;
+        return fat_flush(fs);
+    }
+
     struct fat_dirent de;
     int rc = read_dirent_at(fs, fp->dir_clus, fp->dir_off, &de);
     if (rc != VFS_OK) return rc;
@@ -895,6 +1008,11 @@ static int fat32_open(void *mnt, const char *path, struct vfs_file *out) {
     fp->dir_off       = doff;
     fp->cluster_in_dir= 0;
 
+    /* Count this handle BEFORE anyone can unlink the name out from under
+     * it -- that count is what makes the deferred release possible. */
+    int orc = foref_get(fs, dc, doff, &fp->oref_id);
+    if (orc != VFS_OK) { kfree(fp); return orc; }
+
     out->priv = fp;
     out->pos  = 0;
     out->size = de.file_size;
@@ -905,7 +1023,16 @@ static int fat32_open(void *mnt, const char *path, struct vfs_file *out) {
 }
 
 static int fat32_close(struct vfs_file *f) {
-    if (f->priv) { kfree(f->priv); f->priv = 0; }
+    if (f->priv) {
+        struct fat32 *fs = (struct fat32 *)f->mnt;
+        struct fat32_filepriv *fp = (struct fat32_filepriv *)f->priv;
+        uint32_t id = fp->oref_id;
+        kfree(fp);
+        f->priv = 0;
+        /* Last close of an already-unlinked file is where its clusters
+         * actually go back. */
+        if (fs) foref_put(fs, id);
+    }
     return VFS_OK;
 }
 
@@ -917,6 +1044,20 @@ static int fat32_close(struct vfs_file *f) {
  * because FAT has no inode. */
 static int fat_fp_refresh(struct fat32 *fs, struct vfs_file *f,
                           struct fat32_filepriv *fp) {
+    struct fat32_openref *r = foref_by_id(fs, fp->oref_id);
+    if (r && r->orphan) {
+        /* The name is gone and the slot may already belong to a new
+         * file, so the entry is no longer this file's truth -- the table
+         * is. Re-reading it here would silently adopt somebody else's
+         * chain. */
+        if (fp->first_clus != r->head) {
+            fp->first_clus   = r->head;
+            fp->cur_clus     = r->head;
+            fp->cur_clus_idx = 0;
+        }
+        f->size = r->size;
+        return VFS_OK;
+    }
     struct fat_dirent de;
     int rc = read_dirent_at(fs, fp->dir_clus, fp->dir_off, &de);
     if (rc != VFS_OK) return rc;
@@ -1043,6 +1184,15 @@ static long fat32_write(struct vfs_file *f, const void *buf, size_t n) {
     /* Flush any pending FAT changes + persist the dirent. */
     int rc = fat_flush(fs);
     if (rc != VFS_OK) return rc;
+    struct fat32_openref *r = foref_by_id(fs, fp->oref_id);
+    if (r && r->orphan) {
+        /* No name, so no entry to update -- and writing the old slot
+         * would corrupt whatever file has been created into it since.
+         * The table carries the length now. */
+        r->head = fp->first_clus;
+        r->size = (uint32_t)f->size;
+        return (long)n;
+    }
     rc = update_dirent(fs, fp->dir_clus, fp->dir_off,
                        (uint32_t)f->size, fp->first_clus);
     if (rc != 0) return VFS_ERR_IO;
@@ -1228,9 +1378,17 @@ static int fat32_unlink(void *mnt, const char *path) {
     if (rc != VFS_OK) return rc;
     if (de.attr & FAT_ATTR_DIRECTORY) return VFS_ERR_ISDIR;
 
-    /* Free cluster chain. */
     uint32_t head = ((uint32_t)de.fst_clus_hi << 16) | de.fst_clus_lo;
-    if (head >= 2) {
+    struct fat32_openref *r = foref_find_live(fs, dc, doff);
+    if (r) {
+        /* Somebody still has it open. Tombstone the name below, but the
+         * clusters belong to those handles until the last one closes --
+         * remember what to free, and what the file's length was, since
+         * the entry that held both is about to become unreadable. */
+        r->orphan = true;
+        r->head   = head;
+        r->size   = de.file_size;
+    } else if (head >= 2) {
         rc = free_chain(fs, head);
         if (rc != VFS_OK) return rc;
     }
