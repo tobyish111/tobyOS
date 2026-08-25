@@ -38,6 +38,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
+#include <tobyos/installer.h>   /* t7: the installer is a writer too */
 
 /* ---- tiny helpers ------------------------------------------------ */
 
@@ -902,6 +903,80 @@ void provision_selftest(void) {
             else
                 kprintf("[PROV] WARN: could not restore original /data\n");
         }
+    }
+
+    /* ---- t7: THE INSTALLER'S GUARD -------------------------------
+     *
+     * installer_run() writes a BOOT IMAGE over the front of a disk and
+     * until 2026-08-25 had no safety check at all -- its caller picked the
+     * target with blk_get_first(), whichever device enumerated first. On a
+     * machine whose internal disk came up before its USB sticks that was a
+     * boot image over somebody's Windows.
+     *
+     * Its rule is STRICTER than provisioning's on purpose: there is no
+     * ERASE escape hatch, because writing a bootloader over a disk has no
+     * everyday case the way handing over a spare USB stick does. So the
+     * assertion is that removable + foreign is refused HERE even though the
+     * very same disk is erasable through datavol.
+     *
+     * These run without an install image loaded, so installer_run stops at
+     * its -2 ("no install image") check AFTER the guard would have fired --
+     * which is why each case asserts the GUARD's specific code and not a
+     * generic failure. */
+    {
+        struct blk_dev *d6 = prd_make(1, "prov1i", 12288);
+        if (d6) {
+            uint8_t s[BLK_SECTOR_SIZE];
+            memset(s, 0, sizeof(s));
+            memcpy(s + 3, "NTFS    ", 8);
+            s[510] = 0x55; s[511] = 0xAA;
+            (void)blk_write(d6, 0, 1, s);
+            bcache_invalidate(d6);
+
+            d6->removable = false;
+            prov_expect("t7 installer refuses NTFS (fixed)",
+                        installer_run(d6), -11);
+            /* Removable makes no difference to the INSTALLER. */
+            d6->removable = true;
+            prov_expect("t7 installer refuses NTFS (removable too)",
+                        installer_run(d6), -11);
+
+            /* The live boot medium. */
+            memset(s, 0, sizeof(s));
+            (void)blk_write(d6, 0, 1, s);
+            {
+                uint8_t iso[BLK_SECTOR_SIZE];
+                memset(iso, 0, sizeof(iso));
+                memcpy(iso + 1, "CD001", 5);
+                (void)blk_write(d6, 64, 1, iso);
+            }
+            bcache_invalidate(d6);
+            prov_expect("t7 installer refuses iso9660",
+                        installer_run(d6), -11);
+
+            /* A partition, not a whole disk. */
+            {
+                uint8_t zero[BLK_SECTOR_SIZE];
+                memset(zero, 0, sizeof(zero));
+                (void)blk_write(d6, 64, 1, zero);
+                (void)blk_write(d6, 0, 1, zero);
+            }
+            bcache_invalidate(d6);
+            d6->class = BLK_CLASS_PARTITION;
+            prov_expect("t7 installer refuses a partition",
+                        installer_run(d6), -12);
+            d6->class = BLK_CLASS_DISK;
+
+            /* A blank disk PASSES the guard and stops at the missing
+             * install image (-2) -- proof the guard let it through rather
+             * than the guard being skipped. */
+            prov_expect("t7 installer accepts a blank disk",
+                        installer_run(d6), -2);
+        } else {
+            kprintf("[PROV] FAIL t7 setup\n");
+            g_prov_st_fail++;
+        }
+        prd_free(1);
     }
 
     if (g_prov_st_fail == 0)

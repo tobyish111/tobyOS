@@ -19,6 +19,7 @@
 
 #include <tobyos/installer.h>
 #include <tobyos/blk.h>
+#include <tobyos/provision.h>   /* the guard -- see installer_guard() */
 #include <tobyos/tobyfs.h>
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
@@ -233,11 +234,84 @@ void installer_m20_selftest(void) {
 void installer_m20_selftest(void) { /* no-op in default builds */ }
 #endif
 
+/* THE INSTALLER IS A WRITER, AND EVERY WRITER MUST BE GUARDED.
+ *
+ * 2026-08-25. This function had NO safety check of any kind: it took a
+ * blk_dev and flashed the front of it. Its only caller picked the target
+ * with blk_get_first() -- literally whichever device enumerated first --
+ * so on a machine whose internal disk came up before its USB sticks,
+ * `install --yes` would have written a boot image over somebody's Windows
+ * with a single line of warning. That is the same shape as the swap bug
+ * this project already carries a scar from (swap_init picked a partition
+ * blindly and landed on the Windows EFI partition); the lesson recorded
+ * then was that foreign-disk safety must guard EVERY writer, and this one
+ * was missed.
+ *
+ * The rule here is STRICTER than provisioning's, deliberately. Provisioning
+ * has an owner-authorised ERASE path for removable media, because handing a
+ * spare USB stick to tobyOS is an ordinary thing to want. Installing writes
+ * a BOOT IMAGE over the front of a disk; there is no equivalent everyday
+ * case, so a foreign filesystem or partition table refuses outright and no
+ * flag lifts it. A user who really means it can clear the disk with
+ * `datavol create <dev> --erase` first and then install onto it.
+ *
+ * Returns 0 when `target` may be written. */
+static int installer_guard(struct blk_dev *target) {
+    char fs[ABI_BLK_FS_MAX];
+    uint32_t fl = 0;
+    uint8_t v = provision_classify(target, &fl, fs);
+
+    switch (v) {
+    case ABI_BLKV_BLANK:
+    case ABI_BLKV_TOBYOS:
+        return 0;                    /* blank, or already ours */
+    case ABI_BLKV_MOUNTED: {
+        const char *mp = 0;
+        (void)provision_dev_mounted(target, &mp);
+        kprintf("[installer] REFUSED '%s': it backs a live mount (%s). "
+                "Installing over a mounted volume corrupts it.\n",
+                target->name, mp ? mp : "?");
+        return -10;
+    }
+    case ABI_BLKV_FOREIGN:
+        kprintf("[installer] REFUSED '%s': it carries %s. tobyOS will not "
+                "write a boot image over somebody else's filesystem.\n",
+                target->name, fs[0] ? fs : "a foreign partition table");
+        if (fs[0] && strcmp(fs, "iso9660") == 0)
+            kprintf("[installer]   (that is the live boot medium -- the "
+                    "system you are running from.)\n");
+        else
+            kprintf("[installer]   To use this disk anyway, erase it first: "
+                    "`datavol create %s --erase` (removable media only).\n",
+                    target->name);
+        return -11;
+    case ABI_BLKV_NOT_DISK:
+        kprintf("[installer] REFUSED '%s': that is a partition. Install "
+                "targets a whole disk.\n", target->name);
+        return -12;
+    default:
+        kprintf("[installer] REFUSED '%s': could not probe it (verdict %u).\n",
+                target->name, (unsigned)v);
+        return -13;
+    }
+}
+
 int installer_run(struct blk_dev *target) {
     if (!target) {
         kprintf("[installer] no target block device\n");
         return -1;
     }
+    /* THE GUARD RUNS FIRST -- before the install-image check, not after.
+     *
+     * Whether this disk may be written is a property of the DISK, and is
+     * worth answering even when there is nothing to write. Ordering it
+     * second also made it untestable: with no image loaded every call
+     * returned -2 ("no install image") and the guard was never reached, so
+     * a self-test asserting "blank disk reaches -2, therefore the guard let
+     * it through" proved nothing at all -- every case reached -2, refusals
+     * included. The caller already reports missing-image separately. */
+    { int g = installer_guard(target); if (g != 0) return g; }
+
     if (!installer_image_available()) {
         kprintf("[installer] no install image available -- are we booted "
                 "from the live ISO?\n");

@@ -68,6 +68,12 @@ KSTUB(blk_dump)
 KSTUB(blk_find)
 KSTUB(blk_get)
 KSTUB(blk_get_first)
+/* 2026-08-25: `install` now LISTS candidate disks (blk_iter_next) and
+ * reports what each carries (provision_classify) instead of silently
+ * taking blk_get_first(). Both are kernel-side; /bin/tsh cannot install
+ * anything anyway -- installer_run is stubbed just below. */
+KSTUB(blk_iter_next)
+KSTUB(provision_classify)
 KSTUB(cap_dump_proc)
 KSTUB(cap_mask_to_string)
 KSTUB(cap_profile_foreach)

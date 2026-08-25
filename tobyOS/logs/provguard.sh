@@ -57,7 +57,7 @@ RC=0
 grep -aq 'PROV. self-test complete: ALL PASS' "$LOG" || RC=1
 [ "$F" != "0" ] && RC=1
 # A floor, because a self-test that dies early still reports no failures.
-[ "$P" -lt 18 ] && { echo "   too few assertions ran ($P, expected ~20)"; RC=1; }
+[ "$P" -lt 24 ] && { echo "   too few assertions ran ($P, expected ~26)"; RC=1; }
 
 if [ "$RC" = "0" ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 exit $RC

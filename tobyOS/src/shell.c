@@ -45,6 +45,8 @@
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
 #include <tobyos/installer.h>
+#include <tobyos/provision.h>   /* provision_classify -- `install` shows what
+                                 * is on each disk before offering it */
 #include <tobyos/blk.h>
 #include <tobyos/partition.h>
 #include <tobyos/tobyfs.h>
@@ -4748,20 +4750,35 @@ static void cmd_panic(int argc, char **argv) {
     kpanic("user-initiated panic from shell");
 }
 
-/* Milestone 20: install tobyOS from the live ISO onto the primary
- * IDE disk. Usage:
+/* Milestone 20: install tobyOS from the live ISO onto a disk. Usage:
  *
- *   install           -- show what would happen (dry run)
- *   install --yes     -- actually flash + format
+ *   install            -- list candidate disks and what would happen
+ *   install DEV        -- dry run against DEV
+ *   install DEV --yes  -- actually flash + format DEV
  *
- * The `--yes` guard is intentional: the operation wipes the target
- * disk's first 4 MiB + a fresh tobyfs region, and we don't want a
- * stray keystroke to destroy someone's persistent /data. */
+ * 2026-08-25: THE TARGET IS NAMED BY THE USER. It used to be whatever
+ * blk_get_first() returned -- the first device that happened to enumerate
+ * -- which is not a choice anybody made. On a machine whose internal disk
+ * came up before its USB sticks, `install --yes` would have written a boot
+ * image over that disk. The kernel now also refuses foreign filesystems
+ * outright (installer_guard), but a destructive command should not be
+ * choosing its own victim in the first place.
+ *
+ * `--yes` stays: the operation wipes the front of the target and stamps a
+ * fresh tobyfs region over the rest. */
 static void cmd_install(int argc, char **argv) {
     bool confirmed = false;
+    const char *devname = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--yes") == 0 || strcmp(argv[i], "-y") == 0) {
             confirmed = true;
+        } else if (argv[i][0] != '-') {
+            devname = argv[i];
+        } else {
+            kprintf("install: unknown option '%s'\n", argv[i]);
+            kprintf("usage: install [DEVICE] [--yes]\n");
+            shell_set_status(2);
+            return;
         }
     }
 
@@ -4773,13 +4790,54 @@ static void cmd_install(int argc, char **argv) {
         return;
     }
 
-    /* Milestone 21: the registry knows about every block device that
-     * successfully probed during PCI binding. blk_get_first() returns
-     * the first one (IDE in QEMU's default i440fx; AHCI/NVMe on later
-     * platforms once those drivers land). */
-    struct blk_dev *target = blk_get_first();
+    /* No device named: SHOW the candidates rather than picking one. The
+     * old code silently took blk_get_first(); a list the user reads and
+     * then names is the difference between a choice and an accident. */
+    if (!devname) {
+        kprintf("install: name the disk to install onto.\n\n");
+        kprintf("  %-14s %-10s %-9s %s\n", "DISK", "SIZE", "CONTENTS",
+                "INSTALLABLE?");
+        size_t it = 0;
+        struct blk_dev *d;
+        int shown = 0;
+        while ((d = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
+            char fs[ABI_BLK_FS_MAX];
+            uint32_t fl = 0;
+            uint8_t v = provision_classify(d, &fl, fs);
+            const char *note;
+            switch (v) {
+            case ABI_BLKV_BLANK:   note = "yes"; break;
+            case ABI_BLKV_TOBYOS:  note = "yes (overwrites tobyOS data)"; break;
+            case ABI_BLKV_MOUNTED: note = "no -- backs a live mount"; break;
+            case ABI_BLKV_FOREIGN:
+                note = (fs[0] && strcmp(fs, "iso9660") == 0)
+                     ? "no -- the live boot medium"
+                     : "no -- carries another system's data";
+                break;
+            default:               note = "no"; break;
+            }
+            kprintf("  %-14s %-10lu %-9s %s\n", d->name,
+                    (unsigned long)(d->sector_count / 2048u),
+                    fs[0] ? fs : "(empty)", note);
+            shown++;
+        }
+        if (!shown) kprintf("  (no disks registered)\n");
+        kprintf("\n  Sizes are MiB. Then: install <DISK> --yes\n");
+        shell_set_status(1);
+        return;
+    }
+
+    struct blk_dev *target = blk_find(devname);
     if (!target) {
-        kprintf("install: no target disk (no block device registered).\n");
+        kprintf("install: no such device '%s' -- run `install` for the "
+                "list.\n", devname);
+        shell_set_status(1);
+        return;
+    }
+    if (target->class != BLK_CLASS_DISK) {
+        kprintf("install: '%s' is a partition; install targets a whole "
+                "disk.\n", devname);
+        shell_set_status(1);
         return;
     }
 
@@ -4797,9 +4855,21 @@ static void cmd_install(int argc, char **argv) {
                 TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK - 1);
 
     if (!confirmed) {
+        /* Say what is on it, not just its name -- "erases ahci0:p0" means
+         * nothing until you know ahci0:p0 is the disk with your Windows. */
+        {
+            char fs[ABI_BLK_FS_MAX];
+            uint32_t fl = 0;
+            (void)provision_classify(target, &fl, fs);
+            if (fs[0])
+                kprintf("\n%s currently contains: %s\n", target->name, fs);
+            if (target->model[0])
+                kprintf("%s is: %s\n", target->name, target->model);
+        }
         kprintf("\nThis will ERASE all data on %s.\n"
-                "Re-run with `install --yes` to proceed.\n",
-                target->name);
+                "Re-run with `install %s --yes` to proceed.\n",
+                target->name, target->name);
+        shell_set_status(1);
         return;
     }
 

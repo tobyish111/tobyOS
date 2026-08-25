@@ -3254,18 +3254,28 @@ void _start(void) {
          * INSTALLER_BOOT_SECTORS on the first disk -- carved without a
          * partition table by the old installer). */
         if (!data_mounted) {
-            struct blk_dev *disk = blk_first_disk();
-            if (!disk) disk = blk_get_first();
-            if (disk && disk->sector_count > INSTALLER_BOOT_SECTORS) {
+            /* SWEEP EVERY DISK, not just the first. This tried
+             * blk_first_disk() alone, so a machine that installed tobyOS to
+             * its second disk booted with a RAM-backed /data and no
+             * explanation -- the installed volume was there, on a device
+             * nothing looked at. Same defect Priority 2 was widened to fix
+             * (its comment records the identical lesson about
+             * blk_first_disk); this arm was simply missed at the time.
+             * Probing is read-only: tobyfs_mount validates the superblock
+             * and returns without writing on a non-tobyfs region. */
+            size_t it = 0;
+            struct blk_dev *disk;
+            while (!data_mounted &&
+                   (disk = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
+                if (disk->sector_count <= INSTALLER_BOOT_SECTORS) continue;
                 uint64_t avail = disk->sector_count - INSTALLER_BOOT_SECTORS;
-                if (avail >= TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) {
-                    struct blk_dev *part = blk_offset_wrap(
-                        disk, INSTALLER_BOOT_SECTORS, avail, "data");
-                    if (part && tobyfs_mount("/data", part) == VFS_OK) {
-                        kprintf("[boot] mounted installed /data at LBA %u on "
-                                "'%s'\n", INSTALLER_BOOT_SECTORS, disk->name);
-                        data_mounted = true;
-                    }
+                if (avail < TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) continue;
+                struct blk_dev *part = blk_offset_wrap(
+                    disk, INSTALLER_BOOT_SECTORS, avail, "data");
+                if (part && tobyfs_mount("/data", part) == VFS_OK) {
+                    kprintf("[boot] mounted installed /data at LBA %u on "
+                            "'%s'\n", INSTALLER_BOOT_SECTORS, disk->name);
+                    data_mounted = true;
                 }
             }
         }
