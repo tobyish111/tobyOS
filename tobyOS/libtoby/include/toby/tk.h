@@ -365,7 +365,18 @@ int  tk_text_width  (const char *s, int px, int bold);
 /* Monospace bitmap text: an 8x16 fixed-cell VGA font with an opaque bg, one
  * call per run. For char grids (terminals) where the proportional TTF
  * tk_draw_text would not column-align. Advance is 8px/char; position at col*8. */
+/* Fixed 8x16 VGA cell, fixed 8px advance, OPAQUE bg -- a real character
+ * grid. (Until 2026-08-24 this routed to the proportional TrueType
+ * renderer and silently dropped bg, so every grid built on it drew its
+ * cells at column*8 and rendered them at Lato's widths.) */
 void tk_draw_text_mono(struct tk_window*, int x, int y, const char *s, uint32_t fg, uint32_t bg);
+/* Same, with an explicit ROW PITCH: the glyph is centred in cell_h and
+ * clipped, and the background covers exactly cell_h rows. Needed because
+ * the grid apps disagree -- the terminal is 16, gui_edit and gui_browser
+ * are 12, gui_viewer is 14 -- and 16 rows of opaque bg in a 12-row pitch
+ * erases the top of the line below. tk_draw_text_mono() is this with 16. */
+void tk_draw_text_cell(struct tk_window*, int x, int y, const char *s,
+                       uint32_t fg, uint32_t bg, int cell_h);
 /* Blit an ARGB8888 source. `src_pitch` is the source row stride in pixels
  * (pass w for a tightly packed buffer). _blend alpha-composites. */
 void tk_draw_blit      (struct tk_window*, int x, int y, int w, int h, const uint32_t *argb, int src_pitch);

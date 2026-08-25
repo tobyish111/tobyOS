@@ -7856,6 +7856,17 @@ void _start(void) {
     }
 #endif
 
+#ifdef GUITEXT_SELFTEST
+    /* 2026-08-24: the fixed-cell text renderer, checked pixel by pixel
+     * against the font table. A terminal is a GUI window, so no userspace
+     * harness can see whether its columns line up -- but the property that
+     * broke (8 px per character, opaque background) is arithmetic. */
+    {
+        extern int gui_text_mono_selftest(void);
+        (void)gui_text_mono_selftest();
+    }
+#endif
+
 #ifdef FSPROBE_BOOT
     /* 2026-08-24: the gate that every previous gate was missing.
      *

@@ -20,7 +20,7 @@ cd /c/CustomOS/tobyOS || exit 1
 export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
 mkdir -p /c/t logs
 
-FLAGS="-DFAST_BOOT -DQUICK_BOOT -DFSPROBE_BOOT"
+FLAGS="-DFAST_BOOT -DQUICK_BOOT -DFSPROBE_BOOT -DGUITEXT_SELFTEST"
 LOG=logs/fsprobe.log
 
 echo "== building ($FLAGS)"
@@ -47,12 +47,17 @@ echo "== results"
 grep -a 'FSPROBE' "$LOG" | sed 's/^\[[0-9 ]*ms\] //'
 
 echo
+echo "== fixed-cell text renderer (GUI grids: terminal, editor, viewer) =="
+grep -a 'GUITEXT' "$LOG" | sed 's/^\[[0-9 ]*ms\] //'
+
+echo
 echo "== gate"
 P=$(grep -ac '\[FSPROBE\]   ok ' "$LOG")
 F=$(grep -ac '\[FSPROBE\]  FAIL ' "$LOG")
 echo "   checks: pass=$P fail=$F"
 RC=0
 grep -aq 'FSPROBE. VERDICT: PASS' "$LOG" || RC=1
+grep -aq 'GUITEXT. VERDICT: PASS' "$LOG" || { echo "   fixed-cell text renderer FAILED"; RC=1; }
 [ "$F" != "0" ] && RC=1
 # A floor on the CHECK COUNT, not just on the verdict: a harness that dies
 # half way still prints "fail=0" for everything it managed to reach.

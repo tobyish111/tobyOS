@@ -118,13 +118,27 @@ static inline void sys_exit(int code) {
         : "rcx", "r11", "memory");
     for (;;) { }
 }
+/* 2026-08-24: this file draws a CHARACTER GRID at CELL_W=8 columns, and
+ * tk_draw_text_mono() finally delivers one -- it used to route to the
+ * proportional TrueType renderer, so the columns never lined up and the
+ * opaque background was dropped. The fixed cell is 8x16, taller than this
+ * file's 12px row pitch, so go through tk_draw_text_cell(): the glyph is
+ * centred in the pitch and clipped, and the background covers exactly that
+ * many rows instead of bleeding into the line below.
+ *
+ * The pitch is spelled here rather than as CELL_H because the drawing
+ * forwarders below sit ~400 lines ABOVE that #define; the static assert
+ * keeps the two from drifting apart. */
+#define MONO_PITCH 12
+#define TK_MONO(w,x,y,s,fg,bg) tk_draw_text_cell((w),(x),(y),(s),(fg),(bg),MONO_PITCH)
+
 /* Drawing now forwards to TobyTK. The content grid is monospace (CELL_W=8), so
  * text uses tk_draw_text_mono (column-aligned, opaque bg). `fd` is ignored. */
 static inline int sys_gui_fill(int fd, int x, int y, int w, int h, uint32_t color) {
     (void)fd; tk_draw_fill(&win, x, y, w, h, color); return 0;
 }
 static inline int sys_gui_text(int fd, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
-    (void)fd; tk_draw_text_mono(&win, x, y, s, fg, bg); return 0;
+    (void)fd; TK_MONO(&win, x, y, s, fg, bg); return 0;
 }
 static inline long sys_http_fetch(struct http_fetch *req) {
     long r;

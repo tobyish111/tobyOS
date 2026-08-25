@@ -273,6 +273,13 @@ void gui_window_blend_coverage(struct window *w, int x, int y,
                                const uint8_t *cov, int gw, int gh, uint32_t xrgb);
 int gui_window_text(struct window *w, int x, int y, const char *s,
                     uint32_t fg, uint32_t bg);
+/* 2026-08-24: genuinely MONOSPACED window text -- 8x16 VGA cell, fixed 8px
+ * advance, opaque `bg` (unless GFX_TRANSPARENT). gui_window_text() renders
+ * proportional TrueType whenever a font is loaded, which is always, so a
+ * character grid (terminal, hex view, anything column-aligned) cannot be
+ * built on it. See the comment at the definition. */
+int gui_window_text_mono(struct window *w, int x, int y, const char *s,
+                         uint32_t fg, uint32_t bg, int cell_h);
 /* M27D: scaled bitmap text into a window backbuf.
  * scale = 1..N -- each source pixel becomes a scale-x-scale block.
  * smooth != 0  -- additionally lay a half-alpha wedge on each

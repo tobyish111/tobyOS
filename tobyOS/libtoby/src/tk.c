@@ -146,10 +146,21 @@ static int g_text_w(const char *s, int px, int face) {
 }
 /* MONO bitmap text (8x16 fixed cell, fg + opaque bg): a2=(x|y<<16), a3=str,
  * a4=fg, a5=bg. The fixed-advance VGA font terminals/char-grids need -- one
- * syscall per run, perfectly column-aligned (TTF is proportional). */
-static void g_text_mono(int fd, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
-    long a2 = ((long)(uint16_t)x) | ((long)(uint16_t)y << 16);
-    sc5(ABI_SYS_GUI_TEXT, fd, a2, (long)s, (long)fg, (long)bg);
+ * syscall per run, perfectly column-aligned (TTF is proportional).
+ *
+ * 2026-08-24: this now calls ABI_SYS_GUI_TEXT_MONO. It used to call
+ * ABI_SYS_GUI_TEXT, and that description was simply UNTRUE -- C18c had
+ * rewired GUI_TEXT to proportional TrueType whenever a font is loaded, which
+ * is every boot, and the TTF path ignores `bg` outright. So the one call in
+ * this toolkit whose whole purpose is a fixed grid produced a variable-width
+ * one with no cell backgrounds. /bin/gui_term drew each run at column*8 and
+ * got Lato's widths back, which is why its block cursor -- a plain rect on
+ * the true 8x16 lattice -- never lined up with its own text. */
+static void g_text_mono(int fd, int x, int y, const char *s, uint32_t fg,
+                        uint32_t bg, int cell_h) {
+    long a2 = ((long)(uint16_t)x) | ((long)(uint16_t)y << 16)
+              | ((long)(uint16_t)cell_h << 32);
+    sc5(ABI_SYS_GUI_TEXT_MONO, fd, a2, (long)s, (long)fg, (long)bg);
 }
 /* RECT (outline): a2=x, a3=y, a4=(w&0xFFFF)|(h<<16), a5=color */
 static void g_rect(int fd, int x, int y, int w, int h, uint32_t c) {
@@ -447,7 +458,11 @@ void tk_draw_text(struct tk_window *win, int x, int y, const char *s, uint32_t f
     if (win && s) g_text(win->fd, x, y, s, fg, px < 8 ? 8 : px, bold ? 1 : 0);
 }
 void tk_draw_text_mono(struct tk_window *win, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
-    if (win && s) g_text_mono(win->fd, x, y, s, fg, bg);
+    if (win && s) g_text_mono(win->fd, x, y, s, fg, bg, 16);
+}
+void tk_draw_text_cell(struct tk_window *win, int x, int y, const char *s,
+                       uint32_t fg, uint32_t bg, int cell_h) {
+    if (win && s) g_text_mono(win->fd, x, y, s, fg, bg, cell_h);
 }
 int tk_text_width(const char *s, int px, int bold) {
     return g_text_w(s ? s : "", px < 8 ? 8 : px, bold ? 1 : 0);

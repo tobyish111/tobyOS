@@ -844,6 +844,29 @@ static long sys_gui_text(int fd, uint32_t xy, const char *s,
     return gui_window_text(f->win, x, y, buf, fg, bg);   /* native apps: 8x8 bitmap */
 }
 
+/* Same packing as sys_gui_text, but the FIXED-CELL renderer. Split rather
+ * than flagged so a caller's choice of grid-vs-prose is visible at the call
+ * site -- the bug this fixes was precisely a call site that believed it had
+ * asked for a grid. */
+static long sys_gui_text_mono(int fd, long a2, const char *s,
+                              uint32_t fg, uint32_t bg) {
+    struct file *f = fd_lookup(fd);
+    if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
+    char buf[256];
+    long n = strncpy_from_user(buf, s, sizeof(buf));
+    if (n < 0) return -1;
+    uint32_t xy = (uint32_t)(a2 & 0xFFFFFFFFu);
+    int x = (int)(int16_t)(xy & 0xFFFFu);
+    int y = (int)(int16_t)((xy >> 16) & 0xFFFFu);
+    /* Cell height rides in the UPPER 32 bits of a2, which was a packed
+     * field already and had them spare. Carrying it in the top byte of the
+     * colour would have been the other option, and the kind of cleverness
+     * that costs an afternoon two years from now. 0 = the font's own 16. */
+    int cell_h = (int)((a2 >> 32) & 0xFFFF);
+    if (cell_h < 0 || cell_h > 256) cell_h = 0;
+    return gui_window_text_mono(f->win, x, y, buf, fg, bg, cell_h);
+}
+
 static long sys_gui_flip(int fd) {
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_WINDOW || !f->win) return -1;
@@ -4582,6 +4605,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_GUI_TEXT:
         return sys_gui_text((int)a1, (uint32_t)a2, (const char *)a3,
                             (uint32_t)a4, (uint32_t)a5);
+    case ABI_SYS_GUI_TEXT_MONO:
+        return sys_gui_text_mono((int)a1, a2, (const char *)a3,
+                                 (uint32_t)a4, (uint32_t)a5);
     case SYS_GUI_FLIP:
         return sys_gui_flip((int)a1);
     case SYS_GUI_FLIP_RECT:

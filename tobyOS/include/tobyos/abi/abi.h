@@ -1066,8 +1066,26 @@ struct abi_vizmap {
  * entire job is updating an mtime never updated one. */
 #define ABI_SYS_UTIMES          198  /* (path, mtime_sec, atime_sec) -> 0|-E */
 
+/* Genuinely MONOSPACED window text: 8x16 VGA cell, fixed 8px advance, opaque
+ * background.
+ *
+ * ABI_SYS_GUI_TEXT was the bitmap call until C18c rewired it to render
+ * proportional TrueType whenever a font is loaded -- which is every boot. The
+ * toolkit's tk_draw_text_mono() still pointed at it and still described itself
+ * as column-aligned, so every character grid built on it (the terminal) placed
+ * its cells at column*8 and rendered them at Lato's widths. The `bg` argument
+ * was dropped entirely too, so cell background colours never painted.
+ *
+ * a2 = (x & 0xFFFF) | (y << 16) | (cell_h << 32). cell_h is the caller's ROW
+ * PITCH -- the glyph is centred in it and clipped, and the opaque background
+ * covers exactly that many rows. It has to be a parameter because the callers
+ * disagree: the terminal is 16, gui_edit and gui_browser are 12, gui_viewer is
+ * 14, and painting 16 rows into a 12-row pitch erases the top of the line
+ * below. 0 means the font's own 16. */
+#define ABI_SYS_GUI_TEXT_MONO   199  /* (fd, xy|cell_h<<32, str, fg, bg) */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          199
+#define ABI_SYS_NR_MAX          200
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
