@@ -454,6 +454,161 @@ static void run_tool(const char *path, const char *a1, const char *a2,
     check(st == want_rc, what, msg);
 }
 
+/* Run a tool with stdout captured to a file, and hand back what it wrote.
+ * Exit codes alone are a weak assertion -- lspci exited 0 for root while
+ * printing nothing useful to a user -- so the option checks below look at
+ * the OUTPUT. Returns the exit status; *out gets the bytes. */
+static int run_tool_capture(const char *path, const char *a1, const char *a2,
+                            char *out, size_t cap) {
+    const char *cap_path = "/tmp/fsprobe-tool.out";
+    out[0] = 0;
+    unlink(cap_path);
+    int fd = open(cap_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    char *argv[4];
+    const char *base = strrchr(path, '/');
+    argv[0] = (char *)(base ? base + 1 : path);
+    argv[1] = (char *)a1;
+    argv[2] = (char *)a2;
+    argv[3] = 0;
+    char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                     (char *)"TERM=vt100", (char *)"LANG=C", 0 };
+    pid_t pid = toby_spawn(path, argv, envp, 0, fd, 2);
+    close(fd);
+    if (pid < 0) return -1;
+    int st = -1;
+    waitpid(pid, &st, 0);
+    read_file(cap_path, out, cap);
+    unlink(cap_path);
+    return st;
+}
+
+static int count_lines(const char *s) {
+    int n = 0;
+    for (const char *p = s; *p; p++) if (*p == '\n') n++;
+    return n;
+}
+
+/* Every line must contain `needle`. Used to prove a filter FILTERED --
+ * "exit 0 and some output" would pass even if -d were ignored entirely. */
+static int every_line_has(const char *s, const char *needle) {
+    char line[256];
+    const char *p = s;
+    int lines = 0;
+    while (*p) {
+        size_t i = 0;
+        while (p[i] && p[i] != '\n' && i < sizeof line - 1) { line[i] = p[i]; i++; }
+        line[i] = 0;
+        if (i) { lines++; if (!strstr(line, needle)) return 0; }
+        p += i;
+        if (*p == '\n') p++;
+    }
+    return lines > 0;
+}
+
+/* The option set lspci grew on 2026-08-24, after the EliteDesk showed it
+ * exiting 2 on the first thing a person tries. Checked by OUTPUT, not by
+ * exit code, and structurally so the assertions hold on any machine --
+ * QEMU's PCI devices are not the EliteDesk's. */
+static void lspci_options(void) {
+    char buf[2048], msg[400], slot[64], vend[32];
+    g_where = "lspci";
+
+    /* Baseline listing, and harvest a real slot + vendor to filter on. */
+    int st = run_tool_capture("/bin/lspci", 0, 0, buf, sizeof buf);
+    int base_lines = count_lines(buf);
+    snprintf(msg, sizeof msg, "exit=%d lines=%d", st, base_lines);
+    check(st == 0 && base_lines > 0, "plain listing", msg);
+    slot[0] = vend[0] = 0;
+    if (base_lines > 0) {
+        /* FIRST LINE ONLY -- buf holds every device, and strrchr over the
+         * whole buffer would harvest fields from the LAST one while `slot`
+         * came from the first, giving a filter pair that matches nothing.
+         * Format: "00:00.0 Class 0600: 8086:1237" */
+        char first[256];
+        size_t k = 0;
+        while (buf[k] && buf[k] != '\n' && k < sizeof first - 1) { first[k] = buf[k]; k++; }
+        first[k] = 0;
+        sscanf(first, "%63s", slot);
+        const char *sp = strrchr(first, ' ');          /* before "8086:1237" */
+        if (sp) {
+            const char *colon = strchr(sp + 1, ':');
+            if (colon) {
+                size_t n = (size_t)(colon - sp - 1);
+                if (n && n < sizeof vend) { memcpy(vend, sp + 1, n); vend[n] = 0; }
+            }
+        }
+    }
+
+    st = run_tool_capture("/bin/lspci", "-h", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d, says usage=%d", st,
+             strstr(buf, "usage: lspci") ? 1 : 0);
+    check(st == 0 && strstr(buf, "usage: lspci") != NULL, "-h prints usage", msg);
+
+    st = run_tool_capture("/bin/lspci", "--help", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d, says usage=%d", st,
+             strstr(buf, "usage: lspci") ? 1 : 0);
+    check(st == 0 && strstr(buf, "usage: lspci") != NULL, "--help prints usage", msg);
+
+    st = run_tool_capture("/bin/lspci", "-t", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d, root=%d", st,
+             strstr(buf, "-[0000:00]-") ? 1 : 0);
+    check(st == 0 && strstr(buf, "-[0000:00]-") != NULL, "-t draws a tree", msg);
+
+    st = run_tool_capture("/bin/lspci", "-D", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d, domain-prefixed=%d", st,
+             strncmp(buf, "0000:", 5) == 0);
+    check(st == 0 && strncmp(buf, "0000:", 5) == 0, "-D shows the domain", msg);
+
+    /* -s must narrow to ONE device: an ignored filter would still exit 0. */
+    if (slot[0]) {
+        st = run_tool_capture("/bin/lspci", "-s", slot, buf, sizeof buf);
+        int nl = count_lines(buf);
+        snprintf(msg, sizeof msg, "-s %s -> exit=%d lines=%d want 1", slot, st, nl);
+        check(st == 0 && nl == 1, "-s selects one slot", msg);
+    } else {
+        bad("-s selects one slot", "no slot harvested from the listing");
+    }
+
+    /* -d must narrow to one vendor, and EVERY surviving line must carry
+     * it -- otherwise a filter that silently matched everything passes. */
+    if (vend[0]) {
+        char pat[64];
+        snprintf(pat, sizeof pat, "%s:", vend);
+        st = run_tool_capture("/bin/lspci", "-d", pat, buf, sizeof buf);
+        int nl = count_lines(buf), all = every_line_has(buf, vend);
+        snprintf(msg, sizeof msg, "-d %s -> exit=%d lines=%d all-match=%d",
+                 pat, st, nl, all);
+        check(st == 0 && nl > 0 && nl <= base_lines && all,
+              "-d selects one vendor", msg);
+    } else {
+        bad("-d selects one vendor", "no vendor harvested from the listing");
+    }
+
+    /* A filter nobody can satisfy must be EMPTY, not everything. */
+    st = run_tool_capture("/bin/lspci", "-d", "ffff:", buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d lines=%d want 0", st, count_lines(buf));
+    check(st == 0 && count_lines(buf) == 0, "-d ffff: matches nothing", msg);
+
+    /* Repeated -v must be accepted, not rejected as an unknown option. */
+    st = run_tool_capture("/bin/lspci", "-vv", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d lines=%d", st, count_lines(buf));
+    check(st == 0 && count_lines(buf) >= base_lines, "-vv accepted", msg);
+
+    /* -x is REFUSED on purpose: config space is not published, and
+     * inventing the bytes would misreport the hardware. */
+    st = run_tool_capture("/bin/lspci", "-x", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d want 2 (honest refusal)", st);
+    check(st == 2, "-x refuses rather than invents", msg);
+
+    /* A genuinely unknown option still fails -- but now with the usage. */
+    st = run_tool_capture("/bin/lspci", "-Z", 0, buf, sizeof buf);
+    snprintf(msg, sizeof msg, "exit=%d want 2", st);
+    check(st == 2, "unknown option still exits 2", msg);
+
+    g_where = "";
+}
+
 static void hardware_tools(int as_root) {
     char msg[400], buf[128];
     g_where = "tools";
@@ -462,6 +617,10 @@ static void hardware_tools(int as_root) {
     run_tool("/bin/lspci", 0, 0, 0, "lspci");
     run_tool("/bin/lspci", "-m", 0, 0, "lspci -m");
     run_tool("/bin/lspci", "-v", 0, 0, "lspci -v");
+    /* The full option set, checked by output. Run in BOTH phases: the
+     * whole point of this harness is that uid 0 is not evidence. */
+    lspci_options();
+    g_where = "tools";          /* lspci_options clears it */
 
     /* dmidecode is ROOT-ONLY, and that is correct rather than a bug: the
      * raw tables under /sys/firmware/dmi/tables are mode 0400, exactly as

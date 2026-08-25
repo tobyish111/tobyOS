@@ -56,7 +56,7 @@ grep -aq 'FSPROBE. VERDICT: PASS' "$LOG" || RC=1
 [ "$F" != "0" ] && RC=1
 # A floor on the CHECK COUNT, not just on the verdict: a harness that dies
 # half way still prints "fail=0" for everything it managed to reach.
-[ "$P" -lt 100 ] && { echo "   too few checks ran ($P, expected ~120) -- the harness did not complete"; RC=1; }
+[ "$P" -lt 140 ] && { echo "   too few checks ran ($P, expected ~150) -- the harness did not complete"; RC=1; }
 
 if [ "$RC" = "0" ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 exit $RC
