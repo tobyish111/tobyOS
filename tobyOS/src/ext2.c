@@ -857,10 +857,27 @@ static int ext2_close(struct vfs_file *f) {
     return VFS_OK;
 }
 
+/* An open handle keeps its OWN copy of the inode, and every mutation --
+ * this handle's, another handle's, a truncate by path -- writes the inode
+ * straight to disk. So disk is the shared truth and the cached copy goes
+ * stale the moment anyone else touches the file. Same reasoning, and the
+ * same fix, as ext4's fp_refresh(). */
+static int fp_refresh(struct ext2 *fs, struct ext2_filepriv *fp) {
+    struct ext4_inode in;
+    int rc = read_inode(fs, fp->inode_no, &in);
+    if (rc != VFS_OK) return rc;
+    fp->in        = in;
+    fp->file_size = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
+    return VFS_OK;
+}
+
 static long ext2_read(struct vfs_file *f, void *buf, size_t n) {
     struct ext2 *fs = (struct ext2 *)f->mnt;
     struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
+    int frc = fp_refresh(fs, fp);          /* another handle may have grown it */
+    if (frc != VFS_OK) return frc;
+    f->size = (size_t)fp->file_size;
     long got = inode_read(fs, &fp->in, fp->file_size, f->pos, buf, n);
     if (got > 0) f->pos += (size_t)got;
     return got;
@@ -870,6 +887,10 @@ static long ext2_write(struct vfs_file *f, const void *buf, size_t n) {
     struct ext2 *fs = (struct ext2 *)f->mnt;
     struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
+
+    int frc = fp_refresh(fs, fp);
+    if (frc != VFS_OK) return frc;
+    f->size = (size_t)fp->file_size;
 
     const uint8_t *src = (const uint8_t *)buf;
     size_t written = 0;
@@ -1461,7 +1482,11 @@ static int ext2_ftruncate(struct vfs_file *f, uint64_t length) {
     struct ext2 *fs = (struct ext2 *)f->mnt;
     struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
-    int rc = ext2_do_truncate(fs, fp->inode_no, &fp->in, length);
+    /* Critical here, not merely tidy: trimming with a stale block list
+     * would free blocks the file no longer owns. */
+    int rc = fp_refresh(fs, fp);
+    if (rc != VFS_OK) return rc;
+    rc = ext2_do_truncate(fs, fp->inode_no, &fp->in, length);
     if (rc == VFS_OK) {
         fp->file_size = length;
         f->size       = (size_t)length;

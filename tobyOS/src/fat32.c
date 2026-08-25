@@ -818,8 +818,11 @@ static int fat32_ftruncate(struct vfs_file *f, uint64_t length) {
     int rc = read_dirent_at(fs, fp->dir_clus, fp->dir_off, &de);
     if (rc != VFS_OK) return rc;
 
-    uint32_t first = fp->first_clus;
-    rc = fat_resize_chain(fs, &first, f->size, length);
+    /* de.file_size, not f->size: the entry we just read is the shared
+     * truth, and resizing against a stale length would free the wrong
+     * clusters. */
+    uint32_t first = ((uint32_t)de.fst_clus_hi << 16) | de.fst_clus_lo;
+    rc = fat_resize_chain(fs, &first, de.file_size, length);
     if (rc != VFS_OK) return rc;
 
     fp->first_clus   = first;
@@ -906,10 +909,35 @@ static int fat32_close(struct vfs_file *f) {
     return VFS_OK;
 }
 
+/* On FAT the file's size and its first cluster live in the DIRECTORY
+ * ENTRY, and every mutation -- this handle's, another handle's, a truncate
+ * by path -- rewrites that entry on disk. So the entry is the shared truth
+ * and the handle's cached copy goes stale the moment anyone else touches
+ * the file. Same reasoning as fp_refresh() in ext4/ext2; the fields differ
+ * because FAT has no inode. */
+static int fat_fp_refresh(struct fat32 *fs, struct vfs_file *f,
+                          struct fat32_filepriv *fp) {
+    struct fat_dirent de;
+    int rc = read_dirent_at(fs, fp->dir_clus, fp->dir_off, &de);
+    if (rc != VFS_OK) return rc;
+    uint32_t first = ((uint32_t)de.fst_clus_hi << 16) | de.fst_clus_lo;
+    if (first != fp->first_clus) {
+        /* The chain moved (or appeared, or was released) -- the cached
+         * cursor into it means nothing now. */
+        fp->first_clus   = first;
+        fp->cur_clus     = first;
+        fp->cur_clus_idx = 0;
+    }
+    f->size = de.file_size;
+    return VFS_OK;
+}
+
 static long fat32_read(struct vfs_file *f, void *buf, size_t n) {
     struct fat32 *fs = (struct fat32 *)f->mnt;
     struct fat32_filepriv *fp = (struct fat32_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
+    int frc = fat_fp_refresh(fs, f, fp);   /* another handle may have grown it */
+    if (frc != VFS_OK) return frc;
     if (f->pos >= f->size || n == 0) return 0;
 
     size_t avail = f->size - f->pos;
@@ -969,6 +997,9 @@ static long fat32_write(struct vfs_file *f, const void *buf, size_t n) {
     struct fat32 *fs = (struct fat32 *)f->mnt;
     struct fat32_filepriv *fp = (struct fat32_filepriv *)f->priv;
     if (!fp || n == 0) return 0;
+
+    int frc = fat_fp_refresh(fs, f, fp);
+    if (frc != VFS_OK) return frc;
 
     const uint8_t *src  = (const uint8_t *)buf;
     size_t         left = n;

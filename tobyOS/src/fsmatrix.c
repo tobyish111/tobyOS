@@ -312,6 +312,78 @@ static void fsm_run(const char *fs, const char *mp, bool expect_links,
 }
 
 
+
+/* ---- one file, two handles ------------------------------------------
+ *
+ * ext4, ext2 and fat32 each cache the file's metadata INSIDE the open
+ * handle (struct ext4_filepriv holds a whole struct ext4_inode; fat32
+ * holds the first cluster). Two handles on one file therefore hold two
+ * copies of the truth, and whichever writes last wins -- silently
+ * discarding the other's growth and leaking the blocks it allocated.
+ *
+ * tmpfs and ramfs point their handles straight at the shared node, so
+ * they are coherent by construction. They run these same checks as the
+ * control: if the assertions were wrong, they would fail there too.
+ */
+static void fsm_coherence(const char *fs, const char *mp) {
+    char f[128], msg[192];
+    ksnprintf(f, sizeof f, "%s/coher.txt", mp);
+
+    /* --- a second handle must not lose the first handle's growth --- */
+    {
+        (void)vfs_unlink(f);
+        int cr = vfs_create(f);
+        uint8_t *big = kmalloc(8192);
+        if (!big || cr != VFS_OK) {
+            if (big) kfree(big);
+            fsm_bad(fs, "2nd handle keeps 1st's growth", "fixture failed");
+        } else {
+            memset(big, 'A', 8192);
+            struct vfs_file a, b;
+            int oa = vfs_open(f, &a);
+            int ob = vfs_open(f, &b);
+            long wa = -1, wb = -1;
+            if (oa == VFS_OK) wa = vfs_write(&a, big, 8192);
+            /* B was opened when the file was empty. One byte at offset 0
+             * must not roll the file back to one byte long. */
+            if (ob == VFS_OK) wb = vfs_write(&b, "B", 1);
+            if (oa == VFS_OK) vfs_close(&a);
+            if (ob == VFS_OK) vfs_close(&b);
+            long sz = fsm_size(f);
+            kfree(big);
+            ksnprintf(msg, sizeof msg,
+                      "wrote %ld then %ld, size=%ld want 8192", wa, wb, sz);
+            fsm_chk(oa == VFS_OK && ob == VFS_OK && wa == 8192 && wb == 1 &&
+                    sz == 8192, fs, "2nd handle keeps 1st's growth", msg);
+        }
+    }
+
+    /* --- a truncate by PATH must be visible to an already-open handle ---
+     * This is the one `> file` used to hit: O_TRUNC truncates by path,
+     * and a handle opened first would write its stale size straight back
+     * over the result. */
+    {
+        (void)vfs_unlink(f);
+        int cr = vfs_write_all(f, "hello\n", 6);
+        struct vfs_file h;
+        int oh = vfs_open(f, &h);
+        int tr = vfs_truncate(f, 0);
+        long mid = fsm_size(f);
+        long w = -1;
+        if (oh == VFS_OK) {
+            w = vfs_write(&h, "Z", 1);
+            vfs_close(&h);
+        }
+        long sz = fsm_size(f);
+        ksnprintf(msg, sizeof msg,
+                  "trunc rc=%d size-after-trunc=%ld want 0, then wrote %ld -> "
+                  "size=%ld want 1", tr, mid, w, sz);
+        fsm_chk(cr == VFS_OK && oh == VFS_OK && tr == VFS_OK && mid == 0 &&
+                w == 1 && sz == 1, fs, "open handle sees a path truncate", msg);
+    }
+    (void)vfs_unlink(f);
+}
+
 /* ---- formatting a REAL device, for host-side verification ------------
  *
  * fsm_run above proves the driver can read what the formatter wrote --
@@ -392,6 +464,7 @@ void fsmatrix_selftest(void) {
 
     /* tmpfs and the initrd root are already mounted and need no fixture. */
     fsm_run("tmpfs", "/tmp", true, true);
+    fsm_coherence("tmpfs", "/tmp");
 
     /* ramfs IS the root every session starts in, and nothing had ever run
      * the matrix against it. Work inside a subdirectory so a failed run
@@ -406,6 +479,7 @@ void fsmatrix_selftest(void) {
             fsm_bad("ramfs", "fixture", msg);
         } else {
             fsm_run("ramfs", dir, true, true);
+            fsm_coherence("ramfs", dir);
             (void)vfs_unlink(dir);
         }
     }
@@ -427,6 +501,7 @@ void fsmatrix_selftest(void) {
                 fsm_bad("ext4", "fixture", msg);
             } else {
                 fsm_run("ext4", "/fsm4", true, true);
+                fsm_coherence("ext4", "/fsm4");
                 (void)vfs_unmount("/fsm4");
             }
         }
@@ -459,6 +534,7 @@ void fsmatrix_selftest(void) {
                     /* No perms and no hard links -- both are real
                      * properties of FAT, not gaps in the driver. */
                     fsm_run("fat32", "/fsmfat", false, false);
+                    fsm_coherence("fat32", "/fsmfat");
                     (void)vfs_unmount("/fsmfat");
                 }
             }
