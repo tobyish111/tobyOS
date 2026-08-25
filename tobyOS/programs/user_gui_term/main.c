@@ -1,9 +1,15 @@
 /* user_gui_term/main.c -- /bin/gui_term, the GUI terminal emulator.
  *
- * Migrated to the TobyTK toolkit (toby/tk.h). The terminal core is unchanged:
+ * 2026-08-24: THIS WINDOW NOW RUNS REAL /bin/tsh ON A REAL PTY.
+ * It previously called SYS_TERM_OPEN, which is not a shell at all -- it is
+ * a kernel-side line reader (src/term.c) with its own small builtin set
+ * that drops every control key. So the desktop's Terminal icon opened
+ * something that merely resembled a shell, while the actual system shell
+ * was only reachable over the serial console. See shell_start() below.
+ *
+ * TobyTK toolkit (toby/tk.h). The terminal core is unchanged:
  * an 80x30 cell grid with a 200-line scrollback ring, an ANSI/VT state machine
- * (ESC[...m SGR colours, cursor moves, erase/insert/delete), and a real PTY
- * session (SYS_TERM_OPEN/READ/WRITE). The UI moved to TobyTK: the whole grid is
+ * (ESC[...m SGR colours, cursor moves, erase/insert/delete). The UI is TobyTK: the whole grid is
  * a full-window TK_CANVAS drawn with tk_draw_text_mono (the 8x16 fixed-cell VGA
  * font -- proportional TTF would not column-align), keys flow through the
  * window key hook to the PTY, and a self-paced loop pumps PTY output + blinks
@@ -12,16 +18,41 @@
 
 #include <toby/tk.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/wait.h>
 
-#define SYS_TERM_OPEN  15
-#define SYS_TERM_WRITE 16
-#define SYS_TERM_READ  17
 #define SYS_CLOCK_MS   48
-
-static inline int  sys_term_open(void){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_TERM_OPEN):"rcx","r11","memory"); return (int)r; }
-static inline long sys_term_write(int fd,const void *b,unsigned long n){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_TERM_WRITE),"D"((long)fd),"S"(b),"d"(n):"rcx","r11","memory"); return r; }
-static inline long sys_term_read(int fd,void *b,unsigned long c){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_TERM_READ),"D"((long)fd),"S"(b),"d"(c):"rcx","r11","memory"); return r; }
 static inline uint32_t sys_clock_ms(void){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_CLOCK_MS):"rcx","r11","memory"); return (uint32_t)r; }
+
+/* ---- the shell behind the window ------------------------------------
+ *
+ * This used to call SYS_TERM_OPEN, which is NOT a shell: it is a
+ * kernel-side line reader in src/term.c that accumulates a command,
+ * calls execute_line(), and DROPS every control key -- no arrows, no
+ * history, no pipes, no job control, and a builtin set entirely separate
+ * from tsh's. The terminal icon therefore never opened the system shell.
+ *
+ * It now spawns REAL /bin/tsh on a real pty, so the window gets the same
+ * shell as the serial console and everything tsh can do works here.
+ *
+ * This is only possible because tcsetattr() now actually reaches the
+ * kernel (libtoby/src/termios.c) -- before that fix a shell on a pty
+ * could not have put the line discipline where it needs it. */
+extern pid_t toby_spawn(const char *path, char *const argv[],
+                        char *const envp[], int fd0, int fd1, int fd2);
+
+#define TIOCSPTLCK  0x40045431UL
+#define TIOCGPTN    0x80045430UL
+#define TIOCSWINSZ  0x5414UL
+#define TIOCSPGRP   0x5410UL
+#define FIONREAD    0x541BUL
+struct winsize_t { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
+
+static int   g_mfd = -1;      /* pty master */
+static pid_t g_shell_pid = -1;
+static int   g_shell_gone = 0;
 
 #define KEY_PGUP 0x86
 #define KEY_PGDN 0x87
@@ -141,7 +172,6 @@ static void vt_putc(uint8_t c){
 
 /* ---- TobyTK canvas --------------------------------------------------- */
 static struct tk_window win;
-static int g_sess;
 
 static void paint(struct tk_window *w,struct tk_widget *c){
     (void)c;
@@ -178,17 +208,96 @@ static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev
     g_need_redraw=1; tk_redraw(w);
 }
 
+static void term_send(const char *s,int n){
+    if(g_mfd>=0&&n>0) (void)write(g_mfd,s,(size_t)n);
+}
+
 static void on_key(struct tk_window *w,struct tk_event *ev){
     uint8_t k=ev->key; if(k==0)return;
-    if(k==KEY_PGUP){ g_scroll_offset+=ROWS/2; int mo=g_ring_count-ROWS; if(mo<0)mo=0; if(g_scroll_offset>mo)g_scroll_offset=mo; g_need_redraw=1; tk_redraw(w); }
-    else if(k==KEY_PGDN){ g_scroll_offset-=ROWS/2; if(g_scroll_offset<0)g_scroll_offset=0; g_need_redraw=1; tk_redraw(w); }
-    else { char kb=(char)k; sys_term_write(g_sess,&kb,1); }
+    if(k==KEY_PGUP){ g_scroll_offset+=ROWS/2; int mo=g_ring_count-ROWS; if(mo<0)mo=0; if(g_scroll_offset>mo)g_scroll_offset=mo; g_need_redraw=1; tk_redraw(w); return; }
+    if(k==KEY_PGDN){ g_scroll_offset-=ROWS/2; if(g_scroll_offset<0)g_scroll_offset=0; g_need_redraw=1; tk_redraw(w); return; }
+
+    /* The GUI hands special keys over as single bytes 0x80.. ; a shell on
+     * a terminal expects the ANSI sequences. Translating here is what
+     * makes arrow keys, Home and End work in tsh (and in anything it
+     * runs) instead of arriving as unprintable garbage. */
+    switch(k){
+    case TK_KEY_UP:    term_send("\033[A",3); return;
+    case TK_KEY_DOWN:  term_send("\033[B",3); return;
+    case TK_KEY_RIGHT: term_send("\033[C",3); return;
+    case TK_KEY_LEFT:  term_send("\033[D",3); return;
+    case TK_KEY_HOME:  term_send("\033[H",3); return;
+    case TK_KEY_END:   term_send("\033[F",3); return;
+    default: break;
+    }
+    if(k>=0x80) return;                 /* other specials: not ours to invent */
+    char kb=(char)k; term_send(&kb,1);
+}
+
+/* Spawn /bin/tsh on a fresh pty. Returns 0 on success. */
+static int shell_start(void){
+    int mfd=open("/dev/ptmx",O_RDWR);
+    if(mfd<0)return -1;
+    int unlock=0; (void)ioctl(mfd,TIOCSPTLCK,&unlock);
+    int idx=-1;
+    if(ioctl(mfd,TIOCGPTN,&idx)!=0||idx<0){ close(mfd); return -2; }
+    char spath[32]; snprintf(spath,sizeof spath,"/dev/pts/%d",idx);
+    int sfd=open(spath,O_RDWR);
+    if(sfd<0){ close(mfd); return -3; }
+
+    /* Tell the pty how big the window is, so tsh and anything it runs
+     * (tedit, tvi, top) lay out for 80x30 rather than the 80x24 default. */
+    struct winsize_t ws={ (unsigned short)ROWS,(unsigned short)COLS,0,0 };
+    (void)ioctl(sfd,TIOCSWINSZ,&ws);
+
+    /* Make our process group the pty's foreground group BEFORE the shell
+     * exists, so its job-control init sees itself foreground from its
+     * first instruction and never stops. Same etiquette /bin/ttyparity
+     * needs. */
+    pid_t self_pg=getpgrp();
+    (void)ioctl(sfd,TIOCSPGRP,&self_pg);
+
+    char *const envp[]={ (char *)"PATH=/bin",(char *)"HOME=/",
+                         (char *)"TERM=vt100",(char *)"LANG=C",0 };
+    char *argv[]={ (char *)"tsh",0 };
+    pid_t pid=toby_spawn("/bin/tsh",argv,envp,sfd,sfd,sfd);
+    close(sfd);
+    if(pid<0){ close(mfd); return -4; }
+    g_mfd=mfd; g_shell_pid=pid;
+    return 0;
+}
+
+/* Non-blocking drain of the shell's output.
+ *
+ * FIONREAD first, ALWAYS: a read() on the pty master BLOCKS when the
+ * shell has said nothing, and this is the GUI thread -- a blocking read
+ * here freezes the whole window, not just the terminal. */
+static int shell_pump(void){
+    if(g_mfd<0)return 0;
+    char buf[512];
+    int got=0,avail=0;
+    while(ioctl(g_mfd,FIONREAD,&avail)==0&&avail>0){
+        int want=avail>(int)sizeof buf?(int)sizeof buf:avail;
+        long n=read(g_mfd,buf,(size_t)want);
+        if(n<=0)break;
+        if(g_scroll_offset>0)g_scroll_offset=0;
+        for(long i=0;i<n;i++)vt_putc((uint8_t)buf[i]);
+        got=1;
+        if(avail<=want)break;
+    }
+    return got;
 }
 
 int main(int argc,char **argv){
     (void)argc;(void)argv;
     if(tk_window_open(&win,WIN_W,WIN_H,"Terminal")!=0)return 1;
-    g_sess=sys_term_open(); if(g_sess<0)return 1;
+    if(shell_start()!=0){
+        /* Say WHY rather than vanishing: a terminal window that closes
+         * instantly is indistinguishable from one that never launched. */
+        const char *m="tobyOS terminal: cannot start /bin/tsh on a pty\r\n";
+        for(const char *p=m;*p;p++)vt_putc((uint8_t)*p);
+        g_need_redraw=1;
+    }
     tk_on_key(&win,on_key);
     struct tk_widget *root=tk_root(&win); tk_pad(root,0);
     struct tk_widget *cv=tk_canvas(&win,root,paint); tk_grow(cv,1);
@@ -197,12 +306,21 @@ int main(int argc,char **argv){
     init_ring();
     g_last_blink=sys_clock_ms();
 
-    char outbuf[256];
     for(;;){
         if(tk_pump(&win))break;
-        long n=sys_term_read(g_sess,outbuf,sizeof outbuf);
-        if(n>0&&g_scroll_offset>0)g_scroll_offset=0;
-        while(n>0){ for(long i=0;i<n;i++)vt_putc((uint8_t)outbuf[i]); n=sys_term_read(g_sess,outbuf,sizeof outbuf); }
+        if(shell_pump())g_need_redraw=1;
+
+        /* Reap the shell if it exited, and say so in the window rather
+         * than leaving a dead terminal that silently ignores typing. */
+        if(g_shell_pid>0&&!g_shell_gone){
+            int st=0;
+            if(waitpid(g_shell_pid,&st,WNOHANG)==g_shell_pid){
+                g_shell_gone=1;
+                const char *m="\r\n[tsh exited -- close this window]\r\n";
+                for(const char *p=m;*p;p++)vt_putc((uint8_t)*p);
+                g_need_redraw=1;
+            }
+        }
         uint32_t now=sys_clock_ms();
         if(now-g_last_blink>=500){ g_cursor_visible=!g_cursor_visible; g_last_blink=now; g_need_redraw=1; }
         if(g_need_redraw){ tk_redraw(&win); g_need_redraw=0; }

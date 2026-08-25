@@ -4177,6 +4177,13 @@ void _start(void) {
     }
     smp_start_aps();         /* INIT-SIPI-SIPI (BSP/IO APIC already up) */
 
+    /* NOW that every AP is online, publish the per-CPU cpufreq tree.
+     * sysfs_init() ran ~60 lines above this, when smp_cpu_count() still
+     * answered 1 -- so doing it there gave a four-core EliteDesk exactly
+     * ONE cpuN/cpufreq directory. Found on real hardware; QEMU declines
+     * the MSR gate entirely, so the loop never ran there to be wrong. */
+    { extern void sysfs_publish_cpufreq(void); sysfs_publish_cpufreq(); }
+
     /* Every online CPU now has its GS base installed (BSP in syscall_init
      * above, each AP in ap_entry before it reached `online`). Switch
      * smp_this_cpu()/current_proc() to the gs-relative fast path: a plain

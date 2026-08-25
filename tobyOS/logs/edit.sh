@@ -34,7 +34,7 @@ cd /c/CustomOS/tobyOS || exit 1
 export PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"
 mkdir -p /c/t logs
 QEMU="/c/Program Files/qemu/qemu-system-x86_64.exe"
-LOG=logs/tvi.log
+LOG=logs/edit.log
 FLAGS="-DFAST_BOOT -DQUICK_BOOT -DTVI_BOOT"
 
 taskkill //IM qemu-system-x86_64.exe //F >/dev/null 2>&1; sleep 1
@@ -43,9 +43,9 @@ echo "== build ($FLAGS)"
 touch src/kernel.c
 if ! make -j4 "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
              "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" \
-             EXTRA_CFLAGS="$FLAGS" iso > logs/tvi.build.log 2>&1; then
+             EXTRA_CFLAGS="$FLAGS" iso > logs/edit.build.log 2>&1; then
     echo "BUILD FAILED -- not running a stale iso. Errors:"
-    grep -E ' error:' logs/tvi.build.log | head -20
+    grep -E ' error:' logs/edit.build.log | head -20
     exit 1
 fi
 python -c "

@@ -717,7 +717,30 @@ static void sysfs_populate_hwmon(void) {
             ti->tjmax_c);
 }
 
-static void sysfs_populate_cpufreq(void) {
+/* Called AFTER smp_start_aps(), NOT from sysfs_init().
+ *
+ * REAL-HARDWARE BUG, 2026-08-24: this used to run inside sysfs_init(),
+ * which kmain calls at line ~4117 -- SIXTY LINES BEFORE smp_start_aps().
+ * At that moment only the BSP is online, so smp_cpu_count() answers 1 and
+ * an EliteDesk with four cores published exactly one cpufreq directory:
+ *
+ *     [sysfs] /sys/devices/system/cpu/cpuN/cpufreq: 1 cpu(s), base 3300000 kHz
+ *
+ * QEMU could never catch it -- there the vendor gate declines and this
+ * loop never runs at all -- so it took a machine where the feature
+ * actually works to expose it. Publishing 1 of 4 CPUs is exactly the
+ * quiet half-truth this arc exists to avoid.
+ *
+ * Note /sys/devices/system/cpu/online was UNAFFECTED: it is a generator,
+ * evaluated at read time, so it reported 0-3 correctly all along. That
+ * contrast is the lesson -- a value captured at init is only as true as
+ * the moment it was captured. */
+static int g_cpufreq_published;
+
+void sysfs_publish_cpufreq(void) {
+    if (g_cpufreq_published) return;      /* idempotent: add_fixed is not */
+    g_cpufreq_published = 1;
+
     const struct cpufreq_msr_info *fi = cpufreq_msr_get();
     if (!fi->present) {
         kprintf("[sysfs] /sys/devices/system/cpu/*/cpufreq: no P-state info "
@@ -1024,7 +1047,9 @@ void sysfs_init(void) {
     sysfs_populate_usb();
     sysfs_populate_dmi();
     sysfs_populate_hwmon();
-    sysfs_populate_cpufreq();
+    /* cpufreq is NOT populated here -- it needs the AP count, and the
+     * APs are not up yet. kmain calls sysfs_publish_cpufreq() after
+     * smp_start_aps(). */
 
     int rc = vfs_mount("/sys", &sysfs_ops, 0);
     if (rc == VFS_OK) {
