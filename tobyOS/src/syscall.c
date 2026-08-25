@@ -11005,11 +11005,34 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                      * unlink removes files AND empty dirs, so it
                                      * serves AT_REMOVEDIR too. */
         return do_syscall(SYS_UNLINK, a2, 0, 0, 0, 0);
-    case LX_fsync:                  /* tobyfs writes are journalled + write-through
-                                     * (bcache flushes on commit), so a successful
-                                     * write is already durable -- report success. */
-    case LX_fdatasync:
-        return 0;
+    case LX_fsync:
+    case LX_fdatasync: {
+        /* This used to `return 0` outright, without so much as looking
+         * at the fd. Two things were wrong with that, and only one of
+         * them is the one you would guess:
+         *
+         *   - fsync(-1) and fsync(999) returned SUCCESS. POSIX says
+         *     EBADF, and a program that checks fsync's return to decide
+         *     whether its data is safe was being lied to about the
+         *     cheapest possible failure.
+         *   - the durability itself was an accident rather than a
+         *     guarantee. It happened to hold -- ext4, ext2 and fat32
+         *     write straight through blk_write(), and tobyfs defers into
+         *     the write-back cache but flushes it on every journal
+         *     commit -- so no data was being lost. But nothing in the
+         *     VFS enforced it; it rested on all four drivers
+         *     independently continuing to behave that way, which is the
+         *     same shape of unwritten assumption that made an open
+         *     handle's cached inode go stale.
+         *
+         * So: validate the fd, and ask the filesystem to flush. Drivers
+         * with no device answer OK, because for them there is nothing
+         * durability could mean. */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        if (f->kind != FILE_KIND_VFS) return 0;   /* pipes, sockets, memfd */
+        return vfs_err_to_abi(vfs_file_sync(&f->vfs));
+    }
     case LX_flock: {                /* real since 2026-08-22 (src/flock.c).
                                      * The old no-op satisfied leveldb/SQLite's
                                      * "locking must not error" check while

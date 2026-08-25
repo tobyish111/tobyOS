@@ -643,6 +643,15 @@ int vfs_truncate(const char *path, uint64_t length) {
     return m->ops->truncate(m->data, rel, length);
 }
 
+int vfs_file_sync(struct vfs_file *f) {
+    if (!f || !f->ops) return VFS_ERR_INVAL;
+    /* No device, nothing to flush -- and saying OK is honest here rather
+     * than the usual "a NULL op means unsupported": a tmpfs write IS as
+     * durable as tmpfs gets. */
+    if (!f->ops->sync) return VFS_OK;
+    return f->ops->sync(f->mnt);
+}
+
 int vfs_file_truncate(struct vfs_file *f, uint64_t length) {
     if (!f || !f->ops) return VFS_ERR_INVAL;
     if (!f->ops->ftruncate) return VFS_ERR_ROFS;

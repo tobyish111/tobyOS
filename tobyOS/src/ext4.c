@@ -2388,6 +2388,18 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     return VFS_OK;
 }
 
+/* fsync(2): the block cache is WRITE-BACK, so a successful write is not
+ * yet on the medium. Without this, fsync() returned 0 while the bytes sat
+ * in RAM -- which is the difference between "saved" and "saved until you
+ * unplug it". */
+static int ext4_sync(void *mnt) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    if (!fs || !fs->dev) return VFS_OK;
+    extern void bcache_sync(struct blk_dev *dev);
+    bcache_sync(fs->dev);
+    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+}
+
 static const struct vfs_ops ext4_ops = {
     .open     = ext4_open,
     .close    = ext4_close,
@@ -2408,6 +2420,7 @@ static const struct vfs_ops ext4_ops = {
     .ftruncate = ext4_ftruncate,
     .link      = ext4_link,
     .statfs    = ext4_statfs,   /* Phase H */
+    .sync      = ext4_sync,
 };
 
 /* ---- probe + mount entry points ---- */

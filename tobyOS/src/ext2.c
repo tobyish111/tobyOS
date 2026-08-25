@@ -1662,6 +1662,18 @@ static int ext2_statfs(void *mnt, struct vfs_statfs *out) {
 
 /* ---- vfs_ops table ---- */
 
+/* fsync(2): the block cache is WRITE-BACK, so a successful write is not
+ * yet on the medium. Without this, fsync() returned 0 while the bytes sat
+ * in RAM -- which is the difference between "saved" and "saved until you
+ * unplug it". */
+static int ext2_sync(void *mnt) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    if (!fs || !fs->dev) return VFS_OK;
+    extern void bcache_sync(struct blk_dev *dev);
+    bcache_sync(fs->dev);
+    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+}
+
 const struct vfs_ops ext2_ops = {
     .open     = ext2_open,
     .close    = ext2_close,
@@ -1683,6 +1695,7 @@ const struct vfs_ops ext2_ops = {
     .link      = ext2_link,
     .umount    = ext2_umount,
     .statfs    = ext2_statfs,   /* Phase H */
+    .sync      = ext2_sync,
 };
 
 struct blk_dev *ext2_blkdev_of(void *mnt) {

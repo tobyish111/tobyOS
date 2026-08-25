@@ -58,7 +58,7 @@ grep -aq 'FSMATRIX. VERDICT: PASS' "$LOG" || RC=1
 # Count every check that RAN -- passes alone would make the floor fire a
 # second time for a run that is merely red, hiding the real reason.
 T=$((P + F))
-[ "$T" -lt 72 ] && { echo "   too few checks ran ($T, expected >=72)"; RC=1; }
+[ "$T" -lt 74 ] && { echo "   too few checks ran ($T, expected >=74)"; RC=1; }
 
 if [ "$RC" = "0" ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 exit $RC

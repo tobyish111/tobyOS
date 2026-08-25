@@ -1560,7 +1560,7 @@ static int tobyfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_OK;
 }
 
-static /* Phase H: real statistics from the live bitmaps -- what df/statvfs and
+/* Phase H: real statistics from the live bitmaps -- what df/statvfs and
  * every "is there room?" preflight actually wants. Data blocks only
  * (metadata blocks are not usable space and Linux filesystems exclude
  * them from f_blocks the same way). */
@@ -1581,6 +1581,18 @@ static int tobyfs_statfs(void *mnt, struct vfs_statfs *out) {
     out->type_magic = 0x746f6279;            /* 'toby' */
     out->namelen    = TFS_NAME_MAX;
     return VFS_OK;
+}
+
+/* fsync(2). tobyfs journals and flushes the cache on commit, so this is
+ * usually already true by the time it is called -- but "usually already
+ * true" is not the same as "guaranteed", and the guarantee is the entire
+ * point of the call. */
+static int tobyfs_sync(void *mnt) {
+    struct tobyfs *fs = (struct tobyfs *)mnt;
+    if (!fs || !fs->dev) return VFS_OK;
+    extern void bcache_sync(struct blk_dev *dev);
+    bcache_sync(fs->dev);
+    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
 }
 
 const struct vfs_ops tobyfs_ops = {
@@ -1605,6 +1617,7 @@ const struct vfs_ops tobyfs_ops = {
     .ftruncate= tobyfs_ftruncate,/* slice 6 */
     .link     = tobyfs_link,     /* Phase G: hard links */
     .statfs   = tobyfs_statfs,   /* Phase H: real numbers for df */
+    .sync     = tobyfs_sync,
 };
 
 /* M28E: identification helper used by sys_fs_check() to recognise

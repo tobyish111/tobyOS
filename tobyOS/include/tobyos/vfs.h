@@ -229,6 +229,15 @@ struct vfs_ops {
      * reports honest zeros (namelen aside) instead of the fabricated
      * 4 GiB tmpfs every mount used to claim. */
     int  (*statfs)  (void *mnt, struct vfs_statfs *out);
+    /* Push everything this mount has buffered out to its backing device.
+     *
+     * NULL means "no backing device", which is the truth for tmpfs,
+     * ramfs, procfs and sysfs -- there is nothing durability could mean
+     * for them, so vfs_file_sync() answers OK. Every driver that DOES
+     * own a device implements this: the block cache is write-back, so
+     * without it fsync(2) reports durable while the bytes are still in
+     * RAM, and pulling the stick loses them. */
+    int  (*sync)    (void *mnt);
 };
 
 /* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
@@ -334,6 +343,10 @@ int  vfs_truncate(const char *path, uint64_t length);
 /* Linux slice 6: truncate via an OPEN file handle. Updates f->size on success
  * so a subsequent fstat sees the new length. */
 int  vfs_file_truncate(struct vfs_file *f, uint64_t length);
+/* fsync(2)/fdatasync(2): flush this file's filesystem to its device.
+ * Filesystems with no device answer VFS_OK -- nothing to do is not a
+ * failure. */
+int  vfs_file_sync(struct vfs_file *f);
 
 int  vfs_mount_lookup(const char *mount_point,
                       const struct vfs_ops **ops_out, void **data_out);

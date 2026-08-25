@@ -472,6 +472,60 @@ static void fsm_unlink_open(const char *fs, const char *mp) {
     (void)vfs_unlink(g);
 }
 
+
+/* ---- fsync must put the bytes on the DEVICE -------------------------
+ *
+ * Writes a payload nothing else would produce, then scans the RAM disk's
+ * backing buffer for it -- that buffer IS the "platter", so finding the
+ * bytes there means they really reached the device.
+ *
+ * READ THE before-fsync COLUMN. It is 1 on both drivers, and that is a
+ * finding rather than a formality: ext4, ext2 and fat32 all write
+ * straight through blk_write(), and tobyfs is the only driver that
+ * defers into the write-back cache (and it flushes on every journal
+ * commit). So no data was ever at risk here, and this check does NOT
+ * currently discriminate -- it would pass with fsync stubbed out.
+ *
+ * It is kept because it stops being vacuous the moment any driver starts
+ * deferring, which is exactly when nobody would think to add it. Printing
+ * both samples is what keeps a green line from claiming more than it
+ * proves.
+ */
+static bool fsm_raw_contains(const uint8_t *needle, size_t n) {
+    if (!g_fsm_ram.buf || g_fsm_ram.bytes < n) return false;
+    for (uint64_t i = 0; i + n <= g_fsm_ram.bytes; i++)
+        if (g_fsm_ram.buf[i] == needle[0] &&
+            memcmp(g_fsm_ram.buf + i, needle, n) == 0) return true;
+    return false;
+}
+
+static void fsm_fsync_check(const char *fs, const char *mp) {
+    char f[128], msg[192];
+    ksnprintf(f, sizeof f, "%s/fsyncme.txt", mp);
+    (void)vfs_unlink(f);
+
+    static const char magic[] = "FSYNC-MAGIC-8A3C1F09-ON-THE-PLATTER";
+    const size_t mlen = sizeof magic - 1;
+
+    int cr = vfs_create(f);
+    struct vfs_file h;
+    int oh = (cr == VFS_OK) ? vfs_open(f, &h) : -1;
+    long w  = (oh == VFS_OK) ? vfs_write(&h, magic, mlen) : -1;
+
+    bool before = fsm_raw_contains((const uint8_t *)magic, mlen);
+    int  sy     = (oh == VFS_OK) ? vfs_file_sync(&h) : -1;
+    bool after  = fsm_raw_contains((const uint8_t *)magic, mlen);
+
+    if (oh == VFS_OK) vfs_close(&h);
+    (void)vfs_unlink(f);
+
+    ksnprintf(msg, sizeof msg,
+              "wrote %ld rc=%d, on-device before-fsync=%d after-fsync=%d",
+              w, sy, before ? 1 : 0, after ? 1 : 0);
+    fsm_chk(cr == VFS_OK && oh == VFS_OK && w == (long)mlen &&
+            sy == VFS_OK && after, fs, "fsync puts bytes on the device", msg);
+}
+
 /* ---- formatting a REAL device, for host-side verification ------------
  *
  * fsm_run above proves the driver can read what the formatter wrote --
@@ -593,6 +647,7 @@ void fsmatrix_selftest(void) {
                 fsm_run("ext4", "/fsm4", true, true);
                 fsm_coherence("ext4", "/fsm4");
                 fsm_unlink_open("ext4", "/fsm4");
+                fsm_fsync_check("ext4", "/fsm4");
                 (void)vfs_unmount("/fsm4");
             }
         }
@@ -627,6 +682,7 @@ void fsmatrix_selftest(void) {
                     fsm_run("fat32", "/fsmfat", false, false);
                     fsm_coherence("fat32", "/fsmfat");
                     fsm_unlink_open("fat32", "/fsmfat");
+                    fsm_fsync_check("fat32", "/fsmfat");
                     (void)vfs_unmount("/fsmfat");
                 }
             }

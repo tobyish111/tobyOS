@@ -1723,6 +1723,19 @@ static int fat32_statfs(void *mnt, struct vfs_statfs *out) {
     return VFS_OK;
 }
 
+/* fsync(2): the block cache is WRITE-BACK, so a successful write is not
+ * yet on the medium. Without this, fsync() returned 0 while the bytes sat
+ * in RAM -- which is the difference between "saved" and "saved until you
+ * unplug it". */
+static int fat32_sync(void *mnt) {
+    struct fat32 *fs = (struct fat32 *)mnt;
+    if (!fs || !fs->dev) return VFS_OK;
+    (void)fat_flush(fs);          /* our own FAT sector cache first */
+    extern void bcache_sync(struct blk_dev *dev);
+    bcache_sync(fs->dev);
+    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+}
+
 const struct vfs_ops fat32_ops = {
     .open     = fat32_open,
     .close    = fat32_close,
@@ -1746,6 +1759,7 @@ const struct vfs_ops fat32_ops = {
      * so `df` on a FAT mount answered EROFS from a function that was
      * sitting right above the table. */
     .statfs    = fat32_statfs,
+    .sync      = fat32_sync,
 };
 
 struct blk_dev *fat32_blkdev_of(void *mnt) {
