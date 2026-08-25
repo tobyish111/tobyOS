@@ -866,6 +866,21 @@ static long sysfs_read(struct vfs_file *f, void *buf, size_t n) {
     return (long)n;
 }
 
+/* Default mode for a node that did not ask for one.
+ *
+ * DIRECTORIES NEED THE EXECUTE BIT. This returned 0444 for every node,
+ * directory or not, which meant a directory nobody could TRAVERSE:
+ * vfs_opendir asks vfs_perm_check for READ|EXEC, and vfs_perm_check
+ * short-circuits for uid 0 -- so root walked /sys happily and every gate
+ * in the tree was green, while the EliteDesk, logged in as `toby`, got
+ * VFS_ERR_PERM from the first component. lspci printed "no PCI bus
+ * exposed" and exited 1 on a machine whose /sys/bus/pci/devices held all
+ * eleven functions. sensors, dmidecode, lsusb and cpupower were all
+ * failing the same way for the same reason. */
+static uint32_t sysfs_default_mode(const struct sysfs_node *n) {
+    return (n->type == VFS_TYPE_DIR) ? 00555u : 00444u;
+}
+
 static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     struct sysfs_node *n = sysfs_find(path);
@@ -874,7 +889,7 @@ static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     out->size = 0;
     out->uid = 0;
     out->gid = 0;
-    out->mode = (n->mode ? n->mode : 00444u) | VFS_MODE_VALID;
+    out->mode = (n->mode ? n->mode : sysfs_default_mode(n)) | VFS_MODE_VALID;
     if (n->type == VFS_TYPE_FILE && n->generate) {
         char tmp[SYSFS_BUF_SIZE];
         int len = n->generate(tmp, SYSFS_BUF_SIZE);
@@ -933,8 +948,10 @@ static int sysfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             out->size = 0;
             out->uid = 0;
             out->gid = 0;
-            out->mode = (g_sysfs_nodes[i].mode ? g_sysfs_nodes[i].mode
-                                               : 00444u) | VFS_MODE_VALID;
+            out->mode = (g_sysfs_nodes[i].mode
+                             ? g_sysfs_nodes[i].mode
+                             : sysfs_default_mode(&g_sysfs_nodes[i]))
+                        | VFS_MODE_VALID;
             d->index++;
             return VFS_OK;
         }

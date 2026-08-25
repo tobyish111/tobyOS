@@ -48,6 +48,27 @@ OVMF_VARS_SZ  := 540672
 # after this change no .d files exist yet, and stale objects from before it
 # would otherwise never notice a header edit. It costs a full kernel rebuild
 # when a top-level header is touched -- exactly the old behaviour, no worse.
+#
+# 2026-08-24 -- WHAT THIS STILL DOES NOT COVER, and what does.
+#
+# -MMD OMITS HEADERS FOUND VIA -isystem, and user programs get libtoby's
+# headers exactly that way (LIBTOBY_CFLAGS = ... -isystem $(LIBTOBY_INC)).
+# So every program .d file listed its own main.c and nothing else --
+# `wc -l programs/user_rm/user_rm.d` was 1 -- and editing
+# libtoby/include/sys/stat.h rebuilt libtoby while leaving every program's
+# object compiled against the OLD struct. That is not a stale build, it is
+# a silent ABI split: libtoby writes N bytes into a struct its caller sized
+# at M. The "touch all program sources when a struct grows" rule this block
+# says it retired was therefore still live for the directory it was written
+# about.
+#
+# -MD (which does list -isystem headers) was tried and REJECTED: on this
+# toolchain it also emits clang's own builtin headers by ABSOLUTE path
+# ("C:/msys64/ucrt64/lib/clang/22/include/stddef.h"), and a Windows drive
+# letter in a make prerequisite is a colon where make expects a target
+# separator. The fix is instead an explicit $(LIBTOBY_HEADERS) prerequisite
+# on every program object -- the same belt-and-braces the kernel already
+# gets from $(HEADERS). See LIBTOBY_PROGRAM_RULES.
 DEPFLAGS := -MMD -MP
 
 CFLAGS := --target=x86_64-elf \
@@ -468,6 +489,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/tvi/tvi.elf \
             programs/tvitest/tvitest.elf \
             programs/tedit/tedit.elf \
+            programs/fsprobe/fsprobe.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -1240,6 +1262,15 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # <tobyos/abi/abi.h> by adding `-I ../../include` themselves.
 LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3
 
+# Every public libtoby header, as an explicit prerequisite for user-program
+# objects. -MMD cannot see these (they arrive through -isystem; see the
+# DEPFLAGS note at the top), so without this list a change to struct stat or
+# struct tk_event rebuilds libtoby and leaves every program's object holding
+# the old layout. Coarse on purpose: touching any libtoby header rebuilds
+# every program, which is what the kernel already does with $(HEADERS).
+LIBTOBY_HEADERS := $(wildcard $(LIBTOBY_INC)/*.h $(LIBTOBY_INC)/sys/*.h \
+                              $(LIBTOBY_INC)/toby/*.h $(LIBTOBY_INC)/toby/*.hpp)
+
 # ---------- Milestone 25D: libtoby.so (shared variant) ----------
 #
 # Same source files as libtoby.a, rebuilt with -fPIC and linked as a
@@ -1384,7 +1415,7 @@ ldtoby: $(LDTOBY_SO)
 # Helper template: link a user program with crt0.o + main.o + libtoby.a.
 # Args: $(1) = directory under programs/, $(2) = output name (defaults to dir).
 define LIBTOBY_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1406,7 +1437,7 @@ define LIBTOBY_KABI_PROGRAM_RULES
 # programs. EXTRA_CFLAGS only reaches kernel objects, so -DCHROME_FULL
 # silently missed chromewin and it exec'd the (now unstaged) headless-shell
 # path -- an exit-127 that looked like a loader failure.
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) $$(PROG_EXTRA_CFLAGS) -I include -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1422,7 +1453,7 @@ endef
 # The program's own program.ld must define the .init_array/.fini_array
 # bounds for static constructors (see programs/user_cpptest/program.ld).
 define LIBTOBY_CPP_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CXX) $$(filter-out -std=c11,$$(LIBTOBY_CFLAGS)) \
 	      -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $$< -o $$@
 
@@ -1510,6 +1541,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,cpupower,cpupower))
 $(eval $(call LIBTOBY_PROGRAM_RULES,tvi,tvi))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tvitest,tvitest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,tedit,tedit))
+$(eval $(call LIBTOBY_PROGRAM_RULES,fsprobe,fsprobe))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -2899,6 +2931,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/tvi/tvi.elf                           $(INITRD_STAGE)/bin/tvi
 	cp programs/tvitest/tvitest.elf                   $(INITRD_STAGE)/bin/tvitest
 	cp programs/tedit/tedit.elf                       $(INITRD_STAGE)/bin/tedit
+	cp programs/fsprobe/fsprobe.elf                   $(INITRD_STAGE)/bin/fsprobe
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -3676,7 +3709,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
-	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit \
+	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \

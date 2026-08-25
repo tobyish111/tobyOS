@@ -241,6 +241,12 @@ bool kbd_haschar(void) {
              case 0x4F: kbd_dispatch_char((char)0x85); break; /* End   */
              case 0x53: kbd_dispatch_char((char)0x86); break; /* Del   */
              case 0x5D: kbd_dispatch_char((char)0x87); break; /* Menu  */
+             /* 2026-08-24: PageUp/PageDown were the only navigation keys
+              * with no code at all, so /bin/gui_term bound its scrollback
+              * to 0x86/0x87 -- which are Delete and Menu. Giving them real
+              * codes (TK_KEY_PGUP/PGDN) is what frees Delete to be Delete. */
+             case 0x49: kbd_dispatch_char((char)0x88); break; /* PgUp  */
+             case 0x51: kbd_dispatch_char((char)0x89); break; /* PgDn  */
              /* Win/Super key -> toggle the taskbar app search, so an
               * app launch is: Win, type a few letters, Enter. */
              case 0x5B:                                       /* LWin  */

@@ -298,3 +298,22 @@ int gettimeofday(struct timeval *tv, struct timezone *tz)
     }
     return 0;
 }
+
+/* ---- utimes (2026-08-24) ------------------------------------------- *
+ *
+ * The kernel takes epoch SECONDS and reads (uint64_t)-1 as "now", so a
+ * NULL `times` needs no clock read here. Sub-second precision is dropped:
+ * struct vfs_stat stores whole seconds, and rounding silently would be
+ * worse than not offering what cannot be stored. */
+
+int utimes(const char *path, const struct timeval times[2])
+{
+    unsigned long long at = ~0ull, mt = ~0ull;   /* both mean "now" */
+    if (times) {
+        at = (unsigned long long)times[0].tv_sec;
+        mt = (unsigned long long)times[1].tv_sec;
+    }
+    return (int)__toby_check(toby_sc3(ABI_SYS_UTIMES,
+                                      (long)(uintptr_t)path,
+                                      (long)mt, (long)at));
+}

@@ -218,10 +218,10 @@ static void hid_kbd_press(struct hid_dev_state *st, uint8_t usage,
     if (usage >= 0x4A && usage <= 0x52) {
         static const uint8_t nav_code[9] = {
             0x84,       /* 0x4A Home   */
-            0,          /* 0x4B PageUp (unmapped) */
+            0x88,       /* 0x4B PageUp (TK_KEY_PGUP, 2026-08-24) */
             0x86,       /* 0x4C Delete */
             0x85,       /* 0x4D End    */
-            0,          /* 0x4E PageDn (unmapped) */
+            0x89,       /* 0x4E PageDn (TK_KEY_PGDN, 2026-08-24) */
             0x83,       /* 0x4F Right  */
             0x82,       /* 0x50 Left   */
             0x81,       /* 0x51 Down   */

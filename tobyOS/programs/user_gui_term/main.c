@@ -54,8 +54,13 @@ static int   g_mfd = -1;      /* pty master */
 static pid_t g_shell_pid = -1;
 static int   g_shell_gone = 0;
 
-#define KEY_PGUP 0x86
-#define KEY_PGDN 0x87
+/* These used to be defined here as 0x86/0x87 -- which are TK_KEY_DELETE and
+ * TK_KEY_MENU. Neither keyboard driver emitted a PageUp/PageDown code at
+ * all, so those two constants could only ever have matched the keys they
+ * collided with: pressing Delete scrolled the scrollback, and forward-delete
+ * was unreachable. Both drivers now emit real codes (0x88/0x89). */
+#define KEY_PGUP TK_KEY_PGUP
+#define KEY_PGDN TK_KEY_PGDN
 
 /* ---- grid geometry --------------------------------------------------- */
 #define COLS 80
@@ -228,6 +233,21 @@ static void on_key(struct tk_window *w,struct tk_event *ev){
     case TK_KEY_LEFT:  term_send("\033[D",3); return;
     case TK_KEY_HOME:  term_send("\033[H",3); return;
     case TK_KEY_END:   term_send("\033[F",3); return;
+    /* Forward delete. The pty line discipline has no notion of it, so in a
+     * shell prompt this reaches the application; editors (tedit, tvi, vi,
+     * nano) act on it. */
+    case TK_KEY_DELETE: term_send("\033[3~",4); return;
+    /* BACKSPACE MUST GO OUT AS DEL (0x7F), NOT BS (0x08).
+     *
+     * The keyboard drivers deliver Backspace as ASCII BS, and this used to
+     * pass it straight through -- but the line discipline's VERASE is 0x7F
+     * (src/pty.c, matching Linux and every terminal emulator since the
+     * VT220). A BS therefore matched nothing, was not an erase, and went
+     * into the line buffer as a literal control character. The visible
+     * symptom on hardware was a shell reporting paths nobody typed: the
+     * embedded BS bytes rubbed characters out of the SERIAL log while
+     * leaving them in the command. */
+    case TK_KEY_BACKSPACE: term_send("\177",1); return;
     default: break;
     }
     if(k>=0x80) return;                 /* other specials: not ours to invent */

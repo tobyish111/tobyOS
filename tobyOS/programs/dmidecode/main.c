@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #define ENTRY_PATH "/sys/firmware/dmi/tables/smbios_entry_point"
 #define TABLE_PATH "/sys/firmware/dmi/tables/DMI"
@@ -44,9 +45,17 @@ static unsigned rd32(const unsigned char *p) {
            ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
 }
 
-static size_t slurp(const char *path, unsigned char *buf, size_t cap) {
+/* `why` receives the errno that stopped us, or 0 if the file opened and
+ * simply held nothing. Distinguishing those two matters: the raw DMI
+ * tables are mode 0400 (Linux publishes them that way, and so do we), so
+ * the overwhelmingly common failure is "you are not root" -- and saying
+ * "no SMBIOS table published by this firmware" to a user who merely
+ * forgot sudo is a claim about their MACHINE that we have not
+ * established. */
+static size_t slurp(const char *path, unsigned char *buf, size_t cap, int *why) {
+    if (why) *why = 0;
     FILE *f = fopen(path, "rb");
-    if (!f) return 0;
+    if (!f) { if (why) *why = errno ? errno : EACCES; return 0; }
     size_t n = fread(buf, 1, cap, f);
     fclose(f);
     return n;
@@ -353,12 +362,21 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "dmidecode: unknown option '%s'\n", a); return 2; }
     }
 
-    g_entry_len = slurp(ENTRY_PATH, g_entry, sizeof g_entry);
-    g_table_len = slurp(TABLE_PATH, g_table, sizeof g_table);
+    int ewhy = 0, twhy = 0;
+    g_entry_len = slurp(ENTRY_PATH, g_entry, sizeof g_entry, &ewhy);
+    g_table_len = slurp(TABLE_PATH, g_table, sizeof g_table, &twhy);
+    (void)ewhy;
     if (!g_table_len) {
-        fprintf(stderr, "dmidecode: cannot read %s: "
-                        "no SMBIOS table published by this firmware\n",
-                TABLE_PATH);
+        if (twhy == EACCES || twhy == EPERM)
+            fprintf(stderr, "dmidecode: cannot read %s: permission denied "
+                            "-- the raw DMI tables are mode 0400, so this "
+                            "needs to run as root\n", TABLE_PATH);
+        else if (twhy == ENOENT)
+            fprintf(stderr, "dmidecode: %s does not exist: no SMBIOS table "
+                            "was published by this firmware\n", TABLE_PATH);
+        else
+            fprintf(stderr, "dmidecode: cannot read %s: %s\n",
+                    TABLE_PATH, strerror(twhy));
         return 1;
     }
 

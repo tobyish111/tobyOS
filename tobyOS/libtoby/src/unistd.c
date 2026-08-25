@@ -227,6 +227,8 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
     u->st_mode = (mode_t)k->mode;
     u->st_uid  = (uid_t)k->uid;
     u->st_gid  = (gid_t)k->gid;
+    u->st_mtime = (time_t)k->mtime;
+    u->st_atime = (time_t)k->atime;
     return 0;
 }
 
@@ -263,27 +265,32 @@ int pipe(int fds[2]) {
 
 /* ---- truncate / ftruncate --------------------------------------- *
  *
- * The kernel doesn't expose these yet -- stub with ENOSYS so linkers
- * resolve the symbol and callers get a clean error. */
+ * 2026-08-24: real syscalls. These were ENOSYS stubs with the comment
+ * "the kernel doesn't expose these yet" -- which stopped being true when
+ * the Linux personality got truncate(2)/ftruncate(2) against the same
+ * VFS, so busybox could shorten a file and a native tobyOS program could
+ * not. ABI_SYS_TRUNCATE/FTRUNCATE close that. */
 
 int truncate(const char *path, off_t length) {
-    (void)path; (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0) { errno = EINVAL; return -1; }
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_TRUNCATE, (long)(uintptr_t)path, (long)length));
 }
 
 int ftruncate(int fd, off_t length) {
-    (void)fd; (void)length;
-    errno = ENOSYS;
-    return -1;
+    if (length < 0) { errno = EINVAL; return -1; }
+    return (int)__toby_check(toby_sc2(ABI_SYS_FTRUNCATE, (long)fd, (long)length));
 }
 
 /* ---- rmdir ------------------------------------------------------ *
  *
- * Maps to unlink for now (tobyfs doesn't distinguish dir removal). */
+ * 2026-08-24: a real rmdir. This used to be `return unlink(path)`, so
+ * `rmdir somefile` DELETED THE FILE rather than reporting ENOTDIR --
+ * every script that probes with rmdir before falling back to unlink was
+ * quietly destroying data. The kernel does the type check. */
 
 int rmdir(const char *path) {
-    return (int)__toby_check(toby_sc1(ABI_SYS_UNLINK, (long)(uintptr_t)path));
+    return (int)__toby_check(toby_sc1(ABI_SYS_RMDIR, (long)(uintptr_t)path));
 }
 
 /* ---- access ----------------------------------------------------- *
@@ -314,30 +321,17 @@ int chown(const char *path, uid_t owner, gid_t group) {
 
 /* ---- rename ----------------------------------------------------- *
  *
- * No kernel rename syscall. Emulate with read-copy-write-unlink.
- * Only works for regular files that fit in memory (64KB limit). */
+ * 2026-08-24: the real thing. This was a read-copy-write-unlink
+ * emulation, which is not a rename: it could not move a DIRECTORY (it
+ * returned EISDIR), it was not atomic, it doubled the file's storage
+ * mid-flight, and a failure part-way left both names present with
+ * different contents. The kernel had vfs_rename all along -- renameat(2)
+ * in the Linux personality already used it. */
 
 int rename(const char *oldpath, const char *newpath) {
-    struct stat st;
-    if (stat(oldpath, &st) < 0) return -1;
-    if ((st.st_mode & S_IFMT) == S_IFDIR) { errno = EISDIR; return -1; }
-
-    int src = open(oldpath, O_RDONLY);
-    if (src < 0) return -1;
-
-    int dst = open(newpath, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 0777);
-    if (dst < 0) { close(src); return -1; }
-
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(src, buf, sizeof(buf))) > 0) {
-        ssize_t w = write(dst, buf, (size_t)n);
-        if (w != n) { close(src); close(dst); return -1; }
-    }
-    close(src);
-    close(dst);
-    if (n < 0) return -1;
-    return unlink(oldpath);
+    return (int)__toby_check(toby_sc2(ABI_SYS_RENAME,
+                                      (long)(uintptr_t)oldpath,
+                                      (long)(uintptr_t)newpath));
 }
 
 /* ---- link / symlink / readlink ---------------------------------- *

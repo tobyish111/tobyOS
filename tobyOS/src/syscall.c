@@ -2924,6 +2924,8 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
      * because it used the native ABI instead of the Linux one. */
     dst->uid = userns_cur_uid(src->uid);
     dst->gid = userns_cur_gid(src->gid);
+    dst->mtime = src->mtime;
+    dst->atime = src->atime;
 }
 
 
@@ -3167,18 +3169,74 @@ static long sys_rename(const char *oldp, const char *newp) {
     if (rr) return rr;
     rr = resolve_user_path(newp, kn, sizeof(kn));
     if (rr) return rr;
-    int rc = vfs_rename(ko, kn);
+    /* The shared mapper rather than a hand-written switch: the switch this
+     * replaces had a `default: -EIO` that swallowed VFS_ERR_XDEV, which is
+     * precisely the code mv needs to see to fall back to copy-then-unlink.
+     * A hand-listed set of arms is one new VFS code away from being wrong
+     * again. */
+    return vfs_err_to_abi(vfs_rename(ko, kn));
+}
+
+/* rmdir(2), the native ABI's. libtoby's rmdir() was `return unlink(path)`,
+ * so `rmdir notadirectory` DELETED THE FILE instead of reporting ENOTDIR.
+ * The type check is the only thing rmdir adds over unlink here -- the
+ * drivers already refuse to remove a non-empty directory -- but it is the
+ * whole point of having a separate call. */
+static long sys_rmdir(const char *path) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    int rc = vfs_unlink(kpath);
     switch (rc) {
     case VFS_OK:        return 0;
     case VFS_ERR_NOENT: return -ABI_ENOENT;
-    case VFS_ERR_NOTDIR:return -ABI_ENOTDIR;
-    case VFS_ERR_EXIST: return -ABI_EEXIST;
-    case VFS_ERR_NOSPC: return -ABI_ENOSPC;
     case VFS_ERR_ROFS:  return -ABI_EROFS;
     case VFS_ERR_PERM:  return -ABI_EACCES;
-    case VFS_ERR_INVAL: return -ABI_EINVAL;
-    default:            return -ABI_EIO;
+    /* Drivers report a non-empty directory as INVAL; POSIX names it
+     * ENOTEMPTY, and callers (busybox rmdir, CPython) test for it. */
+    case VFS_ERR_INVAL: return -ABI_ENOTEMPTY;
+    default:            return -ABI_EACCES;
     }
+}
+
+/* utimes(2), native. (uint64_t)-1 means "now" in either field -- that is
+ * how touch(1) spells its default, and resolving it kernel-side keeps the
+ * clock in one place rather than having every caller invent one. */
+static long sys_utimes_native(const char *path, uint64_t mtime, uint64_t atime) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    uint64_t now = 0;
+    if (mtime == (uint64_t)-1 || atime == (uint64_t)-1) {
+        extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+        now = lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+    }
+    if (mtime == (uint64_t)-1) mtime = now;
+    if (atime == (uint64_t)-1) atime = now;
+    return vfs_err_to_abi(vfs_utimes(kpath, mtime, atime));
+}
+
+static long sys_truncate_path(const char *path, uint64_t len) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (st.type == VFS_TYPE_DIR) return -ABI_EISDIR;
+    return vfs_err_to_abi(vfs_truncate(kpath, len));
+}
+
+static long sys_ftruncate_fd(int fd, uint64_t len) {
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    if (f->kind == FILE_KIND_MEMFD) return memfd_ftruncate(f->memfd, len);
+    if (f->kind != FILE_KIND_VFS)   return -ABI_EINVAL;
+    return vfs_err_to_abi(vfs_file_truncate(&f->vfs, len));
 }
 
 static long sys_mkdir(const char *path, int mode) {
@@ -4611,6 +4669,19 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_DUP2:          return sys_dup2((int)a1, (int)a2);
     case SYS_UNLINK:        return sys_unlink((const char *)a1);
     case SYS_MKDIR:         return sys_mkdir((const char *)a1, (int)a2);
+    /* 2026-08-24: the write-side calls the native ABI was missing. Every
+     * one of these already existed for the Linux personality against the
+     * same VFS -- a busybox binary could truncate and rename where a
+     * native tobyOS program got ENOSYS from its own libc. */
+    case ABI_SYS_TRUNCATE:
+        return sys_truncate_path((const char *)a1, (uint64_t)a2);
+    case ABI_SYS_FTRUNCATE:
+        return sys_ftruncate_fd((int)a1, (uint64_t)a2);
+    case ABI_SYS_RENAME:
+        return sys_rename((const char *)a1, (const char *)a2);
+    case ABI_SYS_RMDIR:     return sys_rmdir((const char *)a1);
+    case ABI_SYS_UTIMES:
+        return sys_utimes_native((const char *)a1, (uint64_t)a2, (uint64_t)a3);
     case SYS_BRK:           return sys_brk((uintptr_t)a1);
     case SYS_GETCWD:        return sys_getcwd((char *)a1, (size_t)a2);
     case SYS_CHDIR:         return sys_chdir((const char *)a1);

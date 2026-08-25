@@ -1045,8 +1045,29 @@ struct abi_vizmap {
  * openpty handshake (TIOCGPTN) from a native program. */
 #define ABI_SYS_IOCTL           193
 
+/* ---- 2026-08-24: the write-side calls the native ABI never had ----
+ *
+ * libtoby carried these as ENOSYS stubs ("the kernel doesn't expose these
+ * yet") and rename() as a read-copy-write-unlink emulation that could not
+ * move a directory and was not atomic. The kernel had all three the whole
+ * time -- vfs_truncate/vfs_rename exist and the LINUX personality already
+ * routes truncate(2)/renameat(2) to them -- so a busybox binary could do
+ * what a native tobyOS program could not, on the same filesystem. */
+#define ABI_SYS_TRUNCATE        194  /* (const char *path, uint64 len) -> 0|-E */
+#define ABI_SYS_FTRUNCATE       195  /* (int fd, uint64 len)          -> 0|-E */
+#define ABI_SYS_RENAME          196  /* (const char *old, const char *new) */
+/* rmdir(2) proper. libtoby's rmdir() was an alias for unlink(), so
+ * `rmdir somefile` removed the FILE instead of reporting ENOTDIR. */
+#define ABI_SYS_RMDIR           197  /* (const char *path) -> 0|-E */
+/* utimes: set a path's timestamps, in EPOCH SECONDS. (uint64_t)-1 in
+ * either field means "now", which is how touch(1) spells its default.
+ * `touch existingfile` used to open() it and close it again, which does
+ * not change a timestamp on any filesystem -- so the one command whose
+ * entire job is updating an mtime never updated one. */
+#define ABI_SYS_UTIMES          198  /* (path, mtime_sec, atime_sec) -> 0|-E */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          194
+#define ABI_SYS_NR_MAX          199
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1588,7 +1609,16 @@ struct abi_stat {
     uint32_t uid;
     uint32_t gid;
     uint32_t _reserved0; /* padding for forward ABI growth */
-    uint64_t _reserved1[2];
+    /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS, claimed out of the
+     * two spare words this struct reserved for exactly this. sizeof is
+     * unchanged, so nothing built against the old layout shifts.
+     *
+     * Until now the native ABI had no way to REPORT a file time (and
+     * none to set one), which is why `touch -m` had nothing to preserve
+     * and native `ls -l` had nothing to print. 0 means the filesystem
+     * has no answer, matching struct vfs_stat. */
+    uint64_t mtime;      /* last data modification */
+    uint64_t atime;      /* last access (best effort) */
 };
 
 /* ============================================================

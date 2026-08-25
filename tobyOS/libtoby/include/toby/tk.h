@@ -66,6 +66,14 @@ extern "C" {
 #define TK_KEY_END        0x85
 #define TK_KEY_DELETE     0x86
 #define TK_KEY_MENU       0x87   /* keyboard context-menu (Apps) key */
+/* 2026-08-24: PageUp/PageDown. Both keyboard drivers left these
+ * deliberately unmapped, so /bin/gui_term had invented its own
+ * KEY_PGUP/KEY_PGDN at 0x86/0x87 -- which are Delete and Menu. The
+ * terminal therefore scrolled its scrollback when you pressed Delete
+ * and could never forward-delete a character. Real codes, mapped in
+ * keyboard.c and usb_hid.c, so nothing has to squat on anything. */
+#define TK_KEY_PGUP       0x88
+#define TK_KEY_PGDN       0x89
 
 /* tk_event.button bit masks (mirror the kernel's gui_event buttons). */
 #define TK_BTN_LEFT       0x01

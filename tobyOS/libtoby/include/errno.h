@@ -45,6 +45,12 @@ extern int errno;
 #define EDEADLK         35
 #define EBUSY           16
 #define ETIMEDOUT      110
+/* 2026-08-24. Both were already reachable from the kernel and had no name
+ * here, so callers could only compare against a bare number: EXDEV is what
+ * vfs_rename answers for a cross-mount move (mv's copy fallback keys off
+ * it) and ENOTEMPTY is what rmdir(2) answers for a populated directory. */
+#define EXDEV           18
+#define ENOTEMPTY       39
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

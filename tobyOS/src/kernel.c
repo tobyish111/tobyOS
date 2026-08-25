@@ -7856,6 +7856,31 @@ void _start(void) {
     }
 #endif
 
+#ifdef FSPROBE_BOOT
+    /* 2026-08-24: the gate that every previous gate was missing.
+     *
+     * Everything spawned from this file runs as ROOT, so no harness in
+     * the tree had ever exercised a permission check -- and the EliteDesk
+     * boot logged in as `toby` (uid 1000), where lspci exited 1 on a tree
+     * PKGPROBE had just called green. /bin/fsprobe runs its checks twice:
+     * once here as root, once in a child that setuid(1000)s first. It
+     * also asserts the filesystem CRUD contract per mount, because "the
+     * root filesystem is writable" had never been stated as a value
+     * anywhere -- only as an absence of complaints. */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=vt100", (char *)"LANG=C", 0 };
+        char *argv[] = { (char *)"fsprobe", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/fsprobe", .name = "fsprobe",
+            .argc = 1, .argv = argv, .envc = 4, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) kprintf("[FSPROBE] SPAWN FAILED\n");
+        else kprintf("[FSPROBE] harness exit=%d\n", proc_wait(pid));
+    }
+#endif
+
 #ifdef CPUTELEM_SELFTEST
     /* Slices 3+4: the MSR decoders, tested against known bit patterns.
      * This exists because QEMU advertises neither a thermal sensor nor

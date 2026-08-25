@@ -941,6 +941,13 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
         return VFS_ERR_PERM;
     }
     if (!m->ops->stat) { perf_zone_end(PERF_Z_VFS_STAT, t_v); return VFS_ERR_INVAL; }
+    /* Zero BEFORE dispatch. Callers declare `struct vfs_stat st;` on the
+     * stack and no driver assigns every field -- ramfs left mtime/atime/
+     * ctime untouched on every path, so `ls -l /bin` dated files from
+     * whatever integers happened to be under them. Fixing it here rather
+     * than in each driver means the next driver cannot reintroduce it, and
+     * an unset field reads as the documented 0 ("this fs has no answer"). */
+    memset(out, 0, sizeof(*out));
     int rc = m->ops->stat(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
 #ifdef PATHFAIL_TRACE
@@ -1088,7 +1095,13 @@ int vfs_rename(const char *oldpath, const char *newpath) {
      * it -- a flag that is accepted and ignored is the same class of lie as a
      * no-op syscall that reports success. */
     if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
-    if (om != nm)   return VFS_ERR_INVAL;    /* cross-mount rename (EXDEV) -- n/s */
+    /* Cross-mount rename. This said VFS_ERR_INVAL with a comment naming
+     * EXDEV as what it meant -- so callers got EINVAL, which reads as "you
+     * asked for something nonsensical" rather than "use a copy instead".
+     * Every mv keys its copy-then-unlink fallback off EXDEV specifically,
+     * so the wrong code turned `mv /tmp/x /data/x` into a hard failure.
+     * VFS_ERR_XDEV already existed (Phase G added it for hard links). */
+    if (om != nm)   return VFS_ERR_XDEV;
     if (!om->ops->rename) return VFS_ERR_ROFS;
     /* Need write on both old and new (source is unlinked, dest is created). */
     if (!cap_check_path(current_proc(), oldpath, CAP_FILE_WRITE, "vfs_rename") ||
@@ -1099,6 +1112,24 @@ int vfs_rename(const char *oldpath, const char *newpath) {
         if (sp != VFS_OK) return sp;
         sp = sysprot_check_write(current_proc(), newpath, "vfs_rename");
         if (sp != VFS_OK) return sp;
+    }
+    /* W+X on BOTH parent directories, the same rule vfs_unlink and
+     * vfs_create apply -- a rename unlinks from one directory and creates
+     * in another, so it needs exactly what those two need. This check was
+     * absent: rename was the one mutation that consulted only the caps
+     * layer, so a user with no write permission on a directory could still
+     * move things out of it. Noticed while wiring ramfs's ->rename, which
+     * is what made the path reachable from the root filesystem at all. */
+    {
+        char par[VFS_PATH_MAX];
+        if (parent_path(oldpath, par, sizeof(par)) == VFS_OK) {
+            int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+        }
+        if (parent_path(newpath, par, sizeof(par)) == VFS_OK) {
+            int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+        }
     }
     int rrc = om->ops->rename(om->data, orel, nrel);
     if (rrc == VFS_OK) {
