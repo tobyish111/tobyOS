@@ -11268,6 +11268,19 @@ void _start(void) {
                 TKAPP_CLICK_X, TKAPP_CLICK_Y);
         gui_post_shell_click(TKAPP_CLICK_X, TKAPP_CLICK_Y);
 #endif
+#ifdef TKAPP_RCLICK_X
+        /* Right-click a point INSIDE the app window (client coordinates),
+         * to open a context menu for a screenshot. gui_post_shell_click
+         * above drives the desktop shell; this drives the focused window's
+         * own event ring, which is where a TobyTK menu comes from. Build:
+         *   -DTKAPP_BOOT -DTKAPP_FILES -DTKAPP_RCLICK_X=40 -DTKAPP_RCLICK_Y=289 */
+        TKA_PUMP(6000);                        /* let the app paint first */
+        kprintf("[TKAPP] synthetic RIGHT-click in-window at (%d,%d)\n",
+                TKAPP_RCLICK_X, TKAPP_RCLICK_Y);
+        gui_post_mouse(GUI_EV_MOUSE_DOWN, TKAPP_RCLICK_X, TKAPP_RCLICK_Y, 0x02);
+        gui_post_mouse(GUI_EV_MOUSE_UP,   TKAPP_RCLICK_X, TKAPP_RCLICK_Y, 0x02);
+        TKA_PUMP(4000);                        /* let the menu open + paint */
+#endif
 #if defined(TKAPP_CHROMEWIN) && defined(CHROMIUM_BOOT)
         /* Slice 39: chrome under the FULL desktop is ~5x slower than the
          * headless one-shot (the compositor + gui_tick steal most cores under
