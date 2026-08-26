@@ -591,8 +591,41 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
             kprintf("[prov] RAM-backed /data restored\n");
         return -ABI_EIO;
     }
+    /* Root-owned 0755 straight out of the formatter; without this the
+     * desktop session that just asked for this volume cannot write to
+     * the thing it just made. */
+    data_volume_relax_perms();
     kprintf("[prov] '%s' is now /data (persistent)\n", pname);
     return ABI_PROV_OK_MOUNTED;
+}
+
+
+/* ---- /data must be writable by the LOGGED-IN USER -------------------
+ *
+ * A freshly formatted tobyfs root is uid 0 / mode 0755, so on any
+ * non-root session every write to /data fails the permission check --
+ * no saved files, no settings, no downloads. /data is the desktop's
+ * shared scratch+data volume, so it gets /tmp semantics: world-writable.
+ *
+ * This lives HERE, called from every site that mounts /data, because it
+ * used to live only in the boot path. Provisioning a stick mid-session
+ * mounts /data a SECOND time, that mount skipped the relaxation, and the
+ * volume stayed root-only until the next reboot -- which is exactly the
+ * "I formatted my USB, made a file, then could not save edits" report
+ * from real hardware on 2026-08-25. One copy, every caller.
+ */
+void data_volume_relax_perms(void) {
+    struct vfs_stat st;
+    if (vfs_stat("/data", &st) != VFS_OK) return;
+    if (st.mode & 00002u) return;              /* already world-writable */
+    unsigned was = (unsigned)(st.mode & 07777u);
+    if (vfs_chmod("/data", 00777u) == VFS_OK)
+        kprintf("[data] /data was mode 0%04o (root-only) -- relaxed to 0777 "
+                "so non-root sessions can use the desktop\n", was);
+    else
+        kprintf("[data] WARN: /data is mode 0%04o (root-only) and could not "
+                "be relaxed -- non-root logins will not be able to save "
+                "anything\n", was);
 }
 
 /* ---- SYS_BLK_LIST record builder (kernel staging buffer) ---------- */
@@ -887,6 +920,19 @@ void provision_selftest(void) {
         prov_expect("t5b FAT on removable + ERASE",
                     provision_create_data_volume(d5, ABI_PROV_F_ERASE),
                     ABI_PROV_OK_MOUNTED);
+
+        /* The volume the caller just asked for must be WRITABLE by the
+         * session that asked. A fresh tobyfs root is uid 0 / 0755, and
+         * this relaxation used to exist only in the boot path -- so a
+         * stick provisioned mid-session stayed root-only until reboot:
+         * "I formatted my USB, made a file, then could not save edits",
+         * reported from real hardware 2026-08-25. */
+        {
+            struct vfs_stat dst;
+            long wr = (vfs_stat("/data", &dst) == VFS_OK &&
+                       (dst.mode & 00002u)) ? 1 : 0;
+            prov_expect("t5b-perm fresh /data is world-writable", wr, 1);
+        }
         (void)vfs_unmount("/data");
     } else {
         kprintf("[PROV] FAIL t5b setup\n");

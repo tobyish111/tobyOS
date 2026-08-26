@@ -3385,21 +3385,10 @@ void _start(void) {
         }
 #endif
         if (data_mounted) {
-            struct vfs_stat dst;
-            if (vfs_stat("/data", &dst) == VFS_OK &&
-                (dst.mode & 00002u) == 0) {
-                /* kprintf has no %o -- split the octal digits by hand. */
-                unsigned mo = (unsigned)(dst.mode & 0777u);
-                unsigned m2 = (mo >> 6) & 7, m1 = (mo >> 3) & 7, m0 = mo & 7;
-                if (vfs_chmod("/data", 00777u) == VFS_OK)
-                    kprintf("[boot] /data was mode 0%d%d%d (root-only) -- "
-                            "relaxed to 0777 so non-root sessions can use the "
-                            "desktop\n", m2, m1, m0);
-                else
-                    kprintf("[boot] WARN: /data is mode 0%d%d%d (root-only) "
-                            "and could not be relaxed -- non-root logins will "
-                            "not be able to save anything\n", m2, m1, m0);
-            }
+            /* One copy of this rule, in provision.c, called by every site
+             * that mounts /data. It used to be written out here only, so
+             * the provisioning path mounted a fresh volume root-only.*/
+            data_volume_relax_perms();
         }
 
 #ifdef PROVISION_SELFTEST
