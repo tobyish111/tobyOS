@@ -1,0 +1,2 @@
+echo | read
+echo status=$?

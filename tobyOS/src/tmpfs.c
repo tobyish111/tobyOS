@@ -95,6 +95,20 @@ struct tmpfs_node {
     size_t        size, cap;
     uint32_t      uid, gid, mode;
     uint64_t      mtime, atime;
+    /* POSIX: unlink() removes the NAME; the file itself survives until
+     * the last open handle closes. Without this, `fd = open(t); unlink(t);
+     * read(fd)` -- which is how every mkstemp()/tmpfile() user, GNU bash
+     * here-documents included, makes a private temp file -- read back
+     * nothing, because unlink freed the data out from under the fd. */
+    int           open_count;
+    bool          unlinked;
+    /* Hard links. A tmpfs node is keyed by its PATH, so a second name for
+     * the same bytes needs one level of indirection: `link_to` is 0 for an
+     * entry that owns its data, or (owner index + 1) for an extra name.
+     * Zero meaning "I am the owner" is deliberate -- every node is created
+     * by memset, so the safe value is the one memset produces. */
+    uint32_t      link_to;
+    uint32_t      nlink;                /* names pointing at this owner */
 };
 
 struct tmpfs_mount {
@@ -102,6 +116,7 @@ struct tmpfs_mount {
     struct tmpfs_node *nodes;
     size_t             bytes;      /* data bytes currently held */
     size_t             max_bytes;
+    bool               reported_full;  /* census printed once, not per create */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
@@ -122,12 +137,33 @@ static bool tnorm(const char *path, char *out, size_t cap)
     return true;
 }
 
-static struct tmpfs_node *tfind(struct tmpfs_mount *m, const char *norm)
+/* Find the NAME. Callers that manipulate the directory entry itself --
+ * unlink, rename, link -- want this one. */
+static struct tmpfs_node *tfind_name(struct tmpfs_mount *m, const char *norm)
 {
     for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-        if (m->nodes[i].used && strcmp(m->nodes[i].path, norm) == 0)
+        if (m->nodes[i].used && !m->nodes[i].unlinked &&
+            strcmp(m->nodes[i].path, norm) == 0)
             return &m->nodes[i];
     return NULL;
+}
+
+/* Follow a name to the node that actually owns the bytes. */
+static struct tmpfs_node *tresolve(struct tmpfs_mount *m,
+                                   struct tmpfs_node *nm)
+{
+    if (!nm || !nm->link_to) return nm;
+    size_t idx = (size_t)nm->link_to - 1;
+    if (idx >= TMPFS_MAX_NODES) return nm;      /* corrupt: fail closed */
+    struct tmpfs_node *ino = &m->nodes[idx];
+    return ino->used ? ino : nm;
+}
+
+/* Find the DATA. Everything that reads or writes a file wants this one,
+ * so every existing caller keeps working through a link unchanged. */
+static struct tmpfs_node *tfind(struct tmpfs_mount *m, const char *norm)
+{
+    return tresolve(m, tfind_name(m, norm));
 }
 
 /* Is `norm` a DIRECT child of directory `dir`? Returns the child's own name. */
@@ -144,10 +180,71 @@ static const char *tchild_of(const char *dir, const char *norm)
     return tchr(rest, '/') ? NULL : rest;
 }
 
+/* Free a node and its data, returning the slot to talloc(). The mount is
+ * found by pointer range so callers that only hold the node can reap. */
+static void treap(struct tmpfs_node *nd)
+{
+    if (!nd || !nd->used) return;
+    for (size_t i = 0; i < TMPFS_MAX_MOUNTS; i++) {
+        if (!g_tmpfs[i].used) continue;
+        if (nd >= g_tmpfs[i].nodes && nd < g_tmpfs[i].nodes + TMPFS_MAX_NODES) {
+            if (nd->data) g_tmpfs[i].bytes -= nd->cap;
+            break;
+        }
+    }
+    if (nd->data) kfree(nd->data);
+    memset(nd, 0, sizeof *nd);
+}
+
+/* Running out of nodes used to be a silent NULL: every create returned an
+ * error the caller reported as a generic failure, and a filesystem that has
+ * simply filled up looked identical to one that is broken. The third-party
+ * shell gate spent a whole run reporting "could not run" for 2,600 cases
+ * because of it. A full table now says so, once per mount, with the census
+ * that distinguishes the two ways it can happen:
+ *
+ *   used but reachable      -- genuinely full, the caller should clean up
+ *   used AND unlinked       -- LEAKED: the name is gone but the slot is held
+ *                              by an open_count that never came back to zero
+ */
+static void tmpfs_census(struct tmpfs_mount *m, const char *why)
+{
+    size_t used = 0, orphan = 0, open_held = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES; i++) {
+        if (!m->nodes[i].used) continue;
+        used++;
+        if (m->nodes[i].unlinked) orphan++;
+        if (m->nodes[i].open_count > 0) open_held++;
+    }
+    kprintf("[tmpfs] %s: %lu/%d nodes used, %lu unlinked-but-held (leaked), "
+            "%lu with open handles, %lu/%lu KiB\n",
+            why, (unsigned long)used, TMPFS_MAX_NODES,
+            (unsigned long)orphan, (unsigned long)open_held,
+            (unsigned long)(m->bytes / 1024u),
+            (unsigned long)(m->max_bytes / 1024u));
+
+    /* Name a few of them. "506 nodes leaked" says a leak exists; the PATHS say
+     * which operation leaked them, and that is the difference between knowing
+     * there is a bug and knowing where it is. Bounded -- this runs from an
+     * allocation failure and must not become the next flood. */
+    int shown = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES && shown < 8; i++) {
+        if (!m->nodes[i].used || !m->nodes[i].unlinked) continue;
+        kprintf("[tmpfs]   leaked: '%s' open_count=%d type=%d size=%lu\n",
+                m->nodes[i].path, m->nodes[i].open_count,
+                (int)m->nodes[i].type, (unsigned long)m->nodes[i].size);
+        shown++;
+    }
+}
+
 static struct tmpfs_node *talloc(struct tmpfs_mount *m)
 {
     for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
         if (!m->nodes[i].used) return &m->nodes[i];
+    if (!m->reported_full) {
+        m->reported_full = true;
+        tmpfs_census(m, "node table FULL");
+    }
     return NULL;
 }
 
@@ -177,6 +274,7 @@ static int tmpfs_open(void *mnt, const char *path, struct vfs_file *out)
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    nd->open_count++;
     out->priv = nd;
     out->pos  = 0;
     out->size = nd->size;
@@ -186,7 +284,15 @@ static int tmpfs_open(void *mnt, const char *path, struct vfs_file *out)
     return VFS_OK;
 }
 
-static int tmpfs_close(struct vfs_file *f) { (void)f; return VFS_OK; }
+/* Releasing the last handle on an unlinked node is what finally frees it. */
+static int tmpfs_close(struct vfs_file *f)
+{
+    struct tmpfs_node *nd = f ? f->priv : 0;
+    if (!nd || !nd->used) return VFS_OK;
+    if (nd->open_count > 0) nd->open_count--;
+    if (nd->unlinked && nd->open_count == 0) treap(nd);
+    return VFS_OK;
+}
 
 static long tmpfs_read(struct vfs_file *f, void *buf, size_t n)
 {
@@ -214,7 +320,17 @@ static int tgrow(struct tmpfs_mount *m, struct tmpfs_node *nd, size_t want)
          * may be what crossed the limit. */
         ncap = want;
         delta = ncap - nd->cap;
-        if (m->bytes + delta > m->max_bytes) return VFS_ERR_NOSPC;
+        if (m->bytes + delta > m->max_bytes) {
+            /* Say so. A tmpfs that has simply filled up returned a bare
+             * NOSPC that every caller reported as a generic write failure,
+             * which is indistinguishable from a broken filesystem -- the
+             * shell gate lost 2,600 cases to exactly that ambiguity. */
+            if (!m->reported_full) {
+                m->reported_full = true;
+                tmpfs_census(m, "byte budget EXHAUSTED");
+            }
+            return VFS_ERR_NOSPC;
+        }
     }
     uint8_t *nb = kmalloc(ncap);
     if (!nb) return VFS_ERR_NOMEM;
@@ -244,6 +360,12 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
     size_t end = f->pos + n;
     int rc = tgrow(m, nd, end);
     if (rc != VFS_OK) return rc;
+    /* A write that starts past EOF leaves a hole, and a hole reads as
+     * zeroes. Same reasoning as ttrunc: the capacity may already cover
+     * this range, in which case tgrow zeroed nothing and the gap would
+     * expose whatever the file held before it was truncated. */
+    if (f->pos > nd->size)
+        memset(nd->data + nd->size, 0, f->pos - nd->size);
     memcpy(nd->data + f->pos, buf, n);
     if (end > nd->size) nd->size = end;
     f->pos = end;
@@ -266,6 +388,7 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
     memset(nd, 0, sizeof *nd);
     nd->used = true;
     nd->type = VFS_TYPE_FILE;
+    nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
     nd->uid = uid; nd->gid = gid;
     nd->mode = mode ? (mode & 07777u) : 0644u;
@@ -287,6 +410,7 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     memset(nd, 0, sizeof *nd);
     nd->used = true;
     nd->type = VFS_TYPE_DIR;
+    nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
     nd->uid = uid; nd->gid = gid;
     nd->mode = mode ? (mode & 07777u) : 0755u;
@@ -294,21 +418,78 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     return VFS_OK;
 }
 
+/* Remove ONE name. The bytes survive while another name or an open handle
+ * still refers to them -- that is what a hard link means, and it is also
+ * what POSIX already required of unlink() on an open file. */
+static void tdrop_name(struct tmpfs_mount *m, struct tmpfs_node *nm)
+{
+    struct tmpfs_node *ino = tresolve(m, nm);
+    if (ino != nm) {                      /* an extra name: drop just it */
+        memset(nm, 0, sizeof *nm);
+        if (ino->nlink) ino->nlink--;
+        if (ino->nlink == 0 && ino->open_count == 0) treap(ino);
+        return;
+    }
+    if (ino->nlink > 1) {
+        /* Other names point here BY INDEX, so the slot has to live on --
+         * but this name is gone, so hide it from lookups and readdir. */
+        ino->nlink--;
+        ino->unlinked = true;
+        return;
+    }
+    if (ino->nlink) ino->nlink--;
+    /* Still open: drop the name now, keep the bytes until the last close.
+     * The slot stays `used` so talloc() cannot hand it out underneath the
+     * handles that still point at it. */
+    if (ino->open_count > 0) { ino->unlinked = true; return; }
+    treap(ino);
+}
+
 static int tmpfs_unlink(void *mnt, const char *path)
 {
     struct tmpfs_mount *m = mnt;
     char norm[VFS_PATH_MAX];
     if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
-    struct tmpfs_node *nd = tfind(m, norm);
+    struct tmpfs_node *nd = tfind_name(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     /* A non-empty directory must not vanish with its contents still in the
-     * table -- those entries would be unreachable but still charged. */
+     * table -- those entries would be unreachable but still charged. An
+     * already-unlinked child does not count: its name is gone, so the
+     * directory really is empty. */
     if (nd->type == VFS_TYPE_DIR)
         for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-            if (m->nodes[i].used && tchild_of(norm, m->nodes[i].path))
+            if (m->nodes[i].used && !m->nodes[i].unlinked &&
+                tchild_of(norm, m->nodes[i].path))
                 return VFS_ERR_EXIST;   /* ENOTEMPTY has no VFS code here */
-    if (nd->data) { m->bytes -= nd->cap; kfree(nd->data); }
-    memset(nd, 0, sizeof *nd);
+    tdrop_name(m, nd);
+    return VFS_OK;
+}
+
+/* Phase G: a second directory entry for the same bytes. */
+static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
+{
+    struct tmpfs_mount *m = mnt;
+    char o[VFS_PATH_MAX], nw[VFS_PATH_MAX];
+    if (!tnorm(oldpath, o, sizeof o) || !tnorm(newpath, nw, sizeof nw))
+        return VFS_ERR_INVAL;
+    struct tmpfs_node *nm = tfind_name(m, o);
+    if (!nm) return VFS_ERR_NOENT;
+    struct tmpfs_node *ino = tresolve(m, nm);
+    /* POSIX forbids hard links to directories: they make the tree cyclic
+     * and every walker that trusts it loops forever. */
+    if (ino->type == VFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    if (tfind_name(m, nw)) return VFS_ERR_EXIST;
+    if (!tparent_ok(m, nw)) return VFS_ERR_NOENT;
+
+    struct tmpfs_node *nn = talloc(m);
+    if (!nn) return VFS_ERR_NOSPC;
+    memset(nn, 0, sizeof *nn);
+    nn->used = true;
+    nn->type = ino->type;
+    tcopy(nn->path, nw, sizeof nn->path);
+    nn->path[sizeof nn->path - 1] = '\0';
+    nn->link_to = (uint32_t)(ino - m->nodes) + 1u;
+    ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
     return VFS_OK;
 }
 
@@ -333,6 +514,7 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     out->mode  = nd->mode;
     out->mtime = nd->mtime;
     out->atime = nd->atime;
+    out->nlink = nd->nlink ? nd->nlink : 1u;
     return VFS_OK;
 }
 
@@ -370,18 +552,23 @@ static int tmpfs_readdir(struct vfs_dir *d, struct vfs_dirent *out)
     if (!dh) return VFS_ERR_INVAL;
     for (; dh->i < TMPFS_MAX_NODES; dh->i++) {
         struct tmpfs_node *nd = &dh->m->nodes[dh->i];
-        if (!nd->used) continue;
+        /* `unlinked` means the NAME is gone; the slot only survives to
+         * keep open handles valid. Listing it made `ls` show files that
+         * unlink() had already removed. */
+        if (!nd->used || nd->unlinked) continue;
         const char *name = tchild_of(dh->dir, nd->path);
         if (!name) continue;
         memset(out->name, 0, VFS_NAME_MAX);
         size_t nl = strlen(name);
         if (nl >= VFS_NAME_MAX) nl = VFS_NAME_MAX - 1;
         memcpy(out->name, name, nl);
-        out->type = nd->type;
-        out->size = nd->size;
-        out->uid  = nd->uid;
-        out->gid  = nd->gid;
-        out->mode = nd->mode;
+        /* A hard link takes its size and ownership from the owner. */
+        struct tmpfs_node *ino = tresolve(dh->m, nd);
+        out->type = ino->type;
+        out->size = ino->size;
+        out->uid  = ino->uid;
+        out->gid  = ino->gid;
+        out->mode = ino->mode;
         dh->i++;
         return VFS_OK;
     }
@@ -426,10 +613,17 @@ static int tmpfs_utimes(void *mnt, const char *path, uint64_t mtime,
 static int ttrunc(struct tmpfs_mount *m, struct tmpfs_node *nd, uint64_t len)
 {
     if (len > nd->size) {
+        size_t from = nd->size;
         int rc = tgrow(m, nd, (size_t)len);
         if (rc != VFS_OK) return rc;
-        /* tgrow zeroes the region past size, so the hole reads as zeroes --
-         * which is what extending a file must do. */
+        /* Zero the hole HERE, not in tgrow. tgrow returns early when the
+         * capacity already covers the request -- and after a shrink it
+         * always does, because the buffer is never given back. So
+         * truncate(f,3) then truncate(f,10) used to hand back bytes 3..9
+         * of the file's PREVIOUS contents. That is a stale-data leak, and
+         * POSIX says an extended file reads as zeroes. */
+        if (nd->data && (size_t)len > from)
+            memset(nd->data + from, 0, (size_t)len - from);
     }
     nd->size = (size_t)len;
     nd->mtime = tmpfs_now_secs();
@@ -471,13 +665,14 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     char o[VFS_PATH_MAX], nw[VFS_PATH_MAX];
     if (!tnorm(oldpath, o, sizeof o) || !tnorm(newpath, nw, sizeof nw))
         return VFS_ERR_INVAL;
-    struct tmpfs_node *src = tfind(m, o);
+    /* Renaming moves a NAME, so both ends are looked up as names: renaming
+     * a hard link must move that link, not the file it points at. */
+    struct tmpfs_node *src = tfind_name(m, o);
     if (!src) return VFS_ERR_NOENT;
     if (!tparent_ok(m, nw)) return VFS_ERR_NOENT;
-    struct tmpfs_node *dst = tfind(m, nw);
-    if (dst) {                                  /* POSIX: replace */
-        if (dst->data) { m->bytes -= dst->cap; kfree(dst->data); }
-        memset(dst, 0, sizeof *dst);
+    struct tmpfs_node *dst = tfind_name(m, nw);
+    if (dst && dst != src) {                    /* POSIX: replace */
+        tdrop_name(m, dst);
     }
     size_t ol = strlen(o), nl = strlen(nw);
     if (src->type == VFS_TYPE_DIR) {
@@ -495,6 +690,25 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     }
     tcopy(src->path, nw, sizeof src->path);
     src->path[sizeof src->path - 1] = '\0';
+    return VFS_OK;
+}
+
+/* Phase H: real numbers -- the mount's byte budget and node table, not
+ * the fabricated 4 GiB every statfs caller used to see. */
+static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
+{
+    struct tmpfs_mount *m = (struct tmpfs_mount *)mnt;
+    size_t files = 0;
+    for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
+        if (m->nodes[i].used) files++;
+    out->bsize      = 4096;
+    out->blocks     = (m->max_bytes + 4095) / 4096;
+    out->bfree      = (m->max_bytes > m->bytes)
+                          ? (m->max_bytes - m->bytes) / 4096 : 0;
+    out->files      = TMPFS_MAX_NODES;
+    out->ffree      = TMPFS_MAX_NODES - files;
+    out->type_magic = 0x01021994;           /* TMPFS_MAGIC */
+    out->namelen    = VFS_PATH_MAX - 1;
     return VFS_OK;
 }
 
@@ -516,8 +730,10 @@ static const struct vfs_ops tmpfs_ops = {
     .utimes    = tmpfs_utimes,
     .truncate  = tmpfs_truncate,
     .ftruncate = tmpfs_ftruncate,
+    .link      = tmpfs_link,
     .readlink  = 0,
     .umount    = 0,
+    .statfs    = tmpfs_statfs,   /* Phase H */
 };
 
 /* Parse the `size=` mount option. Accepts a plain byte count or a k/m/g

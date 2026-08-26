@@ -44,6 +44,12 @@ uint64_t perf_now_ns(void) {
 
 uint32_t perf_tsc_khz(void) { return g_tsc_khz; }
 
+/* vDSO (2026-08-23): the userspace clock computes the SAME function of
+ * the TSC as perf_now_ns, so it needs the same base. Recalibration
+ * rebases this (continuity preserved above); the vdso_refresh sweep
+ * republishes within a tick. */
+uint64_t perf_boot_tsc(void) { return g_boot_tsc; }
+
 void perf_init(void) {
     if (g_tsc_khz) return;      /* already calibrated */
 

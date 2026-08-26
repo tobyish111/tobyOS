@@ -146,6 +146,10 @@ enum file_kind {
      * namespace outlives its last member while an fd still names it (the
      * mechanism `ip netns add` pins one with). See nsproxy.c. */
     FILE_KIND_NSFD       = 24,
+    /* 2026-08-22: a REAL inotify fd. sys_inotify_init used to return a
+     * bare instance INDEX -- the first caller got 0 and then read stdin
+     * believing it was watching the filesystem. */
+    FILE_KIND_INOTIFY    = 25,
 };
 
 struct eventfd;
@@ -215,6 +219,15 @@ struct file {
      * O_RDWR via F_GETFL -- a blanket-0 fcntl made it look read-only and
      * ImmediateCrash'd. Copied across dup() in file_clone. */
     int o_accmode;
+    /* For FILE_KIND_INOTIFY: the instance index in inotify.c's table. */
+    int inotify_id;
+    /* The canonical path this handle was opened by (2026-08-22), kmalloc'd
+     * at open, cloned on dup/fork, freed at close; NULL for kinds with no
+     * path. The long-missing identity behind three audit findings at once:
+     * /proc/<pid>/fd readlink answered "/", fgetxattr/fsetxattr had no file
+     * to attach to, and glibc's fexecve fallback (/proc/self/fd/N) resolved
+     * to nothing. NOT an inode identity -- unlink/rename do not chase it. */
+    char *open_path;
 };
 
 /* eventfd flags (Linux ABI) */
@@ -267,7 +280,51 @@ struct file *console_file_make(void);
 /* Allocate a fresh struct file pointing at the same backing object as
  * `src`. For pipes this also bumps the pipe's reader/writer count, so
  * inheritance Just Works. Returns NULL on OOM. */
+/* ---- the open file description -------------------------------------------
+ *
+ * POSIX says a descriptor duplicated by dup()/dup2() or inherited across
+ * fork() shares ONE open file description with its original, and therefore
+ * one file OFFSET. tobyOS did not: file_clone() byte-copies struct vfs_file,
+ * cursor included, so parent and child each advanced their own copy. A
+ * subshell would write at offset N, the parent's offset would still be N, and
+ * the parent's next write would overwrite the child's bytes -- which is
+ * exactly what made `(echo a) >> log` and `cmd > f 2>&1` lose output.
+ *
+ * The fix reuses the side allocation that already exists. `struct file` has
+ * carried an `int *vfs_refs` since milestone 25A so that dup'd handles share
+ * one refcount; that pointer now aims at the `refs` member of this struct
+ * instead of a bare int. `refs` is deliberately FIRST, so every existing
+ * `*f->vfs_refs` read, write and kfree() keeps working unchanged, and
+ * sizeof(struct file) does not move -- which matters, because this build has
+ * no header dependency tracking and a real layout change to struct file would
+ * silently corrupt every object not rebuilt.
+ *
+ * The cursor is synchronised at the file_read/file_write boundary rather than
+ * being read through a pointer everywhere: struct vfs_file is also used
+ * standalone by drivers that know nothing about descriptors. */
+struct vfs_ofd {
+    int    refs;        /* MUST stay first: vfs_refs points here */
+    size_t pos;         /* the shared file offset */
+};
+
+/* Read/set the offset of `f`, honouring the shared description when there is
+ * one and falling back to the embedded cursor when there is not (memfd, and
+ * handles minted before the description existed). */
+size_t file_pos_get(struct file *f);
+void   file_pos_set(struct file *f, size_t pos);
+
+/* A fresh handle on the shell's own standard descriptor `fd` (0, 1 or 2).
+ *
+ * The shell stores NULL for "not redirected", which duplication turned into
+ * nothing: `echo x 1>&2` cloned a NULL and set fd 1 to NULL, i.e. back to the
+ * default, so the redirection silently did nothing. Duplication needs a real
+ * object to clone, and only the host knows what its standard descriptors are
+ * -- the kernel's are all the console, a user process's are three different
+ * files. Implemented in src/file.c and in programs/tsh/host.c. */
+struct file *file_std_handle(int fd);
+
 struct file *file_clone(struct file *src);
+void file_set_open_path(struct file *f, const char *kpath);
 
 /* Drop one fd-level reference. For pipes, this decrements the pipe's
  * reader/writer count (potentially waking the other end with EOF/EPIPE)

@@ -476,6 +476,11 @@ typedef struct {
     const char  *group_start[MAX_GROUPS];
     const char  *group_end[MAX_GROUPS];
     int          depth;
+    /* Where the accepting path ended. regexec used to try to discover
+     * this by re-running the matcher, and got it wrong; the matcher
+     * already knows, because ND_MATCH is reached with sp sitting exactly
+     * at the end of the match. */
+    const char  *match_end;
 } match_ctx;
 
 #define MAX_DEPTH 4096
@@ -488,6 +493,7 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
     while (node) {
         switch (node->type) {
         case ND_MATCH:
+            ctx->match_end = sp;
             ctx->depth--;
             return 1;
         case ND_LIT: {
@@ -646,51 +652,30 @@ int regexec(const regex_t *preg, const char *string,
         memset(ctx.group_end, 0, sizeof(ctx.group_end));
         ctx.group_start[0] = sp;
         ctx.depth = 0;
+        ctx.match_end = sp;
 
         if (match_node(&ctx, comp->start, sp)) {
             if (pmatch && nmatch > 0 && !(comp->cflags & REG_NOSUB)) {
-                /* Find how far the match consumed by re-running from
-                 * stored group info. For group 0, we need the end.
-                 * Since our match doesn't store the end position
-                 * directly, we find it by iterating. */
+                /* THE MATCH END COMES FROM THE MATCHER, NOT A GUESS.
+                 *
+                 * This block used to hunt for the end by re-running
+                 * match_node in a loop -- but every call in that loop
+                 * started from `sp` and ignored the loop variable, so the
+                 * result never varied and `best_end` simply walked to the
+                 * END OF THE STRING. rm_eo was therefore strlen(string)
+                 * for EVERY successful match, whatever it actually
+                 * matched. Nothing in the tree read rm_eo until tvi's
+                 * :s did, which is why it survived: a substitute of
+                 * /a/b/ on "aaa" produced "b", silently eating the tail.
+                 *
+                 * ND_MATCH is reached with sp exactly at the end of the
+                 * accepting path, so the matcher records it and we read
+                 * it here. One traversal, and it is correct by
+                 * construction rather than by search. */
                 pmatch[0].rm_so = (regoff_t)(sp - string);
-                /* We need to find actual end position -- try longest */
-                const char *ep = sp;
-                while (*ep) {
-                    memset(ctx.group_start, 0, sizeof(ctx.group_start));
-                    memset(ctx.group_end, 0, sizeof(ctx.group_end));
-                    ctx.group_start[0] = sp;
-                    ctx.depth = 0;
-                    ep++;
-                }
-                /* Re-match to get groups */
-                memset(ctx.group_start, 0, sizeof(ctx.group_start));
-                memset(ctx.group_end, 0, sizeof(ctx.group_end));
-                ctx.group_start[0] = sp;
-                ctx.depth = 0;
-                /* Walk the string to find the longest match endpoint */
-                const char *best_end = sp;
-                for (const char *try = (*sp ? sp + 1 : sp); ; try++) {
-                    memset(ctx.group_start, 0, sizeof(ctx.group_start));
-                    memset(ctx.group_end, 0, sizeof(ctx.group_end));
-                    ctx.group_start[0] = sp;
-                    ctx.depth = 0;
-                    if (match_node(&ctx, comp->start, sp)) {
-                        /* Match succeeded; find where in the string
-                         * the match ends by checking group_end[0] or
-                         * by testing substrings. For now use a simpler
-                         * approach. */
-                        best_end = try;
-                    }
-                    if (!*try) break;
-                }
-                /* Simple heuristic: binary-search-ish isn't worth it.
-                 * Instead, just record group 0 spanning from sp and
-                 * let the engine figure the end from the NFA traversal. */
-                pmatch[0].rm_so = (regoff_t)(sp - string);
-                pmatch[0].rm_eo = (regoff_t)(best_end - string);
-                if (pmatch[0].rm_eo <= pmatch[0].rm_so && *sp)
-                    pmatch[0].rm_eo = pmatch[0].rm_so + 1;
+                pmatch[0].rm_eo = (regoff_t)(ctx.match_end - string);
+                if (pmatch[0].rm_eo < pmatch[0].rm_so)
+                    pmatch[0].rm_eo = pmatch[0].rm_so;
                 for (size_t i = 1; i < nmatch; i++) {
                     if ((int)i <= comp->nsub && ctx.group_start[i] && ctx.group_end[i]) {
                         pmatch[i].rm_so = (regoff_t)(ctx.group_start[i] - string);

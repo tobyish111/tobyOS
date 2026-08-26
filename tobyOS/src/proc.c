@@ -204,8 +204,14 @@ struct proc *proc_slot_claim(void) {
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            /* The wake-after-death tombstone must not outlive the slot's
+             * previous occupant, or the new process is unwakeable. This
+             * is the ONE clearing point every creation path goes through
+             * (fork/vfork/clone/spawn memcpy AFTER claiming). */
+            g_proc[i].dying = false;
             return &g_proc[i];
+        }
     }
     return 0;
 }
@@ -320,6 +326,17 @@ struct proc *proc_ap_idle(uint32_t cpu, uint64_t kstack_top) {
 /* ---- per-process fd table helpers --------------------------------- */
 
 static void close_all_fds(struct proc *p) {
+    /* Exit sweep: the process's fcntl record locks die with it (flock
+     * locks die with their descriptions inside file_close below), and so
+     * do its POSIX interval timers. */
+    { extern void fl_release_proc(struct proc *p);
+      fl_release_proc(p); }
+    { extern void ptimer_release_proc(int pid);
+      ptimer_release_proc(p->is_thread ? p->tgid : p->pid); }
+    /* Phase H: apply SEM_UNDO -- a crashed semaphore holder must release
+     * what it held or every sibling deadlocks (the flag's whole point). */
+    { extern void sysv_release_proc(int tgid);
+      sysv_release_proc(p->is_thread ? p->tgid : p->pid); }
     for (int i = 0; i < PROC_NFDS; i++) {
         if (p->fds[i]) {
             file_close(p->fds[i]);
@@ -337,7 +354,9 @@ static bool install_initial_fds(struct proc *p,
                                 struct file *fd1,
                                 struct file *fd2,
                                 struct file *fd3,
-                                struct file *fd4) {
+                                struct file *fd4,
+                                const struct proc_fd_map *extra,
+                                int nextra) {
     /* fd0..fd2 default to the console; fd3/fd4 are OPTIONAL preopens
      * (slice 39: chrome's --remote-debugging-pipe reads DevTools JSON on
      * fd 3 and writes it on fd 4 -- the browser-window host hands the
@@ -357,6 +376,20 @@ static bool install_initial_fds(struct proc *p,
             return false;
         }
         p->fds[i] = nf;
+    }
+
+    /* Descriptors at chosen numbers, for `exec 3>file` and `cmd 8<<EOF`.
+     * Cloned like the fixed ones, so the caller keeps its own reference. */
+    for (int i = 0; i < nextra; i++) {
+        int fd = extra[i].fd;
+        if (fd < 0 || fd >= PROC_NFDS || !extra[i].f) continue;
+        struct file *nf = file_clone(extra[i].f);
+        if (!nf) {
+            close_all_fds(p);
+            return false;
+        }
+        if (p->fds[fd]) file_close(p->fds[fd]);
+        p->fds[fd] = nf;
     }
     return true;
 }
@@ -607,9 +640,57 @@ static bool build_kstack(struct proc *p) {
  * "fork" -- we always build a fresh PML4 + a fresh user-space image,
  * which keeps the model trivially correct for an MMU-only kernel
  * without a copy-on-write story. */
+/* Kernel-side seam for the shell's `set -m`: assign PID's process group
+ * directly. The kernel shell is trusted context -- the permission checks
+ * live in the syscall path (lx_do_setpgid); the hosted /bin/tsh reaches
+ * the same state through setpgid(2) via its host.c shim. */
+int proc_set_pgid(int pid, int pgid) {
+    struct proc *t = proc_lookup(pid);
+    if (!t) return -1;
+    t->pgid = pgid;
+    return 0;
+}
+
+/* Kernel-side WUNTRACED-style foreground wait (see proc.h). Yield-poll,
+ * the same shape as the syscall arms; the kernel shell runs as a kernel
+ * thread, so there is no syscall boundary to deliver an EINTR across. */
+int proc_wait_fg(int pid, int *stop_sig) {
+    if (stop_sig) *stop_sig = 0;
+    for (;;) {
+        struct proc *c = proc_lookup(pid);
+        if (!c) return -1;
+        if (c->state == PROC_STOPPED && !c->stop_reported) {
+            c->stop_reported = true;
+            if (stop_sig) *stop_sig = c->stop_sig > 0 ? c->stop_sig : 19;
+            return 0;
+        }
+        if (c->state == PROC_TERMINATED) return proc_wait(pid);
+        sched_yield();
+    }
+}
+
+/* Record argv for /proc/<pid>/cmdline, NUL-separated, capped. Shared by
+ * spawn (below) and execve (fork.c). */
+void proc_record_cmdline(struct proc *p, int argc, char **argv) {
+    size_t off = 0;
+    if (!p) return;
+    for (int i = 0; i < argc && argv && argv[i]; i++) {
+        size_t l = strlen(argv[i]);
+        if (off + l + 1 > sizeof p->cmdline) {
+            if (off + 1 >= sizeof p->cmdline) break;
+            l = sizeof p->cmdline - off - 1;
+        }
+        memcpy(p->cmdline + off, argv[i], l);
+        off += l;
+        p->cmdline[off++] = '\0';
+    }
+    p->cmdline_len = (uint16_t)off;
+}
+
 static int spawn_internal(const char *path, const char *name,
                           struct file *fd0, struct file *fd1, struct file *fd2,
                           struct file *fd3, struct file *fd4,
+                          const struct proc_fd_map *extra, int nextra,
                           int argc, char **argv,
                           int envc, char **envp,
                           const char *cwd_override) {
@@ -624,6 +705,7 @@ static int spawn_internal(const char *path, const char *name,
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the very end */
     p->pid       = (int)(p - g_proc);
     p->wait_pid  = -1;
+    proc_record_cmdline(p, argc, argv);   /* /proc/<pid>/cmdline */
     /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
      * is a VALID syscall number -- BKL hold time would be misattributed to
      * read()/native-0 for every proc that never made one. */
@@ -666,6 +748,11 @@ static int spawn_internal(const char *path, const char *name,
     {
         struct proc *parent = current_proc();
         p->session_id = parent ? parent->session_id : 0;
+        /* Process group: inherited, like the session tag. A parent that
+         * predates the pgid field (or pid 0 itself) reads as leading its
+         * own group. */
+        p->pgid       = (parent && parent->pgid > 0) ? parent->pgid
+                      : (parent ? parent->pid : p->pid);
         p->uid        = parent ? parent->uid        : 0;
         p->gid        = parent ? parent->gid        : 0;
         /* Linux slice 1: umask is inherited, like uid/gid. 0022 for a
@@ -751,7 +838,7 @@ static int spawn_internal(const char *path, const char *name,
     }
 
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
-    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4)) {
+    if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4, extra, nextra)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
@@ -959,7 +1046,7 @@ static int spawn_internal(const char *path, const char *name,
      * static programs -- the trailing AT_NULL is harmless to libtoby
      * crt0 (which doesn't read auxv at all today) and makes the stack
      * shape uniform across static and dynamic launches. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int             auxc = 0;
     if (ok) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PHDR,   prog_info.phdr_va  };
@@ -971,18 +1058,40 @@ static int spawn_internal(const char *path, const char *name,
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE          };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                  };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                  };
+        /* Real credentials (2026-08-22; were hardcoded 0). glibc reads
+         * AT_SECURE to decide secure-mode (ignore LD_* env, etc.) and
+         * compares AT_EUID against geteuid() -- both lie if these do.
+         * Translated at the user-namespace reporting boundary, same as
+         * getuid/stat/procfs (slice 11's rule). */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP2, 0                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_MINSIGSTKSZ, 2048       };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100                };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u     };
         /* AT_RANDOM: 16 bytes a Linux libc reads for its stack canary.
          * Point at the 16-byte scratch pad pack_user_stack always leaves
          * at the very top of the (zeroed) user stack -- valid + readable.
          * Slice 87: seed with CSPRNG after packing (was left zero). */
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): same contract as the execve arm (fork.c) --
+         * map into the fresh address space, advertise via auxv, omit the
+         * entry entirely when unavailable. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(p->cr3);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
     }
 
     /* Default RSP if no argv -- pack a canonical
@@ -1063,7 +1172,7 @@ static int spawn_internal(const char *path, const char *name,
 
 int proc_create_from_elf(const char *path, const char *name) {
     /* Default: console for fd 0/1/2, no argv, no envp, inherit cwd. */
-    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    return spawn_internal(path, name, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 }
 
 /* Ring-0 kernel worker: no user half, no ELF, no fds. Same PCB + fake
@@ -1117,6 +1226,7 @@ int proc_spawn(const struct proc_spec *spec) {
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
                              spec->fd3, spec->fd4,
+                             spec->extra_fds, spec->extra_nfds,
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);
@@ -1276,6 +1386,7 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             if (q == p || q->state == PROC_UNUSED ||
                 q->state == PROC_EMBRYO) continue;
             if (!(q->tgid == tgid || q->pid == tgid)) continue;
+            q->dying = true;                 /* tombstone before state */
             q->exit_code = code;
             q->state = PROC_TERMINATED;
             struct proc *w = q->join_waiters;
@@ -1288,6 +1399,8 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             }
             q->join_waiters = 0;
             sched_dequeue(q);
+            /* Phase F: robust-mutex stamps before the futex state is gone. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
             /* Slice 89: a member parked in cow_fork_lock_acquire's quiesce
@@ -1337,6 +1450,68 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
     proc_exit(code);
 }
 
+/* Force-terminate every non-leader thread of leader `p` (Phase F: factored
+ * from proc_exit so sys_execve can reap the group pre-commit -- POSIX says
+ * exec from the leader kills the other threads; before this, an exec'd
+ * image ran with the old image's threads still scheduled on page tables
+ * about to be replaced). The BKL must NOT be held: the off-CPU wait spins
+ * on remote cores that may be stuck in bkl_enter. Runs on the group's live
+ * address space -- each sibling's robust-mutex list is walked before its
+ * futex state is forgotten. */
+void proc_reap_group_threads(struct proc *p, int code) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == p || q->state == PROC_UNUSED ||
+            q->state == PROC_EMBRYO) continue;
+        if (q->tgid == p->pid && q->is_thread) {
+            /* Force-terminate the thread */
+            q->dying = true;                 /* tombstone before state */
+            q->exit_code = code;
+            q->state = PROC_TERMINATED;
+            /* Wake any joiners */
+            struct proc *w = q->join_waiters;
+            while (w) {
+                struct proc *nxt = w->next_wait;
+                w->state = PROC_READY;
+                w->next_wait = 0;
+                sched_enqueue(w);
+                w = nxt;
+            }
+            q->join_waiters = 0;
+            /* Remove it from the ready queue BEFORE freeing its stack. A
+             * force-terminated sibling that was PROC_READY is still linked
+             * in a run queue; freeing its kstack and marking the slot
+             * UNUSED without unlinking leaves the scheduler able to pop it
+             * and switch in with kstack_top == NULL -> triple fault in
+             * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
+             * kstack_top=0x0.) */
+            sched_dequeue(q);
+            /* Phase F: the dying sibling's held robust mutexes must be
+             * stamped while the shared address space is still live. */
+            { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
+            { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
+            { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Slice 88: wait until the sibling is off-CPU before freeing
+             * its kstack -- sched_dequeue does not stop a thread still
+             * running on another core.
+             * Slice 89: release a quiesce-parked spinner first, and bound
+             * the wait (see proc_exit_group -- same hang, same fix). */
+            __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
+            if (!proc_wait_off_cpu_bounded(q)) {
+                kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
+                        "kstack NOT freed\n", q->pid);
+                continue;
+            }
+            /* Free the thread's kernel stack */
+            if (q->kstack_base) kfree(q->kstack_base);
+            q->kstack_base = 0;
+            q->kstack_top  = 0;
+            nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
+            q->state = PROC_UNUSED;
+        }
+    }
+}
+
 __attribute__((noreturn)) void proc_exit(int code) {
     struct proc *p = current_proc();
 
@@ -1358,6 +1533,15 @@ __attribute__((noreturn)) void proc_exit(int code) {
     /* Track B graphics: flush a Linux /dev/fb0 mmap to the display while this
      * process's pages are still mapped (before cli()/teardown below). */
     if (p) fbdev_proc_exit(p->is_thread ? p->tgid : p->pid);
+
+    /* Phase F: walk this thread's glibc robust-mutex list while its user
+     * memory is still mapped -- held robust mutexes get FUTEX_OWNER_DIED
+     * and one waiter woken, so the next lock() reports EOWNERDEAD instead
+     * of hanging. Same placement constraints as clear_child_tid below. */
+    if (p) {
+        extern void futex_robust_exit(struct proc *);
+        futex_robust_exit(p);
+    }
 
     /* B11: Linux pthread_join. If this thread registered a clear_child_tid
      * (via clone(CLONE_CHILD_CLEARTID) or set_tid_address), write 0 to that
@@ -1407,6 +1591,18 @@ __attribute__((noreturn)) void proc_exit(int code) {
         }
     }
 
+    /* SIGCHLD to the parent. The header of signal.c has promised this
+     * since M1 and NOTHING ever sent it. bash's job table only updates
+     * through its SIGCHLD handler; without the signal a job killed while
+     * stopped stayed "stopped" in bash's books and an interactive `exit`
+     * refused with "There are stopped jobs." forever. Default disposition
+     * is ignore, so parents that don't care see nothing. Same
+     * before-cli() reasoning as the namespace block above. */
+    if (p && !p->is_thread && p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
+
     cli();
 
     p->exit_code   = code;
@@ -1423,53 +1619,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
          * bkl_enter would never leave the CPU while we hold the lock. */
         if (bkl_held()) bkl_exit();
         /* Leader exiting -- kill all threads in this group */
-        for (int i = 0; i < PROC_MAX; i++) {
-            struct proc *q = &g_proc[i];
-            if (q == p || q->state == PROC_UNUSED ||
-                q->state == PROC_EMBRYO) continue;
-            if (q->tgid == p->pid && q->is_thread) {
-                /* Force-terminate the thread */
-                q->exit_code = code;
-                q->state = PROC_TERMINATED;
-                /* Wake any joiners */
-                struct proc *w = q->join_waiters;
-                while (w) {
-                    struct proc *nxt = w->next_wait;
-                    w->state = PROC_READY;
-                    w->next_wait = 0;
-                    sched_enqueue(w);
-                    w = nxt;
-                }
-                q->join_waiters = 0;
-                /* Remove it from the ready queue BEFORE freeing its stack. A
-                 * force-terminated sibling that was PROC_READY is still linked
-                 * in a run queue; freeing its kstack and marking the slot
-                 * UNUSED without unlinking leaves the scheduler able to pop it
-                 * and switch in with kstack_top == NULL -> triple fault in
-                 * syscall_entry. (Measured: pid=27 is_thread=1 tgid=17,
-                 * kstack_top=0x0.) */
-                sched_dequeue(q);
-                { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
-                { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
-                /* Slice 88: wait until the sibling is off-CPU before freeing
-                 * its kstack -- sched_dequeue does not stop a thread still
-                 * running on another core.
-                 * Slice 89: release a quiesce-parked spinner first, and bound
-                 * the wait (see proc_exit_group -- same hang, same fix). */
-                __atomic_store_n(&q->vm_quiesce, 0, __ATOMIC_RELEASE);
-                if (!proc_wait_off_cpu_bounded(q)) {
-                    kprintf("[exitg] pid=%d never left cpu -- slot leaked, "
-                            "kstack NOT freed\n", q->pid);
-                    continue;
-                }
-                /* Free the thread's kernel stack */
-                if (q->kstack_base) kfree(q->kstack_base);
-                q->kstack_base = 0;
-                q->kstack_top  = 0;
-                nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
-                q->state = PROC_UNUSED;
-            }
-        }
+        proc_reap_group_threads(p, code);
         /* Slice 89: close under the BKL -- file_close refcounts are plain
          * ints guarded ONLY by the BKL, and this path runs with it dropped;
          * unlocked closes raced other CPUs' open/close/dup on the shared
@@ -1495,6 +1645,12 @@ __attribute__((noreturn)) void proc_exit(int code) {
         p->join_waiters = 0;
     }
 
+    /* Tombstone at the point of no return (2026-08-23): teardown ABOVE
+     * may legitimately block and be woken (lingering TCP close waits on
+     * the net tick), so the flag arms only HERE -- past this store the
+     * proc does nothing but yield away forever, and any wake is the
+     * wake-after-death bug sched_enqueue now refuses and names. */
+    p->dying       = true;
     p->state       = PROC_TERMINATED;
 
     /* Milestone 19 metric: one more process exited. */

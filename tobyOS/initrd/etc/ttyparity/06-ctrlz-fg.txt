@@ -1,0 +1,13 @@
+# The ^Z contract, end to end: the pty's ISIG sends SIGTSTP to the
+# foreground GROUP; the shell's WUNTRACED wait sees the stop, takes the
+# terminal back, and reports the job; fg resumes it and ^C then kills it.
+# $? after the stop is 128+SIGTSTP in both shells (both read the same
+# kernel's signal numbers).
+sleep 30
+%CTRLZ%
+echo "rc=$?"
+jobs
+fg
+%CTRLC%
+echo "after=$?"
+exit 0

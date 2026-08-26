@@ -155,4 +155,37 @@ struct limine_rsdp_request {
     struct limine_rsdp_response *response;
 };
 
+/* ---- SMBIOS / DMI entry points ----
+ *
+ * Same deal as the RSDP request above: the firmware puts the SMBIOS entry
+ * point either in the BIOS F-segment (legacy) or in a UEFI configuration
+ * table, and only the bootloader is in a position to know which. Asking
+ * Limine covers both; src/smbios.c still keeps the 0xF0000 scan as a
+ * fallback so a BIOS boot works even if this response is absent.
+ *
+ * entry_32 is the 2.1 "_SM_" structure, entry_64 the 3.0 "_SM3_" one;
+ * either may be NULL, and on a machine with no SMBIOS at all both are.
+ *
+ * The magic was VERIFIED against limine/BOOTX64.EFI rather than recalled:
+ * both halves appear 10 bytes apart in the same table as the RSDP magic
+ * this kernel already uses, and an invented control magic is absent. A
+ * wrong id here would leave the response NULL, which is indistinguishable
+ * from "this machine has no SMBIOS" -- exactly the kind of silent
+ * miss this arc exists to avoid. */
+
+#define LIMINE_SMBIOS_REQUEST \
+    { LIMINE_COMMON_MAGIC, 0x9e9046f11e095391, 0xaa4a520fefbde5ee }
+
+struct limine_smbios_response {
+    uint64_t revision;
+    void    *entry_32;  /* "_SM_"  entry point, or NULL */
+    void    *entry_64;  /* "_SM3_" entry point, or NULL */
+};
+
+struct limine_smbios_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_smbios_response *response;
+};
+
 #endif /* TOBYOS_LIMINE_H */

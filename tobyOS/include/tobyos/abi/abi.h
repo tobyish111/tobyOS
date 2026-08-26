@@ -121,7 +121,13 @@ extern "C" {
  * above -- adding new ones is explicitly safe per the stability promise. */
 #define ABI_EINTR            4   /* interrupted system call */
 #define ABI_ENOTEMPTY       39   /* directory not empty (rmdir) */
+#define ABI_ENOLCK          37   /* no record locks available (table full) */
 #define ABI_ENODEV          19   /* no such device / unknown filesystem type */
+#define ABI_ENODATA         61   /* no such extended attribute (Linux ENODATA) */
+#define ABI_ENOTSUP         95   /* operation not supported (EOPNOTSUPP) */
+#define ABI_EXDEV           18   /* hard link across filesystems */
+#define ABI_ENOMSG          42   /* no message of desired type (msgrcv) */
+#define ABI_EIDRM           43   /* IPC id was removed */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)
@@ -1025,8 +1031,61 @@ struct abi_vizmap {
 #define ABI_SYS_SETUID          189
 #define ABI_SYS_SETGID          190
 
+/* Job control: real process groups (the shell's `set -m` contract).
+ * SETPGID(pid, pgid) follows POSIX: pid 0 means self, pgid 0 means the
+ * target's own pid. GETPGID(pid), pid 0 for self. Both route into the
+ * same implementation the Linux personality's setpgid/getpgid use --
+ * one process-group model, two ABIs, per the shared-semantics rule
+ * above. */
+#define ABI_SYS_SETPGID         191
+#define ABI_SYS_GETPGID         192
+/* ioctl(fd, req, argp). Routed through the Linux personality's ioctl arm,
+ * so the tty/pty control surface (TIOC*, TC*) is ONE implementation for
+ * both ABIs. Added for the interactive parity gate, which needs the
+ * openpty handshake (TIOCGPTN) from a native program. */
+#define ABI_SYS_IOCTL           193
+
+/* ---- 2026-08-24: the write-side calls the native ABI never had ----
+ *
+ * libtoby carried these as ENOSYS stubs ("the kernel doesn't expose these
+ * yet") and rename() as a read-copy-write-unlink emulation that could not
+ * move a directory and was not atomic. The kernel had all three the whole
+ * time -- vfs_truncate/vfs_rename exist and the LINUX personality already
+ * routes truncate(2)/renameat(2) to them -- so a busybox binary could do
+ * what a native tobyOS program could not, on the same filesystem. */
+#define ABI_SYS_TRUNCATE        194  /* (const char *path, uint64 len) -> 0|-E */
+#define ABI_SYS_FTRUNCATE       195  /* (int fd, uint64 len)          -> 0|-E */
+#define ABI_SYS_RENAME          196  /* (const char *old, const char *new) */
+/* rmdir(2) proper. libtoby's rmdir() was an alias for unlink(), so
+ * `rmdir somefile` removed the FILE instead of reporting ENOTDIR. */
+#define ABI_SYS_RMDIR           197  /* (const char *path) -> 0|-E */
+/* utimes: set a path's timestamps, in EPOCH SECONDS. (uint64_t)-1 in
+ * either field means "now", which is how touch(1) spells its default.
+ * `touch existingfile` used to open() it and close it again, which does
+ * not change a timestamp on any filesystem -- so the one command whose
+ * entire job is updating an mtime never updated one. */
+#define ABI_SYS_UTIMES          198  /* (path, mtime_sec, atime_sec) -> 0|-E */
+
+/* Genuinely MONOSPACED window text: 8x16 VGA cell, fixed 8px advance, opaque
+ * background.
+ *
+ * ABI_SYS_GUI_TEXT was the bitmap call until C18c rewired it to render
+ * proportional TrueType whenever a font is loaded -- which is every boot. The
+ * toolkit's tk_draw_text_mono() still pointed at it and still described itself
+ * as column-aligned, so every character grid built on it (the terminal) placed
+ * its cells at column*8 and rendered them at Lato's widths. The `bg` argument
+ * was dropped entirely too, so cell background colours never painted.
+ *
+ * a2 = (x & 0xFFFF) | (y << 16) | (cell_h << 32). cell_h is the caller's ROW
+ * PITCH -- the glyph is centred in it and clipped, and the opaque background
+ * covers exactly that many rows. It has to be a parameter because the callers
+ * disagree: the terminal is 16, gui_edit and gui_browser are 12, gui_viewer is
+ * 14, and painting 16 rows into a 12-row pitch erases the top of the line
+ * below. 0 means the font's own 16. */
+#define ABI_SYS_GUI_TEXT_MONO   199  /* (fd, xy|cell_h<<32, str, fg, bg) */
+
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          191
+#define ABI_SYS_NR_MAX          200
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
@@ -1332,6 +1391,12 @@ _Static_assert(sizeof(struct abi_dev_info) == 16 + ABI_DEVT_NAME_MAX +
 #define ABI_BLK_F_TOBYFS   0x10u  /* tobyfs superblock found             */
 #define ABI_BLK_F_RAM      0x20u  /* RAM-backed (contents lost on boot)  */
 #define ABI_BLK_F_GONE     0x40u  /* hardware removed                    */
+/* Removable media (USB mass storage). The one flag ABI_PROV_F_ERASE is
+ * gated on, so a listing must show it: it is the difference between "this
+ * stick is yours to reformat" and "this is a fixed disk and no flag will
+ * touch it". Reported in `flags` rather than a new struct field because
+ * abi_blk_info's layout is frozen at 160 bytes. */
+#define ABI_BLK_F_REMOVABLE 0x80u
 
 #define ABI_BLK_NAME_MAX   32
 #define ABI_BLK_MODEL_MAX  44
@@ -1372,6 +1437,42 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * does NOT unlock foreign filesystems / partition tables -- those are
  * refused unconditionally in the kernel. */
 #define ABI_PROV_F_FORCE   0x1u
+
+/* ERASE: reformat a REMOVABLE device that carries a foreign filesystem.
+ *
+ * 2026-08-25. Strictly stronger than FORCE and deliberately a separate
+ * bit, because it authorises DESTROYING SOMEBODY ELSE'S DATA. The guard's
+ * blanket "foreign is never writable" is right for anything automatic, and
+ * wrong as an absolute: an owner must be able to reformat their own USB
+ * stick, which is all `mkfs` has ever been.
+ *
+ * What it does NOT unlock, in the kernel, regardless of the flag:
+ *   - anything not marked blk_dev.removable -- an internal disk holding
+ *     someone's Windows install can never be reached this way;
+ *   - an iso9660 volume, i.e. the live boot medium we are running from;
+ *   - a device backing a live mount.
+ * The userspace caller is expected to name the device and confirm; the
+ * kernel re-checks all of the above regardless of what it was told. */
+#define ABI_PROV_F_ERASE   0x2u
+
+/* FORMAT_ONLY: lay a tobyfs filesystem across the WHOLE device and stop.
+ * No partition table, no /data takeover.
+ *
+ * 2026-08-25. Provisioning answers "make this my persistent /data", which
+ * is not the same question as "format this USB stick so I can put files on
+ * it" -- the second stick in a machine wants a filesystem and a mount
+ * point, not to become the system volume. A whole-disk tobyfs is what
+ * `mount -t tobyfs <dev> /mnt/usb` wants, and busybox's mount applet
+ * already ships.
+ *
+ * The guard is identical -- this flag changes WHAT IS WRITTEN, never WHO
+ * MAY BE WRITTEN TO. ERASE is still required for a foreign filesystem, and
+ * a fixed disk / the live boot medium / a mounted volume are still refused.
+ *
+ * Note the volume is a valid tobyfs, so a later boot with no other
+ * candidate can adopt it as /data through the existing whole-disk sweep.
+ * The CLI says so rather than letting that be a surprise. */
+#define ABI_PROV_F_FORMAT_ONLY 0x4u
 
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
@@ -1529,6 +1630,10 @@ _Static_assert(sizeof(struct abi_display_info) ==
  *  waitpid flags
  * ============================================================ */
 #define ABI_WNOHANG     0x1   /* don't block; return 0 if no child ready */
+#define ABI_WUNTRACED   0x2   /* also report job-control stops (status
+                               * 0x10000|sig -- the Linux 0x7f byte would
+                               * collide with a real `exit 127`) */
+#define ABI_WCONTINUED  0x4   /* also report SIGCONT resumes (status 0x20000) */
 
 /* ============================================================
  *  stat structure
@@ -1564,7 +1669,16 @@ struct abi_stat {
     uint32_t uid;
     uint32_t gid;
     uint32_t _reserved0; /* padding for forward ABI growth */
-    uint64_t _reserved1[2];
+    /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS, claimed out of the
+     * two spare words this struct reserved for exactly this. sizeof is
+     * unchanged, so nothing built against the old layout shifts.
+     *
+     * Until now the native ABI had no way to REPORT a file time (and
+     * none to set one), which is why `touch -m` had nothing to preserve
+     * and native `ls -l` had nothing to print. 0 means the filesystem
+     * has no answer, matching struct vfs_stat. */
+    uint64_t mtime;      /* last data modification */
+    uint64_t atime;      /* last access (best effort) */
 };
 
 /* ============================================================
@@ -1592,6 +1706,15 @@ struct abi_stat {
  * child is enqueued and ready to run. Use SYS_WAITPID to block on
  * the child's exit.
  */
+/* One descriptor above 2, handed to the child at a chosen number. `parent_fd`
+ * names a descriptor in the CALLER's table; the kernel clones it. */
+struct abi_spawn_fd {
+    int child_fd;
+    int parent_fd;
+};
+
+#define ABI_SPAWN_EXTRA_MAX 16      /* bound on nextra, so the copy-in is finite */
+
 struct abi_spawn_req {
     const char         *path;
     char *const        *argv;       /* NULL-terminated */
@@ -1600,6 +1723,12 @@ struct abi_spawn_req {
     int                 fd1;
     int                 fd2;
     uint32_t            flags;
+    /* Descriptors above 2. Appended, and zero means NONE, so a caller that
+     * predates these fields is unaffected -- which is the only reason it is
+     * safe to grow a struct the syscall layer copies in wholesale. A shell
+     * needs them for `exec 3>file` and `cmd 8<<EOF`; nothing else passes any. */
+    uint32_t                    nextra;
+    const struct abi_spawn_fd  *extra;
 };
 
 /* fd0/fd1/fd2 sentinels for spawn_req. */
@@ -1679,6 +1808,9 @@ struct abi_dirent {
 #define ABI_AT_CLKTCK   17      /* frequency of times() ticks */
 #define ABI_AT_SECURE   23      /* nonzero if this is a secure exec */
 #define ABI_AT_RANDOM   25      /* ptr to 16 random bytes (libc stack canary) */
+#define ABI_AT_HWCAP2   26      /* extended capability mask (0: none claimed) */
+#define ABI_AT_MINSIGSTKSZ 51   /* minimum signal-frame stack (glibc sysconf) */
+#define ABI_AT_SYSINFO_EHDR 33  /* vDSO base address (2026-08-23) */
 /* Minimal x86-64 HWCAP: FPU|VME|DE|PSE|TSC|MSR|PAE|MCE|CX8|APIC|SEP|MTRR|
  * PGE|MCA|CMOV|PAT|PSE36|CLFLUSH|MMX|FXSR|SSE|SSE2 — enough for glibc/GLib
  * feature probes that abort when getauxval(AT_HWCAP) is missing entirely. */

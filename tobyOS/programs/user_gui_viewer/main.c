@@ -30,6 +30,15 @@ static void offset_to_hex8(char *o,long off){ const char *h="0123456789ABCDEF"; 
 #define PAD 6
 #define CELL_W 8
 #define CELL_H 14
+
+/* 2026-08-24: this file draws a CHARACTER GRID at CELL_W=8 columns, and
+ * tk_draw_text_mono() finally delivers one -- it used to route to the
+ * proportional TrueType renderer, so the columns never lined up and the
+ * opaque background was dropped. The fixed cell is 8x16, taller than this
+ * file's row pitch, so go through tk_draw_text_cell() to keep the pitch:
+ * the glyph is centred in CELL_H and clipped, and the background covers
+ * exactly CELL_H rows instead of bleeding into the line below. */
+#define TK_MONO(w,x,y,s,fg,bg) tk_draw_text_cell((w),(x),(y),(s),(fg),(bg),CELL_H)
 #define CONTENT_Y TOOLBAR_H
 #define CONTENT_H (WIN_H-TOOLBAR_H-STATUS_H)
 #define ROWS (CONTENT_H/CELL_H)
@@ -82,13 +91,13 @@ static struct tk_window win;
 
 static void draw_toolbar(struct tk_window *w){
     tk_draw_fill(w,0,0,WIN_W,TOOLBAR_H,COL_TOOLBAR);
-    tk_draw_text_mono(w,8,9,"Text",(g_mode==MODE_TEXT)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
-    tk_draw_text_mono(w,44,9,"|",COL_DIM,COL_TOOLBAR);
-    tk_draw_text_mono(w,56,9,"Hex",(g_mode==MODE_HEX)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
-    tk_draw_text_mono(w,96,9,"Search",COL_TEXT,COL_TOOLBAR);
+    TK_MONO(w,8,9,"Text",(g_mode==MODE_TEXT)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
+    TK_MONO(w,44,9,"|",COL_DIM,COL_TOOLBAR);
+    TK_MONO(w,56,9,"Hex",(g_mode==MODE_HEX)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
+    TK_MONO(w,96,9,"Search",COL_TEXT,COL_TOOLBAR);
     int plen=(int)my_strlen(g_path); int maxp=(WIN_W-160)/CELL_W;
     const char *disp=g_path; if(plen>maxp)disp=g_path+(plen-maxp);
-    tk_draw_text_mono(w,WIN_W-(int)my_strlen(disp)*CELL_W-8,9,disp,COL_DIM,COL_TOOLBAR);
+    TK_MONO(w,WIN_W-(int)my_strlen(disp)*CELL_W-8,9,disp,COL_DIM,COL_TOOLBAR);
 }
 static void draw_status(struct tk_window *w){
     int sy=WIN_H-STATUS_H; tk_draw_fill(w,0,sy,WIN_W,STATUS_H,COL_STATUS);
@@ -106,7 +115,7 @@ static void draw_status(struct tk_window *w){
     if(g_mode==MODE_TEXT){ status[pos++]='T';status[pos++]='E';status[pos++]='X';status[pos++]='T'; }
     else { status[pos++]='H';status[pos++]='E';status[pos++]='X'; }
     status[pos]='\0';
-    tk_draw_text_mono(w,8,sy+5,status,COL_TEXT,COL_STATUS);
+    TK_MONO(w,8,sy+5,status,COL_TEXT,COL_STATUS);
 }
 static void draw_text_mode(struct tk_window *w){
     int y=CONTENT_Y; char lnum[8];
@@ -115,7 +124,7 @@ static void draw_text_mode(struct tk_window *w){
         uint32_t line_bg=(li==g_found_line)?COL_FOUND:COL_BG;
         tk_draw_fill(w,0,y,GUTTER_W,CELL_H,COL_GUTTER);
         uint_to_dec(lnum,li+1); int nlen=(int)my_strlen(lnum); int gx=GUTTER_W-(nlen+1)*CELL_W; if(gx<2)gx=2;
-        tk_draw_text_mono(w,gx,y+1,lnum,COL_DIM,COL_GUTTER);
+        TK_MONO(w,gx,y+1,lnum,COL_DIM,COL_GUTTER);
         if(li==g_found_line)tk_draw_fill(w,GUTTER_W,y,WIN_W-GUTTER_W,CELL_H,COL_FOUND);
         long start=g_line_off[li], end=(li+1<g_line_count)?g_line_off[li+1]:g_size;
         if(end>start&&g_buf[end-1]=='\n')end--;
@@ -123,7 +132,7 @@ static void draw_text_mode(struct tk_window *w){
         char line[TEXT_COLS+1];
         for(long k=0;k<len;k++){ char c=g_buf[start+k]; if(c<0x20||c>0x7E)c='.'; line[k]=c; }
         line[len]='\0';
-        tk_draw_text_mono(w,GUTTER_W+PAD,y+1,line,COL_TEXT,line_bg);
+        TK_MONO(w,GUTTER_W+PAD,y+1,line,COL_TEXT,line_bg);
         y+=CELL_H;
     }
 }
@@ -139,7 +148,7 @@ static void draw_hex_mode(struct tk_window *w){
         line[pos++]='|'; line[pos++]=' ';
         for(int i=0;i<16;i++){ if(i<count){ uint8_t c=(uint8_t)g_buf[off+i]; line[pos++]=(c>=0x20&&c<=0x7E)?(char)c:'.'; } else line[pos++]=' '; }
         line[pos]='\0';
-        tk_draw_text_mono(w,PAD,y+1,line,COL_TEXT,COL_BG);
+        TK_MONO(w,PAD,y+1,line,COL_TEXT,COL_BG);
         y+=CELL_H;
     }
 }
@@ -149,7 +158,7 @@ static void draw_search_bar(struct tk_window *w){
     char bar[SEARCH_MAX+12]; bar[0]='/'; bar[1]=' '; int p=2;
     for(int i=0;i<g_search_len&&p<(int)sizeof(bar)-2;i++)bar[p++]=g_search[i];
     bar[p++]='_'; bar[p]='\0';
-    tk_draw_text_mono(w,8,by+6,bar,COL_ACCENT,COL_TOOLBAR);
+    TK_MONO(w,8,by+6,bar,COL_ACCENT,COL_TOOLBAR);
 }
 static void paint(struct tk_window *w,struct tk_widget *c){
     (void)c;
@@ -164,6 +173,13 @@ static int toolbar_hit(int x,int y){ if(y<0||y>=TOOLBAR_H)return 0; if(x>=4&&x<4
 
 static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
     (void)c;
+    if(ev->type==TK_EV_WHEEL){
+        if(!ev->wheel)return;
+        if(ev->wheel>0)scroll_up((int)ev->wheel*TK_WHEEL_LINES);
+        else           scroll_down((int)-ev->wheel*TK_WHEEL_LINES);
+        tk_redraw(w);
+        return;
+    }
     if(ev->type!=TK_EV_MOUSE_DOWN)return;
     int hit=toolbar_hit(ev->x,ev->y);
     if(hit==1&&g_mode!=MODE_TEXT){ g_mode=MODE_TEXT; g_top_line=0; tk_redraw(w); }

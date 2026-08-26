@@ -45,6 +45,7 @@
 #include <tobyos/perf.h>
 #include <tobyos/percpu.h>
 #include <tobyos/smp.h>
+#include <tobyos/klibc.h>    /* memset -- sched_guard_selftest's fake proc */
 #include <tobyos/spinlock.h>
 #include <tobyos/watchdog.h>
 #include <tobyos/pit.h>
@@ -349,6 +350,25 @@ static struct proc *queue_pop_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
+        /* Wake-after-death, second net (2026-08-23): a proc that was
+         * enqueued BEFORE its exit reached the tombstone store can still
+         * sit here -- the sched_enqueue guard cannot see history.
+         * Switching into it resumes a TERMINATED context and proc_exit's
+         * "sched_yield returned" panic fires (observed ~1/13 boots).
+         * Unlink it in place and say so; the stale entry is the crime
+         * scene this line photographs. */
+        if (p->dying) {
+            struct proc *nx = p->next_ready;
+            kprintf("[sched] DROPPED queued dying pid=%d '%s' (state=%d)\n",
+                    p->pid, p->name ? p->name : "?", (int)p->state);
+            if (prev) prev->next_ready = nx;
+            else      cpu->ready_head  = nx;
+            if (cpu->ready_tail == p) cpu->ready_tail = prev;
+            p->next_ready = 0;
+            p->on_rq      = false;
+            p = nx;
+            continue;
+        }
         /* Slice 39: skip procs whose context save hasn't completed (still
          * live on some CPU). They stay queued; the next pop after
          * sched_finish_switch clears on_cpu gets them with a VALID context.
@@ -401,9 +421,12 @@ static struct proc *queue_steal_locked(struct percpu *cpu) {
     struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
     int best_eff = 0;
     while (p) {
-        /* Skip idle procs (pinned) and on_cpu procs (context not yet saved
-         * -- see queue_pop_locked / ledger slice 39). */
-        if (!p->is_idle && !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+        /* Skip idle procs (pinned), on_cpu procs (context not yet saved
+         * -- see queue_pop_locked / ledger slice 39), and dying procs
+         * (2026-08-23: never steal a corpse; the home queue's pop guard
+         * unlinks and logs it). */
+        if (!p->is_idle && !p->dying &&
+            !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
             int eff = eff_prio(p, now);
             if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
         }
@@ -474,8 +497,168 @@ static struct proc *steal_one(struct percpu *me) {
  * SYSCALL stack/TLS/FPU, then the register switch. `reacquire_bkl` re-takes
  * the BKL when `from` resumes (the caller released it before switching away).
  * Shared by sched_yield and the AP idle loop. */
+/* Is `to`'s saved context plausible enough to LOAD?
+ *
+ * 2026-08-25, against the open wake-after-death flake. Every validation
+ * do_switch had was behind #ifdef CHROMIUM_BOOT, so the SHIPPED kernel
+ * switched into whatever the proc table said without looking -- and the
+ * recorded mechanism of that flake is precisely "do_switch loads a garbage
+ * saved context and jumps to a wild rip". The two archived corpses agree:
+ * one had rip=0xb2f64d1bef, the other a user stack address arriving as a
+ * syscall number. Both are what you get after restoring a saved_rsp that
+ * does not point at a real kernel stack.
+ *
+ * THE RSP RANGE CHECK IS THE NEW ONE. proc_context_switch restores rsp from
+ * this field and returns through it; if it does not point INSIDE this
+ * proc's own kernel stack, the `ret` goes wherever the garbage says. Two
+ * compares to find that out.
+ *
+ * DELIBERATELY CHEAP -- this is on every context switch. vmm_pml4_is_live()
+ * walks 256 PML4 entries and stays behind CHROMIUM_BOOT; what is left here
+ * is a handful of compares, next to nothing beside the fpu_save, CR3 reload
+ * and three MSR writes this function already does.
+ *
+ * This is a NET, not a cure: the flake is still not root-caused. But it
+ * turns a wild jump into a logged, survivable skip, and the log finally
+ * names WHICH proc and WHAT was wrong -- which is the evidence every
+ * previous fire lacked. */
+static bool sched_ctx_plausible(struct proc *to, const char **why) {
+    if (!to) { *why = "null proc"; return false; }
+    if (to->pid == 0 || to->is_idle) return true;   /* idle: kernel-owned */
+    if (to->state == PROC_UNUSED)  { *why = "state=UNUSED";  return false; }
+    if (to->state == PROC_EMBRYO)  { *why = "state=EMBRYO";  return false; }
+    /* NOT `dying`. It was in this list for one battery run and cost
+     * ttyparity's 07-jobspec case: a killed job reported "[1]+ Exit 143"
+     * where bash says "[1]  Exit 143" -- one character, and the sign of a
+     * job whose teardown had been stranded.
+     *
+     * The tombstone is set just before PROC_TERMINATED precisely BECAUSE
+     * teardown may block (see the flake notes), so a proc can legitimately
+     * be marked dying and still owe one more scheduling to finish. The
+     * enqueue side already refuses to WAKE dying procs; refusing to RESUME
+     * one is a different and wrong thing. It also buys nothing against the
+     * corruption this guard is for -- proc_slot_claim clears the flag, so a
+     * recycled slot reads dying=false anyway. */
+    uint64_t top = (uint64_t)to->kstack_top;
+    if (!top)                      { *why = "no kstack";     return false; }
+    if (!to->saved_rsp)            { *why = "saved_rsp=0";   return false; }
+    if (to->saved_rsp > top || to->saved_rsp < top - PROC_KSTACK_SZ) {
+        *why = "saved_rsp outside its own kstack";
+        return false;
+    }
+    return true;
+}
+
+/* Prove the predicate above, case by case.
+ *
+ * A guard against a ~1-in-15-boot flake will almost never fire on demand,
+ * so "it did not crash" is no evidence that it works. sched_ctx_plausible
+ * is a pure function of a struct proc, which means it can be asked
+ * directly -- including the corpse shapes the archived fingerprints
+ * describe. Compiled unconditionally, called from kernel.c only under
+ * -DSCHEDGUARD_SELFTEST (the pattern provision_selftest uses, and for the
+ * same reason: EXTRA_CFLAGS does not trigger recompiles, so a definition
+ * behind the flag link-fails when only kernel.c is touched). */
+int sched_guard_selftest(void) {
+    static uint8_t fake_stack[PROC_KSTACK_SZ] __attribute__((aligned(16)));
+    uint64_t top = (uint64_t)(uintptr_t)(fake_stack + PROC_KSTACK_SZ);
+    int fails = 0;
+    const char *why;
+
+    struct proc p;
+    memset(&p, 0, sizeof p);
+    p.pid        = 42;
+    p.state      = PROC_READY;
+    p.kstack_top = (void *)(uintptr_t)top;
+    p.saved_rsp  = top - 512;              /* a plausible mid-stack rsp */
+
+#define GCHECK(expect, label) do {                                            \
+        why = "?";                                                            \
+        bool got = sched_ctx_plausible(&p, &why);                             \
+        if (got != (expect)) {                                                \
+            kprintf("[SCHEDGUARD] FAIL %-34s got=%d want=%d (%s)\n",           \
+                    (label), got ? 1 : 0, (expect) ? 1 : 0, why);             \
+            fails++;                                                          \
+        } else {                                                              \
+            kprintf("[SCHEDGUARD]   ok  %-34s %s\n", (label),                 \
+                    (expect) ? "accepted" : why);                             \
+        }                                                                     \
+    } while (0)
+
+    GCHECK(true, "a healthy runnable proc");
+
+    /* The shapes a dead/recycled slot leaves behind. */
+    p.state = PROC_UNUSED;  GCHECK(false, "slot recycled (UNUSED)");
+    p.state = PROC_EMBRYO;  GCHECK(false, "half-built (EMBRYO)");
+    p.state = PROC_READY;
+    /* dying is deliberately NOT a refusal -- see sched_ctx_plausible.
+     * Asserted as ACCEPTED so nobody re-adds it without this failing. */
+    p.dying = true;         GCHECK(true,  "dying is still resumable");
+    p.dying = false;
+
+    /* The wake-after-death corpse itself: a saved_rsp that does not point
+     * into this proc's own kernel stack. proc_context_switch restores rsp
+     * from it and RETURNS through it, so a wild value here is exactly the
+     * "jumps to a wild rip" the fingerprints record. */
+    p.saved_rsp = top + 8;          GCHECK(false, "saved_rsp above its stack");
+    p.saved_rsp = top - PROC_KSTACK_SZ - 8;
+                                    GCHECK(false, "saved_rsp below its stack");
+    p.saved_rsp = 0xb2f64d1befULL;  GCHECK(false, "saved_rsp = archived garbage");
+    p.saved_rsp = 0x7ffffffffe00ULL;
+                                    GCHECK(false, "saved_rsp = a USER address");
+    p.saved_rsp = 0;                GCHECK(false, "saved_rsp = 0");
+
+    p.saved_rsp  = top - 512;
+    p.kstack_top = 0;               GCHECK(false, "kstack freed underneath it");
+    p.kstack_top = (void *)(uintptr_t)top;
+
+    /* The boundaries themselves are legal -- an off-by-one here would
+     * refuse healthy switches, which is a worse bug than the one being
+     * guarded against. */
+    p.saved_rsp = top;                    GCHECK(true, "rsp exactly at the top");
+    p.saved_rsp = top - PROC_KSTACK_SZ;   GCHECK(true, "rsp exactly at the base");
+
+    /* pid 0 / idle are kernel-owned and exempt by design. */
+    p.pid = 0; p.state = PROC_UNUSED; p.saved_rsp = 0; p.kstack_top = 0;
+    GCHECK(true, "pid 0 is exempt");
+#undef GCHECK
+
+    kprintf("[SCHEDGUARD] VERDICT: %s fails=%d\n",
+            fails ? "FAIL" : "PASS", fails);
+    return fails;
+}
+
 static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                       bool reacquire_bkl) {
+    /* The net described above. Capped logging: a repeating fault must not
+     * bury the serial log it is the only evidence in. */
+    {
+        extern struct proc g_proc[];      /* for the slot index in the log */
+        const char *why = "?";
+        if (!sched_ctx_plausible(to, &why)) {
+            static int logged;
+            if (logged < 16) {
+                logged++;
+                kprintf("[sched] REFUSED switch into pid=%d '%s' slot=%ld "
+                        "state=%d dying=%d: %s "
+                        "(saved_rsp=0x%lx kstack_top=0x%lx cr3=0x%lx) "
+                        "from pid=%d cpu%u\n",
+                        to ? to->pid : -1, to ? to->name : "?",
+                        to ? (long)(to - g_proc) : -1L,
+                        to ? (int)to->state : -1, (to && to->dying) ? 1 : 0,
+                        why,
+                        to ? (unsigned long)to->saved_rsp : 0UL,
+                        to ? (unsigned long)(uintptr_t)to->kstack_top : 0UL,
+                        to ? (unsigned long)to->cr3 : 0UL,
+                        from ? from->pid : -1, me->cpu_idx);
+            }
+            /* Fall back to this CPU's idle proc. Returning without
+             * switching would leave `from` running, which is also correct
+             * but hides the event from the run queue's accounting. */
+            if (me->idle && from != me->idle) to = me->idle;
+            else return;
+        }
+    }
 #ifdef CHROMIUM_BOOT
     /* Validate BEFORE latching on_cpu / current. Slice 88: a reaper may have
      * freed this PML4 after we popped the proc; skip to idle instead of panic. */
@@ -686,6 +869,25 @@ void sched_enqueue(struct proc *p) {
     if (p->pid != 0 && (!p->kstack_top || p->state == PROC_UNUSED ||
                         p->state == PROC_EMBRYO))
         return;
+    /* Wake-after-death tombstone (2026-08-23). A waker's `state =
+     * PROC_READY; sched_enqueue()` pair destroys the TERMINATED evidence
+     * before this function can see it -- observed live (~1/13 boots) as
+     * proc_exit's "sched_yield returned" panic when a stale waker
+     * re-queued a dying proc. `dying` is set by the exit paths BEFORE
+     * state changes and is never written by any waker, so it survives
+     * the overwrite. Refuse the wake and NAME the caller -- this line is
+     * the tripwire that identifies the racing waker when it next fires. */
+    /* The dying proc CONTINUING ITSELF is legitimate -- teardown yields
+     * cooperatively (BKL bounces, off-CPU waits) and the scheduler must
+     * be able to re-queue it, or every exit hangs. Only a DIFFERENT
+     * context waking the dying proc is the bug being policed. */
+    if (p->dying && p != current_proc()) {
+        struct proc *me = current_proc();
+        kprintf("[sched] REFUSED wake of dying pid=%d '%s' by pid=%d '%s'\n",
+                p->pid, p->name ? p->name : "?",
+                me ? me->pid : -1, (me && me->name) ? me->name : "?");
+        return;
+    }
     if (__atomic_load_n(&p->vm_quiesce, __ATOMIC_ACQUIRE)) {
         p->state = PROC_BLOCKED;
         p->vm_quiesced = 1;
@@ -792,6 +994,51 @@ int sched_get_prio(int pid) {
     return p ? p->prio : SCHED_PRIO_NONE;
 }
 
+/* Slice 128's sleeper wake, shared between sched_yield's entry and the two
+ * halted-CPU loops below. Wakes every PROC_BLOCKED proc whose nanosleep
+ * deadline has passed. No BKL required: touches only per-proc fields and
+ * sched_enqueue (own ready_lock). O(1) clock read + a proc-table walk. */
+static void sched_sleep_sweep(void) {
+    extern struct proc g_proc[];
+    uint64_t snow = perf_now_ns();
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state != PROC_BLOCKED) continue;
+        uint64_t dl = __atomic_load_n(&p->sleep_deadline_ns,
+                                      __ATOMIC_ACQUIRE);
+        if (!dl || snow < dl) continue;
+        __atomic_store_n(&p->sleep_deadline_ns, 0, __ATOMIC_RELEASE);
+        p->state = PROC_READY;
+        sched_enqueue(p);
+    }
+}
+
+/* Every wake source in this kernel is a SWEEP driven from scheduler entry
+ * points (sched_yield's entry, sched_yield_fast's decline window, pid 0's
+ * idle_loop) -- none is IRQ-driven. A CPU that halts waiting for "something
+ * runnable" without passing those entry points must therefore drive the
+ * sweeps itself, or a fully-parked machine stays parked forever: the timer
+ * IRQ breaks the hlt, the queue is still empty (nothing ever ran a sweep to
+ * refill it), and the CPU halts again. Slice 128 made that shape REACHABLE
+ * for the first time -- sleepers park now, so the system can go all-blocked
+ * -- and the first boot flavour to reach it wedged with every CPU in hlt and
+ * zero heartbeats (LXPOSIX: pid 0 blocked in wait, its child parked in
+ * poll(timerfd); 2026-08-22). Each IRQ that breaks a hlt now doubles as the
+ * sweep tick. Cost is nil in the only state that runs it (the machine is
+ * idle by definition); every sweep is O(1) when nothing is parked.
+ * Caller must NOT hold the BKL. */
+static void sched_halted_wake_sweeps(void) {
+    extern void signal_tick_alarms(void);
+    extern void futex_expire_timeouts(void);
+    extern void poll_tick(void);
+    sched_sleep_sweep();
+    futex_expire_timeouts();          /* g_futex_lock only, never the BKL */
+    bkl_enter();
+    signal_tick_alarms();             /* signal_send touches the run queue */
+    poll_tick();                      /* poll list is BKL-serialised */
+    bkl_exit();
+}
+
 /* ---- Slice 64 (perf tier 2): BKL-FREE sched_yield fast path ----------
  *
  * MEASURED (slice 64 [lx-top]): chrome issues ~401,000 sched_yield per 60s
@@ -866,6 +1113,21 @@ void sched_yield(void) {
             else { bkl_enter(); signal_tick_alarms(); bkl_exit(); }
         }
     }
+
+    /* Slice 128: wake procs whose nanosleep deadline has passed.
+     *
+     * Sits beside the alarm sweep, at the TOP of sched_yield, for the reason
+     * that comment gives: the sweeps further down only run in the
+     * still-RUNNING-and-queue-empty shape, and a sleeper is BLOCKED by
+     * definition, so a wake placed there would never fire for the very
+     * processes it exists to serve.
+     *
+     * Deliberately NOT rate-limited: the cost is a clock read plus a walk of
+     * the proc table only when some proc is actually sleeping, and a 10 ms
+     * rate limit would quantise every sleep to the sweep period -- which is
+     * exactly the latency this slice exists to remove. Waking depends on the
+     * scheduler running, never on IRQ delivery. */
+    sched_sleep_sweep();
 
     /* ---- Milestone 19 fast path ----------------------------------
      *
@@ -1027,18 +1289,76 @@ void sched_yield(void) {
         if (me->idle && cur != me->idle) {
             next = me->idle;
         } else {
+            static uint64_t halt_since;      /* census timer; reset on work */
+            static int      wedge_dumped;    /* once per boot */
             for (;;) {
                 /* Slice 94: kickable while halted in place (see sched_idle). */
                 __atomic_store_n(&me->idle_halted, 1, __ATOMIC_SEQ_CST);
                 sti();
                 hlt();
                 __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
+                /* This loop is the one place a CPU waits without passing a
+                 * scheduler entry point, so it must drive the wake sweeps
+                 * itself -- see sched_halted_wake_sweeps. Without this the
+                 * all-parked machine is a wedge, not an idle. */
+                sched_halted_wake_sweeps();
+                /* Wedge census: a machine that halts here >5 s with blocked
+                 * procs is either legitimately idle or deadlocked, and the
+                 * serial log cannot tell the two apart -- a wedge is SILENT
+                 * by definition. Print each blocked proc's signal/futex
+                 * state ONCE so the log names what everyone is waiting for
+                 * (found necessary diagnosing the linux-nptl setxid wedge,
+                 * where three theories fit the same silence). */
+                {
+                    uint64_t hn = perf_now_ns();
+                    if (!halt_since) halt_since = hn;
+                    if (!wedge_dumped && hn - halt_since > 5000000000ull) {
+                        wedge_dumped = 1;
+                        extern struct proc g_proc[];
+                        extern const char *proc_state_name(enum proc_state);
+                        kprintf("[idlewedge] BSP halted >5s, nothing runnable; census:\n");
+                        for (int wi = 0; wi < PROC_MAX; wi++) {
+                            struct proc *q = &g_proc[wi];
+                            if (q->state == PROC_UNUSED ||
+                                q->state == PROC_EMBRYO) continue;
+                            kprintf("[idlewedge]  pid=%d '%s' st=%s thr=%d tg=%d "
+                                    "pend=0x%llx mask=0x%llx fxdl=%llu slpdl=%llu "
+                                    "wh=%p\n",
+                                    q->pid, q->name, proc_state_name(q->state),
+                                    (int)q->is_thread, q->tgid,
+                                    (unsigned long long)q->pending_signals,
+                                    (unsigned long long)q->sigstate.mask,
+                                    (unsigned long long)q->futex_deadline_ns,
+                                    (unsigned long long)q->sleep_deadline_ns,
+                                    (void *)q->wait_head);
+                        }
+                    }
+                }
+                /* And the proc halting HERE may itself be the parked poller
+                 * (it is whoever blocked LAST, and on the BSP a blocking
+                 * poller halts in place). poll_wake_all deliberately keeps
+                 * the current proc parked -- correct on the yield that parks
+                 * it, fatal here where there is nobody left to wake it. One
+                 * re-scan per hlt-wake is the pre-slice-43 poll loop at IRQ
+                 * cadence, paid only while the whole machine is idle. */
+                {
+                    extern int poll_unpark_current(void);
+                    bkl_enter();
+                    int self = poll_unpark_current();
+                    bkl_exit();
+                    if (self && cur) {
+                        cur->state = PROC_RUNNING;
+                        halt_since = 0;
+                        YIELD_RETURN();
+                    }
+                }
                 uint64_t f = spin_lock_irqsave(&me->ready_lock);
                 next = queue_pop_locked(me);
                 spin_unlock_irqrestore(&me->ready_lock, f);
-                if (next) break;
+                if (next) { halt_since = 0; break; }
                 if (cur && cur->state == PROC_READY) {
                     cur->state = PROC_RUNNING;
+                    halt_since = 0;
                     YIELD_RETURN();
                 }
             }
@@ -1080,6 +1400,15 @@ void sched_idle(void) {
             sti();
             hlt();
             __atomic_store_n(&me->idle_halted, 0, __ATOMIC_RELAXED);
+            /* Same reasoning as sched_yield's halt-in-place loop: a halted
+             * CPU passes no scheduler entry point, so it must drive the
+             * wake sweeps or an all-parked machine never refills any queue.
+             * The BSP's loop covers the common shape; this covers the one
+             * where the BSP is pinned in a long kernel-mode operation while
+             * every parked proc waits on a sweep only an idle AP can run
+             * (the slice-56 single-point-of-failure, from the other side).
+             * The idle proc never holds the BKL, as required. */
+            sched_halted_wake_sweeps();
         }
     }
 }
@@ -1225,7 +1554,26 @@ void sched_tick(struct regs *r) {
              * exist inside chrome and change per frame, or not? Rides this
              * heartbeat for the same reason xserver_debug_tick does -- pid
              * 0's idle loop never runs under chrome load. */
+            /* SLICE 129: OFF BY DEFAULT NOW -- the question it was built to
+             * answer is closed, and the instrument outlived it.
+             *
+             * MEASURED on a 260 s Bing run: 86 rounds x ~641 regions = 55,164
+             * lines = 3.9 MB, which is 84% of ALL serial output. The guest
+             * emits 18.1 KB/s against a 38400-baud UART that carries 3.84
+             * KB/s, so on the user's real hardware this instrument alone
+             * oversubscribes the wire 4.7x -- and in QEMU every one of those
+             * bytes is a VM exit (slice 63c's lesson, applied to the biggest
+             * offender rather than the smallest).
+             *
+             * What it was for: "does a framebuffer-sized shared region exist
+             * inside chrome and change per frame?" Slice 110 answered yes and
+             * measured the resulting path; slice 129 then measured that path
+             * LOSING to plain CDP on a real page (6.16 vs 7.32 fps) because a
+             * static page commits ~6x/s, not 60. The premise is settled in
+             * both directions. Build with -DSHM_CENSUS to bring it back. */
+#ifdef SHM_CENSUS
             { extern void shm_census_dump(void); shm_census_dump(); }
+#endif
             if (now - last_deep > 60000000000ull) {
             last_deep = now;
             extern struct proc g_proc[];

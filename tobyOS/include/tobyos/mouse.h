@@ -9,7 +9,11 @@
 #define MOUSE_BTN_RIGHT   0x02
 #define MOUSE_BTN_MIDDLE  0x04
 
-typedef void (*mouse_event_fn)(int dx, int dy, uint8_t buttons);
+/* dz = wheel detents, +1 per notch AWAY from the user (scroll up/back),
+ * -1 per notch toward the user, matching the sign both PS/2 IntelliMouse
+ * and USB HID put on the wire. Consumers turn detents into pixels/lines;
+ * the driver never invents a step size. */
+typedef void (*mouse_event_fn)(int dx, int dy, int dz, uint8_t buttons);
 
 void mouse_init(void);
 void mouse_set_callback(mouse_event_fn cb);
@@ -17,7 +21,7 @@ uint8_t mouse_buttons(void);
 void mouse_flush_pending(void);
 
 /* Shared input sink used by PS/2 and USB-HID. */
-void mouse_inject_event(int dx, int dy, uint8_t buttons);
+void mouse_inject_event(int dx, int dy, int dz, uint8_t buttons);
 
 /* PS/2 byte-level entry point.
  * Exported so the keyboard IRQ can drain shared 8042 output bytes and
@@ -32,5 +36,12 @@ uint64_t mouse_dy_abs_total(void);
 uint8_t  mouse_last_buttons(void);
 int8_t   mouse_last_dx(void);
 int8_t   mouse_last_dy(void);
+int8_t   mouse_last_dz(void);
+uint64_t mouse_wheel_total(void);   /* detents seen, either direction */
+
+/* True once a PS/2 wheel (IntelliMouse, device id 3) answered the
+ * knock in mouse_init. Reported by devlist/hwinfo; USB wheels are
+ * independent of this. */
+bool mouse_ps2_has_wheel(void);
 
 #endif /* TOBYOS_MOUSE_H */

@@ -26,7 +26,7 @@ cd /c/CustomOS/tobyOS || exit 1
 
 MODE="${1:-cpu}"          # cpu | gl (ANGLE-on-GL) | gle (native EGL, no ANGLE)
 PAGE="${2:-anim}"         # anim | webgl
-TAG="${MODE}_${PAGE}"
+TAG="${MODE}_${PAGE}${SMPTAG:-}"
 PY=/c/Users/tdude/AppData/Local/Programs/Python/Python311/python
 
 case "$PAGE" in
@@ -34,7 +34,14 @@ case "$PAGE" in
   webgl) URL='file:///etc/webgl.html' ;;
   input) URL='file:///etc/input.html' ;;   # slice 114: static latency-probe page
   font)  URL='file:///etc/fonttest.html' ;; # slice 117: font-coverage acceptance
-  *)     echo "usage: $0 {cpu|gl} {anim|webgl|input|font}"; exit 2 ;;
+  # SLICE 129: a REAL page. Every arm above is a local file, and that is the
+  # single biggest reason this harness's numbers did not describe the user's
+  # experience: on anim.html the plain CDP path already runs at ~46 fps
+  # (cap avg=21ms), while on a real SERP the same build measures ~8 fps
+  # (cap avg=140ms). Comparing "8 fps on Bing" against "53 fps on anim.html"
+  # is not an A/B -- it is two different workloads. Set URL= to override.
+  url)   URL="${URL:-https://www.bing.com/search?q=perf+test}" ;;
+  *)     echo "usage: $0 {cpu|gl} {anim|webgl|input|font|url}"; exit 2 ;;
 esac
 
 # The quotes around the URL must reach the COMPILER, which means surviving two
@@ -58,7 +65,11 @@ case "$MODE" in
   *)   echo "usage: $0 {cpu|gl|gle|gld|mp|viz|vizp|lat} {anim|webgl|input}"; exit 2 ;;
 esac
 
-echo "=== [1/3] build: mode=$MODE page=$PAGE ==="
+# Slice 133: extra chromewin defines for one-off A/Bs without editing this
+# script (e.g. CW_EXTRA=-DCW_Q=20 to split encode cost from capture cost).
+PROGF="$PROGF ${CW_EXTRA:-}"
+
+echo "=== [1/3] build: mode=$MODE page=$PAGE ${CW_EXTRA:+extra=$CW_EXTRA} ==="
 taskkill //F //IM qemu-system-x86_64.exe >/dev/null 2>&1
 sleep 1                     # let Windows release the ISO lock (slice 61f)
 rm -f build/initrd.tar build/base.iso tobyOS.iso
@@ -66,10 +77,30 @@ rm -f build/initrd.tar build/base.iso tobyOS.iso
 # stale object built for the OTHER arm of the A/B (slice 73's lesson, and it
 # would silently invert the experiment here).
 rm -f programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
-# mmap.o depends on VIZPROD_DIAG (vizp vs viz), and make does NOT rebuild on
-# an EXTRA_CFLAGS change -- a stale object silently inverts THIS experiment
-# too. One file, so always rebuild it.
-rm -f src/mmap.o
+# SLICE 129 -- THE KERNEL SIDE OF THE SAME TRAP, AND IT COST A WHOLE SLICE.
+#
+# This script force-rebuilt chromewin.o and mmap.o and stopped there, so the
+# rule "make does NOT rebuild on an EXTRA_CFLAGS change" still applied to
+# EVERY OTHER kernel object -- including src/kernel.o, which is where
+# TKAPP_BOOT / TKAPP_CHROMEWIN / CHROMIUM_BOOT live. Run .013 of viz_anim was
+# built on a kernel.o left over from a plain `make` (no -DTKAPP_CHROMEWIN),
+# so the guest booted to the desktop and NEVER LAUNCHED THE BROWSER: 250 s of
+# heartbeats, a 31 KiB log, and a "multi-process is broken / the log plumbing
+# is broken" conclusion that was neither. The log was complete and correct.
+#
+# So: stamp the kernel flags, and blow away every kernel object when they
+# change. A full src/ rebuild costs a couple of minutes; a silently stale one
+# costs a slice.
+KSTAMP=build/.gpuperf_kcflags
+mkdir -p build
+if [ "$(cat "$KSTAMP" 2>/dev/null)" != "$KCF" ]; then
+    echo "kernel flags changed (or unknown) -> full kernel rebuild"
+    echo "  was: $(cat "$KSTAMP" 2>/dev/null || echo '<none>')"
+    echo "  now: $KCF"
+    rm -f src/*.o
+fi
+rm -f "$KSTAMP"             # only a SUCCESSFUL build earns the stamp
+do_build () {
 if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
           "HOST_CC=TMP='C:\\t' TEMP='C:\\t' gcc" iso \
      EXTRA_CFLAGS="$KCF" \
@@ -77,15 +108,76 @@ if ! make "CC=TMP='C:\\t' TEMP='C:\\t' clang" \
     echo "BUILD FAILED -- tail:"; tail -25 "logs/gpuperf_${TAG}.build.log"; exit 1
 fi
 [ -f tobyOS.iso ] || { echo "BUILD FAILED (no ISO)"; exit 1; }
+}
+do_build
+printf '%s' "$KCF" > "$KSTAMP"
 grep -a "CW_GL\|chromewin.elf" "logs/gpuperf_${TAG}.build.log" | tail -2
 ls -l --time-style=full-iso tobyOS.iso
 
-echo "=== [2/3] run: SMP=4 $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
+# GATE 0 -- THE FLAGS ARE IN THE BINARIES, checked BEFORE the run.
+#
+# The stamp above catches the flags changing between two gpuperf runs, but it
+# cannot see `make`, `defboot.sh` or a hand build leaving objects behind with
+# different defines -- which is exactly how .013 happened. A string only
+# reaches a binary if its #ifdef compiled, so ask the binaries directly. This
+# is cheap and it fails in seconds instead of six minutes.
+# Slice 131: gate 0 SELF-HEALS once. The stamp cannot see a hand `make` or
+# defboot.sh leaving objects with other defines behind, and that happened
+# three times in a single day of ISO builds. Rebuilding from clean is the
+# known and only fix, so do it rather than making a human retype it -- but
+# say so loudly, and if the SECOND check still fails the problem is real.
+GATE0_HEALED=0
+gate0_fail() {
+    if [ "$GATE0_HEALED" = "0" ]; then
+        echo "GATE 0: $1"
+        echo "GATE 0: stale kernel objects -- clearing src/*.o and rebuilding ONCE."
+        GATE0_HEALED=1
+        rm -f src/*.o programs/chromewin/chromewin.o programs/chromewin/chromewin.elf
+        rm -f build/initrd.tar build/base.iso tobyOS.iso
+        do_build
+        printf '%s' "$KCF" > "$KSTAMP"
+        gate0_check
+        echo "gate0 flags-in-binary: OK after rebuild ($MODE)"
+        return 0
+    fi
+    echo "GATE 0 FAIL (after a clean rebuild -- this one is real): $1"
+    exit 1
+}
+CWELF=programs/chromewin/chromewin.elf
+gate0_check() {
+    grep -aq 'TKAPP\] launching' tobyos.bin \
+      || gate0_fail "kernel has no TKAPP launcher (-DTKAPP_BOOT did not compile in), so the guest will boot to the desktop and never start the browser."
+    grep -aq '/bin/chromewin' tobyos.bin \
+      || gate0_fail "kernel's TKAPP target is not chromewin (-DTKAPP_CHROMEWIN missing)."
+    grep -aq -- "$URL" "$CWELF" \
+      || gate0_fail "chromewin.elf does not carry $URL -- it would navigate to the PREVIOUS arm's page."
+    case "$MODE" in
+      mp|viz|vizp|lat)
+        grep -aq -- '--single-process' "$CWELF" \
+          && gate0_fail "chromewin still carries --single-process, so CW_MP did not compile in and this is NOT a multi-process run." ;;
+      *)
+        grep -aq -- '--single-process' "$CWELF" \
+          || gate0_fail "chromewin has no --single-process, so this 'cpu' arm is secretly multi-process." ;;
+    esac
+    case "$MODE" in
+      viz|vizp|lat)
+        grep -aq 'cwviz' "$CWELF" \
+          || gate0_fail "chromewin has no [cwviz] strings, so CW_VIZ did not compile in." ;;
+    esac
+    return 0
+}
+gate0_check
+echo "gate0 flags-in-binary: OK ($MODE)"
+
+# Slice 131: SMP is an A/B variable now, not a constant. Whether extra
+# cores help this workload at all is a question, not an assumption.
+SMP="${SMP:-4}"
+echo "=== [2/3] run: SMP=$SMP $( [ "$MODE" != cpu ] && echo 'GLDEV=1 (virtio-gpu-gl-pci + ANGLE)' ) ==="
 if [ "$MODE" != "cpu" ] && [ "$MODE" != "mp" ] && [ "$MODE" != "viz" ] && [ "$MODE" != "vizp" ] && [ "$MODE" != "lat" ]; then
     [ -d logs/angle ] || bash logs/setup_angle.sh > "logs/gpuperf_${TAG}.angle.log" 2>&1
-    SMP=4 GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
+    SMP=$SMP GLDEV=1 $PY logs/run_watch.py 2>&1 | tail -6
 else
-    SMP=4 $PY logs/run_watch.py 2>&1 | tail -6
+    SMP=$SMP $PY logs/run_watch.py 2>&1 | tail -6
 fi
 # Slice 108: keep EVERY run, not just the last. These logs were overwritten
 # per mode, and that destroyed the only failing multi-process run before it
@@ -140,6 +232,19 @@ if [ "${MAXTS:-0}" -lt "$MINTS" ]; then
     tail -c 400 "$L" | tr -d '\r' | tail -3
     exit 1
 fi
+# GATE 1b -- DID THE BROWSER EVEN START?
+#
+# Run .013 passed gate 1 (the guest kept perfect time for 250 s) and then
+# failed on the '[bkl] cpu' check, which reads as "the kernel is wedged". It
+# was not: the kernel was idle because nothing had asked it to launch a
+# browser. Ask the direct question, and say which one it is.
+if ! grep -aq 'TKAPP\] launching' "$L"; then
+    echo "GATE FAIL: the guest never launched the TKAPP -- this run measured an"
+    echo "           idle desktop, not the browser. (gate 0 should have caught"
+    echo "           this at build time; if it did not, the ISO is not the one"
+    echo "           just built.)"
+    exit 1
+fi
 BKL=$(grep -ac '\[bkl\] cpu' "$L")
 if [ "$RUNMS" -ge 300000 ] && [ "$BKL" -eq 0 ]; then
     echo "GATE FAIL: full-length run with no '[bkl] cpu' report."
@@ -164,8 +269,45 @@ fi
 
 FRAMES=$(grep -ao 'exiting; frames=[0-9]*' "$L" | tail -1 | grep -o '[0-9]*')
 [ -z "$FRAMES" ] && FRAMES=$(grep -ao 'frames=[0-9]*' "$L" | tail -1 | grep -o '[0-9]*')
-echo "FRAMES($TAG) = ${FRAMES:-none}   (360s run => fps = frames/360)"
+echo "FRAMES($TAG) = ${FRAMES:-none}   (last COUNTER value, NOT a rate)"
 grep -ao 'probe #[0-9]* at [0-9]*s: frames=[0-9]*' "$L" | tail -3
+# THE A/B NUMBER. Counter/wall-clock is wrong twice over: the guest clock is
+# shorter than the wall clock, and bootstrap (first frame lands ~15-40 s in)
+# is not steady state. Count frame MARKERS by their own guest timestamps from
+# 25 s onward. Markers, not "frame N" -- chromewin's stdout is chunked through
+# [fd1] so the number lands in a later chunk (slice 108).
+echo "--- STEADY-STATE CADENCE (the A/B number) ---"
+python - "$L" <<'PYR'
+import io,re,sys
+# Rate, not counter. Three things make the naive readings wrong, and each one
+# was actually made in this tree:
+#   * frames/RUNSECS divides a GUEST counter by WALL seconds -- and under
+#     multi-process the guest runs at ~46% of wall clock.
+#   * counting "[cwviz] frame" MARKERS undercounts 30x: chromewin prints one
+#     line per 30 frames.
+#   * the frame lines LOSE their "[N ms]" prefix once the [fd1] chunk logger
+#     stops wrapping them, so a per-line timestamp regex silently drops the
+#     entire steady state and reports on the first 25 seconds.
+# So: carry the last seen guest timestamp forward, read the COUNTER, and take
+# dCounter/dt from 25 s onward. This reproduces slice 110's 52.68 fps from
+# gpuperf_viz_anim.011.log to the digit.
+pat={"cwviz":re.compile(r"\[cwviz\] frame (\d+):"),
+     "cwif" :re.compile(r"\[cwif\] frame (\d+) \|")}
+rows={k:[] for k in pat}
+ts=0
+for ln in io.open(sys.argv[1],encoding="utf-8",errors="replace"):
+    for m in re.finditer(r"\[(\d+) ms\]",ln): ts=int(m.group(1))
+    for k,p in pat.items():
+        for m in p.finditer(ln): rows[k].append((ts,int(m.group(1))))
+for k,v in rows.items():
+    if len(v)<2: print("%-6s %d sample(s) -- NO RATE"%(k,len(v))); continue
+    ss=[x for x in v if x[0]>=25000] or v
+    dt=(ss[-1][0]-ss[0][0])/1000.0; dn=ss[-1][1]-ss[0][1]
+    print("%-6s counter %d..%d over guest %.1f..%.1fs"
+          %(k,v[0][1],v[-1][1],v[0][0]/1000.0,v[-1][0]/1000.0))
+    if dt>1: print("       STEADY %.2f fps  (%d frames / %.1fs guest, from 25s on)"%(dn/dt,dn,dt))
+    else:    print("       STEADY VACUOUS: only %.1fs of guest clock after 25s"%dt)
+PYR
 echo "--- [cwviz] viz shm frame path ---"
 grep -a '\[cwviz\]' "$L" | tail -6
 if [ "$MODE" = "lat" ]; then
@@ -215,6 +357,12 @@ echo "--- faults (empty=clean) ---"
 grep -aiE 'KERNEL PANIC|EXCEPTION [0-9]+|#GP|terminating user process' "$L" \
   | grep -viE 'reset_reg' | head -5
 echo "--- [census] shared regions >=64KiB (candidate 1's premise) ---"
+# Slice 129: the census is now OFF unless the kernel was built -DSHM_CENSUS
+# (it was 84% of all serial output, and serial bytes are VM exits). Absence is
+# expected, not a failure -- say so rather than reporting a vacuous census.
+if ! grep -aq '\[census\] r' "$L"; then
+    echo "census DISABLED in this build (add -DSHM_CENSUS to KCF to restore)."
+else
 # THE CENSUS'S OWN VACUITY GUARD. Asking "does a region change per frame?"
 # means nothing if no frames were being produced while the census ran -- and
 # that is exactly what the first mp run did (chrome reached sessionId and the
@@ -247,6 +395,7 @@ PY2
 echo "largest regions seen:"
 grep -ao 'pages=[0-9]* ([0-9]*KiB)' "$L" | sort -t= -k2 -n -u | tail -5
 grep -a '\[census\]' "$L" | tail -16
+fi
 echo "--- [drm] unhandled (the gap list, empty=clean) ---"
 grep -a '\[drm\] UNHANDLED' "$L" | sort | uniq -c | head
 echo "(end $TAG)"

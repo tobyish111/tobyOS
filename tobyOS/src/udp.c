@@ -48,6 +48,10 @@ bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
      * wire that every correct receiver drops. */
     h->checksum = net_udp_checksum(net_my_ip(), dst_ip_be, buf, udp_len);
     if (h->checksum == 0) h->checksum = htons(0xFFFF);
+    /* Loopback delivery is src==dst (see ip_send), so a pseudo-header
+     * computed over net_my_ip() cannot validate on the receive side.
+     * RFC 768 lets a sender opt out entirely -- do that for loops. */
+    if ((dst_ip_be & 0xFFu) == 127u) h->checksum = 0;
 
     bool ok = ip_send(dst_ip_be, IP_PROTO_UDP, buf, udp_len);
     if (heap) kfree(buf);
@@ -126,7 +130,14 @@ void udp_recv(uint32_t src_ip_be, const void *udp_packet, size_t len) {
     }
 
     struct sock *s = sock_lookup_by_port(h->dst_port);
-    if (!s) return;                       /* no listener: silent drop */
+    if (!s) {
+        /* No listener: answer with port-unreachable (2026-08-22) so the
+         * sender's connected socket learns ECONNREFUSED instead of
+         * timing out. Was a silent drop. */
+        extern void icmp_send_port_unreach(uint32_t, const void *, size_t);
+        icmp_send_port_unreach(src_ip_be, udp_packet, udp_n);
+        return;
+    }
 
     const uint8_t *payload = (const uint8_t *)udp_packet + UDP_HDR_LEN;
     size_t         pln     = udp_n - UDP_HDR_LEN;

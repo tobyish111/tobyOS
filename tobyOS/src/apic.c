@@ -179,6 +179,11 @@ static bool cpu_may_hold_cr3(const struct percpu *c, uint64_t cr3) {
  * [tlbto]). ack_timeouts = per-CPU 2M-spin round timeouts; giveups =
  * tlb_shootdown_remote returning after 2 un-acked rounds (see below). */
 uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+/* Slice 125: distribution behind the counter -- per-CPU timeout tallies and
+ * the worst observed wait, so the health line can distinguish scheduling
+ * noise from one wedged core. See the timeout site below. */
+uint64_t g_tlb_to_percpu[MAX_CPUS];
+uint64_t g_tlb_wait_max_ns;
 
 static void tlb_shootdown_self_ack(uint32_t me) {
     uint64_t cr3;
@@ -252,10 +257,37 @@ static bool tlb_shootdown_sync_filtered(uint64_t cr3) {
             if (((++spins & 0x3ffu) == 0) && perf_now_ns() > deadline) {
                 static uint32_t warns;
                 extern uint64_t g_tlb_ack_timeouts;
+                extern uint64_t g_tlb_to_percpu[MAX_CPUS];
+                extern uint64_t g_tlb_wait_max_ns;
                 __atomic_fetch_add(&g_tlb_ack_timeouts, 1, __ATOMIC_RELAXED);
+                /* Slice 125: WHICH cpu, and HOW LATE. The bare counter could
+                 * not tell "one host-descheduled vCPU under WHPX" (routine,
+                 * per the note above) from "one core genuinely wedged on real
+                 * hardware" -- and the EliteDesk logged 16 of these with the
+                 * WARN line capped at 8, so half the events were invisible
+                 * and the distribution entirely so. Per-CPU counts expose a
+                 * single sick core; the max wait says whether we missed the
+                 * 10 ms deadline by a hair or by a mile. Both are just
+                 * counters -- no behaviour change on this path. */
+                if (i < MAX_CPUS)
+                    __atomic_fetch_add(&g_tlb_to_percpu[i], 1, __ATOMIC_RELAXED);
+                {
+                    uint64_t waited = perf_now_ns() + 10000000ull - deadline;
+                    uint64_t prev = __atomic_load_n(&g_tlb_wait_max_ns,
+                                                    __ATOMIC_RELAXED);
+                    while (waited > prev &&
+                           !__atomic_compare_exchange_n(&g_tlb_wait_max_ns,
+                                                        &prev, waited, false,
+                                                        __ATOMIC_RELAXED,
+                                                        __ATOMIC_RELAXED))
+                        ;
+                }
                 if (warns < 8) {
                     warns++;
                     kprintf("[tlb] WARN: cpu%u shootdown ack timeout\n", i);
+                    if (warns == 8)
+                        kprintf("[tlb] WARN log CAP HIT (8) -- further "
+                                "timeouts counted in [tlb] health only\n");
                 }
                 all_acked = false;
                 break;

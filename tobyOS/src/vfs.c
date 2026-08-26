@@ -643,6 +643,15 @@ int vfs_truncate(const char *path, uint64_t length) {
     return m->ops->truncate(m->data, rel, length);
 }
 
+int vfs_file_sync(struct vfs_file *f) {
+    if (!f || !f->ops) return VFS_ERR_INVAL;
+    /* No device, nothing to flush -- and saying OK is honest here rather
+     * than the usual "a NULL op means unsupported": a tmpfs write IS as
+     * durable as tmpfs gets. */
+    if (!f->ops->sync) return VFS_OK;
+    return f->ops->sync(f->mnt);
+}
+
 int vfs_file_truncate(struct vfs_file *f, uint64_t length) {
     if (!f || !f->ops) return VFS_ERR_INVAL;
     if (!f->ops->ftruncate) return VFS_ERR_ROFS;
@@ -941,6 +950,13 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
         return VFS_ERR_PERM;
     }
     if (!m->ops->stat) { perf_zone_end(PERF_Z_VFS_STAT, t_v); return VFS_ERR_INVAL; }
+    /* Zero BEFORE dispatch. Callers declare `struct vfs_stat st;` on the
+     * stack and no driver assigns every field -- ramfs left mtime/atime/
+     * ctime untouched on every path, so `ls -l /bin` dated files from
+     * whatever integers happened to be under them. Fixing it here rather
+     * than in each driver means the next driver cannot reintroduce it, and
+     * an unset field reads as the documented 0 ("this fs has no answer"). */
+    memset(out, 0, sizeof(*out));
     int rc = m->ops->stat(m->data, rel, out);
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
 #ifdef PATHFAIL_TRACE
@@ -950,6 +966,34 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
 }
 
 /* -------- write-side (each returns ROFS if the driver omits the op) -------- */
+
+/* inotify (2026-08-22): path-addressed mutations announce themselves.
+ * One helper so the emit sites cannot diverge; the first check is one
+ * global load, so a system with no watchers pays nothing. fd-addressed
+ * writes emit IN_MODIFY through vfs_notify_modify() below, fed by struct
+ * file's open_path -- the identity whose absence was recorded here as one
+ * open item covering both this and /proc/<pid>/fd (closed 2026-08-22). */
+static void vfs_notify(const char *path, uint32_t mask, uint32_t cookie) {
+    extern bool inotify_active(void);
+    extern void inotify_emit_cookie(const char *, uint32_t,
+                                    const char *, uint32_t);
+    if (!path || !inotify_active()) return;
+    const char *base = path;
+    for (const char *c = path; *c; c++) if (*c == '/') base = c + 1;
+    inotify_emit_cookie(path, mask, base, cookie);
+}
+#define VFS_IN_MODIFY     0x002u
+#define VFS_IN_MOVED_FROM 0x040u
+#define VFS_IN_MOVED_TO   0x080u
+#define VFS_IN_CREATE     0x100u
+#define VFS_IN_DELETE     0x200u
+#define VFS_IN_ISDIR      0x40000000u
+
+/* The fd-addressed emit door: file_write calls this with the handle's
+ * open_path after a successful VFS write. */
+void vfs_notify_modify(const char *path) {
+    vfs_notify(path, VFS_IN_MODIFY, 0);
+}
 
 int vfs_create(const char *path) {
     if (!path) return VFS_ERR_INVAL;
@@ -980,9 +1024,11 @@ int vfs_create(const char *path) {
     /* Default new-file mode: owner-rw + world-r. Owner = current uid.
      * Root spawning during boot leaves uid 0 / gid 0, which is what we
      * want for kernel-installed system files (settings.conf, users). */
-    return m->ops->create(m->data, rel,
-                          (uint32_t)current_uid(), (uint32_t)current_gid(),
-                          00644u | VFS_MODE_VALID);
+    int crc = m->ops->create(m->data, rel,
+                             (uint32_t)current_uid(), (uint32_t)current_gid(),
+                             00644u | VFS_MODE_VALID);
+    if (crc == VFS_OK) vfs_notify(path, VFS_IN_CREATE, 0);
+    return crc;
 }
 
 int vfs_unlink(const char *path) {
@@ -1010,7 +1056,69 @@ int vfs_unlink(const char *path) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
-    return m->ops->unlink(m->data, rel);
+    int urc = m->ops->unlink(m->data, rel);
+    if (urc == VFS_OK) {
+        vfs_notify(path, VFS_IN_DELETE, 0);
+        { extern void xattr_forget_path(const char *);
+          xattr_forget_path(path); }
+    }
+    return urc;
+}
+
+/* Phase G: hard links. Cross-mount linking is impossible by construction
+ * (an inode number means nothing outside its filesystem), which is exactly
+ * what EXDEV exists to say -- coreutils' ln/mv fall back to copying on it. */
+int vfs_link(const char *oldpath, const char *newpath) {
+    if (!oldpath || !newpath) return VFS_ERR_INVAL;
+    const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
+    const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
+    if (!om || !nm) return VFS_ERR_NOMOUNT;
+    if (om != nm) return VFS_ERR_XDEV;
+    /* This op used to go straight to the driver with no checks at all --
+     * no read-only test, no capability test, no directory permission. It
+     * was survivable only because tobyfs was the one filesystem with a
+     * .link op; once tmpfs, ramfs, ext2 and ext4 grew one (2026-08-25) the
+     * same unchecked path covered every mount in the tree. A hard link
+     * creates a name and bumps a link count -- it is a mutation, and it
+     * has to answer to the same rules as unlink and rename.
+     *
+     * The read-only mount check in particular: a flag that is accepted
+     * and ignored is the same class of lie as a no-op syscall that
+     * reports success. */
+    if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
+    if (!om->ops->link) return VFS_ERR_ROFS;
+    if (!cap_check_path(current_proc(), newpath, CAP_FILE_WRITE, "vfs_link"))
+        return VFS_ERR_PERM;
+    {
+        int sp = sysprot_check_write(current_proc(), newpath, "vfs_link");
+        if (sp != VFS_OK) return sp;
+    }
+    /* Need W+X on the directory the NEW name lands in -- creating a name
+     * there is exactly what unlink needs permission to undo. Reading the
+     * old name needs nothing extra: a hard link copies no bytes, and the
+     * caller could already stat the path to get here. */
+    char par[VFS_PATH_MAX];
+    if (parent_path(newpath, par, sizeof(par)) == VFS_OK) {
+        int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+        if (prc != VFS_OK) return prc;
+    }
+    int rc = om->ops->link(om->data, orel, nrel);
+    if (rc == VFS_OK) vfs_notify(newpath, VFS_IN_CREATE, 0);
+    return rc;
+}
+
+/* Phase H: real per-mount statistics. A driver without the op gets
+ * honest zeros -- df shows a filesystem it cannot size, not a
+ * fabricated 4 GiB tmpfs. */
+int vfs_statfs(const char *path, struct vfs_statfs *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    const char *rel; struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return VFS_ERR_NOMOUNT;
+    memset(out, 0, sizeof *out);
+    out->bsize   = 4096;
+    out->namelen = 255;
+    if (m->ops->statfs) return m->ops->statfs(m->data, out);
+    return VFS_OK;
 }
 
 int vfs_rename(const char *oldpath, const char *newpath) {
@@ -1023,7 +1131,13 @@ int vfs_rename(const char *oldpath, const char *newpath) {
      * it -- a flag that is accepted and ignored is the same class of lie as a
      * no-op syscall that reports success. */
     if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
-    if (om != nm)   return VFS_ERR_INVAL;    /* cross-mount rename (EXDEV) -- n/s */
+    /* Cross-mount rename. This said VFS_ERR_INVAL with a comment naming
+     * EXDEV as what it meant -- so callers got EINVAL, which reads as "you
+     * asked for something nonsensical" rather than "use a copy instead".
+     * Every mv keys its copy-then-unlink fallback off EXDEV specifically,
+     * so the wrong code turned `mv /tmp/x /data/x` into a hard failure.
+     * VFS_ERR_XDEV already existed (Phase G added it for hard links). */
+    if (om != nm)   return VFS_ERR_XDEV;
     if (!om->ops->rename) return VFS_ERR_ROFS;
     /* Need write on both old and new (source is unlinked, dest is created). */
     if (!cap_check_path(current_proc(), oldpath, CAP_FILE_WRITE, "vfs_rename") ||
@@ -1035,7 +1149,37 @@ int vfs_rename(const char *oldpath, const char *newpath) {
         sp = sysprot_check_write(current_proc(), newpath, "vfs_rename");
         if (sp != VFS_OK) return sp;
     }
-    return om->ops->rename(om->data, orel, nrel);
+    /* W+X on BOTH parent directories, the same rule vfs_unlink and
+     * vfs_create apply -- a rename unlinks from one directory and creates
+     * in another, so it needs exactly what those two need. This check was
+     * absent: rename was the one mutation that consulted only the caps
+     * layer, so a user with no write permission on a directory could still
+     * move things out of it. Noticed while wiring ramfs's ->rename, which
+     * is what made the path reachable from the root filesystem at all. */
+    {
+        char par[VFS_PATH_MAX];
+        if (parent_path(oldpath, par, sizeof(par)) == VFS_OK) {
+            int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+        }
+        if (parent_path(newpath, par, sizeof(par)) == VFS_OK) {
+            int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+        }
+    }
+    int rrc = om->ops->rename(om->data, orel, nrel);
+    if (rrc == VFS_OK) {
+        /* The FROM/TO pair shares a cookie so a watcher can correlate the
+         * two halves of one move -- without it, editors' rename-into-place
+         * reads as an unrelated delete + create. */
+        static uint32_t g_mv_cookie;
+        uint32_t ck = ++g_mv_cookie;
+        vfs_notify(oldpath, VFS_IN_MOVED_FROM, ck);
+        vfs_notify(newpath, VFS_IN_MOVED_TO,   ck);
+        { extern void xattr_rename_path(const char *, const char *);
+          xattr_rename_path(oldpath, newpath); }
+    }
+    return rrc;
 }
 
 /* Slice 86: mkdir with the CALLER's mode. This used to hardcode 0755 for
@@ -1068,9 +1212,11 @@ int vfs_mkdir_mode(const char *path, uint32_t mode) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
-    return m->ops->mkdir(m->data, rel,
-                         (uint32_t)current_uid(), (uint32_t)current_gid(),
-                         (mode & 07777u) | VFS_MODE_VALID);
+    int mrc = m->ops->mkdir(m->data, rel,
+                            (uint32_t)current_uid(), (uint32_t)current_gid(),
+                            (mode & 07777u) | VFS_MODE_VALID);
+    if (mrc == VFS_OK) vfs_notify(path, VFS_IN_CREATE | VFS_IN_ISDIR, 0);
+    return mrc;
 }
 
 int vfs_mkdir(const char *path) {
@@ -1316,6 +1462,7 @@ const char *vfs_strerror(int err) {
     case VFS_ERR_NAMETOOLONG:   return "name too long";
     case VFS_ERR_PERM:          return "permission denied";
     case VFS_ERR_LOOP:          return "too many levels of symbolic links";
+    case VFS_ERR_XDEV:          return "cross-device link";
     default:                    return "unknown error";
     }
 }
@@ -1451,4 +1598,107 @@ int vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz) {
         memcpy(buf_a, e->target, plen + 1);
     }
     return VFS_ERR_LOOP;
+}
+
+/* ================================================================== *
+ * Slice 127: recursive delete, shared by every caller that needs it.
+ *
+ * `rm` in the kernel shell could remove a file or an EMPTY directory and
+ * nothing else, and the GUI terminal (src/term.c, its own much smaller
+ * builtin set) had no delete at all -- so a directory TREE could not be
+ * removed from this OS by any route. Found the practical way: a corrupt
+ * chrome profile at /data/cr2, thousands of files deep, needed clearing.
+ *
+ * It lives HERE rather than in either shell because both need it and the
+ * file manager will too; duplicating a recursive unlink into three command
+ * tables is how they drift.
+ *
+ * Two things this gets right that a naive version does not:
+ *
+ *  - The readdir cursor is an index into a directory whose entries are
+ *    being deleted underneath it, so HOLDING it across an unlink skips
+ *    entries. Remove one child, close, reopen, repeat until a full pass
+ *    finds nothing left. Slower, correct, obvious.
+ *  - Recursion carries ONE path buffer, appended to and truncated on the
+ *    way back out. A VFS_PATH_MAX buffer per frame is what would overflow
+ *    the kernel stack on a deep tree; depth is capped at VFS_RMTREE_MAX
+ *    besides, with a real error rather than a fault.
+ *
+ * `failed` (optional) receives the path of the first thing that could not
+ * be removed, so a caller can report something better than an errno.
+ * ================================================================== */
+#define VFS_RMTREE_MAX_DEPTH 32
+
+static int vfs_rmtree_walk(char *path, size_t len, size_t cap, int depth,
+                           bool force, char *failed, size_t failed_cap) {
+    struct vfs_stat st;
+    int rc = vfs_stat(path, &st);
+    if (rc != VFS_OK)
+        return (force && rc == VFS_ERR_NOENT) ? VFS_OK : rc;
+
+    if (st.type == VFS_TYPE_DIR) {
+        if (depth >= VFS_RMTREE_MAX_DEPTH) {
+            if (failed && failed_cap) {
+                size_t n = 0;
+                while (path[n] && n + 1 < failed_cap) { failed[n] = path[n]; n++; }
+                failed[n] = 0;
+            }
+            return VFS_ERR_NAMETOOLONG;
+        }
+        for (;;) {
+            struct vfs_dir d;
+            if (vfs_opendir(path, &d) != VFS_OK) break;
+            struct vfs_dirent ent;
+            bool removed_one = false;
+            while (vfs_readdir(&d, &ent) == VFS_OK) {
+                if (ent.name[0] == '.' &&
+                    (ent.name[1] == 0 ||
+                     (ent.name[1] == '.' && ent.name[2] == 0)))
+                    continue;
+                size_t nlen = 0;
+                while (ent.name[nlen]) nlen++;
+                if (len + 1 + nlen + 1 > cap) continue;      /* skip: too long */
+                size_t save = len;
+                if (len == 0 || path[len - 1] != '/') path[len++] = '/';
+                for (size_t i = 0; i < nlen; i++) path[len + i] = ent.name[i];
+                len += nlen;
+                path[len] = 0;
+
+                int sub = vfs_rmtree_walk(path, len, cap, depth + 1, force,
+                                          failed, failed_cap);
+                len = save; path[len] = 0;
+                if (sub != VFS_OK) { vfs_closedir(&d); return sub; }
+                removed_one = true;
+                break;                                       /* rewind */
+            }
+            vfs_closedir(&d);
+            if (!removed_one) break;
+        }
+    }
+
+    rc = vfs_unlink(path);
+    if (rc != VFS_OK) {
+        if (force && rc == VFS_ERR_NOENT) return VFS_OK;
+        if (failed && failed_cap) {
+            size_t n = 0;
+            while (path[n] && n + 1 < failed_cap) { failed[n] = path[n]; n++; }
+            failed[n] = 0;
+        }
+        return rc;
+    }
+    return VFS_OK;
+}
+
+int vfs_rmtree(const char *path, bool force, char *failed, size_t failed_cap) {
+    if (!path || !path[0]) return VFS_ERR_INVAL;
+    /* Refuse to recurse from the root: it would walk into /proc and /sys and
+     * fail confusingly on synthesised nodes the caller never meant to touch. */
+    if (path[0] == '/' && path[1] == 0) return VFS_ERR_INVAL;
+    char buf[VFS_PATH_MAX];
+    size_t len = 0;
+    while (path[len] && len + 1 < sizeof buf) { buf[len] = path[len]; len++; }
+    if (path[len]) return VFS_ERR_NAMETOOLONG;
+    buf[len] = 0;
+    if (failed && failed_cap) failed[0] = 0;
+    return vfs_rmtree_walk(buf, len, sizeof buf, 0, force, failed, failed_cap);
 }

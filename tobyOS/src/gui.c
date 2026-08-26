@@ -1838,8 +1838,8 @@ static struct window *window_at(int px, int py) {
  * windowed Linux app's input straight from the event-producer path. */
 void fbdev_window_event(struct window *w, const struct gui_event *e);
 
-static void enqueue_event(struct window *w, int type, int x, int y,
-                          uint8_t button, uint8_t key) {
+static void enqueue_event_w(struct window *w, int type, int x, int y,
+                            uint8_t button, uint8_t key, int8_t wheel) {
     uint8_t next = (uint8_t)((w->ev_head + 1u) % GUI_EVENT_RING);
     if (next == w->ev_tail) {
         /* full -- drop oldest */
@@ -1851,12 +1851,20 @@ static void enqueue_event(struct window *w, int type, int x, int y,
     e->y      = y;
     e->button = button;
     e->key    = key;
-    e->_pad[0] = e->_pad[1] = 0;
+    e->wheel  = wheel;
+    e->_pad[0] = 0;
     w->ev_head = next;
 
     /* If this window is a windowed Linux app, mirror the event to its evdev
      * rings (focus-routed input; no-op for every other window). */
     fbdev_window_event(w, e);
+}
+
+/* The pre-wheel spelling, kept so the ~40 existing call sites read the
+ * same as they always did. */
+static void enqueue_event(struct window *w, int type, int x, int y,
+                          uint8_t button, uint8_t key) {
+    enqueue_event_w(w, type, x, y, button, key, 0);
 }
 
 /* Forward decls -- needed because on_mouse_event() (below) calls
@@ -1866,7 +1874,7 @@ static void recompute_active(void);
 
 /* ---- mouse callback (IRQ) ----------------------------------------- */
 
-static void on_mouse_event(int dx, int dy, uint8_t buttons) {
+static void on_mouse_event(int dx, int dy, int dz, uint8_t buttons) {
     if (!g.ready) return;
 
     int W = (int)gfx_width(), H = (int)gfx_height();
@@ -2481,6 +2489,25 @@ static void on_mouse_event(int dx, int dy, uint8_t buttons) {
         int cx = nx - (under->x + GUI_BORDER);
         int cy = ny - (under->y + GUI_TITLE_BAR_H);
         enqueue_event(under, GUI_EV_MOUSE_MOVE, cx, cy, buttons, 0);
+    }
+
+    /* ---- wheel (2026-08-23) ----------------------------------------
+     *
+     * Routed to the window UNDER THE CURSOR, not the focused one. That
+     * is the rule every desktop uses and it is deliberately different
+     * from the keyboard path (gui_post_key -> g.z_top): scrolling the
+     * list you are pointing at, without having to click it first, is
+     * the whole ergonomic point of a wheel.
+     *
+     * Outside the `else if` ladder above on purpose -- a notch usually
+     * arrives with dx=dy=0 and no button change, so it would fall
+     * through every branch there and be dropped. */
+    if (dz && under && point_in_client(under, nx, ny)) {
+        int cx = nx - (under->x + GUI_BORDER);
+        int cy = ny - (under->y + GUI_TITLE_BAR_H);
+        int8_t wz = (int8_t)(dz < -127 ? -127 : (dz > 127 ? 127 : dz));
+        enqueue_event_w(under, GUI_EV_WHEEL, cx, cy, buttons, 0, wz);
+        gui_trace_logf("wheel=(%d,%d) dz=%d -> win", cx, cy, dz);
     }
 
     /* Context menu hover tracking. */
@@ -5651,6 +5678,188 @@ static void window_draw_glyph(struct window *w, int x, int y, char c,
     }
 }
 
+/* 2026-08-24: TRUE MONOSPACED WINDOW TEXT -- 8x16 VGA cell, fixed advance,
+ * opaque background.
+ *
+ * WHY THIS HAD TO EXIST. libtoby's tk_draw_text_mono() carried the comment
+ * "MONO bitmap text (8x16 fixed cell) ... perfectly column-aligned (TTF is
+ * proportional)" and then called SYS_GUI_TEXT -- which C18c had quietly
+ * rewired to render proportional Lato whenever a font is loaded, and one is
+ * loaded on every boot. So the one call in the toolkit whose entire purpose
+ * was a fixed grid produced a variable-width one, and its `bg` argument was
+ * dropped on the floor (the TTF path takes no background).
+ *
+ * The visible result was in /bin/gui_term: every run of cells was drawn at
+ * column*8 but rendered at whatever width Lato happened to be, so the text
+ * drifted left of its own grid while the block cursor -- a plain filled rect
+ * on the exact 8x16 lattice -- stayed put. The cursor looked wrong; the TEXT
+ * was wrong. Cell background colours had never rendered either, for the same
+ * reason.
+ *
+ * font8x16_data is MSB-first per row (bit 7 is the leftmost pixel), unlike
+ * font8x8_basic which is LSB-first -- see gfx.c, which reads it the same way.
+ */
+extern const uint8_t font8x16_data[128][16];
+
+/* `cell_h` is the caller's ROW PITCH, and it matters: the four callers of
+ * tk_draw_text_mono do not agree on one. The terminal is 16 (an exact fit
+ * for this font), but gui_edit and gui_browser are 12 and gui_viewer is 14.
+ * Painting a full 16 rows of opaque background into a 12-row pitch would
+ * bleed into the line below and erase the top of its glyphs -- so the glyph
+ * is vertically CENTRED in cell_h and clipped, and the background covers
+ * exactly cell_h rows and no more. 0 means "16". */
+int gui_window_text_mono(struct window *w, int x, int y, const char *s,
+                         uint32_t fg, uint32_t bg, int cell_h) {
+    if (!w || !w->in_use || !w->backbuf || !s) return -1;
+    if (cell_h <= 0) cell_h = 16;
+    bool transparent = (bg == GFX_TRANSPARENT);
+    /* Offset of glyph row 0 within the cell. Negative when the cell is
+     * shorter than the font, which is what clips evenly top and bottom. */
+    int gy0 = (cell_h - 16) / 2;
+    int cx = x;
+    for (; *s; s++) {
+        if (*s == '\n') { cx = x; y += cell_h; continue; }
+        unsigned char ch = (unsigned char)*s;
+        if (ch >= 128) ch = '?';
+        const uint8_t *glyph = font8x16_data[ch];
+        for (int row = 0; row < cell_h; row++) {
+            int py = y + row;
+            if (py < 0 || py >= w->client_h) continue;
+            int grow = row - gy0;                  /* font row for this line */
+            uint8_t bits = (grow >= 0 && grow < 16) ? glyph[grow] : 0u;
+            for (int col = 0; col < 8; col++) {
+                int px = cx + col;
+                if (px < 0 || px >= w->client_w) continue;
+                bool on = ((bits >> (7 - col)) & 1u) != 0;
+                if      (on)           w->backbuf[py * w->client_w + px] = fg;
+                else if (!transparent) w->backbuf[py * w->client_w + px] = bg;
+            }
+        }
+        cx += 8;                      /* FIXED advance -- the whole point */
+    }
+    return 0;
+}
+
+/* COMPILED UNCONDITIONALLY, called from kernel.c only under
+ * -DGUITEXT_SELFTEST -- the same pattern as provision_selftest and
+ * blk_nvme_selftest, and for a concrete reason: EXTRA_CFLAGS changes do NOT
+ * trigger a recompile in this build, and the gates only `touch src/kernel.c`.
+ * With the definition behind the flag, kernel.c was rebuilt WITH it while
+ * gui.o kept an object built WITHOUT it by the preceding gate -- an
+ * undefined-symbol link failure that has nothing to do with the code.
+ * A few KiB in the shipped kernel is the right price for that. */
+/* Prove the fixed-cell contract PIXEL BY PIXEL, against the font table
+ * itself. A terminal is a GUI window, so no userspace harness can see
+ * whether its columns line up -- but the property that was actually
+ * violated is arithmetic, and arithmetic can be asserted:
+ *
+ *   1. every pixel of an 8x16 cell is written (opaque bg -- the TTF path
+ *      dropped `bg` entirely, so cell colours never painted),
+ *   2. it matches font8x16_data bit for bit,
+ *   3. the advance is EXACTLY 8 px per character, so column N lands on
+ *      8*N and the block cursor drawn there covers its own glyph.
+ *
+ * Returns 0 on success, or the number of failed assertions. */
+int gui_text_mono_selftest(void) {
+    const int W = 40, H = 16;
+    const uint32_t FG = 0x00FFFFFFu, BG = 0x00112233u, VIRGIN = 0x00DEAD00u;
+    int fails = 0;
+
+    uint32_t *buf = (uint32_t *)kmalloc((size_t)W * H * sizeof(uint32_t));
+    if (!buf) { kprintf("[GUITEXT] FAIL cannot allocate a test backbuf\n"); return 1; }
+    for (int i = 0; i < W * H; i++) buf[i] = VIRGIN;
+
+    struct window tw;
+    memset(&tw, 0, sizeof tw);
+    tw.in_use = true;
+    tw.backbuf = buf;
+    tw.client_w = W;
+    tw.client_h = H;
+
+    /* Two glyphs with very different ink so a stuck advance shows up. */
+    const char *s = "Wi";
+    gui_window_text_mono(&tw, 0, 0, s, FG, BG, 16);
+
+    int mismatched = 0, ink = 0;
+    for (int c = 0; c < 2; c++) {
+        unsigned char ch = (unsigned char)s[c];
+        const uint8_t *glyph = font8x16_data[ch];
+        for (int row = 0; row < 16; row++) {
+            for (int col = 0; col < 8; col++) {
+                uint32_t want = ((glyph[row] >> (7 - col)) & 1u) ? FG : BG;
+                uint32_t got  = buf[row * W + c * 8 + col];
+                if (got != want) mismatched++;
+                if (want == FG) ink++;
+            }
+        }
+    }
+    if (mismatched) {
+        kprintf("[GUITEXT] FAIL %d of 256 cell pixels differ from font8x16_data\n",
+                mismatched);
+        fails++;
+    } else {
+        kprintf("[GUITEXT]   ok   256/256 cell pixels match font8x16_data "
+                "(%d lit)\n", ink);
+    }
+
+    /* Column 16 onward must be untouched: two characters advance 16 px and
+     * not one pixel more. A proportional renderer fails here immediately. */
+    int spill = 0;
+    for (int row = 0; row < H; row++)
+        for (int col = 16; col < W; col++)
+            if (buf[row * W + col] != VIRGIN) spill++;
+    if (spill) {
+        kprintf("[GUITEXT] FAIL %d pixels written past x=16: the advance is "
+                "not a fixed 8 px\n", spill);
+        fails++;
+    } else {
+        kprintf("[GUITEXT]   ok   advance is exactly 8 px/char (nothing past "
+                "x=16 of %d)\n", W);
+    }
+
+    /* The background really is opaque -- no VIRGIN pixel survives inside a
+     * drawn cell. This is the half that made ANSI cell colours a no-op. */
+    int holes = 0;
+    for (int row = 0; row < 16; row++)
+        for (int col = 0; col < 16; col++)
+            if (buf[row * W + col] == VIRGIN) holes++;
+    if (holes) {
+        kprintf("[GUITEXT] FAIL %d pixels inside the cells were left unwritten "
+                "-- bg is not opaque\n", holes);
+        fails++;
+    } else {
+        kprintf("[GUITEXT]   ok   background is opaque (0 unwritten pixels in "
+                "the 2 cells)\n");
+    }
+
+    /* A SHORTER ROW PITCH must stay inside itself. gui_edit and gui_browser
+     * are 12, gui_viewer 14; a 16-row opaque cell in a 12-row pitch would
+     * erase the top of the line below, which is a worse bug than the
+     * misalignment this whole change is fixing. */
+    for (int i = 0; i < W * H; i++) buf[i] = VIRGIN;
+    gui_window_text_mono(&tw, 0, 0, "W", FG, BG, 12);
+    int bled = 0;
+    for (int row = 12; row < 16; row++)
+        for (int col = 0; col < 8; col++)
+            if (buf[row * W + col] != VIRGIN) bled++;
+    int covered = 0;
+    for (int row = 0; row < 12; row++)
+        for (int col = 0; col < 8; col++)
+            if (buf[row * W + col] != VIRGIN) covered++;
+    if (bled || covered != 96) {
+        kprintf("[GUITEXT] FAIL cell_h=12 wrote %d rows-worth inside and bled "
+                "into %d pixels of the next line\n", covered / 8, bled);
+        fails++;
+    } else {
+        kprintf("[GUITEXT]   ok   cell_h=12 fills exactly 12 rows, 0 pixels "
+                "bleed into the line below\n");
+    }
+
+    kfree(buf);
+    kprintf("[GUITEXT] VERDICT: %s fails=%d\n", fails ? "FAIL" : "PASS", fails);
+    return fails;
+}
+
 /* C18c: pixel height for native/desktop window text when rendered as TrueType.
  * Sized to sit within roughly the same vertical band the 8x8 bitmap font used so
  * existing per-app layouts (which place text on an ~8-10px grid) stay readable. */
@@ -5945,8 +6154,8 @@ void gui_post_shell_click(int x, int y) {
     if (!g.ready) return;
     g.cur_x = x;
     g.cur_y = y;
-    on_mouse_event(0, 0, 1);     /* left button DOWN at (x, y) */
-    on_mouse_event(0, 0, 0);     /* release */
+    on_mouse_event(0, 0, 0, 1);  /* left button DOWN at (x, y) */
+    on_mouse_event(0, 0, 0, 0);  /* release */
 }
 #endif
 
@@ -5967,7 +6176,7 @@ void gui_toggle_search(void) {
 void gui_post_mouse(int type, int x, int y, uint8_t button) {
     if (!g.ready || !g.active || !g.z_top) return;
     if (type != GUI_EV_MOUSE_MOVE && type != GUI_EV_MOUSE_DOWN &&
-        type != GUI_EV_MOUSE_UP)
+        type != GUI_EV_MOUSE_UP && type != GUI_EV_WHEEL)
         return;
     struct window *w = g.z_top;
     if (w->state == GUI_WIN_MINIMIZED) return;
@@ -5975,7 +6184,13 @@ void gui_post_mouse(int type, int x, int y, uint8_t button) {
         gui_trace_logf("post_mouse type=%d xy=(%d,%d) btn=0x%02x -> wid=%d owner_pid=%d",
                        type, x, y, (unsigned)button, w->wid, w->owner_pid);
     }
-    enqueue_event(w, type, x, y, button, 0);
+    /* GUI_EV_WHEEL carries its detents in `button` here: this harness
+     * entry point has no wheel parameter of its own and widening it
+     * would break its callers. One notch up is the useful default. */
+    if (type == GUI_EV_WHEEL)
+        enqueue_event_w(w, type, x, y, 0, 0, button ? (int8_t)button : 1);
+    else
+        enqueue_event(w, type, x, y, button, 0);
     g.input_boost_pid = w->owner_pid;
 }
 

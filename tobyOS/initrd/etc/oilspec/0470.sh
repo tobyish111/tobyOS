@@ -1,0 +1,2 @@
+echo async &
+wait

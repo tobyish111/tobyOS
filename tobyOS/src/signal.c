@@ -9,6 +9,7 @@
  */
 
 #include <tobyos/signal.h>
+#include <tobyos/shell.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
 #include <tobyos/printk.h>
@@ -97,6 +98,7 @@ void signal_init_proc(struct signal_state *ss) {
         ss->actions[i].sa_flags   = 0;
         ss->si_pid[i] = 0;
         ss->si_uid[i] = 0;
+        ss->si_code[i] = 0;
     }
     ss->mask     = 0;
     ss->pending  = 0;
@@ -166,9 +168,16 @@ void signal_send(struct proc *p, int sig) {
     if (sig == SIGCONT) {
         p->pending_signals  &= ~SIGMASK_STOPS;
         p->sigstate.pending &= ~SIGMASK_STOPS;
+        p->stop_sig = 0;
+        p->stop_reported = false;
         if (p->state == PROC_STOPPED) {
+            p->cont_pending = true;        /* WCONTINUED: report once */
             p->state = PROC_READY;
             sched_enqueue(p);
+            if (p->ppid > 0) {             /* Linux: SIGCHLD on continue */
+                struct proc *par = proc_lookup(p->ppid);
+                if (par) signal_send(par, SIGCHLD);
+            }
         }
     } else if (SIGMASK(sig) & SIGMASK_STOPS) {
         p->pending_signals  &= ~SIGMASK(SIGCONT);
@@ -177,7 +186,7 @@ void signal_send(struct proc *p, int sig) {
 
     /* Check if signal is ignored (SIG_IGN) and not SIGKILL/SIGSTOP */
     if (sig != SIGKILL && sig != SIGSTOP) {
-        struct sigaction *sa = &p->sigstate.actions[sig];
+        struct sigaction *sa = &sig_actions_of(p)[sig];
         if (sa->sa_handler == SIG_IGN) return;
     }
 
@@ -193,6 +202,7 @@ void signal_send(struct proc *p, int sig) {
         bool from_user = snd && snd != p && snd->pid > 0;
         p->sigstate.si_pid[sig] = from_user ? snd->pid : 0;
         p->sigstate.si_uid[sig] = from_user ? snd->uid : 0;
+        p->sigstate.si_code[sig] = SI_USER;   /* tgkill overrides after */
     }
 
     /* Unblock if asleep */
@@ -210,13 +220,61 @@ void signal_send(struct proc *p, int sig) {
     }
 }
 
+int signal_send_to_pid_checked(int pid, int sig) {
+    /* The shell runs as a kernel thread and never returns to user mode, so
+     * the normal delivery point -- the return-to-user path -- never runs for
+     * it and a `trap ... USR1` handler would never fire. shell_deliver_signal
+     * existed for exactly this and had no callers at all. Hand it the signal;
+     * the shell dispatches pending traps at the next command boundary, which
+     * is where POSIX says a trap action runs. */
+    if (shell_owns_pid(pid)) { shell_deliver_signal(sig); return 0; }
+    struct proc *p = proc_lookup(pid);
+    if (!p) return -1;
+    signal_send(p, sig);
+    return 0;
+}
+
 void signal_send_to_pid(int pid, int sig) {
-    signal_send(proc_lookup(pid), sig);
+    (void)signal_send_to_pid_checked(pid, sig);
+}
+
+/* Kernel-internal group send (tty/pty line discipline: ^C/^Z to the
+ * foreground group). No caller-permission model -- the tty IS the
+ * authority on who its foreground group is. */
+void signal_send_to_pgrp(int pgrp, int sig) {
+    if (pgrp <= 0) return;
+    extern struct proc g_proc[];
+    int hits = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pgrp) {
+            signal_send(&g_proc[i], sig);
+            hits++;
+        }
+    }
+    (void)hits;
 }
 
 void signal_send_to_foreground(int sig) {
-    if (g_foreground_pid > 0) {
+    if (g_foreground_pid <= 0) return;
+    /* A tty signal goes to the foreground JOB, not one pid: ^C must reach
+     * every stage of a foreground pipeline. The single-fg-pid model stays
+     * (nothing else changes who is foreground); delivery just follows the
+     * fg proc's process group when it has one. */
+    struct proc *fg = proc_lookup(g_foreground_pid);
+    int pg = (fg && fg->pgid > 0) ? fg->pgid : 0;
+    if (pg <= 0) {
         signal_send_to_pid(g_foreground_pid, sig);
+        return;
+    }
+    extern struct proc g_proc[];
+    for (int i = 1; i < PROC_MAX; i++) {
+        if (g_proc[i].state == PROC_UNUSED ||
+            g_proc[i].state == PROC_EMBRYO) continue;
+        int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+        if (gp == pg) signal_send_to_pid(g_proc[i].pid, sig);
     }
 }
 
@@ -224,10 +282,21 @@ bool signal_pending_self(void) {
     struct proc *p = current_proc();
     if (!p) return false;
     /* Pending signals not blocked by the mask */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
     /* SIGKILL and SIGSTOP cannot be blocked */
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     return deliverable != 0;
+}
+
+/* See signal.h: the handler table is a THREAD-GROUP property; a thread
+ * reads and writes its leader's copy. Falls back to the proc's own table
+ * when the leader is gone mid-teardown -- a stale snapshot beats a NULL. */
+struct sigaction *sig_actions_of(struct proc *p) {
+    if (p && p->is_thread) {
+        struct proc *ld = proc_lookup(p->tgid);
+        if (ld) return ld->sigstate.actions;
+    }
+    return p ? p->sigstate.actions : 0;
 }
 
 /* Determine default action for a signal */
@@ -257,7 +326,13 @@ static void signal_apply_default(struct proc *p, int sig) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d '%s' killed by signal %d\n",
                 p->pid, p->name, sig);
-        proc_exit(128 + sig);
+        /* GROUP-fatal, as POSIX requires: an uncaught fatal signal kills
+         * the PROCESS. proc_exit killed only the receiving thread -- a
+         * SIGSEGV in a worker left the rest of the process limping, which
+         * no crash handler, supervisor, or shell $? logic expects.
+         * proc_exit_group degenerates to proc_exit for the single-threaded
+         * case and for a leader (whose proc_exit already reaps threads). */
+        proc_exit_group(128 + sig);
     }
 
     /* action == 2: job-control stop. We are running as `p` (delivery happens
@@ -285,10 +360,44 @@ static void signal_apply_default(struct proc *p, int sig) {
         p->ptrace_stopped = 1;
         proc_wake_waiters(p->pid);
     }
+    /* Job control: record the stop so a WUNTRACED wait can report it
+     * exactly once. SIGCONT clears both fields. The parent gets SIGCHLD
+     * for the transition, as Linux sends it. */
+    p->stop_sig = sig;
+    p->stop_reported = false;
+    if (p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
     p->state = PROC_STOPPED;
     sched_yield();
     /* Resumed: by SIGCONT, or by the tracer's PTRACE_CONT/PTRACE_SYSCALL. */
     p->ptrace_stopped = 0;
+}
+
+/* Cooperative stop point for long-held syscall loops (nanosleep). The IRQ
+ * tick cannot stop a proc that is parked inside a syscall loop -- measured
+ * on the interactive gate, not assumed -- so such loops must offer the stop
+ * themselves. Consumes and applies ONE pending default-disposition stop
+ * signal; returns true if the proc stopped (and has since been continued).
+ * False means the stop signal is CAUGHT -- the caller should EINTR so the
+ * handler can run at syscall exit. */
+bool signal_take_pending_stop(void) {
+    struct proc *p = current_proc();
+    if (!p) return false;
+    uint64_t stops = p->pending_signals & SIGMASK_STOPS;
+    if (!stops) return false;
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++)
+        if (stops & SIGMASK(i)) { sig = i; break; }
+    if (sig != SIGSTOP) {
+        struct sigaction *sa = &sig_actions_of(p)[sig];
+        if (sa->sa_handler != SIG_DFL) return false;
+    }
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    signal_apply_default(p, sig);          /* parks here until SIGCONT */
+    return true;
 }
 
 /* Build a signal frame on the user stack and redirect the saved syscall
@@ -480,7 +589,7 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
      * expects (native or Linux ABI layout), and pass their addresses in
      * RSI/RDX. regs->rcx/r11 hold the user's RIP/RFLAGS on the sysret frame. */
     if (siginfo) {
-        if (!sig_emit_info_uctx(p, sig, SI_USER, 0, ctx,
+        if (!sig_emit_info_uctx(p, sig, p->sigstate.si_code[sig], 0, ctx,
                                 regs->rcx, regs->r11,
                                 info_addr, uctx_addr, linux_layout)) {
             kprintf("[signal] pid=%d sig %d: cannot write siginfo/ucontext\n",
@@ -541,7 +650,17 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
 
     /* Lowest-numbered deliverable signal (unblocked, plus the two that can
      * never be blocked). */
-    uint32_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    /* RT-signal trace, delivery side (capped). */
+    if (p->pending_signals >> 32) {
+        static int rtd = 0;
+        if (rtd < 16) { rtd++;
+            kprintf("[rtdlv] pid=%d pend=0x%llx mask=0x%llx deliv=0x%llx regs=%d\n",
+                    p->pid, (unsigned long long)p->pending_signals,
+                    (unsigned long long)p->sigstate.mask,
+                    (unsigned long long)deliverable, regs ? 1 : 0);
+        }
+    }
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
     if (deliverable == 0) return;
 
@@ -551,7 +670,7 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     }
     if (sig == 0) return;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
 
     /* A caught (user-handler) signal can only be delivered when we have a
      * trapframe to rewrite. On the IRQ path we leave it pending so the next
@@ -564,11 +683,11 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     p->pending_signals  &= ~SIGMASK(sig);
     p->sigstate.pending &= ~SIGMASK(sig);
 
-    /* SIGKILL is always fatal and can never be caught. */
+    /* SIGKILL is always fatal, can never be caught, and kills the GROUP. */
     if (sig == SIGKILL) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d killed by SIGKILL\n", p->pid);
-        proc_exit(128 + sig);
+        proc_exit_group(128 + sig);
     }
 
     if (sa->sa_handler == SIG_IGN) return;
@@ -626,10 +745,70 @@ void signal_tick_alarms(void) {
         p->alarm_deadline_ns = 0;         /* clear BEFORE raising: one-shot */
         signal_send(p, SIGALRM);          /* full send: also WAKES a blocked proc */
     }
+    /* POSIX interval timers ride the same sweep + clock (ptimer.c). */
+    { extern void ptimer_tick(void); ptimer_tick(); }
+    /* vDSO time-constant republish (2026-08-23): compare-and-skip when
+     * nothing changed, so TSC recalibration and the first RTC latch
+     * reach userspace within one ~10 ms tick. */
+    { extern void vdso_refresh(void); vdso_refresh(); }
 }
 
 void signal_deliver_if_pending(void) {
     signal_deliver(0, 0, -1);
+}
+
+/* CAUGHT signals, delivered from the TIMER IRQ.
+ *
+ * 2026-08-25. signal_deliver() refuses a caught signal when it has no
+ * trapframe to rewrite ("on the IRQ path we leave it pending so the next
+ * syscall return delivers it"), and the PIT calls it with regs = NULL. That
+ * reasoning has a hole: A PROCESS SPINNING IN USERSPACE MAKES NO SYSCALLS,
+ * so "the next syscall return" never comes and the signal stays pending
+ * forever. pit.c's comment claims this path is "what makes a CPU-bound user
+ * loop killable by Ctrl+C" -- true only while the process takes the DEFAULT
+ * action. Install a handler, as every shell must, and the same loop becomes
+ * uninterruptible.
+ *
+ * Found via /bin/tsh: `while :; do :; done` runs entirely in builtins, so
+ * there is no child for the tty to signal AND no syscall for the shell's
+ * own SIGINT to ride home on. ^C did nothing at all.
+ *
+ * The frame-building is signal_deliver_fault()'s, unchanged -- it already
+ * turns a `struct regs` into a handler entry, and an IRQ trapframe has the
+ * same shape as the exception one. si_code is SI_USER (a tty/kill-generated
+ * signal, not a fault) and there is no fault address.
+ *
+ * Returns true if a handler was entered; false leaves everything pending so
+ * the caller's default-disposition path runs exactly as before. Takes NO
+ * locks: signal_send() must never be called from here (see the deadlock
+ * recorded above signal_tick_alarms) and this does not. */
+bool signal_deliver_irq(struct regs *r) {
+    struct proc *p = current_proc();
+    if (!r || !p || p->pid == 0 || p->pending_signals == 0) return false;
+
+    uint64_t deliverable = p->pending_signals & ~p->sigstate.mask;
+    deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (deliverable == 0) return false;
+
+    int sig = 0;
+    for (int i = 1; i < SIG_MAX; i++) {
+        if (deliverable & SIGMASK(i)) { sig = i; break; }
+    }
+    if (sig == 0) return false;
+
+    /* SIGKILL/SIGSTOP and the default/ignore dispositions are the existing
+     * path's business -- it can already act on them without a trapframe. */
+    struct sigaction *sa = &sig_actions_of(p)[sig];
+    if (sig == SIGKILL || sig == SIGSTOP ||
+        sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
+
+    if (!signal_deliver_fault(r, sig, SI_USER, 0)) return false;
+
+    /* Consumed only once the frame is really built: a failed setup must
+     * leave the signal pending rather than swallow it. */
+    p->pending_signals  &= ~SIGMASK(sig);
+    p->sigstate.pending &= ~SIGMASK(sig);
+    return true;
 }
 
 /* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
@@ -659,7 +838,7 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     if (!p || p->pid == 0) return false;
     if (sig <= 0 || sig >= SIG_MAX) return false;
 
-    struct sigaction *sa = &p->sigstate.actions[sig];
+    struct sigaction *sa = &sig_actions_of(p)[sig];
     if (sa->sa_handler == SIG_DFL || sa->sa_handler == SIG_IGN) return false;
     if (p->sigstate.restorer == 0) return false;
     /* A fault arriving while its own signal is blocked is undefined in POSIX
@@ -748,7 +927,7 @@ int sys_sigaction(int sig, const void *uact, void *uoldact) {
     if (sig <= 0 || sig >= SIG_MAX) return -22; /* EINVAL */
     if (sig == SIGKILL || sig == SIGSTOP) return -22; /* can't change */
 
-    struct sigaction *cur = &p->sigstate.actions[sig];
+    struct sigaction *cur = &sig_actions_of(p)[sig];
 
     if (uoldact) {
         struct abi_sigaction old = {
@@ -845,6 +1024,55 @@ long sys_sigreturn(void) {
     return (long)ctx->rax;          /* becomes user RAX after SYSRETQ */
 }
 
+/* tkill/tgkill: THREAD-directed, so the process-directed retarget in
+ * sys_kill must NOT apply -- glibc's pthread_kill aims at one specific
+ * thread (the NPTL setxid/cancel broadcasts depend on exactly that), and
+ * rerouting it would deliver a cancellation to the wrong sibling. tgid > 0
+ * is verified against the target's real group (ESRCH on mismatch); pass
+ * tgid <= 0 for tkill's unchecked form. */
+int sys_tgkill(int tgid, int tid, int sig) {
+    if (sig < 0 || sig >= SIG_MAX) return -22;
+    struct proc *p = current_proc();
+    if (!p) return -1;
+    int ktid = pid_knr(tid);
+    if (!ktid) return -3;                              /* ESRCH */
+    struct proc *t = proc_lookup(ktid);
+    if (!t) return -3;
+    if (tgid > 0) {
+        int kgid = t->is_thread ? t->tgid : t->pid;
+        struct proc *ld = proc_lookup(kgid);
+        int vgid = ld ? pid_vnr(ld) : kgid;
+        if (vgid != tgid) return -3;                   /* tid not in tgid */
+    }
+    /* RT-signal trace (NPTL setxid/cancel debugging): name each link of
+     * the chain, capped. */
+    if (sig >= 32) {
+        static int tgk = 0;
+        if (tgk < 16) { tgk++;
+            struct sigaction *sa = &sig_actions_of(t)[sig];
+            kprintf("[tgk] %d->tid %d sig=%d tstate=%d hnd=%p mask=0x%llx "
+                    "pend(pre)=0x%llx\n",
+                    p->pid, t->pid, sig, (int)t->state,
+                    (void *)sa->sa_handler,
+                    (unsigned long long)t->sigstate.mask,
+                    (unsigned long long)t->pending_signals);
+        }
+    }
+    signal_send(t, sig);
+    if (sig > 0) {
+        /* Linux stamps the sender's TGID (glibc's handlers compare si_pid
+         * against their getpid(), which is the tgid) -- a thread's own tid
+         * here would make the anti-spoof check reject a legitimate
+         * broadcast sent from any non-main thread. */
+        int spid = p->is_thread ? p->tgid : p->pid;
+        struct proc *sld = proc_lookup(spid);
+        t->sigstate.si_pid[sig] = pid_vnr_in(t->pid_ns, sld ? sld->pid : spid);
+        t->sigstate.si_uid[sig] = p->uid;
+        t->sigstate.si_code[sig] = SI_TKILL;   /* the NPTL anti-spoof check */
+    }
+    return 0;
+}
+
 int sys_kill(int pid, int sig) {
     if (sig < 0 || sig >= SIG_MAX) return -22;
 
@@ -865,19 +1093,45 @@ int sys_kill(int pid, int sig) {
         if (!kpid) return -3;                        /* not visible => ESRCH */
         struct proc *target = proc_lookup(kpid);
         if (!target) return -3; /* ESRCH */
+        /* PROCESS-directed delivery (2026-08-22): kill(pid) targets the
+         * PROCESS, and POSIX says any thread with the signal unblocked may
+         * take it. This used to land on the leader's slot unconditionally,
+         * so a leader that blocked the signal pinned it pending forever
+         * while a sibling sat ready to handle it. SIGKILL/SIGSTOP skip the
+         * scan -- they act regardless of masks. */
+        if (!target->is_thread && sig > 0 &&
+            sig != SIGKILL && sig != SIGSTOP &&
+            (target->sigstate.mask & SIGMASK(sig))) {
+            extern struct proc g_proc[];
+            for (int i = 1; i < PROC_MAX; i++) {
+                struct proc *q = &g_proc[i];
+                if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO)
+                    continue;
+                if (!q->is_thread || q->tgid != target->pid) continue;
+                if (q->sigstate.mask & SIGMASK(sig)) continue;
+                target = q;                          /* it can take it now */
+                break;
+            }
+        }
         signal_send(target, sig);
         if (sig > 0) {
             target->sigstate.si_pid[sig] = pid_vnr_in(target->pid_ns, p->pid);
             target->sigstate.si_uid[sig] = p->uid;
         }
     } else if (pid == 0) {
-        /* Send to all processes in the same process group (simplified:
-         * send to all in same session) */
+        /* kill(0, sig): the CALLER'S PROCESS GROUP. The old "simplified:
+         * whole session" reading was harmless while pgids were lies, and
+         * became a live bug the moment they weren't: interactive bash's
+         * job-control init does kill(0, SIGTTIN) when it is not foreground,
+         * and the session broadcast stopped login and the gate runner
+         * along with bash itself. */
         extern struct proc g_proc[];
+        int mypg = p->pgid > 0 ? p->pgid : p->pid;
         for (int i = 1; i < PROC_MAX; i++) {
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO &&
-                g_proc[i].session_id == p->session_id) {
+                gp == mypg) {
                 /* A broadcast must not escape the caller's pid namespace: a
                  * container that can signal the host is not a container. The
                  * visibility map is the whole check. */
@@ -905,6 +1159,29 @@ int sys_kill(int pid, int sig) {
                 }
             }
         }
+    } else {
+        /* kill(-pgid): the whole process group. This branch DID NOT EXIST
+         * -- a negative pid fell through every arm and returned 0, so
+         * `kill -- -$!` reported success while signalling nobody. ESRCH
+         * when the group has no member the caller can see, like Linux. */
+        int pg = -pid;
+        extern struct proc g_proc[];
+        bool any = false;
+        for (int i = 1; i < PROC_MAX; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+            if (gp != pg) continue;
+            if (!pid_ns_can_see(p, &g_proc[i])) continue;
+            if (sig > 0) {
+                signal_send(&g_proc[i], sig);
+                g_proc[i].sigstate.si_pid[sig] =
+                    pid_vnr_in(g_proc[i].pid_ns, p->pid);
+                g_proc[i].sigstate.si_uid[sig] = p->uid;
+            }
+            any = true;
+        }
+        if (!any) return -3;                        /* ESRCH */
     }
     return 0;
 }

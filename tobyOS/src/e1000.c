@@ -82,6 +82,7 @@
 
 /* RCTL bits. */
 #define RCTL_EN          (1u << 1)
+#define RCTL_MPE         (1u << 4)       /* multicast promiscuous */
 #define RCTL_BAM         (1u << 15)      /* broadcast accept */
 #define RCTL_BSIZE_2048  0u
 #define RCTL_SECRC       (1u << 26)      /* strip CRC */
@@ -247,6 +248,13 @@ static bool e1000_setup_rx(void) {
         RCTL_EN |
         RCTL_BAM |
         RCTL_UPE |        /* temporary debug: accept all unicast frames */
+        /* MPE (2026-08-23): the MTA below is zeroed and nothing ever
+         * programs it, so without multicast-promiscuous EVERY multicast
+         * frame died in the filter -- including all IPv6 Router
+         * Advertisements (ff02::1 -> MAC 33:33:00:00:00:01) and NDP
+         * solicited-node traffic. SLAAC could only ever pass its
+         * synthetic selftest; on the real wire the stack was RX-deaf. */
+        RCTL_MPE |
         RCTL_SECRC |
         RCTL_BSIZE_2048;
 

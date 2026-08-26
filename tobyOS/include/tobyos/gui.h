@@ -83,6 +83,7 @@ enum compositor_mode {
 #define GUI_EV_KEY           4
 #define GUI_EV_CLOSE         5
 #define GUI_EV_RESIZE        6
+#define GUI_EV_WHEEL         7   /* 2026-08-23; wheel detents in .wheel */
 
 /* Window states for minimize/maximize/restore */
 #define GUI_WIN_NORMAL       0
@@ -105,7 +106,14 @@ struct gui_event {
     int     y;           /* mouse: client-area y; key: 0 */
     uint8_t button;      /* mouse buttons bitmask (LEFT/RIGHT/MIDDLE) */
     uint8_t key;         /* key event: ASCII code, 0 otherwise */
-    uint8_t _pad[2];
+    /* GUI_EV_WHEEL: signed detents, + = away from the user (scroll up).
+     * Deliberately carved out of the existing _pad rather than appended:
+     * this struct is copied verbatim to userspace by SYS_GUI_POLL_EVENT,
+     * so growing it would break every already-built program. x/y still
+     * carry the pointer position, so a handler can scroll whatever is
+     * under the cursor. */
+    int8_t  wheel;
+    uint8_t _pad[1];
 };
 
 /* ---- forward declarations ----------------------------------------- */
@@ -265,6 +273,13 @@ void gui_window_blend_coverage(struct window *w, int x, int y,
                                const uint8_t *cov, int gw, int gh, uint32_t xrgb);
 int gui_window_text(struct window *w, int x, int y, const char *s,
                     uint32_t fg, uint32_t bg);
+/* 2026-08-24: genuinely MONOSPACED window text -- 8x16 VGA cell, fixed 8px
+ * advance, opaque `bg` (unless GFX_TRANSPARENT). gui_window_text() renders
+ * proportional TrueType whenever a font is loaded, which is always, so a
+ * character grid (terminal, hex view, anything column-aligned) cannot be
+ * built on it. See the comment at the definition. */
+int gui_window_text_mono(struct window *w, int x, int y, const char *s,
+                         uint32_t fg, uint32_t bg, int cell_h);
 /* M27D: scaled bitmap text into a window backbuf.
  * scale = 1..N -- each source pixel becomes a scale-x-scale block.
  * smooth != 0  -- additionally lay a half-alpha wedge on each

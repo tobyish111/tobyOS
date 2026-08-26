@@ -24,6 +24,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/klibc.h>
+#include <tobyos/printk.h>
 #include <tobyos/cpu.h>
 
 #define PTY_MAX  8
@@ -171,6 +172,53 @@ void pty_clone_ref(struct file *f) {
     else                                 t->slave_refs++;
 }
 
+/* ---- canonical line editing (master-write time) -----------------
+ *
+ * 2026-08-24. VERASE and VKILL used to be applied only when the slave
+ * ASSEMBLED a line (slave_canonical_read below), which got the buffer
+ * right and the SCREEN wrong: the erase byte itself was echoed back to
+ * the master verbatim, so a terminal drew a 0x7F and left the rubbed-out
+ * character on display. The command that ran and the command you could
+ * see stopped agreeing -- visible in the EliteDesk serial log as the
+ * kernel reporting paths nobody had typed.
+ *
+ * n_tty does this editing at input-processing time, and that is the only
+ * place with the context to echo a rub-out, so it moves here. The
+ * read-time arms stay as a fallback for bytes that were written while
+ * ICANON was off and are read after it came back on. */
+
+/* Visible columns one echoed input byte occupies. Control characters
+ * echo as two ("^C"); tab is echoed literally and its width depends on
+ * the column, so it counts as one -- the conservative choice, since
+ * over-erasing would eat the prompt. */
+static int echo_width(uint8_t c) {
+    return (c < 0x20 && c != '\t') ? 2 : 1;
+}
+
+/* Is the current, still-unterminated line empty? Everything after the
+ * last newline in the input ring is that line. Erase must never reach
+ * back past a newline into a line the program has already been given. */
+static bool pending_line_empty(struct pty *t) {
+    if (t->in_head == t->in_tail) return true;
+    size_t prev = (t->in_head - 1) & (PTY_BUF - 1);
+    return t->in[prev] == '\n';
+}
+
+static void erase_one(struct pty *t) {
+    if (pending_line_empty(t)) return;            /* nothing to take back */
+    size_t prev = (t->in_head - 1) & (PTY_BUF - 1);
+    uint8_t victim = t->in[prev];
+    t->in_head = prev;                            /* un-push */
+    if ((t->tio.c_lflag & TTY_ECHO) && (t->tio.c_lflag & TTY_ECHOE)) {
+        int w = echo_width(victim);
+        for (int i = 0; i < w; i++) {
+            ring_push(t->out, &t->out_head, t->out_tail, '\b');
+            ring_push(t->out, &t->out_head, t->out_tail, ' ');
+            ring_push(t->out, &t->out_head, t->out_tail, '\b');
+        }
+    }
+}
+
 /* ---- echo (master-write time, slave ECHO set) ------------------- */
 static void echo_to_master(struct pty *t, uint8_t c) {
     if (!(t->tio.c_lflag & TTY_ECHO)) return;
@@ -195,6 +243,42 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
         uint8_t c = in[put];
         if ((t->tio.c_iflag & TTY_ICRNL) && c == '\r') c = '\n';
         else if ((t->tio.c_iflag & TTY_INLCR) && c == '\n') c = '\r';
+        /* ISIG: ^C and ^Z are SIGNALS to the foreground group, not input
+         * bytes. They echo (^C / ^Z) like every control char, and never
+         * reach the input ring -- exactly n_tty. Nothing acted on these
+         * before this slice; ^Z on a pty was two bytes of data. */
+        if ((t->tio.c_lflag & TTY_ISIG) && t->pgrp > 0) {
+            if (c == t->tio.c_cc[TTY_VINTR]) {
+                echo_to_master(t, c);
+                signal_send_to_pgrp(t->pgrp, SIGINT);
+                continue;
+            }
+            if (c == t->tio.c_cc[TTY_VSUSP]) {
+                echo_to_master(t, c);
+                signal_send_to_pgrp(t->pgrp, SIGTSTP);
+                continue;
+            }
+        }
+        /* ICANON editing, applied HERE rather than at line-assembly time
+         * so the rub-out can be echoed. See erase_one() above. */
+        if (t->tio.c_lflag & TTY_ICANON) {
+            if (c == t->tio.c_cc[TTY_VERASE]) { erase_one(t); continue; }
+            if (c == t->tio.c_cc[TTY_VKILL]) {
+                /* ECHOKE rubs the line out column by column; plain ECHOK
+                 * (what our defaults set, and what POSIX specifies for the
+                 * flag) just moves to a fresh line. Either way the line
+                 * itself goes. */
+                bool ke = (t->tio.c_lflag & TTY_ECHOKE) != 0;
+                while (!pending_line_empty(t)) {
+                    if (ke) erase_one(t);
+                    else { t->in_head = (t->in_head - 1) & (PTY_BUF - 1); }
+                }
+                if (!ke && (t->tio.c_lflag & TTY_ECHO) &&
+                    (t->tio.c_lflag & TTY_ECHOK))
+                    echo_to_master(t, '\n');
+                continue;
+            }
+        }
         ring_push(t->in, &t->in_head, t->in_tail, c);
         echo_to_master(t, c);
     }

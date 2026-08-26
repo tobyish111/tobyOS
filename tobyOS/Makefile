@@ -48,6 +48,27 @@ OVMF_VARS_SZ  := 540672
 # after this change no .d files exist yet, and stale objects from before it
 # would otherwise never notice a header edit. It costs a full kernel rebuild
 # when a top-level header is touched -- exactly the old behaviour, no worse.
+#
+# 2026-08-24 -- WHAT THIS STILL DOES NOT COVER, and what does.
+#
+# -MMD OMITS HEADERS FOUND VIA -isystem, and user programs get libtoby's
+# headers exactly that way (LIBTOBY_CFLAGS = ... -isystem $(LIBTOBY_INC)).
+# So every program .d file listed its own main.c and nothing else --
+# `wc -l programs/user_rm/user_rm.d` was 1 -- and editing
+# libtoby/include/sys/stat.h rebuilt libtoby while leaving every program's
+# object compiled against the OLD struct. That is not a stale build, it is
+# a silent ABI split: libtoby writes N bytes into a struct its caller sized
+# at M. The "touch all program sources when a struct grows" rule this block
+# says it retired was therefore still live for the directory it was written
+# about.
+#
+# -MD (which does list -isystem headers) was tried and REJECTED: on this
+# toolchain it also emits clang's own builtin headers by ABSOLUTE path
+# ("C:/msys64/ucrt64/lib/clang/22/include/stddef.h"), and a Windows drive
+# letter in a make prerequisite is a colon where make expects a target
+# separator. The fix is instead an explicit $(LIBTOBY_HEADERS) prerequisite
+# on every program object -- the same belt-and-braces the kernel already
+# gets from $(HEADERS). See LIBTOBY_PROGRAM_RULES.
 DEPFLAGS := -MMD -MP
 
 CFLAGS := --target=x86_64-elf \
@@ -124,6 +145,9 @@ C_SRCS := src/kernel.c \
           src/tss.c \
           src/syscall.c \
           src/acpi.c \
+          src/smbios.c \
+          src/cputherm.c \
+          src/cpufreq_msr.c \
           src/apic.c \
           src/smp.c \
           src/vfs.c \
@@ -171,12 +195,18 @@ C_SRCS := src/kernel.c \
           src/blk_offset.c \
           src/partition.c \
           src/provision.c \
+          src/fsmatrix.c \
           src/tobyfs.c \
           src/fat32.c \
           src/ext4.c \
           src/ext2.c \
           src/usb_msc.c \
           src/file.c \
+          src/flock.c \
+          src/ptimer.c \
+          src/xattr.c \
+          src/sysvipc.c \
+          src/vdso.c \
           src/pipe.c \
           src/signal.c \
           src/pci.c \
@@ -330,7 +360,8 @@ C_SRCS := src/kernel.c \
 S_SRCS := src/isr_stubs.S \
           src/syscall_entry.S \
           src/ap_trampoline.S \
-          src/proc_switch.S
+          src/proc_switch.S \
+          src/vdso_blob.S
 
 # stage 13H: BearSSL X.509 chain validation (RSA + ECDSA) for TLS cert
 # verification. The decode/verify-only subset of the vendored reference
@@ -405,13 +436,15 @@ HEADERS := $(wildcard include/tobyos/*.h)
 # Full rules live further below. We declare the per-tool ELF list up
 # here so PROGRAMS (built with := immediate-expansion) can reference it.
 PORTS_SBASE_DIR    := ports/sbase
-PORTS_SBASE_TOOLS  := echo cat wc head ls grep
+PORTS_SBASE_TOOLS  := echo cat wc head ls grep \
+                      basename dirname sleep tee expr tr cut uniq sort
 PORTS_SBASE_ELFS   := $(addprefix $(PORTS_SBASE_DIR)/,$(addsuffix .elf,$(PORTS_SBASE_TOOLS)))
 
 # Programs built and bundled into the boot initrd. Each is a tiny
 # static ELF; programs/user_hello/user_hello.elf becomes /bin/hello
 # inside the initramfs (see initrd-stage rules below).
-PROGRAMS := programs/hello/hello.elf \
+PROGRAMS := programs/awk/awk.elf \
+            programs/hello/hello.elf \
             programs/user_hello/user_hello.elf \
             programs/user_bad/user_bad.elf \
             programs/user_echo/user_echo.elf \
@@ -448,6 +481,17 @@ PROGRAMS := programs/hello/hello.elf \
             programs/c_alloctest/c_alloctest.elf \
             programs/c_envtest/c_envtest.elf \
             programs/c_dynhello/c_dynhello.elf \
+            programs/lscpu/lscpu.elf \
+            programs/lspci/lspci.elf \
+            programs/lsusb/lsusb.elf \
+            programs/dmidecode/dmidecode.elf \
+            programs/sensors/sensors.elf \
+            programs/cpupower/cpupower.elf \
+            programs/tvi/tvi.elf \
+            programs/tvitest/tvitest.elf \
+            programs/tedit/tedit.elf \
+            programs/fsprobe/fsprobe.elf \
+            programs/datavol/datavol.elf \
             programs/devlist/devlist.elf \
             programs/drvtest/drvtest.elf \
             programs/usbtest/usbtest.elf \
@@ -493,6 +537,7 @@ PROGRAMS := programs/hello/hello.elf \
             programs/user_df/user_df.elf \
             programs/user_mkdir/user_mkdir.elf \
             programs/user_touch/user_touch.elf \
+            programs/user_kill/user_kill.elf \
             programs/user_tail/user_tail.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
@@ -507,6 +552,13 @@ PROGRAMS := programs/hello/hello.elf \
             programs/pkgmgr/pkgmgr.elf \
             programs/init/init.elf \
             programs/sh/sh.elf \
+            programs/shparity/shparity.elf \
+            programs/oilspec/oilspec.elf \
+            programs/id/id.elf \
+            programs/newgrp/newgrp.elf \
+            programs/ttyparity/ttyparity.elf \
+            programs/spechelp/spechelp.elf \
+            programs/tsh/tsh.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
@@ -535,6 +587,12 @@ PROGRAMS := programs/hello/hello.elf \
 INITRD_STAGE := build/initrd
 INITRD_TAR   := build/initrd.tar
 
+# Bash-parity corpus. Wildcarded on purpose -- this is the ONE place the
+# initrd's otherwise-explicit file list uses a glob, because the corpus is
+# meant to grow a case at a time and a case that silently failed to ship
+# would show up as a PASS. The tar list globs the staged copies to match.
+SHPARITY_CASES := $(wildcard initrd/etc/shparity/*.sh)
+
 # ---------- Disk image (tobyfs, milestone 6) ----------
 #
 # Backed by a 4 MiB raw file passed to QEMU as the IDE primary master.
@@ -546,6 +604,14 @@ INITRD_TAR   := build/initrd.tar
 DISK_IMG       := disk.img
 MKFS_SRC       := tools/mkfs_tobyfs.c
 MKFS_BIN       := build/mkfs_tobyfs
+LDSOCACHE_SRC  := tools/mkldsocache.c
+LDSOCACHE_BIN  := build/mkldsocache
+# vDSO (2026-08-23): a real Linux shared object built alongside the kernel
+# and embedded via src/vdso_blob.S. Compiled with LINUX-target flags, NOT
+# the freestanding kernel CFLAGS -- it runs in ring 3 of a glibc process.
+VDSO_SRC := tools/vdso/vdso.c
+VDSO_MAP := tools/vdso/vdso.map
+VDSO_SO  := build/vdso_image.so
 MKPKG_SRC      := tools/mkpkg.c
 MKPKG_BIN      := build/mkpkg
 MKDISK_GPT_SRC := tools/mkdisk_gpt.c
@@ -1198,6 +1264,15 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # <tobyos/abi/abi.h> by adding `-I ../../include` themselves.
 LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3
 
+# Every public libtoby header, as an explicit prerequisite for user-program
+# objects. -MMD cannot see these (they arrive through -isystem; see the
+# DEPFLAGS note at the top), so without this list a change to struct stat or
+# struct tk_event rebuilds libtoby and leaves every program's object holding
+# the old layout. Coarse on purpose: touching any libtoby header rebuilds
+# every program, which is what the kernel already does with $(HEADERS).
+LIBTOBY_HEADERS := $(wildcard $(LIBTOBY_INC)/*.h $(LIBTOBY_INC)/sys/*.h \
+                              $(LIBTOBY_INC)/toby/*.h $(LIBTOBY_INC)/toby/*.hpp)
+
 # ---------- Milestone 25D: libtoby.so (shared variant) ----------
 #
 # Same source files as libtoby.a, rebuilt with -fPIC and linked as a
@@ -1342,7 +1417,7 @@ ldtoby: $(LDTOBY_SO)
 # Helper template: link a user program with crt0.o + main.o + libtoby.a.
 # Args: $(1) = directory under programs/, $(2) = output name (defaults to dir).
 define LIBTOBY_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1364,7 +1439,7 @@ define LIBTOBY_KABI_PROGRAM_RULES
 # programs. EXTRA_CFLAGS only reaches kernel objects, so -DCHROME_FULL
 # silently missed chromewin and it exec'd the (now unstaged) headless-shell
 # path -- an exit-127 that looked like a loader failure.
-programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CC) $$(LIBTOBY_CFLAGS) $$(PROG_EXTRA_CFLAGS) -I include -c $$< -o $$@
 
 programs/$(1)/$(2).elf: programs/$(1)/$(2).o \
@@ -1380,7 +1455,7 @@ endef
 # The program's own program.ld must define the .init_array/.fini_array
 # bounds for static constructors (see programs/user_cpptest/program.ld).
 define LIBTOBY_CPP_PROGRAM_RULES
-programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR)
+programs/$(1)/$(2).o: programs/$(1)/main.cpp $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
 	$$(CXX) $$(filter-out -std=c11,$$(LIBTOBY_CFLAGS)) \
 	      -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -c $$< -o $$@
 
@@ -1459,6 +1534,17 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,c_filedemo,c_filedemo))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_alloctest,c_alloctest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,c_envtest,c_envtest))
 $(eval $(call LIBTOBY_PROGRAM_RULES,init,init))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lspci,lspci))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lscpu,lscpu))
+$(eval $(call LIBTOBY_PROGRAM_RULES,lsusb,lsusb))
+$(eval $(call LIBTOBY_PROGRAM_RULES,dmidecode,dmidecode))
+$(eval $(call LIBTOBY_PROGRAM_RULES,sensors,sensors))
+$(eval $(call LIBTOBY_PROGRAM_RULES,cpupower,cpupower))
+$(eval $(call LIBTOBY_PROGRAM_RULES,tvi,tvi))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,tvitest,tvitest))
+$(eval $(call LIBTOBY_PROGRAM_RULES,tedit,tedit))
+$(eval $(call LIBTOBY_PROGRAM_RULES,fsprobe,fsprobe))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,datavol,datavol))
 
 # ---------- M26A: peripheral test harness userland tools ----------
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,devlist,devlist))
@@ -1573,6 +1659,62 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,pkgmgr,pkgmgr))
 
 # ---------- Advanced userland: shell, utilities, networking, GUI ----------
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
+# /bin/shparity -- the bash-parity gate. Runs every /etc/shparity/*.sh case
+# under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
+# byte-identical stdout plus an identical exit status. See programs/shparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,shparity,shparity))
+
+# /bin/id and /bin/newgrp -- POSIX identity utilities. newgrp changes the
+# real/effective gid (checked against /etc/group membership) and execs a
+# fresh shell; id is its observer. Both read /etc/passwd + /etc/group.
+$(eval $(call LIBTOBY_PROGRAM_RULES,id,id))
+$(eval $(call LIBTOBY_PROGRAM_RULES,newgrp,newgrp))
+
+# /bin/ttyparity -- the INTERACTIVE bash-parity gate: both shells on real
+# pty pairs, transcripts compared byte-for-byte. See programs/ttyparity.
+$(eval $(call LIBTOBY_PROGRAM_RULES,ttyparity,ttyparity))
+# /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
+# as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
+# rather than the 54 cases we wrote ourselves. See programs/oilspec.
+$(eval $(call LIBTOBY_PROGRAM_RULES,oilspec,oilspec))
+# The corpus's Python helpers (argv.py and friends) reimplemented in C, so the
+# gate does not depend on CPython and the host oracle runs the SAME code.
+$(eval $(call LIBTOBY_PROGRAM_RULES,spechelp,spechelp))
+
+# ---------- /bin/tsh: the shell language, hosted in userspace ----------
+#
+# src/shell.c is compiled TWICE -- once into the kernel (where the keyboard
+# poll loop drives it) and once here, where programs/tsh/host.c does. One
+# language implementation, two hosts, so the expansion/arithmetic/glob core
+# cannot drift between the kernel shell and /bin/tsh.
+#
+# The kernel object and this one are built from the same file with different
+# flags into DIFFERENT output paths, so neither can clobber the other. Note
+# -I include: shell.c speaks the kernel's headers (vfs.h, proc.h, file.h) and
+# the host implements that interface rather than the other way round.
+TSH_OBJS := programs/tsh/shell_hosted.o \
+            programs/tsh/host.o \
+            programs/tsh/kstubs.o
+
+# -DSHELL_HOSTED: userspace exposes only the POSIX/bash builtin set, so the
+# kernel shell's convenience builtins (cat, ls, mkdir, ...) stop shadowing the
+# real utilities in /bin. See shell_hosted_builtin() in src/shell.c.
+# EXTRA_CFLAGS must reach THIS copy too. src/shell.c is compiled twice, and a
+# -D passed on the make line used to land only in the kernel's copy -- so
+# instrumentation added to diagnose a /bin/tsh failure silently was not in
+# /bin/tsh, and its absent output read as "this code path is never reached".
+# Same shape as the PROG_EXTRA_CFLAGS trap: a define reaching one half of a
+# twice-compiled file.
+programs/tsh/shell_hosted.o: src/shell.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) $(EXTRA_CFLAGS) -I include -DSHELL_HOSTED -c $< -o $@
+
+programs/tsh/%.o: programs/tsh/%.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/tsh/tsh.elf: $(TSH_OBJS) $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      programs/tsh/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/tsh/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) $(TSH_OBJS) $(LIBTOBY_AR)
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_pkg,user_pkg))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_svcctl,user_svcctl))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ps,user_ps))
@@ -1588,6 +1730,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_df,user_df))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_kill,user_kill))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
@@ -1971,6 +2114,16 @@ programs/linux-static-auto/linux-static-auto.elf: programs/linux-static-auto/mai
 # GetStdHandle / WriteFile / ExitProcess. PE is self-identifying by its
 # 'MZ' magic, so -- unlike the brandelf'd Linux ELFs -- it needs NO brand;
 # tobyOS's exec path sniffs the magic and routes it to the PE loader.
+# awk keeps numeric values as doubles, so this one program needs SSE
+# re-enabled -- the default userland flags disable it kernel-style.
+programs/awk/awk.o: programs/awk/main.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -msse -msse2 -c $< -o $@
+
+programs/awk/awk.elf: programs/awk/awk.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                      $(PORTS_SBASE_LD)
+	$(LD) $(PROG_LDFLAGS) -T $(PORTS_SBASE_LD) -o $@ \
+	      $(LIBTOBY_CRT0) programs/awk/awk.o $(LIBTOBY_AR)
+
 programs/win-hello/win-hello.exe: programs/win-hello/hello.c
 	$(CC) --target=x86_64-w64-mingw32 -nostdlib -ffreestanding -fno-builtin \
 	      -fno-stack-protector -O1 -Wl,-e,hello_entry -Wl,--subsystem,console \
@@ -2420,7 +2573,11 @@ programs/user_gui_about/user_gui_about.elf: \
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_term,user_gui_term))
 
 # File Explorer -- migrated to TobyTK (crt0 + libtoby.a).
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_files,user_gui_files))
+# KABI variant: the Format action speaks the real <tobyos/abi/abi.h>
+# (abi_blk_info / abi_provision_req / the ABI_PROV_F_* flags) rather than
+# hand-mirroring a 160-byte struct whose layout is frozen by a static
+# assert the mirror would not be subject to.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_files,user_gui_files))
 
 # File viewer (text/hex) -- migrated to TobyTK; monospace via tk_draw_text_mono.
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_viewer,user_gui_viewer))
@@ -2535,7 +2692,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 # (bin/, lib/, etc/, repo/, ...) are exact -- this caveat is only the
 # opt-in third-party trees.
 
-$(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
+$(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf \
                programs/linux-xdg-settings/linux-xdg-settings.elf \
                programs/linux-crashpad/linux-crashpad.elf \
                programs/linux-sigtest/linux-sigtest.elf \
@@ -2627,7 +2784,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
                $(HELLOAPP_TPKG_SIGNED) $(HELLOAPP_TPKG_SIG_UNKNOWN) \
                $(HELLOAPP_TPKG_SIG_TAMPER) \
                $(HELLOAPP_TPKG_CAPS_RO) \
-               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile
+               initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile \
+               $(SHPARITY_CASES)
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
@@ -2771,6 +2929,17 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp initrd/etc/c19b.lua                            $(INITRD_STAGE)/etc/c19b.lua
 	cp initrd/etc/c20.lua                             $(INITRD_STAGE)/etc/c20.lua
 	cp initrd/etc/c21.lua                             $(INITRD_STAGE)/etc/c21.lua
+	cp programs/lscpu/lscpu.elf                       $(INITRD_STAGE)/bin/lscpu
+	cp programs/lspci/lspci.elf                       $(INITRD_STAGE)/bin/lspci
+	cp programs/lsusb/lsusb.elf                       $(INITRD_STAGE)/bin/lsusb
+	cp programs/dmidecode/dmidecode.elf               $(INITRD_STAGE)/bin/dmidecode
+	cp programs/sensors/sensors.elf                   $(INITRD_STAGE)/bin/sensors
+	cp programs/cpupower/cpupower.elf                 $(INITRD_STAGE)/bin/cpupower
+	cp programs/tvi/tvi.elf                           $(INITRD_STAGE)/bin/tvi
+	cp programs/tvitest/tvitest.elf                   $(INITRD_STAGE)/bin/tvitest
+	cp programs/tedit/tedit.elf                       $(INITRD_STAGE)/bin/tedit
+	cp programs/fsprobe/fsprobe.elf                   $(INITRD_STAGE)/bin/fsprobe
+	cp programs/datavol/datavol.elf                   $(INITRD_STAGE)/bin/datavol
 	cp programs/devlist/devlist.elf                   $(INITRD_STAGE)/bin/devlist
 	cp programs/drvtest/drvtest.elf                   $(INITRD_STAGE)/bin/drvtest
 	cp programs/usbtest/usbtest.elf                   $(INITRD_STAGE)/bin/usbtest
@@ -2804,6 +2973,32 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
 	cp programs/user_sh/user_sh.elf                 $(INITRD_STAGE)/bin/sh
+# /bin/tsh -- the tobyOS shell language hosted in userspace: src/shell.c
+# compiled a second time against programs/tsh/host.c. It replaced
+# programs/sh/sh.elf here, which had a parser but almost no expansion layer
+# and scored 0/14 against real bash. /bin/sh (programs/user_sh) is untouched.
+	cp programs/tsh/tsh.elf                         $(INITRD_STAGE)/bin/tsh
+	cp programs/id/id.elf                           $(INITRD_STAGE)/bin/id
+	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
+	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
+	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
+	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
+	mkdir -p $(INITRD_STAGE)/etc/shparity
+	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
+	cp programs/ttyparity/ttyparity.elf             $(INITRD_STAGE)/bin/ttyparity
+	mkdir -p $(INITRD_STAGE)/etc/ttyparity
+	cp initrd/etc/ttyparity/*.txt                   $(INITRD_STAGE)/etc/ttyparity/
+	cp programs/oilspec/oilspec.elf                 $(INITRD_STAGE)/bin/oilspec
+	mkdir -p $(INITRD_STAGE)/etc/oilspec/bin
+# 2,776 case files: `cp a/*.sh b/` blows past the command-line limit here, so
+# copy the directory rather than the glob.
+	cp -r initrd/etc/oilspec/.                      $(INITRD_STAGE)/etc/oilspec/
+# One binary, four names. tobyOS has no hard links, so these are copies -- and
+# spechelp dispatches on argv[0], so the name IS the interface.
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/argv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/printenv.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/stdout_stderr.py
+	cp programs/spechelp/spechelp.elf               $(INITRD_STAGE)/etc/oilspec/bin/read_from_fd.py
 	cp programs/user_pkg/user_pkg.elf               $(INITRD_STAGE)/bin/pkg
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
@@ -2819,6 +3014,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
 	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
 	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
+	cp programs/user_kill/user_kill.elf             $(INITRD_STAGE)/bin/kill
 	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
 	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
 	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
@@ -2857,6 +3053,24 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/p_head
 	cp $(PORTS_SBASE_DIR)/ls.elf                      $(INITRD_STAGE)/bin/p_ls
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/p_grep
+# ...and under the names scripts actually use. sbase's grep/wc/head had a
+# p_ prefix and no plain entry, so `grep` was simply not a command that
+# existed. echo/cat/ls keep the prefix because other programs own those.
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/grep
+	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/wc
+	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/head
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/egrep
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/fgrep
+	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
+	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
+	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
+	cp $(PORTS_SBASE_DIR)/tee.elf                       $(INITRD_STAGE)/bin/tee
+	cp $(PORTS_SBASE_DIR)/expr.elf                      $(INITRD_STAGE)/bin/expr
+	cp $(PORTS_SBASE_DIR)/tr.elf                        $(INITRD_STAGE)/bin/tr
+	cp $(PORTS_SBASE_DIR)/cut.elf                       $(INITRD_STAGE)/bin/cut
+	cp $(PORTS_SBASE_DIR)/uniq.elf                      $(INITRD_STAGE)/bin/uniq
+	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
+	cp $(PORTS_SBASE_DIR)/sort.elf                      $(INITRD_STAGE)/bin/sort
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
 	cp $(HELLOAPP_TPKG)                               $(INITRD_STAGE)/repo/helloapp.tpkg
@@ -2993,6 +3207,144 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	         $(INITRD_STAGE)/bin/linux-gapfill;                            \
 	    echo "[initrd] staged linux-gapfill (fdinfo + new syscalls)";      \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-gapfill";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-cloexec/linux-cloexec.elf ]; then               \
+	    cp programs/linux-cloexec/linux-cloexec.elf                        \
+	         $(INITRD_STAGE)/bin/linux-cloexec;                            \
+	    echo "[initrd] staged linux-cloexec (close-on-exec + close_range)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cloexec";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-flock/linux-flock.elf ]; then                   \
+	    cp programs/linux-flock/linux-flock.elf                            \
+	         $(INITRD_STAGE)/bin/linux-flock;                              \
+	    echo "[initrd] staged linux-flock (record locks + flock)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-flock";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-sock/linux-sock.elf ]; then                     \
+	    cp programs/linux-sock/linux-sock.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sock;                               \
+	    echo "[initrd] staged linux-sock (socket semantics, peer-less)";   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sock";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sockserver/linux-sockserver.elf ]; then         \
+	    cp programs/linux-sockserver/linux-sockserver.elf                  \
+	         $(INITRD_STAGE)/bin/linux-sockserver;                         \
+	    echo "[initrd] staged linux-sockserver (host-peer gate half)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sockserver";                  \
+	fi;                                                                   \
+	if [ -f programs/linux-nptl/linux-nptl.elf ]; then                     \
+	    cp programs/linux-nptl/linux-nptl.elf                              \
+	         $(INITRD_STAGE)/bin/linux-nptl;                               \
+	    echo "[initrd] staged linux-nptl (thread-group semantics)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-nptl";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-watch/linux-watch.elf ]; then                   \
+	    cp programs/linux-watch/linux-watch.elf                            \
+	         $(INITRD_STAGE)/bin/linux-watch;                              \
+	    echo "[initrd] staged linux-watch (inotify + epoll honesty)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-watch";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-misc/linux-misc.elf ]; then                     \
+	    cp programs/linux-misc/linux-misc.elf                              \
+	         $(INITRD_STAGE)/bin/linux-misc;                               \
+	    echo "[initrd] staged linux-misc (syscall-tail batch)";            \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-misc";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-procdev/linux-procdev.elf ]; then               \
+	    cp programs/linux-procdev/linux-procdev.elf                        \
+	         $(INITRD_STAGE)/bin/linux-procdev;                            \
+	    echo "[initrd] staged linux-procdev (procfs+dev fidelity)";        \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-procdev";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-loop/linux-loop.elf ]; then                     \
+	    cp programs/linux-loop/linux-loop.elf                              \
+	         $(INITRD_STAGE)/bin/linux-loop;                               \
+	    echo "[initrd] staged linux-loop (loopback datapath)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-loop";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-proc2/linux-proc2.elf ]; then                   \
+	    cp programs/linux-proc2/linux-proc2.elf                            \
+	         $(INITRD_STAGE)/bin/linux-proc2;                              \
+	    echo "[initrd] staged linux-proc2 (procfs deep fidelity)";         \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-proc2";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-io/linux-io.elf ]; then                         \
+	    cp programs/linux-io/linux-io.elf                                  \
+	         $(INITRD_STAGE)/bin/linux-io;                                 \
+	    echo "[initrd] staged linux-io (POSIX timers + copy family)";      \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-io";                          \
+	fi;                                                                   \
+	if [ -f programs/linux-xattr/linux-xattr.elf ]; then                   \
+	    cp programs/linux-xattr/linux-xattr.elf                            \
+	         $(INITRD_STAGE)/bin/linux-xattr;                              \
+	    echo "[initrd] staged linux-xattr (xattr + fd identity + fexecve)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-xattr";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-thread2/linux-thread2.elf ]; then               \
+	    cp programs/linux-thread2/linux-thread2.elf                        \
+	         $(INITRD_STAGE)/bin/linux-thread2;                            \
+	    echo "[initrd] staged linux-thread2 (de_thread + pshared + robust)"; \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-thread2";                     \
+	fi;                                                                   \
+	if [ -f programs/linux-fs2/linux-fs2.elf ]; then                       \
+	    cp programs/linux-fs2/linux-fs2.elf                                \
+	         $(INITRD_STAGE)/bin/linux-fs2;                                \
+	    echo "[initrd] staged linux-fs2 (writable root + hard links)";     \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fs2";                         \
+	fi;                                                                   \
+	if [ -f programs/linux-ldso/linux-ldso.elf ]; then                     \
+	    cp programs/linux-ldso/linux-ldso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ldso;                               \
+	    echo "[initrd] staged linux-ldso (ld.so.cache proof)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ldso";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-sysv/linux-sysv.elf ]; then                     \
+	    cp programs/linux-sysv/linux-sysv.elf                              \
+	         $(INITRD_STAGE)/bin/linux-sysv;                               \
+	    echo "[initrd] staged linux-sysv (SysV sem + msg)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-sysv";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-stat/linux-stat.elf ]; then                     \
+	    cp programs/linux-stat/linux-stat.elf                              \
+	         $(INITRD_STAGE)/bin/linux-stat;                               \
+	    echo "[initrd] staged linux-stat (statfs truth)";                  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-stat";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-vfork/linux-vfork.elf ]; then                   \
+	    cp programs/linux-vfork/linux-vfork.elf                            \
+	         $(INITRD_STAGE)/bin/linux-vfork;                              \
+	    echo "[initrd] staged linux-vfork (true vfork)";                   \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vfork";                       \
+	fi;                                                                   \
+	if [ -f programs/linux-vdso/linux-vdso.elf ]; then                     \
+	    cp programs/linux-vdso/linux-vdso.elf                              \
+	         $(INITRD_STAGE)/bin/linux-vdso;                               \
+	    echo "[initrd] staged linux-vdso (userspace clock)";               \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-vdso";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-cont/linux-cont.elf ]; then                     \
+	    cp programs/linux-cont/linux-cont.elf                              \
+	         $(INITRD_STAGE)/bin/linux-cont;                               \
+	    echo "[initrd] staged linux-cont (resume-latency)";                \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-cont";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-ipv6/linux-ipv6.elf ]; then                     \
+	    cp programs/linux-ipv6/linux-ipv6.elf                              \
+	         $(INITRD_STAGE)/bin/linux-ipv6;                               \
+	    echo "[initrd] staged linux-ipv6 (AF_INET6 UDP)";                  \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-ipv6";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-tcp6/linux-tcp6.elf ]; then                     \
+	    cp programs/linux-tcp6/linux-tcp6.elf                              \
+	         $(INITRD_STAGE)/bin/linux-tcp6;                               \
+	    echo "[initrd] staged linux-tcp6 (TCP over IPv6)";                 \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-tcp6";                        \
+	fi;                                                                   \
+	if [ -f programs/linux-v6host/linux-v6host.elf ]; then                 \
+	    cp programs/linux-v6host/linux-v6host.elf                          \
+	         $(INITRD_STAGE)/bin/linux-v6host;                             \
+	    echo "[initrd] staged linux-v6host (v6 vs real peer)";             \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-v6host";                      \
 	fi;                                                                   \
 	if [ -f programs/linux-tmpfs/linux-tmpfs.elf ]; then                   \
 	    cp programs/linux-tmpfs/linux-tmpfs.elf                            \
@@ -3320,6 +3672,10 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    done; \
 	    echo "[initrd] chromium: staged managed policy PostQuantumKeyAgreementEnabled=false (disable X25519MLKEM768 PQ KEX -- tobyOS ML-KEM wall)"; \
 	fi; \
+	if $(LDSOCACHE_BIN) $(INITRD_STAGE)                                    \
+	       $(INITRD_STAGE)/etc/ld.so.cache; then                           \
+	    EXTRA_FILES="$$EXTRA_FILES etc/ld.so.cache";                       \
+	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
 	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
@@ -3340,6 +3696,8 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/linux-scmsg bin/linux-futex bin/linux-eventfd bin/linux-mapshare bin/linux-demrace bin/linux-mlkem \
 	    bin/linux-qfreeze bin/linux-drmtest bin/linux-sndtest \
 	    bin/linux-xstub \
+	    bin/basename bin/dirname bin/sleep bin/tee bin/expr \
+	    bin/tr bin/cut bin/uniq bin/sort bin/awk \
 	    bin/linux-glibc \
 	    bin/win-hello.exe \
 	    bin/win-crt.exe bin/win-hello3.exe bin/win-cpp.exe              \
@@ -3359,6 +3717,7 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/win-math20.exe bin/win-printf21.exe bin/win-scan22.exe    \
 	    bin/win-wide23.exe bin/win-reloc24.exe                        \
 	    bin/win-xprod.exe bin/win-xcons.exe bin/win-xfilter.exe       \
+	    bin/lspci bin/lscpu bin/lsusb bin/dmidecode bin/sensors bin/cpupower bin/tvi bin/tvitest bin/tedit bin/fsprobe bin/datavol \
 	    bin/devlist bin/drvtest bin/usbtest bin/audiotest bin/audioplay bin/batterytest \
 	    bin/displayinfo bin/drawtest bin/rendertest bin/fonttest          \
 	    bin/logview bin/crashinfo bin/wdogtest bin/safesh bin/fscheck     \
@@ -3367,6 +3726,14 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
+	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
+	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
+	    bin/kill bin/id bin/newgrp                                        \
+	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
+	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
+	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
+	    bin/bluescreen                                                    \
+	    bin/tsh bin/shparity bin/oilspec bin/ttyparity                    \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=0644 \
@@ -3387,8 +3754,60 @@ $(INITRD_TAR): $(PROGRAMS) programs/linux-hello/linux-hello.elf \
 	    repo/hello_cli.tpkg repo/hello_gui.tpkg repo/notes_app.tpkg       \
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
+	    etc/passwd etc/group \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
+	    etc/shparity/*.sh \
+	    etc/ttyparity/*.txt \
 	    readme.txt
+# The 2,776 corpus scripts are DATA (run as `bash FILE`), so 0644 is right.
+# Tarred as a TREE, not a glob: 2,776 names is 75 KB of command line. The
+# helper binaries are excluded here and added below with the executable bit,
+# because staging them 0644 made every case that calls argv.py fail to run
+# it -- 327 cases reporting a shell divergence that was a permission bit.
+# No './' prefix: gate 0 matches exact tar paths and './etc/...' is not
+# the same name as 'etc/...'.
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0644 \
+	    --owner=0 --group=0 --numeric-owner \
+	    --exclude='etc/oilspec/bin' --exclude='etc/oilspec/bin/*' \
+	    -rf ../initrd.tar etc/oilspec
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	    etc/oilspec/bin
+# busybox applets on PATH. Runs LAST, and both halves of that matter:
+#   - AFTER every other bin/ has been staged, so the "already taken"
+#     test sees the real binaries. Done earlier it reported 0 collisions
+#     and would then have had `cp` write the real awk THROUGH the hard
+#     link into the shared inode -- corrupting busybox and all 400 names
+#     with it.
+#   - appended with `-T`, not on the command line: 400 names is the same
+#     75 KB-of-argv problem the oilspec corpus above documents.
+# HARD links (tar typeflag '1'), which ramfs resolves by sharing the
+# target's bytes; it deliberately skips symlinks. busybox picks its
+# applet from argv[0], exactly as it does on a real system.
+	@if [ -f $(INITRD_STAGE)/bin/busybox ] && \
+	    [ -f programs/busybox/applets.txt ]; then \
+	    : > $(INITRD_STAGE)/.applets.list; \
+	    bb_n=0; bb_skip=0; \
+	    while read -r ap; do \
+	        ap=$${ap%$$(printf '\r')}; \
+	        case "$$ap" in ''|\#*) continue;; esac; \
+	        if [ -e "$(INITRD_STAGE)/bin/$$ap" ]; then \
+	            bb_skip=$$((bb_skip+1)); continue; \
+	        fi; \
+	        if ln $(INITRD_STAGE)/bin/busybox \
+	              "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null; then \
+	            echo "bin/$$ap" >> $(INITRD_STAGE)/.applets.list; \
+	            bb_n=$$((bb_n+1)); \
+	        fi; \
+	    done < programs/busybox/applets.txt; \
+	    if [ "$$bb_n" -gt 0 ]; then \
+	        (cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
+	            --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
+	            -T .applets.list); \
+	    fi; \
+	    rm -f $(INITRD_STAGE)/.applets.list; \
+	    echo "[initrd] busybox applets: $$bb_n linked onto PATH, $$bb_skip skipped (a real binary owns the name)"; \
+	fi
 
 # ---------- Build ISO ----------
 #
@@ -3510,6 +3929,28 @@ $(ISO): $(KERNEL) limine.conf $(LIMINE_FILES) $(INITRD_TAR) $(INSTALL_IMG)
 $(MKFS_BIN): $(MKFS_SRC)
 	mkdir -p build
 	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+$(LDSOCACHE_BIN): $(LDSOCACHE_SRC)
+	mkdir -p build
+	$(HOST_CC) $(HOST_CFLAGS) -o $@ $<
+
+# The vDSO image. -m elf_x86_64 is REQUIRED: without an explicit flavor
+# this lld build guesses COFF and rejects every GNU flag. The version
+# script is what makes glibc's LINUX_2.6-versioned lookup succeed; the
+# output must contain ZERO relocations (vdso.c's no-GOT discipline) --
+# the kernel maps the raw image and nobody ever relocates it.
+$(VDSO_SO): $(VDSO_SRC) $(VDSO_MAP)
+	mkdir -p build
+	$(CC) --target=x86_64-unknown-linux-gnu -fPIC -O2 \
+	      -fno-stack-protector -fno-asynchronous-unwind-tables \
+	      -c $(VDSO_SRC) -o build/vdso_user.o
+	ld.lld -m elf_x86_64 -shared -o $@ build/vdso_user.o \
+	      --version-script=$(VDSO_MAP) -z noseparate-code \
+	      -z max-page-size=4096 -z rodynamic --no-undefined \
+	      --image-base=0x1000 \
+	      --soname=linux-vdso.so.1 --hash-style=both
+
+src/vdso_blob.o: $(VDSO_SO)
 
 # Only formats if disk.img doesn't already exist -- protects user data
 # across normal `make` invocations. Use `make wipe-disk` to force.
@@ -4987,6 +5428,7 @@ clean:
 	       programs/crashinfo/crashinfo.o programs/crashinfo/crashinfo.elf \
 	       programs/wdogtest/wdogtest.o programs/wdogtest/wdogtest.elf \
 	       programs/safesh/safesh.o programs/safesh/safesh.elf \
+	       programs/shparity/shparity.o programs/shparity/shparity.elf \
 	       programs/fscheck/fscheck.o programs/fscheck/fscheck.elf \
 	       programs/services/services.o programs/services/services.elf \
 	       programs/svc_crasher/svc_crasher.o programs/svc_crasher/svc_crasher.elf \
@@ -5018,6 +5460,7 @@ clean:
 	       programs/user_df/user_df.o programs/user_df/user_df.elf \
 	       programs/user_mkdir/user_mkdir.o programs/user_mkdir/user_mkdir.elf \
 	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \
+	       programs/user_kill/user_kill.o programs/user_kill/user_kill.elf \
 	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
 	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
 	       programs/user_date/user_date.o programs/user_date/user_date.elf \

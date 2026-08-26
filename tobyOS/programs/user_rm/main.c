@@ -17,7 +17,13 @@ static int remove_path(const char *path) {
         return 1;
     }
 
-    if ((st.st_mode & S_IFDIR) && recursive) {
+    /* S_ISDIR, not `st.st_mode & S_IFDIR`. The bit test happens to give the
+     * right answer while only S_IFREG and S_IFDIR exist, because their
+     * values share no bits -- but it is testing one bit of a 4-bit type
+     * FIELD, so the first type that includes 0x4000 in its encoding (a
+     * symlink is 0xA000; a socket 0xC000) would read as a directory and
+     * `rm` would recurse into it. */
+    if (S_ISDIR(st.st_mode) && recursive) {
         DIR *d = opendir(path);
         if (!d) {
             fprintf(stderr, "rm: cannot open dir '%s': %s\n", path, strerror(errno));
@@ -39,7 +45,7 @@ static int remove_path(const char *path) {
         }
         if (verbose) printf("removed directory '%s'\n", path);
         return err;
-    } else if (st.st_mode & S_IFDIR) {
+    } else if (S_ISDIR(st.st_mode)) {
         fprintf(stderr, "rm: '%s' is a directory (use -r)\n", path);
         return 1;
     }

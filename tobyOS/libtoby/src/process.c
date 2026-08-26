@@ -35,8 +35,21 @@ pid_t fork(void) {
 /* Bonus: a tiny posix_spawn-flavoured helper. Not exported via a
  * header in M25B (M25C will add a proper <spawn.h>); samples and
  * future ports include the prototype themselves if they need it. */
+pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
+                    int fd0, int fd1, int fd2,
+                    const struct abi_spawn_fd *extra, unsigned nextra);
+
 pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
                  int fd0, int fd1, int fd2) {
+    return toby_spawn_ex(path, argv, envp, fd0, fd1, fd2, 0, 0);
+}
+
+/* As toby_spawn, plus descriptors above 2. A shell needs them for
+ * `exec 3>file` and `cmd 8<<EOF`; every other caller passes (0, 0) and gets
+ * exactly the old behaviour. */
+pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
+                    int fd0, int fd1, int fd2,
+                    const struct abi_spawn_fd *extra, unsigned nextra) {
     struct abi_spawn_req req = {
         .path = path,
         .argv = argv,
@@ -45,6 +58,8 @@ pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
         .fd1  = fd1,
         .fd2  = fd2,
         .flags = 0,
+        .nextra = nextra,
+        .extra  = extra,
     };
     long rv = toby_sc1(ABI_SYS_SPAWN, (long)(uintptr_t)&req);
     return (pid_t)__toby_check(rv);

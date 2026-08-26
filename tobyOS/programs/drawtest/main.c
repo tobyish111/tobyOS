@@ -53,7 +53,9 @@ struct gui_event {
     int           y;
     unsigned char button;
     unsigned char key;
-    unsigned char _pad[2];
+    signed char   wheel;
+
+    unsigned char _pad[1];
 };
 #define GUI_EV_NONE  0
 #define GUI_EV_CLOSE 5

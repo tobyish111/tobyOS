@@ -22,6 +22,7 @@
 #define TOBYOS_TCP_H
 
 #include <tobyos/types.h>
+#include <tobyos/ipv6.h>   /* TCP6 (2026-08-23): struct ipv6_addr peers */
 
 typedef enum {
     TCP_CLOSED        = 0,
@@ -75,6 +76,24 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
  * to go out. */
 struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be);
 
+/* ---- TCP over IPv6 (2026-08-23) ---------------------------------------
+ * The engine is shared; only the prologue (demux/checksum/emit) is
+ * family-aware. A listener is port-scoped and family-blind, so a v6
+ * listener accepts v4 SYNs too -- Linux's dual-stack default. */
+void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
+                      const void *tcp_packet, size_t len);
+struct tcp_conn *tcp_connect6(const struct ipv6_addr *dst,
+                              uint16_t dst_port_be, uint32_t timeout_ms);
+struct tcp_conn *tcp_connect6_nb(const struct ipv6_addr *dst,
+                                 uint16_t dst_port_be);
+bool tcp_conn_is6(const struct tcp_conn *c);
+const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c);
+/* Async ICMPv6 verdict on a handshake (LXE errno; 0 = none) and the
+ * inbound hook that sets it (called from icmpv6.c's error handler). */
+int  tcp_icmp_err(const struct tcp_conn *c);
+void tcp6_icmp_error(uint16_t local_port_be, const struct ipv6_addr *peer,
+                     uint16_t peer_port_be, uint8_t code);
+
 /* Send without waiting for ACKs: queues as much as the congestion/receive
  * window allows right now and returns the byte count accepted (0 means the
  * window is full -- the caller reports EAGAIN). tcp_send by contrast blocks
@@ -91,6 +110,9 @@ uint16_t tcp_remote_port_be(const struct tcp_conn *c);
  * internally (see TCP_LISTEN_BACKLOG in tcp.c). Returns NULL if the port
  * is busy or no slot is free. */
 struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog);
+/* SO_REUSEADDR form: dying conns (TIME_WAIT &c) don't hold the port. */
+struct tcp_conn *tcp_listen_reuse(uint16_t local_port_be, int backlog,
+                                  bool reuse);
 
 /* Block until a completed handshake is queued on `listener`, or timeout.
  * Returns a new connection in ESTABLISHED state, or NULL on timeout. */
@@ -102,6 +124,10 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
  * >0 = bytes copied, 0 = nothing buffered, -1 = EOF/reset. */
 long tcp_peek(struct tcp_conn *c, void *buf, size_t cap);
 void tcp_close(struct tcp_conn *c);
+
+/* Half-close: send FIN, keep receiving (shutdown(SHUT_WR)). Non-blocking,
+ * non-freeing; the later tcp_close/tcp_close_nowait finishes teardown. */
+void tcp_shutdown_tx(struct tcp_conn *c);
 /* Abortive close: send RST and free immediately -- no graceful FIN
  * exchange, no TIME_WAIT linger. For tearing down a handshake rejected
  * mid-flight (e.g. TLS cert validation) without the active-closer

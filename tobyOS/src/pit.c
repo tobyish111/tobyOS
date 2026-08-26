@@ -64,7 +64,14 @@ static void pit_irq(struct regs *r) {
      * gets freed when the parent reaps. EOI was already sent above so
      * future PIT IRQs can fire on the new running proc. */
     if ((r->cs & 3) == 3) {
-        signal_deliver_if_pending();
+        /* CAUGHT handlers first, using the ring-3 trapframe we interrupted.
+         * signal_deliver_if_pending() below can only take DEFAULT actions
+         * (it has no frame to rewrite), so on its own it left a process
+         * that catches SIGINT and spins in userspace permanently
+         * uninterruptible -- the loop makes no syscalls, and the deferral
+         * to "the next syscall return" never comes due. */
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
 
         /* Timer preemption: if we interrupted a user-mode process that
          * is NOT pid 0, force a yield so the kernel idle loop (pid 0)

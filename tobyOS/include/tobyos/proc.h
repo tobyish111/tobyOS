@@ -237,6 +237,16 @@ struct proc {
      * deadline and sets futex_timed_out so the return is -ETIMEDOUT. */
     uint64_t        futex_deadline_ns;
     bool            futex_timed_out;
+    /* Wake-after-death tombstone (2026-08-23): set by every exit path
+     * BEFORE the state changes, never written by wakers, cleared only at
+     * slot claim. sched_enqueue refuses (and names) any wake of a dying
+     * proc -- the `state = PROC_READY` overwrite that used to destroy
+     * the evidence cannot touch this. */
+    bool            dying;
+    /* glibc robust-mutex list head (set_robust_list, Phase F): user address
+     * of this thread's struct robust_list_head, walked at death by
+     * futex_robust_exit so held robust mutexes get FUTEX_OWNER_DIED. */
+    uint64_t        robust_list_head;
     /* Wake-latency instruments (slice 56): when this proc PARKED on a futex,
      * when the wake was DELIVERED (state->READY, by FUTEX_WAKE or the timeout
      * sweep), and which Linux syscall it is currently inside (cursys, -1 =
@@ -277,7 +287,8 @@ struct proc {
      * for any pending signal is proc_exit(128+sig); checked at syscall
      * return, in the PIT IRQ if it interrupted ring 3, and inside
      * blocking primitives that return -EINTR. See signal.h. */
-    uint32_t        pending_signals;
+    uint64_t        pending_signals;   /* one bit per signal 1..63 (SIG_MAX
+                                        * is 64 since 2026-08-22) */
 
     /* Phase 1 M1.3: full POSIX signal state (handlers, mask, restorer) */
     struct signal_state sigstate;
@@ -421,6 +432,19 @@ struct proc {
      *      credentials.cc, which is why its child died at cr2 = -0x28 (the
      *      stack-canary reload `cmp -0x28(%rbp),%rcx`) with syscalls=0. */
     uint64_t        clone_child_stack;
+    /* Phase F: clone(2) tid plumbing for PROCESS forks (the thread path
+     * handles its own inline). clone_child_settid/cleartid are per-call
+     * STAGING on the parent, consumed by sys_fork while the child is
+     * EMBRYO (post-fork fixup = SMP race, see clone_ns_flags above).
+     * set_child_tid is the CHILD-side result: fork_child_entry writes the
+     * child's own vtid there on first entry -- the write must happen in
+     * the child's context or it lands in the CoW-shared frame. glibc's
+     * fork() passes &THREAD_SELF->tid here; without the stamp every
+     * forked child computed with its PARENT's cached tid, and robust-
+     * mutex words carried an owner the death walk could never match. */
+    uint64_t        clone_child_settid;
+    uint64_t        clone_child_cleartid;
+    uint64_t        set_child_tid;
 
     /* ---- ptrace(2) ------------------------------------------------------
      * tracer_pid == 0 means untraced, the zero-init default.
@@ -444,10 +468,39 @@ struct proc {
      * deadline per process is exactly what alarm(2) offers, and setitimer's
      * richer shape can grow from here if something needs it. */
     uint64_t        alarm_deadline_ns;
+    /* Slice 128: a REAL timed sleep. sys_nanosleep used to pause-spin with a
+     * sched_yield() per iteration until the deadline, so a sleeping process
+     * never actually slept -- it burned a core's worth of scheduling slots
+     * and BKL round-trips for the whole duration. Measured on the EliteDesk:
+     * chromewin, whose main loop is one usleep(15000) per pass, took 34% CPU
+     * doing nothing while chrome itself got 8.7% and the browser rendered at
+     * ~3 fps. Non-zero means "PROC_BLOCKED until perf_now_ns() reaches this";
+     * the sweep in sched_yield wakes it. */
+    uint64_t        sleep_deadline_ns;
 
     /* Per-process file descriptor table. Slot indices that fit in a
      * struct file pointer are owning -- close-on-exit drops them. */
     struct file    *fds[PROC_NFDS];
+
+    /* /proc/<pid>/cmdline: the argv recorded at spawn/exec, NUL-separated
+     * exactly as Linux emits it (2026-08-22 -- it was fabricated as
+     * name+'\n', which is not the format ps/pgrep/argv readers parse).
+     * Capped; 0 for kernel procs, and the generator falls back to the
+     * name for those. */
+    char            cmdline[192];
+    uint16_t        cmdline_len;
+
+    /* Close-on-exec bitmap, one bit per fd slot (Linux FD_CLOEXEC). A
+     * property of the DESCRIPTOR, not the open file description -- dup()
+     * clears it on the new fd, fcntl(F_SETFD) flips it, and a successful
+     * execve closes every marked fd before the new image runs. Lives
+     * beside fds[] so fork's whole-PCB memcpy inherits it for free, and
+     * threads reach the LEADER's copy through the same accessor
+     * indirection as proc_fds() -- a per-thread copy would let one
+     * thread's F_SETFD silently diverge from its siblings. Before this
+     * existed every creator dropped O_CLOEXEC/SOCK_CLOEXEC on the floor
+     * and every descriptor leaked across exec (2026-08-22 audit). */
+    uint8_t         fd_cloexec[PROC_NFDS / 8];
 
     /* Session tag (milestone 14). 0 means "no user session" (kernel
      * thread / pre-login boot procs). On every spawn we copy this
@@ -458,6 +511,20 @@ struct proc {
      * the spawn so apps launched from the desktop end up in the
      * correct session. */
     int             session_id;
+    /* POSIX process group (job control). Inherited from the parent at
+     * spawn; a parentless/kernel proc leads its own group. setpgid moves
+     * it, kill(-pgid) fans out over it, and the tty delivers foreground
+     * signals to the whole group. 0 means "never set" and is read as
+     * "own pid" everywhere, so pre-existing code paths stay valid. */
+    int             pgid;
+    /* Job-control stop reporting (WUNTRACED): which signal stopped this
+     * proc, and whether a wait has already reported that stop. Set when a
+     * stop signal's default action runs, cleared by SIGCONT. */
+    int             stop_sig;
+    bool            stop_reported;
+    /* WCONTINUED: a SIGCONT resumed this proc from a stop and no wait has
+     * reported the continue yet. */
+    bool            cont_pending;
 
     /* User identity (milestone 15). Inherited from the parent in
      * spawn_internal -- so a kernel-spawned proc starts as uid 0/gid 0
@@ -733,6 +800,14 @@ int proc_create_kernel(void (*entry)(void), const char *name);
  * fd0/fd1/fd2 are inherited via file_clone() -- the caller keeps its
  * own ref and must file_close() it separately. Returns the new pid on
  * success, or -1 on failure. */
+/* A descriptor to install in the child at a CHOSEN number. fd0..fd2 (and the
+ * fd3/fd4 chrome preopens) cover the fixed slots; this covers the rest, which
+ * is what a shell needs for `exec 3>file` and `cmd 8<<EOF`. */
+struct proc_fd_map {
+    int          fd;            /* number in the CHILD */
+    struct file *f;             /* caller keeps ownership; this is cloned */
+};
+
 struct proc_spec {
     const char  *path;
     const char  *name;          /* may be NULL -> derived from path */
@@ -744,6 +819,11 @@ struct proc_spec {
      * commands on fd 3 and writes responses/events on fd 4. */
     struct file *fd3;
     struct file *fd4;
+    /* Descriptors at arbitrary numbers. NULL/0 = none, which is what a
+     * zero-initialised proc_spec gives, so every existing caller is
+     * unaffected. */
+    const struct proc_fd_map *extra_fds;
+    int                       extra_nfds;
     int          argc;
     char       **argv;          /* argc strings, each NUL-terminated */
     /* Milestone 25C: optional environment vector. NULL = inherit from
@@ -781,6 +861,10 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk);
  * returns. Closes every open fd before yielding so any pipe ends drop
  * their reader/writer count immediately (rather than at reap time). */
 __attribute__((noreturn)) void proc_exit(int code);
+/* Phase F: force-terminate every non-leader thread of leader p (factored
+ * from proc_exit; sys_execve reaps the group pre-commit). BKL must NOT be
+ * held -- the off-CPU wait spins on remote cores. */
+void proc_reap_group_threads(struct proc *p, int code);
 
 /* Spin until `p` is no longer live-on-CPU (on_cpu cleared). Call after
  * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
@@ -833,6 +917,17 @@ int proc_wait(int pid);
 /* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED/EMBRYO. */
 struct proc *proc_lookup(int pid);
 
+/* Assign PID's process group (kernel-trusted; the checked path is the
+ * setpgid syscall). The shell's `set -m` uses this through a host seam:
+ * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
+int proc_set_pgid(int pid, int pgid);
+
+/* Kernel-side WUNTRACED-style foreground wait: returns the exit code, or
+ * 0 with *stop_sig set when the child job-control-stopped. The KERNEL
+ * shell's monitor path uses this; /bin/tsh's host.c provides the same
+ * signature over waitpid(WUNTRACED). */
+int proc_wait_fg(int pid, int *stop_sig);
+
 /* Atomically claim a free proc slot (state CAS UNUSED -> EMBRYO). The ONLY
  * way to allocate a slot -- a plain "scan for UNUSED" race is exactly the
  * chrome bootstrap flake. Release on failure by resetting state to
@@ -849,6 +944,14 @@ void proc_slot_wipe(struct proc *p);
  * go through here rather than touching p->fds directly -- reading p->fds on a
  * thread silently yields an EMPTY table. Defined in syscall.c. */
 struct file **proc_fds(struct proc *p);
+
+/* Close-on-exec bitmap accessors (syscall.c). Thread-aware: route to the
+ * leader's bitmap exactly as proc_fds routes to the leader's table. */
+void fd_cloexec_set(struct proc *p, int fd, int on);
+int  fd_cloexec_get(struct proc *p, int fd);
+
+/* Record argv for /proc/<pid>/cmdline (proc.c; spawn + execve call it). */
+void proc_record_cmdline(struct proc *p, int argc, char **argv);
 
 /* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
  * Returns the child pid, or -1 if there are no children. */

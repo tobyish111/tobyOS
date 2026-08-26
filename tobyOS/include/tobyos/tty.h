@@ -48,6 +48,11 @@ struct ktermios {
 #define TTY_ECHOE   0x0010u
 #define TTY_ECHOK   0x0020u
 #define TTY_ECHONL  0x0040u
+/* ECHOKE: VKILL rubs the line out on screen instead of just echoing a
+ * newline. Same value as Linux. Not in the pty defaults -- POSIX's plain
+ * ECHOK behaviour is what those select -- but honoured when a program
+ * asks for it, which real Linux userland routinely does. */
+#define TTY_ECHOKE  0x0800u
 
 /* c_iflag bits. */
 #define TTY_INLCR   0x0040u

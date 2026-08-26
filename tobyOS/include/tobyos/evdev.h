@@ -19,7 +19,7 @@ void evdev_feed_key(uint8_t code, int value);
 /* Push one mouse report into the mouse evdev queue: EV_REL motion + BTN_*
  * edges + a SYN frame. `buttons`/`prev` are the PS/2 button bitmasks
  * (1=left,2=right,4=middle) now and before this report. */
-void evdev_feed_mouse(int dx, int dy, uint8_t buttons, uint8_t prev);
+void evdev_feed_mouse(int dx, int dy, int dz, uint8_t buttons, uint8_t prev);
 
 /* Drop any queued events on all devices (used by proof harnesses before
  * injecting a deterministic sequence). */

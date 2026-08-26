@@ -157,6 +157,18 @@ static __attribute__((noreturn)) void fork_child_entry(void) {
      * post-switch line -- release the proc this CPU switched away from
      * (see sched_finish_switch), or it stays on_cpu/unschedulable. */
     sched_finish_switch();
+    /* Phase F: the deferred CLONE_CHILD_SETTID stamp -- we are now IN the
+     * child's context, so the write breaks CoW into the child's own frame
+     * (a parent-side write would have changed the shared page under both).
+     * See proc.h set_child_tid for why glibc's fork() depends on this. */
+    if (p->set_child_tid) {
+        extern int pid_vnr(struct proc *);
+        int v = pid_vnr(p);
+        uint32_t vtid = (uint32_t)(v ? v : p->pid);
+        (void)copy_to_user((void *)(uintptr_t)p->set_child_tid,
+                           &vtid, sizeof vtid);
+        p->set_child_tid = 0;
+    }
     /* Load the child's FPU/SSE state (copied from the parent at fork time)
      * -- the switch that landed us here restored the previous proc's state. */
     fpu_restore(p->fpu_state);
@@ -507,6 +519,8 @@ long sys_fork(void) {
      * just did not stop working. */
     child->clone_ns_flags   = 0;
     child->clone_child_stack = 0;
+    child->clone_child_settid   = 0;   /* Phase F: staging, same rule */
+    child->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -685,6 +699,20 @@ long sys_fork(void) {
      * every raw syscall(SYS_clone, flags, NULL, ...) caller wants -- and is why
      * ignoring a2 outright went unnoticed until glibc's clone() wrapper, whose
      * child-side pops its function pointer off this exact stack. */
+    /* Phase F: consume the staged tid addresses while the child is still
+     * EMBRYO (same race rule as the namespace flags above). CLEARTID is
+     * re-staged, never inherited: Linux clears a fork child's
+     * clear_child_tid unless the caller passed CLONE_CHILD_CLEARTID, and
+     * the memcpy above copied the parent's. SETTID is applied by
+     * fork_child_entry in the CHILD's context -- a parent-side write
+     * would land in the CoW-shared frame both sides still see. */
+    {
+        child->set_child_tid    = parent->clone_child_settid;
+        child->clear_child_tid  = parent->clone_child_cleartid;
+        parent->clone_child_settid   = 0;
+        parent->clone_child_cleartid = 0;
+    }
+
     {
         uint64_t cstk = parent->clone_child_stack;
         parent->clone_child_stack = 0;
@@ -838,6 +866,15 @@ long sys_fork_share(void) {
     /* Per-call clone staging must not be inherited -- see sys_fork. */
     child->clone_ns_flags    = 0;
     child->clone_child_stack = 0;
+    /* Phase F: consume the staged tid addresses (share path too -- Linux
+     * honours SETTID/CLEARTID for vfork-style clones; the stamp lands in
+     * the SHARED space, which is the correct semantics there). */
+    child->set_child_tid    = parent->clone_child_settid;
+    child->clear_child_tid  = parent->clone_child_cleartid;
+    child->clone_child_settid   = 0;
+    child->clone_child_cleartid = 0;
+    parent->clone_child_settid   = 0;
+    parent->clone_child_cleartid = 0;
     child->next_wait  = NULL;
     child->wait_head  = NULL;
     child->join_waiters = NULL;
@@ -898,81 +935,49 @@ long sys_fork_share(void) {
            (uint8_t *)parent->kstack_top - sizeof(struct syscall_regs),
            sizeof(struct syscall_regs));
 
-    /* clone(2) with an EXPLICIT child_stack takes precedence over the private
-     * stack below, and the distinction is the whole reason this is safe.
-     *
-     * Two different callers arrive here:
-     *
-     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL. The
-     *     caller expects the child to run on the PARENT's stack. We give it a
-     *     private one instead -- a documented, pre-existing deviation that the
-     *     comment below explains and that the Chromium launcher path depends
-     *     on. UNCHANGED here.
+    /* Stack selection (TRUE vfork since 2026-08-23):
      *
      *   clone(fn, child_stack, CLONE_VM|CLONE_VFORK|SIGCHLD, arg) -- glibc's
      *     library wrapper. The caller supplied a stack PRECISELY so the child
      *     would not touch the parent's, and __clone's child side pops its entry
      *     function off it (`xor %ebp,%ebp; pop %rax; pop %rdi; call *%rax`).
-     *     Handing that child a fresh ZEROED stack makes it pop 0 and `call *0`
-     *     -- an instruction fetch at NULL, which is the rip=0/err=0x14 fault
-     *     already recorded against busybox `unshare -f`. Chromium's
-     *     ChrootToSafeEmptyDir (credentials.cc) is the same call, and it died
-     *     the same way.
+     *     Handing that child anything else makes it pop 0 and `call *0` --
+     *     the rip=0/err=0x14 fault recorded against busybox `unshare -f` and
+     *     Chromium's ChrootToSafeEmptyDir. Honoured, unchanged.
      *
-     * Honouring an explicitly supplied stack cannot disturb the first caller,
-     * because that caller supplies none. CLONE_VM means the address space is
-     * shared, so the pointer is valid in the child by construction. */
+     *   vfork() / clone(CLONE_VM|CLONE_VFORK) with child_stack == NULL: the
+     *     child runs on the PARENT'S OWN STACK -- the copied syscall_regs
+     *     already carry the parent's rsp, so "do nothing" is the whole
+     *     implementation. This is what vfork MEANS: the parent is suspended
+     *     (the fence-hardened wait loop below), the child pushes only below
+     *     the vfork frame, and every write it makes to locals in that frame
+     *     is visible to the parent when it resumes -- which is exactly the
+     *     channel `err = errno` exec-failure reporting uses.
+     *
+     *     HISTORY, because this replaced a load-bearing-looking shim: the
+     *     child used to get a PRIVATE 512 KiB stack mapped into the shared
+     *     CR3, added in the bring-up era when the parent's suspension was
+     *     racy -- with both sides live on one stack, the child smashed the
+     *     launcher's frame and the parent resumed at rip=0 (the crashpad
+     *     double-fork story). Slice 89's store-BLOCKED -> fence -> load-flag
+     *     protocol fixed the actual bug; the shim outlived its reason and
+     *     quietly broke the CONTRACT: an rsp-relative local written by the
+     *     child (exec errno, the classic) landed on the private stack the
+     *     parent never sees, and rsp-relative ARGUMENT reads in the child
+     *     found zeroed memory -- vfork+exec only survived where values
+     *     happened to sit in callee-saved registers. The deviation was
+     *     recorded as the standing debt "vfork private stack"; this is its
+     *     repayment. vfork_stack_va/pages stay as fields (always 0 now) so
+     *     vfork_child_done's teardown remains a no-op rather than a hazard. */
     uint64_t user_cstk = parent->clone_child_stack;
     parent->clone_child_stack = 0;
+    child->vfork_stack_va    = 0;
+    child->vfork_stack_pages = 0;
     if (user_cstk) {
         struct syscall_regs *cr =
             (struct syscall_regs *)((uint8_t *)child->kstack_top
                                     - sizeof(struct syscall_regs));
         cr->user_rsp = user_cstk;
-        child->vfork_stack_va = 0;      /* nothing for vfork_child_done to free */
-        child->vfork_stack_pages = 0;
-    } else
-    /* Private user stack in the shared CR3. Sharing the parent's RSP lets
-     * the child (crashpad double-fork, glibc) smash the launcher's frame;
-     * parent then resumes at rip=0. Map a fresh 512 KiB stack at a high VA
-     * keyed by child pid (visible to the parent too until vfork_child_done). */
-    {
-        const uint32_t np = 128; /* 512 KiB — glibc/crashpad probes past 32K */
-        uint64_t slot = 0x00007f0000000000ULL +
-                        ((uint64_t)child_pid * 0x200000ULL); /* 2 MiB slots */
-        uint64_t stack_va = slot;
-        uint64_t saved = vmm_set_editor_root(tg->cr3);
-        bool ok = true;
-        for (uint32_t i = 0; i < np; i++) {
-            uint64_t phys = pmm_alloc_page();
-            if (!phys) { ok = false; break; }
-            if (!vmm_map(stack_va + (uint64_t)i * PAGE_SIZE, phys, PAGE_SIZE,
-                         VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
-                pmm_free_page(phys);
-                ok = false;
-                break;
-            }
-            memset(pmm_phys_to_virt(phys), 0, PAGE_SIZE);
-        }
-        vmm_set_editor_root(saved);
-        if (!ok) {
-            for (int i = 0; i < PROC_NFDS; i++) {
-                if (child->fds[i]) file_close(child->fds[i]);
-                child->fds[i] = NULL;
-            }
-            if (child->kstack_base) kfree(child->kstack_base);
-            nsproxy_release(child);    /* slice 8 */
-            memset(child, 0, sizeof(*child));
-            child->state = PROC_UNUSED;
-            return -ABI_ENOMEM;
-        }
-        child->vfork_stack_va = stack_va;
-        child->vfork_stack_pages = np;
-        struct syscall_regs *cr =
-            (struct syscall_regs *)((uint8_t *)child->kstack_top
-                                    - sizeof(struct syscall_regs));
-        /* SysV ABI red zone is 128 bytes below RSP; leave headroom. */
-        cr->user_rsp = stack_va + (uint64_t)np * PAGE_SIZE - 256;
     }
 
     /* SLICE 16: NO charge here, and that is deliberate.
@@ -1200,6 +1205,24 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
  * but a Win32 CRT wants more headroom, so the PE arm maps its own. */
 #define PE_STACK_PAGES  64
 
+/* POSIX: a successful exec closes every descriptor marked FD_CLOEXEC.
+ * Runs at the COMMIT point only -- a failed execve returns -1 with the
+ * caller's descriptors intact, which is what lets shells retry. Only the
+ * Linux personality sets bits, so a native or Win32 image pays one bitmap
+ * walk and closes nothing. Shared by the ELF and PE exec arms: exec is
+ * exec, whichever personality the new image lands in. */
+static void exec_close_cloexec_fds(struct proc *p) {
+    struct file **tab = proc_fds(p);
+    if (!tab) return;
+    for (int i = 0; i < PROC_NFDS; i++) {
+        if (tab[i] && fd_cloexec_get(p, i)) {
+            file_close(tab[i]);
+            tab[i] = 0;
+            fd_cloexec_set(p, i, 0);
+        }
+    }
+}
+
 /* ===================================================================
  * execve_pe -- the Windows-PE arm of sys_execve (Track X / X1).
  *
@@ -1275,6 +1298,9 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
     p->win_heap_cur = 0;
     p->win_heap_end = 0;
     p->clear_child_tid = 0;
+
+    /* FD_CLOEXEC acts on ANY successful exec, a .exe included. */
+    exec_close_cloexec_fds(p);
 
     /* Flip to the Win32 personality and install the PE's TEB + resource/TLS
      * metadata -- mirrors the PE arm of proc_spawn (proc.c). */
@@ -1467,6 +1493,28 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         return -ABI_ENOENT;
     }
 
+    /* ---- Phase F: POSIX de_thread (2026-08-22) -------------------------
+     * exec from the leader kills every other thread in the group BEFORE the
+     * new image is built. Until now an exec'd image ran with the old
+     * image's threads still scheduled -- on page tables the commit path was
+     * about to destroy. Placed here for the same reason as the setuid
+     * transition below: the image has been read, so the exec can no longer
+     * fail for the common (missing/unreadable file) reasons; Linux's
+     * de_thread sits at the equivalent point (flush_old_exec). A failure
+     * AFTER this point loses the siblings anyway -- exactly as on Linux,
+     * where past the point of no return a failed exec kills the process.
+     * The old image's robust-mutex registration is walked while its memory
+     * is still mapped, then dropped (glibc re-registers in the new image).
+     * exec from a NON-leader thread keeps its documented divergence (no
+     * pid takeover, siblings survive) -- nothing exercised does it. */
+    if (!p->is_thread) {
+        bool had_bkl = bkl_held();
+        if (had_bkl) bkl_exit();
+        proc_reap_group_threads(p, 0);
+        if (had_bkl) bkl_enter();
+    }
+    { extern void futex_robust_exit(struct proc *); futex_robust_exit(p); }
+
     /* ---- Linux slice 2: the set-user-ID-on-exec transition ----
      *
      * Applied here: the image has been read (so we know the exec will not fail
@@ -1613,7 +1661,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 
     /* Build auxv + pack argv/envp onto user stack. */
-    struct abi_auxv aux[20];
+    struct abi_auxv aux[24];
     int auxc = 0;
     uint64_t user_rsp = USER_STACK_RSP_INIT;
 
@@ -1626,14 +1674,38 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         aux[auxc++] = (struct abi_auxv){ ABI_AT_ENTRY,  prog_info.entry   };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_PAGESZ, PAGE_SIZE         };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_FLAGS,  0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,   0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,    0                 };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,   0                 };
+        /* Real credentials at exec (2026-08-22; were hardcoded 0) --
+         * packed AFTER the setuid-on-exec credential update, so a suid
+         * image reports AT_SECURE=1 and glibc enters secure mode (drops
+         * LD_* env), which is the protection suid exists to keep. Same
+         * user-namespace reporting boundary as getuid/stat/procfs. */
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_UID,
+                                         userns_cur_uid((uint32_t)p->ruid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EUID,
+                                         userns_cur_uid((uint32_t)p->uid)  };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_GID,
+                                         userns_cur_gid((uint32_t)p->rgid) };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_EGID,
+                                         userns_cur_gid((uint32_t)p->gid)  };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP,  ABI_AT_HWCAP_X86_64_BASE };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_HWCAP2, 0                };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_MINSIGSTKSZ, 2048       };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_CLKTCK, 100               };
-        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE, 0                 };
+        aux[auxc++] = (struct abi_auxv){ ABI_AT_SECURE,
+                                         (p->uid != p->ruid ||
+                                          p->gid != p->rgid) ? 1u : 0u    };
         aux[auxc++] = (struct abi_auxv){ ABI_AT_RANDOM, USER_STACK_TOP_VA - 16 };
+        /* vDSO (2026-08-23): map into the NEW image and advertise it.
+         * glibc reads AT_SYSINFO_EHDR at startup and routes
+         * clock_gettime/gettimeofday/time through the mapped code
+         * instead of syscalls. Absent (base 0) => entry omitted and
+         * glibc keeps its syscall fallback -- the pre-vDSO world. */
+        {
+            extern uint64_t vdso_map_root(uint64_t cr3);
+            uint64_t vb = vdso_map_root(new_pml4);
+            if (vb)
+                aux[auxc++] = (struct abi_auxv){ ABI_AT_SYSINFO_EHDR, vb };
+        }
 
         /* Pack using inline logic (we can't call proc.c's static pack_user_stack).
          * We build a minimal layout: argc, argv[], NULL, envp[], NULL,
@@ -1762,6 +1834,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * clear_child_tid carried over from the replaced image. */
     p->clear_child_tid = 0;
 
+    /* FD_CLOEXEC acts NOW -- past the commit, before the new image runs. */
+    exec_close_cloexec_fds(p);
+
     /* Update name from the new path. */
     const char *base = kpath;
     for (const char *c = kpath; *c; c++) if (*c == '/') base = c + 1;
@@ -1769,6 +1844,10 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (n >= PROC_NAME_MAX) n = PROC_NAME_MAX - 1;
     memcpy(p->name, base, n);
     p->name[n] = '\0';
+
+    /* /proc/<pid>/cmdline follows the NEW image's argv. */
+    { extern void proc_record_cmdline(struct proc *, int, char **);
+      proc_record_cmdline(p, kargc, kargv_buf); }
 
     /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
     {

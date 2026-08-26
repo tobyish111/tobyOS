@@ -1,0 +1,6 @@
+cat <<EOF \
+1
+2
+3
+EOF
+| tac

@@ -249,6 +249,27 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len) {
     if (payload_len > IP_MAX_PAYLOAD_SEND) return false;
 
+    /* LOOPBACK (2026-08-22). 127/8 -- and our own unicast address, as
+     * Linux routes it -- delivers INLINE on the sender's stack, the veth
+     * model: by the time ip_send returns, the receiving socket's state
+     * has already advanced, so the caller's own wait loop sees it. The
+     * delivered src is the destination itself (src==dst), which keeps
+     * TCP's conn matching symmetric across both halves of a self-
+     * connection. NO loopback existed in this stack before (cut 1's
+     * founding measurement): 127.0.0.1 was routed at the gateway and
+     * died, so every local test server and localhost-only service was
+     * structurally impossible. Scoped to the namespace's own address
+     * space -- an empty net namespace is still refused at the socket
+     * boundary before reaching here. */
+    {
+        uint32_t me = net_my_ip();
+        if ((dst_ip_be & 0xFFu) == 127u || (me != 0 && dst_ip_be == me)) {
+            ip_deliver_l4(dst_ip_be, proto, (const uint8_t *)payload,
+                          payload_len);
+            return true;
+        }
+    }
+
     /* CUT 5 made this decision NAMESPACE-RELATIVE: "is this on my subnet, and
      * if not who is my gateway" was answered from the HOST's address, mask and
      * gateway no matter who asked, so a container sending off its own subnet
@@ -359,6 +380,7 @@ static bool ip_dst_is_for_us(uint32_t dst_ip_be) {
     uint32_t me   = net_my_ip();
     uint32_t mask = net_my_netmask();
     if (dst_ip_be == me) return true;
+    if ((dst_ip_be & 0xFFu) == 127u) return true;   /* loopback (2026-08-22) */
     if (dst_ip_be == IP_BROADCAST_BE) return true;
     if (me == 0) return true;
     if (mask) {

@@ -58,6 +58,23 @@ sighandler_t signal(int signum, sighandler_t handler) {
     return old.sa_handler;
 }
 
+/* signal() WITHOUT SA_RESTART: a blocked syscall returns EINTR rather than
+ * resuming transparently.
+ *
+ * 2026-08-25. signal()'s SA_RESTART is right for almost every handler and
+ * exactly wrong for an interactive reader. /bin/tsh armed SIGINT with it,
+ * so ^C at the prompt ran the handler and then RESUMED the blocked read():
+ * the half-typed line stayed, no newline appeared, no fresh prompt was
+ * drawn. The key did nothing observable, which is indistinguishable from
+ * ^C not being wired at all. Anything that must REACT to a signal mid-read
+ * -- a shell, a pager, an editor -- wants this one. */
+sighandler_t signal_norestart(int signum, sighandler_t handler) {
+    struct sigaction sa = { .sa_handler = handler, .sa_mask = 0, .sa_flags = 0 };
+    struct sigaction old = {0};
+    if (sigaction(signum, &sa, &old) < 0) return SIG_ERR;
+    return old.sa_handler;
+}
+
 int sigemptyset(sigset_t *set)  { if (set) *set = 0; return 0; }
 int sigfillset(sigset_t *set)   { if (set) *set = ~0UL; return 0; }
 int sigaddset(sigset_t *set, int n) { if (set && n > 0 && n < 64) { *set |= (1UL << n); return 0; } return -1; }

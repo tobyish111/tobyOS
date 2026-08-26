@@ -38,6 +38,13 @@ struct stat {
     mode_t st_mode;
     uid_t  st_uid;
     gid_t  st_gid;
+    /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS. The kernel had them
+     * in struct vfs_stat all along and struct abi_stat had nowhere to put
+     * them, so no native program could read a file's date -- which is why
+     * `touch -m` had no existing atime to preserve. 0 means the filesystem
+     * has no answer (fstat on a pipe, say), not 1970. */
+    time_t st_mtime;
+    time_t st_atime;
 };
 
 int stat (const char *path, struct stat *out);

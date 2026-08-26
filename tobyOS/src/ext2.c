@@ -26,6 +26,10 @@
 
 /* ---- in-memory mount state ---- */
 
+/* Concurrent open handles tracked per mount. Sized for "plenty";
+ * exceeding it is reported, never silently ignored. */
+#define EXT2_MAX_OPEN_INODES 64
+
 struct ext2 {
     struct blk_dev *dev;
 
@@ -47,6 +51,14 @@ struct ext2 {
     uint8_t *blk_buf;
     uint8_t *blk_buf2;
     uint8_t *blk_buf3;
+
+    /* Open handles per inode, so unlink() can defer the release to the
+     * last close the way POSIX requires. Same reasoning as ext4's. */
+    struct ext2_openref {
+        uint32_t ino;             /* 0 = free slot */
+        int      refs;
+        bool     orphan;          /* the last NAME went away while open */
+    } openrefs[EXT2_MAX_OPEN_INODES];
 };
 
 /* Per-handle state for an open file. */
@@ -122,6 +134,8 @@ static int flush_gdt(struct ext2 *fs) {
 }
 
 /* ---- inode read/write ---- */
+
+static uint64_t ext2_now_secs(void);
 
 static int read_inode(struct ext2 *fs, uint32_t ino, struct ext4_inode *out) {
     if (ino == 0) return VFS_ERR_INVAL;
@@ -817,6 +831,62 @@ static int dir_remove_entry(struct ext2 *fs, uint32_t dir_ino,
     return VFS_ERR_NOENT;
 }
 
+/* ---- open-handle references, so unlink can defer the release --------
+ *
+ * POSIX: unlink() removes the NAME; the file survives until the last
+ * descriptor closes, and THAT is when the blocks come back. This driver
+ * freed them the moment i_links_count hit zero, leaving an open handle
+ * reading blocks already returned to the allocator -- and, once the
+ * inode number was reissued, a different file entirely. mkstemp(),
+ * tmpfile() and every bash here-document depend on the correct
+ * behaviour. Mirrors ext4's table. */
+static struct ext2_openref *oref_find(struct ext2 *fs, uint32_t ino) {
+    for (size_t i = 0; i < EXT2_MAX_OPEN_INODES; i++)
+        if (fs->openrefs[i].ino == ino && fs->openrefs[i].refs > 0)
+            return &fs->openrefs[i];
+    return 0;
+}
+
+static int oref_get(struct ext2 *fs, uint32_t ino) {
+    struct ext2_openref *r = oref_find(fs, ino);
+    if (r) { r->refs++; return VFS_OK; }
+    for (size_t i = 0; i < EXT2_MAX_OPEN_INODES; i++) {
+        if (fs->openrefs[i].refs == 0) {
+            fs->openrefs[i].ino    = ino;
+            fs->openrefs[i].refs   = 1;
+            fs->openrefs[i].orphan = false;
+            return VFS_OK;
+        }
+    }
+    /* Refuse rather than proceed untracked -- an untracked handle is the
+     * exact bug this table exists to prevent. */
+    kprintf("[ext2] open-inode table full (%d) -- refusing to open ino %u "
+            "untracked\n", EXT2_MAX_OPEN_INODES, (unsigned)ino);
+    return VFS_ERR_NOMEM;
+}
+
+static void ext2_release_inode(struct ext2 *fs, uint32_t ino) {
+    struct ext4_inode in;
+    if (read_inode(fs, ino, &in) != VFS_OK) return;
+    if (in.i_links_count != 0) return;        /* re-linked in the meantime */
+    free_inode_blocks(fs, &in);
+    in.i_size_lo = 0;
+    in.i_size_hi = 0;
+    in.i_dtime   = (uint32_t)ext2_now_secs();
+    write_inode(fs, ino, &in);
+    free_inode(fs, ino);
+}
+
+static void oref_put(struct ext2 *fs, uint32_t ino) {
+    struct ext2_openref *r = oref_find(fs, ino);
+    if (!r) return;
+    if (--r->refs > 0) return;
+    bool orphan = r->orphan;
+    r->ino    = 0;
+    r->orphan = false;
+    if (orphan) ext2_release_inode(fs, ino);   /* now the space comes back */
+}
+
 /* ---- vfs_ops implementation ---- */
 
 static int ext2_open(void *mnt, const char *path, struct vfs_file *out) {
@@ -836,6 +906,10 @@ static int ext2_open(void *mnt, const char *path, struct vfs_file *out) {
 
     struct ext2_filepriv *fp = kcalloc(1, sizeof(*fp));
     if (!fp) return VFS_ERR_NOMEM;
+    /* Count this handle BEFORE anyone can unlink the name out from under
+     * it -- that count is what makes the deferred release possible. */
+    int orc = oref_get(fs, ino);
+    if (orc != VFS_OK) { kfree(fp); return orc; }
     fp->inode_no  = ino;
     fp->in        = in;
     fp->file_size = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
@@ -851,7 +925,28 @@ static int ext2_open(void *mnt, const char *path, struct vfs_file *out) {
 }
 
 static int ext2_close(struct vfs_file *f) {
-    if (f && f->priv) { kfree(f->priv); f->priv = NULL; }
+    if (f && f->priv) {
+        struct ext2 *fs = (struct ext2 *)f->mnt;
+        struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
+        uint32_t ino = fp->inode_no;
+        kfree(fp);
+        f->priv = NULL;
+        if (fs) oref_put(fs, ino);
+    }
+    return VFS_OK;
+}
+
+/* An open handle keeps its OWN copy of the inode, and every mutation --
+ * this handle's, another handle's, a truncate by path -- writes the inode
+ * straight to disk. So disk is the shared truth and the cached copy goes
+ * stale the moment anyone else touches the file. Same reasoning, and the
+ * same fix, as ext4's fp_refresh(). */
+static int fp_refresh(struct ext2 *fs, struct ext2_filepriv *fp) {
+    struct ext4_inode in;
+    int rc = read_inode(fs, fp->inode_no, &in);
+    if (rc != VFS_OK) return rc;
+    fp->in        = in;
+    fp->file_size = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
     return VFS_OK;
 }
 
@@ -859,6 +954,9 @@ static long ext2_read(struct vfs_file *f, void *buf, size_t n) {
     struct ext2 *fs = (struct ext2 *)f->mnt;
     struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
+    int frc = fp_refresh(fs, fp);          /* another handle may have grown it */
+    if (frc != VFS_OK) return frc;
+    f->size = (size_t)fp->file_size;
     long got = inode_read(fs, &fp->in, fp->file_size, f->pos, buf, n);
     if (got > 0) f->pos += (size_t)got;
     return got;
@@ -868,6 +966,10 @@ static long ext2_write(struct vfs_file *f, const void *buf, size_t n) {
     struct ext2 *fs = (struct ext2 *)f->mnt;
     struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
     if (!fp) return VFS_ERR_INVAL;
+
+    int frc = fp_refresh(fs, fp);
+    if (frc != VFS_OK) return frc;
+    f->size = (size_t)fp->file_size;
 
     const uint8_t *src = (const uint8_t *)buf;
     size_t written = 0;
@@ -958,6 +1060,41 @@ static int ext2_create(void *mnt, const char *path,
     return VFS_OK;
 }
 
+/* Hard links. ext2_unlink() below already decrements i_links_count and
+ * only releases the blocks at zero, so the inode half was always right --
+ * only the second-directory-entry half was missing. */
+static int ext2_link(void *mnt, const char *oldpath, const char *newpath) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, oldpath, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    /* POSIX forbids hard links to directories -- they make the tree
+     * cyclic and every walker that trusts it loops forever. */
+    if (ftype == EXT4_FT_DIR ||
+        (in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) return VFS_ERR_ISDIR;
+
+    uint32_t np_ino;
+    char np_leaf[VFS_NAME_MAX];
+    rc = path_parent(fs, newpath, &np_ino, np_leaf, sizeof(np_leaf));
+    if (rc != VFS_OK) return rc;
+
+    uint32_t clash; uint8_t clash_ft;
+    if (path_to_inode(fs, newpath, &clash, &clash_ft) == VFS_OK)
+        return VFS_ERR_EXIST;
+
+    rc = dir_add_entry(fs, np_ino, np_leaf, ino, ftype);
+    if (rc != VFS_OK) return rc;
+
+    in.i_links_count++;
+    in.i_ctime = (uint32_t)ext2_now_secs();
+    return write_inode(fs, ino, &in);
+}
+
 static int ext2_unlink(void *mnt, const char *path) {
     struct ext2 *fs = (struct ext2 *)mnt;
 
@@ -981,16 +1118,59 @@ static int ext2_unlink(void *mnt, const char *path) {
 
     in.i_links_count--;
     if (in.i_links_count == 0) {
+        struct ext2_openref *r = oref_find(fs, ino);
+        if (r) {
+            /* Still open: the NAME went away above, but the bytes belong
+             * to those handles until the last one closes. */
+            r->orphan = true;
+            return write_inode(fs, ino, &in);
+        }
         free_inode_blocks(fs, &in);
         in.i_size_lo = 0;
         in.i_size_hi = 0;
-        in.i_dtime = 1;
+        in.i_dtime = (uint32_t)ext2_now_secs();
         write_inode(fs, ino, &in);
         free_inode(fs, ino);
     } else {
         write_inode(fs, ino, &in);
     }
     return VFS_OK;
+}
+
+/* Phase H: rename within the mount, dirent-level -- add the new name
+ * for the same inode, drop the old, unlinking a clobbered destination
+ * the way rename(2) requires. leveldb/SQLite rename a temp file over a
+ * live one constantly; on ext volumes that answered ROFS forever.
+ * SCOPE, stated: a DIRECTORY may only be renamed within its parent --
+ * moving one across directories would leave its ".." entry pointing at
+ * the old parent, and silently corrupting a foreign filesystem's tree
+ * is worse than refusing. Files move freely. */
+static int ext2_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint32_t src_ino; uint8_t src_ft;
+    int rc = path_to_inode(fs, oldpath, &src_ino, &src_ft);
+    if (rc != VFS_OK) return rc;
+    uint32_t op_ino, np_ino;
+    char op_leaf[VFS_NAME_MAX], np_leaf[VFS_NAME_MAX];
+    rc = path_parent(fs, oldpath, &op_ino, op_leaf, sizeof op_leaf);
+    if (rc != VFS_OK) return rc;
+    rc = path_parent(fs, newpath, &np_ino, np_leaf, sizeof np_leaf);
+    if (rc != VFS_OK) return rc;
+    if (src_ft == EXT4_FT_DIR && op_ino != np_ino) return VFS_ERR_INVAL;
+
+    uint32_t dst_ino; uint8_t dst_ft;
+    int drc = path_to_inode(fs, newpath, &dst_ino, &dst_ft);
+    if (drc == VFS_OK) {
+        if (dst_ino == src_ino) return VFS_OK;   /* same file: no-op */
+        if (dst_ft == EXT4_FT_DIR) return VFS_ERR_INVAL;
+        rc = ext2_unlink(mnt, newpath);
+        if (rc != VFS_OK) return rc;
+    } else if (drc != VFS_ERR_NOENT) {
+        return drc;
+    }
+    rc = dir_add_entry(fs, np_ino, np_leaf, src_ino, src_ft);
+    if (rc != VFS_OK) return rc;
+    return dir_remove_entry(fs, op_ino, op_leaf);
 }
 
 static int ext2_mkdir(void *mnt, const char *path,
@@ -1212,6 +1392,208 @@ static int ext2_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_OK;
 }
 
+/* ================================================================
+ * truncate / ftruncate / utimes.
+ *
+ * ext2 had chmod and chown but none of these three, and a NULL vfs op
+ * becomes VFS_ERR_ROFS -- so `truncate`, `>` redirection onto an existing
+ * file and `touch -d` all reported a read-only filesystem on a volume
+ * that was writable. free_inode_blocks() above frees EVERY block; these
+ * free only the tail, which is the part unlink never has to think about.
+ * ================================================================ */
+
+static uint64_t ext2_now_secs(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+}
+
+/* Walk one indirect table, freeing the pointers whose logical block is at
+ * or past `from`. `*out_still` receives how many pointers survive, so the
+ * caller can drop the table itself when it empties. */
+static int trim_one_indirect(struct ext2 *fs, uint32_t table_blk,
+                             uint32_t base_lblk, uint32_t from,
+                             uint32_t *out_still) {
+    uint32_t per_block = fs->block_size / 4;
+    uint8_t *buf = kmalloc(fs->block_size);
+    if (!buf) return VFS_ERR_NOMEM;
+    int rc = read_block(fs, table_blk, buf);
+    if (rc != VFS_OK) { kfree(buf); return rc; }
+
+    uint32_t *t = (uint32_t *)buf;
+    uint32_t still = 0;
+    bool dirty = false;
+    for (uint32_t i = 0; i < per_block; i++) {
+        if (!t[i]) continue;
+        if (base_lblk + i >= from) {
+            free_block(fs, t[i]);
+            t[i]  = 0;
+            dirty = true;
+        } else {
+            still++;
+        }
+    }
+    /* Only worth writing back if the table survives; if it does not, the
+     * caller is about to free it. */
+    if (dirty && still) rc = write_block(fs, table_blk, buf);
+    kfree(buf);
+    *out_still = still;
+    return rc;
+}
+
+/* Free every block from logical block `from` onward, keeping the rest.
+ * free_inode_blocks() is the `from == 0` case of this. */
+static int trim_inode_blocks(struct ext2 *fs, struct ext4_inode *in,
+                             uint32_t from) {
+    uint32_t per_block = fs->block_size / 4;
+    uint64_t kept = 0;
+
+    for (uint32_t i = 0; i < 12; i++) {
+        if (!in->i_block[i]) continue;
+        if (i >= from) {
+            free_block(fs, in->i_block[i]);
+            in->i_block[i] = 0;
+        } else {
+            kept++;
+        }
+    }
+
+    if (in->i_block[12]) {                    /* single indirect */
+        uint32_t still = 0;
+        int rc = trim_one_indirect(fs, in->i_block[12], 12, from, &still);
+        if (rc != VFS_OK) return rc;
+        if (still == 0) {
+            free_block(fs, in->i_block[12]);
+            in->i_block[12] = 0;
+        } else {
+            kept += still + 1;                /* +1: the table itself */
+        }
+    }
+
+    if (in->i_block[13]) {                    /* double indirect */
+        uint32_t base = 12 + per_block;
+        uint8_t *l1buf = kmalloc(fs->block_size);
+        if (!l1buf) return VFS_ERR_NOMEM;
+        int rc = read_block(fs, in->i_block[13], l1buf);
+        if (rc != VFS_OK) { kfree(l1buf); return rc; }
+
+        uint32_t *l1 = (uint32_t *)l1buf;
+        uint32_t live = 0;
+        bool dirty = false;
+        for (uint32_t i = 0; i < per_block; i++) {
+            if (!l1[i]) continue;
+            uint32_t still = 0;
+            rc = trim_one_indirect(fs, l1[i], base + i * per_block, from,
+                                   &still);
+            if (rc != VFS_OK) { kfree(l1buf); return rc; }
+            if (still == 0) {
+                free_block(fs, l1[i]);
+                l1[i] = 0;
+                dirty = true;
+            } else {
+                live++;
+                kept += still + 1;
+            }
+        }
+        if (live == 0) {
+            free_block(fs, in->i_block[13]);
+            in->i_block[13] = 0;
+        } else {
+            kept += 1;                        /* the l1 table */
+            if (dirty) rc = write_block(fs, in->i_block[13], l1buf);
+        }
+        kfree(l1buf);
+        if (rc != VFS_OK) return rc;
+    }
+
+    in->i_blocks_lo = (uint32_t)(kept * (fs->block_size / 512));
+    return VFS_OK;
+}
+
+static int ext2_do_truncate(struct ext2 *fs, uint32_t ino,
+                            struct ext4_inode *in, uint64_t len) {
+    if ((in->i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) return VFS_ERR_ISDIR;
+    uint64_t old = ((uint64_t)in->i_size_hi << 32) | in->i_size_lo;
+
+    if (len < old) {
+        /* Zero the tail of the last surviving block before freeing the
+         * rest: those bytes live inside a block we keep, so growing the
+         * file again would otherwise hand back its own old contents
+         * instead of the zeroes POSIX promises. */
+        uint32_t off = (uint32_t)(len % fs->block_size);
+        if (off) {
+            uint64_t phys = 0;
+            int rc = inode_block_map(fs, in,
+                                     (uint32_t)(len / fs->block_size), &phys);
+            if (rc != VFS_OK) return rc;
+            if (phys) {
+                uint8_t *tmp = kmalloc(fs->block_size);
+                if (!tmp) return VFS_ERR_NOMEM;
+                rc = read_block(fs, phys, tmp);
+                if (rc == VFS_OK) {
+                    memset(tmp + off, 0, fs->block_size - off);
+                    rc = write_block(fs, phys, tmp);
+                }
+                kfree(tmp);
+                if (rc != VFS_OK) return rc;
+            }
+        }
+        int rc = trim_inode_blocks(
+            fs, in, (uint32_t)((len + fs->block_size - 1) / fs->block_size));
+        if (rc != VFS_OK) return rc;
+    }
+    /* Growing allocates nothing: an unmapped block is a hole, and this
+     * driver's read path already returns zeroes for one. */
+
+    in->i_size_lo = (uint32_t)(len & 0xFFFFFFFFu);
+    in->i_size_hi = (uint32_t)(len >> 32);
+    uint32_t now = (uint32_t)ext2_now_secs();
+    in->i_mtime = now;
+    in->i_ctime = now;
+    return write_inode(fs, ino, in);
+}
+
+static int ext2_truncate(void *mnt, const char *path, uint64_t length) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    return ext2_do_truncate(fs, ino, &in, length);
+}
+
+static int ext2_ftruncate(struct vfs_file *f, uint64_t length) {
+    struct ext2 *fs = (struct ext2 *)f->mnt;
+    struct ext2_filepriv *fp = (struct ext2_filepriv *)f->priv;
+    if (!fp) return VFS_ERR_INVAL;
+    /* Critical here, not merely tidy: trimming with a stale block list
+     * would free blocks the file no longer owns. */
+    int rc = fp_refresh(fs, fp);
+    if (rc != VFS_OK) return rc;
+    rc = ext2_do_truncate(fs, fp->inode_no, &fp->in, length);
+    if (rc == VFS_OK) {
+        fp->file_size = length;
+        f->size       = (size_t)length;
+    }
+    return rc;
+}
+
+static int ext2_utimes(void *mnt, const char *path, uint64_t mtime,
+                       uint64_t atime) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    in.i_mtime = (uint32_t)mtime;
+    in.i_atime = (uint32_t)atime;
+    return write_inode(fs, ino, &in);
+}
+
 static int ext2_stat(void *mnt, const char *path, struct vfs_stat *out) {
     struct ext2 *fs = (struct ext2 *)mnt;
     uint32_t ino; uint8_t ftype;
@@ -1235,6 +1617,9 @@ static int ext2_stat(void *mnt, const char *path, struct vfs_stat *out) {
     }
     out->uid  = in.i_uid;
     out->gid  = in.i_gid;
+    out->mtime = in.i_mtime;
+    out->atime = in.i_atime;
+    out->nlink = in.i_links_count;
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
     return VFS_OK;
@@ -1253,7 +1638,41 @@ static int ext2_umount(void *mnt) {
     return VFS_OK;
 }
 
+/* Phase H: real numbers from the group descriptors -- the same free
+ * counters the allocators maintain, summed. */
+static int ext2_statfs(void *mnt, struct vfs_statfs *out) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    uint64_t bfree = 0, ifree = 0;
+    for (uint32_t g = 0; g < fs->group_count; g++) {
+        struct ext4_group_desc_32 *gd =
+            (struct ext4_group_desc_32 *)(fs->gdt_buf +
+                                          (uint64_t)g * fs->desc_size);
+        bfree += gd->bg_free_blocks_count_lo;
+        ifree += gd->bg_free_inodes_count_lo;
+    }
+    out->bsize      = fs->block_size;
+    out->blocks     = fs->total_blocks;
+    out->bfree      = bfree;
+    out->files      = fs->total_inodes;
+    out->ffree      = ifree;
+    out->type_magic = 0xEF53;               /* EXT4_SUPER_MAGIC */
+    out->namelen    = 255;
+    return VFS_OK;
+}
+
 /* ---- vfs_ops table ---- */
+
+/* fsync(2): the block cache is WRITE-BACK, so a successful write is not
+ * yet on the medium. Without this, fsync() returned 0 while the bytes sat
+ * in RAM -- which is the difference between "saved" and "saved until you
+ * unplug it". */
+static int ext2_sync(void *mnt) {
+    struct ext2 *fs = (struct ext2 *)mnt;
+    if (!fs || !fs->dev) return VFS_OK;
+    extern void bcache_sync(struct blk_dev *dev);
+    bcache_sync(fs->dev);
+    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+}
 
 const struct vfs_ops ext2_ops = {
     .open     = ext2_open,
@@ -1262,14 +1681,21 @@ const struct vfs_ops ext2_ops = {
     .write    = ext2_write,
     .create   = ext2_create,
     .unlink   = ext2_unlink,
+    .rename   = ext2_rename,   /* Phase H */
     .mkdir    = ext2_mkdir,
     .opendir  = ext2_opendir,
     .closedir = ext2_closedir,
     .readdir  = ext2_readdir,
     .stat     = ext2_stat,
-    .chmod    = ext2_chmod,
-    .chown    = ext2_chown,
-    .umount   = ext2_umount,
+    .chmod     = ext2_chmod,
+    .chown     = ext2_chown,
+    .utimes    = ext2_utimes,
+    .truncate  = ext2_truncate,
+    .ftruncate = ext2_ftruncate,
+    .link      = ext2_link,
+    .umount    = ext2_umount,
+    .statfs    = ext2_statfs,   /* Phase H */
+    .sync      = ext2_sync,
 };
 
 struct blk_dev *ext2_blkdev_of(void *mnt) {

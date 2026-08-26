@@ -38,6 +38,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
+#include <tobyos/installer.h>   /* t7: the installer is a writer too */
 
 /* ---- tiny helpers ------------------------------------------------ */
 
@@ -226,6 +227,7 @@ uint8_t provision_classify(struct blk_dev *d, uint32_t *flags,
 
     bool mounted = provision_dev_mounted(d, 0);
     if (mounted) fl |= ABI_BLK_F_MOUNTED;
+    if (d->removable) fl |= ABI_BLK_F_REMOVABLE;
 
     /* MBR / protective-MBR probe. */
     uint8_t b0[BLK_SECTOR_SIZE];
@@ -418,8 +420,10 @@ io_fail:
 
 /* ---- end-to-end create ------------------------------------------- */
 
-long provision_create_data_volume(struct blk_dev *d, bool force) {
+long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
     if (!d) return -ABI_EINVAL;
+    bool force = (flags & ABI_PROV_F_FORCE) != 0;
+    bool erase = (flags & ABI_PROV_F_ERASE) != 0;
 
     char fs[ABI_BLK_FS_MAX];
     uint32_t fl = 0;
@@ -443,14 +447,75 @@ long provision_create_data_volume(struct blk_dev *d, bool force) {
         return -ABI_EBUSY;
     }
     case ABI_BLKV_FOREIGN:
-        kprintf("[prov] REFUSED '%s': foreign filesystem/partition table "
-                "(%s) -- never writable through provisioning\n",
-                d->name, fs[0] ? fs : "partition table");
-        return -ABI_EPERM;
+        /* THE OWNER MAY REFORMAT THEIR OWN REMOVABLE MEDIA -- and nothing
+         * else. Every condition below is re-checked HERE, in the kernel,
+         * whatever userspace claims to have confirmed.
+         *
+         * The blanket refusal this replaces was right about the danger and
+         * wrong as an absolute: it also meant a user with a FAT32 stick had
+         * no way to hand it to tobyOS, which is all `mkfs` has ever been.
+         * What stays refused is everything the owner cannot plausibly mean:
+         * a fixed disk (so the drive holding a Windows install is
+         * unreachable by ANY flag), the live boot medium we are running
+         * from, and anything currently mounted. */
+        if (!erase) {
+            kprintf("[prov] REFUSED '%s': foreign filesystem/partition table "
+                    "(%s) -- ERASE is required to reformat removable media\n",
+                    d->name, fs[0] ? fs : "partition table");
+            return -ABI_EPERM;
+        }
+        if (!d->removable) {
+            kprintf("[prov] REFUSED '%s': ERASE covers REMOVABLE media only; "
+                    "this is a fixed disk carrying %s\n",
+                    d->name, fs[0] ? fs : "a partition table");
+            return -ABI_EPERM;
+        }
+        if (fs[0] && strcmp(fs, "iso9660") == 0) {
+            kprintf("[prov] REFUSED '%s': iso9660 -- this is the live boot "
+                    "medium; erasing it would destroy the running system\n",
+                    d->name);
+            return -ABI_EPERM;
+        }
+        if (provision_dev_mounted(d, 0)) {
+            kprintf("[prov] REFUSED '%s': backs a live mount\n", d->name);
+            return -ABI_EBUSY;
+        }
+        kprintf("[prov] ERASE '%s' (%s, %lu MiB): destroying %s at the "
+                "owner's explicit request\n",
+                d->name, d->model[0] ? d->model : "unknown model",
+                (unsigned long)(d->sector_count / 2048u),
+                fs[0] ? fs : "an existing partition table");
+        break;
     default:
         kprintf("[prov] REFUSED '%s': not a provisionable whole disk "
                 "(verdict %u)\n", d->name, (unsigned)v);
         return -ABI_EINVAL;
+    }
+
+    /* FORMAT_ONLY: a plain whole-disk tobyfs, and nothing else.
+     *
+     * Placed HERE, after the verdict switch, so it inherits the guard
+     * unchanged -- the flag decides what gets written, never who may be
+     * written to. No GPT (a transfer stick does not need a partition
+     * table), and /data is deliberately left alone: "format this USB" and
+     * "make this my system volume" are different requests. */
+    if (flags & ABI_PROV_F_FORMAT_ONLY) {
+        kprintf("[prov] formatting '%s' (%s, %lu MiB) as whole-disk tobyfs\n",
+                d->name, d->model[0] ? d->model : "unknown model",
+                (unsigned long)(d->sector_count / 2048u));
+        int fmt = tobyfs_format(d);
+        if (fmt != VFS_OK) {
+            kprintf("[prov] format of '%s' FAILED: %s\n",
+                    d->name, vfs_strerror(fmt));
+            return -ABI_EIO;
+        }
+        /* The failed probes above cached this device's pre-format sectors;
+         * drop them or a following mount re-reads the old bytes. Exactly
+         * the trap the GPT path documents a few lines further down. */
+        bcache_invalidate(d);
+        kprintf("[prov] '%s' formatted -- mount it with: "
+                "mount -t tobyfs %s /mnt/usb\n", d->name, d->name);
+        return ABI_PROV_OK_NEXT_BOOT;
     }
 
     /* Geometry: partition @ 1 MiB .. last usable LBA. tobyfs needs at
@@ -526,8 +591,41 @@ long provision_create_data_volume(struct blk_dev *d, bool force) {
             kprintf("[prov] RAM-backed /data restored\n");
         return -ABI_EIO;
     }
+    /* Root-owned 0755 straight out of the formatter; without this the
+     * desktop session that just asked for this volume cannot write to
+     * the thing it just made. */
+    data_volume_relax_perms();
     kprintf("[prov] '%s' is now /data (persistent)\n", pname);
     return ABI_PROV_OK_MOUNTED;
+}
+
+
+/* ---- /data must be writable by the LOGGED-IN USER -------------------
+ *
+ * A freshly formatted tobyfs root is uid 0 / mode 0755, so on any
+ * non-root session every write to /data fails the permission check --
+ * no saved files, no settings, no downloads. /data is the desktop's
+ * shared scratch+data volume, so it gets /tmp semantics: world-writable.
+ *
+ * This lives HERE, called from every site that mounts /data, because it
+ * used to live only in the boot path. Provisioning a stick mid-session
+ * mounts /data a SECOND time, that mount skipped the relaxation, and the
+ * volume stayed root-only until the next reboot -- which is exactly the
+ * "I formatted my USB, made a file, then could not save edits" report
+ * from real hardware on 2026-08-25. One copy, every caller.
+ */
+void data_volume_relax_perms(void) {
+    struct vfs_stat st;
+    if (vfs_stat("/data", &st) != VFS_OK) return;
+    if (st.mode & 00002u) return;              /* already world-writable */
+    unsigned was = (unsigned)(st.mode & 07777u);
+    if (vfs_chmod("/data", 00777u) == VFS_OK)
+        kprintf("[data] /data was mode 0%04o (root-only) -- relaxed to 0777 "
+                "so non-root sessions can use the desktop\n", was);
+    else
+        kprintf("[data] WARN: /data is mode 0%04o (root-only) and could not "
+                "be relaxed -- non-root logins will not be able to save "
+                "anything\n", was);
 }
 
 /* ---- SYS_BLK_LIST record builder (kernel staging buffer) ---------- */
@@ -669,7 +767,7 @@ void provision_selftest(void) {
     prov_expect("t1 classify blank", provision_classify(d1, &fl, fs),
                 ABI_BLKV_BLANK);
     prov_expect("t1 provision blank",
-                provision_create_data_volume(d1, false),
+                provision_create_data_volume(d1, 0u),
                 ABI_PROV_OK_MOUNTED);
     {
         struct vfs_file f;
@@ -688,14 +786,14 @@ void provision_selftest(void) {
     prov_expect("t2 classify while /data mounted",
                 provision_classify(d1, &fl, fs), ABI_BLKV_MOUNTED);
     prov_expect("t2 re-provision mounted (FORCE)",
-                provision_create_data_volume(d1, true), -ABI_EBUSY);
+                provision_create_data_volume(d1, ABI_PROV_F_FORCE), -ABI_EBUSY);
     (void)vfs_unmount("/data");
     prov_expect("t2 classify unmounted", provision_classify(d1, &fl, fs),
                 ABI_BLKV_TOBYOS);
     prov_expect("t2 re-provision without FORCE",
-                provision_create_data_volume(d1, false), -ABI_EEXIST);
+                provision_create_data_volume(d1, 0u), -ABI_EEXIST);
     prov_expect("t2 re-provision unmounted (FORCE)",
-                provision_create_data_volume(d1, true),
+                provision_create_data_volume(d1, ABI_PROV_F_FORCE),
                 ABI_PROV_OK_MOUNTED);
     (void)vfs_unmount("/data");
 
@@ -708,7 +806,7 @@ void provision_selftest(void) {
         prov_expect("t3 classify foreign GPT",
                     provision_classify(d2, &fl, fs), ABI_BLKV_FOREIGN);
         prov_expect("t3 provision foreign GPT (FORCE)",
-                    provision_create_data_volume(d2, true), -ABI_EPERM);
+                    provision_create_data_volume(d2, ABI_PROV_F_FORCE), -ABI_EPERM);
     } else {
         kprintf("[PROV] FAIL t3 setup\n");
         g_prov_st_fail++;
@@ -726,7 +824,7 @@ void provision_selftest(void) {
         prov_expect("t4 classify NTFS", provision_classify(d3, &fl, fs),
                     ABI_BLKV_FOREIGN);
         prov_expect("t4 provision NTFS (FORCE)",
-                    provision_create_data_volume(d3, true), -ABI_EPERM);
+                    provision_create_data_volume(d3, ABI_PROV_F_FORCE), -ABI_EPERM);
 
         /* t5: same disk, rewritten as an MBR with one Linux (0x83)
          * partition entry -> FOREIGN. */
@@ -741,12 +839,173 @@ void provision_selftest(void) {
         prov_expect("t5 classify MBR table", provision_classify(d3, &fl, fs),
                     ABI_BLKV_FOREIGN);
         prov_expect("t5 provision MBR table (FORCE)",
-                    provision_create_data_volume(d3, true), -ABI_EPERM);
+                    provision_create_data_volume(d3, ABI_PROV_F_FORCE), -ABI_EPERM);
     } else {
         kprintf("[PROV] FAIL t4/t5 setup\n");
         g_prov_st_fail++;
     }
     prd_free(2);
+
+    /* ---- t5b: THE EXPLICIT-ERASE PATH, in all four directions -------
+     *
+     * ABI_PROV_F_ERASE is the one flag that authorises destroying somebody
+     * else's data, so the interesting assertions are the REFUSALS. A
+     * permission model is only proven by what it says no to.
+     *
+     * The disk is rebuilt as FAT for each case; `removable` is toggled by
+     * hand, which is the whole point -- an internal disk carrying the same
+     * bytes must be unreachable by the same flag. */
+    /* 12288 sectors, matching t1/t3: a provisionable volume needs
+     * PROV_PART_START_LBA + TFS_TOTAL_BLOCKS*TFS_SECTORS_PER_BLOCK +
+     * PROV_ARRAY_SECTORS + 2 = 10274 sectors. At 8192 the ALLOW case
+     * returned EINVAL ("too small") and looked like a guard failure. */
+    struct blk_dev *d5 = prd_make(2, "prov2e", 12288);  /* 6 MiB */
+    if (d5) {
+        uint8_t s[BLK_SECTOR_SIZE];
+
+        /* THE REFUSALS RUN FIRST, and the ALLOW case last, because a
+         * successful provision MOUNTS the disk as /data -- after which it
+         * classifies MOUNTED and every later assertion here would be
+         * testing the mounted path wearing another name. The first draft
+         * had the allow case in the middle and the iso9660 refusal after
+         * it: the refusal "passed" for the wrong reason (EBUSY, not
+         * EPERM), which the expected-value check caught. */
+
+        /* iso9660 + removable + ERASE -> REFUSED. The live boot medium;
+         * erasing it destroys the system that is running. */
+        memset(s, 0, sizeof(s));
+        (void)blk_write(d5, 0, 1, s);
+        {
+            uint8_t iso[BLK_SECTOR_SIZE];
+            memset(iso, 0, sizeof(iso));
+            memcpy(iso + 1, "CD001", 5);
+            (void)blk_write(d5, 64, 1, iso);
+        }
+        bcache_invalidate(d5);
+        d5->removable = true;
+        prov_expect("t5b iso9660 + removable + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    -ABI_EPERM);
+
+        /* Now a FAT32 boot sector: the everyday factory-formatted stick.
+         * Sector 64 is cleared too, or the iso9660 probe still matches and
+         * the next three cases test the wrong signature. */
+        {
+            uint8_t zero[BLK_SECTOR_SIZE];
+            memset(zero, 0, sizeof(zero));
+            (void)blk_write(d5, 64, 1, zero);
+        }
+        memset(s, 0, sizeof(s));
+        memcpy(s + 82, "FAT32   ", 8);
+        s[510] = 0x55; s[511] = 0xAA;
+        (void)blk_write(d5, 0, 1, s);
+        bcache_invalidate(d5);
+
+        /* Fixed disk + ERASE -> refused. The assertion that keeps this
+         * flag away from the drive holding someone's Windows. */
+        d5->removable = false;
+        prov_expect("t5b FAT on FIXED disk + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    -ABI_EPERM);
+
+        /* Removable, but WITHOUT the flag -> refused. */
+        d5->removable = true;
+        prov_expect("t5b FAT on removable, no ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_FORCE),
+                    -ABI_EPERM);
+
+        /* Removable + ERASE -> ALLOWED. The stick is the owner's. /data is
+         * unmounted by now (t2 left it that way), so the new volume becomes
+         * the live /data: OK_MOUNTED, not OK_NEXT_BOOT. */
+        prov_expect("t5b FAT on removable + ERASE",
+                    provision_create_data_volume(d5, ABI_PROV_F_ERASE),
+                    ABI_PROV_OK_MOUNTED);
+
+        /* The volume the caller just asked for must be WRITABLE by the
+         * session that asked. A fresh tobyfs root is uid 0 / 0755, and
+         * this relaxation used to exist only in the boot path -- so a
+         * stick provisioned mid-session stayed root-only until reboot:
+         * "I formatted my USB, made a file, then could not save edits",
+         * reported from real hardware 2026-08-25. */
+        {
+            struct vfs_stat dst;
+            long wr = (vfs_stat("/data", &dst) == VFS_OK &&
+                       (dst.mode & 00002u)) ? 1 : 0;
+            prov_expect("t5b-perm fresh /data is world-writable", wr, 1);
+        }
+        (void)vfs_unmount("/data");
+    } else {
+        kprintf("[PROV] FAIL t5b setup\n");
+        g_prov_st_fail++;
+    }
+    /* NOT prd_free(2): a provisioned disk owns a partition record that
+     * holds a parent pointer forever (see prd_free's own comment), so the
+     * slot leaks by design -- exactly as slot 0 does after t1. */
+
+    /* ---- t5c: FORMAT_ONLY -- "format my USB stick" ------------------
+     *
+     * A different question from provisioning, and the assertions say so:
+     * the same guard applies (the flag changes WHAT is written, not WHO
+     * may be written to), the result is a real tobyfs, and /data IS LEFT
+     * ALONE. That last one is the whole distinction -- a format that
+     * quietly stole the system volume would be a worse surprise than the
+     * missing feature. */
+    {
+        struct blk_dev *d7 = prd_make(1, "prov1f", 12288);
+        struct blk_dev *data_before_fmt = data_backing_dev();
+        if (d7) {
+            uint8_t s[BLK_SECTOR_SIZE];
+            memset(s, 0, sizeof(s));
+            memcpy(s + 82, "FAT32   ", 8);
+            s[510] = 0x55; s[511] = 0xAA;
+            (void)blk_write(d7, 0, 1, s);
+            bcache_invalidate(d7);
+
+            /* Fixed disk -- refused, exactly as for provisioning. */
+            d7->removable = false;
+            prov_expect("t5c format FIXED disk + ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE),
+                        -ABI_EPERM);
+
+            /* Removable but no ERASE over a foreign fs -- refused. */
+            d7->removable = true;
+            prov_expect("t5c format removable, no ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY),
+                        -ABI_EPERM);
+
+            /* Removable + ERASE -- formatted. */
+            prov_expect("t5c format removable + ERASE",
+                        provision_create_data_volume(
+                            d7, ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE),
+                        ABI_PROV_OK_NEXT_BOOT);
+
+            /* It is a REAL tobyfs: mountable, and round-trips a file.
+             * "returned OK" is not evidence that a filesystem exists. */
+            {
+                long ok = -1;
+                if (tobyfs_mount("/fmttest", d7) == VFS_OK) {
+                    struct vfs_file f;
+                    if (vfs_create("/fmttest/hello.txt") == VFS_OK &&
+                        vfs_open("/fmttest/hello.txt", &f) == VFS_OK) {
+                        if (vfs_write(&f, "usb", 3) == 3) ok = 0;
+                        vfs_close(&f);
+                    }
+                    (void)vfs_unmount("/fmttest");
+                }
+                prov_expect("t5c formatted stick mounts + writes", ok, 0);
+            }
+
+            /* AND /data was not touched. */
+            prov_expect("t5c format left /data alone",
+                        (long)(data_backing_dev() == data_before_fmt), 1L);
+        } else {
+            kprintf("[PROV] FAIL t5c setup\n");
+            g_prov_st_fail++;
+        }
+        prd_free(1);
+    }
 
     /* t6: a mounted tobyfs volume refuses provisioning (BUSY), then
      * accepts it once unmounted (with FORCE -- it carries tobyfs). */
@@ -757,7 +1016,7 @@ void provision_selftest(void) {
             prov_expect("t6 classify mounted",
                         provision_classify(d4, &fl, fs), ABI_BLKV_MOUNTED);
             prov_expect("t6 provision mounted (FORCE)",
-                        provision_create_data_volume(d4, true), -ABI_EBUSY);
+                        provision_create_data_volume(d4, ABI_PROV_F_FORCE), -ABI_EBUSY);
             (void)vfs_unmount("/ptest");
             prov_expect("t6 classify unmounted tobyfs",
                         provision_classify(d4, &fl, fs), ABI_BLKV_TOBYOS);
@@ -781,6 +1040,80 @@ void provision_selftest(void) {
             else
                 kprintf("[PROV] WARN: could not restore original /data\n");
         }
+    }
+
+    /* ---- t7: THE INSTALLER'S GUARD -------------------------------
+     *
+     * installer_run() writes a BOOT IMAGE over the front of a disk and
+     * until 2026-08-25 had no safety check at all -- its caller picked the
+     * target with blk_get_first(), whichever device enumerated first. On a
+     * machine whose internal disk came up before its USB sticks that was a
+     * boot image over somebody's Windows.
+     *
+     * Its rule is STRICTER than provisioning's on purpose: there is no
+     * ERASE escape hatch, because writing a bootloader over a disk has no
+     * everyday case the way handing over a spare USB stick does. So the
+     * assertion is that removable + foreign is refused HERE even though the
+     * very same disk is erasable through datavol.
+     *
+     * These run without an install image loaded, so installer_run stops at
+     * its -2 ("no install image") check AFTER the guard would have fired --
+     * which is why each case asserts the GUARD's specific code and not a
+     * generic failure. */
+    {
+        struct blk_dev *d6 = prd_make(1, "prov1i", 12288);
+        if (d6) {
+            uint8_t s[BLK_SECTOR_SIZE];
+            memset(s, 0, sizeof(s));
+            memcpy(s + 3, "NTFS    ", 8);
+            s[510] = 0x55; s[511] = 0xAA;
+            (void)blk_write(d6, 0, 1, s);
+            bcache_invalidate(d6);
+
+            d6->removable = false;
+            prov_expect("t7 installer refuses NTFS (fixed)",
+                        installer_run(d6), -11);
+            /* Removable makes no difference to the INSTALLER. */
+            d6->removable = true;
+            prov_expect("t7 installer refuses NTFS (removable too)",
+                        installer_run(d6), -11);
+
+            /* The live boot medium. */
+            memset(s, 0, sizeof(s));
+            (void)blk_write(d6, 0, 1, s);
+            {
+                uint8_t iso[BLK_SECTOR_SIZE];
+                memset(iso, 0, sizeof(iso));
+                memcpy(iso + 1, "CD001", 5);
+                (void)blk_write(d6, 64, 1, iso);
+            }
+            bcache_invalidate(d6);
+            prov_expect("t7 installer refuses iso9660",
+                        installer_run(d6), -11);
+
+            /* A partition, not a whole disk. */
+            {
+                uint8_t zero[BLK_SECTOR_SIZE];
+                memset(zero, 0, sizeof(zero));
+                (void)blk_write(d6, 64, 1, zero);
+                (void)blk_write(d6, 0, 1, zero);
+            }
+            bcache_invalidate(d6);
+            d6->class = BLK_CLASS_PARTITION;
+            prov_expect("t7 installer refuses a partition",
+                        installer_run(d6), -12);
+            d6->class = BLK_CLASS_DISK;
+
+            /* A blank disk PASSES the guard and stops at the missing
+             * install image (-2) -- proof the guard let it through rather
+             * than the guard being skipped. */
+            prov_expect("t7 installer accepts a blank disk",
+                        installer_run(d6), -2);
+        } else {
+            kprintf("[PROV] FAIL t7 setup\n");
+            g_prov_st_fail++;
+        }
+        prd_free(1);
     }
 
     if (g_prov_st_fail == 0)

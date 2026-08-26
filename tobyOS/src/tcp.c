@@ -3,6 +3,7 @@
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
 #include <tobyos/ip.h>
+#include <tobyos/ipv6.h>    /* TCP6 (2026-08-23): v6 peers + checksum/send */
 #include <tobyos/cpu.h>
 #include <tobyos/pit.h>
 #include <tobyos/printk.h>
@@ -11,6 +12,7 @@
 #include <tobyos/proc.h>    /* current_proc()->tcp_yield_wait (stage 12D) */
 #include <tobyos/nsproxy.h> /* net_ctx_* -- a connection sends in its own ns (cut 5) */
 #include <tobyos/percpu.h>  /* slice 56: yield-if-ready in tcp_poll_until */
+#include <tobyos/perf.h>    /* perf_now_ns: all timeouts are ns-based (2026-08-22) */
 #include <tobyos/smp.h>
 
 /* 16: HTTP keep-alive (http.c) parks up to KEEP_MAX=4 idle conns on top
@@ -31,6 +33,13 @@
  * the already-advertised wscale shift=4. 16 conns x 64 KiB = 1 MiB. */
 #define TCP_RX_BUF_BYTES   65536
 #define TCP_DEFAULT_MSS     1460
+/* TCP6 (2026-08-23): the v6 header is 20 bytes bigger than v4's, and v6
+ * has NO on-path fragmentation (RFC 8200) -- ipv6_send refuses anything
+ * over ETH_MTU-40, so a v4-sized 1460-byte segment is 1480 bytes of
+ * TCP and cannot leave the machine. Found by the 48 KiB stream gate:
+ * every full-MSS segment failed to emit while the small echo bits
+ * passed. 1500 - 40 (v6 hdr) - 20 (tcp hdr) = 1440. */
+#define TCP_V6_MSS          1440
 #define TCP_MAX_TX_PENDING  4
 #define TCP_LISTEN_BACKLOG  4
 #define TCP_EPHEMERAL_LO    49152
@@ -61,6 +70,16 @@ struct tcp_conn {
     void        *net_ns;
     tcp_state_t  state;
     uint32_t     remote_ip_be;
+    /* TCP6 (2026-08-23): when is6 is set, remote6 is the peer and
+     * remote_ip_be stays 0. Only the prologue (demux/checksum/emit) is
+     * family-aware; the whole sequence-space engine is shared. */
+    bool         is6;
+    struct ipv6_addr remote6;
+    uint8_t      icmp_err;      /* async ICMPv6 verdict (LXE errno), or 0.
+                                 * Set by tcp6_icmp_error on a SYN_SENT
+                                 * conn; read via tcp_icmp_err so connect
+                                 * reports ENETUNREACH and not a made-up
+                                 * ECONNREFUSED. */
     uint16_t     remote_port_be;
     uint16_t     local_port_be;
     uint32_t     snd_una;
@@ -94,7 +113,7 @@ struct tcp_conn {
 
     /* CUBIC state */
     uint32_t     w_max;           /* cwnd before last loss (in bytes) */
-    uint64_t     epoch_start;     /* pit_ticks() at last loss event */
+    uint64_t     epoch_start;     /* perf_now_ns() at last loss event */
     uint32_t     origin_point;    /* W_max for CUBIC calculation */
     uint32_t     tcp_friendliness_cwnd; /* TCP-friendly cwnd estimate */
 
@@ -151,7 +170,7 @@ struct tcp_conn {
     uint8_t      acc_head, acc_tail, acc_count, backlog_cap;
     int8_t       acc_q[TCP_LISTEN_BACKLOG];
     int8_t       parent_lsn;
-    uint64_t     tw_deadline_tick;
+    uint64_t     tw_deadline_ns;
     /* Owner has abandoned this conn (tcp_close_nowait): it is only
      * running out its FIN handshake / TIME_WAIT timer, and
      * tcp_service_tick may recycle the slot. Never set while a caller
@@ -212,7 +231,7 @@ static struct tcp_conn *conn_alloc(void) {
             struct tcp_conn *v = &g_conns[i];
             if (v->state == TCP_LISTEN) continue;
             if (v->state == TCP_TIME_WAIT &&
-                (!tw || v->tw_deadline_tick < tw->tw_deadline_tick))
+                (!tw || v->tw_deadline_ns < tw->tw_deadline_ns))
                 tw = v;
             else if (v->detached && !det)
                 det = v;
@@ -273,10 +292,25 @@ static struct tcp_conn *conn_lookup(uint32_t rip, uint16_t rport,
     void *ns = net_current_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
-        if (!c->in_use) continue;
+        if (!c->in_use || c->is6) continue;
         if (c->net_ns != ns) continue;
         if (c->remote_ip_be != rip || c->remote_port_be != rport ||
             c->local_port_be != lport)
+            continue;
+        return c;
+    }
+    return NULL;
+}
+
+static struct tcp_conn *conn_lookup6(const struct ipv6_addr *rip,
+                                     uint16_t rport, uint16_t lport) {
+    void *ns = net_current_ns();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use || !c->is6) continue;
+        if (c->net_ns != ns) continue;
+        if (!ipv6_addr_equal(&c->remote6, rip) ||
+            c->remote_port_be != rport || c->local_port_be != lport)
             continue;
         return c;
     }
@@ -509,10 +543,11 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
         uint32_t end = p->seq + (uint32_t)p->len + extra;
         if (seq_delta(ack, end) >= 0) {
             if (!sampled) {
-                uint32_t hz = pit_hz();
-                if (hz == 0) hz = 100;
-                uint64_t age_ms =
-                    ((pit_ticks() - p->sent_at) * 1000ull) / (uint64_t)hz;
+                /* 2026-08-22: ns-based. pit ticks under TCG arrive at ~1/15
+                 * of the programmed rate, so tick-derived RTT samples read
+                 * 15x SMALL and every timeout built on them ran 15x long
+                 * (measured: a "5 s" connect classified at 75651 ms). */
+                uint64_t age_ms = (perf_now_ns() - p->sent_at) / 1000000ull;
                 rto_update_on_ack(c, (uint32_t)age_ms);
                 sampled = true;
             }
@@ -544,18 +579,29 @@ static void pend_ack(struct tcp_conn *c, uint32_t ack) {
  * the host's segments and compute the checksum over it. Same rule cut 1 chose
  * for sockets -- the namespace belongs to the endpoint, not to whoever happens
  * to be running. */
-static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags, uint32_t seq,
                             const void *payload, size_t plen);
 
-static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
-                      const void *payload, size_t plen) {
+/* Emit with an EXPLICIT sequence number. The send path accounts snd_nxt
+ * BEFORE emitting (loopback delivers inline -- see tcp_send_data_segment),
+ * and the retransmit path re-sends old sequence numbers; both used to get
+ * this by temporarily rewinding c->snd_nxt around the emit, which a NESTED
+ * inline delivery (the peer's reply sending on this very conn) would read
+ * or clobber mid-trick. */
+static bool tcp_emit_at(struct tcp_conn *c, uint8_t flags, uint32_t seq,
+                        const void *payload, size_t plen) {
     struct net_ctx nprev = net_ctx_enter(c->net_ns, 0);
-    bool r = tcp_emit_locked(c, flags, payload, plen);
+    bool r = tcp_emit_locked(c, flags, seq, payload, plen);
     net_ctx_leave(nprev);
     return r;
 }
 
-static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
+static bool tcp_emit(struct tcp_conn *c, uint8_t flags,
+                      const void *payload, size_t plen) {
+    return tcp_emit_at(c, flags, c->snd_nxt, payload, plen);
+}
+
+static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags, uint32_t seq,
                       const void *payload, size_t plen) {
     uint8_t buf[TCP_HDR_LEN + 4 + TCP_DEFAULT_MSS]; /* +4 for options */
     if (plen > TCP_DEFAULT_MSS) return false;
@@ -570,7 +616,7 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
     memset(h, 0, hdr_len);
     h->src_port = c->local_port_be;
     h->dst_port = c->remote_port_be;
-    h->seq      = htonl(c->snd_nxt);
+    h->seq      = htonl(seq);
     h->ack      = htonl(c->rcv_nxt);
     h->data_off = (uint8_t)((hdr_len / 4u) << 4);
     h->flags    = flags;
@@ -580,6 +626,28 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
      * at 65535: with a 64 KiB buffer the raw value is 65536, which a
      * bare uint16_t cast would truncate to a ZERO window. */
     uint32_t free_wnd = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
+    /* Slice 124 REVERTED 2026-08-15, same day, on real-hardware evidence.
+     *
+     * This briefly applied RFC 1122 4.2.3.3 receiver-side silly-window
+     * avoidance: announce ZERO rather than any non-zero window below one
+     * MSS. The rule is correct in the abstract and I shipped it anyway on
+     * a bad justification -- I had MEASURED that it never fired in QEMU
+     * and reasoned it was therefore harmless. "Never fires in my test" is
+     * not "never fires"; it means the path went to the user UNTESTED IN
+     * EFFECT, and on the EliteDesk (different timing, real NIC pacing) it
+     * could fire and slam the window shut.
+     *
+     * Announcing zero is only safe if something reliably re-opens it, and
+     * this stack's re-opener is a single pure ACK from tcp_recv -- never
+     * retransmitted, so one loss strands the connection until the peer's
+     * zero-window probe. Shipping the shut half without the persist half
+     * was the mistake; the two belong in one slice, with a gate that can
+     * actually make the rule fire (a deliberately throttled reader).
+     *
+     * Restores the exact wire behaviour that demonstrably worked on that
+     * machine earlier the same day (search -> results -> click-through).
+     * The tcp_recv logging fix that came with it is KEPT: it changes no
+     * bytes on the wire and removed a real observer effect. */
     uint16_t adv_wnd;
     if (c->wscale_ok && !(flags & TCP_FLAG_SYN))
         adv_wnd = (uint16_t)(free_wnd >> c->rcv_wnd_shift);
@@ -598,9 +666,19 @@ static bool tcp_emit_locked(struct tcp_conn *c, uint8_t flags,
     }
 
     if (plen) memcpy(buf + hdr_len, payload, plen);
-    h->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(), c->remote_ip_be,
-                                   buf, hdr_len + plen);
-    bool sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    bool sent;
+    if (c->is6) {
+        /* TCP6: checksum over the pseudo-header ipv6_send will really
+         * stamp (loopback: src == dst). Mandatory in v6. */
+        h->checksum = ipv6_l4_checksum(ipv6_src_for(&c->remote6),
+                                       &c->remote6, IPV6_NH_TCP,
+                                       buf, hdr_len + plen);
+        sent = ipv6_send(&c->remote6, IPV6_NH_TCP, buf, hdr_len + plen) == 0;
+    } else {
+        h->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(),
+                                      c->remote_ip_be, buf, hdr_len + plen);
+        sent = ip_send(c->remote_ip_be, IP_PROTO_TCP, buf, hdr_len + plen);
+    }
     /* Slice 56: remember what the peer now believes our window is, so
      * tcp_recv can send a window-update ACK when reality outgrows it. */
     if (sent) c->adv_free_last = free_wnd;
@@ -621,7 +699,38 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
         flags |= TCP_FLAG_ACK;
     if (plen > 0) flags |= TCP_FLAG_PSH;
 
-    if (!tcp_emit(c, flags, payload, plen)) return false;
+    /* ACCOUNT BEFORE EMIT (2026-08-22). On loopback, ip_send delivers
+     * INLINE: the peer's reply recurses into tcp_recv_packet before this
+     * function's post-emit bookkeeping runs, so every field updated after
+     * the emit is one handshake-step stale when the reply is processed.
+     * Observed: the client's final ACK (= ISS+1) arrived while the
+     * server's snd_nxt still said ISS, failed the SYN_RECEIVED ack check,
+     * and the handshake crawled home on 30 s of retransmits. Wire
+     * behaviour is unchanged -- a wire reply cannot arrive inside the
+     * function. */
+    uint32_t send_seq = c->snd_nxt;
+    {
+        struct tx_pend *pp = &c->pend[pi];
+        pp->used    = true;
+        pp->seq     = send_seq;
+        pp->len     = plen;
+        pp->xflags  = xf;
+        pp->sent_at = perf_now_ns();
+        pp->retries = 0;
+        if (plen) memcpy(pp->buf, payload, plen);
+    }
+    uint32_t consumed = (uint32_t)plen;
+    if (xf & TCP_FLAG_SYN) consumed++;
+    if (xf & TCP_FLAG_FIN) consumed++;
+    c->snd_nxt         += consumed;
+    c->bytes_in_flight += consumed;
+
+    if (!tcp_emit_at(c, flags, send_seq, payload, plen)) {
+        c->pend[pi].used    = false;
+        c->snd_nxt         -= consumed;
+        c->bytes_in_flight -= consumed;
+        return false;
+    }
 #ifdef CHROMIUM_BOOT
     c->dbg_tx_total += plen;
     /* Slice 35: log outbound TLS record headers on port 443. This is the
@@ -638,20 +747,6 @@ static bool tcp_send_data_segment(struct tcp_conn *c, uint8_t xf,
     }
 #endif
 
-    struct tx_pend *p = &c->pend[pi];
-    p->used    = true;
-    p->seq     = c->snd_nxt;
-    p->len     = plen;
-    p->xflags  = xf;
-    p->sent_at = pit_ticks();
-    p->retries = 0;
-    if (plen) memcpy(p->buf, payload, plen);
-
-    uint32_t consumed = (uint32_t)plen;
-    if (xf & TCP_FLAG_SYN) consumed++;
-    if (xf & TCP_FLAG_FIN) consumed++;
-    c->snd_nxt += consumed;
-    c->bytes_in_flight += consumed;
     c->last_send_tsc = pit_ticks();
     return true;
 }
@@ -664,12 +759,9 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
         flags |= TCP_FLAG_ACK;
     if (p->len > 0) flags |= TCP_FLAG_PSH;
 
-    uint32_t saved = c->snd_nxt;
-    c->snd_nxt     = p->seq;
-    bool ok        = tcp_emit(c, flags, p->len ? p->buf : NULL, p->len);
-    c->snd_nxt     = saved;
+    bool ok = tcp_emit_at(c, flags, p->seq, p->len ? p->buf : NULL, p->len);
     if (ok) {
-        p->sent_at = pit_ticks();
+        p->sent_at = perf_now_ns();
         p->retries++;
         c->retransmit_count++;
 #ifdef CHROMIUM_BOOT
@@ -688,13 +780,10 @@ static bool tcp_retransmit_slot(struct tcp_conn *c, int pi) {
 static bool tcp_tick_one(struct tcp_conn *c) {
     if (!c || !c->in_use) return true;
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-
     for (int i = 0; i < TCP_MAX_TX_PENDING; i++) {
         struct tx_pend *p = &c->pend[i];
         if (!p->used) continue;
-        uint64_t age_ms = ((pit_ticks() - p->sent_at) * 1000ull) / hz;
+        uint64_t age_ms = (perf_now_ns() - p->sent_at) / 1000000ull;
         if ((uint32_t)age_ms < c->rto_ms) continue;
         if (p->retries >= TCP_RETX_LIMIT) {
             kprintf("[tcp] retx limit (lp=%u)\n",
@@ -732,11 +821,11 @@ static void tcp_tick_all(void) {
  * slot is recycled here a couple of ticks later. */
 void tcp_service_tick(void) {
     tcp_tick_all();
-    uint64_t now = pit_ticks();
+    uint64_t now = perf_now_ns();
     for (int i = 0; i < TCP_MAX_CONNS; i++) {
         struct tcp_conn *c = &g_conns[i];
         if (!c->in_use || !c->detached) continue;   /* only orphaned conns */
-        if (c->state == TCP_TIME_WAIT && now >= c->tw_deadline_tick)
+        if (c->state == TCP_TIME_WAIT && now >= c->tw_deadline_ns)
             conn_free(c);
         else if (c->state == TCP_CLOSED)
             conn_free(c);
@@ -751,6 +840,7 @@ static void listen_enqueue(struct tcp_conn *lsn, int child_idx) {
 }
 
 static void passive_syn(struct tcp_conn *lsn, uint32_t src_ip,
+    const struct ipv6_addr *src6,       /* non-NULL = v6 peer (TCP6) */
     uint16_t src_port, uint16_t dst_port, uint32_t seq,
     const void *tcp_packet, unsigned hlen) {
 int lidx = conn_index(lsn);
@@ -761,7 +851,8 @@ kprintf("[tcp] listen backlog full lp=%u\n",
 return;
 }
 
-if (conn_lookup(src_ip, src_port, dst_port)) {
+if (src6 ? (conn_lookup6(src6, src_port, dst_port) != NULL)
+         : (conn_lookup(src_ip, src_port, dst_port) != NULL)) {
 kprintf("[tcp] duplicate SYN ignored lp=%u rp=%u\n",
 (unsigned)ntohs(dst_port),
 (unsigned)ntohs(src_port));
@@ -771,7 +862,12 @@ return;
     struct tcp_conn *ch = conn_alloc();
     if (!ch) return;
 
-    ch->remote_ip_be   = src_ip;
+    if (src6) {
+        ch->is6     = true;
+        ch->remote6 = *src6;
+    } else {
+        ch->remote_ip_be = src_ip;
+    }
     ch->remote_port_be = src_port;
     ch->local_port_be  = dst_port;
     ch->parent_lsn     = (int8_t)lidx;
@@ -821,6 +917,10 @@ return;
             (unsigned)ch->rcv_nxt);
 }
 
+static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,
+                             const void *tcp_packet, size_t len,
+                             unsigned hlen);
+
 void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     if (len < TCP_HDR_LEN) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)tcp_packet;
@@ -828,7 +928,10 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     if (hlen < TCP_HDR_LEN || hlen > len) return;
 
     uint32_t me_ip = net_my_ip();
-    if (me_ip != 0) {
+    /* Loopback frames arrive with src==dst==127.x (see ip_send), so a
+     * pseudo-header over (src, me_ip) cannot validate -- and cannot be
+     * wrong either: the bytes never left this machine's memory. */
+    if (me_ip != 0 && (src_ip_be & 0xFFu) != 127u) {
         if (net_l4_checksum(IP_PROTO_TCP, src_ip_be, me_ip, tcp_packet,
                              len) != 0)
             return;
@@ -842,12 +945,109 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
         struct tcp_conn *lsn = listen_lookup(dstp);
         if (lsn && (h->flags & TCP_FLAG_SYN) &&
             !(h->flags & TCP_FLAG_ACK)) {
-            passive_syn(lsn, src_ip_be, srcp, dstp, ntohl(h->seq),
+            passive_syn(lsn, src_ip_be, NULL, srcp, dstp, ntohl(h->seq),
                         tcp_packet, hlen);
+            return;
+        }
+        /* CLOSED port: answer RST (2026-08-22; was a silent drop). RFC
+         * 793's rule, and what turns a connect() to a dead local port
+         * into an instant ECONNREFUSED instead of a SYN-retry crawl --
+         * on loopback the RST arrives before connect even returns. Not
+         * for RSTs (never answer a reset with a reset). */
+        if (!(h->flags & TCP_FLAG_RST)) {
+            uint8_t rst[TCP_HDR_LEN];
+            memset(rst, 0, sizeof rst);
+            struct tcp_hdr *r = (struct tcp_hdr *)rst;
+            r->src_port = dstp;
+            r->dst_port = srcp;
+            if (h->flags & TCP_FLAG_ACK) {
+                r->seq   = h->ack;             /* seq = their ack */
+                r->flags = TCP_FLAG_RST;
+            } else {
+                uint32_t extra = (h->flags & TCP_FLAG_SYN) ? 1u : 0u;
+                r->seq   = 0;
+                r->ack   = htonl(ntohl(h->seq) + (uint32_t)(len - hlen) + extra);
+                r->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+            }
+            r->data_off = (uint8_t)((TCP_HDR_LEN / 4) << 4);
+            r->checksum = 0;
+            r->checksum = net_l4_checksum(IP_PROTO_TCP, net_my_ip(),
+                                          src_ip_be, rst, sizeof rst);
+            (void)ip_send(src_ip_be, IP_PROTO_TCP, rst, sizeof rst);
         }
         return;
     }
 
+    tcp_recv_segment(c, h, tcp_packet, len, hlen);
+}
+
+/* TCP-over-IPv6 entry (2026-08-23), called from ipv6.c's demux with the
+ * packet's real addresses. Only this prologue -- checksum verify, conn
+ * demux, passive open, dead-port RST -- is family-specific; the whole
+ * sequence-space engine below (tcp_recv_segment) is shared verbatim. */
+void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
+                      const void *tcp_packet, size_t len) {
+    if (len < TCP_HDR_LEN) return;
+    const struct tcp_hdr *h = (const struct tcp_hdr *)tcp_packet;
+    unsigned hlen = tcp_hdr_bytes(h->data_off);
+    if (hlen < TCP_HDR_LEN || hlen > len) return;
+
+    /* Loopback frames are SELF-ADDRESSED (src == dst, see ipv6_send) and
+     * never left this machine's memory -- skip verification exactly as the
+     * v4 path does for 127/8. Anything off the wire must checksum
+     * (mandatory in v6). A valid packet's recomputed sum is -0, which
+     * ipv6_l4_checksum's zero rule reports as 0xFFFF. */
+    if (!ipv6_addr_equal(src, dst)) {
+        if (ipv6_l4_checksum(src, dst, IPV6_NH_TCP, tcp_packet, len)
+                != 0xFFFF)
+            return;
+    }
+
+    uint16_t dstp = h->dst_port;
+    uint16_t srcp = h->src_port;
+
+    struct tcp_conn *c = conn_lookup6(src, srcp, dstp);
+    if (!c) {
+        struct tcp_conn *lsn = listen_lookup(dstp);
+        if (lsn && (h->flags & TCP_FLAG_SYN) &&
+            !(h->flags & TCP_FLAG_ACK)) {
+            passive_syn(lsn, 0, src, srcp, dstp, ntohl(h->seq),
+                        tcp_packet, hlen);
+            return;
+        }
+        /* CLOSED port: RST, same rule and shape as v4 -- this is what
+         * makes a v6 connect() to a dead local port an instant
+         * ECONNREFUSED instead of a SYN-retry crawl. */
+        if (!(h->flags & TCP_FLAG_RST)) {
+            uint8_t rst[TCP_HDR_LEN];
+            memset(rst, 0, sizeof rst);
+            struct tcp_hdr *r = (struct tcp_hdr *)rst;
+            r->src_port = dstp;
+            r->dst_port = srcp;
+            if (h->flags & TCP_FLAG_ACK) {
+                r->seq   = h->ack;
+                r->flags = TCP_FLAG_RST;
+            } else {
+                uint32_t extra = (h->flags & TCP_FLAG_SYN) ? 1u : 0u;
+                r->seq   = 0;
+                r->ack   = htonl(ntohl(h->seq) + (uint32_t)(len - hlen) + extra);
+                r->flags = TCP_FLAG_RST | TCP_FLAG_ACK;
+            }
+            r->data_off = (uint8_t)((TCP_HDR_LEN / 4) << 4);
+            r->checksum = 0;
+            r->checksum = ipv6_l4_checksum(ipv6_src_for(src), src,
+                                           IPV6_NH_TCP, rst, sizeof rst);
+            (void)ipv6_send(src, IPV6_NH_TCP, rst, sizeof rst);
+        }
+        return;
+    }
+
+    tcp_recv_segment(c, h, tcp_packet, len, hlen);
+}
+
+static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,
+                             const void *tcp_packet, size_t len,
+                             unsigned hlen) {
     uint32_t seq = ntohl(h->seq);
     uint32_t ack = ntohl(h->ack);
     uint8_t  fl  = h->flags;
@@ -1036,13 +1236,8 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                      * the simple hobby-OS fallback.
                      */
                     c->state = TCP_TIME_WAIT;
-                    {
-                        uint32_t hz = pit_hz();
-                        if (hz == 0) hz = 100;
-                        c->tw_deadline_tick =
-                            pit_ticks() +
-                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
-                    }
+                    c->tw_deadline_ns =
+                        perf_now_ns() + (uint64_t)TCP_TW_MSL_MS * 1000000ull;
                     break;
                 
                 case TCP_FIN_WAIT_2:
@@ -1050,13 +1245,8 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
                      * Normal active close: our FIN was ACKed, then peer sent FIN.
                      */
                     c->state = TCP_TIME_WAIT;
-                    {
-                        uint32_t hz = pit_hz();
-                        if (hz == 0) hz = 100;
-                        c->tw_deadline_tick =
-                            pit_ticks() +
-                            ((uint64_t)hz * TCP_TW_MSL_MS) / 1000u;
-                    }
+                    c->tw_deadline_ns =
+                        perf_now_ns() + (uint64_t)TCP_TW_MSL_MS * 1000000ull;
                     break;
                 
                 default:
@@ -1101,7 +1291,7 @@ static int tcp_poll_until(struct tcp_conn *c, uint64_t deadline,
         int p = pred(c);
         if (p) return p;
         if (!tcp_tick_one(c)) return -1;
-        if (pit_ticks() >= deadline) return 0;
+        if (perf_now_ns() >= deadline) return 0;   /* deadline is NS now */
 
         /* Idle until the next interrupt. CRITICAL: drop the big kernel lock
          * across the wait. This loop backs the blocking TCP syscalls
@@ -1226,9 +1416,7 @@ struct tcp_conn *tcp_connect(uint32_t dst_ip_be, uint16_t dst_port_be,
     struct tcp_conn *c = tcp_syn_out(dst_ip_be, dst_port_be);
     if (!c) return NULL;
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     if (tcp_poll_until(c, dl, pred_est) != 1) {
         conn_free(c);
         return NULL;
@@ -1240,6 +1428,53 @@ struct tcp_conn *tcp_connect_nb(uint32_t dst_ip_be, uint16_t dst_port_be) {
     return tcp_syn_out(dst_ip_be, dst_port_be);
 }
 
+/* TCP6 active open (2026-08-23). Same shape as tcp_syn_out; the address
+ * gate is ipv6_is_up() rather than net_my_ip() -- a v6 conn's source is
+ * picked per-destination by ipv6_send (loopback: the destination). */
+static struct tcp_conn *tcp_syn_out6(const struct ipv6_addr *dst,
+                                     uint16_t dst_port_be) {
+    if (!dst || ipv6_addr_is_zero(dst) || !ipv6_is_up()) return NULL;
+    struct tcp_conn *c = conn_alloc();
+    if (!c) return NULL;
+    uint16_t lp = alloc_ephemeral_port();
+    if (lp == 0) {
+        conn_free(c);
+        return NULL;
+    }
+    c->local_port_be  = lp;
+    c->is6            = true;
+    c->remote6        = *dst;
+    c->remote_port_be = dst_port_be;
+    c->state          = TCP_SYN_SENT;
+
+    uint64_t mix = (uint64_t)pit_ticks() * 0x9E3779B97F4A7C15ull;
+    mix ^= ((uint64_t)g_my_mac[3] << 16) | ((uint64_t)g_my_mac[5]);
+    c->snd_nxt = c->snd_una = (uint32_t)(mix ^ (mix >> 32));
+
+    if (!tcp_send_data_segment(c, TCP_FLAG_SYN, NULL, 0)) {
+        conn_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+struct tcp_conn *tcp_connect6(const struct ipv6_addr *dst,
+                              uint16_t dst_port_be, uint32_t timeout_ms) {
+    struct tcp_conn *c = tcp_syn_out6(dst, dst_port_be);
+    if (!c) return NULL;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    if (tcp_poll_until(c, dl, pred_est) != 1) {
+        conn_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+struct tcp_conn *tcp_connect6_nb(const struct ipv6_addr *dst,
+                                 uint16_t dst_port_be) {
+    return tcp_syn_out6(dst, dst_port_be);
+}
+
 uint16_t tcp_local_port_be(const struct tcp_conn *c) {
     return (c && c->in_use) ? c->local_port_be : 0;
 }
@@ -1249,10 +1484,59 @@ uint32_t tcp_remote_ip_be(const struct tcp_conn *c) {
 uint16_t tcp_remote_port_be(const struct tcp_conn *c) {
     return (c && c->in_use) ? c->remote_port_be : 0;
 }
+bool tcp_conn_is6(const struct tcp_conn *c) {
+    return c && c->in_use && c->is6;
+}
+const struct ipv6_addr *tcp_remote6(const struct tcp_conn *c) {
+    return (c && c->in_use && c->is6) ? &c->remote6 : NULL;
+}
+int tcp_icmp_err(const struct tcp_conn *c) {
+    return (c && c->in_use) ? (int)c->icmp_err : 0;
+}
 
-struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
+/* ICMPv6 destination-unreachable naming one of OUR segments (RFC 4443
+ * code in `code`). Linux's tcp_v6_err shape: a connection still in the
+ * handshake dies with the mapped errno; an established one ignores the
+ * soft error. Without this, SLIRP's "no route" verdict on a v6 SYN --
+ * its answer whenever the host side cannot service the destination --
+ * was thrown away and every such connect sat out its full timeout. */
+void tcp6_icmp_error(uint16_t local_port_be, const struct ipv6_addr *peer,
+                     uint16_t peer_port_be, uint8_t code) {
+    uint8_t err = (code == 4) ? 111        /* ECONNREFUSED */
+                : (code == 0) ? 101        /* ENETUNREACH  */
+                : (code == 1) ? 13         /* EACCES       */
+                :               113;       /* EHOSTUNREACH */
+    struct tcp_conn *c = conn_lookup6(peer, peer_port_be, local_port_be);
+    if (!c || c->state != TCP_SYN_SENT) return;
+    kprintf("[tcp] ICMPv6 unreach code=%u kills tcp[%d] in SYN_SENT\n",
+            (unsigned)code, conn_index(c));
+    c->icmp_err = err;
+    c->state    = TCP_CLOSED;
+}
+
+/* SO_REUSEADDR's actual meaning for a listener: conns that are merely
+ * DYING (TIME_WAIT and the rest of the close ladder) do not hold the port
+ * against a new listen. A LIVE listener or established conn still does --
+ * reuse is not steal. */
+static bool port_blocks_listen(uint16_t port_be, bool reuse) {
+    void *ns = net_current_ns();
+    for (int i = 0; i < TCP_MAX_CONNS; i++) {
+        struct tcp_conn *c = &g_conns[i];
+        if (!c->in_use || c->net_ns != ns || c->local_port_be != port_be)
+            continue;
+        if (!reuse) return true;
+        if (c->state == TCP_LISTEN || c->state == TCP_ESTABLISHED ||
+            c->state == TCP_SYN_RECEIVED || c->state == TCP_SYN_SENT)
+            return true;                       /* genuinely alive */
+        /* FIN_WAIT*/ /* CLOSE_WAIT/LAST_ACK/TIME_WAIT/CLOSED: dying */
+    }
+    return false;
+}
+
+struct tcp_conn *tcp_listen_reuse(uint16_t local_port_be, int backlog,
+                                  bool reuse) {
     if (net_my_ip() == 0) return NULL;          /* cut 5: ours, not the host's */
-    if (port_in_use(local_port_be)) return NULL;
+    if (port_blocks_listen(local_port_be, reuse)) return NULL;
     struct tcp_conn *c = conn_alloc();
     if (!c) return NULL;
     c->local_port_be = local_port_be;
@@ -1269,6 +1553,38 @@ struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
             (unsigned)c->backlog_cap);
 
     return c;
+}
+
+struct tcp_conn *tcp_listen(uint16_t local_port_be, int backlog) {
+    return tcp_listen_reuse(local_port_be, backlog, false);
+}
+
+/* /proc/net/tcp support (2026-08-22): read-only snapshot of slot idx.
+ * Returns 0 and fills the row for a live conn, -1 for a free slot, -2
+ * past the table. lx_state is Linux's /proc/net/tcp state code. */
+int tcp_conn_snapshot(int idx, uint32_t *lip, uint16_t *lport,
+                      uint32_t *rip, uint16_t *rport, int *lx_state) {
+    if (idx < 0 || idx >= TCP_MAX_CONNS) return -2;
+    struct tcp_conn *c = &g_conns[idx];
+    if (!c->in_use) return -1;
+    *lip   = net_my_ip();
+    *lport = c->local_port_be;
+    *rip   = c->remote_ip_be;
+    *rport = c->remote_port_be;
+    switch (c->state) {
+    case TCP_ESTABLISHED:  *lx_state = 0x01; break;
+    case TCP_SYN_SENT:     *lx_state = 0x02; break;
+    case TCP_SYN_RECEIVED: *lx_state = 0x03; break;
+    case TCP_FIN_WAIT_1:   *lx_state = 0x04; break;
+    case TCP_FIN_WAIT_2:   *lx_state = 0x05; break;
+    case TCP_TIME_WAIT:    *lx_state = 0x06; break;
+    case TCP_CLOSED:       *lx_state = 0x07; break;
+    case TCP_CLOSE_WAIT:   *lx_state = 0x08; break;
+    case TCP_LAST_ACK:     *lx_state = 0x09; break;
+    case TCP_LISTEN:       *lx_state = 0x0A; break;
+    default:               *lx_state = 0x07; break;
+    }
+    return 0;
 }
 
 static int pred_accept(const struct tcp_conn *lsn) {
@@ -1293,18 +1609,25 @@ int tcp_poll_flags(const struct tcp_conn *c) {
     if (c->remote_fin_seen || c->state == TCP_CLOSE_WAIT ||
         c->state == TCP_CLOSED || c->state >= TCP_FIN_WAIT_1)
         f |= TCP_RDY_HUP | TCP_RDY_RECV;
-    /* send() is OK while our send side is open: ESTABLISHED, or CLOSE_WAIT
-     * (peer closed their write half but we may still write). */
-    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT)
-        f |= TCP_RDY_SEND;
+    /* send() is OK while our send side is open (ESTABLISHED, or CLOSE_WAIT:
+     * peer closed their write half but we may still write) AND the window
+     * has room. 2026-08-22: the window half was missing -- POLLOUT was
+     * derived from STATE alone while tcp_send_nb returns 0 exactly when
+     * flight >= min(cwnd, snd_wnd), so under backpressure epoll said
+     * "writable", send said EAGAIN, and the caller busy-spun between the
+     * two answers. Same gate as tcp_send_nb, kept in lockstep. */
+    if (c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) {
+        size_t flight = pend_flight_bytes(c);
+        size_t wnd = c->cwnd_bytes < (size_t)c->snd_wnd
+                       ? c->cwnd_bytes : (size_t)c->snd_wnd;
+        if (flight < wnd) f |= TCP_RDY_SEND;
+    }
     return f;
 }
 
 struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms) {
     if (!listener || listener->state != TCP_LISTEN) return NULL;
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     if (tcp_poll_until(listener, dl, pred_accept) != 1) return NULL;
     int idx = listener->acc_q[listener->acc_head];
     listener->acc_head =
@@ -1329,13 +1652,12 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
 
     const uint8_t *p          = (const uint8_t *)buf;
     size_t         remaining  = len;
-    uint32_t       hz         = pit_hz();
-    if (hz == 0) hz = 100;
 
     while (remaining > 0) {
         while (pend_flight_bytes(c) >= c->cwnd_bytes ||
                pend_flight_bytes(c) >= (size_t)c->snd_wnd) {
-            uint64_t dl = pit_ticks() + ((uint64_t)hz * (c->rto_ms + 500u)) / 1000u;
+            uint64_t dl = perf_now_ns() +
+                          (uint64_t)(c->rto_ms + 500u) * 1000000ull;
             int r = tcp_poll_until(c, dl, pred_pend_clear);
             if (r == -1 || r == -2) {
                 if (c->remote_rst_seen) return -2;
@@ -1345,14 +1667,15 @@ long tcp_send(struct tcp_conn *c, const void *buf, size_t len) {
         }
 
         size_t chunk = remaining;
-        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
+        size_t mss   = c->is6 ? TCP_V6_MSS : TCP_DEFAULT_MSS;
+        if (chunk > mss) chunk = mss;
         if (!tcp_send_data_segment(c, 0, p, chunk)) return -1;
         p += chunk;
         remaining -= chunk;
     }
 
-    uint64_t dl =
-        pit_ticks() + ((uint64_t)hz * (TCP_RETX_LIMIT + 2u) * c->rto_ms) / 1000u;
+    uint64_t dl = perf_now_ns() +
+        (uint64_t)(TCP_RETX_LIMIT + 2u) * c->rto_ms * 1000000ull;
     int r = tcp_poll_until(c, dl, pred_pend_clear);
     if (r != 1) {
         if (c->remote_rst_seen) return -2;
@@ -1387,8 +1710,9 @@ long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len) {
         size_t room = wnd - flight;
 
         size_t chunk = remaining;
-        if (chunk > TCP_DEFAULT_MSS) chunk = TCP_DEFAULT_MSS;
-        if (chunk > room)            chunk = room;
+        size_t mss   = c->is6 ? TCP_V6_MSS : TCP_DEFAULT_MSS;
+        if (chunk > mss)  chunk = mss;
+        if (chunk > room) chunk = room;
         if (chunk == 0) break;
 
         if (!tcp_send_data_segment(c, 0, p, chunk)) break;  /* no pending slot */
@@ -1410,9 +1734,7 @@ static int pred_recv(const struct tcp_conn *c) {
 
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
     if (!c || !c->in_use || cap == 0) return -1;
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + ((uint64_t)hz * timeout_ms) / 1000u;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     int r = tcp_poll_until(c, dl, pred_recv);
     if (r == -2) return -2;
     if (r == -1) {
@@ -1468,14 +1790,40 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
         uint32_t free_now = (uint32_t)(TCP_RX_BUF_BYTES - c->rx_count);
         if (free_now > c->adv_free_last &&
             free_now - c->adv_free_last >= 2u * TCP_DEFAULT_MSS) {
+            /* Slice 124: SEND FIRST, LOG AFTER. This kprintf used to sit
+             * between the decision and the send, and on a 38400-baud console
+             * one ~50-char line costs ~13 ms with interrupts enabled -- so
+             * in-flight data refilled the ring before tcp_emit sampled
+             * rx_count, and we advertised the collapsed window instead of the
+             * one we had just decided to announce. The 2026-08-15 capture
+             * shows the signature: twelve consecutive updates whose
+             * free-minus-announced gap is EXACTLY 17280 bytes, a constant
+             * because the log line is a constant duration. A varying delay
+             * would have given a varying gap; that constant is what says
+             * "instrument", not "network".
+             *
+             * This is the same trap tcp_set_trace(1) is documented for --
+             * per-segment logging on this console delays ACKs until senders
+             * back off, CAUSING the stall it was meant to observe. Logging
+             * after the send also reports strictly more: what the peer knew
+             * AND what we actually told it (adv_free_last is stamped by
+             * tcp_emit), which is the pair needed to judge the window. */
+#ifdef CHROMIUM_BOOT
+            uint32_t knew = c->adv_free_last;   /* before the send stamps it */
+#endif
+            tcp_send_ack(c);
 #ifdef CHROMIUM_BOOT
             {   static int wu = 0;
                 if (wu < 24) { wu++;
-                    kprintf("[tcp] WIN-UPDATE tcp[%d] free=%u peer-knew=%u\n",
-                            conn_index(c), free_now, c->adv_free_last);
+                    kprintf("[tcp] WIN-UPDATE tcp[%d] free=%u peer-knew=%u "
+                            "announced=%u\n",
+                            conn_index(c), free_now, knew,
+                            (unsigned)c->adv_free_last);
+                    if (wu == 24)
+                        kprintf("[tcp] WIN-UPDATE log CAP HIT (24) -- later "
+                                "updates are NOT logged\n");
                 } }
 #endif
-            tcp_send_ack(c);
         }
 #ifdef CHROMIUM_BOOT
         if (c->rx_full_episode && free_now >= TCP_RX_BUF_BYTES / 2u)
@@ -1489,6 +1837,22 @@ static int pred_closed_basic(const struct tcp_conn *c) {
     if (c->remote_rst_seen) return 1;
     if (c->state == TCP_CLOSED) return 1;
     return 0;
+}
+
+/* Half-close (shutdown(SHUT_WR)): send our FIN and keep RECEIVING. The
+ * transition pair is tcp_close's opening move, but nothing here waits and
+ * nothing frees -- the connection stays live for inbound data until the
+ * fd's real close runs the rest of the handshake. Idempotent: a connection
+ * already past ESTABLISHED/CLOSE_WAIT has said everything a FIN says. */
+void tcp_shutdown_tx(struct tcp_conn *c) {
+    if (!c || !c->in_use) return;
+    if (c->state == TCP_ESTABLISHED) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_FIN_WAIT_1;
+    } else if (c->state == TCP_CLOSE_WAIT) {
+        if (tcp_send_data_segment(c, TCP_FLAG_FIN, NULL, 0))
+            c->state = TCP_LAST_ACK;
+    }
 }
 
 void tcp_close(struct tcp_conn *c) {
@@ -1518,13 +1882,11 @@ void tcp_close(struct tcp_conn *c) {
         return;
     }
 
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 100;
-    uint64_t dl = pit_ticks() + hz * 5u;
+    uint64_t dl = perf_now_ns() + 5000000000ull;
     (void)tcp_poll_until(c, dl, pred_closed_basic);
 
     if (c->in_use && c->state == TCP_TIME_WAIT) {
-        while (pit_ticks() < c->tw_deadline_tick) {
+        while (perf_now_ns() < c->tw_deadline_ns) {
             struct net_dev *nd = net_default();
             if (nd && nd->rx_drain) nd->rx_drain(nd);
             tcp_tick_all();
@@ -1616,18 +1978,20 @@ void tcp_congestion_on_ack(struct tcp_conn *c, uint32_t bytes_acked) {
         c->cwnd_bytes += bytes_acked;
         if (c->cwnd_bytes >= c->ssthresh) {
             c->in_slow_start = 0;
-            c->epoch_start = pit_ticks();
+            c->epoch_start = perf_now_ns();
         }
         return;
     }
 
     /* CUBIC congestion avoidance */
-    uint64_t now = pit_ticks();
+    uint64_t now = perf_now_ns();
     if (c->epoch_start == 0) c->epoch_start = now;
 
-    /* Time since epoch in milliseconds (PIT at ~1000 Hz) */
-    uint64_t elapsed_ticks = now - c->epoch_start;
-    uint32_t elapsed_ms = (uint32_t)(elapsed_ticks);
+    /* Time since epoch in ms -- ns-clocked (2026-08-22): the old
+     * ticks-as-ms read ~15x slow under TCG, so the cubic window grew at
+     * a fraction of its design rate on exactly the machine the browser
+     * benchmarks run on. */
+    uint32_t elapsed_ms = (uint32_t)((now - c->epoch_start) / 1000000ull);
 
     /* K = cubic_root(w_max * 0.3 / 0.4) in segments, converted to ms */
     uint32_t w_max_segs = c->w_max / TCP_DEFAULT_MSS;
@@ -1669,7 +2033,7 @@ void tcp_congestion_on_loss(struct tcp_conn *c) {
     if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
     c->ssthresh = c->cwnd_bytes;
     c->in_slow_start = 0;
-    c->epoch_start = pit_ticks();
+    c->epoch_start = perf_now_ns();
 }
 
 void tcp_retransmit_check(struct tcp_conn *c) {
@@ -1699,7 +2063,7 @@ void tcp_fast_retransmit(struct tcp_conn *c) {
         if (c->cwnd_bytes < TCP_DEFAULT_MSS) c->cwnd_bytes = TCP_DEFAULT_MSS;
         c->ssthresh   = c->cwnd_bytes;
         c->in_slow_start = 0;
-        c->epoch_start = pit_ticks();
+        c->epoch_start = perf_now_ns();
 
         tcp_retransmit_slot(c, oldest);
     }

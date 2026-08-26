@@ -1,0 +1,1 @@
+type -f FOO BAR NOT FOUND

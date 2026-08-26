@@ -13,6 +13,7 @@
 
 #include <tobyos/types.h>
 #include <tobyos/net.h>
+#include <tobyos/ipv6.h>   /* AF_INET6 endpoints (2026-08-23) */
 
 #define SOCK_MAX               128     /* pool depth (chrome/Mojo makes many pairs) */
 #define SOCK_RX_DGRAMS         128     /* per-socket UDP/UNIX ring depth. Was 64
@@ -36,7 +37,7 @@
 /* User-visible "domain"/"type" constants. */
 #define AF_UNIX                1
 #define AF_INET                2
-#define AF_INET6               10      /* not implemented; lx_socket -> EAFNOSUPPORT */
+#define AF_INET6               10      /* UDP since 2026-08-23; SOCK_STREAM -> EAFNOSUPPORT */
 #define AF_NETLINK             16      /* rtnetlink (chrome's NetworkChangeNotifier) */
 #define NETLINK_ROUTE          0
 #define SOCK_STREAM            1       /* TCP */
@@ -91,6 +92,10 @@ struct file;
 struct sock_dgram {
     uint32_t  src_ip;          /* network byte order */
     uint16_t  src_port;        /* network byte order */
+    /* AF_INET6 (2026-08-23): when src_is6 is set, src6 carries the
+     * sender and src_ip is meaningless. src_port serves both families. */
+    uint8_t   src_is6;
+    struct ipv6_addr src6;
     /* Slice 56d: uint16_t until 2026-07-28 -- and unix_enqueue_fds SILENTLY
      * TRUNCATED any AF_UNIX message > 65535 bytes while telling the sender it
      * all went out. Chrome's browser->renderer Mojo channel messages cross
@@ -155,12 +160,36 @@ struct sock {
     uint32_t         recv_timeout_ms;
     uint32_t         send_timeout_ms;
 
+    /* shutdown(2) state (2026-08-22 -- it was a `return 0` no-op before,
+     * so no half-close existed anywhere). shut_tx: we sent our FIN /
+     * promised no more data -- further sends are EPIPE. shut_rd: reads
+     * return EOF. rx_eof: the PEER shut its write side (AF_UNIX) -- reads
+     * return EOF once the ring drains, while OUR sends still work; this is
+     * deliberately distinct from severing the peer link (peer_ip = 0),
+     * which kills both directions and is what full close does. */
+    uint8_t          shut_tx;
+    uint8_t          shut_rd;
+    uint8_t          rx_eof;
+    /* SO_REUSEADDR (2026-08-22): lets listen() take a port whose only
+     * holders are dying conns (TIME_WAIT &c). It was accept-and-discard
+     * while bind refused in-use ports unconditionally, so a restarted
+     * server hit EADDRINUSE with no escape -- the exact scenario the
+     * option exists for. */
+    uint8_t          reuseaddr;
+
     /* UDP: connect() peer (network byte order; 0 = not connected). A
      * connected UDP socket lets send()/recv() and read()/write() omit the
      * address, and recvfrom filters to this peer is not enforced (SLIRP is
      * the only sender in practice). */
     uint32_t         peer_ip;
     uint16_t         peer_port;
+
+    /* AF_INET6 (2026-08-23). is_v6 marks the socket's family for the
+     * syscall arms; local6 is the bind address (all-zero = ::, any);
+     * peer6 is the connect() peer when is_v6 (peer_port is shared). */
+    uint8_t          is_v6;
+    struct ipv6_addr local6;
+    struct ipv6_addr peer6;
 
     /* ---- Slice 89: SLOT GENERATION (fixes the hazard slice 78 named) ----
      * Pool slots are recycled IMMEDIATELY by sock_alloc, and an AF_UNIX
@@ -218,7 +247,10 @@ struct sock {
      * in SYN_SENT forever and make poll() silent for good. */
     uint8_t          connecting;
     int              so_error;         /* pending errno; 0 = none */
-    uint64_t         conn_deadline;    /* pit ticks; 0 = no deadline */
+    uint64_t         conn_deadline;    /* perf_now_ns() ns; 0 = no deadline.
+                                        * Was pit ticks: under TCG only ~1/15
+                                        * of 1 kHz PIT IRQs arrive, so every
+                                        * tick-based ms deadline ran 15x long. */
 
     /* AF_NETLINK: the nl_pid this socket bound to (unique per socket, as on
      * Linux, where an unbound sendmsg auto-binds to the tid). */
@@ -283,6 +315,8 @@ void sock_ref(struct sock *s);
 long sock_unix_send_fds(struct sock *self, const void *kbuf, size_t n,
                         struct file **files, int nfiles);
 struct sock *sock_peer_of(struct sock *self);   /* slice 81: SO_PEERCRED */
+void sock_shutdown_rd(struct sock *s);          /* shutdown(2): reads -> EOF */
+void sock_unix_shutdown_tx(struct sock *self);  /* peer sees EOF, keeps sending */
 long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
                         uint32_t timeout_ms,
                         struct file **out_files, int max_out, int *out_n);
@@ -311,6 +345,18 @@ void sock_unix_unbind(struct sock *s);
 int sock_bind(struct sock *s, uint16_t port_be);
 
 /* UDP sendto / recvfrom. */
+/* AF_INET6 UDP (2026-08-23). sendto6 checksums with the mandatory v6
+ * pseudo-header and short-circuits ::1/self through the inline loopback;
+ * recvfrom6_to mirrors recvfrom_to with a v6 source out-param; the
+ * deliver hook is called from ipv6_recv's UDP demux. */
+long sock_sendto6(struct sock *s, const void *buf, size_t len,
+                  const struct ipv6_addr *dst, uint16_t dst_port_be);
+long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
+                       struct ipv6_addr *src6_out, uint16_t *src_port_be,
+                       uint32_t timeout_ms);
+void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
+                       uint16_t dport, const void *data, size_t len);
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be);
 long sock_recvfrom(struct sock *s, void *buf, size_t n,

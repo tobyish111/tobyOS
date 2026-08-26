@@ -45,8 +45,16 @@
 #define SIGIO    29
 #define SIGSYS   31
 
-#define SIG_MAX  32
-#define SIGMASK(s) ((uint32_t)1u << (s))
+/* 2026-08-22: SIG_MAX 32 -> 64. The realtime range (32..63) exists so that
+ * glibc NPTL works AT ALL on the Linux personality: its internal SIGCANCEL
+ * is 32 and SIGSETXID is 33, and with SIG_MAX at 32 both rt_sigaction and
+ * tgkill answered EINVAL -- so pthread_cancel and setuid() from any
+ * threaded process were structurally impossible, quietly. tobyOS's mask
+ * convention keeps bit s for signal s (bit 0 unused), so 64 bits carry
+ * signals 1..63; Linux's signal 64 (SIGRTMAX) is the one casualty, refused
+ * with EINVAL rather than silently aliased. */
+#define SIG_MAX  64
+#define SIGMASK(s) ((uint64_t)1ull << (s))
 
 /* ---- Signal action flags ----
  *
@@ -69,7 +77,10 @@
 
 /* ---- sigaction structure ---- */
 
-typedef uint32_t sigset_t;
+typedef uint64_t sigset_t;   /* 64 signals since 2026-08-22; matches
+                              * libtoby's unsigned long sigset_t for real
+                              * now (the old u32 only matched by accident
+                              * of ucontext padding). */
 
 struct sigaction {
     void     (*sa_handler)(int);
@@ -122,8 +133,9 @@ typedef struct {
 typedef struct ucontext {
     uint64_t          uc_flags;
     struct ucontext  *uc_link;
-    sigset_t          uc_sigmask;
-    uint32_t          _pad;
+    sigset_t          uc_sigmask;   /* was u32 mask + u32 pad; an 8-byte
+                                     * sigset_t occupies the same bytes, so
+                                     * the layout libtoby reads is unchanged */
     mcontext_t        uc_mcontext;
 } ucontext_t;
 
@@ -138,6 +150,14 @@ struct signal_state {
      * send time and read at delivery to populate siginfo_t. */
     int              si_pid[SIG_MAX];
     uint32_t         si_uid[SIG_MAX];
+    /* si_code per pending signal (SI_USER=0 / SI_TKILL=-6). NOT cosmetic:
+     * glibc's NPTL handlers for SIGCANCEL/SIGSETXID begin with
+     *   if (si->si_pid != getpid() || si->si_code != SI_TKILL) return;
+     * -- an anti-spoof check -- so a tgkill-generated signal delivered
+     * with SI_USER is silently DISCARDED by the very handler it exists
+     * for. Found live: the threaded-setuid broadcast's handler ran and
+     * did nothing, forever (2026-08-22). */
+    int8_t           si_code[SIG_MAX];
 };
 
 /* errno-ish return value for interrupted blocking primitives */
@@ -170,6 +190,16 @@ void signal_init(void);
 /* Initialize per-process signal state to defaults */
 void signal_init_proc(struct signal_state *ss);
 
+/* The HANDLER TABLE is a thread-group property (POSIX sighand): a handler
+ * installed by any thread is visible to all. Threads reach the LEADER's
+ * actions[] through this accessor -- the same indirection proc_fds() uses
+ * for the fd table, and for the same reason: sys_clone_thread's whole-PCB
+ * memcpy gives each thread a SNAPSHOT copy, and before this accessor
+ * existed (2026-08-22) a handler installed after pthread_create was
+ * invisible to every sibling. Masks and pending sets stay PER-THREAD --
+ * that half of the split is correct POSIX, not a shortcut. */
+struct sigaction *sig_actions_of(struct proc *p);
+
 /* Foreground tracking */
 int  signal_get_foreground(void);
 void signal_set_foreground(int pid);
@@ -177,13 +207,30 @@ void signal_set_foreground(int pid);
 /* Send a signal. Safe from IRQ context. */
 void signal_send(struct proc *p, int sig);
 void signal_send_to_pid(int pid, int sig);
+/* Same, but reports a pid that does not exist: 0 on delivery, -1 if there
+ * is no such process. The shell's `kill` needs the answer for its status. */
+int  signal_send_to_pid_checked(int pid, int sig);
 void signal_send_to_foreground(int sig);
+/* Group send for the tty/pty line discipline (^C/^Z to the foreground
+ * group). Kernel-trusted; no permission model. */
+void signal_send_to_pgrp(int pgrp, int sig);
+
+/* Cooperative stop point for long-held syscall loops: applies one pending
+ * default-disposition stop (parks until SIGCONT) and returns true; false
+ * when the pending stop is caught (caller should EINTR instead). */
+bool signal_take_pending_stop(void);
 
 /* Check and deliver pending signals from an IRQ (PIT) context, where no
  * saved syscall trapframe exists. Handles fatal/default dispositions;
  * caught (user-handler) signals are left pending for the next syscall
  * return to deliver. */
 void signal_deliver_if_pending(void);
+/* Deliver a CAUGHT signal from the timer IRQ by rewriting the ring-3
+ * trapframe. Without this, a process that installs a handler and then spins
+ * in userspace never receives the signal at all -- signal_deliver_if_pending
+ * defers caught signals to "the next syscall return", which a pure userspace
+ * loop never reaches. Returns true if a handler was entered. */
+bool signal_deliver_irq(struct regs *r);
 
 /* Check and deliver pending signals from the SYSCALL return path. `rv` is
  * the syscall's return value and `num` its number (for SA_RESTART: an
@@ -224,8 +271,13 @@ long sys_sigreturn(void);
 /* sigrestorer: register the user-space sigreturn trampoline address. */
 void sys_sigrestorer(uint64_t addr);
 
-/* kill: send signal to process */
+/* kill: send signal to process (process-directed: may deliver to any
+ * group member with the signal unblocked) */
 int sys_kill(int pid, int sig);
+
+/* tkill/tgkill: thread-directed, never retargeted; tgid > 0 is verified
+ * against the target's group, tgid <= 0 skips the check (tkill). */
+int sys_tgkill(int tgid, int tid, int sig);
 
 /* sigprocmask `how` values */
 #define SIG_BLOCK   0

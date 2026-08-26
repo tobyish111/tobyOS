@@ -757,7 +757,21 @@ static void default_exception(struct regs *r) {
             }
         }
 #endif
-        proc_exit(-1);
+        /* GROUP-fatal, with the Linux-shaped code (2026-08-22). This was
+         * proc_exit(-1): an uncaught fault killed only the faulting THREAD
+         * -- a worker's SIGSEGV left its siblings limping on, which no
+         * crash handler or supervisor expects -- and the parent's waitpid
+         * read -1 instead of the signal. linux-nptl bit4 caught both. */
+        {
+            int fsig;
+            switch (r->vector) {
+            case 0: case 16: case 19: fsig = SIGFPE;  break;
+            case 3:                   fsig = SIGTRAP; break;
+            case 6:                   fsig = SIGILL;  break;
+            default:                  fsig = SIGSEGV; break;
+            }
+            proc_exit_group(128 + fsig);
+        }
         /* unreachable */
     }
 

@@ -605,6 +605,10 @@ bool usb_msc_probe(struct usb_device *dev,
     m->blk.sector_count = m->block_count;
     m->blk.priv         = m;
     m->blk.class        = BLK_CLASS_DISK;
+    /* USB mass storage is REMOVABLE. The provisioning guard's explicit-erase
+     * path is gated on this, so that "yes, reformat my stick" can never be
+     * aimed at an internal disk -- see the field's comment in blk.h. */
+    m->blk.removable    = true;
     m->self             = m;
     /* Model = INQUIRY vendor (8 chars) + product (16 chars), trimmed. */
     {

@@ -1,0 +1,2 @@
+source
+echo status=$?

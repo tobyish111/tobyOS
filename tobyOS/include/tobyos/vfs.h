@@ -112,6 +112,7 @@ enum vfs_type {
 
 #define VFS_SYMLINK_MAX   8   /* max symlink hops before ELOOP */
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
+#define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
 
 struct vfs_stat {
     enum vfs_type type;
@@ -160,6 +161,7 @@ struct vfs_dirent {
  * `priv` slot; everything else is bookkeeping the VFS owns. */
 struct vfs_file;
 struct vfs_dir;
+struct vfs_statfs;          /* defined below (Phase H) */
 
 struct vfs_ops {
     int  (*open)    (void *mnt, const char *path, struct vfs_file *out);
@@ -219,6 +221,36 @@ struct vfs_ops {
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops
      * the entry; the underlying state is leaked. */
     int  (*umount)  (void *mnt);
+    /* Phase G (optional): create a HARD link -- a second directory entry
+     * for oldpath's inode, within this mount. NULL => vfs_link answers
+     * VFS_ERR_ROFS (the filesystem has no inode indirection to link). */
+    int  (*link)    (void *mnt, const char *oldpath, const char *newpath);
+    /* Phase H (optional): real filesystem statistics. NULL => vfs_statfs
+     * reports honest zeros (namelen aside) instead of the fabricated
+     * 4 GiB tmpfs every mount used to claim. */
+    int  (*statfs)  (void *mnt, struct vfs_statfs *out);
+    /* Push everything this mount has buffered out to its backing device.
+     *
+     * NULL means "no backing device", which is the truth for tmpfs,
+     * ramfs, procfs and sysfs -- there is nothing durability could mean
+     * for them, so vfs_file_sync() answers OK. Every driver that DOES
+     * own a device implements this: the block cache is write-back, so
+     * without it fsync(2) reports durable while the bytes are still in
+     * RAM, and pulling the stick loses them. */
+    int  (*sync)    (void *mnt);
+};
+
+/* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
+ * counts in bsize units; a driver reports what it truly knows and
+ * leaves the rest zero. */
+struct vfs_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t files;
+    uint64_t ffree;
+    uint32_t type_magic;    /* Linux f_type value (TMPFS_MAGIC etc.) */
+    uint32_t namelen;
 };
 
 /* Per-handle state. The driver stuffs whatever it likes into `priv`
@@ -311,6 +343,10 @@ int  vfs_truncate(const char *path, uint64_t length);
 /* Linux slice 6: truncate via an OPEN file handle. Updates f->size on success
  * so a subsequent fstat sees the new length. */
 int  vfs_file_truncate(struct vfs_file *f, uint64_t length);
+/* fsync(2)/fdatasync(2): flush this file's filesystem to its device.
+ * Filesystems with no device answer VFS_OK -- nothing to do is not a
+ * failure. */
+int  vfs_file_sync(struct vfs_file *f);
 
 int  vfs_mount_lookup(const char *mount_point,
                       const struct vfs_ops **ops_out, void **data_out);
@@ -374,6 +410,18 @@ long vfs_read    (struct vfs_file *f, void *buf, size_t n);
 long vfs_write   (struct vfs_file *f, const void *buf, size_t n);
 int  vfs_create  (const char *path);
 int  vfs_unlink  (const char *path);
+/* Phase G: hard link newpath -> oldpath's inode. Both paths must resolve
+ * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the
+ * filesystem has no ->link. */
+int  vfs_link    (const char *oldpath, const char *newpath);
+/* Phase H: real statfs for the mount containing `path`. Always succeeds
+ * for a resolvable path; drivers without ->statfs report honest zeros. */
+int  vfs_statfs  (const char *path, struct vfs_statfs *out);
+/* Slice 127: remove a path and, if it is a directory, everything under it.
+ * `force` ignores missing paths. `failed` (may be NULL) receives the path of
+ * the first entry that could not be removed, so callers can report something
+ * more useful than an errno. Refuses "/" outright. Depth-capped at 32. */
+int  vfs_rmtree  (const char *path, bool force, char *failed, size_t failed_cap);
 int  vfs_rename  (const char *oldpath, const char *newpath);
 int  vfs_mkdir   (const char *path);
 int  vfs_opendir (const char *path, struct vfs_dir *out);

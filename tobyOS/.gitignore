@@ -130,9 +130,23 @@ programs/linux-clonestk/*.elf
 programs/linux-ocirun/*.elf
 programs/linux-ctrprobe/*.elf
 programs/linux-gapfill/*.elf
+programs/linux-cloexec/*.elf
+programs/linux-flock/*.elf
+programs/linux-sock/*.elf
+programs/linux-sockserver/*.elf
+programs/linux-nptl/*.elf
+programs/linux-watch/*.elf
+programs/linux-misc/*.elf
+programs/linux-procdev/*.elf
+programs/linux-loop/*.elf
+programs/linux-proc2/*.elf
+programs/linux-io/*.elf
 programs/linux-tmpfs/*.elf
 programs/linux-ptrace/*.elf
 
 # Build scratch left by ad-hoc debugging sessions
 .tmp_*/
 .tmp_*.sh
+
+# logs/fatinterop.sh recreates this blank scratch disk every run.
+fatscratch.img

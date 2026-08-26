@@ -103,8 +103,9 @@ bool tty_handle_isig(char c) {
     else if (c == (char)g_tio.c_cc[TTY_VQUIT]) sig = SIGQUIT;
     else if (c == (char)g_tio.c_cc[TTY_VSUSP]) sig = SIGTSTP;
     if (!sig) return false;
-    int fg = signal_get_foreground();
-    if (fg > 0) signal_send_to_pid(fg, sig);
+    /* Deliver to the foreground GROUP: ^C/^Z must reach every stage of a
+     * foreground pipeline, and a ^Z'd job's WHOLE group must stop. */
+    signal_send_to_foreground(sig);
     /* Consume the control char either way: a tty never delivers ^C as data
      * while ISIG is on, and we don't want it lingering in the input ring. */
     return true;

@@ -188,6 +188,34 @@ void usbreg_record_attach(uint8_t slot_id,
     }
 }
 
+void usbreg_record_details(uint8_t slot_id,
+                           uint8_t bus_address,
+                           uint32_t route_string,
+                           uint16_t bcd_usb,
+                           uint16_t bcd_device,
+                           uint16_t max_packet0,
+                           uint8_t num_configs,
+                           const char *manufacturer,
+                           const char *prod_name,
+                           const char *serial) {
+    if (!g_inited) return;
+    uint64_t f = spin_lock_irqsave(&g_lock);
+    struct usbreg_entry *e = find_slot_locked(slot_id);
+    if (e) {
+        e->bus_address  = bus_address;
+        e->route_string = route_string;
+        e->bcd_usb      = bcd_usb;
+        e->bcd_device   = bcd_device;
+        e->max_packet0  = max_packet0;
+        e->num_configs  = num_configs;
+        copy_str(e->manufacturer, sizeof(e->manufacturer), manufacturer);
+        copy_str(e->prod_name,    sizeof(e->prod_name),    prod_name);
+        copy_str(e->serial,       sizeof(e->serial),       serial);
+        e->have_details = true;
+    }
+    spin_unlock_irqrestore(&g_lock, f);
+}
+
 void usbreg_record_detach(uint8_t slot_id) {
     if (!g_inited) return;
     char friendly[USBREG_FRIENDLY_MAX] = "(unknown)";

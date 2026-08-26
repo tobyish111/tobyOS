@@ -38,4 +38,61 @@ void shell_run_test_line(const char *line);
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);
 
+/* True when `pid` is the process the shell itself runs as. Used by signal
+ * delivery to route a signal aimed at the shell to its trap dispatcher. */
+bool shell_owns_pid(int pid);
+
+/* ---- hosted entry points ------------------------------------------------
+ *
+ * shell.c is compiled twice: into the kernel (driven by shell_poll above) and
+ * into userspace /bin/tsh (driven by programs/tsh/host.c). One language, two
+ * hosts -- so the shell's expansion, arithmetic, globbing and control flow
+ * exist exactly once and cannot drift between the two.
+ *
+ * The host provides the other half of the seam: kmalloc, vfs_*, proc_spawn,
+ * file_*, kprintf. Real subsystems in the kernel; libtoby syscall wrappers in
+ * userspace. See programs/tsh/host.c. */
+
+/* Initialise state without printing a banner or prompt (scripts must emit
+ * nothing the oracle would not). `argv0` becomes $0. */
+void shell_init_hosted(const char *argv0);
+
+/* Declare whether this is a terminal session. Defaults to true, because the
+ * kernel shell always is; a script or `-c` must clear it. Alias expansion is
+ * keyed on this -- bash expands aliases interactively and ignores them in a
+ * script unless `shopt -s expand_aliases` says otherwise. */
+void shell_set_interactive_hosted(bool on);
+
+/* Run a script file / a single -c line. Both return the exit status. */
+int  shell_run_script_hosted(const char *path);
+int  shell_run_line_hosted(const char *text);
+
+/* Is `set -o ignoreeof` on? The interactive read loop asks at each EOF. */
+bool shell_opt_ignoreeof_hosted(void);
+
+/* Read a shell variable (PS1/PS2 are rarely exported, so getenv cannot see
+ * them). NULL when unset. */
+const char *shell_get_var_hosted(const char *name);
+
+/* Set a shell variable from the host wrapper (PPID at startup). */
+void shell_set_var_hosted(const char *name, const char *value);
+
+/* Continuation test for the interactive loop: 0 = complete, 1 = incomplete
+ * (join with a newline), 2 = backslash continuation (drop the backslash). */
+int shell_line_incomplete_hosted(const char *s);
+
+/* True after a line whose execution asked the shell to exit; *status gets
+ * the exit status. The interactive loop must check this after every line. */
+bool shell_wants_exit_hosted(int *status);
+
+/* Record one interactive line in the history ring (what `fc` lists). */
+void shell_history_add_hosted(const char *line);
+
+/* Reap + announce finished background jobs, bash-style; the interactive
+ * loop calls this right before each PS1. */
+void shell_notify_jobs_hosted(void);
+
+/* Set $1..$n before running. */
+int  shell_set_args_hosted(int argc, char **argv);
+
 #endif /* TOBYOS_SHELL_H */

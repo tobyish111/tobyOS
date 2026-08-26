@@ -23,6 +23,10 @@
  */
 
 #include <toby/tk.h>
+/* The REAL ABI header, not a hand-mirrored copy: struct abi_blk_info's
+ * layout is frozen by a static assert that only applies to the original,
+ * and the Format action below depends on it byte for byte. */
+#include <tobyos/abi/abi.h>
 
 typedef unsigned long usize;
 typedef long          ssize_t;
@@ -68,6 +72,9 @@ static inline long sys_unlink(const char *p){ long r; __asm__ volatile("syscall"
 static inline long sys_mkdir(const char *p,int m){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_MKDIR),"D"(p),"S"((long)m):"rcx","r11","memory"); return r; }
 static inline long sys_clock_ms(void){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_CLOCK_MS):"rcx","r11","memory"); return r; }
 static inline long sys_clip_copy(const char *s,usize n){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_CLIP_COPY),"D"(s),"S"(n):"rcx","r11","memory"); return r; }
+/* Format USB: the block-device list and the provisioning request. */
+static inline long sys_blk_list(void *out,long cap){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)ABI_SYS_BLK_LIST),"D"(out),"S"(cap):"rcx","r11","memory"); return r; }
+static inline long sys_provision(const void *req){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)ABI_SYS_DATA_PROVISION),"D"(req):"rcx","r11","memory"); return r; }
 
 /* ---- tiny libc --------------------------------------------------------- */
 static usize my_strlen(const char *s){ const char *p=s; while(*p)p++; return (usize)(p-s); }
@@ -102,7 +109,29 @@ static char g_status[96] = "";
 static int  g_selected   = 0;
 static char g_clipboard[256] = "";
 static int  g_clip_is_file = 0;
-static int  g_confirm_mode = 0;     /* 0=normal, 1=delete, 2=new folder, 3=new file */
+static int  g_confirm_mode = 0;     /* 0=normal, 1=delete, 2=new folder, 3=new file,
+                                     * 4=pick a USB to format, 5=confirm format */
+
+/* ---- Format USB ---------------------------------------------------------
+ *
+ * A file manager is where people look for their USB stick, so it is where
+ * "format it" belongs -- the disk manager exists but nobody finds it, which
+ * is the same reason /data sat RAM-backed for months while the provisioning
+ * machinery was right there.
+ *
+ * This program decides NOTHING about safety. It shows what the kernel
+ * already reports (removable, mounted, what filesystem is on it) and sends
+ * a request; the kernel re-runs its guard and refuses fixed disks, the live
+ * boot medium and mounted volumes whatever this asks for. What the GUI owns
+ * is FRICTION: a destructive button one click from a file listing needs the
+ * same typed confirmation the CLI asks for, because a mis-click is far
+ * likelier here than a mis-typed command. */
+#define FMT_DEVS_MAX 16
+static struct abi_blk_info g_fmt_devs[FMT_DEVS_MAX];
+static const char *g_fmt_labels[FMT_DEVS_MAX];
+static char  g_fmt_label_buf[FMT_DEVS_MAX][64];
+static int   g_fmt_count = 0;
+static int   g_fmt_sel   = 0;
 static long g_last_click_ms = 0;    /* double-click detection */
 static int  g_last_click_row = -1;
 
@@ -110,6 +139,22 @@ static const char *g_sidebar_labels[] = { "Data","Root","Binaries","Config","Lib
 static const char *g_sidebar_paths[]  = { "/data","/","/bin","/etc","/lib","/repo","/system" };
 #define SIDEBAR_COUNT 7
 static int g_sidebar_sel = 0;
+
+/* Volumes shown in the sidebar, and the flattened Places+Volumes model
+ * the listbox actually renders (the toolkit has no tree widget). */
+#define VOL_MAX 12
+static struct abi_blk_info g_vols[VOL_MAX];
+static char g_vol_label_buf[VOL_MAX][48];
+static int  g_vol_count = 0;
+
+enum { SIDE_PLACE=0, SIDE_VOLUME=1, SIDE_HEAD=2 };
+#define SIDE_MAX (SIDEBAR_COUNT + 1 + VOL_MAX)
+static const char *g_side_items[SIDE_MAX];
+static int  g_side_kind[SIDE_MAX];
+static int  g_side_idx [SIDE_MAX];
+static int  g_side_count = 0;
+static int  g_side_sel   = 0;
+
 
 /* ---- path helpers -------------------------------------------------------- */
 static void path_join(char *dst,usize cap,const char *dir,const char *leaf){
@@ -358,7 +403,7 @@ static void update_view(void){
     if(w_path)   tk_set_text(&win,w_path,g_path);
     if(w_status) tk_set_text(&win,w_status,g_status);
     if(w_table){ w_table->sel=g_selected; tk_table_rows(&win,w_table,g_entry_count+1,file_cell,0); }
-    if(w_list)   w_list->sel=g_sidebar_sel;
+    if(w_list && g_confirm_mode==0) w_list->sel=g_side_sel;
     tk_redraw(&win);
 }
 
@@ -385,10 +430,230 @@ static void on_tbl(struct tk_window *w,struct tk_widget *t){
     g_last_click_row=row; g_last_click_ms=now;
     g_selected=row;
 }
+/* ---- Volumes in the sidebar --------------------------------------------
+ *
+ * "Format my USB stick" was reachable only from a toolbar button, which is
+ * not where anyone looks for it -- you look at the drive. So the Places
+ * sidebar grew a Volumes section listing the machine's actual disks, and a
+ * right-click on one offers Format.
+ *
+ * Every disk is listed, including the ones that cannot be formatted. The
+ * pick-list deliberately hides those (offering the Windows disk invites
+ * someone to try it), but a sidebar is an INVENTORY -- a file manager that
+ * silently omits your system disk is lying about the machine. The refusal
+ * is explained on right-click instead, which is honest without being an
+ * invitation.
+ *
+ * This still decides nothing about safety: the same kernel guard runs on
+ * the request, and Format goes through the same typed confirmation the
+ * toolbar path uses. */
+
+/* The one place the "can this be formatted?" filter lives. fmt_scan() uses
+ * it too -- two copies of this rule would drift, and the copy that drifted
+ * would be the one offering somebody's system disk. */
+static int vol_formattable(const struct abi_blk_info *d){
+    if(d->class!=1)                                          return 0; /* whole disks */
+    if(!(d->flags&ABI_BLK_F_REMOVABLE))                      return 0; /* USB only */
+    if(d->flags&(ABI_BLK_F_MOUNTED|ABI_BLK_F_RAM|ABI_BLK_F_GONE)) return 0;
+    if(d->fs[0]&&streq(d->fs,"iso9660"))                     return 0; /* boot medium */
+    return 1;
+}
+
+/* Why not -- said in the words someone would use, not a flag dump. */
+static const char *vol_refusal(const struct abi_blk_info *d){
+    if(d->flags&ABI_BLK_F_GONE)                return "that device has been unplugged";
+    if(d->fs[0]&&streq(d->fs,"iso9660"))       return "this is the live boot medium";
+    if(d->flags&ABI_BLK_F_MOUNTED)             return "it is mounted -- unmount it first";
+    if(d->flags&ABI_BLK_F_RAM)                 return "it is RAM-backed, not real storage";
+    if(!(d->flags&ABI_BLK_F_REMOVABLE))        return "it is a fixed disk -- tobyOS never formats those";
+    return "the kernel does not accept this device";
+}
+
+static void num_append(char *b,int *p,int cap,unsigned long v){
+    char t[24]; int k=0;
+    if(!v)t[k++]='0'; else while(v){t[k++]=(char)('0'+v%10);v/=10;}
+    while(k>0&&*p+1<cap)b[(*p)++]=t[--k];
+    b[*p]='\0';
+}
+
+static void vol_scan(void){
+    static struct abi_blk_info all[32];
+    g_vol_count=0;
+    long n=sys_blk_list(all,32);
+    if(n<0)return;
+    for(long i=0;i<n && g_vol_count<VOL_MAX;i++){
+        struct abi_blk_info *d=&all[i];
+        if(d->class!=1)continue;                 /* whole disks, not partitions */
+        if(d->flags&ABI_BLK_F_GONE)continue;
+        g_vols[g_vol_count]=*d;
+        {
+            char *b=g_vol_label_buf[g_vol_count]; int p=0; b[0]='\0';
+            unsigned long mib=(unsigned long)(d->sector_count/2048u);
+            p=str_cat(b,p,48,d->name);
+            p=str_cat(b,p,48,"  ");
+            /* The old label was "name  NNNNN MiB  fs" -- past 17 characters
+             * the 150px sidebar clipped it mid-word. */
+            if(mib>=1024ul){ num_append(b,&p,48,mib/1024ul); p=str_cat(b,p,48," GB"); }
+            else           { num_append(b,&p,48,mib);        p=str_cat(b,p,48," MB"); }
+            if(d->flags&ABI_BLK_F_DATA) p=str_cat(b,p,48,"  /data");
+            (void)p;
+        }
+        g_vol_count++;
+    }
+}
+
+/* The sidebar is Places + a Volumes section, flattened into one listbox
+ * (the toolkit has no tree). g_side_kind says what each row is, so a
+ * click on the heading does nothing and a click on a volume does not try
+ * to cd into a device name. */
+
+static void side_rebuild(void){
+    g_side_count=0;
+    for(int i=0;i<SIDEBAR_COUNT && g_side_count<SIDE_MAX;i++){
+        g_side_items[g_side_count]=g_sidebar_labels[i];
+        g_side_kind [g_side_count]=SIDE_PLACE;
+        g_side_idx  [g_side_count]=i;
+        g_side_count++;
+    }
+    vol_scan();
+    if(g_vol_count>0 && g_side_count<SIDE_MAX){
+        g_side_items[g_side_count]="-- Volumes --";
+        g_side_kind [g_side_count]=SIDE_HEAD;
+        g_side_idx  [g_side_count]=-1;
+        g_side_count++;
+        for(int i=0;i<g_vol_count && g_side_count<SIDE_MAX;i++){
+            g_side_items[g_side_count]=g_vol_label_buf[i];
+            g_side_kind [g_side_count]=SIDE_VOLUME;
+            g_side_idx  [g_side_count]=i;
+            g_side_count++;
+        }
+    }
+    if(g_side_sel>=g_side_count)g_side_sel=0;
+}
+
+/* Map the current path back onto a Places row, so the highlight follows
+ * navigation the way it did before volumes existed. */
+static void side_sync_path(void){
+    for(int i=0;i<g_side_count;i++)
+        if(g_side_kind[i]==SIDE_PLACE && streq(g_path,g_sidebar_paths[g_side_idx[i]])){
+            g_side_sel=i; return;
+        }
+}
+
+static void vol_describe(const struct abi_blk_info *d){
+    char b[96]; int p=0; b[0]='\0';
+    p=str_cat(b,p,96,d->name);
+    p=str_cat(b,p,96,d->model[0]?"  ":"");
+    p=str_cat(b,p,96,d->model[0]?d->model:"");
+    if(!vol_formattable(d)){
+        p=str_cat(b,p,96,"  -- cannot format: ");
+        (void)str_cat(b,p,96,vol_refusal(d));
+    } else {
+        (void)str_cat(b,p,96,"  -- right-click to format");
+    }
+    set_status(b);
+}
+
 static void on_side(struct tk_window *w,struct tk_widget *l){
-    (void)w; int i=tk_selected(l); if(i<0||i>=SIDEBAR_COUNT)return;
-    g_sidebar_sel=i; str_copy(g_path,g_sidebar_paths[i],sizeof(g_path));
-    refresh_listing(); update_view();
+    (void)w; int i=tk_selected(l); if(i<0||i>=g_side_count)return;
+    g_side_sel=i;
+    if(g_side_kind[i]==SIDE_PLACE){
+        int k=g_side_idx[i];
+        g_sidebar_sel=k; str_copy(g_path,g_sidebar_paths[k],sizeof(g_path));
+        refresh_listing(); update_view();
+    } else if(g_side_kind[i]==SIDE_VOLUME){
+        /* A device is not a directory -- describe it instead of trying to
+         * cd into a name that is not a path. */
+        vol_describe(&g_vols[g_side_idx[i]]);
+        update_view();
+    } else {
+        update_view();                    /* the heading: inert */
+    }
+}
+
+/* ---- Format USB: device discovery -------------------------------------- */
+
+/* Build the pick-list. Only devices the kernel would actually accept are
+ * offered -- showing the Windows disk greyed out invites someone to try. */
+static void fmt_scan(void){
+    static struct abi_blk_info all[32];
+    g_fmt_count=0; g_fmt_sel=0;
+    long n=sys_blk_list(all,32);
+    if(n<0)return;
+    for(long i=0;i<n && g_fmt_count<FMT_DEVS_MAX;i++){
+        struct abi_blk_info *d=&all[i];
+        if(!vol_formattable(d))continue;
+        g_fmt_devs[g_fmt_count]=*d;
+        {
+            char *b=g_fmt_label_buf[g_fmt_count];
+            int p=0;
+            b[0]='\0';
+            p=str_cat(b,p,64,d->name);
+            p=str_cat(b,p,64,"  ");
+            {   /* MiB, decimal, no libc */
+                unsigned long v=(unsigned long)(d->sector_count/2048u);
+                char t[16]; int k=0;
+                if(!v)t[k++]='0'; else while(v){t[k++]=(char)('0'+v%10);v/=10;}
+                while(k>0&&p+1<64)b[p++]=t[--k];
+                b[p]='\0';
+            }
+            p=str_cat(b,p,64," MiB  ");
+            (void)str_cat(b,p,64,d->fs[0]?d->fs:"(empty)");
+            g_fmt_labels[g_fmt_count]=b;
+        }
+        g_fmt_count++;
+    }
+}
+
+static void on_fmt_open(struct tk_window *w,struct tk_widget *b){
+    (void)w;(void)b;
+    fmt_scan();
+    if(g_fmt_count==0){
+        set_status("No formattable USB found (removable, not mounted, not the boot stick)");
+        rebuild();
+        return;
+    }
+    g_confirm_mode=4; rebuild();
+}
+static void on_fmt_pick(struct tk_window *w,struct tk_widget *b){
+    (void)w;(void)b;
+    if(g_fmt_count==0)return;
+    g_confirm_mode=5; rebuild();
+}
+static void on_fmt_sel(struct tk_window *w,struct tk_widget *b){
+    (void)w; if(b)g_fmt_sel=b->sel;
+}
+
+/* The actual request. ERASE because anything reaching this page carries a
+ * foreign filesystem or nothing; FORMAT_ONLY because "format my stick" is
+ * not "take over my system volume". */
+static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
+    (void)w;(void)b;
+    if(g_fmt_sel<0||g_fmt_sel>=g_fmt_count){ g_confirm_mode=0; rebuild(); return; }
+    struct abi_blk_info *d=&g_fmt_devs[g_fmt_sel];
+
+    /* Typed confirmation, same bar as the CLI. */
+    const char *typed=w_name?tk_get_text(w_name):"";
+    if(!streq(typed,d->name)){
+        set_status2("Not formatted -- type the device name exactly: ",d->name);
+        g_confirm_mode=0; rebuild(); return;
+    }
+
+    struct abi_provision_req req;
+    my_memset(&req,0,sizeof req);
+    str_copy(req.dev,d->name,sizeof req.dev);
+    req.flags=ABI_PROV_F_FORMAT_ONLY|ABI_PROV_F_ERASE;
+
+    long rc=sys_provision(&req);
+    if(rc==ABI_PROV_OK_MOUNTED||rc==ABI_PROV_OK_NEXT_BOOT)
+        set_status2("Formatted. Mount it with: mount -t tobyfs ",d->name);
+    else if(rc==-ABI_EPERM)
+        set_status("Refused by the kernel -- not removable, or the boot medium");
+    else if(rc==-ABI_EBUSY)
+        set_status("Refused -- that device is mounted; unmount it first");
+    else
+        set_status("Format failed -- the device may be faulty");
+    g_confirm_mode=0; refresh_listing(); rebuild();
 }
 
 static void on_del_yes(struct tk_window *w,struct tk_widget *b){ (void)w;(void)b; do_delete(); g_confirm_mode=0; refresh_listing(); rebuild(); }
@@ -399,6 +664,52 @@ static void on_create (struct tk_window *w,struct tk_widget *b){
     const char *nn=w_name?tk_get_text(w_name):0;
     do_create(is_dir,nn);
     g_confirm_mode=0; refresh_listing(); rebuild();
+}
+
+/* ---- volume context menu ----------------------------------------------- */
+enum { MI_VOL_FORMAT=101, MI_VOL_WHY, MI_VOL_REFRESH };
+
+static const char *const g_volmenu_ok[]  = { "Format as tobyOS volume...","-","Refresh volumes" };
+static const int         g_volmenu_ok_id[]={ MI_VOL_FORMAT,0,MI_VOL_REFRESH };
+static const char *const g_volmenu_no[]  = { "Why can't I format this?","-","Refresh volumes" };
+static const int         g_volmenu_no_id[]={ MI_VOL_WHY,0,MI_VOL_REFRESH };
+#define VOLMENU_N 3
+
+/* The right-clicked volume, captured when the menu opened: the listbox
+ * selection can move before the menu item fires. */
+static int g_vol_ctx = -1;
+
+static void on_vol_menu(struct tk_window *w,int id){
+    (void)w;
+    if(g_vol_ctx<0||g_vol_ctx>=g_vol_count){ update_view(); return; }
+    struct abi_blk_info *d=&g_vols[g_vol_ctx];
+    switch(id){
+    case MI_VOL_FORMAT: {
+        /* Hand off to the EXISTING typed-confirmation page rather than
+         * formatting from a menu click. Re-scan first: the pick-list is
+         * what on_fmt_go() reads, and it is also a second check that the
+         * device is still acceptable. */
+        fmt_scan();
+        int sel=-1;
+        for(int i=0;i<g_fmt_count;i++)
+            if(streq(g_fmt_devs[i].name,d->name)){ sel=i; break; }
+        if(sel<0){ set_status2("No longer formattable: ",d->name); update_view(); break; }
+        g_fmt_sel=sel;
+        g_confirm_mode=5;                 /* type the device name to confirm */
+        rebuild();
+        break;
+    }
+    case MI_VOL_WHY:
+        set_status2("Cannot format -- ",vol_refusal(d));
+        update_view();
+        break;
+    case MI_VOL_REFRESH:
+        side_rebuild();
+        set_status("Volumes refreshed");
+        rebuild();
+        break;
+    default: update_view(); break;
+    }
 }
 
 /* ---- context menu ----------------------------------------------------- */
@@ -429,7 +740,23 @@ static void on_menu(struct tk_window *w,int id){
  * g_selected is the right-clicked row by the time this runs. */
 static void on_context(struct tk_window *w,struct tk_widget *hit,struct tk_event *ev){
     if(g_confirm_mode!=0)return;              /* not on modal pages */
-    if(!hit||hit!=w_table)return;             /* file area only */
+    if(!hit)return;
+    if(hit==w_list){
+        /* The sidebar. The toolkit already moved the listbox selection to
+         * the row under the cursor, so this is the row that was clicked. */
+        int i=tk_selected(w_list);
+        if(i<0||i>=g_side_count)return;
+        if(g_side_kind[i]!=SIDE_VOLUME)return;   /* places have no menu */
+        g_side_sel=i;
+        g_vol_ctx=g_side_idx[i];
+        struct abi_blk_info *d=&g_vols[g_vol_ctx];
+        if(vol_formattable(d))
+            tk_menu_open(w,ev->x,ev->y,g_volmenu_ok,g_volmenu_ok_id,VOLMENU_N,on_vol_menu);
+        else
+            tk_menu_open(w,ev->x,ev->y,g_volmenu_no,g_volmenu_no_id,VOLMENU_N,on_vol_menu);
+        return;
+    }
+    if(hit!=w_table)return;                   /* file area otherwise */
     g_selected=tk_table_selected(w_table);
     g_last_click_row=-1;                      /* don't chain into dbl-click */
     tk_menu_open(w,ev->x,ev->y,g_menu_items,g_menu_ids,MENU_N,on_menu);
@@ -459,6 +786,7 @@ static void rebuild(void){
     tbtn(tb,"New Folder",on_newdir,0);
     tbtn(tb,"Paste",on_paste,0);
     tbtn(tb,"Delete",on_del,0x003D2020u);
+    tbtn(tb,"Format USB",on_fmt_open,0x003D2020u);
     tbtn(tb,"Refresh",on_refresh,0);
 
     /* path bar */
@@ -475,6 +803,43 @@ static void rebuild(void){
         tk_colors(tk_button(&win,row,"Yes, delete",on_del_yes),COL_DANGER,0x00FFFFFF);
         tk_button(&win,row,"Cancel",on_dlg_no);
         tk_grow(tk_label(&win,dlg,""),1);
+    } else if(g_confirm_mode==4){
+        /* Pick the stick. Only devices the kernel would accept are listed --
+         * offering the Windows disk greyed out invites someone to try it. */
+        struct tk_widget *dlg=tk_vbox(&win,root,8); tk_pad(dlg,20); tk_grow(dlg,1);
+        tk_bold(tk_colors(tk_label(&win,dlg,"Format a USB stick"),0,COL_ACCENT));
+        tk_colors(tk_label(&win,dlg,
+            "Removable devices that are not mounted and are not the boot medium:"),
+            0,win.theme.text_dim);
+        w_list=tk_listbox(&win,dlg,g_fmt_labels,g_fmt_count);
+        w_list->on_change=on_fmt_sel; w_list->sel=g_fmt_sel; tk_grow(w_list,1);
+        struct tk_widget *row=tk_hbox(&win,dlg,8);
+        tk_colors(tk_button(&win,row,"Continue",on_fmt_pick),COL_DANGER,0x00FFFFFF);
+        tk_button(&win,row,"Cancel",on_dlg_no);
+        win.focus=w_list; w_list->focused=1;
+    } else if(g_confirm_mode==5){
+        /* The typed confirmation. Same bar as the CLI: a mis-click is far
+         * likelier here than a mis-typed command, so the friction matters
+         * MORE in the GUI, not less. */
+        struct tk_widget *dlg=tk_vbox(&win,root,8); tk_pad(dlg,20); tk_grow(dlg,1);
+        struct abi_blk_info *d=(g_fmt_sel>=0&&g_fmt_sel<g_fmt_count)
+                               ?&g_fmt_devs[g_fmt_sel]:0;
+        tk_bold(tk_colors(tk_label(&win,dlg,"EVERYTHING ON THIS DEVICE WILL BE LOST"),
+                          0,COL_DANGER));
+        if(d){
+            tk_label(&win,dlg,g_fmt_labels[g_fmt_sel]);
+            if(d->model[0]) tk_colors(tk_label(&win,dlg,d->model),0,win.theme.text_dim);
+            tk_colors(tk_label(&win,dlg,
+                "Type the device name below to confirm:"),0,win.theme.text_dim);
+            tk_colors(tk_label(&win,dlg,d->name),0,COL_ACCENT);
+        }
+        w_name=tk_field(&win,dlg,"");
+        w_name->on_click=on_fmt_go;
+        struct tk_widget *row=tk_hbox(&win,dlg,8);
+        tk_colors(tk_button(&win,row,"Format",on_fmt_go),COL_DANGER,0x00FFFFFF);
+        tk_button(&win,row,"Cancel",on_dlg_no);
+        tk_grow(tk_label(&win,dlg,""),1);
+        win.focus=w_name; w_name->focused=1;
     } else if(g_confirm_mode==2||g_confirm_mode==3){
         struct tk_widget *dlg=tk_vbox(&win,root,8); tk_pad(dlg,24); tk_grow(dlg,1);
         tk_bold(tk_label(&win,dlg,g_confirm_mode==2?"New folder name:":"New file name:"));
@@ -488,11 +853,12 @@ static void rebuild(void){
     } else {
         struct tk_widget *main=tk_hbox(&win,root,0); tk_grow(main,1);
         /* places sidebar */
-        struct tk_widget *side=tk_vbox(&win,main,2); tk_pad(side,6); tk_size(side,150,0);
+        struct tk_widget *side=tk_vbox(&win,main,2); tk_pad(side,6); tk_size(side,190,0);
         tk_colors(side,0x00252536u,0);
         tk_colors(tk_label(&win,side,"Places"),0,COL_ACCENT);
-        w_list=tk_listbox(&win,side,g_sidebar_labels,SIDEBAR_COUNT);
-        w_list->on_change=on_side; w_list->sel=g_sidebar_sel; tk_grow(w_list,1);
+        side_sync_path();
+        w_list=tk_listbox(&win,side,g_side_items,g_side_count);
+        w_list->on_change=on_side; w_list->sel=g_side_sel; tk_grow(w_list,1);
         /* file table */
         struct tk_widget *right=tk_vbox(&win,main,0); tk_pad(right,4); tk_grow(right,1);
         w_table=tk_table(&win,right,file_hdr,file_w,3);
@@ -514,6 +880,7 @@ int main(int argc,char **argv){
     if(tk_window_open(&win,780,500,"File Explorer")!=0)return 1;
     tk_on_context(&win,on_context);
     g_base=tk_checkpoint(&win);
+    side_rebuild();            /* Places + the machine's actual volumes */
     refresh_listing();
     rebuild();
     return tk_run(&win);

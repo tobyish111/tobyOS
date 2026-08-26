@@ -74,7 +74,37 @@ struct ramfs_node {
      * to free/grow, and what keeps the shared initrd image itself immutable. */
     bool          owned;
     size_t        cap;
+    /* Phase G: the writable root. A removed node is marked DEAD, never
+     * compacted away -- open handles hold raw pointers into the node
+     * tables, so slots must be address-stable for the mount's lifetime.
+     * open_refs gates data teardown (unlink-while-open keeps the bytes
+     * readable until the last close) and dead-slot reuse. */
+    bool          dead;
+    int           open_refs;
+    /* Hard links. Like tmpfs, a ramfs node is keyed by its PATH, so a
+     * second name for the same bytes needs one level of indirection:
+     * `link_to` is 0 for an entry that owns its data, or (combined node
+     * index + 1) for an extra name. Zero meaning "owner" is deliberate --
+     * nodes are born from memset, so the safe value is the one it makes. */
+    uint32_t      link_to;
+    uint32_t      nlink;
+    /* 2026-08-24: real timestamps. The tar carries an mtime per entry and
+     * ramfs had been throwing it away -- worse, ramfs_stat never assigned
+     * out->mtime/atime/ctime at all, so `ls -l /bin` printed whatever the
+     * caller happened to have on its stack (the same defect the nlink
+     * comment above records). Epoch seconds, like every other filesystem
+     * here; 0 means "no answer", which stat emitters report as the epoch. */
+    uint64_t      mtime;
+    uint64_t      atime;
 };
+
+/* Epoch seconds, the way tmpfs gets them. Files created or written after
+ * boot get a real time; tar-backed ones keep the archive's. */
+static uint64_t ramfs_now_secs(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+}
 
 /* Fallbacks for a tar whose mode field is missing or unparseable. These are
  * the OLD hardcoded values -- a malformed header degrades to the previous
@@ -93,6 +123,18 @@ struct ramfs_mount {
 };
 
 static struct ramfs_mount g_mount;
+
+/* Phase G: the SPILLOVER node table for files/dirs created after mount.
+ * A separate static array (not a realloc of m->nodes) because open
+ * handles hold raw node pointers -- growth must never move live slots.
+ * 256 creatable names on / is a documented honest cap; real churn
+ * belongs on /tmp (tmpfs) and /data (tobyfs), both unbounded. A dead
+ * spillover slot with no open refs is reused; dead TAR slots are not
+ * (their names stay tombstoned so the tar image itself is never
+ * consulted again for them). */
+#define RAMFS_EXTRA_MAX 256
+static struct ramfs_node g_extra[RAMFS_EXTRA_MAX];
+static size_t            g_extra_count;
 
 /* ---- helpers ---- */
 
@@ -270,6 +312,8 @@ int ramfs_mount(const void *image, size_t size) {
                         nd->mode = tgt->mode;
                         nd->uid  = tgt->uid;
                         nd->gid  = tgt->gid;
+                        nd->mtime = tgt->mtime;
+                        nd->atime = tgt->atime;
                         idx++;
                     }
                 }
@@ -283,6 +327,10 @@ int ramfs_mount(const void *image, size_t size) {
                 uint32_t tmode = (uint32_t)parse_octal(h->mode, sizeof(h->mode));
                 nd->uid = (uint32_t)parse_octal(h->uid, sizeof(h->uid));
                 nd->gid = (uint32_t)parse_octal(h->gid, sizeof(h->gid));
+                /* USTAR mtime: octal epoch seconds, the archive's own
+                 * record of when the file was last written. */
+                nd->mtime = (uint64_t)parse_octal(h->mtime, sizeof(h->mtime));
+                nd->atime = nd->mtime;
 
                 if (tf == '5') {
                     nd->type = VFS_TYPE_DIR;
@@ -347,12 +395,45 @@ size_t ramfs_node_count(void) { return g_mount.node_count; }
 
 /* ---- vfs_ops impl ---- */
 
-static struct ramfs_node *find_node(struct ramfs_mount *m,
-                                    const char *norm_path) {
-    for (size_t i = 0; i < m->node_count; i++) {
-        if (strcmp(m->nodes[i].name, norm_path) == 0) return &m->nodes[i];
+/* Phase G: one iteration space over BOTH node tables (tar + spillover).
+ * Every walker below goes through these two, so a dead node disappears
+ * from lookup/listing everywhere at once. */
+static size_t node_total(struct ramfs_mount *m) {
+    return m->node_count + g_extra_count;
+}
+static struct ramfs_node *node_at(struct ramfs_mount *m, size_t i) {
+    if (i < m->node_count) return &m->nodes[i];
+    return &g_extra[i - m->node_count];
+}
+
+/* Find the NAME -- what unlink, rename and link manipulate. */
+static struct ramfs_node *find_node_name(struct ramfs_mount *m,
+                                         const char *norm_path) {
+    for (size_t i = 0; i < node_total(m); i++) {
+        struct ramfs_node *nd = node_at(m, i);
+        if (!nd->dead && strcmp(nd->name, norm_path) == 0) return nd;
     }
     return 0;
+}
+
+/* Follow a name to the node that owns the bytes. */
+static struct ramfs_node *ramfs_resolve(struct ramfs_mount *m,
+                                        struct ramfs_node *nm) {
+    if (!nm || !nm->link_to) return nm;
+    size_t idx = (size_t)nm->link_to - 1;
+    if (idx >= node_total(m)) return nm;         /* corrupt: fail closed */
+    struct ramfs_node *ino = node_at(m, idx);
+    /* A dead owner that still has links is NOT gone -- its own name was
+     * unlinked but the bytes belong to the remaining names. Only a dead
+     * owner with no links left is a genuinely stale target. */
+    return (ino->dead && ino->nlink == 0) ? nm : ino;
+}
+
+/* Find the DATA -- what everything that reads or writes wants, so every
+ * existing caller works through a link with no change. */
+static struct ramfs_node *find_node(struct ramfs_mount *m,
+                                    const char *norm_path) {
+    return ramfs_resolve(m, find_node_name(m, norm_path));
 }
 
 /* True if any node lives under `norm_path/`. Used to recognise implicit
@@ -360,8 +441,10 @@ static struct ramfs_node *find_node(struct ramfs_mount *m,
  * entry was tar'd). */
 static bool has_children(struct ramfs_mount *m, const char *norm_path) {
     size_t plen = strlen(norm_path);
-    for (size_t i = 0; i < m->node_count; i++) {
-        const char *name = m->nodes[i].name;
+    for (size_t i = 0; i < node_total(m); i++) {
+        struct ramfs_node *nd = node_at(m, i);
+        if (nd->dead) continue;
+        const char *name = nd->name;
         if (plen == 0) return true;     /* root always has children */
         if (strncmp(name, norm_path, plen) == 0 && name[plen] == '/') {
             return true;
@@ -382,19 +465,32 @@ static int ramfs_open(void *mnt, const char *path, struct vfs_file *out) {
     out->priv = nd;
     out->pos  = 0;
     out->size = nd->size;
-    /* The node's real identity, as recorded in the tar. Writability is NOT
-     * expressed here: ramfs leaves every write-side op NULL, so the VFS
-     * returns VFS_ERR_ROFS regardless of the mode bits. That is the Linux
-     * split -- the mode describes the FILE, read-only-ness is a property of
-     * the MOUNT -- and it is why a 0755 binary here still cannot be written.
-     * MODE_VALID forces the VFS to enforce these bits explicitly. */
+    /* The node's real identity, as recorded in the tar. MODE_VALID forces
+     * the VFS to enforce these bits explicitly rather than treat the inode
+     * as "no permission info". (This comment used to say ramfs left every
+     * write-side op NULL so the mode bits could not matter -- true when it
+     * was written, false since Phase G made the root writable and doubly so
+     * now that the rest of the CRUD ops are wired below.) */
     out->uid  = nd->uid;
     out->gid  = nd->gid;
     out->mode = nd->mode | VFS_MODE_VALID;
+    nd->open_refs++;                   /* Phase G: gates unlink teardown */
     return VFS_OK;
 }
 
 static int ramfs_close(struct vfs_file *f) {
+    struct ramfs_node *nd = (struct ramfs_node *)f->priv;
+    /* Phase G: last close of an unlinked node frees its owned bytes and
+     * (for a spillover slot) makes the slot reusable. Tar-backed dead
+     * nodes keep their tombstone -- the image bytes were never ours. */
+    if (nd && nd->open_refs > 0 && --nd->open_refs == 0 && nd->dead &&
+        nd->nlink == 0) {
+        if (nd->owned && nd->data) kfree((void *)nd->data);
+        nd->data  = 0;
+        nd->size  = 0;
+        nd->cap   = 0;
+        nd->owned = false;
+    }
     f->priv = 0;
     return VFS_OK;
 }
@@ -476,14 +572,16 @@ static int ramfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
      * -- node counts in the initrd are small (single digits). */
     struct ramfs_diriter *it = kmalloc(sizeof(*it));
     if (!it) return VFS_ERR_NOMEM;
-    size_t cap = m->node_count > 0 ? m->node_count : 1;
+    size_t cap = node_total(m) > 0 ? node_total(m) : 1;
     it->ents = kcalloc(cap, sizeof(*it->ents));
     if (!it->ents) { kfree(it); return VFS_ERR_NOMEM; }
     it->count = 0;
 
     size_t plen = strlen(norm);
-    for (size_t i = 0; i < m->node_count; i++) {
-        const char *name = m->nodes[i].name;
+    for (size_t i = 0; i < node_total(m); i++) {
+        struct ramfs_node *ind = node_at(m, i);
+        if (ind->dead) continue;       /* Phase G: unlinked names vanish */
+        const char *name = ind->name;
         const char *rest;
 
         if (plen == 0) {
@@ -501,11 +599,14 @@ static int ramfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
         while (*slash && *slash != '/') slash++;
 
         if (*slash == 0) {
-            /* Direct child entry -- report the node's own recorded mode. */
+            /* Direct child entry -- report the node's own recorded mode.
+             * A hard link carries no bytes of its own, so its size and
+             * ownership come from the node it points at. */
+            struct ramfs_node *ent = ramfs_resolve(m, ind);
             if (!dirent_push_unique(it->ents, &it->count, cap, rest,
-                                    m->nodes[i].type, m->nodes[i].size,
-                                    m->nodes[i].mode, m->nodes[i].uid,
-                                    m->nodes[i].gid)) {
+                                    ent->type, ent->size,
+                                    ent->mode, ent->uid,
+                                    ent->gid)) {
                 break;
             }
         } else {
@@ -563,6 +664,13 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
      * 2-for-directories, so setting 0 routes through that shared default
      * rather than duplicating the policy here. */
     out->nlink = 0;
+    /* Same reasoning as nlink, and the same defect: mtime/atime/ctime were
+     * never assigned on any arm, so every ramfs stat handed back whatever
+     * the caller had on its stack. 0 is the honest answer for a path with
+     * no recorded time; a real one is filled in below where we have it. */
+    out->mtime = 0;
+    out->atime = 0;
+    out->ctime = 0;
 
     /* The mount root has no tar header of its own -- same synthesised 0755
      * as any other implicit directory. */
@@ -582,6 +690,12 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
         out->uid  = nd->uid;
         out->gid  = nd->gid;
         out->mode = nd->mode | VFS_MODE_VALID;
+        out->mtime = nd->mtime;
+        out->atime = nd->atime;
+        out->ctime = nd->mtime;
+        /* A real count once hard links exist; 0 still means "no answer"
+         * for tar-loaded nodes, which routes through the shared default. */
+        if (nd->nlink > 1) out->nlink = nd->nlink;
         return VFS_OK;
     }
     /* Implicit directory? */
@@ -610,10 +724,10 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
  * Chromium reported ERR_NAME_NOT_RESOLVED with nothing in the log to explain
  * it.
  *
- * SCOPE, DELIBERATELY NARROW: an EXISTING file can be overwritten; a NEW file
- * still cannot be created and nothing can be unlinked or mkdir'd. That keeps
- * "you cannot add to /" true -- which existing behaviour and tests rely on --
- * while fixing the case that actually bit. Widening it later is additive.
+ * SCOPE: originally narrowed to overwrite-in-place only ("you cannot add
+ * to /"). Phase G widened it -- create/unlink/mkdir now work through the
+ * spillover table (see g_extra) -- so this CoW machinery serves both
+ * pre-existing tar files and newly created ones.
  *
  * The first write to a tar-backed node kmallocs a private buffer and repoints
  * `data` at it; `owned` then says the buffer is ours to free and grow. The
@@ -646,49 +760,379 @@ static long ramfs_write(struct vfs_file *f, const void *buf, size_t n) {
     if (need < f->pos) return VFS_ERR_INVAL;          /* offset overflow */
     int rc = ramfs_cow(nd, need);
     if (rc != VFS_OK) return rc;
+    /* A write past the old end leaves a hole when f->pos > nd->size (lseek
+     * beyond EOF then write). ramfs_cow zeroes a buffer it has just
+     * allocated, but returns untouched when the node already owns enough
+     * capacity -- so the gap has to be zeroed explicitly or it would read
+     * back whatever the file used to hold there. */
+    if (f->pos > nd->size)
+        memset((uint8_t *)nd->data + nd->size, 0, f->pos - nd->size);
     memcpy((uint8_t *)nd->data + f->pos, buf, n);
     f->pos += n;
     if (need > nd->size) nd->size = need;
     f->size = nd->size;
+    nd->mtime = ramfs_now_secs();
     return (long)n;
 }
 
+/* Set a node's length exactly, zero-filling any growth (POSIX). Shared by
+ * truncate(2) and ftruncate(2). */
+static int ramfs_set_len(struct ramfs_node *nd, uint64_t length) {
+    size_t want = (size_t)length;
+    if ((uint64_t)want != length) return VFS_ERR_NOSPC;   /* > SIZE_MAX */
+    /* ramfs_cow(nd, 0) would kmalloc(0); ask for one byte instead. */
+    int rc = ramfs_cow(nd, want ? want : 1);
+    if (rc != VFS_OK) return rc;
+    if (want > nd->size)
+        memset((uint8_t *)nd->data + nd->size, 0, want - nd->size);
+    nd->size  = want;
+    nd->mtime = ramfs_now_secs();
+    return VFS_OK;
+}
+
+/* ---- Phase G: the WRITABLE root ---------------------------------------
+ *
+ * Linux's initramfs is a writable tmpfs; ours was a read-only tar view
+ * with a truncate-in-place patch (the resolv.conf slice above). That
+ * deviation had a second cost the first one hid: nothing could CREATE a
+ * file or directory anywhere ramfs is mounted, so /etc could not gain
+ * files (ld.so.cache, machine-id, dhcp leases), and every "make a
+ * scratch file next to the config" idiom failed with EROFS. Widened
+ * here: create/unlink/mkdir work, backed by the spillover table --
+ * address-stable, capped, reusable slots (see g_extra above). */
+
+/* A spillover slot for a NEW name: a dead slot with no open refs is
+ * recycled, else the table grows. NULL when the cap is hit. */
+static struct ramfs_node *extra_alloc(void) {
+    for (size_t i = 0; i < g_extra_count; i++)
+        /* nlink > 0 means some other NAME still points at this slot by
+         * index; handing it out would silently re-point that name at a
+         * different file. */
+        if (g_extra[i].dead && g_extra[i].open_refs == 0 &&
+            g_extra[i].nlink == 0) {
+            memset(&g_extra[i], 0, sizeof(g_extra[i]));
+            return &g_extra[i];
+        }
+    if (g_extra_count >= RAMFS_EXTRA_MAX) return 0;
+    return &g_extra[g_extra_count++];
+}
+
+/* The parent of `norm` must exist as a directory (explicit, implicit, or
+ * the root). Rejecting orphans here keeps readdir's implicit-directory
+ * inference sound -- a child under a never-created parent would conjure
+ * the parent into listings. */
+static int parent_dir_ok(struct ramfs_mount *m, const char *norm) {
+    size_t plen = strlen(norm);
+    while (plen > 0 && norm[plen - 1] != '/') plen--;
+    if (plen == 0) return VFS_OK;                    /* direct child of / */
+    char parent[VFS_PATH_MAX];
+    memcpy(parent, norm, plen - 1);
+    parent[plen - 1] = 0;
+    struct ramfs_node *pd = find_node(m, parent);
+    if (pd) return pd->type == VFS_TYPE_DIR ? VFS_OK : VFS_ERR_NOTDIR;
+    return has_children(m, parent) ? VFS_OK : VFS_ERR_NOENT;
+}
+
 /* vfs_write_all() calls create() before open(), and treats VFS_ERR_EXIST as
- * "fine, carry on" -- so this hook is what makes that helper usable here. It
- * TRUNCATES, matching the contract vfs_write_all documents ("create() on a
- * file that already exists is OK -- we then truncate"). Without the truncate a
- * shorter replacement would leave the tail of the old contents behind, which
- * for resolv.conf would mean two nameserver lines. */
-static int ramfs_create(void *mnt, const char *path, uint32_t mode,
-                        uint32_t uid, uint32_t gid) {
-    /* mode/uid/gid are ignored on purpose: this hook never creates anything,
-     * so there is no new file whose ownership they could describe. The
-     * existing node keeps the identity the USTAR header gave it. */
-    (void)mode; (void)uid; (void)gid;
+ * "fine, carry on" -- so the EXIST arm TRUNCATES, matching the contract
+ * vfs_write_all documents. Without the truncate a shorter replacement
+ * would leave the tail of the old contents behind, which for resolv.conf
+ * would mean two nameserver lines. New names allocate a spillover node. */
+static int ramfs_create(void *mnt, const char *path,
+                        uint32_t uid, uint32_t gid, uint32_t mode) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    if (norm[0] == 0) return VFS_ERR_ISDIR;
+    if (strlen(norm) >= VFS_NAME_MAX) return VFS_ERR_NAMETOOLONG;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (nd) {
+        if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+        int rc = ramfs_cow(nd, 1);
+        if (rc != VFS_OK) return rc;
+        nd->size = 0;                                        /* truncate */
+        return VFS_ERR_EXIST;
+    }
+    int prc = parent_dir_ok(m, norm);
+    if (prc != VFS_OK) return prc;
+    nd = extra_alloc();
+    if (!nd) return VFS_ERR_NOSPC;
+    memcpy(nd->name, norm, strlen(norm) + 1);
+    nd->type  = VFS_TYPE_FILE;
+    nd->mode  = mode & VFS_MODE_PERMS;
+    nd->uid   = uid;
+    nd->gid   = gid;
+    nd->nlink = 1;
+    nd->mtime = ramfs_now_secs();
+    nd->atime = nd->mtime;
+    return VFS_OK;
+}
+
+/* Phase G: a second directory entry for the same bytes. */
+static int ramfs_link(void *mnt, const char *oldpath, const char *newpath) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char o[VFS_PATH_MAX], nw[VFS_PATH_MAX];
+    if (!normalise_path(oldpath, o, sizeof(o)) ||
+        !normalise_path(newpath, nw, sizeof(nw))) return VFS_ERR_INVAL;
+    if (o[0] == 0 || nw[0] == 0) return VFS_ERR_INVAL;
+    if (strlen(nw) >= VFS_NAME_MAX) return VFS_ERR_NAMETOOLONG;
+
+    struct ramfs_node *nm = find_node_name(m, o);
+    if (!nm) return VFS_ERR_NOENT;
+    struct ramfs_node *ino = ramfs_resolve(m, nm);
+    /* POSIX forbids hard links to directories -- they make the tree
+     * cyclic and every walker that trusts it loops forever. */
+    if (ino->type == VFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    if (find_node_name(m, nw) || has_children(m, nw)) return VFS_ERR_EXIST;
+    int prc = parent_dir_ok(m, nw);
+    if (prc != VFS_OK) return prc;
+
+    /* The owner's index in the combined (initrd + spillover) space. */
+    size_t owner_idx = (size_t)-1;
+    for (size_t i = 0; i < node_total(m); i++)
+        if (node_at(m, i) == ino) { owner_idx = i; break; }
+    if (owner_idx == (size_t)-1) return VFS_ERR_IO;
+
+    struct ramfs_node *nn = extra_alloc();
+    if (!nn) return VFS_ERR_NOSPC;
+    memcpy(nn->name, nw, strlen(nw) + 1);
+    nn->type    = ino->type;
+    nn->mode    = ino->mode;
+    nn->uid     = ino->uid;
+    nn->gid     = ino->gid;
+    nn->mtime   = ino->mtime;
+    nn->atime   = ino->atime;
+    nn->link_to = (uint32_t)owner_idx + 1u;
+    ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
+    return VFS_OK;
+}
+
+static int ramfs_unlink(void *mnt, const char *path) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    if (norm[0] == 0) return VFS_ERR_INVAL;          /* not the root */
+    struct ramfs_node *nm = find_node_name(m, norm);
+    if (!nm) return VFS_ERR_NOENT;
+    if (nm->type == VFS_TYPE_DIR && has_children(m, norm))
+        return VFS_ERR_INVAL;                        /* non-empty dir */
+
+    struct ramfs_node *nd = ramfs_resolve(m, nm);
+    if (nd != nm) {
+        /* Dropping an extra NAME: the bytes belong to another slot and
+         * must outlive this entry. */
+        nm->dead = true;
+        nm->link_to = 0;
+        if (nd->nlink) nd->nlink--;
+        if (nd->nlink == 0 && nd->open_refs == 0 && nd->dead) {
+            if (nd->owned && nd->data) kfree((void *)nd->data);
+            nd->data = 0; nd->size = 0; nd->cap = 0; nd->owned = false;
+        }
+        return VFS_OK;
+    }
+    if (nd->nlink > 1) {
+        /* Other names still point at this slot BY INDEX, so the bytes
+         * stay; only this name goes away. */
+        nd->nlink--;
+        nd->dead = true;
+        return VFS_OK;
+    }
+    if (nd->nlink) nd->nlink--;
+    nd->dead = true;
+    if (nd->open_refs == 0) {
+        /* No handle outstanding: reclaim owned bytes now. With handles
+         * open, ramfs_close's last-close arm does this instead --
+         * unlink-while-open keeps the bytes readable, as POSIX wants. */
+        if (nd->owned && nd->data) kfree((void *)nd->data);
+        nd->data  = 0;
+        nd->size  = 0;
+        nd->cap   = 0;
+        nd->owned = false;
+    }
+    return VFS_OK;
+}
+
+static int ramfs_mkdir(void *mnt, const char *path,
+                       uint32_t uid, uint32_t gid, uint32_t mode) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    if (norm[0] == 0) return VFS_ERR_EXIST;
+    if (strlen(norm) >= VFS_NAME_MAX) return VFS_ERR_NAMETOOLONG;
+    if (find_node(m, norm) || has_children(m, norm)) return VFS_ERR_EXIST;
+    int prc = parent_dir_ok(m, norm);
+    if (prc != VFS_OK) return prc;
+    struct ramfs_node *nd = extra_alloc();
+    if (!nd) return VFS_ERR_NOSPC;
+    memcpy(nd->name, norm, strlen(norm) + 1);
+    nd->type = VFS_TYPE_DIR;
+    nd->mode = mode & VFS_MODE_PERMS;
+    nd->uid  = uid;
+    nd->gid  = gid;
+    nd->mtime = ramfs_now_secs();
+    nd->atime = nd->mtime;
+    return VFS_OK;
+}
+
+static int ramfs_truncate(void *mnt, const char *path, uint64_t length) {
     struct ramfs_mount *m = (struct ramfs_mount *)mnt;
     char norm[VFS_PATH_MAX];
     if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
     struct ramfs_node *nd = find_node(m, norm);
-    if (!nd) return VFS_ERR_ROFS;      /* creating NEW files stays unsupported */
+    if (!nd) return VFS_ERR_NOENT;
     if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
-    int rc = ramfs_cow(nd, 1);
-    if (rc != VFS_OK) return rc;
-    nd->size = 0;                                            /* truncate */
-    return VFS_ERR_EXIST;
+    return ramfs_set_len(nd, length);
 }
 
-/* unlink/mkdir stay NULL -- the VFS turns a NULL hook into VFS_ERR_ROFS, so
- * the root is still not something you can add to or remove from. */
+static int ramfs_ftruncate(struct vfs_file *f, uint64_t length) {
+    struct ramfs_node *nd = (struct ramfs_node *)f->priv;
+    if (!nd) return VFS_ERR_INVAL;
+    if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
+    int rc = ramfs_set_len(nd, length);
+    if (rc == VFS_OK) f->size = nd->size;
+    return rc;
+}
+
+/* chmod/chown/utimes need somewhere to PUT the value, and an implicit
+ * directory (one the tar never named, inferred from its children) has no
+ * node at all. Reporting ROFS there is the honest answer -- the
+ * alternative, accepting the call and dropping the value, is the lie
+ * utimensat used to tell across the whole VFS. */
+static int ramfs_chmod(void *mnt, const char *path, uint32_t mode) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (!nd) return has_children(m, norm) ? VFS_ERR_ROFS : VFS_ERR_NOENT;
+    nd->mode = mode & VFS_MODE_PERMS;
+    return VFS_OK;
+}
+
+static int ramfs_chown(void *mnt, const char *path, uint32_t uid, uint32_t gid) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (!nd) return has_children(m, norm) ? VFS_ERR_ROFS : VFS_ERR_NOENT;
+    if (uid != (uint32_t)-1) nd->uid = uid;
+    if (gid != (uint32_t)-1) nd->gid = gid;
+    return VFS_OK;
+}
+
+static int ramfs_utimes(void *mnt, const char *path,
+                        uint64_t mtime, uint64_t atime) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_path(path, norm, sizeof(norm))) return VFS_ERR_INVAL;
+    struct ramfs_node *nd = find_node(m, norm);
+    if (!nd) return has_children(m, norm) ? VFS_ERR_ROFS : VFS_ERR_NOENT;
+    nd->mtime = mtime;
+    nd->atime = atime;
+    return VFS_OK;
+}
+
+/* Rename within the mount. Paths are stored whole, so moving a DIRECTORY
+ * means rewriting every descendant's name too -- otherwise `mv a b` would
+ * strand every child under a parent that no longer exists (tmpfs_rename
+ * learned the same lesson). */
+static int ramfs_rename(void *mnt, const char *oldpath, const char *newpath) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    char o[VFS_PATH_MAX], nw[VFS_PATH_MAX];
+    if (!normalise_path(oldpath, o, sizeof(o)) ||
+        !normalise_path(newpath, nw, sizeof(nw))) return VFS_ERR_INVAL;
+    if (o[0] == 0 || nw[0] == 0) return VFS_ERR_INVAL;    /* not the root */
+    if (strcmp(o, nw) == 0) return VFS_OK;
+    /* Renaming moves a NAME. Resolving to the owner here would rename the
+     * file a hard link points at instead of the link itself -- and if that
+     * owner had already been unlinked, it would rename a node that lookups
+     * deliberately skip, so the new name would not exist. */
+    struct ramfs_node *src = find_node_name(m, o);
+    if (!src) return VFS_ERR_NOENT;
+    size_t ol = strlen(o), nl = strlen(nw);
+    if (nl >= VFS_NAME_MAX) return VFS_ERR_NAMETOOLONG;
+    /* Refuse to move a directory inside itself: the subtree rewrite below
+     * would chase its own tail, and POSIX says EINVAL anyway. */
+    if (src->type == VFS_TYPE_DIR &&
+        strncmp(nw, o, ol) == 0 && nw[ol] == '/') return VFS_ERR_INVAL;
+
+    int prc = parent_dir_ok(m, nw);
+    if (prc != VFS_OK) return prc;
+
+    struct ramfs_node *dst = find_node_name(m, nw);
+    if (dst) {                                   /* POSIX: replace */
+        if (dst == src) return VFS_OK;
+        if (dst->type == VFS_TYPE_DIR && has_children(m, nw))
+            return VFS_ERR_INVAL;                /* target dir not empty */
+        int rc = ramfs_unlink(mnt, nw);
+        if (rc != VFS_OK) return rc;
+    }
+
+    if (src->type == VFS_TYPE_DIR) {
+        /* Bound-check every descendant BEFORE moving anything: a rewrite
+         * that fails halfway would leave the tree split across two names. */
+        for (size_t i = 0; i < node_total(m); i++) {
+            struct ramfs_node *c = node_at(m, i);
+            if (c->dead || c == src) continue;
+            if (strncmp(c->name, o, ol) != 0 || c->name[ol] != '/') continue;
+            if (nl + strlen(c->name + ol) >= VFS_NAME_MAX)
+                return VFS_ERR_NAMETOOLONG;
+        }
+        for (size_t i = 0; i < node_total(m); i++) {
+            struct ramfs_node *c = node_at(m, i);
+            if (c->dead || c == src) continue;
+            if (strncmp(c->name, o, ol) != 0 || c->name[ol] != '/') continue;
+            char moved[VFS_NAME_MAX];
+            size_t rest = strlen(c->name + ol);
+            memcpy(moved, nw, nl);
+            memcpy(moved + nl, c->name + ol, rest + 1);
+            memcpy(c->name, moved, nl + rest + 1);
+        }
+    }
+    memcpy(src->name, nw, nl + 1);
+    return VFS_OK;
+}
+
+/* Phase H: honest numbers for the initrd view -- the image is the
+ * "disk", the spillover table is the only growth room. */
+static int ramfs_statfs(void *mnt, struct vfs_statfs *out) {
+    struct ramfs_mount *m = (struct ramfs_mount *)mnt;
+    size_t free_slots = RAMFS_EXTRA_MAX - g_extra_count;
+    for (size_t i = 0; i < g_extra_count; i++)
+        if (g_extra[i].dead && g_extra[i].open_refs == 0) free_slots++;
+    out->bsize      = 4096;
+    out->blocks     = (m->image_size + 4095) / 4096;
+    out->bfree      = 0;                     /* the tar itself never grows */
+    out->files      = node_total(m);
+    out->ffree      = free_slots;
+    out->type_magic = 0x858458f6;            /* RAMFS_MAGIC */
+    out->namelen    = VFS_NAME_MAX - 1;
+    return VFS_OK;
+}
+
 const struct vfs_ops ramfs_ops = {
     .open     = ramfs_open,
     .close    = ramfs_close,
     .read     = ramfs_read,
     .write    = ramfs_write,
     .create   = ramfs_create,
-    .unlink   = 0,
-    .mkdir    = 0,
+    .unlink   = ramfs_unlink,   /* Phase G: writable root */
+    .mkdir    = ramfs_mkdir,    /* Phase G: writable root */
     .opendir  = ramfs_opendir,
     .closedir = ramfs_closedir,
     .readdir  = ramfs_readdir,
     .stat     = ramfs_stat,
+    .statfs   = ramfs_statfs,   /* Phase H */
+    /* 2026-08-24: the rest of the CRUD contract. Phase G gave the root
+     * create/unlink/mkdir and stopped there, which left `mv`, `truncate`,
+     * `chmod`, `chown` and `touch` on an existing file all answering EROFS
+     * on the one filesystem every session starts in. A NULL op here is not
+     * a stub -- the VFS turns it straight into VFS_ERR_ROFS -- so the gap
+     * was invisible until something tried to use it. */
+    .rename    = ramfs_rename,
+    .chmod     = ramfs_chmod,
+    .chown     = ramfs_chown,
+    .utimes    = ramfs_utimes,
+    .truncate  = ramfs_truncate,
+    .ftruncate = ramfs_ftruncate,
+    .link      = ramfs_link,
 };

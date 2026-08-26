@@ -1,0 +1,10 @@
+# PS2 continuation: an unterminated quote and a backslash-newline both pull
+# a continuation prompt; the joined command then runs as one unit.
+echo 'first
+second'
+echo one \
+two
+if true
+then echo in-if
+fi
+exit 0

@@ -54,6 +54,15 @@ static int str_append_uint(char *b,int p,unsigned v){ char t[16]; fmt_uint(t,v);
 #define STATUS_Y (WIN_H-STATUS_H)
 #define CELL_W 8
 #define CELL_H 12
+
+/* 2026-08-24: this file draws a CHARACTER GRID at CELL_W=8 columns, and
+ * tk_draw_text_mono() finally delivers one -- it used to route to the
+ * proportional TrueType renderer, so the columns never lined up and the
+ * opaque background was dropped. The fixed cell is 8x16, taller than this
+ * file's row pitch, so go through tk_draw_text_cell() to keep the pitch:
+ * the glyph is centred in CELL_H and clipped, and the background covers
+ * exactly CELL_H rows instead of bleeding into the line below. */
+#define TK_MONO(w,x,y,s,fg,bg) tk_draw_text_cell((w),(x),(y),(s),(fg),(bg),CELL_H)
 #define LINE_H 14
 #define GUTTER_W 40
 #define TEXT_X (GUTTER_W+4)
@@ -114,6 +123,19 @@ static void ensure_cursor_visible(void){
     if(g_cursor_row>=g_scroll_row+VISIBLE_ROWS)g_scroll_row=g_cursor_row-VISIBLE_ROWS+1;
     if(g_scroll_row<0)g_scroll_row=0;
 }
+/* Wheel scrolls the view WITHOUT moving the caret -- ensure_cursor_visible
+ * only runs on cursor motion, so the view stays where the wheel left it
+ * until you actually type or arrow somewhere. */
+static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
+    (void)c;
+    if(ev->type!=TK_EV_WHEEL||!ev->wheel)return;
+    g_scroll_row-=(int)ev->wheel*TK_WHEEL_LINES;
+    int maxs=g_line_count-VISIBLE_ROWS; if(maxs<0)maxs=0;
+    if(g_scroll_row>maxs)g_scroll_row=maxs;
+    if(g_scroll_row<0)g_scroll_row=0;
+    tk_redraw(w);
+}
+
 static void insert_char(char ch){ int len=line_len(g_cursor_row); if(len>=MAX_COLS-2)return; for(int i=len;i>=g_cursor_col;i--)g_lines[g_cursor_row][i+1]=g_lines[g_cursor_row][i]; g_lines[g_cursor_row][g_cursor_col]=ch; g_cursor_col++; g_modified=1; }
 static void delete_back(void){
     if(g_cursor_col>0){ int len=line_len(g_cursor_row); for(int i=g_cursor_col-1;i<len;i++)g_lines[g_cursor_row][i]=g_lines[g_cursor_row][i+1]; g_cursor_col--; g_modified=1; }
@@ -148,7 +170,7 @@ static void paint(struct tk_window *w,struct tk_widget *c){
     if(g_has_file){ tp=str_append(title,tp," - "); tp=str_append(title,tp,g_filename); } else tp=str_append(title,tp," - [untitled]");
     if(g_modified)tp=str_append(title,tp," *");
     title[tp]='\0';
-    tk_draw_text_mono(w,8,5,title,g_modified?COL_MODIFIED:COL_TITLE_FG,COL_TITLE_BG);
+    TK_MONO(w,8,5,title,g_modified?COL_MODIFIED:COL_TITLE_FG,COL_TITLE_BG);
 
     tk_draw_fill(w,0,EDITOR_Y,GUTTER_W,EDITOR_H,COL_GUTTER);
     tk_draw_fill(w,GUTTER_W,EDITOR_Y,1,EDITOR_H,0x00313244u);
@@ -160,11 +182,11 @@ static void paint(struct tk_window *w,struct tk_widget *c){
         uint32_t gbg=is_cur?COL_CURSOR:COL_GUTTER;
         char lnum[8]; fmt_uint(lnum,(unsigned)(row+1));
         int lnum_len=(int)my_strlen(lnum); int lnum_x=GUTTER_W-(lnum_len+1)*CELL_W; if(lnum_x<2)lnum_x=2;
-        tk_draw_text_mono(w,lnum_x,y+1,lnum,is_cur?COL_ACCENT:COL_LINENUM,gbg);
+        TK_MONO(w,lnum_x,y+1,lnum,is_cur?COL_ACCENT:COL_LINENUM,gbg);
         int len=line_len(row);
         if(len>0){ char disp[VISIBLE_COLS+2]; int dlen=len; if(dlen>VISIBLE_COLS)dlen=VISIBLE_COLS;
             if(dlen>0){ my_memcpy(disp,g_lines[row],(unsigned long)dlen); disp[dlen]='\0';
-                        tk_draw_text_mono(w,TEXT_X,y+1,disp,COL_TEXT,is_cur?COL_CURSOR:COL_BG); } }
+                        TK_MONO(w,TEXT_X,y+1,disp,COL_TEXT,is_cur?COL_CURSOR:COL_BG); } }
         if(is_cur){ int cx=TEXT_X+g_cursor_col*CELL_W; if(cx<WIN_W-4)tk_draw_fill(w,cx,y+1,2,CELL_H,COL_ACCENT); }
     }
 
@@ -177,8 +199,8 @@ static void paint(struct tk_window *w,struct tk_widget *c){
     if(g_modified)sp=str_append(st,sp,"  [Modified]");
     sp=str_append(st,sp,"  |  "); sp=str_append_uint(st,sp,(unsigned)g_line_count); sp=str_append(st,sp," lines");
     st[sp]='\0';
-    tk_draw_text_mono(w,4,STATUS_Y+5,st,COL_ST_TEXT,COL_STATUS);
-    if(g_message[0]&&sys_clock_ms()<g_msg_expire){ int mx=WIN_W-((int)my_strlen(g_message)+1)*CELL_W; tk_draw_text_mono(w,mx,STATUS_Y+5,g_message,g_msg_color,COL_STATUS); }
+    TK_MONO(w,4,STATUS_Y+5,st,COL_ST_TEXT,COL_STATUS);
+    if(g_message[0]&&sys_clock_ms()<g_msg_expire){ int mx=WIN_W-((int)my_strlen(g_message)+1)*CELL_W; TK_MONO(w,mx,STATUS_Y+5,g_message,g_msg_color,COL_STATUS); }
 
     if(g_line_count>VISIBLE_ROWS){
         int sb_x=WIN_W-6; tk_draw_fill(w,sb_x,EDITOR_Y,4,EDITOR_H,0x00252536u);
@@ -215,7 +237,8 @@ int main(int argc,char **argv){
     if(tk_window_open(&win,WIN_W,WIN_H,"TobyEdit")!=0)return 1;
     tk_on_key(&win,on_key);
     struct tk_widget *root=tk_root(&win); tk_pad(root,0);
-    tk_grow(tk_canvas(&win,root,paint),1);
+    { struct tk_widget *cv=tk_canvas(&win,root,paint); tk_grow(cv,1);
+      tk_on_event(cv,on_event); }
 
     for(;;){
         if(tk_pump(&win))break;

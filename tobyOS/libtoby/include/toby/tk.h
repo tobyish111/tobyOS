@@ -53,6 +53,7 @@ extern "C" {
 #define TK_EV_KEY         4
 #define TK_EV_CLOSE       5
 #define TK_EV_RESIZE      6
+#define TK_EV_WHEEL       7   /* == GUI_EV_WHEEL; detents in .wheel */
 
 #define TK_KEY_BACKSPACE  0x08
 #define TK_KEY_TAB        0x09
@@ -65,20 +66,38 @@ extern "C" {
 #define TK_KEY_END        0x85
 #define TK_KEY_DELETE     0x86
 #define TK_KEY_MENU       0x87   /* keyboard context-menu (Apps) key */
+/* 2026-08-24: PageUp/PageDown. Both keyboard drivers left these
+ * deliberately unmapped, so /bin/gui_term had invented its own
+ * KEY_PGUP/KEY_PGDN at 0x86/0x87 -- which are Delete and Menu. The
+ * terminal therefore scrolled its scrollback when you pressed Delete
+ * and could never forward-delete a character. Real codes, mapped in
+ * keyboard.c and usb_hid.c, so nothing has to squat on anything. */
+#define TK_KEY_PGUP       0x88
+#define TK_KEY_PGDN       0x89
 
 /* tk_event.button bit masks (mirror the kernel's gui_event buttons). */
 #define TK_BTN_LEFT       0x01
 #define TK_BTN_RIGHT      0x02
 #define TK_BTN_MIDDLE     0x04
 
-/* Byte-compatible with the kernel struct gui_event. */
+/* Byte-compatible with the kernel struct gui_event -- including the
+ * wheel field carved out of the old _pad, so sizeof is unchanged and
+ * programs built before wheels existed still load. */
 struct tk_event {
     int     type;
     int     x, y;
     uint8_t button;
     uint8_t key;
-    uint8_t _pad[2];
+    int8_t  wheel;      /* TK_EV_WHEEL: + = away from user (scroll up) */
+    uint8_t _pad[1];
 };
+
+/* Pixels of document scroll one wheel detent should move. Shared so the
+ * browser, viewer, editor and toolkit all travel the same distance per
+ * notch instead of each inventing a feel. */
+#define TK_WHEEL_STEP_PX  48
+/* Rows per detent for list/table/textarea widgets (the usual desktop 3). */
+#define TK_WHEEL_LINES    3
 
 /* Window state for tk_maximize (matches GUI_WIN_*). */
 #define TK_WIN_NORMAL     0
@@ -175,6 +194,12 @@ struct tk_widget {
     /* listbox */
     const char **items;
     int  n_items, sel, scroll;
+    /* The selection index as of the last paint. Painting reveals `sel`
+     * only when it has CHANGED since -- without that test the reveal ran
+     * on every frame and pinned scroll to the selection, so a wheel (or
+     * any other free scroll) snapped straight back and looked broken.
+     * -1 means "nothing painted yet", which forces the first reveal. */
+    int  sel_shown;
 
     /* table (TK_TABLE): headers + per-cell accessor are app-owned */
     const char *const *th;   /* column headers, ncols entries (may be NULL) */
@@ -340,7 +365,18 @@ int  tk_text_width  (const char *s, int px, int bold);
 /* Monospace bitmap text: an 8x16 fixed-cell VGA font with an opaque bg, one
  * call per run. For char grids (terminals) where the proportional TTF
  * tk_draw_text would not column-align. Advance is 8px/char; position at col*8. */
+/* Fixed 8x16 VGA cell, fixed 8px advance, OPAQUE bg -- a real character
+ * grid. (Until 2026-08-24 this routed to the proportional TrueType
+ * renderer and silently dropped bg, so every grid built on it drew its
+ * cells at column*8 and rendered them at Lato's widths.) */
 void tk_draw_text_mono(struct tk_window*, int x, int y, const char *s, uint32_t fg, uint32_t bg);
+/* Same, with an explicit ROW PITCH: the glyph is centred in cell_h and
+ * clipped, and the background covers exactly cell_h rows. Needed because
+ * the grid apps disagree -- the terminal is 16, gui_edit and gui_browser
+ * are 12, gui_viewer is 14 -- and 16 rows of opaque bg in a 12-row pitch
+ * erases the top of the line below. tk_draw_text_mono() is this with 16. */
+void tk_draw_text_cell(struct tk_window*, int x, int y, const char *s,
+                       uint32_t fg, uint32_t bg, int cell_h);
 /* Blit an ARGB8888 source. `src_pitch` is the source row stride in pixels
  * (pass w for a tightly packed buffer). _blend alpha-composites. */
 void tk_draw_blit      (struct tk_window*, int x, int y, int w, int h, const uint32_t *argb, int src_pitch);

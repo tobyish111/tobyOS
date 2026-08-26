@@ -47,6 +47,8 @@
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/acpi.h>
+#include <tobyos/smbios.h>
+#include <tobyos/cputelem.h>
 #include <tobyos/apic.h>
 #include <tobyos/smp.h>
 #include <tobyos/initrd.h>
@@ -395,6 +397,17 @@ static volatile struct limine_rsdp_request rsdp_req = {
     .response = 0
 };
 
+/* SMBIOS/DMI entry point -- the firmware's description of the physical
+ * machine (board, BIOS, chassis, DIMMs). src/smbios.c falls back to
+ * scanning the BIOS F-segment if this response is absent, so a NULL here
+ * is not fatal on a legacy boot. */
+__attribute__((used, section(".limine_reqs")))
+static volatile struct limine_smbios_request smbios_req = {
+    .id       = LIMINE_SMBIOS_REQUEST,
+    .revision = 0,
+    .response = 0
+};
+
 __attribute__((used, section(".limine_reqs")))
 static volatile uint64_t requests_end[] = {
     0xadc0e0531bb10d03, 0x9572709f31764c62
@@ -698,6 +711,17 @@ static void smp_init_bsp(void) {
                      ? normalise_rsdp_pointer(rsdp_req.response->address)
                      : 0;
     acpi_init(rsdp);
+    /* SMBIOS/DMI. Needs the VMM (it maps the firmware's table into the
+     * HHDM) and nothing else, so it rides here next to the other
+     * firmware-table discovery. */
+    smbios_init(smbios_req.response ? smbios_req.response->entry_32 : 0,
+                smbios_req.response ? smbios_req.response->entry_64 : 0);
+    /* CPU telemetry read from MSRs. Both gate themselves on CPUID before
+     * touching a register (there is no exception-fixup table, so a
+     * speculative rdmsr is a fault waiting for the wrong machine) and
+     * publish nothing when the gate says no. */
+    cputherm_init();
+    cpufreq_msr_init();
     /* Recalibrate the TSC rate against the FADT's PM timer now that we
      * know its port. perf_init's PIT-IRQ-based estimate can be inflated
      * many-fold under loaded QEMU TCG (observed 15x: the whole OS clock
@@ -781,15 +805,34 @@ static void serial_heartbeat(void) {
      * Prints nothing on a healthy system, so it costs a comparison per beat. */
     {
         extern uint64_t g_tlb_ack_timeouts, g_tlb_giveups;
+        extern uint64_t g_tlb_to_percpu[MAX_CPUS];
+        extern uint64_t g_tlb_wait_max_ns;
         uint64_t to = __atomic_load_n(&g_tlb_ack_timeouts, __ATOMIC_RELAXED);
         uint64_t gu = __atomic_load_n(&g_tlb_giveups, __ATOMIC_RELAXED);
         uint64_t qn = 0, ql = 0;
         mmap_tlbq_stats(&qn, &ql);
-        if (to || gu || qn || ql)
+        if (to || gu || qn || ql) {
+            /* Slice 125: report the DISTRIBUTION, not just the total. A tally
+             * spread across every CPU is scheduling noise (WHPX deschedules,
+             * or a console-heavy burst); one CPU carrying nearly all of them
+             * is a core to go look at. worst= says by how much the 10 ms
+             * deadline was actually missed. */
+            uint64_t mx = __atomic_load_n(&g_tlb_wait_max_ns, __ATOMIC_RELAXED);
+            char per[96]; size_t pn = 0; per[0] = 0;
+            for (uint32_t i = 0; i < MAX_CPUS && pn + 12 < sizeof per; i++) {
+                uint64_t v = __atomic_load_n(&g_tlb_to_percpu[i],
+                                             __ATOMIC_RELAXED);
+                if (!v) continue;
+                pn += (size_t)ksnprintf(per + pn, sizeof per - pn,
+                                        "%scpu%u=%lu", pn ? "," : "",
+                                        i, (unsigned long)v);
+            }
             kprintf_serial("[tlb] health: ack_timeouts=%lu giveups=%lu "
-                           "quarantined=%lu leaked=%lu\n",
+                           "quarantined=%lu leaked=%lu worst=%luus [%s]\n",
                            (unsigned long)to, (unsigned long)gu,
-                           (unsigned long)qn, (unsigned long)ql);
+                           (unsigned long)qn, (unsigned long)ql,
+                           (unsigned long)(mx / 1000u), per[0] ? per : "-");
+        }
     }
 #ifdef CHROMIUM_BOOT
     /* Wake Ozone X clients blocked in recvmsg (poll path never runs). */
@@ -2857,7 +2900,7 @@ static void winpe8_move_cursor_to(int tx, int ty) {
         if (sx == 0 && ex) sx = (ex > 0) ? 1 : -1;
         int sy = ey / 6; if (sy > 40) sy = 40; if (sy < -40) sy = -40;
         if (sy == 0 && ey) sy = (ey > 0) ? 1 : -1;
-        mouse_inject_event(sx, sy, 0);
+        mouse_inject_event(sx, sy, 0, 0);
         winpe8_pump_ms(15);
     }
 }
@@ -3211,18 +3254,28 @@ void _start(void) {
          * INSTALLER_BOOT_SECTORS on the first disk -- carved without a
          * partition table by the old installer). */
         if (!data_mounted) {
-            struct blk_dev *disk = blk_first_disk();
-            if (!disk) disk = blk_get_first();
-            if (disk && disk->sector_count > INSTALLER_BOOT_SECTORS) {
+            /* SWEEP EVERY DISK, not just the first. This tried
+             * blk_first_disk() alone, so a machine that installed tobyOS to
+             * its second disk booted with a RAM-backed /data and no
+             * explanation -- the installed volume was there, on a device
+             * nothing looked at. Same defect Priority 2 was widened to fix
+             * (its comment records the identical lesson about
+             * blk_first_disk); this arm was simply missed at the time.
+             * Probing is read-only: tobyfs_mount validates the superblock
+             * and returns without writing on a non-tobyfs region. */
+            size_t it = 0;
+            struct blk_dev *disk;
+            while (!data_mounted &&
+                   (disk = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
+                if (disk->sector_count <= INSTALLER_BOOT_SECTORS) continue;
                 uint64_t avail = disk->sector_count - INSTALLER_BOOT_SECTORS;
-                if (avail >= TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) {
-                    struct blk_dev *part = blk_offset_wrap(
-                        disk, INSTALLER_BOOT_SECTORS, avail, "data");
-                    if (part && tobyfs_mount("/data", part) == VFS_OK) {
-                        kprintf("[boot] mounted installed /data at LBA %u on "
-                                "'%s'\n", INSTALLER_BOOT_SECTORS, disk->name);
-                        data_mounted = true;
-                    }
+                if (avail < TFS_TOTAL_BLOCKS * TFS_SECTORS_PER_BLOCK) continue;
+                struct blk_dev *part = blk_offset_wrap(
+                    disk, INSTALLER_BOOT_SECTORS, avail, "data");
+                if (part && tobyfs_mount("/data", part) == VFS_OK) {
+                    kprintf("[boot] mounted installed /data at LBA %u on "
+                            "'%s'\n", INSTALLER_BOOT_SECTORS, disk->name);
+                    data_mounted = true;
                 }
             }
         }
@@ -3266,22 +3319,76 @@ void _start(void) {
          * semantics: world-writable. Applied at MOUNT, not just at format,
          * because volumes provisioned by earlier builds are already 0755 on
          * disk and would stay broken forever. Idempotent and logged. */
+#ifdef RMTREE_SELFTEST
+        /* Slice 127: prove `rm -r` on a real tree, on the real filesystem.
+         * Runs before the desktop so the assertions are early in the log.
+         * Opt-in only -- it creates and deletes /data/.rmtest. */
         if (data_mounted) {
-            struct vfs_stat dst;
-            if (vfs_stat("/data", &dst) == VFS_OK &&
-                (dst.mode & 00002u) == 0) {
-                /* kprintf has no %o -- split the octal digits by hand. */
-                unsigned mo = (unsigned)(dst.mode & 0777u);
-                unsigned m2 = (mo >> 6) & 7, m1 = (mo >> 3) & 7, m0 = mo & 7;
-                if (vfs_chmod("/data", 00777u) == VFS_OK)
-                    kprintf("[boot] /data was mode 0%d%d%d (root-only) -- "
-                            "relaxed to 0777 so non-root sessions can use the "
-                            "desktop\n", m2, m1, m0);
-                else
-                    kprintf("[boot] WARN: /data is mode 0%d%d%d (root-only) "
-                            "and could not be relaxed -- non-root logins will "
-                            "not be able to save anything\n", m2, m1, m0);
+            struct vfs_stat st;
+            int fails = 0;
+            kprintf("[RMTREE] building /data/.rmtest ...\n");
+            shell_run_test_line("mkdir /data/.rmtest");
+            shell_run_test_line("mkdir /data/.rmtest/a");
+            shell_run_test_line("mkdir /data/.rmtest/a/b");
+            shell_run_test_line("write /data/.rmtest/top.txt hello");
+            shell_run_test_line("write /data/.rmtest/a/mid.txt hello");
+            shell_run_test_line("write /data/.rmtest/a/b/leaf.txt hello");
+            if (vfs_stat("/data/.rmtest/a/b/leaf.txt", &st) != VFS_OK) {
+                kprintf("[RMTREE] FAIL: could not build the tree\n"); fails++;
             }
+            /* Plain rm must REFUSE a non-empty directory (and say why). */
+            shell_run_test_line("rm /data/.rmtest");
+            if (vfs_stat("/data/.rmtest", &st) != VFS_OK) {
+                kprintf("[RMTREE] FAIL: plain rm deleted a non-empty tree\n");
+                fails++;
+            } else {
+                kprintf("[RMTREE] ok: plain rm refused the directory\n");
+            }
+            /* -r must remove it entirely. */
+            shell_run_test_line("rm -r /data/.rmtest");
+            if (vfs_stat("/data/.rmtest", &st) == VFS_OK) {
+                kprintf("[RMTREE] FAIL: tree survived rm -r\n"); fails++;
+            } else {
+                kprintf("[RMTREE] ok: rm -r removed the whole tree\n");
+            }
+            /* -f on a missing path must be silent and succeed. */
+            shell_run_test_line("rm -f /data/.rmtest/nope");
+            /* THE GUI TERMINAL IS A DIFFERENT COMMAND TABLE, and that is the
+             * whole reason this gate grew: `rm` answered "unknown" there even
+             * after the kernel shell had rm -r, because src/term.c keeps its
+             * own much smaller builtin set. A shell-only test cannot see that
+             * gap, so drive a real term session the way the GUI app does --
+             * bytes in, newline to execute. */
+            {
+                struct term_session *ts = term_session_create();
+                if (!ts) {
+                    kprintf("[RMTREE] FAIL: no term session available\n");
+                    fails++;
+                } else {
+                    shell_run_test_line("mkdir /data/.rmtest2");
+                    shell_run_test_line("mkdir /data/.rmtest2/x");
+                    shell_run_test_line("write /data/.rmtest2/x/f.txt hi");
+                    const char *line = "rm -r /data/.rmtest2\n";
+                    term_session_write_input(ts, line, strlen(line));
+                    if (vfs_stat("/data/.rmtest2", &st) == VFS_OK) {
+                        kprintf("[RMTREE] FAIL: GUI-terminal rm -r left the "
+                                "tree behind\n");
+                        fails++;
+                    } else {
+                        kprintf("[RMTREE] ok: GUI-terminal rm -r removed the "
+                                "tree\n");
+                    }
+                    term_session_close(ts);
+                }
+            }
+            kprintf("[RMTREE] VERDICT: %s\n", fails ? "FAIL" : "PASS");
+        }
+#endif
+        if (data_mounted) {
+            /* One copy of this rule, in provision.c, called by every site
+             * that mounts /data. It used to be written out here only, so
+             * the provisioning path mounted a fresh volume root-only.*/
+            data_volume_relax_perms();
         }
 
 #ifdef PROVISION_SELFTEST
@@ -3306,7 +3413,7 @@ void _start(void) {
                 uint32_t pfl = 0;
                 if (provision_classify(pd, &pfl, pfs) != ABI_BLKV_BLANK)
                     continue;
-                long prc = provision_create_data_volume(pd, false);
+                long prc = provision_create_data_volume(pd, 0u);
                 kprintf("[PROVBOOT] provision '%s' -> rc=%ld (%s)\n",
                         pd->name, prc,
                         prc >= 0 ? "OK" : "FAILED");
@@ -3755,6 +3862,39 @@ void _start(void) {
             if (!ext_mounted) {
                 kprintf("[boot] no ext4 partition discovered -- /ext unmounted\n");
             }
+            /* Phase H (2026-08-23): SELF-PROVISION when nothing was found.
+             * The in-kernel formatter exists precisely so this self-test
+             * needs no host mke2fs -- format a provably BLANK spare disk
+             * (no partitions, no boot sector, no ext/tobyfs magic; the
+             * live /data disk can never match) and mount it RW. This is
+             * what lets the ext4 rename/statfs arms run LIVE. Dev flavour
+             * only: this whole block compiles out without
+             * FS_BOOT_SELFTESTS, which is the real-hardware data-safety
+             * boundary. */
+            if (!ext_mounted) {
+                size_t it = 0;
+                struct blk_dev *d;
+                while (!ext_mounted &&
+                       (d = blk_iter_next(&it, BLK_CLASS_DISK)) != NULL) {
+                    uint8_t s0[512], s2x2[1024];
+                    if (blk_read(d, 0, 1, s0) != 0) continue;
+                    if (blk_read(d, 2, 2, s2x2) != 0) continue;
+                    bool blank = true;
+                    for (int bi = 0; bi < 512 && blank; bi++)
+                        if (s0[bi]) blank = false;
+                    for (int bi = 0; bi < 1024 && blank; bi++)
+                        if (s2x2[bi]) blank = false;
+                    if (!blank) continue;
+                    kprintf("[boot] blank disk '%s' -- self-provisioning "
+                            "ext4 for the Phase H live test\n", d->name);
+                    if (ext4_format_ex(d, 1) != VFS_OK) continue;
+                    if (ext4_mount("/ext", d) == VFS_OK) {
+                        kprintf("[boot] mounted /ext on self-provisioned "
+                                "'%s' (RW)\n", d->name);
+                        ext_mounted = true;
+                    }
+                }
+            }
         }
 
         /* Milestone 23D self-test: read-only smoke test over /ext.
@@ -3818,17 +3958,104 @@ void _start(void) {
                         vfs_strerror(rc));
             }
 
-            /* Confirm read-only enforcement: write/create/unlink MUST
-             * each return VFS_ERR_ROFS. Anything else means the driver
-             * accidentally surfaced a write path. */
-            rc = vfs_write_all("/ext/SHOULD_FAIL.TXT", "x", 1);
-            kprintf("[ext4-test]   write_all /ext/... -> %s "
-                    "(want ROFS / -9)\n", vfs_strerror(rc));
-            rc = vfs_unlink("/ext/HELLO.TXT");
-            kprintf("[ext4-test]   unlink /ext/HELLO.TXT -> %s "
-                    "(want ROFS / -9)\n", vfs_strerror(rc));
+            /* The ROFS assertions that used to live here were STALE: the
+             * driver gained real write paths in the ext4-rw slice and
+             * this text still claimed read-only-ness nobody enforced.
+             * Replaced (2026-08-23) by the write/rename round-trip the
+             * Phase H arms need: create -> rename -> read through the
+             * new name -> old name gone -> unlink. */
+            rc = vfs_write_all("/ext/RENAME_A.TXT", "phaseH", 6);
+            kprintf("[ext4-test]   create RENAME_A.TXT -> %s\n",
+                    vfs_strerror(rc));
+            if (rc == VFS_OK) {
+                rc = vfs_rename("/ext/RENAME_A.TXT", "/ext/RENAME_B.TXT");
+                void *rb = 0; size_t rl = 0;
+                int rr = vfs_read_all("/ext/RENAME_B.TXT", &rb, &rl);
+                struct vfs_stat gone;
+                int gr = vfs_stat("/ext/RENAME_A.TXT", &gone);
+                kprintf("[ext4-test]   rename A->B -> %s, read B -> %s "
+                        "(%u bytes%s), A -> %s (want NOENT) => %s\n",
+                        vfs_strerror(rc), vfs_strerror(rr), (unsigned)rl,
+                        (rr == VFS_OK && rl == 6 &&
+                         memcmp(rb, "phaseH", 6) == 0) ? ", content OK" : "",
+                        vfs_strerror(gr),
+                        (rc == VFS_OK && rr == VFS_OK && rl == 6 &&
+                         gr == VFS_ERR_NOENT) ? "RENAME OK" : "** FAIL **");
+                if (rr == VFS_OK && rb) kfree(rb);
+                (void)vfs_unlink("/ext/RENAME_B.TXT");
+            }
+
+            /* Phase H live check: statfs is a READ, so it works on the
+             * RO mount -- the group-descriptor sums must be nonzero and
+             * self-consistent, not the fabricated 4 GiB of old. (The
+             * ext4 rename arm stays untested here: /ext mounts RO by
+             * data-safety policy, and relaxing that for a smoke test is
+             * exactly the wrong trade. It shares its ext2 twin's shape,
+             * which the FAT check below exercises structurally.) */
+            {
+                struct vfs_statfs sf;
+                if (vfs_statfs("/ext", &sf) == VFS_OK)
+                    kprintf("[ext4-test]   statfs: bsize=%lu blocks=%lu "
+                            "bfree=%lu files=%lu ffree=%lu magic=0x%x %s\n",
+                            (unsigned long)sf.bsize,
+                            (unsigned long)sf.blocks,
+                            (unsigned long)sf.bfree,
+                            (unsigned long)sf.files,
+                            (unsigned long)sf.ffree,
+                            (unsigned)sf.type_magic,
+                            (sf.blocks > 0 && sf.bfree <= sf.blocks &&
+                             sf.type_magic == 0xEF53)
+                                ? "SANE" : "** BOGUS **");
+                else
+                    kprintf("[ext4-test]   statfs FAILED\n");
+            }
 
             kprintf("[ext4-test] <<< end smoke test on /ext\n");
+        }
+
+        /* Phase H live check on the WRITABLE FAT mount: the new rename
+         * arm end-to-end (create -> rename -> read through the new name
+         * -> old name gone) plus real statfs numbers from the FAT scan. */
+        if (fat_mounted) {
+            kprintf("[fat32-test] >>> Phase H rename + statfs on /fat\n");
+            int rc = vfs_write_all("/fat/RENAME_A.TXT", "phaseH", 6);
+            kprintf("[fat32-test]   create RENAME_A.TXT -> %s\n",
+                    vfs_strerror(rc));
+            if (rc == VFS_OK) {
+                rc = vfs_rename("/fat/RENAME_A.TXT", "/fat/RENAME_B.TXT");
+                kprintf("[fat32-test]   rename A->B -> %s\n",
+                        vfs_strerror(rc));
+                void *body = 0; size_t blen = 0;
+                int rr = vfs_read_all("/fat/RENAME_B.TXT", &body, &blen);
+                struct vfs_stat gone;
+                int gr = vfs_stat("/fat/RENAME_A.TXT", &gone);
+                kprintf("[fat32-test]   read B -> %s (%u bytes%s), "
+                        "A stat -> %s (want NOENT) => %s\n",
+                        vfs_strerror(rr), (unsigned)blen,
+                        (rr == VFS_OK && blen == 6 &&
+                         memcmp(body, "phaseH", 6) == 0)
+                            ? ", content OK" : "",
+                        vfs_strerror(gr),
+                        (rc == VFS_OK && rr == VFS_OK && blen == 6 &&
+                         gr == VFS_ERR_NOENT) ? "RENAME OK" : "** FAIL **");
+                if (rr == VFS_OK && body) kfree(body);
+                (void)vfs_unlink("/fat/RENAME_B.TXT");
+            }
+            {
+                struct vfs_statfs sf;
+                if (vfs_statfs("/fat", &sf) == VFS_OK)
+                    kprintf("[fat32-test]   statfs: blocks=%lu bfree=%lu "
+                            "magic=0x%x %s\n",
+                            (unsigned long)sf.blocks,
+                            (unsigned long)sf.bfree,
+                            (unsigned)sf.type_magic,
+                            (sf.blocks > 0 && sf.bfree <= sf.blocks &&
+                             sf.type_magic == 0x4d44)
+                                ? "SANE" : "** BOGUS **");
+                else
+                    kprintf("[fat32-test]   statfs FAILED\n");
+            }
+            kprintf("[fat32-test] <<< end\n");
         }
 #endif /* FS_BOOT_SELFTESTS -- foreign-FS auto-mount + smoke tests */
 
@@ -3888,11 +4115,49 @@ void _start(void) {
     unix_socket_init();      /* Phase 1 M1.4: Unix domain sockets */
     sysfs_init();            /* Phase 1 M1.5: sysfs virtual filesystem */
     cgroup_init();           /* Slice 15: cgroup v2 hierarchy */
+
+    /* A writable /tmp. POSIX programs assume one exists, and until now none
+     * did: the root filesystem is the read-only initrd ramfs, whose create
+     * hook returns ROFS for any path that is not already in the tar, so
+     * nothing anywhere could make a temp file.
+     *
+     * The bash-parity gate is what surfaced it. GNU bash implements a
+     * here-document by writing the body to a temp file and reading it back;
+     * with no writable /tmp that silently produced truncated garbage, so the
+     * ORACLE was wrong and a correct tsh looked like the failure. Every
+     * ported program that calls tmpfile()/mkstemp() had the same problem.
+     *
+     * tmpfs has been in the tree since slice 5 and was reachable only through
+     * mount(2) -- a working filesystem nothing had mounted. */
+    {
+        extern int tmpfs_mount_at(const char *path, const char *opts);
+        int rc = tmpfs_mount_at("/tmp", 0);
+        kprintf("[boot] /tmp: %s\n",
+                rc == VFS_OK ? "tmpfs mounted (writable)"
+                             : "MOUNT FAILED -- temp files will not work");
+        /* 2026-08-22: /dev/shm too. glibc's shm_open() IS
+         * open("/dev/shm/<name>") -- with no mount there, POSIX shared
+         * memory never existed for Linux binaries (memfd carried chrome
+         * instead). Path resolution is longest-prefix over the mount
+         * table, so this works without /dev being a real directory. */
+        rc = tmpfs_mount_at("/dev/shm", 0);
+        kprintf("[boot] /dev/shm: %s\n",
+                rc == VFS_OK ? "tmpfs mounted (POSIX shm live)"
+                             : "MOUNT FAILED -- shm_open will ENOENT");
+    }
     cgroup_mount();          /* ...and cgroupfs at /sys/fs/cgroup (nests in /sys) */
     aslr_init();             /* Phase 7 M7.1: address space layout randomization */
     oom_init();              /* Phase 1: OOM killer -- see the idle-loop check */
     hardening_init();        /* Phase 7 M7.2: SMEP/SMAP/NX enforcement */
     page_fault_init();       /* Phase 1: COW + demand paging refcounts + vm_spaces */
+    /* 2026-08-23: the vDSO. MUST follow page_fault_init -- its frame pins
+     * go through the page-refcount array, and a pin taken before that
+     * array exists is a silent no-op. That exact ordering slip made the
+     * first boot-helper's exit teardown free the LIVE GLOBAL vDSO frames
+     * (free_subtree frees refs<=1 leaves), the heap grew into them, and
+     * every ~10 ms vdso_refresh wrote tsc_khz into a kmalloc freelist
+     * node -- a GP in kmalloc two spawns later, 550 ms from the cause. */
+    { extern void vdso_init(void); vdso_init(); }
     aml_interp_init();       /* Phase 4: AML namespace + interpreter */
     clipboard_init();        /* Phase 2 M2.7: system clipboard */
     hidpi_init();            /* Phase 2 M2.6: HiDPI display scaling */
@@ -3910,6 +4175,13 @@ void _start(void) {
                 (unsigned)0x40);
     }
     smp_start_aps();         /* INIT-SIPI-SIPI (BSP/IO APIC already up) */
+
+    /* NOW that every AP is online, publish the per-CPU cpufreq tree.
+     * sysfs_init() ran ~60 lines above this, when smp_cpu_count() still
+     * answered 1 -- so doing it there gave a four-core EliteDesk exactly
+     * ONE cpuN/cpufreq directory. Found on real hardware; QEMU declines
+     * the MSR gate entirely, so the loop never ran there to be wrong. */
+    { extern void sysfs_publish_cpufreq(void); sysfs_publish_cpufreq(); }
 
     /* Every online CPU now has its GS base installed (BSP in syscall_init
      * above, each AP in ap_entry before it reached `online`). Switch
@@ -4125,6 +4397,12 @@ void _start(void) {
         }
 
         mouse_init();
+#ifdef WHEEL_SELFTEST
+        /* Wheel decode proof: runs right after init so it can report what
+         * the IntelliMouse knock actually got, before the GUI starts
+         * consuming events. */
+        { extern void mouse_wheel_selftest(void); mouse_wheel_selftest(); }
+#endif
         gui_init();
 
         /* Auto-enable GPU-accelerated compositor if VirtIO-GPU is active.
@@ -4514,10 +4792,10 @@ void _start(void) {
         const int ty[3] = { 300, 400, 560 };
         evdev_reset();
         for (int i = 0; i < 3; i++) {
-            mouse_inject_event(tx[i] - curx, ty[i] - cury, 0);  /* move */
+            mouse_inject_event(tx[i] - curx, ty[i] - cury, 0, 0);  /* move */
             curx = tx[i]; cury = ty[i];
-            mouse_inject_event(0, 0, MOUSE_BTN_LEFT);           /* press  */
-            mouse_inject_event(0, 0, 0);                        /* release */
+            mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);           /* press  */
+            mouse_inject_event(0, 0, 0, 0);                        /* release */
         }
         char *argv[] = { (char *)"linux-paint", 0 };
         char *envp[] = { (char *)"PATH=/bin", 0 };
@@ -5190,9 +5468,9 @@ void _start(void) {
                 if (gui_focused_window_client_center(&cx, &cy)) {
                     kprintf("[boot] WINPE8: real mouse click at screen (%d,%d)\n", cx, cy);
                     winpe8_move_cursor_to(cx, cy);
-                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);  /* button down */
+                    mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);  /* button down */
                     winpe8_pump_ms(250);
-                    mouse_inject_event(0, 0, 0);               /* button up   */
+                    mouse_inject_event(0, 0, 0, 0);               /* button up   */
                     winpe8_pump_ms(400);
                 }
                 uint32_t after_real = win32_gui_fill_color();
@@ -5270,9 +5548,9 @@ void _start(void) {
                     kprintf("[boot] WINPE10: real mouse click into focused window at (%d,%d)\n",
                             cx, cy);
                     winpe8_move_cursor_to(cx, cy);
-                    mouse_inject_event(0, 0, MOUSE_BTN_LEFT);
+                    mouse_inject_event(0, 0, 0, MOUSE_BTN_LEFT);
                     winpe8_pump_ms(250);
-                    mouse_inject_event(0, 0, 0);
+                    mouse_inject_event(0, 0, 0, 0);
                     winpe8_pump_ms(500);
                 }
 
@@ -6712,6 +6990,34 @@ void _start(void) {
     }
 #endif
 
+#ifdef LXSOCK_BOOT
+    /* 2026-08-22 socket-semantics gate, peer-required half. Runs
+     * /bin/linux-sockserver, whose peer is the HOST over SLIRP hostfwd
+     * (logs/lxsock.sh -- the b14 pattern). Proves: a blocking accept()
+     * really blocks past the old 3 s EAGAIN cap; a pre-data MSG_DONTWAIT
+     * recv is EAGAIN on the real TCP path; shutdown(SHUT_WR) is a live
+     * half-close ON THE WIRE (the host asserts the FIN arrived and its
+     * post-FIN line still gets through); send-after-shutdown is EPIPE. */
+    {
+        kprintf("[boot] LXSOCK: net_up=%d -- spawning /bin/linux-sockserver\n",
+                (int)net_is_up());
+        char *kargv[] = { (char *)"linux-sockserver", 0 };
+        char *kenvp[] = { (char *)"PATH=/bin", 0 };
+        struct proc_spec kspec = {
+            .path = "/bin/linux-sockserver", .name = "linux-sockserver",
+            .argc = 1, .argv = kargv, .envc = 1, .envp = kenvp,
+        };
+        int kpid = proc_spawn(&kspec);
+        if (kpid < 0) {
+            kprintf("[LXSOCKSRV] VERDICT: FAIL reason=spawn\n");
+        } else {
+            int krc = proc_wait(kpid);
+            kprintf("[boot] LXSOCK: exit=%d (bits; 15=all; the [lxsock] lines "
+                    "above say which half failed)\n", krc);
+        }
+    }
+#endif
+
 #ifdef LXNETSRV_BOOT
     /* Track B milestone B14 -- networking capstone. A genuine Linux x86-64
      * ELF (raw syscalls) runs an EVENT-DRIVEN TCP echo server on the Linux
@@ -7529,6 +7835,205 @@ void _start(void) {
     }
 #endif
 
+#ifdef TVI_BOOT
+    /* Slice 5: the native vi conformance gate. /bin/tvitest drives
+     * /bin/tvi over a real pty and compares the RESULTING FILE BYTES --
+     * an editor's contract is what it leaves on disk, not that it exited
+     * 0. It needs a pty and a writable /tmp, so it runs here rather than
+     * as a PKGPROBE one-liner. */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=vt100", (char *)"LANG=C", 0 };
+        char *argv[] = { (char *)"tvitest", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/tvitest", .name = "tvitest",
+            .argc = 1, .argv = argv, .envc = 4, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) kprintf("[TVI] SPAWN FAILED\n");
+        else kprintf("[TVI] harness exit=%d\n", proc_wait(pid));
+    }
+#endif
+
+#ifdef FATDISK_SELFTEST
+    /* 2026-08-25: format an attached BLANK scratch disk as FAT32 and leave
+     * real content on it, so an implementation that is not ours can be
+     * asked whether the volume is actually readable. Refuses any disk that
+     * is not already blank -- see fsmatrix_format_scratch(). */
+    {
+        extern void fsmatrix_format_scratch(void);
+        fsmatrix_format_scratch();
+    }
+#endif
+
+#ifdef FSMATRIX_SELFTEST
+    /* 2026-08-25: the CRUD contract, asked of every filesystem driver
+     * rather than only the three that userspace happens to mount. Formats
+     * RAM-backed ext4 and FAT32 volumes and runs the same matrix over
+     * those, tmpfs and ramfs. See src/fsmatrix.c for why. */
+    {
+        extern void fsmatrix_selftest(void);
+        fsmatrix_selftest();
+    }
+#endif
+
+#ifdef SCHEDGUARD_SELFTEST
+    /* 2026-08-25: the do_switch context guard, against the open
+     * wake-after-death flake. The guard itself fires perhaps once in
+     * fifteen boots, so the predicate is asked directly -- including the
+     * two archived corpse shapes. */
+    {
+        extern int sched_guard_selftest(void);
+        (void)sched_guard_selftest();
+    }
+#endif
+
+#ifdef GUITEXT_SELFTEST
+    /* 2026-08-24: the fixed-cell text renderer, checked pixel by pixel
+     * against the font table. A terminal is a GUI window, so no userspace
+     * harness can see whether its columns line up -- but the property that
+     * broke (8 px per character, opaque background) is arithmetic. */
+    {
+        extern int gui_text_mono_selftest(void);
+        (void)gui_text_mono_selftest();
+    }
+#endif
+
+#ifdef FSPROBE_BOOT
+    /* 2026-08-24: the gate that every previous gate was missing.
+     *
+     * Everything spawned from this file runs as ROOT, so no harness in
+     * the tree had ever exercised a permission check -- and the EliteDesk
+     * boot logged in as `toby` (uid 1000), where lspci exited 1 on a tree
+     * PKGPROBE had just called green. /bin/fsprobe runs its checks twice:
+     * once here as root, once in a child that setuid(1000)s first. It
+     * also asserts the filesystem CRUD contract per mount, because "the
+     * root filesystem is writable" had never been stated as a value
+     * anywhere -- only as an absence of complaints. */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=vt100", (char *)"LANG=C", 0 };
+        char *argv[] = { (char *)"fsprobe", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/fsprobe", .name = "fsprobe",
+            .argc = 1, .argv = argv, .envc = 4, .envp = envp,
+        };
+        int pid = proc_spawn(&spec);
+        if (pid < 0) kprintf("[FSPROBE] SPAWN FAILED\n");
+        else kprintf("[FSPROBE] harness exit=%d\n", proc_wait(pid));
+    }
+#endif
+
+#ifdef CPUTELEM_SELFTEST
+    /* Slices 3+4: the MSR decoders, tested against known bit patterns.
+     * This exists because QEMU advertises neither a thermal sensor nor
+     * EIST, so a QEMU run can only ever watch those modules DECLINE to
+     * publish -- which leaves the arithmetic (a TjMax subtraction and two
+     * ratio fields) completely unexercised on the only machine we can
+     * boot on demand. Nothing here is published; these are inputs to
+     * pure functions with spec-defined outputs. */
+    {
+        extern int cputherm_selftest(void);
+        extern int cpufreq_msr_selftest(void);
+        int bad = cputherm_selftest() + cpufreq_msr_selftest();
+        kprintf("[CPUTELEM] VERDICT: %s\n", bad == 0 ? "PASS" : "FAIL");
+    }
+#endif
+
+#ifdef PKGPROBE_BOOT
+    /* ==================================================================
+     * 2026-08-23: do the newly-exposed Linux commands actually RUN?
+     *
+     * Two separate claims, and a green here needs both:
+     *   1. the busybox applets are reachable BY NAME on PATH (the initrd
+     *      hard-links them), not just as `busybox <applet>`, and
+     *   2. the ones that read /sys have something to read -- lspci was
+     *      the motivating case, and it printed nothing for as long as
+     *      /sys/bus/pci existed but was empty.
+     * ================================================================== */
+    {
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/",
+                         (char *)"TERM=linux", (char *)"LANG=C", 0 };
+        struct { const char *what; const char *cmd; } probes[] = {
+            { "applet by name",       "which vi nproc lspci" },
+            { "sysfs pci tree",       "ls /sys/bus/pci/devices" },
+            { "read one vendor file", "cat /sys/bus/pci/devices/0000:00:00.0/vendor" },
+            { "lscpu",                "lscpu" },
+            { "editors present",      "which vi nano less" },
+            { "lspci raw",            "lspci; echo lspci-rc=$?" },
+            { "lspci -m",             "lspci -m; echo rc=$?" },
+            { "free/uptime/nproc",    "nproc; uptime; free" },
+            { "seq + hexdump",        "seq 3 | hexdump -C" },
+            /* 2026-08-24 -- slice 1 of the native-userland arc: does the
+             * USB tree carry real values, and does lsusb read them? The
+             * probe prints the FILES as well as the tool, so a wrong
+             * number is attributable to the kernel or the tool and not
+             * to "something went wrong somewhere". */
+            { "which lsusb",          "which lsusb" },
+            { "sysfs usb tree",       "ls /sys/bus/usb/devices" },
+            { "usb attrs (raw)",      "for d in /sys/bus/usb/devices/*/; do "
+                                      "echo \"== $d\"; cat $d/uevent; "
+                                      "for a in idVendor idProduct speed "
+                                      "version busnum devnum manufacturer "
+                                      "product serial; do "
+                                      "[ -f $d$a ] && echo \"$a=$(cat $d$a)\"; "
+                                      "done; done" },
+            { "lsusb",                "lsusb; echo lsusb-rc=$?" },
+            { "lsusb -t",             "lsusb -t; echo rc=$?" },
+            { "lsusb -v",             "lsusb -v; echo rc=$?" },
+            /* Slice 2: SMBIOS. Print the FILES and the tool separately so
+             * a wrong value is attributable to the kernel or the decoder,
+             * and dump /sys/class/dmi/id so a missing attribute (firmware
+             * said nothing) is visible as absent rather than as blank. */
+            { "dmi tables present",   "ls -l /sys/firmware/dmi/tables" },
+            { "dmi id attributes",    "for f in /sys/class/dmi/id/*; do "
+                                      "echo \"$(basename $f)=$(cat $f)\"; done" },
+            { "dmidecode -t 0",       "dmidecode -t 0; echo rc=$?" },
+            { "dmidecode -t 1 -t 2",  "dmidecode -t 1 -t 2; echo rc=$?" },
+            { "dmidecode -t 17",      "dmidecode -t 17; echo rc=$?" },
+            { "dmidecode -s",         "dmidecode -s system-manufacturer; "
+                                      "dmidecode -s bios-version; "
+                                      "echo rc=$?" },
+            /* Labelled, and whitespace-stripped: `wc -l` pads its output,
+             * so a bare count cannot be asserted with an anchored regex
+             * and an unanchored one matches every other number in the
+             * boot log. */
+            { "dmidecode full",       "echo \"dmidecode-lines=$(dmidecode "
+                                      "| wc -l | tr -d ' ')\"" },
+            /* Slices 3+4. On QEMU the EXPECTED result is that neither
+             * tree exists: no thermal sensor and no EIST are advertised,
+             * so both modules decline to publish. These probes therefore
+             * gate the HONEST-ABSENCE path -- the tools must say so
+             * plainly and exit non-zero, not print a nominal number.
+             * The positive path is covered by CPUTELEM_SELFTEST, which
+             * tests the decoders against known MSR bit patterns. */
+            { "hwmon tree",           "ls /sys/class/hwmon 2>&1; "
+                                      "echo hwmon-rc=$?" },
+            { "cpufreq tree",         "ls /sys/devices/system/cpu/cpu0 2>&1; "
+                                      "echo cpufreq-rc=$?" },
+            { "sensors",              "sensors; echo sensors-rc=$?" },
+            { "cpupower",             "cpupower frequency-info; "
+                                      "echo cpupower-rc=$?" },
+        };
+        kprintf("[PKGPROBE] ==== newly exposed Linux commands ====\n");
+        int n = (int)(sizeof(probes) / sizeof(probes[0]));
+        for (int i = 0; i < n; i++) {
+            kprintf("[PKGPROBE] --- %s: %s\n", probes[i].what, probes[i].cmd);
+            char *argv[] = { (char *)"sh", (char *)"-c",
+                             (char *)probes[i].cmd, 0 };
+            struct proc_spec spec = {
+                .path = "/bin/busybox", .name = "sh",
+                .argc = 3, .argv = argv, .envc = 4, .envp = envp,
+            };
+            int pid = proc_spawn(&spec);
+            if (pid < 0) { kprintf("[PKGPROBE]   SPAWN FAILED\n"); continue; }
+            int rc = proc_wait(pid);
+            kprintf("[PKGPROBE]   exit=%d\n", rc);
+        }
+        kprintf("[PKGPROBE] ==== done ====\n");
+    }
+#endif
+
 #ifdef LXPOSIX_BOOT
     /* ==================================================================
      * Linux slice 4: THE STANDING POSIX ACCEPTANCE GATE.
@@ -7582,6 +8087,131 @@ void _start(void) {
             { "/bin/linux-suid",   "linux-suid",   0, 63, "setuid-on-exec" },
             { "/bin/linux-timers", "linux-timers", 0, 63, "timerfd/signalfd/alarm" },
             { "/bin/linux-mount",  "linux-mount",  0, 63, "mount/umount2/chroot" },
+            /* 2026-08-22: close-on-exec exists now. bit3 is the one that
+             * carries it -- a marked fd must be CLOSED in an exec'd child
+             * while an unmarked one survives, asserted from INSIDE the
+             * child. A flag that stores and reads back but never acts is
+             * exactly the accept-and-ignore lie this gate exists to catch. */
+            { "/bin/linux-cloexec", "linux-cloexec", 0, 63,
+              "close-on-exec + close_range" },
+            /* 2026-08-22: record locks exist now (src/flock.c). Every
+             * assertion is made from a SECOND process -- locks only mean
+             * anything between processes -- and every refusal asserts its
+             * errno, because "the lock failed" is also what a no-op or an
+             * EBADF looks like. */
+            { "/bin/linux-flock", "linux-flock", 0, 63,
+              "fcntl record locks + flock(2)" },
+            /* 2026-08-22: the peer-less half of the socket-semantics work
+             * (AF_UNIX half-close, the owed pre-data EAGAIN test, connect
+             * classification against the SLIRP host). The peer-REQUIRED
+             * half -- blocking accept past 3 s, FIN on the wire -- lives in
+             * logs/lxsock.sh, because this stack has no loopback and a test
+             * with no peer cannot prove those. */
+            { "/bin/linux-sock", "linux-sock", 0, 255,
+              "socket semantics (peer-less half)" },
+            /* 2026-08-22: thread-group semantics. Real glibc NPTL doing
+             * what it could structurally never do before: pthread_cancel
+             * (SIGCANCEL=32 needed SIG_MAX 64), threaded setuid (SIGSETXID
+             * =33 broadcast), a handler installed after pthread_create
+             * firing in a sibling (shared sighand), a worker's SIGSEGV
+             * killing the whole group, and getpid()==tgid in threads. */
+            { "/bin/linux-nptl", "linux-nptl", 0, 63,
+              "thread-group semantics (NPTL)" },
+            /* 2026-08-22: inotify is real (fd, watches, VFS-emitted events
+             * with names + rename cookies) and epoll stops lying (cap 512,
+             * ONESHOT disarms, ET never loses a wakeup). */
+            { "/bin/linux-watch", "linux-watch", 0, 63,
+              "inotify events + epoll honesty" },
+            /* 2026-08-22 syscall-tail batch: real auxv creds (AT_SECURE
+             * included), sendmmsg/recvmmsg, authoritative io_uring/bpf
+             * refusals (the census-contract comments now tell the truth),
+             * sigqueue, restart_syscall. */
+            { "/bin/linux-misc", "linux-misc", 0, 63,
+              "auxv creds + syscall tail" },
+            /* 2026-08-22 procfs+dev fidelity: /proc/self names the reader's
+             * pid, /proc/self/mounts exists, raw stat(2) sees /dev nodes,
+             * /dev is listable, /dev/shm is a real tmpfs (glibc shm_open
+             * works), and cmdline is the real NUL-separated argv. */
+            { "/bin/linux-procdev", "linux-procdev", 0, 63,
+              "/proc + /dev fidelity" },
+            /* 2026-08-22: the loopback datapath exists. Inline delivery
+             * (the veth model), RST for closed ports, and the full ICMP
+             * chain -- a single-threaded process is both ends of its own
+             * TCP connection in bit1. */
+            { "/bin/linux-loop", "linux-loop", 0, 63,
+              "loopback datapath (127/8 + own IP)" },
+            /* 2026-08-22: /proc deep fidelity -- the REAL maps table,
+             * /proc/sys, /proc/net (a listener we open must appear), and
+             * status fields including a VmRSS that MOVES. */
+            { "/bin/linux-proc2", "linux-proc2", 0, 63,
+              "/proc maps + sys + net + status" },
+            /* 2026-08-22: timer_create family (librt lands somewhere now)
+             * + sendfile/copy_file_range/splice through one kernel copy
+             * loop, each byte-exact by assertion. */
+            { "/bin/linux-io", "linux-io", 0, 63,
+              "POSIX timers + kernel copy family" },
+            /* Phase E: the xattr family (user.*), /proc/self/fd links that
+             * answer real paths, mknod(S_IFREG), and glibc fexecve through
+             * its /proc/self/fd execve fallback. */
+            { "/bin/linux-xattr", "linux-xattr", 0, 63,
+              "xattr + fd identity + mknod + fexecve" },
+            /* Phase F: exec kills sibling threads (de_thread), PROCESS_
+             * SHARED futex keying (phys addr for MAP_SHARED words), and
+             * the robust-mutex death protocol (set_robust_list was a
+             * silent no-op; EOWNERDEAD never happened). */
+            { "/bin/linux-thread2", "linux-thread2", 0, 63,
+              "exec de_thread + pshared futex + robust mutexes" },
+            /* Phase G: the root accepts new files/dirs (Linux initramfs
+             * is writable; ours wasn't), and tobyfs hard links -- the
+             * on-disk nlink existed since the format was born, unread. */
+            { "/bin/linux-fs2", "linux-fs2", 0, 63,
+              "writable root + hard links" },
+            /* Phase G: /etc/ld.so.cache generated at initrd build (real
+             * glibc-ld.so.cache1.1 format) -- a dynamic glibc PIE starts
+             * with NO LD_LIBRARY_PATH for the first time. */
+            { "/bin/linux-ldso", "linux-ldso", 0, 3,
+              "ld.so.cache ends the LD_LIBRARY_PATH era" },
+            /* Phase H: SysV sem + msg (shm existed; these were census
+             * gaps). SEM_UNDO asserted by dying-holder release. */
+            { "/bin/linux-sysv", "linux-sysv", 0, 63,
+              "SysV semaphores + message queues" },
+            /* Phase H: statfs stops fabricating -- per-fs real numbers
+             * (tobyfs bitmaps, tmpfs budget, ramfs image), and they MOVE
+             * when bytes are written. */
+            { "/bin/linux-stat", "linux-stat", 0, 15,
+              "statfs tells the truth" },
+            /* 2026-08-23: TRUE vfork -- the child runs on the PARENT's
+             * stack while the parent is suspended (the private-stack shim
+             * outlived the racy-suspension bug it worked around). */
+            { "/bin/linux-vfork", "linux-vfork", 0, 63,
+              "true vfork: shared stack + suspended parent" },
+            /* 2026-08-23: the vDSO. clock_gettime/gettimeofday/time stop
+             * syscalling -- proven by the kernel's own syscall counter. */
+            { "/bin/linux-vdso", "linux-vdso", 0, 63,
+              "vDSO: the userspace clock is real" },
+            /* 2026-08-23: the job-control arc's open scheduler item --
+             * a SIGCONT'd proc must run promptly even with spinners on
+             * every core (measured 1.4 s once; want two ticks). */
+            { "/bin/linux-cont", "linux-cont", 0, 3,
+              "woken-from-stop resume latency" },
+            /* 2026-08-23: AF_INET6 UDP + ::1 loopback (IPv6 slice 1).
+             * The v6 substrate existed for months with no socket layer
+             * to reach it; this proves echo/dual-stack/getsockname by
+             * value. */
+            { "/bin/linux-ipv6", "linux-ipv6", 0, 63,
+              "AF_INET6 UDP: ::1 echo + dual-stack" },
+            /* 2026-08-23: TCP over IPv6 (IPv6 slice 2). Same engine as
+             * v4; proves the family-aware prologue + dual-stack listen/
+             * connect + endpoint reporting + 48 KiB stream integrity. */
+            { "/bin/linux-tcp6", "linux-tcp6", 0, 63,
+              "TCP6: ::1 streams + dual-stack listen" },
+            /* 2026-08-23: IPv6 vs a REAL peer (slice 3) -- SLIRP's RA ->
+             * SLAAC, cold-neighbor NDP, DNS relay round trip, off-link
+             * routing, wire RST. Chasing this found the multicast-deaf
+             * e1000 filter and the hop-limit-64 NDP bug. bit2 needs the
+             * host's resolver to answer (LAN router). */
+            { "/bin/linux-v6host", "linux-v6host", 0, 63,
+              "v6 wire: SLAAC + DNS relay + RST" },
             /* A REAL mount round-trip, not just the failure paths the C test
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
@@ -8586,6 +9216,107 @@ void _start(void) {
             kprintf("[REALTOOL] VERDICT: %s pass=%d/%d (UNMODIFIED GNU binutils "
                     "readelf: glibc ld.so + getopt + file mmap + ELF parse)\n",
                     (tpass == trun && trun > 0) ? "PASS" : "FAIL", tpass, trun);
+    }
+#endif
+
+#ifdef SHPARITY_BOOT
+    /* The bash-parity gate. tobyOS's shell is meant to be a SUPERSET of bash
+     * -- every bash script runs unchanged and produces the same bytes -- and
+     * this is what turns that from a claim into a measured property.
+     *
+     * The oracle is not a spec we interpret: it is the UNMODIFIED GNU bash 5.2
+     * already in the initrd (see REALBASH_BOOT below). /bin/shparity runs each
+     * /etc/shparity/*.sh case under both bash and /bin/tsh and diffs stdout +
+     * exit status. All the interesting logic is in userspace where it can be
+     * extended without a kernel rebuild; the kernel's whole job is to spawn it
+     * and let its verdict reach the serial log.
+     *
+     * Needs a writable /data (tobyfs) for scratch -- the root ramfs cannot
+     * create files. shparity reports SKIP with the reason if it is missing,
+     * so a QEMU run without a disk is loud rather than falsely green. */
+    {
+        char *argv[] = { (char *)"shparity", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/shparity", .name = "shparity",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] SHPARITY: differential bash-parity gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[SHPARITY] VERDICT: SKIP reason=no-binary "
+                    "(/bin/shparity not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] SHPARITY: gate (pid=%d) exit=%d\n", pid, rc);
+        }
+    }
+#endif
+
+#ifdef TTYPARITY_BOOT
+    /* The INTERACTIVE bash-parity gate. shparity above measures the script
+     * surface; this one runs both shells on a real pseudoterminal pair and
+     * compares the terminal byte streams -- prompts, PS2 continuation,
+     * ignoreeof, interactive option defaults. The runner validates ITSELF
+     * first (bash vs bash must produce identical transcripts) and aborts
+     * loudly if the pacing protocol is broken. */
+    {
+        char *argv[] = { (char *)"ttyparity", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/ttyparity", .name = "ttyparity",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] TTYPARITY: interactive bash-parity gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[TTYPARITY] VERDICT: SKIP reason=no-binary "
+                    "(/bin/ttyparity not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] TTYPARITY: gate (pid=%d) exit=%d\n", pid, rc);
+        }
+    }
+#endif
+
+#ifdef OILSPEC_BOOT
+    /* The THIRD-PARTY shell conformance gate.
+     *
+     * SHPARITY_BOOT above runs 54 cases we wrote. This runs ~2,776 written by
+     * the Oils project, for their own shell, to document where bash/dash/mksh/
+     * ash/zsh disagree -- a corpus nobody here chose, over corners nobody here
+     * thought of. It is the difference between "passes our tests" and "passes
+     * someone else's".
+     *
+     * Same oracle as shparity: the unmodified GNU bash 5.2 in the initrd, not
+     * a specification we interpret. /bin/oilspec runs each /etc/oilspec/*.sh
+     * case under bash and /bin/tsh and diffs stdout + exit status.
+     *
+     * To restrict the run to one band of case ids WITH full per-case diffs,
+     * put "LO-HI" in /etc/oilspec/FILTER (logs/oilspec.sh writes it). That
+     * used to be a -DOILSPEC_FILTER string macro, but the quotes did not
+     * survive make -> sh -> clang: the macro expanded to the integer
+     * expression 0001-0200, argv[1] became (char *)1 - 200, and the gate
+     * faulted before printing anything. A file has no quoting layers.
+     *
+     * Needs a writable /tmp or /data for scratch; /bin/oilspec reports SKIP
+     * with the reason if neither is there, rather than inventing a pass. */
+    {
+        char *argv[] = { (char *)"oilspec", 0 };
+        char *envp[] = { (char *)"PATH=/bin", (char *)"HOME=/", 0 };
+        struct proc_spec spec = {
+            .path = "/bin/oilspec", .name = "oilspec",
+            .argc = 1, .argv = argv, .envc = 2, .envp = envp,
+        };
+        kprintf("[boot] OILSPEC: third-party shell conformance gate\n");
+        int pid = proc_spawn(&spec);
+        if (pid < 0) {
+            kprintf("[OILSPEC] VERDICT: SKIP reason=no-binary "
+                    "(/bin/oilspec not staged)\n");
+        } else {
+            int rc = proc_wait(pid);
+            kprintf("[boot] OILSPEC: gate (pid=%d) exit=%d\n", pid, rc);
+        }
     }
 #endif
 
@@ -10525,6 +11256,19 @@ void _start(void) {
         kprintf("[TKAPP] synthetic shell click at (%d,%d)\n",
                 TKAPP_CLICK_X, TKAPP_CLICK_Y);
         gui_post_shell_click(TKAPP_CLICK_X, TKAPP_CLICK_Y);
+#endif
+#ifdef TKAPP_RCLICK_X
+        /* Right-click a point INSIDE the app window (client coordinates),
+         * to open a context menu for a screenshot. gui_post_shell_click
+         * above drives the desktop shell; this drives the focused window's
+         * own event ring, which is where a TobyTK menu comes from. Build:
+         *   -DTKAPP_BOOT -DTKAPP_FILES -DTKAPP_RCLICK_X=40 -DTKAPP_RCLICK_Y=289 */
+        TKA_PUMP(6000);                        /* let the app paint first */
+        kprintf("[TKAPP] synthetic RIGHT-click in-window at (%d,%d)\n",
+                TKAPP_RCLICK_X, TKAPP_RCLICK_Y);
+        gui_post_mouse(GUI_EV_MOUSE_DOWN, TKAPP_RCLICK_X, TKAPP_RCLICK_Y, 0x02);
+        gui_post_mouse(GUI_EV_MOUSE_UP,   TKAPP_RCLICK_X, TKAPP_RCLICK_Y, 0x02);
+        TKA_PUMP(4000);                        /* let the menu open + paint */
 #endif
 #if defined(TKAPP_CHROMEWIN) && defined(CHROMIUM_BOOT)
         /* Slice 39: chrome under the FULL desktop is ~5x slower than the

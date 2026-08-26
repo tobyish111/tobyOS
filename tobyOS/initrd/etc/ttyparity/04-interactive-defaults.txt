@@ -1,0 +1,6 @@
+# Interactive option defaults: bash turns monitor ON at a terminal, and
+# expands aliases interactively. Both greps pin a single table line.
+set -o | grep monitor
+alias hi='echo aliased'
+hi
+exit 3

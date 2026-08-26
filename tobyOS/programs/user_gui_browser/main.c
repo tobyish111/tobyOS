@@ -51,13 +51,17 @@ struct http_fetch {
     uint8_t       reserved[64];
 };
 
+/* Local mirror of the kernel struct gui_event -- keep in step with
+ * include/tobyos/gui.h AND toby/tk.h (the wheel field replaced one of
+ * the two old pad bytes; size is unchanged). */
 struct gui_event {
     int     type;
     int     x;
     int     y;
     uint8_t button;
     uint8_t key;
-    uint8_t _pad[2];
+    signed char wheel;   /* int8_t is not in this program's type set */
+    uint8_t _pad[1];
 };
 #define GUI_EV_MOUSE_MOVE 1
 #define GUI_EV_MOUSE_DOWN 2
@@ -114,13 +118,27 @@ static inline void sys_exit(int code) {
         : "rcx", "r11", "memory");
     for (;;) { }
 }
+/* 2026-08-24: this file draws a CHARACTER GRID at CELL_W=8 columns, and
+ * tk_draw_text_mono() finally delivers one -- it used to route to the
+ * proportional TrueType renderer, so the columns never lined up and the
+ * opaque background was dropped. The fixed cell is 8x16, taller than this
+ * file's 12px row pitch, so go through tk_draw_text_cell(): the glyph is
+ * centred in the pitch and clipped, and the background covers exactly that
+ * many rows instead of bleeding into the line below.
+ *
+ * The pitch is spelled here rather than as CELL_H because the drawing
+ * forwarders below sit ~400 lines ABOVE that #define; the static assert
+ * keeps the two from drifting apart. */
+#define MONO_PITCH 12
+#define TK_MONO(w,x,y,s,fg,bg) tk_draw_text_cell((w),(x),(y),(s),(fg),(bg),MONO_PITCH)
+
 /* Drawing now forwards to TobyTK. The content grid is monospace (CELL_W=8), so
  * text uses tk_draw_text_mono (column-aligned, opaque bg). `fd` is ignored. */
 static inline int sys_gui_fill(int fd, int x, int y, int w, int h, uint32_t color) {
     (void)fd; tk_draw_fill(&win, x, y, w, h, color); return 0;
 }
 static inline int sys_gui_text(int fd, int x, int y, const char *s, uint32_t fg, uint32_t bg) {
-    (void)fd; tk_draw_text_mono(&win, x, y, s, fg, bg); return 0;
+    (void)fd; TK_MONO(&win, x, y, s, fg, bg); return 0;
 }
 static inline long sys_http_fetch(struct http_fetch *req) {
     long r;
@@ -16967,6 +16985,14 @@ static void on_event(struct tk_window *w, struct tk_widget *c, struct tk_event *
     (void)w; (void)c;
     if (ev->type == TK_EV_MOUSE_DOWN) handle_mouse_down(0, ev->x, ev->y);
     else if (ev->type == TK_EV_MOUSE_MOVE) handle_mouse_move(0, ev->x, ev->y);
+    else if (ev->type == TK_EV_WHEEL && ev->wheel) {
+        /* Same travel per notch as j/k, times the standard 3 lines --
+         * and through the same clamp, so the document end still stops
+         * dead rather than scrolling into blank space. */
+        int px = ev->wheel * TK_WHEEL_LINES * TK_WHEEL_STEP_PX;
+        if (px > 0) scroll_up(px); else scroll_down(-px);
+        redraw(0);
+    }
 }
 
 static void on_key(struct tk_window *w, struct tk_event *ev) {
