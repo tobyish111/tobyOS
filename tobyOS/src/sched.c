@@ -1466,6 +1466,13 @@ volatile uint64_t g_cpu_mono_ns[MAX_CPUS];
 #endif
 
 void sched_tick(struct regs *r) {
+    /* The watchdog used to be driven ONLY from the PIT IRQ -- the very
+     * interrupt this scheduler stops depending on once the LAPIC timer is
+     * live. That made it inert in a normal boot, which is why a real freeze
+     * on hardware produced no diagnostic at all. Drive it from the timer
+     * that actually keeps ticking; wdog_check() rate-limits itself to 1 Hz,
+     * so a 100 Hz caller costs nothing. */
+    wdog_check();
     struct percpu *me = smp_this_cpu();
     if (me) {
 #ifdef CHROMIUM_BOOT

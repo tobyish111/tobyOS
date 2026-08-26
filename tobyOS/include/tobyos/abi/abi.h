@@ -1177,6 +1177,7 @@ _Static_assert(sizeof(struct abi_crash_header) ==
 #define ABI_WDOG_KIND_KERNEL_HANG    2u  /* PIT advanced but sched did not */
 #define ABI_WDOG_KIND_USER_HANG      3u  /* userland process not yielding */
 #define ABI_WDOG_KIND_MANUAL         4u  /* triggered by wdogtest --hang */
+#define ABI_WDOG_KIND_IDLE_STALL     5u  /* pid 0 / idle loop wedged   */
 
 struct abi_wdog_status {
     uint32_t enabled;                    /* 0/1                        */

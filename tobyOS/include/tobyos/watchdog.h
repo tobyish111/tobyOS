@@ -47,6 +47,10 @@ void wdog_set_timeout_ms(uint32_t timeout_ms);
 void wdog_kick_kernel(void);
 void wdog_kick_sched(void);
 void wdog_kick_proc(int pid);
+/* 4. wdog_kick_idle() -- bumped by pid 0's idle loop. The heartbeat was
+ *    already the signal that pid 0 is alive; this is what finally reads
+ *    it. Checked from the PIT IRQ, which still runs when pid 0 does not. */
+void wdog_kick_idle(void);
 
 /* Periodic check: scan counters, fire bite events as needed. Safe to
  * call from PIT IRQ. Throttles itself to ~1 Hz internally. */

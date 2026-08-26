@@ -27,6 +27,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/slog.h>
 #include <tobyos/pit.h>
+#include <tobyos/perf.h>
 #include <tobyos/cpu.h>
 #include <tobyos/klibc.h>
 #include <tobyos/spinlock.h>
@@ -67,15 +68,27 @@ static struct {
     char       last_reason[ABI_WDOG_REASON_MAX];
 } g_evt;
 
+/* THE WATCHDOG'S CLOCK MUST NOT BE THE THING THAT DIES.
+ *
+ * This used to be (pit_ticks() * 1000) / pit_hz(). But pit_sleep_ms()'s own
+ * comment says it plainly: "the scheduler moves the tick to the LAPIC timer
+ * early in boot, and on headless QEMU/TCG (and defensively on real HW) the
+ * IOAPIC->LAPIC PIT edge can be lost". So g_ticks stops advancing in a
+ * normal boot -- and a watchdog whose clock has frozen never decides that
+ * anything is late. Measured: two runs of the SAME binary, one where the
+ * PIT reached 30 s in 30 s of wall time and one where it had not reached it
+ * after 178 s.
+ *
+ * perf_now_ns() is TSC-based and keeps running regardless; it is what the
+ * serial heartbeat has always used. */
 static uint64_t now_ms(void) {
-    uint32_t hz = pit_hz();
-    if (hz == 0) return 0;
-    return (pit_ticks() * 1000ull) / hz;
+    return perf_now_ns() / 1000000ull;
 }
 
 static const char *kind_name(uint32_t kind) {
     switch (kind) {
     case ABI_WDOG_KIND_SCHED_STALL: return "sched_stall";
+    case ABI_WDOG_KIND_IDLE_STALL:  return "idle_stall";
     case ABI_WDOG_KIND_KERNEL_HANG: return "kernel_hang";
     case ABI_WDOG_KIND_USER_HANG:   return "user_hang";
     case ABI_WDOG_KIND_MANUAL:      return "manual";
@@ -168,6 +181,61 @@ void wdog_record_event(uint32_t kind, int pid, const char *reason) {
             pid, reason ? reason : "");
 }
 
+
+/* ---- pid 0 / idle-loop liveness -------------------------------------
+ *
+ * The serial heartbeat's own comment says "if pid 0 ever wedges, the beat
+ * simply stops -- which is itself the signal". It was a signal nothing
+ * consumed: on 2026-08-25 an EliteDesk froze at idle, the beat stopped,
+ * and not one line came out. The sched-stall test above could not see it
+ * because the OTHER CPUs kept scheduling happily -- a global stall is a
+ * different thing from pid 0 being stuck, and only the global one was
+ * being checked.
+ *
+ * This check runs from the PIT IRQ, which keeps firing while pid 0 is
+ * wedged, so it can still speak when the machine otherwise cannot. It
+ * reports the BKL owner and ticket numbers because "pid 0 blocked on a
+ * lock somebody else holds" is the top hypothesis for that freeze, and
+ * those three numbers distinguish it from every other cause.
+ */
+static volatile uint64_t g_idle_hb            = 0;
+static volatile uint64_t g_last_idle_kick_ms  = 0;
+static volatile bool     g_idle_bitten        = false;
+
+void wdog_kick_idle(void) {
+    g_idle_hb++;
+    g_last_idle_kick_ms = now_ms();
+    /* Recovered: arm the bite again so a LATER stall is reported too. */
+    g_idle_bitten = false;
+}
+
+/* Owned by sched.c, but ONLY compiled under SMP_DIAG -- referencing it
+ * unconditionally is a link error, and moving it out of that guard would
+ * put a store on the BKL acquire path for the sake of a diagnostic. So:
+ * report it when the build has it, say so plainly when it does not. */
+#ifdef SMP_DIAG
+extern volatile int g_bkl_owner;
+#define WDOG_BKL_OWNER  (g_bkl_owner)
+#else
+#define WDOG_BKL_OWNER  (-2)        /* -2 == not built with SMP_DIAG */
+#endif
+
+static void wdog_check_idle(uint64_t now) {
+    if (g_idle_hb == 0) return;            /* idle loop not started yet */
+    if (g_idle_bitten) return;             /* one bite per stall episode */
+    uint64_t since = now - g_last_idle_kick_ms;
+    if (since <= g_timeout_ms) return;
+
+    g_idle_bitten = true;
+    char reason[ABI_WDOG_REASON_MAX];
+    ksnprintf(reason, sizeof reason,
+              "pid 0 idle loop stalled %lums (beats=%lu, bkl_owner=%d "
+              "[-1 free, -2 needs SMP_DIAG])",
+              (unsigned long)since, (unsigned long)g_idle_hb,
+              WDOG_BKL_OWNER);
+    wdog_record_event(ABI_WDOG_KIND_IDLE_STALL, 0, reason);
+}
+
 void wdog_check(void) {
     if (!g_ready) return;
     uint64_t now = now_ms();
@@ -184,6 +252,11 @@ void wdog_check(void) {
         wdog_record_event(ABI_WDOG_KIND_SCHED_STALL, -1,
                           "scheduler heartbeat stalled");
     }
+    /* pid 0 liveness -- see wdog_check_idle(). Separate from the sched
+     * test above: the other CPUs can schedule normally while pid 0 is
+     * wedged, and that is exactly the case that used to go unreported. */
+    wdog_check_idle(now);
+
     /* Kernel-tick test: PIT itself should advance. Since wdog_check
      * runs from PIT, this is mostly a sanity assertion -- if PIT
      * stopped firing, we wouldn't be here in the first place. We do

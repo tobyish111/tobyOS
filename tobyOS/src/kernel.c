@@ -885,6 +885,32 @@ static __attribute__((noreturn)) void idle_loop(void) {
 
     for (;;) {
         uint64_t frames_before = gfx_frame_count();
+        /* Tell the watchdog pid 0 is still going round. Unconditional and
+         * ahead of everything else in the iteration: the serial heartbeat
+         * below can be compiled out, and the whole point of this is to
+         * still be true when the machine has otherwise gone quiet. */
+        wdog_kick_idle();
+#ifdef WDOG_IDLE_STALL_TEST
+        /* Prove the idle watchdog BITES. A detector that never fires is
+         * worse than none -- it is silence you trust. This genuinely wedges
+         * pid 0 (interrupts still on, BKL not held, so the PIT keeps firing
+         * and wdog_check still runs), which is the real shape of the freeze
+         * this was written for, not a mocked counter. */
+        {
+            /* perf_now_ns(), NOT pit_ticks(): the first version of this hook
+             * used the PIT and never fired, because the PIT is exactly the
+             * dead clock this whole change is about. The test cannot share
+             * the defect it is testing for. */
+            static bool wd_done = false;
+            if (!wd_done && perf_now_ns() > 30000000000ull) {
+                wd_done = true;
+                kprintf("[WDIDLE] wedging pid 0 for 15s without kicking\n");
+                uint64_t end = perf_now_ns() + 15000000000ull;
+                while (perf_now_ns() < end) __asm__ volatile("pause");
+                kprintf("[WDIDLE] pid 0 released -- one BITE expected above\n");
+            }
+        }
+#endif
 #ifndef NO_SERIAL_HEARTBEAT
         /* Serial-only liveness beat, emitted at the TOP of the loop --
          * before the GUI/service phases -- so the last beat pinpoints
