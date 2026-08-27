@@ -393,6 +393,12 @@ static void  sh_array_unset(const char *name);
 static void  sh_array_unset_idx(struct sh_array *a, long idx);
 static int   sh_array_set(const char *name, long idx, const char *val);
 static const char *sh_array_get(const char *name, long idx);
+static bool  sh_array_is_assoc(const char *name);
+static int   sh_array_make_assoc(const char *name);
+static int   sh_array_set_key(const char *name, const char *key,
+                              const char *val);
+static const char *sh_array_get_key(const char *name, const char *key);
+static void  sh_array_unset_key(struct sh_array *a, const char *key);
 static long  sh_array_max_idx(const struct sh_array *a);
 static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
                                    const char *name, bool star,
@@ -981,6 +987,38 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         }
         elem[n] = '\0';
         if (n == 0) continue;      /* blank line between elements */
+        /* AN ELEMENT MAY NAME ITS OWN SUBSCRIPT: `([k1]=v1 [k2]=v2)` for an
+         * associative array, and `a=([3]=x [7]=y)` for an indexed one -- bash
+         * allows the form in both, and it is the ONLY way to write an
+         * associative literal.
+         *
+         * Without this the whole `[k1]=v1` text was stored as element 0's
+         * VALUE: the count came out right (2) while every lookup returned
+         * empty, which is the failure mode a count-only assertion misses. */
+        if (elem[0] == '[') {
+            char *rb = 0;
+            for (char *q = elem + 1; *q; q++) if (*q == ']') { rb = q; break; }
+            if (rb && rb[1] == '=') {
+                *rb = '\0';
+                const char *k = elem + 1, *v = rb + 2;
+                if (sh_array_is_assoc(name)) {
+                    if (sh_array_set_key(name, k, v) < 0) return -1;
+                } else {
+                    long ix = 0;
+                    if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
+                        if (sh_array_set(name, ix, v) < 0) return -1;
+                        next = ix + 1;   /* a later bare element follows on */
+                    }
+                }
+                continue;
+            }
+        }
+        if (sh_array_is_assoc(name)) {
+            /* A bare word in an associative literal has no key to go under.
+             * bash rejects it; storing it at a made-up index would be worse
+             * than saying nothing. */
+            continue;
+        }
         if (sh_array_set(name, next++, elem) < 0) return -1;
     }
     return 0;
@@ -1006,6 +1044,27 @@ static int sh_try_array_assignment(const char *kv) {
     char name[128], sub[128];
     if (sh_split_subscript(kv, keylen, name, sizeof name, sub, sizeof sub)) {
         if (!shell_name_is_valid(name, strlen(name))) return 0;
+        /* AN ASSOCIATIVE SUBSCRIPT IS A LITERAL STRING, not arithmetic.
+         * `m[alpha]=1` must not try to evaluate `alpha` as a variable, and
+         * `m[two words]` is one key. Only `declare -A` puts an array in this
+         * mode -- an ordinary array keeps arithmetic subscripts. */
+        {
+            /* Asked through an accessor, not a field read: this interception
+             * sits ABOVE the store's definition (env_set_kv is early), so the
+             * type is still incomplete here. */
+            if (sh_array_is_assoc(name)) {
+                if (append) {
+                    const char *old = sh_array_get_key(name, sub);
+                    char joined[512];
+                    size_t ol = old ? strlen(old) : 0, vl = strlen(val);
+                    if (ol + vl + 1 > sizeof joined) return 0;
+                    if (ol) memcpy(joined, old, ol);
+                    memcpy(joined + ol, val, vl + 1);
+                    return sh_array_set_key(name, sub, joined) == 0 ? 1 : 0;
+                }
+                return sh_array_set_key(name, sub, val) == 0 ? 1 : 0;
+            }
+        }
         long idx = 0;
         if (!sh_subscript_eval(sub, name, true, &idx)) return 0;
         if (append) {
@@ -2017,11 +2076,23 @@ static void cmd_unsetenv(int argc, char **argv) {
 #define SH_ARRAY_MAX    64      /* distinct arrays alive at once */
 #define SH_ARRELEM_MAX  512     /* elements in one array */
 
-struct sh_arr_elem { long idx; char *val; };
+/* ASSOCIATIVE ARRAYS share this store rather than getting their own.
+ *
+ * The sparse (subscript, value) shape an indexed array already needed IS an
+ * associative array -- the only difference is whether the subscript is an
+ * evaluated integer or a literal string. So an element carries both: `key`
+ * is NULL for an indexed array and `idx` is meaningless for an associative
+ * one. Two tables would have meant two copies of set/get/unset/join and a
+ * standing invitation for them to drift.
+ *
+ * Associative arrays are NOT sorted: bash gives no order guarantee for
+ * ${!m[@]}, and insertion order is the least surprising thing to report. */
+struct sh_arr_elem { long idx; char *key; char *val; };
 struct sh_array {
     char *name;
+    bool  assoc;                /* declare -A: subscripts are STRING keys */
     struct sh_arr_elem e[SH_ARRELEM_MAX];
-    int  n;                     /* used slots, kept sorted by idx */
+    int  n;                     /* used slots; sorted by idx when indexed */
 };
 static struct sh_array g_arrays[SH_ARRAY_MAX];
 static int g_narrays;
@@ -2054,6 +2125,7 @@ static void sh_array_unset_idx(struct sh_array *a, long idx) {
     if (!a) return;
     for (int i = 0; i < a->n; i++) {
         if (a->e[i].idx != idx) continue;
+        kfree(a->e[i].key);
         kfree(a->e[i].val);
         for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
         a->n--;
@@ -2064,7 +2136,7 @@ static void sh_array_unset_idx(struct sh_array *a, long idx) {
 static void sh_array_unset(const char *name) {
     struct sh_array *a = sh_array_find(name);
     if (!a) return;
-    for (int i = 0; i < a->n; i++) kfree(a->e[i].val);
+    for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
     a->n = 0;
     kfree(a->name);
     int slot = (int)(a - g_arrays);
@@ -2091,6 +2163,7 @@ static int sh_array_set(const char *name, long idx, const char *val) {
     int at = a->n;                                   /* keep sorted by idx */
     while (at > 0 && a->e[at - 1].idx > idx) { a->e[at] = a->e[at - 1]; at--; }
     a->e[at].idx = idx;
+    a->e[at].key = 0;          /* indexed element: no string key */
     a->e[at].val = copy;
     a->n++;
     return 0;
@@ -2131,6 +2204,69 @@ static bool sh_subscript_eval(const char *sub, const char *name,
     }
     *out = v;
     return true;
+}
+
+/* `declare -A m` must mark the array BEFORE any assignment is parsed --
+ * otherwise `declare -A m=([k]=v)` reads its literal with arithmetic
+ * subscripts and stores nothing useful. Creates the array if needed so that
+ * a bare `declare -A m` followed by `m[k]=v` works. */
+static int sh_array_make_assoc(const char *name) {
+    struct sh_array *a = sh_array_create(name);
+    if (!a) return -1;
+    a->assoc = true;
+    return 0;
+}
+
+static bool sh_array_is_assoc(const char *name) {
+    struct sh_array *a = sh_array_find(name);
+    return a && a->assoc;
+}
+
+static int sh_array_set_key(const char *name, const char *key,
+                            const char *val) {
+    struct sh_array *a = sh_array_create(name);
+    if (!a) return -1;
+    size_t vn = strlen(val) + 1;
+    char *copy = (char *)kmalloc(vn);
+    if (!copy) return -1;
+    memcpy(copy, val, vn);
+    for (int i = 0; i < a->n; i++) {
+        if (a->e[i].key && strcmp(a->e[i].key, key) == 0) {
+            kfree(a->e[i].val);
+            a->e[i].val = copy;
+            return 0;
+        }
+    }
+    if (a->n >= SH_ARRELEM_MAX) { kfree(copy); return -1; }
+    size_t kn = strlen(key) + 1;
+    char *kc = (char *)kmalloc(kn);
+    if (!kc) { kfree(copy); return -1; }
+    memcpy(kc, key, kn);
+    a->e[a->n].idx = 0;
+    a->e[a->n].key = kc;
+    a->e[a->n].val = copy;
+    a->n++;                       /* insertion order; see the note above */
+    return 0;
+}
+
+static const char *sh_array_get_key(const char *name, const char *key) {
+    struct sh_array *a = sh_array_find(name);
+    if (!a) return 0;
+    for (int i = 0; i < a->n; i++)
+        if (a->e[i].key && strcmp(a->e[i].key, key) == 0) return a->e[i].val;
+    return 0;
+}
+
+static void sh_array_unset_key(struct sh_array *a, const char *key) {
+    if (!a) return;
+    for (int i = 0; i < a->n; i++) {
+        if (!a->e[i].key || strcmp(a->e[i].key, key) != 0) continue;
+        kfree(a->e[i].key);
+        kfree(a->e[i].val);
+        for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
+        a->n--;
+        return;
+    }
 }
 
 static const char *sh_array_get(const char *name, long idx) {
@@ -2598,6 +2734,7 @@ static void cmd_declare(int argc, char **argv) {
     bool set_export = false, clear_export = false, set_readonly = false;
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
+    bool set_assoc = false;
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -2609,7 +2746,11 @@ static void cmd_declare(int argc, char **argv) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; break;
             case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
-            case 'A': case 'a': if (on) set_array = true; break;
+            case 'a': if (on) set_array = true; break;
+            /* -A is ASSOCIATIVE, and that is a different type from -a:
+             * its subscripts are literal strings rather than arithmetic.
+             * They shared a case while neither did anything. */
+            case 'A': if (on) { set_array = true; set_assoc = true; } break;
             case 'i': case 'u': case 'l':
             case 'F': case 'f': case 'p': case 'g': case 't': break;
             default:  known = false; break;
@@ -2643,6 +2784,15 @@ static void cmd_declare(int argc, char **argv) {
         }
         memcpy(name, argv[i], klen);
         name[klen] = '\0';
+
+        /* BEFORE the assignment: the literal parser asks whether the array is
+         * associative to decide if `[k1]=v1` is a string key or arithmetic.
+         * The other attributes go on afterwards (see the nameref note below),
+         * but this one has to lead. */
+        if (set_assoc && sh_array_make_assoc(name) < 0) {
+            shell_set_status(1);
+            continue;
+        }
 
         if (has_value) {
             if (env_set_kv(argv[i]) < 0) { shell_set_status(1); continue; }
@@ -2943,6 +3093,7 @@ static void cmd_unset(int argc, char **argv) {
             if (sh_split_subscript(argv[i], al, nm, sizeof nm,
                                    sub, sizeof sub)) {
                 struct sh_array *arr = sh_array_find(nm);
+                if (arr && arr->assoc) { sh_array_unset_key(arr, sub); continue; }
                 long ix = 0;
                 if (arr && sh_subscript_eval(sub, nm, false, &ix)) {
                     sh_array_unset_idx(arr, ix);
@@ -11361,8 +11512,14 @@ static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
             if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
                 return -1;
             if (indices) {
-                if (shell_append_uint(buf, pos, cap,
-                                      (unsigned long)a->e[i].idx) < 0) return -1;
+                /* For an associative array the "indices" ARE the keys. */
+                if (a->e[i].key) {
+                    if (shell_append_data_str(buf, pos, cap, a->e[i].key) < 0)
+                        return -1;
+                } else if (shell_append_uint(buf, pos, cap,
+                                      (unsigned long)a->e[i].idx) < 0) {
+                    return -1;
+                }
             } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
                 return -1;
             }
@@ -11372,8 +11529,13 @@ static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
     for (int i = 0; i < n; i++) {
         if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
         if (indices) {
-            if (shell_append_uint(buf, pos, cap,
-                                  (unsigned long)a->e[i].idx) < 0) return -1;
+            if (a->e[i].key) {
+                if (shell_append_data_str(buf, pos, cap, a->e[i].key) < 0)
+                    return -1;
+            } else if (shell_append_uint(buf, pos, cap,
+                                  (unsigned long)a->e[i].idx) < 0) {
+                return -1;
+            }
         } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
             return -1;
         }
@@ -12011,6 +12173,20 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                     /* The subscript is an ARITHMETIC EXPRESSION -- a bare
                      * name, a computation, or a negative index counting back
                      * from the end. sh_subscript_eval owns all of that. */
+                    {   /* ${m[key]} -- literal key, no arithmetic. */
+                        struct sh_array *ea = sh_array_find(nm);
+                        if (ea && ea->assoc && suffix[0] == '\0') {
+                            char kbuf[256];
+                            if (slen + 1 > sizeof kbuf) return 0;
+                            memcpy(kbuf, sub, slen); kbuf[slen] = '\0';
+                            const char *v = sh_array_get_key(nm, kbuf);
+                            if (count)
+                                return shell_append_uint(buf, pos, cap,
+                                    (unsigned long)(v ? strlen(v) : 0));
+                            if (!v) return 0;
+                            return shell_append_data_str(buf, pos, cap, v);
+                        }
+                    }
                     char subbuf[256];
                     long idx = 0;
                     bool num = false;
