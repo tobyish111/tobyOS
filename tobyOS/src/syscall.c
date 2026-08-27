@@ -3341,21 +3341,32 @@ static long sys_getcwd(char *out, size_t cap) {
     return (long)n;
 }
 
-static long sys_chdir(const char *path) {
-    char kpath[ABI_PATH_MAX];
-    int rr = resolve_user_path(path, kpath, sizeof(kpath));
-    if (rr) return rr;
+/* Adopt an ALREADY-RESOLVED kernel path as the cwd.
+ *
+ * Split out of sys_chdir so fchdir(2) shares the identical validation --
+ * exists, is a directory, fits -- rather than growing a second copy that can
+ * drift from this one. The caller is responsible for resolution: chdir(2)
+ * resolves a user path, fchdir(2) takes the path off an open handle. */
+static long chdir_kpath(const char *kpath) {
     struct vfs_stat st;
     int sr = vfs_stat(kpath, &st);
     if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
     if (sr != VFS_OK)        return -ABI_EACCES;
     if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
     struct proc *p = current_proc();
+    if (!p) return -ABI_EINVAL;
     size_t n = strlen(kpath);
     if (n >= ABI_PATH_MAX) n = ABI_PATH_MAX - 1;
     memcpy(p->cwd, kpath, n);
     p->cwd[n] = '\0';
     return 0;
+}
+
+static long sys_chdir(const char *path) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    return chdir_kpath(kpath);
 }
 
 /* SYS_GETENV is a kernel-side stub: the kernel does NOT maintain a
@@ -6497,7 +6508,7 @@ static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms) {
                 return -ABI_EFAULT;
             return nready;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         g_lx_poll_iters++;
         if (self) g_lx_poll_last_pid = self->pid;
         /* B14: drive RX so inbound TCP segments (handshakes completing on the
@@ -6550,7 +6561,7 @@ static long lx_do_select(int nfds, uint64_t urd, uint64_t uwr, uint64_t uex,
             if (uex && nbytes && copy_to_user((void *)(uintptr_t)uex, oex, nbytes)) return -ABI_EFAULT;
             return nready;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         if (saw_sock) net_poll();              /* B14: pump RX (see lx_do_poll) */
         poll_wait_block();   /* slice 43: BLOCK, don't busy-spin */
     }
@@ -6695,7 +6706,7 @@ static long lx_epoll_wait(int epfd, uint64_t uevents, int maxevents, long timeou
 #endif
             return n;
         }
-        if (self && self->pending_signals) return -LX_EINTR;
+        if (self && SIG_SHOULD_EINTR(self)) return -LX_EINTR;
         /* B14: epoll over sockets must pump RX while blocked (a full scan
          * before yielding would otherwise never see the handshake complete). */
         if (saw_sock) net_poll();
@@ -7250,7 +7261,7 @@ static long lx_accept(int fd, uint64_t uaddr, uint64_t ualen, int flags) {
             child = tcp_accept(s->tcp, 500);
             if (child) break;
             struct proc *me = current_proc();
-            if (me && me->pending_signals) return -LXE_EINTR;
+            if (me && SIG_SHOULD_EINTR(me)) return -LXE_EINTR;
         }
     }
     struct sock *ns = sock_alloc(SOCK_KIND_TCP);
@@ -7447,7 +7458,7 @@ tcp_start:;
                                                   * conn is torn down by close,
                                                   * same as the nb path */
         struct proc *me = current_proc();
-        if (me && me->pending_signals) return -LXE_EINTR;
+        if (me && SIG_SHOULD_EINTR(me)) return -LXE_EINTR;
         sched_yield();
     }
 }
@@ -9939,6 +9950,40 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_getcwd: return do_syscall(SYS_GETCWD, a1, a2, 0, 0, 0);
     case LX_chdir:  return do_syscall(SYS_CHDIR, a1, 0, 0, 0, 0);
     case LX_mkdir:  return do_syscall(SYS_MKDIR, a1, a2, 0, 0, 0);
+
+    case 81: {                         /* fchdir(fd) */
+        /* Absent from the kernel AND from libtoby before 2026-08-26, so it
+         * fell through to the ENOSYS logger. Not exotic: the
+         * openat(dirfd)+fchdir idiom is what find, tar, rsync, git and
+         * glibc's nftw(3) use to walk a tree without rebuilding path strings,
+         * so anything doing a real directory traversal was getting -ENOSYS.
+         *
+         * The path comes from the handle's stamped open_path (set for every
+         * open in sys_open), which carries one FIDELITY LIMIT worth stating:
+         * Linux's fchdir follows the INODE, so it still works if the
+         * directory is renamed after the open, and this follows the NAME.
+         * Closing that needs a cwd held as a vnode reference rather than a
+         * string, which is a change to how every path in this kernel is
+         * resolved -- out of scope for adding one syscall. Everything else,
+         * including EBADF vs ENOTDIR ordering, is real. */
+        struct file *f = fd_lookup((int)a1);
+        if (!f) return -ABI_EBADF;
+        /* A DIRECTORY handle keeps its path in `dirpath`, not `open_path`.
+         * The Linux open path routes directories through linux_open_dir(),
+         * which builds a FILE_KIND_DIR handle and RETURNS EARLY -- it never
+         * reaches the file_set_open_path() call near the end of
+         * sys_open_resolved. A first cut checked only open_path and so
+         * returned EBADF for every real directory; the gate caught it
+         * (`FAIL fchdir: returned errno=9`). Plain files still come from
+         * open_path, which is what makes the ENOTDIR half below work. */
+        const char *kp = (f->kind == FILE_KIND_DIR && f->dirpath)
+                       ? f->dirpath : f->open_path;
+        /* The fd IS valid (fd_lookup succeeded), so EBADF would be a lie: a
+         * handle with no path -- a pipe, a socket -- is simply not a
+         * directory, which is what Linux reports for it. */
+        if (!kp || !kp[0]) return -ABI_ENOTDIR;
+        return chdir_kpath(kp);
+    }
 
     /* ---- the *at / hint batch, all forwards onto machinery already here ----
      *
@@ -20572,6 +20617,84 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * only syscall is the Win32 marshalling gate. The native path (the common
      * case, personality 0) is completely unchanged. */
     long rv;
+#ifdef SYSDIAG_REGCHECK
+    /* 2026-08-26, against the wake-after-death flake. The captured fire panics
+     * at the `caller->cursys_nat = -1` store BELOW, with r12 (the compiler's
+     * cached `caller`) == 0, faulting on NULL+0x510. The source has `if
+     * (caller)` on both sides; the compiler correctly elides the second test
+     * because a local cannot change across a call -- so the C is right and the
+     * MACHINE STATE is what went wrong. In the same dump rbx, which holds
+     * `num` for the call, contained a kernel pointer that looks like &g_proc[N]
+     * instead of a small integer. Two callee-saved registers wrong at once.
+     *
+     * That leaves two possibilities and one sample cannot separate them:
+     *   (a) the callee-saved set was CORRUPTED across the call (a bad context
+     *       restore -- the flake's recorded mechanism), or
+     *   (b) control reached that store without ever loading a valid `caller`.
+     *
+     * THIS SEPARATES THEM. `caller_onstack` is volatile, so the compiler must
+     * keep it in memory on this frame while `caller` stays in a callee-saved
+     * register. If the two disagree after the call, the REGISTER changed while
+     * the stack copy survived -- (a), decisively. If they agree, it is (b).
+     * cpu_before/after says whether the proc migrated, i.e. whether a context
+     * switch was even involved.
+     *
+     * Deliberately behind a flag: this is one compare on every syscall, and it
+     * must not ship. It also must not "fix" anything -- reading the fresh
+     * pointer here would paper over the corruption and hide the bug. */
+    struct proc *const volatile caller_onstack = caller;
+    /* NOT smp_current_cpu_idx() -- that is the LAPIC MMIO read described
+     * below. It survived an earlier cut of this instrument only because it sat
+     * in a never-taken branch and the compiler could sink it; the stack check
+     * further down is unconditional, so nothing on this path may depend on
+     * that staying true. gs:[cpu_idx] is the same answer for a single load. */
+    unsigned cpu_before;
+    __asm__ volatile ("movl %%gs:%c1, %0"
+                      : "=r"(cpu_before)
+                      : "i"(__builtin_offsetof(struct percpu, cpu_idx)));
+
+    /* HYPOTHESIS 2, tested in the same run so one night settles both.
+     *
+     * If it is NOT a dual-schedule, the next suspect is this CPU running the
+     * current proc on ANOTHER proc's syscall stack. percpu.syscall_rsp is what
+     * syscall_entry.S loads into RSP on every entry ("mov rsp, gs:[0]"), and
+     * do_switch is supposed to keep it == current->kstack_top (signal.h states
+     * that invariant outright, and the syscall_regs mirror depends on it). If
+     * it ever lags the running proc, two procs' frames overlap on one stack
+     * and each overwrites the other's saved USER registers -- which is exactly
+     * what "a user stack address arrived as a syscall number" looks like from
+     * outside, and would corrupt callee-saved registers on the way back out.
+     *
+     * Exact compare is correct: entry only LOADS syscall_rsp, it never
+     * modifies it, so at this point it must still equal kstack_top. Threads
+     * have their own kstack and do_switch stamps the thread's, so a thread is
+     * not a false positive. */
+    if (caller) {
+        /* Read syscall_rsp the way syscall_entry.S itself does -- a single
+         * gs-relative load at percpu offset 0 (percpu.h pins it there for
+         * exactly this reason). NOT smp_this_cpu(): its fast path is this same
+         * load, but if the gs self-pointer ever reads NULL it falls back to
+         * &g_percpu[smp_current_cpu_idx()], and smp_current_cpu_idx() is a
+         * LAPIC MMIO read -- "a VM exit / device-model dispatch, ~1000x a plain
+         * load under TCG" per its own comment. Unconditionally, on EVERY
+         * syscall, that measured ~60x slower: the first cut of this check
+         * produced 10 s of guest time in 600 s of wall clock and the harness
+         * scored the boot DEAD. It was never hung, only crawling. */
+        uint64_t srsp;
+        __asm__ volatile ("movq %%gs:0, %0" : "=r"(srsp));
+        const uint64_t ktop = (uint64_t)(uintptr_t)caller->kstack_top;
+        if (srsp != ktop) {
+            static int stack_logged;
+            if (stack_logged < 8) {
+                stack_logged++;
+                kprintf("[sysdiag] SYSCALL-STACK MISMATCH pid=%d '%s' cpu=%u "
+                        "syscall_rsp=0x%lx kstack_top=0x%lx num=%ld\n",
+                        caller->pid, caller->name, cpu_before,
+                        (unsigned long)srsp, (unsigned long)ktop, num);
+            }
+        }
+    }
+#endif
     if (caller && caller->personality == ABI_PERS_LINUX)
         rv = linux_syscall(num, a1, a2, a3, a4, a5);
     else if (caller && caller->personality == ABI_PERS_WIN32)
@@ -20581,9 +20704,34 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
          * to it (chromewin's GUI/blit calls live here). */
         if (caller) caller->cursys_nat = (int32_t)num;
         rv = do_syscall(num, a1, a2, a3, a4, a5);
+#ifdef SYSDIAG_REGCHECK
+        /* Check BEFORE the store that actually faulted, so the evidence is
+         * printed even on the boot where it would have panicked. */
+        if (caller != caller_onstack) {
+            kprintf("[sysdiag] CALLEE-SAVED CORRUPTION at native syscall %ld: "
+                    "caller(reg)=%p caller(stack)=%p cpu %u->%u pid=%d\n",
+                    num, (void *)caller, (void *)caller_onstack,
+                    cpu_before, smp_current_cpu_idx(),
+                    caller_onstack ? caller_onstack->pid : -1);
+            caller = (struct proc *)caller_onstack;   /* survive to keep logging */
+        }
+#endif
         if (caller) caller->cursys_nat = -1;
     }
 
+#ifdef SYSDIAG_REGCHECK
+    /* Same check for the Linux/Win32 branches, which the captured fire did not
+     * happen to take -- if the corruption is a context-restore bug it is not
+     * personality-specific, and covering only the branch that fired once would
+     * be assuming the answer. */
+    if (caller != caller_onstack) {
+        kprintf("[sysdiag] CALLEE-SAVED CORRUPTION after syscall %ld "
+                "(pers branch): caller(reg)=%p caller(stack)=%p cpu %u->%u\n",
+                num, (void *)caller, (void *)caller_onstack,
+                cpu_before, smp_current_cpu_idx());
+        caller = (struct proc *)caller_onstack;
+    }
+#endif
     perf_syscall_exit((int)num, t_sys);
     perf_zone_end(PERF_Z_SYSCALL, t_sys);
 

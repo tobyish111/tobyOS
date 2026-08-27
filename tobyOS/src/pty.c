@@ -296,11 +296,11 @@ long pty_master_read(struct file *f, void *buf, size_t n) {
     while (t->out_head == t->out_tail) {
         if (t->slave_refs == 0) return 0;          /* slave gone -> EOF */
         struct proc *self = current_proc();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         wq_add(&t->wq_master_read, self);
         self->state = PROC_BLOCKED;
         sched_yield();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
     }
     size_t got = 0;
     while (got < n) {
@@ -336,11 +336,11 @@ static long slave_canonical_read(struct pty *t, uint8_t *out, size_t n) {
             break;   /* deliver the partial trailing input on hangup */
         }
         struct proc *self = current_proc();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         wq_add(&t->wq_slave_read, self);
         self->state = PROC_BLOCKED;
         sched_yield();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
     }
     /* Assemble one line into t->line[], applying VERASE/VKILL editing. */
     uint8_t verase = t->tio.c_cc[TTY_VERASE];
@@ -376,11 +376,13 @@ static long slave_raw_read(struct pty *t, uint8_t *out, size_t n) {
             if (got >= vmin) break;
             if (t->master_refs == 0) return got ? (long)got : 0;
             struct proc *self = current_proc();
-            if (self->pending_signals) return got ? (long)got : EINTR_RET;
+            if (SIG_SHOULD_EINTR(self))
+                return got ? (long)got : EINTR_RET;
             wq_add(&t->wq_slave_read, self);
             self->state = PROC_BLOCKED;
             sched_yield();
-            if (self->pending_signals) return got ? (long)got : EINTR_RET;
+            if (SIG_SHOULD_EINTR(self))
+                return got ? (long)got : EINTR_RET;
             continue;
         }
         out[got++] = (uint8_t)c;

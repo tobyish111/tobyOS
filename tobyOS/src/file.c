@@ -277,7 +277,7 @@ static long timerfd_read(struct file *f, void *buf, size_t n) {
             return -EFD_EAGAIN;
         }
         struct proc *p = current_proc();
-        if (p && p->pending_signals) return EINTR_RET;
+        if (p && SIG_SHOULD_EINTR(p)) return EINTR_RET;
         sched_yield();
     }
 }
@@ -681,7 +681,7 @@ long file_read(struct file *f, void *buf, size_t n) {
         while (!inotify_readable(f->inotify_id)) {
             if (inotify_nonblock(f->inotify_id)) return -ABI_EAGAIN;
             struct proc *self = current_proc();
-            if (self && self->pending_signals) return EINTR_RET;
+            if (self && SIG_SHOULD_EINTR(self)) return EINTR_RET;
             sched_yield();
         }
         long r = inotify_read(f->inotify_id, buf, n);

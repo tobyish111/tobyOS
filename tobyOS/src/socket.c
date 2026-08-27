@@ -560,7 +560,7 @@ long sock_unix_recv_fds(struct sock *self, void *kbuf, size_t n,
         }
 #endif
         struct proc *me = current_proc();
-        if (me->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(me)) return EINTR_RET;
         if (!self->in_use)       return -1;
         if (self->peer_ip == 0 && !self->x_server)
             return 0;                            /* peer closed + drained -> EOF */
@@ -1001,7 +1001,7 @@ long sock_recvfrom_to(struct sock *s, void *buf, size_t n,
 
     while (s->count == 0) {
         struct proc *self = current_proc();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         if (!s->in_use)            return -1;
         if (deadline && perf_now_ns() >= deadline) return 0;   /* timed out */
         /* Actively pull the NIC RX ring so inbound datagrams are delivered
@@ -1158,7 +1158,7 @@ long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
 
     while (s->count == 0) {
         struct proc *self = current_proc();
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         if (!s->in_use)            return -1;
         if (s->nonblock)           return SOCK_ERR_AGAIN;
         /* An async ICMPv6 error (sock_udp6_icmp_error) ends the wait NOW

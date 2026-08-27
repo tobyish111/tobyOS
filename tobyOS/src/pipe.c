@@ -162,7 +162,7 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
         struct proc *self = current_proc();
         /* Signal arrived before we even parked? Bail immediately so
          * the syscall return path can deliver it. */
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
         wq_add(&p->wq_read, self);
         self->state = PROC_BLOCKED;
         sched_yield();
@@ -171,7 +171,7 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
          *     re-checks the predicate, normal case.
          *   - signal_send() spliced us off the queue and made us
          *     READY because a SIGINT/SIGTERM hit us -- bail with EINTR. */
-        if (self->pending_signals) return EINTR_RET;
+        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
     }
 
     if (p->count == 0) {
@@ -218,13 +218,13 @@ long pipe_write(struct pipe *p, const void *buf, size_t n) {
         /* Block while the buffer is full. */
         while (p->count == PIPE_BUF_SZ && p->readers > 0) {
             struct proc *self = current_proc();
-            if (self->pending_signals) {
+            if (SIG_SHOULD_EINTR(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
             wq_add(&p->wq_write, self);
             self->state = PROC_BLOCKED;
             sched_yield();
-            if (self->pending_signals) {
+            if (SIG_SHOULD_EINTR(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
         }

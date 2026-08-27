@@ -56,6 +56,54 @@
 #define SIG_MAX  64
 #define SIGMASK(s) ((uint64_t)1ull << (s))
 
+/* Signals whose DEFAULT DISPOSITION IS IGNORE, as a mask.
+ *
+ * A blocking primitive must not report EINTR for a signal the process is
+ * ignoring -- Linux only interrupts a syscall for a signal that is actually
+ * ACTED ON (a handler, or a default action that stops/kills). Every blocking
+ * path in this kernel except the wait arms was testing `pending_signals` RAW,
+ * so any of these spuriously interrupted it.
+ *
+ * Found 2026-08-27 chasing a "ptrace POKEDATA is broken" gate failure that
+ * turned out not to involve ptrace at all: the tracer sat in read() on a pipe,
+ * the tracee exited, the resulting SIGCHLD (only wired up recently, 269963f)
+ * EINTR'd the read, and the test's `while ((r = read(..)) > 0)` loop treated
+ * that as end-of-data. The value it then blamed on POKEDATA was its own
+ * uninitialised default. pty.c had the same shape, which means a WINDOW RESIZE
+ * (SIGWINCH) interrupted terminal reads.
+ *
+ * Deliberately NARROWER than syscall.c's SLEEP_UNINTERRUPTING, which also
+ * masks the STOP class. Stop handling is taken at a cooperative stop point,
+ * and a read loop that neither returns nor reaches that point would hang a
+ * ^Z'd process -- a different question, on a gate (ttyparity job control)
+ * that was only just closed at 7/7. Not reopening it here. */
+#define SIG_DEFAULT_IGNORE_MASK \
+    (SIGMASK(SIGCHLD) | SIGMASK(SIGURG) | SIGMASK(SIGWINCH))
+
+/* Would any signal pending on `p` actually be ACTED ON, and therefore
+ * legitimately interrupt a blocking call?
+ *
+ * NOT a pure function of the pending mask, which is why this is a call and not
+ * a macro. SIG_DEFAULT_IGNORE_MASK above lists signals whose DEFAULT action is
+ * ignore -- but "default" is the operative word: a process that installs a
+ * handler for SIGCHLD (routine for async child reaping) MUST be interrupted so
+ * the handler can run, exactly as Linux does. A first cut of this fix masked
+ * those three unconditionally and so traded one wrong answer for another:
+ * ignored signals stopped interrupting (right) but HANDLED ones stopped too
+ * (wrong). This consults the actual per-thread-group disposition.
+ *
+ * Blocked signals do not count either -- a signal the thread has masked is not
+ * going to be delivered, so it cannot be the reason a syscall returns EINTR. */
+struct proc;   /* forward-declared HERE, before the prototype below: a
+                * `struct proc *` first mentioned inside a prototype gets
+                * PROTOTYPE SCOPE and is a distinct incomplete type, which
+                * produces the memorable "incompatible pointer types passing
+                * 'struct proc *' to 'struct proc *'". */
+bool sig_should_eintr(struct proc *p);
+
+/* Call sites take the PROC, not the mask -- the disposition is needed. */
+#define SIG_SHOULD_EINTR(p)  sig_should_eintr(p)
+
 /* ---- Signal action flags ----
  *
  * VALUES ARE ABI: userland passes these through sys_sigaction's raw

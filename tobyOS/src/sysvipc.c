@@ -22,6 +22,7 @@
 #include <tobyos/sched.h>
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
+#include <tobyos/signal.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/perf.h>
 #include <tobyos/abi/abi.h>
@@ -182,7 +183,7 @@ long sysv_semop(int id, uint64_t usops, int nops, uint64_t deadline_ns) {
         if (nowait) return -ABI_EAGAIN;
         if (deadline_ns && perf_now_ns() >= deadline_ns)
             return -ABI_EAGAIN;          /* semtimedop timeout, per Linux */
-        if (p && p->pending_signals) return -ABI_EINTR;
+        if (p && SIG_SHOULD_EINTR(p)) return -ABI_EINTR;
         sched_yield();
     }
 }
@@ -333,7 +334,7 @@ long sysv_msgsnd(int id, uint64_t umsgp, size_t msgsz, int flags) {
             return 0;
         }
         if (flags & LX_IPC_NOWAIT) return -ABI_EAGAIN;
-        if (p && p->pending_signals) return -ABI_EINTR;
+        if (p && SIG_SHOULD_EINTR(p)) return -ABI_EINTR;
         sched_yield();
     }
 }
@@ -385,7 +386,7 @@ long sysv_msgrcv(int id, uint64_t umsgp, size_t msgsz, long msgtyp,
             return (long)give;
         }
         if (flags & LX_IPC_NOWAIT) return -ABI_ENOMSG;
-        if (p && p->pending_signals) return -ABI_EINTR;
+        if (p && SIG_SHOULD_EINTR(p)) return -ABI_EINTR;
         sched_yield();
     }
 }

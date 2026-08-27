@@ -278,6 +278,44 @@ void signal_send_to_foreground(int sig) {
     }
 }
 
+/* Would any signal pending on `p` actually be ACTED ON? See signal.h.
+ *
+ * Mirrors signal_pending_self()'s notion of "deliverable" (unblocked, plus the
+ * two that cannot be blocked) and then asks the extra question a blocking
+ * primitive needs: of what IS deliverable, would anything actually happen?
+ * A pending SIGCHLD with no handler is not a reason to fail a read with
+ * EINTR; the same SIGCHLD with a handler installed absolutely is. */
+bool sig_should_eintr(struct proc *p) {
+    if (!p) return false;
+    uint64_t pend = p->pending_signals & ~p->sigstate.mask;
+    pend |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
+    if (!pend) return false;
+    /* Anything outside the default-ignore set acts: it has a handler, or its
+     * default action terminates or stops the process. */
+    if (pend & ~SIG_DEFAULT_IGNORE_MASK) return true;
+    /* Only default-ignore signals are pending. They interrupt ONLY if this
+     * thread group installed a real handler for one of them. */
+    struct sigaction *act = sig_actions_of(p);
+    if (!act) return false;
+    /* Only the SIG_DEFAULT_IGNORE_MASK bits can still be set here, so scan
+     * exactly those three -- never all 64.
+     *
+     * The 64-wide loop this replaces was measurably expensive, and ttyparity
+     * caught it: case 11-loop-1024 (a 5000-iteration shell loop) went from
+     * cpu=6205 ms PASS to 7476 ms and a harness SIGKILL. A shell with jobs has
+     * SIGCHLD pending almost continuously and no handler for it, which is
+     * precisely the path that falls through to here -- so the scan ran on
+     * essentially every blocking call rather than in some rare corner. */
+    static const int ignorable[] = { SIGCHLD, SIGURG, SIGWINCH };
+    for (unsigned i = 0; i < sizeof ignorable / sizeof ignorable[0]; i++) {
+        const int s = ignorable[i];
+        if (!(pend & SIGMASK(s))) continue;
+        void (*h)(int) = act[s].sa_handler;
+        if (h != SIG_DFL && h != SIG_IGN) return true;   /* handler: must act */
+    }
+    return false;
+}
+
 bool signal_pending_self(void) {
     struct proc *p = current_proc();
     if (!p) return false;

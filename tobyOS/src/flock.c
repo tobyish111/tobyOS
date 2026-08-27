@@ -195,7 +195,7 @@ long fl_fcntl(struct file *f, struct proc *p, int cmd, struct lx_flock *fl) {
         struct file_lock *c = fl_conflict(&k, false, pid, 0, excl, s, e);
         if (!c) break;
         if (cmd == 6 /* F_SETLK */) return -ABI_EAGAIN;
-        if (p && p->pending_signals) return -ABI_EINTR;
+        if (p && SIG_SHOULD_EINTR(p)) return -ABI_EINTR;
         sched_yield();                     /* cooperative F_SETLKW wait */
     }
     if (fl_carve(&k, pid, s, e)) return -ABI_ENOLCK;
@@ -233,7 +233,7 @@ long fl_flock(struct file *f, struct proc *p, int op) {
         struct file_lock *c = fl_conflict(&k, true, -1, ofd, excl, 0, FL_END_MAX);
         if (!c) break;
         if (nb) return -ABI_EAGAIN;
-        if (p && p->pending_signals) return -ABI_EINTR;
+        if (p && SIG_SHOULD_EINTR(p)) return -ABI_EINTR;
         sched_yield();
     }
     /* Upgrade/downgrade in place if this description already holds one. */
