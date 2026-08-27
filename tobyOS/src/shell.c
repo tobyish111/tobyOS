@@ -12247,6 +12247,104 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     char opch = '\0';
     const char *word = "";
     if (*op) {
+        /* ---- ${v/pat/rep} and ${v^^} / ${v,,} ---------------------------
+         *
+         * Neither existed, on a scalar OR an array: ${a[@]/x/y} reached the
+         * array code, which correctly handed each element to the ordinary
+         * scalar expansion, and the scalar expansion had nothing to hand it
+         * to. So this is the parameter-expansion half of finishing arrays.
+         *
+         * The matcher is the one #/% already use, walked over candidate
+         * substrings, so `*`, `?` and bracket expressions behave identically
+         * in all of them rather than a second dialect appearing here. */
+        if (*op == '/') {
+            op++;
+            bool all = false, at_start = false, at_end = false;
+            if (*op == '/')      { all = true; op++; }
+            else if (*op == '#') { at_start = true; op++; }
+            else if (*op == '%') { at_end = true; op++; }
+
+            char patraw[SHELL_PARSE_BUF_MAX];
+            size_t pi = 0;
+            while (*op && *op != '/' && pi + 1 < sizeof patraw) patraw[pi++] = *op++;
+            patraw[pi] = '\0';
+            const char *rep = (*op == '/') ? op + 1 : "";
+
+            char pattern[SHELL_PARSE_BUF_MAX];
+            if (shell_expand_word_ex(patraw, pattern, sizeof pattern, true, true) < 0)
+                return -1;
+            shell_case_unquote(pattern, sizeof pattern);
+            char repl[SHELL_PARSE_BUF_MAX];
+            if (shell_expand_word_ex(rep, repl, sizeof repl, true, true) < 0)
+                return -1;
+
+            char value[SHELL_PARSE_BUF_MAX];
+            bool is_set = false, vjoin = false;
+            if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0)
+                return -1;
+
+            size_t vlen = strlen(value);
+            char out[SHELL_PARSE_BUF_MAX];
+            size_t o = 0;
+            size_t i = 0;
+            bool done_one = false;
+            char cand[SHELL_PARSE_BUF_MAX];
+            while (i <= vlen && o + 1 < sizeof out) {
+                bool matched = false;
+                size_t mlen = 0;
+                if ((!done_one || all) && !(at_start && i != 0)) {
+                    /* Longest match at this position, so a pattern ending in
+                     * a star replaces as much as it can -- bash's behaviour --
+                     * rather than a single character. (Deliberately not
+                     * writing that pattern out: the star-slash inside it would
+                     * close this comment.) */
+                    for (size_t L = vlen - i; ; L--) {
+                        if (L + 1 <= sizeof cand) {
+                            memcpy(cand, value + i, L);
+                            cand[L] = '\0';
+                            if ((!at_end || i + L == vlen) &&
+                                shell_glob_match(pattern, cand)) {
+                                matched = true; mlen = L; break;
+                            }
+                        }
+                        if (L == 0) break;
+                    }
+                }
+                if (matched) {
+                    for (const char *q = repl; *q && o + 1 < sizeof out; q++)
+                        out[o++] = *q;
+                    done_one = true;
+                    if (mlen == 0) {           /* empty match: do not spin */
+                        if (i < vlen && o + 1 < sizeof out) out[o++] = value[i];
+                        i++;
+                    } else {
+                        i += mlen;
+                    }
+                    continue;
+                }
+                if (i < vlen && o + 1 < sizeof out) out[o++] = value[i];
+                i++;
+            }
+            out[o] = '\0';
+            return vjoin ? shell_append_str(buf, pos, cap, out)
+                         : shell_append_data_str(buf, pos, cap, out);
+        }
+        if (*op == '^' || *op == ',') {
+            char cop = *op++;
+            bool all = (*op == cop);
+            char value[SHELL_PARSE_BUF_MAX];
+            bool is_set = false, vjoin = false;
+            if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0)
+                return -1;
+            for (size_t i = 0; value[i]; i++) {
+                char c = value[i];
+                if (cop == '^') { if (c >= 'a' && c <= 'z') value[i] = (char)(c - 32); }
+                else            { if (c >= 'A' && c <= 'Z') value[i] = (char)(c + 32); }
+                if (!all) break;          /* ${v^} touches the FIRST char only */
+            }
+            return vjoin ? shell_append_str(buf, pos, cap, value)
+                         : shell_append_data_str(buf, pos, cap, value);
+        }
         if (*op == '#' || *op == '%') {
             char strip_op = *op++;
             bool greedy = (*op == strip_op);
