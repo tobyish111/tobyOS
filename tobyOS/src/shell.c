@@ -397,6 +397,11 @@ static long  sh_array_max_idx(const struct sh_array *a);
 static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
                                    const char *name, bool star,
                                    long off, long cnt);
+struct file;
+static int shell_read_line_from_file(struct file *in, bool raw,
+                                     char *out, size_t cap,
+                                     bool *got_any, char delim,
+                                     bool *escmap);
 static bool  sh_subscript_eval(const char *sub, const char *name,
                                bool for_write, long *out);
 /* Moved up from beside the evaluator: an array SUBSCRIPT is arithmetic
@@ -952,7 +957,13 @@ static int sh_array_assign_literal(const char *name, const char *paren,
     if (!sh_array_create(name)) return -1;
     char elem[512];
     for (;;) {
-        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        /* `;` separates too: the reader joins continued physical lines
+         * with "; ", so a multi-line literal arrives here as
+         * `( ; one ; two ; )`. Without this the elements come out as
+         * "one;" "two;" -- the right COUNT with the separator glued
+         * onto every value, which is the sort of bug that survives a
+         * count-only assertion. */
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';') p++;
         if (*p == ')' || *p == '\0') break;
         size_t n = 0;
         /* Elements may be quoted; strip one level, honouring both quote
@@ -964,10 +975,12 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 if (*p == q) p++;
                 continue;
             }
-            if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ')') break;
+            if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' ||
+                *p == ')') break;
             elem[n++] = *p++;
         }
         elem[n] = '\0';
+        if (n == 0) continue;      /* blank line between elements */
         if (sh_array_set(name, next++, elem) < 0) return -1;
     }
     return 0;
@@ -1916,6 +1929,11 @@ static bool shell_hosted_builtin(const char *name) {
         /* bash spells these as builtins too, and the corpus uses them for
          * plain `NAME=VALUE` with an export or readonly attribute. */
         "declare", "typeset", "compgen",
+        /* Array builtins. Same trap as ulimit/fc above: implemented in
+         * the table but missing here, so /bin/tsh looked for
+         * /bin/readarray, found nothing, and the array silently stayed
+         * empty -- ${#arr[@]} was 0 with no error to explain it. */
+        "readarray", "mapfile",
         0
     };
     for (int i = 0; allow[i]; i++)
@@ -2752,6 +2770,86 @@ static void cmd_readonly(int argc, char **argv) {
 
         if (shell_readonly_mark(argv[i], klen) < 0) shell_set_status(1);
     }
+}
+
+/* readarray / mapfile -- fill an array from lines on stdin.
+ *
+ * `-t` strips the trailing newline from each line, which is what essentially
+ * every real use wants; WITHOUT it bash KEEPS the newline in the element, so
+ * `${arr[0]}` is "l1\n". That difference is the whole reason the flag exists,
+ * so both behaviours are real here rather than -t being assumed.
+ *
+ * The array is REPLACED, not appended to: `readarray x < f` twice leaves the
+ * contents of the second read only. Reads through the same shell_in/fd[0]
+ * handle `read` uses, so a redirection on the command applies.
+ */
+static void cmd_readarray(int argc, char **argv) {
+    shell_set_status(0);
+    bool trim = false;
+    int first = 1;
+    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) { first++; break; }
+        for (const char *q = argv[first] + 1; *q; q++) {
+            if (*q == 't') trim = true;
+            /* Other flags (-n, -O, -s, -c, -C) are not implemented. Refusing
+             * is better than silently ignoring a count or origin and handing
+             * back an array that quietly differs from what was asked for. */
+            else {
+                kprintf("%s: -%c not supported\n", argv[0], *q);
+                shell_set_status(2);
+                return;
+            }
+        }
+        first++;
+    }
+    const char *name = (first < argc) ? argv[first] : "MAPFILE";
+    if (!shell_name_is_valid(name, strlen(name))) {
+        kprintf("%s: `%s': not a valid identifier\n", argv[0], name);
+        shell_set_status(1);
+        return;
+    }
+
+    struct file *tmp_console = 0;
+    struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
+    if (!in) { tmp_console = console_file_make(); in = tmp_console; }
+    if (!in) {
+        kprintf("%s: failed to open stdin\n", argv[0]);
+        shell_set_status(1);
+        return;
+    }
+
+    sh_array_unset(name);                 /* REPLACE, do not append */
+    if (!sh_array_create(name)) { shell_set_status(1); goto done; }
+
+    {
+        char line[1024];
+        long idx = 0;
+        for (;;) {
+            bool got_any = false;
+            int rr = shell_read_line_from_file(in, true, line,
+                                               sizeof line, &got_any,
+                                               '\n', 0);
+            /* !got_any IS end-of-input -- cmd_read uses exactly that test to
+             * end `while read line`, and an EMPTY line still sets it, so a
+             * blank line mid-file does not stop the read.
+             *
+             * Testing rr instead was wrong: the reader returns 1 (not 0) when
+             * input ends without a trailing newline, so the loop never broke
+             * and filled the array to SH_ARRELEM_MAX -- ${#arr[@]} came back
+             * 512 with the first three elements perfectly correct, which is a
+             * failure that a spot-check of arr[0] would have passed. */
+            if (rr < 0 || !got_any) break;
+            size_t n = strlen(line);
+            if (!trim) {
+                /* Put the delimiter back: bash keeps it without -t, and the
+                 * reader strips it. */
+                if (n + 1 < sizeof line) { line[n] = '\n'; line[n + 1] = '\0'; }
+            }
+            if (sh_array_set(name, idx++, line) < 0) { shell_set_status(1); break; }
+        }
+    }
+done:
+    if (tmp_console) file_close(tmp_console);
 }
 
 static void cmd_unset(int argc, char **argv) {
@@ -6494,7 +6592,24 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         return;
     }
     if (c == ';') {
-        if (st->in_array_lit) st->bad_paren = true;   /* see the `&` arm */
+        /* NO array-literal rejection here, deliberately. The reader joins
+         * continued physical lines with "; " (see the accumulator), so a
+         * multi-line
+         *     a=(
+         *       one
+         *       two
+         *     )
+         * reaches this scanner as `a=( ; one ; two ; )`. Rejecting `;`
+         * here therefore rejects every multi-line array literal -- which
+         * is exactly what it did, with "syntax error near unexpected
+         * token `('".
+         *
+         * KNOWN DIVERGENCE, stated rather than hidden: a literal `;` typed
+         * inside a literal (`a=(1 ; 2)`) is a syntax error in bash and is
+         * accepted here, because after joining it is indistinguishable
+         * from a newline. `&` and `|` are still rejected -- the
+         * accumulator never inserts those, so they can only have been
+         * typed. */
         bool dbl = (p[1] == ';');
         p += dbl ? 2 : 1;
         /* `;;` ONLY MEANS SOMETHING INSIDE A CASE. `echo 1 ;; echo 2` is a
@@ -10042,6 +10157,8 @@ static const struct cmd cmds[] = {
     { "local",    "local NAME[=VALUE]...: function-scoped variable",      cmd_local    },
     { "shopt",    "shopt [-suqp] [NAME...]: shell option toggles",        cmd_shopt    },
     { "readonly", "readonly [NAME[=VALUE]...]: mark variables readonly", cmd_readonly },
+    { "readarray","readarray [-t] NAME: read lines into an array",      cmd_readarray},
+    { "mapfile",  "mapfile [-t] NAME: synonym for readarray",           cmd_readarray},
     { "unset",    "unset NAME [NAME...]: remove shell variables",         cmd_unset    },
     { "set",      "set [NAME=VALUE...]: print or set shell variables",    cmd_set      },
     { "shift",    "shift [n]: shift positional parameters",              cmd_shift    },
@@ -11768,6 +11885,59 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                             cnt = -1;
                         return shell_append_array_slice(buf, pos, cap, nm,
                                                         star, off, cnt);
+                    }
+                    /* ${a[@]<op>} -- the operator DISTRIBUTES over elements
+                     * and the result is still one word each.
+                     *
+                     * Each element is pushed into a scratch variable and run
+                     * through the ORDINARY scalar expansion, so # ## % %% /
+                     * // ^ ^^ , ,, and friends all behave exactly as they do
+                     * on a plain variable. Reimplementing them here would be
+                     * a second copy of a dozen operators, guaranteed to
+                     * drift from the first. */
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
+                        suffix[0] != '\0' && suffix[0] != ':') {
+                        struct sh_array *arr = sh_array_find(nm);
+                        int an = arr ? arr->n : 0;
+                        bool star = (sub[0] == '*');
+                        char sep = ' ';
+                        const char *ifs2 = env_get("IFS");
+                        if (ifs2 && *ifs2) sep = ifs2[0];
+                        else if (ifs2) sep = '\0';
+                        if (!star && shell_append_char(buf, pos, cap,
+                                                       SHELL_ARG_MARK) < 0)
+                            return -1;
+                        for (int i = 0; i < an; i++) {
+                            if (i > 0) {
+                                if (!star) {
+                                    if (shell_append_char(buf, pos, cap,
+                                            SHELL_ARG_MARK) < 0) return -1;
+                                } else if (sep &&
+                                    shell_append_char(buf, pos, cap, sep) < 0) {
+                                    return -1;
+                                }
+                            }
+                            /* SHELL_ARRAY_ELEM is a scratch scalar: set it to
+                             * this element, then expand "${SHELL_ARRAY_ELEM<op>}"
+                             * with the real machinery. */
+                            if (env_set("SHELL_ARRAY_ELEM", arr->e[i].val) < 0)
+                                return -1;
+                            char sub_expr[512];
+                            size_t k = 0;
+                            const char *pfx = "SHELL_ARRAY_ELEM";
+                            for (const char *q = pfx; *q && k + 1 < sizeof sub_expr; q++)
+                                sub_expr[k++] = *q;
+                            for (const char *q = suffix; *q && k + 1 < sizeof sub_expr; q++)
+                                sub_expr[k++] = *q;
+                            sub_expr[k] = '\0';
+                            if (shell_expand_braced_parameter(sub_expr, buf,
+                                                              pos, cap) < 0) {
+                                (void)env_unset("SHELL_ARRAY_ELEM");
+                                return -1;
+                            }
+                        }
+                        (void)env_unset("SHELL_ARRAY_ELEM");
+                        return 0;
                     }
                     if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
                         suffix[0] == '\0') {
