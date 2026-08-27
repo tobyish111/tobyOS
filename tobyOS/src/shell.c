@@ -2191,6 +2191,11 @@ static void shell_print_export_entry(const char *entry) {
 struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
     char *name;           /* variable name, NUL-terminated */
+    /* An ARRAY of the same name is part of the same variable and must be
+     * scoped with it -- arrays live in their own table, so saving only the
+     * scalar let `local -a g=(p q)` leak to the caller. */
+    struct sh_array *arr_saved;
+    bool  arr_existed;
     char *kv;             /* prior "KEY=VALUE" blob, or 0 if it did not exist */
     unsigned char flags;  /* prior flags */
     bool  existed;
@@ -2222,6 +2227,36 @@ static int shell_locals_push(const char *name, int depth) {
         sv->flags = 0;
         sv->existed = false;
     }
+    /* AN ARRAY OF THE SAME NAME IS PART OF THE SAME VARIABLE.
+     *
+     * Arrays live in their own table (g_env holds flat "KEY=VALUE" blobs and
+     * is handed to proc_spawn as envp), so localising only the scalar left
+     * `local -a g=(p q)` visible to the CALLER after the function returned --
+     * a `local` that does not scope is worse than no `local`, because the
+     * leak is silent. The saved copy is detached from the live table so the
+     * function's writes cannot reach it. */
+    sv->arr_saved = 0;
+    sv->arr_existed = false;
+    {
+        struct sh_array *a = sh_array_find(name);
+        if (a) {
+            sv->arr_saved = (struct sh_array *)kmalloc(sizeof *sv->arr_saved);
+            if (sv->arr_saved) {
+                memset(sv->arr_saved, 0, sizeof *sv->arr_saved);
+                for (int i = 0; i < a->n; i++) {
+                    size_t vn = strlen(a->e[i].val) + 1;
+                    char *cp = (char *)kmalloc(vn);
+                    if (!cp) break;
+                    memcpy(cp, a->e[i].val, vn);
+                    sv->arr_saved->e[sv->arr_saved->n].idx = a->e[i].idx;
+                    sv->arr_saved->e[sv->arr_saved->n].val = cp;
+                    sv->arr_saved->n++;
+                }
+                sv->arr_existed = true;
+            }
+            sh_array_unset(name);   /* the function starts from nothing */
+        }
+    }
     sv->depth = depth;
     g_localc++;
     return 0;
@@ -2245,6 +2280,20 @@ static bool shell_local_declared_here(const char *name, int depth) {
 static void shell_locals_pop(int depth) {
     while (g_localc > 0 && g_locals[g_localc - 1].depth >= depth) {
         struct shell_local_save *sv = &g_locals[--g_localc];
+        /* Drop whatever the function built, then put the caller's array back
+         * (if it had one). Mirrors the scalar restore below. */
+        sh_array_unset(sv->name);
+        if (sv->arr_existed && sv->arr_saved) {
+            for (int i = 0; i < sv->arr_saved->n; i++)
+                (void)sh_array_set(sv->name, sv->arr_saved->e[i].idx,
+                                   sv->arr_saved->e[i].val);
+        }
+        if (sv->arr_saved) {
+            for (int i = 0; i < sv->arr_saved->n; i++)
+                kfree(sv->arr_saved->e[i].val);
+            kfree(sv->arr_saved);
+            sv->arr_saved = 0;
+        }
         size_t klen = strlen(sv->name);
         int idx = env_find(sv->name, klen);
         if (sv->existed) {
@@ -2288,6 +2337,15 @@ static void cmd_local(int argc, char **argv) {
         return;
     }
     for (int i = 1; i < argc; i++) {
+        /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
+         * flag as a variable NAME produced "local: bad name '-a'" and left
+         * the array unscoped. The attributes themselves are carried by the
+         * assignment that follows (an array literal makes an array), so the
+         * flag only has to be skipped, not interpreted. */
+        if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
+        if (argv[i][0] == '-' && argv[i][1] &&
+            (argv[i][1] == 'a' || argv[i][1] == 'A' || argv[i][1] == 'i' ||
+             argv[i][1] == 'r' || argv[i][1] == 'x') && !argv[i][2]) continue;
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
         if (!has_value) klen = strlen(argv[i]);
@@ -13394,6 +13452,14 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
     size_t wpos = 0;
     const char *p = src;
     bool prefix_ok = true;          /* still in the command's assignment prefix */
+    /* A DECLARATION UTILITY takes ASSIGNMENTS as its operands, so an
+     * array literal is legal there even though it is not the first word:
+     *     declare -a e=(x y z)      local -a g=(p q)
+     * prefix_ok is false by then (the command word ended the prefix), so
+     * without this the literal was split and only `x` survived. The
+     * validity scanner already makes the same distinction with its own
+     * decl_util flag; this is the tokenizer's half of it. */
+    bool decl_util_cmd = false;
     bool literal_word = false;      /* the next word is a here-doc delimiter */
     g_capture_last_status = 0;
 
@@ -13421,6 +13487,9 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             if (shell_emit_token(tok, &ntok, SH_TOK_SEMI, 0, false) < 0) return -1;
             /* A separator starts a new command, and a new prefix with it. */
             prefix_ok = true;
+            decl_util_cmd = false;
+            decl_util_cmd = false;
+            decl_util_cmd = false;
             g_tokpfx_n = 0;
             p++;
             continue;
@@ -13562,7 +13631,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              * with `=`, so `echo (x)` and `f (x)` keep their meanings. The
              * validity scanner above already rejects the illegal shapes
              * (`ls foo=(1 2)`, `a= (1 2)`, `for x in a=()`). */
-            if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' && prefix_ok) {
+            if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' &&
+                (prefix_ok || decl_util_cmd)) {
                 int depth = 0;
                 do {
                     if (*p == '(') depth++;
@@ -13805,6 +13875,22 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                     memcpy(g_tokpfx[g_tokpfx_n++], plain, o + 1);
                 }
             } else {
+                /* The command word itself: remember whether it is a
+                 * declaration utility before the prefix closes. */
+                if (prefix_ok) {
+                    char plain[64];
+                    size_t o = 0;
+                    for (const char *q = start; *q && o + 1 < sizeof plain; q++)
+                        if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC)
+                            plain[o++] = *q;
+                    plain[o] = '\0';
+                    if (strcmp(plain, "declare") == 0 ||
+                        strcmp(plain, "typeset") == 0 ||
+                        strcmp(plain, "local")   == 0 ||
+                        strcmp(plain, "export")  == 0 ||
+                        strcmp(plain, "readonly") == 0)
+                        decl_util_cmd = true;
+                }
                 prefix_ok = false;
             }
         }
