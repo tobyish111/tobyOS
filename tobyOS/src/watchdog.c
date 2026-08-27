@@ -223,7 +223,25 @@ extern volatile int g_bkl_owner;
 static void wdog_check_idle(uint64_t now) {
     if (g_idle_hb == 0) return;            /* idle loop not started yet */
     if (g_idle_bitten) return;             /* one bite per stall episode */
-    uint64_t since = now - g_last_idle_kick_ms;
+    /* Snapshot ONCE and never subtract a later stamp from an earlier `now`.
+     *
+     * 2026-08-27: caught biting a demonstrably healthy system --
+     *   [51036 ms] [wdog] BITE kind=idle_stall pid=0
+     *              reason='pid 0 idle loop stalled 18446744073709551615ms
+     *                      (beats=2908, ...)'
+     * 18446744073709551615 is UINT64_MAX, i.e. (uint64_t)-1, and `[hb] #1`
+     * had printed 0.6 s earlier with 2908 beats. `now` is sampled by
+     * wdog_check() and passed down; if another CPU runs wdog_kick_idle() in
+     * the gap, g_last_idle_kick_ms ends up NEWER than `now`, the subtraction
+     * wraps, and the result always exceeds any timeout. A plain race -- no
+     * TSC skew required, though skew would do it too.
+     *
+     * wdog_status() below already guards exactly this
+     * ((now > last) ? (now - last) : 0); the two arms that actually decide to
+     * BITE did not. */
+    const uint64_t last = g_last_idle_kick_ms;
+    if (now <= last) return;               /* kicked after `now` was sampled */
+    uint64_t since = now - last;
     if (since <= g_timeout_ms) return;
 
     g_idle_bitten = true;
@@ -248,7 +266,13 @@ void wdog_check(void) {
      * the scheduler has actually started (g_sched_hb > 0) — during
      * early boot, the LAPIC timer and scheduler aren't running yet
      * and that's expected, not a stall. */
-    if (g_sched_hb > 0 && (now - g_last_sched_kick_ms) > g_timeout_ms) {
+    /* Same snapshot-and-guard as wdog_check_idle(): a kick landing between
+     * `now` being sampled above and this comparison makes `now - last`
+     * underflow to ~UINT64_MAX, which beats any timeout and bites a healthy
+     * scheduler. Measured on the idle arm; this arm has the identical shape. */
+    const uint64_t last_sched = g_last_sched_kick_ms;
+    if (g_sched_hb > 0 && now > last_sched &&
+        (now - last_sched) > g_timeout_ms) {
         wdog_record_event(ABI_WDOG_KIND_SCHED_STALL, -1,
                           "scheduler heartbeat stalled");
     }

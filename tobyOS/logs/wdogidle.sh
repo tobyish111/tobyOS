@@ -58,6 +58,47 @@ ck "and it is the FIRST event, not a repeat" "BITE event=1 kind=idle_stall"
 if [ "$(grep -acF '[hb] #' "$LOG")" -gt 5 ]; then echo "  ok   heartbeat still running after the bite"
 else echo "  FAIL heartbeat did not resume"; RC=1; fi
 
+# ---------------------------------------------------------------------------
+# PHASE 2 -- THE NEGATIVE CASE. Added 2026-08-27.
+#
+# Phase 1 proves the watchdog FIRES when pid 0 is wedged. Nothing proved it
+# STAYS SILENT when nothing is wrong, and it did not: a flake-hunt boot caught
+#   [wdog] BITE kind=idle_stall reason='pid 0 idle loop stalled
+#          18446744073709551615ms (beats=2908, ...)'
+# on a healthy system. That number is UINT64_MAX -- `now` is sampled by
+# wdog_check() and a kick from another CPU landing in the gap made
+# g_last_idle_kick_ms NEWER than `now`, so the subtraction wrapped and beat any
+# timeout. Fixed by snapshotting and guarding in BOTH bite arms (src/watchdog.c);
+# wdog_status() had always guarded it, the deciding arms had not.
+#
+# A detector is only proven by BOTH directions -- the same reason the fs gate
+# asserts the DENIAL. Cheap here: rebuild WITHOUT the wedge flag and require
+# zero bites across a boot long enough to have caught the original.
+echo
+echo "== phase 2: healthy boot must produce NO bite"
+FLAGS2="-DFAST_BOOT -DQUICK_BOOT"
+LOG2=logs/wdogidle-healthy.log
+touch src/kernel.c
+if ! make -j4 "CC=TMP='C:	' TEMP='C:	' clang"           "HOST_CC=TMP='C:	' TEMP='C:	' gcc"           EXTRA_CFLAGS="$FLAGS2" iso > logs/wdogidle2.build.log 2>&1; then
+    echo "  FAIL phase-2 build"; grep -E ' error:' logs/wdogidle2.build.log | head -10; exit 1
+fi
+rm -f "$LOG2"
+timeout 240 "/c/Program Files/qemu/qemu-system-x86_64.exe"     -cdrom tobyOS.iso -drive file=disk.img,format=raw,if=ide,index=0,media=disk     -boot d -smp 4 -m 5120 -serial file:"$LOG2"     -no-reboot -display none > /dev/null 2>&1
+taskkill //IM qemu-system-x86_64.exe //F >/dev/null 2>&1
+
+NB=$(grep -acF "[wdog] BITE" "$LOG2"); NB=${NB:-0}
+if [ "$NB" = "0" ]; then echo "  ok   no bite on a healthy boot"
+else
+    echo "  FAIL watchdog bit a healthy system ($NB time(s)) -- FALSE POSITIVE"
+    grep -aF "[wdog] BITE" "$LOG2" | head -3 | sed 's/^\[[0-9 ]*ms\] //'
+    RC=1
+fi
+# The boot must have been long enough for the check to run at all, or "no
+# bite" is vacuous -- the same trap as a guard that never executes.
+HB2=$(grep -acF '[hb] #' "$LOG2"); HB2=${HB2:-0}
+if [ "$HB2" -gt 5 ]; then echo "  ok   healthy boot ran long enough to be meaningful ($HB2 beats)"
+else echo "  FAIL healthy boot produced only $HB2 beats -- verdict is vacuous"; RC=1; fi
+
 echo
 if [ "$RC" = "0" ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
 exit $RC
