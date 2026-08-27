@@ -383,6 +383,21 @@ static void shell_parse_error(void);
 /* 0 while no line is executing; 1 inside an input line; >1 inside a segment,
  * body or condition re-entering the executor. Only depth 0 is a NEW line. */
 static int g_exec_line_depth;
+/* Indexed arrays. The store is defined further down, next to the name
+ * validator it uses, but env_set_kv() -- which sits above it -- has to
+ * intercept the array assignment forms, so the accessors are declared here. */
+struct sh_array;
+static struct sh_array *sh_array_find(const char *name);
+static struct sh_array *sh_array_create(const char *name);
+static void  sh_array_unset(const char *name);
+static void  sh_array_unset_idx(struct sh_array *a, long idx);
+static int   sh_array_set(const char *name, long idx, const char *val);
+static const char *sh_array_get(const char *name, long idx);
+static long  sh_array_max_idx(const struct sh_array *a);
+static const char *sh_split_subscript(const char *key, size_t klen,
+                                      char *name, size_t namecap,
+                                      char *sub, size_t subcap);
+
 static bool shell_name_is_valid(const char *s, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
@@ -798,7 +813,15 @@ static const char *env_get(const char *key) {
             return g_tokpfx[i] + klen + 1;
     }
     int idx = env_find(key, klen);
-    if (idx < 0) return 0;
+    if (idx < 0) {
+        /* An array's NAME alone is its element 0 -- `a=(x y); echo $a`
+         * prints x, not the whole array and not nothing. Checked only after
+         * the scalar table misses, so a scalar of the same name still wins
+         * (bash: assigning a scalar to an array name sets element 0, which is
+         * the same observable answer either way). */
+        const char *e0 = sh_array_get(key, 0);
+        return e0 ? e0 : 0;
+    }
     /* FOLLOW A NAMEREF, and give up on a cycle rather than on the stack.
      *
      *     typeset -n ref1=ref2 ; typeset -n ref2=ref1 ; echo $ref1
@@ -879,8 +902,109 @@ static void env_remove_at(int idx) {
  * in place (frees the previous slot) so the table stays compact. */
 static const char *env_deref_name(const char *key, char *buf, size_t cap);
 
+/* Split "name[sub]" / "name" out of an assignment word's key part.
+ * Returns the subscript text (into `sub`) or NULL when there is none. */
+static const char *sh_split_subscript(const char *key, size_t klen,
+                                      char *name, size_t namecap,
+                                      char *sub, size_t subcap) {
+    const char *lb = 0;
+    for (size_t i = 0; i < klen; i++) if (key[i] == '[') { lb = key + i; break; }
+    if (!lb || key[klen - 1] != ']') return 0;
+    size_t nlen = (size_t)(lb - key);
+    size_t slen = klen - nlen - 2;               /* strip '[' and ']' */
+    if (nlen == 0 || nlen + 1 > namecap || slen + 1 > subcap) return 0;
+    memcpy(name, key, nlen); name[nlen] = '\0';
+    memcpy(sub, lb + 1, slen); sub[slen] = '\0';
+    return sub;
+}
+
+/* Parse "( a b 'c d' )" into elements. Reuses the shell's own field splitter
+ * semantics only as far as whitespace: each element is expanded as a word by
+ * the caller before it gets here, so quoting has already been resolved. */
+static int sh_array_assign_literal(const char *name, const char *paren,
+                                   bool append) {
+    const char *p = paren;
+    while (*p && *p != '(') p++;
+    if (*p != '(') return -1;
+    p++;
+    struct sh_array *a = sh_array_find(name);
+    long next = 0;
+    if (append && a) next = sh_array_max_idx(a) + 1;
+    else if (!append && a) sh_array_unset(name);      /* a=(...) REPLACES */
+    if (!sh_array_create(name)) return -1;
+    char elem[512];
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (*p == ')' || *p == '\0') break;
+        size_t n = 0;
+        /* Elements may be quoted; strip one level, honouring both quote
+         * kinds, and stop at unquoted whitespace or the closing paren. */
+        while (*p && n + 1 < sizeof elem) {
+            if (*p == '\'' || *p == '"') {
+                char q = *p++;
+                while (*p && *p != q && n + 1 < sizeof elem) elem[n++] = *p++;
+                if (*p == q) p++;
+                continue;
+            }
+            if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ')') break;
+            elem[n++] = *p++;
+        }
+        elem[n] = '\0';
+        if (sh_array_set(name, next++, elem) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Intercept the assignment forms that mean ARRAY before the scalar path sees
+ * them. Returns 1 when handled, 0 to fall through to env_set_kv's normal
+ * behaviour.
+ *
+ *     a=(x y)      literal, replaces
+ *     a+=(z)       literal, appends at max_idx+1 (NOT at ${#a[@]} -- they
+ *                  differ the moment the array is sparse)
+ *     a[2]=v       element
+ *     a[2]+=v      append to that element's text
+ */
+static int sh_try_array_assignment(const char *kv) {
+    size_t klen = env_key_len(kv);
+    if (klen == 0) return 0;
+    const char *val = kv + klen + 1;
+    bool append = (klen > 0 && kv[klen - 1] == '+');
+    size_t keylen = append ? klen - 1 : klen;
+
+    char name[128], sub[128];
+    if (sh_split_subscript(kv, keylen, name, sizeof name, sub, sizeof sub)) {
+        if (!shell_name_is_valid(name, strlen(name))) return 0;
+        long idx = 0;
+        for (const char *q = sub; *q; q++) {
+            if (*q < '0' || *q > '9') return 0;      /* not an index we grok */
+            idx = idx * 10 + (*q - '0');
+        }
+        if (append) {
+            const char *old = sh_array_get(name, idx);
+            char joined[512];
+            size_t ol = old ? strlen(old) : 0, vl = strlen(val);
+            if (ol + vl + 1 > sizeof joined) return 0;
+            if (ol) memcpy(joined, old, ol);
+            memcpy(joined + ol, val, vl + 1);
+            return sh_array_set(name, idx, joined) == 0 ? 1 : 0;
+        }
+        return sh_array_set(name, idx, val) == 0 ? 1 : 0;
+    }
+
+    if (val[0] == '(') {
+        char nm[128];
+        if (keylen + 1 > sizeof nm) return 0;
+        memcpy(nm, kv, keylen); nm[keylen] = '\0';
+        if (!shell_name_is_valid(nm, keylen)) return 0;
+        return sh_array_assign_literal(nm, val, append) == 0 ? 1 : 0;
+    }
+    return 0;
+}
+
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
+    if (sh_try_array_assignment(kv_in)) return 0;
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
 
@@ -1836,6 +1960,124 @@ static void cmd_unsetenv(int argc, char **argv) {
     if (env_unset(argv[1]) < 0) shell_set_status(1);
 }
 
+/* ===========================================================================
+ * INDEXED ARRAYS
+ *
+ * WHY A SEPARATE TABLE, AND NOT g_env.
+ * g_env is an array of flat "KEY=VALUE" blobs handed to proc_spawn as envp
+ * directly -- that is the whole reason it has that shape. An array has many
+ * values and sparse indices, so it cannot live in one blob, and it must not
+ * reach a child anyway: bash does not export arrays, which the pre-existing
+ * SHVAR_ARRAY comment already noted. So arrays live here and g_env is
+ * untouched.
+ *
+ * SPARSE ON PURPOSE. `a[0]=x; a[9]=y` has two elements and indices 0 and 9 --
+ * ${#a[@]} is 2, not 10, and ${!a[@]} prints "0 9". A dense vector would have
+ * to invent eight empty elements and would get both answers wrong, so the
+ * store is a list of (index, value) kept sorted by index.
+ *
+ * THE MULTI-WORD PROBLEM IS ALREADY SOLVED. "${a[@]}" must expand to one word
+ * per element even inside double quotes -- exactly the property "$@" has --
+ * and this shell already carries SHELL_ARG_MARK (0x01) for that, a byte no
+ * expansion can produce. Array expansion reuses it rather than inventing a
+ * second mechanism; see shell_append_array_join(). */
+#define SH_ARRAY_MAX    64      /* distinct arrays alive at once */
+#define SH_ARRELEM_MAX  512     /* elements in one array */
+
+struct sh_arr_elem { long idx; char *val; };
+struct sh_array {
+    char *name;
+    struct sh_arr_elem e[SH_ARRELEM_MAX];
+    int  n;                     /* used slots, kept sorted by idx */
+};
+static struct sh_array g_arrays[SH_ARRAY_MAX];
+static int g_narrays;
+
+static struct sh_array *sh_array_find(const char *name) {
+    if (!name || !*name) return 0;
+    for (int i = 0; i < g_narrays; i++)
+        if (g_arrays[i].name && strcmp(g_arrays[i].name, name) == 0)
+            return &g_arrays[i];
+    return 0;
+}
+
+static struct sh_array *sh_array_create(const char *name) {
+    struct sh_array *a = sh_array_find(name);
+    if (a) return a;
+    if (g_narrays >= SH_ARRAY_MAX) return 0;
+    a = &g_arrays[g_narrays];
+    size_t n = strlen(name) + 1;
+    a->name = (char *)kmalloc(n);
+    if (!a->name) return 0;
+    memcpy(a->name, name, n);
+    a->n = 0;
+    g_narrays++;
+    return a;
+}
+
+/* Drop one element, keeping the remaining indices EXACTLY as they were --
+ * `unset a[1]` leaves a hole, it does not renumber. */
+static void sh_array_unset_idx(struct sh_array *a, long idx) {
+    if (!a) return;
+    for (int i = 0; i < a->n; i++) {
+        if (a->e[i].idx != idx) continue;
+        kfree(a->e[i].val);
+        for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
+        a->n--;
+        return;
+    }
+}
+
+static void sh_array_unset(const char *name) {
+    struct sh_array *a = sh_array_find(name);
+    if (!a) return;
+    for (int i = 0; i < a->n; i++) kfree(a->e[i].val);
+    a->n = 0;
+    kfree(a->name);
+    int slot = (int)(a - g_arrays);
+    for (int j = slot; j + 1 < g_narrays; j++) g_arrays[j] = g_arrays[j + 1];
+    g_narrays--;
+}
+
+static int sh_array_set(const char *name, long idx, const char *val) {
+    if (idx < 0) return -1;
+    struct sh_array *a = sh_array_create(name);
+    if (!a) return -1;
+    size_t vn = strlen(val) + 1;
+    char *copy = (char *)kmalloc(vn);
+    if (!copy) return -1;
+    memcpy(copy, val, vn);
+    for (int i = 0; i < a->n; i++) {                 /* replace in place */
+        if (a->e[i].idx == idx) {
+            kfree(a->e[i].val);
+            a->e[i].val = copy;
+            return 0;
+        }
+    }
+    if (a->n >= SH_ARRELEM_MAX) { kfree(copy); return -1; }
+    int at = a->n;                                   /* keep sorted by idx */
+    while (at > 0 && a->e[at - 1].idx > idx) { a->e[at] = a->e[at - 1]; at--; }
+    a->e[at].idx = idx;
+    a->e[at].val = copy;
+    a->n++;
+    return 0;
+}
+
+static const char *sh_array_get(const char *name, long idx) {
+    struct sh_array *a = sh_array_find(name);
+    if (!a) return 0;
+    for (int i = 0; i < a->n; i++)
+        if (a->e[i].idx == idx) return a->e[i].val;
+    return 0;
+}
+
+/* Highest index in use, or -1 when empty. `a+=(v)` appends at this + 1, which
+ * is bash's rule and is NOT the same as appending at ${#a[@]} once the array
+ * is sparse. */
+static long sh_array_max_idx(const struct sh_array *a) {
+    return (a && a->n) ? a->e[a->n - 1].idx : -1;
+}
+
 static bool shell_name_is_valid(const char *s, size_t n) {
     if (!s || n == 0) return false;
     char c = s[0];
@@ -2482,8 +2724,30 @@ static void cmd_unset(int argc, char **argv) {
         return;
     }
     for (int i = first; i < argc; i++) {
-        if (functions) shell_function_unset(argv[i]);
-        else if (env_unset(argv[i]) < 0) shell_set_status(1);
+        if (functions) { shell_function_unset(argv[i]); continue; }
+        /* `unset a[1]` drops ONE element and leaves the rest numbered as they
+         * were -- it does not renumber, which is why the store is sparse.
+         * `unset a` drops the whole array. Both are checked before the scalar
+         * path so a name that is an array is not left behind in g_env. */
+        {
+            size_t al = strlen(argv[i]);
+            char nm[128], sub[128];
+            if (sh_split_subscript(argv[i], al, nm, sizeof nm,
+                                   sub, sizeof sub)) {
+                struct sh_array *arr = sh_array_find(nm);
+                bool num = (sub[0] != 0);
+                long ix = 0;
+                for (const char *q = sub; *q; q++) {
+                    if (*q < '0' || *q > '9') { num = false; break; }
+                    ix = ix * 10 + (*q - '0');
+                }
+                if (arr && num) { sh_array_unset_idx(arr, ix); continue; }
+            } else if (sh_array_find(argv[i])) {
+                sh_array_unset(argv[i]);
+                continue;
+            }
+        }
+        if (env_unset(argv[i]) < 0) shell_set_status(1);
     }
 }
 
@@ -6743,6 +7007,17 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         bool assign = false;
         for (size_t i = 0; i < n; i++) {
             if (w[i] == '=') { assign = (i > 0); break; }
+            /* `a+=(x)` and `a[2]=v` are assignments too, so the characters
+             * that may precede the `=` are not only NAME characters.
+             *
+             * `+` counts only immediately before the `=` (the append
+             * OPERATOR), and a `[...]` subscript counts anywhere after the
+             * first character. Without this the scanner did not see an
+             * assignment prefix, so the array literal's `(` looked illegal
+             * and `a+=(appended)` died with the bad-paren status 2 -- while
+             * plain `a=(...)` worked, which is a confusing pair to debug. */
+            if (w[i] == '+' && i > 0 && i + 1 < n && w[i + 1] == '=') continue;
+            if (w[i] == '[' || w[i] == ']') { if (i > 0) continue; break; }
             if (!((w[i] >= 'A' && w[i] <= 'Z') || (w[i] >= 'a' && w[i] <= 'z') ||
                   (w[i] >= '0' && w[i] <= '9') || w[i] == '_')) break;
         }
@@ -10815,6 +11090,52 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
     return 0;
 }
 
+/* "${a[@]}" and "${a[*]}", which are the array spellings of "$@" and "$*" and
+ * behave identically -- so this is deliberately the same shape as
+ * shell_append_positional_join() above rather than a second mechanism.
+ *
+ *   star=false  one word per element, SHELL_ARG_MARK prefixed, so the words
+ *               survive double quotes. Zero elements yields zero words.
+ *   star=true   a single word joined by the first character of IFS.
+ *
+ * `indices` switches the source from values to subscripts, which is ${!a[@]}.
+ * Sparse arrays are why that exists at all: after `a[0]=x; a[9]=y` the
+ * indices are 0 and 9, and no amount of counting recovers them. */
+static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
+                                   const char *name, bool star, bool indices) {
+    struct sh_array *a = sh_array_find(name);
+    int n = a ? a->n : 0;
+    char sep = ' ';
+    const char *ifs = env_get("IFS");
+    if (ifs && *ifs) sep = ifs[0];
+    else if (ifs) sep = '\0';
+
+    if (!star) {
+        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        for (int i = 0; i < n; i++) {
+            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                return -1;
+            if (indices) {
+                if (shell_append_uint(buf, pos, cap,
+                                      (unsigned long)a->e[i].idx) < 0) return -1;
+            } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
+        if (indices) {
+            if (shell_append_uint(buf, pos, cap,
+                                  (unsigned long)a->e[i].idx) < 0) return -1;
+        } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* `is_join` reports a `$@`/`$*` value: one whose SHELL_ARG_MARKs are
  * structure rather than data. Everything else comes back as raw bytes, which
  * is what the pattern operators and ${#x} want to work on -- so the escaping
@@ -11264,6 +11585,70 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             expr[1 + plen] == '\0') {
             length_mode = true;
             expr++;
+        }
+    }
+
+    /* ---- ARRAY SUBSCRIPTS: ${a[i]} ${a[@]} ${a[*]} ${#a[@]} ${!a[@]} ------
+     *
+     * Handled before shell_parse_braced_name() because a subscript is not part
+     * of a NAME and that parser would reject it. Anything that is not a valid
+     * name followed by a bracketed subscript falls straight through to the
+     * scalar path, so this cannot change existing behaviour.
+     *
+     * `indices` (${!a[@]}) is stripped here rather than by the generic `!`
+     * indirection handler above: for an array the `!` means SUBSCRIPTS, not
+     * "expand the value as a variable name". */
+    {
+        const char *aexpr = expr;
+        bool indices = false;
+        bool count = length_mode;
+        /* ${#a[@]} never sets length_mode: that detection requires the text
+         * after `#` to be EXACTLY a name, and `a[@]` is a name plus a
+         * subscript. So the `#` is still on the front here and has to be
+         * stripped locally -- otherwise the name reads as `#a`, fails
+         * validation, and the whole expansion falls through to the scalar
+         * path, which is why the `count=` line vanished entirely. */
+        if (!count && aexpr[0] == '#' && aexpr[1]) { count = true; aexpr++; }
+        if (aexpr[0] == '!' && aexpr[1]) { indices = true; aexpr++; }
+        const char *lb = 0;
+        for (const char *q = aexpr; *q; q++) if (*q == '[') { lb = q; break; }
+        size_t nlen = lb ? (size_t)(lb - aexpr) : 0;
+        if (lb && nlen && shell_name_is_valid(aexpr, nlen)) {
+            size_t elen = strlen(aexpr);
+            if (aexpr[elen - 1] == ']') {
+                char nm[128];
+                if (nlen + 1 <= sizeof nm) {
+                    memcpy(nm, aexpr, nlen); nm[nlen] = '\0';
+                    const char *sub = lb + 1;
+                    size_t slen = elen - nlen - 2;
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*')) {
+                        bool star = (sub[0] == '*');
+                        if (count) {                 /* ${#a[@]} -- COUNT */
+                            struct sh_array *a = sh_array_find(nm);
+                            return shell_append_uint(buf, pos, cap,
+                                       (unsigned long)(a ? a->n : 0));
+                        }
+                        return shell_append_array_join(buf, pos, cap, nm,
+                                                       star, indices);
+                    }
+                    /* A numeric subscript. Everything else (arithmetic,
+                     * associative keys) falls through rather than guessing. */
+                    bool num = slen > 0;
+                    long idx = 0;
+                    for (size_t i = 0; i < slen; i++) {
+                        if (sub[i] < '0' || sub[i] > '9') { num = false; break; }
+                        idx = idx * 10 + (sub[i] - '0');
+                    }
+                    if (num) {
+                        const char *v = sh_array_get(nm, idx);
+                        if (count)                   /* ${#a[i]} -- LENGTH */
+                            return shell_append_uint(buf, pos, cap,
+                                       (unsigned long)(v ? strlen(v) : 0));
+                        if (!v) return 0;            /* unset element: empty */
+                        return shell_append_data_str(buf, pos, cap, v);
+                    }
+                }
+            }
         }
     }
 
@@ -12840,6 +13225,31 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             return -1; lit_open = false; } } while (0)
         while (*p && !is_space(*p) && !shell_operator_char(*p)) {
             got = true;
+            /* AN ARRAY LITERAL IS ONE WORD, spaces and all.
+             *
+             *     a=(one two three)
+             *
+             * Word splitting would otherwise cut that into `a=(one`, `two`
+             * and `three)`, so `two` became a COMMAND -- tsh really did try to
+             * launch /bin/two. The whole parenthesised run is copied verbatim
+             * into the current word; sh_array_assign_literal() splits it later,
+             * after quoting has been resolved.
+             *
+             * Only in ASSIGNMENT position and only when the word so far ends
+             * with `=`, so `echo (x)` and `f (x)` keep their meanings. The
+             * validity scanner above already rejects the illegal shapes
+             * (`ls foo=(1 2)`, `a= (1 2)`, `for x in a=()`). */
+            if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' && prefix_ok) {
+                int depth = 0;
+                do {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') depth--;
+                    if (shell_append_char(words, &wpos, word_cap, *p) < 0)
+                        return -1;
+                    p++;
+                } while (*p && depth > 0);
+                continue;
+            }
             if (*p == '$' && p[1] == '\'') {
                 SH_LIT_CLOSE();
                 word_quoted = true;
@@ -14665,7 +15075,20 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
 static bool shell_is_assignment_word(const char *s) {
     if (!s) return false;
     size_t klen = env_key_len(s);
-    return s[klen] == '=' && shell_name_is_valid(s, klen);
+    if (s[klen] != '=') return false;
+    /* `a+=v` -- the '+' is part of the OPERATOR, not the name. */
+    size_t nlen = klen;
+    if (nlen && s[nlen - 1] == '+') nlen--;
+    if (shell_name_is_valid(s, nlen)) return true;
+    /* `a[i]=v` and `a[i]+=v`. A subscript is not part of a NAME, so without
+     * this the whole word is taken for a COMMAND and the line dies with
+     * "not found" -- which is what tsh did before arrays existed. */
+    {
+        char nm[128], sub[128];
+        if (sh_split_subscript(s, nlen, nm, sizeof nm, sub, sizeof sub))
+            return shell_name_is_valid(nm, strlen(nm));
+    }
+    return false;
 }
 
 static bool shell_assignment_overrides(const char *kv, char **assignv,
