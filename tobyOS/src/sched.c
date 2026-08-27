@@ -691,18 +691,44 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
     perf_count_ctx_switch();
     perf_zone_end(PERF_Z_SCHED_SWITCH, t);
 
-#ifdef CHROMIUM_BOOT
     /* Slice 89 tripwire: switching into a proc that is STILL live on another
      * CPU means two CPUs will run the same kernel stack/register image --
      * the exact mechanism that produces "kernel pointers in user registers"
      * and wandering heap corruption. Every picker is supposed to skip
-     * on_cpu procs; if this ever fires, one of them does not. */
+     * on_cpu procs; if this ever fires, one of them does not.
+     *
+     * 2026-08-26: MADE UNCONDITIONAL, for the same reason sched_ctx_plausible
+     * was (dc9c955) -- it lived behind #ifdef CHROMIUM_BOOT, so the SHIPPED
+     * kernel never asked the question, on real hardware or anywhere else.
+     *
+     * WHY THIS IS NOW THE PRIME SUSPECT for the wake-after-death flake. The
+     * captured fire (loop-20260826-225352/run001.log) panics in
+     * syscall_dispatch with r12 -- the compiler's cached `caller` -- zeroed
+     * across do_syscall, and rbx, which holds the syscall NUMBER for that
+     * call, containing a kernel pointer instead of a small integer. "Kernel
+     * pointers in user registers" is this comment's own words. It also
+     * explains why sched_ctx_plausible did NOT fire on that boot: in a
+     * dual-schedule the saved_rsp is perfectly VALID -- it simply belongs to
+     * a proc another CPU is already running -- so a guard that checks whether
+     * saved_rsp lies inside the proc's own kernel stack is structurally blind
+     * to this failure. Two CPUs then pop the same saved register image.
+     *
+     * Logging only, deliberately: refusing the switch here would be a fix
+     * built on one sample, and if the on_cpu flag can be STALE the refusal
+     * would strand a runnable proc. Capped so a repeating fire cannot bury
+     * the serial log it is the only evidence in. */
     if (__atomic_load_n(&to->on_cpu, __ATOMIC_ACQUIRE)) {
-        kprintf("[dsched] DUAL-SCHEDULE pid=%d state=%d on cpu%u (from=%d)\n",
-                to->pid, (int)to->state, me->cpu_idx,
-                from ? from->pid : -1);
+        static int dsched_logged;
+        if (dsched_logged < 16) {
+            dsched_logged++;
+            kprintf("[dsched] DUAL-SCHEDULE pid=%d '%s' state=%d dying=%d "
+                    "on cpu%u (from pid=%d) saved_rsp=0x%lx kstack_top=0x%lx\n",
+                    to->pid, to->name, (int)to->state, to->dying ? 1 : 0,
+                    me->cpu_idx, from ? from->pid : -1,
+                    (unsigned long)to->saved_rsp,
+                    (unsigned long)(uintptr_t)to->kstack_top);
+        }
     }
-#endif
 #ifdef CHROMIUM_BOOT
     /* Slice 94: [wlat] -- wall time between a proc being made READY and it
      * actually starting to run. This is THE number behind every IPC hop on
