@@ -394,6 +394,24 @@ static void  sh_array_unset_idx(struct sh_array *a, long idx);
 static int   sh_array_set(const char *name, long idx, const char *val);
 static const char *sh_array_get(const char *name, long idx);
 static long  sh_array_max_idx(const struct sh_array *a);
+static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
+                                   const char *name, bool star,
+                                   long off, long cnt);
+static bool  sh_subscript_eval(const char *sub, const char *name,
+                               bool for_write, long *out);
+/* Moved up from beside the evaluator: an array SUBSCRIPT is arithmetic
+ * context, so sh_subscript_eval() below needs the COMPLETE type. */
+struct shell_arith {
+    const char *p;
+    bool ok;
+};
+/* The real entry point. `shell_arith_expr` is a MACRO alias for this,
+ * #defined ~10k lines below -- so calling it up here compiles fine and
+ * then fails at LINK with "undefined symbol: shell_arith_expr".
+ * -fsyntax-only cannot see that, which is why it went unnoticed while
+ * the gate quietly re-ran a stale ISO. */
+static long shell_arith_comma(struct shell_arith *a);
+static void shell_arith_skip(struct shell_arith *a);
 static const char *sh_split_subscript(const char *key, size_t klen,
                                       char *name, size_t namecap,
                                       char *sub, size_t subcap);
@@ -976,10 +994,7 @@ static int sh_try_array_assignment(const char *kv) {
     if (sh_split_subscript(kv, keylen, name, sizeof name, sub, sizeof sub)) {
         if (!shell_name_is_valid(name, strlen(name))) return 0;
         long idx = 0;
-        for (const char *q = sub; *q; q++) {
-            if (*q < '0' || *q > '9') return 0;      /* not an index we grok */
-            idx = idx * 10 + (*q - '0');
-        }
+        if (!sh_subscript_eval(sub, name, true, &idx)) return 0;
         if (append) {
             const char *old = sh_array_get(name, idx);
             char joined[512];
@@ -2063,6 +2078,43 @@ static int sh_array_set(const char *name, long idx, const char *val) {
     return 0;
 }
 
+/* Evaluate an array SUBSCRIPT.
+ *
+ * A subscript is ARITHMETIC CONTEXT, not a literal integer: `${a[i]}` reads
+ * the variable i, `${a[i+1]}` computes, and `${a[$i]}` works because the text
+ * is expanded before it gets here. A digit-only parse -- which is what the
+ * first cut did -- makes every one of those silently fall through to the
+ * scalar path and expand empty.
+ *
+ * A NEGATIVE index counts back from the end: ${a[-1]} is the last element.
+ * bash resolves that against the HIGHEST INDEX, not the count, so it stays
+ * correct on a sparse array. Returns false when the text is not a usable
+ * subscript, and the caller then leaves the word alone rather than guessing.
+ *
+ * `for_write` suppresses the negative rewrite for assignment targets, where
+ * bash rejects a negative subscript on an array that has no elements yet. */
+static bool sh_subscript_eval(const char *sub, const char *name,
+                              bool for_write, long *out) {
+    if (!sub || !*sub) return false;
+    char expanded[256];
+    const char *src = sub;
+    if (shell_expand_literal_quotes(sub, expanded, sizeof expanded) == 0)
+        src = expanded;
+    struct shell_arith a = { .p = src, .ok = true };
+    long v = shell_arith_comma(&a);
+    shell_arith_skip(&a);
+    if (!a.ok || *a.p != '\0') return false;
+    if (v < 0) {
+        struct sh_array *arr = sh_array_find(name);
+        long top = sh_array_max_idx(arr);
+        if (top < 0) { if (for_write) return false; *out = -1; return true; }
+        v = top + 1 + v;                    /* -1 -> the last element */
+        if (v < 0) { *out = -1; return true; }   /* out of range: unset */
+    }
+    *out = v;
+    return true;
+}
+
 static const char *sh_array_get(const char *name, long idx) {
     struct sh_array *a = sh_array_find(name);
     if (!a) return 0;
@@ -2735,13 +2787,11 @@ static void cmd_unset(int argc, char **argv) {
             if (sh_split_subscript(argv[i], al, nm, sizeof nm,
                                    sub, sizeof sub)) {
                 struct sh_array *arr = sh_array_find(nm);
-                bool num = (sub[0] != 0);
                 long ix = 0;
-                for (const char *q = sub; *q; q++) {
-                    if (*q < '0' || *q > '9') { num = false; break; }
-                    ix = ix * 10 + (*q - '0');
+                if (arr && sh_subscript_eval(sub, nm, false, &ix)) {
+                    sh_array_unset_idx(arr, ix);
+                    continue;
                 }
-                if (arr && num) { sh_array_unset_idx(arr, ix); continue; }
             } else if (sh_array_find(argv[i])) {
                 sh_array_unset(argv[i]);
                 continue;
@@ -11156,6 +11206,48 @@ static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
     return 0;
 }
 
+/* ${a[@]:off:len}. Deliberately the same shape as shell_append_array_join()
+ * above -- a slice differs only in WHICH elements it visits, so quoting still
+ * produces one word each.
+ *
+ * The window is over ELEMENT POSITION, not over subscript value: on a sparse
+ * array `${a[@]:1:2}` means "the second and third elements that exist", which
+ * is what bash does and is why this walks the store rather than indexing it.
+ * A negative or absent count means "to the end". */
+static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
+                                    const char *name, bool star,
+                                    long off, long cnt) {
+    struct sh_array *a = sh_array_find(name);
+    int n = a ? a->n : 0;
+    if (off < 0) { off = n + off; if (off < 0) off = 0; }
+    long end = (cnt < 0) ? n : off + cnt;
+    if (end > n) end = n;
+
+    char sep = ' ';
+    const char *ifs = env_get("IFS");
+    if (ifs && *ifs) sep = ifs[0];
+    else if (ifs) sep = '\0';
+
+    if (!star) {
+        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        bool first = true;
+        for (long i = off; i < end; i++) {
+            if (!first && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                return -1;
+            first = false;
+            if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) return -1;
+        }
+        return 0;
+    }
+    bool first = true;
+    for (long i = off; i < end; i++) {
+        if (!first && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
+        first = false;
+        if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) return -1;
+    }
+    return 0;
+}
+
 /* `is_join` reports a `$@`/`$*` value: one whose SHELL_ARG_MARKs are
  * structure rather than data. Everything else comes back as raw bytes, which
  * is what the pattern operators and ${#x} want to work on -- so the escaping
@@ -11634,14 +11726,51 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         for (const char *q = aexpr; *q; q++) if (*q == '[') { lb = q; break; }
         size_t nlen = lb ? (size_t)(lb - aexpr) : 0;
         if (lb && nlen && shell_name_is_valid(aexpr, nlen)) {
-            size_t elen = strlen(aexpr);
-            if (aexpr[elen - 1] == ']') {
+            /* Find the bracket that CLOSES this subscript. It is not
+             * necessarily the last character: ${a[@]:1:2} and ${a[@]#pat}
+             * both carry an operator SUFFIX after the `]`. An earlier cut
+             * tested `aexpr[strlen-1] == ']'`, so every sliced form missed
+             * the array branch entirely and fell through to the scalar path
+             * as "bad substitution". */
+            const char *rb = 0;
+            {
+                int d = 0;
+                for (const char *q = lb; *q; q++) {
+                    if (*q == '[') d++;
+                    else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
+                }
+            }
+            if (rb) {
                 char nm[128];
                 if (nlen + 1 <= sizeof nm) {
                     memcpy(nm, aexpr, nlen); nm[nlen] = '\0';
                     const char *sub = lb + 1;
-                    size_t slen = elen - nlen - 2;
-                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*')) {
+                    size_t slen = (size_t)(rb - lb - 1);
+                    const char *suffix = rb + 1;   /* "", ":1:2", "#pat", ... */
+                    /* ${a[@]:off:len} -- a slice is still a join, just over
+                     * a window. Quoted, it must STILL yield one word per
+                     * element, so it goes through the same ARG_MARK path
+                     * rather than being flattened to a string first. */
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
+                        suffix[0] == ':') {
+                        bool star = (sub[0] == '*');
+                        char spec[192];
+                        size_t sfl = strlen(suffix + 1);
+                        if (sfl + 1 > sizeof spec) return 0;
+                        memcpy(spec, suffix + 1, sfl);
+                        spec[sfl] = '\0';
+                        char *colon = 0;
+                        for (char *q = spec; *q; q++) if (*q == ':') { colon = q; break; }
+                        if (colon) *colon = '\0';
+                        long off = 0, cnt = -1;
+                        if (!sh_subscript_eval(spec, nm, false, &off)) off = 0;
+                        if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
+                            cnt = -1;
+                        return shell_append_array_slice(buf, pos, cap, nm,
+                                                        star, off, cnt);
+                    }
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
+                        suffix[0] == '\0') {
                         bool star = (sub[0] == '*');
                         if (count) {                 /* ${#a[@]} -- COUNT */
                             struct sh_array *a = sh_array_find(nm);
@@ -11651,13 +11780,18 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                         return shell_append_array_join(buf, pos, cap, nm,
                                                        star, indices);
                     }
-                    /* A numeric subscript. Everything else (arithmetic,
-                     * associative keys) falls through rather than guessing. */
-                    bool num = slen > 0;
+                    /* The subscript is an ARITHMETIC EXPRESSION -- a bare
+                     * name, a computation, or a negative index counting back
+                     * from the end. sh_subscript_eval owns all of that. */
+                    char subbuf[256];
                     long idx = 0;
-                    for (size_t i = 0; i < slen; i++) {
-                        if (sub[i] < '0' || sub[i] > '9') { num = false; break; }
-                        idx = idx * 10 + (sub[i] - '0');
+                    bool num = false;
+                    /* A suffix on a single element (${a[0]#pat}) is a pattern
+                     * operator, not handled here yet -- fall through rather
+                     * than silently dropping it. */
+                    if (suffix[0] == '\0' && slen + 1 <= sizeof subbuf) {
+                        memcpy(subbuf, sub, slen); subbuf[slen] = '\0';
+                        num = sh_subscript_eval(subbuf, nm, false, &idx);
                     }
                     if (num) {
                         const char *v = sh_array_get(nm, idx);
@@ -11997,10 +12131,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
 #undef SH_WORD_TILDE
 }
 
-struct shell_arith {
-    const char *p;
-    bool ok;
-};
+/* struct shell_arith is defined up with the array store -- an array
+ * SUBSCRIPT is arithmetic context, so sh_subscript_eval() needs the
+ * complete type long before this point. */
 
 static void shell_arith_skip(struct shell_arith *a) {
     while (*a->p == ' ' || *a->p == '\t') a->p++;

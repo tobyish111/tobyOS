@@ -39,10 +39,27 @@ echo "=== build gate ISO ($CASES cases) ==="
 # kernel.c carries the SHPARITY_BOOT hook, so it must be recompiled whenever
 # the flag changes -- make cannot see a -D change as a reason to rebuild.
 touch src/kernel.c
-make "${MAKE_TMP[@]}" iso \
-    EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DSHPARITY_BOOT" \
-    >logs/shparity.build.log 2>&1
-[ -f tobyOS.iso ] || { echo "ISO BUILD FAIL"; tail -30 logs/shparity.build.log; exit 1; }
+# GATE THE BUILD ON make's EXIT STATUS, not on the ISO merely existing.
+#
+# This checked `[ -f tobyOS.iso ]`, which a STALE iso from the previous run
+# satisfies -- so a failed build sailed straight past and every case ran
+# against old bits. The header of this file already warns "a failed build
+# silently leaves the PREVIOUS iso in place and you test stale bits"; the
+# check just did not implement it.
+#
+# It cost real time on 2026-08-27: a link error (undefined symbol
+# shell_arith_expr, a macro alias declared 10k lines above its #define)
+# left tobyos.bin unbuilt, and three rounds of array work were "tested"
+# against an ISO that predated them. Report the actual error, too -- the
+# tail of a build log is usually the ISO packaging, not the failure.
+if ! make "${MAKE_TMP[@]}" iso \
+        EXTRA_CFLAGS="-DFAST_BOOT -DQUICK_BOOT -DSHPARITY_BOOT" \
+        >logs/shparity.build.log 2>&1; then
+    echo "ISO BUILD FAIL -- not running a stale iso. Errors:"
+    grep -E ' error:|undefined symbol|Error [0-9]' logs/shparity.build.log | head -20
+    exit 1
+fi
+[ -f tobyOS.iso ] || { echo "ISO MISSING after a successful make"; exit 1; }
 
 # GATE 0: the flags and the payload must actually be IN the artefacts. A build
 # that quietly skipped the recompile, or an initrd missing the corpus, would
