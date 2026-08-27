@@ -283,9 +283,28 @@ int main(void)
         if (got == 0x5A5A5A5A)
             ok(32, "POKEDATA landed: the child read back %ld from a variable "
                    "only the tracer wrote", got);
-        else
-            no("the child reported %ld, want %ld -- POKEDATA did not reach "
-               "the other address space", got, (long)0x5A5A5A5A);
+        else {
+            /* `got` defaults to 0 AND is 0 when the child genuinely reports 0,
+             * so the bare number cannot say which failed: the poke, or the
+             * pipe readback this assertion rides on. Print the evidence.
+             * Note the child inherited g_poked = 0x1111 across fork, so a
+             * report of 0 is not even the pre-poke value -- that would point
+             * at the readback or at the child's page, not at POKEDATA. */
+            no("the child reported %ld (0x%lx), want %ld -- POKEDATA did not "
+               "reach the other address space", got, got, (long)0x5A5A5A5A);
+            no("  evidence: total=%ld pattern_match=%d num='%.*s'",
+               (long)total,
+               (total >= (ssize_t)PATLEN && memcmp(out, PATTERN, PATLEN) == 0),
+               (int)(total > (ssize_t)PATLEN ? total - (ssize_t)PATLEN : 0),
+               num);
+            {
+                char hex[3 * 24 + 1]; int hn = 0;
+                for (int i = 0; i < total && i < 24; i++)
+                    hn += snprintf(hex + hn, sizeof hex - (size_t)hn, "%02x ",
+                                   (unsigned char)out[i]);
+                no("  first bytes: %s", hex);
+            }
+        }
     }
 
     if (refusals_ok)

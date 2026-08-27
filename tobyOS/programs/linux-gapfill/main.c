@@ -42,7 +42,13 @@
  *      the open while dropping them would hand back a sandbox that does not
  *      exist. The errno is the assertion, not the failure.
  *
- * exit status is the bitmask; 255 = all eight.
+ * bit8 fchdir(2) actually MOVES the cwd (getcwd confirms) and REFUSES a
+ *      non-directory fd with ENOTDIR. It was missing from the kernel and from
+ *      libtoby entirely, so every openat(dirfd)+fchdir traversal got -ENOSYS.
+ *
+ * exit status is 255 for all NINE, 0 otherwise; the BITS= line is the
+ * diagnosis (bits 0..7 filled a byte, so the exit can no longer be the mask
+ * -- see the note in main()).
  * ===========================================================================
  */
 #define _GNU_SOURCE
@@ -404,6 +410,64 @@ static void check_openat2(void)
             "not silently ignored");
 }
 
+/* ---- bit 8: fchdir --------------------------------------------------------
+ *
+ * fchdir(2) was absent from BOTH the kernel dispatcher and libtoby until
+ * 2026-08-26, so it fell through to the ENOSYS logger. Not exotic: the
+ * openat(dirfd)+fchdir idiom is how find, tar, rsync, git and glibc's nftw(3)
+ * walk a tree without rebuilding path strings, so real directory traversal was
+ * quietly getting -ENOSYS.
+ *
+ * Two-sided on purpose. "fchdir returned 0" proves nothing -- a stub that
+ * returns success would pass it. The claim is that the CWD ACTUALLY MOVED, so
+ * getcwd() must report the new directory afterwards; and a NON-directory fd
+ * must be REFUSED with ENOTDIR rather than silently accepted, because a
+ * chdir to nowhere is worse than an error. */
+static void check_fchdir(void)
+{
+    char before[4096], after[4096];
+    if (!getcwd(before, sizeof before)) { no("fchdir: getcwd errno=%d", errno); return; }
+
+    if (mkdir("/data/fchd", 0755) != 0 && errno != EEXIST) {
+        no("fchdir: mkdir errno=%d", errno); return;
+    }
+    int dfd = open("/data/fchd", O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { no("fchdir: open(dir) errno=%d", errno); return; }
+
+    if (fchdir(dfd) != 0) {
+        no("fchdir: returned errno=%d (was -ENOSYS before 2026-08-26)", errno);
+        close(dfd); return;
+    }
+    if (!getcwd(after, sizeof after)) {
+        no("fchdir: getcwd after errno=%d", errno); close(dfd); return;
+    }
+    if (strcmp(after, "/data/fchd") != 0) {
+        no("fchdir: returned 0 but cwd is '%s', not /data/fchd -- the call "
+           "succeeded without moving anything", after);
+        close(dfd); (void)chdir(before); return;
+    }
+    close(dfd);
+
+    /* The refusal is the other half of the claim. */
+    int ffd = open("/data/fchd/f", O_RDWR | O_CREAT, 0644);
+    if (ffd < 0) { no("fchdir: could not make a plain file (errno=%d)", errno);
+                   (void)chdir(before); return; }
+    int r = fchdir(ffd);
+    int e = errno;
+    close(ffd);
+    (void)chdir(before);
+    if (r == 0) {
+        no("fchdir: ACCEPTED a non-directory fd -- cwd is now undefined");
+        return;
+    }
+    if (e != ENOTDIR) {
+        no("fchdir: refused a plain file with errno=%d, want ENOTDIR(%d)",
+           e, ENOTDIR);
+        return;
+    }
+    ok(0x100, "fchdir moves the cwd and refuses a non-directory (ENOTDIR)");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -416,6 +480,12 @@ int main(void)
     check_getcpu();
     check_hints();
     check_openat2();
-    printf("gapfill: BITS=0x%x (want 0xff)\n", g_bits);
-    return g_bits;
+    check_fchdir();
+    /* THE EXIT CONTRACT CHANGED 2026-08-27, and the reason matters. Bits 0..7
+     * filled a byte exactly (0xff) and the gate asserts exit==255, so a ninth
+     * check had nowhere to go. Returning `g_bits & 0xff` would have been a
+     * FALSE PASS: bits 0-7 green with bit8 red still yields 255. So the exit is
+     * now PASS/FAIL and the BITS= line carries the diagnosis. */
+    printf("gapfill: BITS=0x%x (want 0x1ff)\n", g_bits);
+    return (g_bits == 0x1ff) ? 255 : 0;
 }
