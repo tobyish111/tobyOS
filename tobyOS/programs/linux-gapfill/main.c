@@ -46,7 +46,10 @@
  *      non-directory fd with ENOTDIR. It was missing from the kernel and from
  *      libtoby entirely, so every openat(dirfd)+fchdir traversal got -ENOSYS.
  *
- * exit status is 255 for all NINE, 0 otherwise; the BITS= line is the
+ * bit9 pause() is NOT woken by an ignored signal (a reaped child's SIGCHLD);
+ *      it must sleep on until a signal that is actually acted on.
+ *
+ * exit status is 255 for all TEN, 0 otherwise; the BITS= line is the
  * diagnosis (bits 0..7 filled a byte, so the exit can no longer be the mask
  * -- see the note in main()).
  * ===========================================================================
@@ -64,6 +67,7 @@
 #include <sys/wait.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <signal.h>
 
 #ifndef AT_FDCWD
 #define AT_FDCWD (-100)
@@ -468,6 +472,51 @@ static void check_fchdir(void)
     ok(0x100, "fchdir moves the cwd and refuses a non-directory (ENOTDIR)");
 }
 
+/* ---- bit 9: pause() is not woken by an IGNORED signal ---------------------
+ *
+ * POSIX: pause() returns only when a signal is CAUGHT (a handler runs) or
+ * terminates the process. A signal being IGNORED is not a reason to return.
+ * Before 2026-08-27 every blocking primitive here tested pending_signals raw,
+ * so a reaped child's SIGCHLD -- default action ignore -- returned EINTR out
+ * of a pause() that should have kept sleeping.
+ *
+ * DISCRIMINATES BY FLAG, NOT BY CLOCK. An earlier gate in this tree became
+ * flaky because it judged a correctness property against a wall-clock
+ * deadline; here the SIGALRM handler sets g_alarmed, so the assertion is
+ * "which signal woke us", and the timings only need to be far apart
+ * (~0.3 s child exit vs a 3 s alarm), not accurate. The alarm also
+ * guarantees the case cannot hang the gate if the fix regresses the other
+ * way and pause() sleeps forever. */
+static volatile sig_atomic_t g_alarmed;
+static void gapfill_on_alarm(int s) { (void)s; g_alarmed = 1; }
+
+static void check_pause_ignored(void)
+{
+    if (signal(SIGALRM, gapfill_on_alarm) == SIG_ERR) {
+        no("pause: cannot install SIGALRM handler (errno=%d)", errno); return;
+    }
+    /* SIGCHLD left at SIG_DFL == ignore, which is the whole point. */
+    pid_t k = fork();
+    if (k < 0) { no("pause: fork errno=%d", errno); return; }
+    if (k == 0) { usleep(300 * 1000); _exit(0); }   /* exits while we pause */
+
+    g_alarmed = 0;
+    alarm(3);
+    pause();
+    int woke_by_alarm = (int)g_alarmed;
+    alarm(0);
+    int st = 0;
+    (void)waitpid(k, &st, 0);
+    signal(SIGALRM, SIG_DFL);
+
+    if (!woke_by_alarm) {
+        no("pause: returned WITHOUT SIGALRM having fired -- an ignored "
+           "SIGCHLD from the reaped child woke it, which POSIX does not allow");
+        return;
+    }
+    ok(0x200, "pause() ignored a child's SIGCHLD and slept until SIGALRM");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -481,11 +530,12 @@ int main(void)
     check_hints();
     check_openat2();
     check_fchdir();
+    check_pause_ignored();
     /* THE EXIT CONTRACT CHANGED 2026-08-27, and the reason matters. Bits 0..7
      * filled a byte exactly (0xff) and the gate asserts exit==255, so a ninth
      * check had nowhere to go. Returning `g_bits & 0xff` would have been a
      * FALSE PASS: bits 0-7 green with bit8 red still yields 255. So the exit is
      * now PASS/FAIL and the BITS= line carries the diagnosis. */
-    printf("gapfill: BITS=0x%x (want 0x1ff)\n", g_bits);
-    return (g_bits == 0x1ff) ? 255 : 0;
+    printf("gapfill: BITS=0x%x (want 0x3ff)\n", g_bits);
+    return (g_bits == 0x3ff) ? 255 : 0;
 }

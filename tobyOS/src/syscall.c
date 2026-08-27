@@ -10807,7 +10807,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!p) return -ABI_EINVAL;
         bool had_bkl = bkl_held();
         if (had_bkl) bkl_exit();
-        while (!p->pending_signals) {
+        /* POSIX: pause() returns only when a signal is CAUGHT (a handler
+         * runs) or terminates the process. A signal being ignored is not a
+         * reason to return -- so if only ignorable ones ever arrive, pause
+         * blocks forever, which is correct. Previously any pending signal
+         * woke it, so an ignored SIGCHLD from a reaped child returned EINTR
+         * out of a pause() that should have kept sleeping. */
+        while (!sig_should_eintr(p)) {
             sti();
             struct percpu *me_cpu = smp_this_cpu();
             if (me_cpu && __atomic_load_n(&me_cpu->ready_head, __ATOMIC_ACQUIRE))
@@ -13007,7 +13013,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
             if (have_to && perf_now_ns() >= deadline)
                 RTSTW_RET(-ABI_EAGAIN);     /* Linux: EAGAIN on timeout */
-            if (p->pending_signals)         /* a signal we are NOT waiting for */
+            /* A signal we are NOT waiting for -- but only one that would
+             * actually be ACTED ON. An ignored SIGCHLD arriving mid-wait is
+             * not an interruption (see sig_should_eintr). Signals we ARE
+             * waiting for never reach here: the `hit` branch above consumes
+             * them. */
+            if (sig_should_eintr(p))
                 RTSTW_RET(EINTR_RET);
             sti();
             {
