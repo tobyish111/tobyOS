@@ -71,6 +71,21 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 #define CAP_TRANS   32768
 #define STEP_MS     20
 #define WAIT_MS     8000
+/* The budget for a shell to FINISH ITS SCRIPT and exit, as opposed to WAIT_MS
+ * which bounds waiting for a prompt. Separate, and much larger, on purpose.
+ *
+ * 2026-08-27: case 11-loop-1024 (5000 shell iterations, whose comment claims
+ * "quick for both shells") ran 6205 ms on an idle host and 7383-7538 ms on a
+ * busy one, against a shared 8000 ms deadline -- so it passed at 03:30 and was
+ * SIGKILLed at 09:00 with no code change. Verified by running the PRISTINE tree
+ * (7430/7398 ms, same BROKEN), so it measured host load, not the guest.
+ *
+ * That case asserts a CORRECTNESS property -- that the loop runs past tsh's old
+ * 1024-iteration cap -- and nothing about speed. A deadline tight enough to
+ * fail on host variance turns it into a flaky perf test whose failure looks
+ * exactly like a hang (st_b=-100). This bound is a HANG-DETECTOR: generous
+ * enough that only a genuinely wedged shell trips it. */
+#define EXIT_WAIT_MS 45000
 
 #define SENT_P      "@P@ "
 #define SENT_C      "@C@ "
@@ -313,7 +328,7 @@ out:;
     if (!s->broken) {
         /* Bounded: a shell that survives its own `exit` line must not hang
          * the gate -- WNOHANG-poll with a REAL-time deadline. */
-        long dl = now_ms() + WAIT_MS;
+        long dl = now_ms() + EXIT_WAIT_MS;
         while (now_ms() < dl) {
             rc = (int)waitpid(s->pid, &status, WNOHANG);
             if (rc != 0) break;
