@@ -2538,6 +2538,42 @@ static void m28b_run_crashinfo_inspector(void) {
     int rc = proc_wait(pid);
     kprintf("[boot] M28B: /bin/crashinfo (pid=%d) exit=%d (%s)\n",
             pid, rc, rc == 0 ? "PASS" : "FAIL");
+
+    /* RETIRE THE DUMP once it has been reported.
+     *
+     * Found 2026-08-26 by the flake-hunt boot loop: NOTHING ever cleared
+     * /data/crash/last.dump, so one old panic was re-decoded and re-printed on
+     * EVERY subsequent boot, forever. That is worse than noise. It makes a
+     * healthy boot indistinguishable from a fresh panic to anything grepping
+     * the serial log (logs/flakeloop.sh called run 1 a PANIC on exactly this),
+     * and it makes the dump useless for dating a crash -- the live writer in
+     * panic.c hardcodes boot_seq=1 behind a TODO and stamps `timestamp` with
+     * uptime, not wall time.
+     *
+     * crash_recovery.c has a crash_clear() that LOOKS like it does this job.
+     * It does not, on two counts: it has zero callers anywhere in the tree,
+     * and it writes a different on-disk format (CRASH_MAGIC 0xDEADC0DE against
+     * the live writer's 'CRSH'). That whole file is dead code -- do not wire
+     * it up expecting this to work.
+     *
+     * RENAME rather than unlink. A dump is the only durable record of a panic
+     * and this kernel is under an open flake hunt; one slot of history costs
+     * nothing and keeps the corpse readable. Note the register block inside it
+     * is kpanic's own capture_regs() frame, NOT the faulting one -- the real
+     * trap frame only ever exists on the [kpf] line in the serial log.
+     *
+     * Only on a SUCCESSFUL report: if crashinfo failed we may be holding a
+     * dump this build cannot decode, and retiring it would destroy the
+     * evidence for the sake of tidiness. */
+    if (rc == 0) {
+        int rr = vfs_rename("/data/crash/last.dump",
+                            "/data/crash/last.dump.reported");
+        if (rr == VFS_OK)
+            kprintf("[boot] M28B: dump retired -> last.dump.reported\n");
+        else
+            kprintf("[boot] M28B: dump retire FAILED (rc=%d) -- "
+                    "it will replay next boot\n", rr);
+    }
 }
 
 /* --- Milestone 28F: service-supervision harness ---
@@ -7911,6 +7947,84 @@ void _start(void) {
     {
         extern int sched_guard_selftest(void);
         (void)sched_guard_selftest();
+    }
+#endif
+
+#ifdef CHURN_BOOT
+    /* 2026-08-26: PROCESS-CHURN STRESSOR for the wake-after-death flake.
+     *
+     * THIS IS NOT A GATE. It has no pass/fail -- it is a workload whose only
+     * job is to make the flake fire while logs/flakeloop.sh is watching. The
+     * counters below are accounting, not a verdict.
+     *
+     * WHY CHURN. 60 idle boots produced zero fires (p ~1.6% if the rate were
+     * the recorded ~1-in-15), so idle alone is not the trigger; both archived
+     * fires followed a GATE workload. The mechanism says why: the soft guard
+     * logged "DROPPED queued dying pid=2 (state=4=PROC_TERMINATED)" on 44 of
+     * those 60 boots, so a terminated-but-still-queued proc is ROUTINE. The
+     * dangerous case needs the slot RECYCLED (proc_slot_claim clears `dying`)
+     * inside that window -- which scales with how many procs are created and
+     * destroyed, not with how long the machine sits idle.
+     *
+     * THE VACUITY TRAP, and the reason for the enable/disable bracket:
+     * boot harnesses run BSP-ONLY -- sched_enable_ap_run() does not fire until
+     * just before idle_loop. QFREEZETEST learned this the expensive way ("a
+     * first cut of this guard passed VACUOUSLY: the hammer threads never got a
+     * CPU, iters=0"). The flake is an AP-side do_switch bug, so churning
+     * without APs would exercise precisely nothing. Same bracket as
+     * QFREEZETEST/MCTEST: enable, work, restore.
+     *
+     * Batches are spawned WITHOUT waiting so several procs are live at once
+     * across CPUs -- serial spawn-then-wait would give slot reuse but no
+     * concurrent switching, and it is the combination that is suspect.
+     *
+     * argc=0 on purpose: /bin/hello (user_hello.elf) takes no arguments, and
+     * the tree has a known "argc>=1 first-run procs on an AP under SMAP
+     * SMEP-fault" issue that would confound a hunt for a different bug. */
+    {
+        extern void sched_enable_ap_run(void);
+        extern void sched_disable_ap_run(void);
+        /* Sized from measurement, not guesswork: the first cut (40 rounds)
+         * ran 640 procs in 1225 ms -- ~1.9 ms each, so it bought barely a
+         * second of pressure before a 150 s idle. Slot-recycling pressure is
+         * what this harness exists to generate and it is nearly free, so
+         * spend ~10 s of boot on it instead of ~1. */
+        enum { CHURN_ROUNDS = 300, CHURN_BATCH = 16 };
+        int pids[CHURN_BATCH];
+        int spawned = 0, reaped = 0, failed = 0, wrong_exit = 0;
+
+        kprintf("[churn] starting: %d rounds x %d concurrent, AP run ENABLED "
+                "(BSP-only would be vacuous -- this is an AP-side bug)\n",
+                CHURN_ROUNDS, CHURN_BATCH);
+        sched_enable_ap_run();
+
+        for (int r = 0; r < CHURN_ROUNDS; r++) {
+            int n = 0;
+            for (int i = 0; i < CHURN_BATCH; i++) {
+                struct proc_spec spec = {
+                    .path = "/bin/hello",
+                    .name = "churnee",
+                    .argc = 0,
+                    .argv = 0,
+                };
+                int pid = proc_spawn(&spec);
+                if (pid < 0) { failed++; break; }
+                pids[n++] = pid;
+                spawned++;
+            }
+            for (int i = 0; i < n; i++) {
+                int rc = proc_wait(pids[i]);
+                reaped++;
+                /* user_hello exits 0x55. A different code means it did not
+                 * actually run to completion -- worth counting, because a
+                 * churn of procs that never ran is the vacuous case again. */
+                if (rc != 0x55) wrong_exit++;
+            }
+        }
+
+        sched_disable_ap_run();
+        kprintf("[CHURN] done: spawned=%d reaped=%d failed=%d wrong_exit=%d\n",
+                spawned, reaped, failed, wrong_exit);
     }
 #endif
 
