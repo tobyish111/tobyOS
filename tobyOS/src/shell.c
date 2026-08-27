@@ -6306,6 +6306,13 @@ struct shell_scan {
     bool redir;         /* the next word is a redirection target, not a command */
     bool func_hdr;      /* the text so far ends in `name ( )`, body still owed */
     bool bad_paren;     /* a `(` that cannot legally be there -- see below */
+    /* Inside `name=( ... )`. NOT the same as being inside a subshell:
+     * an array literal takes WORDS, so a control operator there is a
+     * syntax error, whereas in a subshell it is ordinary. bash exits 2
+     * on `a=(1 & 2)`; without this the scanner saw a normal paren
+     * context and accepted it. */
+    bool in_array_lit;
+    int  array_lit_depth;
     bool bad_semi;      /* a `;;` outside any `case` */
     bool bad_rparen;    /* a `)` that closes nothing and is not a pattern */
     bool cmd_seen;      /* something has been said since the last separator */
@@ -6339,6 +6346,8 @@ static void shell_scan_init(struct shell_scan *st) {
     st->redir = false;
     st->func_hdr = false;
     st->bad_paren = false;
+    st->in_array_lit = false;
+    st->array_lit_depth = 0;
     st->bad_semi = false;
     st->bad_rparen = false;
     st->cmd_seen = false;
@@ -6435,6 +6444,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         return;
     }
     if (c == ';') {
+        if (st->in_array_lit) st->bad_paren = true;   /* see the `&` arm */
         bool dbl = (p[1] == ';');
         p += dbl ? 2 : 1;
         /* `;;` ONLY MEANS SOMETHING INSIDE A CASE. `echo 1 ;; echo 2` is a
@@ -6454,6 +6464,11 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         return;
     }
     if (c == '&' || c == '|') {
+        /* An array literal takes WORDS, so a control operator inside one is a
+         * syntax error -- bash exits 2 on `a=(1 & '2 3')`. Inside a SUBSHELL
+         * the same byte is ordinary, which is why this asks in_array_lit and
+         * not merely whether some paren is open. */
+        if (st->in_array_lit) st->bad_paren = true;
         bool dbl = (p[1] == c);
         p += dbl ? 2 : 1;
         /* A SINGLE `|` INSIDE A CASE PATTERN IS ALTERNATION, not a pipe:
@@ -6611,6 +6626,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                  * are in assignment position even though they are not the
                  * first word. */
                 if (!st->assign_prefix && !st->decl_util) st->bad_paren = true;
+                else { st->in_array_lit = true; st->array_lit_depth = st->paren + 1; }
             } else if (glued_word) {
                 st->bad_paren = true;
             } else if (st->assign_prefix) {
@@ -6634,6 +6650,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     if (c == ')') {
         p++;
         if (st->paren > 0) {
+            if (st->in_array_lit && st->paren == st->array_lit_depth) {
+                st->in_array_lit = false;
+                st->array_lit_depth = 0;
+            }
             st->paren--;
             st->cmd_pos = false;
             /* A CLOSED SUBSHELL IS A COMMAND, so `( ... ) || echo` has one in
