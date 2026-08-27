@@ -972,11 +972,13 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';') p++;
         if (*p == ')' || *p == '\0') break;
         size_t n = 0;
+        bool quoted = false;      /* saw a quote: an empty result is REAL */
         /* Elements may be quoted; strip one level, honouring both quote
          * kinds, and stop at unquoted whitespace or the closing paren. */
         while (*p && n + 1 < sizeof elem) {
             if (*p == '\'' || *p == '"') {
                 char q = *p++;
+                quoted = true;
                 while (*p && *p != q && n + 1 < sizeof elem) elem[n++] = *p++;
                 if (*p == q) p++;
                 continue;
@@ -986,7 +988,14 @@ static int sh_array_assign_literal(const char *name, const char *paren,
             elem[n++] = *p++;
         }
         elem[n] = '\0';
-        if (n == 0) continue;      /* blank line between elements */
+        /* An empty element is only noise when it came from SEPARATORS --
+         * the reader joins continued lines with "; ", so a blank line inside
+         * a multi-line literal would otherwise become an empty element. A
+         * QUOTED empty string is a real element and must be kept:
+         *     a=("" "")   is two elements, not zero.
+         * Skipping both made ${#a[@]} 0 there, which the third-party suite
+         * caught (array-sparse ${a-}) and my own cases did not cover. */
+        if (n == 0 && !quoted) continue;
         /* AN ELEMENT MAY NAME ITS OWN SUBSCRIPT: `([k1]=v1 [k2]=v2)` for an
          * associative array, and `a=([3]=x [7]=y)` for an indexed one -- bash
          * allows the form in both, and it is the ONLY way to write an
@@ -2994,19 +3003,34 @@ static void cmd_readonly(int argc, char **argv) {
 static void cmd_readarray(int argc, char **argv) {
     shell_set_status(0);
     bool trim = false;
+    char delim = '\n';
     int first = 1;
     while (first < argc && argv[first][0] == '-' && argv[first][1]) {
         if (strcmp(argv[first], "--") == 0) { first++; break; }
         for (const char *q = argv[first] + 1; *q; q++) {
-            if (*q == 't') trim = true;
-            /* Other flags (-n, -O, -s, -c, -C) are not implemented. Refusing
-             * is better than silently ignoring a count or origin and handing
-             * back an array that quietly differs from what was asked for. */
-            else {
-                kprintf("%s: -%c not supported\n", argv[0], *q);
+            if (*q == 't') { trim = true; continue; }
+            if (*q == 'd') {
+                /* -d DELIM ends each record at DELIM instead of newline. The
+                 * operand may be glued (-d:) or separate (-d :), and an EMPTY
+                 * one means NUL -- `mapfile -d ''` is the null-separated
+                 * idiom, and is why this cannot just be refused. Same
+                 * convention `read -d` already follows. */
+                if (q[1]) { delim = q[1]; break; }
+                if (first + 1 < argc) {
+                    delim = argv[first + 1][0];   /* '' -> '\0' */
+                    first++;
+                    break;
+                }
+                kprintf("%s: -d: option requires an argument\n", argv[0]);
                 shell_set_status(2);
                 return;
             }
+            /* -n, -O, -s, -c, -C remain unimplemented. Refusing is better
+             * than silently ignoring a count or origin and handing back an
+             * array that quietly differs from what was asked for. */
+            kprintf("%s: -%c not supported\n", argv[0], *q);
+            shell_set_status(2);
+            return;
         }
         first++;
     }
@@ -3036,7 +3060,7 @@ static void cmd_readarray(int argc, char **argv) {
             bool got_any = false;
             int rr = shell_read_line_from_file(in, true, line,
                                                sizeof line, &got_any,
-                                               '\n', 0);
+                                               delim, 0);
             /* !got_any IS end-of-input -- cmd_read uses exactly that test to
              * end `while read line`, and an EMPTY line still sets it, so a
              * blank line mid-file does not stop the read.
@@ -3050,8 +3074,13 @@ static void cmd_readarray(int argc, char **argv) {
             size_t n = strlen(line);
             if (!trim) {
                 /* Put the delimiter back: bash keeps it without -t, and the
-                 * reader strips it. */
-                if (n + 1 < sizeof line) { line[n] = '\n'; line[n + 1] = '\0'; }
+                 * reader strips it. A NUL delimiter cannot be re-appended to
+                 * a C string, and bash's own output for `-d ''` without -t
+                 * carries it -- so that combination is the one place this
+                 * differs, noted rather than silently wrong. */
+                if (delim && n + 1 < sizeof line) {
+                    line[n] = delim; line[n + 1] = '\0';
+                }
             }
             if (sh_array_set(name, idx++, line) < 0) { shell_set_status(1); break; }
         }
