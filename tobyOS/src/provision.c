@@ -470,11 +470,21 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
                     d->name, fs[0] ? fs : "a partition table");
             return -ABI_EPERM;
         }
-        if (fs[0] && strcmp(fs, "iso9660") == 0) {
+        if (fs[0] && strcmp(fs, "iso9660") == 0 &&
+            !(flags & ABI_PROV_F_ERASE_ISO)) {
             kprintf("[prov] REFUSED '%s': iso9660 -- this is the live boot "
-                    "medium; erasing it would destroy the running system\n",
+                    "medium; erasing it would destroy the running system "
+                    "(ERASE_ISO overrides this)\n",
                     d->name);
             return -ABI_EPERM;
+        }
+        if (fs[0] && strcmp(fs, "iso9660") == 0) {
+            /* The override was given. Say so loudly: this is the one place
+             * the kernel knowingly writes over something it believes might
+             * be the medium it booted from. */
+            kprintf("[prov] WARNING: erasing iso9660 '%s' on explicit "
+                    "ERASE_ISO -- if this is the stick you booted from, it "
+                    "will not boot again\n", d->name);
         }
         if (provision_dev_mounted(d, 0)) {
             kprintf("[prov] REFUSED '%s': backs a live mount\n", d->name);
@@ -886,6 +896,17 @@ void provision_selftest(void) {
         prov_expect("t5b iso9660 + removable + ERASE",
                     provision_create_data_volume(d5, ABI_PROV_F_ERASE),
                     -ABI_EPERM);
+
+        /* t5b2: the SAME device, plus the explicit ERASE_ISO override, is
+         * allowed. Pinning both halves is the point -- the refusal above is
+         * the default that protects the boot stick, and this is the only
+         * way past it. FORMAT_ONLY so the test does not hand /data away
+         * mid-run (see the ordering note above). */
+        prov_expect("t5b2 iso9660 + removable + ERASE|ERASE_ISO",
+                    provision_create_data_volume(
+                        d5, ABI_PROV_F_ERASE | ABI_PROV_F_ERASE_ISO |
+                            ABI_PROV_F_FORMAT_ONLY),
+                    ABI_PROV_OK_NEXT_BOOT);
 
         /* Now a FAT32 boot sector: the everyday factory-formatted stick.
          * Sector 64 is cleared too, or the iso9660 probe still matches and

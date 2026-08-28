@@ -27,6 +27,7 @@
  * layout is frozen by a static assert that only applies to the original,
  * and the Format action below depends on it byte for byte. */
 #include <tobyos/abi/abi.h>
+#include <tobyos_slog.h>
 
 typedef unsigned long usize;
 typedef long          ssize_t;
@@ -448,6 +449,21 @@ static void on_tbl(struct tk_window *w,struct tk_widget *t){
  * the request, and Format goes through the same typed confirmation the
  * toolbar path uses. */
 
+/* Storage messages go to the SERIAL log as well as the status bar. On
+ * real hardware the serial cable is the only debugging channel there is,
+ * and a refusal that exists only on screen is a refusal nobody can
+ * diagnose afterwards -- which is exactly how a "my format did nothing"
+ * report ended up with a kernel log containing no trace of a format. */
+static void vol_log(unsigned level, const char *msg){
+    tobylog_write(level, "files", msg);
+}
+static void vol_log2(unsigned level, const char *a, const char *b){
+    char m[192]; int p=0; m[0]=0;
+    p=str_cat(m,p,sizeof m,a);
+    (void)str_cat(m,p,sizeof m,b);
+    tobylog_write(level, "files", m);
+}
+
 /* The one place the "can this be formatted?" filter lives. fmt_scan() uses
  * it too -- two copies of this rule would drift, and the copy that drifted
  * would be the one offering somebody's system disk. */
@@ -457,6 +473,19 @@ static int vol_formattable(const struct abi_blk_info *d){
     if(d->flags&(ABI_BLK_F_MOUNTED|ABI_BLK_F_RAM|ABI_BLK_F_GONE)) return 0;
     if(d->fs[0]&&streq(d->fs,"iso9660"))                     return 0; /* boot medium */
     return 1;
+}
+
+/* A removable device whose signature says iso9660. The kernel assumes any
+ * such device is the live boot medium and refuses to erase it, because it
+ * genuinely cannot tell -- Limine reports no boot device. But a spare
+ * stick written with Rufus once and never rewritten looks identical, and
+ * without a route past this it can never be reclaimed. These are offered
+ * only with a label saying what they are, never mixed in silently. */
+static int vol_reclaimable(const struct abi_blk_info *d){
+    if(d->class!=1)                                          return 0;
+    if(!(d->flags&ABI_BLK_F_REMOVABLE))                      return 0;
+    if(d->flags&(ABI_BLK_F_MOUNTED|ABI_BLK_F_RAM|ABI_BLK_F_GONE)) return 0;
+    return d->fs[0] && streq(d->fs,"iso9660");
 }
 
 /* Why not -- said in the words someone would use, not a flag dump. */
@@ -582,7 +611,11 @@ static void fmt_scan(void){
     if(n<0)return;
     for(long i=0;i<n && g_fmt_count<FMT_DEVS_MAX;i++){
         struct abi_blk_info *d=&all[i];
-        if(!vol_formattable(d))continue;
+        int reclaim=0;
+        if(!vol_formattable(d)){
+            if(!vol_reclaimable(d))continue;
+            reclaim=1;
+        }
         g_fmt_devs[g_fmt_count]=*d;
         {
             char *b=g_fmt_label_buf[g_fmt_count];
@@ -598,7 +631,10 @@ static void fmt_scan(void){
                 b[p]='\0';
             }
             p=str_cat(b,p,64," MiB  ");
-            (void)str_cat(b,p,64,d->fs[0]?d->fs:"(empty)");
+            p=str_cat(b,p,64,d->fs[0]?d->fs:"(empty)");
+            /* Never let a boot image be erased via a list entry that
+             * reads like any other. */
+            if(reclaim)(void)str_cat(b,p,64,"  [BOOT IMAGE - WILL ERASE]");
             g_fmt_labels[g_fmt_count]=b;
         }
         g_fmt_count++;
@@ -610,6 +646,9 @@ static void on_fmt_open(struct tk_window *w,struct tk_widget *b){
     fmt_scan();
     if(g_fmt_count==0){
         set_status("No formattable USB found (removable, not mounted, not the boot stick)");
+        vol_log(ABI_SLOG_LEVEL_WARN,
+                "format: no candidate device (need removable, unmounted, "
+                "whole-disk)");
         rebuild();
         return;
     }
@@ -636,6 +675,8 @@ static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
     const char *typed=w_name?tk_get_text(w_name):"";
     if(!streq(typed,d->name)){
         set_status2("Not formatted -- type the device name exactly: ",d->name);
+        vol_log2(ABI_SLOG_LEVEL_WARN,
+                 "format: name confirmation did not match for ",d->name);
         g_confirm_mode=0; rebuild(); return;
     }
 
@@ -643,16 +684,29 @@ static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
     my_memset(&req,0,sizeof req);
     str_copy(req.dev,d->name,sizeof req.dev);
     req.flags=ABI_PROV_F_FORMAT_ONLY|ABI_PROV_F_ERASE;
+    /* Only for a device we LISTED as a boot image, and only after the
+     * typed confirmation above. */
+    if(vol_reclaimable(d)) req.flags|=ABI_PROV_F_ERASE_ISO;
 
+    vol_log2(ABI_SLOG_LEVEL_INFO,
+             "format: requesting whole-disk tobyfs on ",d->name);
     long rc=sys_provision(&req);
-    if(rc==ABI_PROV_OK_MOUNTED||rc==ABI_PROV_OK_NEXT_BOOT)
+    if(rc==ABI_PROV_OK_MOUNTED||rc==ABI_PROV_OK_NEXT_BOOT){
         set_status2("Formatted. Mount it with: mount -t tobyfs ",d->name);
-    else if(rc==-ABI_EPERM)
+        vol_log2(ABI_SLOG_LEVEL_INFO,"format: OK on ",d->name);
+    }else if(rc==-ABI_EPERM){
         set_status("Refused by the kernel -- not removable, or the boot medium");
-    else if(rc==-ABI_EBUSY)
+        vol_log2(ABI_SLOG_LEVEL_ERROR,"format: kernel refused EPERM on ",d->name);
+    }else if(rc==-ABI_EBUSY){
         set_status("Refused -- that device is mounted; unmount it first");
-    else
+        vol_log2(ABI_SLOG_LEVEL_ERROR,"format: kernel refused EBUSY on ",d->name);
+    }else if(rc==-ABI_EEXIST){
+        set_status("Already a tobyOS volume -- nothing to do");
+        vol_log2(ABI_SLOG_LEVEL_WARN,"format: already a tobyfs volume ",d->name);
+    }else{
         set_status("Format failed -- the device may be faulty");
+        vol_log2(ABI_SLOG_LEVEL_ERROR,"format: FAILED on ",d->name);
+    }
     g_confirm_mode=0; refresh_listing(); rebuild();
 }
 
@@ -701,6 +755,8 @@ static void on_vol_menu(struct tk_window *w,int id){
     }
     case MI_VOL_WHY:
         set_status2("Cannot format -- ",vol_refusal(d));
+        vol_log2(ABI_SLOG_LEVEL_WARN,"format refused client-side: ",
+                 vol_refusal(d));
         update_view();
         break;
     case MI_VOL_REFRESH:

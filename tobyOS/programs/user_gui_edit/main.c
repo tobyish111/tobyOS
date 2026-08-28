@@ -10,6 +10,9 @@
 
 #include <toby/tk.h>
 #include <unistd.h>
+/* Save failures are reported to the kernel log as well as on screen;
+ * see save_file(). Pulls in the ABI errno + log-level constants. */
+#include <tobyos_slog.h>
 
 #define SYS_WRITE 1
 #define SYS_READ  2
@@ -110,9 +113,48 @@ static void load_file(const char *path){
     if(g_line_count==0)g_line_count=1;
     g_modified=0; my_strcpy(g_filename,path); g_has_file=1; set_message("Loaded",COL_MSG_OK);
 }
+/* Bounded append -- str_append() above takes no capacity, which is fine for
+ * the fixed-width status line but not for a message carrying a file path. */
+static int log_cat(char *b,int p,int cap,const char *s){
+    while(*s && p+1<cap) b[p++]=*s++;
+    b[p]='\0';
+    return p;
+}
+
+/* Why the save failed, in the words someone would use. "Save failed" alone
+ * sent a real user chasing a formatted USB stick for an hour, because the
+ * message named no cause and never reached the serial log -- the only
+ * channel available on the machine it happened on. */
+static const char *save_reason(long e){
+    switch(-e){
+    case ABI_EACCES: return "Save failed: permission denied";
+    case ABI_EROFS:  return "Save failed: that filesystem is read-only";
+    case ABI_ENOSPC: return "Save failed: the volume is full";
+    case ABI_ENOENT: return "Save failed: that folder no longer exists";
+    case ABI_EISDIR: return "Save failed: that path is a folder";
+    case ABI_ENOTDIR:return "Save failed: a path component is not a folder";
+    default:         return "Save failed";
+    }
+}
+
 static void save_file(void){
     if(!g_has_file){ set_message("No filename",COL_MSG_ERR); return; }
-    long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0); if(ffd<0){ set_message("Save failed",COL_MSG_ERR); return; }
+    long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0);
+    if(ffd<0){
+        set_message(save_reason(ffd),COL_MSG_ERR);
+        /* Also to the kernel log: on real hardware that is the only record
+         * which survives, and it carries the path AND the errno. Bounded
+         * appends -- g_filename can be as long as this whole buffer, and
+         * str_append() above takes no cap. */
+        { char m[320]; int p=0; char num[16]; m[0]='\0';
+          p=log_cat(m,p,(int)sizeof m,"save FAILED errno=");
+          fmt_uint(num,(unsigned)(-ffd));
+          p=log_cat(m,p,(int)sizeof m,num);
+          p=log_cat(m,p,(int)sizeof m," path=");
+          (void)log_cat(m,p,(int)sizeof m,g_filename);
+          tobylog_write(ABI_SLOG_LEVEL_ERROR,"edit",m); }
+        return;
+    }
     for(int i=0;i<g_line_count;i++){ int len=line_len(i); if(len>0)sys_write_fd((int)ffd,g_lines[i],(unsigned long)len); if(i<g_line_count-1)sys_write_fd((int)ffd,"\n",1); }
     sys_close((int)ffd); g_modified=0; set_message("Saved",COL_MSG_OK);
 }

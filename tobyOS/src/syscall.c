@@ -4032,7 +4032,7 @@ static long sys_data_provision(const struct abi_provision_req *ureq) {
      * hide what userspace asked for. */
     return provision_create_data_volume(d,
         req.flags & (ABI_PROV_F_FORCE | ABI_PROV_F_ERASE |
-                     ABI_PROV_F_FORMAT_ONLY));
+                     ABI_PROV_F_FORMAT_ONLY | ABI_PROV_F_ERASE_ISO));
 }
 
 /* ---- Milestone 28E: filesystem check ------------------------ */

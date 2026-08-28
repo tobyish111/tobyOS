@@ -2654,7 +2654,9 @@ programs/user_gui_helloapp/user_gui_helloapp.elf: \
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_taskmgr,user_gui_taskmgr))
 
 # Text editor -- migrated to TobyTK (crt0 + libtoby.a); monospace via tk_draw_text_mono.
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_gui_edit,user_gui_edit))
+# Needs -I include: it logs save failures through <tobyos_slog.h>,
+# which pulls in the kernel ABI header for the errno/level constants.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_edit,user_gui_edit))
 
 # ---------- Build initramfs (USTAR tar) ----------
 #

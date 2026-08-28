@@ -1475,6 +1475,28 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * The CLI says so rather than letting that be a surprise. */
 #define ABI_PROV_F_FORMAT_ONLY 0x4u
 
+/* ERASE_ISO: also erase a device whose signature says iso9660.
+ *
+ * 2026-08-27. ERASE alone deliberately refuses iso9660, because a stick
+ * carrying an ISO is ASSUMED to be the live boot medium and erasing it
+ * destroys the running system. That assumption is a heuristic, not a
+ * fact: Limine reports no boot device, so tobyOS cannot tell the stick it
+ * booted from apart from a second stick that merely still has an old ISO
+ * on it. Reported from real hardware -- a spare stick that had once been
+ * written with Rufus could never be reclaimed, and the refusal was only
+ * visible in a GUI status bar.
+ *
+ * So the blanket refusal stays the default and this flag is the explicit
+ * override, valid ONLY together with ERASE and only on REMOVABLE media.
+ * It is a separate bit rather than a widening of ERASE precisely so that
+ * every existing caller keeps the safe behaviour it was written against.
+ *
+ * The caller is expected to have made the user type the device name. If
+ * they aim it at the stick they booted from, that stick is destroyed --
+ * the kernel and initrd are already in RAM, so the session survives and
+ * the next boot does not. */
+#define ABI_PROV_F_ERASE_ISO   0x8u
+
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
     uint32_t flags;                      /* ABI_PROV_F_*                 */
