@@ -133,6 +133,12 @@ static const char *g_fmt_labels[FMT_DEVS_MAX];
 static char  g_fmt_label_buf[FMT_DEVS_MAX][64];
 static int   g_fmt_count = 0;
 static int   g_fmt_sel   = 0;
+/* Survive a failed confirmation: what was typed, so a single wrong
+ * character can be fixed, and why it was rejected, shown IN the dialog.
+ * The status bar cannot carry this -- it only exists in the main
+ * layout, so it is invisible until the dialog is already gone. */
+static char  g_fmt_typed[64];
+static char  g_fmt_err[96];
 static long g_last_click_ms = 0;    /* double-click detection */
 static int  g_last_click_row = -1;
 
@@ -657,6 +663,7 @@ static void on_fmt_open(struct tk_window *w,struct tk_widget *b){
 static void on_fmt_pick(struct tk_window *w,struct tk_widget *b){
     (void)w;(void)b;
     if(g_fmt_count==0)return;
+    g_fmt_typed[0]='\0'; g_fmt_err[0]='\0';
     g_confirm_mode=5; rebuild();
 }
 static void on_fmt_sel(struct tk_window *w,struct tk_widget *b){
@@ -674,11 +681,23 @@ static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
     /* Typed confirmation, same bar as the CLI. */
     const char *typed=w_name?tk_get_text(w_name):"";
     if(!streq(typed,d->name)){
-        set_status2("Not formatted -- type the device name exactly: ",d->name);
+        /* Keep the dialog up. Closing it here meant one wrong character
+         * cost the whole flow -- reopen the menu, re-pick the device,
+         * retype -- and the explanation landed in a status bar that does
+         * not exist until the dialog has gone. */
+        str_copy(g_fmt_typed,typed,sizeof g_fmt_typed);
+        /* One message for both the empty box and a typo. It was two, keyed
+         * on typed[0], until the empty-case string turned out to be absent
+         * from the built object -- the compiler had dropped that arm, and a
+         * message that cannot be shown is worse than a blunter one that
+         * always is. Blank submit is the common mistake, so it must speak. */
+        str_copy(g_fmt_err,"Name did not match. Type it exactly as shown.",
+                 sizeof g_fmt_err);
         vol_log2(ABI_SLOG_LEVEL_WARN,
                  "format: name confirmation did not match for ",d->name);
-        g_confirm_mode=0; rebuild(); return;
+        rebuild(); return;
     }
+    g_fmt_typed[0]='\0'; g_fmt_err[0]='\0';
 
     struct abi_provision_req req;
     my_memset(&req,0,sizeof req);
@@ -711,7 +730,7 @@ static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
 }
 
 static void on_del_yes(struct tk_window *w,struct tk_widget *b){ (void)w;(void)b; do_delete(); g_confirm_mode=0; refresh_listing(); rebuild(); }
-static void on_dlg_no (struct tk_window *w,struct tk_widget *b){ (void)w;(void)b; g_confirm_mode=0; set_status("Cancelled"); rebuild(); }
+static void on_dlg_no (struct tk_window *w,struct tk_widget *b){ (void)w;(void)b; g_confirm_mode=0; g_fmt_typed[0]='\0'; g_fmt_err[0]='\0'; set_status("Cancelled"); rebuild(); }
 static void on_create (struct tk_window *w,struct tk_widget *b){
     (void)w;(void)b;
     int is_dir=(g_confirm_mode==2);
@@ -889,8 +908,10 @@ static void rebuild(void){
                 "Type the device name below to confirm:"),0,win.theme.text_dim);
             tk_colors(tk_label(&win,dlg,d->name),0,COL_ACCENT);
         }
-        w_name=tk_field(&win,dlg,"");
+        w_name=tk_field(&win,dlg,g_fmt_typed);
         w_name->on_click=on_fmt_go;
+        if(g_fmt_err[0])
+            tk_colors(tk_label(&win,dlg,g_fmt_err),0,COL_DANGER);
         struct tk_widget *row=tk_hbox(&win,dlg,8);
         tk_colors(tk_button(&win,row,"Format",on_fmt_go),COL_DANGER,0x00FFFFFF);
         tk_button(&win,row,"Cancel",on_dlg_no);
