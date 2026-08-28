@@ -1874,20 +1874,19 @@ static void recompute_active(void);
 
 /* ---- mouse callback (IRQ) ----------------------------------------- */
 
+static void pointer_to(int nx, int ny, int dz, uint8_t buttons);
+
+/*
+ * Relative path (the mouse driver). Applies pointer speed / acceleration,
+ * then hands the resulting ABSOLUTE position to the shared core below.
+ *
+ * Raw USB HID mouse deltas feel slow compared to Windows because Windows
+ * applies pointer speed and acceleration. This does not fix USB report
+ * burstiness, but it makes each received report move the cursor farther.
+ */
 static void on_mouse_event(int dx, int dy, int dz, uint8_t buttons) {
     if (!g.ready) return;
 
-    int W = (int)gfx_width(), H = (int)gfx_height();
-    int old_x = g.cur_x, old_y = g.cur_y;
-
-    /*
-     * Pointer speed / acceleration.
-     *
-     * Raw USB HID mouse deltas feel slow compared to Windows because
-     * Windows applies pointer speed and acceleration. This does not fix
-     * USB report burstiness, but it makes each received report move the
-     * cursor farther.
-     */
     int ax = dx < 0 ? -dx : dx;
     int ay = dy < 0 ? -dy : dy;
     int maxa = ax > ay ? ax : ay;
@@ -1901,11 +1900,24 @@ static void on_mouse_event(int dx, int dy, int dz, uint8_t buttons) {
     if (maxa >= 24)
         mult = 5;
 
-    int sdx = dx * mult;
-    int sdy = dy * mult;
+    pointer_to(g.cur_x + dx * mult, g.cur_y + dy * mult, dz, buttons);
+}
 
-    int nx = g.cur_x + sdx;
-    int ny = g.cur_y + sdy;
+/*
+ * Absolute pointer placement -- the shared core.
+ *
+ * The VNC server drives this directly: an RFB PointerEvent carries an
+ * absolute position, and feeding it back through the accelerated relative
+ * path above would overshoot (which is exactly why the C8 harness had to
+ * steer the cursor with closed-loop feedback). Everything from the clamp
+ * down is the original handler body, so drag, resize, hit-testing, focus
+ * and event dispatch stay shared rather than growing a second copy.
+ */
+static void pointer_to(int nx, int ny, int dz, uint8_t buttons) {
+    if (!g.ready) return;
+
+    int W = (int)gfx_width(), H = (int)gfx_height();
+    int old_x = g.cur_x, old_y = g.cur_y;
 
     if (nx < 0)      nx = 0;
     if (ny < 0)      ny = 0;
@@ -6197,6 +6209,13 @@ void gui_post_mouse(int type, int x, int y, uint8_t button) {
 /* Current desktop cursor position (screen coords). Lets the C8 harness drive a
  * REAL mouse to a target via feedback (mouse_inject_event applies a pointer-
  * acceleration multiplier, so open-loop delta math overshoots). */
+/* Place the pointer at an absolute screen position and apply `buttons` as
+ * the current button state, exactly as a real mouse report would. `dz` is
+ * wheel detents. Used by the VNC server; see pointer_to(). */
+void gui_pointer_warp(int x, int y, int dz, uint8_t buttons) {
+    pointer_to(x, y, dz, buttons);
+}
+
 void gui_cursor_pos(int *x, int *y) {
     if (x) *x = g.cur_x;
     if (y) *y = g.cur_y;

@@ -29,6 +29,7 @@
 #include <tobyos/socket.h>
 #include <tobyos/dhcp.h>
 #include <tobyos/ssh.h>
+#include <tobyos/vnc.h>
 #include <tobyos/tcp.h>
 #include <tobyos/tcp_echo.h>
 #include <tobyos/tcp_shell.h>
@@ -663,6 +664,11 @@ void net_service_tick(void) {
 poll_and_release:
     net_poll();
     ssh_poll();
+    /* vnc_init() is idempotent and self-throttling: calling it here (rather
+     * than only at DHCP bring-up like ssh_init) is what lets `vncpasswd`
+     * start the server without a reboot. */
+    vnc_init();
+    vnc_poll();
 
     __atomic_store_n(&g_net_service_busy, 0, __ATOMIC_RELEASE);
 }

@@ -80,7 +80,11 @@ def main():
                      "-device", "virtio-blk-pci,drive=hd0"]
     cmd = [QEMU, "-cdrom", ISO] + disk_args + [
            "-boot", "d",
-           "-netdev", "user,id=net0",
+           # HOSTFWD lets a gate expose a guest port on the host, e.g.
+           # HOSTFWD="hostfwd=tcp::5900-:5900" for logs/vnc.sh. Empty by
+           # default so every other gate's networking is unchanged.
+           "-netdev", "user,id=net0" + (
+               ("," + os.environ["HOSTFWD"]) if os.environ.get("HOSTFWD") else ""),
            "-device", "e1000,netdev=net0,mac=52:54:00:12:34:56",
            "-accel", "whpx,kernel-irqchip=off",
            # Slice 88: -smp 4 was tried once the wake-handoff landed and

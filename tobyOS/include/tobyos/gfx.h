@@ -279,6 +279,15 @@ bool gfx_dirty_get(int *x, int *y, int *w, int *h);
  * would no-op present-wise. */
 void gfx_dirty_clear(void);
 
+/* Damage for REMOTE consumers (the VNC server), accumulated separately from
+ * the compositor's own rect. gfx_dirty_get/clear above are owned by the
+ * local present path in display.c, which clears them every flip -- a remote
+ * viewer sharing that accumulator would race it and drop frames. take()
+ * returns the pending region and resets it; all() forces a whole-screen
+ * region (used when a viewer first connects). */
+bool gfx_remote_damage_take(int *x, int *y, int *w, int *h);
+void gfx_remote_damage_all(void);
+
 /* M27E: per-flip stats so the compositor + tests can prove dirty
  * rectangles are actually shrinking presents. Counters are monotonic;
  * partial_pixels accumulates with saturation. */

@@ -238,6 +238,8 @@ C_SRCS := src/kernel.c \
           src/tcp_shell.c \
           src/ssh.c \
           src/ssh_crypto.c \
+          src/des.c \
+          src/vnc.c \
           src/http.c \
           src/http_async.c \
           src/ws.c \
@@ -534,6 +536,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_tee/user_tee.elf \
             programs/user_env/user_env.elf \
             programs/user_chmod/user_chmod.elf \
+            programs/user_vncpasswd/user_vncpasswd.elf \
             programs/user_df/user_df.elf \
             programs/user_mkdir/user_mkdir.elf \
             programs/user_touch/user_touch.elf \
@@ -1727,6 +1730,8 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_sort,user_sort))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tee,user_tee))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_env,user_env))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
+# vncpasswd compiles src/des.c in, so it needs the kernel include path.
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_vncpasswd,user_vncpasswd))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_df,user_df))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
@@ -3011,6 +3016,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
 	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
 	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
+	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
 	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
 	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
 	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
@@ -3728,7 +3734,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
-	    bin/kill bin/id bin/newgrp                                        \
+	    bin/kill bin/id bin/newgrp bin/vncpasswd                          \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
@@ -4536,7 +4542,7 @@ run: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4559,7 +4565,7 @@ run-ssh: $(ISO) $(DISK_IMG)
 	        -smp 4 \
 	        -object rng-builtin,id=rng0 \
 	        -device virtio-rng-pci,rng=rng0,disable-legacy=on \
-	        -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::2222-:22,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4599,7 +4605,7 @@ run-installed:
 	$(QEMU) -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -boot c \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4636,7 +4642,7 @@ run-ahci: $(ISO) $(DISK_IMG)
 	        -device ide-hd,drive=hd0,bus=ahci0.0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4658,7 +4664,7 @@ run-ahci-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -drive file=$(DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device ide-hd,drive=hd0,bus=ahci0.0 \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4694,7 +4700,7 @@ run-nvme: $(ISO) $(DISK_IMG)
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4714,7 +4720,7 @@ run-nvme-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -drive file=$(DISK_IMG),format=raw,if=none,id=hd0 \
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4753,7 +4759,7 @@ run-virtio-net: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4803,7 +4809,7 @@ run-virtio-net-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device virtio-net-pci,netdev=net0,disable-legacy=on,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4836,7 +4842,7 @@ run-e1000e: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4855,7 +4861,7 @@ run-e1000e-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -4894,7 +4900,7 @@ run-rtl8139: $(ISO) $(DISK_IMG)
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
@@ -4915,7 +4921,7 @@ run-rtl8139-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device rtl8139,netdev=net0,mac=52:54:00:12:34:78 \
 	        -netdev user,id=net1 \
 	        -device e1000,netdev=net1,mac=52:54:00:12:34:56 \
@@ -5251,7 +5257,7 @@ run-uefi: $(ISO) $(DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -5271,7 +5277,7 @@ run-installed-uefi: $(OVMF_CODE) $(OVMF_VARS)
 	        -drive if=pflash,unit=1,format=raw,file=$(OVMF_VARS) \
 	        -drive file=$(DISK),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -serial file:$(LOGDIR)/serial.log \
 	        -debugcon file:$(LOGDIR)/debug.log \
@@ -5304,7 +5310,7 @@ run-gpt: $(ISO) $(GPT_DISK_IMG)
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -5321,7 +5327,7 @@ run-gpt-uefi: $(ISO) $(GPT_DISK_IMG) $(OVMF_CODE) $(OVMF_VARS)
 	        -cdrom $(ISO) \
 	        -drive file=$(GPT_DISK_IMG),format=raw,if=ide,index=0,media=disk \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -5338,7 +5344,7 @@ run-gpt-nvme: $(ISO) $(GPT_DISK_IMG)
 	        -device nvme,drive=hd0,serial=tobyOSnvme0 \
 	        -boot d \
 	        -smp 4 \
-	        -netdev user,id=net0,hostfwd=udp::5555-:5555 \
+	        -netdev user,id=net0,hostfwd=tcp::5900-:5900,hostfwd=udp::5555-:5555 \
 	        -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 	        -object filter-dump,id=fd0,netdev=net0,file=$(LOGDIR)/net.pcap \
 	        -serial file:$(LOGDIR)/serial.log \
@@ -5457,6 +5463,7 @@ clean:
 	       programs/user_tee/user_tee.o programs/user_tee/user_tee.elf \
 	       programs/user_env/user_env.o programs/user_env/user_env.elf \
 	       programs/user_chmod/user_chmod.o programs/user_chmod/user_chmod.elf \
+	       programs/user_vncpasswd/user_vncpasswd.o programs/user_vncpasswd/user_vncpasswd.elf \
 	       programs/user_df/user_df.o programs/user_df/user_df.elf \
 	       programs/user_mkdir/user_mkdir.o programs/user_mkdir/user_mkdir.elf \
 	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \

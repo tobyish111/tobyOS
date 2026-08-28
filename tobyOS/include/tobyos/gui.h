@@ -348,6 +348,10 @@ bool gui_focused_window_client_center(int *cx, int *cy);
 /* Current desktop cursor position (screen coords). */
 void gui_cursor_pos(int *x, int *y);
 
+/* Absolute pointer placement (screen coords) with an explicit button mask
+ * and wheel delta -- the input path the VNC server drives. */
+void gui_pointer_warp(int x, int y, int dz, uint8_t buttons);
+
 /* ---- desktop activity tracing ------------------------------------- *
  *
  * Lightweight kprintf-based event trace. Every event line goes to
