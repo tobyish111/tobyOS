@@ -1497,6 +1497,26 @@ _Static_assert(sizeof(struct abi_blk_info) == 160,
  * the next boot does not. */
 #define ABI_PROV_F_ERASE_ISO   0x8u
 
+/* REPLACE_DATA: also allow the device that currently backs /data.
+ *
+ * 2026-08-29. A mounted device is refused, which is right -- except that it
+ * made the ONE volume a user most wants to re-make unreachable. Once /data
+ * persists on a stick, that stick is mounted at every boot, so File Explorer
+ * and diskmgr both refuse it forever: the reward for setting up a persistent
+ * /data was losing the ability to re-format it. The only way out was to boot
+ * with the stick unplugged and hot-plug it afterwards.
+ *
+ * With this flag the kernel unmounts /data, formats, and mounts the fresh
+ * volume back at /data. Everything on it is destroyed -- settings, users, the
+ * SSH host key -- so the caller is expected to have made the user type the
+ * device name, exactly as ERASE does.
+ *
+ * Deliberately NARROW: it permits a device whose ONLY mount is /data. A
+ * device backing anything else (the live boot medium, /usb, a future second
+ * mount) stays refused, because "reformat my data volume" is a request the
+ * user can mean and "reformat something the system is using" is not. */
+#define ABI_PROV_F_REPLACE_DATA 0x10u
+
 struct abi_provision_req {
     char     dev[ABI_BLK_NAME_MAX];      /* whole-disk device name       */
     uint32_t flags;                      /* ABI_PROV_F_*                 */

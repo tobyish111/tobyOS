@@ -442,8 +442,20 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
     case ABI_BLKV_MOUNTED: {
         const char *mp = 0;
         (void)provision_dev_mounted(d, &mp);
-        kprintf("[prov] REFUSED '%s': backs a live mount (%s)\n",
-                d->name, mp ? mp : "?");
+        /* The one mount the owner may deliberately replace is their own
+         * /data -- see ABI_PROV_F_REPLACE_DATA. Anything else stays refused,
+         * and so does /data unless the caller asked for it by name. */
+        if ((flags & ABI_PROV_F_REPLACE_DATA) && mp &&
+            strcmp(mp, "/data") == 0 && data_backing_dev() == d) {
+            kprintf("[prov] '%s' backs /data; replacing it at the owner's "
+                    "explicit request\n", d->name);
+            break;
+        }
+        kprintf("[prov] REFUSED '%s': backs a live mount (%s)%s\n",
+                d->name, mp ? mp : "?",
+                (mp && strcmp(mp, "/data") == 0)
+                    ? " -- re-formatting your data volume needs REPLACE_DATA"
+                    : "");
         return -ABI_EBUSY;
     }
     case ABI_BLKV_FOREIGN:
@@ -510,6 +522,17 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
      * table), and /data is deliberately left alone: "format this USB" and
      * "make this my system volume" are different requests. */
     if (flags & ABI_PROV_F_FORMAT_ONLY) {
+        /* Is this the volume currently serving /data? If so it has to be
+         * unmounted before the formatter touches a byte -- writing a new
+         * superblock underneath a live mount would leave the cached geometry
+         * describing a filesystem that no longer exists. */
+        bool was_data = (data_backing_dev() == d);
+        if (was_data) {
+            kprintf("[prov] unmounting /data from '%s' before format\n",
+                    d->name);
+            (void)vfs_unmount("/data");
+        }
+
         kprintf("[prov] formatting '%s' (%s, %lu MiB) as whole-disk tobyfs\n",
                 d->name, d->model[0] ? d->model : "unknown model",
                 (unsigned long)(d->sector_count / 2048u));
@@ -517,12 +540,36 @@ long provision_create_data_volume(struct blk_dev *d, uint32_t flags) {
         if (fmt != VFS_OK) {
             kprintf("[prov] format of '%s' FAILED: %s\n",
                     d->name, vfs_strerror(fmt));
+            /* Put /data back if we took it away; a failed format must not
+             * also cost the session its writable /data. */
+            if (was_data && tobyfs_mount("/data", d) == VFS_OK)
+                kprintf("[prov] /data remounted on '%s' after the failure\n",
+                        d->name);
             return -ABI_EIO;
         }
         /* The failed probes above cached this device's pre-format sectors;
          * drop them or a following mount re-reads the old bytes. Exactly
          * the trap the GPT path documents a few lines further down. */
         bcache_invalidate(d);
+
+        if (was_data) {
+            /* Mount the fresh volume straight back, so the desktop has a
+             * writable /data for the rest of the session instead of waiting
+             * for a reboot. It is empty: settings, users and the SSH host key
+             * were on the volume that was just erased, and the subsystems
+             * that own them write their defaults again on demand. */
+            if (tobyfs_mount("/data", d) == VFS_OK) {
+                (void)vfs_chmod("/data", 0777);
+                kprintf("[prov] '%s' formatted and remounted at /data "
+                        "(now empty)\n", d->name);
+                return ABI_PROV_OK_MOUNTED;
+            }
+            kprintf("[prov] '%s' formatted, but remounting it at /data "
+                    "FAILED -- /data is unavailable until the next boot\n",
+                    d->name);
+            return ABI_PROV_OK_NEXT_BOOT;
+        }
+
         kprintf("[prov] '%s' formatted -- mount it with: "
                 "mount -t tobyfs %s /mnt/usb\n", d->name, d->name);
         return ABI_PROV_OK_NEXT_BOOT;

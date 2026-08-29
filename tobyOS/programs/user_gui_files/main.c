@@ -473,6 +473,17 @@ static void vol_log2(unsigned level, const char *a, const char *b){
 /* The one place the "can this be formatted?" filter lives. fmt_scan() uses
  * it too -- two copies of this rule would drift, and the copy that drifted
  * would be the one offering somebody's system disk. */
+/* The device currently serving /data. Mounted, so vol_formattable() says no
+ * -- but it is the ONE mount the owner can coherently ask to re-make, and
+ * refusing it forever is how a persistent /data became impossible to resize.
+ * Offered separately, labelled, and with the kernel re-checking. */
+static int vol_is_datavol(const struct abi_blk_info *d){
+    return d->class==1
+        && (d->flags&ABI_BLK_F_REMOVABLE)
+        && (d->flags&ABI_BLK_F_DATA)
+        && !(d->flags&(ABI_BLK_F_RAM|ABI_BLK_F_GONE));
+}
+
 static int vol_formattable(const struct abi_blk_info *d){
     if(d->class!=1)                                          return 0; /* whole disks */
     if(!(d->flags&ABI_BLK_F_REMOVABLE))                      return 0; /* USB only */
@@ -498,6 +509,7 @@ static int vol_reclaimable(const struct abi_blk_info *d){
 static const char *vol_refusal(const struct abi_blk_info *d){
     if(d->flags&ABI_BLK_F_GONE)                return "that device has been unplugged";
     if(d->fs[0]&&streq(d->fs,"iso9660"))       return "this is the live boot medium";
+    if(d->flags&ABI_BLK_F_DATA)                return "this is your /data volume -- Format erases it and re-mounts it empty";
     if(d->flags&ABI_BLK_F_MOUNTED)             return "it is mounted -- unmount it first";
     if(d->flags&ABI_BLK_F_RAM)                 return "it is RAM-backed, not real storage";
     if(!(d->flags&ABI_BLK_F_REMOVABLE))        return "it is a fixed disk -- tobyOS never formats those";
@@ -580,7 +592,9 @@ static void vol_describe(const struct abi_blk_info *d){
     p=str_cat(b,p,96,d->name);
     p=str_cat(b,p,96,d->model[0]?"  ":"");
     p=str_cat(b,p,96,d->model[0]?d->model:"");
-    if(!vol_formattable(d)){
+    if(vol_is_datavol(d)){
+        (void)str_cat(b,p,96,"  -- /data: format ERASES it, re-mounts empty");
+    } else if(!vol_formattable(d)){
         p=str_cat(b,p,96,"  -- cannot format: ");
         (void)str_cat(b,p,96,vol_refusal(d));
     } else {
@@ -619,8 +633,12 @@ static void fmt_scan(void){
         struct abi_blk_info *d=&all[i];
         int reclaim=0;
         if(!vol_formattable(d)){
-            if(!vol_reclaimable(d))continue;
-            reclaim=1;
+            /* The /data volume is mounted, so vol_formattable() says no --
+             * but it is the one mount the owner can coherently ask to
+             * re-make, and leaving it out is what made a persistent /data
+             * impossible to resize. Listed, labelled, kernel re-checked. */
+            if(!vol_reclaimable(d) && !vol_is_datavol(d))continue;
+            if(!vol_is_datavol(d)) reclaim=1;
         }
         g_fmt_devs[g_fmt_count]=*d;
         {
@@ -706,11 +724,18 @@ static void on_fmt_go(struct tk_window *w,struct tk_widget *b){
     /* Only for a device we LISTED as a boot image, and only after the
      * typed confirmation above. */
     if(vol_reclaimable(d)) req.flags|=ABI_PROV_F_ERASE_ISO;
+    /* Only for the /data volume itself, and only past the typed-name
+     * confirmation above. The kernel re-checks that this device backs /data
+     * and nothing else before it unmounts anything. */
+    if(vol_is_datavol(d))  req.flags|=ABI_PROV_F_REPLACE_DATA;
 
     vol_log2(ABI_SLOG_LEVEL_INFO,
              "format: requesting whole-disk tobyfs on ",d->name);
     long rc=sys_provision(&req);
-    if(rc==ABI_PROV_OK_MOUNTED||rc==ABI_PROV_OK_NEXT_BOOT){
+    if(rc==ABI_PROV_OK_MOUNTED){
+        set_status2("Formatted and re-mounted at /data, now empty: ",d->name);
+        vol_log2(ABI_SLOG_LEVEL_INFO,"format: OK, /data replaced on ",d->name);
+    }else if(rc==ABI_PROV_OK_NEXT_BOOT){
         set_status2("Formatted. Mount it with: mount -t tobyfs ",d->name);
         vol_log2(ABI_SLOG_LEVEL_INFO,"format: OK on ",d->name);
     }else if(rc==-ABI_EPERM){

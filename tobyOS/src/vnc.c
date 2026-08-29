@@ -34,6 +34,7 @@
 #include <tobyos/vfs.h>
 #include <tobyos/heap.h>
 #include <tobyos/pit.h>
+#include <tobyos/settings.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 
@@ -1018,7 +1019,7 @@ void vnc_init(void) {
      * password configured must not hit the filesystem on every tick, and
      * the complaints below must not fill the log. */
     static uint64_t next_try;
-    static bool     told_nopass, told_norng, told_des;
+    static bool     told_nopass, told_norng, told_des, told_off;
     uint64_t now = pit_ticks();
     if (next_try && now < next_try) return;
     next_try = now + (uint64_t)pit_hz() * VNC_RETRY_SEC;
@@ -1048,10 +1049,32 @@ void vnc_init(void) {
     }
 #endif
 
+    /* An explicit off switch, separate from the password.
+     *
+     * Before this the ONLY way to stop the server was to delete the password,
+     * which also throws away the credential -- so "not right now" and "forget
+     * my password" were the same action. Default on: a volume that carries a
+     * vnc.passwd is one whose owner already asked for remote desktop, and
+     * vnc_init runs from net_service_tick every tick, so setting the password
+     * starts the server without a reboot. */
+    if (settings_get_u32("vnc.autostart", 1) == 0) {
+        if (!told_off) {
+            kprintf("[vnc] vnc.autostart=0 -- not listening (password kept; "
+                    "set it back to 1 to start)\n");
+            told_off = true;
+        }
+        return;
+    }
+
     if (!g_have_passwd && !vnc_load_password()) {
         if (!told_nopass) {
-            kprintf("[vnc] no %s -- not listening. Set one with "
-                    "`vncpasswd`.\n", VNC_PASSWD_PATH);
+            /* Say what happens NEXT, not just what is missing. The old line
+             * left it looking like a per-boot chore; with a persistent /data
+             * the password is set once and the server comes up on every boot
+             * from then on. */
+            kprintf("[vnc] no %s -- not listening. Run `vncpasswd <pw>` once "
+                    "(<=8 chars); it starts immediately and on every boot "
+                    "while /data persists.\n", VNC_PASSWD_PATH);
             told_nopass = true;
         }
         return;
