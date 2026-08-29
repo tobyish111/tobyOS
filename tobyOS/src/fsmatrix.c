@@ -83,7 +83,15 @@ static const struct blk_ops g_fsm_ops = { .read = fsm_read, .write = fsm_write }
 static struct blk_dev g_fsm_dev;
 static struct fsm_ram g_fsm_ram;
 
-static struct blk_dev *fsm_make_disk(const char *name, uint64_t sectors) {
+/* `fill` is the byte the raw device is primed with BEFORE the formatter
+ * runs. Zero models a pristine device; 0xFF models the honest case -- a
+ * stick that already held something. That distinction is not cosmetic:
+ * tobyfs_format deliberately does NOT zero the bulk of the inode table
+ * (lazy_itable_init), so a fixture that hands the formatter an all-zero
+ * device cannot tell "format cleared the table" from "format skipped the
+ * table and the bitmap is doing its job". Only a dirty fixture can. */
+static struct blk_dev *fsm_make_disk_filled(const char *name, uint64_t sectors,
+                                            uint8_t fill) {
     /* One fixture at a time: give the previous volume's memory back
      * before minting the next, or the second driver tested doubles the
      * peak. Callers unmount first. */
@@ -91,7 +99,7 @@ static struct blk_dev *fsm_make_disk(const char *name, uint64_t sectors) {
     g_fsm_ram.bytes = sectors * BLK_SECTOR_SIZE;
     g_fsm_ram.buf   = (uint8_t *)kmalloc((size_t)g_fsm_ram.bytes);
     if (!g_fsm_ram.buf) return 0;
-    memset(g_fsm_ram.buf, 0, (size_t)g_fsm_ram.bytes);
+    memset(g_fsm_ram.buf, fill, (size_t)g_fsm_ram.bytes);
     memset(&g_fsm_dev, 0, sizeof g_fsm_dev);
     g_fsm_dev.name         = name;
     g_fsm_dev.ops          = &g_fsm_ops;
@@ -99,6 +107,101 @@ static struct blk_dev *fsm_make_disk(const char *name, uint64_t sectors) {
     g_fsm_dev.priv         = &g_fsm_ram;
     g_fsm_dev.class        = BLK_CLASS_DISK;
     return &g_fsm_dev;
+}
+
+static struct blk_dev *fsm_make_disk(const char *name, uint64_t sectors) {
+    return fsm_make_disk_filled(name, sectors, 0x00);
+}
+
+/* ---- a SPARSE RAM disk, for volumes far larger than RAM ---------------
+ *
+ * The dense fixture above allocates every byte, which caps it at a few tens
+ * of MiB -- and a volume that small has exactly ONE data-bitmap block, so it
+ * cannot exercise the paged bitmap at all. Everything interesting about
+ * paging (skipping a full bitmap block via the summary, the allocation hint,
+ * crossing from one bitmap block to the next) only exists above 32768
+ * blocks, and the case that matters most -- a volume whose METADATA alone
+ * fills bitmap block 0, so every allocation must skip it -- needs 16 GiB.
+ *
+ * Chunks are materialised on first write; unwritten regions read as zeroes,
+ * exactly like a thin-provisioned device. Formatting a 16 GiB tobyfs touches
+ * the superblock, 32 inode-bitmap blocks, 128 data-bitmap blocks, one inode
+ * table block and the journal -- about 4 MiB of real memory for a volume
+ * that reports 16 GiB. */
+#define FSM_SPARSE_CHUNK_BLOCKS 256u                      /* 1 MiB per chunk */
+#define FSM_SPARSE_CHUNK_BYTES  (FSM_SPARSE_CHUNK_BLOCKS * 4096u)
+
+struct fsm_sparse {
+    uint8_t **chunk;
+    uint64_t  nchunks;
+    uint64_t  bytes;
+};
+static struct fsm_sparse g_fsm_sp;
+static struct blk_dev    g_fsm_sp_dev;
+
+static int fsm_sp_rw(struct fsm_sparse *sp, uint64_t off, uint64_t len,
+                     void *buf, bool write) {
+    uint8_t *p = (uint8_t *)buf;
+    if (off + len > sp->bytes) return -1;
+    while (len) {
+        uint64_t ci  = off / FSM_SPARSE_CHUNK_BYTES;
+        uint64_t co  = off % FSM_SPARSE_CHUNK_BYTES;
+        uint64_t run = FSM_SPARSE_CHUNK_BYTES - co;
+        if (run > len) run = len;
+        if (ci >= sp->nchunks) return -1;
+        if (!sp->chunk[ci]) {
+            if (!write) { memset(p, 0, (size_t)run); goto next; }
+            sp->chunk[ci] = (uint8_t *)kmalloc(FSM_SPARSE_CHUNK_BYTES);
+            if (!sp->chunk[ci]) return -1;
+            memset(sp->chunk[ci], 0, FSM_SPARSE_CHUNK_BYTES);
+        }
+        if (write) memcpy(sp->chunk[ci] + co, p, (size_t)run);
+        else       memcpy(p, sp->chunk[ci] + co, (size_t)run);
+    next:
+        p += run; off += run; len -= run;
+    }
+    return 0;
+}
+
+static int fsm_sp_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *buf) {
+    return fsm_sp_rw((struct fsm_sparse *)d->priv, lba * BLK_SECTOR_SIZE,
+                     (uint64_t)n * BLK_SECTOR_SIZE, buf, false);
+}
+static int fsm_sp_write(struct blk_dev *d, uint64_t lba, uint32_t n,
+                        const void *buf) {
+    return fsm_sp_rw((struct fsm_sparse *)d->priv, lba * BLK_SECTOR_SIZE,
+                     (uint64_t)n * BLK_SECTOR_SIZE, (void *)buf, true);
+}
+static const struct blk_ops g_fsm_sp_ops = { .read = fsm_sp_read,
+                                             .write = fsm_sp_write };
+
+static struct blk_dev *fsm_make_sparse(const char *name, uint64_t bytes) {
+    g_fsm_sp.bytes   = bytes;
+    g_fsm_sp.nchunks = (bytes + FSM_SPARSE_CHUNK_BYTES - 1) / FSM_SPARSE_CHUNK_BYTES;
+    g_fsm_sp.chunk   = (uint8_t **)kmalloc((size_t)g_fsm_sp.nchunks * sizeof(uint8_t *));
+    if (!g_fsm_sp.chunk) return 0;
+    memset(g_fsm_sp.chunk, 0, (size_t)g_fsm_sp.nchunks * sizeof(uint8_t *));
+    memset(&g_fsm_sp_dev, 0, sizeof g_fsm_sp_dev);
+    g_fsm_sp_dev.name         = name;
+    g_fsm_sp_dev.ops          = &g_fsm_sp_ops;
+    g_fsm_sp_dev.sector_count = bytes / BLK_SECTOR_SIZE;
+    g_fsm_sp_dev.priv         = &g_fsm_sp;
+    g_fsm_sp_dev.class        = BLK_CLASS_DISK;
+    return &g_fsm_sp_dev;
+}
+
+static uint64_t fsm_sparse_resident(void) {
+    uint64_t n = 0;
+    for (uint64_t i = 0; i < g_fsm_sp.nchunks; i++) if (g_fsm_sp.chunk[i]) n++;
+    return n * FSM_SPARSE_CHUNK_BYTES;
+}
+
+static void fsm_free_sparse(void) {
+    if (!g_fsm_sp.chunk) return;
+    for (uint64_t i = 0; i < g_fsm_sp.nchunks; i++)
+        if (g_fsm_sp.chunk[i]) kfree(g_fsm_sp.chunk[i]);
+    kfree(g_fsm_sp.chunk);
+    g_fsm_sp.chunk = 0; g_fsm_sp.nchunks = 0; g_fsm_sp.bytes = 0;
 }
 
 /* ---- the matrix ------------------------------------------------------- */
@@ -600,6 +703,120 @@ void fsmatrix_format_scratch(void) {
 
 /* ---- entry point ------------------------------------------------------ */
 
+/* tobyfs on a RAM volume, run twice: once over a ZEROED device and once
+ * over a 0xFF one.
+ *
+ * The pair is the point. tobyfs_format writes the superblock, both bitmaps,
+ * the FIRST inode-table block (the root) and the journal -- and deliberately
+ * leaves the remaining inode-table blocks holding whatever the device held
+ * before, because zeroing them made format O(volume): a 30 GB stick meant
+ * ~59000 single-block writes. Format has never zeroed DATA blocks either.
+ *
+ * Safety therefore rests on the inode BITMAP being the sole authority on
+ * which slots exist, and on every allocator zeroing what it hands out. An
+ * all-zero fixture cannot test either claim -- stale bytes and correct bytes
+ * are the same bytes. 0xFF is the hostile case: untouched inode slots read as
+ * type=0xFFFFFFFF, nlink=0xFFFF, size=4 GiB, direct[]=OUT OF RANGE, and an
+ * unzeroed data block reads as 0xFF instead of NUL.
+ *
+ * Running BOTH means the log itself separates the two diagnoses: a check that
+ * fails only under tobyfsX is a stale-data bug, one that fails under both is
+ * a plain tobyfs bug that simply had no fixture before. */
+static void fsm_tobyfs_case(const char *label, uint8_t fill) {
+    struct blk_dev *d = fsm_make_disk_filled("fsmatrixtfs", 65536, fill);
+    if (!d) {
+        fsm_bad(label, "fixture", "out of memory for the RAM volume");
+        return;
+    }
+    char msg[192];
+    int fr = tobyfs_format(d);
+    ksnprintf(msg, sizeof msg, "tobyfs_format rc=%d over 0x%02X", fr, fill);
+    fsm_chk(fr == VFS_OK, label, "format over the device", msg);
+    if (fr != VFS_OK) return;
+    bcache_invalidate(d);
+
+    /* 1. Structural check WITHOUT mounting. If anything consulted the stale
+     *    inode table this reports FATAL, naming the offending inode. */
+    struct tobyfs_check chk;
+    int cr = tobyfs_check_dev(d, &chk);
+    ksnprintf(msg, sizeof msg, "rc=%d sev=%d errs=%u: %s", cr, chk.severity,
+              chk.errors, chk.detail[0] ? chk.detail : "(none)");
+    fsm_chk(cr == 0 && chk.severity == TFS_CHECK_OK, label,
+            "fscheck clean after format", msg);
+
+    /* 2. Exactly one inode allocated -- the root, and nothing the previous
+     *    contents left behind. */
+    ksnprintf(msg, sizeof msg, "inodes_used=%u (want 1) of %u",
+              chk.inodes_used, chk.inodes_total);
+    fsm_chk(chk.inodes_used == 1, label, "only the root inode is allocated",
+            msg);
+
+    int m = tobyfs_mount("/fsmtfs", d);
+    ksnprintf(msg, sizeof msg, "tobyfs_mount rc=%d", m);
+    fsm_chk(m == VFS_OK, label, "format then mount", msg);
+    if (m != VFS_OK) return;
+
+    /* 3. A freshly allocated inode carries the values its creator wrote, not
+     *    the slot's previous bytes. A stale 0xFF slot shows up as size
+     *    4294967295 rather than 0. */
+    const char *f = "/fsmtfs/stale.txt";
+    (void)vfs_unlink(f);
+    int c = vfs_create(f);
+    long sz = fsm_size(f);
+    ksnprintf(msg, sizeof msg, "create rc=%d size=%ld (want 0)", c, sz);
+    fsm_chk(c == VFS_OK && sz == 0, label,
+            "new inode is clean, not the slot's old bytes", msg);
+    (void)vfs_unlink(f);
+
+    /* 3b. Reach PAST the first inode-table block.
+     *
+     * This is the assertion the rest of the case cannot make. Inodes are 32
+     * to a 4 KiB block, and format writes table block 0 in full (it carries
+     * the root), so every check above lands on inodes 1..~10 -- bytes that
+     * format zeroed either way. The blocks lazy_itable_init actually leaves
+     * alone are 1..63, and nothing had yet read one.
+     *
+     * 40 files pushes allocation to inode ~41, which is in table block 1 --
+     * still 0xFF on the hostile fixture. Each file gets a distinct byte and
+     * is read back, so a slot that kept any of its previous contents shows
+     * up as a wrong size or a wrong byte rather than as nothing at all. */
+    {
+        enum { NFILE = 40 };
+        char path[64];
+        int made = 0, verified = 0;
+        for (int i = 0; i < NFILE; i++) {
+            ksnprintf(path, sizeof path, "/fsmtfs/i%d.bin", i);
+            if (vfs_create(path) != VFS_OK) continue;
+            made++;
+            /* size must be 0 the instant the inode exists -- a stale 0xFF
+             * slot reads back as 4294967295 here. */
+            if (fsm_size(path) != 0) continue;
+            uint8_t b = (uint8_t)('a' + (i % 26));
+            if (vfs_write_all(path, &b, 1) != VFS_OK) continue;
+            void *rb = 0; size_t rn = 0;
+            if (vfs_read_all(path, &rb, &rn) == VFS_OK && rb && rn == 1 &&
+                ((const uint8_t *)rb)[0] == b) verified++;
+            if (rb) kfree(rb);
+        }
+        for (int i = 0; i < NFILE; i++) {
+            ksnprintf(path, sizeof path, "/fsmtfs/i%d.bin", i);
+            (void)vfs_unlink(path);
+        }
+        ksnprintf(msg, sizeof msg,
+                  "created %d/%d, byte-exact %d/%d (spans inode-table block 1)",
+                  made, (int)NFILE, verified, (int)NFILE);
+        fsm_chk(made == NFILE && verified == NFILE, label,
+                "inodes past table block 0 are clean", msg);
+    }
+
+    /* 4. And the whole CRUD contract, same as every other driver. */
+    fsm_run(label, "/fsmtfs", true, true);
+    fsm_coherence(label, "/fsmtfs");
+    fsm_unlink_open(label, "/fsmtfs");
+    fsm_fsync_check(label, "/fsmtfs");
+    (void)vfs_unmount("/fsmtfs");
+}
+
 void fsmatrix_selftest(void) {
     g_fsm_pass = g_fsm_fail = 0;
     kprintf("[FSMATRIX] ==== the CRUD contract, per driver ====\n");
@@ -627,6 +844,130 @@ void fsmatrix_selftest(void) {
             (void)vfs_unlink(dir);
         }
     }
+
+    /* A 16 GiB volume on the sparse device -- the paged data bitmap.
+     *
+     * Size chosen for one specific property: at 16 GiB the inode table alone
+     * is 32768 blocks, so data_blk_start lands at 32929, PAST the 32768 bits
+     * that data-bitmap block 0 covers. Block 0 is therefore entirely
+     * metadata and permanently full, which means every single allocation on
+     * this volume has to consult the free-count summary, skip block 0
+     * without reading it, and find space in a later one. On the 32 MiB
+     * fixtures above there is exactly one bitmap block and none of that code
+     * ever runs.
+     *
+     * The old whole-bitmap cache would have wanted 512 KiB here and 512 MiB
+     * at the format's ceiling; the window plus summary want 4 KiB + 256 B. */
+    {
+        struct blk_dev *d = fsm_make_sparse("fsmbig", 16ULL * 1024 * 1024 * 1024);
+        char msg[192];
+        if (!d) {
+            fsm_bad("tobyfsB", "fixture", "out of memory for the sparse volume");
+        } else {
+            int fr = tobyfs_format(d);
+            ksnprintf(msg, sizeof msg, "tobyfs_format rc=%d on 16 GiB", fr);
+            fsm_chk(fr == VFS_OK, "tobyfsB", "format a 16 GiB volume", msg);
+            if (fr == VFS_OK) {
+                bcache_invalidate(d);
+
+                struct tobyfs_check chk;
+                int cr = tobyfs_check_dev(d, &chk);
+                ksnprintf(msg, sizeof msg, "rc=%d sev=%d errs=%u: %s", cr,
+                          chk.severity, chk.errors,
+                          chk.detail[0] ? chk.detail : "(none)");
+                fsm_chk(cr == 0 && chk.severity == TFS_CHECK_OK, "tobyfsB",
+                        "fscheck clean at 16 GiB", msg);
+
+                int m = tobyfs_mount("/fsmbig", d);
+                ksnprintf(msg, sizeof msg, "tobyfs_mount rc=%d", m);
+                fsm_chk(m == VFS_OK, "tobyfsB", "mount a 16 GiB volume", msg);
+                if (m == VFS_OK) {
+                    /* Prove the shape this case exists to create: more than
+                     * one bitmap block, and a first one the allocator can
+                     * never use. If a future geometry change quietly undoes
+                     * that, the rest of this case stops testing paging and
+                     * would still pass -- so assert it out loud. */
+                    struct vfs_statfs st;
+                    int sr = vfs_statfs("/fsmbig", &st);
+                    ksnprintf(msg, sizeof msg,
+                              "statfs rc=%d blocks=%lu bfree=%lu (>32768 bits/bitmap block)",
+                              sr, (unsigned long)st.blocks,
+                              (unsigned long)st.bfree);
+                    fsm_chk(sr == VFS_OK && st.blocks > 32768 &&
+                            st.bfree > 32768 && st.bfree <= st.blocks,
+                            "tobyfsB", "statfs spans many bitmap blocks", msg);
+
+                    /* Every allocation below therefore starts by skipping a
+                     * full bitmap block via the summary. */
+                    fsm_run("tobyfsB", "/fsmbig", true, true);
+                    fsm_coherence("tobyfsB", "/fsmbig");
+                    fsm_unlink_open("tobyfsB", "/fsmbig");
+
+                    /* And the free count must survive all of that.
+                     *
+                     * WARM UP FIRST. The obvious version of this check --
+                     * compare bfree from just after mount against bfree at
+                     * the end -- fails by exactly one block, and the block
+                     * is real: the first create in an empty directory
+                     * allocates the root's first dirent block, which is a
+                     * one-time cost that no later delete gives back. That is
+                     * directory growth, not drift, and a check that cannot
+                     * tell them apart is measuring the wrong thing.
+                     *
+                     * So grow the directory first, then cycle. statfs is now
+                     * derived from the paged summary rather than counted bit
+                     * by bit, so a summary that lost or double-counted a bit
+                     * would surface here and almost nowhere else. */
+                    {
+                        const char *cf = "/fsmbig/cycle.bin";
+                        uint8_t *big = kmalloc(8192);
+                        (void)vfs_unlink(cf);
+                        (void)vfs_create(cf);           /* warm-up: grows root */
+                        (void)vfs_unlink(cf);
+
+                        struct vfs_statfs base, now;
+                        int br = vfs_statfs("/fsmbig", &base);
+                        int cycles = 0;
+                        if (big) {
+                            memset(big, 'C', 8192);
+                            for (int c = 0; c < 8; c++) {
+                                if (vfs_create(cf) != VFS_OK) break;
+                                if (vfs_write_all(cf, big, 8192) != VFS_OK) break;
+                                if (vfs_unlink(cf) != VFS_OK) break;
+                                cycles++;
+                            }
+                            kfree(big);
+                        }
+                        int nr = vfs_statfs("/fsmbig", &now);
+                        ksnprintf(msg, sizeof msg,
+                                  "%d/8 cycles of 8 KiB, bfree %lu -> %lu (want equal)",
+                                  cycles, (unsigned long)base.bfree,
+                                  (unsigned long)now.bfree);
+                        fsm_chk(br == VFS_OK && nr == VFS_OK && cycles == 8 &&
+                                now.bfree == base.bfree, "tobyfsB",
+                                "summary free-count does not drift", msg);
+                        (void)vfs_unlink(cf);
+                    }
+                    (void)vfs_unmount("/fsmbig");
+                }
+                ksnprintf(msg, sizeof msg,
+                          "%lu MiB resident for a 16384 MiB volume",
+                          (unsigned long)(fsm_sparse_resident() >> 20));
+                fsm_note("tobyfsB", "sparse fixture cost", msg);
+            }
+            fsm_free_sparse();
+        }
+    }
+
+    /* The control first, then the hostile one. Same code, same volume size,
+     * only the pre-existing bytes differ -- so any check that passes as
+     * `tobyfs` and fails as `tobyfsX` is naming a stale-data leak, and one
+     * that fails as both is naming a bug the gate simply never had a tobyfs
+     * fixture to find. */
+    fsm_tobyfs_case("tobyfs", 0x00);
+    fsm_tobyfs_case("tobyfsX", 0xFF);
+    fsm_note("tobyfsX", "what the X means",
+             "same volume, but the raw device was 0xFF before format");
 
     /* ext4 on a freshly formatted RAM volume. 32 MiB: comfortably above
      * the formatter's minimum and small enough to allocate. */

@@ -187,19 +187,26 @@ static const struct blk_ops g_ramdata_ops = {
  *
  *     tar: can't create symlink './usr/bin/readlink' to '/bin/busybox'
  *
- * because tobyfs derives its inode count from the VOLUME size --
- * `inodes = total_blocks / 64`, floored at TFS_INODE_COUNT (256) -- and the
- * rootfs is 528 entries, of which 335 are symlinks. 32 MiB bought 256 inodes
- * and it ran out at roughly half. The content fits; the metadata does not.
+ * because tobyfs derives its inode count from the VOLUME size, and the rootfs
+ * is 528 entries, of which 335 are symlinks. 32 MiB ran out at roughly half.
+ * The content fits; the metadata does not.
  *
- * 192 MiB = 49152 blocks = 768 inodes, ~230 spare over the 535 the rootfs plus
- * the probe need. The volume is ~95% empty and that is the point. */
+ * 192 MiB = 49152 blocks. The density has since been raised (1 inode per 4
+ * blocks, was 1 per 64), so that now buys 12288 inodes rather than 768 --
+ * still ~95% empty, which remains the point. Keep the assert MIRRORING
+ * tfs_compute_geom: it is the only thing that catches "the volume fits the
+ * bytes but not the metadata" at COMPILE time, and it is worth nothing if it
+ * models a formula the filesystem no longer uses -- as this one did, for two
+ * density changes running. */
 #define RAMOCI_BYTES  (192u * 1024u * 1024u)
 #define RAMOCI_MIN_INODES 600u        /* 528 rootfs entries + probe + slack */
-/* tobyfs_format: inodes = max(total_blocks / 64, TFS_INODE_COUNT=256). */
+/* Mirrors tfs_compute_geom(): 1 inode per 4 blocks, floored at
+ * TFS_INODE_COUNT, then capped at TFS_MAX_INODES. */
 #define RAMOCI_BLOCKS ((RAMOCI_BYTES) / 4096u)
-#define RAMOCI_INODES ((RAMOCI_BLOCKS / 64u) < 256u ? 256u \
-                                                    : (RAMOCI_BLOCKS / 64u))
+#define RAMOCI_INODES_RAW ((RAMOCI_BLOCKS / 4u) < TFS_INODE_COUNT \
+                           ? TFS_INODE_COUNT : (RAMOCI_BLOCKS / 4u))
+#define RAMOCI_INODES ((RAMOCI_INODES_RAW) > TFS_MAX_INODES \
+                       ? TFS_MAX_INODES : (RAMOCI_INODES_RAW))
 _Static_assert(RAMOCI_INODES >= RAMOCI_MIN_INODES,
                "container volume too small: tobyfs sizes its INODE table from "
                "the volume, and the Alpine rootfs is 528 entries -- a volume "

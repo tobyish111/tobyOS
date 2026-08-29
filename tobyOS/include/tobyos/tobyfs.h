@@ -67,10 +67,54 @@
 #define TFS_JOURNAL_START     (TFS_TOTAL_BLOCKS - TFS_JOURNAL_BLOCKS)  /* 992 */
 #define TFS_USABLE_BLOCKS     TFS_JOURNAL_START                        /* 992 */
 
-/* Largest volume we'll format/mount, in 4 KiB blocks. Caps RAM used by the
- * cached bitmaps + bounds the format math. 1 GiB = 262144 blocks => an 8-block
- * data bitmap. Plenty for /data and big-file testing; raise if ever needed. */
-#define TFS_MAX_TOTAL_BLOCKS  (256u * 1024u)      /* 1 GiB */
+/* Largest volume we'll format/mount, in 4 KiB blocks: ~16 TiB, which is the
+ * ceiling the ON-DISK FORMAT imposes -- total_blocks is a uint32 in the
+ * superblock. Going further needs a format change (a wider field or a bigger
+ * block), not another edit here.
+ *
+ * The exact value is 0xFFFF0000 rather than 0xFFFFFFFF on purpose: the
+ * geometry math rounds up with (total_blocks + TFS_BITS_PER_BLOCK - 1), which
+ * OVERFLOWS at the top of the range and would compute a one-block data bitmap
+ * for a 16 TiB volume. Backing off by one bitmap block's worth of bits makes
+ * every such expression safe and divides evenly (131070 bitmap blocks).
+ *
+ * This was 1 GiB, then 2 TiB. What moved it each time was never this constant:
+ *
+ *   - 1 GiB -> 2 TiB needed TFS_MAX_INODES, because ino_gen is 4 bytes per
+ *     inode and inodes scale with the volume (a 2 TiB volume wanted 134M
+ *     inodes and half a gigabyte of ino_gen), plus a lazy inode table,
+ *     because format was O(volume).
+ *   - 2 TiB -> 16 TiB needed the DATA BITMAP PAGED. It used to be cached
+ *     whole at total_blocks/8 bytes in one kmalloc: 64 MiB at 2 TiB, 512 MiB
+ *     here. It is now a single 4 KiB window plus a uint16 free-bit count per
+ *     bitmap block, so the per-mount cost is 256 KiB at this cap instead of
+ *     512 MiB -- and, unlike the old array, it barely grows with the volume.
+ *
+ * Per-mount RAM now, all of it sized from the superblock:
+ *
+ *     dbm window  = 4 KiB                    (fixed)
+ *     dbm summary = total_blocks / 16384     (256 KiB at this cap)
+ *     ibitmap     = inode_count / 8          (512 KiB, capped)
+ *     ino_gen     = inode_count * 4          (16 MiB, capped)
+ *
+ * ~17 MiB for a 16 TiB volume, and ino_gen is now the part worth attacking
+ * if that ever matters. The one thing that still scales linearly with the
+ * volume is MOUNT TIME: the summary is built by reading every bitmap block
+ * once (131070 of them at the cap), which is the same I/O the old full cache
+ * did, and formatting writes that many blocks too.
+ *
+ * Note the separate device-side limit: SCSI READ(10)/WRITE(10) carry a 32-bit
+ * LBA, which is exactly 2 TiB at 512-byte sectors, so usb_msc switches to the
+ * 16-byte variants past that (see USB_MSC_LBA32_MAX). */
+#define TFS_MAX_TOTAL_BLOCKS  0xFFFF0000u              /* ~16 TiB */
+
+/* Ceiling on the scaled inode count (see tfs_compute_geom). Volumes up to
+ * 64 GiB never reach it -- they land below it on the 1-inode-per-16-KiB rule
+ * and keep exactly the density they have today, so nothing about existing
+ * sticks or images changes. Past that the count pins here, which bounds
+ * ibitmap + ino_gen RAM and keeps alloc_inode's linear free-slot scan from
+ * walking a hundred million bits to hand out one file. */
+#define TFS_MAX_INODES        (4u * 1024u * 1024u)     /* 4M files */
 
 #define TFS_TXN_BEGIN_MAGIC   0x4A4F5552U  /* "JOUR" */
 #define TFS_TXN_COMMIT_MAGIC  0x434F4D54U  /* "COMT" */
