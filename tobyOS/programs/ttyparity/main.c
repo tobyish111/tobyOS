@@ -233,7 +233,14 @@ static int session_start(struct session *s, const char *shell, char *trans) {
     char *argv_bash[] = { (char *)"bash", (char *)"--norc",
                           (char *)"--noprofile", (char *)"--noediting",
                           (char *)"-i", 0 };
-    char *argv_tsh[]  = { (char *)"tsh", 0 };
+    /* tsh gets --noediting for the SAME reason bash does, stated above: this
+     * gate compares the COOKED line discipline, and a line editor puts the
+     * tty in raw mode and paints the line itself, so neither shell's
+     * transcript would be about the thing under test. tsh grew an editor on
+     * 2026-08-29; without matching the flag this gate went 11/11 -> 0/11 and
+     * was measuring readline, not the shell. The editor has its own gate,
+     * logs/lineedit.sh. */
+    char *argv_tsh[]  = { (char *)"tsh", (char *)"--noediting", 0 };
     char *const *argv = strcmp(shell, BASH_PATH) == 0 ? argv_bash : argv_tsh;
 
     /* Terminal etiquette: make OUR process group the pty's foreground

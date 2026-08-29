@@ -40,10 +40,33 @@ if ! grep -aq "ssh\] listening" "$LOG" 2>/dev/null; then
     echo "ABORT: sshd never came up"
     MSYS_NO_PATHCONV=1 taskkill /F /IM qemu-system-x86_64.exe >/dev/null 2>&1; exit 1
 fi
+
+# "listening" is NOT ready. sshd binds ~14s in, while the desktop, login and
+# the rest of boot are still starting; sessions opened in that window get
+# accepted and then serviced too slowly, and the client gives up during the
+# banner exchange. That looked like editing failures, but only ever hit the
+# FIRST few cases -- the later ones passed on the same binary.
+#
+# So wait for a signal that boot has actually finished (the desktop) and for
+# the heartbeat to tick a few times, rather than guessing at a sleep.
+for i in $(seq 1 30); do grep -aq "Desktop ready" "$LOG" 2>/dev/null && break; sleep 1; done
+for i in $(seq 1 30); do
+    [ "$(grep -ac '\[hb\]' "$LOG")" -ge 4 ] && break
+    sleep 1
+done
 sleep 2
 
 SSH="/c/Windows/System32/OpenSSH/ssh.exe -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o LogLevel=ERROR -o ConnectTimeout=10 -p 2222 toby@127.0.0.1"
 PASS=0; FAIL=0
+
+# A stale ssh.exe from an aborted run holds a session, and the server serves
+# ONE at a time -- a second connection then sits unanswered until it times
+# out, which reads as an editing failure. Clear them, then take one throwaway
+# session so the first ASSERTED one is not also the first connect after boot.
+MSYS_NO_PATHCONV=1 taskkill /F /IM ssh.exe >/dev/null 2>&1
+sleep 1
+(printf 'exit\n' | timeout 20 $SSH >/dev/null 2>&1) || true
+sleep 2
 
 # le <label> <want-exact-line> <must-not-appear> <chunk> [<chunk>...]
 # Each chunk is printf'd then followed by a pause, so the editor is reading
@@ -56,6 +79,12 @@ le() {
     # random failures that moved between runs.
     out=$( { sleep 1.5; for c in "$@"; do printf "$c"; sleep 0.7; done; printf 'exit\n'; sleep 0.5; } \
            | timeout 30 $SSH 2>&1 | tr -d '\r' )
+    # Let the server finish tearing the session down before the next case.
+    # It serves ONE session at a time by design, so back-to-back connections
+    # race the previous teardown -- the next one is either refused or sits
+    # unserviced until it times out. That is a property of the server, not a
+    # flake, so the harness paces itself rather than pretending otherwise.
+    sleep 2
     # Exact-line, like the positive check: the typed text is echoed by the
     # repaint, so only a whole OUTPUT line proves the edit did not happen.
     if [ -n "$nope" ] && echo "$out" | grep -qx "$nope"; then
@@ -74,6 +103,7 @@ echo "=== history ==="
 # Run it, then Up + Enter runs it again -> the output line appears TWICE.
 out=$( { sleep 1.5; printf 'echo alpha\n'; sleep 1; printf '\033[A\n'; sleep 1; printf 'exit\n'; sleep 0.5; } \
        | timeout 30 $SSH 2>&1 | tr -d '\r' )
+sleep 2
 c=$(echo "$out" | grep -cx 'alpha')
 if [ "$c" -ge 2 ]; then echo "  ok   Up recalls and re-runs (alpha x$c)"; PASS=$((PASS+1))
 else echo "  FAIL Up recalls -- 'alpha' on its own line $c time(s), want >=2"; FAIL=$((FAIL+1)); fi

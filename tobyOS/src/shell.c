@@ -21022,6 +21022,78 @@ void shell_run_test_line(const char *in) {
     spin_unlock_irqrestore(&g_shell_line_lock, irqf);
 }
 
+/* ---- kernel-shell line editing -----------------------------------------
+ *
+ * shell_poll() used to append printable ASCII and handle backspace, dropping
+ * everything else -- so the arrow keys did nothing and the history ring that
+ * `fc` reads was unreachable from the keyboard.
+ *
+ * This is the same idea as /bin/tsh's editor but a much smaller one, because
+ * the two hosts differ: there is no termios here (the keyboard driver hands
+ * us cooked characters already, with the arrow cluster as 0x80..0x83 and Ctrl
+ * folded to c & 0x1F), and no pty. The console does understand ANSI, so the
+ * repaint below uses ESC[K and ESC[D exactly as the hosted one does.
+ *
+ * Single-line, like its counterpart: a command wider than the console wraps
+ * and the cursor arithmetic stops being right. */
+static size_t g_kline_pos;          /* cursor within line[] */
+static int    g_kline_hist;         /* history index being shown; == count = live */
+static char   g_kline_saved[LINE_MAX];  /* the live line, parked while browsing */
+
+static void kline_refresh(void) {
+    kputc('\r');
+    prompt();                               /* redraw the prompt itself */
+    for (size_t i = 0; i < line_len; i++) kputc(line[i]);
+    kputc(0x1B); kputc('['); kputc('K');    /* erase what the old line left */
+    size_t back = line_len - g_kline_pos;
+    if (back) {
+        /* ESC[<n>D: one escape rather than n separate backspaces, so moving
+         * the cursor a long way costs one sequence on a slow console. */
+        char d[8];
+        int dn = 0;
+        while (back && dn < (int)sizeof d) { d[dn++] = (char)('0' + (back % 10)); back /= 10; }
+        kputc(0x1B); kputc('[');
+        for (int i = dn - 1; i >= 0; i--) kputc(d[i]);
+        kputc('D');
+    }
+}
+
+static void kline_delete(size_t from, size_t to) {
+    if (to > line_len) to = line_len;
+    if (to <= from) return;
+    for (size_t i = from; i + (to - from) < line_len; i++) line[i] = line[i + (to - from)];
+    line_len -= (to - from);
+    line[line_len] = '\0';
+    if (g_kline_pos > line_len) g_kline_pos = line_len;
+}
+
+static void kline_set(const char *t) {
+    size_t n = t ? strlen(t) : 0;
+    if (n >= LINE_MAX) n = LINE_MAX - 1;
+    if (n) memcpy(line, t, n);
+    line[n] = '\0';
+    line_len = n;
+    g_kline_pos = n;
+}
+
+/* dir -1 = older, +1 = newer. The half-typed line is parked so walking up and
+ * back down returns it -- the same rule the hosted editor follows. */
+static void kline_history(int dir) {
+    if (g_hist_count <= 0) return;
+    if (g_kline_hist >= g_hist_count) {
+        size_t n = line_len < sizeof g_kline_saved - 1 ? line_len : sizeof g_kline_saved - 1;
+        memcpy(g_kline_saved, line, n);
+        g_kline_saved[n] = '\0';
+    }
+    int want = g_kline_hist + dir;
+    if (want < 0) want = 0;
+    if (want > g_hist_count) want = g_hist_count;
+    if (want == g_kline_hist) return;
+    g_kline_hist = want;
+    kline_set(want == g_hist_count ? g_kline_saved : g_hist[want]);
+    kline_refresh();
+}
+
 void shell_poll(void) {
     /* Lazy reap of any background jobs that have terminated since the
      * previous poll. Non-blocking: proc_wait() on an already-TERMINATED
@@ -21039,6 +21111,8 @@ void shell_poll(void) {
                 uint64_t irqf = spin_lock_irqsave(&g_shell_line_lock);
                 execute_line();
                 line_len = 0;
+                g_kline_pos = 0;
+                g_kline_hist = g_hist_count;
                 line[0]  = '\0';
                 spin_unlock_irqrestore(&g_shell_line_lock, irqf);
             }
@@ -21046,21 +21120,66 @@ void shell_poll(void) {
             continue;
         }
 
-        if (ch == '\b') {
-            if (line_len > 0) {
-                line_len--;
-                line[line_len] = '\0';
-                console_backspace();
+        if (ch == '\b' || ch == 0x7F) {
+            if (g_kline_pos > 0) {
+                kline_delete(g_kline_pos - 1, g_kline_pos);
+                g_kline_pos--;
+                kline_refresh();
             }
             continue;
         }
 
-        /* Printable ASCII only; ignore the rest for now. */
-        if ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E) continue;
+        /* The PS/2 and USB HID drivers deliver the arrow cluster as 0x80..0x83
+         * (see kbd_dispatch_char) rather than an ESC sequence -- there is no
+         * serial RX path, so the only keyboard is the local one. Up/Down walk
+         * the same history ring `fc` uses. */
+        if (ch == (char)0x80) { kline_history(-1); continue; }   /* Up    */
+        if (ch == (char)0x81) { kline_history(+1); continue; }   /* Down  */
+        if (ch == (char)0x82) {                                  /* Left  */
+            if (g_kline_pos > 0) { g_kline_pos--; kline_refresh(); }
+            continue;
+        }
+        if (ch == (char)0x83) {                                  /* Right */
+            if (g_kline_pos < line_len) { g_kline_pos++; kline_refresh(); }
+            continue;
+        }
 
+        /* Ctrl combos arrive folded to c & 0x1F. */
+        if (ch == 0x01) { g_kline_pos = 0;        kline_refresh(); continue; } /* ^A */
+        if (ch == 0x05) { g_kline_pos = line_len; kline_refresh(); continue; } /* ^E */
+        if (ch == 0x02) { if (g_kline_pos) g_kline_pos--;         kline_refresh(); continue; }
+        if (ch == 0x06) { if (g_kline_pos < line_len) g_kline_pos++; kline_refresh(); continue; }
+        if (ch == 0x10) { kline_history(-1); continue; }                       /* ^P */
+        if (ch == 0x0E) { kline_history(+1); continue; }                       /* ^N */
+        if (ch == 0x0B) { kline_delete(g_kline_pos, line_len); kline_refresh(); continue; } /* ^K */
+        if (ch == 0x15) { kline_delete(0, g_kline_pos); g_kline_pos = 0;
+                          kline_refresh(); continue; }                         /* ^U */
+        if (ch == 0x17) {                                                      /* ^W */
+            size_t p = g_kline_pos;
+            while (p > 0 && line[p - 1] == ' ') p--;
+            while (p > 0 && line[p - 1] != ' ') p--;
+            kline_delete(p, g_kline_pos);
+            g_kline_pos = p;
+            kline_refresh();
+            continue;
+        }
+        if (ch == 0x04) {                                                      /* ^D */
+            if (g_kline_pos < line_len) { kline_delete(g_kline_pos, g_kline_pos + 1);
+                                          kline_refresh(); }
+            continue;
+        }
+
+        /* Printable ASCII only; ignore the rest. */
+        if ((unsigned char)ch < 0x20 || (unsigned char)ch > 0x7E) continue;
         if (line_len + 1 >= LINE_MAX) continue;   /* drop overflow */
-        line[line_len++] = ch;
-        kputc(ch);
+
+        /* INSERT at the cursor, not append: with Left/Right available the
+         * cursor is no longer always at the end. */
+        for (size_t i = line_len; i > g_kline_pos; i--) line[i] = line[i - 1];
+        line[g_kline_pos++] = ch;
+        line_len++;
+        line[line_len] = '\0';
+        kline_refresh();
     }
 }
 

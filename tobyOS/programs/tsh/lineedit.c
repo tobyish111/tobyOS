@@ -17,6 +17,7 @@ struct le {
     const char  *prompt;
     size_t       plen;
     int          hist;           /* == count while on the live line */
+    int          painted;        /* has anything been drawn for this line yet */
     char         saved[LE_MAX];  /* live line, parked while browsing history */
 };
 
@@ -35,6 +36,28 @@ static void outs(const char *s) { out(s, strlen(s)); }
 static void refresh(struct le *s) {
     char o[LE_MAX + 128];
     size_t k = 0;
+
+    /* FIRST paint of a line: emit the prompt and buffer plainly, with no CR
+     * and no erase. Two reasons, and the second is not cosmetic.
+     *
+     * Nothing has been drawn yet, so there is nothing to erase or rewind --
+     * this is what readline does too.
+     *
+     * And the interactive parity gate frames its whole protocol on PROMPT
+     * SENTINELS (see the note in host.c). Wrapping a fresh prompt as
+     * "\r" + prompt + ESC[K makes those bytes stop matching, so the harness
+     * waits for a prompt it will never recognise, times out, and SIGKILLs
+     * tsh -- ttyparity went from 11/11 to 0/11 BROKEN, with the shell simply
+     * blocked in read(). A line editor may repaint itself freely, but the
+     * bytes of an untouched prompt have to stay exactly what they were. */
+    if (!s->painted) {
+        s->painted = 1;
+        for (size_t i = 0; i < s->plen && k < sizeof o - 8; i++) o[k++] = s->prompt[i];
+        for (size_t i = 0; i < s->len && k < sizeof o - 8; i++) o[k++] = s->buf[i];
+        if (k) out(o, k);
+        return;
+    }
+
     o[k++] = '\r';
     for (size_t i = 0; i < s->plen && k < sizeof o - 32; i++) o[k++] = s->prompt[i];
     for (size_t i = 0; i < s->len && k < sizeof o - 32; i++) o[k++] = s->buf[i];
@@ -128,6 +151,7 @@ static int reverse_search(struct le *s) {
         struct le tmp = *s;
         tmp.prompt = disp;
         tmp.plen = strlen(disp);
+        tmp.painted = 1;      /* the search prompt always REPLACES a line */
         if (found >= 0) set_line(&tmp, shell_history_get_hosted(found));
         refresh(&tmp);
 

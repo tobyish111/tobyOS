@@ -696,6 +696,20 @@ int main(int argc, char **argv) {
         if (argc > 3) (void)shell_set_args_hosted(argc - 3, argv + 3);
         return shell_run_line_hosted(argv[2]);
     }
+    /* --noediting: read the tty COOKED, no line editor. Same spelling and
+     * same meaning as bash, because the reasons to want it are the same --
+     * a harness comparing terminal byte streams, a terminal that mangles the
+     * escape sequences, or simply preferring the line discipline. Consumed
+     * here so it never reaches the script/-c arms below. */
+    int noediting = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--noediting") != 0) continue;
+        noediting = 1;
+        for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
+        argc--; argv[argc] = 0;
+        i--;
+    }
+
     if (argc >= 2 && argv[1][0] == '-' && argv[1][1] != '\0') {
         usage();
         return 2;
@@ -746,7 +760,7 @@ int main(int argc, char **argv) {
          * a pipe, a file, `echo cmd | tsh` -- keeps the plain reader below,
          * because there is no cursor to move there and putting a non-tty
          * into raw mode would break it. */
-        if (tsh_lineedit_available()) {
+        if (!noediting && tsh_lineedit_available()) {
             long r = tsh_readline(ps, line, sizeof line);
             if (r == TSH_LE_INTR) {
                 interrupted = 1;
