@@ -86,12 +86,26 @@ static int str_append_uint(char *b,int p,unsigned v){ char t[16]; fmt_uint(t,v);
 #define COL_MSG_OK   0x00A6E3A1u
 #define COL_MSG_ERR  0x00F38BA8u
 
-/* ---- text buffer (unchanged model) ----------------------------------- */
-#define MAX_LINES 512
-#define MAX_COLS 256
+/* ---- text buffer -----------------------------------------------------
+ *
+ * These were 512 x 256 with a READ buffer of MAX_LINES*80 = 40960 bytes --
+ * smaller than the line array itself, so a 41 KB file was cut short before
+ * the line limit was ever reached. load_file() then reported "Loaded" and
+ * Ctrl+S wrote the truncated copy back with O_TRUNC. Opening /data/boot.log
+ * (34 KB and growing) and saving would have deleted whatever did not fit.
+ * Raised to cover ordinary text, and the read buffer now matches the real
+ * capacity so ONE limit governs instead of three disagreeing ones. */
+#include "textbuf.h"
+
+#define MAX_LINES 2048
+#define MAX_COLS 512
 static char g_lines[MAX_LINES][MAX_COLS];
 static int g_line_count=1, g_cursor_row, g_cursor_col, g_scroll_row, g_modified;
 static char g_filename[256]; static int g_has_file;
+/* Non-zero when the buffer does NOT hold the whole file. Saving is refused
+ * while set: a partial buffer written back with O_TRUNC is silent data loss,
+ * and no status-line message is worth a destroyed file. */
+static int g_truncated; static const char *g_trunc_why;
 static char g_message[64]; static uint32_t g_msg_color; static long g_msg_expire;
 
 static int line_len(int row){ return (int)my_strlen(g_lines[row]); }
@@ -99,19 +113,27 @@ static void set_message(const char *msg,uint32_t color){ my_strncpy(g_message,ms
 
 static void load_file(const char *path){
     long ffd=sys_open(path,O_RDONLY,0); if(ffd<0){ set_message("Open failed",COL_MSG_ERR); return; }
-    static char filebuf[MAX_LINES*80]; long total=0;
-    for(;;){ long n=sys_read((int)ffd,filebuf+total,sizeof(filebuf)-(unsigned long)total-1); if(n<=0)break; total+=n; if((unsigned long)total>=sizeof(filebuf)-1)break; }
-    sys_close((int)ffd); filebuf[total]='\0';
-    my_memset(g_lines,0,sizeof(g_lines)); g_line_count=0; g_cursor_row=g_cursor_col=g_scroll_row=0;
-    int col=0;
-    for(long i=0;i<total&&g_line_count<MAX_LINES;i++){
-        if(filebuf[i]=='\n'){ g_lines[g_line_count][col]='\0'; g_line_count++; col=0; }
-        else if(filebuf[i]=='\r')continue;
-        else { if(col<MAX_COLS-1)g_lines[g_line_count][col++]=filebuf[i]; }
+    /* Sized to the LINE ARRAY, so the read is no longer the first limit to
+     * give out. The spare byte lets a short read prove the file ended here
+     * rather than merely filling the buffer. */
+    static char filebuf[MAX_LINES*MAX_COLS]; long total=0; int more=0;
+    for(;;){
+        long n=sys_read((int)ffd,filebuf+total,sizeof(filebuf)-(unsigned long)total-1);
+        if(n<=0)break;
+        total+=n;
+        if((unsigned long)total>=sizeof(filebuf)-1){
+            char probe; more=(sys_read((int)ffd,&probe,1)>0);   /* anything left? */
+            break;
+        }
     }
-    if(col>0||g_line_count==0){ g_lines[g_line_count][col]='\0'; g_line_count++; }
-    if(g_line_count==0)g_line_count=1;
-    g_modified=0; my_strcpy(g_filename,path); g_has_file=1; set_message("Loaded",COL_MSG_OK);
+    sys_close((int)ffd); filebuf[total]='\0';
+    my_memset(g_lines,0,sizeof(g_lines)); g_cursor_row=g_cursor_col=g_scroll_row=0;
+    struct textbuf_result tr;
+    textbuf_parse(&g_lines[0][0],MAX_LINES,MAX_COLS,filebuf,total,more,&tr);
+    g_line_count=tr.line_count; g_truncated=tr.truncated; g_trunc_why=tr.why;
+    g_modified=0; my_strcpy(g_filename,path); g_has_file=1;
+    if(g_truncated) set_message("READ-ONLY: truncated on load, saving disabled",COL_MSG_ERR);
+    else            set_message("Loaded",COL_MSG_OK);
 }
 /* Bounded append -- str_append() above takes no capacity, which is fine for
  * the fixed-width status line but not for a message carrying a file path. */
@@ -139,6 +161,20 @@ static const char *save_reason(long e){
 
 static void save_file(void){
     if(!g_has_file){ set_message("No filename",COL_MSG_ERR); return; }
+    /* The whole point of tracking truncation. Writing g_lines back with
+     * O_TRUNC when the buffer never held the whole file DELETES the rest --
+     * silently, and reports "Saved". Refuse, and name the limit that hit. */
+    if(g_truncated){
+        char m[192]; int p=0; m[0]='\0';
+        p=log_cat(m,p,(int)sizeof m,"Save refused: ");
+        (void)log_cat(m,p,(int)sizeof m,g_trunc_why?g_trunc_why:"buffer is partial");
+        set_message(m,COL_MSG_ERR);
+        { char l[320]; int q=0; l[0]='\0';
+          q=log_cat(l,q,(int)sizeof l,"save REFUSED (partial buffer) path=");
+          (void)log_cat(l,q,(int)sizeof l,g_filename);
+          tobylog_write(ABI_SLOG_LEVEL_WARN,"edit",l); }
+        return;
+    }
     long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0);
     if(ffd<0){
         set_message(save_reason(ffd),COL_MSG_ERR);
@@ -158,7 +194,7 @@ static void save_file(void){
     for(int i=0;i<g_line_count;i++){ int len=line_len(i); if(len>0)sys_write_fd((int)ffd,g_lines[i],(unsigned long)len); if(i<g_line_count-1)sys_write_fd((int)ffd,"\n",1); }
     sys_close((int)ffd); g_modified=0; set_message("Saved",COL_MSG_OK);
 }
-static void new_file(void){ my_memset(g_lines,0,sizeof(g_lines)); g_line_count=1; g_cursor_row=g_cursor_col=g_scroll_row=0; g_modified=0; g_has_file=0; g_filename[0]='\0'; set_message("New file",COL_MSG_OK); }
+static void new_file(void){ g_truncated=0; g_trunc_why=0; my_memset(g_lines,0,sizeof(g_lines)); g_line_count=1; g_cursor_row=g_cursor_col=g_scroll_row=0; g_modified=0; g_has_file=0; g_filename[0]='\0'; set_message("New file",COL_MSG_OK); }
 
 static void ensure_cursor_visible(void){
     if(g_cursor_row<g_scroll_row)g_scroll_row=g_cursor_row;
