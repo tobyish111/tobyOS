@@ -677,6 +677,8 @@ static void tsh_arm_sigint(void) {
     (void)signal_norestart(SIGINT, tsh_sigint);
 }
 
+#include "lineedit.h"
+
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
     {
@@ -735,10 +737,37 @@ int main(int argc, char **argv) {
         if (!cont) shell_notify_jobs_hosted();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
-        write(1, ps, strlen(ps));
         size_t n = 0;
         g_tsh_sigint = 0;
         int interrupted = 0;
+
+        /* A terminal gets the line editor: history, cursor keys and the
+         * control bindings everyone has in their fingers. Anything else --
+         * a pipe, a file, `echo cmd | tsh` -- keeps the plain reader below,
+         * because there is no cursor to move there and putting a non-tty
+         * into raw mode would break it. */
+        if (tsh_lineedit_available()) {
+            long r = tsh_readline(ps, line, sizeof line);
+            if (r == TSH_LE_INTR) {
+                interrupted = 1;
+                n = 0;
+            } else if (r == TSH_LE_EOF) {
+                if (!cont) {
+                    if (shell_opt_ignoreeof_hosted() && ++eofs < 10) {
+                        fputs("Use \"exit\" to leave the shell.\n", stderr);
+                        continue;
+                    }
+                    write(1, "exit\n", 5);
+                    return last;
+                }
+                n = 0;
+            } else {
+                n = (size_t)r;
+            }
+            goto have_line;
+        }
+
+        write(1, ps, strlen(ps));
         for (;;) {
             char c;
             long r = read(0, &c, 1);
@@ -769,6 +798,7 @@ int main(int argc, char **argv) {
             if (n + 1 < sizeof line) line[n++] = c;
         }
         line[n] = '\0';
+    have_line:
         if (interrupted) {
             /* The tty already echoed "^C" with no newline, so the next
              * prompt would run on from it. bash prints the newline; so do

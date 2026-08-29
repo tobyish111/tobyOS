@@ -21149,6 +21149,15 @@ bool shell_wants_exit_hosted(int *status) {
  * The ring and fc were both fully built -- and the hosted REPL never
  * called this, so interactive fc listed an empty history forever. */
 void shell_history_add_hosted(const char *line) { shell_history_add(line); }
+/* Read access for the hosted line editor's Up/Down and ^R. The ring already
+ * existed for `fc`; nothing could READ it from outside. Index 0 is the
+ * OLDEST entry, matching g_hist's own order, so the editor walks backwards
+ * from count-1 without needing to know the ring is compacted on overflow. */
+int shell_history_count_hosted(void) { return g_hist_count; }
+const char *shell_history_get_hosted(int i) {
+    if (i < 0 || i >= g_hist_count) return 0;
+    return g_hist[i];
+}
 
 void shell_init_hosted(const char *argv0) {
     line_len = 0;

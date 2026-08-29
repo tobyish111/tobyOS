@@ -1697,6 +1697,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,spechelp,spechelp))
 # the host implements that interface rather than the other way round.
 TSH_OBJS := programs/tsh/shell_hosted.o \
             programs/tsh/host.o \
+            programs/tsh/lineedit.o \
             programs/tsh/kstubs.o
 
 # -DSHELL_HOSTED: userspace exposes only the POSIX/bash builtin set, so the
