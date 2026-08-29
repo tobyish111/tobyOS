@@ -16,7 +16,13 @@
 #include <tobyos/sec.h>
 #include <tobyos/rng.h>
 #include <tobyos/users.h>
-#include <tobyos/term.h>
+#include <tobyos/pty.h>
+#include <tobyos/users.h>
+#include <tobyos/proc.h>
+#include <tobyos/sched.h>
+#include <tobyos/cpu.h>
+#include <tobyos/file.h>
+#include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/pit.h>
@@ -70,6 +76,17 @@
 #define SSH_CHANNEL_WINDOW 32768u
 #define SSH_CHANNEL_PACKET 2048u
 
+/* One interactive session.
+ *
+ * This used to hold a `struct term_session`, which is a 14-builtin command
+ * interpreter living inside term.c -- no pipelines, no redirection, no
+ * external programs, and an input path that discarded every control
+ * character. `cat f | less` did not fail there; it silently ran `cat f` and
+ * threw away the rest of the line, because the builtin reads argv[1] and
+ * nothing else.
+ *
+ * Now the session is a real /bin/tsh on a real pty, so the shell doing the
+ * work is the same one the bash-parity gate measures. */
 struct ssh_channel {
     bool active;
     bool term_started;
@@ -79,7 +96,20 @@ struct ssh_channel {
     uint32_t remote_id;
     uint32_t remote_window;
     uint32_t remote_max_packet;
-    struct term_session *term;
+
+    struct file *ptym;          /* pty master, held by the server */
+    int          pty_idx;
+    int          child_pid;     /* the /bin/tsh we spawned, -1 = none */
+
+    /* The spawn is DEFERRED, not done in the request handler. ssh_poll()
+     * runs both from the pid-0 idle loop and from the syscall-return path,
+     * so `current_proc()` at request time is whoever happened to syscall
+     * last -- and a child inherits its parent's caps, cwd and identity. A
+     * shell whose privileges depend on unrelated timing is a flake
+     * generator, so we wait for a tick that really is pid 0. */
+    bool         want_spawn;
+    char         exec_cmd[256];
+    uint16_t     win_cols, win_rows;
 };
 
 struct ssh_chachapoly_ctx {
@@ -98,6 +128,9 @@ enum ssh_state {
     SSH_CHANNEL_OPEN,
     SSH_SENT_DISCONNECT,
 };
+
+#define SSH_TX_MAX 65536u
+static void ssh_tx_flush(void);
 
 static struct tcp_conn *g_lsn;
 static struct tcp_conn *g_cli;
@@ -119,12 +152,39 @@ static struct ssh_chachapoly_ctx g_in_cipher;
 static struct ssh_chachapoly_ctx g_out_cipher;
 static char            g_auth_user[USER_NAME_MAX];
 static struct ssh_channel g_chan;
+static uint8_t         g_tx[SSH_TX_MAX];
+static size_t          g_tx_head, g_tx_tail;
+static int             g_worker_pid = -1;
 static uint32_t        g_send_seq;
 static uint32_t        g_recv_seq;
 
+/* Release the pty master. The child's own fds are closed by its exit path;
+ * dropping this reference is what lets the pair be reused. */
+static void ssh_channel_teardown(void) {
+#ifdef SSH_PTY_DIAG
+    kprintf("[ptydiag] ssh teardown idx=%d child=%d\n",
+            g_chan.pty_idx, g_chan.child_pid);
+#endif
+    if (g_chan.ptym) { pty_close(g_chan.ptym); kfree(g_chan.ptym); g_chan.ptym = 0; }
+    g_chan.pty_idx = -1;
+    g_chan.child_pid = -1;
+    g_chan.want_spawn = false;
+}
+
 static void ssh_close_client(void) {
-    if (g_chan.term) term_session_close(g_chan.term);
-    if (g_cli) tcp_close(g_cli);
+    ssh_channel_teardown();
+    g_tx_head = g_tx_tail = 0;
+    /* Push any queued bytes, then close WITHOUT waiting.
+     *
+     * tcp_close() waits up to 5 s for the peer's FIN and then lingers through
+     * TIME_WAIT -- and ssh_close_client() runs inside ssh_poll(), on pid 0,
+     * from net_service_tick(). That parked the idle loop on every session
+     * teardown: "pid 0 idle loop stalled 10753ms" from the watchdog, with the
+     * whole machine (network, GUI, input) frozen behind it. tcp_close_nowait
+     * sends the FIN and hands the handshake plus the linger to
+     * tcp_service_tick, which is what it exists for. The conn is untouchable
+     * afterwards, which is fine -- g_cli is cleared on the next line. */
+    if (g_cli) { ssh_tx_flush(); tcp_close_nowait(g_cli); }
     g_cli = 0;
     g_state = SSH_WAIT_IDENT;
     g_line_len = 0;
@@ -142,14 +202,59 @@ static void ssh_close_client(void) {
     g_recv_seq = 0;
 }
 
-static bool ssh_send_all(struct tcp_conn *c, const void *buf, size_t len) {
-    const uint8_t *p = (const uint8_t *)buf;
-    while (len > 0) {
-        long n = tcp_send(c, p, len);
-        if (n <= 0) return false;
-        p += (size_t)n;
-        len -= (size_t)n;
+/* ---- TX window ------------------------------------------------------
+ *
+ * Everything the server sends is buffered here and drained with
+ * tcp_send_nb(). It used to go straight out through tcp_send(), which
+ * BLOCKS: it waits for the congestion/receive window to open and then waits
+ * again for the data to be acknowledged, up to (TCP_RETX_LIMIT + 2) * rto.
+ *
+ * ssh_poll() runs from net_service_tick() with the BKL held, so that wait
+ * parks pid 0 holding the lock and the whole machine stops -- observed as
+ * "pid 0 idle loop stalled 10816ms" from the watchdog the first time a real
+ * shell produced enough output to fill the window. The old 14-builtin
+ * interpreter emitted a few bytes and closed, so it never got there.
+ *
+ * Same shape as vnc.c, and for the same reason -- see the note at the top
+ * of that file. */
+static size_t ssh_tx_pending(void) { return g_tx_tail - g_tx_head; }
+
+static void ssh_tx_compact(void) {
+    if (g_tx_head == 0) return;
+    size_t n = ssh_tx_pending();
+    if (n) memmove(g_tx, g_tx + g_tx_head, n);
+    g_tx_head = 0;
+    g_tx_tail = n;
+}
+
+static size_t ssh_tx_space(void) {
+    ssh_tx_compact();
+    return SSH_TX_MAX - g_tx_tail;
+}
+
+/* Drain whatever the send window will take right now. Never blocks. */
+static void ssh_tx_flush(void) {
+    while (g_cli && g_tx_head < g_tx_tail) {
+        long s = tcp_send_nb(g_cli, g_tx + g_tx_head, ssh_tx_pending());
+        if (s <= 0) break;
+        g_tx_head += (size_t)s;
     }
+    if (g_tx_head == g_tx_tail) g_tx_head = g_tx_tail = 0;
+}
+
+/* Queue bytes for the client. Returns false only when the buffer is full,
+ * which callers treat as a fatal connection error -- the alternative is a
+ * silently truncated SSH packet, and the protocol cannot resynchronise from
+ * that. Backpressure is applied earlier instead: ssh_drain_channel_output()
+ * stops reading the pty while the buffer is close to full, so the shell is
+ * throttled rather than its output lost. */
+static bool ssh_send_all(struct tcp_conn *c, const void *buf, size_t len) {
+    (void)c;
+    ssh_tx_flush();                       /* make room if the wire allows */
+    if (ssh_tx_space() < len) return false;
+    memcpy(g_tx + g_tx_tail, buf, len);
+    g_tx_tail += len;
+    ssh_tx_flush();
     return true;
 }
 
@@ -981,20 +1086,16 @@ static void ssh_handle_channel_open_payload(const uint8_t *payload,
         return;
     }
 
-    struct term_session *term = term_session_create();
-    if (!term) {
-        (void)ssh_send_channel_open_failure(g_cli, sender,
-            SSH_OPEN_CONNECT_FAILED, "no terminal sessions available");
-        return;
-    }
-
+    /* The pty and the shell are created on the "shell"/"exec" request, not
+     * here: a client may open the channel and never ask for either. */
     memset(&g_chan, 0, sizeof(g_chan));
+    g_chan.pty_idx = -1;
+    g_chan.child_pid = -1;
     g_chan.active = true;
     g_chan.local_id = 0;
     g_chan.remote_id = sender;
     g_chan.remote_window = win;
     g_chan.remote_max_packet = maxpkt ? maxpkt : SSH_CHANNEL_PACKET;
-    g_chan.term = term;
 
     if (!ssh_send_channel_open_confirmation(g_cli)) {
         ssh_close_client();
@@ -1024,18 +1125,30 @@ static void ssh_handle_channel_request_payload(const uint8_t *payload,
     }
 
     if (ssh_string_eq(type, type_n, "pty-req")) {
+        /* TERM string, then cols/rows in characters. Keep the geometry so the
+         * slave's winsize is right before the shell starts -- `less` and every
+         * other full-screen program sizes itself from it. */
+        {
+            const uint8_t *term_s; size_t term_n;
+            if (read_string(payload, n, &o, &term_s, &term_n) && o + 8u <= n) {
+                g_chan.win_cols = (uint16_t)get_u32_be(payload + o);
+                g_chan.win_rows = (uint16_t)get_u32_be(payload + o + 4u);
+            }
+        }
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
             ssh_close_client();
             return;
         }
-        kprintf("[ssh] pty-req accepted for '%s' (term shim)\n",
-                g_auth_user);
+        kprintf("[ssh] pty-req accepted for '%s' (%ux%u)\n",
+                g_auth_user, g_chan.win_cols, g_chan.win_rows);
         return;
     }
 
     if (ssh_string_eq(type, type_n, "shell")) {
         g_chan.term_started = true;
         g_chan.exec_mode = false;
+        g_chan.exec_cmd[0] = 0;
+        g_chan.want_spawn = true;      /* ssh_poll spawns it on a pid-0 tick */
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
             ssh_close_client();
             return;
@@ -1050,11 +1163,15 @@ static void ssh_handle_channel_request_payload(const uint8_t *payload,
         if (!read_string(payload, n, &o, &cmd, &cmd_n)) goto malformed;
         g_chan.term_started = true;
         g_chan.exec_mode = true;
-        if (cmd_n > 0 && g_chan.term) {
-            (void)term_session_write_input(g_chan.term,
-                                           (const char *)cmd, cmd_n);
-            (void)term_session_write_input(g_chan.term, "\n", 1);
+        /* Handed to `tsh -c` verbatim, so `ssh host 'a | b'` gets the
+         * same parser as an interactive line, not a second dialect. */
+        {
+            size_t cl = cmd_n < sizeof(g_chan.exec_cmd) - 1u
+                      ? cmd_n : sizeof(g_chan.exec_cmd) - 1u;
+            memcpy(g_chan.exec_cmd, cmd, cl);
+            g_chan.exec_cmd[cl] = 0;
         }
+        g_chan.want_spawn = true;
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
             ssh_close_client();
             return;
@@ -1063,8 +1180,21 @@ static void ssh_handle_channel_request_payload(const uint8_t *payload,
         return;
     }
 
-    if (ssh_string_eq(type, type_n, "env") ||
-        ssh_string_eq(type, type_n, "window-change")) {
+    if (ssh_string_eq(type, type_n, "window-change")) {
+        if (o + 8u <= n) {
+            g_chan.win_cols = (uint16_t)get_u32_be(payload + o);
+            g_chan.win_rows = (uint16_t)get_u32_be(payload + o + 4u);
+            if (g_chan.ptym)
+                pty_set_winsize(g_chan.ptym, g_chan.win_cols, g_chan.win_rows);
+        }
+        if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
+            ssh_close_client();
+            return;
+        }
+        return;
+    }
+
+    if (ssh_string_eq(type, type_n, "env")) {
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
             ssh_close_client();
             return;
@@ -1093,9 +1223,12 @@ static void ssh_handle_channel_data_payload(const uint8_t *payload,
     if (o + 4u > n) goto malformed;
     recipient = get_u32_be(payload + o); o += 4u;
     if (!read_string(payload, n, &o, &data, &data_n)) goto malformed;
-    if (!g_chan.active || recipient != g_chan.local_id || !g_chan.term)
+    if (!g_chan.active || recipient != g_chan.local_id || !g_chan.ptym)
         return;
-    (void)term_session_write_input(g_chan.term, (const char *)data, data_n);
+    /* Straight into the line discipline: no filtering. term.c dropped every
+     * control character, which is why nothing interactive could be driven
+     * over SSH -- no arrows, no Ctrl-C, no Tab. */
+    (void)pty_master_write(g_chan.ptym, (const char *)data, data_n);
     return;
 
 malformed:
@@ -1133,49 +1266,144 @@ static void ssh_handle_channel_control_payload(const uint8_t *payload,
 
     if (msg == SSH_MSG_CHANNEL_CLOSE) {
         (void)ssh_send_channel_close(g_cli);
-        if (g_chan.term) {
-            term_session_close(g_chan.term);
-            g_chan.term = 0;
-        }
+        ssh_channel_teardown();
         g_chan.active = false;
         return;
     }
 }
 
+/* Start /bin/tsh on a fresh pty for this channel.
+ *
+ * Called ONLY from a tick where current_proc() is pid 0 -- see the note on
+ * ssh_channel.want_spawn. Everything the child inherits (caps, cwd, uid) then
+ * comes from a known parent instead of whichever process last made a syscall.
+ *
+ * Reference counting, which this codebase has been bitten by before:
+ * install_initial_fds() CLONES every struct file it is handed, so those three
+ * clones belong to the child and the one pty_open_slave() returned is still
+ * ours. Dropping it here leaves slave_refs == 3, all owned by the child, so
+ * its exit takes them to zero -- which is exactly the EOF the pump below
+ * watches for to close the channel. */
+static bool ssh_spawn_shell(void) {
+    g_chan.want_spawn = false;
+
+    struct file *m = pty_open_master();
+    if (!m) {
+        kprintf("[ssh] no free pty for '%s'\n", g_auth_user);
+        return false;
+    }
+    int idx = pty_index_of(m);
+    struct file *sl = (idx >= 0) ? pty_open_slave(idx) : 0;
+    if (!sl) {
+        pty_close(m); kfree(m);
+        kprintf("[ssh] pty slave open failed\n");
+        return false;
+    }
+    if (g_chan.win_cols || g_chan.win_rows)
+        pty_set_winsize(m, g_chan.win_cols, g_chan.win_rows);
+
+    char a0[] = "tsh", a1[] = "-c";
+    char *argv[3];
+    int   argc = 1;
+    argv[0] = a0;
+    if (g_chan.exec_mode && g_chan.exec_cmd[0]) {
+        argv[1] = a1;
+        argv[2] = g_chan.exec_cmd;
+        argc = 3;
+    }
+
+    struct proc_spec spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.path = "/bin/tsh";
+    spec.name = "tsh-ssh";
+    spec.fd0 = sl; spec.fd1 = sl; spec.fd2 = sl;
+    spec.argc = argc;
+    spec.argv = argv;
+    spec.cwd  = "/";
+
+    int pid = proc_spawn(&spec);
+    pty_close(sl); kfree(sl);        /* the child holds its own clones now */
+
+    if (pid < 0) {
+        pty_close(m); kfree(m);
+        kprintf("[ssh] spawn of /bin/tsh FAILED rc=%d\n", pid);
+        return false;
+    }
+
+    /* Run as the account that authenticated, not as pid 0's root.
+     * Safe to set here: this is a cooperative kernel, we are on pid 0,
+     * and the child exists but has not been scheduled yet. Without this
+     * every SSH login would silently be root. */
+    {
+        struct proc *cp = proc_lookup(pid);
+        const struct user *u = users_lookup_by_name(g_auth_user);
+        if (cp && u) { cp->uid = u->uid; cp->gid = u->gid; }
+    }
+
+    g_chan.ptym = m;
+    g_chan.pty_idx = idx;
+    g_chan.child_pid = pid;
+    kprintf("[ssh] /bin/tsh pid=%d on pty%d for '%s'%s\n",
+            pid, idx, g_auth_user, g_chan.exec_mode ? " (exec)" : "");
+    return true;
+}
+
+/* Move shell output to the client, and notice when the shell is gone.
+ *
+ * pty_master_read_nb separates "nothing yet" (-2) from "the slave end is
+ * fully closed" (0). That distinction is the whole exit path: the child
+ * holds the only three slave references, so when it exits they drop to zero
+ * and this read reports EOF. That works for an interactive shell as well as
+ * for exec, which the old term-session version could not do -- it only ever
+ * closed the channel in exec mode, because an empty ring and a finished
+ * command looked identical to it. */
 static void ssh_drain_channel_output(void) {
-    if (!g_cli || !g_chan.active || !g_chan.term || g_chan.close_sent)
+    if (!g_cli || !g_chan.active || !g_chan.ptym || g_chan.close_sent)
         return;
 
     for (int rounds = 0; rounds < 4; rounds++) {
         if (g_chan.remote_window == 0) return;
 
+        /* Throttle on our OWN buffer as well as the peer's window. Reading
+         * the pty faster than the wire drains would overflow g_tx, and a
+         * dropped SSH packet is unrecoverable. Leave headroom for the packet
+         * framing ssh_send_channel_data adds around the payload. */
+        size_t room = ssh_tx_space();
+        if (room < 1024u) return;
         char out[512];
         size_t cap = sizeof(out);
+        if (cap > room - 512u) cap = room - 512u;
         if (cap > g_chan.remote_window) cap = g_chan.remote_window;
         if (cap > g_chan.remote_max_packet && g_chan.remote_max_packet > 0)
             cap = g_chan.remote_max_packet;
         if (cap == 0) return;
 
-        long n = term_session_read_output(g_chan.term, out, cap);
-        if (n < 0) {
+        long n = pty_master_read_nb(g_chan.ptym, out, cap);
+        if (n == -2) return;                    /* nothing buffered yet */
+        if (n < 0) {                            /* bad handle: give up */
             (void)ssh_send_channel_close(g_cli);
-            term_session_close(g_chan.term);
-            g_chan.term = 0;
+            ssh_channel_teardown();
             g_chan.active = false;
             return;
         }
         if (n == 0) {
-            if (g_chan.exec_mode) {
-                if (!ssh_send_channel_exit_status(g_cli, 0) ||
-                    !ssh_send_channel_eof(g_cli) ||
-                    !ssh_send_channel_close(g_cli)) {
-                    ssh_close_client();
-                    return;
-                }
-                term_session_close(g_chan.term);
-                g_chan.term = 0;
-                g_chan.active = false;
+            /* The shell exited and the pty drained. Report its status and
+             * close, whether this was `ssh host cmd` or an interactive
+             * session the user typed `exit` into. */
+            int code = 0;
+            struct proc *cp = (g_chan.child_pid > 0)
+                            ? proc_lookup(g_chan.child_pid) : 0;
+            if (cp) code = cp->exit_code;
+            kprintf("[ssh] session shell pid=%d finished rc=%d\n",
+                    g_chan.child_pid, code);
+            if (!ssh_send_channel_exit_status(g_cli, (uint32_t)code) ||
+                !ssh_send_channel_eof(g_cli) ||
+                !ssh_send_channel_close(g_cli)) {
+                ssh_close_client();
+                return;
             }
+            ssh_channel_teardown();
+            g_chan.active = false;
             return;
         }
 
@@ -1388,36 +1616,42 @@ void ssh_init(void) {
             (unsigned)SSH_PORT);
 }
 
-void ssh_poll(void) {
-    if (!g_lsn || !net_is_up()) return;
+/* Drive the live client session. WORKER CONTEXT ONLY -- see ssh_worker().
+ *
+ * This body used to be ssh_poll(), called straight from net_service_tick()
+ * on pid 0's idle loop, and that is what made the tsh rewrite unsafe. The
+ * session does TCP waits, which drop the BKL by design (tcp_poll_until says
+ * so explicitly, to avoid starving pid 0), so the tick was not atomic; and
+ * it touches pty rings that the spawned shell manipulates from another CPU.
+ * On -smp 4 the guest wedged at random with "pid 0 idle loop stalled", while
+ * a byte-identical binary ran 6/6 clean on -smp 1. Every attempt to
+ * instrument the window made it disappear.
+ *
+ * So the work moved off the idle loop instead of being chased. A ring-0
+ * worker is an ordinary schedulable proc: if it blocks, or even wedges,
+ * ONLY IT stops. pid 0 keeps beating, the watchdog stays quiet and the
+ * machine stays usable. Same model as http_async.c and ws.c. */
+static void ssh_service(void) {
+    if (!g_lsn || !net_is_up() || !g_cli) return;
 
-    if (!g_cli) {
-        g_cli = tcp_accept(g_lsn, 0);
-        if (!g_cli) return;
+    ssh_tx_flush();
 
-        g_state = SSH_WAIT_IDENT;
-        g_line_len = 0;
-        g_line[0] = '\0';
-        g_rx_len = 0;
-        g_client_kexinit_len = 0;
-        g_server_kexinit_len = 0;
-        g_have_session_id = false;
-        memset(g_session_id, 0, sizeof(g_session_id));
-        memset(&g_in_cipher, 0, sizeof(g_in_cipher));
-        memset(&g_out_cipher, 0, sizeof(g_out_cipher));
-        memset(g_auth_user, 0, sizeof(g_auth_user));
-        memset(&g_chan, 0, sizeof(g_chan));
-        g_send_seq = 0;
-        g_recv_seq = 0;
-        kprintf("[ssh] client connected\n");
-        if (!ssh_send_all(g_cli, SSH_IDENT, strlen(SSH_IDENT))) {
-            ssh_close_client();
-            return;
+    /* No pid-0 dance needed any more: the worker IS a fixed, known parent,
+     * so the shell's caps, cwd and identity no longer depend on whichever
+     * process happened to make the last syscall. */
+    if (g_chan.want_spawn && g_chan.active) {
+        if (!ssh_spawn_shell()) {
+            (void)ssh_send_channel_close(g_cli);
+            g_chan.active = false;
         }
     }
 
+    /* A real timeout is affordable here, and wanted. In the old idle-tick
+     * context any wait froze the machine, so this was 0 and the loop spun;
+     * on the worker tcp_yield_wait turns the wait into a yield, which paces
+     * the loop and cuts round-trip latency at the same time. */
     uint8_t buf[128];
-    long n = tcp_recv(g_cli, buf, sizeof(buf), 0);
+    long n = tcp_recv(g_cli, buf, sizeof(buf), 20);
     if (n > 0) {
         if (g_state == SSH_WAIT_IDENT) {
             for (long i = 0; i < n; i++) {
@@ -1454,5 +1688,64 @@ void ssh_poll(void) {
     if (g_state == SSH_SENT_DISCONNECT ||
         (st != TCP_ESTABLISHED && st != TCP_CLOSE_WAIT)) {
         ssh_close_client();
+    }
+}
+
+/* The ring-0 worker. Spawned on the first client and then long-lived. */
+static void ssh_worker(void) {
+    /* First entry arrives through the context switch with no BKL. */
+    if (!bkl_held()) bkl_enter();
+    struct proc *self = current_proc();
+    if (self) self->tcp_yield_wait = true;   /* yield, never hlt, in tcp waits */
+    kprintf("[ssh] worker up (pid=%d)\n", self ? self->pid : -1);
+
+    for (;;) {
+        ssh_service();
+        /* Never yield holding the BKL. */
+        bkl_exit();
+        sched_yield();
+        bkl_enter();
+    }
+}
+
+/* Tick context (net_service_tick, pid 0). Deliberately does ONE cheap,
+ * non-blocking thing: notice a new connection and hand it to the worker.
+ * Nothing here may block or touch a pty. */
+void ssh_poll(void) {
+    if (!g_lsn || !net_is_up()) return;
+    if (g_cli) return;                       /* the worker owns the session */
+
+    struct tcp_conn *c = tcp_accept(g_lsn, 0);
+    if (!c) return;
+
+    g_state = SSH_WAIT_IDENT;
+    g_line_len = 0;
+    g_line[0] = '\0';
+    g_rx_len = 0;
+    g_client_kexinit_len = 0;
+    g_server_kexinit_len = 0;
+    g_have_session_id = false;
+    memset(g_session_id, 0, sizeof(g_session_id));
+    memset(&g_in_cipher, 0, sizeof(g_in_cipher));
+    memset(&g_out_cipher, 0, sizeof(g_out_cipher));
+    memset(g_auth_user, 0, sizeof(g_auth_user));
+    memset(&g_chan, 0, sizeof(g_chan));
+    g_chan.pty_idx = -1;
+    g_chan.child_pid = -1;
+    g_tx_head = g_tx_tail = 0;
+    g_send_seq = 0;
+    g_recv_seq = 0;
+    g_cli = c;
+
+    kprintf("[ssh] client connected\n");
+    if (!ssh_send_all(g_cli, SSH_IDENT, strlen(SSH_IDENT))) {
+        ssh_close_client();
+        return;
+    }
+
+    if (g_worker_pid < 0) {
+        g_worker_pid = proc_create_kernel(ssh_worker, "sshd");
+        if (g_worker_pid < 0)
+            kprintf("[ssh] could not start worker; session dropped\n");
     }
 }

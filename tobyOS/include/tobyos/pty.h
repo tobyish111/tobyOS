@@ -49,6 +49,33 @@ long pty_ioctl       (struct file *f, unsigned long cmd, unsigned long arg);
 void pty_close        (struct file *f);   /* drop one end's reference */
 void pty_clone_ref     (struct file *f);   /* dup/fork: bump end refcount */
 
+/* ---- kernel-side helpers (no userspace pointers involved) ------------
+ *
+ * The three calls above this point are the userspace path: pty_ioctl moves
+ * termios/winsize through copy_to_user/copy_from_user, and pty_master_read
+ * BLOCKS the calling process on a wait queue. Neither is usable from an
+ * in-kernel service such as the SSH server, which pumps bytes from
+ * net_service_tick() -- a context that runs on the syscall-return path and
+ * must never block. These are the same operations without those two
+ * assumptions. */
+
+/* Which pair does this master belong to? Needed to open the matching slave,
+ * since `struct pty` is private to pty.c. Returns -1 if `f` is not a master. */
+int  pty_index_of(struct file *f);
+
+/* Like pty_master_read, but never parks the caller. Returns:
+ *     > 0  bytes read
+ *       0  EOF -- the slave end is fully closed (the program on it exited)
+ *      -2  nothing buffered right now; try again next tick
+ * The 0-vs--2 split is the whole point: a poller must be able to tell "the
+ * shell has nothing to say yet" from "the shell is gone", and the blocking
+ * pty_master_read collapses both onto a wait. */
+long pty_master_read_nb(struct file *f, void *buf, size_t n);
+
+/* Set the slave's window size from kernel memory (SSH pty-req / window-change
+ * carry it in the protocol, not in a user buffer). */
+void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows);
+
 /* poll/select readiness for a PTY fd (master or slave). */
 bool pty_readable(struct file *f);
 bool pty_hup(struct file *f);             /* other end fully closed */

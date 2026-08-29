@@ -27,6 +27,12 @@
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
 
+/* -DSSH_PTY_DIAG traces pty open/clone/close with refcounts. Useful for
+ * lifecycle and refcount questions -- but DO NOT reach for it on a timing
+ * bug: it masks them. The SMP deadlock in the SSH-on-tsh work reproduced
+ * every 1-3 sessions on a plain build and went 10/10 GREEN with this
+ * enabled (so did -DSMP_DIAG). sched.c carries the same warning about
+ * per-event BKL logging. */
 #define PTY_MAX  8
 #define PTY_BUF  4096
 
@@ -130,6 +136,10 @@ struct file *pty_open_master(void) {
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_PTY_MASTER;
     f->pty  = t;
+#ifdef SSH_PTY_DIAG
+    kprintf("[ptydiag] open_master idx=%d m=%d s=%d\n", idx,
+            t->master_refs, t->slave_refs);
+#endif
     return f;
 }
 
@@ -143,6 +153,10 @@ struct file *pty_open_slave(int index) {
     f->kind = FILE_KIND_PTY_SLAVE;
     f->pty  = t;
     t->slave_refs++;
+#ifdef SSH_PTY_DIAG
+    kprintf("[ptydiag] open_slave  idx=%d m=%d s=%d\n", index,
+            t->master_refs, t->slave_refs);
+#endif
     return f;
 }
 
@@ -162,6 +176,11 @@ void pty_close(struct file *f) {
         if (t->slave_refs > 0) t->slave_refs--;
         if (t->slave_refs == 0) wq_wake_all(&t->wq_master_read);  /* master HUP */
     }
+#ifdef SSH_PTY_DIAG
+    kprintf("[ptydiag] close  %s idx=%d m=%d s=%d used=%d\n",
+            f->kind == FILE_KIND_PTY_MASTER ? "master" : "slave ",
+            t->index, t->master_refs, t->slave_refs, (int)t->used);
+#endif
     pty_maybe_free(t);
 }
 
@@ -170,6 +189,11 @@ void pty_clone_ref(struct file *f) {
     if (!t) return;
     if (f->kind == FILE_KIND_PTY_MASTER) t->master_refs++;
     else                                 t->slave_refs++;
+#ifdef SSH_PTY_DIAG
+    kprintf("[ptydiag] clone  %s idx=%d m=%d s=%d\n",
+            f->kind == FILE_KIND_PTY_MASTER ? "master" : "slave ",
+            t->index, t->master_refs, t->slave_refs);
+#endif
 }
 
 /* ---- canonical line editing (master-write time) -----------------
@@ -309,6 +333,38 @@ long pty_master_read(struct file *f, void *buf, size_t n) {
         out[got++] = (uint8_t)c;
     }
     return (long)got;
+}
+
+/* ---- kernel-side helpers (see pty.h) ----------------------------- */
+
+int pty_index_of(struct file *f) {
+    if (!f || f->kind != FILE_KIND_PTY_MASTER || !f->pty) return -1;
+    return f->pty->index;
+}
+
+long pty_master_read_nb(struct file *f, void *buf, size_t n) {
+    struct pty *t = f ? f->pty : 0;
+    if (!t) return -1;
+    /* Empty ring is NOT an error and NOT a reason to park: an in-kernel
+     * poller calls this every tick and simply wants "nothing yet". Only a
+     * departed slave is EOF, which is how the SSH server learns the shell
+     * it spawned has exited. */
+    if (t->out_head == t->out_tail) return (t->slave_refs == 0) ? 0 : -2;
+    uint8_t *out = (uint8_t *)buf;
+    size_t got = 0;
+    while (got < n) {
+        int c = ring_pop(t->out, t->out_head, &t->out_tail);
+        if (c < 0) break;
+        out[got++] = (uint8_t)c;
+    }
+    return (long)got;
+}
+
+void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows) {
+    struct pty *t = f ? f->pty : 0;
+    if (!t) return;
+    t->win.ws_col = cols;
+    t->win.ws_row = rows;
 }
 
 /* ---- slave end -------------------------------------------------- */
