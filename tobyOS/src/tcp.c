@@ -1125,6 +1125,31 @@ static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,
             }
     
             tcp_send_ack(c);
+        } else if ((fl & TCP_FLAG_SYN) && !(fl & TCP_FLAG_ACK) &&
+                   seq + 1u == c->rcv_nxt) {
+            /* A DUPLICATE SYN, same ISN: the peer never saw our SYN/ACK, so
+             * it is asking again. RFC 793 says retransmit it; dropping it
+             * leaves both sides waiting and the connection never opens.
+             *
+             * This was masked until the ARP fix (eth.c learns the sender MAC
+             * from inbound frames). Before it, the FIRST SYN/ACK could not be
+             * sent at all -- ip_send missed the ARP cache and returned false
+             * -- and the handler conn_free()d the connection, so the peer's
+             * retransmit built a fresh one and the session opened a second
+             * late. Once the SYN/ACK started going out, the connection
+             * survived in SYN_RECEIVED and the retransmit landed HERE, where
+             * it was ignored: the accidental recovery was gone and nothing
+             * had replaced it. Observed as "Connection timed out during
+             * banner exchange". */
+            kprintf("[tcp] duplicate SYN tcp[%d] -- retransmitting SYN/ACK\n",
+                    conn_index(c));
+            /* Re-emit the ORIGINAL SYN/ACK at its own sequence number, and
+             * touch no send state: the first one is still sitting in the
+             * pending list awaiting its ACK, so rewinding snd_nxt or
+             * allocating a second slot would make the retransmit timer and
+             * the flight accounting disagree about what is outstanding. */
+            (void)tcp_emit_at(c, TCP_FLAG_SYN | TCP_FLAG_ACK, c->snd_una,
+                              NULL, 0);
         } else {
             kprintf("[tcp] SYN_RECEIVED ignored tcp[%d] fl=0x%02x seq=%u ack=%u expected seq=%u ack=%u\n",
                     conn_index(c),

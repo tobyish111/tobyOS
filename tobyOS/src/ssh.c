@@ -1713,7 +1713,29 @@ static void ssh_worker(void) {
  * Nothing here may block or touch a pty. */
 void ssh_poll(void) {
     if (!g_lsn || !net_is_up()) return;
-    if (g_cli) return;                       /* the worker owns the session */
+
+    if (g_cli) {
+        /* Already serving one session -- this server has exactly one.
+         *
+         * Do NOT just leave the next connection sitting in the backlog: the
+         * peer has already completed the TCP handshake, so from its side it
+         * is CONNECTED and waiting for a banner that will never arrive. It
+         * then hangs for its whole timeout ("Connection timed out during
+         * banner exchange"), which is what two sessions in quick succession
+         * looked like -- the second arrives while the first is still tearing
+         * down. Close it instead: the client gets an immediate, honest
+         * failure it can retry, rather than a stall. */
+        struct tcp_conn *extra = tcp_accept(g_lsn, 0);
+        if (extra) {
+            static const char busy[] =
+                "SSH-2.0-tobyOS_busy\r\nonly one session at a time\r\n";
+            (void)tcp_send_nb(extra, busy, sizeof busy - 1);
+            tcp_close_nowait(extra);
+            kprintf("[ssh] refused a second connection (one session at a "
+                    "time)\n");
+        }
+        return;
+    }
 
     struct tcp_conn *c = tcp_accept(g_lsn, 0);
     if (!c) return;

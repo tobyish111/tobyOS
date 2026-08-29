@@ -134,6 +134,34 @@ static void eth_recv_inner(const void *frame, size_t len) {
         arp_recv(pl, pln);
         break;
     case ETH_TYPE_IPV4:
+        /* Learn the sender's MAC from the frame that just carried it.
+         *
+         * Without this the cache was fed ONLY by arp_recv(), so the first
+         * reply to any host that spoke to us first was dropped: ip_send()
+         * calls arp_resolve(), and on a miss it fires an ARP request and
+         * RETURNS FALSE -- the packet is discarded, not queued. Measured on
+         * the EliteDesk as "[tcp] SYN/ACK send failed" on the opening SYN of
+         * every inbound connection, with the session only establishing on the
+         * client retransmit ~1 s later. One second of dead air on every first
+         * SSH or VNC connect.
+         *
+         * ONLY for senders on our own subnet. A packet from off-subnet
+         * arrives wearing the GATEWAY MAC, and caching that against the
+         * remote IP would record a mapping that is not a fact about the
+         * network -- it would work by accident and hide the next-hop logic.
+         *
+         * This trusts what the wire says, as any ARP cache must; it is the
+         * same trust arp_recv() already extends, and matches how a normal
+         * stack treats received unicast on a LAN. */
+        if (pln >= 20) {
+            uint32_t src_ip;
+            memcpy(&src_ip, pl + 12, sizeof src_ip);
+            uint32_t me = net_my_ip(), mask = net_my_netmask();
+            if (src_ip != 0 && src_ip != 0xFFFFFFFFu && src_ip != me &&
+                mask != 0 && (src_ip & mask) == (me & mask) &&
+                !(f[6] & 0x01))            /* never a multicast/broadcast MAC */
+                arp_cache_set(src_ip, f + 6);
+        }
         ip_recv(pl, pln);
         break;
     case ETH_TYPE_IPV6:
