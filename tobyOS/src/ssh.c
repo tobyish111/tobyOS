@@ -1651,7 +1651,7 @@ static void ssh_service(void) {
      * on the worker tcp_yield_wait turns the wait into a yield, which paces
      * the loop and cuts round-trip latency at the same time. */
     uint8_t buf[128];
-    long n = tcp_recv(g_cli, buf, sizeof(buf), 20);
+    long n = tcp_recv_quiet(g_cli, buf, sizeof(buf), 20);
     if (n > 0) {
         if (g_state == SSH_WAIT_IDENT) {
             for (long i = 0; i < n; i++) {

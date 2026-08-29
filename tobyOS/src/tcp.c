@@ -1732,7 +1732,12 @@ static int pred_recv(const struct tcp_conn *c) {
     return 0;
 }
 
-long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
+/* Shared body. `quiet` suppresses the RECV-TIMEOUT diagnostic below; see
+ * tcp_recv_quiet(). Everything else -- including the slice-56 window-update
+ * rule -- is common, deliberately: duplicating receiver flow control to get a
+ * silent poll would be how the two copies drift. */
+static long tcp_recv_impl(struct tcp_conn *c, void *buf, size_t cap,
+                          uint32_t timeout_ms, bool quiet) {
     if (!c || !c->in_use || cap == 0) return -1;
     uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     int r = tcp_poll_until(c, dl, pred_recv);
@@ -1757,6 +1762,7 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
          * this prints free >> adv_free_last: WE have room, the peer was never
          * successfully told, and neither side speaks. If instead free is small
          * the ring genuinely never drained and the stall is elsewhere. */
+        if (quiet) return 0;
         kprintf("[tcp] RECV-TIMEOUT tcp[%d] port=%u %ums state=%s "
                 "free=%u adv_free_last=%u rx_count=%u\n",
                 conn_index(c), (unsigned)ntohs(c->remote_port_be),
@@ -1831,6 +1837,29 @@ long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
 #endif
     }
     return got;
+}
+
+/* The blocking/timed receive every existing caller uses. Unchanged. */
+long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms) {
+    return tcp_recv_impl(c, buf, cap, timeout_ms, false);
+}
+
+/* Same, but SILENT on timeout -- for a service that POLLS.
+ *
+ * The RECV-TIMEOUT line above justifies itself with "a recv timeout is rare,
+ * so one line here is free". True of the blocking callers it was written for;
+ * false of a poller. The SSH worker calls this every 20 ms, and on real
+ * hardware one ~110-byte line needs ~29 ms to clear a 38400-baud console, so
+ * the log outruns the wire permanently and delays the very ACKs the
+ * diagnostic exists to study -- exactly the failure its own comment warns
+ * about for the per-segment trace. Measured on the EliteDesk: a continuous
+ * flood from ONE idle SSH session.
+ *
+ * The timeout is still honoured, so the caller keeps its pacing; only the
+ * reporting is dropped. */
+long tcp_recv_quiet(struct tcp_conn *c, void *buf, size_t cap,
+                    uint32_t timeout_ms) {
+    return tcp_recv_impl(c, buf, cap, timeout_ms, true);
 }
 
 static int pred_closed_basic(const struct tcp_conn *c) {

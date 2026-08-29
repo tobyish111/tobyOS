@@ -120,6 +120,11 @@ struct tcp_conn *tcp_accept(struct tcp_conn *listener, uint32_t timeout_ms);
 
 long tcp_send(struct tcp_conn *c, const void *buf, size_t len);
 long tcp_recv(struct tcp_conn *c, void *buf, size_t cap, uint32_t timeout_ms);
+/* As tcp_recv, but does NOT log the RECV-TIMEOUT diagnostic. For services
+ * that poll: that line is only 'free' because timeouts are rare, which a
+ * poller makes false -- on a 38400-baud console it outruns the wire. */
+long tcp_recv_quiet(struct tcp_conn *c, void *buf, size_t cap,
+                    uint32_t timeout_ms);
 /* MSG_PEEK support: copy buffered rx bytes without consuming.
  * >0 = bytes copied, 0 = nothing buffered, -1 = EOF/reset. */
 long tcp_peek(struct tcp_conn *c, void *buf, size_t cap);
