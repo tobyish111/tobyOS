@@ -108,7 +108,9 @@ struct ssh_channel {
      * shell whose privileges depend on unrelated timing is a flake
      * generator, so we wait for a tick that really is pid 0. */
     bool         want_spawn;
-    char         exec_cmd[256];
+    /* 4 KiB: real command lines fit, and anything past it is
+     * REFUSED rather than silently cut (see the exec handler). */
+    char         exec_cmd[4096];
     uint16_t     win_cols, win_rows;
 };
 
@@ -1165,12 +1167,30 @@ static void ssh_handle_channel_request_payload(const uint8_t *payload,
         g_chan.exec_mode = true;
         /* Handed to `tsh -c` verbatim, so `ssh host 'a | b'` gets the
          * same parser as an interactive line, not a second dialect. */
-        {
-            size_t cl = cmd_n < sizeof(g_chan.exec_cmd) - 1u
-                      ? cmd_n : sizeof(g_chan.exec_cmd) - 1u;
-            memcpy(g_chan.exec_cmd, cmd, cl);
-            g_chan.exec_cmd[cl] = 0;
+        /* REFUSE an over-long command; never truncate one.
+         *
+         * This used to clamp to the buffer and run the fragment. The
+         * buffer was 256 bytes, so `ssh host "...; cat c.txt"` at 262
+         * characters arrived as `...; ca` and the shell reported
+         * "failed to launch /bin/ca" -- which at least LOOKS wrong.
+         * The dangerous shape is the one that still parses: a command
+         * cut at a path separator or mid-argument runs something the
+         * caller never wrote, and reports success for it. Silence is
+         * the bug here, not the limit.
+         *
+         * The limit itself is now 4 KiB, which is past where real
+         * command lines sit; anything longer is refused out loud. */
+        if (cmd_n >= sizeof(g_chan.exec_cmd)) {
+            kprintf("[ssh] exec command refused: %lu bytes, limit %lu\n",
+                    (unsigned long)cmd_n,
+                    (unsigned long)(sizeof(g_chan.exec_cmd) - 1u));
+            g_chan.exec_mode = false;
+            g_chan.term_started = false;
+            if (want_reply) (void)ssh_send_channel_failure(g_cli, recipient);
+            return;
         }
+        memcpy(g_chan.exec_cmd, cmd, cmd_n);
+        g_chan.exec_cmd[cmd_n] = 0;
         g_chan.want_spawn = true;
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
             ssh_close_client();

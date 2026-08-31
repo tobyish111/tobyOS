@@ -1438,6 +1438,10 @@ static long sys_term_read(int fd, void *buf, size_t cap) {
     return (long)total;
 }
 
+/* Defined further down, next to the other path plumbing. Declared here
+ * because the VFS syscalls below are the earliest callers. */
+int resolve_user_path(const char *user_path, char *out, size_t cap);
+
 /* ---- VFS syscalls (milestone 13) --------------------------------- */
 
 static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
@@ -1447,7 +1451,16 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
     if (!user_buf_ok((uint64_t)(uintptr_t)out,
                      (size_t)cap * sizeof(*out))) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    /* resolve_user_path() is what prepends the cwd and applies chroot; this
+     * syscall used to hand the RAW user string to the VFS, so a relative path
+     * was looked up from the filesystem root instead of the working
+     * directory. `cd /tmp; cp -r t1 t2` failed with "cannot read directory
+     * 't1'" while tsh's own globbing of t1/* worked, because the shell
+     * resolves for itself and only this syscall did not. It also meant a
+     * chrooted process read outside its root here -- the same omission that
+     * once let execve run the HOST binary from inside a chroot. */
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
 
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
@@ -1488,7 +1501,9 @@ static long sys_fs_readfile(const char *path, void *out, size_t cap) {
     if (cap > SYS_MAX_RW) cap = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)out, cap)) return -ABI_EFAULT;
     char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    /* Same omission as sys_fs_readdir above: no cwd, no chroot. */
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
 
     struct vfs_file f;
     int rc = vfs_open(kpath, &f);
