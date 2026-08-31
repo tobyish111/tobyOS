@@ -3295,6 +3295,26 @@ static void filetypes_selftest(void) {
         pass++;
     } else { kprintf("[FILETYPES]   FAIL video honesty\n"); fail++; }
 
+    /* Every handler the table names must actually be installed. This is the
+     * one failure that is completely silent at runtime: spawn returns an
+     * error nobody reads and the double-click simply does nothing. The host
+     * test can only check the STRINGS; whether the file is in the initrd is
+     * knowable only from inside a booted system. */
+    {
+        const char *apps[] = { "/bin/gui_edit", "/bin/gui_viewer",
+                               "/bin/gui_browser", "/bin/mediaplayer" };
+        int missing = 0;
+        for (unsigned i = 0; i < sizeof(apps)/sizeof(apps[0]); i++) {
+            struct vfs_stat st;
+            if (vfs_stat(apps[i], &st) != VFS_OK) {
+                kprintf("[FILETYPES]   handler NOT INSTALLED: %s\n", apps[i]);
+                missing++;
+            }
+        }
+        if (missing) { kprintf("[FILETYPES]   FAIL %d handler(s) missing\n", missing); fail++; }
+        else { kprintf("[FILETYPES]   ok   all 4 handlers are installed\n"); pass++; }
+    }
+
     /* ---- the image actually decodes ---- */
     const char *bmp = "/data/ftype_test.bmp";
     (void)vfs_unlink(bmp);

@@ -348,7 +348,28 @@ static void do_edit(void){
     if(!selected_full_path(full,sizeof(full))){ set_status("Select a file to edit"); return; }
     int idx=g_selected-1;
     if(g_entries[idx].type==SYS_FS_TYPE_DIR){ set_status("Cannot edit a folder"); return; }
+    /* Edit used to load ANYTHING into the text editor -- a PNG, an ISO,
+     * a shared library. The registry now knows which types are text, so
+     * refuse the rest and name the type: the editor would show a binary
+     * as mojibake and write it back mangled on save. "View" opens the
+     * same file safely, which is what the message points at. */
+    if(!toby_file_type_editable(g_entries[idx].name)){
+        char m[96]; int p=0; m[0]=0;
+        p=str_cat(m,p,sizeof(m),toby_file_type_label(g_entries[idx].name));
+        (void)str_cat(m,p,sizeof(m)," is not text -- use View");
+        set_status(m); return;
+    }
     set_status(sys_exec("/bin/gui_edit",full)==0?"Opened in editor":"Editor failed");
+}
+
+/* Open in the viewer regardless of type: its hex mode can show any file
+ * on the system, and its image mode any picture we can decode. Without
+ * this, a binary had no menu route at all once Edit started refusing. */
+static void do_view(void){
+    char full[256];
+    if(!selected_full_path(full,sizeof(full))){ set_status("Select a file to view"); return; }
+    if(g_entries[g_selected-1].type==SYS_FS_TYPE_DIR){ set_status("Cannot view a folder"); return; }
+    set_status(sys_exec("/bin/gui_viewer",full)==0?"Opened in viewer":"Viewer failed");
 }
 
 static int open_entry(int row){
@@ -412,7 +433,10 @@ static const char *file_cell(void *u,int r,int c){
     fmt_size(b,sizeof(b),e->size); return b;
 }
 static const char *const file_hdr[]={"Name","Type","Size"};
-static const int         file_w[]  ={370,110,80};
+/* Type widened for the registry's real labels: "Configuration file"
+ * and "PowerPoint slides" do not fit the 110px this column had when
+ * every answer was a single word like "Text". */
+static const int         file_w[]  ={330,150,80};
 
 static void update_view(void){
     if(w_path)   tk_set_text(&win,w_path,g_path);
@@ -821,20 +845,21 @@ static void on_vol_menu(struct tk_window *w,int id){
 }
 
 /* ---- context menu ----------------------------------------------------- */
-enum { MI_OPEN=1, MI_EDIT, MI_COPY, MI_PASTE, MI_COPYPATH, MI_DELETE };
+enum { MI_OPEN=1, MI_EDIT, MI_VIEW, MI_COPY, MI_PASTE, MI_COPYPATH, MI_DELETE };
 static const char *const g_menu_items[]={
-    "Open","Edit","-","Copy","Paste","Copy file path","-","Delete"
+    "Open","Edit","View","-","Copy","Paste","Copy file path","-","Delete"
 };
 static const int g_menu_ids[]={
-    MI_OPEN,MI_EDIT,0,MI_COPY,MI_PASTE,MI_COPYPATH,0,MI_DELETE
+    MI_OPEN,MI_EDIT,MI_VIEW,0,MI_COPY,MI_PASTE,MI_COPYPATH,0,MI_DELETE
 };
-#define MENU_N 8
+#define MENU_N 9
 
 static void on_menu(struct tk_window *w,int id){
     (void)w;
     switch(id){
     case MI_OPEN:     if(open_entry(g_selected))refresh_listing(); update_view(); break;
     case MI_EDIT:     do_edit(); update_view(); break;
+    case MI_VIEW:     do_view(); update_view(); break;
     case MI_COPY:     do_copy(); update_view(); break;
     case MI_PASTE:    do_paste(); refresh_listing(); update_view(); break;
     case MI_COPYPATH: do_copy_path(); update_view(); break;

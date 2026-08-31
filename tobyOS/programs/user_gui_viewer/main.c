@@ -277,6 +277,11 @@ static void on_key(struct tk_window *w,struct tk_event *ev){
     case 'G': g_top_line=max_top(); break;
     case 'f': case '/': g_search_active=1; g_search_len=0; break;
     case 'n': if(g_search_len>0){ g_search[g_search_len]='\0'; int start=(g_found_line>=0)?g_found_line+1:g_top_line; int f=search_forward(start); if(f<0)f=search_forward(0); if(f>=0){ g_found_line=f; g_top_line=f; int mt=max_top(); if(g_top_line>mt)g_top_line=mt; } } break;
+    /* Mode keys. 'i' only bites when an image decoded -- otherwise it
+     * would blank the pane on a file with no picture in it. */
+    case 't': g_mode=MODE_TEXT;  g_top_line=0; break;
+    case 'x': g_mode=MODE_HEX;   g_top_line=0; break;
+    case 'i': if(g_img)g_mode=MODE_IMAGE; break;
     case 'q': case 27: tk_quit(w); return;
     default: return;
     }

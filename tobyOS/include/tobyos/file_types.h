@@ -29,8 +29,11 @@
 #ifndef TOBYOS_FILE_TYPES_H
 #define TOBYOS_FILE_TYPES_H
 
-/* Broad category. Drives the Explorer colour/icon and lets callers ask
- * "is this an image?" without knowing every image extension. */
+/* Broad category, so callers can ask "is this an image?" without knowing
+ * every image extension. Used by gui_viewer to decide whether to attempt a
+ * decode at all, and by the kernel's file_assoc_get_icon(). NOT used for
+ * colour in File Explorer: tk_table cells are plain strings with no per-cell
+ * colour, so the group would have nowhere to show. */
 enum file_group {
     FTG_OTHER = 0,
     FTG_TEXT,       /* prose, logs, notes */
