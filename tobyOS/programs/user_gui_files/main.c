@@ -28,6 +28,7 @@
  * and the Format action below depends on it byte for byte. */
 #include <tobyos/abi/abi.h>
 #include <tobyos_slog.h>
+#include <toby/fileassoc.h>
 
 typedef unsigned long usize;
 typedef long          ssize_t;
@@ -218,31 +219,16 @@ static void refresh_listing(void){
     b[p]='\0'; set_status(b);
 }
 
-/* Explorer-style "Type" column + whether a file is editable text. */
+/* Explorer-style "Type" column.
+ *
+ * Both answers now come from the ONE shared table in <tobyos/file_types.h>
+ * via libtoby. This function used to be a hand-rolled ladder of a dozen
+ * streq()s, and it was the only file-type logic in the system that actually
+ * ran -- src/file_assoc.c and libtoby/src/fileassoc.c each had their own
+ * list and no callers at all. They disagreed with this one, too. */
 static const char *file_type_name(const struct vfs_dirent_user *e){
     if(e->type==SYS_FS_TYPE_DIR)return "Folder";
-    const char *x=find_ext(e->name); if(!x)return "File";
-    if(streq(x,".elf"))return "Application";
-    if(streq(x,".c")||streq(x,".h"))return "C source";
-    if(streq(x,".txt"))return "Text";
-    if(streq(x,".md"))return "Markdown";
-    if(streq(x,".log"))return "Log";
-    if(streq(x,".conf")||streq(x,".toml")||streq(x,".ini"))return "Config";
-    if(streq(x,".sh"))return "Script";
-    if(streq(x,".py"))return "Python";
-    if(streq(x,".tpkg"))return "Package";
-    if(streq(x,".so")||streq(x,".a")||streq(x,".o"))return "Library";
-    if(streq(x,".tar")||streq(x,".img")||streq(x,".iso"))return "Archive";
-    if(streq(x,".bmp")||streq(x,".png")||streq(x,".jpg"))return "Image";
-    if(streq(x,".db"))return "Database";
-    return "File";
-}
-static int is_text_file(const struct vfs_dirent_user *e){
-    const char *x=find_ext(e->name);
-    if(!x)return 1;                    /* extensionless: motd, users, hosts... */
-    return streq(x,".txt")||streq(x,".md")||streq(x,".c")||streq(x,".h")||
-           streq(x,".conf")||streq(x,".toml")||streq(x,".ini")||streq(x,".log")||
-           streq(x,".sh")||streq(x,".py")||streq(x,".json")||streq(x,".csv");
+    return toby_file_type_label(e->name);
 }
 
 /* Full path of the selected row; 0 for ".." / invalid. */
@@ -371,10 +357,32 @@ static int open_entry(int row){
     const struct vfs_dirent_user *e=&g_entries[idx];
     if(e->type==SYS_FS_TYPE_DIR){ char next[256]; path_join(next,sizeof(next),g_path,e->name); str_copy(g_path,next,sizeof(g_path)); return 1; }
     char full[256]; path_join(full,sizeof(full),g_path,e->name);
-    const char *ext=find_ext(e->name);
-    if(ext&&streq(ext,".elf")){ set_status(sys_exec(full,0)==0?"Launched":"Exec failed"); return 0; }
-    if(is_text_file(e)){ set_status(sys_exec("/bin/gui_edit",full)==0?"Opened in editor":"Open failed"); return 0; }
-    set_status(sys_exec("/bin/gui_viewer",full)==0?"Opened in viewer":"Open failed"); return 0;
+
+    const struct file_type *t=toby_file_type(e->name);
+
+    /* Unknown or absent extension. Text is the right guess -- motd, hosts,
+     * users and every dotfile live here -- and the editor refuses anything
+     * it cannot hold whole, so a wrong guess costs a message, not data. */
+    if(!t){
+        set_status(sys_exec("/bin/gui_edit",full)==0?"Opened in editor":"Open failed");
+        return 0;
+    }
+    if(t->action==FTA_RUN){
+        set_status(sys_exec(full,0)==0?"Launched":"Exec failed");
+        return 0;
+    }
+    if(t->action==FTA_NONE||!t->handler){
+        /* Recognised, but nothing installed can open it. Naming the type is
+         * the difference between an answer and a dead click: the Type column
+         * says "MPEG-4 video", so the status bar must not say "unknown". */
+        char m[96]; int p=0; m[0]='\0';
+        p=str_cat(m,p,sizeof(m),t->label);
+        (void)str_cat(m,p,sizeof(m)," -- no app installed opens this");
+        set_status(m);
+        return 0;
+    }
+    set_status(sys_exec(t->handler,full)==0?"Opened":"Open failed");
+    return 0;
 }
 
 /* ---- TobyTK UI ------------------------------------------------------------ */

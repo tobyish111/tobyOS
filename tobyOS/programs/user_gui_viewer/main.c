@@ -9,6 +9,10 @@
  */
 
 #include <toby/tk.h>
+#include <tobyos_slog.h>
+#include <toby/image.h>
+#include <toby/fileassoc.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #define SYS_FS_READFILE 19
@@ -62,7 +66,27 @@ static long g_line_off[LINES_MAX];
 static int g_line_count=0, g_top_line=0;
 #define MODE_TEXT 0
 #define MODE_HEX 1
+#define MODE_IMAGE 2
 static int g_mode=MODE_TEXT;
+
+/* ---- image mode -------------------------------------------------------
+ *
+ * The decoder (libtoby/src/image.c, stb_image) has been in the tree the
+ * whole time with no standalone user -- only the browser called it. So the
+ * file-type table could route a .png somewhere, but the only thing waiting
+ * was a hex dump. It now decodes here.
+ *
+ * We decode from the PATH, not from g_buf: VIEWER_CAP is 32 KiB and almost
+ * no real image fits, so decoding the text buffer would fail on nearly every
+ * file that matters and look like a broken decoder.
+ *
+ * Only files the registry calls FTG_IMAGE are attempted. Trying every file
+ * would let stb_image find a plausible header in an archive now and then and
+ * present garbage as a picture. */
+static toby_image_t *g_img;         /* decoded, or 0 */
+static const char   *g_img_err;     /* why not, when it was supposed to be */
+static uint32_t     *g_scaled;      /* nearest-neighbour scratch */
+static int           g_scaled_w, g_scaled_h;
 #define SEARCH_MAX 64
 static char g_search[SEARCH_MAX];
 static int g_search_len=0, g_search_active=0, g_found_line=-1;
@@ -86,6 +110,12 @@ static int search_forward(int start_line){
     return -1;
 }
 
+/* Bounded append: g_path can be as long as this whole buffer. */
+static int log_cat(char *b,int p,int cap,const char *s){
+    while(*s&&p<cap-1)b[p++]=*s++;
+    b[p]='\0'; return p;
+}
+
 /* ---- TobyTK canvas --------------------------------------------------- */
 static struct tk_window win;
 
@@ -94,7 +124,13 @@ static void draw_toolbar(struct tk_window *w){
     TK_MONO(w,8,9,"Text",(g_mode==MODE_TEXT)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
     TK_MONO(w,44,9,"|",COL_DIM,COL_TOOLBAR);
     TK_MONO(w,56,9,"Hex",(g_mode==MODE_HEX)?COL_ACCENT:COL_DIM,COL_TOOLBAR);
-    TK_MONO(w,96,9,"Search",COL_TEXT,COL_TOOLBAR);
+    TK_MONO(w,88,9,"|",COL_DIM,COL_TOOLBAR);
+    /* Dim when there is no image: the tab still SHOWS, so a picture that
+     * failed to decode is visibly a picture we could not read, not a file
+     * with no image in it. */
+    TK_MONO(w,100,9,"Image",g_img?((g_mode==MODE_IMAGE)?COL_ACCENT:COL_DIM)
+                                 :COL_DIM,COL_TOOLBAR);
+    TK_MONO(w,152,9,"Search",COL_TEXT,COL_TOOLBAR);
     int plen=(int)my_strlen(g_path); int maxp=(WIN_W-160)/CELL_W;
     const char *disp=g_path; if(plen>maxp)disp=g_path+(plen-maxp);
     TK_MONO(w,WIN_W-(int)my_strlen(disp)*CELL_W-8,9,disp,COL_DIM,COL_TOOLBAR);
@@ -160,16 +196,51 @@ static void draw_search_bar(struct tk_window *w){
     bar[p++]='_'; bar[p]='\0';
     TK_MONO(w,8,by+6,bar,COL_ACCENT,COL_TOOLBAR);
 }
+/* Fit-to-window, aspect preserved, and NEVER upscaled past 1:1 -- blowing a
+ * 16x16 icon up to fill 700px shows interpolation artefacts, not the icon.
+ * Nearest-neighbour into a scratch buffer, then one blit: tk_draw_blit takes
+ * a source pitch but does no scaling, and a per-pixel fill would be far too
+ * slow at these sizes. */
+static void draw_image_mode(struct tk_window *w){
+    int ax=PAD, ay=CONTENT_Y;
+    int aw=WIN_W-2*PAD, ah=WIN_H-CONTENT_Y-STATUS_H-PAD;
+    if(aw<1||ah<1||!g_img||g_img->width<1||g_img->height<1)return;
+
+    int dw=g_img->width, dh=g_img->height;
+    if(dw>aw){ dh=(int)(((long)dh*aw)/dw); dw=aw; if(dh<1)dh=1; }
+    if(dh>ah){ dw=(int)(((long)dw*ah)/dh); dh=ah; if(dw<1)dw=1; }
+
+    if(dw!=g_scaled_w||dh!=g_scaled_h||!g_scaled){
+        free(g_scaled);
+        g_scaled=(uint32_t *)malloc((unsigned long)dw*(unsigned long)dh*4u);
+        if(!g_scaled){ g_scaled_w=g_scaled_h=0; return; }
+        g_scaled_w=dw; g_scaled_h=dh;
+        for(int y=0;y<dh;y++){
+            int sy=(int)(((long)y*g_img->height)/dh);
+            const uint32_t *srow=g_img->pixels+(long)sy*g_img->width;
+            uint32_t *drow=g_scaled+(long)y*dw;
+            for(int x=0;x<dw;x++)
+                drow[x]=srow[((long)x*g_img->width)/dw];
+        }
+    }
+    tk_draw_blit(w,ax+(aw-dw)/2,ay+(ah-dh)/2,dw,dh,g_scaled,dw);
+}
+
 static void paint(struct tk_window *w,struct tk_widget *c){
     (void)c;
     tk_draw_fill(w,0,0,WIN_W,WIN_H,COL_BG);
     draw_toolbar(w);
-    if(g_mode==MODE_TEXT)draw_text_mode(w); else draw_hex_mode(w);
+    if(g_mode==MODE_IMAGE&&g_img)draw_image_mode(w);
+    else if(g_mode==MODE_TEXT)draw_text_mode(w);
+    else draw_hex_mode(w);
     draw_search_bar(w);
     draw_status(w);
 }
 
-static int toolbar_hit(int x,int y){ if(y<0||y>=TOOLBAR_H)return 0; if(x>=4&&x<40)return 1; if(x>=52&&x<88)return 2; if(x>=92&&x<148)return 3; return 0; }
+/* Must track draw_toolbar() above: Text 8, Hex 56, Image 100, Search 152. */
+static int toolbar_hit(int x,int y){ if(y<0||y>=TOOLBAR_H)return 0;
+    if(x>=4&&x<44)return 1; if(x>=52&&x<84)return 2;
+    if(x>=96&&x<148)return 4; if(x>=150&&x<206)return 3; return 0; }
 
 static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
     (void)c;
@@ -184,6 +255,7 @@ static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev
     int hit=toolbar_hit(ev->x,ev->y);
     if(hit==1&&g_mode!=MODE_TEXT){ g_mode=MODE_TEXT; g_top_line=0; tk_redraw(w); }
     else if(hit==2&&g_mode!=MODE_HEX){ g_mode=MODE_HEX; g_top_line=0; tk_redraw(w); }
+    else if(hit==4&&g_img&&g_mode!=MODE_IMAGE){ g_mode=MODE_IMAGE; tk_redraw(w); }
     else if(hit==3){ g_search_active=1; g_search_len=0; tk_redraw(w); }
 }
 
@@ -217,6 +289,37 @@ int main(int argc,char **argv){
     if(n<0){ const char *msg="gui_viewer: cannot read file"; g_size=(long)my_strlen(msg); for(long i=0;i<g_size;i++)g_buf[i]=msg[i]; g_buf[g_size]='\0'; }
     else { g_size=n; g_buf[g_size]='\0'; }
     index_lines();
+
+    /* Ask the shared registry what this file IS, and only then try to decode
+     * it. A file the table calls an image but stb_image refuses keeps the
+     * reason in g_img_err, and the viewer opens in hex with that reason on
+     * the status line -- a picture we cannot read should say so, not look
+     * like a viewer that ignored the argument. */
+    if(toby_file_type_group(g_path)==FTG_IMAGE){
+        g_img=toby_image_load_file(g_path);
+        /* Logged either way. The decode happens before any window exists, so
+         * without this the only evidence of what it did is pixels on a
+         * screen -- which no gate can read. */
+        char m[192]; int q=0; m[0]=0; char d[12];
+        if(g_img){
+            g_mode=MODE_IMAGE;
+            q=log_cat(m,q,(int)sizeof m,"decoded image ");
+            uint_to_dec(d,g_img->width);  q=log_cat(m,q,(int)sizeof m,d);
+            q=log_cat(m,q,(int)sizeof m,"x");
+            uint_to_dec(d,g_img->height); q=log_cat(m,q,(int)sizeof m,d);
+            q=log_cat(m,q,(int)sizeof m," path=");
+            (void)log_cat(m,q,(int)sizeof m,g_path);
+            tobylog_write(ABI_SLOG_LEVEL_INFO,"viewer",m);
+        } else {
+            g_img_err=toby_image_error(); if(!g_img_err)g_img_err="cannot decode";
+            g_mode=MODE_HEX;
+            q=log_cat(m,q,(int)sizeof m,"image decode FAILED (");
+            q=log_cat(m,q,(int)sizeof m,g_img_err);
+            q=log_cat(m,q,(int)sizeof m,") path=");
+            (void)log_cat(m,q,(int)sizeof m,g_path);
+            tobylog_write(ABI_SLOG_LEVEL_WARN,"viewer",m);
+        }
+    }
 
     if(tk_window_open(&win,WIN_W,WIN_H,"Viewer")!=0)return 1;
     tk_on_key(&win,on_key);

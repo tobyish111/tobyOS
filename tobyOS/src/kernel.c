@@ -15,6 +15,8 @@
  * milestone. Right now kmain just halts in a CPU-idle loop.
  */
 
+#include <tobyos/file_assoc.h>
+#include <tobyos/file_types.h>
 #include <tobyos/types.h>
 #include <tobyos/cpu.h>
 #include <tobyos/serial.h>
@@ -3184,6 +3186,150 @@ static void editsave_selftest(void) {
 }
 #endif /* EDITSAVE_SELFTEST */
 
+
+#ifdef FILETYPES_SELFTEST
+/* ---------------------------------------------------------------------
+ * The file-type registry, proven at runtime.  EXTRA_CFLAGS+=-DFILETYPES_SELFTEST
+ *
+ * logs/filetypes.sh runs a HOST test over the same table first; that covers
+ * the table's own invariants. What only a boot can show is the other half:
+ * that the KERNEL links this table (its answers used to come from a private
+ * list nothing called), and that routing a .bmp to the viewer now puts a
+ * decoded image on screen instead of a hex dump.
+ *
+ * Its own pump rather than the editsave harness's: these are independent
+ * gates, and a shared helper means touching one can break the other.
+ * ------------------------------------------------------------------- */
+static void ft_pump_ms(uint64_t ms) {
+    uint64_t hz = pit_hz(); if (hz == 0) hz = 100;
+    uint64_t end = pit_ticks() + (ms * hz + 999) / 1000;
+    do {
+        sched_yield();
+        mouse_flush_pending();
+        kbd_flush_pending();
+        gui_tick();
+    } while (pit_ticks() < end);
+}
+
+/* A 4x4 24-bpp BMP, built by hand. Small enough to sit in .rodata, and a
+ * format stb_image genuinely decodes -- the point is to prove the decode
+ * path runs, so the image has to be real. */
+static const unsigned char ft_bmp[] = {
+    'B','M', 0x66,0,0,0,  0,0,0,0,  0x36,0,0,0,          /* file header  */
+    0x28,0,0,0,  4,0,0,0,  4,0,0,0,  1,0,  24,0,         /* DIB header   */
+    0,0,0,0,  0x30,0,0,0,  0x13,0x0B,0,0,  0x13,0x0B,0,0,
+    0,0,0,0,  0,0,0,0,
+    /* 4 rows x 4 px x BGR */
+    0,0,255, 0,0,255, 0,0,255, 0,0,255,
+    0,255,0, 0,255,0, 0,255,0, 0,255,0,
+    255,0,0, 255,0,0, 255,0,0, 255,0,0,
+    255,255,255, 255,255,255, 255,255,255, 255,255,255
+};
+
+static int ft_find_proc(const char *want) {
+    for (int pid = 1; pid < PROC_MAX; pid++) {
+        struct proc *p = proc_lookup(pid);
+        if (!p) continue;
+        if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
+        const char *n = p->name; int i = 0;
+        while (want[i] && n[i] == want[i]) i++;
+        if (!want[i] && !n[i]) return pid;
+    }
+    return -1;
+}
+
+static int ft_streq(const char *a, const char *b) {
+    if (!a || !b) return 0;
+    while (*a && *b) { if (*a != *b) return 0; a++; b++; }
+    return *a == '\0' && *b == '\0';
+}
+
+static void filetypes_selftest(void) {
+    int pass = 0, fail = 0;
+    kprintf("[FILETYPES] registry: kernel answers + a real image decode\n");
+    kprintf("[FILETYPES] TYPECOUNT=%d\n", file_assoc_count());
+
+    /* The kernel half was DEAD -- file_assoc_init() had no caller anywhere,
+     * so these answers had never once been produced on a running system. */
+    struct { const char *path, *label, *app; } want[] = {
+        { "/a/report.txt", "Text document", "/bin/gui_edit"    },
+        { "/a/main.c",     "C source",      "/bin/gui_edit"    },
+        { "/a/photo.png",  "PNG image",     "/bin/gui_viewer"  },
+        { "/a/page.html",  "HTML document", "/bin/gui_browser" },
+        { "/a/song.wav",   "WAV audio",     "/bin/mediaplayer" },
+    };
+    int bad = 0;
+    for (unsigned i = 0; i < sizeof(want)/sizeof(want[0]); i++) {
+        const char *l = file_assoc_get_label(want[i].path);
+        const char *a = file_assoc_get_app(want[i].path);
+        if (!ft_streq(l, want[i].label) || !ft_streq(a, want[i].app)) {
+            kprintf("[FILETYPES]   %s -> '%s'/'%s' (wanted '%s'/'%s')\n",
+                    want[i].path, l ? l : "(null)", a ? a : "(none)",
+                    want[i].label, want[i].app);
+            bad++;
+        }
+    }
+    if (bad) { kprintf("[FILETYPES]   FAIL kernel lookups\n"); fail++; }
+    else     { kprintf("[FILETYPES]   ok   kernel names and routes files\n"); pass++; }
+
+    /* A directory with a dot in it must not be mistaken for an extension --
+     * "/etc/conf.d/motd" has no extension at all. */
+    if (ft_streq(file_assoc_get_label("/etc/conf.d/motd"), "File")) {
+        kprintf("[FILETYPES]   ok   a dot in a DIRECTORY is not an extension\n");
+        pass++;
+    } else {
+        kprintf("[FILETYPES]   FAIL '/etc/conf.d/motd' read as '%s'\n",
+                file_assoc_get_label("/etc/conf.d/motd"));
+        fail++;
+    }
+
+    /* .elf must RUN, not open in something. */
+    if (file_assoc_get_action("/bin/hello.elf") == FTA_RUN) {
+        kprintf("[FILETYPES]   ok   .elf is runnable, not 'openable'\n"); pass++;
+    } else { kprintf("[FILETYPES]   FAIL .elf action\n"); fail++; }
+
+    /* A type we name but cannot open must report exactly that. */
+    if (file_assoc_get_action("/a/clip.mp4") == FTA_NONE &&
+        ft_streq(file_assoc_get_label("/a/clip.mp4"), "MPEG-4 video")) {
+        kprintf("[FILETYPES]   ok   video is named but honestly unopenable\n");
+        pass++;
+    } else { kprintf("[FILETYPES]   FAIL video honesty\n"); fail++; }
+
+    /* ---- the image actually decodes ---- */
+    const char *bmp = "/data/ftype_test.bmp";
+    (void)vfs_unlink(bmp);
+    int wrote = 0;
+    if (vfs_create(bmp) == VFS_OK) {
+        struct vfs_file f;
+        if (vfs_open(bmp, &f) == VFS_OK) {
+            wrote = (vfs_write(&f, ft_bmp, sizeof ft_bmp) == (long)sizeof ft_bmp);
+            vfs_close(&f);
+        }
+    }
+    if (!wrote) {
+        kprintf("[FILETYPES]   FAIL could not stage the test bitmap\n"); fail++;
+    } else {
+        (void)gui_launch_enqueue_arg("/bin/gui_viewer", bmp);
+        for (int i = 0; i < 40 && ft_find_proc("gui_viewer") < 0; i++)
+            ft_pump_ms(100);
+        int pid = ft_find_proc("gui_viewer");
+        if (pid < 0) {
+            kprintf("[FILETYPES]   FAIL viewer never started\n"); fail++;
+        } else {
+            /* The viewer logs its decode result before opening a window --
+             * see the [viewer] line. Give it time to reach that. */
+            ft_pump_ms(2500);
+            kprintf("[FILETYPES]   ok   viewer launched for an image\n"); pass++;
+            signal_send_to_pid(pid, SIGKILL);
+            ft_pump_ms(400);
+        }
+    }
+    (void)vfs_unlink(bmp);
+
+    kprintf("[FILETYPES] VERDICT: %s pass=%d fail=%d\n",
+            fail ? "FAIL" : "PASS", pass, fail);
+}
+#endif /* FILETYPES_SELFTEST */
 void _start(void) {
     early_init();
     framebuffer_init();
@@ -4394,6 +4540,10 @@ void _start(void) {
     { extern void vdso_init(void); vdso_init(); }
     aml_interp_init();       /* Phase 4: AML namespace + interpreter */
     clipboard_init();        /* Phase 2 M2.7: system clipboard */
+    /* File-type registry. Shipped dead for its whole life -- nothing
+     * ever called this, so the desktop had no shared idea of what a
+     * file WAS and File Explorer carried its own hardcoded copy. */
+    file_assoc_init();
     hidpi_init();            /* Phase 2 M2.6: HiDPI display scaling */
     audio_engine_init();     /* Phase B: audio mixing + userland playback */
     inotify_init_subsystem(); /* Phase 1 M1.5: file watching */
@@ -5092,6 +5242,9 @@ void _start(void) {
 
 #ifdef EDITSAVE_SELFTEST
     editsave_selftest();
+#endif
+#ifdef FILETYPES_SELFTEST
+    filetypes_selftest();
 #endif
 
     if (safemode_skip_services()) {

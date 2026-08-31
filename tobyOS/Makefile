@@ -1265,7 +1265,11 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # public POSIX-shape headers under libtoby/include only -- not the
 # kernel tree. Users wanting raw syscalls can still #include
 # <tobyos/abi/abi.h> by adding `-I ../../include` themselves.
-LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3
+# -I include: libtoby public headers may reference the SHARED kernel/userland
+# headers under include/tobyos (file_types.h is the first). LIBTOBY_BUILD_CFLAGS
+# already carries it for libtoby own sources; without it here, any PROGRAM that
+# includes such a header fails to compile while libtoby itself builds fine.
+LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3 -I include
 
 # Every public libtoby header, as an explicit prerequisite for user-program
 # objects. -MMD cannot see these (they arrive through -isystem; see the

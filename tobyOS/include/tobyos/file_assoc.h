@@ -30,4 +30,11 @@ const char *file_assoc_get_mime(const char *filename);
 int         file_assoc_open(const char *filepath);
 int         file_assoc_list(struct file_assoc *out, int max);
 
+/* Human type name for Explorer-style UI ("PNG image"); "File" if unknown. */
+const char *file_assoc_get_label(const char *filename);
+/* enum file_action from <tobyos/file_types.h>. */
+int         file_assoc_get_action(const char *filename);
+/* Number of built-in types -- lets a gate prove the table is linked in. */
+int         file_assoc_count(void);
+
 #endif /* TOBYOS_FILE_ASSOC_H */
