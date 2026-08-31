@@ -3496,6 +3496,18 @@ static void coreutils_selftest(void) {
         cu_wait_pumping(pid, 60000);
         kprintf("[COREUTILS] ssh done\n");
     }
+    argv[1] = (char *)"/etc/util_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "util-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] util exit=%d\n", rc);
+    }
     kprintf("[COREUTILS] VERDICT: DONE\n");
 }
 #endif /* COREUTILS_SELFTEST */
