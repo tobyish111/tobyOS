@@ -86,6 +86,28 @@ static int str_append_uint(char *b,int p,unsigned v){ char t[16]; fmt_uint(t,v);
 #define COL_MSG_OK   0x00A6E3A1u
 #define COL_MSG_ERR  0x00F38BA8u
 
+/* ---- the Save button -------------------------------------------------
+ *
+ * Painted into this window's OWN title bar rather than built from
+ * tk_button(). The window is a single full-bleed canvas that draws all its
+ * chrome itself, so a real button widget would mean splitting the root into
+ * a toolbar row plus a shorter canvas and re-basing every coordinate in
+ * paint() off the canvas origin -- a lot of churn to gain a widget that
+ * would then need to match hand-painted chrome anyway.
+ *
+ * The cost of painting it: TK_EV_MOUSE_MOVE only reaches a canvas while the
+ * canvas holds the capture, i.e. during a drag that STARTED on it, so there
+ * is no hover highlight. Press feedback works, and press/release is what
+ * makes a button feel like a button. */
+#define SAVE_W  56
+#define SAVE_H  (TITLE_H-8)
+#define SAVE_X  (WIN_W-SAVE_W-8)
+#define SAVE_Y  4
+#define COL_BTN         0x00313244u
+#define COL_BTN_FG      0x00CDD6F4u
+#define COL_BTN_DOWN    0x0089B4FAu
+#define COL_BTN_FG_DOWN 0x00181825u
+
 /* ---- text buffer -----------------------------------------------------
  *
  * These were 512 x 256 with a READ buffer of MAX_LINES*80 = 40960 bytes --
@@ -159,8 +181,11 @@ static const char *save_reason(long e){
     }
 }
 
-static void save_file(void){
-    if(!g_has_file){ set_message("No filename",COL_MSG_ERR); return; }
+/* Returns 1 only when the bytes actually reached the file. The Save button
+ * closes the window on the strength of this answer, so every failure path
+ * must return 0 -- a false "saved" here costs the user the whole buffer. */
+static int save_file(void){
+    if(!g_has_file){ set_message("No filename",COL_MSG_ERR); return 0; }
     /* The whole point of tracking truncation. Writing g_lines back with
      * O_TRUNC when the buffer never held the whole file DELETES the rest --
      * silently, and reports "Saved". Refuse, and name the limit that hit. */
@@ -173,7 +198,7 @@ static void save_file(void){
           q=log_cat(l,q,(int)sizeof l,"save REFUSED (partial buffer) path=");
           (void)log_cat(l,q,(int)sizeof l,g_filename);
           tobylog_write(ABI_SLOG_LEVEL_WARN,"edit",l); }
-        return;
+        return 0;
     }
     long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0);
     if(ffd<0){
@@ -189,10 +214,11 @@ static void save_file(void){
           p=log_cat(m,p,(int)sizeof m," path=");
           (void)log_cat(m,p,(int)sizeof m,g_filename);
           tobylog_write(ABI_SLOG_LEVEL_ERROR,"edit",m); }
-        return;
+        return 0;
     }
     for(int i=0;i<g_line_count;i++){ int len=line_len(i); if(len>0)sys_write_fd((int)ffd,g_lines[i],(unsigned long)len); if(i<g_line_count-1)sys_write_fd((int)ffd,"\n",1); }
     sys_close((int)ffd); g_modified=0; set_message("Saved",COL_MSG_OK);
+    return 1;
 }
 static void new_file(void){ g_truncated=0; g_trunc_why=0; my_memset(g_lines,0,sizeof(g_lines)); g_line_count=1; g_cursor_row=g_cursor_col=g_scroll_row=0; g_modified=0; g_has_file=0; g_filename[0]='\0'; set_message("New file",COL_MSG_OK); }
 
@@ -201,12 +227,59 @@ static void ensure_cursor_visible(void){
     if(g_cursor_row>=g_scroll_row+VISIBLE_ROWS)g_scroll_row=g_cursor_row-VISIBLE_ROWS+1;
     if(g_scroll_row<0)g_scroll_row=0;
 }
+/* g_save_armed: the press STARTED on the button. g_save_down: it started
+ * there and the pointer is still on it, so draw it pressed. Two flags, not
+ * one, so sliding off the button and back on re-arms it the way every other
+ * button behaves -- with a single flag, sliding off would lose the press for
+ * good, because nothing would still say the drag began here. */
+static int g_save_armed, g_save_down;
+
+static int in_save_btn(const struct tk_event *ev){
+    return ev->x>=SAVE_X && ev->x<SAVE_X+SAVE_W &&
+           ev->y>=SAVE_Y && ev->y<SAVE_Y+SAVE_H;
+}
+
+/* Save, then close -- but ONLY if the write happened. Closing on a failed
+ * save is exactly the data-loss bug this editor already had once: the window
+ * goes away and takes the edits with it. Every refusal save_file() can
+ * return -- a partial buffer, a read-only volume, a full one, no filename --
+ * leaves the window OPEN with the reason in the status bar, because that is
+ * the only state from which the user can still rescue the work. */
+static void save_and_close(struct tk_window *w){
+    if(save_file()) tk_quit(w);
+}
+
 /* Wheel scrolls the view WITHOUT moving the caret -- ensure_cursor_visible
  * only runs on cursor motion, so the view stays where the wheel left it
  * until you actually type or arrow somewhere. */
 static void on_event(struct tk_window *w,struct tk_widget *c,struct tk_event *ev){
     (void)c;
-    if(ev->type!=TK_EV_WHEEL||!ev->wheel)return;
+    switch(ev->type){
+    case TK_EV_MOUSE_DOWN:
+        /* The toolkit gives the canvas the capture on mouse-down, which is
+         * what routes the following MOVE and UP here instead of to the
+         * hover tracker. */
+        if(in_save_btn(ev)){ g_save_armed=g_save_down=1; tk_redraw(w); }
+        return;
+    case TK_EV_MOUSE_MOVE:
+        if(g_save_armed){
+            int now=in_save_btn(ev);
+            if(now!=g_save_down){ g_save_down=now; tk_redraw(w); }
+        }
+        return;
+    case TK_EV_MOUSE_UP:
+        if(g_save_armed){
+            int fire=g_save_down;
+            /* Clear BEFORE acting: save_and_close() can tk_quit(), and
+             * releasing off the button must cancel, not save. */
+            g_save_armed=g_save_down=0; tk_redraw(w);
+            if(fire) save_and_close(w);
+        }
+        return;
+    case TK_EV_WHEEL: break;
+    default: return;
+    }
+    if(!ev->wheel)return;
     g_scroll_row-=(int)ev->wheel*TK_WHEEL_LINES;
     int maxs=g_line_count-VISIBLE_ROWS; if(maxs<0)maxs=0;
     if(g_scroll_row>maxs)g_scroll_row=maxs;
@@ -250,6 +323,13 @@ static void paint(struct tk_window *w,struct tk_widget *c){
     title[tp]='\0';
     TK_MONO(w,8,5,title,g_modified?COL_MODIFIED:COL_TITLE_FG,COL_TITLE_BG);
 
+    /* After the title, never before: a long filename runs the width of the
+     * bar, and the button has to sit on top of it rather than under it. */
+    { uint32_t bbg=g_save_down?COL_BTN_DOWN:COL_BTN;
+      uint32_t bfg=g_save_down?COL_BTN_FG_DOWN:COL_BTN_FG;
+      tk_draw_fill(w,SAVE_X,SAVE_Y,SAVE_W,SAVE_H,bbg);
+      TK_MONO(w,SAVE_X+(SAVE_W-4*CELL_W)/2,SAVE_Y,"Save",bfg,bbg); }
+
     tk_draw_fill(w,0,EDITOR_Y,GUTTER_W,EDITOR_H,COL_GUTTER);
     tk_draw_fill(w,GUTTER_W,EDITOR_Y,1,EDITOR_H,0x00313244u);
 
@@ -290,7 +370,9 @@ static void paint(struct tk_window *w,struct tk_widget *c){
 
 static void on_key(struct tk_window *w,struct tk_event *ev){
     uint8_t k=ev->key;
-    if(k==0x13)save_file();
+    /* Ctrl+S stays save-ONLY. Only the button carries "and close": a key
+     * you hit reflexively mid-edit must not take the window away. */
+    if(k==0x13)(void)save_file();
     else if(k==0x11){ tk_quit(w); return; }
     else if(k==0x0E)new_file();
     else if(k==KEY_UP){ if(g_cursor_row>0){ g_cursor_row--; int len=line_len(g_cursor_row); if(g_cursor_col>len)g_cursor_col=len; ensure_cursor_visible(); } }

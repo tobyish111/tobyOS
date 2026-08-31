@@ -2939,6 +2939,7 @@ static void m28e_run_fscheck_harness(void) {
  * COLORREF, so the framebuffer colour is 0x0028B45A. */
 #define WINPE8_GREEN 0x0028B45Au
 
+
 /* Pump the desktop for ~`ms` milliseconds: yield so the GUI app runs, drain
  * local input (so injected mouse reports are processed), and composite. We run
  * here on pid 0 BEFORE idle_loop, so this is the compositor's only driver. */
@@ -3018,6 +3019,170 @@ static int winpe_spawn_session_app(const char *path, const char *name) {
     return pid;
 }
 #endif /* WINPE8_BOOT || WINPE10_BOOT */
+
+#ifdef EDITSAVE_SELFTEST
+/* ---------------------------------------------------------------------
+ * TobyEdit's Save button, driven end to end.  EXTRA_CFLAGS+=-DEDITSAVE_SELFTEST
+ *
+ * logs/edittrunc.sh says gui_edit "cannot be driven headlessly", and for
+ * load_file() that is still the cheaper truth. But the Save BUTTON is a
+ * GUI-only path -- the click, the write, and the window closing -- and
+ * gui_post_mouse()/gui_post_key() feed the very same event ring the real
+ * mouse does, so it can be driven after all.
+ *
+ * Two cases, and the SECOND is the one that matters. Closing the window on
+ * a save that did not happen is how an editor eats a buffer, so the test
+ * that a FAILED save leaves the window open is worth more than the test
+ * that a good one closes it.
+ * ------------------------------------------------------------------- */
+#define ES_PATH "/data/editsave_test.txt"
+#define ES_BODY "alpha\nbravo\n"
+
+/* Same job as winpe8_pump_ms, which lives inside the WINPE*_BOOT guard and
+ * is therefore not compiled in this build. Yield so the GUI app runs,
+ * drain input so injected reports are seen, then composite. */
+static void es_pump_ms(uint64_t ms) {
+    uint64_t hz = pit_hz(); if (hz == 0) hz = 100;
+    uint64_t end = pit_ticks() + (ms * hz + 999) / 1000;
+    do {
+        sched_yield();
+        mouse_flush_pending();
+        kbd_flush_pending();
+        gui_tick();
+    } while (pit_ticks() < end);
+}
+
+/* The proc table is the only place that knows whether the editor is still
+ * alive, and we deliberately never learn its pid: gui_launch_enqueue_arg()
+ * only queues the launch, so the pid does not exist yet when it returns.
+ * Scanning by name asks the question we actually care about -- "is a
+ * gui_edit still on screen?" -- and survives the launch being deferred. */
+static int es_find_gui_edit(void) {
+    for (int pid = 1; pid < PROC_MAX; pid++) {
+        struct proc *p = proc_lookup(pid);
+        if (!p) continue;
+        if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
+        const char *n = p->name;
+        if (n[0]=='g'&&n[1]=='u'&&n[2]=='i'&&n[3]=='_'&&
+            n[4]=='e'&&n[5]=='d'&&n[6]=='i'&&n[7]=='t'&&n[8]=='\0')
+            return pid;
+    }
+    return -1;
+}
+
+static bool es_write_file(const char *path, const char *body) {
+    (void)vfs_unlink(path);
+    if (vfs_create(path) != VFS_OK) return false;
+    struct vfs_file f;
+    if (vfs_open(path, &f) != VFS_OK) return false;
+    size_t n = 0; while (body[n]) n++;
+    long w = vfs_write(&f, body, n);
+    vfs_close(&f);
+    return w == (long)n;
+}
+
+static long es_read_file(const char *path, char *out, size_t cap) {
+    struct vfs_file f;
+    if (vfs_open(path, &f) != VFS_OK) return -1;
+    long r = vfs_read(&f, out, cap - 1);
+    vfs_close(&f);
+    if (r < 0) r = 0;
+    out[r] = '\0';
+    return r;
+}
+
+/* Click the Save button. These coordinates must agree with SAVE_X/SAVE_Y in
+ * programs/user_gui_edit/main.c -- the centre of a 56x12 button at
+ * (WIN_W-64, 4) in a 640-wide client area. gui_post_mouse takes CLIENT
+ * coords, which is the same space the editor's paint() and in_save_btn()
+ * use, so no title-bar offset applies. */
+static void es_click_save(void) {
+    const int x = 640 - 64 + 56/2, y = 4 + 12/2;
+    gui_post_mouse(GUI_EV_MOUSE_DOWN, x, y, MOUSE_BTN_LEFT);
+    es_pump_ms(150);
+    gui_post_mouse(GUI_EV_MOUSE_UP,   x, y, 0);
+    es_pump_ms(600);
+}
+
+static void editsave_selftest(void) {
+    int pass = 0, fail = 0;
+    kprintf("[EDITSAVE] Save button: writes the file, then closes the window\n");
+
+    /* ---- case 1: a real save closes the window and lands on disk ---- */
+    if (!es_write_file(ES_PATH, ES_BODY)) {
+        kprintf("[EDITSAVE]   FAIL could not stage " ES_PATH "\n");
+        fail++;
+    } else {
+        (void)gui_launch_enqueue_arg("/bin/gui_edit", ES_PATH);
+        for (int i = 0; i < 40 && es_find_gui_edit() < 0; i++)
+            es_pump_ms(100);
+        int pid = es_find_gui_edit();
+        if (pid < 0) {
+            kprintf("[EDITSAVE]   FAIL editor never appeared\n"); fail++;
+        } else {
+            /* Type one character so the buffer really differs from the file;
+             * a save that wrote nothing new would otherwise still "pass". */
+            gui_post_key('X');
+            es_pump_ms(300);
+            es_click_save();
+            for (int i = 0; i < 30 && es_find_gui_edit() >= 0; i++)
+                es_pump_ms(100);
+
+            if (es_find_gui_edit() >= 0) {
+                kprintf("[EDITSAVE]   FAIL window stayed open after a good save\n");
+                fail++;
+                signal_send_to_pid(pid, SIGKILL);
+                es_pump_ms(300);
+            } else {
+                kprintf("[EDITSAVE]   ok   window closed after Save\n"); pass++;
+            }
+            char buf[64];
+            long n = es_read_file(ES_PATH, buf, sizeof buf);
+            if (n > 0 && buf[0]=='X' && buf[1]=='a' && buf[2]=='l') {
+                kprintf("[EDITSAVE]   ok   edit reached the file (%ld bytes)\n", n);
+                pass++;
+            } else {
+                kprintf("[EDITSAVE]   FAIL file does not carry the edit "
+                        "(%ld bytes, starts '%c%c%c')\n", n,
+                        n>0?buf[0]:'?', n>1?buf[1]:'?', n>2?buf[2]:'?');
+                fail++;
+            }
+        }
+    }
+
+    /* ---- case 2: a save that CANNOT happen must not close the window ----
+     * Launched with no path, so save_file() refuses with "No filename". If
+     * the button closed the window anyway, the typed buffer would be gone
+     * with no file to recover it from -- silent data loss, which is exactly
+     * the failure this editor already shipped once. */
+    (void)gui_launch_enqueue_arg("/bin/gui_edit", NULL);
+    for (int i = 0; i < 40 && es_find_gui_edit() < 0; i++)
+        es_pump_ms(100);
+    int upid = es_find_gui_edit();
+    if (upid < 0) {
+        kprintf("[EDITSAVE]   FAIL untitled editor never appeared\n"); fail++;
+    } else {
+        gui_post_key('Z');
+        es_pump_ms(300);
+        es_click_save();
+        es_pump_ms(1200);
+        if (es_find_gui_edit() >= 0) {
+            kprintf("[EDITSAVE]   ok   refused save kept the window open\n");
+            pass++;
+            signal_send_to_pid(upid, SIGKILL);
+            es_pump_ms(300);
+        } else {
+            kprintf("[EDITSAVE]   FAIL window closed on a save that never "
+                    "happened -- the buffer was lost\n");
+            fail++;
+        }
+    }
+
+    (void)vfs_unlink(ES_PATH);
+    kprintf("[EDITSAVE] VERDICT: %s pass=%d fail=%d\n",
+            fail ? "FAIL" : "PASS", pass, fail);
+}
+#endif /* EDITSAVE_SELFTEST */
 
 void _start(void) {
     early_init();
@@ -4924,6 +5089,10 @@ void _start(void) {
         gui_invalidate_full();
         gui_tick();
     }
+
+#ifdef EDITSAVE_SELFTEST
+    editsave_selftest();
+#endif
 
     if (safemode_skip_services()) {
         kprintf("[safe] skipping pkg_init + selftests + devtest harnesses "
