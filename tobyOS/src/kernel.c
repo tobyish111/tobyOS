@@ -623,6 +623,34 @@ static void m14_init(void) {
      * against a real database. session_init itself relies on this. */
     users_init();
 
+    /* Restore /etc/passwd and /etc/group from /data, if the account tools
+     * have written a copy there.
+     *
+     * /etc is ramfs unpacked from the initrd: an existing file can be
+     * rewritten, a new one cannot be created, and NOTHING there survives a
+     * reboot. So useradd/groupadd/usermod mirror every change to /data/etc
+     * and this restores it. Without this the tools would work perfectly and
+     * then lose the account at the next power cycle, which is the kind of
+     * half-working that is worse than not having them.
+     *
+     * Only OVERWRITES files that already exist in the ramfs -- the mirror
+     * is a copy of /etc/passwd, not a way to introduce new files into a
+     * directory the ramfs will not extend. */
+    {
+        static const struct { const char *src, *dst; } restore[] = {
+            { "/data/etc/passwd", "/etc/passwd" },
+            { "/data/etc/group",  "/etc/group"  },
+        };
+        for (unsigned i = 0; i < sizeof(restore)/sizeof(restore[0]); i++) {
+            void *buf = 0; size_t sz = 0;
+            if (vfs_read_all(restore[i].src, &buf, &sz) != VFS_OK) continue;
+            if (sz && vfs_write_all(restore[i].dst, buf, sz) == VFS_OK)
+                kprintf("[users] restored %s from %s (%lu bytes)\n",
+                        restore[i].dst, restore[i].src, (unsigned long)sz);
+            kfree(buf);
+        }
+    }
+
     /* Milestone 31: pick the active UI palette from settings BEFORE
      * the compositor paints anything. theme_init() is safe to call
      * even when /data isn't mounted -- settings_get_str returns the
@@ -3405,6 +3433,20 @@ static void coreutils_selftest(void) {
     if (pid >= 0) {
         rc = proc_wait(pid);
         kprintf("[COREUTILS] extra exit=%d\n", rc);
+    }
+    /* Account tools share this harness: same pattern, same reliability,
+     * and one boot instead of two. */
+    argv[1] = (char *)"/etc/accounts_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "acct-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] accounts exit=%d\n", rc);
     }
     kprintf("[COREUTILS] VERDICT: DONE\n");
 }

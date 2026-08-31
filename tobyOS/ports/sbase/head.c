@@ -51,6 +51,29 @@ static void usage(void) { eprintf("usage: %s [-n lines] [file ...]", argv0); }
 int main(int argc, char *argv[]) {
     util_argv0_set(argv[0]);
 
+    /* GNU accepts `head -5` as shorthand for `head -n 5`, and scripts use it
+     * constantly (`chage -l alice | head -2`). getopt() cannot express a
+     * numeric option, so consume it before getopt sees it.
+     *
+     * The argument is REMOVED rather than rewritten into "-n" plus a value:
+     * inserting needs one slot more than argv has -- argv[argc] is the NULL
+     * terminator and nothing past it is ours -- so growing it writes out of
+     * bounds. Shrinking is always safe. (tail had the same gap and the same
+     * trap; see programs/user_tail/main.c.) */
+    for (int i = 1; i < argc; ) {
+        const char *a = argv[i];
+        if (a[0] != '-' || a[1] < '0' || a[1] > '9') { i++; continue; }
+        int ok = 1, v = 0;
+        for (const char *q = a + 1; *q; q++) {
+            if (*q < '0' || *q > '9') { ok = 0; break; }
+            v = v * 10 + (*q - '0');
+        }
+        if (!ok) { i++; continue; }
+        n_lines = v;
+        for (int k = i; k < argc; k++) argv[k] = argv[k + 1];   /* NULL moves too */
+        argc--;
+    }
+
     int opt;
     while ((opt = getopt(argc, argv, "n:")) != -1) {
         switch (opt) {
