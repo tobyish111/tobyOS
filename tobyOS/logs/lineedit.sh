@@ -113,6 +113,14 @@ le "Up twice reaches the OLDER command" 'one' '' \
 le "^P recalls like Up"                 'ctrlp' '' \
    'echo ctrlp\n' '\020\n'
 
+# `history` prints the ring the arrow keys walk. It only fills on an
+# INTERACTIVE shell -- bash behaves the same -- so this is the only harness
+# that can test it at all.
+# `history` prints NUMBERED entries ("    1  echo histcase"), so the exact
+# line to match includes the number. A fresh session starts the ring empty,
+# which is what makes the number predictable.
+le "history lists what was typed" '    1  echo histcase' ''    'echo histcase\n' 'history\n'
+
 echo "=== editing bindings ==="
 le "^A moves to start of line"          'world' '' \
    'world' '\001echo \n'

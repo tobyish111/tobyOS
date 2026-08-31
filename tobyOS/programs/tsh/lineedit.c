@@ -4,6 +4,14 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* Provided by src/shell.c: the completion specs registered by
+ * `complete -W`, and the builtin names hosted tsh will run. */
+const char *tsh_complete_wordlist(const char *cmdname);
+const char *tsh_builtin_name_at(int i);
 
 extern int         shell_history_count_hosted(void);
 extern const char *shell_history_get_hosted(int i);
@@ -190,6 +198,236 @@ int tsh_lineedit_available(void) {
     return isatty(0) && isatty(1) && tcgetattr(0, &t) == 0;
 }
 
+
+/* ---- Tab completion ----------------------------------------------------
+ *
+ * There was none. Tab inserted a literal tab, which in a shell prompt is
+ * never what anyone means -- and it left `complete`/`compopt` with nothing to
+ * feed, so implementing those first would have produced a registry no code
+ * consumed.
+ *
+ * The rules follow bash closely enough to be unsurprising:
+ *   - the FIRST word of a command completes against PATH (and builtins);
+ *     every later word completes against the filesystem. Completing a
+ *     filename where a command belongs is the mistake that makes a completer
+ *     feel broken.
+ *   - one match completes in place, adding '/' for a directory and a space
+ *     otherwise, so the next word can be typed straight away.
+ *   - several matches extend the word by the LONGEST COMMON PREFIX and, only
+ *     if that added nothing, print the candidates. Redrawing the list on
+ *     every Tab when there is still an unambiguous prefix to insert is what
+ *     makes completion feel chatty.
+ *   - a word registered with `complete -W` completes from that list instead.
+ */
+
+#define LE_MATCH_MAX 256
+
+/* The word under the cursor: from the last unquoted separator to the caret. */
+static size_t le_word_start(const struct le *s) {
+    size_t i = s->pos;
+    while (i > 0) {
+        char c = s->buf[i - 1];
+        if (c == ' ' || c == '\t' || c == '|' || c == '&' ||
+            c == ';' || c == '(' || c == ')' || c == '<' || c == '>') break;
+        i--;
+    }
+    return i;
+}
+
+/* Is the word at `start` the first of its command? Anything before it must be
+ * blank or a command separator. */
+static int le_is_command_slot(const struct le *s, size_t start) {
+    size_t i = start;
+    while (i > 0) {
+        char c = s->buf[i - 1];
+        if (c == ' ' || c == '\t') { i--; continue; }
+        return (c == '|' || c == '&' || c == ';' ||
+                c == '(' || c == '\n');
+    }
+    return 1;
+}
+
+struct le_matches {
+    char  v[LE_MATCH_MAX][128];
+    int   n;
+};
+
+static void le_add(struct le_matches *m, const char *name, int is_dir) {
+    if (m->n >= LE_MATCH_MAX) return;
+    size_t i = 0;
+    for (; name[i] && i < sizeof(m->v[0]) - 2; i++) m->v[m->n][i] = name[i];
+    if (is_dir && i < sizeof(m->v[0]) - 2) m->v[m->n][i++] = '/';
+    m->v[m->n][i] = 0;
+    m->n++;
+}
+
+/* Split "dir/partial" into the directory to scan and the prefix to match. */
+static void le_split(const char *word, char *dir, size_t dcap,
+                     char *pre, size_t pcap) {
+    const char *slash = 0;
+    for (const char *p = word; *p; p++) if (*p == '/') slash = p;
+    if (!slash) {
+        dir[0] = '.'; dir[1] = 0;
+        size_t i = 0;
+        for (; word[i] && i + 1 < pcap; i++) pre[i] = word[i];
+        pre[i] = 0;
+        return;
+    }
+    size_t dl = (size_t)(slash - word) + 1;          /* keep the slash */
+    if (dl >= dcap) dl = dcap - 1;
+    for (size_t i = 0; i < dl; i++) dir[i] = word[i];
+    dir[dl] = 0;
+    size_t i = 0;
+    for (const char *p = slash + 1; *p && i + 1 < pcap; p++) pre[i++] = *p;
+    pre[i] = 0;
+}
+
+static void le_scan_dir(struct le_matches *m, const char *dir, const char *pre) {
+    DIR *d = opendir(dir);
+    if (!d) return;
+    size_t pl = strlen(pre);
+    struct dirent *e;
+    while ((e = readdir(d)) != 0) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        /* A dotfile only shows when the user has typed the dot, as in bash. */
+        if (e->d_name[0] == '.' && (pl == 0 || pre[0] != '.')) continue;
+        if (pl && strncmp(e->d_name, pre, pl) != 0) continue;
+        char full[512];
+        snprintf(full, sizeof full, "%s%s%s", dir,
+                 (dir[strlen(dir) - 1] == '/') ? "" : "/", e->d_name);
+        struct stat st;
+        int isdir = (stat(full, &st) == 0) && S_ISDIR(st.st_mode);
+        le_add(m, e->d_name, isdir);
+    }
+    closedir(d);
+}
+
+/* Commands: every executable name on PATH, plus the shell's own builtins. */
+static void le_scan_commands(struct le_matches *m, const char *pre) {
+    const char *path = getenv("PATH");
+    if (!path || !*path) path = "/bin";
+    size_t pl = strlen(pre);
+    char dir[256];
+    const char *p = path;
+    while (*p) {
+        size_t i = 0;
+        while (*p && *p != ':' && i + 1 < sizeof dir) dir[i++] = *p++;
+        dir[i] = 0;
+        if (*p == ':') p++;
+        if (!i) continue;
+        DIR *d = opendir(dir);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d)) != 0) {
+            if (e->d_name[0] == '.') continue;
+            if (pl && strncmp(e->d_name, pre, pl) != 0) continue;
+            int dup = 0;
+            for (int k = 0; k < m->n; k++)
+                if (!strcmp(m->v[k], e->d_name)) { dup = 1; break; }
+            if (!dup) le_add(m, e->d_name, 0);
+        }
+        closedir(d);
+    }
+    for (int i = 0; ; i++) {
+        const char *bn = tsh_builtin_name_at(i);
+        if (!bn) break;
+        if (pl && strncmp(bn, pre, pl) != 0) continue;
+        int dup = 0;
+        for (int k = 0; k < m->n; k++)
+            if (!strcmp(m->v[k], bn)) { dup = 1; break; }
+        if (!dup) le_add(m, bn, 0);
+    }
+}
+
+static int le_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+static void do_complete(struct le *s) {
+    size_t start = le_word_start(s);
+    char word[256];
+    size_t wl = s->pos - start;
+    if (wl >= sizeof word) return;
+    memcpy(word, s->buf + start, wl);
+    word[wl] = 0;
+
+    struct le_matches m;
+    m.n = 0;
+
+    /* A `complete -W` spec for the COMMAND wins over the filesystem: that is
+     * the whole point of registering one. */
+    char cmdname[128];
+    cmdname[0] = 0;
+    if (!le_is_command_slot(s, start)) {
+        size_t i = 0;
+        while (i < s->len && (s->buf[i] == ' ' || s->buf[i] == '\t')) i++;
+        size_t k = 0;
+        while (i < s->len && s->buf[i] != ' ' && s->buf[i] != '\t' &&
+               k + 1 < sizeof cmdname) cmdname[k++] = s->buf[i++];
+        cmdname[k] = 0;
+    }
+    const char *wl_spec = cmdname[0] ? tsh_complete_wordlist(cmdname) : 0;
+    if (wl_spec) {
+        size_t pl = strlen(word);
+        const char *p = wl_spec;
+        while (*p) {
+            while (*p == ' ') p++;
+            char tok[128];
+            size_t k = 0;
+            while (*p && *p != ' ' && k + 1 < sizeof tok) tok[k++] = *p++;
+            tok[k] = 0;
+            if (k && (!pl || strncmp(tok, word, pl) == 0)) le_add(&m, tok, 0);
+        }
+    } else if (le_is_command_slot(s, start) && !strchr(word, '/')) {
+        le_scan_commands(&m, word);
+    } else {
+        char dir[256], pre[256];
+        le_split(word, dir, sizeof dir, pre, sizeof pre);
+        le_scan_dir(&m, dir, pre);
+    }
+
+    if (m.n == 0) return;
+    qsort(m.v, (size_t)m.n, sizeof m.v[0], le_cmp);
+
+    /* How much of the word is already typed -- only the part AFTER the last
+     * slash was matched against, so only that part gets replaced. */
+    size_t typed = strlen(word);
+    const char *lastslash = strrchr(word, '/');
+    if (lastslash && !wl_spec) typed = strlen(lastslash + 1);
+
+    if (m.n == 1) {
+        const char *v = m.v[0];
+        size_t vl = strlen(v);
+        for (size_t i = typed; i < vl; i++) insert(s, v[i]);
+        if (vl && v[vl - 1] != '/') insert(s, ' ');
+        refresh(s);
+        return;
+    }
+
+    /* Longest common prefix across the candidates. */
+    size_t lcp = strlen(m.v[0]);
+    for (int i = 1; i < m.n; i++) {
+        size_t k = 0;
+        while (k < lcp && m.v[i][k] && m.v[0][k] == m.v[i][k]) k++;
+        lcp = k;
+    }
+    if (lcp > typed) {
+        for (size_t i = typed; i < lcp; i++) insert(s, m.v[0][i]);
+        refresh(s);
+        return;
+    }
+
+    /* Nothing left to insert -- now it is worth showing the list. */
+    outs("\r\n");
+    for (int i = 0; i < m.n; i++) {
+        outs(m.v[i]);
+        outs((i + 1) % 4 == 0 ? "\r\n" : "  ");
+    }
+    if (m.n % 4) outs("\r\n");
+    s->painted = 0;      /* the prompt must be drawn fresh under the list */
+    refresh(s);
+}
+
 long tsh_readline(const char *prompt, char *buf, size_t cap) {
     struct termios orig, raw;
     if (!buf || cap < 2) return TSH_LE_EOF;
@@ -234,6 +472,7 @@ long tsh_readline(const char *prompt, char *buf, size_t cap) {
             if (s.pos > 0) { del_range(&s, s.pos - 1, s.pos, 0); refresh(&s); }
             continue;
         }
+        if (c == 9)  { do_complete(&s);            continue; }   /* Tab */
         if (c == 1)  { s.pos = 0;                  refresh(&s); continue; }
         if (c == 5)  { s.pos = s.len;              refresh(&s); continue; }
         if (c == 2)  { if (s.pos) s.pos--;         refresh(&s); continue; }

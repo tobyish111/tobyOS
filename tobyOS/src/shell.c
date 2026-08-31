@@ -2002,6 +2002,12 @@ static bool shell_hosted_builtin(const char *name) {
          * /bin/readarray, found nothing, and the array silently stayed
          * empty -- ${#arr[@]} was 0 with no error to explain it. */
         "readarray", "mapfile",
+        /* Closing the census gap: bash lists 61 builtins, this shell
+         * had 46. `help` needed no code -- it was in the table all
+         * along and only this list kept it from hosted tsh. */
+        "let", "dirs", "pushd", "popd", "history", "builtin",
+        "disown", "suspend", "logout", "enable", "help",
+        "complete", "compopt", "caller", "bind",
         0
     };
     for (int i = 0; allow[i]; i++)
@@ -2010,8 +2016,15 @@ static bool shell_hosted_builtin(const char *name) {
 }
 #endif
 
+static bool shell_builtin_disabled(const char *name);
+
 static const struct cmd *shell_cmd_lookup(const char *name) {
     if (!name) return 0;
+    /* `enable -n NAME` makes the builtin invisible HERE, so the word
+     * falls through to a PATH lookup exactly as in bash. Recording
+     * the intent without acting on it would be a lie the user could
+     * only discover by the command still being handled internally. */
+    if (shell_builtin_disabled(name)) return 0;
 #ifdef SHELL_HOSTED
     if (!shell_hosted_builtin(name)) return 0;
 #endif
@@ -8489,69 +8502,126 @@ static void cmd_command(int argc, char **argv) {
                                 /*background=*/false, /*profile=*/0);
 }
 
+/* type [-atpP] NAME...
+ *
+ * The flags were missing entirely, so `type -t echo` looked up a command
+ * literally named "-t", printed "-t: not found", and then described echo
+ * anyway -- output that is wrong in a way scripts act on, because -t is how
+ * every script asks "is this a builtin or a file". Resolution happens once
+ * and the flags only choose how to render it. */
 static void cmd_type(int argc, char **argv) {
+    bool f_t = false, f_p = false, f_P = false, f_a = false;
+    int first = argc;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] && !(argv[i][1] == '-' && !argv[i][2])) {
+            for (const char *c = argv[i] + 1; *c; c++) {
+                if      (*c == 't') f_t = true;
+                else if (*c == 'p') f_p = true;
+                else if (*c == 'P') { f_P = true; f_p = true; }
+                else if (*c == 'a') f_a = true;
+                else if (*c == 'f') { /* suppress function lookup: accepted */ }
+                else {
+                    kprintf("type: -%c: invalid option\n", *c);
+                    shell_set_status(2);
+                    return;
+                }
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--") == 0) { first = i + 1; break; }
+        first = i; break;
+    }
     shell_set_status(0);
-    if (argc < 2) {
-        shell_printf("usage: type NAME [NAME...]\n");
+    if (first >= argc) {
+        shell_printf("usage: type [-atpP] NAME [NAME...]\n");
         shell_set_status(1);
         return;
     }
-    for (int i = 1; i < argc; i++) {
-        bool found = false;
-        int aidx = shell_alias_find(argv[i]);
-        if (aidx >= 0) {
-            shell_printf("%s is an alias for '%s'\n",
-                         argv[i], g_aliases[aidx].value);
-            found = true;
-        }
-        if (found) continue;
 
-        /* A RESERVED WORD IS NOT A BUILTIN. `type while cd` says
-         * "while is a shell keyword / cd is a shell builtin"; tsh had nothing
-         * to say about `while` at all and went looking for /bin/while. */
-        {
-            static const char *const kw[] = {
-                "if", "then", "else", "elif", "fi", "case", "esac", "for",
-                "select", "while", "until", "do", "done", "in", "function",
-                "time", "{", "}", "!", "[[", "]]", 0
-            };
-            for (int k = 0; kw[k]; k++) {
-                if (strcmp(argv[i], kw[k]) != 0) continue;
-                shell_printf("%s is a shell keyword\n", argv[i]);
-                found = true;
-                break;
-            }
-        }
-        if (found) continue;
-
-        struct shell_function *fn = shell_function_lookup(argv[i]);
-        if (fn) {
-            shell_printf("%s is a shell function\n", argv[i]);
-            found = true;
-        }
-        if (found) continue;
-
-        /* Same rule as `command -v`: the hosted allow-list decides what
-         * `type` may call a builtin. */
-        {
-            const struct cmd *c = shell_cmd_lookup(argv[i]);
-            if (c) {
-                if (shell_special_builtin_name(c->name)) {
-                    shell_printf("%s is a special shell builtin\n", argv[i]);
-                } else {
-                    shell_printf("%s is a shell builtin\n", argv[i]);
-                }
-                found = true;
-            }
-        }
-        if (found) continue;
-
+    for (int i = first; i < argc; i++) {
+        const char *name = argv[i];
         char path_buf[64];
-        const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
-        if (path_is_file(path)) {
-            shell_printf("%s is %s\n", argv[i], path);
-        } else {
-            shell_printf("%s: not found\n", argv[i]);
+        const char *path = resolve_program(name, path_buf, sizeof(path_buf));
+        bool is_file = path_is_file(path);
+
+        /* -P skips every shell-level meaning and reports only the file. */
+        if (f_P) {
+            if (is_file) shell_printf("%s\n", path);
+            else shell_set_status(1);
+            continue;
+        }
+
+        /* bash only treats a name as an alias here when expand_aliases is
+         * ON -- which it is not in a non-interactive shell. Reporting the
+         * alias anyway made `type -t zz` answer "alias" where bash answers
+         * nothing, and `type` is exactly what scripts use to decide how a
+         * name will actually resolve. An alias that cannot expand is not
+         * how the word will run. */
+        int aidx = g_opt_expand_aliases ? shell_alias_find(name) : -1;
+        static const char *const kw[] = {
+            "if", "then", "else", "elif", "fi", "case", "esac", "for",
+            "select", "while", "until", "do", "done", "in", "function",
+            "time", "{", "}", "!", "[[", "]]", 0 };
+        bool is_kw = false;
+        for (int k = 0; kw[k]; k++)
+            if (strcmp(name, kw[k]) == 0) { is_kw = true; break; }
+        struct shell_function *fn = shell_function_lookup(name);
+        const struct cmd *c = shell_cmd_lookup(name);
+
+        /* -p prints a path only when the name would ACTUALLY run a file;
+         * a builtin shadowing it means there is no path to report. */
+        if (f_p) {
+            if (aidx < 0 && !is_kw && !fn && !c && is_file)
+                shell_printf("%s\n", path);
+            else if (!(aidx >= 0 || is_kw || fn || c || is_file))
+                shell_set_status(1);
+            continue;
+        }
+
+        if (f_t) {
+            if      (aidx >= 0) shell_printf("alias\n");
+            else if (is_kw)     shell_printf("keyword\n");
+            else if (fn)        shell_printf("function\n");
+            else if (c)         shell_printf("builtin\n");
+            else if (is_file)   shell_printf("file\n");
+            else                shell_set_status(1);
+            continue;
+        }
+
+        bool any = false;
+        if (aidx >= 0) {
+            shell_printf("%s is an alias for '%s'\n", name, g_aliases[aidx].value);
+            any = true;
+            if (!f_a) continue;
+        }
+        /* A RESERVED WORD IS NOT A BUILTIN. `type while cd` says
+         * "while is a shell keyword / cd is a shell builtin"; tsh once had
+         * nothing to say about `while` and went looking for /bin/while. */
+        if (is_kw) {
+            shell_printf("%s is a shell keyword\n", name);
+            any = true;
+            if (!f_a) continue;
+        }
+        if (fn) {
+            shell_printf("%s is a shell function\n", name);
+            any = true;
+            if (!f_a) continue;
+        }
+        if (c) {
+            /* Same rule as `command -v`: the hosted allow-list decides what
+             * `type` may call a builtin. */
+            shell_printf(shell_special_builtin_name(c->name)
+                         ? "%s is a special shell builtin\n"
+                         : "%s is a shell builtin\n", name);
+            any = true;
+            if (!f_a) continue;
+        }
+        if (is_file) {
+            shell_printf("%s is %s\n", name, path);
+            any = true;
+        }
+        if (!any) {
+            shell_printf("%s: not found\n", name);
             shell_set_status(1);
         }
     }
@@ -10166,8 +10236,12 @@ static void cmd_pathchk(int argc, char **argv) {
             if (portable) {
                 for (const char *c = comp; c < end; c++) {
                     if (!shell_word_has(portable_set, *c)) {
-                        kprintf("pathchk: %s: non-portable character '%c'\n",
-                                path, *c);
+                        /* GNU wording and argument order. pathchk output is something
+                         * build scripts grep, so the phrasing is part of the interface.
+                         * The BUILTIN is what runs -- it shadows /bin/pathchk -- so
+                         * fixing only the binary changed nothing anyone could see. */
+                        kprintf("pathchk: nonportable character '%c' in file name '%s'\n",
+                                *c, path);
                         bad = true;
                         break;
                     }
@@ -10367,7 +10441,640 @@ static void cmd_fc(int argc, char **argv) {
 
 static void cmd_env(int argc, char **argv);
 
+
+/* ---- bash builtins tsh was missing -------------------------------------
+ *
+ * Measured, not guessed: `compgen -b` in real bash lists 61 builtins and
+ * this shell implemented 46. The rest are here.
+ *
+ * `help` needed no code at all -- it was already in the table and merely
+ * absent from the hosted allow-list, the same trap the comment on
+ * shell_hosted_builtin() describes for ulimit/fc/readarray.
+ * ---------------------------------------------------------------------- */
+
+/* ---- let ---------------------------------------------------------------
+ * The exit status is the INVERSE of the last value: 0 when it is non-zero.
+ * That inversion is the whole point -- `while let i--` has to stay true
+ * until the counter hits 0 -- and getting it backwards makes loops run once
+ * or forever, so it is the one detail here worth stating out loud. */
+static void cmd_let(int argc, char **argv) {
+    if (argc < 2) {
+        kprintf("let: expression expected\n");
+        shell_set_status(1);
+        return;
+    }
+    long last = 0;
+    for (int i = 1; i < argc; i++) {
+        struct shell_arith a;
+        a.p  = argv[i];
+        a.ok = true;
+        last = shell_arith_comma(&a);
+        if (!a.ok) {
+            kprintf("let: %s: syntax error\n", argv[i]);
+            shell_set_status(1);
+            return;
+        }
+    }
+    shell_set_status(last != 0 ? 0 : 1);
+}
+
+/* ---- directory stack: dirs / pushd / popd ------------------------------
+ * Position 0 is ALWAYS the live cwd rather than a stored copy, so the stack
+ * cannot go stale when something else changes directory between two pushes.
+ * bash works the same way; caching the path at push time would show a
+ * top-of-stack that is not where the shell actually is. */
+#define DIRSTACK_MAX 32
+static char g_dirstack[DIRSTACK_MAX][VFS_PATH_MAX];
+static int  g_dirstack_n;    /* entries stacked BELOW the current directory */
+
+static void dirstack_print(bool per_line, bool with_index) {
+    for (int i = 0; i <= g_dirstack_n; i++) {
+        const char *d = (i == 0) ? shell_cwd() : g_dirstack[g_dirstack_n - i];
+        if (with_index)      shell_printf("%2d  %s\n", i, d);
+        else if (per_line)   shell_printf("%s\n", d);
+        else                 shell_printf(i == 0 ? "%s" : " %s", d);
+    }
+    if (!per_line && !with_index) shell_printf("\n");
+}
+
+static void cmd_dirs(int argc, char **argv) {
+    bool per_line = false, with_index = false;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] != '-' || !argv[i][1]) continue;
+        for (const char *c = argv[i] + 1; *c; c++) {
+            if      (*c == 'l') { /* paths are already absolute here */ }
+            else if (*c == 'p') per_line = true;
+            else if (*c == 'v') { with_index = true; per_line = true; }
+            else if (*c == 'c') { g_dirstack_n = 0; shell_set_status(0); return; }
+            else {
+                kprintf("dirs: -%c: invalid option\n", *c);
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    dirstack_print(per_line, with_index);
+    shell_set_status(0);
+}
+
+static void dirstack_copy(char *dst, const char *src) {
+    size_t i = 0;
+    for (; src[i] && i + 1 < VFS_PATH_MAX; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+static void cmd_pushd(int argc, char **argv) {
+    if (argc < 2) {
+        /* Bare `pushd` swaps the top two entries. */
+        if (g_dirstack_n < 1) {
+            kprintf("pushd: no other directory\n");
+            shell_set_status(1);
+            return;
+        }
+        char here[VFS_PATH_MAX];
+        dirstack_copy(here, shell_cwd());
+        if (shell_set_cwd(g_dirstack[g_dirstack_n - 1]) < 0) {
+            kprintf("pushd: %s: cannot change directory\n",
+                    g_dirstack[g_dirstack_n - 1]);
+            shell_set_status(1);
+            return;
+        }
+        dirstack_copy(g_dirstack[g_dirstack_n - 1], here);
+        dirstack_print(false, false);
+        shell_set_status(0);
+        return;
+    }
+    if (g_dirstack_n >= DIRSTACK_MAX) {
+        kprintf("pushd: directory stack full (%d)\n", DIRSTACK_MAX);
+        shell_set_status(1);
+        return;
+    }
+    /* Record where we ARE before moving, so popd can come back. */
+    char here[VFS_PATH_MAX];
+    dirstack_copy(here, shell_cwd());
+    if (shell_set_cwd(argv[1]) < 0) {
+        kprintf("pushd: %s: No such file or directory\n", argv[1]);
+        shell_set_status(1);
+        return;
+    }
+    dirstack_copy(g_dirstack[g_dirstack_n], here);
+    g_dirstack_n++;
+    dirstack_print(false, false);
+    shell_set_status(0);
+}
+
+static void cmd_popd(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (g_dirstack_n < 1) {
+        kprintf("popd: directory stack empty\n");
+        shell_set_status(1);
+        return;
+    }
+    g_dirstack_n--;
+    if (shell_set_cwd(g_dirstack[g_dirstack_n]) < 0) {
+        kprintf("popd: %s: cannot change directory\n", g_dirstack[g_dirstack_n]);
+        shell_set_status(1);
+        return;
+    }
+    dirstack_print(false, false);
+    shell_set_status(0);
+}
+
+/* ---- history -----------------------------------------------------------
+ * The ring already existed for the line editor and for `fc`; nothing could
+ * print it. Numbering runs from g_hist_base so the numbers keep climbing as
+ * old entries fall off the end, which is what makes them worth showing. */
+static void cmd_history(int argc, char **argv) {
+    int limit = -1;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0) {
+            for (int k = 0; k < g_hist_count; k++) { kfree(g_hist[k]); g_hist[k] = 0; }
+            g_hist_count = 0;
+            shell_set_status(0);
+            return;
+        }
+        if (argv[i][0] == '-') {
+            kprintf("history: %s: invalid option\n", argv[i]);
+            shell_set_status(2);
+            return;
+        }
+        int  v = 0;
+        bool digits = argv[i][0] != '\0';
+        for (const char *p = argv[i]; *p; p++) {
+            if (*p < '0' || *p > '9') { digits = false; break; }
+            v = v * 10 + (*p - '0');
+        }
+        if (!digits) {
+            kprintf("history: %s: numeric argument required\n", argv[i]);
+            shell_set_status(1);
+            return;
+        }
+        limit = v;
+    }
+    int start = 0;
+    if (limit >= 0 && limit < g_hist_count) start = g_hist_count - limit;
+    for (int i = start; i < g_hist_count; i++)
+        shell_printf("%5d  %s\n", g_hist_base + i + 1, g_hist[i]);
+    shell_set_status(0);
+}
+
+/* ---- builtin -----------------------------------------------------------
+ * Runs the builtin even when a shell FUNCTION shadows the name. That is what
+ * lets `cd() { builtin cd "$@"; ...; }` work instead of recursing forever,
+ * which is the only reason this builtin exists. */
+static void cmd_builtin(int argc, char **argv) {
+    if (argc < 2) { shell_set_status(0); return; }
+    const struct cmd *c = shell_cmd_lookup(argv[1]);
+    if (!c) {
+        kprintf("builtin: %s: not a shell builtin\n", argv[1]);
+        shell_set_status(1);
+        return;
+    }
+    c->fn(argc - 1, argv + 1);
+}
+
+/* ---- disown ------------------------------------------------------------
+ * Drops the job from the shell's table so it is no longer reported or waited
+ * for. The PROCESS is deliberately untouched: disown is bookkeeping, not a
+ * kill, and conflating the two would silently destroy a long-running job. */
+static void cmd_disown(int argc, char **argv) {
+    bool all = false;
+    int  taken = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "-r") == 0) { all = true; continue; }
+        if (strcmp(argv[i], "-h") == 0) continue;   /* nothing here sends SIGHUP */
+        struct job *j = jobs_by_spec(argv[i]);
+        if (!j) {
+            kprintf("disown: %s: no such job\n", argv[i]);
+            shell_set_status(1);
+            return;
+        }
+        j->id = 0;
+        taken++;
+    }
+    if (all) {
+        for (int i = 0; i < JOB_MAX; i++) g_jobs[i].id = 0;
+        taken++;
+    }
+    if (!taken) {
+        struct job *j = jobs_newest();
+        if (!j) {
+            kprintf("disown: current: no such job\n");
+            shell_set_status(1);
+            return;
+        }
+        j->id = 0;
+    }
+    shell_set_status(0);
+}
+
+/* ---- suspend -----------------------------------------------------------
+ * SIGSTOP to ourselves. A login shell refuses without -f: stopping it can
+ * leave the user with nothing running that could resume it. */
+static void cmd_suspend(int argc, char **argv) {
+    bool force = false;
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "-f") == 0) force = true;
+    if (g_shopt_misc[21] && !force) {
+        kprintf("suspend: cannot suspend a login shell (use -f)\n");
+        shell_set_status(1);
+        return;
+    }
+    if (g_shell_pid < 0) {
+        kprintf("suspend: cannot determine shell pid\n");
+        shell_set_status(1);
+        return;
+    }
+    shell_set_status(0);
+    (void)signal_send_to_pid_checked(g_shell_pid, SIGSTOP);
+}
+
+/* ---- logout ------------------------------------------------------------ */
+static void cmd_logout(int argc, char **argv) {
+    if (!g_shopt_misc[21]) {
+        kprintf("logout: not login shell: use `exit'\n");
+        shell_set_status(1);
+        return;
+    }
+    cmd_exit(argc, argv);
+}
+
+/* ---- enable ------------------------------------------------------------
+ * A disabled builtin falls through to a PATH lookup, which is how one tests
+ * an external replacement for something the shell handles internally
+ * (`enable -n test` then runs /bin/test). shell_cmd_lookup() consults the
+ * disabled set, so disabling really does change resolution rather than just
+ * bookkeeping the intent. */
+#define BUILTIN_OFF_MAX 32
+static char g_builtin_off[BUILTIN_OFF_MAX][24];
+static int  g_builtin_off_n;
+
+static bool shell_builtin_disabled(const char *name) {
+    for (int i = 0; i < g_builtin_off_n; i++)
+        if (strcmp(g_builtin_off[i], name) == 0) return true;
+    return false;
+}
+
+static void shell_builtin_set_disabled(const char *name, bool off) {
+    for (int i = 0; i < g_builtin_off_n; i++) {
+        if (strcmp(g_builtin_off[i], name) != 0) continue;
+        if (off) return;
+        for (int k = i; k < g_builtin_off_n - 1; k++)
+            memcpy(g_builtin_off[k], g_builtin_off[k + 1], sizeof(g_builtin_off[0]));
+        g_builtin_off_n--;
+        return;
+    }
+    if (!off || g_builtin_off_n >= BUILTIN_OFF_MAX) return;
+    size_t i = 0;
+    for (; name[i] && i + 1 < sizeof(g_builtin_off[0]); i++)
+        g_builtin_off[g_builtin_off_n][i] = name[i];
+    g_builtin_off[g_builtin_off_n][i] = '\0';
+    g_builtin_off_n++;
+}
+
+static void cmd_enable(int argc, char **argv) {
+    bool disable = false, list_all = false;
+    int  first = argc;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1]) {
+            for (const char *c = argv[i] + 1; *c; c++) {
+                if      (*c == 'n') disable = true;
+                else if (*c == 'a') list_all = true;
+                else if (*c == 'p') { /* print form is the default below */ }
+                else {
+                    kprintf("enable: -%c: invalid option\n", *c);
+                    shell_set_status(2);
+                    return;
+                }
+            }
+        } else { first = i; break; }
+    }
+    if (first >= argc) {
+        for (const struct cmd *c = cmds; c->name; c++) {
+            bool off = shell_builtin_disabled(c->name);
+            if (off && !disable && !list_all) continue;
+            if (!off && disable) continue;
+            shell_printf("enable %s%s\n", off ? "-n " : "", c->name);
+        }
+        shell_set_status(0);
+        return;
+    }
+    int rc = 0;
+    for (int i = first; i < argc; i++) {
+        const struct cmd *found = 0;
+        for (const struct cmd *c = cmds; c->name; c++)
+            if (strcmp(c->name, argv[i]) == 0) { found = c; break; }
+        if (!found) {
+            kprintf("enable: %s: not a shell builtin\n", argv[i]);
+            rc = 1;
+            continue;
+        }
+        shell_builtin_set_disabled(argv[i], disable);
+    }
+    shell_set_status(rc);
+}
+
+
+/* ---- complete / compopt ------------------------------------------------
+ *
+ * These store per-command completion specs. They are only worth having
+ * because the line editor now READS them (programs/tsh/lineedit.c calls
+ * tsh_complete_wordlist below on Tab) -- a registry nothing consumes is the
+ * dead-subsystem shape this tree has been bitten by more than once.
+ *
+ * -W (an explicit word list) is what actually drives completion here. The
+ * generator forms (-F a function, -C a command, -G a glob) are PARSED and
+ * stored so `complete -p` can print the spec back, but they are not run: to
+ * run them the completer would have to execute shell code mid-keystroke, and
+ * a half-working -F that silently produced nothing would be worse than
+ * saying so. `complete -p` shows exactly what was registered either way.
+ */
+#define COMPSPEC_MAX 32
+struct compspec {
+    char name[64];
+    char words[256];    /* -W list, empty when the spec has none */
+    char opts[64];      /* -o options, recorded for -p */
+    char gen[64];       /* -F/-C/-G text, recorded for -p */
+    char genkind;       /* 'F', 'C', 'G' or 0 */
+    bool used;
+};
+static struct compspec g_compspecs[COMPSPEC_MAX];
+
+static struct compspec *compspec_find(const char *name) {
+    for (int i = 0; i < COMPSPEC_MAX; i++)
+        if (g_compspecs[i].used && strcmp(g_compspecs[i].name, name) == 0)
+            return &g_compspecs[i];
+    return 0;
+}
+
+static struct compspec *compspec_add(const char *name) {
+    struct compspec *c = compspec_find(name);
+    if (c) return c;
+    for (int i = 0; i < COMPSPEC_MAX; i++) {
+        if (g_compspecs[i].used) continue;
+        c = &g_compspecs[i];
+        memset(c, 0, sizeof *c);
+        size_t k = 0;
+        for (; name[k] && k + 1 < sizeof c->name; k++) c->name[k] = name[k];
+        c->name[k] = 0;
+        c->used = true;
+        return c;
+    }
+    return 0;
+}
+
+static void compspec_print(const struct compspec *c) {
+    shell_printf("complete");
+    if (c->opts[0]) shell_printf(" -o %s", c->opts);
+    if (c->genkind)  shell_printf(" -%c '%s'", c->genkind, c->gen);
+    if (c->words[0]) shell_printf(" -W '%s'", c->words);
+    shell_printf(" %s\n", c->name);
+}
+
+static void cmd_complete(int argc, char **argv) {
+    bool remove = false, print = false;
+    const char *words = 0, *opts = 0, *gen = 0;
+    char genkind = 0;
+    int first = argc;
+
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) { first = i; break; }
+        if (strcmp(a, "-r") == 0) { remove = true; continue; }
+        if (strcmp(a, "-p") == 0) { print = true; continue; }
+        if (strcmp(a, "-W") == 0 && i + 1 < argc) { words = argv[++i]; continue; }
+        if (strcmp(a, "-o") == 0 && i + 1 < argc) { opts  = argv[++i]; continue; }
+        if (strcmp(a, "-F") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'F'; continue; }
+        if (strcmp(a, "-C") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'C'; continue; }
+        if (strcmp(a, "-G") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'G'; continue; }
+        if (strcmp(a, "-A") == 0 && i + 1 < argc) { i++; continue; }
+        /* Single-letter action flags bash accepts (-a -b -c -d -f -v ...).
+         * Consumed so a real completion script does not abort on them. */
+        if (a[1] && !a[2]) continue;
+        kprintf("complete: %s: invalid option\n", a);
+        shell_set_status(2);
+        return;
+    }
+
+    if (first >= argc) {
+        if (remove) {
+            for (int i = 0; i < COMPSPEC_MAX; i++) g_compspecs[i].used = false;
+            shell_set_status(0);
+            return;
+        }
+        for (int i = 0; i < COMPSPEC_MAX; i++)
+            if (g_compspecs[i].used) compspec_print(&g_compspecs[i]);
+        shell_set_status(0);
+        return;
+    }
+
+    int rc = 0;
+    for (int i = first; i < argc; i++) {
+        if (remove) {
+            struct compspec *c = compspec_find(argv[i]);
+            if (c) c->used = false;
+            continue;
+        }
+        if (print) {
+            struct compspec *c = compspec_find(argv[i]);
+            if (!c) { rc = 1; continue; }
+            compspec_print(c);
+            continue;
+        }
+        struct compspec *c = compspec_add(argv[i]);
+        if (!c) { kprintf("complete: too many specifications\n"); rc = 1; continue; }
+        size_t k;
+        if (words) {
+            for (k = 0; words[k] && k + 1 < sizeof c->words; k++) c->words[k] = words[k];
+            c->words[k] = 0;
+        }
+        if (opts) {
+            for (k = 0; opts[k] && k + 1 < sizeof c->opts; k++) c->opts[k] = opts[k];
+            c->opts[k] = 0;
+        }
+        if (gen) {
+            for (k = 0; gen[k] && k + 1 < sizeof c->gen; k++) c->gen[k] = gen[k];
+            c->gen[k] = 0;
+            c->genkind = genkind;
+        }
+    }
+    shell_set_status(rc);
+}
+
+static void cmd_compopt(int argc, char **argv) {
+    /* compopt adjusts the -o options of an existing spec. With no name it
+     * applies to the completion in progress, which only exists inside a -F
+     * generator -- and those do not run here, so that form has nothing to
+     * act on and says so rather than pretending. */
+    const char *add = 0;
+    int first = argc;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { add = argv[++i]; continue; }
+        if (strcmp(argv[i], "+o") == 0 && i + 1 < argc) { i++; continue; }
+        if (argv[i][0] == '-' && argv[i][1]) continue;
+        first = i; break;
+    }
+    if (first >= argc) {
+        kprintf("compopt: not currently executing a completion function\n");
+        shell_set_status(1);
+        return;
+    }
+    int rc = 0;
+    for (int i = first; i < argc; i++) {
+        struct compspec *c = compspec_find(argv[i]);
+        if (!c) {
+            kprintf("compopt: %s: no completion specification\n", argv[i]);
+            rc = 1;
+            continue;
+        }
+        if (add) {
+            size_t k = 0;
+            for (; add[k] && k + 1 < sizeof c->opts; k++) c->opts[k] = add[k];
+            c->opts[k] = 0;
+        }
+    }
+    shell_set_status(rc);
+}
+
+/* ---- caller ------------------------------------------------------------
+ * Reports where the running function was called FROM. That needs a per-frame
+ * record, which did not exist: tsh tracks $LINENO and the nesting depth, but
+ * nothing remembered the line a call was made at. shell_callframe_push/pop
+ * around the function body now keep one, so the number printed here is the
+ * real call site rather than wherever execution happens to be.
+ *
+ * The source is reported as "main": tsh does not track a script PATH, and
+ * bash itself says "main" for a shell reading from -c or stdin, so this is
+ * the true answer for how these scripts run rather than a placeholder. */
+#define CALLFRAME_MAX 16
+struct callframe { unsigned long line; const char *name; };
+static struct callframe g_callframes[CALLFRAME_MAX];
+static int g_callframe_n;
+
+static void shell_callframe_push(const char *name, unsigned long line) {
+    if (g_callframe_n >= CALLFRAME_MAX) { g_callframe_n++; return; }
+    g_callframes[g_callframe_n].line = line;
+    g_callframes[g_callframe_n].name = name;
+    g_callframe_n++;
+}
+static void shell_callframe_pop(void) {
+    if (g_callframe_n > 0) g_callframe_n--;
+}
+
+static void cmd_caller(int argc, char **argv) {
+    if (g_callframe_n <= 0) { shell_set_status(1); return; }
+    int want = 0;
+    if (argc > 1) {
+        for (const char *q = argv[1]; *q; q++) {
+            if (*q < '0' || *q > '9') { want = -1; break; }
+            want = want * 10 + (*q - '0');
+        }
+        if (want < 0) {
+            kprintf("caller: %s: invalid frame number\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
+    }
+    int depth = g_callframe_n < CALLFRAME_MAX ? g_callframe_n : CALLFRAME_MAX;
+    if (want >= depth) { shell_set_status(1); return; }
+    const struct callframe *f = &g_callframes[depth - 1 - want];
+    if (argc > 1)
+        shell_printf("%lu %s main\n", f->line, f->name ? f->name : "main");
+    else
+        shell_printf("%lu main\n", f->line);
+    shell_set_status(0);
+}
+
+/* ---- bind --------------------------------------------------------------
+ * tsh has its own editor (programs/tsh/lineedit.c), not readline, so the
+ * bindable set is the one that editor implements. The query forms answer
+ * truthfully from that set; rebinding is not supported and says so instead
+ * of accepting a binding it would never honour -- a `bind` that returns 0
+ * and changes nothing is how a .inputrc silently stops working. */
+static const char *const g_bind_funcs[] = {
+    "beginning-of-line",      /* ^A */
+    "end-of-line",            /* ^E */
+    "backward-char",          /* ^B, Left */
+    "forward-char",           /* ^F, Right */
+    "previous-history",       /* ^P, Up */
+    "next-history",           /* ^N, Down */
+    "kill-line",              /* ^K */
+    "unix-line-discard",      /* ^U */
+    "unix-word-rubout",       /* ^W */
+    "yank",                   /* ^Y */
+    "backward-word",          /* ESC-b */
+    "forward-word",           /* ESC-f */
+    "delete-char",            /* ^D */
+    "backward-delete-char",   /* Backspace */
+    "complete",               /* Tab */
+    "reverse-search-history", /* ^R */
+    "accept-line",            /* Enter */
+    0
+};
+
+static void cmd_bind(int argc, char **argv) {
+    if (argc < 2) { shell_set_status(0); return; }
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-l") == 0) {
+            for (int k = 0; g_bind_funcs[k]; k++)
+                shell_printf("%s\n", g_bind_funcs[k]);
+            shell_set_status(0);
+            return;
+        }
+        if (strcmp(a, "-p") == 0 || strcmp(a, "-P") == 0 ||
+            strcmp(a, "-s") == 0 || strcmp(a, "-S") == 0 ||
+            strcmp(a, "-v") == 0 || strcmp(a, "-V") == 0) {
+            /* Nothing is user-rebindable, so there are no bindings to dump
+             * beyond the built-in set -l already prints. */
+            shell_set_status(0);
+            return;
+        }
+        if (strcmp(a, "-q") == 0 && i + 1 < argc) {
+            const char *fn = argv[++i];
+            for (int k = 0; g_bind_funcs[k]; k++) {
+                if (strcmp(g_bind_funcs[k], fn) != 0) continue;
+                shell_printf("%s can be invoked via its default binding\n", fn);
+                shell_set_status(0);
+                return;
+            }
+            shell_printf("%s is not bound to any keys\n", fn);
+            shell_set_status(0);
+            return;
+        }
+        if (strcmp(a, "-m") == 0 && i + 1 < argc) { i++; continue; }
+        if (strcmp(a, "-f") == 0 && i + 1 < argc) {
+            kprintf("bind: -f: reading an inputrc is not supported\n");
+            shell_set_status(1);
+            return;
+        }
+        if (a[0] == '-') {
+            kprintf("bind: %s: invalid option\n", a);
+            shell_set_status(2);
+            return;
+        }
+        kprintf("bind: rebinding is not supported (see `bind -l`)\n");
+        shell_set_status(1);
+        return;
+    }
+    shell_set_status(0);
+}
+
 static const struct cmd cmds[] = {
+    { "complete","complete [-W list] NAME...: completion spec", cmd_complete },
+    { "compopt", "compopt [-o opt] NAME...: adjust a spec", cmd_compopt },
+    { "caller",  "caller [n]: show the call site", cmd_caller },
+    { "bind",    "bind [-l|-q fn]: line-editor bindings", cmd_bind },
+    { "let",     "let EXPR...: evaluate arithmetic", cmd_let },
+    { "dirs",    "dirs [-clpv]: show the directory stack", cmd_dirs },
+    { "pushd",   "pushd [dir]: push a directory and cd there", cmd_pushd },
+    { "popd",    "popd: pop the directory stack and cd back", cmd_popd },
+    { "history", "history [-c] [n]: show the command history", cmd_history },
+    { "builtin", "builtin NAME [args]: run a builtin, not a function", cmd_builtin },
+    { "disown",  "disown [-a|-h] [job]: forget a job", cmd_disown },
+    { "suspend", "suspend [-f]: stop this shell", cmd_suspend },
+    { "logout",  "logout [n]: exit a login shell", cmd_logout },
+    { "enable",  "enable [-n] [NAME...]: enable/disable builtins", cmd_enable },
     { "help",   "list available commands",      cmd_help   },
     { "clear",  "clear the screen",             cmd_clear  },
     { "echo",   "print arguments",              cmd_echo   },
@@ -16514,7 +17221,11 @@ static int shell_run_function(struct shell_simple *cmd) {
         for (int i = 0; i < fn->nheredoc; i++)
             (void)shell_heredoc_push(fn->heredoc[i], strlen(fn->heredoc[i]));
     }
+    /* Record the CALL SITE so `caller` can report it. g_shell_lineno is
+     * still the caller's line at this point; it moves as the body runs. */
+    shell_callframe_push(fn->name, g_shell_lineno);
     execute_line_text(fn->body);
+    shell_callframe_pop();
     if (saved_hd) {
         memcpy(g_heredocs, saved_hd, sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
         g_heredoc_count = saved_hd_count;
@@ -21409,4 +22120,28 @@ int shell_run_line_hosted(const char *text) {
 /* Set the positional parameters ($1..$n) from a hosted caller. */
 int shell_set_args_hosted(int argc, char **argv) {
     return shell_set_positional_params(argc, argv);
+}
+
+/* Seams for the hosted line editor's Tab completion. Kept here because the
+ * spec table and the builtin table both live in this file; lineedit.c has no
+ * business reaching into either. */
+const char *tsh_complete_wordlist(const char *cmdname) {
+    if (!cmdname || !*cmdname) return 0;
+    struct compspec *c = compspec_find(cmdname);
+    if (!c || !c->words[0]) return 0;
+    return c->words;
+}
+
+const char *tsh_builtin_name_at(int i) {
+    /* Only names hosted tsh will actually run: offering `mkdir` as a builtin
+     * completion when the hosted shell resolves it from PATH would advertise
+     * a builtin that is not one here. */
+    int seen = 0;
+    for (const struct cmd *c = cmds; c->name; c++) {
+#ifdef SHELL_HOSTED
+        if (!shell_hosted_builtin(c->name)) continue;
+#endif
+        if (seen++ == i) return c->name;
+    }
+    return 0;
 }
