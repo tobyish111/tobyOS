@@ -3350,6 +3350,65 @@ static void filetypes_selftest(void) {
             fail ? "FAIL" : "PASS", pass, fail);
 }
 #endif /* FILETYPES_SELFTEST */
+
+#ifdef COREUTILS_SELFTEST
+/* ---------------------------------------------------------------------
+ * The coreutils transcript, run from the BOOT HARNESS.
+ * EXTRA_CFLAGS+=-DCOREUTILS_SELFTEST
+ *
+ * logs/coreutils.sh drove this over SSH first, and repeated sessions were
+ * the wrong vehicle: this server serves one at a time, and the run churns
+ * dozens of short-lived processes -- which is the documented trigger for the
+ * open idle-stall flake. Runs wedged at a DIFFERENT case each time and
+ * reported up to 27 phantom failures for one hung session.
+ *
+ * Here there is no network and no session: pid 0 spawns /bin/tsh on the
+ * script once, with console fds, so the transcript lands on the serial log
+ * the gate already reads. Same pattern as the editsave and filetypes
+ * harnesses, both of which have never stalled.
+ * ------------------------------------------------------------------- */
+static void coreutils_selftest(void) {
+    kprintf("[COREUTILS] running /etc/coreutils_test.sh under /bin/tsh\n");
+
+    char *argv[3];
+    argv[0] = (char *)"tsh";
+    argv[1] = (char *)"/etc/coreutils_test.sh";
+    argv[2] = 0;
+
+    struct proc_spec spec;
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "cu-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    /* fd0/1/2 left NULL: the console, which is the serial log. */
+
+    int pid = proc_spawn(&spec);
+    if (pid < 0) {
+        kprintf("[COREUTILS] FAILED to spawn tsh rc=%d\n", pid);
+        kprintf("[COREUTILS] VERDICT: FAIL\n");
+        return;
+    }
+    int rc = proc_wait(pid);
+    kprintf("[COREUTILS] script exit=%d\n", rc);
+
+    /* The second script has no GNU oracle; run it the same way. */
+    argv[1] = (char *)"/etc/coreutils_extra.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "cu-extra";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] extra exit=%d\n", rc);
+    }
+    kprintf("[COREUTILS] VERDICT: DONE\n");
+}
+#endif /* COREUTILS_SELFTEST */
 void _start(void) {
     early_init();
     framebuffer_init();
@@ -5265,6 +5324,9 @@ void _start(void) {
 #endif
 #ifdef FILETYPES_SELFTEST
     filetypes_selftest();
+#endif
+#ifdef COREUTILS_SELFTEST
+    coreutils_selftest();
 #endif
 
     if (safemode_skip_services()) {

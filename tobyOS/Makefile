@@ -542,6 +542,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_touch/user_touch.elf \
             programs/user_kill/user_kill.elf \
             programs/user_tail/user_tail.elf \
+            programs/user_coreutil/user_coreutil.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1742,6 +1743,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_mkdir,user_mkdir))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_touch,user_touch))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_kill,user_kill))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_coreutil,user_coreutil))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_wget,user_wget))
@@ -3029,6 +3031,18 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
 	cp programs/user_kill/user_kill.elf             $(INITRD_STAGE)/bin/kill
 	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
+	cp programs/user_coreutil/user_coreutil.elf     $(INITRD_STAGE)/bin/coreutil
+	cp etc/coreutils_test.sh                        $(INITRD_STAGE)/etc/coreutils_test.sh
+	cp etc/coreutils_extra.sh                       $(INITRD_STAGE)/etc/coreutils_extra.sh
+	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
+	@# that dispatches on argv[0] -- the same way busybox is installed below.
+	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
+	@# typeflag 2, so a symlink would not resolve.
+	@for ap in tsort fmt join pathchk dir vdir dircolors csplit pr numfmt \
+	           chcon runcon pinky ptx stdbuf basenc sha224sum sha384sum b2sum; do \
+	    ln -f $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
 	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
 	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
@@ -3741,6 +3755,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
+	    etc/coreutils_test.sh etc/coreutils_extra.sh                       \
+	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
+	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
+	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
+	    bin/sha224sum bin/sha384sum                                       \
 	    bin/kill bin/id bin/newgrp bin/vncpasswd                          \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
@@ -5476,6 +5495,7 @@ clean:
 	       programs/user_touch/user_touch.o programs/user_touch/user_touch.elf \
 	       programs/user_kill/user_kill.o programs/user_kill/user_kill.elf \
 	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
+	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
 	       programs/user_date/user_date.o programs/user_date/user_date.elf \
 	       programs/user_wget/user_wget.o programs/user_wget/user_wget.elf \

@@ -8,6 +8,29 @@
 int main(int argc, char **argv) {
     int nlines = 10;
     int opt;
+
+    /* GNU accepts `tail -5` as shorthand for `tail -n 5`, and scripts use it
+     * constantly (`history | tail -1`). getopt() cannot express a numeric
+     * option, so consume it here first.
+     *
+     * The argument is REMOVED rather than rewritten into "-n" plus a value:
+     * inserting would need one more slot than argv has (argv[argc] is the
+     * NULL terminator and there is nothing valid past it), so growing it
+     * writes out of bounds. Shrinking is always safe. */
+    for (int i = 1; i < argc; ) {
+        const char *a = argv[i];
+        if (a[0] != '-' || a[1] < '0' || a[1] > '9') { i++; continue; }
+        int ok = 1, v = 0;
+        for (const char *q = a + 1; *q; q++) {
+            if (*q < '0' || *q > '9') { ok = 0; break; }
+            v = v * 10 + (*q - '0');
+        }
+        if (!ok) { i++; continue; }
+        nlines = v > 0 ? v : 10;
+        for (int k = i; k < argc; k++) argv[k] = argv[k + 1];   /* NULL moves too */
+        argc--;
+    }
+
     while ((opt = getopt(argc, argv, "n:")) != -1) {
         switch (opt) {
         case 'n':
