@@ -365,10 +365,23 @@ static int do_format(sink_fn sink, void *ctx, const char *fmt, va_list ap) {
             else f.precision = parse_int(&fmt);
         }
 
-        /* length modifier */
+        /* length modifier
+         *
+         * Only ONE character was consumed, so "%lld" took the first 'l' as
+         * the modifier and then read the SECOND 'l' as the conversion --
+         * which is not one, so printf emitted the format text verbatim.
+         * Any ported program using %lld (and they are everywhere) printed
+         * "%lld" where a number belonged, with no error anywhere.
+         *
+         * "ll" collapses to 'l' and "hh" to 'h': this is LP64, so long and
+         * long long are both 64-bit and are passed identically in varargs,
+         * and conv_int already works in 64-bit. On an ABI where they differ
+         * this would need its own case. */
         if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 'L') {
             f.length = *fmt;
             fmt++;
+            if ((f.length == 'l' && *fmt == 'l') ||
+                (f.length == 'h' && *fmt == 'h')) fmt++;
         }
 
         f.conv = *fmt ? *fmt++ : 0;

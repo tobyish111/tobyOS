@@ -73,7 +73,13 @@ pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
  * otherwise never returns (the synchronous "exec" semantics). */
 static int exec_emulate(const char *path, char *const argv[],
                         char *const envp[]) {
-    pid_t pid = toby_spawn(path, argv, envp, 0, 0, 0);
+    /* The child must inherit THIS process's stdin, stdout and stderr.
+     * These were 0,0,0 -- so an exec'd child wrote its output to the
+     * caller's STDIN. Every redirection was silently lost: `vdir f1 |
+     * grep f1` sent the listing to the terminal and handed grep an
+     * empty pipe, which looks like the exec'd program produced
+     * nothing. Affects every user of execv/execve/execvp. */
+    pid_t pid = toby_spawn(path, argv, envp, 0, 1, 2);
     if (pid < 0) return -1;
     int status = 0;
     pid_t rc = waitpid(pid, &status, 0);
