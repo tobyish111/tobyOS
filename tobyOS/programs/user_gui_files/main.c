@@ -29,6 +29,7 @@
 #include <tobyos/abi/abi.h>
 #include <tobyos_slog.h>
 #include <toby/fileassoc.h>
+#include <tobyos/unique_name.h>
 
 typedef unsigned long usize;
 typedef long          ssize_t;
@@ -85,7 +86,9 @@ static void my_memcpy(void *d,const void *s,usize n){ unsigned char *a=d; const 
 static int streq(const char *a,const char *b){ while(*a&&*a==*b){a++;b++;} return *a=='\0'&&*b=='\0'; }
 static int my_strcmp(const char *a,const char *b){ while(*a&&*a==*b){a++;b++;} return (int)(unsigned char)*a-(int)(unsigned char)*b; }
 static void str_copy(char *d,const char *s,usize cap){ usize i=0; while(i<cap-1&&s[i]){d[i]=s[i];i++;} d[i]='\0'; }
-static const char *find_ext(const char *name){ const char *dot=0; for(const char *c=name;*c;c++)if(*c=='.')dot=c; return dot; }
+/* find_ext() lived here. Both its users are gone -- the Type column asks
+ * the shared registry, and uniquify() uses the shared naming rule. A
+ * second extension parser in this file is what let the old copies drift. */
 static int str_cat(char *d,int p,usize cap,const char *s){ for(usize j=0;s[j]&&(usize)p+1<cap;j++)d[p++]=s[j]; d[p]='\0'; return p; }
 
 static void fmt_size(char *buf,usize cap,uint32_t bytes){
@@ -258,55 +261,73 @@ static void do_copy(void){
     set_status2("Copied: ",g_entries[idx].name);
 }
 
-/* Windows-style collision handling: "name.txt" -> "name (copy).txt"
- * -> "name (copy 2).txt" ... Returns 0 if no free name was found. */
+/* Collision handling, from the ONE rule in <tobyos/unique_name.h>:
+ * "report.txt" -> "report_1.txt" -> "report_2.txt". This used to build
+ * "report (copy).txt" here and nowhere else, so /bin/cp -U and Explorer
+ * would have produced different names for the same operation.
+ *
+ * nth == 0 yields the original name, so the untaken name is tried first.
+ * Returns 0 if every candidate up to the cap is taken. */
 static int uniquify(char *dst,usize cap,const char *dir,const char *base){
-    path_join(dst,cap,dir,base);
-    if(!file_exists(dst))return 1;
-    const char *x=find_ext(base);
-    char stem[SYS_FS_NAME_MAX], ext[16];
-    if(x){ usize sl=(usize)(x-base); if(sl>=sizeof(stem))sl=sizeof(stem)-1;
-           for(usize i=0;i<sl;i++)stem[i]=base[i]; stem[sl]='\0';
-           str_copy(ext,x,sizeof(ext)); }
-    else { str_copy(stem,base,sizeof(stem)); ext[0]='\0'; }
-    for(int nth=1;nth<=9;nth++){
-        char cand[SYS_FS_NAME_MAX]; int p=0;
-        p=str_cat(cand,p,sizeof(cand),stem);
-        p=str_cat(cand,p,sizeof(cand)," (copy");
-        if(nth>1){ char d[2]={(char)('0'+nth),0}; p=str_cat(cand,p,sizeof(cand)," "); p=str_cat(cand,p,sizeof(cand),d); }
-        p=str_cat(cand,p,sizeof(cand),")");
-        str_cat(cand,p,sizeof(cand),ext);
+    for(unsigned nth=0;nth<=999;nth++){
+        char cand[SYS_FS_NAME_MAX];
+        if(!unique_name_nth(cand,sizeof(cand),base,nth))break;
         path_join(dst,cap,dir,cand);
         if(!file_exists(dst))return 1;
     }
     return 0;
 }
 
-static void do_paste(void){
-    if(!g_clipboard[0]){ set_status("Clipboard empty -- Copy a file first"); return; }
-    if(!g_clip_is_file){ set_status("Can only paste files"); return; }
-    long sfd=sys_open(g_clipboard,O_RDONLY,0);
-    if(sfd<0){ set_status("Source no longer exists"); return; }
-    char dest[256];
-    if(!uniquify(dest,sizeof(dest),g_path,path_basename(g_clipboard))){
-        sys_close((int)sfd); set_status("Too many copies here already"); return;
-    }
-    long dfd=sys_open(dest,O_WRONLY|O_CREAT|O_TRUNC,0);
-    if(dfd<0){ sys_close((int)sfd); set_status("Create failed (read-only folder?)"); return; }
-    /* Chunked fd-to-fd copy: any file size, no truncation. */
-    long total=0, err=0;
+/* Chunked fd-to-fd copy: any size, no truncation. Shared by Paste and
+ * Duplicate -- two copies of a copy loop is two places to get the
+ * partial-write cleanup wrong. Removes the half-written file on failure,
+ * because a truncated copy that keeps the name is worse than no copy. */
+static int copy_bytes(const char *src,const char *dst,const char **why){
+    long sfd=sys_open(src,O_RDONLY,0);
+    if(sfd<0){ *why="Source no longer exists"; return 0; }
+    long dfd=sys_open(dst,O_WRONLY|O_CREAT|O_TRUNC,0);
+    if(dfd<0){ sys_close((int)sfd); *why="Create failed (read-only folder?)"; return 0; }
+    int err=0;
     for(;;){
         ssize_t n=sys_read_fd((int)sfd,g_iobuf,sizeof(g_iobuf));
         if(n<0){ err=1; break; }
         if(n==0)break;
         ssize_t w=sys_write_to((int)dfd,g_iobuf,(usize)n);
         if(w!=n){ err=1; break; }
-        total+=n;
     }
     sys_close((int)sfd); sys_close((int)dfd);
-    if(err){ sys_unlink(dest); set_status("Paste failed mid-copy (disk full?)"); return; }
-    (void)total;
+    if(err){ sys_unlink(dst); *why="Copy failed mid-way (disk full?)"; return 0; }
+    return 1;
+}
+
+static void do_paste(void){
+    if(!g_clipboard[0]){ set_status("Clipboard empty -- Copy a file first"); return; }
+    if(!g_clip_is_file){ set_status("Can only paste files"); return; }
+    char dest[256];
+    if(!uniquify(dest,sizeof(dest),g_path,path_basename(g_clipboard))){
+        set_status("Too many copies here already"); return;
+    }
+    const char *why="Paste failed";
+    if(!copy_bytes(g_clipboard,dest,&why)){ set_status(why); return; }
     set_status2("Pasted: ",path_basename(dest));
+}
+
+/* Duplicate: copy the selected file beside itself under the next free
+ * name. Paste already did this, but only after a Copy and only into
+ * whatever folder you had navigated to -- there was no way to say
+ * "another one of these, right here". */
+static void do_duplicate(void){
+    char full[256];
+    if(!selected_full_path(full,sizeof(full))){ set_status("Select a file to duplicate"); return; }
+    int idx=g_selected-1;
+    if(g_entries[idx].type==SYS_FS_TYPE_DIR){ set_status("Cannot duplicate a folder"); return; }
+    char dest[256];
+    if(!uniquify(dest,sizeof(dest),g_path,g_entries[idx].name)){
+        set_status("Too many copies here already"); return;
+    }
+    const char *why="Duplicate failed";
+    if(!copy_bytes(full,dest,&why)){ set_status(why); return; }
+    set_status2("Duplicated: ",path_basename(dest));
 }
 
 static void do_copy_path(void){
@@ -845,14 +866,14 @@ static void on_vol_menu(struct tk_window *w,int id){
 }
 
 /* ---- context menu ----------------------------------------------------- */
-enum { MI_OPEN=1, MI_EDIT, MI_VIEW, MI_COPY, MI_PASTE, MI_COPYPATH, MI_DELETE };
+enum { MI_OPEN=1, MI_EDIT, MI_VIEW, MI_COPY, MI_PASTE, MI_DUPLICATE, MI_COPYPATH, MI_DELETE };
 static const char *const g_menu_items[]={
-    "Open","Edit","View","-","Copy","Paste","Copy file path","-","Delete"
+    "Open","Edit","View","-","Copy","Paste","Duplicate","Copy file path","-","Delete"
 };
 static const int g_menu_ids[]={
-    MI_OPEN,MI_EDIT,MI_VIEW,0,MI_COPY,MI_PASTE,MI_COPYPATH,0,MI_DELETE
+    MI_OPEN,MI_EDIT,MI_VIEW,0,MI_COPY,MI_PASTE,MI_DUPLICATE,MI_COPYPATH,0,MI_DELETE
 };
-#define MENU_N 9
+#define MENU_N 10
 
 static void on_menu(struct tk_window *w,int id){
     (void)w;
@@ -862,6 +883,7 @@ static void on_menu(struct tk_window *w,int id){
     case MI_VIEW:     do_view(); update_view(); break;
     case MI_COPY:     do_copy(); update_view(); break;
     case MI_PASTE:    do_paste(); refresh_listing(); update_view(); break;
+    case MI_DUPLICATE: do_duplicate(); refresh_listing(); update_view(); break;
     case MI_COPYPATH: do_copy_path(); update_view(); break;
     case MI_DELETE:   if(g_selected>0){ g_confirm_mode=1; rebuild(); } break;
     default: break;
