@@ -14,13 +14,12 @@
 
 int toby_dns_resolve(const char *hostname, uint32_t *ip_out) {
     if (!hostname || !ip_out) return -1;
-
-    /* Use kernel's DNS resolve syscall (SYS_DNS_RESOLVE = 78 if it exists) 
-     * For now, use HTTP_GET with a DNS trick - actually let's use the 
-     * nslookup pattern: send UDP DNS query */
-    /* The simplest approach: do a raw syscall that the kernel provides */
-    long r = toby_sc2(78, (long)hostname, (long)ip_out);
-    return (int)r;
+    /* This called syscall 78 -- which is ABI_SYS_CLIP_PASTE, not a resolver.
+     * Every lookup was a clipboard paste with the hostname as the destination
+     * and the address of *ip_out as the buffer size: it never resolved
+     * anything and could corrupt memory. ABI_SYS_DNS_RESOLVE now exists and
+     * handles both a literal dotted quad and a real query. */
+    return (int)toby_sc2(ABI_SYS_DNS_RESOLVE, (long)hostname, (long)ip_out);
 }
 
 /* ---- TCP sockets ---- */

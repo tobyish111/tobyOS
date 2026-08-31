@@ -3395,6 +3395,38 @@ static void filetypes_selftest(void) {
  * the gate already reads. Same pattern as the editsave and filetypes
  * harnesses, both of which have never stalled.
  * ------------------------------------------------------------------- */
+/* Wait for `pid` WITHOUT blocking pid 0.
+ *
+ * proc_wait() parks pid 0 until the child exits, which is fine for a script
+ * that only needs its own processes -- and wrong for the SSH client test.
+ * sshd is a ring-0 WORKER: it has to be scheduled to accept a connection.
+ * With pid 0 parked, the client's TCP connection reached ESTABLISHED (the
+ * stack is fine) and then sat waiting for a banner from a server that was
+ * never run, which reads as "no banner from the server" and looks like a
+ * client bug. Yielding in a loop lets the worker run. */
+static int cu_wait_pumping(int pid, uint64_t max_ms) {
+    uint64_t hz = pit_hz(); if (hz == 0) hz = 100;
+    uint64_t end = pit_ticks() + (max_ms * hz + 999) / 1000;
+    for (;;) {
+        struct proc *p = proc_lookup(pid);
+        if (!p || p->state == PROC_UNUSED || p->state == PROC_TERMINATED) break;
+        sched_yield();
+        gui_tick();
+        /* sshd creates its worker LAZILY, inside ssh_poll()'s accept path.
+         * Nothing else calls ssh_poll this early -- pid 0 has not reached
+         * its idle loop -- so without this the loopback connection reaches
+         * ESTABLISHED and is never accepted, and the client waits for a
+         * banner from a server that was never started. */
+        ssh_poll();
+        if (pit_ticks() > end) {
+            kprintf("[COREUTILS] pid %d did not finish in %lums\n",
+                    pid, (unsigned long)max_ms);
+            break;
+        }
+    }
+    return 0;
+}
+
 static void coreutils_selftest(void) {
     kprintf("[COREUTILS] running /etc/coreutils_test.sh under /bin/tsh\n");
 
@@ -3447,6 +3479,22 @@ static void coreutils_selftest(void) {
     if (pid >= 0) {
         rc = proc_wait(pid);
         kprintf("[COREUTILS] accounts exit=%d\n", rc);
+    }
+    /* The SSH client, against our own sshd over loopback. Needs the network
+     * up, which it is by the time this harness runs. */
+    argv[1] = (char *)"/etc/ssh_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "ssh-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        /* Pumping, not proc_wait: sshd is a ring-0 worker and must be
+         * scheduled for the loopback connection to be accepted. */
+        cu_wait_pumping(pid, 60000);
+        kprintf("[COREUTILS] ssh done\n");
     }
     kprintf("[COREUTILS] VERDICT: DONE\n");
 }

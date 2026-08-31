@@ -18,9 +18,25 @@
 #include "util.h"
 
 static int n_lines = 10;
+static long n_bytes = -1;   /* -c: bytes instead of lines */
 
 static int head_fd(int fd, const char *label) {
     char  buf[4096];
+    /* -c counts BYTES, not lines. GNU has had it forever and scripts use it
+     * to peek at binary headers; without it `head -c 11 file` was a usage
+     * error. */
+    if (n_bytes >= 0) {
+        long left_b = n_bytes;
+        while (left_b > 0) {
+            size_t want = (size_t)(left_b < (long)sizeof(buf) ? left_b : (long)sizeof(buf));
+            ssize_t n = read(fd, buf, want);
+            if (n == 0) break;
+            if (n < 0) { weprintf("read %s:", label); return -1; }
+            if (write(1, buf, (size_t)n) < 0) { weprintf("write:"); return -1; }
+            left_b -= n;
+        }
+        return 0;
+    }
     int   left = n_lines;
     for (;;) {
         if (left <= 0) return 0;
@@ -46,7 +62,7 @@ static int head_fd(int fd, const char *label) {
     }
 }
 
-static void usage(void) { eprintf("usage: %s [-n lines] [file ...]", argv0); }
+static void usage(void) { eprintf("usage: %s [-n lines] [-c bytes] [file ...]", argv0); }
 
 int main(int argc, char *argv[]) {
     util_argv0_set(argv[0]);
@@ -75,9 +91,10 @@ int main(int argc, char *argv[]) {
     }
 
     int opt;
-    while ((opt = getopt(argc, argv, "n:")) != -1) {
+    while ((opt = getopt(argc, argv, "n:c:")) != -1) {
         switch (opt) {
         case 'n': n_lines = atoi(optarg); if (n_lines < 0) usage(); break;
+        case 'c': n_bytes = atol(optarg); if (n_bytes < 0) usage(); break;
         default:  usage();
         }
     }

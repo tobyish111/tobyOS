@@ -4650,6 +4650,35 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_term_write((int)a1, (const void *)a2, (size_t)a3);
     case SYS_TERM_READ:
         return sys_term_read((int)a1, (void *)a2, (size_t)a3);
+    case ABI_SYS_DNS_RESOLVE: {
+        /* The kernel already had dns_resolve(); nothing exposed it, so no
+         * userland program could turn a name into an address for a raw TCP
+         * connection. A literal dotted quad is answered WITHOUT a query --
+         * asking a DNS server to resolve "127.0.0.1" is both pointless and
+         * guaranteed to fail. */
+        char name[256];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a2, sizeof(uint32_t))) return -ABI_EFAULT;
+        uint32_t ip_be = 0;
+        unsigned b[4]; int nb = 0; const char *p = name; bool literal = true;
+        while (nb < 4) {
+            unsigned v = 0; int digits = 0;
+            while (*p >= '0' && *p <= '9') { v = v*10 + (unsigned)(*p++ - '0'); digits++; }
+            if (!digits || v > 255) { literal = false; break; }
+            b[nb++] = v;
+            if (nb < 4) { if (*p != '.') { literal = false; break; } p++; }
+        }
+        if (literal && nb == 4 && *p == 0) {
+            ip_be = ((uint32_t)b[0]) | ((uint32_t)b[1] << 8) |
+                    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        } else {
+            struct dns_result r;
+            if (!dns_resolve(name, 4000, &r)) return -1;
+            ip_be = r.ip_be;
+        }
+        if (copy_to_user((void *)a2, &ip_be, sizeof ip_be) != 0) return -ABI_EFAULT;
+        return 0;
+    }
     case SYS_FS_READDIR:
         return sys_fs_readdir((const char *)a1,
                               (struct vfs_dirent_user *)a2,

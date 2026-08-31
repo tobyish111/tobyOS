@@ -1085,7 +1085,17 @@ struct abi_vizmap {
 #define ABI_SYS_GUI_TEXT_MONO   199  /* (fd, xy|cell_h<<32, str, fg, bg) */
 
 /* Highest assigned syscall number plus one. */
-#define ABI_SYS_NR_MAX          200
+/* Resolve a hostname to an IPv4 address, network byte order.
+ *
+ * There was NO resolver syscall, and libtoby's toby_dns_resolve() called
+ * number 78 anyway -- which is ABI_SYS_CLIP_PASTE. Every hostname lookup
+ * from userland was therefore a clipboard paste with the hostname as the
+ * destination buffer and the address of the caller's output variable as
+ * the buffer SIZE. It never resolved anything, and it could corrupt
+ * memory. This is the call it should always have made. */
+#define ABI_SYS_DNS_RESOLVE     200  /* (const char *name, uint32_t *ip_be) */
+
+#define ABI_SYS_NR_MAX          201
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

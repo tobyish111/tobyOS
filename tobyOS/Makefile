@@ -544,6 +544,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_tail/user_tail.elf \
             programs/user_coreutil/user_coreutil.elf \
             programs/user_admin/user_admin.elf \
+            programs/user_ssh/user_ssh.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1003,6 +1004,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/h264_decode.c \
                    $(LIBTOBY_SRC)/media.c \
                    $(LIBTOBY_SRC)/fileassoc.c \
+                   $(LIBTOBY_SRC)/sha2.c \
                    $(LIBTOBY_SRC)/render.c \
                    $(LIBTOBY_SRC)/clipboard_ext.c \
                    $(LIBTOBY_SRC)/unicode.c \
@@ -1116,6 +1118,23 @@ $(LIBTOBY_SRC)/oh264_glue.pic.o: $(LIBTOBY_SRC)/oh264_glue.cpp
 	$(CXX) $(LIBTOBY_CXXFLAGS) -fPIC -I third_party/openh264/api -c $< -o $@
 
 LIBTOBY_OBJS += $(LIBTOBY_SRC)/cxxrt.o $(LIBTOBY_SRC)/oh264_glue.o
+
+# Monocypher into LIBTOBY as well as the kernel.
+#
+# /bin/ssh needs exactly what the SSH server needs -- X25519, Ed25519,
+# SHA-512, ChaCha20-Poly1305 -- and monocypher was compiled only into the
+# kernel. It is dependency-free C99 (its own headers and nothing else), so
+# it drops straight into the freestanding userland build. Sharing the
+# implementation also means the client and the server cannot disagree about
+# a primitive, which is the kind of bug that shows up as an unexplained
+# handshake failure.
+LIBTOBY_OBJS += third_party/monocypher-4.0.2/src/monocypher.libtoby.o                 third_party/monocypher-4.0.2/src/optional/monocypher-ed25519.libtoby.o
+
+third_party/monocypher-4.0.2/src/%.libtoby.o: third_party/monocypher-4.0.2/src/%.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I third_party/monocypher-4.0.2/src 	      -I third_party/monocypher-4.0.2/src/optional -c $< -o $@
+
+third_party/monocypher-4.0.2/src/optional/%.libtoby.o: third_party/monocypher-4.0.2/src/optional/%.c
+	$(CC) $(LIBTOBY_BUILD_CFLAGS) -I third_party/monocypher-4.0.2/src 	      -I third_party/monocypher-4.0.2/src/optional -c $< -o $@
 # (the .pic.o append lives next to the other vendored PIC appends,
 # after LIBTOBY_PIC_OBJS is first assigned)
 
@@ -1271,7 +1290,9 @@ $(LIBTOBY_AR): $(LIBTOBY_OBJS)
 # headers under include/tobyos (file_types.h is the first). LIBTOBY_BUILD_CFLAGS
 # already carries it for libtoby own sources; without it here, any PROGRAM that
 # includes such a header fails to compile while libtoby itself builds fine.
-LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3 -I include
+LIBTOBY_CFLAGS  := $(USER_CFLAGS) -isystem $(LIBTOBY_INC) -isystem third_party/wasm3 -I include \
+                   -I third_party/monocypher-4.0.2/src \
+                   -I third_party/monocypher-4.0.2/src/optional
 
 # Every public libtoby header, as an explicit prerequisite for user-program
 # objects. -MMD cannot see these (they arrive through -isystem; see the
@@ -1746,6 +1767,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_kill,user_kill))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_coreutil,user_coreutil))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_admin,user_admin))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ssh,user_ssh))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_uniq,user_uniq))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_date,user_date))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_wget,user_wget))
@@ -3035,6 +3057,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
 	cp programs/user_coreutil/user_coreutil.elf     $(INITRD_STAGE)/bin/coreutil
 	cp programs/user_admin/user_admin.elf           $(INITRD_STAGE)/bin/user_admin
+	cp programs/user_ssh/user_ssh.elf               $(INITRD_STAGE)/bin/user_ssh
+	@# SSH client family, one binary dispatched on argv[0]
+	@for ap in ssh ssh-keygen ssh-add scp sftp; do \
+	    ln -f $(INITRD_STAGE)/bin/user_ssh "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/user_ssh "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	@# shadow-suite account tools, one binary dispatched on argv[0]
 	@for ap in useradd userdel usermod groupadd groupdel groupmod \
 	           gpasswd chsh chfn chage vipw vigr; do \
@@ -3044,6 +3072,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/coreutils_test.sh                        $(INITRD_STAGE)/etc/coreutils_test.sh
 	cp etc/coreutils_extra.sh                       $(INITRD_STAGE)/etc/coreutils_extra.sh
 	cp etc/accounts_test.sh                         $(INITRD_STAGE)/etc/accounts_test.sh
+	cp etc/ssh_test.sh                              $(INITRD_STAGE)/etc/ssh_test.sh
 	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
 	@# that dispatches on argv[0] -- the same way busybox is installed below.
 	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
@@ -3766,9 +3795,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
 	    etc/coreutils_test.sh etc/coreutils_extra.sh etc/accounts_test.sh  \
+	    etc/ssh_test.sh                                                    \
 	    bin/user_admin bin/useradd bin/userdel bin/usermod bin/groupadd    \
 	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
 	    bin/vipw bin/vigr                                                  \
+	    bin/user_ssh bin/ssh bin/ssh-keygen bin/ssh-add bin/scp bin/sftp    \
 	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
 	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
 	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
@@ -5510,6 +5541,7 @@ clean:
 	       programs/user_tail/user_tail.o programs/user_tail/user_tail.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
+	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \
 	       programs/user_uniq/user_uniq.o programs/user_uniq/user_uniq.elf \
 	       programs/user_date/user_date.o programs/user_date/user_date.elf \
 	       programs/user_wget/user_wget.o programs/user_wget/user_wget.elf \
