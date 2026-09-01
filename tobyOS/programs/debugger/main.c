@@ -313,19 +313,14 @@ static void do_run(void) {
     if (pid < 0) { printf("fork failed\n"); return; }
     if (pid == 0) {
         pt(PTRACE_TRACEME, 0, 0, 0);
-        /* THE REAL execve SYSCALL, not libtoby's execvp.
-         *
-         * libtoby's exec family is exec_emulate(): it SPAWNS a new process,
-         * waits for it, and exits with its status. The calling process
-         * survives as a wrapper -- which is fine for a shell and fatal
-         * here. The traced child would have stayed a traced child sitting
-         * in waitpid while an UNTRACED grandchild ran the program, so the
-         * exec stop never happened and `run` waited for a stop that could
-         * not exist. ABI_SYS_EXECVE replaces THIS process, which is what
-         * being the tracee requires. */
-        extern char **environ;
-        sc4(ABI_SYS_EXECVE, (long)(uintptr_t)g_prog,
-            (long)(uintptr_t)g_argv, (long)(uintptr_t)environ, 0);
+        /* execvp REPLACES this process, which is what being the tracee
+         * requires -- the program has to run as the pid the tracer is
+         * watching. That was not always true: libtoby's exec used to spawn
+         * a child and wait for it, so a traced process that exec'd stayed
+         * a traced WRAPPER while an untraced grandchild ran the program,
+         * and the exec stop could not happen. Fixed in libtoby; this uses
+         * the ordinary call, and gets a PATH search with it. */
+        execvp(g_prog, g_argv);
         _exit(127);
     }
     g_target = pid;

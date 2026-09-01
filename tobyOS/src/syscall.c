@@ -4608,6 +4608,21 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
      *
      * The child is NOT reaped: it is stopped, not dead, and the tracer is
      * going to resume it. */
+    /* A PTRACE STOP IS REPORTED HERE TOO, and it was not before: the Linux
+     * personality's wait4 has always had this arm and the native waitpid
+     * never did, so a native tracer -- which /bin/gdb is -- saw a traced
+     * child as merely "still running".
+     *
+     * DELIBERATELY NARROW. An earlier version routed EVERY blocking wait
+     * through proc_wait_or_ptrace so that a blocking tracer would work
+     * too; that put a tracing feature in the path of every waitpid in the
+     * system and wedged unrelated things (the `at` runner, an FTP
+     * session). A tracer polls instead -- WNOHANG plus a yield, which is
+     * what /bin/gdb and /bin/strace both do -- and this stays a check that
+     * cannot affect an untraced child at all.
+     *
+     * The child is NOT reaped: it is stopped, not dead, and the tracer is
+     * going to resume it. */
     {
         struct proc *me = current_proc();
         struct proc *child = (pid > 0) ? proc_lookup(pid) : 0;
@@ -20970,6 +20985,22 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         /* Slice 64c: stamp the NATIVE syscall so BKL hold time attributes
          * to it (chromewin's GUI/blit calls live here). */
         if (caller) caller->cursys_nat = (int32_t)num;
+        /* NO PTRACE SYSCALL STOP ON THE NATIVE PATH, and that is a
+         * decision rather than an omission.
+         *
+         * It was tried. Parking a native tracee at every syscall boundary
+         * wedged the machine reproducibly -- with the BKL held, and still
+         * with the established drop/retake idiom around it. The native
+         * dispatcher is the hottest path in the kernel and it is reached
+         * from contexts the Linux path never is; making it safe to park
+         * there is its own piece of work, not a rider on a tracing tool.
+         *
+         * So `strace` traces LINUX-personality programs (busybox, bash,
+         * python3 -- where linux_syscall's stops have worked since the
+         * ptrace slice) and SAYS SO when handed a native binary, rather
+         * than attaching and printing nothing. Breakpoint debugging is
+         * unaffected: #BP/#DB stops come from the exception path, which is
+         * why /bin/gdb works on native programs. */
         rv = do_syscall(num, a1, a2, a3, a4, a5);
 #ifdef SYSDIAG_REGCHECK
         /* Check BEFORE the store that actually faulted, so the evidence is

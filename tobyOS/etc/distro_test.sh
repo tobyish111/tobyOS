@@ -381,4 +381,33 @@ echo @@gdb_nosym
 printf 'break no_such_symbol\nquit\n' > /tmp/gdbcmd2
 gdb /etc/dbg_test.elf < /tmp/gdbcmd2 2>&1 | grep -i "not defined" | head -1
 
+# --- exec really replaces the process -----------------------------------
+# `env CMD` execs CMD. libtoby used to SPAWN it and wait, so an `env`
+# process stayed alive alongside the command; a real exec leaves only the
+# command. Counting the processes is what tells the two apart.
+echo @@exec_replaces
+env sleep 20 &
+sleep 2
+echo "env wrappers: $(pgrep env | wc -l)"
+echo "sleep running: $(pgrep sleep | wc -l)"
+killall sleep 2>/dev/null
+
+# --- strace: real syscall tracing ---------------------------------------
+# /etc/dbg_test.elf is a NATIVE tobyOS program, so this exercises the
+# native-path syscall stops (the Linux path has always had them). Bounded,
+# because every traced syscall is two context switches.
+# /bin/arch is a busybox applet, so it runs under the LINUX personality --
+# which is where the kernel's syscall stops live. Bounded, because every
+# traced syscall is two context switches.
+echo @@strace_run
+timeout 40 strace /bin/arch 2>&1 | head -8
+echo @@strace_exit
+timeout 40 strace /bin/arch 2>&1 | grep "exited with" | head -1
+echo @@strace_count
+timeout 40 strace -c /bin/arch 2>&1 | head -16
+echo @@strace_native
+# A native binary is refused BY NAME rather than traced to no effect.
+strace /etc/dbg_test.elf 2>&1 | head -1
+strace /etc/dbg_test.elf > /dev/null 2>&1; echo rc=$?
+
 echo @@dt_END

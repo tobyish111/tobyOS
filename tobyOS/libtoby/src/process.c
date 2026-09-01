@@ -66,37 +66,44 @@ pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
 }
 
 /* ============================================================
- *  Exec emulation (Milestone 25C)
+ *  exec (Milestone 25C, made real 2026-09-01)
  * ============================================================ */
 
-/* spawn-then-wait-then-exit. Returns -1 with errno set on failure;
- * otherwise never returns (the synchronous "exec" semantics). */
-static int exec_emulate(const char *path, char *const argv[],
-                        char *const envp[]) {
-    /* The child must inherit THIS process's stdin, stdout and stderr.
-     * These were 0,0,0 -- so an exec'd child wrote its output to the
-     * caller's STDIN. Every redirection was silently lost: `vdir f1 |
-     * grep f1` sent the listing to the terminal and handed grep an
-     * empty pipe, which looks like the exec'd program produced
-     * nothing. Affects every user of execv/execve/execvp. */
-    pid_t pid = toby_spawn(path, argv, envp, 0, 1, 2);
-    if (pid < 0) return -1;
-    int status = 0;
-    pid_t rc = waitpid(pid, &status, 0);
-    if (rc < 0) return -1;
-    /* Mirror the child's outcome: exited normally -> _exit(code).
-     * Anything else collapses to a non-zero exit so the parent can
-     * still tell something went wrong (the kernel doesn't surface
-     * signal info today). */
-    if (WIFEXITED(status)) _exit(WEXITSTATUS(status));
-    _exit(WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 1);
-    /* unreachable */
-    return -1;
-}
-
+/* THIS USED TO BE AN EMULATION, and the difference is not cosmetic.
+ *
+ * exec_emulate() spawned a NEW process, waited for it, and exited with its
+ * status -- so the calling process survived as a wrapper and the program
+ * ran as its CHILD. For a shell running a command that is close enough to
+ * pass unnoticed, which is why it lasted. It is wrong for anything that
+ * cares which process is which:
+ *
+ *   * A traced child that exec'd stayed a traced child sitting in waitpid
+ *     while an UNTRACED grandchild ran the program. That is why the
+ *     debugger could not put a breakpoint in anything -- found the hard
+ *     way, over several boots, while the tracer looked like the broken
+ *     part.
+ *   * The pid changes, so anything holding the pre-exec pid (a supervisor,
+ *     a pidfile, a `kill`) is now pointing at a wrapper.
+ *   * Two processes exist where POSIX promises one, doubling the process
+ *     table cost of every exec.
+ *   * A setuid transition applies to the grandchild, not to the process
+ *     the caller believes it is.
+ *
+ * ABI_SYS_EXECVE (142) has been dispatched in the kernel all along; the
+ * header comment's premise ("without fork()") stopped being true when
+ * fork landed. On success this does not return, because the image is
+ * REPLACED. Descriptors survive it -- minus FD_CLOEXEC, which is the point
+ * of that flag and which the emulation could not honour because it never
+ * exec'd at all.
+ */
 int execve(const char *path, char *const argv[], char *const envp[]) {
     if (!path || !argv) { errno = EINVAL; return -1; }
-    return exec_emulate(path, argv, envp);
+    if (!envp) envp = environ;      /* execv/execvp pass environ; be safe */
+    long rv = toby_sc3(ABI_SYS_EXECVE, (long)(uintptr_t)path,
+                       (long)(uintptr_t)argv, (long)(uintptr_t)envp);
+    /* Only reached on failure: a successful execve never comes back. */
+    __toby_check(rv);
+    return -1;
 }
 
 int execv(const char *path, char *const argv[]) {

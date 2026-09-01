@@ -308,6 +308,27 @@ ck gdb_session "the first stop shows the argument"  'rdi 0x1'
 ck gdb_fixture "the target exits on its own"        'standalone rc=7'
 ck gdb_nosym   "an unknown symbol is refused"       'not defined'
 
+echo "=== exec replaces the process, rather than spawning one ==="
+# This is the check the old emulation could not have passed: it spawned the
+# command and waited, so the `env` process was still there.
+eq exec_replaces "no wrapper process is left behind" 'env wrappers: 0|sleep running: 1|'
+
+echo "=== strace: real syscall tracing ==="
+# The old /bin/strace traced nothing -- it called PTRACE_TRACEME on itself
+# and, when that failed, printed a canned transcript. None of these could
+# have passed against invented output, because they assert the calls this
+# particular program actually makes.
+ck strace_run    "syscalls are named, with arguments" '\((0x[0-9a-f]+, ){2}0x[0-9a-f]+\) = '
+# busybox writes through writev, not write -- the assertion has to name
+# the call the program actually makes.
+ck strace_run    "and the output write is among them" 'writev\('
+ck strace_run    "an ioctl on a pipe reports ENOTTY"  'ioctl.*errno 25'
+ck strace_exit   "the exit status is reported"        'exited with 0'
+ck strace_count  "-c totals the calls"                'total'
+# The honest half: a native binary has no syscall stops, and saying so
+# beats attaching and printing an empty trace.
+ck strace_native "a native binary is refused, with the reason"                  'native tobyOS program.*rc=[1-9]'
+
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"
 [ "$FAIL" = "0" ] || exit 1
