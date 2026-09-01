@@ -3508,6 +3508,42 @@ static void coreutils_selftest(void) {
         rc = proc_wait(pid);
         kprintf("[COREUTILS] util exit=%d\n", rc);
     }
+    argv[1] = (char *)"/etc/e2fs_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "e2fs-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] e2fs exit=%d\n", rc);
+    }
+    argv[1] = (char *)"/etc/gzip_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "gzip-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] gzip exit=%d\n", rc);
+    }
+    argv[1] = (char *)"/etc/compress_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "compress-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] compress exit=%d\n", rc);
+    }
     kprintf("[COREUTILS] VERDICT: DONE\n");
 }
 #endif /* COREUTILS_SELFTEST */
