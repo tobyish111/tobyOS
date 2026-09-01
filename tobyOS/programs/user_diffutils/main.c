@@ -1,7 +1,9 @@
-/* diff / cmp -- one multi-call binary, dispatching on argv[0].
+/* diff / cmp / sdiff / diff3 -- one multi-call binary, on argv[0].
  *
- *     diff [-bcilNqrsuw] [-U n] file1 file2
- *     cmp  [-ls] file1 file2
+ *     diff  [-bcilNqrsuw] [-U n] file1 file2
+ *     cmp   [-ls] file1 file2
+ *     sdiff [-bilw] [-w cols] file1 file2
+ *     diff3 [-e] file1 file2 file3
  *
  * Neither existed natively. busybox in this tree has both, but it is a
  * gitignored, opt-in Linux-ABI demo that is not part of the userland, so
@@ -416,6 +418,246 @@ static void diff_dirs(const char *da, const char *db) {
     closedir(d);
 }
 
+
+/* ------------------------------------------------------------- sdiff ----
+ *
+ * Side by side. The right-hand column starts at the first TAB STOP past
+ * (width-3)/2 -- measured against GNU sdiff across seven widths, which is
+ * where its otherwise puzzling column choices come from (w=40 puts it at
+ * 25, not 20). The padding itself is tabs, as GNU's is.
+ *
+ * NOT claimed as byte-identical to GNU: GNU mixes tabs and spaces before
+ * the marker in a way that does not follow from the width alone. The
+ * COLUMNS, the markers and the content match; the exact run of whitespace
+ * before the marker may not.
+ */
+
+static int sdiff_width = 130;
+
+static int next_tabstop(int col) {      /* stops at 1, 9, 17, ... */
+    int t = 1;
+    while (t <= col) t += 8;
+    return t;
+}
+
+static void sdiff_row(const char *l, const char *r, char marker) {
+    int half  = (sdiff_width - 3) / 2;
+    int rcol  = next_tabstop(half);
+    int mcol  = rcol - 2;
+
+    int col = 1;
+    if (l) {
+        for (const char *p = l; *p; p++) { putchar(*p); col++; }
+    }
+    /* Tabs up to the marker column, then spaces for the remainder. */
+    while (col < mcol) {
+        int nt = next_tabstop(col);
+        if (nt <= mcol) { putchar(9); col = nt; }
+        else            { putchar(' '); col++; }
+    }
+    if (marker != ' ') { putchar(marker); col++; }
+    while (col < rcol) {
+        int nt = next_tabstop(col);
+        if (nt <= rcol) { putchar(9); col = nt; }
+        else            { putchar(' '); col++; }
+    }
+    if (r) fputs(r, stdout);
+    putchar(10);
+}
+
+static int do_sdiff(const char *pa, const char *pb) {
+    struct filebuf A, B;
+    if (load(pa, &A) != 0) { fprintf(stderr, "sdiff: %s: No such file or directory" "\n", pa); return 2; }
+    if (load(pb, &B) != 0) { fprintf(stderr, "sdiff: %s: No such file or directory" "\n", pb); return 2; }
+    nedits = 0;
+    if (myers(&A, &B) != 0) {
+        fprintf(stderr, "sdiff: too many differences" "\n");
+        return 2;
+    }
+    int differ = 0;
+    size_t i = 0;
+    while (i < nedits) {
+        if (edits[i].op == OP_SAME) {
+            sdiff_row(A.line[edits[i].a], B.line[edits[i].b], ' ');
+            i++;
+            continue;
+        }
+        /* Pair up a run of deletions with the additions that follow, so a
+         * changed line shows as one row with `|` rather than as a delete
+         * and an add on separate rows. */
+        size_t d0 = i, nd = 0;
+        while (i < nedits && edits[i].op == OP_DEL) { nd++; i++; }
+        size_t a0 = i, na = 0;
+        while (i < nedits && edits[i].op == OP_ADD) { na++; i++; }
+        differ = 1;
+        size_t k = 0;
+        for (; k < nd && k < na; k++)
+            sdiff_row(A.line[edits[d0 + k].a], B.line[edits[a0 + k].b], '|');
+        for (; k < nd; k++) sdiff_row(A.line[edits[d0 + k].a], NULL, '<');
+        for (; k < na; k++) sdiff_row(NULL, B.line[edits[a0 + k].b], '>');
+    }
+    free(A.data); free(A.line); free(B.data); free(B.line);
+    return differ ? 1 : 0;
+}
+
+/* ------------------------------------------------------------- diff3 ----
+ *
+ * Aligns file1 and file3 against file2 (the classic MINE / OLDER / YOURS
+ * order) and reports every region where the three do not agree. A region
+ * is labelled ====N when only file N differs, and a bare ==== when all
+ * three disagree -- which is what a merge conflict is.
+ */
+
+/* For each line of the base, the matching line in `other`, or -1. */
+static int *align(struct filebuf *base, struct filebuf *other) {
+    int *map = (int *)malloc((base->nlines + 1) * sizeof(int));
+    if (!map) return NULL;
+    for (size_t i = 0; i <= base->nlines; i++) map[i] = -1;
+    nedits = 0;
+    if (myers(base, other) != 0) { free(map); return NULL; }
+    for (size_t k = 0; k < nedits; k++)
+        if (edits[k].op == OP_SAME) map[edits[k].a] = (int)edits[k].b;
+    return map;
+}
+
+static void d3_range(const char *label, long lo, long hi) {
+    /* lo/hi are 0-based and inclusive; an empty region prints as `a` at
+     * the line BEFORE it, which is how diff3 says "append here". */
+    if (hi < lo) printf("%s:%lda" "\n", label, lo);
+    else if (hi == lo) printf("%s:%ldc" "\n", label, lo + 1);
+    else printf("%s:%ld,%ldc" "\n", label, lo + 1, hi + 1);
+}
+
+static void d3_text(struct filebuf *f, long lo, long hi) {
+    for (long k = lo; k <= hi && k < (long)f->nlines; k++)
+        printf("  %s" "\n", f->line[k]);
+}
+
+
+/* Do the two spans hold the same lines? Used to decide which two of the
+ * three files agree in a region. */
+static int same_span(struct filebuf *A, long alo, long ahi,
+                     struct filebuf *B, long blo, long bhi) {
+    if (ahi - alo != bhi - blo) return 0;
+    for (long k = 0; k <= ahi - alo; k++) {
+        long i = alo + k, j = blo + k;
+        if (i < 0 || j < 0 || i >= (long)A->nlines || j >= (long)B->nlines) return 0;
+        if (strcmp(A->line[i], B->line[j])) return 0;
+    }
+    return 1;
+}
+
+static int do_diff3(const char *p1, const char *p2, const char *p3) {
+    struct filebuf F1, F2, F3;
+    if (load(p1, &F1) != 0 || load(p2, &F2) != 0 || load(p3, &F3) != 0) {
+        fprintf(stderr, "diff3: cannot read one of the files" "\n");
+        return 2;
+    }
+    int *m1 = align(&F2, &F1);      /* base line -> file1 line, or -1 */
+    int *m3 = align(&F2, &F3);      /* base line -> file3 line, or -1 */
+    if (!m1 || !m3) {
+        fprintf(stderr, "diff3: files are too different to align" "\n");
+        free(m1); free(m3);
+        return 2;
+    }
+
+    int any = 0;
+    size_t i = 0;
+    while (i < F2.nlines) {
+        if (m1[i] >= 0 && m3[i] >= 0) { i++; continue; }
+        /* A region begins here and runs while either side is unmatched. */
+        size_t lo = i;
+        while (i < F2.nlines && (m1[i] < 0 || m3[i] < 0)) i++;
+        size_t hi = i - 1;
+
+        /* The corresponding spans in files 1 and 3 lie between the nearest
+         * matched lines on either side. */
+        long a_lo = 0, c_lo = 0;
+        for (long k = (long)lo - 1; k >= 0; k--) {
+            if (m1[k] >= 0 && a_lo == 0) a_lo = m1[k] + 1;
+            if (m3[k] >= 0 && c_lo == 0) c_lo = m3[k] + 1;
+            if (a_lo && c_lo) break;
+        }
+        long a_hi = (long)F1.nlines - 1, c_hi = (long)F3.nlines - 1;
+        for (size_t k = hi + 1; k < F2.nlines; k++) {
+            if (m1[k] >= 0) { a_hi = m1[k] - 1; break; }
+        }
+        for (size_t k = hi + 1; k < F2.nlines; k++) {
+            if (m3[k] >= 0) { c_hi = m3[k] - 1; break; }
+        }
+
+        /* Which of the three is the odd one out? */
+        int one_differs = 0, three_differs = 0;
+        for (size_t k = lo; k <= hi; k++) {
+            if (m1[k] < 0) one_differs = 1;
+            if (m3[k] < 0) three_differs = 1;
+        }
+
+        any = 1;
+
+        /* diff3 prints the two files that AGREE as one block -- their
+         * ranges consecutively, then the text once -- and the block
+         * containing file 1 comes first. That is why ====2 reads
+         * "1: 3: <text> 2: <text>" while ====1 reads "1: <text> 2: 3:
+         * <text>": it is not numeric order, it is grouping. */
+        long lo1 = a_lo, hi1 = a_hi;
+        long lo2 = (long)lo, hi2 = (long)hi;
+        long lo3 = c_lo, hi3 = c_hi;
+        struct filebuf *fb[3] = { &F1, &F2, &F3 };
+        long los[3] = { lo1, lo2, lo3 };
+        long his[3] = { hi1, hi2, hi3 };
+
+        int same13 = same_span(&F1, lo1, hi1, &F3, lo3, hi3);
+        int same12 = same_span(&F1, lo1, hi1, &F2, lo2, hi2);
+        int same23 = same_span(&F2, lo2, hi2, &F3, lo3, hi3);
+
+        int g[2][3], gn[2] = {0, 0};
+        if (same23 && !same12) {                 /* 2 and 3 agree: odd is 1 */
+            printf("====1" "\n");
+            g[0][gn[0]++] = 0;
+            g[1][gn[1]++] = 1; g[1][gn[1]++] = 2;
+        } else if (same13 && !same12) {          /* 1 and 3 agree: odd is 2 */
+            printf("====2" "\n");
+            g[0][gn[0]++] = 0; g[0][gn[0]++] = 2;
+            g[1][gn[1]++] = 1;
+        } else if (same12 && !same13) {          /* 1 and 2 agree: odd is 3 */
+            printf("====3" "\n");
+            g[0][gn[0]++] = 0; g[0][gn[0]++] = 1;
+            g[1][gn[1]++] = 2;
+        } else {                                  /* all three disagree */
+            printf("====" "\n");
+            g[0][gn[0]++] = 0;
+            g[1][gn[1]++] = 1;
+            /* a third group; handled by the loop below via gn[1] */
+            g[1][gn[1]++] = -2;                   /* sentinel: break after 2 */
+        }
+
+        if (gn[1] == 2 && g[1][1] == -2) {
+            /* Conflict: each file on its own, in order. */
+            static const char *nm[3] = { "1", "2", "3" };
+            for (int k = 0; k < 3; k++) {
+                d3_range(nm[k], los[k], his[k]);
+                d3_text(fb[k], los[k], his[k]);
+            }
+        } else {
+            static const char *nm[3] = { "1", "2", "3" };
+            for (int grp = 0; grp < 2; grp++) {
+                for (int k = 0; k < gn[grp]; k++)
+                    d3_range(nm[g[grp][k]], los[g[grp][k]], his[g[grp][k]]);
+                int first = g[grp][0];
+                d3_text(fb[first], los[first], his[first]);
+            }
+        }
+    }
+
+    free(m1); free(m3);
+    free(F1.data); free(F1.line);
+    free(F2.data); free(F2.line);
+    free(F3.data); free(F3.line);
+    (void)any;
+    return 0;   /* GNU reserves 1 for merge conflicts, 2 for trouble */
+}
+
 /* ------------------------------------------------------------------ cmp */
 
 /* GNU quotes the name, and says "which is empty" rather than
@@ -463,7 +705,9 @@ int main(int argc, char **argv) {
     const char *base = argv[0] ? argv[0] : "diff";
     for (const char *p = base; *p; p++) if (*p == '/') base = p + 1;
     prog = base;
-    int is_cmp = !strcmp(base, "cmp");
+    int is_cmp   = !strcmp(base, "cmp");
+    int is_sdiff = !strcmp(base, "sdiff");
+    int is_diff3 = !strcmp(base, "diff3");
 
     int files[8], nf = 0;
     for (int i = 1; i < argc; i++) {
@@ -488,7 +732,15 @@ int main(int argc, char **argv) {
                 case 'r': rflag = 1; break;
                 case 's': sflag = 1; break;
                 case 'u': uflag = 1; break;
-                case 'w': wflag = 1; break;
+                case 'w':
+                    /* sdiff -w takes a COLUMN COUNT; diff -w means "ignore\n* all whitespace". Same letter, different tools. */
+                    if (is_sdiff) {
+                        const char *v = p[1] ? p + 1 : (i + 1 < argc ? argv[++i] : NULL);
+                        if (v) sdiff_width = atoi(v);
+                        if (sdiff_width < 20) sdiff_width = 20;
+                        p = ""; p--;
+                    } else wflag = 1;
+                    break;
                 case 'c': uflag = 1; break;   /* context: unified is close enough
                                                * and is what everything reads */
                 default:
@@ -508,6 +760,14 @@ int main(int argc, char **argv) {
     const char *pa = argv[files[0]], *pb = argv[files[1]];
 
     if (is_cmp) return do_cmp(pa, pb);
+    if (is_sdiff) return do_sdiff(pa, pb);
+    if (is_diff3) {
+        if (nf < 3) {
+            fprintf(stderr, "usage: diff3 file1 file2 file3\n");
+            return 2;
+        }
+        return do_diff3(pa, pb, argv[files[2]]);
+    }
 
     struct stat sa, sb;
     if (rflag || (stat(pa, &sa) == 0 && S_ISDIR(sa.st_mode) &&

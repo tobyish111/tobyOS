@@ -19,6 +19,7 @@
 static char *g_lines[MAX_LINES];
 static int g_nlines;
 static int g_top;
+static int g_is_more;   /* invoked as `more`: cat when piped, stop at EOF */
 static int g_rows = DEFAULT_ROWS;
 static int g_cols = DEFAULT_COLS;
 static char g_search[256];
@@ -214,11 +215,18 @@ static void clamp_top(void) {
 }
 
 int main(int argc, char **argv) {
+    const char *base = argv[0] ? argv[0] : "less";
+    for (const char *q = base; *q; q++) if (*q == 47) base = q + 1;
+    g_is_more = !strcmp(base, "more");
+    int start_line = 0;
+
     int show_lines = 1;
     const char *path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-N") == 0) show_lines = 0;
+        else if (argv[i][0] == '+' && argv[i][1] >= '0' && argv[i][1] <= '9')
+            start_line = atoi(argv[i] + 1) - 1;   /* more +N starts at line N */
         else if (argv[i][0] != '-') path = argv[i];
     }
     (void)show_lines;
@@ -230,11 +238,20 @@ int main(int argc, char **argv) {
     }
 
     if (g_nlines == 0) return 0;
+    if (start_line > 0) g_top = start_line < g_nlines ? start_line : g_nlines - 1;
+
+    /* Not a terminal: more copies its input through, which is what makes
+     * `cmd | more > file` and `more f | grep x` behave at all. */
+    if (g_is_more && !isatty(1)) {
+        for (int k = g_top; k < g_nlines; k++)
+            printf("%s\n", g_lines[k]);
+        return 0;
+    }
 
     int visible = g_rows - 1;
-    if (g_nlines <= visible) {
-        for (int i = 0; i < g_nlines; i++)
-            printf("%s\n", g_lines[i]);
+    if (g_nlines - g_top <= visible) {
+        for (int k = g_top; k < g_nlines; k++)
+            printf("%s\n", g_lines[k]);
         return 0;
     }
 

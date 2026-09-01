@@ -133,4 +133,86 @@ cmp d1.txt d1.txt; echo rc=$?
 echo @@cmp_differ
 cmp d1.txt d2.txt; echo rc=$?
 
+# --- sdiff, diff3, more -------------------------------------------------
+printf 'a\nb\nc\nd\n' > x1
+printf 'a\nB\nc\nd\n' > x2
+printf 'a\nb\nc\nD\n' > x3
+echo @@sdiff_changed
+sdiff -w 40 x1 x2 | tr '\t' ' ' | sed -E 's/[ ]+/ /g; s/ $//'
+echo @@sdiff_added
+printf 'a\nb\n' > y1; printf 'a\nb\nc\n' > y2
+sdiff -w 40 y1 y2 | tr '\t' ' ' | sed -E 's/[ ]+/ /g; s/ $//'
+echo @@diff3_middle
+diff3 x1 x2 x3; echo rc=$?
+echo @@diff3_conflict
+printf 'a\nX\nc\n' > k1; printf 'a\nb\nc\n' > k2; printf 'a\nY\nc\n' > k3
+diff3 k1 k2 k3
+echo @@more_piped
+more x1
+echo @@more_plusN
+more +3 x1
+
+# --- patch ---------------------------------------------------------------
+i=1; : > pb; while [ $i -le 12 ]; do echo $i >> pb; i=$((i+1)); done
+sed '5s/^/CHANGED/' pb > pm
+diff -u pb pm > p.patch
+echo @@patch_unified
+cp pb pt; patch pt < p.patch >/dev/null 2>&1; echo rc=$?; sed -n '5p' pt
+echo @@patch_reverse
+patch -R pt < p.patch >/dev/null 2>&1; echo rc=$?; sed -n '5p' pt
+echo @@patch_offset
+{ echo x; echo x; cat pb; } > pd
+patch pd < p.patch 2>&1 | grep -o 'offset [0-9-]* line[s]*'; sed -n '7p' pd
+echo @@patch_reject
+printf 'nothing\nlike\nit\n' > pr
+rm -f pr.rej
+patch pr < p.patch >/dev/null 2>&1; echo rc=$?
+echo "rej exists: $([ -f pr.rej ] && echo yes || echo no)"
+echo "unchanged: $(head -1 pr)"
+echo @@patch_dryrun
+cp pb pdry; patch --dry-run pdry < p.patch >/dev/null 2>&1
+echo "still original: $(sed -n '5p' pdry)"
+
+# --- locate / updatedb ---------------------------------------------------
+mkdir -p /tmp/lctest/deep
+echo hi > /tmp/lctest/findme.txt
+echo hi > /tmp/lctest/deep/buried.log
+echo @@locate_build
+updatedb -U /tmp/lctest -o /tmp/lc.db -v
+echo @@locate_find
+locate -d /tmp/lc.db findme
+echo @@locate_deep
+locate -d /tmp/lc.db buried
+echo @@locate_glob
+locate -d /tmp/lc.db "*.log"
+echo @@locate_count
+locate -d /tmp/lc.db -c hi_nothing_matches_this; locate -d /tmp/lc.db -c findme
+echo @@locate_basename
+locate -d /tmp/lc.db -b findme.txt
+echo @@locate_nodb
+locate -d /tmp/nosuch.db findme 2>&1; echo rc=$?
+
+# --- rm -f and ln --------------------------------------------------------
+echo @@rm_force_missing
+rm -f /tmp/definitely_not_there 2>&1; echo rc=$?
+echo @@rm_force_real
+echo x > /tmp/rmme; rm -f /tmp/rmme; echo "gone: $([ -f /tmp/rmme ] && echo no || echo yes)"; echo rc=$?
+echo @@rm_no_force
+rm /tmp/definitely_not_there > /tmp/rmerr 2>&1; echo rc=$?; head -1 /tmp/rmerr
+echo @@ln_hard
+echo content > /tmp/lnsrc
+rm -f /tmp/lnhard; ln /tmp/lnsrc /tmp/lnhard 2>&1; echo rc=$?
+echo @@ln_sym
+# `ln -s` is checked by READLINK, not by reading through the link. On tmpfs
+# a symlink goes into the VFS's in-RAM table, and vfs_resolve_path() -- the
+# only thing that consults that table -- has NO CALLERS, so open() never
+# follows it. That is a VFS gap, not something ln can fix; what ln is
+# responsible for is creating the link the right way round.
+rm -f /tmp/lnsym; ln -s /tmp/lnsrc /tmp/lnsym; echo rc=$?
+echo "readlink says: $(readlink /tmp/lnsym 2>&1)"
+echo @@ln_force
+ln -sf /tmp/lnsrc /tmp/lnsym; echo rc=$?
+echo @@ln_basename
+cd /tmp; rm -f lnsrc2; echo two > /tmp/dir_target 2>/dev/null; ln -s /tmp/lnsrc; echo rc=$?; cat /tmp/lnsrc
+
 echo @@compress_END

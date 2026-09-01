@@ -554,6 +554,9 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_sed/user_sed.elf \
             programs/user_procnet/user_procnet.elf \
             programs/user_power/user_power.elf \
+            programs/user_patch/user_patch.elf \
+            programs/user_locate/user_locate.elf \
+            programs/user_ln/user_ln.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1783,6 +1786,9 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_zutils,user_zutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sed,user_sed))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_procnet,user_procnet))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_power,user_power))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_patch,user_patch))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_locate,user_locate))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3103,7 +3109,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_gzip/user_gzip.elf             $(INITRD_STAGE)/bin/gzip
 	cp programs/user_diffutils/user_diffutils.elf   $(INITRD_STAGE)/bin/diff
 	@# diff/cmp, one binary dispatched on argv[0]
-	@for ap in cmp; do \
+	@for ap in cmp sdiff diff3; do \
 	    ln -f $(INITRD_STAGE)/bin/diff "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/diff "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3117,6 +3123,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_sed/user_sed.elf              $(INITRD_STAGE)/bin/sed
 	cp programs/user_procnet/user_procnet.elf      $(INITRD_STAGE)/bin/vmstat
 	cp programs/user_power/user_power.elf          $(INITRD_STAGE)/bin/shutdown
+	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
+	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
+	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
+	@# the indexer is the same binary under its other name
+	@ln -f $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb 2>/dev/null || \
+	   cp $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb
 	@# power control, one binary dispatched on argv[0]
 	@for ap in poweroff halt reboot; do \
 	    ln -f $(INITRD_STAGE)/bin/shutdown "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
@@ -3207,6 +3219,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/lua/lua.elf                         $(INITRD_STAGE)/bin/lua
 	cp programs/make/make.elf                       $(INITRD_STAGE)/bin/make
 	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/less
+	@# the same pager, dispatching on argv[0]: more cats when piped
+	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/more
 	cp programs/curl/curl.elf                       $(INITRD_STAGE)/bin/curl
 	cp programs/tcc/tcc.elf                         $(INITRD_STAGE)/bin/tcc
 	cp programs/as/as.elf                           $(INITRD_STAGE)/bin/as
@@ -3896,7 +3910,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/services bin/svc_crasher bin/stabilitytest                    \
 	    bin/hwinfo bin/drvmatch bin/hwcompat bin/hwreport bin/compattest  \
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
-    bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
+    bin/lua bin/make bin/less bin/more bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep bin/rgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
@@ -3912,7 +3926,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/vipw bin/vigr                                                  \
 	    bin/user_ssh bin/ssh bin/ssh-keygen bin/ssh-add bin/scp bin/sftp    \
 	    bin/gzip bin/gunzip bin/zcat bin/gzcat bin/uncompress            \
-	    bin/diff bin/cmp                                                 \
+	    bin/diff bin/cmp bin/sdiff bin/diff3                                                 \
 	    bin/bzip2 bin/bunzip2 bin/bzcat bin/zgrep bin/zegrep bin/zfgrep    \
 	    bin/zdiff bin/zcmp bin/zless bin/zmore bin/gzexe bin/lesspipe      \
 	    bin/bzgrep bin/bzegrep bin/bzfgrep bin/bzdiff bin/bzcmp            \
@@ -3920,7 +3934,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/sed                                                          \
 	    bin/vmstat bin/tload bin/slabtop bin/skill bin/snice bin/ss       \
 	    bin/bridge bin/tracepath                                          \
-	    bin/shutdown bin/poweroff bin/halt bin/reboot                     \
+	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5673,6 +5687,9 @@ clean:
 	       programs/user_sed/user_sed.o programs/user_sed/user_sed.elf \
 	       programs/user_procnet/user_procnet.o programs/user_procnet/user_procnet.elf \
 	       programs/user_power/user_power.o programs/user_power/user_power.elf \
+	       programs/user_patch/user_patch.o programs/user_patch/user_patch.elf \
+	       programs/user_locate/user_locate.o programs/user_locate/user_locate.elf \
+	       programs/user_ln/user_ln.o programs/user_ln/user_ln.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

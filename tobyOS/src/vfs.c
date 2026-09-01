@@ -1031,6 +1031,10 @@ int vfs_create(const char *path) {
     return crc;
 }
 
+/* Defined with the symlink table further down; declared here because
+ * vfs_unlink needs it and the table's struct is not visible yet. */
+static int symlink_table_remove(const char *path);
+
 int vfs_unlink(const char *path) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
@@ -1055,6 +1059,15 @@ int vfs_unlink(const char *path) {
     if (parent_path(path, par, sizeof(par)) == VFS_OK) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
+    }
+    /* A symlink held in the in-RAM table has no backing file for the
+     * filesystem to unlink, and nothing here ever looked in the table --
+     * so such a link could be CREATED but never removed, and `ln -sf`
+     * over one failed with EEXIST forever. Checked after the permission
+     * work above so removing a link is as guarded as removing a file. */
+    if (symlink_table_remove(path)) {
+        vfs_notify(path, VFS_IN_DELETE, 0);
+        return VFS_OK;
     }
     int urc = m->ops->unlink(m->data, rel);
     if (urc == VFS_OK) {
@@ -1490,6 +1503,15 @@ static struct vfs_symlink_entry *symlink_find(const char *path) {
             return &g_symlinks[i];
     }
     return 0;
+}
+
+static int symlink_table_remove(const char *path) {
+    struct vfs_symlink_entry *e = symlink_find(path);
+    if (!e) return 0;
+    e->used = false;
+    e->path[0] = 0;
+    e->target[0] = 0;
+    return 1;
 }
 
 int vfs_symlink(const char *path, const char *target) {

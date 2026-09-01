@@ -9,10 +9,17 @@
 
 static int recursive = 0;
 static int verbose = 0;
+/* -f was missing entirely, and `rm -f` is one of the commonest lines in
+ * any shell script: it means "remove it, and a file that is not there is
+ * not an error". Without it every `rm -f x` printed a diagnostic and
+ * exited 1 when x did not exist -- precisely the case it exists to make
+ * quiet. */
+static int force = 0;
 
 static int remove_path(const char *path) {
     struct stat st;
     if (stat(path, &st) < 0) {
+        if (force) return 0;      /* not there is not a failure under -f */
         fprintf(stderr, "rm: cannot stat '%s': %s\n", path, strerror(errno));
         return 1;
     }
@@ -51,6 +58,7 @@ static int remove_path(const char *path) {
     }
 
     if (unlink(path) < 0) {
+        if (force) return 0;
         fprintf(stderr, "rm: cannot remove '%s': %s\n", path, strerror(errno));
         return 1;
     }
@@ -60,18 +68,23 @@ static int remove_path(const char *path) {
 
 int main(int argc, char **argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "rv")) != -1) {
+    while ((opt = getopt(argc, argv, "rRfvi")) != -1) {
         switch (opt) {
-        case 'r': recursive = 1; break;
+        case 'r': case 'R': recursive = 1; break;
+        case 'f': force = 1; break;
+        case 'i': break;   /* prompting needs a terminal we may not have */
         case 'v': verbose = 1; break;
         default:
-            fprintf(stderr, "usage: rm [-r] [-v] path...\n");
+            fprintf(stderr, "usage: rm [-rRfvi] path...\n");
             return 1;
         }
     }
 
     if (optind >= argc) {
-        fprintf(stderr, "usage: rm [-r] [-v] path...\n");
+        /* `rm -f` with nothing to remove succeeds, which is what lets
+         * `rm -f $MAYBE_EMPTY` appear unguarded in a script. */
+        if (force) return 0;
+        fprintf(stderr, "usage: rm [-rRfvi] path...\n");
         return 1;
     }
 

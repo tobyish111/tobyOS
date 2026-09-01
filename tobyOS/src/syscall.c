@@ -5362,12 +5362,24 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     /* ---- Phase 1 M1.5: Enhanced VFS ---- */
 
     case ABI_SYS_SYMLINK: {
-        char kpath[ABI_PATH_MAX], ktarget[ABI_PATH_MAX];
-        if (!user_str_in(kpath, sizeof(kpath),
-                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        /* POSIX order is symlink(TARGET, LINKPATH): a1 is what the link
+         * points at, a2 is the link to create. vfs_symlink() takes them the
+         * other way round -- link first -- and this passed them STRAIGHT
+         * THROUGH, so every native symlink() ever made created a link named
+         * after the TARGET, pointing at the link name. It returned success
+         * while doing it. Nothing had noticed because no native program
+         * called symlink() until `ln` was written; the Linux compat path
+         * (LX_symlink) had it right all along, and this now matches it --
+         * including resolving a relative link path against the caller's
+         * cwd, which vfs_symlink cannot do for itself (it rejects any path
+         * that does not start with '/'). */
+        char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
         if (!user_str_in(ktarget, sizeof(ktarget),
-                         (const char *)(uintptr_t)a2)) return -ABI_EFAULT;
-        int rc = vfs_symlink(kpath, ktarget);
+                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        int rr = resolve_user_path((const char *)(uintptr_t)a2,
+                                   klink, sizeof klink);
+        if (rr) return rr;
+        int rc = vfs_symlink(klink, ktarget);
         if (rc == VFS_OK) return 0;
         if (rc == VFS_ERR_EXIST) return -ABI_EEXIST;
         if (rc == VFS_ERR_NOSPC) return -ABI_ENOSPC;
@@ -5378,8 +5390,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         char *buf        = (char *)(uintptr_t)a2;
         size_t bufsz     = (size_t)a3;
         char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
-        if (!user_str_in(kpath, sizeof(kpath),
-                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        /* Resolved against the cwd for the same reason as symlink above:
+         * vfs_readlink only understands absolute paths. */
+        { int rr = resolve_user_path((const char *)(uintptr_t)a1,
+                                     kpath, sizeof kpath);
+          if (rr) return rr; }
         if (!buf || bufsz == 0) return -ABI_EFAULT;
         if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
         memset(ktmp, 0, sizeof ktmp);          /* slice 86: see LX_readlink */

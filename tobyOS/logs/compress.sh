@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# compress.sh -- bzip2, the z*/bz* wrappers, and diff/cmp.
+# compress.sh -- bzip2 and the z*/bz* wrappers, plus the file and text
+# tools that share this boot: diff, cmp, sdiff, diff3, more, patch,
+# locate and updatedb. They live here because one boot is six minutes
+# and they have no reason to need their own.
 #
 #   bash logs/compress.sh
 #
@@ -120,6 +123,56 @@ eq diff_brief      "-q names the files"  'Files d1.txt and d2.txt differ|rc=1|'
 eq diff_ignorecase "-i ignores case"     'rc=0|'
 eq cmp_same        "cmp on identical"    'rc=0|'
 eq cmp_differ      "cmp reports byte and line" 'd1.txt d2.txt differ: char 7, line 2|rc=1|'
+
+echo "=== sdiff, diff3 and more ==="
+# sdiff pads with tabs; the guest normalises them away, so what is compared
+# is the CONTENT and the MARKERS. GNU mixes tabs and spaces before the
+# marker in a way that does not follow from the width alone, so byte
+# identity of the padding is not claimed -- the columns and markers are.
+eq sdiff_changed  "sdiff marks a changed line with |"  'a a|b | B|c c|d d|'
+eq sdiff_added    "sdiff marks an added line with >"   'a a|b b| > c|'
+eq diff3_middle   "diff3 groups the two files that agree"                   '====2|1:2c|3:2c|  b|2:2c|  B|====3|1:4c|2:4c|  d|3:4c|  D|rc=0|'
+eq diff3_conflict "diff3 reports a three-way conflict"                   '====|1:2c|  X|2:2c|  b|3:2c|  Y|'
+eq more_piped     "more cats when stdout is not a tty" 'a|b|c|d|'
+eq more_plusN     "more +N starts at that line"        'c|d|'
+
+
+echo "=== patch ==="
+eq patch_unified "applies a unified diff"          'rc=0|CHANGED5|'
+eq patch_reverse "-R undoes it"                    'rc=0|5|'
+eq patch_offset  "finds a hunk the file has moved" 'offset 2 lines|CHANGED5|'
+# The important one: a hunk that matches nowhere must be REJECTED, with the
+# file untouched, not forced into place.
+eq patch_reject  "rejects a hunk that matches nowhere"                  'rc=1|rej exists: yes|unchanged: nothing|'
+eq patch_dryrun  "--dry-run leaves the file alone"  'still original: 5|'
+
+
+echo "=== locate / updatedb ==="
+ck locate_build    "updatedb indexes a tree"     'indexed [0-9]+ paths'
+ck locate_find     "locate finds a file"         'findme.txt'
+ck locate_deep     "and one nested deeper"       'deep/buried.log'
+ck locate_glob     "a glob pattern"              'buried.log'
+eq locate_count    "-c counts, and 0 is not a match" '0|1|'
+ck locate_basename "-b matches the basename"     'findme.txt'
+ck locate_nodb     "a missing database says run updatedb" 'run updatedb first.*rc=[1-9]'
+
+
+echo "=== rm -f and ln, neither of which existed ==="
+# `rm -f x` on a missing file must be SILENT and succeed -- that is the
+# entire reason the flag exists, and rm had no -f at all.
+eq rm_force_missing "rm -f on a missing file is silent and succeeds" 'rc=0|'
+ck rm_force_real    "rm -f still removes what is there"  'gone: yes\|rc=0'
+ck rm_no_force      "without -f a missing file is an error" 'rc=[1-9].*cannot stat'
+# tobyfs has no hard links; ln must SAY that rather than fail obscurely.
+ck ln_hard          "ln says hard links are unimplemented" 'hard links are not implemented.*rc=[1-9]'
+# The link must point at the TARGET, not the other way round: the native
+# symlink() syscall passed POSIX's (target, linkpath) straight into
+# vfs_symlink(link, target) and built every link backwards, returning
+# success while doing it.
+ck ln_sym           "ln -s makes a link pointing AT the target"                     'rc=0\|readlink says: /tmp/lnsrc'
+ck ln_force         "ln -sf replaces an existing link" 'rc=0\|'
+ck ln_basename      "ln -s with no linkname uses the basename" 'rc=[0-9]'
+
 
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
