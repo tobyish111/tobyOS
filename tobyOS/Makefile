@@ -562,6 +562,12 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_tar/user_tar.elf \
             programs/user_textutils/user_textutils.elf \
             programs/user_zstd/user_zstd.elf \
+            programs/user_zip/user_zip.elf \
+            programs/user_dig/user_dig.elf \
+            programs/user_strip/user_strip.elf \
+            programs/user_at/user_at.elf \
+            programs/user_setpci/user_setpci.elf \
+            programs/user_systemctl/user_systemctl.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1026,6 +1032,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/bzip2.c \
                    $(LIBTOBY_SRC)/bzip2_enc.c \
                    $(LIBTOBY_SRC)/zstd.c \
+                   $(LIBTOBY_SRC)/lzw.c \
                    $(LIBTOBY_SRC)/md5sha1.c \
                    $(LIBTOBY_SRC)/render.c \
                    $(LIBTOBY_SRC)/clipboard_ext.c \
@@ -1800,6 +1807,11 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_textutils,user_textutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_zstd,user_zstd))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_dig,user_dig))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_strip,user_strip))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_at,user_at))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_setpci,user_setpci))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_systemctl,user_systemctl))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -1848,6 +1860,23 @@ programs/user_tar/user_tar.elf: programs/user_tar/user_tar.o \
 	$(LD) $(PROG_LDFLAGS) -T programs/user_tar/program.ld -o $@ \
 	      $(LIBTOBY_CRT0) programs/user_tar/user_tar.o \
 	      programs/user_tar/puff.o $(LIBTOBY_AR)
+
+# zip stores a BARE deflate stream per entry, so it links the same shared
+# inflater tar and gzip do -- src/puff.c, which grew puff_inflate_raw() for
+# exactly this. The encoder side is libtoby's deflate_raw().
+programs/user_zip/user_zip.o: programs/user_zip/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_zip/puff.o: src/puff.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_zip/user_zip.elf: programs/user_zip/user_zip.o \
+                                programs/user_zip/puff.o \
+                                $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                programs/user_zip/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_zip/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_zip/user_zip.o \
+	      programs/user_zip/puff.o $(LIBTOBY_AR)
 
 # ---------- Browser application ----------
 
@@ -3160,6 +3189,26 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
 	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
 	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
+	cp programs/user_zip/user_zip.elf               $(INITRD_STAGE)/bin/zip
+	cp programs/user_dig/user_dig.elf               $(INITRD_STAGE)/bin/dig
+	cp programs/user_strip/user_strip.elf           $(INITRD_STAGE)/bin/strip
+	cp programs/user_at/user_at.elf                 $(INITRD_STAGE)/bin/at
+	cp programs/user_setpci/user_setpci.elf         $(INITRD_STAGE)/bin/setpci
+	cp programs/user_systemctl/user_systemctl.elf   $(INITRD_STAGE)/bin/systemctl
+	@# systemctl/service, one binary dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service"
+	@# the at family, one binary dispatched on argv[0]
+	@for ap in batch atq atrm; do \
+	    ln -f $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	@# dig/host, one resolver dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host"
+	@# zip/unzip, one binary dispatched on argv[0]
+	@ln -f $(INITRD_STAGE)/bin/zip "$(INITRD_STAGE)/bin/unzip" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/zip "$(INITRD_STAGE)/bin/unzip"
 	@# zstd family, one binary dispatched on argv[0]
 	@for ap in unzstd zstdcat; do \
 	    ln -f $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
@@ -3169,7 +3218,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# twenty more names that were busybox applets, one binary
 	@for ap in expand unexpand fold nl od hexdump paste rev shuf split \
 	           readlink realpath mktemp groups hostname chown killall \
-	           mount umount; do \
+	           mount umount domainname getent; do \
 	    ln -f $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3201,7 +3250,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	      cp $(INITRD_STAGE)/bin/zgrep "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	@# gzip family, one binary dispatched on argv[0]
-	@for ap in gunzip zcat gzcat uncompress; do \
+	@for ap in gunzip zcat gzcat uncompress compress; do \
 	    ln -f $(INITRD_STAGE)/bin/gzip "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/gzip "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3212,7 +3261,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	done
 	@# util-linux tools, one binary dispatched on argv[0]
 	@for ap in column colrm col rename whereis namei uuidgen setterm \
-	           lsblk findmnt lsns wdctl prlimit lslocks lsipc zramctl; do \
+	           lsblk findmnt lsns wdctl prlimit lslocks lsipc zramctl \
+	           mkfs; do \
 	    ln -f $(INITRD_STAGE)/bin/user_util "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/user_util "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3239,10 +3289,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/gnumade.gz                               $(INITRD_STAGE)/etc/gnumade.gz
 	cp etc/gnubadcrc.gz                             $(INITRD_STAGE)/etc/gnubadcrc.gz
 	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
+	cp etc/distro_test.sh                           $(INITRD_STAGE)/etc/distro_test.sh
 	cp etc/gnumade.bz2                              $(INITRD_STAGE)/etc/gnumade.bz2
 	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
 	cp etc/gnumade.zst                              $(INITRD_STAGE)/etc/gnumade.zst
 	cp etc/gnubadzst.zst                            $(INITRD_STAGE)/etc/gnubadzst.zst
+	cp etc/gnumade.zip                              $(INITRD_STAGE)/etc/gnumade.zip
+	cp etc/gnubadzip.zip                            $(INITRD_STAGE)/etc/gnubadzip.zip
 	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
 	cp etc/procnet_test.sh                          $(INITRD_STAGE)/etc/procnet_test.sh
 	cp etc/power_test.sh                            $(INITRD_STAGE)/etc/power_test.sh
@@ -3260,6 +3313,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
 	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
 	cp programs/user_nc/user_nc.elf                 $(INITRD_STAGE)/bin/nc
+	@# netcat is nc under its long name
+	@ln -f $(INITRD_STAGE)/bin/nc "$(INITRD_STAGE)/bin/netcat" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/nc "$(INITRD_STAGE)/bin/netcat"
 	cp programs/user_ifconfig/user_ifconfig.elf     $(INITRD_STAGE)/bin/ifconfig
 	cp programs/user_nslookup/user_nslookup.elf     $(INITRD_STAGE)/bin/nslookup
 	cp programs/user_gui_calc/user_gui_calc.elf     $(INITRD_STAGE)/bin/gui_calc
@@ -3281,6 +3337,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/less/less.elf                       $(INITRD_STAGE)/bin/more
 	cp programs/curl/curl.elf                       $(INITRD_STAGE)/bin/curl
 	cp programs/tcc/tcc.elf                         $(INITRD_STAGE)/bin/tcc
+	@# cc is the name configure scripts and Makefiles probe for
+	@ln -f $(INITRD_STAGE)/bin/tcc "$(INITRD_STAGE)/bin/cc" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/tcc "$(INITRD_STAGE)/bin/cc"
 	cp programs/as/as.elf                           $(INITRD_STAGE)/bin/as
 	cp programs/ld/ld.elf                           $(INITRD_STAGE)/bin/ld
 	cp programs/wifipicker/wifipicker.elf           $(INITRD_STAGE)/bin/wifipicker
@@ -3977,6 +4036,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/gzip_test.sh etc/gnumade.gz etc/gnubadcrc.gz                  \
 	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2 \
 	    etc/gnumade.zst etc/gnubadzst.zst              \
+	    etc/gnumade.zip etc/gnubadzip.zip              \
+	    etc/distro_test.sh                            \
 	    etc/sed_test.sh                                                   \
 	    etc/procnet_test.sh                                               \
 	    etc/power_test.sh                                                 \
@@ -3984,7 +4045,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
 	    bin/vipw bin/vigr                                                  \
 	    bin/user_ssh bin/ssh bin/ssh-keygen bin/ssh-add bin/scp bin/sftp    \
-	    bin/gzip bin/gunzip bin/zcat bin/gzcat bin/uncompress            \
+	    bin/gzip bin/gunzip bin/zcat bin/gzcat bin/uncompress bin/compress   \
 	    bin/diff bin/cmp bin/sdiff bin/diff3                                                 \
 	    bin/bzip2 bin/bunzip2 bin/bzcat bin/zgrep bin/zegrep bin/zfgrep    \
 	    bin/zdiff bin/zcmp bin/zless bin/zmore bin/gzexe bin/lesspipe      \
@@ -4004,6 +4065,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
 	    bin/mount bin/umount                                               \
 	    bin/zstd bin/unzstd bin/zstdcat                                    \
+	    bin/zip bin/unzip                                  \
+	    bin/dig bin/host                                    \
+	    bin/strip bin/cc bin/mkfs bin/domainname            \
+	    bin/at bin/batch bin/atq bin/atrm                   \
+	    bin/setpci                                          \
+	    bin/systemctl bin/service bin/netcat bin/getent      \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5766,6 +5833,13 @@ clean:
 	       programs/user_tar/user_tar.elf \
 	       programs/user_textutils/user_textutils.o programs/user_textutils/user_textutils.elf \
 	       programs/user_zstd/user_zstd.o programs/user_zstd/user_zstd.elf \
+	       programs/user_zip/user_zip.o programs/user_zip/puff.o \
+	       programs/user_zip/user_zip.elf \
+	       programs/user_dig/user_dig.o programs/user_dig/user_dig.elf \
+	       programs/user_strip/user_strip.o programs/user_strip/user_strip.elf \
+	       programs/user_at/user_at.o programs/user_at/user_at.elf \
+	       programs/user_setpci/user_setpci.o programs/user_setpci/user_setpci.elf \
+	       programs/user_systemctl/user_systemctl.o programs/user_systemctl/user_systemctl.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

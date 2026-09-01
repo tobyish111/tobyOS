@@ -243,6 +243,8 @@ static int gen_drm_uevent(char *b, size_t s) {
 /* ---- registration ---- */
 
 static void sysfs_populate_pci(void);
+static void sysfs_add_blob(const char *path, const uint8_t *data,
+                           size_t len, uint32_t mode);
 
 static void sysfs_add_dir(const char *path) {
     if (g_sysfs_count >= SYSFS_MAX_NODES) return;
@@ -294,6 +296,46 @@ static void sysfs_add_fixed(const char *path, const char *text) {
     n->fixed = copy;
 }
 
+/* Slice: REAL per-device config space.
+ *
+ * There was already a gen_pci_config(), but it hand-writes a virtio-gpu
+ * header for one function because libdrm reads that one file. Every other
+ * device had no `config` at all, so `lspci -x` had nothing to dump and
+ * setpci had nothing to read.
+ *
+ * These are blob nodes: 256 bytes of the device's ACTUAL config space,
+ * read once at mount. A snapshot would go stale the moment anything wrote
+ * to config space, so the write syscall calls sysfs_pci_config_refresh()
+ * and the file never disagrees with the hardware.
+ */
+struct pci_cfg_cache {
+    uint8_t  bus, slot, fn;
+    uint8_t *bytes;                 /* 256, owned for the life of the system */
+};
+#define PCI_CFG_CACHE_MAX 64
+static struct pci_cfg_cache g_pci_cfg[PCI_CFG_CACHE_MAX];
+static int g_pci_cfg_count;
+
+static void pci_cfg_fill(uint8_t *b, uint8_t bus, uint8_t slot, uint8_t fn) {
+    for (int off = 0; off < 256; off += 4) {
+        uint32_t v = pci_cfg_read32(bus, slot, fn, (uint8_t)off);
+        b[off + 0] = (uint8_t)(v & 0xFF);
+        b[off + 1] = (uint8_t)((v >> 8) & 0xFF);
+        b[off + 2] = (uint8_t)((v >> 16) & 0xFF);
+        b[off + 3] = (uint8_t)((v >> 24) & 0xFF);
+    }
+}
+
+void sysfs_pci_config_refresh(uint8_t bus, uint8_t slot, uint8_t fn) {
+    for (int i = 0; i < g_pci_cfg_count; i++) {
+        if (g_pci_cfg[i].bus == bus && g_pci_cfg[i].slot == slot &&
+            g_pci_cfg[i].fn == fn && g_pci_cfg[i].bytes) {
+            pci_cfg_fill(g_pci_cfg[i].bytes, bus, slot, fn);
+            return;
+        }
+    }
+}
+
 /* ---- /sys/bus/pci/devices (2026-08-23) ----------------------------
  *
  * The layout pciutils' lspci and busybox's lspci both walk: one
@@ -313,8 +355,8 @@ static void sysfs_populate_pci(void) {
     for (size_t i = 0; i < n; i++) {
         struct pci_dev *d = pci_device_at(i);
         if (!d) continue;
-        /* Leave headroom: each device costs 1 dir + 8 files. */
-        if (g_sysfs_count + 10 >= SYSFS_MAX_NODES) {
+        /* Leave headroom: each device costs 1 dir + 9 files. */
+        if (g_sysfs_count + 12 >= SYSFS_MAX_NODES) {
             kprintf("[sysfs] WARN: node table full -- %lu of %lu PCI "
                     "device(s) exposed\n",
                     (unsigned long)made, (unsigned long)n);
@@ -350,6 +392,23 @@ static void sysfs_populate_pci(void) {
         ksnprintf(val, sizeof val, "%u\n",
                   d->irq_line == 0xFF ? 0u : (unsigned)d->irq_line);
         sysfs_add_fixed(path, val);
+
+        /* config -- 256 REAL bytes, which is what `lspci -x` dumps and
+         * what setpci reads. Kept in a cache the write path refreshes, so
+         * the file cannot end up disagreeing with the hardware. */
+        if (g_pci_cfg_count < PCI_CFG_CACHE_MAX) {
+            uint8_t *cb = (uint8_t *)kmalloc(256);
+            if (cb) {
+                pci_cfg_fill(cb, d->bus, d->slot, d->fn);
+                g_pci_cfg[g_pci_cfg_count].bus  = d->bus;
+                g_pci_cfg[g_pci_cfg_count].slot = d->slot;
+                g_pci_cfg[g_pci_cfg_count].fn   = d->fn;
+                g_pci_cfg[g_pci_cfg_count].bytes = cb;
+                g_pci_cfg_count++;
+                ksnprintf(path, sizeof path, "%s/config", dir);
+                sysfs_add_blob(path, cb, 256, 0444);
+            }
+        }
 
         /* We do not track subsystem ids per device; report the device's
          * own ids rather than inventing a different vendor, which is what

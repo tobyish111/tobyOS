@@ -1135,6 +1135,9 @@ struct abi_vizmap {
  * plug", could not exist. Not privileged: flushing your own writes is not
  * a privileged act, and the call cannot lose data. */
 #define ABI_SYS_SYNC            203  /* () */
+#define ABI_SYS_PCI_CFG         204  /* (op, bdf, off, val) */
+#define ABI_PCI_CFG_READ32      0
+#define ABI_PCI_CFG_WRITE32     1
 
 #define ABI_SYS_NR_MAX          204
 

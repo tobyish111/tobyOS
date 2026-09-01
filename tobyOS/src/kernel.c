@@ -3568,6 +3568,18 @@ static void coreutils_selftest(void) {
         rc = proc_wait(pid);
         kprintf("[COREUTILS] procnet exit=%d\n", rc);
     }
+    argv[1] = (char *)"/etc/distro_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "distro-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] distro exit=%d\n", rc);
+    }
     argv[1] = (char *)"/etc/power_test.sh";
     memset(&spec, 0, sizeof spec);
     spec.path = "/bin/tsh";

@@ -39,6 +39,7 @@
 #include <tobyos/term.h>
 #include <tobyos/vfs.h>
 #include <tobyos/apic.h>
+#include <tobyos/pci.h>   /* setpci: config-space accessors + struct pci_dev */
 #include <tobyos/procfs.h>
 #include <tobyos/cgroup.h>
 int sysfs_mount_at(const char *path);   /* src/sysfs.c has no public header */
@@ -4678,6 +4679,60 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         extern void bcache_sync(struct blk_dev *dev);
         bcache_sync(NULL);          /* NULL == every device */
         return 0;
+    }
+    case ABI_SYS_PCI_CFG: {
+        /* setpci(8)'s two operations, and nothing else.
+         *
+         * Reads are open to anyone -- the same 256 bytes are already
+         * readable as /sys/bus/pci/devices/<addr>/config, so refusing them
+         * here would only make the tool inconsistent with the file.
+         *
+         * WRITES ARE ROOT-ONLY, and deliberately narrow: config space is
+         * where a wrong dword unmaps a disk controller mid-write. The
+         * offset is bounds-checked to the 256-byte header, the address is
+         * checked against a device that ACTUALLY EXISTS (so a typo pokes
+         * nothing rather than an unenumerated function), and the sysfs
+         * snapshot is refreshed afterwards so the file and the hardware
+         * cannot disagree.
+         *
+         * a1 = op, a2 = bdf packed as (bus << 16) | (slot << 8) | fn,
+         * a3 = byte offset (dword-aligned), a4 = value for a write.
+         */
+        /* pci.h supplies the accessors and struct pci_dev; only the sysfs
+         * refresh is declared here, the way bcache_sync is below. */
+        extern void sysfs_pci_config_refresh(uint8_t, uint8_t, uint8_t);
+
+        unsigned op   = (unsigned)a1;
+        unsigned bdf  = (unsigned)a2;
+        unsigned off  = (unsigned)a3;
+        uint8_t  bus  = (uint8_t)((bdf >> 16) & 0xFF);
+        uint8_t  slot = (uint8_t)((bdf >> 8) & 0x1F);
+        uint8_t  fn   = (uint8_t)(bdf & 0x07);
+
+        if (off > 252 || (off & 3)) return -ABI_EINVAL;
+
+        /* The address must name a function this kernel enumerated. */
+        int known = 0;
+        for (size_t i = 0, n = pci_device_count(); i < n; i++) {
+            struct pci_dev *d = pci_device_at(i);
+            if (d && d->bus == bus && d->slot == slot && d->fn == fn) { known = 1; break; }
+        }
+        if (!known) return -ABI_ENODEV;
+
+        if (op == ABI_PCI_CFG_READ32)
+            return (long)(uint32_t)pci_cfg_read32(bus, slot, fn, (uint8_t)off);
+
+        if (op == ABI_PCI_CFG_WRITE32) {
+            struct proc *me = current_proc();
+            if (!me || me->uid != 0) return -ABI_EPERM;
+            kprintf("[setpci] pid %d writes %02x:%02x.%u off 0x%02x = 0x%08x\n",
+                    me->pid, (unsigned)bus, (unsigned)slot, (unsigned)fn,
+                    off, (unsigned)a4);
+            pci_cfg_write32(bus, slot, fn, (uint8_t)off, (uint32_t)a4);
+            sysfs_pci_config_refresh(bus, slot, fn);
+            return 0;
+        }
+        return -ABI_EINVAL;
     }
     case ABI_SYS_POWER: {
         /* Root only: this ends every other process on the machine without

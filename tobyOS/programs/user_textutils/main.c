@@ -586,6 +586,154 @@ static int do_hostname(int argc, char **argv) {
     return 0;
 }
 
+/* -------------------------------------------------------------- getent
+ *
+ * The databases this system actually HAS: passwd and group are real files,
+ * hosts is /etc/hosts if it exists plus the loopback name every resolver
+ * knows, and ahosts/ahostsv4 answer from the same place. A database this
+ * system does not keep (shadow, netgroup, rpc) is reported as unknown
+ * rather than answered as empty -- `getent shadow` printing nothing and
+ * exiting 0 would read as "no users have passwords".
+ */
+
+static int getent_file(const char *path, const char *key, int keyfield,
+                       int numeric_field)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 2;
+    char line[512];
+    int found = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (!line[0] || line[0] == '#') continue;
+        if (!key) { printf("%s\n", line); found = 1; continue; }
+
+        /* split on ':' just far enough to reach the two fields a key can
+         * match: the name, and the numeric id */
+        char copy[512];
+        snprintf(copy, sizeof copy, "%s", line);
+        char *fields[8];
+        int nf = 0;
+        char *p = copy;
+        while (nf < 8) {
+            fields[nf++] = p;
+            char *c = strchr(p, ':');
+            if (!c) break;
+            *c = 0;
+            p = c + 1;
+        }
+        if (keyfield < nf && !strcmp(fields[keyfield], key)) { printf("%s\n", line); found = 1; }
+        else if (numeric_field >= 0 && numeric_field < nf &&
+                 !strcmp(fields[numeric_field], key)) { printf("%s\n", line); found = 1; }
+    }
+    fclose(f);
+    return found ? 0 : 2;
+}
+
+static int getent_hosts(const char *key) {
+    int found = 0;
+    FILE *f = fopen("/etc/hosts", "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = 0;
+            char *hash = strchr(line, '#');
+            if (hash) *hash = 0;
+            if (!line[0]) continue;
+            if (!key) { printf("%s\n", line); found = 1; continue; }
+            /* the key may be the address or any of the names on the line */
+            char copy[512];
+            snprintf(copy, sizeof copy, "%s", line);
+            char *tok = copy;
+            while (*tok) {
+                while (*tok == ' ' || *tok == '\t') tok++;
+                if (!*tok) break;
+                char *end = tok;
+                while (*end && *end != ' ' && *end != '\t') end++;
+                char save = *end;
+                *end = 0;
+                if (!strcmp(tok, key)) { printf("%s\n", line); found = 1; break; }
+                *end = save;
+                tok = end;
+            }
+        }
+        fclose(f);
+    }
+    /* Loopback is not in a file here, and every getent answers it. */
+    if (!found && (!key || !strcmp(key, "localhost") || !strcmp(key, "127.0.0.1"))) {
+        printf("127.0.0.1       localhost\n");
+        found = 1;
+    }
+    return found ? 0 : 2;
+}
+
+static int do_getent(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: getent DATABASE [KEY ...]\n");
+        fprintf(stderr, "databases: passwd group hosts ahosts ahostsv4 services\n");
+        return 1;
+    }
+    const char *db = argv[1];
+    int rc = 2;
+
+    if (!strcmp(db, "passwd")) {
+        if (argc == 2) return getent_file("/etc/passwd", NULL, 0, -1);
+        for (int i = 2; i < argc; i++) {
+            int r = getent_file("/etc/passwd", argv[i], 0, 2);
+            if (r == 0) rc = 0;
+        }
+        return rc;
+    }
+    if (!strcmp(db, "group")) {
+        if (argc == 2) return getent_file("/etc/group", NULL, 0, -1);
+        for (int i = 2; i < argc; i++) {
+            int r = getent_file("/etc/group", argv[i], 0, 2);
+            if (r == 0) rc = 0;
+        }
+        return rc;
+    }
+    if (!strcmp(db, "hosts") || !strcmp(db, "ahosts") || !strcmp(db, "ahostsv4")) {
+        if (argc == 2) return getent_hosts(NULL);
+        for (int i = 2; i < argc; i++) if (getent_hosts(argv[i]) == 0) rc = 0;
+        return rc;
+    }
+    if (!strcmp(db, "services")) {
+        if (argc == 2) return getent_file("/etc/services", NULL, 0, -1);
+        for (int i = 2; i < argc; i++) {
+            int r = getent_file("/etc/services", argv[i], 0, -1);
+            if (r == 0) rc = 0;
+        }
+        return rc;
+    }
+
+    fprintf(stderr, "getent: unknown database '%s' -- this system keeps "
+                    "passwd, group, hosts and services\n", db);
+    return 2;
+}
+
+/* ---------------------------------------------------------- domainname */
+
+static int do_domainname(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1]) continue;
+        fprintf(stderr, "domainname: cannot set the name: no setdomainname is "
+                        "exposed to userland; the UTS namespace is only "
+                        "readable from here\n");
+        return 1;
+    }
+    char buf[256];
+    if (slurp("/proc/sys/kernel/domainname", buf, sizeof buf) < 0) {
+        fprintf(stderr, "domainname: cannot read /proc/sys/kernel/domainname\n");
+        return 1;
+    }
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = 0;
+    printf("%s\n", buf);
+    return 0;
+}
+
 /* --------------------------------------------------------------- chown */
 
 static int do_chown(int argc, char **argv) {
@@ -729,6 +877,8 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "mktemp"))   return do_mktemp(argc, argv);
     if (!strcmp(base, "groups"))   return do_groups(argc, argv);
     if (!strcmp(base, "hostname")) return do_hostname(argc, argv);
+    if (!strcmp(base, "getent"))   return do_getent(argc, argv);
+    if (!strcmp(base, "domainname")) return do_domainname(argc, argv);
     if (!strcmp(base, "chown"))    return do_chown(argc, argv);
     if (!strcmp(base, "killall"))  return do_killall(argc, argv);
     if (!strcmp(base, "mount"))    return do_mount(argc, argv);

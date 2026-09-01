@@ -412,4 +412,46 @@ echo "same: $([ "$(wc -c < /tmp/zr.txt)" = "$(wc -c < /tmp/zr.back)" ] && echo y
 echo @@zst_pipe
 printf 'round trip me\n' | zstd -q 2>/dev/null | unzstd
 
+# --- zip / unzip --------------------------------------------------------
+echo @@zip_list
+unzip -l /etc/gnumade.zip | tr -s ' '
+echo @@zip_extract
+cd /tmp && rm -rf zx && mkdir zx && cd zx
+unzip -q /etc/gnumade.zip
+echo "bytes: $(wc -c < gnumade.txt)"
+echo "lines: $(wc -l < gnumade.txt)"
+sha256sum gnumade.txt | cut -d' ' -f1
+cd /tmp
+echo @@zip_test_ok
+unzip -t /etc/gnumade.zip | tail -1
+unzip -t /etc/gnumade.zip > /dev/null 2>&1; echo rc=$?
+echo @@zip_badcrc
+unzip -t /etc/gnubadzip.zip 2>&1 | grep -i crc | head -1
+unzip -t /etc/gnubadzip.zip > /dev/null 2>&1; echo rc=$?
+echo @@zip_pipe
+unzip -p /etc/gnumade.zip | head -1
+echo @@zip_roundtrip
+cd /tmp && rm -rf zr && mkdir zr && cd zr
+cp /tmp/zx/gnumade.txt big.txt
+printf 'small\n' > small.txt
+zip -q /tmp/ours.zip big.txt small.txt
+echo "made: $([ -f /tmp/ours.zip ] && echo yes || echo no)"
+echo "smaller: $([ "$(wc -c < /tmp/ours.zip)" -lt "$(wc -c < big.txt)" ] && echo yes || echo no)"
+cd /tmp && rm -rf zb && mkdir zb && cd zb
+unzip -q /tmp/ours.zip
+cmp /tmp/zr/big.txt big.txt && echo "big: same" || echo "big: DIFFER"
+cmp /tmp/zr/small.txt small.txt && echo "small: same" || echo "small: DIFFER"
+cd /tmp
+echo @@zip_store
+cd /tmp/zr && zip -q -0 /tmp/st.zip small.txt && cd /tmp
+unzip -p /tmp/st.zip small.txt
+echo @@zip_member
+cd /tmp && rm -rf zm && mkdir zm && cd zm
+unzip -q /tmp/ours.zip small.txt
+ls | tr '\n' ','
+cd /tmp
+echo @@zip_notzip
+unzip -l /etc/motd 2>&1 | head -1
+unzip -l /etc/motd > /dev/null 2>&1; echo rc=$?
+
 echo @@compress_END

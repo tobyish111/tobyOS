@@ -1,8 +1,14 @@
 /* user_svcctl/main.c -- /bin/svcctl, enhanced service manager CLI.
  *
- * Provides start/stop/restart/status/log subcommands for managing
- * kernel-supervised services. Communicates via SYS_SVC_LIST for
- * reading and SYS_SLOG_WRITE/READ for commands and logs. */
+ * status and log are REAL: SYS_SVC_LIST reads the live registry and
+ * SYS_SLOG_READ reads the kernel log.
+ *
+ * start/stop/restart ARE NOT. They write a line to the system log, and
+ * nothing anywhere reads it back as a command -- the supervisor exposes
+ * no control syscall. They used to print "Requested start of X" and exit
+ * 0, which is indistinguishable from having worked; they now say what
+ * actually happened and exit nonzero. See /bin/systemctl, which refuses
+ * those verbs outright for the same reason. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -128,24 +134,29 @@ static int cmd_start(const char *name) {
     char msg[128];
     snprintf(msg, sizeof(msg), "svcctl: start %s", name);
     sys_slog_write(4, "svcctl", msg);
-    printf("Requested start of '%s' (via slog command)\n", name);
-    printf("Note: kernel service supervisor handles actual start.\n");
-    return 0;
+    printf("Logged a start request for '%s'.\n", name);
+    fprintf(stderr, "svcctl: NOTHING CONSUMES THAT LOG LINE. The supervisor "
+                    "exposes only SYS_SVC_LIST, which reads the registry; "
+                    "there is no start syscall, so the service was not "
+                    "started.\n");
+    return 1;
 }
 
 static int cmd_stop(const char *name) {
     char msg[128];
     snprintf(msg, sizeof(msg), "svcctl: stop %s", name);
     sys_slog_write(4, "svcctl", msg);
-    printf("Requested stop of '%s' (via slog command)\n", name);
-    return 0;
+    printf("Logged a stop request for '%s'.\n", name);
+    fprintf(stderr, "svcctl: NOTHING CONSUMES THAT LOG LINE. There is no stop "
+                    "syscall, so the service is still running.\n");
+    return 1;
 }
 
 static int cmd_restart(const char *name) {
     cmd_stop(name);
     usleep(500000);
     cmd_start(name);
-    return 0;
+    return 1;          /* neither half acted; do not report success */
 }
 
 static int cmd_log(const char *name, int num_entries) {

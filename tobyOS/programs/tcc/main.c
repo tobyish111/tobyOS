@@ -1498,11 +1498,42 @@ static int write_elf(TccState *s) {
 
     unsigned long base = 0x400000;
     s->text_base = base + sizeof(Elf64_Ehdr) + 2 * sizeof(Elf64_Phdr);
-    s->data_base = s->text_base + ((s->code_len + 0xFFF) & ~0xFFF);
 
-    /* Re-run to fix up data_base addresses -- in a real compiler we'd
-     * do a two-pass or use relocations. For now, the addresses were set
-     * during code generation. */
+    /* data_base is NOT recomputed here. Code generation already baked the
+     * address of every string literal and global into the instruction
+     * stream, using the value main() set (0x600000). Overwriting it now
+     * placed the data segment somewhere else entirely, so the emitted code
+     * loaded its globals from an address the segment did not cover. The
+     * segment goes where the code already believes it is. */
+
+    /* The entry stub is appended below and grows code_len, so it is emitted
+     * BEFORE any size is taken from code_len. */
+    int entry_off = -1;
+    {
+        Symbol *start_sym = find_sym(s, "_start");
+        Symbol *main_sym = start_sym ? NULL : find_sym(s, "main");
+        if (main_sym) {
+            /* main CANNOT be the entry point: at process entry the stack
+             * holds argc, so main's `ret` pops argc and jumps to it. Every
+             * binary this compiler emitted died exactly that way -- a page
+             * fault at rip=0x1, because argc was 1.
+             *
+             * The stub calls main and turns its return value into an exit
+             * status. A program that defines its own _start is left alone;
+             * it is saying it will do this itself. */
+            entry_off = s->code_len;
+            int rel = main_sym->offset - (entry_off + 5);
+            emit_byte(s, 0xE8);                       /* call rel32 -> main */
+            emit_byte(s, (unsigned char)(rel & 0xFF));
+            emit_byte(s, (unsigned char)((rel >> 8) & 0xFF));
+            emit_byte(s, (unsigned char)((rel >> 16) & 0xFF));
+            emit_byte(s, (unsigned char)((rel >> 24) & 0xFF));
+            emit_byte(s, 0x89); emit_byte(s, 0xC7);   /* mov edi, eax        */
+            emit_byte(s, 0x31); emit_byte(s, 0xC0);   /* xor eax, eax  (EXIT) */
+            emit_byte(s, 0x0F); emit_byte(s, 0x05);   /* syscall             */
+            emit_byte(s, 0xEB); emit_byte(s, 0xFE);   /* jmp $  (never runs) */
+        }
+    }
 
     Elf64_Ehdr ehdr;
     memset(&ehdr, 0, sizeof(ehdr));
@@ -1521,10 +1552,11 @@ static int write_elf(TccState *s) {
     ehdr.e_phentsize = sizeof(Elf64_Phdr);
     ehdr.e_phnum = 2;
 
-    /* Find _start or main as entry */
+    /* _start if the program supplies one, otherwise the stub above. */
     Symbol *entry_sym = find_sym(s, "_start");
-    if (!entry_sym) entry_sym = find_sym(s, "main");
-    ehdr.e_entry = entry_sym ? (s->text_base + entry_sym->offset) : s->text_base;
+    if (entry_sym)        ehdr.e_entry = s->text_base + entry_sym->offset;
+    else if (entry_off >= 0) ehdr.e_entry = s->text_base + (unsigned long)entry_off;
+    else                  ehdr.e_entry = s->text_base;
 
     /* Text segment */
     Elf64_Phdr text_phdr;
@@ -1574,7 +1606,13 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    TccState state;
+    /* MEGABYTES: MAX_TOKENS tokens, MAX_CODE + MAX_DATA buffers, 4096
+     * relocs and 512 string literals all live inside this struct. As a
+     * stack local the memset below walked straight off the end of the
+     * stack -- every `cc file.c` died with a page fault at rsp-8, about
+     * 12 MB below the frame it started in. Static puts it in .bss, which
+     * is where a single-threaded compiler's state belongs anyway. */
+    static TccState state;
     memset(&state, 0, sizeof(state));
     TccState *s = &state;
     s->outfile = "a.out";

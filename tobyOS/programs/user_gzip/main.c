@@ -26,9 +26,11 @@
 #include <sys/stat.h>
 
 #include <toby/deflate.h>
+#include <toby/lzw.h>
 #include <tobyos/puff.h>
 
 static const char *prog = "gzip";
+static int zflag;   /* .Z: this invocation is compress(1), not gzip */
 static int dflag, cflag, fflag, kflag, tflag, lflag, qflag, vflag, rflag;
 static int level = 6;
 static int status;
@@ -152,6 +154,7 @@ static void strip_suffix(const char *in, char *out, size_t cap) {
     size_t cut = 0;
     if (n > 3 && !strcmp(in + n - 3, ".gz"))        cut = 3;
     else if (n > 5 && !strcmp(in + n - 5, ".gzip")) cut = 5;
+    else if (n > 2 && !strcmp(in + n - 2, ".Z"))    cut = 2;
     else if (n > 2 && !strcmp(in + n - 2, ".z"))    cut = 2;
     snprintf(out, cap, "%.*s", (int)(n - cut), in);
 }
@@ -206,8 +209,20 @@ static int do_path(const char *path) {
     }
 
     char target[1024];
+    /* A .Z file is recognised by its magic even when the tool was called
+     * as gunzip or zcat, because that is what GNU gzip does and what makes
+     * `zcat foo.Z` work. Compression only writes .Z when the tool was
+     * called as compress. */
+    int is_z = zflag || (inlen >= 3 && in[0] == 0x1F && in[1] == 0x9D);
+
     if (dflag || tflag) {
-        if (inflate_buf(in, inlen, &out, &outlen, path) != 0) {
+        if (is_z) {
+            const char *why = "";
+            if (lzw_decompress(in, inlen, &out, &outlen, &why) != 0) {
+                fprintf(stderr, "%s: %s: %s\n", prog, path, why);
+                free(in); status = 1; return -1;
+            }
+        } else if (inflate_buf(in, inlen, &out, &outlen, path) != 0) {
             free(in); status = 1; return -1;
         }
         if (tflag) {
@@ -220,6 +235,18 @@ static int do_path(const char *path) {
             warn("%s: unknown suffix -- ignored", path);
             free(in); free(out); status = 1; return -1;
         }
+    } else if (zflag) {
+        size_t n = strlen(path);
+        if (n > 2 && !strcmp(path + n - 2, ".Z") && !fflag) {
+            warn("%s: already has .Z suffix -- unchanged", path);
+            free(in); status = 1; return -1;
+        }
+        const char *why = "";
+        if (lzw_compress(in, inlen, LZW_MAX_BITS, &out, &outlen, &why) != 0) {
+            fprintf(stderr, "%s: %s: %s\n", prog, path, why);
+            free(in); status = 1; return -1;
+        }
+        snprintf(target, sizeof target, "%s.Z", path);
     } else {
         if (has_gz_suffix(path) && !fflag) {
             warn("%s: already has .gz suffix -- unchanged", path);
@@ -275,7 +302,14 @@ int main(int argc, char **argv) {
     const char *base = argv[0] ? argv[0] : "gzip";
     for (const char *p = base; *p; p++) if (*p == '/') base = p + 1;
     prog = base;
-    if (!strcmp(base, "gunzip") || !strcmp(base, "uncompress")) dflag = 1;
+    if (!strcmp(base, "gunzip")) dflag = 1;
+    /* compress/uncompress are the .Z format, not gzip under another
+     * name. `uncompress` used to be a plain alias for gunzip, which
+     * cannot read a .Z file at all -- the name was on PATH and the
+     * format was not. */
+    if (!strcmp(base, "compress"))   zflag = 1;
+    if (!strcmp(base, "uncompress")) { zflag = 1; dflag = 1; }
+    if (!strcmp(base, "zcat_z"))     { zflag = 1; dflag = 1; cflag = 1; }
     if (!strcmp(base, "zcat") || !strcmp(base, "gzcat")) { dflag = 1; cflag = 1; }
 
     int files[256], nfiles = 0;

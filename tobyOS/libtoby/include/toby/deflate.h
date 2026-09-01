@@ -21,6 +21,11 @@ int gz_compress(const uint8_t *in, size_t inlen, int level,
                 const char *name, uint32_t mtime,
                 uint8_t **out, size_t *outlen);
 
+/* The same encoder without the gzip header and trailer -- a bare deflate
+ * stream, which is what a ZIP entry stores. */
+int deflate_raw(const uint8_t *in, size_t inlen, int level,
+                uint8_t **out, size_t *outlen);
+
 /* CRC-32 (RFC 1952 / IEEE 802.3). Seed 0 for a fresh run. */
 uint32_t gz_crc32(const uint8_t *p, size_t n, uint32_t seed);
 

@@ -665,6 +665,14 @@ static int gen_sys(const char *rest, char *buf, size_t cap) {
         memcpy(t, hn, l); t[l] = '\n'; t[l + 1] = 0;
         SYS_OUT(t);
     }
+    if (strcmp(rest, "kernel/domainname") == 0) {
+        /* uts_ns has carried this since the namespace slice; nothing was
+         * reading it, which is why no file named it. */
+        const char *dn = uts_domainname();
+        char t[80]; size_t l = strlen(dn); if (l > 76) l = 76;
+        memcpy(t, dn, l); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
     if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("256\n");
     if (strcmp(rest, "fs/file-max") == 0)      SYS_OUT("1024\n");
     if (strcmp(rest, "vm/overcommit_memory") == 0) SYS_OUT("0\n");

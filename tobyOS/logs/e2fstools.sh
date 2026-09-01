@@ -111,9 +111,14 @@ fi
 kern_strip() {
     sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
         { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
-              print substr($0, 1, RSTART - 1); pending = 1; next }
-          if (pending && $0 == "") { pending = 0; next }
-          pending = 0; print }'
+              frag = frag substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending) {
+              pending = 0
+              if ($0 == "") { print frag; frag = ""; next }
+              print frag $0; frag = ""; next }
+          print }
+        END { if (frag != "") print frag }' |
+    sed -E 's/(.)(@@[a-z_])/\1\n\2/g'
 }
 OUT=$(sed -n '/@@e2_lsblk/,/@@e2_END/p' "$LOG" | kern_strip | tr -d '\r')
 if ! echo "$OUT" | grep -q "@@e2_END"; then

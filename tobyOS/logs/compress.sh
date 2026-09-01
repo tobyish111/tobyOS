@@ -68,9 +68,14 @@ fi
 kern_strip() {
     sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
         { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
-              print substr($0, 1, RSTART - 1); pending = 1; next }
-          if (pending && $0 == "") { pending = 0; next }
-          pending = 0; print }'
+              frag = frag substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending) {
+              pending = 0
+              if ($0 == "") { print frag; frag = ""; next }
+              print frag $0; frag = ""; next }
+          print }
+        END { if (frag != "") print frag }' |
+    sed -E 's/(.)(@@[a-z_])/\1\n\2/g'
 }
 OUT=$(sed -n '/@@bz_pipe/,/@@compress_END/p' "$LOG" | kern_strip | tr -d '\r')
 if ! echo "$OUT" | grep -q "@@compress_END"; then
@@ -306,6 +311,29 @@ ck zst_pipe    "a pipeline round trips"       '^round trip me'
 
 
 echo
+echo "=== zip / unzip: the container, over the deflate already here ==="
+# etc/gnumade.zip is real Info-ZIP `zip -9` output, so its entry is a
+# DYNAMIC-Huffman deflate stream. Our own encoder only ever emits fixed
+# blocks, which means a self round trip would never decode one.
+ck zip_list      "lists the member and its size" 'gnumade.txt'
+ck zip_list      "reports the stored length"     "$GNU_BYTES"
+ck zip_extract   "extracts real zip -9 bytes"    "$GNU_SHA"
+ck zip_extract   "byte count matches"            "bytes: $GNU_BYTES\|"
+ck zip_extract   "line count matches"            "lines: $GNU_LINES\|"
+ck zip_test_ok   "-t accepts a good archive"     'No errors detected'
+ck zip_test_ok   "and exits zero"                'rc=0'
+# etc/gnubadzip.zip is STORED, not deflated: inflating cannot be what
+# fails, so ONLY the per-entry CRC can catch the flipped byte.
+ck zip_badcrc    "-t catches a flipped byte"     'CRC error'
+ck zip_badcrc    "and exits nonzero"             'rc=[1-9]'
+ck zip_pipe      "-p writes the member to stdout" '.'
+eq zip_roundtrip "our archives read back byte-identical" \
+                 'made: yes|smaller: yes|big: same|small: same|'
+eq zip_store     "-0 stores without deflating"   'small|'
+eq zip_member    "a named member extracts alone" 'small.txt,|'
+ck zip_notzip    "a non-zip file is refused"     'not a zip archive'
+ck zip_notzip    "and exits nonzero"             'rc=[1-9]'
+
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"
 [ "$FAIL" = "0" ] || exit 1

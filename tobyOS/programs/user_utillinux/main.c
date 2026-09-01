@@ -36,6 +36,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <tobyos/abi/abi.h>
 #include <tobyos_wdog.h>
@@ -468,6 +469,55 @@ static int cmd_zramctl(int argc, char **argv) {
 
 /* ---- dispatch ---------------------------------------------------------- */
 struct applet { const char *name; int (*fn)(int, char **); };
+/* ------------------------------------------------------------------ mkfs
+ *
+ * util-linux's mkfs is a dispatcher, not a filesystem writer: it execs
+ * mkfs.<type>. This one does the same, so `mkfs -t ext2 /dev/x` reaches
+ * the same tool `mkfs.ext2 /dev/x` does -- and a type with no builder
+ * says which types DO have one rather than failing as "not found". */
+static int cmd_mkfs(int argc, char **argv) {
+    const char *type = NULL;
+    char *pass[64];
+    int np = 0;
+
+    for (int i = 1; i < argc && np < 62; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-t") && i + 1 < argc) { type = argv[++i]; continue; }
+        if (!strncmp(a, "--type=", 7)) { type = a + 7; continue; }
+        if (!strcmp(a, "-V") || !strcmp(a, "--version")) {
+            printf("mkfs (tobyOS) 1.0\n");
+            return 0;
+        }
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
+            printf("usage: mkfs [-t type] device [blocks]\n");
+            return 0;
+        }
+        pass[np++] = argv[i];
+    }
+    if (!type) type = "ext2";           /* what util-linux defaults to */
+
+    char tool[64];
+    snprintf(tool, sizeof tool, "mkfs.%s", type);
+
+    char *av[64];
+    int n = 0;
+    av[n++] = tool;
+    for (int i = 0; i < np; i++) av[n++] = pass[i];
+    av[n] = NULL;
+
+    pid_t pid = fork();
+    if (pid < 0) { fprintf(stderr, "mkfs: fork failed\n"); return 1; }
+    if (pid == 0) {
+        execvp(tool, av);
+        fprintf(stderr, "mkfs: %s: no builder for this type "
+                        "(have ext2, minix, reiser, vfat)\n", tool);
+        _exit(127);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+}
+
 static const struct applet g_applets[] = {
     { "column",  cmd_column },
     { "colrm",   cmd_colrm },
@@ -485,6 +535,7 @@ static const struct applet g_applets[] = {
     { "lslocks", cmd_lslocks },
     { "lsipc",   cmd_lsipc },
     { "zramctl", cmd_zramctl },
+    { "mkfs",    cmd_mkfs },
     { 0, 0 }
 };
 

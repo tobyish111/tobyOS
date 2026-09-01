@@ -188,9 +188,12 @@ static void emit_stored(struct bw *b, const uint8_t *in, size_t inlen) {
     } while (off < inlen);
 }
 
-int gz_compress(const uint8_t *in, size_t inlen, int level,
-                const char *name, uint32_t mtime,
-                uint8_t **out, size_t *outlen)
+/* The gzip wrapper and the bare stream share one encoder: `raw_only`
+ * skips the header and trailer, which is exactly what a ZIP entry stores.
+ * Two copies of an LZ77 matcher would be two places for it to drift. */
+static int deflate_core(const uint8_t *in, size_t inlen, int level,
+                        const char *name, uint32_t mtime, int raw_only,
+                        uint8_t **out, size_t *outlen)
 {
     if (!out || !outlen) return -1;
     if (!in && inlen) return -1;
@@ -208,8 +211,9 @@ int gz_compress(const uint8_t *in, size_t inlen, int level,
     struct bw b;
     memset(&b, 0, sizeof b);
 
-    /* ---- gzip header (RFC 1952) ---- */
-    int have_name = name && name[0];
+    /* ---- gzip header (RFC 1952), skipped for a bare stream ---- */
+    int have_name = !raw_only && name && name[0];
+    if (!raw_only) {
     bw_byte(&b, 0x1F);
     bw_byte(&b, 0x8B);
     bw_byte(&b, 8);                               /* CM = deflate */
@@ -223,6 +227,7 @@ int gz_compress(const uint8_t *in, size_t inlen, int level,
     if (have_name) {
         for (const char *p = name; *p; p++) bw_byte(&b, (uint8_t)*p);
         bw_byte(&b, 0);
+    }
     }
     if (b.err) { free(b.buf); return -1; }
 
@@ -315,6 +320,12 @@ int gz_compress(const uint8_t *in, size_t inlen, int level,
         }
     }
 
+    if (raw_only) {
+        if (b.err) { free(b.buf); return -1; }
+        *out = b.buf; *outlen = b.len;
+        return 0;
+    }
+
     uint32_t crc = gz_crc32(in, inlen, 0);
     uint32_t isz = (uint32_t)(inlen & 0xFFFFFFFFu);
     bw_byte(&b, (uint8_t)(crc & 0xFF));
@@ -330,4 +341,17 @@ int gz_compress(const uint8_t *in, size_t inlen, int level,
     *out = b.buf;
     *outlen = b.len;
     return 0;
+}
+
+int gz_compress(const uint8_t *in, size_t inlen, int level,
+                const char *name, uint32_t mtime,
+                uint8_t **out, size_t *outlen)
+{
+    return deflate_core(in, inlen, level, name, mtime, 0, out, outlen);
+}
+
+int deflate_raw(const uint8_t *in, size_t inlen, int level,
+                uint8_t **out, size_t *outlen)
+{
+    return deflate_core(in, inlen, level, NULL, 0, 1, out, outlen);
 }

@@ -229,7 +229,7 @@ static int dynamic(struct state *s) {
 
 /* Raw DEFLATE. Returns PUFF_OK, PUFF_TRUNC, or PUFF_ERR. *destlen is set
  * to the number of bytes written. */
-static int puff_raw(uint8_t *dest, unsigned long *destlen,
+int puff_inflate_raw(uint8_t *dest, unsigned long *destlen,
                     const uint8_t *source, unsigned long sourcelen) {
     struct state s = { dest, *destlen, 0, 0, source, sourcelen, 0, 0, 0 };
     int last, err = 0;
@@ -266,7 +266,7 @@ int puff_gzip(uint8_t *dest, unsigned long *destlen,
     if (p >= srclen) return PUFF_ERR;
     unsigned long deflate_len = (srclen - p >= 8) ? (srclen - p - 8)
                                                   : (srclen - p);
-    return puff_raw(dest, destlen, src + p, deflate_len);
+    return puff_inflate_raw(dest, destlen, src + p, deflate_len);
 }
 
 int puff_zlib(uint8_t *dest, unsigned long *destlen,
@@ -275,5 +275,5 @@ int puff_zlib(uint8_t *dest, unsigned long *destlen,
     if ((src[0] & 0x0f) != 8) return PUFF_ERR;    /* CM=deflate */
     unsigned long body = srclen - 2;
     if (src[1] & 0x20) body -= 4;                 /* FDICT preset (rare) */
-    return puff_raw(dest, destlen, src + 2, body - 4 /* adler32 trailer */);
+    return puff_inflate_raw(dest, destlen, src + 2, body - 4 /* adler32 trailer */);
 }
