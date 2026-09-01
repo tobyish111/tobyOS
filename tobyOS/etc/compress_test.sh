@@ -319,4 +319,34 @@ cd /tmp
 echo @@tar_corrupt
 tar -tf /etc/motd > /dev/null 2>&1; echo rc=$?
 
+# --- the second batch that was busybox ----------------------------------
+echo @@b2_printenv
+FOO=bar printenv FOO 2>/dev/null || (export FOO=bar; printenv FOO)
+echo @@b2_printenv_all
+printenv | grep -c '='
+echo @@b2_cksum
+printf "%s\n" "$(printf 'abc' | cksum)"
+echo @@b2_truncate
+truncate -s 7 /tmp/trunc.bin; echo "size: $(wc -c < /tmp/trunc.bin)"
+echo abcdefghij > /tmp/trunc2.bin; truncate -s 4 /tmp/trunc2.bin
+echo "shrunk: $(wc -c < /tmp/trunc2.bin)"
+echo @@b2_install
+echo payload > /tmp/isrc; rm -rf /tmp/idst; mkdir -p /tmp/idst
+install -m 644 /tmp/isrc /tmp/idst/; cat /tmp/idst/isrc
+echo @@b2_install_d
+rm -rf /tmp/idir; install -d /tmp/idir/deep; echo "made: $([ -d /tmp/idir/deep ] && echo yes || echo no)"
+echo @@b2_pgrep
+sleep 40 &
+sleep 1
+pgrep sleep | head -1 | grep -c '^[0-9]'
+pkill -TERM sleep; echo "pkill rc=$?"
+echo @@b2_tty
+tty | cat
+echo @@b2_stty
+stty | head -1 | cut -d' ' -f1
+echo @@b2_nice
+nice echo ran 2>/dev/null
+echo @@b2_mkfifo
+mkfifo /tmp/fifo1 2>&1; echo rc=$?
+
 echo @@compress_END

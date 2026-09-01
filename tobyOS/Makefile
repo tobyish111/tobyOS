@@ -3157,7 +3157,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
 	@# sixteen names that were busybox applets until now, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
-	           nohup timeout watch dd; do \
+	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
+	           cksum truncate install mkfifo; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3974,6 +3975,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
 	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
 	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
+	    bin/printenv bin/nice bin/pgrep bin/pkill bin/tty bin/stty        \
+	    bin/cksum bin/truncate bin/install bin/mkfifo                     \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \

@@ -1,5 +1,6 @@
 /* rmdir yes tac seq whoami which uname free sync nohup timeout watch
- * stat du xargs dd
+ * stat du xargs dd printenv nice pgrep pkill tty stty cksum truncate
+ * install mkfifo
  *
  * One multi-call binary, dispatching on argv[0]. Every one of these names
  * previously resolved to a busybox applet -- and busybox in this tree is a
@@ -22,6 +23,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 
 #include <tobyos/abi/abi.h>
 
@@ -662,6 +664,322 @@ done:
     return 0;
 }
 
+/* ------------------------------- the second batch of busybox-only names */
+
+extern char **environ;
+
+static int do_printenv(int argc, char **argv) {
+    if (argc > 1) {
+        int rc = 1;
+        for (int i = 1; i < argc; i++) {
+            if (argv[i][0] == '-' && argv[i][1]) continue;
+            const char *v = getenv(argv[i]);
+            if (v) { printf("%s\n", v); rc = 0; }
+        }
+        return rc;
+    }
+    for (char **e = environ; e && *e; e++) printf("%s\n", *e);
+    return 0;
+}
+
+static int do_nice(int argc, char **argv) {
+    int argi = 1;
+    for (; argi < argc; argi++) {
+        if (!strcmp(argv[argi], "-n") && argi + 1 < argc) { argi++; continue; }
+        if (argv[argi][0] == '-' && argv[argi][1]) continue;
+        break;
+    }
+    if (argi >= argc) {
+        fprintf(stderr, "nice: no setpriority syscall is exposed, so there "
+                        "is no niceness to report\n");
+        return 1;
+    }
+    /* The command still RUNS; only the priority change is impossible, and
+     * that is said once rather than silently dropped. */
+    fprintf(stderr, "nice: running without a priority change: no setpriority "
+                    "syscall is exposed to userland\n");
+    execvp(argv[argi], argv + argi);
+    fprintf(stderr, "nice: cannot run %s: %s\n", argv[argi], strerror(errno));
+    return 127;
+}
+
+/* ---- pgrep / pkill: the same /proc walk skill uses ---- */
+
+static int name_of_pid(const char *pid, char *out, size_t cap) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%s/status", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char line[256];
+    int got = -1;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "Name:", 5)) continue;
+        const char *q = line + 5;
+        while (*q == ' ' || *q == 9) q++;
+        size_t n = 0;
+        while (q[n] && q[n] != 10 && q[n] != 13 && n + 1 < cap) { out[n] = q[n]; n++; }
+        out[n] = 0;
+        got = 0;
+        break;
+    }
+    fclose(f);
+    return got;
+}
+
+static int sig_from_name(const char *s) {
+    if (*s == '-') s++;
+    if (*s >= '0' && *s <= '9') return atoi(s);
+    if (!strncmp(s, "SIG", 3)) s += 3;
+    if (!strcmp(s, "HUP"))  return SIGHUP;
+    if (!strcmp(s, "INT"))  return SIGINT;
+    if (!strcmp(s, "QUIT")) return SIGQUIT;
+    if (!strcmp(s, "KILL")) return SIGKILL;
+    if (!strcmp(s, "TERM")) return SIGTERM;
+    if (!strcmp(s, "STOP")) return SIGSTOP;
+    if (!strcmp(s, "CONT")) return SIGCONT;
+    if (!strcmp(s, "USR1")) return SIGUSR1;
+    if (!strcmp(s, "USR2")) return SIGUSR2;
+    return -1;
+}
+
+static int do_pgrep(int argc, char **argv, int do_kill) {
+    int sig = SIGTERM;
+    const char *pat = NULL;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] == '-' && a[1]) {
+            if (do_kill) {
+                int s = sig_from_name(a);
+                if (s > 0) { sig = s; continue; }
+            }
+            continue;                 /* -f, -l and friends: accepted */
+        }
+        if (!pat) pat = a;
+    }
+    if (!pat) {
+        fprintf(stderr, "%s: no pattern given\n", do_kill ? "pkill" : "pgrep");
+        return 2;
+    }
+    DIR *d = opendir("/proc");
+    if (!d) { fprintf(stderr, "%s: cannot open /proc\n", prog); return 2; }
+    int hits = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        int pid = atoi(e->d_name);
+        if (pid <= 1 || pid == (int)getpid()) continue;
+        char nm[64];
+        if (name_of_pid(e->d_name, nm, sizeof nm) != 0) continue;
+        if (!strstr(nm, pat)) continue;      /* pgrep matches a substring */
+        hits++;
+        if (do_kill) kill(pid, sig);
+        else         printf("%d\n", pid);
+    }
+    closedir(d);
+    return hits ? 0 : 1;
+}
+
+static int do_tty(void) {
+    if (!isatty(0)) { printf("not a tty\n"); return 1; }
+    /* No ttyname(3) here and no /proc/self/fd to read a link from, so the
+     * name is the console this system gives every session. */
+    printf("/dev/console\n");
+    return 0;
+}
+
+static int do_stty(int argc, char **argv) {
+    struct termios t;
+    if (tcgetattr(0, &t) != 0) {
+        fprintf(stderr, "stty: standard input is not a terminal\n");
+        return 1;
+    }
+    int changed = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        int off = 0;
+        if (a[0] == '-' && a[1] && strcmp(a, "-a") && strcmp(a, "-g")) { off = 1; a++; }
+        if (!strcmp(a, "a") || !strcmp(a, "g")) continue;
+        if (!strcmp(a, "echo"))   { if (off) t.c_lflag &= ~ECHO;   else t.c_lflag |= ECHO;   changed = 1; continue; }
+        if (!strcmp(a, "icanon")) { if (off) t.c_lflag &= ~ICANON; else t.c_lflag |= ICANON; changed = 1; continue; }
+        if (!strcmp(a, "raw"))    { t.c_lflag &= (tcflag_t)~(ICANON | ECHO); changed = 1; continue; }
+        if (!strcmp(a, "cooked") || !strcmp(a, "sane")) {
+            t.c_lflag |= (ICANON | ECHO);
+            changed = 1;
+            continue;
+        }
+    }
+    if (changed) {
+        if (tcsetattr(0, 0, &t) != 0) {
+            fprintf(stderr, "stty: cannot set terminal attributes\n");
+            return 1;
+        }
+        return 0;
+    }
+    printf("speed 38400 baud; line = 0;\n");
+    printf("%sicanon %secho\n",
+           (t.c_lflag & ICANON) ? "" : "-", (t.c_lflag & ECHO) ? "" : "-");
+    return 0;
+}
+
+/* POSIX cksum is a CRC-32 with a DIFFERENT convention from gzip's: the
+ * polynomial runs MSB-first and the LENGTH is fed in after the data, which
+ * is why the two never agree on the same file. */
+static unsigned long cksum_tab[256];
+static int cksum_ready;
+
+static unsigned long posix_cksum(const unsigned char *p, size_t n) {
+    if (!cksum_ready) {
+        for (unsigned long i = 0; i < 256; i++) {
+            unsigned long c = i << 24;
+            for (int k = 0; k < 8; k++)
+                c = (c & 0x80000000UL) ? ((c << 1) ^ 0x04C11DB7UL) : (c << 1);
+            cksum_tab[i] = c & 0xFFFFFFFFUL;
+        }
+        cksum_ready = 1;
+    }
+    unsigned long c = 0;
+    for (size_t i = 0; i < n; i++)
+        c = ((c << 8) ^ cksum_tab[((c >> 24) ^ p[i]) & 0xFF]) & 0xFFFFFFFFUL;
+    for (size_t len = n; len; len >>= 8)
+        c = ((c << 8) ^ cksum_tab[((c >> 24) ^ (len & 0xFF)) & 0xFF]) & 0xFFFFFFFFUL;
+    return (~c) & 0xFFFFFFFFUL;
+}
+
+static unsigned char *slurp_stream(FILE *f, size_t *outlen) {
+    unsigned char *b = NULL;
+    size_t cap = 0, len = 0;
+    for (;;) {
+        if (len == cap) {
+            cap = cap ? cap * 2 : 65536;
+            b = (unsigned char *)realloc(b, cap);
+            if (!b) { *outlen = 0; return NULL; }
+        }
+        size_t got = fread(b + len, 1, cap - len, f);
+        if (!got) break;
+        len += got;
+    }
+    *outlen = len;
+    return b;
+}
+
+static int do_cksum(int argc, char **argv) {
+    int rc = 0, any = 0;
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1]) continue;
+        any = 1;
+        FILE *f = fopen(argv[i], "rb");
+        if (!f) { fprintf(stderr, "cksum: %s: %s\n", argv[i], strerror(errno)); rc = 1; continue; }
+        size_t len = 0;
+        unsigned char *b = slurp_stream(f, &len);
+        fclose(f);
+        printf("%lu %zu %s\n", posix_cksum(b, len), len, argv[i]);
+        free(b);
+    }
+    if (!any) {
+        size_t len = 0;
+        unsigned char *b = slurp_stream(stdin, &len);
+        printf("%lu %zu\n", posix_cksum(b, len), len);
+        free(b);
+    }
+    return rc;
+}
+
+static long size_arg(const char *s) {
+    long v = 0;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+    if (*p == 'K' || *p == 'k') v *= 1024L;
+    else if (*p == 'M' || *p == 'm') v *= 1024L * 1024L;
+    else if (*p == 'G' || *p == 'g') v *= 1024L * 1024L * 1024L;
+    return v;
+}
+
+static int do_truncate(int argc, char **argv) {
+    long size = -1;
+    int rc = 0, any = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-s") && i + 1 < argc) { size = size_arg(argv[++i]); continue; }
+        if (!strncmp(argv[i], "-s", 2) && argv[i][2]) { size = size_arg(argv[i] + 2); continue; }
+        if (!strncmp(argv[i], "--size=", 7)) { size = size_arg(argv[i] + 7); continue; }
+        if (argv[i][0] == '-' && argv[i][1]) continue;
+        any = 1;
+        if (size < 0) { fprintf(stderr, "truncate: -s is required\n"); return 1; }
+        /* Created if absent, as truncate does. */
+        int fd = open(argv[i], O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) close(fd);
+        if (truncate(argv[i], (off_t)size) != 0) {
+            fprintf(stderr, "truncate: %s: %s\n", argv[i], strerror(errno));
+            rc = 1;
+        }
+    }
+    if (!any) { fprintf(stderr, "usage: truncate -s SIZE file...\n"); return 1; }
+    return rc;
+}
+
+static int copy_one(const char *src, const char *dst, int mode) {
+    FILE *in = fopen(src, "rb");
+    if (!in) { fprintf(stderr, "install: %s: %s\n", src, strerror(errno)); return 1; }
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); fprintf(stderr, "install: %s: %s\n", dst, strerror(errno)); return 1; }
+    char b[8192];
+    size_t n;
+    while ((n = fread(b, 1, sizeof b, in)) > 0) fwrite(b, 1, n, out);
+    fclose(in);
+    fclose(out);
+    if (mode >= 0) chmod(dst, (mode_t)mode);
+    return 0;
+}
+
+static int do_install(int argc, char **argv) {
+    int mode = 0755, dirs = 0;
+    const char *args[64];
+    int n = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-m") && i + 1 < argc) {
+            mode = (int)strtol(argv[++i], NULL, 8);
+            continue;
+        }
+        if (!strcmp(argv[i], "-d")) { dirs = 1; continue; }
+        if (argv[i][0] == '-' && argv[i][1]) continue;
+        if (n < 64) args[n++] = argv[i];
+    }
+    if (n == 0) { fprintf(stderr, "usage: install [-m mode] src dst | -d dir...\n"); return 1; }
+    if (dirs) {
+        /* `install -d a/b/c` creates EVERY component, as GNU does -- that
+         * is the whole reason a Makefile reaches for it over mkdir. */
+        int rc = 0;
+        for (int i = 0; i < n; i++) {
+            char tmp[1024];
+            snprintf(tmp, sizeof tmp, "%s", args[i]);
+            for (char *q = tmp + 1; *q; q++) {
+                if (*q != '/') continue;
+                *q = 0;
+                mkdir(tmp, (mode_t)mode);
+                *q = '/';
+            }
+            if (mkdir(tmp, (mode_t)mode) != 0 && errno != EEXIST) {
+                fprintf(stderr, "install: %s: %s\n", args[i], strerror(errno));
+                rc = 1;
+            }
+        }
+        return rc;
+    }
+    if (n < 2) { fprintf(stderr, "install: need a source and a destination\n"); return 1; }
+    struct stat st;
+    if (stat(args[n-1], &st) == 0 && S_ISDIR(st.st_mode)) {
+        int rc = 0;
+        for (int i = 0; i < n - 1; i++) {
+            const char *b = args[i];
+            for (const char *q = args[i]; *q; q++) if (*q == '/') b = q + 1;
+            char dst[1024];
+            snprintf(dst, sizeof dst, "%s/%s", args[n-1], b);
+            if (copy_one(args[i], dst, mode)) rc = 1;
+        }
+        return rc;
+    }
+    return copy_one(args[0], args[n-1], mode);
+}
+
 /* ---------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
@@ -685,6 +1003,23 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "timeout")) return do_timeout(argc, argv);
     if (!strcmp(base, "watch"))   return do_watch(argc, argv);
     if (!strcmp(base, "dd"))      return do_dd(argc, argv);
+    if (!strcmp(base, "printenv")) return do_printenv(argc, argv);
+    if (!strcmp(base, "nice"))     return do_nice(argc, argv);
+    if (!strcmp(base, "pgrep"))    return do_pgrep(argc, argv, 0);
+    if (!strcmp(base, "pkill"))    return do_pgrep(argc, argv, 1);
+    if (!strcmp(base, "tty"))      return do_tty();
+    if (!strcmp(base, "stty"))     return do_stty(argc, argv);
+    if (!strcmp(base, "cksum"))    return do_cksum(argc, argv);
+    if (!strcmp(base, "truncate")) return do_truncate(argc, argv);
+    if (!strcmp(base, "install"))  return do_install(argc, argv);
+    if (!strcmp(base, "mkfifo")) {
+        /* No mkfifo syscall and no FIFO type in the VFS, so this cannot be
+         * faked: a regular file under the name would be worse than a
+         * refusal that names what is missing. */
+        fprintf(stderr, "mkfifo: named pipes are not implemented: the VFS has "
+                        "no FIFO type and no mkfifo syscall exists\n");
+        return 1;
+    }
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;

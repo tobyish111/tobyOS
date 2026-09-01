@@ -247,6 +247,23 @@ eq tar_member       "extracts only a named member" 'a.txt|'
 eq tar_corrupt      "a non-archive is refused"    'rc=2|'
 
 
+echo "=== ten more names that were only busybox ==="
+ck b2_printenv     "printenv reads the environment"  '^bar'
+ck b2_printenv_all "and lists it all"                '^[1-9]'
+# POSIX cksum is NOT gzip's CRC -- MSB-first, and the length is fed in
+# after the data. GNU prints 1219131554 3 for "abc".
+eq b2_cksum        "cksum matches the POSIX CRC"     '1219131554 3|'
+eq b2_truncate     "truncate grows and shrinks"      'size: 7|shrunk: 4|'
+eq b2_install      "install copies with a mode"      'payload|'
+eq b2_install_d    "install -d makes the tree"       'made: yes|'
+ck b2_pgrep        "pgrep finds it, pkill ends it"   '^1\|pkill rc=0'
+eq b2_tty          "tty names the terminal"          '/dev/console|'
+ck b2_stty         "stty reports the line"           'speed'
+ck b2_nice         "nice still runs the command"     '^ran'
+# No FIFO type in the VFS: a regular file under the name would be worse.
+ck b2_mkfifo       "mkfifo refuses and says why"     'not implemented.*rc=[1-9]'
+
+
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"
