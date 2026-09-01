@@ -4673,6 +4673,30 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         kfree(tmp);
         return 0;
     }
+    case ABI_SYS_POWER: {
+        /* Root only: this ends every other process on the machine without
+         * asking them. acpi_shutdown() flushes the block cache first, so a
+         * graceful power-off does not lose /data. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        /* Declared here rather than pulling acpi.h into this translation
+         * unit for three symbols; bcache_sync is already extern'd this way
+         * further down the file. */
+        extern __attribute__((noreturn)) void acpi_shutdown(void);
+        extern __attribute__((noreturn)) void acpi_reboot(void);
+        extern void bcache_sync(struct blk_dev *dev);
+        unsigned action = (unsigned)a1;
+        kprintf("[power] pid %d requested action %u\n",
+                current_proc() ? current_proc()->pid : -1, action);
+        switch (action) {
+        case ABI_POWER_OFF:    acpi_shutdown();   /* noreturn */ break;
+        case ABI_POWER_REBOOT: acpi_reboot();     /* noreturn */ break;
+        case ABI_POWER_HALT:   bcache_sync(NULL); cli(); hlt_forever(); break;
+        default: return -ABI_EINVAL;
+        }
+        /* Only reached if the ACPI path could not act. */
+        return -ABI_EIO;
+    }
     case ABI_SYS_DNS_RESOLVE: {
         /* The kernel already had dns_resolve(); nothing exposed it, so no
          * userland program could turn a name into an address for a raw TCP

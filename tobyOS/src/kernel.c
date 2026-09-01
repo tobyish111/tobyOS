@@ -3568,7 +3568,33 @@ static void coreutils_selftest(void) {
         rc = proc_wait(pid);
         kprintf("[COREUTILS] procnet exit=%d\n", rc);
     }
+    argv[1] = (char *)"/etc/power_test.sh";
+    memset(&spec, 0, sizeof spec);
+    spec.path = "/bin/tsh";
+    spec.name = "power-test";
+    spec.argc = 2;
+    spec.argv = argv;
+    spec.cwd  = "/tmp";
+    pid = proc_spawn(&spec);
+    if (pid >= 0) {
+        rc = proc_wait(pid);
+        kprintf("[COREUTILS] power exit=%d\n", rc);
+    }
     kprintf("[COREUTILS] VERDICT: DONE\n");
+#ifdef POWER_REALTEST
+    /* logs/power.sh builds with this. It runs AFTER the verdict line so
+     * every other gate still sees its own result, then actually powers the
+     * machine off -- which is the only way to prove ABI_SYS_POWER reaches
+     * the hardware rather than merely returning a plausible code. */
+    kprintf("[POWER] about to spawn /bin/poweroff for real\n");
+    { char *pv[2]; pv[0] = (char *)"poweroff"; pv[1] = 0;
+      struct proc_spec ps; memset(&ps, 0, sizeof ps);
+      ps.path = "/bin/poweroff"; ps.name = "poweroff";
+      ps.argc = 1; ps.argv = pv; ps.cwd = "/";
+      int ppid = proc_spawn(&ps);
+      if (ppid >= 0) (void)proc_wait(ppid);
+      kprintf("[POWER] poweroff RETURNED -- the machine is still up\n"); }
+#endif
 }
 #endif /* COREUTILS_SELFTEST */
 void _start(void) {

@@ -1109,7 +1109,23 @@ struct abi_vizmap {
  */
 #define ABI_SYS_BLK_READ        201  /* (name, lba, buf, nsectors) */
 
-#define ABI_SYS_NR_MAX          202
+/* Power control: shut down, reboot, or halt the machine.
+ *
+ * args: (unsigned action)  -- one of ABI_POWER_* below.  ROOT ONLY.
+ * Does not return on success; returns -ABI_E* if it could not act.
+ *
+ * The kernel has had acpi_shutdown() and acpi_reboot() for a long time
+ * (src/acpi.c, which also flushes the block cache first), but nothing
+ * exposed them, so shutdown/poweroff/halt/reboot -- four commands every
+ * distro has -- could not exist. Root only for the obvious reason: this
+ * ends every other process on the machine without asking them. */
+#define ABI_SYS_POWER           202  /* (action) */
+
+#define ABI_POWER_OFF     0u   /* ACPI S5 */
+#define ABI_POWER_REBOOT  1u
+#define ABI_POWER_HALT    2u   /* stop the CPUs, leave the power on */
+
+#define ABI_SYS_NR_MAX          203
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

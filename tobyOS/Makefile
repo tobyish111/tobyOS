@@ -553,6 +553,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_zutils/user_zutils.elf \
             programs/user_sed/user_sed.elf \
             programs/user_procnet/user_procnet.elf \
+            programs/user_power/user_power.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1781,6 +1782,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_bzip2,user_bzip2))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_zutils,user_zutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sed,user_sed))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_procnet,user_procnet))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_power,user_power))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3114,6 +3116,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_zutils/user_zutils.elf        $(INITRD_STAGE)/bin/zgrep
 	cp programs/user_sed/user_sed.elf              $(INITRD_STAGE)/bin/sed
 	cp programs/user_procnet/user_procnet.elf      $(INITRD_STAGE)/bin/vmstat
+	cp programs/user_power/user_power.elf          $(INITRD_STAGE)/bin/shutdown
+	@# power control, one binary dispatched on argv[0]
+	@for ap in poweroff halt reboot; do \
+	    ln -f $(INITRD_STAGE)/bin/shutdown "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/shutdown "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	@# procps/iproute2 stragglers, one binary dispatched on argv[0]
 	@for ap in tload slabtop skill snice ss bridge tracepath; do \
 	    ln -f $(INITRD_STAGE)/bin/vmstat "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
@@ -3168,6 +3176,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
 	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
 	cp etc/procnet_test.sh                          $(INITRD_STAGE)/etc/procnet_test.sh
+	cp etc/power_test.sh                            $(INITRD_STAGE)/etc/power_test.sh
 	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
 	@# that dispatches on argv[0] -- the same way busybox is installed below.
 	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
@@ -3897,6 +3906,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2              \
 	    etc/sed_test.sh                                                   \
 	    etc/procnet_test.sh                                               \
+	    etc/power_test.sh                                                 \
 	    bin/user_admin bin/useradd bin/userdel bin/usermod bin/groupadd    \
 	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
 	    bin/vipw bin/vigr                                                  \
@@ -3910,6 +3920,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/sed                                                          \
 	    bin/vmstat bin/tload bin/slabtop bin/skill bin/snice bin/ss       \
 	    bin/bridge bin/tracepath                                          \
+	    bin/shutdown bin/poweroff bin/halt bin/reboot                     \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5661,6 +5672,7 @@ clean:
 	       programs/user_zutils/user_zutils.o programs/user_zutils/user_zutils.elf \
 	       programs/user_sed/user_sed.o programs/user_sed/user_sed.elf \
 	       programs/user_procnet/user_procnet.o programs/user_procnet/user_procnet.elf \
+	       programs/user_power/user_power.o programs/user_power/user_power.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \
