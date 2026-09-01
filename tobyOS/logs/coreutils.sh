@@ -47,12 +47,28 @@ rm -f "$LOG" || { echo "ABORT: log busy"; exit 1; }
 # so the transcript lands on the serial log. Same pattern as the editsave and
 # filetypes gates, neither of which has ever stalled.
 rm -f src/kernel.o
-PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"   make "CC=TMP='C:	' TEMP='C:	' clang" "HOST_CC=TMP='C:	' TEMP='C:	' gcc"        EXTRA_CFLAGS=-DCOREUTILS_SELFTEST iso >/dev/null 2>&1
+PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH"   make "CC=TMP='C:	' TEMP='C:	' clang" "HOST_CC=TMP='C:	' TEMP='C:	' gcc"        EXTRA_CFLAGS=-DCOREUTILS_SELFTEST iso >logs/.buildlog.txt 2>&1
+BUILD_RC=$?
+# A FAILED BUILD USED TO LOOK LIKE A PASSING GATE. make's output went to
+# /dev/null and the only check was "does an ISO exist" -- which a PREVIOUS
+# run's ISO satisfies. One compile error therefore aborted make, left the
+# stale image in place, and this gate booted it and reported confident
+# results about source that was never in the build. Seen for real: a broken
+# char literal in head.c silently froze three gates on an hour-old ISO.
+if [ $BUILD_RC -ne 0 ]; then
+    echo "ABORT: the build FAILED -- the ISO on disk is stale, so any"
+    echo "       verdict below would have described code that is not in it."
+    tail -25 logs/.buildlog.txt
+    exit 1
+fi
 [ -f tobyOS.iso ] || { echo "ABORT: build produced no ISO"; exit 1; }
 
 "/c/Program Files/qemu/qemu-system-x86_64.exe"   -cdrom tobyOS.iso -drive file=disk.img,format=raw,if=ide,index=0,media=disk   -boot d -smp 4 -m 5120 -cpu max   -serial file:"$LOG" -no-reboot -display none 2>/dev/null &
 
-for i in $(seq 1 90); do grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break; sleep 2; done
+# The shared boot harness now runs six scripts (coreutils, extra,
+# accounts, ssh, util, e2fs) and the ssh one alone takes ~40s of guest
+# time. Waiting is cheap; a false ABORT costs a whole rebuild.
+for i in $(seq 1 200); do grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break; sleep 2; done
 MSYS_NO_PATHCONV=1 taskkill /F /IM qemu-system-x86_64.exe >/dev/null 2>&1
 if ! grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null; then
     echo "ABORT: the harness never reported"
@@ -161,6 +177,25 @@ lit_case chcon     "chcon reports no SELinux" \
 lit_case runcon    "runcon reports no SELinux" \
    'runcon: SELinux is not enabled on this system|rc=1|'
 lit_case stdbuf    "stdbuf still runs the command" 'ran|'
+
+# tail/head window arithmetic, diffed against GNU rather than asserted.
+cmp_case tailplus    "tail -n +2 skips the header"
+cmp_case tailplus1   "tail -n +1 is the whole file"
+cmp_case tailplusbig "tail -n +N past the end is empty"
+cmp_case taillast    "tail -n 2 is the last two"
+cmp_case tailneg     "tail -n -2 is the last two"
+cmp_case tailzero    "tail -n 0 prints nothing"
+cmp_case tailshort   "tail -5 shorthand"
+cmp_case tailcplus   "tail -c +4 skips bytes"
+cmp_case tailclast   "tail -c 3 is the last bytes"
+cmp_case tailmulti   "tail over two files heads each"
+cmp_case tailq       "tail -q suppresses the headers"
+cmp_case headneg     "head -n -2 drops the last two"
+cmp_case headneg1    "head -n -1 drops the last one"
+cmp_case headnegall  "head -n -N past the end is empty"
+cmp_case headcneg    "head -c -4 drops the last bytes"
+cmp_case headplain   "head -n 2 is unchanged"
+cmp_case headq       "head -q suppresses the headers"
 
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"

@@ -31,4 +31,35 @@ echo @@csplit;  csplit -f cs f1 2 > /dev/null; cat cs00; echo --; cat cs01
 echo @@pr;      pr -t f1
 echo @@pathbad; pathchk -p 'bad name!' 2>&1; echo rc=$?
 echo @@pathok;  pathchk -p good_name; echo rc=$?
+
+# --- tail/head window arithmetic -----------------------------------------
+# `tail -n +2` used to mean `tail -n 2` here, because the count was read
+# with atoi() and atoi("+2") is 2. Dropping a header line is the commonest
+# use of tail in any script, and it was silently printing the LAST two lines
+# instead. head had the mirror-image gap: a negative count was rejected as a
+# usage error rather than meaning "all but the last N".
+printf 'L1
+L2
+L3
+L4
+L5
+' > five
+printf 'abcdefghij' > ten
+echo @@tailplus;   tail -n +2 five
+echo @@tailplus1;  tail -n +1 five
+echo @@tailplusbig; tail -n +9 five; echo rc=$?
+echo @@taillast;   tail -n 2 five
+echo @@tailneg;    tail -n -2 five
+echo @@tailzero;   tail -n 0 five; echo rc=$?
+echo @@tailshort;  tail -5 five
+echo @@tailcplus;  printf "%s\n" "$(tail -c +4 ten)"
+echo @@tailclast;  printf "%s\n" "$(tail -c 3 ten)"
+echo @@tailmulti;  tail -n 1 five h
+echo @@tailq;      tail -q -n 1 five h
+echo @@headneg;    head -n -2 five
+echo @@headneg1;   head -n -1 five
+echo @@headnegall; head -n -9 five; echo rc=$?
+echo @@headcneg;   printf "%s\n" "$(head -c -4 ten)"
+echo @@headplain;  head -n 2 five
+echo @@headq;      head -q -n 1 five h
 echo @@END
