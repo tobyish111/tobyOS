@@ -288,6 +288,23 @@ ck b3_mount    "mount reports the real table" '^[1-9]'
 ck b3_umount   "umount refuses, with the reason" 'no native syscall.*rc=[1-9]'
 
 
+echo "=== zstd: the last format that blocked reading real data ==="
+# etc/gnumade.zst is real `zstd -19` output. Our own encoder writes RAW
+# blocks, so a self round trip would never touch the FSE tables, the
+# Huffman literals or the sequence machinery -- this fixture is the only
+# thing that does.
+ck zst_gnu     "decodes real zstd -19 output" "$GNU_SHA"
+ck zst_gnu     "line count matches"           "lines: $GNU_LINES\|"
+ck zst_gnu     "byte count matches"           "bytes: $GNU_BYTES\|"
+eq zst_test_ok "-t accepts it"                'rc=0|'
+# One bit flipped mid-payload: the frame still parses, so ONLY the XXH64
+# content checksum catches it. If this ever passes, that check is gone.
+ck zst_badsum  "-t catches a flipped bit"     'checksum mismatch.*rc=[1-9]'
+ck zst_notzst  "a non-zstd file is refused"   'not in zstd format'
+eq zst_roundtrip "our own frames read back"   'made: yes|same: yes|'
+ck zst_pipe    "a pipeline round trips"       '^round trip me'
+
+
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"

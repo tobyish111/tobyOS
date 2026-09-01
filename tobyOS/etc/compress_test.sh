@@ -392,4 +392,24 @@ mount | head -1 | wc -w
 echo @@b3_umount
 umount /tmp 2>&1; echo rc=$?
 
+# --- zstd ---------------------------------------------------------------
+echo @@zst_gnu
+zstdcat /etc/gnumade.zst > /tmp/zg.out
+echo "lines: $(wc -l < /tmp/zg.out)"
+echo "bytes: $(wc -c < /tmp/zg.out)"
+sha256sum /tmp/zg.out | cut -d' ' -f1
+echo @@zst_test_ok
+zstd -t /etc/gnumade.zst; echo rc=$?
+echo @@zst_badsum
+zstd -t /etc/gnubadzst.zst 2>&1; echo rc=$?
+echo @@zst_notzst
+unzstd -c /etc/motd 2>&1 | head -1; echo done
+echo @@zst_roundtrip
+cp /tmp/zg.out /tmp/zr.txt
+zstd -q -k /tmp/zr.txt 2>/dev/null; echo "made: $([ -f /tmp/zr.txt.zst ] && echo yes || echo no)"
+unzstd -c /tmp/zr.txt.zst > /tmp/zr.back 2>/dev/null
+echo "same: $([ "$(wc -c < /tmp/zr.txt)" = "$(wc -c < /tmp/zr.back)" ] && echo yes || echo no)"
+echo @@zst_pipe
+printf 'round trip me\n' | zstd -q 2>/dev/null | unzstd
+
 echo @@compress_END

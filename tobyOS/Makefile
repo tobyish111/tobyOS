@@ -561,6 +561,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_ls/user_ls.elf \
             programs/user_tar/user_tar.elf \
             programs/user_textutils/user_textutils.elf \
+            programs/user_zstd/user_zstd.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1024,6 +1025,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/deflate.c \
                    $(LIBTOBY_SRC)/bzip2.c \
                    $(LIBTOBY_SRC)/bzip2_enc.c \
+                   $(LIBTOBY_SRC)/zstd.c \
                    $(LIBTOBY_SRC)/md5sha1.c \
                    $(LIBTOBY_SRC)/render.c \
                    $(LIBTOBY_SRC)/clipboard_ext.c \
@@ -1797,6 +1799,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_textutils,user_textutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_zstd,user_zstd))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3156,6 +3159,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
 	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
 	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
+	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
+	@# zstd family, one binary dispatched on argv[0]
+	@for ap in unzstd zstdcat; do \
+	    ln -f $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	cp programs/user_textutils/user_textutils.elf  $(INITRD_STAGE)/bin/comm
 	@# twenty more names that were busybox applets, one binary
 	@for ap in expand unexpand fold nl od hexdump paste rev shuf split \
@@ -3232,6 +3241,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
 	cp etc/gnumade.bz2                              $(INITRD_STAGE)/etc/gnumade.bz2
 	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
+	cp etc/gnumade.zst                              $(INITRD_STAGE)/etc/gnumade.zst
+	cp etc/gnubadzst.zst                            $(INITRD_STAGE)/etc/gnubadzst.zst
 	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
 	cp etc/procnet_test.sh                          $(INITRD_STAGE)/etc/procnet_test.sh
 	cp etc/power_test.sh                            $(INITRD_STAGE)/etc/power_test.sh
@@ -3964,7 +3975,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/coreutils_test.sh etc/coreutils_extra.sh etc/accounts_test.sh  \
 	    etc/ssh_test.sh etc/util_test.sh etc/e2fs_test.sh                   \
 	    etc/gzip_test.sh etc/gnumade.gz etc/gnubadcrc.gz                  \
-	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2              \
+	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2 \
+	    etc/gnumade.zst etc/gnubadzst.zst              \
 	    etc/sed_test.sh                                                   \
 	    etc/procnet_test.sh                                               \
 	    etc/power_test.sh                                                 \
@@ -3991,6 +4003,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
 	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
 	    bin/mount bin/umount                                               \
+	    bin/zstd bin/unzstd bin/zstdcat                                    \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5752,6 +5765,7 @@ clean:
 	       programs/user_tar/user_tar.o programs/user_tar/puff.o \
 	       programs/user_tar/user_tar.elf \
 	       programs/user_textutils/user_textutils.o programs/user_textutils/user_textutils.elf \
+	       programs/user_zstd/user_zstd.o programs/user_zstd/user_zstd.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \
