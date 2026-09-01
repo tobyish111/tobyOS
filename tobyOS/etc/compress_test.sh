@@ -349,4 +349,47 @@ nice echo ran 2>/dev/null
 echo @@b2_mkfifo
 mkfifo /tmp/fifo1 2>&1; echo rc=$?
 
+# --- the third batch that was busybox -----------------------------------
+printf 'a\nb\nd\n' > /tmp/c1
+printf 'b\nc\nd\n' > /tmp/c2
+echo @@b3_comm
+comm /tmp/c1 /tmp/c2 | tr '	' ':'
+echo @@b3_comm12
+comm -12 /tmp/c1 /tmp/c2
+echo @@b3_expand
+printf 'a	b\n' > /tmp/tabf; expand -t4 /tmp/tabf | cat -A 2>/dev/null || expand -t4 /tmp/tabf | tr ' ' '.'
+echo @@b3_fold
+echo abcdefghij | fold -w 4
+echo @@b3_nl
+printf 'x\n\ny\n' | nl | tr -s ' '
+echo @@b3_paste
+paste /tmp/c1 /tmp/c2 | tr '	' ':'
+echo @@b3_rev
+echo abcde | rev
+echo @@b3_split
+printf '1\n2\n3\n4\n' > /tmp/sp; cd /tmp && split -l 2 /tmp/sp part && cat partaa && echo -- && cat partab
+cd /tmp
+echo @@b3_shuf
+printf 'a\nb\nc\n' | shuf | sort | tr '\n' ','
+echo @@b3_od
+printf 'AB' | od | head -1 | tr -s ' '
+echo @@b3_mktemp
+T=$(mktemp /tmp/mt.XXXXXX); echo "created: $([ -f "$T" ] && echo yes || echo no)"
+echo @@b3_groups
+groups | head -1 | wc -w
+echo @@b3_hostname
+hostname
+echo @@b3_hostname_set
+hostname newname 2>&1; echo rc=$?
+echo @@b3_readlink
+ln -sf /tmp/c1 /tmp/lnk3; readlink /tmp/lnk3
+echo @@b3_killall
+sleep 40 &
+sleep 1
+killall sleep; echo "rc=$?"
+echo @@b3_mount
+mount | head -1 | wc -w
+echo @@b3_umount
+umount /tmp 2>&1; echo rc=$?
+
 echo @@compress_END

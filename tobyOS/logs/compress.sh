@@ -264,6 +264,30 @@ ck b2_nice         "nice still runs the command"     '^ran'
 ck b2_mkfifo       "mkfifo refuses and says why"     'not implemented.*rc=[1-9]'
 
 
+echo "=== twenty more names that were only busybox ==="
+# comm's column layout is tabs; the guest turns them into ':' so the
+# alignment is visible in a single-line comparison.
+eq b3_comm     "comm's three columns"        'a|::b|:c|::d|'
+eq b3_comm12   "comm -12 is the intersection" 'b|d|'
+eq b3_expand   "expand -t4 turns a tab into stops" 'a...b|'
+eq b3_fold     "fold -w 4"                   'abcd|efgh|ij|'
+ck b3_nl       "nl numbers non-empty lines"  '1.x'
+eq b3_paste    "paste joins column-wise"     'a:b|b:c|d:d|'
+eq b3_rev      "rev reverses each line"      'edcba|'
+eq b3_split    "split -l 2 makes two parts"  '1|2|--|3|4|'
+eq b3_shuf     "shuf keeps every line"       'a,b,c,|'
+# GNU od with no options is OCTAL 16-BIT WORDS: "AB" is one word, 041101.
+eq b3_od       "od defaults to octal words"  '0000000 041101|'
+eq b3_mktemp   "mktemp creates the file"     'created: yes|'
+ck b3_groups   "groups names at least one"   '^[0-9]'
+ck b3_hostname "hostname reads the real name" '.'
+ck b3_hostname_set "setting it is refused, with the reason"                    'no sethostname.*rc=[1-9]'
+ck b3_readlink "readlink resolves the link"  '/tmp/c1'
+eq b3_killall  "killall ends a match"        'rc=0|'
+ck b3_mount    "mount reports the real table" '^[1-9]'
+ck b3_umount   "umount refuses, with the reason" 'no native syscall.*rc=[1-9]'
+
+
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"

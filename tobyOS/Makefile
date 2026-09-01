@@ -560,6 +560,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_shellutils/user_shellutils.elf \
             programs/user_ls/user_ls.elf \
             programs/user_tar/user_tar.elf \
+            programs/user_textutils/user_textutils.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1795,6 +1796,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_locate,user_locate))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_textutils,user_textutils))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3154,6 +3156,14 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
 	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
 	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
+	cp programs/user_textutils/user_textutils.elf  $(INITRD_STAGE)/bin/comm
+	@# twenty more names that were busybox applets, one binary
+	@for ap in expand unexpand fold nl od hexdump paste rev shuf split \
+	           readlink realpath mktemp groups hostname chown killall \
+	           mount umount; do \
+	    ln -f $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
 	@# sixteen names that were busybox applets until now, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
@@ -3977,6 +3987,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
 	    bin/printenv bin/nice bin/pgrep bin/pkill bin/tty bin/stty        \
 	    bin/cksum bin/truncate bin/install bin/mkfifo                     \
+	    bin/comm bin/expand bin/unexpand bin/fold bin/nl bin/od bin/hexdump \
+	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
+	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
+	    bin/mount bin/umount                                               \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5737,6 +5751,7 @@ clean:
 	       programs/user_ls/user_ls.o programs/user_ls/user_ls.elf \
 	       programs/user_tar/user_tar.o programs/user_tar/puff.o \
 	       programs/user_tar/user_tar.elf \
+	       programs/user_textutils/user_textutils.o programs/user_textutils/user_textutils.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \
