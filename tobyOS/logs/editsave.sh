@@ -32,7 +32,15 @@ rm -f "$LOG" || { echo "ABORT: log busy"; exit 1; }
 rm -f src/kernel.o
 PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH" \
   make "CC=TMP='C:\t' TEMP='C:\t' clang" "HOST_CC=TMP='C:\t' TEMP='C:\t' gcc" \
-       EXTRA_CFLAGS=-DEDITSAVE_SELFTEST iso >/dev/null 2>&1
+       EXTRA_CFLAGS=-DEDITSAVE_SELFTEST iso >logs/.buildlog.txt 2>&1
+BUILD_RC=$?
+# A FAILED BUILD USED TO LOOK LIKE A PASSING GATE -- see logs/coreutils.sh.
+if [ $BUILD_RC -ne 0 ]; then
+    echo "ABORT: the build FAILED -- the ISO on disk is stale, so any"
+    echo "       verdict below would have described code that is not in it."
+    tail -25 logs/.buildlog.txt
+    exit 1
+fi
 if [ ! -f tobyOS.iso ]; then echo "ABORT: build produced no ISO"; exit 1; fi
 
 "/c/Program Files/qemu/qemu-system-x86_64.exe" \
