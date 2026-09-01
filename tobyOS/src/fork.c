@@ -1868,10 +1868,36 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     kprintf("[execve] pid=%d now running '%s' entry=%p rsp=%p\n",
             p->pid, p->name, (void *)p->user_entry, (void *)p->user_rsp);
 
+    /* THE EXEC STOP. A tracer that asked to follow this process gets one
+     * chance to act after the new image is mapped and before a single
+     * instruction of it runs -- which is the only moment a debugger can
+     * write a breakpoint into text that does not exist yet at TRACEME time
+     * and is already executing a moment later.
+     *
+     * Linux delivers exactly this (a SIGTRAP after a successful exec) and
+     * every debugger depends on it. Without it `run` had nothing to wait
+     * for: the tracer called waitpid, the child ran to completion, and a
+     * debugger that never sees its target stop is a prompt with no program
+     * behind it.
+     *
+     * Parked here, inside the syscall and holding the BKL, exactly as the
+     * syscall-boundary stop does -- the frame GETREGS reports is execve's
+     * own, so a tracer reads the program's entry from the ELF rather than
+     * from rip, which is what it does anyway. */
     /* This path enters ring 3 directly and never returns to syscall_dispatch,
      * so release the BKL here (execve was called from a syscall holding it).
      * Idempotent if already released. */
     bkl_exit();
+
+    /* AFTER bkl_exit, and that ordering is the whole point: the stop parks
+     * this process with sched_yield, and yielding while holding the big
+     * kernel lock stops every other CPU too -- the machine went silent and
+     * the boot harness never reported at all. Parking here means the tracer
+     * can actually be scheduled to resume us. */
+    if (p->tracer_pid) {
+        extern void ptrace_exec_stop(struct proc *p);
+        ptrace_exec_stop(p);
+    }
 
     /* Jump to new program -- does not return. */
     proc_enter_user_asm(p->user_entry, p->user_rsp);

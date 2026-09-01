@@ -568,6 +568,11 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_at/user_at.elf \
             programs/user_setpci/user_setpci.elf \
             programs/user_systemctl/user_systemctl.elf \
+            programs/user_ping/user_ping.elf \
+            programs/user_ftp/user_ftp.elf \
+            programs/user_sudo/user_sudo.elf \
+            programs/user_ranlib/user_ranlib.elf \
+            programs/user_addr2line/user_addr2line.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1812,6 +1817,11 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_strip,user_strip))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_at,user_at))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_setpci,user_setpci))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_systemctl,user_systemctl))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ping,user_ping))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ftp,user_ftp))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_sudo,user_sudo))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ranlib,user_ranlib))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_addr2line,user_addr2line))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3112,6 +3122,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/reclaimtest/reclaimtest.elf           $(INITRD_STAGE)/bin/reclaimtest
 	cp programs/strace/strace.elf                     $(INITRD_STAGE)/bin/strace
 	cp programs/debugger/debugger.elf                 $(INITRD_STAGE)/bin/debugger
+	@# gdb is the debugger under the name people actually type
+	@ln -f $(INITRD_STAGE)/bin/debugger "$(INITRD_STAGE)/bin/gdb" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/debugger "$(INITRD_STAGE)/bin/gdb"
 	cp programs/pkgmgr/pkgmgr.elf                    $(INITRD_STAGE)/bin/pkgmgr
 	cp programs/tobycc/tobycc.elf                     $(INITRD_STAGE)/bin/tobycc
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
@@ -3195,6 +3208,20 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_at/user_at.elf                 $(INITRD_STAGE)/bin/at
 	cp programs/user_setpci/user_setpci.elf         $(INITRD_STAGE)/bin/setpci
 	cp programs/user_systemctl/user_systemctl.elf   $(INITRD_STAGE)/bin/systemctl
+	cp programs/user_ping/user_ping.elf             $(INITRD_STAGE)/bin/ping
+	@# ping/clockdiff/tcpdump, one raw-socket binary dispatched on argv[0]
+	@for ap in clockdiff tcpdump; do \
+	    ln -f $(INITRD_STAGE)/bin/ping "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/ping "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_ftp/user_ftp.elf               $(INITRD_STAGE)/bin/ftp
+	cp programs/user_sudo/user_sudo.elf             $(INITRD_STAGE)/bin/sudo
+	cp programs/user_ranlib/user_ranlib.elf         $(INITRD_STAGE)/bin/ranlib
+	cp programs/user_addr2line/user_addr2line.elf   $(INITRD_STAGE)/bin/addr2line
+	cp initrd/etc/sudoers                           $(INITRD_STAGE)/etc/sudoers
+	@# the FTP server the client is tested against
+	@ln -f $(INITRD_STAGE)/bin/ftp "$(INITRD_STAGE)/bin/ftpd" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/ftp "$(INITRD_STAGE)/bin/ftpd"
 	@# systemctl/service, one binary dispatched on argv[0]
 	@ln -f $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service" 2>/dev/null || \
 	    cp $(INITRD_STAGE)/bin/systemctl "$(INITRD_STAGE)/bin/service"
@@ -3255,7 +3282,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	      cp $(INITRD_STAGE)/bin/gzip "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	@# ext2/3/4 inspection tools, one binary dispatched on argv[0]
-	@for ap in dumpe2fs e2fsck debugfs badblocks; do \
+	@for ap in dumpe2fs e2fsck debugfs badblocks resize2fs; do \
 	    ln -f $(INITRD_STAGE)/bin/user_e2fs "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/user_e2fs "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3290,6 +3317,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/gnubadcrc.gz                             $(INITRD_STAGE)/etc/gnubadcrc.gz
 	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
 	cp etc/distro_test.sh                           $(INITRD_STAGE)/etc/distro_test.sh
+	cp etc/libtest.a                                $(INITRD_STAGE)/etc/libtest.a
+	cp etc/dwarf_test.elf                           $(INITRD_STAGE)/etc/dwarf_test.elf
+	cp etc/dbg_test.elf                             $(INITRD_STAGE)/etc/dbg_test.elf
 	cp etc/gnumade.bz2                              $(INITRD_STAGE)/etc/gnumade.bz2
 	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
 	cp etc/gnumade.zst                              $(INITRD_STAGE)/etc/gnumade.zst
@@ -4038,6 +4068,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/gnumade.zst etc/gnubadzst.zst              \
 	    etc/gnumade.zip etc/gnubadzip.zip              \
 	    etc/distro_test.sh                            \
+	    etc/libtest.a etc/dwarf_test.elf              \
+	    etc/dbg_test.elf                              \
 	    etc/sed_test.sh                                                   \
 	    etc/procnet_test.sh                                               \
 	    etc/power_test.sh                                                 \
@@ -4071,10 +4103,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/at bin/batch bin/atq bin/atrm                   \
 	    bin/setpci                                          \
 	    bin/systemctl bin/service bin/netcat bin/getent      \
+	    bin/ping bin/clockdiff bin/tcpdump bin/ftp bin/ftpd  \
+	    bin/ranlib bin/addr2line etc/sudoers                 \
+	    bin/gdb                                             \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
-	    bin/user_e2fs bin/dumpe2fs bin/e2fsck bin/debugfs bin/badblocks    \
+	    bin/user_e2fs bin/dumpe2fs bin/e2fsck bin/debugfs bin/badblocks bin/resize2fs    \
 	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
 	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
 	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
@@ -4088,6 +4123,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/tsh bin/shparity bin/oilspec bin/ttyparity                    \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
+	  && tar --format=ustar --mode=4755 \
+	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
+	    bin/sudo                                                          \
 	  && tar --format=ustar --mode=0644 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
@@ -5840,6 +5878,11 @@ clean:
 	       programs/user_at/user_at.o programs/user_at/user_at.elf \
 	       programs/user_setpci/user_setpci.o programs/user_setpci/user_setpci.elf \
 	       programs/user_systemctl/user_systemctl.o programs/user_systemctl/user_systemctl.elf \
+	       programs/user_ping/user_ping.o programs/user_ping/user_ping.elf \
+	       programs/user_ftp/user_ftp.o programs/user_ftp/user_ftp.elf \
+	       programs/user_sudo/user_sudo.o programs/user_sudo/user_sudo.elf \
+	       programs/user_ranlib/user_ranlib.o programs/user_ranlib/user_ranlib.elf \
+	       programs/user_addr2line/user_addr2line.o programs/user_addr2line/user_addr2line.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

@@ -40,6 +40,21 @@ for d in $(lsblk | tail -n +2 | cut -d' ' -f1); do
 done
 echo @@e2_badblocks_refuses_write
 badblocks -w /dev/null 2>&1; echo rc=$?
+echo @@e2_resize_p
+for d in $(lsblk | tail -n +2 | cut -d' ' -f1); do
+  if dumpe2fs -h $d 2>/dev/null | grep -q TOBYGOOD; then resize2fs -P $d; break; fi
+done
+echo @@e2_resize_write
+for d in $(lsblk | tail -n +2 | cut -d' ' -f1); do
+  # No pipeline: `echo rc=$?` after one reports the LAST command's status,
+  # not resize2fs's, and merging stderr into a pipe lost the message too.
+  if dumpe2fs -h $d 2>/dev/null | grep -q TOBYGOOD; then
+    MSG=$(resize2fs $d 2>&1)
+    echo rc=$?
+    echo "$MSG"
+    break
+  fi
+done
 echo @@e2_notext4
 dumpe2fs -h nosuchdev 2>&1; echo rc=$?
 echo @@e2_END

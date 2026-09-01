@@ -679,6 +679,21 @@ static void phase_user(void) {
            TAG, (int)getuid());
     snprintf(msg, sizeof msg, "uid=%d gid=%d", (int)getuid(), (int)getgid());
     check(getuid() == 1000, "privilege really dropped", msg);
+    /* A raw socket can read every packet the machine receives and forge the
+     * contents of one it sends. Linux gates that on root and so does this
+     * kernel -- and a permission model is only proven by the DENIAL, which
+     * is why the check lives here rather than in a harness that runs as
+     * root and could only ever watch it succeed. */
+    {
+        int rfd = socket(2 /* AF_INET */, 3 /* SOCK_RAW */, 1 /* ICMP */);
+        check(rfd < 0, "a raw socket is refused to a normal user",
+              rfd < 0 ? "denied" : "OPENED -- the root-only gate is gone");
+        if (rfd >= 0) close(rfd);
+        int pfd = socket(17 /* AF_PACKET */, 3 /* SOCK_RAW */, 0);
+        check(pfd < 0, "so is an AF_PACKET tap",
+              pfd < 0 ? "denied" : "OPENED -- the root-only gate is gone");
+        if (pfd >= 0) close(pfd);
+    }
     /* The two mounts a desktop session actually writes to. */
     crud("/tmp");
     crud("/data");

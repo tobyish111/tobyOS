@@ -16,6 +16,14 @@ cd "$(dirname "$0")/.."
 LOG=logs/procnet.log
 rm -f "$LOG"
 
+# FORCE A KERNEL REBUILD. EXTRA_CFLAGS is not a file, so make cannot see
+# that it changed: src/kernel.o built by the PREVIOUS gate -- with that
+# gate's -D flags -- is newer than kernel.c and gets reused. Running
+# logs/fsprobe.sh (which builds -DFSPROBE_BOOT, no -DCOREUTILS_SELFTEST)
+# and then this gate booted a kernel with NO selftest in it at all: the
+# harness never ran, and the only symptom was a boot that looked healthy
+# and said nothing. Five other gates already did this; these did not.
+rm -f src/kernel.o
 PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH" \
   make "CC=TMP='C:\t' TEMP='C:\t' clang" "HOST_CC=TMP='C:\t' TEMP='C:\t' gcc" \
        EXTRA_CFLAGS=-DCOREUTILS_SELFTEST iso >logs/.buildlog.txt 2>&1
@@ -35,7 +43,11 @@ fi
   -boot d -smp 4 -m 5120 -cpu max \
   -serial file:"$LOG" -no-reboot -display none 2>/dev/null &
 
-for i in $(seq 1 220); do
+# 800 s, not 440: the shared boot now runs eleven test scripts and the
+# distro one alone spends ~40 s in ping, tcpdump, an FTP session and a
+# debugger. The machine was alive and working at 438 s when this gate
+# gave up on it.
+for i in $(seq 1 400); do
     grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break
     sleep 2
 done

@@ -90,7 +90,7 @@ fi
 # The shared boot harness now runs six scripts (coreutils, extra,
 # accounts, ssh, util, e2fs) and the ssh one alone takes ~40s of guest
 # time. Waiting is cheap; a false ABORT costs a whole rebuild.
-for i in $(seq 1 200); do grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break; sleep 2; done
+for i in $(seq 1 400); do grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break; sleep 2; done
 MSYS_NO_PATHCONV=1 taskkill /F /IM qemu-system-x86_64.exe >/dev/null 2>&1
 if ! grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null; then
     echo "ABORT: the harness never reported"
@@ -153,6 +153,10 @@ echo "=== the write modes refuse, and say why ==="
 want e2_e2fsck_refuses_repair  "e2fsck -y refuses"    'REPAIR.*rc=8'
 want e2_debugfs_refuses_write  "debugfs -w refuses"   'read-only.*rc=1'
 want e2_badblocks_refuses_write "badblocks -w refuses" 'WRITE test.*rc=1'
+
+echo "=== resize2fs: the calculation is real, the move is refused ==="
+want e2_resize_p     "-P reports a minimum size" 'Estimated minimum size.*[0-9]'
+want e2_resize_write "an actual resize is refused, with the reason" 'read-only by design'
 
 echo "=== read paths ==="
 want e2_debugfs   "debugfs stats reads the superblock" 'TOBYGOOD.*Block count'

@@ -128,6 +128,7 @@ extern "C" {
 #define ABI_EXDEV           18   /* hard link across filesystems */
 #define ABI_ENOMSG          42   /* no message of desired type (msgrcv) */
 #define ABI_EIDRM           43   /* IPC id was removed */
+#define ABI_EAFNOSUPPORT    97   /* address family not supported */
 
 /* ============================================================
  *  Process ABI personality (Track B: foreign-binary compat)
@@ -1136,6 +1137,7 @@ struct abi_vizmap {
  * a privileged act, and the call cannot lose data. */
 #define ABI_SYS_SYNC            203  /* () */
 #define ABI_SYS_PCI_CFG         204  /* (op, bdf, off, val) */
+#define ABI_SYS_AUTH_CHECK      205  /* (user, password) -> 0 | -EACCES */
 #define ABI_PCI_CFG_READ32      0
 #define ABI_PCI_CFG_WRITE32     1
 

@@ -150,20 +150,24 @@ static int udp_send(uint32_t ip, uint16_t port) {
 
 /* ------------------------------------------------------------ TCP paths */
 
-/* Pumps stdin to the connection and the connection to stdout. There is no
- * poll() worth trusting here (see the shell tty-parity notes), so the loop
- * alternates a non-blocking-ish read of each side and yields. */
+/* Pumps stdin to the connection and the connection to stdout.
+ *
+ * tcp_recv returns > 0 for data, 0 for "the ten-second cap expired and the
+ * peer has not spoken", and < 0 when the peer has CLOSED. Reading 0 as
+ * end-of-file -- which this did -- ends the session on the first quiet
+ * moment and leaves a live connection looking finished. */
 static int tcp_pump(int conn) {
     char buf[4096];
-    int saw_eof_in = 0;
+    int saw_eof_in = 0, idle = 0;
     for (;;) {
         int n = toby_tcp_recv(conn, buf, sizeof buf);
         if (n > 0) {
             fwrite(buf, 1, (size_t)n, stdout);
             fflush(stdout);
+            idle = 0;
             continue;
         }
-        if (n == 0) break;                 /* peer closed */
+        if (n < 0) break;                  /* peer closed */
         if (!saw_eof_in) {
             if (fgets(buf, sizeof buf, stdin)) {
                 size_t len = strlen(buf);
@@ -175,16 +179,9 @@ static int tcp_pump(int conn) {
             }
             saw_eof_in = 1;
         }
-        /* stdin is done and the peer has nothing yet: give it a chance to
-         * answer before deciding the exchange is over. */
-        int idle = 0;
-        for (; idle < 200; idle++) {
-            n = toby_tcp_recv(conn, buf, sizeof buf);
-            if (n > 0) { fwrite(buf, 1, (size_t)n, stdout); fflush(stdout); break; }
-            if (n == 0) return 0;
-            nc_yield();
-        }
-        if (idle >= 200) break;
+        /* stdin is finished and the peer is quiet. Two more waits, then the
+         * exchange is over. */
+        if (++idle >= 2) break;
     }
     return 0;
 }

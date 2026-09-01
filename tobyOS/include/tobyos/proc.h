@@ -458,7 +458,15 @@ struct proc {
     uint8_t         ptrace_stopped;
     uint8_t         ptrace_syscall;
     uint8_t         ptrace_atexit;
-    int             ptrace_stopsig;
+    int      ptrace_stopsig;
+    /* NON-NULL while the tracee is parked in an EXCEPTION stop (#BP or
+     * #DB) rather than a syscall stop. The two save completely different
+     * frames -- a syscall entry keeps rip in rcx and rflags in r11 because
+     * that is what SYSRET reloads, while an exception pushes real rip,
+     * rflags and rsp -- so GETREGS/SETREGS have to know which one they are
+     * looking at. Reading the syscall frame after an int3 would report the
+     * register values of whatever syscall the process last made. */
+    struct regs *ptrace_exc_regs;
     long            ptrace_orig_rax;
     long            ptrace_retval;
 

@@ -33,17 +33,34 @@
 #define SOCK_KIND_TCP          2
 #define SOCK_KIND_UNIX         3       /* AF_UNIX socketpair endpoint (Track B) */
 #define SOCK_KIND_NETLINK      4       /* AF_NETLINK/NETLINK_ROUTE (Track B) */
+#define SOCK_KIND_RAW          5       /* SOCK_RAW: AF_INET (IP datagrams,
+                                        * header included) or AF_PACKET
+                                        * (whole ethernet frames) */
 
 /* User-visible "domain"/"type" constants. */
 #define AF_UNIX                1
 #define AF_INET                2
 #define AF_INET6               10      /* UDP since 2026-08-23; SOCK_STREAM -> EAFNOSUPPORT */
 #define AF_NETLINK             16      /* rtnetlink (chrome's NetworkChangeNotifier) */
+#define AF_PACKET              17      /* link-layer frames (tcpdump) */
+#define ETH_P_ALL              0x0003  /* AF_PACKET: every EtherType */
 #define NETLINK_ROUTE          0
 #define SOCK_STREAM            1       /* TCP */
 #define SOCK_DGRAM             2       /* UDP */
 #define SOCK_RAW               3       /* AF_NETLINK uses this */
 #define SOCK_SEQPACKET         5       /* AF_UNIX message socket (Mojo uses this) */
+
+/* The native ABI's socket() takes (domain, type) and has no room for a
+ * protocol argument. A raw socket needs one, so it rides in the TOP 16
+ * bits of `type`: socket(AF_INET, SOCK_RAW | (IPPROTO_ICMP << 16)).
+ * Protocol 0 means "every protocol", which is what tcpdump wants. */
+#define SOCK_RAW_PROTO_SHIFT   16
+#define SOCK_TYPE_MASK         0xFFFF
+
+#define IPPROTO_ICMP           1
+#define IPPROTO_TCP            6
+#define IPPROTO_UDP            17
+#define IPPROTO_RAW            255
 
 /* Type-flag bits OR'd into socket()/accept4()'s `type` argument. Chrome's
  * network service creates EVERY socket with SOCK_NONBLOCK and drives it from
@@ -153,6 +170,14 @@ struct sock {
                                         * responder, which enqueues replies back
                                         * into THIS sock's own rx ring. */
     uint8_t         x_setup_done;      /* X11 connection-setup reply delivered. */
+
+    /* SOCK_RAW. `raw_proto` is the IP protocol number this socket wants (0
+     * = all). `raw_is_packet` marks an AF_PACKET socket, which receives
+     * whole ethernet frames instead of IP datagrams and is never a send
+     * target. Every raw socket is root-only at creation; nothing here
+     * re-checks, because a socket cannot change owner. */
+    uint8_t          raw_proto;
+    uint8_t          raw_is_packet;
 
     /* TCP: wrapped kernel connection. */
     struct tcp_conn *tcp;
@@ -356,6 +381,17 @@ long sock_recvfrom6_to(struct sock *s, void *buf, size_t n,
                        uint32_t timeout_ms);
 void sock_udp6_deliver(const struct ipv6_addr *src, uint16_t sport,
                        uint16_t dport, const void *data, size_t len);
+
+/* Raw delivery. sock_deliver_raw takes the WHOLE IP datagram (header
+ * included, as Linux does for SOCK_RAW) and fans it out to every raw
+ * socket whose protocol matches. sock_deliver_packet takes a whole
+ * ethernet frame and fans it out to every AF_PACKET socket. Both are
+ * no-ops when no raw socket exists, which is the normal case. */
+void sock_deliver_raw(uint32_t src_ip_be, uint8_t proto,
+                      const void *ip_datagram, size_t len);
+void sock_deliver_packet(const void *frame, size_t len);
+int  sock_any_packet_listener(void);
+int  sock_any_raw_listener(void);
 
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be);

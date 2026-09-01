@@ -17,6 +17,7 @@
  */
 
 #include <tobyos/ip.h>
+#include <tobyos/socket.h>  /* sock_deliver_raw */
 #include <tobyos/eth.h>
 #include <tobyos/arp.h>
 #include <tobyos/icmp.h>
@@ -198,6 +199,7 @@ static bool ip_recv_maybe_reassemble(const struct ip_hdr *h,
     s->have_unique += added;
 
     if (s->total > 0 && bm_complete(s)) {
+        sock_deliver_raw(s->src_ip, s->proto, s->buf, s->total);
         ip_deliver_l4(s->src_ip, s->proto, s->buf, s->total);
         memset(s, 0, sizeof(*s));
     }
@@ -264,6 +266,27 @@ bool ip_send(uint32_t dst_ip_be, uint8_t proto,
     {
         uint32_t me = net_my_ip();
         if ((dst_ip_be & 0xFFu) == 127u || (me != 0 && dst_ip_be == me)) {
+            /* Raw sockets must see loopback too, or `ping 127.0.0.1` sends a
+             * request, the ICMP responder answers it, and the ping never sees
+             * either -- 100% loss on a machine talking to itself. This path
+             * returns BEFORE ip_send_frame, so the header a raw socket
+             * expects does not exist yet; it is built here, once, and only
+             * when something is actually listening. */
+            if (sock_any_raw_listener()) {
+                uint8_t lb[IP_HDR_LEN + 1500];
+                size_t n = payload_len < 1500 ? payload_len : 1500;
+                struct ip_hdr *lh = (struct ip_hdr *)lb;
+                memset(lh, 0, IP_HDR_LEN);
+                lh->ver_ihl   = 0x45;
+                lh->total_len = htons((uint16_t)(IP_HDR_LEN + n));
+                lh->ttl       = 64;
+                lh->proto     = proto;
+                lh->src_ip    = dst_ip_be;     /* src == dst on loopback */
+                lh->dst_ip    = dst_ip_be;
+                lh->checksum  = net_checksum(lh, IP_HDR_LEN);
+                memcpy(lb + IP_HDR_LEN, payload, n);
+                sock_deliver_raw(dst_ip_be, proto, lb, IP_HDR_LEN + n);
+            }
             ip_deliver_l4(dst_ip_be, proto, (const uint8_t *)payload,
                           payload_len);
             return true;
@@ -519,6 +542,13 @@ void ip_recv(const void *payload, size_t len) {
 
     const uint8_t *l4    = frame + IP_HDR_LEN;
     size_t         l4len = total - IP_HDR_LEN;
+
+    /* Raw sockets see the WHOLE datagram, header included, the way Linux
+     * hands SOCK_RAW its packets -- ping reads the IP header to get the
+     * TTL, and a sniffer needs the addresses. This runs BEFORE the L4
+     * dispatch and does not replace it: icmp_recv still answers pings
+     * addressed to us whether or not anything is watching. */
+    sock_deliver_raw(h->src_ip, h->proto, frame, total);
 
     ip_deliver_l4(h->src_ip, h->proto, l4, l4len);
 }

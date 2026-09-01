@@ -27,6 +27,14 @@ cd "$(dirname "$0")/.."
 LOG=logs/distrotail.log
 rm -f "$LOG" || { echo "ABORT: log busy"; exit 1; }
 
+# FORCE A KERNEL REBUILD. EXTRA_CFLAGS is not a file, so make cannot see
+# that it changed: src/kernel.o built by the PREVIOUS gate -- with that
+# gate's -D flags -- is newer than kernel.c and gets reused. Running
+# logs/fsprobe.sh (which builds -DFSPROBE_BOOT, no -DCOREUTILS_SELFTEST)
+# and then this gate booted a kernel with NO selftest in it at all: the
+# harness never ran, and the only symptom was a boot that looked healthy
+# and said nothing. Five other gates already did this; these did not.
+rm -f src/kernel.o
 PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH" \
   make "CC=TMP='C:\t' TEMP='C:\t' clang" "HOST_CC=TMP='C:\t' TEMP='C:\t' gcc" \
        EXTRA_CFLAGS=-DCOREUTILS_SELFTEST iso >logs/.buildlog.txt 2>&1
@@ -45,7 +53,11 @@ fi
   -boot d -smp 4 -m 5120 -cpu max \
   -serial file:"$LOG" -no-reboot -display none 2>/dev/null &
 
-for i in $(seq 1 220); do
+# 800 s, not 440: the shared boot now runs eleven test scripts and the
+# distro one alone spends ~40 s in ping, tcpdump, an FTP session and a
+# debugger. The machine was alive and working at 438 s when this gate
+# gave up on it.
+for i in $(seq 1 400); do
     grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null && break
     sleep 2
 done
@@ -213,6 +225,88 @@ ck z_notz      "a non-.Z file is refused"               'not in compress \(\.Z\)
 echo "=== nc: TCP by default, as netcat has always been ==="
 ck nc_tcp_open   "an open TCP port is reported open"  'port 22 \(tcp\) open.*rc=0'
 ck nc_tcp_closed "a closed one is refused"            'failed.*rc=[1-9]'
+
+echo "=== raw sockets: ping, tcpdump, clockdiff ==="
+# None of these could exist before the kernel had SOCK_RAW; the reply also
+# proves the raw socket delivers the WHOLE IP datagram, since ttl comes
+# from the IP header.
+ck ping_gateway "the gateway answers, with a ttl" 'bytes from 10\.0\.2\.2: icmp_seq=1 ttl=[0-9]+ time='
+ck ping_gateway "and a second sequence number"   'icmp_seq=2'
+ck ping_stats   "statistics report no loss"      '2 received, 0% packet loss'
+ck ping_stats   "and an rtt line"                'rtt min/avg/max'
+ck ping_badhost "an unresolvable name is refused" 'cannot resolve.*rc=[1-9]'
+ck tcpdump_capture "the tap sees frames"          'frames: [1-9]'
+ck tcpdump_capture "and reports what it captured" 'summary: 1'
+ck clockdiff    "clockdiff answers or says why"   'delta=|did not answer'
+
+echo
+echo "=== ftp, against the ftpd running in this same boot ==="
+ck ftp_setup    "the server has files to serve"   'served: [1-9]'
+ck ftp_session  "the greeting arrives"            '220 tobyOS FTP server ready'
+ck ftp_session  "login succeeds"                  '230 Logged in'
+ck ftp_session  "PWD answers"                     '257 "/"'
+ck ftp_session  "LIST shows the served file"      'greeting\.txt'
+ck ftp_session  "SIZE reports the length"         '213 26'
+ck ftp_session  "MKD creates a directory"         'subdir'
+ck ftp_session  "RMD removes it"                  '250 Removed'
+ck ftp_session  "DELE removes the file"           '250 Deleted'
+ck ftp_session  "and the transfers report bytes"  '26 bytes received'
+ck ftp_session  "including the upload"            'bytes sent for upload.txt'
+# The transfer is only real if the bytes match.
+eq ftp_bytes    "the downloaded file is identical"  'same: yes|'
+eq ftp_upload   "and so is the uploaded one"        'uploaded: yes|identical: yes|'
+eq ftp_deleted  "delete really deleted"             'greeting still there: no|'
+ck ftp_noserver "connecting to a dead port is refused" 'cannot connect'
+ck ftp_serverlog "the server logged that it was listening" 'listening on port 21'
+
+echo "=== sudo: a real setuid-root program ==="
+# Without the setuid bit the whole thing is decoration, so the bit itself
+# is checked before anything it enables.
+ck sudo_mode   "the binary is setuid"              '^-rws'
+ck sudo_root   "root runs a command"               'uid=0'
+ck sudo_root   "and -n succeeds without a prompt"  'rc=0'
+ck sudo_list   "-l lists what the caller may run"  'may run the following'
+ck sudo_nocmd  "an unknown command is reported"    'command not found.*rc=127'
+ck sudo_nouser "an unknown target user is refused" 'unknown user'
+ck sudo_sudoers "the shipped sudoers has the wheel rule" '^[1-9]'
+
+echo
+echo "=== ranlib ==="
+# Only DEFINED globals belong in the index: internal_only is static, so a
+# linker sent to liba.o for it would be sent for nothing.
+ck ranlib_list  "lists the globals of both members" 'lib_add.*liba\.o'
+ck ranlib_list  "including the second member's"     'lib_mul.*libb\.o'
+ck ranlib_list  "and the counts"                    '2 member\(s\), 5 symbol\(s\)'
+ck ranlib_write "writing the index reports it"      '5 symbol\(s\) indexed'
+ck ranlib_write "and the archive grew by the index" 'grew: yes'
+ck ranlib_idempotent "running twice changes nothing" 'stable: yes'
+ck ranlib_notar "a non-archive is refused"          'not an archive.*rc=[1-9]'
+
+echo
+echo "=== addr2line ==="
+# Pinned to what GNU addr2line answers for the same address in the same
+# file -- taken from the host, not from this implementation.
+eq a2l_line     "the line number matches GNU"       'dw.c:1|'
+eq a2l_func     "-f names the function too"         'dw_helper|dw.c:1|'
+ck a2l_unmapped "an unmapped address is ??:0"       '\?\?:0'
+ck a2l_nodebug  "a file with no DWARF says so"      'no \.debug_line'
+
+echo "=== gdb: real breakpoints over ptrace ==="
+# The old /bin/debugger called PTRACE_TRACEME on ITSELF and its `break` only
+# wrote an address into a table -- it never planted an int3 and never
+# stopped anything. These assertions are what that could not have passed.
+ck gdb_session "symbols are read from the target"   'Reading symbols'
+ck gdb_session "a breakpoint is set on a symbol"    'Breakpoint 0 at 0x.*dbg_step'
+ck gdb_session "and the target actually stops on it" 'Breakpoint 0, 0x.*in dbg_step'
+ck gdb_session "registers can be read at the stop"  'rip 0x'
+ck gdb_session "continuing hits it again"           'Breakpoint 0.*Breakpoint 0'
+ck gdb_session "three calls, three stops"           'Breakpoint 0.*Breakpoint 0.*Breakpoint 0'
+ck gdb_session "the first stop shows the argument"  'rdi 0x1'
+# Whether the target then runs to completion is answered separately, by
+# running the SAME binary with no debugger attached -- otherwise a fixture
+# that never exits and a debugger that cannot resume look identical.
+ck gdb_fixture "the target exits on its own"        'standalone rc=7'
+ck gdb_nosym   "an unknown symbol is refused"       'not defined'
 
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"

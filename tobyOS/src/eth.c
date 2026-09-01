@@ -22,6 +22,7 @@
 
 #include <tobyos/eth.h>
 #include <tobyos/net.h>
+#include <tobyos/socket.h>  /* AF_PACKET taps */
 #include <tobyos/arp.h>
 #include <tobyos/ip.h>
 #include <tobyos/ipv6.h>
@@ -108,6 +109,13 @@ void eth_recv_dev(const void *frame, size_t len, void *ns,
 
 static void eth_recv_inner(const void *frame, size_t len) {
     if (len < ETH_HDR_LEN) return;
+
+    /* AF_PACKET taps see the frame exactly as it arrived -- before the
+     * EtherType demux, so ARP and IPv6 are visible too, and before any
+     * decision about whether the frame is addressed to us. That is the
+     * whole point of a sniffer. Guarded so the normal case (nobody
+     * listening) costs one predictable branch. */
+    if (sock_any_packet_listener()) sock_deliver_packet(frame, len);
 
     const uint8_t *f = (const uint8_t *)frame;
     /* `et_off` indexes the 16-bit EtherType field (always 12 bytes after

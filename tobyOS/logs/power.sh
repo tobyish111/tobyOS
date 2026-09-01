@@ -21,6 +21,14 @@ cd "$(dirname "$0")/.."
 LOG=logs/power.log
 rm -f "$LOG"
 
+# FORCE A KERNEL REBUILD. EXTRA_CFLAGS is not a file, so make cannot see
+# that it changed: src/kernel.o built by the PREVIOUS gate -- with that
+# gate's -D flags -- is newer than kernel.c and gets reused. Running
+# logs/fsprobe.sh (which builds -DFSPROBE_BOOT, no -DCOREUTILS_SELFTEST)
+# and then this gate booted a kernel with NO selftest in it at all: the
+# harness never ran, and the only symptom was a boot that looked healthy
+# and said nothing. Five other gates already did this; these did not.
+rm -f src/kernel.o
 PATH="/c/msys64/ucrt64/bin:/c/msys64/usr/bin:$PATH" \
   make "CC=TMP='C:\t' TEMP='C:\t' clang" "HOST_CC=TMP='C:\t' TEMP='C:\t' gcc" \
        "EXTRA_CFLAGS=-DCOREUTILS_SELFTEST -DPOWER_REALTEST" iso \
@@ -45,7 +53,7 @@ QPID=$!
 # exits when the guest writes SLP_EN; if it does not, this times out and
 # the gate says so rather than quietly killing the VM and passing.
 EXITED=0
-for i in $(seq 1 240); do
+for i in $(seq 1 400); do
     if ! kill -0 "$QPID" 2>/dev/null; then EXITED=1; break; fi
     sleep 2
 done

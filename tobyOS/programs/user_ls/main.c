@@ -57,6 +57,15 @@ static void mode_str(mode_t m, char *out) {
     static const char *rwx = "rwxrwxrwx";
     for (int i = 0; i < 9; i++)
         out[1 + i] = (m & (0400 >> i)) ? rwx[i] : '-';
+    /* setuid, setgid and sticky REPLACE the execute character of their
+     * field -- lower case when execute is also set, upper case when it is
+     * not. Without this a setuid binary is indistinguishable from an
+     * ordinary one in `ls -l`, which is exactly the thing anyone looking at
+     * /bin with `ls -l` is checking for. (Found by staging /bin/sudo mode
+     * 4755: the tar recorded it, ramfs preserved it, and ls hid it.) */
+    if (m & 04000) out[3] = (out[3] == 'x') ? 's' : 'S';
+    if (m & 02000) out[6] = (out[6] == 'x') ? 's' : 'S';
+    if (m & 01000) out[9] = (out[9] == 'x') ? 't' : 'T';
     out[10] = 0;
 }
 

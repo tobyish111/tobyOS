@@ -256,4 +256,129 @@ OUT=$(nc -z -w 2 127.0.0.1 9 2>&1); RC=$?
 echo "$OUT" | head -1
 echo rc=$RC
 
+# --- raw sockets: ping, tcpdump, clockdiff -------------------------------
+# 10.0.2.2 is QEMU's gateway and answers ICMP echo. None of these three
+# tools could exist before the kernel had SOCK_RAW.
+echo @@ping_gateway
+ping -c 2 -W 3 10.0.2.2
+echo @@ping_stats
+ping -c 2 -W 3 -q 10.0.2.2 | tail -2
+echo @@ping_badhost
+ping -c 1 no-such-host-here 2>&1 | head -1
+ping -c 1 no-such-host-here > /dev/null 2>&1; echo rc=$?
+echo @@tcpdump_capture
+# -c 2, and enough ping traffic to satisfy it well before the wait ends:
+# asking for 4 frames and looking after 3 seconds read the file while
+# tcpdump was still waiting for the fourth, so the summary was not there yet.
+tcpdump -c 2 > /tmp/dump.txt 2>&1 &
+sleep 1
+ping -c 4 -q -W 2 10.0.2.2 > /dev/null 2>&1
+sleep 4
+echo "frames: $(grep -c 'IP \|ARP' /tmp/dump.txt)"
+echo "summary: $(grep -c 'packets captured' /tmp/dump.txt)"
+echo @@clockdiff
+# Most hosts ignore ICMP TIMESTAMP; whichever way it goes must be SAID.
+clockdiff 10.0.2.2 2>&1 | head -1
+
+# --- ftp, against the ftpd running in this same boot ---------------------
+echo @@ftp_setup
+rm -rf /tmp/ftproot /tmp/ftpget
+mkdir /tmp/ftproot
+mkdir /tmp/ftpget
+printf 'hello from the ftp server\n' > /tmp/ftproot/greeting.txt
+# A pristine copy OUTSIDE the served root: the session deletes greeting.txt
+# from the server on purpose, so comparing the download against the server's
+# copy afterwards compares it against a file that is meant to be gone.
+cp /tmp/ftproot/greeting.txt /tmp/greeting.orig
+cp /etc/gnumade.txt /tmp/ftproot/big.txt 2>/dev/null || cp /etc/motd /tmp/ftproot/big.txt
+printf 'payload to upload\n' > /tmp/ftpget/upload.txt
+echo "served: $(ls /tmp/ftproot | wc -l) files"
+ftpd -n 1 -d /tmp/ftproot > /tmp/ftpd.log 2>&1 &
+sleep 2
+echo @@ftp_session
+cd /tmp/ftpget
+printf 'user anonymous\npwd\nls\nsize greeting.txt\nget greeting.txt\n' > /tmp/ftpcmd
+printf 'put upload.txt\nmkdir subdir\nls\nrmdir subdir\n' >> /tmp/ftpcmd
+printf 'delete greeting.txt\nls\nquit\n' >> /tmp/ftpcmd
+ftp -v 127.0.0.1 21 < /tmp/ftpcmd
+echo @@ftp_serverlog
+cat /tmp/ftpd.log 2>/dev/null | head -8
+echo "ftpd still running: $(pgrep ftpd | wc -l)"
+echo @@ftp_bytes
+echo "same: $(cmp -s /tmp/greeting.orig /tmp/ftpget/greeting.txt && echo yes || echo no)"
+echo @@ftp_upload
+echo "uploaded: $([ -f /tmp/ftproot/upload.txt ] && echo yes || echo no)"
+echo "identical: $(cmp -s /tmp/ftpget/upload.txt /tmp/ftproot/upload.txt && echo yes || echo no)"
+echo @@ftp_deleted
+echo "greeting still there: $([ -f /tmp/ftproot/greeting.txt ] && echo yes || echo no)"
+echo @@ftp_noserver
+# Nothing listens on 2121; the client must say so rather than hang.
+ftp 127.0.0.1 2121 < /dev/null 2>&1 | head -1
+cd /tmp
+
+# --- sudo ---------------------------------------------------------------
+# /bin/sudo is staged mode 4755 by a tar pass of its own; the main pass
+# forces 0755 over everything and the setuid bit would not survive it.
+echo @@sudo_mode
+ls -l /bin/sudo | cut -c1-10
+echo @@sudo_root
+sudo id | head -1
+sudo -n true; echo rc=$?
+echo @@sudo_list
+sudo -l | head -2
+echo @@sudo_nocmd
+sudo definitely-not-a-command 2>&1 | head -1
+sudo definitely-not-a-command > /dev/null 2>&1; echo rc=$?
+echo @@sudo_nouser
+sudo -u no-such-user-at-all id 2>&1 | head -1
+echo @@sudo_sudoers
+grep -c wheel /etc/sudoers
+
+# --- ranlib -------------------------------------------------------------
+# /etc/libtest.a is a real ar archive of two cross-compiled objects,
+# committed WITHOUT an index so ranlib has something to do.
+echo @@ranlib_list
+cp /etc/libtest.a /tmp/lib.a
+ranlib -t /tmp/lib.a
+echo @@ranlib_write
+ranlib -v /tmp/lib.a
+echo "grew: $([ "$(wc -c < /tmp/lib.a)" -gt "$(wc -c < /etc/libtest.a)" ] && echo yes || echo no)"
+echo @@ranlib_idempotent
+cp /tmp/lib.a /tmp/lib1.a
+ranlib /tmp/lib.a
+echo "stable: $(cmp -s /tmp/lib.a /tmp/lib1.a && echo yes || echo no)"
+echo @@ranlib_notar
+printf 'not an archive\n' > /tmp/bogus.a
+ranlib /tmp/bogus.a 2>&1 | head -1
+ranlib /tmp/bogus.a > /dev/null 2>&1; echo rc=$?
+
+# --- addr2line ----------------------------------------------------------
+# /etc/dwarf_test.elf carries real DWARF 4; the expected answers were taken
+# from GNU addr2line on the host before this was written down.
+echo @@a2l_line
+addr2line -e /etc/dwarf_test.elf -s 201120
+echo @@a2l_func
+addr2line -e /etc/dwarf_test.elf -f -s 201120
+echo @@a2l_unmapped
+addr2line -e /etc/dwarf_test.elf ffffffff | tail -1
+echo @@a2l_nodebug
+addr2line -e /bin/echo 400000 2>&1 | head -1
+
+# --- gdb: real breakpoints over ptrace ----------------------------------
+# /etc/dbg_test.elf calls dbg_step three times and then exits 7. The
+# breakpoint is a real int3 the debugger writes into the target's text.
+echo @@gdb_session
+printf 'break dbg_step\nrun\ninfo registers\ncontinue\ncontinue\ndelete\ncontinue\nquit\n' > /tmp/gdbcmd
+gdb /etc/dbg_test.elf < /tmp/gdbcmd 2>&1 | head -30
+echo @@gdb_fixture
+# Does the target exit on its own, with no debugger anywhere near it? This
+# separates "the debugger cannot resume" from "the fixture never exits".
+# BOUNDED. The first version of this fixture never exited, and running it
+# unbounded here hung the whole boot -- a broken fixture must fail a check,
+# not take the machine down with it.
+timeout 5 /etc/dbg_test.elf > /dev/null 2>&1; echo "standalone rc=$?"
+echo @@gdb_nosym
+printf 'break no_such_symbol\nquit\n' > /tmp/gdbcmd2
+gdb /etc/dbg_test.elf < /tmp/gdbcmd2 2>&1 | grep -i "not defined" | head -1
+
 echo @@dt_END

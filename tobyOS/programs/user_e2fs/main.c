@@ -17,6 +17,9 @@
  *              the reason, rather than accepted and silently not repairing.
  *   debugfs    read-only subset: stats, and the superblock fields
  *   badblocks  the read-only scan, which is badblocks' own default
+ *   resize2fs  -P (the minimum size) is a calculation over the
+ *              superblock and is REAL; an actual resize is refused,
+ *              for the same reason e2fsck -y and debugfs -w are
  *
  * A checker that says "clean" without being able to repair is still useful;
  * one that ACCEPTS -y and then repairs nothing is a trap.
@@ -371,11 +374,74 @@ static int cmd_badblocks(int argc, char **argv) {
 
 /* ---- dispatch ---------------------------------------------------------- */
 struct applet { const char *name; int (*fn)(int, char **); };
+/* --------------------------------------------------------------- resize2fs
+ *
+ * The interesting half of resize2fs is readable: -P computes the smallest
+ * the filesystem could be shrunk to, which is (blocks in use) plus the
+ * metadata that has to survive, and every number it needs is in the
+ * superblock. That half is done properly.
+ *
+ * The other half MOVES DATA, and userland block access here is read-only by
+ * design -- the same wall e2fsck -y, debugfs -w and badblocks -w hit, and
+ * for the same reason: raw writes from userland would bypass the
+ * foreign-filesystem guards. It is refused by name.
+ */
+static int cmd_resize2fs(int argc, char **argv) {
+    int print_min = 0, minimize = 0, argi = 1;
+    for (; argi < argc; argi++) {
+        if (argv[argi][0] != '-' || !argv[argi][1]) break;
+        if (!strcmp(argv[argi], "-P")) { print_min = 1; continue; }
+        if (!strcmp(argv[argi], "-M")) { minimize = 1; continue; }
+        if (!strcmp(argv[argi], "-f") || !strcmp(argv[argi], "-p")) continue;
+        if (!strcmp(argv[argi], "-d") && argi + 1 < argc) { argi++; continue; }
+        fprintf(stderr, "resize2fs: unsupported option %s\n", argv[argi]);
+        return 1;
+    }
+    if (argi >= argc) {
+        fprintf(stderr, "usage: resize2fs [-P] [-M] device [size]\n");
+        return 1;
+    }
+    const char *dev = argv[argi++];
+    const char *want = (argi < argc) ? argv[argi] : NULL;
+
+    struct ext_sb sb;
+    uint32_t bs = 0;
+    if (read_sb(dev, &sb, &bs) != 0) return 1;
+
+    uint64_t total = sb.blocks_count_lo;
+    uint64_t freeb = sb.free_blocks_count_lo;
+    uint64_t used  = total > freeb ? total - freeb : total;
+    /* resize2fs -P reports the minimum in FILESYSTEM BLOCKS, and adds a
+     * margin for the metadata a smaller filesystem still needs. Two percent
+     * plus the reserved blocks is what e2fsprogs settles on in practice; a
+     * bare used-block count would be a number no shrink could ever reach. */
+    uint64_t minimum = used + used / 50 + sb.r_blocks_count_lo + 1;
+    if (minimum > total) minimum = total;
+
+    printf("Estimated minimum size of the filesystem: %llu\n",
+           (unsigned long long)minimum);
+    if (print_min) return 0;
+
+    if (!want && !minimize) {
+        /* No size and no -M means "grow to fill the device", which is still
+         * a write. */
+        fprintf(stderr, "resize2fs: %s is %llu blocks of %u bytes "
+                        "(%llu in use)\n", dev,
+                (unsigned long long)total, bs, (unsigned long long)used);
+    }
+    fprintf(stderr, "resize2fs: RESIZING WOULD WRITE, and userland block "
+                    "access here is read-only by design, so that raw writes "
+                    "cannot bypass the foreign-filesystem guards. The "
+                    "calculation (-P) is done; the move is not.\n");
+    return 1;
+}
+
 static const struct applet g_applets[] = {
     { "dumpe2fs",  cmd_dumpe2fs },
     { "e2fsck",    cmd_e2fsck },
     { "debugfs",   cmd_debugfs },
     { "badblocks", cmd_badblocks },
+    { "resize2fs", cmd_resize2fs },
     { 0, 0 }
 };
 

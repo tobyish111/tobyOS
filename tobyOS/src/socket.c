@@ -8,6 +8,7 @@
  */
 
 #include <tobyos/socket.h>
+#include <tobyos/ip.h>      /* raw sockets send straight over IP */
 #include <tobyos/udp.h>
 #include <tobyos/tcp.h>
 #include <tobyos/net.h>
@@ -112,7 +113,8 @@ static struct sock *sock_peer_checked(struct sock *self) {
 
 struct sock *sock_alloc(int kind) {
     if (kind != SOCK_KIND_UDP && kind != SOCK_KIND_TCP &&
-        kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK) return 0;
+        kind != SOCK_KIND_UNIX && kind != SOCK_KIND_NETLINK &&
+        kind != SOCK_KIND_RAW) return 0;
     for (int i = 0; i < SOCK_MAX; i++) {
         if (!g_socks[i].in_use) {
             memset(&g_socks[i], 0, sizeof(g_socks[i]));
@@ -952,11 +954,72 @@ int sock_unix_pair(struct sock **out_a, struct sock **out_b) {
 
 /* ---- UDP syscall surface --------------------------------------- */
 
+/* ---- raw sockets -------------------------------------------------------
+ *
+ * Both fan-outs walk the pool. That is O(SOCK_MAX) per packet, which would
+ * matter if it ran on every packet always -- it does not: the loop skips
+ * every slot unless a raw socket exists, and creating one needs root.
+ */
+void sock_deliver_raw(uint32_t src_ip_be, uint8_t proto,
+                      const void *ip_datagram, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_RAW) continue;
+        if (s->raw_is_packet) continue;
+        /* Protocol 0 means every protocol, which is what a sniffer wants. */
+        if (s->raw_proto != 0 && s->raw_proto != proto) continue;
+        sock_deliver(s, src_ip_be, 0, ip_datagram, len);
+    }
+}
+
+void sock_deliver_packet(const void *frame, size_t len) {
+    for (int i = 0; i < SOCK_MAX; i++) {
+        struct sock *s = &g_socks[i];
+        if (!s->in_use || s->kind != SOCK_KIND_RAW || !s->raw_is_packet) continue;
+        sock_deliver(s, 0, 0, frame, len);
+    }
+}
+
+/* Lets the loopback path skip building a header nobody will read. */
+int sock_any_raw_listener(void) {
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (g_socks[i].in_use && g_socks[i].kind == SOCK_KIND_RAW &&
+            !g_socks[i].raw_is_packet) return 1;
+    return 0;
+}
+
+/* Lets the ethernet path skip work when nobody is listening. */
+int sock_any_packet_listener(void) {
+    for (int i = 0; i < SOCK_MAX; i++)
+        if (g_socks[i].in_use && g_socks[i].kind == SOCK_KIND_RAW &&
+            g_socks[i].raw_is_packet) return 1;
+    return 0;
+}
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be) {
     if (!cap_check(current_proc(), CAP_NET, "sock_sendto")) return -1;
     if (!s || !s->in_use)  return -1;
     if (!buf && len)       return -1;
+
+    if (s->kind == SOCK_KIND_RAW) {
+        /* An AF_PACKET socket is a receive-only tap here: injecting a raw
+         * ethernet frame is a different capability from watching one, and
+         * nothing in this tree needs it. Refused by name rather than
+         * silently sent as IP. */
+        if (s->raw_is_packet) return -1;
+        if (len > ETH_MTU - 20) return -1;
+        if (!net_is_up()) return -4;
+        /* No port and no ephemeral bind: the payload IS the L4 packet and
+         * the kernel supplies only the IP header. */
+        struct net_ctx rprev = net_ctx_enter(s->net_ns, 0);
+        bool rsent = ip_send(dst_ip_be,
+                             s->raw_proto ? s->raw_proto : IPPROTO_RAW,
+                             buf, len);
+        net_ctx_leave(rprev);
+        return rsent ? (long)len : -3;
+    }
+
     if (dst_port_be == 0)  return -1;
     if (len > ETH_MTU - 28) return -1;
 
@@ -985,7 +1048,17 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
 
 long sock_recvfrom(struct sock *s, void *buf, size_t n,
                    uint32_t *src_ip_be, uint16_t *src_port_be) {
-    return sock_recvfrom_to(s, buf, n, src_ip_be, src_port_be, 0);
+    /* A timeout of 0 here means WAIT FOREVER, and for a raw socket that is
+     * always wrong. A raw socket has no notion of an expected reply: ping
+     * asks "has an echo reply arrived yet", tcpdump asks "has any frame
+     * arrived yet", and clockdiff asks a question most hosts never answer
+     * at all. Blocking forever on the first of those made `clockdiff`
+     * against a host that ignores ICMP TIMESTAMP hang the whole boot.
+     *
+     * So raw receives poll: a short bounded wait, returning 0 for "nothing
+     * yet", which is what every caller above is already written to loop on. */
+    uint32_t to = (s && s->kind == SOCK_KIND_RAW) ? 100 : 0;
+    return sock_recvfrom_to(s, buf, n, src_ip_be, src_port_be, to);
 }
 
 long sock_recvfrom_to(struct sock *s, void *buf, size_t n,

@@ -1,0 +1,16 @@
+# /etc/sudoers -- who may run commands as another user.
+#
+# Syntax understood by /bin/sudo here:
+#     user    ALL=(ALL) ALL
+#     %group  ALL=(ALL) ALL
+#     user    ALL=(ALL) NOPASSWD: ALL
+# Host and runas must both be ALL, and the command set must be ALL. A rule
+# this parser cannot read in full is IGNORED and reported, never widened --
+# a half-read rule is a privilege escalation written by a typo.
+
+# root does not need a rule, but stating it is clearer than relying on the
+# special case.
+root    ALL=(ALL) ALL
+
+# The wheel group, password required -- the configuration a distro ships.
+%wheel  ALL=(ALL) ALL

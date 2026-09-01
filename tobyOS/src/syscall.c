@@ -623,9 +623,33 @@ static long sys_yield(void) {
 
 static long sys_socket(int domain, int type) {
     if (!cap_check(current_proc(), CAP_NET, "sys_socket")) return -1;
-    if (domain != AF_INET || type != SOCK_DGRAM) return -1;
-    struct sock *s = sock_alloc(SOCK_KIND_UDP);
+
+    /* SOCK_RAW carries its protocol in the top 16 bits of `type`, because
+     * the native ABI's socket() has only two arguments. See socket.h. */
+    int base_type = type & SOCK_TYPE_MASK;
+    unsigned raw_proto = (unsigned)(type >> SOCK_RAW_PROTO_SHIFT) & 0xFF;
+
+    int kind = SOCK_KIND_UDP;
+    int is_packet = 0;
+    if (base_type == SOCK_RAW) {
+        /* ROOT ONLY, the way Linux gates raw sockets. A raw socket can read
+         * every packet the machine receives and can forge the contents of
+         * one it sends; neither belongs to an unprivileged process. */
+        struct proc *rp = current_proc();
+        if (!rp || rp->uid != 0) return -ABI_EPERM;
+        if (domain == AF_PACKET)     is_packet = 1;
+        else if (domain != AF_INET)  return -ABI_EAFNOSUPPORT;
+        kind = SOCK_KIND_RAW;
+    } else if (domain != AF_INET || base_type != SOCK_DGRAM) {
+        return -1;
+    }
+
+    struct sock *s = sock_alloc(kind);
     if (!s) return -1;
+    if (kind == SOCK_KIND_RAW) {
+        s->raw_proto     = (uint8_t)raw_proto;
+        s->raw_is_packet = (uint8_t)is_packet;
+    }
 
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) { sock_close(s); return -1; }
@@ -2953,7 +2977,13 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     memset(dst, 0, sizeof(*dst));
     dst->size = (uint64_t)src->size;
     uint32_t typ = (src->type == VFS_TYPE_DIR) ? ABI_S_IFDIR : ABI_S_IFREG;
-    dst->mode = typ | (src->mode & ABI_S_IFMT ? src->mode : (src->mode & 0777));
+    /* 07777, not 0777: the mask decides what userland can SEE, and 0777
+     * silently drops setuid, setgid and sticky. ramfs preserves all three
+     * from the USTAR header and execve reads S_ISUID straight from the VFS,
+     * so a setuid binary WORKED while `ls -l` and every stat()-based check
+     * reported it as an ordinary 0755 file -- the one place you would look
+     * to find out. */
+    dst->mode = typ | (src->mode & ABI_S_IFMT ? src->mode : (src->mode & 07777));
     /* If the underlying fs doesn't carry mode info, default to 0644 / 0755. */
     if ((src->mode & 0777) == 0) {
         dst->mode |= (src->type == VFS_TYPE_DIR) ? 0755 : 0644;
@@ -4567,6 +4597,29 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
             sched_yield();
         }
     }
+    /* A PTRACE STOP IS REPORTED HERE TOO, and it was not before.
+     *
+     * The Linux personality's wait4 has always had this arm; the native
+     * waitpid never did, so a native tracer -- which is what /bin/gdb is --
+     * called waitpid on a child parked in a ptrace stop and got either
+     * "still running" or a block that never ended. Every debugger operation
+     * begins with "wait for the target to stop", so without this the whole
+     * tool is unreachable however correct the rest of it is.
+     *
+     * The child is NOT reaped: it is stopped, not dead, and the tracer is
+     * going to resume it. */
+    {
+        struct proc *me = current_proc();
+        struct proc *child = (pid > 0) ? proc_lookup(pid) : 0;
+        if (me && child && ptrace_stopped_for(me, child)) {
+            int ssig = ptrace_stop_signal(child);
+            uint32_t st = 0x10000u | (uint32_t)(ssig > 0 ? ssig : SIGTRAP);
+            if (status_out && put_user_u32(status_out, st) != 0)
+                return -ABI_EFAULT;
+            return vpid;
+        }
+    }
+
     if (flags & ABI_WNOHANG) {
         struct proc *child = proc_lookup(pid);
         if (!child) return -ABI_ENOENT;
@@ -4679,6 +4732,42 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         extern void bcache_sync(struct blk_dev *dev);
         bcache_sync(NULL);          /* NULL == every device */
         return 0;
+    }
+    case ABI_SYS_PTRACE:
+        /* ABI_SYS_PTRACE (149) has been DECLARED in abi.h since the ptrace
+         * slice and never dispatched here: only the Linux personality's
+         * syscall 101 reached ptrace_do, so a native program calling it got
+         * "unknown number 149 -- returning -ENOSYS". That is exactly why
+         * /bin/debugger printed "ptrace not fully available, running in demo
+         * mode" -- it was telling the truth about a syscall the header
+         * promised. Same implementation, no second credential model. */
+        return ptrace_do((long)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
+
+    case ABI_SYS_AUTH_CHECK: {
+        /* Verify a password WITHOUT touching the session.
+         *
+         * users_check_password() has existed since the accounts milestone
+         * and nothing outside the kernel could reach it: the only exposed
+         * entry point was SYS_LOGIN, which calls session_login() and
+         * switches the active desktop session. `sudo` must not do that --
+         * it authenticates the person at the keyboard and then runs one
+         * command, leaving the session exactly as it found it.
+         *
+         * ROOT ONLY, and that is not a formality: an unprivileged caller
+         * with this syscall has an offline password oracle. sudo reaches
+         * it because it is setuid-root, which is the same shape as every
+         * other system that lets you type your password to a helper. */
+        struct proc *ap = current_proc();
+        if (!ap || ap->uid != 0) return -ABI_EPERM;
+        char kuser[64], kpass[65];
+        if (!user_str_in(kuser, sizeof kuser, (const char *)(uintptr_t)a1))
+            return -ABI_EFAULT;
+        kpass[0] = 0;
+        if (a2 && strncpy_from_user(kpass, (const char *)(uintptr_t)a2,
+                                    sizeof kpass) < 0)
+            return -ABI_EFAULT;
+        extern bool users_check_password(const char *username, const char *password);
+        return users_check_password(kuser, kpass) ? 0 : -ABI_EACCES;
     }
     case ABI_SYS_PCI_CFG: {
         /* setpci(8)'s two operations, and nothing else.

@@ -53,6 +53,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/uaccess.h>
+#include <tobyos/isr.h>     /* struct regs: the exception-stop frame */
 
 /* Linux request numbers. */
 #define PT_TRACEME       0
@@ -137,6 +138,35 @@ static void ptrace_stop(struct proc *p, int sig)
     { static int n; if (n < 24) { n++;
         kprintf("[ptdbg] pid=%d RESUMED\n", p->pid); } }
     p->ptrace_stopped = 0;
+}
+
+/* An EXCEPTION stop: the tracee hit an int3 a debugger planted, or finished
+ * a single step. Called from the exception path with the trap frame, which
+ * is remembered so GETREGS/SETREGS report and edit the registers the
+ * process will actually resume with.
+ *
+ * Returns true if the process was parked (and has since been resumed), and
+ * false if nothing is tracing it -- in which case the caller must fall
+ * through to the ordinary signal delivery, because an untraced int3 is
+ * still SIGTRAP. */
+bool ptrace_trap_stop(struct proc *p, int sig, struct regs *r)
+{
+    if (!p || !p->tracer_pid) return false;
+    p->ptrace_exc_regs = r;
+    ptrace_stop(p, sig);
+    p->ptrace_exc_regs = 0;
+    return true;
+}
+
+/* The stop a successful execve takes, so a tracer can write breakpoints
+ * into the freshly mapped image before it runs. No ptrace_syscall check:
+ * this stop is owed to ANY tracer, which is what makes `run` possible. */
+void ptrace_exec_stop(struct proc *p)
+{
+    if (!p || !p->tracer_pid) return;
+    p->ptrace_orig_rax = -1;
+    p->ptrace_retval   = 0;
+    ptrace_stop(p, SIGTRAP);
 }
 
 /* Called at both syscall boundaries from linux_syscall. `entering` picks the
@@ -268,10 +298,28 @@ long ptrace_do(long req, int vpid, uint64_t addr, uint64_t data)
 
     case PT_GETREGS: {
         if (!t->ptrace_stopped) return -ABI_ESRCH;   /* must be stopped */
-        struct syscall_regs *r = tracee_regs(t);
-        if (!r) return -ABI_EIO;
         struct lx_user_regs u;
         memset(&u, 0, sizeof u);
+        if (t->ptrace_exc_regs) {
+            /* Stopped in an exception: a real trap frame, with rip, rflags
+             * and rsp exactly as the CPU pushed them. This is the frame a
+             * debugger needs -- rip points just past the int3 it planted. */
+            struct regs *x = t->ptrace_exc_regs;
+            u.r15 = x->r15; u.r14 = x->r14; u.r13 = x->r13; u.r12 = x->r12;
+            u.rbp = x->rbp; u.rbx = x->rbx; u.r11 = x->r11; u.r10 = x->r10;
+            u.r9  = x->r9;  u.r8  = x->r8;
+            u.rax = x->rax; u.rcx = x->rcx; u.rdx = x->rdx;
+            u.rsi = x->rsi; u.rdi = x->rdi;
+            u.rip = x->rip; u.rsp = x->rsp; u.eflags = x->rflags;
+            u.cs = x->cs;   u.ss = x->ss;
+            u.fs_base = t->tls_base;
+            u.orig_rax = (uint64_t)-1;
+            if (copy_to_user((void *)(uintptr_t)data, &u, sizeof u) != 0)
+                return -ABI_EFAULT;
+            return 0;
+        }
+        struct syscall_regs *r = tracee_regs(t);
+        if (!r) return -ABI_EIO;
         u.r15 = r->r15; u.r14 = r->r14; u.r13 = r->r13; u.r12 = r->r12;
         u.rbp = r->rbp; u.rbx = r->rbx; u.r11 = r->r11; u.r10 = r->r10;
         u.r9  = r->r9;  u.r8  = r->r8;
@@ -295,11 +343,27 @@ long ptrace_do(long req, int vpid, uint64_t addr, uint64_t data)
     }
     case PT_SETREGS: {
         if (!t->ptrace_stopped) return -ABI_ESRCH;
-        struct syscall_regs *r = tracee_regs(t);
-        if (!r) return -ABI_EIO;
         struct lx_user_regs u;
         if (copy_from_user(&u, (const void *)(uintptr_t)data, sizeof u) != 0)
             return -ABI_EFAULT;
+        if (t->ptrace_exc_regs) {
+            /* Writing rip here is how a debugger rewinds past the int3 it
+             * planted -- the CPU pushed rip pointing AFTER the 0xCC. */
+            struct regs *x = t->ptrace_exc_regs;
+            x->r15 = u.r15; x->r14 = u.r14; x->r13 = u.r13; x->r12 = u.r12;
+            x->rbp = u.rbp; x->rbx = u.rbx; x->r11 = u.r11; x->r10 = u.r10;
+            x->r9  = u.r9;  x->r8  = u.r8;
+            x->rax = u.rax; x->rcx = u.rcx; x->rdx = u.rdx;
+            x->rsi = u.rsi; x->rdi = u.rdi;
+            x->rip = u.rip; x->rsp = u.rsp;
+            /* rflags is filtered: a tracee must not be able to gain IOPL or
+             * clear IF by having its debugger write them. Only the arithmetic
+             * flags and TF/DF are taken from the tracer. */
+            x->rflags = (x->rflags & ~0x0000CDDULL) | (u.eflags & 0x0000CDDULL);
+            return 0;
+        }
+        struct syscall_regs *r = tracee_regs(t);
+        if (!r) return -ABI_EIO;
         r->r15 = u.r15; r->r14 = u.r14; r->r13 = u.r13; r->r12 = u.r12;
         r->rbp = u.rbp; r->rbx = u.rbx; r->r10 = u.r10;
         r->r9  = u.r9;  r->r8  = u.r8;
@@ -325,6 +389,15 @@ long ptrace_do(long req, int vpid, uint64_t addr, uint64_t data)
         return 0;
 
     case PT_CONT:
+        /* Clear TF. Without this a tracee that was single-stepped once keeps
+         * trapping after every instruction for the rest of its life, and the
+         * tracer sees an endless stream of stops it never asked for. */
+        if (t->ptrace_exc_regs) t->ptrace_exc_regs->rflags &= ~(1ull << 8);
+        else {
+            struct syscall_regs *cr = tracee_regs(t);
+            if (cr) cr->r11 &= ~(1ull << 8);
+        }
+        /* fall through */
     case PT_SYSCALL:
         if (!t->ptrace_stopped) return -ABI_ESRCH;
         t->ptrace_syscall = (req == PT_SYSCALL) ? 1 : 0;
@@ -353,7 +426,26 @@ long ptrace_do(long req, int vpid, uint64_t addr, uint64_t data)
         }
         return 0;
 
-    case PT_SINGLESTEP:
+    case PT_SINGLESTEP: {
+        /* TF makes the CPU raise #DB after exactly one instruction. It is
+         * set in the frame the tracee will resume through, so it takes
+         * effect on the iretq/sysret that returns it to userspace. */
+        if (!t->ptrace_stopped) return -ABI_ESRCH;
+        if (t->ptrace_exc_regs) t->ptrace_exc_regs->rflags |= (1ull << 8);
+        else {
+            struct syscall_regs *r = tracee_regs(t);
+            if (!r) return -ABI_EIO;
+            r->r11 |= (1ull << 8);      /* SYSRET reloads rflags from r11 */
+        }
+        t->ptrace_syscall = 0;
+        if (t->ptrace_stopped) {
+            t->ptrace_stopped = 0;
+            t->state = PROC_READY;
+            sched_enqueue(t);
+        }
+        return 0;
+    }
+
     case PT_GETREGSET:
     default:
         /* Refused, not faked. See the header: a tracer told "yes" for a stop

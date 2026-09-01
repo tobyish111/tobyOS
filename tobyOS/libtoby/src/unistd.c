@@ -407,7 +407,12 @@ int ioctl(int fd, unsigned long req, void *argp) {
 /* ---- socket API ------------------------------------------------- */
 
 int socket(int domain, int type, int protocol) {
-    (void)protocol;
+    /* The kernel's socket() takes only (domain, type), so a raw socket's
+     * protocol rides in the top 16 bits of `type` -- see SOCK_RAW_PROTO_SHIFT
+     * in tobyos/socket.h. Discarding it (which this did) meant every raw
+     * socket asked for protocol 0 and got every packet on the machine. */
+    if ((type & 0xFFFF) == 3 /* SOCK_RAW */ && protocol > 0)
+        type |= (protocol & 0xFF) << 16;
     return (int)__toby_check(toby_sc2(ABI_SYS_SOCKET, domain, type));
 }
 
