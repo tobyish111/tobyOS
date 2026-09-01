@@ -44,4 +44,28 @@ echo @@lsipc
 lsipc 2>&1; echo rc=$?
 echo @@zramctl
 zramctl 2>&1; echo rc=$?
+echo @@grep_q
+printf 'alpha
+beta
+' > g.txt
+grep -q beta g.txt; echo rc=$?
+grep -q zeta g.txt; echo rc=$?
+echo @@grep_regex
+printf 'foo123
+bar
+' > g2.txt
+grep '[0-9][0-9]*' g2.txt
+echo @@grep_E
+grep -E 'foo|bar' g2.txt
+echo @@grep_o
+grep -o '[0-9]*' g2.txt
+echo @@grep_w
+printf 'cat
+concat
+' > g3.txt
+grep -w cat g3.txt
+echo @@grep_l
+grep -l alpha g.txt
+echo @@grep_badre
+grep '[' g.txt 2>&1; echo rc=$?
 echo @@END

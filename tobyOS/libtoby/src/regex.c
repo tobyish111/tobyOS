@@ -23,6 +23,11 @@ enum {
     ND_BRANCH,     /* alternation: try .out first, then .out2 */
     ND_SPLIT,      /* like BRANCH but for quantifiers */
     ND_MATCH,      /* accept state */
+    ND_NOP,        /* pass-through: the EXIT of a quantified
+                    * fragment. It cannot be ND_MATCH, because
+                    * ND_MATCH accepts on arrival and `foo.*bar`
+                    * would then match "fooX" -- the star would
+                    * declare success before `bar` was required. */
 };
 
 #define CLASS_BITMAP_SIZE 32  /* 256 bits */
@@ -37,6 +42,11 @@ typedef struct nd {
 } nd_t;
 
 typedef struct {
+    /* A parse error has to be RECORDED, not just returned: parse_alt
+     * substitutes an empty-match node when a sub-parse yields NULL, so
+     * a bad pattern silently became "matches everywhere" instead of an
+     * error. regcomp checks this before accepting the compile. */
+    int          err;
     nd_t        *nodes;
     int          nnodes;
     int          cap;
@@ -73,6 +83,7 @@ static nd_t *new_node(compiled_t *c) {
 
 /* Forward decl */
 static nd_t *parse_alt(compiled_t *c, const char **pp, int ere);
+static nd_t *chain_end(compiled_t *c, nd_t *n);
 
 static int is_meta(char ch, int ere) {
     if (ere) return ch == '|' || ch == ')';
@@ -110,8 +121,7 @@ static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
         sp->out = greedy ? body : tail;
         sp->out2 = greedy ? tail : body;
         /* Point body end back to split */
-        nd_t *n = body;
-        while (n->out) n = n->out;
+        nd_t *n = chain_end(c, body);
         n->out = sp;
         return sp;
     }
@@ -123,8 +133,7 @@ static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
         sp->greedy = greedy;
         sp->out = greedy ? body : tail;
         sp->out2 = greedy ? tail : body;
-        nd_t *n = body;
-        while (n->out) n = n->out;
+        nd_t *n = chain_end(c, body);
         n->out = sp;
         return body;
     }
@@ -136,8 +145,7 @@ static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
         sp->greedy = greedy;
         sp->out = greedy ? body : tail;
         sp->out2 = greedy ? tail : body;
-        nd_t *n = body;
-        while (n->out) n = n->out;
+        nd_t *n = chain_end(c, body);
         n->out = tail;
         return sp;
     }
@@ -152,12 +160,31 @@ static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
     sp->greedy = greedy;
     sp->out = greedy ? body : tail;
     sp->out2 = greedy ? tail : body;
-    nd_t *n = body;
-    while (n->out) n = n->out;
+    nd_t *n = chain_end(c, body);
     n->out = sp;
     return sp;
 }
 
+/* Walk to the end of an acyclic chain.
+ *
+ * The code used `while (n->out) n = n->out;` in six places. quantify()
+ * builds a star as a LOOP (body -> split -> body), which is correct for an
+ * NFA and fatal for that walk: regcomp hung forever on any pattern
+ * containing `*` -- a*, ab*, [0-9]*, aa*. That is the most common construct
+ * in regex, so libtoby regex has never worked for it, which is why
+ * ports/sbase/grep.c was written fixed-string-only.
+ *
+ * Bounded by the node pool, so a cycle stops the walk instead of hanging.
+ * Callers that KNOW their fragment exit (a quantified fragment exits at the
+ * ND_MATCH node handed to quantify) pass it explicitly and never come here. */
+static nd_t *chain_end(compiled_t *c, nd_t *n) {
+    int guard = 0;
+    while (n && n->out) {
+        if (++guard > c->nnodes) return n;   /* cycle: stop, do not spin */
+        n = n->out;
+    }
+    return n;
+}
 /* Parse a character class [... ] */
 static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
     const char *p = *pp;
@@ -187,7 +214,12 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
             }
         }
     }
-    if (*p == ']') p++;
+    /* An unterminated class is an ERROR. It used to compile and match
+     * whatever had been accumulated, so `grep '['` searched for something
+     * instead of reporting a bad pattern -- a typo turning into a wrong
+     * answer rather than a diagnostic. */
+    if (*p != ']') { c->err = REG_EBRACK; return 0; }
+    p++;
     *pp = p;
     return node;
 }
@@ -286,8 +318,7 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
             ge->ch = gi;
 
             gs->out = inner;
-            nd_t *n = inner;
-            while (n->out) n = n->out;
+            nd_t *n = chain_end(c, inner);
             n->out = ge;
             node = gs;
         }
@@ -330,8 +361,7 @@ static nd_t *parse_bre_group(compiled_t *c, const char **pp) {
     ge->ch = gi;
 
     gs->out = inner;
-    nd_t *n = inner;
-    while (n->out) n = n->out;
+    nd_t *n = chain_end(c, inner);
     n->out = ge;
 
     if (*p == '\\' && p[1] == ')') p += 2;
@@ -352,6 +382,7 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
            !(*p == '\\' && p[1] == '|' && !ere)) {
 
         nd_t *atom = 0;
+        nd_t *frag_end = 0;   /* known exit for quantified fragments */
 
         /* BRE: \( starts a group */
         if (!ere && *p == '\\' && p[1] == '(') {
@@ -370,7 +401,7 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
 
             nd_t *match = new_node(c);
             if (!match) return 0;
-            match->type = ND_MATCH;
+            match->type = ND_NOP;
 
             int qmin = 0, qmax = -1;
             if (q == '*') { qmin = 0; qmax = -1; }
@@ -379,6 +410,7 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
 
             atom = quantify(c, atom, match, qmin, qmax, greedy);
             if (!atom) return 0;
+            frag_end = match;
         }
         /* BRE quantifiers: \{n,m\} */
         else if (!ere && *p == '\\' && p[1] == '{') {
@@ -395,9 +427,10 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
             /* Simplified: treat as * */
             nd_t *match = new_node(c);
             if (!match) return 0;
-            match->type = ND_MATCH;
+            match->type = ND_NOP;
             atom = quantify(c, atom, match, 0, -1, 1);
             if (!atom) return 0;
+            frag_end = match;
         }
         /* ERE: {n,m} */
         else if (ere && *p == '{') {
@@ -415,13 +448,19 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
 
             nd_t *match = new_node(c);
             if (!match) return 0;
-            match->type = ND_MATCH;
+            match->type = ND_NOP;
             atom = quantify(c, atom, match, qmin, qmax, greedy);
             if (!atom) return 0;
         }
 
+        /* A quantified fragment EXITS at the ND_MATCH node handed to
+         * quantify(); its body is a loop and walking it never terminates.
+         * Using that known exit is both correct and the reason regcomp no
+         * longer hangs on `*`. Plain atoms are acyclic, so the guarded walk
+         * finds their end. */
         tail->out = atom;
-        while (tail->out) tail = tail->out;
+        if (frag_end) tail = frag_end;
+        else          tail = chain_end(c, tail);
     }
 
     *pp = p;
@@ -496,6 +535,14 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             ctx->match_end = sp;
             ctx->depth--;
             return 1;
+        case ND_NOP:
+            if (!node->out) {   /* nothing follows: this IS the end */
+                ctx->match_end = sp;
+                ctx->depth--;
+                return 1;
+            }
+            node = node->out;
+            continue;
         case ND_LIT: {
             if (!*sp) { ctx->depth--; return 0; }
             int ch = (unsigned char)*sp;
@@ -605,6 +652,12 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
     const char *p = pattern;
     int ere = (cflags & REG_EXTENDED) != 0;
     nd_t *root = parse_alt(comp, &p, ere);
+    if (comp->err) {
+        int e = comp->err;
+        free(comp->nodes);
+        free(comp);
+        return e;
+    }
     if (!root) {
         free(comp->nodes);
         free(comp);
