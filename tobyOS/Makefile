@@ -551,6 +551,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_diffutils/user_diffutils.elf \
             programs/user_bzip2/user_bzip2.elf \
             programs/user_zutils/user_zutils.elf \
+            programs/user_sed/user_sed.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1777,6 +1778,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_tail,user_tail))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_diffutils,user_diffutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_bzip2,user_bzip2))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_zutils,user_zutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_sed,user_sed))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3108,6 +3110,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	      cp $(INITRD_STAGE)/bin/bzip2 "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	cp programs/user_zutils/user_zutils.elf        $(INITRD_STAGE)/bin/zgrep
+	cp programs/user_sed/user_sed.elf              $(INITRD_STAGE)/bin/sed
 	@# the compressed-file wrappers, one binary dispatched on argv[0]
 	@for ap in zegrep zfgrep zdiff zcmp zless zmore gzexe lesspipe \
 	           bzgrep bzegrep bzfgrep bzdiff bzcmp bzless bzmore; do \
@@ -3155,6 +3158,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
 	cp etc/gnumade.bz2                              $(INITRD_STAGE)/etc/gnumade.bz2
 	cp etc/gnubadbz.bz2                             $(INITRD_STAGE)/etc/gnubadbz.bz2
+	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
 	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
 	@# that dispatches on argv[0] -- the same way busybox is installed below.
 	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
@@ -3209,6 +3213,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/head
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/egrep
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/fgrep
+	@# grep dispatches on argv[0]; rgrep is grep -r
+	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/rgrep
 	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
 	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
 	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
@@ -3874,12 +3880,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
-	    bin/grep bin/wc bin/head bin/egrep bin/fgrep                      \
+	    bin/grep bin/wc bin/head bin/egrep bin/fgrep bin/rgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
 	    etc/coreutils_test.sh etc/coreutils_extra.sh etc/accounts_test.sh  \
 	    etc/ssh_test.sh etc/util_test.sh etc/e2fs_test.sh                   \
 	    etc/gzip_test.sh etc/gnumade.gz etc/gnubadcrc.gz                  \
 	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2              \
+	    etc/sed_test.sh                                                   \
 	    bin/user_admin bin/useradd bin/userdel bin/usermod bin/groupadd    \
 	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
 	    bin/vipw bin/vigr                                                  \
@@ -3890,6 +3897,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/zdiff bin/zcmp bin/zless bin/zmore bin/gzexe bin/lesspipe      \
 	    bin/bzgrep bin/bzegrep bin/bzfgrep bin/bzdiff bin/bzcmp            \
 	    bin/bzless bin/bzmore                                              \
+	    bin/sed                                                          \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5639,6 +5647,7 @@ clean:
 	       programs/user_diffutils/user_diffutils.elf \
 	       programs/user_bzip2/user_bzip2.o programs/user_bzip2/user_bzip2.elf \
 	       programs/user_zutils/user_zutils.o programs/user_zutils/user_zutils.elf \
+	       programs/user_sed/user_sed.o programs/user_sed/user_sed.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

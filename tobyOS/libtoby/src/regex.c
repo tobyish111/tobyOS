@@ -67,18 +67,44 @@ static int cls_test(const unsigned char *c, int b) {
 
 /* ---- compiler --------------------------------------------------- */
 
+/* The node array is allocated ONCE, by regcomp, and never grows.
+ *
+ * It used to realloc here, which silently invalidated every nd_t* the
+ * parser was holding at that moment -- `tail`, `atom`, the group ends, the
+ * fragment being quantified. Nothing had ever noticed, because a pattern
+ * needing fewer than 64 nodes never grew the array; but bounded repetition
+ * duplicates whole fragments, so the first `x{20}` would have been a
+ * use-after-free. Running out of room is now a clean REG_ESPACE. */
 static nd_t *new_node(compiled_t *c) {
-    if (c->nnodes >= c->cap) {
-        int newcap = c->cap ? c->cap * 2 : 64;
-        nd_t *p = (nd_t *)realloc(c->nodes, (size_t)newcap * sizeof(nd_t));
-        if (!p) return 0;
-        c->nodes = p;
-        c->cap = newcap;
-    }
+    if (c->nnodes >= c->cap) { c->err = REG_ESPACE; return 0; }
     nd_t *n = &c->nodes[c->nnodes++];
     memset(n, 0, sizeof(*n));
     n->greedy = 1;
     return n;
+}
+
+/* Copy the nodes in [lo,hi) to the end of the array and return the copy of
+ * `entry`. Pointers INTO the range are rebased onto the copy; pointers out
+ * of it (to a shared tail) are left alone, which is what the caller wants.
+ * This is what makes {n,m} possible: an NFA cannot express "exactly three"
+ * without three copies of the thing being repeated. */
+static nd_t *clone_range(compiled_t *c, int lo, int hi, nd_t *entry) {
+    int n = hi - lo;
+    if (n <= 0) return entry;
+    if (c->nnodes + n > c->cap) { c->err = REG_ESPACE; return 0; }
+    int base = c->nnodes;
+    for (int i = 0; i < n; i++) c->nodes[base + i] = c->nodes[lo + i];
+    c->nnodes += n;
+    for (int i = 0; i < n; i++) {
+        nd_t *d = &c->nodes[base + i];
+        if (d->out  && d->out  >= &c->nodes[lo] && d->out  < &c->nodes[hi])
+            d->out  = &c->nodes[base + (int)(d->out  - &c->nodes[lo])];
+        if (d->out2 && d->out2 >= &c->nodes[lo] && d->out2 < &c->nodes[hi])
+            d->out2 = &c->nodes[base + (int)(d->out2 - &c->nodes[lo])];
+    }
+    if (entry >= &c->nodes[lo] && entry < &c->nodes[hi])
+        return &c->nodes[base + (int)(entry - &c->nodes[lo])];
+    return entry;
 }
 
 /* Forward decl */
@@ -102,7 +128,7 @@ static int parse_count(const char **pp) {
 /* Build a quantified chain: repeat `body` between min and max times,
  * where max == -1 means infinity. */
 static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
-                      int min, int max, int greedy) {
+                      int min, int max, int greedy, int lo, int hi) {
     /* For min copies, just chain body->...->body */
     nd_t *first = 0;
     nd_t *prev_tail = 0;
@@ -150,19 +176,63 @@ static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
         return sp;
     }
 
-    /* General case: just treat as body repeated. For simplicity in
-     * this embedded regex engine, just chain split nodes. */
-    (void)first; (void)prev_tail; (void)max;
-    /* Fallback: treat as * for simplicity */
-    nd_t *sp = new_node(c);
-    if (!sp) return 0;
-    sp->type = ND_SPLIT;
-    sp->greedy = greedy;
-    sp->out = greedy ? body : tail;
-    sp->out2 = greedy ? tail : body;
-    nd_t *n = chain_end(c, body);
-    n->out = sp;
-    return sp;
+    /* GENERAL {n,m}. This used to fall through to a `*`, so `x{3}` matched
+     * ANY number of x -- wrong output rather than an error, which is why it
+     * survived. An NFA cannot say "exactly three" without three copies, so
+     * the fragment is cloned.
+     *
+     * Built from the inside out: the optional copies first, each wrapped in
+     * a split that can skip to what follows, then the required ones in
+     * front. The ORIGINAL fragment is used as the outermost copy and is
+     * therefore mutated last, so every clone is taken from a pristine
+     * range. */
+    if (min < 0) min = 0;
+    if (max >= 0 && max < min) max = min;
+    if (max == 0) return tail;          /* {0} matches empty */
+
+    nd_t *cur = tail;
+
+    if (max < 0) {
+        /* {n,} -- an unbounded tail, so the last copy loops. */
+        nd_t *b = clone_range(c, lo, hi, body);
+        if (!b) return 0;
+        nd_t *sp = new_node(c);
+        if (!sp) return 0;
+        sp->type = ND_SPLIT;
+        sp->greedy = greedy;
+        sp->out  = greedy ? b : cur;
+        sp->out2 = greedy ? cur : b;
+        nd_t *be = chain_end(c, b);
+        if (!be) return 0;
+        be->out = sp;
+        cur = (min > 0) ? b : sp;       /* n>0: one copy is mandatory */
+        if (min > 0) min--;
+    } else {
+        for (int k = 0; k < max - min; k++) {
+            nd_t *b = clone_range(c, lo, hi, body);
+            if (!b) return 0;
+            nd_t *be = chain_end(c, b);
+            if (!be) return 0;
+            be->out = cur;
+            nd_t *sp = new_node(c);
+            if (!sp) return 0;
+            sp->type = ND_SPLIT;
+            sp->greedy = greedy;
+            sp->out  = greedy ? b : cur;
+            sp->out2 = greedy ? cur : b;
+            cur = sp;
+        }
+    }
+
+    for (int k = 0; k < min; k++) {
+        nd_t *b = (k == min - 1) ? body : clone_range(c, lo, hi, body);
+        if (!b) return 0;
+        nd_t *be = chain_end(c, b);
+        if (!be) return 0;
+        be->out = cur;
+        cur = b;
+    }
+    return cur;
 }
 
 /* Walk to the end of an acyclic chain.
@@ -284,6 +354,25 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
                 node->type = (*p == 's') ? ND_CLASS : ND_NCLASS;
             }
             p++;
+        } else if (*p == 'n' || *p == 't' || *p == 'r' ||
+                   *p == 'f' || *p == 'v' || *p == 'a') {
+            /* GNU regex maps these to the control characters they name.
+             * POSIX leaves them undefined, so this is a superset -- and it
+             * is what `sed 's/\n/+/'` needs to see the newline
+             * that N puts in the pattern space, and what `grep '\t'`
+             * needs to find a tab. Without it they matched the LETTER. */
+            node = new_node(c);
+            if (!node) return 0;
+            node->type = ND_LIT;
+            switch (*p) {
+            case 'n': node->ch = 10; break;
+            case 't': node->ch = 9;  break;
+            case 'r': node->ch = 13; break;
+            case 'f': node->ch = 12; break;
+            case 'v': node->ch = 11; break;
+            default:     node->ch = 7;  break;
+            }
+            p++;
         } else if (*p) {
             node = new_node(c);
             if (!node) return 0;
@@ -381,6 +470,9 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
     while (*p && *p != '|' && *p != ')' && !(*p == '\\' && p[1] == ')') &&
            !(*p == '\\' && p[1] == '|' && !ere)) {
 
+        /* The atom occupies nodes [atom_lo, atom_hi); a bounded
+         * quantifier has to CLONE that range. */
+        int atom_lo = c->nnodes, atom_hi;
         nd_t *atom = 0;
         nd_t *frag_end = 0;   /* known exit for quantified fragments */
 
@@ -399,6 +491,7 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
             char q = *p++;
             if (*p == '?') { greedy = 0; p++; }
 
+            atom_hi = c->nnodes;
             nd_t *match = new_node(c);
             if (!match) return 0;
             match->type = ND_NOP;
@@ -408,7 +501,7 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
             else if (q == '+') { qmin = 1; qmax = -1; }
             else { qmin = 0; qmax = 1; }
 
-            atom = quantify(c, atom, match, qmin, qmax, greedy);
+            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
             if (!atom) return 0;
             frag_end = match;
         }
@@ -423,12 +516,11 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
                 else { qmax = parse_count(&p); }
             }
             if (*p == '\\' && p[1] == '}') p += 2;
-            (void)qmin; (void)qmax;
-            /* Simplified: treat as * */
+            atom_hi = c->nnodes;
             nd_t *match = new_node(c);
             if (!match) return 0;
             match->type = ND_NOP;
-            atom = quantify(c, atom, match, 0, -1, 1);
+            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
             if (!atom) return 0;
             frag_end = match;
         }
@@ -446,10 +538,11 @@ static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
             greedy = 1;
             if (*p == '?') { greedy = 0; p++; }
 
+            atom_hi = c->nnodes;
             nd_t *match = new_node(c);
             if (!match) return 0;
             match->type = ND_NOP;
-            atom = quantify(c, atom, match, qmin, qmax, greedy);
+            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
             if (!atom) return 0;
         }
 
@@ -642,6 +735,38 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
 
 /* ---- public API ------------------------------------------------- */
 
+/* An upper bound on the nodes a pattern needs. Each character can produce
+ * a couple of nodes; each {n,m} multiplies the fragment before it by up to
+ * m. Both the per-interval count and the product are capped, so a pattern
+ * like a{1000}{1000} asks for a bounded amount and gets REG_ESPACE rather
+ * than trying to allocate the world. */
+static int estimate_nodes(const char *pat, int ere) {
+    long len = 0;
+    for (const char *q = pat; *q; q++) len++;
+    long base = len * 3 + 32;
+    long factor = 1;
+    for (const char *q = pat; *q; q++) {
+        int is_open = ere ? (*q == '{') : (*q == '\\' && q[1] == '{');
+        if (!is_open) continue;
+        const char *r = ere ? q + 1 : q + 2;
+        long lo = 0, hi = 0;
+        int gotlo = 0, gothi = 0;
+        while (*r >= '0' && *r <= '9') { lo = lo * 10 + (*r++ - '0'); gotlo = 1; }
+        if (*r == ',') {
+            r++;
+            while (*r >= '0' && *r <= '9') { hi = hi * 10 + (*r++ - '0'); gothi = 1; }
+        }
+        long m = gothi ? hi : (gotlo ? lo : 1);
+        if (m < 1) m = 1;
+        if (m > 256) m = 256;
+        factor *= m;
+        if (factor > 2048) { factor = 2048; break; }
+    }
+    long total = base * factor + 32;
+    if (total > 300000) total = 300000;
+    return (int)total;
+}
+
 int regcomp(regex_t *preg, const char *pattern, int cflags) {
     if (!preg || !pattern) return REG_BADPAT;
 
@@ -651,6 +776,15 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
 
     const char *p = pattern;
     int ere = (cflags & REG_EXTENDED) != 0;
+
+    /* Size the node array ONCE. new_node() no longer grows it, because
+     * growing it moved every node and invalidated the pointers the parser
+     * holds. A bounded repetition duplicates its fragment, so the bound has
+     * to account for the repeat counts in the pattern. */
+    comp->cap = estimate_nodes(pattern, ere);
+    comp->nodes = (nd_t *)malloc((size_t)comp->cap * sizeof(nd_t));
+    if (!comp->nodes) { free(comp); return REG_ESPACE; }
+
     nd_t *root = parse_alt(comp, &p, ere);
     if (comp->err) {
         int e = comp->err;
