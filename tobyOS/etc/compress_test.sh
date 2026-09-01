@@ -294,4 +294,29 @@ dmesg | wc -l
 echo @@vi_exists
 vi --version 2>&1 | head -1; which vi
 
+# --- tar ----------------------------------------------------------------
+rm -rf /tmp/tsrc /tmp/tout; mkdir -p /tmp/tsrc/sub
+echo alpha > /tmp/tsrc/a.txt
+printf 'deep\ncontent\n' > /tmp/tsrc/sub/c.txt
+cd /tmp
+echo @@tar_create
+tar -cf t.tar tsrc; echo rc=$?
+echo @@tar_list
+tar -tf t.tar | sort
+echo @@tar_extract
+mkdir -p /tmp/tout && cd /tmp/tout && tar -xf ../t.tar && cat tsrc/sub/c.txt
+cd /tmp
+echo @@tar_gzip
+tar -czf t.tgz tsrc; tar -tf t.tgz | sort | tail -1
+echo @@tar_bzip2
+tar -cjf t.tbz tsrc; tar -tf t.tbz | sort | tail -1
+echo @@tar_roundtrip_z
+rm -rf /tmp/tz && mkdir -p /tmp/tz && cd /tmp/tz && tar -xzf ../t.tgz && cat tsrc/a.txt
+cd /tmp
+echo @@tar_member
+rm -rf /tmp/tm && mkdir -p /tmp/tm && cd /tmp/tm && tar -xf ../t.tar tsrc/a.txt && ls tsrc | cat
+cd /tmp
+echo @@tar_corrupt
+tar -tf /etc/motd > /dev/null 2>&1; echo rc=$?
+
 echo @@compress_END

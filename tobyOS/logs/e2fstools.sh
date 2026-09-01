@@ -104,7 +104,17 @@ fi
 # The e2fs markers are prefixed e2_ because util_test.sh runs in the SAME
 # boot and also emits @@lsblk. Sharing a marker made this gate parse the
 # other test's output and report failures that were not about ext4 at all.
-kern_strip() { sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' ; }
+# A kernel diagnostic can interleave MID-LINE, not only at the start of
+# one, so a filter that drops lines beginning with '[' leaves it behind and
+# a perfectly correct tool looks broken. Cut an embedded diagnostic off
+# where it starts, and swallow the blank line its own newline leaves.
+kern_strip() {
+    sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
+        { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
+              print substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending && $0 == "") { pending = 0; next }
+          pending = 0; print }'
+}
 OUT=$(sed -n '/@@e2_lsblk/,/@@e2_END/p' "$LOG" | kern_strip | tr -d '\r')
 if ! echo "$OUT" | grep -q "@@e2_END"; then
     echo "ABORT: transcript incomplete"; echo "$OUT" | tail -5; exit 1

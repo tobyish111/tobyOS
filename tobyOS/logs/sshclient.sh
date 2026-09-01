@@ -66,7 +66,17 @@ if ! grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null; then
     echo "ABORT: the harness never reported"; exit 1
 fi
 
-kern_strip() { sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' ; }
+# A kernel diagnostic can interleave MID-LINE, not only at the start of
+# one, so a filter that drops lines beginning with '[' leaves it behind and
+# a perfectly correct tool looks broken. Cut an embedded diagnostic off
+# where it starts, and swallow the blank line its own newline leaves.
+kern_strip() {
+    sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
+        { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
+              print substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending && $0 == "") { pending = 0; next }
+          pending = 0; print }'
+}
 OUT=$(sed -n '/@@keygen/,/@@END/p' "$LOG" | kern_strip | tr -d '\r')
 if ! echo "$OUT" | grep -q "@@END"; then
     echo "ABORT: transcript incomplete"; echo "$OUT" | tail -5; exit 1

@@ -55,7 +55,23 @@ if ! grep -aq "COREUTILS. VERDICT" "$LOG" 2>/dev/null; then
     exit 1
 fi
 
-kern_strip() { sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' ; }
+# Kernel diagnostics interleave with program output, and NOT only at the
+# start of a line: a process being reaped can emit "[NNNN ms] [proc] ..."
+# in the middle of one, which then survives a filter that only drops lines
+# BEGINNING with '['. That produced five different phantom failures in
+# tools whose output was perfectly correct.
+#
+# So: drop the leading timestamp, drop whole kernel lines, and cut an
+# EMBEDDED diagnostic off at the point it starts -- swallowing the one
+# blank line its own newline leaves behind, which would otherwise become a
+# spurious empty field.
+kern_strip() {
+    sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
+        { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
+              print substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending && $0 == "") { pending = 0; next }
+          pending = 0; print }'
+}
 OUT=$(sed -n '/@@bz_pipe/,/@@compress_END/p' "$LOG" | kern_strip | tr -d '\r')
 if ! echo "$OUT" | grep -q "@@compress_END"; then
     echo "ABORT: the guest transcript is incomplete"
@@ -217,6 +233,18 @@ echo "=== dmesg and vi ==="
 ck dmesg     "dmesg prints kernel log lines" '[A-Z]'
 ck dmesg_any "and there are some"            '^[1-9]'
 ck vi_exists "vi resolves to the native vi"  '/bin/vi'
+
+
+echo "=== tar, the last name that was busybox ==="
+eq tar_create       "creates an archive"          'rc=0|'
+eq tar_list         "lists what it stored"        'tsrc/|tsrc/a.txt|tsrc/sub/|tsrc/sub/c.txt|'
+eq tar_extract      "extracts the contents back"  'deep|content|'
+ck tar_gzip         "-z produces a readable archive"  'tsrc/sub/c.txt'
+ck tar_bzip2        "-j produces a readable archive"  'tsrc/sub/c.txt'
+eq tar_roundtrip_z  "-xz brings the bytes back"   'alpha|'
+eq tar_member       "extracts only a named member" 'a.txt|'
+# A file that is not a tar at all must be refused, with tar's exit code 2.
+eq tar_corrupt      "a non-archive is refused"    'rc=2|'
 
 
 echo

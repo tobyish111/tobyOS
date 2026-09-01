@@ -559,6 +559,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_ln/user_ln.elf \
             programs/user_shellutils/user_shellutils.elf \
             programs/user_ls/user_ls.elf \
+            programs/user_tar/user_tar.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1826,6 +1827,22 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nc,user_nc))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ifconfig,user_ifconfig))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_nslookup,user_nslookup))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_gui_calc,user_gui_calc))
+
+# tar decompresses in-process, so it links the same shared inflater gzip
+# does (src/puff.c, compiled a second time for userland).
+programs/user_tar/user_tar.o: programs/user_tar/main.c $(LIBTOBY_AR) $(LIBTOBY_HEADERS)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_tar/puff.o: src/puff.c $(LIBTOBY_AR)
+	$(CC) $(LIBTOBY_CFLAGS) -I include -c $< -o $@
+
+programs/user_tar/user_tar.elf: programs/user_tar/user_tar.o \
+                                programs/user_tar/puff.o \
+                                $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                                programs/user_tar/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/user_tar/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/user_tar/user_tar.o \
+	      programs/user_tar/puff.o $(LIBTOBY_AR)
 
 # ---------- Browser application ----------
 
@@ -3136,6 +3153,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
 	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
+	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
 	@# sixteen names that were busybox applets until now, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
@@ -3955,7 +3973,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
 	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
 	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
-	    bin/watch bin/dd bin/dmesg bin/vi bin/ls                                                   \
+	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5714,6 +5732,8 @@ clean:
 	       programs/user_ln/user_ln.o programs/user_ln/user_ln.elf \
 	       programs/user_shellutils/user_shellutils.o programs/user_shellutils/user_shellutils.elf \
 	       programs/user_ls/user_ls.o programs/user_ls/user_ls.elf \
+	       programs/user_tar/user_tar.o programs/user_tar/puff.o \
+	       programs/user_tar/user_tar.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

@@ -52,7 +52,17 @@ rm -rf "$H"; mkdir -p "$H"
 HOST_OUT=$(MSYS_NO_PATHCONV=1 WORKDIR="$H" bash etc/sed_test.sh 2>&1)
 rm -rf "$H"
 
-kern_strip() { sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' ; }
+# A kernel diagnostic can interleave MID-LINE, not only at the start of
+# one, so a filter that drops lines beginning with '[' leaves it behind and
+# a perfectly correct tool looks broken. Cut an embedded diagnostic off
+# where it starts, and swallow the blank line its own newline leaves.
+kern_strip() {
+    sed -E 's/^\[[0-9 ]+ms\] //' | grep -v '^\[' | awk '
+        { if (match($0, /\[[0-9]+ ms\] \[[a-z_0-9]+\]/)) {
+              print substr($0, 1, RSTART - 1); pending = 1; next }
+          if (pending && $0 == "") { pending = 0; next }
+          pending = 0; print }'
+}
 GUEST_OUT=$(sed -n '/@@s_basic/,/@@sed_END/p' "$LOG" | kern_strip | tr -d '\r')
 
 if ! echo "$GUEST_OUT" | grep -q "@@sed_END"; then
