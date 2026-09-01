@@ -1095,7 +1095,21 @@ struct abi_vizmap {
  * memory. This is the call it should always have made. */
 #define ABI_SYS_DNS_RESOLVE     200  /* (const char *name, uint32_t *ip_be) */
 
-#define ABI_SYS_NR_MAX          201
+/* Read raw sectors from a registered block device.
+ *
+ * args: (const char *devname, uint64_t lba, void *buf, uint32_t nsectors)
+ * returns 0, or -ABI_E* .  ROOT ONLY.
+ *
+ * There was no way for userland to see a disk's bytes at all, so none of
+ * dumpe2fs / e2fsck / debugfs / badblocks could exist. This is READ-ONLY on
+ * purpose: a general raw WRITE would bypass the foreign-filesystem and
+ * boot-medium guards that provisioning carries, and those exist because
+ * swap once targeted a Windows EFI partition. Anything that needs to write
+ * should go through SYS_DATA_PROVISION and its checks.
+ */
+#define ABI_SYS_BLK_READ        201  /* (name, lba, buf, nsectors) */
+
+#define ABI_SYS_NR_MAX          202
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

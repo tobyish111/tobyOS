@@ -4650,6 +4650,29 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_term_write((int)a1, (const void *)a2, (size_t)a3);
     case SYS_TERM_READ:
         return sys_term_read((int)a1, (void *)a2, (size_t)a3);
+    case ABI_SYS_BLK_READ: {
+        /* Root only. Raw sectors are every byte of every filesystem on the
+         * machine, including other users' files and the password database,
+         * so this is exactly as privileged as the disk itself. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        char name[ABI_BLK_NAME_MAX];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        uint64_t lba = (uint64_t)a2;
+        uint32_t nsec = (uint32_t)a4;
+        if (nsec == 0 || nsec > 256u) return -ABI_EINVAL;
+        size_t bytes = (size_t)nsec * 512u;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a3, bytes)) return -ABI_EFAULT;
+        struct blk_dev *d = blk_find(name);
+        if (!d) return -ABI_ENOENT;
+        void *tmp = kmalloc(bytes);
+        if (!tmp) return -ABI_ENOMEM;
+        int rc = blk_read(d, lba, nsec, tmp);
+        if (rc != 0) { kfree(tmp); return -ABI_EIO; }
+        if (copy_to_user((void *)a3, tmp, bytes) != 0) { kfree(tmp); return -ABI_EFAULT; }
+        kfree(tmp);
+        return 0;
+    }
     case ABI_SYS_DNS_RESOLVE: {
         /* The kernel already had dns_resolve(); nothing exposed it, so no
          * userland program could turn a name into an address for a raw TCP
