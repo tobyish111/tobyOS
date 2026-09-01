@@ -174,6 +174,32 @@ ck ln_force         "ln -sf replaces an existing link" 'rc=0\|'
 ck ln_basename      "ln -s with no linkname uses the basename" 'rc=[0-9]'
 
 
+echo "=== the sixteen names that were busybox, now native ==="
+eq su_seq     "seq counts, ranges and -s"   '1|2|3|2|3|4|1,2,3|'
+eq su_tac     "tac reverses"                'three|two|one|'
+ck su_rmdir   "rmdir removes, and says why it cannot"               'gone: yes.*failed to remove'
+ck su_whoami  "whoami names the uid"        '^[a-z]'
+# This kernel reports itself as Linux 6.1.0-tobyos ON PURPOSE -- Chromium,
+# glibc and every ported binary check it -- so `uname` printing Linux is it
+# reading the real source, not a stub. The release string carries the truth.
+ck su_uname   "uname reads the real kernel identity" 'Linux.*Linux.*x86_64.*6.1.0-tobyos'
+ck su_which   "which finds a tool and fails on a fake" '/bin/sed.*rc=[1-9]'
+ck su_free    "free reads /proc/meminfo"    'Mem:'
+eq su_sync    "sync returns cleanly"        'rc=0|'
+ck su_stat    "stat -c reports size and type" '6 regular file'
+ck su_du      "du -s totals a directory"    '/tmp/dut'
+eq su_xargs   "xargs builds one command"    'a b c|'
+eq su_timeout "timeout runs a fast command" 'quick|rc=0|'
+eq su_yes     "yes repeats"                 'hi|hi|'
+eq su_dd      "dd copies a byte count"      'hello|'
+
+echo "=== checksums, against the values GNU prints ==="
+eq su_md5     "md5sum of abc"     '900150983cd24fb0d6963f7d28e17f72|'
+eq su_sha1    "sha1sum of abc"    'a9993e364706816aba3e25717850c26c9cd0d89d|'
+eq su_sha256  "sha256sum of abc"  'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad|'
+eq su_base64  "base64 both ways"  'aGVsbG8=|hello|'
+
+
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"

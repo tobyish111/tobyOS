@@ -557,6 +557,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_patch/user_patch.elf \
             programs/user_locate/user_locate.elf \
             programs/user_ln/user_ln.elf \
+            programs/user_shellutils/user_shellutils.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1020,6 +1021,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/deflate.c \
                    $(LIBTOBY_SRC)/bzip2.c \
                    $(LIBTOBY_SRC)/bzip2_enc.c \
+                   $(LIBTOBY_SRC)/md5sha1.c \
                    $(LIBTOBY_SRC)/render.c \
                    $(LIBTOBY_SRC)/clipboard_ext.c \
                    $(LIBTOBY_SRC)/unicode.c \
@@ -1789,6 +1791,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_power,user_power))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_patch,user_patch))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_locate,user_locate))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3126,6 +3129,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
 	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
+	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
+	@# sixteen names that were busybox applets until now, one binary
+	@for ap in yes tac seq whoami which uname free sync stat du xargs \
+	           nohup timeout watch dd; do \
+	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	@# the indexer is the same binary under its other name
 	@ln -f $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb 2>/dev/null || \
 	   cp $(INITRD_STAGE)/bin/locate $(INITRD_STAGE)/bin/updatedb
@@ -3194,7 +3204,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
 	@# typeflag 2, so a symlink would not resolve.
 	@for ap in tsort fmt join pathchk dir vdir dircolors csplit pr numfmt \
-	           chcon runcon pinky ptx stdbuf basenc sha224sum sha384sum b2sum; do \
+	           chcon runcon pinky ptx stdbuf basenc sha224sum sha384sum b2sum \
+	           sha256sum sha512sum md5sum sha1sum base64 base32; do \
 	    ln -f $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3935,6 +3946,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/vmstat bin/tload bin/slabtop bin/skill bin/snice bin/ss       \
 	    bin/bridge bin/tracepath                                          \
 	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
+	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
+	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
+	    bin/watch bin/dd                                                   \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -3942,7 +3956,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
 	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
 	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
-	    bin/sha224sum bin/sha384sum                                       \
+	    bin/sha224sum bin/sha384sum bin/sha256sum bin/sha512sum \
+	    bin/md5sum bin/sha1sum bin/base64 bin/base32                                       \
 	    bin/kill bin/id bin/newgrp bin/vncpasswd                          \
 	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
@@ -5690,6 +5705,7 @@ clean:
 	       programs/user_patch/user_patch.o programs/user_patch/user_patch.elf \
 	       programs/user_locate/user_locate.o programs/user_locate/user_locate.elf \
 	       programs/user_ln/user_ln.o programs/user_ln/user_ln.elf \
+	       programs/user_shellutils/user_shellutils.o programs/user_shellutils/user_shellutils.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

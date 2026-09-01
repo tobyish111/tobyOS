@@ -4673,6 +4673,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         kfree(tmp);
         return 0;
     }
+    case ABI_SYS_SYNC: {
+        /* Not privileged: flushing writes is not a privileged act. */
+        extern void bcache_sync(struct blk_dev *dev);
+        bcache_sync(NULL);          /* NULL == every device */
+        return 0;
+    }
     case ABI_SYS_POWER: {
         /* Root only: this ends every other process on the machine without
          * asking them. acpi_shutdown() flushes the block cache first, so a

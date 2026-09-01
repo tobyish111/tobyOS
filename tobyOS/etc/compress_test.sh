@@ -215,4 +215,46 @@ ln -sf /tmp/lnsrc /tmp/lnsym; echo rc=$?
 echo @@ln_basename
 cd /tmp; rm -f lnsrc2; echo two > /tmp/dir_target 2>/dev/null; ln -s /tmp/lnsrc; echo rc=$?; cat /tmp/lnsrc
 
+# --- the sixteen that were busybox, and the new checksums ---------------
+echo @@su_seq
+seq 3; seq 2 4; seq -s, 1 3
+echo @@su_tac
+printf 'one\ntwo\nthree\n' > tf; tac tf
+echo @@su_rmdir
+mkdir -p /tmp/rd/a; rmdir /tmp/rd/a; echo "gone: $([ -d /tmp/rd/a ] && echo no || echo yes)"
+rmdir /tmp/rd/nope 2>&1 | head -1; echo rc=$?
+echo @@su_whoami
+whoami
+echo @@su_uname
+uname; uname -s; uname -m; uname -r
+echo @@su_which
+which sed; which definitely_no_such_tool; echo rc=$?
+echo @@su_free
+free | head -2 | tail -1 | cut -c1-4
+echo @@su_sync
+sync; echo rc=$?
+echo @@su_stat
+echo hello > /tmp/statme
+stat -c '%s %F' /tmp/statme
+echo @@su_du
+mkdir -p /tmp/dut; echo aaaa > /tmp/dut/f1; du -s /tmp/dut | cut -f2
+echo @@su_xargs
+printf 'a\nb\nc\n' | xargs echo
+echo @@su_timeout
+timeout 2 echo quick; echo rc=$?
+echo @@su_yes
+yes hi | head -2
+echo @@su_dd
+dd if=/tmp/statme of=/tmp/ddout bs=1 count=5 2>/dev/null
+printf "%s\n" "$(cat /tmp/ddout)"
+echo @@su_md5
+printf 'abc' | md5sum | cut -d' ' -f1
+echo @@su_sha1
+printf 'abc' | sha1sum | cut -d' ' -f1
+echo @@su_sha256
+printf 'abc' | sha256sum | cut -d' ' -f1
+echo @@su_base64
+printf 'hello' | base64
+printf "%s\n" "$(printf 'aGVsbG8=' | base64 -d)"
+
 echo @@compress_END

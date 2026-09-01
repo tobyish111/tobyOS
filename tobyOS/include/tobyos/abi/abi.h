@@ -1125,7 +1125,18 @@ struct abi_vizmap {
 #define ABI_POWER_REBOOT  1u
 #define ABI_POWER_HALT    2u   /* stop the CPUs, leave the power on */
 
-#define ABI_SYS_NR_MAX          203
+/* Flush every dirty filesystem block to stable media.
+ *
+ * args: none.  ret: 0.
+ *
+ * The block cache has always had bcache_sync(), and the graceful power-off
+ * path calls it, but no syscall reached it -- so `sync`, which is how a
+ * script says "make sure that is really on the disk before I pull the
+ * plug", could not exist. Not privileged: flushing your own writes is not
+ * a privileged act, and the call cannot lose data. */
+#define ABI_SYS_SYNC            203  /* () */
+
+#define ABI_SYS_NR_MAX          204
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

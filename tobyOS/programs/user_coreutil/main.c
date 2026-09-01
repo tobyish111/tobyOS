@@ -16,6 +16,7 @@
  */
 
 #include <stdio.h>
+#include <toby/md5sha1.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -1076,6 +1077,87 @@ static int cmd_b2sum(int argc, char **argv) {
 
 /* ---------------------------------------------------------------- dispatch */
 struct applet { const char *name; int (*fn)(int, char **); };
+
+/* -------------------------------------------------- md5sum / sha1sum ----
+ * MD5 and SHA-1 come from libtoby (toby/md5sha1.h). NEITHER IS A SECURITY
+ * PRIMITIVE any more; they are here so the checksum files the world already
+ * publishes can be read. Anything that must be trusted should use sha256sum
+ * or Ed25519.
+ *
+ * sha256sum and sha512sum are the SAME cores sha224sum and sha384sum
+ * already use, with the standard initial values and no truncation -- which
+ * is why the four sit together rather than being four implementations.
+ */
+
+static int hashsum_run(int argc, char **argv, int kind) {
+    int argi = 1;
+    for (; argi < argc; argi++) if (argv[argi][0] != '-' || !argv[argi][1]) break;
+    int rc = 0;
+    do {
+        const char *nm = (argi < argc) ? argv[argi] : "-";
+        FILE *f = (argi < argc && strcmp(nm, "-")) ? fopen(nm, "rb") : stdin;
+        if (!f) { rc = err(strerror(errno), nm); argi++; continue; }
+        unsigned char b[4096], d[64];
+        size_t n, outlen = 0;
+        if (kind == 0) {
+            toby_md5_ctx c; toby_md5_init(&c);
+            while ((n = fread(b, 1, sizeof b, f)) > 0) toby_md5_update(&c, b, n);
+            toby_md5_final(&c, d); outlen = 16;
+        } else if (kind == 1) {
+            toby_sha1_ctx c; toby_sha1_init(&c);
+            while ((n = fread(b, 1, sizeof b, f)) > 0) toby_sha1_update(&c, b, n);
+            toby_sha1_final(&c, d); outlen = 20;
+        } else if (kind == 2) {
+            sha256_ctx c;
+            c.h[0]=0x6a09e667; c.h[1]=0xbb67ae85; c.h[2]=0x3c6ef372; c.h[3]=0xa54ff53a;
+            c.h[4]=0x510e527f; c.h[5]=0x9b05688c; c.h[6]=0x1f83d9ab; c.h[7]=0x5be0cd19;
+            c.len = 0; c.n = 0;
+            while ((n = fread(b, 1, sizeof b, f)) > 0) sha256_update(&c, b, n);
+            sha256_final(&c, d); outlen = 32;
+        } else {
+            sha512_ctx c;
+            c.h[0]=0x6a09e667f3bcc908ULL; c.h[1]=0xbb67ae8584caa73bULL;
+            c.h[2]=0x3c6ef372fe94f82bULL; c.h[3]=0xa54ff53a5f1d36f1ULL;
+            c.h[4]=0x510e527fade682d1ULL; c.h[5]=0x9b05688c2b3e6c1fULL;
+            c.h[6]=0x1f83d9abfb41bd6bULL; c.h[7]=0x5be0cd19137e2179ULL;
+            c.len = 0; c.n = 0;
+            while ((n = fread(b, 1, sizeof b, f)) > 0) sha512_update(&c, b, n);
+            sha512_final(&c, d); outlen = 64;
+        }
+        for (size_t i = 0; i < outlen; i++) printf("%02x", d[i]);
+        printf("  %s" "\n", (argi < argc) ? nm : "-");
+        if (f != stdin) fclose(f);
+        argi++;
+    } while (argi < argc);
+    return rc;
+}
+
+static int cmd_md5sum   (int argc, char **argv) { return hashsum_run(argc, argv, 0); }
+static int cmd_sha1sum  (int argc, char **argv) { return hashsum_run(argc, argv, 1); }
+static int cmd_sha256sum(int argc, char **argv) { return hashsum_run(argc, argv, 2); }
+static int cmd_sha512sum(int argc, char **argv) { return hashsum_run(argc, argv, 3); }
+
+/* base64/base32 are basenc with the base fixed and GNU's simpler option
+ * set: no --baseNN selector, and -w defaults to 76. */
+static int base_n_run(int argc, char **argv, int base) {
+    int decode = 0, wrap = 76, argi = 1;
+    for (; argi < argc; argi++) {
+        if (argv[argi][0] != '-' || !argv[argi][1]) break;
+        if (!strcmp(argv[argi], "-d") || !strcmp(argv[argi], "--decode")) { decode = 1; continue; }
+        if (!strcmp(argv[argi], "-i") || !strcmp(argv[argi], "--ignore-garbage")) continue;
+        if (!strcmp(argv[argi], "-w") && argi + 1 < argc) { wrap = atoi(argv[++argi]); continue; }
+        if (!strncmp(argv[argi], "-w", 2) && argv[argi][2]) { wrap = atoi(argv[argi] + 2); continue; }
+        return err("unknown option", argv[argi]);
+    }
+    FILE *f = open_or_stdin(argc, argv, argi);
+    if (!f) return 1;
+    int rc = decode ? basenc_decode(f, base) : basenc_encode(f, base, wrap);
+    if (f != stdin) fclose(f);
+    return rc;
+}
+static int cmd_base64(int argc, char **argv) { return base_n_run(argc, argv, 64); }
+static int cmd_base32(int argc, char **argv) { return base_n_run(argc, argv, 32); }
+
 static const struct applet g_applets[] = {
     { "tsort",     cmd_tsort },
     { "fmt",       cmd_fmt },
@@ -1094,6 +1176,12 @@ static const struct applet g_applets[] = {
     { "stdbuf",    cmd_stdbuf },
     { "basenc",    cmd_basenc },
     { "sha224sum", cmd_sha224 },
+    { "sha256sum", cmd_sha256sum },
+    { "sha512sum", cmd_sha512sum },
+    { "md5sum",    cmd_md5sum },
+    { "sha1sum",   cmd_sha1sum },
+    { "base64",    cmd_base64 },
+    { "base32",    cmd_base32 },
     { "sha384sum", cmd_sha384 },
     { "b2sum",     cmd_b2sum },
     { 0, 0 }
