@@ -248,13 +248,50 @@ echo @@su_dd
 dd if=/tmp/statme of=/tmp/ddout bs=1 count=5 2>/dev/null
 printf "%s\n" "$(cat /tmp/ddout)"
 echo @@su_md5
-printf 'abc' | md5sum | cut -d' ' -f1
+printf "%s\n" "$(printf 'abc' | md5sum | cut -d' ' -f1)"
 echo @@su_sha1
-printf 'abc' | sha1sum | cut -d' ' -f1
+printf "%s\n" "$(printf 'abc' | sha1sum | cut -d' ' -f1)"
 echo @@su_sha256
-printf 'abc' | sha256sum | cut -d' ' -f1
+printf "%s\n" "$(printf 'abc' | sha256sum | cut -d' ' -f1)"
 echo @@su_base64
-printf 'hello' | base64
+printf "%s\n" "$(printf 'hello' | base64)"
 printf "%s\n" "$(printf 'aGVsbG8=' | base64 -d)"
+
+# --- ls, dmesg, vi ------------------------------------------------------
+mkdir -p /tmp/lst
+echo aa > /tmp/lst/alpha
+echo bbbb > /tmp/lst/beta
+mkdir -p /tmp/lst/sub
+# Piped through cat on purpose: the guest console IS a terminal, so a bare
+# `ls` there correctly prints COLUMNS. The one-per-line form is what a
+# script sees, and it is the form worth pinning.
+echo @@ls_plain
+ls /tmp/lst | cat
+echo @@ls_all
+# A real dotfile: this VFS's readdir does not return "." or ".." at all,
+# so -a is about hidden FILES here, not the two special entries.
+echo x > /tmp/lst/.hidden
+ls /tmp/lst | cat | grep -c hidden
+ls -a /tmp/lst | cat | grep -c hidden
+echo @@ls_long
+ls -l /tmp/lst | cat | head -1
+echo @@ls_long_mode
+ls -l /tmp/lst | cat | grep alpha | cut -c1-10
+echo @@ls_size_col
+ls -l /tmp/lst | cat | grep beta | tr -s ' ' | cut -d' ' -f4
+echo @@ls_classify
+ls -F /tmp/lst | cat
+echo @@ls_reverse
+ls -r /tmp/lst | cat
+echo @@ls_onefile
+ls /tmp/lst/alpha | cat
+echo @@ls_missing
+ls /tmp/no_such_entry > /tmp/lserr 2>&1; echo rc=$?; head -1 /tmp/lserr
+echo @@dmesg
+dmesg -t | head -2 | cut -c1-5
+echo @@dmesg_any
+dmesg | wc -l
+echo @@vi_exists
+vi --version 2>&1 | head -1; which vi
 
 echo @@compress_END

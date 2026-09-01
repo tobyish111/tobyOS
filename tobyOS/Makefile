@@ -558,6 +558,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_locate/user_locate.elf \
             programs/user_ln/user_ln.elf \
             programs/user_shellutils/user_shellutils.elf \
+            programs/user_ls/user_ls.elf \
             programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
@@ -1792,6 +1793,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_patch,user_patch))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_locate,user_locate))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_ln,user_ln))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_shellutils,user_shellutils))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
 
 # gzip is the one user program that compiles a KERNEL source a second time:
 # src/puff.c is the inflater the browser uses for Content-Encoding: gzip, and
@@ -3023,6 +3025,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/sensors/sensors.elf                   $(INITRD_STAGE)/bin/sensors
 	cp programs/cpupower/cpupower.elf                 $(INITRD_STAGE)/bin/cpupower
 	cp programs/tvi/tvi.elf                           $(INITRD_STAGE)/bin/tvi
+	@# tvi IS a POSIX vi, so it holds the name too
+	cp programs/tvi/tvi.elf                          $(INITRD_STAGE)/bin/vi
 	cp programs/tvitest/tvitest.elf                   $(INITRD_STAGE)/bin/tvitest
 	cp programs/tedit/tedit.elf                       $(INITRD_STAGE)/bin/tedit
 	cp programs/fsprobe/fsprobe.elf                   $(INITRD_STAGE)/bin/fsprobe
@@ -3038,6 +3042,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/rendertest/rendertest.elf             $(INITRD_STAGE)/bin/rendertest
 	cp programs/fonttest/fonttest.elf                 $(INITRD_STAGE)/bin/fonttest
 	cp programs/logview/logview.elf                   $(INITRD_STAGE)/bin/logview
+	@# the same reader under the name every distro uses for it
+	cp programs/logview/logview.elf                  $(INITRD_STAGE)/bin/dmesg
 	cp programs/crashinfo/crashinfo.elf               $(INITRD_STAGE)/bin/crashinfo
 	cp programs/wdogtest/wdogtest.elf                 $(INITRD_STAGE)/bin/wdogtest
 	cp programs/safesh/safesh.elf                     $(INITRD_STAGE)/bin/safesh
@@ -3129,6 +3135,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
 	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
+	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
 	@# sixteen names that were busybox applets until now, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
@@ -3948,7 +3955,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
 	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
 	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
-	    bin/watch bin/dd                                                   \
+	    bin/watch bin/dd bin/dmesg bin/vi bin/ls                                                   \
 	    bin/user_util bin/column bin/colrm bin/col bin/rename bin/whereis   \
 	    bin/namei bin/uuidgen bin/setterm bin/lsblk bin/findmnt bin/lsns    \
 	    bin/wdctl bin/prlimit bin/lslocks bin/lsipc bin/zramctl             \
@@ -5706,6 +5713,7 @@ clean:
 	       programs/user_locate/user_locate.o programs/user_locate/user_locate.elf \
 	       programs/user_ln/user_ln.o programs/user_ln/user_ln.elf \
 	       programs/user_shellutils/user_shellutils.o programs/user_shellutils/user_shellutils.elf \
+	       programs/user_ls/user_ls.o programs/user_ls/user_ls.elf \
 	       programs/user_coreutil/user_coreutil.o programs/user_coreutil/user_coreutil.elf \
 	       programs/user_admin/user_admin.o programs/user_admin/user_admin.elf \
 	       programs/user_ssh/user_ssh.o programs/user_ssh/user_ssh.elf \

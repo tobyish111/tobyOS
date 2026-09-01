@@ -68,7 +68,10 @@ int main(int argc, char *argv[]) {
     int n1 = expand(argv[i++], set1, sizeof(set1));
     int n2 = (i < argc) ? expand(argv[i++], set2, sizeof(set2)) : 0;
     if (i < argc) eprintf("too many arguments");
-    if (!dflag && n2 == 0) eprintf("missing string2");
+    /* `tr -s SET1` with no SET2 is valid and common -- it squeezes runs of
+     * SET1 without translating anything, which is what `tr -s " "` means.
+     * Requiring string2 rejected that outright. */
+    if (!dflag && !sflag && n2 == 0) eprintf("missing string2");
 
     int in1[256] = {0};
     for (int k = 0; k < n1; k++) in1[set1[k]] = 1;
@@ -78,7 +81,9 @@ int main(int argc, char *argv[]) {
      * cover a longer string1, which is what POSIX specifies. */
     unsigned char map[256];
     for (int k = 0; k < 256; k++) map[k] = (unsigned char)k;
-    if (!dflag) {
+    /* n2 == 0 only happens under -s now, and then the map stays the
+     * identity -- building it would index set2[-1]. */
+    if (!dflag && n2 > 0) {
         int j = 0;
         for (int k = 0; k < 256; k++) {
             if (!in1[k]) continue;

@@ -190,13 +190,21 @@ int usleep(unsigned int usecs) {
 
 /* ---- isatty ------------------------------------------------------ *
  *
- * The kernel exposes no "is this fd a tty?" syscall yet (M25A scope).
- * We approximate by treating stdin/stdout/stderr as ttys and everything
- * else as not. Good enough for the M25E-era ports of cat/ls which only
- * use isatty to decide whether to colourise output. */
+ * ASK THE KERNEL. This used to return 1 for any of fd 0/1/2 whatever they
+ * were pointing at, under a comment saying no syscall could tell -- while
+ * _exit() twenty lines above was already using the right probe: TCGETS
+ * succeeds on a console or a pty and returns ENOTTY on anything else.
+ *
+ * The stub was not harmless. Every tool that changes behaviour for a
+ * terminal was taking the terminal branch when redirected: `ls` printed
+ * COLUMNS into a pipe instead of one name per line, `more` paged instead
+ * of copying its input through, `nohup` always redirected to nohup.out,
+ * and `watch` would have looped forever in a script. */
 int isatty(int fd) {
-    if (fd >= 0 && fd <= 2) return 1;
-    return 0;
+    if (fd < 0) return 0;
+    char tio_probe[64];
+    return toby_sc3(ABI_SYS_IOCTL, fd, 0x5401 /* TCGETS */,
+                    (long)(uintptr_t)tio_probe) >= 0;
 }
 
 /* ---- open ------------------------------------------------------- *

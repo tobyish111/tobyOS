@@ -200,6 +200,25 @@ eq su_sha256  "sha256sum of abc"  'ba7816bf8f01cfea414140de5dae2223b00361a396177
 eq su_base64  "base64 both ways"  'aGVsbG8=|hello|'
 
 
+echo "=== ls, the last big one that was busybox ==="
+# Piped, so one name per line -- which is what every script that parses ls
+# assumes, and getting it wrong breaks them silently.
+eq ls_plain     "lists a directory, sorted"    'alpha|beta|sub|'
+eq ls_all       "-a is what reveals a hidden file" '0|1|'
+ck ls_long      "-l prints a total"            '^total [0-9]'
+ck ls_long_mode "the mode column looks right"  '^-rw'
+eq ls_size_col  "-l reports the real size"     '5|'
+eq ls_classify  "-F marks the directory"       'alpha|beta|sub/|'
+eq ls_reverse   "-r reverses"                  'sub|beta|alpha|'
+eq ls_onefile   "a plain file lists as itself" '/tmp/lst/alpha|'
+ck ls_missing   "a missing path is an error"   'rc=[1-9].*cannot access'
+
+echo "=== dmesg and vi ==="
+ck dmesg     "dmesg prints kernel log lines" '[A-Z]'
+ck dmesg_any "and there are some"            '^[1-9]'
+ck vi_exists "vi resolves to the native vi"  '/bin/vi'
+
+
 echo
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"
