@@ -51,6 +51,12 @@ extern int errno;
  * it) and ENOTEMPTY is what rmdir(2) answers for a populated directory. */
 #define EXDEV           18
 #define ENOTEMPTY       39
+/* 2026-09-01: the loaders learned "#!". ENOEXEC is what execve answers for
+ * a file that is neither script, ELF nor PE (execvp then runs it through
+ * the shell, per POSIX); ELOOP is a #! chain deeper than the kernel will
+ * follow. */
+#define ENOEXEC          8
+#define ELOOP           40
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

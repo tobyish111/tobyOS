@@ -83,6 +83,65 @@ static long stat_field(const char *buf, const char *key) {
     return -1;
 }
 
+/* The "cpu  ..." line and the two counters vmstat's system/cpu columns are
+ * made of. Nothing here is a placeholder any more: the kernel accumulates
+ * all of them (2026-09-01). */
+struct cpustat { long user, nice, sys, idle, iowait, irq, softirq, steal, intr, ctxt; };
+
+static int read_cpustat(struct cpustat *c) {
+    char st[4096];
+    if (slurp("/proc/stat", st, sizeof st) < 0) return -1;
+    memset(c, 0, sizeof *c);
+    const char *p = st;
+    if (strncmp(p, "cpu ", 4)) return -1;
+    p += 4;
+    long *f[8] = { &c->user, &c->nice, &c->sys, &c->idle,
+                   &c->iowait, &c->irq, &c->softirq, &c->steal };
+    for (int i = 0; i < 8; i++) {
+        while (*p == ' ') p++;
+        long v = 0;
+        while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+        *f[i] = v;
+    }
+    c->intr = stat_field(st, "intr");
+    c->ctxt = stat_field(st, "ctxt");
+    if (c->intr < 0) c->intr = 0;
+    if (c->ctxt < 0) c->ctxt = 0;
+    return 0;
+}
+
+/* /proc/uptime's first field, in whole seconds (at least 1). */
+static long read_uptime_s(void) {
+    char up[64];
+    if (slurp("/proc/uptime", up, sizeof up) < 0) return 1;
+    long v = 0;
+    for (const char *p = up; *p >= '0' && *p <= '9'; p++) v = v * 10 + (*p - '0');
+    return v > 0 ? v : 1;
+}
+
+/* One vmstat row's system and cpu columns from a pair of samples: the
+ * first row is the average since boot (divided by uptime), every later one
+ * the delta over the interval, which is what procps prints. */
+static void cpu_columns(const struct cpustat *a, const struct cpustat *b,
+                        long secs, long *in, long *cs,
+                        long *us, long *sy, long *id, long *wa, long *st) {
+    long du = (b->user - a->user) + (b->nice - a->nice);
+    long ds = (b->sys - a->sys) + (b->irq - a->irq) + (b->softirq - a->softirq);
+    long di = b->idle - a->idle;
+    long dw = b->iowait - a->iowait;
+    long dt = b->steal - a->steal;
+    long tot = du + ds + di + dw + dt;
+    if (secs < 1) secs = 1;
+    *in = (b->intr - a->intr) / secs;
+    *cs = (b->ctxt - a->ctxt) / secs;
+    if (tot <= 0) { *us = *sy = *wa = *st = 0; *id = 100; return; }
+    *us = du * 100 / tot;
+    *sy = ds * 100 / tot;
+    *wa = dw * 100 / tot;
+    *st = dt * 100 / tot;
+    *id = 100 - *us - *sy - *wa - *st;
+}
+
 /* ---------------------------------------------------------------- vmstat */
 
 static int do_vmstat(int argc, char **argv) {
@@ -116,11 +175,16 @@ static int do_vmstat(int argc, char **argv) {
     long blocked  = stat_field(st, "procs_blocked");
 
     /* Said ONCE, to stderr, so the table stays parseable and the reader is
-     * not left to assume an idle machine. */
+     * not left to assume an idle disk. The cpu and system columns are real
+     * now; the io ones need page-in/page-out counters this kernel does not
+     * publish (there is no /proc/vmstat). */
     fprintf(stderr,
-            "%s: cpu/io/system columns are unavailable: /proc/stat reports "
-            "0 for user, system, idle, intr and ctxt because the kernel "
-            "does not accumulate them.\n", prog);
+            "%s: io columns (si so bi bo) are unavailable: there is no "
+            "/proc/vmstat to read page traffic from.\n", prog);
+    struct cpustat zero, prev, cur;
+    memset(&zero, 0, sizeof zero);
+    int have_prev = read_cpustat(&prev) == 0;
+    long boot_secs = read_uptime_s();
 
     printf("procs -----------memory---------- ---swap-- -----io---- "
            "-system-- ------cpu-----\n");
@@ -142,15 +206,24 @@ static int do_vmstat(int argc, char **argv) {
         }
         long swused = (swtot >= 0 && swfree >= 0) ? swtot - swfree : 0;
 
-        printf("%2ld %2ld %6ld %6ld %6ld %6ld %4s %4s %5s %5s %4s %4s "
-               "%2s %2s %2s %2s %2s\n",
+        long in = 0, cs = 0, us = 0, sy = 0, id = 100, wa = 0, stl = 0;
+        if (have_prev) {
+            if (iter == 0)
+                cpu_columns(&zero, &prev, boot_secs, &in, &cs, &us, &sy, &id, &wa, &stl);
+            else if (read_cpustat(&cur) == 0) {
+                cpu_columns(&prev, &cur, delay, &in, &cs, &us, &sy, &id, &wa, &stl);
+                prev = cur;
+            }
+        }
+        printf("%2ld %2ld %6ld %6ld %6ld %6ld %4s %4s %5s %5s %4ld %4ld "
+               "%2ld %2ld %2ld %2ld %2ld\n",
                running < 0 ? 0 : running,
                blocked < 0 ? 0 : blocked,
                swused,
                free_kb  < 0 ? 0 : free_kb,
                buff_kb  < 0 ? 0 : buff_kb,
                cache_kb < 0 ? 0 : cache_kb,
-               "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-");
+               "-", "-", "-", "-", in, cs, us, sy, id, wa, stl);
         iter++;
         if (count && iter >= count) break;
         if (delay <= 0) break;

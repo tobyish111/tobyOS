@@ -154,6 +154,7 @@ C_SRCS := src/kernel.c \
           src/ramfs.c \
           src/tmpfs.c \
           src/ptrace.c \
+          src/binfmt.c \
           src/initrd.c \
           src/proc.c \
           src/thread.c \

@@ -369,7 +369,12 @@ addr2line -e /bin/echo 400000 2>&1 | head -1
 # breakpoint is a real int3 the debugger writes into the target's text.
 echo @@gdb_session
 printf 'break dbg_step\nrun\ninfo registers\ncontinue\ncontinue\ndelete\ncontinue\nquit\n' > /tmp/gdbcmd
-gdb /etc/dbg_test.elf < /tmp/gdbcmd 2>&1 | head -30
+gdb /etc/dbg_test.elf < /tmp/gdbcmd 2>&1 | head -60
+echo @@gdb_exitcode
+# gdb's "[Inferior 1 (process N) exited with code 7]" begins with '[', which
+# the gate's kernel-line filter drops from every section -- so the line is
+# counted HERE, where only the count crosses the filter.
+gdb /etc/dbg_test.elf < /tmp/gdbcmd 2>&1 | grep -c "exited with code 7"
 echo @@gdb_fixture
 # Does the target exit on its own, with no debugger anywhere near it? This
 # separates "the debugger cannot resume" from "the fixture never exits".
@@ -406,8 +411,112 @@ timeout 40 strace /bin/arch 2>&1 | grep "exited with" | head -1
 echo @@strace_count
 timeout 40 strace -c /bin/arch 2>&1 | head -16
 echo @@strace_native
-# A native binary is refused BY NAME rather than traced to no effect.
-strace /etc/dbg_test.elf 2>&1 | head -1
-strace /etc/dbg_test.elf > /dev/null 2>&1; echo rc=$?
+# A NATIVE tobyOS program, traced through the native dispatcher's stops --
+# which did not exist until 2026-09-01; strace refused native binaries by
+# name. The fixture exits 7, and that exit is a native syscall.
+timeout 40 strace /etc/dbg_test.elf 2>&1 | tail -5
+
+# --- #! scripts ----------------------------------------------------------
+# Neither loader read a shebang: `./script.sh` returned 127 from a shell
+# that could run every binary on the system and none of the scripts. Both
+# (spawn and execve) now hand a "#!" file to its interpreter by Linux's
+# rules: one optional argument, the script's path in place of argv[0],
+# nesting bounded at 4. A text file with NO "#!" is bash's to run itself.
+echo @@shebang_spawn
+printf '#!/bin/tsh\necho "shebang ok $1 $#"\n' > /tmp/sb1.sh; chmod +x /tmp/sb1.sh
+/tmp/sb1.sh world; echo rc=$?
+echo @@shebang_exec
+# `env` execs its command: this is the execve loader, not spawn.
+env /tmp/sb1.sh via-execve; echo rc=$?
+echo @@shebang_optarg
+# Everything after the interpreter is ONE argument, then the script's path,
+# then the script's own arguments -- /bin/echo prints its argv, so this is
+# the interpreter's argv verbatim.
+printf '#!/bin/echo hello there\n' > /tmp/sb2.sh; chmod +x /tmp/sb2.sh
+/tmp/sb2.sh a b
+echo @@shebang_nested
+printf '#!/tmp/sb2.sh\n' > /tmp/sb3.sh; chmod +x /tmp/sb3.sh
+/tmp/sb3.sh z
+echo @@shebang_busybox
+# A Linux-personality interpreter, through the same loader.
+printf '#!/bin/busybox sh\necho "busybox sh: $1"\n' > /tmp/sb6.sh; chmod +x /tmp/sb6.sh
+/tmp/sb6.sh ok; echo rc=$?
+echo @@shebang_badinterp
+printf '#!/no/such/interp\n' > /tmp/sb4.sh; chmod +x /tmp/sb4.sh
+/tmp/sb4.sh 2>&1; echo rc=$?
+echo @@shebang_loop
+# A script that names itself as its interpreter: bounded, not recursed.
+printf '#!/tmp/sb5.sh\n' > /tmp/sb5.sh; chmod +x /tmp/sb5.sh
+/tmp/sb5.sh 2>&1; echo rc=$?
+echo @@shebang_plain
+printf 'echo "plain text $1 $0"\n' > /tmp/sb7.sh; chmod +x /tmp/sb7.sh
+/tmp/sb7.sh yes; echo rc=$?
+echo @@shebang_plain_pipe
+/tmp/sb7.sh piped | cat; echo rc=$?
+echo @@shebang_plain_linux
+# busybox sh runs a #!-less text file itself too -- given ENOEXEC from the
+# loader, which used to answer with a code that read as "no such file".
+busybox sh -c '/tmp/sb7.sh bb'; echo rc=$?
+echo @@shebang_plain_execvp
+# and libtoby's execvp does what POSIX says: through the shell.
+env /tmp/sb7.sh execvp; echo rc=$?
+echo @@shebang_binary
+printf 'binary\000junk\000' > /tmp/sb8; chmod +x /tmp/sb8
+/tmp/sb8 2>&1; echo rc=$?
+echo @@shebang_noexec
+printf 'echo never\n' > /tmp/sb9.sh; chmod 644 /tmp/sb9.sh
+/tmp/sb9.sh 2>&1; echo rc=$?
+
+# --- /proc/stat: real accounting ------------------------------------------
+# The cpu, intr and ctxt counters were literal zeros ("nothing accumulates
+# them"), and /proc/loadavg was "0.00 0.00 0.00". Now the 100 Hz tick, the
+# ISR dispatcher and the scheduler's switch do the accumulating. The proof
+# is a DELTA across real work, not a nonzero number.
+echo @@pstat_before
+grep -E '^(cpu |intr |ctxt |btime |processes |procs_running )' /proc/stat | cut -c1-72
+echo @@pstat_work
+i=0; while [ $i -lt 40000 ]; do i=$((i+1)); done; echo "looped $i"
+echo @@pstat_after
+grep -E '^(cpu |intr |ctxt |btime |processes |procs_running )' /proc/stat | cut -c1-72
+echo @@pstat_loadavg
+cat /proc/loadavg
+echo @@pstat_vmstat
+vmstat 1 2 2>/tmp/vmstat.err; echo "stderr: $(cat /tmp/vmstat.err)"
+
+# --- chmod: symbolic modes ------------------------------------------------
+# /bin/chmod accepted three octal digits and nothing else, so `chmod +x`
+# printed "invalid mode" -- which is how every script fixture above stayed
+# 0644 on the first run of this gate. busybox's stat reads the bits back.
+echo @@chmod_sym
+printf 'x\n' > /tmp/cm1; chmod 644 /tmp/cm1
+chmod +x /tmp/cm1;          stat -c '%a' /tmp/cm1
+chmod u+s,g-x /tmp/cm1;     stat -c '%a' /tmp/cm1
+chmod a=r /tmp/cm1;         stat -c '%a' /tmp/cm1
+chmod -w /tmp/cm1;          stat -c '%a' /tmp/cm1
+chmod u=rwx,go=rx /tmp/cm1; stat -c '%a' /tmp/cm1
+chmod o+t /tmp/cm1;         stat -c '%a' /tmp/cm1
+chmod 0600 /tmp/cm1;        stat -c '%a' /tmp/cm1
+echo @@chmod_verbose
+chmod -v 644 /tmp/cm1
+chmod -c 644 /tmp/cm1; echo "rc=$?"
+chmod -v 755 /tmp/cm1
+echo @@chmod_recursive
+mkdir -p /tmp/cmd/sub; printf 'y\n' > /tmp/cmd/sub/f; chmod 600 /tmp/cmd/sub/f
+chmod -R g+r /tmp/cmd; stat -c '%a' /tmp/cmd/sub/f
+# X: execute for a directory, or for a file that already has an x bit.
+chmod -R 700 /tmp/cmd; chmod 600 /tmp/cmd/sub/f; chmod -R +X /tmp/cmd
+stat -c '%a' /tmp/cmd/sub /tmp/cmd/sub/f
+echo @@chmod_bad
+chmod +q /tmp/cm1 2>&1; echo "rc=$?"
+chmod 644 /tmp/nonexistent 2>&1; echo "rc=$?"
+
+# --- printf: a NUL is a byte ---------------------------------------------
+# `printf '%s\0'` is how every find|xargs -0 pipeline is fed. The shell's
+# output sink took C strings, so the \0 was silently nothing -- which is
+# also why the "binary" fixture above was plain text on the first run.
+echo @@printf_nul
+printf '%s\0' x y | wc -c
+printf 'a\0b' | wc -c
+printf 'a\0b\n' | od -An -c | tr -s ' '
 
 echo @@dt_END

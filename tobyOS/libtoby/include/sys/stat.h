@@ -50,6 +50,7 @@ struct stat {
 int stat (const char *path, struct stat *out);
 int fstat(int fd,           struct stat *out);
 int mkdir(const char *path, mode_t mode);
+mode_t umask(mode_t mask);
 
 #ifdef __cplusplus
 }

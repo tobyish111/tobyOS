@@ -150,6 +150,7 @@ const char *strerror(int err) {
     case 2:  return "No such file or directory";
     case 5:  return "I/O error";
     case 7:  return "Argument list too long";
+    case 8:  return "Exec format error";
     case 9:  return "Bad file descriptor";
     case 10: return "No child processes";
     case 12: return "Out of memory";
@@ -167,6 +168,7 @@ const char *strerror(int err) {
     case 34: return "Result out of range";
     case 36: return "File name too long";
     case 38: return "Function not implemented";
+    case 40: return "Too many levels of symbolic links";
     default: return "Unknown error";
     }
 }

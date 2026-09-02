@@ -302,6 +302,9 @@ ck gdb_session "registers can be read at the stop"  'rip 0x'
 ck gdb_session "continuing hits it again"           'Breakpoint 0.*Breakpoint 0'
 ck gdb_session "three calls, three stops"           'Breakpoint 0.*Breakpoint 0.*Breakpoint 0'
 ck gdb_session "the first stop shows the argument"  'rdi 0x1'
+# The exit CODE reaches the debugger: the tracee's status is collected by
+# the tracer's own waitpid, not lost to a reap before it looked.
+eq gdb_exitcode "and the exit code is collected at the end" '1|'
 # Whether the target then runs to completion is answered separately, by
 # running the SAME binary with no debugger attached -- otherwise a fixture
 # that never exits and a debugger that cannot resume look identical.
@@ -325,9 +328,77 @@ ck strace_run    "and the output write is among them" 'writev\('
 ck strace_run    "an ioctl on a pipe reports ENOTTY"  'ioctl.*errno 25'
 ck strace_exit   "the exit status is reported"        'exited with 0'
 ck strace_count  "-c totals the calls"                'total'
-# The honest half: a native binary has no syscall stops, and saying so
-# beats attaching and printing an empty trace.
-ck strace_native "a native binary is refused, with the reason"                  'native tobyOS program.*rc=[1-9]'
+# The native dispatcher stops too, now: the fixture's exit(7) is a NATIVE
+# syscall, named from the native table, and the status comes from waitpid.
+ck strace_native "a NATIVE program is traced: its exit syscall is named" 'exit\(0x7'
+ck strace_native "and its exit status is reported"                        'exited with 7'
+
+echo "=== #! scripts ==="
+# Both loaders were ELF/PE-only: ./script.sh was 127 from a shell that could
+# run every binary on the system and none of the scripts. Each of these is a
+# different path: spawn, execve, the one-argument rule, nesting, a Linux
+# interpreter, and the three failures bash names.
+eq shebang_spawn      "spawn hands a #! file to its interpreter"      'shebang ok world 1|rc=0|'
+eq shebang_exec       "and so does execve (through env)"              'shebang ok via-execve 1|rc=0|'
+eq shebang_optarg     "the rest of the line is ONE argument, then the script" 'hello there /tmp/sb2.sh a b|'
+eq shebang_nested     "a script may be another script's interpreter"  'hello there /tmp/sb2.sh /tmp/sb3.sh z|'
+eq shebang_busybox    "a Linux-personality interpreter works too"     'busybox sh: ok|rc=0|'
+ck shebang_badinterp  "a missing interpreter: bash's message, 126"    'tsh: /tmp/sb4.sh: /no/such/interp: bad interpreter: No such file or directory.*rc=126'
+ck shebang_loop       "a self-interpreting script is refused, not recursed" 'tsh: /tmp/sb5.sh: /tmp/sb5.sh: bad interpreter: Too many levels of symbolic links.*rc=126'
+ck shebang_plain      "a text file with no #! runs as a script, as in bash" 'plain text yes /tmp/sb7.sh.*rc=0'
+ck shebang_plain_pipe "also as a pipeline stage"                      'plain text piped /tmp/sb7.sh.*rc=0'
+ck shebang_plain_linux "busybox sh does the same, given ENOEXEC"      'plain text bb /tmp/sb7.sh.*rc=0'
+ck shebang_plain_execvp "and execvp runs it through the shell (POSIX)" 'plain text execvp /tmp/sb7.sh.*rc=0'
+ck shebang_binary     "a binary that is no executable says so, 126"   'tsh: /tmp/sb8: cannot execute binary file: Exec format error.*rc=126'
+ck shebang_noexec     "no execute bit: Permission denied, 126"        'tsh: /tmp/sb9.sh: Permission denied.*rc=126'
+
+echo "=== /proc/stat: real accounting ==="
+# Deltas across a busy loop in the guest, computed here. cpu user+system must
+# grow while the shell loops; ctxt and intr grow across anything at all.
+PB=$(section pstat_before); PA=$(section pstat_after)
+BU=$(echo "$PB" | awk '$1=="cpu"{print $2+$4}'); AU=$(echo "$PA" | awk '$1=="cpu"{print $2+$4}')
+AI=$(echo "$PA" | awk '$1=="cpu"{print $5}')
+BC=$(echo "$PB" | awk '$1=="ctxt"{print $2}');   AC=$(echo "$PA" | awk '$1=="ctxt"{print $2}')
+BN=$(echo "$PB" | awk '$1=="intr"{print $2}');   AN=$(echo "$PA" | awk '$1=="intr"{print $2}')
+BT=$(echo "$PA" | awk '$1=="btime"{print $2}')
+PR=$(echo "$PA" | awk '$1=="processes"{print $2}')
+RN=$(echo "$PA" | awk '$1=="procs_running"{print $2}')
+isnum() { echo "$1" | grep -Eq '^[0-9]+$'; }
+delta() {   # delta <label> <before> <after> <min-growth>
+    if isnum "$2" && isnum "$3" && [ "$3" -ge $(( $2 + $4 )) ]; then
+        echo "  ok   $1 ($2 -> $3)"; PASS=$((PASS+1))
+    else
+        echo "  FAIL $1 -- '$2' -> '$3' (wanted growth >= $4)"; FAIL=$((FAIL+1))
+    fi
+}
+delta "cpu user+system jiffies grew across the busy loop" "$BU" "$AU" 3
+delta "ctxt grew"                                       "$BC" "$AC" 1
+delta "intr grew"                                       "$BN" "$AN" 10
+if isnum "$AI" && [ "$AI" -gt 0 ]; then echo "  ok   idle jiffies are counted too ($AI)"; PASS=$((PASS+1)); else echo "  FAIL idle jiffies '$AI'"; FAIL=$((FAIL+1)); fi
+if isnum "$BT" && [ "$BT" -gt 1600000000 ]; then echo "  ok   btime is a real epoch time ($BT)"; PASS=$((PASS+1)); else echo "  FAIL btime '$BT'"; FAIL=$((FAIL+1)); fi
+if isnum "$PR" && [ "$PR" -gt 100 ]; then echo "  ok   processes counts every spawn since boot ($PR)"; PASS=$((PASS+1)); else echo "  FAIL processes '$PR'"; FAIL=$((FAIL+1)); fi
+if isnum "$RN" && [ "$RN" -ge 1 ]; then echo "  ok   procs_running is sampled ($RN)"; PASS=$((PASS+1)); else echo "  FAIL procs_running '$RN'"; FAIL=$((FAIL+1)); fi
+ck pstat_loadavg "loadavg has three real averages and running/total" '^[0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+\.[0-9]{2} [0-9]+/[0-9]+ [0-9]+'
+# vmstat's second row is a one-second interval: the timer alone is 100
+# interrupts a second, so "in" below 100 would mean the column is invented.
+VM2=$(section pstat_vmstat | sed -n '4p')
+VIN=$(echo "$VM2" | awk '{print $11}'); VCS=$(echo "$VM2" | awk '{print $12}')
+VUS=$(echo "$VM2" | awk '{print $13}'); VSY=$(echo "$VM2" | awk '{print $14}'); VID=$(echo "$VM2" | awk '{print $15}')
+if isnum "$VIN" && [ "$VIN" -ge 100 ]; then echo "  ok   vmstat in >= 100/s from a 100 Hz tick ($VIN)"; PASS=$((PASS+1)); else echo "  FAIL vmstat in -- row '$VM2'"; FAIL=$((FAIL+1)); fi
+if isnum "$VCS" && [ "$VCS" -ge 1 ]; then echo "  ok   vmstat cs is a rate ($VCS)"; PASS=$((PASS+1)); else echo "  FAIL vmstat cs -- row '$VM2'"; FAIL=$((FAIL+1)); fi
+if isnum "$VUS" && isnum "$VSY" && isnum "$VID" && [ $((VUS + VSY + VID)) -ge 95 ] && [ $((VUS + VSY + VID)) -le 100 ]; then echo "  ok   vmstat us+sy+id is a percentage ($VUS+$VSY+$VID)"; PASS=$((PASS+1)); else echo "  FAIL vmstat cpu columns -- row '$VM2'"; FAIL=$((FAIL+1)); fi
+ck pstat_vmstat "and it names the io columns as the missing ones" 'io columns .* are unavailable'
+
+echo "=== chmod: symbolic modes ==="
+eq chmod_sym       "the symbolic clauses land bit for bit"       '755|4745|444|444|755|1755|600|'
+ck chmod_verbose   "-v reports a change the way GNU does"        'changed from 0600 \(rw-------\) to 0644 \(rw-r--r--\)\|rc=0\|.*to 0755 \(rwxr-xr-x\)'
+eq chmod_recursive "-R walks the tree; X adds x only where due"  '640|711|600|'
+ck chmod_bad       "a bad mode is refused by name, status 1"     "invalid mode: '\+q'\|rc=1"
+ck chmod_bad       "a missing file gets GNU's message, status 1" "cannot access '/tmp/nonexistent': No such file or directory\|rc=1"
+
+echo "=== printf: a NUL byte reaches a pipe ==="
+ck printf_nul "%s\\0 writes the separator bytes (4 = x NUL y NUL)" '^4\|3\|'
+ck printf_nul "and the byte lands where the escape was"             ' a \\0 b '
 
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"

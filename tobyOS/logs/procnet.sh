@@ -122,7 +122,16 @@ else
     echo "  FAIL could not compare vmstat and meminfo"; FAIL=$((FAIL+1))
 fi
 # The columns it CANNOT fill must be named, not filled with zeros.
-ck pn_vmstat_says_why  "says which counters are missing" 'cpu/io/system columns are unavailable'
+ck pn_vmstat_says_why  "says which counters are missing" 'io columns .* are unavailable'
+# The system and cpu columns are numbers now (in cs us sy id wa st), from the
+# counters /proc/stat accumulates since 2026-09-01; the io ones stay "-".
+VMIN=$(echo "$VMROW" | awk '{print $11}')
+VMCS=$(echo "$VMROW" | awk '{print $12}')
+if echo "$VMIN$VMCS" | grep -Eq '^[0-9]+$'; then
+    echo "  ok   the in/cs columns are numbers ($VMIN $VMCS)"; PASS=$((PASS+1))
+else
+    echo "  FAIL in/cs columns -- row was '$VMROW'"; FAIL=$((FAIL+1))
+fi
 
 echo "=== tload ==="
 TL=$(section pn_tload | head -1)

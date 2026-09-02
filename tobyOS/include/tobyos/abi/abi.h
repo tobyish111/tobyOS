@@ -97,6 +97,8 @@ extern "C" {
 #define ABI_ESRCH            3   /* no such process */
 #define ABI_EIO              5   /* I/O error from underlying device */
 #define ABI_E2BIG            7   /* arg/env list too long */
+#define ABI_ENOEXEC          8   /* exec format error */
+#define ABI_ELOOP           40   /* too many levels (#! nesting) */
 #define ABI_EBADF            9   /* bad file descriptor */
 #define ABI_ECHILD          10   /* no child processes */
 #define ABI_EAGAIN          11   /* resource temporarily unavailable (== EWOULDBLOCK) */
@@ -1141,7 +1143,13 @@ struct abi_vizmap {
 #define ABI_PCI_CFG_READ32      0
 #define ABI_PCI_CFG_WRITE32     1
 
-#define ABI_SYS_NR_MAX          204
+/* Native umask(2) (2026-09-01). The per-process umask has existed since
+ * Linux slice 1 and file creation applied it, but only the Linux
+ * personality's umask(2) could set or read it. chmod's who-less "+x" is
+ * defined in terms of it. Returns the previous mask. */
+#define ABI_SYS_UMASK           206
+
+#define ABI_SYS_NR_MAX          206
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

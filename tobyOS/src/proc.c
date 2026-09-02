@@ -46,6 +46,7 @@
  */
 
 #include <tobyos/proc.h>
+#include <tobyos/binfmt.h>
 #include <tobyos/sched.h>
 #include <tobyos/signal.h>
 #include <tobyos/vmm.h>
@@ -687,13 +688,13 @@ void proc_record_cmdline(struct proc *p, int argc, char **argv) {
     p->cmdline_len = (uint16_t)off;
 }
 
-static int spawn_internal(const char *path, const char *name,
-                          struct file *fd0, struct file *fd1, struct file *fd2,
-                          struct file *fd3, struct file *fd4,
-                          const struct proc_fd_map *extra, int nextra,
-                          int argc, char **argv,
-                          int envc, char **envp,
-                          const char *cwd_override) {
+static int spawn_body(const char *path, const char *name,
+                      struct file *fd0, struct file *fd1, struct file *fd2,
+                      struct file *fd3, struct file *fd4,
+                      const struct proc_fd_map *extra, int nextra,
+                      int argc, char **argv,
+                      int envc, char **envp,
+                      const char *cwd_override, int depth) {
     if (!path) return -1;
 
     struct proc *p = alloc_slot();
@@ -718,6 +719,12 @@ static int spawn_internal(const char *path, const char *name,
     {
         struct proc *parent_for_ppid = current_proc();
         p->ppid = parent_for_ppid ? parent_for_ppid->pid : 0;
+        /* umask: inherited from the spawner, 0022 for a kernel spawn. The
+         * field was left ZERO for every spawned process until 2026-09-01
+         * (fork copies it, spawn never set it), which made every native
+         * mkdir a 0777 directory. */
+        p->umask = (parent_for_ppid && parent_for_ppid->pid != 0)
+                 ? parent_for_ppid->umask : 0022u;
     }
     /* Milestone 25A: per-proc heap starts empty -- proc_brk grows it. */
     p->brk_base = USER_HEAP_BASE;
@@ -855,6 +862,40 @@ static int spawn_internal(const char *path, const char *name,
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
+    }
+
+    /* ---- 1b. "#!": this is a script; spawn its interpreter instead ----
+     * The slot is given back exactly as the read-failure path does, and the
+     * recursion carries the interpreter's argv: [interp, optarg?, script,
+     * argv[1..]]. The strings live on this frame, which outlives the
+     * recursive call that copies them to the new process's stack. */
+    {
+        char interp[BINFMT_SHEBANG_MAX];
+        char optarg[BINFMT_SHEBANG_MAX];
+        int sb = binfmt_shebang(image, image_size, interp, sizeof interp,
+                                optarg, sizeof optarg);
+        if (sb != 0) {
+            kfree(image);
+            close_all_fds(p);
+            memset(p, 0, sizeof(*p));
+            p->state = PROC_UNUSED;
+            if (sb < 0) {
+                kprintf("[proc] '%s': #! with no interpreter\n", path);
+                return -1;
+            }
+            if (depth >= BINFMT_MAX_RECURSION) {
+                kprintf("[proc] '%s': #! nested more than %d deep\n",
+                        path, BINFMT_MAX_RECURSION);
+                return -1;
+            }
+            char *nargv[ABI_ARGV_MAX];
+            int nargc = binfmt_shebang_argv(interp, optarg, path, argc, argv,
+                                            nargv, ABI_ARGV_MAX);
+            if (nargc < 0) return -1;
+            return spawn_body(interp, name, fd0, fd1, fd2, fd3, fd4,
+                              extra, nextra, nargc, nargv, envc, envp,
+                              cwd_override, depth + 1);
+        }
     }
 
     /* ---- 2. allocate fresh PML4 ---- */
@@ -1168,6 +1209,17 @@ static int spawn_internal(const char *path, const char *name,
             (void *)p->user_rsp, p->cr3, p->kstack_top, argc, envc,
             p->cwd);
     return p->pid;
+}
+
+static int spawn_internal(const char *path, const char *name,
+                          struct file *fd0, struct file *fd1, struct file *fd2,
+                          struct file *fd3, struct file *fd4,
+                          const struct proc_fd_map *extra, int nextra,
+                          int argc, char **argv,
+                          int envc, char **envp,
+                          const char *cwd_override) {
+    return spawn_body(path, name, fd0, fd1, fd2, fd3, fd4, extra, nextra,
+                      argc, argv, envc, envp, cwd_override, 0);
 }
 
 int proc_create_from_elf(const char *path, const char *name) {

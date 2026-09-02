@@ -9,6 +9,7 @@
  */
 
 #include <tobyos/proc.h>
+#include <tobyos/binfmt.h>
 #include <tobyos/sched.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
@@ -493,6 +494,19 @@ long sys_fork(void) {
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     /* Slice 39: the memcpy above copied the parent's LIVE scheduler linkage
      * -- on_cpu is 1 (the parent is running RIGHT NOW) and on_rq may be set.
      * A child born with on_cpu=1 is skipped by every picker FOREVER (nothing
@@ -859,6 +873,19 @@ long sys_fork_share(void) {
     child->wait_pid  = -1;
     child->exit_code = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     child->on_rq  = false;
     child->on_cpu = 0;
     child->vm_quiesce  = 0;
@@ -1072,10 +1099,36 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->vfork_parent = 0;
     child->vfork_child  = 0;
     child->detached   = true;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     child->state      = PROC_EMBRYO;  /* memcpy copied parent's state */
     child->wait_pid   = -1;
     child->exit_code  = -1;
     child->next_ready = NULL;
+    /* NOT TRACED. ptrace state is per-process, and a tracer that did not
+     * ask for PTRACE_O_TRACEFORK/TRACECLONE does not know this child
+     * exists. Left copied from the parent, the child would park at its
+     * first syscall for a tracer that never looks at it (2026-09-01). */
+    child->tracer_pid      = 0;
+    child->ptrace_opts     = 0;
+    child->ptrace_stopped  = 0;
+    child->ptrace_syscall  = 0;
+    child->ptrace_atexit   = 0;
+    child->ptrace_stopsig  = 0;
+    child->ptrace_exc_regs = 0;
+    child->ptrace_orig_rax = 0;
+    child->ptrace_retval   = 0;
     /* Slice 39: same reset as sys_fork -- the memcpy copied the parent's
      * live on_cpu/on_rq, which would make this thread unschedulable. */
     child->on_rq  = false;
@@ -1481,6 +1534,9 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     void  *image      = NULL;
     size_t image_size = 0;
     int    img_borrowed = 0;
+    int    shebang_depth = 0;
+    int    pool_hi = kargc;      /* first free kargv_pool row */
+reread:;
 #ifdef CHROMIUM_BOOT
     xt_read = perf_now_ns();
 #endif
@@ -1491,6 +1547,59 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
         return -ABI_ENOENT;
+    }
+
+    /* "#!": the exec becomes the interpreter's, with the script's path as
+     * its argument, and the image is read again -- at most
+     * BINFMT_MAX_RECURSION times. The new strings go in the pool's free
+     * tail (pool_hi never moves back down, so a nested level cannot land
+     * on a row an outer one still points at). */
+    {
+        char interp[BINFMT_SHEBANG_MAX];
+        char optarg[BINFMT_SHEBANG_MAX];
+        int sb = binfmt_shebang(image, image_size, interp, sizeof interp,
+                                optarg, sizeof optarg);
+        if (sb != 0) {
+            if (!img_borrowed) kfree(image);
+            image = NULL;
+            if (sb < 0) return -ABI_ENOEXEC;
+            if (shebang_depth >= BINFMT_MAX_RECURSION) return -ABI_ELOOP;
+            int extra = 2 + (optarg[0] ? 1 : 0);
+            size_t kl = strlen(kpath);
+            if (pool_hi + extra > ABI_ARGV_MAX || kl >= ABI_ARG_MAX)
+                return -ABI_E2BIG;
+            char *s_interp = kargv_pool[pool_hi++];
+            memcpy(s_interp, interp, strlen(interp) + 1);
+            char *s_opt = NULL;
+            if (optarg[0]) {
+                s_opt = kargv_pool[pool_hi++];
+                memcpy(s_opt, optarg, strlen(optarg) + 1);
+            }
+            char *s_script = kargv_pool[pool_hi++];
+            memcpy(s_script, kpath, kl + 1);
+            char *nargv[ABI_ARGV_MAX];
+            int nargc = binfmt_shebang_argv(s_interp, s_opt, s_script,
+                                            kargc, kargv_buf, nargv,
+                                            ABI_ARGV_MAX);
+            if (nargc < 0) return -ABI_E2BIG;
+            memcpy(kargv_buf, nargv, (size_t)nargc * sizeof nargv[0]);
+            kargc = nargc;
+            memcpy(kpath, interp, strlen(interp) + 1);
+            plen = (long)strlen(kpath);
+            shebang_depth++;
+            goto reread;
+        }
+    }
+
+    /* Neither a script, a PE image nor an ELF. ENOEXEC is what glibc's
+     * execvp and busybox's sh test for before running a file as a shell
+     * script themselves; the loader used to fail further down with a code
+     * that read as "no such file". Checked here, before de_thread and the
+     * page-table allocation, so a refusal leaves the caller intact. */
+    if (!pe_is_image(image, image_size) &&
+        (image_size < 4 || memcmp(image, "\x7f" "ELF", 4) != 0)) {
+        if (!img_borrowed) kfree(image);
+        return -ABI_ENOEXEC;
     }
 
     /* ---- Phase F: POSIX de_thread (2026-08-22) -------------------------

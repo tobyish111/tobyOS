@@ -327,6 +327,11 @@ int chown(const char *path, uid_t owner, gid_t group) {
         toby_sc3(ABI_SYS_CHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
 }
 
+/* Always succeeds; the kernel answers with the previous mask. */
+mode_t umask(mode_t mask) {
+    return (mode_t)toby_sc1(ABI_SYS_UMASK, (long)mask);
+}
+
 /* ---- rename ----------------------------------------------------- *
  *
  * 2026-08-24: the real thing. This was a read-copy-write-unlink

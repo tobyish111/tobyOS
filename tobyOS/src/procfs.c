@@ -34,6 +34,8 @@
 #include <tobyos/net.h>       /* /proc/net tables (2026-08-22) */
 #include <tobyos/hwinfo.h>    /* real CPUID vendor/brand for cpuinfo */
 #include <tobyos/perf.h>      /* boot_id derivation */
+#include <tobyos/percpu.h>    /* MAX_CPUS: the per-CPU jiffy table */
+#include <tobyos/rtc.h>       /* btime */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
  * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
@@ -266,6 +268,17 @@ static int live_proc_count(void) {
 
 /* /proc/loadavg -- "0.00 0.00 0.00 <running>/<total> <lastpid>". We don't
  * compute real load averages; the running/total + lastpid fields are real. */
+/* The scheduler's counters (src/sched.c) and the ISR dispatcher's
+ * (src/isr.c). Declared here, at the one consumer, the way poll_tick is. */
+extern uint64_t g_cpu_jiffies[MAX_CPUS][3];
+extern uint64_t g_ctxt_switches;
+extern uint64_t g_loadavg_fixed[3];
+extern uint32_t g_nr_running;
+extern uint64_t g_intr_total;
+extern uint64_t g_intr_vec[256];
+
+/* /proc/loadavg -- three real moving averages (sampled every 5 s on the BSP,
+ * decayed exactly as Linux's calc_load), "running/total" and the last pid. */
 static int gen_loadavg(char *buf, size_t cap) {
     int total = live_proc_count();
     int lastpid = 0;
@@ -279,16 +292,31 @@ static int gen_loadavg(char *buf, size_t cap) {
         if ((size_t)off + sl >= cap) return off; \
         memcpy(buf + off, s, sl); off += (int)sl; } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
-    APPEND_STR("0.00 0.00 0.00 1/");
+    #define APPEND_FRAC2(v) do { char f[3]; f[0] = (char)('0' + (int)(((v)/10)%10)); \
+        f[1] = (char)('0' + (int)((v)%10)); f[2] = 0; APPEND_STR(f); } while (0)
+    for (int i = 0; i < 3; i++) {
+        uint64_t lv = g_loadavg_fixed[i];
+        APPEND_INT(lv >> 11); APPEND_STR(".");
+        APPEND_FRAC2(((lv & 2047u) * 100u) >> 11); APPEND_STR(" ");
+    }
+    APPEND_INT(g_nr_running); APPEND_STR("/");
     APPEND_INT(total); APPEND_STR(" "); APPEND_INT(lastpid); APPEND_STR("\n");
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_INT
+    #undef APPEND_FRAC2
 }
 
-/* /proc/stat -- the aggregate "cpu" line + per-cpu lines + a few counters
- * tools parse (btime, processes, procs_running). Jiffy counters are zero. */
+/* /proc/stat -- real counters (2026-09-01). The cpu lines are user / nice /
+ * system / idle / iowait / irq / softirq / steal / guest / guest_nice in
+ * USER_HZ jiffies, from the 100 Hz tick; "intr" is the ISR dispatcher's
+ * total followed by the sixteen legacy IRQ vectors; "ctxt" is the
+ * scheduler's switch count; "btime" is the RTC minus uptime; "processes"
+ * is every spawn and fork since boot; "procs_running" is the load
+ * sampler's last count. procs_blocked is Linux's nr_iowait, and there is
+ * no uninterruptible-I/O state here to count, so it is 0 rather than a
+ * guess -- the one column that stays synthetic. */
 static int gen_stat(char *buf, size_t cap) {
     int off = 0;
     char tmp[24];
@@ -296,23 +324,49 @@ static int gen_stat(char *buf, size_t cap) {
         if ((size_t)off + sl >= cap) return off; \
         memcpy(buf + off, s, sl); off += (int)sl; } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    #define APPEND_CPU(u, s, i) do { \
+        APPEND_U64(u); APPEND_STR(" 0 "); APPEND_U64(s); APPEND_STR(" "); \
+        APPEND_U64(i); APPEND_STR(" 0 0 0 0 0 0\n"); } while (0)
     uint32_t ncpu = smp_cpu_count();
     if (ncpu == 0) ncpu = 1;
-    APPEND_STR("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    if (ncpu > MAX_CPUS) ncpu = MAX_CPUS;
+    uint64_t tu = 0, ts = 0, ti = 0;
     for (uint32_t i = 0; i < ncpu; i++) {
-        APPEND_STR("cpu"); APPEND_INT(i);
-        APPEND_STR(" 0 0 0 0 0 0 0 0 0 0\n");
+        tu += g_cpu_jiffies[i][0];
+        ts += g_cpu_jiffies[i][1];
+        ti += g_cpu_jiffies[i][2];
     }
-    APPEND_STR("intr 0\n");
-    APPEND_STR("ctxt 0\n");
-    APPEND_STR("btime 0\n");
-    APPEND_STR("processes "); APPEND_INT(live_proc_count()); APPEND_STR("\n");
-    APPEND_STR("procs_running 1\n");
+    APPEND_STR("cpu  "); APPEND_CPU(tu, ts, ti);
+    for (uint32_t i = 0; i < ncpu; i++) {
+        APPEND_STR("cpu"); APPEND_INT(i); APPEND_STR(" ");
+        APPEND_CPU(g_cpu_jiffies[i][0], g_cpu_jiffies[i][1],
+                   g_cpu_jiffies[i][2]);
+    }
+    APPEND_STR("intr "); APPEND_U64(g_intr_total);
+    for (int v = 32; v < 48; v++) { APPEND_STR(" "); APPEND_U64(g_intr_vec[v]); }
+    APPEND_STR("\n");
+    APPEND_STR("ctxt "); APPEND_U64(g_ctxt_switches); APPEND_STR("\n");
+    {
+        uint64_t ticks = pit_ticks();
+        uint32_t hz    = pit_hz();
+        uint64_t up    = (hz > 0) ? ticks / hz : 0;
+        uint64_t now   = rtc_unix_time();
+        APPEND_STR("btime "); APPEND_U64(now > up ? now - up : 0); APPEND_STR("\n");
+    }
+    {
+        struct perf_sys ps;
+        perf_sys_snapshot(&ps);
+        APPEND_STR("processes "); APPEND_U64(ps.proc_spawns); APPEND_STR("\n");
+    }
+    APPEND_STR("procs_running "); APPEND_INT(g_nr_running); APPEND_STR("\n");
     APPEND_STR("procs_blocked 0\n");
     buf[off] = '\0';
     return off;
     #undef APPEND_STR
     #undef APPEND_INT
+    #undef APPEND_U64
+    #undef APPEND_CPU
 }
 
 /* /proc/mounts -- one line per VFS mount: "<dev> <point> <type> <opts> 0 0".

@@ -150,16 +150,37 @@ static int path_search(const char *file, char *out_buf, size_t out_sz) {
     return -1;
 }
 
+/* POSIX: execvp and execlp run a file the loader answers ENOEXEC for -- a
+ * text file with no "#!" line -- through the shell, as [sh, path,
+ * argv[1..]]. glibc's sh is /bin/sh; here that is still the minimal shell,
+ * and the one every script on the system is written against is /bin/tsh. */
+static int execve_or_script(const char *path, char *const argv[]) {
+    int rv = execve(path, argv, environ);
+    if (errno != ENOEXEC) return rv;
+    int argc = 0;
+    while (argv[argc]) argc++;
+    char **nargv = malloc((size_t)(argc + 3) * sizeof *nargv);
+    if (!nargv) { errno = ENOMEM; return -1; }
+    int n = 0;
+    nargv[n++] = (char *)"/bin/tsh";
+    nargv[n++] = (char *)path;
+    for (int i = 1; i < argc; i++) nargv[n++] = argv[i];
+    nargv[n] = 0;
+    rv = execve("/bin/tsh", nargv, environ);
+    free(nargv);
+    return rv;
+}
+
 int execvp(const char *file, char *const argv[]) {
     if (!file || !argv) { errno = EINVAL; return -1; }
     /* If the caller embedded a slash anywhere, treat it as an
      * explicit path (POSIX behaviour). */
     for (const char *c = file; *c; c++) {
-        if (*c == '/') return execve(file, argv, environ);
+        if (*c == '/') return execve_or_script(file, argv);
     }
     char buf[256];
     if (path_search(file, buf, sizeof(buf)) < 0) return -1;
-    return execve(buf, argv, environ);
+    return execve_or_script(buf, argv);
 }
 
 /* ============================================================

@@ -57,6 +57,44 @@
  * percpu->syscall_rsp (gs:[0]); the scheduler updates it on every switch. */
 
 /* From proc_switch.S. */
+/* ---- /proc/stat accounting (2026-09-01) ---------------------------------
+ * Until now /proc/stat printed literal zeros for cpu, intr and ctxt, and
+ * /proc/loadavg printed "0.00 0.00 0.00", because nothing accumulated any
+ * of it -- vmstat printed "-" in those columns and said so. These are the
+ * counters: jiffies per CPU (user / system / idle), the context-switch
+ * count, and a Linux-style load average. The tick is 100 Hz on every CPU,
+ * which is USER_HZ, so a tick IS a jiffy; it is sampled where the interrupt
+ * frame says which ring was running. */
+uint64_t g_cpu_jiffies[MAX_CPUS][3];     /* [cpu][0 user, 1 system, 2 idle] */
+uint64_t g_ctxt_switches;
+uint64_t g_loadavg_fixed[3];             /* FSHIFT 11, as Linux's avenrun[] */
+uint32_t g_nr_running;                   /* last sample: runnable, non-idle */
+
+#define LOAD_FSHIFT  11
+#define LOAD_FIXED_1 (1u << LOAD_FSHIFT)
+#define LOAD_EXP_1   1884                /* 1/exp(5s/1min)  in fixed point */
+#define LOAD_EXP_5   2014                /* 1/exp(5s/5min)  */
+#define LOAD_EXP_15  2037                /* 1/exp(5s/15min) */
+
+/* Every 5 s on the BSP, as Linux's calc_load: the runnable count decays
+ * into three moving averages. Reads the table without a lock -- a sample
+ * that is off by one for one period is what a load average tolerates. */
+static void loadavg_sample(void) {
+    uint32_t n = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *p = proc_lookup(i);
+        if (p && p->state == PROC_RUNNING && !p->is_idle) n++;
+    }
+    g_nr_running = n;
+    uint64_t active = (uint64_t)n << LOAD_FSHIFT;
+    static const uint64_t exp[3] = { LOAD_EXP_1, LOAD_EXP_5, LOAD_EXP_15 };
+    for (int i = 0; i < 3; i++) {
+        uint64_t load = g_loadavg_fixed[i];
+        load = load * exp[i] + active * (LOAD_FIXED_1 - exp[i]);
+        g_loadavg_fixed[i] = load >> LOAD_FSHIFT;
+    }
+}
+
 extern void proc_context_switch(uint64_t *save_old_rsp,
                                 uint64_t  new_rsp,
                                 uint64_t  new_cr3);
@@ -786,6 +824,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
           to->gs_base ? to->gs_base : (uint64_t)me);
 
     fpu_save(from->fpu_state);
+    __atomic_fetch_add(&g_ctxt_switches, 1, __ATOMIC_RELAXED);   /* /proc/stat ctxt */
     proc_context_switch(&from->saved_rsp, to->saved_rsp, to->cr3);
     /* --- `from` resumes here when some later switch picks it again --- */
     /* Release the proc THIS cpu just switched away from (its saved_rsp is
@@ -1511,6 +1550,16 @@ void sched_tick(struct regs *r) {
          * idle (kernel-mode) ticks are counted in the denominator too. */
         struct proc *c = me->current;
         if (c && !c->is_idle) me->sched_busy_ticks++;
+        /* /proc/stat: the same sample, split three ways. */
+        if (me->cpu_idx < MAX_CPUS) {
+            int k = (c && c->is_idle) ? 2
+                  : ((r && (r->cs & 3) == 3) ? 0 : 1);
+            g_cpu_jiffies[me->cpu_idx][k]++;
+        }
+        if (me->is_bsp) {
+            static uint32_t load_ticks;
+            if (++load_ticks >= 500) { load_ticks = 0; loadavg_sample(); }
+        }
     }
     /* M28C: count scheduler-tick events as heartbeats too. */
     wdog_kick_sched();

@@ -436,6 +436,7 @@ static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap);
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
+static void shell_putc_raw(char c);
 static void shell_case_unquote(char *pat, size_t cap);
 static char *shell_unquoted_newline(char *s);
 static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
@@ -9459,7 +9460,7 @@ static void cmd_printf(int argc, char **argv) {
                 int c = printf_parse_escape(&p);
                 if (c >= 0) {
                     if (g_printf_escape_raw) shell_putc('\\');
-                    shell_putc((char)c);
+                    shell_putc_raw((char)c);        /* \0 is a byte too */
                 }
                 continue;
             }
@@ -11366,6 +11367,119 @@ static const char *resolve_program(const char *name, char *out_buf,
     return name;
 }
 
+/* ---- why did the spawn fail? ------------------------------------------
+ * proc_spawn answers a failure with -1 and nothing else, so the shell used
+ * to say "failed to launch" for everything and pick 126 or 127 by whether
+ * the file existed. bash tells the user WHICH thing went wrong -- and for
+ * one of them does not fail at all: a text file with no "#!" line is run
+ * as a shell script by the shell itself, which is how most one-off scripts
+ * on any Linux box get executed. So on a failure the shell looks at the
+ * file the way bash does.
+ *
+ * Returns  1 -- text with no "#!": run it under /bin/tsh
+ *          0 -- bash's message has been printed; *status is bash's status
+ *         -1 -- nothing to add; *status is 126 (exists) or 127 (does not) */
+#define SHELL_EXEC_HEAD 256
+#define SHELL_SHEBANG_DEPTH 4       /* the kernel's BINFMT_MAX_RECURSION */
+
+/* The head of `path`: 1 = "#!" (interp filled, possibly empty), 0 = text,
+ * -1 = holds a NUL, so a binary, -2 = unreadable. */
+static int shell_exec_head(const char *path, char *interp, size_t cap) {
+    void *img = 0;
+    size_t len = 0;
+    if (vfs_read_all(path, &img, &len) != VFS_OK) return -2;
+    const char *p = (const char *)img;
+    size_t n = len < SHELL_EXEC_HEAD ? len : SHELL_EXEC_HEAD;
+    int rc = 0;
+    if (n >= 2 && p[0] == '#' && p[1] == '!') {
+        size_t i = 2;
+        while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
+        size_t s = i;
+        while (i < n && p[i] != ' ' && p[i] != '\t' &&
+               p[i] != '\n' && p[i] != '\r') i++;
+        size_t l = i - s;
+        if (l >= cap) l = cap - 1;
+        memcpy(interp, p + s, l);
+        interp[l] = 0;
+        rc = 1;
+    } else {
+        for (size_t i = 0; i < n; i++) if (p[i] == 0) { rc = -1; break; }
+    }
+    kfree(img);
+    return rc;
+}
+
+static int shell_explain_spawn_failure(const char *path, const char *as_typed,
+                                       int *status) {
+    struct vfs_stat est;
+    int sr = vfs_stat(path, &est);
+    /* A NAME TOO LONG IS "CANNOT EXECUTE", NOT "NOT FOUND": bash reports
+     * 126 for the ENAMETOOLONG its execve returns. */
+    if (sr == VFS_ERR_NAMETOOLONG) { *status = 126; return -1; }
+    if (sr != VFS_OK) { *status = 127; return -1; }
+    *status = 126;
+    if (est.type == VFS_TYPE_DIR) {
+        kprintf("tsh: %s: Is a directory\n", as_typed);
+        return 0;
+    }
+    if (est.type != VFS_TYPE_FILE) return -1;
+    if (est.mode != 0 && (est.mode & 0111) == 0) {
+        kprintf("tsh: %s: Permission denied\n", as_typed);
+        return 0;
+    }
+    char chain[2][SHELL_EXEC_HEAD];
+    const char *cur = path;
+    for (int depth = 0; depth < SHELL_SHEBANG_DEPTH; depth++) {
+        char *interp = chain[depth & 1];
+        int h = shell_exec_head(cur, interp, SHELL_EXEC_HEAD);
+        if (h == -2) {
+            kprintf("tsh: %s: Permission denied\n", as_typed);
+            return 0;
+        }
+        if (h == -1) {
+            if (depth == 0)
+                kprintf("tsh: %s: cannot execute binary file: "
+                        "Exec format error\n", as_typed);
+            else
+                kprintf("tsh: %s: %s: bad interpreter: Exec format error\n",
+                        as_typed, cur);
+            return 0;
+        }
+        if (h == 0 || interp[0] == 0) {
+            /* no "#!" (or an empty one, which the kernel refuses the same
+             * way): the script is ours to run -- unless it is somebody's
+             * interpreter, which cannot be a plain text file. */
+            if (depth == 0) return 1;
+            kprintf("tsh: %s: %s: bad interpreter: Exec format error\n",
+                    as_typed, cur);
+            return 0;
+        }
+        struct vfs_stat ist;
+        if (vfs_stat(interp, &ist) != VFS_OK) {
+            kprintf("tsh: %s: %s: bad interpreter: No such file or directory\n",
+                    as_typed, interp);
+            return 0;
+        }
+        if (depth == SHELL_SHEBANG_DEPTH - 1) {
+            kprintf("tsh: %s: %s: bad interpreter: "
+                    "Too many levels of symbolic links\n", as_typed, interp);
+            return 0;
+        }
+        cur = interp;
+    }
+    return -1;
+}
+
+/* [/bin/tsh, script, argv[1..]] -- the script's path is its $0. */
+static int shell_script_argv(const char *path, int argc, char **argv,
+                             char **out) {
+    int n = 0;
+    out[n++] = (char *)"/bin/tsh";
+    out[n++] = (char *)path;
+    for (int i = 1; i < argc && n < ARG_MAX + 2; i++) out[n++] = argv[i];
+    return n;
+}
+
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            char **argv, bool background,
                                            const char *profile,
@@ -11399,20 +11513,22 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
          *     touch f ; ./f      ->  126, not 127
          *
          * tsh reported 127 for both, so a file that exists but is not a
-         * program looked to the caller like a typo. */
-        struct vfs_stat est;
-        int rc127 = 127;
-        int sr = vfs_stat(path, &est);
-        if (sr == VFS_OK && est.type == VFS_TYPE_FILE)
-            rc127 = 126;
-        /* A NAME TOO LONG IS "CANNOT EXECUTE", NOT "NOT FOUND". 127 says the
-         * shell looked and found nothing; here the name could not even be
-         * resolved, which is the 126 case -- bash reports 126 for the
-         * ENAMETOOLONG its execve returns. */
-        else if (sr == VFS_ERR_NAMETOOLONG)
-            rc127 = 126;
-        kprintf("spawn: failed to launch '%s'\n", path);
-        return rc127;
+         * program looked to the caller like a typo. And a text file with
+         * no "#!" is a third thing: a script bash would simply run. */
+        int status = 126;
+        int why = shell_explain_spawn_failure(path, path_arg, &status);
+        if (why == 1) {
+            char *sargv[ARG_MAX + 2];
+            int sargc = shell_script_argv(path, argc, argv, sargv);
+            spec.path = "/bin/tsh";
+            spec.argc = sargc;
+            spec.argv = sargv;
+            pid = proc_spawn(&spec);
+        }
+        if (pid < 0) {
+            if (why != 0) kprintf("spawn: failed to launch '%s'\n", path);
+            return status;
+        }
     }
 
     if (background) {
@@ -17011,6 +17127,20 @@ static void shell_file_kputc(void *ctx, char c) {
     if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
 }
 
+/* One byte, NUL included. shell_putc hands the sink a C string, so a NUL
+ * byte vanished on the way out: `printf '%s\0' a b | xargs -0` and
+ * `printf '\0' > file` wrote NOTHING for the \0 -- the one printf escape
+ * whose entire point is the byte. The file/pipe sink takes a length; the
+ * capture sinks ($(...) and printf -v) drop the byte, as bash does. */
+static void shell_putc_raw(char c) {
+    if (g_shell_out == shell_file_output) {
+        struct file *f = (struct file *)g_shell_out_ctx;
+        if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
+        return;
+    }
+    shell_putc(c);
+}
+
 struct shell_printk_bridge {
     shell_write_fn_t fn;
     void *ctx;
@@ -17613,10 +17743,25 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
         .cwd = shell_cwd(),
     };
     int pid = proc_spawn(&spec);
+    int status = 127, why = -1;
+    if (pid < 0) {
+        /* The same three-way answer as the foreground site; the retry
+         * must come BEFORE the owned descriptors are closed, since spec
+         * still points at them. */
+        why = shell_explain_spawn_failure(path, argv[0], &status);
+        if (why == 1) {
+            char *sargv[ARG_MAX + 2];
+            int sargc = shell_script_argv(path, argc, argv, sargv);
+            spec.path = "/bin/tsh";
+            spec.argc = sargc;
+            spec.argv = sargv;
+            pid = proc_spawn(&spec);
+        }
+    }
     shell_fd_state_close_owned(&fds);
     if (pid < 0) {
-        kprintf("pipeline: failed to spawn '%s'\n", path);
-        return 127;                     /* command not found, per POSIX */
+        if (why != 0) kprintf("pipeline: failed to spawn '%s'\n", path);
+        return status;
     }
     *out_pid = pid;
     return 0;
@@ -22089,6 +22234,10 @@ static void shell_drain_background(void) {
 #endif
 
 int shell_run_script_hosted(const char *path) {
+    /* `tsh script args`: $0 is the script, as it is in bash -- it was the
+     * shell's own argv[0] until 2026-09-01, so a script run through the
+     * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
+    (void)shell_set_param0(path);
     int st = shell_run_script_path(path, true);
     shell_drain_background();
     return st;

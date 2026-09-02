@@ -4758,6 +4758,16 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * promised. Same implementation, no second credential model. */
         return ptrace_do((long)a1, (int)a2, (uint64_t)a3, (uint64_t)a4);
 
+    case ABI_SYS_UMASK: {
+        /* Same semantics as the Linux personality's umask(2) below: set the
+         * caller's mask, answer with the old one. Nothing to validate --
+         * every value is a legal mask. */
+        struct proc *up = current_proc();
+        uint32_t old = up ? up->umask : 0022u;
+        if (up) up->umask = (uint32_t)a1 & 07777u;
+        return (long)old;
+    }
+
     case ABI_SYS_AUTH_CHECK: {
         /* Verify a password WITHOUT touching the session.
          *
@@ -20985,23 +20995,24 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         /* Slice 64c: stamp the NATIVE syscall so BKL hold time attributes
          * to it (chromewin's GUI/blit calls live here). */
         if (caller) caller->cursys_nat = (int32_t)num;
-        /* NO PTRACE SYSCALL STOP ON THE NATIVE PATH, and that is a
-         * decision rather than an omission.
+        /* THE PTRACE SYSCALL STOPS, NATIVE PATH (2026-09-01).
          *
-         * It was tried. Parking a native tracee at every syscall boundary
-         * wedged the machine reproducibly -- with the BKL held, and still
-         * with the established drop/retake idiom around it. The native
-         * dispatcher is the hottest path in the kernel and it is reached
-         * from contexts the Linux path never is; making it safe to park
-         * there is its own piece of work, not a rider on a tracing tool.
-         *
-         * So `strace` traces LINUX-personality programs (busybox, bash,
-         * python3 -- where linux_syscall's stops have worked since the
-         * ptrace slice) and SAYS SO when handed a native binary, rather
-         * than attaching and printing nothing. Breakpoint debugging is
-         * unaffected: #BP/#DB stops come from the exception path, which is
-         * why /bin/gdb works on native programs. */
+         * The Linux personality has had these since the ptrace slice; the
+         * native path refused them after an attempt wedged the machine.
+         * That attempt was made while libtoby's execve was still a
+         * spawn-and-wait (the traced child was a GRANDCHILD the tracer's
+         * waitpid could never see) and while every blocking waitpid was
+         * being routed through proc_wait_or_ptrace -- the two things that
+         * were actually wedging. With a real execve and a narrow waitpid
+         * arm, these are the same two calls linux_syscall makes, at the
+         * same two points, gated so an untraced process pays one
+         * predictable branch. The number and result are NATIVE ones; the
+         * tracer picks its name table from the target's ELF. */
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, true, num, 0);
         rv = do_syscall(num, a1, a2, a3, a4, a5);
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, false, num, rv);
 #ifdef SYSDIAG_REGCHECK
         /* Check BEFORE the store that actually faulted, so the evidence is
          * printed even on the boot where it would have panicked. */
