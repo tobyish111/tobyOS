@@ -597,6 +597,17 @@ uint64_t perf_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* The kernel's RTC-anchored realtime clock, under the name the shell calls
+ * it by (printf %(fmt)T). The kernel's converter takes a monotonic reading;
+ * here libtoby's CLOCK_REALTIME already IS that converter's answer, via
+ * ABI_SYS_CLOCK_NS, so the argument is not needed. */
+uint64_t lx_realtime_ns(uint64_t mono_ns) {
+    (void)mono_ns;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
 /* The hosted shell reads stdin line-at-a-time in main(); the kernel's
  * keyboard ring has no userspace counterpart. -1 == "nothing queued". */
 int kbd_trygetc(void) { return -1; }

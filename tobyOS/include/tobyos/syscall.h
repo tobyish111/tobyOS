@@ -248,6 +248,7 @@
 #define SYS_GETENV         ABI_SYS_GETENV
 #define SYS_NANOSLEEP      ABI_SYS_NANOSLEEP
 #define SYS_CLOCK_MS       ABI_SYS_CLOCK_MS
+#define SYS_CLOCK_NS       ABI_SYS_CLOCK_NS
 #define SYS_ABI_VERSION    ABI_SYS_ABI_VERSION
 
 /* --- Milestone 31: desktop notifications -------------------------- *

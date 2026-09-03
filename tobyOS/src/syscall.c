@@ -4768,6 +4768,24 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return (long)old;
     }
 
+    case ABI_SYS_CLOCK_NS: {
+        /* The native realtime clock (2026-09-03). Until this existed the
+         * native ABI's only clock was CLOCK_MS, milliseconds since boot, so
+         * libtoby's time() counted from boot and `date` printed 2025 on a
+         * machine whose RTC said 2026 -- while busybox, on the Linux path,
+         * printed the truth. Same converter as CLOCK_REALTIME there:
+         * anchored to the RTC once, driven by the TSC, so a native and a
+         * Linux program asking at the same instant get the same number,
+         * and tobyfs/tmpfs mtimes (stamped from it) read back in the same
+         * calendar. No CMOS read on this path: lx_realtime_ns latches the
+         * RTC on its first call and never touches the port pair again. */
+        extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+        uint64_t mono = perf_now_ns();
+        if ((int)a1 == ABI_CLOCK_REALTIME)  return (long)lx_realtime_ns(mono);
+        if ((int)a1 == ABI_CLOCK_MONOTONIC) return (long)mono;
+        return -ABI_EINVAL;
+    }
+
     case ABI_SYS_AUTH_CHECK: {
         /* Verify a password WITHOUT touching the session.
          *

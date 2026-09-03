@@ -44,6 +44,7 @@
 #include <tobyos/pkg.h>
 #include <tobyos/cap.h>
 #include <tobyos/perf.h>
+#include <tobyos/civiltime.h>
 #include <tobyos/installer.h>
 #include <tobyos/provision.h>   /* provision_classify -- `install` shows what
                                  * is on each disk before offering it */
@@ -9092,6 +9093,17 @@ static unsigned long g_printf_last_u64;
 /* The last operand did not fit a SIGNED 64-bit conversion. Only %d and %i care;
  * %u happily prints values above 2^63. */
 
+/* The wall clock, for printf's %(fmt)T. In the kernel build this is the
+ * RTC-anchored realtime clock every Linux-personality program reads; the
+ * hosted build (programs/tsh/host.c) answers it from libtoby's
+ * CLOCK_REALTIME, which is the same kernel clock through ABI_SYS_CLOCK_NS.
+ * Either way it is the clock `date` and `busybox date` print. */
+extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+static int64_t shell_wall_secs(void) {
+    return (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+}
+static int64_t g_shell_start_secs;      /* printf %T's -2: when the shell began */
+
 static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
     if (*argi >= argc) return 0;
@@ -9527,7 +9539,39 @@ static void cmd_printf(int argc, char **argv) {
             char spec = *p;
             if (spec) p++;
 
-            if (spec == 's') {
+            if (spec == '(') {
+                /* bash: %(datefmt)T -- strftime(3) of the operand, which is
+                 * seconds since the epoch. -1 or no operand at all is now,
+                 * -2 is when the shell started; an empty format is "%X %x".
+                 * Flags and a width apply to the formatted string. */
+                char dfmt[256];
+                size_t dn = 0;
+                while (*p && *p != ')') {
+                    if (dn < sizeof dfmt - 1) dfmt[dn++] = *p;
+                    p++;
+                }
+                dfmt[dn] = '\0';
+                if (*p == ')') p++;
+                if (*p == 'T') p++;
+                int64_t when = -1;
+                if (argi < argc) when = (int64_t)printf_arg_int(argc, argv, &argi);
+                if (when == -1) when = shell_wall_secs();
+                else if (when == -2) when = g_shell_start_secs;
+                struct civil_time ct;
+                civil_from_unix(when, &ct);
+                char tbuf[512];
+                /* bash: an EMPTY datefmt means "%X" (the time), not "%X %x".
+                 * Measured against bash 5.2: `printf '%()T' 0` and
+                 * `printf '%(%X)T' 0` are byte-identical, and neither carries
+                 * the date. */
+                if (civil_strftime(tbuf, sizeof tbuf, dn ? dfmt : "%X", &ct) == 0)
+                    tbuf[0] = '\0';
+                int slen = (int)strlen(tbuf);
+                int pad = width > slen ? width - slen : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                for (int i = 0; i < slen; i++) shell_putc(tbuf[i]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 's') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int slen = (int)strlen(s);
                 if (prec >= 0 && slen > prec) slen = prec;
@@ -21843,6 +21887,7 @@ void shell_init(void) {
     g_getopts_last_optind = 1;
     g_getopts_char_index = 1;
     shell_trap_clear_all();
+    g_shell_start_secs = shell_wall_secs();
     if (shell_set_param0("tobysh") < 0) kprintf("shell: failed to set $0\n");
     (void)shell_set_positional_params(0, 0);
     kprintf("type 'help' to list commands.\n");
@@ -22139,6 +22184,7 @@ void shell_init_hosted(const char *argv0) {
     line[0]  = '\0';
     for (int i = 0; i < SHELL_FD_MAX; i++) g_shell_fd[i] = 0;
     env_init_defaults();
+    g_shell_start_secs = shell_wall_secs();
 
 #ifdef SHELL_HOSTED
     /* INHERIT THE ENVIRONMENT. env_init_defaults() stamps PATH=/bin, HOME=/,

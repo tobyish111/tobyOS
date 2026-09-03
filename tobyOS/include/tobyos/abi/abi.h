@@ -1149,7 +1149,20 @@ struct abi_vizmap {
  * defined in terms of it. Returns the previous mask. */
 #define ABI_SYS_UMASK           206
 
-#define ABI_SYS_NR_MAX          206
+/* Native realtime clock (2026-09-03). (clk) -> nanoseconds, or -EINVAL.
+ * ABI_CLOCK_REALTIME counts from 1970-01-01 00:00:00 UTC, anchored to the
+ * RTC once at first use and driven by the TSC -- the same converter the
+ * Linux personality's CLOCK_REALTIME and the filesystems' inode stamps use,
+ * so a native and a Linux program asking at the same instant get the same
+ * number. ABI_CLOCK_MONOTONIC counts from boot at the same resolution.
+ * Until this existed the only native clock was CLOCK_MS, and libtoby's
+ * time() was seconds since boot on a pretend 2025-01-01 base: `date` said
+ * 2025 on a machine whose RTC said 2026, and busybox said 2026. */
+#define ABI_SYS_CLOCK_NS        207
+#define ABI_CLOCK_REALTIME      0
+#define ABI_CLOCK_MONOTONIC     1
+
+#define ABI_SYS_NR_MAX          207
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
