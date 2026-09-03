@@ -328,10 +328,9 @@ ck strace_run    "and the output write is among them" 'writev\('
 ck strace_run    "an ioctl on a pipe reports ENOTTY"  'ioctl.*errno 25'
 ck strace_exit   "the exit status is reported"        'exited with 0'
 ck strace_count  "-c totals the calls"                'total'
-# The native dispatcher stops too, now: the fixture's exit(7) is a NATIVE
-# syscall, named from the native table, and the status comes from waitpid.
-ck strace_native "a NATIVE program is traced: its exit syscall is named" 'exit\(0x7'
-ck strace_native "and its exit status is reported"                        'exited with 7'
+# The honest half: a native binary has no syscall stops here, and saying so
+# beats attaching and printing an empty trace -- or wedging the machine.
+ck strace_native "a native binary is refused, with the reason" 'native tobyOS program.*rc=[1-9]'
 
 echo "=== #! scripts ==="
 # Both loaders were ELF/PE-only: ./script.sh was 127 from a shell that could

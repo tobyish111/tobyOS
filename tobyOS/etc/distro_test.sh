@@ -411,10 +411,11 @@ timeout 40 strace /bin/arch 2>&1 | grep "exited with" | head -1
 echo @@strace_count
 timeout 40 strace -c /bin/arch 2>&1 | head -16
 echo @@strace_native
-# A NATIVE tobyOS program, traced through the native dispatcher's stops --
-# which did not exist until 2026-09-01; strace refused native binaries by
-# name. The fixture exits 7, and that exit is a native syscall.
-timeout 40 strace /etc/dbg_test.elf 2>&1 | tail -5
+# A native binary is refused BY NAME rather than traced to no effect. The
+# stops it would need park the tracee with the BKL held, which wedges a real
+# multi-core box -- measured on the EliteDesk, not theorised.
+strace /etc/dbg_test.elf 2>&1 | head -1
+strace /etc/dbg_test.elf > /dev/null 2>&1; echo rc=$?
 
 # --- #! scripts ----------------------------------------------------------
 # Neither loader read a shebang: `./script.sh` returned 127 from a shell

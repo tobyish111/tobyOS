@@ -256,10 +256,22 @@ int main(int argc, char **argv) {
     (void)follow;   /* child-following needs the fork/clone event stops */
 
     const char *prog = argv[argi];
-    /* Which NAME TABLE: the target's ELF decides its personality by the
-     * kernel's own rule. The kernel stops native and Linux syscalls alike
-     * now (2026-09-01); native programs used to be refused here by name. */
+    /* The target's ELF decides its personality by the kernel's own rule.
+     * Syscall stops exist ONLY on the Linux path: parking a native tracee
+     * happens with the big kernel lock held and wedges a real multi-core
+     * machine (proven on hardware 2026-09-02 -- see the long note at the
+     * native dispatcher in src/syscall.c). Refusing by name beats attaching
+     * and printing an empty trace, and beats taking the box down. */
     int is_linux = target_is_linux_abi(prog);
+    if (!is_linux) {
+        fprintf(stderr,
+                "strace: %s is a native tobyOS program. Syscall stops exist "
+                "only on the Linux personality here, so tracing it would "
+                "attach and print nothing. Use /bin/gdb for native programs "
+                "(breakpoints work there), or strace a busybox, bash or "
+                "python3 binary.\n", prog);
+        return 1;
+    }
 
     int pid = fork();
     if (pid < 0) { fprintf(stderr, "strace: fork failed\n"); return 1; }
