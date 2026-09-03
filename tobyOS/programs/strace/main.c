@@ -14,13 +14,12 @@
  * execs instead of spawning a child -- a tracer whose tracee spawns a
  * grandchild traces the wrapper.
  *
- * LINUX-PERSONALITY PROGRAMS ONLY, and it says so rather than attaching
- * to a native one and printing nothing. The kernel raises syscall stops
- * inside linux_syscall; the native dispatcher has none, because parking a
- * native tracee at every syscall boundary wedged the machine reproducibly
- * (see the note at that call site). That covers what anyone would actually
- * strace here -- busybox, bash, python3 -- and `gdb` covers native
- * programs, since breakpoint stops come from the exception path instead.
+ * BOTH PERSONALITIES. The kernel raises syscall stops in linux_syscall and,
+ * since 2026-09-03, in the native dispatcher too. Native tracing was on
+ * for a day and then refused by name: parking a native tracee wedged a real
+ * 4-core machine. The cause turned out to live in the shared ptrace_stop()
+ * (it yielded with the big kernel lock held, and the Linux path had the
+ * same bug), so the fix went there and the refusal came out.
  *
  * The personality is decided from the target's ELF using the same rule the
  * kernel uses: EI_OSABI == ELFOSABI_LINUX, or a PT_INTERP.
@@ -163,6 +162,27 @@ static const char *native_name(long n) {
     case ABI_SYS_TCP_CLOSE: return "tcp_close";
     case ABI_SYS_TCP_LISTEN: return "tcp_listen";
     case ABI_SYS_TCP_ACCEPT: return "tcp_accept";
+    case ABI_SYS_BRK:       return "brk";
+    case ABI_SYS_GETCWD:    return "getcwd";
+    case ABI_SYS_CHDIR:     return "chdir";
+    case ABI_SYS_GETENV:    return "getenv";
+    case ABI_SYS_NANOSLEEP: return "nanosleep";
+    case ABI_SYS_CLOCK_MS:  return "clock_ms";
+    case ABI_SYS_CLOCK_NS:  return "clock_ns";
+    case ABI_SYS_ABI_VERSION: return "abi_version";
+    case ABI_SYS_UMASK:     return "umask";
+    case ABI_SYS_UTIMES:    return "utimes";
+    case ABI_SYS_RENAME:    return "rename";
+    case ABI_SYS_RMDIR:     return "rmdir";
+    case ABI_SYS_TRUNCATE:  return "truncate";
+    case ABI_SYS_FTRUNCATE: return "ftruncate";
+    case ABI_SYS_SETUID:    return "setuid";
+    case ABI_SYS_SETGID:    return "setgid";
+    case ABI_SYS_SETPGID:   return "setpgid";
+    case ABI_SYS_GETPGID:   return "getpgid";
+    case ABI_SYS_SYNC:      return "sync";
+    case ABI_SYS_READ_NB:   return "read_nb";
+    case ABI_SYS_DNS_RESOLVE: return "dns_resolve";
     default: return 0;
     }
 }
@@ -256,22 +276,9 @@ int main(int argc, char **argv) {
     (void)follow;   /* child-following needs the fork/clone event stops */
 
     const char *prog = argv[argi];
-    /* The target's ELF decides its personality by the kernel's own rule.
-     * Syscall stops exist ONLY on the Linux path: parking a native tracee
-     * happens with the big kernel lock held and wedges a real multi-core
-     * machine (proven on hardware 2026-09-02 -- see the long note at the
-     * native dispatcher in src/syscall.c). Refusing by name beats attaching
-     * and printing an empty trace, and beats taking the box down. */
+    /* The target's ELF decides its personality by the kernel's own rule,
+     * and with it which name table the numbers are printed from. */
     int is_linux = target_is_linux_abi(prog);
-    if (!is_linux) {
-        fprintf(stderr,
-                "strace: %s is a native tobyOS program. Syscall stops exist "
-                "only on the Linux personality here, so tracing it would "
-                "attach and print nothing. Use /bin/gdb for native programs "
-                "(breakpoints work there), or strace a busybox, bash or "
-                "python3 binary.\n", prog);
-        return 1;
-    }
 
     int pid = fork();
     if (pid < 0) { fprintf(stderr, "strace: fork failed\n"); return 1; }

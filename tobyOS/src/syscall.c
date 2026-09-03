@@ -21013,43 +21013,35 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         /* Slice 64c: stamp the NATIVE syscall so BKL hold time attributes
          * to it (chromewin's GUI/blit calls live here). */
         if (caller) caller->cursys_nat = (int32_t)num;
-        /* NO PTRACE SYSCALL STOP ON THE NATIVE PATH. This is a decision,
-         * it has now been made twice, and the second time it was settled by
-         * hardware rather than by argument.
+        /* PTRACE SYSCALL STOPS ON THE NATIVE PATH: the same two calls
+         * linux_syscall makes, at the same two points, gated so an untraced
+         * process pays one predictable branch. The number and result are
+         * NATIVE ones; the tracer picks its name table from the target's
+         * ELF.
          *
-         * 2026-09-01: I turned these on, reasoning that the earlier attempt
-         * had wedged only because of two OTHER bugs live at the time (a
-         * libtoby execve that spawned instead of exec'ing, so the tracee was
-         * a grandchild no waitpid could see; and every blocking waitpid
-         * routed through proc_wait_or_ptrace). Both were real, both were
-         * fixed, and the whole distro gate passed at 161/161 under QEMU with
-         * -smp 4, strace assertions included.
-         *
-         * 2026-09-02: `strace` on the real 4-core EliteDesk wedged the box.
-         * Not the tool -- the machine, in the way this kernel wedges when a
-         * CPU stops making progress while holding the big kernel lock: it
-         * still answered ping and completed TCP handshakes from the NIC
-         * interrupt, and never ran another service tick.
-         *
-         * The mechanism is right here. ptrace_syscall_stop parks the tracee
-         * through ptrace_stop, which calls sched_yield(), and this site
-         * holds the BKL. Yielding under the BKL is the exact hazard the exec
-         * stop was moved after bkl_exit() to avoid. Every OTHER blocking
-         * point in this file drops and retakes the lock around itself
-         * (`bool had = bkl_held(); if (had) bkl_exit(); ...`); the earlier
-         * attempt reportedly tried that idiom here and wedged anyway, which
-         * is why this needs to be its own piece of work rather than a rider
-         * on a tracing tool. QEMU does not reproduce it: with real
-         * parallelism the window is wide open, under emulation it is not.
-         *
-         * So `strace` traces LINUX-personality programs (busybox, bash,
-         * python3), where linux_syscall's stops have worked since the ptrace
-         * slice, and it says so plainly when handed a native binary.
-         * Breakpoint debugging is unaffected -- #BP/#DB stops come from the
-         * exception path, where a user-mode trap cannot be holding the BKL,
-         * which is why /bin/gdb works on native programs and strace does
-         * not. */
+         * HISTORY, in full, because this was turned on, reverted, and is on
+         * again, and the next reader deserves the story rather than a
+         * warning. Enabled 2026-09-01. `strace` on the real 4-core EliteDesk
+         * then wedged the box -- still answering ping and completing TCP
+         * handshakes off the NIC interrupt, never running another service
+         * tick. Reverted 2026-09-02 with the diagnosis "the stop yields
+         * under the BKL". The diagnosis was right and the revert was aimed
+         * at the wrong place: the yield lives in the SHARED ptrace_stop() in
+         * src/ptrace.c, and the Linux path had been making these exact
+         * calls from the same lock state since the ptrace slice -- `strace
+         * /bin/arch`, a Linux-personality target, wedged the same hardware
+         * the same way. ptrace_stop now drops the BKL around its yield
+         * (3c523d2), and a tracer's exit detaches the tracees it left parked
+         * (a4ad8a9); eighty cumulative Linux traces on the box proved both.
+         * With the hazard fixed where it lived, nothing about this branch
+         * differs from the Linux one above it, and it is proven the same
+         * way: native traces on the EliteDesk, in a loop, with progress
+         * written to /data so a wedge names its iteration. */
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, true, num, 0);
         rv = do_syscall(num, a1, a2, a3, a4, a5);
+        if (caller && caller->tracer_pid && caller->ptrace_syscall)
+            ptrace_syscall_stop(caller, false, num, rv);
 #ifdef SYSDIAG_REGCHECK
         /* Check BEFORE the store that actually faulted, so the evidence is
          * printed even on the boot where it would have panicked. */
