@@ -9874,37 +9874,125 @@ static void cmd_umask(int argc, char **argv) {
     }
 }
 
+/* THE COMMAND HASH TABLE bash keeps. `hash NAME` records NAME's PATH
+ * lookup, `hash` lists the table in bash's format, -r clears it (and then,
+ * as bash does, hashes any operands rather than refusing them), -d forgets
+ * one, -t prints one, -l lists in a reusable form, -p PATH NAME records an
+ * explicit path. tsh had no table: `hash NAME` printed "NAME=path" and
+ * `hash` said the table was empty, which is the contract the conformance
+ * corpus reads back (`hash whoami; hash | grep -o /whoami`).
+ *
+ * The table is what `hash` SHOWS; spawn does not consult it. That is the
+ * observable contract, and it keeps a stale entry from ever running the
+ * wrong binary. */
+#define HASHTAB_MAX 64
+static struct { char name[64]; char path[256]; int hits; } g_hashtab[HASHTAB_MAX];
+static int g_hashtab_n;
+
+static int hashtab_find(const char *name) {
+    for (int i = 0; i < g_hashtab_n; i++)
+        if (strcmp(g_hashtab[i].name, name) == 0) return i;
+    return -1;
+}
+
+static void hashtab_set(const char *name, const char *path) {
+    int i = hashtab_find(name);
+    if (i < 0) {
+        if (g_hashtab_n >= HASHTAB_MAX) return;
+        i = g_hashtab_n++;
+        size_t nl = strlen(name);
+        if (nl >= sizeof g_hashtab[i].name) nl = sizeof g_hashtab[i].name - 1;
+        memcpy(g_hashtab[i].name, name, nl);
+        g_hashtab[i].name[nl] = '\0';
+        g_hashtab[i].hits = 0;
+    }
+    size_t pl = strlen(path);
+    if (pl >= sizeof g_hashtab[i].path) pl = sizeof g_hashtab[i].path - 1;
+    memcpy(g_hashtab[i].path, path, pl);
+    g_hashtab[i].path[pl] = '\0';
+}
+
+static bool hashtab_add(const char *name) {
+    char path_buf[256];
+    const char *path = resolve_program(name, path_buf, sizeof path_buf);
+    if (!path_is_file(path)) return false;
+    hashtab_set(name, path);
+    return true;
+}
+
 static void cmd_hash(int argc, char **argv) {
     shell_set_status(0);
-    if (argc >= 2 && strcmp(argv[1], "-r") == 0) {
-        /* `hash -r` takes NO operands: `hash -r whoami` is a usage error in
-         * bash (status 1), not a clear-then-look-up. Nothing was printed
-         * either way, so the only visible difference is the status -- which
-         * is exactly what the case tests. */
-        if (argc > 2) {
-            kprintf("hash: -r: too many arguments\n");
-            shell_set_status(1);
+    bool clear = false, del = false, tpath = false, list = false;
+    const char *ppath = 0;
+    int i = 1;
+    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        bool stop = false;
+        for (const char *f = argv[i] + 1; *f && !stop; f++) {
+            switch (*f) {
+            case 'r': clear = true; break;
+            case 'd': del = true; break;
+            case 't': tpath = true; break;
+            case 'l': list = true; break;
+            case 'p':
+                if (f[1]) ppath = f + 1;
+                else if (i + 1 < argc) ppath = argv[++i];
+                else { kprintf("hash: -p: option requires an argument\n"); shell_set_status(2); return; }
+                stop = true;
+                break;
+            default:
+                kprintf("hash: -%c: invalid option\n", *f);
+                kprintf("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n");
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    /* bash refuses every form while hashing is off (`set +h`). */
+    if (!g_opt_hashall) {
+        kprintf("hash: hashing disabled\n");
+        shell_set_status(1);
+        return;
+    }
+    if (clear) g_hashtab_n = 0;
+    if (del) {
+        for (; i < argc; i++) {
+            int k = hashtab_find(argv[i]);
+            if (k < 0) { kprintf("hash: %s: not found\n", argv[i]); shell_set_status(1); continue; }
+            for (int m = k + 1; m < g_hashtab_n; m++) g_hashtab[m - 1] = g_hashtab[m];
+            g_hashtab_n--;
+        }
+        return;
+    }
+    if (tpath) {
+        int many = (argc - i) > 1;
+        for (; i < argc; i++) {
+            int k = hashtab_find(argv[i]);
+            if (k < 0) { kprintf("hash: %s: not found\n", argv[i]); shell_set_status(1); continue; }
+            if (many) shell_printf("%s\t%s\n", argv[i], g_hashtab[k].path);
+            else      shell_printf("%s\n", g_hashtab[k].path);
+        }
+        return;
+    }
+    if (i >= argc) {
+        if (clear) return;                     /* bash prints nothing */
+        if (g_hashtab_n == 0) {
+            shell_printf("hash: hash table empty\n");
             return;
         }
-        /* bash prints NOTHING on a successful clear -- the old "table
-         * cleared" chat landed in the compared stdout -- and refuses the
-         * clear entirely while hashing is off (`set +h`). */
-        if (!g_opt_hashall) {
-            kprintf("hash: hashing disabled\n");
-            shell_set_status(1);
+        if (list) {
+            for (int k = 0; k < g_hashtab_n; k++)
+                shell_printf("builtin hash -p %s %s\n", g_hashtab[k].path, g_hashtab[k].name);
+        } else {
+            shell_printf("hits\tcommand\n");
+            for (int k = 0; k < g_hashtab_n; k++)
+                shell_printf("%4d\t%s\n", g_hashtab[k].hits, g_hashtab[k].path);
         }
         return;
     }
-    if (argc <= 1) {
-        shell_printf("hash: table is empty\n");
-        return;
-    }
-    for (int i = 1; i < argc; i++) {
-        char path_buf[64];
-        const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
-        if (path_is_file(path)) {
-            shell_printf("%s=%s\n", argv[i], path);
-        } else {
+    for (; i < argc; i++) {
+        if (ppath) { hashtab_set(argv[i], ppath); continue; }
+        if (!hashtab_add(argv[i])) {
             kprintf("hash: %s: not found\n", argv[i]);
             shell_set_status(1);
         }
@@ -12602,12 +12690,15 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
             bool stop_nul = false;      /* a NUL ends the word; see below */
             while (*p && *p != '\'') {
                 char c = *p;
+                bool esc = false;       /* c came from an escape: it is DATA */
+                char ub[4]; int un = 0; /* a multi-byte escape (\u, \U) */
                 if (c == '\\' && p[1]) {
                     p++;
+                    esc = true;
                     switch (*p) {
                     case 'a': c = '\a'; p++; break;
                     case 'b': c = '\b'; p++; break;
-                    case 'e': c = 0x1B; p++; break;
+                    case 'e': case 'E': c = 0x1B; p++; break;
                     case 'f': c = '\f'; p++; break;
                     case 'n': c = '\n'; p++; break;
                     case 'r': c = '\r'; p++; break;
@@ -12616,8 +12707,13 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                     case '\\': c = '\\'; p++; break;
                     case '\'': c = '\''; p++; break;
                     case '"': c = '"'; p++; break;
-                    case '0': {
-                        p++;
+                    case '?': c = '?'; p++; break;
+                    case '0': case '1': case '2': case '3':
+                    case '4': case '5': case '6': case '7': {
+                        /* \nnn: ONE TO THREE octal digits, the first any of
+                         * 0-7 -- $'\1' is byte 1 and $'\377' byte 255, as in
+                         * bash. Only \0nnn was read here before, so $'\1'
+                         * came out as the letter 1. */
                         int v = 0, cnt = 0;
                         while (cnt < 3 && *p >= '0' && *p <= '7') {
                             v = v * 8 + (*p++ - '0'); cnt++;
@@ -12639,10 +12735,66 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                         c = (char)v;
                         break;
                     }
+                    case 'u': case 'U': {
+                        /* \uHHHH / \UHHHHHHHH: a code point, written as
+                         * UTF-8. U+0000 is a NUL and ends the word like any
+                         * other; with no digits at all the backslash and
+                         * letter stand, as in bash. */
+                        int maxd = (*p == 'u') ? 4 : 8;
+                        const char *q = p + 1;
+                        unsigned long cp = 0; int cnt = 0;
+                        while (cnt < maxd) {
+                            int d = -1;
+                            if (*q >= '0' && *q <= '9') d = *q - '0';
+                            else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+                            else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+                            if (d < 0) break;
+                            cp = cp * 16 + (unsigned long)d; q++; cnt++;
+                        }
+                        if (cnt == 0) {
+                            ub[0] = '\\'; ub[1] = *p; un = 2; p++;
+                            break;
+                        }
+                        p = q;
+                        if (cp == 0) { c = 0; break; }
+                        if (cp < 0x80) { ub[0] = (char)cp; un = 1; }
+                        else if (cp < 0x800) {
+                            ub[0] = (char)(0xC0 | (cp >> 6));
+                            ub[1] = (char)(0x80 | (cp & 0x3F)); un = 2;
+                        } else if (cp < 0x10000) {
+                            ub[0] = (char)(0xE0 | (cp >> 12));
+                            ub[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            ub[2] = (char)(0x80 | (cp & 0x3F)); un = 3;
+                        } else {
+                            ub[0] = (char)(0xF0 | ((cp >> 18) & 0x07));
+                            ub[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            ub[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            ub[3] = (char)(0x80 | (cp & 0x3F)); un = 4;
+                        }
+                        break;
+                    }
+                    case 'c': {
+                        /* \cX: the control character for X */
+                        p++;
+                        if (*p) {
+                            char x = *p++;
+                            if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
+                            c = (char)(x ^ 0x40);
+                        } else {
+                            c = '\\';
+                        }
+                        break;
+                    }
                     default: c = *p++; break;
                     }
                 } else {
                     p++;
+                }
+                if (un > 0) {
+                    /* an escape that decoded to several bytes */
+                    if (!stop_nul && shell_append_data_n(out, &pos, cap, ub, (size_t)un) < 0)
+                        return -1;
+                    continue;
                 }
                 /* A NUL ENDS THE WORD. `$'foo\0bar'` is the three characters
                  * `foo` as far as anything downstream can tell: the word is a
@@ -12655,8 +12807,17 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                  * that is wrong either way. Stopping there is what bash's
                  * execve() does with the same bytes. */
                 if (!c) { stop_nul = true; continue; }
-                if (!stop_nul && shell_append_char(out, &pos, cap, c) < 0)
-                    return -1;
+                if (stop_nul) continue;
+                /* A byte that an ESCAPE produced is data, and may collide
+                 * with the word buffer's in-band markers ($'\1' is
+                 * SHELL_ARG_MARK): route it through the data append, which
+                 * escapes such a byte the way expansion output is escaped.
+                 * A literal character between the quotes cannot collide. */
+                if (esc) {
+                    if (shell_append_data_n(out, &pos, cap, &c, 1) < 0) return -1;
+                } else {
+                    if (shell_append_char(out, &pos, cap, c) < 0) return -1;
+                }
             }
             if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
