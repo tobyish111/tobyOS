@@ -1455,6 +1455,12 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Same reason as the single-process exit path: this member may
+             * have been tracing something, and a tracee whose tracer vanishes
+             * must not stay parked forever. The group teardown terminates
+             * members here directly rather than routing each through
+             * proc_exit, so the call has to be repeated at both sites. */
+            { extern void ptrace_detach_all(int); ptrace_detach_all(q->pid); }
             /* Slice 89: a member parked in cow_fork_lock_acquire's quiesce
              * loop spins ON-CPU until vm_quiesce clears -- and the forker
              * that set it may be exactly who we just terminated, so nobody
@@ -1543,6 +1549,12 @@ void proc_reap_group_threads(struct proc *p, int code) {
             { extern void futex_robust_exit(struct proc *); futex_robust_exit(q); }
             { extern void futex_forget_proc(struct proc *); futex_forget_proc(q); }
             { extern void poll_forget_proc(struct proc *);  poll_forget_proc(q);  }
+            /* Same reason as the single-process exit path: this member may
+             * have been tracing something, and a tracee whose tracer vanishes
+             * must not stay parked forever. The group teardown terminates
+             * members here directly rather than routing each through
+             * proc_exit, so the call has to be repeated at both sites. */
+            { extern void ptrace_detach_all(int); ptrace_detach_all(q->pid); }
             /* Slice 88: wait until the sibling is off-CPU before freeing
              * its kstack -- sched_dequeue does not stop a thread still
              * running on another core.
@@ -1577,6 +1589,31 @@ __attribute__((noreturn)) void proc_exit(int code) {
         bt_dump_group(p->is_thread ? p->tgid : p->pid);
     }
 #endif
+
+    /* RELEASE ANY PROCESS THIS ONE WAS TRACING (2026-09-02).
+     *
+     * ptrace_detach_all() has existed since the ptrace slice, its own
+     * comment says "Called from the exit path for every process", and
+     * NOTHING CALLED IT. Dead code that reads as live -- the same shape as
+     * the ASLR/OOM/reclaim subsystems found initialised-but-never-called in
+     * the dead-subsystem audit.
+     *
+     * The consequence is a leak with a delayed fuse. A tracer that exits
+     * while its tracee sits in a ptrace stop leaves that tracee
+     * PROC_STOPPED forever: never resumed, never reaped, holding a proc
+     * slot, an address space and its descriptors, and still pointing
+     * tracer_pid at a pid that will eventually be recycled onto somebody
+     * else. Every strace run ending with its tracee stopped burns one.
+     *
+     * Measured on real hardware: twenty strace runs completed cleanly and
+     * left the box standing, and then the very next operation -- a plain
+     * file upload -- wedged it. That latency is the signature. The machine
+     * does not die on the guilty operation, it dies on whatever comes
+     * after it and needs a resource. */
+    if (p) {
+        extern void ptrace_detach_all(int tracer_pid);
+        ptrace_detach_all(p->pid);
+    }
 
     /* Share-until-exec: child _exit without exec must unblock the launcher. */
     if (p && p->vfork_parent > 0)
