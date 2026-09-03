@@ -1,8 +1,4 @@
-/* c_hello/program.ld -- linker script for /bin/c_hello.
- *
- * Anchored at 0x400000, identical to user_echo/program.ld. ENTRY
- * resolves to _start in libtoby/src/crt0.S, which calls
- * __libtoby_init then main. */
+/* tsh/program.ld -- linker script for /bin/tsh (the hosted tobyOS shell). */
 
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
@@ -10,9 +6,9 @@ ENTRY(_start)
 
 PHDRS
 {
-    text   PT_LOAD FLAGS(5);   /* R + X */
-    rodata PT_LOAD FLAGS(4);   /* R     */
-    data   PT_LOAD FLAGS(6);   /* R + W */
+    text   PT_LOAD FLAGS(5);
+    rodata PT_LOAD FLAGS(4);
+    data   PT_LOAD FLAGS(6);
 }
 
 SECTIONS

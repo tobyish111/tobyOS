@@ -692,6 +692,13 @@ static void tsh_arm_sigint(void) {
 
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
+    /* Invoked as `sh` -- /bin/sh is a link to this binary -- means POSIX
+     * mode, as it does for bash. */
+    {
+        const char *b = argv[0] ? strrchr(argv[0], '/') : 0;
+        b = b ? b + 1 : (argv[0] ? argv[0] : "");
+        if (strcmp(b, "sh") == 0) shell_set_posix_hosted(true);
+    }
     {
         /* XCU 2.5.3: PPID is set at shell startup. It was simply absent. */
         char pb[16];

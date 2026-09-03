@@ -294,6 +294,7 @@ static bool g_opt_allexport; /* set -a */
  * cmd's failure; without it `set -o pipefail` was "unknown option" and the
  * script died on the option rather than on the pipeline. */
 static bool g_opt_pipefail;
+static bool g_opt_posix;        /* set -o posix: on when invoked as `sh` */
 /* True while executing INSIDE a pipeline stage (forked or lastpipe): a
  * stage must never run the monitor-mode foreground dance -- the first
  * interactive pipeline handed the TERMINAL to `cat` from a forked stage
@@ -3183,7 +3184,8 @@ static void shell_print_options(bool reinput) {
         { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
         { "noglob",    g_opt_noglob },    { "nolog",     g_opt_nolog },
         { "notify",    g_opt_notify },    { "nounset",   g_opt_nounset },
-        { "pipefail",  g_opt_pipefail },  { "verbose",   g_opt_verbose },
+        { "pipefail",  g_opt_pipefail },  { "posix",     g_opt_posix },
+        { "verbose",   g_opt_verbose },
         { "xtrace",    g_opt_xtrace },
     };
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
@@ -3202,6 +3204,7 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         {"monitor", 'm'}, {"hashall", 'h'},
     };
     if (strcmp(name, "pipefail")  == 0) { g_opt_pipefail  = on; return true; }
+    if (strcmp(name, "posix")     == 0) { g_opt_posix     = on; return true; }
     if (strcmp(name, "ignoreeof") == 0) { g_opt_ignoreeof = on; return true; }
     if (strcmp(name, "nolog")     == 0) { g_opt_nolog     = on; return true; }
     for (size_t i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
@@ -3230,6 +3233,7 @@ static bool shell_option_is_set(const char *name) {
     if (strcmp(name, "noexec")    == 0) return g_opt_noexec;
     if (strcmp(name, "allexport") == 0) return g_opt_allexport;
     if (strcmp(name, "pipefail")  == 0) return g_opt_pipefail;
+    if (strcmp(name, "posix")     == 0) return g_opt_posix;
     if (strcmp(name, "monitor")   == 0) return g_opt_monitor;
     if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
     if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
@@ -7837,7 +7841,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
 
 struct shell_opt_frame {
     bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
-    bool monitor, ignoreeof, nolog, hashall;
+    bool monitor, ignoreeof, nolog, hashall, posix;
 };
 
 static void shell_save_opts(struct shell_opt_frame *f) {
@@ -7854,6 +7858,7 @@ static void shell_save_opts(struct shell_opt_frame *f) {
     f->ignoreeof = g_opt_ignoreeof;
     f->nolog     = g_opt_nolog;
     f->hashall   = g_opt_hashall;
+    f->posix     = g_opt_posix;
 }
 
 static void shell_restore_opts(const struct shell_opt_frame *f) {
@@ -7870,6 +7875,7 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_ignoreeof = f->ignoreeof;
     g_opt_nolog     = f->nolog;
     g_opt_hashall   = f->hashall;
+    g_opt_posix     = f->posix;
 }
 
 static void shell_reset_opts(void) {
@@ -7911,6 +7917,10 @@ static void cmd_sh(int argc, char **argv) {
         struct shell_opt_frame opt_frame;
         shell_save_opts(&opt_frame);
         shell_reset_opts();
+        /* This builtin IS `sh`, so it runs in POSIX mode -- the same thing
+         * host.c does for the /bin/sh -> /bin/tsh link when argv[0] is "sh".
+         * bash reports `set -o posix` on when invoked as sh; so does tsh. */
+        g_opt_posix = true;
         char *copy = shell_strdup(argv[2]);
         if (!copy) {
             shell_restore_opts(&opt_frame);
@@ -7949,6 +7959,7 @@ static void cmd_sh(int argc, char **argv) {
     struct shell_opt_frame opt_frame;
     shell_save_opts(&opt_frame);
     shell_reset_opts();
+    g_opt_posix = true;                 /* invoked as `sh`: POSIX mode */
     int st = shell_run_script_path(argv[1], true);
     shell_restore_opts(&opt_frame);
     shell_trap_restore(&trap_frame);
@@ -22116,6 +22127,12 @@ void shell_set_interactive_hosted(bool on) {
      * script never inherits monitor from the way the binary was invoked. */
     g_opt_monitor = on;
 }
+
+/* `sh` is tsh in POSIX mode (2026-09-03): /bin/sh is a link to /bin/tsh and
+ * host.c turns this on when argv[0]'s basename is "sh", exactly as bash does
+ * for its own `sh` link. tsh is a strict superset of the POSIX shell, so the
+ * mode changes what `set -o` reports, not what runs. */
+void shell_set_posix_hosted(bool on) { g_opt_posix = on; }
 
 /* `set -o ignoreeof` -- only the hosted interactive read loop can see an
  * EOF, and it lives in programs/tsh/host.c, outside this translation unit. */

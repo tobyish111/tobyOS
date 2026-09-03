@@ -152,8 +152,8 @@ static int path_search(const char *file, char *out_buf, size_t out_sz) {
 
 /* POSIX: execvp and execlp run a file the loader answers ENOEXEC for -- a
  * text file with no "#!" line -- through the shell, as [sh, path,
- * argv[1..]]. glibc's sh is /bin/sh; here that is still the minimal shell,
- * and the one every script on the system is written against is /bin/tsh. */
+ * argv[1..]]. That shell is /bin/sh, as in glibc. (It was /bin/tsh by name
+ * here while /bin/sh was still the minimal shell; /bin/sh IS tsh now.) */
 static int execve_or_script(const char *path, char *const argv[]) {
     int rv = execve(path, argv, environ);
     if (errno != ENOEXEC) return rv;
@@ -162,11 +162,11 @@ static int execve_or_script(const char *path, char *const argv[]) {
     char **nargv = malloc((size_t)(argc + 3) * sizeof *nargv);
     if (!nargv) { errno = ENOMEM; return -1; }
     int n = 0;
-    nargv[n++] = (char *)"/bin/tsh";
+    nargv[n++] = (char *)"/bin/sh";
     nargv[n++] = (char *)path;
     for (int i = 1; i < argc; i++) nargv[n++] = argv[i];
     nargv[n] = 0;
-    rv = execve("/bin/tsh", nargv, environ);
+    rv = execve("/bin/sh", nargv, environ);
     free(nargv);
     return rv;
 }
@@ -184,94 +184,34 @@ int execvp(const char *file, char *const argv[]) {
 }
 
 /* ============================================================
- *  system() (Milestone 25C)
+ *  system() -- POSIX: `sh -c cmd`, and the waitpid status back
  * ============================================================ *
  *
- * tobyOS doesn't have a /bin/sh yet, so we emulate "sh -c" with an
- * inline whitespace tokenizer + execvp-style PATH search + waitpid.
+ * This ran `sh -c` only when it spotted a shell metacharacter, and
+ * otherwise tokenised on whitespace and spawned the words itself --
+ * because /bin/sh used to be a minimal shell nobody trusted, and the
+ * tokeniser was the lesser evil. /bin/sh is tsh now (2026-09-03), so
+ * every command gets the real parser: quoting, variables, redirection,
+ * the lot. argv[0] is "sh", as glibc passes it, which is also what puts
+ * tsh into POSIX mode.
  *
  * Returns:
- *   - if cmd is NULL: 1 (a "shell is available" probe; we always say yes)
+ *   - if cmd is NULL: 1 (a "shell is available" probe)
  *   - on spawn or wait failure: -1, errno set
- *   - on success: the encoded status (use WIFEXITED/WEXITSTATUS to
- *     decode -- same shape as waitpid). */
-
-#define SYSTEM_ARG_MAX 32
+ *   - on success: the encoded status (WIFEXITED/WEXITSTATUS decode it,
+ *     the same shape as waitpid) */
 
 int system(const char *cmd) {
     if (!cmd) return 1;
-
-    /* If the command contains shell metacharacters, delegate to /bin/sh. */
-    int need_shell = 0;
-    for (const char *c = cmd; *c; c++) {
-        if (*c == '|' || *c == '>' || *c == '<' || *c == '&' ||
-            *c == ';' || *c == '(' || *c == ')' || *c == '$' ||
-            *c == '`' || *c == '*' || *c == '?') {
-            need_shell = 1;
-            break;
-        }
-    }
-    if (need_shell) {
-        char *sh_argv[4];
-        sh_argv[0] = "/bin/sh";
-        sh_argv[1] = "-c";
-        sh_argv[2] = (char *)cmd;
-        sh_argv[3] = 0;
-        pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 0, 0);
-        if (pid < 0) {
-            /* Fallback: try without shell */
-            need_shell = 0;
-        } else {
-            int status = 0;
-            pid_t rc = waitpid(pid, &status, 0);
-            if (rc < 0) return -1;
-            return status;
-        }
-    }
-
-    /* Duplicate cmd so we can tokenise in-place. */
-    size_t clen = strlen(cmd);
-    char *buf = (char *)malloc(clen + 1);
-    if (!buf) { errno = ENOMEM; return -1; }
-    memcpy(buf, cmd, clen + 1);
-
-    char *argv[SYSTEM_ARG_MAX];
-    int argc = 0;
-    char *s = buf;
-    while (*s) {
-        while (*s == ' ' || *s == '\t') s++;
-        if (!*s) break;
-        if (argc >= SYSTEM_ARG_MAX - 1) {
-            free(buf);
-            errno = E2BIG;
-            return -1;
-        }
-        argv[argc++] = s;
-        while (*s && *s != ' ' && *s != '\t') s++;
-        if (*s) *s++ = '\0';
-    }
-    argv[argc] = 0;
-    if (argc == 0) { free(buf); return 0; }       /* empty command */
-
-    /* PATH-resolve argv[0] explicitly so we can spawn with its full
-     * path (the kernel's open() doesn't search). */
-    char path_buf[256];
-    const char *path = argv[0];
-    bool has_slash = false;
-    for (const char *c = argv[0]; *c; c++) if (*c == '/') { has_slash = true; break; }
-    if (!has_slash) {
-        if (path_search(argv[0], path_buf, sizeof(path_buf)) < 0) {
-            free(buf);
-            return -1;
-        }
-        path = path_buf;
-    }
-
-    pid_t pid = toby_spawn(path, argv, environ, 0, 0, 0);
-    if (pid < 0) { free(buf); return -1; }
+    char *sh_argv[4];
+    sh_argv[0] = (char *)"sh";
+    sh_argv[1] = (char *)"-c";
+    sh_argv[2] = (char *)cmd;
+    sh_argv[3] = 0;
+    pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 0, 0);
+    if (pid < 0) return -1;
     int status = 0;
     pid_t rc = waitpid(pid, &status, 0);
-    free(buf);
     if (rc < 0) return -1;
     return status;
 }

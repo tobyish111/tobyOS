@@ -448,6 +448,7 @@ PORTS_SBASE_ELFS   := $(addprefix $(PORTS_SBASE_DIR)/,$(addsuffix .elf,$(PORTS_S
 # inside the initramfs (see initrd-stage rules below).
 PROGRAMS := programs/awk/awk.elf \
             programs/hello/hello.elf \
+            programs/systest/systest.elf \
             programs/user_hello/user_hello.elf \
             programs/user_bad/user_bad.elf \
             programs/user_echo/user_echo.elf \
@@ -524,7 +525,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/tobycc/tobycc.elf \
             programs/tobybuild/tobybuild.elf \
             programs/selfhosttest/selfhosttest.elf \
-            programs/user_sh/user_sh.elf \
             programs/user_pkg/user_pkg.elf \
             programs/user_svcctl/user_svcctl.elf \
             programs/user_ps/user_ps.elf \
@@ -907,6 +907,14 @@ USER_CFLAGS := --target=x86_64-elf \
                -fno-unwind-tables -fno-asynchronous-unwind-tables \
                -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
                -nostdlib -O2 -Wall -Wextra -std=c11 $(DEPFLAGS)
+
+programs/systest/systest.o: programs/systest/main.c
+	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
+
+programs/systest/systest.elf: programs/systest/systest.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+                              programs/systest/program.ld
+	$(LD) $(PROG_LDFLAGS) -T programs/systest/program.ld -o $@ \
+	      $(LIBTOBY_CRT0) programs/systest/systest.o $(LIBTOBY_AR)
 
 programs/hello/hello.o: programs/hello/main.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -1723,7 +1731,6 @@ $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,debugger,debugger))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,pkgmgr,pkgmgr))
 
 # ---------- Advanced userland: shell, utilities, networking, GUI ----------
-$(eval $(call LIBTOBY_PROGRAM_RULES,user_sh,user_sh))
 # /bin/shparity -- the bash-parity gate. Runs every /etc/shparity/*.sh case
 # under BOTH the real GNU bash 5.2 we already ship and /bin/tsh, and requires
 # byte-identical stdout plus an identical exit status. See programs/shparity.
@@ -2967,6 +2974,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/fonts.conf                 $(INITRD_STAGE)/etc/fonts/fonts.conf
 	cp initrd/readme.txt                     $(INITRD_STAGE)/readme.txt
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
+	cp programs/systest/systest.elf          $(INITRD_STAGE)/bin/systest
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
 	cp programs/user_echo/user_echo.elf      $(INITRD_STAGE)/bin/echo
 	cp programs/user_cat/user_cat.elf        $(INITRD_STAGE)/bin/cat
@@ -3130,12 +3138,17 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/tobycc/tobycc.elf                     $(INITRD_STAGE)/bin/tobycc
 	cp programs/tobybuild/tobybuild.elf             $(INITRD_STAGE)/bin/tobybuild
 	cp programs/selfhosttest/selfhosttest.elf       $(INITRD_STAGE)/bin/selfhosttest
-	cp programs/user_sh/user_sh.elf                 $(INITRD_STAGE)/bin/sh
 # /bin/tsh -- the tobyOS shell language hosted in userspace: src/shell.c
 # compiled a second time against programs/tsh/host.c. It replaced
 # programs/sh/sh.elf here, which had a parser but almost no expansion layer
-# and scored 0/14 against real bash. /bin/sh (programs/user_sh) is untouched.
+# and scored 0/14 against real bash.
 	cp programs/tsh/tsh.elf                         $(INITRD_STAGE)/bin/tsh
+# /bin/sh IS tsh (2026-09-03), the way /bin/sh is bash on many a distro: one
+# binary, and tsh runs in POSIX mode when argv[0]'s basename is "sh". Until
+# now /bin/sh was programs/user_sh, a minimal shell that scored 0/14 against
+# bash -- and system(), popen() and every #!/bin/sh script went through it.
+	@ln -f $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh" 2>/dev/null || \
+	    cp $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh"
 	cp programs/id/id.elf                           $(INITRD_STAGE)/bin/id
 	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
 	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
@@ -4012,7 +4025,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	fi; \
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -cf ../initrd.tar             \
-	    bin/hello bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
+	    bin/hello bin/systest bin/bad bin/echo bin/cat bin/long_task bin/netecho      \
 	    bin/gui_demo bin/x2gui bin/gui_clock bin/gui_widgets bin/gui_about          \
 	    bin/cpptest bin/oh264test bin/bsdroute bin/mp4play bin/stltest bin/av1test bin/aactest bin/wasmtest \
 	    bin/gui_term bin/gui_files bin/gui_viewer                         \
@@ -4117,11 +4130,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/sha224sum bin/sha384sum bin/sha256sum bin/sha512sum \
 	    bin/md5sum bin/sha1sum bin/base64 bin/base32                                       \
 	    bin/kill bin/id bin/newgrp bin/vncpasswd                          \
-	    bin/env bin/find bin/tail bin/df bin/ps bin/top bin/sh            \
+	    bin/env bin/find bin/tail bin/df bin/ps bin/top                  \
 	    bin/nc bin/wget bin/nslookup bin/ifconfig bin/pkg bin/svcctl      \
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
 	    bin/bluescreen                                                    \
-	    bin/tsh bin/shparity bin/oilspec bin/ttyparity                    \
+	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \
@@ -5779,6 +5792,7 @@ clean:
 	done
 	rm -rf $(OBJS) $(KERNEL) iso build \
 	       programs/hello/hello.o programs/hello/hello.elf \
+	       programs/systest/systest.o programs/systest/systest.elf \
 	       programs/user_hello/user_hello.o programs/user_hello/user_hello.elf \
 	       programs/user_bad/user_bad.o programs/user_bad/user_bad.elf \
 	       programs/user_echo/user_echo.o programs/user_echo/user_echo.elf \
@@ -5835,7 +5849,6 @@ clean:
 	       programs/tobycc/tobycc.o programs/tobycc/m36_elf.o programs/tobycc/tobycc.elf \
 	       programs/tobybuild/tobybuild.o programs/tobybuild/tobybuild.elf \
 	       programs/selfhosttest/selfhosttest.o programs/selfhosttest/selfhosttest.elf \
-	       programs/user_sh/user_sh.o programs/user_sh/user_sh.elf \
 	       programs/user_pkg/user_pkg.o programs/user_pkg/user_pkg.elf \
 	       programs/user_svcctl/user_svcctl.o programs/user_svcctl/user_svcctl.elf \
 	       programs/user_ps/user_ps.o programs/user_ps/user_ps.elf \
