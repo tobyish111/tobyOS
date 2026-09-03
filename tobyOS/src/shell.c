@@ -1650,6 +1650,7 @@ static void shell_run_trap(int sig) {
 static int g_shell_pid = -1;
 
 static void shell_latch_pid(void) {
+    if (g_shell_pid >= 0) return;      /* latched once, by the main shell */
     struct proc *cur = current_proc();
     if (cur) g_shell_pid = cur->pid;
 }
@@ -14030,9 +14031,9 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
     if (*p == '$') {
         p++;
         *pp = p;
-        struct proc *cur = current_proc();
-        return shell_append_uint(buf, pos, cap,
-                                 (unsigned long)(cur ? cur->pid : 0));
+        int pid = g_shell_pid;
+        if (pid < 0) { struct proc *cur = current_proc(); pid = cur ? cur->pid : 0; }
+        return shell_append_uint(buf, pos, cap, (unsigned long)pid);
     }
     if (*p == '#') {
         p++;
