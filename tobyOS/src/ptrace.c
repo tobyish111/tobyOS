@@ -134,7 +134,35 @@ static void ptrace_stop(struct proc *p, int sig)
      * hand-rolled enqueue, because a hand-rolled one in the signal path wedged
      * the guest outright once already. */
     proc_wake_waiters(p->pid);
+
+    /* DROP THE BIG KERNEL LOCK ACROSS THE PARK (2026-09-02).
+     *
+     * A syscall-path stop arrives with the BKL held, and sched_yield()
+     * under the BKL stops the entire machine: every other CPU piles up in
+     * bkl_enter, pid 0's service lane never runs again, and from outside
+     * the box still answers ping and completes TCP handshakes off the NIC
+     * interrupt while doing nothing else, forever.
+     *
+     * That is how `strace` wedged a real 4-core EliteDesk -- on the LINUX
+     * path, which has had these stops since the ptrace slice. So this is
+     * not a new bug; it had simply never been run on real parallel
+     * hardware. QEMU never opens the window, and the distro gate has been
+     * green on this code the whole time.
+     *
+     * bkl_held() rather than an unconditional drop, because the
+     * EXCEPTION-path caller (ptrace_trap_stop, from a #BP/#DB) does not
+     * hold it -- a user-mode trap cannot -- and that is exactly why
+     * /bin/gdb has always worked here where strace did not.
+     *
+     * The ordering is safe as written. state is already PROC_STOPPED
+     * before the lock goes, so a tracer that runs in the window sets us
+     * back to READY and the yield below simply returns; and no scheduler
+     * will pick a PROC_STOPPED proc, so nothing can run us early. Same
+     * shape as every other blocking point in the syscall layer. */
+    bool had_bkl = bkl_held();
+    if (had_bkl) bkl_exit();
     sched_yield();          /* resumes here when the tracer flips us READY */
+    if (had_bkl) bkl_enter();
     { static int n; if (n < 24) { n++;
         kprintf("[ptdbg] pid=%d RESUMED\n", p->pid); } }
     p->ptrace_stopped = 0;
