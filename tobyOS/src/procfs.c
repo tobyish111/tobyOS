@@ -348,11 +348,25 @@ static int gen_stat(char *buf, size_t cap) {
     APPEND_STR("\n");
     APPEND_STR("ctxt "); APPEND_U64(g_ctxt_switches); APPEND_STR("\n");
     {
-        uint64_t ticks = pit_ticks();
-        uint32_t hz    = pit_hz();
-        uint64_t up    = (hz > 0) ? ticks / hz : 0;
-        uint64_t now   = rtc_unix_time();
-        APPEND_STR("btime "); APPEND_U64(now > up ? now - up : 0); APPEND_STR("\n");
+        /* COMPUTED ONCE. btime is the wall-clock instant the machine booted,
+         * which by definition never changes -- recomputing it on every read
+         * was pointless even before it was dangerous.
+         *
+         * And it was dangerous: rtc_unix_time() drives the CMOS, so reading
+         * /proc/stat put that on a path any process could take from any core
+         * at any time. On real 4-core hardware `head -1 /proc/stat` wedged
+         * the machine outright, every time. src/rtc.c now locks and bounds
+         * its side of it; caching here keeps the common path away from the
+         * hardware altogether. */
+        static uint64_t s_btime;
+        if (s_btime == 0) {
+            uint64_t ticks = pit_ticks();
+            uint32_t hz    = pit_hz();
+            uint64_t up    = (hz > 0) ? ticks / hz : 0;
+            uint64_t now   = rtc_unix_time();
+            s_btime = (now > up) ? now - up : 0;
+        }
+        APPEND_STR("btime "); APPEND_U64(s_btime); APPEND_STR("\n");
     }
     {
         struct perf_sys ps;
