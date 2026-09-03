@@ -278,7 +278,9 @@ ls -l /tmp/lst | cat | head -1
 echo @@ls_long_mode
 ls -l /tmp/lst | cat | grep alpha | cut -c1-10
 echo @@ls_size_col
-ls -l /tmp/lst | cat | grep beta | tr -s ' ' | cut -d' ' -f4
+# GNU's fifth column: mode, links, owner, group, SIZE. (It was the fourth
+# here until ls -l grew the link count and the owner/group names.)
+ls -l /tmp/lst | cat | grep beta | tr -s ' ' | cut -d' ' -f5
 echo @@ls_classify
 ls -F /tmp/lst | cat
 echo @@ls_reverse

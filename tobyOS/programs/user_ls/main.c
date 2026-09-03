@@ -1,6 +1,11 @@
 /* ls -- list directory contents.
  *
- *     ls [-1aAdFhlrRSt] [-i] [file ...]
+ *     ls [-1aAdFgGhlnorRSt] [-i] [file ...]
+ *
+ * `ls -l` prints GNU's columns -- mode, link count, OWNER and GROUP by
+ * name, size, date, name -- since 2026-09-03. It printed numeric ids and no
+ * link count before, so `ls -l | awk '{print $5}'` (the size, everywhere
+ * else) gave the date here, and a bare number where a name belonged.
  *
  * `ls` was the single most-used command in the image that had no native
  * implementation. ports/sbase has one, but it accepts only -aFl and is
@@ -25,6 +30,7 @@
 
 static int a_all, A_almost, d_dir, F_class, h_human, l_long;
 static int r_rev, R_recurse, S_size, t_time, one_per_line, i_inode;
+static int n_numeric, g_noowner, o_nogroup;   /* -n, -g, -o/-G */
 static int status;
 static int term_cols = 80;
 
@@ -95,32 +101,118 @@ static int cmp_ent(const void *pa, const void *pb) {
     return r_rev ? -c : c;
 }
 
-static void fmt_time(time_t t, char *out, size_t cap) {
-    struct tm *tm = localtime(&t);
-    if (!tm) { snprintf(out, cap, "%12s", "?"); return; }
-    static const char *mon[] = { "Jan","Feb","Mar","Apr","May","Jun",
-                                 "Jul","Aug","Sep","Oct","Nov","Dec" };
-    snprintf(out, cap, "%s %2d %02d:%02d",
-             mon[tm->tm_mon % 12], tm->tm_mday, tm->tm_hour, tm->tm_min);
+/* GNU's date column: a file modified in the last six months (and not more
+ * than an hour in the future) shows its time of day, anything older shows
+ * its year instead. The six months are GNU's own 15778476 seconds. */
+static void fmt_time(time_t t, time_t now, char *out, size_t cap) {
+    struct tm tmv;
+    if (!gmtime_r(&t, &tmv)) { snprintf(out, cap, "%12s", "?"); return; }
+    if (t <= now + 3600 && t + 15778476L >= now)
+        strftime(out, cap, "%b %e %H:%M", &tmv);
+    else
+        strftime(out, cap, "%b %e  %Y", &tmv);
 }
 
-static void print_long(const struct ent *e) {
+/* Owner and group NAMES, from the files everything else reads them from.
+ * ls printed bare numbers here, which is not what `ls -l` looks like
+ * anywhere else; -n asks for the numbers back. */
+static const char *id_name(const char *file, unsigned id, char *out, size_t cap) {
+    snprintf(out, cap, "%u", id);
+    if (n_numeric) return out;
+    FILE *f = fopen(file, "r");
+    if (!f) return out;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char *c1 = strchr(line, ':'); if (!c1) continue;
+        char *c2 = strchr(c1 + 1, ':'); if (!c2) continue;
+        if ((unsigned)atoi(c2 + 1) == id) {
+            *c1 = '\0';
+            snprintf(out, cap, "%s", line);
+            break;
+        }
+    }
+    fclose(f);
+    return out;
+}
+
+static const char *user_name(unsigned uid) {
+    static char cache[8][40]; static unsigned ids[8]; static int n;
+    for (int i = 0; i < n; i++) if (ids[i] == uid) return cache[i];
+    int slot = n < 8 ? n++ : 7;
+    ids[slot] = uid;
+    return id_name("/etc/passwd", uid, cache[slot], sizeof cache[slot]);
+}
+
+static const char *group_name(unsigned gid) {
+    static char cache[8][40]; static unsigned ids[8]; static int n;
+    for (int i = 0; i < n; i++) if (ids[i] == gid) return cache[i];
+    int slot = n < 8 ? n++ : 7;
+    ids[slot] = gid;
+    return id_name("/etc/group", gid, cache[slot], sizeof cache[slot]);
+}
+
+/* There is no st_nlink here; GNU shows 1 for a file and 2 for a directory
+ * (its . and its parent's entry), which is what any script or eye reading
+ * the column expects to find. */
+static int nlink_of(const struct ent *e) {
+    return (e->have_stat && S_ISDIR(e->st.st_mode)) ? 2 : 1;
+}
+
+static void size_of(const struct ent *e, char *out, size_t cap) {
+    if (!e->have_stat) { snprintf(out, cap, "?"); return; }
+    if (h_human) human((long)e->st.st_size, out, cap);
+    else         snprintf(out, cap, "%ld", (long)e->st.st_size);
+}
+
+/* Column widths are the widest entry in the listing, as in GNU ls: nlink
+ * and size right-aligned, owner and group left-aligned. */
+struct lwidths { int nlink, user, group, size; };
+
+static void long_widths(const struct ent *v, size_t n, struct lwidths *w) {
+    char buf[64];
+    w->nlink = w->user = w->group = w->size = 1;
+    for (size_t i = 0; i < n; i++) {
+        snprintf(buf, sizeof buf, "%d", nlink_of(&v[i]));
+        if ((int)strlen(buf) > w->nlink) w->nlink = (int)strlen(buf);
+        size_of(&v[i], buf, sizeof buf);
+        if ((int)strlen(buf) > w->size) w->size = (int)strlen(buf);
+        if (v[i].have_stat) {
+            int ul = (int)strlen(user_name((unsigned)v[i].st.st_uid));
+            int gl = (int)strlen(group_name((unsigned)v[i].st.st_gid));
+            if (ul > w->user) w->user = ul;
+            if (gl > w->group) w->group = gl;
+        }
+    }
+}
+
+static void pad_to(int have, int want) { while (have++ < want) putchar(' '); }
+
+static void print_long(const struct ent *e, const struct lwidths *w, time_t now) {
     char m[16] = "?---------";
-    char sz[32], tm[32];
+    char sz[32], tm[32], nl[16];
     if (e->have_stat) {
         mode_str(e->st.st_mode, m);
-        if (h_human) human((long)e->st.st_size, sz, sizeof sz);
-        else         snprintf(sz, sizeof sz, "%ld", (long)e->st.st_size);
-        fmt_time(e->st.st_mtime, tm, sizeof tm);
+        fmt_time(e->st.st_mtime, now, tm, sizeof tm);
     } else {
-        snprintf(sz, sizeof sz, "?");
         snprintf(tm, sizeof tm, "?");
     }
+    size_of(e, sz, sizeof sz);
+    snprintf(nl, sizeof nl, "%d", nlink_of(e));
     if (i_inode) printf("%8d ", 0);   /* no st_ino in this struct stat */
-    printf("%s %4u %4u %8s %s %s%s\n", m,
-           e->have_stat ? (unsigned)e->st.st_uid : 0,
-           e->have_stat ? (unsigned)e->st.st_gid : 0,
-           sz, tm, e->name, classify(e));
+    fputs(m, stdout);
+    putchar(' ');
+    pad_to((int)strlen(nl), w->nlink); fputs(nl, stdout);
+    if (!g_noowner) {
+        const char *u = e->have_stat ? user_name((unsigned)e->st.st_uid) : "?";
+        putchar(' '); fputs(u, stdout); pad_to((int)strlen(u), w->user);
+    }
+    if (!o_nogroup) {
+        const char *g = e->have_stat ? group_name((unsigned)e->st.st_gid) : "?";
+        putchar(' '); fputs(g, stdout); pad_to((int)strlen(g), w->group);
+    }
+    putchar(' ');
+    pad_to((int)strlen(sz), w->size); fputs(sz, stdout);
+    printf(" %s %s%s\n", tm, e->name, classify(e));
 }
 
 /* Down-then-across, the layout ls has always used: the eye reads a column
@@ -157,7 +249,10 @@ static void emit(struct ent *v, size_t n, const char *dirpath) {
         for (size_t i = 0; i < n; i++)
             if (v[i].have_stat) total += (long)((v[i].st.st_size + 1023) / 1024);
         if (dirpath) printf("total %ld\n", total);
-        for (size_t i = 0; i < n; i++) print_long(&v[i]);
+        struct lwidths w;
+        long_widths(v, n, &w);
+        time_t now = time(0);
+        for (size_t i = 0; i < n; i++) print_long(&v[i], &w, now);
     } else if (one_per_line) {
         for (size_t i = 0; i < n; i++)
             printf("%s%s\n", v[i].name, classify(&v[i]));
@@ -222,10 +317,12 @@ int main(int argc, char **argv) {
         const char *a = argv[i];
         if (a[0] == '-' && a[1]) {
             if (!strcmp(a, "--help")) {
-                printf("usage: ls [-1aAdFhilrRSt] [file ...]\n");
+                printf("usage: ls [-1aAdFgGhilnorRSt] [file ...]\n");
                 return 0;
             }
             if (!strcmp(a, "--color") || !strncmp(a, "--color=", 8)) continue;
+            if (!strcmp(a, "--no-group")) { o_nogroup = 1; continue; }
+            if (!strcmp(a, "--numeric-uid-gid")) { n_numeric = 1; l_long = 1; one_per_line = 0; continue; }
             for (const char *p = a + 1; *p; p++) {
                 switch (*p) {
                 case '1': one_per_line = 1; l_long = 0; break;
@@ -236,6 +333,10 @@ int main(int argc, char **argv) {
                 case 'h': h_human = 1; break;
                 case 'i': i_inode = 1; break;
                 case 'l': l_long = 1; one_per_line = 0; break;
+                case 'n': n_numeric = 1; l_long = 1; one_per_line = 0; break;
+                case 'g': g_noowner = 1; l_long = 1; one_per_line = 0; break;
+                case 'o': o_nogroup = 1; l_long = 1; one_per_line = 0; break;
+                case 'G': o_nogroup = 1; break;
                 case 'r': r_rev = 1; break;
                 case 'R': R_recurse = 1; break;
                 case 'S': S_size = 1; break;

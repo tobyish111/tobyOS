@@ -39,7 +39,10 @@ sleep 40 &
 sleep 1
 skill -TERM sleep; echo "skill rc=$?"
 sleep 1
-echo "still running: $(ps 2>/dev/null | grep -c '^ *[0-9][0-9]* *sleep')"
+# ps is procps-style now: -C selects by command name, pid= drops the header.
+# (The old grep matched the old /bin/ps's SERVICE listing, which never had a
+# sleep in it, so this line passed whether or not skill had worked.)
+echo "still running: $(ps -C sleep -o pid= 2>/dev/null | grep -c .)"
 
 echo @@pn_skill_nomatch
 skill -TERM nosuchprocessname; echo rc=$?

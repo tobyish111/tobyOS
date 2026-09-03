@@ -185,10 +185,16 @@ static int procfs_kpid(const char *s) {
  * the second field mirrors the first (tools like busybox `uptime` parse the
  * first field only). */
 static int gen_uptime(char *buf, size_t cap) {
-    uint64_t ticks = pit_ticks();
-    uint32_t hz    = pit_hz();
-    uint64_t secs  = (hz > 0) ? ticks / hz : 0;
-    uint64_t frac  = (hz > 0) ? ((ticks % hz) * 100) / hz : 0;
+    /* perf_now_ns(), NOT pit_ticks() (2026-09-03). The PIT tick count loses
+     * ticks under emulation -- measured: 42 s of ticks in 123 s of wall
+     * clock -- while every other clock here runs off the TSC: CLOCK_MONOTONIC,
+     * /proc/<pid>/stat's starttime, the anchor CLOCK_REALTIME hangs off.
+     * ps computes ELAPSED as uptime minus starttime, and with two clocks a
+     * two-second-old child read 0. One clock for everything. */
+    extern uint64_t perf_now_ns(void);
+    uint64_t ns    = perf_now_ns();
+    uint64_t secs  = ns / 1000000000ull;
+    uint64_t frac  = (ns % 1000000000ull) / 10000000ull;
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { size_t sl = strlen(s); \
@@ -360,10 +366,16 @@ static int gen_stat(char *buf, size_t cap) {
          * hardware altogether. */
         static uint64_t s_btime;
         if (s_btime == 0) {
-            uint64_t ticks = pit_ticks();
-            uint32_t hz    = pit_hz();
-            uint64_t up    = (hz > 0) ? ticks / hz : 0;
-            uint64_t now   = rtc_unix_time();
+            /* The same anchored clock CLOCK_REALTIME reports, minus the same
+             * uptime /proc/uptime reports, so btime + starttime/HZ is a
+             * process's real start instant the way ps computes it. The CMOS
+             * stays off this path: lx_realtime_ns latches the RTC once, for
+             * whichever caller comes first. */
+            extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+            extern uint64_t perf_now_ns(void);
+            uint64_t mono = perf_now_ns();
+            uint64_t now  = lx_realtime_ns(mono) / 1000000000ull;
+            uint64_t up   = mono / 1000000000ull;
             s_btime = (now > up) ? now - up : 0;
         }
         APPEND_STR("btime "); APPEND_U64(s_btime); APPEND_STR("\n");
@@ -472,6 +484,28 @@ static int gen_devices(char *buf, size_t cap) {
  * honest ENOENT; a present but empty one would read as "this process has no
  * environment", which is false. */
 
+/* Linux's comm: the executable's basename, at most 15 bytes (TASK_COMM_LEN
+ * less the NUL). p->name is the label the SPAWNER chose -- "distro-test",
+ * "tsh-ssh", "c_envtest-boot" -- which is right for the kernel log and wrong
+ * for `ps -C tsh`, `pkill tsh` or anything else that matches on comm the way
+ * it does on Linux. A proc with no image (pid 0, kernel workers) keeps its
+ * name. */
+static const char *proc_comm(const struct proc *p, char *buf, size_t cap) {
+    const char *src = p->name;
+    if (p->exe_path[0]) {
+        const char *b = p->exe_path;
+        for (const char *s = p->exe_path; *s; s++)
+            if (*s == '/' && s[1]) b = s + 1;
+        src = b;
+    }
+    size_t n = strlen(src);
+    if (n > 15) n = 15;
+    if (n >= cap) n = cap - 1;
+    memcpy(buf, src, n);
+    buf[n] = '\0';
+    return buf;
+}
+
 static int gen_pid_status(int pid, char *buf, size_t cap) {
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
@@ -489,7 +523,7 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         APPEND_STR(tmp); \
     } while (0)
 
-    APPEND_STR("Name:   "); APPEND_STR(p->name);     APPEND_STR("\n");
+    { char cm[16]; APPEND_STR("Name:   "); APPEND_STR(proc_comm(p, cm, sizeof cm)); APPEND_STR("\n"); }
     APPEND_STR("State:  "); APPEND_STR(proc_state_name(p->state)); APPEND_STR("\n");
     /* Slice 10: report pids as the READER numbers them, not as the kernel
      * stores them. A process inside a pid namespace reading /proc must see its
@@ -965,6 +999,7 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         case PROC_RUNNING: case PROC_READY: st = 'R'; break;
         case PROC_BLOCKED: st = 'S'; break;
         case PROC_TERMINATED: st = 'Z'; break;
+        case PROC_STOPPED: st = 'T'; break;     /* ptrace / SIGSTOP: procps shows T */
         default: st = 'R'; break;
     }
     int off = 0;
@@ -975,12 +1010,24 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         memcpy(buf + off, s, sl); off += (int)sl; \
     } while (0)
     #define APPEND_INT(v) do { int_to_str(tmp, sizeof(tmp), (int64_t)(v)); APPEND_STR(tmp); } while (0)
+    /* Threads in the group, the same count /proc/<pid>/status reports. */
+    int nthreads = 0;
+    {   int tg = p->is_thread ? p->tgid : p->pid;
+        for (int ti = 0; ti < PROC_MAX; ti++) {
+            struct proc *q = &g_proc[ti];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->state == PROC_TERMINATED) continue;
+            if (q->pid == tg || (q->is_thread && q->tgid == tg)) nthreads++;
+        }
+        if (nthreads < 1) nthreads = 1;
+    }
 
     /* Slice 10: fields 1 and 4 are pid and ppid -- namespace-translated for the
      * same reason as /proc/<pid>/status. busybox `ps` reads field 1 and then
      * offers it to kill(1). */
     APPEND_INT(pid_vnr(p)); APPEND_STR(" (");
-    APPEND_STR(p->name); APPEND_STR(") ");
+    { char cm[16]; APPEND_STR(proc_comm(p, cm, sizeof cm)); }
+    APPEND_STR(") ");
     { char ss[2] = { st, 0 }; APPEND_STR(ss); }
     APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->ppid));
 
@@ -1008,8 +1055,15 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         uint64_t rss_pages = p->user_pages;
         uint64_t vsize = rss_pages * 4096ull;
 
-        APPEND_STR(" 0");                    /*  5 pgrp        */
-        APPEND_STR(" 0");                    /*  6 session     */
+        /* 2026-09-03: pgrp, session and starttime were literal zeros, so a
+         * procps-style ps had no PGID, no SID, no ELAPSED/START and no
+         * %CPU -- every one of them is a function of these fields. The
+         * process group is a pid and is namespace-translated like ppid;
+         * the session is the login session id (there is no setsid(2)
+         * session distinct from it here), which is also what a bare `ps`
+         * uses in place of "the invoker's terminal". */
+        APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->pgid));  /*  5 pgrp */
+        APPEND_STR(" "); APPEND_INT(p->session_id);            /*  6 session */
         APPEND_STR(" 0");                    /*  7 tty_nr      */
         APPEND_STR(" -1");                   /*  8 tpgid       */
         APPEND_STR(" 0");                    /*  9 flags       */
@@ -1023,9 +1077,11 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         APPEND_STR(" 0");                    /* 17 cstime      */
         APPEND_STR(" 20");                   /* 18 priority    */
         APPEND_STR(" 0");                    /* 19 nice        */
-        APPEND_STR(" 1");                    /* 20 num_threads */
+        APPEND_STR(" "); APPEND_INT(nthreads);   /* 20 num_threads */
         APPEND_STR(" 0");                    /* 21 itrealvalue */
-        APPEND_STR(" 0");                    /* 22 starttime   */
+        /* 22 starttime: clock ticks (USER_HZ = 100) after boot, from the
+         * creation stamp every spawn/fork/clone site already records. */
+        APPEND_STR(" "); APPEND_INT(p->created_ns / 10000000ull);
         APPEND_STR(" "); APPEND_INT(vsize);      /* 23 vsize   */
         APPEND_STR(" "); APPEND_INT(rss_pages);  /* 24 rss (in PAGES) */
         /* 25 rsslim: Linux reports RLIM_INFINITY here. */
