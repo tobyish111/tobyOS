@@ -80,12 +80,48 @@ print("BANNER %s" % (b.decode("utf8", "replace").strip() if b else "EMPTY"))
 PY
 }
 
-check() {
-    local r
+# ---- finding the box when DHCP moves it ----------------------------------
+# The address is a DHCP lease, not a fact. It sat on .90 all through the first
+# day and came back as .101 the next morning, which presented as "nothing is
+# listening on 22" and then "no ICMP" -- two alarming errors for a machine
+# that was perfectly healthy at a different number.
+#
+# So sweep the /24 for tobyOS's own SSH banner rather than making anyone chase
+# it. Nothing else on a network answers with that string, so it is an exact
+# identifier and not a guess. Set ED_HOST to skip the sweep entirely.
+discover() {
+    python - <<'PY'
+import socket, concurrent.futures
+def probe(ip):
+    s = socket.socket(); s.settimeout(1.2)
+    try:
+        s.connect((ip, 22)); s.settimeout(2)
+        try: b = s.recv(64)
+        except Exception: return None
+        return ip if b.startswith(b"SSH-2.0-tobyOS") else None
+    except Exception:
+        return None
+    finally:
+        s.close()
+ips = ["192.168.68.%d" % i for i in range(1, 255)]
+with concurrent.futures.ThreadPoolExecutor(max_workers=128) as ex:
+    for r in ex.map(probe, ips):
+        if r:
+            print(r); break
+PY
+}
+
+# One preflight against $ED_HOST. $1 = "quiet" suppresses the explanations,
+# used for the first attempt so a box that merely MOVED does not print a
+# scary diagnosis before we go and find it.
+check_at() {
+    local quiet="${1:-}" r
     r=$(preflight) || return $?
     case "$r" in
-      SHUT*)   echo "edremote: $ED_HOST is up but nothing is listening on 22." >&2
-               echo "          ($r)" >&2
+      SHUT*)   if [ -z "$quiet" ]; then
+                 echo "edremote: $ED_HOST is up but nothing is listening on 22." >&2
+                 echo "          ($r)" >&2
+               fi
                return 91 ;;
       SILENT)  echo "edremote: $ED_HOST accepts TCP on 22 but sends no SSH banner." >&2
                echo "          The kernel is alive (it answers ping and completes the" >&2
@@ -101,6 +137,31 @@ check() {
       *)       echo "edremote: unexpected preflight result '$r'" >&2
                return 92 ;;
     esac
+}
+
+check() {
+    check_at quiet && return 0
+    local rc=$?
+
+    # 90 (no ICMP) and 91 (port shut) both look like "the box is gone" and are
+    # usually "the box moved". 92 is the WEDGE and must never trigger a sweep:
+    # that host is right there, answering, and simply not serving.
+    if [ "$rc" = "90" ] || [ "$rc" = "91" ]; then
+        local found
+        found=$(discover)
+        if [ -n "$found" ] && [ "$found" != "$ED_HOST" ]; then
+            echo "edremote: $ED_HOST did not answer; found tobyOS at $found" >&2
+            echo "          (DHCP moved it -- export ED_HOST=$found to skip the sweep)" >&2
+            ED_HOST="$found"
+            check_at
+            return $?
+        fi
+    fi
+
+    # Nothing found, or the failure was the wedge: re-run loudly so the user
+    # gets the real explanation rather than silence.
+    check_at
+    return $?
 }
 
 # ---- main ----------------------------------------------------------------
