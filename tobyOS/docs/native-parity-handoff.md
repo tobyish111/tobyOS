@@ -70,6 +70,20 @@ including two RETRACTIONS worth understanding), `elitedesk-remote-channel.md`,
 Ordered by what a user hits first. Each has a "proof" line: the test that
 must exist and pass, on hardware, before the item is done.
 
+> PROGRESS 2026-09-03 (8 commits on feat/posix-shell, ebb204f..f9ea44a):
+> items 1 (clock), 2 (ps), 3 (strace), 4 (/bin/sh), 5 (ABI_ARG_MAX) and 8
+> (2 of the oils groups -- 6 POSIX cases) are IMPLEMENTED, QEMU-GREEN and
+> COMMITTED. `bash logs/distrotail.sh` 198/0, `bash logs/shparity.sh` 111/111,
+> oilspec 6 POSIX cases fixed. Item 9's `logs/hwgate.sh` runner is written.
+> A $$-is-a-forked-child's-pid bug was found and fixed en route (commit
+> 8dab1e6). **HARDWARE PROOF IS OWED FOR EVERY ITEM**: the EliteDesk was
+> powered off the whole session (edremote --check exited 90), so nothing was
+> confirmed on real hardware -- run `bash logs/hwgate.sh` per section and
+> `bash logs/edordinary.sh` once the box is up. STILL OPEN: item 6 (the
+> intermittent wedge -- did NOT reproduce in QEMU this session), item 7 (the
+> 46 busybox-only utilities, natively), item 10 (device gaps). The remaining
+> oils failures are 5 POSIX cases (1069, 1286, 1366, and two exec-code cases).
+
 ### 1. Native programs have no real clock
 
 **Wrong:** `libtoby/src/time.c` treats `time_t` as seconds since boot and
