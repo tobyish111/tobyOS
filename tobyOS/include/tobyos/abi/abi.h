@@ -81,7 +81,13 @@ extern "C" {
 #define ABI_RW_MAX          65536u
 
 /* Maximum argv string and environment string length passed to spawn. */
-#define ABI_ARG_MAX         512
+/* One argv/envp string. 512 until 2026-09-03, which cut `ssh host 'long
+ * command'` silently at the spawn (measured: 500 bytes fine, 660 nothing)
+ * and refused any `-c` script, `python3 -c`, or grep pattern past it, on
+ * every personality. 4096 matches the SSH server's exec-command cap, so
+ * that refusal threshold is the real one. The two static pools in
+ * sys_execve (src/fork.c) are sized off this: 64 x 4 KiB each. */
+#define ABI_ARG_MAX         4096
 
 /* Maximum number of argv / envp entries passed to spawn. */
 #define ABI_ARGV_MAX        64

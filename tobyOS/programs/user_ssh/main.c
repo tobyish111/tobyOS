@@ -667,7 +667,7 @@ static int cmd_ssh(int argc, char **argv) {
         user = (u && *u) ? u : "root";
     }
     if (i < argc) {
-        static char cmdbuf[2048];
+        static char cmdbuf[4096];      /* the server's exec cap, and ABI_ARG_MAX */
         size_t o = 0;
         for (; i < argc; i++) {
             int k = snprintf(cmdbuf + o, sizeof cmdbuf - o, "%s%s",

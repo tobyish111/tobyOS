@@ -22,6 +22,13 @@ echo @@exec_status
 ssh toby@127.0.0.1 'exit 7' 2>&1; echo rc=$?
 echo @@pipeline
 ssh toby@127.0.0.1 'echo a b c | wc -w' 2>&1
+echo @@exec_long
+# 3200 bytes in ONE argv element. The client spawn, the server's exec
+# handler and `tsh -c` all capped an element at 512 and cut it SILENTLY:
+# 500 bytes worked, 660 printed nothing. The whole command must run.
+L="$(i=0; while [ $i -lt 400 ]; do i=$((i+1)); printf 'echo x; '; done)echo END"
+echo "len=${#L}"
+ssh toby@127.0.0.1 "$L" 2>&1 | tail -1
 echo @@knownhosts
 grep -c '127.0.0.1 ssh-ed25519' /data/ssh/known_hosts
 echo @@badport

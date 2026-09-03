@@ -106,6 +106,7 @@ echo "=== the handshake, against our own sshd ==="
 want exec        "runs a remote command"        'hello-from-remote'
 want exec_status "propagates the remote status" 'rc=7'
 want pipeline    "a remote pipeline works"      '3'
+want exec_long   "a 3 KB command survives the exec channel whole" 'len=3208|END'
 want knownhosts  "pins the host key"            '^1'
 
 echo "=== failure paths ==="
