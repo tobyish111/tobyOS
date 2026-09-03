@@ -411,11 +411,21 @@ timeout 40 strace /bin/arch 2>&1 | grep "exited with" | head -1
 echo @@strace_count
 timeout 40 strace -c /bin/arch 2>&1 | head -16
 echo @@strace_native
-# A native binary is refused BY NAME rather than traced to no effect. The
-# stops it would need park the tracee with the BKL held, which wedges a real
-# multi-core box -- measured on the EliteDesk, not theorised.
-strace /etc/dbg_test.elf 2>&1 | head -1
-strace /etc/dbg_test.elf > /dev/null 2>&1; echo rc=$?
+# A NATIVE tobyOS program, traced through the native dispatcher's stops.
+# Enabled 2026-09-01, wedged real hardware, reverted; the real cause was the
+# shared ptrace_stop() yielding under the BKL (3c523d2), which the Linux
+# path had too. The fixture exits 7, and that exit is a native syscall.
+timeout 40 strace /etc/dbg_test.elf 2>&1 | tail -5
+echo @@strace_native_repeat
+# Ten in a row. The second wedge mechanism (a tracer exiting with its tracee
+# parked forever) was cumulative, and a single trace could never show it.
+n=0; i=0
+while [ $i -lt 10 ]; do
+    i=$((i+1))
+    timeout 40 strace /etc/dbg_test.elf 2>&1 | grep -q "exited with 7" && n=$((n+1))
+done
+echo "traced: $n/10"
+ps -e -o comm= | grep -c dbg_test
 
 # --- #! scripts ----------------------------------------------------------
 # Neither loader read a shebang: `./script.sh` returned 127 from a shell
@@ -519,5 +529,147 @@ echo @@printf_nul
 printf '%s\0' x y | wc -c
 printf 'a\0b' | wc -c
 printf 'a\0b\n' | od -An -c | tr -s ' '
+
+# --- the native clock is the real clock -----------------------------------
+# /bin/date is native, and it said 2025 on a box whose RTC said 2026:
+# libtoby's time_t was seconds since boot on a pretend 2025-01-01 base,
+# because the native ABI had no realtime syscall to ask. busybox runs under
+# the Linux personality and reads the kernel's RTC-anchored clock, so it is
+# the oracle here: the two personalities must agree about what time it is,
+# and about how every strftime conversion spells it.
+echo @@clock_agree
+N=$(date +%s); B=$(busybox date +%s)
+D=$((B - N)); [ "$D" -lt 0 ] && D=$((0 - D))
+echo "native=$N busybox=$B skew=$D"
+echo @@clock_year
+date +%Y
+busybox date +%Y
+echo @@clock_default
+date
+echo @@clock_fixed
+# A fixed instant, so the two outputs can be compared byte for byte.
+F='%Y-%m-%d|%H:%M:%S|%a %A|%b %B|%e|%j|%u %w|%U %W|%V %G %g|%C %y|%D|%F|%T|%R|%r|%I %p|%Z|%z|%s|%%'
+date -u -d @1700000000 "+$F"
+busybox date -u -d @1700000000 "+$F"
+echo @@clock_fixed_flags
+date -u -d @1700000000 '+%-d|%-m|%_H|%-H|%010Y|%c'
+busybox date -u -d @1700000000 '+%-d|%-m|%_H|%-H|%010Y|%c'
+echo @@clock_gnu_only
+# GNU conversions busybox's libc does not know (its output STOPS at %k):
+date -u -d @1700000000 '+%k|%l|%P|%q'
+echo @@clock_dateparse
+date -u -d '2024-02-29 12:34:56' +%s
+date -u -d '2024-02-29T12:34' +%s
+date -u -d 2024-02-29 +%s
+date -u -d @0
+date -d 'nonsense' 2>&1; echo rc=$?
+echo @@clock_iso_rfc
+date -u -d @1700000000 -I
+date -u -d @1700000000 -Iseconds
+date -u -d @1700000000 -R
+echo @@clock_mtime
+# A file created by a NATIVE program (touch), stamped by the filesystem,
+# read back by busybox stat -- and the reverse, native date -r and ls -l.
+rm -f /tmp/ck1 /tmp/ck2; touch /tmp/ck1
+M=$(busybox stat -c %Y /tmp/ck1); N=$(date +%s)
+D=$((N - M)); [ "$D" -lt 0 ] && D=$((0 - D))
+echo "mtime=$M now=$N skew=$D"
+date -r /tmp/ck1 +%Y
+busybox touch /tmp/ck2; ls -l /tmp/ck2 | awk '{print $6}'
+echo @@clock_printf_T
+printf '%(%Y)T\n' -1
+printf '%(%Y)T\n'
+T=$(printf '%(%s)T' -1); N=$(date +%s); D=$((N - T)); [ "$D" -lt 0 ] && D=$((0 - D)); echo "skew=$D"
+printf '%(%Y-%m-%d %H:%M:%S %A %j)T\n' 1700000000
+printf '%(%s)T\n' 1700000000
+# a leading x: the gate drops any line that begins with '[' as a kernel line
+printf 'x[%12(%F)T][%-12(%F)T]\n' 86400 86400
+printf '%()T\n' 0
+
+# --- ps: processes, not services ------------------------------------------
+# /bin/ps listed the SERVICES the supervisor manages, and the shell builtin
+# listed processes. On Linux `ps` lists processes, from /proc, which this
+# kernel had been serving to busybox ps all along. The service listing moved
+# to `svcctl list`. The oracles: /proc itself, busybox ps, and procps's
+# column headers verbatim.
+echo @@ps_self
+ps -p $$ -o pid=,comm=
+ps -o comm= -p $$
+echo "dollarpipe: $(echo $$ | cat) main $$"
+echo @@ps_header_bare
+ps | head -1
+echo @@ps_header_aux
+ps aux | head -1
+echo @@ps_header_ef
+ps -ef | head -1
+echo @@ps_header_ax
+ps ax | head -1
+echo @@ps_aux_tsh
+ps aux | grep -c '[t]sh'
+echo @@ps_pidset
+# Two snapshots a few milliseconds apart: the only pids that may differ are
+# the ones the snapshot commands themselves are.
+ps -e -o pid= | tr -d ' ' | sort -n > /tmp/ps_e.txt
+echo "count: $(grep -c . /tmp/ps_e.txt)"
+# The shell (pid $$) must be in `ps -e`. pid 0 is deliberately NOT here:
+# Linux `ps -e` omits the scheduler (pid 0) and busybox ps agrees.
+echo "shell: $(grep -cx "$$" /tmp/ps_e.txt)"
+echo @@ps_busybox
+busybox ps -o pid= | tr -d ' ' | sort -n > /tmp/ps_bb.txt
+echo "only-in-one: $(sort /tmp/ps_e.txt /tmp/ps_bb.txt | uniq -u | grep -c .)"
+echo @@ps_columns
+ps -o pid,ppid,pgid,user,%cpu,%mem,vsz,rss,stat,etime,time,comm -p $$
+echo @@ps_custom_header
+ps -o pid=PROCESS,comm=NAME -p $$
+ps -o comm= -p $$
+echo @@ps_etime
+sleep 3 &
+SP=$!
+sleep 2
+ps -o etimes= -p $SP | tr -d ' '
+ps -o stat= -p $SP | cut -c1
+ps -o ppid= -p $SP | tr -d ' '
+echo "self=$$"
+kill $SP 2>/dev/null; wait $SP 2>/dev/null
+echo @@ps_none
+ps -p 99999 > /dev/null; echo rc=$?
+ps -C nosuchcommand -o pid= | grep -c .
+ps -o nosuchcolumn 2>&1 | head -1
+echo @@ps_services
+ps --json > /dev/null 2>&1; echo rc=$?
+svcctl list | grep -c .
+
+# --- /bin/sh is tsh ---------------------------------------------------------
+# /bin/sh was programs/user_sh, a minimal shell that scored 0/14 against
+# bash -- and system(), popen(), execvp's ENOEXEC fallback and every
+# #!/bin/sh script went through it. It is a link to /bin/tsh now, in POSIX
+# mode, the way /bin/sh is bash on many a distro.
+echo @@sh_same_binary
+echo "same as tsh: $([ "$(wc -c < /bin/sh)" = "$(wc -c < /bin/tsh)" ] && echo yes || echo no)"
+echo @@sh_c
+sh -c 'echo $((1+2)); x=abc; echo ${x#a} ${x%c} ${#x}; for i in 1 2; do printf "%s-" $i; done; echo'
+echo @@sh_posix_mode
+sh -c 'set -o | grep posix'
+tsh -c 'set -o | grep posix'
+echo @@sh_script
+cat > /tmp/posix.sh <<'EOF'
+#!/bin/sh
+f() { return $(( $1 * 2 )); }
+f 21; r=$?
+case "$r" in 42) echo "case ok" ;; *) echo "case bad $r" ;; esac
+cat <<EOT
+heredoc $r
+EOT
+[ -n "${HOME:-}" ] && echo "test ok"
+echo "$0 $#"
+EOF
+chmod +x /tmp/posix.sh
+/tmp/posix.sh a b; echo rc=$?
+echo @@sh_system
+# /bin/systest is a NATIVE C program (built with libtoby, in the image) whose
+# system() and popen() must reach a real shell: a pipeline, an exit status
+# carried through waitpid's encoding, popen for reading AND writing, and a
+# quoted argument. This used to route through the 0/14 minimal shell.
+systest
 
 echo @@dt_END
