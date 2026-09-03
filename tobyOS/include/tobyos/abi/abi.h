@@ -1293,6 +1293,12 @@ struct abi_fscheck_report {
  *  Service supervision (Milestone 28F)
  * ============================================================ */
 
+/* The most entries ABI_SYS_SVC_LIST will accept in one call. This existed
+ * only as a bare 64 inside the kernel's bounds check while /bin/ps asked for
+ * 128, so every single `ps` invocation came back -EINVAL and the tool had
+ * never once worked. Named here so the two sides share one number. */
+#define ABI_SVC_LIST_MAX  64
+
 #define ABI_SVC_NAME_MAX  16
 #define ABI_SVC_PATH_MAX  64
 

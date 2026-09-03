@@ -4540,7 +4540,7 @@ static long sys_notify_dismiss(uint32_t id) {
  * implementation lives in service.c; this wrapper just enforces
  * the user-buffer contract. */
 static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
-    if (cap == 0 || cap > 64) return -ABI_EINVAL;
+    if (cap == 0 || cap > ABI_SVC_LIST_MAX) return -ABI_EINVAL;
     if (!user_buf_ok((uint64_t)(uintptr_t)out,
                      (size_t)cap * sizeof(struct abi_service_info))) {
         return -ABI_EFAULT;
