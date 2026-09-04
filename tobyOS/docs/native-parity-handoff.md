@@ -80,9 +80,30 @@ must exist and pass, on hardware, before the item is done.
 > powered off the whole session (edremote --check exited 90), so nothing was
 > confirmed on real hardware -- run `bash logs/hwgate.sh` per section and
 > `bash logs/edordinary.sh` once the box is up. STILL OPEN: item 6 (the
-> intermittent wedge -- did NOT reproduce in QEMU this session), item 7 (the
-> 46 busybox-only utilities, natively), item 10 (device gaps). The remaining
-> oils failures are 5 POSIX cases (1069, 1286, 1366, and two exec-code cases).
+> intermittent wedge -- did NOT reproduce in QEMU this session), and the
+> hardware proof for everything below.
+>
+> **2026-09-04 (QEMU-green, committed): item 7 is DONE** -- all 46
+> busybox-only utilities are native (commits "feat(kernel): the syscalls and
+> /proc files the native utilities were missing", "fix(tsh): 512 positional
+> parameters...", "feat(libtoby): xz", "feat(userland): the 46 busybox-only
+> utilities, natively", "test(gate): distro cases for the 46..."); the distro
+> gate is 243/243, shparity 111/111. **Item 10's QEMU-doable part is done**
+> (`/proc/vmstat` exists with a live page-fault counter); HDA, PS/2 and xHCI
+> are hardware-only and untouched. **Item 8 moved:** POSIX-class Oils cases
+> 1366, 1414, 1415 and 2373 pass now; what remains is 1069 (`ulimit -f`),
+> 1286 (`type` -> alias/external) and three exec-status nuances -- the
+> committed baseline is `logs/oilspec_failures.BASE_2026-09-04.txt` (compare
+> SETS against it, never the last run's archive).
+>
+> Found on the way and FIXED: the module loader executed modules from the NX
+> heap (hello.ko was the first module ever loaded); `su` accepted any password
+> (native `getuid()` returns the EFFECTIVE uid, 0 after su's own setuid exec --
+> `ABI_SYS_GETRUID` now); `useradd` never registered in the kernel login
+> database, so its accounts could not log in, su or sudo (`ABI_SYS_USERADD`);
+> libtoby `sscanf` had no scansets (sudo's parser matched nobody); a
+> subshell's trailing redirections pointed into a dead stack frame. Found and
+> NOT fixed -- see item 11.
 
 ### 1. Native programs have no real clock
 
@@ -266,11 +287,34 @@ per section the way distrotail does. Run it after every ISO.
   (resp=0xffffffff)`. Second controller at 00:1b.0 is ignored by design.
 - PS/2 mouse init NACKs every command; harmless because USB HID binds.
 - xHCI ports 5 and 6 (`speed=1`) never enable after reset.
-- `procs_blocked` in `/proc/stat` is 0 by design (no D-state); `/proc/vmstat`
-  does not exist so vmstat's io columns are `-`.
+- `procs_blocked` in `/proc/stat` is 0 by design (no D-state). `/proc/vmstat`
+  exists since 2026-09-04 (nr_free_pages, pgfault, pgmajfault, pswpin/out).
 
 Absent and out of scope unless asked: `node`, `perl`, `ruby` (ports);
 `vim` (tvi exists; the name would misname it); `gcc` (`cc` is tcc and works).
+
+### 11. The native text tools are subsets (found writing item 7's gate)
+
+The census counts these as "native", and they are, but a user CAN tell them
+from the Linux ones:
+
+- `awk` (programs/awk, 313 lines): no `$NF`, no `?:`, no `sub()`/`gsub()`,
+  and a `$1=="x"` pattern does not select. Every one of these silently
+  produced wrong output in a gate fixture before the fixtures were rewritten
+  with sed/cut/grep. A real awk (or porting one-true-awk) is a full item.
+- `sed`: a bracket class in `s/^default via \([0-9.]*\) .*/\1/p` returned
+  the whole rest of the line, not the capture. Bracket expressions need a
+  look.
+- `grep` has no `-m`. `ls -l` prints a synthetic link count (1 for files,
+  2 for directories) because libtoby's `stat` carries no `st_nlink`,
+  `st_ino` or `st_dev` -- `test -ef` is path equality for the same reason.
+- `tail -1 FILE` was observed printing nothing for a file written with
+  `> f 2>&1` once (gate run 6, `/tmp/tn2.out`, 122 bytes); the diagnostic
+  section `diag_redir` in etc/distro_test.sh could not reproduce it. Left
+  as a note.
+
+**Proof when closed:** the same fixtures, written the natural awk/sed way,
+still pass; busybox and native agree on the census's awk/sed one-liners.
 
 ---
 
