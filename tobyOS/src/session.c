@@ -40,6 +40,7 @@
 #define LOGIN_PROGRAM_PATH "/bin/login"
 
 static struct {
+    uint64_t login_epoch_s;   /* since= in SYS_SESSION_INFO */
     int  id;
     bool active;
     char username[SESSION_USER_MAX];
@@ -165,6 +166,7 @@ void session_get_info(struct session_info *out) {
     out->active = g.active;
     out->uid    = g.active ? g.uid : 0;
     out->gid    = g.active ? g.gid : 0;
+    out->since_epoch_s = g.active ? g.login_epoch_s : 0;
     copy_capped(out->username, g.username, SESSION_USER_MAX);
 }
 
@@ -220,6 +222,8 @@ int session_login(const char *username, const char *password) {
      * automatically de-tagged from the new session. */
     g.id += 1;
     g.active = true;
+    { extern uint64_t lx_realtime_ns(void);
+      g.login_epoch_s = lx_realtime_ns() / 1000000000ull; }
     g.uid    = u->uid;
     g.gid    = u->gid;
     copy_capped(g.username, u->name, SESSION_USER_MAX);

@@ -57,6 +57,14 @@ int     link   (const char *oldpath, const char *newpath);
 int     symlink(const char *target, const char *linkpath);
 ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 
+/* tobyOS-specific (2026-09-04): per-socket options and the ARP cache, for
+ * traceroute and arping. Linux spells these setsockopt(IP_TTL) and
+ * /proc/net/arp + raw ethernet; the native ABI has neither, so these are the
+ * two small calls the tools actually need. */
+int toby_sockopt(int fd, int opt, long val);
+int toby_arp_resolve(unsigned int ip_be, unsigned char mac[6]);   /* 0, or -1 */
+int toby_arp_request(unsigned int ip_be);
+
 int     setpgid(pid_t pid, pid_t pgid);
 pid_t   getpgid(pid_t pid);
 pid_t   getpgrp(void);

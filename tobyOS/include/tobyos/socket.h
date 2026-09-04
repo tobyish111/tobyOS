@@ -178,6 +178,9 @@ struct sock {
      * re-checks, because a socket cannot change owner. */
     uint8_t          raw_proto;
     uint8_t          raw_is_packet;
+    uint8_t          ip_ttl;        /* 0 = IP_DEFAULT_TTL; else the TTL this
+                                       socket's datagrams leave with
+                                       (ABI_SOCKOPT_IP_TTL, for traceroute) */
 
     /* TCP: wrapped kernel connection. */
     struct tcp_conn *tcp;
@@ -392,6 +395,9 @@ void sock_deliver_raw(uint32_t src_ip_be, uint8_t proto,
 void sock_deliver_packet(const void *frame, size_t len);
 int  sock_any_packet_listener(void);
 int  sock_any_raw_listener(void);
+
+/* Native ABI_SYS_SOCKOPT: set one per-socket option. 0 or -ABI_E*. */
+long sock_setopt(struct sock *s, int opt, long val);
 
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be);

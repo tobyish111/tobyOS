@@ -21,6 +21,11 @@
 
 bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
               const void *payload, size_t payload_len) {
+    return udp_send_ttl(src_port_be, dst_ip_be, dst_port_be, payload, payload_len, 0);
+}
+
+bool udp_send_ttl(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
+                  const void *payload, size_t payload_len, uint8_t ttl) {
     if (payload_len > 65535u - UDP_HDR_LEN - IP_HDR_LEN) return false;
 
     size_t   udp_len = UDP_HDR_LEN + payload_len;
@@ -53,7 +58,7 @@ bool udp_send(uint16_t src_port_be, uint32_t dst_ip_be, uint16_t dst_port_be,
      * RFC 768 lets a sender opt out entirely -- do that for loops. */
     if ((dst_ip_be & 0xFFu) == 127u) h->checksum = 0;
 
-    bool ok = ip_send(dst_ip_be, IP_PROTO_UDP, buf, udp_len);
+    bool ok = ip_send_ttl(dst_ip_be, IP_PROTO_UDP, buf, udp_len, ttl);
     if (heap) kfree(buf);
     return ok;
 }

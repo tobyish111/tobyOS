@@ -52,6 +52,7 @@ struct session_info {
     char username[SESSION_USER_MAX];
     int  uid;
     int  gid;
+    uint64_t since_epoch_s;   /* wall-clock second the session logged in (who/uptime) */
 };
 
 /* Boot-time entry. Zeroes session state, registers + starts the login

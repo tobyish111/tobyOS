@@ -160,6 +160,7 @@ uint32_t net_my_gateway(void) {
 }
 
 bool net_is_up(void) { return g_net_up; }
+void net_set_up(bool up) { g_net_up = up; }
 
 bool net_boot_used_dhcp(void) { return g_net_boot_via_dhcp; }
 

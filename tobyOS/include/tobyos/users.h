@@ -91,6 +91,9 @@ bool users_check_password(const char *username, const char *password);
 
 /* Set (or clear) the password for username. Returns 0 on success. */
 int users_set_password(const char *username, const char *password);
+/* Remove an account from the table (2026-09-04, for userdel). 0, or -1 if
+ * absent. Root (uid 0) cannot be removed. Caller persists with users_save(). */
+int users_del(const char *username);
 
 /* Iterate the cache. cb is called once per registered user; return
  * value of cb is ignored. Used by the shell `users` command. */

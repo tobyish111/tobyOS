@@ -255,6 +255,7 @@ void net_service_tick(void);
 /* Did net_init() succeed? Kept so syscall stubs can reject cleanly
  * with -ENONET on systems where the e1000 wasn't present. */
 bool net_is_up(void);
+void net_set_up(bool up);   /* ABI_SYS_NETCFG op 4: `ip link set eth0 up|down` */
 
 /* True if net_init()'s DHCP handshake succeeded (IPv4 from lease, not the
  * static fallback). Unchanged by later net_dhcp_renew(); for bootlog only. */

@@ -1168,7 +1168,69 @@ struct abi_vizmap {
 #define ABI_CLOCK_REALTIME      0
 #define ABI_CLOCK_MONOTONIC     1
 
-#define ABI_SYS_NR_MAX          207
+/* ---- Native-parity batch (2026-09-04): what the last 46 busybox-only
+ * utilities needed from the kernel that no native program could reach. */
+#define ABI_SYS_BLK_WRITE       208  /* (name, lba, buf, nsectors) -> 0|-E.
+                                        ROOT ONLY, and REFUSED (-EBUSY) for a
+                                        device backing a live mount: mkfs on
+                                        /data through this is a bug, not a
+                                        feature. Mirrors BLK_READ. */
+#define ABI_SYS_LINK            209  /* (oldpath, newpath) -> 0|-E: a HARD
+                                        link. tobyfs/tmpfs/ramfs carry it;
+                                        -EPERM where the fs cannot. */
+#define ABI_SYS_SETPASSWD       210  /* (user, newpw, oldpw) -> 0|-E. Root
+                                        sets anyone's (oldpw ignored); a user
+                                        sets ONLY their own and must present
+                                        the old one (-EACCES otherwise). */
+#define ABI_SYS_SOCKOPT         211  /* (fd, opt, val) -> 0|-E */
+#define ABI_SOCKOPT_IP_TTL      1    /* val 1..255: the IP TTL this socket's
+                                        datagrams leave with. traceroute. */
+#define ABI_SYS_ARP             212  /* (op, ip_be, mac6) -> 0|-E
+                                        op 0: resolve from the cache into mac6
+                                              (-ENOENT if absent)
+                                        op 1: send an ARP request for ip_be
+                                        op 2: (index, struct abi_arp_entry*)
+                                              -- cache slot #index; -ENOENT
+                                              past the end, valid=0 if empty
+                                        op 3: delete the entry for ip_be
+                                        op 4: set a static entry (ip_be, mac6)
+                                        op 5: (ip_be, mac6) resolve, PUMPING the
+                                              NIC once -- fills mac6 from the
+                                              cache, or on a miss sends a request,
+                                              drains the RX ring and tries again;
+                                              -ENOENT if still unresolved. The
+                                              caller loops this with a short
+                                              sleep (the wait stays in userspace,
+                                              never spinning the NIC under the BKL).
+                                        ops 1, 3, 4 are root only. */
+struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _pad; };
+
+#define ABI_SYS_NETCFG          213  /* (op, a, b, c) -> 0|-E. ROOT ONLY.
+                                        op 0: set address  (ip_be, mask_be)
+                                        op 1: set gateway  (gw_be)
+                                        op 2: route add    (dst_be, mask_be, gw_be)
+                                        op 3: route del    (dst_be, mask_be)
+                                        op 4: link up/down (1|0)
+                                        op 5: get MAC into mac6 (any uid)
+                                        The native `ip`/`route` setters; the
+                                        Linux personality reaches the same
+                                        kernel state through rtnetlink. */
+#define ABI_SYS_USERADD         214  /* (op, name, uid, gid) -> 0|-E. ROOT ONLY.
+                                        op 0: add the account to the KERNEL's
+                                              authentication database
+                                              (-EEXIST if the name or uid is taken)
+                                        op 1: delete it (-ENOENT if absent)
+                                        useradd/userdel wrote only /etc/passwd
+                                        before 2026-09-04; the kernel kept a
+                                        separate table that only a shell
+                                        builtin could add to, so a useradd'd
+                                        user could never authenticate. */
+#define ABI_SYS_GETRUID         215  /* () -> the caller's REAL uid. getuid
+                                        returns the EFFECTIVE uid, which a
+                                        setuid-root exec has already set to 0;
+                                        su must ask "was the INVOKER root?"
+                                        before it decides to skip the password. */
+#define ABI_SYS_NR_MAX          215
 
 /* ============================================================
  *  Structured logging (Milestone 28A)

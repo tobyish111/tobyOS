@@ -805,6 +805,12 @@ install-img: $(INSTALL_IMG)
 src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 
+# Loadable kernel modules: ET_REL objects built with the kernel's own flags
+# and never linked -- src/module.c relocates them against the ksym table at
+# insmod time. Staged under /lib/modules for insmod/modprobe/lsmod/rmmod.
+modules/%.ko: modules/%.c $(HEADERS) Makefile
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # C14b: kfont.c runs stb_truetype's floating-point math, so it must be built
 # with SSE (overriding the kernel's default -mno-sse). The FP usage is bracketed
 # by an FXSAVE/FXRSTOR guard (kfpu_begin/end) so the calling user process's live
@@ -2943,7 +2949,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
                $(HELLOAPP_TPKG_SIG_TAMPER) \
                $(HELLOAPP_TPKG_CAPS_RO) \
                initrd/m36/m36_part2.c initrd/m36/m36_sample.c initrd/m36/Tobyfile \
-               $(SHPARITY_CASES)
+               $(SHPARITY_CASES) modules/hello.ko
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
@@ -3420,6 +3426,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp $(PORTS_SBASE_DIR)/sort.elf                      $(INITRD_STAGE)/bin/sort
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
+	mkdir -p $(INITRD_STAGE)/lib/modules
+	cp modules/hello.ko                               $(INITRD_STAGE)/lib/modules/hello.ko
 	cp $(HELLOAPP_TPKG)                               $(INITRD_STAGE)/repo/helloapp.tpkg
 	cp $(HELLOAPP_TPKG_V2)                            $(INITRD_STAGE)/repo/helloapp_v2.tpkg
 	# M34A fixtures: deliberately-broken cousins of helloapp.tpkg used
@@ -4087,6 +4095,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/sed_test.sh                                                   \
 	    etc/procnet_test.sh                                               \
 	    etc/power_test.sh                                                 \
+	    lib/modules/hello.ko                                              \
 	    bin/user_admin bin/useradd bin/userdel bin/usermod bin/groupadd    \
 	    bin/groupdel bin/groupmod bin/gpasswd bin/chsh bin/chfn bin/chage  \
 	    bin/vipw bin/vigr                                                  \

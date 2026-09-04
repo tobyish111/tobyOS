@@ -249,6 +249,14 @@
 #define SYS_NANOSLEEP      ABI_SYS_NANOSLEEP
 #define SYS_CLOCK_MS       ABI_SYS_CLOCK_MS
 #define SYS_CLOCK_NS       ABI_SYS_CLOCK_NS
+#define SYS_BLK_WRITE      ABI_SYS_BLK_WRITE
+#define SYS_LINK           ABI_SYS_LINK
+#define SYS_SETPASSWD      ABI_SYS_SETPASSWD
+#define SYS_SOCKOPT        ABI_SYS_SOCKOPT
+#define SYS_ARP            ABI_SYS_ARP
+#define SYS_NETCFG         ABI_SYS_NETCFG
+#define SYS_USERADD        ABI_SYS_USERADD
+#define SYS_GETRUID        ABI_SYS_GETRUID
 #define SYS_ABI_VERSION    ABI_SYS_ABI_VERSION
 
 /* --- Milestone 31: desktop notifications -------------------------- *

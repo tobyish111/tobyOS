@@ -182,8 +182,13 @@ static inline void invlpg(uint64_t addr) {
 
 /* ---- Main page fault handler ---- */
 
+/* Every #PF that reaches the handler, for /proc/vmstat's pgfault. */
+static uint64_t g_pf_total;
+uint64_t page_fault_total(void) { return g_pf_total; }
+
 bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
                         struct proc *p) {
+    g_pf_total++;
     if (!p) return false;
 
     /* Slice 88: serialize with CoW-fork STW -- do not promote/copy pages

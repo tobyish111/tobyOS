@@ -36,6 +36,9 @@
 #include <tobyos/perf.h>      /* boot_id derivation */
 #include <tobyos/percpu.h>    /* MAX_CPUS: the per-CPU jiffy table */
 #include <tobyos/rtc.h>       /* btime */
+#include <tobyos/module.h>    /* /proc/modules */
+#include <tobyos/arp.h>       /* /proc/net/arp */
+#include <tobyos/net.h>       /* /proc/net/route */
 
 /* Describe an open file for /proc/<pid>/fd/<n> readlink: a real path where we
  * have one, else the Linux-style synthetic target (pipe:[..], socket:[..],
@@ -803,6 +806,10 @@ static int gen_sys(const char *rest, char *buf, size_t cap) {
 /* /proc/net -- the tables ifconfig/netstat/ss read (2026-08-22; there was
  * NO /proc/net at all, so every one of them was blind). Rows come from
  * the REAL conn/socket pools via read-only snapshots. */
+/* defined below, after the per-file generators */
+static int gen_net_route(char *buf, size_t cap);
+static int gen_net_arp(char *buf, size_t cap);
+
 static int gen_net(const char *rest, char *buf, size_t cap) {
     int off = 0;
     char h32[9], h16[5];
@@ -811,6 +818,8 @@ static int gen_net(const char *rest, char *buf, size_t cap) {
         if ((size_t)off + sl >= cap) { buf[off] = 0; return off; } \
         memcpy(buf + off, s, sl); off += (int)sl; } while (0)
 
+    if (strcmp(rest, "route") == 0) return gen_net_route(buf, cap);
+    if (strcmp(rest, "arp") == 0)   return gen_net_arp(buf, cap);
     if (strcmp(rest, "dev") == 0) {
         NET_STR("Inter-|   Receive                            "
                 "                    |  Transmit\n");
@@ -1100,6 +1109,151 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
     #undef APPEND_INT
 }
 
+/* /proc/modules -- Linux's format: name size refcount deps state address.
+ * The module loader has been real since it was written; this is the first
+ * thing that reads its table from userspace (lsmod). */
+static int gen_modules(char *buf, size_t cap) {
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    for (int i = 0; i < MODULE_MAX; i++) {
+        const struct loaded_module *m = module_slot(i);
+        if (!m || !m->in_use) continue;
+        APPEND_STR(m->name); APPEND_STR(" ");
+        APPEND_U64(m->size); APPEND_STR(" 0 - ");
+        APPEND_STR(m->initialized ? "Live" : "Loading");
+        APPEND_STR(" 0x");
+        { char hx[20]; hex_to_str(hx, sizeof hx, (uint64_t)(uintptr_t)m->base); APPEND_STR(hx); }
+        APPEND_STR("\n");
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_U64
+}
+
+/* /proc/vmstat -- the handful of counters procps's vmstat -s and free read.
+ * Page-fault totals come from the #PF handler; swap-ins from the reclaim
+ * path (swap-OUT has no production caller, so pswpout is honestly 0). */
+static int gen_vmstat(char *buf, size_t cap) {
+    extern uint64_t page_fault_total(void);
+    extern uint64_t reclaim_stat_faulted_back(void);
+    int off = 0;
+    char tmp[24];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    #define APPEND_U64(v) do { uint_to_str(tmp, sizeof(tmp), (uint64_t)(v)); APPEND_STR(tmp); } while (0)
+    APPEND_STR("nr_free_pages "); APPEND_U64(pmm_free_pages()); APPEND_STR("\n");
+    APPEND_STR("nr_pages_total "); APPEND_U64(pmm_total_pages()); APPEND_STR("\n");
+    APPEND_STR("pgfault "); APPEND_U64(page_fault_total()); APPEND_STR("\n");
+    APPEND_STR("pgmajfault "); APPEND_U64(reclaim_stat_faulted_back()); APPEND_STR("\n");
+    APPEND_STR("pswpin "); APPEND_U64(reclaim_stat_faulted_back()); APPEND_STR("\n");
+    APPEND_STR("pswpout 0\n");
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+    #undef APPEND_U64
+}
+
+/* One IPv4 address as eight little-endian hex digits, the way Linux prints
+ * them in /proc/net/route (the address is stored in network order and the
+ * kernel dumps its bytes as a host-order word). */
+static void route_hex(uint32_t ip_be, char *out) {
+    static const char *hx = "0123456789ABCDEF";
+    /* Linux prints the 32-bit word in host byte order; on x86 that reverses
+     * the bytes of the network-order address: 10.0.2.2 -> 0202000A. */
+    uint32_t v = ip_be;
+    for (int i = 7; i >= 0; i--) { out[i] = hx[v & 0xF]; v >>= 4; }
+    out[8] = '\0';
+}
+
+static int gen_net_route(char *buf, size_t cap) {
+    int off = 0;
+    char h[9];
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    APPEND_STR("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
+    uint32_t ip = net_my_ip(), mask = net_my_netmask(), gw = net_my_gateway();
+    if (gw) {
+        /* default route: destination 0, gateway set, flags UG (0003) */
+        APPEND_STR("eth0\t00000000\t"); route_hex(gw, h); APPEND_STR(h);
+        APPEND_STR("\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+    }
+    if (ip && mask) {
+        APPEND_STR("eth0\t"); route_hex(ip & mask, h); APPEND_STR(h);
+        APPEND_STR("\t00000000\t0001\t0\t0\t0\t"); route_hex(mask, h); APPEND_STR(h);
+        APPEND_STR("\t0\t0\t0\n");
+    }
+    /* routes added to the initial namespace's table (ip route add, route
+     * add): skip the two synthesized above so nothing prints twice */
+    {
+        struct proc *me = current_proc();
+        void *ns = me ? me->net_ns : NULL;
+        for (size_t i = 0; ; i++) {
+            uint32_t rd, rm, rg; struct net_dev *dev;
+            if (!net_ns_route_at(ns, i, &rd, &rm, &rg, &dev)) break;
+            if (rd == 0 && rm == 0 && gw && rg == gw) continue;
+            if (mask && rm == mask && rd == (ip & mask) && rg == 0) continue;
+            APPEND_STR("eth0\t"); route_hex(rd, h); APPEND_STR(h); APPEND_STR("\t");
+            route_hex(rg, h); APPEND_STR(h);
+            APPEND_STR(rg ? "\t0003\t0\t0\t0\t" : "\t0001\t0\t0\t0\t");
+            route_hex(rm, h); APPEND_STR(h);
+            APPEND_STR("\t0\t0\t0\n");
+        }
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+}
+
+static int gen_net_arp(char *buf, size_t cap) {
+    int off = 0;
+    #define APPEND_STR(s) do { size_t sl = strlen(s); \
+        if ((size_t)off + sl >= cap) return off; \
+        memcpy(buf + off, s, sl); off += (int)sl; } while (0)
+    APPEND_STR("IP address       HW type     Flags       HW address            Mask     Device\n");
+    for (int i = 0; i < arp_cache_capacity(); i++) {
+        uint32_t ip; uint8_t mac[6];
+        if (!arp_cache_entry(i, &ip, mac)) continue;
+        char line[96];
+        char ipd[16];
+        {   /* dotted quad, padded to the 17-column field Linux uses */
+            unsigned b0 = ip & 0xFF, b1 = (ip >> 8) & 0xFF, b2 = (ip >> 16) & 0xFF, b3 = (ip >> 24) & 0xFF;
+            int n = 0;
+            unsigned parts[4] = { b0, b1, b2, b3 };
+            for (int k = 0; k < 4; k++) {
+                char d[4]; int dn = 0; unsigned v = parts[k];
+                do { d[dn++] = (char)('0' + v % 10); v /= 10; } while (v);
+                while (dn) ipd[n++] = d[--dn];
+                if (k < 3) ipd[n++] = '.';
+            }
+            ipd[n] = '\0';
+        }
+        static const char *hx = "0123456789abcdef";
+        int n = 0;
+        for (const char *p = ipd; *p; p++) line[n++] = *p;
+        while (n < 17) line[n++] = ' ';
+        const char *mid = "0x1         0x2         ";
+        for (const char *p = mid; *p; p++) line[n++] = *p;
+        for (int k = 0; k < 6; k++) {
+            line[n++] = hx[mac[k] >> 4]; line[n++] = hx[mac[k] & 0xF];
+            if (k < 5) line[n++] = ':';
+        }
+        const char *tail = "     *        eth0\n";
+        for (const char *p = tail; *p; p++) line[n++] = *p;
+        line[n] = '\0';
+        APPEND_STR(line);
+    }
+    buf[off] = '\0';
+    return off;
+    #undef APPEND_STR
+}
+
 /* ---- VFS driver ---- */
 
 /* Slice 11: which writable procfs file a handle refers to (PW_NONE for the
@@ -1134,6 +1288,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                                         if (len < 0) return VFS_ERR_NOENT; }
     else if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
     else if (strcmp(rel, "meminfo") == 0) { len = gen_meminfo(buf, sizeof(buf)); }
+    else if (strcmp(rel, "modules") == 0) { len = gen_modules(buf, sizeof(buf)); }
+    else if (strcmp(rel, "vmstat") == 0)  { len = gen_vmstat(buf, sizeof(buf)); }
     else if (strcmp(rel, "version") == 0) { len = gen_version(buf, sizeof(buf)); }
     else if (strcmp(rel, "cpuinfo") == 0) { len = gen_cpuinfo(buf, sizeof(buf)); }
     else if (strcmp(rel, "loadavg") == 0) { len = gen_loadavg(buf, sizeof(buf)); }
@@ -1588,8 +1744,10 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                                          "cpuinfo", "loadavg", "stat",
                                          "mounts", "self",
                                          /* slice 6 */
-                                         "filesystems", "devices" };
-        const int nglobals = 10;
+                                         "filesystems", "devices",
+                                         /* native-parity batch */
+                                         "modules", "vmstat" };
+        const int nglobals = 12;
         if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);

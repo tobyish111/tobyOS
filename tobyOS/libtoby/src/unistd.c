@@ -349,13 +349,15 @@ int rename(const char *oldpath, const char *newpath) {
 
 /* ---- link / symlink / readlink ---------------------------------- *
  *
- * link() still stubs (hard links not implemented in tobyfs).
+ * link() reaches ABI_SYS_LINK (native-parity batch, 2026-09-04).
  * symlink/readlink use the kernel's SYS_SYMLINK/SYS_READLINK. */
 
 int link(const char *oldpath, const char *newpath) {
-    (void)oldpath; (void)newpath;
-    errno = ENOSYS;
-    return -1;
+    /* ABI_SYS_LINK (2026-09-04): a real hard link where the filesystem has
+     * inode indirection (tobyfs, tmpfs); -EPERM where it cannot, which is
+     * exactly Linux's answer on FAT. This stubbed ENOSYS for years. */
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_LINK, (long)(uintptr_t)oldpath, (long)(uintptr_t)newpath));
 }
 
 int symlink(const char *target, const char *linkpath) {
@@ -436,4 +438,17 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, void *src_out) {
     return (ssize_t)__toby_check(
         toby_sc4(ABI_SYS_RECVFROM, sockfd, (long)(uintptr_t)buf,
                  (long)len, (long)(uintptr_t)src_out));
+}
+
+int toby_sockopt(int fd, int opt, long val) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_SOCKOPT, (long)fd, (long)opt, val));
+}
+
+int toby_arp_resolve(unsigned int ip_be, unsigned char mac[6]) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_ARP, 0, (long)ip_be,
+                                      (long)(uintptr_t)mac));
+}
+
+int toby_arp_request(unsigned int ip_be) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_ARP, 1, (long)ip_be, 0));
 }

@@ -221,6 +221,18 @@ int users_add(const char *name, int uid, int gid) {
     return 0;
 }
 
+int users_del(const char *username) {
+    if (!username || !username[0]) return -1;
+    for (int i = 0; i < g_count; i++) {
+        if (strcmp(g_users[i].name, username) != 0) continue;
+        if (g_users[i].uid == 0) return -1;
+        for (int k = i + 1; k < g_count; k++) g_users[k - 1] = g_users[k];
+        g_count--;
+        return 0;
+    }
+    return -1;
+}
+
 void users_visit(users_visit_fn cb, void *ctx) {
     if (!cb) return;
     for (int i = 0; i < g_count; i++) cb(&g_users[i], ctx);

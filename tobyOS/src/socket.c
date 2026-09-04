@@ -996,6 +996,19 @@ int sock_any_packet_listener(void) {
     return 0;
 }
 
+long sock_setopt(struct sock *s, int opt, long val) {
+    if (!s) return -ABI_EBADF;
+    switch (opt) {
+    case ABI_SOCKOPT_IP_TTL:
+        if (val < 1 || val > 255) return -ABI_EINVAL;
+        if (s->kind != SOCK_KIND_UDP && s->kind != SOCK_KIND_RAW) return -ABI_EINVAL;
+        s->ip_ttl = (uint8_t)val;
+        return 0;
+    default:
+        return -ABI_EINVAL;
+    }
+}
+
 long sock_sendto(struct sock *s, const void *buf, size_t len,
                  uint32_t dst_ip_be, uint16_t dst_port_be) {
     if (!cap_check(current_proc(), CAP_NET, "sock_sendto")) return -1;
@@ -1013,9 +1026,9 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
         /* No port and no ephemeral bind: the payload IS the L4 packet and
          * the kernel supplies only the IP header. */
         struct net_ctx rprev = net_ctx_enter(s->net_ns, 0);
-        bool rsent = ip_send(dst_ip_be,
-                             s->raw_proto ? s->raw_proto : IPPROTO_RAW,
-                             buf, len);
+        bool rsent = ip_send_ttl(dst_ip_be,
+                                 s->raw_proto ? s->raw_proto : IPPROTO_RAW,
+                                 buf, len, s->ip_ttl);
         net_ctx_leave(rprev);
         return rsent ? (long)len : -3;
     }
@@ -1040,7 +1053,7 @@ long sock_sendto(struct sock *s, const void *buf, size_t len,
      * that knows -- udp.c's other callers (DHCP, DNS, mDNS, NTP, QUIC) are host
      * services and correctly get the initial namespace by default. */
     struct net_ctx nprev = net_ctx_enter(s->net_ns, 0);
-    bool sent = udp_send(s->local_port, dst_ip_be, dst_port_be, buf, len);
+    bool sent = udp_send_ttl(s->local_port, dst_ip_be, dst_port_be, buf, len, s->ip_ttl);
     net_ctx_leave(nprev);
     if (!sent) return -3;
     return (long)len;

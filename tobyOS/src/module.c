@@ -6,10 +6,14 @@
  */
 
 #include <tobyos/module.h>
+#include <tobyos/proc.h>
+#include <tobyos/abi/abi.h>
 #include <tobyos/elf.h>
 #include <tobyos/vfs.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/heap.h>
+#include <tobyos/vmm.h>
+#include <tobyos/pmm.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pci.h>
@@ -93,6 +97,11 @@ void module_init(void) {
             MODULE_MAX);
 }
 
+const struct loaded_module *module_slot(int i) {
+    if (i < 0 || i >= MODULE_MAX) return NULL;
+    return &g_modules[i];
+}
+
 struct loaded_module *module_find(const char *name) {
     for (int i = 0; i < MODULE_MAX; i++) {
         if (g_modules[i].in_use && strcmp(g_modules[i].name, name) == 0)
@@ -125,6 +134,56 @@ static const char *shdr_name(const Elf64_Ehdr *ehdr, const uint8_t *data,
 /* ================================================================
  *  ELF ET_REL loader
  * ================================================================ */
+
+/* ================================================================
+ *  Executable module memory (2026-09-04)
+ *
+ *  The heap is mapped NX, and a module is CODE: the first real module ever
+ *  loaded (hello.ko, from /lib/modules at boot) faulted on its first
+ *  instruction fetch. Modules are built -mcmodel=kernel like the kernel, so
+ *  their PC32/32S relocations only reach the top 2 GiB: the window sits
+ *  1 GiB above the kernel image, one 2 MiB slot per module, backed by PMM
+ *  pages mapped writable+executable, supervisor only.
+ * ================================================================ */
+#define MODULE_VA_BASE   0xffffffffc0000000ull
+#define MODULE_VA_STRIDE (2ull << 20)
+static bool g_va_used[MODULE_MAX];
+
+static void module_free_exec(void *base, uint64_t *pages, size_t npages, int va_slot) {
+    if (base && npages) {
+        vmm_unmap((uint64_t)(uintptr_t)base, npages * PAGE_SIZE);
+        for (size_t i = 0; i < npages; i++) if (pages && pages[i]) pmm_free_page(pages[i]);
+    }
+    if (pages) kfree(pages);
+    if (va_slot >= 0 && va_slot < MODULE_MAX) g_va_used[va_slot] = false;
+}
+
+static void *module_alloc_exec(size_t bytes, uint64_t **pages_out, size_t *npages_out, int *va_slot_out) {
+    *pages_out = NULL; *npages_out = 0; *va_slot_out = -1;
+    if (bytes == 0 || bytes > MODULE_VA_STRIDE) return NULL;
+    int slot = -1;
+    for (int i = 0; i < MODULE_MAX; i++) if (!g_va_used[i]) { slot = i; break; }
+    if (slot < 0) return NULL;
+    size_t npages = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t *pages = (uint64_t *)kmalloc(npages * sizeof(uint64_t));
+    if (!pages) return NULL;
+    memset(pages, 0, npages * sizeof(uint64_t));
+    uint64_t va = MODULE_VA_BASE + (uint64_t)slot * MODULE_VA_STRIDE;
+    for (size_t i = 0; i < npages; i++) {
+        uint64_t phys = pmm_alloc_page();
+        if (!phys || !vmm_map(va + i * PAGE_SIZE, phys, PAGE_SIZE, VMM_WRITE)) {
+            if (phys) pmm_free_page(phys);
+            if (i) { vmm_unmap(va, i * PAGE_SIZE); for (size_t k = 0; k < i; k++) pmm_free_page(pages[k]); }
+            kfree(pages);
+            return NULL;
+        }
+        pages[i] = phys;
+    }
+    g_va_used[slot] = true;
+    memset((void *)(uintptr_t)va, 0, npages * PAGE_SIZE);
+    *pages_out = pages; *npages_out = npages; *va_slot_out = slot;
+    return (void *)(uintptr_t)va;
+}
 
 int module_load(const char *path) {
     void  *filedata = NULL;
@@ -188,6 +247,7 @@ int module_load(const char *path) {
     }
 
     /* --- Calculate total size needed for ALLOC sections --- */
+    /* (the executable window allocator lives above; see module_alloc_exec) */
     const Elf64_Shdr *shdrs = (const Elf64_Shdr *)(data + ehdr->e_shoff);
     size_t total_alloc = 0;
 
@@ -206,19 +266,19 @@ int module_load(const char *path) {
         return -1;
     }
 
-    /* Allocate kernel memory for the module code/data. */
-    uint8_t *mod_base = (uint8_t *)kmalloc(total_alloc);
+    /* Executable supervisor memory for the module code/data: NOT the heap. */
+    uint64_t *mod_pages = NULL; size_t mod_npages = 0; int va_slot = -1;
+    uint8_t *mod_base = (uint8_t *)module_alloc_exec(total_alloc, &mod_pages, &mod_npages, &va_slot);
     if (!mod_base) {
-        kprintf("[module] %s: failed to allocate %zu bytes\n", path, total_alloc);
+        kprintf("[module] %s: failed to allocate %lu bytes of executable memory\n", path, (unsigned long)total_alloc);
         kfree(filedata);
         return -1;
     }
-    memset(mod_base, 0, total_alloc);
 
     /* --- Per-section runtime addresses (for relocation resolution) --- */
     uint64_t *sec_addrs = (uint64_t *)kmalloc(shnum * sizeof(uint64_t));
     if (!sec_addrs) {
-        kfree(mod_base);
+        module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
         kfree(filedata);
         return -1;
     }
@@ -237,7 +297,7 @@ int module_load(const char *path) {
             if (shdrs[i].sh_offset + shdrs[i].sh_size > filesz) {
                 kprintf("[module] %s: section %u truncated\n", path, i);
                 kfree(sec_addrs);
-                kfree(mod_base);
+                module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
                 kfree(filedata);
                 return -1;
             }
@@ -262,7 +322,7 @@ int module_load(const char *path) {
     if (!symtab_sh || !symstrtab) {
         kprintf("[module] %s: no symbol table\n", path);
         kfree(sec_addrs);
-        kfree(mod_base);
+        module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
         kfree(filedata);
         return -1;
     }
@@ -291,7 +351,7 @@ int module_load(const char *path) {
                 kprintf("[module] %s: reloc sym index %u out of range\n",
                         path, sym_idx);
                 kfree(sec_addrs);
-                kfree(mod_base);
+                module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
                 kfree(filedata);
                 return -1;
             }
@@ -307,7 +367,7 @@ int module_load(const char *path) {
                     kprintf("[module] %s: unresolved symbol '%s'\n",
                             path, sym_name);
                     kfree(sec_addrs);
-                    kfree(mod_base);
+                    module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
                     kfree(filedata);
                     return -1;
                 }
@@ -324,7 +384,7 @@ int module_load(const char *path) {
                 kprintf("[module] %s: bad symbol section index %u\n",
                         path, sym->st_shndx);
                 kfree(sec_addrs);
-                kfree(mod_base);
+                module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
                 kfree(filedata);
                 return -1;
             }
@@ -354,7 +414,7 @@ int module_load(const char *path) {
                 kprintf("[module] %s: unsupported reloc type %u\n",
                         path, rel_type);
                 kfree(sec_addrs);
-                kfree(mod_base);
+                module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
                 kfree(filedata);
                 return -1;
             }
@@ -385,7 +445,13 @@ int module_load(const char *path) {
         const char *slash = path;
         for (const char *p = path; *p; p++)
             if (*p == '/') slash = p + 1;
-        mod_name = slash;
+        /* "hello.ko" is the FILE; the module is "hello" (lsmod, rmmod) */
+        static char nbuf[MODULE_NAME_MAX];
+        size_t nl = strlen(slash);
+        if (nl > 3 && strcmp(slash + nl - 3, ".ko") == 0) nl -= 3;
+        if (nl >= MODULE_NAME_MAX) nl = MODULE_NAME_MAX - 1;
+        memcpy(nbuf, slash, nl); nbuf[nl] = '\0';
+        mod_name = nbuf;
     }
 
     if (!mod_ver) mod_ver = "0.0";
@@ -396,7 +462,7 @@ int module_load(const char *path) {
         spin_unlock_irqrestore(&g_mod_lock, flags);
         kprintf("[module] %s: module '%s' already loaded\n", path, mod_name);
         kfree(sec_addrs);
-        kfree(mod_base);
+        module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
         kfree(filedata);
         return -1;
     }
@@ -406,7 +472,7 @@ int module_load(const char *path) {
         spin_unlock_irqrestore(&g_mod_lock, flags);
         kprintf("[module] %s: no free module slots\n", path);
         kfree(sec_addrs);
-        kfree(mod_base);
+        module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
         kfree(filedata);
         return -1;
     }
@@ -418,13 +484,16 @@ int module_load(const char *path) {
     slot->name[nlen] = '\0';
     slot->base   = mod_base;
     slot->size   = total_alloc;
+    slot->pages  = mod_pages;
+    slot->npages = mod_npages;
+    slot->va_slot = va_slot;
     slot->init   = mod_init_fn;
     slot->fini   = mod_fini_fn;
     slot->initialized = false;
     spin_unlock_irqrestore(&g_mod_lock, flags);
 
-    kprintf("[module] loaded '%s' v%s (%zu bytes at %p)\n",
-            slot->name, mod_ver, total_alloc, mod_base);
+    kprintf("[module] loaded '%s' v%s (%lu bytes at %p)\n",
+            slot->name, mod_ver, (unsigned long)total_alloc, mod_base);
 
     /* Call init function. */
     if (mod_init_fn) {
@@ -438,7 +507,7 @@ int module_load(const char *path) {
             flags = spin_lock_irqsave(&g_mod_lock);
             slot->in_use = false;
             spin_unlock_irqrestore(&g_mod_lock, flags);
-            kfree(mod_base);
+            module_free_exec(mod_base, mod_pages, mod_npages, va_slot);
             return -1;
         }
         slot->initialized = true;
@@ -466,13 +535,14 @@ int module_unload(const char *name) {
         m->fini();
 
     void *base = m->base;
+    uint64_t *pages = m->pages; size_t npages = m->npages; int va_slot = m->va_slot;
     kprintf("[module] unloaded '%s'\n", m->name);
     m->in_use = false;
     m->initialized = false;
-    m->base = NULL;
+    m->base = NULL; m->pages = NULL; m->npages = 0; m->va_slot = -1;
     spin_unlock_irqrestore(&g_mod_lock, flags);
 
-    kfree(base);
+    module_free_exec(base, pages, npages, va_slot);
     return 0;
 }
 
@@ -539,19 +609,36 @@ void module_list(void) {
  * ================================================================ */
 
 long sys_module(uint64_t op, uint64_t arg1, uint64_t arg2) {
+    /* A module is ring-0 code relocated against the kernel symbol table.
+     * Loading one is exactly as privileged as the kernel itself; before
+     * 2026-09-04 any uid could insmod. */
+    { struct proc *me = current_proc();
+      if (!me || me->uid != 0) return -ABI_EPERM; }
     (void)arg2;
     switch (op) {
     case 0: {
         char kpath[VFS_PATH_MAX];
         if (strncpy_from_user(kpath, (const char *)(uintptr_t)arg1,
                               sizeof(kpath)) < 0) return -1;
-        return module_load(kpath);
+        {   /* the errno insmod/modprobe report: EEXIST, ENOENT, EINVAL */
+            const char *slash = kpath;
+            for (const char *p = kpath; *p; p++) if (*p == '/') slash = p + 1;
+            char nm[MODULE_NAME_MAX]; size_t nl = strlen(slash);
+            if (nl > 3 && strcmp(slash + nl - 3, ".ko") == 0) nl -= 3;
+            if (nl >= MODULE_NAME_MAX) nl = MODULE_NAME_MAX - 1;
+            memcpy(nm, slash, nl); nm[nl] = '\0';
+            if (module_find(nm)) return -ABI_EEXIST;
+            struct vfs_stat vs;
+            if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
+            return module_load(kpath) == 0 ? 0 : -ABI_EINVAL;
+        }
     }
     case 1: {
         char kname[MODULE_NAME_MAX];
         if (strncpy_from_user(kname, (const char *)(uintptr_t)arg1,
                               sizeof(kname)) < 0) return -1;
-        return module_unload(kname);
+        if (!module_find(kname)) return -ABI_ENOENT;
+        return module_unload(kname) == 0 ? 0 : -ABI_EBUSY;
     }
     case 2:
         module_list();

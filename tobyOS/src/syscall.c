@@ -76,6 +76,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/devtest.h>
 #include <tobyos/blk.h>
 #include <tobyos/provision.h>
+#include <tobyos/arp.h>        /* ABI_SYS_ARP */
 #include <tobyos/display.h>
 #include <tobyos/hotplug.h>
 #include <tobyos/slog.h>
@@ -1656,6 +1657,17 @@ static long sys_session_info(char *out, size_t cap) {
     while (*p3 && i < sizeof(buf) - 1) buf[i++] = *p3++;
     for (int j = 0; info.username[j] && i < sizeof(buf) - 1; j++) {
         buf[i++] = info.username[j];
+    }
+    /* since=<epoch seconds> (2026-09-04): who/users/uptime need a login
+     * time, and the console session is the only one the kernel tracks. */
+    const char *p4 = " since=";
+    while (*p4 && i < sizeof(buf) - 1) buf[i++] = *p4++;
+    {
+        char tmp[24]; int k = 0;
+        uint64_t v = info.since_epoch_s;
+        if (v == 0) tmp[k++] = '0';
+        while (v) { tmp[k++] = (char)('0' + v % 10u); v /= 10u; }
+        while (k && i < sizeof(buf) - 1) buf[i++] = tmp[--k];
     }
     if (i < sizeof(buf) - 1) buf[i++] = '\n';
     buf[i] = '\0';
@@ -4719,6 +4731,199 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_term_write((int)a1, (const void *)a2, (size_t)a3);
     case SYS_TERM_READ:
         return sys_term_read((int)a1, (void *)a2, (size_t)a3);
+    /* ---- native-parity batch (2026-09-04) ---------------------------- */
+
+    case ABI_SYS_BLK_WRITE: {
+        /* Root only, like BLK_READ -- and REFUSED for a device that backs a
+         * live mount. mkfs.ext2 aimed at /data's device through this would
+         * be a silent filesystem wipe under a running kernel, which is the
+         * one thing a "write raw sectors" call must not be able to do by
+         * accident. Unmounted devices (the gate's scratch disk, a fresh USB
+         * stick) are exactly what mkfs/fsck/tune2fs are for. */
+        { struct proc *me = current_proc();
+          if (!me || me->uid != 0) return -ABI_EPERM; }
+        char name[ABI_BLK_NAME_MAX];
+        if (!user_str_in(name, sizeof(name), (const char *)a1)) return -ABI_EFAULT;
+        uint64_t lba = (uint64_t)a2;
+        uint32_t nsec = (uint32_t)a4;
+        if (nsec == 0 || nsec > 256u) return -ABI_EINVAL;
+        size_t bytes = (size_t)nsec * 512u;
+        if (!user_buf_ok((uint64_t)(uintptr_t)a3, bytes)) return -ABI_EFAULT;
+        struct blk_dev *d = blk_find(name);
+        if (!d) return -ABI_ENOENT;
+        const char *mp = NULL;
+        if (provision_dev_mounted(d, &mp)) return -ABI_EBUSY;
+        void *tmp = kmalloc(bytes);
+        if (!tmp) return -ABI_ENOMEM;
+        if (copy_from_user(tmp, (const void *)a3, bytes) != 0) { kfree(tmp); return -ABI_EFAULT; }
+        int rc = blk_write(d, lba, nsec, tmp);
+        kfree(tmp);
+        return rc == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_LINK: {
+        /* The Linux personality has had link(2) since Phase G; the native
+         * ABI never did, so /bin/link and `ln` (hard) could not exist. Same
+         * semantics: real where the fs has inode indirection (tobyfs, tmpfs),
+         * EPERM where it cannot. */
+        char kold[ABI_PATH_MAX], knew[ABI_PATH_MAX];
+        long orr = resolve_user_path((const char *)a1, kold, sizeof kold);
+        long nrr = resolve_user_path((const char *)a2, knew, sizeof knew);
+        if (orr != 0 || nrr != 0) return -ABI_ENOENT;
+        long lr = vfs_link(kold, knew);
+        if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
+        return vfs_err_to_abi(lr);
+    }
+
+    case ABI_SYS_SETPASSWD: {
+        /* (user, newpw, oldpw). Root sets anyone's password and the old one
+         * is not consulted. Anyone else may change ONLY their own, and only
+         * by presenting the current one -- the same contract passwd(1) has
+         * enforced since 1979, now available to a native /bin/passwd. Before
+         * this the ONLY way to change a password was the GUI login screen. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        char user[64], newpw[128], oldpw[128];
+        if (!user_str_in(user, sizeof(user), (const char *)a1)) return -ABI_EFAULT;
+        if (!user_str_in(newpw, sizeof(newpw), (const char *)a2)) return -ABI_EFAULT;
+        if (!user[0] || !newpw[0]) return -ABI_EINVAL;
+        const struct user *u = users_lookup_by_name(user);
+        if (!u) return -ABI_ENOENT;
+        if (me->uid != 0) {
+            if (u->uid != me->uid) return -ABI_EPERM;
+            if (!a3 || !user_str_in(oldpw, sizeof(oldpw), (const char *)a3))
+                return -ABI_EFAULT;
+            if (!users_check_password(user, oldpw)) return -ABI_EACCES;
+        }
+        int src = users_set_password(user, newpw);
+        return src == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_SOCKOPT: {
+        /* native sockets live in the file table: the socket table's index is
+         * NOT the fd (the first cut indexed it by fd and got EBADF) */
+        struct file *f = fd_lookup((int)a1);
+        if (!f || f->kind != FILE_KIND_SOCKET || !f->sock) return -ABI_EBADF;
+        return sock_setopt(f->sock, (int)a2, (long)a3);
+    }
+
+    case ABI_SYS_GETRUID: {
+        struct proc *p = current_proc();
+        return p ? (long)p->ruid : 0;
+    }
+
+    case ABI_SYS_USERADD: {
+        struct proc *me = current_proc();
+        if (!me || me->uid != 0) return -ABI_EPERM;
+        char name[64];
+        if (!user_str_in(name, sizeof(name), (const char *)a2)) return -ABI_EFAULT;
+        if (!name[0]) return -ABI_EINVAL;
+        int op = (int)a1;
+        if (op == 0) {
+            if (users_lookup_by_name(name) || users_lookup_by_uid((int)a3)) return -ABI_EEXIST;
+            if (users_add(name, (int)a3, (int)a4) != 0) return -ABI_ENOSPC;
+        } else if (op == 1) {
+            if (users_del(name) != 0) return -ABI_ENOENT;
+        } else return -ABI_EINVAL;
+        return users_save() == 0 ? 0 : -ABI_EIO;
+    }
+
+    case ABI_SYS_ARP: {
+        /* Native arping/arp. AF_PACKET sockets are receive-only in this
+         * kernel (the injection side was never built), so the ARP cache
+         * and the request sender are reached directly instead. */
+        int op = (int)a1;
+        if (op == 0) {
+            uint8_t mac[6];
+            if (!arp_resolve((uint32_t)a2, mac)) return -ABI_ENOENT;
+            if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        if (op == 1) {
+            if (!net_is_up()) return -ABI_EIO;
+            arp_request((uint32_t)a2);
+            return 0;
+        }
+        if (op == 5) {
+            /* Resolve, pumping the NIC once. On a miss send a request and
+             * drain the RX ring so the reply is actually processed -- the
+             * caller loops this with a userspace sleep. */
+            uint8_t mac[6];
+            if (arp_resolve((uint32_t)a2, mac)) {
+                if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+                return 0;
+            }
+            if (!net_is_up()) return -ABI_EIO;         /* net down */
+            arp_request((uint32_t)a2);
+            net_poll();
+            if (arp_resolve((uint32_t)a2, mac)) {
+                if (copy_to_user((void *)a3, mac, 6) != 0) return -ABI_EFAULT;
+                return 0;
+            }
+            return -ABI_ENOENT;
+        }
+        if (op == 3 || op == 4) {
+            struct proc *me = current_proc();
+            if (!me || me->uid != 0) return -ABI_EPERM;
+            if (op == 3) return arp_cache_delete((uint32_t)a2) ? 0 : -ABI_ENOENT;
+            uint8_t mac[6];
+            if (copy_from_user(mac, (const void *)a3, 6) != 0) return -ABI_EFAULT;
+            arp_cache_set((uint32_t)a2, mac);
+            return 0;
+        }
+        if (op == 2) {
+            struct abi_arp_entry e; uint32_t ip; uint8_t mac[6];
+            int idx = (int)a2;
+            if (idx < 0 || idx >= arp_cache_capacity()) return -ABI_ENOENT;
+            memset(&e, 0, sizeof e);
+            if (arp_cache_entry(idx, &ip, mac)) {
+                e.ip_be = ip; memcpy(e.mac, mac, 6); e.valid = 1;
+            }
+            if (copy_to_user((void *)a3, &e, sizeof e) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        return -ABI_EINVAL;
+    }
+
+    case ABI_SYS_NETCFG: {
+        struct proc *me = current_proc();
+        int op = (int)a1;
+        if (op == 5) {
+            /* get the interface MAC: read-only, any uid (ip link show) */
+            const uint8_t *mac = net_my_mac();
+            if (!mac || copy_to_user((void *)a2, mac, 6) != 0) return -ABI_EFAULT;
+            return 0;
+        }
+        if (!me || me->uid != 0) return -ABI_EPERM;
+        switch (op) {
+        case 0:
+            g_my_ip = (uint32_t)a2;
+            g_my_netmask = (uint32_t)a3;
+            return 0;
+        case 1:
+            g_gateway_ip = (uint32_t)a2;
+            return 0;
+        case 2: case 3: {
+            void *ns = me->net_ns;
+            uint32_t dst = (uint32_t)a2, mask = (uint32_t)a3, gw = (uint32_t)a4;
+            if (op == 3) return net_ns_route_del(ns, dst & mask, mask) ? 0 : -ABI_ENOENT;
+            struct net_dev *dev = NULL; uint32_t nh = 0;
+            if (gw) { struct net_dev *g = NULL; if (net_ns_route_lookup(ns, gw, &nh, &g)) dev = g; }
+            if (!dev) dev = net_ns_find_dev(ns, "eth0");
+            /* the initial namespace keeps its NIC in net.c, not in its
+             * interface table: fall back to the primary device */
+            if (!dev) dev = net_default();
+            if (!dev) return -ABI_ENODEV;
+            return net_ns_route_add(ns, dst & mask, mask, gw, dev) ? 0 : -ABI_ENOSPC;
+        }
+        case 4:
+            net_set_up(a2 != 0);
+            return 0;
+        default:
+            return -ABI_EINVAL;
+        }
+    }
+
     case ABI_SYS_BLK_READ: {
         /* Root only. Raw sectors are every byte of every filesystem on the
          * machine, including other users' files and the password database,

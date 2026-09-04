@@ -208,6 +208,12 @@ static bool ip_recv_maybe_reassemble(const struct ip_hdr *h,
 
 /* ---- send (with fragmentation) ----------------------------------- */
 
+/* Set for the duration of one ip_send_ttl(): every send runs under the BKL
+ * and the frame builder is the only reader, so a file-scope override is
+ * simpler (and no less correct) than threading a ttl through the fragment
+ * and routing layers. */
+static uint8_t g_ip_ttl_override;
+
 static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
                           const uint8_t mac[ETH_ADDR_LEN], uint16_t id_be,
                           uint16_t flags_frag_be, const void *payload,
@@ -221,7 +227,7 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
     h->total_len  = htons((uint16_t)(IP_HDR_LEN + payload_len));
     h->id         = id_be;
     h->flags_frag = htons(flags_frag_be);
-    h->ttl        = IP_DEFAULT_TTL;
+    h->ttl        = g_ip_ttl_override ? g_ip_ttl_override : IP_DEFAULT_TTL;
     h->proto      = proto;
     h->checksum   = 0;
     /* CUT 5: the SOURCE ADDRESS is namespace-relative.
@@ -246,6 +252,15 @@ static bool ip_send_frame(uint32_t dst_ip_be, uint8_t proto,
 
 static bool ip_send_routed(uint32_t dst_ip_be, uint32_t next_hop, uint8_t proto,
                            const void *payload, size_t payload_len);
+
+bool ip_send_ttl(uint32_t dst_ip_be, uint8_t proto,
+                 const void *payload, size_t payload_len, uint8_t ttl) {
+    uint8_t prev = g_ip_ttl_override;
+    g_ip_ttl_override = ttl;
+    bool ok = ip_send(dst_ip_be, proto, payload, payload_len);
+    g_ip_ttl_override = prev;
+    return ok;
+}
 
 bool ip_send(uint32_t dst_ip_be, uint8_t proto,
              const void *payload, size_t payload_len) {
