@@ -66,7 +66,18 @@ extern volatile struct limine_module_request module_req;
 /* Parse scratch: also the cap on a multi-line compound command joined
  * into one line by shell_run_script_text. Defined here rather than beside
  * SHELL_TOKEN_MAX because that reader runs long before that point. */
+/* The word/expansion buffer -- and so the most a $(...) can capture. It was
+ * 1 KiB in both builds, and `$(seq 512)` (1.9 KiB) came back "command
+ * substitution output truncated" with status 2 where bash has no cap at all.
+ * The hosted /bin/tsh runs on a user stack and gets 16 KiB; the in-kernel
+ * shell keeps 1 KiB because these are stack arrays on a 32 KiB kernel stack
+ * (fifty-two of them in this file). Growing them onto the heap is the next
+ * step; this one is what the conformance corpus needed. */
+#ifdef SHELL_HOSTED
+#define SHELL_PARSE_BUF_MAX (8 * 1024)     /* the Oils corpus needs ~2 KiB; nested subshells share a 256 KiB stack */
+#else
 #define SHELL_PARSE_BUF_MAX (LINE_MAX * 2)
+#endif
 /* Word-boundary marker planted by "$@" expansion; see
  * shell_append_positional_join(). Never appears in real shell text. */
 /* Descriptors the shell can hold open. POSIX requires at least 0..9, and
@@ -98,7 +109,16 @@ extern volatile struct limine_module_request module_req;
  * teaching those scans to step over IT changed the answer for words that had
  * no collision in them. 0x04 appears only where this puts it. */
 #define SHELL_DATA_ESC '\x04'
-#define ARG_MAX  32
+/* 256, not 32 (2026-09-04). `for i in $(seq 1 255)` -- the Oils suite's
+ * byte-matching case, and an ordinary shape of loop -- died with "too many
+ * arguments (max 32)". 256 keeps every char *argv[ARG_MAX] frame at 2 KiB,
+ * which the 32 KiB kernel stack the in-kernel shell runs on can carry; the
+ * real fix is a heap-grown argv, and this is the step before it. */
+#ifdef SHELL_HOSTED
+#define ARG_MAX  512       /* user stack (256 KiB): `set -- $(seq 1 255)` is 257 words */
+#else
+#define ARG_MAX  256
+#endif
 #define SHELL_ALIAS_MAX 32
 #define SHELL_FUNC_MAX 32
 #define SHELL_HEREDOC_MAX 4
@@ -11425,7 +11445,9 @@ struct shell_simple {
      * a variable called foo. The quoting is gone by the time argv exists, so
      * the answer has to be carried alongside it. ARG_MAX is 32, which is
      * exactly what fits here. */
-    unsigned arg_noassign;
+    /* one bit per argv slot: a `=` in the NAME position was quoted. This was
+     * a 32-bit mask shifted by argc -- silent nonsense past 32 arguments. */
+    unsigned char arg_noassign[(ARG_MAX + 7) / 8];
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -11633,6 +11655,14 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            int envc, char **envp,
                                            const struct proc_fd_map *extra,
                                            int nextra) {
+    /* AN EMPTY COMMAND NAME IS "command not found", status 127 -- bash's
+     * answer for `"$SH" -c x` with $SH unset. resolve_program("") walked
+     * PATH, joined "" onto each directory, landed on the directory itself
+     * and reported "Is a directory" with 126. Two Oils cases turned on it. */
+    if (!path_arg || !path_arg[0]) {
+        kprintf("tsh: : command not found\n");
+        return 127;
+    }
     char path_buf[64];
     const char *path = resolve_program(path_arg, path_buf, sizeof(path_buf));
 
@@ -16245,7 +16275,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                (*e >= '0' && *e <= '9') || *e == '_')
             e++;
         if (e > word && *e == SHELL_GLOB_ESC && e[1] == '=')
-            cur->arg_noassign |= (1u << cur->argc);
+            if (cur->argc < ARG_MAX) cur->arg_noassign[cur->argc >> 3] |= (unsigned char)(1u << (cur->argc & 7));
     }
     if (has_esc) {
         char plain[SHELL_PARSE_BUF_MAX];
@@ -17647,7 +17677,7 @@ static int shell_background_forked(const char *text, const char *label) {
 static int shell_run_single(struct shell_simple *cmd, bool background) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign & (1u << assignc)) &&
+           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -17808,7 +17838,7 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
                                           struct file *pipe_out) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign & (1u << assignc)) &&
+           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -17911,7 +17941,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign & (1u << assignc)) &&
+           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -18049,7 +18079,7 @@ static void cmd_env(int argc, char **argv) {
 static bool shell_stage_is_builtin(struct shell_simple *cmd) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign & (1u << assignc)) &&
+           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -20527,16 +20557,22 @@ static bool shell_try_subshell_command(const char *src) {
         }
     }
 
+    /* The redirection words live in `words` and `pl` for as long as the io
+     * frame needs them: `redirs = pl.stage[0]` copies POINTERS into these
+     * buffers, so they must outlive the block that fills them. They used to
+     * be block-local, and the dangling targets happened to survive until the
+     * parse buffers grew (2026-09-04) and the next frames overwrote them:
+     * `( echo sub ) > f` then opened '' -- "is a directory". */
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    struct shell_pipeline pl;
     if (*tail) {
-        struct shell_token tok[SHELL_TOKEN_MAX];
-        char words[SHELL_PARSE_BUF_MAX];
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
             return true;
         }
         int i = 0;
-        struct shell_pipeline pl;
         int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
         if (parsed < 0 || parsed == 0 || pl.count != 1 ||
             pl.stage[0].argc != 0) {
@@ -20682,16 +20718,22 @@ static bool shell_try_group_command(const char *src) {
         }
     }
 
+    /* The redirection words live in `words` and `pl` for as long as the io
+     * frame needs them: `redirs = pl.stage[0]` copies POINTERS into these
+     * buffers, so they must outlive the block that fills them. They used to
+     * be block-local, and the dangling targets happened to survive until the
+     * parse buffers grew (2026-09-04) and the next frames overwrote them:
+     * `( echo sub ) > f` then opened '' -- "is a directory". */
+    struct shell_token tok[SHELL_TOKEN_MAX];
+    char words[SHELL_PARSE_BUF_MAX];
+    struct shell_pipeline pl;
     if (*tail) {
-        struct shell_token tok[SHELL_TOKEN_MAX];
-        char words[SHELL_PARSE_BUF_MAX];
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
             return true;
         }
         int i = 0;
-        struct shell_pipeline pl;
         int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
         if (parsed < 0 || parsed == 0 || pl.count != 1 ||
             pl.stage[0].argc != 0) {
