@@ -1,0 +1,961 @@
+# id  code  class  file  case name
+0001  stdout-diff  BASH-ONLY  alias                     Usage of builtins
+0049  stdout-diff  BASH-ONLY  append                    Append string to string
+0051  both-diff    BASH-ONLY  append                    Append string to undefined variable
+0053  stdout-diff  BASH-ONLY  append                    error: s+=(my array)
+0054  stdout-diff  BASH-ONLY  append                    error: myarray+=s
+0055  stdout-diff  BASH-ONLY  append                    typeset s+=(my array)
+0056  stdout-diff  BASH-ONLY  append                    error: typeset myarray+=s
+0057  stdout-diff  BASH-ONLY  append                    error: append used like env prefix
+0060  both-diff    BASH-ONLY  append                    Try to append list to element
+0061  stdout-diff  BASH-ONLY  append                    Strings have value semantics, not reference semantics
+0062  both-diff    BASH-ONLY  append                    typeset s+=
+0063  both-diff    BASH-ONLY  append                    typeset s${dyn}+=
+0064  both-diff    BASH-ONLY  append                    export readonly +=
+0065  both-diff    BASH-ONLY  append                    local +=
+0066  stdout-diff  BASH-ONLY  append                    assign builtin appending array: declare d+=(d e)
+0067  stdout-diff  BASH-ONLY  append                    export+=array disallowed (strict_array)
+0099  exit-diff    BASH-ONLY  arith                     Constant with quotes like '1'
+0104  both-diff    BASH-ONLY  arith                     Integer constant parsing
+0111  stdout-diff  BASH-ONLY  arith                     Increment and decrement array elements
+0112  both-diff    BASH-ONLY  arith                     Increment undefined variables with nounset
+0117  stdout-diff  BASH-ONLY  arith                     Logical Ops Short Circuit
+0120  exit-diff    BASH-ONLY  arith                     No floating point
+0121  both-diff    BASH-ONLY  arith                     Array indexing in arith
+0122  both-diff    BASH-ONLY  arith                     Constants in base 36
+0123  both-diff    BASH-ONLY  arith                     Constants in bases 2 to 64
+0124  both-diff    BASH-ONLY  arith                     Multiple digit constants with base N
+0125  both-diff    BASH-ONLY  arith                     Dynamic base constants
+0131  stdout-diff  BASH-ONLY  arith                     Recursive name evaluation is a result of runtime parse/eval
+0132  both-diff    BASH-ONLY  arith                     nounset with arithmetic
+0136  stdout-diff  BASH-ONLY  arith                     Invalid LValue that looks like array
+0137  stdout-diff  BASH-ONLY  arith                     Invalid LValue: two sets of brackets
+0141  exit-diff    BASH-ONLY  arith                     Negative exponent
+0142  stdout-diff  BASH-ONLY  arith                     Comment not allowed in the middle of multiline arithmetic
+0144  stdout-diff  BASH-ONLY  arith                     Add integer to associative array (a[0] decay)
+0145  both-diff    BASH-ONLY  arith                     Double subscript
+0148  stdout-diff  BASH-ONLY  arith                     comma operator
+0150  stdout-diff  BASH-ONLY  arith                     array assignment with dynamic array name
+0152  stdout-diff  BASH-ONLY  arith                     unary array assignment with dynamic var name
+0153  stdout-diff  BASH-ONLY  arith                     Dynamic parsing of arithmetic
+0157  stdout-diff  BASH-ONLY  arith                     Invalid constant
+0161  stdout-diff  BASH-ONLY  arith                     undef[0]
+0162  both-diff    BASH-ONLY  arith                     undef[0] with nounset
+0163  stdout-diff  BASH-ONLY  arith                     s[0] with string abc
+0164  stdout-diff  BASH-ONLY  arith                     s[0] with string 42
+0165  stdout-diff  BASH-ONLY  arith                     s[0] with string '12 34'
+0072  both-diff    BASH-ONLY  arith-context             Multiple right brackets inside expression
+0073  both-diff    BASH-ONLY  arith-context             Slicing of string with constants
+0074  both-diff    BASH-ONLY  arith-context             Slicing of string with variables
+0076  stdout-diff  BASH-ONLY  arith-context             Array index on LHS with indices
+0077  both-diff    BASH-ONLY  arith-context             Slicing of string with expressions
+0078  both-diff    BASH-ONLY  arith-context             Ambiguous colon in slice
+0081  stdout-diff  BASH-ONLY  arith-context             $[ is a synonym for $((
+0082  stdout-diff  BASH-ONLY  arith-context             $[$var is a synonym for $(($var (#2426)
+0083  stdout-diff  BASH-ONLY  arith-context             $[$undefined] is a synonym for $(($undefined (#2566)
+0084  both-diff    BASH-ONLY  arith-context             Empty expression (( ))  $(( ))
+0085  both-diff    BASH-ONLY  arith-context             Empty expression for (( ))
+0086  stdout-diff  BASH-ONLY  arith-context             Empty expression in ${a[@]: : }
+0087  stdout-diff  BASH-ONLY  arith-context             Empty expression a[]
+0088  both-diff    BASH-ONLY  arith-dynamic             Double quotes
+0089  stdout-diff  BASH-ONLY  arith-dynamic             Single quotes
+0090  both-diff    BASH-ONLY  arith-dynamic             Substitutions
+0091  stdout-diff  BASH-ONLY  arith-dynamic             Variable references
+0297  stdout-diff  BASH-ONLY  array                     Command with with word splitting in array
+0301  stdout-diff  BASH-ONLY  array                     array with empty string
+0305  stdout-diff  BASH-ONLY  array                     Negative index and sparse array
+0306  both-diff    BASH-ONLY  array                     Negative index and sparse array
+0313  stdout-diff  BASH-ONLY  array                     ${!a[1]} is named ref in bash
+0314  both-diff    BASH-ONLY  array                     ${!a} on array
+0319  stdout-diff  BASH-ONLY  array                     Interpolate array into array
+0320  stdout-diff  BASH-ONLY  array                     Exporting array doesn't do anything, not even first element
+0321  stdout-diff  BASH-ONLY  array                     strict_array prevents exporting array
+0324  stdout-diff  BASH-ONLY  array                     glob within array yields separate elements
+0327  stdout-diff  BASH-ONLY  array                     Single array with :-
+0330  exit-diff    BASH-ONLY  array                     Multiple subscripts not allowed
+0331  exit-diff    BASH-ONLY  array                     Length op, index op, then transform op is not allowed
+0332  stdout-diff  BASH-ONLY  array                     ${mystr[@]} and ${mystr[*]} are no-ops
+0334  stdout-diff  BASH-ONLY  array                     Create a "user" array out of the argv array
+0335  stdout-diff  BASH-ONLY  array                     Tilde expansion within array
+0336  stdout-diff  BASH-ONLY  array                     Brace Expansion within Array
+0337  stdout-diff  BASH-ONLY  array                     array default
+0338  stdout-diff  BASH-ONLY  array                     Singleton Array Copy and Assign.  OSH can't index strings with ints
+0342  stdout-diff  BASH-ONLY  array                     Append sparse arrays
+0343  stdout-diff  BASH-ONLY  array                     Slice of sparse array with [@]
+0345  stdout-diff  BASH-ONLY  array                     Using an array itself as the index on RHS
+0347  stdout-diff  BASH-ONLY  array                     Dynamic parsing of LHS a[$code]=value
+0349  stdout-diff  BASH-ONLY  array                     Is element set?  test -v a[i]
+0350  stdout-diff  BASH-ONLY  array                     [[ -v a[i] ]]
+0351  stdout-diff  BASH-ONLY  array                     test -v a[i] with arith expressions
+0352  stdout-diff  BASH-ONLY  array                     More arith expressions in [[ -v array[expr]] ]]
+0353  exit-diff    BASH-ONLY  array                     Regression: Assigning with out-of-range negative index
+0354  stdout-diff  BASH-ONLY  array                     Regression: Negative index in [[ -v a[index] ]]
+0355  exit-diff    BASH-ONLY  array                     Regression: Negative out-of-range index in [[ -v a[index] ]]
+0357  exit-diff    BASH-ONLY  array                     Regression: unset a[-2]: out-of-bound negative index should cause error
+0358  stdout-diff  BASH-ONLY  array                     Regression: Out-of-bound negative offset for ${a[@]:offset}
+0360  both-diff    BASH-ONLY  array                     Regression: ${a[@]@Q} crash with `a[0]=x a[2]=y`
+0361  stdout-diff  BASH-ONLY  array                     Regression: silent out-of-bound negative index in ${a[-2]} and $((a[-2]))
+0167  stdout-diff  BASH-ONLY  array-assign              Indexed LHS with spaces
+0168  stdout-diff  BASH-ONLY  array-assign              Nested a[i[0]]=0
+0169  stdout-diff  BASH-ONLY  array-assign              Multiple LHS array words
+0170  stdout-diff  BASH-ONLY  array-assign              LHS array is protected with shopt -s eval_unsafe_arith, e.g. 'a[$(echo 2)]'
+0171  both-diff    BASH-ONLY  array-assign              file named a[ is  not executed
+0172  exit-diff    BASH-ONLY  array-assign              More fragments like a[  a[5  a[5 +  a[5 + 3]
+0173  stdout-diff  BASH-ONLY  array-assign              Are quotes allowed?
+0174  stdout-diff  BASH-ONLY  array-assign              Tricky parsing - a[ a[0]=1 ]=X  a[ a[0]+=1 ]+=X
+0175  stdout-diff  BASH-ONLY  array-assign              argv.py a[1 + 2]=
+0176  stdout-diff  BASH-ONLY  array-assign              declare builtin doesn't allow spaces
+0177  stdout-diff  BASH-ONLY  array-assoc               Literal syntax ([x]=y)
+0178  stdout-diff  BASH-ONLY  array-assoc               set associative array to indexed array literal (very surprising bash behavior)
+0179  stdout-diff  BASH-ONLY  array-assoc               Can initialize assoc array with the "(key value ...)" sequence
+0180  stdout-diff  BASH-ONLY  array-assoc               create empty assoc array, put, then get
+0187  stdout-diff  BASH-ONLY  array-assoc               ${assoc} is like ${assoc[0]}
+0190  stdout-diff  BASH-ONLY  array-assoc               lookup with double quoted strings "mykey"
+0191  stdout-diff  BASH-ONLY  array-assoc               lookup with single quoted string
+0192  stdout-diff  BASH-ONLY  array-assoc               lookup with unquoted $key and quoted "$i$i"
+0194  stdout-diff  BASH-ONLY  array-assoc               bash bug: "i+1" and i+1 are the same key
+0195  stdout-diff  BASH-ONLY  array-assoc               Array stored in associative array gets converted to string (without strict_array)
+0196  stdout-diff  BASH-ONLY  array-assoc               Indexed array as key of associative array coerces to string (without shopt -s strict_array)
+0197  stdout-diff  BASH-ONLY  array-assoc               Append to associative array value A['x']+='suffix'
+0198  stdout-diff  BASH-ONLY  array-assoc               Slice of associative array doesn't make sense in bash
+0199  stdout-diff  BASH-ONLY  array-assoc               bash variable can have an associative array part and a string part
+0200  stdout-diff  BASH-ONLY  array-assoc               Associative array expressions inside (( )) with keys that look like numbers
+0201  stdout-diff  BASH-ONLY  array-assoc               (( A[5] += 42 ))
+0202  stdout-diff  BASH-ONLY  array-assoc               (( A[5] += 42 )) with empty cell
+0203  stdout-diff  BASH-ONLY  array-assoc               setting key to itself (from bash-bug mailing list)
+0204  stdout-diff  BASH-ONLY  array-assoc               readonly associative array can't be modified
+0205  stdout-diff  BASH-ONLY  array-assoc               associative array and brace expansion
+0207  both-diff    BASH-ONLY  array-assoc               unset -v and assoc array
+0208  both-diff    BASH-ONLY  array-assoc               nameref and assoc array
+0209  both-diff    BASH-ONLY  array-assoc               ${!ref} and assoc array
+0210  both-diff    BASH-ONLY  array-assoc               printf -v and assoc array
+0211  stdout-diff  BASH-ONLY  array-assoc               bash bug: (( A["$key"] = 1 )) doesn't work
+0213  stdout-diff  BASH-ONLY  array-assoc               test -v assoc[key]
+0214  stdout-diff  BASH-ONLY  array-assoc               test -v with dynamic parsing
+0215  stdout-diff  BASH-ONLY  array-assoc               [[ -v assoc[key] ]]
+0216  stdout-diff  BASH-ONLY  array-assoc               [[ -v assoc[key] ]] syntax errors
+0217  stdout-diff  BASH-ONLY  array-assoc               BashAssoc a+=()
+0218  both-diff    BASH-ONLY  array-assoc               BashAssoc ${a[@]@Q}
+0223  stdout-diff  BASH-ONLY  array-basic               Empty array with :-
+0226  stdout-diff  BASH-ONLY  array-compat              User arrays decay
+0231  both-diff    BASH-ONLY  array-compat              array decays to string when comparing with [[ a = b ]]
+0232  stdout-diff  BASH-ONLY  array-compat              ++ on a whole array increments the first element (disallowed with strict_array)
+0234  stdout-diff  BASH-ONLY  array-compat              value.BashArray internal representation - Indexed
+0235  stdout-diff  BASH-ONLY  array-compat              value.BashArray internal representation - Assoc (ordering is a problem)
+0236  stdout-diff  BASH-ONLY  array-literal             Tilde expansions in RHS of [k]=v (BashArray)
+0237  stdout-diff  BASH-ONLY  array-literal             Tilde expansions in RHS of [k]=v (BashAssoc)
+0239  stdout-diff  BASH-ONLY  array-literal             [k]=$v and [k]="$@" (BashArray)
+0240  stdout-diff  BASH-ONLY  array-literal             [k]=$v and [k]="$@" (BashAssoc)
+0241  stdout-diff  BASH-ONLY  array-literal             append to element (BashArray)
+0242  stdout-diff  BASH-ONLY  array-literal             append to element (BashAssoc)
+0244  stdout-diff  BASH-ONLY  array-literal             Evaluation order (1)
+0245  stdout-diff  BASH-ONLY  array-literal             Evaluation order (2)
+0246  stdout-diff  BASH-ONLY  array-literal             Evaluation order (3)
+0247  both-diff    BASH-ONLY  array-literal             [k1]=v1 (BashArray)
+0248  stdout-diff  BASH-ONLY  array-literal             [k1]=v1 (BashAssoc)
+0249  stdout-diff  BASH-ONLY  array-literal             [k1]=v1 looking like brace expansions (BashAssoc)
+0250  both-diff    BASH-ONLY  array-literal             [k1]=v1 looking like brace expansions (BashArray)
+0251  stdout-diff  BASH-ONLY  array-literal             BashArray cannot be changed to BashAssoc and vice versa
+0252  stdout-diff  BASH-ONLY  array-literal             (strict_array) s+=()
+0253  stdout-diff  BASH-ONLY  array-literal             (strict_array) declare -A s+=()
+0254  stdout-diff  BASH-ONLY  array-literal             (strict_array) assoc=(key value ...) is not allowed
+0255  both-diff    BASH-ONLY  array-sparse              Performance demo
+0257  stdout-diff  BASH-ONLY  array-sparse              test "declare -p sp"
+0258  stdout-diff  BASH-ONLY  array-sparse              +=
+0259  stdout-diff  BASH-ONLY  array-sparse              a[i]=v
+0260  stdout-diff  BASH-ONLY  array-sparse              Negative index with a[i]=v
+0262  stdout-diff  BASH-ONLY  array-sparse              Negative out-of-bound index with a[i]=v (1/2)
+0263  stdout-diff  BASH-ONLY  array-sparse              Negative out-of-bound index with a[i]=v (2/2)
+0265  stdout-diff  BASH-ONLY  array-sparse              unset -v a[i]
+0266  exit-diff    BASH-ONLY  array-sparse              unset -v a[i] with out-of-bound negative index
+0267  stdout-diff  BASH-ONLY  array-sparse              unset -v a[i] for max index
+0268  stdout-diff  BASH-ONLY  array-sparse              [[ -v a[i] ]]
+0269  stdout-diff  BASH-ONLY  array-sparse              [[ -v a[i] ]] with invalid negative index
+0270  both-diff    BASH-ONLY  array-sparse              ((sp[i])) and ((sp[i]++))
+0271  both-diff    BASH-ONLY  array-sparse              ((sp[i])) and ((sp[i]++)) with invalid negative index
+0272  stdout-diff  BASH-ONLY  array-sparse              ${sp[i]}
+0274  stdout-diff  BASH-ONLY  array-sparse              ${a[@]:offset:length}
+0277  stdout-diff  BASH-ONLY  array-sparse              ${a[@]}
+0278  stdout-diff  BASH-ONLY  array-sparse              ${a[@]#...}
+0279  stdout-diff  BASH-ONLY  array-sparse              ${a[@]/pat/rep}
+0280  both-diff    BASH-ONLY  array-sparse              ${a[@]@P}, ${a[@]@Q}, and ${a[@]@a}
+0281  stdout-diff  BASH-ONLY  array-sparse              ${a[@]-unset}, ${a[@]:-empty}, etc.
+0283  stdout-diff  BASH-ONLY  array-sparse              ${!a[0]}
+0284  stdout-diff  BASH-ONLY  array-sparse              ${!a[@]}
+0285  stdout-diff  BASH-ONLY  array-sparse              "${a[*]}"
+0286  both-diff    BASH-ONLY  array-sparse              compgen -F _set_COMPREPLY
+0289  both-diff    BASH-ONLY  array-sparse              (YSH) $[a1 === a2]
+0291  exit-diff    BASH-ONLY  array-sparse              (YSH) $[bool(a)]
+0293  exit-diff    BASH-ONLY  array-sparse              Regression: a[-1]=1
+0428  stdout-diff  BASH-ONLY  assign                    Env binding in readonly/declare is NOT exported!  (pitfall)
+0432  exit-diff    BASH-ONLY  assign                    'local x' does not set variable
+0433  exit-diff    BASH-ONLY  assign                    'local -a x' does not set variable
+0435  stdout-diff  BASH-ONLY  assign                    'declare -A' and then dict assignment
+0439  stdout-diff  BASH-ONLY  assign                    Test above without 'local' (which is not POSIX)
+0444  stdout-diff  BASH-ONLY  assign                    assignment using dynamic keyword (splits in most shells, not in zsh/osh)
+0449  exit-diff    BASH-ONLY  assign                    readonly a=(1 2) no_value c=(3 4) makes 'no_value' readonly
+0459  stdout-diff  BASH-ONLY  assign                    "declare -a arr" and "readonly -a a" creates an empty array (OSH)
+0460  exit-diff    BASH-ONLY  assign                    "var d = {}; declare -p d" does not print anything (OSH)
+0461  stdout-diff  BASH-ONLY  assign                    readonly array should not be modified by a+=(1)
+0362  stdout-diff  BASH-ONLY  assign-deferred           typeset a[3]=4
+0363  stdout-diff  BASH-ONLY  assign-deferred           typeset -a a[1]=a a[3]=c
+0364  stdout-diff  BASH-ONLY  assign-deferred           local a[3]=4
+0371  stdout-diff  BASH-ONLY  assign-dialects           K and V are variables in (( array[K] = V ))
+0372  stdout-diff  BASH-ONLY  assign-dialects           test -v with strings
+0373  stdout-diff  BASH-ONLY  assign-dialects           test -v with arrays
+0374  stdout-diff  BASH-ONLY  assign-dialects           test -v with assoc arrays
+0377  stdout-diff  BASH-ONLY  assign-extended           declare -f exit code indicates function existence
+0378  stdout-diff  BASH-ONLY  assign-extended           declare -F prints function names
+0379  stdout-diff  BASH-ONLY  assign-extended           declare -F with shopt -s extdebug prints more info
+0381  stdout-diff  BASH-ONLY  assign-extended           declare -p var (exit status)
+0384  stdout-diff  BASH-ONLY  assign-extended           declare -p doesn't print binary data, but can be loaded into bash
+0386  stdout-diff  BASH-ONLY  assign-extended           declare -p arr
+0387  stdout-diff  BASH-ONLY  assign-extended           declare -p foo=bar doesn't make sense
+0393  both-diff    BASH-ONLY  assign-extended           ble.sh: eval -- "$(declare -p var arr)"
+0394  both-diff    BASH-ONLY  assign-extended           declare -p and value.Undef
+0395  both-diff    BASH-ONLY  assign-extended           eval -- "$(declare -p arr)" (restore arrays w/ unset elements)
+0396  stdout-diff  BASH-ONLY  assign-extended           declare -p UNDEF (and typeset) -- prints something to stderr
+0397  stdout-diff  BASH-ONLY  assign-extended           typeset -f
+0398  stdout-diff  BASH-ONLY  assign-extended           typeset -p
+0399  stdout-diff  BASH-ONLY  assign-extended           typeset -r makes a string readonly
+0400  stdout-diff  BASH-ONLY  assign-extended           typeset -ar makes it readonly
+0404  stdout-diff  BASH-ONLY  assign-extended           syntax error in array assignment
+0405  stdout-diff  BASH-ONLY  assign-extended           declare -g (bash-specific; bash-completion uses it)
+0406  stdout-diff  BASH-ONLY  assign-extended           myvar=typeset (another form of dynamic assignment)
+0411  both-diff    BASH-ONLY  assign-extended           function name with /
+0413  both-diff    BASH-ONLY  assign-extended           unset and shell funcs
+0463  stdout-diff  BASH-ONLY  background                wait -n with arguments - arguments are respected
+0464  exit-diff    BASH-ONLY  background                wait -n with nothing to wait for
+0467  exit-diff    BASH-ONLY  background                wait with invalid arg
+0474  stdout-diff  BASH-ONLY  background                Wait for job and PIPESTATUS
+0475  stdout-diff  BASH-ONLY  background                Wait for job and PIPESTATUS - cat
+0479  stdout-diff  BASH-ONLY  background                wait -n
+0489  stdout-diff  BASH-ONLY  ble-features              [bash_unset] local-unset / dynamic-unset for localvar
+0490  stdout-diff  BASH-ONLY  ble-features              [bash_unset] local-unset / dynamic-unset for localvar (mutated from tempenv)
+0491  stdout-diff  BASH-ONLY  ble-features              [bash_unset] local-unset / dynamic-unset for tempenv
+0492  stdout-diff  BASH-ONLY  ble-features              [bash_unset] function call with tempenv vs tempenv-eval
+0493  stdout-diff  BASH-ONLY  ble-features              [bash_unset] localvar-inherit from tempenv
+0495  stdout-diff  BASH-ONLY  ble-features              [compat_array] scalar write to arrays
+0496  stdout-diff  BASH-ONLY  ble-features              [compat_array] scalar write to associative arrays
+0497  both-diff    BASH-ONLY  ble-features              [compat_array] ${alpha@a}
+0498  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: one level
+0499  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: two levels
+0500  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: short circuit &&, ||
+0501  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: short circuit ?:
+0502  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: side effects
+0503  stdout-diff  BASH-ONLY  ble-idioms                recursive arith: recursion
+0504  both-diff    BASH-ONLY  ble-idioms                recursive arith: array elements
+0508  both-diff    BASH-ONLY  ble-idioms                is-array with ${var@a}
+0510  both-diff    BASH-ONLY  ble-idioms                shift unshift reverse
+0511  both-diff    BASH-ONLY  ble-idioms                shopt -u expand_aliases and eval
+0517  stdout-diff  BASH-ONLY  ble-idioms                Issue #1069 [53] BUG: a[1 + 1]=2, etc. fails
+0518  both-diff    BASH-ONLY  ble-idioms                Issue #1069 [53] - LHS array parsing a[1 + 2]=3 (see spec/array-assign for more)
+0519  exit-diff    BASH-ONLY  ble-idioms                Issue #1069 [56] BUG: declare -p unset does not print any error message
+0522  stdout-diff  BASH-ONLY  ble-idioms                Issue #1069 [59] N-I: arr=s should set RHS to arr[0]
+0523  stdout-diff  BASH-ONLY  ble-idioms                Issue #1069 [59] - Assigning Str to BashArray/BashAssoc should not remove BashArray/BashAssoc
+0525  stdout-diff  BASH-ONLY  ble-unset                 [bash_unset] local-unset / dynamic-unset for localvar on nested-context
+0526  stdout-diff  BASH-ONLY  ble-unset                 [bash_unset] dynamic-unset for nested localvars
+0527  stdout-diff  BASH-ONLY  ble-unset                 [bash_unset] dynamic-unset for nested tempenvs
+0528  stdout-diff  BASH-ONLY  ble-unset                 [bash_unset] local-unset for nested tempenvs
+0542  exit-diff    BASH-ONLY  blog1                     ${#1#'###'}
+0543  both-diff    BASH-ONLY  blog1                     Julia example from spec/oil-user-feedback
+0559  stdout-diff  BASH-ONLY  bool-parse                [[ -f -f ]] and [[ -f == ]]
+0563  stdout-diff  BASH-ONLY  brace-expansion           partial leading expansion 2
+0574  stdout-diff  BASH-ONLY  brace-expansion           expansion with command sub
+0575  stdout-diff  BASH-ONLY  brace-expansion           expansion with arith sub
+0588  stdout-diff  BASH-ONLY  brace-expansion           Tilde expansion with brace expansion
+0589  stdout-diff  BASH-ONLY  brace-expansion           Two kinds of tilde expansion
+0594  stdout-diff  BASH-ONLY  brace-expansion           regression: 0 step disallowed
+0602  exit-diff    BASH-ONLY  brace-expansion           Mixed case char expansion is invalid
+0604  stdout-diff  BASH-ONLY  brace-expansion           Fixed width number range expansion
+0605  stdout-diff  BASH-ONLY  brace-expansion           Inconsistent fixed width number range expansion
+0606  stdout-diff  BASH-ONLY  brace-expansion           Inconsistent fixed width number range expansion
+0618  both-diff    BASH-ONLY  bugs                      assign readonly -- one line
+0620  both-diff    BASH-ONLY  bugs                      assign readonly -- multiple lines -- set -o posix
+0626  both-diff    BASH-ONLY  bugs                      fastlex: PS1 format string that's incomplete / with NUL byte
+0630  both-diff    BASH-ONLY  bugs                      for loop (issue #1446)
+0631  both-diff    BASH-ONLY  bugs                      for loop 2 (issue #1446)
+0634  stdout-diff  BASH-ONLY  bugs                      command execution $(echo 42 | tee PWNED) not allowed
+0635  stdout-diff  BASH-ONLY  bugs                      process sub <(echo 42 | tee PWNED) not allowed
+0638  both-diff    BASH-ONLY  bugs                      (( status bug
+0642  stdout-diff  BASH-ONLY  bugs                      Crash after changing $[] to be alias of $(( ))
+0644  stdout-diff  BASH-ONLY  builtin-bash              help
+0645  stdout-diff  BASH-ONLY  builtin-bash              bad help topic
+0653  both-diff    BASH-ONLY  builtin-bash              mapfile -t bugs (ble.sh)
+0654  stdout-diff  BASH-ONLY  builtin-bash              mapfile (store position): -O start
+0655  stdout-diff  BASH-ONLY  builtin-bash              mapfile (input range): -s start -n count
+0658  both-diff    BASH-ONLY  builtin-bind              bind -p -P to print function names and key bindings
+0660  stdout-diff  BASH-ONLY  builtin-bind              bind -v -V accepted
+0661  stdout-diff  BASH-ONLY  builtin-bind              bind -q
+0662  stdout-diff  BASH-ONLY  builtin-bind              bind -X
+0663  stdout-diff  BASH-ONLY  builtin-bind              bind -m with bind -x/-X
+0664  stdout-diff  BASH-ONLY  builtin-bind              bind -r
+0665  stdout-diff  BASH-ONLY  builtin-bind              bind -r of bind -x commands
+0703  stdout-diff  POSIX      builtin-bracket           -u for setuid, -g too
+0704  stdout-diff  BASH-ONLY  builtin-bracket           -v to test variable (bash)
+0716  stdout-diff  BASH-ONLY  builtin-bracket           Looks like octal, but digit is too big
+0720  stdout-diff  BASH-ONLY  builtin-cd                cd with 2 or more args - with strict_arg_parse
+0721  exit-diff    BASH-ONLY  builtin-cd                cd with 2 or more args is allowed (strict_arg_parse disabled)
+0748  stdout-diff  BASH-ONLY  builtin-completion        complete with no args and complete -p both print completion spec
+0749  stdout-diff  BASH-ONLY  builtin-completion        complete -F f is usage error
+0752  both-diff    BASH-ONLY  builtin-completion        -A function prints functions
+0753  stdout-diff  BASH-ONLY  builtin-completion        Invalid syntax
+0754  both-diff    BASH-ONLY  builtin-completion        how compgen calls completion functions
+0756  stdout-diff  BASH-ONLY  builtin-completion        compopt with invalid syntax
+0760  both-diff    BASH-ONLY  builtin-completion        compgen -v with local vars
+0762  stdout-diff  BASH-ONLY  builtin-completion        compgen -v P
+0763  both-diff    BASH-ONLY  builtin-completion        compgen -e with global/local exported vars
+0766  stdout-diff  BASH-ONLY  builtin-completion        compgen -e P
+0767  stdout-diff  BASH-ONLY  builtin-completion        compgen with actions: function / variable / file
+0768  both-diff    BASH-ONLY  builtin-completion        compgen with actions: alias, setopt
+0769  both-diff    BASH-ONLY  builtin-completion        compgen with actions: shopt
+0770  both-diff    BASH-ONLY  builtin-completion        compgen with action and suffix: helptopic
+0774  stdout-diff  BASH-ONLY  builtin-completion        compgen -A command completes external commands
+0775  stdout-diff  BASH-ONLY  builtin-completion        compgen -A command completes functions and aliases
+0776  stdout-diff  BASH-ONLY  builtin-completion        compgen -A command completes builtins and keywords
+0778  stdout-diff  POSIX      builtin-completion        compgen -k shows Oils keywords too
+0779  stdout-diff  BASH-ONLY  builtin-completion        compgen -k completes reserved shell keywords
+0780  both-diff    BASH-ONLY  builtin-completion        -o filenames and -o nospace have no effect with compgen
+0781  stdout-diff  BASH-ONLY  builtin-completion        -o plusdirs and -o dirnames with compgen
+0787  both-diff    BASH-ONLY  builtin-completion        compgen -W 'one two three'
+0788  both-diff    BASH-ONLY  builtin-completion        compgen -W evaluates code in $()
+0789  both-diff    BASH-ONLY  builtin-completion        compgen -W uses IFS, and delimiters are escaped with \
+0794  both-diff    BASH-ONLY  builtin-completion        compgen -A builtin
+0795  stdout-diff  BASH-ONLY  builtin-completion        complete -C vs. compgen -C
+0798  both-diff    BASH-ONLY  builtin-completion        compgen -F with scalar COMPREPLY
+0800  stdout-diff  BASH-ONLY  builtin-dirs              pushd usage
+0801  stdout-diff  BASH-ONLY  builtin-dirs              popd usage error
+0802  both-diff    BASH-ONLY  builtin-dirs              popd returns error on empty directory stack
+0808  stdout-diff  BASH-ONLY  builtin-dirs              dirs -l to print in long format, no tilde prefix
+0809  stdout-diff  BASH-ONLY  builtin-dirs              dirs to print using tilde-prefix format
+0810  stdout-diff  BASH-ONLY  builtin-dirs              dirs test converting true home directory to tilde
+0812  stdout-diff  BASH-ONLY  builtin-dirs              dirs tilde test when $HOME is exactly $PWD
+0815  stdout-diff  POSIX      builtin-dirs              pushd does not take more than one argument
+0816  stdout-diff  POSIX      builtin-dirs              dirs does not take arguments
+0823  stdout-diff  BASH-ONLY  builtin-echo              echo -ez (invalid flag)
+0826  stdout-diff  BASH-ONLY  builtin-echo              echo -e with C escapes
+0828  stdout-diff  BASH-ONLY  builtin-echo              \0
+0829  stdout-diff  BASH-ONLY  builtin-echo              \c stops processing input
+0830  stdout-diff  BASH-ONLY  builtin-echo              echo -e with hex escape
+0832  stdout-diff  BASH-ONLY  builtin-echo              echo -e with 4 digit unicode escape
+0833  stdout-diff  BASH-ONLY  builtin-echo              echo -e with 8 digit unicode escape
+0845  both-diff    BASH-ONLY  builtin-eval-source       eval accepts/ignores --
+0846  stdout-diff  BASH-ONLY  builtin-eval-source       eval usage
+0852  both-diff    BASH-ONLY  builtin-eval-source       source accepts/ignores --
+0860  both-diff    BASH-ONLY  builtin-eval-source       Eval in bash does tilde expansion in array
+0866  stdout-diff  BASH-ONLY  builtin-eval-source       sourcing along PATH should ignore directories
+0885  exit-diff    BASH-ONLY  builtin-getopts           OPTARG is empty (not unset) after parsing a flag doesn't take an arg
+0887  stdout-diff  BASH-ONLY  builtin-getopts           getopts with invalid variable name
+0895  stdout-diff  BASH-ONLY  builtin-getopts           OPTIND after multiple getopts with different spec
+0913  stdout-diff  BASH-ONLY  builtin-history           history -w writes out the in-memory history to the history file
+0914  stdout-diff  BASH-ONLY  builtin-history           history -r reads from the history file, and appends it to the current history
+0915  stdout-diff  BASH-ONLY  builtin-history           history -n reads *new* commands from the history file, and appends them to the current history
+0924  stdout-diff  BASH-ONLY  builtin-history           HISTSIZE shrinks the in-memory history when changed
+0925  stdout-diff  BASH-ONLY  builtin-history           HISTFILESIZE shrinks the history file when changed
+0927  stdout-diff  BASH-ONLY  builtin-history           shopt histappend toggle check
+0931  stdout-diff  BASH-ONLY  builtin-kill              kill -n 9 specifies the signal number
+0936  stdout-diff  BASH-ONLY  builtin-kill              kill -L also shows signals
+0938  stdout-diff  BASH-ONLY  builtin-kill              kill -L checks for invalid input
+0941  both-diff    BASH-ONLY  builtin-kill              kill -l 0 returns EXIT
+0942  both-diff    BASH-ONLY  builtin-kill              kill -l 0 INT lists both signals
+0944  stdout-diff  BASH-ONLY  builtin-kill              kill -15 %% kills current job
+0945  stdout-diff  BASH-ONLY  builtin-kill              kill -15 %- kills previous job
+0960  stdout-diff  BASH-ONLY  builtin-meta              command -v
+0962  stdout-diff  BASH-ONLY  builtin-meta              command -v with multiple names
+0965  stdout-diff  BASH-ONLY  builtin-meta              command -V
+0966  stdout-diff  BASH-ONLY  builtin-meta              command -V nonexistent
+0970  stdout-diff  BASH-ONLY  builtin-meta              command -p (override existing program)
+0971  both-diff    BASH-ONLY  builtin-meta              command -p (hide tool in custom path)
+0976  stdout-diff  BASH-ONLY  builtin-meta              builtin usage
+0978  stdout-diff  BASH-ONLY  builtin-misc              history builtin usage
+0979  both-diff    BASH-ONLY  builtin-misc              Print shell strings with weird chars: set and printf %q and ${x@Q}
+0980  both-diff    BASH-ONLY  builtin-misc              Print shell strings with normal chars: set and printf %q and ${x@Q}
+0987  both-diff    BASH-ONLY  builtin-printf            printf -v %q
+0988  stdout-diff  BASH-ONLY  builtin-printf            printf -v a[1]
+0991  stdout-diff  BASH-ONLY  builtin-printf            dynamic declare instead of %q
+0992  stdout-diff  BASH-ONLY  builtin-printf            printf -v dynamic scope
+1008  exit-diff    BASH-ONLY  builtin-printf            empty string (osh is more strict)
+1017  stdout-diff  BASH-ONLY  builtin-printf            printf backslash escapes
+1019  stdout-diff  BASH-ONLY  builtin-printf            printf unicode backslash escapes
+1023  stdout-diff  BASH-ONLY  builtin-printf            printf %c unicode - prints the first BYTE of a string - it does not respect UTF-8
+1024  stdout-diff  BASH-ONLY  builtin-printf            printf invalid format
+1025  stdout-diff  BASH-ONLY  builtin-printf            printf %q
+1026  stdout-diff  BASH-ONLY  builtin-printf            printf %6q (width)
+1034  stdout-diff  BASH-ONLY  builtin-printf            %10.5(strftime format)T
+1036  exit-diff    BASH-ONLY  builtin-printf            bash truncates long strftime string at 128
+1040  stdout-diff  BASH-ONLY  builtin-printf            printf %b unicode escapes
+1051  both-diff    BASH-ONLY  builtin-process           exec builtin accepts --
+1053  both-diff    BASH-ONLY  builtin-process           exec -a sets argv[0]
+1056  stdout-diff  BASH-ONLY  builtin-process           Exit builtin with too many args
+1062  stdout-diff  BASH-ONLY  builtin-process           ulimit -a doesn't take arg
+1064  stdout-diff  BASH-ONLY  builtin-process           YSH readability: ulimit --all the same as ulimit -a
+1069  stdout-diff  POSIX      builtin-process           ulimit -f 1 prevents files larger 512 bytes
+1072  stdout-diff  BASH-ONLY  builtin-process           Changing resource limit is denied
+1076  stdout-diff  BASH-ONLY  builtin-read              read /dev/null
+1083  stdout-diff  BASH-ONLY  builtin-read              read -n doesn't strip whitespace (bug fix)
+1084  stdout-diff  BASH-ONLY  builtin-read              read -d -n - respects delimiter and splits
+1085  stdout-diff  BASH-ONLY  builtin-read              read -n with invalid arg
+1086  stdout-diff  BASH-ONLY  builtin-read              read -n from pipe
+1089  stdout-diff  BASH-ONLY  builtin-read              read -N ignores delimiters
+1090  stdout-diff  BASH-ONLY  builtin-read              read will unset extranous vars
+1096  stdout-diff  BASH-ONLY  builtin-read              read -s from pipe, not a terminal
+1102  stdout-diff  BASH-ONLY  builtin-read              read -a reads into array
+1107  stdout-diff  BASH-ONLY  builtin-read              read -t 0 tests if input is available
+1108  stdout-diff  BASH-ONLY  builtin-read              read -t 0.5
+1109  stdout-diff  BASH-ONLY  builtin-read              read -t -0.5 is invalid
+1110  stdout-diff  BASH-ONLY  builtin-read              read -u
+1111  stdout-diff  BASH-ONLY  builtin-read              read -u syntax error
+1112  stdout-diff  BASH-ONLY  builtin-read              read -u -s
+1113  stdout-diff  BASH-ONLY  builtin-read              read -u 3 -d 5
+1114  stdout-diff  BASH-ONLY  builtin-read              read -u 3 -d b -N 6
+1115  stdout-diff  BASH-ONLY  builtin-read              read -N doesn't respect delimiter, while read -n does
+1116  stdout-diff  BASH-ONLY  builtin-read              read -p (not fully tested)
+1117  stdout-diff  BASH-ONLY  builtin-read              read usage
+1118  stdout-diff  BASH-ONLY  builtin-read              read with smooshed args
+1122  stdout-diff  BASH-ONLY  builtin-read              mapfile from directory (bash doesn't handle errors)
+1124  stdout-diff  BASH-ONLY  builtin-read              read -n and backslash escape
+1125  stdout-diff  BASH-ONLY  builtin-read              read -n 4 with incomplete backslash
+1126  stdout-diff  BASH-ONLY  builtin-read              read -n 4 with backslash + delim
+1127  stdout-diff  BASH-ONLY  builtin-read              "backslash + newline" should be swallowed regardless of "-d <delim>"
+1129  stdout-diff  BASH-ONLY  builtin-read              IFS='x ' read -a: trailing spaces (unlimited split)
+1131  stdout-diff  BASH-ONLY  builtin-read              IFS='x ' read -a: intermediate spaces (unlimited split)
+1137  stdout-diff  BASH-ONLY  builtin-read              read bash bug
+1148  both-diff    BASH-ONLY  builtin-set               set -eu (flag parsing)
+1150  both-diff    BASH-ONLY  builtin-set               'set' and 'eval' round trip
+1167  stdout-diff  BASH-ONLY  builtin-special           Which shells allow special builtins to be redefined?
+1168  stdout-diff  BASH-ONLY  builtin-special           Special builtins can't be redefined as shell functions (set -o posix)
+1172  stdout-diff  BASH-ONLY  builtin-special           bash 'type' gets confused - says 'function', but runs builtin
+1221  both-diff    BASH-ONLY  builtin-trap              traps are not active inside subshells $() ()  trap | cat
+1228  both-diff    BASH-ONLY  builtin-trap              trap -p is like trap: it prints the handlers and full signal names
+1231  stdout-diff  BASH-ONLY  builtin-trap              trap EXIT clears the EXIT trap
+1175  exit-diff    BASH-ONLY  builtin-trap-bash         trap -l
+1176  stdout-diff  BASH-ONLY  builtin-trap-bash         trap -p
+1177  stdout-diff  BASH-ONLY  builtin-trap-bash         trap -p in child is BUGGY in bash
+1178  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG ignores $?
+1179  both-diff    BASH-ONLY  builtin-trap-bash         but trap DEBUG respects errexit
+1180  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG with 'return'
+1181  both-diff    BASH-ONLY  builtin-trap-bash         trap DEBUG with 'exit'
+1182  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG with non-compound commands
+1183  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG and control flow
+1184  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG and command sub / subshell
+1185  both-diff    BASH-ONLY  builtin-trap-bash         trap DEBUG not run in forked interpreter for first pipeline part
+1186  stdout-diff  BASH-ONLY  builtin-trap-bash         One 'echo' in first pipeline part - why does bash behave differently from case above?
+1187  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG and pipeline (lastpipe difference)
+1188  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG function call
+1189  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG case
+1190  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG for each
+1191  both-diff    BASH-ONLY  builtin-trap-bash         trap DEBUG for expr
+1192  stdout-diff  BASH-ONLY  builtin-trap-bash         trap DEBUG if while
+1193  stdout-diff  BASH-ONLY  builtin-trap-bash         trap RETURN
+1194  stdout-diff  BASH-ONLY  builtin-trap-bash         Compare trap DEBUG vs. trap ERR
+1195  stdout-diff  BASH-ONLY  builtin-trap-bash         Combine DEBUG trap and USR1 trap
+1196  stdout-diff  BASH-ONLY  builtin-trap-bash         Combine ERR trap and USR1 trap
+1197  stdout-diff  BASH-ONLY  builtin-trap-bash         Combine DEBUG trap and ERR trap
+1204  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR pipelines without simple commands
+1205  stdout-diff  BASH-ONLY  builtin-trap-err          Pipeline group quirk
+1207  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR doesn't run in subprograms - subshell, command sub, async
+1208  stdout-diff  BASH-ONLY  builtin-trap-err          set -o errtrace: trap ERR runs in subprograms
+1210  stdout-diff  BASH-ONLY  builtin-trap-err          set -o errtrace: trap ERR with &
+1212  stdout-diff  BASH-ONLY  builtin-trap-err          set -o errtrace - trap ERR runs in shell functions
+1213  stdout-diff  BASH-ONLY  builtin-trap-err          set -o errtrace - trap ERR runs in shell functions (LINENO)
+1214  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR with "atoms": assignment (( [[
+1215  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR with for,  case, { }
+1218  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR
+1219  stdout-diff  BASH-ONLY  builtin-trap-err          trap ERR and pipelines - PIPESTATUS difference
+1220  stdout-diff  BASH-ONLY  builtin-trap-err          error in trap ERR (recursive)
+1286  both-diff    POSIX      builtin-type              type -> alias external
+1288  stdout-diff  BASH-ONLY  builtin-type              type -> not found
+1289  stdout-diff  BASH-ONLY  builtin-type              special builtins are called out
+1290  stdout-diff  BASH-ONLY  builtin-type              more special builtins
+1269  stdout-diff  BASH-ONLY  builtin-type-bash         type -f builtin -> not found
+1270  stdout-diff  BASH-ONLY  builtin-type-bash         type -f builtin -> function and file exists
+1271  stdout-diff  BASH-ONLY  builtin-type-bash         type prints function source code
+1273  stdout-diff  BASH-ONLY  builtin-type-bash         type -a -> alias; prints alias definition
+1281  both-diff    BASH-ONLY  builtin-type-bash         type -a -> builtin and file and shell function
+1282  stdout-diff  BASH-ONLY  builtin-type-bash         type -ap -> builtin and file; doesn't print builtin or function
+1283  stdout-diff  BASH-ONLY  builtin-type-bash         type -a -> executable not in PATH
+1299  stdout-diff  POSIX      builtin-umask             'umask -S' prints symbolic umask
+1300  stdout-diff  BASH-ONLY  builtin-umask             'umask -p' prints a form that can be eval'd
+1316  stdout-diff  BASH-ONLY  builtin-vars              Export sets a global variable that persists after export -n
+1317  both-diff    BASH-ONLY  builtin-vars              export -n undefined is ignored
+1318  stdout-diff  BASH-ONLY  builtin-vars              export -n foo=bar not allowed
+1337  both-diff    BASH-ONLY  builtin-vars              Unset a function without -f
+1339  stdout-diff  BASH-ONLY  builtin-vars              Unset and scope (bug #653)
+1347  stdout-diff  BASH-ONLY  builtin-vars              Unset wrong type
+1348  stdout-diff  BASH-ONLY  builtin-vars              unset -v assoc (related to issue #661)
+1352  exit-diff    BASH-ONLY  builtin-vars              Local without variable is still unset!
+1354  stdout-diff  BASH-ONLY  builtin-vars              unset a[-1] (bf.bash regression)
+1357  both-diff    BASH-ONLY  case_                     Case statement with ;;&
+1358  both-diff    BASH-ONLY  case_                     Case statement with ;&
+1367  both-diff    BASH-ONLY  case_                     \(\) in pattern (regression)
+1377  both-diff    BASH-ONLY  command-sub-ksh           for loop / case
+1409  exit-diff    POSIX      command_                  Permission denied
+1416  both-diff    BASH-ONLY  command_                  $PATH lookup
+1417  both-diff    BASH-ONLY  command_                  filling $PATH cache, then insert the same command earlier in cache
+1418  stdout-diff  BASH-ONLY  command_                  filling $PATH cache, then deleting command
+1419  stdout-diff  BASH-ONLY  command_                  Non-executable on $PATH
+1420  stdout-diff  BASH-ONLY  command_                  hash without args prints the cache
+1423  stdout-diff  BASH-ONLY  command_                  Executing command with same name as directory in PATH (#2429)
+1427  both-diff    BASH-ONLY  dbracket                  [[ glob matching with escapes
+1430  stdout-diff  BASH-ONLY  dbracket                  [[ regex matching
+1431  exit-diff    BASH-ONLY  dbracket                  [[ regex syntax error
+1437  stdout-diff  BASH-ONLY  dbracket                  [[ compound expressions
+1440  both-diff    BASH-ONLY  dbracket                  Octal literals with -eq
+1441  stdout-diff  BASH-ONLY  dbracket                  Hex literals with -eq
+1442  stdout-diff  BASH-ONLY  dbracket                  > on strings
+1444  stdout-diff  BASH-ONLY  dbracket                  -eq on strings
+1446  stdout-diff  BASH-ONLY  dbracket                  [[ with op variable (compare with test-builtin.test.sh)
+1452  stdout-diff  BASH-ONLY  dbracket                  User array compared to "$@" (broken unless shopt -s strict_array)
+1453  stdout-diff  BASH-ONLY  dbracket                  Array coerces to string (shopt -s strict_array to disallow)
+1454  stdout-diff  BASH-ONLY  dbracket                  (( array1 == array2 )) doesn't work
+1456  stdout-diff  BASH-ONLY  dbracket                  -eq does dynamic arithmetic parsing (not supported in OSH)
+1457  stdout-diff  BASH-ONLY  dbracket                  -eq coercion produces weird results
+1458  stdout-diff  BASH-ONLY  dbracket                  [[ '(' ]] is treated as literal
+1460  stdout-diff  BASH-ONLY  dbracket                  empty ! is treated as literal
+1461  stdout-diff  BASH-ONLY  dbracket                  [[ -z ]] is syntax error
+1468  stdout-diff  BASH-ONLY  dbracket                  tilde expansion in [[
+1469  stdout-diff  BASH-ONLY  dbracket                  more tilde expansion
+1470  stdout-diff  BASH-ONLY  dbracket                  tilde expansion with =~ (confusing)
+1471  both-diff    BASH-ONLY  dbracket                  [[ ]] with redirect
+1472  stdout-diff  BASH-ONLY  dbracket                  special chars
+1473  stdout-diff  BASH-ONLY  dbracket                  \(\) in pattern (regression)
+1474  stdout-diff  BASH-ONLY  dbracket                  negative numbers - zero, decimal, octal, hex, base N
+1477  stdout-diff  BASH-ONLY  divergence                Changing PATH will invalidate PATH cache
+1483  stdout-diff  BASH-ONLY  dparen                    (( )) with arrays
+1485  stdout-diff  BASH-ONLY  dparen                    bash and mksh: V in (( a[K] = V )) gets coerced to integer
+1486  stdout-diff  BASH-ONLY  dparen                    bash: K in (( A[K] = V )) is a constant string
+1488  stdout-diff  BASH-ONLY  dparen                    bash: V in (( A["K"] = V )) gets coerced to integer
+1489  stdout-diff  BASH-ONLY  dparen                    literal strings inside (( ))
+1490  stdout-diff  BASH-ONLY  dparen                    (( )) with redirect
+1491  stdout-diff  BASH-ONLY  dparen                    Assigning whole raray (( b = a ))
+1492  stdout-diff  BASH-ONLY  dparen                    set associative array
+1493  stdout-diff  BASH-ONLY  dparen                    Example of incrementing associative array entry with var key (ble.sh)
+1514  stdout-diff  BASH-ONLY  errexit-osh               local: middle command fails and keeps going
+1526  both-diff    BASH-ONLY  errexit-osh               command_sub_errexit and command sub in array
+1567  stdout-diff  BASH-ONLY  exit-status               Truncating 'return' status
+1582  both-diff    BASH-ONLY  extglob-files             @() matches exactly one of the patterns
+1583  both-diff    BASH-ONLY  extglob-files             ?() matches 0 or 1
+1584  both-diff    BASH-ONLY  extglob-files             *() matches 0 or more
+1585  both-diff    BASH-ONLY  extglob-files             +() matches 1 or more
+1586  both-diff    BASH-ONLY  extglob-files             !(*.h|*.cc) to match everything except C++
+1587  both-diff    BASH-ONLY  extglob-files             Two adjacent alternations
+1588  both-diff    BASH-ONLY  extglob-files             Nested extended glob pattern
+1589  both-diff    BASH-ONLY  extglob-files             Extended glob patterns with spaces
+1590  both-diff    BASH-ONLY  extglob-files             Filenames with spaces
+1591  both-diff    BASH-ONLY  extglob-files             nullglob with extended glob
+1592  both-diff    BASH-ONLY  extglob-files             Glob other punctuation chars (lexer mode)
+1593  both-diff    BASH-ONLY  extglob-files             More glob escaping
+1594  both-diff    BASH-ONLY  extglob-files             Escaping of pipe (glibc bug, see demo/glibc_fnmatch.c)
+1595  stdout-diff  BASH-ONLY  extglob-files             Extended glob as argument to ${undef:-} (dynamic globbing)
+1596  both-diff    BASH-ONLY  extglob-files             Extended glob in assignment builtin
+1597  both-diff    BASH-ONLY  extglob-files             Extended glob in same word as array
+1598  both-diff    BASH-ONLY  extglob-files             Extended glob with word splitting
+1599  both-diff    BASH-ONLY  extglob-files             In Array Literal and for loop
+1600  exit-diff    BASH-ONLY  extglob-files             No extended glob with simple_word_eval (YSH evaluation)
+1601  stdout-diff  BASH-ONLY  extglob-files             no match
+1602  both-diff    BASH-ONLY  extglob-files             no_dash_glob
+1603  both-diff    BASH-ONLY  extglob-files             noglob
+1604  both-diff    BASH-ONLY  extglob-files             failglob
+1605  stdout-diff  BASH-ONLY  extglob-match             @ matches exactly one
+1606  stdout-diff  BASH-ONLY  extglob-match             @() with variable arms
+1607  both-diff    BASH-ONLY  extglob-match             extglob in variable
+1608  stdout-diff  BASH-ONLY  extglob-match             Matching literal '@(cc)'
+1609  stdout-diff  BASH-ONLY  extglob-match             nested @()
+1610  stdout-diff  BASH-ONLY  extglob-match             nested @() with quotes and vars
+1611  stdout-diff  BASH-ONLY  extglob-match             ? matches 0 or 1
+1612  stdout-diff  BASH-ONLY  extglob-match             + matches 1 or more
+1613  stdout-diff  BASH-ONLY  extglob-match             * matches 0 or more
+1614  stdout-diff  BASH-ONLY  extglob-match             simple repetition with *(foo) and +(Foo)
+1615  stdout-diff  BASH-ONLY  extglob-match             ! matches none
+1616  stdout-diff  BASH-ONLY  extglob-match             match is anchored
+1617  stdout-diff  BASH-ONLY  extglob-match             repeated match is anchored
+1618  stdout-diff  BASH-ONLY  extglob-match             repetition with glob
+1619  stdout-diff  BASH-ONLY  extglob-match             No brace expansion in ==
+1620  stdout-diff  BASH-ONLY  extglob-match             adjacent extglob
+1621  stdout-diff  BASH-ONLY  extglob-match             nested extglob
+1622  stdout-diff  BASH-ONLY  extglob-match             extglob empty string
+1623  stdout-diff  BASH-ONLY  extglob-match             extglob empty pattern
+1624  both-diff    BASH-ONLY  extglob-match             case with extglob
+1625  stdout-diff  BASH-ONLY  extglob-match             [[ $x == !($str) ]]
+1626  stdout-diff  BASH-ONLY  extglob-match             Turning extglob on changes the meaning of [[ !(str) ]] in bash
+1627  stdout-diff  BASH-ONLY  extglob-match             With extglob on, !($str) on the left or right of == has different meanings
+1628  stdout-diff  BASH-ONLY  extglob-match             extglob inside arg word
+1629  stdout-diff  BASH-ONLY  extglob-match             extglob is not detected in regex!
+1631  stdout-diff  BASH-ONLY  extglob-match             extended glob of single unicode char
+1632  stdout-diff  BASH-ONLY  extglob-match             Extended glob in ${x//pat/replace}
+1633  stdout-diff  BASH-ONLY  extglob-match             Extended glob in ${x%PATTERN}
+1638  both-diff    BASH-ONLY  for-expr                  C-style for loop
+1639  both-diff    BASH-ONLY  for-expr                  For loop with and without semicolon
+1640  both-diff    BASH-ONLY  for-expr                  Accepts { } syntax too
+1641  both-diff    BASH-ONLY  for-expr                  Empty init
+1642  both-diff    BASH-ONLY  for-expr                  Empty init and cond
+1643  both-diff    BASH-ONLY  for-expr                  Infinite loop with ((;;))
+1644  both-diff    BASH-ONLY  for-expr                  Arith lexer mode
+1645  both-diff    BASH-ONLY  for-expr                  Integers near 31, 32, 62 bits
+1646  both-diff    BASH-ONLY  for-expr                  Condition that's greater than 32 bits
+1651  both-diff    BASH-ONLY  func-parsing              . in function name
+1652  both-diff    BASH-ONLY  func-parsing              = in function name
+1653  exit-diff    BASH-ONLY  func-parsing              Function name with $
+1654  exit-diff    BASH-ONLY  func-parsing              Function name with command sub
+1655  exit-diff    BASH-ONLY  func-parsing              Function name with !
+1656  exit-diff    BASH-ONLY  func-parsing              Function name with -
+1659  stdout-diff  BASH-ONLY  glob-bash                 shopt -s nullglob
+1660  stdout-diff  BASH-ONLY  glob-bash                 shopt -s failglob in command context
+1661  stdout-diff  BASH-ONLY  glob-bash                 shopt -s failglob in loop context
+1662  stdout-diff  BASH-ONLY  glob-bash                 shopt -s failglob in array literal context
+1663  both-diff    BASH-ONLY  glob-bash                 shopt -s failglob exits properly in command context with set -e
+1664  both-diff    BASH-ONLY  glob-bash                 shopt -s failglob exits properly in loop context with set -e
+1665  stdout-diff  BASH-ONLY  glob-bash                 shopt -s failglob behavior on single line with semicolon
+1666  stdout-diff  BASH-ONLY  glob-bash                 dotglob (bash option that no_dash_glob is roughly consistent with)
+1707  stdout-diff  BASH-ONLY  globignore                Ignore *.txt
+1708  stdout-diff  BASH-ONLY  globignore                Ignore ?.txt
+1709  stdout-diff  BASH-ONLY  globignore                Ignore *.o:*.h
+1710  stdout-diff  BASH-ONLY  globignore                Ignore single file src/__main__.py
+1711  stdout-diff  BASH-ONLY  globignore                Ignore dirs dist/*:node_modules/*
+1712  stdout-diff  BASH-ONLY  globignore                find files in subdirectory but not the ignored pattern
+1713  stdout-diff  BASH-ONLY  globignore                Ignore globs with char patterns like [!ab]
+1714  stdout-diff  BASH-ONLY  globignore                Ignore globs with char classes like [[:alnum:]]
+1715  stdout-diff  BASH-ONLY  globignore                Ignore *
+1716  stdout-diff  BASH-ONLY  globignore                treat escaped patterns literally
+1717  stdout-diff  BASH-ONLY  globignore                resetting globignore reverts to default behaviour
+1719  stdout-diff  BASH-ONLY  globignore                Quoting GLOBIGNORE
+1721  stdout-diff  BASH-ONLY  globignore                When GLOBIGNORE is set, glob may become empty (nullglob too)
+1722  stdout-diff  BASH-ONLY  globignore                When GLOBIGNORE is set, no_dash_glob isn't respected
+1723  both-diff    BASH-ONLY  globignore                Extended glob expansion combined with GLOBIGNORE
+1729  both-diff    BASH-ONLY  here-doc                  Here string
+1730  both-diff    BASH-ONLY  here-doc                  Here string with $
+1785  stdout-diff  BASH-ONLY  interactive               HISTFILE is written in interactive shell
+1789  stdout-diff  BASH-ONLY  introspect                ${FUNCNAME[@]} array
+1791  stdout-diff  BASH-ONLY  introspect                BASH_SOURCE and BASH_LINENO scalar or array (e.g. for virtualenv)
+1792  both-diff    BASH-ONLY  introspect                ${FUNCNAME} with prefix/suffix operators
+1793  both-diff    BASH-ONLY  introspect                operators on FUNCNAME
+1794  exit-diff    BASH-ONLY  introspect                ${FUNCNAME} and "set -u" (OSH regression)
+1795  stdout-diff  BASH-ONLY  introspect                $((BASH_LINENO)) (scalar form in arith)
+1796  stdout-diff  BASH-ONLY  introspect                ${BASH_SOURCE[@]} with source and function name
+1798  stdout-diff  BASH-ONLY  introspect                ${BASH_LINENO[@]} is a stack of line numbers for function calls
+1805  both-diff    BASH-ONLY  let                       let with ()
+1808  exit-diff    BASH-ONLY  loop                      for loop with invalid identifier
+1823  stdout-diff  BASH-ONLY  loop                      too many args to continue
+1835  stdout-diff  BASH-ONLY  nameref                   pass array by reference
+1836  stdout-diff  BASH-ONLY  nameref                   mutate array by reference
+1837  stdout-diff  BASH-ONLY  nameref                   pass assoc array by reference
+1838  stdout-diff  BASH-ONLY  nameref                   pass local array by reference, relying on DYNAMIC SCOPING
+1841  both-diff    BASH-ONLY  nameref                   flag -n combined ${!ref} -- bash INVERTS
+1847  both-diff    BASH-ONLY  nameref                   name ref on Undef cell
+1850  stdout-diff  BASH-ONLY  nameref                   -n attribute on array is hard error, not a warning
+1854  stdout-diff  BASH-ONLY  nameref                   unset nameref
+1857  stdout-diff  BASH-ONLY  nameref                   Mutually recursive namerefs detected on WRITE
+1858  stdout-diff  BASH-ONLY  nameref                   Dynamic scope with namerefs
+1859  stdout-diff  BASH-ONLY  nameref                   change reference itself
+1860  stdout-diff  BASH-ONLY  nameref                   a[2] in nameref
+1861  stdout-diff  BASH-ONLY  nameref                   a[expr] in nameref
+1862  stdout-diff  BASH-ONLY  nameref                   a[@] in nameref
+1863  stdout-diff  BASH-ONLY  nameref                   mutate through nameref: ref[0]=
+1864  stdout-diff  BASH-ONLY  nameref                   bad mutation through nameref: ref[0]= where ref is array[0]
+1865  stdout-diff  BASH-ONLY  nameref                   @ in nameref isn't supported, unlike in ${!ref}
+1866  stdout-diff  BASH-ONLY  nameref                   Unquoted assoc reference on RHS
+1867  stdout-diff  BASH-ONLY  nix-idioms                var ref to array 'preHooks[@]'
+1868  both-diff    BASH-ONLY  nix-idioms                Similar to above with set -u
+1869  both-diff    BASH-ONLY  nix-idioms                ${!ref} to undefined array
+1870  both-diff    BASH-ONLY  nix-idioms                ${!ref} to undefined string var is fatal, INCONSISTENT with array
+1871  stdout-diff  BASH-ONLY  nix-idioms                export with dynamic var name +=
+1872  stdout-diff  BASH-ONLY  nix-idioms                let idiom can be written in POSIX shell - eval ": \$(( ))"
+1873  stdout-diff  BASH-ONLY  nocasematch-match         [[ equality matching
+1874  stdout-diff  BASH-ONLY  nocasematch-match         [[ regex matching
+1876  stdout-diff  BASH-ONLY  nocasematch-match         case matching
+1889  stdout-diff  POSIX      nul-bytes                 Compare \x00 byte versus \x01 byte - read builtin
+1890  stdout-diff  BASH-ONLY  nul-bytes                 Compare \x00 byte versus \x01 byte - read -n
+1897  both-diff    BASH-ONLY  osh-bugs                  YSH $[expr_sub] in OSH should not do dynamic globbing
+1900  both-diff    BASH-ONLY  paren-ambiguity           $(( closed with ) ) after multiple lines is command - #2337
+1911  exit-diff    BASH-ONLY  parse-errors              Bad braced var sub -- not allowed
+1920  both-diff    BASH-ONLY  parse-errors              Invalid for loop variable name
+1930  stdout-diff  BASH-ONLY  parse-errors              array literal inside array is a parse error
+1942  stdout-diff  BASH-ONLY  pipeline                  PIPESTATUS
+1943  stdout-diff  BASH-ONLY  pipeline                  PIPESTATUS is set on simple commands
+1944  stdout-diff  BASH-ONLY  pipeline                  PIPESTATUS with shopt -s lastpipe
+1945  stdout-diff  BASH-ONLY  pipeline                  |&
+1957  stdout-diff  BASH-ONLY  pipeline                  SIGPIPE causes pipeline to die (regression for issue #295)
+1977  both-diff    BASH-ONLY  print-source-code         typeset -f with function keyword (ksh style)
+1980  exit-diff    BASH-ONLY  process-sub               Process sub input
+1981  exit-diff    BASH-ONLY  process-sub               Process sub from external process to stdin
+1982  exit-diff    BASH-ONLY  process-sub               Process sub from shell to stdin
+1983  both-diff    BASH-ONLY  process-sub               Non-linear pipeline with >()
+1984  both-diff    BASH-ONLY  process-sub               $(<file) idiom with process sub
+1985  both-diff    BASH-ONLY  process-sub               status code is available
+1986  both-diff    BASH-ONLY  process-sub               shopt -s process_sub_fail
+1987  both-diff    BASH-ONLY  process-sub               process subs and pipelines together
+1988  both-diff    BASH-ONLY  process-sub               process sub in background &
+1990  both-diff    BASH-ONLY  prompt                    \[\] are non-printing
+1991  both-diff    BASH-ONLY  prompt                    literal escapes
+1992  both-diff    BASH-ONLY  prompt                    special case for $
+1993  both-diff    BASH-ONLY  prompt                    PS1 evaluation order
+1994  stdout-diff  BASH-ONLY  prompt                    PS1 evaluation order 2
+1995  both-diff    BASH-ONLY  prompt                    \1004
+1996  both-diff    BASH-ONLY  prompt                    \001 octal literals are supported
+1997  both-diff    BASH-ONLY  prompt                    \555 is beyond max octal byte of \377 and wrapped to m
+1998  both-diff    BASH-ONLY  prompt                    \x55 hex literals not supported
+1999  both-diff    BASH-ONLY  prompt                    Single backslash
+2000  both-diff    BASH-ONLY  prompt                    Escaped backslash
+2001  both-diff    BASH-ONLY  prompt                    \0001 octal literals are not supported
+2002  stdout-diff  BASH-ONLY  prompt                    \u0001 unicode literals not supported
+2003  both-diff    BASH-ONLY  prompt                    constant string
+2004  stdout-diff  BASH-ONLY  prompt                    hostname
+2005  stdout-diff  BASH-ONLY  prompt                    username
+2006  stdout-diff  BASH-ONLY  prompt                    current working dir
+2007  stdout-diff  BASH-ONLY  prompt                    \W is basename of working dir
+2008  stdout-diff  BASH-ONLY  prompt                    \t for 24h time (HH:MM:SS)
+2009  stdout-diff  BASH-ONLY  prompt                    \T for 12h time (HH:MM:SS)
+2010  stdout-diff  BASH-ONLY  prompt                    \@ for 12h time (HH:MM AM/PM)
+2011  stdout-diff  BASH-ONLY  prompt                    \A for 24h time (HH:MM)
+2012  stdout-diff  BASH-ONLY  prompt                    \d for date
+2013  stdout-diff  BASH-ONLY  prompt                    \D{%H:%M} for strftime
+2016  timeout      BASH-ONLY  prompt                    \j for number of jobs
+2017  stdout-diff  BASH-ONLY  prompt                    \l for TTY device basename
+2018  stdout-diff  BASH-ONLY  prompt                    \! for history number
+2019  stdout-diff  BASH-ONLY  prompt                    \# for command number
+2050  stdout-diff  BASH-ONLY  quote                     OSH allows invalid backslashes
+2052  stdout-diff  BASH-ONLY  quote                     $"" is a synonym for ""
+2060  stdout-diff  BASH-ONLY  redir-order               [[ + redirect order
+2100  stdout-diff  BASH-ONLY  redirect                  2&>1 (is it a redirect or is it like a&>1)
+2107  stdout-diff  BASH-ONLY  redirect                  Named file descriptor
+2108  both-diff    BASH-ONLY  redirect                  Double digit fd (20> file)
+2116  both-diff    BASH-ONLY  redirect                  Redirect to file descriptor that's not open
+2120  both-diff    BASH-ONLY  redirect                  &> redirects stdout and stderr
+2123  stdout-diff  BASH-ONLY  redirect                  1>&2- to move file descriptor
+2124  stdout-diff  BASH-ONLY  redirect                  1>&2- (Bash bug: fail to restore closed fd)
+2129  both-diff    BASH-ONLY  redirect                  can't mention big file descriptor
+2131  exit-diff    BASH-ONLY  redirect                  echo foo >&100 (OSH regression: does not fail with invalid fd 100)
+2133  stdout-diff  BASH-ONLY  redirect                  exec {fd}>&- (OSH regression: fails to close fd)
+2062  stdout-diff  BASH-ONLY  redirect-command          $(< $file) yields the contents of the file
+2063  stdout-diff  BASH-ONLY  redirect-command          `< $file` behaves like $(< file)
+2074  both-diff    BASH-ONLY  redirect-command          redirect bash extensions:   [[  ((  for ((
+2084  stdout-diff  BASH-ONLY  redirect-multi            File redirects with glob args (bash and zsh only)
+2087  stdout-diff  BASH-ONLY  redirect-multi            File redirect without matching any file, with failglob
+2090  both-diff    BASH-ONLY  redirect-multi            File redirect to $var with glob char
+2091  stdout-diff  BASH-ONLY  redirect-multi            File redirect that globs to more than one file (bash and zsh only)
+2092  both-diff    BASH-ONLY  redirect-multi            File redirect with extended glob
+2093  both-diff    BASH-ONLY  redirect-multi            Extended glob that doesn't match anything
+2094  stdout-diff  BASH-ONLY  redirect-multi            Non-file redirects don't respect glob args (we differe from bash)
+2095  stdout-diff  BASH-ONLY  redirect-multi            Redirect with brace expansion isn't allowed
+2096  stdout-diff  BASH-ONLY  redirect-multi            File redirects have word splitting too!
+2138  stdout-diff  BASH-ONLY  regex                     BASH_REMATCH
+2139  stdout-diff  BASH-ONLY  regex                     Match is unanchored at both ends
+2140  exit-diff    BASH-ONLY  regex                     Failed match
+2141  stdout-diff  BASH-ONLY  regex                     Regex quoted with \ -- preferred in bash
+2142  exit-diff    BASH-ONLY  regex                     Regex quoted with single quotes
+2143  exit-diff    BASH-ONLY  regex                     Regex quoted with double quotes
+2144  stdout-diff  BASH-ONLY  regex                     Fix single quotes by storing in variable
+2145  stdout-diff  BASH-ONLY  regex                     Fix single quotes by storing in variable
+2146  exit-diff    BASH-ONLY  regex                     Double quoting pat variable -- again bash doesn't like it.
+2147  stdout-diff  BASH-ONLY  regex                     Mixing quoted and unquoted parts
+2151  both-diff    BASH-ONLY  regex                     Regex with |
+2152  stdout-diff  BASH-ONLY  regex                     Regex to match literal brackets []
+2153  stdout-diff  BASH-ONLY  regex                     Regex to match literals . ^ $ etc.
+2154  stdout-diff  BASH-ONLY  regex                     Unquoted { is a regex parse error
+2155  stdout-diff  BASH-ONLY  regex                     Fatal error inside [[ =~ ]]
+2156  stdout-diff  BASH-ONLY  regex                     Quoted { and +
+2157  stdout-diff  BASH-ONLY  regex                     Escaped {
+2158  stdout-diff  BASH-ONLY  regex                     Escaped { stored in variable first
+2159  stdout-diff  BASH-ONLY  regex                     regex with ?
+2160  stdout-diff  BASH-ONLY  regex                     regex with unprintable characters
+2161  stdout-diff  BASH-ONLY  regex                     pattern $f(x)  -- regression
+2162  stdout-diff  BASH-ONLY  regex                     pattern a=(1)
+2163  both-diff    BASH-ONLY  regex                     pattern @f(x)
+2164  stdout-diff  BASH-ONLY  regex                     Bug: Nix idiom with closing ) next to pattern
+2165  stdout-diff  BASH-ONLY  regex                     unquoted (a  b) as pattern, (a  b|c)
+2166  stdout-diff  BASH-ONLY  regex                     Multiple adjacent () groups
+2168  stdout-diff  BASH-ONLY  regex                     c|a unquoted
+2173  stdout-diff  BASH-ONLY  regex                     make a lisp example
+2174  stdout-diff  BASH-ONLY  regex                     Operators and space lose meaning inside ()
+2175  both-diff    BASH-ONLY  serialize                 printf %q newline
+2176  stdout-diff  BASH-ONLY  serialize                 printf %q spaces
+2177  both-diff    BASH-ONLY  serialize                 printf %q quotes
+2178  stdout-diff  BASH-ONLY  serialize                 printf %q unprintable
+2179  stdout-diff  BASH-ONLY  serialize                 printf %q unicode
+2180  stdout-diff  BASH-ONLY  serialize                 printf %q invalid unicode
+2181  stdout-diff  BASH-ONLY  serialize                 set
+2182  stdout-diff  BASH-ONLY  serialize                 declare
+2195  exit-diff    BASH-ONLY  sh-func                   Scope of global variable when sourced in function (Shell Functions aren't Closures)
+2206  stdout-diff  BASH-ONLY  sh-options                $- with pipefail
+2215  both-diff    BASH-ONLY  sh-options                nounset
+2216  both-diff    BASH-ONLY  sh-options                -u is nounset
+2219  stdout-diff  BASH-ONLY  sh-options                shopt -p -o prints 'set' options
+2220  stdout-diff  BASH-ONLY  sh-options                shopt -o prints 'set' options
+2221  stdout-diff  BASH-ONLY  sh-options                shopt -p prints 'shopt' options
+2222  stdout-diff  BASH-ONLY  sh-options                shopt with no flags prints options
+2229  stdout-diff  BASH-ONLY  sh-options                set without args lists variables
+2230  stdout-diff  BASH-ONLY  sh-options                set without args and array variables
+2231  stdout-diff  BASH-ONLY  sh-options                set without args and assoc array variables (not in OSH)
+2234  both-diff    BASH-ONLY  sh-options                shopt -s strict:all
+2235  stdout-diff  BASH-ONLY  sh-options                shopt allows for backward compatibility like bash
+2236  stdout-diff  BASH-ONLY  sh-options                shopt -p validates option names
+2237  stdout-diff  BASH-ONLY  sh-options                shopt -p -o validates option names
+2240  stdout-diff  BASH-ONLY  sh-options                Unimplemented options - print, query, set, unset
+2241  stdout-diff  BASH-ONLY  sh-options                Unimplemented options - OSH shopt -s ignore_shopt_not_impl
+2243  stdout-diff  BASH-ONLY  sh-options                no-ops not shown by shopt -p
+2196  stdout-diff  BASH-ONLY  sh-options-bash           SHELLOPTS is updated when options are changed
+2197  stdout-diff  BASH-ONLY  sh-options-bash           SHELLOPTS is readonly
+2198  both-diff    BASH-ONLY  sh-options-bash           SHELLOPTS and BASHOPTS are non-empty
+2200  stdout-diff  BASH-ONLY  sh-options-bash           export SHELLOPTS does cross-process tracing
+2201  stdout-diff  BASH-ONLY  sh-options-bash           export SHELLOPTS does cross-process tracing with bash
+2203  stdout-diff  BASH-ONLY  sh-options-bash           If shopt --set xtrace is allowed, it should update SHELLOPTS, not BASHOPTS
+2255  stdout-diff  BASH-ONLY  sh-usage                  --rcfile in non-interactive shell prints warnings
+2335  both-diff    BASH-ONLY  strict-options            Arrays are incorrectly compared, but strict_array prevents it
+2344  both-diff    BASH-ONLY  temp-binding              More eval 'local v='
+2355  stdout-diff  BASH-ONLY  tilde                     ${x//~/~root}
+2357  stdout-diff  BASH-ONLY  tilde                     a[x]=foo:~ has tilde expansion
+2385  both-diff    BASH-ONLY  toysh                     @Q
+2386  both-diff    BASH-ONLY  toysh                     extglob $IFS 1
+2387  both-diff    BASH-ONLY  toysh                     extglob $IFS 2
+2388  both-diff    BASH-ONLY  toysh                     char class / extglob
+2389  stdout-diff  BASH-ONLY  toysh                     patsub of $* - http://landley.net/notes.html#23-04-2020
+2391  both-diff    BASH-ONLY  toysh                     {abc}<<< - http://landley.net/notes-2019.html#09-12-2019
+2392  both-diff    BASH-ONLY  toysh                     slice of @ and @ - http://landley.net/notes.html#23-04-2020
+2364  stdout-diff  BASH-ONLY  toysh-posix               readonly with temp binding
+2365  stdout-diff  BASH-ONLY  toysh-posix               Failed redirect in assignment, vs. export
+2393  stdout-diff  BASH-ONLY  type-compat               declare -i -l -u errors can be silenced - ignore_flags_not_impl
+2394  stdout-diff  BASH-ONLY  type-compat               declare -i with +=
+2395  stdout-diff  BASH-ONLY  type-compat               declare -i with arithmetic inside strings (Nix, issue 864)
+2397  stdout-diff  BASH-ONLY  type-compat               declare array vs. string: mixing -a +a and () ''
+2398  stdout-diff  BASH-ONLY  type-compat               declare array vs. associative array
+2399  stdout-diff  BASH-ONLY  type-compat               declare -l -u
+2401  stdout-diff  BASH-ONLY  unicode                   Unicode escapes \u03bc \U000003bc in $'', echo -e, printf
+2402  exit-diff    BASH-ONLY  unicode                   Max code point U+10ffff can escaped with $''  printf  echo -e
+2403  exit-diff    BASH-ONLY  unicode                   $'' does NOT check that 0x110000 is too big at parse time
+2404  exit-diff    BASH-ONLY  unicode                   $'' does not check for surrogate range at parse time
+2405  both-diff    BASH-ONLY  unicode                   printf / echo -e do NOT check max code point at runtime
+2406  both-diff    BASH-ONLY  unicode                   printf / echo -e do NOT check surrogates at runtime
+2416  stdout-diff  BASH-ONLY  var-op-bash               Case folding - Unicode characters
+2417  stdout-diff  BASH-ONLY  var-op-bash               Case folding - multi code point
+2419  stdout-diff  BASH-ONLY  var-op-bash               Lower Case with constant string (VERY WEIRD)
+2420  stdout-diff  BASH-ONLY  var-op-bash               Lower Case glob
+2421  both-diff    BASH-ONLY  var-op-bash               ${x@u} U L - upper / lower case (bash 5.1 feature)
+2422  both-diff    BASH-ONLY  var-op-bash               ${x@Q}
+2423  both-diff    BASH-ONLY  var-op-bash               ${array@Q} and ${array[@]@Q}
+2424  both-diff    BASH-ONLY  var-op-bash               ${!prefix@} ${!prefix*} yields sorted array of var names
+2425  both-diff    BASH-ONLY  var-op-bash               ${!prefix@} matches var name (regression)
+2426  both-diff    BASH-ONLY  var-op-bash               ${var@a} for attributes
+2427  both-diff    BASH-ONLY  var-op-bash               ${var@a} error conditions
+2433  both-diff    BASH-ONLY  var-op-bash               ${!A@a} and ${!A[@]@a}
+2434  both-diff    BASH-ONLY  var-op-bash               undef vs. empty string in var ops
+2435  stdout-diff  BASH-ONLY  var-op-bash               -o nounset with var ops
+2436  both-diff    BASH-ONLY  var-op-bash               ${a[0]@a} and ${a@a}
+2437  both-diff    BASH-ONLY  var-op-bash               ${!r@a} with r='a[0]' (attribute for indirect expansion of an array element)
+2438  stdout-diff  BASH-ONLY  var-op-bash               Array expansion with nullary var op @Q
+2439  stdout-diff  BASH-ONLY  var-op-bash               Array expansion with nullary var op @P
+2440  stdout-diff  BASH-ONLY  var-op-bash               Array expansion with nullary var op @a
+2442  stdout-diff  BASH-ONLY  var-op-len                Unicode string length (UTF-8)
+2445  stdout-diff  BASH-ONLY  var-op-len                String length with invalid utf-8 continuation bytes
+2447  both-diff    BASH-ONLY  var-op-len                Length of undefined variable with nounset
+2448  exit-diff    BASH-ONLY  var-op-len                Length operator can't be followed by test operator
+2449  stdout-diff  BASH-ONLY  var-op-len                ${#s} respects LC_ALL - length in bytes or code points
+2451  both-diff    BASH-ONLY  var-op-patsub             Pattern replacement on unset variable
+2455  stdout-diff  BASH-ONLY  var-op-patsub             Replace hard glob
+2458  stdout-diff  BASH-ONLY  var-op-patsub             Confusing unquoted slash matches bash (and ash)
+2459  stdout-diff  BASH-ONLY  var-op-patsub             Synthesized ${x///} bug (similar to above)
+2461  stdout-diff  BASH-ONLY  var-op-patsub             Replacement with special chars (bug fix)
+2462  stdout-diff  BASH-ONLY  var-op-patsub             Replace backslash
+2463  stdout-diff  BASH-ONLY  var-op-patsub             Replace right ]
+2464  stdout-diff  BASH-ONLY  var-op-patsub             Substitute glob characters in pattern, quoted and unquoted
+2469  stdout-diff  BASH-ONLY  var-op-patsub             patsub with single quotes and hyphen in character class (regression)
+2470  stdout-diff  BASH-ONLY  var-op-patsub             patsub with [^]]
+2472  stdout-diff  BASH-ONLY  var-op-patsub             Pattern is empty $foo$bar -- regression for infinite loop
+2473  stdout-diff  BASH-ONLY  var-op-patsub             Chromium from http://www.oilshell.org/blog/2016/11/07.html
+2474  stdout-diff  BASH-ONLY  var-op-patsub             ${x//~homedir/}
+2475  both-diff    BASH-ONLY  var-op-slice              String slice
+2476  exit-diff    BASH-ONLY  var-op-slice              Cannot take length of substring slice
+2477  stdout-diff  BASH-ONLY  var-op-slice              Out of range string slice: begin
+2478  stdout-diff  BASH-ONLY  var-op-slice              Out of range string slice: length
+2479  both-diff    BASH-ONLY  var-op-slice              Negative start index
+2480  both-diff    BASH-ONLY  var-op-slice              Negative start index respects unicode
+2481  both-diff    BASH-ONLY  var-op-slice              Negative second arg is position, not length!
+2482  both-diff    BASH-ONLY  var-op-slice              Negative start index respects unicode
+2483  both-diff    BASH-ONLY  var-op-slice              String slice with math
+2484  both-diff    BASH-ONLY  var-op-slice              Slice undefined
+2485  both-diff    BASH-ONLY  var-op-slice              Slice UTF-8 String
+2486  both-diff    BASH-ONLY  var-op-slice              Slice string with invalid UTF-8 results in empty string and warning
+2487  both-diff    BASH-ONLY  var-op-slice              Slice string with invalid UTF-8 with strict_word_eval
+2488  both-diff    BASH-ONLY  var-op-slice              Slice with an index that's an array -- silent a[0] decay
+2489  both-diff    BASH-ONLY  var-op-slice              Slice with an assoc array
+2490  both-diff    BASH-ONLY  var-op-slice              Simple ${@:offset}
+2491  both-diff    BASH-ONLY  var-op-slice              ${@:offset} and ${*:offset}
+2492  both-diff    BASH-ONLY  var-op-slice              ${@:offset:length} and ${*:offset:length}
+2493  stdout-diff  BASH-ONLY  var-op-slice              ${@:0:1}
+2494  both-diff    BASH-ONLY  var-op-slice              Permutations of implicit begin and length
+2496  both-diff    BASH-ONLY  var-op-slice              ${array[@]::} has implicit length of zero - for ble.sh
+2500  stdout-diff  BASH-ONLY  var-op-strip              Remove const suffix is vectorized on $@ array
+2525  stdout-diff  BASH-ONLY  var-op-strip              extglob in pattern
+2540  stdout-diff  BASH-ONLY  var-op-test               "${a[@]+foo}" and "${a[@]:+foo}" - operators are equivalent on arrays?
+2541  both-diff    BASH-ONLY  var-op-test               Nix idiom ${!hooksSlice+"${!hooksSlice}"} - was workaround for obsolete bash 4.3 bug
+2543  stdout-diff  BASH-ONLY  var-op-test               array and - and +
+2544  stdout-diff  BASH-ONLY  var-op-test               $@ (empty) and - and +
+2549  stdout-diff  BASH-ONLY  var-op-test               assoc array and - and +
+2554  stdout-diff  BASH-ONLY  var-op-test               array ${arr[0]=x}
+2555  stdout-diff  BASH-ONLY  var-op-test               assoc array ${arr["k"]=x}
+2558  both-diff    BASH-ONLY  var-op-test               op-test for ${a} and ${a[0]}
+2559  both-diff    BASH-ONLY  var-ref                   var ref ${!a}
+2560  both-diff    BASH-ONLY  var-ref                   ${!ref-default}
+2561  exit-diff    BASH-ONLY  var-ref                   ${!undef:-}
+2562  stdout-diff  BASH-ONLY  var-ref                   comparison to ${!array[@]} keys (similar SYNTAX)
+2563  stdout-diff  BASH-ONLY  var-ref                   ${!a[@]-'default'} is legal but fails with more than one element
+2564  both-diff    BASH-ONLY  var-ref                   var ref to $@ with @
+2565  both-diff    BASH-ONLY  var-ref                   var ref to $1 and $2 with 1 and 2
+2566  both-diff    BASH-ONLY  var-ref                   var ref: 1, @, *
+2567  both-diff    BASH-ONLY  var-ref                   var ref to special var BASH_SOURCE
+2568  both-diff    BASH-ONLY  var-ref                   var ref to $? with '?'
+2569  both-diff    BASH-ONLY  var-ref                   Var ref, then assignment with ${ := }
+2570  both-diff    BASH-ONLY  var-ref                   Var ref, then error with ${ ? }
+2571  stdout-diff  BASH-ONLY  var-ref                   Indirect expansion, THEN suffix operators
+2572  both-diff    BASH-ONLY  var-ref                   var ref OF array var -- silent a[0] decay
+2573  both-diff    BASH-ONLY  var-ref                   array ref
+2574  both-diff    BASH-ONLY  var-ref                   array ref with strict_array
+2575  both-diff    BASH-ONLY  var-ref                   var ref TO array var
+2576  both-diff    BASH-ONLY  var-ref                   var ref TO array var, with subscripts
+2577  both-diff    BASH-ONLY  var-ref                   var ref TO assoc array a[key]
+2578  stdout-diff  BASH-ONLY  var-ref                   var ref TO array with arbitrary subscripts
+2579  exit-diff    BASH-ONLY  var-ref                   Bizarre tilde expansion in array index
+2580  stdout-diff  BASH-ONLY  var-ref                   Indirect expansion TO fancy expansion features bash disallows
+2581  stdout-diff  BASH-ONLY  var-ref                   Bad var ref
+2582  stdout-diff  BASH-ONLY  var-ref                   Bad var ref 2
+2583  both-diff    BASH-ONLY  var-ref                   ${!OPTIND} (used by bash completion
+2584  stdout-diff  BASH-ONLY  var-ref                   var ref doesn't need cycle detection
+2585  stdout-diff  BASH-ONLY  var-ref                   Var Ref Code Injection $(tee PWNED)
+2586  stdout-diff  BASH-ONLY  var-ref                   ${!array_ref:-set} and ${!array_ref:=assign}
+2587  both-diff    BASH-ONLY  var-ref                   Array indirect expansion with suffix operators
+2588  both-diff    BASH-ONLY  var-ref                   Array indirect expansion with replacements
+2589  both-diff    BASH-ONLY  var-ref                   Array indirect expansion with @? conversion
+2631  exit-diff    BASH-ONLY  var-sub                   Bad var sub
+2635  exit-diff    BASH-ONLY  var-sub                   Descriptor redirect to bad "$@"
+2622  stdout-diff  BASH-ONLY  var-sub-quote             "${undef-'c d'}" and "${foo%'c d'}" are parsed differently
+2625  stdout-diff  BASH-ONLY  var-sub-quote             / operator with single quoted arg (causes syntax error in regex in OSH, reported by Crestwave)
+2626  stdout-diff  BASH-ONLY  var-sub-quote             single quotes work inside character classes
+2628  stdout-diff  BASH-ONLY  var-sub-quote             Right Brace as argument (similar to #702)
+2651  both-diff    BASH-ONLY  vars-special              $BASHPID DOES change with subshell and command sub
+2654  stdout-diff  BASH-ONLY  vars-special              $PIPESTATUS
+2656  both-diff    BASH-ONLY  vars-special              $UID and $EUID
+2657  stdout-diff  BASH-ONLY  vars-special              $OSTYPE is non-empty
+2658  stdout-diff  BASH-ONLY  vars-special              $HOSTNAME
+2659  stdout-diff  BASH-ONLY  vars-special              $LINENO is the current line, not line of function call
+2663  stdout-diff  BASH-ONLY  vars-special              $LINENO in ((
+2666  both-diff    BASH-ONLY  vars-special              $LINENO in for (( loop
+2669  stdout-diff  BASH-ONLY  vars-special              $_ with simple command and evaluation
+2670  stdout-diff  BASH-ONLY  vars-special              $_ and ${_}
+2671  stdout-diff  BASH-ONLY  vars-special              $_ with word splitting
+2672  stdout-diff  BASH-ONLY  vars-special              $_ with pipeline and subshell
+2673  stdout-diff  BASH-ONLY  vars-special              $_ with && and ||
+2674  stdout-diff  BASH-ONLY  vars-special              $_ is not reset with (( and [[
+2675  stdout-diff  BASH-ONLY  vars-special              $_ with assignments, arrays, etc.
+2676  stdout-diff  BASH-ONLY  vars-special              $_ with loop
+2688  stdout-diff  BASH-ONLY  word-eval                 Word joining
+2731  stdout-diff  BASH-ONLY  word-split                IFS='' with ${a[@]} and ${a[*]} (bug #627)
+2732  both-diff    BASH-ONLY  word-split                IFS='' with ${!prefix@} and ${!prefix*} (bug #627)
+2733  stdout-diff  BASH-ONLY  word-split                IFS='' with ${!a[@]} and ${!a[*]} (bug #627)
+2742  stdout-diff  BASH-ONLY  word-split                IFS=x and '' and $@ (#2)
+2745  both-diff    BASH-ONLY  word-split                Regression: "${!v*}"x should not be split
+2751  stdout-diff  BASH-ONLY  xtrace                    xtrace with unicode chars
+2765  exit-diff    BASH-ONLY  xtrace                    Regression: xtrace for "declare -a a+=(v)"
+2768  stdout-diff  BASH-ONLY  zsh-assoc                 retrieve key
+2769  stdout-diff  BASH-ONLY  zsh-assoc                 set key
+2770  exit-diff    BASH-ONLY  zsh-assoc                 iterate over keys
+2772  stdout-diff  BASH-ONLY  zsh-assoc                 get length
+2776  stdout-diff  BASH-ONLY  zsh-idioms                zsh var sub is rejected at runtime

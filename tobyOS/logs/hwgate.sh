@@ -34,7 +34,10 @@ fi
 
 PREFIXES=("$@")
 # pstat_ is in the default set because the clock checks read btime from it.
-[ ${#PREFIXES[@]} -gt 0 ] || PREFIXES=(pstat_ clock_ ps_ sh_ strace_native)
+# The native-parity batch's prefixes are in too, except mkfs_ (it formats the
+# gate's AHCI scratch disk, which only QEMU has). su_ creates and deletes a
+# throwaway account, so it needs a writable /data.
+[ ${#PREFIXES[@]} -gt 0 ] || PREFIXES=(pstat_ clock_ ps_ sh_ strace_native census_ setup_ proc_ tsh_ mu_ su_ arc_ ed_ cron_ sys_ net_ teardown_)
 
 # ---- cut the sections out of the fixture -----------------------------------
 python - "$FIX" "$REMOTE" "${PREFIXES[@]}" <<'PY'

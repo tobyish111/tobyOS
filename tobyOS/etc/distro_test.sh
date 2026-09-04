@@ -401,15 +401,16 @@ killall sleep 2>/dev/null
 # /etc/dbg_test.elf is a NATIVE tobyOS program, so this exercises the
 # native-path syscall stops (the Linux path has always had them). Bounded,
 # because every traced syscall is two context switches.
-# /bin/arch is a busybox applet, so it runs under the LINUX personality --
+# `busybox arch` runs under the LINUX personality (/bin/arch is native
+# since 2026-09-04) --
 # which is where the kernel's syscall stops live. Bounded, because every
 # traced syscall is two context switches.
 echo @@strace_run
-timeout 40 strace /bin/arch 2>&1 | head -8
+timeout 40 strace busybox arch 2>&1 | head -8
 echo @@strace_exit
-timeout 40 strace /bin/arch 2>&1 | grep "exited with" | head -1
+timeout 40 strace busybox arch 2>&1 | grep "exited with" | head -1
 echo @@strace_count
-timeout 40 strace -c /bin/arch 2>&1 | head -16
+timeout 40 strace -c busybox arch 2>&1 | head -16
 echo @@strace_native
 # A NATIVE tobyOS program, traced through the native dispatcher's stops.
 # Enabled 2026-09-01, wedged real hardware, reverted; the real cause was the
@@ -671,5 +672,318 @@ echo @@sh_system
 # carried through waitpid's encoding, popen for reading AND writing, and a
 # quoted argument. This used to route through the 0/14 minimal shell.
 systest
+
+# =========================================================================
+# Native-parity batch (2026-09-04): the 46 busybox-only utilities, natively.
+# Section prefixes: census_ setup_ proc_ tsh_ mu_ (coreutils) su_ arc_
+# (archive) ed_ cron_ sys_ (modules) net_ mkfs_ (needs the gate's AHCI
+# scratch disk: QEMU only, excluded from hwgate's default set) teardown_.
+# The native awk is a 313-line subset ($NF, ?:, sub() and `$1=="x"` patterns
+# are not there): these sections use sed/cut/grep. `tail` reads files, never
+# pipes. Privilege tests run as `pcall`, created in setup_users.
+# =========================================================================
+echo @@census_46
+# every one of the 46 must be a real /bin file that is NOT the busybox binary
+for n in arch chgrp factor false link logname nproc printf pwd shred sum test true unlink uptime users who ar cpio unxz xz xzcat ed crontab init insmod lsmod modprobe rmmod blkid fsck mkfs.ext2 mkfs.minix mkfs.vfat tune2fs arp arping hostid ip netstat route telnet traceroute passwd su; do
+    if [ ! -f "/bin/$n" ]; then echo "MISSING $n"
+    elif cmp -s "/bin/$n" /bin/busybox; then echo "BUSYBOX $n"; fi
+done
+echo "census done"
+
+echo @@setup_users
+# useradd registers in BOTH /etc/passwd and the kernel's login database now
+userdel pcall > /dev/null 2>&1
+useradd -u 1601 -g 100 -s /bin/tsh pcall > /tmp/ua.out 2>&1; echo add=$?
+grep -c '^pcall:' /etc/passwd
+grep -c 'kernel login database' /tmp/ua.out
+sudo -u pcall id -u
+
+echo @@proc_new
+cut -d' ' -f1 /proc/vmstat | tr '\n' ' '; echo
+PF=$(sed -n 's/^pgfault //p' /proc/vmstat); [ "${PF:-0}" -gt 0 ] && echo "faults counted" || echo "no faults"
+head -1 /proc/net/route | tr '\t' ' ' | tr -s ' ' | cut -c1-40
+grep -c eth0 /proc/net/route
+head -1 /proc/net/arp | tr -s ' ' | cut -c1-30
+
+echo @@tsh_caps
+# ARG_MAX 32 -> 512 (hosted); $(...) capture 1 KiB -> 8 KiB (hosted); "" -> 127
+tsh -c 'set -- $(seq 1 255); echo $#'
+tsh -c 'x=$(seq 512 | tr "\n" " "); echo ${#x}'
+tsh -c '"" -c x' 2>&1; echo rc=$?
+tsh -c 'for i in $(seq 1 200); do :; done; echo loop ok'
+
+echo @@mu_arch
+/bin/arch; busybox arch
+echo @@mu_true_false
+/bin/true; echo rc=$?; /bin/false; echo rc=$?; /bin/true --version | head -1 | cut -d' ' -f1
+echo @@mu_printf
+/bin/printf '%s|%5d|%-4s|%03o|%x|%c|%b|%%\n' abc 42 ab 8 255 zed 'x\ty'
+/bin/printf '%d %d\n' 1 2 3
+/bin/printf '%.3f %e %g %+d %.2f\n' 3.14159 1234.5 0.0001 7 2.006
+/bin/printf '\x41\102\u00e9\n'
+/bin/printf '%q\n' "it's"
+/bin/printf '%d\n' abc 2>&1; echo rc=$?
+/bin/printf '%5.2s|%-6b|\n' abcdef 'a\nb'
+echo @@mu_test
+/bin/test 3 -gt 2; echo rc=$?
+/bin/test abc = abd; echo rc=$?
+/bin/[ -d /tmp -a -f /bin/tsh ]; echo rc=$?
+/bin/test ! \( 1 -eq 1 -o 2 -eq 3 \); echo rc=$?
+env /bin/[ x > /tmp/bt.out 2>&1; RC=$?; grep 'missing' /tmp/bt.out | sed 's/^/x/'; echo rc=$RC
+/bin/test -n "" -o -z ""; echo rc=$?
+/bin/test 1 -eq x 2>&1; echo rc=$?
+/bin/test -e /bin/tsh -a ! -e /nonesuch; echo rc=$?
+/bin/test /bin/tsh -ef /bin/tsh; echo rc=$?
+echo @@mu_factor
+/bin/factor 360 97 1 1000000007
+echo 12 | /bin/factor
+/bin/factor abc 2>&1; echo rc=$?
+echo @@mu_sum
+printf 'hello world\n' > /tmp/sum.txt
+/bin/sum /tmp/sum.txt; busybox sum /tmp/sum.txt
+/bin/sum -s /tmp/sum.txt; busybox sum -s /tmp/sum.txt
+echo @@mu_link_unlink
+# a hard link shares the inode: write through one name, read through the other
+D=/tmp; [ -w /data ] && mkdir -p /data/nptest && D=/data/nptest
+echo one > $D/lk1; rm -f $D/lk2
+/bin/link $D/lk1 $D/lk2 2>&1; echo rc=$?
+[ -f $D/lk2 ] && echo two > $D/lk2 && cat $D/lk1
+/bin/unlink $D/lk2 2>&1; echo rc=$?
+[ -e $D/lk2 ] && echo still || echo gone
+cat $D/lk1
+/bin/unlink $D/nonesuch 2>&1; echo rc=$?
+rm -f $D/lk1; [ "$D" = /data/nptest ] && rmdir /data/nptest
+echo @@mu_logname_users
+/bin/logname; echo rc=$?
+echo "users=[$(/bin/users)]"
+echo "who=$(/bin/who | wc -l)"
+/bin/who -q | grep 'users='
+/bin/who -b | grep -c 'system boot'
+/bin/nproc; /bin/nproc --ignore=1
+echo "hostid=$(/bin/hostid)"
+echo @@mu_uptime
+/bin/uptime
+/bin/uptime -p
+/bin/uptime -s
+echo @@mu_pwd
+cd /tmp && /bin/pwd && /bin/pwd -P && cd /
+echo @@mu_chgrp
+touch /tmp/cg; /bin/chgrp -v wheel /tmp/cg; ls -l /tmp/cg | awk '{print $4}'
+/bin/chgrp 20 /tmp/cg; ls -ln /tmp/cg | awk '{print $4}'
+/bin/chgrp nogroup /tmp/cg 2>&1; echo rc=$?
+echo @@mu_shred
+printf 'secret data here\n' > /tmp/shr
+/bin/shred -n 2 -z -u -v /tmp/shr 2>&1 | sed 's/^shred: //'
+[ -e /tmp/shr ] && echo still || echo gone
+echo @@mu_init
+/bin/init 2>&1; echo rc=$?
+
+echo @@su_passwd
+userdel ptest > /dev/null 2>&1
+useradd -u 1600 -g 100 -s /bin/tsh ptest > /dev/null 2>&1; echo add=$?
+mkdir -p /home/ptest
+printf 'pw-one\npw-one\n' | /bin/passwd ptest > /tmp/pw1.out 2>&1; echo rc=$?; grep '^passwd:' /tmp/pw1.out
+# a non-root caller must present the target's password
+sudo -u pcall /bin/su ptest -c 'id -un' <<'EOF'
+pw-one
+EOF
+echo rc=$?
+sudo -u pcall /bin/su ptest -c 'id -un' <<'EOF'
+wrong
+EOF
+echo rc=$?
+# the user changes their own password: the current one is checked by the KERNEL
+sudo -u ptest /bin/passwd > /tmp/pw2.out 2>&1 <<'EOF'
+pw-one
+pw-two
+pw-two
+EOF
+echo rc=$?; grep '^passwd: password' /tmp/pw2.out
+sudo -u ptest /bin/passwd > /tmp/pw3.out 2>&1 <<'EOF'
+nope
+pw-three
+pw-three
+EOF
+echo rc=$?; grep '^passwd: password' /tmp/pw3.out
+sudo -u pcall /bin/su - ptest -c 'echo $HOME $USER' <<'EOF'
+pw-two
+EOF
+# a user may not set someone else's password
+sudo -u pcall /bin/passwd ptest > /tmp/pw4.out 2>&1 <<'EOF'
+x
+y
+y
+EOF
+echo rc=$?; grep '^passwd:' /tmp/pw4.out
+/bin/su ptest -c 'id -u'; echo rc=$?
+userdel ptest > /dev/null 2>&1
+
+echo @@arc_ar
+cd /tmp && printf 'aaa\n' > a.txt && printf 'bbbbbb\n' > b.txt && printf 'c\n' > a-very-long-member-name.txt
+/bin/ar rcs libt.a a.txt b.txt a-very-long-member-name.txt; echo rc=$?
+/bin/ar t libt.a; busybox ar t libt.a
+/bin/ar p libt.a b.txt
+mkdir -p x && cd x && /bin/ar x ../libt.a && cat a-very-long-member-name.txt && cd ..
+/bin/ar d libt.a b.txt; /bin/ar t libt.a | wc -l
+head -c 7 libt.a; echo
+/bin/ar tv libt.a | tr -s ' ' | cut -d' ' -f1,3,8
+cd /
+echo @@arc_cpio
+rm -rf /tmp/cp /tmp/cpx /tmp/t.cpio /tmp/bb.cpio /tmp/t.odc; mkdir -p /tmp/cp/sub /tmp/cpx; echo hi > /tmp/cp/f1; echo there > /tmp/cp/sub/f2
+cd /tmp/cp; printf 'f1\nsub/f2\n' | /bin/cpio -o -H newc > /tmp/t.cpio 2>/dev/null; echo rc=$?; cd /
+head -c 6 /tmp/t.cpio; echo
+/bin/cpio -t < /tmp/t.cpio | sort; busybox cpio -t < /tmp/t.cpio 2>/dev/null | sort
+cd /tmp/cpx; /bin/cpio -id < /tmp/t.cpio 2>&1; cat /tmp/cpx/sub/f2; cd /
+cd /tmp/cp; printf 'f1\nsub/f2\n' | busybox cpio -o -H newc > /tmp/bb.cpio 2>/dev/null; cd /; /bin/cpio -t < /tmp/bb.cpio | sort | tr '\n' ' '; echo
+cd /tmp/cp; printf 'f1\nsub/f2\n' | /bin/cpio -o -H odc > /tmp/t.odc 2>/dev/null; cd /; head -c 6 /tmp/t.odc; echo; /bin/cpio -t < /tmp/t.odc | wc -l
+echo @@arc_xz_decode
+/bin/unxz -c /etc/gnumade.xz | sha256sum | cut -c1-16
+/bin/xzcat /etc/gnumade32.xz | sha256sum | cut -c1-16
+/bin/xz -dc /etc/gnumadeblk.xz | sha256sum | cut -c1-16
+sha256sum /etc/xzsrc.txt | cut -c1-16
+/bin/xz -t /etc/gnumade.xz; echo rc=$?
+/bin/xz -t /etc/gnubad.xz 2>&1; echo rc=$?
+/bin/xz -l /etc/gnumadeblk.xz
+echo @@arc_xz_encode
+cp /etc/xzsrc.txt /tmp/xe.txt && /bin/xz -k /tmp/xe.txt; echo rc=$?
+busybox unxz -c /tmp/xe.txt.xz > /tmp/xe1.out && cmp /tmp/xe1.out /etc/xzsrc.txt && echo "busybox reads native xz"
+/bin/xz -dc /tmp/xe.txt.xz > /tmp/xe2.out && cmp /tmp/xe2.out /etc/xzsrc.txt && echo "round trip"
+/bin/xz -c --check=crc32 /tmp/xe.txt | /bin/xz -d > /tmp/xe3.out && cmp /tmp/xe3.out /etc/xzsrc.txt && echo "crc32 pipe"
+printf '' | /bin/xz | /bin/xz -d | wc -c
+/bin/xz --version | head -1 | cut -d' ' -f1-3
+
+echo @@ed_basic
+cd /tmp && printf 'one\ntwo\nthree\n' > edt.txt
+printf '2d\n$a\nfour\n.\n1s/one/ONE/\n,p\nw\nq\n' | /bin/ed -s edt.txt
+cat edt.txt
+echo @@ed_more
+printf 'g/e/s/e/E/g\n,n\nu\n,p\nQ\n' | /bin/ed -s /tmp/edt.txt
+printf '1,2m$\n,p\n2t0\n,p\n1,2j\n,p\n/four/\n=\nQ\n' | /bin/ed -s /tmp/edt.txt
+printf 'H\nzz\nq\n' | /bin/ed -s /tmp/edt.txt | head -1
+printf ',s/e/X/2\n,p\nQ\n' | /bin/ed -s /tmp/edt.txt
+printf 'r !echo shell\n,p\nw /tmp/edout.txt\nQ\n' | /bin/ed -s /tmp/edt.txt; cat /tmp/edout.txt | wc -l
+printf 'a\nline1\nline2\n.\nw /tmp/ednew.txt\nq\n' | /bin/ed -s; cat /tmp/ednew.txt
+printf '1\nka\n3\n'"'"'ap\n,s/^/> /\n,p\nQ\n' | /bin/ed -s /tmp/edt.txt
+cd /
+
+echo @@cron_install
+rm -f /tmp/cron_out
+printf 'x * * * * true\n' | /bin/crontab - 2>&1; echo rc=$?
+printf '# a comment\nSHELL=/bin/tsh\n* * * * * echo tick >> /tmp/cron_out\n@reboot echo boot >> /tmp/cron_out\n' | /bin/crontab -; echo rc=$?
+/bin/crontab -l | grep -c .
+i=0; while [ $i -lt 70 ] && ! grep -q tick /tmp/cron_out 2>/dev/null; do sleep 1; i=$((i+1)); done
+grep -c tick /tmp/cron_out; grep -c boot /tmp/cron_out
+/bin/crontab -r; echo rc=$?
+/bin/crontab -l 2>&1; echo rc=$?
+
+echo @@sys_modules
+ls /lib/modules
+/bin/rmmod hello > /dev/null 2>&1        # the kernel autoloads /lib/modules at boot
+/bin/lsmod
+/bin/insmod /lib/modules/hello.ko; echo rc=$?
+/bin/lsmod | grep -c '^hello '
+cut -d' ' -f1,5 /proc/modules
+/bin/insmod /lib/modules/hello.ko 2>&1; echo rc=$?
+/bin/rmmod hello; echo rc=$?
+/bin/lsmod | grep -c hello
+/bin/modprobe hello; echo rc=$?
+/bin/modprobe -r hello; echo rc=$?
+/bin/modprobe nonesuch 2>&1; echo rc=$?
+/bin/rmmod hello 2>&1; echo rc=$?
+sudo -u pcall /bin/insmod /lib/modules/hello.ko 2>&1; echo rc=$?
+
+echo @@net_ip
+/bin/ip addr show eth0 | sed 's/^ *//' | cut -d' ' -f1-3
+/bin/ip -br addr | tr -s ' ' | cut -d' ' -f1,2
+/bin/ip -br addr | grep -c '/'
+/bin/ip link show eth0 | head -1 | cut -d' ' -f1-3
+/bin/ip route | cut -d' ' -f1-4
+/bin/ip -o link | wc -l
+/bin/ip neigh > /dev/null; echo rc=$?
+echo @@net_route_netstat
+/bin/route -n | sed -n '2,3p' | tr -s ' ' | cut -d' ' -f1,4,8
+/bin/netstat -rn | head -1
+/bin/netstat -tln | head -2
+/bin/netstat -i | head -3 | cut -d' ' -f1 | tr '\n' ' '; echo
+/bin/netstat -an | grep -c '^tcp'
+echo @@net_arp
+GW=$(/bin/ip route | grep '^default' | cut -d' ' -f3); echo "gw=$GW"
+ping -c1 -W2 $GW > /dev/null 2>&1
+/bin/arp -n | sed 1d | tr -s ' ' | cut -d' ' -f1,2,3
+/bin/arp -a | head -1 | cut -d' ' -f1-2
+/bin/ip neigh | head -1 | tr -s ' ' | cut -d' ' -f1,2,3,5
+/bin/arp -s 10.0.2.99 aa:bb:cc:dd:ee:ff; echo rc=$?
+/bin/arp -n | grep -c 10.0.2.99
+/bin/arp -d 10.0.2.99; echo rc=$?
+/bin/arp -n | grep -c 10.0.2.99
+/bin/arp -d 10.0.2.98 2>&1; echo rc=$?
+echo @@net_arping
+GW=$(/bin/ip route | grep '^default' | cut -d' ' -f3)
+/bin/arping -c 2 -w 3 $GW > /tmp/ap.out; echo rc=$?; sed 's/  [0-9.]*ms/  T ms/; s/\[[0-9A-F:]*\]/[MAC]/' /tmp/ap.out
+/bin/arping -c 1 -w 1 10.0.2.77 > /tmp/ap2.out; echo rc=$?; tail -1 /tmp/ap2.out
+sudo -u pcall /bin/arping -c 1 $GW 2>&1; echo rc=$?
+echo @@net_traceroute
+GW=$(/bin/ip route | grep '^default' | cut -d' ' -f3)
+/bin/traceroute -n -q 1 -w 2 -m 3 $GW > /tmp/tr.out 2>&1; echo rc=$?; sed 's/  [0-9.]* ms/  T ms/g' /tmp/tr.out
+sudo -u pcall /bin/traceroute -n -m 1 $GW 2>&1; echo rc=$?
+echo @@net_ip_set
+GW=$(/bin/ip route | grep '^default' | cut -d' ' -f3)
+/bin/ip route add 192.168.77.0/24 via $GW; echo rc=$?
+/bin/ip route | grep -c 192.168.77
+/bin/route del -net 192.168.77.0 netmask 255.255.255.0; echo rc=$?
+/bin/ip route | grep -c 192.168.77
+/bin/route add -host 192.168.78.1 gw $GW; echo rc=$?
+/bin/route -n | grep -c 192.168.78.1
+/bin/ip route del 192.168.78.1/32; echo rc=$?
+/bin/ip link set eth0 up; echo rc=$?
+sudo -u pcall /bin/ip route add 10.9.9.0/24 via $GW 2>&1; echo rc=$?
+echo @@net_telnet
+# QEMU's SLIRP does not loop the guest's own IP back, so telnet the loopback
+# FTP server -- a fresh ftpd (-n 1: one connection then exit), the same target
+# the ftp section uses at 127.0.0.1:21.
+ftpd -n 1 -d /tmp/ftproot > /tmp/tftpd.log 2>&1 &
+sleep 1
+printf 'QUIT\r\n' | /bin/telnet 127.0.0.1 21 > /tmp/tn.out 2>&1; echo rc=$?; tr -d '\r' < /tmp/tn.out | sed 's/^220 .*/220 BANNER/; s/^221 .*/221 BYE/'
+# a port with no listener: </dev/null so a stray connect cannot block on stdin
+/bin/telnet 127.0.0.1 9 </dev/null > /tmp/tn2.out 2>&1; echo "refused_rc=$?"
+head -1 /tmp/tn2.out
+
+echo @@mkfs_disk
+DEV=$(lsblk | grep '^ahci' | grep ' disk ' | tr -s ' ' | cut -d' ' -f1 | head -1); echo "dev=${DEV:-none}"
+echo @@mkfs_ext2
+/bin/mkfs.ext2 -q -L scratch $DEV; echo rc=$?
+/bin/blkid /dev/$DEV | sed 's/UUID="[^"]*"/UUID="U"/'
+e2fsck -n $DEV > /tmp/e2.out 2>&1; echo rc=$?; grep 'files (' /tmp/e2.out
+dumpe2fs -h $DEV 2>/dev/null | grep -E 'volume name|Inode count|^Block count|magic number' | tr -s ' '
+/bin/tune2fs -L renamed -c 25 -i 1w -e remount-ro $DEV > /tmp/t2.out; tail -4 /tmp/t2.out
+/bin/tune2fs -l $DEV | grep -E 'volume name|Maximum mount|Check interval|Errors behavior' | tr -s ' '
+/bin/fsck -t ext2 $DEV > /tmp/fk.out 2>&1; echo rc=$?; grep 'files (' /tmp/fk.out
+echo @@mkfs_vfat
+/bin/mkfs.vfat -n SCRATCH $DEV; echo rc=$?
+/bin/blkid /dev/$DEV | sed 's/UUID="[^"]*"/UUID="U"/'
+/bin/fsck.vfat $DEV > /tmp/fv.out; echo rc=$?; tail -1 /tmp/fv.out
+/bin/fsck $DEV > /tmp/fv2.out 2>&1; grep 'files,' /tmp/fv2.out
+/bin/mkfs.vfat -F 32 $DEV 2>/dev/null | head -1; /bin/blkid -s TYPE -o value $DEV; /bin/fsck.vfat $DEV > /tmp/fv3.out; tail -1 /tmp/fv3.out
+echo @@mkfs_minix
+/bin/mkfs.minix $DEV; echo rc=$?
+/bin/blkid $DEV
+/bin/fsck.minix $DEV > /tmp/fm.out; echo rc=$?; tail -2 /tmp/fm.out
+/bin/mkfs.minix -2 $DEV | head -1; /bin/fsck.minix $DEV > /tmp/fm2.out; tail -2 /tmp/fm2.out
+/bin/mkfs.minix -3 $DEV | head -1; /bin/fsck.minix $DEV > /tmp/fm3.out; tail -2 /tmp/fm3.out
+echo @@mkfs_guard
+/bin/mkfs.ext2 -q ide0:master 2>&1; echo rc=$?
+sudo -u pcall /bin/mkfs.vfat $DEV > /tmp/mg.out 2>&1; echo rc=$?; grep 'mkfs.vfat:' /tmp/mg.out
+/bin/mkfs.ext2 -q $DEV > /dev/null; e2fsck -n $DEV > /tmp/e2.out 2>&1; echo rc=$?; grep 'files (' /tmp/e2.out
+
+echo @@diag_redir
+# INFORMATIONAL (no check): `cmd > f 2>&1` followed by `tail -1 f` printed
+# nothing in gate run 3 while sed/grep read the same file. Characterise it.
+sh -c 'echo out; echo err >&2' > /tmp/d1 2>&1; echo "bytes=$(wc -c < /tmp/d1)"; cat /tmp/d1; echo "tail:[$(tail -1 /tmp/d1)]"; echo "bbtail:[$(busybox tail -1 /tmp/d1)]"
+sh -c 'echo out' > /tmp/d2; echo "tail2:[$(tail -1 /tmp/d2)]"
+sh -c 'echo out; echo err >&2' > /tmp/d3 2>&1; echo "tail3:[$(tail -n 1 /tmp/d3)]"; ls -l /tmp/d3 | tr -s ' ' | cut -d' ' -f5
+
+echo @@teardown_users
+userdel pcall > /dev/null 2>&1; echo del=$?
+grep -c '^pcall:' /etc/passwd
 
 echo @@dt_END

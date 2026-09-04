@@ -3379,6 +3379,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/gnumade.gz                               $(INITRD_STAGE)/etc/gnumade.gz
 	cp etc/gnubadcrc.gz                             $(INITRD_STAGE)/etc/gnubadcrc.gz
 	cp etc/compress_test.sh                         $(INITRD_STAGE)/etc/compress_test.sh
+	cp etc/xzsrc.txt                                $(INITRD_STAGE)/etc/xzsrc.txt
+	cp etc/gnumade.xz                               $(INITRD_STAGE)/etc/gnumade.xz
+	cp etc/gnumade32.xz                             $(INITRD_STAGE)/etc/gnumade32.xz
+	cp etc/gnumadeblk.xz                            $(INITRD_STAGE)/etc/gnumadeblk.xz
+	cp etc/gnubad.xz                                $(INITRD_STAGE)/etc/gnubad.xz
 	cp etc/distro_test.sh                           $(INITRD_STAGE)/etc/distro_test.sh
 	cp etc/libtest.a                                $(INITRD_STAGE)/etc/libtest.a
 	cp etc/dwarf_test.elf                           $(INITRD_STAGE)/etc/dwarf_test.elf
@@ -4132,6 +4137,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/compress_test.sh etc/gnumade.bz2 etc/gnubadbz.bz2 \
 	    etc/gnumade.zst etc/gnubadzst.zst              \
 	    etc/gnumade.zip etc/gnubadzip.zip              \
+	    etc/xzsrc.txt etc/gnumade.xz etc/gnumade32.xz etc/gnumadeblk.xz etc/gnubad.xz \
 	    etc/distro_test.sh                            \
 	    etc/libtest.a etc/dwarf_test.elf              \
 	    etc/dbg_test.elf                              \

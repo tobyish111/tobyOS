@@ -397,6 +397,63 @@ ck sh_posix_mode  "sh runs in POSIX mode, tsh does not"                         
 eq sh_script      "a #!/bin/sh script with the POSIX constructs runs"           'case ok|heredoc 42|test ok|/tmp/posix.sh 2|rc=0|'
 eq sh_system      "system() and popen() from a native program go through it"    'FROM-SYSTEM|system_status=3|system_probe=1|popen_lines=3|popen_write_first=alpha|6|system_quoted=0|systest: OK (0 fail)|'
 
+echo
+echo "=== native-parity batch: the 46 busybox-only utilities, natively ==="
+eq census_46  "all 46 exist in /bin and none is the busybox binary" 'census done|'
+eq setup_users "useradd registers the account in /etc/passwd AND the kernel login database" 'add=0|1|1|1601|'
+ck proc_new   "/proc/vmstat has the procps counters"        'nr_free_pages nr_pages_total pgfault pgmajfault pswpin pswpout'
+ck proc_new   "and the page-fault counter is live"          'faults counted'
+ck proc_new   "/proc/net/route has Linux's header and an eth0 route" 'Iface Destination Gateway.*\|[1-9]\|'
+ck proc_new   "/proc/net/arp has Linux's header"            'IP address HW type Flags'
+eq tsh_caps   "tsh: 255 positional parameters, a 1.9 KiB \$(...) and \"\" -> 127" '255|1940|tsh: : command not found|rc=127|loop ok|'
+eq mu_arch    "arch agrees with busybox"                    'x86_64|x86_64|'
+eq mu_true_false "true/false exit as named, true --help works" 'rc=0|rc=1|true|'
+eq mu_printf  "printf: widths, octal/hex, %c, %b, reuse, floats, \\x \\u, %q, bad number" 'abc|   42|ab  |010|ff|z|x	y|%|1 2|3 0|3.142 1.234500e+03 0.0001 +7 2.01|ABé|'"'"'it'"'"'\'"'"''"'"'s'"'"'|printf: '"'"'abc'"'"': expected a numeric value|0|rc=1|   ab|a|b   ||'
+eq mu_test    "test/[: unary, binary, ! ( ) -a -o, missing ], bad integer" 'rc=0|rc=1|rc=0|rc=1|x[: missing '"'"']'"'"'|rc=2|rc=0|test: x: integer expression expected|rc=2|rc=0|rc=0|'
+eq mu_factor  "factor: primes, composites, stdin, bad input" '360: 2 2 2 3 3 5|97: 97|1:|1000000007: 1000000007|12: 2 2 3|factor: '"'"'abc'"'"' is not a valid positive integer|rc=1|'
+same_first_field() {   # the checksum (first field) of line pairs agree
+    sel "$1" || return 0
+    local a b c d
+    a=$(section "$1" | sed -n 1p | cut -d' ' -f1); b=$(section "$1" | sed -n 2p | cut -d' ' -f1)
+    c=$(section "$1" | sed -n 3p | cut -d' ' -f1); d=$(section "$1" | sed -n 4p | cut -d' ' -f1)
+    if [ -n "$a" ] && [ "$a" = "$b" ] && [ -n "$c" ] && [ "$c" = "$d" ]; then echo "  ok   $2"; PASS=$((PASS+1)); else echo "  FAIL $2 -- $(section "$1" | tr '\n' '|')"; FAIL=$((FAIL+1)); fi
+}
+same_first_field mu_sum "sum: BSD and SysV checksums agree with busybox"
+ck mu_link_unlink "link makes a real hard link (shared inode) and unlink removes one name" '^(rc=0\|two\|rc=0\|gone\|two\|)|(link: cannot create link.*Operation not permitted\|rc=1\|unlink: cannot unlink.*No such file or directory\|rc=1\|gone\|one\|)'
+ck mu_link_unlink "unlink of a missing file fails as coreutils does"    'unlink: cannot unlink .*nonesuch.*: No such file or directory\|rc=1\|$'
+ck mu_logname_users "logname/users/who agree on the console session; nproc; hostid" '^root\|rc=0\|(users=\[\]\|who=0\|# users=0|users=\[root\]\|who=1\|# users=1)\|1\|[1-9][0-9]*\|[1-9][0-9]*\|hostid=[0-9a-f]{8}\|$'
+ck mu_uptime  "uptime, -p and -s in procps's formats"       '^ [0-9]{2}:[0-9]{2}:[0-9]{2} up .*,  [0-9]+ users?,  load average: [0-9]+\.[0-9]{2}, [0-9]+\.[0-9]{2}, [0-9]+\.[0-9]{2}\|up .*minute.*\|20[2-9][0-9]-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\|$'
+eq mu_pwd     "pwd and pwd -P"                              '/tmp|/tmp|'
+eq mu_chgrp   "chgrp by name and by id, -v, unknown group"  'changed group of '"'"'/tmp/cg'"'"' from root to wheel|wheel|20|chgrp: invalid group: '"'"'nogroup'"'"'|rc=1|'
+eq mu_shred   "shred: passes, zero pass, remove"            '/tmp/shr: pass 1/3 (random)...|/tmp/shr: pass 2/3 (random)...|/tmp/shr: pass 3/3 (000000)...|/tmp/shr: removing|/tmp/shr: removed|gone|'
+eq mu_init    "init refuses to run as anything but PID 1"   'init: must be run as PID 1|rc=1|'
+eq su_passwd  "passwd/su: root sets, the user authenticates, changes their own, wrong ones refused" 'add=0|rc=0|passwd: password updated successfully|ptest|rc=0|su: Authentication failure|rc=1|rc=0|passwd: password updated successfully|rc=1|passwd: password unchanged|/home/ptest ptest|rc=1|passwd: You may not view or modify password information for ptest.|1600|rc=0|'
+eq arc_ar     "ar: rcs/t/p/x/d with a GNU long name, readable by busybox" 'rc=0|a.txt|b.txt|a-very-long-member-name.txt|a.txt|b.txt|a-very-long-member-name.txt|bbbbbb|c|2|!<arch>|rw-r--r-- 4 a.txt|rw-r--r-- 2 a-very-long-member-name.txt|'
+eq arc_cpio   "cpio: newc/odc create, list, extract, busybox interop" 'rc=0|070701|f1|sub/f2|f1|sub/f2|1 block|there|f1 sub/f2 |070707|2|'
+ck arc_xz_decode "xz: CRC64, CRC32 and multi-block/no-check streams decode to the source" '^42a0b7093cea7549\|42a0b7093cea7549\|42a0b7093cea7549\|42a0b7093cea7549\|rc=0\|'
+ck arc_xz_decode "a corrupted stream is refused by its check"  'xz: /etc/gnubad.xz: [A-Za-z0-9 ()]+\|rc=1'
+ck arc_xz_decode "xz -l counts the blocks"                     'Strms +Blocks +Compressed +Uncompressed +Ratio +Check +Filename\| +1 +5 +[0-9]+ B +274000 B +0\.[0-9]+ +None +/etc/gnumadeblk.xz'
+eq arc_xz_encode "xz encodes a stream busybox and xz itself decode; empty input round-trips" 'rc=0|busybox reads native xz|round trip|crc32 pipe|0|xz (XZ Utils)|'
+eq ed_basic   "ed: d, a, s, ,p, w"                           'ONE|three|four|ONE|three|four|'
+eq ed_more    "ed: g/re/, n, u, m, t, j, addresses, marks, H, r !cmd, w file, stdin buffer" '1	ONE|2	thrEE|3	four|ONE|three|four|four|ONE|three|ONE|four|ONE|three|ONEfour|ONE|three|ONEfour|3|?|ONE|threX|four|ONE|three|four|shell|4|line1|line2|ONE|four|ONE|> ONE|> three|> four|'
+ck cron_install "crontab: rejects a bad table, installs, lists, the runner ticks and @reboot fires, -r" '^"-":1: bad minute\|errors in crontab file, can.t install.\|rc=1\|rc=0\|4\|[1-9]\|1\|rc=0\|no crontab for root\|rc=1\|$'
+eq sys_modules "insmod/lsmod/rmmod/modprobe on a real module; non-root refused" 'hello.ko|Module                  Size  Used by|rc=0|1|hello Live|insmod: ERROR: could not insert module /lib/modules/hello.ko: File exists|rc=1|rc=0|0|rc=0|rc=0|modprobe: FATAL: Module nonesuch not found in directory /lib/modules|rc=1|rmmod: ERROR: Module hello is not currently loaded|rc=1|insmod: ERROR: could not insert module /lib/modules/hello.ko: Operation not permitted|rc=1|'
+ck net_ip     "ip addr/link/route/-br/-o in iproute2's shapes"   '^2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\|link/ether [0-9a-f:]{17} brd\|inet [0-9.]+/[0-9]+ brd\|valid_lft forever preferred_lft\|lo UNKNOWN\|eth0 UP\|2\|2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP>\|default via [0-9.]+ dev\|[0-9.]+/[0-9]+ dev eth0 proto\|2\|rc=0\|$'
+ck net_route_netstat "route -n / netstat -r -t -i -a"          '^Destination Flags Iface\|0.0.0.0 UG eth0\|Kernel IP routing table\|Active Internet connections \(only servers\)\|Proto Recv-Q Send-Q Local Address +Foreign Address +State +\|Kernel Iface lo \|[0-9]+\|$'
+ck net_arp    "arp -n/-a, ip neigh, arp -s/-d"                 '^gw=[0-9.]+\|([0-9.]+ ether [0-9a-f:]{17}\|)+\? \([0-9.]+\)\|[0-9.]+ dev eth0 [0-9a-f:]{17}\|rc=0\|1\|rc=0\|0\|No ARP entry for 10.0.2.98\|rc=1\|$'
+ck net_arping "arping gets replies from the gateway, none from a ghost, refused for non-root" '^rc=0\|ARPING [0-9.]+ from [0-9.]+ eth0\|Unicast reply from [0-9.]+ \[MAC\]  T ms\|Unicast reply from [0-9.]+ \[MAC\]  T ms\|Sent 2 probes \(2 broadcast\(s\)\)\|Received 2 response\(s\)\|rc=1\|Received 0 response\(s\)\|arping: socket: Operation not permitted\|rc=2\|$'
+ck net_traceroute "traceroute reaches the gateway in one hop with a per-probe TTL; non-root refused" '^rc=0\|traceroute to [0-9.]+ \([0-9.]+\), 3 hops max, 60 byte packets\| 1  [0-9.]+  T ms\|( 2  [0-9.]+  T ms\|)?traceroute: socket: Operation not permitted\|rc=2\|$'
+eq net_ip_set "ip route add/del, route add/del, ip link set, non-root refused" 'rc=0|1|rc=0|0|rc=0|1|rc=0|rc=0|RTNETLINK answers: Operation not permitted|rc=2|'
+ck net_telnet "telnet connects to the loopback FTP server, trades the banner, and fails a dead port" 'rc=0\|Trying 127.0.0.1...\|Connected to 127.0.0.1.\|Escape character is .\^\].\.\|220 BANNER\|221 BYE\|Connection closed by foreign host.\|refused_rc=[1-9]\|Trying 127.0.0.1...'
+if sel mkfs_; then
+ck mkfs_disk  "the gate's AHCI scratch disk is visible"                'dev=ahci'
+ck mkfs_ext2  "mkfs.ext2 writes a filesystem blkid, e2fsck, dumpe2fs and tune2fs all read" '^rc=0\|/dev/ahci[^ ]*: LABEL="scratch" UUID="U" TYPE="ext2" VERSION="1.0"\|rc=0\|[^|]*: [0-9]+/[0-9]+ files \([0-9]+% used\), [0-9]+/32768 blocks\|.*volume name: scratch\|.*[Mm]agic number: 0xEF53\|Inode count: [0-9]+\|Block count: 32768\|tune2fs 1.47.0 \(tobyOS\)\|Setting maximal mount count to 25\|Setting interval between checks to 604800 seconds\|Setting error behavior to 2\|.*volume name: renamed\|Errors behavior: Remount read-only\|Maximum mount count: 25\|Check interval: 604800 \(1 week\)\|rc=0\|[^|]*files \([0-9]+% used\), [0-9]+/32768 blocks\|$'
+ck mkfs_vfat  "mkfs.vfat FAT16 and FAT32 with labels; fsck.vfat and fsck dispatch" '^mkfs.fat 4.2 \(2021-01-31\)\|rc=0\|/dev/ahci[^ ]*: LABEL="SCRATCH" UUID="U" TYPE="vfat" VERSION="FAT16"\|rc=0\|/dev/ahci[^ ]*: 0 files, 0/[0-9]+ clusters\|/dev/ahci[^ ]*: 0 files, 0/[0-9]+ clusters\|mkfs.fat 4.2 \(2021-01-31\)\|vfat\|/dev/ahci[^ ]*: 0 files, 1/[0-9]+ clusters\|$'
+ck mkfs_minix "mkfs.minix v1/v2/v3 and fsck.minix"                   '^[0-9]+ inodes\|32768 blocks\|Firstdatazone=[0-9]+ \([0-9]+\)\|Zonesize=1024\|Maxsize=268966912\|\|rc=0\|/dev/ahci[^ ]*: TYPE="minix" VERSION="1"\|rc=0\|1 inodes used \([0-9]+%\)\|1 zones used \([0-9]+%\)\|[0-9]+ inodes\|1 inodes used \([0-9]+%\)\|1 zones used \([0-9]+%\)\|[0-9]+ inodes\|1 inodes used \([0-9]+%\)\|1 zones used \([0-9]+%\)\|$'
+ck mkfs_guard "the kernel refuses to write /data's device or serve a non-root mkfs" '^mkfs.ext2: Device or resource busy while writing to /dev/ide0:master\|rc=1\|rc=1\|mkfs.vfat: unable to (write|open) /dev/ahci[^ ]*: (Operation not permitted|No such file or directory)\|rc=0\|[^|]*: [0-9]+/[0-9]+ files \([0-9]+% used\), [0-9]+/32768 blocks\|$'
+fi
+eq teardown_users "userdel removes the account from both databases" 'del=0|0|'
+
 echo "  idle_stalls=$(grep -ac 'idle_stall' "$LOG")  panics=$(grep -ac 'KERNEL PANIC at' "$LOG")"
 echo "VERDICT: pass=$PASS fail=$FAIL"
 [ "$FAIL" = "0" ] || exit 1

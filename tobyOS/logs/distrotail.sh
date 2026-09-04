@@ -47,9 +47,16 @@ if [ $BUILD_RC -ne 0 ]; then
     exit 1
 fi
 [ -f tobyOS.iso ] || { echo "ABORT: build produced no ISO"; exit 1; }
+# A fresh 32 MiB AHCI scratch disk every run: the mkfs/fsck/tune2fs/blkid
+# fixtures format it, so it must start blank -- and it must NOT be disk.img
+# (/data). The kernel's BLK_WRITE refuses a mounted device; the gate proves
+# that too.
+rm -f logs/scratch.img; truncate -s 32M logs/scratch.img
 
 "/c/Program Files/qemu/qemu-system-x86_64.exe" \
   -cdrom tobyOS.iso -drive file=disk.img,format=raw,if=ide,index=0,media=disk \
+  -device ahci,id=ahci0 -drive if=none,id=scratch,file=logs/scratch.img,format=raw \
+  -device ide-hd,drive=scratch,bus=ahci0.0 \
   -boot d -smp 4 -m 5120 -cpu max \
   -serial file:"$LOG" -no-reboot -display none 2>/dev/null &
 
