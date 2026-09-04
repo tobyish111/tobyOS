@@ -38,6 +38,17 @@
 #include <errno.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <tobyos/abi/abi.h>
+
+/* The kernel's authentication database is a separate table; before
+ * 2026-09-04 useradd/userdel touched only /etc/passwd, so a new user could
+ * never log in, su, or sudo. Now both are updated. */
+static long sc4(long n, long a, long b, long c, long d) {
+    long r;
+    register long r10 __asm__("r10") = d;
+    __asm__ volatile("syscall" : "=a"(r) : "0"(n), "D"(a), "S"(b), "d"(c), "r"(r10) : "rcx", "r11", "memory");
+    return r;
+}
 
 #define PASSWD_PATH "/etc/passwd"
 #define GROUP_PATH  "/etc/group"
@@ -257,6 +268,9 @@ static int cmd_useradd(int argc, char **argv) {
              name, uid, gid, gecos ? gecos : name, home, shell);
     if (lines_append(&P, line) != 0) return errf("passwd file is full", 0);
     if (lines_save(&P, PASSWD_PATH, MIRROR_PW) != 0) return 1;
+    {   long krc = sc4(ABI_SYS_USERADD, 0, (long)(uintptr_t)name, uid, gid);
+        if (krc < 0 && krc != -ABI_EEXIST)
+            fprintf(stderr, "useradd: NOTE: could not register '%s' in the kernel account database (%ld)\n", name, -krc); }
 
     if (groups) {
         char tmp[256];
@@ -277,13 +291,10 @@ static int cmd_useradd(int argc, char **argv) {
         fprintf(stderr, "useradd: warning: cannot create %s: %s\n",
                 home, strerror(errno));
 
-    /* Say the part that is NOT done, rather than let it be discovered at a
-     * login prompt: the kernel's auth database is separate and userland has
-     * no syscall to add to it. */
-    fprintf(stderr, "useradd: '%s' added to %s. NOTE: the kernel login "
-                    "database (/data/users) is separate and unchanged, so "
-                    "this account cannot log in until it is added there.\n",
-            name, PASSWD_PATH);
+    /* Both databases are updated now (ABI_SYS_USERADD); the account has no
+     * password yet, which is exactly what `passwd NAME` is for. */
+    fprintf(stderr, "useradd: '%s' added to %s and the kernel login database; "
+                    "set a password with `passwd %s`.\n", name, PASSWD_PATH, name);
     return 0;
 }
 
@@ -310,6 +321,7 @@ static int cmd_userdel(int argc, char **argv) {
     field(P.v[idx], 5, home, sizeof home);
     lines_remove(&P, idx);
     if (lines_save(&P, PASSWD_PATH, MIRROR_PW) != 0) return 1;
+    sc4(ABI_SYS_USERADD, 1, (long)(uintptr_t)name, 0, 0);   /* absent is fine */
 
     if (lines_load(&G, GROUP_PATH) == 0) {
         group_purge_user(&G, name);

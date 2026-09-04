@@ -567,6 +567,13 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_dig/user_dig.elf \
             programs/user_strip/user_strip.elf \
             programs/user_at/user_at.elf \
+            programs/user_archive/user_archive.elf \
+            programs/user_ed/user_ed.elf \
+            programs/user_cron/user_cron.elf \
+            programs/user_su/user_su.elf \
+            programs/user_moreutils/user_moreutils.elf \
+            programs/user_sysutils/user_sysutils.elf \
+            programs/user_netutils/user_netutils.elf \
             programs/user_setpci/user_setpci.elf \
             programs/user_systemctl/user_systemctl.elf \
             programs/user_ping/user_ping.elf \
@@ -1830,6 +1837,13 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_zstd,user_zstd))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_dig,user_dig))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_strip,user_strip))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_at,user_at))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_archive,user_archive))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ed,user_ed))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_cron,user_cron))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_su,user_su))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_moreutils,user_moreutils))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_sysutils,user_sysutils))
+$(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_netutils,user_netutils))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_setpci,user_setpci))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_systemctl,user_systemctl))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_ping,user_ping))
@@ -3251,6 +3265,34 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    ln -f $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/at "$(INITRD_STAGE)/bin/$$ap"; \
 	done
+	@# ---- native-parity batch (2026-09-04): the 46 busybox-only utilities ----
+	cp programs/user_archive/user_archive.elf      $(INITRD_STAGE)/bin/archive
+	@# archive family, one binary dispatched on argv[0]
+	@for ap in ar cpio xz unxz xzcat; do \
+	    ln -f $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_ed/user_ed.elf                $(INITRD_STAGE)/bin/ed
+	cp programs/user_cron/user_cron.elf            $(INITRD_STAGE)/bin/crontab
+	cp programs/user_su/user_su.elf                $(INITRD_STAGE)/bin/su
+	cp programs/user_moreutils/user_moreutils.elf  $(INITRD_STAGE)/bin/moreutils
+	@# moreutils family, one binary dispatched on argv[0]
+	@for ap in arch chgrp factor false link logname nproc printf pwd shred sum test "[" true unlink uptime users who hostid init passwd; do \
+	    ln -f $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_sysutils/user_sysutils.elf    $(INITRD_STAGE)/bin/sysutils
+	@# sysutils family, one binary dispatched on argv[0]
+	@for ap in insmod rmmod lsmod modprobe blkid fsck fsck.ext2 fsck.ext3 fsck.ext4 fsck.vfat fsck.fat fsck.minix mkfs.ext2 mke2fs mkfs.minix mkfs.vfat mkfs.fat tune2fs; do \
+	    ln -f $(INITRD_STAGE)/bin/sysutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/sysutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
+	cp programs/user_netutils/user_netutils.elf    $(INITRD_STAGE)/bin/netutils
+	@# netutils family, one binary dispatched on argv[0]
+	@for ap in arp arping ip netstat route telnet traceroute; do \
+	    ln -f $(INITRD_STAGE)/bin/netutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/netutils "$(INITRD_STAGE)/bin/$$ap"; \
+	done
 	@# dig/host, one resolver dispatched on argv[0]
 	@ln -f $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host" 2>/dev/null || \
 	    cp $(INITRD_STAGE)/bin/dig "$(INITRD_STAGE)/bin/host"
@@ -4125,6 +4167,19 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/dig bin/host                                    \
 	    bin/strip bin/cc bin/mkfs bin/domainname            \
 	    bin/at bin/batch bin/atq bin/atrm                   \
+	       bin/archive bin/ar bin/cpio bin/xz bin/unxz bin/xzcat \
+	       bin/ed \
+	       bin/crontab \
+	       bin/moreutils bin/arch bin/chgrp bin/factor bin/false bin/link \
+	    bin/logname bin/nproc bin/printf bin/pwd bin/shred bin/sum bin/test \
+	    'bin/['  bin/true bin/unlink bin/uptime bin/users bin/who bin/hostid \
+	    bin/init bin/passwd \
+	       bin/sysutils bin/insmod bin/rmmod bin/lsmod bin/modprobe bin/blkid \
+	    bin/fsck bin/fsck.ext2 bin/fsck.ext3 bin/fsck.ext4 bin/fsck.vfat \
+	    bin/fsck.fat bin/fsck.minix bin/mkfs.ext2 bin/mke2fs bin/mkfs.minix \
+	    bin/mkfs.vfat bin/mkfs.fat bin/tune2fs \
+	       bin/netutils bin/arp bin/arping bin/ip bin/netstat bin/route \
+	    bin/telnet bin/traceroute \
 	    bin/setpci                                          \
 	    bin/systemctl bin/service bin/netcat bin/getent      \
 	    bin/ping bin/clockdiff bin/tcpdump bin/ftp bin/ftpd  \
@@ -4149,7 +4204,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
-	    bin/sudo                                                          \
+	    bin/sudo bin/su                                                   \
 	  && tar --format=ustar --mode=0644 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
@@ -5900,6 +5955,13 @@ clean:
 	       programs/user_dig/user_dig.o programs/user_dig/user_dig.elf \
 	       programs/user_strip/user_strip.o programs/user_strip/user_strip.elf \
 	       programs/user_at/user_at.o programs/user_at/user_at.elf \
+	       programs/user_archive/user_archive.o programs/user_archive/user_archive.elf \
+	       programs/user_ed/user_ed.o programs/user_ed/user_ed.elf \
+	       programs/user_cron/user_cron.o programs/user_cron/user_cron.elf \
+	       programs/user_su/user_su.o programs/user_su/user_su.elf \
+	       programs/user_moreutils/user_moreutils.o programs/user_moreutils/user_moreutils.elf \
+	       programs/user_sysutils/user_sysutils.o programs/user_sysutils/user_sysutils.elf \
+	       programs/user_netutils/user_netutils.o programs/user_netutils/user_netutils.elf \
 	       programs/user_setpci/user_setpci.o programs/user_setpci/user_setpci.elf \
 	       programs/user_systemctl/user_systemctl.o programs/user_systemctl/user_systemctl.elf \
 	       programs/user_ping/user_ping.o programs/user_ping/user_ping.elf \

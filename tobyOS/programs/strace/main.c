@@ -190,7 +190,23 @@ static const char *native_name(long n) {
 /* Same rule the kernel uses (elf_is_linux_abi): an explicit GNU/Linux
  * OSABI brand, or a PT_INTERP -- a dynamic loader means glibc/musl, which
  * means Linux numbers. */
+/* A bare name ("busybox") is what execvp will search PATH for: look at the
+ * same file it will run, or the personality guess is "native" by default
+ * and a Linux tracee's syscalls print unnamed. */
+static const char *resolve_target(const char *prog, char *buf, size_t cap) {
+    if (strchr(prog, '/')) return prog;
+    static const char *dirs[] = { "/bin", "/usr/bin", "/sbin", "/usr/sbin", 0 };
+    for (int i = 0; dirs[i]; i++) {
+        snprintf(buf, cap, "%s/%s", dirs[i], prog);
+        FILE *f = fopen(buf, "rb");
+        if (f) { fclose(f); return buf; }
+    }
+    return prog;
+}
+
 static int target_is_linux_abi(const char *path) {
+    char rbuf[512];
+    path = resolve_target(path, rbuf, sizeof rbuf);
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
     unsigned char h[64];

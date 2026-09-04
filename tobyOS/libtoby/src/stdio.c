@@ -847,6 +847,10 @@ int sscanf(const char *str, const char *fmt, ...) {
         fmt++; /* skip % */
         if (*fmt == '%') { if (*s != '%') break; s++; fmt++; continue; }
 
+        /* %*: match and discard (2026-09-04; sudo's passwd parser needed it) */
+        int suppress = 0;
+        if (*fmt == '*') { suppress = 1; fmt++; }
+
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
 
@@ -858,49 +862,85 @@ int sscanf(const char *str, const char *fmt, ...) {
             char *end;
             long v = strtol(s, &end, 10);
             if (end == s) goto done;
-            if (lng) { long *p = va_arg(ap, long *); *p = v; }
-            else     { int  *p = va_arg(ap, int *);  *p = (int)v; }
+            if (!suppress) {
+                if (lng) { long *p = va_arg(ap, long *); *p = v; }
+                else     { int  *p = va_arg(ap, int *);  *p = (int)v; }
+                count++;
+            }
             s = end;
-            count++;
             break;
         }
         case 'u': {
             char *end;
             unsigned long v = strtoul(s, &end, 10);
             if (end == s) goto done;
-            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
-            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            if (!suppress) {
+                if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+                else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+                count++;
+            }
             s = end;
-            count++;
             break;
         }
         case 'x': case 'X': {
             char *end;
             unsigned long v = strtoul(s, &end, 16);
             if (end == s) goto done;
-            if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
-            else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+            if (!suppress) {
+                if (lng) { unsigned long *p = va_arg(ap, unsigned long *); *p = v; }
+                else     { unsigned int  *p = va_arg(ap, unsigned int *);  *p = (unsigned int)v; }
+                count++;
+            }
             s = end;
-            count++;
+            break;
+        }
+        case '[': {
+            /* scanset: %[abc], %[^abc], %[]abc], %[a-z]; width caps it */
+            fmt++;
+            int negate = 0;
+            if (*fmt == '^') { negate = 1; fmt++; }
+            unsigned char set[32] = { 0 };
+            if (*fmt == ']') { set[']' >> 3] |= (unsigned char)(1u << (']' & 7)); fmt++; }
+            while (*fmt && *fmt != ']') {
+                unsigned char lo = (unsigned char)*fmt;
+                if (fmt[1] == '-' && fmt[2] && fmt[2] != ']') {
+                    unsigned char hi = (unsigned char)fmt[2];
+                    for (unsigned c = lo; c <= hi; c++) set[c >> 3] |= (unsigned char)(1u << (c & 7));
+                    fmt += 3;
+                } else { set[lo >> 3] |= (unsigned char)(1u << (lo & 7)); fmt++; }
+            }
+            if (*fmt != ']') goto done;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            int w = 0;
+            while (*s) {
+                unsigned char c = (unsigned char)*s;
+                int in = (set[c >> 3] >> (c & 7)) & 1;
+                if (in == negate) break;
+                if (width > 0 && w >= width) break;
+                if (p) *p++ = *s;
+                s++; w++;
+            }
+            if (w == 0) goto done;
+            if (p) { *p = '\0'; count++; }
             break;
         }
         case 's': {
-            char *p = va_arg(ap, char *);
+            char *p = suppress ? NULL : va_arg(ap, char *);
             while (*s == ' ' || *s == '\t') s++;
             int w = 0;
             while (*s && *s != ' ' && *s != '\t' && *s != '\n') {
                 if (width > 0 && w >= width) break;
-                *p++ = *s++;
+                if (p) *p++ = *s;
+                s++;
                 w++;
             }
-            *p = '\0';
-            count++;
+            if (p) { *p = '\0'; count++; }
             break;
         }
         case 'c': {
-            char *p = va_arg(ap, char *);
-            *p = *s++;
-            count++;
+            char *p = suppress ? NULL : va_arg(ap, char *);
+            if (p) { *p = *s; count++; }
+            s++;
             break;
         }
         case 'n': {
