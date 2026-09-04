@@ -1052,6 +1052,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/bzip2.c \
                    $(LIBTOBY_SRC)/bzip2_enc.c \
                    $(LIBTOBY_SRC)/zstd.c \
+                   $(LIBTOBY_SRC)/xz.c \
                    $(LIBTOBY_SRC)/lzw.c \
                    $(LIBTOBY_SRC)/md5sha1.c \
                    $(LIBTOBY_SRC)/render.c \
