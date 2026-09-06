@@ -14,6 +14,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/apic.h>   /* tlb_shootdown_remote on module free */
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pci.h>
@@ -152,6 +153,17 @@ static bool g_va_used[MODULE_MAX];
 static void module_free_exec(void *base, uint64_t *pages, size_t npages, int va_slot) {
     if (base && npages) {
         vmm_unmap((uint64_t)(uintptr_t)base, npages * PAGE_SIZE);
+        /* vmm_unmap does a LOCAL invlpg only (see vmm.h): the other CPUs are
+         * still holding writable translations for this window. The pages are
+         * about to go back to the PMM and be handed to somebody else, and the
+         * VA is about to be reused by the next insmod at the same address --
+         * both are frame changes, so every peer must drop its entries FIRST.
+         *
+         * Found on the 4-core EliteDesk: `rmmod hello` then `insmod` hung,
+         * where QEMU's software TLB had never reproduced it. Ordering is
+         * load-bearing -- shoot down BEFORE pmm_free_page, or a peer can
+         * still write through a stale entry into reallocated memory. */
+        tlb_shootdown_remote();
         for (size_t i = 0; i < npages; i++) if (pages && pages[i]) pmm_free_page(pages[i]);
     }
     if (pages) kfree(pages);
