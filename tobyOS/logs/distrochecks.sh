@@ -428,6 +428,7 @@ eq mu_chgrp   "chgrp by name and by id, -v, unknown group"  'changed group of '"
 eq mu_shred   "shred: passes, zero pass, remove"            '/tmp/shr: pass 1/3 (random)...|/tmp/shr: pass 2/3 (random)...|/tmp/shr: pass 3/3 (000000)...|/tmp/shr: removing|/tmp/shr: removed|gone|'
 eq mu_init    "init refuses to run as anything but PID 1"   'init: must be run as PID 1|rc=1|'
 eq su_passwd  "passwd/su: root sets, the user authenticates, changes their own, wrong ones refused" 'add=0|rc=0|passwd: password updated successfully|ptest|rc=0|su: Authentication failure|rc=1|rc=0|passwd: password updated successfully|rc=1|passwd: password unchanged|/home/ptest ptest|rc=1|passwd: You may not view or modify password information for ptest.|1600|rc=0|'
+eq setuid_spawn "a setuid-root binary gains privilege when the SHELL spawns it, not only via execve" '-rwsr-xr-x 0 0|root|root|'
 eq arc_ar     "ar: rcs/t/p/x/d with a GNU long name, readable by busybox" 'rc=0|a.txt|b.txt|a-very-long-member-name.txt|a.txt|b.txt|a-very-long-member-name.txt|bbbbbb|c|2|!<arch>|rw-r--r-- 4 a.txt|rw-r--r-- 2 a-very-long-member-name.txt|'
 eq arc_cpio   "cpio: newc/odc create, list, extract, busybox interop" 'rc=0|070701|f1|sub/f2|f1|sub/f2|1 block|there|f1 sub/f2 |070707|2|'
 ck arc_xz_decode "xz: CRC64, CRC32 and multi-block/no-check streams decode to the source" '^42a0b7093cea7549\|42a0b7093cea7549\|42a0b7093cea7549\|42a0b7093cea7549\|rc=0\|'

@@ -501,7 +501,7 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     if (!*norm) {                                  /* the mount root */
         memset(out, 0, sizeof *out);
         out->type = VFS_TYPE_DIR;
-        out->mode = 0777u;
+        out->mode = 0777u | VFS_MODE_VALID;
         return VFS_OK;
     }
     struct tmpfs_node *nd = tfind(m, norm);
@@ -511,7 +511,17 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     out->size  = nd->size;
     out->uid   = nd->uid;
     out->gid   = nd->gid;
-    out->mode  = nd->mode;
+    /* VFS_MODE_VALID, and the same 07777 mask tmpfs_open already uses.
+     *
+     * Without the flag this stat says "this filesystem carries no permission
+     * information", and every caller that gates on it skips its check. The
+     * one that matters: BOTH exec paths test
+     *     vfs_stat(path,&st) == VFS_OK && (st.mode & VFS_MODE_VALID)
+     * before honouring S_ISUID -- so a setuid binary anywhere on tmpfs was
+     * SILENTLY run unprivileged, while the identical binary on the initrd
+     * ramfs (whose stat does set the flag) worked. tmpfs_open set it and
+     * tmpfs_stat did not, so the two disagreed about the same file. */
+    out->mode  = (nd->mode & 07777u) | VFS_MODE_VALID;
     out->mtime = nd->mtime;
     out->atime = nd->atime;
     out->nlink = nd->nlink ? nd->nlink : 1u;

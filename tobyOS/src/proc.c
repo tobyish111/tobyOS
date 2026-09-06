@@ -1038,6 +1038,47 @@ static int spawn_body(const char *path, const char *name,
      * off-the-shelf dynamic Linux binary drops-and-runs. Everything else keeps
      * the tobyOS default. */
     if (ok) {
+        /* ---- set-user-ID-on-exec, for the SPAWN path too (2026-09-06) ----
+         *
+         * This transition existed ONLY in execve (src/fork.c). spawn seeded
+         * the credential triple from the parent's effective ids above and
+         * never looked at the image, so a setuid binary launched by the
+         * shell ran UNPRIVILEGED: `sudo` from tsh reported "this binary is
+         * not setuid root" while the very same /bin/sudo worked under
+         * `busybox sh -c`, which fork+execve's it. su was equally dead.
+         * That is the native-vs-hosted inversion this arc is about, and it
+         * was invisible to every QEMU gate because those run as ROOT, and a
+         * root caller never needs the bit. Found on the EliteDesk.
+         *
+         * Rules are execve's, and they are the POSIX ones: the EFFECTIVE and
+         * SAVED ids move to the file's owner, the REAL uid is untouched (so
+         * a setuid program can still tell who invoked it -- ABI_SYS_GETRUID
+         * is what su asks), and a nosuid mount is honoured. Applied here,
+         * after a SUCCESSFUL image load, for the same reason execve does it
+         * there: a failed spawn must not hand out privilege. */
+        {
+            struct vfs_stat sst;
+            uint32_t smf = vfs_path_mount_flags(path);
+            if (!(smf & VFS_MNT_NOSUID) &&
+                vfs_stat(path, &sst) == VFS_OK && (sst.mode & VFS_MODE_VALID)) {
+                if (sst.mode & VFS_MODE_SETUID) {
+                    p->uid  = (int)sst.uid;
+                    p->suid = p->uid;
+                    if (p->uid == 0)
+                        p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
+                }
+                if (sst.mode & VFS_MODE_SETGID) {
+                    p->gid  = (int)sst.gid;
+                    p->sgid = p->gid;
+                }
+            } else if (smf & VFS_MNT_NOSUID) {
+                struct vfs_stat nst;
+                if (vfs_stat(path, &nst) == VFS_OK &&
+                    (nst.mode & (VFS_MODE_SETUID | VFS_MODE_SETGID)))
+                    kprintf("[spawn] nosuid mount: ignoring set-id bits on '%s'\n",
+                            path);
+            }
+        }
         bool is_linux = elf_is_linux_abi(prog_info.osabi, has_interp,
                                          interp_path, prog_info.has_gnu_phdr);
         p->personality = is_linux ? ABI_PERS_LINUX : ABI_PERS_TOBY;
