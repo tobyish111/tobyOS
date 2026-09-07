@@ -2,7 +2,57 @@
  *
  * NFA-based with backtracking. Compiles to a small IR of node structs,
  * then runs a recursive matcher. Supports: . * + ? | [] [^] ^ $ {n,m}
- * () groups, backrefs \1-\9, \d \w \s shortcuts. */
+ * () groups, backrefs \1-\9, POSIX [:classes:], \b \B \< \> word
+ * boundaries, and the \d \w \s shortcuts.
+ *
+ * ------------------------------------------------------------------
+ * THE FRAGMENT-EXIT REWRITE (2026-09-06), and why it had to happen.
+ *
+ * The parser used to hand fragments around as a single `nd_t *entry` and
+ * rediscover the other end by walking `->out` (`chain_end`). That works
+ * only while the graph is a tree, and quantifiers make it a GRAPH:
+ * quantify() builds `x*` as a LOOP (split -> body -> back to split).
+ *
+ * So for `\([0-9.]*\)` the group's own wiring --
+ *
+ *     nd_t *n = chain_end(c, inner);   n->out = ge;
+ *
+ * -- walked into the star's cycle, ran until its cycle guard tripped,
+ * and then overwrote a LOOP EDGE with the group-end pointer. The star
+ * was destroyed (it could match at most one character), the fragment's
+ * real exit was orphaned with a NULL ->out, and an orphaned ND_NOP is
+ * read by the matcher as "accept here" -- so the zero-iteration branch
+ * accepted the whole pattern immediately and \1 was never closed.
+ *
+ * Visible as: the `ip route` idiom -- a sed -n script whose pattern is
+ *   ^default via \([0-9.]*\) .\*  and whose replacement is \1 -- printing
+ * the rest of the line instead of the address. (Spelled with the star
+ * escaped because the real thing ends in a comment terminator.) It was
+ * filed as "bracket
+ * expressions need a look", but brackets were never the problem: EVERY
+ * group whose last element is quantified was miscompiled, `(a*)` and
+ * `\(x\)*` alike, in both BRE and ERE.
+ *
+ * The fix is structural, not a patch: parse_atom/parse_seq/parse_alt now
+ * return a frag_t {entry, exit}, every construct wires its own exit, and
+ * chain_end is GONE. Nothing walks a graph it cannot know is acyclic.
+ *
+ * ------------------------------------------------------------------
+ * ND_REPEAT, and why the old matcher could not survive a long line.
+ *
+ * A greedy `.*` used to recurse once PER CHARACTER CONSUMED (split ->
+ * dot -> split -> ...). A native user stack is 64 pages = 256 KiB and a
+ * frame here is ~96 bytes, so a 4 KiB line -- ordinary for sed -- came
+ * within a hair of running off the bottom of it, and MAX_DEPTH's only
+ * defence was to report a false "no match".
+ *
+ * When the body of a quantifier is a single consuming node (a literal, a
+ * dot, a class -- which covers `.*`, `[0-9]+`, `[^,]*`, `a{3}`, nearly
+ * everything real patterns do), it is now compiled to ONE ND_REPEAT node
+ * that consumes iteratively and backtracks by decrementing a count. Depth
+ * became a function of pattern complexity instead of input length, and
+ * bounded repetition of a simple body no longer clones anything.
+ */
 
 #include <regex.h>
 #include <stdlib.h>
@@ -17,17 +67,18 @@ enum {
     ND_NCLASS,     /* negated class [^abc] */
     ND_ANCHOR_BOL, /* ^ */
     ND_ANCHOR_EOL, /* $ */
+    ND_WORDB,      /* \b */
+    ND_NWORDB,     /* \B */
+    ND_WSTART,     /* \< */
+    ND_WEND,       /* \> */
     ND_GROUP_S,    /* start of group i */
     ND_GROUP_E,    /* end of group i */
     ND_BACKREF,    /* \1..\9 */
     ND_BRANCH,     /* alternation: try .out first, then .out2 */
     ND_SPLIT,      /* like BRANCH but for quantifiers */
+    ND_REPEAT,     /* iterative {min,max} over a single-node body */
     ND_MATCH,      /* accept state */
-    ND_NOP,        /* pass-through: the EXIT of a quantified
-                    * fragment. It cannot be ND_MATCH, because
-                    * ND_MATCH accepts on arrival and `foo.*bar`
-                    * would then match "fooX" -- the star would
-                    * declare success before `bar` was required. */
+    ND_NOP,        /* pass-through: a fragment's exit / a join point */
 };
 
 #define CLASS_BITMAP_SIZE 32  /* 256 bits */
@@ -37,9 +88,20 @@ typedef struct nd {
     int           ch;             /* ND_LIT char, or group index, or backref */
     unsigned char cclass[CLASS_BITMAP_SIZE];
     int           greedy;
+    /* ND_REPEAT only: the body it repeats, folded into this node. */
+    int           btype;
+    int           rmin, rmax;     /* rmax < 0 == unbounded */
     struct nd    *out;
     struct nd    *out2;
 } nd_t;
+
+/* A parsed piece of the pattern: where control ENTERS it, and the node
+ * whose ->out is where control LEAVES it. Every producer sets both; no
+ * consumer ever has to go looking. */
+typedef struct {
+    nd_t *entry;
+    nd_t *exit;
+} frag_t;
 
 typedef struct {
     /* A parse error has to be RECORDED, not just returned: parse_alt
@@ -53,6 +115,9 @@ typedef struct {
     nd_t        *start;
     int          nsub;
     int          cflags;
+    const char  *pat;      /* the whole pattern, for BRE ^/$ position rules */
+    int          has_alt;  /* pattern contains alternation */
+    int          has_lazy; /* pattern contains a non-greedy quantifier */
 } compiled_t;
 
 /* ---- bit helpers for character classes --------------------------- */
@@ -63,6 +128,77 @@ static void cls_set(unsigned char *c, int b) {
 
 static int cls_test(const unsigned char *c, int b) {
     return (c[(unsigned)b >> 3] >> ((unsigned)b & 7)) & 1;
+}
+
+static void cls_add(unsigned char *c, int ch, int icase) {
+    cls_set(c, ch);
+    if (icase) {
+        if (ch >= 'a' && ch <= 'z') cls_set(c, ch - 32);
+        if (ch >= 'A' && ch <= 'Z') cls_set(c, ch + 32);
+    }
+}
+
+/* ---- ctype, spelled out ------------------------------------------
+ * libtoby has <ctype.h>, but this file is also linked into freestanding
+ * builds; the definitions are two lines each and locale-free (the C
+ * locale is the only locale this system has). */
+static int rx_upper(int c) { return c >= 'A' && c <= 'Z'; }
+static int rx_lower(int c) { return c >= 'a' && c <= 'z'; }
+static int rx_alpha(int c) { return rx_upper(c) || rx_lower(c); }
+static int rx_digit(int c) { return c >= '0' && c <= '9'; }
+static int rx_alnum(int c) { return rx_alpha(c) || rx_digit(c); }
+static int rx_space(int c) {
+    return c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r' || c == '\f' || c == '\v';
+}
+static int rx_blank(int c) { return c == ' ' || c == '\t'; }
+static int rx_cntrl(int c) { return c < 32 || c == 127; }
+static int rx_print(int c) { return c >= 32 && c < 127; }
+static int rx_graph(int c) { return c > 32 && c < 127; }
+static int rx_punct(int c) { return rx_graph(c) && !rx_alnum(c); }
+static int rx_xdigit(int c) {
+    return rx_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+static int rx_word(int c) { return rx_alnum(c) || c == '_'; }
+
+static int name_is(const char *s, size_t len, const char *lit) {
+    size_t i;
+    for (i = 0; i < len; i++)
+        if (!lit[i] || s[i] != lit[i]) return 0;
+    return lit[len] == '\0';
+}
+
+/* [:alpha:] and friends. Returns 0 for an unknown class name, which is
+ * REG_ECTYPE and not "matches nothing": `grep '[[:alpah:]]'` should say
+ * so rather than quietly finding zero lines.
+ *
+ * Before this existed, parse_class read `[[:alpha:]]` one byte at a time
+ * and produced the set { [ : a l p h }, then left a stray `]` in the
+ * pattern -- a wrong answer, never a diagnostic. */
+static int add_named_class(unsigned char *bm, const char *nm, size_t len,
+                           int icase) {
+    int (*fn)(int) = 0;
+    if      (name_is(nm, len, "alpha"))  fn = rx_alpha;
+    else if (name_is(nm, len, "digit"))  fn = rx_digit;
+    else if (name_is(nm, len, "alnum"))  fn = rx_alnum;
+    else if (name_is(nm, len, "upper"))  fn = rx_upper;
+    else if (name_is(nm, len, "lower"))  fn = rx_lower;
+    else if (name_is(nm, len, "space"))  fn = rx_space;
+    else if (name_is(nm, len, "blank"))  fn = rx_blank;
+    else if (name_is(nm, len, "punct"))  fn = rx_punct;
+    else if (name_is(nm, len, "print"))  fn = rx_print;
+    else if (name_is(nm, len, "graph"))  fn = rx_graph;
+    else if (name_is(nm, len, "cntrl"))  fn = rx_cntrl;
+    else if (name_is(nm, len, "xdigit")) fn = rx_xdigit;
+    else return 0;
+
+    for (int c = 0; c < 256; c++)
+        if (fn(c)) cls_set(bm, c);
+    /* [:upper:] under -i has to admit lower case too, and vice versa;
+     * without this `grep -i '[[:upper:]]'` disagreed with GNU. */
+    if (icase && (fn == rx_upper || fn == rx_lower))
+        for (int c = 'a'; c <= 'z'; c++) { cls_set(bm, c); cls_set(bm, c - 32); }
+    return 1;
 }
 
 /* ---- compiler --------------------------------------------------- */
@@ -80,41 +216,48 @@ static nd_t *new_node(compiled_t *c) {
     nd_t *n = &c->nodes[c->nnodes++];
     memset(n, 0, sizeof(*n));
     n->greedy = 1;
+    n->rmax   = -1;
     return n;
 }
 
-/* Copy the nodes in [lo,hi) to the end of the array and return the copy of
- * `entry`. Pointers INTO the range are rebased onto the copy; pointers out
- * of it (to a shared tail) are left alone, which is what the caller wants.
- * This is what makes {n,m} possible: an NFA cannot express "exactly three"
- * without three copies of the thing being repeated. */
-static nd_t *clone_range(compiled_t *c, int lo, int hi, nd_t *entry) {
+static nd_t *new_nop(compiled_t *c) {
+    nd_t *n = new_node(c);
+    if (n) n->type = ND_NOP;
+    return n;
+}
+
+/* Map one pointer from the range [lo,hi) onto its copy at `base`.
+ * Pointers outside the range (a shared tail, or NULL) pass through. */
+static nd_t *clone_map(compiled_t *c, int lo, int hi, int base, nd_t *p) {
+    if (p >= &c->nodes[lo] && p < &c->nodes[hi])
+        return &c->nodes[base + (int)(p - &c->nodes[lo])];
+    return p;
+}
+
+/* Copy the nodes in [lo,hi) to the end of the array, rebasing every
+ * internal pointer onto the copy, and report where the fragment's entry
+ * and exit ended up. This is what makes {n,m} possible for a compound
+ * body: an NFA cannot express "exactly three" without three copies. */
+static int clone_frag(compiled_t *c, int lo, int hi,
+                      const frag_t *in, frag_t *out) {
     int n = hi - lo;
-    if (n <= 0) return entry;
+    if (n <= 0) { *out = *in; return 1; }
     if (c->nnodes + n > c->cap) { c->err = REG_ESPACE; return 0; }
     int base = c->nnodes;
     for (int i = 0; i < n; i++) c->nodes[base + i] = c->nodes[lo + i];
     c->nnodes += n;
     for (int i = 0; i < n; i++) {
         nd_t *d = &c->nodes[base + i];
-        if (d->out  && d->out  >= &c->nodes[lo] && d->out  < &c->nodes[hi])
-            d->out  = &c->nodes[base + (int)(d->out  - &c->nodes[lo])];
-        if (d->out2 && d->out2 >= &c->nodes[lo] && d->out2 < &c->nodes[hi])
-            d->out2 = &c->nodes[base + (int)(d->out2 - &c->nodes[lo])];
+        d->out  = clone_map(c, lo, hi, base, d->out);
+        d->out2 = clone_map(c, lo, hi, base, d->out2);
     }
-    if (entry >= &c->nodes[lo] && entry < &c->nodes[hi])
-        return &c->nodes[base + (int)(entry - &c->nodes[lo])];
-    return entry;
+    out->entry = clone_map(c, lo, hi, base, in->entry);
+    out->exit  = clone_map(c, lo, hi, base, in->exit);
+    return 1;
 }
 
-/* Forward decl */
-static nd_t *parse_alt(compiled_t *c, const char **pp, int ere);
-static nd_t *chain_end(compiled_t *c, nd_t *n);
-
-static int is_meta(char ch, int ere) {
-    if (ere) return ch == '|' || ch == ')';
-    return 0;
-}
+/* Forward decls */
+static int parse_alt(compiled_t *c, const char **pp, int ere, frag_t *out);
 
 static int parse_count(const char **pp) {
     int v = 0;
@@ -125,136 +268,163 @@ static int parse_count(const char **pp) {
     return v;
 }
 
-/* Build a quantified chain: repeat `body` between min and max times,
+/* A body of exactly one consuming node can be repeated by counting
+ * instead of by looping through the graph -- see the ND_REPEAT note at
+ * the top of the file. */
+static int simple_body(const frag_t *f) {
+    if (f->entry != f->exit) return 0;
+    switch (f->entry->type) {
+    case ND_LIT: case ND_DOT: case ND_CLASS: case ND_NCLASS:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Build a quantified fragment: repeat `body` between min and max times,
  * where max == -1 means infinity. */
-static nd_t *quantify(compiled_t *c, nd_t *body, nd_t *tail,
-                      int min, int max, int greedy, int lo, int hi) {
-    /* For min copies, just chain body->...->body */
-    nd_t *first = 0;
-    nd_t *prev_tail = 0;
+static int quantify(compiled_t *c, frag_t body, int min, int max, int greedy,
+                    int lo, int hi, frag_t *out) {
+    if (min < 0) min = 0;
+    if (max >= 0 && max < min) max = min;
 
-    /* We can't easily duplicate NFA nodes, so for the simple common
-     * cases (*, +, ?, {n,m}) we use split nodes. For complex {n,m}
-     * with n > 0 we simply unroll by running the body multiple times. */
+    /* THE FAST PATH, and the one nearly every real pattern takes. */
+    if (simple_body(&body)) {
+        nd_t *r = body.entry;
+        r->btype  = r->type;
+        r->type   = ND_REPEAT;
+        r->rmin   = min;
+        r->rmax   = max;
+        r->greedy = greedy;
+        out->entry = r;
+        out->exit  = r;
+        return 1;
+    }
 
-    /* Simple cases */
-    if (min == 0 && max == -1) {
-        /* * : split -> body -> back to split, or split -> tail */
+    nd_t *join = new_nop(c);
+    if (!join) return 0;
+
+    if (max == 0) {                     /* {0} matches empty */
+        out->entry = join;
+        out->exit  = join;
+        return 1;
+    }
+    if (min == 0 && max == -1) {        /* * */
         nd_t *sp = new_node(c);
         if (!sp) return 0;
         sp->type = ND_SPLIT;
         sp->greedy = greedy;
-        sp->out = greedy ? body : tail;
-        sp->out2 = greedy ? tail : body;
-        /* Point body end back to split */
-        nd_t *n = chain_end(c, body);
-        n->out = sp;
-        return sp;
+        sp->out  = greedy ? body.entry : join;
+        sp->out2 = greedy ? join : body.entry;
+        body.exit->out = sp;
+        out->entry = sp;
+        out->exit  = join;
+        return 1;
     }
-    if (min == 1 && max == -1) {
-        /* + : body -> split(body|tail) */
+    if (min == 1 && max == -1) {        /* + */
         nd_t *sp = new_node(c);
         if (!sp) return 0;
         sp->type = ND_SPLIT;
         sp->greedy = greedy;
-        sp->out = greedy ? body : tail;
-        sp->out2 = greedy ? tail : body;
-        nd_t *n = chain_end(c, body);
-        n->out = sp;
-        return body;
+        sp->out  = greedy ? body.entry : join;
+        sp->out2 = greedy ? join : body.entry;
+        body.exit->out = sp;
+        out->entry = body.entry;
+        out->exit  = join;
+        return 1;
     }
-    if (min == 0 && max == 1) {
-        /* ? : split(body|tail) */
+    if (min == 0 && max == 1) {         /* ? */
         nd_t *sp = new_node(c);
         if (!sp) return 0;
         sp->type = ND_SPLIT;
         sp->greedy = greedy;
-        sp->out = greedy ? body : tail;
-        sp->out2 = greedy ? tail : body;
-        nd_t *n = chain_end(c, body);
-        n->out = tail;
-        return sp;
+        sp->out  = greedy ? body.entry : join;
+        sp->out2 = greedy ? join : body.entry;
+        body.exit->out = join;
+        out->entry = sp;
+        out->exit  = join;
+        return 1;
     }
 
-    /* GENERAL {n,m}. This used to fall through to a `*`, so `x{3}` matched
-     * ANY number of x -- wrong output rather than an error, which is why it
-     * survived. An NFA cannot say "exactly three" without three copies, so
-     * the fragment is cloned.
+    /* GENERAL {n,m} over a compound body. This used to fall through to a
+     * `*`, so `(ab){3}` matched ANY number of them -- wrong output rather
+     * than an error, which is why it survived so long.
      *
-     * Built from the inside out: the optional copies first, each wrapped in
-     * a split that can skip to what follows, then the required ones in
+     * Built from the inside out: the optional copies first, each wrapped
+     * in a split that can skip to what follows, then the required ones in
      * front. The ORIGINAL fragment is used as the outermost copy and is
      * therefore mutated last, so every clone is taken from a pristine
      * range. */
-    if (min < 0) min = 0;
-    if (max >= 0 && max < min) max = min;
-    if (max == 0) return tail;          /* {0} matches empty */
-
-    nd_t *cur = tail;
+    nd_t *cur = join;
 
     if (max < 0) {
         /* {n,} -- an unbounded tail, so the last copy loops. */
-        nd_t *b = clone_range(c, lo, hi, body);
-        if (!b) return 0;
+        frag_t b;
+        if (!clone_frag(c, lo, hi, &body, &b)) return 0;
         nd_t *sp = new_node(c);
         if (!sp) return 0;
         sp->type = ND_SPLIT;
         sp->greedy = greedy;
-        sp->out  = greedy ? b : cur;
-        sp->out2 = greedy ? cur : b;
-        nd_t *be = chain_end(c, b);
-        if (!be) return 0;
-        be->out = sp;
-        cur = (min > 0) ? b : sp;       /* n>0: one copy is mandatory */
+        sp->out  = greedy ? b.entry : cur;
+        sp->out2 = greedy ? cur : b.entry;
+        b.exit->out = sp;
+        cur = (min > 0) ? b.entry : sp;   /* n>0: one copy is mandatory */
         if (min > 0) min--;
     } else {
         for (int k = 0; k < max - min; k++) {
-            nd_t *b = clone_range(c, lo, hi, body);
-            if (!b) return 0;
-            nd_t *be = chain_end(c, b);
-            if (!be) return 0;
-            be->out = cur;
+            frag_t b;
+            if (!clone_frag(c, lo, hi, &body, &b)) return 0;
+            b.exit->out = cur;
             nd_t *sp = new_node(c);
             if (!sp) return 0;
             sp->type = ND_SPLIT;
             sp->greedy = greedy;
-            sp->out  = greedy ? b : cur;
-            sp->out2 = greedy ? cur : b;
+            sp->out  = greedy ? b.entry : cur;
+            sp->out2 = greedy ? cur : b.entry;
             cur = sp;
         }
     }
 
     for (int k = 0; k < min; k++) {
-        nd_t *b = (k == min - 1) ? body : clone_range(c, lo, hi, body);
-        if (!b) return 0;
-        nd_t *be = chain_end(c, b);
-        if (!be) return 0;
-        be->out = cur;
-        cur = b;
+        frag_t b;
+        if (k == min - 1) b = body;                    /* pristine until now */
+        else if (!clone_frag(c, lo, hi, &body, &b)) return 0;
+        b.exit->out = cur;
+        cur = b.entry;
     }
-    return cur;
+    out->entry = cur;
+    out->exit  = join;
+    return 1;
 }
 
-/* Walk to the end of an acyclic chain.
- *
- * The code used `while (n->out) n = n->out;` in six places. quantify()
- * builds a star as a LOOP (body -> split -> body), which is correct for an
- * NFA and fatal for that walk: regcomp hung forever on any pattern
- * containing `*` -- a*, ab*, [0-9]*, aa*. That is the most common construct
- * in regex, so libtoby regex has never worked for it, which is why
- * ports/sbase/grep.c was written fixed-string-only.
- *
- * Bounded by the node pool, so a cycle stops the walk instead of hanging.
- * Callers that KNOW their fragment exit (a quantified fragment exits at the
- * ND_MATCH node handed to quantify) pass it explicitly and never come here. */
-static nd_t *chain_end(compiled_t *c, nd_t *n) {
-    int guard = 0;
-    while (n && n->out) {
-        if (++guard > c->nnodes) return n;   /* cycle: stop, do not spin */
-        n = n->out;
+/* One character inside a bracket expression, honouring backslash escapes
+ * only when the caller asked for them (see REG_ESCBRACKET in regex.h --
+ * awk wants them, sed and grep must not have them). */
+static int bracket_char(compiled_t *c, const char **pp) {
+    const char *p = *pp;
+    if ((c->cflags & REG_ESCBRACKET) && *p == '\\' && p[1]) {
+        p++;
+        int v;
+        switch (*p) {
+        case 'n': v = '\n'; break;
+        case 't': v = '\t'; break;
+        case 'r': v = '\r'; break;
+        case 'f': v = '\f'; break;
+        case 'v': v = '\v'; break;
+        case 'a': v = '\a'; break;
+        case 'b': v = '\b'; break;
+        case '0': v = '\0'; break;
+        default:  v = (unsigned char)*p; break;
+        }
+        p++;
+        *pp = p;
+        return v;
     }
-    return n;
+    int v = (unsigned char)*p++;
+    *pp = p;
+    return v;
 }
+
 /* Parse a character class [... ] */
 static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
     const char *p = *pp;
@@ -270,19 +440,36 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
     int first = 1;
     while (*p && (*p != ']' || first)) {
         first = 0;
-        int lo = (unsigned char)*p++;
+
+        /* [:class:], [.collating.], [=equivalence=] */
+        if (p[0] == '[' && (p[1] == ':' || p[1] == '.' || p[1] == '=')) {
+            char kind = p[1];
+            const char *nm = p + 2, *e = nm;
+            while (*e && !(e[0] == kind && e[1] == ']')) e++;
+            if (!*e) { c->err = REG_EBRACK; return 0; }
+            size_t nlen = (size_t)(e - nm);
+            if (kind == ':') {
+                if (!add_named_class(node->cclass, nm, nlen, icase)) {
+                    c->err = REG_ECTYPE; return 0;
+                }
+            } else {
+                /* Single characters collate to themselves in the C
+                 * locale, which is the only locale this system has. */
+                if (nlen != 1) { c->err = REG_ECOLLATE; return 0; }
+                cls_add(node->cclass, (unsigned char)nm[0], icase);
+            }
+            p = e + 2;
+            continue;
+        }
+
+        int lo = bracket_char(c, &p);
         int hi = lo;
         if (*p == '-' && p[1] && p[1] != ']') {
             p++;
-            hi = (unsigned char)*p++;
+            hi = bracket_char(c, &p);
         }
-        for (int ch = lo; ch <= hi; ch++) {
-            cls_set(node->cclass, ch);
-            if (icase) {
-                if (ch >= 'a' && ch <= 'z') cls_set(node->cclass, ch - 32);
-                if (ch >= 'A' && ch <= 'Z') cls_set(node->cclass, ch + 32);
-            }
-        }
+        if (hi < lo) { c->err = REG_ERANGE; return 0; }
+        for (int ch = lo; ch <= hi; ch++) cls_add(node->cclass, ch, icase);
     }
     /* An unterminated class is an ERROR. It used to compile and match
      * whatever had been accumulated, so `grep '['` searched for something
@@ -294,10 +481,44 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
     return node;
 }
 
-/* Parse a single atom */
-static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
+/* Does `p` sit on a well-formed interval? GNU treats a `{` that does not
+ * open one as a literal brace -- `grep -cE 'a{'` finds the line rather
+ * than reporting a bad pattern, and the old code silently deleted the
+ * atom in front of it instead. */
+static int is_interval(const char *p, int ere) {
+    if (ere) { if (*p != '{') return 0; p++; }
+    else     { if (p[0] != '\\' || p[1] != '{') return 0; p += 2; }
+    int sawlo = 0;
+    while (rx_digit((unsigned char)*p)) { p++; sawlo = 1; }
+    if (*p == ',') { p++; while (rx_digit((unsigned char)*p)) p++; }
+    else if (!sawlo) return 0;
+    if (ere) return *p == '}';
+    return p[0] == '\\' && p[1] == '}';
+}
+
+/* In a BRE, ^ is an anchor only where a pattern can start, and $ only
+ * where one can end; everywhere else they are literal characters. GNU
+ * agrees: `echo 'a$b' | sed 's/a$b/X/'` prints X. */
+static int bre_bol_here(compiled_t *c, const char *p) {
+    if (p == c->pat) return 1;
+    if (p - c->pat >= 2 && p[-2] == '\\' && (p[-1] == '(' || p[-1] == '|'))
+        return 1;
+    return 0;
+}
+
+static int bre_eol_here(const char *p) {
+    if (p[1] == '\0') return 1;
+    if (p[1] == '\\' && (p[2] == ')' || p[2] == '|')) return 1;
+    return 0;
+}
+
+/* Parse a single atom. Returns 0 with out->entry == 0 when there is
+ * nothing here to parse (the caller ends its sequence). */
+static int parse_atom(compiled_t *c, const char **pp, int ere, frag_t *out) {
     const char *p = *pp;
     nd_t *node = 0;
+
+    out->entry = out->exit = 0;
 
     switch (*p) {
     case '.':
@@ -307,12 +528,14 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
         p++;
         break;
     case '^':
+        if (!ere && !bre_bol_here(c, p)) goto literal;
         node = new_node(c);
         if (!node) return 0;
         node->type = ND_ANCHOR_BOL;
         p++;
         break;
     case '$':
+        if (!ere && !bre_eol_here(p)) goto literal;
         node = new_node(c);
         if (!node) return 0;
         node->type = ND_ANCHOR_EOL;
@@ -321,6 +544,7 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
     case '[':
         p++;
         node = parse_class(c, &p, c->cflags & REG_ICASE);
+        if (!node) return 0;
         break;
     case '\\':
         p++;
@@ -329,6 +553,17 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
             if (!node) return 0;
             node->type = ND_BACKREF;
             node->ch = *p - '0';
+            if (node->ch > c->nsub) { c->err = REG_ESUBREG; return 0; }
+            p++;
+        } else if (*p == 'b' || *p == 'B' || *p == '<' || *p == '>') {
+            /* GNU's word operators. sed and grep scripts in the wild use
+             * \< and \> constantly; without them they matched the LETTER
+             * b, or the literal characters < and >. */
+            node = new_node(c);
+            if (!node) return 0;
+            node->type = (*p == 'b') ? ND_WORDB  :
+                         (*p == 'B') ? ND_NWORDB :
+                         (*p == '<') ? ND_WSTART : ND_WEND;
             p++;
         } else if (*p == 'd' || *p == 'w' || *p == 's' ||
                    *p == 'D' || *p == 'W' || *p == 'S') {
@@ -339,18 +574,12 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
                 for (int i = '0'; i <= '9'; i++) cls_set(node->cclass, i);
                 node->type = (*p == 'd') ? ND_CLASS : ND_NCLASS;
             } else if (*p == 'w' || *p == 'W') {
-                for (int i = 'a'; i <= 'z'; i++) cls_set(node->cclass, i);
-                for (int i = 'A'; i <= 'Z'; i++) cls_set(node->cclass, i);
-                for (int i = '0'; i <= '9'; i++) cls_set(node->cclass, i);
-                cls_set(node->cclass, '_');
+                for (int i = 0; i < 256; i++)
+                    if (rx_word(i)) cls_set(node->cclass, i);
                 node->type = (*p == 'w') ? ND_CLASS : ND_NCLASS;
             } else {
-                cls_set(node->cclass, ' ');
-                cls_set(node->cclass, '\t');
-                cls_set(node->cclass, '\n');
-                cls_set(node->cclass, '\r');
-                cls_set(node->cclass, '\f');
-                cls_set(node->cclass, '\v');
+                for (int i = 0; i < 256; i++)
+                    if (rx_space(i)) cls_set(node->cclass, i);
                 node->type = (*p == 's') ? ND_CLASS : ND_NCLASS;
             }
             p++;
@@ -370,7 +599,7 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
             case 'r': node->ch = 13; break;
             case 'f': node->ch = 12; break;
             case 'v': node->ch = 11; break;
-            default:     node->ch = 7;  break;
+            default:  node->ch = 7;  break;
             }
             p++;
         } else if (*p) {
@@ -378,18 +607,15 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
             if (!node) return 0;
             node->type = ND_LIT;
             node->ch = (unsigned char)*p++;
+            if ((c->cflags & REG_ICASE) && rx_upper(node->ch)) node->ch += 32;
+        } else {
+            /* A pattern ending in a lone backslash. */
+            c->err = REG_EESCAPE;
+            return 0;
         }
         break;
     case '(':
-        if (!ere) {
-            /* BRE: literal ( */
-            node = new_node(c);
-            if (!node) return 0;
-            node->type = ND_LIT;
-            node->ch = (unsigned char)*p++;
-            break;
-        }
-        /* ERE: group */
+        if (!ere) goto literal;          /* BRE: a plain ( is a character */
         p++;
         {
             int gi = ++c->nsub;
@@ -398,42 +624,46 @@ static nd_t *parse_atom(compiled_t *c, const char **pp, int ere) {
             gs->type = ND_GROUP_S;
             gs->ch = gi;
 
-            nd_t *inner = parse_alt(c, &p, ere);
-            if (!inner) return 0;
+            frag_t inner;
+            if (!parse_alt(c, &p, ere, &inner)) return 0;
 
             nd_t *ge = new_node(c);
             if (!ge) return 0;
             ge->type = ND_GROUP_E;
             ge->ch = gi;
 
-            gs->out = inner;
-            nd_t *n = chain_end(c, inner);
-            n->out = ge;
-            node = gs;
+            gs->out = inner.entry;
+            inner.exit->out = ge;        /* the exit is KNOWN, not hunted */
+            if (*p != ')') { c->err = REG_EPAREN; return 0; }
+            p++;
+            out->entry = gs;
+            out->exit  = ge;
+            *pp = p;
+            return 1;
         }
-        if (*p == ')') p++;
-        break;
     default:
-        if (*p && !is_meta(*p, ere) && *p != '*' && *p != '+' && *p != '?') {
+    literal:
+        if (*p && !(ere && (*p == '|' || *p == ')')) &&
+            *p != '*' && !(ere && (*p == '+' || *p == '?'))) {
             node = new_node(c);
             if (!node) return 0;
             node->type = ND_LIT;
             node->ch = (unsigned char)*p;
-            if (c->cflags & REG_ICASE) {
-                if (node->ch >= 'A' && node->ch <= 'Z')
-                    node->ch += 32;
-            }
+            if ((c->cflags & REG_ICASE) && rx_upper(node->ch)) node->ch += 32;
             p++;
         }
         break;
     }
 
     *pp = p;
-    return node;
+    if (!node) return 1;                 /* nothing parsed; entry stays 0 */
+    out->entry = node;
+    out->exit  = node;
+    return 1;
 }
 
 /* Parse a BRE group \(...\) */
-static nd_t *parse_bre_group(compiled_t *c, const char **pp) {
+static int parse_bre_group(compiled_t *c, const char **pp, frag_t *out) {
     const char *p = *pp;
     int gi = ++c->nsub;
     nd_t *gs = new_node(c);
@@ -441,159 +671,146 @@ static nd_t *parse_bre_group(compiled_t *c, const char **pp) {
     gs->type = ND_GROUP_S;
     gs->ch = gi;
 
-    nd_t *inner = parse_alt(c, &p, 0);
-    if (!inner) return 0;
+    frag_t inner;
+    if (!parse_alt(c, &p, 0, &inner)) return 0;
 
     nd_t *ge = new_node(c);
     if (!ge) return 0;
     ge->type = ND_GROUP_E;
     ge->ch = gi;
 
-    gs->out = inner;
-    nd_t *n = chain_end(c, inner);
-    n->out = ge;
+    gs->out = inner.entry;
+    inner.exit->out = ge;
+    if (!(p[0] == '\\' && p[1] == ')')) { c->err = REG_EPAREN; return 0; }
+    p += 2;
 
-    if (*p == '\\' && p[1] == ')') p += 2;
     *pp = p;
-    return gs;
+    out->entry = gs;
+    out->exit  = ge;
+    return 1;
 }
 
 /* Parse a sequence of atoms with optional quantifiers */
-static nd_t *parse_seq(compiled_t *c, const char **pp, int ere) {
+static int parse_seq(compiled_t *c, const char **pp, int ere, frag_t *out) {
     const char *p = *pp;
+    nd_t *entry = 0, *tail = 0;
 
-    /* Dummy head to chain from */
-    nd_t head;
-    memset(&head, 0, sizeof(head));
-    nd_t *tail = &head;
-
-    while (*p && *p != '|' && *p != ')' && !(*p == '\\' && p[1] == ')') &&
-           !(*p == '\\' && p[1] == '|' && !ere)) {
+    for (;;) {
+        if (!*p) break;
+        if (ere && (*p == '|' || *p == ')')) break;
+        if (!ere && *p == '\\' && (p[1] == ')' || p[1] == '|')) break;
 
         /* The atom occupies nodes [atom_lo, atom_hi); a bounded
-         * quantifier has to CLONE that range. */
+         * quantifier over a compound body has to CLONE that range. */
         int atom_lo = c->nnodes, atom_hi;
-        nd_t *atom = 0;
-        nd_t *frag_end = 0;   /* known exit for quantified fragments */
+        frag_t atom;
 
-        /* BRE: \( starts a group */
         if (!ere && *p == '\\' && p[1] == '(') {
             p += 2;
-            atom = parse_bre_group(c, &p);
+            if (!parse_bre_group(c, &p, &atom)) return 0;
+        } else if (!ere && *p == '*' && !entry) {
+            /* A BRE that STARTS with * matches a literal asterisk --
+             * a BRE of star-a against the text star-a-b prints Xb. Previously the atom
+             * came back empty and the whole rest of the pattern was
+             * silently dropped. */
+            nd_t *n = new_node(c);
+            if (!n) return 0;
+            n->type = ND_LIT;
+            n->ch = '*';
+            p++;
+            atom.entry = atom.exit = n;
         } else {
-            atom = parse_atom(c, &p, ere);
+            if (!parse_atom(c, &p, ere, &atom)) return 0;
+            if (!atom.entry) break;
         }
-        if (!atom) break;
+        atom_hi = c->nnodes;
 
-        /* Check for quantifiers */
-        int greedy = 1;
+        /* Quantifiers. In a BRE only `*` and the GNU escapes \+ \? and
+         * the interval \{n,m\} are quantifiers: a bare + or ? there is
+         * an ordinary character, which is why they are not tested for
+         * unless `ere`. */
+        int qmin = -1, qmax = -1, greedy = 1;
+
         if (*p == '*' || (ere && (*p == '+' || *p == '?'))) {
             char q = *p++;
-            if (*p == '?') { greedy = 0; p++; }
-
-            atom_hi = c->nnodes;
-            nd_t *match = new_node(c);
-            if (!match) return 0;
-            match->type = ND_NOP;
-
-            int qmin = 0, qmax = -1;
-            if (q == '*') { qmin = 0; qmax = -1; }
+            if (ere && *p == '?') { greedy = 0; p++; c->has_lazy = 1; }
+            if (q == '*')      { qmin = 0; qmax = -1; }
             else if (q == '+') { qmin = 1; qmax = -1; }
-            else { qmin = 0; qmax = 1; }
-
-            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
-            if (!atom) return 0;
-            frag_end = match;
-        }
-        /* BRE quantifiers: \{n,m\} */
-        else if (!ere && *p == '\\' && p[1] == '{') {
+            else               { qmin = 0; qmax = 1;  }
+        } else if (!ere && p[0] == '\\' && (p[1] == '+' || p[1] == '?')) {
+            qmin = (p[1] == '+') ? 1 : 0;
+            qmax = (p[1] == '+') ? -1 : 1;
             p += 2;
-            int qmin = parse_count(&p);
-            int qmax = qmin;
+        } else if (is_interval(p, ere)) {
+            p += ere ? 1 : 2;
+            qmin = parse_count(&p);
+            qmax = qmin;
             if (*p == ',') {
                 p++;
-                if (*p == '\\') { qmax = -1; }
-                else { qmax = parse_count(&p); }
+                if (ere ? (*p == '}') : (*p == '\\')) qmax = -1;
+                else qmax = parse_count(&p);
             }
-            if (*p == '\\' && p[1] == '}') p += 2;
-            atom_hi = c->nnodes;
-            nd_t *match = new_node(c);
-            if (!match) return 0;
-            match->type = ND_NOP;
-            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
-            if (!atom) return 0;
-            frag_end = match;
-        }
-        /* ERE: {n,m} */
-        else if (ere && *p == '{') {
-            p++;
-            int qmin = parse_count(&p);
-            int qmax = qmin;
-            if (*p == ',') {
-                p++;
-                if (*p == '}') { qmax = -1; }
-                else { qmax = parse_count(&p); }
-            }
-            if (*p == '}') p++;
-            greedy = 1;
-            if (*p == '?') { greedy = 0; p++; }
-
-            atom_hi = c->nnodes;
-            nd_t *match = new_node(c);
-            if (!match) return 0;
-            match->type = ND_NOP;
-            atom = quantify(c, atom, match, qmin, qmax, greedy, atom_lo, atom_hi);
-            if (!atom) return 0;
+            p += ere ? 1 : 2;            /* past } or \} */
+            if (ere && *p == '?') { greedy = 0; p++; c->has_lazy = 1; }
+            if (qmax >= 0 && qmax < qmin) { c->err = REG_BADBR; return 0; }
         }
 
-        /* A quantified fragment EXITS at the ND_MATCH node handed to
-         * quantify(); its body is a loop and walking it never terminates.
-         * Using that known exit is both correct and the reason regcomp no
-         * longer hangs on `*`. Plain atoms are acyclic, so the guarded walk
-         * finds their end. */
-        tail->out = atom;
-        if (frag_end) tail = frag_end;
-        else          tail = chain_end(c, tail);
+        if (qmin >= 0) {
+            frag_t q;
+            if (!quantify(c, atom, qmin, qmax, greedy, atom_lo, atom_hi, &q))
+                return 0;
+            atom = q;
+        }
+
+        if (!entry) entry = atom.entry;
+        else        tail->out = atom.entry;
+        tail = atom.exit;
+    }
+
+    if (!entry) {                        /* an empty branch matches empty */
+        nd_t *n = new_nop(c);
+        if (!n) return 0;
+        entry = tail = n;
     }
 
     *pp = p;
-    return head.out;
+    out->entry = entry;
+    out->exit  = tail;
+    return 1;
 }
 
 /* Parse alternatives (a|b) */
-static nd_t *parse_alt(compiled_t *c, const char **pp, int ere) {
-    nd_t *left = parse_seq(c, pp, ere);
-    if (!left) {
-        left = new_node(c);
-        if (!left) return 0;
-        left->type = ND_MATCH;
-    }
+static int parse_alt(compiled_t *c, const char **pp, int ere, frag_t *out) {
+    frag_t left;
+    if (!parse_seq(c, pp, ere, &left)) return 0;
 
     const char *p = *pp;
-    char sep = ere ? '|' : '\\';
 
-    while ((ere && *p == '|') || (!ere && *p == '\\' && p[1] == '|')) {
-        if (ere) p++;
-        else p += 2;
+    while ((ere && *p == '|') || (!ere && p[0] == '\\' && p[1] == '|')) {
+        p += ere ? 1 : 2;
+        c->has_alt = 1;
 
-        nd_t *right = parse_seq(c, &p, ere);
-        if (!right) {
-            right = new_node(c);
-            if (!right) return 0;
-            right->type = ND_MATCH;
-        }
+        frag_t right;
+        if (!parse_seq(c, &p, ere, &right)) return 0;
 
         nd_t *br = new_node(c);
         if (!br) return 0;
         br->type = ND_BRANCH;
-        br->out = left;
-        br->out2 = right;
-        left = br;
+        br->out  = left.entry;
+        br->out2 = right.entry;
+
+        nd_t *join = new_nop(c);
+        if (!join) return 0;
+        left.exit->out  = join;
+        right.exit->out = join;
+
+        left.entry = br;
+        left.exit  = join;
     }
 
     *pp = p;
-    (void)sep;
-    return left;
+    *out = left;
+    return 1;
 }
 
 /* ---- matcher (backtracking) ------------------------------------- */
@@ -613,18 +830,70 @@ typedef struct {
      * already knows, because ND_MATCH is reached with sp sitting exactly
      * at the end of the match. */
     const char  *match_end;
+    /* POSIX leftmost-LONGEST mode: keep exploring past an accept and
+     * remember the longest one instead of taking the first. */
+    int          longest;
+    int          have_match;
+    long         steps;
+    long         budget;
+    const char  *best_start[MAX_GROUPS];
+    const char  *best_end[MAX_GROUPS];
 } match_ctx;
 
-#define MAX_DEPTH 4096
+/* One frame is ~96 bytes and a native user stack is 64 pages (256 KiB),
+ * so this ceiling is a hard safety property, not a tuning knob. It used
+ * to be 4096 -- reachable, because a greedy `.*` recursed once per
+ * character and sed lines are routinely 4 KiB. ND_REPEAT removed that
+ * whole class of recursion; what is left is one frame per group and per
+ * repetition of a COMPOUND body, which no sane pattern drives to 1500. */
+#define MAX_DEPTH 1500
+
+static int rx_is_word_at(const char *p) { return rx_word((unsigned char)*p); }
+
+static int match_body(const match_ctx *ctx, const nd_t *n, int btype, int c) {
+    if (c == '\0') return 0;
+    switch (btype) {
+    case ND_LIT: {
+        int a = c, b = n->ch;
+        if (ctx->cflags & REG_ICASE) {
+            if (rx_upper(a)) a += 32;
+            if (rx_upper(b)) b += 32;
+        }
+        return a == b;
+    }
+    case ND_DOT:
+        return !((ctx->cflags & REG_NEWLINE) && c == '\n');
+    case ND_CLASS:
+        return cls_test(n->cclass, c);
+    case ND_NCLASS:
+        if ((ctx->cflags & REG_NEWLINE) && c == '\n') return 0;
+        return !cls_test(n->cclass, c);
+    default:
+        return 0;
+    }
+}
 
 static int match_node(match_ctx *ctx, nd_t *node, const char *sp);
 
 static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
-    if (ctx->depth++ > MAX_DEPTH) return 0;
+    if (++ctx->depth > MAX_DEPTH) { ctx->depth--; return 0; }
+    if (ctx->budget && ++ctx->steps > ctx->budget) { ctx->depth--; return 0; }
 
     while (node) {
         switch (node->type) {
         case ND_MATCH:
+            if (ctx->longest) {
+                if (!ctx->have_match || sp > ctx->match_end) {
+                    ctx->have_match = 1;
+                    ctx->match_end  = sp;
+                    memcpy(ctx->best_start, ctx->group_start,
+                           sizeof ctx->best_start);
+                    memcpy(ctx->best_end, ctx->group_end,
+                           sizeof ctx->best_end);
+                }
+                ctx->depth--;
+                return 0;             /* keep looking for a longer one */
+            }
             ctx->match_end = sp;
             ctx->depth--;
             return 1;
@@ -636,63 +905,80 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             }
             node = node->out;
             continue;
-        case ND_LIT: {
-            if (!*sp) { ctx->depth--; return 0; }
-            int ch = (unsigned char)*sp;
-            int want = node->ch;
-            if (ctx->cflags & REG_ICASE) {
-                if (ch >= 'A' && ch <= 'Z') ch += 32;
-                if (want >= 'A' && want <= 'Z') want += 32;
-            }
-            if (ch != want) { ctx->depth--; return 0; }
-            sp++;
-            node = node->out;
-            continue;
-        }
+        case ND_LIT:
         case ND_DOT:
-            if (!*sp) { ctx->depth--; return 0; }
-            if ((ctx->cflags & REG_NEWLINE) && *sp == '\n') {
-                ctx->depth--; return 0;
-            }
-            sp++;
-            node = node->out;
-            continue;
         case ND_CLASS:
-            if (!*sp || !cls_test(node->cclass, (unsigned char)*sp)) {
-                ctx->depth--; return 0;
-            }
-            sp++;
-            node = node->out;
-            continue;
         case ND_NCLASS:
-            if (!*sp || cls_test(node->cclass, (unsigned char)*sp)) {
+            if (!match_body(ctx, node, node->type, (unsigned char)*sp)) {
                 ctx->depth--; return 0;
             }
             sp++;
             node = node->out;
             continue;
+        case ND_REPEAT: {
+            /* Consume greedily by COUNTING, then hand the continuation
+             * successively shorter prefixes. One frame per attempt
+             * instead of one per character. */
+            long n = 0;
+            while ((node->rmax < 0 || n < node->rmax) &&
+                   match_body(ctx, node, node->btype, (unsigned char)sp[n]))
+                n++;
+            if (n < node->rmin) { ctx->depth--; return 0; }
+            if (node->greedy) {
+                for (long k = n; k >= node->rmin; k--)
+                    if (match_node(ctx, node->out, sp + k)) {
+                        ctx->depth--; return 1;
+                    }
+            } else {
+                for (long k = node->rmin; k <= n; k++)
+                    if (match_node(ctx, node->out, sp + k)) {
+                        ctx->depth--; return 1;
+                    }
+            }
+            ctx->depth--;
+            return 0;
+        }
         case ND_ANCHOR_BOL:
-            if (sp != ctx->bol) {
-                if ((ctx->cflags & REG_NEWLINE) && sp > ctx->bol && sp[-1] == '\n') {
-                    /* ok */
-                } else if (ctx->eflags & REG_NOTBOL) {
-                    ctx->depth--; return 0;
-                } else if (sp != ctx->bol) {
-                    ctx->depth--; return 0;
-                }
+            if (sp == ctx->bol) {
+                if (ctx->eflags & REG_NOTBOL) { ctx->depth--; return 0; }
+            } else if ((ctx->cflags & REG_NEWLINE) && sp[-1] == '\n') {
+                /* ok: start of an embedded line */
+            } else {
+                ctx->depth--; return 0;
             }
             node = node->out;
             continue;
         case ND_ANCHOR_EOL:
-            if (*sp != '\0') {
-                if ((ctx->cflags & REG_NEWLINE) && *sp == '\n') {
-                    /* ok */
-                } else {
-                    ctx->depth--; return 0;
-                }
+            if (*sp == '\0') {
+                if (ctx->eflags & REG_NOTEOL) { ctx->depth--; return 0; }
+            } else if ((ctx->cflags & REG_NEWLINE) && *sp == '\n') {
+                /* ok: end of an embedded line */
+            } else {
+                ctx->depth--; return 0;
             }
             node = node->out;
             continue;
+        case ND_WORDB:
+        case ND_NWORDB: {
+            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
+            int after  = rx_is_word_at(sp);
+            int b = (before != after);
+            if ((node->type == ND_WORDB) != (b != 0)) { ctx->depth--; return 0; }
+            node = node->out;
+            continue;
+        }
+        case ND_WSTART: {
+            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
+            if (before || !rx_is_word_at(sp)) { ctx->depth--; return 0; }
+            node = node->out;
+            continue;
+        }
+        case ND_WEND: {
+            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
+            if (!before || rx_is_word_at(sp)) { ctx->depth--; return 0; }
+            node = node->out;
+            continue;
+        }
         case ND_GROUP_S: {
             const char *save = ctx->group_start[node->ch];
             ctx->group_start[node->ch] = sp;
@@ -713,7 +999,17 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
                 ctx->depth--; return 0;
             }
             size_t len = (size_t)(ctx->group_end[gi] - ctx->group_start[gi]);
-            if (strncmp(sp, ctx->group_start[gi], len) != 0) {
+            if (ctx->cflags & REG_ICASE) {
+                size_t i;
+                for (i = 0; i < len; i++) {
+                    int a = (unsigned char)sp[i];
+                    int b = (unsigned char)ctx->group_start[gi][i];
+                    if (rx_upper(a)) a += 32;
+                    if (rx_upper(b)) b += 32;
+                    if (!a || a != b) break;
+                }
+                if (i != len) { ctx->depth--; return 0; }
+            } else if (strncmp(sp, ctx->group_start[gi], len) != 0) {
                 ctx->depth--; return 0;
             }
             sp += len;
@@ -736,14 +1032,14 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
 /* ---- public API ------------------------------------------------- */
 
 /* An upper bound on the nodes a pattern needs. Each character can produce
- * a couple of nodes; each {n,m} multiplies the fragment before it by up to
- * m. Both the per-interval count and the product are capped, so a pattern
- * like a{1000}{1000} asks for a bounded amount and gets REG_ESPACE rather
- * than trying to allocate the world. */
+ * a couple of nodes; each {n,m} over a COMPOUND body multiplies the
+ * fragment before it by up to m. Both the per-interval count and the
+ * product are capped, so a pattern like a{1000}{1000} asks for a bounded
+ * amount and gets REG_ESPACE rather than trying to allocate the world. */
 static int estimate_nodes(const char *pat, int ere) {
     long len = 0;
     for (const char *q = pat; *q; q++) len++;
-    long base = len * 3 + 32;
+    long base = len * 4 + 64;
     long factor = 1;
     for (const char *q = pat; *q; q++) {
         int is_open = ere ? (*q == '{') : (*q == '\\' && q[1] == '{');
@@ -762,7 +1058,7 @@ static int estimate_nodes(const char *pat, int ere) {
         factor *= m;
         if (factor > 2048) { factor = 2048; break; }
     }
-    long total = base * factor + 32;
+    long total = base * factor + 64;
     if (total > 300000) total = 300000;
     return (int)total;
 }
@@ -773,6 +1069,7 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
     compiled_t *comp = (compiled_t *)calloc(1, sizeof(compiled_t));
     if (!comp) return REG_ESPACE;
     comp->cflags = cflags;
+    comp->pat    = pattern;
 
     const char *p = pattern;
     int ere = (cflags & REG_EXTENDED) != 0;
@@ -785,20 +1082,22 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
     comp->nodes = (nd_t *)malloc((size_t)comp->cap * sizeof(nd_t));
     if (!comp->nodes) { free(comp); return REG_ESPACE; }
 
-    nd_t *root = parse_alt(comp, &p, ere);
-    if (comp->err) {
-        int e = comp->err;
+    frag_t root;
+    int ok = parse_alt(comp, &p, ere, &root);
+    if (ok && *p) {
+        /* Something stopped the parse that is not the end of the pattern:
+         * an unbalanced ) in an ERE. Silently ignoring the tail meant a
+         * bad pattern matched a PREFIX of what was asked for. */
+        comp->err = REG_EPAREN;
+        ok = 0;
+    }
+    if (!ok || comp->err) {
+        int e = comp->err ? comp->err : REG_BADPAT;
         free(comp->nodes);
         free(comp);
         return e;
     }
-    if (!root) {
-        free(comp->nodes);
-        free(comp);
-        return REG_BADPAT;
-    }
 
-    /* Append match node at end of all branches */
     nd_t *end = new_node(comp);
     if (!end) {
         free(comp->nodes);
@@ -806,18 +1105,35 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
         return REG_ESPACE;
     }
     end->type = ND_MATCH;
+    /* THE ONE PLACE the accept state gets wired. There used to be a
+     * sweep here that pointed every node with a NULL ->out at `end`,
+     * which is how a fragment exit orphaned by chain_end() turned into
+     * "accept immediately" instead of a compile error. Every node's
+     * successor is now set by the construct that created it. */
+    root.exit->out = end;
 
-    /* Wire dangling ends to the match node */
-    for (int i = 0; i < comp->nnodes - 1; i++) {
-        nd_t *n = &comp->nodes[i];
-        if (n->type != ND_BRANCH && n->type != ND_SPLIT && !n->out)
-            n->out = end;
-    }
-
-    comp->start = root;
+    comp->start = root.entry;
     preg->priv = comp;
     preg->re_nsub = comp->nsub;
     return 0;
+}
+
+static void run_from(match_ctx *ctx, compiled_t *comp, const char *sp,
+                     int longest, long budget) {
+    memset(ctx->group_start, 0, sizeof ctx->group_start);
+    memset(ctx->group_end, 0, sizeof ctx->group_end);
+    ctx->group_start[0] = sp;
+    ctx->depth      = 0;
+    ctx->steps      = 0;
+    ctx->budget     = budget;
+    ctx->longest    = longest;
+    ctx->have_match = 0;
+    ctx->match_end  = sp;
+    if (match_node(ctx, comp->start, sp)) {
+        ctx->have_match = 1;
+        memcpy(ctx->best_start, ctx->group_start, sizeof ctx->best_start);
+        memcpy(ctx->best_end, ctx->group_end, sizeof ctx->best_end);
+    }
 }
 
 int regexec(const regex_t *preg, const char *string,
@@ -832,16 +1148,34 @@ int regexec(const regex_t *preg, const char *string,
     ctx.eflags = eflags;
     ctx.cflags = comp->cflags;
 
-    /* Try match at each position */
+    /* POSIX says leftmost-LONGEST; a backtracking engine naturally gives
+     * leftmost-FIRST. With greedy quantifiers the two agree, so the only
+     * patterns that need the slower answer are the ones with alternation:
+     * `echo ab | grep -oE 'a|ab'` prints ab in GNU grep and printed a
+     * here. Explicitly not done when the pattern uses a non-greedy
+     * quantifier, where taking the longest is the opposite of what the
+     * author asked for. */
+    int want_longest = comp->has_alt && !comp->has_lazy;
+
     const char *sp = string;
     while (1) {
-        memset(ctx.group_start, 0, sizeof(ctx.group_start));
-        memset(ctx.group_end, 0, sizeof(ctx.group_end));
-        ctx.group_start[0] = sp;
-        ctx.depth = 0;
-        ctx.match_end = sp;
+        run_from(&ctx, comp, sp, 0, 0);
+        if (ctx.have_match) {
+            if (want_longest) {
+                const char *first_end = ctx.match_end;
+                const char *fs[MAX_GROUPS], *fe[MAX_GROUPS];
+                memcpy(fs, ctx.best_start, sizeof fs);
+                memcpy(fe, ctx.best_end, sizeof fe);
 
-        if (match_node(&ctx, comp->start, sp)) {
+                /* Bounded: a pathological pattern falls back to the
+                 * leftmost-first answer rather than running forever. */
+                run_from(&ctx, comp, sp, 1, 200000);
+                if (!ctx.have_match || ctx.match_end < first_end) {
+                    ctx.match_end = first_end;
+                    memcpy(ctx.best_start, fs, sizeof fs);
+                    memcpy(ctx.best_end, fe, sizeof fe);
+                }
+            }
             if (pmatch && nmatch > 0 && !(comp->cflags & REG_NOSUB)) {
                 /* THE MATCH END COMES FROM THE MATCHER, NOT A GUESS.
                  *
@@ -851,22 +1185,16 @@ int regexec(const regex_t *preg, const char *string,
                  * result never varied and `best_end` simply walked to the
                  * END OF THE STRING. rm_eo was therefore strlen(string)
                  * for EVERY successful match, whatever it actually
-                 * matched. Nothing in the tree read rm_eo until tvi's
-                 * :s did, which is why it survived: a substitute of
-                 * /a/b/ on "aaa" produced "b", silently eating the tail.
-                 *
-                 * ND_MATCH is reached with sp exactly at the end of the
-                 * accepting path, so the matcher records it and we read
-                 * it here. One traversal, and it is correct by
-                 * construction rather than by search. */
+                 * matched. */
                 pmatch[0].rm_so = (regoff_t)(sp - string);
                 pmatch[0].rm_eo = (regoff_t)(ctx.match_end - string);
                 if (pmatch[0].rm_eo < pmatch[0].rm_so)
                     pmatch[0].rm_eo = pmatch[0].rm_so;
                 for (size_t i = 1; i < nmatch; i++) {
-                    if ((int)i <= comp->nsub && ctx.group_start[i] && ctx.group_end[i]) {
-                        pmatch[i].rm_so = (regoff_t)(ctx.group_start[i] - string);
-                        pmatch[i].rm_eo = (regoff_t)(ctx.group_end[i] - string);
+                    if ((int)i <= comp->nsub && i < MAX_GROUPS &&
+                        ctx.best_start[i] && ctx.best_end[i]) {
+                        pmatch[i].rm_so = (regoff_t)(ctx.best_start[i] - string);
+                        pmatch[i].rm_eo = (regoff_t)(ctx.best_end[i] - string);
                     } else {
                         pmatch[i].rm_so = -1;
                         pmatch[i].rm_eo = -1;
