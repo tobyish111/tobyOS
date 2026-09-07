@@ -86,4 +86,56 @@ echo "bytes: $(wc -c < nn.out)"
 sed -n 'p' nn.txt > nn2.out
 echo "p bytes: $(wc -c < nn2.out)"
 
+# ---- 2026-09-06: the regex engine's fragment-exit rewrite ----------------
+# EVERY case below produced the wrong answer before it, because a group
+# whose last element was quantified had its loop edge overwritten by the
+# group-end pointer. They are here because they FAILED, not because they
+# looked interesting.
+
+printf 'default via 192.168.68.1 dev eth0 proto dhcp\n' > route
+printf 'aaab\nabc\nxyz\n' > gq
+printf 'ab1cd\nA1B2\n' > cls
+printf 'a+b\na?b\na)b\na|b\n' > lit
+printf 'cat concat cats\n' > w
+
+echo @@rx_route;     sed -n 's/^default via \([0-9.]*\) .*/\1/p' route
+echo @@rx_grp_star;  sed 's/\(a*\)b/<\1>/' gq
+echo @@rx_grp_plus;  sed -E 's/(a+)b/<\1>/' gq
+echo @@rx_grp_ere;   sed -E 's/^([a-z]*)([0-9]*)/<\1><\2>/' cls
+echo @@rx_grp_bre;   sed 's/^\([a-z]*\)/<\1>/' cls
+echo @@rx_grp_rep;   sed -E 's/(ab)*/</' gq
+echo @@rx_grp_intv;  sed -E 's/([0-9]{1,3})/<\1>/' route
+
+echo @@rx_cls_alpha; sed 's/[[:alpha:]]*/</' cls
+echo @@rx_cls_digit; sed 's/[[:digit:]]/D/g' cls
+echo @@rx_cls_upper; sed 's/[[:upper:]]/U/g' cls
+echo @@rx_cls_neg;   sed 's/[^[:digit:]]/./g' cls
+echo @@rx_cls_punct; sed 's/[[:punct:]]/P/g' lit
+
+echo @@rx_lit_plus;  sed 's/a+/X/' lit
+echo @@rx_lit_quest; sed 's/a?/X/' lit
+echo @@rx_lit_paren; sed 's/)/X/' lit
+echo @@rx_lit_pipe;  sed 's/|/X/' lit
+echo @@rx_gnu_plus;  sed 's/a\+/X/' gq
+echo @@rx_gnu_quest; sed 's/xa\?b/X/' gq
+
+echo @@rx_word_lt;   sed 's/\<cat/X/g' w
+echo @@rx_word_gt;   sed 's/cat\>/X/g' w
+echo @@rx_word_b;    sed 's/\bcat\b/X/g' w
+
+echo @@rx_longest;   sed -E 's/a|ab/</' gq
+echo @@rx_alt_grp;   sed -E 's/(a|ab)(c|bc)/<\1|\2>/' gq
+
+# NOT `$(seq 1 3000)`: that substitution is ~14 KB and tsh caps command
+# substitution output, so the guest printed a truncation warning ahead of
+# the answer. Doubling a variable needs no subshell at all.
+LONGA=aaaaaaaaaa
+for i in 1 2 3 4 5 6 7 8 9; do LONGA=$LONGA$LONGA; done
+printf '%sX\n' "$LONGA" > big
+echo @@rx_long_line; sed 's/.*X/OK/' big
+echo @@rx_long_star;  sed 's/a*X/OK/' big
+
+echo @@rx_backref;   sed -E 's/(a)\1/D/' gq
+echo @@rx_nested;    sed -E 's/((a)*b)/<\1>/' gq
+
 echo @@sed_END

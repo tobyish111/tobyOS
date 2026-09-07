@@ -3395,6 +3395,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp etc/gnumade.zip                              $(INITRD_STAGE)/etc/gnumade.zip
 	cp etc/gnubadzip.zip                            $(INITRD_STAGE)/etc/gnubadzip.zip
 	cp etc/sed_test.sh                              $(INITRD_STAGE)/etc/sed_test.sh
+	cp etc/awk_test.sh                              $(INITRD_STAGE)/etc/awk_test.sh
+	cp etc/grep_test.sh                             $(INITRD_STAGE)/etc/grep_test.sh
 	cp etc/procnet_test.sh                          $(INITRD_STAGE)/etc/procnet_test.sh
 	cp etc/power_test.sh                            $(INITRD_STAGE)/etc/power_test.sh
 	@# The 19 coreutils commands tobyOS lacked, hard-linked to one binary
@@ -4142,6 +4144,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/libtest.a etc/dwarf_test.elf              \
 	    etc/dbg_test.elf                              \
 	    etc/sed_test.sh                                                   \
+	    etc/awk_test.sh                                                   \
+	    etc/grep_test.sh                                                  \
 	    etc/procnet_test.sh                                               \
 	    etc/power_test.sh                                                 \
 	    lib/modules/hello.ko                                              \
