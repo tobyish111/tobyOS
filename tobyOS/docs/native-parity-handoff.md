@@ -43,7 +43,8 @@ touching anything; the traps at the end each cost a reboot cycle to learn.
 | Oils third-party POSIX suite | 1271/1280 | `bash logs/oilspec.sh` (own make, see trap) |
 | distro-parity gate | 160/160 | `bash logs/distrotail.sh` (~12 min) |
 | Linux POSIX gate | 32/32, enosys_gaps=0 | `bash logs/lxposix.sh [--full]` |
-| utilities: native / busybox-only / absent | 222 / 46 / 7 | `python <scratchpad>/census.py` |
+| utilities: native / busybox-only / absent | 268 / 0 / 7 | `python <scratchpad>/census.py` |
+| sed / awk / grep vs the GNU tools | 88 / 129 / 56 | `bash logs/textgate.sh` |
 
 Recent commits, newest first, all on real hardware evidence:
 
@@ -293,28 +294,72 @@ per section the way distrotail does. Run it after every ISO.
 Absent and out of scope unless asked: `node`, `perl`, `ruby` (ports);
 `vim` (tvi exists; the name would misname it); `gcc` (`cc` is tcc and works).
 
-### 11. The native text tools are subsets (found writing item 7's gate)
+### 11. The native text tools are subsets -- CLOSED 2026-09-06 (QEMU)
 
-The census counts these as "native", and they are, but a user CAN tell them
-from the Linux ones:
+**What it said:** awk was a 313-line subset (no `$NF`, no `?:`, no
+`sub()`/`gsub()`, and a `$1=="x"` pattern did not select); a sed bracket
+expression returned the whole rest of the line instead of the capture;
+grep had no `-m`.
 
-- `awk` (programs/awk, 313 lines): no `$NF`, no `?:`, no `sub()`/`gsub()`,
-  and a `$1=="x"` pattern does not select. Every one of these silently
-  produced wrong output in a gate fixture before the fixtures were rewritten
-  with sed/cut/grep. A real awk (or porting one-true-awk) is a full item.
-- `sed`: a bracket class in `s/^default via \([0-9.]*\) .*/\1/p` returned
-  the whole rest of the line, not the capture. Bracket expressions need a
-  look.
-- `grep` has no `-m`. `ls -l` prints a synthetic link count (1 for files,
-  2 for directories) because libtoby's `stat` carries no `st_nlink`,
-  `st_ino` or `st_dev` -- `test -ef` is path equality for the same reason.
-- `tail -1 FILE` was observed printing nothing for a file written with
-  `> f 2>&1` once (gate run 6, `/tmp/tn2.out`, 122 bytes); the diagnostic
-  section `diag_redir` in etc/distro_test.sh could not reproduce it. Left
-  as a note.
+**What it actually was.** The sed complaint was not about brackets. The
+regex engine's parser handed fragments around as a single entry pointer and
+rediscovered the other end by walking `->out` (`chain_end`), which works
+only while the graph is a tree -- and a quantifier makes it a GRAPH. For
+`\([0-9.]*\)` that walk went round the star's own loop, tripped its cycle
+guard, and then **overwrote a loop edge with the group-end pointer**. The
+star was destroyed, the fragment's real exit was orphaned with a NULL
+successor, and an orphaned exit node is read by the matcher as "accept
+here" -- so the zero-iteration branch accepted the whole pattern and the
+group was never closed. **Every group whose last element is quantified was
+miscompiled**, `(a*)` and `\(x\)*` alike, BRE and ERE.
 
-**Proof when closed:** the same fixtures, written the natural awk/sed way,
-still pass; busybox and native agree on the census's awk/sed one-liners.
+**Done:**
+
+- `libtoby/src/regex.c` rebuilt around an explicit `frag_t {entry, exit}`.
+  Every construct wires its own exit; `chain_end` is gone. Also added:
+  POSIX `[:classes:]` (`[[:alpha:]]` used to parse one byte at a time and
+  match the set `[ : a l p h`), `\b \B \< \>`, BRE positional `^`/`$`
+  with `+ ? ) |` literal and GNU's `\+ \?`, a literal `{` that does not
+  open an interval, leftmost-LONGEST for alternation (`grep -oE 'a|ab'`),
+  and `REG_ESCBRACKET` -- a private flag for awk, because awk processes
+  backslash escapes inside a bracket and sed and grep provably do not.
+  A greedy quantifier over a single-node body compiles to one iterative
+  `ND_REPEAT` instead of recursing once per character consumed: a 4 KiB sed
+  line used to come within a hair of the bottom of a 256 KiB user stack.
+- `programs/awk/main.c` is a real POSIX awk (lexer, recursive-descent
+  parser, tree-walking interpreter): user functions with arrays passed by
+  reference, all four getline forms, the three print redirections, every
+  built-in, and the POSIX comparison rule. Two value-semantics bugs found
+  by the differential suite and fixed: a cached number-to-string conversion
+  used to change a value's TYPE (`x=2; s=x ""` then `x<10` was false), and
+  `truth()` consulted a cached numeric value so `x="0abc"; y=x+0` made x
+  false.
+- `ports/sbase/grep.c` gained `-m`, `-e`, `-f`, `-A/-B/-C` with GNU's `--`
+  group separator, and `-s`. `-o` printed only the FIRST match per line;
+  `-w`/`-x` gave up at the first candidate instead of scanning on. And
+  **`grep 'x$'` had never matched anything**: fgets keeps the newline, the
+  pattern was matched against the whole buffer, so `$` sat one character
+  short. It reported "no lines", never an error, which is why it lasted.
+
+**Proof:** `bash logs/textgate.sh` -- one boot, three fixtures
+(`etc/sed_test.sh`, `etc/awk_test.sh`, `etc/grep_test.sh`), each run twice:
+by tsh in the guest and by bash on the host against real GNU sed/awk/grep,
+diffed section by section. The section list is derived from the fixture, so
+a new case is graded the moment it is added. 27 rx_ sections were added to
+the sed fixture; **21 of them fail against the pre-rewrite engine**, which
+is what makes them a gate rather than a description.
+
+Because libtoby's regex.c, sed, awk and grep all build against host gcc
+unchanged, the same fixtures run on the host in seconds -- do that before
+paying for a boot.
+
+**Still open here:** `ls -l` prints a synthetic link count (1 for files, 2
+for directories) and `test -ef` is path equality, both because libtoby's
+`struct stat` carries no `st_nlink`, `st_ino` or `st_dev` and
+`struct abi_stat` has nowhere to put them. That is an ABI change, not a
+text-tool one, and is the last piece of this item.
+
+**HARDWARE PROOF OWED**, as for every item above it.
 
 ---
 
