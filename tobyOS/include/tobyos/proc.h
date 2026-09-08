@@ -930,6 +930,10 @@ struct proc *proc_lookup(int pid);
  * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
 int proc_set_pgid(int pid, int pgid);
 
+/* Signal `pid` and every process descended from it. Returns the count.
+ * Uses live parent links, so it cannot follow a recycled pid. */
+int proc_kill_tree(int pid, int sig);
+
 /* Kernel-side WUNTRACED-style foreground wait: returns the exit code, or
  * 0 with *stop_sig set when the child job-control-stopped. The KERNEL
  * shell's monitor path uses this; /bin/tsh's host.c provides the same

@@ -652,6 +652,42 @@ int proc_set_pgid(int pid, int pgid) {
     return 0;
 }
 
+/* Signal a process and everything descended from it.
+ *
+ * WHY NOT A PROCESS GROUP. The obvious way to reap an SSH session is to
+ * give its shell a process group of its own and signal that. Measured: it
+ * stalls the machine. Handing the session shell its own pgid changed the
+ * fan-out of paths that deliver to a group -- and pid 0's idle loop went
+ * with it, reproducibly, at a different session each run. A bisect that
+ * removed only proc_set_pgid and the group kill came back clean.
+ *
+ * So ancestry, not groups. The parent links are walked live and only for a
+ * root that is still running, which also means no recycled pid can be
+ * mistaken for a session member -- the failure mode that made the group
+ * version dangerous even before it stalled anything.
+ *
+ * The walk is bounded by the table size, so a corrupted parent cycle costs
+ * a bounded scan rather than a hang. Returns how many procs were signalled.
+ */
+int proc_kill_tree(int pid, int sig) {
+    struct proc *root = proc_lookup(pid);
+    if (!root) return 0;
+    int hits = 0;
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *p = &g_proc[i];
+        if (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) continue;
+        int q = (p->pid == pid) ? pid : p->ppid;
+        int guard = 0;
+        while (q > 0 && guard++ < PROC_MAX) {
+            if (q == pid) { signal_send(p, sig); hits++; break; }
+            struct proc *pp = proc_lookup(q);
+            if (!pp) break;
+            q = pp->ppid;
+        }
+    }
+    return hits;
+}
+
 /* Kernel-side WUNTRACED-style foreground wait (see proc.h). Yield-poll,
  * the same shape as the syscall arms; the kernel shell runs as a kernel
  * thread, so there is no syscall boundary to deliver an EINTR across. */
