@@ -1792,17 +1792,32 @@ static long sys_username(int uid, char *out, size_t cap) {
  * refusal was correct and the errno userspace saw was ENOMEM. "Out of memory" for a
  * permission denial sends a debugger in precisely the wrong direction, and a test
  * that only asserted "chown failed" would have accepted it forever. */
+/* RESOLVE THE PATH AGAINST THE CALLER'S CWD, like every other path
+ * syscall here does.
+ *
+ * These two took the user string verbatim and handed it to the VFS, so a
+ * RELATIVE path never resolved: `cd /tmp; chmod 755 f` reported "No such
+ * file or directory" for a file that stat() in the same process found
+ * without trouble. That asymmetry is what made it survive -- chmod's own
+ * stat() succeeds first, so the tool gets far enough to look like it is
+ * working on the right file and fails at the last step.
+ *
+ * Found by a distro-gate case for `test -x`, and it is also the cause of
+ * the Oils builtin-type failure (1286), where `touch _tmp/date` works and
+ * `chmod +x _tmp/date` then cannot find what touch just made. */
 static long sys_chmod(const char *path, uint32_t mode) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chmod")) return -ABI_EPERM;
-    char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
     return vfs_err_to_abi(vfs_chmod(kpath, mode));
 }
 
 static long sys_chown(const char *path, uint32_t uid, uint32_t gid) {
     if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_chown")) return -ABI_EPERM;
-    char kpath[VFS_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), path)) return -ABI_EFAULT;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
     return vfs_err_to_abi(vfs_chown(kpath, uid, gid));
 }
 
