@@ -9093,23 +9093,58 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
     return n;
 }
 
-/* access(2)/faccessat(2) family: resolve the path and report existence. We do
- * not enforce per-file R/W/X bits (tobyOS files in /bin are all executable and
- * the VFS doesn't model Unix mode bits here), so any existing path is
- * accessible -- exactly what PATH search / `test -e` / shell rc-probing need.
+/* access(2)/faccessat(2) family: resolve the path and ANSWER THE QUESTION
+ * THAT WAS ASKED.
+ *
+ * The mode argument used to be ignored entirely, under a comment saying the
+ * VFS did not model Unix mode bits. That was true when it was written and
+ * is not any more -- the bits are in struct vfs_stat, and `ls -l` prints
+ * them. So `access(f, X_OK)` said YES for a plain 0644 file, and bash's
+ * `test -x` (which is access(2) underneath) called every regular file
+ * executable. Found because tsh's own `test -x` was taught to read the
+ * mode bits and immediately disagreed with the bash running beside it.
+ *
+ * Same rule the shell's test_access_ok uses: a filesystem carrying no
+ * permission information at all is reported accessible, root reads and
+ * writes anything, and root still needs SOME execute bit to execute.
+ *
  * AT_FDCWD and absolute paths are honoured (resolve_user_path also handles
- * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the cwd
- * (best-effort -- bash/coreutils use AT_FDCWD). */
+ * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the
+ * cwd (best-effort -- bash/coreutils use AT_FDCWD). */
 /* Defined next to sys_stat: the single table of synthesised /dev nodes. */
 static uint32_t dev_synth_mode(const char *kpath);
 
-static long lx_faccess(const char *upath) {
+#define LX_R_OK 4
+#define LX_W_OK 2
+#define LX_X_OK 1
+
+static long lx_faccess(const char *upath, int mode) {
     char kpath[ABI_PATH_MAX];
     if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
         return -ABI_EFAULT;
     if (dev_synth_mode(kpath)) return 0;   /* synthesised /dev node */
     struct vfs_stat vs;
-    return (vfs_stat(kpath, &vs) == VFS_OK) ? 0 : -ABI_ENOENT;
+    if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
+
+    unsigned want = (unsigned)mode & 7u;
+    if (want == 0) return 0;               /* F_OK: existence only */
+
+    unsigned perm = vs.mode & 0777u;
+    if (!(vs.mode & VFS_MODE_VALID) && perm == 0) return 0;
+
+    struct proc *me = current_proc();
+    uint32_t uid = me ? me->uid : 0;
+    uint32_t gid = me ? me->gid : 0;
+
+    if (uid == 0) {
+        if (!(want & LX_X_OK)) return 0;
+        return (perm & 0111u) ? 0 : -ABI_EACCES;
+    }
+    unsigned bits;
+    if      (vs.uid == uid) bits = (perm >> 6) & 7u;
+    else if (vs.gid == gid) bits = (perm >> 3) & 7u;
+    else                    bits = perm & 7u;
+    return ((bits & want) == want) ? 0 : -ABI_EACCES;
 }
 
 /* ------------------------------------------------------------------ *
@@ -13628,10 +13663,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
 
     case LX_access:                 /* (path, mode) */
-        return lx_faccess((const char *)a1);
+        return lx_faccess((const char *)a1, (int)a2);
     case LX_faccessat:              /* (dirfd, path, mode) */
     case LX_faccessat2:             /* (dirfd, path, mode, flags) */
-        return lx_faccess((const char *)a2);
+        return lx_faccess((const char *)a2, (int)a3);
 
     /* Known-optional: libc/busybox probe these and fall back cleanly on
      * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */
