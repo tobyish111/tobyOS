@@ -8797,6 +8797,37 @@ static int test_fd_is_tty(long fd) {
 #endif
 }
 
+/* What access(2) would say about this file for the caller.
+ *
+ * -r, -w and -x used to `return 0` -- TRUE for anything that existed, so
+ * `test -x /etc/passwd` said yes and every "is this runnable" check in
+ * every script was decoration. The permission bits were sitting in the
+ * stat all along; only nobody consulted them.
+ *
+ * `want` is 4 read / 2 write / 1 execute. A filesystem that carries no
+ * permission information at all (no VFS_MODE_VALID and no bits) is
+ * reported accessible, which is the same answer the permission checker
+ * gives it elsewhere. Root reads and writes anything, but still needs an
+ * execute bit SOMEWHERE to execute -- that is the one place root is not
+ * exempt, and getting it wrong would make `test -x` useless for the user
+ * most likely to be running the script. */
+static bool test_access_ok(const struct vfs_stat *st, unsigned want) {
+    unsigned perm = st->mode & 0777u;
+    if (!(st->mode & VFS_MODE_VALID) && perm == 0) return true;
+
+    struct proc *me = current_proc();
+    uint32_t uid = me ? me->uid : 0;
+    uint32_t gid = me ? me->gid : 0;
+
+    if (uid == 0) return (want == 1u) ? ((perm & 0111u) != 0) : true;
+
+    unsigned bits;
+    if      (st->uid == uid) bits = (perm >> 6) & 7u;
+    else if (st->gid == gid) bits = (perm >> 3) & 7u;
+    else                     bits = perm & 7u;
+    return (bits & want) != 0;
+}
+
 static int test_unary(const char *op, const char *operand) {
     if (strcmp(op, "-n") == 0) return operand[0] != '\0' ? 0 : 1;
     if (strcmp(op, "-z") == 0) return operand[0] == '\0' ? 0 : 1;
@@ -8843,7 +8874,10 @@ static int test_unary(const char *op, const char *operand) {
     if (op2 == 'k') return (st.mode & 01000u) ? 0 : 1;
     if (op2 == 'N') return 1;
     if (op2 == 'G' || op2 == 'O') return 0;
-    return 0;                                        /* -a -e -r -w -x */
+    if (op2 == 'r') return test_access_ok(&st, 4u) ? 0 : 1;
+    if (op2 == 'w') return test_access_ok(&st, 2u) ? 0 : 1;
+    if (op2 == 'x') return test_access_ok(&st, 1u) ? 0 : 1;
+    return 0;                                        /* -a -e */
 }
 
 /* Returns 0 true / 1 false; sets *err for "integer expression expected". */
