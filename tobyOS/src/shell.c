@@ -115,7 +115,23 @@ extern volatile struct limine_module_request module_req;
  * which the 32 KiB kernel stack the in-kernel shell runs on can carry; the
  * real fix is a heap-grown argv, and this is the step before it. */
 #ifdef SHELL_HOSTED
-#define ARG_MAX  512       /* user stack (256 KiB): `set -- $(seq 1 255)` is 257 words */
+/* 512 -- and RAISING THIS IS NOT THE WAY TO GO PAST IT (measured 2026-09-08).
+ *
+ * The Oils case "ulimit -f 1 prevents files larger 512 bytes" does not
+ * measure ulimit at all: it runs `for i in $(seq 513)` and dies here with
+ * "too many arguments (max 512)" while bash carries on. The obvious fix is
+ * a bigger number, and it is a stack hazard: ARG_MAX multiplies through
+ * `struct shell_simple.argv[ARG_MAX]`, and `struct shell_pipeline` holds
+ * SHELL_STAGE_MAX = 8 of those and is allocated ON THE STACK in three
+ * places that nest with subshells and command substitution. At 512 that is
+ * already 32 KiB per pipeline against a 256 KiB user stack; 1024 makes it
+ * 64 KiB and four levels of nesting overflow. A stack overflow in the
+ * shell would present as exactly the kind of intermittent wedge this tree
+ * has spent weeks chasing, which is a bad trade for one conformance case.
+ *
+ * The real fix is the one the note below has always named: grow argv on the
+ * heap. Until then this stays at 512 and that case stays failing. */
+#define ARG_MAX  512
 #else
 #define ARG_MAX  256
 #endif
@@ -3632,6 +3648,12 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         if (n < 0) return -1;
         if (n == 0) { hit_eof = true; break; }
         *got_any = true;
+        /* A NUL BYTE IS IGNORED, not stored. `printf '.\000.' | read s`
+         * leaves bash with a two-character ".." -- the value is a C string
+         * underneath, so storing the NUL truncated it to one character
+         * instead. Only when NUL is the DELIMITER (read -d '') does it
+         * mean anything, and that is handled below. */
+        if (c == '\0' && delim != '\0') continue;
 
         if (!raw && escaped) {
             escaped = false;
@@ -8812,7 +8834,13 @@ static int test_unary(const char *op, const char *operand) {
     if (op2 == 'b') return fmt == 0060000u ? 0 : 1; /* S_IFBLK */
     if (op2 == 'p') return fmt == 0010000u ? 0 : 1; /* S_IFIFO */
     if (op2 == 'S') return fmt == 0140000u ? 0 : 1; /* S_IFSOCK */
-    if (op2 == 'g' || op2 == 'u' || op2 == 'k') return 1;
+    /* setuid / setgid / sticky, which were hardcoded FALSE. The bits are
+     * in the mode the VFS already reports -- `ls -l` prints the `s` from
+     * the same place -- so `test -u` on a setuid file answered "no" while
+     * ls showed rwsr-xr-x two lines earlier. */
+    if (op2 == 'u') return (st.mode & 04000u) ? 0 : 1;
+    if (op2 == 'g') return (st.mode & 02000u) ? 0 : 1;
+    if (op2 == 'k') return (st.mode & 01000u) ? 0 : 1;
     if (op2 == 'N') return 1;
     if (op2 == 'G' || op2 == 'O') return 0;
     return 0;                                        /* -a -e -r -w -x */
@@ -9761,6 +9789,37 @@ static void cmd_printf(int argc, char **argv) {
 
 static int g_shell_umask = 022;
 
+/* The shell's umask is the PROCESS umask, inherited like every other
+ * shell's. It used to be a number this file kept to itself: initialised to
+ * 022 whatever the process had, never applied to anything the shell
+ * created, and reported by `umask` as if it were real. bash in the same
+ * guest reported 0 and tsh reported 022 -- two shells, one process tree,
+ * different answers to the same question. */
+#ifdef SHELL_HOSTED
+/* libtoby's umask(2), declared here rather than by including <sys/stat.h>:
+ * this file compiles against the KERNEL headers in both builds and the two
+ * type sets collide. libtoby's mode_t is unsigned int. */
+extern unsigned int umask(unsigned int mask);
+#endif
+
+static void shell_umask_sync(void) {
+    static bool synced = false;
+    if (synced) return;
+    synced = true;
+#ifdef SHELL_HOSTED
+    unsigned int old = umask(0u);      /* read it the only way POSIX offers */
+    umask(old);
+    g_shell_umask = (int)(old & 0777u);
+#endif
+}
+
+static void shell_umask_apply(int mask) {
+    g_shell_umask = mask;
+#ifdef SHELL_HOSTED
+    umask((unsigned int)(mask & 0777));
+#endif
+}
+
 /* `u=rwx,g=rx,o=rx` for 022: the symbolic form names the permissions the
  * mask ALLOWS, all three groups always present, letters always in rwx
  * order. Needs at least 18 bytes. */
@@ -9781,6 +9840,7 @@ static void shell_umask_symbolic(unsigned mask, char *out) {
 
 static void cmd_umask(int argc, char **argv) {
     shell_set_status(0);
+    shell_umask_sync();
     /* `-S` symbolic, `-p` reinput form. POSIX mandates -S; nothing in 2,776
      * third-party cases ever passed it and tsh called it an invalid mode. */
     bool sym = false, reinput = false;
@@ -9824,7 +9884,7 @@ static void cmd_umask(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
-        g_shell_umask = val;
+        shell_umask_apply(val);
         if (sym) {
             shell_umask_symbolic((unsigned)g_shell_umask, symbuf);
             shell_printf("%s\n", symbuf);
@@ -9887,7 +9947,7 @@ static void cmd_umask(int argc, char **argv) {
             return;
         }
     }
-    g_shell_umask = (int)((~perms) & 0777u);
+    shell_umask_apply((int)((~perms) & 0777u));
     if (sym) {
         shell_umask_symbolic((unsigned)g_shell_umask, symbuf);
         shell_printf("%s\n", symbuf);
@@ -10665,7 +10725,14 @@ static void dirstack_print(bool per_line, bool with_index) {
 static void cmd_dirs(int argc, char **argv) {
     bool per_line = false, with_index = false;
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-' || !argv[i][1]) continue;
+        /* An OPERAND is an error -- `dirs a` is a usage mistake, and this
+         * used to skip over it and print the stack as if it had been asked
+         * for nothing in particular. */
+        if (argv[i][0] != '-' || !argv[i][1]) {
+            kprintf("dirs: %s: invalid argument\n", argv[i]);
+            shell_set_status(2);
+            return;
+        }
         for (const char *c = argv[i] + 1; *c; c++) {
             if      (*c == 'l') { /* paths are already absolute here */ }
             else if (*c == 'p') per_line = true;
@@ -10689,6 +10756,13 @@ static void dirstack_copy(char *dst, const char *src) {
 }
 
 static void cmd_pushd(int argc, char **argv) {
+    /* bash: one operand at most, and it says so rather than quietly using
+     * the first and dropping the rest. */
+    if (argc > 2) {
+        kprintf("pushd: too many arguments\n");
+        shell_set_status(1);
+        return;
+    }
     if (argc < 2) {
         /* Bare `pushd` swaps the top two entries. */
         if (g_dirstack_n < 1) {
