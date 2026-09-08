@@ -4194,7 +4194,7 @@ static void        shell_spawn_program_profile(const char *path, int argc,
                                                const char *profile);
 static const char *resolve_program(const char *name, char *out_buf,
                                    size_t out_sz);
-static bool        path_is_file(const char *path);
+static bool        path_is_runnable(const char *path);
 
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) {
@@ -8525,7 +8525,7 @@ static void cmd_command(int argc, char **argv) {
             if (found) continue;
             char path_buf[64];
             const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
-            if (path_is_file(path)) {
+            if (path_is_runnable(path)) {
                 /* `command -v` answers with the PATH it resolved, not the
                  * name it was asked about -- `command -v newgrp` is
                  * /bin/newgrp in every shell. */
@@ -8598,7 +8598,7 @@ static void cmd_type(int argc, char **argv) {
         const char *name = argv[i];
         char path_buf[64];
         const char *path = resolve_program(name, path_buf, sizeof(path_buf));
-        bool is_file = path_is_file(path);
+        bool is_file = path_is_runnable(path);
 
         /* -P skips every shell-level meaning and reports only the file. */
         if (f_P) {
@@ -8693,7 +8693,7 @@ static void cmd_which(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         char path_buf[64];
         const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
-        if (path_is_file(path)) {
+        if (path_is_runnable(path)) {
             shell_printf("%s\n", path);
         } else {
             shell_printf("%s not found\n", argv[i]);
@@ -10037,7 +10037,7 @@ static void hashtab_set(const char *name, const char *path) {
 static bool hashtab_add(const char *name) {
     char path_buf[256];
     const char *path = resolve_program(name, path_buf, sizeof path_buf);
-    if (!path_is_file(path)) return false;
+    if (!path_is_runnable(path)) return false;
     hashtab_set(name, path);
     return true;
 }
@@ -11597,10 +11597,21 @@ static const char *path_join(const char *prefix, size_t plen,
 }
 
 /* Probe the VFS: returns true if `path` resolves to a regular file. */
-static bool path_is_file(const char *path) {
+/* Is this path a COMMAND -- a regular file the caller may execute?
+ *
+ * It used to ask only "is it a regular file", and every caller is really
+ * asking the other question: the PATH walk in resolve_program, `type`,
+ * `command -v`, `which`, and hash. bash requires the execute bit for all
+ * of them -- a non-executable file sitting in a PATH directory is not a
+ * command -- so `command -v _tmp/non-executable` named it as one.
+ *
+ * Renamed from path_is_runnable because the old name described the test and
+ * not the question, which is how it came to be used for the question. */
+static bool path_is_runnable(const char *path) {
     struct vfs_stat st;
     if (vfs_stat(path, &st) != VFS_OK) return false;
-    return st.type == VFS_TYPE_FILE;
+    if (st.type != VFS_TYPE_FILE) return false;
+    return test_access_ok(&st, 1u);
 }
 
 /* Resolve a single argv[0] to a runnable ELF path.
@@ -11633,7 +11644,7 @@ static const char *resolve_program(const char *name, char *out_buf,
         if (plen > 0) {
             const char *cand = path_join(cur, plen, name, nlen,
                                          out_buf, out_sz);
-            if (cand && path_is_file(cand)) return cand;
+            if (cand && path_is_runnable(cand)) return cand;
         }
         cur = colon;
         if (*cur == ':') cur++;
