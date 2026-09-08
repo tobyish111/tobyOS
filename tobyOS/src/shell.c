@@ -15153,8 +15153,23 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                         case '\\': c = '\\'; p++; break;
                         case '\'': c = '\''; p++; break;
                         case '"': c = '"'; p++; break;
-                        case '0': {
-                            p++;
+                        case '0': case '1': case '2': case '3':
+                        case '4': case '5': case '6': case '7': {
+                            /* \nnn: ONE TO THREE octal digits, the first any
+                             * of 0-7. Measured against bash: \1 is byte 01,
+                             * \111 is 'I', \377 is 0xff, and \0377 is 0x1f
+                             * followed by a literal '7' -- three digits TOTAL,
+                             * with no leading-zero prefix rule.
+                             *
+                             * THIS IS THE SECOND COPY OF THIS DECODER. The
+                             * one in the ${...} path was fixed for exactly
+                             * this, with a comment saying so; this one still
+                             * read only \0nnn, so $'\1' came out as the
+                             * letter 1 in ordinary words. The gate could not
+                             * tell, because both Oils cases that cover it
+                             * pipe through `od -A n -c`, and od was treating
+                             * the "n" as a filename and failing for bash and
+                             * tsh alike. */
                             int v = 0, cnt = 0;
                             while (cnt < 3 && *p >= '0' && *p <= '7') {
                                 v = v * 8 + (*p++ - '0'); cnt++;
