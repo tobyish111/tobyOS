@@ -753,6 +753,50 @@ echo one > $D/lk1; rm -f $D/lk2
 cat $D/lk1
 /bin/unlink $D/nonesuch 2>&1; echo rc=$?
 rm -f $D/lk1; [ "$D" = /data/nptest ] && rmdir /data/nptest
+echo @@tt_od_types
+# `od -A n -t x1` is how a script hexdumps, and it used to open a file
+# called "x1": -A and -t take an OPERAND and od read it as the path, so
+# every one of these reported "No such file or directory".
+#
+# The expectations are GNU od's actual output for these bytes, checked on
+# the host. busybox is NOT the oracle here -- it has no od applet in this
+# build and answers every one of them with silence, which would have made
+# a differential pass vacuously in the other direction.
+printf 'AB\001\000C' > /tmp/odt.bin
+/bin/od -A n -t x1 /tmp/odt.bin
+/bin/od -A d -t u1 /tmp/odt.bin
+/bin/od -N 2 -A n -t x1 /tmp/odt.bin
+echo "empty:[$(printf '' | /bin/od -A n -t x1)]"
+echo @@tt_od_chars
+/bin/od -A n -t c /tmp/odt.bin
+rm -f /tmp/odt.bin
+
+echo @@tt_test_perm
+# -r/-w/-x used to return TRUE for anything that existed. The gate runs as
+# root, and root is exempt from r/w but still needs an execute BIT -- so
+# the execute cases are meaningful here and the read/write ones assert
+# root's actual semantics.
+cd /tmp; rm -f perm_x perm_nx
+echo x > perm_x; echo x > perm_nx
+chmod 755 perm_x; chmod 644 perm_nx
+[ -x perm_x ]  && echo "x755=yes" || echo "x755=no"
+[ -x perm_nx ] && echo "x644=yes" || echo "x644=no"
+[ -r perm_nx ] && echo "r=yes" || echo "r=no"
+[ -w perm_nx ] && echo "w=yes" || echo "w=no"
+chmod 000 perm_nx
+[ -x perm_nx ] && echo "x000=yes" || echo "x000=no"
+[ -r perm_nx ] && echo "root_r000=yes" || echo "root_r000=no"
+rm -f perm_x perm_nx; cd /
+
+echo @@tt_proc_ids
+# `ls /proc | grep '^[0-9]*$'` returned NOTHING here while ps and busybox
+# ps agreed on ~22 pids -- recorded as unchased. grep's ^ and $ anchors
+# were both broken then ($ never matched at all), so this is the first
+# time the question has been asked with a working grep.
+LSN=$(ls /proc | grep -c '^[0-9][0-9]*$')
+PSN=$(busybox ps | grep -c '^ *[0-9]')
+echo "ls_pids_nonzero=$([ "$LSN" -gt 0 ] && echo yes || echo no)"
+echo "both_see_pids=$([ "$LSN" -gt 0 ] && [ "$PSN" -gt 0 ] && echo yes || echo no)"
 echo @@mu_inode_identity
 # INODE IDENTITY (2026-09-08). Every one of these was wrong before struct
 # stat carried st_nlink/st_ino/st_dev: `ls -l` printed a synthetic link

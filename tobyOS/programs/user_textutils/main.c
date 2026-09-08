@@ -242,18 +242,18 @@ static int do_nl(int argc, char **argv) {
  * dump would say 101 102. -c gives characters; hexdump -C gives the
  * canonical hex-plus-ASCII view. Getting the default wrong produces
  * output that looks reasonable and matches nothing. */
-static void dump_octal_words(FILE *f) {
+static void dump_octal_words(FILE *f, char addr) {
     unsigned char b[16];
     size_t off = 0, n;
     while ((n = fread(b, 1, sizeof b, f)) > 0) {
-        printf("%07lo", (unsigned long)off);
+        if (addr != 'n') printf("%07lo", (unsigned long)off);
         for (size_t i = 0; i + 1 < n; i += 2)
             printf(" %06o", (unsigned)(b[i] | (b[i+1] << 8)));
         if (n & 1) printf(" %06o", (unsigned)b[n-1]);
         putchar(10);
         off += n;
     }
-    printf("%07lo\n", (unsigned long)off);
+    if (addr != 'n') printf("%07lo\n", (unsigned long)off);
 }
 
 static void dump_chars(FILE *f) {
@@ -293,23 +293,134 @@ static void dump_canonical(FILE *f) {
     printf("%08lx\n", (unsigned long)off);
 }
 
+/* One -t format, printed GNU's way. `od -A n -t x1` is how every script in
+ * the world hexdumps a byte string, and it is what the conformance corpus
+ * uses; without -t this program could only print octal words. */
+static void dump_typed(FILE *f, char addr, char tcode, int tsize, long limit) {
+    unsigned char b[16];
+    size_t off = 0, n;
+    int per = 16;                       /* bytes per line, as GNU uses */
+    long left = limit;
+
+    for (;;) {
+        size_t want = (size_t)per;
+        if (left >= 0) {
+            if (left == 0) break;
+            if ((long)want > left) want = (size_t)left;
+        }
+        n = fread(b, 1, want, f);
+        if (n == 0) break;
+        if (left > 0) left -= (long)n;
+
+        if (addr != 'n') {
+            if      (addr == 'd') printf("%07lu", (unsigned long)off);
+            else if (addr == 'x') printf("%06lx", (unsigned long)off);
+            else                  printf("%07lo", (unsigned long)off);
+        }
+        for (size_t k = 0; k < n; ) {
+            switch (tcode) {
+            case 'c': {
+                unsigned char c = b[k];
+                if (c == 10)      printf("  \\n");
+                else if (c == 9)  printf("  \\t");
+                else if (c == 13) printf("  \\r");
+                else if (c == 0)  printf("  \\0");
+                else if (c >= 32 && c < 127) printf("   %c", c);
+                else              printf(" %03o", c);
+                k += 1;
+                break;
+            }
+            case 'd': {
+                if (tsize == 1) { printf(" %4d", (int)(signed char)b[k]); k += 1; }
+                else {
+                    unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
+                    printf(" %6d", (int)(short)v);
+                    k += 2;
+                }
+                break;
+            }
+            case 'u': printf(" %3u", (unsigned)b[k]); k += 1; break;
+            case 'o': printf(" %03o", (unsigned)b[k]); k += 1; break;
+            case 'x':
+            default:
+                if (tsize == 1) { printf(" %02x", (unsigned)b[k]); k += 1; }
+                else if (tsize == 2) {
+                    unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
+                    printf(" %04x", v);
+                    k += 2;
+                } else {
+                    unsigned long v = 0;
+                    for (int q = 3; q >= 0; q--)
+                        v = (v << 8) | ((k + (size_t)q < n) ? b[k + (size_t)q] : 0u);
+                    printf(" %08lx", v);
+                    k += 4;
+                }
+                break;
+            }
+        }
+        putchar(10);
+        off += n;
+        if (n < want) break;
+    }
+    /* GNU prints a final offset line -- but not when -A n suppressed the
+     * column, where the output is the bytes and nothing else. */
+    if (addr != 'n') {
+        if      (addr == 'd') printf("%07lu\n", (unsigned long)off);
+        else if (addr == 'x') printf("%06lx\n", (unsigned long)off);
+        else                  printf("%07lo\n", (unsigned long)off);
+    }
+}
+
 static int do_od(int argc, char **argv, int hexdump_style) {
     const char *path = NULL;
-    int chars = 0, canonical = 0;
+    int chars = 0, canonical = 0, typed = 0;
+    char addr = 'o', tcode = 'x';
+    int  tsize = 1;
+    long limit = -1;
     (void)hexdump_style;
+
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == 45 && argv[i][1]) {
-            if (!strcmp(argv[i], "-C")) { canonical = 1; continue; }
-            if (!strcmp(argv[i], "-c")) { chars = 1; continue; }
-            continue;
+        const char *a = argv[i];
+        if (a[0] == 45 && a[1]) {
+            if (!strcmp(a, "-C")) { canonical = 1; continue; }
+            if (!strcmp(a, "-c")) { chars = 1; continue; }
+            /* OPTIONS THAT TAKE AN OPERAND. Without this the operand was
+             * read as a FILENAME: `od -A n -t x1` opened "x1" and reported
+             * "No such file or directory", which is what the nul-bytes
+             * cases in the conformance corpus were hitting. */
+            if (a[1] == 'A' || a[1] == 't' || a[1] == 'N' || a[1] == 'j' ||
+                a[1] == 'w') {
+                const char *val = a[2] ? a + 2 : (i + 1 < argc ? argv[++i] : "");
+                if (a[1] == 'A') {
+                    addr = val[0] ? val[0] : 'o';
+                } else if (a[1] == 't') {
+                    typed = 1;
+                    tcode = val[0] ? val[0] : 'x';
+                    tsize = 1;
+                    for (const char *d = val; *d; d++)
+                        if (*d >= 49 && *d <= 56) { tsize = *d - 48; break; }
+                    if (tcode == 'c' || tcode == 'a') tsize = 1;
+                } else if (a[1] == 'N') {
+                    limit = 0;
+                    for (const char *d = val; *d >= 48 && *d <= 57; d++)
+                        limit = limit * 10 + (*d - 48);
+                }
+                continue;
+            }
+            continue;                  /* unknown flag: ignored, as before */
         }
-        path = argv[i];
+        path = a;
     }
     FILE *f = path ? fopen(path, "rb") : stdin;
     if (!f) { fprintf(stderr, "%s: %s: %s\n", prog, path ? path : "-", strerror(errno)); return 1; }
-    if (canonical)   dump_canonical(f);
-    else if (chars)  dump_chars(f);
-    else             dump_octal_words(f);
+    /* -c IS -t c, and routing it through the typed dumper is what makes
+     * `od -A n -c` obey the -A: dump_chars() hardcodes the offset column,
+     * so the address radix was honoured for -t and silently ignored for
+     * -c -- and `od -A n -c` is the form the conformance corpus uses. */
+    if (canonical)      dump_canonical(f);
+    else if (typed)     dump_typed(f, addr, tcode, tsize, limit);
+    else if (chars)     dump_typed(f, addr, 'c', 1, limit);
+    else                dump_octal_words(f, addr);
     if (f != stdin) fclose(f);
     return 0;
 }
