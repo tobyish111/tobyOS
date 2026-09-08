@@ -284,14 +284,49 @@ the netlink and `/proc/net` sources already built.
 has distro-gate cases asserting output the busybox one produces, run on
 hardware.
 
-### 8. The Oils POSIX suite: 9 named failures
+### 8. The Oils POSIX suite: 9 named failures -> 3 (2026-09-08)
 
-1271/1280. The nine are pre-existing and unexplained. `shell-oilspec-
-third-party-gate.md` has the trap: the report diffs against the LAST RUN'S
-archive, not a baseline, and the failures file is gitignored -- follow the
-clearing recipe there before believing a diff.
+Six fixed: `test -u`/`-g` were hardcoded false while `ls -l` printed the
+`s` from the same mode bits; `pushd . .` and `dirs a` accepted operands
+they should refuse; `read` stored a NUL into a C string and truncated
+there; and the umask was DISPLAY-ONLY -- initialised to 022 whatever the
+process had, never applied to anything the shell created, so bash and tsh
+in one process tree gave different answers. `umask -p` came free.
 
-**Proof:** 1280/1280, with the archive committed as the baseline this time.
+**Three remain, and one of them should not be "fixed":**
+
+- **1069 does not measure ulimit.** Guest bash does not enforce the limit
+  either; both write all 513 bytes. It measures ARG_MAX -- tsh dies on
+  `for i in $(seq 513)`. Raising the constant is a STACK HAZARD: ARG_MAX
+  multiplies through `struct shell_simple.argv[ARG_MAX]`, and
+  `struct shell_pipeline` holds eight of those and is stack-allocated in
+  three places that nest with subshells. 32 KiB per pipeline today against
+  a 256 KiB stack; 64 KiB at 1024 and four levels overflow. The real fix
+  is the heap-grown argv the file has always named.
+- **1286** needs `mkdir -p _tmp; touch _tmp/date` to work -- the failure
+  is a chmod on a file `touch` did not create. Unexamined; it is a
+  relative-path bug somewhere, worth more than the case.
+- **1409** is an exit-diff where GUEST BASH reports 0 for running a
+  non-executable file and tsh reports 126. 126 is what POSIX says, so
+  matching the oracle here would mean being wrong; understand the
+  harness before touching the shell.
+
+**TWELVE CASES WERE PASSING VACUOUSLY** and now fail honestly, which is
+worth more than the six points. They all filter output before comparing:
+the `declare` family through `grep -E '^\b.*test_var.\b'`, two others
+through `egrep 'emacs$|vi$'` and an anchored pattern, and `$SECONDS`
+through `awk '/[0-9]+/'`. Until the text tools were fixed, `\b` was not a
+word boundary, `grep 'x$'` never matched anything, and the old awk printed
+regardless -- so the filters selected nothing, both shells agreed about
+nothing, and the cases passed. A conformance corpus is only as honest as
+the tools its cases pipe through. The twelve are real BASH-ONLY gaps:
+`declare -p` output format (8), `$SECONDS`, `${PS1@P}` `\D{}`, the `\s`
+and `\v` prompt escapes, and `set -o emacs`/`vi` exclusivity.
+
+**Baseline:** `logs/oilspec_failures.BASE_2026-09-08.txt`. Compare SETS
+against it, never against `oilspec_prev.json` -- that archive named four
+flaky background/timing cases as fresh losses in one run and as fresh
+gains in the next.
 
 ### 9. Real hardware as part of the gate, not an afterthought
 
@@ -376,11 +411,23 @@ Because libtoby's regex.c, sed, awk and grep all build against host gcc
 unchanged, the same fixtures run on the host in seconds -- do that before
 paying for a boot.
 
-**Still open here:** `ls -l` prints a synthetic link count (1 for files, 2
-for directories) and `test -ef` is path equality, both because libtoby's
-`struct stat` carries no `st_nlink`, `st_ino` or `st_dev` and
-`struct abi_stat` has nowhere to put them. That is an ABI change, not a
-text-tool one, and is the last piece of this item.
+**CLOSED 2026-09-08.** `struct stat` now carries `st_nlink`, `st_ino` and
+`st_dev`: `ls -l` prints the real link count and `test -ef` asks whether
+two names are one file. `struct vfs_stat` already had `nlink` and
+`abi_stat` still had its spare word, so the count needed no filesystem
+changes at all; hard links exist only on tobyfs, so only `tobyfs_stat`
+reports an inode and every other driver returns 0 meaning "no answer",
+where callers fall back to comparing paths as before. Gate section
+`mu_inode_identity` in the distro gate, five of whose seven assertions
+fail on the old code.
+
+Two things found on the way: a directory link count needs a FLOOR of 2
+(tobyfs counts only the parent's entry, so the raw number printed 1 where
+every Unix prints 2 or more), and the hosted shell's own `vfs_stat` shim
+in `programs/tsh/host.c` copied only four fields -- which left `test -ef`
+comparing paths in the shell the gates actually measure, and left
+`test -nt` / `-ot` comparing 0 with 0, false for every pair of files in
+the system.
 
 **HARDWARE PROOF OWED**, as for every item above it.
 
