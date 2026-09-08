@@ -753,6 +753,28 @@ echo one > $D/lk1; rm -f $D/lk2
 cat $D/lk1
 /bin/unlink $D/nonesuch 2>&1; echo rc=$?
 rm -f $D/lk1; [ "$D" = /data/nptest ] && rmdir /data/nptest
+echo @@mu_inode_identity
+# INODE IDENTITY (2026-09-08). Every one of these was wrong before struct
+# stat carried st_nlink/st_ino/st_dev: `ls -l` printed a synthetic link
+# count of 1 however many names a file had, and `test -ef` compared
+# canonicalised PATHS, so two hard links to one file -- the only thing the
+# operator exists to detect -- compared as different files.
+D=/tmp; [ -w /data ] && mkdir -p /data/idtest && D=/data/idtest
+rm -f $D/id1 $D/id2 $D/id3
+echo body > $D/id1
+echo body > $D/id3
+# tmpfs cannot make a hard link (node-per-path); say so rather than assert
+# an outcome that depends on which filesystem $D landed on.
+if /bin/link $D/id1 $D/id2 2>/dev/null; then echo "link=ok"; else echo "link=unsupported"; fi
+[ $D/id1 -ef $D/id2 ] && echo "same=yes" || echo "same=no"
+[ $D/id1 -ef $D/id3 ] && echo "other=yes" || echo "other=no"
+[ $D/id1 -ef $D/id1 ] && echo "self=yes" || echo "self=no"
+# the link count is REAL: two names, then one again after unlink
+/bin/ls -l $D/id1 | awk '{print "nlink=" $2}'
+/bin/unlink $D/id2 2>/dev/null
+/bin/ls -l $D/id1 | awk '{print "after=" $2}'
+/bin/ls -ld $D | awk '{print "dir>=2:" ($2 >= 2 ? "yes" : "no")}'
+rm -f $D/id1 $D/id3; [ "$D" = /data/idtest ] && rmdir /data/idtest
 echo @@mu_logname_users
 /bin/logname; echo rc=$?
 echo "users=[$(/bin/users)]"

@@ -3007,6 +3007,21 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     dst->gid = userns_cur_gid(src->gid);
     dst->mtime = src->mtime;
     dst->atime = src->atime;
+    /* 0 from the filesystem means "no answer": substitute what every stat
+     * emitter here has always substituted, so nothing that reads nlink
+     * sees a zero where a count belongs. */
+    dst->nlink = src->nlink ? src->nlink
+                            : ((src->type == VFS_TYPE_DIR) ? 2u : 1u);
+    /* A DIRECTORY HAS AT LEAST TWO LINKS by construction -- its own name in
+     * its parent, and the "." inside it -- so anything below 2 is not a
+     * link count, it is a filesystem that does not keep one. tobyfs stores
+     * an on-disk nlink that counts only the parent's entry, and reporting
+     * that verbatim would print 1 where every Unix prints 2 or more. This
+     * is a floor, not a substitution: a filesystem that really does track
+     * subdirectories passes through untouched. */
+    if (src->type == VFS_TYPE_DIR && dst->nlink < 2u) dst->nlink = 2u;
+    dst->ino = src->ino;
+    dst->dev = (uint64_t)src->dev;
 }
 
 

@@ -151,11 +151,16 @@ static const char *group_name(unsigned gid) {
     return id_name("/etc/group", gid, cache[slot], sizeof cache[slot]);
 }
 
-/* There is no st_nlink here; GNU shows 1 for a file and 2 for a directory
- * (its . and its parent's entry), which is what any script or eye reading
- * the column expects to find. */
+/* The REAL hard-link count (2026-09-08). This column used to be
+ * synthesised -- 1 for a file, 2 for a directory -- because struct stat
+ * carried no st_nlink, so a file with three names still read as 1 and the
+ * column was decoration rather than information. The kernel substitutes
+ * the same 1/2 defaults when a filesystem genuinely has no answer, so an
+ * fs without link counts looks exactly as it did. */
 static int nlink_of(const struct ent *e) {
-    return (e->have_stat && S_ISDIR(e->st.st_mode)) ? 2 : 1;
+    if (!e->have_stat) return 1;
+    if (e->st.st_nlink) return (int)e->st.st_nlink;
+    return S_ISDIR(e->st.st_mode) ? 2 : 1;
 }
 
 static void size_of(const struct ent *e, char *out, size_t cap) {

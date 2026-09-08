@@ -237,6 +237,9 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
     u->st_gid  = (gid_t)k->gid;
     u->st_mtime = (time_t)k->mtime;
     u->st_atime = (time_t)k->atime;
+    u->st_nlink = (nlink_t)k->nlink;
+    u->st_ino   = (ino_t)k->ino;
+    u->st_dev   = (dev_t)k->dev;
     return 0;
 }
 

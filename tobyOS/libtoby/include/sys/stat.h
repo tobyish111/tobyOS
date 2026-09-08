@@ -45,6 +45,13 @@ struct stat {
      * has no answer (fstat on a pipe, say), not 1970. */
     time_t st_mtime;
     time_t st_atime;
+    /* 2026-09-08. st_nlink was absent, so `ls -l` printed a synthetic
+     * count; st_ino/st_dev were absent, so `test -ef` compared paths and
+     * answered "different" for two hard links to one file. 0 for ino/dev
+     * means the filesystem has no answer -- compare paths instead. */
+    nlink_t st_nlink;
+    ino_t   st_ino;
+    dev_t   st_dev;
 };
 
 int stat (const char *path, struct stat *out);

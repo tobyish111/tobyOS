@@ -1862,7 +1862,12 @@ struct abi_stat {
     uint32_t mode;       /* ABI_S_IFMT bits + permission bits */
     uint32_t uid;
     uint32_t gid;
-    uint32_t _reserved0; /* padding for forward ABI growth */
+    /* 2026-09-08: the hard-link count, claimed out of the spare word this
+     * struct was carrying. `ls -l` printed a SYNTHETIC count (1 for files,
+     * 2 for directories) because there was nowhere for the real one to
+     * travel -- while the VFS had been reporting it since hard links
+     * landed. */
+    uint32_t nlink;
     /* 2026-08-24: timestamps, in UNIX EPOCH SECONDS, claimed out of the
      * two spare words this struct reserved for exactly this. sizeof is
      * unchanged, so nothing built against the old layout shifts.
@@ -1873,6 +1878,13 @@ struct abi_stat {
      * has no answer, matching struct vfs_stat. */
     uint64_t mtime;      /* last data modification */
     uint64_t atime;      /* last access (best effort) */
+    /* Inode identity, appended (the struct grows; libtoby translates
+     * field by field, so nothing shifts underneath userland). 0 means the
+     * filesystem has no answer -- callers fall back to comparing paths.
+     * Without these `test -ef` was path equality and could not see that
+     * two hard links name one file. */
+    uint64_t ino;
+    uint64_t dev;
 };
 
 /* ============================================================

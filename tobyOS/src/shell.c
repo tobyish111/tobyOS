@@ -8858,9 +8858,13 @@ static int test_binary(const char *a, const char *op, const char *b, bool *err) 
      * evaluated, so they fell through to "is the first word non-empty" and
      * `[ anything -nt anything ]` was simply true.
      *
-     * -ef compares canonical paths rather than device+inode because this
-     * kernel has no hard links at all, so two paths name the same file
-     * exactly when they resolve to the same path. */
+     * -ef asks whether two names are ONE FILE, so it compares device and
+     * inode when the filesystem has them. It used to compare canonical
+     * PATHS under a comment saying this kernel had no hard links -- true
+     * when it was written, false since link(2) landed, and the operator
+     * then answered "different" for exactly the case it exists to detect.
+     * A filesystem with no inode identity reports ino 0, and there the
+     * path comparison is still the best available answer. */
     if (strcmp(op, "-nt") == 0 || strcmp(op, "-ot") == 0 ||
         strcmp(op, "-ef") == 0) {
         char pa[VFS_PATH_MAX], pb[VFS_PATH_MAX];
@@ -8869,8 +8873,12 @@ static int test_binary(const char *a, const char *op, const char *b, bool *err) 
         struct vfs_stat sa, sb;
         bool oka = (vfs_stat(pa, &sa) == VFS_OK);
         bool okb = (vfs_stat(pb, &sb) == VFS_OK);
-        if (strcmp(op, "-ef") == 0)
-            return (oka && okb && strcmp(pa, pb) == 0) ? 0 : 1;
+        if (strcmp(op, "-ef") == 0) {
+            if (!oka || !okb) return 1;
+            if (sa.ino && sb.ino)
+                return (sa.ino == sb.ino && sa.dev == sb.dev) ? 0 : 1;
+            return strcmp(pa, pb) == 0 ? 0 : 1;
+        }
         if (strcmp(op, "-nt") == 0) {
             if (oka && !okb) return 0;
             if (!oka) return 1;

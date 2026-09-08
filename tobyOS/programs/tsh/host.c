@@ -376,6 +376,22 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
     out->mode = st.st_mode & 0177777;
     out->uid  = st.st_uid;
     out->gid  = st.st_gid;
+    /* EVERYTHING struct stat CARRIES, not just the fields the shim happened
+     * to need first. Each omission here is silently wrong somewhere in the
+     * shell rather than obviously missing:
+     *   - ino/dev absent made `test -ef` fall back to comparing paths, so
+     *     two hard links to one file answered "different" -- the only
+     *     question that operator exists to answer;
+     *   - nlink absent left the count at 0;
+     *   - mtime/atime absent left `test -nt` and `-ot` comparing 0 with 0,
+     *     which is FALSE for every pair of files in the system. They were
+     *     implemented and gated, and this zeroed their input. */
+    out->nlink = (uint32_t)st.st_nlink;
+    out->ino   = (uint64_t)st.st_ino;
+    out->dev   = (uint32_t)st.st_dev;
+    out->mtime = (uint64_t)st.st_mtime;
+    out->atime = (uint64_t)st.st_atime;
+    out->ctime = (uint64_t)st.st_mtime;
     return VFS_OK;
 }
 

@@ -145,6 +145,20 @@ struct vfs_stat {
     uint64_t      mtime;       /* last data modification */
     uint64_t      atime;       /* last access (best effort) */
     uint64_t      ctime;       /* last inode change */
+    /* INODE IDENTITY. 0 = "this filesystem has no answer", which is the
+     * honest report for a node-per-path filesystem and is what every
+     * driver except tobyfs gives today.
+     *
+     * It exists because two names for ONE file cannot be told apart
+     * without it: `test -ef` compared canonicalised PATHS, so two hard
+     * links to the same inode compared as different files -- the one
+     * question the operator exists to answer. A path hash cannot fix
+     * that (the Linux path's lx_ino_hash is exactly such a hash, and it
+     * gives the two names different inodes by construction); only the
+     * filesystem knows. Callers must fall back to path comparison when
+     * ino is 0 rather than treating unknown as equal. */
+    uint64_t      ino;
+    uint32_t      dev;         /* which mount; 0 = unknown */
 };
 
 struct vfs_dirent {

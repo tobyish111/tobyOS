@@ -849,6 +849,14 @@ static int tobyfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     out->mtime = node.mtime;      /* slice 6 */
     out->atime = node.mtime;      /* no separate atime on disk */
     out->ctime = node.mtime;
+    /* The inode number path_walk just resolved. This is what makes two
+     * hard links to one file compare EQUAL -- tobyfs is the only
+     * filesystem here that can create such a pair, so it is the only one
+     * that has to answer. The mount pointer stands in for a device id:
+     * distinct per mount, stable for the life of the boot, never
+     * persisted anywhere. */
+    out->ino = (uint64_t)ino;
+    out->dev = (uint32_t)(uintptr_t)fs;
     /* Phase G: the on-disk nlink has existed since the format was born and
      * was never reported -- every stat emitter substituted 1. Real counts
      * matter now that link(2) can raise them. Legacy inodes may carry 0;

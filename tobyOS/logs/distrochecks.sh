@@ -420,6 +420,8 @@ same_first_field() {   # the checksum (first field) of line pairs agree
 }
 same_first_field mu_sum "sum: BSD and SysV checksums agree with busybox"
 ck mu_link_unlink "link makes a real hard link (shared inode) and unlink removes one name" '^(rc=0\|two\|rc=0\|gone\|two\|)|(link: cannot create link.*Operation not permitted\|rc=1\|unlink: cannot unlink.*No such file or directory\|rc=1\|gone\|one\|)'
+ck mu_inode_identity "two hard links are ONE file; ls -l counts the names" \
+   '(link=ok\|same=yes\|other=no\|self=yes\|nlink=2\|after=1\|dir>=2:yes)|(link=unsupported\|same=no\|other=no\|self=yes\|nlink=1\|after=1\|dir>=2:yes)'
 ck mu_link_unlink "unlink of a missing file fails as coreutils does"    'unlink: cannot unlink .*nonesuch.*: No such file or directory\|rc=1\|$'
 ck mu_logname_users "logname/users/who agree on the console session; nproc; hostid" '^root\|rc=0\|(users=\[\]\|who=0\|# users=0|users=\[root\]\|who=1\|# users=1)\|1\|[1-9][0-9]*\|[1-9][0-9]*\|hostid=[0-9a-f]{8}\|$'
 ck mu_uptime  "uptime, -p and -s in procps's formats"       '^ [0-9]{2}:[0-9]{2}:[0-9]{2} up .*,  [0-9]+ users?,  load average: [0-9]+\.[0-9]{2}, [0-9]+\.[0-9]{2}, [0-9]+\.[0-9]{2}\|up .*minute.*\|20[2-9][0-9]-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\|$'
