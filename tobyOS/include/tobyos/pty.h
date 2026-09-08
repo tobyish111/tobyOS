@@ -42,7 +42,13 @@ struct file *pty_open_slave(int index);
 
 /* file.c backend dispatch (read/write/close/clone reference-count). */
 long pty_master_read (struct file *f, void *buf, size_t n);
+/* Returns the number of bytes ACCEPTED, which may be less than n when the
+ * input ring is full -- callers must retry the remainder. */
 long pty_master_write(struct file *f, const void *buf, size_t n);
+
+/* Master side end-of-input: slave reads return 0 once the ring drains,
+ * while the pty stays open for output. */
+void pty_master_input_eof(struct file *f);
 long pty_slave_read  (struct file *f, void *buf, size_t n);
 long pty_slave_write (struct file *f, const void *buf, size_t n);
 long pty_ioctl       (struct file *f, unsigned long cmd, unsigned long arg);
@@ -74,6 +80,10 @@ long pty_master_read_nb(struct file *f, void *buf, size_t n);
 
 /* Set the slave's window size from kernel memory (SSH pty-req / window-change
  * carry it in the protocol, not in a user buffer). */
+/* Raw mode: no canonical assembly, echo, signals or CR/LF translation.
+ * For a channel that is a byte pipe rather than a terminal. */
+void pty_set_raw(struct file *f);
+
 void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows);
 
 /* poll/select readiness for a PTY fd (master or slave). */

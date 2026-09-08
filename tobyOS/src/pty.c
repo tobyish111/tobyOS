@@ -59,6 +59,15 @@ struct pty {
 
     struct proc *wq_master_read;   /* parked waiting for slave output */
     struct proc *wq_slave_read;    /* parked waiting for master input */
+
+    /* The master says no more input will ever arrive, while the pty stays
+     * open for OUTPUT. That is what an SSH client means by
+     * SSH_MSG_CHANNEL_EOF, and there was no way to express it: the only
+     * end-of-input this pty had was the master closing, which also tears
+     * down the direction the command still needs to answer on. Without it
+     * `ssh host 'cat > file' < local` -- how edremote uploads a script --
+     * left cat blocked on a stdin that never ended, forever. */
+    bool   in_eof;
 };
 
 static struct pty g_ptys[PTY_MAX];
@@ -88,10 +97,18 @@ static size_t ring_count(size_t head, size_t tail) {
 static bool ring_full(size_t head, size_t tail) {
     return ring_count(head, tail) == PTY_BUF - 1;
 }
-static void ring_push(uint8_t *buf, size_t *head, size_t tail, uint8_t c) {
-    if (ring_full(*head, tail)) return;   /* drop on overflow */
+/* Returns false when the ring is full and the byte was NOT stored.
+ *
+ * It used to return void, and every caller therefore treated a dropped
+ * byte as a written one. pty_master_write went on to report the full
+ * count, so the SSH server -- which pushes a channel's data straight in
+ * here -- believed a 20 KB upload had landed in a 4 KiB ring. The middle
+ * of the file simply vanished, with nothing anywhere saying so. */
+static bool ring_push(uint8_t *buf, size_t *head, size_t tail, uint8_t c) {
+    if (ring_full(*head, tail)) return false;
     buf[*head] = c;
     *head = (*head + 1) & (PTY_BUF - 1);
+    return true;
 }
 static int ring_pop(uint8_t *buf, size_t head, size_t *tail) {
     if (head == *tail) return -1;
@@ -303,7 +320,11 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
                 continue;
             }
         }
-        ring_push(t->in, &t->in_head, t->in_tail, c);
+        /* STOP at the first byte that does not fit and report a SHORT
+         * WRITE. The caller has to know: this is the pty's only back
+         * pressure, and pretending the byte landed is how an upload
+         * larger than PTY_BUF lost its middle. */
+        if (!ring_push(t->in, &t->in_head, t->in_tail, c)) break;
         echo_to_master(t, c);
     }
     if (put) {
@@ -311,6 +332,16 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
         if (t->tio.c_lflag & TTY_ECHO) wq_wake_all(&t->wq_master_read);
     }
     return (long)put;
+}
+
+/* Master side: "I will send no more input." Everything already in the ring
+ * is still delivered; once it drains, slave reads return 0. The pty stays
+ * open in the other direction, so the command can still write its answer. */
+void pty_master_input_eof(struct file *f) {
+    struct pty *t = f ? f->pty : 0;
+    if (!t || t->in_eof) return;
+    t->in_eof = true;
+    wq_wake_all(&t->wq_slave_read);
 }
 
 long pty_master_read(struct file *f, void *buf, size_t n) {
@@ -360,6 +391,27 @@ long pty_master_read_nb(struct file *f, void *buf, size_t n) {
     return (long)got;
 }
 
+/* Put the line discipline in RAW mode: no canonical line assembly, no
+ * echo, no CR/LF translation, no signal characters.
+ *
+ * An SSH channel with no pty-req is not a terminal -- it is a byte pipe,
+ * and OpenSSH gives it real pipes. This pty stands in for those, and in
+ * canonical mode it could not carry the traffic: a 20 KB upload with no
+ * newline in it is ONE line, and a canonical read assembles a line into a
+ * PTY_BUF buffer, so `ssh host 'cat > file' < local` arrived truncated at
+ * 4095 bytes. Echo would also have doubled every byte back at the client,
+ * and ICRNL would have rewritten a \r in a binary file. */
+void pty_set_raw(struct file *f) {
+    struct pty *t = f ? f->pty : 0;
+    if (!t) return;
+    t->tio.c_lflag &= (uint32_t)~(TTY_ICANON | TTY_ECHO | TTY_ECHOE |
+                                  TTY_ECHOK | TTY_ISIG);
+    t->tio.c_iflag &= (uint32_t)~(TTY_ICRNL | TTY_INLCR);
+    t->tio.c_oflag &= (uint32_t)~TTY_OPOST;
+    t->tio.c_cc[TTY_VMIN] = 1;
+    t->tio.c_cc[TTY_VTIME] = 0;
+}
+
 void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows) {
     struct pty *t = f ? f->pty : 0;
     if (!t) return;
@@ -387,7 +439,7 @@ static long slave_canonical_read(struct pty *t, uint8_t *out, size_t n) {
     }
     /* Block until a whole line is available (or the master closed). */
     while (!in_has_line(t)) {
-        if (t->master_refs == 0) {
+        if (t->master_refs == 0 || t->in_eof) {
             if (t->in_head == t->in_tail) return 0;   /* EOF */
             break;   /* deliver the partial trailing input on hangup */
         }
@@ -430,7 +482,7 @@ static long slave_raw_read(struct pty *t, uint8_t *out, size_t n) {
         int c = ring_pop(t->in, t->in_head, &t->in_tail);
         if (c < 0) {
             if (got >= vmin) break;
-            if (t->master_refs == 0) return got ? (long)got : 0;
+            if (t->master_refs == 0 || t->in_eof) return got ? (long)got : 0;
             struct proc *self = current_proc();
             if (SIG_SHOULD_EINTR(self))
                 return got ? (long)got : EINTR_RET;
