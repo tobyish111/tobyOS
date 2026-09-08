@@ -209,7 +209,30 @@ the real one, so it never lies.
 prints END on hardware. Remove the stdin workaround's threshold from
 edremote.sh only after this lands.
 
-### 6. The intermittent wedge on real hardware (OPEN, oldest item)
+### 6. The intermittent wedge on real hardware (PARTLY SOLVED 2026-09-08)
+
+**One half of this is solved, reproduced and gated.** The shape recorded
+below -- the box answers ping, completes TCP handshakes, and no service
+ever speaks (`edremote --check` returns 92) -- is what a HELD SSH SESSION
+SLOT looks like, and there was a deterministic way to hold it: the server
+acknowledged `SSH_MSG_CHANNEL_EOF` and threw it away, so edremote's own
+`ssh host 'cat > file' < local` upload left `cat` on a stdin that never
+ended. Measured in QEMU at 33 minutes with the guest otherwise healthy.
+Short commands never redirect stdin, which is exactly why only uploads
+ever wedged it. Fixed, with two more bugs behind it (the pty input ring
+dropped bytes and reported success; an exec channel ran through a terminal
+line discipline that truncated a large upload at 4095 bytes), and gated:
+`bash logs/sshreap.sh`, 28/28, over SLIRP hostfwd with the host's own
+OpenSSH client. See `ssh-session-slot-wedge` in memory.
+
+**What is NOT settled:** whether the two remaining sightings below were
+this bug. They were a GUI editor session (day 1) and a plain `chmod`/`stat`
+line (day 3), neither of which uploads anything -- but both were observed
+THROUGH this same channel, where a held slot is indistinguishable from a
+kernel stall. Re-test on hardware before assuming either way, and note
+that `logs/hwgate.sh` should be runnable now: its 21 KB script upload was
+failing its md5 check for the reason above.
+
 
 **Facts:** a state where the box answers ping and completes TCP handshakes
 (NIC interrupt path) but no service ever speaks (pid 0's
