@@ -7763,8 +7763,37 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                  * `$((1` + `+ 2))` joined with "; " becomes `$((1; + 2))`,
                  * which is a different expression. A command substitution
                  * does want the semicolon -- what is inside it IS a list. */
+                /* A TRAILING BACKSLASH CONTINUES THE LINE, and there is
+                 * then nothing to separate: `\<newline>` is removed
+                 * entirely and the two physical lines are ONE.
+                 *
+                 * This joined them with "; " anyway, and the backslash was
+                 * still sitting there -- so `printf x \` + `-e y` became
+                 * `printf x \; -e y`, where the backslash ESCAPES the
+                 * semicolon into a literal word. The command received an
+                 * argument of ";". That is how a function body whose `sed`
+                 * is split across lines handed sed a file called ";" (the
+                 * Oils builtin-type case), and it only bit inside a
+                 * compound command -- at top level the continuation is
+                 * handled before this accumulator ever sees the line.
+                 *
+                 * Only an ODD number of trailing backslashes continues:
+                 * `\\` at end of line is a literal backslash and the
+                 * command ends there. */
+                bool continued = false;
+                {
+                    size_t bs = 0;
+                    while (bs < alen && accum[alen - 1 - bs] == '\\') bs++;
+                    if (bs & 1u) {
+                        alen -= 1;
+                        accum[alen] = '\0';
+                        continued = true;
+                    }
+                }
                 const char *sep;
-                if (scan.nest > 0) {
+                if (continued) {
+                    sep = "";
+                } else if (scan.nest > 0) {
                     char kind = scan.nest_kind[scan.nest - 1];
                     /* Arithmetic and `${ }` hold ONE expression, so their
                      * lines join with a space. A command substitution holds a
