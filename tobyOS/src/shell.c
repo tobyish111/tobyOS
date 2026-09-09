@@ -17960,6 +17960,24 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         sink_active = true;
     }
     g_shell_in = fds.fd[0];
+    /* A BUILTIN'S OWN DIAGNOSTICS FOLLOW ITS fd 2.
+     *
+     *     type zz 2>err.txt          # err.txt was EMPTY
+     *     { type zz; } 2>err.txt     # err.txt had the message
+     *
+     * The redirections were applied into the local fd state above, and
+     * stdin and stdout were wired out of it -- but fd 2 was left pointing
+     * at whatever the shell had, so kprintf (the diagnostic channel; see
+     * shell_current_diag_file, which reads exactly this slot) wrote past
+     * the redirection to the terminal. The braces worked only because a
+     * GROUP goes through shell_enter_io_frame, which installs every
+     * descriptor; the two spellings have to capture the same bytes.
+     *
+     * `exec 2>file`, which is the one redirection that must OUTLIVE the
+     * command, never arrives here -- it returns from the bare-exec branch
+     * in shell_run_simple before any builtin is dispatched. */
+    struct file *old_diag = g_shell_fd[2];
+    g_shell_fd[2] = fds.fd[2];
     /* `exit` AND `return` DEFAULT TO THE PREVIOUS COMMAND'S STATUS, and the
      * line below had already destroyed it. Every builtin is entered with the
      * status pre-set to 0 so that one that never calls shell_set_status
@@ -17970,6 +17988,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     shell_set_status(0);
     c->fn(cmd->argc, cmd->argv);
     int rc = g_last_status;
+    g_shell_fd[2] = old_diag;
     g_shell_in = old_in;
     if (restore_env) {
         shell_prefix_restore(&prefix_save);
