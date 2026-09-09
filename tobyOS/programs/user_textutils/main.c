@@ -256,24 +256,9 @@ static void dump_octal_words(FILE *f, char addr) {
     if (addr != 'n') printf("%07lo\n", (unsigned long)off);
 }
 
-static void dump_chars(FILE *f) {
-    unsigned char b[16];
-    size_t off = 0, n;
-    while ((n = fread(b, 1, sizeof b, f)) > 0) {
-        printf("%07lo", (unsigned long)off);
-        for (size_t i = 0; i < n; i++) {
-            unsigned char c = b[i];
-            if (c == 10)      printf("  \\n");
-            else if (c == 9)  printf("  \\t");
-            else if (c == 0)  printf("  \\0");
-            else if (c >= 32 && c < 127) printf("   %c", c);
-            else              printf(" %03o", c);
-        }
-        putchar(10);
-        off += n;
-    }
-    printf("%07lo\n", (unsigned long)off);
-}
+/* dump_chars() lived here. -c is -t c and now goes through
+ * dump_typed(), which is what makes `od -A n -c` obey the -A --
+ * this copy hardcoded the offset column. */
 
 static void dump_canonical(FILE *f) {
     unsigned char b[16];
@@ -293,89 +278,139 @@ static void dump_canonical(FILE *f) {
     printf("%08lx\n", (unsigned long)off);
 }
 
-/* One -t format, printed GNU's way. `od -A n -t x1` is how every script in
- * the world hexdumps a byte string, and it is what the conformance corpus
- * uses; without -t this program could only print octal words. */
-static void dump_typed(FILE *f, char addr, char tcode, int tsize, long limit) {
+/* -t formats, printed GNU's way. `od -A n -t x1` is how every script in
+ * the world hexdumps, and it is what the conformance corpus uses.
+ *
+ * SEVERAL -t SPECS ARE ALLOWED and each gets its own line per block, which
+ * `od -A n -t c -t x1` relies on to show a byte both ways at once. Only
+ * the LAST spec used to survive. When an offset column is on, it is
+ * printed against the FIRST format only and blanked to the same width for
+ * the rest -- that is what GNU does, and the blanks are what line the
+ * columns up. */
+#define OD_MAX_TYPES 4
+
+static int od_addr_width(char addr) {
+    if (addr == 'n') return 0;
+    return (addr == 'x') ? 6 : 7;
+}
+
+static void od_put_addr(char addr, size_t off, int first) {
+    int w = od_addr_width(addr);
+    if (w == 0) return;
+    if (!first) { for (int i = 0; i < w; i++) putchar(32); return; }
+    if      (addr == 'd') printf("%07lu", (unsigned long)off);
+    else if (addr == 'x') printf("%06lx", (unsigned long)off);
+    else                  printf("%07lo", (unsigned long)off);
+}
+
+/* The natural column width of one item in a format. When SEVERAL -t specs
+ * are given GNU lines them all up on the WIDEST -- `-t c -t x1` prints
+ * "   A" over "  41", not "   A" over " 41" -- so the byte and its hex sit
+ * in the same column. Getting this wrong is invisible for one format and
+ * obvious for two. */
+static int od_item_width(char tcode, int tsize) {
+    switch (tcode) {
+    case 'c': return 4;
+    case 'o': return 4;
+    case 'u': return 4;
+    case 'd': return (tsize == 1) ? 5 : 7;
+    case 'x':
+    default:  return (tsize == 1) ? 3 : (tsize == 2) ? 5 : 9;
+    }
+}
+
+static void od_put_items(const unsigned char *b, size_t n, char tcode,
+                         int tsize, int width) {
+    char it[32];
+    for (size_t k = 0; k < n; ) {
+        int used = 1;
+        switch (tcode) {
+        case 'c': {
+            unsigned char c = b[k];
+            if (c == 10)      snprintf(it, sizeof it, "\\n");
+            else if (c == 9)  snprintf(it, sizeof it, "\\t");
+            else if (c == 13) snprintf(it, sizeof it, "\\r");
+            else if (c == 0)  snprintf(it, sizeof it, "\\0");
+            else if (c >= 32 && c < 127) snprintf(it, sizeof it, "%c", c);
+            else              snprintf(it, sizeof it, "%03o", c);
+            break;
+        }
+        case 'd':
+            if (tsize == 1) snprintf(it, sizeof it, "%d", (int)(signed char)b[k]);
+            else {
+                unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
+                snprintf(it, sizeof it, "%d", (int)(short)v);
+                used = 2;
+            }
+            break;
+        case 'u': snprintf(it, sizeof it, "%u", (unsigned)b[k]); break;
+        case 'o': snprintf(it, sizeof it, "%03o", (unsigned)b[k]); break;
+        case 'x':
+        default:
+            if (tsize == 1) snprintf(it, sizeof it, "%02x", (unsigned)b[k]);
+            else if (tsize == 2) {
+                unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
+                snprintf(it, sizeof it, "%04x", v);
+                used = 2;
+            } else {
+                unsigned long v = 0;
+                for (int q = 3; q >= 0; q--)
+                    v = (v << 8) | ((k + (size_t)q < n) ? b[k + (size_t)q] : 0u);
+                snprintf(it, sizeof it, "%08lx", v);
+                used = 4;
+            }
+            break;
+        }
+        printf("%*s", width, it);
+        k += (size_t)used;
+    }
+}
+
+static void dump_typed(FILE *f, char addr, const char *tcodes,
+                       const int *tsizes, int ntypes, long limit) {
     unsigned char b[16];
     size_t off = 0, n;
-    int per = 16;                       /* bytes per line, as GNU uses */
     long left = limit;
+    if (ntypes <= 0) ntypes = 1;
+    /* One column width for every format in this run -- see od_item_width. */
+    int width = 0;
+    for (int t = 0; t < ntypes; t++) {
+        int w = od_item_width(tcodes[t], tsizes[t]);
+        if (w > width) width = w;
+    }
 
     for (;;) {
-        size_t want = (size_t)per;
+        size_t want = 16;
         if (left >= 0) {
             if (left == 0) break;
-            if ((long)want > left) want = (size_t)left;
+            if ((size_t)left < want) want = (size_t)left;
         }
         n = fread(b, 1, want, f);
         if (n == 0) break;
         if (left > 0) left -= (long)n;
 
-        if (addr != 'n') {
-            if      (addr == 'd') printf("%07lu", (unsigned long)off);
-            else if (addr == 'x') printf("%06lx", (unsigned long)off);
-            else                  printf("%07lo", (unsigned long)off);
+        for (int t = 0; t < ntypes; t++) {
+            od_put_addr(addr, off, t == 0);
+            od_put_items(b, n, tcodes[t], tsizes[t], width);
+            putchar(10);
         }
-        for (size_t k = 0; k < n; ) {
-            switch (tcode) {
-            case 'c': {
-                unsigned char c = b[k];
-                if (c == 10)      printf("  \\n");
-                else if (c == 9)  printf("  \\t");
-                else if (c == 13) printf("  \\r");
-                else if (c == 0)  printf("  \\0");
-                else if (c >= 32 && c < 127) printf("   %c", c);
-                else              printf(" %03o", c);
-                k += 1;
-                break;
-            }
-            case 'd': {
-                if (tsize == 1) { printf(" %4d", (int)(signed char)b[k]); k += 1; }
-                else {
-                    unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
-                    printf(" %6d", (int)(short)v);
-                    k += 2;
-                }
-                break;
-            }
-            case 'u': printf(" %3u", (unsigned)b[k]); k += 1; break;
-            case 'o': printf(" %03o", (unsigned)b[k]); k += 1; break;
-            case 'x':
-            default:
-                if (tsize == 1) { printf(" %02x", (unsigned)b[k]); k += 1; }
-                else if (tsize == 2) {
-                    unsigned v = (unsigned)b[k] | ((k + 1 < n) ? ((unsigned)b[k+1] << 8) : 0u);
-                    printf(" %04x", v);
-                    k += 2;
-                } else {
-                    unsigned long v = 0;
-                    for (int q = 3; q >= 0; q--)
-                        v = (v << 8) | ((k + (size_t)q < n) ? b[k + (size_t)q] : 0u);
-                    printf(" %08lx", v);
-                    k += 4;
-                }
-                break;
-            }
-        }
-        putchar(10);
         off += n;
         if (n < want) break;
     }
     /* GNU prints a final offset line -- but not when -A n suppressed the
      * column, where the output is the bytes and nothing else. */
     if (addr != 'n') {
-        if      (addr == 'd') printf("%07lu\n", (unsigned long)off);
-        else if (addr == 'x') printf("%06lx\n", (unsigned long)off);
-        else                  printf("%07lo\n", (unsigned long)off);
+        od_put_addr(addr, off, 1);
+        putchar(10);
     }
 }
 
 static int do_od(int argc, char **argv, int hexdump_style) {
     const char *path = NULL;
-    int chars = 0, canonical = 0, typed = 0;
-    char addr = 'o', tcode = 'x';
-    int  tsize = 1;
+    int chars = 0, canonical = 0, ntypes = 0;
+    char addr = 'o';
+    char tcodes[OD_MAX_TYPES];
+    int  tsizes[OD_MAX_TYPES];
     long limit = -1;
     (void)hexdump_style;
 
@@ -394,12 +429,16 @@ static int do_od(int argc, char **argv, int hexdump_style) {
                 if (a[1] == 'A') {
                     addr = val[0] ? val[0] : 'o';
                 } else if (a[1] == 't') {
-                    typed = 1;
-                    tcode = val[0] ? val[0] : 'x';
-                    tsize = 1;
-                    for (const char *d = val; *d; d++)
-                        if (*d >= 49 && *d <= 56) { tsize = *d - 48; break; }
-                    if (tcode == 'c' || tcode == 'a') tsize = 1;
+                    if (ntypes < OD_MAX_TYPES) {
+                        char tc = val[0] ? val[0] : 'x';
+                        int  ts = 1;
+                        for (const char *d = val; *d; d++)
+                            if (*d >= 49 && *d <= 56) { ts = *d - 48; break; }
+                        if (tc == 'c' || tc == 'a') ts = 1;
+                        tcodes[ntypes] = tc;
+                        tsizes[ntypes] = ts;
+                        ntypes++;
+                    }
                 } else if (a[1] == 'N') {
                     limit = 0;
                     for (const char *d = val; *d >= 48 && *d <= 57; d++)
@@ -413,13 +452,13 @@ static int do_od(int argc, char **argv, int hexdump_style) {
     }
     FILE *f = path ? fopen(path, "rb") : stdin;
     if (!f) { fprintf(stderr, "%s: %s: %s\n", prog, path ? path : "-", strerror(errno)); return 1; }
-    /* -c IS -t c, and routing it through the typed dumper is what makes
-     * `od -A n -c` obey the -A: dump_chars() hardcodes the offset column,
-     * so the address radix was honoured for -t and silently ignored for
-     * -c -- and `od -A n -c` is the form the conformance corpus uses. */
+    /* -c IS -t c, and routing it through the same dumper is what makes
+     * `od -A n -c` obey the -A: the old -c path hardcoded the offset
+     * column, so the address radix was honoured for -t and silently
+     * ignored for -c -- and `-A n -c` is the form the corpus uses. */
     if (canonical)      dump_canonical(f);
-    else if (typed)     dump_typed(f, addr, tcode, tsize, limit);
-    else if (chars)     dump_typed(f, addr, 'c', 1, limit);
+    else if (ntypes)    dump_typed(f, addr, tcodes, tsizes, ntypes, limit);
+    else if (chars)     { char tc = 'c'; int ts = 1; dump_typed(f, addr, &tc, &ts, 1, limit); }
     else                dump_octal_words(f, addr);
     if (f != stdin) fclose(f);
     return 0;

@@ -769,6 +769,13 @@ printf 'AB\001\000C' > /tmp/odt.bin
 echo "empty:[$(printf '' | /bin/od -A n -t x1)]"
 echo @@tt_od_chars
 /bin/od -A n -t c /tmp/odt.bin
+echo @@tt_od_multi
+# SEVERAL -t specs: one line each, and with an offset column the offset is
+# printed against the FIRST only and blanked to the same width after. Only
+# the last spec used to survive, which is what the Oils nul-bytes case
+# (`od -A n -t c -t x1`) needs and could not get.
+/bin/od -A n -t c -t x1 /tmp/odt.bin
+/bin/od -A o -t c -t x1 /tmp/odt.bin
 rm -f /tmp/odt.bin
 
 echo @@tt_test_perm
