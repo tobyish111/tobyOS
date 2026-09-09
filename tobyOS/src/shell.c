@@ -4231,6 +4231,30 @@ static inline bool cmd_res_is_file(int how) {
     return how == CMDRES_EXEC || how == CMDRES_PATH_NOEXEC;
 }
 
+static const char *path_join(const char *prefix, size_t plen,
+                             const char *name, size_t nlen,
+                             char *out_buf, size_t out_sz);
+static bool test_access_ok(const struct vfs_stat *st, unsigned want);
+/* ...and these two live just above cmd_type, which is below cmd_command. */
+static int  shell_type_print_paths(const char *name, const char *first,
+                                   bool as_is);
+static void shell_print_function_def(const char *name, const char *body);
+
+/* Is `name` one of the shell's reserved words?
+ *
+ * `type` and `command -v` both have to answer for a keyword -- `command -v
+ * for` prints "for" and `type for` says it is a keyword -- and only `type`
+ * knew the list, so `command -v for` reported nothing and exited 1. */
+static bool shell_word_is_keyword(const char *name) {
+    static const char *const kw[] = {
+        "if", "then", "else", "elif", "fi", "case", "esac", "for",
+        "select", "while", "until", "do", "done", "in", "function",
+        "time", "{", "}", "!", "[[", "]]", 0 };
+    for (int k = 0; kw[k]; k++)
+        if (strcmp(name, kw[k]) == 0) return true;
+    return false;
+}
+
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) {
         kprintf("usage: run [--sandbox <profile>] <path> [args...]\n");
@@ -8553,7 +8577,8 @@ static void cmd_command(int argc, char **argv) {
             int aidx = shell_alias_find(argv[i]);
             if (aidx >= 0) {
                 if (verbose) {
-                    shell_printf("%s is an alias for '%s'\n",
+                    /* bash's wording -- see cmd_type. */
+                    shell_printf("%s is aliased to `%s'\n",
                                  argv[i], g_aliases[aidx].value);
                 } else {
                     shell_print_alias(&g_aliases[aidx]);
@@ -8561,10 +8586,20 @@ static void cmd_command(int argc, char **argv) {
                 found = true;
             }
             if (found) continue;
+            /* A RESERVED WORD IS A COMMAND NAME TOO. `command -v for`
+             * prints "for" and `command -V for` calls it a shell keyword;
+             * this knew nothing about keywords and went looking for a
+             * /bin/for, so both reported nothing and exited 1. */
+            if (shell_word_is_keyword(argv[i])) {
+                shell_printf(verbose ? "%s is a shell keyword\n" : "%s\n",
+                             argv[i]);
+                continue;
+            }
             struct shell_function *fn = shell_function_lookup(argv[i]);
             if (fn) {
-                shell_printf(verbose ? "%s is a shell function\n" : "%s\n",
+                shell_printf(verbose ? "%s is a function\n" : "%s\n",
                              argv[i]);
+                if (verbose) shell_print_function_def(argv[i], fn->body);
                 found = true;
             }
             if (found) continue;
@@ -8575,14 +8610,10 @@ static void cmd_command(int argc, char **argv) {
             {
                 const struct cmd *c = shell_cmd_lookup(argv[i]);
                 if (c) {
-                    if (verbose && shell_special_builtin_name(c->name)) {
-                        shell_printf("%s is a special shell builtin\n",
-                                     argv[i]);
-                    } else {
-                        shell_printf(verbose ? "%s is a shell builtin\n"
-                                             : "%s\n",
-                                     argv[i]);
-                    }
+                    /* No "special" here either -- see cmd_type. */
+                    shell_printf(verbose ? "%s is a shell builtin\n"
+                                         : "%s\n",
+                                 argv[i]);
                     found = true;
                 }
             }
@@ -8624,7 +8655,126 @@ static void cmd_command(int argc, char **argv) {
                                 /*background=*/false, /*profile=*/0);
 }
 
-/* type [-atpP] NAME...
+/* Every $PATH match for `name`, in $PATH order -- what `type -a` reports,
+ * as against the FIRST match that every other caller wants.
+ *
+ * `as_is` picks the rendering: "NAME is PATH" for `type -a`, the bare path
+ * for `-ap` and `-aP`. Returns how many lines it printed.
+ *
+ * A name with a slash is not a $PATH search and has exactly one answer;
+ * and when the walk finds no EXECUTABLE at all, `first` -- the answer
+ * resolve_program_ex already worked out, which may be an exec-preferred
+ * non-executable (see enum cmd_res) -- stands, so that `type -a` and
+ * `type -t` never disagree about whether a name is a file. */
+static int shell_type_print_paths(const char *name, const char *first,
+                                  bool as_is) {
+    bool slashed = false;
+    for (const char *c = name; *c; c++) if (*c == '/') { slashed = true; break; }
+    if (slashed) {
+        if (as_is) shell_printf("%s is %s\n", name, first);
+        else       shell_printf("%s\n", first);
+        return 1;
+    }
+
+    size_t nlen = strlen(name);
+    const char *path_var = env_get("PATH");
+    const char *cur = (path_var && *path_var) ? path_var : "/bin";
+    char buf[VFS_PATH_MAX];
+    int n = 0;
+    while (*cur) {
+        const char *colon = cur;
+        while (*colon && *colon != ':') colon++;
+        size_t plen = (size_t)(colon - cur);
+        if (plen > 0) {
+            const char *cand = path_join(cur, plen, name, nlen, buf, sizeof buf);
+            struct vfs_stat st;
+            if (cand && vfs_stat(cand, &st) == VFS_OK &&
+                st.type == VFS_TYPE_FILE && test_access_ok(&st, 1u)) {
+                if (as_is) shell_printf("%s is %s\n", name, cand);
+                else       shell_printf("%s\n", cand);
+                n++;
+            }
+        }
+        cur = colon;
+        if (*cur == ':') cur++;
+    }
+    if (n == 0 && first) {
+        if (as_is) shell_printf("%s is %s\n", name, first);
+        else       shell_printf("%s\n", first);
+        n = 1;
+    }
+    return n;
+}
+
+/* Print a function definition the way bash's `type` and `command -V` do:
+ *
+ *     f ()
+ *     {
+ *         echo
+ *     }
+ *
+ * bash leaves a trailing space after `f ()` and after `{`; this reproduces
+ * that, because the gates compare bytes.
+ *
+ * WHAT THIS IS AND IS NOT. bash re-prints a function from its PARSE TREE,
+ * so it normalises whatever was typed. tsh keeps the body as SOURCE TEXT
+ * -- shell_function_set stores the characters between the braces -- so
+ * this re-indents that text instead: split on top-level `;` and newlines,
+ * trim each statement, print it indented by four, and separate them with
+ * ";" the way bash's list printer does.
+ *
+ * That is byte-identical to bash for a body of simple commands, which is
+ * what `type` is asked about in practice. A body holding a COMPOUND
+ * statement (if/while/case) keeps its own layout rather than bash's
+ * re-indentation, so those still differ -- printing the definition at all
+ * is the part that was missing, and a wrong indent is a smaller lie than
+ * an absent body. */
+static void shell_print_function_def(const char *name, const char *body) {
+    shell_printf("%s () \n{ \n", name);
+    const char *p = body;
+    bool printed_any = false;
+    while (p && *p) {
+        /* Blanks and separators ahead of the next statement. */
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ';')
+            p++;
+        if (!*p) break;
+
+        const char *st = p;
+        const char *end = p;      /* one past the last non-blank consumed */
+        char q = 0;               /* the quote we are inside, if any */
+        int depth = 0;            /* ( ) and { } nesting */
+        while (*p) {
+            const char *cs = p;
+            char ch = *p;
+            if (q) {
+                if (ch == q) q = 0;
+                else if (q == '"' && ch == '\\' && p[1]) p++;
+            } else if (ch == '\'' || ch == '"') {
+                q = ch;
+            } else if (ch == '\\' && p[1]) {
+                p++;
+            } else if (ch == '(' || ch == '{') {
+                depth++;
+            } else if (ch == ')' || ch == '}') {
+                if (depth > 0) depth--;
+            } else if (depth == 0 && (ch == ';' || ch == '\n')) {
+                break;
+            }
+            p++;
+            if (*cs != ' ' && *cs != '\t' && *cs != '\r') end = p;
+        }
+        if (end > st) {
+            if (printed_any) shell_printf(";\n");
+            shell_printf("    ");
+            for (const char *k = st; k < end; k++) shell_putc(*k);
+            printed_any = true;
+        }
+    }
+    if (printed_any) shell_putc('\n');
+    shell_printf("}\n");
+}
+
+/* type [-afpPt] NAME...
  *
  * The flags were missing entirely, so `type -t echo` looked up a command
  * literally named "-t", printed "-t: not found", and then described echo
@@ -8632,7 +8782,7 @@ static void cmd_command(int argc, char **argv) {
  * every script asks "is this a builtin or a file". Resolution happens once
  * and the flags only choose how to render it. */
 static void cmd_type(int argc, char **argv) {
-    bool f_t = false, f_p = false, f_P = false, f_a = false;
+    bool f_t = false, f_p = false, f_P = false, f_a = false, f_f = false;
     int first = argc;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] && !(argv[i][1] == '-' && !argv[i][2])) {
@@ -8641,7 +8791,10 @@ static void cmd_type(int argc, char **argv) {
                 else if (*c == 'p') f_p = true;
                 else if (*c == 'P') { f_P = true; f_p = true; }
                 else if (*c == 'a') f_a = true;
-                else if (*c == 'f') { /* suppress function lookup: accepted */ }
+                /* -f SUPPRESSES FUNCTION LOOKUP -- it was parsed and then
+                 * ignored, so `type -f mv` named the function where bash
+                 * names the file standing behind it. */
+                else if (*c == 'f') f_f = true;
                 else {
                     kprintf("type: -%c: invalid option\n", *c);
                     shell_set_status(2);
@@ -8672,8 +8825,10 @@ static void cmd_type(int argc, char **argv) {
 
         /* -P skips every shell-level meaning and reports only the file. */
         if (f_P) {
-            if (is_file) shell_printf("%s\n", path);
-            else shell_set_status(1);
+            if (is_file) {
+                if (f_a) shell_type_print_paths(name, path, false);
+                else     shell_printf("%s\n", path);
+            } else shell_set_status(1);
             continue;
         }
 
@@ -8684,23 +8839,23 @@ static void cmd_type(int argc, char **argv) {
          * name will actually resolve. An alias that cannot expand is not
          * how the word will run. */
         int aidx = g_opt_expand_aliases ? shell_alias_find(name) : -1;
-        static const char *const kw[] = {
-            "if", "then", "else", "elif", "fi", "case", "esac", "for",
-            "select", "while", "until", "do", "done", "in", "function",
-            "time", "{", "}", "!", "[[", "]]", 0 };
-        bool is_kw = false;
-        for (int k = 0; kw[k]; k++)
-            if (strcmp(name, kw[k]) == 0) { is_kw = true; break; }
-        struct shell_function *fn = shell_function_lookup(name);
+        bool is_kw = shell_word_is_keyword(name);
+        struct shell_function *fn = f_f ? 0 : shell_function_lookup(name);
         const struct cmd *c = shell_cmd_lookup(name);
 
         /* -p prints a path only when the name would ACTUALLY run a file;
          * a builtin shadowing it means there is no path to report. */
         if (f_p) {
-            if (aidx < 0 && !is_kw && !fn && !c && is_file)
-                shell_printf("%s\n", path);
-            else if (!(aidx >= 0 || is_kw || fn || c || is_file))
+            /* ...unless -a is given too, which forces the $PATH search:
+             * `type -ap pwd` prints the files even though the builtin
+             * shadows them, while plain `type -p pwd` prints nothing. */
+            bool shadowed = (aidx >= 0 || is_kw || fn || c);
+            if (is_file && (f_a || !shadowed)) {
+                if (f_a) shell_type_print_paths(name, path, false);
+                else     shell_printf("%s\n", path);
+            } else if (!shadowed && !is_file) {
                 shell_set_status(1);
+            }
             continue;
         }
 
@@ -8716,7 +8871,11 @@ static void cmd_type(int argc, char **argv) {
 
         bool any = false;
         if (aidx >= 0) {
-            shell_printf("%s is an alias for '%s'\n", name, g_aliases[aidx].value);
+            /* bash's wording, byte for byte -- a backtick before and an
+             * apostrophe after. tsh printed OSH's "is an alias for": a
+             * different sentence for the same fact, and `type` output is
+             * exactly what a script greps. */
+            shell_printf("%s is aliased to `%s'\n", name, g_aliases[aidx].value);
             any = true;
             if (!f_a) continue;
         }
@@ -8729,21 +8888,33 @@ static void cmd_type(int argc, char **argv) {
             if (!f_a) continue;
         }
         if (fn) {
-            shell_printf("%s is a shell function\n", name);
+            /* bash prints the DEFINITION under the label; tsh printed only
+             * the label, so `type f` said f was a function and nothing
+             * about what it does -- most of the reason to ask. */
+            shell_printf("%s is a function\n", name);
+            shell_print_function_def(name, fn->body);
             any = true;
             if (!f_a) continue;
         }
         if (c) {
             /* Same rule as `command -v`: the hosted allow-list decides what
-             * `type` may call a builtin. */
-            shell_printf(shell_special_builtin_name(c->name)
-                         ? "%s is a special shell builtin\n"
-                         : "%s is a shell builtin\n", name);
+             * `type` may call a builtin.
+             *
+             * AND BASH DOES NOT SAY "SPECIAL". POSIX has special builtins
+             * and so does this shell -- shell_special_builtin_name still
+             * decides who survives a failure under `set -e` and whose
+             * assignments persist -- but bash's `type` calls every one of
+             * them "a shell builtin", which is what Oils records as bash's
+             * own output for "special builtins are called out". Saying
+             * "special" here reported an internal distinction bash does
+             * not report. */
+            shell_printf("%s is a shell builtin\n", name);
             any = true;
             if (!f_a) continue;
         }
         if (is_file) {
-            shell_printf("%s is %s\n", name, path);
+            if (f_a) shell_type_print_paths(name, path, true);
+            else     shell_printf("%s is %s\n", name, path);
             any = true;
         }
         if (!any) {
