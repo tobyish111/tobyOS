@@ -4192,9 +4192,44 @@ static void        shell_spawn_program(const char *path, int argc, char **argv,
 static void        shell_spawn_program_profile(const char *path, int argc,
                                                char **argv, bool background,
                                                const char *profile);
+/* How a name resolved -- the answer resolve_program_ex hands back.
+ *
+ * bash's $PATH walk is EXEC-PREFERRED, not exec-only. It prefers a file
+ * with the execute bit, but it remembers the first existing-but-not-
+ * executable match and falls back to that when the walk finds nothing
+ * better. Both halves of that rule are observable:
+ *
+ *   - a non-executable one/mycmd and an executable two/mycmd run TWO
+ *     (Oils spec/command_ "Non-executable on $PATH"), so the walk must
+ *     keep going PAST the non-executable;
+ *   - a name matching ONLY a non-executable file is still a command as
+ *     far as `type` and `command -v` are concerned -- bash prints "file"
+ *     and execs it to collect the EACCES that makes the status 126 (Oils
+ *     spec/builtin-type-bash "type -t doesn't find non-executable",
+ *     whose `## BUG bash` block records exactly that, and tsh is a bash
+ *     SUPERSET, so bash's answer is the one to match).
+ *
+ * A name WITH A SLASH is not a PATH search and gets no fallback: bash
+ * calls a non-executable `_tmp/file` not-found (Oils "type of relative
+ * path"). That is why one bool could not carry this -- the two shapes
+ * need different answers to the same stat. */
+enum cmd_res {
+    CMDRES_NONE = 0,        /* no such file anywhere */
+    CMDRES_EXEC,            /* a regular file that can be executed */
+    CMDRES_PATH_NOEXEC,     /* the $PATH walk's fallback: exists, cannot run */
+    CMDRES_SLASH_NOEXEC     /* an explicit path that exists, cannot run */
+};
+
 static const char *resolve_program(const char *name, char *out_buf,
                                    size_t out_sz);
+static const char *resolve_program_ex(const char *name, char *out_buf,
+                                      size_t out_sz, int *how);
 static bool        path_is_runnable(const char *path);
+
+/* Is this how-code a file that `type`/`command -v` should NAME? */
+static inline bool cmd_res_is_file(int how) {
+    return how == CMDRES_EXEC || how == CMDRES_PATH_NOEXEC;
+}
 
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) {
@@ -8553,8 +8588,10 @@ static void cmd_command(int argc, char **argv) {
             }
             if (found) continue;
             char path_buf[64];
-            const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
-            if (path_is_runnable(path)) {
+            int how = CMDRES_NONE;
+            const char *path = resolve_program_ex(argv[i], path_buf,
+                                                  sizeof(path_buf), &how);
+            if (cmd_res_is_file(how)) {
                 /* `command -v` answers with the PATH it resolved, not the
                  * name it was asked about -- `command -v newgrp` is
                  * /bin/newgrp in every shell. */
@@ -8626,8 +8663,12 @@ static void cmd_type(int argc, char **argv) {
     for (int i = first; i < argc; i++) {
         const char *name = argv[i];
         char path_buf[64];
-        const char *path = resolve_program(name, path_buf, sizeof(path_buf));
-        bool is_file = path_is_runnable(path);
+        int how = CMDRES_NONE;
+        const char *path = resolve_program_ex(name, path_buf,
+                                              sizeof(path_buf), &how);
+        /* A file reached THROUGH $PATH counts even without the execute
+         * bit; an explicit path does not. See enum cmd_res. */
+        bool is_file = cmd_res_is_file(how);
 
         /* -P skips every shell-level meaning and reports only the file. */
         if (f_P) {
@@ -11643,21 +11684,35 @@ static bool path_is_runnable(const char *path) {
     return test_access_ok(&st, 1u);
 }
 
-/* Resolve a single argv[0] to a runnable ELF path.
+/* Resolve a single argv[0] to a runnable ELF path, and say HOW it
+ * resolved -- see enum cmd_res, which is where the rule is written down.
  *
- *   1. If `name` contains a slash, return it verbatim (explicit path).
+ *   1. If `name` contains a slash, return it verbatim (explicit path);
+ *      the how-code says whether it can actually run.
  *   2. Otherwise walk $PATH from the shell env, ":"-separated, and
- *      return the first "<entry>/<name>" that exists as a regular file.
+ *      return the first executable "<entry>/<name>" -- falling back to
+ *      the first non-executable one only if no executable turns up.
  *   3. Fallback: synthesize "/bin/<name>" so unresolved bare names
  *      still get a sensible message ("'foo' not found in $PATH").
  *
  * The returned pointer either aliases `name` or `out_buf`, so callers
  * must keep both live until the spawn is done. (M25C) */
-static const char *resolve_program(const char *name, char *out_buf,
-                                   size_t out_sz) {
+static const char *resolve_program_ex(const char *name, char *out_buf,
+                                      size_t out_sz, int *how) {
+    int ignored;
+    if (!how) how = &ignored;
+
     /* (1) explicit path */
     for (const char *c = name; *c; c++) {
-        if (*c == '/') return name;
+        if (*c == '/') {
+            struct vfs_stat st;
+            if (vfs_stat(name, &st) != VFS_OK || st.type != VFS_TYPE_FILE)
+                *how = CMDRES_NONE;
+            else
+                *how = test_access_ok(&st, 1u) ? CMDRES_EXEC
+                                               : CMDRES_SLASH_NOEXEC;
+            return name;
+        }
     }
 
     size_t nlen = strlen(name);
@@ -11666,6 +11721,8 @@ static const char *resolve_program(const char *name, char *out_buf,
      * to keep behaviour stable when the user clears env unwisely. */
     const char *path_var = env_get("PATH");
     const char *cur = (path_var && *path_var) ? path_var : "/bin";
+    const char *keep_dir = 0;       /* first non-executable match, if any */
+    size_t      keep_dlen = 0;
     while (*cur) {
         const char *colon = cur;
         while (*colon && *colon != ':') colon++;
@@ -11673,11 +11730,26 @@ static const char *resolve_program(const char *name, char *out_buf,
         if (plen > 0) {
             const char *cand = path_join(cur, plen, name, nlen,
                                          out_buf, out_sz);
-            if (cand && path_is_runnable(cand)) return cand;
+            struct vfs_stat st;
+            if (cand && vfs_stat(cand, &st) == VFS_OK &&
+                st.type == VFS_TYPE_FILE) {
+                if (test_access_ok(&st, 1u)) { *how = CMDRES_EXEC; return cand; }
+                if (!keep_dir) { keep_dir = cur; keep_dlen = plen; }
+            }
         }
         cur = colon;
         if (*cur == ':') cur++;
     }
+    if (keep_dir) {
+        /* Remember the DIRECTORY and rebuild, rather than stashing the
+         * path: every candidate above is written into out_buf, so the
+         * remembered one is gone by the end of the walk -- and out_sz is
+         * as small as 64 in the `type` callers, too small to shadow. */
+        const char *cand = path_join(keep_dir, keep_dlen, name, nlen,
+                                     out_buf, out_sz);
+        if (cand) { *how = CMDRES_PATH_NOEXEC; return cand; }
+    }
+    *how = CMDRES_NONE;
 
     /* (3) explicit fallback so the failure path has a stable label. */
     size_t prefix = sizeof(PIPE_BIN_PREFIX) - 1;
@@ -11687,6 +11759,11 @@ static const char *resolve_program(const char *name, char *out_buf,
         return out_buf;
     }
     return name;
+}
+
+static const char *resolve_program(const char *name, char *out_buf,
+                                   size_t out_sz) {
+    return resolve_program_ex(name, out_buf, out_sz, 0);
 }
 
 /* ---- why did the spawn fail? ------------------------------------------
