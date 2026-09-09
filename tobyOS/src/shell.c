@@ -15244,8 +15244,29 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * that is wrong either way. Stopping there is what bash's
                          * execve() does with the same bytes. */
                         if (!c) { stop_nul = true; continue; }
+                        /* A BYTE AN ESCAPE PRODUCED IS DATA, and may collide
+                         * with the word buffer's in-band markers -- $'\1' IS
+                         * SHELL_ARG_MARK, $'\2' is SHELL_NOSPLIT_MARK, $'\3'
+                         * is SHELL_GLOB_ESC and $'\4' is SHELL_DATA_ESC
+                         * itself. Appended raw, the very next scan reads it as
+                         * a mark: `$'\001'` produced NOTHING at all, because
+                         * the word machinery saw an argument boundary where
+                         * the script had asked for a byte.
+                         *
+                         * shell_append_data_n escapes exactly these four the
+                         * way every other expansion output is escaped, and
+                         * shell_strip_glob_escapes takes the escape back off
+                         * at the end of word processing -- so the raw byte
+                         * comes out. The mechanism was already here and this
+                         * path simply did not use it; the copy of this decoder
+                         * in the ${...} path does, and carries a comment
+                         * saying why. Second time these two decoders have
+                         * differed by one arc's worth of fix.
+                         *
+                         * A LITERAL character between the quotes cannot
+                         * collide -- it came from the script text. */
                         if (!stop_nul &&
-                            shell_append_char(words, &wpos, word_cap, c) < 0)
+                            shell_append_data_n(words, &wpos, word_cap, &c, 1) < 0)
                             return -1;
                     } else {
                         /* Ordinary characters after the NUL are consumed and dropped
