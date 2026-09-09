@@ -8747,7 +8747,19 @@ static void cmd_type(int argc, char **argv) {
             any = true;
         }
         if (!any) {
-            shell_printf("%s: not found\n", name);
+            /* A DIAGNOSTIC, NOT OUTPUT. bash says "bash: type: zz: not
+             * found" on STDERR, and this said it on stdout -- which put a
+             * line into the middle of the answer whenever `type` was asked
+             * about several names and only some existed. Oils "type of
+             * relative path" asks about two and reads back only the one
+             * that WAS found; "type -> not found" greps the message out of
+             * a redirected stderr and got an empty file.
+             *
+             * shell.c has no stderr of its own -- shell_write goes to the
+             * one output sink. kprintf IS the diagnostic channel here, and
+             * the hosted build routes it through the shell's current fd 2,
+             * so `type zz 2>err.txt` captures it. */
+            kprintf("tsh: type: %s: not found\n", name);
             shell_set_status(1);
         }
     }
