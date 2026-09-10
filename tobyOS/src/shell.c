@@ -7178,8 +7178,20 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         }
         /* `name (` in command position is a FUNCTION HEADER, not a subshell.
          * Its parentheses are part of the definition and its body may start
-         * on the next line, so the header alone leaves the command owed. */
-        if (st->prev_word_cmd && st->paren == 0) {
+         * on the next line, so the header alone leaves the command owed.
+         *
+         * AND A SUBSHELL IS A PLACE COMMANDS RUN, so a definition inside one
+         * is an ordinary command:
+         *
+         *     ( f() { echo in-sub; }; f )
+         *
+         * This asked for st->paren == 0, so every such line was a syntax
+         * error. What the depth test was really guarding is an ARRAY
+         * LITERAL, where `x ( )` is not a definition and bash exits 2 --
+         * and that has a state of its own, so ask it directly. A case
+         * pattern needs no test: it is not command position, so
+         * prev_word_cmd is already false there. */
+        if (st->prev_word_cmd && !st->in_array_lit) {
             const char *q = p + 1;
             while (*q == ' ' || *q == '\t') q++;
             if (*q == ')') {
