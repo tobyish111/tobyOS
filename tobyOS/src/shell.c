@@ -466,6 +466,12 @@ static const char *sh_split_subscript(const char *key, size_t klen,
                                       char *sub, size_t subcap);
 
 static bool shell_name_is_valid(const char *s, size_t n);
+/* The WORD rule for a FUNCTION name -- not shell_name_is_valid, which is
+ * the rule for a variable. Declared here because shell_function_set needs
+ * it 900 lines before it is defined. */
+static bool shell_func_name_char(char c);
+static bool shell_func_name_is_valid(const char *s, size_t n);
+static bool shell_word_is_func_name(const char *w, size_t n);
 static bool shell_special_builtin_name(const char *name);
 static int shell_expand_param_word(const char *word, char *out, size_t cap);
 static bool shell_word_has_argmark(const char *s);
@@ -1479,7 +1485,11 @@ static struct shell_function *shell_function_lookup(const char *name) {
 }
 
 static int shell_function_set(const char *name, const char *body) {
-    if (!name || !body || !shell_name_is_valid(name, strlen(name))) return -1;
+    /* The WORD rule -- see shell_func_name_char. This held a function name
+     * to the variable rule, so a definition the parser had accepted was
+     * then refused here. */
+    if (!name || !body || !shell_func_name_is_valid(name, strlen(name)))
+        return -1;
     if (shell_special_builtin_name(name)) {
         kprintf("%s: cannot define a function with a special builtin name\n",
                 name);
@@ -2358,6 +2368,86 @@ static bool shell_name_is_valid(const char *s, size_t n) {
               (c >= '0' && c <= '9') || c == '_')) {
             return false;
         }
+    }
+    return true;
+}
+
+/* A FUNCTION NAME IS A WORD, NOT AN IDENTIFIER.
+ *
+ * shell_name_is_valid above is the rule for a VARIABLE, and a function name
+ * was being held to it in four separate places -- the scanner's
+ * prev_word_name, shell_try_function_definition's name scan,
+ * shell_function_set's check, and a comment asserting "A FUNCTION NAME IS A
+ * NAME" that was simply not true of bash. So
+ *
+ *     osh-normalize() { sed 's/shell function/function/'; }
+ *
+ * was not a function definition at all: the name scan stopped at the `-`,
+ * the `(` did not follow the name, and the shell went looking for a program
+ * called osh-normalize. Hyphenated function names are ordinary in real
+ * scripts, and the Oils corpus has a whole file on this.
+ *
+ * bash's rule, from spec/func-parsing: `func-name.ext`, `foo!bar`,
+ * `foo-bar` and even `func-name=ext` are all accepted -- the corpus calls
+ * that last one "WOW, bash is so lenient" -- and the ONLY names it refuses
+ * are the ones it would have to EXPAND to know: `$foo-bar()` and
+ * `foo-$(echo hi)()` are "not a valid identifier" with status 1 (not a
+ * syntax error, which is why the word still has to scan as a name).
+ *
+ * So: a name character is anything that does not end a word or introduce a
+ * quote, and `$`/backtick are scanned as part of the word here and rejected
+ * by shell_func_name_is_valid when the definition is made. */
+static bool shell_func_name_char(char c) {
+    if ((unsigned char)c <= ' ' || (unsigned char)c == 127) return false;
+    switch (c) {
+    case '|': case '&': case ';': case '(': case ')':
+    case '<': case '>': case '\'': case '"': case '\\':
+    case '#':
+        return false;
+    default:
+        return true;
+    }
+}
+
+static bool shell_func_name_is_valid(const char *s, size_t n) {
+    if (!s || n == 0) return false;
+    for (size_t i = 0; i < n; i++)
+        if (s[i] == '$' || s[i] == '`') return false;
+    return true;
+}
+
+/* Could this whole word be a function name?
+ *
+ * A WORD ENDING IN `=` IS AN ASSIGNMENT, and `name=( ... )` is an ARRAY
+ * LITERAL -- not a function called `name=`. That is the one place the
+ * permissive word rule has to give way, and it is not a corner: `a=()` is
+ * how every empty array is written. Letting it through turned each one
+ * into a function definition, which cost seven cases in a single run --
+ * empty arrays, sparse arrays, an empty COMP_ARGV, and the `%foo=()`
+ * parse error that is a named regression test.
+ *
+ * `func-name=ext ( )` still defines a function, because it does not END in
+ * `=` -- which is exactly how bash tells the two apart. */
+static bool shell_word_is_func_name(const char *w, size_t n) {
+    if (!w || n == 0) return false;
+    if (w[n - 1] == '=') return false;
+    for (size_t i = 0; i < n; i++) {
+        /* A command substitution is part of the WORD, parentheses and all.
+         * Judging it character by character called the `(` a metacharacter
+         * and made the whole line a syntax error, where bash parses it and
+         * then refuses the NAME. */
+        if (w[i] == '$' && i + 1 < n && w[i + 1] == '(') {
+            int d = 0;
+            size_t j = i + 1;
+            for (; j < n; j++) {
+                if (w[j] == '(') d++;
+                else if (w[j] == ')' && --d == 0) break;
+            }
+            if (j >= n) return false;          /* unbalanced */
+            i = j;
+            continue;
+        }
+        if (!shell_func_name_char(w[i])) return false;
     }
     return true;
 }
@@ -7093,8 +7183,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             const char *q = p + 1;
             while (*q == ' ' || *q == '\t') q++;
             if (*q == ')') {
-                /* A FUNCTION NAME IS A NAME. `foo$x() { ...; }` is a syntax
-                 * error in bash, not a function called `foo$x`. */
+                /* A function name is a WORD -- see shell_func_name_char.
+                 * `foo$x() { ...; }` is still refused, but at the
+                 * definition and with status 1, not here as a syntax
+                 * error. */
                 if (!st->prev_word_name) st->bad_paren = true;
                 *pp = q + 1;
                 st->func_hdr = true;
@@ -7590,18 +7682,12 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                     shell_word_eq(w, n, "local")    ||
                     shell_word_eq(w, n, "declare")  ||
                     shell_word_eq(w, n, "typeset");
-    /* Whether it could be a FUNCTION NAME -- checked when a `(` follows. */
-    {
-        bool ok = (n > 0);
-        for (size_t i = 0; i < n && ok; i++) {
-            char ch = w[i];
-            bool alpha = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                         ch == '_';
-            bool digit = (ch >= '0' && ch <= '9');
-            if (!(alpha || (digit && i > 0))) ok = false;
-        }
-        st->prev_word_name = ok;
-    }
+    /* Whether it could be a FUNCTION NAME -- checked when a `(` follows.
+     * The word rule, not the variable rule; see shell_func_name_char. A
+     * name that needs expanding scans fine here and is refused later, at
+     * the definition, because bash makes it status 1 and not a syntax
+     * error. */
+    st->prev_word_name = shell_word_is_func_name(w, n);
 }
 
 /* Run the scanner over one physical line. A newline is a command separator,
@@ -20531,11 +20617,35 @@ static bool shell_line_syntax_ok(const char *src);
 
 static bool shell_try_function_definition(const char *src) {
     const char *s = shell_skip_blanks(src);
-    if (!shell_var_start(*s)) return false;
+    if (!shell_func_name_char(*s)) return false;
 
     const char *name_start = s;
-    while (shell_var_char(*s)) s++;
+    while (*s) {
+        /* `$( ... )` inside the name is part of the WORD. Stopping at its
+         * `(` left `foo-$` followed by `(echo hi)()`, which does not look
+         * like a header, so the line fell through to "command not found"
+         * where bash reports an invalid identifier. */
+        if (*s == '$' && s[1] == '(') {
+            int d = 0;
+            const char *q = s + 1;
+            for (; *q; q++) {
+                if (*q == '(') d++;
+                else if (*q == ')' && --d == 0) { q++; break; }
+            }
+            if (d != 0) break;          /* unbalanced: not our business */
+            s = q;
+            continue;
+        }
+        if (!shell_func_name_char(*s)) break;
+        s++;
+    }
     size_t name_len = (size_t)(s - name_start);
+    /* Not a function name -- and not one bash would REFUSE as a name
+     * either, which is the `$`/backtick case that has to keep going so it
+     * can be reported. What is left is an ordinary word like `a=`, and it
+     * belongs to the assignment path. */
+    if (!shell_word_is_func_name(name_start, name_len) &&
+        shell_func_name_is_valid(name_start, name_len)) return false;
     const char *after_name = shell_skip_blanks(s);
     /* `( )` and `()` are the same header: POSIX makes `(` and `)` separate
      * tokens, so `fun ( ) { ...; }` is legal and was reported as
@@ -20543,6 +20653,20 @@ static bool shell_try_function_definition(const char *src) {
     if (after_name[0] != '(') return false;
     const char *close = shell_skip_blanks(after_name + 1);
     if (*close != ')') return false;
+
+    /* From here it IS a function definition, so a name this shell cannot
+     * accept is reported as one -- bash answers `$foo-bar() { ls; }` with
+     * "not a valid identifier" and status 1, where falling through to the
+     * command path would have said "not found" and 127. */
+    if (!shell_func_name_is_valid(name_start, name_len)) {
+        char bad[64];
+        size_t bn = name_len < sizeof bad - 1 ? name_len : sizeof bad - 1;
+        memcpy(bad, name_start, bn);
+        bad[bn] = '\0';
+        kprintf("tsh: `%s': not a valid identifier\n", bad);
+        shell_set_status(1);
+        return true;
+    }
 
     s = shell_skip_blanks(close + 1);
     /* `f() ( return 42 )` -- a subshell body. POSIX allows any compound
