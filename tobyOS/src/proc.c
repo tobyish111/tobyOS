@@ -1480,10 +1480,36 @@ int proc_wait_or_ptrace(int pid) {
  * down (real fbdev programs draw into the mmap and exit without panning). */
 extern void fbdev_proc_exit(int pid);
 
+/* Wait until `p` is no longer loaded on any CPU.
+ *
+ * NEVER SPIN ON THIS WHILE HOLDING THE BKL. A proc that has exited stays
+ * `current` on its CPU until that CPU switches away, and that CPU reaches
+ * the switch through bkl_enter(). Spinning on on_cpu with the lock held is
+ * therefore hold-and-wait: the very CPU this loop is waiting for cannot
+ * make the progress the loop needs. Every other core then queues behind
+ * the lock, pid 0 starves, and the box is gone inside ten seconds.
+ *
+ * That is not hypothetical -- it took the EliteDesk down on the first real
+ * hardware run of the native-parity arc (2026-09-11, commit 158cb7b). A
+ * plain `while : ; do x=$(echo hi); done` under the Linux-ABI bash froze
+ * it within a handful of forks, with the reaper holding the lock here and
+ * the dead child sitting TERMINATED-but-still-on_cpu on another core.
+ * QEMU had never reproduced it in hundreds of gate boots: it needs two
+ * cores to race a dying proc's context save against a reaper.
+ *
+ * So the DECISION IS MADE HERE rather than left to callers. Holding the
+ * BKL, this yields -- sched_yield() releases the lock on the way out and
+ * re-takes it on the way back, which is the shape every other blocking
+ * primitive in this kernel uses (see LX_wait4). Without it, the old spin
+ * is still right. Four call sites had to get this correct independently
+ * (proc_reap, and thread_join/thread_detach x3); exactly one of them did,
+ * and only after it had already cost a wedged machine. */
 void proc_wait_off_cpu(struct proc *p) {
     if (!p) return;
-    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE))
-        __asm__ volatile("pause");
+    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+        if (bkl_held()) sched_yield();
+        else            __asm__ volatile("pause");
+    }
 }
 
 /* Slice 89: bounded variant for group teardown. A member wedged ON-CPU
@@ -1849,36 +1875,10 @@ static void proc_reap(struct proc *p) {
     { extern void futex_forget_proc(struct proc *); futex_forget_proc(p); }
     { extern void poll_forget_proc(struct proc *);  poll_forget_proc(p);  }
 
-    /* WAIT FOR THE CORPSE TO LEAVE ITS CPU BY YIELDING, NOT BY SPINNING.
-     *
-     * p is TERMINATED, but it may still be `current` on ANOTHER CPU: a
-     * dying proc's context is not released until that CPU switches away,
-     * and that CPU reaches the switch through bkl_enter(). proc_wait_off_cpu
-     * spins on on_cpu with `pause` and never drops the BKL, so this was
-     * hold-and-wait: the corpse's CPU could never make the progress the
-     * spin was waiting for.
-     *
-     * proc_exit's thread-group teardown already knows the hazard -- "a
-     * sibling spinning in bkl_enter would never leave the CPU while we hold
-     * the lock", above proc_reap_group_threads -- and drops the lock by
-     * hand. This path uses the yield-poll shape instead, which is what
-     * every other blocking primitive in this kernel does (see LX_wait4):
-     * sched_yield() releases the BKL on the way out and re-takes it on the
-     * way back in, so the other CPU gets its turn and the accounting stays
-     * in one place rather than being open-coded here.
-     *
-     * MEASURED ON REAL HARDWARE, 2026-09-11, four cores: a plain
-     *     while : ; do x=$(echo hi); done
-     * under the Linux-ABI bash wedged the box within a few forks. The
-     * serial log shows the child's exit with no "reaped" line after it --
-     * the reap had started and stopped right here -- and the stall dump
-     * shows the parent RUNNING with holds_bkl=1 on one CPU while the dead
-     * child sat state=TERMINATED, still on_cpu, on another, with every
-     * remaining CPU queued on the ticket lock behind them. QEMU has never
-     * reproduced it in hundreds of gate boots: it needs two cores to race
-     * for real. */
-    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE))
-        sched_yield();
+    /* The corpse may still be loaded on another CPU; proc_wait_off_cpu
+     * knows not to spin on that while we hold the BKL. This call used to
+     * deadlock the machine -- see the header there. */
+    proc_wait_off_cpu(p);
 
     /* SLICE 16: return this process's whole memory charge to its cgroup.
      *
