@@ -601,6 +601,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/ttyparity/ttyparity.elf \
             programs/spechelp/spechelp.elf \
             programs/tsh/tsh.elf \
+            programs/tjoinchurn/tjoinchurn.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
@@ -1759,6 +1760,11 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,newgrp,newgrp))
 # /bin/ttyparity -- the INTERACTIVE bash-parity gate: both shells on real
 # pty pairs, transcripts compared byte-for-byte. See programs/ttyparity.
 $(eval $(call LIBTOBY_PROGRAM_RULES,ttyparity,ttyparity))
+
+# /bin/tjoinchurn -- churn for the NATIVE thread join/detach reap paths.
+# Those three call sites had no test at all: /bin/linux-join rides the futex
+# contract and never enters thread.c. See the header in its main.c.
+$(eval $(call LIBTOBY_PROGRAM_RULES,tjoinchurn,tjoinchurn))
 # /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
 # as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
 # rather than the 54 cases we wrote ourselves. See programs/oilspec.
@@ -3175,6 +3181,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
 	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
+	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
 	cp programs/ttyparity/ttyparity.elf             $(INITRD_STAGE)/bin/ttyparity
@@ -4210,6 +4217,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
 	    bin/bluescreen                                                    \
 	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
+	    bin/tjoinchurn                                                    \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \
