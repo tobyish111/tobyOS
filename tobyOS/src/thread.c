@@ -44,10 +44,16 @@ static struct proc *thread_alloc_slot(void) {
     return proc_slot_claim();
 }
 
+static void thread_reap_detached(struct proc *leader);
+
 int thread_create(uint64_t entry, uint64_t arg,
                   uint64_t user_stack_top, uint64_t tls_base) {
     struct proc *leader = current_proc();
     if (!leader) return -1;
+
+    /* Reclaim detached siblings that have exited; see the header there.
+     * This is the moment their proc slots are about to be needed. */
+    thread_reap_detached(leader);
 
     /* Find the actual thread-group leader */
     struct proc *tg_leader = leader;
@@ -251,6 +257,44 @@ void thread_exit(int code) {
 
     /* Should never reach here */
     for (;;) hlt();
+}
+
+/* Reclaim detached threads of this group that have already exited.
+ *
+ * A DETACHED THREAD HAD NOBODY TO REAP IT. thread_exit sends it through
+ * proc_exit(), which leaves it PROC_TERMINATED -- and proc_reap() is only
+ * ever reached from proc_wait_ex(), which nothing calls for a thread. A
+ * joinable thread is fine (its joiner reaps it) and so is a thread that
+ * was ALREADY terminated when detach was called (thread_detach reaps it
+ * inline). The gap is the one in between: detach a RUNNING thread, let it
+ * exit, and its proc slot is gone for the life of the process.
+ *
+ * MEASURED ON REAL HARDWARE, 2026-09-12: /bin/tjoinchurn detaches every
+ * fourth round, and after 36 rounds -- 36 detached threads, against a proc
+ * table whose pids never got past 34 -- thread_create failed for the rest
+ * of the run. The counters froze at ran=144 joined=108 detached=36 while
+ * `failed` climbed by exactly one per round, which is what "the very first
+ * create in the round fails, forever" looks like.
+ *
+ * Swept HERE, at create time, because that is the moment the slot is
+ * about to be wanted; the same shape libtoby uses for the matching user
+ * stacks. A detached thread that has NOT exited is left alone -- it is
+ * still running. */
+static void thread_reap_detached(struct proc *leader) {
+    if (!leader) return;
+    int tg = leader->is_thread ? leader->tgid : leader->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q == leader || !q->is_thread) continue;
+        if (q->tgid != tg) continue;
+        if (q->state != PROC_TERMINATED || !q->detached) continue;
+        sched_dequeue(q);
+        proc_wait_off_cpu(q);          /* yields if we hold the BKL */
+        if (q->kstack_base) kfree(q->kstack_base);
+        q->kstack_base = 0;
+        q->kstack_top  = 0;
+        q->state = PROC_UNUSED;
+    }
 }
 
 /* ---- Thread join ----------------------------------------------------- */
