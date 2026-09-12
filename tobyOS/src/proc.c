@@ -1848,7 +1848,37 @@ static void proc_reap(struct proc *p) {
     sched_dequeue(p);
     { extern void futex_forget_proc(struct proc *); futex_forget_proc(p); }
     { extern void poll_forget_proc(struct proc *);  poll_forget_proc(p);  }
-    proc_wait_off_cpu(p);
+
+    /* WAIT FOR THE CORPSE TO LEAVE ITS CPU BY YIELDING, NOT BY SPINNING.
+     *
+     * p is TERMINATED, but it may still be `current` on ANOTHER CPU: a
+     * dying proc's context is not released until that CPU switches away,
+     * and that CPU reaches the switch through bkl_enter(). proc_wait_off_cpu
+     * spins on on_cpu with `pause` and never drops the BKL, so this was
+     * hold-and-wait: the corpse's CPU could never make the progress the
+     * spin was waiting for.
+     *
+     * proc_exit's thread-group teardown already knows the hazard -- "a
+     * sibling spinning in bkl_enter would never leave the CPU while we hold
+     * the lock", above proc_reap_group_threads -- and drops the lock by
+     * hand. This path uses the yield-poll shape instead, which is what
+     * every other blocking primitive in this kernel does (see LX_wait4):
+     * sched_yield() releases the BKL on the way out and re-takes it on the
+     * way back in, so the other CPU gets its turn and the accounting stays
+     * in one place rather than being open-coded here.
+     *
+     * MEASURED ON REAL HARDWARE, 2026-09-11, four cores: a plain
+     *     while : ; do x=$(echo hi); done
+     * under the Linux-ABI bash wedged the box within a few forks. The
+     * serial log shows the child's exit with no "reaped" line after it --
+     * the reap had started and stopped right here -- and the stall dump
+     * shows the parent RUNNING with holds_bkl=1 on one CPU while the dead
+     * child sat state=TERMINATED, still on_cpu, on another, with every
+     * remaining CPU queued on the ticket lock behind them. QEMU has never
+     * reproduced it in hundreds of gate boots: it needs two cores to race
+     * for real. */
+    while (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE))
+        sched_yield();
 
     /* SLICE 16: return this process's whole memory charge to its cgroup.
      *
