@@ -252,6 +252,41 @@ static void wdog_check_idle(uint64_t now) {
               (unsigned long)since, (unsigned long)g_idle_hb,
               WDOG_BKL_OWNER);
     wdog_record_event(ABI_WDOG_KIND_IDLE_STALL, 0, reason);
+
+    /* Who holds it, and what are they doing -- see bkl_dump_stall. Reads
+     * only; safe from interrupt context with the lock stuck. */
+    { extern void bkl_dump_stall(void); bkl_dump_stall(); }
+
+#ifdef SMP_DIAG
+    /* THE BKL ACCOUNTING, ON ITS OWN LINE. The reason string above is
+     * capped at ABI_WDOG_REASON_MAX (96) and already nearly fills it, so
+     * these go out separately rather than being silently truncated.
+     *
+     * This runs ONCE per stall episode (g_idle_bitten guards it), from the
+     * PIT check -- not a hot path, so it does not fall under sched.c's
+     * warning about per-bkl_enter/exit logging perturbing the timing.
+     *
+     * What to read: lost_release non-zero means a bkl_exit() found
+     * holds_bkl clear while the lock was actually held by somebody, i.e. a
+     * release went missing and the BKL leaked -- which would explain pid 0
+     * spinning forever on an acquire nobody will ever hand over. owner >= 0
+     * with everything else zero means the holder is simply blocked while
+     * holding it. owner == -1 means the BKL is FREE and pid 0 is stalled on
+     * something else entirely, which would send this hunt somewhere new. */
+    {
+        extern volatile uint64_t g_bkl_reenters, g_bkl_enter_idmm,
+                                 g_bkl_exit_idmm, g_bkl_exit_notheld;
+        extern volatile int g_bkl_mm_owner, g_bkl_mm_caller;
+        kprintf("[wdog] BKL owner=%d lost_release=%lu reenters=%lu "
+                "enter_idmm=%lu exit_idmm=%lu mm_owner=%d mm_caller=%d\n",
+                g_bkl_owner,
+                (unsigned long)g_bkl_exit_notheld,
+                (unsigned long)g_bkl_reenters,
+                (unsigned long)g_bkl_enter_idmm,
+                (unsigned long)g_bkl_exit_idmm,
+                g_bkl_mm_owner, g_bkl_mm_caller);
+    }
+#endif
 }
 
 void wdog_check(void) {

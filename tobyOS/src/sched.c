@@ -222,7 +222,84 @@ volatile uint64_t g_bkl_exit_idmm   = 0;
 volatile uint64_t g_bkl_exit_notheld = 0;
 volatile int      g_bkl_mm_owner    = -1;   /* owner at the last mismatch */
 volatile int      g_bkl_mm_caller   = -1;   /* mis-id'd cpu at last mismatch */
+
+/* WHICH ACQUIRE IS THE ONE THAT NEVER CAME BACK.
+ *
+ * The stall dump can say the BKL is held and that every other CPU is queued
+ * behind it, but not by WHAT -- cursys is already cleared by the time the
+ * exit path runs, so the holder shows as "in no syscall at all". These name
+ * the acquire itself: the return address of whoever called bkl_enter, plus
+ * the pid and cpu it ran on. Resolve the address against tobyos.bin (nm /
+ * addr2line) and it names the code site directly.
+ *
+ * Three single stores, which is the class sched.c's warning above calls
+ * freeze-safe -- and SMP_DIAG-only regardless, so the stock build's hottest
+ * lock path is not touched at all. That warning is not theoretical here: an
+ * instrumented build once ran clean while the same source froze 3/3. */
+volatile unsigned long g_bkl_acq_ra  = 0;
+volatile int           g_bkl_acq_pid = -1;
+volatile int           g_bkl_acq_cpu = -1;
+
+/* ...and the mirror: WHICH RELEASE WAS THROWN AWAY.
+ *
+ * bkl_exit()'s "idempotent: never double-unlock" guard is `if this CPU does
+ * not hold it, do nothing` -- which is right for a genuine double-unlock and
+ * indistinguishable, from inside, from a release that simply arrived on the
+ * wrong CPU. The counter cannot tell those apart; the CALL SITE can. */
+volatile unsigned long g_bkl_lost_ra  = 0;
+volatile int           g_bkl_lost_pid = -1;
+volatile int           g_bkl_lost_cpu = -1;
 #endif
+
+/* A one-shot, LOCK-FREE picture of the BKL at a stall.
+ *
+ * Called from the watchdog's idle-stall bite: from the PIT, in interrupt
+ * context, at a moment when the BKL is very likely stuck. So it must take
+ * NO locks and call nothing that might -- every line below is a plain read
+ * of memory somebody else owns. A diagnostic that blocks on the very thing
+ * it is diagnosing reports nothing at all.
+ *
+ * WHAT TO READ. The BKL is a ticket lock: `next` is the number handed out,
+ * `serving` the one being served. next - serving is how many CPUs are
+ * QUEUED behind the holder, which separates "the lock leaked and nobody
+ * will ever hand it over" from "pid 0 is merely slow". Then, per CPU: what
+ * is running there, whether that CPU thinks it holds the lock, and which
+ * syscall it is inside -- the difference between "the BKL leaked" and
+ * "this specific path never released it".
+ *
+ * Deliberately NOT under SMP_DIAG: it costs nothing until a stall, and a
+ * stall on a stock build is exactly when nobody has a diagnostic ISO to
+ * hand. */
+void bkl_dump_stall(void);
+void bkl_dump_stall(void) {
+    kprintf("[wdog] bkl ticket next=%u serving=%u\n",
+            (unsigned)__atomic_load_n(&g_bkl.next, __ATOMIC_RELAXED),
+            (unsigned)__atomic_load_n(&g_bkl.serving, __ATOMIC_RELAXED));
+    for (uint32_t ci = 0; ci < smp_cpu_count() && ci < MAX_CPUS; ci++) {
+        const struct percpu *pc = smp_cpu(ci);
+        if (!pc || !pc->online) continue;
+        struct proc *cp = pc->current;
+        /* state and cursys_nat as well as cursys: the first version of this
+         * dump printed only the Linux syscall, so a holder sitting in a
+         * NATIVE syscall -- or blocked rather than running -- read as "in no
+         * syscall at all", which is the one ambiguity that matters here. */
+        kprintf("[wdog] cpu%u holds_bkl=%d pid=%d '%s' state=%d "
+                "cursys=%d nat=%d\n",
+                ci, pc->holds_bkl ? 1 : 0,
+                cp ? cp->pid : -1,
+                cp ? cp->name : "(none)",
+                cp ? (int)cp->state : -1,
+                cp ? (int)cp->cursys : -1,
+                cp ? (int)cp->cursys_nat : -1);
+    }
+#ifdef SMP_DIAG
+    /* The acquire that is still outstanding -- see g_bkl_acq_ra. */
+    kprintf("[wdog] last bkl_enter ra=0x%lx pid=%d cpu=%d\n",
+            (unsigned long)g_bkl_acq_ra, g_bkl_acq_pid, g_bkl_acq_cpu);
+    kprintf("[wdog] last DROPPED bkl_exit ra=0x%lx pid=%d cpu=%d\n",
+            (unsigned long)g_bkl_lost_ra, g_bkl_lost_pid, g_bkl_lost_cpu);
+#endif
+}
 
 void bkl_enter(void) {
     struct percpu *me = smp_this_cpu();
@@ -239,7 +316,10 @@ void bkl_enter(void) {
     }
     me->holds_bkl = true;
 #ifdef SMP_DIAG
-    g_bkl_owner = (int)me->cpu_idx;
+    g_bkl_owner   = (int)me->cpu_idx;
+    g_bkl_acq_ra  = (unsigned long)__builtin_return_address(0);
+    g_bkl_acq_pid = me->current ? me->current->pid : -1;
+    g_bkl_acq_cpu = (int)me->cpu_idx;
 #endif
 }
 
@@ -253,6 +333,9 @@ void bkl_exit(void) {
             g_bkl_exit_notheld++;
             g_bkl_mm_owner  = g_bkl_owner;
             g_bkl_mm_caller = (int)me->cpu_idx;
+            g_bkl_lost_ra   = (unsigned long)__builtin_return_address(0);
+            g_bkl_lost_pid  = me->current ? me->current->pid : -1;
+            g_bkl_lost_cpu  = (int)me->cpu_idx;
         }
 #endif
         return;                          /* idempotent: never double-unlock */
