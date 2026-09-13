@@ -488,6 +488,11 @@ echo @@pstat_before
 grep -E '^(cpu |intr |ctxt |btime |processes |procs_running )' /proc/stat | cut -c1-72
 echo @@pstat_work
 i=0; while [ $i -lt 40000 ]; do i=$((i+1)); done; echo "looped $i"
+# Spawn a KNOWN number of processes between the two /proc/stat samples, so
+# the `processes` counter can be checked as a delta like its neighbours
+# rather than against an absolute floor. The loop above is pure shell
+# arithmetic and forks nothing, so without this there is no spawn to count.
+j=0; while [ $j -lt 8 ]; do /bin/true; j=$((j+1)); done; echo "spawned $j"
 echo @@pstat_after
 grep -E '^(cpu |intr |ctxt |btime |processes |procs_running )' /proc/stat | cut -c1-72
 echo @@pstat_loadavg
