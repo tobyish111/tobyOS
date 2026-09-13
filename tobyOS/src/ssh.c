@@ -1584,6 +1584,15 @@ static void ssh_drain_channel_output(void) {
             return;
         }
 
+        /* OUTPUT COUNTS AS LIFE. g_last_client_ns used to advance only
+         * when the CLIENT sent something, so a session that was busy
+         * producing megabytes -- a gate run, a build, anything that takes
+         * a while without a keystroke -- looked silent and was reaped out
+         * from under the user at SSH_PREEMPT_NS. Measured: `/bin/shparity`
+         * over ssh died at 30s, every time, and the console just said
+         * "Connection closed by remote host" with no hint why. Silence
+         * means NO TRAFFIC EITHER WAY. */
+        g_last_client_ns = perf_now_ns();
         if (!ssh_send_channel_data(g_cli, out, (size_t)n)) {
             ssh_close_client();
             return;
@@ -1817,7 +1826,14 @@ static void ssh_service(void) {
      * worker exists. */
     if (g_reap_request) {
         g_reap_request = false;
-        kprintf("[ssh] reaping an idle session for a new connection\n");
+        /* SAY WHICH IT IS. This claimed "for a new connection"
+         * unconditionally, including when the preempt had fired with
+         * nobody waiting at all -- so the single log line that could
+         * have explained a dropped session asserted something false,
+         * which is most of why nobody noticed sessions dying at 30s. */
+        kprintf("[ssh] reaping the session (silent %us -- idle, or "
+                "preempted for a waiting client)\n",
+                (unsigned)(SSH_PREEMPT_NS / 1000000000ull));
         ssh_close_client();
         return;
     }
@@ -1929,12 +1945,28 @@ void ssh_poll(void) {
          * has walked away from. The teardown itself belongs to the worker,
          * so only ask for it here and leave the connection in the backlog
          * -- the next tick accepts it, milliseconds later. */
-        if (!g_reap_request && g_last_client_ns &&
+        /* ONLY PREEMPT FOR SOMEBODY WHO IS ACTUALLY WAITING.
+         *
+         * This used to fire on the silence alone, before anything was
+         * accepted -- so a quiet session was closed even with nobody
+         * wanting the slot, which is the 30-MINUTE idle reap's job (see
+         * SSH_IDLE_REAP_NS in the worker, which is where abandonment is
+         * decided). Thirty seconds was doing a thirty-minute job.
+         *
+         * So: accept first, and only take the slot away from a silent
+         * session when there is a real connection to give it to. The new
+         * connection stays in the backlog and the next tick accepts it,
+         * milliseconds later; the teardown belongs to the worker. */
+        struct tcp_conn *extra = tcp_accept(g_lsn, 0);
+        if (extra && !g_reap_request && g_last_client_ns &&
             perf_now_ns() - g_last_client_ns > SSH_PREEMPT_NS) {
+            tcp_close_nowait(extra);      /* it will reconnect into the slot */
             g_reap_request = true;
+            kprintf("[ssh] preempting a session silent for %us -- another "
+                    "client is waiting\n",
+                    (unsigned)(SSH_PREEMPT_NS / 1000000000ull));
             return;
         }
-        struct tcp_conn *extra = tcp_accept(g_lsn, 0);
         if (extra) {
             static const char busy[] =
                 "SSH-2.0-tobyOS_busy\r\nonly one session at a time\r\n";
