@@ -1770,14 +1770,40 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                  * filters, not just the per-pid lookup, or a container's `ps`
                  * enumerates host processes and then fails to stat them.
                  *
-                 * A reader in the initial namespace is left EXACTLY as before,
-                 * pid 0 included -- pid_vnr_in reports 0 as "not visible", so
-                 * routing the initial namespace through it would have silently
-                 * dropped /proc/0 from the listing. Same reasoning as
-                 * procfs_kpid(). */
+                 * A reader in the initial namespace gets the identity mapping,
+                 * EXCEPT that pid 0 is not listed. Slice 10 left it in
+                 * deliberately, calling its removal "an unrelated behaviour
+                 * change that a pid-namespace slice has no business making".
+                 * This is that change, made on its own.
+                 *
+                 * LINUX HAS NO /proc/0, so `ls /proc` and everything that
+                 * enumerates /proc/[0-9]* omits the scheduler. Ours listed it,
+                 * and busybox `ps` -- which enumerates the directory -- duly
+                 * reported a pid 0 that native `ps -e` already filtered out.
+                 * Neither tool was wrong: both were faithful, and the
+                 * DIRECTORY was the thing diverging from Linux.
+                 *
+                 * Caught on the real EliteDesk. The distro gate's "busybox ps
+                 * sees the same set" check compares the two listings and
+                 * tolerates 3 differing pids for the snapshots' own
+                 * transients; on hardware the transients reached 3 and this
+                 * constant pushed it to 4. In QEMU the count had been sitting
+                 * at exactly 1 -- pid 0 and nothing else -- for the life of
+                 * the check, green throughout. etc/distro_test.sh has stated
+                 * the intended behaviour since it was written: "pid 0 is
+                 * deliberately NOT here: Linux `ps -e` omits the scheduler
+                 * (pid 0) and busybox ps agrees."
+                 *
+                 * ONLY THE LISTING CHANGES. A direct /proc/0/... lookup still
+                 * resolves as before: that path is procfs_kpid() and its
+                 * thirteen call sites, nothing in the tree reads it, and it is
+                 * already half-formed (there is no /proc/0/stat). Whether to
+                 * remove it outright is a separate question from the
+                 * enumeration parity this fixes. */
                 int vp;
                 if (!me || !me->pid_ns) {
                     vp = g_proc[i].pid;
+                    if (vp == 0) continue;
                 } else {
                     vp = pid_vnr_in(me->pid_ns, g_proc[i].pid);
                     if (!vp) continue;
