@@ -131,45 +131,34 @@ void *sbrk(long inc) {
  *
  * Bypasses atexit handlers (see exit() in stdlib.c for the full path). */
 
-/* DEBUG (M25C): trace each _exit() call with caller RIP + code so we
- * can pin down a mystery exit(2) coming out of the env test program.
- * Uses raw write() so no stdio buffering can swallow the line. */
-static void __toby_exit_trace(int code, void *caller) {
-    char buf[80];
-    static const char hex[] = "0123456789abcdef";
-    int  i = 0;
-    buf[i++] = '[';  buf[i++] = '_';  buf[i++] = 'e'; buf[i++] = 'x';
-    buf[i++] = 'i';  buf[i++] = 't';  buf[i++] = ']';
-    buf[i++] = ' ';  buf[i++] = 'c';  buf[i++] = 'o'; buf[i++] = 'd';
-    buf[i++] = 'e';  buf[i++] = '=';
-    /* Decimal code (handles negative). */
-    int c = code;
-    if (c < 0) { buf[i++] = '-'; c = -c; }
-    char tmp[12]; int ti = 0;
-    if (c == 0) { tmp[ti++] = '0'; }
-    while (c) { tmp[ti++] = (char)('0' + (c % 10)); c /= 10; }
-    while (ti) buf[i++] = tmp[--ti];
-    buf[i++] = ' '; buf[i++] = 'c'; buf[i++] = 'a'; buf[i++] = 'l';
-    buf[i++] = 'l'; buf[i++] = 'e'; buf[i++] = 'r'; buf[i++] = '=';
-    buf[i++] = '0'; buf[i++] = 'x';
-    unsigned long p = (unsigned long)(uintptr_t)caller;
-    for (int s = 60; s >= 0; s -= 4) {
-        buf[i++] = hex[(p >> s) & 0xf];
-    }
-    buf[i++] = '\n';
-    /* Direct write to fd=2 (stderr); ignore failures. */
-    (void)toby_sc3(ABI_SYS_WRITE, 2, (long)(uintptr_t)buf, (long)i);
-}
-
+/* THE M25C EXIT TRACE IS GONE (2026-09-13).
+ *
+ * It wrote "[_exit] code=<n> caller=0x<rip>" to fd 2 on every _exit(), to
+ * pin down one mystery exit(2) coming out of the env test program. That
+ * question was answered long ago; the line outlived it and became a tax on
+ * every harness in the tree.
+ *
+ * It fired precisely when stderr was NOT a tty -- which is the definition
+ * of a captured stream, so it polluted exactly the transcripts that get
+ * compared and never the screen where a human might have noticed it. Its
+ * own comment claimed it stayed "for captured streams (harnesses read
+ * it)", and no harness ever read it: programs/oilspec/main.c skips the
+ * line in two places, and logs/kernstrip.sh strips it for both distro
+ * gates. Three filters, zero consumers.
+ *
+ * It also cost a real verdict. On the real EliteDesk the shred section
+ * graded FAIL with
+ *
+ *     ...|/tmp/shr: removed|[_exit] code=0 caller=0x4070a4|gone|
+ *
+ * against an expectation identical but for that middle field. A diagnostic
+ * that no one reads, which corrupts the streams that ARE read, is not a
+ * diagnostic -- it is noise with a build dependency. Filtering it in three
+ * places was the wrong repair; not emitting it is the right one.
+ *
+ * (oilspec's two filters are left alone: they cost nothing and still guard
+ * against a stale binary built before this commit.) */
 void _exit(int code) {
-    /* The trace stays for captured streams (harnesses read it), but NOT on
-     * a terminal: a byte-compared pty transcript -- or a human's screen --
-     * should not end with harness chatter. TCGETS succeeding on fd 2 means
-     * stderr is a tty. */
-    char tio_probe[64];
-    if (toby_sc3(ABI_SYS_IOCTL, 2, 0x5401 /* TCGETS */,
-                 (long)(uintptr_t)tio_probe) < 0)
-        __toby_exit_trace(code, __builtin_return_address(0));
     toby_sc1(ABI_SYS_EXIT, code);
     for (;;) { __asm__ volatile ("hlt"); }   /* unreachable */
 }
