@@ -18853,6 +18853,51 @@ static int shell_copy_segment(char *dst, size_t cap,
     return 0;
 }
 
+/* A COMPOUND COMMAND'S BODY, ON THE HEAP.
+ *
+ * while/until/for/if and friends used to copy their condition and body into
+ * `char body[LINE_MAX]` on the STACK, and LINE_MAX is 512. Anything longer
+ * was refused outright -- "while: command too long" -- before the first
+ * iteration.
+ *
+ * 512 is not a defensible number. POSIX requires LINE_MAX to be at least
+ * 2048, so the shell sat under the mandated floor, and bash has no limit
+ * here at all. A dozen ordinary lines inside a loop exceeds it.
+ *
+ * It was found because logs/edordinary.sh -- the measurement the
+ * native-parity handoff names for the real-hardware wedge -- had NEVER RUN
+ * AN ITERATION. Its loop is 755 bytes, so on the box it printed that one
+ * line, reported ORDINARY-DONE 0, and still exited 0. The handoff had been
+ * recommending it for ten days.
+ *
+ * THE STACK IS WHY IT WAS SMALL, so the fix is to stop using the stack
+ * rather than to raise the constant. Those buffers are per-frame and
+ * compounds NEST: an `if` frame carries three of them, and the in-kernel
+ * shell runs on a 32 KiB kernel stack (PROC_KSTACK_SZ), so raising
+ * LINE_MAX to 4 KiB would have put 12 KiB on it per nesting level. The
+ * same reasoning is already written down beside SHELL_ARG_MAX ("the real
+ * fix is a heap-grown argv, and this is the step before it") and
+ * SHELL_HEREDOC_BODY_MAX ("Heap, not stack"). Heap costs nothing per frame
+ * and is identical in both builds -- shell.c compiles twice, into the
+ * kernel and as /bin/tsh, and the stack budgets differ.
+ *
+ * 16 KiB: eight times the POSIX floor and twice the hosted
+ * SHELL_PARSE_BUF_MAX, which the file's own note calls enough for the Oils
+ * corpus. It is deliberately not the 64 KiB a heredoc gets: one heredoc is
+ * live at a time, whereas nesting multiplies this. Returns NULL if the
+ * segment does not fit or the allocation fails; the caller reports it. */
+#define SHELL_COMPOUND_BODY_MAX (16 * 1024)
+
+static char *shell_dup_segment(const char *start, const char *end) {
+    char *buf = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
+    if (!buf) return 0;
+    if (shell_copy_segment(buf, SHELL_COMPOUND_BODY_MAX, start, end) < 0) {
+        kfree(buf);
+        return 0;
+    }
+    return buf;
+}
+
 static bool shell_word_boundary_before(const char *start, const char *p);
 
 static bool shell_is_word_end(char c) {
@@ -19900,29 +19945,43 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
-    char list[LINE_MAX];
-    char body[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). Besides lifting the
+     * 512-byte cap, this takes 1 KiB off a frame the note below already
+     * records as having overflowed the stack once. */
+    char *list = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
+    char *body = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
+    if (!list || !body) {
+        kfree(list); kfree(body);
+        kprintf("for: out of memory\n"); shell_set_status(2); return true;
+    }
+    list[0] = '\0';
     if (implicit_at) {
         size_t lpos = 0;
         for (int i = 0; i < g_positional_count; i++) {
-            if (i > 0 && shell_append_char(list, &lpos, sizeof(list), ' ') < 0) {
+            if (i > 0 && shell_append_char(list, &lpos,
+                                           SHELL_COMPOUND_BODY_MAX, ' ') < 0) {
+                kfree(list); kfree(body);
                 kprintf("for: list too long\n"); shell_set_status(2); return true;
             }
-            if (shell_append_str(list, &lpos, sizeof(list), g_positional[i]) < 0) {
+            if (shell_append_str(list, &lpos, SHELL_COMPOUND_BODY_MAX,
+                                 g_positional[i]) < 0) {
+                kfree(list); kfree(body);
                 kprintf("for: list too long\n"); shell_set_status(2); return true;
             }
         }
         list[lpos] = '\0';
     } else {
-        if (shell_copy_segment(list, sizeof(list), s, do_at) < 0) {
+        if (shell_copy_segment(list, SHELL_COMPOUND_BODY_MAX, s, do_at) < 0) {
+            kfree(list); kfree(body);
             kprintf("for: command too long\n");
             shell_set_status(2);
             return true;
         }
     }
     unsigned long body_line = shell_lineno_body(do_end);
-    if (shell_copy_segment(body, sizeof(body), do_end,
+    if (shell_copy_segment(body, SHELL_COMPOUND_BODY_MAX, do_end,
                            done_at) < 0) {
+        kfree(list); kfree(body);
         kprintf("for: command too long\n");
         shell_set_status(2);
         return true;
@@ -19938,6 +19997,7 @@ static bool shell_try_for_command(const char *src) {
     if (shell_parse_compound_redirs(done_end,
                                     &tail_redirs, tail_paths,
                                     sizeof(tail_paths), "for") < 0) {
+        kfree(list); kfree(body);
         shell_set_status(2);
         return true;
     }
@@ -19958,6 +20018,7 @@ static bool shell_try_for_command(const char *src) {
     bool io_active = false;
     if (tail_redirs.redir_count > 0) {
         if (shell_enter_io_frame(&tail_redirs, "for", &io_frame) < 0) {
+            kfree(list); kfree(body);
             shell_set_status(1);
             return true;
         }
@@ -19969,6 +20030,7 @@ static bool shell_try_for_command(const char *src) {
     int ntok = 0;
     if (shell_tokenize(list, tok, &ntok, words, sizeof(words)) < 0) {
         if (io_active) shell_restore_io_frame(&io_frame);
+        kfree(list); kfree(body);
         shell_set_status(2);
         return true;
     }
@@ -19991,6 +20053,7 @@ static bool shell_try_for_command(const char *src) {
         if (wl) kfree(wl);
         if (items) kfree(items);
         if (io_active) shell_restore_io_frame(&io_frame);
+        kfree(list); kfree(body);
         kprintf("for: out of memory expanding list\n");
         shell_set_status(2);
         return true;
@@ -20010,6 +20073,7 @@ static bool shell_try_for_command(const char *src) {
                 shell_add_one_arg(wl, items, saved, true) < 0) {
                 kfree(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
+                kfree(list); kfree(body);
                 shell_set_status(2);
                 return true;
             }
@@ -20021,6 +20085,7 @@ static bool shell_try_for_command(const char *src) {
                                  tok[i].expanded, tok[i].assign_src) < 0) {
                 kfree(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
+                kfree(list); kfree(body);
                 shell_set_status(2);
                 return true;
             }
@@ -20081,6 +20146,8 @@ done:
     if (io_active) shell_restore_io_frame(&io_frame);
     kfree(wl);
     kfree(items);
+    kfree(list);
+    kfree(body);
     if (set_last) shell_set_status(last);
     return true;
 }
@@ -20115,12 +20182,15 @@ static bool shell_try_while_command(const char *src) {
         return true;
     }
 
-    char cond[LINE_MAX];
-    char body[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). 512 bytes of loop body is
+     * under the POSIX LINE_MAX floor, and it made logs/edordinary.sh a
+     * silent no-op for ten days. */
+    char *cond = shell_dup_segment(s, do_at);
+    char *body = shell_dup_segment(do_end, done_at);
     unsigned long body_line = shell_lineno_body(do_end);
-    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_end,
-                           done_at) < 0) {
+    if (!cond || !body) {
+        kfree(cond);
+        kfree(body);
         kprintf("while: command too long\n");
         shell_set_status(2);
         return true;
@@ -20136,6 +20206,8 @@ static bool shell_try_while_command(const char *src) {
     if (tail_redirs.redir_count > 0) {
         if (shell_enter_io_frame(&tail_redirs, "while", &io_frame) < 0) {
             g_shell_loop_depth--;
+            kfree(cond);
+            kfree(body);
             shell_set_status(1);
             return true;
         }
@@ -20205,6 +20277,8 @@ static bool shell_try_while_command(const char *src) {
 done:
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
+    kfree(cond);
+    kfree(body);
     if (overrun) {
         kprintf("while: iteration limit reached\n");
         shell_set_status(2);
@@ -20244,12 +20318,13 @@ static bool shell_try_until_command(const char *src) {
         return true;
     }
 
-    char cond[LINE_MAX];
-    char body[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). */
+    char *cond = shell_dup_segment(s, do_at);
+    char *body = shell_dup_segment(do_end, done_at);
     unsigned long body_line = shell_lineno_body(do_end);
-    if (shell_copy_segment(cond, sizeof(cond), s, do_at) < 0 ||
-        shell_copy_segment(body, sizeof(body), do_end,
-                           done_at) < 0) {
+    if (!cond || !body) {
+        kfree(cond);
+        kfree(body);
         kprintf("until: command too long\n");
         shell_set_status(2);
         return true;
@@ -20265,6 +20340,8 @@ static bool shell_try_until_command(const char *src) {
     if (tail_redirs.redir_count > 0) {
         if (shell_enter_io_frame(&tail_redirs, "until", &io_frame) < 0) {
             g_shell_loop_depth--;
+            kfree(cond);
+            kfree(body);
             shell_set_status(1);
             return true;
         }
@@ -20338,6 +20415,8 @@ static bool shell_try_until_command(const char *src) {
 done:
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
+    kfree(cond);
+    kfree(body);
     if (overrun) {
         kprintf("until: iteration limit reached\n");
         shell_set_status(2);
