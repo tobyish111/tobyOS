@@ -19821,8 +19821,13 @@ static bool shell_try_if_command(const char *src) {
         const char *branch_at = shell_find_elif_else(after_then, fi_at,
                                                      &branch_end, &is_elif);
 
-        char cond[LINE_MAX];
-        if (shell_copy_segment(cond, sizeof(cond), cond_start, then_at) < 0) {
+        /* Heap, not stack -- see shell_dup_segment(). An `if` frame carried
+         * THREE of these, more than any other construct, which is why
+         * raising LINE_MAX would have been worst here. Each one is dead the
+         * moment its execute_line_text() returns, so it is freed there
+         * rather than at every exit below. */
+        char *cond = shell_dup_segment(cond_start, then_at);
+        if (!cond) {
             kprintf("if: condition too long\n");
             shell_set_status(2);
             return true;
@@ -19833,12 +19838,13 @@ static bool shell_try_if_command(const char *src) {
         g_errexit_suspend++;
         execute_line_text(cond);
         g_errexit_suspend--;
+        kfree(cond);
         if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
         if (g_last_status == 0) {
-            char yes[LINE_MAX];
             const char *body_end = branch_at ? branch_at : fi_at;
-            if (shell_copy_segment(yes, sizeof(yes), after_then, body_end) < 0) {
+            char *yes = shell_dup_segment(after_then, body_end);
+            if (!yes) {
                 kprintf("if: body too long\n");
                 shell_set_status(2);
                 return true;
@@ -19850,6 +19856,7 @@ static bool shell_try_if_command(const char *src) {
                 execute_line_text(yes);
                 g_shell_lineno = ln_save;
             }
+            kfree(yes);
             return true;
         }
 
@@ -19859,9 +19866,9 @@ static bool shell_try_if_command(const char *src) {
         }
 
         if (!is_elif) {
-            char no[LINE_MAX];
             const char *else_body = branch_end;
-            if (shell_copy_segment(no, sizeof(no), else_body, fi_at) < 0) {
+            char *no = shell_dup_segment(else_body, fi_at);
+            if (!no) {
                 kprintf("if: else body too long\n");
                 shell_set_status(2);
                 return true;
@@ -19873,6 +19880,7 @@ static bool shell_try_if_command(const char *src) {
                 execute_line_text(no);
                 g_shell_lineno = ln_save;
             }
+            kfree(no);
             return true;
         }
 
@@ -20634,14 +20642,17 @@ static bool shell_try_case_command(const char *src) {
     }
     if (shell_compound_tail_redirs(src, esac_at + 4, "case")) return true;
 
-    char word_src[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). Dead once expanded. */
+    char *word_src = shell_dup_segment(s, in_at);
     char word[SHELL_PARSE_BUF_MAX];
-    if (shell_copy_segment(word_src, sizeof(word_src), s, in_at) < 0 ||
+    if (!word_src ||
         shell_expand_case_word(word_src, word, sizeof(word)) < 0) {
+        kfree(word_src);
         kprintf("case: word too long\n");
         shell_set_status(2);
         return true;
     }
+    kfree(word_src);
 
     const char *p = shell_skip_blanks(in_at + 2);
     if (*p == ';') p++;
@@ -20681,9 +20692,12 @@ static bool shell_try_case_command(const char *src) {
         if (!sep || sep > esac_at) sep = esac_at;
 
         char pats[128];
-        char body_text[LINE_MAX];
-        if (shell_copy_segment(pats, sizeof(pats), p, close) < 0 ||
-            shell_copy_segment(body_text, sizeof(body_text), body, sep) < 0) {
+        /* Heap, not stack -- see shell_dup_segment(). A clause body is
+         * re-allocated per clause and dead at the end of the iteration. */
+        char *body_text = shell_dup_segment(body, sep);
+        if (!body_text ||
+            shell_copy_segment(pats, sizeof(pats), p, close) < 0) {
+            kfree(body_text);
             kprintf("case: clause too long\n");
             shell_set_status(2);
             return true;
@@ -20692,10 +20706,12 @@ static bool shell_try_case_command(const char *src) {
         if (!matched && shell_case_pattern_match(pats, word)) {
             matched = true;
             execute_line_text(body_text);
+            kfree(body_text);
             last = g_last_status;
             shell_set_status(last);
             return true;
         }
+        kfree(body_text);
 
         p = (sep < esac_at) ? sep + 2 : esac_at;
     }
@@ -20842,9 +20858,11 @@ static bool shell_try_function_definition(const char *src) {
     }
 
     char name[64];
-    char body[LINE_MAX];
-    if (name_len == 0 || name_len + 1 > sizeof(name) ||
-        shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+    /* Heap, not stack -- see shell_dup_segment(). shell_function_set()
+     * strdup()s the text, so this is freed on every path below. */
+    char *body = shell_dup_segment(body_start, body_end);
+    if (name_len == 0 || name_len + 1 > sizeof(name) || !body) {
+        kfree(body);
         kprintf("function: definition too long\n");
         shell_set_status(2);
         return true;
@@ -20864,11 +20882,14 @@ static bool shell_try_function_definition(const char *src) {
     {
         const char *tail = shell_skip_blanks(body_end + 1);
         if (*tail && *tail != ';' && *tail != '&' && *tail != '|') {
-            char wrapped[LINE_MAX];
-            int wn = ksnprintf(wrapped, sizeof wrapped, "{ %s; } %s",
-                               body, tail);
-            if (wn > 0 && (size_t)wn < sizeof wrapped)
-                memcpy(body, wrapped, (size_t)wn + 1);
+            char *wrapped = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
+            if (wrapped) {
+                int wn = ksnprintf(wrapped, SHELL_COMPOUND_BODY_MAX,
+                                   "{ %s; } %s", body, tail);
+                if (wn > 0 && (size_t)wn < SHELL_COMPOUND_BODY_MAX)
+                    memcpy(body, wrapped, (size_t)wn + 1);
+                kfree(wrapped);
+            }
         }
     }
 
@@ -20878,12 +20899,14 @@ static bool shell_try_function_definition(const char *src) {
      *
      * tsh stored the text and validated nothing until the call, so a function
      * that is defined and never called hid its own syntax error completely. */
-    if (!shell_line_syntax_ok(body)) return true;
+    if (!shell_line_syntax_ok(body)) { kfree(body); return true; }
     if (shell_function_set(name, body) < 0) {
+        kfree(body);
         kprintf("function: failed to define '%s'\n", name);
         shell_set_status(1);
         return true;
     }
+    kfree(body);
     shell_set_status(0);
     return true;
 }
@@ -21211,11 +21234,13 @@ static bool shell_try_subshell_command(const char *src) {
         return true;
     }
 
-    char body[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). */
+    char *body = shell_dup_segment(body_start, body_end);
     unsigned long body_line = shell_lineno_body(body_start);
-    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+    if (!body) {
         kprintf("subshell: body too long\n");
         shell_set_status(2);
+        kfree(body);
         return true;
     }
 
@@ -21239,6 +21264,7 @@ static bool shell_try_subshell_command(const char *src) {
             kprintf("subshell: can't be backgrounded in the kernel shell\n");
             shell_set_status(1);
 #endif
+            kfree(body);
             return true;
         }
     }
@@ -21256,6 +21282,7 @@ static bool shell_try_subshell_command(const char *src) {
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
+            kfree(body);
             return true;
         }
         int i = 0;
@@ -21264,12 +21291,14 @@ static bool shell_try_subshell_command(const char *src) {
             pl.stage[0].argc != 0) {
             kprintf("subshell: expected only redirections after ')'\n");
             shell_parse_error();
+            kfree(body);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
         if (sep != SH_TOK_SEMI || i < ntok) {
             kprintf("subshell: unexpected text after redirection\n");
             shell_set_status(2);
+            kfree(body);
             return true;
         }
         redirs = pl.stage[0];
@@ -21279,6 +21308,7 @@ static bool shell_try_subshell_command(const char *src) {
     if (shell_subshell_frame_capture(&state) < 0) {
         kprintf("subshell: failed to save shell state\n");
         shell_set_status(1);
+        kfree(body);
         return true;
     }
 
@@ -21288,6 +21318,7 @@ static bool shell_try_subshell_command(const char *src) {
         if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
             shell_subshell_frame_restore(&state);
             shell_set_status(1);
+            kfree(body);
             return true;
         }
         io_active = true;
@@ -21315,6 +21346,7 @@ static bool shell_try_subshell_command(const char *src) {
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
+    kfree(body);
     return true;
 }
 
@@ -21372,11 +21404,13 @@ static bool shell_try_group_command(const char *src) {
         return true;
     }
 
-    char body[LINE_MAX];
+    /* Heap, not stack -- see shell_dup_segment(). */
+    char *body = shell_dup_segment(body_start, body_end);
     unsigned long body_line = shell_lineno_body(body_start);
-    if (shell_copy_segment(body, sizeof(body), body_start, body_end) < 0) {
+    if (!body) {
         kprintf("group: body too long\n");
         shell_set_status(2);
+        kfree(body);
         return true;
     }
 
@@ -21400,6 +21434,7 @@ static bool shell_try_group_command(const char *src) {
             kprintf("group: can't be backgrounded in the kernel shell\n");
             shell_set_status(1);
 #endif
+            kfree(body);
             return true;
         }
     }
@@ -21417,6 +21452,7 @@ static bool shell_try_group_command(const char *src) {
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
+            kfree(body);
             return true;
         }
         int i = 0;
@@ -21425,12 +21461,14 @@ static bool shell_try_group_command(const char *src) {
             pl.stage[0].argc != 0) {
             kprintf("group: expected only redirections after '}'\n");
             shell_parse_error();
+            kfree(body);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
         if (sep != SH_TOK_SEMI || i < ntok) {
             kprintf("group: unexpected text after redirection\n");
             shell_set_status(2);
+            kfree(body);
             return true;
         }
         redirs = pl.stage[0];
@@ -21441,6 +21479,7 @@ static bool shell_try_group_command(const char *src) {
     if (redirs.redir_count > 0) {
         if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
             shell_set_status(1);
+            kfree(body);
             return true;
         }
         io_active = true;
@@ -21456,6 +21495,7 @@ static bool shell_try_group_command(const char *src) {
     int rc = g_last_status;
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_set_status(rc);
+    kfree(body);
     return true;
 }
 
