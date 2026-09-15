@@ -968,6 +968,19 @@ rm -f /tmp/cron_out
 printf 'x * * * * true\n' | /bin/crontab - 2>&1; echo rc=$?
 printf '# a comment\nSHELL=/bin/tsh\n* * * * * echo tick >> /tmp/cron_out\n@reboot echo boot >> /tmp/cron_out\n' | /bin/crontab -; echo rc=$?
 /bin/crontab -l | grep -c .
+# `tick` is the event this gate can actually wait for. @reboot is NOT: it
+# fires when cron STARTS, at boot, not when a crontab is installed -- which
+# is what Linux does too. Measured on the real box at 1h22m uptime:
+# installing this exact table and waiting 100 s gives tick=1, boot=0, every
+# time. Only the FIRST cron run after a reboot can see boot=1.
+#
+# That collides with hwgate being re-runnable inside one boot. It showed up
+# as two failures in six consecutive hardware runs, and the rounds that
+# "passed" were worse than the ones that failed: the previous round's
+# @reboot job landing late, in the file this round had just recreated. So
+# the count below is graded as 0-or-1 (see logs/distrochecks.sh) rather
+# than asserted, and the tick -- the part that proves cron SCHEDULES -- is
+# still waited for and still asserted.
 i=0; while [ $i -lt 70 ] && ! grep -q tick /tmp/cron_out 2>/dev/null; do sleep 1; i=$((i+1)); done
 grep -c tick /tmp/cron_out; grep -c boot /tmp/cron_out
 /bin/crontab -r; echo rc=$?
