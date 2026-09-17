@@ -12894,6 +12894,131 @@ static int shell_expand_backtick(const char **pp, char *buf,
 static int shell_expand_var(const char **pp, char *buf, size_t *pos,
                             size_t cap);
 
+/* ONE decoder for a $'...' escape, because there were TWO and they have now
+ * diverged three separate times.
+ *
+ * The copies sat in the ${...} expansion path and in the ordinary-word path.
+ * The first divergence was \nnn octal: fixed in one, missed in the other, so
+ * `$'\1'` came out as the letter 1 in ordinary words (2395001). The second
+ * copy then grew a comment saying "THIS IS THE SECOND COPY OF THIS DECODER"
+ * -- and diverged again anyway. Measured 2026-09-17 against the Oils case
+ * "printf - literal NUL in format string" (1880), the word-path copy was
+ * missing THREE escapes the other had: \E, \u/\U and \c. `$'x\U0z'` printed
+ * `xU0z` where bash prints `x`.
+ *
+ * A comment naming the duplication did not stop the duplication drifting.
+ * One function does.
+ *
+ * `*pp` points AT the character after the backslash and is advanced past the
+ * escape. Returns the number of bytes written to out[] (1..4). A return of 1
+ * with out[0] == 0 is a REAL NUL -- callers end the word there, because the
+ * word is a C string and so is the filename it becomes. */
+static int shell_ansic_escape(const char **pp, char out[4]) {
+    const char *p = *pp;
+    unsigned char c;
+    switch (*p) {
+    case 'a': c = '\a'; p++; break;
+    case 'b': c = '\b'; p++; break;
+    case 'e': case 'E': c = 0x1B; p++; break;
+    case 'f': c = '\f'; p++; break;
+    case 'n': c = '\n'; p++; break;
+    case 'r': c = '\r'; p++; break;
+    case 't': c = '\t'; p++; break;
+    case 'v': c = '\v'; p++; break;
+    case '\\': c = '\\'; p++; break;
+    case '\'': c = '\''; p++; break;
+    case '"':  c = '"';  p++; break;
+    case '0': case '1': case '2': case '3':
+    case '4': case '5': case '6': case '7': {
+        /* \nnn: ONE TO THREE octal digits, the first any of 0-7. Measured
+         * against bash: \1 is byte 01, \111 is 'I', \377 is 0xff, and \0377
+         * is 0x1f followed by a literal '7' -- three digits TOTAL, with no
+         * leading-zero prefix rule. */
+        int v = 0, cnt = 0;
+        while (cnt < 3 && *p >= '0' && *p <= '7') { v = v * 8 + (*p++ - '0'); cnt++; }
+        c = (unsigned char)v;
+        break;
+    }
+    case 'x': {
+        p++;
+        int v = 0, cnt = 0;
+        while (cnt < 2) {
+            int d = -1;
+            if (*p >= '0' && *p <= '9') d = *p - '0';
+            else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+            else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+            if (d < 0) break;
+            v = v * 16 + d; p++; cnt++;
+        }
+        c = (unsigned char)v;
+        break;
+    }
+    case 'u': case 'U': {
+        /* \uHHHH / \UHHHHHHHH: a code point, written as UTF-8. U+0000 is a
+         * NUL and ends the word like any other; with no digits at all the
+         * backslash and the letter both stand, as in bash. */
+        int maxd = (*p == 'u') ? 4 : 8;
+        const char *q = p + 1;
+        unsigned long cp = 0; int cnt = 0;
+        while (cnt < maxd) {
+            int d = -1;
+            if (*q >= '0' && *q <= '9') d = *q - '0';
+            else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
+            else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
+            if (d < 0) break;
+            cp = cp * 16 + (unsigned long)d; q++; cnt++;
+        }
+        if (cnt == 0) { out[0] = '\\'; out[1] = *p; *pp = p + 1; return 2; }
+        p = q;
+        if (cp == 0)          { out[0] = 0; *pp = p; return 1; }
+        if (cp < 0x80)        { out[0] = (char)cp; *pp = p; return 1; }
+        if (cp < 0x800) {
+            out[0] = (char)(0xC0 | (cp >> 6));
+            out[1] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 2;
+        }
+        if (cp < 0x10000) {
+            out[0] = (char)(0xE0 | (cp >> 12));
+            out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[2] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 3;
+        }
+        out[0] = (char)(0xF0 | ((cp >> 18) & 0x07));
+        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 4;
+    }
+    case 'c': {
+        /* \cX: the control character for X.
+         *
+         * THE CLOSING QUOTE WINS. bash does not let \c swallow the ' that
+         * ends the $'...' string. Measured against bash 5.2 through the
+         * Oils case "\c' is an escape, unlike bash" (2055):
+         *
+         *     echo -n $'\c'' | od        bash: SYNTAX ERROR, exit 2
+         *
+         * because `$'\c'` ends at that quote and the next ' opens a string
+         * nothing closes. Letting \c take the quote instead produced the
+         * byte 0x27 ^ 0x40 = 'g' and a happy exit 0 -- a clean-looking
+         * answer to a line bash refuses to run. mksh and ksh do treat it as
+         * an escape; the corpus case exists to say bash does not, and bash
+         * is this shell's oracle. */
+        if (p[1] == '\'') { c = 'c'; p++; break; }
+        p++;
+        if (*p) {
+            char x = *p++;
+            if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
+            c = (unsigned char)(x ^ 0x40);
+        } else {
+            c = '\\';
+        }
+        break;
+    }
+    default: c = (unsigned char)*p++; break;
+    }
+    out[0] = (char)c;
+    *pp = p;
+    return 1;
+}
+
 static bool shell_var_start(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
 }
@@ -13239,98 +13364,10 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 if (c == '\\' && p[1]) {
                     p++;
                     esc = true;
-                    switch (*p) {
-                    case 'a': c = '\a'; p++; break;
-                    case 'b': c = '\b'; p++; break;
-                    case 'e': case 'E': c = 0x1B; p++; break;
-                    case 'f': c = '\f'; p++; break;
-                    case 'n': c = '\n'; p++; break;
-                    case 'r': c = '\r'; p++; break;
-                    case 't': c = '\t'; p++; break;
-                    case 'v': c = '\v'; p++; break;
-                    case '\\': c = '\\'; p++; break;
-                    case '\'': c = '\''; p++; break;
-                    case '"': c = '"'; p++; break;
-                    case '?': c = '?'; p++; break;
-                    case '0': case '1': case '2': case '3':
-                    case '4': case '5': case '6': case '7': {
-                        /* \nnn: ONE TO THREE octal digits, the first any of
-                         * 0-7 -- $'\1' is byte 1 and $'\377' byte 255, as in
-                         * bash. Only \0nnn was read here before, so $'\1'
-                         * came out as the letter 1. */
-                        int v = 0, cnt = 0;
-                        while (cnt < 3 && *p >= '0' && *p <= '7') {
-                            v = v * 8 + (*p++ - '0'); cnt++;
-                        }
-                        c = (char)v;
-                        break;
-                    }
-                    case 'x': {
-                        p++;
-                        int v = 0, cnt = 0;
-                        while (cnt < 2) {
-                            int d = -1;
-                            if (*p >= '0' && *p <= '9') d = *p - '0';
-                            else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
-                            else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
-                            if (d < 0) break;
-                            v = v * 16 + d; p++; cnt++;
-                        }
-                        c = (char)v;
-                        break;
-                    }
-                    case 'u': case 'U': {
-                        /* \uHHHH / \UHHHHHHHH: a code point, written as
-                         * UTF-8. U+0000 is a NUL and ends the word like any
-                         * other; with no digits at all the backslash and
-                         * letter stand, as in bash. */
-                        int maxd = (*p == 'u') ? 4 : 8;
-                        const char *q = p + 1;
-                        unsigned long cp = 0; int cnt = 0;
-                        while (cnt < maxd) {
-                            int d = -1;
-                            if (*q >= '0' && *q <= '9') d = *q - '0';
-                            else if (*q >= 'a' && *q <= 'f') d = *q - 'a' + 10;
-                            else if (*q >= 'A' && *q <= 'F') d = *q - 'A' + 10;
-                            if (d < 0) break;
-                            cp = cp * 16 + (unsigned long)d; q++; cnt++;
-                        }
-                        if (cnt == 0) {
-                            ub[0] = '\\'; ub[1] = *p; un = 2; p++;
-                            break;
-                        }
-                        p = q;
-                        if (cp == 0) { c = 0; break; }
-                        if (cp < 0x80) { ub[0] = (char)cp; un = 1; }
-                        else if (cp < 0x800) {
-                            ub[0] = (char)(0xC0 | (cp >> 6));
-                            ub[1] = (char)(0x80 | (cp & 0x3F)); un = 2;
-                        } else if (cp < 0x10000) {
-                            ub[0] = (char)(0xE0 | (cp >> 12));
-                            ub[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                            ub[2] = (char)(0x80 | (cp & 0x3F)); un = 3;
-                        } else {
-                            ub[0] = (char)(0xF0 | ((cp >> 18) & 0x07));
-                            ub[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-                            ub[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-                            ub[3] = (char)(0x80 | (cp & 0x3F)); un = 4;
-                        }
-                        break;
-                    }
-                    case 'c': {
-                        /* \cX: the control character for X */
-                        p++;
-                        if (*p) {
-                            char x = *p++;
-                            if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
-                            c = (char)(x ^ 0x40);
-                        } else {
-                            c = '\\';
-                        }
-                        break;
-                    }
-                    default: c = *p++; break;
-                    }
+                    /* ONE decoder, shared with the ordinary-word path --
+                     * see shell_ansic_escape(). */
+                    int n = shell_ansic_escape(&p, ub);
+                    if (n == 1) c = ub[0]; else un = n;
                 } else {
                     p++;
                 }
@@ -15538,59 +15575,13 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 while (*p && *p != '\'') {
                     if (*p == '\\' && p[1]) {
                         p++;
-                        char c = 0;
-                        switch (*p) {
-                        case 'a': c = '\a'; p++; break;
-                        case 'b': c = '\b'; p++; break;
-                        case 'e': c = 0x1B; p++; break;
-                        case 'f': c = '\f'; p++; break;
-                        case 'n': c = '\n'; p++; break;
-                        case 'r': c = '\r'; p++; break;
-                        case 't': c = '\t'; p++; break;
-                        case 'v': c = '\v'; p++; break;
-                        case '\\': c = '\\'; p++; break;
-                        case '\'': c = '\''; p++; break;
-                        case '"': c = '"'; p++; break;
-                        case '0': case '1': case '2': case '3':
-                        case '4': case '5': case '6': case '7': {
-                            /* \nnn: ONE TO THREE octal digits, the first any
-                             * of 0-7. Measured against bash: \1 is byte 01,
-                             * \111 is 'I', \377 is 0xff, and \0377 is 0x1f
-                             * followed by a literal '7' -- three digits TOTAL,
-                             * with no leading-zero prefix rule.
-                             *
-                             * THIS IS THE SECOND COPY OF THIS DECODER. The
-                             * one in the ${...} path was fixed for exactly
-                             * this, with a comment saying so; this one still
-                             * read only \0nnn, so $'\1' came out as the
-                             * letter 1 in ordinary words. The gate could not
-                             * tell, because both Oils cases that cover it
-                             * pipe through `od -A n -c`, and od was treating
-                             * the "n" as a filename and failing for bash and
-                             * tsh alike. */
-                            int v = 0, cnt = 0;
-                            while (cnt < 3 && *p >= '0' && *p <= '7') {
-                                v = v * 8 + (*p++ - '0'); cnt++;
-                            }
-                            c = (char)v;
-                            break;
-                        }
-                        case 'x': {
-                            p++;
-                            int v = 0, cnt = 0;
-                            while (cnt < 2) {
-                                int d = -1;
-                                if (*p >= '0' && *p <= '9') d = *p - '0';
-                                else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
-                                else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
-                                if (d < 0) break;
-                                v = v * 16 + d; p++; cnt++;
-                            }
-                            c = (char)v;
-                            break;
-                        }
-                        default: c = *p++; break;
-                        }
+                        /* ONE decoder, shared with the ${...} path -- see
+                         * shell_ansic_escape(). These two copies had drifted
+                         * apart three times; this one was missing \E, \u/\U
+                         * and \c when that was finally counted. */
+                        char ub[4];
+                        int un = shell_ansic_escape(&p, ub);
+                        char c = ub[0];
                         /* A NUL ENDS THE WORD. `$'foo\0bar'` is the three characters
                          * `foo` as far as anything downstream can tell: the word is a
                          * C string, and so is the filename it becomes.
@@ -15601,7 +15592,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * into `foobar`, a name that does not exist -- the one answer
                          * that is wrong either way. Stopping there is what bash's
                          * execve() does with the same bytes. */
-                        if (!c) { stop_nul = true; continue; }
+                        if (un == 1 && !c) { stop_nul = true; continue; }
                         /* A BYTE AN ESCAPE PRODUCED IS DATA, and may collide
                          * with the word buffer's in-band markers -- $'\1' IS
                          * SHELL_ARG_MARK, $'\2' is SHELL_NOSPLIT_MARK, $'\3'
@@ -15624,7 +15615,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * A LITERAL character between the quotes cannot
                          * collide -- it came from the script text. */
                         if (!stop_nul &&
-                            shell_append_data_n(words, &wpos, word_cap, &c, 1) < 0)
+                            shell_append_data_n(words, &wpos, word_cap,
+                                                ub, (size_t)un) < 0)
                             return -1;
                     } else {
                         /* Ordinary characters after the NUL are consumed and dropped
