@@ -2890,12 +2890,92 @@ static void cmd_export(int argc, char **argv) {
  * rest of bash's letters -- -A -a -i -n -u -l -F -p -- are accepted and
  * ignored rather than rejected, because a script that says `declare -i n=0`
  * wants a variable named n set to 0 more than it wants an error. */
+/* `declare -p NAME` -- print a variable as an assignment that would recreate
+ * it. The flag was PARSED AND THEN IGNORED: it fell into the no-op group
+ * beside -F/-g/-t, so `declare -p a` quietly re-declared `a` and printed
+ * nothing at all. 44 failing corpus cases use it, spread across the array
+ * bands and assign-extended, because it is how a spec test asks a shell what
+ * it actually stored.
+ *
+ * Every detail below is MEASURED against bash 5.2 on the guest, including
+ * the one that looks like a typo:
+ *
+ *     declare -- s="plain"            no attributes prints as --
+ *     declare -- q="a b\"c\$d"        " $ ` and \ are backslash-escaped
+ *     declare -rx rx="3"              letters in bash's own order
+ *     declare -a a=([0]="x" [1]="" [2]="z")
+ *     declare -a sp=([3]="q" [7]="r")     sparse keeps its real indices
+ *     declare -A m=([k]="v" )         <- ASSOCIATIVE HAS A TRAILING SPACE
+ *     declare -A em=()                 ...but an empty one does not
+ *     declare -n nr="s"               a nameref prints its target
+ *     declare: nosuch: not found      stderr, status 1
+ *
+ * The trailing space on a non-empty associative array is not a mistake in
+ * the transcript; bash emits `[k]="v" ` per element and then `)`, while the
+ * indexed form joins with a separator. Matching it is the difference between
+ * passing these cases and looking like it.
+ */
+static void shell_declare_quote(const char *v) {
+    shell_printf("\"");
+    for (const char *p = v ? v : ""; *p; p++) {
+        if (*p == '"' || *p == '\\' || *p == '$' || *p == '`')
+            shell_printf("\\");
+        shell_printf("%c", *p);
+    }
+    shell_printf("\"");
+}
+
+/* Print one `declare` line. Returns false when the name is not set at all,
+ * which is the caller's cue to report it and set status 1. */
+static bool shell_declare_print(const char *name) {
+    size_t klen = strlen(name);
+    int idx = env_find(name, klen);
+    struct sh_array *arr = sh_array_find(name);
+    unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
+    bool is_arr = (arr != 0) || (f & SHVAR_ARRAY);
+    if (idx < 0 && !arr) return false;
+
+    /* bash's own letter order is a A i l n r t u x; tsh tracks the five it
+     * can honestly answer for. No attribute at all prints as `--`. */
+    char fl[8];
+    size_t fn = 0;
+    if (arr && arr->assoc)  fl[fn++] = 'A';
+    else if (is_arr)        fl[fn++] = 'a';
+    if (f & SHVAR_NAMEREF)  fl[fn++] = 'n';
+    if (shell_readonly_find(name, klen) >= 0) fl[fn++] = 'r';
+    if (f & SHVAR_EXPORTED) fl[fn++] = 'x';
+    fl[fn] = '\0';
+    shell_printf("declare -%s %s=", fn ? fl : "-", name);
+
+    if (is_arr) {
+        int n = arr ? arr->n : 0;
+        shell_printf("(");
+        for (int k = 0; k < n; k++) {
+            if (arr->assoc) shell_printf("[%s]=", arr->e[k].key ? arr->e[k].key : "");
+            else            shell_printf("[%ld]=", arr->e[k].idx);
+            shell_declare_quote(arr->e[k].val);
+            /* Indexed joins with a separator; associative appends one after
+             * EVERY element, which is where the trailing space comes from. */
+            if (arr->assoc)      shell_printf(" ");
+            else if (k + 1 < n)  shell_printf(" ");
+        }
+        shell_printf(")\n");
+        return true;
+    }
+
+    const char *val = (idx >= 0) ? g_env[idx] + klen + 1 : "";
+    shell_declare_quote(val);
+    shell_printf("\n");
+    return true;
+}
+
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
     bool set_assoc = false;
+    bool print_mode = false;
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -2912,8 +2992,9 @@ static void cmd_declare(int argc, char **argv) {
              * its subscripts are literal strings rather than arithmetic.
              * They shared a case while neither did anything. */
             case 'A': if (on) { set_array = true; set_assoc = true; } break;
+            case 'p': if (on) print_mode = true; break;
             case 'i': case 'u': case 'l':
-            case 'F': case 'f': case 'p': case 'g': case 't': break;
+            case 'F': case 'f': case 'g': case 't': break;
             default:  known = false; break;
             }
             if (!known) break;
@@ -2922,9 +3003,36 @@ static void cmd_declare(int argc, char **argv) {
     }
     if (i >= argc) {
         /* No names: list the variable table, as `declare` with only flags
-         * does. Exported entries are the useful subset and the only one this
-         * table can label. */
-        for (int k = 0; k < g_envc; k++) shell_printf("declare -- %s\n", g_env[k]);
+         * does. It used to print the raw `key=value` blob with an unquoted
+         * value and a hardcoded `--`, which is not what any reader of this
+         * output parses; it goes through the same formatter now. */
+        for (int k = 0; k < g_envc; k++) {
+            size_t kl = env_key_len(g_env[k]);
+            char nm[128];
+            if (kl == 0 || kl + 1 > sizeof nm) continue;
+            memcpy(nm, g_env[k], kl);
+            nm[kl] = '\0';
+            (void)shell_declare_print(nm);
+        }
+        return;
+    }
+
+    /* `declare -p NAME...` PRINTS, it does not declare. A name that is not
+     * set is an error on stderr with status 1, and the remaining names are
+     * still printed -- bash does not stop at the first one. */
+    if (print_mode) {
+        for (; i < argc; i++) {
+            size_t kl = env_key_len(argv[i]);
+            if (argv[i][kl] != '=') kl = strlen(argv[i]);
+            char nm[128];
+            if (kl == 0 || kl + 1 > sizeof nm) continue;
+            memcpy(nm, argv[i], kl);
+            nm[kl] = '\0';
+            if (!shell_declare_print(nm)) {
+                kprintf("declare: %s: not found\n", nm);
+                shell_set_status(1);
+            }
+        }
         return;
     }
 
