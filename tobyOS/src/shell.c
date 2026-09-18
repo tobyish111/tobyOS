@@ -446,6 +446,12 @@ static int   sh_array_set_key(const char *name, const char *key,
                               const char *val);
 static const char *sh_array_get_key(const char *name, const char *key);
 static void  sh_array_unset_key(struct sh_array *a, const char *key);
+/* The array-literal parser EXPANDS each element, so it needs the word
+ * expander and the marker cleanup 12k lines below. */
+static int shell_expand_word_ex(const char *word, char *out, size_t cap,
+                                bool dq_syntax, bool sq_syntax);
+static void shell_strip_nosplit_inplace(char *s);
+
 static long  sh_array_max_idx(const struct sh_array *a);
 static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
                                    const char *name, bool star,
@@ -1004,6 +1010,88 @@ static const char *sh_split_subscript(const char *key, size_t klen,
 /* Parse "( a b 'c d' )" into elements. Reuses the shell's own field splitter
  * semantics only as far as whitespace: each element is expanded as a word by
  * the caller before it gets here, so quoting has already been resolved. */
+/* Copy one balanced span -- $(...), ${...}, $((...)) or `...` -- verbatim.
+ * Returns the number of source bytes consumed, or 0 if `p` starts none.
+ *
+ * The element scanner needs this because a blank inside a substitution is NOT
+ * an element boundary: `e=($(echo p q))` is ONE element before expansion and
+ * TWO after. Without it the scanner broke at the blank, the parens stopped
+ * balancing, and the literal came out as three elements, the first of them
+ * `$(echo p`. */
+static size_t sh_copy_balanced(const char *p, char *out, size_t *n,
+                               size_t cap) {
+    const char *s = p;
+    char open, close;
+    if (*p == '`') {
+        if (*n + 1 < cap) out[(*n)++] = *p;
+        p++;
+        while (*p && *p != '`') { if (*n + 1 < cap) out[(*n)++] = *p; p++; }
+        if (*p == '`' && *n + 1 < cap) out[(*n)++] = *p++;
+        return (size_t)(p - s);
+    }
+    if (p[0] != '$' || (p[1] != '(' && p[1] != '{')) return 0;
+    open = p[1];
+    close = (open == '(') ? ')' : '}';
+    if (*n + 2 < cap) { out[(*n)++] = p[0]; out[(*n)++] = p[1]; }
+    p += 2;
+    int depth = 1;
+    while (*p && depth > 0) {
+        if (*p == open) depth++;
+        else if (*p == close) depth--;
+        if (depth > 0 || *p == close) { if (*n + 1 < cap) out[(*n)++] = *p; }
+        p++;
+    }
+    return (size_t)(p - s);
+}
+
+/* Is `c` an IFS field separator? Default IFS is space, tab and newline. */
+static bool sh_ifs_is_sep(char c) {
+    const char *ifs = env_get("IFS");
+    if (!ifs) return c == ' ' || c == '\t' || c == '\n';
+    for (const char *q = ifs; *q; q++) if (*q == c) return true;
+    return false;
+}
+
+/* Store one expanded element, splitting it into FIELDS when the source was
+ * unquoted. `keep_empty` is for the quoted-empty case: `a=("" "")` is two
+ * elements, not zero. Returns -1 on error. */
+static int sh_array_store_expanded(const char *name, const char *ex,
+                                   bool split, bool keep_empty, long *next) {
+    char field[512];
+    size_t f = 0;
+    bool any = false;
+    bool in_nosplit = false;
+    for (const char *q = ex; ; q++) {
+        bool end = (*q == '\0');
+        bool boundary = false;
+        if (!end) {
+            if (*q == SHELL_DATA_ESC && q[1]) {
+                if (f + 2 < sizeof field) { field[f++] = *q; field[f++] = q[1]; }
+                q++;
+                continue;
+            }
+            if (*q == SHELL_NOSPLIT_MARK) { in_nosplit = !in_nosplit; continue; }
+            /* A `$@`/`${a[@]}` mark is a field boundary even inside quotes --
+             * that is the whole reason the marker exists. */
+            if (*q == SHELL_ARG_MARK) boundary = true;
+            else if (split && !in_nosplit && sh_ifs_is_sep(*q)) boundary = true;
+        }
+        if (end || boundary) {
+            field[f] = '\0';
+            shell_strip_nosplit_inplace(field);
+            if (field[0] || (keep_empty && !any)) {
+                if (sh_array_set(name, (*next)++, field) < 0) return -1;
+                any = true;
+            }
+            f = 0;
+            if (end) break;
+            continue;
+        }
+        if (f + 1 < sizeof field) field[f++] = *q;
+    }
+    return 0;
+}
+
 static int sh_array_assign_literal(const char *name, const char *paren,
                                    bool append) {
     const char *p = paren;
@@ -1027,15 +1115,35 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (*p == ')' || *p == '\0') break;
         size_t n = 0;
         bool quoted = false;      /* saw a quote: an empty result is REAL */
-        /* Elements may be quoted; strip one level, honouring both quote
-         * kinds, and stop at unquoted whitespace or the closing paren. */
+        /* THE QUOTES STAY IN. They used to be stripped here, which meant
+         * the element never reached an expander -- `a=($v)` stored the two
+         * literal characters `$v` and `a=(~)` stored a tilde. Everything in
+         * a literal is a WORD: it expands, and an unquoted one then field
+         * splits. shell_expand_word_ex() removes the quotes downstream,
+         * which is also the only way `"$v"` can be told from `$v`. */
         while (*p && n + 1 < sizeof elem) {
             if (*p == '\'' || *p == '"') {
-                char q = *p++;
+                char q = *p;
                 quoted = true;
-                while (*p && *p != q && n + 1 < sizeof elem) elem[n++] = *p++;
-                if (*p == q) p++;
+                elem[n++] = *p++;
+                while (*p && *p != q && n + 1 < sizeof elem) {
+                    /* keep a backslash pair together inside double quotes */
+                    if (q == '"' && *p == '\\' && p[1] && n + 2 < sizeof elem)
+                        elem[n++] = *p++;
+                    elem[n++] = *p++;
+                }
+                if (*p == q && n + 1 < sizeof elem) elem[n++] = *p++;
                 continue;
+            }
+            if (*p == '\\' && p[1] && n + 2 < sizeof elem) {
+                elem[n++] = *p++;
+                elem[n++] = *p++;
+                continue;
+            }
+            /* A blank inside $(...) ${...} or `...` is NOT a boundary. */
+            {
+                size_t used = sh_copy_balanced(p, elem, &n, sizeof elem);
+                if (used) { p += used; continue; }
             }
             if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' ||
                 *p == ')') break;
@@ -1064,12 +1172,31 @@ static int sh_array_assign_literal(const char *name, const char *paren,
             if (rb && rb[1] == '=') {
                 *rb = '\0';
                 const char *k = elem + 1, *v = rb + 2;
+                /* THE RHS IS AN ASSIGNMENT, so it expands but does NOT
+                 * field split: `[i]=$v` with v='1 2 3' is one element
+                 * holding all three words, while a bare `$v` beside it is
+                 * three elements. Storing the raw text made every one of
+                 * these read back as the literal `$v`. */
+                char vraw[SHELL_PARSE_BUF_MAX], vx[SHELL_PARSE_BUF_MAX];
+                if (shell_expand_word_ex(v, vraw, sizeof vraw, true, true) < 0)
+                    return -1;
+                /* `${x[@]}` in an ASSIGNMENT joins on a space. There is no
+                 * field splitting here to give its ARG_MARKs a meaning, so
+                 * leaving them put raw 0x01 bytes INSIDE the value -- the
+                 * gate printed '\x013\x015\x017' where bash prints '3 5 7'. */
+                if (shell_argmarks_to_spaces(vraw, vx, sizeof vx) < 0)
+                    return -1;
                 if (sh_array_is_assoc(name)) {
-                    if (sh_array_set_key(name, k, v) < 0) return -1;
+                    char kraw[256], kx[256];
+                    if (shell_expand_word_ex(k, kraw, sizeof kraw, true, true) < 0)
+                        return -1;
+                    if (shell_argmarks_to_spaces(kraw, kx, sizeof kx) < 0)
+                        return -1;
+                    if (sh_array_set_key(name, kx, vx) < 0) return -1;
                 } else {
                     long ix = 0;
                     if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
-                        if (sh_array_set(name, ix, v) < 0) return -1;
+                        if (sh_array_set(name, ix, vx) < 0) return -1;
                         next = ix + 1;   /* a later bare element follows on */
                     }
                 }
@@ -1082,7 +1209,15 @@ static int sh_array_assign_literal(const char *name, const char *paren,
              * than saying nothing. */
             continue;
         }
-        if (sh_array_set(name, next++, elem) < 0) return -1;
+        {
+            char ex[SHELL_PARSE_BUF_MAX];
+            if (shell_expand_word_ex(elem, ex, sizeof ex, true, true) < 0)
+                return -1;
+            /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
+             * is three elements -- and a quoted one never does. */
+            if (sh_array_store_expanded(name, ex, !quoted, quoted, &next) < 0)
+                return -1;
+        }
     }
     return 0;
 }
