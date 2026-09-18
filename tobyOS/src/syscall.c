@@ -9118,10 +9118,20 @@ static uint32_t dev_synth_mode(const char *kpath);
 #define LX_W_OK 2
 #define LX_X_OK 1
 
-static long lx_faccess(const char *upath, int mode) {
-    char kpath[ABI_PATH_MAX];
-    if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
-        return -ABI_EFAULT;
+/* The access(2) rule, on an ALREADY-RESOLVED kernel path.
+ *
+ * Split out of lx_faccess so that sys_execve() can ask the same question and
+ * get the same answer. It could not before, and the gap was visible: execve
+ * checked NO execute bit at all, so `touch f; ./f` as root ran a mode-0644
+ * file. bash's execve succeeded, bash fell back to treating the empty file
+ * as a shell script, and the whole thing exited 0 -- where real bash on
+ * Linux prints "Permission denied" and exits 126. tsh was right and its own
+ * userspace check was the only thing enforcing it (Oils POSIX case 1409).
+ *
+ * Two implementations of one question is how you find out which is lying,
+ * so there is one. */
+long lx_access_kpath(const char *kpath, int mode);
+long lx_access_kpath(const char *kpath, int mode) {
     if (dev_synth_mode(kpath)) return 0;   /* synthesised /dev node */
     struct vfs_stat vs;
     if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
@@ -9145,6 +9155,13 @@ static long lx_faccess(const char *upath, int mode) {
     else if (vs.gid == gid) bits = (perm >> 3) & 7u;
     else                    bits = perm & 7u;
     return ((bits & want) == want) ? 0 : -ABI_EACCES;
+}
+
+static long lx_faccess(const char *upath, int mode) {
+    char kpath[ABI_PATH_MAX];
+    if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
+        return -ABI_EFAULT;
+    return lx_access_kpath(kpath, mode);
 }
 
 /* ------------------------------------------------------------------ *

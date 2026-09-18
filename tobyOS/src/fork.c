@@ -1444,6 +1444,22 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     long plen = (long)strlen(kpath);
     if (plen == 0) return -ABI_EINVAL;
 
+    /* THE EXECUTE BIT. execve checked none at all, so `touch f; ./f` as root
+     * ran a mode-0644 file: the exec succeeded, bash fell back to treating
+     * the empty file as a shell script, and the line exited 0 where real
+     * bash on Linux prints "Permission denied" and exits 126 (Oils POSIX
+     * case 1409). access(2) already had the rule right -- root still needs
+     * at least ONE x bit somewhere in the mode, everyone else needs their
+     * own -- and this asks that same function rather than restating it.
+     *
+     * Before the ELF is read, so a file nobody may run is refused rather
+     * than parsed. */
+    {
+        extern long lx_access_kpath(const char *kpath, int mode);
+        long xrc = lx_access_kpath(kpath, 1 /* X_OK */);
+        if (xrc != 0) return xrc;
+    }
+
     /* Resolve symlinks NOW, so everything downstream -- the ELF read, p->name
      * and above all p->exe_path -- refers to the REAL binary. Linux execve does
      * this: after exec'ing a symlink, /proc/self/exe names the target, not the
