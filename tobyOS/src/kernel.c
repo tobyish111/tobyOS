@@ -9003,19 +9003,46 @@ void _start(void) {
              * on one identical token, `/data/hwgate.txt: permission denied`,
              * with every expectation matching right up to it.
              *
-             * blkid is the same source `mount` and the gates use, so the
-             * name is right by construction on both machines. If no tobyfs
-             * volume is found the test SKIPS -- it does not unmount
-             * something it has no name to restore. And every failure path
-             * puts /data back read-write before reporting, because the one
-             * outcome worse than a failing test is a failing test that
-             * disables the machine behind it. */
+             * blkid is the same source the gates already use, so the name
+             * is right by construction on both machines. TWO TRAPS, both
+             * measured on the box rather than reasoned about:
+             *
+             *   * it must be /bin/blkid, the NATIVE one. busybox blkid
+             *     scans /dev as a DIRECTORY and tobyOS has no such
+             *     directory -- /dev is a synthetic device namespace -- so
+             *     busybox blkid fails with "/dev: No such file or
+             *     directory" on BOTH machines and discovery came back
+             *     empty everywhere.
+             *   * mount(2) takes a device NAME, not a path. blkid prints
+             *     `/dev/usb1`; the mount wants `usb1`, and passing the
+             *     path fails with ENOENT. Hence the second sed clause.
+             *   * the field cut is at the FIRST ": ", not at ": TYPE=".
+             *     The box prints `/dev/usb1: TYPE="tobyfs"` but QEMU prints
+             *     `ide0:master.p1: LABEL="tobyOS-data" TYPE="tobyfs"`, so a
+             *     cut anchored on TYPE matches one machine and not the
+             *     other. The device name's own colon (`ide0:`) is safe
+             *     because it is not followed by a space.
+             *
+             * AN EMPTY DISCOVERY IS A FAILURE, not a skip. The first cut
+             * of this fix exited 0 when it found no volume, so when
+             * discovery broke the harness graded a silent no-op as `ok`
+             * -- a green that proved nothing, which is worse than the red
+             * it replaced. Both machines always have a tobyfs /data (the
+             * rest of this battery writes to it), so "not found" can only
+             * mean the discovery itself is broken. It still does not
+             * unmount anything it has no name to restore.
+             *
+             * Every failure path puts /data back read-write before
+             * reporting, because the one outcome worse than a failing test
+             * is a failing test that disables the machine behind it. */
             { "/bin/busybox", "sh",
-              "DEV=$(/bin/busybox blkid 2>/dev/null | "
+              "DEV=$(/bin/blkid 2>/dev/null | "
               "/bin/busybox grep 'TYPE=\"tobyfs\"' | "
-              "/bin/busybox head -1 | /bin/busybox sed 's/: TYPE=.*$//'); "
+              "/bin/busybox head -1 | "
+              "/bin/busybox sed 's/: .*$//; s|^/dev/||'); "
               "if [ -z \"$DEV\" ]; then "
-              "echo '[MOUNT] no tobyfs volume found -- skipped'; exit 0; fi; "
+              "echo '[MOUNT] NO tobyfs volume found -- discovery is broken'; "
+              "exit 1; fi; "
               "/bin/busybox umount /data && "
               "/bin/busybox mount -t tobyfs -o ro \"$DEV\" /data && "
               "! /bin/busybox touch /data/rotest 2>/dev/null && "
