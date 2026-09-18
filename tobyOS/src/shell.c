@@ -15123,6 +15123,64 @@ static long shell_parse_long_value(const char *s, bool *ok) {
     return neg ? -v : v;
 }
 
+/* THE VALUE OF A VARIABLE IN ARITHMETIC IS ITSELF AN EXPRESSION.
+ *
+ *     x="1+1" ; echo $((x))        bash: 2    tsh was: 0
+ *     y=x     ; echo $((y))        bash: 2    -- it chains
+ *     a=(0 1 2); e="a[1]"
+ *     echo $((e))  ${b[e]}         bash: 1    -- and a subscript is
+ *                                               arithmetic context too
+ *
+ * tsh ran the value through shell_parse_long_value() and took 0 when that
+ * failed, so every one of these answered 0. The rule is POSIX's as much as
+ * bash's, and it is why `${b[expr]}` with expr='a[$(echo 2)]' reads b[2].
+ *
+ * ONE HELPER, FOUR CALLERS. The bare name, `++x`, `--x` and the post-forms
+ * each had their own copy of the lookup; this file has already paid twice
+ * for a decoder that existed twice and drifted three times, so the lookup
+ * exists once now.
+ *
+ * THE DEPTH CAP IS THE SEMANTICS, not a safety net. `x=x` and `a=b; b=a`
+ * are infinite by construction, and bash answers them with
+ * "expression recursion level exceeded" and abandons the command -- so
+ * exceeding the cap sets a->ok, exactly like a syntax error, rather than
+ * quietly returning 0.
+ *
+ * There is deliberately NO integer fast path. Sending "010" straight to
+ * shell_parse_long_value() would read ten where arithmetic means eight, and
+ * "0x10" sixteen; re-entering the real parser gets the bases right for free.
+ */
+#define SHELL_ARITH_MAX_DEPTH 32
+static int g_arith_depth;
+
+static long shell_arith_name_value(struct shell_arith *a, const char *name) {
+    const char *vstr = env_get(name);
+    if (!vstr) return 0;
+    /* EMPTY *OR BLANK* IS ZERO, and the difference is a POSIX case. `a=''`
+     * and `a2=' '` must both give 0; re-entering the parser on " " runs it
+     * off the end of the string and reports a syntax error, which is how
+     * the first cut of this helper broke 0154 while fixing 24 others. */
+    {
+        const char *q = vstr;
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (!*q) return 0;
+    }
+    if (g_arith_depth >= SHELL_ARITH_MAX_DEPTH) {
+        kprintf("shell: %s: expression recursion level exceeded\n", name);
+        a->ok = false;
+        return 0;
+    }
+    g_arith_depth++;
+    struct shell_arith inner;
+    inner.p = vstr;
+    inner.ok = true;
+    long r = shell_arith_comma(&inner);
+    shell_arith_skip(&inner);
+    if (!inner.ok || *inner.p) { a->ok = false; r = 0; }
+    g_arith_depth--;
+    return r;
+}
+
 static long shell_arith_factor(struct shell_arith *a) {
     shell_arith_skip(a);
     if (*a->p == '!') {
@@ -15138,10 +15196,8 @@ static long shell_arith_factor(struct shell_arith *a) {
         char name[64]; size_t n = 0;
         while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
         name[n] = '\0';
-        const char *vstr = env_get(name);
-        bool ok = false;
-        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
-        if (!ok) v = 0;
+        long v = shell_arith_name_value(a, name);
+        if (!a->ok) return 0;
         v++;
         char tmp[32]; size_t tpos = 0;
         shell_append_long(tmp, &tpos, sizeof(tmp), v);
@@ -15153,10 +15209,8 @@ static long shell_arith_factor(struct shell_arith *a) {
         char name[64]; size_t n = 0;
         while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
         name[n] = '\0';
-        const char *vstr = env_get(name);
-        bool ok = false;
-        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
-        if (!ok) v = 0;
+        long v = shell_arith_name_value(a, name);
+        if (!a->ok) return 0;
         v--;
         char tmp[32]; size_t tpos = 0;
         shell_append_long(tmp, &tpos, sizeof(tmp), v);
@@ -15234,10 +15288,8 @@ static long shell_arith_factor(struct shell_arith *a) {
             assign_op = *a->p;
             a->p += 2;
         }
-        const char *vstr = env_get(name);
-        bool ok = false;
-        long v = shell_parse_long_value(vstr ? vstr : "0", &ok);
-        if (!ok) v = 0;
+        long v = shell_arith_name_value(a, name);
+        if (!a->ok) return 0;
         if (assign_op) {
             long rhs = shell_arith_ternary(a);
             if (!a->ok) return 0;
