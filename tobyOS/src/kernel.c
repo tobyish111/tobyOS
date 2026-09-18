@@ -8991,15 +8991,41 @@ void _start(void) {
              * covers: unmount the live /data volume, remount it read-only via
              * mount(2), confirm a write is refused, then restore it read-write
              * and confirm writes work again. Uses busybox so the flags travel
-             * the same path a real caller would use. */
+             * the same path a real caller would use.
+             *
+             * THE DEVICE IS DISCOVERED, NEVER NAMED. This test used to say
+             * `ide0:master.p1`, which is QEMU's data volume and does not
+             * exist on the EliteDesk -- where /data is /dev/usb1. On real
+             * hardware the umount therefore SUCCEEDED and every remount
+             * failed, so a test whose subject is persistent storage left the
+             * box with no persistent storage for the rest of the boot. It
+             * cost a whole hardware gate run: 45 of hwgate's sections failed
+             * on one identical token, `/data/hwgate.txt: permission denied`,
+             * with every expectation matching right up to it.
+             *
+             * blkid is the same source `mount` and the gates use, so the
+             * name is right by construction on both machines. If no tobyfs
+             * volume is found the test SKIPS -- it does not unmount
+             * something it has no name to restore. And every failure path
+             * puts /data back read-write before reporting, because the one
+             * outcome worse than a failing test is a failing test that
+             * disables the machine behind it. */
             { "/bin/busybox", "sh",
+              "DEV=$(/bin/busybox blkid 2>/dev/null | "
+              "/bin/busybox grep 'TYPE=\"tobyfs\"' | "
+              "/bin/busybox head -1 | /bin/busybox sed 's/: TYPE=.*$//'); "
+              "if [ -z \"$DEV\" ]; then "
+              "echo '[MOUNT] no tobyfs volume found -- skipped'; exit 0; fi; "
               "/bin/busybox umount /data && "
-              "/bin/busybox mount -t tobyfs -o ro ide0:master.p1 /data && "
+              "/bin/busybox mount -t tobyfs -o ro \"$DEV\" /data && "
               "! /bin/busybox touch /data/rotest 2>/dev/null && "
               "/bin/busybox umount /data && "
-              "/bin/busybox mount -t tobyfs ide0:master.p1 /data && "
+              "/bin/busybox mount -t tobyfs \"$DEV\" /data && "
               "/bin/busybox touch /data/rwtest && "
-              "/bin/busybox rm -f /data/rwtest",
+              "/bin/busybox rm -f /data/rwtest || { "
+              "/bin/busybox mount -t tobyfs \"$DEV\" /data 2>/dev/null; "
+              "echo \"[MOUNT] round-trip FAILED on $DEV (/data restored)\"; "
+              "exit 1; }",
               0, "mount round-trip (ro then rw)" },
             /* Slice 6: timestamps must be REAL and must PERSIST. Checks the
              * three things that were each independently broken: stat reports
