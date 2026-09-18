@@ -13787,6 +13787,231 @@ static int shell_quote_ansic(const char *v, char *out, size_t cap, size_t *op) {
     return 0;
 }
 
+/* The host name, for \h and \H.
+ *
+ * There is no gethostname() on this side: the nodename lives in the UTS
+ * namespace, which only the kernel build can reach directly. Both builds CAN
+ * read /proc/sys/kernel/hostname, which is what `hostname` and `uname -n`
+ * already answer from, so the prompt agrees with them by construction rather
+ * than by carrying its own copy of the name. $HOSTNAME wins when set, the
+ * way bash lets it.
+ */
+static const char *shell_prompt_host(char *buf, size_t cap) {
+    const char *h = env_get("HOSTNAME");
+    if (h && *h) return h;
+    struct vfs_file f;
+    if (cap > 1 && vfs_open("/proc/sys/kernel/hostname", &f) == VFS_OK) {
+        long n = vfs_read(&f, buf, (long)cap - 1);
+        vfs_close(&f);
+        if (n > 0) {
+            buf[n] = '\0';
+            for (char *q = buf; *q; q++)
+                if (*q == '\n' || *q == '\r') { *q = '\0'; break; }
+            if (buf[0]) return buf;
+        }
+    }
+    return "localhost";
+}
+
+/* ${PS1@P} -- PROMPT EXPANSION, in the two passes bash actually uses.
+ *
+ * MEASURED, because the two-pass shape is not guessable from the manual and
+ * a one-pass reading gets every one of these wrong (bash 5.2, non-root):
+ *
+ *     PS1          @P        why
+ *     A$B          A         $B is EXPANDED -- pass two is a real expansion
+ *     A\$B         A$B       the prompt char, protected from pass two
+ *     A\\$B        A$B       \\ -> \, so pass two sees \$ and yields $
+ *     A\B          A\B       an unknown escape keeps BOTH bytes
+ *     A\\B         A\B       and so does a decoded backslash
+ *
+ * Pass one decodes the prompt escapes and EMITS THE PROTECTION: a literal
+ * that must survive pass two goes out as `\$`, `\`` or `\\`. Pass two is
+ * shell_expand_word_ex() with quotes inactive, whose documented rule -- a
+ * backslash is special only before $ ` \ and newline -- is exactly what the
+ * table above needs. Writing a second expander here would have been a third
+ * copy of $(...) handling.
+ *
+ * WHAT THIS SHELL CANNOT ANSWER HONESTLY, and so does not pretend to: \s is
+ * "tsh", not "bash", and the clock escapes (\t \T \@ \A \d \D) read
+ * shell_wall_secs(), which is SECONDS SINCE BOOT on a hardcoded epoch --
+ * see the native-time note. Those cases stay failing on purpose rather than
+ * being tuned to the oracle.
+ */
+static int shell_prompt_put(char *out, size_t *o, size_t cap, const char *s,
+                            bool protect) {
+    for (const char *p = s; *p; p++) {
+        if (protect && (*p == '$' || *p == '`' || *p == '\\')) {
+            if (*o + 2 >= cap) return -1;
+            out[(*o)++] = '\\';
+        }
+        if (*o + 1 >= cap) return -1;
+        out[(*o)++] = *p;
+    }
+    return 0;
+}
+
+static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
+                               size_t cap) {
+    char dec[SHELL_PARSE_BUF_MAX];
+    size_t o = 0;
+    char scratch[128];
+
+    for (const char *p = ps ? ps : ""; *p && o + 8 < sizeof dec; ) {
+        if (*p != '\\') { dec[o++] = *p++; continue; }
+        if (!p[1]) { dec[o++] = *p++; continue; }   /* a trailing lone \ */
+        p++;
+        char c = *p++;
+        switch (c) {
+        case 'a': dec[o++] = '\a'; break;
+        case 'e': dec[o++] = 0x1b; break;
+        case 'n': dec[o++] = '\n'; break;
+        case 'r': dec[o++] = '\r'; break;
+        case '\\': dec[o++] = '\\'; break;
+        case '[': case ']': break;      /* non-printing markers: dropped */
+        case '$': {
+            /* ONLY THE `$` FORM NEEDS PROTECTING. Root's `#` is not special
+             * to pass two, and emitting a backslash in front of it put a
+             * literal `\\#` in the prompt -- which is what the gate caught the
+             * first time this ran as root. */
+            struct proc *cur = current_proc();
+            if (cur && cur->uid == 0) { dec[o++] = '#'; break; }
+            dec[o++] = '\\';
+            dec[o++] = '$';
+            break;
+        }
+        case '0': case '1': case '2': case '3':
+        case '4': case '5': case '6': case '7': {
+            /* THREE octal digits at most, and the value wraps at 256: bash
+             * prints `m` for \555 (0555 = 365) and `@4` for \1004. */
+            unsigned v = (unsigned)(c - '0');
+            int n = 1;
+            while (n < 3 && *p >= '0' && *p <= '7') { v = v * 8 + (unsigned)(*p++ - '0'); n++; }
+            v &= 0xffu;
+            if (v == '$' || v == '`' || v == '\\') dec[o++] = '\\';
+            dec[o++] = (char)v;
+            break;
+        }
+        case 'u': {
+            struct proc *cur = current_proc();
+            const struct user *u = users_lookup_by_uid(cur ? cur->uid : 0);
+            const char *nm = u ? u->name : env_get("USER");
+            if (shell_prompt_put(dec, &o, sizeof dec, nm ? nm : "user", true) < 0)
+                return -1;
+            break;
+        }
+        case 'h': case 'H': {
+            char hb[128];
+            const char *hn = shell_prompt_host(hb, sizeof hb);
+            char sb[128];
+            if (c == 'h') {
+                size_t i = 0;
+                while (hn[i] && hn[i] != '.' && i + 1 < sizeof sb) { sb[i] = hn[i]; i++; }
+                sb[i] = '\0';
+                hn = sb;
+            }
+            if (shell_prompt_put(dec, &o, sizeof dec, hn, true) < 0) return -1;
+            break;
+        }
+        case 'w': case 'W': {
+            const char *cwd = shell_cwd();
+            const char *home = env_get("HOME");
+            char wb[256];
+            size_t hl = home ? strlen(home) : 0;
+            if (c == 'W') {
+                const char *b = cwd, *q = cwd;
+                for (; *q; q++) if (*q == '/' && q[1]) b = q + 1;
+                cwd = (strcmp(cwd, "/") == 0) ? "/" : b;
+            } else if (hl && strncmp(cwd, home, hl) == 0 &&
+                       (cwd[hl] == '\0' || cwd[hl] == '/')) {
+                wb[0] = '~';
+                size_t i = 0;
+                while (cwd[hl + i] && i + 2 < sizeof wb) { wb[1 + i] = cwd[hl + i]; i++; }
+                wb[1 + i] = '\0';
+                cwd = wb;
+            }
+            if (shell_prompt_put(dec, &o, sizeof dec, cwd, true) < 0) return -1;
+            break;
+        }
+        case 's':
+            if (shell_prompt_put(dec, &o, sizeof dec, "tsh", true) < 0) return -1;
+            break;
+        case 'v':
+            if (shell_prompt_put(dec, &o, sizeof dec, "1.0", true) < 0) return -1;
+            break;
+        case 'V':
+            if (shell_prompt_put(dec, &o, sizeof dec, "1.0.0", true) < 0) return -1;
+            break;
+        case 'l':
+            /* bash falls back to "tty" when stdin is not a terminal, which
+             * is how every non-interactive run of this case reads. */
+            if (shell_prompt_put(dec, &o, sizeof dec, "tty", true) < 0) return -1;
+            break;
+        case 'j': {
+            int live = 0;
+            for (int i = 0; i < JOB_MAX; i++)
+                if (g_jobs[i].id && !g_jobs[i].dead) live++;
+            size_t sp = 0;
+            scratch[0] = 0;
+            if (shell_append_uint(scratch, &sp, sizeof scratch,
+                                  (unsigned long)live) < 0) return -1;
+            scratch[sp] = 0;
+            if (shell_prompt_put(dec, &o, sizeof dec, scratch, false) < 0) return -1;
+            break;
+        }
+        case '!': case '#': {
+            /* tsh keeps one counter, the history ring, and no separate
+             * command number -- so \# answers with the same figure rather
+             * than inventing a second one that nothing else agrees with. */
+            size_t sp2 = 0;
+            scratch[0] = 0;
+            if (shell_append_uint(scratch, &sp2, sizeof scratch,
+                                  (unsigned long)(g_hist_count + 1)) < 0)
+                return -1;
+            scratch[sp2] = 0;
+            if (shell_prompt_put(dec, &o, sizeof dec, scratch, false) < 0) return -1;
+            break;
+        }
+        case 't': case 'T': case '@': case 'A': case 'd': case 'D': {
+            const char *fmt = "%H:%M:%S";
+            char dfmt[128];
+            if (c == 'T') fmt = "%I:%M:%S";
+            else if (c == '@') fmt = "%I:%M %p";
+            else if (c == 'A') fmt = "%H:%M";
+            else if (c == 'd') fmt = "%a %b %d";
+            else if (c == 'D') {
+                size_t n = 0;
+                if (*p == '{') {
+                    p++;
+                    while (*p && *p != '}' && n + 1 < sizeof dfmt) dfmt[n++] = *p++;
+                    if (*p == '}') p++;
+                }
+                dfmt[n] = '\0';
+                fmt = n ? dfmt : "%X";
+            }
+            struct civil_time ct;
+            civil_from_unix(shell_wall_secs(), &ct);
+            char tb[256];
+            if (civil_strftime(tb, sizeof tb, fmt, &ct) == 0) tb[0] = '\0';
+            if (shell_prompt_put(dec, &o, sizeof dec, tb, true) < 0) return -1;
+            break;
+        }
+        default:
+            /* An UNKNOWN escape keeps both bytes: bash prints \x55 for
+             * PS1='\x55', it does not decode hex. Emitting `\` then the
+             * character lets pass two hand both through untouched. */
+            dec[o++] = '\\';
+            dec[o++] = c;
+            break;
+        }
+    }
+    dec[o] = '\0';
+
+    char out[SHELL_PARSE_BUF_MAX];
+    if (shell_expand_word_ex(dec, out, sizeof out, false, false) < 0) return -1;
+    return shell_append_data_str(buf, pos, cap, out);
+}
+
 /* ${v@Q} and friends -- THE TRANSFORM OPERATORS, none of which existed:
  * `@` after a parameter was a flat "bad substitution". Measured against
  * bash 5.2, the gate's own oracle, with x="a b'c":
@@ -13802,10 +14027,12 @@ static int shell_quote_ansic(const char *v, char *out, size_t cap, size_t *op) {
  * A second switch here is precisely the mistake that commit was cleaning up:
  * the two copies it merged had drifted three separate times.
  *
- * NOT IMPLEMENTED, and still "bad substitution": @P, which needs a PS1
- * escape expander this shell does not have, and @K/@k, which describe a
- * whole array rather than a value. tsh reports the i/l/t/u attributes as
- * absent because it does not track them -- `declare -i` has no integer flag.
+ * @P is the prompt string, and it is its own two-pass problem -- see
+ * shell_expand_prompt() just above. STILL "bad substitution": @K and @k,
+ * which describe a whole array rather than a value. tsh reports the i/l/t/u
+ * attributes as absent because it does not track them -- `declare -i` has no
+ * integer flag here, and inventing one to satisfy a letter would be a lie in
+ * the table rather than a fix.
  */
 static int shell_expand_at_transform(const char *name, char opch,
                                      char *buf, size_t *pos, size_t cap) {
@@ -13851,6 +14078,8 @@ static int shell_expand_at_transform(const char *name, char opch,
     }
 
     switch (opch) {
+    case 'P':
+        return shell_expand_prompt(value, buf, pos, cap);
     case 'Q':
         if (shell_quote_ansic(value, out, sizeof out, &o) < 0) return -1;
         break;
