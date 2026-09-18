@@ -908,7 +908,12 @@ static const char *env_get(const char *key) {
          * the scalar table misses, so a scalar of the same name still wins
          * (bash: assigning a scalar to an array name sets element 0, which is
          * the same observable answer either way). */
-        const char *e0 = sh_array_get(key, 0);
+        /* ...and for an ASSOCIATIVE array element 0 is the string KEY
+         * "0", not the integer index. `declare -A a; a=([0]=zzz);
+         * echo "${a}"` is zzz in bash; asking sh_array_get() for index 0
+         * looked in the wrong table and answered empty. */
+        const char *e0 = sh_array_is_assoc(key) ? sh_array_get_key(key, "0")
+                                                : sh_array_get(key, 0);
         return e0 ? e0 : 0;
     }
     /* FOLLOW A NAMEREF, and give up on a cycle rather than on the stack.
@@ -1104,6 +1109,9 @@ static int sh_array_assign_literal(const char *name, const char *paren,
     else if (!append && a) sh_array_unset(name);      /* a=(...) REPLACES */
     if (!sh_array_create(name)) return -1;
     char elem[512];
+    char pend[256];            /* an associative literal's dangling KEY */
+    bool pend_key = false;
+    bool saw_keyed = false;    /* a [k]=v element turns pairing OFF */
     for (;;) {
         /* `;` separates too: the reader joins continued physical lines
          * with "; ", so a multi-line literal arrives here as
@@ -1193,6 +1201,7 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                     if (shell_argmarks_to_spaces(kraw, kx, sizeof kx) < 0)
                         return -1;
                     if (sh_array_set_key(name, kx, vx) < 0) return -1;
+                    saw_keyed = true;
                 } else {
                     long ix = 0;
                     if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
@@ -1204,9 +1213,38 @@ static int sh_array_assign_literal(const char *name, const char *paren,
             }
         }
         if (sh_array_is_assoc(name)) {
-            /* A bare word in an associative literal has no key to go under.
-             * bash rejects it; storing it at a made-up index would be worse
-             * than saying nothing. */
+            /* BARE WORDS IN AN ASSOCIATIVE LITERAL ARE KEY/VALUE PAIRS.
+             * bash 5.1 added this and the guest's bash 5.2 has it:
+             *
+             *     declare -A A=(1 2 3)
+             *     declare -p A   ->  declare -A A=([3]="" [1]="2" )
+             *
+             * so (1,2) pair up and a TRAILING odd key takes the empty
+             * string. tsh skipped bare words entirely on the reasoning
+             * that they had no key -- true of bash 4.4, wrong of the
+             * oracle this gate actually runs against, and it made
+             * `assoc=(foo 'spam eggs')` silently produce an empty array. */
+            /* ...but ONLY in an all-bare literal. Mixing the two forms
+             * makes bash warn and DISCARD the bare words:
+             *
+             *     declare -A a=([j]=1 2 3 4)   ->  keys ['j'] vals ['1']
+             *
+             * so a [k]=v element seen earlier turns pairing off rather
+             * than letting `2 3 4` invent three more entries. */
+            if (saw_keyed) continue;
+            char kx[256], kj[256];
+            if (shell_expand_word_ex(elem, kx, sizeof kx, true, true) < 0)
+                return -1;
+            if (shell_argmarks_to_spaces(kx, kj, sizeof kj) < 0) return -1;
+            if (!pend_key) {
+                size_t kl = strlen(kj);
+                if (kl + 1 > sizeof pend) continue;
+                memcpy(pend, kj, kl + 1);
+                pend_key = true;
+                continue;
+            }
+            if (sh_array_set_key(name, pend, kj) < 0) return -1;
+            pend_key = false;
             continue;
         }
         {
@@ -1219,6 +1257,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 return -1;
         }
     }
+    /* An odd number of bare words leaves the last KEY holding "". */
+    if (pend_key && sh_array_set_key(name, pend, "") < 0) return -1;
     return 0;
 }
 
