@@ -115,23 +115,32 @@ extern volatile struct limine_module_request module_req;
  * which the 32 KiB kernel stack the in-kernel shell runs on can carry; the
  * real fix is a heap-grown argv, and this is the step before it. */
 #ifdef SHELL_HOSTED
-/* 512 -- and RAISING THIS IS NOT THE WAY TO GO PAST IT (measured 2026-09-08).
+/* 1024, and the reason it may now be raised at all is structural, not a
+ * change of mind about the number (2026-09-18).
  *
- * The Oils case "ulimit -f 1 prevents files larger 512 bytes" does not
- * measure ulimit at all: it runs `for i in $(seq 513)` and dies here with
- * "too many arguments (max 512)" while bash carries on. The obvious fix is
- * a bigger number, and it is a stack hazard: ARG_MAX multiplies through
- * `struct shell_simple.argv[ARG_MAX]`, and `struct shell_pipeline` holds
- * SHELL_STAGE_MAX = 8 of those and is allocated ON THE STACK in three
- * places that nest with subshells and command substitution. At 512 that is
- * already 32 KiB per pipeline against a 256 KiB user stack; 1024 makes it
- * 64 KiB and four levels of nesting overflow. A stack overflow in the
- * shell would present as exactly the kind of intermittent wedge this tree
- * has spent weeks chasing, which is a bad trade for one conformance case.
+ * The note this replaces said 512 must stand because ARG_MAX multiplies
+ * through `struct shell_simple.argv[ARG_MAX]`, and `struct shell_pipeline`
+ * holds SHELL_STAGE_MAX = 8 of those and was allocated ON THE STACK in
+ * three places that nest with subshells and command substitution -- 32 KiB
+ * per pipeline against a 256 KiB user stack, with four levels of nesting
+ * enough to overflow. That was correct, and a stack overflow in the shell
+ * would present as exactly the kind of intermittent wedge this tree has
+ * spent weeks chasing.
  *
- * The real fix is the one the note below has always named: grow argv on the
- * heap. Until then this stays at 512 and that case stays failing. */
-#define ARG_MAX  512
+ * ALL THREE OF THOSE ARE NOW ON THE HEAP, so the pipeline no longer costs
+ * the stack anything at any ARG_MAX. 1024 closes the Oils case "ulimit -f 1
+ * prevents files larger 512 bytes" (1069), which never measured ulimit at
+ * all: it runs `for i in $(seq 513)` and died here with "too many arguments
+ * (max 512)" while bash carried on.
+ *
+ * WHAT STILL BOUNDS THIS, so the next person does not just double it again:
+ * eight `struct shell_simple` instances remain on the stack (the `redirs` /
+ * `tail_redirs` / `cmd` locals in the compound parsers), and those DO nest.
+ * At 1024 each is ~8 KiB, which the 256 KiB user stack carries about thirty
+ * deep. At 4096 it is ~33 KiB and four levels is trouble again. Going
+ * materially past this means heap-growing argv itself -- the fix the old
+ * note named -- not another doubling. */
+#define ARG_MAX  1024
 #else
 #define ARG_MAX  256
 #endif
@@ -21228,11 +21237,16 @@ static bool shell_try_subshell_command(const char *src) {
 
     /* Heap, not stack -- see shell_dup_segment(). */
     char *body = shell_dup_segment(body_start, body_end);
+    /* Heap, not stack: struct shell_pipeline is ~40 KiB and this frame
+     * nests through subshells and command substitution. Declared here so
+     * every exit can free it unconditionally -- kfree(NULL) is a no-op. */
+    struct shell_pipeline *plp = 0;
     unsigned long body_line = shell_lineno_body(body_start);
     if (!body) {
         kprintf("subshell: body too long\n");
         shell_set_status(2);
         kfree(body);
+        kfree(plp);
         return true;
     }
 
@@ -21257,33 +21271,37 @@ static bool shell_try_subshell_command(const char *src) {
             shell_set_status(1);
 #endif
             kfree(body);
+            kfree(plp);
             return true;
         }
     }
 
     /* The redirection words live in `words` and `pl` for as long as the io
-     * frame needs them: `redirs = pl.stage[0]` copies POINTERS into these
+     * frame needs them: `redirs = plp->stage[0]` copies POINTERS into these
      * buffers, so they must outlive the block that fills them. They used to
      * be block-local, and the dangling targets happened to survive until the
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
-    struct shell_pipeline pl;
+    plp = kmalloc(sizeof(*plp));
+    if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
             kfree(body);
+            kfree(plp);
             return true;
         }
         int i = 0;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
-            pl.stage[0].argc != 0) {
+        int parsed = shell_parse_pipeline(tok, ntok, &i, plp);
+        if (parsed < 0 || parsed == 0 || plp->count != 1 ||
+            plp->stage[0].argc != 0) {
             kprintf("subshell: expected only redirections after ')'\n");
             shell_parse_error();
             kfree(body);
+            kfree(plp);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
@@ -21291,9 +21309,10 @@ static bool shell_try_subshell_command(const char *src) {
             kprintf("subshell: unexpected text after redirection\n");
             shell_set_status(2);
             kfree(body);
+            kfree(plp);
             return true;
         }
-        redirs = pl.stage[0];
+        redirs = plp->stage[0];
     }
 
     struct shell_subshell_frame state;
@@ -21301,6 +21320,7 @@ static bool shell_try_subshell_command(const char *src) {
         kprintf("subshell: failed to save shell state\n");
         shell_set_status(1);
         kfree(body);
+        kfree(plp);
         return true;
     }
 
@@ -21311,6 +21331,7 @@ static bool shell_try_subshell_command(const char *src) {
             shell_subshell_frame_restore(&state);
             shell_set_status(1);
             kfree(body);
+            kfree(plp);
             return true;
         }
         io_active = true;
@@ -21339,6 +21360,7 @@ static bool shell_try_subshell_command(const char *src) {
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
     kfree(body);
+    kfree(plp);
     return true;
 }
 
@@ -21398,11 +21420,16 @@ static bool shell_try_group_command(const char *src) {
 
     /* Heap, not stack -- see shell_dup_segment(). */
     char *body = shell_dup_segment(body_start, body_end);
+    /* Heap, not stack: struct shell_pipeline is ~40 KiB and this frame
+     * nests through subshells and command substitution. Declared here so
+     * every exit can free it unconditionally -- kfree(NULL) is a no-op. */
+    struct shell_pipeline *plp = 0;
     unsigned long body_line = shell_lineno_body(body_start);
     if (!body) {
         kprintf("group: body too long\n");
         shell_set_status(2);
         kfree(body);
+        kfree(plp);
         return true;
     }
 
@@ -21427,33 +21454,37 @@ static bool shell_try_group_command(const char *src) {
             shell_set_status(1);
 #endif
             kfree(body);
+            kfree(plp);
             return true;
         }
     }
 
     /* The redirection words live in `words` and `pl` for as long as the io
-     * frame needs them: `redirs = pl.stage[0]` copies POINTERS into these
+     * frame needs them: `redirs = plp->stage[0]` copies POINTERS into these
      * buffers, so they must outlive the block that fills them. They used to
      * be block-local, and the dangling targets happened to survive until the
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
     struct shell_token tok[SHELL_TOKEN_MAX];
     char words[SHELL_PARSE_BUF_MAX];
-    struct shell_pipeline pl;
+    plp = kmalloc(sizeof(*plp));
+    if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
         if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
             shell_set_status(2);
             kfree(body);
+            kfree(plp);
             return true;
         }
         int i = 0;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
-        if (parsed < 0 || parsed == 0 || pl.count != 1 ||
-            pl.stage[0].argc != 0) {
+        int parsed = shell_parse_pipeline(tok, ntok, &i, plp);
+        if (parsed < 0 || parsed == 0 || plp->count != 1 ||
+            plp->stage[0].argc != 0) {
             kprintf("group: expected only redirections after '}'\n");
             shell_parse_error();
             kfree(body);
+            kfree(plp);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
@@ -21461,9 +21492,10 @@ static bool shell_try_group_command(const char *src) {
             kprintf("group: unexpected text after redirection\n");
             shell_set_status(2);
             kfree(body);
+            kfree(plp);
             return true;
         }
-        redirs = pl.stage[0];
+        redirs = plp->stage[0];
     }
 
     struct shell_io_frame io_frame;
@@ -21472,6 +21504,7 @@ static bool shell_try_group_command(const char *src) {
         if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
             shell_set_status(1);
             kfree(body);
+            kfree(plp);
             return true;
         }
         io_active = true;
@@ -21488,6 +21521,7 @@ static bool shell_try_group_command(const char *src) {
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_set_status(rc);
     kfree(body);
+    kfree(plp);
     return true;
 }
 
@@ -22481,15 +22515,20 @@ static void execute_line_text_inner(const char *src) {
             continue;
         }
 
-        struct shell_pipeline pl;
-        int parsed = shell_parse_pipeline(tok, ntok, &i, &pl);
+        /* Heap, not stack: struct shell_pipeline is ~40 KiB, and this is the
+         * per-command path that recurses through every compound construct. */
+        struct shell_pipeline *plp = kmalloc(sizeof(*plp));
+        if (!plp) { shell_set_status(2); return; }
+        int parsed = shell_parse_pipeline(tok, ntok, &i, plp);
         if (parsed < 0) {
             shell_set_status(2);
+            kfree(plp);
             return;
         }
         if (parsed == 0) {
             kprintf("shell: expected command\n");
             shell_set_status(2);
+            kfree(plp);
             return;
         }
 
@@ -22498,18 +22537,18 @@ static void execute_line_text_inner(const char *src) {
         if (should_run) {
             if (g_opt_xtrace) {
                 kprintf("+ ");
-                for (int s = 0; s < pl.count; s++) {
+                for (int s = 0; s < plp->count; s++) {
                     if (s > 0) kprintf("| ");
-                    for (int a = 0; a < pl.stage[s].argc; a++)
-                        kprintf("%s%s", pl.stage[s].argv[a],
-                                a + 1 < pl.stage[s].argc ? " " : "");
+                    for (int a = 0; a < plp->stage[s].argc; a++)
+                        kprintf("%s%s", plp->stage[s].argv[a],
+                                a + 1 < plp->stage[s].argc ? " " : "");
                 }
                 kprintf("\n");
             }
-            last = shell_run_pipeline(&pl, background);
+            last = shell_run_pipeline(plp, background);
             if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
-            if (g_shell_flow != SHELL_FLOW_NONE) return;
+            if (g_shell_flow != SHELL_FLOW_NONE) { kfree(plp); return; }
             /* A segment reaching here has already been split off any && or ||
              * by shell_run_list_line, which is where the AND-OR exemption
              * lives; `sep` is all but always SH_TOK_SEMI. It is still tested
@@ -22532,9 +22571,11 @@ static void execute_line_text_inner(const char *src) {
                 g_errexit_negate == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
+                kfree(plp);
                 return;
             }
         }
+        kfree(plp);
         prev_link = sep;
     }
 }
