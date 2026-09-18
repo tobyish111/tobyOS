@@ -13660,6 +13660,229 @@ static void shell_word_tilde(char *w, size_t cap) {
     if (o + 1 <= cap) memcpy(w, out, o + 1);
 }
 
+/* ${!pre@} and ${!pre*} -- THE NAMES that begin with `pre`, not their values.
+ *
+ * The third meaning of `!` in a braced expansion, after indirection and
+ * array keys, and the reason the indirection path has to check for it first:
+ * `${!a@}` is a listing, while `${!a@Q}` is an indirection with a transform.
+ * The `@}` / `*}` ending is the whole difference.
+ *
+ * bash sorts the names, and `@` yields one word each while `*` joins on the
+ * first character of IFS -- the same split ${a[@]} and ${a[*]} make, so it
+ * goes through the same SHELL_ARG_MARK path rather than a string.
+ */
+static int shell_expand_name_prefix(const char *prefix, bool star,
+                                    char *buf, size_t *pos, size_t cap) {
+    size_t plen = prefix ? strlen(prefix) : 0;
+    int idxs[ENV_MAX];
+    int n = 0;
+    for (int i = 0; i < g_envc && n < ENV_MAX; i++) {
+        const char *e = g_env[i];
+        if (!e) continue;
+        size_t klen = env_key_len(e);
+        if (klen < plen || memcmp(e, prefix, plen) != 0) continue;
+        idxs[n++] = i;
+    }
+    /* Insertion sort on the KEY only -- the blob continues into the value,
+     * so a plain strcmp of g_env[i] would order by value on a shared name
+     * prefix. Small n, and the table is already nearly ordered. */
+    for (int i = 1; i < n; i++) {
+        int v = idxs[i], j = i - 1;
+        while (j >= 0) {
+            const char *a = g_env[idxs[j]], *b = g_env[v];
+            size_t al = env_key_len(a), bl = env_key_len(b);
+            size_t m = al < bl ? al : bl;
+            int c = memcmp(a, b, m);
+            if (c == 0) c = (al < bl) ? -1 : (al > bl ? 1 : 0);
+            if (c <= 0) break;
+            idxs[j + 1] = idxs[j];
+            j--;
+        }
+        idxs[j + 1] = v;
+    }
+
+    char sep = ' ';
+    const char *ifs = env_get("IFS");
+    if (ifs && *ifs) sep = ifs[0];
+    else if (ifs) sep = '\0';
+
+    if (!star && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        if (i > 0) {
+            if (!star) {
+                if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                    return -1;
+            } else if (sep) {
+                if (shell_append_char(buf, pos, cap, sep) < 0) return -1;
+            }
+        }
+        const char *e = g_env[idxs[i]];
+        if (shell_append_data_n(buf, pos, cap, e, env_key_len(e)) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+/* Quote `v` the way bash's ${x@Q} does: reusable as shell input.
+ *
+ * SINGLE QUOTES normally, with the embedded-quote dance ('\''), but bash
+ * SWITCHES FORM the moment a control byte appears and emits $'a\nb' instead.
+ * Single-quoting a raw newline is still valid shell, but it does not survive
+ * a diff, a log, or this gate's own transcript -- so the form is part of the
+ * answer, not a detail. Anything else unprintable goes out as three-digit
+ * OCTAL, which is what bash prints for $'\001\E\177'.
+ */
+static int shell_quote_ansic(const char *v, char *out, size_t cap, size_t *op) {
+    size_t o = 0;
+    bool ctl = false;
+    for (const char *p = v; *p; p++)
+        if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f) ctl = true;
+
+    if (!ctl) {
+        if (o + 1 < cap) out[o++] = '\'';
+        for (const char *p = v; *p; p++) {
+            if (*p == '\'') {
+                /* close the string, an escaped quote, open another */
+                const char *esc = "'\\''";
+                for (const char *q = esc; *q && o + 1 < cap; q++) out[o++] = *q;
+            } else if (o + 1 < cap) out[o++] = *p;
+        }
+        if (o + 1 < cap) out[o++] = '\'';
+        out[o] = '\0';
+        if (op) *op = o;
+        return 0;
+    }
+
+    if (o + 2 < cap) { out[o++] = '$'; out[o++] = '\''; }
+    for (const char *p = v; *p && o + 5 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        char named = '\0';
+        switch (c) {
+        case '\a': named = 'a';  break;
+        case '\b': named = 'b';  break;
+        case 0x1b: named = 'E';  break;
+        case '\f': named = 'f';  break;
+        case '\n': named = 'n';  break;
+        case '\r': named = 'r';  break;
+        case '\t': named = 't';  break;
+        case '\v': named = 'v';  break;
+        case '\\': named = '\\'; break;
+        case '\'': named = '\''; break;
+        default: break;
+        }
+        if (named) { out[o++] = '\\'; out[o++] = named; continue; }
+        if (c < 0x20 || c == 0x7f) {
+            out[o++] = '\\';
+            out[o++] = (char)('0' + ((c >> 6) & 7));
+            out[o++] = (char)('0' + ((c >> 3) & 7));
+            out[o++] = (char)('0' + (c & 7));
+            continue;
+        }
+        out[o++] = (char)c;
+    }
+    if (o + 1 < cap) out[o++] = '\'';
+    out[o] = '\0';
+    if (op) *op = o;
+    return 0;
+}
+
+/* ${v@Q} and friends -- THE TRANSFORM OPERATORS, none of which existed:
+ * `@` after a parameter was a flat "bad substitution". Measured against
+ * bash 5.2, the gate's own oracle, with x="a b'c":
+ *
+ *     ${x@Q}   'a b'\''c'      reusable as shell input
+ *     ${x@E}   a b'c           the $'...' escapes in the value, expanded
+ *     ${x@U}   A B'C     ${x@L} a b'c     ${x@u} A b'c
+ *     ${x@a}   ''              the ATTRIBUTE letters, in bash's own order
+ *                              a A i l n r t u x
+ *     ${x@A}   x='a b'\''c'    an assignment that would restore it
+ *
+ * @E goes through shell_ansic_escape(), the ONE decoder 86aec7d left behind.
+ * A second switch here is precisely the mistake that commit was cleaning up:
+ * the two copies it merged had drifted three separate times.
+ *
+ * NOT IMPLEMENTED, and still "bad substitution": @P, which needs a PS1
+ * escape expander this shell does not have, and @K/@k, which describe a
+ * whole array rather than a value. tsh reports the i/l/t/u attributes as
+ * absent because it does not track them -- `declare -i` has no integer flag.
+ */
+static int shell_expand_at_transform(const char *name, char opch,
+                                     char *buf, size_t *pos, size_t cap) {
+    char value[SHELL_PARSE_BUF_MAX];
+    bool is_set = false, vjoin = false;
+    if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0) {
+        kprintf("shell: parameter expansion too long\n");
+        return -1;
+    }
+    char out[SHELL_PARSE_BUF_MAX];
+    size_t o = 0;
+
+    if (opch == 'a' || opch == 'A') {
+        /* The letters come from the flag table and the ARRAY table together:
+         * `assoc` lives on the array record, not on the name's flags. */
+        char at[8];
+        size_t an = 0;
+        int vidx = env_find(name, strlen(name));
+        unsigned f = (vidx >= 0) ? (unsigned)g_env_flags[vidx] : 0u;
+        struct sh_array *arr = sh_array_find(name);
+        if (arr && arr->assoc)             at[an++] = 'A';
+        else if ((f & SHVAR_ARRAY) || arr) at[an++] = 'a';
+        if (f & SHVAR_NAMEREF)             at[an++] = 'n';
+        if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
+        if (f & SHVAR_EXPORTED)            at[an++] = 'x';
+        at[an] = '\0';
+        if (opch == 'a') return shell_append_data_str(buf, pos, cap, at);
+        /* @A -- the assignment statement. bash prints NOTHING for a name
+         * that is not set, and prefixes `declare -a`/`-A` for an array. */
+        if (!is_set) return 0;
+        if (at[0] == 'a' || at[0] == 'A') {
+            const char *dp = (at[0] == 'A') ? "declare -A " : "declare -a ";
+            for (const char *q = dp; *q && o + 1 < sizeof out; q++) out[o++] = *q;
+        }
+        for (const char *q = name; *q && o + 1 < sizeof out; q++) out[o++] = *q;
+        if (o + 1 < sizeof out) out[o++] = '=';
+        char tail[SHELL_PARSE_BUF_MAX];
+        size_t t = 0;
+        if (shell_quote_ansic(value, tail, sizeof tail, &t) < 0) return -1;
+        for (size_t i = 0; i < t && o + 1 < sizeof out; i++) out[o++] = tail[i];
+        out[o] = '\0';
+        return shell_append_data_str(buf, pos, cap, out);
+    }
+
+    switch (opch) {
+    case 'Q':
+        if (shell_quote_ansic(value, out, sizeof out, &o) < 0) return -1;
+        break;
+    case 'E':
+        for (const char *p = value; *p && o + 4 < sizeof out; ) {
+            if (*p != '\\' || !p[1]) { out[o++] = *p++; continue; }
+            p++;
+            char eb[4];
+            const char *save = p;
+            int n = shell_ansic_escape(&p, eb);
+            if (n <= 0) { out[o++] = '\\'; p = save; continue; }
+            for (int i = 0; i < n && o + 1 < sizeof out; i++) out[o++] = eb[i];
+        }
+        break;
+    case 'U': case 'L': case 'u':
+        for (const char *p = value; *p && o + 1 < sizeof out; p++) {
+            char c = *p;
+            if (opch == 'L')      { if (c >= 'A' && c <= 'Z') c = (char)(c + 32); }
+            else if (opch == 'U') { if (c >= 'a' && c <= 'z') c = (char)(c - 32); }
+            else if (p == value && c >= 'a' && c <= 'z') c = (char)(c - 32);
+            out[o++] = c;
+        }
+        break;
+    default:
+        kprintf("shell: bad substitution\n");
+        return -1;
+    }
+    out[o] = '\0';
+    return vjoin ? shell_append_str(buf, pos, cap, out)
+                 : shell_append_data_str(buf, pos, cap, out);
+}
+
 /* ${v:off} and ${v:off:len} -- SUBSTRING EXPANSION, which tsh did not have at
  * all. `${x:2}` was a flat "bad substitution", and so was every corpus case
  * that uses one. The gap survived because SLICING already existed: the array
@@ -13848,6 +14071,13 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             memcpy(rname, expr + 1, inlen);
             rname[inlen] = '\0';
             refval[0] = '\0';
+            /* ${!pre@} / ${!pre*} is a NAME LISTING, the third meaning of
+             * this `!`. It has to be tested before anything else here: the
+             * only thing separating it from an indirection with a transform
+             * (${!ref@Q}) is that the `@` ends the expression. */
+            if ((rest[0] == '@' || rest[0] == '*') && rest[1] == '\0')
+                return shell_expand_name_prefix(rname, rest[0] == '*',
+                                                buf, pos, cap);
             if (rest[0] == '[') {
                 /* The reference is an ELEMENT -- but only when the subscript
                  * is an index or a key. `@` and `*` mean the whole array, and
@@ -14129,6 +14359,11 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
     char opch = '\0';
     const char *word = "";
     if (*op) {
+        /* ${v@op} -- a ONE-LETTER TRANSFORM of the value, and the only
+         * operator here that is a single character with nothing after it. */
+        if (op[0] == '@' && op[1] && op[2] == '\0')
+            return shell_expand_at_transform(name, op[1], buf, pos, cap);
+
         /* ---- ${v/pat/rep} and ${v^^} / ${v,,} ---------------------------
          *
          * Neither existed, on a scalar OR an array: ${a[@]/x/y} reached the
