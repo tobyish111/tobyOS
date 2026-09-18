@@ -13660,6 +13660,34 @@ static void shell_word_tilde(char *w, size_t cap) {
     if (o + 1 <= cap) memcpy(w, out, o + 1);
 }
 
+/* Is `t` something bash will accept as the TARGET of an indirection?
+ *
+ * A parameter designator -- a name, `@`, `*`, a digit, `?`, `#`, `$`, `-` --
+ * optionally followed by ONE balanced subscript, and nothing else. Measured
+ * against bash 5.2, which rejects everything outside that with status 1:
+ *
+ *     e=''    ; echo ${!e}       ->  : invalid variable name
+ *     a='!a'  ; echo ${!a}       ->  !a: invalid variable name   (no recursion)
+ *     b='x y' ; echo ${!b}       ->  x y: invalid variable name
+ *
+ * The check is not a nicety. `${!ref}` is implemented by splicing the target
+ * in front of the operator suffix and re-expanding, so without it a reference
+ * holding `x-y` would concatenate into `${x-y}` and quietly answer `y`. */
+static bool shell_indirect_target_ok(const char *t) {
+    size_t n = 0;
+    if (!t || !*t) return false;
+    if (shell_parse_braced_name(t, &n) < 0) return false;
+    const char *r = t + n;
+    if (*r == '\0') return true;
+    if (*r != '[') return false;
+    int d = 0;
+    for (; *r; r++) {
+        if (*r == '[') d++;
+        else if (*r == ']') { d--; if (d == 0) return r[1] == '\0'; }
+    }
+    return false;
+}
+
 static int shell_expand_braced_parameter(const char *expr, char *buf,
                                          size_t *pos, size_t cap) {
     if (!expr) return -1;
@@ -13693,6 +13721,109 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             expr[1 + plen] == '\0') {
             length_mode = true;
             expr++;
+        }
+    }
+
+    /* ---- ${!ref} -- INDIRECTION: THE VALUE OF `ref` IS USED AS A NAME -----
+     *
+     *     a=b; b=c; echo ${!a}        ->  c
+     *
+     * This `!` is not the one in `${!a[@]}`. A SUBSCRIPT BINDS TIGHTER than
+     * the indirection, so the two readings split on what is in the brackets:
+     *
+     *     ${!a[@]}  ${!a[*]}    the KEYS of a  -- left to the array branch
+     *     ${!a[1]}              indirect through the VALUE of a[1]
+     *
+     * Nearly every operator in "Shell Parameter Expansion" is allowed after a
+     * reference, and it applies to the TARGET rather than to the reference.
+     * So `!ref<op>` is rewritten as `<target><op>` and this function is
+     * re-entered: the smallest implementation, and the only one that cannot
+     * drift from the dozen operators it would otherwise duplicate.
+     *
+     * THE RECURSION IS ONE FRAME DEEP, not open-ended -- the target is
+     * validated to be a bare parameter designator, so it can never begin with
+     * another `!`. bash agrees: `a='!a'; echo ${!a}` is an error, not a loop.
+     * The spliced expression is on the HEAP for the same reason `${...}`'s
+     * other big buffers are: SHELL_PARSE_BUF_MAX is 8 KiB and this frame
+     * already carries several, against a 32 KiB stack in the kernel build. */
+    if (expr[0] == '!' && expr[1] && !length_mode) {
+        size_t inlen = 0;
+        if (shell_parse_braced_name(expr + 1, &inlen) == 0 && inlen < 64) {
+            const char *rest = expr + 1 + inlen;
+            char rname[64];
+            char refval[256];
+            bool have_ref = false, ref_set = false;
+            memcpy(rname, expr + 1, inlen);
+            rname[inlen] = '\0';
+            refval[0] = '\0';
+            if (rest[0] == '[') {
+                /* The reference is an ELEMENT -- but only when the subscript
+                 * is an index or a key. `@` and `*` mean the whole array, and
+                 * there `!` is the KEYS operator, which the array branch
+                 * below owns. Falling through is how that stays true. */
+                const char *rb = 0;
+                int d = 0;
+                for (const char *q = rest; *q; q++) {
+                    if (*q == '[') d++;
+                    else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
+                }
+                size_t slen = rb ? (size_t)(rb - rest - 1) : 0;
+                if (rb && !(slen == 1 &&
+                            (rest[1] == '@' || rest[1] == '*'))) {
+                    char sub[128];
+                    if (slen + 1 <= sizeof sub) {
+                        memcpy(sub, rest + 1, slen);
+                        sub[slen] = '\0';
+                        struct sh_array *ea = sh_array_find(rname);
+                        const char *v = 0;
+                        long aidx = 0;
+                        if (ea && ea->assoc) v = sh_array_get_key(rname, sub);
+                        else if (sh_subscript_eval(sub, rname, false, &aidx))
+                            v = sh_array_get(rname, aidx);
+                        if (v && strlen(v) + 1 <= sizeof refval) {
+                            memcpy(refval, v, strlen(v) + 1);
+                            ref_set = true;
+                        }
+                        have_ref = true;
+                        rest = rb + 1;
+                    }
+                }
+            } else {
+                bool vjoin = false;
+                ref_set = true;
+                if (shell_parameter_value(rname, refval, sizeof refval,
+                                          &ref_set, &vjoin) < 0)
+                    refval[0] = '\0';
+                if (!ref_set) refval[0] = '\0';
+                have_ref = true;
+            }
+            if (have_ref) {
+                if (!shell_indirect_target_ok(refval)) {
+                    /* bash splits the message on whether the REFERENCE was
+                     * set, not on whether its value was empty. Both are
+                     * status 1, the command is skipped, and the script
+                     * carries on -- which is what g_bad_subst_soft means. */
+                    if (!ref_set)
+                        kprintf("shell: %s: invalid indirect expansion\n",
+                                rname);
+                    else
+                        kprintf("shell: %s: invalid variable name\n", refval);
+                    g_bad_subst_soft = true;
+                    return -1;
+                }
+                size_t tl = strlen(refval), sl = strlen(rest);
+                if (tl + sl + 1 > SHELL_PARSE_BUF_MAX) {
+                    kprintf("shell: bad substitution\n");
+                    return -1;
+                }
+                char *nexpr = (char *)kmalloc(tl + sl + 1);
+                if (!nexpr) return -1;
+                memcpy(nexpr, refval, tl);
+                memcpy(nexpr + tl, rest, sl + 1);
+                int irc = shell_expand_braced_parameter(nexpr, buf, pos, cap);
+                kfree(nexpr);
+                return irc;
+            }
         }
     }
 
