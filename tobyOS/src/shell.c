@@ -16400,8 +16400,76 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
 #define SH_LIT_CLOSE() do { if (lit_open) { \
         if (shell_append_char(words, &wpos, word_cap, SHELL_NOSPLIT_MARK) < 0) \
             return -1; lit_open = false; } } while (0)
-        while (*p && !is_space(*p) && !shell_operator_char(*p)) {
+        /* Depth of an assignment-position subscript, if we are inside one.
+         * A blank does not end the word while it is non-zero -- see the
+         * rule just below. */
+        int sub_depth = 0;
+        while (*p && (sub_depth > 0 ||
+                      (!is_space(*p) && !shell_operator_char(*p)))) {
             got = true;
+            /* A SUBSCRIPT IN ASSIGNMENT POSITION IS PART OF THE WORD,
+             * SPACES AND ALL.
+             *
+             *     a[1 * 1]=x      a[ 1 + 2 ]=z      a[ i[1]+i[2] ]=3
+             *
+             * Ordinary splitting cuts those at the blanks, so tsh took
+             * `a[1` for a command and died with
+             * "spawn: failed to launch '/bin/a[1'".
+             *
+             * THREE THINGS HERE WERE MEASURED, NOT ASSUMED (bash 5.2):
+             *
+             *   * it applies in the ASSIGNMENT PREFIX ONLY. In argument
+             *     position bash splits normally -- `argv.py a[3 + 4]=`
+             *     really does pass three words -- which is exactly what
+             *     corpus case 0175 exists to pin down.
+             *   * NOT for declaration utilities, unlike the array-literal
+             *     rule just below. `declare a[1 + 2]=Q` is three errors in
+             *     bash, not an assignment, so `decl_util_cmd` is
+             *     deliberately absent from this condition.
+             *   * the `=` is NOT required. `a[1 + 2]` alone reports
+             *     `a[1 + 2]: command not found` -- one word -- so the
+             *     brackets are joined before anyone asks what follows.
+             *
+             * The matching `]` is found BEFORE anything is consumed: an
+             * unterminated `[` has to stay an ordinary character rather
+             * than swallow the rest of the line. */
+            if (*p == '[' && prefix_ok) {
+                /* MEASURE THE NAME ACROSS THE IN-BAND MARKERS. The word
+                 * buffer is not plain text: a no-split run is already open
+                 * by the time the name is written, so `a` arrives as
+                 * 0x02 0x61 and a raw shell_name_is_valid() over those two
+                 * bytes says no. That is the whole reason the first cut of
+                 * this rule compiled, ran, and changed nothing. */
+                char nmbuf[64];
+                size_t nmlen = 0;
+                bool nmok = true;
+                for (char *z = start; z < words + wpos; z++) {
+                    if (*z == SHELL_ARG_MARK || *z == SHELL_NOSPLIT_MARK ||
+                        *z == SHELL_GLOB_ESC) continue;
+                    if (nmlen + 1 >= sizeof nmbuf) { nmok = false; break; }
+                    nmbuf[nmlen++] = *z;
+                }
+                int bd = 0;
+                const char *q = p;
+                for (; *q && *q != '\n' && *q != ';' && *q != '&' &&
+                       *q != '|'; q++) {
+                    if (*q == '[') bd++;
+                    else if (*q == ']') { bd--; if (bd == 0) break; }
+                }
+                if (nmok && nmlen > 0 && shell_name_is_valid(nmbuf, nmlen) &&
+                    bd == 0 && *q == ']') {
+                    /* ENTER the subscript; every byte of it still goes
+                     * through the ordinary path below. The first cut copied
+                     * the span RAW and that was wrong: it skipped quote
+                     * removal and expansion, so `a["$var"]=b` keyed on the
+                     * five literal characters instead of on x, and it broke
+                     * four associative cases to fix two indexed ones. */
+                    sub_depth = 1;
+                }
+            } else if (sub_depth > 0) {
+                if (*p == '[') sub_depth++;
+                else if (*p == ']') sub_depth--;
+            }
             /* AN ARRAY LITERAL IS ONE WORD, spaces and all.
              *
              *     a=(one two three)
