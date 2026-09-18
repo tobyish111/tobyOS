@@ -13660,6 +13660,98 @@ static void shell_word_tilde(char *w, size_t cap) {
     if (o + 1 <= cap) memcpy(w, out, o + 1);
 }
 
+/* ${v:off} and ${v:off:len} -- SUBSTRING EXPANSION, which tsh did not have at
+ * all. `${x:2}` was a flat "bad substitution", and so was every corpus case
+ * that uses one. The gap survived because SLICING already existed: the array
+ * form `${a[@]:1:2}` has worked for a while, and it simply could not be
+ * reached without a subscript to get into the array branch.
+ *
+ * `off` and `len` are ARITHMETIC EXPRESSIONS, so they go through the same
+ * sh_subscript_eval() the array slice uses rather than a second integer
+ * parser appearing here. Splitting on the FIRST colon is that code's rule
+ * too, and it is what makes `${x:i?1:2}` the documented loss.
+ *
+ * MEASURED against bash 5.2, which is also the gate's oracle:
+ *
+ *     x=abcdef
+ *     ${x:2}    cdef    ${x: -2}   ef      (the blank is the only thing
+ *     ${x:2:2}  cd      ${x:2:-1}  cde      keeping `:-` a default word)
+ *     ${x:10}   ''      ${x:}      bad substitution -- an EMPTY spec is an
+ *                                  error, not offset 0
+ *     set -- p q r s
+ *     ${@:2}    q r s   ${@:0}     $0 p q r s  -- INDEX 0 IS $0, not $1,
+ *                                  which is why the list length is N+1
+ */
+static int shell_expand_substring(const char *name, const char *spec,
+                                  char *buf, size_t *pos, size_t cap) {
+    if (!spec || !*spec) {
+        kprintf("shell: bad substitution\n");
+        return -1;
+    }
+    char sbuf[256];                 /* an arithmetic spec, not a value */
+    size_t sl = strlen(spec);
+    if (sl + 1 > sizeof sbuf) {
+        kprintf("shell: bad substitution\n");
+        return -1;
+    }
+    memcpy(sbuf, spec, sl + 1);
+    char *split = 0;
+    for (char *q = sbuf; *q; q++) if (*q == ':') { split = q; break; }
+    bool have_len = (split != 0);
+    if (split) *split = '\0';
+    long off = 0, cnt = 0;
+    if (!sh_subscript_eval(sbuf, name, false, &off)) off = 0;
+    if (have_len && !sh_subscript_eval(split + 1, name, false, &cnt)) cnt = 0;
+
+    if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
+        bool star = (name[0] == '*');
+        long n = (long)g_positional_count + 1;      /* +1 for $0 */
+        if (off < 0) { off = n + off; if (off < 0) off = 0; }
+        long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
+        if (end > n) end = n;
+        char sep = ' ';
+        const char *ifs = env_get("IFS");
+        if (ifs && *ifs) sep = ifs[0];
+        else if (ifs) sep = '\0';
+        if (!star && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+            return -1;
+        bool first = true;
+        for (long i = off; i < end; i++) {
+            const char *v = (i == 0) ? (g_param0 ? g_param0 : "tobysh")
+                                     : g_positional[i - 1];
+            if (!v) continue;
+            if (!first) {
+                if (!star) {
+                    if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                        return -1;
+                } else if (sep) {
+                    if (shell_append_char(buf, pos, cap, sep) < 0) return -1;
+                }
+            }
+            first = false;
+            if (shell_append_data_str(buf, pos, cap, v) < 0) return -1;
+        }
+        return 0;
+    }
+
+    char value[SHELL_PARSE_BUF_MAX];
+    bool is_set = false, vjoin = false;
+    if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0) {
+        kprintf("shell: parameter expansion too long\n");
+        return -1;
+    }
+    (void)is_set;                   /* an unset parameter slices to empty */
+    long n = (long)strlen(value);
+    if (off < 0) { off = n + off; if (off < 0) off = 0; }
+    if (off > n) off = n;
+    long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
+    if (end > n) end = n;
+    if (end < off) end = off;
+    return vjoin
+        ? shell_append_n(buf, pos, cap, value + off, (size_t)(end - off))
+        : shell_append_data_n(buf, pos, cap, value + off, (size_t)(end - off));
+}
+
 /* Is `t` something bash will accept as the TARGET of an indirection?
  *
  * A parameter designator -- a name, `@`, `*`, a digit, `?`, `#`, `$`, `-` --
@@ -14259,6 +14351,11 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         if (*op == '-' || *op == '=' || *op == '?' || *op == '+') {
             opch = *op++;
             word = op;
+        } else if (colon) {
+            /* A colon NOT followed by one of - = ? + is a SUBSTRING,
+             * not a malformed default. This `else` is where all 31 of
+             * the corpus's ${x:n} cases used to die. */
+            return shell_expand_substring(name, op, buf, pos, cap);
         } else {
             kprintf("shell: bad substitution\n");
             return -1;
