@@ -14763,6 +14763,21 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                             char kbuf[256];
                             if (slen + 1 > sizeof kbuf) return 0;
                             memcpy(kbuf, sub, slen); kbuf[slen] = '\0';
+                            /* THE KEY IS A WORD: it expands, and its quotes
+                             * come off. The two sides disagreed. `a[\"aa\"]=b`
+                             * is an assignment word, so the ordinary path
+                             * had already unquoted it to `aa`, while this
+                             * lookup asked for the four characters
+                             * `\"aa\"` and found nothing. Storing and reading the
+                             * same literal did not round-trip. */
+                            char kx[256], kj[256];
+                            if (shell_expand_word_ex(kbuf, kx, sizeof kx,
+                                                     true, true) >= 0 &&
+                                shell_argmarks_to_spaces(kx, kj,
+                                                         sizeof kj) >= 0) {
+                                memcpy(kbuf, kj, sizeof kbuf);
+                                kbuf[sizeof kbuf - 1] = '\0';
+                            }
                             const char *v = sh_array_get_key(nm, kbuf);
                             if (count)
                                 return shell_append_uint(buf, pos, cap,
