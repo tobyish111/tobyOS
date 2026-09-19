@@ -16738,7 +16738,12 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              * The matching `]` is found BEFORE anything is consumed: an
              * unterminated `[` has to stay an ordinary character rather
              * than swallow the rest of the line. */
-            if (*p == '[' && prefix_ok) {
+            /* sub_depth == 0 GUARDS THE ENTRY. Without it the INNER `[`
+             * of `a[ i[1] ]=1` re-entered this branch, failed the name
+             * test on `a[ i`, and fell through WITHOUT incrementing the
+             * depth -- so the inner `]` closed the subscript and the
+             * word ended at the next blank. */
+            if (*p == '[' && prefix_ok && sub_depth == 0) {
                 /* MEASURE THE NAME ACROSS THE IN-BAND MARKERS. The word
                  * buffer is not plain text: a no-split run is already open
                  * by the time the name is written, so `a` arrives as
