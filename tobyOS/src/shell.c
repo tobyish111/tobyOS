@@ -2816,16 +2816,27 @@ static void cmd_local(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    bool l_array = false, l_assoc = false;
     for (int i = 1; i < argc; i++) {
         /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
          * flag as a variable NAME produced "local: bad name '-a'" and left
-         * the array unscoped. The attributes themselves are carried by the
-         * assignment that follows (an array literal makes an array), so the
-         * flag only has to be skipped, not interpreted. */
-        if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
+         * the array unscoped.
+         *
+         * The old comment here said the flag only had to be SKIPPED, on the
+         * grounds that the assignment carries the attribute -- an array
+         * literal makes an array. That stopped being true for `local -a x`
+         * with NO value: nothing downstream could then tell a declared-empty
+         * ARRAY from an empty scalar, and `"${x[@]}"` interpolated one
+         * empty word where bash interpolates none. The flag is recorded
+         * now, exactly as declare records it. */
         if (argv[i][0] == '-' && argv[i][1] &&
             (argv[i][1] == 'a' || argv[i][1] == 'A' || argv[i][1] == 'i' ||
-             argv[i][1] == 'r' || argv[i][1] == 'x') && !argv[i][2]) continue;
+             argv[i][1] == 'r' || argv[i][1] == 'x') && !argv[i][2]) {
+            if (argv[i][1] == 'a') l_array = true;
+            if (argv[i][1] == 'A') { l_array = true; l_assoc = true; }
+            continue;
+        }
+        if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
         if (!has_value) klen = strlen(argv[i]);
@@ -2848,11 +2859,17 @@ static void cmd_local(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+        if (l_assoc) (void)sh_array_make_assoc(name);
         if (has_value) {
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
         } else if (!already) {
             int idx = env_find(name, klen);
             if (idx >= 0) env_remove_at(idx);
+        }
+        if (l_array) {
+            if (!env_get(name)) (void)env_set(name, "");
+            int aidx = env_find(name, strlen(name));
+            if (aidx >= 0) g_env_flags[aidx] |= SHVAR_ARRAY;
         }
     }
 }
