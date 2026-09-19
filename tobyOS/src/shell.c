@@ -9425,7 +9425,7 @@ static bool test_is_unary_op(const char *s) {
      * shell-option test for the same reason. */
     static const char *const u[] = {
         "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-n", "-o",
-        "-p", "-r", "-s", "-t", "-u", "-w", "-x", "-z", "-G", "-L", "-N",
+        "-p", "-r", "-s", "-t", "-u", "-v", "-w", "-x", "-z", "-G", "-L", "-N",
         "-O", "-S", 0
     };
     for (int i = 0; u[i]; i++) if (strcmp(s, u[i]) == 0) return true;
@@ -9496,6 +9496,34 @@ static bool test_access_ok(const struct vfs_stat *st, unsigned want) {
 }
 
 static int test_unary(const char *op, const char *operand) {
+    /* `-v NAME` -- is that parameter SET? It was missing from the unary
+     * table entirely, so `[[ -v x ]]` was a syntax error even for a plain
+     * scalar, and every `[[ -v a[k] ]]` in the corpus died the same way.
+     *
+     * A SUBSCRIPT ASKS ABOUT THE ELEMENT, following the table it belongs
+     * to: a literal key for an associative array, arithmetic for an
+     * indexed one. `a[@]` and `a[*]` ask whether the array has ANY
+     * element. A bare NAME on an array means element 0, which is why
+     * `a=(); [[ -v a ]]` is false in bash while `a=(1)` is true. */
+    if (strcmp(op, "-v") == 0) {
+        char nm[128], sub[128];
+        if (sh_split_subscript(operand, strlen(operand), nm, sizeof nm,
+                               sub, sizeof sub)) {
+            if (sub[0] && !sub[1] && (sub[0] == '@' || sub[0] == '*')) {
+                struct sh_array *ar = sh_array_find(nm);
+                return (ar && ar->n > 0) ? 0 : 1;
+            }
+            if (sh_array_is_assoc(nm))
+                return sh_array_get_key(nm, sub) ? 0 : 1;
+            long ix = 0;
+            if (!sh_subscript_eval(sub, nm, false, &ix)) return 1;
+            return sh_array_get(nm, ix) ? 0 : 1;
+        }
+        if (env_find(operand, strlen(operand)) >= 0) return 0;
+        if (sh_array_is_assoc(operand))
+            return sh_array_get_key(operand, "0") ? 0 : 1;
+        return sh_array_get(operand, 0) ? 0 : 1;
+    }
     if (strcmp(op, "-n") == 0) return operand[0] != '\0' ? 0 : 1;
     if (strcmp(op, "-z") == 0) return operand[0] == '\0' ? 0 : 1;
     if (strcmp(op, "-t") == 0) {
