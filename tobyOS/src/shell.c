@@ -2911,7 +2911,7 @@ static struct shell_shopt g_shopts[] = {
     { "nullglob",             &g_shopt_nullglob,             false, false },
     { "failglob",             &g_shopt_failglob,             false, false },
     { "dotglob",              &g_shopt_dotglob,              false, false },
-    { "extglob",              &g_shopt_extglob,              false, false },
+    { "extglob",              &g_shopt_extglob,              true,  false },
     { "globstar",             &g_shopt_globstar,             true,  false },
     { "nocaseglob",           &g_shopt_nocaseglob,           false, false },
     { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
@@ -7575,6 +7575,32 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * both of which the scanner already knows. */
         {
             char prev = (st->start && p > st->start) ? p[-1] : '\0';
+            /* AN EXTGLOB GROUP IS PART OF THE WORD, not a subshell.
+             * `echo @(*.cc|*.h)` reaches here as a `(` GLUED to a word,
+             * which is otherwise `echo a(b)` and a syntax error -- so the
+             * scanner rejected it before the tokenizer ever saw it.
+             *
+             * Consumed whole, right here: the `|` inside is alternation
+             * rather than a pipe and the `)` must not unbalance the
+             * paren count, so neither may reach the rest of the scanner.
+             * Gated on the shopt because that is exactly what bash gates:
+             * with extglob OFF it reports a syntax error on this `(`.
+             * Not at command position -- there `!(cmd)` is a negated
+             * subshell, which the glued_word test below already knows. */
+            if (g_shopt_extglob && !st->cmd_pos &&
+                (prev == '?' || prev == '*' || prev == '+' ||
+                 prev == '@' || prev == '!')) {
+                int d = 0;
+                do {
+                    if (*p == '(') d++;
+                    else if (*p == ')') d--;
+                    p++;
+                } while (*p && d > 0);
+                st->cmd_seen = true;
+                st->no_sep = false;
+                *pp = p;
+                return;
+            }
             bool glued_eq = (prev == '=');
             /* Glued to the end of an ordinary WORD: `echo a(b)`,
              * `foo$identity('z')`. A subshell never starts that way. */
@@ -13839,7 +13865,21 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                     return -1;
                 }
             } else if (dq_syntax) {
+                /* An unquoted `\\x` means the BYTE x, and dropping the
+                 * backslash here loses that the byte was escaped. Harmless
+                 * while a paren meant nothing to the matcher; now that
+                 * `@(`/`*(` open a group it is not: `${x%*\\(\\)}` arrived as
+                 * `*()` and was read as zero-or-more-of-nothing instead of
+                 * a literal `()`. Re-mark the metacharacters so the matcher
+                 * still sees "this byte, literally"; the mark is removed
+                 * again by shell_strip_glob_escapes at the end of word
+                 * processing, so nothing else can observe it. */
                 p++;              /* unquoted word: escape, next byte literal */
+                if (*p == '*' || *p == '?' || *p == '[' || *p == ']' ||
+                    *p == '(' || *p == ')') {
+                    if (shell_append_char(out, &pos, cap, SHELL_GLOB_ESC) < 0)
+                        return -1;
+                }
             } else if (p[1] == '$' || p[1] == '`' ||
                        p[1] == '\\' || p[1] == '\n') {
                 p++;              /* here-doc body: special only before these */
@@ -16854,6 +16894,29 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              * with `=`, so `echo (x)` and `f (x)` keep their meanings. The
              * validity scanner above already rejects the illegal shapes
              * (`ls foo=(1 2)`, `a= (1 2)`, `for x in a=()`). */
+            /* AN EXTGLOB GROUP IS ONE WORD, and `shopt -s extglob` is what
+             * permits it here. `echo @(*.cc|*.h)` has to survive the
+             * tokenizer with its `(` and `|` intact, or the globber never
+             * sees a pattern. Without the shopt bash reports a SYNTAX
+             * ERROR on the `(` -- measured -- so leaving it alone when the
+             * option is off is the matching behaviour, not a shortfall.
+             *
+             * The operator is already in the word, so the test is the byte
+             * before, exactly as the [[ ]] splitter does it. */
+            if (*p == '(' && g_shopt_extglob && wpos > 0 &&
+                (words[wpos-1] == '?' || words[wpos-1] == '*' ||
+                 words[wpos-1] == '+' || words[wpos-1] == '@' ||
+                 words[wpos-1] == '!')) {
+                int depth = 0;
+                do {
+                    if (*p == '(') depth++;
+                    else if (*p == ')') depth--;
+                    if (shell_append_char(words, &wpos, word_cap, *p) < 0)
+                        return -1;
+                    p++;
+                } while (*p && depth > 0);
+                continue;
+            }
             if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' &&
                 (prefix_ok || decl_util_cmd)) {
                 int depth = 0;
@@ -17450,6 +17513,12 @@ static bool shell_has_glob(const char *s) {
             continue;
         }
         if (*s == '*' || *s == '?' || *s == '[') return true;
+        /* AN EXTGLOB GROUP MAKES A WORD A PATTERN even when it carries no
+         * other metacharacter. `echo @(foo|bar).py` has neither `*`, `?`
+         * nor `[`, so this said "not a glob", the globber never ran, and
+         * the word reached the command VERBATIM -- which is what every
+         * remaining extglob-files case was printing. */
+        if ((*s == '@' || *s == '+' || *s == '!') && s[1] == '(') return true;
     }
     return false;
 }
@@ -17553,29 +17622,176 @@ static bool shell_glob_bracket(const char **pp, char c) {
     return negate ? !matched : matched;
 }
 
-static bool shell_glob_match(const char *pat, const char *name) {
-    while (*pat) {
+/* ---- EXTENDED GLOBS: ?() *() +() @() !() -------------------------------
+ *
+ * MEASURED against bash 5.2 on the box, because the gating is not what the
+ * manual leads you to expect:
+ *
+ *     [[ --verbose == --@(help|verbose) ]]      TRUE with NO shopt at all
+ *     case --verbose in --@(help|verbose))      TRUE, likewise
+ *     v=foo.cc; echo ${v##@(foo|bar).}          cc
+ *     echo @(*.cc|*.h)                          needs `shopt -s extglob`,
+ *                                               and WITHOUT it bash reports
+ *                                               a SYNTAX ERROR on the `(`
+ *
+ * So the shopt gates the TOKENIZER -- whether `@(` may begin a word at all --
+ * and not the matcher. Every pattern that reaches here is already in a
+ * context where bash honours extglob, so the matcher honours it
+ * unconditionally.
+ *
+ *     @(a|b)   exactly one alternative
+ *     ?(a|b)   zero or one
+ *     *(a|b)   zero or more
+ *     +(a|b)   one or more
+ *     !(a|b)   anything the list does NOT match
+ *
+ * THE MATCHER IS NOW BOUNDED at both ends. An alternative is a SLICE of the
+ * pattern, and the text it must match is a SLICE of the name, so neither can
+ * be a NUL-terminated C string any more. Rather than grow a second matcher
+ * for slices -- this file has been burned twice by a second copy of
+ * something, most recently the two $'...' decoders in 86aec7d -- the one
+ * matcher takes end pointers and the old two-argument entry point becomes a
+ * wrapper over it.
+ */
+
+/* The `)` that closes the group `p` opens, or 0. `p` points at the `(`. */
+static const char *eg_close_paren(const char *p, const char *pend) {
+    int depth = 0;
+    for (; p < pend; p++) {
+        if (*p == '\\' && p + 1 < pend) { p++; continue; }
+        if (*p == '(') depth++;
+        else if (*p == ')') { if (--depth == 0) return p; }
+    }
+    return 0;
+}
+
+/* The next top-level `|` in [p,end), or `end`. Nested groups do not count. */
+static const char *eg_next_alt(const char *p, const char *end) {
+    int depth = 0;
+    for (; p < end; p++) {
+        if (*p == '\\' && p + 1 < end) { p++; continue; }
+        if (*p == '(') depth++;
+        else if (*p == ')') depth--;
+        else if (*p == '|' && depth == 0) return p;
+    }
+    return end;
+}
+
+static bool shell_glob_match_e(const char *pat, const char *pend,
+                               const char *name, const char *nend);
+
+/* Zero or more repetitions of the alternation in [ls,le), then [rest,pend).
+ * Shared by `*(...)` and, after one forced repetition, by `+(...)`. */
+static bool eg_match_star(const char *ls, const char *le,
+                          const char *rest, const char *pend,
+                          const char *name, const char *nend) {
+    /* Zero more repetitions. */
+    if (shell_glob_match_e(rest, pend, name, nend)) return true;
+    for (const char *as = ls; as <= le; ) {
+        const char *ae = eg_next_alt(as, le);
+        /* A repetition must consume at least one character, or `*(a|)` on a
+         * non-matching name would recurse on the same position forever. */
+        for (const char *n = name + 1; n <= nend; n++) {
+            if (shell_glob_match_e(as, ae, name, n) &&
+                eg_match_star(ls, le, rest, pend, n, nend))
+                return true;
+        }
+        if (ae >= le) break;
+        as = ae + 1;
+    }
+    return false;
+}
+
+/* `pat` points at the operator; `lp` at the `(`. Returns true/false in
+ * `*out` when this is a well-formed group, and false as the return value
+ * when it is not one (so the caller treats the character literally). */
+static bool eg_try(char op, const char *lp, const char *pend,
+                   const char *name, const char *nend, bool *out) {
+    const char *rp = eg_close_paren(lp, pend);
+    if (!rp) return false;                      /* unbalanced: literal */
+    const char *ls = lp + 1, *le = rp;
+    const char *rest = rp + 1;
+
+    if (op == '*') { *out = eg_match_star(ls, le, rest, pend, name, nend); return true; }
+    if (op == '!') {
+        /* Any split whose prefix the list does NOT match, and whose
+         * remainder matches the rest of the pattern. */
+        for (const char *n = name; n <= nend; n++) {
+            bool hit = false;
+            for (const char *as = ls; as <= le; ) {
+                const char *ae = eg_next_alt(as, le);
+                if (shell_glob_match_e(as, ae, name, n)) { hit = true; break; }
+                if (ae >= le) break;
+                as = ae + 1;
+            }
+            if (!hit && shell_glob_match_e(rest, pend, n, nend)) { *out = true; return true; }
+        }
+        *out = false;
+        return true;
+    }
+    if (op == '?' && shell_glob_match_e(rest, pend, name, nend)) { *out = true; return true; }
+
+    for (const char *as = ls; as <= le; ) {
+        const char *ae = eg_next_alt(as, le);
+        for (const char *n = name; n <= nend; n++) {
+            if (!shell_glob_match_e(as, ae, name, n)) continue;
+            bool ok = (op == '+')
+                        ? eg_match_star(ls, le, rest, pend, n, nend)
+                        : shell_glob_match_e(rest, pend, n, nend);
+            if (ok) { *out = true; return true; }
+        }
+        if (ae >= le) break;
+        as = ae + 1;
+    }
+    *out = false;
+    return true;
+}
+
+static bool shell_glob_match_e(const char *pat, const char *pend,
+                               const char *name, const char *nend) {
+    while (pat < pend) {
+        /* EXTGLOB FIRST, and that ordering is the whole bug if you get it
+         * wrong: the `*` fast path below collapses a run of stars, so it
+         * would swallow the `*` of `*(ab)` and leave `(ab)` as literals. */
+        if ((*pat == '?' || *pat == '*' || *pat == '+' ||
+             *pat == '@' || *pat == '!') &&
+            pat + 1 < pend && pat[1] == '(') {
+            bool r = false;
+            if (eg_try(*pat, pat + 1, pend, name, nend, &r)) return r;
+        }
         /* A backslash makes the next character literal. This is how a QUOTED
          * metacharacter survives: `case $v in "*")` must match the one-character
          * string `*`, not everything. shell_case_unquote() strips the quotes
          * and escapes what was inside them, so the distinction between `*` and
          * `"*"` reaches here instead of being lost with the quotes. */
         if ((*pat == '\\' || *pat == SHELL_GLOB_ESC ||
-             *pat == SHELL_DATA_ESC) && pat[1]) {
-            if (*name != pat[1]) return false;
+             *pat == SHELL_DATA_ESC) && pat + 1 < pend) {
+            if (name >= nend || *name != pat[1]) return false;
             pat += 2;
             name++;
             continue;
         }
         if (*pat == '*') {
-            while (*pat == '*') pat++;
-            if (!*pat) return true;
+            while (pat < pend && *pat == '*') {
+                /* ...but a star that OPENS A WELL-FORMED GROUP is not part
+                 * of the run. The `eg_close_paren` test is not decoration:
+                 * `${line##*([}` has a `*(` with NO closing paren, so the
+                 * group is invalid and eg_try() above already declined it.
+                 * Breaking on the bare `(` then left `pat` sitting on the
+                 * `*` and the loop below re-entered with the SAME pattern
+                 * and the same name -- unbounded recursion, not a wrong
+                 * answer. It took out three POSIX cases. */
+                if (pat + 1 < pend && pat[1] == '(' &&
+                    eg_close_paren(pat + 1, pend)) break;
+                pat++;
+            }
+            if (pat >= pend) return true;
             for (const char *n = name; ; n++) {
-                if (shell_glob_match(pat, n)) return true;
-                if (!*n) return false;
+                if (shell_glob_match_e(pat, pend, n, nend)) return true;
+                if (n >= nend) return false;
             }
         }
-        if (!*name) return false;
+        if (name >= nend) return false;
         if (*pat == '?') {
             pat++;
             name++;
@@ -17592,7 +17808,12 @@ static bool shell_glob_match(const char *pat, const char *name) {
         pat++;
         name++;
     }
-    return *name == '\0';
+    return name == nend;
+}
+
+static bool shell_glob_match(const char *pat, const char *name) {
+    if (!pat || !name) return false;
+    return shell_glob_match_e(pat, pat + strlen(pat), name, name + strlen(name));
 }
 
 static int shell_expand_tilde_word(struct shell_pipeline *pl,
@@ -20737,6 +20958,7 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
         size_t rp = 0;
         bool quoted = false;
         bool bare_paren = false;
+        int eg_depth = 0;          /* inside an extglob group @( ... ) */
         while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
             /* AN UNQUOTED PARENTHESIS INSIDE A WORD IS A SYNTAX ERROR.
              *
@@ -20745,8 +20967,23 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
              * `(` and `)` are grouping OPERATORS in this grammar, so bash's
              * lexer will not have them glued into an operand. Treating them
              * as ordinary pattern characters made that line match and print
-             * where bash refuses to run it at all. A quoted one is data. */
-            if (*p == '(' || *p == ')') bare_paren = true;
+             * where bash refuses to run it at all. A quoted one is data.
+             *
+             * AN EXTGLOB GROUP IS THE EXCEPTION, and it needs no shopt:
+             * `[[ --verbose == --@(help|verbose) ]]` is TRUE in bash with
+             * extglob OFF -- measured on the box. The shopt gates whether
+             * `@(` may open a word in COMMAND position, not whether this
+             * grammar accepts one. The operator character is already in
+             * `raw`, so the test is simply what precedes the paren. */
+            if (*p == '(' && rp > 0 &&
+                (raw[rp-1] == '?' || raw[rp-1] == '*' || raw[rp-1] == '+' ||
+                 raw[rp-1] == '@' || raw[rp-1] == '!')) {
+                eg_depth++;
+            } else if (*p == ')' && eg_depth > 0) {
+                eg_depth--;
+            } else if (*p == '(' || *p == ')') {
+                bare_paren = true;
+            }
             if (*p == '\'') {
                 quoted = true;
                 if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
