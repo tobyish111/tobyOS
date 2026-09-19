@@ -167,6 +167,9 @@ static int g_last_status;
  * tsh printed the empty substitution and carried on. */
 static bool g_parse_error;
 static int g_last_bg_pid;
+/* Set in a background child whose text is ONE simple command: the external
+ * it runs may REPLACE this process rather than be spawned and waited on. */
+static bool g_bg_exec_ok;
 static int g_getopts_last_optind;
 static int g_getopts_char_index;
 static bool g_getopts_internal_optind_write;
@@ -12554,6 +12557,18 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         .sandbox_profile = profile,
         .cwd = shell_cwd(),
     };
+#ifdef SHELL_HOSTED
+    /* THE BACKGROUND CHILD EXECS ITS ONE EXTERNAL instead of spawning it
+     * and waiting -- so the job is one process and `$!` names it. Only
+     * when the child's whole text was that one simple command, only in the
+     * foreground (a nested `&` spawns), and never twice. A failed exec
+     * falls through to the spawn below, which is what ran before. */
+    if (g_bg_exec_ok && !background) {
+        extern int proc_exec_in_place(const struct proc_spec *);
+        g_bg_exec_ok = false;
+        (void)proc_exec_in_place(&spec);
+    }
+#endif
     int pid = proc_spawn(&spec);
     if (pid < 0) {
         /* 127 IS "NOT FOUND", 126 IS "FOUND BUT COULD NOT RUN". POSIX XCU
@@ -19487,6 +19502,52 @@ static int shell_run_function(struct shell_simple *cmd) {
 extern int fork(void);
 extern void _exit(int status);
 
+/* Is `text` ONE SIMPLE COMMAND -- no unquoted metacharacter, no leading
+ * compound keyword? Decides whether the background child may EXEC it.
+ *
+ * CONSERVATIVE BY CONSTRUCTION. Only a text this is SURE about qualifies;
+ * anything else keeps the spawn-and-wait the child does today, which is
+ * behaviour-neutral. Quoting is tracked with the same shell_scan walker
+ * shell_find_bg_at() uses, so `echo "a|b" &` is still simple.
+ *
+ * This is deliberately NOT a reason to skip the fork. A backgrounded
+ * command is a subshell INCLUDING ITS EXPANSIONS -- `echo ${bar=2} &` must
+ * assign bar in the child only, and routing a simple command to the token
+ * parser broke exactly that (shparity 67, three runs out of three). The
+ * fork stays; only what the child does with the external changes. */
+static bool shell_bg_text_is_simple(const char *s, const char *end) {
+    static const char *const kw[] = {
+        "if", "while", "until", "for", "case", "select",
+        "function", "time", "do", "then", "else", "elif", 0 };
+    struct shell_scan st;
+    shell_scan_init(&st);
+    const char *p = s;
+    bool first = true;
+    while (p < end && *p) {
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p >= end || !*p) break;
+        if (!shell_scan_incomplete(&st)) {
+            char c = *p;
+            if (c == '|' || c == ';' || c == '&' || c == '(' || c == ')' ||
+                c == '{' || c == '}' || c == '!' || c == '\n')
+                return false;
+            if (first) {
+                for (int i = 0; kw[i]; i++) {
+                    size_t n = strlen(kw[i]);
+                    if ((size_t)(end - p) >= n &&
+                        strncmp(p, kw[i], n) == 0 &&
+                        (p + n >= end || p[n] == ' ' || p[n] == '\t'))
+                        return false;
+                }
+            }
+        }
+        first = false;
+        const char *before = p;
+        shell_scan_token(&st, &p);
+        if (p <= before) p = before + 1;
+    }
+    return true;
+}
 static int shell_background_forked(const char *text, const char *label) {
     int pid = fork();
     if (pid < 0) {
@@ -19506,6 +19567,9 @@ static int shell_background_forked(const char *text, const char *label) {
          * parent's view of a backgrounded pipeline; the copy inside the fork
          * needs its own. */
         shell_trap_clear_all();
+        /* ONE simple external may replace this process -- see
+         * shell_bg_text_is_simple and proc_exec_in_place. */
+        g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
         execute_line_text(text);
         int st = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
@@ -19603,6 +19667,11 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
             /* Only when there IS a prefix. A function shares the caller's
              * environment, so `f() { g=1; }; f` must leave g set -- snapshotting
              * around every call would roll that back. */
+            /* A function or builtin body may run externals of its own;
+             * none of those is THE background command, so they spawn. */
+            if (shell_function_lookup(exec_cmd.argv[0]) ||
+                shell_cmd_lookup(exec_cmd.argv[0]))
+                g_bg_exec_ok = false;
             if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
                 if (shell_env_frame_capture(&env_frame) == 0) restore = true;
                 if (shell_apply_assignments_ex(cmd->argv, assignc, "shell",
@@ -19622,6 +19691,7 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
     } else {
         bool is_fn = shell_function_lookup(exec_cmd.argv[0]) != 0;
         bool is_bi = shell_cmd_lookup(exec_cmd.argv[0]) != 0;
+        g_bg_exec_ok = false;      /* a nested `&` is never the exec target */
         if (is_fn || is_bi) {
 #ifdef SHELL_HOSTED
             /* Fork and run it there -- see shell_background_forked. Rebuild

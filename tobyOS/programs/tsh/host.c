@@ -568,6 +568,59 @@ int proc_spawn(const struct proc_spec *spec) {
                               fd0, fd1, fd2, nextra ? extra : 0, nextra);
 }
 
+/* REPLACE THIS PROCESS with the program -- the exec half of fork+exec.
+ *
+ * proc_spawn() above is the only way tsh has ever run an external, and a
+ * backgrounded command therefore became TWO processes: the forked shell
+ * that expanded the text, and the program that shell then spawned and
+ * waited on. `$!` named the shell. Measured against bash on the box:
+ *
+ *     tsh    SELF=111  $!=113 (a tsh)   actual sleep=114
+ *     bash   SELF=106  $!=109            actual sleep=109
+ *
+ * So the child installs the same descriptors proc_spawn would have handed a
+ * new process -- into ITS OWN table, with dup2 -- and execs. On success it
+ * does not return; the fork pid is now the program, and `$!` is right for
+ * the same reason it is right in bash. Returns -1 only on failure, and the
+ * caller falls back to the spawn it would have done anyway. */
+int proc_exec_in_place(const struct proc_spec *spec) {
+    if (!spec || !spec->path) return -1;
+    int fd0 = spec->fd0 ? VF_FD(&spec->fd0->vfs) : 0;
+    int fd1 = spec->fd1 ? VF_FD(&spec->fd1->vfs) : 1;
+    int fd2 = spec->fd2 ? VF_FD(&spec->fd2->vfs) : 2;
+    /* Same offset rule as proc_spawn: `>>` lives in ->vfs.pos. */
+    if (spec->fd1 && fd1 > 2) (void)lseek(fd1, (off_t)spec->fd1->vfs.pos, SEEK_SET);
+    if (spec->fd2 && fd2 > 2) (void)lseek(fd2, (off_t)spec->fd2->vfs.pos, SEEK_SET);
+    if (spec->fd0 && fd0 > 2) (void)lseek(fd0, (off_t)spec->fd0->vfs.pos, SEEK_SET);
+    /* Extras first, then 0/1/2: an extra that targets 0/1/2 would otherwise
+     * be clobbered, and dup2 onto itself is a no-op so the common case is
+     * untouched. */
+    for (int i = 0; i < spec->extra_nfds; i++) {
+        struct file *f = spec->extra_fds[i].f;
+        if (!f) continue;
+        int pfd = VF_FD(&f->vfs);
+        int cfd = spec->extra_fds[i].fd;
+        if (pfd < 0 || cfd < 0 || pfd == cfd) continue;
+        if (dup2(pfd, cfd) < 0) return -1;
+    }
+    if (fd0 != 0 && dup2(fd0, 0) < 0) return -1;
+    if (fd1 != 1 && dup2(fd1, 1) < 0) return -1;
+    if (fd2 != 2 && dup2(fd2, 2) < 0) return -1;
+
+    char *argv[ARG_MAX_HOST + 1];
+    int n = spec->argc;
+    if (n > ARG_MAX_HOST) n = ARG_MAX_HOST;
+    for (int i = 0; i < n; i++) argv[i] = spec->argv[i];
+    argv[n] = 0;
+    char *envp[ENV_MAX_HOST + 1];
+    int e = spec->envc;
+    if (e > ENV_MAX_HOST) e = ENV_MAX_HOST;
+    for (int i = 0; i < e; i++) envp[i] = spec->envp[i];
+    envp[e] = 0;
+    (void)execve(spec->path, argv, spec->envp ? envp : 0);
+    return -1;                      /* only reached when the exec failed */
+}
+
 int proc_wait(int pid) {
     int status = 0;
     /* Retry EINTR: the parent now receives SIGCHLD, and a wait must not
