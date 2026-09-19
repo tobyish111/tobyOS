@@ -2908,8 +2908,8 @@ static bool g_shopt_promptvars = true;
 
 static struct shell_shopt g_shopts[] = {
     { "expand_aliases",       &g_opt_expand_aliases,         true,  false },
-    { "nullglob",             &g_shopt_nullglob,             false, false },
-    { "failglob",             &g_shopt_failglob,             false, false },
+    { "nullglob",             &g_shopt_nullglob,             true , false },
+    { "failglob",             &g_shopt_failglob,             true , false },
     { "dotglob",              &g_shopt_dotglob,              false, false },
     { "extglob",              &g_shopt_extglob,              true,  false },
     { "globstar",             &g_shopt_globstar,             true,  false },
@@ -7587,9 +7587,14 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
              * with extglob OFF it reports a syntax error on this `(`.
              * Not at command position -- there `!(cmd)` is a negated
              * subshell, which the glued_word test below already knows. */
-            if (g_shopt_extglob && !st->cmd_pos &&
-                (prev == '?' || prev == '*' || prev == '+' ||
-                 prev == '@' || prev == '!')) {
+            /* `?*+@` can only be extglob operators, wherever they sit --
+             * `g=--@(help|verbose)` is an ASSIGNMENT and its `(` is at
+             * command position, so requiring !cmd_pos rejected it. Only
+             * `!` is ambiguous: at command position `!(cmd)` is a negated
+             * subshell, so that one keeps the restriction. */
+            if (g_shopt_extglob &&
+                (prev == '?' || prev == '*' || prev == '+' || prev == '@' ||
+                 (prev == '!' && !st->cmd_pos))) {
                 int d = 0;
                 do {
                     if (*p == '(') d++;
@@ -16809,7 +16814,10 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
          * A blank does not end the word while it is non-zero -- see the
          * rule just below. */
         int sub_depth = 0;
-        while (*p && (sub_depth > 0 ||
+        /* ...and the same for an extglob group: `@(a b|foo)` holds a blank
+         * and a `|`, and neither ends the word. */
+        int eg_depth = 0;
+        while (*p && (sub_depth > 0 || eg_depth > 0 ||
                       (!is_space(*p) && !shell_operator_char(*p)))) {
             got = true;
             /* A SUBSCRIPT IN ASSIGNMENT POSITION IS PART OF THE WORD,
@@ -16903,19 +16911,27 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              *
              * The operator is already in the word, so the test is the byte
              * before, exactly as the [[ ]] splitter does it. */
-            if (*p == '(' && g_shopt_extglob && wpos > 0 &&
+            if (*p == '(' && g_shopt_extglob && eg_depth == 0 && wpos > 0 &&
                 (words[wpos-1] == '?' || words[wpos-1] == '*' ||
                  words[wpos-1] == '+' || words[wpos-1] == '@' ||
                  words[wpos-1] == '!')) {
-                int depth = 0;
-                do {
-                    if (*p == '(') depth++;
-                    else if (*p == ')') depth--;
-                    if (shell_append_char(words, &wpos, word_cap, *p) < 0)
-                        return -1;
-                    p++;
-                } while (*p && depth > 0);
-                continue;
+                /* ENTER the group; every byte of it still travels the
+                 * ordinary path below. The first cut COPIED the span raw
+                 * and that was wrong for the same reason it was wrong for
+                 * array subscripts: a raw copy skips quote processing, so
+                 * `@('_*'|'_?')` kept its quote characters as literal
+                 * bytes and matched nothing. The quotes have to become
+                 * escapes, which only the normal path does.
+                 *
+                 * eg_depth == 0 guards the ENTRY -- without it the inner
+                 * `(` of `@(a|@(b|c))` re-enters here instead of counting,
+                 * and the inner `)` closes the group early. That exact bug
+                 * cost a round on the array subscripts (8573acb). */
+                eg_depth = 1;
+            } else if (eg_depth > 0 && *p == '(') {
+                eg_depth++;
+            } else if (eg_depth > 0 && *p == ')') {
+                eg_depth--;
             }
             if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' &&
                 (prefix_ok || decl_util_cmd)) {
@@ -17658,7 +17674,9 @@ static bool shell_glob_bracket(const char **pp, char c) {
 static const char *eg_close_paren(const char *p, const char *pend) {
     int depth = 0;
     for (; p < pend; p++) {
-        if (*p == '\\' && p + 1 < pend) { p++; continue; }
+        /* escape-aware: a marked byte is DATA, never grouping. */
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
+            p + 1 < pend) { p++; continue; }
         if (*p == '(') depth++;
         else if (*p == ')') { if (--depth == 0) return p; }
     }
@@ -17669,7 +17687,9 @@ static const char *eg_close_paren(const char *p, const char *pend) {
 static const char *eg_next_alt(const char *p, const char *end) {
     int depth = 0;
     for (; p < end; p++) {
-        if (*p == '\\' && p + 1 < end) { p++; continue; }
+        /* escape-aware: a marked `|` is a literal bar, not a separator. */
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
+            p + 1 < end) { p++; continue; }
         if (*p == '(') depth++;
         else if (*p == ')') depth--;
         else if (*p == '|' && depth == 0) return p;
@@ -18256,6 +18276,26 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         n = shell_expand_glob_word(pl, cur, word);
         if (n < 0) return -1;
         if (n > 0) return 0;
+        /* NOTHING MATCHED. The default is to hand the pattern through as a
+         * literal word, which is POSIX and is what every caller below
+         * assumes -- but two shopts change it, and both were declared and
+         * unwired:
+         *
+         *   nullglob  the word DISAPPEARS (zero arguments, not one)
+         *   failglob  the command does not run at all, status 1
+         *
+         * failglob wins when both are set, which is bash's order. */
+        if (g_shopt_failglob) {
+            kprintf("shell: no match: %s\n", word);
+            /* STATUS 1, NOT 2. bash does not run the command and leaves 1;
+             * a bare -1 here reaches the tokenizer's failure path and
+             * becomes the generic syntax-error 2. g_bad_subst_soft is the
+             * existing way to say "skip this command, status 1, keep
+             * reading". */
+            g_bad_subst_soft = true;
+            return -1;
+        }
+        if (g_shopt_nullglob) return 0;
     }
 
     if (!quoted) {
@@ -22066,7 +22106,13 @@ static int shell_expand_case_word(const char *src, char *out, size_t cap) {
 /* Glob metacharacters that must be neutralised when they came from inside
  * quotes -- `"*"` is the literal asterisk, not the match-anything pattern. */
 static bool shell_glob_meta(char c) {
-    return c == '*' || c == '?' || c == '[' || c == ']' || c == '\\';
+    /* `|`, `(` and `)` joined the set when extglob landed: inside a group
+     * they are alternation and grouping, so a QUOTED one has to be
+     * neutralised like any other metacharacter. A file really named `__|`
+     * is matched by `@('foo'|'__|'|bar)`, and without the mark the middle
+     * alternative was split in two at its own quoted bar. */
+    return c == '*' || c == '?' || c == '[' || c == ']' || c == '\\' ||
+           c == '|' || c == '(' || c == ')';
 }
 
 /* Strip one level of shell quoting from a case pattern, escaping whatever was
