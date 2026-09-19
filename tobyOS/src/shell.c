@@ -451,6 +451,7 @@ static void  sh_array_unset_key(struct sh_array *a, const char *key);
 static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                                 bool dq_syntax, bool sq_syntax);
 static void shell_strip_nosplit_inplace(char *s);
+static void shell_word_tilde(char *w, size_t cap);
 
 static long  sh_array_max_idx(const struct sh_array *a);
 static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
@@ -1194,6 +1195,9 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                  * gate printed '\x013\x015\x017' where bash prints '3 5 7'. */
                 if (shell_argmarks_to_spaces(vraw, vx, sizeof vx) < 0)
                     return -1;
+                /* An assignment's RHS tilde-expands, after the `=` and
+                 * after each `:` -- shell_word_tilde owns that rule. */
+                shell_word_tilde(vx, sizeof vx);
                 if (sh_array_is_assoc(name)) {
                     char kraw[256], kx[256];
                     if (shell_expand_word_ex(k, kraw, sizeof kraw, true, true) < 0)
@@ -1251,6 +1255,10 @@ static int sh_array_assign_literal(const char *name, const char *paren,
             char ex[SHELL_PARSE_BUF_MAX];
             if (shell_expand_word_ex(elem, ex, sizeof ex, true, true) < 0)
                 return -1;
+            /* A leading `~` on an UNQUOTED element expands, the same way
+             * the ordinary word path does it after expansion. `a=(~/src)`
+             * was storing the tilde. */
+            if (!quoted) shell_word_tilde(ex, sizeof ex);
             /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
              * is three elements -- and a quoted one never does. */
             if (sh_array_store_expanded(name, ex, !quoted, quoted, &next) < 0)
