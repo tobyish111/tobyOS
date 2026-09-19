@@ -15367,8 +15367,11 @@ static long shell_parse_long_value(const char *s, bool *ok) {
 #define SHELL_ARITH_MAX_DEPTH 32
 static int g_arith_depth;
 
-static long shell_arith_name_value(struct shell_arith *a, const char *name) {
-    const char *vstr = env_get(name);
+/* Evaluate a stored VALUE as an arithmetic expression. Split out of
+ * shell_arith_name_value() so an array ELEMENT gets the identical rule --
+ * `a[0]=1+1; echo $(( a[0] ))` is 2 for the same reason `x=1+1` is. */
+static long shell_arith_eval_str(struct shell_arith *a, const char *vstr,
+                                 const char *what) {
     if (!vstr) return 0;
     /* EMPTY *OR BLANK* IS ZERO, and the difference is a POSIX case. `a=''`
      * and `a2=' '` must both give 0; re-entering the parser on " " runs it
@@ -15380,7 +15383,7 @@ static long shell_arith_name_value(struct shell_arith *a, const char *name) {
         if (!*q) return 0;
     }
     if (g_arith_depth >= SHELL_ARITH_MAX_DEPTH) {
-        kprintf("shell: %s: expression recursion level exceeded\n", name);
+        kprintf("shell: %s: expression recursion level exceeded\n", what);
         a->ok = false;
         return 0;
     }
@@ -15393,6 +15396,53 @@ static long shell_arith_name_value(struct shell_arith *a, const char *name) {
     if (!inner.ok || *inner.p) { a->ok = false; r = 0; }
     g_arith_depth--;
     return r;
+}
+
+static long shell_arith_name_value(struct shell_arith *a, const char *name) {
+    return shell_arith_eval_str(a, env_get(name), name);
+}
+
+/* An ARRAY ELEMENT as an arithmetic target. `(( A[5] = 10 ))` and
+ * `(( A[5] += 6 ))` are ordinary bash, and tsh had no element lvalue at
+ * all: the name parser read `A`, stopped at the `[`, and the leftover
+ * `[5] = 10` failed the expression -- so the whole `((...))` reported a
+ * syntax error and the assignment never happened.
+ *
+ * The subscript follows the table it belongs to: a literal KEY for an
+ * associative array, an arithmetic expression for an indexed one, which
+ * is what sh_subscript_eval() already decides everywhere else. */
+static long sh_arith_elem_get(struct shell_arith *a, const char *name,
+                              const char *sub) {
+    const char *v = 0;
+    if (sh_array_is_assoc(name)) {
+        v = sh_array_get_key(name, sub);
+    } else {
+        long ix = 0;
+        if (sh_subscript_eval(sub, name, false, &ix)) v = sh_array_get(name, ix);
+    }
+    return shell_arith_eval_str(a, v, name);
+}
+
+/* Returns false when the SUBSCRIPT itself is not an expression, so the
+ * caller can fail the whole `$(( ))` the way bash does:
+ *
+ *     x='a[<(echo 42)]=1' ; echo $(( x ))
+ *     bash: syntax error, and the echo prints NOTHING
+ *
+ * Silently doing nothing and still returning the RHS made tsh print `1`
+ * for that -- an answer bash refuses to give. (It never RAN the process
+ * substitution, so this was a correctness gap, not the injection the
+ * case is named for.) */
+static bool sh_arith_elem_set(const char *name, const char *sub, long v) {
+    char tmp[32];
+    size_t tpos = 0;
+    tmp[0] = '\0';
+    if (shell_append_long(tmp, &tpos, sizeof tmp, v) < 0) return false;
+    tmp[tpos] = '\0';
+    if (sh_array_is_assoc(name)) return sh_array_set_key(name, sub, tmp) >= 0;
+    long ix = 0;
+    if (!sh_subscript_eval(sub, name, true, &ix)) return false;
+    return sh_array_set(name, ix, tmp) >= 0;
 }
 
 static long shell_arith_factor(struct shell_arith *a) {
@@ -15484,11 +15534,38 @@ static long shell_arith_factor(struct shell_arith *a) {
             name[n++] = *a->p++;
         }
         name[n] = '\0';
+        /* A SUBSCRIPT MAKES THE TARGET AN ELEMENT, for reading and for
+         * every assignment form below. Captured balanced so `a[b[1]]`
+         * works, and left empty when there is no `[`. */
+        char sub[128];
+        bool is_elem = false;
+        sub[0] = '\0';
+        if (*a->p == '[') {
+            const char *q = a->p;
+            int bd = 0;
+            for (; *q; q++) {
+                if (*q == '[') bd++;
+                else if (*q == ']') { bd--; if (bd == 0) break; }
+            }
+            if (bd == 0 && *q == ']') {
+                size_t sl = (size_t)(q - a->p - 1);
+                if (sl + 1 <= sizeof sub) {
+                    memcpy(sub, a->p + 1, sl);
+                    sub[sl] = '\0';
+                    is_elem = true;
+                    a->p = q + 1;
+                }
+            }
+        }
         shell_arith_skip(a);
         if (*a->p == '=' && a->p[1] != '=') {
             a->p++;
             long rhs = shell_arith_ternary(a);
             if (!a->ok) return 0;
+            if (is_elem) {
+                if (!sh_arith_elem_set(name, sub, rhs)) { a->ok = false; return 0; }
+                return rhs;
+            }
             char tmp[32];
             size_t tpos = 0;
             shell_append_long(tmp, &tpos, sizeof(tmp), rhs);
@@ -15502,7 +15579,8 @@ static long shell_arith_factor(struct shell_arith *a) {
             assign_op = *a->p;
             a->p += 2;
         }
-        long v = shell_arith_name_value(a, name);
+        long v = is_elem ? sh_arith_elem_get(a, name, sub)
+                         : shell_arith_name_value(a, name);
         if (!a->ok) return 0;
         if (assign_op) {
             long rhs = shell_arith_ternary(a);
@@ -15512,15 +15590,24 @@ static long shell_arith_factor(struct shell_arith *a) {
             else if (assign_op == '*') v *= rhs;
             else if (assign_op == '/') { if (rhs == 0) { a->ok = false; return 0; } v /= rhs; }
             else if (assign_op == '%') { if (rhs == 0) { a->ok = false; return 0; } v %= rhs; }
-            char tmp[32];
-            size_t tpos = 0;
-            shell_append_long(tmp, &tpos, sizeof(tmp), v);
-            env_set(name, tmp);
+            if (is_elem) {
+                if (!sh_arith_elem_set(name, sub, v)) { a->ok = false; return 0; }
+            }
+            else {
+                char tmp[32];
+                size_t tpos = 0;
+                shell_append_long(tmp, &tpos, sizeof(tmp), v);
+                env_set(name, tmp);
+            }
         }
         shell_arith_skip(a);
         if (a->p[0] == '+' && a->p[1] == '+') {
             a->p += 2;
             long ret = v;
+            if (is_elem) {
+                if (!sh_arith_elem_set(name, sub, v + 1)) { a->ok = false; return 0; }
+                return ret;
+            }
             char tmp[32]; size_t tpos = 0;
             shell_append_long(tmp, &tpos, sizeof(tmp), v + 1);
             env_set(name, tmp);
@@ -15529,6 +15616,10 @@ static long shell_arith_factor(struct shell_arith *a) {
         if (a->p[0] == '-' && a->p[1] == '-') {
             a->p += 2;
             long ret = v;
+            if (is_elem) {
+                if (!sh_arith_elem_set(name, sub, v - 1)) { a->ok = false; return 0; }
+                return ret;
+            }
             char tmp[32]; size_t tpos = 0;
             shell_append_long(tmp, &tpos, sizeof(tmp), v - 1);
             env_set(name, tmp);
