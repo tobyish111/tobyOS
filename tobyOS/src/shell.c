@@ -3565,6 +3565,22 @@ static void cmd_unset(int argc, char **argv) {
             if (sh_split_subscript(argv[i], al, nm, sizeof nm,
                                    sub, sizeof sub)) {
                 struct sh_array *arr = sh_array_find(nm);
+                /* `unset a[@]` and `unset a[*]` empty an INDEXED array --
+                 * every element, the array itself kept. tsh fell through
+                 * to sh_subscript_eval("@"), which is not a number, so
+                 * nothing happened and `unset d[@]` left all three
+                 * elements in place.
+                 *
+                 * NOT for an associative array: bash leaves that one
+                 * alone (measured -- `declare -A g=([x]=1 [y]=2);
+                 * unset "g[@]"` keeps both), so the assoc branch below
+                 * still runs first and takes `@` as a literal key. */
+                if (arr && !arr->assoc && sub[0] && !sub[1] &&
+                    (sub[0] == '@' || sub[0] == '*')) {
+                    sh_array_unset(nm);
+                    (void)sh_array_create(nm);
+                    continue;
+                }
                 if (arr && arr->assoc) { sh_array_unset_key(arr, sub); continue; }
                 long ix = 0;
                 if (arr && sh_subscript_eval(sub, nm, false, &ix)) {
