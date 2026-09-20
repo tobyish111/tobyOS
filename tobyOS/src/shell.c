@@ -479,7 +479,9 @@ struct file;
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      char *out, size_t cap,
                                      bool *got_any, char delim,
-                                     bool *escmap);
+                                     bool *escmap, long maxchars,
+                                     bool ignore_delim);
+static struct file *shell_builtin_fd(int n);
 static bool  sh_subscript_eval(const char *sub, const char *name,
                                bool for_write, long *out);
 /* Moved up from beside the evaluator: an array SUBSCRIPT is arithmetic
@@ -3602,7 +3604,7 @@ static void cmd_readarray(int argc, char **argv) {
             bool got_any = false;
             int rr = shell_read_line_from_file(in, true, line,
                                                sizeof line, &got_any,
-                                               delim, 0);
+                                               delim, 0, -1, false);
             /* !got_any IS end-of-input -- cmd_read uses exactly that test to
              * end `while read line`, and an EMPTY line still sets it, so a
              * blank line mid-file does not stop the read.
@@ -4137,38 +4139,41 @@ static bool shell_ifs_is_ws(const char *ifs, char c) {
 /* `delim` is the byte the record ends at -- '\n' normally, whatever `read -d`
  * was given otherwise. `read -d ''` passes '\0', which no input contains, so
  * the record runs to end of input; that is exactly what bash does with it. */
+/* One `read`: up to the delimiter (or EOF), with the backslash rules.
+ *
+ * Backslash-NEWLINE is a line continuation and vanishes, whatever the
+ * delimiter is (`read -d ,` on `a b\<newline>c d` gives `a bc d`); an
+ * escaped anything-else is that byte, the delimiter included (`a b\,c d`
+ * under -d , reads on past the comma), marked in escmap so the field
+ * splitter does not treat it as IFS. Both measured against bash (1127);
+ * the first cut had them the other way round. -r turns all of that off.
+ *
+ * maxchars (-n/-N) counts CHARACTERS AS READ -- after the backslash is
+ * resolved, so `read -n 5` on `a\b\c\d\e` is `abcde` and a continuation
+ * counts for nothing (1124-1126, measured). ignore_delim is -N: the
+ * delimiter is data. */
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      char *out, size_t cap,
                                      bool *got_any, char delim,
-                                     bool *escmap) {
+                                     bool *escmap, long maxchars,
+                                     bool ignore_delim) {
     if (!in || !out || cap == 0 || !got_any) return -1;
     bool hit_eof = false;
     size_t pos = 0;
     bool escaped = false;
-    *got_any = false;
-
     for (;;) {
+        if (maxchars >= 0 && (long)pos >= maxchars) { escaped = false; break; }
         char c = 0;
         long n = file_read(in, &c, 1);
         if (n < 0) return -1;
         if (n == 0) { hit_eof = true; break; }
         *got_any = true;
-        /* A NUL BYTE IS IGNORED, not stored. `printf '.\000.' | read s`
-         * leaves bash with a two-character ".." -- the value is a C string
-         * underneath, so storing the NUL truncated it to one character
-         * instead. Only when NUL is the DELIMITER (read -d '') does it
-         * mean anything, and that is handled below. */
         if (c == '\0' && delim != '\0') continue;
 
         if (!raw && escaped) {
             escaped = false;
-            if (c == delim) continue;
+            if (c == '\n') continue;              /* line continuation */
             if (pos + 1 >= cap) return -2;
-            /* AN ESCAPED CHARACTER IS NOT A DELIMITER. Without -r, `b\: c`
-             * with IFS=':' is ONE field containing a colon -- the backslash
-             * is removed but what it protected must survive the split, and
-             * the splitter cannot tell afterwards which colon was quoted.
-             * Marking it here is the only place that knows. */
             if (escmap) escmap[pos] = true;
             out[pos++] = c;
             continue;
@@ -4177,7 +4182,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
             escaped = true;
             continue;
         }
-        if (c == delim) break;
+        if (c == delim && !ignore_delim) break;
         if (pos + 1 >= cap) return -2;
         out[pos++] = c;
     }
@@ -4288,59 +4293,223 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
     return rc;
 }
 
-static void cmd_read(int argc, char **argv) {
-    bool raw = false;
-    char delim = '\n';
-    int first = 1;
-    shell_set_status(0);
-
-    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
-        if (strcmp(argv[first], "--") == 0) {
-            first++;
+/* `read -a NAME`: every IFS field of the line becomes one element, under the
+ * ordinary field-splitting rules -- a run of IFS whitespace is one
+ * separator, a non-whitespace IFS byte is a separator of its own (so
+ * `a xx b` with IFS='x ' has an empty field between the two x), whitespace
+ * around a non-whitespace separator belongs to it, and trailing whitespace
+ * ends nothing. An escaped byte (escmap) is never a separator. */
+static int shell_read_assign_array(const char *name, const char *line,
+                                   const bool *escmap) {
+    const char *ifs = env_get("IFS");
+    if (!ifs) ifs = " \t\n";
+    if (!shell_name_is_valid(name, strlen(name))) {
+        kprintf("read: `%s': not a valid identifier\n", name);
+        return 1;
+    }
+    sh_array_unset(name);
+    if (!sh_array_create(name)) return 1;
+    long idx = 0;
+    char field[LINE_MAX];
+    size_t f = 0;
+#define SH_RA_IFS(q)    (!(escmap && escmap[(q) - line]) && shell_ifs_has(ifs, *(q)))
+#define SH_RA_IFS_WS(q) (!(escmap && escmap[(q) - line]) && shell_ifs_is_ws(ifs, *(q)))
+    const char *p = line;
+    if (ifs[0] == '\0') {
+        return sh_array_set(name, 0, line) < 0 ? 1 : 0;
+    }
+    while (*p && SH_RA_IFS_WS(p)) p++;
+    while (*p) {
+        f = 0;
+        while (*p && !SH_RA_IFS(p)) {
+            if (f + 1 < sizeof field) field[f++] = *p;
+            p++;
+        }
+        field[f] = '\0';
+        if (!*p) {                       /* last field, no separator after */
+            if (sh_array_set(name, idx++, field) < 0) return 1;
             break;
         }
-        bool consumed_arg = false;
-        for (const char *p = argv[first] + 1; *p; p++) {
-            if (*p == 'r') {
-                raw = true;
-            } else if (*p == 'd') {
-                /* -d DELIM: end the record at DELIM instead of newline. The
-                 * operand may be glued on (-d:) or separate (-d :), and an
-                 * EMPTY one means NUL -- `read -rd '' var` is the idiom for
-                 * slurping a whole here-document into one variable. */
-                if (p[1]) {
-                    delim = p[1];
-                    break;
-                }
-                if (first + 1 < argc) {
-                    delim = argv[first + 1][0];   /* '' -> '\0': no match, so
-                                                   * the record is everything */
-                    consumed_arg = true;
-                } else {
-                    kprintf("read: -d requires an argument\n");
+        /* a separator: whitespace run, optionally one non-ws byte, ws run */
+        bool was_ws = SH_RA_IFS_WS(p);
+        if (was_ws) {
+            while (*p && SH_RA_IFS_WS(p)) p++;
+            if (*p && SH_RA_IFS(p) && !SH_RA_IFS_WS(p)) {
+                p++;
+                while (*p && SH_RA_IFS_WS(p)) p++;
+            } else if (!*p) {            /* trailing whitespace ends nothing */
+                if (sh_array_set(name, idx++, field) < 0) return 1;
+                break;
+            }
+        } else {
+            p++;
+            while (*p && SH_RA_IFS_WS(p)) p++;
+        }
+        if (sh_array_set(name, idx++, field) < 0) return 1;
+        /* a non-ws separator at the very end delimits a final EMPTY field only
+         * when nothing else follows -- `a bx` is a, b; `a b x x` is a, b, '', ''.
+         * That falls out of the loop: at end of input the loop exits with the
+         * field already stored. */
+    }
+#undef SH_RA_IFS
+#undef SH_RA_IFS_WS
+    return 0;
+}
+
+/* Is there input to read on `in` -- or will a read return EOF at once? bash's
+ * `read -t 0` asks exactly that and reads nothing. A timeout above zero waits
+ * that long for the first byte. Hosted: poll(2) on the descriptor; the
+ * in-kernel console shell has no such primitive and answers "ready". */
+#ifdef SHELL_HOSTED
+extern int host_input_ready(struct file *f, long timeout_ms);   /* host.c */
+static int shell_read_wait_ready(struct file *in, long timeout_ms) {
+    return host_input_ready(in, timeout_ms);
+}
+#else
+static int shell_read_wait_ready(struct file *in, long timeout_ms) {
+    (void)in; (void)timeout_ms;
+    return 1;
+}
+#endif
+
+/* read [-ers] [-a NAME] [-d DELIM] [-n N] [-N N] [-p PROMPT] [-t T] [-u FD]
+ *      [-i TEXT] [NAME ...]
+ *
+ * The option set bash has, with bash's diagnostics: a bad count is
+ * "read: X: invalid number" and a bad descriptor "read: X: invalid file
+ * descriptor specification", both status 2. An option's argument may be
+ * attached (`-rn1`, `-d,`) or the next word. -e and -s are accepted and do
+ * nothing here: there is no line editor behind a non-terminal read, and
+ * echo is the terminal's business. -p prints only when stdin is the
+ * console, as bash prints only to a terminal. */
+static void cmd_read(int argc, char **argv) {
+    bool raw = false, silent = false, want_prompt = false;
+    char delim = '\n';
+    long maxchars = -1;
+    bool exact = false;                 /* -N: delimiter is data, no split */
+    long timeout_ms = -1;               /* -t: <0 none, 0 poll, >0 wait   */
+    int use_fd = -1;
+    const char *array_name = 0;
+    const char *prompt = 0;
+    int first = 1;
+    shell_set_status(0);
+    (void)silent;
+
+    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) { first++; break; }
+        const char *p = argv[first] + 1;
+        bool consumed_next = false;
+        bool done_word = false;
+        for (; *p && !done_word; p++) {
+            char o = *p;
+            const char *arg = 0;
+            if (o == 'a' || o == 'd' || o == 'n' || o == 'N' || o == 'p' ||
+                o == 't' || o == 'u' || o == 'i') {
+                if (p[1]) { arg = p + 1; done_word = true; }
+                else if (first + 1 < argc) { arg = argv[first + 1]; consumed_next = true; }
+                else {
+                    kprintf("read: -%c: option requires an argument\n", o);
+                    kprintf("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
+                            "[-n nchars] [-N nchars] [-p prompt] [-t timeout] "
+                            "[-u fd] [name ...]\n");
                     shell_set_status(2);
                     return;
                 }
-            } else {
-                kprintf("read: bad option '-%c'\n", *p);
+            }
+            switch (o) {
+            case 'r': raw = true; break;
+            case 's': silent = true; break;
+            case 'e': break;
+            case 'i': break;                       /* readline preload: no editor */
+            case 'a': array_name = arg; break;
+            case 'p': prompt = arg; want_prompt = true; break;
+            case 'd': delim = arg[0]; break;       /* '' -> NUL */
+            case 'n': case 'N': {
+                const char *q = arg;
+                long v = 0;
+                bool ok = *q != '\0';
+                for (; *q; q++) {
+                    if (*q < '0' || *q > '9') { ok = false; break; }
+                    v = v * 10 + (*q - '0');
+                    if (v > 1000000) v = 1000000;
+                }
+                if (!ok) {
+                    kprintf("read: %s: invalid number\n", arg);
+                    shell_set_status(1);          /* bash: 1, not 2 */
+                    return;
+                }
+                maxchars = v;
+                exact = (o == 'N');
+                break;
+            }
+            case 't': {
+                /* seconds, fractional allowed; negative is an error */
+                const char *q = arg;
+                if (*q == '-') q++;              /* bash takes |t| */
+                long whole = 0, frac = 0, fdiv = 1;
+                bool ok = *q != '\0', dot = false;
+                for (; *q; q++) {
+                    if (*q == '.' && !dot) { dot = true; continue; }
+                    if (*q < '0' || *q > '9') { ok = false; break; }
+                    if (!dot) whole = whole * 10 + (*q - '0');
+                    else if (fdiv < 1000) { frac = frac * 10 + (*q - '0'); fdiv *= 10; }
+                }
+                if (!ok) {
+                    kprintf("read: %s: invalid timeout specification\n", arg);
+                    shell_set_status(2);
+                    return;
+                }
+                timeout_ms = whole * 1000 + (fdiv > 1 ? frac * (1000 / fdiv) : 0);
+                break;
+            }
+            case 'u': {
+                const char *q = arg;
+                long v = 0;
+                bool ok = *q != '\0';
+                for (; *q; q++) {
+                    if (*q < '0' || *q > '9') { ok = false; break; }
+                    v = v * 10 + (*q - '0');
+                    if (v > 100000) v = 100000;
+                }
+                if (!ok) {
+                    kprintf("read: %s: invalid file descriptor specification\n", arg);
+                    shell_set_status(1);          /* bash: 1 */
+                    return;
+                }
+                use_fd = (int)v;
+                break;
+            }
+            default:
+                kprintf("read: -%c: invalid option\n", o);
+                kprintf("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
+                        "[-n nchars] [-N nchars] [-p prompt] [-t timeout] "
+                        "[-u fd] [name ...]\n");
                 shell_set_status(2);
                 return;
             }
         }
         first++;
-        if (consumed_arg) first++;
+        if (consumed_next) first++;
     }
-    /* No NAME operands: the line goes to REPLY, whole -- no field
-     * splitting, no IFS trimming. tsh called it a usage error, which the
-     * standard walk caught: `read` alone is how a script takes a line
-     * verbatim. */
-    bool reply_mode = (first >= argc);
+    bool reply_mode = (first >= argc) && !array_name;
 
     struct file *tmp_console = 0;
-    struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
-    if (!in) {
-        tmp_console = console_file_make();
-        in = tmp_console;
+    struct file *in;
+    if (use_fd >= 0) {
+        in = shell_builtin_fd(use_fd);
+        if (use_fd == 0 && !in) in = g_shell_in;
+        if (!in) {
+            kprintf("read: %d: invalid file descriptor: Bad file descriptor\n", use_fd);
+            shell_set_status(1);
+            return;
+        }
+    } else {
+        in = g_shell_in ? g_shell_in : g_shell_fd[0];
+        if (!in) {
+            tmp_console = console_file_make();
+            in = tmp_console;
+            if (want_prompt && prompt && in) kprintf("%s", prompt);
+        }
     }
     if (!in) {
         kprintf("read: failed to open stdin\n");
@@ -4348,17 +4517,30 @@ static void cmd_read(int argc, char **argv) {
         return;
     }
 
-#ifdef SHELL_TRACE_READ
-    kprintf("[readtrace] argc=%d first=%d in=%p g_shell_in=%p fd0=%p IFS='%s'\n",
-            argc, first, (void *)in, (void *)g_shell_in, (void *)g_shell_fd[0],
-            env_get("IFS") ? env_get("IFS") : "(unset)");
-#endif
+    if (timeout_ms >= 0) {
+        int ready = shell_read_wait_ready(in, timeout_ms);
+        if (timeout_ms == 0) {
+            /* bash: read nothing, report whether input is available */
+            if (tmp_console) file_close(tmp_console);
+            shell_set_status(ready ? 0 : 1);
+            return;
+        }
+        if (!ready) {
+            if (tmp_console) file_close(tmp_console);
+            if (reply_mode) (void)env_set("REPLY", "");
+            else if (!array_name) (void)shell_read_assign_empty(argc, argv, first);
+            shell_set_status(142);          /* 128 + SIGALRM, as bash */
+            return;
+        }
+    }
+
     char linebuf[LINE_MAX];
     bool got_any = false;
     static bool escmap[LINE_MAX];       /* .bss: 512 bytes is a lot of stack */
     memset(escmap, 0, sizeof escmap);
     int rr = shell_read_line_from_file(in, raw, linebuf, sizeof(linebuf),
-                                       &got_any, delim, raw ? 0 : escmap);
+                                       &got_any, delim, raw ? 0 : escmap,
+                                       maxchars, exact);
     if (tmp_console) file_close(tmp_console);
     if (rr < 0) {
         kprintf(rr == -2 ? "read: line too long\n"
@@ -4366,19 +4548,31 @@ static void cmd_read(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    /* EOF with nothing read at all: the variables are cleared, status 1.
+     * EOF after SOME data (a last line without its newline) still assigns
+     * and still reports 1 -- that is the `while read` idiom's ending. */
     if (!got_any) {
-        if (reply_mode) (void)env_set("REPLY", "");
+        if (array_name) { sh_array_unset(array_name); (void)sh_array_create(array_name); }
+        else if (reply_mode) (void)env_set("REPLY", "");
         else (void)shell_read_assign_empty(argc, argv, first);
         shell_set_status(1);
         return;
     }
 
-    int rc = reply_mode
-        ? (env_set("REPLY", linebuf) < 0 ? 1 : 0)
-        : shell_read_assign_fields(argc, argv, first, linebuf,
-                                   raw ? 0 : escmap);
-    /* Fields are assigned either way; the status reports that input ran
-     * out mid-line, which is what stops a `while read` loop. */
+    int rc;
+    if (array_name) {
+        rc = shell_read_assign_array(array_name, linebuf, raw ? 0 : escmap);
+    } else if (reply_mode) {
+        rc = env_set("REPLY", linebuf) < 0 ? 1 : 0;
+    } else if (exact) {
+        /* -N: no splitting -- the first name takes it all */
+        rc = (!shell_name_is_valid(argv[first], strlen(argv[first])) ||
+              env_set(argv[first], linebuf) < 0) ? 1 : 0;
+        if (shell_read_assign_empty(argc, argv, first + 1)) rc = 1;
+    } else {
+        rc = shell_read_assign_fields(argc, argv, first, linebuf,
+                                      raw ? 0 : escmap);
+    }
     shell_set_status(rc ? rc : (rr == 1 ? 1 : 0));
 }
 
@@ -19466,6 +19660,17 @@ struct shell_fd_state {
     bool owned[SHELL_FD_MAX];
 };
 
+/* The fd table of the BUILTIN THAT IS RUNNING, set around the call by the
+ * builtin runner. `read -u 3 3<<EOF` applies its redirection here, not to
+ * g_shell_fd -- the runner wires only fd 0 (g_shell_in) and fd 2 through --
+ * so without this the builtin saw no fd 3 at all. */
+static struct shell_fd_state *g_builtin_fds;
+static struct file *shell_builtin_fd(int n) {
+    if (n < 0 || n >= SHELL_FD_MAX) return 0;
+    if (g_builtin_fds && g_builtin_fds->fd[n]) return g_builtin_fds->fd[n];
+    return g_shell_fd[n];
+}
+
 /* Collect the descriptors above 2 that a command has open, as the child-fd
  * mapping proc_spawn wants. This is what makes `exec 3>file` and `cmd 8<<EOF`
  * reach the program: fd 3+ were built correctly and then never handed over,
@@ -19883,7 +20088,10 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
      * pre-set (builtins rely on it) and remember what it replaced. */
     g_shell_prev_status = g_last_status;
     shell_set_status(0);
+    struct shell_fd_state *old_bfds = g_builtin_fds;
+    g_builtin_fds = &fds;
     c->fn(cmd->argc, cmd->argv);
+    g_builtin_fds = old_bfds;
     int rc = g_last_status;
     g_shell_fd[2] = old_diag;
     g_shell_in = old_in;

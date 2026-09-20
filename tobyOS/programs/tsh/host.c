@@ -51,6 +51,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 
@@ -583,6 +584,18 @@ int proc_spawn(const struct proc_spec *spec) {
  * does not return; the fork pid is now the program, and `$!` is right for
  * the same reason it is right in bash. Returns -1 only on failure, and the
  * caller falls back to the spawn it would have done anyway. */
+/* `read -t`: is there input on this descriptor, or would a read return EOF at
+ * once? poll(2) says; a timeout above zero waits that long for it. Lives
+ * here because VF_FD and <poll.h> are the host shim's, not the shell's. */
+int host_input_ready(struct file *f, long timeout_ms) {
+    int fd = f ? VF_FD(&f->vfs) : -1;
+    if (fd < 0) return 1;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int r = poll(&pfd, 1, (int)timeout_ms);
+    if (r < 0) return 1;
+    return r > 0 ? 1 : 0;
+}
+
 int proc_exec_in_place(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
     int fd0 = spec->fd0 ? VF_FD(&spec->fd0->vfs) : 0;
