@@ -482,8 +482,14 @@ static int g_heredoc_count;
 static int g_heredoc_head;
 /* One slot per signal, plus EXIT at 0 and ERR at SHELL_TRAP_ERR. ERR is a
  * condition, not a signal, so it needs a slot of its own past the end. */
-#define SHELL_TRAP_ERR SIG_MAX
-static char *g_traps[SIG_MAX + 1];
+#define SHELL_TRAP_ERR    SIG_MAX
+/* DEBUG runs before every simple command (and the compound heads bash
+ * treats as commands); RETURN runs when a function or a sourced script
+ * finishes. Conditions like ERR, so slots of their own past the signals. */
+#define SHELL_TRAP_DEBUG  (SIG_MAX + 1)
+#define SHELL_TRAP_RETURN (SIG_MAX + 2)
+#define SHELL_TRAP_LAST   SHELL_TRAP_RETURN
+static char *g_traps[SHELL_TRAP_LAST + 1];
 
 /* Depth of shell-function calls in progress. The ERR trap is NOT inherited by
  * a function unless `set -o errtrace`, which this shell does not have -- so
@@ -1923,11 +1929,13 @@ static const char *shell_signal_name(int num) {
 static const char *shell_trap_name(int sig) {
     if (sig == 0) return "EXIT";
     if (sig == SHELL_TRAP_ERR) return "ERR";
+    if (sig == SHELL_TRAP_DEBUG) return "DEBUG";
+    if (sig == SHELL_TRAP_RETURN) return "RETURN";
     return shell_signal_name(sig);
 }
 
 static void shell_trap_unset(int sig) {
-    if (sig < 0 || sig > SHELL_TRAP_ERR) return;
+    if (sig < 0 || sig > SHELL_TRAP_LAST) return;
     if (g_traps[sig]) {
         kfree(g_traps[sig]);
         g_traps[sig] = 0;
@@ -1935,17 +1943,20 @@ static void shell_trap_unset(int sig) {
 }
 
 static void shell_trap_clear_all(void) {
-    for (int i = 0; i <= SHELL_TRAP_ERR; i++) shell_trap_unset(i);
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) shell_trap_unset(i);
 }
 
+/* EVERY slot, conditions included. This held SIG_MAX entries, so a frame
+ * cleared ERR on entry and never put it back -- `trap ... ERR; ( : )` lost
+ * the trap -- and the same for DEBUG and RETURN once they existed. */
 struct shell_trap_frame {
-    char *trap[SIG_MAX];
+    char *trap[SHELL_TRAP_LAST + 1];
 };
 
 static int shell_trap_enter_child(struct shell_trap_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
-    for (int i = 0; i < SIG_MAX; i++) {
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         if (!g_traps[i]) continue;
         frame->trap[i] = shell_strdup(g_traps[i]);
         if (!frame->trap[i]) {
@@ -1963,7 +1974,7 @@ static int shell_trap_enter_child(struct shell_trap_frame *frame) {
 static void shell_trap_restore(struct shell_trap_frame *frame) {
     if (!frame) return;
     shell_trap_clear_all();
-    for (int i = 0; i < SIG_MAX; i++) {
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         g_traps[i] = frame->trap[i];
         frame->trap[i] = 0;
     }
@@ -1991,11 +2002,14 @@ static void shell_run_trap(int sig) {
      * The handler still SEES the interrupted command's status in `$?`, which
      * is why it is set rather than cleared on the way in. */
     int saved_status = g_last_status;
+    unsigned long saved_line = g_shell_lineno;
     g_trap_running = true;
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
+    g_shell_lineno = 1;                /* the action is its own script (1195) */
 
     execute_line_text(action);
+    g_shell_lineno = saved_line;
 
     if (g_shell_flow != SHELL_FLOW_EXIT) {
         g_shell_flow = saved_flow;
@@ -2071,23 +2085,84 @@ static void shell_check_pending_signals(void) {
  * must not disturb it for whatever runs next -- an ERR trap that quietly reset
  * $? would change the meaning of the very failure it reports. g_trap_running
  * keeps a handler that itself fails from re-entering. */
+static bool g_in_pipeline_stage;     /* defined with the pipeline runner */
+static int  g_capture_depth;         /* defined with $( ) */
+static bool g_err_trap_running;
 static void shell_run_err_trap(int status) {
-    if (g_trap_running) return;
+    if (g_err_trap_running) return;
     /* Not inherited by a shell function. bash only runs it there under
      * `set -o errtrace`, which this shell does not implement, so inside a
      * function the trap stays silent. */
     if (g_fn_depth > 0) return;
+    if (g_in_pipeline_stage || g_capture_depth > 0) return;
     const char *act = g_traps[SHELL_TRAP_ERR];
     if (!act || !*act) return;
 
     char *action = shell_strdup(act);
     if (!action) return;
 
+    bool was_running = g_trap_running;
+    g_err_trap_running = true;
     g_trap_running = true;
     shell_set_status(status);
     execute_line_text(action);
-    g_trap_running = false;
+    g_trap_running = was_running;
+    g_err_trap_running = false;
     shell_set_status(status);
+    kfree(action);
+}
+
+/* The DEBUG trap, before a command. `$?` inside it is the status of the
+ * previous command and the trap's own status is thrown away afterwards
+ * (bash without extdebug); `exit` inside it leaves the shell. Not inside
+ * a function (no functrace), not in a forked child, never re-entrant. */
+static bool g_debug_trap_running;
+static void shell_run_debug_trap(void) {
+    if (g_debug_trap_running) return;
+    if (g_fn_depth > 0) return;
+    /* Not inside `$( )` and not in a pipeline stage's child: bash runs no
+     * DEBUG trap in a command substitution, and a pipeline's stages are
+     * accounted for by the parent, once per stage, before it starts them
+     * (`false | false | false` is three firings on the same line). */
+    if (g_capture_depth > 0 || g_in_pipeline_stage) return;
+    const char *act = g_traps[SHELL_TRAP_DEBUG];
+    if (!act || !*act) return;
+    char *action = shell_strdup(act);
+    if (!action) return;
+    int saved_status = g_last_status;
+    unsigned long saved_line = g_shell_lineno;
+    bool was_running = g_trap_running;
+    g_debug_trap_running = true;
+    g_trap_running = true;
+    execute_line_text(action);
+    g_trap_running = was_running;
+    g_debug_trap_running = false;
+    g_shell_lineno = saved_line;
+    /* `return` in a top-level DEBUG trap is bash's "can only return from a
+     * function or sourced script": reported, and nothing else happens. */
+    if (g_shell_flow == SHELL_FLOW_RETURN) {
+        kprintf("shell: return: can only `return' from a function or sourced script\n");
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+    }
+    if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(saved_status);
+    kfree(action);
+}
+
+/* The RETURN trap, after a function or a sourced script finishes. */
+static void shell_run_return_trap(void) {
+    if (g_trap_running || g_in_pipeline_stage || g_capture_depth > 0) return;
+    const char *act = g_traps[SHELL_TRAP_RETURN];
+    if (!act || !*act) return;
+    char *action = shell_strdup(act);
+    if (!action) return;
+    int saved_status = g_last_status;
+    unsigned long saved_line = g_shell_lineno;
+    g_trap_running = true;
+    execute_line_text(action);
+    g_trap_running = false;
+    g_shell_lineno = saved_line;
+    if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(saved_status);
     kfree(action);
 }
 
@@ -8995,6 +9070,7 @@ static void cmd_dot(int argc, char **argv) {
     argv[1] = resolved;
     if (argc <= 2) {
         shell_set_status(shell_run_script_path(argv[1], false));
+        shell_run_return_trap();       /* a sourced script finished */
         return;
     }
 
@@ -9005,6 +9081,8 @@ static void cmd_dot(int argc, char **argv) {
         return;
     }
     int st = shell_run_script_path(argv[1], false);
+    shell_set_status(st);
+    shell_run_return_trap();           /* a sourced script finished */
     shell_restore_params_from_frame(&frame);
     shell_set_status(st);
 }
@@ -9229,6 +9307,8 @@ static int shell_trap_parse_condition(const char *s, int *out_sig) {
         *out_sig = 0;
         return 0;
     }
+    if (strcmp(s, "DEBUG") == 0) { *out_sig = SHELL_TRAP_DEBUG; return 0; }
+    if (strcmp(s, "RETURN") == 0) { *out_sig = SHELL_TRAP_RETURN; return 0; }
     if (strcmp(s, "ERR") == 0) {
         *out_sig = SHELL_TRAP_ERR;
         return 0;
@@ -9264,14 +9344,46 @@ static void cmd_trap(int argc, char **argv) {
         argv = &argv[1];
         argc--;
     }
-    if (argc <= 1) {
-        for (int i = 0; i <= SHELL_TRAP_ERR; i++) {
+    /* trap -l: the signal table, bash's layout (five to a line). */
+    if (argc > 1 && strcmp(argv[1], "-l") == 0) {
+        int col = 0;
+        for (int i = 1; i < SIG_MAX; i++) {
+            const char *nm = shell_signal_name(i);
+            if (!nm) continue;
+            shell_printf("%2d) SIG%s", i, nm);
+            if (++col % 5 == 0) shell_printf("\n"); else shell_printf("\t");
+        }
+        if (col % 5) shell_printf("\n");
+        return;
+    }
+    /* trap -p [COND...]: print the traps, all of them or the named ones.
+     * Same lines as a bare `trap`; a child shell still shows what it
+     * inherited even though it will not run it, as bash does (1177). */
+    bool print_only = (argc > 1 && strcmp(argv[1], "-p") == 0);
+    if (print_only && argc > 2) {
+        for (int a = 2; a < argc; a++) {
+            int sig = -1;
+            if (shell_trap_parse_condition(argv[a], &sig) < 0) {
+                kprintf("trap: %s: invalid signal specification\n", argv[a]);
+                shell_set_status(1);
+                continue;
+            }
+            if (!g_traps[sig]) continue;
+            bool pseudo = (sig == 0 || sig >= SHELL_TRAP_ERR);
+            shell_printf("trap -- ");
+            shell_print_quoted_trap_action(g_traps[sig]);
+            shell_printf(" %s%s\n", pseudo ? "" : "SIG", shell_trap_name(sig));
+        }
+        return;
+    }
+    if (argc <= 1 || print_only) {
+        for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
             if (!g_traps[i]) continue;
             const char *name = shell_trap_name(i);
             if (!name) continue;
             /* bash prints real signals with the SIG prefix (SIGUSR1, not
              * USR1); the pseudo-conditions EXIT and ERR carry none. */
-            bool pseudo = (i == 0 || i == SHELL_TRAP_ERR);
+            bool pseudo = (i == 0 || i >= SHELL_TRAP_ERR);
             shell_printf("trap -- ");
             shell_print_quoted_trap_action(g_traps[i]);
             shell_printf(" %s%s\n", pseudo ? "" : "SIG", name);
@@ -22035,6 +22147,8 @@ static bool shell_try_dbracket_command(const char *src) {
           (s[2] == ' ' || s[2] == '\t' || s[2] == '\n' || s[2] == '\0')))
         return false;
     s += 2;
+    shell_run_debug_trap();            /* `[[ ]]` is a command (1182) */
+    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     /* Find the `]]` that closes it, ignoring one inside quotes. */
     const char *end = 0;
@@ -22156,6 +22270,8 @@ static bool shell_try_arith_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!(s[0] == '(' && s[1] == '(')) return false;
     s += 2;
+    shell_run_debug_trap();            /* `(( ))` is a command (1182) */
+    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     /* Find the `))` that closes it. A nested `(` inside the expression is
      * ordinary grouping and must not be mistaken for the end. */
@@ -22542,6 +22658,10 @@ static bool shell_try_for_command(const char *src) {
      * `return true` inside the loop became a `goto done` for that reason. */
     bool set_last = true;
     for (int i = 0; i < items->argc; i++) {
+        /* bash fires DEBUG for the `for` head on EVERY iteration, with the
+         * head's line, before the body's own commands fire (1190). */
+        shell_run_debug_trap();
+        if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (env_set(name, items->argv[i]) < 0) {
             kprintf("for: failed to set '%s'\n", name);
             last = 1;
@@ -23064,6 +23184,8 @@ static bool shell_try_case_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "case")) return false;
     s = shell_skip_blanks(s + 4);
+    shell_run_debug_trap();            /* the case head fires once (1189) */
+    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     const char *in_at = shell_find_word_marker(s, "in");
     if (!in_at) {
@@ -24344,6 +24466,8 @@ static bool shell_try_compound_pipeline(const char *src) {
 
     int n = 0;
     bool any_compound = false, overflow = false;
+    size_t stage_off[SHELL_STAGE_MAX];
+    bool stage_simple[SHELL_STAGE_MAX];
     const char *cur = src;
     for (;;) {
         const char *sep = shell_find_pipe_at(cur);
@@ -24353,7 +24477,9 @@ static bool shell_try_compound_pipeline(const char *src) {
             overflow = true;
             break;
         }
-        if (shell_stage_is_compound(stages[n])) any_compound = true;
+        stage_off[n] = (size_t)(shell_skip_blanks(cur) - src);
+        stage_simple[n] = !shell_stage_is_compound(stages[n]);
+        if (!stage_simple[n]) any_compound = true;
         n++;
         if (!sep) break;
         cur = sep + 1;
@@ -24390,6 +24516,17 @@ static bool shell_try_compound_pipeline(const char *src) {
     int cpids[SHELL_STAGE_MAX];
     for (int i = 0; i < SHELL_STAGE_MAX; i++) cpids[i] = 0;
 
+    /* THE DEBUG TRAP, once per stage, BEFORE any stage starts: bash fires it
+     * per pipeline element (`false | false | false` is three lines, 1194),
+     * and it must run while stdout is still the shell's -- inside the loop
+     * below it is already the next stage's pipe. */
+    for (int i = 0; i < n; i++) {
+        if (!stage_simple[i]) continue;
+        unsigned long ln = shell_lineno_at(src + stage_off[i]);
+        if (ln) g_shell_lineno = ln;
+        shell_run_debug_trap();
+    }
+    if (g_shell_flow != SHELL_FLOW_NONE) { kfree(stages); return true; }
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
         if (i + 1 < n && pipe_create(&r, &w) != 0) {
@@ -24822,6 +24959,10 @@ static void execute_line_text_inner(const char *src) {
          *
          * printed `four`: the while stage failed, the pipeline reported 1, and
          * nothing acted on it. */
+        if (g_last_status != 0 && g_errexit_suspend == 0 &&
+            g_errexit_negate == 0 && !g_status_exempt &&
+            g_shell_flow == SHELL_FLOW_NONE)
+            shell_run_err_trap(g_last_status);      /* ERR, same contexts */
         if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
             g_errexit_negate == 0 &&
             !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
@@ -25069,6 +25210,11 @@ static void execute_line_text_inner(const char *src) {
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
         bool background = (sep == SH_TOK_BG);
         if (should_run) {
+            /* THE DEBUG TRAP, before the command -- once per pipeline stage,
+             * which is what bash's per-element firing looks like from
+             * outside (1194). $LINENO is the command's own line here. */
+            for (int s = 0; s < plp->count; s++) shell_run_debug_trap();
+            if (g_shell_flow != SHELL_FLOW_NONE) { kfree(plp); return; }
             if (g_opt_xtrace) {
                 kprintf("+ ");
                 for (int s = 0; s < plp->count; s++) {
@@ -25087,9 +25233,14 @@ static void execute_line_text_inner(const char *src) {
              * by shell_run_list_line, which is where the AND-OR exemption
              * lives; `sep` is all but always SH_TOK_SEMI. It is still tested
              * because a `;`-separated list does reach this loop. */
-            bool in_and_or = (prev_link == SH_TOK_AND_IF ||
-                              prev_link == SH_TOK_OR_IF ||
-                              sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
+            /* THE LAST COMMAND OF AN and-or LIST COUNTS. bash exempts "any
+             * command in a && or || list except the command following the
+             * final && or ||" -- so `false || false || false` runs the ERR
+             * trap once, for the last one (1194), and exits under set -e
+             * there too. Testing prev_link as well exempted the last element
+             * and neither fired. */
+            (void)prev_link;
+            bool in_and_or = (sep == SH_TOK_AND_IF || sep == SH_TOK_OR_IF);
             /* The ERR trap fires in exactly the contexts errexit acts in --
              * not on a negated command, not on the left of && or ||, not in a
              * condition -- and independently of whether `set -e` is on.
