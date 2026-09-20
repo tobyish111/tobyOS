@@ -1038,6 +1038,22 @@ static size_t sh_copy_balanced(const char *p, char *out, size_t *n,
         if (*p == '`' && *n + 1 < cap) out[(*n)++] = *p++;
         return (size_t)(p - s);
     }
+    /* An EXTGLOB GROUP is part of the element too: `arr=( @(a|b) x )` is
+     * two elements, and without this the group's own `)` ended the whole
+     * literal at the first one. */
+    if ((*p == '?' || *p == '*' || *p == '+' || *p == '@' || *p == '!') &&
+        p[1] == '(') {
+        if (*n + 1 < cap) out[(*n)++] = *p;
+        p++;
+        int d = 0;
+        do {
+            if (*p == '(') d++;
+            else if (*p == ')') d--;
+            if (*n + 1 < cap) out[(*n)++] = *p;
+            p++;
+        } while (*p && d > 0);
+        return (size_t)(p - s);
+    }
     if (p[0] != '$' || (p[1] != '(' && p[1] != '{')) return 0;
     open = p[1];
     close = (open == '(') ? ')' : '}';
@@ -22172,13 +22188,21 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
         while (*p == ' ' || *p == '\t' || *p == '(') p++;
         const char *start = p;
         bool in_sq = false, in_dq = false;
-        /* A `|` inside quotes is a literal, not an alternation separator. */
+        int eg = 0;
+        /* A `|` inside quotes is a literal, not an alternation separator --
+         * and neither is one inside an EXTGLOB GROUP. `case --help in
+         * --@(help|verbose))` was split at the group's own bar into
+         * `--@(help` and `verbose)`, so neither alternative matched and the
+         * clause fell through to `*)`. The parse was fine; only the split
+         * was wrong, which is why it looked like a matcher bug. */
         while (*p) {
             if (in_sq) { if (*p == '\'') in_sq = false; p++; continue; }
             if (in_dq) { if (*p == '"')  in_dq = false; p++; continue; }
             if (*p == '\'') { in_sq = true; p++; continue; }
             if (*p == '"')  { in_dq = true; p++; continue; }
-            if (*p == '|') break;
+            if (*p == '(') { eg++; p++; continue; }
+            if (*p == ')') { if (eg > 0) eg--; p++; continue; }
+            if (*p == '|' && eg == 0) break;
             p++;
         }
         const char *end = p;
@@ -22292,8 +22316,32 @@ static bool shell_try_case_command(const char *src) {
         while (p < esac_at && (is_space(*p) || *p == ';')) p++;
         if (p >= esac_at) break;
 
+        /* THE `)` THAT ENDS THE PATTERN LIST, not the first one in it. An
+         * extglob group carries its own parens -- `--@(help)` -- and
+         * stopping at the first `)` cut the pattern to `--@(help`, which
+         * matched nothing and sent every such clause to `*)`. It looked
+         * like the matcher and was the clause splitter; `[[ ]]` with the
+         * identical pattern worked all along, which is what gave it away. */
         const char *close = p;
-        while (close < esac_at && *close != ')') close++;
+        {
+            /* Skip the OPTIONAL clause-opening paren first -- `( a|b )` is
+             * bash's other clause form, and counting it made the real
+             * closing paren look like the group's, so the scan ran on into
+             * the body and took four case tests with it. Only a bare `(`
+             * here is that form; an extglob group always has its operator
+             * in front. */
+            const char *q = p;
+            while (q < esac_at &&
+                   (*q == ' ' || *q == '\t' || *q == '\n')) q++;
+            if (q < esac_at && *q == '(') q++;
+            int d = 0;
+            close = q;
+            while (close < esac_at) {
+                if (*close == '(') d++;
+                else if (*close == ')') { if (d == 0) break; d--; }
+                close++;
+            }
+        }
         if (close >= esac_at) {
             kprintf("case: expected ')'\n");
             shell_parse_error();
