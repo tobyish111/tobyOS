@@ -7528,6 +7528,49 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 return;
             }
         }
+        /* AN EXTGLOB GROUP IS PART OF THE WORD, not a subshell.
+         * `echo @(*.cc|*.h)` reaches here as a `(` GLUED to a word, which
+         * is otherwise `echo a(b)` and a syntax error -- so the scanner
+         * rejected it before the tokenizer ever saw it. Consumed whole,
+         * right here: the `|` inside is alternation rather than a pipe and
+         * the `)` must not unbalance the paren count.
+         *
+         * AHEAD OF THE CASE-PATTERN PAREN, and that order is why this
+         * moved. `case $w in --@(help|verbose) )` has TWO opening parens
+         * where a pattern may legally start, and the case_pat branch below
+         * took the group's `(` for the optional clause-opening one: `help`
+         * and `verbose` became words, the group's `)` ended the pattern,
+         * and the clause's own `)` was then "a `)` that closes nothing" --
+         * a syntax error on a construct bash runs. A trace in the old
+         * position printed NOTHING for that line; that is how the dead
+         * branch was found.
+         *
+         * Gated on the shopt because that is what bash gates: with extglob
+         * OFF `echo @(a|b)` is a syntax error on the `(`. A CASE PATTERN is
+         * the exception -- `case --verbose in --@(help|verbose))` is TRUE
+         * with no shopt at all, measured on the box, the same way the
+         * right-hand side of `[[ == ]]` is. `?*+@` can only be extglob
+         * operators wherever they sit (`g=--@(help|verbose)` is an
+         * assignment at command position); `!` is ambiguous, because
+         * `!(cmd)` at command position is a negated subshell -- unless a
+         * pattern may start there, where `!(foo))` is a negated group. */
+        {
+            char prev = (st->start && p > st->start) ? p[-1] : '\0';
+            if ((g_shopt_extglob || st->case_pat) &&
+                (prev == '?' || prev == '*' || prev == '+' || prev == '@' ||
+                 (prev == '!' && (!st->cmd_pos || st->case_pat)))) {
+                int d = 0;
+                do {
+                    if (*p == '(') d++;
+                    else if (*p == ')') d--;
+                    p++;
+                } while (*p && d > 0);
+                st->cmd_seen = true;
+                st->no_sep = false;
+                *pp = p;
+                return;
+            }
+        }
         /* `name (` in command position is a FUNCTION HEADER, not a subshell.
          * Its parentheses are part of the definition and its body may start
          * on the next line, so the header alone leaves the command owed.
@@ -7591,37 +7634,6 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * both of which the scanner already knows. */
         {
             char prev = (st->start && p > st->start) ? p[-1] : '\0';
-            /* AN EXTGLOB GROUP IS PART OF THE WORD, not a subshell.
-             * `echo @(*.cc|*.h)` reaches here as a `(` GLUED to a word,
-             * which is otherwise `echo a(b)` and a syntax error -- so the
-             * scanner rejected it before the tokenizer ever saw it.
-             *
-             * Consumed whole, right here: the `|` inside is alternation
-             * rather than a pipe and the `)` must not unbalance the
-             * paren count, so neither may reach the rest of the scanner.
-             * Gated on the shopt because that is exactly what bash gates:
-             * with extglob OFF it reports a syntax error on this `(`.
-             * Not at command position -- there `!(cmd)` is a negated
-             * subshell, which the glued_word test below already knows. */
-            /* `?*+@` can only be extglob operators, wherever they sit --
-             * `g=--@(help|verbose)` is an ASSIGNMENT and its `(` is at
-             * command position, so requiring !cmd_pos rejected it. Only
-             * `!` is ambiguous: at command position `!(cmd)` is a negated
-             * subshell, so that one keeps the restriction. */
-            if (g_shopt_extglob &&
-                (prev == '?' || prev == '*' || prev == '+' || prev == '@' ||
-                 (prev == '!' && !st->cmd_pos))) {
-                int d = 0;
-                do {
-                    if (*p == '(') d++;
-                    else if (*p == ')') d--;
-                    p++;
-                } while (*p && d > 0);
-                st->cmd_seen = true;
-                st->no_sep = false;
-                *pp = p;
-                return;
-            }
             bool glued_eq = (prev == '=');
             /* Glued to the end of an ordinary WORD: `echo a(b)`,
              * `foo$identity('z')`. A subshell never starts that way. */
