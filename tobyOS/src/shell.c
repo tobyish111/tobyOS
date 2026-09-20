@@ -283,6 +283,13 @@ enum shell_flow {
      * the tty's signal to the foreground group. Distinct from EXIT because
      * the shell survives: the prompt loop clears it and carries on. */
     SHELL_FLOW_INTERRUPT,
+    /* failglob: bash's jump_to_top_level(DISCARD). The rest of the
+     * CURRENT TOP-LEVEL COMMAND is thrown away -- the remaining list
+     * items, and every enclosing loop or group -- and the next logical
+     * line runs with status 1. Measured: `echo *.ZZ; echo status=$?` on
+     * ONE line prints nothing, on two lines prints status=1. eval is a
+     * boundary too: it discards the rest of its string and returns 1. */
+    SHELL_FLOW_DISCARD,
 };
 
 static enum shell_flow g_shell_flow;
@@ -8442,6 +8449,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         execute_line_text(line);
         g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
+        /* A DISCARD threw away the rest of THAT logical line and nothing
+         * more: the script goes on, and the status it left is 1. */
+        if (g_shell_flow == SHELL_FLOW_DISCARD) {
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+            shell_set_status(1);
+        }
         last = g_last_status;
         shell_heredoc_reset();
         if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -9048,6 +9062,13 @@ static void cmd_eval(int argc, char **argv) {
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
+    }
+    /* eval CATCHES A DISCARD: the rest of its string is gone, the caller
+     * goes on, and eval's status is 1 (bash: parse_and_execute). */
+    if (g_shell_flow == SHELL_FLOW_DISCARD) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        shell_set_status(1);
     }
 }
 
@@ -16052,6 +16073,13 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                 shell_arith_skip(&a);
                 if (!a.ok || *a.p != '\0') {
                     kprintf("shell: bad arithmetic expansion\n");
+                    /* AN EXPANSION ERROR, status 1 and the rest of the line
+                     * discarded -- not the tokenizer's syntax-error 2. bash
+                     * (evalexp): `echo $((1/0)); echo $?` prints nothing,
+                     * the NEXT line sees 1. In /bin/tsh the error came out
+                     * as 2 and, inside `[[ ]]`, as a syntax error that ended
+                     * the script. */
+                    g_bad_subst_soft = true;
                     return -1;
                 }
                 return shell_append_long(buf, pos, cap, v);
@@ -18339,6 +18367,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
              * existing way to say "skip this command, status 1, keep
              * reading". */
             g_bad_subst_soft = true;
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
             return -1;
         }
         if (g_shopt_nullglob) return 0;
@@ -21347,6 +21379,20 @@ static bool shell_try_dbracket_command(const char *src) {
     }
     int value = 0;
     bool bad = (shell_dbr_split(d, expr) < 0);
+    if (bad && g_bad_subst_soft) {
+        /* AN EXPANSION ERROR INSIDE THE CONDITIONAL -- `[[ a =~ $((1/0)) ]]`
+         * -- is not a syntax error in it. bash reports the expansion,
+         * discards the rest of the line and the next one sees status 1;
+         * the syntax-error path below ENDED THE SCRIPT. */
+        kfree(d);
+        g_bad_subst_soft = false;
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
+        return true;
+    }
     if (!bad) {
         if (d->n == 0) bad = true;
         else {
@@ -21763,7 +21809,17 @@ static bool shell_try_for_command(const char *src) {
                 kfree(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
                 kfree(list); kfree(body);
-                shell_set_status(2);
+                /* failglob in the list: status 1, the loop never runs. */
+                if (g_bad_subst_soft) {
+                    g_bad_subst_soft = false;
+                    shell_set_status(1);
+                    if (g_shell_flow == SHELL_FLOW_NONE) {
+                        g_shell_flow = SHELL_FLOW_DISCARD;
+                        g_shell_flow_status = 1;
+                    }
+                } else {
+                    shell_set_status(2);
+                }
                 return true;
             }
         }
@@ -21796,6 +21852,7 @@ static bool shell_try_for_command(const char *src) {
          * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_INTERRUPT ||
+            g_shell_flow == SHELL_FLOW_DISCARD ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -21926,6 +21983,7 @@ static bool shell_try_while_command(const char *src) {
          * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_INTERRUPT ||
+            g_shell_flow == SHELL_FLOW_DISCARD ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -22064,6 +22122,7 @@ static bool shell_try_until_command(const char *src) {
          * that is worse than not handling it at all. */
         if (g_shell_flow == SHELL_FLOW_RETURN ||
             g_shell_flow == SHELL_FLOW_INTERRUPT ||
+            g_shell_flow == SHELL_FLOW_DISCARD ||
             g_shell_flow == SHELL_FLOW_EXIT) {
             set_last = false;
             goto done;
@@ -24165,8 +24224,15 @@ static void execute_line_text_inner(const char *src) {
 
     if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
         if (g_bad_subst_soft) {
+            /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
+             * command is skipped with status 1 and so is the rest of
+             * the logical line -- see SHELL_FLOW_DISCARD. */
             g_bad_subst_soft = false;
             shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
             return;
         }
         /* RETRACTION: a malformed expansion was briefly made fatal with status
@@ -24227,7 +24293,21 @@ static void execute_line_text_inner(const char *src) {
         if (!plp) { shell_set_status(2); return; }
         int parsed = shell_parse_pipeline(tok, ntok, &i, plp);
         if (parsed < 0) {
-            shell_set_status(2);
+            /* failglob (and a bad indirection) ask for STATUS 1 and the
+             * command skipped; everything else that fails here is the
+             * generic 2. The flag was set for the tokenizer's failure
+             * path and never reached this one, so `echo @(*)` with
+             * nothing matching reported 2 where bash reports 1. */
+            if (g_bad_subst_soft) {
+                g_bad_subst_soft = false;
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+            } else {
+                shell_set_status(2);
+            }
             kfree(plp);
             return;
         }
@@ -24992,6 +25072,10 @@ int shell_run_line_hosted(const char *text) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
         rc = 130;
+    } else if (g_shell_flow == SHELL_FLOW_DISCARD) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        rc = 1;
     }
     (void)shell_take_interrupt();
     shell_drain_background();
