@@ -2971,7 +2971,7 @@ static struct shell_shopt g_shopts[] = {
     { "expand_aliases",       &g_opt_expand_aliases,         true,  false },
     { "nullglob",             &g_shopt_nullglob,             true , false },
     { "failglob",             &g_shopt_failglob,             true , false },
-    { "dotglob",              &g_shopt_dotglob,              false, false },
+    { "dotglob",              &g_shopt_dotglob,              true , false },
     { "extglob",              &g_shopt_extglob,              true,  false },
     { "globstar",             &g_shopt_globstar,             true,  false },
     { "nocaseglob",           &g_shopt_nocaseglob,           false, false },
@@ -17989,6 +17989,96 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
 
 static void shell_strip_glob_escapes(char *s);
 
+/* ---- GLOBIGNORE and dotfiles ------------------------------------------ *
+ *
+ * GLOBIGNORE is a colon-separated list of patterns; a pathname matching any
+ * of them is dropped from every pathname expansion. It is matched against
+ * the name AS THE EXPANSION WOULD PRINT IT (`foo/two.txt` for foo/star.star,
+ * `dir1/ignore.txt` for star/star) and COMPONENT BY COMPONENT: a `*` in the
+ * ignore pattern does not cross a slash, so `*.txt` leaves foo/two.txt alone
+ * while star/ignore-star takes dir1/ignore.txt -- measured against bash, and
+ * the first cut got exactly this wrong. The variable's own text is the
+ * pattern, so a backslash in it quotes: GLOBIGNORE='escape\*.txt' is one
+ * file.
+ *
+ * DOTFILES. A leading dot needs a leading dot in the pattern -- unless the
+ * dotglob shopt is on (a table entry the globber never read until now), or
+ * GLOBIGNORE has been set, when only `.` and `..` stay hidden. bash turns
+ * dot-matching on when GLOBIGNORE is assigned a non-empty value and off
+ * when it is UNSET; assigning the empty string leaves it as it was
+ * (measured: `GLOBIGNORE=*.txt; GLOBIGNORE=; echo *` still lists .hidden).
+ * The state is read at glob time rather than hooked into assignment, which
+ * is the same thing unless two assignments happen with no glob between. */
+static bool g_globignore_dot;
+
+static bool shell_glob_dot_ok(const char *name, const char *comp) {
+    if (name[0] != '.' || comp[0] == '.') return true;
+    const char *gi = env_get("GLOBIGNORE");
+    if (!gi) g_globignore_dot = false;
+    else if (*gi) g_globignore_dot = true;
+    if (!g_shopt_dotglob && !g_globignore_dot) return false;
+    return !(name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+static bool shell_glob_match_path(const char *pat, const char *path) {
+    for (;;) {
+        const char *pe = pat, *ne = path;
+        while (*pe && *pe != '/') pe++;
+        while (*ne && *ne != '/') ne++;
+        if (!shell_glob_match_e(pat, pe, path, ne)) return false;
+        if (!*pe || !*ne) return !*pe && !*ne;
+        pat = pe + 1;
+        path = ne + 1;
+    }
+}
+
+/* The end of the bracket expression opening at `p` (which points at `[`),
+* or `p` itself when it never closes. A `[:class:]` inside it is skipped
+* whole, so its colons are not list separators. */
+static const char *shell_globignore_bracket_end(const char *p) {
+    const char *q = p + 1;
+    if (*q == '!' || *q == '^') q++;
+    if (*q == ']') q++;                 /* a leading ] is literal */
+    for (; *q; q++) {
+        if (q[0] == '[' && q[1] == ':') {
+            const char *c = q + 2;
+            while (*c && !(c[0] == ':' && c[1] == ']')) c++;
+            if (!*c) return p;
+            q = c + 1;
+            continue;
+        }
+        if (*q == ']') return q;
+    }
+    return p;
+}
+
+static bool shell_globignored(const char *path) {
+    const char *gi = env_get("GLOBIGNORE");
+    if (!gi || !*gi) return false;
+    for (const char *p = gi; ; ) {
+        /* the next unbracketed colon: `[[:alnum:]]*` is ONE pattern */
+        const char *e = p;
+        while (*e && *e != ':') {
+            if (*e == '[') {
+                const char *be = shell_globignore_bracket_end(e);
+                if (be != e) { e = be + 1; continue; }
+            }
+            e++;
+        }
+        if (e > p) {
+            char pat[VFS_PATH_MAX];
+            size_t n = (size_t)(e - p);
+            if (n < sizeof pat) {
+                memcpy(pat, p, n);
+                pat[n] = '\0';
+                if (shell_glob_match_path(pat, path)) return true;
+            }
+        }
+        if (!*e) return false;
+        p = e + 1;
+    }
+}
+
 /* ---- `**`, the globstar match --------------------------------------- *
  *
  *     shopt -s globstar
@@ -18024,6 +18114,7 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
                                int ncomp, int ci, int depth);
 
 static int shell_globstar_emit(struct shell_globstar *g, const char *path) {
+    if (shell_globignored(path)) return 0;         /* GLOBIGNORE */
     if (g->cur->argc >= ARG_MAX) {
         g->overflow = true;
         return -1;
@@ -18084,7 +18175,7 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
     if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
     struct vfs_dirent ent;
     while (vfs_readdir(&d, &ent) == VFS_OK) {
-        if (ent.name[0] == '.' && comps[ci][0] != '.') continue;
+        if (!shell_glob_dot_ok(ent.name, comps[ci])) continue;
         if (!shell_glob_match(comps[ci], ent.name)) continue;
         char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
         int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
@@ -18190,8 +18281,7 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
 }
 
 
-static int shell_expand_glob_word(struct shell_pipeline *pl,
-                                  struct shell_simple *cur,
+static int shell_expand_glob_word(struct shell_pipeline *pl,                                  struct shell_simple *cur,
                                   const char *word) {
     const char *last_slash = 0;
     for (const char *p = word; *p; p++) {
@@ -18251,7 +18341,10 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
     int first_arg = cur->argc;
     struct vfs_dirent ent;
     while ((rc = vfs_readdir(&d, &ent)) == VFS_OK) {
-        if (ent.name[0] == '.' && pattern[0] != '.') continue;
+        /* A leading dot needs a leading dot in the pattern -- unless
+         * dotglob is on or GLOBIGNORE is set, when only `.` and `..` stay
+         * hidden. dotglob was a table entry the globber never read. */
+        if (!shell_glob_dot_ok(ent.name, pattern)) continue;
         if (!shell_glob_match(pattern, ent.name)) continue;
         if (cur->argc >= ARG_MAX) {
             vfs_closedir(&d);
@@ -18267,6 +18360,7 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
         }
         memcpy(tmp, display_prefix, pre);
         memcpy(tmp + pre, ent.name, nam + 1);
+        if (shell_globignored(tmp)) continue;      /* GLOBIGNORE */
         if (shell_pipeline_save_word(pl, tmp, &cur->argv[cur->argc]) < 0) {
             vfs_closedir(&d);
             return -1;
