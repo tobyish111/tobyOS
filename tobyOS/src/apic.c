@@ -42,6 +42,7 @@
 #include <tobyos/percpu.h>
 #include <tobyos/perf.h>     /* slice 95: time-bounded shootdown ack waits */
 #include <tobyos/sched.h>
+#include <tobyos/signal.h>   /* signal_deliver_irq, for the AP timer */
 #include <tobyos/smp.h>      /* tlb_shootdown_remote: percpu walk */
 
 /* Single virtual page mapped to LAPIC MMIO. Same kernel virt for every
@@ -474,6 +475,23 @@ void apic_timer_calibrate_global(void) {
  * preempts when ring 3 was interrupted. */
 static void apic_timer_isr(struct regs *r) {
     apic_eoi();
+    /* CAUGHT SIGNALS FOR THE PROCESS RUNNING ON THIS CORE (2026-09-20).
+     *
+     * The PIT handler delivers a pending caught signal to a process it
+     * interrupted at ring 3 (signal_deliver_irq); the PIT fires on the BSP
+     * only. A CPU-bound process on an APPLICATION PROCESSOR took this
+     * interrupt instead, which only preempted it, so a handler-installing
+     * program spinning in user code on an AP never ran its handler: the
+     * signal stayed pending until its next syscall, which a spin never
+     * makes. /bin/sigregs hung on the four-core EliteDesk exactly there --
+     * its child blocked on an acknowledgement the parent's handler never
+     * got to send -- and passed on QEMU, where the parent happened to sit
+     * on the BSP. Same block as pit.c, same order: EOI first, because a
+     * default disposition may exit the process and never return. */
+    if (r && (r->cs & 3) == 3) {
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
+    }
     sched_tick(r);
 }
 
