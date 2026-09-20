@@ -3199,9 +3199,16 @@ static void cmd_declare(int argc, char **argv) {
     for (; i < argc; i++) {
         char sign = argv[i][0];
         if ((sign != '-' && sign != '+') || argv[i][1] == '\0') break;
+        /* `--` ENDS THE OPTIONS, as it does for every builtin. It used to
+         * fall out of the switch as an unknown letter and be taken for a
+         * name, which `shell_name_is_valid` then rejected. */
+        if (sign == '-' && argv[i][1] == '-' && argv[i][2] == '\0') {
+            i++;
+            break;
+        }
         bool on = (sign == '-');
-        bool known = true;
-        for (const char *f = argv[i] + 1; *f; f++) {
+        char bad = '\0';
+        for (const char *f = argv[i] + 1; *f && !bad; f++) {
             switch (*f) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; break;
@@ -3212,13 +3219,24 @@ static void cmd_declare(int argc, char **argv) {
              * They shared a case while neither did anything. */
             case 'A': if (on) { set_array = true; set_assoc = true; } break;
             case 'p': if (on) print_mode = true; break;
-            case 'i': case 'u': case 'l':
+            case 'i': case 'I': case 'u': case 'l':
             case 'F': case 'f': case 'g': case 't': break;
-            default:  known = false; break;
+            default:  bad = *f; break;
             }
-            if (!known) break;
         }
-        if (!known) break;
+        if (bad) {
+            /* AN UNKNOWN OPTION IS A USAGE ERROR, STATUS 2 -- not a name.
+             * `typeset -@(*.py) myvar` with nothing matching hands the
+             * builtin the literal `-@(*.py)`; bash rejects the `@` with
+             * its usage line and exits 2. tsh took the word for a NAME,
+             * called it bad, and exited 1. */
+            kprintf("%s: -%c: invalid option\n", argv[0], bad);
+            kprintf("%s: usage: %s [-aAfFgiIlnrtux] [name[=value] ...] or "
+                    "%s -p [-aAfFilnrtux] [name ...]\n",
+                    argv[0], argv[0], argv[0]);
+            shell_set_status(2);
+            return;
+        }
     }
     if (i >= argc) {
         /* No names: list the variable table, as `declare` with only flags
