@@ -12,6 +12,9 @@
  */
 
 #include <tobyos/shell.h>
+#ifdef SHELL_HOSTED
+#include <regex.h>          /* libtoby's ERE engine, for `[[ =~ ]]` */
+#endif
 #include <tobyos/keyboard.h>
 #include <tobyos/console.h>
 #include <tobyos/printk.h>
@@ -21098,9 +21101,10 @@ static void shell_parse_error(void) {
  * Until now /bin/tsh spawned `/bin/[[` and reported 127 for every conditional
  * expression in existence.
  *
- * What is NOT here, stated rather than hidden: `=~` needs a POSIX ERE engine,
- * which this shell does not have. It reports that rather than quietly
- * answering false.
+ * `=~` runs on libtoby's POSIX ERE engine (regex.c, the one sed, awk and
+ * grep already share) and fills BASH_REMATCH. Only /bin/tsh links it: the
+ * in-kernel console shell still reports the gap rather than answering
+ * false.
  *
  * The differences from `test` that matter, and are implemented:
  *   - no field splitting and no pathname expansion on the operands, so
@@ -21119,6 +21123,7 @@ struct shell_dbr {
     int    n;
     int    pos;
     bool   err;
+    bool   bad_re;              /* `=~` with a pattern that does not compile */
     char   buf[SHELL_PARSE_BUF_MAX];
     size_t bufpos;
 };
@@ -21411,6 +21416,7 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     d->n = 0;
     d->pos = 0;
     d->err = false;
+    d->bad_re = false;
     d->bufpos = 0;
     struct shell_dbr_scratch *sc =
         (struct shell_dbr_scratch *)kmalloc(sizeof *sc);
@@ -21420,16 +21426,81 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     return rc;
 }
 
-/* `[[ subject =~ regex ]]`: what this needs is a POSIX ERE engine. The
- * splitter above already hands the right-hand side over as ONE word with
- * its quoted bytes marked, which is the half a matcher can be built on. */
+/* `[[ subject =~ regex ]]`: 1 on a match, 0 on none, -1 when the pattern
+ * does not compile (bash: status 2, and the script carries on).
+ *
+ * The word arrives with its quoted bytes MARKED (shell_dbr_split). A marked
+ * byte that the ERE grammar would read as an operator gets a backslash;
+ * every other marked byte is itself. That is bash's rule exactly
+ * (quote_string_for_globbing, QGLOB_REGEXP), and it is why a quoted `-`
+ * inside a bracket is still a range -- `[[ - =~ ["a-z"] ]]` is FALSE, the
+ * "weird rule all shells agree on" in the corpus.
+ *
+ * BASH_REMATCH is rebuilt on every match and cleared on a failed one. */
+#ifdef SHELL_HOSTED
+static bool shell_dbr_ere_special(char c) {
+    return c == '.' || c == '[' || c == ']' || c == '(' || c == ')' ||
+           c == '*' || c == '+' || c == '?' || c == '{' || c == '}' ||
+           c == '|' || c == '^' || c == '$' || c == '\\';
+}
+
+static int shell_dbr_regex(const char *subj, const char *pat) {
+    size_t n = strlen(pat);
+    char *ere = (char *)kmalloc(2 * n + 1);
+    if (!ere) return -1;
+    char *w = ere;
+    for (const char *q = pat; *q; q++) {
+        if ((*q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) && q[1]) {
+            q++;
+            if (shell_dbr_ere_special(*q)) *w++ = '\\';
+        }
+        *w++ = *q;
+    }
+    *w = '\0';
+
+    regex_t re;
+    int cflags = REG_EXTENDED;
+    if (g_shopt_misc[3]) cflags |= REG_ICASE;          /* nocasematch */
+    if (regcomp(&re, ere, cflags) != 0) {
+        kfree(ere);
+        return -1;
+    }
+    size_t nm = (size_t)re.re_nsub + 1;
+    regmatch_t *m = (regmatch_t *)kmalloc(nm * sizeof *m);
+    if (!m) { regfree(&re); kfree(ere); return -1; }
+    int rc = regexec(&re, subj, nm, m, 0);
+    sh_array_unset("BASH_REMATCH");
+    if (rc == 0) {
+        size_t sl = strlen(subj);
+        for (size_t i = 0; i < nm; i++) {
+            if (m[i].rm_so < 0 || m[i].rm_eo < m[i].rm_so ||
+                (size_t)m[i].rm_eo > sl) {
+                (void)sh_array_set("BASH_REMATCH", (long)i, "");
+                continue;
+            }
+            size_t len = (size_t)(m[i].rm_eo - m[i].rm_so);
+            char *piece = (char *)kmalloc(len + 1);
+            if (!piece) break;
+            memcpy(piece, subj + m[i].rm_so, len);
+            piece[len] = '\0';
+            (void)sh_array_set("BASH_REMATCH", (long)i, piece);
+            kfree(piece);
+        }
+    }
+    regfree(&re);
+    kfree(m);
+    kfree(ere);
+    return rc == 0 ? 1 : 0;
+}
+#else
 static int shell_dbr_regex(const char *subj, const char *pat) {
     (void)subj; (void)pat;
-    /* Stated, not faked: an ERE engine is what this needs. */
+    /* Stated, not faked: the console shell does not link the engine. */
     kprintf("tsh: [[: =~ needs a regular-expression engine, "
-            "which this shell does not have\n");
+            "which the in-kernel shell does not link\n");
     return -1;
 }
+#endif
 
 static const char *shell_dbr_peek(struct shell_dbr *d) {
     return d->pos < d->n ? d->w[d->pos] : 0;
@@ -21503,7 +21574,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
         const char *re = d->w[d->pos + 1];
         d->pos += 2;
         int r = shell_dbr_regex(a, re);
-        if (r < 0) { d->err = true; return 0; }
+        if (r < 0) { d->bad_re = true; return 0; }
         return r;
     }
 
@@ -21636,7 +21707,14 @@ static bool shell_try_dbracket_command(const char *src) {
             if (d->err || d->pos != d->n) bad = true;
         }
     }
+    bool bad_re = d->bad_re;
     kfree(d);
+    /* A REGEX THAT DOES NOT COMPILE IS STATUS 2, NOT A SYNTAX ERROR:
+     * `[[ foo.py =~ * ]]` exits 2 in bash and the script continues. */
+    if (!bad && bad_re) {
+        shell_set_status(2);
+        return true;
+    }
 
     if (bad) {
         /* A SYNTAX ERROR IN A CONDITIONAL ABORTS THE SCRIPT AND CHANGES
@@ -23683,6 +23761,7 @@ static bool shell_run_list_line(const char *src) {
  */
 static const char *shell_find_pipe_at(const char *s) {
     bool in_sq = false, in_dq = false, in_bt = false;
+    bool dbr = false;               /* inside `[[ ... ]]` */
     int paren = 0, compound = 0, brace = 0;
     const char *start = s;
 
@@ -23716,6 +23795,22 @@ static const char *shell_find_pipe_at(const char *s) {
         if (*p == '(') { paren++; continue; }
         if (*p == ')') { if (paren > 0) paren--; continue; }
         if (paren > 0) continue;
+        /* `[[ ... ]]` HAS ITS OWN GRAMMAR, and `|` is not a pipe in it:
+         * `[[ bar =~ foo|bar ]]` is one conditional with an alternation,
+         * which this cut into a two-stage pipeline whose first stage
+         * had no `]]`. The scanner already knows this (st->dbracket);
+         * this walker did not. */
+        if (dbr) {
+            if (p[0] == ']' && p[1] == ']') { dbr = false; p++; }
+            continue;
+        }
+        if (p[0] == '[' && p[1] == '[' &&
+            (p[2] == ' ' || p[2] == '\t' || p[2] == '\0') &&
+            shell_word_boundary_before(start, p)) {
+            dbr = true;
+            p++;
+            continue;
+        }
 
         if (shell_word_boundary_before(start, p)) {
             if (shell_starts_with_word(p, "if")    ||
