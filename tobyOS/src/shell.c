@@ -462,6 +462,11 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                                 bool dq_syntax, bool sq_syntax);
 static void shell_strip_nosplit_inplace(char *s);
 static void shell_word_tilde(char *w, size_t cap);
+/* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
+static bool shell_has_glob(const char *s);
+static bool g_shopt_nullglob, g_shopt_failglob;   /* defined with the shopt table */
+static int  sh_array_glob_field(const char *name, const char *field,
+                                long *next);
 
 static long  sh_array_max_idx(const struct sh_array *a);
 static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
@@ -1110,8 +1115,31 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         }
         if (end || boundary) {
             field[f] = '\0';
+            /* AN UNQUOTED FIELD IS GLOBBED, as it is in bash: `a=(*.py)` is
+             * the files. This parser expanded and split each element and
+             * never globbed, so it stored the pattern. Decided BEFORE the
+             * strip below, because the strip removes the marks that say a
+             * metacharacter was quoted -- `a=(x\*)` is the literal x*. */
+            int globbed = 0;
+            if (split && shell_has_glob(field)) {
+                globbed = sh_array_glob_field(name, field, next);
+                if (globbed < 0) return -1;
+                if (globbed == 0 && g_shopt_failglob) {
+                    shell_strip_nosplit_inplace(field);
+                    kprintf("shell: no match: %s\n", field);
+                    g_bad_subst_soft = true;
+                    if (g_shell_flow == SHELL_FLOW_NONE) {
+                        g_shell_flow = SHELL_FLOW_DISCARD;
+                        g_shell_flow_status = 1;
+                    }
+                    return -1;
+                }
+                if (globbed == 0 && g_shopt_nullglob) globbed = -2;
+            }
             shell_strip_nosplit_inplace(field);
-            if (field[0] || (keep_empty && !any)) {
+            if (globbed > 0) {
+                any = true;
+            } else if (globbed == 0 && (field[0] || (keep_empty && !any))) {
                 if (sh_array_set(name, (*next)++, field) < 0) return -1;
                 any = true;
             }
@@ -1356,14 +1384,21 @@ static int sh_try_array_assignment(const char *kv) {
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
         if (!shell_name_is_valid(nm, keylen)) return 0;
-        return sh_array_assign_literal(nm, val, append) == 0 ? 1 : 0;
+        /* -1: it WAS an array literal and it FAILED (failglob, no memory).
+         * Returning 0 here let env_set_kv store the text `(*.ZZ)` as a
+         * scalar and report success. */
+        return sh_array_assign_literal(nm, val, append) == 0 ? 1 : -1;
     }
     return 0;
 }
 
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
-    if (sh_try_array_assignment(kv_in)) return 0;
+    {
+        int ar = sh_try_array_assignment(kv_in);
+        if (ar > 0) return 0;
+        if (ar < 0) return -1;
+    }
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
 
@@ -18256,6 +18291,43 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,
 
 /* True while the word being added came out of an expansion. See the comment
  * in shell_add_arg_ex. */
+/* PATHNAME EXPANSION FOR ONE ARRAY-LITERAL FIELD. The globber writes
+ * into a pipeline stage, so it is handed a scratch one -- on the heap,
+ * since a pipeline is ~40 KiB and literals nest through subshells. The
+ * field arrives with its no-split marks still in (they are what say a
+ * span was quoted, and the caller has not stripped them yet); they are
+ * not pattern characters, so they come out here and the escapes stay.
+ * Returns the number of matches stored, 0 when nothing matched. */
+static int sh_array_glob_field(const char *name, const char *field,
+                               long *next) {
+    char pat[SHELL_PARSE_BUF_MAX];
+    size_t o = 0;
+    for (const char *r = field; *r && o + 2 < sizeof pat; r++) {
+        if (*r == SHELL_DATA_ESC && r[1]) { pat[o++] = *r++; pat[o++] = *r; continue; }
+        if (*r != SHELL_NOSPLIT_MARK) pat[o++] = *r;
+    }
+    pat[o] = '\0';
+    struct shell_pipeline *pl = (struct shell_pipeline *)kmalloc(sizeof *pl);
+    struct shell_simple *cur = (struct shell_simple *)kmalloc(sizeof *cur);
+    if (!pl || !cur) {
+        if (pl) kfree(pl);
+        if (cur) kfree(cur);
+        return -1;
+    }
+    pl->count = 0;
+    pl->expand_pos = 0;
+    shell_simple_init(cur);
+    int n = shell_expand_glob_word(pl, cur, pat);
+    if (n > 0) {
+        for (int i = 0; i < cur->argc; i++) {
+            if (sh_array_set(name, (*next)++, cur->argv[i]) < 0) { n = -1; break; }
+        }
+    }
+    kfree(cur);
+    kfree(pl);
+    return n;
+}
+
 static bool g_arg_from_expansion;
 
 static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
