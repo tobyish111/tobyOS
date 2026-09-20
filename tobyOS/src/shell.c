@@ -232,6 +232,60 @@ static void shell_lmap_add(size_t off, unsigned long line) {
 /* The physical line a pointer INTO the current logical line came from, or 0
  * if it did not come from there -- a compound body that was copied out, or a
  * nested one, keeps whatever line the enclosing construct set. */
+/* COPY LAYERS. Every executor that runs a piece of a logical line runs a
+ * COPY of it -- a loop body, an if branch, a case clause, each `;`-separated
+ * list element -- so a pointer into the text being executed is not a
+ * pointer into the buffer the offset map was built for, and $LINENO inside
+ * a multi-line body was the body's FIRST line for every command in it
+ * (`while ...; do` / `echo hello` / `break` reported the same number for
+ * both, 1183). A layer says "this copy is that original"; the lookup
+ * translates a pointer through every layer that contains it, innermost
+ * first, until it lands in the mapped buffer. Pushed and popped around the
+ * execute call, so a layer never outlives its buffer. */
+#define SHELL_LMAP_LAYERS 24
+static struct { const char *copy; size_t len; const char *orig; }
+    g_lmap_layer[SHELL_LMAP_LAYERS];
+static int g_lmap_layers;
+
+static void shell_lmap_push_copy(const char *copy, const char *orig) {
+    /* The copier drops leading blanks and separators; the original still
+     * has them (a body starts right after `do`, on the PREVIOUS line). Align
+     * both sides on their first real byte, or every lookup lands one line
+     * early. */
+    while (copy && (*copy == ' ' || *copy == '\t' || *copy == ';' || *copy == '\n')) copy++;
+    while (orig && (*orig == ' ' || *orig == '\t' || *orig == ';' || *orig == '\n')) orig++;
+    if (!copy || !orig || g_lmap_layers >= SHELL_LMAP_LAYERS) {
+        g_lmap_layers++;               /* keep push/pop balanced */
+        return;
+    }
+    g_lmap_layer[g_lmap_layers].copy = copy;
+    g_lmap_layer[g_lmap_layers].len  = strlen(copy);
+    g_lmap_layer[g_lmap_layers].orig = orig;
+    g_lmap_layers++;
+}
+
+static void shell_lmap_pop_copy(void) {
+    if (g_lmap_layers > 0) g_lmap_layers--;
+}
+
+static const char *shell_lmap_translate(const char *p) {
+    for (int hops = 0; p && hops < SHELL_LMAP_LAYERS; hops++) {
+        bool moved = false;
+        int top = g_lmap_layers < SHELL_LMAP_LAYERS ? g_lmap_layers
+                                                    : SHELL_LMAP_LAYERS;
+        for (int i = top - 1; i >= 0; i--) {
+            const char *c = g_lmap_layer[i].copy;
+            if (p >= c && p <= c + g_lmap_layer[i].len) {
+                p = g_lmap_layer[i].orig + (p - c);
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) break;
+    }
+    return p;
+}
+
 static unsigned long shell_lineno_at(const char *p);
 
 /* The line a BODY starts on. The keyword and the body are joined with a
@@ -245,13 +299,17 @@ static unsigned long shell_lineno_body(const char *p) {
 }
 
 static unsigned long shell_lineno_at(const char *p) {
+    p = shell_lmap_translate(p);           /* through the copy layers */
     if (!g_lmap_base || !p || p < g_lmap_base || g_lmap_n == 0) return 0;
     size_t off = (size_t)(p - g_lmap_base);
     /* A POINTER FROM SOMEWHERE ELSE IS NOT AN OFFSET. Compound bodies are
      * copied out into their own buffers, and one of those at a higher
      * address answered the range test and indexed into the wrong end of the
      * map -- every `$LINENO` in a loop body reported the `done` line. */
-    if (off > g_lmap_len) return 0;
+    /* Past the LAST join is still inside the last joined line -- a continued
+     * pipeline's final stage lives there (1185/1186) -- so only a pointer
+     * past any plausible end of the buffer is refused. */
+    if (off > g_lmap_len + SHELL_PARSE_BUF_MAX) return 0;
     unsigned long best = 0;
     for (int i = 0; i < g_lmap_n; i++)
         if (g_lmap_off[i] <= off) best = g_lmap_line[i];
@@ -8374,6 +8432,14 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
     }
 }
 
+/* Does the text end in an ODD number of backslashes -- a line continuation
+ * still owed? (An even number is escaped backslashes.) */
+static bool shell_text_ends_in_continuation(const char *t, size_t n) {
+    size_t bs = 0;
+    while (bs < n && t[n - 1 - bs] == '\\') bs++;
+    return (bs & 1u) != 0;
+}
+
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
     if (g_script_depth >= 8) {
@@ -8430,6 +8496,10 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     break;
                 }
                 size_t alen = (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
+                /* The offset map is keyed on this buffer too -- a `\`-joined
+                 * pipeline's stages sit on different lines and the DEBUG trap
+                 * reports each on its own (1186). */
+                shell_lmap_reset(accum, line_first);
                 bool bad = false;
                 while (inc && *p) {
                     /* A continuation drops the backslash and joins directly;
@@ -8443,6 +8513,11 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     char nsaved = *p;
                     if (*p) *p++ = '\0';
                     if (nsaved == '\r' && *p == '\n') p++;
+                    /* A JOINED LINE IS STILL A LINE. This path never counted
+                     * them, so `echo x \` + `| cat` left every $LINENO after
+                     * it one short; the compound path always did. */
+                    g_shell_lineno++;
+                    shell_lmap_add(alen, g_shell_lineno);
 
                     size_t nlen = strlen(nstart);
                     if (alen + nlen + 1 > SHELL_PARSE_BUF_MAX) {
@@ -8511,14 +8586,20 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             }
             size_t alen = (line == accum) ? strlen(accum)
                         : (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
-            /* The offset map is keyed on THIS buffer; see shell_lineno_at. */
-            shell_lmap_reset(accum, g_shell_lineno);
+            /* The offset map is keyed on THIS buffer; see shell_lineno_at. A
+             * continuation-joined line arrives with its map already built. */
+            if (line != accum) shell_lmap_reset(accum, g_shell_lineno);
             /* The newline that ended this line's comment is about to be
              * replaced by "; ", so the comment has to go with it. */
             shell_strip_comment(accum);
             alen = strlen(accum);
             bool overflow = false;
-            while (shell_scan_incomplete(&scan) && *p) {
+            /* ...OR THE TEXT SO FAR ENDS IN A BACKSLASH. `{ ...; } \` followed
+             * by `| cat` is one pipeline: the group closes, the scanner is
+             * satisfied, and the continuation still has to pull the next
+             * line in -- it used to hand `| cat` to the parser on its own. */
+            while ((shell_scan_incomplete(&scan) ||
+                    shell_text_ends_in_continuation(accum, alen)) && *p) {
                 char *nstart = p;
                 while (*p && *p != '\n' && *p != '\r') p++;
                 char nsaved = *p;
@@ -8678,6 +8759,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * put back afterwards so the next line still follows on. */
         unsigned long line_last = g_shell_lineno;
         g_shell_lineno = line_first;
+        if (!accum) shell_lmap_reset(line, line_first);
         execute_line_text(line);
         g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
@@ -22167,7 +22249,9 @@ static bool shell_try_if_command(const char *src) {
         /* The condition's status is the decision, so `set -e` must not act
          * on it: `if false; then` used to exit the shell outright. */
         g_errexit_suspend++;
+        shell_lmap_push_copy(cond, cond_start);
         execute_line_text(cond);
+        shell_lmap_pop_copy();
         g_errexit_suspend--;
         kfree(cond);
         if (g_shell_flow != SHELL_FLOW_NONE) return true;
@@ -22184,7 +22268,9 @@ static bool shell_try_if_command(const char *src) {
                 unsigned long ln_save = g_shell_lineno;
                 unsigned long bl = shell_lineno_body(after_then);
                 if (bl) g_shell_lineno = bl;
+                shell_lmap_push_copy(yes, after_then);
                 execute_line_text(yes);
+                shell_lmap_pop_copy();
                 g_shell_lineno = ln_save;
             }
             kfree(yes);
@@ -22208,7 +22294,9 @@ static bool shell_try_if_command(const char *src) {
                 unsigned long ln_save = g_shell_lineno;
                 unsigned long bl = shell_lineno_body(else_body);
                 if (bl) g_shell_lineno = bl;
+                shell_lmap_push_copy(no, else_body);
                 execute_line_text(no);
+                shell_lmap_pop_copy();
                 g_shell_lineno = ln_save;
             }
             kfree(no);
@@ -22455,7 +22543,9 @@ static bool shell_try_for_command(const char *src) {
         }
         unsigned long ln_save = g_shell_lineno;
         if (body_line) g_shell_lineno = body_line;
+        shell_lmap_push_copy(body, do_end);
         execute_line_text(body);
+        shell_lmap_pop_copy();
         /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
          * line made every line after the compound short by the number
          * of lines the body spanned. */
@@ -22586,7 +22676,9 @@ static bool shell_try_while_command(const char *src) {
         }
         unsigned long ln_save = g_shell_lineno;
         if (body_line) g_shell_lineno = body_line;
-        execute_line_text(body);          /* the BODY is not exempt */
+        shell_lmap_push_copy(body, do_end);
+        execute_line_text(body);
+        shell_lmap_pop_copy();          /* the BODY is not exempt */
         /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
          * line made every line after the compound short by the number
          * of lines the body spanned. */
@@ -22725,7 +22817,9 @@ static bool shell_try_until_command(const char *src) {
         }
         unsigned long ln_save = g_shell_lineno;
         if (body_line) g_shell_lineno = body_line;
+        shell_lmap_push_copy(body, do_end);
         execute_line_text(body);
+        shell_lmap_pop_copy();
         /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
          * line made every line after the compound short by the number
          * of lines the body spanned. */
@@ -23087,7 +23181,9 @@ static bool shell_try_case_command(const char *src) {
 
         if (!matched && shell_case_pattern_match(pats, word)) {
             matched = true;
+            shell_lmap_push_copy(body_text, body);
             execute_line_text(body_text);
+            shell_lmap_pop_copy();
             kfree(body_text);
             last = g_last_status;
             shell_set_status(last);
@@ -24025,7 +24121,9 @@ static bool shell_run_list_line(const char *src) {
                               (link == SH_LINK_AND || link == SH_LINK_OR);
                 g_status_exempt = false;
                 if (exempt) g_errexit_suspend++;
+                shell_lmap_push_copy(seg, cur);
                 execute_line_text(seg);
+                shell_lmap_pop_copy();
                 if (exempt) g_errexit_suspend--;
                 /* Remember that this failure was exempt, so a COMPOUND that
                  * returns it is not re-judged as a fresh failure one level up:
@@ -24514,6 +24612,13 @@ static void execute_line_text_inner(const char *src) {
     int ntok = 0;
 
     src = src ? src : "";
+    /* $LINENO for THIS piece of the line, when the text can be traced back
+     * to the buffer the reader mapped (see the copy layers). A piece that
+     * cannot -- a trap action, a function body -- keeps the current one. */
+    {
+        unsigned long ln = shell_lineno_at(shell_skip_blanks(src));
+        if (ln) g_shell_lineno = ln;
+    }
     if (g_shell_flow != SHELL_FLOW_NONE) return;
     if (g_opt_verbose) kprintf("%s\n", src);
     /* ^C ABORTS THE WHOLE CONSTRUCT, not just the current command. Checked
