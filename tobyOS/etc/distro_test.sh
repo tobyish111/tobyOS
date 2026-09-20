@@ -717,6 +717,8 @@ tsh -c 'x=$(seq 512 | tr "\n" " "); echo ${#x}'
 tsh -c '"" -c x' 2>&1; echo rc=$?
 tsh -c 'for i in $(seq 1 200); do :; done; echo loop ok'
 
+echo @@sig_regs
+/bin/sigregs
 echo @@mu_arch
 /bin/arch; busybox arch
 echo @@mu_true_false

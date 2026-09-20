@@ -602,6 +602,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/spechelp/spechelp.elf \
             programs/tsh/tsh.elf \
             programs/tjoinchurn/tjoinchurn.elf \
+            programs/sigregs/sigregs.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
             programs/updater/updater.elf \
@@ -1765,6 +1766,10 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,ttyparity,ttyparity))
 # Those three call sites had no test at all: /bin/linux-join rides the futex
 # contract and never enters thread.c. See the header in its main.c.
 $(eval $(call LIBTOBY_PROGRAM_RULES,tjoinchurn,tjoinchurn))
+# /bin/sigregs -- do rcx/r11 survive an ASYNCHRONOUS (timer-IRQ) signal? The
+# sigreturn path returned through SYSRETQ and could not restore them; GNU bash
+# faulted on it in the Oils corpus. Run by the distro fixture (@@sig_regs).
+$(eval $(call LIBTOBY_PROGRAM_RULES,sigregs,sigregs))
 # /bin/oilspec -- the THIRD-PARTY conformance gate. Same differential engine
 # as shparity, but over the ~2.8k-case Oils spec suite in third_party/oils-spec
 # rather than the 54 cases we wrote ourselves. See programs/oilspec.
@@ -3182,6 +3187,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
+	cp programs/sigregs/sigregs.elf                 $(INITRD_STAGE)/bin/sigregs
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
 	cp programs/ttyparity/ttyparity.elf             $(INITRD_STAGE)/bin/ttyparity
@@ -4217,7 +4223,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
 	    bin/bluescreen                                                    \
 	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
-	    bin/tjoinchurn                                                    \
+	    bin/tjoinchurn bin/sigregs                                        \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \

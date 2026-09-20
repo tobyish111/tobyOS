@@ -62,13 +62,22 @@ enum {
 
 /* Saved user context pushed onto the user stack for a caught signal and read
  * back by sys_sigreturn. It sits ABOVE the 8-byte handler return address so
- * the handler's own stack growth (downward) never clobbers it. rcx/r11 are
- * intentionally absent: the `syscall` instruction clobbers them by ABI, so
- * the interrupted user code already treats them as dead. */
+ * the handler's own stack growth (downward) never clobbers it.
+ *
+ * rcx AND r11 ARE SAVED (2026-09-20). They used to be "intentionally
+ * absent: the syscall instruction clobbers them by ABI, so the interrupted
+ * user code already treats them as dead" -- true of a context interrupted
+ * by a syscall, and false of one interrupted by the TIMER IRQ, which is how
+ * a caught signal reaches a process that is running user code
+ * (signal_deliver_irq). There rcx/r11 are live, and resuming through
+ * SYSRETQ handed the code rcx = its own RIP and r11 = RFLAGS. GNU bash
+ * faulted on exactly that (ecx was the character being classified).
+ * sys_sigreturn now returns through IRETQ with these restored. */
 struct sig_context {
     uint64_t rax;        /* syscall return value at the interruption point */
     uint64_t rdi, rsi, rdx, r10, r8, r9;
     uint64_t rbx, rbp, r12, r13, r14, r15;
+    uint64_t rcx, r11;   /* live across an IRQ; RIP/RFLAGS on a syscall */
     uint64_t rip;        /* resume RIP    */
     uint64_t rsp;        /* resume RSP    */
     uint64_t rflags;     /* resume RFLAGS */
@@ -611,6 +620,10 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     ctx->r14 = regs->r14; ctx->r15 = regs->r15;
     ctx->rsp       = regs->user_rsp;   /* original user RSP    */
     ctx->rflags    = regs->r11;        /* original user RFLAGS */
+    /* A syscall clobbered the user's rcx/r11; what SYSRETQ would have left
+     * in them is RIP/RFLAGS, so the IRETQ resume leaves exactly that. */
+    ctx->rcx       = ctx->rip;
+    ctx->r11       = ctx->rflags;
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic     = SIG_FRAME_MAGIC;
 
@@ -904,6 +917,8 @@ bool signal_deliver_fault(struct regs *r, int sig, int si_code,
     ctx->rip = r->rip;                 /* resume at the faulting instruction */
     ctx->rsp = r->rsp;
     ctx->rflags = r->rflags;
+    ctx->rcx = r->rcx;                 /* LIVE here -- an IRQ/fault frame */
+    ctx->r11 = r->r11;
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic = SIG_FRAME_MAGIC;
 
@@ -1022,9 +1037,10 @@ void sys_sigrestorer(uint64_t addr) {
 /* Restore the interrupted context saved by signal_setup_user_frame. The
  * handler has returned to the restorer trampoline, which issued SYS_SIGRETURN
  * with RSP pointing at the saved sig_context. We copy that context back into
- * the syscall trapframe so the SYSRETQ at the end of this very syscall
- * resumes the originally-interrupted instruction. Returns the value to leave
- * in the user's RAX. */
+ * the syscall trapframe and mark it for the IRETQ exit (syscall_entry.S,
+ * .Lsigreturn_iret): the interrupted context may have been cut by the timer
+ * IRQ where rcx/r11 are live, and SYSRETQ cannot restore those two. Returns
+ * the value to leave in the user's RAX. */
 long sys_sigreturn(void) {
     struct proc *p = current_proc();
     struct syscall_regs *regs = current_syscall_regs();
@@ -1056,6 +1072,9 @@ long sys_sigreturn(void) {
     regs->rcx      = ctx->rip;      /* resume RIP    */
     regs->r11      = ctx->rflags;   /* resume RFLAGS */
     regs->user_rsp = ctx->rsp;      /* resume RSP    */
+    regs->sig_rcx  = ctx->rcx;      /* the user's real rcx/r11 -- only an */
+    regs->sig_r11  = ctx->r11;      /* IRETQ exit can put them back      */
+    regs->pad      = 1;             /* ...so ask for one */
 
     p->sigstate.mask = (sigset_t)ctx->saved_mask;
 

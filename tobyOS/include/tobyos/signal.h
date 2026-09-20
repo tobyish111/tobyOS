@@ -221,11 +221,24 @@ struct signal_state {
  *
  * THIS MUST STAY IN SYNC WITH THE PUSH SEQUENCE IN syscall_entry.S. */
 struct syscall_regs {
+    /* THE IRETQ RETURN PATH (2026-09-20). sys_sigreturn cannot resume an
+     * interrupted context through SYSRETQ: that instruction loads RIP from
+     * rcx and RFLAGS from r11, so the user's own rcx/r11 are destroyed. That
+     * is harmless when the context was a syscall (the ABI already treats
+     * them as dead there) and fatal when it was interrupted by the TIMER
+     * IRQ in the middle of ordinary code -- which is exactly how a caught
+     * signal reaches a running process (pit.c -> signal_deliver_irq). GNU
+     * bash 5.2 in the corpus took its SIGCHLD that way and faulted with ecx
+     * holding a code address. So sys_sigreturn parks the real rcx/r11 here
+     * and sets `pad` non-zero; syscall_return_unwind then builds an IRETQ
+     * frame instead of falling through to sysretq. Pushed as zero on every
+     * entry, so a stale selector can never leak into the next syscall. */
+    uint64_t sig_rcx, sig_r11;
     uint64_t r15, r14, r13, r12, rbp, rbx;   /* callee-saved          */
     uint64_t r9, r8, r10, rdx, rsi, rdi;     /* user syscall arg regs */
     uint64_t r11;        /* user RFLAGS (SYSRETQ reloads from here)   */
     uint64_t rcx;        /* user RIP    (SYSRETQ reloads from here)   */
-    uint64_t pad;        /* 16-byte alignment pad                     */
+    uint64_t pad;        /* alignment pad; non-zero = return via IRETQ  */
     uint64_t user_rsp;   /* saved user RSP                            */
 };
 
