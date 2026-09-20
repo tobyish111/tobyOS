@@ -1192,7 +1192,8 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                     kprintf("shell: no match: %s\n", field);
                     g_bad_subst_soft = true;
                     if (g_shell_flow == SHELL_FLOW_NONE) {
-                        g_shell_flow = SHELL_FLOW_DISCARD;
+                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                     : SHELL_FLOW_DISCARD;
                         g_shell_flow_status = 1;
                     }
                     return -1;
@@ -18813,7 +18814,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
              * reading". */
             g_bad_subst_soft = true;
             if (g_shell_flow == SHELL_FLOW_NONE) {
-                g_shell_flow = SHELL_FLOW_DISCARD;
+                /* set -e: an expansion error EXITS (bash: the failglob
+                 * report is followed by the shell leaving, status 1). */
+                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                             : SHELL_FLOW_DISCARD;
                 g_shell_flow_status = 1;
             }
             return -1;
@@ -22079,7 +22083,8 @@ static bool shell_try_dbracket_command(const char *src) {
         g_bad_subst_soft = false;
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
-            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                         : SHELL_FLOW_DISCARD;
             g_shell_flow_status = 1;
         }
         return true;
@@ -22518,7 +22523,8 @@ static bool shell_try_for_command(const char *src) {
                     g_bad_subst_soft = false;
                     shell_set_status(1);
                     if (g_shell_flow == SHELL_FLOW_NONE) {
-                        g_shell_flow = SHELL_FLOW_DISCARD;
+                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                     : SHELL_FLOW_DISCARD;
                         g_shell_flow_status = 1;
                     }
                 } else {
@@ -24968,7 +24974,10 @@ static void execute_line_text_inner(const char *src) {
             g_bad_subst_soft = false;
             shell_set_status(1);
             if (g_shell_flow == SHELL_FLOW_NONE) {
-                g_shell_flow = SHELL_FLOW_DISCARD;
+                /* set -e: an expansion error EXITS (bash: the failglob
+                 * report is followed by the shell leaving, status 1). */
+                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                             : SHELL_FLOW_DISCARD;
                 g_shell_flow_status = 1;
             }
             return;
@@ -25040,7 +25049,8 @@ static void execute_line_text_inner(const char *src) {
                 g_bad_subst_soft = false;
                 shell_set_status(1);
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = SHELL_FLOW_DISCARD;
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
                     g_shell_flow_status = 1;
                 }
             } else {
