@@ -21114,6 +21114,8 @@ static void shell_parse_error(void) {
 struct shell_dbr {
     char  *w[SH_DBR_MAX];       /* expanded operand / operator text */
     bool   pat[SH_DBR_MAX];     /* unquoted: the word may be a pattern */
+    bool   opr[SH_DBR_MAX];     /* an OPERATOR of the grammar: ( ) && || ! --
+                                 * a quoted "(" is a one-character string */
     int    n;
     int    pos;
     bool   err;
@@ -21130,149 +21132,313 @@ static char *shell_dbr_store(struct shell_dbr *d, const char *s) {
     return out;
 }
 
-/* Split the expression into words. Blanks separate; quotes are absorbed and
- * remembered, because a quoted right-hand side of `==` is a literal string
- * and an unquoted one is a glob pattern. */
-static int shell_dbr_split(struct shell_dbr *d, const char *src) {
+/* THE SPLIT, AND WHAT QUOTING MEANS IN IT.
+ *
+ * Blanks separate words. Quotes are removed, and what was inside them is
+ * marked so that it is matched as ITSELF -- bash: "any part of the pattern
+ * may be quoted to force the quoted portion to be matched as a string".
+ * The first cut kept ONE flag per word and compared the whole thing with
+ * strcmp if any part had been quoted, so
+ *
+ *     [[ --no-long-option == --@(help|$prefix-@(long|short)-'option') ]]
+ *
+ * was false in tsh and true in bash: one quoted `'option'` demoted the
+ * whole pattern to a string. A word is now assembled span by span --
+ * unquoted runs go through the expander and come back as pattern text,
+ * quoted spans (and `\x`) come back with every operator character marked
+ * literal -- and the flag that survives says only whether ANY part was
+ * unquoted. The marks are the tokenizer's SHELL_GLOB_ESC, which the glob
+ * matcher already honours; the regex builder turns them into backslashes,
+ * and every other reader has them stripped here.
+ *
+ * PARENTHESES. `(` and `)` are operators of this grammar, so an unquoted
+ * one that is glued to a word ENDS the word and becomes a token of its own
+ * -- that is how bash's lexer sees it, and it is what makes
+ * `[[ !($empty) ]]` read as NOT ( "" ) when extglob is off. Two things
+ * keep a paren inside a word instead:
+ *
+ *   - an extglob group `X( ... )`, X one of ?*+@!. Recognised when the
+ *     shopt is on, and ALWAYS on the right-hand side of ==, != and =~,
+ *     which is where bash turns extglob on for the one token it reads
+ *     there (parse.y, cond_term) -- `[[ --verbose == --@(help|verbose) ]]`
+ *     is true with no shopt, measured on the box;
+ *   - a REGEX group on the right-hand side of =~, where `(a  b|c)` is one
+ *     word, blanks and all. bash reads a balanced paren there as part of
+ *     the token, and the corpus's `(< >)` and `$f(x)` lean on it.
+ *
+ * The buffers live on the heap: four line-sized arrays are more than the
+ * kernel stack has to spare, and this is compiled for it too. */
+struct shell_dbr_scratch {
+    char raw[SHELL_PARSE_BUF_MAX];   /* the word as written: the operator test */
+    char seg[SHELL_PARSE_BUF_MAX];   /* the pending unquoted run, for the expander */
+    char tmp[SHELL_PARSE_BUF_MAX];   /* one segment's expansion */
+    char out[SHELL_PARSE_BUF_MAX];   /* the assembled word */
+};
+
+/* An operator character of EITHER grammar a right-hand side can be read in,
+ * the glob's or the ERE's. A quoted one is marked; see above. */
+static bool shell_dbr_special(char c) {
+    return shell_glob_meta(c) || c == '.' || c == '+' || c == '{' ||
+           c == '}' || c == '^' || c == '$';
+}
+
+/* Append a QUOTED span of n bytes, every operator character marked. */
+static int shell_dbr_put_quoted(char *out, size_t *op, size_t cap,
+                                const char *s, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (shell_dbr_special(s[i]) &&
+            shell_append_char(out, op, cap, SHELL_GLOB_ESC) < 0) return -1;
+        if (shell_append_char(out, op, cap, s[i]) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Expand the pending unquoted run and append whatever it yields as it is:
+ * an unquoted `$pat` IS a pattern in bash. */
+static int shell_dbr_flush(struct shell_dbr_scratch *sc, size_t *sp,
+                           size_t *op) {
+    if (*sp == 0) return 0;
+    sc->seg[*sp] = '\0';
+    *sp = 0;
+    if (shell_expand_word_ex(sc->seg, sc->tmp, sizeof sc->tmp, true, true) < 0)
+        return -1;
+    shell_strip_nosplit_inplace(sc->tmp);
+    return shell_append_str(sc->out, op, sizeof sc->out, sc->tmp);
+}
+
+static int shell_dbr_put2(struct shell_dbr_scratch *sc, size_t *rp,
+                          size_t *sp, char c) {
+    if (shell_append_char(sc->raw, rp, sizeof sc->raw, c) < 0) return -1;
+    return shell_append_char(sc->seg, sp, sizeof sc->seg, c);
+}
+
+/* Copy a substitution -- `$( )`, `$(( ))`, `${ }` or backticks -- whole:
+ * what is inside belongs to its own grammar, blanks and quotes and all.
+ *
+ *     [[ $(echo \" > f) ]]
+ *
+ * Splitting on blanks tore that into `$(echo`, `\"`, `>` and `f)`, and the
+ * `>` then looked like the comparison operator. */
+static int shell_dbr_copy_subst(const char **pp, struct shell_dbr_scratch *sc,
+                                size_t *rp, size_t *sp) {
+    const char *p = *pp;
+    if (*p == '`') {
+        if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+        while (*p && *p != '`') {
+            if (*p == '\\' && p[1] && shell_dbr_put2(sc, rp, sp, *p++) < 0)
+                return -1;
+            if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+        }
+        if (*p == '`' && shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+        *pp = p;
+        return 0;
+    }
+    char open_ch = p[1], close_ch = (p[1] == '(') ? ')' : '}';
+    if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;       /* the $ */
+    int depth = 0;
+    bool sq = false, dq = false;
+    while (*p) {
+        char c = *p++;
+        if (shell_dbr_put2(sc, rp, sp, c) < 0) return -1;
+        if (sq) { if (c == '\'') sq = false; continue; }
+        if (c == '\\' && *p) {
+            if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+            continue;
+        }
+        if (dq) { if (c == '"') dq = false; continue; }
+        if (c == '\'') { sq = true; continue; }
+        if (c == '"') { dq = true; continue; }
+        if (c == open_ch) depth++;
+        else if (c == close_ch && --depth == 0) break;
+    }
+    *pp = p;
+    return 0;
+}
+
+static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
+                              struct shell_dbr_scratch *sc) {
     const char *p = src;
-    d->n = 0;
-    d->pos = 0;
-    d->err = false;
-    d->bufpos = 0;
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
         if (!*p) break;
         if (d->n >= SH_DBR_MAX) return -1;
 
-        char raw[SHELL_PARSE_BUF_MAX];
-        size_t rp = 0;
-        bool quoted = false;
-        bool bare_paren = false;
-        int eg_depth = 0;          /* inside an extglob group @( ... ) */
-        while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
-            /* AN UNQUOTED PARENTHESIS INSIDE A WORD IS A SYNTAX ERROR.
-             *
-             *     [[ '^(a b)$' == ^(a b)$ ]]      bash: parse error
-             *
-             * `(` and `)` are grouping OPERATORS in this grammar, so bash's
-             * lexer will not have them glued into an operand. Treating them
-             * as ordinary pattern characters made that line match and print
-             * where bash refuses to run it at all. A quoted one is data.
-             *
-             * AN EXTGLOB GROUP IS THE EXCEPTION, and it needs no shopt:
-             * `[[ --verbose == --@(help|verbose) ]]` is TRUE in bash with
-             * extglob OFF -- measured on the box. The shopt gates whether
-             * `@(` may open a word in COMMAND position, not whether this
-             * grammar accepts one. The operator character is already in
-             * `raw`, so the test is simply what precedes the paren. */
-            if (*p == '(' && rp > 0 &&
-                (raw[rp-1] == '?' || raw[rp-1] == '*' || raw[rp-1] == '+' ||
-                 raw[rp-1] == '@' || raw[rp-1] == '!')) {
-                eg_depth++;
-            } else if (*p == ')' && eg_depth > 0) {
-                eg_depth--;
-            } else if (*p == '(' || *p == ')') {
-                bare_paren = true;
-            }
-            if (*p == '\'') {
-                quoted = true;
-                if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                while (*p && *p != '\'') {
-                    if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                }
-                if (*p == '\'') { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; }
-                continue;
-            }
-            if (*p == '"') {
-                quoted = true;
-                if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                while (*p && *p != '"') {
-                    if (*p == '\\' && p[1]) {
-                        if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
-                        else p += 2;
-                        continue;
-                    }
-                    if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                }
-                if (*p == '"') { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; }
-                continue;
-            }
-            if (*p == '\\' && p[1]) {
-                quoted = true;
-                if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
-                else p += 2;
-                continue;
-            }
-            /* A SUBSTITUTION IS ONE WORD, BLANKS AND ALL.
-             *
-             *     [[ $(echo \" > f) ]]
-             *
-             * Splitting on blanks tore that into `$(echo`, `\"`, `>` and `f)`,
-             * and the `>` then looked like the comparison operator. What is
-             * inside `$( )` or backticks belongs to the substitution's own
-             * grammar, so it is taken whole and expanded as one operand. */
-            if ((*p == '$' && p[1] == '(') || *p == '`') {
-                char open_ch = (*p == '`') ? '`' : '(';
-                int depth = 0;
-                if (open_ch == '(') {
-                    if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
-                    else p += 2;
-                    depth = 1;
-                    while (*p && depth > 0) {
-                        if (*p == '(') depth++;
-                        else if (*p == ')') depth--;
-                        if (depth == 0) { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; break; }
-                        if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                    }
-                } else {
-                    if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                    while (*p && *p != '`') {
-                        if (*p == '\\' && p[1]) {
-                            if (rp + 2 < sizeof raw) { raw[rp++] = *p++; raw[rp++] = *p++; }
-                            else p += 2;
-                            continue;
-                        }
-                        if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
-                    }
-                    if (*p == '`') { if (rp + 1 < sizeof raw) raw[rp++] = *p; p++; }
-                }
-                continue;
-            }
-            if (rp + 1 < sizeof raw) raw[rp++] = *p++; else p++;
+        /* The previous token decides what THIS one may contain. */
+        bool prev_unq = d->n > 0 && d->pat[d->n - 1];
+        const char *pw = d->n > 0 ? d->w[d->n - 1] : "";
+        bool rhs_pat = prev_unq && (strcmp(pw, "==") == 0 ||
+                                    strcmp(pw, "=") == 0 ||
+                                    strcmp(pw, "!=") == 0);
+        bool rhs_re  = prev_unq && strcmp(pw, "=~") == 0;
+
+        /* A bare parenthesis is a token of its own. On the right of `=~`
+         * an opening one starts a regex group instead, so it is a word. */
+        if ((*p == '(' && !rhs_re) || *p == ')') {
+            char one[2] = { *p, '\0' };
+            char *st = shell_dbr_store(d, one);
+            if (!st) return -1;
+            d->pat[d->n] = false;
+            d->opr[d->n] = true;
+            d->w[d->n++] = st;
+            p++;
+            continue;
         }
-        raw[rp] = '\0';
+
+        size_t rp = 0, sp = 0, op = 0;
+        bool any_q = false, any_u = false;
+        int eg_depth = 0;          /* inside an extglob group X( ... ) */
+        int re_depth = 0;          /* inside a regex group ( ... ) */
+        while (*p) {
+            char c = *p;
+            if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
+            if (c == '\'') {
+                any_q = true;
+                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
+                if (shell_append_char(sc->raw, &rp, sizeof sc->raw, c) < 0) return -1;
+                p++;
+                const char *q = p;
+                while (*p && *p != '\'') p++;
+                if (shell_dbr_put_quoted(sc->out, &op, sizeof sc->out, q,
+                                         (size_t)(p - q)) < 0) return -1;
+                for (const char *r = q; r < p; r++)
+                    if (shell_append_char(sc->raw, &rp, sizeof sc->raw, *r) < 0) return -1;
+                if (*p == '\'') {
+                    if (shell_append_char(sc->raw, &rp, sizeof sc->raw, *p) < 0) return -1;
+                    p++;
+                }
+                continue;
+            }
+            if (c == '"' || (c == '$' && (p[1] == '"' || p[1] == '\''))) {
+                /* A double-quoted span (or $"..." / $'...') is ONE segment,
+                 * expanded on its own so its result can be marked literal. */
+                any_q = true;
+                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
+                if (c == '$') {
+                    if (shell_dbr_put2(sc, &rp, &sp, c) < 0) return -1;
+                    p++;
+                }
+                char qc = *p;
+                if (shell_dbr_put2(sc, &rp, &sp, qc) < 0) return -1;
+                p++;
+                while (*p && *p != qc) {
+                    if (*p == '\\' && p[1]) {
+                        if (shell_dbr_put2(sc, &rp, &sp, *p) < 0) return -1;
+                        p++;
+                    }
+                    if (shell_dbr_put2(sc, &rp, &sp, *p) < 0) return -1;
+                    p++;
+                }
+                if (*p == qc) {
+                    if (shell_dbr_put2(sc, &rp, &sp, qc) < 0) return -1;
+                    p++;
+                }
+                sc->seg[sp] = '\0';
+                sp = 0;
+                if (shell_expand_word_ex(sc->seg, sc->tmp, sizeof sc->tmp,
+                                         true, true) < 0) return -1;
+                shell_strip_nosplit_inplace(sc->tmp);
+                if (shell_dbr_put_quoted(sc->out, &op, sizeof sc->out, sc->tmp,
+                                         strlen(sc->tmp)) < 0) return -1;
+                continue;
+            }
+            if (c == '\\' && p[1]) {
+                /* `\x` quotes x, whatever x is. */
+                any_q = true;
+                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
+                if (shell_append_char(sc->raw, &rp, sizeof sc->raw, c) < 0 ||
+                    shell_append_char(sc->raw, &rp, sizeof sc->raw, p[1]) < 0 ||
+                    shell_append_char(sc->out, &op, sizeof sc->out, SHELL_GLOB_ESC) < 0 ||
+                    shell_append_char(sc->out, &op, sizeof sc->out, p[1]) < 0)
+                    return -1;
+                p += 2;
+                continue;
+            }
+            if ((c == '$' && (p[1] == '(' || p[1] == '{')) || c == '`') {
+                any_u = true;
+                if (shell_dbr_copy_subst(&p, sc, &rp, &sp) < 0) return -1;
+                continue;
+            }
+            if (c == '(') {
+                char prevc = rp > 0 ? sc->raw[rp - 1] : '\0';
+                bool eg_op = (prevc == '?' || prevc == '*' || prevc == '+' ||
+                              prevc == '@' || prevc == '!');
+                if (eg_depth > 0) eg_depth++;
+                else if (re_depth > 0) re_depth++;
+                else if (eg_op && (g_shopt_extglob || rhs_pat || rhs_re)) eg_depth = 1;
+                else if (rhs_re) re_depth = 1;
+                else break;                     /* bare: the word ends here */
+            } else if (c == ')') {
+                if (eg_depth > 0) eg_depth--;
+                else if (re_depth > 0) re_depth--;
+                else break;
+            }
+            any_u = true;
+            if (shell_dbr_put2(sc, &rp, &sp, c) < 0) return -1;
+            p++;
+        }
+        if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
+        sc->raw[rp] = '\0';
+        sc->out[op] = '\0';
 
         /* The operators are recognised only as WHOLE words, and only when
          * they were not quoted -- `[[ "&&" ]]` is a one-word test of a
          * two-character string. */
-        if (!quoted && (strcmp(raw, "(") == 0 || strcmp(raw, ")") == 0 ||
-                        strcmp(raw, "&&") == 0 || strcmp(raw, "||") == 0 ||
-                        strcmp(raw, "!") == 0)) {
-            char *st = shell_dbr_store(d, raw);
+        if (!any_q && (strcmp(sc->raw, "&&") == 0 || strcmp(sc->raw, "||") == 0 ||
+                       strcmp(sc->raw, "!") == 0)) {
+            char *st = shell_dbr_store(d, sc->raw);
             if (!st) return -1;
             d->pat[d->n] = false;
+            d->opr[d->n] = true;
             d->w[d->n++] = st;
             continue;
         }
 
-        /* A word that is EXACTLY `(` or `)` was handled above as an
-         * operator, so anything reaching here with one in it has it glued. */
-        if (bare_paren) return -1;
-
-        char expanded[SHELL_PARSE_BUF_MAX];
-        if (shell_expand_word_ex(raw, expanded, sizeof expanded, true, true) < 0)
-            return -1;
-        shell_strip_nosplit_inplace(expanded);
-        char *st = shell_dbr_store(d, expanded);
+        /* Only a PATTERN keeps its marks: the right of == / != with an
+         * unquoted part, or the right of =~. A wholly quoted right-hand
+         * side is a string and is compared as one. */
+        bool keep = rhs_re || (rhs_pat && any_u);
+        if (!keep) shell_strip_glob_escapes(sc->out);
+        char *st = shell_dbr_store(d, sc->out);
         if (!st) return -1;
-        d->pat[d->n] = !quoted;
+        d->pat[d->n] = any_u;
+        d->opr[d->n] = false;
         d->w[d->n++] = st;
     }
     return 0;
 }
 
+static int shell_dbr_split(struct shell_dbr *d, const char *src) {
+    d->n = 0;
+    d->pos = 0;
+    d->err = false;
+    d->bufpos = 0;
+    struct shell_dbr_scratch *sc =
+        (struct shell_dbr_scratch *)kmalloc(sizeof *sc);
+    if (!sc) return -1;
+    int rc = shell_dbr_split_in(d, src, sc);
+    kfree(sc);
+    return rc;
+}
+
+/* `[[ subject =~ regex ]]`: what this needs is a POSIX ERE engine. The
+ * splitter above already hands the right-hand side over as ONE word with
+ * its quoted bytes marked, which is the half a matcher can be built on. */
+static int shell_dbr_regex(const char *subj, const char *pat) {
+    (void)subj; (void)pat;
+    /* Stated, not faked: an ERE engine is what this needs. */
+    kprintf("tsh: [[: =~ needs a regular-expression engine, "
+            "which this shell does not have\n");
+    return -1;
+}
+
 static const char *shell_dbr_peek(struct shell_dbr *d) {
     return d->pos < d->n ? d->w[d->pos] : 0;
+}
+
+/* Is the token at `i` the grammar operator `op`? A quoted "(" spells the
+ * same text and is a string -- `[[ "(" =~ "(" ]]` is a match, not a group. */
+static bool shell_dbr_is_op(struct shell_dbr *d, int i, const char *op) {
+    return i < d->n && d->opr[i] && strcmp(d->w[i], op) == 0;
 }
 
 static int shell_dbr_or(struct shell_dbr *d);
@@ -21281,17 +21447,17 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     const char *t = shell_dbr_peek(d);
     if (!t) { d->err = true; return 0; }
 
-    if (strcmp(t, "(") == 0) {
+    if (shell_dbr_is_op(d, d->pos, "(")) {
         d->pos++;
         int v = shell_dbr_or(d);
-        const char *c = shell_dbr_peek(d);
-        if (!c || strcmp(c, ")") != 0) { d->err = true; return 0; }
+        if (!shell_dbr_is_op(d, d->pos, ")")) { d->err = true; return 0; }
         d->pos++;
         return v;
     }
     /* A `)` where an expression belongs is bash's "unexpected token" -- the
      * one shape the corpus tests directly. */
-    if (strcmp(t, ")") == 0 || strcmp(t, "&&") == 0 || strcmp(t, "||") == 0) {
+    if (shell_dbr_is_op(d, d->pos, ")") || shell_dbr_is_op(d, d->pos, "&&") ||
+        shell_dbr_is_op(d, d->pos, "||")) {
         d->err = true;
         return 0;
     }
@@ -21311,12 +21477,12 @@ static int shell_dbr_primary(struct shell_dbr *d) {
          * asks whether the one-character string `>` is empty. d->pat says
          * the word arrived unquoted, which is the same flag that decides
          * whether the right-hand side of `==` is a pattern. */
-        bool nxt_is_op = d->pat[d->pos + 1] &&
-                         (strcmp(nxt, ")") == 0 || strcmp(nxt, "&&") == 0 ||
-                          strcmp(nxt, "||") == 0 || strcmp(nxt, "<") == 0 ||
+        bool nxt_is_op = d->opr[d->pos + 1] ||
+                         (d->pat[d->pos + 1] &&
+                         (strcmp(nxt, "<") == 0 ||
                           strcmp(nxt, ">") == 0 || strcmp(nxt, "=~") == 0 ||
                           strcmp(nxt, "==") == 0 || strcmp(nxt, "!=") == 0 ||
-                          strcmp(nxt, "=") == 0 || test_is_binary_op(nxt));
+                          strcmp(nxt, "=") == 0 || test_is_binary_op(nxt)));
         if (!nxt_is_op) {
             d->pos += 2;
             return test_unary(t, nxt) == 0;
@@ -21327,17 +21493,18 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     const char *a = t;
     d->pos++;
     const char *op = shell_dbr_peek(d);
-    if (!op || strcmp(op, ")") == 0 || strcmp(op, "&&") == 0 ||
-        strcmp(op, "||") == 0) {
+    if (!op || shell_dbr_is_op(d, d->pos, ")") || shell_dbr_is_op(d, d->pos, "&&") ||
+        shell_dbr_is_op(d, d->pos, "||")) {
         return a[0] != '\0';               /* a bare word: true if non-empty */
     }
 
     if (strcmp(op, "=~") == 0) {
-        /* Stated, not faked: an ERE engine is what this needs. */
-        kprintf("tsh: [[: =~ needs a regular-expression engine, "
-                "which this shell does not have\n");
-        d->err = true;
-        return 0;
+        if (d->pos + 1 >= d->n) { d->err = true; return 0; }
+        const char *re = d->w[d->pos + 1];
+        d->pos += 2;
+        int r = shell_dbr_regex(a, re);
+        if (r < 0) { d->err = true; return 0; }
+        return r;
     }
 
     bool patrhs = (strcmp(op, "==") == 0 || strcmp(op, "=") == 0 ||
@@ -21371,8 +21538,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
 }
 
 static int shell_dbr_not(struct shell_dbr *d) {
-    const char *t = shell_dbr_peek(d);
-    if (t && strcmp(t, "!") == 0) {
+    if (shell_dbr_is_op(d, d->pos, "!")) {
         d->pos++;
         return !shell_dbr_not(d);
     }
@@ -21382,8 +21548,7 @@ static int shell_dbr_not(struct shell_dbr *d) {
 static int shell_dbr_and(struct shell_dbr *d) {
     int v = shell_dbr_not(d);
     for (;;) {
-        const char *t = shell_dbr_peek(d);
-        if (!t || strcmp(t, "&&") != 0) break;
+        if (!shell_dbr_is_op(d, d->pos, "&&")) break;
         d->pos++;
         /* Both sides are still PARSED even when the left is false, so that a
          * syntax error on the right is reported either way and d->pos ends
@@ -21397,8 +21562,7 @@ static int shell_dbr_and(struct shell_dbr *d) {
 static int shell_dbr_or(struct shell_dbr *d) {
     int v = shell_dbr_and(d);
     for (;;) {
-        const char *t = shell_dbr_peek(d);
-        if (!t || strcmp(t, "||") != 0) break;
+        if (!shell_dbr_is_op(d, d->pos, "||")) break;
         d->pos++;
         int r = shell_dbr_and(d);
         v = v || r;
