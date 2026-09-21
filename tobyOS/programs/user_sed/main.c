@@ -152,7 +152,9 @@ static char *take_delim(const char **pp, char delim, int keep_escapes) {
  * compiled with REG_EXTENDED only under -E/-r. */
 static int compile_re(regex_t *re, const char *pat, int icase) {
     int flags = 0;
-    if (Eflag) flags |= REG_EXTENDED;
+    /* `sed -E 's/a{/X/'` is an ERROR in GNU sed ("Unmatched \{"), unlike
+     * grep -E, which takes the brace literally. */
+    if (Eflag) flags |= REG_EXTENDED | REG_STRICTBRACE;
     if (icase) flags |= REG_ICASE;
     return regcomp(re, pat, flags);
 }

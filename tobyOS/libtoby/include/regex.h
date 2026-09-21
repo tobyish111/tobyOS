@@ -43,6 +43,21 @@ typedef struct {
  * property of the CALLER. awk passes this flag, sed and grep do not. */
 #define REG_ESCBRACKET  0x100
 
+/* LIBTOBY EXTENSION, and it exists for the same reason: a `{` that does
+ * not open a valid interval. GNU is SPLIT on it, measured:
+ *
+ *   printf 'a{' | grep -cE 'a{'   -> 1        (a literal brace)
+ *   printf 'a{' | awk  '/a{/'     -> matches  (a literal brace)
+ *   printf 'a{' | sed -E 's/a{/X/'-> error: Unmatched \{
+ *   bash: [[ { =~ { ]]            -> status 2 (regcomp refused it)
+ *
+ * glibc's regcomp REJECTS it; grep and gawk opt into the lenient
+ * reading through RE_INVALID_INTERVAL_ORD. libtoby was lenient for
+ * everyone, so `[[ { =~ { ]]` matched where bash reports a bad pattern.
+ * The callers that want glibc's answer -- tsh's `=~` and sed -E -- pass
+ * this flag; grep, awk and the editors keep the literal brace. */
+#define REG_STRICTBRACE 0x200
+
 /* eflags for regexec */
 #define REG_NOTBOL    1
 #define REG_NOTEOL    2

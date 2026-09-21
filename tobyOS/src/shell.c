@@ -22111,7 +22111,11 @@ static int shell_dbr_regex(const char *subj, const char *pat) {
     *w = '\0';
 
     regex_t re;
-    int cflags = REG_EXTENDED;
+    /* REG_STRICTBRACE: bash's `=~` goes through glibc's regcomp, which
+     * refuses a `{` that opens no interval -- `[[ { =~ { ]]` is status 2,
+     * not a match on a literal brace. libtoby is lenient by default
+     * because GNU grep and awk are. */
+    int cflags = REG_EXTENDED | REG_STRICTBRACE;
     if (g_shopt_misc[3]) cflags |= REG_ICASE;          /* nocasematch */
     if (regcomp(&re, ere, cflags) != 0) {
         kfree(ere);

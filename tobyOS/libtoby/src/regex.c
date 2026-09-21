@@ -641,6 +641,16 @@ static int parse_atom(compiled_t *c, const char **pp, int ere, frag_t *out) {
             *pp = p;
             return 1;
         }
+    case '{':
+        /* An invalid interval is an error only for a caller that asked
+         * for it; see REG_STRICTBRACE in regex.h for the measurements
+         * that put the choice on the caller. Otherwise fall through and
+         * take the brace as the literal character it looks like. */
+        if (ere && (c->cflags & REG_STRICTBRACE) && !is_interval(p, ere)) {
+            c->err = REG_EBRACE;
+            return 0;
+        }
+        goto literal;
     default:
     literal:
         if (*p && !(ere && (*p == '|' || *p == ')')) &&
