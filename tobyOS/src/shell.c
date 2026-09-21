@@ -7250,6 +7250,28 @@ static int shell_line_find_heredocs(const char *line,
             if (!*p) break;
             continue;
         }
+        /* `(( ... ))` is ARITHMETIC: an arithmetic command, an `if (( ))`
+         * test, or the head of a C-style `for`. It holds the left-shift
+         * operator, so `for ((i = 1 << 32; i; ++i))` was read as a here-
+         * document introduced by `<<` and the reader hunted to end of file
+         * for a delimiter named `32`. The `$(( ))` form above is a
+         * different token and was already skipped. A nested subshell
+         * `( (cmd) )` must NOT be skipped -- its body can legitimately
+         * hold a here-document -- so the region counts as arithmetic only
+         * when its matching close is itself `))`. */
+        if (p[0] == '(' && p[1] == '(') {
+            const char *q = p;
+            int depth = 0;
+            while (*q) {
+                if (*q == '(') depth++;
+                else if (*q == ')') { depth--; if (depth == 0) break; }
+                q++;
+            }
+            if (*q == ')' && q > p + 1 && q[-1] == ')') {
+                p = q;
+                continue;
+            }
+        }
         /* `<<<` is a here-STRING, not a here-document: it takes its text
          * from the same line and has no body to collect. Reading it as `<<`
          * would send the reader hunting for a delimiter that never comes. */
