@@ -897,6 +897,17 @@ static size_t env_key_len(const char *kv) {
     return (size_t)(eq - kv);
 }
 
+/* The NAME in an operand that may carry the append operator: `e+=foo`
+ * names `e`. env_key_len() stops at the `=` and so counts the `+` as
+ * part of the name, which is right for finding the `=` and wrong for
+ * everything else -- the declaration builtins validated the name with
+ * it and rejected `export e+=foo` as a bad name. */
+static size_t env_assign_name_len(const char *kv) {
+    size_t k = env_key_len(kv);
+    if (k > 1 && kv[k - 1] == '+') return k - 1;
+    return k;
+}
+
 /* Find the index of the entry whose key matches `key`/`klen`, or -1. */
 static int env_find(const char *key, size_t klen) {
     if (!key || klen == 0) return -1;
@@ -1455,6 +1466,18 @@ static int sh_try_array_assignment(const char *kv) {
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
         if (!shell_name_is_valid(nm, keylen)) return 0;
+        /* APPENDING A LITERAL TO A SCALAR KEEPS THE SCALAR, as element 0:
+         *
+         *     b=abc; b+=(d e f); echo "${b[@]}"    ->  abc d e f
+         *
+         * The name holds a plain variable, not an array, so the append had
+         * nothing to append TO and produced `d e f`. bash promotes the
+         * scalar first -- the same rule that makes `$b` on an array mean
+         * element 0, read in the other direction. */
+        if (append && !sh_array_find(nm)) {
+            const char *scalar = env_get(nm);
+            if (scalar) (void)sh_array_set(nm, 0, scalar);
+        }
         /* -1: it WAS an array literal and it FAILED (failglob, no memory).
          * Returning 0 here let env_set_kv store the text `(*.ZZ)` as a
          * scalar and report success. */
@@ -1472,6 +1495,56 @@ static int env_set_kv(const char *kv_in) {
     }
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
+
+    /* `s+=str` APPENDS TO THE VALUE. The array forms already went through
+     * sh_try_array_assignment above -- `a+=(x y)` and `a[i]+=v` -- but the
+     * plain scalar landed here, where env_key_len() counts the `+` as part
+     * of the NAME. So `s+=d` created a variable called `s+` and left `s`
+     * alone: the most ordinary form of the operator was the one missing.
+     *
+     *     s=abc; s+=d; echo $s          ->  abcd
+     *     unset t; t+=foo; echo $t      ->  foo     (and see set -u below)
+     *     a=(x y); a+=z                 ->  element 0 becomes `xz`
+     *
+     * APPENDING DOES NOT RESPECT `set -u`. bash and mksh agree, the Oils
+     * corpus records it in three cases, and its own comment calls it a
+     * mistake they copy because `+=` is legacy. Reading the old value with
+     * env_get() rather than the expansion path is what keeps that true.
+     *
+     * A NAME THAT IS AN ARRAY appends to element 0, which is bash's answer
+     * and is the same rule `$a` already follows for a bare array name. */
+    if (klen > 1 && kv_in[klen - 1] == '+') {
+        char nm[128];
+        size_t nlen = klen - 1;
+        if (nlen + 1 > sizeof nm) return -1;
+        memcpy(nm, kv_in, nlen);
+        nm[nlen] = '\0';
+        if (!shell_name_is_valid(nm, nlen)) return -1;
+
+        const char *add = kv_in + klen + 1;
+        struct sh_array *arr = sh_array_find(nm);
+        const char *old_val = arr ? sh_array_get(nm, 0) : env_get(nm);
+        size_t ol = old_val ? strlen(old_val) : 0, al = strlen(add);
+
+        if (arr) {
+            char *joined = (char *)kmalloc(ol + al + 1);
+            if (!joined) return -1;
+            if (ol) memcpy(joined, old_val, ol);
+            memcpy(joined + ol, add, al + 1);
+            int rc = sh_array_set(nm, 0, joined);
+            kfree(joined);
+            return rc == 0 ? 0 : -1;
+        }
+        char *rebuilt = (char *)kmalloc(nlen + 1 + ol + al + 1);
+        if (!rebuilt) return -1;
+        memcpy(rebuilt, nm, nlen);
+        rebuilt[nlen] = '=';
+        if (ol) memcpy(rebuilt + nlen + 1, old_val, ol);
+        memcpy(rebuilt + nlen + 1 + ol, add, al + 1);
+        int rc = env_set_kv(rebuilt);
+        kfree(rebuilt);
+        return rc;
+    }
 
     /* AN ASSIGNMENT TO A NAMEREF WRITES THROUGH IT.
      *
@@ -3040,7 +3113,8 @@ static void cmd_local(int argc, char **argv) {
         if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
-        if (!has_value) klen = strlen(argv[i]);
+        if (has_value) klen = env_assign_name_len(argv[i]);  /* `s+=v` */
+        else klen = strlen(argv[i]);
         if (!shell_name_is_valid(argv[i], klen)) {
             kprintf("local: bad name '%s'\n", argv[i]);
             shell_set_status(1);
@@ -3251,7 +3325,8 @@ static void cmd_export(int argc, char **argv) {
     if (strcmp(argv[1], "-p") == 0) start = 2;
     for (int i = start; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
-        if (!shell_name_is_valid(argv[i], klen)) {
+        size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
+        if (!shell_name_is_valid(argv[i], nlen)) {
             kprintf("export: bad name '%s'\n", argv[i]);
             shell_set_status(1);
             continue;
@@ -3275,7 +3350,7 @@ static void cmd_export(int argc, char **argv) {
                 continue;
             }
         }
-        int idx = env_find(argv[i], klen);
+        int idx = env_find(argv[i], nlen);
         if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
     }
 }
@@ -3458,7 +3533,8 @@ static void cmd_declare(int argc, char **argv) {
     for (; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
-        if (!has_value) klen = strlen(argv[i]);
+        if (has_value) klen = env_assign_name_len(argv[i]);  /* `d+=v` */
+        else klen = strlen(argv[i]);
         if (!shell_name_is_valid(argv[i], klen)) {
             kprintf("declare: bad name '%s'\n", argv[i]);
             shell_set_status(1);
@@ -3645,7 +3721,8 @@ static void cmd_readonly(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
-        if (!shell_name_is_valid(argv[i], klen)) {
+        size_t nlen = env_assign_name_len(argv[i]);   /* `r+=bar` -> `r` */
+        if (!shell_name_is_valid(argv[i], nlen)) {
             kprintf("readonly: bad name '%s'\n", argv[i]);
             shell_set_status(1);
             continue;
@@ -3664,7 +3741,9 @@ static void cmd_readonly(int argc, char **argv) {
             }
         }
 
-        if (shell_readonly_mark(argv[i], klen) < 0) shell_set_status(1);
+        /* Marked under the NAME, not `r+`: the append form must make the
+         * same variable read-only that it just wrote. */
+        if (shell_readonly_mark(argv[i], nlen) < 0) shell_set_status(1);
     }
 }
 
@@ -20141,7 +20220,8 @@ static bool shell_assignment_overrides(const char *kv, char **assignv,
                                        int assignc) {
     size_t klen = env_key_len(kv);
     for (int i = 0; i < assignc; i++) {
-        size_t alen = env_key_len(assignv[i]);
+        /* The NAME, so `A+=a` is recognised as overriding `A`. */
+        size_t alen = env_assign_name_len(assignv[i]);
         if (alen == klen && memcmp(kv, assignv[i], klen) == 0) return true;
     }
     return false;
@@ -20169,8 +20249,42 @@ static int shell_build_env_overlay(char **assignv, int assignc,
             out_env[n++] = g_env[i];
         }
     }
+    /* `A+=a cmd` IS A PREFIX ASSIGNMENT THAT APPENDS, and it must append
+     * to the value the shell has now while leaving that value alone:
+     *
+     *     A=a; A+=a printenv.py A   ->  aa, and the shell still has A=a
+     *
+     * So it is resolved HERE and not by env_set_kv, which would write it
+     * back. The rebuilt strings live in a static pool: the overlay is
+     * built and handed to the spawn in one breath, and every other entry
+     * in it is a borrowed pointer too. */
+    static char append_pool[8][256];
+    int napp = 0;
     for (int i = 0; i < assignc; i++) {
         if (n >= ENV_MAX + ARG_MAX) return -1;
+        const char *kv = assignv[i];
+        size_t klen = env_key_len(kv);
+        if (klen > 1 && kv[klen - 1] == '+' &&
+            napp < (int)(sizeof append_pool / sizeof append_pool[0])) {
+            char nm[128];
+            size_t nlen = klen - 1;
+            const char *add = kv + klen + 1;
+            if (nlen + 1 <= sizeof nm) {
+                memcpy(nm, kv, nlen);
+                nm[nlen] = '\0';
+                const char *old = env_get(nm);
+                size_t ol = old ? strlen(old) : 0, al = strlen(add);
+                if (nlen + 1 + ol + al + 1 <= sizeof append_pool[0]) {
+                    char *d = append_pool[napp++];
+                    memcpy(d, nm, nlen);
+                    d[nlen] = '=';
+                    if (ol) memcpy(d + nlen + 1, old, ol);
+                    memcpy(d + nlen + 1 + ol, add, al + 1);
+                    out_env[n++] = d;
+                    continue;
+                }
+            }
+        }
         out_env[n++] = assignv[i];
     }
     out_env[n] = 0;
