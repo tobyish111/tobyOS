@@ -7689,6 +7689,9 @@ struct shell_scan {
     bool case_pat;      /* a case PATTERN may start here, so `(` is legal */
     bool after_in;      /* the last token was the `in` of a for/case */
     bool dbracket;      /* inside `[[ ... ]]`, where none of this applies */
+    bool for_head;      /* the last token was `for`: `((` opens an arithmetic head */
+    bool await_body;    /* a for head just closed: a `{` opens its BODY */
+    bool brace_body[16];/* per brace level: this `}` also ends a compound */
     bool no_sep;        /* the text so far cannot end a command: joining the
                          * next line to it must NOT insert a `;` */
     bool decl_util;     /* the command is export/readonly/local/declare */
@@ -7725,6 +7728,10 @@ static void shell_scan_init(struct shell_scan *st) {
     st->after_in = false;
     st->no_sep = true;
     st->dbracket = false;
+    st->for_head = false;
+    st->await_body = false;
+    for (unsigned i = 0; i < sizeof st->brace_body / sizeof st->brace_body[0]; i++)
+        st->brace_body[i] = false;
     st->decl_util = false;
     st->case_depth = 0;
     st->cont_op = false;
@@ -7793,6 +7800,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     bool was_after_in = st->after_in;
     st->after_in = false;
     (void)was_after_in;
+    /* Set by the arithmetic for head and cleared by every token except a
+     * separator, so only a `{` that directly follows the head opens a body. */
+    bool was_await_body = st->await_body;
+    st->await_body = false;
 
     /* Still inside an unclosed `$( )` / `${ }` / backtick from a previous
      * line: every character belongs to that word, so none of the operator
@@ -7842,6 +7853,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         if (!dbl && !st->cmd_seen) st->bad_semi = true;
         st->cmd_seen = false;
         st->case_pat = dbl;              /* a pattern follows `;;` */
+        st->await_body = was_await_body; /* `for (( )); { ... }` is legal */
         st->no_sep = true;
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
@@ -7915,7 +7927,11 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * belongs to the arithmetic grammar. If the closing `))` is not on
          * this line the construct is left alone, so an ordinary nested
          * subshell still reaches the rules below. */
-        if (st->cmd_pos && p[1] == '(') {
+        /* ...and `for (( init; cond; step ))` is the same token after `for`,
+         * where no command may start: the arithmetic for loop (1638-1646). */
+        bool arith_for = st->for_head;
+        st->for_head = false;
+        if ((st->cmd_pos || arith_for) && p[1] == '(') {
             int depth = 0;
             bool sq = false, dq = false;
             const char *q = p + 2;
@@ -7939,7 +7955,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             if (close) {
                 *pp = close + 2;
                 st->cmd_seen = true;
-                st->cmd_pos = false;
+                /* After an arithmetic for head a `do`, a `;` or a `{` follows
+                 * -- command position, so `{` opens the group form (1640). */
+                st->cmd_pos = arith_for;
+                st->await_body = arith_for;
                 st->prev_word_cmd = false;
                 st->prev_word_name = false;
                 st->assign_prefix = false;
@@ -8328,6 +8347,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     if (p == w) p++;                     /* never stall on an odd byte */
     size_t n = (size_t)(p - w);
     st->cmd_seen = true;
+    st->for_head = false;             /* only `((` right after `for` counts */
     st->nest = nest < 0 ? 0 : nest;
     if (st->nest > 0) {
         st->in_sq = sq; st->in_dq = dq;
@@ -8414,12 +8434,29 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * and only the one after `;` closes the group. */
     if (resv && n == 1 && w[0] == '{') {
         st->brace++;
+        /* `for (( )) { list; }` IS BASH'S BRACE BODY FOR A LOOP, and the
+         * `}` ends the `for`: no `done` is coming. `for` opened a compound
+         * that only `done` closed, so the reader kept pulling lines to the
+         * end of the file and everything after the loop became part of one
+         * unterminated command (Oils 1640). */
+        if (was_await_body &&
+            (unsigned)st->brace < sizeof st->brace_body / sizeof st->brace_body[0])
+            st->brace_body[st->brace] = true;
         st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = true;
         return;
     }
     if (resv && n == 1 && w[0] == '}') {
-        if (st->brace > 0) st->brace--;
+        if (st->brace > 0) {
+            bool body = false;
+            if ((unsigned)st->brace <
+                sizeof st->brace_body / sizeof st->brace_body[0]) {
+                body = st->brace_body[st->brace];
+                st->brace_body[st->brace] = false;
+            }
+            st->brace--;
+            if (body && st->compound > 0) st->compound--;
+        }
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;
         st->cmd_seen = true;            /* a closed group is a command */
@@ -8441,6 +8478,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         }
         st->cmd_pos = false; st->prev_word_cmd = false;   /* a name or a word */
         st->no_sep = true;              /* `for` / `case` want a NAME next */
+        st->for_head = shell_word_eq(w, n, "for");
         return;
     }
     if (resv && (shell_word_eq(w, n, "fi")   || shell_word_eq(w, n, "done") ||
@@ -22832,6 +22870,238 @@ done:
     return true;
 }
 
+/* ---- `for (( init; cond; step ))`, the arithmetic for loop -------------
+ *
+ * bash's C-style loop (for-expr, 9 cases, and the last trap-bash case).
+ * Each of the three expressions is optional; an empty condition is true.
+ * They are shell arithmetic and get the same treatment `$(( ))` gets: a
+ * double-quoted operand is the value, a single-quoted one is bash's error
+ * (1644). The body is
+ * `do ... done` -- with or without a `;` before `do` -- or `{ ... }`
+ * (1640). bash fires the DEBUG trap once per expression evaluation, with
+ * the head's line (1191). break/continue/return and the tail redirection
+ * frame behave as in the list form. */
+static bool shell_arith_for_eval(char *expr, long *out) {
+    while (*expr == ' ' || *expr == '\t') expr++;
+    if (!*expr) { *out = 1; return true; }
+    if (!shell_arith_dequote(expr)) return false;
+    if (!*expr) { *out = 1; return true; }
+    char xexpr[SHELL_PARSE_BUF_MAX];
+    if (shell_expand_literal_quotes(expr, xexpr, sizeof xexpr) != 0) return false;
+    struct shell_arith a;
+    a.p = xexpr;
+    a.ok = true;
+    long v = shell_arith_expr(&a);
+    if (!a.ok) return false;
+    shell_arith_skip(&a);
+    if (*a.p) return false;
+    *out = v;
+    return true;
+}
+
+static bool shell_try_arith_for_command(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "for")) return false;
+    s = shell_skip_blanks(s + 3);
+    if (!(s[0] == '(' && s[1] == '(')) return false;
+    const char *open = s + 2;
+    const char *end = 0;
+    {
+        int depth = 0;
+        bool sq = false, dq = false;
+        for (const char *q = open; *q; q++) {
+            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (dq) {
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '"') dq = false;
+                continue;
+            }
+            if (*q == '\'') { sq = true; continue; }
+            if (*q == '"') { dq = true; continue; }
+            if (*q == '(') { depth++; continue; }
+            if (*q == ')') {
+                if (depth > 0) { depth--; continue; }
+                if (q[1] == ')') { end = q; break; }
+                return false;
+            }
+        }
+    }
+    if (!end) {
+        kprintf("for: expected '))'\n");
+        shell_parse_error();
+        return true;
+    }
+    /* The three expressions: top-level `;` inside the parens.
+     *
+     * COPIED VERBATIM, not with shell_copy_segment, which trims leading and
+     * trailing `;` along with blanks. Here the `;` ARE the structure and any
+     * of the three may be empty -- `for (( ; ; ))` is the infinite loop --
+     * so trimming them turned three expressions into two or one and the loop
+     * died as "expected three expressions" (Oils 1641, 1642, 1643). */
+    char head[SHELL_PARSE_BUF_MAX];
+    size_t head_len = (size_t)(end - open);
+    if (head_len + 1 > sizeof head) return false;
+    memcpy(head, open, head_len);
+    head[head_len] = '\0';
+    char *exprs[3] = { head, 0, 0 };
+    int nexpr = 1;
+    {
+        int depth = 0;
+        bool sq = false, dq = false;
+        for (char *q = head; *q && nexpr < 3; q++) {
+            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (dq) { if (*q == '"') dq = false; continue; }
+            if (*q == '\'') { sq = true; continue; }
+            if (*q == '"') { dq = true; continue; }
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            else if (*q == ';' && depth == 0) { *q = '\0'; exprs[nexpr++] = q + 1; }
+        }
+    }
+    if (nexpr != 3) {
+        kprintf("for: expected three expressions in (( )), got %d\n", nexpr);
+        shell_parse_error();
+        return true;
+    }
+
+    /* the body: `[;] do ... done` or `{ ... }` */
+    const char *after = end + 2;
+    while (*after == ' ' || *after == '\t' || *after == ';' || *after == '\n') after++;
+    const char *body_start = 0, *body_end = 0, *tail = 0;
+    const char *label = "for";
+    if (shell_starts_with_word(after, "do")) {
+        body_start = after + 2;
+        const char *done_end = 0;
+        const char *done_at = shell_find_matching_done(body_start, &done_end);
+        if (!done_at) {
+            kprintf("for: expected '; done'\n");
+            shell_parse_error();
+            return true;
+        }
+        body_end = done_at;
+        tail = done_end;
+    } else if (shell_group_open_at(after)) {
+        body_start = after + 1;
+        int depth = 1;
+        bool sq = false, dq = false;
+        for (const char *q = body_start; *q; q++) {
+            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (dq) {
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '"') dq = false;
+                continue;
+            }
+            if (*q == '\'') { sq = true; continue; }
+            if (*q == '"') { dq = true; continue; }
+            if (shell_group_open_at(q)) { depth++; continue; }
+            if (shell_group_close_at(q)) {
+                if (--depth == 0) { body_end = q; tail = q + 1; break; }
+            }
+        }
+        if (!body_end) {
+            kprintf("for: expected '}'\n");
+            shell_parse_error();
+            return true;
+        }
+    } else {
+        kprintf("for: expected 'do'\n");
+        shell_parse_error();
+        return true;
+    }
+
+    struct shell_simple tail_redirs;
+    char tail_paths[512];
+    if (shell_parse_compound_redirs(tail, &tail_redirs, tail_paths,
+                                    sizeof(tail_paths), label) < 0) {
+        shell_set_status(2);
+        return true;
+    }
+    char *body = shell_dup_segment(body_start, body_end);
+    unsigned long body_line = shell_lineno_body(body_start);
+    if (!body) {
+        kprintf("for: command too long\n");
+        shell_set_status(2);
+        return true;
+    }
+    int last = 0;
+    g_shell_loop_depth++;
+    struct shell_io_frame io_frame;
+    bool io_active = false;
+    if (tail_redirs.redir_count > 0) {
+        if (shell_enter_io_frame(&tail_redirs, label, &io_frame) < 0) {
+            g_shell_loop_depth--;
+            kfree(body);
+            shell_set_status(1);
+            return true;
+        }
+        io_active = true;
+    }
+    bool set_last = true;
+    long v = 0;
+    unsigned long head_line = g_shell_lineno;
+    shell_run_debug_trap();                     /* init (1191) */
+    if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
+    if (!shell_arith_for_eval(exprs[0], &v)) {
+        kprintf("for: bad arithmetic expression: %s\n", exprs[0]);
+        last = 1;
+        goto done;
+    }
+    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+        g_shell_lineno = head_line;
+        shell_run_debug_trap();                 /* the condition */
+        if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
+        if (!shell_arith_for_eval(exprs[1], &v)) {
+            kprintf("for: bad arithmetic expression: %s\n", exprs[1]);
+            last = 1;
+            goto done;
+        }
+        if (v == 0) goto done;
+        if (body_line) g_shell_lineno = body_line;
+        shell_lmap_push_copy(body, body_start);
+        execute_line_text(body);
+        shell_lmap_pop_copy();
+        last = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_RETURN ||
+            g_shell_flow == SHELL_FLOW_INTERRUPT ||
+            g_shell_flow == SHELL_FLOW_DISCARD ||
+            g_shell_flow == SHELL_FLOW_EXIT) {
+            set_last = false;
+            goto done;
+        }
+        if (g_shell_flow == SHELL_FLOW_BREAK) {
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            }
+            goto done;
+        }
+        if (g_shell_flow == SHELL_FLOW_CONTINUE) {
+            if (--g_shell_break_depth <= 0) {
+                g_shell_flow = SHELL_FLOW_NONE;
+                g_shell_flow_status = 0;
+            } else {
+                set_last = false;
+                goto done;
+            }
+        }
+        g_shell_lineno = head_line;
+        shell_run_debug_trap();                 /* the step */
+        if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
+        if (!shell_arith_for_eval(exprs[2], &v)) {
+            kprintf("for: bad arithmetic expression: %s\n", exprs[2]);
+            last = 1;
+            goto done;
+        }
+    }
+done:
+    g_shell_lineno = head_line;
+    g_shell_loop_depth--;
+    if (io_active) shell_restore_io_frame(&io_frame);
+    kfree(body);
+    if (set_last) shell_set_status(last);
+    return true;
+}
+
 static bool shell_try_while_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "while")) return false;
@@ -25089,6 +25359,7 @@ static void execute_line_text_inner(const char *src) {
         shell_try_dbracket_command(src) ||
         shell_try_arith_command(src) ||
         shell_try_if_command(src) ||
+        shell_try_arith_for_command(src) ||
         shell_try_for_command(src) ||
         shell_try_while_command(src) ||
         shell_try_until_command(src) ||
