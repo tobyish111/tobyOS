@@ -16492,6 +16492,66 @@ static int shell_append_long(char *buf, size_t *pos, size_t cap, long v) {
     return shell_append_uint(buf, pos, cap, (unsigned long)v);
 }
 
+/* THE TWO KINDS OF QUOTE ARE NOT THE SAME THING INSIDE ARITHMETIC. bash
+ * expands the text of `(( ))` and `$(( ))`, REMOVES its double quotes, and
+ * hands what is left to the arithmetic lexer -- which has no notion of ''':
+ *
+ *     echo $(( "3" + 1 ))        bash: 4
+ *     echo $(( '3' + 1 ))        bash: syntax error, operand expected
+ *     for ((i = $"3"; ...))      bash: runs
+ *     for ((i = $'3'; ...))      bash: syntax error, operand expected
+ *
+ * tsh kept BOTH kinds literally -- the word expander used here is the one
+ * that leaves quote characters alone -- so the evaluator refused all four
+ * and the two forms bash runs printed nothing (Oils 1644).
+ *
+ * Rewrites the expression in place: a top-level `"` goes away, and so does
+ * the `$` of `$"..."`, which is only a translation marker. A top-level `'`
+ * returns false, which is bash's error. A substitution body is copied
+ * through untouched: the quotes in `$(( $(echo '3') ))` belong to the inner
+ * parse -- but a `${ }` body is NOT one of those: bash lets the quotes
+ * inside it reach the arithmetic lexer, so `$(( ${x:-'3'} ))` is an error
+ * and `$(( ${x:-"3"} ))` is 3, exactly as if the braces were not there.
+ * Idempotent, and it has to be -- a for head's condition and step are
+ * re-evaluated on every iteration. */
+static bool shell_arith_dequote(char *expr) {
+    char *w = expr;
+    for (const char *p = expr; *p; p++) {
+        if (*p == '\\' && p[1]) { *w++ = *p++; *w++ = *p; continue; }
+        if (*p == '`') {                      /* legacy substitution */
+            *w++ = *p++;
+            while (*p && *p != '`') {
+                if (*p == '\\' && p[1]) *w++ = *p++;
+                *w++ = *p++;
+            }
+            if (!*p) break;
+            *w++ = *p;
+            continue;
+        }
+        if (*p == '$' && p[1] == '(') {       /* command substitution */
+            int depth = 0;
+            *w++ = *p++;                      /* the `$` */
+            while (*p) {
+                if (*p == '(') depth++;
+                else if (*p == ')') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+                *w++ = *p++;
+            }
+            if (!*p) break;
+            *w++ = *p;                        /* the closing paren */
+            continue;
+        }
+        if (*p == '$' && p[1] == '"') continue;   /* $"..." is its own text */
+        if (*p == '"') continue;
+        if (*p == '\'') return false;
+        *w++ = *p;
+    }
+    *w = '\0';
+    return true;
+}
+
 static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                               size_t cap) {
     const char *p = *pp;
@@ -16509,6 +16569,7 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                 p += 2;
                 expr[epos] = '\0';
                 *pp = p;
+                bool quoted_operand = !shell_arith_dequote(expr);
                 /* Expand the expression text before evaluating it. The
                  * evaluator resolves bare names itself, but knows nothing
                  * about `$( )` or `${ }`, so `$(( $(echo 4) + 1 ))` reached
@@ -16527,7 +16588,7 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                 struct shell_arith a = { .p = expr, .ok = true };
                 long v = shell_arith_expr(&a);
                 shell_arith_skip(&a);
-                if (!a.ok || *a.p != '\0') {
+                if (!a.ok || *a.p != '\0' || quoted_operand) {
                     kprintf("shell: bad arithmetic expansion\n");
                     /* AN EXPANSION ERROR, status 1 and the rest of the line
                      * discarded -- not the tokenizer's syntax-error 2. bash
