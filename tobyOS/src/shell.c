@@ -593,6 +593,7 @@ static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
 static int shell_run_exit_trap(int status);
 static bool shell_starts_with_word(const char *s, const char *word);
+static bool shell_operator_char(char c);
 static inline bool is_space(char c);
 static bool shell_group_open_at(const char *p);
 static bool shell_group_close_at(const char *p);
@@ -13446,8 +13447,81 @@ static void shell_alias_restore(const struct shell_alias_save *sv) {
     }
 }
 
+/* `$(<file)` READS THE FILE. It is not a command substitution that happens to
+ * contain a redirection -- bash special-cases the shape where the body is
+ * ONE redirection and nothing else, and reads the file directly:
+ *
+ *     echo $(<f)        the contents        echo $(< f)      the same
+ *     echo $(<f; echo h)  `h` -- a LIST, so the ordinary path runs it
+ *
+ * tsh ran the general path for all of them, where `<f` is a null command
+ * with a redirection: it produces no output, so `$(<f)` was the empty
+ * string. Returns the number of bytes, or -1; trailing newlines come off
+ * the same way they do for a real substitution. */
+static int shell_capture_read_file(const char *word, char *out, size_t out_cap) {
+    char path[SHELL_PARSE_BUF_MAX];
+    if (shell_expand_word_ex(word, path, sizeof path, true, true) < 0) return -1;
+    shell_strip_nosplit_inplace(path);
+    struct file *f = shell_open_vfs_file(path, false, false, "shell");
+    if (!f) return -1;
+    size_t pos = 0;
+    for (;;) {
+        if (pos + 1 >= out_cap) break;
+        long got = file_read(f, out + pos, out_cap - 1 - pos);
+        if (got <= 0) break;
+        pos += (size_t)got;
+    }
+    file_close(f);
+    while (pos > 0 && out[pos - 1] == '\n') pos--;
+    out[pos] = '\0';
+    return (int)pos;
+}
+
+/* Is `cmd` exactly `< word`? Returns the word, or 0. */
+static const char *shell_capture_is_file_read(const char *cmd) {
+    const char *p = shell_skip_blanks(cmd);
+    if (*p != '<' || p[1] == '<' || p[1] == '&' || p[1] == '>') return 0;
+    p = shell_skip_blanks(p + 1);
+    if (!*p) return 0;
+    /* One word and nothing after it. A `;`, a newline or an operator means
+     * this is a list, and bash runs it. */
+    const char *w = p;
+    bool sq = false, dq = false;
+    for (; *p; p++) {
+        if (sq) { if (*p == '\'') sq = false; continue; }
+        if (dq) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\"') dq = false;
+            continue;
+        }
+        if (*p == '\'') { sq = true; continue; }
+        if (*p == '\"')  { dq = true; continue; }
+        if (is_space(*p)) break;
+        if (shell_operator_char(*p) || *p == '(' || *p == ')') return 0;
+    }
+    const char *tail = shell_skip_blanks(p);
+    if (*tail) return 0;
+    return w;
+}
+
 static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     if (!cmd || !out || out_cap == 0) return -1;
+
+    {
+        const char *fw = shell_capture_is_file_read(cmd);
+        if (fw) {
+            char wcopy[SHELL_PARSE_BUF_MAX];
+            size_t wl = strlen(fw);
+            if (wl + 1 > sizeof wcopy) return -1;
+            memcpy(wcopy, fw, wl + 1);
+            while (wl > 0 && (wcopy[wl - 1] == ' ' || wcopy[wl - 1] == '\t'))
+                wcopy[--wl] = '\0';
+            int n = shell_capture_read_file(wcopy, out, out_cap);
+            if (n < 0) { out[0] = '\0'; shell_set_status(1); return 0; }
+            shell_set_status(0);
+            return n;
+        }
+    }
 
     struct shell_capture cap = { .buf = out, .cap = out_cap, .pos = 0 };
     out[0] = '\0';
