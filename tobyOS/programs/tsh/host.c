@@ -584,6 +584,27 @@ int proc_spawn(const struct proc_spec *spec) {
  * does not return; the fork pid is now the program, and `$!` is right for
  * the same reason it is right in bash. Returns -1 only on failure, and the
  * caller falls back to the spawn it would have done anyway. */
+/* THE REAL DESCRIPTOR BEHIND A HANDLE, and moving one to a chosen number.
+ *
+ * Process substitution needs both. The filename it hands a command is
+ * /dev/fd/N, and N has to name the pipe in the SHELL (which may open that
+ * path itself, for a redirect target) and in the COMMAND (which opens it
+ * after being spawned). One number, two processes -- so the shell moves its
+ * end to a number it picked, rather than reading off whatever the pipe
+ * happened to get. VF_FD and dup2 are the shim's, not the shell's. */
+int host_file_fd(struct file *f) { return f ? VF_FD(&f->vfs) : -1; }
+
+int host_file_move_fd(struct file *f, int want) {
+    if (!f || want < 0) return -1;
+    int cur = VF_FD(&f->vfs);
+    if (cur < 0) return -1;
+    if (cur == want) return want;
+    if (dup2(cur, want) < 0) return -1;
+    close(cur);
+    VF_SET(&f->vfs, want);
+    return want;
+}
+
 /* `read -t`: is there input on this descriptor, or would a read return EOF at
  * once? poll(2) says; a timeout above zero waits that long for it. Lives
  * here because VF_FD and <poll.h> are the host shim's, not the shell's. */

@@ -7910,6 +7910,43 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         return;
     }
     if (c == '<' || c == '>') {
+        /* `<(cmd)` AND `>(cmd)` ARE WORDS, NOT REDIRECTIONS. The parenthesis
+         * belongs to the process substitution, so the subshell rules below
+         * must not see it -- they called it a `(` where no command may start
+         * and rejected the whole line as a syntax error before the tokenizer
+         * ever ran. Consumed whole here, the way `(( ))` and `[[ ]]` are.
+         * The result is a WORD: a filename the command will open. */
+        if (p[1] == '(') {
+            int depth = 0;
+            bool sq = false, dq = false;
+            const char *q = p + 1;
+            const char *close = 0;
+            for (; *q; q++) {
+                if (sq) { if (*q == '\'') sq = false; continue; }
+                if (dq) {
+                    if (*q == '\\' && q[1]) { q++; continue; }
+                    if (*q == '\"') dq = false;
+                    continue;
+                }
+                if (*q == '\'') { sq = true; continue; }
+                if (*q == '\"')  { dq = true; continue; }
+                if (*q == '(') { depth++; continue; }
+                if (*q == ')') { if (--depth == 0) { close = q; break; } }
+            }
+            if (close) {
+                *pp = close + 1;
+                st->cmd_seen = true;
+                st->redir = false;
+                st->cmd_pos = false;
+                st->prev_word_cmd = false;
+                st->prev_word_name = false;
+                st->assign_prefix = false;
+                st->no_sep = false;
+                return;
+            }
+            /* Unbalanced on this line: fall through and let the reader pull
+             * more input, exactly as an unclosed `(( ))` does. */
+        }
         while (*p == '<' || *p == '>' || *p == '&' || *p == '-') p++;
         st->redir = true; st->prev_word_cmd = false;
         st->no_sep = true;   /* a filename must follow */
@@ -16725,6 +16762,196 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
     return -1;
 }
 
+/* ---- PROCESS SUBSTITUTION: `<(cmd)` and `>(cmd)` ----------------------
+ *
+ * bash runs the command concurrently on one end of a pipe and substitutes a
+ * FILENAME for the other end, so a program that only knows how to open files
+ * can read from, or write to, a process:
+ *
+ *     cat <(head -n2 f) <(tail -n2 f)     two producers, one consumer
+ *     seq 3 > >(tac)                      one producer, one consumer
+ *     tr A-Z a-z < <(cat f)               as a redirection target
+ *
+ * The filename is /dev/fd/N, which sys_open() turns into a DUPLICATE of
+ * descriptor N of whoever opens it. That is why the descriptor has to sit at
+ * the same number in two processes: the shell may open the path itself, when
+ * the substitution is a redirection target, and an external command opens it
+ * after being spawned. The numbers are taken from 63 downwards, which is
+ * bash's choice too and is well clear of the 3..9 the shell's own
+ * redirections use.
+ *
+ * IT IS NOT BUFFERED. Collecting the command's output into a spill file the
+ * way `$( )` does would be simpler and wrong: `cat <(yes)` would never
+ * return, and `>(cmd)` cannot work that way at all, because its command has
+ * to run WHILE the consumer writes. So this forks.
+ *
+ * Nobody waits for these children -- bash does not either, which is what the
+ * Oils corpus case about ordering is complaining about. The shell closes its
+ * end when the command that used it is done; that is the EOF the reader was
+ * waiting for. */
+#define SHELL_PROCSUB_MAX    8
+#define SHELL_PROCSUB_FD_TOP 63
+
+struct shell_procsub {
+    struct file *keep;      /* the end the shell holds for the consumer */
+    int          fd;        /* its number, the same in both processes */
+    int          pid;
+    bool         input;     /* `<( )`; the other direction is `>( )` */
+};
+static struct shell_procsub g_procsub[SHELL_PROCSUB_MAX];
+static int g_procsub_n;
+
+static int shell_procsub_mark(void) { return g_procsub_n; }
+
+/* Close everything opened since `mark`. Taking a mark per LINE is what makes
+ * nesting work: a `$( )` runs a whole line in this process, and its
+ * substitutions must not outlive it or be closed by it. */
+static void shell_procsub_release(int mark) {
+    while (g_procsub_n > mark) {
+        struct shell_procsub *ps = &g_procsub[--g_procsub_n];
+        if (ps->keep) file_close(ps->keep);
+        /* AN OUTPUT SUBSTITUTION IS WAITED FOR, AN INPUT ONE IS NOT.
+         *
+         *     seq 3 > >(tac)        bash: 3 2 1
+         *
+         * `>(cmd)` is a CONSUMER: the close above is its end of input,
+         * so it is about to finish, and whether its output lands before
+         * or after the next command is a race. bash loses that race
+         * often enough that the Oils corpus has a case whose comment is
+         * a complaint about it -- and the shell can simply not race.
+         * Waiting costs the time the filter needs and makes the output
+         * ordering a fact instead of a coin flip.
+         *
+         * `<(cmd)` is a PRODUCER and must NOT be waited for: the reader
+         * may have stopped early, leaving it blocked on a pipe nobody
+         * will drain, and `cat <(yes) | head -1` would never return. */
+        if (!ps->input && ps->pid > 0) (void)proc_wait(ps->pid);
+        ps->keep = 0;
+        ps->fd = -1;
+        ps->pid = -1;
+        ps->input = false;
+    }
+}
+
+#ifdef SHELL_HOSTED
+extern int  fork(void);
+extern void _exit(int status);
+extern int  host_file_fd(struct file *f);          /* host.c */
+extern int  host_file_move_fd(struct file *f, int want);
+
+static bool shell_procsub_make(const char *text, bool input,
+                               char *out, size_t cap) {
+    if (g_procsub_n >= SHELL_PROCSUB_MAX) {
+        kprintf("tsh: too many process substitutions\n");
+        return false;
+    }
+    /* `<(<file)` IS THE FILE. Measured against bash 5.2, and it is the only
+     * place bash gives a redirection-only command any output at all:
+     *
+     *     cat <(<f)          the contents of f
+     *     cat <(<f; echo x)  just `x`   -- a LIST, so the ordinary path runs
+     *     ( <f )             nothing    -- and so does every other context
+     *
+     * The same shortcut `$(<f)` gets. Handing over the open file itself is
+     * exactly equivalent and cheaper than forking something to copy it. */
+    if (input) {
+        const char *fw = shell_capture_is_file_read(text);
+        if (fw) {
+            char wcopy[SHELL_PARSE_BUF_MAX];
+            size_t wl = strlen(fw);
+            if (wl + 1 <= sizeof wcopy) {
+                memcpy(wcopy, fw, wl + 1);
+                while (wl > 0 && (wcopy[wl - 1] == ' ' || wcopy[wl - 1] == '\t'))
+                    wcopy[--wl] = '\0';
+                char fpath[SHELL_PARSE_BUF_MAX];
+                if (shell_expand_word_ex(wcopy, fpath, sizeof fpath,
+                                         true, true) == 0) {
+                    shell_strip_nosplit_inplace(fpath);
+                    struct file *ff = shell_open_vfs_file(fpath, false, false,
+                                                          "shell");
+                    if (!ff) return false;
+                    int fwant = SHELL_PROCSUB_FD_TOP - g_procsub_n;
+                    if (host_file_move_fd(ff, fwant) < 0) {
+                        file_close(ff);
+                        return false;
+                    }
+                    struct shell_procsub *fps = &g_procsub[g_procsub_n++];
+                    fps->keep  = ff;
+                    fps->fd    = fwant;
+                    fps->pid   = -1;        /* no child: nothing to wait for */
+                    fps->input = true;
+                    int fn = ksnprintf(out, cap, "/dev/fd/%d", fwant);
+                    return fn > 0 && (size_t)fn < cap;
+                }
+            }
+        }
+    }
+
+    struct file *r = 0, *w = 0;
+    if (pipe_create(&r, &w) < 0) {
+        kprintf("tsh: process substitution: cannot create a pipe\n");
+        return false;
+    }
+    /* `<(cmd)` reads what the command WRITES, so the command owns the write
+     * end and the shell keeps the read end. `>(cmd)` is the mirror. */
+    struct file *child_end = input ? w : r;
+    struct file *keep      = input ? r : w;
+
+    int want = SHELL_PROCSUB_FD_TOP - g_procsub_n;
+    if (host_file_move_fd(keep, want) < 0) {
+        file_close(r); file_close(w);
+        kprintf("tsh: process substitution: no descriptor %d\n", want);
+        return false;
+    }
+
+    size_t tl = strlen(text);
+    char *copy = (char *)kmalloc(tl + 1);
+    if (!copy) { file_close(r); file_close(w); return false; }
+    memcpy(copy, text, tl + 1);
+
+    int pid = fork();
+    if (pid == 0) {
+        /* The child IS the command. It must not keep the end the shell kept:
+         * a reader still holding the write end never sees EOF. */
+        file_close(keep);
+        (void)host_file_move_fd(child_end, input ? 1 : 0);
+        /* Inside `$( )` the shell's output is being captured into a spill
+         * file. This child's output belongs to the pipe. */
+        shell_set_output(0, 0);
+        printk_set_sink_mode(0, 0, false);
+        g_capture_depth = 0;
+        g_in_pipeline_stage = true;
+        g_procsub_n = 0;              /* the parent's table is not ours */
+        execute_line_text(copy);
+        _exit(g_last_status & 0xff);
+    }
+    kfree(copy);
+    if (pid < 0) {
+        file_close(r); file_close(w);
+        kprintf("tsh: process substitution: cannot fork\n");
+        return false;
+    }
+    file_close(child_end);
+
+    struct shell_procsub *ps = &g_procsub[g_procsub_n++];
+    ps->keep  = keep;
+    ps->fd    = want;
+    ps->pid   = pid;
+    ps->input = input;
+    int n = ksnprintf(out, cap, "/dev/fd/%d", want);
+    return n > 0 && (size_t)n < cap;
+}
+#else
+static bool shell_procsub_make(const char *text, bool input,
+                               char *out, size_t cap) {
+    (void)text; (void)input; (void)out; (void)cap;
+    /* Stated, not faked -- the same answer the console shell gives for `=~`.
+     * It has no fork, which is why its pipeline stages run differently too. */
+    kprintf("tsh: process substitution needs fork, which the console "
+            "shell does not have\n");
+    return false;
+}
+#endif
 static bool shell_operator_char(char c) {
     return c == ';' || c == '&' || c == '|' || c == '<' || c == '>';
 }
@@ -17344,6 +17571,60 @@ static int shell_tokenize_outer(const char *src, struct shell_token *tok,
     return shell_tokenize_inner(src, tok, out_ntok, words, word_cap);
 }
 
+/* `<(cmd)` and `>(cmd)` are WORDS, and the word is the /dev/fd path the
+ * substitution produced. Consumes the whole construct, parens balanced and
+ * quotes respected, starts the command, and appends the path to the word
+ * buffer -- token text is a pointer INTO that buffer, never a copy. */
+static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
+                                  const char **pp, bool input,
+                                  char *words, size_t *wpos, size_t word_cap) {
+    const char *body = *pp + 2;            /* past the `<(` */
+    const char *q = body;
+    int depth = 1;
+    bool sq = false, dq = false;
+    for (; *q; q++) {
+        if (sq) { if (*q == '\'') sq = false; continue; }
+        if (dq) {
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '\"') dq = false;
+            continue;
+        }
+        if (*q == '\'') { sq = true; continue; }
+        if (*q == '\"')  { dq = true; continue; }
+        if (*q == '(') { depth++; continue; }
+        if (*q == ')') { if (--depth == 0) break; }
+    }
+    if (depth != 0 || *q != ')') {
+        kprintf("tsh: unterminated process substitution\n");
+        return -1;
+    }
+    size_t blen = (size_t)(q - body);
+    char *text = (char *)kmalloc(blen + 1);
+    if (!text) return -1;
+    memcpy(text, body, blen);
+    text[blen] = '\0';
+
+    char path[32];
+    bool ok = shell_procsub_make(text, input, path, sizeof path);
+    kfree(text);
+    if (!ok) return -1;
+
+    char *start = words + *wpos;
+    for (const char *c = path; *c; c++)
+        if (shell_append_char(words, wpos, word_cap, *c) < 0) {
+            kprintf("shell: word too long\n");
+            return -1;
+        }
+    if (shell_append_char(words, wpos, word_cap, '\0') < 0) {
+        kprintf("shell: parse buffer full\n");
+        return -1;
+    }
+    /* Quoted: the path is a finished word. Nothing in it should be split on
+     * IFS or matched against the filesystem. */
+    if (shell_emit_token(tok, ntok, SH_TOK_WORD, start, true) < 0) return -1;
+    *pp = q + 1;
+    return 0;
+}
 static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                                 int *out_ntok, char *words, size_t word_cap) {
     int ntok = 0;
@@ -17408,6 +17689,22 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             prefix_ok = true;
             g_tokpfx_n = 0;
             p++;
+            continue;
+        }
+        if (*p == '<' && p[1] == '(') {
+            /* `<(cmd)` IS NOT A REDIRECTION. See the process substitution
+             * block: the construct is a word, and the word is a path. */
+            if (shell_tokenize_procsub(tok, &ntok, &p, true,
+                                       words, &wpos, word_cap) < 0) return -1;
+            prefix_ok = false;
+            g_tokpfx_n = 0;
+            continue;
+        }
+        if (*p == '>' && p[1] == '(') {
+            if (shell_tokenize_procsub(tok, &ntok, &p, false,
+                                       words, &wpos, word_cap) < 0) return -1;
+            prefix_ok = false;
+            g_tokpfx_n = 0;
             continue;
         }
         if (*p == '<') {
@@ -20102,11 +20399,23 @@ static struct file *shell_builtin_fd(int n) {
 static int shell_fd_state_extra(const struct shell_fd_state *st,
                                 struct proc_fd_map *out, int max) {
     int n = 0;
-    if (!st) return 0;
-    for (int i = 3; i < SHELL_FD_MAX && n < max; i++) {
-        if (!st->fd[i]) continue;
-        out[n].fd = i;
-        out[n].f  = st->fd[i];
+    if (st) {
+        for (int i = 3; i < SHELL_FD_MAX && n < max; i++) {
+            if (!st->fd[i]) continue;
+            out[n].fd = i;
+            out[n].f  = st->fd[i];
+            n++;
+        }
+    }
+    /* AND THE PROCESS SUBSTITUTIONS. `cat /dev/fd/63` can only work if
+     * descriptor 63 is open in `cat`, so every command spawned while a
+     * substitution is live inherits it AT THE SAME NUMBER -- the number
+     * is in the path the command was given. Slots 3..9 above are shell
+     * fds and cannot collide with 63 downwards. */
+    for (int i = 0; i < g_procsub_n && n < max; i++) {
+        if (!g_procsub[i].keep) continue;
+        out[n].fd = g_procsub[i].fd;
+        out[n].f  = g_procsub[i].keep;
         n++;
     }
     return n;
@@ -20877,8 +21186,9 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         return 1;
     }
 
-    struct proc_fd_map xfd[SHELL_FD_MAX];
-    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX);
+    struct proc_fd_map xfd[SHELL_FD_MAX + SHELL_PROCSUB_MAX];
+    int nxfd = shell_fd_state_extra(&fds, xfd,
+                                    SHELL_FD_MAX + SHELL_PROCSUB_MAX);
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
@@ -21033,8 +21343,9 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 
     char path_buf[64];
     const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
-    struct proc_fd_map xfd[SHELL_FD_MAX];
-    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX);
+    struct proc_fd_map xfd[SHELL_FD_MAX + SHELL_PROCSUB_MAX];
+    int nxfd = shell_fd_state_extra(&fds, xfd,
+                                    SHELL_FD_MAX + SHELL_PROCSUB_MAX);
     struct proc_spec spec = {
         .path = path, .name = argv[0],
         .fd0 = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
@@ -25766,7 +26077,9 @@ static bool shell_line_syntax_ok(const char *src) {
 static void execute_line_text(const char *src) {
     if (g_exec_line_depth > 0) {           /* a piece of a line already being run */
         g_exec_line_depth++;
+        int psub = shell_procsub_mark();
         execute_line_text_inner(src);
+        shell_procsub_release(psub);
         g_exec_line_depth--;
         return;
     }
@@ -25828,6 +26141,10 @@ static void execute_line_text(const char *src) {
      * had one it came from the reader joining a multi-line quoted string, and
      * that newline is part of a string literal. Quotes are tracked for the same
      * reason: `alias x='echo "a<newline>b"'` is still one command. */
+    /* A process substitution lives exactly as long as the line that wrote
+     * it: the shell's end closes here, and that close is the EOF the
+     * command on the other side is waiting for. */
+    int psub = shell_procsub_mark();
     if (abuf && line_src == abuf && !shell_text_has_newline(src) &&
         shell_text_has_newline(abuf)) {
         char *p = abuf;
@@ -25841,6 +26158,7 @@ static void execute_line_text(const char *src) {
     } else {
         execute_line_text_inner(line_src);
     }
+    shell_procsub_release(psub);
     g_exec_line_depth--;
     if (abuf) kfree(abuf);
 }
