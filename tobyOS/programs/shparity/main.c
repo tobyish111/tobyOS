@@ -215,7 +215,9 @@ static int run_shell(const char *shell, char *const argv[],
  * difference visible: a missing line, an extra line, or a changed one. Bounded,
  * so a wholly divergent case cannot flood the serial log. */
 
-#define DIFF_MAX_LINES 400   /* a whole probe fixture, not a taste of it */
+#define DIFF_MAX_LINES 400
+/* ...and how many stderr lines per side; see the reporting block below. */
+#define STDERR_MAX_LINES 12   /* a whole probe fixture, not a taste of it */
 
 /* Copy line `want` (0-based) of `buf` into `out`, escaping control characters.
  * Returns -1 if that line does not exist -- itself information, since it says
@@ -405,9 +407,14 @@ int main(void) {
         }
 
         /* stderr is informational -- reported, never fatal. See header. But
-         * its FIRST LINE is usually the actual cause ("[: not found" explains
-         * a whole file of wrong branches), so print that rather than only a
-         * byte count that leaves the reader guessing. */
+         * its lines are usually the actual cause ("[: not found" explains a
+         * whole file of wrong branches), so print them rather than only a
+         * byte count that leaves the reader guessing.
+         *
+         * UP TO STDERR_MAX_LINES, not just the first. A case that failed for
+         * TWO reasons showed only the earlier one, so each fix revealed the
+         * next only after another full build-and-boot round -- twice on the
+         * for-expression probe (2026-09-20). */
         long ea_n = read_all(ae, g_buf_a, sizeof g_buf_a);
         long eb_n = read_all(be, g_buf_b, sizeof g_buf_b);
         if (ea_n > 0 || eb_n > 0) {
@@ -418,13 +425,19 @@ int main(void) {
                 const char *s = side ? g_buf_b : g_buf_a;
                 long n = side ? eb_n : ea_n;
                 if (n <= 0) continue;
-                char first[120];
-                size_t o = 0;
-                for (long k = 0; k < n && s[k] != '\n' && o < sizeof first - 1; k++)
-                    if ((unsigned char)s[k] >= 0x20) first[o++] = s[k];
-                first[o] = '\0';
-                emitf("[shparity]     %s stderr[0]: %s\n",
-                      side ? "tsh " : "bash", first);
+                long k = 0;
+                for (int ln = 0; ln < STDERR_MAX_LINES && k < n; ln++) {
+                    char text[160];
+                    size_t o = 0;
+                    for (; k < n && s[k] != '\n'; k++)
+                        if ((unsigned char)s[k] >= 0x20 && o < sizeof text - 1)
+                            text[o++] = s[k];
+                    text[o] = '\0';
+                    if (k < n) k++;               /* step over the newline */
+                    if (o == 0) { ln--; continue; }    /* a blank line is not one */
+                    emitf("[shparity]     %s stderr[%d]: %s\n",
+                          side ? "tsh " : "bash", ln, text);
+                }
             }
         }
     }
