@@ -2595,6 +2595,54 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
         }
     }
 
+    /* /dev/fd/<n> AND /proc/self/fd/<n> OPEN AS A DUPLICATE of the caller's
+     * descriptor <n> -- they do NOT resolve as symlinks.
+     *
+     * This is the mechanism bash's process substitution runs on. `cat
+     * <(head f)` hands `cat` the path /dev/fd/63 and keeps the pipe's read
+     * end open at descriptor 63; `cat` opens that path and must come out
+     * holding the pipe. A pipe has no name, so readlink's answer
+     * ("pipe:[r]", which is what Linux reports too) cannot be re-opened --
+     * the magic is in open(), not in the link text.
+     *
+     * Only the CALLER's own descriptors. /proc/<other>/fd/<n> still goes to
+     * procfs and reads as a symlink, which is what ls -l wants.
+     *
+     * The clone shares the open file description, so the two descriptors
+     * share one position -- the same thing dup(2) gives, and the same thing
+     * Linux gives for a pipe. */
+    {
+        const char *fdnum = 0;
+        if (strncmp(kpath, "/dev/fd/", 8) == 0) {
+            fdnum = kpath + 8;
+        } else if (strncmp(kpath, "/proc/self/fd/", 14) == 0) {
+            fdnum = kpath + 14;
+        } else if (strncmp(kpath, "/proc/", 6) == 0) {
+            const char *q = kpath + 6;
+            int v = 0;
+            while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+            struct proc *me = current_proc();
+            if (q != kpath + 6 && strncmp(q, "/fd/", 4) == 0 && me) {
+                int kk = pid_knr(v);
+                if (kk && kk == me->pid) fdnum = q + 4;
+            }
+        }
+        if (fdnum && *fdnum) {
+            const char *q = fdnum;
+            int v = 0;
+            while (*q >= '0' && *q <= '9') { v = v * 10 + (*q - '0'); q++; }
+            if (*q == ' ') {                  /* a bare number, not fd/3/x */
+                struct file *src = fd_lookup(v);
+                if (!src) return -ABI_EBADF;
+                struct file *cl = file_clone(src);
+                if (!cl) return -ABI_ENOMEM;
+                int nfd = fd_alloc_into(current_proc(), cl);
+                if (nfd < 0) { file_close(cl); return -ABI_EMFILE; }
+                return nfd;
+            }
+        }
+    }
+
     /* 2026-08-22: /dev itself is openable and listable. It has never been
      * a real directory -- nodes are synthesised in the open path -- so
      * `ls /dev` answered ENOENT since forever, an inventory every Unix
