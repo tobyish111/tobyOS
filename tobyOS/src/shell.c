@@ -7274,8 +7274,14 @@ static int shell_line_find_heredocs(const char *line,
         }
         /* `<<<` is a here-STRING, not a here-document: it takes its text
          * from the same line and has no body to collect. Reading it as `<<`
-         * would send the reader hunting for a delimiter that never comes. */
-        if (p[0] != '<' || p[1] != '<' || p[2] == '<') continue;
+         * would send the reader hunting for a delimiter that never comes.
+         *
+         * STEP OVER ALL THREE. `continue` advances one character, so the
+         * next pass looked at the SECOND and third `<` -- `<<` again, this
+         * time with nothing after it to disqualify the match, and
+         * `read x <<< abc` went hunting for a delimiter `abc`. */
+        if (p[0] == '<' && p[1] == '<' && p[2] == '<') { p += 2; continue; }
+        if (p[0] != '<' || p[1] != '<') continue;
 
         struct shell_heredoc_spec *sp = &out[found];
         sp->strip_tabs = false;
@@ -12770,6 +12776,7 @@ enum shell_tok_type {
     SH_TOK_REDIR_IN,
     SH_TOK_HEREDOC,
     SH_TOK_HEREDOC_TABS,
+    SH_TOK_HERESTRING,      /* <<< WORD: the word, plus a newline, is stdin */
     SH_TOK_REDIR_OUT,
     SH_TOK_REDIR_APPEND,
     SH_TOK_REDIR_CLOBBER,
@@ -17235,7 +17242,14 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             if (p[1] == '<') {
                 t = SH_TOK_HEREDOC;
                 p++;
-                if (p[1] == '-') {
+                if (p[1] == '<') {
+                    /* A HERE-STRING is not a here-document: its operand is an
+                     * ordinary expanded word, not a delimiter, and no body
+                     * follows. `read x <<< abc` used to wait for a line `abc`
+                     * that never came ("here-document delimited by EOF"). */
+                    t = SH_TOK_HERESTRING;
+                    p++;
+                } else if (p[1] == '-') {
                     t = SH_TOK_HEREDOC_TABS;
                     p++;
                 }
@@ -19404,8 +19418,8 @@ static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
 static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
     if (explicit_fd >= 0) return explicit_fd;
     if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
-        t == SH_TOK_HEREDOC_TABS || t == SH_TOK_DUP_IN ||
-        t == SH_TOK_REDIR_RW) {
+        t == SH_TOK_HEREDOC_TABS || t == SH_TOK_HERESTRING ||
+        t == SH_TOK_DUP_IN || t == SH_TOK_REDIR_RW) {
         return 0;
     }
     return 1;
@@ -19486,7 +19500,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         }
 
         if (t == SH_TOK_REDIR_IN || t == SH_TOK_HEREDOC ||
-            t == SH_TOK_HEREDOC_TABS || t == SH_TOK_REDIR_OUT ||
+            t == SH_TOK_HEREDOC_TABS || t == SH_TOK_HERESTRING ||
+            t == SH_TOK_REDIR_OUT ||
             t == SH_TOK_REDIR_APPEND || t == SH_TOK_REDIR_CLOBBER ||
             t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT ||
             t == SH_TOK_REDIR_RW) {
@@ -19509,6 +19524,22 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             } else if (t == SH_TOK_REDIR_RW) {
                 if (shell_add_redir(cur, SH_RD_OPEN_RW, fd, tok[*io].text,
                                     0, -1) < 0) return -1;
+            } else if (t == SH_TOK_HERESTRING) {
+                /* The expanded word, one newline appended, becomes the
+                 * command's stdin through the here-document machinery. */
+                size_t wl = strlen(tok[*io].text);
+                char *hs = (char *)kmalloc(wl + 2);
+                if (!hs) return -1;
+                memcpy(hs, tok[*io].text, wl);
+                hs[wl] = '\n';
+                hs[wl + 1] = '\0';
+                char *saved = 0;
+                int src_rc = shell_pipeline_save_word(pl, hs, &saved);
+                kfree(hs);
+                if (src_rc < 0) return -1;
+                cur->stdin_text = saved;
+                if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, saved,
+                                    -1) < 0) return -1;
             } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
                 const struct shell_heredoc *h = shell_heredoc_pop();
                 if (!h) {
