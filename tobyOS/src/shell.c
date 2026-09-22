@@ -1395,9 +1395,15 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (elem[0] == '[') {
             char *rb = 0;
             for (char *q = elem + 1; *q; q++) if (*q == ']') { rb = q; break; }
-            if (rb && rb[1] == '=') {
+            /* AN ELEMENT MAY APPEND: `a=([k]=1 [k]+=2)` leaves `12` there.
+             * Only `]=` was accepted, so `[k]+=2` matched nothing and fell
+             * through to the bare-word path -- it became the literal VALUE
+             * `[hello]+=2` at the next free index, which reads like the
+             * feature working until you look at what is in the array. */
+            bool eplus = (rb && rb[1] == '+' && rb[2] == '=');
+            if (rb && (rb[1] == '=' || eplus)) {
                 *rb = '\0';
-                const char *k = elem + 1, *v = rb + 2;
+                const char *k = elem + 1, *v = rb + (eplus ? 3 : 2);
                 /* THE RHS IS AN ASSIGNMENT, so it expands but does NOT
                  * field split: `[i]=$v` with v='1 2 3' is one element
                  * holding all three words, while a bare `$v` beside it is
@@ -1421,11 +1427,54 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                         return -1;
                     if (shell_argmarks_to_spaces(kraw, kx, sizeof kx) < 0)
                         return -1;
+                    /* `[k]+=v` IS HONOURED IN AN APPENDING LITERAL AND
+                     * IGNORED IN A REPLACING ONE. Measured against bash
+                     * 5.2, because the asymmetry is not guessable:
+                     *
+                     *   declare -A o=([k]=1 [k]+=2 [k]+=3)   ->  3
+                     *   m[k]=X; m+=([k]=1 [k]+=2)            ->  12
+                     *   n[k]=X; n+=([k]+=2)                  ->  X2
+                     *
+                     * In `name=(...)` the whole compound is rebuilt and the
+                     * `+=` collapses to a plain `=` (last one wins); in
+                     * `name+=(...)` each element appends to the array as it
+                     * stands. The Oils corpus records the first as
+                     * `## BUG bash` -- bash <= 5.0 chained there -- and this
+                     * gate grades against the live bash, so the bug is what
+                     * passes. An INDEXED array chains in both forms, which
+                     * is why the two sides of this branch differ. */
+                    if (eplus && append) {
+                        const char *old = sh_array_get_key(name, kx);
+                        size_t ol = old ? strlen(old) : 0;
+                        size_t vl = strlen(vx);
+                        if (ol && ol + vl + 1 <= sizeof vx) {
+                            memmove(vx + ol, vx, vl + 1);
+                            memcpy(vx, old, ol);
+                        }
+                    }
                     if (sh_array_set_key(name, kx, vx) < 0) return -1;
                     saw_keyed = true;
                 } else {
                     long ix = 0;
                     if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
+                        /* Prepend the old value in place rather than into
+                         * another buffer: this function already carries two
+                         * SHELL_PARSE_BUF_MAX locals and the kernel stack is
+                         * 32 KiB. `old` points into the array store, which
+                         * the set below may reallocate, so it is copied
+                         * first. THE ASSOCIATIVE SIDE DELIBERATELY DOES NOT
+                         * DO THIS: bash >= 5.1 replaces instead of appending
+                         * there, the Oils corpus records it as `## BUG bash`,
+                         * and this gate grades against the live bash. */
+                        if (eplus) {
+                            const char *old = sh_array_get(name, ix);
+                            size_t ol = old ? strlen(old) : 0;
+                            size_t vl = strlen(vx);
+                            if (ol && ol + vl + 1 <= sizeof vx) {
+                                memmove(vx + ol, vx, vl + 1);
+                                memcpy(vx, old, ol);
+                            }
+                        }
                         if (sh_array_set(name, ix, vx) < 0) return -1;
                         next = ix + 1;   /* a later bare element follows on */
                     }
