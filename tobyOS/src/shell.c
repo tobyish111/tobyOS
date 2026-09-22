@@ -3400,9 +3400,21 @@ static struct shell_shopt *shell_shopt_find(const char *name) {
     return 0;
 }
 
+/* bash pads the name to 15 before the tab -- the same column the `set -o`
+ * listing uses. Printing it unpadded made every `shopt` line differ from
+ * bash by whitespace, which a corpus case comparing output notices. */
 static void shell_shopt_print(const struct shell_shopt *o) {
-    shell_printf("%s\t%s\n", o->name, *o->slot ? "on" : "off");
+    shell_printf("%-15s\t%s\n", o->name, *o->slot ? "on" : "off");
 }
+
+/* `shopt -p` prints what you would TYPE to get this state back. */
+static void shell_shopt_print_reinput(const struct shell_shopt *o) {
+    shell_printf("shopt -%c %s\n", *o->slot ? 's' : 'u', o->name);
+}
+
+static bool shell_opt_state_by_name(const char *name, bool *out);
+static void shell_print_options(bool reinput);
+static bool shell_set_opt_by_name(const char *name, bool on);
 
 /* `shopt [-suqp] [NAME...]`
  *
@@ -3411,6 +3423,7 @@ static void shell_shopt_print(const struct shell_shopt *o) {
  * diagnostic, which is what bash does and what several corpus cases check. */
 static void cmd_shopt(int argc, char **argv) {
     bool set = false, unset = false, quiet = false, print = false;
+    bool setopts = false;      /* -o: the `set -o` namespace, not shopt's */
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
         for (const char *c = argv[i] + 1; *c; c++) {
@@ -3419,7 +3432,7 @@ static void cmd_shopt(int argc, char **argv) {
             case 'u': unset = true; break;
             case 'q': quiet = true; break;
             case 'p': print = true; break;
-            case 'o': break;   /* `shopt -o` addresses `set -o` names */
+            case 'o': setopts = true; break;
             default:
                 kprintf("shopt: -%c: invalid option\n", *c);
                 shell_set_status(2);
@@ -3427,13 +3440,47 @@ static void cmd_shopt(int argc, char **argv) {
             }
         }
     }
-    (void)print;
+
+    /* `-o` ADDRESSES THE `set -o` OPTIONS. It was parsed and then ignored, so
+     * `shopt -o nounset` looked up `nounset` in the SHOPT table, did not find
+     * it, and reported an invalid option name for something bash prints the
+     * state of. `-p` was ignored too -- see the reinput printer above. */
+    if (setopts) {
+        if (i >= argc) {                   /* no names: the whole listing */
+            if (!quiet) shell_print_options(print);
+            shell_set_status(0);
+            return;
+        }
+        int st = 0;
+        for (; i < argc; i++) {
+            bool on = false;
+            if (!shell_opt_state_by_name(argv[i], &on)) {
+                if (!quiet)
+                    kprintf("shopt: %s: invalid shell option name\n", argv[i]);
+                st = 1;
+                continue;
+            }
+            if (set || unset) {
+                if (!shell_set_opt_by_name(argv[i], set)) st = 1;
+                continue;
+            }
+            if (!quiet) {
+                if (print) shell_printf("set %co %s\n", on ? '-' : '+', argv[i]);
+                else       shell_printf("%-15s\t%s\n", argv[i], on ? "on" : "off");
+            }
+            if (!on) st = 1;
+        }
+        shell_set_status(st);
+        return;
+    }
 
     if (i >= argc) {                       /* no names: list everything */
         for (int k = 0; g_shopts[k].name; k++) {
             if (set   && !*g_shopts[k].slot) continue;
             if (unset &&  *g_shopts[k].slot) continue;
-            if (!quiet) shell_shopt_print(&g_shopts[k]);
+            if (quiet) continue;
+            if (print) shell_shopt_print_reinput(&g_shopts[k]);
+            else       shell_shopt_print(&g_shopts[k]);
         }
         shell_set_status(0);
         return;
@@ -3455,7 +3502,10 @@ static void cmd_shopt(int argc, char **argv) {
                         "behaviour is unchanged\n", o->name);
             }
         } else {
-            if (!quiet) shell_shopt_print(o);
+            if (!quiet) {
+                if (print) shell_shopt_print_reinput(o);
+                else       shell_shopt_print(o);
+            }
             if (!*o->slot) status = 1;
         }
     }
@@ -4137,6 +4187,30 @@ static void shell_print_options(bool reinput) {
         else
             shell_printf("%-15s\t%s\n", t[i].name, t[i].on ? "on" : "off");
     }
+}
+
+/* The state of a `set -o` option by NAME. The printer above walks the
+ * whole table and the setter takes a name, but nothing could ASK about
+ * one -- which is what `shopt -o NAME` and `shopt -po NAME` need. */
+static bool shell_opt_state_by_name(const char *name, bool *out) {
+    const struct { const char *name; bool on; } t[] = {
+        { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
+        { "hashall",   g_opt_hashall },   { "ignoreeof", g_opt_ignoreeof },
+        { "monitor",   g_opt_monitor },   { "noclobber", g_opt_noclobber },
+        { "noexec",    g_opt_noexec },    { "noglob",    g_opt_noglob },
+        { "nolog",     g_opt_nolog },     { "notify",    g_opt_notify },
+        { "nounset",   g_opt_nounset },   { "pipefail",  g_opt_pipefail },
+        { "posix",     g_opt_posix },     { "verbose",   g_opt_verbose },
+        { "xtrace",    g_opt_xtrace },
+    };
+    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++)
+        if (strcmp(name, t[i].name) == 0) { *out = t[i].on; return true; }
+    /* The line-editing modes exist and are never on; see the setter. */
+    if (strcmp(name, "vi") == 0 || strcmp(name, "emacs") == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
 }
 
 static bool shell_set_opt_by_name(const char *name, bool on) {
