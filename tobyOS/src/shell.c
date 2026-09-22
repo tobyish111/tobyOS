@@ -1042,7 +1042,8 @@ static const char *env_get(const char *key) {
 
 /* The name a nameref resolves to, or the name itself when it is not one.
  * An ASSIGNMENT to a nameref writes THROUGH it. */
-static const char *env_deref_name(const char *key, char *buf, size_t cap) {
+static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
+                                     bool writing) {
     if (!key) return key;
     size_t klen = strlen(key);
     int idx = env_find(key, klen);
@@ -1060,7 +1061,10 @@ static const char *env_deref_name(const char *key, char *buf, size_t cap) {
          * different and stays put (env_get returns the raw value): only a
          * WRITE resolves the question. */
         if (!shell_name_is_valid(target, strlen(target))) {
-            g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
+            /* ...and only a WRITE resolves it. A read that cleared the
+             * attribute would decide the question on the caller's behalf,
+             * which is why this takes `writing` at all. */
+            if (writing) g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
             break;
         }
         size_t n = strlen(target);
@@ -1073,6 +1077,10 @@ static const char *env_deref_name(const char *key, char *buf, size_t cap) {
         idx = nx;
     }
     return key;
+}
+
+static const char *env_deref_name(const char *key, char *buf, size_t cap) {
+    return env_deref_name_ex(key, buf, cap, true);
 }
 
 /* Drop entry at index `idx` (free its blob, shift the tail down). */
@@ -2635,10 +2643,45 @@ struct sh_array {
 static struct sh_array g_arrays[SH_ARRAY_MAX];
 static int g_narrays;
 
-static struct sh_array *sh_array_find(const char *name) {
+/* The array under EXACTLY this name, following no reference. Scope
+ * management needs it: a local going out of scope must drop the local,
+ * not whatever it happens to point at. Getting that wrong deleted the
+ * CALLER's array when a `local -n` returned. */
+static struct sh_array *sh_array_find_literal(const char *name) {
     if (!name || !*name) return 0;
     for (int i = 0; i < g_narrays; i++)
         if (g_arrays[i].name && strcmp(g_arrays[i].name, name) == 0)
+            return &g_arrays[i];
+    return 0;
+}
+
+static void sh_array_unset_at(struct sh_array *a);
+
+/* Drop the array under exactly this name. See sh_array_find_literal. */
+static void sh_array_unset_literal(const char *name) {
+    sh_array_unset_at(sh_array_find_literal(name));
+}
+
+static struct sh_array *sh_array_find(const char *name) {
+    if (!name || !*name) return 0;
+    /* A NAMEREF IS ITS TARGET FOR EVERY ARRAY OPERATION.
+     *
+     *     f() { local -n r=$1; echo "${r[2]}"; }
+     *     a=(ga bu zo meu); f a                  bash: zo
+     *
+     * Scalars have resolved through env_deref_name since namerefs
+     * existed; the array TABLE never did, so a reference to an array was
+     * a reference to nothing and every subscripted use of one read empty.
+     * Reads and writes both arrive here by name, so resolving once at the
+     * lookup covers `${r[i]}`, `r[i]=v` and `r=(...)` together.
+     *
+     * Read-only: resolving the is-it-really-a-reference question belongs
+     * to a write, and a lookup is not one. */
+    char target[128];
+    const char *real = env_deref_name_ex(name, target, sizeof target, false);
+    if (!real || !*real) real = name;
+    for (int i = 0; i < g_narrays; i++)
+        if (g_arrays[i].name && strcmp(g_arrays[i].name, real) == 0)
             return &g_arrays[i];
     return 0;
 }
@@ -2671,8 +2714,7 @@ static void sh_array_unset_idx(struct sh_array *a, long idx) {
     }
 }
 
-static void sh_array_unset(const char *name) {
-    struct sh_array *a = sh_array_find(name);
+static void sh_array_unset_at(struct sh_array *a) {
     if (!a) return;
     for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
     a->n = 0;
@@ -2680,6 +2722,13 @@ static void sh_array_unset(const char *name) {
     int slot = (int)(a - g_arrays);
     for (int j = slot; j + 1 < g_narrays; j++) g_arrays[j] = g_arrays[j + 1];
     g_narrays--;
+}
+
+/* `unset ref` on a nameref removes the TARGET, which is bash's rule and
+ * why this one follows the reference. Scope cleanup wants the other
+ * one -- sh_array_unset_literal. */
+static void sh_array_unset(const char *name) {
+    sh_array_unset_at(sh_array_find(name));
 }
 
 static int sh_array_set(const char *name, long idx, const char *val) {
@@ -3008,7 +3057,7 @@ static int shell_locals_push(const char *name, int depth) {
                 }
                 sv->arr_existed = true;
             }
-            sh_array_unset(name);   /* the function starts from nothing */
+            sh_array_unset_literal(name);  /* the function starts fresh */
         }
     }
     sv->depth = depth;
@@ -3036,7 +3085,7 @@ static void shell_locals_pop(int depth) {
         struct shell_local_save *sv = &g_locals[--g_localc];
         /* Drop whatever the function built, then put the caller's array back
          * (if it had one). Mirrors the scalar restore below. */
-        sh_array_unset(sv->name);
+        sh_array_unset_literal(sv->name);
         if (sv->arr_existed && sv->arr_saved) {
             for (int i = 0; i < sv->arr_saved->n; i++)
                 (void)sh_array_set(sv->name, sv->arr_saved->e[i].idx,
@@ -3090,7 +3139,7 @@ static void cmd_local(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
-    bool l_array = false, l_assoc = false;
+    bool l_array = false, l_assoc = false, l_nameref = false;
     for (int i = 1; i < argc; i++) {
         /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
          * flag as a variable NAME produced "local: bad name '-a'" and left
@@ -3103,11 +3152,23 @@ static void cmd_local(int argc, char **argv) {
          * ARRAY from an empty scalar, and `"${x[@]}"` interpolated one
          * empty word where bash interpolates none. The flag is recorded
          * now, exactly as declare records it. */
+        /* `-n` MAKES A NAMEREF, and `local -n` is how almost every real
+         * use of the feature is written:
+         *
+         *     show() { local -n r=$1; echo "${r[2]}"; }
+         *     a=(ga bu zo meu); show a            bash: zo
+         *
+         * declare and typeset took the flag; local did not, so it fell
+         * through to the name check and said "local: bad name '-n'".
+         * The reference was never created, which is why every nameref
+         * case that went through a function read empty. */
         if (argv[i][0] == '-' && argv[i][1] &&
             (argv[i][1] == 'a' || argv[i][1] == 'A' || argv[i][1] == 'i' ||
-             argv[i][1] == 'r' || argv[i][1] == 'x') && !argv[i][2]) {
+             argv[i][1] == 'r' || argv[i][1] == 'x' ||
+             argv[i][1] == 'n') && !argv[i][2]) {
             if (argv[i][1] == 'a') l_array = true;
             if (argv[i][1] == 'A') { l_array = true; l_assoc = true; }
+            if (argv[i][1] == 'n') l_nameref = true;
             continue;
         }
         if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
@@ -3135,6 +3196,11 @@ static void cmd_local(int argc, char **argv) {
             continue;
         }
         if (l_assoc) (void)sh_array_make_assoc(name);
+        /* `local -n r=x` rebinds; see the same note in declare. */
+        if (l_nameref && has_value) {
+            int pre = env_find(name, klen);
+            if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
+        }
         if (has_value) {
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
         } else if (!already) {
@@ -3145,6 +3211,12 @@ static void cmd_local(int argc, char **argv) {
             if (!env_get(name)) (void)env_set(name, "");
             int aidx = env_find(name, strlen(name));
             if (aidx >= 0) g_env_flags[aidx] |= SHVAR_ARRAY;
+        }
+        /* The attribute goes on AFTER the value, so the assignment that
+         * creates the reference is not itself a write THROUGH it. */
+        if (l_nameref) {
+            int nidx = env_find(name, strlen(name));
+            if (nidx >= 0) g_env_flags[nidx] |= SHVAR_NAMEREF;
         }
     }
 }
@@ -3556,6 +3628,21 @@ static void cmd_declare(int argc, char **argv) {
         if (set_assoc && sh_array_make_assoc(name) < 0) {
             shell_set_status(1);
             continue;
+        }
+
+        /* `typeset -n ref=y` REBINDS; it does not write THROUGH.
+         *
+         *     x=XX y=YY; typeset -n ref=x; typeset -n ref=y; echo $ref
+         *     bash: YY
+         *
+         * The attribute goes on after the value precisely so the assignment
+         * that CREATES a reference is not a write through it -- but when the
+         * name is already one, that assignment went to the OLD target and the
+         * rebind never happened: `ref` still pointed at x and x had been
+         * overwritten with the string `y`. */
+        if (set_nameref && has_value) {
+            int pre = env_find(name, klen);
+            if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
         }
 
         if (has_value) {
