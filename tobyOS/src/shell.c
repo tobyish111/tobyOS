@@ -991,6 +991,24 @@ static void shell_getopts_note_external_optind_write(const char *key,
 static char g_tokpfx[SHELL_TOKPFX_MAX][256];
 static int  g_tokpfx_n;
 
+/* A NAMEREF MAY NAME AN ARRAY ELEMENT, not just a variable:
+ *
+ *     a=(zero one two three); typeset -n ref='a[2]'
+ *     echo $ref      ->  two          ref=CHANGED  ->  a[2] is CHANGED
+ *     declare -A m=([k]=v); typeset -n r='m[k]'; r=NEW  ->  m[k] is NEW
+ *
+ * `a[2]` is not a valid NAME, and both walkers treated "not a name" as
+ * "not really a reference" -- the read handed back the literal text `a[2]`
+ * and the write dropped the attribute. Splits the target when it is one,
+ * so the two callers can tell the two cases apart. */
+static bool shell_nameref_element(const char *target, char *name, size_t ncap,
+                                  char *sub, size_t scap) {
+    if (!target || !*target) return false;
+    if (!sh_split_subscript(target, strlen(target), name, ncap, sub, scap))
+        return false;
+    return shell_name_is_valid(name, strlen(name));
+}
+
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
@@ -1029,6 +1047,20 @@ static const char *env_get(const char *key) {
          *
          * `1` and `#` cannot name a variable, so bash leaves the value
          * alone rather than resolving to nothing. */
+        {
+            char enm[128], esub[128];
+            if (shell_nameref_element(target, enm, sizeof enm,
+                                      esub, sizeof esub)) {
+                if (sh_array_is_assoc(enm)) {
+                    const char *v = sh_array_get_key(enm, esub);
+                    return v ? v : "";
+                }
+                long ix = 0;
+                if (!sh_subscript_eval(esub, enm, true, &ix)) return "";
+                const char *v = sh_array_get(enm, ix);
+                return v ? v : "";
+            }
+        }
         if (!shell_name_is_valid(target, strlen(target))) return target;
         klen = strlen(target);
         int nx = env_find(target, klen);
@@ -1060,6 +1092,19 @@ static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
          * on `ref` itself and the reference is gone. Reading one of these is
          * different and stays put (env_get returns the raw value): only a
          * WRITE resolves the question. */
+        {
+            /* An ELEMENT target ends the walk and is handed back whole:
+             * the caller rebuilds `a[2]=value`, which the array
+             * assignment path already understands. */
+            char enm[128], esub[128];
+            if (shell_nameref_element(target, enm, sizeof enm,
+                                      esub, sizeof esub)) {
+                size_t tl = strlen(target);
+                if (tl + 1 > cap) break;
+                memcpy(buf, target, tl + 1);
+                return buf;
+            }
+        }
         if (!shell_name_is_valid(target, strlen(target))) {
             /* ...and only a WRITE resolves it. A read that cleared the
              * attribute would decide the question on the caller's behalf,
