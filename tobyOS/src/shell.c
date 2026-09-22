@@ -4258,10 +4258,134 @@ static bool shell_option_is_set(const char *name) {
     return false;
 }
 
+/* `set` with no arguments prints every variable as you would TYPE it.
+ * Unlike `declare -p`, which double-quotes, this uses SHELL quoting --
+ * single quotes, and only when the value needs them:
+ *
+ *     __p=plain     __s='a b'     __q='it'\\''s'     __e=
+ */
+static void shell_set_quote(const char *v) {
+    const char *p = v ? v : "";
+    /* An EMPTY value prints bare: bash writes `x=`, not `x=''`. */
+    if (!*p) return;
+    bool need = false;
+    for (const char *q = p; *q && !need; q++)
+        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '.' ||
+              *q == '/' || *q == '-' || *q == ':' || *q == '+' ||
+              *q == ',' || *q == '=' || *q == '@' || *q == '%'))
+            need = true;
+    if (!need) { shell_printf("%s", p); return; }
+    shell_printf("'");
+    for (; *p; p++) {
+        if (*p == '\'') shell_printf("'\\\''");   /* close, escaped quote, reopen */
+        else shell_printf("%c", *p);
+    }
+    shell_printf("'");
+}
+
+/* An associative KEY is printed bare when it can be, double-quoted when it
+ * cannot: bash writes `[a]=\"b\"` and `[\"k e y\"]=\"v a l\"`. */
+static void shell_declare_quote_key(const char *k) {
+    const char *p = k ? k : "";
+    bool need = (*p == '\0');
+    for (const char *q = p; *q && !need; q++)
+        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+              (*q >= '0' && *q <= '9') || *q == '_'))
+            need = true;
+    if (!need) { shell_printf("%s", p); return; }
+    shell_declare_quote(p);
+}
+
+/* One `set` line: `name=value`, or the array form for an array. */
+static void shell_set_print_one(const char *name) {
+    struct sh_array *arr = sh_array_find_literal(name);
+    if (arr) {
+        /* ASSOCIATIVE ORDER IS NOT REPRODUCIBLE. bash prints its own
+         * hash order -- `([zebra]=1 [apple]=2 [mango]=3 [banana]=4)`
+         * comes back apple, mango, zebra, banana, from either insertion
+         * order -- and nothing here can imitate that. Sorting by key is
+         * a DETERMINISTIC stand-in, not bash's rule: it agrees on small
+         * key sets and will differ on larger ones. Stated rather than
+         * hidden, because the alternative is insertion order, which
+         * agrees with bash even less often. */
+        int *ord = (int *)kmalloc((size_t)(arr->n > 0 ? arr->n : 1) * sizeof(int));
+        if (!ord) return;
+        for (int k = 0; k < arr->n; k++) ord[k] = k;
+        if (arr->assoc) {
+            for (int a = 1; a < arr->n; a++) {
+                int v = ord[a], b = a - 1;
+                const char *vk = arr->e[v].key ? arr->e[v].key : "";
+                while (b >= 0) {
+                    const char *bk = arr->e[ord[b]].key ? arr->e[ord[b]].key : "";
+                    if (strcmp(bk, vk) <= 0) break;
+                    ord[b + 1] = ord[b];
+                    b--;
+                }
+                ord[b + 1] = v;
+            }
+        }
+        shell_printf("%s=(", name);
+        for (int oi = 0; oi < arr->n; oi++) {
+            int k = ord[oi];
+            if (arr->assoc) {
+                shell_printf("[");
+                shell_declare_quote_key(arr->e[k].key ? arr->e[k].key : "");
+                shell_printf("]=");
+            } else {
+                shell_printf("[%ld]=", arr->e[k].idx);
+            }
+            shell_declare_quote(arr->e[k].val);
+            if (arr->assoc)           shell_printf(" ");
+            else if (oi + 1 < arr->n) shell_printf(" ");
+        }
+        shell_printf(")\n");
+        kfree(ord);
+        return;
+    }
+    size_t klen = strlen(name);
+    int idx = env_find(name, klen);
+    shell_printf("%s=", name);
+    shell_set_quote(idx >= 0 ? g_env[idx] + klen + 1 : "");
+    shell_printf("\n");
+}
+
 static void cmd_set(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        for (int i = 0; i < g_envc; i++) shell_printf("%s\n", g_env[i]);
+        /* SORTED, AND ARRAYS INCLUDED. It printed the raw g_env blobs in
+         * table order, so the output was unsorted and every array was
+         * missing -- an array does not live in g_env at all. bash prints
+         * one line per variable in name order, arrays in literal form. */
+        /* STATIC: PROC_KSTACK_SZ is 32 KiB and this array is 4.6 KiB of
+         * it. `set` with no arguments cannot re-enter itself, so one copy
+         * is enough -- and this file has already lost a corpus case to a
+         * large frame (the shell_pipeline that moved off the stack). */
+        static const char *names[ENV_MAX + SH_ARRAY_MAX];
+        int n = 0;
+        for (int i = 0; i < g_envc && n < (int)(sizeof names/sizeof names[0]); i++) {
+            size_t kl = env_key_len(g_env[i]);
+            static char keybuf[ENV_MAX][64];
+            if (kl == 0 || kl + 1 > sizeof keybuf[0]) continue;
+            memcpy(keybuf[n], g_env[i], kl);
+            keybuf[n][kl] = '\0';
+            names[n] = keybuf[n];
+            n++;
+        }
+        for (int i = 0; i < g_narrays && n < (int)(sizeof names/sizeof names[0]); i++) {
+            if (!g_arrays[i].name) continue;
+            bool dup = false;
+            for (int k = 0; k < n; k++)
+                if (strcmp(names[k], g_arrays[i].name) == 0) { dup = true; break; }
+            if (!dup) names[n++] = g_arrays[i].name;
+        }
+        for (int i = 1; i < n; i++) {                 /* insertion sort */
+            const char *v = names[i];
+            int j = i - 1;
+            while (j >= 0 && strcmp(names[j], v) > 0) { names[j + 1] = names[j]; j--; }
+            names[j + 1] = v;
+        }
+        for (int i = 0; i < n; i++) shell_set_print_one(names[i]);
         return;
     }
 
