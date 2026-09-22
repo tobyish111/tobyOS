@@ -2864,6 +2864,35 @@ static bool sh_subscript_eval(const char *sub, const char *name,
     const char *src = sub;
     if (shell_expand_literal_quotes(sub, expanded, sizeof expanded) == 0)
         src = expanded;
+    /* A DOUBLE-QUOTED SUBSCRIPT IS STILL ARITHMETIC. bash removes the
+     * quotes and evaluates what is left, so `${a["k1"]}` reads the
+     * variable k1 exactly as `${a[k1]}` does and `${a["1"]}` is index 1.
+     * Rejecting the quotes made all three "bad substitution".
+     *
+     * ONLY `"` COMES OFF. bash does NOT remove a single quote here --
+     * `${a['1']}` is an arithmetic syntax error there, error token
+     * `'1'` -- so a `'` is left in place to fail the parse below, which
+     * produces the same empty answer by the same route.
+     *
+     * The strip writes into `expanded` reading from `src`; the write
+     * index only ever trails the read index, so the two may alias. */
+    {
+        /* AN UNBALANCED QUOTE IS NOT QUOTE REMOVAL. `${a[1"]}` is a "bad
+         * substitution" in bash -- the corpus tests exactly that -- so a
+         * lone `"` has to stay and fail the parse below. Dropping it
+         * unconditionally turned that case into a successful read of
+         * a[1], which is a wrong ANSWER rather than a missing one. */
+        bool quoted = false, open = false;
+        for (const char *q = src; *q; q++)
+            if (*q == '"') { quoted = true; open = !open; }
+        if (quoted && !open) {
+            size_t o = 0;
+            for (const char *q = src; *q && o + 1 < sizeof expanded; q++)
+                if (*q != '"') expanded[o++] = *q;
+            expanded[o] = '\0';
+            src = expanded;
+        }
+    }
     struct shell_arith a = { .p = src, .ok = true };
     long v = shell_arith_comma(&a);
     shell_arith_skip(&a);
