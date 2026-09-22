@@ -435,6 +435,13 @@ static bool g_opt_nolog;
  * does not keep a hash table, so the flag's one visible effect is the one
  * bash shows a script: `hash -r` fails while hashing is off. */
 static bool g_opt_hashall = true;
+/* `set -o emacs` / `set -o vi`: the line-editing mode. tsh has one line
+ * editor and no vi bindings, so NEITHER changes how anything reads -- but
+ * both are real state that a script can set and read back, and bash makes
+ * them MUTUALLY EXCLUSIVE: turning one on turns the other off. Both start
+ * off, which is what bash gives a non-interactive shell. */
+static bool g_opt_emacs;
+static bool g_opt_vi;
 static bool g_opt_expand_aliases;
 /* True for a terminal session, false while running a script or `-c`. The
  * kernel shell is always a terminal session, so this defaults true and only
@@ -4180,6 +4187,10 @@ static void shell_print_options(bool reinput) {
         { "pipefail",  g_opt_pipefail },  { "posix",     g_opt_posix },
         { "verbose",   g_opt_verbose },
         { "xtrace",    g_opt_xtrace },
+        /* The line-editing modes must be LISTED even though nothing here
+         * reads them: a name missing from the listing is not the same
+         * answer as a name that is off. */
+        { "emacs",     g_opt_emacs },    { "vi",        g_opt_vi },
     };
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
         if (reinput)
@@ -4205,11 +4216,8 @@ static bool shell_opt_state_by_name(const char *name, bool *out) {
     };
     for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++)
         if (strcmp(name, t[i].name) == 0) { *out = t[i].on; return true; }
-    /* The line-editing modes exist and are never on; see the setter. */
-    if (strcmp(name, "vi") == 0 || strcmp(name, "emacs") == 0) {
-        *out = false;
-        return true;
-    }
+    if (strcmp(name, "emacs") == 0) { *out = g_opt_emacs; return true; }
+    if (strcmp(name, "vi")    == 0) { *out = g_opt_vi;    return true; }
     return false;
 }
 
@@ -4228,12 +4236,20 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         if (strcmp(name, map[i].name) == 0)
             return shell_set_opt(map[i].flag, on);
     }
-    /* The line-editing modes. tsh has one line editor and no vi bindings, so
-     * neither name changes anything -- but `set -o emacs` is what an
-     * interactive rc file says, and rejecting it with status 1 stopped
-     * scripts that had nothing to do with editing. Accepting a no-op is the
-     * honest answer: the option exists, it is simply not observable here. */
-    if (strcmp(name, "vi") == 0 || strcmp(name, "emacs") == 0) return true;
+    /* The line-editing modes. Nothing in tsh reads them, but they are
+     * state, not a no-op: a script sets one and reads it back. Turning
+     * one ON turns the other OFF -- bash allows only one mode at a time.
+     * Turning one OFF leaves the other alone; +o emacs does not mean vi. */
+    if (strcmp(name, "emacs") == 0) {
+        g_opt_emacs = on;
+        if (on) g_opt_vi = false;
+        return true;
+    }
+    if (strcmp(name, "vi") == 0) {
+        g_opt_vi = on;
+        if (on) g_opt_emacs = false;
+        return true;
+    }
     return false;
 }
 
@@ -4255,6 +4271,8 @@ static bool shell_option_is_set(const char *name) {
     if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
     if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
     if (strcmp(name, "hashall")   == 0) return g_opt_hashall;
+    if (strcmp(name, "emacs")     == 0) return g_opt_emacs;
+    if (strcmp(name, "vi")        == 0) return g_opt_vi;
     return false;
 }
 
@@ -9454,6 +9472,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
 struct shell_opt_frame {
     bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
     bool monitor, ignoreeof, nolog, hashall, posix;
+    bool emacs, vi;
 };
 
 static void shell_save_opts(struct shell_opt_frame *f) {
@@ -9471,6 +9490,8 @@ static void shell_save_opts(struct shell_opt_frame *f) {
     f->nolog     = g_opt_nolog;
     f->hashall   = g_opt_hashall;
     f->posix     = g_opt_posix;
+    f->emacs     = g_opt_emacs;
+    f->vi        = g_opt_vi;
 }
 
 static void shell_restore_opts(const struct shell_opt_frame *f) {
@@ -9488,6 +9509,8 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_nolog     = f->nolog;
     g_opt_hashall   = f->hashall;
     g_opt_posix     = f->posix;
+    g_opt_emacs     = f->emacs;
+    g_opt_vi        = f->vi;
 }
 
 static void shell_reset_opts(void) {
@@ -9496,6 +9519,7 @@ static void shell_reset_opts(void) {
     g_opt_notify = g_opt_noexec = g_opt_allexport = false;
     g_opt_monitor = g_opt_ignoreeof = g_opt_nolog = false;
     g_opt_hashall = true;               /* bash's default state is ON */
+    g_opt_emacs = g_opt_vi = false;
 }
 
 static void cmd_sh(int argc, char **argv) {
