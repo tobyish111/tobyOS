@@ -17907,6 +17907,61 @@ static bool shell_has_brace(const char *src) {
     return false;
 }
 
+/* The ASSIGNMENT BUILTINS. bash parses what follows one of these as
+ * assignments rather than as ordinary words, which is the whole reason
+ * `declare -a d=(v{0..2})` expands its braces: without this, `d=(v{0..2})`
+ * is just an argument, the plain word path splits it around the brace and
+ * `declare` receives three separate assignments `d=(v0) d=(v1) d=(v2)` --
+ * last one wins, so the array came out holding one element. */
+static bool shell_is_assign_builtin(const char *w, size_t n) {
+    static const char *names[] = { "declare", "typeset", "local",
+                                   "export", "readonly" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t l = strlen(names[i]);
+        if (n == l && memcmp(w, names[i], l) == 0) return true;
+    }
+    return false;
+}
+
+/* An element word that is ITSELF an assignment -- `[k1]=v{1,2}` -- keeps
+ * its braces, by the same rule that makes the scalar `x={a,b}` keep them.
+ * A plain element word next to it, `v{1,2}`, expands. One array literal can
+ * hold both forms, so the question is asked per element and not per array. */
+static bool shell_arr_elem_is_assign(const char *w, size_t n) {
+    if (n == 0 || w[0] != '[') return false;
+    int depth = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (w[i] == '[') depth++;
+        else if (w[i] == ']' && --depth == 0)
+            return (i + 1 < n && w[i + 1] == '=') ||
+                   (i + 2 < n && w[i + 1] == '+' && w[i + 2] == '=');
+    }
+    return false;
+}
+
+/* Where an array literal ends. Scans from just inside the `(` and returns
+ * the offset of the `)` that brings the depth back to zero, or `len` when
+ * the literal runs on into the next word -- `*depth` is left holding what
+ * is still open. Quoted and escaped parens do not count, and a `$( )` in
+ * the literal balances itself, so plain depth counting is enough. */
+static size_t shell_arr_literal_close(const char *s, size_t len, int *depth) {
+    bool sq = false, dq = false;
+    for (size_t i = 0; i < len; i++) {
+        if (sq) { if (s[i] == '\'') sq = false; continue; }
+        if (dq) {
+            if (s[i] == '\\' && i + 1 < len) { i++; continue; }
+            if (s[i] == '"') dq = false;
+            continue;
+        }
+        if (s[i] == '\'') { sq = true; continue; }
+        if (s[i] == '"')  { dq = true; continue; }
+        if (s[i] == '\\' && i + 1 < len) { i++; continue; }
+        if (s[i] == '(') (*depth)++;
+        else if (s[i] == ')' && --(*depth) == 0) return i;
+    }
+    return len;
+}
+
 /* Rewrite a whole line, expanding the braces in each word. Words are split on
  * unquoted blanks and on the operator characters, so `echo a;echo {x,y}`
  * keeps its `;` and `> {a,b}` keeps its redirection. */
@@ -17923,6 +17978,14 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
      * depends on POSITION, not on the word. Expanding both turned `x={a,b}`
      * into `x=a x=b`: an assignment followed by a command called `x=b`. */
     bool cmd_pos = true;
+    /* How many array-literal parens are still open. A literal may run over
+     * several words -- `a=(v{0..2} w{3,4})` -- and every word inside it is a
+     * VALUE word: brace-expanded, and never mistaken for a command name. */
+    int arr_depth = 0;
+    /* Set once the command name turns out to be an assignment builtin, and
+     * held for the REST of that command: `declare`'s options sit between the
+     * name and the assignments and must not clear it. */
+    bool assign_cmd = false;
     out[0] = '\0';
     while (*p) {
         if (*p == ' ' || *p == '\t' || *p == '\n') {
@@ -17931,7 +17994,14 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
         }
         if (*p == ';' || *p == '|' || *p == '&' || *p == '<' || *p == '>' ||
             *p == '(' || *p == ')') {
+            /* A standalone paren closes the literal `a=( ... )` opened,
+             * because the `)` there is a word of its own. */
+            if (arr_depth > 0) {
+                if (*p == '(') arr_depth++;
+                else if (*p == ')') arr_depth--;
+            }
             cmd_pos = true;
+            assign_cmd = false;
             if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
             continue;
         }
@@ -17958,26 +18028,92 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
         /* In command position, a NAME= word is an assignment PREFIX, and one
          * assignment may follow another. Anything else ends the prefix. */
         bool is_assign = false;
+        bool assign_prefix = false;     /* a real prefix, not declare's arg */
+        size_t vstart = 0;              /* the first byte of the VALUE */
         bool was_cmd_pos = cmd_pos;
-        if (cmd_pos) {
+        if (arr_depth > 0) {
+            /* A word inside an array literal is never an assignment and
+             * never a command name, so neither test applies to it. */
+        } else if (cmd_pos || assign_cmd) {
             size_t k = 0;
             while (k < wlen && ((w[k] >= 'A' && w[k] <= 'Z') ||
                                 (w[k] >= 'a' && w[k] <= 'z') ||
                                 (w[k] >= '0' && w[k] <= '9') || w[k] == '_'))
                 k++;
-            is_assign = (k > 0 && k < wlen && w[k] == '=' &&
-                         !(w[0] >= '0' && w[0] <= '9'));
-            if (!is_assign) cmd_pos = false;
+            if (k > 0 && !(w[0] >= '0' && w[0] <= '9')) {
+                if (k < wlen && w[k] == '=') {
+                    is_assign = true;  vstart = k + 1;
+                } else if (k + 1 < wlen && w[k] == '+' && w[k + 1] == '=') {
+                    /* `a+=(...)` IS an assignment. It was not recognised as
+                     * one, so its words fell through to the command-name
+                     * path -- which is how `a=(v{0..2} w{3,4})` ended up
+                     * trying to run `/bin/w4)`. */
+                    is_assign = true;  vstart = k + 2;
+                }
+            }
+            assign_prefix = is_assign && cmd_pos;
+            if (!is_assign && cmd_pos) {
+                /* This word is the COMMAND NAME. Decide once, here, whether
+                 * its arguments are assignments; a later option word such as
+                 * `-a` must not be allowed to unset that. */
+                cmd_pos = false;
+                assign_cmd = shell_is_assign_builtin(w, wlen);
+            }
         }
-        bool cmd_pos_here = was_cmd_pos && !is_assign;
+        bool cmd_pos_here = (arr_depth == 0) && was_cmd_pos && !is_assign;
         /* A word with nothing to expand is copied through untouched, which
          * keeps the emit function's space-separation out of the common
          * path -- it must not insert one in the middle of `a;b`. */
         char tmp[SHELL_PARSE_BUF_MAX];
         size_t tp = 0;
-        if (is_assign) {
+        if (is_assign && vstart < wlen && w[vstart] == '(') {
+            /* AN ARRAY LITERAL IS NOT A SCALAR VALUE. The rule above -- an
+             * assignment's value is not brace-expanded -- is about the
+             * scalar `x={a,b}`. The words inside `a=( ... )` are an ordinary
+             * word LIST and bash expands each one, so `a=(v{0..4})` has five
+             * elements while `x={a,b}` has one. The two words look alike:
+             * NAME= followed by something. Only the `(` tells them apart.
+             *
+             * `name=(` is copied through, the inside is expanded, and the
+             * closing `)` with anything after it is copied again. */
+            for (size_t i = 0; i <= vstart && tp + 1 < sizeof tmp; i++)
+                tmp[tp++] = w[i];
+            int depth = 1;
+            size_t inner = vstart + 1;
+            size_t close = shell_arr_literal_close(w + inner, wlen - inner,
+                                                   &depth);
+            if (shell_arr_elem_is_assign(w + inner, close)) {
+                for (size_t i = 0; i < close && tp + 1 < sizeof tmp; i++)
+                    tmp[tp++] = w[inner + i];
+            } else if (shell_brace_word(w + inner, close, tmp, &tp,
+                                        sizeof tmp, 0) < 0) {
+                return -1;
+            }
+            for (size_t i = inner + close; i < wlen && tp + 1 < sizeof tmp; i++)
+                tmp[tp++] = w[i];
+            arr_depth = depth;          /* zero when it closed in this word */
+        } else if (is_assign && assign_prefix) {
+            /* A SCALAR assignment PREFIX keeps its braces: `x={a,b}` is one
+             * variable holding `{a,b}`. An assignment builtin's ARGUMENT is
+             * the opposite -- `declare x={a,b}` brace-expands into the two
+             * words `x=a` and `x=b`, declare runs both, and `b` is what
+             * survives. Same bytes, opposite answers, decided by position;
+             * only the array-literal `(` above is treated alike in both. */
             for (size_t i = 0; i < wlen && tp + 1 < sizeof tmp; i++)
                 tmp[tp++] = w[i];
+        } else if (arr_depth > 0) {
+            /* A continuation word of a literal opened in an earlier word. */
+            int depth = arr_depth;
+            size_t close = shell_arr_literal_close(w, wlen, &depth);
+            if (shell_arr_elem_is_assign(w, close)) {
+                for (size_t i = 0; i < close && tp + 1 < sizeof tmp; i++)
+                    tmp[tp++] = w[i];
+            } else if (shell_brace_word(w, close, tmp, &tp, sizeof tmp, 0) < 0) {
+                return -1;
+            }
+            for (size_t i = close; i < wlen && tp + 1 < sizeof tmp; i++)
+                tmp[tp++] = w[i];
+            arr_depth = depth;
         } else if (shell_brace_word(w, wlen, tmp, &tp, sizeof tmp, 0) < 0) {
             return -1;
         } else if (cmd_pos_here &&
