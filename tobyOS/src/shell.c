@@ -1252,6 +1252,27 @@ static int sh_array_assign_literal(const char *name, const char *paren,
     long next = 0;
     if (append && a) next = sh_array_max_idx(a) + 1;
     else if (!append && a) sh_array_unset(name);      /* a=(...) REPLACES */
+    /* AN ARRAY LITERAL REPLACES A SCALAR OF THE SAME NAME.
+     *
+     *     w=W; w=(p q); echo $w                        bash: p
+     *     z=Z; typeset -n r=z; r=(p q); echo $z        bash: p
+     *
+     * env_get() checks the scalar table first -- a scalar of the same name
+     * wins, which is right for reading an array's element 0 and wrong once
+     * a literal has replaced it. The old scalar stayed and shadowed the new
+     * array forever.
+     *
+     * Found through the nameref work, but it was never about namerefs: the
+     * probe carried the same shape with no reference in it as a control,
+     * and that case diverged too. A fix aimed only at the reference path
+     * would have left the plain one wrong and looked complete. */
+    if (!append) {
+        char tgt[128];
+        const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+        if (!real || !*real) real = name;
+        int si = env_find(real, strlen(real));
+        if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
+    }
     if (!sh_array_create(name)) return -1;
     char elem[512];
     char pend[256];            /* an associative literal's dangling KEY */
@@ -2690,6 +2711,19 @@ static struct sh_array *sh_array_create(const char *name) {
     struct sh_array *a = sh_array_find(name);
     if (a) return a;
     if (g_narrays >= SH_ARRAY_MAX) return 0;
+    /* CREATED UNDER THE TARGET'S NAME, not the reference's.
+     *
+     *     z=Z; typeset -n r=z; r=(p q)
+     *     bash: ${r[@]} is `p q` and $z is `p`
+     *
+     * The lookup above already follows the reference, so finding an
+     * existing array worked; CREATING one did not, and put the array
+     * under `r` where nothing would ever look for it again -- the read
+     * back through `r` resolved to `z`, found no array, and answered
+     * empty. */
+    char tgt[128];
+    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    if (real && *real) name = real;
     a = &g_arrays[g_narrays];
     size_t n = strlen(name) + 1;
     a->name = (char *)kmalloc(n);
@@ -3991,6 +4025,26 @@ static void cmd_unset(int argc, char **argv) {
                 }
             } else if (sh_array_find(argv[i])) {
                 sh_array_unset(argv[i]);
+                continue;
+            }
+        }
+        /* `unset ref` ON A NAMEREF REMOVES THE TARGET, not the
+         * reference:
+         *
+         *     y=Y; typeset -n r=y; unset r; echo "[$y]"    bash: []
+         *
+         * `unset -n r` is the spelling that removes the reference
+         * itself. tsh dropped `r` and left `y` standing, so the name
+         * the caller meant to clear survived. */
+        {
+            char tgt[128];
+            const char *real = env_deref_name_ex(argv[i], tgt,
+                                                 sizeof tgt, false);
+            if (real && *real && real != argv[i] &&
+                strcmp(real, argv[i]) != 0) {
+                if (sh_array_find_literal(real)) sh_array_unset_literal(real);
+                (void)env_unset(real);
+                (void)env_unset(argv[i]);
                 continue;
             }
         }
