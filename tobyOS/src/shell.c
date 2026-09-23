@@ -3737,6 +3737,25 @@ static bool shell_declare_print(const char *name) {
     return true;
 }
 
+/* One function definition, in bash's frame.
+ *
+ * NOT bash's output. bash re-renders the PARSED body -- it reindents four
+ * spaces per level, puts each statement on its own line and rewrites a
+ * compound, so `a4() { for i in 1 2; do echo $i; done; }` comes back as six
+ * lines. tsh keeps the body as TEXT, so there is no tree to walk and no way
+ * to reproduce that without a pretty-printer for the whole grammar.
+ *
+ * What is printed here is the stored body inside bash's header, which is
+ * valid shell and re-reads as the same function. The header lines carry
+ * bash's trailing spaces so at least those match byte for byte. Stated
+ * rather than hidden: a case that prints a body and compares it to bash
+ * will still differ, and none of the ones this change closes does. */
+static void shell_declare_print_function(const struct shell_function *fn) {
+    if (!fn || !fn->name) return;
+    shell_printf("%s () \n", fn->name);
+    shell_printf("%s\n", fn->body ? fn->body : "{ :; }");
+}
+
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
@@ -3744,6 +3763,8 @@ static void cmd_declare(int argc, char **argv) {
     bool set_array = false;
     bool set_assoc = false;
     bool print_mode = false;
+    bool func_mode = false;    /* -f or -F: this is about FUNCTIONS */
+    bool func_names = false;   /* -F: names only, no bodies */
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -3768,8 +3789,13 @@ static void cmd_declare(int argc, char **argv) {
              * They shared a case while neither did anything. */
             case 'A': if (on) { set_array = true; set_assoc = true; } break;
             case 'p': if (on) print_mode = true; break;
+            /* `-f` and `-F` were PARSED AND THEN DROPPED -- they sat in the
+             * ignore list with -i/-u/-l, so `declare -F` fell through to the
+             * variable listing and printed the environment. */
+            case 'f': if (on) func_mode = true; break;
+            case 'F': if (on) { func_mode = true; func_names = true; } break;
             case 'i': case 'I': case 'u': case 'l':
-            case 'F': case 'f': case 'g': case 't': break;
+            case 'g': case 't': break;
             default:  bad = *f; break;
             }
         }
@@ -3787,6 +3813,54 @@ static void cmd_declare(int argc, char **argv) {
             return;
         }
     }
+    /* `declare -f` / `-F` ask about FUNCTIONS, so they come before every
+     * variable path below.
+     *
+     * The two spellings differ in a way that is easy to miss, and both were
+     * measured against bash 5.2 rather than assumed:
+     *
+     *     declare -F          declare -f add      (the REINPUT form)
+     *     declare -F add      add                 (the BARE name)
+     *     declare -F nosuch   nothing, status 1
+     *
+     * Status is 0 only when EVERY name given is a function; a variable of
+     * that name does not count, which is what `func2=x; declare -f func2`
+     * turns on. */
+    if (func_mode) {
+        if (i >= argc) {
+            /* Sorted by name. bash's order is plain byte order -- `__ec`
+             * before `_ab` before `add` -- not definition order. */
+            int idx[SHELL_FUNC_MAX], n = 0;
+            for (int k = 0; k < SHELL_FUNC_MAX; k++)
+                if (g_functions[k].name) idx[n++] = k;
+            for (int a = 1; a < n; a++) {
+                int v = idx[a], b = a - 1;
+                while (b >= 0 &&
+                       strcmp(g_functions[idx[b]].name,
+                              g_functions[v].name) > 0) {
+                    idx[b + 1] = idx[b];
+                    b--;
+                }
+                idx[b + 1] = v;
+            }
+            for (int a = 0; a < n; a++) {
+                const struct shell_function *fn = &g_functions[idx[a]];
+                if (func_names) shell_printf("declare -f %s\n", fn->name);
+                else            shell_declare_print_function(fn);
+            }
+            return;
+        }
+        bool missing = false;
+        for (; i < argc; i++) {
+            const struct shell_function *fn = shell_function_lookup(argv[i]);
+            if (!fn) { missing = true; continue; }
+            if (func_names) shell_printf("%s\n", fn->name);
+            else            shell_declare_print_function(fn);
+        }
+        if (missing) shell_set_status(1);
+        return;
+    }
+
     if (i >= argc) {
         /* No names: list the variable table, as `declare` with only flags
          * does. It used to print the raw `key=value` blob with an unquoted
@@ -4234,7 +4308,24 @@ static void cmd_unset(int argc, char **argv) {
                 continue;
             }
         }
-        if (env_unset(argv[i]) < 0) shell_set_status(1);
+        /* `unset NAME` WITH NO -f/-v REMOVES THE FUNCTION when there is no
+         * variable of that name. tsh stopped at the variable, so
+         *
+         *     foo() { echo bar; } ; unset foo ; foo
+         *
+         * still ran the function where bash reports 127. A variable wins
+         * when both exist, so the function only goes when there was none.
+         *
+         * THE TEST HAS TO COME FIRST. env_unset() returns 0 whether or not
+         * the name was set -- its -1 means READONLY -- so asking it whether
+         * anything was removed does not work, and the obvious
+         * `if (env_unset(...) < 0)` version of this silently never fired. */
+        {
+            bool had_var = (env_find(argv[i], strlen(argv[i])) >= 0);
+            if (env_unset(argv[i]) < 0) shell_set_status(1);
+            else if (!had_var && shell_function_find(argv[i]) >= 0)
+                shell_function_unset(argv[i]);
+        }
     }
 }
 
