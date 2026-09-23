@@ -3703,6 +3703,31 @@ static void shell_declare_quote(const char *v) {
     shell_printf("\"");
 }
 
+/* Does NAME carry every attribute the option letters asked for?
+ *
+ * `declare -pr` lists the READONLY variables, not all of them with the
+ * readonly ones formatted differently. tsh applied no filter at all, so
+ * `declare -pn` printed the whole table and `declare -pa` printed it
+ * without the arrays -- two different wrong answers from one missing
+ * test. Several letters AND together, which is bash's rule.
+ *
+ * `-A` sets the caller's array flag too, so the INDEXED test has to
+ * exclude the associative case or `-pA` would demand both. */
+static bool shell_declare_filter_ok(const char *name, bool want_array,
+                                    bool want_assoc, bool want_nameref,
+                                    bool want_readonly, bool want_export) {
+    size_t klen = strlen(name);
+    int idx = env_find(name, klen);
+    struct sh_array *arr = sh_array_find_literal(name);
+    unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
+    if (want_assoc && !(arr && arr->assoc)) return false;
+    if (want_array && !want_assoc && !(arr && !arr->assoc)) return false;
+    if (want_nameref && !(f & SHVAR_NAMEREF)) return false;
+    if (want_readonly && shell_readonly_find(name, klen) < 0) return false;
+    if (want_export && !(f & SHVAR_EXPORTED)) return false;
+    return true;
+}
+
 /* Print one `declare` line. Returns false when the name is not set at all,
  * which is the caller's cue to report it and set status 1. */
 static bool shell_declare_print(const char *name) {
@@ -3875,13 +3900,32 @@ static void cmd_declare(int argc, char **argv) {
         /* No names: list the variable table, as `declare` with only flags
          * does. It used to print the raw `key=value` blob with an unquoted
          * value and a hardcoded `--`, which is not what any reader of this
-         * output parses; it goes through the same formatter now. */
+         * output parses; it goes through the same formatter now.
+         *
+         * AN ARRAY IS NOT IN g_env. It lives in g_arrays, so walking the
+         * environment alone left every array out of the listing -- which is
+         * why `declare -pa` printed nothing at all rather than printing too
+         * much. Same omission the bare `set` listing had. */
         for (int k = 0; k < g_envc; k++) {
             size_t kl = env_key_len(g_env[k]);
             char nm[128];
             if (kl == 0 || kl + 1 > sizeof nm) continue;
             memcpy(nm, g_env[k], kl);
             nm[kl] = '\0';
+            if (!shell_declare_filter_ok(nm, set_array, set_assoc,
+                                         set_nameref, set_readonly,
+                                         set_export))
+                continue;
+            (void)shell_declare_print(nm);
+        }
+        for (int k = 0; k < g_narrays; k++) {
+            const char *nm = g_arrays[k].name;
+            if (!nm) continue;
+            if (env_find(nm, strlen(nm)) >= 0) continue;   /* already done */
+            if (!shell_declare_filter_ok(nm, set_array, set_assoc,
+                                         set_nameref, set_readonly,
+                                         set_export))
+                continue;
             (void)shell_declare_print(nm);
         }
         return;
