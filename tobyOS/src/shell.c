@@ -589,6 +589,9 @@ static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
  * Defined beside cmd_printf, used here as well -- see shell_ansi_render. */
 static bool shell_q_needs_ansi(const char *s);
 static int  shell_ansi_render(const char *s, bool emit);
+/* Used by `local` and `declare` above the points where they are defined. */
+static bool shell_declare_print(const char *name);
+static void shell_print_vars_set_format(void);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
 static void shell_putc_raw(char c);
@@ -3313,6 +3316,45 @@ static void cmd_local(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    /* `local` OR `local -p` WITH NO NAMES LISTS THIS FUNCTION'S LOCALS.
+     * tsh printed nothing. Measured against bash 5.2:
+     *
+     *   - only the CURRENT frame: a function called from one that has
+     *     locals does not see its caller's;
+     *   - SORTED by name, not declaration order -- `local zb za zc` lists
+     *     za, zb, zc;
+     *   - in `declare -p` form, `$'...'` and arrays included;
+     *   - a local with no value prints bare: `declare -- zc`.
+     *
+     * Only for no arguments or `-p` alone. What bash does for `local -a`
+     * with no names was not measured, so that keeps its old behaviour. */
+    {
+        bool listing = true;
+        for (int i = 1; i < argc; i++)
+            if (strcmp(argv[i], "-p") != 0) { listing = false; break; }
+        if (listing) {
+            static const char *ln[SHELL_LOCAL_MAX];   /* see cmd_set's note */
+            int n = 0;
+            for (int i = 0; i < g_localc; i++) {
+                if (g_locals[i].depth != g_script_depth || !g_locals[i].name)
+                    continue;
+                bool dup = false;
+                for (int k = 0; k < n; k++)
+                    if (strcmp(ln[k], g_locals[i].name) == 0) { dup = true; break; }
+                if (!dup) ln[n++] = g_locals[i].name;
+            }
+            for (int a = 1; a < n; a++) {
+                const char *v = ln[a];
+                int b = a - 1;
+                while (b >= 0 && strcmp(ln[b], v) > 0) { ln[b + 1] = ln[b]; b--; }
+                ln[b + 1] = v;
+            }
+            for (int a = 0; a < n; a++)
+                if (!shell_declare_print(ln[a]))
+                    shell_printf("declare -- %s\n", ln[a]);
+            return;
+        }
+    }
     bool l_array = false, l_assoc = false, l_nameref = false;
     for (int i = 1; i < argc; i++) {
         /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
@@ -3798,6 +3840,7 @@ static void cmd_declare(int argc, char **argv) {
     bool set_array = false;
     bool set_assoc = false;
     bool print_mode = false;
+    bool any_opt = false;      /* any option letter at all was given */
     bool func_mode = false;    /* -f or -F: this is about FUNCTIONS */
     bool func_names = false;   /* -F: names only, no bodies */
     int i = 1;
@@ -3811,6 +3854,7 @@ static void cmd_declare(int argc, char **argv) {
             i++;
             break;
         }
+        any_opt = true;
         bool on = (sign == '-');
         char bad = '\0';
         for (const char *f = argv[i] + 1; *f && !bad; f++) {
@@ -3893,6 +3937,16 @@ static void cmd_declare(int argc, char **argv) {
             else            shell_declare_print_function(fn);
         }
         if (missing) shell_set_status(1);
+        return;
+    }
+
+    /* BARE `declare` IS NOT `declare -p`. With no option letters and no
+     * names bash prints the `set` listing -- `test_var1=111`, not
+     * `declare -- test_var1="111"` -- and it is only a letter such as -p,
+     * -r or -x that switches to the reinput form below. tsh sent both
+     * spellings down the same path. */
+    if (i >= argc && !any_opt) {
+        shell_print_vars_set_format();
         return;
     }
 
@@ -4601,9 +4655,17 @@ static void shell_set_print_one(const char *name) {
     shell_printf("\n");
 }
 
-static void cmd_set(int argc, char **argv) {
-    shell_set_status(0);
-    if (argc <= 1) {
+/* Every variable, sorted by name, in `set` format -- `name=value` with
+ * shell quoting, arrays in literal form. Shared by bare `set` and bare
+ * `declare`, which bash prints identically: both show `zv1=111` and
+ * `zsp='a b'`, and a nameref as its raw value, `zv4=zv1`.
+ *
+ * Neither prints FUNCTIONS, although bash's do. tsh stores a function body
+ * as text and cannot reproduce bash's re-rendering of it (see
+ * shell_declare_print_function), so the two listings stay variables-only
+ * rather than append something that looks like bash's output and is not. */
+static void shell_print_vars_set_format(void) {
+    {
         /* SORTED, AND ARRAYS INCLUDED. It printed the raw g_env blobs in
          * table order, so the output was unsorted and every array was
          * missing -- an array does not live in g_env at all. bash prints
@@ -4637,6 +4699,13 @@ static void cmd_set(int argc, char **argv) {
             names[j + 1] = v;
         }
         for (int i = 0; i < n; i++) shell_set_print_one(names[i]);
+    }
+}
+
+static void cmd_set(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 1) {
+        shell_print_vars_set_format();
         return;
     }
 
