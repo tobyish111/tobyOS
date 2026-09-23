@@ -1350,11 +1350,17 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         while (*p && n + 1 < sizeof elem) {
             if (*p == '\'' || *p == '"') {
                 char q = *p;
+                /* `$'...'` honours `\'` where a plain `'...'` does not. The
+                 * `$` has already been copied into elem, so the only way to
+                 * tell the two apart here is to look back one byte. */
+                bool ansi = (q == '\'' && n > 0 && elem[n - 1] == '$');
                 quoted = true;
                 elem[n++] = *p++;
                 while (*p && *p != q && n + 1 < sizeof elem) {
-                    /* keep a backslash pair together inside double quotes */
-                    if (q == '"' && *p == '\\' && p[1] && n + 2 < sizeof elem)
+                    /* keep a backslash pair together inside double quotes,
+                     * and inside an ANSI-C span */
+                    if ((q == '"' || ansi) && *p == '\\' && p[1] &&
+                        n + 2 < sizeof elem)
                         elem[n++] = *p++;
                     elem[n++] = *p++;
                 }
@@ -8056,15 +8062,24 @@ static int shell_collect_heredoc(char **pp, const char *delim,
  * `#` only starts a comment at the start of a word, so `a#b`, `${#x}` and
  * `$#` are untouched. */
 static void shell_strip_comment(char *s) {
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, sq_ansi = false;
+    /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there for what went wrong. */
     for (char *p = s; *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {
+            in_sq = true; sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         if (*p == '#' && (p == s || is_space(p[-1]) || p[-1] == ';' ||
@@ -8084,14 +8099,27 @@ static void shell_strip_comment(char *s) {
  * only ever shortens the string, so it is safe to do in place, and it leaves
  * quoted text untouched. */
 static void shell_normalise_separators(char *s) {
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, sq_ansi = false;
     char *w = s;
+    /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there for what went wrong. */
     for (char *r = s; *r; r++) {
-        if (in_sq) { *w++ = *r; if (*r == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            *w++ = *r;
+            if (sq_ansi && *r == '\\' && r[1]) { r++; *w++ = *r; continue; }
+            if (*r == '\'') { in_sq = false; sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*r == '\\' && r[1]) { *w++ = *r++; *w++ = *r; continue; }
             *w++ = *r;
             if (*r == '"') in_dq = false;
+            continue;
+        }
+        if (*r == '$' && r[1] == '\'') {
+            *w++ = *r++;
+            *w++ = *r;
+            in_sq = true; sq_ansi = true;
             continue;
         }
         if (*r == '\'') { in_sq = true; *w++ = *r; continue; }
@@ -8118,6 +8146,17 @@ static void shell_normalise_separators(char *s) {
  * caller must also drop), 0 when the line stands on its own. */
 static int shell_line_incomplete(const char *s) {
     bool in_sq = false, in_dq = false, esc = false;
+    /* `$'...'` IS NOT `'...'`. A plain single-quoted string has no escapes,
+     * which is why every quote walker in this file treats `'` as "skip to
+     * the next `'`". ANSI-C quoting does honour them, and `\'` is the one
+     * that matters here: read the naive way, `$'it\'s'` closes at the
+     * backslash-quote and the LAST `'` opens a span that never ends, so
+     * this function reported the line incomplete and the reader glued
+     * every following line onto it. The script after it simply vanished.
+     *
+     * Only outside double quotes: inside `"..."` bash does not treat `$'`
+     * as ANSI-C, and the in_dq branch below returns before this is read. */
+    bool sq_ansi = false;
     /* A SUBSTITUTION HAS ITS OWN QUOTE STATE HERE TOO.
      *
      *     echo "[$(printf "that's")]"
@@ -8132,7 +8171,8 @@ static int shell_line_incomplete(const char *s) {
     for (const char *p = s; *p; p++) {
         esc = false;
         if (in_sq) {
-            if (*p == '\'') in_sq = false;
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; sq_ansi = false; }
             continue;
         }
         if (in_dq) {
@@ -8177,6 +8217,12 @@ static int shell_line_incomplete(const char *s) {
             nest--;
             in_sq = sq_at[nest];
             in_dq = dq_at[nest];
+            continue;
+        }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true;
+            sq_ansi = true;
+            p++;
             continue;
         }
         if (*p == '\'') { in_sq = true; continue; }
@@ -8260,6 +8306,10 @@ struct shell_scan {
     int  nest;          /* open `$( )`, `${ }`, `$(( ))`, backticks */
     char nest_kind[16]; /* per level: c=$( ) v=${ } a=$(( )) p=( ) b=`` */
     bool in_sq, in_dq;  /* a quote left open INSIDE that nesting */
+    /* ...and whether that open single quote is an ANSI-C `$'...'`, which
+     * honours `\'` where a plain `'...'` does not. A `$'` span may run over
+     * several lines, so the flag has to survive with in_sq. */
+    bool in_sq_ansi;
     bool nest_sq[16], nest_dq[16];  /* the quote state each nesting suspended */
     int  in_case;       /* open `case ... esac` INSIDE that nesting */
     bool in_case_in;    /* ...and its `in` is still owed */
@@ -8297,6 +8347,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->cont_op = false;
     st->nest = 0;
     st->in_sq = false;
+    st->in_sq_ansi = false;
     st->in_dq = false;
     st->in_case = 0;
     st->in_case_in = false;
@@ -8774,18 +8825,29 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * semicolon produces `$((1; + 2))`, which is not the same sum. */
     const char *w = p;
     bool sq = st->in_sq, dq = st->in_dq;
+    bool sq_ansi = st->in_sq_ansi;
     int nest = st->nest;
     int case_open = st->in_case;
     bool case_want_in = st->in_case_in;
     bool case_pat = st->in_case_pat;
     st->in_sq = false;
+    st->in_sq_ansi = false;
     st->in_dq = false;
     st->in_case = 0;
     st->in_case_in = false;
     st->in_case_pat = false;
     while (*p) {
         char d = *p;
-        if (sq) { if (d == '\'') sq = false; p++; continue; }
+        /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Read the
+         * naive way, `$'a\'b; do c'` ends its quote early and the `; do`
+         * inside the STRING is counted as an open compound -- the scanner
+         * then reported a syntax error for a line that is perfectly valid. */
+        if (sq) {
+            if (sq_ansi && d == '\\' && p[1]) { p += 2; continue; }
+            if (d == '\'') { sq = false; sq_ansi = false; }
+            p++;
+            continue;
+        }
         if (dq) {
             if (d == '\\' && p[1]) { p += 2; continue; }
             /* A SUBSTITUTION INSIDE DOUBLE QUOTES IS STILL A SUBSTITUTION.
@@ -8835,6 +8897,9 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             continue;
         }
         if (d == '\\' && p[1]) { p += 2; continue; }
+        if (d == '$' && p[1] == '\'') {
+            sq = true; sq_ansi = true; p += 2; continue;
+        }
         if (d == '\'') { sq = true; p++; continue; }
         if (d == '"')  { dq = true; p++; continue; }
         if (d == '`') {
@@ -8947,7 +9012,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     st->for_head = false;             /* only `((` right after `for` counts */
     st->nest = nest < 0 ? 0 : nest;
     if (st->nest > 0) {
-        st->in_sq = sq; st->in_dq = dq;
+        st->in_sq = sq; st->in_sq_ansi = sq_ansi; st->in_dq = dq;
         st->in_case = case_open; st->in_case_in = case_want_in;
         st->in_case_pat = case_pat;
     }
@@ -14430,10 +14495,21 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
      * whole command produced nothing at all. Quotes are tracked a character
      * at a time now, and each `$(` suspends the pair it was found inside. */
     bool in_sq = false, in_dq = false;
+    /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Without this
+     * the quote closed early and the scan ran past the `)` that ends the
+     * substitution, so `echo "$(echo $'s\'t')"` produced nothing and took
+     * the rest of the script with it. Same rule as shell_line_incomplete. */
+    bool sq_ansi = false;
     bool sq_at[16], dq_at[16];
     while (*p) {
         if (in_sq) {
-            if (*p == '\'') in_sq = false;
+            if (sq_ansi && *p == '\\' && p[1]) {
+                if (pos + 2 >= cmd_cap) return -1;
+                cmd[pos++] = *p++;
+                cmd[pos++] = *p++;
+                continue;
+            }
+            if (*p == '\'') { in_sq = false; sq_ansi = false; }
             if (pos + 1 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
             continue;
@@ -14469,6 +14545,14 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
              * double quote. Copying the backslash and then letting the `"`
              * set the flag left the matcher inside a string that never ended,
              * and it ran past the `)` that closes the substitution. */
+            if (pos + 2 >= cmd_cap) return -1;
+            cmd[pos++] = *p++;
+            cmd[pos++] = *p++;
+            continue;
+        }
+        if (*p == '$' && p[1] == '\'') {
+            in_sq = true;
+            sq_ansi = true;
             if (pos + 2 >= cmd_cap) return -1;
             cmd[pos++] = *p++;
             cmd[pos++] = *p++;
@@ -18127,13 +18211,23 @@ static bool shell_arr_elem_is_assign(const char *w, size_t n) {
  * is still open. Quoted and escaped parens do not count, and a `$( )` in
  * the literal balances itself, so plain depth counting is enough. */
 static size_t shell_arr_literal_close(const char *s, size_t len, int *depth) {
-    bool sq = false, dq = false;
+    bool sq = false, dq = false, sq_ansi = false;
+    /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Without this
+     * `a=($'e\'f' g)` closed its quote at the backslash and the `)` that
+     * ends the literal was read as ordinary text. */
     for (size_t i = 0; i < len; i++) {
-        if (sq) { if (s[i] == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && s[i] == '\\' && i + 1 < len) { i++; continue; }
+            if (s[i] == '\'') { sq = false; sq_ansi = false; }
+            continue;
+        }
         if (dq) {
             if (s[i] == '\\' && i + 1 < len) { i++; continue; }
             if (s[i] == '"') dq = false;
             continue;
+        }
+        if (s[i] == '$' && i + 1 < len && s[i + 1] == '\'') {
+            sq = true; sq_ansi = true; i++; continue;
         }
         if (s[i] == '\'') { sq = true; continue; }
         if (s[i] == '"')  { dq = true; continue; }
@@ -22595,20 +22689,29 @@ static const char *shell_sep_cut(const char *p) {
  * is the whole point -- so the opening keyword at position 0 counts too. */
 static const char *shell_find_loop_do(const char *start, const char **after) {
     int depth = 0;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     const char *p = start;
     if (shell_starts_with_word(p, "while") || shell_starts_with_word(p, "until") ||
         shell_starts_with_word(p, "for")   || shell_starts_with_word(p, "select") ||
         shell_starts_with_word(p, "if")    || shell_starts_with_word(p, "case"))
         depth++;
     for (; *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
@@ -22648,10 +22751,13 @@ static const char *shell_find_loop_do(const char *start, const char **after) {
 static const char *shell_find_matching_done(const char *start,
                                             const char **after) {
     int depth = 1;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     for (const char *p = start; *p; p++) {
         if (in_sq) {
-            if (*p == '\'') in_sq = false;
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
         }
         if (in_dq) {
@@ -22660,6 +22766,9 @@ static const char *shell_find_matching_done(const char *start,
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"') { in_dq = true; continue; }
 
@@ -22708,15 +22817,24 @@ static const char *shell_find_matching_done(const char *start,
 static const char *shell_find_kw_sep(const char *start, const char *kw,
                                      const char **after) {
     size_t kl = strlen(kw);
-    bool sq = false, dq = false;
+    bool sq = false, dq = false, sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     for (const char *p = start; *p; p++) {
-        if (sq) { if (*p == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { sq = false; sq_ansi = false; }
+            continue;
+        }
         if (dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            sq = true; sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { sq = true; continue; }
         if (*p == '"')  { dq = true; continue; }
         if (*p != ';' && *p != '&' && *p != '|' && *p != '}' && *p != ')')
@@ -22755,15 +22873,24 @@ static const char *shell_find_kw_sep(const char *start, const char *kw,
  * old fixed "; fi" / ";fi" pair could not. */
 static const char *shell_find_if_fi(const char *start, const char **after) {
     int depth = 1;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     for (const char *p = start; *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
@@ -22787,15 +22914,24 @@ static const char *shell_find_if_fi(const char *start, const char **after) {
 static const char *shell_find_elif_else(const char *start, const char *fi_at,
                                         const char **after, bool *is_elif) {
     int depth = 0;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     for (const char *p = start; p < fi_at && *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
@@ -26293,16 +26429,25 @@ static bool shell_try_compound_pipeline(const char *src) {
 static int shell_syntax_check(const char *s) {
     int if_depth = 0, do_depth = 0, case_depth = 0;
     int brace = 0, paren = 0, loop_open = 0;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
 
     for (const char *p = s; *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         if (*p == '#' && (p == s || is_space(p[-1]))) {
@@ -27016,13 +27161,16 @@ static size_t g_continuation_len;
 static bool shell_line_needs_continuation(const char *s) {
     int if_depth = 0, do_depth = 0, case_depth = 0;
     int brace_depth = 0, paren_depth = 0;
-    bool in_sq = false, in_dq = false;
+    bool in_sq = false, in_dq = false, in_sq_ansi = false;
+    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
+     * shell_line_incomplete -- see the comment there. */
     bool last_was_pipe = false, last_was_and = false, last_was_or = false;
     bool last_was_backslash = false;
 
     for (const char *p = s; *p; p++) {
         if (in_sq) {
-            if (*p == '\'') in_sq = false;
+            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
         }
         if (in_dq) {
@@ -27032,6 +27180,9 @@ static bool shell_line_needs_continuation(const char *s) {
         }
         if (*p == '\\' && !p[1]) { last_was_backslash = true; continue; }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
+            in_sq = true; in_sq_ansi = true; p++; continue;
+        }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"') { in_dq = true; continue; }
         if (*p == '{') brace_depth++;
