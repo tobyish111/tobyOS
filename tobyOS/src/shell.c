@@ -585,6 +585,10 @@ static bool shell_word_has_argmark(const char *s);
 static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap);
 
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
+/* ANSI-C quoting, shared by `printf %q`, `declare -p` and bare `set`.
+ * Defined beside cmd_printf, used here as well -- see shell_ansi_render. */
+static bool shell_q_needs_ansi(const char *s);
+static int  shell_ansi_render(const char *s, bool emit);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
 static void shell_putc_raw(char c);
@@ -3684,6 +3688,12 @@ static void cmd_export(int argc, char **argv) {
  * passing these cases and looking like it.
  */
 static void shell_declare_quote(const char *v) {
+    /* A VALUE WITH A NON-PRINTABLE BYTE GOES IN `$'...'`, not in quotes:
+     * bash prints `declare -- zz=$'one\ntwo'` and `declare -a arr=([0]="a"
+     * [1]=$'p\nq')` -- the choice is made per VALUE, so one array can carry
+     * both forms. Double-quoting a newline produced a line break in the
+     * middle of a `declare` line, which no reader of that output parses. */
+    if (v && shell_q_needs_ansi(v)) { (void)shell_ansi_render(v, true); return; }
     shell_printf("\"");
     for (const char *p = v ? v : ""; *p; p++) {
         if (*p == '"' || *p == '\\' || *p == '$' || *p == '`')
@@ -4461,6 +4471,10 @@ static void shell_set_quote(const char *v) {
     const char *p = v ? v : "";
     /* An EMPTY value prints bare: bash writes `x=`, not `x=''`. */
     if (!*p) return;
+    /* Same rule as `declare -p`, different fallback: a non-printable byte
+     * forces `$'...'`, and everything else stays with the single quotes
+     * below. `zz=$'one\ntwo'` is what bash's `set` prints. */
+    if (shell_q_needs_ansi(p)) { (void)shell_ansi_render(p, true); return; }
     bool need = false;
     for (const char *q = p; *q && !need; q++)
         if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
@@ -11630,11 +11644,14 @@ static bool shell_q_backslash(unsigned char c, bool first) {
 /* Render, or with `emit` false only COUNT, so `%*q` can pad to a width
  * without a temporary buffer -- the ANSI form can quadruple a string and
  * this file is already close to its stack budget. Returns the byte count. */
-static int shell_q_render(const char *s, bool emit) {
+/* The `$'...'` form on its own, because THREE printers need exactly it:
+ * `printf %q`, `declare -p` and bare `set`. They disagree about everything
+ * else -- %q backslashes a space, `set` single-quotes it, `declare -p`
+ * double-quotes it -- and agree completely here. */
+static int shell_ansi_render(const char *s, bool emit) {
     int n = 0;
 #define Q_PUT(ch) do { if (emit) shell_putc((char)(ch)); n++; } while (0)
-    if (!*s) { Q_PUT('\''); Q_PUT('\''); return n; }
-    if (shell_q_needs_ansi(s)) {
+    {
         Q_PUT('$'); Q_PUT('\'');
         for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
             unsigned char c = *p;
@@ -11672,6 +11689,14 @@ static int shell_q_render(const char *s, bool emit) {
         Q_PUT('\'');
         return n;
     }
+#undef Q_PUT
+}
+
+static int shell_q_render(const char *s, bool emit) {
+    int n = 0;
+#define Q_PUT(ch) do { if (emit) shell_putc((char)(ch)); n++; } while (0)
+    if (!*s) { Q_PUT('\''); Q_PUT('\''); return n; }
+    if (shell_q_needs_ansi(s)) return shell_ansi_render(s, emit);
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         if (shell_q_backslash(*p, p == (const unsigned char *)s)) Q_PUT('\\');
         Q_PUT(*p);
