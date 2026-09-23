@@ -11429,6 +11429,101 @@ static void printf_capture_sink(const char *s, void *ctx) {
     c->buf[c->len] = '\0';
 }
 
+/* `printf %q` -- print an argument as text you could type back.
+ *
+ * bash picks between TWO forms and the choice is not stylistic:
+ *
+ *   plain      ->  plain          nothing needs escaping
+ *   one two    ->  one\ two       BACKSLASHES, not quotes
+ *   ''         ->  ''             the empty string is the one quoted case
+ *   $'a\nb'    ->  $'a\nb'        ANSI-C, once ANY byte is not printable
+ *
+ * Every rule below was measured against the GNU bash 5.2 in the guest
+ * rather than taken from the spec file, because the corpus records bash
+ * as an `## OK` variant in four of these six cases -- its canonical
+ * answer for `one two` is `'one two'` and for U+03BC is the character
+ * itself, and bash gives neither. */
+static bool shell_q_needs_ansi(const char *s) {
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p < 0x20 || *p == 0x7f || *p >= 0x80) return true;
+    return false;
+}
+
+/* Which bytes take a backslash in the plain form. Measured one byte at a
+ * time, in both a leading and a mid-string position:
+ *
+ *   always      space ! " $ & ' ( ) * , ; < > ? [ \ ] ^ ` { | }
+ *   LEADING ONLY  # ~     -- `a#b` and `tilde~mid` come back untouched;
+ *                            only a word that STARTS with one is ambiguous
+ *   never       % + - . / : = @ _ and alphanumerics
+ */
+static bool shell_q_backslash(unsigned char c, bool first) {
+    switch (c) {
+    case ' ': case '!': case '"': case '$': case '&': case '\'':
+    case '(': case ')': case '*': case ',': case ';': case '<':
+    case '>': case '?': case '[': case '\\': case ']': case '^':
+    case '`': case '{': case '|': case '}':
+        return true;
+    case '#': case '~':
+        return first;
+    default:
+        return false;
+    }
+}
+
+/* Render, or with `emit` false only COUNT, so `%*q` can pad to a width
+ * without a temporary buffer -- the ANSI form can quadruple a string and
+ * this file is already close to its stack budget. Returns the byte count. */
+static int shell_q_render(const char *s, bool emit) {
+    int n = 0;
+#define Q_PUT(ch) do { if (emit) shell_putc((char)(ch)); n++; } while (0)
+    if (!*s) { Q_PUT('\''); Q_PUT('\''); return n; }
+    if (shell_q_needs_ansi(s)) {
+        Q_PUT('$'); Q_PUT('\'');
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            unsigned char c = *p;
+            char e = 0;
+            switch (c) {
+            case '\n': e = 'n';  break;
+            case '\t': e = 't';  break;
+            case '\r': e = 'r';  break;
+            case '\a': e = 'a';  break;
+            case '\b': e = 'b';  break;
+            case '\f': e = 'f';  break;
+            case '\v': e = 'v';  break;
+            case 0x1b: e = 'E';  break;   /* bash prints \E, not \e */
+            case '\'': e = '\''; break;
+            case '\\': e = '\\'; break;
+            default: break;
+            }
+            /* INSIDE `$'...'` ONLY `'` AND `\` ARE ESCAPED. A space stays a
+             * space and a `*` stays a `*` -- `$'a b\nc'` and `$'star*\nx'`
+             * are bash's own output. Escaping them here would still EVAL
+             * back correctly, which is exactly why it has to be measured
+             * against bytes rather than reasoned about. */
+            if (e) { Q_PUT('\\'); Q_PUT(e); }
+            else if (c >= 0x20 && c < 0x7f) { Q_PUT(c); }
+            else {
+                /* Three-digit OCTAL, not hex: bash gives $'\377', and a
+                 * high byte goes octal per byte -- U+03BC is $'\316\274',
+                 * not the character. */
+                Q_PUT('\\');
+                Q_PUT('0' + ((c >> 6) & 7));
+                Q_PUT('0' + ((c >> 3) & 7));
+                Q_PUT('0' + (c & 7));
+            }
+        }
+        Q_PUT('\'');
+        return n;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (shell_q_backslash(*p, p == (const unsigned char *)s)) Q_PUT('\\');
+        Q_PUT(*p);
+    }
+    return n;
+#undef Q_PUT
+}
+
 static void cmd_printf(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
@@ -11581,6 +11676,15 @@ static void cmd_printf(int argc, char **argv) {
                 int pad = width > slen ? width - slen : 0;
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
                 for (int i = 0; i < slen; i++) shell_putc(tbuf[i]);
+                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+            } else if (spec == 'q') {
+                /* `%q` was not a conversion at all: the chain fell through
+                 * and the two bytes `%q` were printed. */
+                const char *s = printf_arg_str(argc, argv, &argi);
+                int slen = shell_q_render(s, false);
+                int pad = width > slen ? width - slen : 0;
+                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                (void)shell_q_render(s, true);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 's') {
                 const char *s = printf_arg_str(argc, argv, &argi);
