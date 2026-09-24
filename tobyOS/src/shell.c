@@ -19084,6 +19084,25 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 SH_LIT_CLOSE();
                 word_quoted = true;
                 p += 2;
+                /* `$'...'` IS A QUOTED SPAN, AND WAS NEVER TREATED AS ONE.
+                 * The plain '...' branch below wraps its bytes in no-split
+                 * marks and runs shell_escape_glob_range over them; this
+                 * branch did neither, so the contents reached pathname
+                 * expansion bare:
+                 *
+                 *     cd dir-with-files-g-and-h
+                 *     echo $'?'      bash: ?      tsh: g h
+                 *     echo $'*'      bash: *      tsh: every file here
+                 *
+                 * so `rm $'*'`, meant for the one file named `*`, would have
+                 * been handed every file in the directory.
+                 *
+                 * An escape-produced byte arrives here data-escaped (0x04 +
+                 * a byte in 0x01..0x04), and none of those is a glob
+                 * character, so the range escape passes over them intact. */
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t ansi_start = wpos;
                 bool stop_nul = false;      /* a NUL ends the word; see below */
                 while (*p && *p != '\'') {
                     if (*p == '\\' && p[1]) {
@@ -19140,6 +19159,10 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                         p++;
                     }
                 }
+                if (shell_escape_glob_range(words, &wpos, word_cap,
+                                            ansi_start) < 0) return -1;
+                if (shell_append_char(words, &wpos, word_cap,
+                                      SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p == '\'') p++;
                 continue;
             }
