@@ -5627,35 +5627,56 @@ static void cmd_clear(int argc, char **argv) {
     console_clear();
 }
 
-static void shell_echo_escape(const char *s) {
-    for (; *s; s++) {
-        if (*s == '\\' && s[1]) {
-            switch (s[1]) {
-            case 'n':  shell_write("\n"); s++; break;
-            case 't':  shell_write("\t"); s++; break;
-            case 'r':  shell_write("\r"); s++; break;
-            case '\\': shell_write("\\"); s++; break;
-            case 'a':  shell_write("\a"); s++; break;
-            case 'b':  shell_write("\b"); s++; break;
-            case 'f':  shell_write("\f"); s++; break;
-            case 'v':  shell_write("\v"); s++; break;
-            case '0': {
-                unsigned val = 0;
-                s++;
-                for (int k = 0; k < 3 && s[1] >= '0' && s[1] <= '7'; k++)
-                    val = val * 8 + (*(++s) - '0');
-                char c = (char)val;
-                if (c) { char tmp[2] = {c, 0}; shell_write(tmp); }
-                break;
-            }
-            case 'c': return;
-            default: { char tmp[2] = {'\\', 0}; shell_write(tmp); } break;
-            }
-        } else {
-            char tmp[2] = {*s, 0};
-            shell_write(tmp);
+static int shell_ansic_escape(const char **pp, char out[16]);
+
+/* `echo -e`. Returns false at `\c`, which ends ALL output -- the rest of
+ * this argument, every later argument and the trailing newline.
+ *
+ * THIS WAS A FOURTH COPY OF THE ESCAPE DECODER, and it had drifted exactly
+ * the way the three merged into shell_ansic_escape() once had: no \x, no
+ * \u or \U, no \e. Every escape whose rule is the SAME in echo and in
+ * $'...' now goes to that one decoder. Measured against bash 5.2, three
+ * rules are genuinely echo's own and stay here:
+ *
+ *   \0NNN  octal needs the leading \0 -- `\1` and `\7` stand as written,
+ *          and `\0400` is 256, which is the byte 0x00 followed by `0`;
+ *   \c     stops everything, where $'\cX' is a control character;
+ *   \" \' \?  are NOT echo escapes: both bytes stand.
+ *
+ * Every byte goes out through shell_putc_raw, because `\0` is a byte too:
+ * shell_write takes a C string, so a NUL written that way disappeared. */
+static bool shell_echo_escape(const char *s) {
+    for (const char *p = s; *p; ) {
+        if (*p != '\\' || !p[1]) { shell_putc_raw(*p++); continue; }
+        switch (p[1]) {
+        case 'c':
+            return false;
+        case '0': {
+            const char *q = p + 2;
+            unsigned v = 0;
+            for (int k = 0; k < 3 && *q >= '0' && *q <= '7'; k++)
+                v = v * 8 + (unsigned)(*q++ - '0');
+            shell_putc_raw((char)(unsigned char)v);
+            p = q;
+            continue;
+        }
+        case 'a': case 'b': case 'e': case 'E': case 'f': case 'n':
+        case 'r': case 't': case 'v': case '\\': case 'x': case 'u':
+        case 'U': {
+            const char *q = p + 1;
+            char ob[16];
+            int n = shell_ansic_escape(&q, ob);
+            for (int k = 0; k < n; k++) shell_putc_raw(ob[k]);
+            p = q;
+            continue;
+        }
+        default:
+            shell_putc_raw('\\');      /* not an echo escape: both bytes stand */
+            p++;
+            continue;
         }
     }
+    return true;
 }
 
 static void cmd_echo(int argc, char **argv) {
@@ -5670,21 +5691,34 @@ static void cmd_echo(int argc, char **argv) {
          * and `result='-'; echo $result`. `--` and `---` were already right,
          * because `-` is not one of n/e/E. */
         if (argv[i][1] == '\0') break;
-        bool valid = true;
+        /* COLLECT, THEN COMMIT. The flags were applied as the word was
+         * scanned, so in `-ez` the `e` had switched escapes on before the
+         * `z` showed the word was not an option at all. bash prints such a
+         * word as text and applies NONE of its letters:
+         *
+         *     echo -ez 'abc\n'     bash: -ez abc\n     tsh: -ez abc<NL>
+         */
+        bool w_newline = newline, w_escapes = escapes, valid = true;
         for (const char *f = argv[i] + 1; *f; f++) {
-            if (*f == 'n') newline = false;
-            else if (*f == 'e') escapes = true;
-            else if (*f == 'E') escapes = false;
+            if (*f == 'n') w_newline = false;
+            else if (*f == 'e') w_escapes = true;
+            else if (*f == 'E') w_escapes = false;
             else { valid = false; break; }
         }
         if (!valid) break;
+        newline = w_newline;
+        escapes = w_escapes;
         i++;
     }
     for (; i < argc; i++) {
-        if (escapes)
-            shell_echo_escape(argv[i]);
-        else
+        if (escapes) {
+            /* `\c` ends everything: later arguments, the separating space
+             * and the newline. tsh stopped only the current argument, so
+             * `echo -e 'ab\cde' zzz` still printed ` zzz`. */
+            if (!shell_echo_escape(argv[i])) return;
+        } else {
             shell_write(argv[i]);
+        }
         if (i + 1 < argc) shell_write(" ");
     }
     if (newline) shell_write("\n");
