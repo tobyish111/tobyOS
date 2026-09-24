@@ -14974,7 +14974,19 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
  * escape. Returns the number of bytes written to out[] (1..4). A return of 1
  * with out[0] == 0 is a REAL NUL -- callers end the word there, because the
  * word is a C string and so is the filename it becomes. */
-static int shell_ansic_escape(const char **pp, char out[4]) {
+/* Is the effective LC_CTYPE the C locale? bash's \u and \U answer depend on
+ * it, and under musl "unset" is NOT "C": the default locale is C.UTF-8.
+ * First non-empty of LC_ALL, LC_CTYPE, LANG -- the POSIX precedence -- and
+ * only the exact names C and POSIX count. Both gates set LC_ALL=C. */
+static bool shell_locale_is_c(void) {
+    const char *v = env_get("LC_ALL");
+    if (!v || !*v) v = env_get("LC_CTYPE");
+    if (!v || !*v) v = env_get("LANG");
+    if (!v || !*v) return false;
+    return strcmp(v, "C") == 0 || strcmp(v, "POSIX") == 0;
+}
+
+static int shell_ansic_escape(const char **pp, char out[16]) {
     const char *p = *pp;
     unsigned char c;
     switch (*p) {
@@ -14989,6 +15001,7 @@ static int shell_ansic_escape(const char **pp, char out[4]) {
     case '\\': c = '\\'; p++; break;
     case '\'': c = '\''; p++; break;
     case '"':  c = '"';  p++; break;
+    case '?':  c = '?';  p++; break;
     case '0': case '1': case '2': case '3':
     case '4': case '5': case '6': case '7': {
         /* \nnn: ONE TO THREE octal digits, the first any of 0-7. Measured
@@ -15011,6 +15024,10 @@ static int shell_ansic_escape(const char **pp, char out[4]) {
             if (d < 0) break;
             v = v * 16 + d; p++; cnt++;
         }
+        /* \x WITH NO HEX DIGIT IS NOT AN ESCAPE. It computed 0 and returned
+         * a NUL, which ENDS the word -- so `$'\xG'` came out as nothing at
+         * all, the G included. bash keeps `\x` and carries on. */
+        if (cnt == 0) { out[0] = '\\'; out[1] = 'x'; *pp = p; return 2; }
         c = (unsigned char)v;
         break;
     }
@@ -15030,22 +15047,45 @@ static int shell_ansic_escape(const char **pp, char out[4]) {
             cp = cp * 16 + (unsigned long)d; q++; cnt++;
         }
         if (cnt == 0) { out[0] = '\\'; out[1] = *p; *pp = p + 1; return 2; }
-        p = q;
-        if (cp == 0)          { out[0] = 0; *pp = p; return 1; }
-        if (cp < 0x80)        { out[0] = (char)cp; *pp = p; return 1; }
-        if (cp < 0x800) {
-            out[0] = (char)(0xC0 | (cp >> 6));
-            out[1] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 2;
+        *pp = q;
+        /* WHAT A CODE POINT BECOMES DEPENDS ON THE LOCALE, and every rule
+         * below was measured against bash 5.2 in both, not assumed:
+         *
+         *                      LC_ALL=C              UTF-8 (musl default)
+         *   0                  NUL (ends the word)   same
+         *   < 0x80             the byte              same
+         *   character >= 0x80  `*`                   UTF-8
+         *   surrogate          `\uD800` printed back UTF-8, ed a0 80
+         *   > 0x10FFFF         `\U00110000` back     classic UTF-8, 4-6 bytes
+         *   >= 0x80000000      NOTHING               NOTHING
+         *
+         * tsh emitted UTF-8 whatever the locale, and both gates run under
+         * LC_ALL=C, where bash answers `*`. The printed-back form is upper
+         * case whatever the case of the input, \u up to FFFF and \U above. */
+        if (cp == 0)          { out[0] = 0; return 1; }
+        if (cp < 0x80)        { out[0] = (char)cp; return 1; }
+        if (cp > 0x7FFFFFFFul) return 0;
+        if (shell_locale_is_c()) {
+            bool surrogate = (cp >= 0xD800 && cp <= 0xDFFF);
+            if (!surrogate && cp <= 0x10FFFF) { out[0] = '*'; return 1; }
+            static const char hx[] = "0123456789ABCDEF";
+            int w = (cp <= 0xFFFF) ? 4 : 8, o = 0;
+            out[o++] = '\\';
+            out[o++] = (cp <= 0xFFFF) ? 'u' : 'U';
+            for (int k = w - 1; k >= 0; k--) out[o++] = hx[(cp >> (4 * k)) & 0xF];
+            return o;
         }
-        if (cp < 0x10000) {
-            out[0] = (char)(0xE0 | (cp >> 12));
-            out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
-            out[2] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 3;
+        {
+            int nb = cp < 0x800 ? 2 : cp < 0x10000 ? 3 : cp < 0x200000 ? 4 :
+                     cp < 0x4000000 ? 5 : 6;
+            static const unsigned char lead[7] = {0, 0, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC};
+            for (int k = nb - 1; k > 0; k--) {
+                out[k] = (char)(0x80 | (cp & 0x3F));
+                cp >>= 6;
+            }
+            out[0] = (char)(lead[nb] | cp);
+            return nb;
         }
-        out[0] = (char)(0xF0 | ((cp >> 18) & 0x07));
-        out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
-        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        out[3] = (char)(0x80 | (cp & 0x3F)); *pp = p; return 4;
     }
     case 'c': {
         /* \cX: the control character for X.
@@ -15073,7 +15113,15 @@ static int shell_ansic_escape(const char **pp, char out[4]) {
         }
         break;
     }
-    default: c = (unsigned char)*p++; break;
+    /* AN UNKNOWN ESCAPE KEEPS ITS BACKSLASH. `$'back\slash'` is ten bytes
+     * in bash and was nine here: the default branch returned the letter
+     * alone. Only the escapes listed above are escapes; `\s`, `\q`, `\8`
+     * and the rest stand as written, in `$'...'` and in `${x@E}` alike. */
+    default:
+        out[0] = '\\';
+        out[1] = *p++;
+        *pp = p;
+        return 2;
     }
     out[0] = (char)c;
     *pp = p;
@@ -15421,13 +15469,14 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
             while (*p && *p != '\'') {
                 char c = *p;
                 bool esc = false;       /* c came from an escape: it is DATA */
-                char ub[4]; int un = 0; /* a multi-byte escape (\u, \U) */
+                char ub[16]; int un = 0; /* a multi-byte escape (\u, \U) */
                 if (c == '\\' && p[1]) {
                     p++;
                     esc = true;
                     /* ONE decoder, shared with the ordinary-word path --
                      * see shell_ansic_escape(). */
                     int n = shell_ansic_escape(&p, ub);
+                    if (n == 0) continue;      /* decodes to nothing at all */
                     if (n == 1) c = ub[0]; else un = n;
                 } else {
                     p++;
@@ -16153,10 +16202,11 @@ static int shell_expand_at_transform(const char *name, char opch,
         for (const char *p = value; *p && o + 4 < sizeof out; ) {
             if (*p != '\\' || !p[1]) { out[o++] = *p++; continue; }
             p++;
-            char eb[4];
+            char eb[16];
             const char *save = p;
             int n = shell_ansic_escape(&p, eb);
-            if (n <= 0) { out[o++] = '\\'; p = save; continue; }
+            if (n < 0) { out[o++] = '\\'; p = save; continue; }
+            /* n == 0: the escape decodes to nothing, and nothing is written */
             for (int i = 0; i < n && o + 1 < sizeof out; i++) out[o++] = eb[i];
         }
         break;
@@ -19111,9 +19161,9 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * shell_ansic_escape(). These two copies had drifted
                          * apart three times; this one was missing \E, \u/\U
                          * and \c when that was finally counted. */
-                        char ub[4];
+                        char ub[16];
                         int un = shell_ansic_escape(&p, ub);
-                        char c = ub[0];
+                        char c = (un > 0) ? ub[0] : 0;
                         /* A NUL ENDS THE WORD. `$'foo\0bar'` is the three characters
                          * `foo` as far as anything downstream can tell: the word is a
                          * C string, and so is the filename it becomes.
