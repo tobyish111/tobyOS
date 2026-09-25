@@ -1327,7 +1327,8 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
                       int image_borrowed,
                       const char *kpath, int kargc, char **kargv_buf,
                       uint64_t old_pml4, uint64_t new_pml4,
-                      uint64_t saved_cr3, uint64_t old_editor) {
+                      uint64_t saved_cr3, uint64_t old_editor,
+                      void *exec_pool) {
     struct pe_load_info pe_info = {0};
     int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
     if (!image_borrowed) kfree(image);   /* slice 112: initrd borrow */
@@ -1434,6 +1435,10 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
             "rsp=%p\n", p->pid, p->name, (void *)p->user_entry,
             (void *)pe_info.teb, (void *)p->user_rsp);
 
+    /* sys_execve's per-call argv/envp pool: argv was consumed by
+     * pe_load_user, and this path does not return. */
+    kfree(exec_pool);
+
     bkl_exit();
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }
@@ -1517,7 +1522,32 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * vector (matching the old tolerant behaviour). */
     int kargc = 0;
     char *kargv_buf[ABI_ARGV_MAX];
-    static char kargv_pool[ABI_ARGV_MAX][ABI_ARG_MAX];
+    /* PER CALL, NOT `static`. These were two static pools shared by every
+     * CPU, and an exec does not hold the BKL from the copy below to the
+     * last use: it DROPS it around proc_reap_group_threads, on every call
+     * from a normal process. A second exec on another CPU refilled the same
+     * pool in that window, and this one then built its stack from the other
+     * process's argv:
+     *
+     *     bash -c 'set -o | grep braceexpand | sed "s/^/X /"'
+     *       grep ran with sed's argv -> no match -> PIPESTATUS 0 1 0
+     *     ... | head -3 | tr '\t' _
+     *       "head: usage: head [-cds] string1 [string2]"  (tr's code, head's argv)
+     *       "tr: open \t: No such file or directory"      (head's code, tr's argv)
+     *
+     * Pipelines exec their stages at the same moment, which is when it
+     * fires. Found 2026-09-25 through the Oils 2202 flake, which f91a175's
+     * timing change made frequent on hardware. One block holds both pools;
+     * it is released on every exit -- the error returns, execve_pe, and just
+     * before the new image is entered. */
+    char (*kargv_pool)[ABI_ARG_MAX] = (char (*)[ABI_ARG_MAX])
+        kmalloc((size_t)(ABI_ARGV_MAX + ABI_ENVP_MAX) * ABI_ARG_MAX);
+    if (!kargv_pool) return -ABI_ENOMEM;
+    char (*kenvp_pool)[ABI_ARG_MAX] = kargv_pool + ABI_ARGV_MAX;
+    /* The value FIRST, then the release: `EXEC_RETURN(execve_pe(...))`
+     * must run execve_pe while the pool is still alive. */
+#define EXEC_RETURN(v) do { long exec_rv_ = (long)(v); \
+                            kfree(kargv_pool); return exec_rv_; } while (0)
 
     if (argv) {
         for (int i = 0; i < ABI_ARGV_MAX; i++) {
@@ -1557,8 +1587,7 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
 
     /* Copy envp into kernel buffers. */
     int kenvc = 0;
-    char *kenvp_buf[ABI_ENVP_MAX];
-    static char kenvp_pool[ABI_ENVP_MAX][ABI_ARG_MAX];
+    char *kenvp_buf[ABI_ENVP_MAX];      /* rows of kenvp_pool, above */
 
     if (envp) {
         for (int i = 0; i < ABI_ENVP_MAX; i++) {
@@ -1592,7 +1621,7 @@ reread:;
 #endif
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
-        return -ABI_ENOENT;
+        EXEC_RETURN(-ABI_ENOENT);
     }
 
     /* "#!": the exec becomes the interpreter's, with the script's path as
@@ -1608,12 +1637,12 @@ reread:;
         if (sb != 0) {
             if (!img_borrowed) kfree(image);
             image = NULL;
-            if (sb < 0) return -ABI_ENOEXEC;
-            if (shebang_depth >= BINFMT_MAX_RECURSION) return -ABI_ELOOP;
+            if (sb < 0) EXEC_RETURN(-ABI_ENOEXEC);
+            if (shebang_depth >= BINFMT_MAX_RECURSION) EXEC_RETURN(-ABI_ELOOP);
             int extra = 2 + (optarg[0] ? 1 : 0);
             size_t kl = strlen(kpath);
             if (pool_hi + extra > ABI_ARGV_MAX || kl >= ABI_ARG_MAX)
-                return -ABI_E2BIG;
+                EXEC_RETURN(-ABI_E2BIG);
             char *s_interp = kargv_pool[pool_hi++];
             memcpy(s_interp, interp, strlen(interp) + 1);
             char *s_opt = NULL;
@@ -1627,7 +1656,7 @@ reread:;
             int nargc = binfmt_shebang_argv(s_interp, s_opt, s_script,
                                             kargc, kargv_buf, nargv,
                                             ABI_ARGV_MAX);
-            if (nargc < 0) return -ABI_E2BIG;
+            if (nargc < 0) EXEC_RETURN(-ABI_E2BIG);
             memcpy(kargv_buf, nargv, (size_t)nargc * sizeof nargv[0]);
             kargc = nargc;
             memcpy(kpath, interp, strlen(interp) + 1);
@@ -1645,7 +1674,7 @@ reread:;
     if (!pe_is_image(image, image_size) &&
         (image_size < 4 || memcmp(image, "\x7f" "ELF", 4) != 0)) {
         if (!img_borrowed) kfree(image);
-        return -ABI_ENOEXEC;
+        EXEC_RETURN(-ABI_ENOEXEC);
     }
 
     /* ---- Phase F: POSIX de_thread (2026-08-22) -------------------------
@@ -1723,7 +1752,7 @@ reread:;
     uint64_t new_pml4 = vmm_create_user_pml4();
     if (!new_pml4) {
         if (!img_borrowed) kfree(image);
-        return -ABI_ENOMEM;
+        EXEC_RETURN(-ABI_ENOMEM);
     }
 
     /* Switch to the new PML4 for loading. */
@@ -1737,9 +1766,12 @@ reread:;
      * process (e.g. a busybox `sh` pipeline stage) execve() a .exe, so a
      * single pipeline can mix Windows and Linux binaries. */
     if (pe_is_image(image, image_size)) {
-        return execve_pe(p, image, image_size, img_borrowed,
-                         kpath, kargc, kargv_buf,
-                         old_pml4, new_pml4, saved_cr3, old_editor);
+        /* execve_pe releases the pool itself before entering the new image
+         * (it does not return then); on failure it returns and we do. */
+        EXEC_RETURN(execve_pe(p, image, image_size, img_borrowed,
+                              kpath, kargc, kargv_buf,
+                              old_pml4, new_pml4, saved_cr3, old_editor,
+                              kargv_pool));
     }
 
     /* Check for PT_INTERP. */
@@ -1942,7 +1974,7 @@ reread:;
         write_cr3(saved_cr3);
         vmm_set_editor_root(old_editor);
         vmm_destroy_user_pml4(new_pml4);
-        return -ABI_ENOMEM;
+        EXEC_RETURN(-ABI_ENOMEM);
     }
 
     /* Success -- point of no return. Destroy the old address space. */
@@ -2003,6 +2035,13 @@ reread:;
     /* /proc/<pid>/cmdline follows the NEW image's argv. */
     { extern void proc_record_cmdline(struct proc *, int, char **);
       proc_record_cmdline(p, kargc, kargv_buf); }
+
+    /* The last reader of kargv_buf/kenvp_buf -- the stack is packed and the
+     * cmdline recorded. Released here because a successful exec never
+     * returns (see EXEC_RETURN above). */
+    kfree(kargv_pool);
+    kargv_pool = 0;
+#undef EXEC_RETURN
 
     /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */
     {
