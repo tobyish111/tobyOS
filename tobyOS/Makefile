@@ -811,6 +811,25 @@ install-img: $(INSTALL_IMG)
 
 # ---------- Compile ----------
 
+# THE KERNEL'S BUILD ID -- the commit it was built from, "-dirty" when src/ or
+# include/ differ from it. Readable on a running box at
+# /proc/sys/kernel/tobyos_build and logged at boot. It exists because a flash
+# that changed only the kernel could not be told apart from the image before
+# it: /bin/tsh was byte-identical and nothing else named the build.
+#
+# The header is rewritten only when the id CHANGES, so an unchanged tree does
+# not recompile what includes it.
+KBUILD_ID := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD -- src include 2>/dev/null || echo -dirty)
+KBUILD_ID_H := build/kbuild_id.h
+.PHONY: kbuild-id-force
+kbuild-id-force:
+$(KBUILD_ID_H): kbuild-id-force
+	@mkdir -p build
+	@printf '#define TOBYOS_BUILD_ID "%s"\n' '$(KBUILD_ID)' > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+src/procfs.o src/kernel.o: $(KBUILD_ID_H)
+
 src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@
 

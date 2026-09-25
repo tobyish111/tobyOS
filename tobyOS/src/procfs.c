@@ -25,6 +25,7 @@
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
 #include <tobyos/heap.h>
+#include "../build/kbuild_id.h"   /* TOBYOS_BUILD_ID -- see the Makefile */
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/pit.h>
@@ -779,6 +780,10 @@ static int gen_sys(const char *rest, char *buf, size_t cap) {
         SYS_OUT(t);
     }
     if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("256\n");
+    /* Which kernel is this? The commit it was built from (Makefile). Its own
+     * file, not /proc/version: uname -v and -a print that file's first line
+     * and gates compare uname across implementations. */
+    if (strcmp(rest, "kernel/tobyos_build") == 0) SYS_OUT(TOBYOS_BUILD_ID "\n");
     if (strcmp(rest, "fs/file-max") == 0)      SYS_OUT("1024\n");
     if (strcmp(rest, "vm/overcommit_memory") == 0) SYS_OUT("0\n");
     if (strcmp(rest, "kernel/random/boot_id") == 0) {

@@ -107,6 +107,7 @@
 #include <tobyos/snd_pcm.h>
 #include <tobyos/display.h>
 #include <tobyos/slog.h>
+#include "../build/kbuild_id.h"   /* TOBYOS_BUILD_ID -- see the Makefile */
 #include <tobyos/watchdog.h>
 #include <tobyos/safemode.h>
 #include <tobyos/hwinfo.h>
@@ -442,6 +443,7 @@ static void early_init(void) {
      * resident so no allocator is required. */
     slog_init();
     SLOG_INFO(SLOG_SUB_BOOT, "tobyOS boot sequence started");
+    SLOG_INFO(SLOG_SUB_BOOT, "kernel build " TOBYOS_BUILD_ID);
 }
 
 static void limine_fb_canonical(struct limine_framebuffer *fb) {
