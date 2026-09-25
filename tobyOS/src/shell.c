@@ -602,6 +602,8 @@ static void shell_putc_raw(char c);
 static void shell_case_unquote(char *pat, size_t cap);
 static char *shell_unquoted_newline(char *s);
 static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
+static const char *shell_expand_aliases_nested(const char *src, char *buf,
+                                               size_t cap);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
 static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
                                  const char *sv);
@@ -14775,7 +14777,27 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
         for (const char *q = cmd; *q; q++)
             if (*q == '\n') { multiline = true; break; }
         if (!multiline) {
-            execute_line_text(cmd);
+            /* A SUBSTITUTION'S TEXT IS SHELL INPUT, SO ITS ALIASES EXPAND:
+             *
+             *     alias echo_='echo [ '
+             *     x=$(echo_ ])               bash: [ ]
+             *                                tsh : /bin/echo_ not found
+             *
+             * execute_line_text rewrites aliases only for a line of its own
+             * (depth 0), and a substitution always runs from inside one.
+             * The same gap eval had; the same explicit pass closes it. A
+             * substitution in a HERE-DOCUMENT body used to get the pass by
+             * accident -- the body was expanded by the reader, before any
+             * line ran -- and lost it when the body moved to run time. */
+            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+            const char *line = cmd;
+            if (abuf) {
+                const char *ex = shell_expand_aliases_nested(
+                    cmd, abuf, SHELL_PARSE_BUF_MAX);
+                if (ex) line = ex;
+            }
+            execute_line_text(line);
+            if (abuf) kfree(abuf);
         } else {
             char *copy = shell_strdup(cmd);
             if (copy) {
@@ -19774,6 +19796,21 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
 
     out[pos] = '\0';
     return 0;
+}
+
+/* shell_expand_aliases() for text that runs WHILE ANOTHER LINE IS BEING
+ * EXPANDED -- a command substitution. It resets the line-scoped state
+ * (the recursion guard, and g_dq_depth, which says whether the word being
+ * expanded is inside double quotes), and the outer word still needs both:
+ * `echo "$(al)"` would finish its word as if it were unquoted. */
+static const char *shell_expand_aliases_nested(const char *src, char *buf,
+                                               size_t cap) {
+    int saved_alias_depth = g_alias_depth;
+    int saved_dq_depth = g_dq_depth;
+    const char *r = shell_expand_aliases(src, buf, cap);
+    g_alias_depth = saved_alias_depth;
+    g_dq_depth = saved_dq_depth;
+    return r;
 }
 
 static const char *shell_expand_aliases(const char *src, char *buf,
