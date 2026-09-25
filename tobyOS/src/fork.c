@@ -610,13 +610,32 @@ long sys_fork(void) {
     /* Slice 88: park same-CR3 siblings before write-protecting their pages. */
     tg_vm_quiesce(parent);
 
-    /* Walk+WP under STW without the BKL: chrome's address space is huge and
+    /* Walk+WP under STW WITHOUT THE BKL: chrome's address space is huge and
      * holding the global lock across vmm_cow_fork freezes every other syscall
      * (including DevTools pipe I/O) for tens of seconds. Siblings are parked;
-     * page_ref atomics serialize with #PF CoW. Re-take BKL for VMA clone. */
+     * page_ref atomics serialize with #PF CoW.
+     *
+     * The BKL is NOT re-taken for mmap_cow_clone below, and does not need to
+     * be. This block used to read `held = bkl_held(); ... if (held)
+     * bkl_enter();` under a comment saying "Re-take BKL for VMA clone" -- but
+     * tg_vm_quiesce has already released the BKL (and sched_yield never
+     * leaves it held), so `held` was always false and that re-take never
+     * ran. Removed, because code that reads as locking and is not is exactly
+     * what hid the fd-clone race (see entry_bkl above).
+     *
+     * Why the clone is safe unlocked, in its one legal position:
+     *   - it reads, and sets CoW flags in, the PARENT's VMA table. Every
+     *     writer of that table is a thread of this address space, and every
+     *     one of them is parked by tg_vm_quiesce (a vfork child shares the
+     *     cr3, so it is parked too);
+     *   - it writes the CHILD's table, which nothing else can reach: the
+     *     child is not runnable yet, and the slot was cleared when its last
+     *     owner was reaped (mmap_cleanup_proc);
+     *   - it MUST run before tg_vm_resume: once siblings run they can map
+     *     regions the PTE snapshot never saw, and the child would inherit
+     *     VMAs its page tables lack. Taking the BKL here instead is the
+     *     slice-92 cycle (forker waits for the lock a parked sibling holds). */
     {
-        bool held = bkl_held();
-        if (held) bkl_exit();
 #ifdef CHROMIUM_BOOT
         kprintf("[fork] cow_fork begin pid=%d\n", parent->pid);
 #endif
@@ -624,17 +643,6 @@ long sys_fork(void) {
 #ifdef CHROMIUM_BOOT
         kprintf("[fork] cow_fork done pid=%d rc=%d\n", parent->pid, cow_rc);
 #endif
-        /* Slice 92: this bkl_enter is the actor edge of the freeze cycle --
-         * a sibling parked on vm_quiesce while holding the BKL wedged us
-         * here forever (before vm_quiesce_park_oncpu dropped it). Time it:
-         * if [fork] bkl re-take ever prints, some park point still holds
-         * the BKL and the cycle is back. */
-        uint64_t bkl_t0 = perf_now_ns();
-        if (held) bkl_enter();
-        uint64_t bkl_dt = perf_now_ns() - bkl_t0;
-        if (bkl_dt > 2000000000ull)
-            kprintf("[fork] bkl re-take after sweep took %lu ms pid=%d\n",
-                    (unsigned long)(bkl_dt / 1000000ull), parent->pid);
         /* VMA tables are tgid-keyed; chrome forks from a launcher THREAD. */
         int vma_pid = parent->is_thread ? parent->tgid : parent->pid;
         if (cow_rc == 0)
