@@ -2505,6 +2505,58 @@ static const struct shell_heredoc *shell_heredoc_take(void) {
     return h;
 }
 
+/* A LOOP RUNS ITS BODY MORE THAN ONCE; ITS HERE-DOCUMENTS WERE READ ONCE.
+ *
+ *     for i in a b; do          bash: i=a / i=b
+ *       cat <<EOF               tsh : i=a / "here-document body missing"
+ *     i=$i
+ *     EOF
+ *     done
+ *
+ * The bodies are queued when the loop is read and consumed as each command
+ * runs, so the first pass took them all and the second found the queue
+ * empty. The loop marks the queue before its first pass -- the raw text,
+ * since shell_heredoc_take() expands a slot in place -- and puts it back
+ * before every later one. A queue with nothing pending costs nothing. */
+struct shell_heredoc_mark {
+    int head, count, n;
+    char *body[SHELL_HEREDOC_MAX];
+    size_t len[SHELL_HEREDOC_MAX];
+    bool expand[SHELL_HEREDOC_MAX];
+};
+
+static void shell_heredoc_mark_take(struct shell_heredoc_mark *m) {
+    m->head = g_heredoc_head;
+    m->count = g_heredoc_count;
+    m->n = 0;
+    for (int i = g_heredoc_head; i < g_heredoc_count; i++) {
+        char *copy = (char *)kmalloc(g_heredocs[i].len + 1);
+        if (!copy) break;
+        memcpy(copy, g_heredocs[i].body, g_heredocs[i].len + 1);
+        m->body[m->n] = copy;
+        m->len[m->n] = g_heredocs[i].len;
+        m->expand[m->n] = g_heredocs[i].expand;
+        m->n++;
+    }
+}
+
+static void shell_heredoc_mark_rewind(const struct shell_heredoc_mark *m) {
+    if (m->n == 0) return;
+    for (int j = 0; j < m->n; j++) {
+        struct shell_heredoc *h = &g_heredocs[m->head + j];
+        memcpy(h->body, m->body[j], m->len[j] + 1);
+        h->len = m->len[j];
+        h->expand = m->expand[j];
+    }
+    g_heredoc_head = m->head;
+    g_heredoc_count = m->count;
+}
+
+static void shell_heredoc_mark_free(struct shell_heredoc_mark *m) {
+    for (int j = 0; j < m->n; j++) kfree(m->body[j]);
+    m->n = 0;
+}
+
 /* ---- cwd/path helpers ------------------------------------------- *
  *
  * The VFS takes canonical absolute paths. User programs get cwd-aware
@@ -24669,7 +24721,10 @@ static bool shell_try_for_command(const char *src) {
     /* One exit path, so the redirection frame is always unwound. Every
      * `return true` inside the loop became a `goto done` for that reason. */
     bool set_last = true;
+    struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
+    shell_heredoc_mark_take(&hd_mark);
     for (int i = 0; i < items->argc; i++) {
+        if (i > 0) shell_heredoc_mark_rewind(&hd_mark);
         /* bash fires DEBUG for the `for` head on EVERY iteration, with the
          * head's line, before the body's own commands fire (1190). */
         shell_run_debug_trap();
@@ -24720,6 +24775,7 @@ static bool shell_try_for_command(const char *src) {
         }
     }
 done:
+    shell_heredoc_mark_free(&hd_mark);
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
     kfree(wl);
@@ -24899,6 +24955,8 @@ static bool shell_try_arith_for_command(const char *src) {
     bool set_last = true;
     long v = 0;
     unsigned long head_line = g_shell_lineno;
+    struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
+    shell_heredoc_mark_take(&hd_mark);
     shell_run_debug_trap();                     /* init (1191) */
     if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
     if (!shell_arith_for_eval(exprs[0], &v)) {
@@ -24907,6 +24965,7 @@ static bool shell_try_arith_for_command(const char *src) {
         goto done;
     }
     for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+        if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         g_shell_lineno = head_line;
         shell_run_debug_trap();                 /* the condition */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
@@ -24954,6 +25013,7 @@ static bool shell_try_arith_for_command(const char *src) {
         }
     }
 done:
+    shell_heredoc_mark_free(&hd_mark);
     g_shell_lineno = head_line;
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
@@ -25037,7 +25097,10 @@ static bool shell_try_while_command(const char *src) {
      * as if it had finished normally. Found on 2026-08-25 by a ^C parity
      * case: `while :; do :; done` returned to a prompt on its own, before
      * the interrupt it was supposed to be testing ever arrived. */
+    struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
+    shell_heredoc_mark_take(&hd_mark);
     for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+        if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         g_errexit_suspend++;              /* the condition is a decision */
         execute_line_text(cond);
         g_errexit_suspend--;
@@ -25088,6 +25151,7 @@ static bool shell_try_while_command(const char *src) {
         if (iter == SHELL_LOOP_ITER_MAX - 1) overrun = true;
     }
 done:
+    shell_heredoc_mark_free(&hd_mark);
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
     kfree(cond);
@@ -25174,7 +25238,10 @@ static bool shell_try_until_command(const char *src) {
      * as if it had finished normally. Found on 2026-08-25 by a ^C parity
      * case: `while :; do :; done` returned to a prompt on its own, before
      * the interrupt it was supposed to be testing ever arrived. */
+    struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
+    shell_heredoc_mark_take(&hd_mark);
     for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+        if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         /* THE CONDITION IS A DECISION, NOT A FAILURE -- and `until` is the
          * loop whose condition is EXPECTED to fail. `set -e; until false; do
          * ...; done` exited the shell before the body ever ran. `while` had
@@ -25229,6 +25296,7 @@ static bool shell_try_until_command(const char *src) {
         if (iter == SHELL_LOOP_ITER_MAX - 1) overrun = true;
     }
 done:
+    shell_heredoc_mark_free(&hd_mark);
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
     kfree(cond);
