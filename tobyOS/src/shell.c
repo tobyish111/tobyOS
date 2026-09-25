@@ -15848,6 +15848,78 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
  * must print the apostrophe, and the arithmetic evaluator has always been
  * handed its text with quotes intact. Sharing one expander with the ${...}
  * word above is what briefly made both of those wrong. */
+/* A PATTERN WORD, after expansion, as the matcher needs it.
+ *
+ * Quoting makes a metacharacter literal, and shell_expand_word_ex records the
+ * quoted spans with no-split marks -- the same marks the field splitter reads.
+ * Each metacharacter inside one becomes an escape, which is how
+ * shell_glob_match spells "match this byte"; the marks themselves go. Used by
+ * ${v#pat}/${v%pat} and ${v/pat/rep} alike, so a `$'...'` or a quoted `*`
+ * means the same thing in both. */
+static void shell_pattern_from_marked(const char *raw, char *out, size_t cap) {
+    size_t o = 0;
+    bool prot = false;
+    for (const char *q = raw; *q && o + 2 < cap; q++) {
+        if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
+            out[o++] = *q++;
+            out[o++] = *q;
+            continue;
+        }
+        if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
+        if (prot && (*q == '*' || *q == '?' || *q == '[' ||
+                     *q == ']' || *q == '\\'))
+            out[o++] = '\\';
+        out[o++] = *q;
+    }
+    out[o] = '\0';
+}
+
+/* Where ${v/PAT/REP} divides: the first `/` that is NOT quoted or nested.
+ *
+ *     ${x//'/'/_}   ${x//"/"/_}   ${x//\//_}   ${x//$'\''/_}   ${x//${y}/_}
+ *
+ * The divider was the first `/` byte, so every one of those split inside its
+ * own pattern. Returns the divider, or 0 when there is no replacement. */
+static const char *shell_patsub_divider(const char *p) {
+    int brace = 0, paren = 0;
+    while (*p) {
+        char c = *p;
+        if (c == '\\' && p[1]) { p += 2; continue; }
+        if (c == '$' && p[1] == '\'') {                 /* $'...' honours \' */
+            p += 2;
+            while (*p && *p != '\'') { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p) p++;
+            continue;
+        }
+        if (c == '\'') {                                /* '...' has no escapes */
+            p++;
+            while (*p && *p != '\'') p++;
+            if (*p) p++;
+            continue;
+        }
+        if (c == '"') {
+            p++;
+            while (*p && *p != '"') { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p) p++;
+            continue;
+        }
+        if (c == '`') {
+            p++;
+            while (*p && *p != '`') { if (*p == '\\' && p[1]) p++; p++; }
+            if (*p) p++;
+            continue;
+        }
+        if (c == '$' && p[1] == '{') { brace++; p += 2; continue; }
+        if (c == '$' && p[1] == '(') { paren++; p += 2; continue; }
+        if (c == '}' && brace > 0) { brace--; p++; continue; }
+        if (c == '(' && paren > 0) { paren++; p++; continue; }
+        if (c == ')' && paren > 0) { paren--; p++; continue; }
+        if (c == '/' && brace == 0 && paren == 0) return p;
+        p++;
+    }
+    return 0;
+}
+
 static int shell_expand_literal_quotes(const char *word, char *out, size_t cap) {
     return shell_expand_word_ex(word, out, cap, false, false);
 }
@@ -16969,19 +17041,30 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             else if (*op == '#') { at_start = true; op++; }
             else if (*op == '%') { at_end = true; op++; }
 
+            /* PATTERN AND REPLACEMENT ARE WORDS, handled as ${v#pat} handles
+             * its pattern. The pattern used to be cut at the first `/` byte
+             * and unquoted with shell_case_unquote, which knows the quote
+             * CHARACTERS but not the no-split marks the expansion leaves --
+             * so `${v//$'\n'/|}` matched a pattern wrapped in mark bytes
+             * (nothing), a quoted `$'*'` stayed a wildcard, and a `$'\t'`
+             * replacement was inserted with its marks still around it. */
+            const char *div = shell_patsub_divider(op);
             char patraw[SHELL_PARSE_BUF_MAX];
             size_t pi = 0;
-            while (*op && *op != '/' && pi + 1 < sizeof patraw) patraw[pi++] = *op++;
+            const char *pend = div ? div : op + strlen(op);
+            while (op < pend && pi + 1 < sizeof patraw) patraw[pi++] = *op++;
             patraw[pi] = '\0';
-            const char *rep = (*op == '/') ? op + 1 : "";
+            const char *rep = div ? div + 1 : "";
 
-            char pattern[SHELL_PARSE_BUF_MAX];
-            if (shell_expand_word_ex(patraw, pattern, sizeof pattern, true, true) < 0)
+            char patexp[SHELL_PARSE_BUF_MAX];
+            if (shell_expand_word_ex(patraw, patexp, sizeof patexp, true, true) < 0)
                 return -1;
-            shell_case_unquote(pattern, sizeof pattern);
+            char pattern[SHELL_PARSE_BUF_MAX];
+            shell_pattern_from_marked(patexp, pattern, sizeof pattern);
             char repl[SHELL_PARSE_BUF_MAX];
             if (shell_expand_word_ex(rep, repl, sizeof repl, true, true) < 0)
                 return -1;
+            shell_strip_nosplit_inplace(repl);
 
             char value[SHELL_PARSE_BUF_MAX];
             bool is_set = false, vjoin = false;
@@ -16989,12 +17072,24 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                 return -1;
 
             size_t vlen = strlen(value);
+            /* AN EMPTY PATTERN CHANGES NOTHING unless it is anchored:
+             * bash gives `abc` for ${x///S} and ${x//''/S}, but `Sabc` and
+             * `abcS` for ${x/#/S} and ${x/%/S}. */
+            if (!pattern[0] && !at_start && !at_end)
+                return vjoin ? shell_append_str(buf, pos, cap, value)
+                             : shell_append_data_str(buf, pos, cap, value);
             char out[SHELL_PARSE_BUF_MAX];
             size_t o = 0;
             size_t i = 0;
             bool done_one = false;
             char cand[SHELL_PARSE_BUF_MAX];
-            while (i <= vlen && o + 1 < sizeof out) {
+            /* THE END OF THE VALUE IS TRIED ONLY WHEN IT CAN BE THE MATCH:
+             * an empty value, or a /% anchor. Otherwise a match that ran to
+             * the end was followed by an empty match AT the end, and
+             * ${x//*\/S} gave `SS` where bash gives `S`. (The backslash only
+             * keeps this comment open.) */
+            while ((i < vlen || (i == vlen && (vlen == 0 || at_end))) &&
+                   o + 1 < sizeof out) {
                 bool matched = false;
                 size_t mlen = 0;
                 if ((!done_one || all) && !(at_start && i != 0)) {
@@ -17083,28 +17178,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             if (shell_expand_word_ex(op, patraw, sizeof patraw, true, true) < 0)
                 return -1;
             char patbuf[SHELL_PARSE_BUF_MAX];
-            {
-                /* Quoting makes a metacharacter literal, and the expansion
-                 * above records the quoted spans with no-split marks -- the
-                 * same marks the field splitter reads. Turn each metacharacter
-                 * inside one into an escape, which is how shell_glob_match
-                 * spells "match this byte". */
-                size_t o = 0;
-                bool prot = false;
-                for (const char *q = patraw; *q && o + 2 < sizeof patbuf; q++) {
-                    if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
-                        patbuf[o++] = *q++;
-                        patbuf[o++] = *q;
-                        continue;
-                    }
-                    if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
-                    if (prot && (*q == '*' || *q == '?' || *q == '[' ||
-                                 *q == ']' || *q == '\\'))
-                        patbuf[o++] = '\\';
-                    patbuf[o++] = *q;
-                }
-                patbuf[o] = '\0';
-            }
+            shell_pattern_from_marked(patraw, patbuf, sizeof patbuf);
             const char *pattern = patbuf;
 
             char value[SHELL_PARSE_BUF_MAX];
@@ -18316,7 +18390,10 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         char closers[16];
         int csp = 0;
         closers[csp++] = '}';
-        bool sq = false, dq = false;
+        /* sq_ansi: the open single quote is `$'...'`, which honours `\'`.
+         * Without it `"${x//$'\''/_}"` closed the quote at the escaped one,
+         * ran on past the `}`, and reported "unterminated ${...}". */
+        bool sq = false, dq = false, sq_ansi = false;
         while (*p && csp > 0) {
             char c = *p;
             if (n + 2 >= sizeof(expr)) {
@@ -18324,7 +18401,10 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
                 return -1;
             }
             if (sq) {
-                if (c == '\'') sq = false;
+                if (sq_ansi && c == '\\' && p[1]) {
+                    expr[n++] = *p++; expr[n++] = *p++; continue;
+                }
+                if (c == '\'') { sq = false; sq_ansi = false; }
                 expr[n++] = *p++;
                 continue;
             }
@@ -18335,6 +18415,11 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
                 continue;
             }
             if (c == '\\' && p[1]) { expr[n++] = *p++; expr[n++] = *p++; continue; }
+            if (c == '$' && p[1] == '\'') {
+                sq = true; sq_ansi = true;
+                expr[n++] = *p++; expr[n++] = *p++;
+                continue;
+            }
             if (c == '\'') { sq = true; expr[n++] = *p++; continue; }
             if (c == '"')  { dq = true; expr[n++] = *p++; continue; }
             if (c == '`') {
