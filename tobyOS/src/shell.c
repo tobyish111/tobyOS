@@ -485,6 +485,68 @@ struct shell_heredoc {
     bool expand;
 };
 
+/* ---- HERE-DOCUMENT BODIES BY TAG ----------------------------------------
+ *
+ * THE QUEUE WAS POSITIONAL, and a construct that does not run something
+ * does not consume its bodies. Every body a compound's lines opened was
+ * queued when the compound was READ, and each `<<` popped the next one when
+ * its command RAN -- so the first `<<` that did not run shifted every later
+ * one onto the wrong text:
+ *
+ *     f() {
+ *       if false; then            bash: wanted
+ *         cat <<A                 tsh : skipped
+ *     skipped
+ *     A
+ *       fi
+ *       cat <<B
+ *     wanted
+ *     B
+ *     }
+ *
+ * and likewise for an elif/else chain, a loop over nothing, a `break`
+ * between two bodies, an unmatched case arm, `false && cat <<A`, a
+ * function defined next to other bodies, and a loop's own `done <<B`
+ * (read before the body ran, so it took the body's text).
+ *
+ * So a body is tied to its OPERATOR, as bash ties it to the redirection
+ * node. When the reader collects one it stores it here and writes the id
+ * into the command text, inside the delimiter word:
+ *
+ *     cat <<EOF      ->      cat <<\x1e17\x1eEOF
+ *
+ * The delimiter is a LITERAL word (never expanded), so the tag rides
+ * through the tokenizer untouched, through every slice, copy, loop pass and
+ * function body the text goes into, and the redirect parser fetches body 17
+ * wherever that text is run. A tagged operator is already collected, so
+ * shell_line_find_heredocs skips it and re-reading stored text never hunts
+ * for a body again.
+ *
+ * LIFETIME. A body belongs to the reader UNIT that collected it -- one
+ * top-level command, simple or compound -- and is freed when that unit has
+ * run, so a long script does not accumulate every body it ever read. A
+ * function definition PINS the bodies its text names (shell_hd_pin_text);
+ * a pinned body outlives its unit and goes when the last pin does
+ * (redefinition or unset). A forked background job gets its own copy.
+ *
+ * 0x1e (ASCII RS) is used by nothing else in the shell; like the 0x01/0x02/
+ * 0x04 marks, a script cannot usefully contain it after `<<`. */
+#define SHELL_HD_TAG '\x1e'
+struct shell_hd_entry {
+    char    *body;
+    size_t   len;
+    bool     expand;     /* unquoted delimiter: expanded at use */
+    bool     live;
+    unsigned unit;       /* collecting reader unit; 0 = orphaned but pinned */
+    int      pins;       /* function definitions naming it */
+};
+static struct shell_hd_entry *g_hd_store;
+static int      g_hd_cap;
+static unsigned g_hd_unit_seq;      /* units are numbered from 1 */
+static unsigned g_hd_unit_cur;
+static void shell_hd_pin_text(const char *text, int delta);
+static void shell_hd_strip_tags(char *s);
+
 static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
 static struct shell_function g_functions[SHELL_FUNC_MAX];
 static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
@@ -738,6 +800,7 @@ static int jobs_add(int pid, const char *name) {
                 }
             }
             g_jobs[i].name[n] = 0;
+            shell_hd_strip_tags(g_jobs[i].name);   /* see SHELL_HD_TAG */
             return g_jobs[i].id;
         }
     }
@@ -2065,6 +2128,12 @@ static int shell_function_set(const char *name, const char *body) {
         return -1;
     }
 
+    /* THE BODY'S HERE-DOCUMENTS LIVE AS LONG AS THE FUNCTION: pin every
+     * tagged one it names (SHELL_HD_TAG) -- the new body first, so a
+     * redefinition from the same text never drops a body it still uses --
+     * and release the old body's. */
+    shell_hd_pin_text(bcopy, +1);
+    shell_hd_pin_text(g_functions[idx].body, -1);
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
     for (int i = 0; i < g_functions[idx].nheredoc; i++)
@@ -2091,6 +2160,7 @@ static int shell_function_set(const char *name, const char *body) {
 static void shell_function_unset(const char *name) {
     int idx = shell_function_find(name);
     if (idx < 0) return;
+    shell_hd_pin_text(g_functions[idx].body, -1);      /* see define */
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
     for (int i = 0; i < g_functions[idx].nheredoc; i++)
@@ -2555,6 +2625,133 @@ static void shell_heredoc_mark_rewind(const struct shell_heredoc_mark *m) {
 static void shell_heredoc_mark_free(struct shell_heredoc_mark *m) {
     for (int j = 0; j < m->n; j++) kfree(m->body[j]);
     m->n = 0;
+}
+
+/* ---- the tag store (see SHELL_HD_TAG) ---- */
+
+static void shell_hd_free(int id) {
+    struct shell_hd_entry *e = &g_hd_store[id];
+    kfree(e->body);
+    memset(e, 0, sizeof *e);
+}
+
+/* Keep a collected body; returns its id, or -1. */
+static int shell_hd_store(const char *body, size_t len, bool expand) {
+    int id = -1;
+    for (int i = 0; i < g_hd_cap; i++)
+        if (!g_hd_store[i].live) { id = i; break; }
+    if (id < 0) {
+        int ncap = g_hd_cap ? g_hd_cap * 2 : 32;
+        struct shell_hd_entry *n =
+            (struct shell_hd_entry *)kmalloc(sizeof(*n) * (size_t)ncap);
+        if (!n) return -1;
+        memset(n, 0, sizeof(*n) * (size_t)ncap);
+        if (g_hd_store) {
+            memcpy(n, g_hd_store, sizeof(*n) * (size_t)g_hd_cap);
+            kfree(g_hd_store);
+        }
+        id = g_hd_cap;
+        g_hd_store = n;
+        g_hd_cap = ncap;
+    }
+    char *copy = (char *)kmalloc(len + 1);
+    if (!copy) return -1;
+    memcpy(copy, body, len);
+    copy[len] = '\0';
+    struct shell_hd_entry *e = &g_hd_store[id];
+    e->body = copy;
+    e->len = len;
+    e->expand = expand;
+    e->live = true;
+    e->unit = g_hd_unit_cur;
+    e->pins = 0;
+    return id;
+}
+
+/* A unit has run: its bodies go, except the ones a function now owns. */
+static void shell_hd_release_unit(unsigned unit) {
+    if (!unit) return;
+    for (int i = 0; i < g_hd_cap; i++) {
+        struct shell_hd_entry *e = &g_hd_store[i];
+        if (!e->live || e->unit != unit) continue;
+        if (e->pins > 0) e->unit = 0;
+        else shell_hd_free(i);
+    }
+}
+
+/* `s` at a tag? Returns the byte after it and sets *id, or 0. */
+static const char *shell_hd_tag_scan(const char *s, int *id) {
+    if (*s != SHELL_HD_TAG) return 0;
+    const char *q = s + 1;
+    long v = 0;
+    bool any = false;
+    while (*q >= '0' && *q <= '9') {
+        v = v * 10 + (*q - '0');
+        if (v > 100000000L) return 0;
+        q++;
+        any = true;
+    }
+    if (!any || *q != SHELL_HD_TAG) return 0;
+    *id = (int)v;
+    return q + 1;
+}
+
+/* Every tag in `text` gains (+1) or loses (-1) a pin. */
+static void shell_hd_pin_text(const char *text, int delta) {
+    for (const char *p = text; p && *p; p++) {
+        int id;
+        const char *e = shell_hd_tag_scan(p, &id);
+        if (!e) continue;
+        if (id >= 0 && id < g_hd_cap && g_hd_store[id].live) {
+            struct shell_hd_entry *en = &g_hd_store[id];
+            en->pins += delta;
+            if (en->pins <= 0) {
+                en->pins = 0;
+                if (en->unit == 0) shell_hd_free(id);
+            }
+        }
+        p = e - 1;
+    }
+}
+
+/* Remove every tag from `s`, in place: text shown to a person (a function
+ * body from `declare -f`/`type`, a job's name) must read as it was typed. */
+static void shell_hd_strip_tags(char *s) {
+    if (!s) return;
+    char *w = s;
+    for (const char *r = s; *r; ) {
+        int id;
+        const char *e = shell_hd_tag_scan(r, &id);
+        if (e) { r = e; continue; }
+        *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+/* The body a TAGGED `<<` names, as the redirection's text. Unexpanded
+ * bodies are used where they sit -- the store outlives the command. An
+ * unquoted delimiter's body is copied into a queue slot and expanded THERE
+ * (shell_heredoc_take), because the stored text must stay raw for the next
+ * loop pass or call. The slots are recycled once every one has been taken:
+ * a taken body was copied into its pipe when the redirect was applied. */
+static const char *shell_hd_text_for(int id) {
+    if (id < 0 || id >= g_hd_cap || !g_hd_store[id].live) {
+        kprintf("shell: here-document body missing\n");
+        return 0;
+    }
+    struct shell_hd_entry *e = &g_hd_store[id];
+    if (!e->expand) return e->body;
+    if (g_heredoc_count >= SHELL_HEREDOC_MAX &&
+        g_heredoc_head >= g_heredoc_count) {
+        g_heredoc_count = 0;
+        g_heredoc_head = 0;
+    }
+    if (shell_heredoc_push(e->body, e->len, true) < 0) {
+        kprintf("shell: too many here-documents in one command\n");
+        return 0;
+    }
+    const struct shell_heredoc *h = shell_heredoc_take();
+    return h ? h->body : 0;
 }
 
 /* ---- cwd/path helpers ------------------------------------------- *
@@ -3934,7 +4131,11 @@ static bool shell_declare_print(const char *name) {
 static void shell_declare_print_function(const struct shell_function *fn) {
     if (!fn || !fn->name) return;
     shell_printf("%s () \n", fn->name);
-    shell_printf("%s\n", fn->body ? fn->body : "{ :; }");
+    /* Without its here-document tags: see SHELL_HD_TAG. */
+    char *shown = fn->body ? shell_strdup(fn->body) : 0;
+    if (shown) shell_hd_strip_tags(shown);
+    shell_printf("%s\n", shown ? shown : (fn->body ? fn->body : "{ :; }"));
+    if (shown) kfree(shown);
 }
 
 static void cmd_declare(int argc, char **argv) {
@@ -8115,6 +8316,7 @@ struct shell_heredoc_spec {
     char delim[64];
     bool strip_tabs;      /* <<- : leading tabs stripped from the body */
     bool quoted;          /* delimiter was quoted: body does not expand */
+    size_t word_off;      /* where the delimiter word starts in the line */
 };
 
 /* Find EVERY here-document operator on `line`, left to right, which is the
@@ -8216,6 +8418,11 @@ static int shell_line_find_heredocs(const char *line,
             p++;
         }
         while (*p == ' ' || *p == '\t') p++;
+        sp->word_off = (size_t)(p - line);
+        /* ALREADY COLLECTED: the word carries a tag (see SHELL_HD_TAG), so
+         * its body is in the store, not on the lines that follow. Step over
+         * the word and do not count it. */
+        bool tagged = (*p == SHELL_HD_TAG);
 
         size_t pos = 0;
         while (shell_heredoc_delim_char(*p)) {
@@ -8234,7 +8441,7 @@ static int shell_line_find_heredocs(const char *line,
         }
         sp->delim[pos] = '\0';
         if (!sp->delim[0]) return found;       /* `<<` with no word */
-        found++;
+        if (!tagged) found++;
         /* Keep scanning from here. The for-header's p++ would skip the
          * character the delimiter scan stopped on, so step back one. */
         p--;
@@ -8274,18 +8481,48 @@ static int shell_collect_heredoc(char **pp, const char *delim,
                                  bool strip_tabs, bool quoted);
 
 /* Collect every here-document body that ONE PHYSICAL LINE opens, in the order
- * its operators appear, appending them to the queue. Returns false on failure.
+ * its operators appear, into the tag store. Returns false on failure.
  *
  * Per physical line because that is where the bodies are: they follow the line
- * that opened them, ahead of any continuation or compound-command text. */
-static bool shell_collect_line_heredocs(const char *line, char **pp) {
+ * that opened them, ahead of any continuation or compound-command text.
+ *
+ * `from` is where operators may start: a line that CONTINUES a quoted string
+ * is string data up to where that string closes, so a `<<` in it is text.
+ * When anything was collected, *tagged receives a heap copy of `line` with
+ * each operator's id written into its delimiter word (SHELL_HD_TAG); the
+ * caller runs or appends THAT, and frees it. Otherwise *tagged is 0. */
+static bool shell_collect_line_heredocs(const char *line, const char *from,
+                                        char **pp, char **tagged) {
+    *tagged = 0;
     struct shell_heredoc_spec hd[SHELL_HEREDOC_MAX];
-    int nhd = shell_line_find_heredocs(line, hd, SHELL_HEREDOC_MAX);
+    int nhd = shell_line_find_heredocs(from, hd, SHELL_HEREDOC_MAX);
+    if (nhd == 0) return true;
+    int ids[SHELL_HEREDOC_MAX];
     for (int i = 0; i < nhd; i++) {
-        if (shell_collect_heredoc(pp, hd[i].delim, hd[i].strip_tabs,
-                                  hd[i].quoted) < 0)
-            return false;
+        ids[i] = shell_collect_heredoc(pp, hd[i].delim, hd[i].strip_tabs,
+                                       hd[i].quoted);
+        if (ids[i] < 0) return false;
     }
+    size_t base = (size_t)(from - line);
+    size_t ll = strlen(line);
+    char *out = (char *)kmalloc(ll + (size_t)nhd * 16 + 1);
+    if (!out) {
+        kprintf("sh: out of memory tagging here-documents\n");
+        return false;
+    }
+    size_t o = 0, r = 0;
+    for (int i = 0; i < nhd; i++) {
+        size_t at = base + hd[i].word_off;
+        memcpy(out + o, line + r, at - r);
+        o += at - r;
+        r = at;
+        o += (size_t)ksnprintf(out + o, 16, "%c%d%c",
+                               SHELL_HD_TAG, ids[i], SHELL_HD_TAG);
+    }
+    memcpy(out + o, line + r, ll - r);
+    o += ll - r;
+    out[o] = '\0';
+    *tagged = out;
     return true;
 }
 
@@ -8313,11 +8550,11 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         const char *match_line = line_start;
         if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
             *pp = p;
-            /* Raw either way: an unquoted body is expanded when it is
-             * USED -- see shell_heredoc_take(). */
-            int prc = shell_heredoc_push(body, bpos, !quoted);
+            /* Into the store, raw -- an unquoted body is expanded when it is
+             * USED (shell_hd_text_for). The id comes back: SHELL_HD_TAG. */
+            int id = shell_hd_store(body, bpos, !quoted);
             kfree(body);
-            return prc;
+            return id;
         }
 
         /* <<- strips leading TABS from the body too, not just from the line
@@ -9656,7 +9893,15 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     int last = 0;
     char *p = text;
     bool first_line = true;
+    /* The here-document unit being read and run (see SHELL_HD_TAG), and a
+     * tagged copy of the unit's first line, both released per unit and once
+     * more on the way out for the paths that `break`. */
+    unsigned hd_saved_unit = g_hd_unit_cur;
+    unsigned hd_unit = 0;
+    char *hd_tline = 0;
     while (*p) {
+        if (hd_unit) { shell_hd_release_unit(hd_unit); hd_unit = 0; }
+        if (hd_tline) { kfree(hd_tline); hd_tline = 0; }
         g_shell_lineno++;
         unsigned long line_first = g_shell_lineno;
         char *line_start = p;
@@ -9767,8 +10012,15 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * terminator then ran off the end of the script. Each physical line the
          * compound scan pulls in contributes its own bodies as it is read, so
          * they queue in the order their operators appear. */
-        shell_heredoc_reset();
-        if (!shell_collect_line_heredocs(line, &p)) hd_failed = true;
+        /* No shell_heredoc_reset here any more: the reader does not queue
+         * bodies (they are tagged), and resetting could clobber slots an
+         * OUTER command had taken but not yet applied. */
+        hd_unit = ++g_hd_unit_seq;
+        if (!hd_unit) hd_unit = ++g_hd_unit_seq;      /* never 0 */
+        g_hd_unit_cur = hd_unit;
+        if (!shell_collect_line_heredocs(line, line, &p, &hd_tline))
+            hd_failed = true;
+        if (hd_tline) line = hd_tline;
 
         struct shell_scan scan;
         shell_scan_init(&scan);
@@ -9927,10 +10179,25 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 } else {
                     sep = "; ";
                 }
-                size_t seplen = strlen(sep), nllen = strlen(nl);
+                /* This physical line may open here-documents of its own --
+                 * `do cat <<E3; break; done` -- whose bodies are the lines
+                 * that follow it, not part of the compound. Collected BEFORE
+                 * the line is appended, so what is appended is the TAGGED
+                 * line. A line that continues a quoted string is string
+                 * data until that string closes. */
+                char *tnl = 0;
+                const char *hd_from = in_q ? (qclose ? qclose : nl + strlen(nl))
+                                           : nl;
+                if (!shell_collect_line_heredocs(nl, hd_from, &p, &tnl)) {
+                    hd_failed = true;
+                    break;
+                }
+                const char *app = tnl ? tnl : nl;
+                size_t seplen = strlen(sep), nllen = strlen(app);
                 if (alen + seplen + nllen + 1 > SHELL_PARSE_BUF_MAX) {
                     kprintf("sh: compound command too long (max %d bytes)\n",
                             SHELL_PARSE_BUF_MAX);
+                    if (tnl) kfree(tnl);
                     overflow = true;
                     break;
                 }
@@ -9938,16 +10205,10 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 /* The counter was advanced where the line was CONSUMED, a
                  * few lines up: this only records where it landed. */
                 shell_lmap_add(alen, g_shell_lineno);
-                memcpy(accum + alen, nl, nllen);   alen += nllen;
+                memcpy(accum + alen, app, nllen);   alen += nllen;
                 accum[alen] = '\0';
-                /* This physical line may open here-documents of its own --
-                 * `do cat <<E3; break; done` -- whose bodies are the lines
-                 * that follow it, not part of the compound. */
-                if (!shell_collect_line_heredocs(nl, &p)) {
-                    hd_failed = true;
-                    break;
-                }
-                shell_scan_line(&scan, nl);
+                shell_scan_line(&scan, app);
+                if (tnl) kfree(tnl);
             }
             if (overflow || shell_scan_incomplete(&scan)) {
                 if (!overflow)
@@ -10001,7 +10262,6 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             shell_set_status(1);
         }
         last = g_last_status;
-        shell_heredoc_reset();
         if (g_shell_flow == SHELL_FLOW_EXIT) {
             last = g_shell_flow_status;
             break;
@@ -10014,6 +10274,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
     }
+    if (hd_unit) shell_hd_release_unit(hd_unit);
+    if (hd_tline) kfree(hd_tline);
+    g_hd_unit_cur = hd_saved_unit;
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
     g_noexec_error = saved_noexec;
@@ -10848,8 +11111,13 @@ static int shell_type_print_paths(const char *name, const char *first,
  * re-indentation, so those still differ -- printing the definition at all
  * is the part that was missing, and a wrong indent is a smaller lie than
  * an absent body. */
-static void shell_print_function_def(const char *name, const char *body) {
+static void shell_print_function_def(const char *name, const char *body_raw) {
     shell_printf("%s () \n{ \n", name);
+    /* Printed without its here-document tags (SHELL_HD_TAG); freed at the
+     * one exit below. */
+    char *body_shown = body_raw ? shell_strdup(body_raw) : 0;
+    if (body_shown) shell_hd_strip_tags(body_shown);
+    const char *body = body_shown ? body_shown : body_raw;
     const char *p = body;
     bool printed_any = false;
     while (p && *p) {
@@ -10891,6 +11159,7 @@ static void shell_print_function_def(const char *name, const char *body) {
     }
     if (printed_any) shell_putc('\n');
     shell_printf("}\n");
+    if (body_shown) kfree(body_shown);
 }
 
 /* type [-afpPt] NAME...
@@ -21540,14 +21809,25 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, saved,
                                     -1) < 0) return -1;
             } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
-                if (g_heredoc_head >= g_heredoc_count) {
-                    kprintf("shell: here-document body missing\n");
-                    return -1;
+                /* A TAGGED operator names its own body (SHELL_HD_TAG); an
+                 * untagged one -- the interactive reader, which collects one
+                 * body per line itself -- takes the next queued body. */
+                const char *hd_text = 0;
+                int hd_id;
+                if (shell_hd_tag_scan(tok[*io].text, &hd_id)) {
+                    hd_text = shell_hd_text_for(hd_id);
+                    if (!hd_text) return -1;
+                } else {
+                    if (g_heredoc_head >= g_heredoc_count) {
+                        kprintf("shell: here-document body missing\n");
+                        return -1;
+                    }
+                    const struct shell_heredoc *h = shell_heredoc_take();
+                    if (!h) return -1;     /* the expansion reported it */
+                    hd_text = h->body;
                 }
-                const struct shell_heredoc *h = shell_heredoc_take();
-                if (!h) return -1;         /* the expansion reported it */
-                cur->stdin_text = h->body;
-                if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, h->body,
+                cur->stdin_text = hd_text;
+                if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, hd_text,
                                     -1) < 0) return -1;
             } else if (t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
                 int target = -1;
