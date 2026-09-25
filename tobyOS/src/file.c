@@ -347,6 +347,23 @@ void file_set_open_path(struct file *f, const char *kpath) {
 
 struct file *file_clone(struct file *src) {
     if (!src) return 0;
+    /* TRIPWIRE: every counter file_clone bumps (pipe readers/writers,
+     * vfs_refs, socket refs) is a plain int whose only guard is the BKL --
+     * see file.h and proc.c's slice 89 note. A clone without it can lose an
+     * update against a close on another CPU, and a lost pipe count frees
+     * the pipe early and then TWICE (hardware 2026-09-25: `double free
+     * ... by=first=` inside file_close -> pipe_close_reader). Warn-once,
+     * so a regression names itself instead of panicking hours later. */
+    if (!bkl_held()) {
+        static int unlocked_warned;
+        if (unlocked_warned < 4) {
+            unlocked_warned++;
+            struct proc *cp = current_proc();
+            kprintf("[file] file_clone kind=%d WITHOUT the BKL (pid=%d) "
+                    "caller=%p\n", (int)src->kind, cp ? cp->pid : -1,
+                    __builtin_return_address(0));
+        }
+    }
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) return 0;
     memset(f, 0, sizeof(*f));

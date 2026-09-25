@@ -599,6 +599,14 @@ long sys_fork(void) {
     child->cr3       = new_pml4;
     child->owns_pml4 = true;
 
+    /* Whether this syscall entered holding the BKL -- read BEFORE
+     * tg_vm_quiesce, because tg_vm_quiesce RELEASES it and deliberately does
+     * not take it back. The `held` test in the block below runs after that,
+     * so it is always false: its bkl_enter never fires, and without the
+     * re-take after the block everything from here to the end of fork ran
+     * with NO BKL -- including the fd clone loop. See the note there. */
+    bool entry_bkl = bkl_held();
+
     /* Slice 88: park same-CR3 siblings before write-protecting their pages. */
     tg_vm_quiesce(parent);
 
@@ -640,6 +648,28 @@ long sys_fork(void) {
             return -ABI_ENOMEM;
         }
     }
+
+    /* RE-TAKE THE BKL BEFORE TOUCHING THE FD TABLE.
+     *
+     * file_clone bumps pipe readers/writers, vfs_refs and socket refs, and
+     * those are plain ints whose ONLY guard is the BKL (file.h; proc.c's
+     * slice 89 note is this same bug on the exit path). This loop ran
+     * unlocked -- see entry_bkl above -- so a fork on one CPU could lose an
+     * update against a close on another. A lost pipe decrement frees the
+     * pipe while an alias still points at it; the next fork of that alias
+     * counts it back up on freed memory, and its close frees it AGAIN:
+     *
+     *   kfree(...): double free size=98272 by=X first=X   (X = file_close's
+     *   call of pipe_close_reader)                          pid 91 (bash)
+     *
+     * twice on real hardware (2026-09-25), during the Oils corpus, where
+     * bash forks constantly with pipes open. The file_clone tripwire in
+     * file.c named sys_fork as an unlocked caller in QEMU on every boot.
+     *
+     * Here, not earlier: tg_vm_resume has run, so no sibling is parked on
+     * vm_quiesce any more, and the slice-92 cycle (forker waits for the BKL
+     * while a parked sibling holds it) cannot form. */
+    if (entry_bkl && !bkl_held()) bkl_enter();
 
     /* Clone file descriptors from the table the parent actually USES.
      *
