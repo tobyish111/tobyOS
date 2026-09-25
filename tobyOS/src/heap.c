@@ -81,7 +81,14 @@ typedef struct arena {
 typedef struct block_hdr {
     size_t   size;              /* header + payload, with INUSE_BIT in bit 0 */
     uint32_t magic;             /* KHEAP_MAGIC, validated on free */
-    uint32_t _pad;              /* keeps header 16 bytes -> payload is 16-aligned */
+    /* WHO LAST FREED THIS BLOCK -- the low 32 bits of kfree's return
+     * address. Kernel text is 0xffffffff8xxxxxxx, so the low half names the
+     * call site exactly (print it as 0xffffffff%08x). It exists for one
+     * reason: a double-free panic used to name only the SECOND caller's
+     * process, never either call site, and a 2026-09-25 hardware panic
+     * (`double free ... pid 97 (bash)`) could not be traced for exactly that
+     * reason. It also keeps the header 16 bytes -> payload 16-aligned. */
+    uint32_t freed_by;
 } block_hdr_t;
 
 _Static_assert(sizeof(block_hdr_t) == 16, "block_hdr_t must be 16 bytes");
@@ -379,21 +386,34 @@ static void coalesce_arena(arena_t *a) {
 void kfree(void *p) {
     if (!p) return;
 
+    /* The CALL SITE, for the panics below and for the stamp. Level 0 is
+     * always available, frame pointers or not. */
+    void *caller = __builtin_return_address(0);
+
     block_hdr_t *b = (block_hdr_t *)((uint8_t *)p - sizeof(block_hdr_t));
     if (b->magic != KHEAP_MAGIC) {
-        kpanic("kfree(%p): bad block magic 0x%x (corruption or not from kmalloc)",
-               p, b->magic);
+        /* Short: the reason is cut at ABI_CRASH_REASON_MAX (128). */
+        kpanic("kfree(%p): bad magic 0x%x by=%p", p, b->magic, caller);
     }
 
     uint64_t flags = spin_lock_irqsave(&g_heap_lock);
     if (!(b->size & INUSE_BIT)) {
+        uint32_t first = b->freed_by;
         spin_unlock_irqrestore(&g_heap_lock, flags);
-        kpanic("kfree(%p): double free (block already free, size=%lu)",
-               p, (unsigned long)(b->size & SIZE_MASK));
+        /* BOTH call sites: by= is this free, first= the one that freed it
+         * before (stamped below; the header survives coalescing as stale
+         * bytes inside the merged block, which is also why `size` here can
+         * be a merged run rather than the original allocation). Kept short:
+         * the reason is cut at ABI_CRASH_REASON_MAX (128), and this line is
+         * 99 characters even with an 8-digit size. */
+        kpanic("kfree(%p): double free size=%lu by=%p first=0xffffffff%08x",
+               p, (unsigned long)(b->size & SIZE_MASK), caller,
+               (unsigned)first);
     }
 
     size_t bsz = b->size & SIZE_MASK;
     b->size = bsz;                  /* clear INUSE_BIT */
+    b->freed_by = (uint32_t)(uintptr_t)caller;
     g_used_bytes -= bsz;
     g_free_count++;
 

@@ -1204,6 +1204,17 @@ static void pmm_init_and_test(void) {
 static void heap_init_and_test(void) {
     heap_init();
 
+#ifdef HEAP_DOUBLEFREE_SELFTEST
+    /* Proves the double-free panic names BOTH call sites: this boot must
+     * die with `by=` resolving to the second kfree line below and `first=`
+     * to the first one. Never in a shipped build. */
+    {
+        void *df = kmalloc(64);
+        kfree(df);                                   /* first=  */
+        kfree(df);                                   /* by=     */
+    }
+#endif
+
     struct heap_stats s0, s1, s2;
     heap_stats(&s0);
     kprintf("[heap] start: arenas=%lu total=%lu used=%lu free=%lu  "
