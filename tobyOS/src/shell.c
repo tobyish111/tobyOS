@@ -25347,6 +25347,28 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
     return false;
 }
 
+/* THE CASE SPLITTER'S QUOTE RULE. The three scans below look for `esac`,
+ * for the `)` that ends a pattern list and for the `;;` that ends a clause,
+ * and none of them knew about quotes: `echo ';;'` ended its own clause at
+ * the quoted `;;`, and a body string holding `esac` closed the whole case.
+ * If `q` starts a quoted span (or a backslash escape), return the LAST byte
+ * of it, so the caller's `q++` resumes just after; otherwise return `q`.
+ * `$'...'` honours `\'`, a plain '...' has no escapes, "..." honours a
+ * backslash. An unterminated span returns the byte before `end`. */
+static const char *shell_case_skip_quoted(const char *q, const char *end) {
+    if (*q == '\\') return (q + 1 < end) ? q + 1 : q;
+    bool ansi = false;
+    char qc = 0;
+    if (*q == '$' && q + 1 < end && q[1] == '\'') { ansi = true; qc = '\''; q++; }
+    else if (*q == '\'' || *q == '"') qc = *q;
+    else return q;
+    for (const char *p = q + 1; p < end; p++) {
+        if ((qc == '"' || ansi) && *p == '\\' && p + 1 < end) { p++; continue; }
+        if (*p == qc) return p;
+    }
+    return end - 1;
+}
+
 static bool shell_try_case_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "case")) return false;
@@ -25367,7 +25389,10 @@ static bool shell_try_case_command(const char *src) {
     const char *esac_at = 0;
     {
         int depth = 1;
+        const char *qend = in_at + 2 + strlen(in_at + 2);
         for (const char *q = in_at + 2; *q; q++) {
+            const char *qs = shell_case_skip_quoted(q, qend);
+            if (qs != q) { q = qs; continue; }
             if (!shell_word_boundary_before(in_at + 2, q)) continue;
             if (shell_starts_with_word(q, "case")) { depth++; continue; }
             if (shell_starts_with_word(q, "esac")) {
@@ -25431,6 +25456,8 @@ static bool shell_try_case_command(const char *src) {
             int d = 0;
             close = q;
             while (close < esac_at) {
+                const char *qs = shell_case_skip_quoted(close, esac_at);
+                if (qs != close) { close = qs + 1; continue; }
                 if (*close == '(') d++;
                 else if (*close == ')') { if (d == 0) break; d--; }
                 close++;
@@ -25450,6 +25477,8 @@ static bool shell_try_case_command(const char *src) {
         {
             int cdepth = 0;
             for (const char *q = body; *q && q < esac_at; q++) {
+                const char *qs = shell_case_skip_quoted(q, esac_at);
+                if (qs != q) { q = qs; continue; }
                 if (shell_word_boundary_before(body, q)) {
                     if (shell_starts_with_word(q, "case")) { cdepth++; continue; }
                     if (shell_starts_with_word(q, "esac")) {
