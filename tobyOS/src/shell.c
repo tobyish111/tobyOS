@@ -8313,7 +8313,12 @@ static int shell_collect_heredoc(char **pp, const char *delim,
  *
  * `#` only starts a comment at the start of a word, so `a#b`, `${#x}` and
  * `$#` are untouched. */
-static void shell_strip_comment(char *s) {
+/* `mid_word`: the byte before `s` is part of a word (the tail of a string
+ * that closed just before it), so a `#` at `s` itself is not a comment. */
+static void shell_strip_comment_from(char *s, bool mid_word);
+static void shell_strip_comment(char *s) { shell_strip_comment_from(s, false); }
+
+static void shell_strip_comment_from(char *s, bool mid_word) {
     bool in_sq = false, in_dq = false, sq_ansi = false;
     /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Same rule as
      * shell_line_incomplete -- see the comment there for what went wrong. */
@@ -8334,8 +8339,9 @@ static void shell_strip_comment(char *s) {
         }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
-        if (*p == '#' && (p == s || is_space(p[-1]) || p[-1] == ';' ||
-                          p[-1] == '&' || p[-1] == '|' || p[-1] == '(')) {
+        if (*p == '#' && ((p == s && !mid_word) ||
+                          (p > s && (is_space(p[-1]) || p[-1] == ';' ||
+                          p[-1] == '&' || p[-1] == '|' || p[-1] == '(')))) {
             *p = '\0';
             return;
         }
@@ -8634,7 +8640,8 @@ static bool shell_scan_incomplete(const struct shell_scan *st) {
      * parser `[[ -n x` -- which is also why the accumulator would not join
      * `[[ a &&` to the line that finishes it. */
     return st->compound > 0 || st->paren > 0 || st->brace > 0 ||
-           st->func_hdr || st->cont_op || st->nest > 0 || st->dbracket;
+           st->func_hdr || st->cont_op || st->nest > 0 || st->dbracket ||
+           st->in_sq || st->in_dq;     /* the line ended inside a string */
 }
 
 static bool shell_word_eq(const char *w, size_t n, const char *lit) {
@@ -8675,7 +8682,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * `)`, `|` and `&` are operators of that grammar and not of this one.
      * Judging them by shell rules turned `[[ 'a b' =~ ^)a( ]]` into a shell
      * syntax error, where bash simply evaluates it. */
-    if (st->nest == 0 && !st->dbracket) {
+    /* ...and the same for a QUOTE left open by a previous line: the
+     * characters that follow are string data, so a continuation line that
+     * begins with `)` or `;;` must not be read as structure. */
+    if (st->nest == 0 && !st->dbracket && !st->in_sq && !st->in_dq) {
     if (c == '#') {                      /* a comment runs to end of line */
         while (*p) p++;
         /* A COMMENT IS NOT A TOKEN. `echo abcd |    # input` still ends in a
@@ -9079,6 +9089,9 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     bool sq = st->in_sq, dq = st->in_dq;
     bool sq_ansi = st->in_sq_ansi;
     int nest = st->nest;
+    /* This token CONTINUES a string opened on an earlier line: it is the
+     * tail of a word that already began, never the start of one. */
+    bool resumed_quote = (sq || dq) && nest == 0;
     int case_open = st->in_case;
     bool case_want_in = st->in_case_in;
     bool case_pat = st->in_case_pat;
@@ -9267,8 +9280,31 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->in_sq = sq; st->in_sq_ansi = sq_ansi; st->in_dq = dq;
         st->in_case = case_open; st->in_case_in = case_want_in;
         st->in_case_pat = case_pat;
+    } else if (sq || dq) {
+        /* A QUOTE LEFT OPEN AT THE END OF A LINE, OUTSIDE ANY NESTING.
+         * This was only recorded inside `$( )` and friends, so at the top
+         * level of a compound body the quote was forgotten at the line
+         * break. Two things followed from that:
+         *
+         *   - the accumulator joined the lines with "; ", so
+         *         if true; then m='a<newline>b'; fi
+         *     stored `a; b` -- in every compound form, both quote kinds;
+         *   - the next line was scanned fresh, so the CLOSING quote was
+         *     read as an OPENING one; in a case arm it swallowed the `;;`
+         *     and the script died with a syntax error.
+         *
+         * The word loop above only stops at a blank or an operator when
+         * no quote is open, so this branch is reached only when the line
+         * itself ran out inside one. */
+        st->in_sq = sq; st->in_sq_ansi = sq_ansi; st->in_dq = dq;
     }
     *pp = p;
+    /* THE TAIL OF A MULTI-LINE STRING IS NOT A KEYWORD. A continuation line
+     * reading `fi` inside a quote was compared against the reserved words
+     * below and closed the `if` early -- the string's own text rewrote the
+     * structure around it. Nothing about command position changes here
+     * either: the word's head was already counted on its own line. */
+    if (resumed_quote) return;
 
     /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar.
      *
@@ -9466,6 +9502,23 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * the definition, because bash makes it status 1 and not a syntax
      * error. */
     st->prev_word_name = shell_word_is_func_name(w, n);
+}
+
+/* On a line that CONTINUES a quoted string, where does that string close?
+ * Returns the character just after the closing quote, or 0 when the whole
+ * line is still inside it. `$'...'` and "..." honour a backslash; a plain
+ * '...' does not. */
+static char *shell_quote_tail_end(char *s, bool sq, bool sq_ansi) {
+    for (char *p = s; *p; p++) {
+        if (sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') return p + 1;
+        } else {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') return p + 1;
+        }
+    }
+    return 0;
 }
 
 /* Run the scanner over one physical line. A newline is a command separator,
@@ -9668,6 +9721,26 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 g_shell_lineno++;
 
                 char *nl = nstart;
+                /* A LINE THAT CONTINUES A QUOTED STRING IS STRING DATA, and
+                 * every clean-up below is wrong for it: the indentation is
+                 * content, a blank line is an empty line OF the string, a
+                 * leading `#` is a character, and trailing blanks are kept.
+                 * Only the part AFTER the string closes on this line is shell
+                 * text again, so only that part can hold a comment -- and a
+                 * `#` directly after the closing quote is mid-word. */
+                bool in_q = (scan.in_sq || scan.in_dq);
+                char *qclose = in_q ? shell_quote_tail_end(nl, scan.in_sq,
+                                                           scan.in_sq_ansi) : 0;
+                if (in_q) {
+                    if (qclose) {
+                        shell_strip_comment_from(qclose, true);
+                        size_t nz = strlen(nl);
+                        size_t keep = (size_t)(qclose - nl);
+                        while (nz > keep && (nl[nz - 1] == ' ' || nl[nz - 1] == '\t'))
+                            nl[--nz] = '\0';
+                    }
+                }
+                if (!in_q)
                 while (*nl == ' ' || *nl == '\t') nl++;
                 /* Inside arithmetic or `${ }` a `#` is an OPERATOR, not a
                  * comment, so the comment rules below apply only where a
@@ -9675,7 +9748,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 bool expr_ctx = (scan.nest > 0 &&
                                  (scan.nest_kind[scan.nest - 1] == 'a' ||
                                   scan.nest_kind[scan.nest - 1] == 'v'));
-                if (!expr_ctx) {
+                if (in_q) {
+                    /* taken as it stands -- see above */
+                } else if (!expr_ctx) {
                     if (*nl == '\0' || *nl == '#') continue;
                     shell_strip_comment(nl);     /* see shell_strip_comment */
                     size_t nz = strlen(nl);
@@ -9726,8 +9801,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                  * Only an ODD number of trailing backslashes continues:
                  * `\\` at end of line is a literal backslash and the
                  * command ends there. */
+                /* A LINE BREAK INSIDE A QUOTED STRING IS PART OF THE STRING.
+                 * Joining it with "; " rewrote `'a<newline>b'` as `a; b`.
+                 * Inside SINGLE quotes nothing is special, so a trailing
+                 * backslash is a literal byte and not a continuation;
+                 * inside DOUBLE quotes backslash-newline still vanishes. */
                 bool continued = false;
-                {
+                if (!scan.in_sq) {
                     size_t bs = 0;
                     while (bs < alen && accum[alen - 1 - bs] == '\\') bs++;
                     if (bs & 1u) {
@@ -9739,6 +9819,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 const char *sep;
                 if (continued) {
                     sep = "";
+                } else if (scan.in_sq || scan.in_dq) {
+                    sep = "\n";
                 } else if (scan.nest > 0) {
                     char kind = scan.nest_kind[scan.nest - 1];
                     /* Arithmetic and `${ }` hold ONE expression, so their
