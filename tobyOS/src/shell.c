@@ -473,12 +473,16 @@ struct shell_function {
      * each call. Heap strings, not the 64 KiB inline buffers the live queue
      * uses: a function record is permanent and most have none of these. */
     char *heredoc[SHELL_FUNC_HEREDOC_MAX];
+    bool  heredoc_expand[SHELL_FUNC_HEREDOC_MAX];   /* see shell_heredoc */
     int   nheredoc;
 };
 
 struct shell_heredoc {
     char body[SHELL_HEREDOC_BODY_MAX];
     size_t len;
+    /* The body is still RAW and has to be expanded when it is used -- an
+     * unquoted delimiter. See shell_heredoc_take(). */
+    bool expand;
 };
 
 static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
@@ -2075,6 +2079,8 @@ static int shell_function_set(const char *name, const char *body) {
                                  g_functions[idx].nheredoc < SHELL_FUNC_HEREDOC_MAX; i++) {
         char *copy = shell_strdup(g_heredocs[i].body);
         if (!copy) break;
+        g_functions[idx].heredoc_expand[g_functions[idx].nheredoc] =
+            g_heredocs[i].expand;
         g_functions[idx].heredoc[g_functions[idx].nheredoc++] = copy;
     }
     return 0;
@@ -2418,10 +2424,11 @@ static void shell_heredoc_reset(void) {
     for (int i = 0; i < SHELL_HEREDOC_MAX; i++) {
         g_heredocs[i].len = 0;
         g_heredocs[i].body[0] = '\0';
+        g_heredocs[i].expand = false;
     }
 }
 
-static int shell_heredoc_push(const char *body, size_t len) {
+static int shell_heredoc_push(const char *body, size_t len, bool expand) {
     if (g_heredoc_count >= SHELL_HEREDOC_MAX ||
         len + 1 > SHELL_HEREDOC_BODY_MAX) {
         return -1;
@@ -2430,6 +2437,7 @@ static int shell_heredoc_push(const char *body, size_t len) {
     memcpy(h->body, body, len);
     h->body[len] = '\0';
     h->len = len;
+    h->expand = expand;
     return 0;
 }
 
@@ -2451,6 +2459,48 @@ static int shell_heredoc_push(const char *body, size_t len) {
 static const struct shell_heredoc *shell_heredoc_pop(void) {
     if (g_heredoc_head >= g_heredoc_count) return 0;
     return &g_heredocs[g_heredoc_head++];
+}
+
+static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
+
+/* Pop the next body and, for an unquoted delimiter, EXPAND IT NOW.
+ *
+ * THE BODY WAS EXPANDED WHEN IT WAS READ, NOT WHEN IT WAS USED:
+ *
+ *     f() {
+ *       w=new
+ *       cat <<EOF                bash: new
+ *     $w                         tsh : (empty)
+ *     EOF
+ *     }
+ *
+ * The reader collects a body when it reads the line that opens it. At the
+ * top level that is just before the command runs, so the difference never
+ * showed; but a function, an `if`, a loop or a `{ }` is read WHOLE before any
+ * of it runs, so every `$var`, `$(cmd)` and `$((n+=1))` in the body saw the
+ * state from before the construct started -- and a function saw the state
+ * at its DEFINITION, the same text on every call. The body is kept raw and
+ * expanded here, where the redirect is set up for the command about to run.
+ * The slot is consumed, so expanding in place loses nothing: a function
+ * re-queues its own raw copies on every call. */
+static const struct shell_heredoc *shell_heredoc_take(void) {
+    struct shell_heredoc *h = (struct shell_heredoc *)shell_heredoc_pop();
+    if (!h || !h->expand) return h;
+    char *x = (char *)kmalloc(SHELL_HEREDOC_BODY_MAX);
+    if (!x) {
+        kprintf("sh: out of memory expanding here-document\n");
+        return 0;
+    }
+    if (shell_expand_literal_quotes(h->body, x, SHELL_HEREDOC_BODY_MAX) < 0) {
+        kfree(x);
+        return 0;
+    }
+    size_t n = strlen(x);
+    memcpy(h->body, x, n + 1);
+    h->len = n;
+    h->expand = false;
+    kfree(x);
+    return h;
 }
 
 /* ---- cwd/path helpers ------------------------------------------- *
@@ -8209,21 +8259,9 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         const char *match_line = line_start;
         if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
             *pp = p;
-            int prc;
-            if (quoted) {
-                prc = shell_heredoc_push(body, bpos);
-            } else {
-                char *xbody = (char *)kmalloc(SHELL_HEREDOC_BODY_MAX);
-                if (!xbody) { kfree(body); return -1; }
-                if (shell_expand_literal_quotes(body, xbody,
-                                                SHELL_HEREDOC_BODY_MAX) < 0) {
-                    kfree(xbody);
-                    kfree(body);
-                    return -1;
-                }
-                prc = shell_heredoc_push(xbody, strlen(xbody));
-                kfree(xbody);
-            }
+            /* Raw either way: an unquoted body is expanded when it is
+             * USED -- see shell_heredoc_take(). */
+            int prc = shell_heredoc_push(body, bpos, !quoted);
             kfree(body);
             return prc;
         }
@@ -21328,11 +21366,12 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, saved,
                                     -1) < 0) return -1;
             } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
-                const struct shell_heredoc *h = shell_heredoc_pop();
-                if (!h) {
+                if (g_heredoc_head >= g_heredoc_count) {
                     kprintf("shell: here-document body missing\n");
                     return -1;
                 }
+                const struct shell_heredoc *h = shell_heredoc_take();
+                if (!h) return -1;         /* the expansion reported it */
                 cur->stdin_text = h->body;
                 if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, h->body,
                                     -1) < 0) return -1;
@@ -22257,7 +22296,8 @@ static int shell_run_function(struct shell_simple *cmd) {
                              sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
         shell_heredoc_reset();
         for (int i = 0; i < fn->nheredoc; i++)
-            (void)shell_heredoc_push(fn->heredoc[i], strlen(fn->heredoc[i]));
+            (void)shell_heredoc_push(fn->heredoc[i], strlen(fn->heredoc[i]),
+                                     fn->heredoc_expand[i]);
     }
     /* Record the CALL SITE so `caller` can report it. g_shell_lineno is
      * still the caller's line at this point; it moves as the body runs. */
@@ -27684,7 +27724,7 @@ static void execute_line(void) {
         if (strcmp(check, g_heredoc_delim) == 0) {
             g_heredoc_collecting = false;
             shell_heredoc_reset();
-            shell_heredoc_push(g_heredoc_body, g_heredoc_body_len);
+            shell_heredoc_push(g_heredoc_body, g_heredoc_body_len, false);
             execute_line_text(g_heredoc_cmd);
             shell_heredoc_reset();
         } else {
