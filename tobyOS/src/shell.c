@@ -568,6 +568,10 @@ static char *g_traps[SHELL_TRAP_LAST + 1];
  * a function unless `set -o errtrace`, which this shell does not have -- so
  * inside a function the trap simply does not fire. */
 static int g_fn_depth;
+/* How many `.`/`source` runs are in progress. `return` is legal inside a
+ * function OR a sourced file -- and g_script_depth cannot tell a sourced
+ * file from an executed script: both are a script reader. See cmd_return. */
+static int g_source_depth;
 static bool g_trap_running;
 
 static bool g_heredoc_collecting;
@@ -3612,7 +3616,15 @@ static void shell_locals_pop(int depth) {
  * instead would make an unset local indistinguishable from an empty one. */
 static void cmd_local(int argc, char **argv) {
     shell_set_status(0);
-    if (g_script_depth <= 0) {
+    /* IN A FUNCTION, not merely in a script. This tested g_script_depth,
+     * which counts SCRIPT READERS -- a script's own top level is depth 1 --
+     * so `local a=1` at the top of any script, of a sourced file, or in a
+     * top-level eval succeeded and SET a (bash: "can only be used in a
+     * function", status 1, a unset), and a bare top-level `local` listed
+     * those variables as locals. Measured: it is legal wherever a function
+     * is running -- directly, in a file that function sources, in a
+     * subshell inside it, in an eval inside it -- which is g_fn_depth. */
+    if (g_fn_depth <= 0) {
         kprintf("local: can only be used in a function\n");
         shell_set_status(1);
         return;
@@ -10541,7 +10553,10 @@ static void cmd_dot(int argc, char **argv) {
     if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) return;
     argv[1] = resolved;
     if (argc <= 2) {
-        shell_set_status(shell_run_script_path(argv[1], false));
+        g_source_depth++;                  /* `return` is legal in here */
+        int st1 = shell_run_script_path(argv[1], false);
+        g_source_depth--;
+        shell_set_status(st1);
         shell_run_return_trap();       /* a sourced script finished */
         return;
     }
@@ -10552,7 +10567,9 @@ static void cmd_dot(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    g_source_depth++;                      /* `return` is legal in here */
     int st = shell_run_script_path(argv[1], false);
+    g_source_depth--;
     shell_set_status(st);
     shell_run_return_trap();           /* a sourced script finished */
     shell_restore_params_from_frame(&frame);
@@ -10720,9 +10737,14 @@ static void cmd_return(int argc, char **argv) {
         shell_set_status(2);
         return;
     }
-    if (g_script_depth <= 0) {
-        kprintf("return: not in a script or function\n");
-        shell_set_status(1);
+    /* A FUNCTION OR A SOURCED FILE, not any script. This tested
+     * g_script_depth too, so `return 3` at the top level of an EXECUTED
+     * script ended the script with status 3; bash refuses it -- "can only
+     * `return' from a function or sourced script", status 2 -- and the
+     * script goes on. g_source_depth is the sourced half. */
+    if (g_fn_depth <= 0 && g_source_depth <= 0) {
+        kprintf("return: can only `return' from a function or sourced script\n");
+        shell_set_status(2);
         return;
     }
     bool ok = true;
