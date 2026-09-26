@@ -9888,18 +9888,39 @@ static bool shell_text_ends_in_continuation(const char *t, size_t n) {
     return (bs & 1u) != 0;
 }
 
+/* Set by cmd_eval for the ONE reader call it makes, and consumed at that
+ * reader's entry -- so a `source` or `$( )` inside the eval'd text gets an
+ * ordinary reader. See eval_mode below. */
+static bool g_reader_eval_pending;
+static int  g_eval_reader_depth;
+
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
-    if (g_script_depth >= 8) {
+    /* EVAL MODE. A multi-line eval string is shell input, so it goes through
+     * this reader -- the only code that knows here-documents, compounds that
+     * span lines, and continuation -- with four differences from a script:
+     *   - `return` belongs to the enclosing FUNCTION: it is left in flight,
+     *     not consumed the way a sourced file's is;
+     *   - an expansion error (DISCARD) ends the rest of the eval string and
+     *     is left for cmd_eval to turn into status 1, as before;
+     *   - each unit is alias-expanded here -- execute_line_text only does it
+     *     for a line of its own, and eval always runs inside one;
+     *   - it is not a SCRIPT level: g_script_depth decides whether `local`
+     *     and `return` are legal, and eval changes neither. It has its own
+     *     nesting bound, and its lines count on from the caller's. */
+    bool eval_mode = g_reader_eval_pending;
+    g_reader_eval_pending = false;
+    if (eval_mode ? g_eval_reader_depth >= 8 : g_script_depth >= 8) {
         kprintf("sh: script nesting too deep\n");
         return 2;
     }
 
-    g_script_depth++;
+    if (eval_mode) g_eval_reader_depth++;
+    else g_script_depth++;
     unsigned long saved_lineno = g_shell_lineno;
     int saved_noexec = g_noexec_error;
     g_noexec_error = 0;
-    g_shell_lineno = 0;
+    g_shell_lineno = (eval_mode && saved_lineno > 0) ? saved_lineno - 1 : 0;
     int last = 0;
     char *p = text;
     bool first_line = true;
@@ -10261,9 +10282,26 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         unsigned long line_last = g_shell_lineno;
         g_shell_lineno = line_first;
         if (!accum) shell_lmap_reset(line, line_first);
-        execute_line_text(line);
+        if (eval_mode) {
+            /* Aliases, as cmd_eval's one-line path expands them. */
+            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+            const char *ex = abuf ? shell_expand_aliases(line, abuf,
+                                                         SHELL_PARSE_BUF_MAX)
+                                  : 0;
+            execute_line_text(ex ? ex : line);
+            if (abuf) kfree(abuf);
+        } else {
+            execute_line_text(line);
+        }
         g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
+        /* eval's DISCARD and RETURN are not this reader's to settle -- see
+         * eval_mode above. */
+        if (eval_mode && (g_shell_flow == SHELL_FLOW_DISCARD ||
+                          g_shell_flow == SHELL_FLOW_RETURN)) {
+            last = g_last_status;
+            break;
+        }
         /* A DISCARD threw away the rest of THAT logical line and nothing
          * more: the script goes on, and the status it left is 1. */
         if (g_shell_flow == SHELL_FLOW_DISCARD) {
@@ -10290,7 +10328,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
     g_noexec_error = saved_noexec;
-    g_script_depth--;
+    if (eval_mode) g_eval_reader_depth--;
+    else g_script_depth--;
     g_shell_lineno = saved_lineno;
     return last;
 }
@@ -10884,6 +10923,45 @@ static void cmd_eval(int argc, char **argv) {
         if (i + 1 < argc) cmd[pos++] = ' ';
     }
     cmd[pos] = '\0';
+    /* A syntax error inside eval ends the EVAL, not the shell: bash reports
+     * it, gives eval status 2 and runs the next command. shell_parse_error()
+     * turns the flow into EXIT, the right answer for a script; this notices
+     * that it happened here and takes it back (below). */
+    bool saved_parse_error = g_parse_error;
+    g_parse_error = false;
+
+    /* A MULTI-LINE STRING GOES THROUGH THE SCRIPT READER, in eval mode (see
+     * shell_run_script_text). Run a line at a time, as it was, a here-
+     * document never saw its body and a compound that spans lines never saw
+     * its end:
+     *
+     *     eval 'cat <<A        bash: x        tsh: an empty line, then the
+     *     x                                         script died on "A"
+     *     A'
+     *
+     *     eval 'if true        bash: y        tsh: exit 2
+     *     then echo y
+     *     fi'
+     *
+     * A one-line string keeps the path it always had. */
+    bool eval_multiline = false;
+    for (const char *q = cmd; *q; q++)
+        if (*q == '\n') { eval_multiline = true; break; }
+    if (eval_multiline) {
+        char *copy = shell_strdup(cmd);
+        if (!copy) {
+            kprintf("eval: out of memory\n");
+            shell_set_status(2);
+            g_parse_error = saved_parse_error;
+            return;
+        }
+        g_reader_eval_pending = true;
+        int rc = shell_run_script_text(copy, false);
+        g_reader_eval_pending = false;
+        kfree(copy);
+        if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(rc);
+        goto eval_done;
+    }
     /* EVAL'S ARGUMENT IS A SCRIPT, NOT A LINE. A newline in it separates
      * commands:
      *
@@ -10923,6 +11001,18 @@ static void cmd_eval(int argc, char **argv) {
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
     }
+eval_done:
+    /* See saved_parse_error above: a parse error's EXIT ends only the eval. */
+    if (g_parse_error && g_shell_flow == SHELL_FLOW_EXIT &&
+        g_shell_flow_status == 2) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        shell_set_status(2);
+        g_parse_error = false;                /* absorbed: eval's, not ours */
+    }
+    /* As command substitution does: restore the caller's flag, keeping one
+     * raised here that was NOT absorbed. */
+    g_parse_error = saved_parse_error || g_parse_error;
     /* eval CATCHES A DISCARD: the rest of its string is gone, the caller
      * goes on, and eval's status is 1 (bash: parse_and_execute). */
     if (g_shell_flow == SHELL_FLOW_DISCARD) {
