@@ -870,13 +870,9 @@ long sys_munmap(uint64_t addr, uint64_t len) {
                      * corruption in whichever process kept the frame).
                      * Freeing is DEFERRED to fb so a TLB shootdown precedes
                      * reuse (see mmap_free_batch above). */
-                    int refs = page_ref_get(phys);
-                    if (refs > 1) {
-                        page_ref_dec(phys);
-                    } else {
-                        if (refs == 1) page_ref_dec(phys);
+                    /* One atomic step: see page_ref_dec_old. */
+                    if (page_ref_dec_old(phys) <= 1)
                         mmap_free_batch_push(&fb, phys);
-                    }
                 }
             }
         }
@@ -1026,13 +1022,10 @@ long sys_madvise_dontneed(uint64_t addr, uint64_t len) {
             if (!phys) continue;                        /* already absent */
             vmm_unmap(a, PAGE_SIZE);
             phys &= PAGE_MASK;
-            int refs = page_ref_get(phys);
-            if (refs > 1) {
-                page_ref_dec(phys);                     /* fork sibling keeps it */
-            } else {
-                if (refs == 1) page_ref_dec(phys);
-                mmap_free_batch_push(&fb, phys);        /* freed AFTER shootdown */
-            }
+            /* A fork sibling keeps it unless we were the last owner -- one
+             * atomic step (page_ref_dec_old); freed AFTER shootdown. */
+            if (page_ref_dec_old(phys) <= 1)
+                mmap_free_batch_push(&fb, phys);
         }
         vmm_set_editor_root(saved_root);
     }
@@ -1203,13 +1196,8 @@ long sys_brk2(uint64_t new_brk) {
                  * this frame. Freeing is DEFERRED behind a shootdown (see
                  * mmap_free_batch) so a reused frame can't be read via a
                  * stale TLB. */
-                int refs = page_ref_get(phys);
-                if (refs > 1) {
-                    page_ref_dec(phys);
-                } else {
-                    if (refs == 1) page_ref_dec(phys);
+                if (page_ref_dec_old(phys) <= 1)      /* see page_ref_dec_old */
                     mmap_free_batch_push(&fb, phys);
-                }
             }
         }
         vmm_set_editor_root(saved_root);
@@ -1604,8 +1592,7 @@ void memfd_unref(struct memfd *mf) {
              * unconditionally here (the pre-slice-38 code) recycled frames
              * other processes were still writing through. */
             uint64_t ph = mf->pages[i];
-            page_ref_dec(ph);
-            if (page_ref_get(ph) == 0)
+            if (page_ref_dec_old(ph) <= 1)            /* see page_ref_dec_old */
                 pmm_free_page(ph);
         }
     if (mf->pages) kfree(mf->pages);

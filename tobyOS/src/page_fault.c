@@ -66,24 +66,75 @@ void page_ref_init(void) {
             (unsigned long)((pages * PAGE_SIZE) / 1024));
 }
 
-void page_ref_inc(uint64_t phys) {
+/* THE COUNTS ARE SHARED BY EVERY CPU, AND WERE PLAIN `++` / `--`.
+ *
+ * vmm_cow_fork runs WITHOUT the BKL (slice 88) and bumps every page the
+ * parent shares, while another CPU tears down an exiting child that shares
+ * the same frames and decrements them. Two unsynchronised read-modify-writes
+ * lose one: a count one too low, and the second-to-last owner frees a frame
+ * the parent still maps. The next allocation hands it to someone else and
+ * the parent runs on their bytes. On 2026-09-26 that was the "hwgate stops
+ * answering" flake -- the gate's shell died with SIGSEGV (exit 139) after
+ *
+ *     [pmm] BUG: alloc'd frame 0x28af000 has refcount 2 (premature free)
+ *     [pmm] BUG: freeing frame 0x28af000 with refcount 2 ... free_subtree
+ *     *** EXCEPTION 13 ... rip=0x96870fc2394cc3fe ... pid=19 'tsh' exit 139
+ *
+ * right after a three-stage pipeline's processes exited together. sys_fork's
+ * comment said "page_ref atomics serialize with #PF CoW"; there were none.
+ *
+ * Every operation is now a compare-and-swap on the 16-bit slot, keeping the
+ * old saturation rules (never above 0xFFFF, never below 0). The callers that
+ * DECIDED on a count and then changed it (`get`, then `dec`, then free) use
+ * page_ref_dec_old / page_ref_share so the decision and the change are one
+ * step -- an atomic dec after a stale get is the same race in a new place. */
+static uint16_t *page_ref_slot(uint64_t phys) {
     size_t idx = phys >> 12;
-    if (g_page_refcounts && idx < g_page_ref_slots &&
-        g_page_refcounts[idx] < 0xFFFF)
-        g_page_refcounts[idx]++;
+    if (!g_page_refcounts || idx >= g_page_ref_slots) return 0;
+    return &g_page_refcounts[idx];
+}
+
+void page_ref_inc(uint64_t phys) {
+    uint16_t *s = page_ref_slot(phys);
+    if (!s) return;
+    uint16_t cur = __atomic_load_n(s, __ATOMIC_RELAXED);
+    while (cur < 0xFFFF &&
+           !__atomic_compare_exchange_n(s, &cur, (uint16_t)(cur + 1), false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        ;
 }
 
 void page_ref_dec(uint64_t phys) {
-    size_t idx = phys >> 12;
-    if (g_page_refcounts && idx < g_page_ref_slots &&
-        g_page_refcounts[idx] > 0)
-        g_page_refcounts[idx]--;
+    (void)page_ref_dec_old(phys);
+}
+
+int page_ref_dec_old(uint64_t phys) {
+    uint16_t *s = page_ref_slot(phys);
+    if (!s) return 0;
+    uint16_t cur = __atomic_load_n(s, __ATOMIC_RELAXED);
+    while (cur > 0 &&
+           !__atomic_compare_exchange_n(s, &cur, (uint16_t)(cur - 1), false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+        ;
+    return cur;              /* the value the successful swap replaced */
+}
+
+void page_ref_share(uint64_t phys) {
+    uint16_t *s = page_ref_slot(phys);
+    if (!s) return;
+    uint16_t cur = __atomic_load_n(s, __ATOMIC_RELAXED);
+    for (;;) {
+        uint16_t want = (cur == 0) ? 2 : (cur < 0xFFFF ? (uint16_t)(cur + 1) : cur);
+        if (want == cur) return;
+        if (__atomic_compare_exchange_n(s, &cur, want, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+    }
 }
 
 int page_ref_get(uint64_t phys) {
-    size_t idx = phys >> 12;
-    if (!g_page_refcounts || idx >= g_page_ref_slots) return 0;
-    return g_page_refcounts[idx];
+    uint16_t *s = page_ref_slot(phys);
+    return s ? __atomic_load_n(s, __ATOMIC_ACQUIRE) : 0;
 }
 
 /* ---- Page table walker ---- */
@@ -133,9 +184,9 @@ bool cow_copy_page(uint64_t old_phys, uint64_t *pte) {
     /* Build new PTE: present + writable + user, clear COW */
     *pte = new_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
 
-    /* Decrement refcount on old page; free if no more references */
-    page_ref_dec(old_phys);
-    if (page_ref_get(old_phys) == 0)
+    /* Drop our reference to the old page; free it if we were the last
+     * (one atomic step -- see page_ref_dec_old). */
+    if (page_ref_dec_old(old_phys) <= 1)
         pmm_free_page(old_phys);
 
     /* New page starts with refcount 1 */
@@ -624,9 +675,7 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                          * slice-33/34 DOM blocker). Keep it writable in
                          * BOTH parent and child. */
                         child_pt[i1] = pte_val;
-                        if (page_ref_get(phys) == 0)
-                            page_ref_inc(phys);
-                        page_ref_inc(phys);
+                        page_ref_share(phys);      /* 0 -> 2, else +1: one atomic step */
                     } else {
 #ifdef CHROMIUM_BOOT
                         /* Tier 2.5: EAGER private copy for EVERY non-SHARED
@@ -654,16 +703,12 @@ int vmm_cow_fork(uint64_t parent_cr3, uint64_t child_cr3) {
                             parent_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
                             /* Child gets same: not writable, COW set */
                             child_pt[i1] = (pte_val & ~PTE_WRITABLE) | PTE_COW;
-                            if (page_ref_get(phys) == 0)
-                                page_ref_inc(phys);
-                            page_ref_inc(phys);
+                            page_ref_share(phys);      /* 0 -> 2, else +1: one atomic step */
                         } else {
                             /* Read-only page: shared + COW-marked. */
                             parent_pt[i1] = pte_val | PTE_COW;
                             child_pt[i1]  = pte_val | PTE_COW;
-                            if (page_ref_get(phys) == 0)
-                                page_ref_inc(phys);
-                            page_ref_inc(phys);
+                            page_ref_share(phys);      /* 0 -> 2, else +1: one atomic step */
                         }
 #endif
                     }

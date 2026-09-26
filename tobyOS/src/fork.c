@@ -613,7 +613,8 @@ long sys_fork(void) {
     /* Walk+WP under STW WITHOUT THE BKL: chrome's address space is huge and
      * holding the global lock across vmm_cow_fork freezes every other syscall
      * (including DevTools pipe I/O) for tens of seconds. Siblings are parked;
-     * page_ref atomics serialize with #PF CoW.
+     * page_ref CAS ops serialize with #PF CoW (they were plain ++/-- until
+     * 2026-09-26 -- see page_fault.c).
      *
      * The BKL is NOT re-taken for mmap_cow_clone below, and does not need to
      * be. This block used to read `held = bkl_held(); ... if (held)

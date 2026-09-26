@@ -2150,12 +2150,9 @@ uint64_t proc_brk(struct proc *p, uint64_t new_brk) {
             uint64_t phys = vmm_translate(va) & ~((uint64_t)PAGE_SIZE - 1);
             vmm_unmap(va, PAGE_SIZE);
             if (!phys) continue;
-            int refs = page_ref_get(phys);
-            if (refs > 1) {
-                page_ref_dec(phys);
-                continue;
-            }
-            if (refs == 1) page_ref_dec(phys);
+            /* Someone else still holds it unless we were the last owner --
+             * one atomic step (page_ref_dec_old). */
+            if (page_ref_dec_old(phys) > 1) continue;
             if (n_doom == BRK_FREE_MAX) {
                 if (tlb_shootdown_remote_sync())
                     for (int i = 0; i < n_doom; i++) pmm_free_page(doomed[i]);

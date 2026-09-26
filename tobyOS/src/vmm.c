@@ -877,12 +877,9 @@ static void free_subtree(uint64_t table_phys, int level) {
              * back to the PMM whenever a fork child exited -- the next
              * allocation recycled them under the parent. */
             uint64_t leaf = e & PTE_ADDR_MASK;
-            int refs = page_ref_get(leaf);
-            if (refs > 1) {
-                page_ref_dec(leaf);
-                continue;
-            }
-            if (refs == 1) page_ref_dec(leaf);
+            /* Drop our reference and learn, in the SAME atomic step, whether
+             * anyone else still holds one (see page_ref_dec_old). */
+            if (page_ref_dec_old(leaf) > 1) continue;
             pmm_free_page(leaf);
             continue;
         }

@@ -99,6 +99,13 @@ void page_ref_init(void);
 void page_ref_inc(uint64_t phys);
 void page_ref_dec(uint64_t phys);
 int  page_ref_get(uint64_t phys);
+/* Drop one reference and return the count BEFORE the drop (0 stays 0: an
+ * untracked single-owner frame). "Was I the last owner?" is `<= 1`, decided
+ * in the same atomic step as the decrement -- see page_fault.c. */
+int  page_ref_dec_old(uint64_t phys);
+/* A second owner appears (fork): 0 (untracked) -> 2, otherwise +1, as ONE
+ * atomic step. */
+void page_ref_share(uint64_t phys);
 
 /* COW fork: mark parent+child page tables for copy-on-write.
  * Walks user-space entries in parent_cr3, clears writable + sets COW
