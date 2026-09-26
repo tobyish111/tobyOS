@@ -9579,6 +9579,16 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 if (d == ')') case_pat = false;
                 p++; continue;
             }
+            /* INSIDE `${ }` A PAREN IS A BYTE of the word or pattern:
+             * `${u//(/x}` opened a level here that its `}` then closed, so
+             * the `${` itself never closed and the reader ran to end of
+             * file ("unterminated compound"). Braces still nest. */
+            bool in_v = (nest - 1 < (int)sizeof st->nest_kind &&
+                         st->nest_kind[nest - 1] == 'v');
+            if (in_v && (d == '(' || d == ')')) {
+                p++;
+                continue;
+            }
             if (d == '(' || d == '{') {
                 if (nest < (int)sizeof st->nest_kind) st->nest_kind[nest] = 'p';
                 nest++;
@@ -26995,12 +27005,29 @@ static bool shell_run_list_line(const char *src) {
  */
 static const char *shell_find_pipe_at(const char *s) {
     bool in_sq = false, in_dq = false, in_bt = false;
+    bool sq_ansi = false;           /* the open single quote is `$'...'` */
     bool dbr = false;               /* inside `[[ ... ]]` */
     int paren = 0, compound = 0, brace = 0;
+    /* Depth of `${ ... }`. A PARAMETER EXPANSION OWNS ITS `|`:
+     *
+     *     echo ${t//|/-}      bash: x-y
+     *     k=${v//$'\n'/|}     bash: a|b
+     *
+     * This walker knew quotes, backticks, `$( )`, compounds and `[[ ]]` but
+     * not `${ }`, so it cut both into a two-stage pipeline: "unterminated
+     * ${...}", then the tail `/-}` launched as a command. Only nested `${`
+     * and its `}` count in here -- a `(` in a pattern (`${v//(/x}`) is a
+     * byte, and counting it would leave the paren depth open and hide the
+     * next REAL pipe. */
+    int vbrace = 0;
     const char *start = s;
 
     for (const char *p = s; *p; p++) {
-        if (in_sq) { if (*p == '\'') in_sq = false; continue; }
+        if (in_sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { in_sq = false; sq_ansi = false; }
+            continue;
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
@@ -27022,9 +27049,15 @@ static const char *shell_find_pipe_at(const char *s) {
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') { in_sq = true; sq_ansi = true; p++; continue; }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         if (*p == '`')  { in_bt = true; continue; }
+        if (*p == '$' && p[1] == '{') { vbrace++; p++; continue; }
+        if (vbrace > 0) {                       /* see vbrace above */
+            if (*p == '}') vbrace--;
+            continue;
+        }
         if (*p == '$' && p[1] == '(') { paren++; p++; continue; }
         if (*p == '(') { paren++; continue; }
         if (*p == ')') { if (paren > 0) paren--; continue; }
