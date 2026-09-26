@@ -819,7 +819,12 @@ install-img: $(INSTALL_IMG)
 #
 # The header is rewritten only when the id CHANGES, so an unchanged tree does
 # not recompile what includes it.
-KBUILD_ID := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD -- src include 2>/dev/null || echo -dirty)
+# THE TREE IS CHECKED OUT WITH core.autocrlf=true, which lives in Git for
+# Windows' SYSTEM config -- and make runs with MSYS2's /usr/bin first, whose
+# own git never reads that file. It saw every CRLF file as changed (21 files,
+# ~60k lines) and stamped a clean build `-dirty`. So the setting is passed
+# explicitly, and --shortstat (content, not the stat cache) decides.
+KBUILD_ID := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(if $(shell git -c core.autocrlf=true diff --shortstat HEAD -- src include 2>/dev/null),-dirty,)
 KBUILD_ID_H := build/kbuild_id.h
 .PHONY: kbuild-id-force
 kbuild-id-force:
