@@ -7021,10 +7021,21 @@ static bool shell_cat_stdin(void) {
     return true;
 }
 
+static struct file *shell_open_dev_node(const char *path);
+
 static bool shell_cat_path(const char *arg) {
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(arg, path, sizeof(path), "cat") < 0)
         return false;
+    /* `cat /dev/null`: /dev is synthesised, vfs_open cannot see it. */
+    {
+        struct file *dev = shell_open_dev_node(path);
+        if (dev) {
+            bool ok = shell_cat_copy_file(dev);
+            file_close(dev);
+            return ok;
+        }
+    }
     /* Stream in 256-byte chunks instead of slurping the whole file --
      * keeps stack usage tiny and works for arbitrarily-large text
      * files without a heap allocation. */
@@ -22288,10 +22299,45 @@ static int shell_apply_assignments(char **assignv, int assignc,
     return shell_apply_assignments_ex(assignv, assignc, label, false);
 }
 
+/* /dev/null AND /dev/zero FOR THE IN-KERNEL SHELL.
+ *
+ * /dev is not a filesystem: its nodes are synthesised in sys_open, so every
+ * process -- /bin/tsh included -- gets them through open(2). The kernel
+ * console shell opens redirect targets with vfs_open directly, never passes
+ * through sys_open, and so could not see them at all:
+ *
+ *     echo x 2>/dev/null        kernel shell: "echo: '/dev/null': no such file
+ *     cat nope 2>/dev/null                    or directory", command NOT run
+ *
+ * -- the most common redirect in shell scripting, failing the command before
+ * it started. Returns the same device file sys_open makes, or 0 when `path`
+ * is not one of the two (and always 0 in /bin/tsh, which has the syscall). */
+static struct file *shell_open_dev_node(const char *path) {
+#ifdef SHELL_HOSTED
+    (void)path;
+    return 0;
+#else
+    enum file_kind kind;
+    if (strcmp(path, "/dev/null") == 0)      kind = FILE_KIND_DEVNULL;
+    else if (strcmp(path, "/dev/zero") == 0) kind = FILE_KIND_DEVZERO;
+    else return 0;
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) return 0;
+    memset(f, 0, sizeof(*f));
+    f->kind = kind;
+    f->o_accmode = 2;                       /* O_RDWR, as sys_open makes it */
+    return f;
+#endif
+}
+
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label) {
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(path_arg, path, sizeof(path), label) < 0) return 0;
+    {
+        struct file *dev = shell_open_dev_node(path);   /* see above */
+        if (dev) return dev;
+    }
 
     if (write) {
         struct vfs_stat st;
@@ -22488,6 +22534,10 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
                                            const char *label) {
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(path_arg, path, sizeof(path), label) < 0) return 0;
+    {
+        struct file *dev = shell_open_dev_node(path);   /* `exec 3<>/dev/null` */
+        if (dev) return dev;
+    }
     struct vfs_stat st;
     int sr = vfs_stat(path, &st);
     if (sr == VFS_ERR_NOENT) {
