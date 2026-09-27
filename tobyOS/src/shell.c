@@ -11224,8 +11224,12 @@ eval_done:
 
 static void cmd_exec(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) return;
-    shell_spawn_program(argv[1], argc - 1, &argv[1], /*background=*/false);
+    /* `--` ends exec's options, as for every builtin: `exec -- ls` runs ls,
+     * where this looked for a program called `--`. */
+    int i = 1;
+    if (i < argc && strcmp(argv[i], "--") == 0) i++;
+    if (i >= argc) return;
+    shell_spawn_program(argv[i], argc - i, &argv[i], /*background=*/false);
     if (g_last_status == 0 && g_script_depth > 0) {
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = 0;
@@ -23330,9 +23334,14 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
          * kept going to the terminal.
          *
          * The handles are installed permanently and deliberately not owned by
-         * an io frame: there is nothing to restore them to. */
-        if (exec_cmd.argc == 1 && strcmp(exec_cmd.argv[0], "exec") == 0 &&
-            cmd->redir_count > 0) {
+         * an io frame: there is nothing to restore them to.
+         *
+         * `exec -- 3>&1` is the same command. It missed this branch (two
+         * words), went to cmd_exec, and the redirection lasted only for a
+         * builtin that did nothing -- so the next `>&3` found fd 3 closed. */
+        if (strcmp(exec_cmd.argv[0], "exec") == 0 && cmd->redir_count > 0 &&
+            (exec_cmd.argc == 1 ||
+             (exec_cmd.argc == 2 && strcmp(exec_cmd.argv[1], "--") == 0))) {
             struct shell_fd_state fds;
             shell_fd_state_init_from_defaults(&fds);
             if (shell_apply_redirs(cmd, &fds, "exec") < 0) {
