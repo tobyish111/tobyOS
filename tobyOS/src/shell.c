@@ -17,6 +17,7 @@
 #endif
 #include <tobyos/keyboard.h>
 #include <tobyos/console.h>
+#include <tobyos/serial.h>
 #include <tobyos/printk.h>
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
@@ -177,6 +178,8 @@ static int g_getopts_last_optind;
 static int g_getopts_char_index;
 static bool g_getopts_internal_optind_write;
 static struct file *g_shell_fd[SHELL_FD_MAX];
+__attribute__((format(printf, 1, 2)))
+static void shell_err(const char *fmt, ...);   /* fd 2, even in the kernel */
 
 /* Command history, kept so `fc` has something to list and re-run. A ring:
  * g_hist_base is the history number of slot 0, so numbers keep climbing as
@@ -2925,7 +2928,6 @@ struct cmd {
 
 static const struct cmd cmds[];   /* forward */
 
-#ifdef SHELL_HOSTED
 /* In userspace the builtin set is exactly the POSIX/bash one -- no more.
  *
  * The kernel shell carries convenience builtins (`cat`, `ls`, `mkdir`, `rm`,
@@ -2938,8 +2940,10 @@ static const struct cmd cmds[];   /* forward */
  *
  * So the hosted build answers "is this a builtin?" from an allow-list of the
  * names bash implements as builtins, and everything else falls through to a
- * PATH lookup. The kernel build is untouched -- this whole function body is
- * compiled only into /bin/tsh. */
+ * PATH lookup. The kernel build keeps every builtin, and asks this list a
+ * different question: whether a builtin's kprintf is a DIAGNOSTIC (it is for
+ * these -- /bin/tsh sends it to fd 2 and the parity gates hold them to it) or
+ * the kernel-only builtin's ordinary output. See shell_diag_kputc. */
 static bool shell_hosted_builtin(const char *name) {
     static const char *const allow[] = {
         /* POSIX special builtins */
@@ -2978,7 +2982,6 @@ static bool shell_hosted_builtin(const char *name) {
         if (strcmp(name, allow[i]) == 0) return true;
     return false;
 }
-#endif
 
 static bool shell_builtin_disabled(const char *name);
 
@@ -6797,7 +6800,7 @@ static void cmd_ls(int argc, char **argv) {
     struct vfs_dir d;
     int rc = vfs_opendir(path, &d);
     if (rc != VFS_OK) {
-        kprintf("ls: '%s': %s\n", path_arg, vfs_strerror(rc));
+        shell_err("ls: '%s': %s\n", path_arg, vfs_strerror(rc));
         shell_set_status(1);
         return;
     }
@@ -6903,13 +6906,13 @@ static int parse_octal_str(const char *s) {
 
 static void cmd_chmod(int argc, char **argv) {
     if (argc != 3) {
-        kprintf("usage: chmod <octal> <path>     e.g. chmod 644 /data/notes\n");
+        shell_err("usage: chmod <octal> <path>     e.g. chmod 644 /data/notes\n");
         shell_set_status(1);
         return;
     }
     int mode = parse_octal_str(argv[1]);
     if (mode < 0 || mode > 0777) {
-        kprintf("chmod: bad mode '%s' -- must be 3 octal digits\n", argv[1]);
+        shell_err("chmod: bad mode '%s' -- must be 3 octal digits\n", argv[1]);
         shell_set_status(1);
         return;
     }
@@ -6917,7 +6920,7 @@ static void cmd_chmod(int argc, char **argv) {
     if (shell_resolve_path_arg(argv[2], path, sizeof(path), "chmod") < 0) return;
     int rc = vfs_chmod(path, (uint32_t)mode);
     if (rc != VFS_OK) {
-        kprintf("chmod: '%s': %s\n", argv[2], vfs_strerror(rc));
+        shell_err("chmod: '%s': %s\n", argv[2], vfs_strerror(rc));
         shell_set_status(1);
     } else {
         kprintf("chmod: '%s' -> 0%o\n", argv[2], (unsigned)mode);
@@ -6927,13 +6930,13 @@ static void cmd_chmod(int argc, char **argv) {
 
 static void cmd_chown(int argc, char **argv) {
     if (argc != 3) {
-        kprintf("usage: chown <user> <path>      (root only)\n");
+        shell_err("usage: chown <user> <path>      (root only)\n");
         shell_set_status(1);
         return;
     }
     const struct user *u = users_lookup_by_name(argv[1]);
     if (!u) {
-        kprintf("chown: unknown user '%s'\n", argv[1]);
+        shell_err("chown: unknown user '%s'\n", argv[1]);
         shell_set_status(1);
         return;
     }
@@ -6941,7 +6944,7 @@ static void cmd_chown(int argc, char **argv) {
     if (shell_resolve_path_arg(argv[2], path, sizeof(path), "chown") < 0) return;
     int rc = vfs_chown(path, (uint32_t)u->uid, (uint32_t)u->gid);
     if (rc != VFS_OK) {
-        kprintf("chown: '%s': %s\n", argv[2], vfs_strerror(rc));
+        shell_err("chown: '%s': %s\n", argv[2], vfs_strerror(rc));
         shell_set_status(1);
     } else {
         kprintf("chown: '%s' -> %s (uid=%d gid=%d)\n",
@@ -6977,6 +6980,106 @@ static void cmd_su(int argc, char **argv) {
             "Type `su root` to restore.\n",
             u->name, u->uid, u->gid);
     shell_set_status(0);
+}
+
+/* THE IN-KERNEL SHELL'S STANDARD ERROR.
+ *
+ * /bin/tsh writes diagnostics with kprintf and host.c sends kprintf to the
+ * shell's fd 2. The kernel console shell had no fd 2 at all: kprintf went
+ * wherever the printk sink pointed, and every capture and every redirected
+ * builtin pointed it at STDOUT --
+ *
+ *     x=$(type nope)              kernel: x="tsh: type: nope: not found"
+ *     x=$(cat /nope 2>/dev/null)  kernel: x="cat: '/nope': no such file..."
+ *     type nope 2>/dev/null       kernel: printed anyway
+ *
+ * -- so an error became DATA, and `2>/dev/null` silenced nothing.
+ *
+ * Now, while a capture or a builtin runs, the sink is this function, and a
+ * diagnostic goes where fd 2 points NOW (g_shell_fd[2]: a redirection, a
+ * group's `2>`, `exec 2>`, a `2>&1` into the capture) or, when fd 2 is not
+ * redirected, to the TERMINAL -- whatever the outermost push found in place:
+ * the TCP client's writer, or the console.
+ *
+ * The kernel-only builtins (ls, ps, mem, mountfs...) print their ORDINARY
+ * output with kprintf, so for those shell_run_builtin still installs the
+ * stdout sink on top; their error lines go through shell_err(), which pushes
+ * this sink for just that line. See shell_hosted_builtin for the split.
+ *
+ * Only installed where a sink already was, for exactly as long: a sink held
+ * across a whole line would take every other CPU's kernel messages -- the
+ * [kpf] fault line included -- off serial for the length of any command. */
+#ifndef SHELL_HOSTED
+struct shell_diag_save {
+    void (*sink)(void *ctx, char c);
+    void *ctx;
+    bool suppress;
+};
+static int g_diag_depth;
+static shell_write_fn_t g_diag_term_fn;
+static void *g_diag_term_ctx;
+static void (*g_diag_term_sink)(void *ctx, char c);
+static void *g_diag_term_sink_ctx;
+static bool g_diag_term_suppress;
+
+static void shell_diag_kputc(void *ctx, char c) {
+    (void)ctx;
+    struct file *f = g_shell_fd[2];
+    if (f && f->kind != FILE_KIND_CONSOLE) {   /* fd 2 is redirected */
+        (void)file_write(f, &c, 1);
+        return;
+    }
+    /* The terminal: exactly what a builtin's kprintf did before a capture
+     * or a redirection was in the way. */
+    if (!g_diag_term_suppress) {
+        serial_putc(c);
+        if (console_ready()) console_putc(c);
+    }
+    if (g_diag_term_fn) {
+        char s[2] = { c, '\0' };
+        g_diag_term_fn(s, g_diag_term_ctx);
+    } else if (g_diag_term_sink && g_diag_term_sink != shell_diag_kputc) {
+        g_diag_term_sink(g_diag_term_sink_ctx, c);
+    }
+}
+
+/* Push BEFORE the caller changes g_shell_out: the outermost push records
+ * where the terminal is, and every nested one reuses that. */
+static void shell_diag_push(struct shell_diag_save *sv) {
+    printk_get_sink(&sv->sink, &sv->ctx, &sv->suppress);
+    if (g_diag_depth++ == 0) {
+        g_diag_term_fn         = g_shell_out;
+        g_diag_term_ctx        = g_shell_out_ctx;
+        g_diag_term_sink       = sv->sink;
+        g_diag_term_sink_ctx   = sv->ctx;
+        g_diag_term_suppress   = sv->suppress;
+    }
+    printk_set_sink_mode(shell_diag_kputc, 0, true);
+}
+
+static void shell_diag_pop(struct shell_diag_save *sv) {
+    printk_set_sink_mode(sv->sink, sv->ctx, sv->suppress);
+    if (g_diag_depth > 0) g_diag_depth--;
+}
+#endif
+
+/* A kernel-only builtin's ERROR line: to fd 2, whatever its stdout is doing.
+ * (In /bin/tsh kprintf is already fd 2, and these builtins are not reached.) */
+__attribute__((format(printf, 1, 2)))
+static void shell_err(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+#ifndef SHELL_HOSTED
+    struct shell_diag_save sv;
+    shell_diag_push(&sv);
+    kvprintf(fmt, ap);
+    shell_diag_pop(&sv);
+#else
+    char buf[512];
+    kvsnprintf(buf, sizeof buf, fmt, ap);
+    kprintf("%s", buf);
+#endif
+    va_end(ap);
 }
 
 /* The kernel shell's `cat` -- the in-kernel console has no /bin to exec,
@@ -7015,7 +7118,7 @@ static bool shell_cat_stdin(void) {
      * console file reads as empty rather than blocking -- see file.h). */
     if (!in) return true;
     if (!shell_cat_copy_file(in)) {
-        kprintf("cat: -: read error\n");
+        shell_err("cat: -: read error\n");
         return false;
     }
     return true;
@@ -7042,7 +7145,7 @@ static bool shell_cat_path(const char *arg) {
     struct vfs_file f;
     int rc = vfs_open(path, &f);
     if (rc != VFS_OK) {
-        kprintf("cat: '%s': %s\n", arg, vfs_strerror(rc));
+        shell_err("cat: '%s': %s\n", arg, vfs_strerror(rc));
         return false;
     }
     char buf[256];
@@ -7050,7 +7153,7 @@ static bool shell_cat_path(const char *arg) {
     for (;;) {
         long n = vfs_read(&f, buf, sizeof(buf));
         if (n < 0) {
-            kprintf("cat: '%s': read error: %s\n", arg, vfs_strerror((int)n));
+            shell_err("cat: '%s': read error: %s\n", arg, vfs_strerror((int)n));
             ok = false;
             break;
         }
@@ -7081,7 +7184,7 @@ static void cmd_cat(int argc, char **argv) {
 
 static void cmd_touch(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: touch <path>      (creates empty file; '/data' is writable)\n");
+        shell_err("usage: touch <path>      (creates empty file; '/data' is writable)\n");
         shell_set_status(1);
         return;
     }
@@ -7091,12 +7194,12 @@ static void cmd_touch(int argc, char **argv) {
     if (rc == VFS_ERR_EXIST) {
         /* `touch` of an existing file is a no-op success in classic
          * shells; surface that politely. */
-        kprintf("touch: '%s' already exists\n", argv[1]);
+        shell_err("touch: '%s' already exists\n", argv[1]);
         shell_set_status(0);
         return;
     }
     if (rc != VFS_OK) {
-        kprintf("touch: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_err("touch: '%s': %s\n", argv[1], vfs_strerror(rc));
         shell_set_status(1);
     } else {
         shell_set_status(0);
@@ -7105,7 +7208,7 @@ static void cmd_touch(int argc, char **argv) {
 
 static void cmd_mkdir(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: mkdir <path>\n");
+        shell_err("usage: mkdir <path>\n");
         shell_set_status(1);
         return;
     }
@@ -7113,7 +7216,7 @@ static void cmd_mkdir(int argc, char **argv) {
     if (shell_resolve_path_arg(argv[1], path, sizeof(path), "mkdir") < 0) return;
     int rc = vfs_mkdir(path);
     if (rc != VFS_OK) {
-        kprintf("mkdir: '%s': %s\n", argv[1], vfs_strerror(rc));
+        shell_err("mkdir: '%s': %s\n", argv[1], vfs_strerror(rc));
         shell_set_status(1);
     } else {
         shell_set_status(0);
@@ -7144,14 +7247,14 @@ static void cmd_rm(int argc, char **argv) {
             if      (*f == 'r' || *f == 'R') recursive = true;
             else if (*f == 'f')              force     = true;
             else {
-                kprintf("rm: unknown option -%c\n", *f);
+                shell_err("rm: unknown option -%c\n", *f);
                 shell_set_status(1);
                 return;
             }
         }
     }
     if (argi >= argc) {
-        kprintf("usage: rm [-r] [-f] <path>...   (-r: recurse into directories)\n");
+        shell_err("usage: rm [-r] [-f] <path>...   (-r: recurse into directories)\n");
         shell_set_status(1);
         return;
     }
@@ -7168,7 +7271,7 @@ static void cmd_rm(int argc, char **argv) {
          * synthesised nodes, and the first confusing failure would come
          * from a filesystem the user never meant to touch. */
         if (recursive && path[0] == '/' && path[1] == 0) {
-            kprintf("rm: refusing to recurse from '/'\n");
+            shell_err("rm: refusing to recurse from '/'\n");
             failed = 1;
             continue;
         }
@@ -7178,7 +7281,7 @@ static void cmd_rm(int argc, char **argv) {
             char bad[VFS_PATH_MAX];
             int rc = vfs_rmtree(path, force, bad, sizeof(bad));
             if (rc != VFS_OK) {
-                kprintf("rm: '%s': %s\n", bad[0] ? bad : path,
+                shell_err("rm: '%s': %s\n", bad[0] ? bad : path,
                         vfs_strerror(rc));
                 failed = 1;
             }
@@ -7192,10 +7295,10 @@ static void cmd_rm(int argc, char **argv) {
                  * someone who just wants the tree gone. */
                 struct vfs_stat st;
                 if (vfs_stat(path, &st) == VFS_OK && st.type == VFS_TYPE_DIR)
-                    kprintf("rm: '%s' is a directory -- use -r to remove it "
+                    shell_err("rm: '%s' is a directory -- use -r to remove it "
                             "and its contents\n", argv[argi]);
                 else
-                    kprintf("rm: '%s': %s\n", argv[argi], vfs_strerror(rc));
+                    shell_err("rm: '%s': %s\n", argv[argi], vfs_strerror(rc));
                 failed = 1;
             }
         }
@@ -15217,14 +15320,26 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     struct shell_capture_file cf = { .f = spill_w, .failed = false };
 
     printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+#ifndef SHELL_HOSTED
+    /* The kernel shell's diagnostics are its stderr, and a substitution
+     * captures stdout only -- see shell_diag_kputc. A kernel-only builtin
+     * run in here still reaches the spill through shell_run_builtin. */
+    struct shell_diag_save diag_save;
+    shell_diag_push(&diag_save);
+    (void)shell_capture_file_kputc; (void)shell_capture_kputc;
+#endif
     if (spill_w) {
         g_shell_fd[1] = spill_w;
         g_capture_depth++;
         shell_set_output(shell_capture_file_write, &cf);
+#ifdef SHELL_HOSTED
         printk_set_sink_mode(shell_capture_file_kputc, &cf, true);
+#endif
     } else {
         shell_set_output(shell_capture_write, &cap);
+#ifdef SHELL_HOSTED
         printk_set_sink_mode(shell_capture_kputc, &cap, true);
+#endif
     }
 
     /* A failure INSIDE the substitution is not the parent's error.
@@ -15334,6 +15449,9 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
     g_last_status = saved_status;
     g_parse_error = saved_parse_error;
 
+#ifndef SHELL_HOSTED
+    shell_diag_pop(&diag_save);
+#endif
     printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     shell_set_output(old_out, old_out_ctx);
 
@@ -22832,8 +22950,20 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     bool restore_env = false;
 
     shell_fd_state_init_from_defaults(&fds);
+#ifndef SHELL_HOSTED
+    /* See shell_diag_kputc. A POSIX builtin's kprintf is its stderr; a
+     * kernel-only builtin's is its stdout, installed over this below. */
+    struct shell_diag_save diag_save;
+    shell_diag_push(&diag_save);
+    const bool kprintf_is_stdout = !shell_hosted_builtin(c->name);
+#else
+    const bool kprintf_is_stdout = true;
+#endif
     if (shell_apply_redirs(cmd, &fds, cmd->argv[0]) < 0) {
         shell_fd_state_close_owned(&fds);
+#ifndef SHELL_HOSTED
+        shell_diag_pop(&diag_save);
+#endif
         return 1;
     }
     if (assignc > 0 && !persist_assignments) {
@@ -22844,15 +22974,20 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         shell_apply_assignments_ex(assignv, assignc, cmd->argv[0], true) != 0) {
         if (restore_env) shell_prefix_restore(&prefix_save);
         shell_fd_state_close_owned(&fds);
+#ifndef SHELL_HOSTED
+        shell_diag_pop(&diag_save);
+#endif
         return 1;
     }
     if (fds.fd[1]) {
         g_shell_out_failed = false;
         shell_set_output(shell_file_output, fds.fd[1]);
-        printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
-        printk_set_sink_mode(shell_file_kputc, fds.fd[1], true);
-        sink_active = true;
-    } else if (g_shell_out) {
+        if (kprintf_is_stdout) {
+            printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+            printk_set_sink_mode(shell_file_kputc, fds.fd[1], true);
+            sink_active = true;
+        }
+    } else if (g_shell_out && kprintf_is_stdout) {
         bridge.fn = g_shell_out;
         bridge.ctx = g_shell_out_ctx;
         printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
@@ -22901,6 +23036,9 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     if (sink_active) {
         printk_set_sink_mode(old_sink, old_sink_ctx, old_sink_suppress);
     }
+#ifndef SHELL_HOSTED
+    shell_diag_pop(&diag_save);
+#endif
     if (fds.fd[1]) {
         shell_set_output(old_fn, old_ctx);
         /* A builtin that could not write what it was asked to write did not
