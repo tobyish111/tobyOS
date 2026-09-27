@@ -6979,31 +6979,67 @@ static void cmd_su(int argc, char **argv) {
     shell_set_status(0);
 }
 
-static void cmd_cat(int argc, char **argv) {
-    if (argc < 2) {
-        kprintf("usage: cat <path>\n");
-        shell_set_status(1);
-        return;
+/* The kernel shell's `cat` -- the in-kernel console has no /bin to exec,
+ * so this is the only cat it has. (/bin/tsh never reaches it: the hosted
+ * build sends `cat` to the real utility, see shell_hosted_builtin.)
+ *
+ * IT READ NO STDIN. It demanded a path, so a here-document, a pipe or a
+ * redirection into it printed "usage: cat <path>":
+ *
+ *     v=$(cat <<EOF          bash: v=body
+ *     body                   kernel shell: v="usage: cat <path>"
+ *     EOF
+ *     )
+ *
+ * Now it is POSIX cat: no operand, or an operand `-`, copies standard input
+ * -- the same source `read` uses: the redirection or here-document text,
+ * else the pipe -- and several operands are concatenated.
+ *
+ * AND IT IS BYTE-EXACT. It appended a newline after every file so the
+ * prompt would not touch the last line; that put an extra byte into every
+ * pipe and capture, and a blank line after every file that already ended
+ * in one. */
+static bool shell_cat_copy_file(struct file *in) {
+    char buf[256];
+    for (;;) {
+        long n = file_read(in, buf, sizeof buf);
+        if (n < 0) return false;
+        if (n == 0) return true;
+        for (long i = 0; i < n; i++) shell_putc(buf[i]);
     }
-    char path[VFS_PATH_MAX];
-    if (shell_resolve_path_arg(argv[1], path, sizeof(path), "cat") < 0) return;
+}
 
+static bool shell_cat_stdin(void) {
+    struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
+    /* Nothing redirected: at the console there is no stream to copy (the
+     * console file reads as empty rather than blocking -- see file.h). */
+    if (!in) return true;
+    if (!shell_cat_copy_file(in)) {
+        kprintf("cat: -: read error\n");
+        return false;
+    }
+    return true;
+}
+
+static bool shell_cat_path(const char *arg) {
+    char path[VFS_PATH_MAX];
+    if (shell_resolve_path_arg(arg, path, sizeof(path), "cat") < 0)
+        return false;
     /* Stream in 256-byte chunks instead of slurping the whole file --
      * keeps stack usage tiny and works for arbitrarily-large text
      * files without a heap allocation. */
     struct vfs_file f;
     int rc = vfs_open(path, &f);
     if (rc != VFS_OK) {
-        kprintf("cat: '%s': %s\n", argv[1], vfs_strerror(rc));
-        shell_set_status(1);
-        return;
+        kprintf("cat: '%s': %s\n", arg, vfs_strerror(rc));
+        return false;
     }
     char buf[256];
     bool ok = true;
     for (;;) {
         long n = vfs_read(&f, buf, sizeof(buf));
         if (n < 0) {
-            kprintf("\ncat: read error: %s\n", vfs_strerror((int)n));
+            kprintf("cat: '%s': read error: %s\n", arg, vfs_strerror((int)n));
             ok = false;
             break;
         }
@@ -7011,9 +7047,22 @@ static void cmd_cat(int argc, char **argv) {
         for (long i = 0; i < n; i++) shell_putc(buf[i]);
     }
     vfs_close(&f);
-    /* Many text files lack a trailing newline -- add one so the next
-     * shell prompt doesn't visually collide with the last line. */
-    shell_putc('\n');
+    return ok;
+}
+
+static void cmd_cat(int argc, char **argv) {
+    bool ok = true;
+    if (argc < 2) {
+        ok = shell_cat_stdin();
+    } else {
+        /* Every operand is tried, as cat does: a missing file is reported
+         * and the rest are still printed, and the status says one failed. */
+        for (int i = 1; i < argc; i++) {
+            bool one = (argv[i][0] == '-' && argv[i][1] == '\0')
+                           ? shell_cat_stdin() : shell_cat_path(argv[i]);
+            if (!one) ok = false;
+        }
+    }
     shell_set_status(ok ? 0 : 1);
 }
 
@@ -14312,7 +14361,7 @@ static const struct cmd cmds[] = {
     { "page",   "walk page tables for virt",    cmd_page   },
     { "modules","list Limine-loaded modules",   cmd_modules},
     { "ls",     "ls [path]: list directory",    cmd_ls     },
-    { "cat",    "cat <path>: print a file",     cmd_cat    },
+    { "cat",    "cat [path|-]...: print files, or standard input", cmd_cat },
     { "touch",  "touch <path>: create empty file (RW mounts)", cmd_touch },
     { "mkdir",  "mkdir <path>: create directory (RW mounts)",  cmd_mkdir },
     { "rm",     "rm [-r] [-f] <path>...: delete file or tree (RW mounts)", cmd_rm },
