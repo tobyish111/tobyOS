@@ -22774,6 +22774,24 @@ static int shell_apply_redirs(struct shell_simple *cmd,
              * the host for a real handle on that standard descriptor. */
             struct file *target = st->fd[r->target_fd];
             struct file *synth = 0;
+            /* A DUP OF A DESCRIPTOR THAT IS NOT OPEN IS AN ERROR.
+             *
+             *     echo x >&3             bash: "3: Bad file descriptor", 1
+             *     exec 3>&-; echo x >&3  bash: the same
+             *
+             * An empty slot above 2 is not a standard descriptor, and the
+             * closed marker `N>&-` leaves is not a file. Both used to fall
+             * through: /bin/tsh treated the empty slot as "no redirection"
+             * and printed x on stdout, status 0; the kernel shell cloned
+             * the console for any number (file_std_handle ignores it there)
+             * -- which is how `exec 3<>/dev/null; echo x >&3` reached the
+             * console-sink recursion described at shell_file_output. */
+            if ((!target && r->target_fd > 2) ||
+                (target && target->kind == FILE_KIND_NULL)) {
+                kprintf("tsh: %d: Bad file descriptor\n", r->target_fd);
+                shell_set_status(1);
+                return -1;
+            }
             if (!target) {
                 synth = file_std_handle(r->target_fd);
                 target = synth;
