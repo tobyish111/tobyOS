@@ -7022,6 +7022,26 @@ static void (*g_diag_term_sink)(void *ctx, char c);
 static void *g_diag_term_sink_ctx;
 static bool g_diag_term_suppress;
 
+static void shell_diag_kputc(void *ctx, char c);
+
+/* One byte to THE TERMINAL: exactly what a builtin's kprintf did before a
+ * capture or a redirection was in the way. Never through kputc() or a
+ * console file -- see shell_file_output for why that recursed. Outside every
+ * push there is no snapshot, and the console is all that is known. */
+static void shell_term_putc(char c) {
+    if (g_diag_depth == 0 || !g_diag_term_suppress) {
+        serial_putc(c);
+        if (console_ready()) console_putc(c);
+    }
+    if (g_diag_depth == 0) return;
+    if (g_diag_term_fn) {
+        char s[2] = { c, '\0' };
+        g_diag_term_fn(s, g_diag_term_ctx);
+    } else if (g_diag_term_sink && g_diag_term_sink != shell_diag_kputc) {
+        g_diag_term_sink(g_diag_term_sink_ctx, c);
+    }
+}
+
 static void shell_diag_kputc(void *ctx, char c) {
     (void)ctx;
     struct file *f = g_shell_fd[2];
@@ -7029,18 +7049,7 @@ static void shell_diag_kputc(void *ctx, char c) {
         (void)file_write(f, &c, 1);
         return;
     }
-    /* The terminal: exactly what a builtin's kprintf did before a capture
-     * or a redirection was in the way. */
-    if (!g_diag_term_suppress) {
-        serial_putc(c);
-        if (console_ready()) console_putc(c);
-    }
-    if (g_diag_term_fn) {
-        char s[2] = { c, '\0' };
-        g_diag_term_fn(s, g_diag_term_ctx);
-    } else if (g_diag_term_sink && g_diag_term_sink != shell_diag_kputc) {
-        g_diag_term_sink(g_diag_term_sink_ctx, c);
-    }
+    shell_term_putc(c);
 }
 
 /* Push BEFORE the caller changes g_shell_out: the outermost push records
@@ -7059,7 +7068,13 @@ static void shell_diag_push(struct shell_diag_save *sv) {
 
 static void shell_diag_pop(struct shell_diag_save *sv) {
     printk_set_sink_mode(sv->sink, sv->ctx, sv->suppress);
-    if (g_diag_depth > 0) g_diag_depth--;
+    if (g_diag_depth > 0 && --g_diag_depth == 0) {
+        g_diag_term_fn = 0;
+        g_diag_term_ctx = 0;
+        g_diag_term_sink = 0;
+        g_diag_term_sink_ctx = 0;
+        g_diag_term_suppress = false;
+    }
 }
 #endif
 
@@ -22835,13 +22850,46 @@ static void shell_restore_io_frame(struct shell_io_frame *frame) {
  * and every builtin writes through it. */
 static bool g_shell_out_failed;
 
+/* A BUILTIN WHOSE STDOUT IS THE CONSOLE TOOK THE WHOLE MACHINE DOWN.
+ *
+ *     cat f >&2                   (kernel shell, fd 2 not redirected)
+ *     { ls; } >&2
+ *     exec 3<>/dev/null; echo x >&3     (the open failed, so fd 3 was the
+ *                                        console too: file_std_handle ignores
+ *                                        the number in the kernel)
+ *
+ * The dup gives the builtin a CONSOLE-kind file as stdout, and
+ * shell_run_builtin installed that file as the printk sink. A console file's
+ * write is tty_console_output, which passes every byte to kputc, which hands
+ * it to the printk sink -- shell_file_kputc -- which writes it to the console
+ * file again. Unbounded recursion on pid 0, inside shell_run_test_line's
+ * irqsave lock: the stack ran into whatever lay below it with interrupts
+ * off, the heartbeat stopped, and the box stopped answering ping. Found on
+ * the EliteDesk 2026-09-26 (build 09fdc23) by the /dev/null probe's
+ * `exec 3<>/dev/null; echo x >&3`, before /dev/null opened.
+ *
+ * Until the kernel shell had a standard error EVERY builtin did this. Since
+ * then a POSIX builtin's kprintf goes to shell_diag_kputc, which never
+ * writes a console file, so `echo x >&2` survived by accident -- and the
+ * kernel-only builtins, whose kprintf is still their stdout, did not.
+ *
+ * A console file means "the terminal", and the terminal is written directly. */
 static void shell_file_output(const char *s, void *ctx) {
     struct file *f = (struct file *)ctx;
+#ifndef SHELL_HOSTED
+    if (s && f && f->kind == FILE_KIND_CONSOLE) {
+        while (*s) shell_term_putc(*s++);
+        return;
+    }
+#endif
     if (s && f && file_write(f, s, strlen(s)) < 0) g_shell_out_failed = true;
 }
 
 static void shell_file_kputc(void *ctx, char c) {
     struct file *f = (struct file *)ctx;
+#ifndef SHELL_HOSTED
+    if (f && f->kind == FILE_KIND_CONSOLE) { shell_term_putc(c); return; }
+#endif
     if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
 }
 
@@ -22853,6 +22901,9 @@ static void shell_file_kputc(void *ctx, char c) {
 static void shell_putc_raw(char c) {
     if (g_shell_out == shell_file_output) {
         struct file *f = (struct file *)g_shell_out_ctx;
+#ifndef SHELL_HOSTED
+        if (f && f->kind == FILE_KIND_CONSOLE) { shell_term_putc(c); return; }
+#endif
         if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
         return;
     }
