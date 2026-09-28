@@ -14983,8 +14983,20 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
      * answer for `"$SH" -c x` with $SH unset. resolve_program("") walked
      * PATH, joined "" onto each directory, landed on the directory itself
      * and reported "Is a directory" with 126. Two Oils cases turned on it. */
+    /* A LAUNCH FAILURE IS THE COMMAND'S OWN STDERR.
+     *
+     *     nosuch 2>/dev/null        bash: silent, 127
+     *     nosuch 2>err              bash: the message is IN err
+     *
+     * The diagnostics below are kprintf, which follows the SHELL's fd 2
+     * (g_shell_fd[2]) -- but the command's `2>` lives only in the fd2 it
+     * hands us, so "failed to launch" went to the terminal whatever the
+     * redirection said. Point fd 2 at the command's for the explanation. */
+    struct file *spawn_diag_saved = g_shell_fd[2];
+    if (fd2) g_shell_fd[2] = fd2;
     if (!path_arg || !path_arg[0]) {
         kprintf("tsh: : command not found\n");
+        g_shell_fd[2] = spawn_diag_saved;
         return 127;
     }
     char path_buf[64];
@@ -15037,9 +15049,11 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         }
         if (pid < 0) {
             if (why != 0) kprintf("spawn: failed to launch '%s'\n", path);
+            g_shell_fd[2] = spawn_diag_saved;
             return status;
         }
     }
+    g_shell_fd[2] = spawn_diag_saved;
 
     if (background) {
         g_last_bg_pid = pid;
