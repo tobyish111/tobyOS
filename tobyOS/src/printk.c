@@ -18,12 +18,82 @@
 #include <tobyos/spinlock.h>
 #include <tobyos/pit.h>
 #include <tobyos/perf.h>
+#include <tobyos/proc.h>
+#include <tobyos/smp.h>
 
 /* Optional "mirror" sink: when set, every emitted byte is also handed
  * off to cb(ctx, c). See printk.h for the semantics + caveats. */
 static void (*g_sink_cb)(void *ctx, char c) = 0;
 static void *g_sink_ctx = 0;
 static bool g_sink_suppress = false;
+
+/* THE SINK IS ITS OWNER'S, AND IT IS FED OUTSIDE THE LOCK.
+ *
+ * The in-kernel shell points the sink at a builtin's stdout -- a pipe, a
+ * capture's tmpfs spill file, the TCP client -- and the callback did that
+ * I/O HERE, inside g_printk_lock with interrupts off. On the EliteDesk
+ * (30cb3c8) `x=$(ls /dev)` in the kernel shell took the whole machine down:
+ * no heartbeat, no ping, no dump. QEMU ran it 10/10. A write that allocates
+ * or wakes a process can need another CPU, and every other CPU that called
+ * kprintf at that moment was spinning on this lock with ITS interrupts off.
+ * (Bisected on the box: `ls /dev` to the terminal survived, `x=$(ls /dev)`
+ * did not -- logs/kpipebisect.py.)
+ *
+ * And the sink was GLOBAL: every CPU's kprintf -- the `[proc] created`
+ * line of a process being spawned on another core, an IRQ handler's log --
+ * went into the builtin's output, and with suppress on, off serial.
+ *
+ * So:
+ *   - only the context that installed the sink feeds it (the same process;
+ *     for pid 0, which every CPU's idle loop shares, the same CPU too).
+ *     Everyone else's kprintf goes to serial and the console as if no sink
+ *     were set -- never captured, never suppressed;
+ *   - its bytes are STAGED here under the lock and handed to the callback
+ *     after the lock is released (sink_deliver), so no sink ever runs its
+ *     I/O inside g_printk_lock;
+ *   - a kprintf made while delivering (the I/O path logging something)
+ *     bypasses the sink rather than recursing into it. */
+static struct proc *g_sink_owner;
+static uint32_t     g_sink_owner_cpu;
+#define SINK_STAGE_SZ 4096
+static char   g_sink_stage[SINK_STAGE_SZ];
+static size_t g_sink_stage_len;
+static size_t g_sink_dropped;
+static bool   g_sink_delivering;
+/* Decided once per call, under the lock: does THIS call feed the sink? */
+static bool   g_emit_to_sink;
+
+static bool sink_is_mine(void) {
+    if (!g_sink_cb || g_sink_delivering) return false;
+    struct proc *p = current_proc();
+    if (p != g_sink_owner) return false;
+    if (p && p->pid != 0) return true;
+    return smp_current_cpu_idx() == g_sink_owner_cpu;
+}
+
+static void sink_stage(char c) {
+    if (g_sink_stage_len < SINK_STAGE_SZ) g_sink_stage[g_sink_stage_len++] = c;
+    else g_sink_dropped++;
+}
+
+/* Called by the owner AFTER releasing g_printk_lock. Only the owner stages,
+ * and a nested kprintf during delivery bypasses the sink, so the stage is
+ * this context's alone. */
+static void sink_deliver(void) {
+    void (*cb)(void *ctx, char c) = g_sink_cb;
+    void *ctx = g_sink_ctx;
+    g_sink_delivering = true;
+    if (cb)
+        for (size_t i = 0; i < g_sink_stage_len; i++) cb(ctx, g_sink_stage[i]);
+    g_sink_stage_len = 0;
+    size_t dropped = g_sink_dropped;
+    g_sink_dropped = 0;
+    g_sink_delivering = false;
+    if (dropped)
+        kprintf_serial("[printk] sink: %lu byte(s) of one message dropped "
+                       "(stage is %u)\n", (unsigned long)dropped,
+                       (unsigned)SINK_STAGE_SZ);
+}
 
 /* When set, emit_char routes ONLY to the COM1 serial sink -- not the
  * framebuffer console, the mirror sink, or the boot log. Used by
@@ -56,6 +126,8 @@ void printk_set_sink_mode(void (*cb)(void *ctx, char c), void *ctx,
     g_sink_cb       = cb;
     g_sink_ctx      = ctx;
     g_sink_suppress = cb ? suppress_normal_output : false;
+    g_sink_owner     = cb ? current_proc() : 0;
+    g_sink_owner_cpu = cb ? smp_current_cpu_idx() : 0;
 }
 
 void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
@@ -70,12 +142,14 @@ static void emit_char(char c) {
         serial_putc(c);
         return;
     }
-    if (!g_sink_suppress) {
+    /* Suppression is the OWNER's request, for the owner's output only. */
+    bool suppress = g_emit_to_sink && g_sink_suppress;
+    if (!suppress) {
         serial_putc(c);
         if (console_ready()) console_putc(c);
     }
-    if (g_sink_cb) g_sink_cb(g_sink_ctx, c);
-    if (!g_sink_suppress) bootlog_char(c);
+    if (g_emit_to_sink) sink_stage(c);
+    if (!suppress) bootlog_char(c);
 }
 
 static void emit_str(const char *s) {
@@ -148,7 +222,7 @@ static uint64_t now_log_ms(void) {
 uint64_t klog_ms(void) { return now_log_ms(); }
 
 static void emit_ts_prefix(void) {
-    if (g_sink_suppress) return;
+    if (g_emit_to_sink && g_sink_suppress) return;
     emit_char('[');
     uint64_t ms = now_log_ms();
     if (ms == (uint64_t)-1) {
@@ -267,9 +341,13 @@ static void kvprintf_unlocked(const char *fmt, va_list ap) {
 
 void kvprintf(const char *fmt, va_list ap) {
     uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    g_emit_to_sink = sink_is_mine();
+    bool deliver = g_emit_to_sink;
     emit_ts_prefix();
     kvprintf_unlocked(fmt, ap);
+    g_emit_to_sink = false;
     spin_unlock_irqrestore(&g_printk_lock, flags);
+    if (deliver) sink_deliver();
 }
 
 void kprintf(const char *fmt, ...) {
@@ -297,14 +375,22 @@ void kprintf_serial(const char *fmt, ...) {
 
 void kputs(const char *s) {
     uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    g_emit_to_sink = sink_is_mine();
+    bool deliver = g_emit_to_sink;
     emit_ts_prefix();
     emit_str(s);
     emit_char('\n');
+    g_emit_to_sink = false;
     spin_unlock_irqrestore(&g_printk_lock, flags);
+    if (deliver) sink_deliver();
 }
 
 void kputc(char c) {
     uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    g_emit_to_sink = sink_is_mine();
+    bool deliver = g_emit_to_sink;
     emit_char(c);
+    g_emit_to_sink = false;
     spin_unlock_irqrestore(&g_printk_lock, flags);
+    if (deliver) sink_deliver();
 }
