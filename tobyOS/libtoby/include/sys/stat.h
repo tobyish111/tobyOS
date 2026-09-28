@@ -19,6 +19,16 @@ extern "C" {
 #define S_IFMT      0xF000
 #define S_IFREG     0x8000
 #define S_IFDIR     0x4000
+/* The other POSIX file types. The kernel reports S_IFCHR for the /dev nodes
+ * (and passes st_mode through unchanged -- see unistd.c), but with only the
+ * two macros below defined, every native tool that asked "what is this?"
+ * got neither answer: `ls -l /dev/null` printed `?rw-rw-rw-` and `stat`
+ * said "unknown". Values are the POSIX/Linux ones. */
+#define S_IFIFO     0x1000
+#define S_IFCHR     0x2000
+#define S_IFBLK     0x6000
+#define S_IFLNK     0xA000
+#define S_IFSOCK    0xC000
 
 #define S_IRUSR     0400
 #define S_IWUSR     0200
@@ -32,6 +42,11 @@ extern "C" {
 
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
+#define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
+#define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
+#define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
 struct stat {
     off_t  st_size;

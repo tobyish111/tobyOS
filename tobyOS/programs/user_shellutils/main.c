@@ -343,12 +343,17 @@ static int do_sync(void) {
 
 /* ------------------------------------------------------------ stat / du */
 
-/* libtoby's <sys/stat.h> defines only S_ISDIR and S_ISREG, and struct stat
- * carries no st_ino -- so `stat` reports the two types the VFS actually
- * distinguishes and says "unknown" rather than guessing at the rest. */
+/* GNU stat's %F names. libtoby's <sys/stat.h> used to define only S_ISDIR
+ * and S_ISREG, so this said "unknown" for every /dev node -- which the
+ * kernel reports as S_IFCHR -- while GNU says "character special file". */
 static const char *type_name(mode_t m) {
-    if (S_ISDIR(m)) return "directory";
-    if (S_ISREG(m)) return "regular file";
+    if (S_ISDIR(m))  return "directory";
+    if (S_ISREG(m))  return "regular file";
+    if (S_ISCHR(m))  return "character special file";
+    if (S_ISBLK(m))  return "block special file";
+    if (S_ISFIFO(m)) return "fifo";
+    if (S_ISLNK(m))  return "symbolic link";
+    if (S_ISSOCK(m)) return "socket";
     return "unknown";
 }
 

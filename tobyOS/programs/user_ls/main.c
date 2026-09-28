@@ -52,9 +52,16 @@ static void human(long bytes, char *out, size_t cap) {
     else        snprintf(out, cap, "%ld%c", v, u[i]);
 }
 
+/* The first column of `ls -l`. Only d and - existed, so every /dev node
+ * listed as `?rw-rw-rw-`; GNU ls says `crw-rw-rw-`. */
 static char type_char(mode_t m) {
-    if (S_ISDIR(m)) return 'd';
-    if (S_ISREG(m)) return '-';
+    if (S_ISDIR(m))  return 'd';
+    if (S_ISREG(m))  return '-';
+    if (S_ISCHR(m))  return 'c';
+    if (S_ISBLK(m))  return 'b';
+    if (S_ISFIFO(m)) return 'p';
+    if (S_ISLNK(m))  return 'l';
+    if (S_ISSOCK(m)) return 's';
     return '?';
 }
 
