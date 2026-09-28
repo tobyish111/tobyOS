@@ -1070,6 +1070,11 @@ void sysfs_init(void) {
     sysfs_add_dir("/cpu");
     sysfs_add_dir("/mem");
     sysfs_add_dir("/kernel");
+    /* /sys/fs: cgroup2 is mounted at /sys/fs/cgroup (cgroup_mount), and its
+     * parent never existed -- `ls /sys` had no `fs`, and `stat /sys/fs` was
+     * ENOENT while /sys/fs/cgroup below it worked. The mount itself is listed
+     * inside it by vfs_readdir's mount-point rule. */
+    sysfs_add_dir("/fs");
     sysfs_add_file("/cpu/count", gen_cpu_count);
     sysfs_add_file("/mem/total", gen_mem_total);
     sysfs_add_file("/mem/free", gen_mem_free);
