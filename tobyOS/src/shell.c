@@ -28735,74 +28735,24 @@ static size_t g_heredoc_body_len;
 static char g_continuation_buf[LINE_MAX * 4];
 static size_t g_continuation_len;
 
+int shell_line_incomplete_hosted(const char *s);
+
+/* DOES THE KERNEL SHELL'S LINE NEED ANOTHER? -- the same answer /bin/tsh's
+ * REPL gets.
+ *
+ *     tobyOS> echo a (b        bash: syntax error, at once
+ *     tobyOS> if then          bash: syntax error, at once
+ *
+ * This was a second, private approximation of the grammar: a character
+ * loop counting if/fi, do/done, case/esac, braces and parens. It saw an
+ * open paren and an open `if` and waited for the rest -- and over TCP,
+ * where no PS2 prompt is printed, the shell simply looked dead while it
+ * swallowed every following line. It also counted the `{` of `${x}` as a
+ * group. The structural scanner behind shell_line_incomplete_hosted is the
+ * one the interactive parity gate measures against bash, and it knows a
+ * line with a certain syntax error is not incomplete. One grammar. */
 static bool shell_line_needs_continuation(const char *s) {
-    int if_depth = 0, do_depth = 0, case_depth = 0;
-    int brace_depth = 0, paren_depth = 0;
-    bool in_sq = false, in_dq = false, in_sq_ansi = false;
-    /* `$'...'` honours `\\'`; a plain `'...'` has no escapes. Same rule as
-     * shell_line_incomplete -- see the comment there. */
-    bool last_was_pipe = false, last_was_and = false, last_was_or = false;
-    bool last_was_backslash = false;
-
-    for (const char *p = s; *p; p++) {
-        if (in_sq) {
-            if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
-            if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
-            continue;
-        }
-        if (in_dq) {
-            if (*p == '\\' && p[1]) { p++; continue; }
-            if (*p == '"') in_dq = false;
-            continue;
-        }
-        if (*p == '\\' && !p[1]) { last_was_backslash = true; continue; }
-        if (*p == '\\' && p[1]) { p++; continue; }
-        if (*p == '$' && p[1] == '\'') {   /* ANSI-C: escapes are live */
-            in_sq = true; in_sq_ansi = true; p++; continue;
-        }
-        if (*p == '\'') { in_sq = true; continue; }
-        if (*p == '"') { in_dq = true; continue; }
-        if (*p == '{') brace_depth++;
-        if (*p == '}') brace_depth--;
-        if (*p == '(') paren_depth++;
-        if (*p == ')') paren_depth--;
-
-        last_was_pipe = false;
-        last_was_and = false;
-        last_was_or = false;
-
-        if (shell_starts_with_word(p, "if") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            if_depth++;
-        if (shell_starts_with_word(p, "then") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            {} /* then is part of if, no depth change */
-        if (shell_starts_with_word(p, "fi") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            if_depth--;
-        if ((shell_starts_with_word(p, "do") && (p == s || is_space(p[-1]) || p[-1] == ';')))
-            do_depth++;
-        if (shell_starts_with_word(p, "done") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            do_depth--;
-        if (shell_starts_with_word(p, "case") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            case_depth++;
-        if (shell_starts_with_word(p, "esac") && (p == s || is_space(p[-1]) || p[-1] == ';'))
-            case_depth--;
-    }
-
-    /* Trailing pipe or logical operator means continuation */
-    const char *end = s + strlen(s);
-    while (end > s && is_space(end[-1])) end--;
-    if (end > s && end[-1] == '|' && !(end - 1 > s && end[-2] == '|'))
-        last_was_pipe = true;
-    if (end - s >= 2 && end[-1] == '&' && end[-2] == '&')
-        last_was_and = true;
-    if (end - s >= 2 && end[-1] == '|' && end[-2] == '|')
-        last_was_or = true;
-
-    if (in_sq || in_dq) return true;
-    if (last_was_backslash) return true;
-    if (if_depth > 0 || do_depth > 0 || case_depth > 0) return true;
-    if (brace_depth > 0 || paren_depth > 0) return true;
-    if (last_was_pipe || last_was_and || last_was_or) return true;
-    return false;
+    return shell_line_incomplete_hosted(s) != 0;
 }
 
 static void execute_line_body(void) {
@@ -28867,7 +28817,27 @@ static void execute_line_body(void) {
         }
         if (shell_line_needs_continuation(g_continuation_buf)) return;
         g_continuation_active = false;
-        execute_line_text(g_continuation_buf);
+        /* LINES JOINED BY A NEWLINE ARE A SCRIPT, NOT A LINE.
+         *
+         *     tobyOS> if true
+         *     tobyOS> then echo in
+         *     tobyOS> fi                  if: expected '; fi'
+         *
+         * execute_line_text parses ONE line; the newlines the join kept are
+         * exactly what separates `if true` from `then`. The script reader is
+         * the code that knows compounds spanning lines -- /bin/tsh's REPL
+         * runs every line through it -- so a multi-line if/for/while never
+         * worked at this prompt until it went there too. No EXIT trap: the
+         * kernel shell does not exit. */
+        {
+            char *copy = shell_strdup(g_continuation_buf);
+            if (copy) {
+                (void)shell_run_script_text(copy, false);
+                kfree(copy);
+            } else {
+                execute_line_text(g_continuation_buf);
+            }
+        }
         return;
     }
 
