@@ -1630,7 +1630,19 @@ reread:;
 #endif
     if (rc != 0) {
         kprintf("[execve] cannot read '%s': %d\n", kpath, rc);
-        EXEC_RETURN(-ABI_ENOENT);
+        /* A PATH THAT EXISTS BUT CANNOT BE READ AS AN IMAGE IS EACCES.
+         *
+         *     /                   bash on Linux: "Is a directory", 126
+         *                         bash here:     "No such file...", 127
+         *
+         * Linux execve returns EACCES for a directory (or any file that is
+         * not a regular one), and bash turns EACCES on a directory into
+         * "Is a directory" and 126. This returned ENOENT for every read
+         * failure, so a directory looked like a typo. ENOENT stays for a
+         * path that is really not there, ENOTDIR for a bad component. */
+        struct vfs_stat xs;
+        if (vfs_stat(kpath, &xs) == VFS_OK) EXEC_RETURN(-ABI_EACCES);
+        EXEC_RETURN(rc == VFS_ERR_NOTDIR ? -ABI_ENOTDIR : -ABI_ENOENT);
     }
 
     /* "#!": the exec becomes the interpreter's, with the script's path as
