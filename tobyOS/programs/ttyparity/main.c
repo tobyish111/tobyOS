@@ -414,6 +414,36 @@ static void report_diff(const char *a, size_t alen, const char *b, size_t blen) 
 
 /* ---- one case, both shells ---------------------------------------------- */
 
+/* THE SHELL'S OWN NAME IS NOT BEHAVIOUR.
+ *
+ * An interactive diagnostic starts with the program's name -- bash says
+ * "bash: syntax error near unexpected token `done'", tsh "shell: ..." or
+ * "tsh: ..." -- and no amount of parity work can make tsh call itself bash.
+ * So a LINE that starts with one of those prefixes has it rewritten to
+ * "SH: " on both sides before the comparison. Everything after the prefix,
+ * and every other byte of the stream, still has to match exactly. Returns
+ * the new length (the rewrite only ever shortens). */
+static size_t norm_diag_prefix(char *t, size_t len) {
+    static const char *const pfx[] = { "bash: ", "tsh: ", "shell: ", 0 };
+    size_t r = 0, w = 0;
+    while (r < len) {
+        if (r == 0 || t[r - 1] == '\n') {
+            for (int i = 0; pfx[i]; i++) {
+                size_t pl = strlen(pfx[i]);
+                if (r + pl <= len && memcmp(t + r, pfx[i], pl) == 0) {
+                    memcpy(t + w, "SH: ", 4);
+                    w += 4;
+                    r += pl;
+                    break;
+                }
+            }
+            if (r >= len) break;
+        }
+        t[w++] = t[r++];
+    }
+    return w;
+}
+
 static int run_pair(const char *name, const char *shell_b, int *pass) {
     static char lines[MAX_LINES][256];
     int nlines = 0;
@@ -447,9 +477,9 @@ static int run_pair(const char *name, const char *shell_b, int *pass) {
     }
 
     const char *a = g_ta + cut_a;
-    size_t alen = sa.tlen - cut_a;
+    size_t alen = norm_diag_prefix(g_ta + cut_a, sa.tlen - cut_a);
     const char *b = g_tb + cut_b;
-    size_t blen = sb.tlen - cut_b;
+    size_t blen = norm_diag_prefix(g_tb + cut_b, sb.tlen - cut_b);
 
     if (alen == blen && memcmp(a, b, alen) == 0 && st_a == st_b) {
         emitf("[ttyparity] %-26s PASS  (%u bytes, exit=%d)\n",

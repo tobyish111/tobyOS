@@ -699,6 +699,26 @@ static void shell_set_status(int status) {
     g_last_status = status;
 }
 
+/* A SYNTAX ERROR ENDS A SCRIPT, NOT A TERMINAL SESSION.
+ *
+ *     $ done                   bash: "syntax error near unexpected token
+ *     $ echo "st=$?"                  `done'", then st=2 -- it carries on
+ *
+ * shell_parse_error raises SHELL_FLOW_EXIT, which is right for a script (one
+ * that cannot be parsed must not run on). At a prompt nothing clears it:
+ * /bin/tsh's REPL saw an exit request and quit on the user's typo, and the
+ * in-kernel shell -- whose loop never consumes a flow at all -- kept the flag
+ * forever and silently ran nothing again, over every later TCP connection,
+ * until a reboot. Called after each line typed at an interactive prompt. */
+static void shell_interactive_line_done(void) {
+    if (g_interactive && g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        g_parse_error = false;
+        shell_set_status(2);
+    }
+}
+
 void shell_set_output(shell_write_fn_t fn, void *ctx) {
     g_shell_out = fn;
     g_shell_out_ctx = ctx;
@@ -25092,6 +25112,7 @@ static bool shell_try_dbracket_command(const char *src) {
          * with the status it already had -- not 2, which is what setting a
          * status here would produce. */
         kprintf("tsh: [[: syntax error in conditional expression\n");
+        g_parse_error = true;   /* not an `exit` -- see g_parse_error */
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
             g_shell_flow_status = g_last_status;
@@ -28198,9 +28219,7 @@ static void execute_line_text_inner(const char *src) {
             if (!shell_starts_with_word(w, misplaced[m])) continue;
             kprintf("shell: syntax error near unexpected token `%s'\n",
                     misplaced[m]);
-            shell_set_status(2);
-            g_shell_flow = SHELL_FLOW_EXIT;
-            g_shell_flow_status = 2;
+            shell_parse_error();   /* a PARSE error: see g_parse_error */
             return;
         }
 
@@ -28275,9 +28294,7 @@ static void execute_line_text_inner(const char *src) {
                 if (!*rest || *rest == ';') break;
                 kprintf("shell: syntax error near unexpected token `%s'\n",
                         compound_kw[m]);
-                shell_set_status(2);
-                g_shell_flow = SHELL_FLOW_EXIT;
-                g_shell_flow_status = 2;
+                shell_parse_error();
                 return;
             }
         }
@@ -28645,7 +28662,7 @@ static bool shell_line_needs_continuation(const char *s) {
     return false;
 }
 
-static void execute_line(void) {
+static void execute_line_body(void) {
     shell_latch_pid();
     if (g_heredoc_collecting) {
         const char *check = line;
@@ -28722,6 +28739,12 @@ static void execute_line(void) {
     }
 
     execute_line_text(line);
+}
+
+/* One line typed at the kernel shell's prompt (console or TCP). */
+static void execute_line(void) {
+    execute_line_body();
+    shell_interactive_line_done();
 }
 
 void shell_init(void) {
@@ -29150,6 +29173,10 @@ int shell_run_line_hosted(const char *text) {
     if (!copy) return 2;
     int rc = shell_run_script_text(copy, true);
     kfree(copy);
+    if (g_interactive && g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) {
+        shell_interactive_line_done();
+        rc = 2;
+    }
     /* An interrupt unwound the whole construct to get here. Clear BOTH the
      * flow and the flag, or the shell arrives at its next prompt already
      * refusing to run anything -- a ^C that permanently bricks the session
