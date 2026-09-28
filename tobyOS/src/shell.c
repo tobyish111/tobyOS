@@ -180,6 +180,13 @@ static bool g_getopts_internal_optind_write;
 static struct file *g_shell_fd[SHELL_FD_MAX];
 __attribute__((format(printf, 1, 2)))
 static void shell_err(const char *fmt, ...);   /* fd 2, even in the kernel */
+#ifndef SHELL_HOSTED
+/* Every kprintf in this file goes through shell_kprintf in the kernel build:
+ * see there. /bin/tsh's kprintf (host.c) is already the shell's fd 2. */
+__attribute__((format(printf, 1, 2)))
+static void shell_kprintf(const char *fmt, ...);
+#define kprintf(...) shell_kprintf(__VA_ARGS__)
+#endif
 
 /* Command history, kept so `fc` has something to list and re-run. A ring:
  * g_hist_base is the history number of slot 0, so numbers keep climbing as
@@ -7116,6 +7123,43 @@ static void shell_err(const char *fmt, ...) {
 #endif
     va_end(ap);
 }
+
+#ifndef SHELL_HOSTED
+/* THE SHELL'S OWN DIAGNOSTICS AT THE TOP OF A LINE.
+ *
+ *     tobyOS> nosuch                   (TCP client: nothing at all)
+ *     tobyOS> exec 3<>/nope/x          (TCP client: nothing at all)
+ *     tobyOS> { nosuch; } 2>/dev/null  (serial: the message anyway)
+ *
+ * shell_diag_kputc only covered what ran INSIDE a builtin or a substitution
+ * -- the spans that already had a printk sink. A diagnostic the shell prints
+ * itself at the top of a line (command not found, a redirection that failed
+ * to open, a syntax error, an expansion error) went to bare kprintf: the
+ * console and serial, never the TCP client, and never where fd 2 pointed.
+ *
+ * So, while a line is executing and no diag frame is active, each of this
+ * file's kprintf calls pushes one for that message alone: fd 2 if it is
+ * redirected, else the terminal (the TCP client's writer, or the console).
+ * It is per MESSAGE, not per line -- nothing else's kernel log is captured
+ * (the no-sink-across-a-line rule at shell_diag_kputc). Inside a frame the
+ * call is plain kvprintf, so a kernel-only builtin's kprintf is still its
+ * stdout. Outside a line (boot banners, the prompt) nothing changes. */
+static bool g_kshell_in_line;
+
+static void shell_kprintf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_kshell_in_line && g_diag_depth == 0) {
+        struct shell_diag_save sv;
+        shell_diag_push(&sv);
+        kvprintf(fmt, ap);
+        shell_diag_pop(&sv);
+    } else {
+        kvprintf(fmt, ap);
+    }
+    va_end(ap);
+}
+#endif
 
 /* The kernel shell's `cat` -- the in-kernel console has no /bin to exec,
  * so this is the only cat it has. (/bin/tsh never reaches it: the hosted
@@ -28804,8 +28848,14 @@ static void shell_kernel_flow_done(void) {
 /* One line typed at the kernel shell's prompt (console or TCP). */
 static void execute_line(void) {
     g_kshell_exit_pending = false;    /* a request is for THIS line's caller */
+#ifndef SHELL_HOSTED
+    g_kshell_in_line = true;          /* see shell_kprintf */
+#endif
     execute_line_body();
     shell_interactive_line_done();
+#ifndef SHELL_HOSTED
+    g_kshell_in_line = false;
+#endif
     shell_kernel_flow_done();
 }
 
