@@ -10969,7 +10969,15 @@ static void cmd_exit(int argc, char **argv) {
         return;
     }
     shell_set_status(st);
-    if (g_script_depth > 0 || g_subshell_depth > 0) {
+    /* At the in-kernel shell's own prompt `exit` did NOTHING -- it only set
+     * $? -- because the flow was raised just inside a script or subshell
+     * and nothing at the top would have consumed it. execute_line consumes
+     * it now (shell_kernel_flow_done), and the TCP service ends the session
+     * the way `exit` ends a bash login. */
+#ifdef SHELL_HOSTED
+    if (g_script_depth > 0 || g_subshell_depth > 0)
+#endif
+    {
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = st;
     }
@@ -28741,10 +28749,64 @@ static void execute_line_body(void) {
     execute_line_text(line);
 }
 
+/* THE KERNEL SHELL NEVER EXITS, SO IT HAS TO CONSUME THE REQUEST.
+ *
+ *     tobyOS> set -e; false
+ *     tobyOS> echo hi          (nothing, then or ever again)
+ *
+ *     tobyOS> shopt -s failglob; echo *.zz
+ *     tobyOS> echo hi          (the same)
+ *
+ * /bin/tsh's REPL asks shell_wants_exit_hosted after each line and quits,
+ * and clears a ^C or failglob flow itself. The kernel shell is pid 0's
+ * console and the TCP 7777 service, and nothing asked: a flow that reached
+ * the top stayed raised, every later line unwound at its first command, and
+ * every later TCP connection was dead too -- one `set -e` failure or one
+ * failglob miss bricked the service until a reboot (measured on 7a09378).
+ *
+ * After each line the flow is consumed here, as the hosted REPL does:
+ * INTERRUPT leaves status 130 and DISCARD 1, and EXIT becomes an exit
+ * REQUEST that the caller acts on -- tcp_shell ends the session, the
+ * console (which has nothing to exit to) says so. `exit` itself raises EXIT
+ * at this prompt now (see cmd_exit), so typing it ends a TCP session as it
+ * ends a bash login. */
+static bool g_kshell_exit_pending;
+
+bool shell_take_exit_request(void) {
+    bool r = g_kshell_exit_pending;
+    g_kshell_exit_pending = false;
+    return r;
+}
+
+static void shell_kernel_flow_done(void) {
+    switch (g_shell_flow) {
+    case SHELL_FLOW_NONE:
+        return;
+    case SHELL_FLOW_EXIT:
+        g_kshell_exit_pending = true;
+        shell_set_status(g_shell_flow_status);
+        break;
+    case SHELL_FLOW_INTERRUPT:
+        shell_set_status(130);
+        break;
+    case SHELL_FLOW_DISCARD:
+        shell_set_status(1);
+        break;
+    default:                     /* a break/continue/return that escaped */
+        break;
+    }
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    g_parse_error = false;
+    (void)shell_take_interrupt();
+}
+
 /* One line typed at the kernel shell's prompt (console or TCP). */
 static void execute_line(void) {
+    g_kshell_exit_pending = false;    /* a request is for THIS line's caller */
     execute_line_body();
     shell_interactive_line_done();
+    shell_kernel_flow_done();
 }
 
 void shell_init(void) {
@@ -28888,6 +28950,8 @@ void shell_poll(void) {
                 line[0]  = '\0';
                 spin_unlock_irqrestore(&g_shell_line_lock, irqf);
             }
+            if (shell_take_exit_request())
+                kprintf("exit: this is the kernel console -- it keeps running\n");
             prompt();
             continue;
         }

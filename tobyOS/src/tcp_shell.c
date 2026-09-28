@@ -97,6 +97,19 @@ void tcp_shell_poll(void) {
                 shell_set_output(tsh_shell_write, g_cli);
                 shell_run_test_line(g_buf);
                 shell_set_output(NULL, NULL);
+
+                /* `exit` ends THIS session, as it ends a bash login: the
+                 * kernel shell has consumed the request and keeps running
+                 * for the next connection. */
+                if (shell_take_exit_request()) {
+                    tsh_send_str(g_cli, "exit\r\n");
+                    kprintf("[tcp-shell] client ended the session (exit)\n");
+                    tcp_close(g_cli);
+                    g_cli = NULL;
+                    g_len = 0;
+                    g_buf[0] = '\0';
+                    return;
+                }
             
                 g_len = 0;
                 g_buf[0] = '\0';
