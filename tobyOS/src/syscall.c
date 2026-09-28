@@ -3112,37 +3112,20 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
  * Found by tracing the path behind an ENOENT (-DPATHFAIL_TRACE) rather than by
  * guessing at Chromium's source.
  *
- * This table is the single answer to "what exists in /dev", so the open path
- * and the stat path cannot drift apart. programs/linux-gapfill asserts they
- * agree NODE BY NODE: anything listed here must both open AND stat, and a node
- * that opens without appearing here fails the test. That symmetry is the whole
- * point -- the bug above was exactly the two disagreeing. */
-struct dev_synth { const char *name; uint32_t mode; };
-static const struct dev_synth g_dev_synth[] = {
-    { "null",     ABI_S_IFCHR | 0666 },
-    { "zero",     ABI_S_IFCHR | 0666 },
-    { "full",     ABI_S_IFCHR | 0666 },
-    { "tty",      ABI_S_IFCHR | 0620 },
-    { "ptmx",     ABI_S_IFCHR | 0666 },
-    { "random",   ABI_S_IFCHR | 0666 },
-    { "urandom",  ABI_S_IFCHR | 0666 },
-};
+ * The single answer to "what exists in /dev" is now the table in devfs.c,
+ * which also mounts /dev as a directory tree -- so the open path, these stat
+ * arms, the listing, chdir and the in-kernel shell cannot drift apart.
+ * programs/linux-gapfill asserts the open/stat symmetry NODE BY NODE, and
+ * logs/kdevtreeprobe.sh walks the whole tree. (The old table here knew seven
+ * nodes; /dev/console, /dev/fb0 and /dev/input/* opened but did not stat.) */
+#include <tobyos/devfs.h>
 
-/* Non-zero (the mode) if `kpath` names a synthesised device node. Also the
- * in-kernel shell's answer for `test -e /dev/null` (see file.h), so that
- * nothing outside this table decides what /dev holds. */
+/* Non-zero (the mode) if `kpath` names a synthesised device node; see
+ * devfs_node_mode for the major/minor. Also the in-kernel shell's fallback
+ * for `test -e /dev/null` (see file.h). */
 uint32_t dev_synth_mode(const char *kpath)
 {
-    if (!kpath || kpath[0] != '/' || kpath[1] != 'd' || kpath[2] != 'e' ||
-        kpath[3] != 'v' || kpath[4] != '/')
-        return 0;
-    const char *dev = kpath + 5;
-    for (unsigned i = 0; i < sizeof g_dev_synth / sizeof g_dev_synth[0]; i++)
-        if (strcmp(g_dev_synth[i].name, dev) == 0)
-            return g_dev_synth[i].mode;
-    /* /dev/pts/<n> is synthesised per pair rather than named up front. */
-    if (strncmp(dev, "pts/", 4) == 0 && dev[4]) return ABI_S_IFCHR | 0620;
-    return 0;
+    return devfs_node_mode(kpath, 0, 0);
 }
 
 /* Fill an abi_stat for a synthesised node. Character devices, because that is
@@ -6365,6 +6348,24 @@ static long linux_emit_chrdev_stat(uint32_t maj, uint32_t min, uint64_t ino,
     return 0;
 }
 
+/* A synthesised /dev node, as Linux reports it: its own major/minor and its
+ * own permissions. (linux_emit_chrdev_stat above is the DRM arms' -- it
+ * stamps 0666 and logs; every other node reported 1:3 and 0666 through it.) */
+static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
+    uint32_t maj = 0, min = 0;
+    uint32_t dm = devfs_node_mode(kpath, &maj, &min);
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    st.st_mode    = 0x2000u | (dm & 0xFFFu);      /* S_IFCHR | its perms */
+    st.st_dev     = 6;
+    st.st_ino     = lx_ino_hash(kpath);
+    st.st_nlink   = 1;
+    st.st_rdev    = lx_makedev(maj, min);
+    st.st_blksize = 4096;
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
@@ -9188,7 +9189,17 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
  * so there is one. */
 long lx_access_kpath(const char *kpath, int mode);
 long lx_access_kpath(const char *kpath, int mode) {
-    if (dev_synth_mode(kpath)) return 0;   /* synthesised /dev node */
+    /* A synthesised /dev node: readable and writable by anyone who can open
+     * it (a pty slave belongs to its session, whatever the table says), but
+     * EXECUTE follows the mode like anything else -- `/dev/null` as a
+     * command is "Permission denied", 126, on Linux. */
+    {
+        uint32_t dm = dev_synth_mode(kpath);
+        if (dm) {
+            if (!((unsigned)mode & LX_X_OK)) return 0;
+            return (dm & 0111u) ? 0 : -ABI_EACCES;
+        }
+    }
     struct vfs_stat vs;
     if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
 
@@ -12170,8 +12181,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * syscalls 4/6 never got the arm, so an assembler-level or
          * Go-style direct stat("/dev/null") still saw ENOENT. */
         {   uint32_t dm = dev_synth_mode(kpath);
-            if (dm) return linux_emit_chrdev_stat(1, 3, lx_ino_hash(kpath),
-                                                  (void *)a2);
+            if (dm) return linux_emit_devnode_stat(kpath, (void *)a2);
         }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
@@ -12225,15 +12235,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * only to LX_stat would never run for a C program -- exactly the trap
          * slice 103 hit with DRM fds. */
         {   uint32_t dm = dev_synth_mode(kpath);
-            if (dm) {
-                (void)dm;
-                /* major 1 minor 3 is /dev/null's real Linux identity; the
-                 * other synthesised nodes share the shape, and nothing in
-                 * tree keys off the exact minor. What matters to callers is
-                 * S_ISCHR, which linux_emit_chrdev_stat sets. */
-                return linux_emit_chrdev_stat(1, 3, lx_ino_hash(kpath),
-                                              (void *)a3);
-            }
+            if (dm) return linux_emit_devnode_stat(kpath, (void *)a3);
         }
         struct vfs_stat vs;
         int sr = vfs_stat(kpath, &vs);
@@ -12300,10 +12302,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 names = dri_names; cnt = 2;
             } else if (strcmp(f->dirpath, "/dev/snd") == 0) {
                 names = snd_names; cnt = 2;
-            } else if (strcmp(f->dirpath, "/dev") == 0) {
-                names = dev_names; types = dev_types;
-                cnt = (uint32_t)(sizeof dev_names / sizeof dev_names[0]);
             }
+            /* /dev ITSELF is devfs now (see devfs.c) and lists through the
+             * VFS below, from the same table stat answers from. This fixed
+             * list named `dri` and `snd` on machines without them, and
+             * `console`, `fb0`, `input` that no stat would confirm. */
+            (void)dev_names; (void)dev_types;
             if (names) {
                 size_t written = 0;
                 uint32_t emitted = 0;
@@ -12350,7 +12354,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             de.d_ino    = (uint64_t)(f->dir_off + emitted + 1);
             de.d_off    = (int64_t)(f->dir_off + emitted + 1);
             de.d_reclen = (uint16_t)reclen;
-            de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR : LX_DT_REG;
+            /* A devfs node is a character device, not a regular file. */
+            de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR
+                        : ((ent.mode & 0xF000u) == 0x2000u) ? LX_DT_CHR
+                        : LX_DT_REG;
             memcpy(de.d_name, ent.name, namelen);
             de.d_name[namelen] = '\0';
             if (copy_to_user(ubuf + written, &de, reclen) != 0) {
@@ -13346,7 +13353,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                             (void *)a5);
                 if (src == 0 && a5) {
                     uint16_t m = (uint16_t)(0x2000u | (dm & 0xFFFu));
-                    uint32_t rmaj = 1, rmin = 3;      /* /dev/null's identity */
+                    uint32_t rmaj = 0, rmin = 0;      /* the node's own */
+                    (void)devfs_node_mode(kpath, &rmaj, &rmin);
                     (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
                     (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
                     (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);

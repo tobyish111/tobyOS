@@ -39,6 +39,9 @@ struct file *pty_open_master(void);
 /* Open /dev/pts/<index>: return a SLAVE struct file for an existing pair.
  * Returns NULL if the index is invalid / not allocated. */
 struct file *pty_open_slave(int index);
+/* True while pair `index` exists and its master is open -- exactly when
+ * pty_open_slave(index) would succeed. /dev/pts lists these (devfs.c). */
+bool pty_slave_live(int index);
 
 /* file.c backend dispatch (read/write/close/clone reference-count). */
 long pty_master_read (struct file *f, void *buf, size_t n);

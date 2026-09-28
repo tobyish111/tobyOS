@@ -464,6 +464,7 @@ static int gen_devices(char *buf, size_t cap) {
         " 13 input\n"
         " 29 fb\n"
         "116 alsa\n"
+        "136 pts\n"
         "226 drm\n"
         "\nBlock devices:\n"
         "  8 sd\n"

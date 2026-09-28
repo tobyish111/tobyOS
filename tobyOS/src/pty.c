@@ -177,6 +177,11 @@ struct file *pty_open_slave(int index) {
     return f;
 }
 
+bool pty_slave_live(int index) {
+    if (index < 0 || index >= PTY_MAX) return false;
+    return g_ptys[index].used && g_ptys[index].master_refs > 0;
+}
+
 static void pty_maybe_free(struct pty *t) {
     if (t->master_refs == 0 && t->slave_refs == 0) {
         t->used = false;

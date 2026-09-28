@@ -4836,6 +4836,12 @@ void _start(void) {
          * memory never existed for Linux binaries (memfd carried chrome
          * instead). Path resolution is longest-prefix over the mount
          * table, so this works without /dev being a real directory. */
+        /* /dev ITSELF: devfs.c. Mounted before its /dev/shm sub-mount so
+         * the table reads top-down; resolution is longest-prefix anyway. */
+        {
+            extern int devfs_init(void);
+            (void)devfs_init();
+        }
         rc = tmpfs_mount_at("/dev/shm", 0);
         kprintf("[boot] /dev/shm: %s\n",
                 rc == VFS_OK ? "tmpfs mounted (POSIX shm live)"

@@ -118,6 +118,7 @@ DISK_IMG_BYTES     := 16777216
 # Source files -- add new .c files here and they'll be picked up by the
 # pattern rule below.
 C_SRCS := src/kernel.c \
+          src/devfs.c \
           src/klibc.c \
           src/serial.c \
           src/font8x8.c \
