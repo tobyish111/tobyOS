@@ -11893,13 +11893,31 @@ static int test_unary(const char *op, const char *operand) {
     if (shell_canonicalize_path(operand, resolved, sizeof(resolved)) < 0)
         return 1;
     struct vfs_stat st;
-    if (vfs_stat(resolved, &st) != VFS_OK) return 1;
+    if (vfs_stat(resolved, &st) != VFS_OK) {
+#ifndef SHELL_HOSTED
+        /* THE KERNEL SHELL ASKS THE SAME TABLE sys_stat DOES.
+         *
+         *     [ -e /dev/null ]     /bin/tsh: true   kernel shell: false
+         *     [ -c /dev/null ]     /bin/tsh: true   kernel shell: false
+         *
+         * /dev nodes are synthesised by sys_open and answered by sys_stat
+         * from dev_synth_mode; vfs_stat has never heard of them, and this
+         * shell calls vfs_stat directly. A node from that table is a
+         * character device owned by root with the table's permissions --
+         * what sys_stat reports -- so -e -c -r -w -x -s -f all follow. */
+        uint32_t dm = dev_synth_mode(resolved);
+        if (!dm) return 1;
+        memset(&st, 0, sizeof st);
+        st.type = VFS_TYPE_FILE;
+        st.mode = dm;
+#else
+        return 1;
+#endif
+    }
     /* Device/fifo/socket tests read the S_IFMT bits carried in mode
-     * (2026-08-23; they were hardcoded FALSE from the no-devices era.
-     * The hosted /bin/tsh gets real formats via sys_stat's /dev synth;
-     * the kernel console shell's vfs_stat has no synth entry for /dev
-     * nodes and answers false above at the NOENT check -- the gates
-     * measure /bin/tsh, which is the build parity is defined on). */
+     * (2026-08-23; they were hardcoded FALSE from the no-devices era).
+     * /bin/tsh gets real formats via sys_stat's /dev synth, the kernel
+     * shell from the same table just above. */
     uint32_t fmt = st.mode & 0170000u;
     if (op2 == 'f') return (st.type == VFS_TYPE_FILE &&
                             (fmt == 0 || fmt == 0100000u)) ? 0 : 1;

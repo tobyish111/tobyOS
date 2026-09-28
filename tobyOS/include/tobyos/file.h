@@ -323,6 +323,12 @@ void   file_pos_set(struct file *f, size_t pos);
  * files. Implemented in src/file.c and in programs/tsh/host.c. */
 struct file *file_std_handle(int fd);
 
+/* The mode (S_IFCHR | perms) of a synthesised /dev node -- /dev/null,
+ * /dev/zero, /dev/tty... -- or 0 if `kpath` is not one. sys_open makes these
+ * without any VFS entry, so vfs_stat has never heard of them; this table in
+ * syscall.c is the single answer to "what exists in /dev". */
+uint32_t dev_synth_mode(const char *kpath);
+
 struct file *file_clone(struct file *src);
 void file_set_open_path(struct file *f, const char *kpath);
 

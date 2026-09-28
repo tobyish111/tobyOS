@@ -3121,8 +3121,10 @@ static const struct dev_synth g_dev_synth[] = {
     { "urandom",  ABI_S_IFCHR | 0666 },
 };
 
-/* Non-zero (the mode) if `kpath` names a synthesised device node. */
-static uint32_t dev_synth_mode(const char *kpath)
+/* Non-zero (the mode) if `kpath` names a synthesised device node. Also the
+ * in-kernel shell's answer for `test -e /dev/null` (see file.h), so that
+ * nothing outside this table decides what /dev holds. */
+uint32_t dev_synth_mode(const char *kpath)
 {
     if (!kpath || kpath[0] != '/' || kpath[1] != 'd' || kpath[2] != 'e' ||
         kpath[3] != 'v' || kpath[4] != '/')
@@ -9160,7 +9162,6 @@ static long lx_recvmsg(int fd, uint64_t umsg, int flags) {
  * cwd-relative); a non-AT_FDCWD dirfd-relative path is resolved against the
  * cwd (best-effort -- bash/coreutils use AT_FDCWD). */
 /* Defined next to sys_stat: the single table of synthesised /dev nodes. */
-static uint32_t dev_synth_mode(const char *kpath);
 
 #define LX_R_OK 4
 #define LX_W_OK 2
