@@ -10367,7 +10367,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         struct shell_scan scan;
         shell_scan_init(&scan);
         shell_scan_line(&scan, line);
-        if (!hd_failed && shell_scan_incomplete(&scan)) {
+        /* A first line with a `(` that cannot be there is not the start of a
+         * longer unit: it runs alone and shell_line_syntax_ok says why --
+         * "unexpected token `('" at THAT line, as bash does, instead of the
+         * reader pulling every following line in and reporting "unexpected
+         * end of file". The same first-line rule, and the same reason it is
+         * safe, as in shell_line_incomplete_hosted. */
+        if (!hd_failed && !scan.bad_paren && shell_scan_incomplete(&scan)) {
             /* The continuation pass above may already own this buffer, with
              * `line` pointing into it; reuse it rather than allocating a
              * second one and leaking the first. */
@@ -29194,6 +29200,19 @@ int shell_line_incomplete_hosted(const char *s) {
     shell_scan_init(&scan);
     const char *p = s;
     char lb[SHELL_PARSE_BUF_MAX];
+    /* A `(` THAT CANNOT BE THERE ENDS THE WAIT FOR MORE INPUT.
+     *
+     *     $ echo a (b      bash: syntax error near unexpected token `('
+     *
+     * The paren is still counted as open, so without this the prompt went to
+     * PS2 and swallowed every following line into a command that was already
+     * an error. bad_paren is trusted here, and ONLY for the FIRST physical
+     * line: scanned from a fresh state it is exactly the one-line scan
+     * shell_line_syntax_ok reports from, and a stray `(` is judged left to
+     * right, so the first line of any valid command cannot set it. (It is not
+     * trusted in shell_scan_incomplete, which the list splitter also asks
+     * about multi-line text -- see the note there.) */
+    bool first = true, first_bad_paren = false;
     while (*p) {
         size_t n = 0;
         while (p[n] && p[n] != '\n') n++;
@@ -29202,8 +29221,10 @@ int shell_line_incomplete_hosted(const char *s) {
             lb[n] = '\0';
             shell_scan_line(&scan, lb);
         }
+        if (first) { first_bad_paren = scan.bad_paren; first = false; }
         p += n + (p[n] ? 1 : 0);
     }
+    if (first_bad_paren) return 0;
     return shell_scan_incomplete(&scan) ? 1 : 0;
 }
 

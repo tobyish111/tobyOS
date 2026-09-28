@@ -1,6 +1,8 @@
 # A LINE THAT CAN NEVER BE COMPLETED IS A SYNTAX ERROR AT ONCE, NOT A PS2
-# PROMPT: bash rejects a closing keyword whose list is empty as soon as the
-# line is read.
+# PROMPT: bash rejects a closing keyword whose list is empty, and a `(` that
+# cannot start anything, as soon as the line is read.
+echo a (b
+echo "after st=$?"
 if then
 echo "after2 st=$?"
 while do
