@@ -114,7 +114,13 @@ void tcp_shell_poll(void) {
                 g_len = 0;
                 g_buf[0] = '\0';
             
-                tsh_send_str(g_cli, "\r\ntobyOS> ");
+                /* A CONTINUATION PROMPT while the shell is still collecting.
+                 * This printed "tobyOS> " after every line, so `if true` or
+                 * `cat <<EOF` looked as if it had run and printed nothing --
+                 * the user had no sign that the next lines were being
+                 * gathered. The console already says "> " (prompt()). */
+                tsh_send_str(g_cli, shell_input_pending() ? "\r\n> "
+                                                          : "\r\ntobyOS> ");
                 continue;
             }
 

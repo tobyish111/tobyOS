@@ -28883,6 +28883,14 @@ static void execute_line_body(void) {
  * ends a bash login. */
 static bool g_kshell_exit_pending;
 
+/* Is the shell still COLLECTING -- a command that needs more lines, or a
+ * here-document body -- rather than waiting for a new command? prompt()
+ * answers "> " for the console from the same two flags; tcp_shell asks this
+ * so the TCP client sees the same. */
+bool shell_input_pending(void) {
+    return g_heredoc_collecting || g_continuation_active;
+}
+
 bool shell_take_exit_request(void) {
     bool r = g_kshell_exit_pending;
     g_kshell_exit_pending = false;

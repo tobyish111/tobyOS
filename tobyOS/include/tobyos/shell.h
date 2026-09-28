@@ -40,6 +40,10 @@ void shell_run_test_line(const char *line);
  * the session. */
 bool shell_take_exit_request(void);
 
+/* True while the shell is still collecting the rest of a command or a
+ * here-document body: the caller should show the continuation prompt. */
+bool shell_input_pending(void);
+
 /* Deliver an asynchronous signal to the shell (called from interrupt context
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);
