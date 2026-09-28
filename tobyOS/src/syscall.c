@@ -2915,9 +2915,16 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
              * condition was ENOSPC (4 MiB tobyfs exhausted), which sent the
              * frame-pipeline-freeze investigation toward permissions and
              * cost a day. Errno fidelity is diagnostic infrastructure. */
-            if (cr == VFS_ERR_NOSPC)        return -ABI_ENOSPC;
-            if (cr == VFS_ERR_NAMETOOLONG)  return -ABI_ENAMETOOLONG;
-            if (cr != VFS_OK)               return -ABI_EACCES;
+            /* ...and not only those two. A missing parent directory is
+             * ENOENT on Linux, and every program on this system reported it
+             * as "Permission denied":
+             *
+             *     echo x > /nope/f     bash: "Permission denied"
+             *                          (Linux: "No such file or directory")
+             *
+             * -- bash, /bin/tsh, every libc caller. vfs_err_to_abi is the
+             * one converter for this, and it keeps PERM as EACCES. */
+            if (cr != VFS_OK)               return vfs_err_to_abi(cr);
         }
     }
 
