@@ -314,6 +314,14 @@ struct vfs_dir {
     void                 *mnt;
     void                 *priv;
     size_t                index;   /* driver-defined; usually next-entry idx */
+    /* vfs.c's own, for the MOUNT POINTS listed after the driver's entries
+     * (see vfs_readdir): the path given to vfs_opendir, the same path
+     * relative to its mount, and how far into the mount entries this handle
+     * has read (0 = still reading the driver). The path must outlive the
+     * handle -- the same contract sysfs_opendir already relies on. */
+    const char           *vpath;
+    const char           *vrel;
+    size_t                xpos;
 };
 
 /* ---- mount table ----

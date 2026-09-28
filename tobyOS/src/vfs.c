@@ -921,8 +921,79 @@ int vfs_opendir(const char *path, struct vfs_dir *out) {
     out->mnt   = m->data;
     out->priv  = 0;
     out->index = 0;
+    out->vpath = path;
+    out->vrel  = rel;
+    out->xpos  = 0;
     if (!m->ops->opendir) return VFS_ERR_INVAL;
     return m->ops->opendir(m->data, rel, out);
+}
+
+/* A MOUNT POINT IS AN ENTRY OF THE DIRECTORY IT SITS IN.
+ *
+ *     $ ls /
+ *     alpine.tar.gz bin etc ... usr        (no dev, proc, sys, tmp, data)
+ *
+ * Each filesystem lists only its own entries, and the root ramfs has no
+ * `tmp` or `dev` of its own -- those exist only as mount points, reachable
+ * by path (`cd /tmp` worked) but in no listing, so `ls /`, `find /` and a
+ * shell glob of the root all said they were not there. Linux lists them.
+ *
+ * So after the driver's last entry, each mount whose point sits DIRECTLY in
+ * this directory is listed as a directory -- unless the underlying
+ * filesystem already has an entry of that name (then the driver listed it).
+ * Slot order in the CURRENT namespace's table, so a getdents64 that skips
+ * already-returned entries by re-reading sees the same sequence. Returns the
+ * `k`th such mount's leaf, or false when there are fewer than k+1. */
+static bool vfs_mount_child(const struct vfs_dir *d, size_t k,
+                            struct vfs_dirent *out) {
+    if (!d->vpath || d->vpath[0] != '/') return false;
+    size_t dl = strlen(d->vpath);
+    while (dl > 1 && d->vpath[dl - 1] == '/') dl--;       /* "/dev/" -> "/dev" */
+    size_t seen = 0;
+    for (size_t i = 0; i < g_mount_count; i++) {
+        const struct vfs_mount *m = &g_mounts[i];
+        const char *pt = m->point;
+        size_t pl = m->point_len;
+        /* Directly inside the directory: "<dir>/<leaf>" with no further '/'. */
+        size_t lead = (dl == 1) ? 1 : dl + 1;
+        if (pl <= lead) continue;
+        if (dl == 1) { if (pt[0] != '/') continue; }
+        else if (strncmp(pt, d->vpath, dl) != 0 || pt[dl] != '/') continue;
+        const char *leaf = pt + lead;
+        bool nested = false;
+        for (const char *q = leaf; *q; q++) if (*q == '/') { nested = true; break; }
+        if (nested) continue;
+        /* Already an entry of the underlying filesystem? */
+        if (d->ops && d->ops->stat && d->vrel) {
+            char rp[VFS_PATH_MAX];
+            size_t rl = strlen(d->vrel);
+            while (rl > 1 && d->vrel[rl - 1] == '/') rl--;
+            bool root = (rl <= 1);
+            size_t ll = strlen(leaf);
+            if ((root ? 1 : rl + 1) + ll < sizeof rp) {
+                size_t o = 0;
+                if (root) rp[o++] = '/';
+                else { memcpy(rp, d->vrel, rl); o = rl; rp[o++] = '/'; }
+                memcpy(rp + o, leaf, ll + 1);
+                struct vfs_stat us;
+                if (d->ops->stat(d->mnt, rp, &us) == VFS_OK) continue;
+            }
+        }
+        if (seen++ != k) continue;
+        memset(out, 0, sizeof *out);
+        size_t ll = strlen(leaf);
+        if (ll >= VFS_NAME_MAX) ll = VFS_NAME_MAX - 1;
+        memcpy(out->name, leaf, ll);
+        out->name[ll] = '\0';
+        /* Only the name and "directory". NOT a stat of the mounted root for
+         * owner and mode: that asked tobyfs for /data's root on every listing
+         * of `/` -- and a listing is not the place to pay for it. Whoever
+         * wants the details stats the path (ls -l does), and the path
+         * resolves into the mounted filesystem, which answers for itself. */
+        out->type = VFS_TYPE_DIR;
+        return true;
+    }
+    return false;
 }
 
 int vfs_closedir(struct vfs_dir *d) {
@@ -934,7 +1005,16 @@ int vfs_closedir(struct vfs_dir *d) {
 
 int vfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     if (!d || !d->ops || !out) return VFS_ERR_INVAL;
-    return d->ops->readdir(d, out);
+    if (d->xpos == 0) {
+        int rc = d->ops->readdir(d, out);
+        if (rc == VFS_OK) return rc;
+        d->xpos = 1;                    /* the driver is done: mount points */
+    }
+    if (vfs_mount_child(d, d->xpos - 1, out)) {
+        d->xpos++;
+        return VFS_OK;
+    }
+    return VFS_ERR_NOENT;
 }
 
 int vfs_stat(const char *path, struct vfs_stat *out) {
