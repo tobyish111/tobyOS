@@ -9130,6 +9130,14 @@ struct shell_scan {
     int  array_lit_depth;
     bool bad_semi;      /* a `;;` outside any `case` */
     bool bad_rparen;    /* a `)` that closes nothing and is not a pattern */
+    /* A list-closing keyword -- then do else elif fi done -- where the list
+     * it closes is EMPTY: `if then`, `while do`, `then fi`. bash rejects
+     * these the moment the line is read. list_empty is true from a
+     * list-opening keyword until the first token that is anything but a
+     * separator, `!` or `time`; see shell_scan_line. */
+    bool bad_kw;
+    bool list_empty;
+    char bad_kw_word[8];
     bool cmd_seen;      /* something has been said since the last separator */
     bool prev_word_name;/* the previous command word is a valid NAME */
     bool case_word;     /* between `case` and its `in` */
@@ -9172,6 +9180,9 @@ static void shell_scan_init(struct shell_scan *st) {
     st->array_lit_depth = 0;
     st->bad_semi = false;
     st->bad_rparen = false;
+    st->bad_kw = false;
+    st->list_empty = false;
+    st->bad_kw_word[0] = '\0';
     st->cmd_seen = false;
     st->prev_word_name = false;
     st->case_word = false;
@@ -9218,6 +9229,27 @@ static bool shell_word_boundary_at(const char *start, const char *p,
 }
 
 static bool shell_scan_incomplete(const struct shell_scan *st) {
+    /* A LINE THAT CAN NEVER BE COMPLETED IS NOT INCOMPLETE.
+     *
+     *     $ if then            bash: syntax error near unexpected token `then'
+     *     $ while do           bash: ...                                `do'
+     *
+     * `if` opens a compound, so this answered "more input owed": the
+     * interactive shell sat at its PS2 prompt swallowing every following
+     * line into a command that was already a syntax error (and the kernel
+     * shell, which prints no PS2 over TCP, just looked dead). An EMPTY list
+     * before its closing keyword can never be repaired by more text, so the
+     * line is handed on as it is and shell_line_syntax_ok reports it.
+     *
+     * ONLY bad_kw. bad_paren, bad_semi and bad_rparen are right about a
+     * FINISHED line -- shell_line_syntax_ok's -- but not mid-construct: they
+     * fire transiently inside `f() { local -a g=(p q); ... }` and on the
+     * first line of a multi-line `a=(`. Trusting them here let the list
+     * splitter cut that function body at its first `;` and stopped the
+     * accumulator after `a=(` (shparity 106/110/112, 14 Oils cases). So
+     * `echo a (b` still waits for more input, in both builds alike. */
+    if (st->bad_kw)
+        return false;
     /* AN OPEN `[[` OWNS ITS OWN `&&`. Without it here the list splitter cut
      * `[[ -n x && -n y ]]` in half at the `&&` and handed the conditional
      * parser `[[ -n x` -- which is also why the accumulator would not join
@@ -10129,7 +10161,32 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
         const char *before = p;
+        /* THE EMPTY LIST (see bad_kw). Judged here, around the token, because
+         * shell_scan_token's keyword branches each return on their own. Only
+         * a word in command position, outside quotes, nesting and `[[ ]]`,
+         * can be a reserved word at all. */
+        bool plain = st->cmd_pos && !st->assign_prefix && !st->dbracket &&
+                     st->nest == 0 && !st->in_sq && !st->in_dq;
+        size_t wn = 0;
+        while (before[wn] && !shell_sep_or_blank(before[wn])) wn++;
+#define KW(lit) (plain && shell_word_eq(before, wn, lit))
+        bool closer = KW("then") || KW("do") || KW("else") || KW("elif") ||
+                      KW("fi") || KW("done");
+        bool opener = KW("if") || KW("while") || KW("until") || KW("then") ||
+                      KW("do") || KW("else") || KW("elif");
+        bool neutral = KW("!") || KW("time") || *before == ';' ||
+                       *before == '&' || *before == '|';
+#undef KW
+        if (closer && st->list_empty && !st->bad_kw) {
+            st->bad_kw = true;
+            size_t k = wn < sizeof st->bad_kw_word - 1
+                           ? wn : sizeof st->bad_kw_word - 1;
+            memcpy(st->bad_kw_word, before, k);
+            st->bad_kw_word[k] = '\0';
+        }
         shell_scan_token(st, &p);
+        if (opener)        st->list_empty = true;
+        else if (!neutral) st->list_empty = false;
         if (p <= before) p = before + 1;      /* belt and braces */
     }
 }
@@ -28570,9 +28627,11 @@ static bool shell_line_syntax_ok(const char *src) {
     struct shell_scan st;
     shell_scan_init(&st);
     shell_scan_line(&st, src ? src : "");
-    if (!st.bad_paren && !st.bad_semi && !st.bad_rparen) return true;
+    if (!st.bad_paren && !st.bad_semi && !st.bad_rparen && !st.bad_kw)
+        return true;
     kprintf("shell: syntax error near unexpected token `%s'\n",
-            st.bad_paren ? "(" : (st.bad_semi ? ";;" : ")"));
+            st.bad_paren ? "(" : st.bad_semi ? ";;" :
+            st.bad_rparen ? ")" : st.bad_kw_word);
     shell_parse_error();
     return false;
 }
