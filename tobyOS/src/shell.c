@@ -20819,7 +20819,29 @@ static bool shell_has_glob(const char *s) {
             s++;
             continue;
         }
-        if (*s == '*' || *s == '?' || *s == '[') return true;
+        if (*s == '*' || *s == '?') return true;
+        /* A `[` IS A PATTERN ONLY WITH ITS `]`.
+         *
+         *     while [ $i -lt 5000 ]; do ...
+         *
+         * The word `[` -- the test command -- counted as a glob, so EVERY
+         * `[ ... ]` read the whole working directory looking for files that
+         * match it (none can: an unmatched `[` is an ordinary character, in
+         * bash and here, so the word always survived unchanged). A 5000-pass
+         * test loop did 5000 directory scans; ttyparity's loop case sat at
+         * 6-7.5 s of its 8 s budget because of it. A bracket expression
+         * needs a closing `]` after at least one character -- after a
+         * leading `!` or `^`, and a `]` right there is itself a member. */
+        if (*s == '[') {
+            const char *q = s + 1;
+            if (*q == '!' || *q == '^') q++;
+            if (*q == ']') q++;
+            for (; *q; q++) {
+                if ((*q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) && q[1]) { q++; continue; }
+                if (*q == ']') return true;
+            }
+            continue;
+        }
         /* AN EXTGLOB GROUP MAKES A WORD A PATTERN even when it carries no
          * other metacharacter. `echo @(foo|bar).py` has neither `*`, `?`
          * nor `[`, so this said "not a glob", the globber never ran, and
