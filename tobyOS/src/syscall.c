@@ -2881,10 +2881,18 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
          * LX_ioctl). */
         {
             bool is_con = (strcmp(dev, "console") == 0) || (strcmp(dev, "tty") == 0);
-            if (!is_con && dev[0] == 't' && dev[1] == 't' && dev[2] == 'y') {
-                is_con = true;                       /* /dev/tty<N> */
-                for (const char *q = dev + 3; *q; q++)
+            /* /dev/tty<N>: tty0..tty63 only, no leading zeros -- exactly the
+             * set devfs lists and stats (devfs_vt_index). Any number used to
+             * open, so /dev/tty999 existed for open() and for nothing else. */
+            if (!is_con && dev[0] == 't' && dev[1] == 't' && dev[2] == 'y' &&
+                dev[3] && !(dev[3] == '0' && dev[4])) {
+                is_con = true;
+                int vt = 0;
+                for (const char *q = dev + 3; *q; q++) {
                     if (*q < '0' || *q > '9') { is_con = false; break; }
+                    vt = vt * 10 + (*q - '0');
+                    if (vt > 63) { is_con = false; break; }
+                }
             }
             if (is_con) {
                 struct file *f = console_file_make();

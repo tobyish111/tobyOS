@@ -98,6 +98,26 @@ static const char *devfs_rel(const char *path) {
     return path ? path : "";
 }
 
+/* /dev/tty<N>, the virtual terminals: tty0..tty63, as on Linux (major 4).
+ * sys_open answers every one with the kernel console; they were openable and
+ * yet in no listing and no stat -- the asymmetry this table exists to end.
+ * "tty" alone is the controlling terminal, a table entry of its own. No
+ * leading zeros: /dev/tty01 does not exist on Linux either. */
+#define DEVFS_VT_MAX 63
+static bool devfs_vt_index(const char *rel, int *idx) {
+    if (strncmp(rel, "tty", 3) != 0) return false;
+    const char *q = rel + 3;
+    if (!*q || (q[0] == '0' && q[1])) return false;
+    int n = 0;
+    for (; *q; q++) {
+        if (*q < '0' || *q > '9') return false;
+        n = n * 10 + (*q - '0');
+        if (n > DEVFS_VT_MAX) return false;
+    }
+    *idx = n;
+    return true;
+}
+
 /* A pty slave node, /dev/pts/<N>: present while its pair is live. */
 static bool devfs_pts_index(const char *rel, int *idx) {
     if (strncmp(rel, "pts/", 4) != 0 || !rel[4]) return false;
@@ -130,6 +150,10 @@ static bool devfs_lookup(const char *rel, uint32_t *mode, uint32_t *maj,
     int idx;
     if (devfs_pts_index(rel, &idx) && pty_slave_live(idx)) {
         *mode = DEV_S_IFCHR | 0620; *maj = 136; *min = (uint32_t)idx;
+        return true;
+    }
+    if (devfs_vt_index(rel, &idx)) {
+        *mode = DEV_S_IFCHR | 0620; *maj = 4; *min = (uint32_t)idx;
         return true;
     }
     return false;
@@ -219,6 +243,17 @@ static int devfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             devfs_fill(out, name, e->mode);
             d->index++;
             return VFS_OK;
+        }
+    }
+    if (dir[0] == '\0') {                          /* /dev: tty0..tty63 */
+        for (int n = 0; n <= DEVFS_VT_MAX; n++) {
+            if (idx++ == d->index) {
+                char nb[8];
+                ksnprintf(nb, sizeof nb, "tty%d", n);
+                devfs_fill(out, nb, DEV_S_IFCHR | 0620);
+                d->index++;
+                return VFS_OK;
+            }
         }
     }
     if (strcmp(dir, "pts") == 0) {
