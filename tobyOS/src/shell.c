@@ -1863,18 +1863,30 @@ static void shell_mark_exported(const char *key) {
     if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
 }
 
+/* A VALUE OF ANY LENGTH. This refused everything past 256 bytes with a bare
+ * -1, and it is the path every variable set BY THE SHELL takes -- `read`,
+ * a `for` variable, `${x:=...}`, getopts, printf -v. An ordinary assignment
+ * goes straight to env_set_kv and never noticed, so `x=$(...)` stored a
+ * long line and `read x` of the same line said "failed to set 'x'". The
+ * short case keeps its stack buffer; env_set_kv copies either way. */
 static int env_set(const char *key, const char *val) {
     if (!key || !val) return -1;
     size_t klen = strlen(key);
     size_t vlen = strlen(val);
     if (klen == 0) return -1;
     size_t need = klen + 1 + vlen + 1;
-    if (need > 256) return -1;
-    char tmp[256];
+    char small[256];
+    char *tmp = (need <= sizeof small) ? small : (char *)kmalloc(need);
+    if (!tmp) {
+        kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)need);
+        return -1;
+    }
     memcpy(tmp, key, klen);
     tmp[klen] = '=';
     memcpy(tmp + klen + 1, val, vlen + 1);
-    return env_set_kv(tmp);
+    int rc = env_set_kv(tmp);
+    if (tmp != small) kfree(tmp);
+    return rc;
 }
 
 static int env_unset(const char *key) {
