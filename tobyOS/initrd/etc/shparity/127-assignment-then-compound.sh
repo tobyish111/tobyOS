@@ -1,0 +1,10 @@
+i=0; while false; do :; done; echo "w1 top-level ok"
+x=$(i=0; while false; do :; done; echo in); echo "w2 [$x]"
+x=$(while false; do :; done; echo in); echo "w3 [$x]"
+x=$(i=0; if true; then echo in; fi); echo "w4 [$x]"
+x=$(i=0; for k in a; do echo in; done); echo "w5 [$x]"
+x=$(i=0 ; while false; do :; done; echo in); echo "w6 [$x]"
+x=$(a=1 b=2; case $a in 1) echo "in $b";; esac); echo "w7 [$x]"
+x=$(i=0 && while false; do :; done; echo in); echo "w8 [$x]"
+x=$(n=3; while [ $n -gt 0 ]; do n=$((n-1)); done; echo "n=$n"); echo "w9 [$x]"
+echo done

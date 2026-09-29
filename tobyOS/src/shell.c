@@ -28434,10 +28434,31 @@ static void execute_line_text_inner(const char *src) {
                    (*n >= '0' && *n <= '9') || *n == '_') n++;
             if (*n != '=') break;
             bool sq = false, dq = false;
-            while (*n && (sq || dq || !is_space(*n))) {
+            /* THE WORD ENDS AT AN OPERATOR, NOT ONLY AT A BLANK.
+             *
+             *     x=$(i=0; while false; do :; done; echo in)
+             *                    bash: in    tsh: "syntax error near
+             *                                unexpected token `while'"
+             *
+             * The value scan ran to the next blank, so `i=0;` swallowed the
+             * `;` and `while` looked like the command a PREFIX introduces.
+             * At the top of a line the list splitter has already cut at the
+             * `;`, which hid it; inside $( ) this sees the whole list. */
+            while (*n && (sq || dq ||
+                          (!is_space(*n) && *n != ';' && *n != '&' &&
+                           *n != '|'))) {
                 if (*n == '\'' && !dq) sq = !sq;
                 else if (*n == '"' && !sq) dq = !dq;
                 n++;
+            }
+            /* ...and a separator right after it means the assignment WAS the
+             * whole command: nothing after it is its prefixed command. */
+            {
+                const char *q = shell_skip_blanks(n);
+                if (*q == ';' || *q == '&' || *q == '|' || *q == '\n') {
+                    saw_prefix = false;
+                    break;
+                }
             }
             saw_prefix = true;
             a = shell_skip_blanks(n);
