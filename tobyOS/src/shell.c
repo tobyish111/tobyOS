@@ -73,15 +73,16 @@ extern volatile struct limine_module_request module_req;
 /* The word/expansion buffer -- and so the most a $(...) can capture. It was
  * 1 KiB in both builds, and `$(seq 512)` (1.9 KiB) came back "command
  * substitution output truncated" with status 2 where bash has no cap at all.
- * The hosted /bin/tsh runs on a user stack and gets 16 KiB; the in-kernel
- * shell keeps 1 KiB because these are stack arrays on a 32 KiB kernel stack
- * (fifty-two of them in this file). Growing them onto the heap is the next
- * step; this one is what the conformance corpus needed. */
-#ifdef SHELL_HOSTED
-#define SHELL_PARSE_BUF_MAX (8 * 1024)     /* the Oils corpus needs ~2 KiB; nested subshells share a 256 KiB stack */
-#else
-#define SHELL_PARSE_BUF_MAX (LINE_MAX * 2)
-#endif
+ * These are stack arrays (seventy of them in this file).
+ *
+ * THE SAME SIZE IN BOTH BUILDS. The in-kernel shell kept 1 KiB because it
+ * ran on pid 0's boot stack, so `x=$(ls /etc)` there (3.7 KiB) failed --
+ * silently, leaving x unchanged -- where /bin/tsh captured it. It now runs
+ * each line on its own 1 MiB stack (shell_run_on_line_stack), which is
+ * more than /bin/tsh's 256 KiB user stack, so it takes the hosted size.
+ * Growing the buffers onto the heap, for bash's "no cap at all", is still
+ * owed in BOTH builds. */
+#define SHELL_PARSE_BUF_MAX (8 * 1024)     /* the Oils corpus needs ~2 KiB */
 /* Word-boundary marker planted by "$@" expansion; see
  * shell_append_positional_join(). Never appears in real shell text. */
 /* Descriptors the shell can hold open. POSIX requires at least 0..9, and
@@ -28963,16 +28964,81 @@ static void shell_kernel_flow_done(void) {
     (void)shell_take_interrupt();
 }
 
+#ifndef SHELL_HOSTED
+/* THE KERNEL SHELL RUNS EACH LINE ON ITS OWN STACK.
+ *
+ * pid 0 -- the console loop and the TCP 7777 service -- runs on the boot
+ * stack Limine hands the kernel, and the shell's expansion buffers are stack
+ * arrays: seventy of them, several live per level of nesting. That is why the
+ * kernel shell's buffers stayed at 1 KiB while /bin/tsh's grew to 8, and why
+ * `x=$(ls /etc)` failed there and worked in /bin/tsh.
+ *
+ * So a line runs on a dedicated 1 MiB stack, allocated once. The scheduler
+ * is indifferent to which stack pid 0 is on (sched_ctx_plausible exempts
+ * pid 0 and idle), so a line that spawns and waits for a child still yields
+ * and resumes normally. The deepest 4 KiB is a canary, checked after every
+ * line: a line that came within 4 KiB of the bottom is reported, not left to
+ * corrupt whatever lies below. Not re-entered: a line never starts another
+ * line, but if it ever did it would simply stay on this stack. */
+#define SHELL_LINE_STACK_SZ   (1024u * 1024u)
+#define SHELL_LINE_CANARY_SZ  4096u
+#define SHELL_LINE_CANARY     0xA5u
+static uint8_t *g_line_stack;
+static bool     g_on_line_stack;
+
+static void shell_run_on_line_stack(void (*fn)(void)) {
+    if (g_on_line_stack) { fn(); return; }
+    if (!g_line_stack) {
+        g_line_stack = (uint8_t *)kmalloc(SHELL_LINE_STACK_SZ);
+        if (g_line_stack)
+            memset(g_line_stack, SHELL_LINE_CANARY, SHELL_LINE_CANARY_SZ);
+        else
+            kprintf("[shell] no memory for the 1 MiB line stack -- lines run "
+                    "on the boot stack\n");
+    }
+    if (!g_line_stack) { fn(); return; }
+    uintptr_t top = ((uintptr_t)g_line_stack + SHELL_LINE_STACK_SZ) &
+                    ~(uintptr_t)15;
+    g_on_line_stack = true;
+    /* rbx is callee-saved, so fn() preserves the old stack pointer in it.
+     * `top` is 16-byte aligned, so fn is entered with rsp % 16 == 8 exactly
+     * as a normal call would leave it. */
+    __asm__ volatile(
+        "movq %%rsp, %%rbx\n\t"
+        "movq %0, %%rsp\n\t"
+        "callq *%1\n\t"
+        "movq %%rbx, %%rsp\n\t"
+        :
+        : "r"(top), "r"(fn)
+        : "rbx", "rax", "rcx", "rdx", "rsi", "rdi",
+          "r8", "r9", "r10", "r11", "memory", "cc");
+    g_on_line_stack = false;
+    for (unsigned i = 0; i < SHELL_LINE_CANARY_SZ; i++) {
+        if (g_line_stack[i] != SHELL_LINE_CANARY) {
+            kprintf("[shell] WARNING: a line used the kernel-shell stack to "
+                    "within %u bytes of its end (1 MiB)\n", i);
+            memset(g_line_stack, SHELL_LINE_CANARY, SHELL_LINE_CANARY_SZ);
+            break;
+        }
+    }
+}
+
+static void execute_line_steps(void) {
+    execute_line_body();
+    shell_interactive_line_done();
+}
+#endif
+
 /* One line typed at the kernel shell's prompt (console or TCP). */
 static void execute_line(void) {
     g_kshell_exit_pending = false;    /* a request is for THIS line's caller */
 #ifndef SHELL_HOSTED
     g_kshell_in_line = true;          /* see shell_kprintf */
-#endif
+    shell_run_on_line_stack(execute_line_steps);
+    g_kshell_in_line = false;
+#else
     execute_line_body();
     shell_interactive_line_done();
-#ifndef SHELL_HOSTED
-    g_kshell_in_line = false;
 #endif
     shell_kernel_flow_done();
 }
