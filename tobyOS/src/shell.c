@@ -1981,13 +1981,13 @@ static int sh_try_array_assignment(const char *kv) {
              * type is still incomplete here. */
             if (sh_array_is_assoc(name)) {
                 if (append) {
+                    /* Any length: the join was a 512-byte array, and a
+                     * longer one fell through to the SCALAR path. */
                     const char *old = sh_array_get_key(name, sub);
-                    char joined[512];
-                    size_t ol = old ? strlen(old) : 0, vl = strlen(val);
-                    if (ol + vl + 1 > sizeof joined) return 0;
-                    if (ol) memcpy(joined, old, ol);
-                    memcpy(joined + ol, val, vl + 1);
-                    return sh_array_set_key(name, sub, joined) == 0 ? 1 : 0;
+                    SH_SB(joined);
+                    if (sb_puts(&joined, old) < 0 || sb_puts(&joined, val) < 0)
+                        return -1;
+                    return sh_array_set_key(name, sub, joined.p) == 0 ? 1 : 0;
                 }
                 return sh_array_set_key(name, sub, val) == 0 ? 1 : 0;
             }
@@ -1996,12 +1996,10 @@ static int sh_try_array_assignment(const char *kv) {
         if (!sh_subscript_eval(sub, name, true, &idx)) return 0;
         if (append) {
             const char *old = sh_array_get(name, idx);
-            char joined[512];
-            size_t ol = old ? strlen(old) : 0, vl = strlen(val);
-            if (ol + vl + 1 > sizeof joined) return 0;
-            if (ol) memcpy(joined, old, ol);
-            memcpy(joined + ol, val, vl + 1);
-            return sh_array_set(name, idx, joined) == 0 ? 1 : 0;
+            SH_SB(joined);                      /* any length -- see above */
+            if (sb_puts(&joined, old) < 0 || sb_puts(&joined, val) < 0)
+                return -1;
+            return sh_array_set(name, idx, joined.p) == 0 ? 1 : 0;
         }
         return sh_array_set(name, idx, val) == 0 ? 1 : 0;
     }
@@ -2105,14 +2103,13 @@ static int env_set_kv(const char *kv_in) {
             nm[klen] = '\0';
             const char *real = env_deref_name(nm, target, sizeof target);
             if (real != nm && strcmp(real, nm) != 0) {
-                char rebuilt[256];
-                size_t rl = strlen(real), vl = strlen(kv_in + klen + 1);
-                if (rl + 1 + vl + 1 <= sizeof rebuilt) {
-                    memcpy(rebuilt, real, rl);
-                    rebuilt[rl] = '=';
-                    memcpy(rebuilt + rl + 1, kv_in + klen + 1, vl + 1);
-                    return env_set_kv(rebuilt);
-                }
+                /* The value is any length. It was a 256-byte array, and a
+                 * longer value set the REFERENCE ITSELF, not its target. */
+                SH_SB(rebuilt);
+                if (sb_puts(&rebuilt, real) < 0 || sb_putc(&rebuilt, '=') < 0 ||
+                    sb_puts(&rebuilt, kv_in + klen + 1) < 0)
+                    return -1;
+                return env_set_kv(rebuilt.p);
             }
         }
     }

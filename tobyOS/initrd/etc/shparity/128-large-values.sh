@@ -36,6 +36,8 @@ k=${s:0:600}; case "$k" in "$k") echo "v24 long-pattern-ok";; esac
 q=$(printf '%s%s' "$s" "$s"); echo "v25 [${#q}]"
 for it in "$s"; do echo "v26 [${#it}]"; done
 unset uv; : "${uv:=$s}"; echo "v27 [${#uv}]"
+tgt=; declare -n ref=tgt; ref=$s; echo "v28 [${#tgt}]"; unset -n ref
+b=(); b[3]=$h; b[3]+=$h; echo "v29 [${#b[3]}]"
 printf -v pv '%s' "$s"; echo "v30 [${#pv}]"
 lit=L; for i in 1 2 3 4 5 6 7; do lit="$lit$lit"; done
 bx=$(eval "printf '%s\n' ${lit}{1..80}"); echo "v31 [${#bx}] [${bx:0:3}]"
