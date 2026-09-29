@@ -27973,13 +27973,23 @@ static bool shell_try_compound_pipeline(const char *src) {
          *     read_from_fd.py 3 3<<EOF3 | read_from_fd.py 0 5 5<<EOF5
          *
          * Sequential is wrong for isolation and right for this, and this is
-         * the case where it can be told. */
+         * the case where it can be told.
+         *
+         * QUEUED MEANS NOT YET TAKEN: head < count. An expanded body is
+         * pushed and taken at once (shell_hd_text_for), and the slots are
+         * recycled only when they run out -- so the COUNT stays non-zero
+         * after every `cat <<EOF` with nothing left in the queue. Testing
+         * the count made every pipeline after the first expanded
+         * here-document run its stages in the shell itself: a stage lost its
+         * subshell (`echo x | { read v; }` set v) and a builtin writing more
+         * than a pipe holds deadlocked, its reader not yet started. */
         /* ...NOR INSIDE A COMMAND SUBSTITUTION. The capture redirects this
          * process's output into a spill file and reads it back afterwards; a
          * stage in another process writes into that file too, and nothing
          * coordinates the two. `echo \`a | b\`` came back as "unmatched
          * backquote" once the stages stopped being this process. */
-        if (!bg_tail && g_heredoc_count == 0 && g_capture_depth == 0 &&
+        if (!bg_tail && g_heredoc_head >= g_heredoc_count &&
+            g_capture_depth == 0 &&
             (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
         if (fpid == 0) {
             g_in_pipeline_stage = true;
