@@ -23966,6 +23966,42 @@ static bool shell_stage_is_builtin(struct shell_simple *cmd) {
     return shell_cmd_lookup(name) != 0 || shell_function_lookup(name) != 0;
 }
 
+#ifndef SHELL_HOSTED
+/* THE KERNEL SHELL HANDS A STAGE'S OUTPUT ON IN A FILE, NOT A PIPE, when the
+ * stage runs in the shell itself.
+ *
+ * It has no fork, so a builtin or function stage runs here, on pid 0, and
+ * finishes before the next stage starts. A pipe holds 64 KiB: a stage that
+ * wrote more blocked pid 0 in pipe_write with its reader not yet started,
+ * and nothing could ever drain it --
+ *
+ *     cat /etc/xzsrc.txt | wc -c        (274 KB, kernel `cat`)
+ *
+ * took the kernel shell down and every network service with it, because
+ * they all run on pid 0's loop; SSH stopped answering. "Finished before the
+ * next one starts" is exactly what a file expresses, and a file has no
+ * capacity to run out of. A stage that is a real PROCESS still gets a pipe:
+ * it may never finish (`yes | head -1`), and it can block without harm. */
+static unsigned g_stage_spill_seq;
+
+static struct file *shell_stage_spill_open(char *path, size_t cap) {
+    ksnprintf(path, cap, "/tmp/.tsh-stage-%u", ++g_stage_spill_seq);
+    struct file *f = shell_open_vfs_file(path, true, false, "pipeline");
+    if (!f) path[0] = '\0';
+    return f;
+}
+
+/* The finished stage's output, for the next stage to read. Unlinked at once:
+ * tmpfs and ramfs keep an open file's bytes until its last handle closes, so
+ * nothing is left behind whichever way the pipeline ends. */
+static struct file *shell_stage_spill_reader(char *path) {
+    struct file *f = shell_open_vfs_file(path, false, false, "pipeline");
+    (void)vfs_unlink(path);
+    path[0] = '\0';
+    return f;
+}
+#endif
+
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
 
@@ -23979,19 +24015,46 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     memset(pids, 0, sizeof(pids));
     memset(has_pid, 0, sizeof(has_pid));
     memset(stage_status, 0, sizeof(stage_status));
+#ifndef SHELL_HOSTED
+    char spill[SHELL_STAGE_MAX - 1][32];
+    memset(spill, 0, sizeof(spill));
+#endif
 
     for (int i = 0; i < pl->count - 1; i++) {
-        if (pipe_create(&pipes_r[i], &pipes_w[i]) != 0) {
-            kprintf("pipeline: pipe_create failed\n");
-            for (int j = 0; j < i; j++) {
-                file_close(pipes_r[j]);
-                file_close(pipes_w[j]);
-            }
-            return 1;
+#ifndef SHELL_HOSTED
+        if (shell_stage_is_builtin(&pl->stage[i])) {
+            pipes_w[i] = shell_stage_spill_open(spill[i], sizeof spill[i]);
+            if (pipes_w[i]) continue;
+        } else
+#endif
+        if (pipe_create(&pipes_r[i], &pipes_w[i]) == 0) {
+            continue;
         }
+        kprintf("pipeline: pipe_create failed\n");
+        for (int j = 0; j < i; j++) {
+            if (pipes_r[j]) file_close(pipes_r[j]);
+            if (pipes_w[j]) file_close(pipes_w[j]);
+#ifndef SHELL_HOSTED
+            if (spill[j][0]) (void)vfs_unlink(spill[j]);
+#endif
+        }
+        return 1;
     }
 
     for (int i = 0; i < pl->count; i++) {
+#ifndef SHELL_HOSTED
+        /* The stage before this one ran here and is finished: its file is
+         * complete, and it is this stage's input. */
+        if (i > 0 && spill[i - 1][0]) {
+            pipes_r[i - 1] = shell_stage_spill_reader(spill[i - 1]);
+            if (!pipes_r[i - 1]) {
+                kprintf("pipeline: cannot read the previous stage's output\n");
+                stage_status[i] = 1;
+                if (pipes_w[i]) { file_close(pipes_w[i]); pipes_w[i] = 0; }
+                continue;
+            }
+        }
+#endif
         struct file *in = (i == 0) ? 0 : pipes_r[i - 1];
         struct file *out = (i + 1 == pl->count) ? 0 : pipes_w[i];
 
@@ -27896,7 +27959,22 @@ static bool shell_try_compound_pipeline(const char *src) {
      * loses: `echo \`\`echo -n e\`cho hi | cat\`` came back as "unmatched
      * backquote" once the pipeline was cut out of the captured text instead
      * of being tokenized whole. */
+#ifdef SHELL_HOSTED
     if (g_capture_depth > 0 && !any_compound) {
+#else
+    /* THE KERNEL SHELL RUNS A PIPELINE OF SIMPLE COMMANDS ON THE TOKEN PATH.
+     * It has no fork, so this path runs every stage here, one after the
+     * other -- and a stage that is a real PROCESS then has to FINISH before
+     * the next one starts. `yes | head -1` never finishes: into a pipe it
+     * blocked on the full buffer, into a stage file it spun on ENOSPC, and
+     * either way pid 0 waited on it for good and took SSH with it. The
+     * token path starts external stages side by side on real pipes, so
+     * `head` exits and `yes` dies of SIGPIPE, exactly as under bash; its
+     * in-shell stages still hand on through a file (shell_stage_spill_open).
+     * A pipeline with a COMPOUND stage still needs this path, and there a
+     * producer that never ends still cannot be stopped -- no fork. */
+    if (!any_compound) {
+#endif
         kfree(stages);
         return false;
     }
@@ -27925,10 +28003,24 @@ static bool shell_try_compound_pipeline(const char *src) {
     if (g_shell_flow != SHELL_FLOW_NONE) { kfree(stages); return true; }
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
+#ifdef SHELL_HOSTED
         if (i + 1 < n && pipe_create(&r, &w) != 0) {
             kprintf("pipeline: pipe_create failed\n");
             break;
         }
+#else
+        /* Every stage here runs in the kernel shell itself, one after the
+         * other, so each hands its output on in a file -- see
+         * shell_stage_spill_open for the wedge a pipe caused. */
+        char spill[32] = { 0 };
+        if (i + 1 < n) {
+            w = shell_stage_spill_open(spill, sizeof spill);
+            if (!w) {
+                kprintf("pipeline: cannot create a stage file\n");
+                break;
+            }
+        }
+#endif
         if (prev_in) g_shell_fd[0] = prev_in;
         if (w)       g_shell_fd[1] = w;
 
@@ -28049,6 +28141,9 @@ static bool shell_try_compound_pipeline(const char *src) {
 
         /* Close the write end before the reader runs, or it never sees EOF. */
         if (w) file_close(w);
+#ifndef SHELL_HOSTED
+        if (spill[0]) r = shell_stage_spill_reader(spill);
+#endif
         if (prev_in) file_close(prev_in);
         prev_in = r;
 
