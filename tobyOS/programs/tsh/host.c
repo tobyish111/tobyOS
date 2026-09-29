@@ -246,14 +246,30 @@ long file_read(struct file *f, void *buf, size_t n) {
     return got;
 }
 
+/* ALL OF IT, OR AN ERROR. write(2) may stop short: a signal that arrives
+ * while it is blocked on a full pipe ends it with the count so far -- a
+ * SIGCHLD from the `seq` a `$( )` just ran is enough. Every caller in
+ * shell.c hands over its whole string once and moves on, so a short count
+ * was data lost: `echo "$x" | wc -c` with a 108 KB $x counted 65537, the
+ * first pipe-full and the newline. Retried, as bash retries. */
 long file_write(struct file *f, const void *buf, size_t n) {
     if (!f) return -1;
     if (f->kind == FILE_KIND_NULL) return (long)n;    /* `>&-` discards */
     if (f->kind != FILE_KIND_VFS) return -1;
     int fd = VF_FD(&f->vfs);
-    long put = write(fd, buf, n);
-    if (put > 0) f->vfs.pos += (size_t)put;
-    return put;
+    const char *p = (const char *)buf;
+    size_t done = 0;
+    while (done < n) {
+        long put = write(fd, p + done, n - done);
+        if (put < 0) {
+            if (errno == EINTR) continue;
+            return done > 0 ? (long)done : put;
+        }
+        if (put == 0) break;
+        done += (size_t)put;
+        f->vfs.pos += (size_t)put;
+    }
+    return (long)done;
 }
 
 /* The kernel keeps the offset in a shared open file description so that

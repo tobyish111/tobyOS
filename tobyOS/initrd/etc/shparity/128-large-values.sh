@@ -38,4 +38,6 @@ for it in "$s"; do echo "v26 [${#it}]"; done
 unset uv; : "${uv:=$s}"; echo "v27 [${#uv}]"
 lit=L; for i in 1 2 3 4 5 6 7; do lit="$lit$lit"; done
 bx=$(eval "printf '%s\n' ${lit}{1..80}"); echo "v31 [${#bx}] [${bx:0:3}]"
+echo "$(seq 20000)" | tail -1 | sed "s/^/v32 /"
+x=$(seq 30000); echo "$x" | wc -c | sed "s/^/v33 /"
 echo done
