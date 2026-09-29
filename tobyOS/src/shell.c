@@ -68,22 +68,12 @@
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 512
-/* Parse scratch: also the cap on a multi-line compound command joined
- * into one line by shell_run_script_text. Defined here rather than beside
- * SHELL_TOKEN_MAX because that reader runs long before that point. */
-/* The word/expansion buffer -- and so the most a $(...) can capture. It was
- * 1 KiB in both builds, and `$(seq 512)` (1.9 KiB) came back "command
- * substitution output truncated" with status 2 where bash has no cap at all.
- * These are stack arrays (seventy of them in this file).
- *
- * THE SAME SIZE IN BOTH BUILDS. The in-kernel shell kept 1 KiB because it
- * ran on pid 0's boot stack, so `x=$(ls /etc)` there (3.7 KiB) failed --
- * silently, leaving x unchanged -- where /bin/tsh captured it. It now runs
- * each line on its own 1 MiB stack (shell_run_on_line_stack), which is
- * more than /bin/tsh's 256 KiB user stack, so it takes the hosted size.
- * Growing the buffers onto the heap, for bash's "no cap at all", is still
- * owed in BOTH builds. */
-#define SHELL_PARSE_BUF_MAX (8 * 1024)     /* the Oils corpus needs ~2 KiB */
+/* There is no parse or expansion buffer size any more. SHELL_PARSE_BUF_MAX
+ * was the size of seventy fixed arrays -- the word being built, each
+ * expansion's output, a joined compound, a `$( )`'s capture -- first 1 KiB,
+ * then 8 KiB, and bash has no such limit anywhere. Text now lives in
+ * growable buffers (struct shell_sb) or in storage sized from what it holds;
+ * see "GROWABLE TEXT" below. */
 /* Word-boundary marker planted by "$@" expansion; see
  * shell_append_positional_join(). Never appears in real shell text. */
 /* Descriptors the shell can hold open. POSIX requires at least 0..9, and
@@ -155,6 +145,241 @@ extern volatile struct limine_module_request module_req;
 #define SHELL_HEREDOC_MAX 4
 #define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
 
+/* ---- GROWABLE TEXT: the buffers expansion writes into -------------------
+ *
+ * bash has no limit on what a word can expand to. tsh had one: every
+ * expansion wrote into a fixed SHELL_PARSE_BUF_MAX array, so
+ *
+ *     x=$(head -c 40000 f); echo ${#x}        bash: 40000
+ *                                             tsh : "command substitution
+ *                                                    output truncated", 0
+ *
+ * A bigger array only moves the wall. A shell_sb grows instead: the first
+ * SHELL_SB_INLINE bytes live inside the struct (so the short words that are
+ * nearly all of a script never touch the heap), and past that it doubles on
+ * the heap. `p[len]` is always a NUL, so `p` can be handed to anything that
+ * wants a C string.
+ *
+ * THE BUFFER MOVES WHEN IT GROWS. A pointer into `p` is good only until the
+ * next append; hold an OFFSET across one. SHELL_SB_STRESS builds a shell in
+ * which every growth moves the text to a fresh exact-size block and poisons
+ * the old one, so a stale pointer reads garbage at once instead of by luck.
+ *
+ * SH_SB declares one that frees itself when it goes out of scope, which is
+ * what lets the many early returns of the expanders stay as they are. Never
+ * copy a shell_sb by value: `p` may point into the original's `inl`. */
+#ifdef SHELL_SB_STRESS
+#define SHELL_SB_INLINE 1
+#else
+#define SHELL_SB_INLINE 256
+#endif
+
+struct shell_sb {
+    char  *p;
+    size_t len;
+    size_t cap;                     /* bytes at p, the NUL included */
+    char   inl[SHELL_SB_INLINE];
+};
+
+static inline void sb_init(struct shell_sb *b) {
+    b->p = b->inl;
+    b->len = 0;
+    b->cap = sizeof b->inl;
+    b->inl[0] = '\0';
+}
+
+static void sb_free(struct shell_sb *b) {
+    if (b->p && b->p != b->inl) kfree(b->p);
+    sb_init(b);
+}
+
+#define SH_SB(name) \
+    struct shell_sb name __attribute__((cleanup(sb_free))); sb_init(&name)
+
+/* Make room for `need` bytes in all, the terminating NUL included. */
+static int sb_grow(struct shell_sb *b, size_t need) {
+    if (need <= b->cap) return 0;
+#ifdef SHELL_SB_STRESS
+    size_t ncap = need;
+#else
+    size_t ncap = b->cap;
+    while (ncap < need) {
+        if (ncap > ((size_t)-1) / 2) return -1;
+        ncap *= 2;
+    }
+#endif
+    char *n = (char *)kmalloc(ncap);
+    if (!n) {
+        kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)ncap);
+        return -1;
+    }
+    memcpy(n, b->p, b->len + 1);
+#ifdef SHELL_SB_STRESS
+    memset(b->p, 0xA5, b->cap);
+#endif
+    if (b->p != b->inl) kfree(b->p);
+    b->p = n;
+    b->cap = ncap;
+    return 0;
+}
+
+static inline int sb_putc(struct shell_sb *b, char c) {
+    if (b->len + 2 > b->cap && sb_grow(b, b->len + 2) < 0) return -1;
+    b->p[b->len++] = c;
+    b->p[b->len] = '\0';
+    return 0;
+}
+
+/* `n` bytes exactly, NULs and all -- the caller has measured them. */
+static int sb_putmem(struct shell_sb *b, const char *s, size_t n) {
+    if (!n) return 0;
+    if (b->len + n + 1 > b->cap && sb_grow(b, b->len + n + 1) < 0) return -1;
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = '\0';
+    return 0;
+}
+
+static int sb_puts(struct shell_sb *b, const char *s) {
+    return s ? sb_putmem(b, s, strlen(s)) : 0;
+}
+
+/* At most `n` bytes, stopping at a NUL. */
+static int sb_putn(struct shell_sb *b, const char *s, size_t n) {
+    if (!s) return 0;
+    size_t k = 0;
+    while (k < n && s[k]) k++;
+    return sb_putmem(b, s, k);
+}
+
+static int sb_put_uint(struct shell_sb *b, unsigned long v) {
+    char tmp[24];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v) { tmp[n++] = (char)('0' + (v % 10UL)); v /= 10UL; }
+    while (n > 0) if (sb_putc(b, tmp[--n]) < 0) return -1;
+    return 0;
+}
+
+static int sb_put_long(struct shell_sb *b, long v) {
+    if (v < 0) {
+        if (sb_putc(b, '-') < 0) return -1;
+        return sb_put_uint(b, (unsigned long)0 - (unsigned long)v);
+    }
+    return sb_put_uint(b, (unsigned long)v);
+}
+
+/* Cut back to `n` bytes (n <= len). */
+static inline void sb_truncate(struct shell_sb *b, size_t n) {
+    if (n < b->len) { b->len = n; b->p[n] = '\0'; }
+}
+
+/* Replace the whole contents with `s`. `s` must not point into `b`. */
+static int sb_set(struct shell_sb *b, const char *s) {
+    sb_truncate(b, 0);
+    return sb_puts(b, s);
+}
+
+/* The text as a heap string the caller owns; `b` is left empty. */
+static char *sb_steal(struct shell_sb *b) {
+    char *r;
+    if (b->p != b->inl) {
+        r = b->p;
+    } else {
+        r = (char *)kmalloc(b->len + 1);
+        if (!r) return 0;
+        memcpy(r, b->p, b->len + 1);
+    }
+    sb_init(b);
+    return r;
+}
+
+/* EXPANSION OUTPUT into a growable buffer: a byte that collides with one of
+ * the in-band markers is escaped with SHELL_DATA_ESC -- the rule "DATA THAT
+ * LOOKS LIKE A MARKER" documents, far below. The runs between such bytes go
+ * in whole,
+ * so a 40 KB value costs a handful of copies, not 40 000 calls. `n` bytes
+ * are taken as they are -- a NUL among them is the caller's to exclude. */
+static int sb_put_data_n(struct shell_sb *b, const char *sv, size_t n) {
+    if (!sv) return 0;
+    size_t from = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = sv[i];
+        if (c != SHELL_ARG_MARK && c != SHELL_NOSPLIT_MARK &&
+            c != SHELL_GLOB_ESC && c != SHELL_DATA_ESC) continue;
+        if (sb_putmem(b, sv + from, i - from) < 0) return -1;
+        if (sb_putc(b, SHELL_DATA_ESC) < 0) return -1;
+        from = i;                       /* the marker byte itself goes next */
+    }
+    return sb_putmem(b, sv + from, n - from);
+}
+
+static int sb_put_data_str(struct shell_sb *b, const char *sv) {
+    return sv ? sb_put_data_n(b, sv, strlen(sv)) : 0;
+}
+
+/* ---- WORD STORAGE THAT NEVER MOVES --------------------------------------
+ *
+ * The tokenizer hands out `char *` to finished words, and argv is built from
+ * pointers the same way, so the storage behind them cannot be a buffer that
+ * grows by moving. It is a chain of chunks instead: a word is copied in
+ * whole, and a word that does not fit the current chunk gets a new one (at
+ * least as big as the word). Nothing already stored ever moves, and the
+ * whole chain goes at once. SH_WORDS frees it at the end of the scope, which
+ * is exactly the lifetime the old stack arrays gave the same pointers. */
+struct shell_words_chunk {
+    struct shell_words_chunk *next;
+    size_t used, cap;
+    char   data[];
+};
+
+struct shell_words {
+    struct shell_words_chunk *head;
+};
+
+static void words_free(struct shell_words *w) {
+    struct shell_words_chunk *c = w->head;
+    while (c) {
+        struct shell_words_chunk *nx = c->next;
+#ifdef SHELL_SB_STRESS
+        memset(c->data, 0xA5, c->cap);
+#endif
+        kfree(c);
+        c = nx;
+    }
+    w->head = 0;
+}
+
+#define SH_WORDS(name) \
+    struct shell_words name __attribute__((cleanup(words_free))) = { 0 }
+
+/* A stable copy of s[0..n) plus a NUL, or 0 when memory ran out. */
+static char *words_store(struct shell_words *w, const char *s, size_t n) {
+    struct shell_words_chunk *c = w->head;
+    if (!c || c->cap - c->used < n + 1) {
+#ifdef SHELL_SB_STRESS
+        size_t cap = n + 1;
+#else
+        size_t cap = 4096;
+        if (cap < n + 1) cap = n + 1;
+#endif
+        c = (struct shell_words_chunk *)kmalloc(sizeof *c + cap);
+        if (!c) {
+            kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)cap);
+            return 0;
+        }
+        c->used = 0;
+        c->cap = cap;
+        c->next = w->head;
+        w->head = c;
+    }
+    char *d = c->data + c->used;
+    if (n) memcpy(d, s, n);
+    d[n] = '\0';
+    c->used += n + 1;
+    return d;
+}
+
 /* Serialises execute_line() between keyboard shell_poll and remote
  * tcp_shell (both use the shared `line` buffer). */
 static spinlock_t g_shell_line_lock = SPINLOCK_INIT;
@@ -214,31 +439,90 @@ static unsigned long g_shell_lineno;
  * two behind for everything after the loop. This records the offset at which
  * each physical line was appended, so a compound can ask which line its body
  * actually started on. */
-#define SHELL_LMAP_MAX 64
+/* GROWABLE, like the buffer it describes: it held 64 entries, so from the
+ * 65th physical line of one compound on, every `$LINENO` reported the 64th.
+ * The arrays are kept between lines and only ever grow. */
 static const char *g_lmap_base;
-static size_t g_lmap_off[SHELL_LMAP_MAX];
-static unsigned long g_lmap_line[SHELL_LMAP_MAX];
+static size_t *g_lmap_off;
+static unsigned long *g_lmap_line;
 static int g_lmap_n;
+static int g_lmap_cap;
 static size_t g_lmap_len;
+/* How many bytes from g_lmap_base belong to the mapped buffer: a pointer at
+ * or past this came from somewhere else. It replaces a guess (the old fixed
+ * buffer size) now that the buffer is sized by what it holds. */
+static size_t g_lmap_limit;
+
+static void shell_lmap_put(size_t off, unsigned long line) {
+    if (g_lmap_n >= g_lmap_cap) {
+        int ncap = g_lmap_cap ? g_lmap_cap * 2 : 64;
+        size_t *no = (size_t *)kmalloc((size_t)ncap * sizeof *no);
+        unsigned long *nl = (unsigned long *)kmalloc((size_t)ncap * sizeof *nl);
+        if (!no || !nl) {               /* stop recording; lookups still work */
+            kfree(no);
+            kfree(nl);
+            return;
+        }
+        if (g_lmap_n) {
+            memcpy(no, g_lmap_off, (size_t)g_lmap_n * sizeof *no);
+            memcpy(nl, g_lmap_line, (size_t)g_lmap_n * sizeof *nl);
+        }
+        kfree(g_lmap_off);
+        kfree(g_lmap_line);
+        g_lmap_off = no;
+        g_lmap_line = nl;
+        g_lmap_cap = ncap;
+    }
+    g_lmap_off[g_lmap_n] = off;
+    g_lmap_line[g_lmap_n] = line;
+    g_lmap_n++;
+}
 
 static void shell_lmap_reset(const char *base, unsigned long first) {
     g_lmap_base = base;
     g_lmap_len = 0;
     g_lmap_n = 0;
-    if (base) {
-        g_lmap_off[0] = 0;
-        g_lmap_line[0] = first;
-        g_lmap_n = 1;
-    }
+    g_lmap_limit = base ? strlen(base) + 1 : 0;
+    if (base) shell_lmap_put(0, first);
 }
 
 static void shell_lmap_add(size_t off, unsigned long line) {
     g_lmap_len = off;
-    if (g_lmap_n < SHELL_LMAP_MAX) {
-        g_lmap_off[g_lmap_n] = off;
-        g_lmap_line[g_lmap_n] = line;
-        g_lmap_n++;
+    shell_lmap_put(off, line);
+}
+
+/* The mapped buffer moved or grew (the script reader's accumulator): the
+ * offsets still hold, only the base and extent change. */
+static void shell_lmap_rebase(const char *old, const char *nw, size_t limit) {
+    if (g_lmap_base && g_lmap_base == old) {
+        g_lmap_base = nw;
+        g_lmap_limit = limit;
     }
+}
+
+/* Room for `need` bytes in the script reader's accumulator -- the buffer a
+ * multi-line compound is joined into. It grows as far as the construct
+ * goes; it was a fixed SHELL_PARSE_BUF_MAX, and a longer `while`, `if` or
+ * function body was "compound command too long (max 8192 bytes)". Growing
+ * MOVES it, and the line map is keyed on its address, so the map moves
+ * with it. */
+static bool shell_accum_room(char **acc, size_t *cap, size_t need) {
+    if (need <= *cap) return true;
+    size_t ncap = *cap ? *cap : 256;
+    while (ncap < need) ncap *= 2;
+    char *n = (char *)kmalloc(ncap);
+    if (!n) {
+        kprintf("sh: out of memory reading a compound command\n");
+        return false;
+    }
+    if (*acc) {
+        memcpy(n, *acc, *cap);
+        shell_lmap_rebase(*acc, n, ncap);
+        kfree(*acc);
+    }
+    *acc = n;
+    *cap = ncap;
+    return true;
 }
 
 /* The physical line a pointer INTO the current logical line came from, or 0
@@ -319,9 +603,9 @@ static unsigned long shell_lineno_at(const char *p) {
      * address answered the range test and indexed into the wrong end of the
      * map -- every `$LINENO` in a loop body reported the `done` line. */
     /* Past the LAST join is still inside the last joined line -- a continued
-     * pipeline's final stage lives there (1185/1186) -- so only a pointer
-     * past any plausible end of the buffer is refused. */
-    if (off > g_lmap_len + SHELL_PARSE_BUF_MAX) return 0;
+     * pipeline's final stage lives there (1185/1186) -- so the bound is the
+     * buffer's own extent, not the last join. */
+    if (off >= g_lmap_limit) return 0;
     unsigned long best = 0;
     for (int i = 0; i < g_lmap_n; i++)
         if (g_lmap_off[i] <= off) best = g_lmap_line[i];
@@ -614,10 +898,10 @@ static const char *sh_array_get_key(const char *name, const char *key);
 static void  sh_array_unset_key(struct sh_array *a, const char *key);
 /* The array-literal parser EXPANDS each element, so it needs the word
  * expander and the marker cleanup 12k lines below. */
-static int shell_expand_word_ex(const char *word, char *out, size_t cap,
+static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
 static void shell_strip_nosplit_inplace(char *s);
-static void shell_word_tilde(char *w, size_t cap);
+static int shell_word_tilde(struct shell_sb *wb);
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
 static bool g_shopt_nullglob, g_shopt_failglob;   /* defined with the shopt table */
@@ -625,14 +909,14 @@ static int  sh_array_glob_field(const char *name, const char *field,
                                 long *next);
 
 static long  sh_array_max_idx(const struct sh_array *a);
-static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
+static int shell_append_array_slice(struct shell_sb *b,
                                    const char *name, bool star,
                                    long off, long cnt);
 struct file;
 static int shell_read_line_from_file(struct file *in, bool raw,
-                                     char *out, size_t cap,
+                                     struct shell_sb *out,
                                      bool *got_any, char delim,
-                                     bool *escmap, long maxchars,
+                                     struct shell_sb *esc, long maxchars,
                                      bool ignore_delim);
 static struct file *shell_builtin_fd(int n);
 static bool  sh_subscript_eval(const char *sub, const char *name,
@@ -662,11 +946,11 @@ static bool shell_func_name_char(char c);
 static bool shell_func_name_is_valid(const char *s, size_t n);
 static bool shell_word_is_func_name(const char *w, size_t n);
 static bool shell_special_builtin_name(const char *name);
-static int shell_expand_param_word(const char *word, char *out, size_t cap);
+static int shell_expand_param_word(const char *word, struct shell_sb *out);
 static bool shell_word_has_argmark(const char *s);
-static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap);
+static int shell_argmarks_to_spaces(const char *src, struct shell_sb *out);
 
-static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
+static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
 /* ANSI-C quoting, shared by `printf %q`, `declare -p` and bare `set`.
  * Defined beside cmd_printf, used here as well -- see shell_ansi_render. */
 static bool shell_q_needs_ansi(const char *s);
@@ -677,15 +961,13 @@ static void shell_print_vars_set_format(void);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
 static void shell_putc_raw(char c);
-static void shell_case_unquote(char *pat, size_t cap);
+static int shell_case_unquote(struct shell_sb *pb);
 static char *shell_unquoted_newline(char *s);
-static const char *shell_expand_aliases(const char *src, char *buf, size_t cap);
-static const char *shell_expand_aliases_nested(const char *src, char *buf,
-                                               size_t cap);
+static const char *shell_expand_aliases(const char *src, struct shell_sb *buf);
+static const char *shell_expand_aliases_nested(const char *src,
+                                               struct shell_sb *buf);
 static int shell_append_char(char *buf, size_t *pos, size_t cap, char c);
-static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
-                                 const char *sv);
-static int shell_append_str(char *buf, size_t *pos, size_t cap, const char *s);
+
 static bool shell_word_has(const char *word, char c);
 static const char *shell_skip_blanks(const char *s);
 static int parse_int(const char *s, int *out);
@@ -1107,7 +1389,10 @@ static void shell_getopts_note_external_optind_write(const char *key,
  * read, so they live here rather than in the variable table: the command's
  * own frame applies them for real when it runs. */
 #define SHELL_TOKPFX_MAX 8
-static char g_tokpfx[SHELL_TOKPFX_MAX][256];
+/* Heap strings, whole values: a slot is freed only when it is written
+ * again. They were 256-byte slots, which cut a longer value short for the
+ * words after it. */
+static char *g_tokpfx[SHELL_TOKPFX_MAX];
 static int  g_tokpfx_n;
 
 /* A NAMEREF MAY NAME AN ARRAY ELEMENT, not just a variable:
@@ -1347,7 +1632,12 @@ static bool sh_ifs_is_sep(char c) {
  * elements, not zero. Returns -1 on error. */
 static int sh_array_store_expanded(const char *name, const char *ex,
                                    bool split, bool keep_empty, long *next) {
-    char field[512];
+    /* A field is a piece of `ex`, so ex's length always holds one. It was a
+     * 512-byte array that cut every longer element short without a word. */
+    SH_SB(fieldb);
+    if (sb_grow(&fieldb, strlen(ex) + 1) < 0) return -1;
+    char *field = fieldb.p;
+    const size_t field_cap = fieldb.cap;
     size_t f = 0;
     bool any = false;
     bool in_nosplit = false;
@@ -1356,7 +1646,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         bool boundary = false;
         if (!end) {
             if (*q == SHELL_DATA_ESC && q[1]) {
-                if (f + 2 < sizeof field) { field[f++] = *q; field[f++] = q[1]; }
+                if (f + 2 < field_cap) { field[f++] = *q; field[f++] = q[1]; }
                 q++;
                 continue;
             }
@@ -1401,7 +1691,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             if (end) break;
             continue;
         }
-        if (f + 1 < sizeof field) field[f++] = *q;
+        if (f + 1 < field_cap) field[f++] = *q;
     }
     return 0;
 }
@@ -1438,8 +1728,14 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
     }
     if (!sh_array_create(name)) return -1;
-    char elem[512];
-    char pend[256];            /* an associative literal's dangling KEY */
+    /* An element's text is a piece of the literal, so the literal's length
+     * always holds one; it was 512 bytes, and a longer element was cut
+     * short without a word. */
+    SH_SB(elemb);
+    if (sb_grow(&elemb, strlen(p) + 1) < 0) return -1;
+    char *elem = elemb.p;
+    const size_t elem_cap = elemb.cap;
+    SH_SB(pend);               /* an associative literal's dangling KEY */
     bool pend_key = false;
     bool saw_keyed = false;    /* a [k]=v element turns pairing OFF */
     for (;;) {
@@ -1459,7 +1755,7 @@ static int sh_array_assign_literal(const char *name, const char *paren,
          * a literal is a WORD: it expands, and an unquoted one then field
          * splits. shell_expand_word_ex() removes the quotes downstream,
          * which is also the only way `"$v"` can be told from `$v`. */
-        while (*p && n + 1 < sizeof elem) {
+        while (*p && n + 1 < elem_cap) {
             if (*p == '\'' || *p == '"') {
                 char q = *p;
                 /* `$'...'` honours `\'` where a plain `'...'` does not. The
@@ -1468,25 +1764,25 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 bool ansi = (q == '\'' && n > 0 && elem[n - 1] == '$');
                 quoted = true;
                 elem[n++] = *p++;
-                while (*p && *p != q && n + 1 < sizeof elem) {
+                while (*p && *p != q && n + 1 < elem_cap) {
                     /* keep a backslash pair together inside double quotes,
                      * and inside an ANSI-C span */
                     if ((q == '"' || ansi) && *p == '\\' && p[1] &&
-                        n + 2 < sizeof elem)
+                        n + 2 < elem_cap)
                         elem[n++] = *p++;
                     elem[n++] = *p++;
                 }
-                if (*p == q && n + 1 < sizeof elem) elem[n++] = *p++;
+                if (*p == q && n + 1 < elem_cap) elem[n++] = *p++;
                 continue;
             }
-            if (*p == '\\' && p[1] && n + 2 < sizeof elem) {
+            if (*p == '\\' && p[1] && n + 2 < elem_cap) {
                 elem[n++] = *p++;
                 elem[n++] = *p++;
                 continue;
             }
             /* A blank inside $(...) ${...} or `...` is NOT a boundary. */
             {
-                size_t used = sh_copy_balanced(p, elem, &n, sizeof elem);
+                size_t used = sh_copy_balanced(p, elem, &n, elem_cap);
                 if (used) { p += used; continue; }
             }
             if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' ||
@@ -1527,23 +1823,25 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                  * holding all three words, while a bare `$v` beside it is
                  * three elements. Storing the raw text made every one of
                  * these read back as the literal `$v`. */
-                char vraw[SHELL_PARSE_BUF_MAX], vx[SHELL_PARSE_BUF_MAX];
-                if (shell_expand_word_ex(v, vraw, sizeof vraw, true, true) < 0)
+                SH_SB(vraw);
+                SH_SB(vx);
+                if (shell_expand_word_ex(v, &vraw, true, true) < 0)
                     return -1;
                 /* `${x[@]}` in an ASSIGNMENT joins on a space. There is no
                  * field splitting here to give its ARG_MARKs a meaning, so
                  * leaving them put raw 0x01 bytes INSIDE the value -- the
                  * gate printed '\x013\x015\x017' where bash prints '3 5 7'. */
-                if (shell_argmarks_to_spaces(vraw, vx, sizeof vx) < 0)
+                if (shell_argmarks_to_spaces(vraw.p, &vx) < 0)
                     return -1;
                 /* An assignment's RHS tilde-expands, after the `=` and
                  * after each `:` -- shell_word_tilde owns that rule. */
-                shell_word_tilde(vx, sizeof vx);
+                if (shell_word_tilde(&vx) < 0) return -1;
                 if (sh_array_is_assoc(name)) {
-                    char kraw[256], kx[256];
-                    if (shell_expand_word_ex(k, kraw, sizeof kraw, true, true) < 0)
+                    SH_SB(kraw);
+                    SH_SB(kx);
+                    if (shell_expand_word_ex(k, &kraw, true, true) < 0)
                         return -1;
-                    if (shell_argmarks_to_spaces(kraw, kx, sizeof kx) < 0)
+                    if (shell_argmarks_to_spaces(kraw.p, &kx) < 0)
                         return -1;
                     /* `[k]+=v` IS HONOURED IN AN APPENDING LITERAL AND
                      * IGNORED IN A REPLACING ONE. Measured against bash
@@ -1562,38 +1860,38 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                      * passes. An INDEXED array chains in both forms, which
                      * is why the two sides of this branch differ. */
                     if (eplus && append) {
-                        const char *old = sh_array_get_key(name, kx);
-                        size_t ol = old ? strlen(old) : 0;
-                        size_t vl = strlen(vx);
-                        if (ol && ol + vl + 1 <= sizeof vx) {
-                            memmove(vx + ol, vx, vl + 1);
-                            memcpy(vx, old, ol);
+                        const char *old = sh_array_get_key(name, kx.p);
+                        if (old && *old) {
+                            SH_SB(cat);
+                            if (sb_puts(&cat, old) < 0 ||
+                                sb_puts(&cat, vx.p) < 0 ||
+                                sb_set(&vx, cat.p) < 0)
+                                return -1;
                         }
                     }
-                    if (sh_array_set_key(name, kx, vx) < 0) return -1;
+                    if (sh_array_set_key(name, kx.p, vx.p) < 0) return -1;
                     saw_keyed = true;
                 } else {
                     long ix = 0;
                     if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
-                        /* Prepend the old value in place rather than into
-                         * another buffer: this function already carries two
-                         * SHELL_PARSE_BUF_MAX locals and the kernel stack is
-                         * 32 KiB. `old` points into the array store, which
-                         * the set below may reallocate, so it is copied
-                         * first. THE ASSOCIATIVE SIDE DELIBERATELY DOES NOT
-                         * DO THIS: bash >= 5.1 replaces instead of appending
-                         * there, the Oils corpus records it as `## BUG bash`,
-                         * and this gate grades against the live bash. */
+                        /* Prepend the old value. `old` points into the
+                         * array store, which the set below may reallocate,
+                         * so it is copied first. THE ASSOCIATIVE SIDE
+                         * DELIBERATELY DOES NOT DO THIS: bash >= 5.1
+                         * replaces instead of appending there, the Oils
+                         * corpus records it as `## BUG bash`, and this gate
+                         * grades against the live bash. */
                         if (eplus) {
                             const char *old = sh_array_get(name, ix);
-                            size_t ol = old ? strlen(old) : 0;
-                            size_t vl = strlen(vx);
-                            if (ol && ol + vl + 1 <= sizeof vx) {
-                                memmove(vx + ol, vx, vl + 1);
-                                memcpy(vx, old, ol);
+                            if (old && *old) {
+                                SH_SB(cat);
+                                if (sb_puts(&cat, old) < 0 ||
+                                    sb_puts(&cat, vx.p) < 0 ||
+                                    sb_set(&vx, cat.p) < 0)
+                                    return -1;
                             }
                         }
-                        if (sh_array_set(name, ix, vx) < 0) return -1;
+                        if (sh_array_set(name, ix, vx.p) < 0) return -1;
                         next = ix + 1;   /* a later bare element follows on */
                     }
                 }
@@ -1620,37 +1918,36 @@ static int sh_array_assign_literal(const char *name, const char *paren,
              * so a [k]=v element seen earlier turns pairing off rather
              * than letting `2 3 4` invent three more entries. */
             if (saw_keyed) continue;
-            char kx[256], kj[256];
-            if (shell_expand_word_ex(elem, kx, sizeof kx, true, true) < 0)
+            SH_SB(kx);
+            SH_SB(kj);
+            if (shell_expand_word_ex(elem, &kx, true, true) < 0)
                 return -1;
-            if (shell_argmarks_to_spaces(kx, kj, sizeof kj) < 0) return -1;
+            if (shell_argmarks_to_spaces(kx.p, &kj) < 0) return -1;
             if (!pend_key) {
-                size_t kl = strlen(kj);
-                if (kl + 1 > sizeof pend) continue;
-                memcpy(pend, kj, kl + 1);
+                if (sb_set(&pend, kj.p) < 0) return -1;
                 pend_key = true;
                 continue;
             }
-            if (sh_array_set_key(name, pend, kj) < 0) return -1;
+            if (sh_array_set_key(name, pend.p, kj.p) < 0) return -1;
             pend_key = false;
             continue;
         }
         {
-            char ex[SHELL_PARSE_BUF_MAX];
-            if (shell_expand_word_ex(elem, ex, sizeof ex, true, true) < 0)
+            SH_SB(ex);
+            if (shell_expand_word_ex(elem, &ex, true, true) < 0)
                 return -1;
             /* A leading `~` on an UNQUOTED element expands, the same way
              * the ordinary word path does it after expansion. `a=(~/src)`
              * was storing the tilde. */
-            if (!quoted) shell_word_tilde(ex, sizeof ex);
+            if (!quoted && shell_word_tilde(&ex) < 0) return -1;
             /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
              * is three elements -- and a quoted one never does. */
-            if (sh_array_store_expanded(name, ex, !quoted, quoted, &next) < 0)
+            if (sh_array_store_expanded(name, ex.p, !quoted, quoted, &next) < 0)
                 return -1;
         }
     }
     /* An odd number of bare words leaves the last KEY holding "". */
-    if (pend_key && sh_array_set_key(name, pend, "") < 0) return -1;
+    if (pend_key && sh_array_set_key(name, pend.p, "") < 0) return -1;
     return 0;
 }
 
@@ -2581,7 +2878,7 @@ static const struct shell_heredoc *shell_heredoc_pop(void) {
     return &g_heredocs[g_heredoc_head++];
 }
 
-static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
+static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
 
 /* Pop the next body and, for an unquoted delimiter, EXPAND IT NOW.
  *
@@ -2606,20 +2903,19 @@ static int shell_expand_literal_quotes(const char *word, char *out, size_t cap);
 static const struct shell_heredoc *shell_heredoc_take(void) {
     struct shell_heredoc *h = (struct shell_heredoc *)shell_heredoc_pop();
     if (!h || !h->expand) return h;
-    char *x = (char *)kmalloc(SHELL_HEREDOC_BODY_MAX);
-    if (!x) {
-        kprintf("sh: out of memory expanding here-document\n");
+    SH_SB(x);
+    if (shell_expand_literal_quotes(h->body, &x) < 0) return 0;
+    /* The expansion itself has no limit; the BODY does, because it reaches
+     * the command through a pipe filled before the command starts. Said,
+     * rather than cut short. */
+    if (x.len + 1 > SHELL_HEREDOC_BODY_MAX) {
+        kprintf("sh: here-document too large (%lu bytes; the limit is %u)\n",
+                (unsigned long)x.len, (unsigned)SHELL_HEREDOC_BODY_MAX - 1u);
         return 0;
     }
-    if (shell_expand_literal_quotes(h->body, x, SHELL_HEREDOC_BODY_MAX) < 0) {
-        kfree(x);
-        return 0;
-    }
-    size_t n = strlen(x);
-    memcpy(h->body, x, n + 1);
-    h->len = n;
+    memcpy(h->body, x.p, x.len + 1);
+    h->len = x.len;
     h->expand = false;
-    kfree(x);
     return h;
 }
 
@@ -3271,10 +3567,10 @@ static int sh_array_set(const char *name, long idx, const char *val) {
 static bool sh_subscript_eval(const char *sub, const char *name,
                               bool for_write, long *out) {
     if (!sub || !*sub) return false;
-    char expanded[256];
+    SH_SB(expanded);
     const char *src = sub;
-    if (shell_expand_literal_quotes(sub, expanded, sizeof expanded) == 0)
-        src = expanded;
+    if (shell_expand_literal_quotes(sub, &expanded) == 0)
+        src = expanded.p;
     /* A DOUBLE-QUOTED SUBSCRIPT IS STILL ARITHMETIC. bash removes the
      * quotes and evaluates what is left, so `${a["k1"]}` reads the
      * variable k1 exactly as `${a[k1]}` does and `${a["1"]}` is index 1.
@@ -3297,11 +3593,14 @@ static bool sh_subscript_eval(const char *sub, const char *name,
         for (const char *q = src; *q; q++)
             if (*q == '"') { quoted = true; open = !open; }
         if (quoted && !open) {
+            if (src != expanded.p && sb_set(&expanded, src) < 0) return false;
+            char *w = expanded.p;
             size_t o = 0;
-            for (const char *q = src; *q && o + 1 < sizeof expanded; q++)
-                if (*q != '"') expanded[o++] = *q;
-            expanded[o] = '\0';
-            src = expanded;
+            for (const char *q = expanded.p; *q; q++)
+                if (*q != '"') w[o++] = *q;
+            w[o] = '\0';
+            expanded.len = o;
+            src = expanded.p;
         }
     }
     struct shell_arith a = { .p = src, .ok = true };
@@ -4662,13 +4961,13 @@ static void cmd_readarray(int argc, char **argv) {
     if (!sh_array_create(name)) { shell_set_status(1); goto done; }
 
     {
-        char line[1024];
+        SH_SB(linesb);
         long idx = 0;
         for (;;) {
             bool got_any = false;
-            int rr = shell_read_line_from_file(in, true, line,
-                                               sizeof line, &got_any,
+            int rr = shell_read_line_from_file(in, true, &linesb, &got_any,
                                                delim, 0, -1, false);
+            char *line = linesb.p;
             /* !got_any IS end-of-input -- cmd_read uses exactly that test to
              * end `while read line`, and an EMPTY line still sets it, so a
              * blank line mid-file does not stop the read.
@@ -4679,15 +4978,18 @@ static void cmd_readarray(int argc, char **argv) {
              * 512 with the first three elements perfectly correct, which is a
              * failure that a spot-check of arr[0] would have passed. */
             if (rr < 0 || !got_any) break;
-            size_t n = strlen(line);
             if (!trim) {
                 /* Put the delimiter back: bash keeps it without -t, and the
                  * reader strips it. A NUL delimiter cannot be re-appended to
                  * a C string, and bash's own output for `-d ''` without -t
                  * carries it -- so that combination is the one place this
                  * differs, noted rather than silently wrong. */
-                if (delim && n + 1 < sizeof line) {
-                    line[n] = delim; line[n + 1] = '\0';
+                if (delim) {
+                    if (sb_putc(&linesb, delim) < 0) {
+                        shell_set_status(1);
+                        break;
+                    }
+                    line = linesb.p;
                 }
             }
             if (sh_array_set(name, idx++, line) < 0) { shell_set_status(1); break; }
@@ -5431,17 +5733,28 @@ static bool shell_ifs_is_ws(const char *ifs, char c) {
  * resolved, so `read -n 5` on `a\b\c\d\e` is `abcde` and a continuation
  * counts for nothing (1124-1126, measured). ignore_delim is -N: the
  * delimiter is data. */
+/* One line -- of ANY length -- into `out`. `esc`, when given, runs parallel
+ * to it: one byte per byte of the line, 1 where the input escaped that byte,
+ * which is what a caller reads as its `const bool *` escape map. Both were
+ * 512-byte arrays for `read` (1 KiB for mapfile), and a longer line was
+ * "read: line too long" -- or, in mapfile, the silent end of the array. */
 static int shell_read_line_from_file(struct file *in, bool raw,
-                                     char *out, size_t cap,
+                                     struct shell_sb *out,
                                      bool *got_any, char delim,
-                                     bool *escmap, long maxchars,
+                                     struct shell_sb *esc, long maxchars,
                                      bool ignore_delim) {
-    if (!in || !out || cap == 0 || !got_any) return -1;
+    if (!in || !out || !got_any) return -1;
+    sb_truncate(out, 0);
+    if (esc) sb_truncate(esc, 0);
     bool hit_eof = false;
-    size_t pos = 0;
     bool escaped = false;
+#define SH_RL_PUT(ch, e)                                                      \
+    do {                                                                      \
+        if (sb_putc(out, (ch)) < 0) return -2;                                \
+        if (esc && sb_putc(esc, (char)((e) ? 1 : 0)) < 0) return -2;          \
+    } while (0)
     for (;;) {
-        if (maxchars >= 0 && (long)pos >= maxchars) { escaped = false; break; }
+        if (maxchars >= 0 && (long)out->len >= maxchars) { escaped = false; break; }
         char c = 0;
         long n = file_read(in, &c, 1);
         if (n < 0) return -1;
@@ -5452,9 +5765,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         if (!raw && escaped) {
             escaped = false;
             if (c == '\n') continue;              /* line continuation */
-            if (pos + 1 >= cap) return -2;
-            if (escmap) escmap[pos] = true;
-            out[pos++] = c;
+            SH_RL_PUT(c, true);
             continue;
         }
         if (!raw && c == '\\') {
@@ -5462,15 +5773,11 @@ static int shell_read_line_from_file(struct file *in, bool raw,
             continue;
         }
         if (c == delim && !ignore_delim) break;
-        if (pos + 1 >= cap) return -2;
-        out[pos++] = c;
+        SH_RL_PUT(c, false);
     }
 
-    if (!raw && escaped) {
-        if (pos + 1 >= cap) return -2;
-        out[pos++] = '\\';
-    }
-    out[pos] = '\0';
+    if (!raw && escaped) SH_RL_PUT('\\', false);
+#undef SH_RL_PUT
     return hit_eof ? 1 : 0;
 }
 
@@ -5589,7 +5896,9 @@ static int shell_read_assign_array(const char *name, const char *line,
     sh_array_unset(name);
     if (!sh_array_create(name)) return 1;
     long idx = 0;
-    char field[LINE_MAX];
+    SH_SB(fieldb);                  /* a field is a piece of the line */
+    if (sb_grow(&fieldb, strlen(line) + 1) < 0) return 1;
+    char *field = fieldb.p;
     size_t f = 0;
 #define SH_RA_IFS(q)    (!(escmap && escmap[(q) - line]) && shell_ifs_has(ifs, *(q)))
 #define SH_RA_IFS_WS(q) (!(escmap && escmap[(q) - line]) && shell_ifs_is_ws(ifs, *(q)))
@@ -5601,7 +5910,7 @@ static int shell_read_assign_array(const char *name, const char *line,
     while (*p) {
         f = 0;
         while (*p && !SH_RA_IFS(p)) {
-            if (f + 1 < sizeof field) field[f++] = *p;
+            field[f++] = *p;
             p++;
         }
         field[f] = '\0';
@@ -5813,20 +6122,21 @@ static void cmd_read(int argc, char **argv) {
         }
     }
 
-    char linebuf[LINE_MAX];
+    SH_SB(linesb);
+    SH_SB(escsb);
     bool got_any = false;
-    static bool escmap[LINE_MAX];       /* .bss: 512 bytes is a lot of stack */
-    memset(escmap, 0, sizeof escmap);
-    int rr = shell_read_line_from_file(in, raw, linebuf, sizeof(linebuf),
-                                       &got_any, delim, raw ? 0 : escmap,
-                                       maxchars, exact);
+    int rr = shell_read_line_from_file(in, raw, &linesb, &got_any, delim,
+                                       raw ? 0 : &escsb, maxchars, exact);
     if (tmp_console) file_close(tmp_console);
     if (rr < 0) {
-        kprintf(rr == -2 ? "read: line too long\n"
+        kprintf(rr == -2 ? "read: out of memory\n"
                          : "read: input error\n");
         shell_set_status(1);
         return;
     }
+    char *linebuf = linesb.p;
+    /* One byte per line byte, 0 or 1 -- the bool representation. */
+    const bool *escmap = raw ? 0 : (const bool *)escsb.p;
     /* EOF with nothing read at all: the variables are cleared, status 1.
      * EOF after SOME data (a last line without its newline) still assigns
      * and still reports 1 -- that is the `while read` idiom's ending. */
@@ -10277,10 +10587,10 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
 
         /* If this line opens a compound, pull following lines until it closes
          * and hand the parser the single line it expects. See the comment
-         * above shell_compound_depth. The buffer is heap-allocated, not a
-         * local: scripts nest up to 8 deep and each level already puts two
-         * SHELL_PARSE_BUF_MAX buffers on the stack inside execute_line_text. */
+         * above shell_compound_depth. The buffer is heap-allocated and grows
+         * -- see shell_accum_room. */
         char *accum = 0;
+        size_t accum_cap = 0;
 
         bool hd_failed = false;
 
@@ -10291,24 +10601,32 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         {
             int inc = shell_line_incomplete(line);
             if (inc) {
-                accum = kmalloc(SHELL_PARSE_BUF_MAX);
-                if (!accum) {
-                    kprintf("sh: out of memory reading continued line\n");
+                size_t llen = strlen(line);
+                if (!shell_accum_room(&accum, &accum_cap, llen + 1)) {
                     shell_set_status(2);
                     break;
                 }
-                size_t alen = (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
+                memcpy(accum, line, llen + 1);
+                size_t alen = llen;
                 /* The offset map is keyed on this buffer too -- a `\`-joined
                  * pipeline's stages sit on different lines and the DEBUG trap
                  * reports each on its own (1186). */
                 shell_lmap_reset(accum, line_first);
+                shell_lmap_rebase(accum, accum, accum_cap);
                 bool bad = false;
                 while (inc && *p) {
                     /* A continuation drops the backslash and joins directly;
                      * an open quote keeps the newline, because it is part of
                      * the string being built. */
-                    if (inc == 2 && alen > 0 && accum[alen - 1] == '\\') alen--;
-                    else if (inc == 1 && alen + 1 < SHELL_PARSE_BUF_MAX) accum[alen++] = '\n';
+                    if (inc == 2 && alen > 0 && accum[alen - 1] == '\\') {
+                        alen--;
+                    } else if (inc == 1) {
+                        if (!shell_accum_room(&accum, &accum_cap, alen + 2)) {
+                            bad = true;
+                            break;
+                        }
+                        accum[alen++] = '\n';
+                    }
 
                     char *nstart = p;
                     while (*p && *p != '\n' && *p != '\r') p++;
@@ -10322,8 +10640,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     shell_lmap_add(alen, g_shell_lineno);
 
                     size_t nlen = strlen(nstart);
-                    if (alen + nlen + 1 > SHELL_PARSE_BUF_MAX) {
-                        kprintf("sh: line too long after continuation\n");
+                    if (!shell_accum_room(&accum, &accum_cap, alen + nlen + 1)) {
                         bad = true;
                         break;
                     }
@@ -10389,21 +10706,25 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * safe, as in shell_line_incomplete_hosted. */
         if (!hd_failed && !scan.bad_paren && shell_scan_incomplete(&scan)) {
             /* The continuation pass above may already own this buffer, with
-             * `line` pointing into it; reuse it rather than allocating a
+             * `line` pointing at it; reuse it rather than allocating a
              * second one and leaking the first. */
-            if (!accum) {
-                accum = kmalloc(SHELL_PARSE_BUF_MAX);
-                if (!accum) {
-                    kprintf("sh: out of memory reading compound command\n");
+            size_t alen;
+            if (accum && line == accum) {
+                alen = strlen(accum);
+            } else {
+                size_t ll = strlen(line);
+                if (!shell_accum_room(&accum, &accum_cap, ll + 1)) {
                     shell_set_status(2);
                     break;
                 }
+                memcpy(accum, line, ll + 1);
+                alen = ll;
+                /* The offset map is keyed on THIS buffer; see
+                 * shell_lineno_at. A continuation-joined line arrives with
+                 * its map already built. */
+                shell_lmap_reset(accum, g_shell_lineno);
             }
-            size_t alen = (line == accum) ? strlen(accum)
-                        : (size_t)ksnprintf(accum, SHELL_PARSE_BUF_MAX, "%s", line);
-            /* The offset map is keyed on THIS buffer; see shell_lineno_at. A
-             * continuation-joined line arrives with its map already built. */
-            if (line != accum) shell_lmap_reset(accum, g_shell_lineno);
+            shell_lmap_rebase(accum, accum, accum_cap);
             /* The newline that ended this line's comment is about to be
              * replaced by "; ", so the comment has to go with it. */
             shell_strip_comment(accum);
@@ -10556,9 +10877,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 }
                 const char *app = tnl ? tnl : nl;
                 size_t seplen = strlen(sep), nllen = strlen(app);
-                if (alen + seplen + nllen + 1 > SHELL_PARSE_BUF_MAX) {
-                    kprintf("sh: compound command too long (max %d bytes)\n",
-                            SHELL_PARSE_BUF_MAX);
+                if (!shell_accum_room(&accum, &accum_cap,
+                                      alen + seplen + nllen + 1)) {
                     if (tnl) kfree(tnl);
                     overflow = true;
                     break;
@@ -10615,12 +10935,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         if (!accum) shell_lmap_reset(line, line_first);
         if (eval_mode) {
             /* Aliases, as cmd_eval's one-line path expands them. */
-            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
-            const char *ex = abuf ? shell_expand_aliases(line, abuf,
-                                                         SHELL_PARSE_BUF_MAX)
-                                  : 0;
+            SH_SB(abuf);
+            const char *ex = shell_expand_aliases(line, &abuf);
             execute_line_text(ex ? ex : line);
-            if (abuf) kfree(abuf);
         } else {
             execute_line_text(line);
         }
@@ -11258,20 +11575,19 @@ static void cmd_eval(int argc, char **argv) {
         shell_set_status(0);
         return;
     }
-    char cmd[LINE_MAX];
-    size_t pos = 0;
+    /* THE ARGUMENTS JOINED, WHATEVER THEIR LENGTH. This was a 512-byte
+     * array, so `eval "$(generator)"` -- how dircolors, ssh-agent and a
+     * great many setup scripts hand the shell its settings -- was "eval:
+     * command too long" as soon as the text passed 511 bytes. */
+    SH_SB(cmdb);
     for (int i = 1; i < argc; i++) {
-        size_t n = strlen(argv[i]);
-        if (pos + n + (i + 1 < argc ? 1 : 0) + 1 > sizeof(cmd)) {
-            kprintf("eval: command too long\n");
+        if (sb_puts(&cmdb, argv[i]) < 0 ||
+            (i + 1 < argc && sb_putc(&cmdb, ' ') < 0)) {
             shell_set_status(2);
             return;
         }
-        memcpy(cmd + pos, argv[i], n);
-        pos += n;
-        if (i + 1 < argc) cmd[pos++] = ' ';
     }
-    cmd[pos] = '\0';
+    char *cmd = cmdb.p;
     /* A syntax error inside eval ends the EVAL, not the shell: bash reports
      * it, gives eval status 2 and runs the next command. shell_parse_error()
      * turns the flow into EXIT, the right answer for a script; this notices
@@ -11338,14 +11654,10 @@ static void cmd_eval(int argc, char **argv) {
              * eval's argument is parsed as shell INPUT, which includes alias
              * substitution. */
             const char *line = p;
-            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
-            if (abuf) {
-                const char *ex = shell_expand_aliases(p, abuf,
-                                                      SHELL_PARSE_BUF_MAX);
-                if (ex) line = ex;
-            }
+            SH_SB(abuf);
+            const char *ex = shell_expand_aliases(p, &abuf);
+            if (ex) line = ex;
             execute_line_text(line);
-            if (abuf) kfree(abuf);
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
@@ -13899,30 +14211,27 @@ static void cmd_fc(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
-        char buf[LINE_MAX];
+        SH_SB(bufb);                /* the whole entry: it was cut at 511 */
         const char *src = g_hist[idx];
         if (old_new) {
             size_t klen = 0;
             while (old_new[klen] && old_new[klen] != '=') klen++;
             const char *rep = old_new + klen + 1;
-            size_t pos = 0;
             bool done = false;
             for (const char *q = src; *q; ) {
                 if (!done && klen && strncmp(q, old_new, klen) == 0) {
-                    if (shell_append_str(buf, &pos, sizeof(buf), rep) < 0) break;
+                    if (sb_puts(&bufb, rep) < 0) { shell_set_status(1); return; }
                     q += klen;
                     done = true;
                     continue;
                 }
-                if (shell_append_char(buf, &pos, sizeof(buf), *q++) < 0) break;
+                if (sb_putc(&bufb, *q++) < 0) { shell_set_status(1); return; }
             }
-            buf[pos] = '\0';
-        } else {
-            size_t n = strlen(src);
-            if (n + 1 > sizeof(buf)) n = sizeof(buf) - 1;
-            memcpy(buf, src, n);
-            buf[n] = '\0';
+        } else if (sb_puts(&bufb, src) < 0) {
+            shell_set_status(1);
+            return;
         }
+        char *buf = bufb.p;
         kprintf("%s\n", buf);
         shell_history_add(buf);
         execute_line_text(buf);
@@ -14831,9 +15140,32 @@ struct shell_simple {
 struct shell_pipeline {
     int count;
     struct shell_simple stage[SHELL_STAGE_MAX];
-    char expand_buf[SHELL_PARSE_BUF_MAX];
-    size_t expand_pos;
+    /* Words made while building the stages -- split fields, glob
+     * matches, unmarked copies. argv points into it, so it is storage
+     * that never moves (see struct shell_words); it was an 8 KiB array
+     * and "expansion buffer full" was the answer past that. */
+    struct shell_words words;
 };
+
+/* Every pipeline comes from here and goes back through shell_pipeline_free,
+ * because its word store is a chain of heap chunks that a plain kfree would
+ * leak. Only the fields the parser reads before it resets the struct are
+ * set; shell_parse_pipeline clears the rest. */
+static struct shell_pipeline *shell_pipeline_new(void) {
+    struct shell_pipeline *pl =
+        (struct shell_pipeline *)kmalloc(sizeof *pl);
+    if (pl) {
+        pl->count = 0;
+        pl->words.head = 0;
+    }
+    return pl;
+}
+
+static void shell_pipeline_free(struct shell_pipeline *pl) {
+    if (!pl) return;
+    words_free(&pl->words);
+    kfree(pl);
+}
 
 /* Build "<prefix>/<name>" into out_buf and return a pointer to it,
  * skipping a redundant slash if `prefix` already ends in one. Returns
@@ -15270,23 +15602,8 @@ static int shell_append_char(char *buf, size_t *pos, size_t cap, char c) {
     return 0;
 }
 
-static int shell_append_str(char *buf, size_t *pos, size_t cap,
-                            const char *s) {
-    if (!s) return 0;
-    while (*s) {
-        if (shell_append_char(buf, pos, cap, *s++) < 0) return -1;
-    }
-    return 0;
-}
 
-static int shell_append_n(char *buf, size_t *pos, size_t cap,
-                          const char *s, size_t n) {
-    if (!s) return 0;
-    for (size_t i = 0; i < n && s[i]; i++) {
-        if (shell_append_char(buf, pos, cap, s[i]) < 0) return -1;
-    }
-    return 0;
-}
+
 
 static int shell_append_uint(char *buf, size_t *pos, size_t cap,
                              unsigned long v) {
@@ -15303,21 +15620,17 @@ static int shell_append_uint(char *buf, size_t *pos, size_t cap,
     return 0;
 }
 
+/* What a substitution has captured so far. It grows with the output -- there
+ * is no cap, as in bash -- so the only way to fail is running out of
+ * memory. */
 struct shell_capture {
-    char *buf;
-    size_t cap;
-    size_t pos;
-    bool overflow;
+    struct shell_sb *sb;
+    bool failed;
 };
 
 static void shell_capture_char(struct shell_capture *cap, char c) {
-    if (!cap || !cap->buf || cap->cap == 0) return;
-    if (cap->pos + 1 >= cap->cap) {
-        cap->overflow = true;
-        return;
-    }
-    cap->buf[cap->pos++] = c;
-    cap->buf[cap->pos] = '\0';
+    if (!cap || !cap->sb || cap->failed) return;
+    if (sb_putc(cap->sb, c) < 0) cap->failed = true;
 }
 
 /* Sink that writes the shell's own output into the same spill file a spawned
@@ -15418,25 +15731,39 @@ static void shell_alias_restore(const struct shell_alias_save *sv) {
  *
  * tsh ran the general path for all of them, where `<f` is a null command
  * with a redirection: it produces no output, so `$(<f)` was the empty
- * string. Returns the number of bytes, or -1; trailing newlines come off
- * the same way they do for a real substitution. */
-static int shell_capture_read_file(const char *word, char *out, size_t out_cap) {
-    char path[SHELL_PARSE_BUF_MAX];
-    if (shell_expand_word_ex(word, path, sizeof path, true, true) < 0) return -1;
-    shell_strip_nosplit_inplace(path);
-    struct file *f = shell_open_vfs_file(path, false, false, "shell");
+ * string. Returns 0, or -1; trailing newlines come off the same way they do
+ * for a real substitution.
+ *
+ * The WHOLE FILE, as bash reads it. This used to stop at the capture buffer,
+ * so `x=$(<f)` on a 274 KB file gave a truncated value with no message at
+ * all. A NUL is dropped, not kept, for the reason the spill reader gives. */
+static int shell_capture_read_file(const char *word, struct shell_sb *out) {
+    SH_SB(path);
+    if (shell_expand_word_ex(word, &path, true, true) < 0) return -1;
+    shell_strip_nosplit_inplace(path.p);
+    struct file *f = shell_open_vfs_file(path.p, false, false, "shell");
     if (!f) return -1;
-    size_t pos = 0;
+    sb_truncate(out, 0);
+    int rc = 0;
     for (;;) {
-        if (pos + 1 >= out_cap) break;
-        long got = file_read(f, out + pos, out_cap - 1 - pos);
+        char chunk[1024];
+        long got = file_read(f, chunk, sizeof chunk);
         if (got <= 0) break;
-        pos += (size_t)got;
+        long from = 0;
+        for (long i = 0; i <= got; i++) {
+            if (i < got && chunk[i] != '\0') continue;
+            if (sb_putmem(out, chunk + from, (size_t)(i - from)) < 0) {
+                rc = -1;
+                break;
+            }
+            from = i + 1;
+        }
+        if (rc < 0) break;
     }
     file_close(f);
-    while (pos > 0 && out[pos - 1] == '\n') pos--;
-    out[pos] = '\0';
-    return (int)pos;
+    while (out->len > 0 && out->p[out->len - 1] == '\n')
+        sb_truncate(out, out->len - 1);
+    return rc;
 }
 
 /* Is `cmd` exactly `< word`? Returns the word, or 0. */
@@ -15466,27 +15793,29 @@ static const char *shell_capture_is_file_read(const char *cmd) {
     return w;
 }
 
-static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
-    if (!cmd || !out || out_cap == 0) return -1;
+static int shell_capture_command(const char *cmd, struct shell_sb *out) {
+    if (!cmd || !out) return -1;
+    sb_truncate(out, 0);
 
     {
         const char *fw = shell_capture_is_file_read(cmd);
         if (fw) {
-            char wcopy[SHELL_PARSE_BUF_MAX];
-            size_t wl = strlen(fw);
-            if (wl + 1 > sizeof wcopy) return -1;
-            memcpy(wcopy, fw, wl + 1);
-            while (wl > 0 && (wcopy[wl - 1] == ' ' || wcopy[wl - 1] == '\t'))
-                wcopy[--wl] = '\0';
-            int n = shell_capture_read_file(wcopy, out, out_cap);
-            if (n < 0) { out[0] = '\0'; shell_set_status(1); return 0; }
+            SH_SB(wcopy);
+            if (sb_puts(&wcopy, fw) < 0) return -1;
+            while (wcopy.len > 0 && (wcopy.p[wcopy.len - 1] == ' ' ||
+                                     wcopy.p[wcopy.len - 1] == '\t'))
+                sb_truncate(&wcopy, wcopy.len - 1);
+            if (shell_capture_read_file(wcopy.p, out) < 0) {
+                sb_truncate(out, 0);
+                shell_set_status(1);
+                return 0;
+            }
             shell_set_status(0);
-            return n;
+            return 0;
         }
     }
 
-    struct shell_capture cap = { .buf = out, .cap = out_cap, .pos = 0 };
-    out[0] = '\0';
+    struct shell_capture cap = { .sb = out, .failed = false };
 
     shell_write_fn_t old_out = g_shell_out;
     void *old_out_ctx = g_shell_out_ctx;
@@ -15607,15 +15936,11 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
              * substitution in a HERE-DOCUMENT body used to get the pass by
              * accident -- the body was expanded by the reader, before any
              * line ran -- and lost it when the body moved to run time. */
-            char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+            SH_SB(abuf);
             const char *line = cmd;
-            if (abuf) {
-                const char *ex = shell_expand_aliases_nested(
-                    cmd, abuf, SHELL_PARSE_BUF_MAX);
-                if (ex) line = ex;
-            }
+            const char *ex = shell_expand_aliases_nested(cmd, &abuf);
+            if (ex) line = ex;
             execute_line_text(line);
-            if (abuf) kfree(abuf);
         } else {
             char *copy = shell_strdup(cmd);
             if (copy) {
@@ -15687,12 +16012,11 @@ static int shell_capture_command(const char *cmd, char *out, size_t out_cap) {
         (void)vfs_unlink(spill);
     }
 
-    while (cap.pos > 0 &&
-           (cap.buf[cap.pos - 1] == '\n' || cap.buf[cap.pos - 1] == '\r')) {
-        cap.buf[--cap.pos] = '\0';
-    }
-    if (cap.overflow) {
-        kprintf("shell: command substitution output truncated\n");
+    while (out->len > 0 && (out->p[out->len - 1] == '\n' ||
+                            out->p[out->len - 1] == '\r'))
+        sb_truncate(out, out->len - 1);
+    if (cap.failed) {
+        kprintf("shell: command substitution: out of memory\n");
         return -1;
     }
     return 0;
@@ -15877,29 +16201,32 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
     return -1;
 }
 
-static int shell_expand_command_subst(const char **pp, char *buf,
-                                      size_t *pos, size_t cap) {
-    char cmd[LINE_MAX];
-    char out[SHELL_PARSE_BUF_MAX];
-    if (shell_parse_command_subst(pp, cmd, sizeof(cmd)) < 0) {
+/* THE COMMAND TEXT IS SIZED FROM THE SOURCE, not from LINE_MAX: it is a
+ * substring of what follows `$(`, so that length always holds it. A 512-byte
+ * array made any `$( )` longer than that a "bad command substitution". */
+static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
+    SH_SB(cmd);
+    if (sb_grow(&cmd, strlen(*pp) + 1) < 0) return -1;
+    if (shell_parse_command_subst(pp, cmd.p, cmd.cap) < 0) {
         kprintf("shell: bad command substitution\n");
         return -1;
     }
+    SH_SB(out);
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
     g_dq_depth = 0;
-    int crc = shell_capture_command(cmd, out, sizeof(out));
+    int crc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     if (crc < 0) return -1;
-    return shell_append_data_str(buf, pos, cap, out);
+    return sb_put_data_n(b, out.p, out.len);
 }
 
-static int shell_expand_backtick(const char **pp, char *buf,
-                                 size_t *pos, size_t cap) {
+static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
     if (*p != '`') return -1;
     p++;
 
-    char cmd[LINE_MAX];
+    SH_SB(cmd);                     /* sized from the source, as for $( ) */
+    if (sb_grow(&cmd, strlen(p) + 1) < 0) return -1;
     size_t cpos = 0;
     /* POSIX 2.6.3: within `...`, a backslash RETAINS ITS LITERAL MEANING
      * except when followed by `$`, a backtick, or another backslash. This
@@ -15918,39 +16245,39 @@ static int shell_expand_backtick(const char **pp, char *buf,
                             (dq && p[1] == '"'))) {
             p++;                          /* removed: the next byte is data */
         } else if (*p == '\\' && p[1]) {
-            if (cpos + 2 >= sizeof(cmd)) {
+            if (cpos + 2 >= cmd.cap) {
                 kprintf("shell: command substitution too long\n");
                 return -1;
             }
-            cmd[cpos++] = *p++;           /* retained: BOTH bytes are data */
+            cmd.p[cpos++] = *p++;         /* retained: BOTH bytes are data */
         }
-        if (cpos + 1 >= sizeof(cmd)) {
+        if (cpos + 1 >= cmd.cap) {
             kprintf("shell: command substitution too long\n");
             return -1;
         }
-        cmd[cpos++] = *p++;
+        cmd.p[cpos++] = *p++;
     }
     if (*p != '`') {
         kprintf("shell: unmatched backquote\n");
         return -1;
     }
     p++;
-    cmd[cpos] = '\0';
+    cmd.p[cpos] = '\0';
+    cmd.len = cpos;
     *pp = p;
 
-    char out[SHELL_PARSE_BUF_MAX];
+    SH_SB(out);
     /* The body is a fresh script. Whatever quotes enclose the backticks do not
      * enclose the commands inside them. */
     int saved_dq = g_dq_depth;
     g_dq_depth = 0;
-    int rc = shell_capture_command(cmd, out, sizeof(out));
+    int rc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     if (rc < 0) return -1;
-    return shell_append_str(buf, pos, cap, out);
+    return sb_putmem(b, out.p, out.len);
 }
 
-static int shell_expand_var(const char **pp, char *buf, size_t *pos,
-                            size_t cap);
+static int shell_expand_var(const char **pp, struct shell_sb *b);
 
 /* ONE decoder for a $'...' escape, because there were TWO and they have now
  * diverged three separate times.
@@ -16152,33 +16479,10 @@ static bool shell_var_char(char c) {
  * instead of reading it as a mark. Those are marked "escape-aware" below.
  *
  * Only expansion OUTPUT goes through here. A marker the tokenizer put in
- * deliberately is appended with shell_append_str as before. */
-static int shell_append_data_n(char *buf, size_t *pos, size_t cap,
-                               const char *sv, size_t n) {
-    if (!sv) return 0;
-    for (size_t i = 0; i < n; i++) {
-        char c = sv[i];
-        if (c == SHELL_ARG_MARK || c == SHELL_NOSPLIT_MARK ||
-            c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) {
-            if (shell_append_char(buf, pos, cap, SHELL_DATA_ESC) < 0) return -1;
-        }
-        if (shell_append_char(buf, pos, cap, c) < 0) return -1;
-    }
-    return 0;
-}
+ * deliberately is appended with sb_putc/sb_puts as before. The appenders
+ * themselves are sb_put_data_n and sb_put_data_str, up with struct
+ * shell_sb: every expansion now writes into a growable buffer. */
 
-static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
-                                 const char *sv) {
-    if (!sv) return 0;
-    for (const char *q = sv; *q; q++) {
-        if (*q == SHELL_ARG_MARK || *q == SHELL_NOSPLIT_MARK ||
-            *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) {
-            if (shell_append_char(buf, pos, cap, SHELL_DATA_ESC) < 0) return -1;
-        }
-        if (shell_append_char(buf, pos, cap, *q) < 0) return -1;
-    }
-    return 0;
-}
 
 /* "$@" has to survive quoting as SEPARATE words -- that is the entire reason
  * it exists, and why `wrapper "$@"` is how every script forwards arguments
@@ -16200,7 +16504,7 @@ static int shell_append_data_str(char *buf, size_t *pos, size_t cap,
  *
  * `star` selects "$*", which is the opposite case: a SINGLE word joined by
  * the first character of IFS. */
-static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
+static int shell_append_positional_join(struct shell_sb *b,
                                         bool star) {
     if (!star) {                                /* "$@" -- one word each */
         /* Emit a marker FIRST, then one before each subsequent parameter:
@@ -16213,11 +16517,11 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
          * distinguishable from a literal empty word, and it makes the text
          * before it unambiguously a PREFIX that shell_add_marked_words glues
          * onto the first parameter -- which is how bash treats `"pre$@"`. */
-        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
-            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+            if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
-            if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+            if (sb_put_data_str(b, g_positional[i]) < 0)
                 return -1;
         }
         return 0;
@@ -16239,19 +16543,19 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
      * files it as POSIX even though it reads like a quirk. Quoted, the join is
      * still correct -- g_dq_depth is what tells the two apart. */
     if (ifs && !*ifs && g_dq_depth == 0) {
-        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
-            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+            if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
-            if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+            if (sb_put_data_str(b, g_positional[i]) < 0)
                 return -1;
         }
         return 0;
     }
 
     for (int i = 0; i < g_positional_count; i++) {
-        if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
-        if (shell_append_data_str(buf, pos, cap, g_positional[i]) < 0)
+        if (i > 0 && sep && sb_putc(b, sep) < 0) return -1;
+        if (sb_put_data_str(b, g_positional[i]) < 0)
             return -1;
     }
     return 0;
@@ -16268,7 +16572,7 @@ static int shell_append_positional_join(char *buf, size_t *pos, size_t cap,
  * `indices` switches the source from values to subscripts, which is ${!a[@]}.
  * Sparse arrays are why that exists at all: after `a[0]=x; a[9]=y` the
  * indices are 0 and 9, and no amount of counting recovers them. */
-static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
+static int shell_append_array_join(struct shell_sb *b,
                                    const char *name, bool star, bool indices) {
     struct sh_array *a = sh_array_find(name);
     int n = a ? a->n : 0;
@@ -16278,36 +16582,34 @@ static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
     else if (ifs) sep = '\0';
 
     if (!star) {
-        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
         for (int i = 0; i < n; i++) {
-            if (i > 0 && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+            if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
             if (indices) {
                 /* For an associative array the "indices" ARE the keys. */
                 if (a->e[i].key) {
-                    if (shell_append_data_str(buf, pos, cap, a->e[i].key) < 0)
+                    if (sb_put_data_str(b, a->e[i].key) < 0)
                         return -1;
-                } else if (shell_append_uint(buf, pos, cap,
-                                      (unsigned long)a->e[i].idx) < 0) {
+                } else if (sb_put_uint(b, (unsigned long)a->e[i].idx) < 0) {
                     return -1;
                 }
-            } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
+            } else if (sb_put_data_str(b, a->e[i].val) < 0) {
                 return -1;
             }
         }
         return 0;
     }
     for (int i = 0; i < n; i++) {
-        if (i > 0 && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
+        if (i > 0 && sep && sb_putc(b, sep) < 0) return -1;
         if (indices) {
             if (a->e[i].key) {
-                if (shell_append_data_str(buf, pos, cap, a->e[i].key) < 0)
+                if (sb_put_data_str(b, a->e[i].key) < 0)
                     return -1;
-            } else if (shell_append_uint(buf, pos, cap,
-                                  (unsigned long)a->e[i].idx) < 0) {
+            } else if (sb_put_uint(b, (unsigned long)a->e[i].idx) < 0) {
                 return -1;
             }
-        } else if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) {
+        } else if (sb_put_data_str(b, a->e[i].val) < 0) {
             return -1;
         }
     }
@@ -16322,7 +16624,7 @@ static int shell_append_array_join(char *buf, size_t *pos, size_t cap,
  * array `${a[@]:1:2}` means "the second and third elements that exist", which
  * is what bash does and is why this walks the store rather than indexing it.
  * A negative or absent count means "to the end". */
-static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
+static int shell_append_array_slice(struct shell_sb *b,
                                     const char *name, bool star,
                                     long off, long cnt) {
     struct sh_array *a = sh_array_find(name);
@@ -16337,21 +16639,21 @@ static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
     else if (ifs) sep = '\0';
 
     if (!star) {
-        if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0) return -1;
+        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
         bool first = true;
         for (long i = off; i < end; i++) {
-            if (!first && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+            if (!first && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
             first = false;
-            if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) return -1;
+            if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
         }
         return 0;
     }
     bool first = true;
     for (long i = off; i < end; i++) {
-        if (!first && sep && shell_append_char(buf, pos, cap, sep) < 0) return -1;
+        if (!first && sep && sb_putc(b, sep) < 0) return -1;
         first = false;
-        if (shell_append_data_str(buf, pos, cap, a->e[i].val) < 0) return -1;
+        if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
     }
     return 0;
 }
@@ -16360,26 +16662,23 @@ static int shell_append_array_slice(char *buf, size_t *pos, size_t cap,
  * structure rather than data. Everything else comes back as raw bytes, which
  * is what the pattern operators and ${#x} want to work on -- so the escaping
  * happens at the append, and only for the values that are not joins. */
-static int shell_parameter_value(const char *name, char *out, size_t cap,
+static int shell_parameter_value(const char *name, struct shell_sb *out,
                                  bool *is_set, bool *is_join) {
-    size_t pos = 0;
-    if (!name || !out || cap == 0 || !is_set) return -1;
-    out[0] = '\0';
+    if (!name || !out || !is_set) return -1;
+    sb_truncate(out, 0);
     *is_set = true;
     if (is_join) *is_join = false;
 
     int rc = -1;
     if (strcmp(name, "?") == 0) {
-        rc = shell_append_uint(out, &pos, cap, (unsigned long)g_last_status);
+        rc = sb_put_uint(out, (unsigned long)g_last_status);
     } else if (strcmp(name, "!") == 0) {
-        rc = shell_append_uint(out, &pos, cap, (unsigned long)g_last_bg_pid);
+        rc = sb_put_uint(out, (unsigned long)g_last_bg_pid);
     } else if (strcmp(name, "$") == 0) {
         struct proc *cur = current_proc();
-        rc = shell_append_uint(out, &pos, cap,
-                               (unsigned long)(cur ? cur->pid : 0));
+        rc = sb_put_uint(out, (unsigned long)(cur ? cur->pid : 0));
     } else if (strcmp(name, "#") == 0) {
-        rc = shell_append_uint(out, &pos, cap,
-                               (unsigned long)g_positional_count);
+        rc = sb_put_uint(out, (unsigned long)g_positional_count);
     } else if (strcmp(name, "-") == 0) {
         char opts[16];
         int oi = 0;
@@ -16395,37 +16694,36 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
         if (g_opt_xtrace)    opts[oi++] = 'x';
         if (g_opt_noclobber) opts[oi++] = 'C';
         opts[oi] = '\0';
-        rc = shell_append_str(out, &pos, cap, opts);
+        rc = sb_puts(out, opts);
     } else if (strcmp(name, "*") == 0) {
         if (is_join) *is_join = true;
-        rc = shell_append_positional_join(out, &pos, cap, true);
+        rc = shell_append_positional_join(out, true);
     } else if (strcmp(name, "@") == 0) {
         if (is_join) *is_join = true;
-        rc = shell_append_positional_join(out, &pos, cap, false);
+        rc = shell_append_positional_join(out, false);
     } else if (name[0] >= '0' && name[0] <= '9') {
         int idx = 0;
         for (const char *d = name; *d >= '0' && *d <= '9'; d++)
             idx = idx * 10 + (*d - '0');
         if (idx == 0) {
             const char *p0 = g_param0 ? g_param0 : "tobysh";
-            rc = shell_append_str(out, &pos, cap, p0);
+            rc = sb_puts(out, p0);
         } else if (idx <= g_positional_count) {
-            rc = shell_append_str(out, &pos, cap, g_positional[idx - 1]);
+            rc = sb_puts(out, g_positional[idx - 1]);
         } else {
             *is_set = false;
             return 0;
         }
     } else if (strcmp(name, "LINENO") == 0 && !env_get("LINENO")) {
-        rc = shell_append_uint(out, &pos, cap, g_shell_lineno);
+        rc = sb_put_uint(out, g_shell_lineno);
     } else {
         const char *v = env_get(name);
         if (!v) {
             *is_set = false;
             return 0;
         }
-        rc = shell_append_str(out, &pos, cap, v);
+        rc = sb_puts(out, v);
     }
-    if (rc >= 0 && pos < cap) out[pos] = '\0';
     return rc;
 }
 
@@ -16443,12 +16741,11 @@ static int shell_parameter_value(const char *name, char *out, size_t cap,
  * needs a "do not split this span" marker through the splitter, the way
  * SHELL_ARG_MARK carries "$@" word boundaries; quote REMOVAL is correct on its
  * own and is what most of these expansions actually need. */
-static int shell_expand_word_ex(const char *word, char *out, size_t cap,
+static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                bool dq_syntax, bool sq_syntax) {
     const char *p = word ? word : "";
-    size_t pos = 0;
-    if (!out || cap == 0) return -1;
-    out[0] = '\0';
+    if (!out) return -1;
+    sb_truncate(out, 0);
 
     while (*p) {
         /* `$'...'` IS ANSI-C QUOTING, and it is recognised inside a `${...}`
@@ -16461,7 +16758,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
          * it is wrapped in no-split marks like any other quoted span. */
         if (*p == '$' && p[1] == '\'') {
             p += 2;
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             bool stop_nul = false;      /* a NUL ends the word; see below */
             while (*p && *p != '\'') {
                 char c = *p;
@@ -16480,7 +16777,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 }
                 if (un > 0) {
                     /* an escape that decoded to several bytes */
-                    if (!stop_nul && shell_append_data_n(out, &pos, cap, ub, (size_t)un) < 0)
+                    if (!stop_nul && sb_put_data_n(out, ub, (size_t)un) < 0)
                         return -1;
                     continue;
                 }
@@ -16502,54 +16799,54 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                  * escapes such a byte the way expansion output is escaped.
                  * A literal character between the quotes cannot collide. */
                 if (esc) {
-                    if (shell_append_data_n(out, &pos, cap, &c, 1) < 0) return -1;
+                    if (sb_put_data_n(out, &c, 1) < 0) return -1;
                 } else {
-                    if (shell_append_char(out, &pos, cap, c) < 0) return -1;
+                    if (sb_putc(out, c) < 0) return -1;
                 }
             }
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
             continue;
         }
         if (sq_syntax && *p == '\'') {           /* literal to next quote */
             p++;
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '\'') {
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
             continue;
         }
         if (dq_syntax && *p == '"') {            /* expands, quotes removed */
             p++;
             g_dq_depth++;
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
                 if (*p == '$') {
-                    if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
+                    if (shell_expand_var(&p, out) < 0) return -1;
                     continue;
                 }
                 if (*p == '`') {
-                    if (shell_expand_backtick(&p, out, &pos, cap) < 0) return -1;
+                    if (shell_expand_backtick(&p, out) < 0) return -1;
                     continue;
                 }
                 /* Inside double quotes a backslash only escapes these four. */
                 if (*p == '\\' && (p[1] == '"' || p[1] == '\\' ||
                                    p[1] == '$'  || p[1] == '`')) p++;
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
             g_dq_depth--;
-            if (shell_append_char(out, &pos, cap, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '"') p++;
             continue;
         }
         if (*p == '$') {
-            if (shell_expand_var(&p, out, &pos, cap) < 0) return -1;
+            if (shell_expand_var(&p, out) < 0) return -1;
             continue;
         }
         if (*p == '`') {
-            if (shell_expand_backtick(&p, out, &pos, cap) < 0) return -1;
+            if (shell_expand_backtick(&p, out) < 0) return -1;
             continue;
         }
         if (*p == '\\' && p[1]) {
@@ -16566,7 +16863,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 if (p[1] == '$' || p[1] == '`' || p[1] == '"' ||
                     p[1] == '\\') {
                     p++;
-                } else if (shell_append_char(out, &pos, cap, *p++) < 0) {
+                } else if (sb_putc(out, *p++) < 0) {
                     return -1;
                 }
             } else if (dq_syntax) {
@@ -16582,7 +16879,7 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 p++;              /* unquoted word: escape, next byte literal */
                 if (*p == '*' || *p == '?' || *p == '[' || *p == ']' ||
                     *p == '(' || *p == ')') {
-                    if (shell_append_char(out, &pos, cap, SHELL_GLOB_ESC) < 0)
+                    if (sb_putc(out, SHELL_GLOB_ESC) < 0)
                         return -1;
                 }
             } else if (p[1] == '$' || p[1] == '`' ||
@@ -16592,24 +16889,23 @@ static int shell_expand_word_ex(const char *word, char *out, size_t cap,
                 /* here-doc body: an ORDINARY backslash. Both bytes are data,
                  * so `\"` stays `\"` -- dropping it made every escaped quote
                  * in a here-document come out bare. */
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
         }
-        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+        if (sb_putc(out, *p++) < 0) return -1;
     }
-    out[pos] = '\0';
     return 0;
 }
 
 /* The WORD of ${name-WORD}: quotes are shell syntax and are removed. */
-static int shell_expand_param_word(const char *word, char *out, size_t cap) {
+static int shell_expand_param_word(const char *word, struct shell_sb *out) {
     /* The two quote characters get different answers inside double quotes:
      *
      *     "${Unset:-'a b c'}"   ->  'a b c'   single quotes are ORDINARY BYTES
      *     "${Unset:-"a b c"}"   ->   a b c    double quotes are still syntax
      *
      * Unquoted, both are syntax. See g_dq_depth. */
-    return shell_expand_word_ex(word, out, cap, true, g_dq_depth == 0);
+    return shell_expand_word_ex(word, out, true, g_dq_depth == 0);
 }
 
 /* A here-document body line, or the inside of $(( )): $ and ` still expand,
@@ -16625,22 +16921,21 @@ static int shell_expand_param_word(const char *word, char *out, size_t cap) {
  * shell_glob_match spells "match this byte"; the marks themselves go. Used by
  * ${v#pat}/${v%pat} and ${v/pat/rep} alike, so a `$'...'` or a quoted `*`
  * means the same thing in both. */
-static void shell_pattern_from_marked(const char *raw, char *out, size_t cap) {
-    size_t o = 0;
+static int shell_pattern_from_marked(const char *raw, struct shell_sb *out) {
+    sb_truncate(out, 0);
     bool prot = false;
-    for (const char *q = raw; *q && o + 2 < cap; q++) {
+    for (const char *q = raw; *q; q++) {
         if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
-            out[o++] = *q++;
-            out[o++] = *q;
+            if (sb_putc(out, *q++) < 0 || sb_putc(out, *q) < 0) return -1;
             continue;
         }
         if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
         if (prot && (*q == '*' || *q == '?' || *q == '[' ||
                      *q == ']' || *q == '\\'))
-            out[o++] = '\\';
-        out[o++] = *q;
+            if (sb_putc(out, '\\') < 0) return -1;
+        if (sb_putc(out, *q) < 0) return -1;
     }
-    out[o] = '\0';
+    return 0;
 }
 
 /* Where ${v/PAT/REP} divides: the first `/` that is NOT quoted or nested.
@@ -16689,25 +16984,34 @@ static const char *shell_patsub_divider(const char *p) {
     return 0;
 }
 
-static int shell_expand_literal_quotes(const char *word, char *out, size_t cap) {
-    return shell_expand_word_ex(word, out, cap, false, false);
+static int shell_expand_literal_quotes(const char *word, struct shell_sb *out) {
+    return shell_expand_word_ex(word, out, false, false);
 }
 
 /* Copy `src` to `dst`, dropping split-protection markers. Called wherever a
  * word becomes an argument; a marker that escaped would be a stray 0x02 byte
  * in a program's argv. */
-static void shell_strip_nosplit(char *dst, size_t cap, const char *src) {
-    size_t o = 0;
-    for (const char *p = src; *p && o + 1 < cap; p++) {
+static int shell_strip_nosplit_n(struct shell_sb *dst, const char *src,
+                                 size_t n) {
+    sb_truncate(dst, 0);
+    if (sb_grow(dst, n + 1) < 0) return -1;     /* it only ever shrinks */
+    char *o = dst->p;
+    for (size_t i = 0; i < n && src[i]; i++) {
         /* escape-aware: carry the pair on for shell_strip_glob_escapes */
-        if (*p == SHELL_DATA_ESC && p[1] && o + 2 < cap) {
-            dst[o++] = *p++;
-            dst[o++] = *p;
+        if (src[i] == SHELL_DATA_ESC && i + 1 < n && src[i + 1]) {
+            *o++ = src[i++];
+            *o++ = src[i];
             continue;
         }
-        if (*p != SHELL_NOSPLIT_MARK) dst[o++] = *p;
+        if (src[i] != SHELL_NOSPLIT_MARK) *o++ = src[i];
     }
-    dst[o] = '\0';
+    *o = '\0';
+    dst->len = (size_t)(o - dst->p);
+    return 0;
+}
+
+static int shell_strip_nosplit(struct shell_sb *dst, const char *src) {
+    return shell_strip_nosplit_n(dst, src, strlen(src));
 }
 
 /* Strip the marks where they stand. The words buffer is writable and marks
@@ -16761,6 +17065,10 @@ static int shell_parse_braced_name(const char *expr, size_t *name_len) {
 }
 
 static bool shell_glob_match(const char *pat, const char *name);
+static bool shell_glob_match_e(const char *pat, const char *pend,
+                               const char *name, const char *nend);
+static long shell_pattern_fixed_len(const char *pat, const char *pend);
+static int shell_pattern_lead_byte(const char *pat, const char *pend);
 
 /* `~user` needs the home directory from /etc/passwd -- the SAME FILE the
  * guest's bash consults, which is what makes the two shells agree. bash
@@ -16814,11 +17122,11 @@ static int shell_passwd_home(const char *name, size_t nlen,
  * same rule an assignment's value follows -- and the word of a `-`/`=`/`+`
  * expansion is expanded as if it were one. `~user` resolves through
  * /etc/passwd now that the repo ships one; an unknown name stays literal. */
-static void shell_word_tilde(char *w, size_t cap) {
+static int shell_word_tilde(struct shell_sb *wb) {
     const char *hm = env_get("HOME");
     if (!hm || !*hm) hm = "/";
-    char out[SHELL_PARSE_BUF_MAX];
-    size_t o = 0;
+    const char *w = wb->p;
+    SH_SB(out);
     bool seg_start = true;
     for (size_t i = 0; w[i]; i++) {
         if (seg_start && w[i] == '~') {
@@ -16830,18 +17138,16 @@ static void shell_word_tilde(char *w, size_t cap) {
             else if (shell_passwd_home(w + i + 1, j - (i + 1),
                                        hb, sizeof hb) == 0) rep = hb;
             if (rep) {
-                for (const char *h = rep; *h && o + 1 < sizeof out; h++)
-                    out[o++] = *h;
+                if (sb_puts(&out, rep) < 0) return -1;
                 i = j - 1;
                 seg_start = false;
                 continue;
             }
         }
-        if (o + 1 < sizeof out) out[o++] = w[i];
+        if (sb_putc(&out, w[i]) < 0) return -1;
         seg_start = (w[i] == ':');
     }
-    out[o] = '\0';
-    if (o + 1 <= cap) memcpy(w, out, o + 1);
+    return sb_set(wb, out.p);
 }
 
 /* ${!pre@} and ${!pre*} -- THE NAMES that begin with `pre`, not their values.
@@ -16856,7 +17162,7 @@ static void shell_word_tilde(char *w, size_t cap) {
  * goes through the same SHELL_ARG_MARK path rather than a string.
  */
 static int shell_expand_name_prefix(const char *prefix, bool star,
-                                    char *buf, size_t *pos, size_t cap) {
+                                    struct shell_sb *b) {
     size_t plen = prefix ? strlen(prefix) : 0;
     int idxs[ENV_MAX];
     int n = 0;
@@ -16890,19 +17196,19 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
     if (ifs && *ifs) sep = ifs[0];
     else if (ifs) sep = '\0';
 
-    if (!star && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+    if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
         return -1;
     for (int i = 0; i < n; i++) {
         if (i > 0) {
             if (!star) {
-                if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                if (sb_putc(b, SHELL_ARG_MARK) < 0)
                     return -1;
             } else if (sep) {
-                if (shell_append_char(buf, pos, cap, sep) < 0) return -1;
+                if (sb_putc(b, sep) < 0) return -1;
             }
         }
         const char *e = g_env[idxs[i]];
-        if (shell_append_data_n(buf, pos, cap, e, env_key_len(e)) < 0)
+        if (sb_put_data_n(b, e, env_key_len(e)) < 0)
             return -1;
     }
     return 0;
@@ -16917,29 +17223,27 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
  * answer, not a detail. Anything else unprintable goes out as three-digit
  * OCTAL, which is what bash prints for $'\001\E\177'.
  */
-static int shell_quote_ansic(const char *v, char *out, size_t cap, size_t *op) {
-    size_t o = 0;
+/* Appends to `out`. */
+static int shell_quote_ansic(const char *v, struct shell_sb *out) {
     bool ctl = false;
     for (const char *p = v; *p; p++)
         if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f) ctl = true;
 
     if (!ctl) {
-        if (o + 1 < cap) out[o++] = '\'';
+        if (sb_putc(out, '\'') < 0) return -1;
         for (const char *p = v; *p; p++) {
             if (*p == '\'') {
                 /* close the string, an escaped quote, open another */
-                const char *esc = "'\\''";
-                for (const char *q = esc; *q && o + 1 < cap; q++) out[o++] = *q;
-            } else if (o + 1 < cap) out[o++] = *p;
+                if (sb_puts(out, "'\\''") < 0) return -1;
+            } else if (sb_putc(out, *p) < 0) {
+                return -1;
+            }
         }
-        if (o + 1 < cap) out[o++] = '\'';
-        out[o] = '\0';
-        if (op) *op = o;
-        return 0;
+        return sb_putc(out, '\'');
     }
 
-    if (o + 2 < cap) { out[o++] = '$'; out[o++] = '\''; }
-    for (const char *p = v; *p && o + 5 < cap; p++) {
+    if (sb_puts(out, "$'") < 0) return -1;
+    for (const char *p = v; *p; p++) {
         unsigned char c = (unsigned char)*p;
         char named = '\0';
         switch (c) {
@@ -16955,20 +17259,21 @@ static int shell_quote_ansic(const char *v, char *out, size_t cap, size_t *op) {
         case '\'': named = '\''; break;
         default: break;
         }
-        if (named) { out[o++] = '\\'; out[o++] = named; continue; }
-        if (c < 0x20 || c == 0x7f) {
-            out[o++] = '\\';
-            out[o++] = (char)('0' + ((c >> 6) & 7));
-            out[o++] = (char)('0' + ((c >> 3) & 7));
-            out[o++] = (char)('0' + (c & 7));
+        if (named) {
+            char e[3] = { '\\', named, '\0' };
+            if (sb_puts(out, e) < 0) return -1;
             continue;
         }
-        out[o++] = (char)c;
+        if (c < 0x20 || c == 0x7f) {
+            char e[5] = { '\\', (char)('0' + ((c >> 6) & 7)),
+                          (char)('0' + ((c >> 3) & 7)),
+                          (char)('0' + (c & 7)), '\0' };
+            if (sb_puts(out, e) < 0) return -1;
+            continue;
+        }
+        if (sb_putc(out, (char)c) < 0) return -1;
     }
-    if (o + 1 < cap) out[o++] = '\'';
-    out[o] = '\0';
-    if (op) *op = o;
-    return 0;
+    return sb_putc(out, '\'');
 }
 
 /* The host name, for \h and \H.
@@ -17022,36 +17327,32 @@ static const char *shell_prompt_host(char *buf, size_t cap) {
  * see the native-time note. Those cases stay failing on purpose rather than
  * being tuned to the oracle.
  */
-static int shell_prompt_put(char *out, size_t *o, size_t cap, const char *s,
+static int shell_prompt_put(struct shell_sb *out, const char *s,
                             bool protect) {
     for (const char *p = s; *p; p++) {
         if (protect && (*p == '$' || *p == '`' || *p == '\\')) {
-            if (*o + 2 >= cap) return -1;
-            out[(*o)++] = '\\';
+            if (sb_putc(out, '\\') < 0) return -1;
         }
-        if (*o + 1 >= cap) return -1;
-        out[(*o)++] = *p;
+        if (sb_putc(out, *p) < 0) return -1;
     }
     return 0;
 }
 
-static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
-                               size_t cap) {
-    char dec[SHELL_PARSE_BUF_MAX];
-    size_t o = 0;
+static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
+    SH_SB(dec);
     char scratch[128];
 
-    for (const char *p = ps ? ps : ""; *p && o + 8 < sizeof dec; ) {
-        if (*p != '\\') { dec[o++] = *p++; continue; }
-        if (!p[1]) { dec[o++] = *p++; continue; }   /* a trailing lone \ */
+    for (const char *p = ps ? ps : ""; *p; ) {
+        if (*p != '\\') { if (sb_putc(&dec, *p++) < 0) return -1; continue; }
+        if (!p[1]) { if (sb_putc(&dec, *p++) < 0) return -1; continue; }   /* a trailing lone \ */
         p++;
         char c = *p++;
         switch (c) {
-        case 'a': dec[o++] = '\a'; break;
-        case 'e': dec[o++] = 0x1b; break;
-        case 'n': dec[o++] = '\n'; break;
-        case 'r': dec[o++] = '\r'; break;
-        case '\\': dec[o++] = '\\'; break;
+        case 'a': if (sb_putc(&dec, '\a') < 0) return -1; break;
+        case 'e': if (sb_putc(&dec, 0x1b) < 0) return -1; break;
+        case 'n': if (sb_putc(&dec, '\n') < 0) return -1; break;
+        case 'r': if (sb_putc(&dec, '\r') < 0) return -1; break;
+        case '\\': if (sb_putc(&dec, '\\') < 0) return -1; break;
         case '[': case ']': break;      /* non-printing markers: dropped */
         case '$': {
             /* ONLY THE `$` FORM NEEDS PROTECTING. Root's `#` is not special
@@ -17059,9 +17360,9 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
              * literal `\\#` in the prompt -- which is what the gate caught the
              * first time this ran as root. */
             struct proc *cur = current_proc();
-            if (cur && cur->uid == 0) { dec[o++] = '#'; break; }
-            dec[o++] = '\\';
-            dec[o++] = '$';
+            if (cur && cur->uid == 0) { if (sb_putc(&dec, '#') < 0) return -1; break; }
+            if (sb_putc(&dec, '\\') < 0) return -1;
+            if (sb_putc(&dec, '$') < 0) return -1;
             break;
         }
         case '0': case '1': case '2': case '3':
@@ -17072,15 +17373,15 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
             int n = 1;
             while (n < 3 && *p >= '0' && *p <= '7') { v = v * 8 + (unsigned)(*p++ - '0'); n++; }
             v &= 0xffu;
-            if (v == '$' || v == '`' || v == '\\') dec[o++] = '\\';
-            dec[o++] = (char)v;
+            if (v == '$' || v == '`' || v == '\\') if (sb_putc(&dec, '\\') < 0) return -1;
+            if (sb_putc(&dec, (char)v) < 0) return -1;
             break;
         }
         case 'u': {
             struct proc *cur = current_proc();
             const struct user *u = users_lookup_by_uid(cur ? cur->uid : 0);
             const char *nm = u ? u->name : env_get("USER");
-            if (shell_prompt_put(dec, &o, sizeof dec, nm ? nm : "user", true) < 0)
+            if (shell_prompt_put(&dec, nm ? nm : "user", true) < 0)
                 return -1;
             break;
         }
@@ -17094,7 +17395,7 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
                 sb[i] = '\0';
                 hn = sb;
             }
-            if (shell_prompt_put(dec, &o, sizeof dec, hn, true) < 0) return -1;
+            if (shell_prompt_put(&dec, hn, true) < 0) return -1;
             break;
         }
         case 'w': case 'W': {
@@ -17114,22 +17415,22 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
                 wb[1 + i] = '\0';
                 cwd = wb;
             }
-            if (shell_prompt_put(dec, &o, sizeof dec, cwd, true) < 0) return -1;
+            if (shell_prompt_put(&dec, cwd, true) < 0) return -1;
             break;
         }
         case 's':
-            if (shell_prompt_put(dec, &o, sizeof dec, "tsh", true) < 0) return -1;
+            if (shell_prompt_put(&dec, "tsh", true) < 0) return -1;
             break;
         case 'v':
-            if (shell_prompt_put(dec, &o, sizeof dec, "1.0", true) < 0) return -1;
+            if (shell_prompt_put(&dec, "1.0", true) < 0) return -1;
             break;
         case 'V':
-            if (shell_prompt_put(dec, &o, sizeof dec, "1.0.0", true) < 0) return -1;
+            if (shell_prompt_put(&dec, "1.0.0", true) < 0) return -1;
             break;
         case 'l':
             /* bash falls back to "tty" when stdin is not a terminal, which
              * is how every non-interactive run of this case reads. */
-            if (shell_prompt_put(dec, &o, sizeof dec, "tty", true) < 0) return -1;
+            if (shell_prompt_put(&dec, "tty", true) < 0) return -1;
             break;
         case 'j': {
             int live = 0;
@@ -17140,7 +17441,7 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
             if (shell_append_uint(scratch, &sp, sizeof scratch,
                                   (unsigned long)live) < 0) return -1;
             scratch[sp] = 0;
-            if (shell_prompt_put(dec, &o, sizeof dec, scratch, false) < 0) return -1;
+            if (shell_prompt_put(&dec, scratch, false) < 0) return -1;
             break;
         }
         case '!': case '#': {
@@ -17153,7 +17454,7 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
                                   (unsigned long)(g_hist_count + 1)) < 0)
                 return -1;
             scratch[sp2] = 0;
-            if (shell_prompt_put(dec, &o, sizeof dec, scratch, false) < 0) return -1;
+            if (shell_prompt_put(&dec, scratch, false) < 0) return -1;
             break;
         }
         case 't': case 'T': case '@': case 'A': case 'd': case 'D': {
@@ -17177,23 +17478,22 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
             civil_from_unix(shell_wall_secs(), &ct);
             char tb[256];
             if (civil_strftime(tb, sizeof tb, fmt, &ct) == 0) tb[0] = '\0';
-            if (shell_prompt_put(dec, &o, sizeof dec, tb, true) < 0) return -1;
+            if (shell_prompt_put(&dec, tb, true) < 0) return -1;
             break;
         }
         default:
             /* An UNKNOWN escape keeps both bytes: bash prints \x55 for
              * PS1='\x55', it does not decode hex. Emitting `\` then the
              * character lets pass two hand both through untouched. */
-            dec[o++] = '\\';
-            dec[o++] = c;
+            if (sb_putc(&dec, '\\') < 0) return -1;
+            if (sb_putc(&dec, c) < 0) return -1;
             break;
         }
     }
-    dec[o] = '\0';
 
-    char out[SHELL_PARSE_BUF_MAX];
-    if (shell_expand_word_ex(dec, out, sizeof out, false, false) < 0) return -1;
-    return shell_append_data_str(buf, pos, cap, out);
+    SH_SB(out);
+    if (shell_expand_word_ex(dec.p, &out, false, false) < 0) return -1;
+    return sb_put_data_n(b, out.p, out.len);
 }
 
 /* ${v@Q} and friends -- THE TRANSFORM OPERATORS, none of which existed:
@@ -17219,15 +17519,11 @@ static int shell_expand_prompt(const char *ps, char *buf, size_t *pos,
  * the table rather than a fix.
  */
 static int shell_expand_at_transform(const char *name, char opch,
-                                     char *buf, size_t *pos, size_t cap) {
-    char value[SHELL_PARSE_BUF_MAX];
+                                     struct shell_sb *b) {
+    SH_SB(value);
     bool is_set = false, vjoin = false;
-    if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0) {
-        kprintf("shell: parameter expansion too long\n");
-        return -1;
-    }
-    char out[SHELL_PARSE_BUF_MAX];
-    size_t o = 0;
+    if (shell_parameter_value(name, &value, &is_set, &vjoin) < 0) return -1;
+    SH_SB(out);
 
     if (opch == 'a' || opch == 'A') {
         /* The letters come from the flag table and the ARRAY table together:
@@ -17243,58 +17539,60 @@ static int shell_expand_at_transform(const char *name, char opch,
         if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
         if (f & SHVAR_EXPORTED)            at[an++] = 'x';
         at[an] = '\0';
-        if (opch == 'a') return shell_append_data_str(buf, pos, cap, at);
+        if (opch == 'a') return sb_put_data_str(b, at);
         /* @A -- the assignment statement. bash prints NOTHING for a name
          * that is not set, and prefixes `declare -a`/`-A` for an array. */
         if (!is_set) return 0;
         if (at[0] == 'a' || at[0] == 'A') {
             const char *dp = (at[0] == 'A') ? "declare -A " : "declare -a ";
-            for (const char *q = dp; *q && o + 1 < sizeof out; q++) out[o++] = *q;
+            if (sb_puts(&out, dp) < 0) return -1;
         }
-        for (const char *q = name; *q && o + 1 < sizeof out; q++) out[o++] = *q;
-        if (o + 1 < sizeof out) out[o++] = '=';
-        char tail[SHELL_PARSE_BUF_MAX];
-        size_t t = 0;
-        if (shell_quote_ansic(value, tail, sizeof tail, &t) < 0) return -1;
-        for (size_t i = 0; i < t && o + 1 < sizeof out; i++) out[o++] = tail[i];
-        out[o] = '\0';
-        return shell_append_data_str(buf, pos, cap, out);
+        if (sb_puts(&out, name) < 0 || sb_putc(&out, '=') < 0) return -1;
+        if (shell_quote_ansic(value.p, &out) < 0) return -1;
+        return sb_put_data_str(b, out.p);
     }
 
     switch (opch) {
     case 'P':
-        return shell_expand_prompt(value, buf, pos, cap);
+        return shell_expand_prompt(value.p, b);
     case 'Q':
-        if (shell_quote_ansic(value, out, sizeof out, &o) < 0) return -1;
+        if (shell_quote_ansic(value.p, &out) < 0) return -1;
         break;
     case 'E':
-        for (const char *p = value; *p && o + 4 < sizeof out; ) {
-            if (*p != '\\' || !p[1]) { out[o++] = *p++; continue; }
+        for (const char *p = value.p; *p; ) {
+            if (*p != '\\' || !p[1]) {
+                if (sb_putc(&out, *p++) < 0) return -1;
+                continue;
+            }
             p++;
             char eb[16];
             const char *save = p;
             int n = shell_ansic_escape(&p, eb);
-            if (n < 0) { out[o++] = '\\'; p = save; continue; }
+            if (n < 0) {
+                if (sb_putc(&out, '\\') < 0) return -1;
+                p = save;
+                continue;
+            }
             /* n == 0: the escape decodes to nothing, and nothing is written */
-            for (int i = 0; i < n && o + 1 < sizeof out; i++) out[o++] = eb[i];
+            if (n > 0 && sb_putmem(&out, eb, (size_t)n) < 0) return -1;
         }
         break;
     case 'U': case 'L': case 'u':
-        for (const char *p = value; *p && o + 1 < sizeof out; p++) {
+        for (const char *p = value.p; *p; p++) {
             char c = *p;
             if (opch == 'L')      { if (c >= 'A' && c <= 'Z') c = (char)(c + 32); }
             else if (opch == 'U') { if (c >= 'a' && c <= 'z') c = (char)(c - 32); }
-            else if (p == value && c >= 'a' && c <= 'z') c = (char)(c - 32);
-            out[o++] = c;
+            else if (p == value.p && c >= 'a' && c <= 'z') c = (char)(c - 32);
+            if (sb_putc(&out, c) < 0) return -1;
         }
         break;
     default:
         kprintf("shell: bad substitution\n");
         return -1;
     }
-    out[o] = '\0';
-    return vjoin ? shell_append_str(buf, pos, cap, out)
-                 : shell_append_data_str(buf, pos, cap, out);
+    /* As a C string, as before: an @E that decoded a NUL ends the value. */
+    return vjoin ? sb_puts(b, out.p)
+                 : sb_put_data_str(b, out.p);
 }
 
 /* ${v:off} and ${v:off:len} -- SUBSTRING EXPANSION, which tsh did not have at
@@ -17320,24 +17618,19 @@ static int shell_expand_at_transform(const char *name, char opch,
  *                                  which is why the list length is N+1
  */
 static int shell_expand_substring(const char *name, const char *spec,
-                                  char *buf, size_t *pos, size_t cap) {
+                                  struct shell_sb *b) {
     if (!spec || !*spec) {
         kprintf("shell: bad substitution\n");
         return -1;
     }
-    char sbuf[256];                 /* an arithmetic spec, not a value */
-    size_t sl = strlen(spec);
-    if (sl + 1 > sizeof sbuf) {
-        kprintf("shell: bad substitution\n");
-        return -1;
-    }
-    memcpy(sbuf, spec, sl + 1);
+    SH_SB(sbuf);                    /* an arithmetic spec, not a value */
+    if (sb_puts(&sbuf, spec) < 0) return -1;
     char *split = 0;
-    for (char *q = sbuf; *q; q++) if (*q == ':') { split = q; break; }
+    for (char *q = sbuf.p; *q; q++) if (*q == ':') { split = q; break; }
     bool have_len = (split != 0);
     if (split) *split = '\0';
     long off = 0, cnt = 0;
-    if (!sh_subscript_eval(sbuf, name, false, &off)) off = 0;
+    if (!sh_subscript_eval(sbuf.p, name, false, &off)) off = 0;
     if (have_len && !sh_subscript_eval(split + 1, name, false, &cnt)) cnt = 0;
 
     if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
@@ -17350,7 +17643,7 @@ static int shell_expand_substring(const char *name, const char *spec,
         const char *ifs = env_get("IFS");
         if (ifs && *ifs) sep = ifs[0];
         else if (ifs) sep = '\0';
-        if (!star && shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+        if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
             return -1;
         bool first = true;
         for (long i = off; i < end; i++) {
@@ -17359,34 +17652,31 @@ static int shell_expand_substring(const char *name, const char *spec,
             if (!v) continue;
             if (!first) {
                 if (!star) {
-                    if (shell_append_char(buf, pos, cap, SHELL_ARG_MARK) < 0)
+                    if (sb_putc(b, SHELL_ARG_MARK) < 0)
                         return -1;
                 } else if (sep) {
-                    if (shell_append_char(buf, pos, cap, sep) < 0) return -1;
+                    if (sb_putc(b, sep) < 0) return -1;
                 }
             }
             first = false;
-            if (shell_append_data_str(buf, pos, cap, v) < 0) return -1;
+            if (sb_put_data_str(b, v) < 0) return -1;
         }
         return 0;
     }
 
-    char value[SHELL_PARSE_BUF_MAX];
+    SH_SB(value);
     bool is_set = false, vjoin = false;
-    if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0) {
-        kprintf("shell: parameter expansion too long\n");
-        return -1;
-    }
+    if (shell_parameter_value(name, &value, &is_set, &vjoin) < 0) return -1;
     (void)is_set;                   /* an unset parameter slices to empty */
-    long n = (long)strlen(value);
+    long n = (long)value.len;
     if (off < 0) { off = n + off; if (off < 0) off = 0; }
     if (off > n) off = n;
     long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
     if (end > n) end = n;
     if (end < off) end = off;
     return vjoin
-        ? shell_append_n(buf, pos, cap, value + off, (size_t)(end - off))
-        : shell_append_data_n(buf, pos, cap, value + off, (size_t)(end - off));
+        ? sb_putn(b, value.p + off, (size_t)(end - off))
+        : sb_put_data_n(b, value.p + off, (size_t)(end - off));
 }
 
 /* Is `t` something bash will accept as the TARGET of an indirection?
@@ -17417,8 +17707,7 @@ static bool shell_indirect_target_ok(const char *t) {
     return false;
 }
 
-static int shell_expand_braced_parameter(const char *expr, char *buf,
-                                         size_t *pos, size_t cap) {
+static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     if (!expr) return -1;
 
     /* `${##...}` IS `$#` WITH A STRIP OPERATOR, NOT A LENGTH.
@@ -17472,26 +17761,23 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
      * THE RECURSION IS ONE FRAME DEEP, not open-ended -- the target is
      * validated to be a bare parameter designator, so it can never begin with
      * another `!`. bash agrees: `a='!a'; echo ${!a}` is an error, not a loop.
-     * The spliced expression is on the HEAP for the same reason `${...}`'s
-     * other big buffers are: SHELL_PARSE_BUF_MAX is 8 KiB and this frame
-     * already carries several, against a 32 KiB stack in the kernel build. */
+     * The reference's name and value, and the spliced expression, are all
+     * growable: none of them has a length limit in bash. */
     if (expr[0] == '!' && expr[1] && !length_mode) {
         size_t inlen = 0;
-        if (shell_parse_braced_name(expr + 1, &inlen) == 0 && inlen < 64) {
+        if (shell_parse_braced_name(expr + 1, &inlen) == 0) {
             const char *rest = expr + 1 + inlen;
-            char rname[64];
-            char refval[256];
+            SH_SB(rname);
+            SH_SB(refval);
             bool have_ref = false, ref_set = false;
-            memcpy(rname, expr + 1, inlen);
-            rname[inlen] = '\0';
-            refval[0] = '\0';
+            if (sb_putmem(&rname, expr + 1, inlen) < 0) return -1;
             /* ${!pre@} / ${!pre*} is a NAME LISTING, the third meaning of
              * this `!`. It has to be tested before anything else here: the
              * only thing separating it from an indirection with a transform
              * (${!ref@Q}) is that the `@` ends the expression. */
             if ((rest[0] == '@' || rest[0] == '*') && rest[1] == '\0')
-                return shell_expand_name_prefix(rname, rest[0] == '*',
-                                                buf, pos, cap);
+                return shell_expand_name_prefix(rname.p, rest[0] == '*',
+                                                b);
             if (rest[0] == '[') {
                 /* The reference is an ELEMENT -- but only when the subscript
                  * is an index or a key. `@` and `*` mean the whole array, and
@@ -17506,59 +17792,49 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                 size_t slen = rb ? (size_t)(rb - rest - 1) : 0;
                 if (rb && !(slen == 1 &&
                             (rest[1] == '@' || rest[1] == '*'))) {
-                    char sub[128];
-                    if (slen + 1 <= sizeof sub) {
-                        memcpy(sub, rest + 1, slen);
-                        sub[slen] = '\0';
-                        struct sh_array *ea = sh_array_find(rname);
-                        const char *v = 0;
-                        long aidx = 0;
-                        if (ea && ea->assoc) v = sh_array_get_key(rname, sub);
-                        else if (sh_subscript_eval(sub, rname, false, &aidx))
-                            v = sh_array_get(rname, aidx);
-                        if (v && strlen(v) + 1 <= sizeof refval) {
-                            memcpy(refval, v, strlen(v) + 1);
-                            ref_set = true;
-                        }
-                        have_ref = true;
-                        rest = rb + 1;
+                    SH_SB(sub);
+                    if (sb_putmem(&sub, rest + 1, slen) < 0) return -1;
+                    struct sh_array *ea = sh_array_find(rname.p);
+                    const char *v = 0;
+                    long aidx = 0;
+                    if (ea && ea->assoc) v = sh_array_get_key(rname.p, sub.p);
+                    else if (sh_subscript_eval(sub.p, rname.p, false, &aidx))
+                        v = sh_array_get(rname.p, aidx);
+                    if (v) {
+                        if (sb_set(&refval, v) < 0) return -1;
+                        ref_set = true;
                     }
+                    have_ref = true;
+                    rest = rb + 1;
                 }
             } else {
                 bool vjoin = false;
                 ref_set = true;
-                if (shell_parameter_value(rname, refval, sizeof refval,
+                if (shell_parameter_value(rname.p, &refval,
                                           &ref_set, &vjoin) < 0)
-                    refval[0] = '\0';
-                if (!ref_set) refval[0] = '\0';
+                    sb_truncate(&refval, 0);
+                if (!ref_set) sb_truncate(&refval, 0);
                 have_ref = true;
             }
             if (have_ref) {
-                if (!shell_indirect_target_ok(refval)) {
+                if (!shell_indirect_target_ok(refval.p)) {
                     /* bash splits the message on whether the REFERENCE was
                      * set, not on whether its value was empty. Both are
                      * status 1, the command is skipped, and the script
                      * carries on -- which is what g_bad_subst_soft means. */
                     if (!ref_set)
                         kprintf("shell: %s: invalid indirect expansion\n",
-                                rname);
+                                rname.p);
                     else
-                        kprintf("shell: %s: invalid variable name\n", refval);
+                        kprintf("shell: %s: invalid variable name\n", refval.p);
                     g_bad_subst_soft = true;
                     return -1;
                 }
-                size_t tl = strlen(refval), sl = strlen(rest);
-                if (tl + sl + 1 > SHELL_PARSE_BUF_MAX) {
-                    kprintf("shell: bad substitution\n");
+                SH_SB(nexpr);
+                if (sb_putmem(&nexpr, refval.p, refval.len) < 0 ||
+                    sb_puts(&nexpr, rest) < 0)
                     return -1;
-                }
-                char *nexpr = (char *)kmalloc(tl + sl + 1);
-                if (!nexpr) return -1;
-                memcpy(nexpr, refval, tl);
-                memcpy(nexpr + tl, rest, sl + 1);
-                int irc = shell_expand_braced_parameter(nexpr, buf, pos, cap);
-                kfree(nexpr);
-                return irc;
+                return shell_expand_braced_parameter(nexpr.p, b);
             }
         }
     }
@@ -17604,9 +17880,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                 }
             }
             if (rb) {
-                char nm[128];
-                if (nlen + 1 <= sizeof nm) {
-                    memcpy(nm, aexpr, nlen); nm[nlen] = '\0';
+                SH_SB(nmb);
+                if (sb_putmem(&nmb, aexpr, nlen) == 0) {
+                    const char *nm = nmb.p;
                     const char *sub = lb + 1;
                     size_t slen = (size_t)(rb - lb - 1);
                     const char *suffix = rb + 1;   /* "", ":1:2", "#pat", ... */
@@ -17617,19 +17893,16 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                     if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
                         suffix[0] == ':') {
                         bool star = (sub[0] == '*');
-                        char spec[192];
-                        size_t sfl = strlen(suffix + 1);
-                        if (sfl + 1 > sizeof spec) return 0;
-                        memcpy(spec, suffix + 1, sfl);
-                        spec[sfl] = '\0';
+                        SH_SB(spec);
+                        if (sb_puts(&spec, suffix + 1) < 0) return -1;
                         char *colon = 0;
-                        for (char *q = spec; *q; q++) if (*q == ':') { colon = q; break; }
+                        for (char *q = spec.p; *q; q++) if (*q == ':') { colon = q; break; }
                         if (colon) *colon = '\0';
                         long off = 0, cnt = -1;
-                        if (!sh_subscript_eval(spec, nm, false, &off)) off = 0;
+                        if (!sh_subscript_eval(spec.p, nm, false, &off)) off = 0;
                         if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
                             cnt = -1;
-                        return shell_append_array_slice(buf, pos, cap, nm,
+                        return shell_append_array_slice(b, nm,
                                                         star, off, cnt);
                     }
                     /* ${a[@]<op>} -- the operator DISTRIBUTES over elements
@@ -17650,16 +17923,14 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                         const char *ifs2 = env_get("IFS");
                         if (ifs2 && *ifs2) sep = ifs2[0];
                         else if (ifs2) sep = '\0';
-                        if (!star && shell_append_char(buf, pos, cap,
-                                                       SHELL_ARG_MARK) < 0)
+                        if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
                             if (i > 0) {
                                 if (!star) {
-                                    if (shell_append_char(buf, pos, cap,
-                                            SHELL_ARG_MARK) < 0) return -1;
+                                    if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
                                 } else if (sep &&
-                                    shell_append_char(buf, pos, cap, sep) < 0) {
+                                    sb_putc(b, sep) < 0) {
                                     return -1;
                                 }
                             }
@@ -17668,16 +17939,13 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                              * with the real machinery. */
                             if (env_set("SHELL_ARRAY_ELEM", arr->e[i].val) < 0)
                                 return -1;
-                            char sub_expr[512];
-                            size_t k = 0;
-                            const char *pfx = "SHELL_ARRAY_ELEM";
-                            for (const char *q = pfx; *q && k + 1 < sizeof sub_expr; q++)
-                                sub_expr[k++] = *q;
-                            for (const char *q = suffix; *q && k + 1 < sizeof sub_expr; q++)
-                                sub_expr[k++] = *q;
-                            sub_expr[k] = '\0';
-                            if (shell_expand_braced_parameter(sub_expr, buf,
-                                                              pos, cap) < 0) {
+                            SH_SB(sub_expr);
+                            if (sb_puts(&sub_expr, "SHELL_ARRAY_ELEM") < 0 ||
+                                sb_puts(&sub_expr, suffix) < 0) {
+                                (void)env_unset("SHELL_ARRAY_ELEM");
+                                return -1;
+                            }
+                            if (shell_expand_braced_parameter(sub_expr.p, b) < 0) {
                                 (void)env_unset("SHELL_ARRAY_ELEM");
                                 return -1;
                             }
@@ -17690,10 +17958,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                         bool star = (sub[0] == '*');
                         if (count) {                 /* ${#a[@]} -- COUNT */
                             struct sh_array *a = sh_array_find(nm);
-                            return shell_append_uint(buf, pos, cap,
-                                       (unsigned long)(a ? a->n : 0));
+                            return sb_put_uint(b, (unsigned long)(a ? a->n : 0));
                         }
-                        return shell_append_array_join(buf, pos, cap, nm,
+                        return shell_append_array_join(b, nm,
                                                        star, indices);
                     }
                     /* The subscript is an ARITHMETIC EXPRESSION -- a bare
@@ -17702,9 +17969,8 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                     {   /* ${m[key]} -- literal key, no arithmetic. */
                         struct sh_array *ea = sh_array_find(nm);
                         if (ea && ea->assoc && suffix[0] == '\0') {
-                            char kbuf[256];
-                            if (slen + 1 > sizeof kbuf) return 0;
-                            memcpy(kbuf, sub, slen); kbuf[slen] = '\0';
+                            SH_SB(kbuf);
+                            if (sb_putmem(&kbuf, sub, slen) < 0) return -1;
                             /* THE KEY IS A WORD: it expands, and its quotes
                              * come off. The two sides disagreed. `a[\"aa\"]=b`
                              * is an assignment word, so the ordinary path
@@ -17712,39 +17978,36 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
                              * lookup asked for the four characters
                              * `\"aa\"` and found nothing. Storing and reading the
                              * same literal did not round-trip. */
-                            char kx[256], kj[256];
-                            if (shell_expand_word_ex(kbuf, kx, sizeof kx,
+                            SH_SB(kx);
+                            SH_SB(kj);
+                            if (shell_expand_word_ex(kbuf.p, &kx,
                                                      true, true) >= 0 &&
-                                shell_argmarks_to_spaces(kx, kj,
-                                                         sizeof kj) >= 0) {
-                                memcpy(kbuf, kj, sizeof kbuf);
-                                kbuf[sizeof kbuf - 1] = '\0';
+                                shell_argmarks_to_spaces(kx.p, &kj) >= 0) {
+                                if (sb_set(&kbuf, kj.p) < 0) return -1;
                             }
-                            const char *v = sh_array_get_key(nm, kbuf);
+                            const char *v = sh_array_get_key(nm, kbuf.p);
                             if (count)
-                                return shell_append_uint(buf, pos, cap,
-                                    (unsigned long)(v ? strlen(v) : 0));
+                                return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
                             if (!v) return 0;
-                            return shell_append_data_str(buf, pos, cap, v);
+                            return sb_put_data_str(b, v);
                         }
                     }
-                    char subbuf[256];
+                    SH_SB(subbuf);
                     long idx = 0;
                     bool num = false;
                     /* A suffix on a single element (${a[0]#pat}) is a pattern
                      * operator, not handled here yet -- fall through rather
                      * than silently dropping it. */
-                    if (suffix[0] == '\0' && slen + 1 <= sizeof subbuf) {
-                        memcpy(subbuf, sub, slen); subbuf[slen] = '\0';
-                        num = sh_subscript_eval(subbuf, nm, false, &idx);
+                    if (suffix[0] == '\0') {
+                        if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
+                        num = sh_subscript_eval(subbuf.p, nm, false, &idx);
                     }
                     if (num) {
                         const char *v = sh_array_get(nm, idx);
                         if (count)                   /* ${#a[i]} -- LENGTH */
-                            return shell_append_uint(buf, pos, cap,
-                                       (unsigned long)(v ? strlen(v) : 0));
+                            return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
                         if (!v) return 0;            /* unset element: empty */
-                        return shell_append_data_str(buf, pos, cap, v);
+                        return sb_put_data_str(b, v);
                     }
                 }
             }
@@ -17775,13 +18038,9 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         return -1;
     }
 
-    char name[64];
-    if (name_len + 1 > sizeof(name)) {
-        kprintf("shell: parameter name too long\n");
-        return -1;
-    }
-    memcpy(name, expr, name_len);
-    name[name_len] = '\0';
+    SH_SB(nameb);                   /* bash has no limit on a name's length */
+    if (sb_putmem(&nameb, expr, name_len) < 0) return -1;
+    const char *name = nameb.p;
 
     const char *op = expr + name_len;
     bool colon = false;
@@ -17791,7 +18050,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         /* ${v@op} -- a ONE-LETTER TRANSFORM of the value, and the only
          * operator here that is a single character with nothing after it. */
         if (op[0] == '@' && op[1] && op[2] == '\0')
-            return shell_expand_at_transform(name, op[1], buf, pos, cap);
+            return shell_expand_at_transform(name, op[1], b);
 
         /* ---- ${v/pat/rep} and ${v^^} / ${v,,} ---------------------------
          *
@@ -17818,101 +18077,117 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
              * (nothing), a quoted `$'*'` stayed a wildcard, and a `$'\t'`
              * replacement was inserted with its marks still around it. */
             const char *div = shell_patsub_divider(op);
-            char patraw[SHELL_PARSE_BUF_MAX];
-            size_t pi = 0;
             const char *pend = div ? div : op + strlen(op);
-            while (op < pend && pi + 1 < sizeof patraw) patraw[pi++] = *op++;
-            patraw[pi] = '\0';
+            SH_SB(patraw);
+            if (sb_putmem(&patraw, op, (size_t)(pend - op)) < 0) return -1;
+            op = pend;
             const char *rep = div ? div + 1 : "";
 
-            char patexp[SHELL_PARSE_BUF_MAX];
-            if (shell_expand_word_ex(patraw, patexp, sizeof patexp, true, true) < 0)
+            SH_SB(patexp);
+            if (shell_expand_word_ex(patraw.p, &patexp, true, true) < 0)
                 return -1;
-            char pattern[SHELL_PARSE_BUF_MAX];
-            shell_pattern_from_marked(patexp, pattern, sizeof pattern);
-            char repl[SHELL_PARSE_BUF_MAX];
-            if (shell_expand_word_ex(rep, repl, sizeof repl, true, true) < 0)
+            SH_SB(patb);
+            if (shell_pattern_from_marked(patexp.p, &patb) < 0) return -1;
+            const char *pattern = patb.p;
+            const char *pat_end = patb.p + patb.len;
+            SH_SB(repl);
+            if (shell_expand_word_ex(rep, &repl, true, true) < 0)
                 return -1;
-            shell_strip_nosplit_inplace(repl);
+            shell_strip_nosplit_inplace(repl.p);
+            size_t rlen = strlen(repl.p);
 
-            char value[SHELL_PARSE_BUF_MAX];
+            SH_SB(valb);
             bool is_set = false, vjoin = false;
-            if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0)
+            if (shell_parameter_value(name, &valb, &is_set, &vjoin) < 0)
                 return -1;
-
-            size_t vlen = strlen(value);
+            const char *value = valb.p;
+            size_t vlen = valb.len;
             /* AN EMPTY PATTERN CHANGES NOTHING unless it is anchored:
              * bash gives `abc` for ${x///S} and ${x//''/S}, but `Sabc` and
              * `abcS` for ${x/#/S} and ${x/%/S}. */
             if (!pattern[0] && !at_start && !at_end)
-                return vjoin ? shell_append_str(buf, pos, cap, value)
-                             : shell_append_data_str(buf, pos, cap, value);
-            char out[SHELL_PARSE_BUF_MAX];
-            size_t o = 0;
+                return vjoin ? sb_puts(b, value)
+                             : sb_put_data_str(b, value);
+            /* WHICH LENGTHS CAN MATCH, AND WHERE. Trying every length at
+             * every position is O(n^2) matcher calls per substitution --
+             * minutes for ${x//e/E} on a 40 KB value, where bash is instant.
+             * bash prunes with the same two facts: a pattern with no `*` and
+             * no extglob group matches ONE length only, and one that starts
+             * with a literal byte can only match where that byte is. Both are
+             * exact, so the answer cannot change -- only the work does. And
+             * a candidate is a SLICE of the value handed to the matcher with
+             * its end, not a copy: copying it was another O(n) per try. */
+            long fixed = shell_pattern_fixed_len(pattern, pat_end);
+            int lead = shell_pattern_lead_byte(pattern, pat_end);
+            SH_SB(out);
             size_t i = 0;
             bool done_one = false;
-            char cand[SHELL_PARSE_BUF_MAX];
             /* THE END OF THE VALUE IS TRIED ONLY WHEN IT CAN BE THE MATCH:
              * an empty value, or a /% anchor. Otherwise a match that ran to
              * the end was followed by an empty match AT the end, and
              * ${x//*\/S} gave `SS` where bash gives `S`. (The backslash only
              * keeps this comment open.) */
-            while ((i < vlen || (i == vlen && (vlen == 0 || at_end))) &&
-                   o + 1 < sizeof out) {
+            while (i < vlen || (i == vlen && (vlen == 0 || at_end))) {
                 bool matched = false;
                 size_t mlen = 0;
-                if ((!done_one || all) && !(at_start && i != 0)) {
+                if ((!done_one || all) && !(at_start && i != 0) &&
+                    (lead < 0 ||
+                     (i < vlen && (unsigned char)value[i] == (unsigned)lead))) {
                     /* Longest match at this position, so a pattern ending in
                      * a star replaces as much as it can -- bash's behaviour --
                      * rather than a single character. (Deliberately not
                      * writing that pattern out: the star-slash inside it would
                      * close this comment.) */
-                    for (size_t L = vlen - i; ; L--) {
-                        if (L + 1 <= sizeof cand) {
-                            memcpy(cand, value + i, L);
-                            cand[L] = '\0';
-                            if ((!at_end || i + L == vlen) &&
-                                shell_glob_match(pattern, cand)) {
-                                matched = true; mlen = L; break;
-                            }
+                    size_t lmax = vlen - i, lmin = 0;
+                    if (at_end) lmin = lmax;          /* must reach the end */
+                    bool any = true;
+                    if (fixed >= 0) {
+                        if ((size_t)fixed > lmax || (size_t)fixed < lmin)
+                            any = false;
+                        else
+                            lmin = lmax = (size_t)fixed;
+                    }
+                    for (size_t L = lmax; any; L--) {
+                        if (shell_glob_match_e(pattern, pat_end,
+                                               value + i, value + i + L)) {
+                            matched = true; mlen = L; break;
                         }
-                        if (L == 0) break;
+                        if (L == lmin) break;
                     }
                 }
                 if (matched) {
-                    for (const char *q = repl; *q && o + 1 < sizeof out; q++)
-                        out[o++] = *q;
+                    if (sb_putmem(&out, repl.p, rlen) < 0) return -1;
                     done_one = true;
                     if (mlen == 0) {           /* empty match: do not spin */
-                        if (i < vlen && o + 1 < sizeof out) out[o++] = value[i];
+                        if (i < vlen && sb_putc(&out, value[i]) < 0) return -1;
                         i++;
                     } else {
                         i += mlen;
                     }
                     continue;
                 }
-                if (i < vlen && o + 1 < sizeof out) out[o++] = value[i];
+                if (i < vlen && sb_putc(&out, value[i]) < 0) return -1;
                 i++;
             }
-            out[o] = '\0';
-            return vjoin ? shell_append_str(buf, pos, cap, out)
-                         : shell_append_data_str(buf, pos, cap, out);
+            return vjoin ? sb_puts(b, out.p)
+                         : sb_put_data_str(b, out.p);
         }
         if (*op == '^' || *op == ',') {
             char cop = *op++;
             bool all = (*op == cop);
-            char value[SHELL_PARSE_BUF_MAX];
+            SH_SB(valb);
             bool is_set = false, vjoin = false;
-            if (shell_parameter_value(name, value, sizeof value, &is_set, &vjoin) < 0)
+            if (shell_parameter_value(name, &valb, &is_set, &vjoin) < 0)
                 return -1;
+            char *value = valb.p;
             for (size_t i = 0; value[i]; i++) {
                 char c = value[i];
                 if (cop == '^') { if (c >= 'a' && c <= 'z') value[i] = (char)(c - 32); }
                 else            { if (c >= 'A' && c <= 'Z') value[i] = (char)(c + 32); }
                 if (!all) break;          /* ${v^} touches the FIRST char only */
             }
-            return vjoin ? shell_append_str(buf, pos, cap, value)
-                         : shell_append_data_str(buf, pos, cap, value);
+            return vjoin ? sb_puts(b, value)
+                         : sb_put_data_str(b, value);
         }
         if (*op == '#' || *op == '%') {
             char strip_op = *op++;
@@ -17938,77 +18213,79 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
              * matched the two literal characters `$f`... against the value and
              * stripped the whole thing. The raw text was quote-stripped but
              * never expanded. */
-            char patraw[SHELL_PARSE_BUF_MAX];
+            SH_SB(patraw);
             /* Single quotes are SYNTAX in a strip pattern even inside double
              * quotes -- `echo -"${var#'a'}"-` strips the `a`. That differs
              * from the `${x:-WORD}` rule, where inside double quotes a single
              * quote is an ordinary byte, so this cannot share
              * shell_expand_param_word's answer. */
-            if (shell_expand_word_ex(op, patraw, sizeof patraw, true, true) < 0)
+            if (shell_expand_word_ex(op, &patraw, true, true) < 0)
                 return -1;
-            char patbuf[SHELL_PARSE_BUF_MAX];
-            shell_pattern_from_marked(patraw, patbuf, sizeof patbuf);
-            const char *pattern = patbuf;
+            SH_SB(patbuf);
+            if (shell_pattern_from_marked(patraw.p, &patbuf) < 0) return -1;
+            const char *pattern = patbuf.p;
+            const char *pat_end = patbuf.p + patbuf.len;
 
-            char value[SHELL_PARSE_BUF_MAX];
+            SH_SB(valb);
             bool is_set = false;
             bool vjoin = false;
-            if (shell_parameter_value(name, value, sizeof(value), &is_set,
-                                      &vjoin) < 0) {
-                kprintf("shell: parameter expansion too long\n");
+            if (shell_parameter_value(name, &valb, &is_set, &vjoin) < 0)
                 return -1;
-            }
+            const char *value = valb.p;
             if (length_mode)
-                return shell_append_uint(buf, pos, cap,
-                                         (unsigned long)strlen(value));
+                return sb_put_uint(b, (unsigned long)valb.len);
 
-            size_t vlen = strlen(value);
-            char tmp[SHELL_PARSE_BUF_MAX];
+            /* Each candidate is a slice handed to the matcher with its end:
+             * the old copy of every prefix into a scratch buffer, and the
+             * strlen the matcher ran on every suffix, made one strip O(n^2)
+             * before a single pattern character was compared. A fixed-length
+             * pattern can only match one prefix or suffix length. */
+            size_t vlen = valb.len;
+            const char *vend = value + vlen;
+            long fixed = shell_pattern_fixed_len(pattern, pat_end);
             if (strip_op == '#') {
                 if (greedy) {
                     for (size_t i = vlen; i > 0; i--) {
-                        memcpy(tmp, value, i);
-                        tmp[i] = '\0';
-                        if (shell_glob_match(pattern, tmp))
+                        if (fixed >= 0 && i != (size_t)fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value, value + i))
                             return vjoin
-                                ? shell_append_str(buf, pos, cap, value + i)
-                                : shell_append_data_str(buf, pos, cap,
-                                                        value + i);
+                                ? sb_puts(b, value + i)
+                                : sb_put_data_str(b, value + i);
                     }
                 } else {
                     for (size_t i = 0; i <= vlen; i++) {
-                        memcpy(tmp, value, i);
-                        tmp[i] = '\0';
-                        if (shell_glob_match(pattern, tmp))
+                        if (fixed >= 0 && i != (size_t)fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value, value + i))
                             return vjoin
-                                ? shell_append_str(buf, pos, cap, value + i)
-                                : shell_append_data_str(buf, pos, cap,
-                                                        value + i);
+                                ? sb_puts(b, value + i)
+                                : sb_put_data_str(b, value + i);
                     }
                 }
             } else {
                 if (greedy) {
                     for (size_t i = 0; i <= vlen; i++) {
-                        if (shell_glob_match(pattern, value + i))
+                        if (fixed >= 0 && vlen - i != (size_t)fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value + i, vend))
                             return vjoin
-                                ? shell_append_n(buf, pos, cap, value, i)
-                                : shell_append_data_n(buf, pos, cap, value, i);
+                                ? sb_putn(b, value, i)
+                                : sb_put_data_n(b, value, i);
                     }
                 } else {
                     for (size_t i = vlen; i > 0; i--) {
-                        if (shell_glob_match(pattern, value + i))
+                        if (fixed >= 0 && vlen - i != (size_t)fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value + i, vend))
                             return vjoin
-                                ? shell_append_n(buf, pos, cap, value, i)
-                                : shell_append_data_n(buf, pos, cap, value, i);
+                                ? sb_putn(b, value, i)
+                                : sb_put_data_n(b, value, i);
                     }
-                    if (shell_glob_match(pattern, value))
+                    if (shell_glob_match_e(pattern, pat_end, value, vend))
                         return vjoin
-                            ? shell_append_n(buf, pos, cap, value, 0)
-                            : shell_append_data_n(buf, pos, cap, value, 0);
+                            ? sb_putn(b, value, 0)
+                            : sb_put_data_n(b, value, 0);
                 }
             }
-            return vjoin ? shell_append_str(buf, pos, cap, value)
-                         : shell_append_data_str(buf, pos, cap, value);
+            return vjoin ? sb_puts(b, value)
+                         : sb_put_data_str(b, value);
         }
         if (*op == ':') {
             colon = true;
@@ -18021,21 +18298,19 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             /* A colon NOT followed by one of - = ? + is a SUBSTRING,
              * not a malformed default. This `else` is where all 31 of
              * the corpus's ${x:n} cases used to die. */
-            return shell_expand_substring(name, op, buf, pos, cap);
+            return shell_expand_substring(name, op, b);
         } else {
             kprintf("shell: bad substitution\n");
             return -1;
         }
     }
 
-    char value[SHELL_PARSE_BUF_MAX];
+    SH_SB(valb);
     bool is_set = false;
     bool is_join = false;
-    if (shell_parameter_value(name, value, sizeof(value), &is_set,
-                              &is_join) < 0) {
-        kprintf("shell: parameter expansion too long\n");
+    if (shell_parameter_value(name, &valb, &is_set, &is_join) < 0)
         return -1;
-    }
+    const char *value = valb.p;
     /* `$@` ARRIVES WITH FIELD MARKERS IN IT, so "is it null?" cannot be a
      * test on the first byte:
      *
@@ -18078,7 +18353,7 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             if (*q == SHELL_DATA_ESC && q[1]) q++;
             vlen++;
         }
-        return shell_append_uint(buf, pos, cap, (unsigned long)vlen);
+        return sb_put_uint(b, (unsigned long)vlen);
     }
 
     if (opch == '\0') {
@@ -18086,13 +18361,12 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
             kprintf("%s: unbound variable\n", name);
             return -1;
         }
-        return is_join ? shell_append_str(buf, pos, cap, value)
-                       : shell_append_data_str(buf, pos, cap, value);
+        return is_join ? sb_puts(b, value)
+                       : sb_put_data_str(b, value);
     }
 
     bool missing = !is_set || (colon && is_null);
-    char expanded_word[SHELL_PARSE_BUF_MAX];
-    expanded_word[0] = '\0';
+    SH_SB(ewb);                     /* the expanded WORD */
 
 /* The WORD of `${x-WORD}` is ONE value, so a `"$@"` inside it joins with a
  * space rather than making fields:
@@ -18115,53 +18389,52 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
  * A quoted span arrives wrapped in no-split markers, so a `~` that is still
  * the FIRST byte was unquoted; and g_dq_depth is what says whether the whole
  * substitution sits inside double quotes. tsh expanded none of the four. */
-#define SH_WORD_TILDE()                                                       do {                                                                          if (g_dq_depth == 0) shell_word_tilde(expanded_word,                                                            sizeof expanded_word);          } while (0)
+#define SH_WORD_TILDE()                                                       \
+    do {                                                                      \
+        if (g_dq_depth == 0 && shell_word_tilde(&ewb) < 0) return -1;         \
+    } while (0)
 
 #define SH_JOIN_WORD_MARKS()                                                  \
     do {                                                                      \
-        if (shell_word_has_argmark(expanded_word)) {                          \
-            char jw[SHELL_PARSE_BUF_MAX];                                     \
-            if (shell_argmarks_to_spaces(expanded_word, jw, sizeof jw) < 0)   \
-                return -1;                                                    \
-            memcpy(expanded_word, jw, strlen(jw) + 1);                        \
+        if (shell_word_has_argmark(ewb.p)) {                                  \
+            SH_SB(jw);                                                        \
+            if (shell_argmarks_to_spaces(ewb.p, &jw) < 0) return -1;          \
+            if (sb_set(&ewb, jw.p) < 0) return -1;                            \
         }                                                                     \
     } while (0)
 
     switch (opch) {
     case '-':
         if (!missing)
-            return is_join ? shell_append_str(buf, pos, cap, value)
-                           : shell_append_data_str(buf, pos, cap, value);
-        if (shell_expand_param_word(word, expanded_word,
-                                    sizeof(expanded_word)) < 0) return -1;
+            return is_join ? sb_puts(b, value)
+                           : sb_put_data_str(b, value);
+        if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
-        return shell_append_str(buf, pos, cap, expanded_word);
+        return sb_puts(b, ewb.p);
     case '=':
         if (!missing)
-            return is_join ? shell_append_str(buf, pos, cap, value)
-                           : shell_append_data_str(buf, pos, cap, value);
+            return is_join ? sb_puts(b, value)
+                           : sb_put_data_str(b, value);
         if (!shell_var_start(name[0])) {
             kprintf("shell: cannot assign to special parameter\n");
             return -1;
         }
-        if (shell_expand_param_word(word, expanded_word,
-                                    sizeof(expanded_word)) < 0) return -1;
+        if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
-        if (env_set(name, expanded_word) < 0) {
+        if (env_set(name, ewb.p) < 0) {
             kprintf("shell: failed to assign '%s'\n", name);
             return -1;
         }
-        return shell_append_str(buf, pos, cap, expanded_word);
+        return sb_puts(b, ewb.p);
     case '?':
         if (!missing)
-            return is_join ? shell_append_str(buf, pos, cap, value)
-                           : shell_append_data_str(buf, pos, cap, value);
-        if (shell_expand_param_word(word, expanded_word,
-                                    sizeof(expanded_word)) < 0) return -1;
+            return is_join ? sb_puts(b, value)
+                           : sb_put_data_str(b, value);
+        if (shell_expand_param_word(word, &ewb) < 0) return -1;
         kprintf("shell: %s: %s\n", name,
-                expanded_word[0] ? expanded_word : "parameter null or not set");
+                ewb.p[0] ? ewb.p : "parameter null or not set");
         /* XCU 2.6.2: the failing ?-form EXITS a non-interactive shell with
          * status 1, and a SUBSHELL exits even under an interactive parent.
          * tsh carried on with status 2 -- `( echo ${x:?}; echo not-reached )`
@@ -18174,11 +18447,10 @@ static int shell_expand_braced_parameter(const char *expr, char *buf,
         return -1;
     case '+':
         if (missing) return 0;
-        if (shell_expand_param_word(word, expanded_word,
-                                    sizeof(expanded_word)) < 0) return -1;
+        if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
-        return shell_append_str(buf, pos, cap, expanded_word);
+        return sb_puts(b, ewb.p);
     default:
         return -1;
     }
@@ -18804,13 +19076,18 @@ static bool shell_arith_dequote(char *expr) {
     return true;
 }
 
-static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
-                              size_t cap) {
+static int shell_expand_arith(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
     if (p[0] != '$' || p[1] != '(' || p[2] != '(') return -1;
     p += 3;
 
-    char expr[256];
+    /* The expression is a piece of the source, so the source's length
+     * always holds it. It was a 256-byte array: a longer `$(( ))` was
+     * "arithmetic expression too long" in tsh and fine in bash. */
+    SH_SB(exprb);
+    if (sb_grow(&exprb, strlen(p) + 3) < 0) return -1;
+    char *expr = exprb.p;
+    const size_t expr_cap = exprb.cap;
     size_t epos = 0;
     int paren_depth = 0;
     while (*p) {
@@ -18828,15 +19105,8 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                  * it as literal text and died as "bad arithmetic expansion".
                  * Expanding first also makes `$(($x + 1))` and `${#a}` work
                  * inside arithmetic for free. */
-                char *xexpr = kmalloc(SHELL_PARSE_BUF_MAX);
-                if (xexpr) {
-                    if (shell_expand_literal_quotes(expr, xexpr,
-                                                    SHELL_PARSE_BUF_MAX) == 0 &&
-                        strlen(xexpr) < sizeof(expr)) {
-                        memcpy(expr, xexpr, strlen(xexpr) + 1);
-                    }
-                    kfree(xexpr);
-                }
+                SH_SB(xexpr);
+                if (shell_expand_literal_quotes(expr, &xexpr) == 0) expr = xexpr.p;
                 struct shell_arith a = { .p = expr, .ok = true };
                 long v = shell_arith_expr(&a);
                 shell_arith_skip(&a);
@@ -18851,11 +19121,11 @@ static int shell_expand_arith(const char **pp, char *buf, size_t *pos,
                     g_bad_subst_soft = true;
                     return -1;
                 }
-                return shell_append_long(buf, pos, cap, v);
+                return sb_put_long(b, v);
             }
             if (paren_depth > 0) paren_depth--;
         }
-        if (epos + 1 >= sizeof(expr)) {
+        if (epos + 1 >= expr_cap) {
             kprintf("shell: arithmetic expression too long\n");
             return -1;
         }
@@ -18960,17 +19230,15 @@ static bool shell_procsub_make(const char *text, bool input,
     if (input) {
         const char *fw = shell_capture_is_file_read(text);
         if (fw) {
-            char wcopy[SHELL_PARSE_BUF_MAX];
-            size_t wl = strlen(fw);
-            if (wl + 1 <= sizeof wcopy) {
-                memcpy(wcopy, fw, wl + 1);
-                while (wl > 0 && (wcopy[wl - 1] == ' ' || wcopy[wl - 1] == '\t'))
-                    wcopy[--wl] = '\0';
-                char fpath[SHELL_PARSE_BUF_MAX];
-                if (shell_expand_word_ex(wcopy, fpath, sizeof fpath,
-                                         true, true) == 0) {
-                    shell_strip_nosplit_inplace(fpath);
-                    struct file *ff = shell_open_vfs_file(fpath, false, false,
+            SH_SB(wcopy);
+            if (sb_puts(&wcopy, fw) == 0) {
+                while (wcopy.len > 0 && (wcopy.p[wcopy.len - 1] == ' ' ||
+                                         wcopy.p[wcopy.len - 1] == '\t'))
+                    sb_truncate(&wcopy, wcopy.len - 1);
+                SH_SB(fpath);
+                if (shell_expand_word_ex(wcopy.p, &fpath, true, true) == 0) {
+                    shell_strip_nosplit_inplace(fpath.p);
+                    struct file *ff = shell_open_vfs_file(fpath.p, false, false,
                                                           "shell");
                     if (!ff) return false;
                     int fwant = SHELL_PROCSUB_FD_TOP - g_procsub_n;
@@ -19059,44 +19327,42 @@ static bool shell_operator_char(char c) {
     return c == ';' || c == '&' || c == '|' || c == '<' || c == '>';
 }
 
-static int shell_expand_var(const char **pp, char *buf, size_t *pos,
-                            size_t cap) {
+static int shell_expand_var(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
-    if (*p != '$') return shell_append_char(buf, pos, cap, *p++);
+    if (*p != '$') return sb_putc(b, *p++);
     p++;
 
     if (*p == '(' && p[1] == '(') {
         p--;
         *pp = p;
-        return shell_expand_arith(pp, buf, pos, cap);
+        return shell_expand_arith(pp, b);
     }
     if (*p == '(') {
         p--;
         *pp = p;
-        return shell_expand_command_subst(pp, buf, pos, cap);
+        return shell_expand_command_subst(pp, b);
     }
     if (*p == '?') {
         p++;
         *pp = p;
-        return shell_append_uint(buf, pos, cap, (unsigned long)g_last_status);
+        return sb_put_uint(b, (unsigned long)g_last_status);
     }
     if (*p == '!') {
         p++;
         *pp = p;
-        return shell_append_uint(buf, pos, cap, (unsigned long)g_last_bg_pid);
+        return sb_put_uint(b, (unsigned long)g_last_bg_pid);
     }
     if (*p == '$') {
         p++;
         *pp = p;
         int pid = g_shell_pid;
         if (pid < 0) { struct proc *cur = current_proc(); pid = cur ? cur->pid : 0; }
-        return shell_append_uint(buf, pos, cap, (unsigned long)pid);
+        return sb_put_uint(b, (unsigned long)pid);
     }
     if (*p == '#') {
         p++;
         *pp = p;
-        return shell_append_uint(buf, pos, cap,
-                                 (unsigned long)g_positional_count);
+        return sb_put_uint(b, (unsigned long)g_positional_count);
     }
     if (*p == '-') {
         p++;
@@ -19115,33 +19381,30 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         if (g_opt_xtrace)    opts[oi++] = 'x';
         if (g_opt_noclobber) opts[oi++] = 'C';
         opts[oi] = '\0';
-        return shell_append_str(buf, pos, cap, opts);
+        return sb_puts(b, opts);
     }
     if (*p == '*') {
         p++;
         *pp = p;
-        return shell_append_positional_join(buf, pos, cap, true);
+        return shell_append_positional_join(b, true);
     }
     if (*p == '@') {
         p++;
         *pp = p;
-        return shell_append_positional_join(buf, pos, cap, false);
+        return shell_append_positional_join(b, false);
     }
     if (*p >= '0' && *p <= '9') {
         int idx = *p++ - '0';
         *pp = p;
         if (idx == 0) {
-            return shell_append_str(buf, pos, cap,
-                                    g_param0 ? g_param0 : "tobysh");
+            return sb_puts(b, g_param0 ? g_param0 : "tobysh");
         }
         if (idx <= g_positional_count) {
-            return shell_append_data_str(buf, pos, cap,
-                                        g_positional[idx - 1]);
+            return sb_put_data_str(b, g_positional[idx - 1]);
         }
         return 0;
     }
 
-    char name[64];
     size_t n = 0;
     if (*p == '{') {
         /* MATCH THE BRACE, DO NOT JUST FIND THE NEXT ONE.
@@ -19155,7 +19418,12 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
          * nests a brace group inside a command substitution, and one counter
          * would let the group's `}` close the substitution's `(`. */
         p++;
-        char expr[LINE_MAX];
+        /* The expression is a piece of the source, so the source's length
+         * always holds it; LINE_MAX (512) made a longer ${...} "too long". */
+        SH_SB(exprb);
+        if (sb_grow(&exprb, strlen(p) + 3) < 0) return -1;
+        char *expr = exprb.p;
+        const size_t expr_cap = exprb.cap;
         char closers[16];
         int csp = 0;
         closers[csp++] = '}';
@@ -19165,7 +19433,7 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         bool sq = false, dq = false, sq_ansi = false;
         while (*p && csp > 0) {
             char c = *p;
-            if (n + 2 >= sizeof(expr)) {
+            if (n + 2 >= expr_cap) {
                 kprintf("shell: ${...} too long\n");
                 return -1;
             }
@@ -19193,7 +19461,7 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
             if (c == '"')  { dq = true; expr[n++] = *p++; continue; }
             if (c == '`') {
                 expr[n++] = *p++;
-                while (*p && *p != '`' && n + 2 < sizeof(expr)) {
+                while (*p && *p != '`' && n + 2 < expr_cap) {
                     if (*p == '\\' && p[1]) expr[n++] = *p++;
                     expr[n++] = *p++;
                 }
@@ -19226,24 +19494,29 @@ static int shell_expand_var(const char **pp, char *buf, size_t *pos,
         }
         expr[n] = '\0';
         *pp = p;
-        return shell_expand_braced_parameter(expr, buf, pos, cap);
-    } else if (shell_var_start(*p)) {
-        while (shell_var_char(*p) && n + 1 < sizeof(name)) name[n++] = *p++;
-    } else {
-        if (shell_append_char(buf, pos, cap, '$') < 0) return -1;
+        return shell_expand_braced_parameter(expr, b);
+    }
+    if (!shell_var_start(*p)) {
+        if (sb_putc(b, '$') < 0) return -1;
         *pp = p;
         return 0;
     }
-    name[n] = '\0';
+    /* A NAME RUNS TO ITS END. It was cut at 63 bytes and the rest left in
+     * the word as text; bash has no limit. */
+    while (shell_var_char(p[n])) n++;
+    SH_SB(nameb);
+    if (sb_putmem(&nameb, p, n) < 0) return -1;
+    const char *name = nameb.p;
+    p += n;
     *pp = p;
     const char *val = env_get(name);
     if (!val && strcmp(name, "LINENO") == 0)
-        return shell_append_uint(buf, pos, cap, g_shell_lineno);
+        return sb_put_uint(b, g_shell_lineno);
     if (!val && g_opt_nounset) {
         kprintf("%s: unbound variable\n", name);
         return -1;
     }
-    return shell_append_data_str(buf, pos, cap, val);
+    return sb_put_data_str(b, val);
 }
 
 static bool g_tok_word_expanded;
@@ -19286,8 +19559,7 @@ static bool shell_is_digit(char c) {
  * tokenization is safe: a substitution records its status when it finishes,
  * which is after every tokenizer it started has already run. */
 static bool shell_glob_meta(char c);
-static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
-                                   size_t from);
+static int shell_escape_glob_range(struct shell_sb *b, size_t from);
 
 /* ---- BRACE EXPANSION ------------------------------------------------ *
  *
@@ -19310,28 +19582,28 @@ static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
  *   - a quoted `"{a,b}"`, which is a four-character string.
  */
 
-#define SH_BRACE_DEPTH_MAX 8
+/* How many groups one word may nest or chain. Each level is a small frame
+ * now that the pieces are growable (it was 8, with an 8 KiB array a level);
+ * the OUTPUT has no limit at all. */
+#define SH_BRACE_DEPTH_MAX 64
 
-static int shell_brace_word(const char *w, size_t wlen, char *out,
-                            size_t *pos, size_t cap, int depth);
+static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
+                            int depth);
 
 /* Emit one finished word, separated from the previous by a space. */
-static int shell_brace_emit(const char *s, size_t n, char *out, size_t *pos,
-                            size_t cap) {
-    if (*pos > 0 && out[*pos - 1] != ' ') {
-        if (shell_append_char(out, pos, cap, ' ') < 0) return -1;
+static int shell_brace_emit(const char *s, size_t n, struct shell_sb *out) {
+    if (out->len > 0 && out->p[out->len - 1] != ' ') {
+        if (sb_putc(out, ' ') < 0) return -1;
     }
-    for (size_t i = 0; i < n; i++)
-        if (shell_append_char(out, pos, cap, s[i]) < 0) return -1;
-    return 0;
+    return sb_putmem(out, s, n);
 }
 
 /* `{1..5}` / `{5..1}` / `{a..e}`. Returns 1 if it expanded, 0 if the body is
- * not a range, -1 on overflow. */
+ * not a range, -1 when memory ran out. */
 static int shell_brace_range(const char *body, size_t blen,
                              const char *pre, size_t prelen,
                              const char *post, size_t postlen,
-                             char *out, size_t *pos, size_t cap, int depth) {
+                             struct shell_sb *out, int depth) {
     /* Find the `..` that separates the endpoints. */
     size_t dots = 0;
     bool found = false;
@@ -19371,30 +19643,38 @@ static int shell_brace_range(const char *body, size_t blen,
     if (alpha) { a = lo[0]; b = hi[0]; }
 
     long dir = (a <= b) ? step : -step;
-    char piece[SHELL_PARSE_BUF_MAX];
-    int guard = 0;
-    for (long v = a; (dir > 0 ? v <= b : v >= b) && guard < 4096; v += dir, guard++) {
-        size_t pp = 0;
-        for (size_t i = 0; i < prelen; i++)
-            if (shell_append_char(piece, &pp, sizeof piece, pre[i]) < 0) return -1;
+    /* EVERY ITEM, as bash gives them. The loop used to stop at 4096 items,
+     * so `{1..5000}` quietly lost its last 904. What stops it now is only
+     * the end of the range -- checked before the step, on the UNSIGNED gap
+     * (exact even across the whole of `long`), so a range that ends near
+     * LONG_MAX cannot wrap around and run for ever. */
+    unsigned long ustep = (dir > 0) ? (unsigned long)dir
+                                    : (unsigned long)0 - (unsigned long)dir;
+    SH_SB(piece);
+    for (long v = a; ; ) {
+        sb_truncate(&piece, 0);
+        if (sb_putmem(&piece, pre, prelen) < 0) return -1;
         if (alpha) {
-            if (shell_append_char(piece, &pp, sizeof piece, (char)v) < 0) return -1;
+            if (sb_putc(&piece, (char)v) < 0) return -1;
         } else {
-            if (shell_append_long(piece, &pp, sizeof piece, v) < 0) return -1;
+            if (sb_put_long(&piece, v) < 0) return -1;
         }
-        for (size_t i = 0; i < postlen; i++)
-            if (shell_append_char(piece, &pp, sizeof piece, post[i]) < 0) return -1;
-        if (shell_brace_word(piece, pp, out, pos, cap, depth + 1) < 0) return -1;
+        if (sb_putmem(&piece, post, postlen) < 0) return -1;
+        if (shell_brace_word(piece.p, piece.len, out, depth + 1) < 0) return -1;
+        unsigned long gap = (dir > 0) ? (unsigned long)b - (unsigned long)v
+                                      : (unsigned long)v - (unsigned long)b;
+        if (gap < ustep) break;
+        v += dir;
     }
     return 1;
 }
 
 /* Expand the FIRST top-level group in `w`; the rest arrive by recursion on
  * each result, which is what makes `{a,b}{c,d}` produce four words. */
-static int shell_brace_word(const char *w, size_t wlen, char *out,
-                            size_t *pos, size_t cap, int depth) {
+static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
+                            int depth) {
     if (depth >= SH_BRACE_DEPTH_MAX)
-        return shell_brace_emit(w, wlen, out, pos, cap);
+        return shell_brace_emit(w, wlen, out);
 
     size_t open = 0;
     size_t close = 0;
@@ -19455,7 +19735,7 @@ static int shell_brace_word(const char *w, size_t wlen, char *out,
             if (have) break;
         }
     }
-    if (!have) return shell_brace_emit(w, wlen, out, pos, cap);
+    if (!have) return shell_brace_emit(w, wlen, out);
 
     const char *pre = w;
     size_t prelen = open;
@@ -19464,50 +19744,52 @@ static int shell_brace_word(const char *w, size_t wlen, char *out,
     const char *post = w + close + 1;
     size_t postlen = wlen - close - 1;
 
-    /* Split the body on TOP-LEVEL commas. */
-    size_t comma[64];
-    int ncomma = 0;
-    {
-        int nest = 0;
-        bool sq = false, dq = false;
-        for (size_t i = 0; i < blen; i++) {
-            char c = body[i];
-            if (sq) { if (c == '\'') sq = false; continue; }
-            if (dq) {
-                if (c == '\\' && i + 1 < blen) { i++; continue; }
-                if (c == '"') dq = false;
-                continue;
-            }
-            if (c == '\'') { sq = true; continue; }
-            if (c == '"')  { dq = true; continue; }
-            if (c == '\\' && i + 1 < blen) { i++; continue; }
-            if (c == '{' || c == '(') { nest++; continue; }
-            if (c == '}' || c == ')') { if (nest > 0) nest--; continue; }
-            if (c == ',' && nest == 0 && ncomma < 64) comma[ncomma++] = i;
-        }
-    }
-
-    if (ncomma == 0) {
-        int r = shell_brace_range(body, blen, pre, prelen, post, postlen,
-                                  out, pos, cap, depth);
-        if (r < 0) return -1;
-        if (r == 1) return 0;
-        /* Neither a list nor a range: the braces are ordinary characters. */
-        return shell_brace_emit(w, wlen, out, pos, cap);
-    }
-
-    char piece[SHELL_PARSE_BUF_MAX];
+    /* Split the body on TOP-LEVEL commas -- found one at a time, so there is
+     * no limit on how many. They were collected into a 64-entry array, and a
+     * 65th comma was silently not a separator: the last alternative came out
+     * with the rest of the list glued to it. A top-level comma is always
+     * outside quotes and at nesting zero, so each scan can start fresh from
+     * the previous one. */
     size_t start = 0;
-    for (int k = 0; k <= ncomma; k++) {
-        size_t end = (k == ncomma) ? blen : comma[k];
-        size_t pp = 0;
-        for (size_t i = 0; i < prelen; i++)
-            if (shell_append_char(piece, &pp, sizeof piece, pre[i]) < 0) return -1;
-        for (size_t i = start; i < end; i++)
-            if (shell_append_char(piece, &pp, sizeof piece, body[i]) < 0) return -1;
-        for (size_t i = 0; i < postlen; i++)
-            if (shell_append_char(piece, &pp, sizeof piece, post[i]) < 0) return -1;
-        if (shell_brace_word(piece, pp, out, pos, cap, depth + 1) < 0) return -1;
+    bool any_comma = false;
+    SH_SB(piece);
+    for (;;) {
+        size_t end = blen;
+        {
+            int nest = 0;
+            bool sq = false, dq = false;
+            for (size_t i = start; i < blen; i++) {
+                char c = body[i];
+                if (sq) { if (c == '\'') sq = false; continue; }
+                if (dq) {
+                    if (c == '\\' && i + 1 < blen) { i++; continue; }
+                    if (c == '"') dq = false;
+                    continue;
+                }
+                if (c == '\'') { sq = true; continue; }
+                if (c == '"')  { dq = true; continue; }
+                if (c == '\\' && i + 1 < blen) { i++; continue; }
+                if (c == '{' || c == '(') { nest++; continue; }
+                if (c == '}' || c == ')') { if (nest > 0) nest--; continue; }
+                if (c == ',' && nest == 0) { end = i; break; }
+            }
+        }
+        if (!any_comma && end == blen) {
+            int r = shell_brace_range(body, blen, pre, prelen, post, postlen,
+                                      out, depth);
+            if (r < 0) return -1;
+            if (r == 1) return 0;
+            /* Neither a list nor a range: the braces are ordinary characters. */
+            return shell_brace_emit(w, wlen, out);
+        }
+        any_comma = true;
+        sb_truncate(&piece, 0);
+        if (sb_putmem(&piece, pre, prelen) < 0 ||
+            sb_putmem(&piece, body + start, end - start) < 0 ||
+            sb_putmem(&piece, post, postlen) < 0)
+            return -1;
+        if (shell_brace_word(piece.p, piece.len, out, depth + 1) < 0) return -1;
+        if (end == blen) break;
         start = end + 1;
     }
     return 0;
@@ -19602,8 +19884,7 @@ static size_t shell_arr_literal_close(const char *s, size_t len, int *depth) {
 /* Rewrite a whole line, expanding the braces in each word. Words are split on
  * unquoted blanks and on the operator characters, so `echo a;echo {x,y}`
  * keeps its `;` and `> {a,b}` keeps its redirection. */
-static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
-    size_t pos = 0;
+static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
     const char *p = src;
     /* AN ASSIGNMENT'S VALUE IS NOT BRACE-EXPANDED.
      *
@@ -19623,10 +19904,10 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
      * held for the REST of that command: `declare`'s options sit between the
      * name and the assignments and must not clear it. */
     bool assign_cmd = false;
-    out[0] = '\0';
+    sb_truncate(out, 0);
     while (*p) {
         if (*p == ' ' || *p == '\t' || *p == '\n') {
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
         if (*p == ';' || *p == '|' || *p == '&' || *p == '<' || *p == '>' ||
@@ -19639,7 +19920,7 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
             }
             cmd_pos = true;
             assign_cmd = false;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
         const char *w = p;
@@ -19701,8 +19982,7 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
         /* A word with nothing to expand is copied through untouched, which
          * keeps the emit function's space-separation out of the common
          * path -- it must not insert one in the middle of `a;b`. */
-        char tmp[SHELL_PARSE_BUF_MAX];
-        size_t tp = 0;
+        SH_SB(tmp);
         if (is_assign && vstart < wlen && w[vstart] == '(') {
             /* AN ARRAY LITERAL IS NOT A SCALAR VALUE. The rule above -- an
              * assignment's value is not brace-expanded -- is about the
@@ -19713,21 +19993,18 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
              *
              * `name=(` is copied through, the inside is expanded, and the
              * closing `)` with anything after it is copied again. */
-            for (size_t i = 0; i <= vstart && tp + 1 < sizeof tmp; i++)
-                tmp[tp++] = w[i];
+            if (sb_putmem(&tmp, w, vstart + 1) < 0) return -1;
             int depth = 1;
             size_t inner = vstart + 1;
             size_t close = shell_arr_literal_close(w + inner, wlen - inner,
                                                    &depth);
             if (shell_arr_elem_is_assign(w + inner, close)) {
-                for (size_t i = 0; i < close && tp + 1 < sizeof tmp; i++)
-                    tmp[tp++] = w[inner + i];
-            } else if (shell_brace_word(w + inner, close, tmp, &tp,
-                                        sizeof tmp, 0) < 0) {
+                if (sb_putmem(&tmp, w + inner, close) < 0) return -1;
+            } else if (shell_brace_word(w + inner, close, &tmp, 0) < 0) {
                 return -1;
             }
-            for (size_t i = inner + close; i < wlen && tp + 1 < sizeof tmp; i++)
-                tmp[tp++] = w[i];
+            if (sb_putmem(&tmp, w + inner + close, wlen - inner - close) < 0)
+                return -1;
             arr_depth = depth;          /* zero when it closed in this word */
         } else if (is_assign && assign_prefix) {
             /* A SCALAR assignment PREFIX keeps its braces: `x={a,b}` is one
@@ -19736,25 +20013,22 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
              * words `x=a` and `x=b`, declare runs both, and `b` is what
              * survives. Same bytes, opposite answers, decided by position;
              * only the array-literal `(` above is treated alike in both. */
-            for (size_t i = 0; i < wlen && tp + 1 < sizeof tmp; i++)
-                tmp[tp++] = w[i];
+            if (sb_putmem(&tmp, w, wlen) < 0) return -1;
         } else if (arr_depth > 0) {
             /* A continuation word of a literal opened in an earlier word. */
             int depth = arr_depth;
             size_t close = shell_arr_literal_close(w, wlen, &depth);
             if (shell_arr_elem_is_assign(w, close)) {
-                for (size_t i = 0; i < close && tp + 1 < sizeof tmp; i++)
-                    tmp[tp++] = w[i];
-            } else if (shell_brace_word(w, close, tmp, &tp, sizeof tmp, 0) < 0) {
+                if (sb_putmem(&tmp, w, close) < 0) return -1;
+            } else if (shell_brace_word(w, close, &tmp, 0) < 0) {
                 return -1;
             }
-            for (size_t i = close; i < wlen && tp + 1 < sizeof tmp; i++)
-                tmp[tp++] = w[i];
+            if (sb_putmem(&tmp, w + close, wlen - close) < 0) return -1;
             arr_depth = depth;
-        } else if (shell_brace_word(w, wlen, tmp, &tp, sizeof tmp, 0) < 0) {
+        } else if (shell_brace_word(w, wlen, &tmp, 0) < 0) {
             return -1;
         } else if (cmd_pos_here &&
-                   (tp != wlen || memcmp(tmp, w, wlen) != 0)) {
+                   (tmp.len != wlen || memcmp(tmp.p, w, wlen) != 0)) {
             /* ASSIGNMENT RECOGNITION HAPPENED ALREADY, on the word as
              * written. `{v,x}=X` is not a NAME= word, so it is a COMMAND --
              * and the `v=X` that brace expansion then produces is that
@@ -19762,73 +20036,70 @@ static int shell_expand_braces_line(const char *src, char *out, size_t cap) {
              * the `=` with the same byte the tokenizer uses for a quoted one
              * carries that decision past the expansion; struct shell_simple
              * already reads it back as arg_noassign. */
-            char marked[SHELL_PARSE_BUF_MAX];
-            size_t mp = 0;
+            SH_SB(marked);
+            const char *tb = tmp.p;
+            const size_t tp = tmp.len;
             size_t i = 0;
             while (i < tp) {
                 size_t start = i;
-                while (i < tp && tmp[i] != ' ') i++;
+                while (i < tp && tb[i] != ' ') i++;
                 size_t k = start;
-                while (k < i && ((tmp[k] >= 'A' && tmp[k] <= 'Z') ||
-                                 (tmp[k] >= 'a' && tmp[k] <= 'z') ||
-                                 (tmp[k] >= '0' && tmp[k] <= '9') ||
-                                 tmp[k] == '_'))
+                while (k < i && ((tb[k] >= 'A' && tb[k] <= 'Z') ||
+                                 (tb[k] >= 'a' && tb[k] <= 'z') ||
+                                 (tb[k] >= '0' && tb[k] <= '9') ||
+                                 tb[k] == '_'))
                     k++;
                 for (size_t q = start; q < i; q++) {
-                    if (q == k && k > start && tmp[k] == '=' &&
-                        mp + 1 < sizeof marked)
-                        marked[mp++] = SHELL_GLOB_ESC;
-                    if (mp + 1 < sizeof marked) marked[mp++] = tmp[q];
+                    if (q == k && k > start && tb[k] == '=' &&
+                        sb_putc(&marked, SHELL_GLOB_ESC) < 0)
+                        return -1;
+                    if (sb_putc(&marked, tb[q]) < 0) return -1;
                 }
-                while (i < tp && tmp[i] == ' ')
-                    if (mp + 1 < sizeof marked) marked[mp++] = tmp[i++];
-                    else i++;
+                while (i < tp && tb[i] == ' ')
+                    if (sb_putc(&marked, tb[i++]) < 0) return -1;
             }
-            if (mp < sizeof tmp) { memcpy(tmp, marked, mp); tp = mp; }
+            if (sb_set(&tmp, marked.p) < 0) return -1;
         }
-        for (size_t i = 0; i < tp; i++)
-            if (shell_append_char(out, &pos, cap, tmp[i]) < 0) return -1;
+        if (sb_putmem(out, tmp.p, tmp.len) < 0) return -1;
     }
-    out[pos] = '\0';
     return 0;
 }
 
 static int shell_tokenize_inner(const char *src, struct shell_token *tok,
-                                int *out_ntok, char *words, size_t word_cap);
+                                int *out_ntok, struct shell_words *words);
 static int shell_tokenize_outer(const char *src, struct shell_token *tok,
-                                int *out_ntok, char *words, size_t word_cap);
+                                int *out_ntok, struct shell_words *words);
 
 /* BRACE EXPANSION HAPPENS BEFORE ANYTHING ELSE READS THE WORD, which is what
  * makes `x={a,b}; echo $x` print the braces back: by the time `$x` produces
  * them, this pass has already gone by. */
+/* The words' text lives in `words`, which the CALLER owns: token pointers
+ * stay good until the caller frees it (SH_WORDS does that at the end of its
+ * scope, the lifetime the old stack array gave them). */
 static int shell_tokenize(const char *src, struct shell_token *tok,
-                          int *out_ntok, char *words, size_t word_cap) {
+                          int *out_ntok, struct shell_words *words) {
     /* Each read gets its own prefix overlay; a command substitution re-enters
      * here and must not clear the one belonging to the line around it. */
     int saved_tokpfx = g_tokpfx_n;
     g_tokpfx_n = 0;
-    int rc_outer = shell_tokenize_outer(src, tok, out_ntok, words, word_cap);
+    int rc_outer = shell_tokenize_outer(src, tok, out_ntok, words);
     g_tokpfx_n = saved_tokpfx;
     return rc_outer;
 }
 
 static int shell_tokenize_outer(const char *src, struct shell_token *tok,
-                                int *out_ntok, char *words, size_t word_cap) {
+                                int *out_ntok, struct shell_words *words) {
     if (src && shell_has_brace(src)) {
-        char *expanded = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
-        if (expanded) {
-            int rc = shell_expand_braces_line(src, expanded,
-                                              SHELL_PARSE_BUF_MAX);
-            if (rc == 0) {
-                rc = shell_tokenize_inner(expanded, tok, out_ntok, words,
-                                          word_cap);
-                kfree(expanded);
-                return rc;
-            }
-            kfree(expanded);
-        }
+        /* The expansion grows as far as it has to: `echo {1..20000}` is
+         * 108 KB of words. A fixed buffer made a big one fail, and a failed
+         * brace expansion fell back to the RAW text -- so tsh printed the
+         * braces back where bash printed the numbers. */
+        SH_SB(expanded);
+        if (shell_expand_braces_line(src, &expanded) < 0)
+            return -1;                  /* only memory can fail it now */
+        return shell_tokenize_inner(expanded.p, tok, out_ntok, words);
     }
-    return shell_tokenize_inner(src, tok, out_ntok, words, word_cap);
+    return shell_tokenize_inner(src, tok, out_ntok, words);
 }
 
 /* `<(cmd)` and `>(cmd)` are WORDS, and the word is the /dev/fd path the
@@ -19837,7 +20108,7 @@ static int shell_tokenize_outer(const char *src, struct shell_token *tok,
  * buffer -- token text is a pointer INTO that buffer, never a copy. */
 static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
                                   const char **pp, bool input,
-                                  char *words, size_t *wpos, size_t word_cap) {
+                                  struct shell_words *words) {
     const char *body = *pp + 2;            /* past the `<(` */
     const char *q = body;
     int depth = 1;
@@ -19869,16 +20140,8 @@ static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
     kfree(text);
     if (!ok) return -1;
 
-    char *start = words + *wpos;
-    for (const char *c = path; *c; c++)
-        if (shell_append_char(words, wpos, word_cap, *c) < 0) {
-            kprintf("shell: word too long\n");
-            return -1;
-        }
-    if (shell_append_char(words, wpos, word_cap, '\0') < 0) {
-        kprintf("shell: parse buffer full\n");
-        return -1;
-    }
+    char *start = words_store(words, path, strlen(path));
+    if (!start) return -1;
     /* Quoted: the path is a finished word. Nothing in it should be split on
      * IFS or matched against the filesystem. */
     if (shell_emit_token(tok, ntok, SH_TOK_WORD, start, true) < 0) return -1;
@@ -19886,9 +20149,9 @@ static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
     return 0;
 }
 static int shell_tokenize_inner(const char *src, struct shell_token *tok,
-                                int *out_ntok, char *words, size_t word_cap) {
+                                int *out_ntok, struct shell_words *words) {
     int ntok = 0;
-    size_t wpos = 0;
+    SH_SB(wb);                      /* the word being built */
     const char *p = src;
     bool prefix_ok = true;          /* still in the command's assignment prefix */
     /* A DECLARATION UTILITY takes ASSIGNMENTS as its operands, so an
@@ -19954,15 +20217,13 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
         if (*p == '<' && p[1] == '(') {
             /* `<(cmd)` IS NOT A REDIRECTION. See the process substitution
              * block: the construct is a word, and the word is a path. */
-            if (shell_tokenize_procsub(tok, &ntok, &p, true,
-                                       words, &wpos, word_cap) < 0) return -1;
+            if (shell_tokenize_procsub(tok, &ntok, &p, true, words) < 0) return -1;
             prefix_ok = false;
             g_tokpfx_n = 0;
             continue;
         }
         if (*p == '>' && p[1] == '(') {
-            if (shell_tokenize_procsub(tok, &ntok, &p, false,
-                                       words, &wpos, word_cap) < 0) return -1;
+            if (shell_tokenize_procsub(tok, &ntok, &p, false, words) < 0) return -1;
             prefix_ok = false;
             g_tokpfx_n = 0;
             continue;
@@ -20016,7 +20277,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             continue;
         }
 
-        char *start = words + wpos;
+        sb_truncate(&wb, 0);
         bool got = false;
 
         if (literal_word) {
@@ -20032,17 +20293,15 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 else if (*p == '"')  { ldq = true; p++; continue; }
                 else if (*p == '\\' && p[1]) { p++; }
                 got = true;
-                if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                if (sb_putc(&wb,*p++) < 0) {
                     kprintf("shell: word too long\n");
                     return -1;
                 }
             }
             if (got) {
-                if (shell_append_char(words, &wpos, word_cap, '\0') < 0) {
-                    kprintf("shell: parse buffer full\n");
-                    return -1;
-                }
-                if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, true) < 0)
+                char *stored = words_store(words, wb.p, wb.len);
+                if (!stored) return -1;
+                if (shell_emit_token(tok, &ntok, SH_TOK_WORD, stored, true) < 0)
                     return -1;
             }
             continue;
@@ -20075,7 +20334,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
          * defined. */
         bool lit_open = false;
 #define SH_LIT_CLOSE() do { if (lit_open) { \
-        if (shell_append_char(words, &wpos, word_cap, SHELL_NOSPLIT_MARK) < 0) \
+        if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) \
             return -1; lit_open = false; } } while (0)
         /* Depth of an assignment-position subscript, if we are inside one.
          * A blank does not end the word while it is non-zero -- see the
@@ -20128,7 +20387,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 char nmbuf[64];
                 size_t nmlen = 0;
                 bool nmok = true;
-                for (char *z = start; z < words + wpos; z++) {
+                for (char *z = wb.p; z < wb.p + wb.len; z++) {
                     if (*z == SHELL_ARG_MARK || *z == SHELL_NOSPLIT_MARK ||
                         *z == SHELL_GLOB_ESC) continue;
                     if (nmlen + 1 >= sizeof nmbuf) { nmok = false; break; }
@@ -20178,10 +20437,10 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              *
              * The operator is already in the word, so the test is the byte
              * before, exactly as the [[ ]] splitter does it. */
-            if (*p == '(' && g_shopt_extglob && eg_depth == 0 && wpos > 0 &&
-                (words[wpos-1] == '?' || words[wpos-1] == '*' ||
-                 words[wpos-1] == '+' || words[wpos-1] == '@' ||
-                 words[wpos-1] == '!')) {
+            if (*p == '(' && g_shopt_extglob && eg_depth == 0 && wb.len > 0 &&
+                (wb.p[wb.len-1] == '?' || wb.p[wb.len-1] == '*' ||
+                 wb.p[wb.len-1] == '+' || wb.p[wb.len-1] == '@' ||
+                 wb.p[wb.len-1] == '!')) {
                 /* ENTER the group; every byte of it still travels the
                  * ordinary path below. The first cut COPIED the span raw
                  * and that was wrong for the same reason it was wrong for
@@ -20200,13 +20459,13 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
             } else if (eg_depth > 0 && *p == ')') {
                 eg_depth--;
             }
-            if (*p == '(' && wpos > 0 && words[wpos - 1] == '=' &&
+            if (*p == '(' && wb.len > 0 && wb.p[wb.len - 1] == '=' &&
                 (prefix_ok || decl_util_cmd)) {
                 int depth = 0;
                 do {
                     if (*p == '(') depth++;
                     else if (*p == ')') depth--;
-                    if (shell_append_char(words, &wpos, word_cap, *p) < 0)
+                    if (sb_putc(&wb,*p) < 0)
                         return -1;
                     p++;
                 } while (*p && depth > 0);
@@ -20232,9 +20491,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                  * An escape-produced byte arrives here data-escaped (0x04 +
                  * a byte in 0x01..0x04), and none of those is a glob
                  * character, so the range escape passes over them intact. */
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
-                size_t ansi_start = wpos;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t ansi_start = wb.len;
                 bool stop_nul = false;      /* a NUL ends the word; see below */
                 while (*p && *p != '\'') {
                     if (*p == '\\' && p[1]) {
@@ -20266,7 +20524,7 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * the word machinery saw an argument boundary where
                          * the script had asked for a byte.
                          *
-                         * shell_append_data_n escapes exactly these four the
+                         * sb_put_data_n escapes exactly these four the
                          * way every other expansion output is escaped, and
                          * shell_strip_glob_escapes takes the escape back off
                          * at the end of word processing -- so the raw byte
@@ -20279,22 +20537,19 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                          * A LITERAL character between the quotes cannot
                          * collide -- it came from the script text. */
                         if (!stop_nul &&
-                            shell_append_data_n(words, &wpos, word_cap,
-                                                ub, (size_t)un) < 0)
+                            sb_put_data_n(&wb,ub, (size_t)un) < 0)
                             return -1;
                     } else {
                         /* Ordinary characters after the NUL are consumed and dropped
                          * too -- the word ended at the NUL. */
                         if (!stop_nul &&
-                            shell_append_char(words, &wpos, word_cap, *p) < 0)
+                            sb_putc(&wb,*p) < 0)
                             return -1;
                         p++;
                     }
                 }
-                if (shell_escape_glob_range(words, &wpos, word_cap,
-                                            ansi_start) < 0) return -1;
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
+                if (shell_escape_glob_range(&wb,ansi_start) < 0) return -1;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p == '\'') p++;
                 continue;
             }
@@ -20304,19 +20559,16 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 p++;
                 /* Mark the span so the splitter can see where quoting starts
                  * and stops WITHIN the word -- `$a"$b"` splits in the middle. */
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
-                size_t sq_start = wpos;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t sq_start = wb.len;
                 while (*p && *p != '\'') {
-                    if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                    if (sb_putc(&wb,*p++) < 0) {
                         kprintf("shell: word too long\n");
                         return -1;
                     }
                 }
-                if (shell_escape_glob_range(words, &wpos, word_cap,
-                                            sq_start) < 0) return -1;
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
+                if (shell_escape_glob_range(&wb,sq_start) < 0) return -1;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '\'') {
                     kprintf("shell: unmatched single quote\n");
                     return -1;
@@ -20329,9 +20581,8 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                 word_quoted = true;
                 p++;
                 g_dq_depth++;
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
-                size_t dq_start = wpos;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
+                size_t dq_start = wb.len;
                 while (*p && *p != '"') {
                     if (*p == '\\' && p[1]) {
                         /* POSIX 2.2.3: inside double quotes a backslash is
@@ -20349,34 +20600,32 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                         if (nxt == '\n') { p += 2; continue; }
                         if (nxt != '$' && nxt != '`' && nxt != '"' &&
                             nxt != '\\' && nxt != '\n') {
-                            if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                            if (sb_putc(&wb,*p++) < 0) {
                                 kprintf("shell: word too long\n");
                                 return -1;
                             }
                             continue;
                         }
                         p++;
-                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                        if (sb_putc(&wb,*p++) < 0) {
                             kprintf("shell: word too long\n");
                             return -1;
                         }
                     } else if (*p == '$') {
-                        if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                        if (shell_expand_var(&p, &wb) < 0) return -1;
                     } else if (*p == '`') {
-                        if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                        if (shell_expand_backtick(&p, &wb) < 0) return -1;
                         g_tok_word_expanded = true;
                     } else {
-                        if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                        if (sb_putc(&wb,*p++) < 0) {
                             kprintf("shell: word too long\n");
                             return -1;
                         }
                     }
                 }
                 g_dq_depth--;
-                if (shell_escape_glob_range(words, &wpos, word_cap,
-                                            dq_start) < 0) return -1;
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
+                if (shell_escape_glob_range(&wb,dq_start) < 0) return -1;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
                     kprintf("shell: unmatched double quote\n");
                     return -1;
@@ -20397,12 +20646,11 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
                  * match a file actually named `[`. The escape comes off again
                  * where the word becomes an argument. */
                 if ((shell_glob_meta(*p) || *p == '=') &&
-                    shell_append_char(words, &wpos, word_cap,
-                                      SHELL_GLOB_ESC) < 0) {
+                    sb_putc(&wb,SHELL_GLOB_ESC) < 0) {
                     kprintf("shell: word too long\n");
                     return -1;
                 }
-                if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+                if (sb_putc(&wb,*p++) < 0) {
                     kprintf("shell: word too long\n");
                     return -1;
                 }
@@ -20414,22 +20662,21 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              * with whatever the last inner word did. */
             if (*p == '`') {
                 SH_LIT_CLOSE();
-                if (shell_expand_backtick(&p, words, &wpos, word_cap) < 0) return -1;
+                if (shell_expand_backtick(&p, &wb) < 0) return -1;
                 g_tok_word_expanded = true;
                 continue;
             }
             if (*p == '$') {
                 SH_LIT_CLOSE();
-                if (shell_expand_var(&p, words, &wpos, word_cap) < 0) return -1;
+                if (shell_expand_var(&p, &wb) < 0) return -1;
                 g_tok_word_expanded = true;
                 continue;
             }
             if (!lit_open) {
-                if (shell_append_char(words, &wpos, word_cap,
-                                      SHELL_NOSPLIT_MARK) < 0) return -1;
+                if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 lit_open = true;
             }
-            if (shell_append_char(words, &wpos, word_cap, *p++) < 0) {
+            if (sb_putc(&wb,*p++) < 0) {
                 kprintf("shell: word too long\n");
                 return -1;
             }
@@ -20438,10 +20685,11 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
 #undef SH_LIT_CLOSE
 
         if (got) {
-            if (shell_append_char(words, &wpos, word_cap, '\0') < 0) {
-                kprintf("shell: parse buffer full\n");
-                return -1;
-            }
+            /* The finished word moves to storage that never moves again --
+             * the token keeps a pointer to it -- and `wb` is reused for the
+             * next one. */
+            char *start = words_store(words, wb.p, wb.len);
+            if (!start) return -1;
             if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
             /* A PREFIX ASSIGNMENT IS IN FORCE FOR THE WORDS AFTER IT. See
              * g_tokpfx. `prefix_ok` is the same command-position rule the
@@ -20449,13 +20697,16 @@ static int shell_tokenize_inner(const char *src, struct shell_token *tok,
              * ends the prefix, and a separator starts a new one. */
             if (prefix_ok && g_tok_word_assign_src) {
                 if (g_tokpfx_n < SHELL_TOKPFX_MAX) {
-                    char plain[256];
+                    size_t sl = strlen(start);
+                    char *plain = (char *)kmalloc(sl + 1);
+                    if (!plain) return -1;
                     size_t o = 0;
-                    for (const char *q = start; *q && o + 1 < sizeof plain; q++)
+                    for (const char *q = start; *q; q++)
                         if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC)
                             plain[o++] = *q;
                     plain[o] = '\0';
-                    memcpy(g_tokpfx[g_tokpfx_n++], plain, o + 1);
+                    if (g_tokpfx[g_tokpfx_n]) kfree(g_tokpfx[g_tokpfx_n]);
+                    g_tokpfx[g_tokpfx_n++] = plain;
                 }
             } else {
                 /* The command word itself: remember whether it is a
@@ -20510,42 +20761,42 @@ static bool shell_alias_already_used(const char *name) {
     return false;
 }
 
-static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
+static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                                      bool *changed) {
     const char *p = src ? src : "";
-    size_t pos = 0;
     bool at_cmd = true;
     *changed = false;
+    sb_truncate(out, 0);
 
     while (*p) {
         if (*p == '#') {
-            if (shell_append_str(out, &pos, cap, p) < 0) return -1;
+            if (sb_puts(out, p) < 0) return -1;
             break;
         }
 
         if (is_space(*p)) {
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
 
         if (*p == ';') {
             at_cmd = true;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
         if (*p == '&') {
             at_cmd = true;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             if (*p == '&') {
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
             continue;
         }
         if (*p == '|') {
             at_cmd = true;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             if (*p == '|') {
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
             continue;
         }
@@ -20561,13 +20812,13 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
          * "/bin/echo_: failed to launch". */
         if (*p == '(' || *p == '{') {
             at_cmd = true;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
         if (*p == '$' && p[1] == '(' && p[2] != '(') {
             at_cmd = true;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
 
@@ -20591,7 +20842,7 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                 while (*r == ' ' || *r == '\t') r++;
                 while (*r && !is_space(*r) && !shell_operator_char(*r)) r++;
                 while (p < r)
-                    if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                    if (sb_putc(out, *p++) < 0) return -1;
                 continue;                                 /* at_cmd survives */
             }
 
@@ -20610,7 +20861,7 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                         a++;
                     }
                     while (p < a)
-                        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                        if (sb_putc(out, *p++) < 0) return -1;
                     continue;                             /* at_cmd survives */
                 }
             }
@@ -20651,18 +20902,15 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                     if (g_alias_depth < SHELL_ALIAS_DEPTH_MAX) {
                         ksnprintf(g_alias_active[g_alias_depth], 64, "%s", name);
                         g_alias_depth++;
-                        char *sub_buf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
-                        if (!sub_buf) { g_alias_depth--; return -1; }
+                        SH_SB(sub_buf);
                         bool sub_changed = false;
-                        int rc = shell_expand_aliases_once(av, sub_buf,
-                                                           SHELL_PARSE_BUF_MAX,
+                        int rc = shell_expand_aliases_once(av, &sub_buf,
                                                            &sub_changed);
                         g_alias_depth--;
-                        if (rc < 0) { kfree(sub_buf); return -1; }
-                        int arc = shell_append_str(out, &pos, cap, sub_buf);
-                        kfree(sub_buf);
-                        if (arc < 0) return -1;
-                    } else if (shell_append_str(out, &pos, cap, av) < 0) {
+                        if (rc < 0) return -1;
+                        if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
+                            return -1;
+                    } else if (sb_puts(out, av) < 0) {
                         return -1;
                     }
                     *changed = true;
@@ -20674,10 +20922,7 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
                     continue;
                 }
             }
-            if (pos + n + 1 > cap) return -1;
-            memcpy(out + pos, start, n);
-            pos += n;
-            out[pos] = '\0';
+            if (sb_putmem(out, start, n) < 0) return -1;
             at_cmd = false;
             continue;
         }
@@ -20685,22 +20930,20 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
         if (*p == '\'' || *p == '"') {
             char quote = *p;
             at_cmd = false;
-            if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (sb_putc(out, *p++) < 0) return -1;
             while (*p && *p != quote) {
                 if (*p == '\\' && quote == '"' && p[1]) {
-                    if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                    if (sb_putc(out, *p++) < 0) return -1;
                 }
-                if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
             }
-            if (*p && shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+            if (*p && sb_putc(out, *p++) < 0) return -1;
             continue;
         }
 
         at_cmd = false;
-        if (shell_append_char(out, &pos, cap, *p++) < 0) return -1;
+        if (sb_putc(out, *p++) < 0) return -1;
     }
-
-    out[pos] = '\0';
     return 0;
 }
 
@@ -20709,28 +20952,27 @@ static int shell_expand_aliases_once(const char *src, char *out, size_t cap,
  * (the recursion guard, and g_dq_depth, which says whether the word being
  * expanded is inside double quotes), and the outer word still needs both:
  * `echo "$(al)"` would finish its word as if it were unquoted. */
-static const char *shell_expand_aliases_nested(const char *src, char *buf,
-                                               size_t cap) {
+static const char *shell_expand_aliases_nested(const char *src,
+                                               struct shell_sb *buf) {
     int saved_alias_depth = g_alias_depth;
     int saved_dq_depth = g_dq_depth;
-    const char *r = shell_expand_aliases(src, buf, cap);
+    const char *r = shell_expand_aliases(src, buf);
     g_alias_depth = saved_alias_depth;
     g_dq_depth = saved_dq_depth;
     return r;
 }
 
-static const char *shell_expand_aliases(const char *src, char *buf,
-                                        size_t cap) {
-    char tmp[SHELL_PARSE_BUF_MAX];
+/* The result is `src` itself when nothing was substituted, else `buf->p`;
+ * 0 only when memory ran out. There is no length limit either way. */
+static const char *shell_expand_aliases(const char *src,
+                                        struct shell_sb *buf) {
     const char *cur = src ? src : "";
     bool changed = false;
-
 
     /* ONE pass. The expander recurses into each replacement itself, carrying
      * the name it is replacing, so there is nothing left for a second pass to
      * find -- and no pass counter to run out, which used to be the only
      * symptom of `alias echo='echo foo'`. */
-    (void)tmp;
     g_alias_depth = 0;
     /* Alias expansion runs once per line, before anything else, so this is the
      * one place that reliably sees a line boundary. An expansion that failed
@@ -20738,8 +20980,8 @@ static const char *shell_expand_aliases(const char *src, char *buf,
      * grew too long -- returns without decrementing, and a leaked depth would
      * make the NEXT line treat ${x:-'a'} as if it were quoted. */
     g_dq_depth = 0;
-    if (shell_expand_aliases_once(cur, buf, cap, &changed) < 0) {
-        kprintf("alias: expansion too long\n");
+    if (shell_expand_aliases_once(cur, buf, &changed) < 0) {
+        kprintf("alias: out of memory\n");
         return 0;
     }
     /* NOTHING SUBSTITUTED, SO HAND BACK THE ORIGINAL. The rewritten copy is
@@ -20749,7 +20991,7 @@ static const char *shell_expand_aliases(const char *src, char *buf,
      * that: the reader records where each physical line landed in the
      * joined buffer, and a silently different buffer threw the map away. */
     if (!changed) return cur;
-    return buf;
+    return buf->p;
 }
 
 static bool shell_is_list_sep(enum shell_tok_type t) {
@@ -20764,14 +21006,8 @@ static void shell_simple_init(struct shell_simple *s) {
 static int shell_pipeline_save_word(struct shell_pipeline *pl,
                                     const char *s, char **out) {
     if (!pl || !s || !out) return -1;
-    size_t n = strlen(s);
-    if (pl->expand_pos + n + 1 > sizeof(pl->expand_buf)) {
-        kprintf("shell: expansion buffer full\n");
-        return -1;
-    }
-    char *dst = pl->expand_buf + pl->expand_pos;
-    memcpy(dst, s, n + 1);
-    pl->expand_pos += n + 1;
+    char *dst = words_store(&pl->words, s, strlen(s));
+    if (!dst) return -1;
     *out = dst;
     return 0;
 }
@@ -20792,14 +21028,14 @@ static int shell_pipeline_save_word(struct shell_pipeline *pl,
  * therefore escapes the metacharacters as it leaves a quoted span, exactly as
  * shell_case_unquote already does for a case pattern, and the escapes are
  * stripped again at the one place a word becomes an argument. */
-static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
-                                   size_t from) {
+static int shell_escape_glob_range(struct shell_sb *b, size_t from) {
     size_t extra = 0;
-    for (size_t i = from; i < *pos; i++)
-        if (shell_glob_meta(buf[i]) || buf[i] == '=') extra++;
+    for (size_t i = from; i < b->len; i++)
+        if (shell_glob_meta(b->p[i]) || b->p[i] == '=') extra++;
     if (extra == 0) return 0;
-    if (*pos + extra + 1 >= cap) return -1;
-    size_t src = *pos, dst = *pos + extra;
+    if (sb_grow(b, b->len + extra + 1) < 0) return -1;
+    char *buf = b->p;                   /* after the grow: it may have moved */
+    size_t src = b->len, dst = b->len + extra;
     while (src > from) {
         char c = buf[--src];
         buf[--dst] = c;
@@ -20809,8 +21045,8 @@ static int shell_escape_glob_range(char *buf, size_t *pos, size_t cap,
          * remembers the `=` was quoted. */
         if (shell_glob_meta(c) || c == '=') buf[--dst] = SHELL_GLOB_ESC;
     }
-    *pos += extra;
-    buf[*pos] = '\0';
+    b->len += extra;
+    buf[b->len] = '\0';
     return 0;
 }
 
@@ -21163,6 +21399,86 @@ static bool shell_glob_match(const char *pat, const char *name) {
     return shell_glob_match_e(pat, pat + strlen(pat), name, name + strlen(name));
 }
 
+/* Where the bracket expression opening at `p` ends (one past its `]`), or 0
+ * when it never closes -- and then the matcher reads the `[` as a literal.
+ * The same walk as shell_glob_bracket, step for step, so the two can never
+ * disagree about where a bracket stops; like it, it runs to the NUL. */
+static const char *shell_glob_bracket_end(const char *p) {
+    const char *q = p + 1;
+    if (*q == '!' || *q == '^') q++;
+    if (*q == ']') q++;
+    while (*q) {
+        if (*q == ']') return q + 1;
+        if (q[0] == '[' && q[1] == ':') {
+            const char *end = q + 2;
+            while (*end && *end != ':') end++;
+            if (end[0] == ':' && end[1] == ']') { q = end + 2; continue; }
+        }
+        if ((*q == '\\' || *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) &&
+            q[1]) {
+            q += 2;
+            continue;
+        }
+        if (q[1] == '-' && q[2] && q[2] != ']') { q += 3; continue; }
+        q++;
+    }
+    return 0;
+}
+
+/* THE ONE LENGTH every match of `pat` has, or -1 when it can vary.
+ *
+ * Every element shell_glob_match_e knows -- a literal, an escaped byte, `?`,
+ * a bracket expression, closed or not -- consumes exactly one character.
+ * Only `*` and an extglob group (a WELL-FORMED one: an unclosed `@(` is a
+ * literal `@`, and `*(` unclosed is still a star) consume a varying amount.
+ * The pattern operators use this to try one candidate length instead of
+ * all of them, which is the whole difference between linear and quadratic
+ * on a large value; it is exact, so it never changes an answer. */
+static long shell_pattern_fixed_len(const char *pat, const char *pend) {
+    long n = 0;
+    const char *p = pat;
+    while (p < pend) {
+        if ((*p == '?' || *p == '*' || *p == '+' || *p == '@' || *p == '!') &&
+            p + 1 < pend && p[1] == '(' && eg_close_paren(p + 1, pend))
+            return -1;
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
+            p + 1 < pend) {
+            p += 2;
+            n++;
+            continue;
+        }
+        if (*p == '*') return -1;
+        if (*p == '[') {
+            const char *e = shell_glob_bracket_end(p);
+            p = e ? e : p + 1;
+            n++;
+            continue;
+        }
+        p++;
+        n++;
+    }
+    return n;
+}
+
+/* The byte every match of `pat` must START with, or -1 when there is no
+ * single one (a `*`, `?`, bracket or group comes first, or the pattern can
+ * match the empty string). A position whose byte differs cannot match, so
+ * the pattern operators skip it without calling the matcher. Exact, like
+ * shell_pattern_fixed_len. */
+static int shell_pattern_lead_byte(const char *pat, const char *pend) {
+    if (pat >= pend) return -1;
+    char c = *pat;
+    if ((c == '\\' || c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) &&
+        pat + 1 < pend)
+        return (unsigned char)pat[1];
+    if (c == '*' || c == '?' || c == '[' || c == '\\' ||
+        c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC)
+        return -1;
+    if ((c == '+' || c == '@' || c == '!') && pat + 1 < pend && pat[1] == '(')
+        return -1;
+    return (unsigned char)c;
+}
+
 static int shell_expand_tilde_word(struct shell_pipeline *pl,
                                    const char *word, char **out) {
     if (!word || word[0] != '~') return 0;
@@ -21187,19 +21503,15 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
         home = ubuf;
     }
 
-    char tmp[VFS_PATH_MAX];
+    /* The word after the tilde is any length -- it was capped at a path's,
+     * and a longer one was "expansion too long". */
+    SH_SB(tmp);
     size_t hlen = strlen(home);
-    size_t rest = strlen(slash);
     bool drop_slash = (hlen > 1 && home[hlen - 1] == '/' && *slash == '/');
-    if (hlen + rest + 1 > sizeof(tmp)) return -1;
-    memcpy(tmp, home, hlen);
-    size_t pos = hlen;
     const char *tail = slash;
     if (drop_slash) tail++;
-    while (*tail && pos + 1 < sizeof(tmp)) tmp[pos++] = *tail++;
-    if (*tail) return -1;
-    tmp[pos] = '\0';
-    return shell_pipeline_save_word(pl, tmp, out) < 0 ? -1 : 1;
+    if (sb_putmem(&tmp, home, hlen) < 0 || sb_puts(&tmp, tail) < 0) return -1;
+    return shell_pipeline_save_word(pl, tmp.p, out) < 0 ? -1 : 1;
 }
 
 static void shell_strip_glob_escapes(char *s);
@@ -21612,22 +21924,24 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,                    
  * Returns the number of matches stored, 0 when nothing matched. */
 static int sh_array_glob_field(const char *name, const char *field,
                                long *next) {
-    char pat[SHELL_PARSE_BUF_MAX];
+    SH_SB(patb);                    /* only ever shorter than the field */
+    if (sb_grow(&patb, strlen(field) + 1) < 0) return -1;
+    char *pat = patb.p;
     size_t o = 0;
-    for (const char *r = field; *r && o + 2 < sizeof pat; r++) {
+    for (const char *r = field; *r; r++) {
         if (*r == SHELL_DATA_ESC && r[1]) { pat[o++] = *r++; pat[o++] = *r; continue; }
         if (*r != SHELL_NOSPLIT_MARK) pat[o++] = *r;
     }
     pat[o] = '\0';
-    struct shell_pipeline *pl = (struct shell_pipeline *)kmalloc(sizeof *pl);
+    patb.len = o;
+    struct shell_pipeline *pl = shell_pipeline_new();
     struct shell_simple *cur = (struct shell_simple *)kmalloc(sizeof *cur);
     if (!pl || !cur) {
-        if (pl) kfree(pl);
+        if (pl) shell_pipeline_free(pl);
         if (cur) kfree(cur);
         return -1;
     }
     pl->count = 0;
-    pl->expand_pos = 0;
     shell_simple_init(cur);
     int n = shell_expand_glob_word(pl, cur, pat);
     if (n > 0) {
@@ -21636,7 +21950,7 @@ static int sh_array_glob_field(const char *name, const char *field,
         }
     }
     kfree(cur);
-    kfree(pl);
+    shell_pipeline_free(pl);
     return n;
 }
 
@@ -21660,7 +21974,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
      * it expanded, every tilde in it stopped expanding -- including the one
      * the script typed. This runs BEFORE the marks come off, which is the
      * only point where the distinction still exists. */
-    char tw[SHELL_PARSE_BUF_MAX];
+    SH_SB(tw);
     if (shell_has_nosplit(word)) {
         char shape0[80];
         size_t so0 = 0;
@@ -21672,32 +21986,29 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         if (shape0[k0] == '=' && shell_name_is_valid(shape0, k0)) {
             const char *hm = env_get("HOME");
             if (!hm || !*hm) hm = "/";
-            size_t o = 0;
             bool prot = false, seg_start = false, seen_eq = false;
             bool changed = false;
             for (const char *q = word; *q; q++) {
                 if (*q == SHELL_NOSPLIT_MARK) {
                     prot = !prot;
-                    if (o + 1 < sizeof tw) tw[o++] = *q;
+                    if (sb_putc(&tw, *q) < 0) return -1;
                     continue;
                 }
                 if (prot && seg_start && *q == '~' &&
                     (q[1] == '\0' || q[1] == '/' || q[1] == ':' ||
                      q[1] == SHELL_NOSPLIT_MARK)) {
-                    for (const char *h = hm; *h && o + 1 < sizeof tw; h++)
-                        tw[o++] = *h;
+                    if (sb_puts(&tw, hm) < 0) return -1;
                     seg_start = false;
                     changed = true;
                     continue;
                 }
-                if (o + 1 < sizeof tw) tw[o++] = *q;
+                if (sb_putc(&tw, *q) < 0) return -1;
                 if (!seen_eq && *q == '=') { seen_eq = true; seg_start = true; }
                 else seg_start = (*q == ':') && seen_eq;
             }
-            tw[o] = '\0';
             if (changed) {
                 char *saved = 0;
-                if (shell_pipeline_save_word(pl, tw, &saved) < 0) return -1;
+                if (shell_pipeline_save_word(pl, tw.p, &saved) < 0) return -1;
                 word = saved;
             }
         }
@@ -21705,11 +22016,11 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
 
     /* The funnel: every word becomes an argument through here, so this is the
      * one place that has to guarantee no split-protection marker escapes. */
-    char unmarked[SHELL_PARSE_BUF_MAX];
     if (shell_has_nosplit(word)) {
-        shell_strip_nosplit(unmarked, sizeof unmarked, word);
+        SH_SB(unmarked);
+        if (shell_strip_nosplit(&unmarked, word) < 0) return -1;
         char *saved = 0;
-        if (shell_pipeline_save_word(pl, unmarked, &saved) < 0) return -1;
+        if (shell_pipeline_save_word(pl, unmarked.p, &saved) < 0) return -1;
         word = saved;
     }
 
@@ -21783,13 +22094,12 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
          * literal tilde that every later use of $x carried around. */
         size_t klen = akey;
         if (assign_word && !g_arg_from_expansion) {
-            char asg[SHELL_PARSE_BUF_MAX];
-            size_t apos = 0;
+            SH_SB(asg);
             bool changed = false;
             const char *q = word;
             /* copy `name=` verbatim */
-            for (size_t i = 0; i <= klen; i++)
-                if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+            if (sb_putmem(&asg, q, klen + 1) < 0) return -1;
+            q += klen + 1;
             while (*q) {
                 if (*q == '~') {
                     const char *seg_end = q;
@@ -21803,7 +22113,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                         int r = shell_expand_tilde_word(pl, seg, &sub);
                         if (r < 0) return -1;
                         if (r > 0) {
-                            if (shell_append_str(asg, &apos, sizeof(asg), sub) < 0) return -1;
+                            if (sb_puts(&asg, sub) < 0) return -1;
                             q = seg_end;
                             changed = true;
                             continue;
@@ -21812,14 +22122,13 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                 }
                 /* Only a tilde that STARTS a segment expands. */
                 while (*q && *q != ':')
-                    if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+                    if (sb_putc(&asg, *q++) < 0) return -1;
                 if (*q == ':')
-                    if (shell_append_char(asg, &apos, sizeof(asg), *q++) < 0) return -1;
+                    if (sb_putc(&asg, *q++) < 0) return -1;
             }
             if (changed) {
-                asg[apos] = '\0';
                 char *saved = 0;
-                if (shell_pipeline_save_word(pl, asg, &saved) < 0) return -1;
+                if (shell_pipeline_save_word(pl, asg.p, &saved) < 0) return -1;
                 cur->argv[cur->argc++] = saved;
                 return 0;
             }
@@ -21845,15 +22154,14 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             if (cur->argc < ARG_MAX) cur->arg_noassign[cur->argc >> 3] |= (unsigned char)(1u << (cur->argc & 7));
     }
     if (has_esc) {
-        char plain[SHELL_PARSE_BUF_MAX];
-        size_t n = strlen(word);
-        if (n + 1 <= sizeof plain) {
-            memcpy(plain, word, n + 1);
-            shell_strip_glob_escapes(plain);
-            char *saved = 0;
-            if (shell_pipeline_save_word(pl, plain, &saved) < 0) return -1;
-            word = saved;
-        }
+        /* A copy in the pipeline's store, stripped where it lies: the
+         * escapes only ever shorten it. It was a fixed array, and a word
+         * longer than that KEPT its escape bytes -- they reached the
+         * program as raw 0x03s. */
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, word, &saved) < 0) return -1;
+        shell_strip_glob_escapes(saved);
+        word = saved;
     }
     cur->argv[cur->argc++] = (char *)word;
     return 0;
@@ -21911,28 +22219,23 @@ static bool shell_word_has_argmark(const char *s) {
  * a boundary, not a separator (see shell_append_positional_join), so it is
  * dropped rather than turned into a leading space. No-split markers travel
  * with the text and are removed here too. */
-static int shell_argmarks_to_spaces(const char *src, char *out, size_t cap) {
-    size_t o = 0;
+static int shell_argmarks_to_spaces(const char *src, struct shell_sb *out) {
+    sb_truncate(out, 0);
     bool first = true;
     for (const char *q = src; *q; q++) {
         /* escape-aware: the pair travels on, to be undone with the rest */
         if (*q == SHELL_DATA_ESC && q[1]) {
-            if (o + 2 >= cap) return -1;
-            out[o++] = *q++;
-            out[o++] = *q;
+            if (sb_putc(out, *q++) < 0 || sb_putc(out, *q) < 0) return -1;
             continue;
         }
         if (*q == SHELL_NOSPLIT_MARK) continue;
         if (*q == SHELL_ARG_MARK) {
             if (first) { first = false; continue; }
-            if (o + 1 >= cap) return -1;
-            out[o++] = ' ';
+            if (sb_putc(out, ' ') < 0) return -1;
             continue;
         }
-        if (o + 1 >= cap) return -1;
-        out[o++] = *q;
+        if (sb_putc(out, *q) < 0) return -1;
     }
-    out[o] = '\0';
     return 0;
 }
 
@@ -21947,7 +22250,7 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
     if (!*first) return 0;                       /* no marker: normal path */
 
     size_t prefix_len = (size_t)(first - word);
-    char tmp[SHELL_PARSE_BUF_MAX];
+    SH_SB(tmp);
     int emitted = 0;
 
     for (const char *p = first; *p == SHELL_ARG_MARK; ) {
@@ -21979,21 +22282,18 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         }
 
         size_t glue = (emitted == 0) ? prefix_len : 0;
-        if (glue + n + 1 > sizeof(tmp)) {
-            kprintf("shell: field too long\n");
+        sb_truncate(&tmp, 0);
+        if (sb_putmem(&tmp, word, glue) < 0 ||
+            sb_putmem(&tmp, start, n) < 0)
             return -1;
-        }
-        if (glue) memcpy(tmp, word, glue);
-        memcpy(tmp + glue, start, n);
-        tmp[glue + n] = '\0';
 
         /* The tokenizer's quote marks travel with the text; strip them here or
          * they reach the program as raw 0x02 bytes in argv. */
-        char clean[SHELL_PARSE_BUF_MAX];
-        shell_strip_nosplit(clean, sizeof clean, tmp);
+        SH_SB(clean);
+        if (shell_strip_nosplit(&clean, tmp.p) < 0) return -1;
 
         char *saved = 0;
-        if (shell_pipeline_save_word(pl, clean, &saved) < 0) return -1;
+        if (shell_pipeline_save_word(pl, clean.p, &saved) < 0) return -1;
         /* An unquoted "$@" still field-splits each parameter; a quoted one
          * keeps each parameter whole, spaces and all. */
         if (quoted) {
@@ -22026,14 +22326,13 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
      * so this fired for the bare form and contributed an argument where bash
      * contributes none. */
     if (emitted == 0 && prefix_len > 0) {
-        if (prefix_len + 1 > sizeof(tmp)) return -1;
-        memcpy(tmp, word, prefix_len);
-        tmp[prefix_len] = '\0';
-        char pre[SHELL_PARSE_BUF_MAX];
-        shell_strip_nosplit(pre, sizeof pre, tmp);
-        if (pre[0]) {
+        sb_truncate(&tmp, 0);
+        if (sb_putmem(&tmp, word, prefix_len) < 0) return -1;
+        SH_SB(pre);
+        if (shell_strip_nosplit(&pre, tmp.p) < 0) return -1;
+        if (pre.p[0]) {
             char *saved = 0;
-            if (shell_pipeline_save_word(pl, pre, &saved) < 0) return -1;
+            if (shell_pipeline_save_word(pl, pre.p, &saved) < 0) return -1;
             if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
         }
     }
@@ -22079,11 +22378,11 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
             (cur->argc == 0 ||
              (assign_src && shell_is_declaration_utility(cur->argv[0])));
         if (nosplit_ctx && shell_word_has_argmark(word)) {
-            char joined[SHELL_PARSE_BUF_MAX];
-            if (shell_argmarks_to_spaces(word, joined, sizeof joined) < 0)
+            SH_SB(joined);
+            if (shell_argmarks_to_spaces(word, &joined) < 0)
                 return -1;
             char *jsaved = 0;
-            if (shell_pipeline_save_word(pl, joined, &jsaved) < 0) return -1;
+            if (shell_pipeline_save_word(pl, joined.p, &jsaved) < 0) return -1;
             return shell_add_one_arg(pl, cur, jsaved, false);
         }
     }
@@ -22103,10 +22402,10 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
     if (!expanded) {
         if (!shell_has_nosplit(word))
             return shell_add_one_arg(pl, cur, word, false);
-        char lit[SHELL_PARSE_BUF_MAX];
-        shell_strip_nosplit(lit, sizeof lit, word);
+        SH_SB(lit);
+        if (shell_strip_nosplit(&lit, word) < 0) return -1;
         char *litsaved = 0;
-        if (shell_pipeline_save_word(pl, lit, &litsaved) < 0) return -1;
+        if (shell_pipeline_save_word(pl, lit.p, &litsaved) < 0) return -1;
         return shell_add_one_arg(pl, cur, litsaved, quoted);
     }
 
@@ -22165,17 +22464,10 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
             p++;
         }
         size_t n = (size_t)(p - start);
-        char raw[SHELL_PARSE_BUF_MAX];
-        char tmp[SHELL_PARSE_BUF_MAX];
-        if (n + 1 > sizeof(raw)) {
-            kprintf("shell: field too long\n");
-            return -1;
-        }
-        memcpy(raw, start, n);
-        raw[n] = '\0';
-        shell_strip_nosplit(tmp, sizeof tmp, raw);
+        SH_SB(tmp);
+        if (shell_strip_nosplit_n(&tmp, start, n) < 0) return -1;
         char *saved = 0;
-        if (shell_pipeline_save_word(pl, tmp, &saved) < 0) return -1;
+        if (shell_pipeline_save_word(pl, tmp.p, &saved) < 0) return -1;
         /* The WORD's flag, not the field's: globbing behaviour is left exactly
          * as it was, so this change is about splitting only. */
         if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
@@ -22250,6 +22542,7 @@ static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
 
 static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                 struct shell_pipeline *pl) {
+    words_free(&pl->words);         /* from shell_pipeline_new, or reused */
     memset(pl, 0, sizeof(*pl));
     if (*io >= ntok || shell_is_list_sep(tok[*io].type)) return 0;
 
@@ -23658,17 +23951,13 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
             /* Fork and run it there -- see shell_background_forked. Rebuild
              * the command text from argv: the caller has already split it,
              * and the child re-parses, which keeps this to one mechanism. */
-            char line[SHELL_PARSE_BUF_MAX];
-            size_t o = 0;
+            SH_SB(line);
             for (int i = 0; i < exec_cmd.argc; i++) {
-                size_t n = strlen(exec_cmd.argv[i]);
-                if (o + n + 2 >= sizeof line) break;
-                if (o) line[o++] = ' ';
-                memcpy(line + o, exec_cmd.argv[i], n);
-                o += n;
+                if ((i && sb_putc(&line, ' ') < 0) ||
+                    sb_puts(&line, exec_cmd.argv[i]) < 0)
+                    return 1;
             }
-            line[o] = '\0';
-            return shell_background_forked(line, exec_cmd.argv[0]);
+            return shell_background_forked(line.p, exec_cmd.argv[0]);
 #else
             kprintf("'%s': %s can't be backgrounded with '&'\n",
                     exec_cmd.argv[0], is_fn ? "shell functions" : "builtins");
@@ -24253,21 +24542,34 @@ static int shell_copy_segment(char *dst, size_t cap,
  * and is identical in both builds -- shell.c compiles twice, into the
  * kernel and as /bin/tsh, and the stack budgets differ.
  *
- * 16 KiB: eight times the POSIX floor and twice the hosted
- * SHELL_PARSE_BUF_MAX, which the file's own note calls enough for the Oils
- * corpus. It is deliberately not the 64 KiB a heredoc gets: one heredoc is
- * live at a time, whereas nesting multiplies this. Returns NULL if the
- * segment does not fit or the allocation fails; the caller reports it. */
-#define SHELL_COMPOUND_BODY_MAX (16 * 1024)
-
+ * It then had a 16 KiB heap buffer, and NOW IT IS SIZED FROM THE SEGMENT
+ * ITSELF, so there is no limit left: a 16 KiB function or loop body was
+ * "definition too long" / "command too long", and real scripts have
+ * functions that size. The buffer is exactly the segment -- a caller that
+ * wants to add to it builds a new one. Returns NULL only when the
+ * allocation fails; the caller reports it. */
 static char *shell_dup_segment(const char *start, const char *end) {
-    char *buf = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
+    if (!start || !end || end < start) return 0;
+    char *buf = (char *)kmalloc((size_t)(end - start) + 1);
     if (!buf) return 0;
-    if (shell_copy_segment(buf, SHELL_COMPOUND_BODY_MAX, start, end) < 0) {
+    if (shell_copy_segment(buf, (size_t)(end - start) + 1, start, end) < 0) {
         kfree(buf);
         return 0;
     }
     return buf;
+}
+
+/* shell_copy_segment into a growable buffer: the same trim, no limit. */
+static int shell_copy_segment_sb(struct shell_sb *dst,
+                                 const char *start, const char *end) {
+    if (!dst || !start || !end || end < start) return -1;
+    while (start < end && (*start == ' ' || *start == '\t' || *start == ';'))
+        start++;
+    while (end > start &&
+           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == ';'))
+        end--;
+    sb_truncate(dst, 0);
+    return sb_putmem(dst, start, (size_t)(end - start));
 }
 
 static bool shell_word_boundary_before(const char *start, const char *p);
@@ -24605,20 +24907,23 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
  * Parses the text after a compound's terminator as redirections only, into
  * `out`. Returns 0 on success (including an empty tail), -1 on a parse error
  * or if the tail contains anything that is not a redirection. */
-/* Re-point a parsed redirection list's strings at caller-owned storage. */
-static int shell_redirs_intern(struct shell_simple *out, char *buf, size_t cap) {
-    size_t pos = 0;
+/* Re-point a parsed redirection list's strings at caller-owned storage.
+ *
+ * The CALLER'S STORE, not a buffer it sized: a here-string's text is an
+ * expanded value, so `done <<< "$x"` needs room for all of $x. It was a
+ * 512-byte array (256 for `[[`), and a longer one was "redirection target
+ * too long" -- for one of the commonest ways to feed a read loop. */
+static int shell_redirs_intern(struct shell_simple *out,
+                               struct shell_words *store) {
     for (int i = 0; i < out->redir_count; i++) {
         struct shell_redir *r = &out->redir[i];
         const char **fields[2] = { &r->path, &r->text };
         for (int f = 0; f < 2; f++) {
             const char *src = *fields[f];
             if (!src) continue;
-            size_t n = strlen(src) + 1;
-            if (pos + n > cap) return -1;
-            memcpy(buf + pos, src, n);
-            *fields[f] = buf + pos;
-            pos += n;
+            char *copy = words_store(store, src, strlen(src));
+            if (!copy) return -1;
+            *fields[f] = copy;
         }
     }
     /* These alias into `words` too and nothing on this path reads them. */
@@ -24627,26 +24932,26 @@ static int shell_redirs_intern(struct shell_simple *out, char *buf, size_t cap) 
 }
 
 static int shell_parse_compound_redirs(const char *tail, struct shell_simple *out,
-                                       char *pathbuf, size_t pathcap,
+                                       struct shell_words *store,
                                        const char *label) {
     shell_simple_init(out);
     tail = shell_skip_blanks(tail);
     if (!*tail) return 0;
 
     /* Heap for the same reason as everywhere else on this path: the loop
-     * parsers that call this already hold list[], body[], tok[] and words[],
-     * and struct shell_pipeline alone is ~5.5 KB. */
+     * parsers that call this already hold list[], body[] and tok[], and
+     * struct shell_pipeline is several KB. */
     struct shell_token *tok = kmalloc(sizeof(*tok) * SHELL_TOKEN_MAX);
-    char *words = kmalloc(SHELL_PARSE_BUF_MAX);
-    struct shell_pipeline *pl = kmalloc(sizeof(*pl));
+    SH_WORDS(words);
+    struct shell_pipeline *pl = shell_pipeline_new();
     int rc = -1;
-    if (!tok || !words || !pl) {
+    if (!tok || !pl) {
         kprintf("%s: out of memory parsing redirections\n", label);
         goto out;
     }
     {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, words, SHELL_PARSE_BUF_MAX) < 0)
+        if (shell_tokenize(tail, tok, &ntok, &words) < 0)
             goto out;
         if (ntok == 0) { rc = 0; goto out; }
 
@@ -24663,16 +24968,12 @@ static int shell_parse_compound_redirs(const char *tail, struct shell_simple *ou
          * filename was freed memory -- `for ... done > file` reported success
          * and wrote to the terminal. Intern the strings into caller-owned
          * storage so they outlive this frame. */
-        if (shell_redirs_intern(out, pathbuf, pathcap) < 0) {
-            kprintf("%s: redirection target too long\n", label);
-            goto out;
-        }
+        if (shell_redirs_intern(out, store) < 0) goto out;
         rc = 0;
     }
 out:
     if (tok)   kfree(tok);
-    if (words) kfree(words);
-    if (pl)    kfree(pl);
+    if (pl)    shell_pipeline_free(pl);
     return rc;
 }
 
@@ -24694,15 +24995,14 @@ static bool shell_compound_tail_redirs(const char *src, const char *tail,
     if (!*t) return false;
 
     struct shell_simple redirs;
-    char paths[512];
-    if (shell_parse_compound_redirs(t, &redirs, paths, sizeof paths, label) < 0)
+    SH_WORDS(paths);
+    if (shell_parse_compound_redirs(t, &redirs, &paths, label) < 0)
         return false;
     if (redirs.redir_count == 0) return false;
 
-    char *buf = kmalloc(SHELL_PARSE_BUF_MAX);
-    if (!buf) return false;
     size_t n = (size_t)(tail - src);
-    if (n + 1 >= SHELL_PARSE_BUF_MAX) { kfree(buf); return false; }
+    char *buf = kmalloc(n + 1);     /* the construct's own length: no limit */
+    if (!buf) return false;
     memcpy(buf, src, n);
     buf[n] = '\0';
 
@@ -24778,17 +25078,17 @@ struct shell_dbr {
     int    pos;
     bool   err;
     bool   bad_re;              /* `=~` with a pattern that does not compile */
-    char   buf[SHELL_PARSE_BUF_MAX];
-    size_t bufpos;
+    struct shell_words store;   /* the words' text; it was an 8 KiB array */
 };
 
 static char *shell_dbr_store(struct shell_dbr *d, const char *s) {
-    size_t n = strlen(s);
-    if (d->bufpos + n + 1 > sizeof d->buf) return 0;
-    char *out = d->buf + d->bufpos;
-    memcpy(out, s, n + 1);
-    d->bufpos += n + 1;
-    return out;
+    return words_store(&d->store, s, strlen(s));
+}
+
+static void shell_dbr_free(struct shell_dbr *d) {
+    if (!d) return;
+    words_free(&d->store);
+    kfree(d);
 }
 
 /* THE SPLIT, AND WHAT QUOTING MEANS IN IT.
@@ -24828,10 +25128,10 @@ static char *shell_dbr_store(struct shell_dbr *d, const char *s) {
  * The buffers live on the heap: four line-sized arrays are more than the
  * kernel stack has to spare, and this is compiled for it too. */
 struct shell_dbr_scratch {
-    char raw[SHELL_PARSE_BUF_MAX];   /* the word as written: the operator test */
-    char seg[SHELL_PARSE_BUF_MAX];   /* the pending unquoted run, for the expander */
-    char tmp[SHELL_PARSE_BUF_MAX];   /* one segment's expansion */
-    char out[SHELL_PARSE_BUF_MAX];   /* the assembled word */
+    struct shell_sb raw;    /* the word as written: the operator test */
+    struct shell_sb seg;    /* the pending unquoted run, for the expander */
+    struct shell_sb tmp;    /* one segment's expansion */
+    struct shell_sb out;    /* the assembled word */
 };
 
 /* An operator character of EITHER grammar a right-hand side can be read in,
@@ -24842,33 +25142,29 @@ static bool shell_dbr_special(char c) {
 }
 
 /* Append a QUOTED span of n bytes, every operator character marked. */
-static int shell_dbr_put_quoted(char *out, size_t *op, size_t cap,
-                                const char *s, size_t n) {
+static int shell_dbr_put_quoted(struct shell_sb *out, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (shell_dbr_special(s[i]) &&
-            shell_append_char(out, op, cap, SHELL_GLOB_ESC) < 0) return -1;
-        if (shell_append_char(out, op, cap, s[i]) < 0) return -1;
+            sb_putc(out, SHELL_GLOB_ESC) < 0) return -1;
+        if (sb_putc(out, s[i]) < 0) return -1;
     }
     return 0;
 }
 
 /* Expand the pending unquoted run and append whatever it yields as it is:
  * an unquoted `$pat` IS a pattern in bash. */
-static int shell_dbr_flush(struct shell_dbr_scratch *sc, size_t *sp,
-                           size_t *op) {
-    if (*sp == 0) return 0;
-    sc->seg[*sp] = '\0';
-    *sp = 0;
-    if (shell_expand_word_ex(sc->seg, sc->tmp, sizeof sc->tmp, true, true) < 0)
-        return -1;
-    shell_strip_nosplit_inplace(sc->tmp);
-    return shell_append_str(sc->out, op, sizeof sc->out, sc->tmp);
+static int shell_dbr_flush(struct shell_dbr_scratch *sc) {
+    if (sc->seg.len == 0) return 0;
+    int rc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
+    sb_truncate(&sc->seg, 0);
+    if (rc < 0) return -1;
+    shell_strip_nosplit_inplace(sc->tmp.p);
+    return sb_puts(&sc->out, sc->tmp.p);
 }
 
-static int shell_dbr_put2(struct shell_dbr_scratch *sc, size_t *rp,
-                          size_t *sp, char c) {
-    if (shell_append_char(sc->raw, rp, sizeof sc->raw, c) < 0) return -1;
-    return shell_append_char(sc->seg, sp, sizeof sc->seg, c);
+static int shell_dbr_put2(struct shell_dbr_scratch *sc, char c) {
+    if (sb_putc(&sc->raw, c) < 0) return -1;
+    return sb_putc(&sc->seg, c);
 }
 
 /* Copy a substitution -- `$( )`, `$(( ))`, `${ }` or backticks -- whole:
@@ -24878,30 +25174,29 @@ static int shell_dbr_put2(struct shell_dbr_scratch *sc, size_t *rp,
  *
  * Splitting on blanks tore that into `$(echo`, `\"`, `>` and `f)`, and the
  * `>` then looked like the comparison operator. */
-static int shell_dbr_copy_subst(const char **pp, struct shell_dbr_scratch *sc,
-                                size_t *rp, size_t *sp) {
+static int shell_dbr_copy_subst(const char **pp, struct shell_dbr_scratch *sc) {
     const char *p = *pp;
     if (*p == '`') {
-        if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+        if (shell_dbr_put2(sc, *p++) < 0) return -1;
         while (*p && *p != '`') {
-            if (*p == '\\' && p[1] && shell_dbr_put2(sc, rp, sp, *p++) < 0)
+            if (*p == '\\' && p[1] && shell_dbr_put2(sc, *p++) < 0)
                 return -1;
-            if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+            if (shell_dbr_put2(sc, *p++) < 0) return -1;
         }
-        if (*p == '`' && shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+        if (*p == '`' && shell_dbr_put2(sc, *p++) < 0) return -1;
         *pp = p;
         return 0;
     }
     char open_ch = p[1], close_ch = (p[1] == '(') ? ')' : '}';
-    if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;       /* the $ */
+    if (shell_dbr_put2(sc, *p++) < 0) return -1;       /* the $ */
     int depth = 0;
     bool sq = false, dq = false;
     while (*p) {
         char c = *p++;
-        if (shell_dbr_put2(sc, rp, sp, c) < 0) return -1;
+        if (shell_dbr_put2(sc, c) < 0) return -1;
         if (sq) { if (c == '\'') sq = false; continue; }
         if (c == '\\' && *p) {
-            if (shell_dbr_put2(sc, rp, sp, *p++) < 0) return -1;
+            if (shell_dbr_put2(sc, *p++) < 0) return -1;
             continue;
         }
         if (dq) { if (c == '"') dq = false; continue; }
@@ -24943,7 +25238,9 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             continue;
         }
 
-        size_t rp = 0, sp = 0, op = 0;
+        sb_truncate(&sc->raw, 0);
+        sb_truncate(&sc->seg, 0);
+        sb_truncate(&sc->out, 0);
         bool any_q = false, any_u = false;
         int eg_depth = 0;          /* inside an extglob group X( ... ) */
         int re_depth = 0;          /* inside a regex group ( ... ) */
@@ -24952,17 +25249,16 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
             if (c == '\'') {
                 any_q = true;
-                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
-                if (shell_append_char(sc->raw, &rp, sizeof sc->raw, c) < 0) return -1;
+                if (shell_dbr_flush(sc) < 0) return -1;
+                if (sb_putc(&sc->raw, c) < 0) return -1;
                 p++;
                 const char *q = p;
                 while (*p && *p != '\'') p++;
-                if (shell_dbr_put_quoted(sc->out, &op, sizeof sc->out, q,
-                                         (size_t)(p - q)) < 0) return -1;
-                for (const char *r = q; r < p; r++)
-                    if (shell_append_char(sc->raw, &rp, sizeof sc->raw, *r) < 0) return -1;
+                if (shell_dbr_put_quoted(&sc->out, q, (size_t)(p - q)) < 0)
+                    return -1;
+                if (sb_putmem(&sc->raw, q, (size_t)(p - q)) < 0) return -1;
                 if (*p == '\'') {
-                    if (shell_append_char(sc->raw, &rp, sizeof sc->raw, *p) < 0) return -1;
+                    if (sb_putc(&sc->raw, *p) < 0) return -1;
                     p++;
                 }
                 continue;
@@ -24971,54 +25267,53 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
                 /* A double-quoted span (or $"..." / $'...') is ONE segment,
                  * expanded on its own so its result can be marked literal. */
                 any_q = true;
-                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
+                if (shell_dbr_flush(sc) < 0) return -1;
                 if (c == '$') {
-                    if (shell_dbr_put2(sc, &rp, &sp, c) < 0) return -1;
+                    if (shell_dbr_put2(sc, c) < 0) return -1;
                     p++;
                 }
                 char qc = *p;
-                if (shell_dbr_put2(sc, &rp, &sp, qc) < 0) return -1;
+                if (shell_dbr_put2(sc, qc) < 0) return -1;
                 p++;
                 while (*p && *p != qc) {
                     if (*p == '\\' && p[1]) {
-                        if (shell_dbr_put2(sc, &rp, &sp, *p) < 0) return -1;
+                        if (shell_dbr_put2(sc, *p) < 0) return -1;
                         p++;
                     }
-                    if (shell_dbr_put2(sc, &rp, &sp, *p) < 0) return -1;
+                    if (shell_dbr_put2(sc, *p) < 0) return -1;
                     p++;
                 }
                 if (*p == qc) {
-                    if (shell_dbr_put2(sc, &rp, &sp, qc) < 0) return -1;
+                    if (shell_dbr_put2(sc, qc) < 0) return -1;
                     p++;
                 }
-                sc->seg[sp] = '\0';
-                sp = 0;
-                if (shell_expand_word_ex(sc->seg, sc->tmp, sizeof sc->tmp,
-                                         true, true) < 0) return -1;
-                shell_strip_nosplit_inplace(sc->tmp);
-                if (shell_dbr_put_quoted(sc->out, &op, sizeof sc->out, sc->tmp,
-                                         strlen(sc->tmp)) < 0) return -1;
+                int xrc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
+                sb_truncate(&sc->seg, 0);
+                if (xrc < 0) return -1;
+                shell_strip_nosplit_inplace(sc->tmp.p);
+                if (shell_dbr_put_quoted(&sc->out, sc->tmp.p,
+                                         strlen(sc->tmp.p)) < 0) return -1;
                 continue;
             }
             if (c == '\\' && p[1]) {
                 /* `\x` quotes x, whatever x is. */
                 any_q = true;
-                if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
-                if (shell_append_char(sc->raw, &rp, sizeof sc->raw, c) < 0 ||
-                    shell_append_char(sc->raw, &rp, sizeof sc->raw, p[1]) < 0 ||
-                    shell_append_char(sc->out, &op, sizeof sc->out, SHELL_GLOB_ESC) < 0 ||
-                    shell_append_char(sc->out, &op, sizeof sc->out, p[1]) < 0)
+                if (shell_dbr_flush(sc) < 0) return -1;
+                if (sb_putc(&sc->raw, c) < 0 ||
+                    sb_putc(&sc->raw, p[1]) < 0 ||
+                    sb_putc(&sc->out, SHELL_GLOB_ESC) < 0 ||
+                    sb_putc(&sc->out, p[1]) < 0)
                     return -1;
                 p += 2;
                 continue;
             }
             if ((c == '$' && (p[1] == '(' || p[1] == '{')) || c == '`') {
                 any_u = true;
-                if (shell_dbr_copy_subst(&p, sc, &rp, &sp) < 0) return -1;
+                if (shell_dbr_copy_subst(&p, sc) < 0) return -1;
                 continue;
             }
             if (c == '(') {
-                char prevc = rp > 0 ? sc->raw[rp - 1] : '\0';
+                char prevc = sc->raw.len > 0 ? sc->raw.p[sc->raw.len - 1] : '\0';
                 bool eg_op = (prevc == '?' || prevc == '*' || prevc == '+' ||
                               prevc == '@' || prevc == '!');
                 if (eg_depth > 0) eg_depth++;
@@ -25032,19 +25327,17 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
                 else break;
             }
             any_u = true;
-            if (shell_dbr_put2(sc, &rp, &sp, c) < 0) return -1;
+            if (shell_dbr_put2(sc, c) < 0) return -1;
             p++;
         }
-        if (shell_dbr_flush(sc, &sp, &op) < 0) return -1;
-        sc->raw[rp] = '\0';
-        sc->out[op] = '\0';
+        if (shell_dbr_flush(sc) < 0) return -1;
 
         /* The operators are recognised only as WHOLE words, and only when
          * they were not quoted -- `[[ "&&" ]]` is a one-word test of a
          * two-character string. */
-        if (!any_q && (strcmp(sc->raw, "&&") == 0 || strcmp(sc->raw, "||") == 0 ||
-                       strcmp(sc->raw, "!") == 0)) {
-            char *st = shell_dbr_store(d, sc->raw);
+        if (!any_q && (strcmp(sc->raw.p, "&&") == 0 || strcmp(sc->raw.p, "||") == 0 ||
+                       strcmp(sc->raw.p, "!") == 0)) {
+            char *st = shell_dbr_store(d, sc->raw.p);
             if (!st) return -1;
             d->pat[d->n] = false;
             d->opr[d->n] = true;
@@ -25056,8 +25349,8 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
          * unquoted part, or the right of =~. A wholly quoted right-hand
          * side is a string and is compared as one. */
         bool keep = rhs_re || (rhs_pat && any_u);
-        if (!keep) shell_strip_glob_escapes(sc->out);
-        char *st = shell_dbr_store(d, sc->out);
+        if (!keep) shell_strip_glob_escapes(sc->out.p);
+        char *st = shell_dbr_store(d, sc->out.p);
         if (!st) return -1;
         d->pat[d->n] = any_u;
         d->opr[d->n] = false;
@@ -25071,11 +25364,19 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     d->pos = 0;
     d->err = false;
     d->bad_re = false;
-    d->bufpos = 0;
+    d->store.head = 0;              /* d is fresh from kmalloc */
     struct shell_dbr_scratch *sc =
         (struct shell_dbr_scratch *)kmalloc(sizeof *sc);
     if (!sc) return -1;
+    sb_init(&sc->raw);
+    sb_init(&sc->seg);
+    sb_init(&sc->tmp);
+    sb_init(&sc->out);
     int rc = shell_dbr_split_in(d, src, sc);
+    sb_free(&sc->raw);
+    sb_free(&sc->seg);
+    sb_free(&sc->tmp);
+    sb_free(&sc->out);
     kfree(sc);
     return rc;
 }
@@ -25331,12 +25632,12 @@ static bool shell_try_dbracket_command(const char *src) {
         return true;
     }
 
-    char expr[SHELL_PARSE_BUF_MAX];
-    if (shell_copy_segment(expr, sizeof expr, s, end) < 0) {
-        kprintf("tsh: [[: expression too long\n");
+    SH_SB(exprb);
+    if (shell_copy_segment_sb(&exprb, s, end) < 0) {
         shell_set_status(2);
         return true;
     }
+    const char *expr = exprb.p;
 
     struct shell_dbr *d = (struct shell_dbr *)kmalloc(sizeof *d);
     if (!d) {
@@ -25351,7 +25652,7 @@ static bool shell_try_dbracket_command(const char *src) {
          * -- is not a syntax error in it. bash reports the expansion,
          * discards the rest of the line and the next one sees status 1;
          * the syntax-error path below ENDED THE SCRIPT. */
-        kfree(d);
+        shell_dbr_free(d);
         g_bad_subst_soft = false;
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -25369,7 +25670,7 @@ static bool shell_try_dbracket_command(const char *src) {
         }
     }
     bool bad_re = d->bad_re;
-    kfree(d);
+    shell_dbr_free(d);
     /* A REGEX THAT DOES NOT COMPILE IS STATUS 2, NOT A SYNTAX ERROR:
      * `[[ foo.py =~ * ]]` exits 2 in bash and the script continues. */
     if (!bad && bad_re) {
@@ -25397,9 +25698,9 @@ static bool shell_try_dbracket_command(const char *src) {
     const char *tail = shell_skip_blanks(end + 2);
     if (*tail && *tail != ';' && *tail != '\n') {
         struct shell_simple redirs;
-        char paths[256];
-        if (shell_parse_compound_redirs(end + 2, &redirs, paths,
-                                        sizeof paths, "[[") < 0) {
+        SH_WORDS(paths);
+        if (shell_parse_compound_redirs(end + 2, &redirs, &paths,
+                                        "[[") < 0) {
             shell_set_status(2);
             return true;
         }
@@ -25463,17 +25764,17 @@ static bool shell_try_arith_command(const char *src) {
     if (*tail && *tail != ';' && *tail != '\n' && *tail != '<' && *tail != '>')
         return false;
 
-    char expr[SHELL_PARSE_BUF_MAX];
-    if (shell_copy_segment(expr, sizeof expr, s, end) < 0) return false;
+    SH_SB(expr);
+    if (shell_copy_segment_sb(&expr, s, end) < 0) return false;
 
     /* The expression is expanded first, exactly as `$(( ))` is: the evaluator
      * resolves bare names itself but knows nothing about `$( )` or `${ }`. */
-    char xexpr[SHELL_PARSE_BUF_MAX];
-    if (shell_expand_literal_quotes(expr, xexpr, sizeof xexpr) != 0)
+    SH_SB(xexpr);
+    if (shell_expand_literal_quotes(expr.p, &xexpr) != 0)
         return false;
 
     struct shell_arith a;
-    a.p = xexpr;
+    a.p = xexpr.p;
     a.ok = true;
     long v = shell_arith_expr(&a);
     if (!a.ok) return false;
@@ -25652,44 +25953,26 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
 
-    /* Heap, not stack -- see shell_dup_segment(). Besides lifting the
-     * 512-byte cap, this takes 1 KiB off a frame the note below already
-     * records as having overflowed the stack once. */
-    char *list = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
-    char *body = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
-    if (!list || !body) {
-        kfree(list); kfree(body);
-        kprintf("for: out of memory\n"); shell_set_status(2); return true;
-    }
-    list[0] = '\0';
+    /* Heap, not stack -- see shell_dup_segment(). Both are sized from what
+     * they hold: the list and the body had a 16 KiB ceiling, and the list
+     * built from "$@" had it too. */
+    char *list = 0;
     if (implicit_at) {
-        size_t lpos = 0;
-        for (int i = 0; i < g_positional_count; i++) {
-            if (i > 0 && shell_append_char(list, &lpos,
-                                           SHELL_COMPOUND_BODY_MAX, ' ') < 0) {
-                kfree(list); kfree(body);
-                kprintf("for: list too long\n"); shell_set_status(2); return true;
-            }
-            if (shell_append_str(list, &lpos, SHELL_COMPOUND_BODY_MAX,
-                                 g_positional[i]) < 0) {
-                kfree(list); kfree(body);
-                kprintf("for: list too long\n"); shell_set_status(2); return true;
-            }
+        SH_SB(lb);
+        bool ok = true;
+        for (int i = 0; i < g_positional_count && ok; i++) {
+            if (i > 0 && sb_putc(&lb, ' ') < 0) ok = false;
+            else if (sb_puts(&lb, g_positional[i]) < 0) ok = false;
         }
-        list[lpos] = '\0';
+        if (ok) list = sb_steal(&lb);
     } else {
-        if (shell_copy_segment(list, SHELL_COMPOUND_BODY_MAX, s, do_at) < 0) {
-            kfree(list); kfree(body);
-            kprintf("for: command too long\n");
-            shell_set_status(2);
-            return true;
-        }
+        list = shell_dup_segment(s, do_at);
     }
     unsigned long body_line = shell_lineno_body(do_end);
-    if (shell_copy_segment(body, SHELL_COMPOUND_BODY_MAX, do_end,
-                           done_at) < 0) {
+    char *body = shell_dup_segment(do_end, done_at);
+    if (!list || !body) {
         kfree(list); kfree(body);
-        kprintf("for: command too long\n");
+        kprintf("for: out of memory\n");
         shell_set_status(2);
         return true;
     }
@@ -25700,10 +25983,10 @@ static bool shell_try_for_command(const char *src) {
             done_end ? done_end : "(null)",
             done_end);
 #endif
-    char tail_paths[512];
+    SH_WORDS(tail_paths);
     if (shell_parse_compound_redirs(done_end,
-                                    &tail_redirs, tail_paths,
-                                    sizeof(tail_paths), "for") < 0) {
+                                    &tail_redirs, &tail_paths,
+                                    "for") < 0) {
         kfree(list); kfree(body);
         shell_set_status(2);
         return true;
@@ -25733,9 +26016,9 @@ static bool shell_try_for_command(const char *src) {
     }
 
     struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
+    SH_WORDS(words);
     int ntok = 0;
-    if (shell_tokenize(list, tok, &ntok, words, sizeof(words)) < 0) {
+    if (shell_tokenize(list, tok, &ntok, &words) < 0) {
         if (io_active) shell_restore_io_frame(&io_frame);
         kfree(list); kfree(body);
         shell_set_status(2);
@@ -25754,10 +26037,10 @@ static bool shell_try_for_command(const char *src) {
      * the pipeline on the stack overflowed it and corrupted memory a byte at
      * a time: output came back with single characters missing at random
      * positions, in cases that had nothing to do with loops. */
-    struct shell_pipeline *wl = kmalloc(sizeof(*wl));
+    struct shell_pipeline *wl = shell_pipeline_new();
     struct shell_simple *items = kmalloc(sizeof(*items));
     if (!wl || !items) {
-        if (wl) kfree(wl);
+        if (wl) shell_pipeline_free(wl);
         if (items) kfree(items);
         if (io_active) shell_restore_io_frame(&io_frame);
         kfree(list); kfree(body);
@@ -25766,7 +26049,6 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
     wl->count = 0;
-    wl->expand_pos = 0;
     shell_simple_init(items);
     if (implicit_at) {
         /* `for a` with no `in` iterates the positional parameters with
@@ -25778,7 +26060,7 @@ static bool shell_try_for_command(const char *src) {
             char *saved = 0;
             if (shell_pipeline_save_word(wl, g_positional[i], &saved) < 0 ||
                 shell_add_one_arg(wl, items, saved, true) < 0) {
-                kfree(wl); kfree(items);
+                shell_pipeline_free(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
                 kfree(list); kfree(body);
                 shell_set_status(2);
@@ -25790,7 +26072,7 @@ static bool shell_try_for_command(const char *src) {
             if (tok[i].type != SH_TOK_WORD) continue;
             if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
                                  tok[i].expanded, tok[i].assign_src) < 0) {
-                kfree(wl); kfree(items);
+                shell_pipeline_free(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
                 kfree(list); kfree(body);
                 /* failglob in the list: status 1, the loop never runs. */
@@ -25873,7 +26155,7 @@ done:
     shell_heredoc_mark_free(&hd_mark);
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
-    kfree(wl);
+    shell_pipeline_free(wl);
     kfree(items);
     kfree(list);
     kfree(body);
@@ -25897,10 +26179,10 @@ static bool shell_arith_for_eval(char *expr, long *out) {
     if (!*expr) { *out = 1; return true; }
     if (!shell_arith_dequote(expr)) return false;
     if (!*expr) { *out = 1; return true; }
-    char xexpr[SHELL_PARSE_BUF_MAX];
-    if (shell_expand_literal_quotes(expr, xexpr, sizeof xexpr) != 0) return false;
+    SH_SB(xexpr);
+    if (shell_expand_literal_quotes(expr, &xexpr) != 0) return false;
     struct shell_arith a;
-    a.p = xexpr;
+    a.p = xexpr.p;
     a.ok = true;
     long v = shell_arith_expr(&a);
     if (!a.ok) return false;
@@ -25949,11 +26231,9 @@ static bool shell_try_arith_for_command(const char *src) {
      * of the three may be empty -- `for (( ; ; ))` is the infinite loop --
      * so trimming them turned three expressions into two or one and the loop
      * died as "expected three expressions" (Oils 1641, 1642, 1643). */
-    char head[SHELL_PARSE_BUF_MAX];
-    size_t head_len = (size_t)(end - open);
-    if (head_len + 1 > sizeof head) return false;
-    memcpy(head, open, head_len);
-    head[head_len] = '\0';
+    SH_SB(headb);                   /* the source's length: no limit */
+    if (sb_putmem(&headb, open, (size_t)(end - open)) < 0) return false;
+    char *head = headb.p;
     char *exprs[3] = { head, 0, 0 };
     int nexpr = 1;
     {
@@ -26021,9 +26301,9 @@ static bool shell_try_arith_for_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
-    char tail_paths[512];
-    if (shell_parse_compound_redirs(tail, &tail_redirs, tail_paths,
-                                    sizeof(tail_paths), label) < 0) {
+    SH_WORDS(tail_paths);
+    if (shell_parse_compound_redirs(tail, &tail_redirs, &tail_paths,
+                                    label) < 0) {
         shell_set_status(2);
         return true;
     }
@@ -26139,10 +26419,10 @@ static bool shell_try_while_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
-    char tail_paths[512];
+    SH_WORDS(tail_paths);
     if (shell_parse_compound_redirs(done_end,
-                                    &tail_redirs, tail_paths,
-                                    sizeof(tail_paths), "while") < 0) {
+                                    &tail_redirs, &tail_paths,
+                                    "while") < 0) {
         shell_set_status(2);
         return true;
     }
@@ -26282,10 +26562,10 @@ static bool shell_try_until_command(const char *src) {
     }
 
     struct shell_simple tail_redirs;
-    char tail_paths[512];
+    SH_WORDS(tail_paths);
     if (shell_parse_compound_redirs(done_end,
-                                    &tail_redirs, tail_paths,
-                                    sizeof(tail_paths), "until") < 0) {
+                                    &tail_redirs, &tail_paths,
+                                    "until") < 0) {
         shell_set_status(2);
         return true;
     }
@@ -26426,20 +26706,17 @@ static const char *shell_find_word_marker(const char *start,
     return 0;
 }
 
-static int shell_expand_case_word(const char *src, char *out, size_t cap) {
+static int shell_expand_case_word(const char *src, struct shell_sb *out) {
     struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
+    SH_WORDS(words);
     int ntok = 0;
-    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) return -1;
+    if (shell_tokenize(src, tok, &ntok, &words) < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
         shell_strip_nosplit_inplace(tok[i].text);
-        size_t n = strlen(tok[i].text);
-        if (n + 1 > cap) return -1;
-        memcpy(out, tok[i].text, n + 1);
-        return 0;
+        return sb_set(out, tok[i].text);
     }
-    out[0] = '\0';
+    sb_truncate(out, 0);
     return 0;
 }
 
@@ -26477,14 +26754,13 @@ static bool shell_glob_meta(char c) {
  * 255 in the middle of a script. A quoted metacharacter in a case pattern is
  * ordinary shell (`case $f in "*.txt")`), so this was reachable from any
  * script, not just the corpus. */
-static void shell_case_unquote(char *pat, size_t cap) {
-    char out[SHELL_PARSE_BUF_MAX];
-    if (cap > sizeof out) cap = sizeof out;
-    size_t o = 0;
+static int shell_case_unquote(struct shell_sb *pb) {
+    SH_SB(out);
+    const char *pat = pb->p;
     bool in_sq = false, in_dq = false;
 
-#define SH_CU_PUT(c) do { if (o + 1 >= cap) goto done; out[o++] = (c); } while (0)
-    for (char *r = pat; *r; r++) {
+#define SH_CU_PUT(c) do { if (sb_putc(&out, (c)) < 0) return -1; } while (0)
+    for (const char *r = pat; *r; r++) {
         if (in_sq) {
             if (*r == '\'') { in_sq = false; continue; }
             if (shell_glob_meta(*r)) SH_CU_PUT('\\');
@@ -26508,10 +26784,8 @@ static void shell_case_unquote(char *pat, size_t cap) {
         if (*r == '\\' && r[1]) { SH_CU_PUT(*++r); continue; }
         SH_CU_PUT(*r);
     }
-done:
 #undef SH_CU_PUT
-    out[o] = '\0';
-    memcpy(pat, out, o + 1);
+    return sb_set(pb, out.p);
 }
 
 static bool shell_case_pattern_match(const char *patterns, const char *word) {
@@ -26540,8 +26814,10 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
         const char *end = p;
         while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
 
-        char pat[128];
-        if (shell_copy_segment(pat, sizeof(pat), start, end) == 0) {
+        /* Growable, like the subject: a pattern was 128 bytes, and one that
+         * EXPANDED past that was cut short and compared as the stump. */
+        SH_SB(pat);
+        if (shell_copy_segment_sb(&pat, start, end) == 0) {
             bool was_quoted = (end > start);
             /* A CASE PATTERN IS EXPANDED, and the pattern is what comes out:
              *
@@ -26556,31 +26832,31 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
              * Only patterns that actually contain an expansion take this
              * route. A pattern like `\*` relies on shell_case_unquote's
              * backslash handling, which the expander would consume. */
-            if (shell_word_has(pat, '$') || shell_word_has(pat, '`')) {
-                char xp[SHELL_PARSE_BUF_MAX];
-                if (shell_expand_word_ex(pat, xp, sizeof xp, true, true) == 0) {
-                    size_t o = 0;
+            if (shell_word_has(pat.p, '$') || shell_word_has(pat.p, '`')) {
+                SH_SB(xp);
+                if (shell_expand_word_ex(pat.p, &xp, true, true) == 0) {
+                    sb_truncate(&pat, 0);
                     bool prot = false;
-                    for (const char *q = xp; *q && o + 2 < sizeof pat; q++) {
+                    for (const char *q = xp.p; *q; q++) {
                         if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
-                            pat[o++] = *q++;
-                            pat[o++] = *q;
+                            if (sb_putc(&pat, *q++) < 0 ||
+                                sb_putc(&pat, *q) < 0) return false;
                             continue;
                         }
                         if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
-                        if (prot && shell_glob_meta(*q)) pat[o++] = '\\';
-                        pat[o++] = *q;
+                        if (prot && shell_glob_meta(*q) &&
+                            sb_putc(&pat, '\\') < 0) return false;
+                        if (sb_putc(&pat, *q) < 0) return false;
                     }
-                    pat[o] = '\0';
-                    if (pat[0] && shell_glob_match(pat, word)) return true;
+                    if (pat.p[0] && shell_glob_match(pat.p, word)) return true;
                     if (*p == '|') p++;
                     continue;
                 }
             }
-            shell_case_unquote(pat, sizeof pat);
+            if (shell_case_unquote(&pat) < 0) return false;
             /* An empty pattern is only meaningful if it came from quotes;
              * a genuinely blank clause is still skipped. */
-            if ((pat[0] || was_quoted) && shell_glob_match(pat, word)) return true;
+            if ((pat.p[0] || was_quoted) && shell_glob_match(pat.p, word)) return true;
         }
         if (*p == '|') p++;
     }
@@ -26656,15 +26932,17 @@ static bool shell_try_case_command(const char *src) {
 
     /* Heap, not stack -- see shell_dup_segment(). Dead once expanded. */
     char *word_src = shell_dup_segment(s, in_at);
-    char word[SHELL_PARSE_BUF_MAX];
+    SH_SB(wordb);
+    const char *word = wordb.p;
     if (!word_src ||
-        shell_expand_case_word(word_src, word, sizeof(word)) < 0) {
+        shell_expand_case_word(word_src, &wordb) < 0) {
         kfree(word_src);
         kprintf("case: word too long\n");
         shell_set_status(2);
         return true;
     }
     kfree(word_src);
+    word = wordb.p;                 /* it may have grown into the heap */
 
     const char *p = shell_skip_blanks(in_at + 2);
     if (*p == ';') p++;
@@ -26731,19 +27009,22 @@ static bool shell_try_case_command(const char *src) {
         }
         if (!sep || sep > esac_at) sep = esac_at;
 
-        char pats[128];
         /* Heap, not stack -- see shell_dup_segment(). A clause body is
-         * re-allocated per clause and dead at the end of the iteration. */
+         * re-allocated per clause and dead at the end of the iteration. The
+         * pattern list is sized from itself; it was 128 bytes. */
         char *body_text = shell_dup_segment(body, sep);
-        if (!body_text ||
-            shell_copy_segment(pats, sizeof(pats), p, close) < 0) {
+        char *pats = shell_dup_segment(p, close);
+        if (!body_text || !pats) {
+            kfree(pats);
             kfree(body_text);
-            kprintf("case: clause too long\n");
+            kprintf("case: out of memory\n");
             shell_set_status(2);
             return true;
         }
 
-        if (!matched && shell_case_pattern_match(pats, word)) {
+        bool hit = !matched && shell_case_pattern_match(pats, word);
+        kfree(pats);
+        if (hit) {
             matched = true;
             shell_lmap_push_copy(body_text, body);
             execute_line_text(body_text);
@@ -26839,25 +27120,18 @@ static bool shell_try_function_definition(const char *src) {
             if (*q == ')') { if (--pdepth == 0) break; }
         }
         if (*q == ')') {
-            char body[SHELL_PARSE_BUF_MAX];
             /* Wrap the subshell text in a group so the stored body is a
              * command the normal executor already understands. */
-            int bn = ksnprintf(body, sizeof body, "( %.*s )",
-                               (int)(q - (s + 1)), s + 1);
-            if (bn < 0 || (size_t)bn >= sizeof body) {
-                kprintf("function: body too long\n");
+            SH_SB(body);
+            SH_SB(fnameb);
+            if (sb_puts(&body, "( ") < 0 ||
+                sb_putmem(&body, s + 1, (size_t)(q - (s + 1))) < 0 ||
+                sb_puts(&body, " )") < 0 ||
+                sb_putmem(&fnameb, name_start, name_len) < 0) {
                 shell_set_status(2);
                 return true;
             }
-            char fname[64];
-            if (name_len + 1 > sizeof fname) {
-                kprintf("function: name too long\n");
-                shell_set_status(2);
-                return true;
-            }
-            memcpy(fname, name_start, name_len);
-            fname[name_len] = '\0';
-            if (shell_function_set(fname, body) < 0) {
+            if (shell_function_set(fnameb.p, body.p) < 0) {
                 shell_set_status(1);
                 return true;
             }
@@ -26899,18 +27173,17 @@ static bool shell_try_function_definition(const char *src) {
         return true;
     }
 
-    char name[64];
+    SH_SB(nameb);
     /* Heap, not stack -- see shell_dup_segment(). shell_function_set()
      * strdup()s the text, so this is freed on every path below. */
     char *body = shell_dup_segment(body_start, body_end);
-    if (name_len == 0 || name_len + 1 > sizeof(name) || !body) {
+    if (name_len == 0 || !body || sb_putmem(&nameb, name_start, name_len) < 0) {
         kfree(body);
         kprintf("function: definition too long\n");
         shell_set_status(2);
         return true;
     }
-    memcpy(name, name_start, name_len);
-    name[name_len] = '\0';
+    const char *name = nameb.p;
 
     /* A REDIRECTION AFTER `}` BELONGS TO THE DEFINITION, NOT TO THE CALL.
      *
@@ -26924,13 +27197,14 @@ static bool shell_try_function_definition(const char *src) {
     {
         const char *tail = shell_skip_blanks(body_end + 1);
         if (*tail && *tail != ';' && *tail != '&' && *tail != '|') {
-            char *wrapped = (char *)kmalloc(SHELL_COMPOUND_BODY_MAX);
-            if (wrapped) {
-                int wn = ksnprintf(wrapped, SHELL_COMPOUND_BODY_MAX,
-                                   "{ %s; } %s", body, tail);
-                if (wn > 0 && (size_t)wn < SHELL_COMPOUND_BODY_MAX)
-                    memcpy(body, wrapped, (size_t)wn + 1);
-                kfree(wrapped);
+            SH_SB(wrapped);
+            if (sb_puts(&wrapped, "{ ") == 0 && sb_puts(&wrapped, body) == 0 &&
+                sb_puts(&wrapped, "; } ") == 0 && sb_puts(&wrapped, tail) == 0) {
+                char *w = sb_steal(&wrapped);
+                if (w) {
+                    kfree(body);
+                    body = w;
+                }
             }
         }
     }
@@ -27287,7 +27561,7 @@ static bool shell_try_subshell_command(const char *src) {
         kprintf("subshell: body too long\n");
         shell_set_status(2);
         kfree(body);
-        kfree(plp);
+        shell_pipeline_free(plp);
         return true;
     }
 
@@ -27312,7 +27586,7 @@ static bool shell_try_subshell_command(const char *src) {
             shell_set_status(1);
 #endif
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
     }
@@ -27324,15 +27598,15 @@ static bool shell_try_subshell_command(const char *src) {
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
     struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
-    plp = kmalloc(sizeof(*plp));
+    SH_WORDS(words);
+    plp = shell_pipeline_new();
     if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+        if (shell_tokenize(tail, tok, &ntok, &words) < 0) {
             shell_set_status(2);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         int i = 0;
@@ -27342,7 +27616,7 @@ static bool shell_try_subshell_command(const char *src) {
             kprintf("subshell: expected only redirections after ')'\n");
             shell_parse_error();
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
@@ -27350,7 +27624,7 @@ static bool shell_try_subshell_command(const char *src) {
             kprintf("subshell: unexpected text after redirection\n");
             shell_set_status(2);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         redirs = plp->stage[0];
@@ -27361,7 +27635,7 @@ static bool shell_try_subshell_command(const char *src) {
         kprintf("subshell: failed to save shell state\n");
         shell_set_status(1);
         kfree(body);
-        kfree(plp);
+        shell_pipeline_free(plp);
         return true;
     }
 
@@ -27372,7 +27646,7 @@ static bool shell_try_subshell_command(const char *src) {
             shell_subshell_frame_restore(&state);
             shell_set_status(1);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         io_active = true;
@@ -27401,7 +27675,7 @@ static bool shell_try_subshell_command(const char *src) {
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
     kfree(body);
-    kfree(plp);
+    shell_pipeline_free(plp);
     return true;
 }
 
@@ -27470,7 +27744,7 @@ static bool shell_try_group_command(const char *src) {
         kprintf("group: body too long\n");
         shell_set_status(2);
         kfree(body);
-        kfree(plp);
+        shell_pipeline_free(plp);
         return true;
     }
 
@@ -27495,7 +27769,7 @@ static bool shell_try_group_command(const char *src) {
             shell_set_status(1);
 #endif
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
     }
@@ -27507,15 +27781,15 @@ static bool shell_try_group_command(const char *src) {
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
     struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
-    plp = kmalloc(sizeof(*plp));
+    SH_WORDS(words);
+    plp = shell_pipeline_new();
     if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, words, sizeof(words)) < 0) {
+        if (shell_tokenize(tail, tok, &ntok, &words) < 0) {
             shell_set_status(2);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         int i = 0;
@@ -27525,7 +27799,7 @@ static bool shell_try_group_command(const char *src) {
             kprintf("group: expected only redirections after '}'\n");
             shell_parse_error();
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         enum shell_tok_type sep = shell_consume_separator(tok, ntok, &i);
@@ -27533,7 +27807,7 @@ static bool shell_try_group_command(const char *src) {
             kprintf("group: unexpected text after redirection\n");
             shell_set_status(2);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         redirs = plp->stage[0];
@@ -27545,7 +27819,7 @@ static bool shell_try_group_command(const char *src) {
         if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
             shell_set_status(1);
             kfree(body);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return true;
         }
         io_active = true;
@@ -27562,7 +27836,7 @@ static bool shell_try_group_command(const char *src) {
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_set_status(rc);
     kfree(body);
-    kfree(plp);
+    shell_pipeline_free(plp);
     return true;
 }
 
@@ -27649,16 +27923,12 @@ static bool shell_run_list_line(const char *src) {
         const char *end = sep ? sep : cur + strlen(cur);
 
         /* Heap: execute_line_text recurses (a compound body re-enters it),
-         * and a kilobyte per level adds up fast on a kernel stack. */
-        char *seg = kmalloc(SHELL_PARSE_BUF_MAX);
+         * and a kilobyte per level adds up fast on a kernel stack. Sized
+         * from the segment -- a list element over 8 KiB was "command too
+         * long". */
+        char *seg = shell_dup_segment(cur, end);
         if (!seg) {
             kprintf("shell: out of memory\n");
-            shell_set_status(2);
-            return true;
-        }
-        if (shell_copy_segment(seg, SHELL_PARSE_BUF_MAX, cur, end) < 0) {
-            kfree(seg);
-            kprintf("shell: command too long\n");
             shell_set_status(2);
             return true;
         }
@@ -27894,12 +28164,8 @@ static bool shell_try_background_line(const char *src) {
         if (q >= left_end) return false;
     }
 
-    char *left = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+    char *left = shell_dup_segment(src, left_end);
     if (!left) return false;
-    if (shell_copy_segment(left, SHELL_PARSE_BUF_MAX, src, left_end) < 0) {
-        kfree(left);
-        return false;
-    }
 
     /* A compound is backgrounded the same way, and this is the one path that
      * can do it without the token parser seeing the keyword first. */
@@ -27916,12 +28182,19 @@ static bool shell_try_background_line(const char *src) {
 
 /* Returns false when this is not a pipeline, or when no stage is compound --
  * in which case the existing token-level path handles it exactly as before. */
+static void shell_stages_free(char **st) {
+    for (int i = 0; i < SHELL_STAGE_MAX; i++) {
+        kfree(st[i]);
+        st[i] = 0;
+    }
+}
+
 static bool shell_try_compound_pipeline(const char *src) {
     if (!shell_find_pipe_at(src)) return false;
 
-    char (*stages)[SHELL_PARSE_BUF_MAX] =
-        kmalloc(sizeof(*stages) * SHELL_STAGE_MAX);
-    if (!stages) return false;
+    /* Each stage's text, sized from itself: they were 8 KiB arrays, and a
+     * longer stage sent the whole pipeline back to the token path. */
+    char *stages[SHELL_STAGE_MAX] = { 0 };
 
     int n = 0;
     bool any_compound = false, overflow = false;
@@ -27932,7 +28205,8 @@ static bool shell_try_compound_pipeline(const char *src) {
         const char *sep = shell_find_pipe_at(cur);
         const char *end = sep ? sep : cur + strlen(cur);
         if (n >= SHELL_STAGE_MAX) { overflow = true; break; }
-        if (shell_copy_segment(stages[n], SHELL_PARSE_BUF_MAX, cur, end) < 0) {
+        stages[n] = shell_dup_segment(cur, end);
+        if (!stages[n]) {
             overflow = true;
             break;
         }
@@ -27975,11 +28249,11 @@ static bool shell_try_compound_pipeline(const char *src) {
      * producer that never ends still cannot be stopped -- no fork. */
     if (!any_compound) {
 #endif
-        kfree(stages);
+        shell_stages_free(stages);
         return false;
     }
     if (overflow || n < 2) {
-        kfree(stages);
+        shell_stages_free(stages);
         return false;
     }
 
@@ -28000,7 +28274,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (ln) g_shell_lineno = ln;
         shell_run_debug_trap();
     }
-    if (g_shell_flow != SHELL_FLOW_NONE) { kfree(stages); return true; }
+    if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages); return true; }
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
 #ifdef SHELL_HOSTED
@@ -28161,7 +28435,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
     }
-    kfree(stages);
+    shell_stages_free(stages);
     if (g_opt_pipefail && failed != 0) last = failed;
     shell_set_status(last);
     return true;
@@ -28261,7 +28535,7 @@ static int shell_syntax_check(const char *s) {
 
 static void execute_line_text_inner(const char *src) {
     struct shell_token tok[SHELL_TOKEN_MAX];
-    char words[SHELL_PARSE_BUF_MAX];
+    SH_WORDS(words);
     int ntok = 0;
 
     src = src ? src : "";
@@ -28423,8 +28697,8 @@ static void execute_line_text_inner(const char *src) {
             if (amp && amp > q) {
 #ifdef SHELL_HOSTED
                 size_t n = (size_t)(amp - q);
-                char *body = kmalloc(SHELL_PARSE_BUF_MAX);
-                if (body && n + 1 < SHELL_PARSE_BUF_MAX) {
+                char *body = kmalloc(n + 1);    /* its own length: no limit */
+                if (body) {
                     memcpy(body, q, n);
                     body[n] = '\0';
                     shell_set_status(shell_background_forked(body, "compound"));
@@ -28668,7 +28942,7 @@ static void execute_line_text_inner(const char *src) {
         }
     }
 
-    if (shell_tokenize(src, tok, &ntok, words, sizeof(words)) < 0) {
+    if (shell_tokenize(src, tok, &ntok, &words) < 0) {
         if (g_bad_subst_soft) {
             /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
              * command is skipped with status 1 and so is the rest of
@@ -28738,7 +29012,7 @@ static void execute_line_text_inner(const char *src) {
 
         /* Heap, not stack: struct shell_pipeline is ~40 KiB, and this is the
          * per-command path that recurses through every compound construct. */
-        struct shell_pipeline *plp = kmalloc(sizeof(*plp));
+        struct shell_pipeline *plp = shell_pipeline_new();
         if (!plp) { shell_set_status(2); return; }
         int parsed = shell_parse_pipeline(tok, ntok, &i, plp);
         if (parsed < 0) {
@@ -28758,13 +29032,13 @@ static void execute_line_text_inner(const char *src) {
             } else {
                 shell_set_status(2);
             }
-            kfree(plp);
+            shell_pipeline_free(plp);
             return;
         }
         if (parsed == 0) {
             kprintf("shell: expected command\n");
             shell_set_status(2);
-            kfree(plp);
+            shell_pipeline_free(plp);
             return;
         }
 
@@ -28775,7 +29049,7 @@ static void execute_line_text_inner(const char *src) {
              * which is what bash's per-element firing looks like from
              * outside (1194). $LINENO is the command's own line here. */
             for (int s = 0; s < plp->count; s++) shell_run_debug_trap();
-            if (g_shell_flow != SHELL_FLOW_NONE) { kfree(plp); return; }
+            if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
             if (g_opt_xtrace) {
                 kprintf("+ ");
                 for (int s = 0; s < plp->count; s++) {
@@ -28789,7 +29063,7 @@ static void execute_line_text_inner(const char *src) {
             last = shell_run_pipeline(plp, background);
             if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
-            if (g_shell_flow != SHELL_FLOW_NONE) { kfree(plp); return; }
+            if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
             /* A segment reaching here has already been split off any && or ||
              * by shell_run_list_line, which is where the AND-OR exemption
              * lives; `sep` is all but always SH_TOK_SEMI. It is still tested
@@ -28817,11 +29091,11 @@ static void execute_line_text_inner(const char *src) {
                 g_errexit_negate == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
-                kfree(plp);
+                shell_pipeline_free(plp);
                 return;
             }
         }
-        kfree(plp);
+        shell_pipeline_free(plp);
         prev_link = sep;
     }
 }
@@ -28873,11 +29147,10 @@ static void execute_line_text(const char *src) {
         return;
     }
 
-    char *abuf = (char *)kmalloc(SHELL_PARSE_BUF_MAX);
+    SH_SB(abuf);
     const char *line_src = src;
-    if (abuf) {
-        const char *expanded = shell_expand_aliases(src ? src : "", abuf,
-                                                    SHELL_PARSE_BUF_MAX);
+    {
+        const char *expanded = shell_expand_aliases(src ? src : "", &abuf);
         if (expanded) {
             /* THE MAP IS KEYED ON A BUFFER, and this is where the buffer
              * changes. An alias pass that changed nothing produces an
@@ -28885,17 +29158,19 @@ static void execute_line_text(const char *src) {
              * that changed something invalidates them, and `$LINENO` falls
              * back to the line the reader was on. */
             if (expanded != src && g_lmap_base == src) {
-                if (src && strcmp(expanded, src) == 0) g_lmap_base = expanded;
-                else g_lmap_base = 0;
+                if (src && strcmp(expanded, src) == 0) {
+                    g_lmap_base = expanded;
+                    g_lmap_limit = strlen(expanded) + 1;
+                } else {
+                    g_lmap_base = 0;
+                }
             }
             line_src = expanded;
         }
         else {
-            /* Expansion overflowed. Say so rather than silently running the
+            /* Memory ran out. Say so rather than silently running the
              * unexpanded text, which would look like the alias never existed. */
-            kprintf("shell: alias expansion too long\n");
             shell_set_status(2);
-            kfree(abuf);
             return;
         }
     }
@@ -28911,7 +29186,6 @@ static void execute_line_text(const char *src) {
      * oops'` produces a `;;` outside any case, which is the syntax error
      * bash reports and tsh used to run. */
     if (!shell_line_syntax_ok(line_src)) {
-        if (abuf) kfree(abuf);
         return;
     }
 
@@ -28934,9 +29208,9 @@ static void execute_line_text(const char *src) {
      * it: the shell's end closes here, and that close is the EOF the
      * command on the other side is waiting for. */
     int psub = shell_procsub_mark();
-    if (abuf && line_src == abuf && !shell_text_has_newline(src) &&
-        shell_text_has_newline(abuf)) {
-        char *p = abuf;
+    if (line_src == abuf.p && !shell_text_has_newline(src) &&
+        shell_text_has_newline(abuf.p)) {
+        char *p = abuf.p;
         while (p && *p) {
             char *nl = shell_unquoted_newline(p);
             if (nl) *nl = '\0';
@@ -28949,7 +29223,6 @@ static void execute_line_text(const char *src) {
     }
     shell_procsub_release(psub);
     g_exec_line_depth--;
-    if (abuf) kfree(abuf);
 }
 
 static char g_heredoc_cmd[LINE_MAX];
@@ -29001,11 +29274,10 @@ static void execute_line_body(void) {
             if (g_heredoc_strip_tabs) while (*raw == '\t') raw++;
 
             const char *emit = raw;
-            char expanded[LINE_MAX * 2];
+            SH_SB(expanded);
             if (!g_heredoc_quoted) {
-                if (shell_expand_literal_quotes(raw, expanded,
-                                                sizeof(expanded)) >= 0)
-                    emit = expanded;
+                if (shell_expand_literal_quotes(raw, &expanded) >= 0)
+                    emit = expanded.p;
             }
             size_t n = strlen(emit);
             if (g_heredoc_body_len + n + 2 <= sizeof(g_heredoc_body)) {
@@ -29493,7 +29765,7 @@ int shell_line_incomplete_hosted(const char *s) {
     struct shell_scan scan;
     shell_scan_init(&scan);
     const char *p = s;
-    char lb[SHELL_PARSE_BUF_MAX];
+    SH_SB(lb);                      /* one physical line, whatever its length */
     /* A `(` THAT CANNOT BE THERE ENDS THE WAIT FOR MORE INPUT.
      *
      *     $ echo a (b      bash: syntax error near unexpected token `('
@@ -29510,11 +29782,9 @@ int shell_line_incomplete_hosted(const char *s) {
     while (*p) {
         size_t n = 0;
         while (p[n] && p[n] != '\n') n++;
-        if (n < sizeof lb) {
-            memcpy(lb, p, n);
-            lb[n] = '\0';
-            shell_scan_line(&scan, lb);
-        }
+        sb_truncate(&lb, 0);
+        if (sb_putmem(&lb, p, n) < 0) return 0;
+        shell_scan_line(&scan, lb.p);
         if (first) { first_bad_paren = scan.bad_paren; first = false; }
         p += n + (p[n] ? 1 : 0);
     }
