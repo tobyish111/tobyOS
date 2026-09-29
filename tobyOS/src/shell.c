@@ -12962,14 +12962,19 @@ static const char *printf_arg_str(int argc, char **argv, int *argi) {
     return argv[(*argi)++];
 }
 
-/* Sink for `printf -v`: collects what would have gone to stdout. */
-struct printf_capture { char buf[4096]; size_t len; };
+/* Sink for `printf -v`: collects what would have gone to stdout -- all of
+ * it. It was a 4 KiB array that dropped the rest without a word, so
+ * `printf -v v '%s' "$long"` left v holding its first 4095 bytes. */
+struct printf_capture { struct shell_sb sb; bool failed; };
 
 static void printf_capture_sink(const char *s, void *ctx) {
     struct printf_capture *c = (struct printf_capture *)ctx;
-    if (!c || !s) return;
-    while (*s && c->len + 1 < sizeof c->buf) c->buf[c->len++] = *s++;
-    c->buf[c->len] = '\0';
+    if (!c || !s || c->failed) return;
+    if (sb_puts(&c->sb, s) < 0) c->failed = true;
+}
+
+static void printf_capture_free(struct printf_capture *c) {
+    sb_free(&c->sb);
 }
 
 /* `printf %q` -- print an argument as text you could type back.
@@ -13101,12 +13106,12 @@ static void cmd_printf(int argc, char **argv) {
         return;
     }
 
-    struct printf_capture cap;
+    struct printf_capture cap __attribute__((cleanup(printf_capture_free)));
+    sb_init(&cap.sb);
+    cap.failed = false;
     shell_write_fn_t saved_out = g_shell_out;
     void *saved_ctx = g_shell_out_ctx;
     if (vname) {
-        cap.len = 0;
-        cap.buf[0] = '\0';
         g_shell_out = printf_capture_sink;
         g_shell_out_ctx = &cap;
     }
@@ -13392,7 +13397,7 @@ static void cmd_printf(int argc, char **argv) {
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
             return;
         }
-        if (env_set(vname, cap.buf) < 0) shell_set_status(1);
+        if (cap.failed || env_set(vname, cap.sb.p) < 0) shell_set_status(1);
     }
 }
 

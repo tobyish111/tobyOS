@@ -36,6 +36,7 @@ k=${s:0:600}; case "$k" in "$k") echo "v24 long-pattern-ok";; esac
 q=$(printf '%s%s' "$s" "$s"); echo "v25 [${#q}]"
 for it in "$s"; do echo "v26 [${#it}]"; done
 unset uv; : "${uv:=$s}"; echo "v27 [${#uv}]"
+printf -v pv '%s' "$s"; echo "v30 [${#pv}]"
 lit=L; for i in 1 2 3 4 5 6 7; do lit="$lit$lit"; done
 bx=$(eval "printf '%s\n' ${lit}{1..80}"); echo "v31 [${#bx}] [${bx:0:3}]"
 echo "$(seq 20000)" | tail -1 | sed "s/^/v32 /"
