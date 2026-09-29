@@ -14,21 +14,47 @@ static struct tcp_conn *g_cli;
 static char             g_buf[TSH_LINE_MAX];
 static size_t           g_len;
 
-static void tsh_send_str(struct tcp_conn *c, const char *s) {
-    if (!c || !s) return;
+/* OUTPUT IS BUFFERED AND SENT IN ONE PIECE PER POLL.
+ *
+ * Every byte the kernel shell wrote went out as its own tcp_send() -- and
+ * tcp_send BLOCKS until what it sent is acknowledged. A 700-byte `ls /dev`
+ * was 700 round trips against a client that delays small ACKs; a send that
+ * gave up dropped its byte and logged "send failed/stalled" (itself a line
+ * that takes ~30 ms at 38400 baud); and the connection was left backed off,
+ * so on the EliteDesk the NEXT command's reply -- even a bare `echo` -- took
+ * ~30 s (measured: alone 1.2 s, after `ls /dev` 30.8 s and 33.1 s). QEMU
+ * acknowledges at once and never showed it.
+ *
+ * Now everything -- the shell's output, the echo of typed keys, prompts --
+ * collects here and is flushed by tsh_flush(): at the end of each poll pass,
+ * before a close, and whenever the buffer fills. One send, one round trip. */
+#define TSH_OUT_MAX 4096u
+static char   g_out[TSH_OUT_MAX];
+static size_t g_out_len;
+static bool   g_out_failed;
 
-    size_t n = strlen(s);
-    if (n == 0) return;
+static void tsh_flush(void) {
+    if (!g_cli || g_out_len == 0) { g_out_len = 0; return; }
+    long w = tcp_send(g_cli, g_out, g_out_len);
+    if (w <= 0 && !g_out_failed) {
+        g_out_failed = true;              /* once per client, not per byte */
+        kprintf("[tcp-shell] send failed/stalled (rc=%ld, %u bytes)\n",
+                w, (unsigned)g_out_len);
+    }
+    g_out_len = 0;
+}
 
-    long w = tcp_send(c, s, n);
-    if (w <= 0) {
-        kprintf("[tcp-shell] send failed/stalled\n");
+static void tsh_out(const char *s) {
+    if (!g_cli || !s) return;
+    for (; *s; s++) {
+        if (g_out_len == TSH_OUT_MAX) tsh_flush();
+        g_out[g_out_len++] = *s;
     }
 }
 
 static void tsh_shell_write(const char *s, void *ctx) {
-    struct tcp_conn *c = (struct tcp_conn *)ctx;
-    tsh_send_str(c, s);
+    (void)ctx;
+    tsh_out(s);
 }
 
 void tcp_shell_init(void) {
@@ -60,18 +86,25 @@ void tcp_shell_poll(void) {
 
             g_len = 0;
             g_buf[0] = '\0';
+            g_out_len = 0;
+            g_out_failed = false;
 
-            tsh_send_str(g_cli,
-                         "tobyOS TCP shell\r\n"
-                         "Input and selected builtin output are accepted over TCP.\r\n"
-                        "Commands still using kprintf will print to local console/serial.\r\n");
+            tsh_out("tobyOS TCP shell\r\n"
+                    "Input and selected builtin output are accepted over TCP.\r\n"
+                    "Commands still using kprintf will print to local console/serial.\r\n");
+            tsh_flush();
         } else {
             return;
         }
     }
 
     uint8_t chunk[256];
-    long n = tcp_recv(g_cli, chunk, sizeof(chunk), 0);
+    /* QUIET: this is a poller. tcp_recv logs "[tcp] RECV-TIMEOUT" on every
+     * empty poll -- twice a millisecond while a client sat connected, far
+     * more than a 38400-baud console can carry, so the serial log overflowed
+     * and garbled, lagging minutes behind the machine. tcp_recv_quiet exists
+     * for exactly this (the SSH worker's same flood). */
+    long n = tcp_recv_quiet(g_cli, chunk, sizeof(chunk), 0);
 
     if (n > 0) {
         for (long i = 0; i < n; i++) {
@@ -84,7 +117,7 @@ void tcp_shell_poll(void) {
                 if (g_len > 0) {
                     g_len--;
                     g_buf[g_len] = '\0';
-                    tsh_send_str(g_cli, "\b \b");
+                    tsh_out("\b \b");
                 }
                 continue;
             }
@@ -92,7 +125,7 @@ void tcp_shell_poll(void) {
             if (ch == '\n') {
                 g_buf[g_len] = '\0';
             
-                tsh_send_str(g_cli, "\r\n");
+                tsh_out("\r\n");
             
                 shell_set_output(tsh_shell_write, g_cli);
                 shell_run_test_line(g_buf);
@@ -102,7 +135,8 @@ void tcp_shell_poll(void) {
                  * kernel shell has consumed the request and keeps running
                  * for the next connection. */
                 if (shell_take_exit_request()) {
-                    tsh_send_str(g_cli, "exit\r\n");
+                    tsh_out("exit\r\n");
+                    tsh_flush();
                     kprintf("[tcp-shell] client ended the session (exit)\n");
                     tcp_close(g_cli);
                     g_cli = NULL;
@@ -119,8 +153,7 @@ void tcp_shell_poll(void) {
                  * `cat <<EOF` looked as if it had run and printed nothing --
                  * the user had no sign that the next lines were being
                  * gathered. The console already says "> " (prompt()). */
-                tsh_send_str(g_cli, shell_input_pending() ? "\r\n> "
-                                                          : "\r\ntobyOS> ");
+                tsh_out(shell_input_pending() ? "\r\n> " : "\r\ntobyOS> ");
                 continue;
             }
 
@@ -128,8 +161,7 @@ void tcp_shell_poll(void) {
                 continue;
 
             if (g_len + 1 >= TSH_LINE_MAX) {
-                tsh_send_str(g_cli,
-                             "\r\n[line too long, cleared]\r\ntobyOS> ");
+                tsh_out("\r\n[line too long, cleared]\r\ntobyOS> ");
                 g_len = 0;
                 g_buf[0] = '\0';
                 continue;
@@ -137,9 +169,10 @@ void tcp_shell_poll(void) {
 
             g_buf[g_len++] = ch;
             char echo[2] = { ch, '\0' };
-            tsh_send_str(g_cli, echo);
+            tsh_out(echo);
         }
 
+        tsh_flush();          /* this pass's echo, output and prompt: one send */
         return;
     }
 
