@@ -28480,11 +28480,44 @@ static void execute_line_text_inner(const char *src) {
                  * `in` that can only belong to a compound, and neither exists
                  * when the keyword ends the command. Erroring on the keyword
                  * itself turned a 127 into a 2. */
-                const char *rest = shell_skip_blanks(
-                    a + strlen(compound_kw[m]));
-                if (!*rest || *rest == ';') break;
-                kprintf("shell: syntax error near unexpected token `%s'\n",
-                        compound_kw[m]);
+                /* WHAT bash rejects, measured (`bash -c`, 5.2):
+                 *
+                 *     FOO=bar for x                  for: command not found, 127
+                 *     FOO=bar for 2>/dev/null        127
+                 *     FOO=bar case x in              case: command not found, 127
+                 *     FOO=bar for i in a b; do ...   syntax error near `do'
+                 *     FOO=bar if true; then ...      syntax error near `then'
+                 *
+                 * After a prefix the keyword is a plain command NAME; what can
+                 * never parse is the CLOSER that follows once that simple
+                 * command ends. tsh rejected the keyword itself whenever
+                 * anything but nothing or `;` came after it, so the first
+                 * three were a status-2 syntax error. The command runs up to
+                 * the first unquoted separator; only a closer right after it
+                 * is the error, and it is the token bash names. (With an
+                 * assignment prefix the list splitter has usually cut at the
+                 * `;` already, and the closer's own segment is then refused
+                 * by the misplaced-keyword check above.) */
+                const char *r = a + strlen(compound_kw[m]);
+                bool rsq = false, rdq = false;
+                while (*r && (rsq || rdq || (*r != ';' && *r != '&' &&
+                                             *r != '|' && *r != '\n'))) {
+                    if (*r == '\\' && r[1] && !rsq) { r += 2; continue; }
+                    if (*r == '\'' && !rdq) rsq = !rsq;
+                    else if (*r == '"' && !rsq) rdq = !rdq;
+                    r++;
+                }
+                if (!*r) break;                      /* one simple command */
+                while (*r == ';' || *r == '&' || *r == '|' || *r == '\n' ||
+                       *r == ' ' || *r == '\t') r++;
+                static const char *const closer[] = {
+                    "do", "then", "done", "fi", "esac", "elif", "else", 0
+                };
+                const char *bad = 0;
+                for (int k = 0; closer[k]; k++)
+                    if (shell_starts_with_word(r, closer[k])) { bad = closer[k]; break; }
+                if (!bad) break;
+                kprintf("shell: syntax error near unexpected token `%s'\n", bad);
                 shell_parse_error();
                 return;
             }
