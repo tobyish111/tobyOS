@@ -18,6 +18,7 @@
 #include <tobyos/keyboard.h>
 #include <tobyos/console.h>
 #include <tobyos/serial.h>
+#include <tobyos/devfs.h>
 #include <tobyos/printk.h>
 #include <tobyos/panic.h>
 #include <tobyos/klibc.h>
@@ -22644,10 +22645,36 @@ static struct file *shell_open_dev_node(const char *path) {
     (void)path;
     return 0;
 #else
+    /* ...and the rest of the plain nodes, made the way sys_open makes them.
+     * Only null and zero were here, so in the kernel shell
+     *
+     *     echo x > /dev/tty1        "'/dev/tty1': permission denied"
+     *     echo x > /dev/full        the same, where bash says "No space left"
+     *     read -n 4 r < /dev/urandom
+     *
+     * all failed at the redirection -- devfs lists and stats these nodes, but
+     * a VFS open of a device is refused (the device FILE is sys_open's job).
+     * The terminals -- /dev/tty, /dev/console, /dev/tty0..63 -- are the
+     * kernel console, which is what sys_open gives any process for them; a
+     * console file written by a builtin goes to THIS shell's terminal (see
+     * shell_file_output). The device-specific nodes (ptmx, fb0, input, pts,
+     * dri, snd) stay refused: they need a process context of their own. */
     enum file_kind kind;
-    if (strcmp(path, "/dev/null") == 0)      kind = FILE_KIND_DEVNULL;
-    else if (strcmp(path, "/dev/zero") == 0) kind = FILE_KIND_DEVZERO;
-    else return 0;
+    if (strcmp(path, "/dev/null") == 0)         kind = FILE_KIND_DEVNULL;
+    else if (strcmp(path, "/dev/zero") == 0)    kind = FILE_KIND_DEVZERO;
+    else if (strcmp(path, "/dev/full") == 0)    kind = FILE_KIND_DEVFULL;
+    else if (strcmp(path, "/dev/random") == 0 ||
+             strcmp(path, "/dev/urandom") == 0) kind = FILE_KIND_DEVRANDOM;
+    else {
+        uint32_t maj = 0, min = 0;
+        bool term = strcmp(path, "/dev/tty") == 0 ||
+                    strcmp(path, "/dev/console") == 0 ||
+                    (devfs_node_mode(path, &maj, &min) && maj == 4);
+        if (!term) return 0;
+        struct file *c = console_file_make();
+        if (c) c->o_accmode = 2;
+        return c;
+    }
     struct file *f = (struct file *)kmalloc(sizeof(*f));
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
