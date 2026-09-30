@@ -1711,6 +1711,28 @@ static int sh_array_store_expanded(const char *name, const char *ex,
     size_t f = 0;
     bool any = false;
     bool in_nosplit = false;
+    /* THE FIRST `$@` MARK IS NOT A BOUNDARY. The expansion puts a mark
+     * BEFORE every element, the first included, and this took each one as
+     * a boundary -- so the (empty) text before the first mark became an
+     * element of its own:
+     *
+     *     a=(1 2 3); c=("${a[@]}")      bash: 1 2 3     tsh: "" 1 2 3
+     *
+     * which is the ordinary way to copy an array. The argv side has always
+     * had the rule (shell_add_marked_words): the first mark glues what
+     * precedes it onto the first element, and a word that is ONE mark with
+     * no text at all -- "${e[@]}" of an empty array -- is no element. */
+    bool first_mark = true;
+    {
+        int marks = 0;
+        size_t real = 0;
+        for (const char *q = ex; *q; q++) {
+            if (*q == SHELL_DATA_ESC && q[1]) { q++; real++; continue; }
+            if (*q == SHELL_ARG_MARK) marks++;
+            else if (*q != SHELL_NOSPLIT_MARK) real++;
+        }
+        if (marks == 1 && real == 0) return 0;
+    }
     for (const char *q = ex; ; q++) {
         bool end = (*q == '\0');
         bool boundary = false;
@@ -1722,8 +1744,12 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             }
             if (*q == SHELL_NOSPLIT_MARK) { in_nosplit = !in_nosplit; continue; }
             /* A `$@`/`${a[@]}` mark is a field boundary even inside quotes --
-             * that is the whole reason the marker exists. */
-            if (*q == SHELL_ARG_MARK) boundary = true;
+             * that is the whole reason the marker exists. Every mark but the
+             * first; see above. */
+            if (*q == SHELL_ARG_MARK) {
+                if (first_mark) { first_mark = false; continue; }
+                boundary = true;
+            }
             else if (split && !in_nosplit && sh_ifs_is_sep(*q)) boundary = true;
         }
         if (end || boundary) {
@@ -1753,7 +1779,10 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             shell_strip_nosplit_inplace(field);
             if (globbed > 0) {
                 any = true;
-            } else if (globbed == 0 && (field[0] || (keep_empty && !any))) {
+            } else if (globbed == 0 &&
+                       (field[0] || (keep_empty && (!any || !first_mark)))) {
+                /* In a quoted word every `$@` element is an element, empty
+                 * or not: ("${s[@]}") with s=(a "" b) is three. */
                 if (sh_array_set(name, (*next)++, field) < 0) return -1;
                 any = true;
             }
