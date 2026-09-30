@@ -18133,6 +18133,113 @@ static bool shell_indirect_target_ok(const char *t) {
     return false;
 }
 
+/* ---- AN OPERATOR ON ONE ARRAY ELEMENT ----------------------------------
+ *
+ *     a=(x "" z); echo "${a[1]:-d} ${a[5]-d} ${a[0]#x}${a[2]^^}"
+ *     bash: d d Z          tsh: shell: bad substitution
+ *
+ * Every operator after a single subscripted element fell through to the
+ * scalar parser, which cannot read a subscript -- so the commonest way to
+ * default an array element or a map lookup was a syntax error.
+ *
+ * The element is evaluated here and its operator run by the ORDINARY
+ * scalar code on a scratch variable, the way ${a[@]<op>} already runs each
+ * element: one implementation of a dozen operators, not two. Three things
+ * make that exact rather than approximate:
+ *   - an UNSET element leaves the scratch unset, so `-`, `+`, `?` and
+ *     `set -u` see what bash sees, and an empty one leaves it empty;
+ *   - `=` and `:=` assign the ELEMENT: whatever the scalar code stored in
+ *     the scratch is written back;
+ *   - messages name `a[i]`, as bash does, not the scratch
+ *     (shell_param_display).
+ * Scratch names carry the nesting depth, since an operator's word may hold
+ * another element operation. */
+struct shell_elem_frame {
+    const char *scratch;
+    const char *display;
+    struct shell_elem_frame *up;
+};
+static struct shell_elem_frame *g_elem_frames;
+static int g_elem_depth;
+
+static const char *shell_param_display(const char *name) {
+    for (struct shell_elem_frame *f = g_elem_frames; f; f = f->up)
+        if (strcmp(f->scratch, name) == 0) return f->display;
+    return name;
+}
+
+static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b);
+
+static int shell_expand_element_op(const char *nm, const char *sub,
+                                   size_t slen, const char *suffix,
+                                   struct shell_sb *b) {
+    SH_SB(subbuf);
+    if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
+    SH_SB(display);
+    if (sb_puts(&display, nm) < 0 || sb_putc(&display, '[') < 0 ||
+        sb_putmem(&display, sub, slen) < 0 || sb_putc(&display, ']') < 0)
+        return -1;
+
+    bool assoc = sh_array_is_assoc(nm);
+    SH_SB(key);                         /* an associative subscript */
+    long idx = -1;                      /* an indexed one */
+    const char *v = 0;
+    if (assoc) {
+        /* The key is a word, exactly as in a plain ${m[k]}. */
+        SH_SB(kx);
+        if (shell_expand_word_ex(subbuf.p, &kx, true, true) < 0 ||
+            shell_argmarks_to_spaces(kx.p, &key) < 0)
+            return -1;
+        v = sh_array_get_key(nm, key.p);
+    } else {
+        if (!sh_subscript_eval(subbuf.p, nm, false, &idx)) {
+            kprintf("shell: bad substitution\n");
+            return -1;
+        }
+        if (idx >= 0) v = sh_array_get(nm, idx);
+    }
+    bool had = (v != 0);
+    SH_SB(old);
+    if (had && sb_set(&old, v) < 0) return -1;
+
+    char scratch[32];
+    ksnprintf(scratch, sizeof scratch, "SHELL_ELEM_%d", g_elem_depth);
+    if (had) {
+        if (env_set(scratch, old.p) < 0) return -1;
+    } else {
+        (void)env_unset(scratch);
+    }
+    SH_SB(ex);
+    if (sb_puts(&ex, scratch) < 0 || sb_puts(&ex, suffix) < 0) {
+        (void)env_unset(scratch);
+        return -1;
+    }
+    struct shell_elem_frame fr = { scratch, display.p, g_elem_frames };
+    g_elem_frames = &fr;
+    g_elem_depth++;
+    int rc = shell_expand_braced_parameter(ex.p, b);
+    g_elem_depth--;
+    g_elem_frames = fr.up;
+
+    /* `=` / `:=` stored into the scratch: that value belongs to the
+     * element. Nothing else changes the scratch. */
+    const char *nv = env_get(scratch);
+    if (rc >= 0 && nv && (!had || strcmp(nv, old.p) != 0)) {
+        SH_SB(nvb);
+        if (sb_set(&nvb, nv) < 0) rc = -1;
+        else if (assoc) {
+            if (sh_array_set_key(nm, key.p, nvb.p) < 0) rc = -1;
+        } else if (idx < 0) {
+            kprintf("shell: %s: bad array subscript\n", display.p);
+            rc = -1;
+        } else if (sh_array_set(nm, idx, nvb.p) < 0) {
+            rc = -1;
+        }
+    }
+    (void)env_unset(scratch);
+    return rc;
+}
+
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     if (!expr) return -1;
 
@@ -18423,12 +18530,14 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                             return sb_put_data_str(b, v);
                         }
                     }
+                    /* An OPERATOR on one element: ${a[i]-d}, ${m[k]:=v},
+                     * ${a[0]#pat}, ${a[2]^^}, ${a[i]@Q} ... */
+                    if (suffix[0] != '\0' && !count && !indices)
+                        return shell_expand_element_op(nm, sub, slen, suffix,
+                                                       b);
                     SH_SB(subbuf);
                     long idx = 0;
                     bool num = false;
-                    /* A suffix on a single element (${a[0]#pat}) is a pattern
-                     * operator, not handled here yet -- fall through rather
-                     * than silently dropping it. */
                     if (suffix[0] == '\0') {
                         if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
                         num = sh_subscript_eval(subbuf.p, nm, false, &idx);
@@ -18789,7 +18898,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
 
     if (opch == '\0') {
         if (!is_set && g_opt_nounset) {
-            kprintf("%s: unbound variable\n", name);
+            kprintf("%s: unbound variable\n", shell_param_display(name));
             return -1;
         }
         return is_join ? sb_puts(b, value)
@@ -18864,8 +18973,13 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
             return is_join ? sb_puts(b, value)
                            : sb_put_data_str(b, value);
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
-        kprintf("shell: %s: %s\n", name,
-                ewb.p[0] ? ewb.p : "parameter null or not set");
+        /* `?` and `:?` say different things when there is no word: bash
+         * reports "parameter not set" for the first, since an empty value
+         * does not trigger it. */
+        kprintf("shell: %s: %s\n", shell_param_display(name),
+                ewb.p[0] ? ewb.p
+                         : (colon ? "parameter null or not set"
+                                  : "parameter not set"));
         /* XCU 2.6.2: the failing ?-form EXITS a non-interactive shell with
          * status 1, and a SUBSHELL exits even under an interactive parent.
          * tsh carried on with status 2 -- `( echo ${x:?}; echo not-reached )`
