@@ -82,6 +82,11 @@ extern pid_t toby_spawn_ex(const char *path, char *const argv[],
                            char *const envp[], int fd0, int fd1, int fd2,
                            const struct abi_spawn_fd *extra, unsigned nextra);
 
+/* Did the last proc_spawn fail because the arguments were too big? The
+ * shell asks straight after the failure (shell_explain_spawn_failure);
+ * proc_spawn leaves errno as the spawn syscall set it. */
+int host_spawn_was_e2big(void) { return errno == E2BIG; }
+
 /* argv and envp for a spawn or an exec, NULL-terminated, on the heap and
  * sized from the spec. They were 128-slot stack arrays that dropped the
  * rest without a word -- a program got its first 127 arguments. What bounds

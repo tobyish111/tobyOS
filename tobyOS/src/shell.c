@@ -15821,6 +15821,22 @@ static int shell_exec_head(const char *path, char *interp, size_t cap) {
 
 static int shell_explain_spawn_failure(const char *path, const char *as_typed,
                                        int *status) {
+#ifdef SHELL_HOSTED
+    /* TOO MANY ARGUMENTS IS NOT A BAD FILE. The kernel refuses an argv or
+     * environment past ABI_ARGS_TOTAL_MAX (or one string past
+     * ABI_ARG_STRLEN_MAX) with E2BIG; everything below looks only at the
+     * file, which is fine, so this said "cannot execute binary file: Exec
+     * format error" about /bin/echo. bash: "Argument list too long", 126.
+     * Asked first, while the spawn's errno is still the one we want. */
+    {
+        extern int host_spawn_was_e2big(void);
+        if (host_spawn_was_e2big()) {
+            kprintf("tsh: %s: Argument list too long\n", as_typed);
+            *status = 126;
+            return 0;
+        }
+    }
+#endif
     struct vfs_stat est;
     int sr = vfs_stat(path, &est);
     /* A NAME TOO LONG IS "CANNOT EXECUTE", NOT "NOT FOUND": bash reports
