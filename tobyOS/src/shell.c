@@ -3951,12 +3951,10 @@ static void shell_print_export_entry(const char *entry) {
 
 /* ---- `local`: function-scoped variables ---------------------------------
  *
- * See the note above shell_locals_push. The stack is global and bounded; a
- * function that localises more than SHELL_LOCAL_MAX variables across the whole
- * call chain gets a diagnostic rather than silent breakage, because silently
- * dropping a save means the variable never gets restored and the caller's
- * value is gone. */
-#define SHELL_LOCAL_MAX 256
+ * See the note above shell_locals_push. The stack is global and GROWS: it
+ * held 256, and the 257th `local` across the call chain was "too many local
+ * variables" -- a deep recursion hit that with one local per frame. It moves
+ * when it grows; an entry's address is used only inside push and pop. */
 
 struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
@@ -3971,15 +3969,26 @@ struct shell_local_save {
     bool  existed;
 };
 
-static struct shell_local_save g_locals[SHELL_LOCAL_MAX];
+static struct shell_local_save *g_locals;
 static int g_localc;
+static int g_local_cap;
 
 /* Record `name`'s current state so the current function's return can put it
  * back. Called before the variable is overwritten. */
 static int shell_locals_push(const char *name, int depth) {
-    if (g_localc >= SHELL_LOCAL_MAX) {
-        kprintf("local: too many local variables (max %d)\n", SHELL_LOCAL_MAX);
-        return -1;
+    if (g_localc >= g_local_cap) {
+        int ncap = g_local_cap ? g_local_cap * 2 : 64;
+        struct shell_local_save *nl =
+            (struct shell_local_save *)kmalloc((size_t)ncap * sizeof *nl);
+        if (!nl) {
+            kprintf("local: out of memory\n");
+            return -1;
+        }
+        if (g_local_cap)
+            memcpy(nl, g_locals, (size_t)g_local_cap * sizeof *nl);
+        kfree(g_locals);
+        g_locals = nl;
+        g_local_cap = ncap;
     }
     struct shell_local_save *sv = &g_locals[g_localc];
     sv->name = shell_strdup(name);
@@ -4131,7 +4140,9 @@ static void cmd_local(int argc, char **argv) {
         for (int i = 1; i < argc; i++)
             if (strcmp(argv[i], "-p") != 0) { listing = false; break; }
         if (listing) {
-            static const char *ln[SHELL_LOCAL_MAX];   /* see cmd_set's note */
+            const char **ln __attribute__((cleanup(shell_kfree_ptr))) =
+                (const char **)kmalloc((size_t)(g_localc + 1) * sizeof *ln);
+            if (!ln) { shell_set_status(1); return; }
             int n = 0;
             for (int i = 0; i < g_localc; i++) {
                 if (g_locals[i].depth != g_script_depth || !g_locals[i].name)
