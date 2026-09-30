@@ -81,7 +81,20 @@ extern volatile struct limine_module_request module_req;
  * were rejected outright. Children still inherit only 0..2 (what
  * proc_spec carries), which is enough for the shell to use high
  * descriptors for its own redirections. */
-#define SHELL_FD_MAX 10
+/* FILE DESCRIPTORS: any number below SHELL_FD_LIMIT, as in bash. There were
+ * ten -- 0..9 -- and `exec 12>f`, `{ ...; } 15>f` or `cmd 20>&3` was "only
+ * file descriptors 0, 1, and 2 are supported" (a message two limits out of
+ * date), the group form a parse error that ended the script. The limit is
+ * the kernel's per-process table (PROC_NFDS), which is what bash's own
+ * ulimit -n reports on this system.
+ *
+ * Every fd table -- the shell's own (g_shell_fd), a command's
+ * (struct shell_fd_state), a redirection frame's saved copy -- starts with
+ * SHELL_FD_BASE slots held inline and moves to the heap only when a higher
+ * descriptor is named. A fixed 1024 would have cost about 13 KiB of stack
+ * for every level of function nesting; this costs what 0..9 did. */
+#define SHELL_FD_BASE  10
+#define SHELL_FD_LIMIT 1024
 
 #define SHELL_ARG_MARK '\x01'
 /* Toggles "do not field-split" while expanding. See the note above
@@ -428,7 +441,27 @@ static bool g_bg_exec_ok;
 static int g_getopts_last_optind;
 static int g_getopts_char_index;
 static bool g_getopts_internal_optind_write;
-static struct file *g_shell_fd[SHELL_FD_MAX];
+static struct file *g_shell_fd_base[SHELL_FD_BASE];
+static struct file **g_shell_fd = g_shell_fd_base;
+static int g_shell_fd_cap = SHELL_FD_BASE;
+
+/* Room in the shell's table for descriptor `fd`. New slots are empty. */
+static bool shell_fd_table_reserve(int fd) {
+    if (fd < g_shell_fd_cap) return true;
+    if (fd >= SHELL_FD_LIMIT) return false;
+    int ncap = g_shell_fd_cap * 2;
+    while (ncap <= fd) ncap *= 2;
+    if (ncap > SHELL_FD_LIMIT) ncap = SHELL_FD_LIMIT;
+    struct file **nt = (struct file **)kmalloc((size_t)ncap * sizeof *nt);
+    if (!nt) return false;
+    memcpy(nt, g_shell_fd, (size_t)g_shell_fd_cap * sizeof *nt);
+    memset(nt + g_shell_fd_cap, 0,
+           (size_t)(ncap - g_shell_fd_cap) * sizeof *nt);
+    if (g_shell_fd != g_shell_fd_base) kfree(g_shell_fd);
+    g_shell_fd = nt;
+    g_shell_fd_cap = ncap;
+    return true;
+}
 __attribute__((format(printf, 1, 2)))
 static void shell_err(const char *fmt, ...);   /* fd 2, even in the kernel */
 #ifndef SHELL_HOSTED
@@ -14408,10 +14441,10 @@ static void cmd_getconf(int argc, char **argv) {
         { "LINE_MAX",        LINE_MAX    },
         { "NAME_MAX",        255         },
         { "PATH_MAX",        VFS_PATH_MAX},
-        { "OPEN_MAX",        SHELL_FD_MAX},
+        { "OPEN_MAX",        SHELL_FD_LIMIT},
         { "_POSIX_VERSION",  200809L     },
         { "_POSIX_ARG_MAX",  SHELL_GETCONF_ARG_MAX },
-        { "_POSIX_OPEN_MAX", SHELL_FD_MAX},
+        { "_POSIX_OPEN_MAX", SHELL_FD_LIMIT},
         { "CHAR_BIT",        8           },
         { "INT_MAX",         2147483647L },
     };
@@ -19864,7 +19897,7 @@ static int g_procsub_cap;            /* only a forking shell makes any */
 /* The number a new substitution's descriptor gets. See the note above. */
 static int shell_procsub_fd_for(struct file *keep) {
     int want = SHELL_PROCSUB_FD_TOP - g_procsub_n;
-    if (want >= SHELL_FD_MAX) return want;
+    if (want >= SHELL_FD_BASE) return want;
     return host_file_fd(keep);
 }
 
@@ -23399,7 +23432,7 @@ static int shell_parse_fd_word(const char *word, int *out_fd) {
     for (const char *p = word; *p; p++) {
         if (!shell_is_digit(*p)) return -1;
         v = v * 10 + (*p - '0');
-        if (v >= SHELL_FD_MAX) return -1;
+        if (v >= SHELL_FD_LIMIT) return -1;
     }
     *out_fd = v;
     return 0;
@@ -23408,8 +23441,8 @@ static int shell_parse_fd_word(const char *word, int *out_fd) {
 static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
                            int fd, const char *path, const char *text,
                            int target_fd) {
-    if (fd < 0 || fd >= SHELL_FD_MAX) {
-        kprintf("shell: only file descriptors 0, 1, and 2 are supported\n");
+    if (fd < 0 || fd >= SHELL_FD_LIMIT) {
+        kprintf("shell: %d: bad file descriptor\n", fd);
         return -1;
     }
     struct shell_redir *r = shell_simple_redir_new(cur);
@@ -24005,10 +24038,55 @@ static struct file *shell_open_text_pipe(const char *text, const char *label) {
     return r;
 }
 
+/* `fd` and `owned` point at the inline base arrays until a descriptor at
+ * or past SHELL_FD_BASE is named, then at the heap; `n` slots either way.
+ * Never copied by value -- the pointers would still name the original's
+ * inline arrays. shell_fd_state_close_owned releases the heap. */
 struct shell_fd_state {
-    struct file *fd[SHELL_FD_MAX];
-    bool owned[SHELL_FD_MAX];
+    int n;
+    struct file **fd;
+    bool *owned;
+    struct file *fd_base[SHELL_FD_BASE];
+    bool owned_base[SHELL_FD_BASE];
 };
+
+/* Frees the heap arrays, if any, and nothing else -- the files are closed
+ * (or handed on) by the code that owns them. Idempotent, and harmless on a
+ * zeroed struct: every `struct shell_fd_state` local carries it as a
+ * cleanup, so no return path can leak the arrays of a table that grew. */
+static void shell_fd_state_free(struct shell_fd_state *st) {
+    if (st->fd && st->fd != st->fd_base) kfree(st->fd);
+    if (st->owned && st->owned != st->owned_base) kfree(st->owned);
+    st->fd = st->fd_base;
+    st->owned = st->owned_base;
+    st->n = 0;
+}
+#define SH_FD_STATE(name) \
+    struct shell_fd_state name __attribute__((cleanup(shell_fd_state_free))) = { 0 }
+
+/* Room in `st` for descriptor `fd`. */
+static bool shell_fd_state_reserve(struct shell_fd_state *st, int fd) {
+    if (fd < st->n) return true;
+    if (fd >= SHELL_FD_LIMIT) return false;
+    int ncap = st->n ? st->n * 2 : SHELL_FD_BASE;
+    while (ncap <= fd) ncap *= 2;
+    if (ncap > SHELL_FD_LIMIT) ncap = SHELL_FD_LIMIT;
+    struct file **nf = (struct file **)kmalloc((size_t)ncap * sizeof *nf);
+    bool *no = (bool *)kmalloc((size_t)ncap * sizeof *no);
+    if (!nf || !no) { kfree(nf); kfree(no); return false; }
+    memset(nf, 0, (size_t)ncap * sizeof *nf);
+    memset(no, 0, (size_t)ncap * sizeof *no);
+    if (st->n) {
+        memcpy(nf, st->fd, (size_t)st->n * sizeof *nf);
+        memcpy(no, st->owned, (size_t)st->n * sizeof *no);
+    }
+    if (st->fd && st->fd != st->fd_base) kfree(st->fd);
+    if (st->owned && st->owned != st->owned_base) kfree(st->owned);
+    st->fd = nf;
+    st->owned = no;
+    st->n = ncap;
+    return true;
+}
 
 /* The fd table of the BUILTIN THAT IS RUNNING, set around the call by the
  * builtin runner. `read -u 3 3<<EOF` applies its redirection here, not to
@@ -24016,9 +24094,10 @@ struct shell_fd_state {
  * so without this the builtin saw no fd 3 at all. */
 static struct shell_fd_state *g_builtin_fds;
 static struct file *shell_builtin_fd(int n) {
-    if (n < 0 || n >= SHELL_FD_MAX) return 0;
-    if (g_builtin_fds && g_builtin_fds->fd[n]) return g_builtin_fds->fd[n];
-    return g_shell_fd[n];
+    if (n < 0) return 0;
+    if (g_builtin_fds && n < g_builtin_fds->n && g_builtin_fds->fd[n])
+        return g_builtin_fds->fd[n];
+    return n < g_shell_fd_cap ? g_shell_fd[n] : 0;
 }
 
 /* Collect the descriptors above 2 that a command has open, as the child-fd
@@ -24029,7 +24108,7 @@ static int shell_fd_state_extra(const struct shell_fd_state *st,
                                 struct proc_fd_map *out, int max) {
     int n = 0;
     if (st) {
-        for (int i = 3; i < SHELL_FD_MAX && n < max; i++) {
+        for (int i = 3; i < st->n && n < max; i++) {
             if (!st->fd[i]) continue;
             out[n].fd = i;
             out[n].f  = st->fd[i];
@@ -24041,7 +24120,7 @@ static int shell_fd_state_extra(const struct shell_fd_state *st,
      * substitution is live inherits it AT THE SAME NUMBER -- the number
      * is in the path the command was given. Slots 3..9 above are shell
      * fds and cannot collide with 63 downwards. The caller sizes `out`
-     * for SHELL_FD_MAX + g_procsub_n. */
+     * for st->n + g_procsub_n. */
     for (int i = 0; i < g_procsub_n && n < max; i++) {
         if (!g_procsub[i].keep) continue;
         out[n].fd = g_procsub[i].fd;
@@ -24051,18 +24130,55 @@ static int shell_fd_state_extra(const struct shell_fd_state *st,
     return n;
 }
 
+/* The shell's table as it was before a redirection took effect: `n` slots,
+ * inline for the first SHELL_FD_BASE, on the heap past that. Filled only by
+ * shell_io_frame_install; shell_restore_io_frame puts it back and frees. */
 struct shell_io_frame {
-    struct file *old_fd[SHELL_FD_MAX];
-    bool owned[SHELL_FD_MAX];
+    int n;
+    struct file **old_fd;
+    bool *owned;
+    struct file *old_base[SHELL_FD_BASE];
+    bool owned_base[SHELL_FD_BASE];
 };
 
 static void shell_fd_state_close_owned(struct shell_fd_state *st) {
     if (!st) return;
-    for (int i = 0; i < SHELL_FD_MAX; i++) {
+    for (int i = 0; i < st->n; i++) {
         if (st->owned[i]) file_close(st->fd[i]);
         st->fd[i] = 0;
         st->owned[i] = false;
     }
+    shell_fd_state_free(st);
+}
+
+/* Make `fds` the shell's table, remembering the old one in `frame`. The
+ * frame takes over what `fds` owned. */
+static int shell_io_frame_install(struct shell_io_frame *frame,
+                                  struct shell_fd_state *fds) {
+    int n = fds->n > g_shell_fd_cap ? fds->n : g_shell_fd_cap;
+    if (!shell_fd_table_reserve(n - 1)) return -1;
+    frame->n = n;
+    frame->old_fd = frame->old_base;
+    frame->owned = frame->owned_base;
+    if (n > SHELL_FD_BASE) {
+        frame->old_fd = (struct file **)kmalloc((size_t)n * sizeof(struct file *));
+        frame->owned = (bool *)kmalloc((size_t)n * sizeof(bool));
+        if (!frame->old_fd || !frame->owned) {
+            kfree(frame->old_fd);
+            kfree(frame->owned);
+            frame->old_fd = 0;
+            frame->owned = 0;
+            frame->n = 0;
+            return -1;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        frame->old_fd[i] = g_shell_fd[i];
+        frame->owned[i] = (i < fds->n) ? fds->owned[i] : false;
+        g_shell_fd[i] = (i < fds->n) ? fds->fd[i] : 0;
+        if (i < fds->n) fds->owned[i] = false;
+    }
+    return 0;
 }
 
 static struct file *shell_closed_file_make(void) {
@@ -24075,7 +24191,7 @@ static struct file *shell_closed_file_make(void) {
 
 static int shell_fd_state_replace(struct shell_fd_state *st, int fd,
                                   struct file *f, bool owned) {
-    if (!st || fd < 0 || fd >= SHELL_FD_MAX) return -1;
+    if (!st || fd < 0 || !shell_fd_state_reserve(st, fd)) return -1;
     if (st->owned[fd]) file_close(st->fd[fd]);
     st->fd[fd] = f;
     st->owned[fd] = owned;
@@ -24084,7 +24200,14 @@ static int shell_fd_state_replace(struct shell_fd_state *st, int fd,
 
 static void shell_fd_state_init_from_defaults(struct shell_fd_state *st) {
     memset(st, 0, sizeof(*st));
-    for (int i = 0; i < SHELL_FD_MAX; i++) {
+    st->fd = st->fd_base;
+    st->owned = st->owned_base;
+    st->n = SHELL_FD_BASE;
+    /* Heap only if the shell's own table already went past the base. If
+     * that allocation fails the state keeps just 0..9 of it. */
+    if (g_shell_fd_cap > SHELL_FD_BASE)
+        (void)shell_fd_state_reserve(st, g_shell_fd_cap - 1);
+    for (int i = 0; i < st->n && i < g_shell_fd_cap; i++) {
         st->fd[i] = g_shell_fd[i];
         st->owned[i] = false;
     }
@@ -24127,7 +24250,7 @@ static int shell_apply_redirs(struct shell_simple *cmd,
     if (!cmd || !st) return -1;
     for (int i = 0; i < cmd->redir_count; i++) {
         struct shell_redir *r = &cmd->redir[i];
-        if (r->fd < 0 || r->fd >= SHELL_FD_MAX) {
+        if (r->fd < 0 || r->fd >= SHELL_FD_LIMIT) {
             kprintf("%s: bad file descriptor %d\n", label, r->fd);
             return -1;
         }
@@ -24193,7 +24316,7 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             continue;
         }
         if (r->op == SH_RD_DUP_IN || r->op == SH_RD_DUP_OUT) {
-            if (r->target_fd < 0 || r->target_fd >= SHELL_FD_MAX) {
+            if (r->target_fd < 0 || r->target_fd >= SHELL_FD_LIMIT) {
                 kprintf("%s: bad file descriptor %d\n", label, r->target_fd);
                 return -1;
             }
@@ -24203,7 +24326,8 @@ static int shell_apply_redirs(struct shell_simple *cmd,
              * file". Cloning NULL used to produce NULL, which reads as
              * the default again -- so `1>&2` quietly did nothing. Ask
              * the host for a real handle on that standard descriptor. */
-            struct file *target = st->fd[r->target_fd];
+            struct file *target = (r->target_fd < st->n)
+                                  ? st->fd[r->target_fd] : 0;
             struct file *synth = 0;
             /* A DUP OF A DESCRIPTOR THAT IS NOT OPEN IS AN ERROR.
              *
@@ -24252,20 +24376,15 @@ static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
     if (!cmd || !frame) return -1;
     memset(frame, 0, sizeof(*frame));
 
-    struct shell_fd_state fds;
+    SH_FD_STATE(fds);
     shell_fd_state_init_from_defaults(&fds);
     if (shell_apply_redirs(cmd, &fds, label) < 0) {
         shell_fd_state_close_owned(&fds);
         return -1;
     }
-
-    for (int i = 0; i < SHELL_FD_MAX; i++) {
-        frame->old_fd[i] = g_shell_fd[i];
-        frame->owned[i] = fds.owned[i];
-        g_shell_fd[i] = fds.fd[i];
-        fds.owned[i] = false;
-    }
-    return 0;
+    int rc = shell_io_frame_install(frame, &fds);
+    shell_fd_state_close_owned(&fds);   /* frees; it owns nothing now */
+    return rc;
 }
 
 #ifdef SHELL_HOSTED
@@ -24282,13 +24401,20 @@ struct file *shell_current_diag_file(void) { return g_shell_fd[2]; }
 #endif
 
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
-    if (!frame) return;
-    for (int i = 0; i < SHELL_FD_MAX; i++) {
-        if (frame->owned[i]) file_close(g_shell_fd[i]);
-        g_shell_fd[i] = frame->old_fd[i];
-        frame->old_fd[i] = 0;
-        frame->owned[i] = false;
+    if (!frame || !frame->old_fd) return;
+    for (int i = 0; i < g_shell_fd_cap; i++) {
+        if (i < frame->n) {
+            if (frame->owned[i]) file_close(g_shell_fd[i]);
+            g_shell_fd[i] = frame->old_fd[i];
+        } else {
+            g_shell_fd[i] = 0;      /* did not exist before the frame */
+        }
     }
+    if (frame->old_fd != frame->old_base) kfree(frame->old_fd);
+    if (frame->owned != frame->owned_base) kfree(frame->owned);
+    frame->old_fd = 0;
+    frame->owned = 0;
+    frame->n = 0;
 }
 
 /* A write to a builtin's redirected stdout that FAILED.
@@ -24464,7 +24590,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     if (!c) c = shell_cmd_lookup(cmd->argv[0]);
     if (!c) return -1;
 
-    struct shell_fd_state fds;
+    SH_FD_STATE(fds);
     memset(&fds, 0, sizeof(fds));
     shell_write_fn_t old_fn = g_shell_out;
     void *old_ctx = g_shell_out_ctx;
@@ -24798,7 +24924,7 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
     }
 
     if (assignc == cmd->argc) {
-        struct shell_fd_state fds;
+        SH_FD_STATE(fds);
         shell_fd_state_init_from_defaults(&fds);
         if (shell_apply_redirs(cmd, &fds, "shell") < 0) {
             shell_fd_state_close_owned(&fds);
@@ -24842,16 +24968,21 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         if (strcmp(exec_cmd.argv[0], "exec") == 0 && cmd->redir_count > 0 &&
             (exec_cmd.argc == 1 ||
              (exec_cmd.argc == 2 && strcmp(exec_cmd.argv[1], "--") == 0))) {
-            struct shell_fd_state fds;
+            SH_FD_STATE(fds);
             shell_fd_state_init_from_defaults(&fds);
             if (shell_apply_redirs(cmd, &fds, "exec") < 0) {
                 shell_fd_state_close_owned(&fds);
                 return 1;
             }
-            for (int i = 0; i < SHELL_FD_MAX; i++) {
+            if (!shell_fd_table_reserve(fds.n - 1)) {
+                shell_fd_state_close_owned(&fds);
+                return 1;
+            }
+            for (int i = 0; i < fds.n; i++) {
                 g_shell_fd[i] = fds.fd[i];
                 fds.owned[i] = false;   /* the shell keeps them now */
             }
+            shell_fd_state_close_owned(&fds);   /* the arrays only */
             return 0;
         }
 
@@ -24936,7 +25067,7 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         shell_build_env_overlay(cmd->argv, assignc, &envc);
     if (!envp) return 1;
 
-    struct shell_fd_state fds;
+    SH_FD_STATE(fds);
     shell_fd_state_init_from_defaults(&fds);
     if (shell_apply_redirs(&exec_cmd, &fds, exec_cmd.argv[0]) < 0) {
         shell_fd_state_close_owned(&fds);
@@ -24944,13 +25075,13 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
     }
 
     struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
-        (struct proc_fd_map *)kmalloc((size_t)(SHELL_FD_MAX + g_procsub_n) *
+        (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n) *
                                       sizeof *xfd);
     if (!xfd) {
         shell_fd_state_close_owned(&fds);
         return 1;
     }
-    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX + g_procsub_n);
+    int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
@@ -24999,7 +25130,7 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     int saved_flow_status = g_shell_flow_status;
     int saved_loop_depth = g_shell_loop_depth;
 
-    struct shell_fd_state fds;
+    SH_FD_STATE(fds);
     shell_fd_state_init_from_defaults(&fds);
     if (pipe_in && shell_fd_state_replace(&fds, 0, pipe_in, false) < 0) {
         shell_fd_state_close_owned(&fds);
@@ -25019,11 +25150,9 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
 
     struct shell_io_frame io_frame;
     memset(&io_frame, 0, sizeof(io_frame));
-    for (int i = 0; i < SHELL_FD_MAX; i++) {
-        io_frame.old_fd[i] = g_shell_fd[i];
-        io_frame.owned[i] = fds.owned[i];
-        g_shell_fd[i] = fds.fd[i];
-        fds.owned[i] = false;
+    if (shell_io_frame_install(&io_frame, &fds) < 0) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
     }
 
     exec_cmd.redir_count = 0;
@@ -25083,7 +25212,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     char **argv = cmd->argv + assignc;     /* a view; NULL-terminated */
     int argc = cmd->argc - assignc;
 
-    struct shell_fd_state fds;
+    SH_FD_STATE(fds);
     shell_fd_state_init_from_defaults(&fds);
     if (pipe_in && shell_fd_state_replace(&fds, 0, pipe_in, false) < 0) {
         shell_fd_state_close_owned(&fds);
@@ -25101,13 +25230,13 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     char path_buf[64];
     const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
     struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
-        (struct proc_fd_map *)kmalloc((size_t)(SHELL_FD_MAX + g_procsub_n) *
+        (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n) *
                                       sizeof *xfd);
     if (!xfd) {
         shell_fd_state_close_owned(&fds);
         return 1;
     }
-    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX + g_procsub_n);
+    int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
     struct proc_spec spec = {
         .path = path, .name = argv[0],
         .fd0 = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
@@ -28434,7 +28563,8 @@ struct shell_subshell_frame {
      * and POSIX 2.12 counts open files as part of it. Without these,
      * `( exec > f; echo x )` left the shell redirected after the
      * subshell ended and every later command wrote into f. */
-    struct file *fd[SHELL_FD_MAX];
+    int nfd;
+    struct file **fd;               /* heap, nfd slots */
 };
 
 static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
@@ -28448,6 +28578,9 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
         if (frame->traps.trap[i]) kfree(frame->traps.trap[i]);
         frame->traps.trap[i] = 0;
     }
+    kfree(frame->fd);
+    frame->fd = 0;
+    frame->nfd = 0;
 }
 
 static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
@@ -28459,7 +28592,11 @@ static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
     frame->flow = g_shell_flow;
     frame->flow_status = g_shell_flow_status;
     frame->loop_depth = g_shell_loop_depth;
-    for (int i = 0; i < SHELL_FD_MAX; i++) frame->fd[i] = g_shell_fd[i];
+    frame->fd = (struct file **)kmalloc((size_t)g_shell_fd_cap *
+                                        sizeof(struct file *));
+    if (!frame->fd) return -1;
+    frame->nfd = g_shell_fd_cap;
+    for (int i = 0; i < frame->nfd; i++) frame->fd[i] = g_shell_fd[i];
 
     shell_save_opts(&frame->opts);
     if (shell_env_frame_capture(&frame->env) < 0 ||
@@ -28490,7 +28627,11 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     /* Anything the subshell installed with `exec` dies with it. The
      * handles it opened are deliberately not closed here: a clone may
      * still be referenced by a spawned child. */
-    for (int i = 0; i < SHELL_FD_MAX; i++) g_shell_fd[i] = frame->fd[i];
+    for (int i = 0; i < g_shell_fd_cap; i++)
+        g_shell_fd[i] = (frame->fd && i < frame->nfd) ? frame->fd[i] : 0;
+    kfree(frame->fd);
+    frame->fd = 0;
+    frame->nfd = 0;
 }
 
 static bool shell_subshell_tail_can_follow(const char *tail) {
@@ -30535,7 +30676,7 @@ void shell_init(void) {
     /* Milestone 25C: stamp boot-time PATH/HOME/USER/PWD/SHELL so any
      * implicit-ELF dispatch immediately has a search path and so any
      * libtoby-linked child sees a meaningful environ at exec. */
-    for (int i = 0; i < SHELL_FD_MAX; i++) g_shell_fd[i] = 0;
+    for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
     g_getopts_last_optind = 1;
     g_getopts_char_index = 1;
@@ -30856,7 +30997,7 @@ const char *shell_history_get_hosted(int i) {
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
-    for (int i = 0; i < SHELL_FD_MAX; i++) g_shell_fd[i] = 0;
+    for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
     g_shell_start_secs = shell_wall_secs();
 
