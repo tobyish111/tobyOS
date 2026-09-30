@@ -386,6 +386,35 @@ static char *words_store(struct shell_words *w, const char *s, size_t n) {
     return d;
 }
 
+/* `n` uninitialised bytes, pointer-aligned, that live exactly as long as the
+ * words do. A command's argv and redirection arrays are kept here: they
+ * point at words in the same store, and they grow by taking a bigger block
+ * and leaving the old one to go with the rest. */
+static void *words_alloc(struct shell_words *w, size_t n) {
+    struct shell_words_chunk *c = w->head;
+    size_t off = c ? ((c->used + 7) & ~(size_t)7) : 0;
+    if (!c || off > c->cap || c->cap - off < n) {
+#ifdef SHELL_SB_STRESS
+        size_t cap = n;
+#else
+        size_t cap = 4096;
+        if (cap < n) cap = n;
+#endif
+        c = (struct shell_words_chunk *)kmalloc(sizeof *c + cap);
+        if (!c) {
+            kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)cap);
+            return 0;
+        }
+        c->used = 0;
+        c->cap = cap;
+        c->next = w->head;
+        w->head = c;
+        off = 0;
+    }
+    c->used = off + n;
+    return c->data + off;
+}
+
 /* Serialises execute_line() between keyboard shell_poll and remote
  * tcp_shell (both use the shared `line` buffer). */
 static spinlock_t g_shell_line_lock = SPINLOCK_INIT;
@@ -15336,8 +15365,7 @@ static void prompt(void) {
 
 #define PIPE_BIN_PREFIX "/bin/"
 #define SHELL_TOKEN_MAX 96
-#define SHELL_STAGE_MAX 8
-#define SHELL_REDIR_MAX 8
+
 
 enum shell_tok_type {
     SH_TOK_WORD = 1,
@@ -15395,28 +15423,38 @@ struct shell_redir {
     const char *text;
 };
 
+/* NO COUNT IS BOUNDED HERE. argv held ARG_MAX words (1024 hosted, 256 in
+ * the kernel), a command eight redirections and a pipeline eight stages;
+ * one more of any of them was an error bash does not have. The arrays live
+ * in `arena` -- the pipeline's word store, where the words they point at
+ * already are -- so they need no owner of their own: a copy of the struct
+ * shares them, and they go when the pipeline does. */
 struct shell_simple {
     int argc;
-    char *argv[ARG_MAX];
+    int argv_cap;               /* slots in argv; one always stays NULL */
+    char **argv;
+    struct shell_words *arena;  /* where argv and redir grow; may be 0 */
     /* Bit i: argv[i] LOOKS like an assignment and is not one, because the
      * `=` was quoted. `foo\=bar` is a command NAME -- bash reports 127, not
      * a variable called foo. The quoting is gone by the time argv exists, so
-     * the answer has to be carried alongside it. ARG_MAX is 32, which is
-     * exactly what fits here. */
-    /* one bit per argv slot: a `=` in the NAME position was quoted. This was
-     * a 32-bit mask shifted by argc -- silent nonsense past 32 arguments. */
-    unsigned char arg_noassign[(ARG_MAX + 7) / 8];
+     * the answer has to be carried alongside it. Only the first 32 words
+     * are ever marked (shell_add_one_arg) -- an assignment prefix is read
+     * from the front -- so 32 bits is all there is; see
+     * shell_simple_noassign. */
+    unsigned char arg_noassign[4];
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
     bool stdout_append;
     int redir_count;
-    struct shell_redir redir[SHELL_REDIR_MAX];
+    int redir_cap;
+    struct shell_redir *redir;
 };
 
 struct shell_pipeline {
     int count;
-    struct shell_simple stage[SHELL_STAGE_MAX];
+    int stage_cap;
+    struct shell_simple *stage;     /* in `words`, like everything else */
     /* Words made while building the stages -- split fields, glob
      * matches, unmarked copies. argv points into it, so it is storage
      * that never moves (see struct shell_words); it was an 8 KiB array
@@ -15664,14 +15702,21 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
     return -1;
 }
 
-/* [/bin/tsh, script, argv[1..]] -- the script's path is its $0. */
-static int shell_script_argv(const char *path, int argc, char **argv,
-                             char **out) {
+/* [/bin/tsh, script, argv[1..], NULL] -- the script's path is its $0. On
+ * the heap and sized from argc (it was ARG_MAX + 2 on the stack); the
+ * caller frees it. */
+static char **shell_script_argv(const char *path, int argc, char **argv,
+                                int *out_n) {
+    char **out = (char **)kmalloc((size_t)(argc + 3) * sizeof(char *));
+    *out_n = 0;
+    if (!out) return 0;
     int n = 0;
     out[n++] = (char *)"/bin/tsh";
     out[n++] = (char *)path;
-    for (int i = 1; i < argc && n < ARG_MAX + 2; i++) out[n++] = argv[i];
-    return n;
+    for (int i = 1; i < argc; i++) out[n++] = argv[i];
+    out[n] = 0;
+    *out_n = n;
+    return out;
 }
 
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
@@ -15744,12 +15789,15 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         int status = 126;
         int why = shell_explain_spawn_failure(path, path_arg, &status);
         if (why == 1) {
-            char *sargv[ARG_MAX + 2];
-            int sargc = shell_script_argv(path, argc, argv, sargv);
-            spec.path = "/bin/tsh";
-            spec.argc = sargc;
-            spec.argv = sargv;
-            pid = proc_spawn(&spec);
+            int sargc = 0;
+            char **sargv __attribute__((cleanup(shell_kfree_ptr))) =
+                shell_script_argv(path, argc, argv, &sargc);
+            if (sargv) {
+                spec.path = "/bin/tsh";
+                spec.argc = sargc;
+                spec.argv = sargv;
+                pid = proc_spawn(&spec);
+            }
         }
         if (pid < 0) {
             if (why != 0) kprintf("spawn: failed to launch '%s'\n", path);
@@ -21294,8 +21342,78 @@ static bool shell_is_list_sep(enum shell_tok_type t) {
            t == SH_TOK_AND_IF || t == SH_TOK_OR_IF;
 }
 
-static void shell_simple_init(struct shell_simple *s) {
+/* What argv is before the first word: a real, empty, NULL-terminated
+ * vector, so `argv[0]` reads NULL exactly as it did from the zeroed inline
+ * array. Never written -- argv_cap 0 means "not ours, allocate first". */
+static char *g_shell_no_args[1];
+
+static void shell_simple_init(struct shell_simple *s,
+                              struct shell_words *arena) {
     memset(s, 0, sizeof(*s));
+    s->argv = g_shell_no_args;
+    s->arena = arena;
+}
+
+/* Room for one more word, with the NULL after it. */
+static int shell_simple_argv_room(struct shell_simple *s) {
+    if (s->argc + 1 < s->argv_cap) return 0;
+    int ncap = s->argv_cap ? s->argv_cap * 2 : 16;
+    while (ncap < s->argc + 2) ncap *= 2;
+    char **na = s->arena
+        ? (char **)words_alloc(s->arena, (size_t)ncap * sizeof(char *)) : 0;
+    if (!na) {
+        kprintf("shell: out of memory for arguments\n");
+        return -1;
+    }
+    if (s->argc) memcpy(na, s->argv, (size_t)s->argc * sizeof(char *));
+    memset(na + s->argc, 0, (size_t)(ncap - s->argc) * sizeof(char *));
+    s->argv = na;
+    s->argv_cap = ncap;
+    return 0;
+}
+
+static bool shell_simple_noassign(const struct shell_simple *s, int i) {
+    return i >= 0 && i < 32 && (s->arg_noassign[i >> 3] & (1u << (i & 7)));
+}
+
+/* A new, zeroed redirection slot at the end of the command's list. */
+static struct shell_redir *shell_simple_redir_new(struct shell_simple *s) {
+    if (s->redir_count >= s->redir_cap) {
+        int ncap = s->redir_cap ? s->redir_cap * 2 : 8;
+        struct shell_redir *nr = s->arena
+            ? (struct shell_redir *)words_alloc(s->arena,
+                                                (size_t)ncap * sizeof *nr)
+            : 0;
+        if (!nr) {
+            kprintf("shell: out of memory for redirections\n");
+            return 0;
+        }
+        if (s->redir_count)
+            memcpy(nr, s->redir, (size_t)s->redir_count * sizeof *nr);
+        s->redir = nr;
+        s->redir_cap = ncap;
+    }
+    struct shell_redir *r = &s->redir[s->redir_count++];
+    memset(r, 0, sizeof *r);
+    return r;
+}
+
+/* Start the pipeline's next stage. The stage table MOVES when it grows:
+ * a `struct shell_simple *` into it is good only until the next call. */
+static struct shell_simple *shell_pipeline_add_stage(struct shell_pipeline *pl) {
+    if (pl->count >= pl->stage_cap) {
+        int ncap = pl->stage_cap ? pl->stage_cap * 2 : 4;
+        struct shell_simple *ns = (struct shell_simple *)
+            words_alloc(&pl->words, (size_t)ncap * sizeof *ns);
+        if (!ns) return 0;
+        if (pl->count)
+            memcpy(ns, pl->stage, (size_t)pl->count * sizeof *ns);
+        pl->stage = ns;
+        pl->stage_cap = ncap;
+    }
+    struct shell_simple *s = &pl->stage[pl->count++];
+    shell_simple_init(s, &pl->words);
+    return s;
 }
 
 static int shell_pipeline_save_word(struct shell_pipeline *pl,
@@ -21937,7 +22055,7 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
 
 static int shell_globstar_emit(struct shell_globstar *g, const char *path) {
     if (shell_globignored(path)) return 0;         /* GLOBIGNORE */
-    if (g->cur->argc >= ARG_MAX) {
+    if (shell_simple_argv_room(g->cur) < 0) {
         g->overflow = true;
         return -1;
     }
@@ -22070,12 +22188,8 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
     } else if (shell_canonicalize_path(".", root, sizeof root) < 0) {
         return 0;
     }
-    if (shell_globstar_walk(&g, root, shown, comps, ncomp, 0, 0) < 0) {
-        if (g.overflow)
-            kprintf("shell: too many arguments after expansion (max %d)\n",
-                    ARG_MAX);
+    if (shell_globstar_walk(&g, root, shown, comps, ncomp, 0, 0) < 0)
         return -1;
-    }
     if (g.matches == 0) return 0;
 
     /* THE SAME NAME CAN BE REACHED TWICE. A pattern with two `**`
@@ -22168,9 +22282,8 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,                    
          * hidden. dotglob was a table entry the globber never read. */
         if (!shell_glob_dot_ok(ent.name, pattern)) continue;
         if (!shell_glob_match(pattern, ent.name)) continue;
-        if (cur->argc >= ARG_MAX) {
+        if (shell_simple_argv_room(cur) < 0) {
             vfs_closedir(&d);
-            kprintf("shell: too many arguments after expansion (max %d)\n", ARG_MAX);
             return -1;
         }
         char tmp[VFS_PATH_MAX];
@@ -22237,7 +22350,7 @@ static int sh_array_glob_field(const char *name, const char *field,
         return -1;
     }
     pl->count = 0;
-    shell_simple_init(cur);
+    shell_simple_init(cur, &pl->words);
     int n = shell_expand_glob_word(pl, cur, pat);
     if (n > 0) {
         for (int i = 0; i < cur->argc; i++) {
@@ -22253,10 +22366,7 @@ static bool g_arg_from_expansion;
 
 static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                              const char *word, bool quoted) {
-    if (cur->argc >= ARG_MAX) {
-        kprintf("shell: too many arguments (max %d)\n", ARG_MAX);
-        return -1;
-    }
+    if (shell_simple_argv_room(cur) < 0) return -1;
 
     /* A TILDE THAT WAS WRITTEN IN THE WORD EXPANDS; ONE THAT ARRIVED FROM AN
      * EXPANSION IS DATA -- and the no-split marks already say which is which,
@@ -22446,7 +22556,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                (*e >= '0' && *e <= '9') || *e == '_')
             e++;
         if (e > word && *e == SHELL_GLOB_ESC && e[1] == '=')
-            if (cur->argc < ARG_MAX) cur->arg_noassign[cur->argc >> 3] |= (unsigned char)(1u << (cur->argc & 7));
+            cur->arg_noassign[cur->argc >> 3] |= (unsigned char)(1u << (cur->argc & 7));
     }
     if (has_esc) {
         /* A copy in the pipeline's store, stripped where it lies: the
@@ -22821,12 +22931,8 @@ static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
         kprintf("shell: only file descriptors 0, 1, and 2 are supported\n");
         return -1;
     }
-    if (cur->redir_count >= SHELL_REDIR_MAX) {
-        kprintf("shell: too many redirections\n");
-        return -1;
-    }
-    struct shell_redir *r = &cur->redir[cur->redir_count++];
-    memset(r, 0, sizeof(*r));
+    struct shell_redir *r = shell_simple_redir_new(cur);
+    if (!r) return -1;
     r->op = op;
     r->fd = fd;
     r->target_fd = target_fd;
@@ -22841,8 +22947,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
     memset(pl, 0, sizeof(*pl));
     if (*io >= ntok || shell_is_list_sep(tok[*io].type)) return 0;
 
-    shell_simple_init(&pl->stage[0]);
-    pl->count = 1;
+    if (!shell_pipeline_add_stage(pl)) return -1;
 
     while (*io < ntok && !shell_is_list_sep(tok[*io].type)) {
         enum shell_tok_type t = tok[*io].type;
@@ -22861,19 +22966,11 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                  * (grep's status). A literal `| |` is still caught, by
                  * shell_line_syntax_ok, before any of this. */
                 (*io)++;
-                if (pl->count >= SHELL_STAGE_MAX) {
-                    kprintf("shell: too many pipeline stages\n");
-                    return -1;
-                }
-                shell_simple_init(&pl->stage[pl->count++]);
+                if (!shell_pipeline_add_stage(pl)) return -1;
                 continue;
             }
             (*io)++;
-            if (pl->count >= SHELL_STAGE_MAX) {
-                kprintf("shell: too many pipeline stages\n");
-                return -1;
-            }
-            shell_simple_init(&pl->stage[pl->count++]);
+            if (!shell_pipeline_add_stage(pl)) return -1;
             continue;
         }
 
@@ -24190,7 +24287,7 @@ static int shell_background_forked(const char *text, const char *label) {
 static int shell_run_single(struct shell_simple *cmd, bool background) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
+           !shell_simple_noassign(cmd, assignc) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -24215,11 +24312,14 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         return rc;
     }
 
+    /* A VIEW of the words after the assignments. It was a copy into the
+     * struct's own array; argv has no fixed size any more, and nothing adds
+     * to exec_cmd, so it never needs room of its own. */
     struct shell_simple exec_cmd = *cmd;
     exec_cmd.argc = cmd->argc - assignc;
-    for (int i = 0; i < exec_cmd.argc; i++) {
-        exec_cmd.argv[i] = cmd->argv[i + assignc];
-    }
+    exec_cmd.argv = cmd->argv + assignc;
+    exec_cmd.argv_cap = cmd->argv_cap - assignc;
+    exec_cmd.arena = 0;
 
     if (!background) {
         /* `exec` with redirections and NO command applies them to the SHELL
@@ -24360,17 +24460,17 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
                                           struct file *pipe_out) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
+           !shell_simple_noassign(cmd, assignc) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
     if (assignc == cmd->argc) return -1;
 
-    struct shell_simple exec_cmd = *cmd;
+    struct shell_simple exec_cmd = *cmd;          /* a view; see above */
     exec_cmd.argc = cmd->argc - assignc;
-    for (int i = 0; i < exec_cmd.argc; i++) {
-        exec_cmd.argv[i] = cmd->argv[i + assignc];
-    }
+    exec_cmd.argv = cmd->argv + assignc;
+    exec_cmd.argv_cap = cmd->argv_cap - assignc;
+    exec_cmd.arena = 0;
 
     const struct cmd *builtin = shell_cmd_lookup(exec_cmd.argv[0]);
     struct shell_function *fn = shell_function_lookup(exec_cmd.argv[0]);
@@ -24461,7 +24561,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
+           !shell_simple_noassign(cmd, assignc) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -24475,9 +24575,8 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
         shell_build_env_overlay(cmd->argv, assignc, &envc);
     if (!envp) return 1;
 
-    char *argv[ARG_MAX];
+    char **argv = cmd->argv + assignc;     /* a view; NULL-terminated */
     int argc = cmd->argc - assignc;
-    for (int i = 0; i < argc; i++) argv[i] = cmd->argv[i + assignc];
 
     struct shell_fd_state fds;
     shell_fd_state_init_from_defaults(&fds);
@@ -24521,12 +24620,15 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
          * still points at them. */
         why = shell_explain_spawn_failure(path, argv[0], &status);
         if (why == 1) {
-            char *sargv[ARG_MAX + 2];
-            int sargc = shell_script_argv(path, argc, argv, sargv);
-            spec.path = "/bin/tsh";
-            spec.argc = sargc;
-            spec.argv = sargv;
-            pid = proc_spawn(&spec);
+            int sargc = 0;
+            char **sargv __attribute__((cleanup(shell_kfree_ptr))) =
+                shell_script_argv(path, argc, argv, &sargc);
+            if (sargv) {
+                spec.path = "/bin/tsh";
+                spec.argc = sargc;
+                spec.argv = sargv;
+                pid = proc_spawn(&spec);
+            }
         }
     }
     shell_fd_state_close_owned(&fds);
@@ -24591,10 +24693,13 @@ static void cmd_env(int argc, char **argv) {
         return;
     }
 
+    SH_WORDS(cmdw);
     struct shell_simple cmd;
-    shell_simple_init(&cmd);
-    for (int k = first_assign; k < argc && cmd.argc < ARG_MAX; k++)
+    shell_simple_init(&cmd, &cmdw);
+    for (int k = first_assign; k < argc; k++) {
+        if (shell_simple_argv_room(&cmd) < 0) { shell_set_status(1); return; }
         cmd.argv[cmd.argc++] = argv[k];
+    }
     shell_set_status(shell_run_single(&cmd, false));
 }
 
@@ -24603,7 +24708,7 @@ static void cmd_env(int argc, char **argv) {
 static bool shell_stage_is_builtin(struct shell_simple *cmd) {
     int assignc = 0;
     while (assignc < cmd->argc &&
-           !(cmd->arg_noassign[assignc >> 3] & (1u << (assignc & 7))) &&
+           !shell_simple_noassign(cmd, assignc) &&
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
@@ -24651,19 +24756,35 @@ static struct file *shell_stage_spill_reader(char *path) {
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
 
-    struct file *pipes_r[SHELL_STAGE_MAX - 1];
-    struct file *pipes_w[SHELL_STAGE_MAX - 1];
-    int pids[SHELL_STAGE_MAX];
-    bool has_pid[SHELL_STAGE_MAX];
-    int stage_status[SHELL_STAGE_MAX];
-    memset(pipes_r, 0, sizeof(pipes_r));
-    memset(pipes_w, 0, sizeof(pipes_w));
-    memset(pids, 0, sizeof(pids));
-    memset(has_pid, 0, sizeof(has_pid));
-    memset(stage_status, 0, sizeof(stage_status));
+    /* Sized from the pipeline; they were eight-stage arrays. */
+    size_t ns = (size_t)pl->count;
+    struct file **pipes_r __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct file **)kmalloc(ns * sizeof(struct file *));
+    struct file **pipes_w __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct file **)kmalloc(ns * sizeof(struct file *));
+    int *pids __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc(ns * sizeof(int));
+    bool *has_pid __attribute__((cleanup(shell_kfree_ptr))) =
+        (bool *)kmalloc(ns * sizeof(bool));
+    int *stage_status __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc(ns * sizeof(int));
+    bool oom = !pipes_r || !pipes_w || !pids || !has_pid || !stage_status;
 #ifndef SHELL_HOSTED
-    char spill[SHELL_STAGE_MAX - 1][32];
-    memset(spill, 0, sizeof(spill));
+    char (*spill)[32] __attribute__((cleanup(shell_kfree_ptr))) =
+        (char (*)[32])kmalloc(ns * sizeof *spill);
+    if (!spill) oom = true;
+#endif
+    if (oom) {
+        kprintf("pipeline: out of memory\n");
+        return 1;
+    }
+    memset(pipes_r, 0, ns * sizeof(struct file *));
+    memset(pipes_w, 0, ns * sizeof(struct file *));
+    memset(pids, 0, ns * sizeof(int));
+    memset(has_pid, 0, ns * sizeof(bool));
+    memset(stage_status, 0, ns * sizeof(int));
+#ifndef SHELL_HOSTED
+    memset(spill, 0, ns * sizeof *spill);
 #endif
 
     for (int i = 0; i < pl->count - 1; i++) {
@@ -25272,6 +25393,21 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
  * too long" -- for one of the commonest ways to feed a read loop. */
 static int shell_redirs_intern(struct shell_simple *out,
                                struct shell_words *store) {
+    /* The ARRAY lives in the pipeline's store too, so it moves out as
+     * well; so does any later growth. */
+    struct shell_redir *nr = 0;
+    if (out->redir_count > 0) {
+        nr = (struct shell_redir *)words_alloc(store,
+                 (size_t)out->redir_count * sizeof *nr);
+        if (!nr) return -1;
+        memcpy(nr, out->redir, (size_t)out->redir_count * sizeof *nr);
+    }
+    out->redir = nr;
+    out->redir_cap = out->redir_count;
+    out->argc = 0;
+    out->argv = g_shell_no_args;
+    out->argv_cap = 0;
+    out->arena = store;
     for (int i = 0; i < out->redir_count; i++) {
         struct shell_redir *r = &out->redir[i];
         const char **fields[2] = { &r->path, &r->text };
@@ -25291,7 +25427,7 @@ static int shell_redirs_intern(struct shell_simple *out,
 static int shell_parse_compound_redirs(const char *tail, struct shell_simple *out,
                                        struct shell_words *store,
                                        const char *label) {
-    shell_simple_init(out);
+    shell_simple_init(out, store);
     tail = shell_skip_blanks(tail);
     if (!*tail) return 0;
 
@@ -26406,7 +26542,7 @@ static bool shell_try_for_command(const char *src) {
         return true;
     }
     wl->count = 0;
-    shell_simple_init(items);
+    shell_simple_init(items, &wl->words);
     if (implicit_at) {
         /* `for a` with no `in` iterates the positional parameters with
          * "$@" semantics: ONE iteration per parameter, each kept whole.
@@ -27909,7 +28045,7 @@ static bool shell_try_subshell_command(const char *src) {
     }
 
     struct shell_simple redirs;
-    shell_simple_init(&redirs);
+    shell_simple_init(&redirs, 0);     /* filled from plp->stage[0] below */
     const char *tail = shell_skip_blanks(body_end + 1);
 
     /* `( ... ) &` -- background the whole compound.
@@ -28092,7 +28228,7 @@ static bool shell_try_group_command(const char *src) {
     }
 
     struct shell_simple redirs;
-    shell_simple_init(&redirs);
+    shell_simple_init(&redirs, 0);     /* filled from plp->stage[0] below */
     const char *tail = shell_skip_blanks(body_end + 1);
 
     /* `{ ...; } &` -- background the whole compound.
@@ -28525,29 +28661,45 @@ static bool shell_try_background_line(const char *src) {
 
 /* Returns false when this is not a pipeline, or when no stage is compound --
  * in which case the existing token-level path handles it exactly as before. */
-static void shell_stages_free(char **st) {
-    for (int i = 0; i < SHELL_STAGE_MAX; i++) {
-        kfree(st[i]);
-        st[i] = 0;
-    }
+static void shell_stages_free(char **st, int n) {
+    if (!st) return;
+    for (int i = 0; i < n; i++) kfree(st[i]);
+    kfree(st);
 }
 
 static bool shell_try_compound_pipeline(const char *src) {
     if (!shell_find_pipe_at(src)) return false;
 
     /* Each stage's text, sized from itself: they were 8 KiB arrays, and a
-     * longer stage sent the whole pipeline back to the token path. */
-    char *stages[SHELL_STAGE_MAX] = { 0 };
+     * longer stage sent the whole pipeline back to the token path. And as
+     * many stages as there are: there were eight, and a ninth sent it to
+     * the token path, which had the same eight and said "too many". */
+    int nst = 0;
+    for (const char *q = src; q; ) {
+        const char *s = shell_find_pipe_at(q);
+        nst++;
+        q = s ? s + 1 : 0;
+    }
+    char **stages = (char **)kmalloc((size_t)nst * sizeof(char *));
+    size_t *stage_off __attribute__((cleanup(shell_kfree_ptr))) =
+        (size_t *)kmalloc((size_t)nst * sizeof(size_t));
+    bool *stage_simple __attribute__((cleanup(shell_kfree_ptr))) =
+        (bool *)kmalloc((size_t)nst * sizeof(bool));
+    int *cpids __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc((size_t)nst * sizeof(int));
+    if (!stages || !stage_off || !stage_simple || !cpids) {
+        kfree(stages);
+        return false;
+    }
+    memset(stages, 0, (size_t)nst * sizeof(char *));
 
     int n = 0;
     bool any_compound = false, overflow = false;
-    size_t stage_off[SHELL_STAGE_MAX];
-    bool stage_simple[SHELL_STAGE_MAX];
     const char *cur = src;
     for (;;) {
         const char *sep = shell_find_pipe_at(cur);
         const char *end = sep ? sep : cur + strlen(cur);
-        if (n >= SHELL_STAGE_MAX) { overflow = true; break; }
+        if (n >= nst) { overflow = true; break; }
         stages[n] = shell_dup_segment(cur, end);
         if (!stages[n]) {
             overflow = true;
@@ -28592,11 +28744,11 @@ static bool shell_try_compound_pipeline(const char *src) {
      * producer that never ends still cannot be stopped -- no fork. */
     if (!any_compound) {
 #endif
-        shell_stages_free(stages);
+        shell_stages_free(stages, nst);
         return false;
     }
     if (overflow || n < 2) {
-        shell_stages_free(stages);
+        shell_stages_free(stages, nst);
         return false;
     }
 
@@ -28604,8 +28756,7 @@ static bool shell_try_compound_pipeline(const char *src) {
     struct file *prev_in = 0;
     int last = 0;
     int failed = 0;                       /* rightmost non-zero, for pipefail */
-    int cpids[SHELL_STAGE_MAX];
-    for (int i = 0; i < SHELL_STAGE_MAX; i++) cpids[i] = 0;
+    for (int i = 0; i < nst; i++) cpids[i] = 0;
 
     /* THE DEBUG TRAP, once per stage, BEFORE any stage starts: bash fires it
      * per pipeline element (`false | false | false` is three lines, 1194),
@@ -28617,7 +28768,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (ln) g_shell_lineno = ln;
         shell_run_debug_trap();
     }
-    if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages); return true; }
+    if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages, nst); return true; }
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
 #ifdef SHELL_HOSTED
@@ -28778,7 +28929,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
     }
-    shell_stages_free(stages);
+    shell_stages_free(stages, nst);
     if (g_opt_pipefail && failed != 0) last = failed;
     shell_set_status(last);
     return true;
