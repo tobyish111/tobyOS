@@ -3541,8 +3541,13 @@ static void cmd_unsetenv(int argc, char **argv) {
  * and this shell already carries SHELL_ARG_MARK (0x01) for that, a byte no
  * expansion can produce. Array expansion reuses it rather than inventing a
  * second mechanism; see shell_append_array_join(). */
-#define SH_ARRAY_MAX    64      /* distinct arrays alive at once */
-#define SH_ARRELEM_MAX  512     /* elements in one array */
+/* NEITHER THE NUMBER OF ARRAYS NOR THEIR SIZE IS BOUNDED. There were 64
+ * arrays of 512 elements each, inline; the 513th element and the 65th array
+ * were a silent failure -- `a[600]=x` stored nothing and said nothing.
+ *
+ * Each array is its own heap record and the table holds POINTERS, so an
+ * array's address does not change when the table grows. The element vector
+ * does move when it grows: nothing may keep `&a->e[i]` across an insert. */
 
 /* ASSOCIATIVE ARRAYS share this store rather than getting their own.
  *
@@ -3559,11 +3564,27 @@ struct sh_arr_elem { long idx; char *key; char *val; };
 struct sh_array {
     char *name;
     bool  assoc;                /* declare -A: subscripts are STRING keys */
-    struct sh_arr_elem e[SH_ARRELEM_MAX];
+    struct sh_arr_elem *e;      /* cap slots on the heap */
     int  n;                     /* used slots; sorted by idx when indexed */
+    int  cap;
 };
-static struct sh_array g_arrays[SH_ARRAY_MAX];
+static struct sh_array **g_arrays;
 static int g_narrays;
+static int g_arrays_cap;
+
+/* Room for one more element. */
+static bool sh_array_reserve(struct sh_array *a) {
+    if (a->n < a->cap) return true;
+    int ncap = a->cap ? a->cap * 2 : 16;
+    struct sh_arr_elem *ne =
+        (struct sh_arr_elem *)kmalloc((size_t)ncap * sizeof *ne);
+    if (!ne) return false;
+    if (a->n) memcpy(ne, a->e, (size_t)a->n * sizeof *ne);
+    kfree(a->e);
+    a->e = ne;
+    a->cap = ncap;
+    return true;
+}
 
 /* The array under EXACTLY this name, following no reference. Scope
  * management needs it: a local going out of scope must drop the local,
@@ -3572,8 +3593,8 @@ static int g_narrays;
 static struct sh_array *sh_array_find_literal(const char *name) {
     if (!name || !*name) return 0;
     for (int i = 0; i < g_narrays; i++)
-        if (g_arrays[i].name && strcmp(g_arrays[i].name, name) == 0)
-            return &g_arrays[i];
+        if (g_arrays[i]->name && strcmp(g_arrays[i]->name, name) == 0)
+            return g_arrays[i];
     return 0;
 }
 
@@ -3603,15 +3624,24 @@ static struct sh_array *sh_array_find(const char *name) {
     const char *real = env_deref_name_ex(name, target, sizeof target, false);
     if (!real || !*real) real = name;
     for (int i = 0; i < g_narrays; i++)
-        if (g_arrays[i].name && strcmp(g_arrays[i].name, real) == 0)
-            return &g_arrays[i];
+        if (g_arrays[i]->name && strcmp(g_arrays[i]->name, real) == 0)
+            return g_arrays[i];
     return 0;
 }
 
 static struct sh_array *sh_array_create(const char *name) {
     struct sh_array *a = sh_array_find(name);
     if (a) return a;
-    if (g_narrays >= SH_ARRAY_MAX) return 0;
+    if (g_narrays >= g_arrays_cap) {
+        int ncap = g_arrays_cap ? g_arrays_cap * 2 : 64;
+        struct sh_array **nt =
+            (struct sh_array **)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) return 0;
+        if (g_narrays) memcpy(nt, g_arrays, (size_t)g_narrays * sizeof *nt);
+        kfree(g_arrays);
+        g_arrays = nt;
+        g_arrays_cap = ncap;
+    }
     /* CREATED UNDER THE TARGET'S NAME, not the reference's.
      *
      *     z=Z; typeset -n r=z; r=(p q)
@@ -3625,13 +3655,14 @@ static struct sh_array *sh_array_create(const char *name) {
     char tgt[128];
     const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
     if (real && *real) name = real;
-    a = &g_arrays[g_narrays];
+    a = (struct sh_array *)kmalloc(sizeof *a);
+    if (!a) return 0;
+    memset(a, 0, sizeof *a);
     size_t n = strlen(name) + 1;
     a->name = (char *)kmalloc(n);
-    if (!a->name) return 0;
+    if (!a->name) { kfree(a); return 0; }
     memcpy(a->name, name, n);
-    a->n = 0;
-    g_narrays++;
+    g_arrays[g_narrays++] = a;
     return a;
 }
 
@@ -3651,10 +3682,14 @@ static void sh_array_unset_idx(struct sh_array *a, long idx) {
 
 static void sh_array_unset_at(struct sh_array *a) {
     if (!a) return;
+    int slot = -1;
+    for (int j = 0; j < g_narrays; j++)
+        if (g_arrays[j] == a) { slot = j; break; }
+    if (slot < 0) return;
     for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
-    a->n = 0;
+    kfree(a->e);
     kfree(a->name);
-    int slot = (int)(a - g_arrays);
+    kfree(a);
     for (int j = slot; j + 1 < g_narrays; j++) g_arrays[j] = g_arrays[j + 1];
     g_narrays--;
 }
@@ -3681,7 +3716,7 @@ static int sh_array_set(const char *name, long idx, const char *val) {
             return 0;
         }
     }
-    if (a->n >= SH_ARRELEM_MAX) { kfree(copy); return -1; }
+    if (!sh_array_reserve(a)) { kfree(copy); return -1; }
     int at = a->n;                                   /* keep sorted by idx */
     while (at > 0 && a->e[at - 1].idx > idx) { a->e[at] = a->e[at - 1]; at--; }
     a->e[at].idx = idx;
@@ -3791,7 +3826,7 @@ static int sh_array_set_key(const char *name, const char *key,
             return 0;
         }
     }
-    if (a->n >= SH_ARRELEM_MAX) { kfree(copy); return -1; }
+    if (!sh_array_reserve(a)) { kfree(copy); return -1; }
     size_t kn = strlen(key) + 1;
     char *kc = (char *)kmalloc(kn);
     if (!kc) { kfree(copy); return -1; }
@@ -4023,6 +4058,7 @@ static int shell_locals_push(const char *name, int depth) {
             if (sv->arr_saved) {
                 memset(sv->arr_saved, 0, sizeof *sv->arr_saved);
                 for (int i = 0; i < a->n; i++) {
+                    if (!sh_array_reserve(sv->arr_saved)) break;
                     size_t vn = strlen(a->e[i].val) + 1;
                     char *cp = (char *)kmalloc(vn);
                     if (!cp) break;
@@ -4070,6 +4106,7 @@ static void shell_locals_pop(int depth) {
         if (sv->arr_saved) {
             for (int i = 0; i < sv->arr_saved->n; i++)
                 kfree(sv->arr_saved->e[i].val);
+            kfree(sv->arr_saved->e);
             kfree(sv->arr_saved);
             sv->arr_saved = 0;
         }
@@ -4790,7 +4827,7 @@ static void cmd_declare(int argc, char **argv) {
             (void)shell_declare_print(nm);
         }
         for (int k = 0; k < g_narrays; k++) {
-            const char *nm = g_arrays[k].name;
+            const char *nm = g_arrays[k]->name;
             if (!nm) continue;
             if (env_find(nm, strlen(nm)) >= 0) continue;   /* already done */
             if (!shell_declare_filter_ok(nm, set_array, set_assoc,
@@ -5131,8 +5168,9 @@ static void cmd_readarray(int argc, char **argv) {
              *
              * Testing rr instead was wrong: the reader returns 1 (not 0) when
              * input ends without a trailing newline, so the loop never broke
-             * and filled the array to SH_ARRELEM_MAX -- ${#arr[@]} came back
-             * 512 with the first three elements perfectly correct, which is a
+             * and filled the array to its old 512-element cap -- ${#arr[@]}
+             * came back 512 with the first three elements perfectly correct,
+             * which is a
              * failure that a spot-check of arr[0] would have passed. */
             if (rr < 0 || !got_any) break;
             if (!trim) {
@@ -5506,11 +5544,11 @@ static void shell_print_vars_set_format(void) {
             names[n++] = k;
         }
         for (int i = 0; i < g_narrays; i++) {
-            if (!g_arrays[i].name) continue;
+            if (!g_arrays[i]->name) continue;
             bool dup = false;
             for (int k = 0; k < n; k++)
-                if (strcmp(names[k], g_arrays[i].name) == 0) { dup = true; break; }
-            if (!dup) names[n++] = g_arrays[i].name;
+                if (strcmp(names[k], g_arrays[i]->name) == 0) { dup = true; break; }
+            if (!dup) names[n++] = g_arrays[i]->name;
         }
         for (int i = 1; i < n; i++) {                 /* insertion sort */
             const char *v = names[i];
@@ -18089,6 +18127,11 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                         if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
+                            /* Looked up again every time round: the operator
+                             * can run a command substitution, and one that
+                             * unsets the array frees the record. */
+                            arr = sh_array_find(nm);
+                            if (!arr || i >= arr->n) break;
                             if (i > 0) {
                                 if (!star) {
                                     if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
