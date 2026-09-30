@@ -1,0 +1,10 @@
+x=$(printf '%s,' L{1..3}); echo "b1 [$x]"
+y=$(echo {a,b}{c,d}); echo "b2 [$y]"
+echo "b3 [$(echo x{1..3}y)]"
+z=`echo q{1,2}`; echo "b4 [$z]"
+echo "b5 [$(echo "{a,b}" {c,d})]"
+v=$(echo $(echo n{1..2})); echo "b6 [$v]"
+w=${undef:-$(echo d{1,2})}; echo "b7 [$w]"
+a=( $(echo e{1..3}) ); echo "b8 [${#a[@]}] [${a[2]}]"
+echo "b9 $(echo '{x,y}' {x,y})"
+echo done

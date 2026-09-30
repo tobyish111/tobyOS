@@ -19933,6 +19933,64 @@ static int shell_escape_glob_range(struct shell_sb *b, size_t from);
 static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
                             int depth);
 
+/* `p` is at `$(`, `$((`, `${` or a backquote. Returns the byte after the
+ * construct -- or `end` if it never closes. What is inside is another
+ * command's text: its quotes are its own, a nested substitution is skipped
+ * whole (inside double quotes as well, where its `"` would otherwise end
+ * the string early), and its braces are for IT to expand when it runs:
+ *
+ *     x=$(printf %s L{1..3})       bash: L1L2L3
+ *
+ * The outer pass split that at the blanks, expanded `L{1..3})` as a word
+ * of its own, and the line became `x=$(printf %s L1) L2) L3)`. */
+static const char *shell_brace_skip_subst(const char *p, const char *end) {
+    if (*p == '`') {
+        p++;
+        while (p < end && *p != '`') {
+            if (*p == '\\' && p + 1 < end) p++;
+            p++;
+        }
+        return p < end ? p + 1 : end;
+    }
+    char open = p[1], close = (open == '(') ? ')' : '}';
+    p += 2;
+    int nest = 1;
+    bool sq = false, sq_ansi = false, dq = false;
+    while (p < end) {
+        if (sq) {
+            if (sq_ansi && *p == '\\' && p + 1 < end) { p += 2; continue; }
+            if (*p == '\'') { sq = false; sq_ansi = false; }
+            p++;
+            continue;
+        }
+        if (*p == '\\' && p + 1 < end) { p += 2; continue; }
+        if ((*p == '$' && p + 1 < end && (p[1] == '(' || p[1] == '{')) ||
+            *p == '`') {
+            p = shell_brace_skip_subst(p, end);
+            continue;
+        }
+        if (dq) {
+            if (*p == '"') dq = false;
+            p++;
+            continue;
+        }
+        if (*p == '$' && p + 1 < end && p[1] == '\'') {
+            sq = true; sq_ansi = true; p += 2; continue;
+        }
+        if (*p == '\'') { sq = true; p++; continue; }
+        if (*p == '"')  { dq = true; p++; continue; }
+        if (*p == open) nest++;
+        else if (*p == close && --nest == 0) return p + 1;
+        p++;
+    }
+    return end;
+}
+
+static bool shell_brace_subst_at(const char *p, const char *end) {
+    return *p == '`' ||
+           (*p == '$' && p + 1 < end && (p[1] == '(' || p[1] == '{'));
+}
+
 /* Emit one finished word, separated from the previous by a space. */
 static int shell_brace_emit(const char *s, size_t n, struct shell_sb *out) {
     if (out->len > 0 && out->p[out->len - 1] != ' ') {
@@ -20027,6 +20085,14 @@ static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
         for (size_t i = 0; i < wlen; i++) {
             char c = w[i];
             if (sq) { if (c == '\'') sq = false; continue; }
+            /* `${...}` is a parameter, `$(...)` and backquotes a command;
+             * their own braces are somebody else's problem -- in double
+             * quotes too, where an inner `"` would otherwise look like the
+             * end of the string. See shell_brace_skip_subst. */
+            if (shell_brace_subst_at(w + i, w + wlen)) {
+                i = (size_t)(shell_brace_skip_subst(w + i, w + wlen) - w) - 1;
+                continue;
+            }
             if (dq) {
                 if (c == '\\' && i + 1 < wlen) { i++; continue; }
                 if (c == '"') dq = false;
@@ -20035,18 +20101,6 @@ static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
             if (c == '\'') { sq = true; continue; }
             if (c == '"')  { dq = true; continue; }
             if (c == '\\' && i + 1 < wlen) { i++; continue; }
-            /* `${...}` is a parameter. So is `$(...)`; its own braces are
-             * somebody else's problem. */
-            if (c == '$' && i + 1 < wlen && (w[i + 1] == '{' || w[i + 1] == '(')) {
-                int nest = 0;
-                for (size_t j = i + 1; j < wlen; j++) {
-                    if (w[j] == '{' || w[j] == '(') nest++;
-                    else if (w[j] == '}' || w[j] == ')') {
-                        if (--nest == 0) { i = j; break; }
-                    }
-                }
-                continue;
-            }
             if (c != '{') continue;
             /* A blank after `{` makes it a GROUP command, never an
              * expansion -- and an empty `{}` has nothing to expand. */
@@ -20229,6 +20283,7 @@ static size_t shell_arr_literal_close(const char *s, size_t len, int *depth) {
  * keeps its `;` and `> {a,b}` keeps its redirection. */
 static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
     const char *p = src;
+    const char *src_end = src + strlen(src);
     /* AN ASSIGNMENT'S VALUE IS NOT BRACE-EXPANDED.
      *
      *     x={a,b} ; echo $x       bash: {a,b}
@@ -20270,6 +20325,12 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
         bool sq = false, dq = false;
         while (*p) {
             if (sq) { if (*p == '\'') sq = false; p++; continue; }
+            /* A substitution is part of the word it sits in, blanks and
+             * operators and all -- quoted or not. */
+            if (shell_brace_subst_at(p, src_end)) {
+                p = shell_brace_skip_subst(p, src_end);
+                continue;
+            }
             if (dq) {
                 if (*p == '\\' && p[1]) { p += 2; continue; }
                 if (*p == '"') dq = false;
