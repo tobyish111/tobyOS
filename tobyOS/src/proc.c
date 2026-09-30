@@ -1456,12 +1456,18 @@ __attribute__((noreturn)) void proc_first_user_entry(void) {
     proc_enter_user_asm(p->user_entry, p->user_rsp);
 }
 
-/* Wake any process blocked on `pid`. Marks them READY and re-enqueues
+/* Wake any process blocked on `pid` -- and its parent or tracer if that is
+ * blocked on any child (PROC_WAIT_ANY). Marks them READY and re-enqueues
  * onto the scheduler. */
 static void wakeup_waiters(int pid) {
+    struct proc *t = proc_lookup(pid);
+    int par = t ? t->ppid : 0, tr = t ? t->tracer_pid : 0;
     for (int i = 0; i < PROC_MAX; i++) {
         struct proc *q = &g_proc[i];
-        if (q->state == PROC_BLOCKED && q->wait_pid == pid) {
+        if (q->state == PROC_BLOCKED &&
+            (q->wait_pid == pid ||
+             (q->wait_pid == PROC_WAIT_ANY && q->pid > 0 &&
+              (q->pid == par || q->pid == tr)))) {
             q->wait_pid = -1;
             q->state    = PROC_READY;
             sched_enqueue(q);
@@ -2040,20 +2046,50 @@ static void proc_reap(struct proc *p) {
     kprintf("[proc] reaped pid=%d, slot recycled\n", pid);
 }
 
-/* Find a child of `ppid` for Linux wait4(-1) ("wait for any child"). Prefers
- * an already-TERMINATED child (so a ready reap returns immediately); otherwise
- * returns the first live child so the caller can block on it. Returns the
- * child pid, or -1 if `ppid` has no children. */
-int proc_any_child(int ppid) {
-    int live = -1;
-    for (int i = 0; i < PROC_MAX; i++) {
-        struct proc *q = &g_proc[i];
-        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
-            q->ppid != ppid) continue;
-        if (q->state == PROC_TERMINATED) return q->pid;   /* reap-ready */
-        if (live < 0) live = q->pid;
+/* Would wait4(pid, options) on this one child report without blocking?
+ * Exactly the events LX_wait4's single-child path reports, so that a child
+ * picked here is answered at once when the caller hands its pid on. */
+static bool wait_any_ready(struct proc *self, struct proc *q, int options) {
+    if (q->state == PROC_TERMINATED) return true;
+    if (options & (0x2 | 0x8))                   /* WUNTRACED | WCONTINUED */
+        return ((options & 0x2) && q->state == PROC_STOPPED &&
+                !q->stop_reported) ||
+               ((options & 0x8) && q->cont_pending);
+    if (options & 0x1) return false;             /* WNOHANG reaps only */
+    return q->ptrace_stopped && q->tracer_pid == self->pid;
+}
+
+/* wait4 with pid <= 0 (see proc.h). THIS USED TO PICK ONE CHILD AND WAIT FOR
+ * IT: the first child that had exited, else the first one alive. A shell that
+ * had started `sleep 3 &` and then ran `cat` in the foreground waited for the
+ * sleep -- the lower pid -- and got cat back three seconds late, after the
+ * sleep had been reaped in its place. Linux waits for whichever child has
+ * an event first, and so does this: every matching child is looked at on
+ * every pass, and the caller sleeps with wait_pid = PROC_WAIT_ANY, which
+ * wakeup_waiters answers for any child's exit or ptrace-stop. */
+int proc_wait_any(int pgid, int options) {
+    struct proc *self = current_proc();
+    if (!self) return -1;
+    for (;;) {
+        bool any = false;
+        for (int i = 0; i < PROC_MAX; i++) {
+            struct proc *q = &g_proc[i];
+            if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                q->is_thread || q->ppid != self->pid) continue;
+            if (pgid > 0 && (q->pgid > 0 ? q->pgid : q->pid) != pgid) continue;
+            any = true;
+            if (wait_any_ready(self, q, options)) return q->pid;
+        }
+        if (!any) return -1;
+        /* WNOHANG, or the stop/continue mode, which LX_wait4 polls. */
+        if (options & (0x1 | 0x2 | 0x8)) return 0;
+        self->wait_pid = PROC_WAIT_ANY;
+        self->state    = PROC_BLOCKED;
+        sched_yield();
+        /* A signal wakes us without clearing it; a stale PROC_WAIT_ANY
+         * would let a later child's exit wake an unrelated sleep. */
+        self->wait_pid = -1;
     }
-    return live;
 }
 
 int proc_wait_info(int pid, struct proc_exit_info *out) {

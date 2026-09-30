@@ -173,7 +173,8 @@ struct proc {
     uint64_t        user_arg;
 
     /* Wait-for-child book-keeping. */
-    int             wait_pid;       /* pid we're blocked on, or -1 */
+    int             wait_pid;       /* pid we're blocked on, or -1, or
+                                     * PROC_WAIT_ANY (any of our children) */
 
     /* Singly-linked ready-queue node. NOTE: this is NOT a reliable "am I
      * queued?" test -- the TAIL of the queue always has next_ready == NULL, so
@@ -989,9 +990,13 @@ int  fd_cloexec_get(struct proc *p, int fd);
 /* Record argv for /proc/<pid>/cmdline (proc.c; spawn + execve call it). */
 void proc_record_cmdline(struct proc *p, int argc, char **argv);
 
-/* Find a child of `ppid` (for Linux wait4(-1)); prefers a TERMINATED child.
- * Returns the child pid, or -1 if there are no children. */
-int proc_any_child(int ppid);
+/* wait4 with pid <= 0: a child of the caller -- in process group `pgid`, or
+ * any group if `pgid` is 0 -- that has an event wait4 reports under
+ * `options` (Linux WNOHANG/WUNTRACED/WCONTINUED bits). Without WNOHANG and
+ * without WUNTRACED/WCONTINUED, blocks until one has. Returns its pid, 0 if
+ * none has one yet, or -1 if the caller has no such child (ECHILD). */
+#define PROC_WAIT_ANY (-2)
+int proc_wait_any(int pgid, int options);
 
 /* For diagnostics. */
 const char *proc_state_name(enum proc_state s);

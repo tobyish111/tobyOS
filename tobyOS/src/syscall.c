@@ -11986,10 +11986,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         void *ustatus = (void *)a2;
         int   options = (int)a3;
         int   pid;                     /* the kpid we operate on internally */
-        if (vpid <= 0) {               /* "any child" -- sh -c forks exactly one */
+        if (vpid <= 0) {
+            /* Any child (-1), any in our own group (0), or any in group
+             * -vpid. Which one is decided by who has an event, not by pid
+             * order -- see proc_wait_any. The child picked is then handled
+             * by the single-child code below, which answers it at once. */
             struct proc *self = current_proc();
-            pid = self ? proc_any_child(self->pid) : -1;
-            if (pid < 0) return -ABI_ECHILD;
+            if (!self) return -ABI_ECHILD;
+            if (vpid == -2147483647 - 1) return -ABI_ESRCH;
+            int pgid = vpid == 0 ? proc_pgid_of(self)
+                     : vpid < -1 ? -vpid : 0;
+            for (;;) {
+                pid = proc_wait_any(pgid, options);
+                if (pid < 0) return -ABI_ECHILD;
+                if (pid > 0) break;
+                if (options & 0x1 /* WNOHANG */) return 0;
+                /* WUNTRACED/WCONTINUED: poll, as the single-child arm does. */
+                if (self->pending_signals & ~SLEEP_UNINTERRUPTING)
+                    return -ABI_EINTR;
+                sched_yield();
+            }
         } else {
             /* Translate the caller's number, and require the target to be
              * visible from the caller's namespace -- otherwise a process could
