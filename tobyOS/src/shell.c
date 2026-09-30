@@ -19367,8 +19367,14 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
  * Nobody waits for these children -- bash does not either, which is what the
  * Oils corpus case about ordering is complaining about. The shell closes its
  * end when the command that used it is done; that is the EOF the reader was
- * waiting for. */
-#define SHELL_PROCSUB_MAX    8
+ * waiting for.
+ *
+ * THERE IS NO COUNT LIMIT. The table held 8, and the ninth `<( )` on one
+ * line was "too many process substitutions". Descriptors come from 63
+ * downwards while that range lasts (down to the shell's own 0..9); past it
+ * the pipe keeps the descriptor it was created on, which is free by
+ * construction. That is bash's rule too: move_to_high_fd searches down
+ * from 63 and, finding nothing, leaves the descriptor where it was. */
 #define SHELL_PROCSUB_FD_TOP 63
 
 struct shell_procsub {
@@ -19377,7 +19383,7 @@ struct shell_procsub {
     int          pid;
     bool         input;     /* `<( )`; the other direction is `>( )` */
 };
-static struct shell_procsub g_procsub[SHELL_PROCSUB_MAX];
+static struct shell_procsub *g_procsub;
 static int g_procsub_n;
 
 static int shell_procsub_mark(void) { return g_procsub_n; }
@@ -19418,11 +19424,30 @@ extern void _exit(int status);
 extern int  host_file_fd(struct file *f);          /* host.c */
 extern int  host_file_move_fd(struct file *f, int want);
 
+static int g_procsub_cap;            /* only a forking shell makes any */
+
+/* The number a new substitution's descriptor gets. See the note above. */
+static int shell_procsub_fd_for(struct file *keep) {
+    int want = SHELL_PROCSUB_FD_TOP - g_procsub_n;
+    if (want >= SHELL_FD_MAX) return want;
+    return host_file_fd(keep);
+}
+
 static bool shell_procsub_make(const char *text, bool input,
                                char *out, size_t cap) {
-    if (g_procsub_n >= SHELL_PROCSUB_MAX) {
-        kprintf("tsh: too many process substitutions\n");
-        return false;
+    if (g_procsub_n >= g_procsub_cap) {
+        int ncap = g_procsub_cap ? g_procsub_cap * 2 : 8;
+        struct shell_procsub *nt =
+            (struct shell_procsub *)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) {
+            kprintf("tsh: process substitution: out of memory\n");
+            return false;
+        }
+        if (g_procsub_n)
+            memcpy(nt, g_procsub, (size_t)g_procsub_n * sizeof *nt);
+        kfree(g_procsub);
+        g_procsub = nt;
+        g_procsub_cap = ncap;
     }
     /* `<(<file)` IS THE FILE. Measured against bash 5.2, and it is the only
      * place bash gives a redirection-only command any output at all:
@@ -19447,8 +19472,8 @@ static bool shell_procsub_make(const char *text, bool input,
                     struct file *ff = shell_open_vfs_file(fpath.p, false, false,
                                                           "shell");
                     if (!ff) return false;
-                    int fwant = SHELL_PROCSUB_FD_TOP - g_procsub_n;
-                    if (host_file_move_fd(ff, fwant) < 0) {
+                    int fwant = shell_procsub_fd_for(ff);
+                    if (fwant < 0 || host_file_move_fd(ff, fwant) < 0) {
                         file_close(ff);
                         return false;
                     }
@@ -19474,8 +19499,8 @@ static bool shell_procsub_make(const char *text, bool input,
     struct file *child_end = input ? w : r;
     struct file *keep      = input ? r : w;
 
-    int want = SHELL_PROCSUB_FD_TOP - g_procsub_n;
-    if (host_file_move_fd(keep, want) < 0) {
+    int want = shell_procsub_fd_for(keep);
+    if (want < 0 || host_file_move_fd(keep, want) < 0) {
         file_close(r); file_close(w);
         kprintf("tsh: process substitution: no descriptor %d\n", want);
         return false;
@@ -23373,7 +23398,8 @@ static int shell_fd_state_extra(const struct shell_fd_state *st,
      * descriptor 63 is open in `cat`, so every command spawned while a
      * substitution is live inherits it AT THE SAME NUMBER -- the number
      * is in the path the command was given. Slots 3..9 above are shell
-     * fds and cannot collide with 63 downwards. */
+     * fds and cannot collide with 63 downwards. The caller sizes `out`
+     * for SHELL_FD_MAX + g_procsub_n. */
     for (int i = 0; i < g_procsub_n && n < max; i++) {
         if (!g_procsub[i].keep) continue;
         out[n].fd = g_procsub[i].fd;
@@ -24244,9 +24270,14 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
         return 1;
     }
 
-    struct proc_fd_map xfd[SHELL_FD_MAX + SHELL_PROCSUB_MAX];
-    int nxfd = shell_fd_state_extra(&fds, xfd,
-                                    SHELL_FD_MAX + SHELL_PROCSUB_MAX);
+    struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct proc_fd_map *)kmalloc((size_t)(SHELL_FD_MAX + g_procsub_n) *
+                                      sizeof *xfd);
+    if (!xfd) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX + g_procsub_n);
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
@@ -24397,9 +24428,14 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
 
     char path_buf[64];
     const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
-    struct proc_fd_map xfd[SHELL_FD_MAX + SHELL_PROCSUB_MAX];
-    int nxfd = shell_fd_state_extra(&fds, xfd,
-                                    SHELL_FD_MAX + SHELL_PROCSUB_MAX);
+    struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct proc_fd_map *)kmalloc((size_t)(SHELL_FD_MAX + g_procsub_n) *
+                                      sizeof *xfd);
+    if (!xfd) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    int nxfd = shell_fd_state_extra(&fds, xfd, SHELL_FD_MAX + g_procsub_n);
     struct proc_spec spec = {
         .path = path, .name = argv[0],
         .fd0 = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
