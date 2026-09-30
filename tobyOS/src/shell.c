@@ -105,40 +105,19 @@ extern volatile struct limine_module_request module_req;
  * teaching those scans to step over IT changed the answer for words that had
  * no collision in them. 0x04 appears only where this puts it. */
 #define SHELL_DATA_ESC '\x04'
-/* 256, not 32 (2026-09-04). `for i in $(seq 1 255)` -- the Oils suite's
- * byte-matching case, and an ordinary shape of loop -- died with "too many
- * arguments (max 32)". 256 keeps every char *argv[ARG_MAX] frame at 2 KiB,
- * which the 32 KiB kernel stack the in-kernel shell runs on can carry; the
- * real fix is a heap-grown argv, and this is the step before it. */
+/* THE SHELL HAS NO ARGUMENT LIMIT (2026-09-29). It was 32, then 256, then
+ * 1024 hosted and 256 in the kernel -- each raise argued against the stack
+ * cost of `char *argv[ARG_MAX]` arrays and of `struct shell_simple`, which
+ * held one. A command's argv now grows in its pipeline's store, and the
+ * positional parameters and every frame that saves them grow on the heap.
+ *
+ * `getconf ARG_MAX` still has to print a number, and prints the one it
+ * always did. That is NOT a limit tsh enforces; what bounds a PROGRAM's
+ * argv is the kernel's spawn/exec ABI (ABI_ARGV_MAX), not the shell. */
 #ifdef SHELL_HOSTED
-/* 1024, and the reason it may now be raised at all is structural, not a
- * change of mind about the number (2026-09-18).
- *
- * The note this replaces said 512 must stand because ARG_MAX multiplies
- * through `struct shell_simple.argv[ARG_MAX]`, and `struct shell_pipeline`
- * holds SHELL_STAGE_MAX = 8 of those and was allocated ON THE STACK in
- * three places that nest with subshells and command substitution -- 32 KiB
- * per pipeline against a 256 KiB user stack, with four levels of nesting
- * enough to overflow. That was correct, and a stack overflow in the shell
- * would present as exactly the kind of intermittent wedge this tree has
- * spent weeks chasing.
- *
- * ALL THREE OF THOSE ARE NOW ON THE HEAP, so the pipeline no longer costs
- * the stack anything at any ARG_MAX. 1024 closes the Oils case "ulimit -f 1
- * prevents files larger 512 bytes" (1069), which never measured ulimit at
- * all: it runs `for i in $(seq 513)` and died here with "too many arguments
- * (max 512)" while bash carried on.
- *
- * WHAT STILL BOUNDS THIS, so the next person does not just double it again:
- * eight `struct shell_simple` instances remain on the stack (the `redirs` /
- * `tail_redirs` / `cmd` locals in the compound parsers), and those DO nest.
- * At 1024 each is ~8 KiB, which the 256 KiB user stack carries about thirty
- * deep. At 4096 it is ~33 KiB and four levels is trouble again. Going
- * materially past this means heap-growing argv itself -- the fix the old
- * note named -- not another doubling. */
-#define ARG_MAX  1024
+#define SHELL_GETCONF_ARG_MAX  1024
 #else
-#define ARG_MAX  256
+#define SHELL_GETCONF_ARG_MAX  256
 #endif
 
 #define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
@@ -649,7 +628,7 @@ static unsigned long shell_lineno_at(const char *p) {
 }
 
 static char *g_param0;
-static char *g_positional[ARG_MAX];
+static char **g_positional;          /* heap, count slots; 0 when none */
 static int g_positional_count;
 
 /* Runaway-loop cap. bash has NO cap at all; this exists only so a
@@ -2329,7 +2308,7 @@ static void env_init_defaults(void) {
 
 struct shell_param_frame {
     char *param0;
-    char *positional[ARG_MAX];
+    char **positional;          /* the table itself, moved in and out */
     int positional_count;
 };
 
@@ -2349,8 +2328,9 @@ static void shell_free_current_params(void) {
     }
     for (int i = 0; i < g_positional_count; i++) {
         if (g_positional[i]) kfree(g_positional[i]);
-        g_positional[i] = 0;
     }
+    kfree(g_positional);
+    g_positional = 0;
     g_positional_count = 0;
 }
 
@@ -2358,11 +2338,9 @@ static void shell_move_params_to_frame(struct shell_param_frame *f) {
     memset(f, 0, sizeof(*f));
     f->param0 = g_param0;
     f->positional_count = g_positional_count;
-    for (int i = 0; i < g_positional_count; i++) {
-        f->positional[i] = g_positional[i];
-        g_positional[i] = 0;
-    }
+    f->positional = g_positional;
     g_param0 = 0;
+    g_positional = 0;
     g_positional_count = 0;
 }
 
@@ -2370,11 +2348,9 @@ static void shell_restore_params_from_frame(struct shell_param_frame *f) {
     shell_free_current_params();
     g_param0 = f->param0;
     g_positional_count = f->positional_count;
-    for (int i = 0; i < g_positional_count; i++) {
-        g_positional[i] = f->positional[i];
-        f->positional[i] = 0;
-    }
+    g_positional = f->positional;
     f->param0 = 0;
+    f->positional = 0;
     f->positional_count = 0;
 }
 
@@ -2387,24 +2363,28 @@ static int shell_set_param0(const char *name) {
 }
 
 static int shell_set_positional_params(int argc, char **argv) {
-    if (argc < 0 || argc > ARG_MAX) return -1;
+    if (argc < 0) return -1;
 
-    char *tmp[ARG_MAX];
-    memset(tmp, 0, sizeof(tmp));
+    /* The new table is built whole before the old one goes: `set -- "$@"`
+     * passes the old strings in. */
+    char **tmp = (char **)kmalloc((size_t)(argc + 1) * sizeof(char *));
+    if (!tmp) return -1;
     for (int i = 0; i < argc; i++) {
         tmp[i] = shell_strdup(argv[i]);
         if (!tmp[i]) {
             for (int j = 0; j < i; j++) kfree(tmp[j]);
+            kfree(tmp);
             return -1;
         }
     }
+    tmp[argc] = 0;
 
     for (int i = 0; i < g_positional_count; i++) {
         if (g_positional[i]) kfree(g_positional[i]);
-        g_positional[i] = 0;
     }
+    kfree(g_positional);
+    g_positional = tmp;
     g_positional_count = argc;
-    for (int i = 0; i < argc; i++) g_positional[i] = tmp[i];
     return 0;
 }
 
@@ -14283,13 +14263,13 @@ static void cmd_logname(int argc, char **argv) {
  * fabricated number. */
 static void cmd_getconf(int argc, char **argv) {
     static const struct { const char *name; long value; } vars[] = {
-        { "ARG_MAX",         ARG_MAX     },
+        { "ARG_MAX",         SHELL_GETCONF_ARG_MAX },
         { "LINE_MAX",        LINE_MAX    },
         { "NAME_MAX",        255         },
         { "PATH_MAX",        VFS_PATH_MAX},
         { "OPEN_MAX",        SHELL_FD_MAX},
         { "_POSIX_VERSION",  200809L     },
-        { "_POSIX_ARG_MAX",  ARG_MAX     },
+        { "_POSIX_ARG_MAX",  SHELL_GETCONF_ARG_MAX },
         { "_POSIX_OPEN_MAX", SHELL_FD_MAX},
         { "CHAR_BIT",        8           },
         { "INT_MAX",         2147483647L },
@@ -27722,7 +27702,7 @@ static bool shell_try_function_definition(const char *src) {
 
 struct shell_param_snapshot {
     char *param0;
-    char *positional[ARG_MAX];
+    char **positional;          /* heap, positional_count slots */
     int positional_count;
 };
 
@@ -27733,9 +27713,11 @@ static void shell_param_snapshot_clear(struct shell_param_snapshot *frame) {
         frame->param0 = 0;
     }
     for (int i = 0; i < frame->positional_count; i++) {
-        if (frame->positional[i]) kfree(frame->positional[i]);
-        frame->positional[i] = 0;
+        if (frame->positional && frame->positional[i])
+            kfree(frame->positional[i]);
     }
+    kfree(frame->positional);
+    frame->positional = 0;
     frame->positional_count = 0;
 }
 
@@ -27746,6 +27728,14 @@ static int shell_param_snapshot_capture(struct shell_param_snapshot *frame) {
         frame->param0 = shell_strdup(g_param0);
         if (!frame->param0) return -1;
     }
+    frame->positional = (char **)kmalloc((size_t)(g_positional_count + 1) *
+                                         sizeof(char *));
+    if (!frame->positional) {
+        shell_param_snapshot_clear(frame);
+        return -1;
+    }
+    memset(frame->positional, 0,
+           (size_t)(g_positional_count + 1) * sizeof(char *));
     frame->positional_count = g_positional_count;
     for (int i = 0; i < g_positional_count; i++) {
         frame->positional[i] = shell_strdup(g_positional[i]);
@@ -27763,10 +27753,8 @@ static void shell_param_snapshot_restore(struct shell_param_snapshot *frame) {
     g_param0 = frame->param0;
     frame->param0 = 0;
     g_positional_count = frame->positional_count;
-    for (int i = 0; i < g_positional_count; i++) {
-        g_positional[i] = frame->positional[i];
-        frame->positional[i] = 0;
-    }
+    g_positional = frame->positional;
+    frame->positional = 0;
     frame->positional_count = 0;
 }
 
