@@ -16475,6 +16475,17 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
             g_shell_flow = SHELL_FLOW_NONE;
             g_shell_flow_status = 0;
         }
+    } else if (g_shell_flow == SHELL_FLOW_DISCARD) {
+        /* ...and a DISCARD (failglob, an expansion error) ends the
+         * SUBSTITUTION with status 1, as it ends bash's subshell. It used to
+         * leak out and throw away the rest of the CALLER's line:
+         *
+         *     shopt -s failglob
+         *     x=$(echo *.ZZ; echo in); echo "[$x] $?"   bash: [] 1
+         *                                              tsh : nothing */
+        g_capture_last_status = 1;
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
     }
     g_last_status = saved_status;
     g_parse_error = saved_parse_error;
