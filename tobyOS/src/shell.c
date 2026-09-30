@@ -25565,13 +25565,15 @@ static void shell_parse_error(void) {
  *   - `&&`, `||`, `!` and parentheses are part of the expression.
  */
 
-#define SH_DBR_MAX 64
-
+/* As many words as the expression has: there were 64, and a longer `[[ ]]`
+ * was a syntax error bash does not report. The three arrays live in
+ * `store` beside the text and grow together (shell_dbr_room). */
 struct shell_dbr {
-    char  *w[SH_DBR_MAX];       /* expanded operand / operator text */
-    bool   pat[SH_DBR_MAX];     /* unquoted: the word may be a pattern */
-    bool   opr[SH_DBR_MAX];     /* an OPERATOR of the grammar: ( ) && || ! --
+    char  **w;                  /* expanded operand / operator text */
+    bool   *pat;                /* unquoted: the word may be a pattern */
+    bool   *opr;                /* an OPERATOR of the grammar: ( ) && || ! --
                                  * a quoted "(" is a one-character string */
+    int    cap;
     int    n;
     int    pos;
     bool   err;
@@ -25581,6 +25583,26 @@ struct shell_dbr {
 
 static char *shell_dbr_store(struct shell_dbr *d, const char *s) {
     return words_store(&d->store, s, strlen(s));
+}
+
+/* Room for one more word. */
+static int shell_dbr_room(struct shell_dbr *d) {
+    if (d->n < d->cap) return 0;
+    int ncap = d->cap ? d->cap * 2 : 64;
+    char **nw = (char **)words_alloc(&d->store, (size_t)ncap * sizeof(char *));
+    bool *np = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
+    bool *no = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
+    if (!nw || !np || !no) return -1;
+    if (d->n) {
+        memcpy(nw, d->w, (size_t)d->n * sizeof(char *));
+        memcpy(np, d->pat, (size_t)d->n * sizeof(bool));
+        memcpy(no, d->opr, (size_t)d->n * sizeof(bool));
+    }
+    d->w = nw;
+    d->pat = np;
+    d->opr = no;
+    d->cap = ncap;
+    return 0;
 }
 
 static void shell_dbr_free(struct shell_dbr *d) {
@@ -25713,7 +25735,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\n') p++;
         if (!*p) break;
-        if (d->n >= SH_DBR_MAX) return -1;
+        if (shell_dbr_room(d) < 0) return -1;
 
         /* The previous token decides what THIS one may contain. */
         bool prev_unq = d->n > 0 && d->pat[d->n - 1];
@@ -25858,6 +25880,10 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
 }
 
 static int shell_dbr_split(struct shell_dbr *d, const char *src) {
+    d->w = 0;
+    d->pat = 0;
+    d->opr = 0;
+    d->cap = 0;
     d->n = 0;
     d->pos = 0;
     d->err = false;
