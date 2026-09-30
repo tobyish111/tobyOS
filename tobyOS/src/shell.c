@@ -1454,13 +1454,16 @@ static void shell_getopts_note_external_optind_write(const char *key,
  * there. tsh expands every word on the line before any of them is applied,
  * so `$FOO` was empty too. The values only need to exist for the rest of the
  * read, so they live here rather than in the variable table: the command's
- * own frame applies them for real when it runs. */
-#define SHELL_TOKPFX_MAX 8
+ * own frame applies them for real when it runs.
+ *
+ * As many as the command has: there were eight slots, and from the ninth
+ * prefix on, `$NAME` in a later word read the variable table instead. */
 /* Heap strings, whole values: a slot is freed only when it is written
  * again. They were 256-byte slots, which cut a longer value short for the
- * words after it. */
-static char *g_tokpfx[SHELL_TOKPFX_MAX];
+ * words after it. The table grows and may move; it is only ever indexed. */
+static char **g_tokpfx;
 static int  g_tokpfx_n;
+static int  g_tokpfx_cap;
 
 /* A NAMEREF MAY NAME AN ARRAY ELEMENT, not just a variable:
  *
@@ -21046,7 +21049,19 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              * rest of the shell runs on: a word that is not an assignment
              * ends the prefix, and a separator starts a new one. */
             if (prefix_ok && g_tok_word_assign_src) {
-                if (g_tokpfx_n < SHELL_TOKPFX_MAX) {
+                if (g_tokpfx_n >= g_tokpfx_cap) {
+                    int ncap = g_tokpfx_cap ? g_tokpfx_cap * 2 : 8;
+                    char **nt = (char **)kmalloc((size_t)ncap * sizeof(char *));
+                    if (!nt) return -1;
+                    if (g_tokpfx_cap)
+                        memcpy(nt, g_tokpfx, (size_t)g_tokpfx_cap * sizeof(char *));
+                    memset(nt + g_tokpfx_cap, 0,
+                           (size_t)(ncap - g_tokpfx_cap) * sizeof(char *));
+                    kfree(g_tokpfx);
+                    g_tokpfx = nt;
+                    g_tokpfx_cap = ncap;
+                }
+                {
                     size_t sl = strlen(start);
                     char *plain = (char *)kmalloc(sl + 1);
                     if (!plain) return -1;
@@ -23908,36 +23923,52 @@ static void shell_printk_bridge_char(void *ctx, char c) {
  * restoring it also undoes what the command itself did. `IFS=: read a b`
  * therefore read the line, assigned a and b, and then had both assignments
  * rolled back with IFS: the variables kept their previous values and the
- * builtin looked like it had never run. Save just the prefixed names. */
-#define SHELL_PREFIX_MAX 16
+ * builtin looked like it had never run. Save just the prefixed names.
+ *
+ * Every one of them, whatever its length: there were 16 slots of 63-byte
+ * names, and the 17th prefix -- or a longer name -- was not saved, so it
+ * was never put back and outlived the command it belonged to. */
+struct shell_prefix_one {
+    char *name;
+    char *prev;                 /* strdup of the old value, or NULL */
+    bool  had;
+    bool  was_exported;
+};
 
 struct shell_prefix_save {
-    char  name[SHELL_PREFIX_MAX][64];
-    char *prev[SHELL_PREFIX_MAX];   /* strdup of the old value, or NULL */
-    bool  had[SHELL_PREFIX_MAX];
-    bool  was_exported[SHELL_PREFIX_MAX];
+    struct shell_prefix_one *v;     /* heap, assignc slots */
     int   count;
 };
 
 static void shell_prefix_capture(struct shell_prefix_save *sv,
                                  char **assignv, int assignc) {
     sv->count = 0;
-    for (int i = 0; i < assignc && sv->count < SHELL_PREFIX_MAX; i++) {
+    sv->v = 0;
+    if (assignc <= 0) return;
+    sv->v = (struct shell_prefix_one *)kmalloc((size_t)assignc * sizeof *sv->v);
+    if (!sv->v) {
+        kprintf("shell: out of memory saving prefix assignments\n");
+        return;
+    }
+    for (int i = 0; i < assignc; i++) {
         size_t klen = env_key_len(assignv[i]);
-        if (klen == 0 || klen + 1 > sizeof(sv->name[0])) continue;
-        int k = sv->count++;
-        memcpy(sv->name[k], assignv[i], klen);
-        sv->name[k][klen] = '\0';
-        const char *old = env_get(sv->name[k]);
-        sv->had[k]  = (old != 0);
-        sv->prev[k] = old ? shell_strdup(old) : 0;
+        if (klen == 0) continue;
+        char *name = (char *)kmalloc(klen + 1);
+        if (!name) continue;
+        memcpy(name, assignv[i], klen);
+        name[klen] = '\0';
+        struct shell_prefix_one *o = &sv->v[sv->count++];
+        o->name = name;
+        const char *old = env_get(name);
+        o->had  = (old != 0);
+        o->prev = old ? shell_strdup(old) : 0;
         /* The EXPORT ATTRIBUTE is restored too. A prefix assignment exports
          * for the duration of the command; putting the value back while
          * leaving the variable exported would leak it into every later
          * child. */
         {
-            int oi = env_find(sv->name[k], klen);
-            sv->was_exported[k] =
+            int oi = env_find(name, klen);
+            o->was_exported =
                 (oi >= 0) && (g_env_flags[oi] & SHVAR_EXPORTED) != 0;
         }
     }
@@ -23945,18 +23976,21 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
 
 static void shell_prefix_restore(struct shell_prefix_save *sv) {
     for (int i = 0; i < sv->count; i++) {
-        if (sv->had[i] && sv->prev[i]) {
-            env_set(sv->name[i], sv->prev[i]);
-            int oi = env_find(sv->name[i], strlen(sv->name[i]));
+        struct shell_prefix_one *o = &sv->v[i];
+        if (o->had && o->prev) {
+            env_set(o->name, o->prev);
+            int oi = env_find(o->name, strlen(o->name));
             if (oi >= 0) {
-                if (sv->was_exported[i]) g_env_flags[oi] |= SHVAR_EXPORTED;
+                if (o->was_exported) g_env_flags[oi] |= SHVAR_EXPORTED;
                 else g_env_flags[oi] &= ~(unsigned char)SHVAR_EXPORTED;
             }
         }
-        else if (!sv->had[i])          env_unset(sv->name[i]);
-        if (sv->prev[i]) kfree(sv->prev[i]);
-        sv->prev[i] = 0;
+        else if (!o->had)          env_unset(o->name);
+        kfree(o->prev);
+        kfree(o->name);
     }
+    kfree(sv->v);
+    sv->v = 0;
     sv->count = 0;
 }
 
