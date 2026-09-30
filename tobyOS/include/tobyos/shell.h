@@ -105,5 +105,7 @@ void shell_notify_jobs_hosted(void);
 
 /* Set $1..$n before running. */
 int  shell_set_args_hosted(int argc, char **argv);
+/* Set $0 -- `sh -c CMD NAME` names the script NAME. */
+int  shell_set_param0_hosted(const char *name);
 
 #endif /* TOBYOS_SHELL_H */

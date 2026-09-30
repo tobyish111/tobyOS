@@ -865,7 +865,16 @@ int main(int argc, char **argv) {
      * this backwards makes a script expand aliases where bash does not. */
     if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
         shell_set_interactive_hosted(false);
-        if (argc > 3) (void)shell_set_args_hosted(argc - 3, argv + 3);
+        /* `sh -c CMD NAME ARGS...`: NAME is $0 and ARGS are $1.., as POSIX
+         * and bash have it. NAME was taken as $1:
+         *
+         *     find . -exec sh -c 'echo "$1"' _ {} \;     printed `_`
+         *     sh -c 'echo $#' _ a b                       bash: 2, tsh: 3
+         */
+        if (argc > 3) {
+            (void)shell_set_param0_hosted(argv[3]);
+            if (argc > 4) (void)shell_set_args_hosted(argc - 4, argv + 4);
+        }
         return shell_run_line_hosted(argv[2]);
     }
     /* --noediting: read the tty COOKED, no line editor. Same spelling and

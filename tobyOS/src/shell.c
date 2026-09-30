@@ -31282,6 +31282,11 @@ int shell_set_args_hosted(int argc, char **argv) {
     return shell_set_positional_params(argc, argv);
 }
 
+/* `sh -c CMD NAME ARGS...`: NAME is $0 (see host.c). */
+int shell_set_param0_hosted(const char *name) {
+    return shell_set_param0(name);
+}
+
 /* Seams for the hosted line editor's Tab completion. Kept here because the
  * spec table and the builtin table both live in this file; lineedit.c has no
  * business reaching into either. */
