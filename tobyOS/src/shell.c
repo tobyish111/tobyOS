@@ -105,6 +105,15 @@ extern volatile struct limine_module_request module_req;
  * teaching those scans to step over IT changed the answer for words that had
  * no collision in them. 0x04 appears only where this puts it. */
 #define SHELL_DATA_ESC '\x04'
+/* The body of an EMPTY element of a quoted "$@" / "${a[@]}". Every element
+ * follows a SHELL_ARG_MARK, so without it zero elements and one empty one
+ * were the same text -- a lone mark -- and every consumer read both as
+ * zero: `f() { g "$@"; }; f ""` passed g nothing. It is written only there
+ * (sh_join_empty_elem) and removed wherever the marks are resolved
+ * (shell_add_marked_words, sh_array_store_expanded,
+ * shell_argmarks_to_spaces), counting as the element's text until then.
+ * Data bytes equal to it are escaped like the other markers'. */
+#define SHELL_EMPTY_ELEM '\x05'
 /* THE SHELL HAS NO ARGUMENT LIMIT (2026-09-29). It was 32, then 256, then
  * 1024 hosted and 256 in the kernel -- each raise argued against the stack
  * cost of `char *argv[ARG_MAX]` arrays and of `struct shell_simple`, which
@@ -283,7 +292,8 @@ static int sb_put_data_n(struct shell_sb *b, const char *sv, size_t n) {
     for (size_t i = 0; i < n; i++) {
         char c = sv[i];
         if (c != SHELL_ARG_MARK && c != SHELL_NOSPLIT_MARK &&
-            c != SHELL_GLOB_ESC && c != SHELL_DATA_ESC) continue;
+            c != SHELL_GLOB_ESC && c != SHELL_DATA_ESC &&
+            c != SHELL_EMPTY_ELEM) continue;
         if (sb_putmem(b, sv + from, i - from) < 0) return -1;
         if (sb_putc(b, SHELL_DATA_ESC) < 0) return -1;
         from = i;                       /* the marker byte itself goes next */
@@ -935,6 +945,7 @@ static int   sh_array_literal_commit(const char *tmp, const char *name,
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
 static void shell_strip_nosplit_inplace(char *s);
+static bool shell_word_has_quoted_null(const char *w);
 static int shell_word_tilde(struct shell_sb *wb);
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
@@ -1718,6 +1729,8 @@ static int sh_array_store_expanded(const char *name, const char *ex,
     size_t f = 0;
     bool any = false;
     bool in_nosplit = false;
+    bool has_marks = false;     /* set below */
+    bool elem = false;          /* the field holds an element's text */
     /* THE FIRST `$@` MARK IS NOT A BOUNDARY. The expansion puts a mark
      * BEFORE every element, the first included, and this took each one as
      * a boundary -- so the (empty) text before the first mark became an
@@ -1738,7 +1751,16 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             if (*q == SHELL_ARG_MARK) marks++;
             else if (*q != SHELL_NOSPLIT_MARK) real++;
         }
-        if (marks == 1 && real == 0) return 0;
+        /* Marks and no text at all: every expansion in the word produced
+         * nothing. No element -- unless a quoted null was written, which is
+         * one empty element, exactly as on the argv side. */
+        if (marks > 0 && real == 0) {
+            if (keep_empty && shell_word_has_quoted_null(ex)) {
+                if (sh_array_set(name, (*next)++, "") < 0) return -1;
+            }
+            return 0;
+        }
+        has_marks = (marks > 0);
     }
     for (const char *q = ex; ; q++) {
         bool end = (*q == '\0');
@@ -1750,6 +1772,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 continue;
             }
             if (*q == SHELL_NOSPLIT_MARK) { in_nosplit = !in_nosplit; continue; }
+            if (*q == SHELL_EMPTY_ELEM) { elem = true; continue; }
             /* A `$@`/`${a[@]}` mark is a field boundary even inside quotes --
              * that is the whole reason the marker exists. Every mark but the
              * first; see above. */
@@ -1787,17 +1810,22 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             if (globbed > 0) {
                 any = true;
             } else if (globbed == 0 &&
-                       (field[0] || (keep_empty && (!any || !first_mark)))) {
+                       (field[0] ||
+                        (keep_empty && (has_marks ? elem : !any)))) {
                 /* In a quoted word every `$@` element is an element, empty
-                 * or not: ("${s[@]}") with s=(a "" b) is three. */
+                 * or not: ("${s[@]}") with s=(a "" b) is three. A field
+                 * between two marks with no element in it is an expansion
+                 * that produced nothing, and is not one. */
                 if (sh_array_set(name, (*next)++, field) < 0) return -1;
                 any = true;
             }
             f = 0;
+            elem = false;
             if (end) break;
             continue;
         }
         if (f + 1 < field_cap) field[f++] = *q;
+        elem = true;
     }
     return 0;
 }
@@ -16908,6 +16936,14 @@ static bool shell_var_char(char c) {
  *
  * `star` selects "$*", which is the opposite case: a SINGLE word joined by
  * the first character of IFS. */
+/* An EMPTY element of a quoted "$@"-style join writes SHELL_EMPTY_ELEM as
+ * its body -- see there. Unquoted, nothing: bash drops an empty element of a
+ * bare $@ anyway. `before` is b->len from before the element was written. */
+static int sh_join_empty_elem(struct shell_sb *b, size_t before) {
+    if (g_dq_depth == 0 || b->len != before) return 0;
+    return sb_putc(b, SHELL_EMPTY_ELEM);
+}
+
 static int shell_append_positional_join(struct shell_sb *b,
                                         bool star) {
     if (!star) {                                /* "$@" -- one word each */
@@ -16925,7 +16961,9 @@ static int shell_append_positional_join(struct shell_sb *b,
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
-            if (sb_put_data_str(b, g_positional[i]) < 0)
+            size_t before = b->len;
+            if (sb_put_data_str(b, g_positional[i]) < 0 ||
+                sh_join_empty_elem(b, before) < 0)
                 return -1;
         }
         return 0;
@@ -16998,8 +17036,11 @@ static int shell_append_array_join(struct shell_sb *b,
                 } else if (sb_put_uint(b, (unsigned long)a->e[i].idx) < 0) {
                     return -1;
                 }
-            } else if (sb_put_data_str(b, a->e[i].val) < 0) {
-                return -1;
+            } else {
+                size_t before = b->len;
+                if (sb_put_data_str(b, a->e[i].val) < 0 ||
+                    sh_join_empty_elem(b, before) < 0)
+                    return -1;
             }
         }
         return 0;
@@ -17069,7 +17110,10 @@ static int shell_append_array_slice(struct shell_sb *b,
             if (!first && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
             first = false;
-            if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
+            size_t before = b->len;
+            if (sb_put_data_str(b, a->e[i].val) < 0 ||
+                sh_join_empty_elem(b, before) < 0)
+                return -1;
         }
         return 0;
     }
@@ -18085,7 +18129,9 @@ static int shell_expand_substring(const char *name, const char *spec,
                 }
             }
             first = false;
+            size_t before = b->len;
             if (sb_put_data_str(b, v) < 0) return -1;
+            if (!star && sh_join_empty_elem(b, before) < 0) return -1;
         }
         return 0;
     }
@@ -18483,7 +18529,9 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                                 (void)env_unset("SHELL_ARRAY_ELEM");
                                 return -1;
                             }
-                            if (shell_expand_braced_parameter(sub_expr.p, b) < 0) {
+                            size_t before = b->len;
+                            if (shell_expand_braced_parameter(sub_expr.p, b) < 0 ||
+                                (!star && sh_join_empty_elem(b, before) < 0)) {
                                 (void)env_unset("SHELL_ARRAY_ELEM");
                                 return -1;
                             }
@@ -18879,6 +18927,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
             if (*nz == SHELL_DATA_ESC && nz[1]) { nz++; text++; continue; }
             if (*nz == SHELL_ARG_MARK)     { marks++; continue; }
             if (*nz == SHELL_NOSPLIT_MARK) continue;
+            if (*nz == SHELL_EMPTY_ELEM)   continue;   /* joins as "" */
             text++;
         }
         is_null = (text == 0 && marks <= 1);
@@ -23019,7 +23068,7 @@ static int shell_argmarks_to_spaces(const char *src, struct shell_sb *out) {
             if (sb_putc(out, *q++) < 0 || sb_putc(out, *q) < 0) return -1;
             continue;
         }
-        if (*q == SHELL_NOSPLIT_MARK) continue;
+        if (*q == SHELL_NOSPLIT_MARK || *q == SHELL_EMPTY_ELEM) continue;
         if (*q == SHELL_ARG_MARK) {
             if (first) { first = false; continue; }
             if (sb_putc(out, ' ') < 0) return -1;
@@ -23028,6 +23077,29 @@ static int shell_argmarks_to_spaces(const char *src, struct shell_sb *out) {
         if (sb_putc(out, *q) < 0) return -1;
     }
     return 0;
+}
+
+/* Does the word carry a QUOTED NULL -- a `""` or `''` with nothing between
+ * the two quote marks? The quotes of a "$@" do not count: they enclose the
+ * expansion's own mark. bash keeps such a word as one empty field even when
+ * every "$@" in it expanded to nothing:
+ *
+ *     set --; f "$@"""      bash: one argument, ""
+ *     set --; f "$@""$@"    bash: none
+ */
+static bool shell_word_has_quoted_null(const char *w) {
+    bool open = false, empty = false;
+    for (const char *q = w; *q; q++) {
+        if (*q == SHELL_DATA_ESC && q[1]) { q++; empty = false; continue; }
+        if (*q == SHELL_NOSPLIT_MARK) {
+            if (!open) { open = true; empty = true; }
+            else if (empty) return true;
+            else open = false;
+            continue;
+        }
+        empty = false;
+    }
+    return false;
 }
 
 static int shell_add_marked_words(struct shell_pipeline *pl,
@@ -23066,6 +23138,13 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         size_t real_prefix = 0;
         for (size_t q = 0; q < prefix_len; q++)
             if (word[q] != SHELL_NOSPLIT_MARK) real_prefix++;
+        /* IN A QUOTED WORD A MARK WITH NO TEXT AFTER IT IS AN EXPANSION THAT
+         * PRODUCED NOTHING -- an element, even an empty one, always has text
+         * there (SHELL_EMPTY_ELEM). It contributes no field wherever it
+         * stands: "$@""$@" with no parameters made two empty arguments, one
+         * for each mark. A prefix it would have carried waits for the next
+         * element, or is emitted on its own below. */
+        if (quoted && real == 0) continue;
         if (real == 0 && emitted == 0 && real_prefix == 0) {
             const char *tail = p;
             while (*tail == SHELL_NOSPLIT_MARK) tail++;
@@ -23082,6 +23161,15 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
          * they reach the program as raw 0x02 bytes in argv. */
         SH_SB(clean);
         if (shell_strip_nosplit(&clean, tmp.p) < 0) return -1;
+        {   /* an empty element's body (SHELL_EMPTY_ELEM) is no text */
+            char *w = clean.p;
+            for (const char *r = clean.p; *r; r++) {
+                if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
+                if (*r != SHELL_EMPTY_ELEM) *w++ = *r;
+            }
+            *w = '\0';
+            clean.len = (size_t)(w - clean.p);
+        }
 
         char *saved = 0;
         if (shell_pipeline_save_word(pl, clean.p, &saved) < 0) return -1;
@@ -23125,7 +23213,14 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
             char *saved = 0;
             if (shell_pipeline_save_word(pl, pre.p, &saved) < 0) return -1;
             if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
+            emitted++;
         }
+    }
+    /* Nothing came out, but a quoted null was written: one empty field. */
+    if (emitted == 0 && quoted && shell_word_has_quoted_null(word)) {
+        char *saved = 0;
+        if (shell_pipeline_save_word(pl, "", &saved) < 0) return -1;
+        if (shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
     }
     return 1;
 }
@@ -27640,8 +27735,14 @@ static int shell_expand_case_word(const char *src, struct shell_sb *out) {
     if (shell_tokenize(src, &tok, &ntok, &words) < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
-        shell_strip_nosplit_inplace(tok[i].text);
-        return sb_set(out, tok[i].text);
+        /* THE FIELDS OF A "$@" JOIN WITH A SPACE, as they do anywhere no
+         * field splitting follows. The marks were stripped as quoting only,
+         * so `case "$@" in "a b")` compared the raw 0x01 bytes, and one empty
+         * parameter never matched `"")`. */
+        SH_SB(joined);
+        if (shell_argmarks_to_spaces(tok[i].text, &joined) < 0) return -1;
+        shell_strip_nosplit_inplace(joined.p);
+        return sb_set(out, joined.p);
     }
     sb_truncate(out, 0);
     return 0;
