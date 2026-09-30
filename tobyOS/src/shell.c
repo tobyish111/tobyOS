@@ -317,6 +317,14 @@ static int sb_put_data_str(struct shell_sb *b, const char *sv) {
     return sv ? sb_put_data_n(b, sv, strlen(sv)) : 0;
 }
 
+/* For `__attribute__((cleanup(shell_kfree_ptr)))` on a heap pointer: frees
+ * it when the variable goes out of scope, on every return path. */
+static void shell_kfree_ptr(void *pp) {
+    void **p = (void **)pp;
+    if (*p) kfree(*p);
+    *p = 0;
+}
+
 /* ---- WORD STORAGE THAT NEVER MOVES --------------------------------------
  *
  * The tokenizer hands out `char *` to finished words, and argv is built from
@@ -1261,14 +1269,18 @@ static void jobs_reap_finished(void) {
  *   SHELL=tobysh
  */
 
-/* ENV_MAX was 32, which is not a limit POSIX allows a shell to have: the
- * 33rd assignment in a script failed with "env: table full". The third-party
- * conformance corpus has cases that define more than that in a loop. */
-#define ENV_MAX 512
+/* NO LIMIT ON THE NUMBER OF VARIABLES. ENV_MAX was 32, then 512, and the
+ * 513th assignment in a script was "env: table full" -- and so was every
+ * one after it, including the prefix assignments of unrelated commands.
+ * The table grows (env_reserve): g_env has g_env_cap entries plus the NULL
+ * terminator, and g_env_flags runs parallel to it. The table MOVES when it
+ * grows; the blobs it points at do not, and nothing keeps a pointer INTO
+ * the table itself. */
 #define SHELL_READONLY_MAX 16
 
-static char *g_env[ENV_MAX + 1];     /* +1 reserved for NULL terminator */
+static char **g_env;                 /* g_env_cap entries + NULL terminator */
 static int   g_envc = 0;
+static int   g_env_cap = 0;
 static char *g_readonly[SHELL_READONLY_MAX];
 
 /* Per-variable flags, parallel to g_env.
@@ -1295,7 +1307,32 @@ static char *g_readonly[SHELL_READONLY_MAX];
  * child's environment, so `typeset -A a; export a; printenv.py a` reports it
  * unset rather than empty. */
 #define SHVAR_ARRAY     0x08u
-static unsigned char g_env_flags[ENV_MAX];
+static unsigned char *g_env_flags;   /* g_env_cap entries */
+
+/* Room for `want` variables. False only when memory ran out. */
+static bool env_reserve(int want) {
+    if (want <= g_env_cap && g_env) return true;
+    int ncap = g_env_cap ? g_env_cap : 64;
+    while (ncap < want) ncap *= 2;
+    char **ne = (char **)kmalloc((size_t)(ncap + 1) * sizeof(char *));
+    unsigned char *nf = (unsigned char *)kmalloc((size_t)ncap);
+    if (!ne || !nf) {
+        kfree(ne);
+        kfree(nf);
+        kprintf("env: out of memory\n");
+        return false;
+    }
+    if (g_env) memcpy(ne, g_env, (size_t)(g_envc + 1) * sizeof(char *));
+    else ne[0] = 0;
+    if (g_env_flags) memcpy(nf, g_env_flags, (size_t)g_env_cap);
+    memset(nf + g_env_cap, 0, (size_t)(ncap - g_env_cap));
+    kfree(g_env);
+    kfree(g_env_flags);
+    g_env = ne;
+    g_env_flags = nf;
+    g_env_cap = ncap;
+    return true;
+}
 
 /* Length of "KEY" up to (but not including) the '='. Returns the
  * byte count, 0 if `kv` doesn't start with at least one non-'=' char. */
@@ -2143,9 +2180,8 @@ static int env_set_kv(const char *kv_in) {
         shell_getopts_note_external_optind_write(kv_in, klen);
         return 0;
     }
-    if (g_envc >= ENV_MAX) {
+    if (!env_reserve(g_envc + 1)) {
         kfree(blob);
-        kprintf("env: table full (max %d)\n", ENV_MAX);
         return -1;
     }
     /* A brand-new variable is NOT exported unless `set -a` is in force. */
@@ -2209,8 +2245,10 @@ static int env_unset(const char *key) {
  * are logged but non-fatal -- a degraded env is still usable. */
 static void env_init_defaults(void) {
     g_envc = 0;
-    g_env[0] = 0;
-    for (int i = 0; i < ENV_MAX; i++) g_env_flags[i] = 0;
+    if (env_reserve(64)) {
+        g_env[0] = 0;
+        memset(g_env_flags, 0, (size_t)g_env_cap);
+    }
     for (int i = 0; i < SHELL_READONLY_MAX; i++) {
         if (g_readonly[i]) kfree(g_readonly[i]);
         g_readonly[i] = 0;
@@ -4024,7 +4062,7 @@ static void shell_locals_pop(int depth) {
                     kfree(g_env[idx]);
                     g_env[idx] = blob;
                     g_env_flags[idx] = sv->flags;
-                } else if (g_envc < ENV_MAX) {
+                } else if (env_reserve(g_envc + 1)) {
                     g_env_flags[g_envc] = sv->flags;
                     g_env[g_envc++] = blob;
                     g_env[g_envc] = 0;
@@ -5430,22 +5468,22 @@ static void shell_print_vars_set_format(void) {
          * table order, so the output was unsorted and every array was
          * missing -- an array does not live in g_env at all. bash prints
          * one line per variable in name order, arrays in literal form. */
-        /* STATIC: PROC_KSTACK_SZ is 32 KiB and this array is 4.6 KiB of
-         * it. `set` with no arguments cannot re-enter itself, so one copy
-         * is enough -- and this file has already lost a corpus case to a
-         * large frame (the shell_pipeline that moved off the stack). */
-        static const char *names[ENV_MAX + SH_ARRAY_MAX];
+        /* ON THE HEAP, sized from the tables: every variable and every
+         * array, with names of any length. It was a static 512 + 64 slots
+         * with 63-byte names, and a longer name was simply not listed. */
+        int cap = g_envc + g_narrays + 1;
+        const char **names = (const char **)kmalloc((size_t)cap * sizeof *names);
+        SH_WORDS(keys);
+        if (!names) { shell_set_status(1); return; }
         int n = 0;
-        for (int i = 0; i < g_envc && n < (int)(sizeof names/sizeof names[0]); i++) {
+        for (int i = 0; i < g_envc; i++) {
             size_t kl = env_key_len(g_env[i]);
-            static char keybuf[ENV_MAX][64];
-            if (kl == 0 || kl + 1 > sizeof keybuf[0]) continue;
-            memcpy(keybuf[n], g_env[i], kl);
-            keybuf[n][kl] = '\0';
-            names[n] = keybuf[n];
-            n++;
+            if (kl == 0) continue;
+            char *k = words_store(&keys, g_env[i], kl);
+            if (!k) { kfree(names); shell_set_status(1); return; }
+            names[n++] = k;
         }
-        for (int i = 0; i < g_narrays && n < (int)(sizeof names/sizeof names[0]); i++) {
+        for (int i = 0; i < g_narrays; i++) {
             if (!g_arrays[i].name) continue;
             bool dup = false;
             for (int k = 0; k < n; k++)
@@ -5459,6 +5497,7 @@ static void shell_print_vars_set_format(void) {
             names[j + 1] = v;
         }
         for (int i = 0; i < n; i++) shell_set_print_one(names[i]);
+        kfree(names);
     }
 }
 
@@ -15659,41 +15698,35 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
  * set. shell_run_single's own external path already filtered; these did not.
  * There is no prefix here (a prefixed command goes through that path), so
  * the overlay is built with an empty assignment list. */
-static int shell_build_env_overlay(char **assignv, int assignc,
-                                   char **out_env, int *out_envc);
+static char **shell_build_env_overlay(char **assignv, int assignc,
+                                      int *out_envc);
 
 static void shell_spawn_program(const char *path_arg, int argc, char **argv,
                                 bool background) {
-    char *child_env[ENV_MAX + ARG_MAX + 1];
     int child_envc = 0;
-    if (shell_build_env_overlay(0, 0, child_env, &child_envc) < 0) {
-        child_envc = g_envc;
-        for (int i = 0; i < g_envc; i++) child_env[i] = g_env[i];
-        child_env[child_envc] = 0;
-    }
+    char **child_env = shell_build_env_overlay(0, 0, &child_envc);
+    if (!child_env) { shell_set_status(1); return; }
     int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
                                              /*profile=*/0,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
                                              child_envc, child_env, 0, 0);
+    kfree(child_env);
     shell_set_status(rc);
 }
 
 static void shell_spawn_program_profile(const char *path_arg, int argc,
                                         char **argv, bool background,
                                         const char *profile) {
-    char *child_env[ENV_MAX + ARG_MAX + 1];
     int child_envc = 0;
-    if (shell_build_env_overlay(0, 0, child_env, &child_envc) < 0) {
-        child_envc = g_envc;
-        for (int i = 0; i < g_envc; i++) child_env[i] = g_env[i];
-        child_env[child_envc] = 0;
-    }
+    char **child_env = shell_build_env_overlay(0, 0, &child_envc);
+    if (!child_env) { shell_set_status(1); return; }
     int rc = shell_spawn_program_profile_fds(path_arg, argc, argv, background,
                                              profile,
                                              g_shell_fd[0], g_shell_fd[1],
                                              g_shell_fd[2],
                                              child_envc, child_env, 0, 0);
+    kfree(child_env);
     shell_set_status(rc);
 }
 
@@ -17270,9 +17303,11 @@ static int shell_word_tilde(struct shell_sb *wb) {
 static int shell_expand_name_prefix(const char *prefix, bool star,
                                     struct shell_sb *b) {
     size_t plen = prefix ? strlen(prefix) : 0;
-    int idxs[ENV_MAX];
+    SH_SB(idxb);                    /* one int per variable, as many as there are */
+    if (sb_grow(&idxb, (size_t)(g_envc + 1) * sizeof(int)) < 0) return -1;
+    int *idxs = (int *)(void *)idxb.p;
     int n = 0;
-    for (int i = 0; i < g_envc && n < ENV_MAX; i++) {
+    for (int i = 0; i < g_envc; i++) {
         const char *e = g_env[i];
         if (!e) continue;
         size_t klen = env_key_len(e);
@@ -22887,8 +22922,44 @@ static bool shell_assignment_overrides(const char *kv, char **assignv,
  * printed 1 where POSIX, bash and dash all print nothing. `assignv` carries
  * the one-shot `VAR=v cmd` prefix assignments, which ARE in the child's
  * environment by definition regardless of the export attribute. */
-static int shell_build_env_overlay(char **assignv, int assignc,
-                                   char **out_env, int *out_envc) {
+/* The array is ONE allocation the caller frees with kfree: the pointer
+ * table, then any strings built here, so nothing else needs freeing. It was
+ * a caller's stack array of ENV_MAX + ARG_MAX slots. Returns 0 when memory
+ * ran out. */
+static char **shell_build_env_overlay(char **assignv, int assignc,
+                                      int *out_envc) {
+    /* `A+=a cmd` IS A PREFIX ASSIGNMENT THAT APPENDS, and it must append
+     * to the value the shell has now while leaving that value alone:
+     *
+     *     A=a; A+=a printenv.py A   ->  aa, and the shell still has A=a
+     *
+     * So it is resolved HERE and not by env_set_kv, which would write it
+     * back. The rebuilt strings live in the same block as the table. They
+     * lived in a static pool of eight 256-byte slots, and a ninth, or a
+     * longer value, went through unresolved as the literal `A+=a`. */
+    size_t extra = 0;
+    for (int i = 0; i < assignc; i++) {
+        const char *kv = assignv[i];
+        size_t klen = env_key_len(kv);
+        if (klen > 1 && kv[klen - 1] == '+') {
+            char nm[128];
+            size_t nlen = klen - 1;
+            if (nlen + 1 <= sizeof nm) {
+                memcpy(nm, kv, nlen);
+                nm[nlen] = '\0';
+                const char *old = env_get(nm);
+                extra += nlen + 1 + (old ? strlen(old) : 0) +
+                         strlen(kv + klen + 1) + 1;
+            }
+        }
+    }
+    size_t slots = (size_t)g_envc + (size_t)assignc + 1;
+    char **out_env = (char **)kmalloc(slots * sizeof(char *) + extra);
+    if (!out_env) {
+        kprintf("shell: out of memory building the environment\n");
+        return 0;
+    }
+    char *pool = (char *)(out_env + slots);
     int n = 0;
     for (int i = 0; i < g_envc; i++) {
         if (!(g_env_flags[i] & SHVAR_EXPORTED)) continue;
@@ -22896,28 +22967,13 @@ static int shell_build_env_overlay(char **assignv, int assignc,
          * one there, so `export a` on an array marks it and exports nothing;
          * printenv reports it unset, not empty. */
         if (g_env_flags[i] & SHVAR_ARRAY) continue;
-        if (!shell_assignment_overrides(g_env[i], assignv, assignc)) {
-            if (n >= ENV_MAX + ARG_MAX) return -1;
+        if (!shell_assignment_overrides(g_env[i], assignv, assignc))
             out_env[n++] = g_env[i];
-        }
     }
-    /* `A+=a cmd` IS A PREFIX ASSIGNMENT THAT APPENDS, and it must append
-     * to the value the shell has now while leaving that value alone:
-     *
-     *     A=a; A+=a printenv.py A   ->  aa, and the shell still has A=a
-     *
-     * So it is resolved HERE and not by env_set_kv, which would write it
-     * back. The rebuilt strings live in a static pool: the overlay is
-     * built and handed to the spawn in one breath, and every other entry
-     * in it is a borrowed pointer too. */
-    static char append_pool[8][256];
-    int napp = 0;
     for (int i = 0; i < assignc; i++) {
-        if (n >= ENV_MAX + ARG_MAX) return -1;
         const char *kv = assignv[i];
         size_t klen = env_key_len(kv);
-        if (klen > 1 && kv[klen - 1] == '+' &&
-            napp < (int)(sizeof append_pool / sizeof append_pool[0])) {
+        if (klen > 1 && kv[klen - 1] == '+') {
             char nm[128];
             size_t nlen = klen - 1;
             const char *add = kv + klen + 1;
@@ -22926,27 +22982,27 @@ static int shell_build_env_overlay(char **assignv, int assignc,
                 nm[nlen] = '\0';
                 const char *old = env_get(nm);
                 size_t ol = old ? strlen(old) : 0, al = strlen(add);
-                if (nlen + 1 + ol + al + 1 <= sizeof append_pool[0]) {
-                    char *d = append_pool[napp++];
-                    memcpy(d, nm, nlen);
-                    d[nlen] = '=';
-                    if (ol) memcpy(d + nlen + 1, old, ol);
-                    memcpy(d + nlen + 1 + ol, add, al + 1);
-                    out_env[n++] = d;
-                    continue;
-                }
+                char *d = pool;
+                memcpy(d, nm, nlen);
+                d[nlen] = '=';
+                if (ol) memcpy(d + nlen + 1, old, ol);
+                memcpy(d + nlen + 1 + ol, add, al + 1);
+                pool += nlen + 1 + ol + al + 1;
+                out_env[n++] = d;
+                continue;
             }
         }
         out_env[n++] = assignv[i];
     }
     out_env[n] = 0;
     *out_envc = n;
-    return 0;
+    return out_env;
 }
 
+/* A copy of every variable, however many there are. */
 struct shell_env_frame {
-    char *env[ENV_MAX + 1];
-    unsigned char flags[ENV_MAX];
+    char **env;
+    unsigned char *flags;
     int envc;
     int getopts_last_optind;
     int getopts_char_index;
@@ -22955,15 +23011,27 @@ struct shell_env_frame {
 static void shell_env_frame_clear(struct shell_env_frame *frame) {
     if (!frame) return;
     for (int i = 0; i < frame->envc; i++) {
-        if (frame->env[i]) kfree(frame->env[i]);
-        frame->env[i] = 0;
+        if (frame->env && frame->env[i]) kfree(frame->env[i]);
     }
+    kfree(frame->env);
+    kfree(frame->flags);
+    frame->env = 0;
+    frame->flags = 0;
     frame->envc = 0;
 }
 
 static int shell_env_frame_capture(struct shell_env_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
+    frame->env = (char **)kmalloc((size_t)(g_envc + 1) * sizeof(char *));
+    frame->flags = (unsigned char *)kmalloc((size_t)g_envc + 1);
+    if (!frame->env || !frame->flags) {
+        kfree(frame->env);
+        kfree(frame->flags);
+        frame->env = 0;
+        frame->flags = 0;
+        return -1;
+    }
     for (int i = 0; i < g_envc; i++) {
         frame->env[i] = shell_strdup(g_env[i]);
         if (!frame->env[i]) {
@@ -22988,6 +23056,8 @@ static void shell_env_frame_restore(struct shell_env_frame *frame) {
         if (g_env[i]) kfree(g_env[i]);
         g_env[i] = 0;
     }
+    g_envc = 0;
+    if (!env_reserve(frame->envc)) return;  /* the table only ever grew */
     g_envc = frame->envc;
     for (int i = 0; i < frame->envc; i++) {
         g_env[i] = frame->env[i];
@@ -24097,14 +24167,10 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
      * child the whole VARIABLE TABLE, so `x=1; env | grep x` printed x=1 and
      * `set +a` could not un-export anything -- the flag was maintained
      * correctly and then ignored at the one boundary that matters. */
-    char *env_overlay[ENV_MAX + ARG_MAX + 1];
-    char **envp;
     int envc = 0;
-    if (shell_build_env_overlay(cmd->argv, assignc, env_overlay, &envc) < 0) {
-        kprintf("shell: environment too large\n");
-        return 1;
-    }
-    envp = env_overlay;
+    char **envp __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_build_env_overlay(cmd->argv, assignc, &envc);
+    if (!envp) return 1;
 
     struct shell_fd_state fds;
     shell_fd_state_init_from_defaults(&fds);
@@ -24227,8 +24293,6 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
                                       struct file *pipe_in,
                                       struct file *pipe_out,
                                       int *out_pid) {
-    char *env_overlay[ENV_MAX + ARG_MAX + 1];
-    char **envp;
     int envc = 0;
 
     int assignc = 0;
@@ -24243,11 +24307,9 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     }
     /* Always: see the note at the other spawn site. The overlay is what
      * applies the export filter, not just what merges assignment prefixes. */
-    if (shell_build_env_overlay(cmd->argv, assignc, env_overlay, &envc) < 0) {
-        kprintf("pipeline: environment too large\n");
-        return 1;
-    }
-    envp = env_overlay;
+    char **envp __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_build_env_overlay(cmd->argv, assignc, &envc);
+    if (!envp) return 1;
 
     char *argv[ARG_MAX];
     int argc = cmd->argc - assignc;
