@@ -1432,8 +1432,7 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
      * above RSP for the marshalling gate's MS-x64 stack-arg reads. */
     p->user_rsp   = ((USER_STACK_TOP_VA - 0x400) & ~0xFULL) - 8;
 
-    signal_init_proc(&p->sigstate);
-    p->pending_signals = 0;
+    signal_exec_reset(&p->sigstate);    /* pending signals survive exec */
 
     /* execve normally relies on do_switch having put this proc's GS base in the
      * SWAPGS shadow before it runs. But we are NOT going through the scheduler
@@ -2055,9 +2054,10 @@ reread:;
     p->user_entry = has_interp ? interp_info.entry : prog_info.entry;
     p->user_rsp   = user_rsp;
 
-    /* Reset signals. */
-    signal_init_proc(&p->sigstate);
-    p->pending_signals = 0;
+    /* Reset signals as exec does: handlers only. A signal already pending
+     * -- one sent between fork and here -- is delivered to the new image.
+     * See signal_exec_reset. */
+    signal_exec_reset(&p->sigstate);
 
     kprintf("[execve] pid=%d now running '%s' entry=%p rsp=%p\n",
             p->pid, p->name, (void *)p->user_entry, (void *)p->user_rsp);

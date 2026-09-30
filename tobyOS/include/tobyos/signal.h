@@ -250,6 +250,8 @@ void signal_init(void);
 
 /* Initialize per-process signal state to defaults */
 void signal_init_proc(struct signal_state *ss);
+/* execve's reset: caught -> default, ignored stays, mask and pending kept. */
+void signal_exec_reset(struct signal_state *ss);
 
 /* The HANDLER TABLE is a thread-group property (POSIX sighand): a handler
  * installed by any thread is visible to all. Threads reach the LEADER's

@@ -114,6 +114,31 @@ void signal_init_proc(struct signal_state *ss) {
     ss->restorer = 0;
 }
 
+/* What execve does to the signal state -- POSIX's rule, and Linux's:
+ * a CAUGHT signal goes back to its default (the handler was in the old
+ * image), an IGNORED one stays ignored, and the blocked mask and every
+ * PENDING signal carry over into the new program.
+ *
+ * execve used signal_init_proc, which also emptied the pending set. A
+ * signal sent between fork and the new image's first instruction was
+ * therefore thrown away:
+ *
+ *     sleep 5 & kill -TERM $!; wait $!     wants 143; 1-2 in 100 gave 0,
+ *                                          after sleeping the full 5 s
+ *
+ * under bash and tsh alike -- the "flaky" kill cases (Oils 0929/0930/0932,
+ * shparity 91) were this. Only the handler table and restorer reset; the
+ * pending bits in struct proc are the caller's to keep. */
+void signal_exec_reset(struct signal_state *ss) {
+    for (int i = 0; i < SIG_MAX; i++) {
+        if (ss->actions[i].sa_handler != SIG_IGN)
+            ss->actions[i].sa_handler = SIG_DFL;
+        ss->actions[i].sa_mask  = 0;
+        ss->actions[i].sa_flags = 0;
+    }
+    ss->restorer = 0;
+}
+
 int signal_get_foreground(void) {
     return g_foreground_pid;
 }
