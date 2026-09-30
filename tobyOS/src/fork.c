@@ -1282,11 +1282,12 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
  * new program. On failure returns a negative ABI error code.
  * =================================================================== */
 
-/* User-stack constants (must match proc.c). */
-#define USER_STACK_PAGES     8
-#define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
+/* User-stack constants. The SIZE comes from proc_user_stack_pages (proc.c):
+ * the 256 KiB a spawned program gets, plus what argv/envp take. It was a
+ * fixed 8 pages here under a "must match proc.c" that no longer did, so
+ * every execve'd program -- native or Linux, bash included -- ran on
+ * 32 KiB against spawn's 256, and argv/envp had to fit in the same 32. */
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
-#define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
 #define USER_STACK_RSP_INIT  (USER_STACK_TOP_VA - 16)
 #define USER_HEAP_BASE       0x0000000010000000ULL
 #define USER_HEAP_MAX_BYTES  (256ULL * 1024ULL * 1024ULL)
@@ -1296,8 +1297,8 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
 #define IA32_KERNEL_GS_BASE_MSR 0xC0000102u
 
 /* Windows entry points are entered with a 256 KiB stack, matching proc.c's
- * build_user_stack (64 pages). The ELF execve path uses USER_STACK_PAGES (8),
- * but a Win32 CRT wants more headroom, so the PE arm maps its own. */
+ * build_user_stack (64 pages). The PE arm maps its own; the ELF arm sizes
+ * its stack with proc_user_stack_pages. */
 #define PE_STACK_PAGES  64
 
 /* POSIX: a successful exec closes every descriptor marked FD_CLOEXEC.
@@ -1340,7 +1341,7 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
                       const char *kpath, int kargc, char **kargv_buf,
                       uint64_t old_pml4, uint64_t new_pml4,
                       uint64_t saved_cr3, uint64_t old_editor,
-                      void *exec_pool) {
+                      char **exec_argv, char **exec_envp) {
     struct pe_load_info pe_info = {0};
     int prc = pe_load_user(image, image_size, kargc, kargv_buf, &pe_info);
     if (!image_borrowed) kfree(image);   /* slice 112: initrd borrow */
@@ -1447,9 +1448,10 @@ static long execve_pe(struct proc *p, void *image, size_t image_size,
             "rsp=%p\n", p->pid, p->name, (void *)p->user_entry,
             (void *)pe_info.teb, (void *)p->user_rsp);
 
-    /* sys_execve's per-call argv/envp pool: argv was consumed by
-     * pe_load_user, and this path does not return. */
-    kfree(exec_pool);
+    /* sys_execve's argv/envp vectors: argv was consumed by pe_load_user,
+     * and this path does not return. */
+    kvec_free(exec_argv);
+    kvec_free(exec_envp);
 
     bkl_exit();
     proc_enter_user_asm(p->user_entry, p->user_rsp);
@@ -1529,11 +1531,19 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
         }
     }
 
-    /* Copy argv into kernel buffers. Each user pointer-array slot and
-     * each string is read through an accessor; a bad slot just ends the
-     * vector (matching the old tolerant behaviour). */
-    int kargc = 0;
-    char *kargv_buf[ABI_ARGV_MAX];
+    /* Copy argv and envp into kernel vectors, EXACTLY: every string whole,
+     * as many as there are, or E2BIG (kvec_copy_in). This copied at most
+     * 64 of each and the first 4 KiB of every string, and ran the program
+     * with whatever fitted -- no error anywhere. */
+    int kargc = 0, kenvc = 0;
+    char **kargv_buf = 0, **kenvp_buf = 0;
+    {
+        size_t budget = ABI_ARGS_TOTAL_MAX;
+        long vrc = kvec_copy_in(argv, &kargv_buf, &kargc, &budget);
+        if (vrc < 0) return vrc;
+        vrc = kvec_copy_in(envp, &kenvp_buf, &kenvc, &budget);
+        if (vrc < 0) { kvec_free(kargv_buf); return vrc; }
+    }
     /* PER CALL, NOT `static`. These were two static pools shared by every
      * CPU, and an exec does not hold the BKL from the copy below to the
      * last use: it DROPS it around proc_reap_group_threads, on every call
@@ -1551,28 +1561,13 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
      * fires. Found 2026-09-25 through the Oils 2202 flake, which f91a175's
      * timing change made frequent on hardware. One block holds both pools;
      * it is released on every exit -- the error returns, execve_pe, and just
-     * before the new image is entered. */
-    char (*kargv_pool)[ABI_ARG_MAX] = (char (*)[ABI_ARG_MAX])
-        kmalloc((size_t)(ABI_ARGV_MAX + ABI_ENVP_MAX) * ABI_ARG_MAX);
-    if (!kargv_pool) return -ABI_ENOMEM;
-    char (*kenvp_pool)[ABI_ARG_MAX] = kargv_pool + ABI_ARGV_MAX;
+     * before the new image is entered. (Now two heap vectors, per call for
+     * the same reason.) */
     /* The value FIRST, then the release: `EXEC_RETURN(execve_pe(...))`
-     * must run execve_pe while the pool is still alive. */
+     * must run execve_pe while the vectors are still alive. */
 #define EXEC_RETURN(v) do { long exec_rv_ = (long)(v); \
-                            kfree(kargv_pool); return exec_rv_; } while (0)
-
-    if (argv) {
-        for (int i = 0; i < ABI_ARGV_MAX; i++) {
-            uint64_t slot = 0;
-            if (get_user_u64(&slot, argv + i) != 0) break;
-            if (!slot) break;
-            if (strncpy_from_user(kargv_pool[kargc],
-                                  (const void *)(uintptr_t)slot,
-                                  ABI_ARG_MAX) < 0) break;
-            kargv_buf[kargc] = kargv_pool[kargc];
-            kargc++;
-        }
-    }
+                            kvec_free(kargv_buf); kvec_free(kenvp_buf); \
+                            return exec_rv_; } while (0)
 
 #ifdef CHROMIUM_BOOT
     /* Slice 21 instrument: chrome re-execs /proc/self/exe for every typed child
@@ -1597,22 +1592,6 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
 #endif
 
-    /* Copy envp into kernel buffers. */
-    int kenvc = 0;
-    char *kenvp_buf[ABI_ENVP_MAX];      /* rows of kenvp_pool, above */
-
-    if (envp) {
-        for (int i = 0; i < ABI_ENVP_MAX; i++) {
-            uint64_t slot = 0;
-            if (get_user_u64(&slot, envp + i) != 0) break;
-            if (!slot) break;
-            if (strncpy_from_user(kenvp_pool[kenvc],
-                                  (const void *)(uintptr_t)slot,
-                                  ABI_ARG_MAX) < 0) break;
-            kenvp_buf[kenvc] = kenvp_pool[kenvc];
-            kenvc++;
-        }
-    }
 
     /* Read the ELF image from VFS. Slice 112: for an initrd (ramfs) file
      * this BORROWS a pointer into the resident tar instead of copying --
@@ -1622,7 +1601,6 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     size_t image_size = 0;
     int    img_borrowed = 0;
     int    shebang_depth = 0;
-    int    pool_hi = kargc;      /* first free kargv_pool row */
 reread:;
 #ifdef CHROMIUM_BOOT
     xt_read = perf_now_ns();
@@ -1650,9 +1628,10 @@ reread:;
 
     /* "#!": the exec becomes the interpreter's, with the script's path as
      * its argument, and the image is read again -- at most
-     * BINFMT_MAX_RECURSION times. The new strings go in the pool's free
-     * tail (pool_hi never moves back down, so a nested level cannot land
-     * on a row an outer one still points at). */
+     * BINFMT_MAX_RECURSION times. The new argv -- interpreter, its option,
+     * the script path, then argv[1..] -- is packed into a vector of its
+     * own (kvec_pack: interp and kpath are about to be reused), and the
+     * old one is released whole. */
     {
         char interp[BINFMT_SHEBANG_MAX];
         char optarg[BINFMT_SHEBANG_MAX];
@@ -1663,25 +1642,18 @@ reread:;
             image = NULL;
             if (sb < 0) EXEC_RETURN(-ABI_ENOEXEC);
             if (shebang_depth >= BINFMT_MAX_RECURSION) EXEC_RETURN(-ABI_ELOOP);
-            int extra = 2 + (optarg[0] ? 1 : 0);
-            size_t kl = strlen(kpath);
-            if (pool_hi + extra > ABI_ARGV_MAX || kl >= ABI_ARG_MAX)
-                EXEC_RETURN(-ABI_E2BIG);
-            char *s_interp = kargv_pool[pool_hi++];
-            memcpy(s_interp, interp, strlen(interp) + 1);
-            char *s_opt = NULL;
-            if (optarg[0]) {
-                s_opt = kargv_pool[pool_hi++];
-                memcpy(s_opt, optarg, strlen(optarg) + 1);
-            }
-            char *s_script = kargv_pool[pool_hi++];
-            memcpy(s_script, kpath, kl + 1);
-            char *nargv[ABI_ARGV_MAX];
-            int nargc = binfmt_shebang_argv(s_interp, s_opt, s_script,
-                                            kargc, kargv_buf, nargv,
-                                            ABI_ARGV_MAX);
-            if (nargc < 0) EXEC_RETURN(-ABI_E2BIG);
-            memcpy(kargv_buf, nargv, (size_t)nargc * sizeof nargv[0]);
+            int nmax = kargc + 4;
+            char **nargv = (char **)kmalloc((size_t)(nmax + 1) * sizeof(char *));
+            if (!nargv) EXEC_RETURN(-ABI_ENOMEM);
+            int nargc = binfmt_shebang_argv(interp, optarg[0] ? optarg : NULL,
+                                            kpath, kargc, kargv_buf,
+                                            nargv, nmax);
+            if (nargc < 0) { kfree(nargv); EXEC_RETURN(-ABI_E2BIG); }
+            char **packed = kvec_pack(nargv, nargc);
+            kfree(nargv);                           /* borrowed pointers only */
+            if (!packed) EXEC_RETURN(-ABI_ENOMEM);
+            kvec_free(kargv_buf);
+            kargv_buf = packed;
             kargc = nargc;
             memcpy(kpath, interp, strlen(interp) + 1);
             plen = (long)strlen(kpath);
@@ -1795,7 +1767,7 @@ reread:;
         EXEC_RETURN(execve_pe(p, image, image_size, img_borrowed,
                               kpath, kargc, kargv_buf,
                               old_pml4, new_pml4, saved_cr3, old_editor,
-                              kargv_pool));
+                              kargv_buf, kenvp_buf));
     }
 
     /* Check for PT_INTERP. */
@@ -1856,12 +1828,15 @@ reread:;
 #ifdef CHROMIUM_BOOT
         xt_stack = perf_now_ns();
 #endif
-        p->user_stack_base  = USER_STACK_TOP_PAGE;
-        p->user_stack_pages = USER_STACK_PAGES;
-        for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+        size_t spages = proc_user_stack_pages(kargc, kargv_buf,
+                                              kenvc, kenvp_buf);
+        uint64_t sbase = USER_STACK_TOP_VA - (uint64_t)spages * PAGE_SIZE;
+        p->user_stack_base  = sbase;
+        p->user_stack_pages = spages;
+        for (size_t i = 0; i < spages; i++) {
             uint64_t phys = pmm_alloc_page();
             if (!phys) { ok = false; break; }
-            if (!vmm_map(USER_STACK_TOP_PAGE + i * PAGE_SIZE, phys, PAGE_SIZE,
+            if (!vmm_map(sbase + i * PAGE_SIZE, phys, PAGE_SIZE,
                          VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
                 pmm_free_page(phys);
                 ok = false;
@@ -1931,7 +1906,7 @@ reread:;
         size_t pad_head    = 16;
 
         size_t total = pad_head + pool_padded + auxv_bytes + envp_bytes + argv_bytes + 8;
-        if (total + 64 > USER_STACK_BYTES) {
+        if (total + 64 > p->user_stack_pages * PAGE_SIZE) {
             ok = false;
         } else {
             uint64_t pool_va = USER_STACK_TOP_VA - pad_head - pool_padded;
@@ -2063,8 +2038,9 @@ reread:;
     /* The last reader of kargv_buf/kenvp_buf -- the stack is packed and the
      * cmdline recorded. Released here because a successful exec never
      * returns (see EXEC_RETURN above). */
-    kfree(kargv_pool);
-    kargv_pool = 0;
+    kvec_free(kargv_buf);
+    kvec_free(kenvp_buf);
+    kargv_buf = kenvp_buf = 0;
 #undef EXEC_RETURN
 
     /* B20 (procfs): re-point /proc/<pid>/exe at the new image. */

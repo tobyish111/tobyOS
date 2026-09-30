@@ -884,6 +884,20 @@ void proc_reap_group_threads(struct proc *p, int code);
 #define PROC_PPID_REAPING  (-2)
 void proc_reap_orphans(void);
 
+/* A new program's arguments and environment (see ABI_ARG_STRLEN_MAX and
+ * ABI_ARGS_TOTAL_MAX). kvec_copy_in copies a user string vector exactly,
+ * charging each string to *budget, and fails with E2BIG rather than cut
+ * anything short; kvec_pack copies a kernel one. Either result is a single
+ * allocation -- pointers, then strings -- which kvec_free releases.
+ * proc_user_stack_pages is how big a new image's user stack must be to
+ * hold them: the base 256 KiB the program runs in, plus what
+ * argv/envp/auxv take at the top. */
+long   kvec_copy_in(char *const *user_arr, char ***out_arr, int *out_count,
+                    size_t *budget);
+char **kvec_pack(char *const *v, int n);
+void   kvec_free(char **arr);
+size_t proc_user_stack_pages(int argc, char **argv, int envc, char **envp);
+
 /* Spin until `p` is no longer live-on-CPU (on_cpu cleared). Call after
  * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
  * kstack_top -- otherwise another CPU can switch into a freed stack. */

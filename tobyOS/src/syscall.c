@@ -3662,59 +3662,123 @@ static long sys_abi_version(void) {
 
 /* ---- spawn / waitpid ------------------------------------------- */
 
-/* Copy one user pointer-array (NULL-terminated) into a fresh
- * kernel-allocated array of kstrdup'd strings. *out_count is the
- * number of strings (excluding the NULL terminator). The caller
- * frees the strings + the array via free_kvec. */
-static int copy_kvec_in(char *const *user_arr,
-                        int max_entries, int max_strlen,
-                        char ***out_arr, int *out_count) {
+/* A kernel string vector is ONE allocation: the NULL-terminated pointer
+ * array, then the strings it points at. kvec_free is a single kfree.
+ *
+ * Not one allocation per string: kmalloc is a first-fit walk over every
+ * block and kfree sweeps the arena, so an exec made two heap operations
+ * per argument: 0.6 s for 24,000 on a fresh boot, and 30 s for 22,000
+ * after half an hour of gate traffic had fragmented the heap (xargs
+ * filling commands to 128 KiB in shparity's stress run). */
+char **kvec_pack(char *const *v, int n) {
+    size_t bytes = 0;
+    for (int i = 0; i < n; i++) bytes += strlen(v[i]) + 1;
+    size_t hdr = (size_t)(n + 1) * sizeof(char *);
+    char **arr = (char **)kmalloc(hdr + bytes);
+    if (!arr) return 0;
+    char *s = (char *)arr + hdr;
+    for (int i = 0; i < n; i++) {
+        size_t l = strlen(v[i]) + 1;
+        memcpy(s, v[i], l);
+        arr[i] = s;
+        s += l;
+    }
+    arr[n] = 0;
+    return arr;
+}
+
+/* Copy one user NULL-terminated string vector into a kernel vector (see
+ * kvec_pack for its shape); *out_count excludes the NULL. The caller
+ * frees it with kvec_free.
+ *
+ * NO COUNT LIMIT: what bounds a vector is bytes, as on Linux. Each string
+ * must be shorter than ABI_ARG_STRLEN_MAX, and every string plus its
+ * pointer comes out of *budget -- one budget for argv and envp together,
+ * starting at ABI_ARGS_TOTAL_MAX. Either one exceeded is E2BIG: nothing
+ * is ever cut short and passed on. Shared by spawn and execve, which had
+ * two different answers (E2BIG past 64 entries, and silent truncation).
+ *
+ * The strings collect in one pool and their offsets in one array, both
+ * doubling as they fill, and the result is built from them in a single
+ * allocation: a handful of heap operations however many strings. */
+long kvec_copy_in(char *const *user_arr, char ***out_arr, int *out_count,
+                  size_t *budget) {
     *out_arr = 0;
     *out_count = 0;
     if (!user_arr) return 0;
-    if (max_strlen <= 1 || max_strlen > 4096) return -ABI_EINVAL;
 
-    /* Count first: read each user pointer slot through the accessor. */
-    int n = 0;
+    char *tmp = (char *)kmalloc(ABI_ARG_STRLEN_MAX);
+    size_t pool_cap = 4096, pool_len = 0;
+    char *pool = (char *)kmalloc(pool_cap);
+    int cap = 64, n = 0;
+    size_t *offs = (size_t *)kmalloc(sizeof(size_t) * (size_t)cap);
+    long rc = 0;
+    if (!tmp || !pool || !offs) {
+        kfree(tmp); kfree(pool); kfree(offs);
+        return -ABI_ENOMEM;
+    }
+
     for (;;) {
         uint64_t slot = 0;
-        if (get_user_u64(&slot, user_arr + n) != 0) return -ABI_EFAULT;
+        if (get_user_u64(&slot, user_arr + n) != 0) { rc = -ABI_EFAULT; break; }
         if (slot == 0) break;
-        if (n >= max_entries) return -ABI_E2BIG;
-        n++;
+        long sl = strncpy_from_user(tmp, (const void *)(uintptr_t)slot,
+                                    ABI_ARG_STRLEN_MAX);
+        if (sl < 0) { rc = -ABI_EFAULT; break; }
+        if ((size_t)sl >= ABI_ARG_STRLEN_MAX - 1) { rc = -ABI_E2BIG; break; }
+        size_t need = (size_t)sl + 1 + sizeof(char *);
+        if (need > *budget) { rc = -ABI_E2BIG; break; }
+        *budget -= need;
+        if (n >= cap) {
+            int ncap = cap * 2;
+            size_t *no = (size_t *)kmalloc(sizeof(size_t) * (size_t)ncap);
+            if (!no) { rc = -ABI_ENOMEM; break; }
+            memcpy(no, offs, sizeof(size_t) * (size_t)n);
+            kfree(offs);
+            offs = no;
+            cap = ncap;
+        }
+        if (pool_len + (size_t)sl + 1 > pool_cap) {
+            size_t ncap = pool_cap * 2;
+            while (pool_len + (size_t)sl + 1 > ncap) ncap *= 2;
+            char *np = (char *)kmalloc(ncap);
+            if (!np) { rc = -ABI_ENOMEM; break; }
+            memcpy(np, pool, pool_len);
+            kfree(pool);
+            pool = np;
+            pool_cap = ncap;
+        }
+        memcpy(pool + pool_len, tmp, (size_t)sl + 1);
+        offs[n++] = pool_len;
+        pool_len += (size_t)sl + 1;
     }
-    if (n == 0) return 0;
-
-    char **arr = (char **)kmalloc(sizeof(char *) * (size_t)(n + 1));
-    if (!arr) return -ABI_ENOMEM;
-    memset(arr, 0, sizeof(char *) * (size_t)(n + 1));
-
-    for (int i = 0; i < n; i++) {
-        uint64_t slot = 0;
-        if (get_user_u64(&slot, user_arr + i) != 0) goto fail;
-        char *kc = (char *)kmalloc((size_t)max_strlen);
-        if (!kc) goto fail;
-        long sl = strncpy_from_user(kc, (const void *)(uintptr_t)slot,
-                                    (size_t)max_strlen);
-        if (sl < 0 || sl >= max_strlen - 1) { kfree(kc); goto fail; }
-        arr[i] = kc;
+    kfree(tmp);
+    char **arr = 0;
+    if (rc == 0) {
+        size_t hdr = (size_t)(n + 1) * sizeof(char *);
+        arr = (char **)kmalloc(hdr + pool_len);
+        if (!arr) {
+            rc = -ABI_ENOMEM;
+        } else {
+            char *s = (char *)arr + hdr;
+            memcpy(s, pool, pool_len);
+            for (int i = 0; i < n; i++) arr[i] = s + offs[i];
+            arr[n] = 0;
+        }
     }
-    arr[n] = 0;
+    kfree(pool);
+    kfree(offs);
+    if (rc < 0) return rc;
     *out_arr   = arr;
     *out_count = n;
     return 0;
-
-fail:
-    for (int i = 0; i < n; i++) if (arr[i]) kfree(arr[i]);
-    kfree(arr);
-    return -ABI_ENOMEM;
 }
 
-static void free_kvec(char **arr) {
-    if (!arr) return;
-    for (int i = 0; arr[i]; i++) kfree(arr[i]);
+void kvec_free(char **arr) {
     kfree(arr);
 }
+
+static void free_kvec(char **arr) { kvec_free(arr); }
 
 static long sys_spawn(const struct abi_spawn_req *req) {
     if (!cap_check(current_proc(), CAP_EXEC, "sys_spawn")) return -ABI_EPERM;
@@ -3730,13 +3794,10 @@ static long sys_spawn(const struct abi_spawn_req *req) {
 
     char **kargv = 0; int kargc = 0;
     char **kenvp = 0; int kenvc = 0;
-    int rc = copy_kvec_in((char *const *)kreq.argv,
-                          ABI_ARGV_MAX, ABI_ARG_MAX,
-                          &kargv, &kargc);
+    size_t budget = ABI_ARGS_TOTAL_MAX;
+    long rc = kvec_copy_in((char *const *)kreq.argv, &kargv, &kargc, &budget);
     if (rc < 0) return rc;
-    rc = copy_kvec_in((char *const *)kreq.envp,
-                      ABI_ENVP_MAX, ABI_ARG_MAX,
-                      &kenvp, &kenvc);
+    rc = kvec_copy_in((char *const *)kreq.envp, &kenvp, &kenvc, &budget);
     if (rc < 0) { free_kvec(kargv); return rc; }
 
     /* Map fd0/fd1/fd2 into struct file pointers, dup-cloning when the
@@ -3775,19 +3836,29 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     /* Descriptors above 2, if the caller asked for any. Each is cloned like
      * fd0/1/2 and released below, whatever the outcome -- install_initial_fds
      * clones again into the child. */
-    struct proc_fd_map kextra[ABI_SPAWN_EXTRA_MAX];
+    /* On the heap, sized from the request: a table of up to
+     * ABI_SPAWN_EXTRA_MAX entries is too big for a kernel stack. */
+    struct proc_fd_map *kextra = 0;
     int nextra = 0;
     if (kreq.nextra) {
-        if (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra) {
+        struct abi_spawn_fd *uex = 0;
+        if (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra ||
+            !(kextra = (struct proc_fd_map *)kmalloc(sizeof(*kextra) *
+                                                     kreq.nextra)) ||
+            !(uex = (struct abi_spawn_fd *)kmalloc(sizeof(*uex) *
+                                                   kreq.nextra))) {
+            kfree(kextra);
             if (f0) file_close(f0);
             if (f1) file_close(f1);
             if (f2) file_close(f2);
             free_kvec(kargv); free_kvec(kenvp);
-            return -ABI_EINVAL;
+            return (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra)
+                   ? -ABI_EINVAL : -ABI_ENOMEM;
         }
-        struct abi_spawn_fd uex[ABI_SPAWN_EXTRA_MAX];
         if (copy_from_user(uex, kreq.extra,
                            sizeof(uex[0]) * kreq.nextra) != 0) {
+            kfree(uex);
+            kfree(kextra);
             if (f0) file_close(f0);
             if (f1) file_close(f1);
             if (f2) file_close(f2);
@@ -3807,8 +3878,10 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             kextra[nextra].f  = cl;
             nextra++;
         }
+        kfree(uex);
         if (failed) {
             for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
+            kfree(kextra);
             if (f0) file_close(f0);
             if (f1) file_close(f1);
             if (f2) file_close(f2);
@@ -3829,6 +3902,7 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     };
     int pid = proc_spawn(&spec);
     for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
+    kfree(kextra);
 
     /* Whether spawn succeeded or not, our k-copies of argv/envp have
      * already been deep-copied onto the child's user stack and are no

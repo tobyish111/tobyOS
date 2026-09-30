@@ -100,12 +100,24 @@ extern __attribute__((noreturn)) void proc_enter_user_thread_asm(uint64_t rip,
  *               the top of the stack (see pack_argv_envp_on_user_stack). */
 /* 64 pages = 256 KiB. The old 8-page (32 KiB) stack was too small for
  * non-trivial ported programs (e.g. interpreters with sizable frames);
- * 256 KiB is a sane default while still tiny next to a Linux 8 MiB stack. */
+ * 256 KiB is a sane default while still tiny next to a Linux 8 MiB stack.
+ *
+ * That is the stack the PROGRAM gets. Its arguments and environment are
+ * packed at the top and the stack is grown by their size
+ * (proc_user_stack_pages), so a long argv costs memory, not stack. */
 #define USER_STACK_PAGES     64
 #define USER_STACK_BYTES     (USER_STACK_PAGES * PAGE_SIZE)
 #define USER_STACK_TOP_VA    0x0000800000000000ULL
-#define USER_STACK_TOP_PAGE  (USER_STACK_TOP_VA - USER_STACK_BYTES)
 #define USER_STACK_RSP_INIT  (USER_STACK_TOP_VA - 16)
+
+size_t proc_user_stack_pages(int argc, char **argv, int envc, char **envp) {
+    size_t bytes = 16 + 8 + (size_t)(argc + 1) * 8 + (size_t)(envc + 1) * 8
+                 + 32 * 16;                        /* auxv, with room */
+    for (int i = 0; i < argc; i++) if (argv && argv[i]) bytes += strlen(argv[i]) + 1;
+    for (int i = 0; i < envc; i++) if (envp && envp[i]) bytes += strlen(envp[i]) + 1;
+    bytes += 64;                                   /* alignment slack */
+    return USER_STACK_PAGES + (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+}
 
 /* Milestone 25A: per-proc heap region. Lives in a fresh slice of the
  * user half well clear of both the ELF (anchored at 0x400000 / runs
@@ -452,30 +464,24 @@ struct user_stack_pack {
      * sentinel is pushed. */
     const struct abi_auxv  *auxv;
     int                     auxc;
+    size_t                  stack_bytes;   /* the mapped user stack */
 };
 
 static bool pack_user_stack(const struct user_stack_pack *L,
                             uint64_t *out_rsp) {
     if (!L || L->argc < 0 || L->envc < 0 || L->auxc < 0) return false;
-    if (L->argc > ABI_ARGV_MAX || L->envc > ABI_ENVP_MAX) {
-        kprintf("[proc] argv/envp too long (%d/%d), max %d/%d\n",
-                L->argc, L->envc, ABI_ARGV_MAX, ABI_ENVP_MAX);
-        return false;
-    }
 
-    /* Total string-pool bytes (argv strings + envp strings). */
+    /* Total string-pool bytes (argv strings + envp strings). The limits
+     * were applied where the vectors were copied in (kvec_copy_in); here
+     * it is only a question of fitting the stack that was sized for them. */
     size_t pool = 0;
     for (int i = 0; i < L->argc; i++) {
         if (!L->argv[i]) return false;
-        size_t l = strlen(L->argv[i]);
-        if (l + 1 > ABI_ARG_MAX) return false;
-        pool += l + 1;
+        pool += strlen(L->argv[i]) + 1;
     }
     for (int i = 0; i < L->envc; i++) {
         if (!L->envp[i]) return false;
-        size_t l = strlen(L->envp[i]);
-        if (l + 1 > ABI_ARG_MAX) return false;
-        pool += l + 1;
+        pool += strlen(L->envp[i]) + 1;
     }
     size_t pool_padded   = (pool + 7) & ~7ULL;                  /* 8-B align */
     size_t argv_bytes    = (size_t)(L->argc + 1) * 8;           /* +NULL term */
@@ -485,7 +491,7 @@ static bool pack_user_stack(const struct user_stack_pack *L,
 
     size_t total = pad_head + pool_padded + auxv_bytes
                  + envp_bytes + argv_bytes + 8;
-    if (total + 64 > USER_STACK_BYTES) {
+    if (total + 64 > L->stack_bytes) {
         kprintf("[proc] argv+envp+auxv too large for user stack "
                 "(%lu bytes)\n", (unsigned long)total);
         return false;
@@ -554,21 +560,22 @@ static bool pack_user_stack(const struct user_stack_pack *L,
     return true;
 }
 
-/* Allocate USER_STACK_PAGES contiguous user-half pages, mapped
- * VMM_USER|VMM_WRITE|VMM_NX. Records the base page so the reaper can
- * unmap+free them later. */
-static bool build_user_stack(struct proc *p) {
-    p->user_stack_base  = USER_STACK_TOP_PAGE;
-    p->user_stack_pages = USER_STACK_PAGES;
+/* Allocate `pages` contiguous user-half pages ending at USER_STACK_TOP_VA,
+ * mapped VMM_USER|VMM_WRITE|VMM_NX. Records the base page so the reaper
+ * can unmap+free them later. */
+static bool build_user_stack(struct proc *p, size_t pages) {
+    uint64_t base = USER_STACK_TOP_VA - (uint64_t)pages * PAGE_SIZE;
+    p->user_stack_base  = base;
+    p->user_stack_pages = pages;
 
-    for (size_t i = 0; i < USER_STACK_PAGES; i++) {
+    for (size_t i = 0; i < pages; i++) {
         uint64_t phys = mm_user_page_alloc(p);      /* slice 16: charged */
         if (phys == 0) {
-            kprintf("[proc] OOM allocating user stack page %lu/%d\n",
-                    (unsigned long)i, USER_STACK_PAGES);
+            kprintf("[proc] OOM allocating user stack page %lu/%lu\n",
+                    (unsigned long)i, (unsigned long)pages);
             return false;
         }
-        if (!vmm_map(USER_STACK_TOP_PAGE + i * PAGE_SIZE, phys, PAGE_SIZE,
+        if (!vmm_map(base + i * PAGE_SIZE, phys, PAGE_SIZE,
                      VMM_PRESENT | VMM_WRITE | VMM_NX | VMM_USER)) {
             kprintf("[proc] vmm_map failed for user stack page %lu\n",
                     (unsigned long)i);
@@ -925,13 +932,19 @@ static int spawn_body(const char *path, const char *name,
                         path, BINFMT_MAX_RECURSION);
                 return -1;
             }
-            char *nargv[ABI_ARGV_MAX];
+            /* As many slots as there are arguments, plus the interpreter,
+             * its option and the script (it was a 64-slot stack array). */
+            int nmax = argc + 4;
+            char **nargv = (char **)kmalloc((size_t)nmax * sizeof(char *));
+            if (!nargv) return -1;
             int nargc = binfmt_shebang_argv(interp, optarg, path, argc, argv,
-                                            nargv, ABI_ARGV_MAX);
-            if (nargc < 0) return -1;
-            return spawn_body(interp, name, fd0, fd1, fd2, fd3, fd4,
-                              extra, nextra, nargc, nargv, envc, envp,
-                              cwd_override, depth + 1);
+                                            nargv, nmax);
+            if (nargc < 0) { kfree(nargv); return -1; }
+            int src = spawn_body(interp, name, fd0, fd1, fd2, fd3, fd4,
+                                 extra, nextra, nargc, nargv, envc, envp,
+                                 cwd_override, depth + 1);
+            kfree(nargv);
+            return src;
         }
     }
 
@@ -1014,7 +1027,7 @@ static int spawn_body(const char *path, const char *name,
         p->win_tls_index    = pe_info.tls_index;
         kprintf("[proc] pid %d '%s' -> Win32 PE personality (entry=%p teb=%p)\n",
                 p->pid, p->name, (void *)pe_info.entry, (void *)pe_info.teb);
-        ok = build_user_stack(p);
+        ok = build_user_stack(p, USER_STACK_PAGES);
     }
     if (ok) {
         /* Windows entry points are entered with RSP%16==8 -- i.e. as if reached
@@ -1159,7 +1172,8 @@ static int spawn_body(const char *path, const char *name,
         }
     }
 
-    if (ok) ok = build_user_stack(p);
+    if (ok) ok = build_user_stack(p, proc_user_stack_pages(argc, argv,
+                                                            envc, envp));
 
     /* Pack auxv (Milestone 25D). Always emit a tiny vector even for
      * static programs -- the trailing AT_NULL is harmless to libtoby
@@ -1222,6 +1236,7 @@ static int spawn_body(const char *path, const char *name,
             .argc = argc, .argv = argv,
             .envc = envc, .envp = envp,
             .auxv = aux,  .auxc = auxc,
+            .stack_bytes = p->user_stack_pages * PAGE_SIZE,
         };
         ok = pack_user_stack(&pack, &user_rsp);
         if (ok) {

@@ -82,10 +82,18 @@ extern pid_t toby_spawn_ex(const char *path, char *const argv[],
                            char *const envp[], int fd0, int fd1, int fd2,
                            const struct abi_spawn_fd *extra, unsigned nextra);
 
-/* Caps for the argv/envp copy in proc_spawn. shell.c enforces its own ARG_MAX
- * before it gets here; these only bound the stack arrays. */
-#define ARG_MAX_HOST 128
-#define ENV_MAX_HOST 128
+/* argv and envp for a spawn or an exec, NULL-terminated, on the heap and
+ * sized from the spec. They were 128-slot stack arrays that dropped the
+ * rest without a word -- a program got its first 127 arguments. What bounds
+ * a program's arguments now is the kernel (ABI_ARGS_TOTAL_MAX: E2BIG).
+ * Returns 0 when memory ran out; the caller frees with free(). */
+static char **host_strvec(char **v, int n) {
+    char **out = (char **)malloc((size_t)(n + 1) * sizeof(char *));
+    if (!out) return 0;
+    for (int i = 0; i < n; i++) out[i] = v[i];
+    out[n] = 0;
+    return out;
+}
 
 /* ---- printk, and the sink that makes $( ) work --------------------------
  *
@@ -589,22 +597,20 @@ int proc_spawn(const struct proc_spec *spec) {
 
     /* proc_spec carries argv WITHOUT a NULL terminator (argc says how many);
      * toby_spawn wants the NULL-terminated POSIX shape. */
-    char *argv[ARG_MAX_HOST + 1];
-    int n = spec->argc;
-    if (n > ARG_MAX_HOST) n = ARG_MAX_HOST;
-    for (int i = 0; i < n; i++) argv[i] = spec->argv[i];
-    argv[n] = 0;
-
-    char *envp[ENV_MAX_HOST + 1];
-    int e = spec->envc;
-    if (e > ENV_MAX_HOST) e = ENV_MAX_HOST;
-    for (int i = 0; i < e; i++) envp[i] = spec->envp[i];
-    envp[e] = 0;
+    char **argv = host_strvec(spec->argv, spec->argc);
+    char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
 
     /* Descriptors above 2 travel as (child fd, parent fd) pairs. The shell
      * side holds struct file*; here they are already real descriptors, so the
-     * mapping is just VF_FD. */
-    struct abi_spawn_fd extra[ABI_SPAWN_EXTRA_MAX];
+     * mapping is just VF_FD. As many as the spec has (it stopped at 16). */
+    int nmax = spec->extra_nfds > 0 ? spec->extra_nfds : 1;
+    struct abi_spawn_fd *extra =
+        (struct abi_spawn_fd *)malloc((size_t)nmax * sizeof *extra);
+    if (!argv || !envp || !extra) {
+        free(argv); free(envp); free(extra);
+        errno = ENOMEM;
+        return -1;
+    }
     unsigned nextra = 0;
     for (int i = 0; i < spec->extra_nfds && nextra < ABI_SPAWN_EXTRA_MAX; i++) {
         struct file *f = spec->extra_fds[i].f;
@@ -616,8 +622,12 @@ int proc_spawn(const struct proc_spec *spec) {
         nextra++;
     }
 
-    return (int)toby_spawn_ex(spec->path, argv, spec->envp ? envp : 0,
-                              fd0, fd1, fd2, nextra ? extra : 0, nextra);
+    int rc = (int)toby_spawn_ex(spec->path, argv, spec->envp ? envp : 0,
+                                fd0, fd1, fd2, nextra ? extra : 0, nextra);
+    int saved = errno;
+    free(argv); free(envp); free(extra);
+    errno = saved;
+    return rc;
 }
 
 /* REPLACE THIS PROCESS with the program -- the exec half of fork+exec.
@@ -692,18 +702,14 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     if (fd1 != 1 && dup2(fd1, 1) < 0) return -1;
     if (fd2 != 2 && dup2(fd2, 2) < 0) return -1;
 
-    char *argv[ARG_MAX_HOST + 1];
-    int n = spec->argc;
-    if (n > ARG_MAX_HOST) n = ARG_MAX_HOST;
-    for (int i = 0; i < n; i++) argv[i] = spec->argv[i];
-    argv[n] = 0;
-    char *envp[ENV_MAX_HOST + 1];
-    int e = spec->envc;
-    if (e > ENV_MAX_HOST) e = ENV_MAX_HOST;
-    for (int i = 0; i < e; i++) envp[i] = spec->envp[i];
-    envp[e] = 0;
+    char **argv = host_strvec(spec->argv, spec->argc);
+    char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
+    if (!argv || !envp) { free(argv); free(envp); return -1; }
     (void)execve(spec->path, argv, spec->envp ? envp : 0);
-    return -1;                      /* only reached when the exec failed */
+    int saved = errno;
+    free(argv); free(envp);         /* only reached when the exec failed */
+    errno = saved;
+    return -1;
 }
 
 int proc_wait(int pid) {

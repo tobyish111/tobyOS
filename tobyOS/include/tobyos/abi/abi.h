@@ -89,9 +89,22 @@ extern "C" {
  * sys_execve (src/fork.c) are sized off this: 64 x 4 KiB each. */
 #define ABI_ARG_MAX         4096
 
-/* Maximum number of argv / envp entries passed to spawn. */
-#define ABI_ARGV_MAX        64
-#define ABI_ENVP_MAX        64
+/* A PROGRAM'S ARGUMENTS AND ENVIRONMENT, as Linux bounds them: no count
+ * limit, ABI_ARG_STRLEN_MAX per string (Linux MAX_ARG_STRLEN, NUL
+ * included) and ABI_ARGS_TOTAL_MAX for all of argv + envp together --
+ * strings and their pointers (Linux: a quarter of the 8 MiB stack limit).
+ * Past either, spawn and execve fail with E2BIG.
+ *
+ * There were 64 entries of 4 KiB each. spawn refused a 65th with E2BIG,
+ * and execve did not refuse at all: it copied the first 64 and the first
+ * 4096 bytes of each and ran the program with what fitted --
+ *
+ *     bash$ /bin/echo $(seq 100) | wc -w      -> 63
+ *     bash$ /bin/echo "$(printf 'x%.0s' $(seq 10000))" | wc -c   -> 4096
+ *
+ * and a child saw 61 of 150 exported variables. The program never knew. */
+#define ABI_ARG_STRLEN_MAX  (128u * 1024u)
+#define ABI_ARGS_TOTAL_MAX  (2u * 1024u * 1024u)
 
 /* ============================================================
  *  Error codes (negative; userspace negates back to ABI_E*).
@@ -1919,7 +1932,11 @@ struct abi_spawn_fd {
     int parent_fd;
 };
 
-#define ABI_SPAWN_EXTRA_MAX 16      /* bound on nextra, so the copy-in is finite */
+/* Bound on nextra, so the copy-in is finite: one per descriptor a process
+ * can have (PROC_NFDS). It was 16, and a spawn from a shell holding more
+ * than 16 descriptors above 2 -- now that tsh has them past 9 -- lost the
+ * rest without a word. */
+#define ABI_SPAWN_EXTRA_MAX 1024
 
 struct abi_spawn_req {
     const char         *path;
