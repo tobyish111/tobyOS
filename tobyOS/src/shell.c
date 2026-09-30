@@ -15344,7 +15344,7 @@ static void prompt(void) {
 /* ---- POSIX-ish command execution -------------------------------- */
 
 #define PIPE_BIN_PREFIX "/bin/"
-#define SHELL_TOKEN_MAX 96
+
 
 
 enum shell_tok_type {
@@ -19850,24 +19850,41 @@ static bool g_tok_word_expanded;
  * from a literal `ex=a b c` -- and bash splits the first, not the second. */
 static bool g_tok_word_assign_src;
 
-static int shell_emit_token_fd(struct shell_token *tok, int *ntok,
+/* The tokens of one line, in the caller's word store beside their text.
+ * There were 96 at most -- `echo` and 95 words -- and the 97th was "too many
+ * tokens"; the vector grows now, and MOVES when it does, which is why only
+ * shell_emit_token_fd writes it and the finished array goes to the caller
+ * once tokenizing is over. */
+struct shell_tokv {
+    struct shell_token *v;
+    int cap;
+    struct shell_words *arena;
+};
+
+static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
                                enum shell_tok_type type, char *text,
                                bool quoted, int fd) {
-    if (*ntok >= SHELL_TOKEN_MAX) {
-        kprintf("shell: too many tokens\n");
-        return -1;
+    if (*ntok >= tok->cap) {
+        int ncap = tok->cap ? tok->cap * 2 : 32;
+        struct shell_token *nv = (struct shell_token *)
+            words_alloc(tok->arena, (size_t)ncap * sizeof *nv);
+        if (!nv) return -1;
+        if (*ntok) memcpy(nv, tok->v, (size_t)*ntok * sizeof *nv);
+        tok->v = nv;
+        tok->cap = ncap;
     }
-    tok[*ntok].type = type;
-    tok[*ntok].text = text;
-    tok[*ntok].quoted = quoted;
-    tok[*ntok].expanded = g_tok_word_expanded;
-    tok[*ntok].assign_src = g_tok_word_assign_src;
-    tok[*ntok].fd = fd;
+    struct shell_token *t = &tok->v[*ntok];
+    t->type = type;
+    t->text = text;
+    t->quoted = quoted;
+    t->expanded = g_tok_word_expanded;
+    t->assign_src = g_tok_word_assign_src;
+    t->fd = fd;
     (*ntok)++;
     return 0;
 }
 
-static int shell_emit_token(struct shell_token *tok, int *ntok,
+static int shell_emit_token(struct shell_tokv *tok, int *ntok,
                             enum shell_tok_type type, char *text,
                             bool quoted) {
     return shell_emit_token_fd(tok, ntok, type, text, quoted, -1);
@@ -20388,9 +20405,9 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
     return 0;
 }
 
-static int shell_tokenize_inner(const char *src, struct shell_token *tok,
+static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words);
-static int shell_tokenize_outer(const char *src, struct shell_token *tok,
+static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words);
 
 /* BRACE EXPANSION HAPPENS BEFORE ANYTHING ELSE READS THE WORD, which is what
@@ -20399,18 +20416,28 @@ static int shell_tokenize_outer(const char *src, struct shell_token *tok,
 /* The words' text lives in `words`, which the CALLER owns: token pointers
  * stay good until the caller frees it (SH_WORDS does that at the end of its
  * scope, the lifetime the old stack array gave them). */
-static int shell_tokenize(const char *src, struct shell_token *tok,
+/* *out_tok receives the array -- in `words`, as long-lived as the text. It
+ * is never NULL on success, so an empty line can still be indexed as
+ * before. */
+static int shell_tokenize(const char *src, struct shell_token **out_tok,
                           int *out_ntok, struct shell_words *words) {
+    struct shell_tokv tv = { 0, 0, words };
+    *out_tok = 0;
+    *out_ntok = 0;
+    tv.v = (struct shell_token *)words_alloc(words, 32 * sizeof *tv.v);
+    if (!tv.v) return -1;
+    tv.cap = 32;
     /* Each read gets its own prefix overlay; a command substitution re-enters
      * here and must not clear the one belonging to the line around it. */
     int saved_tokpfx = g_tokpfx_n;
     g_tokpfx_n = 0;
-    int rc_outer = shell_tokenize_outer(src, tok, out_ntok, words);
+    int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
     g_tokpfx_n = saved_tokpfx;
+    *out_tok = tv.v;
     return rc_outer;
 }
 
-static int shell_tokenize_outer(const char *src, struct shell_token *tok,
+static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
     if (src && shell_has_brace(src)) {
         /* The expansion grows as far as it has to: `echo {1..20000}` is
@@ -20429,7 +20456,7 @@ static int shell_tokenize_outer(const char *src, struct shell_token *tok,
  * substitution produced. Consumes the whole construct, parens balanced and
  * quotes respected, starts the command, and appends the path to the word
  * buffer -- token text is a pointer INTO that buffer, never a copy. */
-static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
+static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
                                   const char **pp, bool input,
                                   struct shell_words *words) {
     const char *body = *pp + 2;            /* past the `<(` */
@@ -20471,7 +20498,7 @@ static int shell_tokenize_procsub(struct shell_token *tok, int *ntok,
     *pp = q + 1;
     return 0;
 }
-static int shell_tokenize_inner(const char *src, struct shell_token *tok,
+static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
     int ntok = 0;
     SH_SB(wb);                      /* the word being built */
@@ -25412,19 +25439,18 @@ static int shell_parse_compound_redirs(const char *tail, struct shell_simple *ou
     if (!*tail) return 0;
 
     /* Heap for the same reason as everywhere else on this path: the loop
-     * parsers that call this already hold list[], body[] and tok[], and
-     * struct shell_pipeline is several KB. */
-    struct shell_token *tok = kmalloc(sizeof(*tok) * SHELL_TOKEN_MAX);
+     * parsers that call this already hold list[] and body[]. */
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     struct shell_pipeline *pl = shell_pipeline_new();
     int rc = -1;
-    if (!tok || !pl) {
+    if (!pl) {
         kprintf("%s: out of memory parsing redirections\n", label);
         goto out;
     }
     {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, &words) < 0)
+        if (shell_tokenize(tail, &tok, &ntok, &words) < 0)
             goto out;
         if (ntok == 0) { rc = 0; goto out; }
 
@@ -25445,7 +25471,6 @@ static int shell_parse_compound_redirs(const char *tail, struct shell_simple *ou
         rc = 0;
     }
 out:
-    if (tok)   kfree(tok);
     if (pl)    shell_pipeline_free(pl);
     return rc;
 }
@@ -26488,10 +26513,10 @@ static bool shell_try_for_command(const char *src) {
         io_active = true;
     }
 
-    struct shell_token tok[SHELL_TOKEN_MAX];
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     int ntok = 0;
-    if (shell_tokenize(list, tok, &ntok, &words) < 0) {
+    if (shell_tokenize(list, &tok, &ntok, &words) < 0) {
         if (io_active) shell_restore_io_frame(&io_frame);
         kfree(list); kfree(body);
         shell_set_status(2);
@@ -27180,10 +27205,10 @@ static const char *shell_find_word_marker(const char *start,
 }
 
 static int shell_expand_case_word(const char *src, struct shell_sb *out) {
-    struct shell_token tok[SHELL_TOKEN_MAX];
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     int ntok = 0;
-    if (shell_tokenize(src, tok, &ntok, &words) < 0) return -1;
+    if (shell_tokenize(src, &tok, &ntok, &words) < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
         shell_strip_nosplit_inplace(tok[i].text);
@@ -28064,13 +28089,13 @@ static bool shell_try_subshell_command(const char *src) {
      * be block-local, and the dangling targets happened to survive until the
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
-    struct shell_token tok[SHELL_TOKEN_MAX];
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     plp = shell_pipeline_new();
     if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, &words) < 0) {
+        if (shell_tokenize(tail, &tok, &ntok, &words) < 0) {
             shell_set_status(2);
             kfree(body);
             shell_pipeline_free(plp);
@@ -28247,13 +28272,13 @@ static bool shell_try_group_command(const char *src) {
      * be block-local, and the dangling targets happened to survive until the
      * parse buffers grew (2026-09-04) and the next frames overwrote them:
      * `( echo sub ) > f` then opened '' -- "is a directory". */
-    struct shell_token tok[SHELL_TOKEN_MAX];
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     plp = shell_pipeline_new();
     if (!plp) { kfree(body); shell_set_status(2); return true; }
     if (*tail) {
         int ntok = 0;
-        if (shell_tokenize(tail, tok, &ntok, &words) < 0) {
+        if (shell_tokenize(tail, &tok, &ntok, &words) < 0) {
             shell_set_status(2);
             kfree(body);
             shell_pipeline_free(plp);
@@ -29016,7 +29041,7 @@ static int shell_syntax_check(const char *s) {
 }
 
 static void execute_line_text_inner(const char *src) {
-    struct shell_token tok[SHELL_TOKEN_MAX];
+    struct shell_token *tok = 0;
     SH_WORDS(words);
     int ntok = 0;
 
@@ -29424,7 +29449,7 @@ static void execute_line_text_inner(const char *src) {
         }
     }
 
-    if (shell_tokenize(src, tok, &ntok, &words) < 0) {
+    if (shell_tokenize(src, &tok, &ntok, &words) < 0) {
         if (g_bad_subst_soft) {
             /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
              * command is skipped with status 1 and so is the rest of
