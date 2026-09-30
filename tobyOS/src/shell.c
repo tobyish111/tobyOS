@@ -1276,12 +1276,13 @@ static void jobs_reap_finished(void) {
  * terminator, and g_env_flags runs parallel to it. The table MOVES when it
  * grows; the blobs it points at do not, and nothing keeps a pointer INTO
  * the table itself. */
-#define SHELL_READONLY_MAX 16
-
 static char **g_env;                 /* g_env_cap entries + NULL terminator */
 static int   g_envc = 0;
 static int   g_env_cap = 0;
-static char *g_readonly[SHELL_READONLY_MAX];
+/* Growable too: it held 16, and the 17th `readonly` was "table full" --
+ * the name was assigned but NOT protected. */
+static char **g_readonly;
+static int   g_nreadonly;            /* slots, used or free */
 
 /* Per-variable flags, parallel to g_env.
  *
@@ -1368,7 +1369,7 @@ static int env_find(const char *key, size_t klen) {
 
 static int shell_readonly_find(const char *key, size_t klen) {
     if (!key || klen == 0) return -1;
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+    for (int i = 0; i < g_nreadonly; i++) {
         if (!g_readonly[i]) continue;
         if (strlen(g_readonly[i]) == klen &&
             memcmp(g_readonly[i], key, klen) == 0) {
@@ -1395,17 +1396,27 @@ static bool shell_readonly_key(const char *key, size_t klen) {
 static int shell_readonly_mark(const char *key, size_t klen) {
     if (!key || klen == 0) return -1;
     if (shell_readonly_key(key, klen)) return 0;
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
-        if (g_readonly[i]) continue;
-        char *copy = (char *)kmalloc(klen + 1);
-        if (!copy) return -1;
-        memcpy(copy, key, klen);
-        copy[klen] = '\0';
-        g_readonly[i] = copy;
-        return 0;
+    int slot = -1;
+    for (int i = 0; i < g_nreadonly; i++)
+        if (!g_readonly[i]) { slot = i; break; }
+    if (slot < 0) {
+        int ncap = g_nreadonly ? g_nreadonly * 2 : 16;
+        char **nt = (char **)kmalloc((size_t)ncap * sizeof(char *));
+        if (!nt) return -1;
+        if (g_nreadonly)
+            memcpy(nt, g_readonly, (size_t)g_nreadonly * sizeof(char *));
+        memset(nt + g_nreadonly, 0, (size_t)(ncap - g_nreadonly) * sizeof(char *));
+        kfree(g_readonly);
+        g_readonly = nt;
+        slot = g_nreadonly;
+        g_nreadonly = ncap;
     }
-    kprintf("readonly: table full (max %d)\n", SHELL_READONLY_MAX);
-    return -1;
+    char *copy = (char *)kmalloc(klen + 1);
+    if (!copy) return -1;
+    memcpy(copy, key, klen);
+    copy[klen] = '\0';
+    g_readonly[slot] = copy;
+    return 0;
 }
 
 static bool shell_key_eq(const char *key, size_t klen, const char *lit) {
@@ -2249,7 +2260,7 @@ static void env_init_defaults(void) {
         g_env[0] = 0;
         memset(g_env_flags, 0, (size_t)g_env_cap);
     }
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+    for (int i = 0; i < g_nreadonly; i++) {
         if (g_readonly[i]) kfree(g_readonly[i]);
         g_readonly[i] = 0;
     }
@@ -4992,7 +5003,7 @@ static void cmd_compgen(int argc, char **argv) {
 static void cmd_readonly(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
-        for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+        for (int i = 0; i < g_nreadonly; i++) {
             if (!g_readonly[i]) continue;
             const char *v = env_get(g_readonly[i]);
             /* bash's reinput form, same reason as shell_print_export_entry. */
@@ -27529,21 +27540,28 @@ static void shell_function_frame_restore(struct shell_function_frame *frame) {
 }
 
 struct shell_readonly_frame {
-    char *name[SHELL_READONLY_MAX];
+    int n;
+    char **name;
 };
 
 static void shell_readonly_frame_clear(struct shell_readonly_frame *frame) {
     if (!frame) return;
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
-        if (frame->name[i]) kfree(frame->name[i]);
-        frame->name[i] = 0;
-    }
+    for (int i = 0; i < frame->n; i++)
+        if (frame->name && frame->name[i]) kfree(frame->name[i]);
+    kfree(frame->name);
+    frame->name = 0;
+    frame->n = 0;
 }
 
 static int shell_readonly_frame_capture(struct shell_readonly_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+    if (g_nreadonly == 0) return 0;
+    frame->name = (char **)kmalloc((size_t)g_nreadonly * sizeof(char *));
+    if (!frame->name) return -1;
+    frame->n = g_nreadonly;
+    memset(frame->name, 0, (size_t)frame->n * sizeof(char *));
+    for (int i = 0; i < frame->n; i++) {
         if (!g_readonly[i]) continue;
         frame->name[i] = shell_strdup(g_readonly[i]);
         if (!frame->name[i]) {
@@ -27556,10 +27574,10 @@ static int shell_readonly_frame_capture(struct shell_readonly_frame *frame) {
 
 static void shell_readonly_frame_restore(struct shell_readonly_frame *frame) {
     if (!frame) return;
-    for (int i = 0; i < SHELL_READONLY_MAX; i++) {
+    for (int i = 0; i < g_nreadonly; i++) {
         if (g_readonly[i]) kfree(g_readonly[i]);
-        g_readonly[i] = frame->name[i];
-        frame->name[i] = 0;
+        g_readonly[i] = (i < frame->n) ? frame->name[i] : 0;
+        if (i < frame->n) frame->name[i] = 0;
     }
 }
 
