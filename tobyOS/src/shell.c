@@ -680,8 +680,16 @@ static int g_positional_count;
  * the bound/check pairing in the while and until drivers). */
 /* 1e6, not 1e7: this is a RUNAWAY NET, and the in-kernel shell has no ^C
  * to escape with -- a gate that trips it must stop in seconds, not minutes.
- * Still ~1000x the old 1024 and far past anything a real script does. */
-#define SHELL_LOOP_ITER_MAX 1000000
+ * Still ~1000x the old 1024 and far past anything a real script does.
+ *
+ * /bin/tsh HAS ^C, so it has no cap, as bash has none: a loop that means to
+ * run for a long time -- a poller, a counter past a million -- was stopped
+ * at 1e6 with "while: iteration limit reached". __LONG_MAX__ is out of reach. */
+#ifdef SHELL_HOSTED
+#define SHELL_LOOP_ITER_MAX __LONG_MAX__
+#else
+#define SHELL_LOOP_ITER_MAX 1000000L
+#endif
 
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
@@ -27591,7 +27599,7 @@ static bool shell_try_arith_for_command(const char *src) {
         last = 1;
         goto done;
     }
-    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+    for (long iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         g_shell_lineno = head_line;
         shell_run_debug_trap();                 /* the condition */
@@ -27726,7 +27734,7 @@ static bool shell_try_while_command(const char *src) {
      * the interrupt it was supposed to be testing ever arrived. */
     struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
     shell_heredoc_mark_take(&hd_mark);
-    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+    for (long iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         g_errexit_suspend++;              /* the condition is a decision */
         execute_line_text(cond);
@@ -27867,7 +27875,7 @@ static bool shell_try_until_command(const char *src) {
      * the interrupt it was supposed to be testing ever arrived. */
     struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
     shell_heredoc_mark_take(&hd_mark);
-    for (int iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
+    for (long iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         /* THE CONDITION IS A DECISION, NOT A FAILURE -- and `until` is the
          * loop whose condition is EXPECTED to fail. `set -e; until false; do
