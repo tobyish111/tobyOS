@@ -299,6 +299,41 @@ struct file *file_std_handle(int fd) {
     return f;
 }
 
+/* Descriptors above 2 that this process INHERITED, for the shell to adopt
+ * (shell_init_hosted). /proc/self/fd lists them; the directory's own
+ * descriptor is on that list while it is being read, so every number is
+ * re-checked with dup() once the directory is closed. Returns the count. */
+int host_inherited_fds(int *out, int max) {
+    int n = 0;
+    DIR *d = opendir("/proc/self/fd");
+    if (!d) return 0;
+    struct dirent *e;
+    while (n < max && (e = readdir(d)) != 0) {
+        const char *s = e->d_name;
+        if (*s < '0' || *s > '9') continue;
+        int v = 0;
+        for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (*s - '0');
+        if (*s == '\0' && v > 2) out[n++] = v;
+    }
+    closedir(d);
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        int x = dup(out[i]);
+        if (x < 0) continue;
+        close(x);
+        out[w++] = out[i];
+    }
+    return w;
+}
+
+/* An inherited descriptor as a file. Unseekable, like the standard three:
+ * a write goes wherever the parent left the offset. */
+struct file *host_wrap_inherited_fd(int fd) {
+    struct file *f = hf_make(fd);
+    if (f) f->vfs.size = VF_UNSEEKABLE;
+    return f;
+}
+
 int pipe_create(struct file **out_r, struct file **out_w) {
     int fds[2];
     if (pipe(fds) != 0) return -1;

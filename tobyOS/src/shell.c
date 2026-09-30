@@ -15567,6 +15567,9 @@ struct shell_token {
      * even when $arg holds the very same `ex=a b c`. */
     bool assign_src;
     int fd;
+    /* `{name}>file`: the operator names a VARIABLE, not a descriptor. See
+     * shell_redir.fdvar. Only ever set on a redirection operator. */
+    const char *fdvar;
 };
 
 struct shell_redir {
@@ -15575,6 +15578,11 @@ struct shell_redir {
     int target_fd;
     const char *path;
     const char *text;
+    /* `{name}>file`, `exec {name}<>f`, `{name}>&-`: bash's varname
+     * redirections. The descriptor is the lowest free one at or past
+     * SHELL_FD_BASE and its number goes into `name`; it outlives the command
+     * (the script closes it with `{name}>&-`). See shell_apply_redirs. */
+    const char *fdvar;
 };
 
 /* NO COUNT IS BOUNDED HERE. argv held ARG_MAX words (1024 hosted, 256 in
@@ -20238,6 +20246,10 @@ static bool g_tok_word_expanded;
  * from a literal `ex=a b c` -- and bash splits the first, not the second. */
 static bool g_tok_word_assign_src;
 
+/* The `{name}` read in front of the redirection operator about to be
+ * emitted; the operator's token takes it (shell_emit_token_fd). */
+static const char *g_tok_fdvar;
+
 /* The tokens of one line, in the caller's word store beside their text.
  * There were 96 at most -- `echo` and 95 words -- and the 97th was "too many
  * tokens"; the vector grows now, and MOVES when it does, which is why only
@@ -20268,6 +20280,8 @@ static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
     t->expanded = g_tok_word_expanded;
     t->assign_src = g_tok_word_assign_src;
     t->fd = fd;
+    t->fdvar = g_tok_fdvar;
+    g_tok_fdvar = 0;
     (*ntok)++;
     return 0;
 }
@@ -20981,6 +20995,22 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             if (*d == '<' || *d == '>') {
                 explicit_fd = n;
                 p = d;
+            }
+        } else if (*redir_p == '{' && shell_var_start(redir_p[1])) {
+            /* `{name}` RIGHT BEFORE `<` or `>` is a descriptor VARIABLE:
+             *
+             *     exec {fd}>log; echo hi >&$fd; exec {fd}>&-
+             *
+             * tsh read `{fd}` as a word and ran it: "failed to launch
+             * '/bin/{fd}'". Anything else keeps being a word -- a brace group
+             * is `{ `, a brace expansion has no `}<`. */
+            const char *d = redir_p + 1;
+            while (shell_var_char(*d)) d++;
+            if (*d == '}' && (d[1] == '<' || d[1] == '>')) {
+                g_tok_fdvar = words_store(words, redir_p + 1,
+                                          (size_t)(d - redir_p - 1));
+                if (!g_tok_fdvar) return -1;
+                p = d + 1;
             }
         }
 
@@ -23496,6 +23526,9 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             t == SH_TOK_REDIR_RW) {
             int fd = shell_default_redir_fd(t, tok[*io].fd);
             int expl_fd = tok[*io].fd;
+            const char *fdvar = tok[*io].fdvar;
+            int rbefore = cur->redir_count;
+            if (fdvar) expl_fd = fd;        /* `{v}>&word` is one descriptor */
             (*io)++;
             if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
                 kprintf("shell: redirection needs a path\n");
@@ -23600,6 +23633,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 }
                 if (shell_add_redir(cur, rk, fd, tok[*io].text, 0, -1) < 0) return -1;
             }
+            for (int ri = rbefore; ri < cur->redir_count; ri++)
+                cur->redir[ri].fdvar = fdvar;
             (*io)++;
             continue;
         }
@@ -24244,12 +24279,77 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
     return shell_open_vfs_file(path_arg, false, false, label);
 }
 
+/* A `{name}` descriptor OUTLIVES ITS COMMAND (bash: the script manages its
+ * lifetime), so once opened it moves from the command's table to the
+ * shell's, which owns it until `{name}>&-`. */
+static void shell_fd_commit_var(struct shell_fd_state *st, int fd) {
+    if (fd < 0 || fd >= st->n || !st->fd[fd]) return;
+    if (!shell_fd_table_reserve(fd)) return;
+    g_shell_fd[fd] = st->fd[fd];
+    st->owned[fd] = false;
+}
+
 static int shell_apply_redirs(struct shell_simple *cmd,
                               struct shell_fd_state *st,
                               const char *label) {
     if (!cmd || !st) return -1;
+    int pending_var = -1;               /* see shell_fd_commit_var */
     for (int i = 0; i < cmd->redir_count; i++) {
+        shell_fd_commit_var(st, pending_var);
+        pending_var = -1;
         struct shell_redir *r = &cmd->redir[i];
+        /* `{name}...`: resolve the descriptor first, then carry on with an
+         * ordinary redirection on it. */
+        struct shell_redir vr;
+        int var_fd = -1;
+        if (r->fdvar) {
+            vr = *r;
+            if (r->op == SH_RD_CLOSE) {
+                /* `{name}>&-` closes the descriptor NAMED BY $name, in the
+                 * shell itself -- it was opened for the script to manage. */
+                const char *v = env_get(r->fdvar);
+                long n = -1;
+                bool ok = false;
+                if (v && *v) n = shell_parse_long_value(v, &ok);
+                if (!ok || n < 0 || n >= SHELL_FD_LIMIT) {
+                    kprintf("%s: %s: bad file descriptor\n", label,
+                            v ? v : r->fdvar);
+                    shell_set_status(1);
+                    return -1;
+                }
+                if (n < g_shell_fd_cap && g_shell_fd[n]) {
+                    file_close(g_shell_fd[n]);
+                    g_shell_fd[n] = 0;
+                }
+                vr.fdvar = 0;
+                vr.fd = (int)n;
+                r = &vr;
+            } else {
+                /* The lowest descriptor open in neither table. A slot that
+                 * holds the CLOSED marker `N>&-` leaves is free: bash hands
+                 * out 10 again after `exec {fd}>&-`. */
+                int fd = SHELL_FD_BASE;
+                while (fd < SHELL_FD_LIMIT &&
+                       ((fd < st->n && st->fd[fd] &&
+                         st->fd[fd]->kind != FILE_KIND_NULL) ||
+                        (fd < g_shell_fd_cap && g_shell_fd[fd] &&
+                         g_shell_fd[fd]->kind != FILE_KIND_NULL)))
+                    fd++;
+                if (fd >= SHELL_FD_LIMIT) {
+                    kprintf("%s: %s: no free file descriptor\n", label,
+                            r->fdvar);
+                    return -1;
+                }
+                char num[16];
+                ksnprintf(num, sizeof num, "%d", fd);
+                if (env_set(r->fdvar, num) < 0) return -1;
+                vr.fdvar = 0;
+                vr.fd = fd;
+                r = &vr;
+                var_fd = fd;
+            }
+        }
+        pending_var = var_fd;
         if (r->fd < 0 || r->fd >= SHELL_FD_LIMIT) {
             kprintf("%s: bad file descriptor %d\n", label, r->fd);
             return -1;
@@ -24368,6 +24468,7 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             continue;
         }
     }
+    shell_fd_commit_var(st, pending_var);
     return 0;
 }
 
@@ -31000,6 +31101,31 @@ void shell_init_hosted(const char *argv0) {
     for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
     g_shell_start_secs = shell_wall_secs();
+
+    /* ADOPT THE DESCRIPTORS WE WERE GIVEN.
+     *
+     *     exec 3>log; sh -c 'echo x >&3'     bash, and sh as bash: x in log
+     *                                        sh as tsh: "3: Bad file descriptor"
+     *
+     * The shell's table started empty above 2, so an inherited descriptor
+     * was not open as far as tsh knew -- a script run with a log on fd 3
+     * could not write to it, and could not pass it on to what it ran. Each
+     * one inherited goes into the table at its own number. The kernel shell
+     * has no parent to inherit from. */
+#ifdef SHELL_HOSTED
+    {
+        extern int host_inherited_fds(int *out, int max);
+        extern struct file *host_wrap_inherited_fd(int fd);
+        int *inh = (int *)kmalloc((size_t)SHELL_FD_LIMIT * sizeof(int));
+        int k = inh ? host_inherited_fds(inh, SHELL_FD_LIMIT) : 0;
+        for (int i = 0; i < k; i++) {
+            int fd = inh[i];
+            if (fd >= SHELL_FD_LIMIT || !shell_fd_table_reserve(fd)) continue;
+            g_shell_fd[fd] = host_wrap_inherited_fd(fd);
+        }
+        kfree(inh);
+    }
+#endif
 
 #ifdef SHELL_HOSTED
     /* INHERIT THE ENVIRONMENT. env_init_defaults() stamps PATH=/bin, HOME=/,
