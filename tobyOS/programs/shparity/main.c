@@ -76,7 +76,6 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 #define BASH_PATH    "/bin/bash"
 #define TSH_PATH     "/bin/tsh"
 
-#define MAX_CASES    160
 #define MAX_PATH     256
 #define CAP_OUT      65536      /* per-stream capture cap */
 
@@ -84,8 +83,12 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
  * 128 KiB and user stacks here are far smaller than that. */
 static char g_buf_a[CAP_OUT];
 static char g_buf_b[CAP_OUT];
-static char g_cases[MAX_CASES][NAME_MAX + 1];
-static int  g_ncases;
+/* The case list grows with the corpus. It was a fixed 160 rows, and the
+ * readdir loop stopped at the 161st case WITHOUT A WORD: with 163 fixtures
+ * the verdict read "PASS 160/160" while three cases -- whichever readdir
+ * happened to return last -- were never run. */
+static char (*g_cases)[NAME_MAX + 1];
+static int  g_ncases, g_cases_cap;
 
 /* ---- output -------------------------------------------------------------
  *
@@ -326,9 +329,21 @@ int main(void) {
         return 0;
     }
     struct dirent *de;
-    while ((de = readdir(cd)) != NULL && g_ncases < MAX_CASES) {
+    while ((de = readdir(cd)) != NULL) {
         if (de->d_name[0] == '.') continue;
         if (!has_suffix(de->d_name, ".sh")) continue;
+        if (g_ncases == g_cases_cap) {
+            int ncap = g_cases_cap ? g_cases_cap * 2 : 256;
+            void *nc = realloc(g_cases, (size_t)ncap * sizeof g_cases[0]);
+            if (!nc) {
+                emit("[SHPARITY] VERDICT: BROKEN reason=out-of-memory "
+                     "(the case list could not grow)\n");
+                closedir(cd);
+                return 1;
+            }
+            g_cases = nc;
+            g_cases_cap = ncap;
+        }
         snprintf(g_cases[g_ncases], sizeof g_cases[0], "%s", de->d_name);
         g_ncases++;
     }
