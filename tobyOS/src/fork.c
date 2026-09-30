@@ -466,6 +466,7 @@ long sys_fork(void) {
     /* Slice 15: the pids controller. Checked BEFORE claiming a slot so a denied
      * fork costs nothing and cannot leave a PROC_EMBRYO behind -- which, per the
      * slice-109 note directly above, is the state that must never leak. */
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent);
       if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
@@ -899,6 +900,7 @@ long sys_fork_share(void) {
                           ? proc_lookup(parent->tgid) : parent;
     if (!tg) tg = parent;
 
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }  /* slice 15 */
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
@@ -1122,6 +1124,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
      * spawning threads instead of forking -- that would make pids.max trivially
      * evadable by any threaded program. cgroup_nr_procs counts g_proc entries,
      * which is threads included, so the two agree. */
+    proc_reap_orphans();          /* exited orphans' slots, first */
     { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;

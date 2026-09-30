@@ -874,6 +874,16 @@ __attribute__((noreturn)) void proc_exit(int code);
  * held -- the off-CPU wait spins on remote cores. */
 void proc_reap_group_threads(struct proc *p, int code);
 
+/* ORPHANS. A process whose parent exits takes this as its ppid (in the
+ * initial pid namespace; a child namespace hands orphans to its own init).
+ * Nobody will ever wait for it, so proc_reap_orphans() reclaims it once it
+ * has exited -- called where a new process is about to be created, which
+ * is when its slot is wanted. getppid() and /proc report such a process as
+ * a child of 1, as Linux does. PROC_PPID_REAPING is the sweep's claim. */
+#define PROC_PPID_ORPHAN   (-1)
+#define PROC_PPID_REAPING  (-2)
+void proc_reap_orphans(void);
+
 /* Spin until `p` is no longer live-on-CPU (on_cpu cleared). Call after
  * sched_dequeue / force-TERMINATED and BEFORE freeing kstack or zeroing
  * kstack_top -- otherwise another CPU can switch into a freed stack. */

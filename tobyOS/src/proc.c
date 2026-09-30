@@ -229,6 +229,7 @@ void proc_slot_wipe(struct proc *p) {
 }
 
 static struct proc *alloc_slot(void) {
+    proc_reap_orphans();                /* their slots, first */
     return proc_slot_claim();
 }
 
@@ -1766,19 +1767,24 @@ __attribute__((noreturn)) void proc_exit(int code) {
             pid_ns_kill_members(p);
         } else {
             /* Orphans inside a namespace reparent to that namespace's init,
-             * not to the host's. Scoped to non-initial namespaces on purpose:
-             * the initial namespace has never reparented orphans in this
-             * kernel, and changing that as a side effect of a namespace slice
-             * is a behaviour change nobody asked for (recorded as an open
-             * item instead). */
+             * not to the host's.
+             *
+             * IN THE INITIAL NAMESPACE THEY ARE MARKED PROC_PPID_ORPHAN, and
+             * proc_reap_orphans() reclaims them once they exit. They used to
+             * keep the dead parent's pid, so nothing ever waited for them:
+             * every orphan became a permanent zombie. On the EliteDesk,
+             * after a day of gate runs, 254 of the 255 process slots were
+             * zombies and nothing could be spawned -- SSH answered, and every
+             * command it ran came back 127. Keeping the dead pid was also
+             * wrong on its own terms: pids are recycled slot numbers, so an
+             * unrelated new process could inherit children it never had. */
             int reaper = pid_ns_reaper_kpid(p);
-            if (reaper) {
-                for (int i = 1; i < PROC_MAX; i++) {
-                    struct proc *q = &g_proc[i];
-                    if (q == p || q->state == PROC_UNUSED ||
-                        q->state == PROC_EMBRYO) continue;
-                    if (q->ppid == p->pid) q->ppid = reaper;
-                }
+            for (int i = 1; i < PROC_MAX; i++) {
+                struct proc *q = &g_proc[i];
+                if (q == p || q->state == PROC_UNUSED ||
+                    q->state == PROC_EMBRYO) continue;
+                if (q->ppid == p->pid)
+                    q->ppid = reaper ? reaper : PROC_PPID_ORPHAN;
             }
         }
     }
@@ -1863,6 +1869,25 @@ __attribute__((noreturn)) void proc_exit(int code) {
 
     sched_yield();          /* never returns: nothing puts us back ready */
     kpanic("proc_exit: sched_yield returned for terminated pid=%d", p->pid);
+}
+
+static void proc_reap(struct proc *p);
+
+/* Reclaim every orphan that has exited (see PROC_PPID_ORPHAN). Each is
+ * CLAIMED first, ppid ORPHAN -> REAPING by compare-and-swap, so two CPUs
+ * creating processes at once cannot reap the same corpse twice. An orphan
+ * still running is left alone; it is swept after it exits. */
+void proc_reap_orphans(void) {
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state != PROC_TERMINATED || q->is_thread) continue;
+        int expected = PROC_PPID_ORPHAN;
+        if (!__atomic_compare_exchange_n(&q->ppid, &expected,
+                                         PROC_PPID_REAPING, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            continue;
+        proc_reap(q);
+    }
 }
 
 /* Free everything owned by a TERMINATED process and recycle the slot. */

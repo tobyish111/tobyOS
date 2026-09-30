@@ -544,7 +544,10 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         APPEND_STR("\n");
     }
     APPEND_STR("Pid:    "); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
-    APPEND_STR("PPid:   "); APPEND_INT(pid_vnr_of_kpid(p->ppid)); APPEND_STR("\n");
+    /* An orphan (PROC_PPID_ORPHAN) reads as a child of 1, as in Linux. */
+    APPEND_STR("PPid:   ");
+    APPEND_INT(p->ppid < 0 ? 1 : pid_vnr_of_kpid(p->ppid));
+    APPEND_STR("\n");
     /* VmSize/VmRSS in kB from the maintained user-page counter (real since
      * the slice-16 fix; before that it was a spawn-time constant). */
     APPEND_STR("VmSize:\t"); APPEND_INT((int64_t)p->user_pages * 4); APPEND_STR(" kB\n");
@@ -1044,7 +1047,7 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
     { char cm[16]; APPEND_STR(proc_comm(p, cm, sizeof cm)); }
     APPEND_STR(") ");
     { char ss[2] = { st, 0 }; APPEND_STR(ss); }
-    APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->ppid));
+    APPEND_STR(" "); APPEND_INT(p->ppid < 0 ? 1 : pid_vnr_of_kpid(p->ppid));
 
     /* Linux /proc/<pid>/stat has FIFTY-TWO fields. We used to stop at 22,
      * which crashed real programs -- not by returning an error, but by

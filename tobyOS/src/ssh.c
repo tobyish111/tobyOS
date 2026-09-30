@@ -227,6 +227,17 @@ static void ssh_channel_teardown(void) {
         (void)proc_kill_tree(g_chan.child_pid, SIGHUP);
         (void)proc_kill_tree(g_chan.child_pid, SIGKILL);
     }
+    /* ...AND DISOWNED. The worker reads the shell's exit code and never
+     * waits for it, so every SSH session left its shell as a zombie child of
+     * the worker (pid 1): measured on the EliteDesk, 219 of 255 process
+     * slots after a day of gate runs, and then every spawn failed. Handed
+     * over as an orphan, it is reclaimed by proc_reap_orphans once it has
+     * exited -- which, after the kill above, it is about to. Its pid cannot
+     * have been recycled: nothing has reaped it. */
+    if (g_chan.child_pid > 0) {
+        struct proc *cp = proc_lookup(g_chan.child_pid);
+        if (cp && !cp->is_thread) cp->ppid = PROC_PPID_ORPHAN;
+    }
     if (g_chan.ptym) { pty_close(g_chan.ptym); kfree(g_chan.ptym); g_chan.ptym = 0; }
     g_chan.pty_idx = -1;
     g_chan.child_pid = -1;

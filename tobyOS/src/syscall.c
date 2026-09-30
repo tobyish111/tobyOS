@@ -1865,6 +1865,9 @@ static long sys_getppid(void) {
      * number there and pid_vnr_of_kpid returns 0 -- which is exactly what Linux
      * reports for getppid() in that position. Do not "fix" the 0 up to the real
      * parent: that would leak a host pid across the boundary. */
+    /* An orphan in the initial namespace (PROC_PPID_ORPHAN) is a child of 1,
+     * which is what Linux reports once init has adopted it. */
+    if (p->ppid < 0) return 1;
     return pid_vnr_of_kpid(p->ppid);
 }
 
