@@ -24071,7 +24071,12 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
         return;
     }
     for (int i = 0; i < assignc; i++) {
-        size_t klen = env_key_len(assignv[i]);
+        /* THE NAME, not the text before the `=`: for `A+=b` that text is
+         * `A+`, so the save recorded a variable called `A+`, the restore
+         * unset it, and A kept the appended value --
+         *
+         *     A=a; A+=b true; echo $A        bash: a    tsh: ab */
+        size_t klen = env_assign_name_len(assignv[i]);
         if (klen == 0) continue;
         char *name = (char *)kmalloc(klen + 1);
         if (!name) continue;
