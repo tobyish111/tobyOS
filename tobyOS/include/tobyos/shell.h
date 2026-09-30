@@ -74,6 +74,10 @@ void shell_init_hosted(const char *argv0);
 void shell_set_interactive_hosted(bool on);
 void shell_set_posix_hosted(bool on);
 
+/* The lowest stack address the shell may nest down to (see g_stack_floor in
+ * src/shell.c); host.c sets it from the process stack's limit. */
+void shell_set_stack_floor_hosted(unsigned long floor);
+
 /* Run a script file / a single -c line. Both return the exit status. */
 int  shell_run_script_hosted(const char *path);
 int  shell_run_line_hosted(const char *text);

@@ -10982,6 +10982,49 @@ static bool shell_text_ends_in_continuation(const char *t, size_t n) {
     return (bs & 1u) != 0;
 }
 
+/* HOW DEEP A FUNCTION, A SOURCED FILE OR AN EVAL MAY NEST IS A QUESTION
+ * ABOUT THE STACK, NOT A COUNT. It was a count of 8, so
+ *
+ *     h() { [ $1 -gt 0 ] && h $(($1 - 1)); }; h 300
+ *
+ * stopped seven levels down with "function nesting too deep" where bash
+ * recursed all 300 (and `. file` 101 deep, and eval 100 deep) -- bash has
+ * no limit of its own. The 8 guarded against running off the end of the
+ * stack, which is real; this asks that question instead: is the frame
+ * still above g_stack_floor, the point below which only a reserve is left?
+ * The floor is set by whoever knows the stack: the kernel shell's line
+ * stack, and host.c for /bin/tsh (the process stack, which grows on demand
+ * to 8 MiB). On a stack of unknown size (floor 0) the count still applies. */
+static uintptr_t g_stack_floor;
+#define SHELL_NEST_FALLBACK 8
+
+static bool shell_stack_exhausted(int depth) {
+    if (!g_stack_floor) return depth >= SHELL_NEST_FALLBACK;
+    return (uintptr_t)__builtin_frame_address(0) < g_stack_floor;
+}
+
+/* FUNCNEST, as bash reads it (legal_number): an optional sign and digits,
+ * whitespace around them allowed, anything else -- and 0, and a negative
+ * number -- means no limit. */
+static long shell_funcnest_max(void) {
+    const char *s = env_get("FUNCNEST");
+    if (!s) return 0;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
+           *s == '\f' || *s == '\r') s++;
+    bool neg = false;
+    if (*s == '+' || *s == '-') neg = (*s++ == '-');
+    if (*s < '0' || *s > '9') return 0;
+    long v = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (v < 1000000000L) v = v * 10 + (*s - '0');
+        s++;
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
+           *s == '\f' || *s == '\r') s++;
+    if (*s) return 0;
+    return neg ? 0 : v;
+}
+
 /* Set by cmd_eval for the ONE reader call it makes, and consumed at that
  * reader's entry -- so a `source` or `$( )` inside the eval'd text gets an
  * ordinary reader. See eval_mode below. */
@@ -11004,7 +11047,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
      *     nesting bound, and its lines count on from the caller's. */
     bool eval_mode = g_reader_eval_pending;
     g_reader_eval_pending = false;
-    if (eval_mode ? g_eval_reader_depth >= 8 : g_script_depth >= 8) {
+    if (shell_stack_exhausted(eval_mode ? g_eval_reader_depth
+                                        : g_script_depth)) {
         kprintf("sh: script nesting too deep\n");
         return 2;
     }
@@ -12032,6 +12076,15 @@ static void cmd_trap(int argc, char **argv) {
 static void cmd_eval(int argc, char **argv) {
     if (argc <= 1) {
         shell_set_status(0);
+        return;
+    }
+    /* eval nests on the stack as a function does (see g_stack_floor).
+     * `x='eval "$x"'; eval "$x"` recursed until the stack ran out and the
+     * shell died of SIGSEGV -- as bash does (both exit 139, measured); this
+     * stops while the reserve is still free. */
+    if (shell_stack_exhausted(0)) {
+        kprintf("sh: script nesting too deep\n");
+        shell_set_status(2);
         return;
     }
     /* THE ARGUMENTS JOINED, WHATEVER THEIR LENGTH. This was a 512-byte
@@ -24854,9 +24907,25 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
 static int shell_run_function(struct shell_simple *cmd) {
     struct shell_function *fn = shell_function_lookup(cmd->argv[0]);
     if (!fn) return -1;
-    if (g_script_depth >= 8) {
-        kprintf("%s: function nesting too deep\n", cmd->argv[0]);
-        return 2;
+    /* FUNCNEST, and the stack. bash refuses the call past FUNCNEST levels
+     * with "maximum function nesting level exceeded" and DISCARDs the rest
+     * of the top-level command -- every caller's remaining commands with
+     * it -- leaving status 1 (measured: `set -e` does not exit on it; eval
+     * and a subshell stop it). Running out of stack is the same refusal
+     * with no FUNCNEST set; bash would crash there instead. */
+    {
+        long fmax = shell_funcnest_max();
+        bool over = fmax > 0 && g_fn_depth >= fmax;
+        if (over || shell_stack_exhausted(g_script_depth)) {
+            kprintf("tsh: %s: maximum function nesting level exceeded (%ld)\n",
+                    cmd->argv[0], over ? fmax : (long)g_fn_depth);
+            shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
+            return 1;
+        }
     }
 
     struct shell_io_frame io_frame;
@@ -30744,15 +30813,23 @@ static void shell_kernel_flow_done(void) {
  * kernel shell's buffers stayed at 1 KiB while /bin/tsh's grew to 8, and why
  * `x=$(ls /etc)` failed there and worked in /bin/tsh.
  *
- * So a line runs on a dedicated 1 MiB stack, allocated once. The scheduler
+ * So a line runs on a dedicated 8 MiB stack, allocated once -- the default
+ * RLIMIT_STACK bash nests in on Linux, and what /bin/tsh's process stack
+ * grows to. It was 1 MiB, which bounded a function recursion at 518 levels
+ * where bash and /bin/tsh go past a thousand (see g_stack_floor). The
+ * scheduler
  * is indifferent to which stack pid 0 is on (sched_ctx_plausible exempts
  * pid 0 and idle), so a line that spawns and waits for a child still yields
  * and resumes normally. The deepest 4 KiB is a canary, checked after every
  * line: a line that came within 4 KiB of the bottom is reported, not left to
  * corrupt whatever lies below. Not re-entered: a line never starts another
  * line, but if it ever did it would simply stay on this stack. */
-#define SHELL_LINE_STACK_SZ   (1024u * 1024u)
+#define SHELL_LINE_STACK_SZ   (8u * 1024u * 1024u)
 #define SHELL_LINE_CANARY_SZ  4096u
+/* Kept free below the deepest nesting allowed (see g_stack_floor): what one
+ * level may still use after its check -- builtins, expansions, a capture.
+ * The same as /bin/tsh's (TSH_STACK_RESERVE in programs/tsh/host.c). */
+#define SHELL_LINE_STACK_RESERVE (512u * 1024u)
 #define SHELL_LINE_CANARY     0xA5u
 static uint8_t *g_line_stack;
 static bool     g_on_line_stack;
@@ -30764,13 +30841,15 @@ static void shell_run_on_line_stack(void (*fn)(void)) {
         if (g_line_stack)
             memset(g_line_stack, SHELL_LINE_CANARY, SHELL_LINE_CANARY_SZ);
         else
-            kprintf("[shell] no memory for the 1 MiB line stack -- lines run "
+            kprintf("[shell] no memory for the 8 MiB line stack -- lines run "
                     "on the boot stack\n");
     }
     if (!g_line_stack) { fn(); return; }
     uintptr_t top = ((uintptr_t)g_line_stack + SHELL_LINE_STACK_SZ) &
                     ~(uintptr_t)15;
     g_on_line_stack = true;
+    g_stack_floor = (uintptr_t)g_line_stack + SHELL_LINE_CANARY_SZ +
+                    SHELL_LINE_STACK_RESERVE;
     /* rbx is callee-saved, so fn() preserves the old stack pointer in it.
      * `top` is 16-byte aligned, so fn is entered with rsp % 16 == 8 exactly
      * as a normal call would leave it. */
@@ -30784,10 +30863,11 @@ static void shell_run_on_line_stack(void (*fn)(void)) {
         : "rbx", "rax", "rcx", "rdx", "rsi", "rdi",
           "r8", "r9", "r10", "r11", "memory", "cc");
     g_on_line_stack = false;
+    g_stack_floor = 0;
     for (unsigned i = 0; i < SHELL_LINE_CANARY_SZ; i++) {
         if (g_line_stack[i] != SHELL_LINE_CANARY) {
             kprintf("[shell] WARNING: a line used the kernel-shell stack to "
-                    "within %u bytes of its end (1 MiB)\n", i);
+                    "within %u bytes of its end (8 MiB)\n", i);
             memset(g_line_stack, SHELL_LINE_CANARY, SHELL_LINE_CANARY_SZ);
             break;
         }
@@ -31061,6 +31141,11 @@ void shell_set_interactive_hosted(bool on) {
  * for its own `sh` link. tsh is a strict superset of the POSIX shell, so the
  * mode changes what `set -o` reports, not what runs. */
 void shell_set_posix_hosted(bool on) { g_opt_posix = on; }
+
+/* host.c knows the stack /bin/tsh runs on; see g_stack_floor. */
+void shell_set_stack_floor_hosted(unsigned long floor) {
+    g_stack_floor = (uintptr_t)floor;
+}
 
 /* `set -o ignoreeof` -- only the hosted interactive read loop can see an
  * EOF, and it lives in programs/tsh/host.c, outside this translation unit. */

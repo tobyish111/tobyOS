@@ -855,8 +855,23 @@ static void tsh_arm_sigint(void) {
 
 #include "lineedit.h"
 
+/* Kept free below the deepest nesting the shell allows. */
+#define TSH_STACK_RESERVE (512ul << 10)
+
 int main(int argc, char **argv) {
     shell_init_hosted(argv[0]);
+    /* HOW DEEP THE SHELL MAY NEST IS SET BY THE STACK (g_stack_floor in
+     * src/shell.c). A native process's stack tops out at the end of the
+     * user half and grows on demand down to USER_STACK_FLOOR_VA, 8 MiB
+     * below, as Linux's default RLIMIT_STACK does for bash; the shell may
+     * use all but TSH_STACK_RESERVE of it. Only if this frame is on that
+     * stack -- otherwise the shell keeps its fallback count. */
+    {
+        unsigned long sp = (unsigned long)__builtin_frame_address(0);
+        if (sp > USER_STACK_FLOOR_VA && sp <= USER_STACK_TOP_LIMIT_VA)
+            shell_set_stack_floor_hosted(USER_STACK_FLOOR_VA +
+                                         TSH_STACK_RESERVE);
+    }
     /* Invoked as `sh` -- /bin/sh is a link to this binary -- means POSIX
      * mode, as it does for bash. */
     {
