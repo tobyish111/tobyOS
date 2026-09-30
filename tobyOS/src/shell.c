@@ -16943,16 +16943,36 @@ static int shell_append_array_join(struct shell_sb *b,
  * above -- a slice differs only in WHICH elements it visits, so quoting still
  * produces one word each.
  *
- * The window is over ELEMENT POSITION, not over subscript value: on a sparse
- * array `${a[@]:1:2}` means "the second and third elements that exist", which
- * is what bash does and is why this walks the store rather than indexing it.
- * A negative or absent count means "to the end". */
+ * ON AN INDEXED ARRAY THE OFFSET IS A SUBSCRIPT, and the window starts at the
+ * first element whose subscript is at least that -- then takes `len` of the
+ * elements that exist. Measured against bash on a sparse array:
+ *
+ *     a=([0]=a [5]=b [10]=c [11]=d)
+ *     ${a[@]:5:1}  b      ${a[@]:6}  c d      ${a[@]: -1}  d
+ *
+ * This walked POSITIONS instead (and said bash did too), so every one of
+ * those came back empty, and on a dense array with a hole -- `unset 'b[0]'`
+ * -- ${b[@]:1:1} was the element after the one bash names. The caller has
+ * already turned a negative offset into a subscript counted back from the
+ * highest one (sh_subscript_eval); one that reaches past the start is -1,
+ * which bash answers with nothing. An associative array has no order but
+ * its own, so there the window is over positions still. A negative or
+ * absent count means "to the end". */
 static int shell_append_array_slice(struct shell_sb *b,
                                     const char *name, bool star,
                                     long off, long cnt) {
     struct sh_array *a = sh_array_find(name);
     int n = a ? a->n : 0;
-    if (off < 0) { off = n + off; if (off < 0) off = 0; }
+    if (a && !a->assoc) {
+        long first = n;                 /* nothing, unless an element fits */
+        if (off >= 0)
+            for (int i = 0; i < n; i++)
+                if (a->e[i].idx >= off) { first = i; break; }
+        off = first;
+    } else if (off < 0) {
+        off = n + off;
+        if (off < 0) off = 0;
+    }
     long end = (cnt < 0) ? n : off + cnt;
     if (end > n) end = n;
 
