@@ -923,6 +923,13 @@ static int   sh_array_set_key(const char *name, const char *key,
                               const char *val);
 static const char *sh_array_get_key(const char *name, const char *key);
 static void  sh_array_unset_key(struct sh_array *a, const char *key);
+static void  sh_array_unset_literal(const char *name);
+static int   sh_array_literal_commit(const char *tmp, const char *name,
+                                     bool append);
+/* The name an array literal is built under until it is complete: a byte no
+ * identifier can start with, so no script can name it and no listing shows
+ * it. See sh_array_assign_literal. */
+#define SH_ARRAY_TMP_MARK '\x01'
 /* The array-literal parser EXPANDS each element, so it needs the word
  * expander and the marker cleanup 12k lines below. */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
@@ -1795,38 +1802,11 @@ static int sh_array_store_expanded(const char *name, const char *ex,
     return 0;
 }
 
-static int sh_array_assign_literal(const char *name, const char *paren,
-                                   bool append) {
-    const char *p = paren;
-    while (*p && *p != '(') p++;
-    if (*p != '(') return -1;
-    p++;
-    struct sh_array *a = sh_array_find(name);
-    long next = 0;
-    if (append && a) next = sh_array_max_idx(a) + 1;
-    else if (!append && a) sh_array_unset(name);      /* a=(...) REPLACES */
-    /* AN ARRAY LITERAL REPLACES A SCALAR OF THE SAME NAME.
-     *
-     *     w=W; w=(p q); echo $w                        bash: p
-     *     z=Z; typeset -n r=z; r=(p q); echo $z        bash: p
-     *
-     * env_get() checks the scalar table first -- a scalar of the same name
-     * wins, which is right for reading an array's element 0 and wrong once
-     * a literal has replaced it. The old scalar stayed and shadowed the new
-     * array forever.
-     *
-     * Found through the nameref work, but it was never about namerefs: the
-     * probe carried the same shape with no reference in it as a control,
-     * and that case diverged too. A fix aimed only at the reference path
-     * would have left the plain one wrong and looked complete. */
-    if (!append) {
-        char tgt[128];
-        const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
-        if (!real || !*real) real = name;
-        int si = env_find(real, strlen(real));
-        if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
-    }
-    if (!sh_array_create(name)) return -1;
+/* The elements of the literal at `p` (just past its `(`), into the array
+ * `dst`. `name` is the array being assigned, which the elements' own
+ * expansions read -- see sh_array_assign_literal. */
+static int sh_array_literal_fill(const char *dst, const char *name,
+                                 const char *p, bool append, long next) {
     /* An element's text is a piece of the literal, so the literal's length
      * always holds one; it was 512 bytes, and a longer element was cut
      * short without a word. */
@@ -1935,7 +1915,7 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 /* An assignment's RHS tilde-expands, after the `=` and
                  * after each `:` -- shell_word_tilde owns that rule. */
                 if (shell_word_tilde(&vx) < 0) return -1;
-                if (sh_array_is_assoc(name)) {
+                if (sh_array_is_assoc(dst)) {
                     SH_SB(kraw);
                     SH_SB(kx);
                     if (shell_expand_word_ex(k, &kraw, true, true) < 0)
@@ -1959,7 +1939,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                      * passes. An INDEXED array chains in both forms, which
                      * is why the two sides of this branch differ. */
                     if (eplus && append) {
-                        const char *old = sh_array_get_key(name, kx.p);
+                        const char *old = sh_array_get_key(dst, kx.p);
+                        if (!old) old = sh_array_get_key(name, kx.p);
                         if (old && *old) {
                             SH_SB(cat);
                             if (sb_puts(&cat, old) < 0 ||
@@ -1968,11 +1949,12 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                                 return -1;
                         }
                     }
-                    if (sh_array_set_key(name, kx.p, vx.p) < 0) return -1;
+                    if (sh_array_set_key(dst, kx.p, vx.p) < 0) return -1;
                     saw_keyed = true;
                 } else {
                     long ix = 0;
-                    if (sh_subscript_eval(k, name, false, &ix) && ix >= 0) {
+                    if (sh_subscript_eval(k, append ? name : dst, false, &ix) &&
+                        ix >= 0) {
                         /* Prepend the old value. `old` points into the
                          * array store, which the set below may reallocate,
                          * so it is copied first. THE ASSOCIATIVE SIDE
@@ -1981,7 +1963,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                          * corpus records it as `## BUG bash`, and this gate
                          * grades against the live bash. */
                         if (eplus) {
-                            const char *old = sh_array_get(name, ix);
+                            const char *old = sh_array_get(dst, ix);
+                            if (!old && append) old = sh_array_get(name, ix);
                             if (old && *old) {
                                 SH_SB(cat);
                                 if (sb_puts(&cat, old) < 0 ||
@@ -1990,14 +1973,14 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                                     return -1;
                             }
                         }
-                        if (sh_array_set(name, ix, vx.p) < 0) return -1;
+                        if (sh_array_set(dst, ix, vx.p) < 0) return -1;
                         next = ix + 1;   /* a later bare element follows on */
                     }
                 }
                 continue;
             }
         }
-        if (sh_array_is_assoc(name)) {
+        if (sh_array_is_assoc(dst)) {
             /* BARE WORDS IN AN ASSOCIATIVE LITERAL ARE KEY/VALUE PAIRS.
              * bash 5.1 added this and the guest's bash 5.2 has it:
              *
@@ -2027,7 +2010,7 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 pend_key = true;
                 continue;
             }
-            if (sh_array_set_key(name, pend.p, kj.p) < 0) return -1;
+            if (sh_array_set_key(dst, pend.p, kj.p) < 0) return -1;
             pend_key = false;
             continue;
         }
@@ -2041,13 +2024,79 @@ static int sh_array_assign_literal(const char *name, const char *paren,
             if (!quoted && shell_word_tilde(&ex) < 0) return -1;
             /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
              * is three elements -- and a quoted one never does. */
-            if (sh_array_store_expanded(name, ex.p, !quoted, quoted, &next) < 0)
+            if (sh_array_store_expanded(dst, ex.p, !quoted, quoted, &next) < 0)
                 return -1;
         }
     }
     /* An odd number of bare words leaves the last KEY holding "". */
-    if (pend_key && sh_array_set_key(name, pend.p, "") < 0) return -1;
+    if (pend_key && sh_array_set_key(dst, pend.p, "") < 0) return -1;
     return 0;
+}
+
+/* `name=(...)` and `name+=(...)`.
+ *
+ * EVERY WORD IS EXPANDED BEFORE THE ARRAY CHANGES, as in bash. The array
+ * was cleared first and then filled one word at a time, so a literal that
+ * reads the array it assigns read the half-built one:
+ *
+ *     acc=(); for i in 1 2 3; do acc=("${acc[@]}" v$i); done
+ *         bash: v1 v2 v3        tsh: v3
+ *     a=(1 2); a+=(x "${a[@]}")
+ *         bash: 1 2 x 1 2       tsh: 1 2 x 1 2 x
+ *     declare -A m=([a]=1); m=([b]=2)
+ *         bash: still associative      tsh: indexed, [0]=2
+ *
+ * -- the last because clearing the array cleared its -A as well. So the
+ * elements go into a hidden array first (SH_ARRAY_TMP_MARK), which the
+ * words' own expansions cannot see; `=` then REPLACES the array with it and
+ * `+=` merges it in. A scalar of the same name goes at the same moment,
+ * not before: `w=W; w=("$w" q)` reads W. */
+static int sh_array_assign_literal(const char *name, const char *paren,
+                                   bool append) {
+    const char *p = paren;
+    while (*p && *p != '(') p++;
+    if (*p != '(') return -1;
+    p++;
+    static unsigned lit_seq;            /* literals nest through $( ) */
+    char tmp[32];
+    ksnprintf(tmp, sizeof tmp, "%clit%u", SH_ARRAY_TMP_MARK, lit_seq++);
+    long next = 0;
+    if (append) {
+        struct sh_array *a = sh_array_find(name);
+        if (a) next = sh_array_max_idx(a) + 1;
+    }
+    if (!sh_array_create(tmp)) return -1;
+    if (sh_array_is_assoc(name) && sh_array_make_assoc(tmp) < 0) {
+        sh_array_unset_literal(tmp);
+        return -1;
+    }
+    if (sh_array_literal_fill(tmp, name, p, append, next) < 0) {
+        sh_array_unset_literal(tmp);
+        return -1;
+    }
+    if (!append) {
+        /* AN ARRAY LITERAL REPLACES A SCALAR OF THE SAME NAME.
+         *
+         *     w=W; w=(p q); echo $w                        bash: p
+         *     z=Z; typeset -n r=z; r=(p q); echo $z        bash: p
+         *
+         * env_get() checks the scalar table first -- a scalar of the same
+         * name wins, which is right for reading an array's element 0 and
+         * wrong once a literal has replaced it. The old scalar stayed and
+         * shadowed the new array forever.
+         *
+         * Found through the nameref work, but it was never about namerefs:
+         * the probe carried the same shape with no reference in it as a
+         * control, and that case diverged too. A fix aimed only at the
+         * reference path would have left the plain one wrong and looked
+         * complete. */
+        char tgt[128];
+        const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+        if (!real || !*real) real = name;
+        int si = env_find(real, strlen(real));
+        if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
+    }
+    return sh_array_literal_commit(tmp, name, append);
 }
 
 /* Intercept the assignment forms that mean ARRAY before the scalar path sees
@@ -3697,6 +3746,37 @@ static void sh_array_unset_literal(const char *name) {
     sh_array_unset_at(sh_array_find_literal(name));
 }
 
+/* The last step of sh_array_assign_literal: the finished elements under
+ * `tmp` become `name`'s -- the whole array for `=`, merged in for `+=`.
+ * `name` is followed through a reference, as sh_array_create follows it. */
+static int sh_array_literal_commit(const char *tmp, const char *name,
+                                   bool append) {
+    struct sh_array *t = sh_array_find_literal(tmp);
+    if (!t) return -1;
+    if (append) {
+        int rc = sh_array_create(name) ? 0 : -1;
+        for (int i = 0; rc == 0 && i < t->n; i++) {
+            if (t->e[i].key)
+                rc = sh_array_set_key(name, t->e[i].key, t->e[i].val);
+            else
+                rc = sh_array_set(name, t->e[i].idx, t->e[i].val);
+        }
+        sh_array_unset_literal(tmp);
+        return rc;
+    }
+    char tgt[128];
+    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    if (!real || !*real) real = name;
+    size_t rn = strlen(real) + 1;
+    char *nn = (char *)kmalloc(rn);
+    if (!nn) { sh_array_unset_literal(tmp); return -1; }
+    memcpy(nn, real, rn);
+    sh_array_unset(name);               /* a=(...) REPLACES */
+    kfree(t->name);                     /* `t` is its own record: still good */
+    t->name = nn;
+    return 0;
+}
+
 static struct sh_array *sh_array_find(const char *name) {
     if (!name || !*name) return 0;
     /* A NAMEREF IS ITS TARGET FOR EVERY ARRAY OPERATION.
@@ -4920,7 +5000,7 @@ static void cmd_declare(int argc, char **argv) {
         }
         for (int k = 0; k < g_narrays; k++) {
             const char *nm = g_arrays[k]->name;
-            if (!nm) continue;
+            if (!nm || nm[0] == SH_ARRAY_TMP_MARK) continue;
             if (env_find(nm, strlen(nm)) >= 0) continue;   /* already done */
             if (!shell_declare_filter_ok(nm, set_array, set_assoc,
                                          set_nameref, set_readonly,
@@ -5636,7 +5716,8 @@ static void shell_print_vars_set_format(void) {
             names[n++] = k;
         }
         for (int i = 0; i < g_narrays; i++) {
-            if (!g_arrays[i]->name) continue;
+            if (!g_arrays[i]->name ||
+                g_arrays[i]->name[0] == SH_ARRAY_TMP_MARK) continue;
             bool dup = false;
             for (int k = 0; k < n; k++)
                 if (strcmp(names[k], g_arrays[i]->name) == 0) { dup = true; break; }
