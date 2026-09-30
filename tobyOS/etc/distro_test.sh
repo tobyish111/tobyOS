@@ -614,14 +614,20 @@ echo @@ps_aux_tsh
 ps aux | grep -c '[t]sh'
 echo @@ps_pidset
 # Two snapshots a few milliseconds apart: the only pids that may differ are
-# the ones the snapshot commands themselves are.
-ps -e -o pid= | tr -d ' ' | sort -n > /tmp/ps_e.txt
+# the ones the snapshot commands themselves are. So each snapshot is ONE
+# process writing a file, and the tidying runs after. It used to be a
+# `ps | tr | sort` pipeline per snapshot -- six processes each -- which
+# passed only while freed pids came straight back and both pipelines got
+# the same ones; pids now rise as in Linux, and that was 12 "disagreeing".
+ps -e -o pid= > /tmp/ps_e.raw
+tr -d ' ' < /tmp/ps_e.raw | sort -n > /tmp/ps_e.txt
 echo "count: $(grep -c . /tmp/ps_e.txt)"
 # The shell (pid $$) must be in `ps -e`. pid 0 is deliberately NOT here:
 # Linux `ps -e` omits the scheduler (pid 0) and busybox ps agrees.
 echo "shell: $(grep -cx "$$" /tmp/ps_e.txt)"
 echo @@ps_busybox
-busybox ps -o pid= | tr -d ' ' | sort -n > /tmp/ps_bb.txt
+busybox ps -o pid= > /tmp/ps_bb.raw
+tr -d ' ' < /tmp/ps_bb.raw | sort -n > /tmp/ps_bb.txt
 echo "only-in-one: $(sort /tmp/ps_e.txt /tmp/ps_bb.txt | uniq -u | grep -c .)"
 echo @@ps_columns
 ps -o pid,ppid,pgid,user,%cpu,%mem,vsz,rss,stat,etime,time,comm -p $$

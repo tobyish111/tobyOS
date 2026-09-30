@@ -211,13 +211,30 @@ void proc_dump_table(void) {
  * (mongrel pid/tgid/is_thread), executed a demand-zeroed text page and
  * died at NULL, while the victim process lost the thread (the mp
  * bootstrap flake, gpuperf_viz_anim.001.log). */
+/* The search STARTS AFTER THE LAST SLOT CLAIMED, and wraps. It used to take
+ * the lowest free slot, so a pid came back the moment its process was
+ * reaped. Linux hands out pids in rising order and reuses one only after
+ * wrapping, and shells rely on it: bash keeps finished jobs' pids in its
+ * job table, and a pid of one background pipeline reappearing in the next
+ * had bash credit exits to the wrong job --
+ *     for i in 3 2 1; do sleep 0.0$i | ( exit $i ) & ...; wait $pid
+ * gave 1 2 1 where Linux gives 3 2 1. The cursor is only a hint: the CAS
+ * below is still what makes a claim exclusive, so a race on it costs
+ * nothing but order. */
+static int g_slot_next = 1;
+
 struct proc *proc_slot_claim(void) {
     /* Slot 0 is reserved for kernel_main. Search 1..PROC_MAX-1. */
-    for (int i = 1; i < PROC_MAX; i++) {
+    int start = __atomic_load_n(&g_slot_next, __ATOMIC_RELAXED);
+    if (start < 1 || start >= PROC_MAX) start = 1;
+    for (int n = 0; n < PROC_MAX - 1; n++) {
+        int i = 1 + (start - 1 + n) % (PROC_MAX - 1);
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_slot_next, i + 1 < PROC_MAX ? i + 1 : 1,
+                             __ATOMIC_RELAXED);
             /* The wake-after-death tombstone must not outlive the slot's
              * previous occupant, or the new process is unwakeable. This
              * is the ONE clearing point every creation path goes through
