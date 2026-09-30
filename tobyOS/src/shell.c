@@ -19483,10 +19483,54 @@ static int g_procsub_n;
 
 static int shell_procsub_mark(void) { return g_procsub_n; }
 
+#ifdef SHELL_HOSTED
+/* PRODUCERS STILL TO BE REAPED. An input substitution is not waited for
+ * when it is released (see below) -- and it was never waited for at all, so
+ * every `<( )` left a zombie for the life of the shell:
+ *
+ *     for i in $(seq 100); do cat <(echo $i) >/dev/null; done
+ *
+ * left 100 of them, and a long enough script ran the box out of processes
+ * ("process substitution: cannot fork"). bash reaps them as they finish;
+ * this reaps whichever have finished each time any substitution is
+ * released, so the list only ever holds producers still running. */
+static int *g_procsub_unreaped;
+static int  g_procsub_unreaped_n;
+static int  g_procsub_unreaped_cap;
+
+static void shell_procsub_reap(void) {
+    extern int proc_try_reap(int pid, int *code);
+    int w = 0;
+    for (int i = 0; i < g_procsub_unreaped_n; i++) {
+        int pid = g_procsub_unreaped[i];
+        if (proc_try_reap(pid, 0) == 0) g_procsub_unreaped[w++] = pid;
+    }
+    g_procsub_unreaped_n = w;
+}
+
+static void shell_procsub_note_unreaped(int pid) {
+    if (g_procsub_unreaped_n >= g_procsub_unreaped_cap) {
+        int ncap = g_procsub_unreaped_cap ? g_procsub_unreaped_cap * 2 : 16;
+        int *nt = (int *)kmalloc((size_t)ncap * sizeof(int));
+        if (!nt) return;            /* it stays a zombie, as it always did */
+        if (g_procsub_unreaped_n)
+            memcpy(nt, g_procsub_unreaped,
+                   (size_t)g_procsub_unreaped_n * sizeof(int));
+        kfree(g_procsub_unreaped);
+        g_procsub_unreaped = nt;
+        g_procsub_unreaped_cap = ncap;
+    }
+    g_procsub_unreaped[g_procsub_unreaped_n++] = pid;
+}
+#endif
+
 /* Close everything opened since `mark`. Taking a mark per LINE is what makes
  * nesting work: a `$( )` runs a whole line in this process, and its
  * substitutions must not outlive it or be closed by it. */
 static void shell_procsub_release(int mark) {
+#ifdef SHELL_HOSTED
+    shell_procsub_reap();
+#endif
     while (g_procsub_n > mark) {
         struct shell_procsub *ps = &g_procsub[--g_procsub_n];
         if (ps->keep) file_close(ps->keep);
@@ -19506,6 +19550,9 @@ static void shell_procsub_release(int mark) {
          * may have stopped early, leaving it blocked on a pipe nobody
          * will drain, and `cat <(yes) | head -1` would never return. */
         if (!ps->input && ps->pid > 0) (void)proc_wait(ps->pid);
+#ifdef SHELL_HOSTED
+        if (ps->input && ps->pid > 0) shell_procsub_note_unreaped(ps->pid);
+#endif
         ps->keep = 0;
         ps->fd = -1;
         ps->pid = -1;
