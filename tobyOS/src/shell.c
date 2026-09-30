@@ -6342,6 +6342,14 @@ static int shell_read_assign_array(const char *name, const char *line,
 #define SH_RA_IFS_WS(q) (!(escmap && escmap[(q) - line]) && shell_ifs_is_ws(ifs, *(q)))
     const char *p = line;
     if (ifs[0] == '\0') {
+        /* The whole line is one field -- and an EMPTY line is none:
+         *
+         *     echo '' | (IFS= read -a a; echo ${#a[@]})     bash: 0
+         *
+         * tsh stored one empty element. It went unseen while "${a[@]}"
+         * could not tell one empty element from none (see
+         * SHELL_EMPTY_ELEM); once it could, Oils 1128 showed it. */
+        if (!*line) return 0;
         return sh_array_set(name, 0, line) < 0 ? 1 : 0;
     }
     while (*p && SH_RA_IFS_WS(p)) p++;
