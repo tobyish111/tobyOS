@@ -19612,6 +19612,18 @@ static bool shell_procsub_make(const char *text, bool input,
          * a reader still holding the write end never sees EOF. */
         file_close(keep);
         (void)host_file_move_fd(child_end, input ? 1 : 0);
+        /* AND THE SHELL'S OWN IDEA OF THAT DESCRIPTOR MOVES TOO.
+         *
+         *     cat <(echo 1) <(echo 2) <(echo 3) | tr '\n' ' '
+         *     bash: 1 2 3        tsh: 123 (or 1 2 3, or 13 2)
+         *
+         * Inside a pipeline stage g_shell_fd[1] is the stage's pipe, and a
+         * builtin writes through it, not through host descriptor 1 -- so
+         * every `echo` in a substitution went straight to `tr`, around the
+         * pipe `cat` was reading, in whatever order the children ran. `cat`
+         * read three empty files. */
+        g_shell_fd[input ? 1 : 0] = child_end;
+        if (!input) g_shell_in = 0;
         /* Inside `$( )` the shell's output is being captured into a spill
          * file. This child's output belongs to the pipe. */
         shell_set_output(0, 0);
