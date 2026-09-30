@@ -140,7 +140,7 @@ extern volatile struct limine_module_request module_req;
 #else
 #define ARG_MAX  256
 #endif
-#define SHELL_ALIAS_MAX 32
+
 #define SHELL_HEREDOC_MAX 4
 #define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
 
@@ -842,7 +842,11 @@ static unsigned g_hd_unit_cur;
 static void shell_hd_pin_text(const char *text, int delta);
 static void shell_hd_strip_tags(char *s);
 
-static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
+/* GROWABLE: it held 32, and the 33rd `alias` was "failed to set". Entries
+ * are found by index and only their string pointers are handed out, so the
+ * table may move when it grows. */
+static struct shell_alias *g_aliases;
+static int g_naliases;                  /* slots, used or free */
 /* GROWABLE. It held 32, so a script's 33rd function was "failed to define"
  * and every call to it went looking for /bin/<name>. A slot is found by
  * index and a lookup's pointer is used only until the body starts running
@@ -2352,7 +2356,7 @@ static int shell_enter_dot_params(struct shell_param_frame *frame,
 
 static int shell_alias_find(const char *name) {
     if (!name || !*name) return -1;
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+    for (int i = 0; i < g_naliases; i++) {
         if (g_aliases[i].name && strcmp(g_aliases[i].name, name) == 0) return i;
     }
     return -1;
@@ -2392,7 +2396,7 @@ static int shell_alias_set(const char *name, const char *value) {
 
     int idx = shell_alias_find(name);
     if (idx < 0) {
-        for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        for (int i = 0; i < g_naliases; i++) {
             if (!g_aliases[i].name) {
                 idx = i;
                 break;
@@ -2400,9 +2404,21 @@ static int shell_alias_set(const char *name, const char *value) {
         }
     }
     if (idx < 0) {
-        kfree(ncopy);
-        kfree(vcopy);
-        return -1;
+        int ncap = g_naliases ? g_naliases * 2 : 32;
+        struct shell_alias *nt =
+            (struct shell_alias *)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) {
+            kfree(ncopy);
+            kfree(vcopy);
+            return -1;
+        }
+        if (g_naliases)
+            memcpy(nt, g_aliases, (size_t)g_naliases * sizeof *nt);
+        memset(nt + g_naliases, 0, (size_t)(ncap - g_naliases) * sizeof *nt);
+        kfree(g_aliases);
+        g_aliases = nt;
+        idx = g_naliases;
+        g_naliases = ncap;
     }
 
     kfree(g_aliases[idx].name);
@@ -2422,8 +2438,70 @@ static void shell_alias_unset(const char *name) {
 }
 
 static void shell_alias_clear_all(void) {
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+    for (int i = 0; i < g_naliases; i++) {
         shell_alias_unset(g_aliases[i].name);
+    }
+}
+
+/* A COPY OF THE ALIAS TABLE, as many slots as it had when taken -- for a
+ * subshell and for a command substitution, which is one. */
+struct shell_alias_frame {
+    int n;
+    char **name;
+    char **value;
+};
+
+static void shell_alias_frame_clear(struct shell_alias_frame *frame) {
+    if (!frame) return;
+    for (int i = 0; i < frame->n; i++) {
+        if (frame->name && frame->name[i]) kfree(frame->name[i]);
+        if (frame->value && frame->value[i]) kfree(frame->value[i]);
+    }
+    kfree(frame->name);
+    kfree(frame->value);
+    frame->name = frame->value = 0;
+    frame->n = 0;
+}
+
+static int shell_alias_frame_capture(struct shell_alias_frame *frame) {
+    if (!frame) return -1;
+    memset(frame, 0, sizeof(*frame));
+    if (g_naliases == 0) return 0;
+    frame->name = (char **)kmalloc((size_t)g_naliases * sizeof(char *));
+    frame->value = (char **)kmalloc((size_t)g_naliases * sizeof(char *));
+    if (!frame->name || !frame->value) {
+        kfree(frame->name);
+        kfree(frame->value);
+        frame->name = frame->value = 0;
+        return -1;
+    }
+    frame->n = g_naliases;
+    memset(frame->name, 0, (size_t)frame->n * sizeof(char *));
+    memset(frame->value, 0, (size_t)frame->n * sizeof(char *));
+    for (int i = 0; i < frame->n; i++) {
+        if (!g_aliases[i].name) continue;
+        frame->name[i] = shell_strdup(g_aliases[i].name);
+        frame->value[i] = shell_strdup(g_aliases[i].value);
+        if (!frame->name[i] || !frame->value[i]) {
+            shell_alias_frame_clear(frame);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void shell_alias_frame_restore(struct shell_alias_frame *frame) {
+    if (!frame) return;
+    /* Slots past the saved ones were added inside, and go. */
+    for (int i = 0; i < g_naliases; i++) {
+        if (g_aliases[i].name) kfree(g_aliases[i].name);
+        if (g_aliases[i].value) kfree(g_aliases[i].value);
+        g_aliases[i].name = (i < frame->n) ? frame->name[i] : 0;
+        g_aliases[i].value = (i < frame->n) ? frame->value[i] : 0;
+        if (i < frame->n) {
+            frame->name[i] = 0;
+            frame->value[i] = 0;
+        }
     }
 }
 
@@ -11249,7 +11327,7 @@ static void shell_print_alias(const struct shell_alias *a) {
 static void cmd_alias(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
+        for (int i = 0; i < g_naliases; i++) {
             if (g_aliases[i].name) shell_print_alias(&g_aliases[i]);
         }
         return;
@@ -15729,33 +15807,25 @@ static int g_capture_last_status;
  *     sayhi                             bash: sayhi: command not found
  *
  * tsh has no fork for `$( )` -- it runs the text in place -- so the table is
- * snapshotted and put back instead. Only the POINTERS are copied: a slot the
- * substitution left alone still holds the same string, and one it changed is
- * freed and restored. (Variables and functions leak the same way and are not
- * covered here; this is the case the corpus measures.) */
+ * copied and put back instead. (Variables and functions leak the same way and
+ * are not covered here; this is the case the corpus measures.)
+ *
+ * A COPY, NOT A SNAPSHOT OF POINTERS. The pointers were enough while the
+ * substitution only ADDED aliases; `unalias x` inside one freed x's strings
+ * and the restore then put the freed pointers back -- a use-after-free on
+ * the next `x`. With no aliases defined this costs nothing. */
 struct shell_alias_save {
-    char *name[SHELL_ALIAS_MAX];
-    char *value[SHELL_ALIAS_MAX];
+    struct shell_alias_frame f;
+    bool ok;
 };
 
 static void shell_alias_save(struct shell_alias_save *sv) {
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
-        sv->name[i] = g_aliases[i].name;
-        sv->value[i] = g_aliases[i].value;
-    }
+    sv->ok = (shell_alias_frame_capture(&sv->f) == 0);
 }
 
-static void shell_alias_restore(const struct shell_alias_save *sv) {
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
-        if (g_aliases[i].name != sv->name[i]) {
-            kfree(g_aliases[i].name);
-            g_aliases[i].name = sv->name[i];
-        }
-        if (g_aliases[i].value != sv->value[i]) {
-            kfree(g_aliases[i].value);
-            g_aliases[i].value = sv->value[i];
-        }
-    }
+static void shell_alias_restore(struct shell_alias_save *sv) {
+    if (sv->ok) shell_alias_frame_restore(&sv->f);
+    shell_alias_frame_clear(&sv->f);
 }
 
 /* `$(<file)` READS THE FILE. It is not a command substitution that happens to
@@ -27333,47 +27403,6 @@ static void shell_param_snapshot_restore(struct shell_param_snapshot *frame) {
     frame->positional_count = 0;
 }
 
-struct shell_alias_frame {
-    char *name[SHELL_ALIAS_MAX];
-    char *value[SHELL_ALIAS_MAX];
-};
-
-static void shell_alias_frame_clear(struct shell_alias_frame *frame) {
-    if (!frame) return;
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
-        if (frame->name[i]) kfree(frame->name[i]);
-        if (frame->value[i]) kfree(frame->value[i]);
-        frame->name[i] = 0;
-        frame->value[i] = 0;
-    }
-}
-
-static int shell_alias_frame_capture(struct shell_alias_frame *frame) {
-    if (!frame) return -1;
-    memset(frame, 0, sizeof(*frame));
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
-        if (!g_aliases[i].name) continue;
-        frame->name[i] = shell_strdup(g_aliases[i].name);
-        frame->value[i] = shell_strdup(g_aliases[i].value);
-        if (!frame->name[i] || !frame->value[i]) {
-            shell_alias_frame_clear(frame);
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static void shell_alias_frame_restore(struct shell_alias_frame *frame) {
-    if (!frame) return;
-    for (int i = 0; i < SHELL_ALIAS_MAX; i++) {
-        if (g_aliases[i].name) kfree(g_aliases[i].name);
-        if (g_aliases[i].value) kfree(g_aliases[i].value);
-        g_aliases[i].name = frame->name[i];
-        g_aliases[i].value = frame->value[i];
-        frame->name[i] = 0;
-        frame->value[i] = 0;
-    }
-}
 
 /* As many slots as the table had when the subshell started. */
 struct shell_function_frame {
