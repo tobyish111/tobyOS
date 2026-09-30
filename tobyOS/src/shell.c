@@ -141,7 +141,6 @@ extern volatile struct limine_module_request module_req;
 #define ARG_MAX  256
 #endif
 
-#define SHELL_HEREDOC_MAX 4
 #define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
 
 /* ---- GROWABLE TEXT: the buffers expansion writes into -------------------
@@ -756,8 +755,6 @@ struct shell_alias {
     char *value;
 };
 
-#define SHELL_FUNC_HEREDOC_MAX 4
-
 struct shell_function {
     char *name;
     char *body;
@@ -773,15 +770,19 @@ struct shell_function {
      * it -- at DEFINITION time -- and then resets the queue. By the time the
      * function is CALLED the body is long gone, and the call died with
      * "here-document body missing". So they are kept here and re-queued for
-     * each call. Heap strings, not the 64 KiB inline buffers the live queue
-     * uses: a function record is permanent and most have none of these. */
-    char *heredoc[SHELL_FUNC_HEREDOC_MAX];
-    bool  heredoc_expand[SHELL_FUNC_HEREDOC_MAX];   /* see shell_heredoc */
-    int   nheredoc;
+     * each call. As many as the definition had: it kept four, and a fifth
+     * body was dropped from the function. */
+    char **heredoc;
+    bool  *heredoc_expand;                          /* see shell_heredoc */
+    int    nheredoc;
 };
 
+/* One queued body. Each is its own heap record and the queue holds
+ * POINTERS: a command holds `body` from the moment its redirect is parsed
+ * until it runs, and several at once (`cmd <<A 3<<B`), so a body must not
+ * move when the queue grows. The queue held four 64 KiB inline bodies. */
 struct shell_heredoc {
-    char body[SHELL_HEREDOC_BODY_MAX];
+    char *body;
     size_t len;
     /* The body is still RAW and has to be expanded when it is used -- an
      * unquoted delimiter. See shell_heredoc_take(). */
@@ -862,8 +863,9 @@ static int g_naliases;                  /* slots, used or free */
  * table may move when it grows. */
 static struct shell_function *g_functions;
 static int g_nfunctions;                /* slots, used or free */
-static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
+static struct shell_heredoc **g_heredocs;
 static int g_heredoc_count;
+static int g_heredoc_cap;
 /* How many of them have been consumed. See shell_heredoc_pop. */
 static int g_heredoc_head;
 /* One slot per signal, plus EXIT at 0 and ERR at SHELL_TRAP_ERR. ERR is a
@@ -2625,6 +2627,10 @@ static int shell_function_set(const char *name, const char *body) {
     kfree(g_functions[idx].body);
     for (int i = 0; i < g_functions[idx].nheredoc; i++)
         kfree(g_functions[idx].heredoc[i]);
+    kfree(g_functions[idx].heredoc);
+    kfree(g_functions[idx].heredoc_expand);
+    g_functions[idx].heredoc = 0;
+    g_functions[idx].heredoc_expand = 0;
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
@@ -2633,13 +2639,24 @@ static int shell_function_set(const char *name, const char *body) {
      * They are still on the live queue at this moment -- the reader collects
      * per line and resets after the line is executed, and defining the
      * function IS that execution. */
-    for (int i = g_heredoc_head; i < g_heredoc_count &&
-                                 g_functions[idx].nheredoc < SHELL_FUNC_HEREDOC_MAX; i++) {
-        char *copy = shell_strdup(g_heredocs[i].body);
-        if (!copy) break;
-        g_functions[idx].heredoc_expand[g_functions[idx].nheredoc] =
-            g_heredocs[i].expand;
-        g_functions[idx].heredoc[g_functions[idx].nheredoc++] = copy;
+    int pending = g_heredoc_count - g_heredoc_head;
+    if (pending > 0) {
+        struct shell_function *fn = &g_functions[idx];
+        fn->heredoc = (char **)kmalloc((size_t)pending * sizeof(char *));
+        fn->heredoc_expand = (bool *)kmalloc((size_t)pending * sizeof(bool));
+        if (!fn->heredoc || !fn->heredoc_expand) {
+            kfree(fn->heredoc);
+            kfree(fn->heredoc_expand);
+            fn->heredoc = 0;
+            fn->heredoc_expand = 0;
+            return 0;
+        }
+        for (int i = g_heredoc_head; i < g_heredoc_count; i++) {
+            char *copy = shell_strdup(g_heredocs[i]->body);
+            if (!copy) break;
+            fn->heredoc_expand[fn->nheredoc] = g_heredocs[i]->expand;
+            fn->heredoc[fn->nheredoc++] = copy;
+        }
     }
     return 0;
 }
@@ -2652,6 +2669,10 @@ static void shell_function_unset(const char *name) {
     kfree(g_functions[idx].body);
     for (int i = 0; i < g_functions[idx].nheredoc; i++)
         kfree(g_functions[idx].heredoc[i]);
+    kfree(g_functions[idx].heredoc);
+    kfree(g_functions[idx].heredoc_expand);
+    g_functions[idx].heredoc = 0;
+    g_functions[idx].heredoc_expand = 0;
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = 0;
     g_functions[idx].body = 0;
@@ -2977,26 +2998,41 @@ static int shell_run_exit_trap(int status) {
     return final_status;
 }
 
+/* Empty the queue. Its records go too: nothing holds a body across a
+ * reset -- the reader resets between lines, and a function call swaps the
+ * whole queue out instead (shell_run_function). */
 static void shell_heredoc_reset(void) {
+    for (int i = 0; i < g_heredoc_count; i++) {
+        kfree(g_heredocs[i]->body);
+        kfree(g_heredocs[i]);
+        g_heredocs[i] = 0;
+    }
     g_heredoc_count = 0;
     g_heredoc_head = 0;
-    for (int i = 0; i < SHELL_HEREDOC_MAX; i++) {
-        g_heredocs[i].len = 0;
-        g_heredocs[i].body[0] = '\0';
-        g_heredocs[i].expand = false;
-    }
 }
 
 static int shell_heredoc_push(const char *body, size_t len, bool expand) {
-    if (g_heredoc_count >= SHELL_HEREDOC_MAX ||
-        len + 1 > SHELL_HEREDOC_BODY_MAX) {
-        return -1;
+    if (len + 1 > SHELL_HEREDOC_BODY_MAX) return -1;
+    if (g_heredoc_count >= g_heredoc_cap) {
+        int ncap = g_heredoc_cap ? g_heredoc_cap * 2 : 8;
+        struct shell_heredoc **nt =
+            (struct shell_heredoc **)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) return -1;
+        if (g_heredoc_count)
+            memcpy(nt, g_heredocs, (size_t)g_heredoc_count * sizeof *nt);
+        kfree(g_heredocs);
+        g_heredocs = nt;
+        g_heredoc_cap = ncap;
     }
-    struct shell_heredoc *h = &g_heredocs[g_heredoc_count++];
-    memcpy(h->body, body, len);
-    h->body[len] = '\0';
+    struct shell_heredoc *h = (struct shell_heredoc *)kmalloc(sizeof *h);
+    char *copy = (char *)kmalloc(len + 1);
+    if (!h || !copy) { kfree(h); kfree(copy); return -1; }
+    memcpy(copy, body, len);
+    copy[len] = '\0';
+    h->body = copy;
     h->len = len;
     h->expand = expand;
+    g_heredocs[g_heredoc_count++] = h;
     return 0;
 }
 
@@ -3017,7 +3053,7 @@ static int shell_heredoc_push(const char *body, size_t len, bool expand) {
  * runs, so returning a pointer to shared scratch would not do either. */
 static const struct shell_heredoc *shell_heredoc_pop(void) {
     if (g_heredoc_head >= g_heredoc_count) return 0;
-    return &g_heredocs[g_heredoc_head++];
+    return g_heredocs[g_heredoc_head++];
 }
 
 static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
@@ -3055,7 +3091,11 @@ static const struct shell_heredoc *shell_heredoc_take(void) {
                 (unsigned long)x.len, (unsigned)SHELL_HEREDOC_BODY_MAX - 1u);
         return 0;
     }
-    memcpy(h->body, x.p, x.len + 1);
+    char *nb = (char *)kmalloc(x.len + 1);
+    if (!nb) return 0;
+    memcpy(nb, x.p, x.len + 1);
+    kfree(h->body);
+    h->body = nb;
     h->len = x.len;
     h->expand = false;
     return h;
@@ -3076,40 +3116,50 @@ static const struct shell_heredoc *shell_heredoc_take(void) {
  * before every later one. A queue with nothing pending costs nothing. */
 struct shell_heredoc_mark {
     int head, count, n;
-    char *body[SHELL_HEREDOC_MAX];
-    size_t len[SHELL_HEREDOC_MAX];
-    bool expand[SHELL_HEREDOC_MAX];
+    struct shell_heredoc *saved;       /* n raw copies, on the heap */
 };
 
 static void shell_heredoc_mark_take(struct shell_heredoc_mark *m) {
     m->head = g_heredoc_head;
     m->count = g_heredoc_count;
     m->n = 0;
+    m->saved = 0;
+    int pending = g_heredoc_count - g_heredoc_head;
+    if (pending <= 0) return;
+    m->saved = (struct shell_heredoc *)kmalloc((size_t)pending *
+                                               sizeof *m->saved);
+    if (!m->saved) return;
     for (int i = g_heredoc_head; i < g_heredoc_count; i++) {
-        char *copy = (char *)kmalloc(g_heredocs[i].len + 1);
+        char *copy = (char *)kmalloc(g_heredocs[i]->len + 1);
         if (!copy) break;
-        memcpy(copy, g_heredocs[i].body, g_heredocs[i].len + 1);
-        m->body[m->n] = copy;
-        m->len[m->n] = g_heredocs[i].len;
-        m->expand[m->n] = g_heredocs[i].expand;
+        memcpy(copy, g_heredocs[i]->body, g_heredocs[i]->len + 1);
+        m->saved[m->n].body = copy;
+        m->saved[m->n].len = g_heredocs[i]->len;
+        m->saved[m->n].expand = g_heredocs[i]->expand;
         m->n++;
     }
 }
 
 static void shell_heredoc_mark_rewind(const struct shell_heredoc_mark *m) {
     if (m->n == 0) return;
-    for (int j = 0; j < m->n; j++) {
-        struct shell_heredoc *h = &g_heredocs[m->head + j];
-        memcpy(h->body, m->body[j], m->len[j] + 1);
-        h->len = m->len[j];
-        h->expand = m->expand[j];
+    for (int j = 0; j < m->n && m->head + j < g_heredoc_count; j++) {
+        struct shell_heredoc *h = g_heredocs[m->head + j];
+        char *copy = (char *)kmalloc(m->saved[j].len + 1);
+        if (!copy) continue;
+        memcpy(copy, m->saved[j].body, m->saved[j].len + 1);
+        kfree(h->body);
+        h->body = copy;
+        h->len = m->saved[j].len;
+        h->expand = m->saved[j].expand;
     }
     g_heredoc_head = m->head;
     g_heredoc_count = m->count;
 }
 
 static void shell_heredoc_mark_free(struct shell_heredoc_mark *m) {
-    for (int j = 0; j < m->n; j++) kfree(m->body[j]);
+    for (int j = 0; j < m->n; j++) kfree(m->saved[j].body);
+    kfree(m->saved);
+    m->saved = 0;
     m->n = 0;
 }
 
@@ -3216,28 +3266,29 @@ static void shell_hd_strip_tags(char *s) {
 
 /* The body a TAGGED `<<` names, as the redirection's text. Unexpanded
  * bodies are used where they sit -- the store outlives the command. An
- * unquoted delimiter's body is copied into a queue slot and expanded THERE
- * (shell_heredoc_take), because the stored text must stay raw for the next
- * loop pass or call. The slots are recycled once every one has been taken:
- * a taken body was copied into its pipe when the redirect was applied. */
-static const char *shell_hd_text_for(int id) {
+ * unquoted delimiter's body is expanded into `words`, the pipeline's own
+ * storage, which lives exactly as long as the command holding the text:
+ * the stored text must stay raw for the next loop pass or call.
+ *
+ * It went through four recycled queue slots, and the fifth `<<` in one
+ * command was "too many here-documents" -- or, once the slots had all been
+ * taken, overwrote a body a command parsed earlier still pointed at. */
+static const char *shell_hd_text_for(int id, struct shell_words *words) {
     if (id < 0 || id >= g_hd_cap || !g_hd_store[id].live) {
         kprintf("shell: here-document body missing\n");
         return 0;
     }
     struct shell_hd_entry *e = &g_hd_store[id];
     if (!e->expand) return e->body;
-    if (g_heredoc_count >= SHELL_HEREDOC_MAX &&
-        g_heredoc_head >= g_heredoc_count) {
-        g_heredoc_count = 0;
-        g_heredoc_head = 0;
-    }
-    if (shell_heredoc_push(e->body, e->len, true) < 0) {
-        kprintf("shell: too many here-documents in one command\n");
+    SH_SB(x);
+    if (shell_expand_literal_quotes(e->body, &x) < 0) return 0;
+    /* Same limit and the same words as shell_heredoc_take. */
+    if (x.len + 1 > SHELL_HEREDOC_BODY_MAX) {
+        kprintf("sh: here-document too large (%lu bytes; the limit is %u)\n",
+                (unsigned long)x.len, (unsigned)SHELL_HEREDOC_BODY_MAX - 1u);
         return 0;
     }
-    const struct shell_heredoc *h = shell_heredoc_take();
-    return h ? h->body : 0;
+    return words_store(words, x.p, x.len);
 }
 
 /* ---- cwd/path helpers ------------------------------------------- *
@@ -9268,10 +9319,23 @@ static int shell_collect_heredoc(char **pp, const char *delim,
 static bool shell_collect_line_heredocs(const char *line, const char *from,
                                         char **pp, char **tagged) {
     *tagged = 0;
-    struct shell_heredoc_spec hd[SHELL_HEREDOC_MAX];
-    int nhd = shell_line_find_heredocs(from, hd, SHELL_HEREDOC_MAX);
+    /* As many operators as the line has: it found four, and the bodies of
+     * a fifth and sixth were then read as commands. Every operator is a
+     * `<<`, so counting those bounds the tables. */
+    int maxhd = 0;
+    for (const char *q = from; q[0] && q[1]; q++)
+        if (q[0] == '<' && q[1] == '<') maxhd++;
+    if (maxhd == 0) return true;
+    struct shell_heredoc_spec *hd __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct shell_heredoc_spec *)kmalloc((size_t)maxhd * sizeof *hd);
+    int *ids __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc((size_t)maxhd * sizeof *ids);
+    if (!hd || !ids) {
+        kprintf("sh: out of memory reading here-documents\n");
+        return false;
+    }
+    int nhd = shell_line_find_heredocs(from, hd, maxhd);
     if (nhd == 0) return true;
-    int ids[SHELL_HEREDOC_MAX];
     for (int i = 0; i < nhd; i++) {
         ids[i] = shell_collect_heredoc(pp, hd[i].delim, hd[i].strip_tabs,
                                        hd[i].quoted);
@@ -22861,7 +22925,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 const char *hd_text = 0;
                 int hd_id;
                 if (shell_hd_tag_scan(tok[*io].text, &hd_id)) {
-                    hd_text = shell_hd_text_for(hd_id);
+                    hd_text = shell_hd_text_for(hd_id, &pl->words);
                     if (!hd_text) return -1;
                 } else {
                     if (g_heredoc_head >= g_heredoc_count) {
@@ -23962,14 +24026,16 @@ static int shell_run_function(struct shell_simple *cmd) {
      * `<<EOF` finds its text on THIS call and every later one. Saved and
      * restored around the call because the caller may have a queue of its own
      * part-way through. */
-    struct shell_heredoc *saved_hd = 0;
+    /* The caller's queue is SET ASIDE, not copied: its records stay where
+     * they are, so a body the caller's command already holds stays valid. */
+    bool swapped_hd = false;
+    struct shell_heredoc **saved_hd = g_heredocs;
     int saved_hd_count = g_heredoc_count, saved_hd_head = g_heredoc_head;
+    int saved_hd_cap = g_heredoc_cap;
     if (fn->nheredoc > 0) {
-        saved_hd = (struct shell_heredoc *)kmalloc(sizeof(*saved_hd) *
-                                                   SHELL_HEREDOC_MAX);
-        if (saved_hd) memcpy(saved_hd, g_heredocs,
-                             sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
-        shell_heredoc_reset();
+        swapped_hd = true;
+        g_heredocs = 0;
+        g_heredoc_count = g_heredoc_head = g_heredoc_cap = 0;
         for (int i = 0; i < fn->nheredoc; i++)
             (void)shell_heredoc_push(fn->heredoc[i], strlen(fn->heredoc[i]),
                                      fn->heredoc_expand[i]);
@@ -23999,11 +24065,13 @@ static int shell_run_function(struct shell_simple *cmd) {
     }
     kfree(run_body);
     kfree(run_name);
-    if (saved_hd) {
-        memcpy(g_heredocs, saved_hd, sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
+    if (swapped_hd) {
+        shell_heredoc_reset();
+        kfree(g_heredocs);
+        g_heredocs      = saved_hd;
         g_heredoc_count = saved_hd_count;
         g_heredoc_head  = saved_hd_head;
-        kfree(saved_hd);
+        g_heredoc_cap   = saved_hd_cap;
     }
     g_fn_depth--;
     g_errexit_negate = saved_ee_negate;
