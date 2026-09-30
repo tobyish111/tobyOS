@@ -141,7 +141,6 @@ extern volatile struct limine_module_request module_req;
 #define ARG_MAX  256
 #endif
 #define SHELL_ALIAS_MAX 32
-#define SHELL_FUNC_MAX 32
 #define SHELL_HEREDOC_MAX 4
 #define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
 
@@ -844,7 +843,13 @@ static void shell_hd_pin_text(const char *text, int delta);
 static void shell_hd_strip_tags(char *s);
 
 static struct shell_alias g_aliases[SHELL_ALIAS_MAX];
-static struct shell_function g_functions[SHELL_FUNC_MAX];
+/* GROWABLE. It held 32, so a script's 33rd function was "failed to define"
+ * and every call to it went looking for /bin/<name>. A slot is found by
+ * index and a lookup's pointer is used only until the body starts running
+ * (shell_run_function hands over fn->body, which lives elsewhere), so the
+ * table may move when it grows. */
+static struct shell_function *g_functions;
+static int g_nfunctions;                /* slots, used or free */
 static struct shell_heredoc g_heredocs[SHELL_HEREDOC_MAX];
 static int g_heredoc_count;
 /* How many of them have been consumed. See shell_heredoc_pop. */
@@ -2424,7 +2429,7 @@ static void shell_alias_clear_all(void) {
 
 static int shell_function_find(const char *name) {
     if (!name || !*name) return -1;
-    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+    for (int i = 0; i < g_nfunctions; i++) {
         if (g_functions[i].name && strcmp(g_functions[i].name, name) == 0) return i;
     }
     return -1;
@@ -2457,7 +2462,7 @@ static int shell_function_set(const char *name, const char *body) {
 
     int idx = shell_function_find(name);
     if (idx < 0) {
-        for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+        for (int i = 0; i < g_nfunctions; i++) {
             if (!g_functions[i].name) {
                 idx = i;
                 break;
@@ -2465,9 +2470,22 @@ static int shell_function_set(const char *name, const char *body) {
         }
     }
     if (idx < 0) {
-        kfree(ncopy);
-        kfree(bcopy);
-        return -1;
+        int ncap = g_nfunctions ? g_nfunctions * 2 : 32;
+        struct shell_function *nt =
+            (struct shell_function *)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) {
+            kfree(ncopy);
+            kfree(bcopy);
+            return -1;
+        }
+        if (g_nfunctions)
+            memcpy(nt, g_functions, (size_t)g_nfunctions * sizeof *nt);
+        memset(nt + g_nfunctions, 0,
+               (size_t)(ncap - g_nfunctions) * sizeof *nt);
+        kfree(g_functions);
+        g_functions = nt;
+        idx = g_nfunctions;
+        g_nfunctions = ncap;
     }
 
     /* THE BODY'S HERE-DOCUMENTS LIVE AS LONG AS THE FUNCTION: pin every
@@ -4566,8 +4584,11 @@ static void cmd_declare(int argc, char **argv) {
         if (i >= argc) {
             /* Sorted by name. bash's order is plain byte order -- `__ec`
              * before `_ab` before `add` -- not definition order. */
-            int idx[SHELL_FUNC_MAX], n = 0;
-            for (int k = 0; k < SHELL_FUNC_MAX; k++)
+            int *idx = g_nfunctions
+                ? (int *)kmalloc((size_t)g_nfunctions * sizeof *idx) : 0;
+            int n = 0;
+            if (g_nfunctions && !idx) { shell_set_status(1); return; }
+            for (int k = 0; k < g_nfunctions; k++)
                 if (g_functions[k].name) idx[n++] = k;
             for (int a = 1; a < n; a++) {
                 int v = idx[a], b = a - 1;
@@ -4584,6 +4605,7 @@ static void cmd_declare(int argc, char **argv) {
                 if (func_names) shell_printf("declare -f %s\n", fn->name);
                 else            shell_declare_print_function(fn);
             }
+            kfree(idx);
             return;
         }
         bool missing = false;
@@ -14793,13 +14815,25 @@ static void cmd_compopt(int argc, char **argv) {
  * The source is reported as "main": tsh does not track a script PATH, and
  * bash itself says "main" for a shell reading from -c or stdin, so this is
  * the true answer for how these scripts run rather than a placeholder. */
-#define CALLFRAME_MAX 16
+/* Growable: it kept 16 frames, so `caller` in a deeper call answered for
+ * the wrong one. A frame that cannot be stored is still counted. */
 struct callframe { unsigned long line; const char *name; };
-static struct callframe g_callframes[CALLFRAME_MAX];
+static struct callframe *g_callframes;
+static int g_callframe_cap;
 static int g_callframe_n;
 
 static void shell_callframe_push(const char *name, unsigned long line) {
-    if (g_callframe_n >= CALLFRAME_MAX) { g_callframe_n++; return; }
+    if (g_callframe_n >= g_callframe_cap) {
+        int ncap = g_callframe_cap ? g_callframe_cap * 2 : 16;
+        struct callframe *nf =
+            (struct callframe *)kmalloc((size_t)ncap * sizeof *nf);
+        if (!nf) { g_callframe_n++; return; }
+        if (g_callframe_cap)
+            memcpy(nf, g_callframes, (size_t)g_callframe_cap * sizeof *nf);
+        kfree(g_callframes);
+        g_callframes = nf;
+        g_callframe_cap = ncap;
+    }
     g_callframes[g_callframe_n].line = line;
     g_callframes[g_callframe_n].name = name;
     g_callframe_n++;
@@ -14822,7 +14856,7 @@ static void cmd_caller(int argc, char **argv) {
             return;
         }
     }
-    int depth = g_callframe_n < CALLFRAME_MAX ? g_callframe_n : CALLFRAME_MAX;
+    int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
     if (want >= depth) { shell_set_status(1); return; }
     const struct callframe *f = &g_callframes[depth - 1 - want];
     if (argc > 1)
@@ -23711,9 +23745,29 @@ static int shell_run_function(struct shell_simple *cmd) {
     }
     /* Record the CALL SITE so `caller` can report it. g_shell_lineno is
      * still the caller's line at this point; it moves as the body runs. */
-    shell_callframe_push(fn->name, g_shell_lineno);
-    execute_line_text(fn->body);
-    shell_callframe_pop();
+    /* THE CALL RUNS A COPY. A body may redefine or unset its own function
+     *
+     *     g() { g() { echo second; }; echo first; }; g; g
+     *
+     * and shell_function_set frees the old text -- which was the text being
+     * executed, and whose name the call frame pointed at. bash finishes the
+     * running body; so does this. The copy holds its own here-document pins
+     * for as long as it runs, as the stored body does for as long as it is
+     * defined. */
+    char *run_body = shell_strdup(fn->body);
+    char *run_name = shell_strdup(fn->name);
+    if (run_body && run_name) {
+        shell_hd_pin_text(run_body, +1);
+        shell_callframe_push(run_name, g_shell_lineno);
+        execute_line_text(run_body);
+        shell_callframe_pop();
+        shell_hd_pin_text(run_body, -1);
+    } else {
+        kprintf("shell: out of memory calling a function\n");
+        shell_set_status(1);
+    }
+    kfree(run_body);
+    kfree(run_name);
     if (saved_hd) {
         memcpy(g_heredocs, saved_hd, sizeof(*saved_hd) * SHELL_HEREDOC_MAX);
         g_heredoc_count = saved_hd_count;
@@ -27321,25 +27375,41 @@ static void shell_alias_frame_restore(struct shell_alias_frame *frame) {
     }
 }
 
+/* As many slots as the table had when the subshell started. */
 struct shell_function_frame {
-    char *name[SHELL_FUNC_MAX];
-    char *body[SHELL_FUNC_MAX];
+    int n;
+    char **name;
+    char **body;
 };
 
 static void shell_function_frame_clear(struct shell_function_frame *frame) {
     if (!frame) return;
-    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
-        if (frame->name[i]) kfree(frame->name[i]);
-        if (frame->body[i]) kfree(frame->body[i]);
-        frame->name[i] = 0;
-        frame->body[i] = 0;
+    for (int i = 0; i < frame->n; i++) {
+        if (frame->name && frame->name[i]) kfree(frame->name[i]);
+        if (frame->body && frame->body[i]) kfree(frame->body[i]);
     }
+    kfree(frame->name);
+    kfree(frame->body);
+    frame->name = frame->body = 0;
+    frame->n = 0;
 }
 
 static int shell_function_frame_capture(struct shell_function_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
-    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+    if (g_nfunctions == 0) return 0;
+    frame->name = (char **)kmalloc((size_t)g_nfunctions * sizeof(char *));
+    frame->body = (char **)kmalloc((size_t)g_nfunctions * sizeof(char *));
+    if (!frame->name || !frame->body) {
+        kfree(frame->name);
+        kfree(frame->body);
+        frame->name = frame->body = 0;
+        return -1;
+    }
+    frame->n = g_nfunctions;
+    memset(frame->name, 0, (size_t)frame->n * sizeof(char *));
+    memset(frame->body, 0, (size_t)frame->n * sizeof(char *));
+    for (int i = 0; i < frame->n; i++) {
         if (!g_functions[i].name) continue;
         frame->name[i] = shell_strdup(g_functions[i].name);
         frame->body[i] = shell_strdup(g_functions[i].body);
@@ -27353,13 +27423,17 @@ static int shell_function_frame_capture(struct shell_function_frame *frame) {
 
 static void shell_function_frame_restore(struct shell_function_frame *frame) {
     if (!frame) return;
-    for (int i = 0; i < SHELL_FUNC_MAX; i++) {
+    /* The table may have grown inside the subshell: slots past what was
+     * saved held nothing before it, and hold nothing after. */
+    for (int i = 0; i < g_nfunctions; i++) {
         if (g_functions[i].name) kfree(g_functions[i].name);
         if (g_functions[i].body) kfree(g_functions[i].body);
-        g_functions[i].name = frame->name[i];
-        g_functions[i].body = frame->body[i];
-        frame->name[i] = 0;
-        frame->body[i] = 0;
+        g_functions[i].name = (i < frame->n) ? frame->name[i] : 0;
+        g_functions[i].body = (i < frame->n) ? frame->body[i] : 0;
+        if (i < frame->n) {
+            frame->name[i] = 0;
+            frame->body[i] = 0;
+        }
     }
 }
 
