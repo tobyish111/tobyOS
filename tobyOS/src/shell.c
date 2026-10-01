@@ -1278,16 +1278,39 @@ static const char *shell_job_status_word(int code, int sig, char *buf,
     return buf;
 }
 
-/* A FOREGROUND JOB KILLED BY A SIGNAL, at an interactive prompt. bash moves
- * to a fresh line after ^C (the tty has echoed "^C" and nothing else) and
- * names any other signal on stderr -- except SIGPIPE, which it does not
- * report. Measured on this kernel's bash: ttyparity 06 and 14. */
-static void shell_report_fg_death(void) {
-    int sig = proc_last_term_sig();
-    if (!g_interactive || sig <= 0) return;
-    if (sig == SIGINT) { shell_write("\n"); return; }
-    if (sig == SIGPIPE) return;
-    kprintf("%s\n", shell_signal_desc(sig));
+/* bash's report of a job a SIGNAL killed (`sig`, 0 = it exited: nothing).
+ * Measured on this kernel's bash -- logs/k23/sigreport-bash.txt,
+ * logs/k23/report-forms.txt, ttyparity 06 and 14:
+ *   interactive, foreground: a newline after ^C (the tty has echoed "^C"
+ *     and nothing else); otherwise the signal's description alone on
+ *     stderr -- nothing for SIGPIPE.
+ *   interactive, background: announced at the next prompt instead
+ *     (shell_notify_jobs_hosted), not here.
+ *   not interactive: "$0: line N:  PID DESCRIPTION  COMMAND" on the shell's
+ *     stderr, for a foreground job and for a background one that `wait`
+ *     reaps -- inside wait's redirections, so `wait $! 2>err.txt` puts it
+ *     in err.txt (Oils 0488). Nothing for SIGINT or SIGPIPE; SIGTERM only
+ *     for a foreground job, and then as the bare word.
+ * bash's COMMAND is the source text of the command; tsh has the words
+ * after expansion, which are the same for a plain command. */
+static void shell_report_job_death(int pid, int sig, const char *cmd,
+                                   bool fg) {
+    if (sig <= 0) return;
+    if (g_interactive) {
+        if (!fg) return;
+        if (sig == SIGINT) { shell_write("\n"); return; }
+        if (sig == SIGPIPE) return;
+        kprintf("%s\n", shell_signal_desc(sig));
+        return;
+    }
+    if (sig == SIGINT || sig == SIGPIPE) return;
+    if (sig == SIGTERM) {
+        if (fg) kprintf("Terminated\n");
+        return;
+    }
+    kprintf("%s: line %lu: %5d %-24s%s\n", g_param0 ? g_param0 : "tsh",
+            (unsigned long)g_shell_lineno, pid, shell_signal_desc(sig),
+            cmd ? cmd : "");
 }
 
 #ifdef SHELL_HOSTED
@@ -7227,7 +7250,7 @@ static void cmd_fg(int argc, char **argv) {
             shell_set_status(128 + ssig);
             return;
         }
-        shell_report_fg_death();
+        shell_report_job_death(pid, proc_last_term_sig(), saved_name, true);
         struct job *j2 = jobs_find(jid);
         if (j2) jobs_remove(j2);
         shell_set_status(frc);
@@ -7303,14 +7326,16 @@ static int shell_wait_job(struct job *j) {
         jobs_remove(j);
         return 127;
     }
+    int sig = proc_last_term_sig();
     if (g_opt_monitor && g_interactive) {
         /* bash announces even a wait-consumed job at the next prompt;
          * leave the corpse for the notifier instead of removing it. */
         j->dead = true;
         j->code = rc;
-        j->sig  = proc_last_term_sig();
+        j->sig  = sig;
         return rc;
     }
+    shell_report_job_death(pid, sig, j->name, false);
     jobs_remove(j);
     return rc;
 }
@@ -16139,12 +16164,20 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                          jid > 0 ? jid : 0, jname);
             return 128 + ssig;
         }
-        shell_report_fg_death();
+        shell_report_job_death(pid, proc_last_term_sig(), 0, true);
         return frc;
     }
     signal_set_foreground(pid);
     int rc = proc_wait(pid);
     signal_set_foreground(0);
+    {
+        int sig = proc_last_term_sig();
+        if (sig > 0) {
+            char text[256];
+            jobs_join_argv(argv, text, sizeof text);
+            shell_report_job_death(pid, sig, text, true);
+        }
+    }
     return rc;
 }
 
