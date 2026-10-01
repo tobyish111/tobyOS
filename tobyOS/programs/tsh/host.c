@@ -954,6 +954,11 @@ int main(int argc, char **argv) {
         return shell_run_script_hosted(argv[1]);
     }
 
+    /* bash gives a shell at a terminal HISTSIZE=500 when it has none, and
+     * that is the bound on its history; tsh's list has no other (S6). */
+    if (isatty(0) && !shell_get_var_hosted("HISTSIZE"))
+        shell_set_var_hosted("HISTSIZE", "500");
+
     /* Interactive: one line at a time. Deliberately not the kernel's raw-mode
      * editor -- history and cursor keys are a separate concern from the
      * language, and this keeps the hosted path free of terminal state. */

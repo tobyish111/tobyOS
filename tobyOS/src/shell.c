@@ -494,13 +494,29 @@ static void shell_kprintf(const char *fmt, ...);
 #define kprintf(...) shell_kprintf(__VA_ARGS__)
 #endif
 
-/* Command history, kept so `fc` has something to list and re-run. A ring:
- * g_hist_base is the history number of slot 0, so numbers keep climbing as
- * entries are overwritten. */
-#define SHELL_HIST_MAX 128
-static char *g_hist[SHELL_HIST_MAX];
-static int g_hist_count;          /* entries currently held (<= MAX) */
-static unsigned long g_hist_base; /* history number of the oldest entry */
+/* Command history: what `history` lists, `fc` re-runs and both line editors
+ * walk. NO FIXED SIZE (S6, 2026-10-01): it was a ring of 128, and a script
+ * could not turn it on at all (`set -o history` was an unknown option). The
+ * bound is bash's, $HISTSIZE -- see shell_hist_var_written. g_hist_base + 1
+ * is the history number of slot 0. */
+static char **g_hist;
+static int g_hist_count;          /* entries held */
+static int g_hist_cap;            /* slots allocated */
+static unsigned long g_hist_base;
+/* bash's bookkeeping, under bash's names: hist_last_line_added (the line
+ * being run was recorded), hist_last_line_pushed (`history -s` has already
+ * replaced it), history_lines_this_session (what -a appends),
+ * history_lines_in_file (where -n resumes), and the stifle bound (-1:
+ * none). */
+static bool g_hist_line_added;
+static bool g_hist_line_pushed;
+static long g_hist_session;
+static long g_hist_in_file;
+static long g_hist_max = -1;
+static void shell_hist_var_written(const char *key, size_t klen);
+static void shell_history_add_raw(const char *raw, const char *raw_base,
+                                  const char *from, const char *to,
+                                  bool heredoc);
 
 /* $LINENO: line number of the command currently executing, counted within the
  * script (or from shell start for interactive input). */
@@ -826,6 +842,10 @@ static bool g_opt_hashall = true;
 static bool g_opt_emacs;
 static bool g_opt_vi;
 static bool g_opt_expand_aliases;
+/* `set -o history`: record the lines the shell reads. On at a terminal, off
+ * in a script and for -c, as in bash -- shell_set_interactive_hosted. It was
+ * not an option at all until S6. */
+static bool g_opt_history = true;
 /* True for a terminal session, false while running a script or `-c`. The
  * kernel shell is always a terminal session, so this defaults true and only
  * the hosted entry points clear it. */
@@ -1164,8 +1184,12 @@ void shell_printf(const char *fmt, ...) {
  *   - lets the user query (`jobs`) or foreground (`fg <id>`) them
  */
 
-#define JOB_MAX       8
-#define JOB_NAME_MAX  32
+/* NO FIXED SIZE (S6, 2026-10-01). The table held 8 jobs with 31-byte names:
+ * a ninth `cmd &` was not tracked at all -- `jobs` did not list it and a bare
+ * `wait` did not wait for it. The table grows; each entry is allocated once
+ * and never moves, so a `struct job *` held across a wait (where a trap may
+ * start another job) stays valid. JOB_MAX is the slot count, used or not. */
+#define JOB_MAX g_jobs_cap
 
 struct job {
     int  id;                   /* shell-assigned, 1..  -- 0 = empty slot */
@@ -1175,11 +1199,12 @@ struct job {
                                 * (bash reports even wait-consumed jobs) */
     int  code;                 /* exit code when dead */
     int  sig;                  /* ...and the signal that killed it, or 0 */
-    char name[JOB_NAME_MAX];   /* command text for display */
+    char *name;                /* command text for display, on the heap; set
+                                * whenever id != 0 */
 };
 
-static struct job g_jobs[JOB_MAX];
-static int        g_next_job_id = 1;
+static struct job **g_jobs;
+static int          g_jobs_cap;
 
 /* Job-control seams, ONE code path for both hosts now: proc_wait_fg comes
  * from proc.c (kernel) or host.c (hosted, over waitpid WUNTRACED); the
@@ -1194,60 +1219,113 @@ static void shell_tty_set_fg_pgrp(int pgrp) {
 }
 #endif
 
-/* bash displays a job by its COMMAND TEXT ("sleep 30"), not argv[0]. */
-static void jobs_join_argv(char **argv, char *out, size_t cap) {
+/* bash displays a job by its COMMAND TEXT ("sleep 30"), not argv[0] -- all
+ * of it, on the heap (the caller frees it; NULL when out of memory). */
+static char *jobs_join_argv(char **argv) {
+    size_t n = 1;
+    for (int i = 0; argv && argv[i]; i++) n += strlen(argv[i]) + 1;
+    char *out = (char *)kmalloc(n);
+    if (!out) return 0;
     size_t o = 0;
     for (int i = 0; argv && argv[i]; i++) {
-        if (i && o + 1 < cap) out[o++] = ' ';
-        for (const char *p = argv[i]; *p && o + 1 < cap; p++) out[o++] = *p;
+        if (i) out[o++] = ' ';
+        size_t l = strlen(argv[i]);
+        memcpy(out + o, argv[i], l);
+        o += l;
     }
-    out[o < cap ? o : cap - 1] = '\0';
+    out[o] = '\0';
+    return out;
 }
 
 /* The most recent job wears bash's `+`. */
 static struct job *jobs_newest(void) {
     struct job *best = 0;
     for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i].id && !g_jobs[i].dead &&
-            (!best || g_jobs[i].id > best->id))
-            best = &g_jobs[i];
+        if (g_jobs[i]->id && !g_jobs[i]->dead &&
+            (!best || g_jobs[i]->id > best->id))
+            best = g_jobs[i];
     return best;
 }
 
-static int jobs_add(int pid, const char *name) {
-    for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0) {
-            g_jobs[i].id  = g_next_job_id++;
-            g_jobs[i].pid = pid;
-            g_jobs[i].stopped = false;
-            g_jobs[i].dead = false;
-            g_jobs[i].code = 0;
-            g_jobs[i].sig  = 0;
-            size_t n = 0;
-            if (name) {
-                while (n + 1 < JOB_NAME_MAX && name[n]) {
-                    g_jobs[i].name[n] = name[n]; n++;
-                }
-            }
-            g_jobs[i].name[n] = 0;
-            shell_hd_strip_tags(g_jobs[i].name);   /* see SHELL_HD_TAG */
-            return g_jobs[i].id;
+/* The one before the newest: bash's `-`. */
+static struct job *jobs_previous(const struct job *newest) {
+    struct job *best = 0;
+    if (!newest) return 0;
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id && !g_jobs[i]->dead &&
+            g_jobs[i]->id < newest->id &&
+            (!best || g_jobs[i]->id > best->id))
+            best = g_jobs[i];
+    return best;
+}
+
+/* Twice the slots when none is free. Old entries keep their addresses. */
+static bool jobs_grow(void) {
+    int ncap = g_jobs_cap ? g_jobs_cap * 2 : 8;
+    struct job **nv = (struct job **)kmalloc((size_t)ncap * sizeof *nv);
+    if (!nv) return false;
+    for (int i = 0; i < g_jobs_cap; i++) nv[i] = g_jobs[i];
+    for (int i = g_jobs_cap; i < ncap; i++) {
+        nv[i] = (struct job *)kcalloc(1, sizeof(struct job));
+        if (!nv[i]) {
+            while (--i >= g_jobs_cap) kfree(nv[i]);
+            kfree(nv);
+            return false;
         }
     }
-    return -1;       /* table full */
+    if (g_jobs) kfree(g_jobs);
+    g_jobs = nv;
+    g_jobs_cap = ncap;
+    return true;
+}
+
+static int jobs_add(int pid, const char *name) {
+    int slot = -1;
+    for (int i = 0; i < JOB_MAX && slot < 0; i++)
+        if (g_jobs[i]->id == 0) slot = i;
+    if (slot < 0) {
+        slot = g_jobs_cap;
+        if (!jobs_grow()) return -1;          /* out of memory */
+    }
+    size_t n = name ? strlen(name) : 0;
+    char *copy = (char *)kmalloc(n + 1);
+    if (!copy) return -1;
+    if (n) memcpy(copy, name, n);
+    copy[n] = '\0';
+    shell_hd_strip_tags(copy);                 /* see SHELL_HD_TAG */
+    /* bash's job number: one past the highest job still in the table, and
+     * 1 again once the table is empty -- tsh counted up forever, so the
+     * twelve jobs after four reaped ones were [5]..[16] where bash says
+     * [1]..[12] (logs/s6/before-jobs-guest.bash). bash's non-interactive
+     * table also wraps round to fill a hole when its 8-slot block is
+     * full; that is not modelled. */
+    int top = 0;
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id > top) top = g_jobs[i]->id;
+    struct job *j = g_jobs[slot];
+    /* A slot `disown` emptied still owns its old name. */
+    if (j->name) kfree(j->name);
+    j->name = copy;
+    j->id  = top + 1;
+    j->pid = pid;
+    j->stopped = false;
+    j->dead = false;
+    j->code = 0;
+    j->sig  = 0;
+    return j->id;
 }
 
 static struct job *jobs_find(int id) {
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == id && !g_jobs[i].dead) return &g_jobs[i];
+        if (g_jobs[i]->id == id && !g_jobs[i]->dead) return g_jobs[i];
     }
     return 0;
 }
 
 static struct job *jobs_find_pid(int pid) {
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id != 0 && !g_jobs[i].dead &&
-            g_jobs[i].pid == pid) return &g_jobs[i];
+        if (g_jobs[i]->id != 0 && !g_jobs[i]->dead &&
+            g_jobs[i]->pid == pid) return g_jobs[i];
     }
     return 0;
 }
@@ -1256,7 +1334,8 @@ static void jobs_remove(struct job *j) {
     if (!j) return;
     j->id  = 0;
     j->pid = 0;
-    j->name[0] = 0;
+    if (j->name) kfree(j->name);
+    j->name = 0;
 }
 
 /* Called from shell_poll(): for every tracked bg job, ask the kernel
@@ -1345,16 +1424,16 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
 void shell_notify_jobs_hosted(void) {
     extern int proc_try_reap(int pid, int *code);
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0) continue;
+        if (g_jobs[i]->id == 0) continue;
         int code = 0, sig = 0;
         int r;
-        if (g_jobs[i].dead) {
+        if (g_jobs[i]->dead) {
             /* Reaped by `wait`; bash still announces it here. */
             r = 1;
-            code = g_jobs[i].code;
-            sig  = g_jobs[i].sig;
+            code = g_jobs[i]->code;
+            sig  = g_jobs[i]->sig;
         } else {
-            r = proc_try_reap(g_jobs[i].pid, &code);
+            r = proc_try_reap(g_jobs[i]->pid, &code);
             if (r == 1) sig = proc_last_term_sig();
         }
         if (r == 0) continue;
@@ -1368,33 +1447,33 @@ void shell_notify_jobs_hosted(void) {
         {
             int maxid = 0;
             for (int k = 0; k < JOB_MAX; k++)
-                if (g_jobs[k].id > maxid) maxid = g_jobs[k].id;
-            if (g_jobs[i].id == maxid) mark = '+';
+                if (g_jobs[k]->id > maxid) maxid = g_jobs[k]->id;
+            if (g_jobs[i]->id == maxid) mark = '+';
         }
-        shell_printf("[%d]%c  %-24s%s\n", g_jobs[i].id, mark, what,
-                     g_jobs[i].name);
-        jobs_remove(&g_jobs[i]);
+        shell_printf("[%d]%c  %-24s%s\n", g_jobs[i]->id, mark, what,
+                     g_jobs[i]->name);
+        jobs_remove(g_jobs[i]);
     }
 }
 #endif
 
 static void jobs_reap_finished(void) {
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0) continue;
-        struct proc *p = proc_lookup(g_jobs[i].pid);
+        if (g_jobs[i]->id == 0) continue;
+        struct proc *p = proc_lookup(g_jobs[i]->pid);
         if (!p) {
             kprintf("[%d] removed (pid=%d gone)\n",
-                    g_jobs[i].id, g_jobs[i].pid);
-            jobs_remove(&g_jobs[i]);
+                    g_jobs[i]->id, g_jobs[i]->pid);
+            jobs_remove(g_jobs[i]);
             continue;
         }
         if (p->state == PROC_TERMINATED) {
-            int jid = g_jobs[i].id;
-            int pid = g_jobs[i].pid;
+            int jid = g_jobs[i]->id;
+            int pid = g_jobs[i]->pid;
             int rc  = proc_wait(pid);   /* doesn't block; just reaps */
             kprintf("\n[%d] done  pid=%d  '%s'  exit=%d (0x%x)\n",
-                    jid, pid, g_jobs[i].name, rc, (unsigned)rc);
-            jobs_remove(&g_jobs[i]);
+                    jid, pid, g_jobs[i]->name, rc, (unsigned)rc);
+            jobs_remove(g_jobs[i]);
             /* Reprint the prompt so the user gets a clean line back. */
             prompt();
             for (size_t k = 0; k < line_len; k++) shell_putc(line[k]);
@@ -2465,6 +2544,7 @@ static int env_set_kv(const char *kv_in) {
         g_env[idx] = blob;
         if (g_opt_allexport) g_env_flags[idx] |= SHVAR_EXPORTED;
         shell_getopts_note_external_optind_write(kv_in, klen);
+        shell_hist_var_written(kv_in, klen);
         return 0;
     }
     if (!env_reserve(g_envc + 1)) {
@@ -2476,6 +2556,7 @@ static int env_set_kv(const char *kv_in) {
     g_env[g_envc++] = blob;
     g_env[g_envc]   = 0;
     shell_getopts_note_external_optind_write(kv_in, klen);
+    shell_hist_var_written(kv_in, klen);
     return 0;
 }
 
@@ -2526,6 +2607,7 @@ static int env_unset(const char *key) {
     int idx = env_find(key, klen);
     if (idx >= 0) env_remove_at(idx);
     shell_getopts_note_external_optind_write(key, klen);
+    shell_hist_var_written(key, klen);
     return 0;
 }
 
@@ -5802,7 +5884,7 @@ static bool shell_set_opt(char c, bool on) {
 static void shell_print_options(bool reinput) {
     const struct { const char *name; bool on; } t[] = {
         { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
-        { "hashall",   g_opt_hashall },
+        { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
         { "ignoreeof", g_opt_ignoreeof }, { "monitor",   g_opt_monitor },
         { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
         { "noglob",    g_opt_noglob },    { "nolog",     g_opt_nolog },
@@ -5829,7 +5911,8 @@ static void shell_print_options(bool reinput) {
 static bool shell_opt_state_by_name(const char *name, bool *out) {
     const struct { const char *name; bool on; } t[] = {
         { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
-        { "hashall",   g_opt_hashall },   { "ignoreeof", g_opt_ignoreeof },
+        { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
+        { "ignoreeof", g_opt_ignoreeof },
         { "monitor",   g_opt_monitor },   { "noclobber", g_opt_noclobber },
         { "noexec",    g_opt_noexec },    { "noglob",    g_opt_noglob },
         { "nolog",     g_opt_nolog },     { "notify",    g_opt_notify },
@@ -5855,6 +5938,7 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
     if (strcmp(name, "posix")     == 0) { g_opt_posix     = on; return true; }
     if (strcmp(name, "ignoreeof") == 0) { g_opt_ignoreeof = on; return true; }
     if (strcmp(name, "nolog")     == 0) { g_opt_nolog     = on; return true; }
+    if (strcmp(name, "history")   == 0) { g_opt_history   = on; return true; }
     for (size_t i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
         if (strcmp(name, map[i].name) == 0)
             return shell_set_opt(map[i].flag, on);
@@ -5894,6 +5978,7 @@ static bool shell_option_is_set(const char *name) {
     if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
     if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
     if (strcmp(name, "hashall")   == 0) return g_opt_hashall;
+    if (strcmp(name, "history")   == 0) return g_opt_history;
     if (strcmp(name, "emacs")     == 0) return g_opt_emacs;
     if (strcmp(name, "vi")        == 0) return g_opt_vi;
     return false;
@@ -7312,38 +7397,59 @@ static void cmd_jobs(int argc, char **argv) {
     for (int i = 1; i < argc; i++)
         if (strcmp(argv[i], "-p") == 0) pids_only = true;
 
+    /* In JOB-NUMBER order, as bash lists them: a slot freed and reused
+     * holds a newer job than the slots after it. */
+    struct job *newest = jobs_newest();
+    struct job *prev = jobs_previous(newest);
     int shown = 0;
-    for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0 || g_jobs[i].dead) continue;
+    int last_id = 0;
+    for (;;) {
+        struct job *j = 0;
+        for (int i = 0; i < JOB_MAX; i++) {
+            struct job *c = g_jobs[i];
+            if (c->id <= last_id || c->dead) continue;
+            if (!j || c->id < j->id) j = c;
+        }
+        if (!j) break;
+        last_id = j->id;
         if (pids_only) {
-            shell_printf("%d\n", g_jobs[i].pid);
+            shell_printf("%d\n", j->pid);
             shown++;
             continue;
         }
-        if (g_opt_monitor) {
-            /* bash's table: no pids (a pid in the line would make every
-             * transcript comparison nondeterministic), `+` on the newest. */
-            struct job *newest = jobs_newest();
-            char mark = (newest && newest->id == g_jobs[i].id) ? '+' : ' ';
-            if (g_jobs[i].stopped)
-                shell_printf("[%d]%c  Stopped                 %s\n",
-                             g_jobs[i].id, mark, g_jobs[i].name);
-            else
-                shell_printf("[%d]%c  Running                 %s &\n",
-                             g_jobs[i].id, mark, g_jobs[i].name);
+#ifndef SHELL_HOSTED
+        if (!g_opt_monitor) {
+            struct proc *p = proc_lookup(j->pid);
+            const char *st = p ? proc_state_name(p->state) : "GONE";
+            shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
+                    j->id, j->pid, st, j->name);
             shown++;
             continue;
         }
-        struct proc *p = proc_lookup(g_jobs[i].pid);
-        const char *st = p ? proc_state_name(p->state) : "GONE";
-        shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
-                g_jobs[i].id, g_jobs[i].pid, st, g_jobs[i].name);
+#endif
+        /* bash's table: no pids (a pid in the line would make every
+         * transcript comparison nondeterministic), `+` on the newest and
+         * `-` on the one before it. /bin/tsh prints it in a script too:
+         * bash does, and the kernel console's own table below called
+         * proc_lookup, which the hosted build does not have -- `jobs` in a
+         * script said "proc_lookup: kernel-only" (S6). */
+        char mark = (j == newest) ? '+' : (j == prev) ? '-' : ' ';
+        if (j->stopped)
+            shell_printf("[%d]%c  Stopped                 %s\n",
+                         j->id, mark, j->name);
+        else
+            shell_printf("[%d]%c  Running                 %s &\n",
+                         j->id, mark, j->name);
         shown++;
     }
     /* bash prints NOTHING for an empty table; the friendly line is the
      * kernel console's, where there is no oracle to diverge from. */
+#ifndef SHELL_HOSTED
     if (shown == 0 && !pids_only && !g_opt_monitor)
         shell_printf("  (no background jobs)\n");
+#else
+    (void)shown;
+#endif
 }
 
 static int parse_int(const char *s, int *out) {
@@ -7366,9 +7472,9 @@ static struct job *jobs_by_spec(const char *s) {
     if (strcmp(s, "%-") == 0) {
         struct job *newest = jobs_newest(), *second = 0;
         for (int i = 0; i < JOB_MAX; i++) {
-            if (!g_jobs[i].id) continue;
-            if (newest && g_jobs[i].id == newest->id) continue;
-            if (!second || g_jobs[i].id > second->id) second = &g_jobs[i];
+            if (!g_jobs[i]->id) continue;
+            if (newest && g_jobs[i]->id == newest->id) continue;
+            if (!second || g_jobs[i]->id > second->id) second = g_jobs[i];
         }
         return second;
     }
@@ -7411,12 +7517,11 @@ static void cmd_fg(int argc, char **argv) {
         }
     }
     int pid = j->pid;
-    /* Snapshot the name into a local buffer because the job slot may
-     * be cleared during proc_wait/reap and we still want to print it. */
-    char saved_name[JOB_NAME_MAX];
-    size_t n = 0;
-    while (n + 1 < JOB_NAME_MAX && j->name[n]) { saved_name[n] = j->name[n]; n++; }
-    saved_name[n] = 0;
+    /* Snapshot the name because the job slot may be cleared during
+     * proc_wait/reap and we still want to print it. */
+    char *saved_heap __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_strdup(j->name);
+    const char *saved_name = saved_heap ? saved_heap : "";
 
     if (g_opt_monitor) {
         /* bash: fg prints the command text, hands the tty to the job's
@@ -7544,8 +7649,8 @@ static void cmd_wait(int argc, char **argv) {
         for (;;) {
             struct job *j = 0;
             for (int i = 0; i < JOB_MAX; i++) {
-                if (g_jobs[i].id != 0 && !g_jobs[i].dead) {
-                    j = &g_jobs[i];
+                if (g_jobs[i]->id != 0 && !g_jobs[i]->dead) {
+                    j = g_jobs[i];
                     break;
                 }
             }
@@ -11278,6 +11383,9 @@ static long shell_funcnest_max(void) {
  * ordinary reader. See eval_mode below. */
 static bool g_reader_eval_pending;
 static int  g_eval_reader_depth;
+/* Set by shell_run_script_hosted for the reader of the script /bin/tsh was
+ * started on -- the one reader that records history (see hist_reader). */
+static bool g_reader_main_script;
 
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
@@ -11295,6 +11403,18 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
      *     nesting bound, and its lines count on from the caller's. */
     bool eval_mode = g_reader_eval_pending;
     g_reader_eval_pending = false;
+    /* HISTORY (S6). The MAIN script's reader records each unit it reads
+     * while `set -o history` is on, as bash's does; a sourced file, eval,
+     * $(...) and -c do not. It records the unit as written in the file, so
+     * the first time it needs to it keeps an untouched copy of the rest of
+     * the script: the reader cuts lines and strips comments in place.
+     * A unit that spans lines is recorded with its newlines -- bash joins
+     * most of them with "; " (its cmdhist rules), which this does not
+     * reproduce. */
+    bool hist_reader = g_reader_main_script && !eval_mode;
+    g_reader_main_script = false;
+    char *hist_raw = 0;
+    const char *hist_raw_base = 0;
     if (shell_stack_exhausted(eval_mode ? g_eval_reader_depth
                                         : g_script_depth)) {
         kprintf("sh: script nesting too deep\n");
@@ -11322,6 +11442,10 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         g_shell_lineno++;
         unsigned long line_first = g_shell_lineno;
         char *line_start = p;
+        if (hist_reader && g_opt_history && !hist_raw) {
+            hist_raw = shell_strdup(p);
+            hist_raw_base = p;
+        }
         while (*p && *p != '\n' && *p != '\r') p++;
         char saved = *p;
         if (*p) *p++ = '\0';
@@ -11334,6 +11458,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             continue;
         }
         first_line = false;
+        /* bash records a comment line; a blank one it does not. */
+        if (*line == '#' && hist_reader)
+            shell_history_add_raw(hist_raw, hist_raw_base, line_start, p, false);
         if (*line == '\0' || *line == '#') continue;
 
         /* If this line opens a compound, pull following lines until it closes
@@ -11445,6 +11572,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         if (!shell_collect_line_heredocs(line, line, &p, &hd_tline))
             hd_failed = true;
         if (hd_tline) line = hd_tline;
+        bool unit_heredoc = (hd_tline != 0);
 
         struct shell_scan scan;
         shell_scan_init(&scan);
@@ -11626,6 +11754,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     hd_failed = true;
                     break;
                 }
+                if (tnl) unit_heredoc = true;
                 const char *app = tnl ? tnl : nl;
                 size_t seplen = strlen(sep), nllen = strlen(app);
                 if (!shell_accum_room(&accum, &accum_cap,
@@ -11681,6 +11810,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
          * FIRST of however many the reader joined: `case $LINENO in` on line 1
          * of a four-line construct is line 1, not the `esac`. The counter is
          * put back afterwards so the next line still follows on. */
+        if (hist_reader)
+            shell_history_add_raw(hist_raw, hist_raw_base, line_start, p,
+                                  unit_heredoc);
         unsigned long line_last = g_shell_lineno;
         g_shell_lineno = line_first;
         if (!accum) shell_lmap_reset(line, line_first);
@@ -11723,6 +11855,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     }
     if (hd_unit) shell_hd_release_unit(hd_unit);
     if (hd_tline) kfree(hd_tline);
+    if (hist_raw) kfree(hist_raw);
     g_hd_unit_cur = hd_saved_unit;
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
@@ -14347,10 +14480,22 @@ static void cmd_umask(int argc, char **argv) {
  *
  * The table is what `hash` SHOWS; spawn does not consult it. That is the
  * observable contract, and it keeps a stale entry from ever running the
- * wrong binary. */
-#define HASHTAB_MAX 64
-static struct { char name[64]; char path[256]; int hits; } g_hashtab[HASHTAB_MAX];
+ * wrong binary.
+ *
+ * NO FIXED SIZE (S6, 2026-10-01): it held 64 entries with a 64-byte name and
+ * a 256-byte path, and the 65th `hash -p` said nothing, returned 0 and
+ * recorded nothing. Names and paths are heap strings now. */
+struct hashent { char *name; char *path; int hits; };
+static struct hashent *g_hashtab;
 static int g_hashtab_n;
+static int g_hashtab_cap;
+
+static void hashtab_forget(int k) {
+    kfree(g_hashtab[k].name);
+    kfree(g_hashtab[k].path);
+    for (int m = k + 1; m < g_hashtab_n; m++) g_hashtab[m - 1] = g_hashtab[m];
+    g_hashtab_n--;
+}
 
 static int hashtab_find(const char *name) {
     for (int i = 0; i < g_hashtab_n; i++)
@@ -14358,29 +14503,38 @@ static int hashtab_find(const char *name) {
     return -1;
 }
 
-static void hashtab_set(const char *name, const char *path) {
+static bool hashtab_set(const char *name, const char *path) {
+    char *p = shell_strdup(path);
+    if (!p) return false;
     int i = hashtab_find(name);
     if (i < 0) {
-        if (g_hashtab_n >= HASHTAB_MAX) return;
+        char *n = shell_strdup(name);
+        if (!n) { kfree(p); return false; }
+        if (g_hashtab_n >= g_hashtab_cap) {
+            int ncap = g_hashtab_cap ? g_hashtab_cap * 2 : 32;
+            struct hashent *nv =
+                (struct hashent *)kmalloc((size_t)ncap * sizeof *nv);
+            if (!nv) { kfree(n); kfree(p); return false; }
+            for (int k = 0; k < g_hashtab_n; k++) nv[k] = g_hashtab[k];
+            if (g_hashtab) kfree(g_hashtab);
+            g_hashtab = nv;
+            g_hashtab_cap = ncap;
+        }
         i = g_hashtab_n++;
-        size_t nl = strlen(name);
-        if (nl >= sizeof g_hashtab[i].name) nl = sizeof g_hashtab[i].name - 1;
-        memcpy(g_hashtab[i].name, name, nl);
-        g_hashtab[i].name[nl] = '\0';
+        g_hashtab[i].name = n;
+        g_hashtab[i].path = 0;
         g_hashtab[i].hits = 0;
     }
-    size_t pl = strlen(path);
-    if (pl >= sizeof g_hashtab[i].path) pl = sizeof g_hashtab[i].path - 1;
-    memcpy(g_hashtab[i].path, path, pl);
-    g_hashtab[i].path[pl] = '\0';
+    if (g_hashtab[i].path) kfree(g_hashtab[i].path);
+    g_hashtab[i].path = p;
+    return true;
 }
 
 static bool hashtab_add(const char *name) {
     char path_buf[256];
     const char *path = resolve_program(name, path_buf, sizeof path_buf);
     if (!path_is_runnable(path)) return false;
-    hashtab_set(name, path);
-    return true;
+    return hashtab_set(name, path);
 }
 
 static void cmd_hash(int argc, char **argv) {
@@ -14417,13 +14571,12 @@ static void cmd_hash(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
-    if (clear) g_hashtab_n = 0;
+    if (clear) while (g_hashtab_n > 0) hashtab_forget(g_hashtab_n - 1);
     if (del) {
         for (; i < argc; i++) {
             int k = hashtab_find(argv[i]);
             if (k < 0) { kprintf("hash: %s: not found\n", argv[i]); shell_set_status(1); continue; }
-            for (int m = k + 1; m < g_hashtab_n; m++) g_hashtab[m - 1] = g_hashtab[m];
-            g_hashtab_n--;
+            hashtab_forget(k);
         }
         return;
     }
@@ -14454,7 +14607,10 @@ static void cmd_hash(int argc, char **argv) {
         return;
     }
     for (; i < argc; i++) {
-        if (ppath) { hashtab_set(argv[i], ppath); continue; }
+        if (ppath) {
+            if (!hashtab_set(argv[i], ppath)) shell_set_status(1);
+            continue;
+        }
         if (!hashtab_add(argv[i])) {
             kprintf("hash: %s: not found\n", argv[i]);
             shell_set_status(1);
@@ -14878,34 +15034,284 @@ static void cmd_newgrp(int argc, char **argv) {
     shell_set_status(1);
 }
 
-/* Record one command line in the history ring. Called for lines the user (or
- * the test harness) submitted, not for the pieces they decompose into. */
+/* readline's add_history: at the stifle bound the oldest entry goes and the
+ * numbers move up by one; at a bound of 0 nothing is kept. */
+static void shell_hist_append(const char *text) {
+    size_t n = strlen(text);
+    char *copy = (char *)kmalloc(n + 1);
+    if (!copy) return;
+    memcpy(copy, text, n + 1);
+    if (g_hist_max >= 0 && g_hist_count >= g_hist_max) {
+        if (g_hist_count == 0) { kfree(copy); return; }
+        kfree(g_hist[0]);
+        for (int i = 1; i < g_hist_count; i++) g_hist[i - 1] = g_hist[i];
+        g_hist_count--;
+        g_hist_base++;
+    }
+    if (g_hist_count >= g_hist_cap) {
+        int ncap = g_hist_cap ? g_hist_cap * 2 : 64;
+        char **nv = (char **)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) { kfree(copy); return; }
+        for (int i = 0; i < g_hist_count; i++) nv[i] = g_hist[i];
+        if (g_hist) kfree(g_hist);
+        g_hist = nv;
+        g_hist_cap = ncap;
+    }
+    g_hist[g_hist_count++] = copy;
+}
+
+/* bash's really_add_history: one entry, counted as this session's. */
+static void shell_hist_add_entry(const char *text) {
+    g_hist_line_added = true;
+    g_hist_line_pushed = false;
+    shell_hist_append(text);
+    g_hist_session++;
+}
+
+/* Record one line the shell READ -- typed at a prompt, or a unit of the main
+ * script -- if `set -o history` is on (bash's maybe_add_history). A blank
+ * line is not recorded. */
 static void shell_history_add(const char *cmdline) {
+    if (!g_opt_history) return;
+    g_hist_line_added = false;
     if (!cmdline) return;
     const char *t = shell_skip_blanks(cmdline);
     if (!*t) return;
-    size_t n = strlen(cmdline);
-    char *copy = (char *)kmalloc(n + 1);
-    if (!copy) return;
-    memcpy(copy, cmdline, n + 1);
+    shell_hist_add_entry(cmdline);
+}
 
-    if (g_hist_count == SHELL_HIST_MAX) {
-        kfree(g_hist[0]);
-        for (int i = 1; i < SHELL_HIST_MAX; i++) g_hist[i - 1] = g_hist[i];
-        g_hist[SHELL_HIST_MAX - 1] = copy;
-        g_hist_base++;
-    } else {
-        g_hist[g_hist_count++] = copy;
+/* The main script's reader records a unit as it is written in the file:
+ * [from, to) of the script text, read from `raw`, an untouched copy of it
+ * that starts where `raw_base` does in the text (the reader cuts lines and
+ * strips comments in place). bash keeps the newline that ends a unit with a
+ * here-document in it. */
+static void shell_history_add_raw(const char *raw, const char *raw_base,
+                                  const char *from, const char *to,
+                                  bool heredoc) {
+    if (!raw || !g_opt_history || from < raw_base || to < from) return;
+    const char *s = raw + (from - raw_base);
+    size_t n = (size_t)(to - from);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) n--;
+    SH_SB(t);
+    if (sb_putmem(&t, s, n) < 0) return;
+    if (heredoc && sb_putc(&t, '\n') < 0) return;
+    shell_history_add(t.p);
+}
+
+/* Drop the newest entry (bash_delete_last_history). `fc` uses this to take
+ * its own invocation back out of the history before it looks at it, which
+ * is what POSIX means by the re-executed command replacing the fc command. */
+static bool shell_history_pop(void) {
+    if (g_hist_count <= 0) return false;
+    kfree(g_hist[--g_hist_count]);
+    g_hist[g_hist_count] = 0;
+    g_hist_session--;
+    return true;
+}
+
+/* bash_delete_histent: one entry, by index. */
+static void shell_hist_delete(int k) {
+    kfree(g_hist[k]);
+    for (int i = k + 1; i < g_hist_count; i++) g_hist[i - 1] = g_hist[i];
+    g_hist_count--;
+    g_hist_session--;
+}
+
+/* bash_clear_history: everything, and the numbers start again at 1. */
+static void shell_history_clear(void) {
+    for (int k = 0; k < g_hist_count; k++) kfree(g_hist[k]);
+    g_hist_count = 0;
+    g_hist_base = 0;
+    g_hist_session = 0;
+}
+
+/* bash's legal_number: blanks, an optional sign, digits, blanks. */
+static bool shell_hist_number(const char *s, long *out) {
+    if (!s) return false;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
+           *s == '\f' || *s == '\r') s++;
+    bool neg = false;
+    if (*s == '+' || *s == '-') neg = (*s++ == '-');
+    if (*s < '0' || *s > '9') return false;
+    long v = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (v > 0x0CCCCCCCCCCCCCCBL) return false;
+        v = v * 10 + (*s++ - '0');
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
+           *s == '\f' || *s == '\r') s++;
+    if (*s) return false;
+    *out = neg ? -v : v;
+    return true;
+}
+
+/* readline's stifle_history: keep the newest `max`. It sets the numbering
+ * base to the count it dropped -- not base + dropped -- and bash's listing
+ * shows that, so this does too. */
+static void shell_hist_stifle(long max) {
+    if (max < 0) max = 0;
+    if (g_hist_count > max) {
+        int drop = g_hist_count - (int)max;
+        for (int i = 0; i < drop; i++) kfree(g_hist[i]);
+        for (int i = drop; i < g_hist_count; i++) g_hist[i - drop] = g_hist[i];
+        g_hist_count -= drop;
+        g_hist_base = (unsigned long)drop - 1;
+    }
+    g_hist_max = max;
+    if (g_hist_session > g_hist_count) g_hist_session = g_hist_count;
+}
+
+/* A VFS error in the C library's words -- musl's strerror, which is what the
+ * guest's bash prints ("No such file or directory"). vfs_strerror's
+ * lower-case wording is the kernel console's own. */
+static const char *shell_errno_text(int err) {
+    switch (err) {
+    case VFS_ERR_NOENT:       return "No such file or directory";
+    case VFS_ERR_NOTDIR:      return "Not a directory";
+    case VFS_ERR_ISDIR:       return "Is a directory";
+    case VFS_ERR_NOMEM:       return "Out of memory";
+    case VFS_ERR_INVAL:       return "Invalid argument";
+    case VFS_ERR_NOMOUNT:     return "No such device";
+    case VFS_ERR_IO:          return "I/O error";
+    case VFS_ERR_EXIST:       return "File exists";
+    case VFS_ERR_ROFS:        return "Read-only file system";
+    case VFS_ERR_NOSPC:       return "No space left on device";
+    case VFS_ERR_NAMETOOLONG: return "Filename too long";
+    case VFS_ERR_PERM:        return "Permission denied";
+    case VFS_ERR_NOTPERM:     return "Operation not permitted";
+    default:                  return "No error information";
     }
 }
 
-/* Drop the newest entry. `fc` uses this to take its own invocation back out
- * of the history before it looks at it, which is what POSIX means by the
- * re-executed command replacing the fc command. */
-static void shell_history_pop(void) {
-    if (g_hist_count <= 0) return;
-    kfree(g_hist[--g_hist_count]);
-    g_hist[g_hist_count] = 0;
+/* The file -a/-n/-r/-w and HISTFILESIZE work on: the operand, else
+ * $HISTFILE, else readline's default, $HOME/.history. */
+static bool shell_hist_file(const char *arg, char *out, size_t cap) {
+    SH_SB(def);
+    const char *f = arg ? arg : env_get("HISTFILE");
+    if (!f) {
+        const char *home = env_get("HOME");
+        if (!home) return false;
+        if (sb_puts(&def, home) < 0 || sb_puts(&def, "/.history") < 0)
+            return false;
+        f = def.p;
+    }
+    if (!*f) return false;
+    return shell_canonicalize_path(f, out, cap) == 0;
+}
+
+/* readline's read_history_range from line `from` on: each line an entry,
+ * an empty one skipped. At a terminal a `#` and a digit starts a timestamp,
+ * which is not a line; in a script it is an ordinary entry -- bash sets the
+ * history comment character only for an interactive shell
+ * (logs/s6/before-hist-guest.bash, block D). Returns the number of lines
+ * the file holds, or -1 if it cannot be read. */
+static long shell_hist_read(const char *path, long from) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all(path, &buf, &sz) != VFS_OK) return -1;
+    const char *s = (const char *)buf, *end = s + sz;
+    long line = 0;
+    SH_SB(t);
+    while (s < end) {
+        const char *e = s;
+        while (e < end && *e != '\n') e++;
+        size_t n = (size_t)(e - s);
+        if (n > 0 && s[n - 1] == '\r') n--;
+        bool stamp = g_interactive &&
+                     (n >= 2 && s[0] == '#' && s[1] >= '0' && s[1] <= '9');
+        if (!stamp) {
+            if (line >= from && n > 0) {
+                sb_truncate(&t, 0);
+                if (sb_putmem(&t, s, n) == 0) shell_hist_append(t.p);
+            }
+            line++;
+        }
+        s = e + 1;
+    }
+    kfree(buf);
+    return line;
+}
+
+/* The whole list, one entry a line (readline's write_history). */
+static int shell_hist_write(const char *path) {
+    SH_SB(b);
+    for (int k = 0; k < g_hist_count; k++)
+        if (sb_puts(&b, g_hist[k]) < 0 || sb_putc(&b, '\n') < 0) return 1;
+    return vfs_write_all(path, b.p, b.len) == VFS_OK ? 0 : 1;
+}
+
+/* bash's maybe_append_history: this session's lines onto the end of the
+ * file, created if missing; and they count as read from it now. */
+static int shell_hist_append_file(const char *path, const char *shown) {
+    if (g_hist_session <= 0) { g_hist_session = 0; return 0; }
+    SH_SB(b);
+    void *old = 0;
+    size_t osz = 0;
+    if (vfs_read_all(path, &old, &osz) == VFS_OK) {
+        int rc = sb_putmem(&b, (const char *)old, osz);
+        kfree(old);
+        if (rc < 0) return 1;
+    } else {
+        int cr = vfs_create(path);
+        if (cr != VFS_OK) {
+            kprintf("history: %s: cannot create: %s\n", shown,
+                    shell_errno_text(cr));
+            return 1;
+        }
+    }
+    if (g_hist_count > 0 && g_hist_session > g_hist_count)
+        g_hist_session = g_hist_count;
+    for (int k = g_hist_count - (int)g_hist_session; k < g_hist_count; k++)
+        if (k >= 0 && (sb_puts(&b, g_hist[k]) < 0 || sb_putc(&b, '\n') < 0))
+            return 1;
+    int rc = vfs_write_all(path, b.p, b.len) == VFS_OK ? 0 : 1;
+    g_hist_in_file += g_hist_session;
+    g_hist_session = 0;
+    return rc;
+}
+
+/* readline's history_truncate_file: keep the file's last `keep` lines. */
+static void shell_hist_truncate_file(long keep) {
+    char path[VFS_PATH_MAX];
+    if (!shell_hist_file(0, path, sizeof path)) return;
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all(path, &buf, &sz) != VFS_OK) return;
+    const char *s = (const char *)buf;
+    long lines = 0;
+    for (size_t k = 0; k < sz; k++) if (s[k] == '\n') lines++;
+    if (sz > 0 && s[sz - 1] != '\n') lines++;
+    if (lines > keep) {
+        size_t at = 0;
+        for (long skip = lines - keep; skip > 0 && at < sz; at++)
+            if (s[at] == '\n') skip--;
+        (void)vfs_write_all(path, s + at, sz - at);
+    }
+    kfree(buf);
+}
+
+/* HISTSIZE and HISTFILESIZE take effect when ASSIGNED, as bash's sv_histsize
+ * does it: HISTSIZE=N keeps the newest N now and bounds the list after (a
+ * negative N, or unsetting it, lifts the bound); HISTFILESIZE=N cuts the
+ * history FILE to its last N lines at once. A value that is not a number
+ * changes nothing. Called by every scalar write and unset. */
+static void shell_hist_var_written(const char *key, size_t klen) {
+    bool hsize = (klen == 8 && strncmp(key, "HISTSIZE", 8) == 0);
+    bool fsize = (klen == 12 && strncmp(key, "HISTFILESIZE", 12) == 0);
+    if (!hsize && !fsize) return;
+    const char *v = env_get(hsize ? "HISTSIZE" : "HISTFILESIZE");
+    if (!v || !*v) {
+        if (hsize) g_hist_max = -1;
+        return;
+    }
+    long n = 0;
+    if (!shell_hist_number(v, &n)) return;
+    if (hsize) {
+        if (n < 0) g_hist_max = -1;
+        else shell_hist_stifle(n);
+    } else if (n >= 0) {
+        shell_hist_truncate_file(n);
+    }
 }
 
 /* Map a history number (or a negative offset, or a prefix string) to a ring
@@ -15087,10 +15493,36 @@ static void cmd_let(int argc, char **argv) {
  * Position 0 is ALWAYS the live cwd rather than a stored copy, so the stack
  * cannot go stale when something else changes directory between two pushes.
  * bash works the same way; caching the path at push time would show a
- * top-of-stack that is not where the shell actually is. */
-#define DIRSTACK_MAX 32
-static char g_dirstack[DIRSTACK_MAX][VFS_PATH_MAX];
-static int  g_dirstack_n;    /* entries stacked BELOW the current directory */
+ * top-of-stack that is not where the shell actually is.
+ *
+ * NO FIXED SIZE (S6, 2026-10-01): it was 32 rows of VFS_PATH_MAX, and the
+ * 33rd pushd said "directory stack full". The entries are heap strings;
+ * g_dirstack[g_dirstack_n - 1] is position 1. */
+static char **g_dirstack;
+static int    g_dirstack_n;    /* entries stacked BELOW the current directory */
+static int    g_dirstack_cap;
+
+/* Take `s` (heap) as the new position 1. False when out of memory, and `s`
+ * is then freed. */
+static bool dirstack_push_owned(char *s) {
+    if (!s) return false;
+    if (g_dirstack_n >= g_dirstack_cap) {
+        int ncap = g_dirstack_cap ? g_dirstack_cap * 2 : 16;
+        char **nv = (char **)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) { kfree(s); return false; }
+        for (int i = 0; i < g_dirstack_n; i++) nv[i] = g_dirstack[i];
+        if (g_dirstack) kfree(g_dirstack);
+        g_dirstack = nv;
+        g_dirstack_cap = ncap;
+    }
+    g_dirstack[g_dirstack_n++] = s;
+    return true;
+}
+
+/* Forget position 1. */
+static void dirstack_drop_top(void) {
+    if (g_dirstack_n > 0) kfree(g_dirstack[--g_dirstack_n]);
+}
 
 static void dirstack_print(bool per_line, bool with_index) {
     for (int i = 0; i <= g_dirstack_n; i++) {
@@ -15117,7 +15549,11 @@ static void cmd_dirs(int argc, char **argv) {
             if      (*c == 'l') { /* paths are already absolute here */ }
             else if (*c == 'p') per_line = true;
             else if (*c == 'v') { with_index = true; per_line = true; }
-            else if (*c == 'c') { g_dirstack_n = 0; shell_set_status(0); return; }
+            else if (*c == 'c') {
+                while (g_dirstack_n > 0) dirstack_drop_top();
+                shell_set_status(0);
+                return;
+            }
             else {
                 kprintf("dirs: -%c: invalid option\n", *c);
                 shell_set_status(2);
@@ -15129,112 +15565,336 @@ static void cmd_dirs(int argc, char **argv) {
     shell_set_status(0);
 }
 
-static void dirstack_copy(char *dst, const char *src) {
-    size_t i = 0;
-    for (; src[i] && i + 1 < VFS_PATH_MAX; i++) dst[i] = src[i];
-    dst[i] = '\0';
+/* pushd's and popd's options, bash's pushd.def rules: -n (S6: "pushd -n"
+ * was "too many arguments") and `--`. +N / -N name a stack position, which
+ * tsh does not implement; such a word is left where it always went -- an
+ * operand to pushd, ignored by popd. Any other word starting with `-` is
+ * bash's usage error. Returns the index of the first operand, or -1 after
+ * reporting the error (status 2). */
+static int dirstack_opts(const char *who, int argc, char **argv, bool *nocd) {
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "-n") == 0) { *nocd = true; continue; }
+        if (strcmp(a, "--") == 0) { i++; break; }
+        if ((a[0] == '-' || a[0] == '+') && a[1] >= '0' && a[1] <= '9')
+            break;
+        if (a[0] == '-' && a[1]) {
+            kprintf("%s: %s: invalid number\n", who, a);
+            kprintf("%s: usage: %s\n", who,
+                    who[0] == 'p' && who[1] == 'u'
+                        ? "pushd [-n] [+N | -N | dir]" : "popd [-n] [+N | -N]");
+            shell_set_status(2);
+            return -1;
+        }
+        break;
+    }
+    return i;
 }
 
 static void cmd_pushd(int argc, char **argv) {
+    bool nocd = false;
+    int first = dirstack_opts("pushd", argc, argv, &nocd);
+    if (first < 0) return;
     /* bash: one operand at most, and it says so rather than quietly using
-     * the first and dropping the rest. */
-    if (argc > 2) {
+     * the first and dropping the rest. -n takes the first and ignores the
+     * rest, as bash's does. */
+    if (argc - first > 1 && !nocd) {
         kprintf("pushd: too many arguments\n");
         shell_set_status(1);
         return;
     }
-    if (argc < 2) {
+    if (first >= argc) {
+        /* `pushd -n` with nothing to push: bash does nothing, status 0. */
+        if (nocd) { shell_set_status(0); return; }
         /* Bare `pushd` swaps the top two entries. */
         if (g_dirstack_n < 1) {
             kprintf("pushd: no other directory\n");
             shell_set_status(1);
             return;
         }
-        char here[VFS_PATH_MAX];
-        dirstack_copy(here, shell_cwd());
+        char *here = shell_strdup(shell_cwd());
+        if (!here) { shell_set_status(1); return; }
         if (shell_set_cwd(g_dirstack[g_dirstack_n - 1]) < 0) {
             kprintf("pushd: %s: cannot change directory\n",
                     g_dirstack[g_dirstack_n - 1]);
+            kfree(here);
             shell_set_status(1);
             return;
         }
-        dirstack_copy(g_dirstack[g_dirstack_n - 1], here);
+        kfree(g_dirstack[g_dirstack_n - 1]);
+        g_dirstack[g_dirstack_n - 1] = here;
         dirstack_print(false, false);
         shell_set_status(0);
         return;
     }
-    if (g_dirstack_n >= DIRSTACK_MAX) {
-        kprintf("pushd: directory stack full (%d)\n", DIRSTACK_MAX);
-        shell_set_status(1);
+    const char *dir = argv[first];
+    /* -n: the word goes in as written, unchecked, and the shell stays
+     * where it is -- `pushd -n usr` stacks "usr", as bash's does. */
+    if (nocd) {
+        if (!dirstack_push_owned(shell_strdup(dir))) {
+            shell_set_status(1);
+            return;
+        }
+        dirstack_print(false, false);
+        shell_set_status(0);
         return;
     }
     /* Record where we ARE before moving, so popd can come back. */
-    char here[VFS_PATH_MAX];
-    dirstack_copy(here, shell_cwd());
-    if (shell_set_cwd(argv[1]) < 0) {
-        kprintf("pushd: %s: No such file or directory\n", argv[1]);
+    char *here = shell_strdup(shell_cwd());
+    if (!here) { shell_set_status(1); return; }
+    if (shell_set_cwd(dir) < 0) {
+        kprintf("pushd: %s: No such file or directory\n", dir);
+        kfree(here);
         shell_set_status(1);
         return;
     }
-    dirstack_copy(g_dirstack[g_dirstack_n], here);
-    g_dirstack_n++;
+    if (!dirstack_push_owned(here)) {
+        shell_set_status(1);
+        return;
+    }
     dirstack_print(false, false);
     shell_set_status(0);
 }
 
 static void cmd_popd(int argc, char **argv) {
-    (void)argc; (void)argv;
+    bool nocd = false;
+    int first = dirstack_opts("popd", argc, argv, &nocd);
+    if (first < 0) return;
+    if (first < argc && argv[first][0] && argv[first][0] != '+' &&
+        argv[first][0] != '-') {
+        kprintf("popd: %s: invalid argument\n", argv[first]);
+        kprintf("popd: usage: popd [-n] [+N | -N]\n");
+        shell_set_status(2);
+        return;
+    }
     if (g_dirstack_n < 1) {
         kprintf("popd: directory stack empty\n");
         shell_set_status(1);
         return;
     }
-    g_dirstack_n--;
-    if (shell_set_cwd(g_dirstack[g_dirstack_n]) < 0) {
-        kprintf("popd: %s: cannot change directory\n", g_dirstack[g_dirstack_n]);
+    /* Change directory FIRST: bash leaves the stack alone when it cannot
+     * (this dropped the entry and then failed). -n removes position 1
+     * without moving at all. */
+    if (!nocd && shell_set_cwd(g_dirstack[g_dirstack_n - 1]) < 0) {
+        kprintf("popd: %s: cannot change directory\n",
+                g_dirstack[g_dirstack_n - 1]);
         shell_set_status(1);
         return;
     }
+    dirstack_drop_top();
     dirstack_print(false, false);
     shell_set_status(0);
 }
 
 /* ---- history -----------------------------------------------------------
- * The ring already existed for the line editor and for `fc`; nothing could
- * print it. Numbering runs from g_hist_base so the numbers keep climbing as
- * old entries fall off the end, which is what makes them worth showing. */
+ * bash's builtin, rule by rule against the guest's bash (S6, 2026-10-01;
+ * tools/agent/probes/hist-guest.sh). Until then tsh had `history [-c] [n]`
+ * and nothing else -- `history -s` was an invalid option.
+ *   history [n]                     list (the last n)
+ *   history -c                      clear; other operands then still act
+ *   history -d N | -d START-END     delete; negative counts from the end
+ *   history -s ARG...               ARGs as one entry, IN PLACE of the
+ *                                   line that ran it (once per line)
+ *   history -p ARG...               print ARGs (tsh has no `!` expansion)
+ *   history -a|-n|-r|-w [FILE]      append this session's lines / read the
+ *                                   lines not yet read / read all / write
+ *                                   all; FILE defaults to $HISTFILE, then
+ *                                   ~/.history */
+static void history_usage(void) {
+    kprintf("history: usage: history [-c] [-d offset] [n] or history -anrw "
+            "[filename] or history -ps arg [arg...]\n");
+}
+
+/* -d's operand to a range of indexes, by bash 5.2's rules as measured
+ * (logs/s6/before-hist-d.bash, before-hist-d2.bash): a negative number
+ * counts back from the end, -1 the last entry; a positive one is a history
+ * NUMBER, so it moves when old entries fall off; inside START-END, 0 also
+ * means the first entry. Returns 0 with the range; 1 after the "out of
+ * range" message, which names the END that was out of range -- or the
+ * whole operand when it is not a number; 2 for a start after its end,
+ * which bash fails without a word. */
+static int history_delete_range(const char *arg, int *lo, int *hi) {
+    long base = (long)g_hist_base + 1, len = g_hist_count;
+    const char *dash = arg[0] == '-' ? arg + 1 : arg;
+    while (*dash && *dash != '-') dash++;
+    SH_SB(first);
+    const char *ends[2] = { arg, 0 };
+    int nends = 1;
+    if (*dash) {
+        if (sb_putmem(&first, arg, (size_t)(dash - arg)) < 0) return 1;
+        ends[0] = first.p;
+        ends[1] = dash + 1;
+        nends = 2;
+    }
+    long v[2] = { 0, 0 }, idx[2] = { 0, 0 };
+    for (int k = 0; k < nends; k++) {
+        if (!shell_hist_number(ends[k], &v[k])) {
+            kprintf("history: %s: history position out of range\n", arg);
+            return 1;
+        }
+    }
+    for (int k = 0; k < nends; k++) {
+        if (ends[k][0] == '-' && v[k] < 0) idx[k] = len + v[k];
+        else if (nends == 2 && v[k] == 0)  idx[k] = 0;
+        else                               idx[k] = v[k] - base;
+        if (idx[k] < 0 || idx[k] >= len) {
+            kprintf("history: %s: history position out of range\n", ends[k]);
+            return 1;
+        }
+    }
+    if (nends == 1) idx[1] = idx[0];
+    if (idx[0] > idx[1]) return 2;
+    *lo = (int)idx[0];
+    *hi = (int)idx[1];
+    return 0;
+}
+
+/* history -s (bash's push_history): the line that ran it goes, once per
+ * line -- and if there is nothing to take back, nothing is stored. */
+static void history_push(char **args, int n) {
+    if (g_opt_history && !g_hist_line_pushed && g_hist_line_added &&
+        !shell_history_pop())
+        return;
+    SH_SB(t);
+    for (int k = 0; k < n; k++)
+        if ((k && sb_putc(&t, ' ') < 0) || sb_puts(&t, args[k]) < 0) return;
+    shell_hist_add_entry(t.p);
+    g_hist_line_pushed = true;
+}
+
 static void cmd_history(int argc, char **argv) {
-    int limit = -1;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0) {
-            for (int k = 0; k < g_hist_count; k++) { kfree(g_hist[k]); g_hist[k] = 0; }
-            g_hist_count = 0;
-            shell_set_status(0);
-            return;
+    enum { HA = 1, HC = 2, HD = 4, HN = 8, HP = 16, HR = 32, HS = 64, HW = 128 };
+    int flags = 0;
+    const char *darg = 0;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { i++; break; }
+        bool took = false;
+        for (const char *c = a + 1; *c && !took; c++) {
+            switch (*c) {
+            case 'a': flags |= HA; break;
+            case 'c': flags |= HC; break;
+            case 'n': flags |= HN; break;
+            case 'p': flags |= HP; break;
+            case 'r': flags |= HR; break;
+            case 's': flags |= HS; break;
+            case 'w': flags |= HW; break;
+            case 'd':
+                flags |= HD;
+                if (c[1]) darg = c + 1;
+                else if (i + 1 < argc) darg = argv[++i];
+                else {
+                    kprintf("history: -d: option requires an argument\n");
+                    history_usage();
+                    shell_set_status(2);
+                    return;
+                }
+                took = true;
+                break;
+            default:
+                kprintf("history: -%c: invalid option\n", *c);
+                history_usage();
+                shell_set_status(2);
+                return;
+            }
         }
-        if (argv[i][0] == '-') {
-            kprintf("history: %s: invalid option\n", argv[i]);
-            shell_set_status(2);
-            return;
-        }
-        int  v = 0;
-        bool digits = argv[i][0] != '\0';
-        for (const char *p = argv[i]; *p; p++) {
-            if (*p < '0' || *p > '9') { digits = false; break; }
-            v = v * 10 + (*p - '0');
-        }
-        if (!digits) {
-            kprintf("history: %s: numeric argument required\n", argv[i]);
+    }
+    int nops = argc - i;
+    int anrw = flags & (HA | HN | HR | HW);
+    if (anrw && anrw != HA && anrw != HN && anrw != HR && anrw != HW) {
+        kprintf("history: cannot use more than one of -anrw\n");
+        shell_set_status(1);
+        return;
+    }
+    shell_set_status(0);
+    if (flags & HC) {
+        shell_history_clear();
+        if (nops == 0) return;
+    }
+    if (flags & HS) {
+        if (nops) history_push(argv + i, nops);
+        return;
+    }
+    if (flags & HP) {
+        if (!nops) return;
+        /* bash's expand_and_print_history takes the line back too -- every
+         * time, it does not mark it pushed. */
+        if (!g_hist_line_pushed && g_hist_line_added && !shell_history_pop()) {
             shell_set_status(1);
             return;
         }
-        limit = v;
+        for (int k = i; k < argc; k++) shell_printf("%s\n", argv[k]);
+        return;
     }
-    int start = 0;
-    if (limit >= 0 && limit < g_hist_count) start = g_hist_count - limit;
-    for (int i = start; i < g_hist_count; i++)
-        shell_printf("%5d  %s\n", g_hist_base + i + 1, g_hist[i]);
-    shell_set_status(0);
+    if (flags & HD) {
+        int lo = 0, hi = 0;
+        if (history_delete_range(darg, &lo, &hi) != 0) {
+            shell_set_status(1);
+            return;
+        }
+        for (int k = hi; k >= lo; k--) shell_hist_delete(k);
+        return;
+    }
+    if (!(flags & (HA | HN | HR | HW | HC))) {
+        long limit = -1;
+        if (nops) {
+            if (!shell_hist_number(argv[i], &limit)) {
+                /* 1, not 2: bash 5.2 (5.3 says 2). */
+                kprintf("history: %s: numeric argument required\n", argv[i]);
+                shell_set_status(1);
+                return;
+            }
+            if (nops > 1) {
+                /* bash's no_args(): the rest of the line is thrown away. */
+                kprintf("history: too many arguments\n");
+                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                             : SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+                shell_set_status(1);
+                return;
+            }
+            if (limit < 0) limit = -limit;
+        }
+        int start = 0;
+        if (limit >= 0 && limit < g_hist_count) start = g_hist_count - (int)limit;
+        for (int k = start; k < g_hist_count; k++)
+            shell_printf("%5lu  %s\n", g_hist_base + (unsigned long)k + 1,
+                         g_hist[k]);
+        return;
+    }
+    if (!anrw) return;                       /* -c with operands: done */
+    char path[VFS_PATH_MAX];
+    if (!shell_hist_file(nops ? argv[i] : 0, path, sizeof path)) {
+        shell_set_status(1);
+        return;
+    }
+    int rc = 0;
+    if (flags & HA) {
+        /* bash names the file as it was given, not as resolved. */
+        const char *hf = env_get("HISTFILE");
+        rc = shell_hist_append_file(path, nops ? argv[i]
+                                          : (hf && *hf) ? hf : path);
+    } else if (flags & HW) {
+        rc = shell_hist_write(path);
+    } else if (flags & HR) {
+        long n = shell_hist_read(path, 0);
+        if (n < 0) rc = 1;
+        else g_hist_in_file = n;
+    } else {
+        long old = g_hist_in_file;
+        unsigned long obase = g_hist_base;
+        long n = shell_hist_read(path, g_hist_in_file);
+        if (n < 0) {
+            rc = 1;
+        } else {
+            g_hist_in_file = n;
+            g_hist_session += (n - old) + (long)(g_hist_base - obase);
+        }
+    }
+    shell_set_status(rc);
 }
 
 /* ---- builtin -----------------------------------------------------------
@@ -15272,7 +15932,7 @@ static void cmd_disown(int argc, char **argv) {
         taken++;
     }
     if (all) {
-        for (int i = 0; i < JOB_MAX; i++) g_jobs[i].id = 0;
+        for (int i = 0; i < JOB_MAX; i++) g_jobs[i]->id = 0;
         taken++;
     }
     if (!taken) {
@@ -15408,45 +16068,73 @@ static void cmd_enable(int argc, char **argv) {
  * a half-working -F that silently produced nothing would be worse than
  * saying so. `complete -p` shows exactly what was registered either way.
  */
-#define COMPSPEC_MAX 32
+/* NO FIXED SIZE (S6, 2026-10-01): 32 specs -- the 33rd `complete` said "too
+ * many specifications" -- with every field cut short (a -W list at 255
+ * bytes). The fields are heap strings, NULL when not given, and the table
+ * grows. A pointer from compspec_find lasts until the next compspec_add. */
 struct compspec {
-    char name[64];
-    char words[256];    /* -W list, empty when the spec has none */
-    char opts[64];      /* -o options, recorded for -p */
-    char gen[64];       /* -F/-C/-G text, recorded for -p */
+    char *name;
+    char *words;        /* -W list */
+    char *opts;         /* -o options, recorded for -p */
+    char *gen;          /* -F/-C/-G text, recorded for -p */
     char genkind;       /* 'F', 'C', 'G' or 0 */
-    bool used;
 };
-static struct compspec g_compspecs[COMPSPEC_MAX];
+static struct compspec *g_compspecs;
+static int g_compspec_n;
+static int g_compspec_cap;
 
 static struct compspec *compspec_find(const char *name) {
-    for (int i = 0; i < COMPSPEC_MAX; i++)
-        if (g_compspecs[i].used && strcmp(g_compspecs[i].name, name) == 0)
-            return &g_compspecs[i];
+    for (int i = 0; i < g_compspec_n; i++)
+        if (strcmp(g_compspecs[i].name, name) == 0) return &g_compspecs[i];
     return 0;
 }
 
 static struct compspec *compspec_add(const char *name) {
     struct compspec *c = compspec_find(name);
     if (c) return c;
-    for (int i = 0; i < COMPSPEC_MAX; i++) {
-        if (g_compspecs[i].used) continue;
-        c = &g_compspecs[i];
-        memset(c, 0, sizeof *c);
-        size_t k = 0;
-        for (; name[k] && k + 1 < sizeof c->name; k++) c->name[k] = name[k];
-        c->name[k] = 0;
-        c->used = true;
-        return c;
+    char *n = shell_strdup(name);
+    if (!n) return 0;
+    if (g_compspec_n >= g_compspec_cap) {
+        int ncap = g_compspec_cap ? g_compspec_cap * 2 : 16;
+        struct compspec *nv =
+            (struct compspec *)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) { kfree(n); return 0; }
+        for (int i = 0; i < g_compspec_n; i++) nv[i] = g_compspecs[i];
+        if (g_compspecs) kfree(g_compspecs);
+        g_compspecs = nv;
+        g_compspec_cap = ncap;
     }
-    return 0;
+    c = &g_compspecs[g_compspec_n++];
+    memset(c, 0, sizeof *c);
+    c->name = n;
+    return c;
+}
+
+static void compspec_remove(struct compspec *c) {
+    int k = (int)(c - g_compspecs);
+    if (c->name)  kfree(c->name);
+    if (c->words) kfree(c->words);
+    if (c->opts)  kfree(c->opts);
+    if (c->gen)   kfree(c->gen);
+    for (int m = k + 1; m < g_compspec_n; m++) g_compspecs[m - 1] = g_compspecs[m];
+    g_compspec_n--;
+}
+
+/* Replace one field with a copy of `v`; the old value stays when out of
+ * memory. */
+static bool compspec_store(char **field, const char *v) {
+    char *n = shell_strdup(v);
+    if (!n) return false;
+    if (*field) kfree(*field);
+    *field = n;
+    return true;
 }
 
 static void compspec_print(const struct compspec *c) {
     shell_printf("complete");
-    if (c->opts[0]) shell_printf(" -o %s", c->opts);
-    if (c->genkind)  shell_printf(" -%c '%s'", c->genkind, c->gen);
-    if (c->words[0]) shell_printf(" -W '%s'", c->words);
+    if (c->opts && c->opts[0]) shell_printf(" -o %s", c->opts);
+    if (c->genkind)  shell_printf(" -%c '%s'", c->genkind, c->gen ? c->gen : "");
+    if (c->words && c->words[0]) shell_printf(" -W '%s'", c->words);
     shell_printf(" %s\n", c->name);
 }
 
@@ -15477,12 +16165,13 @@ static void cmd_complete(int argc, char **argv) {
 
     if (first >= argc) {
         if (remove) {
-            for (int i = 0; i < COMPSPEC_MAX; i++) g_compspecs[i].used = false;
+            while (g_compspec_n > 0)
+                compspec_remove(&g_compspecs[g_compspec_n - 1]);
             shell_set_status(0);
             return;
         }
-        for (int i = 0; i < COMPSPEC_MAX; i++)
-            if (g_compspecs[i].used) compspec_print(&g_compspecs[i]);
+        for (int i = 0; i < g_compspec_n; i++)
+            compspec_print(&g_compspecs[i]);
         shell_set_status(0);
         return;
     }
@@ -15491,7 +16180,7 @@ static void cmd_complete(int argc, char **argv) {
     for (int i = first; i < argc; i++) {
         if (remove) {
             struct compspec *c = compspec_find(argv[i]);
-            if (c) c->used = false;
+            if (c) compspec_remove(c);
             continue;
         }
         if (print) {
@@ -15501,20 +16190,12 @@ static void cmd_complete(int argc, char **argv) {
             continue;
         }
         struct compspec *c = compspec_add(argv[i]);
-        if (!c) { kprintf("complete: too many specifications\n"); rc = 1; continue; }
-        size_t k;
-        if (words) {
-            for (k = 0; words[k] && k + 1 < sizeof c->words; k++) c->words[k] = words[k];
-            c->words[k] = 0;
-        }
-        if (opts) {
-            for (k = 0; opts[k] && k + 1 < sizeof c->opts; k++) c->opts[k] = opts[k];
-            c->opts[k] = 0;
-        }
+        if (!c) { rc = 1; continue; }            /* out of memory */
+        if (words && !compspec_store(&c->words, words)) rc = 1;
+        if (opts && !compspec_store(&c->opts, opts)) rc = 1;
         if (gen) {
-            for (k = 0; gen[k] && k + 1 < sizeof c->gen; k++) c->gen[k] = gen[k];
-            c->gen[k] = 0;
-            c->genkind = genkind;
+            if (compspec_store(&c->gen, gen)) c->genkind = genkind;
+            else rc = 1;
         }
     }
     shell_set_status(rc);
@@ -15546,11 +16227,7 @@ static void cmd_compopt(int argc, char **argv) {
             rc = 1;
             continue;
         }
-        if (add) {
-            size_t k = 0;
-            for (; add[k] && k + 1 < sizeof c->opts; k++) c->opts[k] = add[k];
-            c->opts[k] = 0;
-        }
+        if (add && !compspec_store(&c->opts, add)) rc = 1;
     }
     shell_set_status(rc);
 }
@@ -16318,9 +16995,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
          * shell's group -- tsh cannot hand the terminal over (no tcsetpgrp
          * from userspace), so moving them would detach ^C for nothing. */
         if (g_opt_monitor) (void)proc_set_pgid(pid, pid);
-        char jname[JOB_NAME_MAX];
-        jobs_join_argv(argv, jname, sizeof jname);
-        int jid = jobs_add(pid, jname);
+        char *jname __attribute__((cleanup(shell_kfree_ptr))) =
+            jobs_join_argv(argv);
+        int jid = jobs_add(pid, jname ? jname : argv[0]);
         if (jid < 0) {
             /* Out of job slots -- still leave the proc running, but warn
              * the user. They'll be reaped opportunistically later by
@@ -16346,13 +17023,13 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         int frc = proc_wait_fg(pid, &ssig);
         shell_tty_set_fg_pgrp(0);
         if (ssig > 0) {
-            char jname[JOB_NAME_MAX];
-            jobs_join_argv(argv, jname, sizeof jname);
-            int jid = jobs_add(pid, jname);
+            char *jname __attribute__((cleanup(shell_kfree_ptr))) =
+                jobs_join_argv(argv);
+            int jid = jobs_add(pid, jname ? jname : argv[0]);
             struct job *sj = jid > 0 ? jobs_find(jid) : 0;
             if (sj) sj->stopped = true;
             shell_printf("\n[%d]+  Stopped                 %s\n",
-                         jid > 0 ? jid : 0, jname);
+                         jid > 0 ? jid : 0, jname ? jname : argv[0]);
             return 128 + ssig;
         }
         shell_report_job_death(pid, proc_last_term_sig(), 0, true);
@@ -16364,9 +17041,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     {
         int sig = proc_last_term_sig();
         if (sig > 0) {
-            char text[256];
-            jobs_join_argv(argv, text, sizeof text);
-            shell_report_job_death(pid, sig, text, true);
+            char *text __attribute__((cleanup(shell_kfree_ptr))) =
+                jobs_join_argv(argv);
+            shell_report_job_death(pid, sig, text ? text : argv[0], true);
         }
     }
     return rc;
@@ -18336,7 +19013,7 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
         case 'j': {
             int live = 0;
             for (int i = 0; i < JOB_MAX; i++)
-                if (g_jobs[i].id && !g_jobs[i].dead) live++;
+                if (g_jobs[i]->id && !g_jobs[i]->dead) live++;
             size_t sp = 0;
             scratch[0] = 0;
             if (shell_append_uint(scratch, &sp, sizeof scratch,
@@ -18346,13 +19023,22 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
             break;
         }
         case '!': case '#': {
-            /* tsh keeps one counter, the history ring, and no separate
-             * command number -- so \# answers with the same figure rather
-             * than inventing a second one that nothing else agrees with. */
+            /* tsh keeps one counter, the history list, and no separate
+             * command number -- so \# answers with the history count + 1
+             * rather than inventing a second one that nothing else agrees
+             * with. \! is bash 5.2's prompt_history_number (S6, Oils 2018):
+             * 1 with history off; else the next history number -- one less,
+             * unless that is 1, for every prompt but PS1, and ${var@P} is
+             * the only prompt this decodes. */
+            unsigned long num = (unsigned long)g_hist_count + 1;
+            if (c == '!') {
+                num = g_opt_history
+                    ? g_hist_base + (unsigned long)g_hist_count + 1 : 1;
+                if (num != 1) num--;
+            }
             size_t sp2 = 0;
             scratch[0] = 0;
-            if (shell_append_uint(scratch, &sp2, sizeof scratch,
-                                  (unsigned long)(g_hist_count + 1)) < 0)
+            if (shell_append_uint(scratch, &sp2, sizeof scratch, num) < 0)
                 return -1;
             scratch[sp2] = 0;
             if (shell_prompt_put(&dec, scratch, false) < 0) return -1;
@@ -31526,6 +32212,8 @@ void shell_set_interactive_hosted(bool on) {
     /* bash enables job control only for interactive shells; follow it, so a
      * script never inherits monitor from the way the binary was invoked. */
     g_opt_monitor = on;
+    /* ...and history the same way (S6). */
+    g_opt_history = on;
 }
 
 /* `sh` is tsh in POSIX mode (2026-09-03): /bin/sh is a link to /bin/tsh and
@@ -31723,7 +32411,10 @@ int shell_run_script_hosted(const char *path) {
      * shell's own argv[0] until 2026-09-01, so a script run through the
      * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
     (void)shell_set_param0(path);
-    return shell_run_script_path(path, true);
+    g_reader_main_script = true;              /* see hist_reader */
+    int rc = shell_run_script_path(path, true);
+    g_reader_main_script = false;
+    return rc;
 }
 
 /* Run one command line (the `-c` form); returns its exit status. */
@@ -31772,7 +32463,7 @@ int shell_set_param0_hosted(const char *name) {
 const char *tsh_complete_wordlist(const char *cmdname) {
     if (!cmdname || !*cmdname) return 0;
     struct compspec *c = compspec_find(cmdname);
-    if (!c || !c->words[0]) return 0;
+    if (!c || !c->words || !c->words[0]) return 0;
     return c->words;
 }
 
