@@ -13041,6 +13041,21 @@ static void cmd_trap(int argc, char **argv) {
 }
 
 static void cmd_eval(int argc, char **argv) {
+    /* eval TAKES NO OPTIONS, and says so as bash does (no_options):
+     * `eval -- TEXT` drops the `--`, and `eval -x` is a usage error, 2.
+     * tsh joined `--` into the text and ran a command called `--` --
+     * "--: command not found", 127 (logs/s16/before-eval.tsh). */
+    if (argc > 1 && argv[1][0] == '-' && argv[1][1] != '\0') {
+        if (strcmp(argv[1], "--") == 0) {
+            argv++;
+            argc--;
+        } else {
+            kprintf("eval: -%c: invalid option\n", argv[1][1]);
+            kprintf("eval: usage: eval [arg ...]\n");
+            shell_set_status(2);
+            return;
+        }
+    }
     if (argc <= 1) {
         shell_set_status(0);
         return;
