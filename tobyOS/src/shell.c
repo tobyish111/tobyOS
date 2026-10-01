@@ -157,7 +157,14 @@ extern volatile struct limine_module_request module_req;
 #define SHELL_GETCONF_ARG_MAX  256
 #endif
 
-#define SHELL_HEREDOC_BODY_MAX PIPE_BUF_SZ
+/* HERE-DOCUMENTS HAVE NO SIZE LIMIT AND NEITHER DO THEIR DELIMITERS (S7,
+ * 2026-09-30). A body was capped at one pipe buffer (PIPE_BUF_SZ, 64 KiB)
+ * because it reached the command through a pipe filled before the command
+ * started: a 70 KB document made the whole script print NOTHING and exit 2.
+ * A delimiter was capped at 63 characters: a longer one was "here-document
+ * body missing", and the body and the delimiter then RAN AS COMMANDS. A body
+ * that fits a pipe still goes through one; a bigger one goes through a /tmp
+ * file opened and unlinked at once, as bash does (shell_open_text_pipe). */
 
 /* ---- GROWABLE TEXT: the buffers expansion writes into -------------------
  *
@@ -3301,7 +3308,6 @@ static void shell_heredoc_reset(void) {
 }
 
 static int shell_heredoc_push(const char *body, size_t len, bool expand) {
-    if (len + 1 > SHELL_HEREDOC_BODY_MAX) return -1;
     if (g_heredoc_count >= g_heredoc_cap) {
         int ncap = g_heredoc_cap ? g_heredoc_cap * 2 : 8;
         struct shell_heredoc **nt =
@@ -3372,14 +3378,6 @@ static const struct shell_heredoc *shell_heredoc_take(void) {
     if (!h || !h->expand) return h;
     SH_SB(x);
     if (shell_expand_literal_quotes(h->body, &x) < 0) return 0;
-    /* The expansion itself has no limit; the BODY does, because it reaches
-     * the command through a pipe filled before the command starts. Said,
-     * rather than cut short. */
-    if (x.len + 1 > SHELL_HEREDOC_BODY_MAX) {
-        kprintf("sh: here-document too large (%lu bytes; the limit is %u)\n",
-                (unsigned long)x.len, (unsigned)SHELL_HEREDOC_BODY_MAX - 1u);
-        return 0;
-    }
     char *nb = (char *)kmalloc(x.len + 1);
     if (!nb) return 0;
     memcpy(nb, x.p, x.len + 1);
@@ -3571,12 +3569,6 @@ static const char *shell_hd_text_for(int id, struct shell_words *words) {
     if (!e->expand) return e->body;
     SH_SB(x);
     if (shell_expand_literal_quotes(e->body, &x) < 0) return 0;
-    /* Same limit and the same words as shell_heredoc_take. */
-    if (x.len + 1 > SHELL_HEREDOC_BODY_MAX) {
-        kprintf("sh: here-document too large (%lu bytes; the limit is %u)\n",
-                (unsigned long)x.len, (unsigned)SHELL_HEREDOC_BODY_MAX - 1u);
-        return 0;
-    }
     return words_store(words, x.p, x.len);
 }
 
@@ -9595,9 +9587,11 @@ static bool shell_heredoc_delim_char(char c) {
            c != '|' && c != '<' && c != '>';
 }
 
-/* One `<<WORD` operator: its delimiter and how it was written. */
+/* One `<<WORD` operator: its delimiter and how it was written. The
+ * delimiter is on the heap, any length (S7); whoever fills a spec frees it
+ * (shell_heredoc_specs_free). */
 struct shell_heredoc_spec {
-    char delim[64];
+    char *delim;
     bool strip_tabs;      /* <<- : leading tabs stripped from the body */
     bool quoted;          /* delimiter was quoted: body does not expand */
     size_t word_off;      /* where the delimiter word starts in the line */
@@ -9694,7 +9688,7 @@ static int shell_line_find_heredocs(const char *line,
         struct shell_heredoc_spec *sp = &out[found];
         sp->strip_tabs = false;
         sp->quoted = false;
-        sp->delim[0] = '\0';
+        sp->delim = 0;
 
         p += 2;
         if (*p == '-') {
@@ -9708,24 +9702,25 @@ static int shell_line_find_heredocs(const char *line,
          * the word and do not count it. */
         bool tagged = (*p == SHELL_HD_TAG);
 
-        size_t pos = 0;
+        SH_SB(dw);
         while (shell_heredoc_delim_char(*p)) {
             if (*p == '\'' || *p == '"') {
                 char q = *p++;
                 sp->quoted = true;
                 while (*p && *p != q) {
-                    if (pos + 1 >= sizeof sp->delim) return found;
-                    sp->delim[pos++] = *p++;
+                    if (sb_putc(&dw, *p++) < 0) return found;
                 }
                 if (*p == q) p++;
                 continue;
             }
-            if (pos + 1 >= sizeof sp->delim) return found;
-            sp->delim[pos++] = *p++;
+            if (sb_putc(&dw, *p++) < 0) return found;
         }
-        sp->delim[pos] = '\0';
-        if (!sp->delim[0]) return found;       /* `<<` with no word */
-        if (!tagged) found++;
+        if (dw.len == 0) return found;         /* `<<` with no word */
+        if (!tagged) {
+            sp->delim = shell_strdup(dw.p);
+            if (!sp->delim) return found;
+            found++;
+        }
         /* Keep scanning from here. The for-header's p++ would skip the
          * character the delimiter scan stopped on, so step back one. */
         p--;
@@ -9736,21 +9731,24 @@ static int shell_line_find_heredocs(const char *line,
 /* Single-result wrapper. The interactive reader is a state machine spread
  * across calls and still handles one here-document at a time; scripts (the
  * path that matters for conformance) use the plural form below. */
-static bool shell_line_find_heredoc(const char *line, char *delim, size_t cap,
+/* *delim receives the delimiter on the heap (the caller frees it). */
+static bool shell_line_find_heredoc(const char *line, char **delim,
                                     bool *strip_tabs, bool *quoted) {
     struct shell_heredoc_spec sp[1];
+    *delim = 0;
     if (shell_line_find_heredocs(line, sp, 1) < 1) {
-        delim[0] = '\0';
         *strip_tabs = false;
         *quoted = false;
         return false;
     }
-    size_t n = strlen(sp[0].delim);
-    if (n + 1 > cap) return false;
-    memcpy(delim, sp[0].delim, n + 1);
+    *delim = sp[0].delim;
     *strip_tabs = sp[0].strip_tabs;
     *quoted = sp[0].quoted;
     return true;
+}
+
+static void shell_heredoc_specs_free(struct shell_heredoc_spec *hd, int n) {
+    for (int i = 0; i < n; i++) { kfree(hd[i].delim); hd[i].delim = 0; }
 }
 
 static bool shell_heredoc_line_matches(const char *line, const char *delim,
@@ -9798,8 +9796,9 @@ static bool shell_collect_line_heredocs(const char *line, const char *from,
     for (int i = 0; i < nhd; i++) {
         ids[i] = shell_collect_heredoc(pp, hd[i].delim, hd[i].strip_tabs,
                                        hd[i].quoted);
-        if (ids[i] < 0) return false;
+        if (ids[i] < 0) { shell_heredoc_specs_free(hd, nhd); return false; }
     }
+    shell_heredoc_specs_free(hd, nhd);
     size_t base = (size_t)(from - line);
     size_t ll = strlen(line);
     char *out = (char *)kmalloc(ll + (size_t)nhd * 16 + 1);
@@ -9825,16 +9824,9 @@ static bool shell_collect_line_heredocs(const char *line, const char *from,
 
 static int shell_collect_heredoc(char **pp, const char *delim,
                                  bool strip_tabs, bool quoted) {
-    /* Heap, not stack: SHELL_HEREDOC_BODY_MAX is 64 KiB, and this function
-     * inlines into the script reader, which gave that reader a 66 KiB frame
-     * on a kernel stack -- one script with a here-document was already at the
-     * edge, and `sh` nests eight deep. */
-    char *body = (char *)kmalloc(SHELL_HEREDOC_BODY_MAX);
-    if (!body) {
-        kprintf("sh: out of memory reading here-document\n");
-        return -1;
-    }
-    size_t bpos = 0;
+    /* Grows with the body (S7): it was one 64 KiB heap block, and a body
+     * that did not fit failed the whole script. */
+    SH_SB(body);
     char *p = *pp;
 
     while (*p) {
@@ -9849,8 +9841,8 @@ static int shell_collect_heredoc(char **pp, const char *delim,
             *pp = p;
             /* Into the store, raw -- an unquoted body is expanded when it is
              * USED (shell_hd_text_for). The id comes back: SHELL_HD_TAG. */
-            int id = shell_hd_store(body, bpos, !quoted);
-            kfree(body);
+            int id = shell_hd_store(body.p ? body.p : "", body.len, !quoted);
+            if (id < 0) kprintf("sh: out of memory storing a here-document\n");
             return id;
         }
 
@@ -9874,17 +9866,13 @@ static int shell_collect_heredoc(char **pp, const char *delim,
          * substitution parser on its own, which is an unterminated `$(` --
          * "bad command substitution" for a here-document bash reads without
          * complaint. The expansion moved to the end of the collection loop. */
-        const char *emit = raw;
-        size_t n = strlen(emit);
-        if (bpos + n + 2 > SHELL_HEREDOC_BODY_MAX) { kfree(body); return -1; }
-        memcpy(body + bpos, emit, n);
-        bpos += n;
-        body[bpos++] = '\n';
-        body[bpos] = '\0';
+        if (sb_puts(&body, raw) < 0 || sb_putc(&body, '\n') < 0) {
+            kprintf("sh: out of memory reading a here-document\n");
+            return -1;
+        }
     }
 
     kprintf("sh: here-document delimited by EOF (wanted '%s')\n", delim);
-    kfree(body);
     return -1;
 }
 
@@ -24485,7 +24473,39 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
     return f;
 }
 
+/* A here-document too big for one pipe buffer: write it to a /tmp file,
+ * open that for reading and unlink it at once -- the data lives until the
+ * reader closes it (tmpfs keeps an unlinked file for its open handles) --
+ * which is what bash does. A pipe would need a reader before its writer
+ * could finish, and the reader is the command that has not started yet. */
+static struct file *shell_open_text_tmpfile(const char *text, size_t len,
+                                            const char *label) {
+    static unsigned seq;
+    struct proc *me = current_proc();
+    char path[64];
+    struct vfs_stat st;
+    int tries = 0;
+    do {
+        ksnprintf(path, sizeof path, "/tmp/sh-thd.%d.%u",
+                  me ? me->pid : 0, seq++);
+    } while (vfs_stat(path, &st) == VFS_OK && ++tries < 1000);
+    struct file *w = shell_open_vfs_file(path, true, false, label);
+    if (!w) return 0;
+    long n = file_write(w, text, len);
+    file_close(w);
+    if (n < 0 || (size_t)n != len) {
+        kprintf("%s: failed to write here-document\n", label);
+        (void)vfs_unlink(path);
+        return 0;
+    }
+    struct file *r = shell_open_vfs_file(path, false, false, label);
+    (void)vfs_unlink(path);
+    return r;
+}
+
 static struct file *shell_open_text_pipe(const char *text, const char *label) {
+    if (text && strlen(text) >= PIPE_BUF_SZ)
+        return shell_open_text_tmpfile(text, strlen(text), label);
     struct file *r = 0;
     struct file *w = 0;
     if (pipe_create(&r, &w) != 0) {
@@ -30972,11 +30992,31 @@ static void execute_line_text(const char *src) {
 }
 
 static char g_heredoc_cmd[LINE_MAX];
-static char g_heredoc_delim[64];
+/* The line reader's here-document in progress: delimiter and body on the
+ * heap, any length (S7). The body dropped every line past 64 KiB here. */
+static char *g_heredoc_delim;
 static bool g_heredoc_strip_tabs;
 static bool g_heredoc_quoted;
-static char g_heredoc_body[SHELL_HEREDOC_BODY_MAX];
-static size_t g_heredoc_body_len;
+static char *g_heredoc_body;
+static size_t g_heredoc_body_len, g_heredoc_body_cap;
+
+static int shell_heredoc_body_append(const char *s, size_t n) {
+    if (g_heredoc_body_len + n + 2 > g_heredoc_body_cap) {
+        size_t ncap = g_heredoc_body_cap ? g_heredoc_body_cap : 4096;
+        while (g_heredoc_body_len + n + 2 > ncap) ncap *= 2;
+        char *nb = (char *)kmalloc(ncap);
+        if (!nb) return -1;
+        if (g_heredoc_body_len) memcpy(nb, g_heredoc_body, g_heredoc_body_len);
+        kfree(g_heredoc_body);
+        g_heredoc_body = nb;
+        g_heredoc_body_cap = ncap;
+    }
+    memcpy(g_heredoc_body + g_heredoc_body_len, s, n);
+    g_heredoc_body_len += n;
+    g_heredoc_body[g_heredoc_body_len++] = '\n';
+    g_heredoc_body[g_heredoc_body_len] = '\0';
+    return 0;
+}
 
 static char g_continuation_buf[LINE_MAX * 4];
 static size_t g_continuation_len;
@@ -31010,7 +31050,8 @@ static void execute_line_body(void) {
         if (strcmp(check, g_heredoc_delim) == 0) {
             g_heredoc_collecting = false;
             shell_heredoc_reset();
-            shell_heredoc_push(g_heredoc_body, g_heredoc_body_len, false);
+            shell_heredoc_push(g_heredoc_body ? g_heredoc_body : "",
+                               g_heredoc_body_len, false);
             execute_line_text(g_heredoc_cmd);
             shell_heredoc_reset();
         } else {
@@ -31025,32 +31066,28 @@ static void execute_line_body(void) {
                 if (shell_expand_literal_quotes(raw, &expanded) >= 0)
                     emit = expanded.p;
             }
-            size_t n = strlen(emit);
-            if (g_heredoc_body_len + n + 2 <= sizeof(g_heredoc_body)) {
-                memcpy(g_heredoc_body + g_heredoc_body_len, emit, n);
-                g_heredoc_body_len += n;
-                g_heredoc_body[g_heredoc_body_len++] = '\n';
-                g_heredoc_body[g_heredoc_body_len] = '\0';
-            }
+            if (shell_heredoc_body_append(emit, strlen(emit)) < 0)
+                kprintf("sh: out of memory reading a here-document\n");
         }
         return;
     }
 
-    char delim[64];
+    char *delim = 0;
     bool strip_tabs = false, quoted = false;
-    if (shell_line_find_heredoc(line, delim, sizeof(delim),
-                                &strip_tabs, &quoted)) {
+    if (shell_line_find_heredoc(line, &delim, &strip_tabs, &quoted)) {
         size_t ll = strlen(line);
         if (ll + 1 <= sizeof(g_heredoc_cmd)) {
             memcpy(g_heredoc_cmd, line, ll + 1);
-            memcpy(g_heredoc_delim, delim, strlen(delim) + 1);
+            kfree(g_heredoc_delim);
+            g_heredoc_delim = delim;
             g_heredoc_strip_tabs = strip_tabs;
             g_heredoc_quoted = quoted;
             g_heredoc_body_len = 0;
-            g_heredoc_body[0] = '\0';
+            if (g_heredoc_body) g_heredoc_body[0] = '\0';
             g_heredoc_collecting = true;
             return;
         }
+        kfree(delim);
     }
     if (g_continuation_active) {
         size_t ll = strlen(line);
