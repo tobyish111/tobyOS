@@ -12878,6 +12878,10 @@ eval_done:
     }
 }
 
+/* Set by `exec` around the one spawn it makes: bash words a command exec
+ * cannot find "exec: NAME: not found" (S10). */
+static const char *g_spawn_for;
+
 static void cmd_exec(int argc, char **argv) {
     shell_set_status(0);
     /* `--` ends exec's options, as for every builtin: `exec -- ls` runs ls,
@@ -12885,7 +12889,9 @@ static void cmd_exec(int argc, char **argv) {
     int i = 1;
     if (i < argc && strcmp(argv[i], "--") == 0) i++;
     if (i >= argc) return;
+    g_spawn_for = "exec";
     shell_spawn_program(argv[i], argc - i, &argv[i], /*background=*/false);
+    g_spawn_for = 0;
     if (g_last_status == 0 && g_script_depth > 0) {
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = 0;
@@ -17133,6 +17139,27 @@ static int shell_exec_head(const char *path, char *interp, size_t cap) {
     return rc;
 }
 
+/* A command that could not be FOUND, in bash's words (S10): a NAME the PATH
+ * search did not find is "NAME: command not found" and a path that is not
+ * there "PATH: No such file or directory", 127 both. tsh said "spawn:
+ * failed to launch '/bin/NAME'" for either -- "pipeline: failed to spawn"
+ * in a pipeline. The one other way here is a path too long to look up:
+ * "Filename too long" -- musl's words -- 126, as bash's execve reports
+ * it. Returns the status. */
+static int shell_report_unrunnable(const char *as_typed, int status) {
+    bool slash = false;
+    for (const char *c = as_typed; *c && !slash; c++) slash = (*c == '/');
+    if (!slash) {
+        if (g_spawn_for) kprintf("%s: %s: not found\n", g_spawn_for, as_typed);
+        else kprintf("tsh: %s: command not found\n", as_typed);
+        return 127;
+    }
+    kprintf("tsh: %s: %s\n", as_typed,
+            shell_errno_text(status == 126 ? VFS_ERR_NAMETOOLONG
+                                           : VFS_ERR_NOENT));
+    return status;
+}
+
 static int shell_explain_spawn_failure(const char *path, const char *as_typed,
                                        int *status) {
 #ifdef SHELL_HOSTED
@@ -17308,7 +17335,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             }
         }
         if (pid < 0) {
-            if (why != 0) kprintf("spawn: failed to launch '%s'\n", path);
+            if (why != 0) status = shell_report_unrunnable(path_arg, status);
             g_shell_fd[2] = spawn_diag_saved;
             return status;
         }
@@ -26868,7 +26895,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     }
     shell_fd_state_close_owned(&fds);
     if (pid < 0) {
-        if (why != 0) kprintf("pipeline: failed to spawn '%s'\n", path);
+        if (why != 0) status = shell_report_unrunnable(argv[0], status);
         return status;
     }
     *out_pid = pid;
