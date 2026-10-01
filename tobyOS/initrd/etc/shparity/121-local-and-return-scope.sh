@@ -1,6 +1,6 @@
 local a=1; echo "L01 top st=$? a=${a-unset}"
 f2() { local b=2; echo "L02 fn st=$? b=$b"; }; f2; echo "L02 after b=${b-unset}"
-src=${TMPDIR:-/tmp}/lsrc.$$
+src=./lsrc.121
 echo 'local c=3; echo "L03 sourced-top st=$? c=${c-unset}"' > "$src"
 . "$src"
 f4() { . "$src"; }; f4
@@ -14,7 +14,7 @@ rm -f "$src"
 echo R before
 return 3
 echo "R after st=$?"
-rsrc=${TMPDIR:-/tmp}/rs.$$
+rsrc=./rs.121
 echo "echo S in; return 4; echo S no" > "$rsrc"
 . "$rsrc"; echo "R2 sourced-return st=$?"
 f() { return 5; }; f; echo "R3 fn st=$?"

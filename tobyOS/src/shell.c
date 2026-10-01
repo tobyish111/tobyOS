@@ -1859,7 +1859,13 @@ static void shell_readonly_print_error(const char *key, size_t klen,
     if (key && n > 0) memcpy(name, key, n);
     name[n] = '\0';
     g_readonly_hit = true;
-    kprintf("%s: %s: readonly variable\n", label ? label : "shell", name);
+    /* An assignment's refusal is bash's bare "NAME: readonly variable",
+     * after the diagnostic prefix; a builtin's carries its own name. The
+     * kernel console keeps its "shell: ". */
+    if (!label || strcmp(label, "shell") == 0)
+        kprintf(SH_PFX_SHELL "%s: readonly variable\n", name);
+    else
+        kprintf("%s: %s: readonly variable\n", label, name);
 }
 
 static bool shell_readonly_key(const char *key, size_t klen) {
@@ -2170,7 +2176,12 @@ static const char *env_get(const char *key) {
         if (nx == idx) return "";        /* names itself */
         idx = nx;
     }
-    if (hops >= 16) return "";
+    /* ...and says so, as bash does: "warning: ref1: circular name
+     * reference", the name that was asked for. */
+    if (hops >= 16) {
+        kprintf("warning: %s: circular name reference\n", key);
+        return "";
+    }
     return g_env[idx] + klen + 1;
 }
 
@@ -3331,16 +3342,18 @@ static int shell_function_set(const char *name, const char *body) {
      * then refused here. */
     if (!name || !body || !shell_func_name_is_valid(name, strlen(name)))
         return -1;
+    /* -2: refused, and already said why -- the definition site must not
+     * add "failed to define" under bash's "g: readonly function". */
     if (shell_special_builtin_name(name)) {
         kprintf("%s: cannot define a function with a special builtin name\n",
                 name);
-        return -1;
+        return -2;
     }
     {
         int ro = shell_function_find(name);
         if (ro >= 0 && g_functions[ro].readonly) {             /* S4 */
             kprintf("%s: readonly function\n", name);
-            return -1;
+            return -2;
         }
     }
 
@@ -5120,7 +5133,7 @@ static void cmd_local(int argc, char **argv) {
         if (has_value) klen = env_assign_name_len(argv[i]);  /* `s+=v` */
         else klen = strlen(argv[i]);
         if (!shell_name_is_valid(argv[i], klen)) {
-            kprintf("local: bad name '%s'\n", argv[i]);
+            kprintf("local: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
@@ -5215,7 +5228,7 @@ static struct shell_shopt g_shopts[] = {
     { "lastpipe",             &g_shopt_lastpipe,             false, false },
     { "huponexit",            &g_shopt_huponexit,            false, false },
     { "checkwinsize",         &g_shopt_checkwinsize,         false, false },
-    { "shift_verbose",        &g_shopt_shift_verbose,        false, false },
+    { "shift_verbose",        &g_shopt_shift_verbose,        true,  false },
     { "execfail",             &g_shopt_execfail,             false, false },
     { "histappend",           &g_shopt_histappend,           false, false },
     { "cmdhist",              &g_shopt_cmdhist,              false, false },
@@ -5253,7 +5266,7 @@ static struct shell_shopt g_shopts[] = {
     { "no_empty_cmd_completion", &g_shopt_misc[23],          false, false },
     { "nullglob",             &g_shopt_nullglob,             false, false },
     { "restricted_shell",     &g_shopt_misc[24],             false, false },
-    { "shift_verbose",        &g_shopt_shift_verbose,        false, false },
+    { "shift_verbose",        &g_shopt_shift_verbose,        true,  false },
     { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
     { "assoc_expand_once",    &g_shopt_misc[25],             false, false },
     { "compat31",             &g_shopt_misc[26],             false, false },
@@ -5402,7 +5415,7 @@ static void cmd_export(int argc, char **argv) {
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
         if (!shell_name_is_valid(argv[i], nlen)) {
-            kprintf("export: bad name '%s'\n", argv[i]);
+            kprintf("export: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
@@ -5764,7 +5777,7 @@ static void cmd_declare(int argc, char **argv) {
         if (has_value) klen = env_assign_name_len(argv[i]);  /* `d+=v` */
         else klen = strlen(argv[i]);
         if (!shell_name_is_valid(argv[i], klen)) {
-            kprintf("declare: bad name '%s'\n", argv[i]);
+            kprintf("declare: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
@@ -6171,22 +6184,32 @@ done:
 
 static void cmd_unset(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) {
-        kprintf_raw("usage: unset [-f|-v] NAME [NAME...]\n");
-        shell_set_status(1);
-        return;
-    }
-
-    bool functions = false;
+    /* OPTIONS AS bash TAKES THEM: -f, -v and -n, together or apart, up to
+     * `--` or the first word that is not one. tsh knew only a lone -f or -v
+     * as the first word; `unset -x foo` unset a variable called "-x" and
+     * then foo, status 0, where bash refuses with a usage error and unsets
+     * nothing (2); and `unset -n ref` removed what ref POINTS AT. No name at
+     * all is not an error: bash returns 0 and says nothing
+     * (logs/s12b/words-before.*). */
+    bool functions = false, vars_only = false, ref_only = false;
     int first = 1;
-    if (strcmp(argv[1], "-f") == 0) {
-        functions = true;
-        first = 2;
-    } else if (strcmp(argv[1], "-v") == 0) {
-        first = 2;
+    for (; first < argc && argv[first][0] == '-' && argv[first][1]; first++) {
+        if (strcmp(argv[first], "--") == 0) { first++; break; }
+        for (const char *c = argv[first] + 1; *c; c++) {
+            if (*c == 'f') functions = true;
+            else if (*c == 'v') vars_only = true;
+            else if (*c == 'n') ref_only = true;
+            else {
+                kprintf("unset: -%c: invalid option\n", *c);
+                kprintf_raw("unset: usage: unset [-f] [-v] [-n] [name ...]\n");
+                shell_set_status(2);
+                return;
+            }
+        }
     }
-    if (first >= argc) {
-        kprintf("unset: missing name\n");
+    if (functions && vars_only) {
+        kprintf("unset: cannot simultaneously unset a function and a "
+                "variable\n");
         shell_set_status(1);
         return;
     }
@@ -6262,7 +6285,7 @@ static void cmd_unset(int argc, char **argv) {
          * `unset -n r` is the spelling that removes the reference
          * itself. tsh dropped `r` and left `y` standing, so the name
          * the caller meant to clear survived. */
-        {
+        if (!ref_only) {
             char tgt[128];
             const char *real = env_deref_name_ex(argv[i], tgt,
                                                  sizeof tgt, false);
@@ -6289,7 +6312,8 @@ static void cmd_unset(int argc, char **argv) {
         {
             bool had_var = (env_find(argv[i], strlen(argv[i])) >= 0);
             if (env_unset(argv[i]) < 0) shell_set_status(1);
-            else if (!had_var && shell_function_find(argv[i]) >= 0)
+            else if (!had_var && !vars_only && !ref_only &&
+                     shell_function_find(argv[i]) >= 0)
                 shell_function_unset(argv[i]);
         }
     }
@@ -6601,7 +6625,7 @@ static void cmd_set(int argc, char **argv) {
             if (i + 1 < argc) {
                 i++;
                 if (!shell_set_opt_by_name(argv[i], true)) {
-                    kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
+                    kprintf("set: %s: invalid option name\n", argv[i]); shell_set_status(2); return;
                 }
             } else {
                 shell_print_options(false);
@@ -6613,7 +6637,7 @@ static void cmd_set(int argc, char **argv) {
             if (i + 1 < argc) {
                 i++;
                 if (!shell_set_opt_by_name(argv[i], false)) {
-                    kprintf("set: unknown option '%s'\n", argv[i]); shell_set_status(1); return;
+                    kprintf("set: %s: invalid option name\n", argv[i]); shell_set_status(2); return;
                 }
             } else {
                 /* Bare `set +o` is not a no-op: POSIX wants the option state
@@ -6687,22 +6711,39 @@ static void cmd_set(int argc, char **argv) {
 static void cmd_shift(int argc, char **argv) {
     int n = 1;
     shell_set_status(0);
+    /* bash 5.2's words and statuses, as the guest's bash gives them
+     * (logs/s12b/words-before.bash) -- an ordinary failure, 1, each time:
+     *
+     *     shift 1 2     shift: too many arguments
+     *     shift x       shift: x: numeric argument required
+     *     shift -1      shift: -1: shift count out of range
+     *     shift 5       (past $#) NOTHING -- unless shopt shift_verbose,
+     *                   then "shift: 5: shift count out of range"
+     *
+     * (The build host's bash exits 2 for a non-numeric count; the guest's
+     * is the one the gate compares against.) */
     if (argc > 2) {
         kprintf("shift: too many arguments\n");
-        shell_set_status(2);
-        return;
-    }
-    if (argc == 2 && parse_int(argv[1], &n) < 0) {
-        /* Status 1, not 2: the bash 5.2 in the initrd -- which is the oracle
-         * here -- reports a non-numeric shift argument as an ordinary builtin
-         * failure and carries on. (The build host's bash exits 2 for the same
-         * input; the guest's is the one the gate compares against.) */
-        kprintf("shift: numeric argument required\n");
         shell_set_status(1);
         return;
     }
+    if (argc == 2) {
+        const char *a = argv[1];
+        bool neg = (a[0] == '-' && a[1] != '\0');
+        if (parse_int(neg ? a + 1 : a, &n) < 0) {
+            kprintf("shift: %s: numeric argument required\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
+        if (neg) n = -n;
+    }
     if (n < 0 || n > g_positional_count) {
-        kprintf("shift: can't shift %d positional parameters\n", n);
+        if (n < 0 || g_shopt_shift_verbose) {
+            if (argc == 2)
+                kprintf("shift: %s: shift count out of range\n", argv[1]);
+            else
+                kprintf("shift: shift count out of range\n");
+        }
         shell_set_status(1);
         return;
     }
@@ -6841,7 +6882,9 @@ static void cmd_getopts(int argc, char **argv) {
         if (silent) {
             if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
         } else {
-            kprintf("getopts: illegal option -- %c\n", opt);
+            /* bash's getopt: "$0: illegal option -- x", with no line. */
+            kprintf_raw("%s: illegal option -- %c\n",
+                        g_param0 ? g_param0 : "tsh", opt);
             if (env_unset("OPTARG") < 0) rc = 1;
         }
         if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
@@ -6870,7 +6913,8 @@ static void cmd_getopts(int argc, char **argv) {
                 if (shell_getopts_set_name(name, ':') < 0) rc = 1;
                 if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
             } else {
-                kprintf("getopts: option requires an argument -- %c\n", opt);
+                kprintf_raw("%s: option requires an argument -- %c\n",
+                            g_param0 ? g_param0 : "tsh", opt);
                 if (shell_getopts_set_name(name, '?') < 0) rc = 1;
                 if (env_unset("OPTARG") < 0) rc = 1;
             }
@@ -7252,7 +7296,7 @@ static void cmd_read(int argc, char **argv) {
                 }
                 if (!ok) {
                     kprintf("read: %s: invalid timeout specification\n", arg);
-                    shell_set_status(2);
+                    shell_set_status(1);
                     return;
                 }
                 timeout_ms = whole * 1000 + (fdiv > 1 ? frac * (1000 / fdiv) : 0);
@@ -7386,6 +7430,8 @@ static void cmd_pwd(int argc, char **argv) {
     shell_set_status(0);
 }
 
+static const char *shell_errno_text(int err);
+
 static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
@@ -7462,13 +7508,15 @@ static void cmd_cd(int argc, char **argv) {
 
     struct vfs_stat st;
     int rc = vfs_stat(path, &st);
+    /* bash's words (S12): "cd: DIR: No such file or directory", the operand
+     * as typed and the C library's text. */
     if (rc != VFS_OK) {
-        kprintf("cd: '%s': %s\n", target, vfs_strerror(rc));
+        kprintf("cd: %s: %s\n", target, shell_errno_text(rc));
         shell_set_status(1);
         return;
     }
     if (st.type != VFS_TYPE_DIR) {
-        kprintf("cd: '%s': not a directory\n", target);
+        kprintf("cd: %s: %s\n", target, shell_errno_text(VFS_ERR_NOTDIR));
         shell_set_status(1);
         return;
     }
@@ -12748,20 +12796,58 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
         struct vfs_stat st;
         if (vfs_stat(out, &st) == VFS_OK) return 0;
     }
-    kprintf(".: %s: not found\n", arg);
+    kprintf("%s: %s\n", arg, shell_errno_text(VFS_ERR_NOENT));
     shell_set_status(1);
     return -1;
 }
 
+/* A `.` THAT CANNOT READ ITS FILE STILL RUNS THE RETURN TRAP -- bash does,
+ * for a missing file with or without a slash and for a directory, not for
+ * a missing operand (logs/s12c/dot-rt-*.bash; Oils 1193). Nothing has run,
+ * so the trap sees the status the `.` came in with; $? is 1 after it
+ * (logs/s12c/dot-rs-*.bash). */
+static int g_shell_prev_status;      /* defined with exit/return, below */
+
+static void shell_dot_failed(int status_in) {
+    shell_set_status(status_in);
+    shell_run_return_trap();
+    shell_set_status(1);
+}
+
 static void cmd_dot(int argc, char **argv) {
+    /* The dispatcher pre-set $? to 0; this is what it replaced. */
+    int status_in = g_shell_prev_status;
     shell_set_status(0);
     if (argc < 2) {
-        kprintf_raw("usage: . script\n");
+        kprintf(".: filename argument required\n");
+        kprintf_raw(".: usage: . filename [arguments]\n");
         shell_set_status(2);
         return;
     }
     char resolved[VFS_PATH_MAX];
-    if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) return;
+    if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) {
+        shell_dot_failed(status_in);
+        return;
+    }
+    /* A file that cannot be read is reported HERE, before the diagnostics
+     * start naming it: bash's "SCRIPT: line N: ./x.sh: No such file or
+     * directory", the operand as typed. Inside shell_run_script_path it
+     * came out as "./x.sh: line N: '/abs/x.sh': no such file or directory"
+     * -- the sourced file's prefix and the resolved path. */
+    {
+        struct vfs_stat dst;
+        int drc = vfs_stat(resolved, &dst);
+        if (drc != VFS_OK) {
+            kprintf("%s: %s\n", argv[1], shell_errno_text(drc));
+            shell_dot_failed(status_in);
+            return;
+        }
+        if (dst.type == VFS_TYPE_DIR) {
+            kprintf(".: %s: is a directory\n", argv[1]);
+            shell_dot_failed(status_in);
+            return;
+        }
+    }
     /* Diagnostics inside name the file (S12): as written when it has a
      * slash, else where the PATH search found it. */
     bool slash = false;
@@ -12847,7 +12933,7 @@ static void cmd_alias(int argc, char **argv) {
 
         int idx = shell_alias_find(argv[i]);
         if (idx < 0) {
-            kprintf("alias: %s not found\n", argv[i]);
+            kprintf("alias: %s: not found\n", argv[i]);
             shell_set_status(1);
         } else {
             shell_print_alias(&g_aliases[idx]);
@@ -12868,7 +12954,7 @@ static void cmd_unalias(int argc, char **argv) {
     }
     for (int i = 1; i < argc; i++) {
         if (shell_alias_find(argv[i]) < 0) {
-            kprintf("unalias: %s not found\n", argv[i]);
+            kprintf("unalias: %s: not found\n", argv[i]);
             shell_set_status(1);
         } else {
             shell_alias_unset(argv[i]);
@@ -14281,6 +14367,7 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
     if (*argi >= argc) return 0;
     const char *s = argv[(*argi)++];
+    const char *as_given = s;
 
     /* POSIX XCU: a leading ' or " means "the numeric value of the next
      * character". Extra characters after it are ignored, not an error. */
@@ -14341,7 +14428,11 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
 
     /* NO trailing-blank skip. bash accepts ` -123` and rejects ` -123 `, and
      * skipping them here reported success for both. */
-    if (*s != '\0' || !any) g_printf_bad_num = true;
+    /* ...and says so, as bash does: "printf: 3abc: invalid number". */
+    if (*s != '\0' || !any) {
+        g_printf_bad_num = true;
+        kprintf("printf: %s: invalid number\n", as_given);
+    }
 
     if (over) {
         /* Past 64 bits: saturate to the unsigned maximum for EITHER sign --
@@ -15094,6 +15185,7 @@ static void cmd_umask(int argc, char **argv) {
             else if (*f == 'p') reinput = true;
             else {
                 kprintf("umask: -%c: invalid option\n", *f);
+                kprintf_raw("umask: usage: umask [-p] [-S] [mode]\n");
                 shell_set_status(2);
                 return;
             }
@@ -15115,14 +15207,16 @@ static void cmd_umask(int argc, char **argv) {
         return;
     }
     const char *s = argv[argi];
-    if (*s >= '0' && *s <= '7') {
+    /* Any leading DIGIT is an octal mask, as in bash: `umask 999` is "999:
+     * octal number out of range", not a symbolic mode. */
+    if (*s >= '0' && *s <= '9') {
         int val = 0;
         while (*s >= '0' && *s <= '7') {
             val = val * 8 + (*s - '0');
             s++;
         }
         if (*s || val > 0777) {
-            kprintf("umask: '%s': invalid octal mask\n", argv[argi]);
+            kprintf("umask: %s: octal number out of range\n", argv[argi]);
             shell_set_status(1);
             return;
         }
@@ -15156,8 +15250,11 @@ static void cmd_umask(int argc, char **argv) {
         }
         if (who == 0) who = 0777u;             /* `who` omitted means all */
         char op = *p;
+        /* bash's parse_symbolic_mode, word for word: a bad operator, then a
+         * bad character after the permissions. An empty clause (`u+r,,u-r`)
+         * is a `,' where the operator should be. */
         if (op != '+' && op != '-' && op != '=') {
-            kprintf("umask: '%s': invalid mode\n", argv[argi]);
+            kprintf("umask: `%c': invalid symbolic mode operator\n", op);
             shell_set_status(1);
             return;
         }
@@ -15176,18 +15273,14 @@ static void cmd_umask(int argc, char **argv) {
 
         if (*p == '\0') break;
         if (*p != ',') {
-            kprintf("umask: '%s': invalid mode\n", argv[argi]);
+            kprintf("umask: `%c': invalid symbolic mode character\n", *p);
             shell_set_status(1);
             return;
         }
         p++;
         /* An empty clause is a syntax error, not a no-op: `u+r,,u-r` must
-         * fail with the mask untouched. */
-        if (*p == '\0' || *p == ',') {
-            kprintf("umask: '%s': invalid mode\n", argv[argi]);
-            shell_set_status(1);
-            return;
-        }
+         * fail with the mask untouched -- the loop's operator check above
+         * reports the second `,'. A trailing `,' is caught the same way. */
     }
     shell_umask_apply((int)((~perms) & 0777u));
     if (sym) {
@@ -15574,7 +15667,9 @@ static void cmd_ulimit(int argc, char **argv) {
             if (*f == 'H') { want_hard = true; continue; }
             if (*f == 'S') { want_soft = true; continue; }
             if (shell_rlimit_find(*f)) { which = *f; continue; }
-            kprintf("ulimit: bad option '-%c'\n", *f);
+            kprintf("ulimit: -%c: invalid option\n", *f);
+            kprintf_raw("ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] "
+                        "[limit]\n");
             shell_set_status(2);
             return;
         }
@@ -18298,6 +18393,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
          * seeking keeps this working on backends whose write handle has no
          * independent read cursor. */
         struct file *spill_r = shell_open_vfs_file(spill, false, false, "shell");
+        bool warned_nul = false;
         if (spill_r) {
             for (;;) {
                 char chunk[512];
@@ -18312,8 +18408,15 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
                      * bash warns and removes the byte, keeping what follows;
                      * the result is a string one byte shorter. Storing it
                      * would truncate the value at the first one, which is a
-                     * different answer (`1` here) and the one tsh gave. */
-                    if (chunk[i] == '\0') continue;
+                     * different answer (`1` here) and the one tsh gave.
+                     * bash's warning comes once per substitution. */
+                    if (chunk[i] == '\0') {
+                        if (!warned_nul)
+                            kprintf("warning: command substitution: ignored "
+                                    "null byte in input\n");
+                        warned_nul = true;
+                        continue;
+                    }
                     shell_capture_char(&cap, chunk[i]);
                 }
             }
@@ -30473,11 +30576,14 @@ static bool shell_try_function_definition(const char *src) {
         while (bs < body_end && (*bs == ' ' || *bs == '\t' || *bs == ';')) bs++;
         shell_fndef_capture_map(bs, (size_t)(body_end - bs), lm_shift);
     }
-    if (shell_function_set(name, body) < 0) {
-        kfree(body);
-        kprintf("function: failed to define '%s'\n", name);
-        shell_set_status(1);
-        return true;
+    {
+        int frc = shell_function_set(name, body);
+        if (frc < 0) {
+            kfree(body);
+            if (frc == -1) kprintf("function: failed to define '%s'\n", name);
+            shell_set_status(1);
+            return true;
+        }
     }
     kfree(body);
     shell_set_status(0);
