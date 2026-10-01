@@ -1231,11 +1231,20 @@ int sys_kill(int pid, int sig) {
             }
         }
     } else if (pid == -1) {
-        /* Send to all processes (except pid 0) */
+        /* Every process the caller can see -- EXCEPT pid 1 and the CALLER
+         * ITSELF (its whole thread group), as Linux's kill_something_info
+         * has it ("on Linux the call kill(-1,sig) does not signal the
+         * calling process", kill(2)). This one sent the signal to the
+         * caller as well: `kill -- -1` from bash killed that bash
+         * (logs/s12a/pid1-killall-excerpt.txt). */
         extern struct proc g_proc[];
+        int mytg = p->is_thread ? p->tgid : p->pid;
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
+                if (g_proc[i].pid == 1) continue;
+                if (g_proc[i].pid == mytg ||
+                    (g_proc[i].is_thread && g_proc[i].tgid == mytg)) continue;
                 if (!pid_ns_can_see(p, &g_proc[i])) continue;   /* slice 10 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {

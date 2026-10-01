@@ -223,16 +223,27 @@ void proc_dump_table(void) {
  * nothing but order. */
 static int g_slot_next = 1;
 
+/* PID 1 IS HANDED OUT ONCE. It went to 'hello-boot', which exits within
+ * the first second, and then came back round like any other slot once the
+ * cursor wrapped at 255 -- to an ordinary background job, whose
+ * `kill -- -$!` is then kill(-1): it took down the shell, login and the
+ * shparity gate (logs/s12a/pid1-killall-excerpt.txt). On Linux pid 1 is
+ * init for the life of the system and is never reused. */
+static bool g_slot1_taken;
+
 struct proc *proc_slot_claim(void) {
     /* Slot 0 is reserved for kernel_main. Search 1..PROC_MAX-1. */
     int start = __atomic_load_n(&g_slot_next, __ATOMIC_RELAXED);
     if (start < 1 || start >= PROC_MAX) start = 1;
     for (int n = 0; n < PROC_MAX - 1; n++) {
         int i = 1 + (start - 1 + n) % (PROC_MAX - 1);
+        if (i == 1 && __atomic_load_n(&g_slot1_taken, __ATOMIC_ACQUIRE))
+            continue;
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            if (i == 1) __atomic_store_n(&g_slot1_taken, true, __ATOMIC_RELEASE);
             __atomic_store_n(&g_slot_next, i + 1 < PROC_MAX ? i + 1 : 1,
                              __ATOMIC_RELAXED);
             /* The wake-after-death tombstone must not outlive the slot's
