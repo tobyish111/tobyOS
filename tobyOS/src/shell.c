@@ -17932,6 +17932,11 @@ static const char *shell_capture_is_file_read(const char *cmd) {
     return w;
 }
 
+/* See shell_subshell_frame_open, with the subshell code below. */
+struct shell_subshell_frame;
+static struct shell_subshell_frame *shell_subshell_frame_open(bool reset_traps);
+static void shell_subshell_frame_close(struct shell_subshell_frame *frame);
+
 static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     if (!cmd || !out) return -1;
     sb_truncate(out, 0);
@@ -18026,10 +18031,19 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     int saved_status = g_last_status;
     bool saved_parse_error = g_parse_error;
     g_parse_error = false;
-    /* The alias table is part of the subshell's state -- see
-     * shell_alias_save. It is put back below, after the text has run. */
+    /* A COMMAND SUBSTITUTION IS A SUBSHELL, and nothing it changes reaches
+     * the shell that ran it (POSIX 2.6.3, 2.12). /bin/tsh runs it in its
+     * own process, and put back only the alias table and $? -- every other
+     * change LEAKED (logs/s15/before-cmdsub-isolation.*): `x=$(y=5)` left y
+     * set, `x=$(cd /)` moved the shell, and so did a function, `set -f`, a
+     * trap, an export, the umask, a shopt, readonly, `set -- a b c` and
+     * `exec 3>...`. It now runs inside the same state frame `( ... )` uses,
+     * put back below once the substitution's status has been taken. The
+     * caller's traps stay in force inside it -- bash shows them to
+     * `$(trap -p)` -- and are restored as they were. */
+    struct shell_subshell_frame *sub_frame = shell_subshell_frame_open(false);
     struct shell_alias_save saved_aliases;
-    shell_alias_save(&saved_aliases);
+    if (!sub_frame) shell_alias_save(&saved_aliases);   /* out of memory */
     /* ...unless `shopt -s inherit_errexit` says otherwise, which is exactly
      * what that option means: the substitution's subshell runs WITH errexit
      * and stops at its first failure. The parent still does not inherit the
@@ -18091,7 +18105,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
         }
     }
     if (!inherit_ee) g_errexit_suspend--;
-    shell_alias_restore(&saved_aliases);
+    if (!sub_frame) shell_alias_restore(&saved_aliases);
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
      *
@@ -18123,6 +18137,16 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     }
     g_last_status = saved_status;
     g_parse_error = saved_parse_error;
+    /* The state goes back now -- after the flow above has been settled,
+     * which is what the frame must not undo (a parse error inside still
+     * stops the caller's line). */
+    if (sub_frame) {
+        enum shell_flow keep_flow = g_shell_flow;
+        int keep_flow_status = g_shell_flow_status;
+        shell_subshell_frame_close(sub_frame);
+        g_shell_flow = keep_flow;
+        g_shell_flow_status = keep_flow_status;
+    }
 
 #ifndef SHELL_HOSTED
     shell_diag_pop(&diag_save);
@@ -30496,6 +30520,10 @@ struct shell_subshell_frame {
      * subshell ended and every later command wrote into f. */
     int nfd;
     struct file **fd;               /* heap, nfd slots */
+    /* ...and the shopt settings and the umask, which a subshell changed
+     * for its parent: `( shopt -s nullglob )` and `( umask 077 )` stuck. */
+    bool *shopt;                    /* heap, one per g_shopts entry */
+    int umask;
 };
 
 static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
@@ -30512,9 +30540,35 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     kfree(frame->fd);
     frame->fd = 0;
     frame->nfd = 0;
+    kfree(frame->shopt);
+    frame->shopt = 0;
 }
 
+/* The traps, copied and LEFT IN FORCE -- a command substitution's frame. */
+static int shell_trap_keep_copy(struct shell_trap_frame *frame) {
+    memset(frame, 0, sizeof(*frame));
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        if (!g_traps[i]) continue;
+        frame->trap[i] = shell_strdup(g_traps[i]);
+        if (!frame->trap[i]) {
+            for (int j = 0; j < i; j++) {
+                kfree(frame->trap[j]);
+                frame->trap[j] = 0;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
+                                           bool reset_traps);
 static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
+    return shell_subshell_frame_capture_ex(frame, true);
+}
+
+static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
+                                           bool reset_traps) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
     const char *cwd = shell_cwd();
@@ -30530,12 +30584,24 @@ static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
     for (int i = 0; i < frame->nfd; i++) frame->fd[i] = g_shell_fd[i];
 
     shell_save_opts(&frame->opts);
+    {
+        /* The table ends with a { 0, 0 } entry. */
+        size_t ns = 0;
+        while (g_shopts[ns].name) ns++;
+        frame->shopt = (bool *)kmalloc((ns + 1) * sizeof(bool));
+        if (!frame->shopt) { shell_subshell_frame_clear(frame); return -1; }
+        for (size_t i = 0; i < ns; i++)
+            frame->shopt[i] = g_shopts[i].slot ? *g_shopts[i].slot : false;
+    }
+    shell_umask_sync();
+    frame->umask = g_shell_umask;
     if (shell_env_frame_capture(&frame->env) < 0 ||
         shell_param_snapshot_capture(&frame->params) < 0 ||
         shell_alias_frame_capture(&frame->aliases) < 0 ||
         shell_function_frame_capture(&frame->functions) < 0 ||
         shell_readonly_frame_capture(&frame->readonly) < 0 ||
-        shell_trap_enter_child(&frame->traps) < 0) {
+        (reset_traps ? shell_trap_enter_child(&frame->traps)
+                     : shell_trap_keep_copy(&frame->traps)) < 0) {
         shell_subshell_frame_clear(frame);
         return -1;
     }
@@ -30551,6 +30617,13 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     shell_readonly_frame_restore(&frame->readonly);
     shell_trap_restore(&frame->traps);
     shell_restore_opts(&frame->opts);
+    if (frame->shopt) {
+        for (size_t i = 0; g_shopts[i].name; i++)
+            if (g_shopts[i].slot) *g_shopts[i].slot = frame->shopt[i];
+        kfree(frame->shopt);
+        frame->shopt = 0;
+    }
+    if (g_shell_umask != frame->umask) shell_umask_apply(frame->umask);
     shell_restore_cwd_only(frame->cwd);
     g_shell_flow = frame->flow;
     g_shell_flow_status = frame->flow_status;
@@ -30563,6 +30636,30 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     kfree(frame->fd);
     frame->fd = 0;
     frame->nfd = 0;
+}
+
+/* A heap frame, for the caller that sees the struct only by name: a
+ * command substitution (reset_traps false). 0 when out of memory. */
+static struct shell_subshell_frame *shell_subshell_frame_open(bool reset_traps) {
+    struct shell_subshell_frame *f =
+        (struct shell_subshell_frame *)kmalloc(sizeof *f);
+    if (!f) return 0;
+    if (shell_subshell_frame_capture_ex(f, reset_traps) < 0) {
+        kfree(f);
+        return 0;
+    }
+    return f;
+}
+
+/* Restoring hands each saved ENTRY back and zeroes its slot, but leaves the
+ * frame's arrays allocated; clearing after it frees just those arrays (the
+ * slots it would free are all zero by then). A substitution runs often, so
+ * they are not left behind. */
+static void shell_subshell_frame_close(struct shell_subshell_frame *frame) {
+    if (!frame) return;
+    shell_subshell_frame_restore(frame);
+    shell_subshell_frame_clear(frame);
+    kfree(frame);
 }
 
 static bool shell_subshell_tail_can_follow(const char *tail) {
