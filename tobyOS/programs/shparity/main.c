@@ -53,6 +53,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 extern pid_t toby_spawn(const char *path, char *const argv[],
                         char *const envp[], int fd0, int fd1, int fd2);
@@ -163,6 +164,30 @@ static int wipe_dir(const char *dir) {
  *
  * Returns the child's exit status, or a negative value if it could not run.
  * `workdir` is the child's cwd; `out`/`err` receive its two streams. */
+/* A BACKGROUND JOB CAN STILL BE WRITING WHEN THE SHELL HAS EXITED.
+ *
+ *     echo trailing &          # the case's last line (fixture 71)
+ *
+ * Neither shell waits for it (bash does not, and since S1 neither does
+ * tsh), so its output can land after waitpid() on the shell has returned,
+ * and reading the files at once lost it: gates-s12cA's first run failed 71
+ * with no "trailing" from tsh (finding 31). So the shell runs in a process
+ * group of its own -- a forked child takes a new group and spawns it -- and
+ * after the shell has exited, the case is over only when nothing is left
+ * in that group: a job started with `&` stays in its shell's group unless
+ * `set -m` gives it one. Bounded by GROUP_WAIT_MS, so a job that outlives
+ * the case on purpose cannot hold the gate. (Orphans are re-marked ppid -1
+ * when their parent exits, so the group, not the parent link, is what
+ * still ties them to the case.) */
+#define GROUP_STEP_MS  10
+#define GROUP_WAIT_MS  3000
+static void wait_for_group(pid_t pgid) {
+    for (int waited = 0; waited < GROUP_WAIT_MS; waited += GROUP_STEP_MS) {
+        if (kill(-pgid, 0) != 0) return;          /* nobody left */
+        usleep(GROUP_STEP_MS * 1000);
+    }
+}
+
 static int run_shell(const char *shell, char *const argv[],
                      const char *workdir, const char *out, const char *err) {
     static char *const envp[] = {
@@ -184,7 +209,17 @@ static int run_shell(const char *shell, char *const argv[],
     if (!getcwd(saved, sizeof saved)) saved[0] = '\0';
     if (chdir(workdir) != 0) { close(fo); close(fe); return -103; }
 
-    pid_t pid = toby_spawn(shell, argv, envp, 0, fo, fe);
+    /* The group leader: a child that takes a group of its own, spawns the
+     * shell into it, waits for it and exits with its status. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        pid_t sh = toby_spawn(shell, argv, envp, 0, fo, fe);
+        if (sh < 0) _exit(104);
+        int st = 0;
+        if (waitpid(sh, &st, 0) < 0) _exit(105);
+        _exit(WEXITSTATUS(st));
+    }
 
     if (saved[0]) (void)chdir(saved);
     close(fo);
@@ -194,6 +229,7 @@ static int run_shell(const char *shell, char *const argv[],
 
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return -105;
+    wait_for_group(pid);
     return WEXITSTATUS(status);
 }
 
