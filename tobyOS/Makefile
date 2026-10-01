@@ -604,6 +604,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/tsh/tsh.elf \
             programs/tjoinchurn/tjoinchurn.elf \
             programs/waittest/waittest.elf \
+            programs/stdiotest/stdiotest.elf \
             programs/sigregs/sigregs.elf \
             programs/devmgr/devmgr.elf \
             programs/indexer/indexer.elf \
@@ -1795,6 +1796,9 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,tjoinchurn,tjoinchurn))
 # /bin/waittest -- the NATIVE wait family (wait, waitpid -1 / 0 / -pgid).
 # libtoby's wait() failed with ENOENT in every native program until K2.
 $(eval $(call LIBTOBY_PROGRAM_RULES,waittest,waittest))
+# /bin/stdiotest -- libtoby's buffered stdio (K5): order against raw writes
+# and stderr, fork, exit/_exit, and the file position of buffered reads.
+$(eval $(call LIBTOBY_PROGRAM_RULES,stdiotest,stdiotest))
 # /bin/sigregs -- do rcx/r11 survive an ASYNCHRONOUS (timer-IRQ) signal? The
 # sigreturn path returned through SYSRETQ and could not restore them; GNU bash
 # faulted on it in the Oils corpus. Run by the distro fixture (@@sig_regs).
@@ -3217,6 +3221,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
 	cp programs/waittest/waittest.elf               $(INITRD_STAGE)/bin/waittest
+	cp programs/stdiotest/stdiotest.elf             $(INITRD_STAGE)/bin/stdiotest
 	cp programs/sigregs/sigregs.elf                 $(INITRD_STAGE)/bin/sigregs
 	mkdir -p $(INITRD_STAGE)/etc/shparity
 	cp initrd/etc/shparity/*.sh                     $(INITRD_STAGE)/etc/shparity/
@@ -4253,7 +4258,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/strace bin/debugger bin/indexer bin/pkgmgr bin/ld             \
 	    bin/bluescreen                                                    \
 	    bin/tsh bin/sh bin/shparity bin/oilspec bin/ttyparity             \
-	    bin/tjoinchurn bin/waittest bin/sigregs                           \
+	    bin/tjoinchurn bin/waittest bin/stdiotest bin/sigregs             \
 	    lib/ld-toby.so lib/libtoby.so                                     \
 	    $$EXTRA_FILES                                                     \
 	  && tar --format=ustar --mode=4755 \

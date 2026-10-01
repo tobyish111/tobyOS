@@ -23,6 +23,17 @@ long toby_sc4(long n, long a, long b, long c, long d);
 long toby_sc5(long n, long a, long b, long c, long d, long e);
 long toby_sc6(long n, long a, long b, long c, long d, long e, long f);
 
+/* The same trampolines WITHOUT the stdio hook (see syscall.c): only for
+ * code that must not flush pending stdio output first -- the flush itself. */
+long toby_sc_raw0(long n);
+long toby_sc_raw3(long n, long a, long b, long c);
+
+/* stdio.c (K5): pending buffered output, and the flush every toby_sc*
+ * makes before entering the kernel when there is any. */
+extern volatile int __toby_stdio_pending;
+extern volatile int __toby_stdio_threaded;
+void __toby_stdio_flush_all(void);
+
 /* If rv looks like a -ABI_E* code (rv in [-4095, -1]), set errno and
  * return -1. Otherwise return rv unchanged. */
 long __toby_check(long rv);

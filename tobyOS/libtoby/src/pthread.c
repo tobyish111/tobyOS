@@ -145,6 +145,10 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                    void *(*start_routine)(void *), void *arg) {
     (void)attr;
 
+    /* From now on stdio locks its streams (K5: they are buffered, and two
+     * threads printing into one buffer would corrupt it). */
+    __toby_stdio_threaded = 1;
+
     /* Reclaim any detached thread that has exited since the last create;
      * this is the moment its memory is about to be needed. */
     pt_sweep_detached();
