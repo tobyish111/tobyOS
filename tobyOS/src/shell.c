@@ -1754,12 +1754,165 @@ static bool shell_nameref_element(const char *target, char *name, size_t ncap,
     return shell_name_is_valid(name, strlen(name));
 }
 
+/* ---- bash's dynamic variables (S13, 2026-10-01) ---------------------------
+ * RANDOM, SRANDOM, SECONDS, EPOCHSECONDS, EPOCHREALTIME, BASHPID and
+ * BASH_ARGV0 are computed when READ, as bash's are. tsh had none of them:
+ * every one expanded to nothing. Each keeps its special meaning until it is
+ * unset, and is an ordinary variable from then on even if set again, as in
+ * bash. Assigning: RANDOM seeds its sequence, SECONDS counts on from the
+ * value given, BASH_ARGV0 sets $0; the other four ignore it. */
+enum { DV_RANDOM, DV_SRANDOM, DV_SECONDS, DV_EPOCHSECONDS, DV_EPOCHREALTIME,
+       DV_BASHPID, DV_BASH_ARGV0, DV_COUNT };
+static const char *const g_dynvar_names[DV_COUNT] = {
+    "RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME",
+    "BASHPID", "BASH_ARGV0" };
+static bool     g_dynvar_gone[DV_COUNT];   /* unset: no longer special */
+static uint32_t g_rand_seed;               /* bash's rseed */
+static int      g_rand_last;               /* bash's last_random_value */
+static int      g_rand_pid = -1;           /* the process that seeded it */
+static int64_t  g_seconds_base;            /* the value SECONDS was given */
+static int64_t  g_seconds_from = -1;       /* ...at this wall second */
+static int64_t  g_shell_start_secs;        /* when the shell began: SECONDS
+                                            * until assigned, printf %T's -2 */
+static char     g_dynvar_buf[4][32];       /* answers, in rotation */
+static int      g_dynvar_next;
+
+extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+static int shell_set_param0(const char *name);
+#ifdef SHELL_HOSTED
+extern uint32_t host_random_u32(void);     /* programs/tsh/host.c */
+static uint32_t shell_random_u32(void) { return host_random_u32(); }
+#else
+extern void rng_fill(void *buf, size_t n);
+static uint32_t shell_random_u32(void) {
+    uint32_t v = 0;
+    rng_fill(&v, sizeof v);
+    return v;
+}
+#endif
+
+static int shell_dynvar_index(const char *key, size_t klen) {
+    if (key[0] != 'R' && key[0] != 'S' && key[0] != 'E' && key[0] != 'B')
+        return -1;
+    for (int i = 0; i < DV_COUNT; i++)
+        if (strlen(g_dynvar_names[i]) == klen &&
+            strncmp(g_dynvar_names[i], key, klen) == 0)
+            return g_dynvar_gone[i] ? -1 : i;
+    return -1;
+}
+
+static int shell_dynvar_pid(void) {
+    struct proc *cur = current_proc();
+    return cur ? cur->pid : 0;
+}
+
+static uint64_t shell_dynvar_realtime_ns(void) {
+    return lx_realtime_ns(perf_now_ns());
+}
+
+/* bash's intrand32: Park and Miller's minimal standard generator. */
+static uint32_t shell_intrand32(uint32_t last) {
+    uint32_t ret = (last == 0) ? 123459876u : last;
+    int32_t h = (int32_t)(ret / 127773u);
+    int32_t l = (int32_t)(ret - 127773u * (uint32_t)h);
+    int32_t t = 16807 * l - 2836 * h;
+    return (t < 0) ? (uint32_t)(t + 0x7fffffff) : (uint32_t)t;
+}
+
+/* bash's get_random_number: 0..32767, never the same twice running, and a
+ * new process (a forked subshell) starts a sequence of its own. */
+static int shell_random_next(void) {
+    int pid = shell_dynvar_pid();
+    if (g_rand_pid != pid) {
+        g_rand_seed = shell_random_u32();
+        g_rand_last = 0;
+        g_rand_pid = pid;
+    }
+    int rv;
+    do {
+        g_rand_seed = shell_intrand32(g_rand_seed);
+        rv = (int)(((g_rand_seed >> 16) ^ (g_rand_seed & 65535u)) & 32767u);
+    } while (rv == g_rand_last);
+    return g_rand_last = rv;
+}
+
+static const char *shell_dynvar_value(int dv) {
+    char *b = g_dynvar_buf[g_dynvar_next];
+    g_dynvar_next = (g_dynvar_next + 1) % 4;
+    size_t cap = sizeof g_dynvar_buf[0];
+    uint64_t ns;
+    switch (dv) {
+    case DV_RANDOM:
+        ksnprintf(b, cap, "%d", shell_random_next());
+        return b;
+    case DV_SRANDOM:
+        ksnprintf(b, cap, "%u", (unsigned)shell_random_u32());
+        return b;
+    case DV_SECONDS: {
+        int64_t now = (int64_t)(shell_dynvar_realtime_ns() / 1000000000ull);
+        int64_t from = g_seconds_from >= 0 ? g_seconds_from : g_shell_start_secs;
+        ksnprintf(b, cap, "%ld", (long)(g_seconds_base + (now - from)));
+        return b;
+    }
+    case DV_EPOCHSECONDS:
+        ns = shell_dynvar_realtime_ns();
+        ksnprintf(b, cap, "%lu", (unsigned long)(ns / 1000000000ull));
+        return b;
+    case DV_EPOCHREALTIME:
+        ns = shell_dynvar_realtime_ns();
+        ksnprintf(b, cap, "%lu.%06lu", (unsigned long)(ns / 1000000000ull),
+                  (unsigned long)((ns % 1000000000ull) / 1000ull));
+        return b;
+    case DV_BASHPID:
+        ksnprintf(b, cap, "%d", shell_dynvar_pid());
+        return b;
+    case DV_BASH_ARGV0:
+        return g_param0 ? g_param0 : "tobysh";
+    }
+    return 0;
+}
+
+/* An assignment to a special name. bash's assign_random seeds with
+ * strtoul's reading of the value (its low 32 bits); assign_seconds takes a
+ * number or 0; assigning BASH_ARGV0 sets $0. */
+static void shell_dynvar_assign(int dv, const char *val) {
+    if (dv == DV_RANDOM) {
+        const char *s = val;
+        while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+        bool neg = false;
+        if (*s == '+' || *s == '-') neg = (*s++ == '-');
+        unsigned long v = 0;
+        while (*s >= '0' && *s <= '9') v = v * 10ul + (unsigned long)(*s++ - '0');
+        if (neg) v = 0ul - v;
+        g_rand_seed = (uint32_t)v;
+        g_rand_last = 0;
+        g_rand_pid = shell_dynvar_pid();
+    } else if (dv == DV_SECONDS) {
+        const char *s = val;
+        while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+        bool neg = false;
+        if (*s == '+' || *s == '-') neg = (*s++ == '-');
+        bool digits = (*s >= '0' && *s <= '9');
+        long v = 0;
+        while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+        while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+        g_seconds_base = (digits && !*s) ? (neg ? -v : v) : 0;
+        g_seconds_from = (int64_t)(shell_dynvar_realtime_ns() / 1000000000ull);
+    } else if (dv == DV_BASH_ARGV0) {
+        (void)shell_set_param0(val);
+    }
+}
+
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
     for (int i = g_tokpfx_n - 1; i >= 0; i--) {
         if (strncmp(g_tokpfx[i], key, klen) == 0 && g_tokpfx[i][klen] == '=')
             return g_tokpfx[i] + klen + 1;
+    }
+    {
+        int dv = shell_dynvar_index(key, klen);
+        if (dv >= 0) return shell_dynvar_value(dv);
     }
     int idx = env_find(key, klen);
     if (idx < 0) {
@@ -2558,6 +2711,13 @@ static int env_set_kv(const char *kv_in) {
         shell_readonly_print_error(kv_in, klen, "shell");
         return -1;
     }
+    {
+        int dv = shell_dynvar_index(kv_in, klen);    /* see env_get */
+        if (dv >= 0) {
+            shell_dynvar_assign(dv, kv_in + klen + 1);
+            return 0;
+        }
+    }
 
     size_t total = strlen(kv_in);
     char *blob = (char *)kcalloc(1, total + 1);
@@ -2635,6 +2795,11 @@ static int env_unset(const char *key) {
     }
     int idx = env_find(key, klen);
     if (idx >= 0) env_remove_at(idx);
+    {
+        /* unset takes a dynamic variable's special meaning away for good. */
+        int dv = shell_dynvar_index(key, klen);
+        if (dv >= 0) g_dynvar_gone[dv] = true;
+    }
     shell_getopts_note_external_optind_write(key, klen);
     shell_hist_var_written(key, klen);
     return 0;
@@ -13857,7 +14022,7 @@ extern uint64_t lx_realtime_ns(uint64_t mono_ns);
 static int64_t shell_wall_secs(void) {
     return (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
 }
-static int64_t g_shell_start_secs;      /* printf %T's -2: when the shell began */
+/* g_shell_start_secs (printf %T's -2) is declared with SECONDS, above env_get. */
 
 static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
@@ -18605,8 +18770,10 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
     } else if (strcmp(name, "!") == 0) {
         rc = sb_put_uint(out, (unsigned long)g_last_bg_pid);
     } else if (strcmp(name, "$") == 0) {
-        struct proc *cur = current_proc();
-        rc = sb_put_uint(out, (unsigned long)(cur ? cur->pid : 0));
+        /* The SHELL's pid, as plain $$ is: see shell_init_hosted (S13). */
+        int pid = g_shell_pid;
+        if (pid < 0) { struct proc *cur = current_proc(); pid = cur ? cur->pid : 0; }
+        rc = sb_put_uint(out, (unsigned long)pid);
     } else if (strcmp(name, "#") == 0) {
         rc = sb_put_uint(out, (unsigned long)g_positional_count);
     } else if (strcmp(name, "-") == 0) {
@@ -32660,6 +32827,13 @@ const char *shell_history_get_hosted(int i) {
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
+    /* $$ IS THIS SHELL'S PID, latched here, so a forked child -- a pipeline
+     * stage, a background job -- still says its parent's, as bash's does,
+     * while $BASHPID says its own (S13). /bin/tsh never latched it (only
+     * the kernel's line path did), and read the CURRENT pid instead:
+     * `{ echo $$; } | cat` printed the stage's pid (logs/s13/bashpid.*). */
+    g_shell_pid = -1;
+    shell_latch_pid();
     for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
     g_shell_start_secs = shell_wall_secs();

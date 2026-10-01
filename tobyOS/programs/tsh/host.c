@@ -799,6 +799,18 @@ uint64_t lx_realtime_ns(uint64_t mono_ns) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* 32 bits from the kernel's CSPRNG, for $SRANDOM and $RANDOM's seed (S13).
+ * The kernel shell calls rng_fill directly. */
+uint32_t host_random_u32(void) {
+    uint32_t v = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        (void)read(fd, &v, sizeof v);
+        close(fd);
+    }
+    return v;
+}
+
 /* The hosted shell reads stdin line-at-a-time in main(); the kernel's
  * keyboard ring has no userspace counterpart. -1 == "nothing queued". */
 int kbd_trygetc(void) { return -1; }
