@@ -1582,6 +1582,8 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
             if (!(q->tgid == tgid || q->pid == tgid)) continue;
             q->dying = true;                 /* tombstone before state */
             q->exit_code = code;
+            q->term_sig  = p->term_sig;      /* K3: a thread's fatal signal
+                                              * is the process's */
             q->state = PROC_TERMINATED;
             struct proc *w = q->join_waiters;
             while (w) {
@@ -2120,6 +2122,7 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
     if (out) {
         out->pid           = child->pid;
         out->exit_code     = code;
+        out->term_sig      = child->term_sig;
         out->cpu_ns        = child->cpu_ns;
         out->syscall_count = child->syscall_count;
         out->wall_ns       = perf_now_ns() - wait_start_ns;

@@ -12092,7 +12092,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (!c) return -ABI_ECHILD;
             if (c->state != PROC_TERMINATED) return 0;
         }
-        int code = proc_wait(pid);
+        struct proc_exit_info xi;
+        memset(&xi, 0, sizeof xi);
+        int code = proc_wait_info(pid, &xi);
         if (code < 0) {
 #ifdef CHROMIUM_BOOT
             /* Slice 83: crashpad's DoubleForkAndExec REQUIRES
@@ -12109,8 +12111,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         if (ustatus) {
             /* Linux wait status: normal exit -> (code & 0xff) << 8, with the
-             * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code. */
-            uint32_t wstatus = ((uint32_t)code & 0xff) << 8;
+             * low 7 bits zero so WIFEXITED is true / WEXITSTATUS == code.
+             * K3: killed by a signal -> the signal number in the low 7 bits
+             * (WIFSIGNALED, WTERMSIG), as Linux reports it. This used to say
+             * exit(128 + sig) for every signal death, so no Linux program --
+             * bash's "Killed" report, Python's returncode -9, a supervisor
+             * restarting on a crash -- could tell one from exit(137). No
+             * path here dumps core, so the 0x80 core bit is never set. */
+            uint32_t wstatus = xi.term_sig > 0
+                             ? ((uint32_t)xi.term_sig & 0x7f)
+                             : ((uint32_t)code & 0xff) << 8;
             if (put_user_u32(ustatus, wstatus) != 0) return -ABI_EFAULT;
         }
 #ifdef CHROMIUM_BOOT

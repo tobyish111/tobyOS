@@ -403,7 +403,10 @@ static void signal_apply_default(struct proc *p, int sig) {
          * SIGSEGV in a worker left the rest of the process limping, which
          * no crash handler, supervisor, or shell $? logic expects.
          * proc_exit_group degenerates to proc_exit for the single-threaded
-         * case and for a leader (whose proc_exit already reaps threads). */
+         * case and for a leader (whose proc_exit already reaps threads).
+         * K3: record the signal itself, so wait4/waitid can report a
+         * signal death as one -- 128 + sig alone reads as exit(128 + sig). */
+        p->term_sig = sig;
         proc_exit_group(128 + sig);
     }
 
@@ -763,6 +766,7 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
     if (sig == SIGKILL) {
         if (g_foreground_pid == p->pid) g_foreground_pid = 0;
         kprintf("[signal] pid=%d killed by SIGKILL\n", p->pid);
+        p->term_sig = sig;                 /* K3: see signal_apply_default */
         proc_exit_group(128 + sig);
     }
 

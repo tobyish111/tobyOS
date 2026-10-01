@@ -113,6 +113,11 @@ struct proc {
     char            exe_path[ABI_PATH_MAX];
     enum proc_state state;
     int             exit_code;
+    /* K3 (2026-09-30): the signal that killed this process, 0 for a normal
+     * exit. exit_code still holds 128 + signal for the native ABI and the
+     * shells' $?; the Linux wait family reads THIS to report WIFSIGNALED /
+     * CLD_KILLED, which exit_code alone cannot tell from exit(137). */
+    int             term_sig;
 
     /* Track B (foreign-binary compat): which syscall ABI this process
      * speaks. ABI_PERS_TOBY (0, the zero-init default) routes `syscall`
@@ -767,6 +772,7 @@ struct proc {
 struct proc_exit_info {
     int      pid;
     int      exit_code;
+    int      term_sig;      /* K3: killing signal, 0 = exited (see struct proc) */
     uint64_t cpu_ns;
     uint64_t syscall_count;
     uint64_t wall_ns;       /* perf_now_ns() delta from proc_wait_info() call */
