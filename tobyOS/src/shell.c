@@ -849,6 +849,8 @@ struct shell_function {
     char **heredoc;
     bool  *heredoc_expand;                          /* see shell_heredoc */
     int    nheredoc;
+    /* `readonly -f` (S4): not redefined, not unset. */
+    bool   readonly;
 };
 
 /* One queued body. Each is its own heap record and the queue holds
@@ -1525,6 +1527,11 @@ static int shell_readonly_find(const char *key, size_t klen) {
     return -1;
 }
 
+/* Set whenever a write is refused because the name is readonly (S4). The
+ * assignment-statement path reads it to tell that refusal -- which discards
+ * the rest of the line, as bash does -- from any other failure. */
+static bool g_readonly_hit;
+
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
     char name[64];
@@ -1532,6 +1539,7 @@ static void shell_readonly_print_error(const char *key, size_t klen,
     if (n >= sizeof(name)) n = sizeof(name) - 1;
     if (key && n > 0) memcpy(name, key, n);
     name[n] = '\0';
+    g_readonly_hit = true;
     kprintf("%s: %s: readonly variable\n", label ? label : "shell", name);
 }
 
@@ -2266,6 +2274,12 @@ static int sh_try_array_assignment(const char *kv) {
     char name[128], sub[128];
     if (sh_split_subscript(kv, keylen, name, sizeof name, sub, sizeof sub)) {
         if (!shell_name_is_valid(name, strlen(name))) return 0;
+        /* A READONLY ARRAY'S ELEMENTS ARE READONLY TOO (S4): `r[0]=9`,
+         * `r[1]+=x`, `m[k]=w`. They all went through. */
+        if (shell_readonly_key(name, strlen(name))) {
+            shell_readonly_print_error(name, strlen(name), "shell");
+            return -1;
+        }
         /* AN ASSOCIATIVE SUBSCRIPT IS A LITERAL STRING, not arithmetic.
          * `m[alpha]=1` must not try to evaluate `alpha` as a variable, and
          * `m[two words]` is one key. Only `declare -A` puts an array in this
@@ -2304,6 +2318,11 @@ static int sh_try_array_assignment(const char *kv) {
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
         if (!shell_name_is_valid(nm, keylen)) return 0;
+        /* `r=(3)` and `r+=(4)` on a readonly array (S4). */
+        if (shell_readonly_key(nm, keylen)) {
+            shell_readonly_print_error(nm, keylen, "shell");
+            return -1;
+        }
         /* APPENDING A LITERAL TO A SCALAR KEEPS THE SCALAR, as element 0:
          *
          *     b=abc; b+=(d e f); echo "${b[@]}"    ->  abc d e f
@@ -2481,7 +2500,8 @@ static int env_unset(const char *key) {
     if (!key) return -1;
     size_t klen = strlen(key);
     if (shell_readonly_key(key, klen)) {
-        shell_readonly_print_error(key, klen, "unset");
+        g_readonly_hit = true;
+        kprintf("unset: %s: cannot unset: readonly variable\n", key);
         return -1;
     }
     int idx = env_find(key, klen);
@@ -2817,6 +2837,13 @@ static int shell_function_set(const char *name, const char *body) {
                 name);
         return -1;
     }
+    {
+        int ro = shell_function_find(name);
+        if (ro >= 0 && g_functions[ro].readonly) {             /* S4 */
+            kprintf("%s: readonly function\n", name);
+            return -1;
+        }
+    }
 
     char *ncopy = shell_strdup(name);
     char *bcopy = shell_strdup(body);
@@ -2898,9 +2925,22 @@ static int shell_function_set(const char *name, const char *body) {
     return 0;
 }
 
+static bool shell_function_is_readonly(const char *name) {
+    int idx = shell_function_find(name);
+    return idx >= 0 && g_functions[idx].readonly;
+}
+
+static bool shell_function_set_readonly(const char *name) {
+    int idx = shell_function_find(name);
+    if (idx < 0) return false;
+    g_functions[idx].readonly = true;
+    return true;
+}
+
 static void shell_function_unset(const char *name) {
     int idx = shell_function_find(name);
     if (idx < 0) return;
+    g_functions[idx].readonly = false;
     shell_hd_pin_text(g_functions[idx].body, -1);      /* see define */
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
@@ -4571,6 +4611,16 @@ static void cmd_local(int argc, char **argv) {
         memcpy(name, argv[i], klen);
         name[klen] = '\0';
 
+        /* A READONLY NAME IS NOT MADE LOCAL (S4): bash refuses with status
+         * 1 and the variable stays what it was. tsh pushed the local first,
+         * so `local -a r=(9)` failed AND left an empty r shadowing the
+         * readonly one for the rest of the function. */
+        if (shell_readonly_key(name, klen)) {
+            shell_readonly_print_error(name, klen, "local");
+            shell_set_status(1);
+            continue;
+        }
+
         bool already = shell_local_declared_here(name, g_script_depth);
         if (!already && shell_locals_push(name, g_script_depth) < 0) {
             shell_set_status(1);
@@ -4943,7 +4993,16 @@ static bool shell_declare_print(const char *name) {
     struct sh_array *arr = sh_array_find(name);
     unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
     bool is_arr = (arr != 0) || (f & SHVAR_ARRAY);
-    if (idx < 0 && !arr) return false;
+    if (idx < 0 && !arr) {
+        /* Marked readonly but never given a value (S4): bash prints the
+         * attribute alone -- `readonly -a e; declare -p e` is
+         * `declare -r e`. */
+        if (shell_readonly_find(name, klen) >= 0) {
+            shell_printf("declare -r %s\n", name);
+            return true;
+        }
+        return false;
+    }
 
     /* bash's own letter order is a A i l n r t u x; tsh tracks the five it
      * can honestly answer for. No attribute at all prints as `--`. */
@@ -5221,7 +5280,25 @@ static void cmd_declare(int argc, char **argv) {
         }
 
         if (has_value) {
-            if (env_set_kv(argv[i]) < 0) { shell_set_status(1); continue; }
+            g_readonly_hit = false;
+            if (env_set_kv(argv[i]) < 0) {
+                shell_set_status(1);
+                /* A COMPOUND value `NAME=(...)` refused for a readonly NAME
+                 * ends the rest of the line at top level, like an
+                 * assignment statement (S4) -- inside a function it is an
+                 * ordinary status-1 failure, and a scalar value never ends
+                 * the line. Measured: logs/s35/ro-decl.txt. */
+                const char *v = argv[i] + env_key_len(argv[i]) + 1;
+                if (g_readonly_hit && *v == '(' && g_fn_depth == 0) {
+                    if (g_shell_flow == SHELL_FLOW_NONE) {
+                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                     : SHELL_FLOW_DISCARD;
+                        g_shell_flow_status = 1;
+                    }
+                    return;
+                }
+                continue;
+            }
         } else if (!env_get(name)) {
             if (env_set(name, "") < 0) { shell_set_status(1); continue; }
         }
@@ -5367,39 +5444,90 @@ static void cmd_compgen(int argc, char **argv) {
     shell_set_status(matches > 0 ? 0 : 1);
 }
 
+/* readonly [-aAfp] [NAME[=VALUE]...] (S4). The options were read as names --
+ * `readonly -a r=(1 2)` said "bad name '-a'" -- and the listing printed
+ * scalars only. -a / -A make the value an indexed / associative array, -f
+ * marks FUNCTIONS, -p (or no operand) lists in declare's reinput form. A
+ * name given without a value is marked and left unset, as bash leaves it:
+ * `readonly e; declare -p e` is `declare -r e`. */
 static void cmd_readonly(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
+    bool opt_a = false, opt_A = false, opt_f = false, opt_p = false;
+    int first = 1;
+    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) { first++; break; }
+        bool ok = true;
+        for (const char *q = argv[first] + 1; *q; q++) {
+            if (*q == 'a') opt_a = true;
+            else if (*q == 'A') opt_A = true;
+            else if (*q == 'f') opt_f = true;
+            else if (*q == 'p') opt_p = true;
+            else { ok = false; break; }
+        }
+        if (!ok) {
+            kprintf("readonly: %s: invalid option\n", argv[first]);
+            kprintf("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p\n");
+            shell_set_status(2);
+            return;
+        }
+        first++;
+    }
+    if (first >= argc) {
+        if (opt_f) {
+            for (int i = 0; i < g_nfunctions; i++)
+                if (g_functions[i].name && g_functions[i].readonly)
+                    shell_printf("readonly -f %s\n", g_functions[i].name);
+            return;
+        }
+        (void)opt_p;
         for (int i = 0; i < g_nreadonly; i++) {
             if (!g_readonly[i]) continue;
-            const char *v = env_get(g_readonly[i]);
-            /* bash's reinput form, same reason as shell_print_export_entry. */
-            shell_printf("declare -r %s", g_readonly[i]);
-            if (v) shell_printf("=\"%s\"", v);
-            shell_printf("\n");
+            /* bash's reinput form -- `declare -r x="1"`, `declare -ar
+             * r=(...)`, `declare -r e` for one that is marked but unset. */
+            if (!shell_declare_print(g_readonly[i]))
+                shell_printf("declare -r %s\n", g_readonly[i]);
         }
         return;
     }
 
-    for (int i = 1; i < argc; i++) {
+    for (int i = first; i < argc; i++) {
+        if (opt_f) {
+            if (!shell_function_set_readonly(argv[i])) {
+                kprintf("readonly: %s: not a function\n", argv[i]);
+                shell_set_status(1);
+            }
+            continue;
+        }
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `r+=bar` -> `r` */
         if (!shell_name_is_valid(argv[i], nlen)) {
-            kprintf("readonly: bad name '%s'\n", argv[i]);
+            kprintf("readonly: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
 
         if (argv[i][klen] == '=') {
+            if (opt_A && !shell_readonly_key(argv[i], nlen)) {
+                char nm[128];
+                if (nlen < sizeof nm) {
+                    memcpy(nm, argv[i], nlen);
+                    nm[nlen] = '\0';
+                    if (!sh_array_is_assoc(nm)) {
+                        sh_array_unset(nm);
+                        (void)sh_array_make_assoc(nm);
+                    }
+                }
+            }
             if (env_set_kv(argv[i]) < 0) {
                 shell_set_status(1);
                 continue;
             }
-        } else if (!env_get(argv[i])) {
-            if (env_set(argv[i], "") < 0) {
-                kprintf("readonly: failed to create '%s'\n", argv[i]);
-                shell_set_status(1);
-                continue;
+        } else if (opt_A) {
+            char nm[128];
+            if (nlen < sizeof nm) {
+                memcpy(nm, argv[i], nlen);
+                nm[nlen] = '\0';
+                if (!sh_array_find(nm)) (void)sh_array_make_assoc(nm);
             }
         }
 
@@ -5407,6 +5535,7 @@ static void cmd_readonly(int argc, char **argv) {
          * same variable read-only that it just wrote. */
         if (shell_readonly_mark(argv[i], nlen) < 0) shell_set_status(1);
     }
+    (void)opt_a;
 }
 
 /* readarray / mapfile -- fill an array from lines on stdin.
@@ -5457,6 +5586,11 @@ static void cmd_readarray(int argc, char **argv) {
     const char *name = (first < argc) ? argv[first] : "MAPFILE";
     if (!shell_name_is_valid(name, strlen(name))) {
         kprintf("%s: `%s': not a valid identifier\n", argv[0], name);
+        shell_set_status(1);
+        return;
+    }
+    if (shell_readonly_key(name, strlen(name))) {               /* S4 */
+        shell_readonly_print_error(name, strlen(name), "shell");
         shell_set_status(1);
         return;
     }
@@ -5535,7 +5669,32 @@ static void cmd_unset(int argc, char **argv) {
         return;
     }
     for (int i = first; i < argc; i++) {
-        if (functions) { shell_function_unset(argv[i]); continue; }
+        if (functions) {
+            if (shell_function_is_readonly(argv[i])) {          /* S4 */
+                kprintf("unset: %s: cannot unset: readonly function\n",
+                        argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+            shell_function_unset(argv[i]);
+            continue;
+        }
+        /* A READONLY NAME CANNOT BE UNSET, whole or by element (S4): bash
+         * says so and returns 1; tsh dropped `r[0]` and then `r`. */
+        {
+            char nmb[128];
+            size_t bl = 0;
+            while (argv[i][bl] && argv[i][bl] != '[' && bl + 1 < sizeof nmb) {
+                nmb[bl] = argv[i][bl];
+                bl++;
+            }
+            nmb[bl] = '\0';
+            if (bl && shell_readonly_key(nmb, bl)) {
+                kprintf("unset: %s: cannot unset: readonly variable\n", nmb);
+                shell_set_status(1);
+                continue;
+            }
+        }
         /* `unset a[1]` drops ONE element and leaves the rest numbered as they
          * were -- it does not renumber, which is why the store is sparse.
          * `unset a` drops the whole array. Both are checked before the scalar
@@ -6664,6 +6823,13 @@ static void cmd_read(int argc, char **argv) {
     /* EOF with nothing read at all: the variables are cleared, status 1.
      * EOF after SOME data (a last line without its newline) still assigns
      * and still reports 1 -- that is the `while read` idiom's ending. */
+    /* `read -a r` into a readonly array (S4): the line is read, then the
+     * assignment is refused -- status 1, as bash. */
+    if (array_name && shell_readonly_key(array_name, strlen(array_name))) {
+        shell_readonly_print_error(array_name, strlen(array_name), "shell");
+        shell_set_status(1);
+        return;
+    }
     if (!got_any) {
         if (array_name) { sh_array_unset(array_name); (void)sh_array_create(array_name); }
         else if (reply_mode) (void)env_set("REPLY", "");
@@ -13698,6 +13864,15 @@ static void cmd_printf(int argc, char **argv) {
         kprintf("usage: printf [-v NAME] FORMAT [ARG...]\n");
         shell_set_status(2);
         return;
+    }
+    if (vname) {                                                  /* S4 */
+        size_t bl = 0;
+        while (vname[bl] && vname[bl] != '[') bl++;
+        if (bl && shell_readonly_key(vname, bl)) {
+            shell_readonly_print_error(vname, bl, "shell");
+            shell_set_status(1);
+            return;
+        }
     }
 
     struct printf_capture cap __attribute__((cleanup(printf_capture_free)));
@@ -24101,7 +24276,23 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                                       const char *label, bool exported) {
     int rc = 0;
     for (int i = 0; i < assignc; i++) {
+        g_readonly_hit = false;
         if (env_set_kv(assignv[i]) < 0) {
+            /* A READONLY NAME (S4), measured against bash -- env_set_kv has
+             * already said "NAME: readonly variable":
+             *   a PREFIX (`x=3 true`): the assignment is skipped and the
+             *     command still runs;
+             *   a STATEMENT (`x=2; echo hi`): the rest of the line is
+             *     discarded, status 1 -- jump_to_top_level, as failglob. */
+            if (g_readonly_hit) {
+                if (exported) continue;
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                return 1;
+            }
             kprintf("%s: failed to set '%s'\n",
                     label ? label : "shell", assignv[i]);
             rc = 1;
@@ -24886,6 +25077,15 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
 static void shell_prefix_restore(struct shell_prefix_save *sv) {
     for (int i = 0; i < sv->count; i++) {
         struct shell_prefix_one *o = &sv->v[i];
+        /* A readonly name was never assigned by its prefix (S4: the
+         * assignment is refused and the command runs anyway), so there is
+         * nothing to put back -- and trying said "readonly variable" a
+         * second time. */
+        if (shell_readonly_key(o->name, strlen(o->name))) {
+            kfree(o->prev);
+            kfree(o->name);
+            continue;
+        }
         if (o->had && o->prev) {
             env_set(o->name, o->prev);
             int oi = env_find(o->name, strlen(o->name));
