@@ -24951,6 +24951,14 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     struct shell_fd_state *old_bfds = g_builtin_fds;
     g_builtin_fds = &fds;
     c->fn(cmd->argc, cmd->argv);
+#ifdef SHELL_HOSTED
+    /* One write per builtin, like bash's flush at the end of each one (S2;
+     * see kputc in programs/tsh/host.c). */
+    {
+        extern void shell_host_builtin_done(void);
+        shell_host_builtin_done();
+    }
+#endif
     g_builtin_fds = old_bfds;
     int rc = g_last_status;
     g_shell_fd[2] = old_diag;

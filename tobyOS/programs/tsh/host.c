@@ -129,12 +129,27 @@ void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
     if (suppress) *suppress = g_sink_suppress;
 }
 
+/* STDOUT IS BUFFERED, AS BASH'S IS (S2, 2026-09-30). This was
+ * write(1, &c, 1): one syscall per character of every builtin's output,
+ * so two shells printing at once interleaved INSIDE words -- 28 of 30 runs
+ * of `tsh -c 'echo word_a & echo word_b'` printed things like
+ * "wwoorrdd__ba", where bash, whose echo is one write, never splits a word.
+ * Now the bytes go through libtoby's stdout (line-buffered on a terminal,
+ * fully buffered otherwise), and shell_host_builtin_done() flushes it at
+ * the end of every builtin -- bash flushes stdout after each builtin the
+ * same way. libtoby also writes pending output out before ANY syscall
+ * (K5), so a spawn, a pipe, a read of the next line or a diagnostic on
+ * fd 2 all still see every byte printed before them. */
 void kputc(char c) {
     if (g_sink) {
         g_sink(g_sink_ctx, c);
         if (g_sink_suppress) return;   /* captured INSTEAD of printed */
     }
-    write(1, &c, 1);
+    (void)fputc((unsigned char)c, stdout);
+}
+
+void shell_host_builtin_done(void) {
+    (void)fflush(stdout);
 }
 
 void kprintf(const char *fmt, ...) {
