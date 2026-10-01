@@ -708,6 +708,102 @@ static unsigned long shell_lineno_at(const char *p) {
     return best;
 }
 
+/* THE LINE MAP OF A FUNCTION BODY ABOUT TO BE STORED. A body is copied out
+ * of the line being read when the definition runs, and only then can the
+ * map say which physical line each part of it came from; once stored, and
+ * called later, nothing could -- $LINENO in a body was the CALL's line
+ * (logs/s12/lineno.*: `f() {` / `echo $LINENO` / ... reported 5, the line
+ * of `f`, where bash says 2). shell_fndef_capture_map records it for the
+ * definition in hand; shell_function_set takes it. */
+static size_t        *g_fndef_lm_off;
+static unsigned long *g_fndef_lm_line;
+static int            g_fndef_lm_n;
+
+static void shell_fndef_drop_map(void) {
+    kfree(g_fndef_lm_off);
+    kfree(g_fndef_lm_line);
+    g_fndef_lm_off = 0;
+    g_fndef_lm_line = 0;
+    g_fndef_lm_n = 0;
+}
+
+/* The body text being stored is ORIG's `len` bytes, starting at offset
+ * `shift` of the stored text (a body wrapped as "{ ...; } REDIR" or
+ * "( ... )" starts 2 bytes in). */
+static void shell_fndef_capture_map(const char *orig, size_t len, size_t shift) {
+    shell_fndef_drop_map();
+    unsigned long first = shell_lineno_at(orig);
+    const char *t = shell_lmap_translate(orig);
+    if (!first || !g_lmap_base || !t || t < g_lmap_base) return;
+    size_t off0 = (size_t)(t - g_lmap_base);
+    int n = 1;
+    for (int i = 0; i < g_lmap_n; i++)
+        if (g_lmap_off[i] > off0 && g_lmap_off[i] < off0 + len) n++;
+    g_fndef_lm_off = (size_t *)kmalloc((size_t)n * sizeof(size_t));
+    g_fndef_lm_line = (unsigned long *)kmalloc((size_t)n * sizeof(unsigned long));
+    if (!g_fndef_lm_off || !g_fndef_lm_line) { shell_fndef_drop_map(); return; }
+    g_fndef_lm_off[0] = 0;
+    g_fndef_lm_line[0] = first;
+    int k = 1;
+    for (int i = 0; i < g_lmap_n && k < n; i++)
+        if (g_lmap_off[i] > off0 && g_lmap_off[i] < off0 + len) {
+            g_fndef_lm_off[k] = g_lmap_off[i] - off0 + shift;
+            g_fndef_lm_line[k] = g_lmap_line[i];
+            k++;
+        }
+    g_fndef_lm_n = k;
+}
+
+/* Run a stored body under its own line map: the caller's map is set aside
+ * and put back after, entry by entry, since a nested reader reuses the
+ * same arrays. */
+struct shell_lmap_saved {
+    const char *base;
+    size_t len, limit;
+    int n;
+    size_t *off;
+    unsigned long *line;
+};
+
+static bool shell_lmap_enter_body(const size_t *off, const unsigned long *line,
+                                  int n, const char *body,
+                                  struct shell_lmap_saved *sv) {
+    if (!off || !line || n <= 0 || !body) return false;
+    sv->base = g_lmap_base;
+    sv->len = g_lmap_len;
+    sv->limit = g_lmap_limit;
+    sv->n = g_lmap_n;
+    sv->off = 0;
+    sv->line = 0;
+    if (g_lmap_n > 0) {
+        sv->off = (size_t *)kmalloc((size_t)g_lmap_n * sizeof(size_t));
+        sv->line = (unsigned long *)kmalloc((size_t)g_lmap_n * sizeof(unsigned long));
+        if (!sv->off || !sv->line) {
+            kfree(sv->off);
+            kfree(sv->line);
+            return false;
+        }
+        memcpy(sv->off, g_lmap_off, (size_t)g_lmap_n * sizeof(size_t));
+        memcpy(sv->line, g_lmap_line, (size_t)g_lmap_n * sizeof(unsigned long));
+    }
+    g_lmap_base = body;
+    g_lmap_len = 0;
+    g_lmap_n = 0;
+    g_lmap_limit = strlen(body) + 1;
+    for (int i = 0; i < n; i++) shell_lmap_put(off[i], line[i]);
+    return true;
+}
+
+static void shell_lmap_leave_body(struct shell_lmap_saved *sv) {
+    g_lmap_n = 0;
+    for (int i = 0; i < sv->n; i++) shell_lmap_put(sv->off[i], sv->line[i]);
+    g_lmap_base = sv->base;
+    g_lmap_len = sv->len;
+    g_lmap_limit = sv->limit;
+    kfree(sv->off);
+    kfree(sv->line);
+}
+
 static char *g_param0;
 static char **g_positional;          /* heap, count slots; 0 when none */
 static int g_positional_count;
@@ -876,6 +972,13 @@ struct shell_function {
     char **heredoc;
     bool  *heredoc_expand;                          /* see shell_heredoc */
     int    nheredoc;
+    /* WHERE EACH LINE OF THE BODY IS, from the definition: lm_line[i] is
+     * the source line from body offset lm_off[i] on. A call runs the body
+     * with this map, so $LINENO -- and a diagnostic -- name the line in the
+     * body, not the line the call is on. */
+    size_t        *lm_off;
+    unsigned long *lm_line;
+    int            lm_n;
     /* `readonly -f` (S4): not redefined, not unset. */
     bool   readonly;
 };
@@ -3194,6 +3297,17 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
 
+    /* ...and the line map the definer captured (see shell_fndef_capture_map),
+     * which belongs to this body and no other. */
+    kfree(g_functions[idx].lm_off);
+    kfree(g_functions[idx].lm_line);
+    g_functions[idx].lm_off = g_fndef_lm_off;
+    g_functions[idx].lm_line = g_fndef_lm_line;
+    g_functions[idx].lm_n = g_fndef_lm_n;
+    g_fndef_lm_off = 0;
+    g_fndef_lm_line = 0;
+    g_fndef_lm_n = 0;
+
     /* Take over whatever here-documents the definition's own lines consumed.
      * They are still on the live queue at this moment -- the reader collects
      * per line and resets after the line is executed, and defining the
@@ -3236,6 +3350,11 @@ static void shell_function_unset(const char *name) {
     int idx = shell_function_find(name);
     if (idx < 0) return;
     g_functions[idx].readonly = false;
+    kfree(g_functions[idx].lm_off);
+    kfree(g_functions[idx].lm_line);
+    g_functions[idx].lm_off = 0;
+    g_functions[idx].lm_line = 0;
+    g_functions[idx].lm_n = 0;
     shell_hd_pin_text(g_functions[idx].body, -1);      /* see define */
     kfree(g_functions[idx].name);
     kfree(g_functions[idx].body);
@@ -26579,7 +26698,14 @@ static int shell_run_function(struct shell_simple *cmd) {
     if (run_body && run_name) {
         shell_hd_pin_text(run_body, +1);
         shell_callframe_push(run_name, g_shell_lineno);
+        /* The body's own lines for $LINENO, and the caller's back after. */
+        unsigned long call_line = g_shell_lineno;
+        struct shell_lmap_saved lm_sv;
+        bool lm_in = shell_lmap_enter_body(fn->lm_off, fn->lm_line, fn->lm_n,
+                                           run_body, &lm_sv);
         execute_line_text(run_body);
+        if (lm_in) shell_lmap_leave_body(&lm_sv);
+        g_shell_lineno = call_line;
         shell_callframe_pop();
         shell_hd_pin_text(run_body, -1);
     } else {
@@ -30083,6 +30209,7 @@ static bool shell_try_function_definition(const char *src) {
                 shell_set_status(2);
                 return true;
             }
+            shell_fndef_capture_map(s + 1, (size_t)(q - (s + 1)), 2);
             if (shell_function_set(fnameb.p, body.p) < 0) {
                 shell_set_status(1);
                 return true;
@@ -30146,6 +30273,7 @@ static bool shell_try_function_definition(const char *src) {
      * the whole group WITH its redirection is enough: the group parser already
      * applies a trailing redirection to everything inside it, and the text is
      * what gets re-executed on each call. */
+    size_t lm_shift = 0;                 /* see shell_fndef_capture_map */
     {
         const char *tail = shell_skip_blanks(body_end + 1);
         if (*tail && *tail != ';' && *tail != '&' && *tail != '|') {
@@ -30156,6 +30284,7 @@ static bool shell_try_function_definition(const char *src) {
                 if (w) {
                     kfree(body);
                     body = w;
+                    lm_shift = 2;
                 }
             }
         }
@@ -30168,6 +30297,13 @@ static bool shell_try_function_definition(const char *src) {
      * tsh stored the text and validated nothing until the call, so a function
      * that is defined and never called hid its own syntax error completely. */
     if (!shell_line_syntax_ok(body)) { kfree(body); return true; }
+    {
+        /* From where the stored text starts: shell_dup_segment trims the
+         * blanks and separators in front of it. */
+        const char *bs = body_start;
+        while (bs < body_end && (*bs == ' ' || *bs == '\t' || *bs == ';')) bs++;
+        shell_fndef_capture_map(bs, (size_t)(body_end - bs), lm_shift);
+    }
     if (shell_function_set(name, body) < 0) {
         kfree(body);
         kprintf("function: failed to define '%s'\n", name);
