@@ -744,6 +744,17 @@ struct proc {
     uint64_t        fault_count;
     uint64_t        last_fault_rip;
     uint64_t        last_fault_cr2;
+
+    /* K1 trace (2026-09-30, dual-schedule hunt): the last 8 run-queue
+     * events of this proc -- push, pop, steal, switch-in, finish -- with
+     * the CPU, the queue, the tsc and the state at that moment. Printed by
+     * the [dsched] tripwire in do_switch. Diagnostic only. */
+    struct {
+        uint64_t tsc;
+        uint64_t ra;
+        uint8_t  kind, cpu, qcpu, state, on_cpu, on_rq;
+    } sched_trace[8];
+    uint32_t        sched_trace_i;
 };
 
 /* ---- Milestone 19: time a child's exit --------------------------- *

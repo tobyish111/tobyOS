@@ -431,11 +431,90 @@ static inline int eff_prio(const struct proc *p, uint64_t now) {
     return p->prio + boost + p->io_boost;
 }
 
-static void queue_push_locked(struct percpu *cpu, struct proc *p) {
-    /* Defensive: never link a proc that is already queued. Doing so with
-     * p == cpu->ready_tail produced p->next_ready = p, a self-cycle that hung
-     * queue_pop_locked's walk (and therefore the entire system) forever. */
-    if (p->on_rq) return;
+/* K1 trace: see struct proc's sched_trace. The tripwire in do_switch prints
+ * it, so a fire names who queued the proc, who took it, and when. */
+enum { STR_PUSH = 1, STR_NOOP, STR_SELF, STR_FRONT, STR_POP, STR_STEAL,
+       STR_DROP, STR_SWIN, STR_FIN, STR_REM, STR_STALE, STR_KEEP };
+static const char *const str_names[] = { "?", "PUSH", "NOOP", "SELF", "FRONT",
+    "POP", "STEAL", "DROP", "SWIN", "FIN", "REM", "STALE", "KEEP" };
+static void str_ev(struct proc *p, int kind, int qcpu, uint64_t ra) {
+    uint32_t i = __atomic_fetch_add(&p->sched_trace_i, 1, __ATOMIC_RELAXED) & 7;
+    struct percpu *c = smp_this_cpu();
+    p->sched_trace[i].tsc    = perf_rdtsc();
+    p->sched_trace[i].ra     = ra;
+    p->sched_trace[i].kind   = (uint8_t)kind;
+    p->sched_trace[i].cpu    = c ? (uint8_t)c->cpu_idx : 0xff;
+    p->sched_trace[i].qcpu   = (uint8_t)qcpu;
+    p->sched_trace[i].state  = (uint8_t)p->state;
+    p->sched_trace[i].on_cpu = p->on_cpu;
+    p->sched_trace[i].on_rq  = p->on_rq ? 1 : 0;
+}
+static void str_dump(struct proc *p) {
+    uint64_t now = perf_rdtsc();
+    uint32_t n = __atomic_load_n(&p->sched_trace_i, __ATOMIC_RELAXED);
+    for (uint32_t k = (n > 8 ? n - 8 : 0); k < n; k++) {
+        uint32_t i = k & 7;
+        uint8_t kd = p->sched_trace[i].kind;
+        kprintf("[dsched]   ev#%u -%luus %s cpu%u q%u st=%u oncpu=%u onrq=%u ra=0x%lx\n",
+                k, (unsigned long)(perf_tsc_to_ns(now - p->sched_trace[i].tsc) / 1000ull),
+                kd <= STR_KEEP ? str_names[kd] : "?",
+                p->sched_trace[i].cpu, p->sched_trace[i].qcpu,
+                p->sched_trace[i].state, p->sched_trace[i].on_cpu,
+                p->sched_trace[i].on_rq, (unsigned long)p->sched_trace[i].ra);
+    }
+}
+
+/* K1 (2026-09-30): "queued" and "claimed" are each ONE atomic fact.
+ *
+ * on_rq  -- linked into exactly one CPU's ready list. Set by compare-and-
+ *           swap BEFORE linking, so two pushers holding two DIFFERENT queue
+ *           locks (sched_enqueue -> cpu 0's queue, sched_yield -> its own)
+ *           cannot both link the same proc. Cleared after unlinking.
+ * on_cpu -- 0 = free, else (cpu_idx + 1) of the CPU that owns the proc: the
+ *           one running it, about to switch into it, or still saving its
+ *           context. Taken by compare-and-swap AT POP, under the queue lock,
+ *           so the pop and the claim are one step; released only by
+ *           sched_finish_switch on the owning CPU (or by a refused switch).
+ *
+ * WHY. The [dsched] DUAL-SCHEDULE tripwire fired in most -smp 4 boots under
+ * pipe load, and the trace (logs/k1/) showed the chain every time:
+ *   1. a pipe waker queues P while P is still descending into its block --
+ *      P then runs on (spurious return) or blocks again, and the entry is
+ *      STALE: P is BLOCKED, off-CPU, and still linked;
+ *   2. CPU A pops the stale entry (state BLOCKED) and clears on_rq, but
+ *      sets on_cpu only later, in do_switch;
+ *   3. in that window pipe_read wakes P again: READY, and on_rq is clear,
+ *      so P is linked a SECOND time;
+ *   4. an idle AP steals that entry (on_cpu still 0) -- two CPUs switch
+ *      into one saved context; the second one's frame is garbage and the
+ *      AP dies ("EXCEPTION 1: Debug", cs = a kernel stack address).
+ * Claim-at-pop closes step 4 (the thief's CAS fails); dropping non-READY
+ * entries at pop closes step 2 (a BLOCKED proc is never run off a stale
+ * entry); the CAS on on_rq closes the two-lock double link. */
+_Static_assert(MAX_CPUS < 255, "on_cpu holds cpu_idx + 1 in one byte");
+static inline uint8_t cpu_tag(const struct percpu *c) {
+    return (uint8_t)(c->cpu_idx + 1);
+}
+
+static inline bool sched_claim(struct proc *p, uint8_t tag) {
+    uint8_t zero = 0;
+    return __atomic_compare_exchange_n(&p->on_cpu, &zero, tag, false,
+                                       __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+static inline bool rq_mark(struct proc *p) {
+    bool no = false;
+    return __atomic_compare_exchange_n(&p->on_rq, &no, true, false,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+
+/* Returns false when p is already linked (here or on another CPU's list). */
+static bool queue_push_locked(struct percpu *cpu, struct proc *p) {
+    /* Never link a proc that is already queued. Doing so with p ==
+     * cpu->ready_tail produced p->next_ready = p, a self-cycle that hung
+     * queue_pop_locked's walk (and therefore the entire system) forever;
+     * doing so on a second CPU's list made two CPUs pop one proc (K1). */
+    if (!rq_mark(p)) return false;
     p->next_ready = 0;
     p->enq_tick   = pit_ticks();       /* start the aging clock for this wait */
 #ifdef CHROMIUM_BOOT
@@ -447,11 +526,11 @@ static void queue_push_locked(struct percpu *cpu, struct proc *p) {
     } else {
         cpu->ready_head = cpu->ready_tail = p;
     }
-    p->on_rq = true;
+    return true;
 }
 
-static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
-    if (!p) return;
+static bool queue_push_front_locked(struct percpu *cpu, struct proc *p) {
+    if (!p || !rq_mark(p)) return false;
     p->enq_tick   = pit_ticks();
 #ifdef CHROMIUM_BOOT
     p->enq_ns     = perf_now_ns();     /* slice 94: [wlat] wake->run stamp */
@@ -459,64 +538,116 @@ static void queue_push_front_locked(struct percpu *cpu, struct proc *p) {
     p->next_ready = cpu->ready_head;
     cpu->ready_head = p;
     if (!cpu->ready_tail) cpu->ready_tail = p;
+    return true;
 }
 
-/* Unlink + return the highest-effective-priority proc on cpu's queue, or NULL.
+static void queue_unlink_locked(struct percpu *cpu, struct proc *prev,
+                                struct proc *p) {
+    if (prev) prev->next_ready = p->next_ready;
+    else      cpu->ready_head  = p->next_ready;
+    if (cpu->ready_tail == p) cpu->ready_tail = prev;
+    p->next_ready = 0;
+}
+
+/* Unlink + CLAIM + return the highest-effective-priority runnable proc on
+ * cpu's queue, or NULL. `steal` = another CPU's queue: idle procs (pid 0,
+ * ap_idle) are pinned to their home core and are never taken, and a dying
+ * proc is left for its home queue's pop to unlink and log.
+ *
  * Ties are broken FIFO (the queue is walked head->tail and a strictly-greater
  * test keeps the first/oldest contender), so equal-priority procs round-robin
  * exactly as the old plain-FIFO pop did -- which is why a tree of all-NORMAL
- * procs behaves identically to before. */
-static struct proc *queue_pop_locked(struct percpu *cpu) {
+ * procs behaves identically to before.
+ *
+ * The returned proc's on_cpu is already `tag`: the caller MUST either switch
+ * into it (do_switch) or release it. */
+static struct proc *queue_take_locked(struct percpu *cpu, uint8_t tag,
+                                      bool steal) {
     uint64_t now = pit_ticks();
-    struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
-    int best_eff = 0;
-    while (p) {
-        /* Wake-after-death, second net (2026-08-23): a proc that was
-         * enqueued BEFORE its exit reached the tombstone store can still
-         * sit here -- the sched_enqueue guard cannot see history.
-         * Switching into it resumes a TERMINATED context and proc_exit's
-         * "sched_yield returned" panic fires (observed ~1/13 boots).
-         * Unlink it in place and say so; the stale entry is the crime
-         * scene this line photographs. */
-        if (p->dying) {
+    for (int pass = 0; pass < 4; pass++) {
+        struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
+        int best_eff = 0, hops = 0;
+        while (p && hops++ < 2 * PROC_MAX) {
             struct proc *nx = p->next_ready;
-            kprintf("[sched] DROPPED queued dying pid=%d '%s' (state=%d)\n",
-                    p->pid, p->name ? p->name : "?", (int)p->state);
-            if (prev) prev->next_ready = nx;
-            else      cpu->ready_head  = nx;
-            if (cpu->ready_tail == p) cpu->ready_tail = prev;
-            p->next_ready = 0;
-            p->on_rq      = false;
-            p = nx;
-            continue;
-        }
-        /* Slice 39: skip procs whose context save hasn't completed (still
-         * live on some CPU). They stay queued; the next pop after
-         * sched_finish_switch clears on_cpu gets them with a VALID context.
-         * ACQUIRE pairs with the RELEASE clear so saved_rsp is visible. */
-        if (!__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
+            /* Wake-after-death, second net (2026-08-23): a proc that was
+             * enqueued BEFORE its exit reached the tombstone store can still
+             * sit here -- the sched_enqueue guard cannot see history.
+             * Switching into it resumes a TERMINATED context and proc_exit's
+             * "sched_yield returned" panic fires (observed ~1/13 boots).
+             * Unlink it in place and say so; the stale entry is the crime
+             * scene this line photographs. */
+            if (p->dying) {
+                if (steal) { prev = p; p = nx; continue; }
+                str_ev(p, STR_DROP, cpu->cpu_idx, 0);
+                kprintf("[sched] DROPPED queued dying pid=%d '%s' (state=%d)\n",
+                        p->pid, p->name ? p->name : "?", (int)p->state);
+                queue_unlink_locked(cpu, prev, p);
+                __atomic_store_n(&p->on_rq, false, __ATOMIC_RELEASE);
+                p = nx;
+                continue;
+            }
+            /* Slice 39: skip procs another CPU owns (running, or context
+             * not yet saved). They stay queued; once sched_finish_switch
+             * releases them the next pop gets them with a VALID context.
+             * ACQUIRE pairs with the RELEASE clear so saved_rsp is visible. */
+            if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE) ||
+                (steal && p->is_idle)) {
+                prev = p; p = nx;
+                continue;
+            }
+            /* K1: a STALE entry -- the proc blocked (or stopped) again after
+             * it was queued. Running it would be a spurious wake at best and,
+             * with a waker racing the switch, a dual schedule. Unlink it.
+             * A waker does {state = READY; lock; CAS on_rq}: clearing on_rq
+             * and THEN re-reading state (both SEQ_CST) means that either the
+             * waker's CAS sees on_rq clear and links it, or we see READY and
+             * keep it -- never neither. */
+            if (p->state != PROC_READY) {
+                queue_unlink_locked(cpu, prev, p);
+                __atomic_store_n(&p->on_rq, false, __ATOMIC_SEQ_CST);
+                if (__atomic_load_n(&p->state, __ATOMIC_SEQ_CST) == PROC_READY &&
+                    queue_push_locked(cpu, p))
+                    str_ev(p, STR_KEEP, cpu->cpu_idx, 0);   /* back at the tail */
+                else
+                    str_ev(p, STR_STALE, cpu->cpu_idx, 0);
+                p = nx;                                     /* prev unchanged */
+                continue;
+            }
             int eff = eff_prio(p, now);
             if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
+            prev = p;
+            p = nx;
         }
-        prev = p;
-        p = p->next_ready;
+        if (!best) return 0;
+        /* The claim. Under this queue's lock, and best is linked only here
+         * (on_rq), so no other picker can be looking at it -- but a proc can
+         * also be claimed directly by do_switch (a CPU's own idle proc), so
+         * the CAS is what decides, and a lost race just scans again. */
+        if (!sched_claim(best, tag)) continue;
+        queue_unlink_locked(cpu, best_prev, best);
+        str_ev(best, steal ? STR_STEAL : STR_POP, cpu->cpu_idx, 0);
+        __atomic_store_n(&best->on_rq, false, __ATOMIC_RELEASE);
+        return best;
     }
-    if (!best) return 0;
-    if (best_prev) best_prev->next_ready = best->next_ready;
-    else           cpu->ready_head       = best->next_ready;
-    if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
-    best->next_ready = 0;
-    best->on_rq      = false;
-    return best;
+    return 0;
+}
+
+static inline struct proc *queue_pop_locked(struct percpu *cpu,
+                                            struct percpu *me) {
+    return queue_take_locked(cpu, cpu_tag(me), false);
+}
+
+static inline struct proc *queue_steal_locked(struct percpu *cpu,
+                                              struct percpu *me) {
+    return queue_take_locked(cpu, cpu_tag(me), true);
 }
 
 static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
     if (!cpu || !p || !cpu->ready_head) return false;
     if (cpu->ready_head == p) {
-        cpu->ready_head = p->next_ready;
-        if (cpu->ready_tail == p) cpu->ready_tail = 0;
-        p->next_ready = 0;
-        p->on_rq      = false;
+        queue_unlink_locked(cpu, 0, p);
+        str_ev(p, STR_REM, cpu->cpu_idx, 0);
+        __atomic_store_n(&p->on_rq, false, __ATOMIC_RELEASE);
         return true;
     }
 
@@ -526,41 +657,10 @@ static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
     }
     if (prev->next_ready != p) return false;
 
-    prev->next_ready = p->next_ready;
-    if (cpu->ready_tail == p) cpu->ready_tail = prev;
-    p->next_ready = 0;
-    p->on_rq      = false;
+    queue_unlink_locked(cpu, prev, p);
+    str_ev(p, STR_REM, cpu->cpu_idx, 0);
+    __atomic_store_n(&p->on_rq, false, __ATOMIC_RELEASE);
     return true;
-}
-
-/* Unlink + return the highest-effective-priority NON-idle runnable proc from
- * cpu's queue, or NULL. Idle procs (pid 0, ap_idle) are pinned to their home
- * core and must never be migrated, so work-stealing skips them. Same FIFO-tie
- * + aging policy as queue_pop_locked. */
-static struct proc *queue_steal_locked(struct percpu *cpu) {
-    uint64_t now = pit_ticks();
-    struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
-    int best_eff = 0;
-    while (p) {
-        /* Skip idle procs (pinned), on_cpu procs (context not yet saved
-         * -- see queue_pop_locked / ledger slice 39), and dying procs
-         * (2026-08-23: never steal a corpse; the home queue's pop guard
-         * unlinks and logs it). */
-        if (!p->is_idle && !p->dying &&
-            !__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) {
-            int eff = eff_prio(p, now);
-            if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
-        }
-        prev = p;
-        p = p->next_ready;
-    }
-    if (!best) return 0;
-    if (best_prev) best_prev->next_ready = best->next_ready;
-    else           cpu->ready_head       = best->next_ready;
-    if (cpu->ready_tail == best) cpu->ready_tail = best_prev;
-    best->next_ready = 0;
-    best->on_rq      = false;
-    return best;
 }
 
 /* Count this CPU's stealable (non-idle) ready procs -- a load estimate for
@@ -579,7 +679,7 @@ static int queue_depth(struct percpu *cpu) {
  * NULL if nothing is runnable anywhere. */
 static struct proc *steal_one(struct percpu *me) {
     uint64_t f = spin_lock_irqsave(&me->ready_lock);
-    struct proc *p = queue_steal_locked(me);
+    struct proc *p = queue_steal_locked(me, me);
     spin_unlock_irqrestore(&me->ready_lock, f);
     if (p) return p;
 
@@ -596,7 +696,7 @@ static struct proc *steal_one(struct percpu *me) {
     }
     if (victim) {
         uint64_t f2 = spin_lock_irqsave(&victim->ready_lock);
-        p = queue_steal_locked(victim);
+        p = queue_steal_locked(victim, me);
         spin_unlock_irqrestore(&victim->ready_lock, f2);
         if (p) return p;
     }
@@ -607,7 +707,7 @@ static struct proc *steal_one(struct percpu *me) {
         struct percpu *o = smp_cpu_mut((me->cpu_idx + i) % n);
         if (!o || !o->ready_head) continue;
         uint64_t f2 = spin_lock_irqsave(&o->ready_lock);
-        p = queue_steal_locked(o);
+        p = queue_steal_locked(o, me);
         spin_unlock_irqrestore(&o->ready_lock, f2);
         if (p) return p;
     }
@@ -749,8 +849,16 @@ int sched_guard_selftest(void) {
     return fails;
 }
 
+/* Give back a claim this CPU took at pop (K1) for a proc it will not run. */
+static void sched_unclaim(struct proc *p, uint8_t tag) {
+    uint8_t mine = tag;
+    if (p) __atomic_compare_exchange_n(&p->on_cpu, &mine, 0, false,
+                                       __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
 static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                       bool reacquire_bkl) {
+    uint8_t tag = cpu_tag(me);
     /* The net described above. Capped logging: a repeating fault must not
      * bury the serial log it is the only evidence in. */
     {
@@ -776,6 +884,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
             /* Fall back to this CPU's idle proc. Returning without
              * switching would leave `from` running, which is also correct
              * but hides the event from the run queue's accounting. */
+            sched_unclaim(to, tag);
             if (me->idle && from != me->idle) to = me->idle;
             else return;
         }
@@ -790,6 +899,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                 to->tgid, from ? from->pid : -1);
         to->state = PROC_UNUSED;
         to->kstack_top = 0;
+        sched_unclaim(to, tag);
         if (me->idle && from != me->idle)
             to = me->idle;
         else
@@ -800,17 +910,13 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
          to->state == PROC_EMBRYO)) {
         kprintf("[sched] SKIP bad kstack pid=%d top=%p state=%d\n",
                 to->pid, to->kstack_top, (int)to->state);
+        sched_unclaim(to, tag);
         if (me->idle && from != me->idle)
             to = me->idle;
         else
             return;
     }
 #endif
-    uint64_t t = perf_rdtsc();
-    if (from) perf_proc_account_out(from, t);
-    perf_proc_account_in(to, t);
-    perf_count_ctx_switch();
-    perf_zone_end(PERF_Z_SCHED_SWITCH, t);
 
     /* Slice 89 tripwire: switching into a proc that is STILL live on another
      * CPU means two CPUs will run the same kernel stack/register image --
@@ -834,11 +940,16 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
      * saved_rsp lies inside the proc's own kernel stack is structurally blind
      * to this failure. Two CPUs then pop the same saved register image.
      *
-     * Logging only, deliberately: refusing the switch here would be a fix
-     * built on one sample, and if the on_cpu flag can be STALE the refusal
-     * would strand a runnable proc. Capped so a repeating fire cannot bury
-     * the serial log it is the only evidence in. */
-    if (__atomic_load_n(&to->on_cpu, __ATOMIC_ACQUIRE)) {
+     * K1 (2026-09-30): ROOT-CAUSED AND NOW A HARD CHECK. The proc must be
+     * owned by THIS cpu: claimed at pop (queue_take_locked), or -- a CPU's
+     * own idle proc, which is never queued -- claimed here. Anything else
+     * means another CPU owns it, and it is NOT run twice: this CPU falls
+     * back to its idle proc (or stays in `from`). The trace printed with the
+     * report names every queue event that led here. It must stay silent.
+     * Capped so a repeating fire cannot bury the serial log. */
+    str_ev(to, STR_SWIN, me->cpu_idx, (uint64_t)__builtin_return_address(0));
+    if (__atomic_load_n(&to->on_cpu, __ATOMIC_ACQUIRE) != tag &&
+        !sched_claim(to, tag)) {
         static int dsched_logged;
         if (dsched_logged < 16) {
             dsched_logged++;
@@ -848,8 +959,21 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
                     me->cpu_idx, from ? from->pid : -1,
                     (unsigned long)to->saved_rsp,
                     (unsigned long)(uintptr_t)to->kstack_top);
+            str_dump(to);
         }
+        /* Never run it twice: the CPU that owns it is running it. */
+        if (me->idle && to != me->idle && from != me->idle &&
+            (__atomic_load_n(&me->idle->on_cpu, __ATOMIC_ACQUIRE) == tag ||
+             sched_claim(me->idle, tag)))
+            to = me->idle;
+        else
+            return;
     }
+    uint64_t t = perf_rdtsc();
+    if (from) perf_proc_account_out(from, t);
+    perf_proc_account_in(to, t);
+    perf_count_ctx_switch();
+    perf_zone_end(PERF_Z_SCHED_SWITCH, t);
 #ifdef CHROMIUM_BOOT
     /* Slice 94: [wlat] -- wall time between a proc being made READY and it
      * actually starting to run. This is THE number behind every IPC hop on
@@ -887,11 +1011,11 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
 #endif
     to->state       = PROC_RUNNING;
     to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
-    /* Slice 39: mark `to` live-on-CPU before it can possibly be re-enqueued,
-     * and remember `from` so the code that runs AFTER the register switch
-     * (post-switch line below, or a first-entry trampoline) can clear its
-     * on_cpu once its context save is complete. See sched_finish_switch. */
-    __atomic_store_n(&to->on_cpu, 1, __ATOMIC_RELAXED);
+    /* Slice 39: `to` is live-on-CPU (claimed above, before it could possibly
+     * be picked again). Remember `from` so the code that runs AFTER the
+     * register switch (post-switch line below, or a first-entry trampoline)
+     * can release its on_cpu once its context save is complete. See
+     * sched_finish_switch. */
     me->prev_proc   = from;
     g_current_proc  = to;
     me->current     = to;
@@ -935,6 +1059,7 @@ void sched_finish_switch(void) {
     struct proc *prev = cpu->prev_proc;
     if (prev) {
         cpu->prev_proc = 0;
+        str_ev(prev, STR_FIN, cpu->cpu_idx, 0);
         __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
 #ifdef CHROMIUM_BOOT
         /* Slice 95: [wlat] measures PICKABLE time. A proc that sat queued
@@ -1061,7 +1186,9 @@ void sched_enqueue(struct proc *p) {
      * (ready_tail->next_ready = p with ready_tail == p), wedging the scheduler
      * for every process; and testing outside the lock races another CPU. */
     uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
-    queue_push_locked(cpu, p);                  /* no-ops if already on_rq */
+    bool pushed = queue_push_locked(cpu, p);    /* no-ops if already on_rq */
+    str_ev(p, pushed ? STR_PUSH : STR_NOOP, cpu->cpu_idx,
+           (uint64_t)__builtin_return_address(0));
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
 
     /* Slice 94: WAKE KICK. Work lands on the BSP queue; a halted AP would
@@ -1119,8 +1246,11 @@ void sched_boost_pid(int pid) {
     if (!cpu) return;
 
     uint64_t flags = spin_lock_irqsave(&cpu->ready_lock);
-    (void)queue_remove_locked(cpu, p);
-    queue_push_front_locked(cpu, p);
+    /* Only a proc that was on THIS queue moves to its front: one linked on
+     * another CPU's list must stay there (K1 -- linking it here as well made
+     * it poppable twice). */
+    if (queue_remove_locked(cpu, p) && queue_push_front_locked(cpu, p))
+        str_ev(p, STR_FRONT, 0, (uint64_t)__builtin_return_address(0));
     spin_unlock_irqrestore(&cpu->ready_lock, flags);
 }
 
@@ -1397,14 +1527,16 @@ void sched_yield(void) {
     if (cur && cur->state == PROC_RUNNING) {
         cur->state = PROC_READY;
         uint64_t f = spin_lock_irqsave(&me->ready_lock);
-        if (!cur->next_ready) queue_push_locked(me, cur);
+        bool pushed = queue_push_locked(me, cur);   /* no-ops if already on_rq */
+        str_ev(cur, pushed ? STR_SELF : STR_NOOP, me->cpu_idx,
+               (uint64_t)__builtin_return_address(0));
         spin_unlock_irqrestore(&me->ready_lock, f);
     }
 
     struct proc *next;
     {
         uint64_t f = spin_lock_irqsave(&me->ready_lock);
-        next = queue_pop_locked(me);
+        next = queue_pop_locked(me, me);
         spin_unlock_irqrestore(&me->ready_lock, f);
     }
 
@@ -1416,7 +1548,7 @@ void sched_yield(void) {
             struct percpu *other = smp_cpu_mut((my_idx + i) % ncpus);
             if (!other || !other->ready_head) continue;
             uint64_t f = spin_lock_irqsave(&other->ready_lock);
-            next = queue_steal_locked(other);    /* skip idle procs */
+            next = queue_steal_locked(other, me);    /* skip idle procs */
             spin_unlock_irqrestore(&other->ready_lock, f);
         }
     }
@@ -1501,7 +1633,7 @@ void sched_yield(void) {
                     }
                 }
                 uint64_t f = spin_lock_irqsave(&me->ready_lock);
-                next = queue_pop_locked(me);
+                next = queue_pop_locked(me, me);
                 spin_unlock_irqrestore(&me->ready_lock, f);
                 if (next) { halt_since = 0; break; }
                 if (cur && cur->state == PROC_READY) {

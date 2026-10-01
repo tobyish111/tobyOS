@@ -516,6 +516,7 @@ long sys_fork(void) {
      * Observed: fork returned but the child never executed one instruction. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     child->vm_quiesce  = 0;
     child->vm_quiesced = 0;
     child->mm_owner    = 0;
@@ -929,6 +930,7 @@ long sys_fork_share(void) {
     child->ptrace_retval   = 0;
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     child->vm_quiesce  = 0;
     child->vm_quiesced = 0;
     /* Per-call clone staging must not be inherited -- see sys_fork. */
@@ -1175,6 +1177,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
      * live on_cpu/on_rq, which would make this thread unschedulable. */
     child->on_rq  = false;
     child->on_cpu = 0;
+    child->sched_trace_i = 0;          /* K1 trace: not the parent's events */
     /* Per-call clone staging must not be inherited -- see sys_fork. */
     child->clone_ns_flags    = 0;
     child->clone_child_stack = 0;
