@@ -127,6 +127,21 @@ extern volatile struct limine_module_request module_req;
  * shell_argmarks_to_spaces), counting as the element's text until then.
  * Data bytes equal to it are escaped like the other markers'. */
 #define SHELL_EMPTY_ELEM '\x05'
+/* TWO "@" EXPANSIONS IN ONE WORD JOIN AT THE SEAM (S3, 2026-09-30):
+ *
+ *     a=(1 2) b=(x y)   "${a[@]}${b[@]}"   bash: [1] [2x] [y]
+ *     set -- A B        "$@$@"             bash: [A] [BA] [B]
+ *
+ * Each expansion's elements are separate words, but the LAST element of one
+ * and the FIRST of the next are one word, with any text between them. Every
+ * "@" expansion opens with a SHELL_ARG_MARK (that is how zero elements are
+ * told from one empty one), so a second expansion's opening mark split the
+ * seam and tsh printed [1] [2] [x] [y]. An expansion that starts in a word
+ * which already holds a mark opens with THIS byte instead: it marks "an @
+ * expansion starts here" without starting a field, and every place that
+ * resolves the marks drops it. Data bytes equal to it are escaped like the
+ * other markers'. */
+#define SHELL_ARG_JOIN '\x06'
 /* THE SHELL HAS NO ARGUMENT LIMIT (2026-09-29). It was 32, then 256, then
  * 1024 hosted and 256 in the kernel -- each raise argued against the stack
  * cost of `char *argv[ARG_MAX]` arrays and of `struct shell_simple`, which
@@ -306,7 +321,7 @@ static int sb_put_data_n(struct shell_sb *b, const char *sv, size_t n) {
         char c = sv[i];
         if (c != SHELL_ARG_MARK && c != SHELL_NOSPLIT_MARK &&
             c != SHELL_GLOB_ESC && c != SHELL_DATA_ESC &&
-            c != SHELL_EMPTY_ELEM) continue;
+            c != SHELL_EMPTY_ELEM && c != SHELL_ARG_JOIN) continue;
         if (sb_putmem(b, sv + from, i - from) < 0) return -1;
         if (sb_putc(b, SHELL_DATA_ESC) < 0) return -1;
         from = i;                       /* the marker byte itself goes next */
@@ -1852,7 +1867,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         for (const char *q = ex; *q; q++) {
             if (*q == SHELL_DATA_ESC && q[1]) { q++; real++; continue; }
             if (*q == SHELL_ARG_MARK) marks++;
-            else if (*q != SHELL_NOSPLIT_MARK) real++;
+            else if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_ARG_JOIN) real++;
         }
         /* Marks and no text at all: every expansion in the word produced
          * nothing. No element -- unless a quoted null was written, which is
@@ -1876,6 +1891,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             }
             if (*q == SHELL_NOSPLIT_MARK) { in_nosplit = !in_nosplit; continue; }
             if (*q == SHELL_EMPTY_ELEM) { elem = true; continue; }
+            if (*q == SHELL_ARG_JOIN) continue;          /* S3: no boundary */
             /* A `$@`/`${a[@]}` mark is a field boundary even inside quotes --
              * that is the whole reason the marker exists. Every mark but the
              * first; see above. */
@@ -17156,6 +17172,32 @@ static int sh_join_empty_elem(struct shell_sb *b, size_t before) {
     return sb_putc(b, SHELL_EMPTY_ELEM);
 }
 
+/* Does the word built so far hold a "@" expansion's field mark? */
+static bool sh_sb_has_argmark(const struct shell_sb *b) {
+    for (size_t i = 0; i < b->len; i++) {
+        if (b->p[i] == SHELL_DATA_ESC && i + 1 < b->len) { i++; continue; }
+        if (b->p[i] == SHELL_ARG_MARK) return true;
+    }
+    return false;
+}
+
+/* The mark that opens a "@" expansion's elements: a field mark, or -- when
+ * an earlier "@" expansion in this word has one -- SHELL_ARG_JOIN, so this
+ * expansion's first element joins the previous one's last (S3). */
+static int sh_put_lead_mark(struct shell_sb *b) {
+    return sb_putc(b, sh_sb_has_argmark(b) ? SHELL_ARG_JOIN : SHELL_ARG_MARK);
+}
+
+/* Append a "$@"-style VALUE -- built on its own, so it opens with its own
+ * field mark -- to the word, under the same rule. */
+static int sh_put_join_value(struct shell_sb *b, const char *value) {
+    if (value[0] == SHELL_ARG_MARK && sh_sb_has_argmark(b)) {
+        if (sb_putc(b, SHELL_ARG_JOIN) < 0) return -1;
+        return sb_puts(b, value + 1);
+    }
+    return sb_puts(b, value);
+}
+
 static int shell_append_positional_join(struct shell_sb *b,
                                         bool star) {
     if (!star) {                                /* "$@" -- one word each */
@@ -17168,8 +17210,10 @@ static int shell_append_positional_join(struct shell_sb *b,
          * The leading marker is what makes the zero-parameter case
          * distinguishable from a literal empty word, and it makes the text
          * before it unambiguously a PREFIX that shell_add_marked_words glues
-         * onto the first parameter -- which is how bash treats `"pre$@"`. */
-        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+         * onto the first parameter -- which is how bash treats `"pre$@"`.
+         * A second "@" expansion in the same word opens with a JOIN instead
+         * (sh_put_lead_mark; S3). */
+        if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
@@ -17197,7 +17241,7 @@ static int shell_append_positional_join(struct shell_sb *b,
      * files it as POSIX even though it reads like a quirk. Quoted, the join is
      * still correct -- g_dq_depth is what tells the two apart. */
     if (ifs && !*ifs && g_dq_depth == 0) {
-        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+        if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
@@ -17236,7 +17280,7 @@ static int shell_append_array_join(struct shell_sb *b,
     else if (ifs) sep = '\0';
 
     if (!star) {
-        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+        if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < n; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
                 return -1;
@@ -17316,7 +17360,7 @@ static int shell_append_array_slice(struct shell_sb *b,
     else if (ifs) sep = '\0';
 
     if (!star) {
-        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+        if (sh_put_lead_mark(b) < 0) return -1;
         bool first = true;
         for (long i = off; i < end; i++) {
             if (!first && sb_putc(b, SHELL_ARG_MARK) < 0)
@@ -17878,7 +17922,7 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
     if (ifs && *ifs) sep = ifs[0];
     else if (ifs) sep = '\0';
 
-    if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
+    if (!star && sh_put_lead_mark(b) < 0)
         return -1;
     for (int i = 0; i < n; i++) {
         if (i > 0) {
@@ -18273,7 +18317,7 @@ static int shell_expand_at_transform(const char *name, char opch,
         return -1;
     }
     /* As a C string, as before: an @E that decoded a NUL ends the value. */
-    return vjoin ? sb_puts(b, out.p)
+    return vjoin ? sh_put_join_value(b, out.p)
                  : sb_put_data_str(b, out.p);
 }
 
@@ -18325,7 +18369,7 @@ static int shell_expand_substring(const char *name, const char *spec,
         const char *ifs = env_get("IFS");
         if (ifs && *ifs) sep = ifs[0];
         else if (ifs) sep = '\0';
-        if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
+        if (!star && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
         for (long i = off; i < end; i++) {
@@ -18714,7 +18758,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                         const char *ifs2 = env_get("IFS");
                         if (ifs2 && *ifs2) sep = ifs2[0];
                         else if (ifs2) sep = '\0';
-                        if (!star && sb_putc(b, SHELL_ARG_MARK) < 0)
+                        if (!star && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
                             /* Looked up again every time round: the operator
@@ -18906,7 +18950,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
              * bash gives `abc` for ${x///S} and ${x//''/S}, but `Sabc` and
              * `abcS` for ${x/#/S} and ${x/%/S}. */
             if (!pattern[0] && !at_start && !at_end)
-                return vjoin ? sb_puts(b, value)
+                return vjoin ? sh_put_join_value(b, value)
                              : sb_put_data_str(b, value);
             /* WHICH LENGTHS CAN MATCH, AND WHERE. Trying every length at
              * every position is O(n^2) matcher calls per substitution --
@@ -18969,7 +19013,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                 if (i < vlen && sb_putc(&out, value[i]) < 0) return -1;
                 i++;
             }
-            return vjoin ? sb_puts(b, out.p)
+            return vjoin ? sh_put_join_value(b, out.p)
                          : sb_put_data_str(b, out.p);
         }
         if (*op == '^' || *op == ',') {
@@ -18986,7 +19030,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                 else            { if (c >= 'A' && c <= 'Z') value[i] = (char)(c + 32); }
                 if (!all) break;          /* ${v^} touches the FIRST char only */
             }
-            return vjoin ? sb_puts(b, value)
+            return vjoin ? sh_put_join_value(b, value)
                          : sb_put_data_str(b, value);
         }
         if (*op == '#' || *op == '%') {
@@ -19084,7 +19128,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                             : sb_put_data_n(b, value, 0);
                 }
             }
-            return vjoin ? sb_puts(b, value)
+            return vjoin ? sh_put_join_value(b, value)
                          : sb_put_data_str(b, value);
         }
         if (*op == ':') {
@@ -19140,6 +19184,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
             if (*nz == SHELL_ARG_MARK)     { marks++; continue; }
             if (*nz == SHELL_NOSPLIT_MARK) continue;
             if (*nz == SHELL_EMPTY_ELEM)   continue;   /* joins as "" */
+            if (*nz == SHELL_ARG_JOIN)     continue;   /* S3: a seam */
             text++;
         }
         is_null = (text == 0 && marks <= 1);
@@ -19162,7 +19207,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
             kprintf("%s: unbound variable\n", shell_param_display(name));
             return -1;
         }
-        return is_join ? sb_puts(b, value)
+        return is_join ? sh_put_join_value(b, value)
                        : sb_put_data_str(b, value);
     }
 
@@ -19207,7 +19252,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     switch (opch) {
     case '-':
         if (!missing)
-            return is_join ? sb_puts(b, value)
+            return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
@@ -19215,7 +19260,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
         return sb_puts(b, ewb.p);
     case '=':
         if (!missing)
-            return is_join ? sb_puts(b, value)
+            return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
         if (!shell_var_start(name[0])) {
             kprintf("shell: cannot assign to special parameter\n");
@@ -19231,7 +19276,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
         return sb_puts(b, ewb.p);
     case '?':
         if (!missing)
-            return is_join ? sb_puts(b, value)
+            return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         /* `?` and `:?` say different things when there is no word: bash
@@ -23302,7 +23347,8 @@ static int shell_argmarks_to_spaces(const char *src, struct shell_sb *out) {
             if (sb_putc(out, *q++) < 0 || sb_putc(out, *q) < 0) return -1;
             continue;
         }
-        if (*q == SHELL_NOSPLIT_MARK || *q == SHELL_EMPTY_ELEM) continue;
+        if (*q == SHELL_NOSPLIT_MARK || *q == SHELL_EMPTY_ELEM ||
+            *q == SHELL_ARG_JOIN) continue;
         if (*q == SHELL_ARG_MARK) {
             if (first) { first = false; continue; }
             if (sb_putc(out, ' ') < 0) return -1;
@@ -23367,7 +23413,7 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         size_t real = 0;
         for (const char *q = start; q < p; q++) {
             if (*q == SHELL_DATA_ESC && q + 1 < p) { q++; real++; continue; }
-            if (*q != SHELL_NOSPLIT_MARK) real++;
+            if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_ARG_JOIN) real++;
         }
         size_t real_prefix = 0;
         for (size_t q = 0; q < prefix_len; q++)
@@ -23395,11 +23441,12 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
          * they reach the program as raw 0x02 bytes in argv. */
         SH_SB(clean);
         if (shell_strip_nosplit(&clean, tmp.p) < 0) return -1;
-        {   /* an empty element's body (SHELL_EMPTY_ELEM) is no text */
+        {   /* an empty element's body (SHELL_EMPTY_ELEM) is no text, and
+             * a seam between two "@" expansions (SHELL_ARG_JOIN) none */
             char *w = clean.p;
             for (const char *r = clean.p; *r; r++) {
                 if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
-                if (*r != SHELL_EMPTY_ELEM) *w++ = *r;
+                if (*r != SHELL_EMPTY_ELEM && *r != SHELL_ARG_JOIN) *w++ = *r;
             }
             *w = '\0';
             clean.len = (size_t)(w - clean.p);
