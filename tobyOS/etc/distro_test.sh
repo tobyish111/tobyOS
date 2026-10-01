@@ -725,6 +725,10 @@ tsh -c 'for i in $(seq 1 200); do :; done; echo loop ok'
 
 echo @@sig_regs
 /bin/sigregs
+echo @@sig_regs_nested
+/bin/sigregs nested 2>&1
+echo @@sig_regs_eintr
+/bin/sigregs eintr 2>&1; echo rc=$?
 echo @@mu_arch
 /bin/arch; busybox arch
 echo @@mu_true_false

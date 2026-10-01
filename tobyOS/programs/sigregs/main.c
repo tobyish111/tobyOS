@@ -36,6 +36,22 @@
  *
  *     sigregs: 200 signals, 0 clobbers
  */
+/*
+ * `sigregs nested` and `sigregs eintr` (M1, finding 21) take the case that
+ * one-at-a-time delivery never reaches: a SECOND signal already pending
+ * when the first handler's rt_sigreturn unblocks it, so it is delivered on
+ * the way out of rt_sigreturn itself -- two SIGCHLDs for two children, the
+ * shape bash 5.2 still died of (exit 139) in shparity 146. The SIGUSR1
+ * handler raises SIGUSR2, which its sa_mask holds off until that return.
+ *
+ *   nested: the parent spins as above; rcx/r11 must survive BOTH frames.
+ *           sigregs nested: 200 signals, 200 at sigreturn, 0 clobbers
+ *   eintr:  the parent sleeps instead, so most SIGUSR1s interrupt the
+ *           sleep and the resumed context's rax is -EINTR; SIGUSR2 has
+ *           SA_RESTART, which must NOT restart anything when the "syscall"
+ *           being returned from is rt_sigreturn. The process must live.
+ *           sigregs eintr: 200 signals, 200 at sigreturn, N sleeps interrupted
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -43,6 +59,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <tobyos/abi/abi.h>
 
 #define N_SIGNALS 200
 #define RCX_MAGIC 0x1122334455667788ULL
@@ -78,7 +95,105 @@ static void spin_and_read(uint64_t iters, uint64_t *rcx_out, uint64_t *r11_out) 
     *r11_out = oe;
 }
 
-int main(void) {
+/* ---- nested / eintr ----------------------------------------------------- */
+
+static volatile int g_hits2;
+
+static void on_usr1_raise(int sig) {
+    (void)sig;
+    g_hits++;
+    (void)raise(SIGUSR2);              /* held by sa_mask until sigreturn */
+    char b = 1;
+    (void)write(g_ack_w, &b, 1);
+}
+
+static void on_usr2(int sig) {
+    (void)sig;
+    g_hits2++;
+}
+
+/* The raw sleep, so its -EINTR is seen (usleep() discards it). */
+static long raw_sleep_ns(uint64_t ns) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "0"((long)ABI_SYS_NANOSLEEP),
+                     "D"((long)ns) : "rcx", "r11", "memory");
+    return r;
+}
+
+static int run_pending_at_sigreturn(int eintr) {
+    int ack[2];
+    if (pipe(ack) != 0) { fprintf(stderr, "sigregs: pipe failed\n"); return 2; }
+    g_ack_w = ack[1];
+
+    struct sigaction sa1, sa2;
+    memset(&sa1, 0, sizeof sa1);
+    sa1.sa_handler = on_usr1_raise;
+    sigemptyset(&sa1.sa_mask);
+    sigaddset(&sa1.sa_mask, SIGUSR2);
+    memset(&sa2, 0, sizeof sa2);
+    sa2.sa_handler = on_usr2;
+    sigemptyset(&sa2.sa_mask);
+    sa2.sa_flags = SA_RESTART;
+    if (sigaction(SIGUSR1, &sa1, 0) != 0 || sigaction(SIGUSR2, &sa2, 0) != 0) {
+        fprintf(stderr, "sigregs: sigaction failed\n");
+        return 2;
+    }
+
+    pid_t parent = getpid();
+    pid_t child = fork();
+    if (child < 0) { fprintf(stderr, "sigregs: fork failed\n"); return 2; }
+    if (child == 0) {
+        close(ack[1]);
+        for (int i = 0; i < N_SIGNALS; i++) {
+            usleep(300);
+            if (kill(parent, SIGUSR1) != 0) _exit(3);
+            char b;
+            if (read(ack[0], &b, 1) != 1) _exit(4);
+        }
+        _exit(0);
+    }
+    close(ack[0]);
+
+    long clobbers = 0, interrupted = 0;
+    uint64_t first_rcx = 0, first_r11 = 0;
+    while (g_hits < N_SIGNALS) {
+        if (eintr) {
+            if (raw_sleep_ns(5000000ull) == -4) interrupted++;
+            continue;
+        }
+        uint64_t rcx, r11;
+        spin_and_read(20000, &rcx, &r11);
+        if (rcx != RCX_MAGIC || r11 != R11_MAGIC) {
+            if (clobbers == 0) { first_rcx = rcx; first_r11 = r11; }
+            clobbers++;
+        }
+    }
+    int st = 0;
+    (void)waitpid(child, &st, 0);
+    /* The last SIGUSR2 runs on the way out of the last handler; wait for
+     * it rather than race it. */
+    for (int i = 0; i < 1000 && g_hits2 < g_hits; i++) usleep(1000);
+
+    if (clobbers) {
+        fprintf(stderr, "sigregs: FIRST CLOBBER rcx=0x%llx (want 0x%llx) "
+                "r11=0x%llx (want 0x%llx)\n",
+                (unsigned long long)first_rcx, (unsigned long long)RCX_MAGIC,
+                (unsigned long long)first_r11, (unsigned long long)R11_MAGIC);
+    }
+    if (eintr)
+        printf("sigregs eintr: %d signals, %d at sigreturn, %ld sleeps "
+               "interrupted\n", g_hits, g_hits2, interrupted);
+    else
+        printf("sigregs nested: %d signals, %d at sigreturn, %ld clobbers\n",
+               g_hits, g_hits2, clobbers);
+    return (clobbers || g_hits2 != g_hits) ? 1 : 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "nested") == 0)
+        return run_pending_at_sigreturn(0);
+    if (argc > 1 && strcmp(argv[1], "eintr") == 0)
+        return run_pending_at_sigreturn(1);
     int ack[2];
     if (pipe(ack) != 0) { fprintf(stderr, "sigregs: pipe failed\n"); return 2; }
     g_ack_w = ack[1];

@@ -579,6 +579,20 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
 
     bool siginfo = (sa->sa_flags & SA_SIGINFO) != 0;
     bool linux_layout = (p->personality == ABI_PERS_LINUX);
+    /* A TRAPFRAME rt_sigreturn HAS JUST RESTORED IS NOT A SYSCALL'S (M1,
+     * finding 21). A second signal held pending by the first handler's mask
+     * is delivered on the way out of that handler's rt_sigreturn -- two
+     * SIGCHLDs for two children -- and the context in `regs` is then the
+     * one sigreturn restored: possibly cut by the timer IRQ, with rcx/r11
+     * as live as any register (sys_sigreturn parks them in sig_rcx/sig_r11
+     * and sets `pad` for the IRETQ exit; `pad` is zero on every syscall
+     * entry), and with rax whatever that code held. This frame saved
+     * rcx=RIP and r11=RFLAGS anyway, so when the second handler returned
+     * the interrupted code had lost both -- GNU bash 5.2 died with exit 139
+     * in shparity 146, its last two syscalls rt_sigreturn -- and a restored
+     * rax that happened to read -EINTR was taken for an interrupted
+     * syscall and "restarted" at RIP-2 with rax = rt_sigreturn's number. */
+    bool restored = regs->pad != 0;
 
     /* Carve the frame out of the user stack, below the SysV red zone. Build
      * each piece in a kernel local and copy out (per-copy uaccess). Layout,
@@ -633,8 +647,8 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
         default: break;
         }
     }
-    if (rv == EINTR_RET && num >= 0 && (sa->sa_flags & SA_RESTART) &&
-        !never_restart) {
+    if (!restored && rv == EINTR_RET && num >= 0 &&
+        (sa->sa_flags & SA_RESTART) && !never_restart) {
         ctx->rax = (uint64_t)num;
         ctx->rip = regs->rcx - 2;
     } else {
@@ -649,9 +663,10 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
     ctx->rsp       = regs->user_rsp;   /* original user RSP    */
     ctx->rflags    = regs->r11;        /* original user RFLAGS */
     /* A syscall clobbered the user's rcx/r11; what SYSRETQ would have left
-     * in them is RIP/RFLAGS, so the IRETQ resume leaves exactly that. */
-    ctx->rcx       = ctx->rip;
-    ctx->r11       = ctx->rflags;
+     * in them is RIP/RFLAGS, so the IRETQ resume leaves exactly that. A
+     * context rt_sigreturn restored keeps its own. */
+    ctx->rcx       = restored ? regs->sig_rcx : ctx->rip;
+    ctx->r11       = restored ? regs->sig_r11 : ctx->rflags;
     ctx->saved_mask = p->sigstate.mask;
     ctx->magic     = SIG_FRAME_MAGIC;
 
