@@ -5041,6 +5041,35 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return p ? (long)p->ruid : 0;
     }
 
+    case ABI_SYS_STATFS: {
+        /* The Linux personality's statfs(2), for native programs: the same
+         * vfs_statfs numbers busybox's df reads. vfs_statfs answers for any
+         * path inside a mount, so the path is stat()ed first -- statfs on a
+         * missing file is ENOENT on Linux. */
+        char kpath[ABI_PATH_MAX];
+        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
+            return -ABI_ENOENT;
+        struct vfs_stat st;
+        int src = vfs_stat(kpath, &st);
+        if (src != VFS_OK) return vfs_err_to_abi(src);
+        struct vfs_statfs vs;
+        int rc = vfs_statfs(kpath, &vs);
+        if (rc != VFS_OK) return vfs_err_to_abi(rc);
+        struct abi_statfs out;
+        memset(&out, 0, sizeof out);
+        out.bsize      = vs.bsize;
+        out.blocks     = vs.blocks;
+        out.bfree      = vs.bfree;
+        out.bavail     = vs.bfree;      /* no reserved blocks anywhere */
+        out.files      = vs.files;
+        out.ffree      = vs.ffree;
+        out.type_magic = vs.type_magic;
+        out.namelen    = vs.namelen;
+        if (copy_to_user((void *)a2, &out, sizeof out) != 0)
+            return -ABI_EFAULT;
+        return 0;
+    }
+
     case ABI_SYS_USERADD: {
         struct proc *me = current_proc();
         if (!me || me->uid != 0) return -ABI_EPERM;

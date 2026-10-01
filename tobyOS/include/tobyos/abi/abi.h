@@ -1243,7 +1243,26 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         setuid-root exec has already set to 0;
                                         su must ask "was the INVOKER root?"
                                         before it decides to skip the password. */
-#define ABI_SYS_NR_MAX          215
+#define ABI_SYS_STATFS          216  /* (path, struct abi_statfs *out) -> 0|-E.
+                                        The numbers statfs(2) gives a Linux
+                                        program, for the filesystem holding
+                                        PATH; -ENOENT if PATH does not exist.
+                                        /bin/df read a filesystem CHECKER's
+                                        report through a struct that did not
+                                        match it (M3). */
+#define ABI_SYS_NR_MAX          216
+
+/* ABI_SYS_STATFS's answer: vfs_statfs, in bsize units. */
+struct abi_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t bavail;
+    uint64_t files;
+    uint64_t ffree;
+    uint32_t type_magic;    /* Linux f_type: TMPFS_MAGIC, 0xEF53, ... */
+    uint32_t namelen;
+};
 
 /* ============================================================
  *  Structured logging (Milestone 28A)
