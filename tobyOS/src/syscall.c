@@ -357,9 +357,8 @@ static int fd_alloc_into(struct proc *p, struct file *f) {
 
 /* ---- syscall implementations ----------------------------------- */
 
-static long sys_write(int fd, const void *buf, size_t len) {
-    if (len == 0) return 0;
-    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
+/* One bounce-buffered write of at most SYS_MAX_RW bytes. */
+static long sys_write_one(int fd, const void *buf, size_t len) {
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
     void *k = bounce_in(buf, len);
@@ -405,6 +404,31 @@ static long sys_write(int fd, const void *buf, size_t len) {
         if (me) signal_send_to_pid(me->pid, SIGPIPE);
     }
     return file_err_to_abi(f, rv);
+}
+
+/* WRITE ALL OF IT (K4, 2026-09-30). The kernel bounces at most SYS_MAX_RW
+ * (64 KiB) per pass, and write(2) used to RETURN after one pass: a 70,000
+ * byte write to a file came back 65536. POSIX lets a regular file write be
+ * short only for an error (disk full, a signal), and real programs rely on
+ * it -- bash 5.2's here-document writer does ONE write of the whole
+ * document and calls a short count ENOSPC, so every bash here-document over
+ * 64 KiB failed with "cannot create temp file for here-document: No space
+ * left on device". Now the passes repeat until the whole buffer is written.
+ * A pass that writes less than it was given (a pipe whose reader left, a
+ * signal, a full disk, a non-blocking descriptor) ends the call with the
+ * total so far -- or with its error if nothing was written. */
+static long sys_write(int fd, const void *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t done = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        long rv = sys_write_one(fd, (const char *)buf + done, n);
+        if (rv < 0) return done ? (long)done : rv;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
+    return (long)done;
 }
 
 static long evdev_read(unsigned dev, uint64_t ubuf, size_t len); /* evdev dev, below */
@@ -552,18 +576,28 @@ static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
 
 static long sys_pwrite64(int fd, const void *buf, size_t len, int64_t offset) {
     if (len == 0) return 0;
-    if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (offset < 0) return -ABI_EINVAL;
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     if (f->kind != FILE_KIND_VFS) return -ABI_ESPIPE;
-    void *k = bounce_in(buf, len);
-    if (!k) return -ABI_EFAULT;
+    /* Whole buffer, in SYS_MAX_RW passes -- see sys_write (K4). */
     size_t saved = file_pos_get(f);
-    file_pos_set(f, (size_t)offset);
-    long rv = file_write(f, k, len);
+    size_t done = 0;
+    long rv = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        void *k = bounce_in((const char *)buf + done, n);
+        if (!k) { rv = -ABI_EFAULT; break; }
+        file_pos_set(f, (size_t)offset + done);
+        rv = file_write(f, k, n);
+        kfree(k);
+        if (rv < 0) break;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
     file_pos_set(f, saved);
-    kfree(k);
+    if (done) return (long)done;
     return rv;
 }
 
