@@ -2117,6 +2117,7 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
     }
 
     int code = child->exit_code;
+    self->last_reap_term_sig = child->term_sig;   /* proc_last_term_sig */
 
     /* Milestone 19: capture per-proc metrics BEFORE reap wipes them. */
     if (out) {
@@ -2140,6 +2141,11 @@ int proc_wait(int pid) {
     /* Back-compat wrapper: callers that don't care about metrics
      * still get the exit code. */
     return proc_wait_info(pid, 0);
+}
+
+int proc_last_term_sig(void) {
+    struct proc *self = current_proc();
+    return self ? self->last_reap_term_sig : 0;
 }
 
 /* ===================================================================

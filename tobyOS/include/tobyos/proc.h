@@ -118,6 +118,10 @@ struct proc {
      * shells' $?; the Linux wait family reads THIS to report WIFSIGNALED /
      * CLD_KILLED, which exit_code alone cannot tell from exit(137). */
     int             term_sig;
+    /* The term_sig of the child this proc last reaped through proc_wait /
+     * proc_wait_info -- how the kernel shell's job reports name a signal
+     * (proc_last_term_sig; /bin/tsh reads it from WTERMSIG instead). */
+    int             last_reap_term_sig;
 
     /* Track B (foreign-binary compat): which syscall ABI this process
      * speaks. ABI_PERS_TOBY (0, the zero-init default) routes `syscall`
@@ -981,6 +985,9 @@ int proc_kill_tree(int pid, int sig);
  * shell's monitor path uses this; /bin/tsh's host.c provides the same
  * signature over waitpid(WUNTRACED). */
 int proc_wait_fg(int pid, int *stop_sig);
+/* The signal that killed the child the caller last reaped, 0 if it exited
+ * (the kernel: current_proc()->last_reap_term_sig; /bin/tsh: host.c). */
+int proc_last_term_sig(void);
 
 /* Atomically claim a free proc slot (state CAS UNUSED -> EMBRYO). The ONLY
  * way to allocate a slot -- a plain "scan for UNUSED" race is exactly the

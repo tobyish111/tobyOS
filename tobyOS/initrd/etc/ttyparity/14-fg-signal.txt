@@ -1,0 +1,11 @@
+# A FOREGROUND JOB KILLED BY A SIGNAL at an interactive prompt. Since K3
+# bash on this kernel sees the signal (the Linux wait status names it) and
+# reports it the way it does on Linux; $? is 128+N either way. /bin/sh, not
+# `sh`: the job must be a separate process with its own $$.
+/bin/sh -c 'kill -9 $$'
+echo "k=$?"
+/bin/sh -c 'kill -15 $$'
+echo "t=$?"
+/bin/sh -c 'kill -13 $$'
+echo "p=$?"
+exit 0

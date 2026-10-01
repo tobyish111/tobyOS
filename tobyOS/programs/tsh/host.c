@@ -717,12 +717,23 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     return -1;
 }
 
+/* The signal that killed the child last reaped through these seams, 0 for
+ * an exit (proc_last_term_sig). bash names it in its job reports. */
+static int g_last_term_sig;
+
+int proc_last_term_sig(void) { return g_last_term_sig; }
+
+static int host_reaped(int status) {
+    g_last_term_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    return WEXITSTATUS(status);
+}
+
 int proc_wait(int pid) {
     int status = 0;
     /* Retry EINTR: the parent now receives SIGCHLD, and a wait must not
      * fail because the signal it exists to consume arrived. */
     for (int tries = 0; tries < 1000; tries++) {
-        if (waitpid(pid, &status, 0) >= 0) return WEXITSTATUS(status);
+        if (waitpid(pid, &status, 0) >= 0) return host_reaped(status);
     }
     return -1;
 }
@@ -791,7 +802,7 @@ int proc_wait_fg(int pid, int *stop_sig) {
             if (stop_sig) *stop_sig = WSTOPSIG(st);
             return 0;
         }
-        return WEXITSTATUS(st);
+        return host_reaped(st);
     }
     return -1;
 }
@@ -810,7 +821,8 @@ int proc_try_reap(int pid, int *code) {
     pid_t r = waitpid(pid, &st, WNOHANG);
     if (r == 0) return 0;
     if (r < 0) return -1;
-    if (code) *code = WEXITSTATUS(st);
+    int c = host_reaped(st);
+    if (code) *code = c;
     return 1;
 }
 

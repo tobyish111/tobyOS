@@ -90,7 +90,9 @@ int main(void) {
              w8 == e ? "the child" : "?", WEXITSTATUS(st));
     check(line, w8 == e && WEXITSTATUS(st) == 11);
 
-    /* Killed by a signal: native encoding is 128 + sig, unchanged. */
+    /* Killed by a signal: still an exit with 128 + sig, as every native
+     * program has always read it -- and the status also names the signal
+     * (WIFSIGNALED / WTERMSIG, 2026-09-30). */
     pid_t f = kid(0, 5000, 0);
     usleep(50000);
     kill(f, SIGKILL);
@@ -98,6 +100,14 @@ int main(void) {
     snprintf(line, sizeof line, "wait, SIGKILLed child: %s exited=%d code %d",
              w9 == f ? "the child" : "?", WIFEXITED(st) ? 1 : 0, WEXITSTATUS(st));
     check(line, w9 == f && WIFEXITED(st) && WEXITSTATUS(st) == 137);
+    snprintf(line, sizeof line, "  ...and signaled=%d termsig=%d",
+             WIFSIGNALED(st) ? 1 : 0, WTERMSIG(st));
+    check(line, WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    pid_t g = kid(42, 10, 0);
+    waitpid(g, &st, 0);
+    snprintf(line, sizeof line, "exit(42): exited=%d code %d signaled=%d",
+             WIFEXITED(st) ? 1 : 0, WEXITSTATUS(st), WIFSIGNALED(st) ? 1 : 0);
+    check(line, WIFEXITED(st) && WEXITSTATUS(st) == 42 && !WIFSIGNALED(st));
 
     errno = 0;
     pid_t w10 = waitpid(-1, &st, WNOHANG);

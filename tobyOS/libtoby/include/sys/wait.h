@@ -4,9 +4,12 @@
  * exited, and returns its pid. The exit code is delivered via the
  * status_out int. WIFEXITED/WEXITSTATUS unpack it.
  *
- * The kernel does not yet model signals on processes (no SIGSEGV/...
- * surfaced to siblings), so WIFSIGNALED is provided but always false.
- * It exists so future M25E ports compile unmodified. */
+ * A child KILLED BY A SIGNAL reads as an exit with status 128+N -- that is
+ * what every native program has always been given, and still is -- and
+ * since 2026-09-30 the status ALSO carries the signal, in bits the other
+ * macros never test: WIFSIGNALED is true and WTERMSIG names it. (So, unlike
+ * POSIX, WIFEXITED is true for such a child too; native code that wants the
+ * difference asks WIFSIGNALED first.) */
 
 #ifndef LIBTOBY_SYS_WAIT_H
 #define LIBTOBY_SYS_WAIT_H
@@ -26,8 +29,8 @@ extern "C" {
  * command-not-found's status). WIFEXITED must exclude both bits. */
 #define WIFEXITED(s)    (((s) & 0x30100) == 0)
 #define WEXITSTATUS(s)  ((s) & 0xFF)
-#define WIFSIGNALED(s)  (0)
-#define WTERMSIG(s)     (0)
+#define WIFSIGNALED(s)  (((s) & 0x40000) != 0)
+#define WTERMSIG(s)     (((s) >> 20) & 0x7F)
 #define WIFSTOPPED(s)   (((s) & 0x10000) != 0)
 #define WSTOPSIG(s)     ((s) & 0xFF)
 #define WIFCONTINUED(s) (((s) & 0x20000) != 0)

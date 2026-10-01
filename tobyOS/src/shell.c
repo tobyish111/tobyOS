@@ -1150,6 +1150,7 @@ struct job {
     bool dead;                 /* reaped by `wait`; announce at next prompt
                                 * (bash reports even wait-consumed jobs) */
     int  code;                 /* exit code when dead */
+    int  sig;                  /* ...and the signal that killed it, or 0 */
     char name[JOB_NAME_MAX];   /* command text for display */
 };
 
@@ -1197,6 +1198,7 @@ static int jobs_add(int pid, const char *name) {
             g_jobs[i].stopped = false;
             g_jobs[i].dead = false;
             g_jobs[i].code = 0;
+            g_jobs[i].sig  = 0;
             size_t n = 0;
             if (name) {
                 while (n + 1 < JOB_NAME_MAX && name[n]) {
@@ -1241,16 +1243,51 @@ static void jobs_remove(struct job *j) {
  * We also drop entries whose PCB slot has gone UNUSED out from under us
  * (e.g. somehow reaped elsewhere) -- this should not happen today, but
  * a stale jobs[] entry would be confusing. */
-/* bash's status word for a finished job. NO signal names here: this
- * kernel reports signal deaths as plain 128+sig exit codes (WIFSIGNALED
- * is not modelled), so the REAL bash on this kernel prints "Exit 143"
- * for a TERM'd job -- measured on the interactive gate -- and parity
- * means matching what bash actually says here, not what it would say on
- * Linux. */
-static const char *shell_job_status_word(int code, char *buf, size_t cap) {
+/* What bash calls a signal in a job report: the C library's strsignal().
+ * bash on this kernel links musl, and these are musl's words, read out of
+ * the guest's /lib/ld-musl-x86_64.so.1 (logs/k23/musl-strsignal.txt) --
+ * "Arithmetic exception", not glibc's "Floating point exception". */
+static const char *shell_signal_desc(int sig) {
+    static const char *const d[32] = {
+        "Unknown signal", "Hangup", "Interrupt", "Quit",
+        "Illegal instruction", "Trace/breakpoint trap", "Aborted",
+        "Bus error", "Arithmetic exception", "Killed",
+        "User defined signal 1", "Segmentation fault",
+        "User defined signal 2", "Broken pipe", "Alarm clock", "Terminated",
+        "Stack fault", "Child process status", "Continued",
+        "Stopped (signal)", "Stopped", "Stopped (tty input)",
+        "Stopped (tty output)", "Urgent I/O condition",
+        "CPU time limit exceeded", "File size limit exceeded",
+        "Virtual timer expired", "Profiling timer expired", "Window changed",
+        "I/O possible", "Power failure", "Bad system call",
+    };
+    return (sig > 0 && sig < 32) ? d[sig] : d[0];
+}
+
+/* bash's status word for a finished job: "Done", "Exit N", or the signal
+ * that killed it. Until K3 this kernel reported a signal death to bash as
+ * a plain exit 128+N, so bash itself said "Exit 143" and tsh matched it;
+ * bash now reads the Linux wait status, sees WIFSIGNALED, and says
+ * "Terminated" -- and so does this, from the native status's WTERMSIG
+ * (proc_last_term_sig). */
+static const char *shell_job_status_word(int code, int sig, char *buf,
+                                         size_t cap) {
+    if (sig > 0) return shell_signal_desc(sig);
     if (code == 0) return "Done";
     ksnprintf(buf, cap, "Exit %d", code);
     return buf;
+}
+
+/* A FOREGROUND JOB KILLED BY A SIGNAL, at an interactive prompt. bash moves
+ * to a fresh line after ^C (the tty has echoed "^C" and nothing else) and
+ * names any other signal on stderr -- except SIGPIPE, which it does not
+ * report. Measured on this kernel's bash: ttyparity 06 and 14. */
+static void shell_report_fg_death(void) {
+    int sig = proc_last_term_sig();
+    if (!g_interactive || sig <= 0) return;
+    if (sig == SIGINT) { shell_write("\n"); return; }
+    if (sig == SIGPIPE) return;
+    kprintf("%s\n", shell_signal_desc(sig));
 }
 
 #ifdef SHELL_HOSTED
@@ -1262,19 +1299,21 @@ void shell_notify_jobs_hosted(void) {
     extern int proc_try_reap(int pid, int *code);
     for (int i = 0; i < JOB_MAX; i++) {
         if (g_jobs[i].id == 0) continue;
-        int code = 0;
+        int code = 0, sig = 0;
         int r;
         if (g_jobs[i].dead) {
             /* Reaped by `wait`; bash still announces it here. */
             r = 1;
             code = g_jobs[i].code;
+            sig  = g_jobs[i].sig;
         } else {
             r = proc_try_reap(g_jobs[i].pid, &code);
+            if (r == 1) sig = proc_last_term_sig();
         }
         if (r == 0) continue;
         char wb[24];
         const char *what = (r < 0) ? "Done"
-                         : shell_job_status_word(code, wb, sizeof wb);
+                         : shell_job_status_word(code, sig, wb, sizeof wb);
         /* The mark reflects the job's standing WHEN ALIVE, so the newest
          * scan here includes the corpse being announced (jobs_newest
          * skips dead entries for every other caller). */
@@ -7188,6 +7227,7 @@ static void cmd_fg(int argc, char **argv) {
             shell_set_status(128 + ssig);
             return;
         }
+        shell_report_fg_death();
         struct job *j2 = jobs_find(jid);
         if (j2) jobs_remove(j2);
         shell_set_status(frc);
@@ -7268,6 +7308,7 @@ static int shell_wait_job(struct job *j) {
          * leave the corpse for the notifier instead of removing it. */
         j->dead = true;
         j->code = rc;
+        j->sig  = proc_last_term_sig();
         return rc;
     }
     jobs_remove(j);
@@ -16098,6 +16139,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                          jid > 0 ? jid : 0, jname);
             return 128 + ssig;
         }
+        shell_report_fg_death();
         return frc;
     }
     signal_set_foreground(pid);

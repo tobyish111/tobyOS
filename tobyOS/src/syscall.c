@@ -4835,13 +4835,26 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
         if (child->state != PROC_TERMINATED) return 0;
     }
 
-    int code = proc_wait(pid);
+    struct proc_exit_info xi;
+    memset(&xi, 0, sizeof xi);
+    int code = proc_wait_info(pid, &xi);
     if (code < 0 && pid < 0) {
         /* proc_wait can't synthesize -ABI_E* directly; -1 means
          * "no such pid / waited on self". */
         return -ABI_ENOENT;
     }
-    if (status_out && put_user_u32(status_out, (uint32_t)code) != 0)
+    /* A SIGNAL DEATH STILL READS AS EXIT 128+N here -- WIFEXITED true,
+     * WEXITSTATUS 128+N, what every native program has always been given --
+     * and now ALSO names the signal: bit 0x40000 with N in bits 20..26
+     * (libtoby's WIFSIGNALED / WTERMSIG). Both sit outside every bit the
+     * existing macros test. /bin/tsh needs the difference since bash, which
+     * reads the Linux wait4 status, reports "Killed" / "Terminated" where
+     * tsh said "Exit 137" (K3). */
+    uint32_t st = (uint32_t)code;
+    if (xi.term_sig > 0)
+        st = ((uint32_t)code & 0xffu) | 0x40000u |
+             ((uint32_t)(xi.term_sig & 0x7f) << 20);
+    if (status_out && put_user_u32(status_out, st) != 0)
         return -ABI_EFAULT;
     return vpid;
 }
