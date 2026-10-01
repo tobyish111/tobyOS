@@ -1,0 +1,16 @@
+# S9: which reaped jobs does `wait -n` hand back? (bash 5.2, a script)
+(exit 3) & p=$!; wait $p; echo "wait PID: $?"
+(exit 4) & sleep 0.2; wait -n; echo "then wait -n: $?"
+wait -n; echo "again: $?"
+(exit 5) & sleep 0.2; wait; echo "plain wait: $?"
+(exit 6) & sleep 0.2; wait -n; echo "after plain wait, wait -n: $?"
+wait -n; echo "again: $?"
+wait -n; echo "and again: $?"
+(exit 7) & sleep 0.2; wait %1 2>/dev/null; echo "wait %1: $?"
+(exit 8) & sleep 0.2; wait -n; echo "after wait %1, wait -n: $?"
+wait -n; echo "again: $?"
+(exit 9) & sleep 0.2; jobs; echo "jobs listed it: $?"
+wait -n; echo "after jobs, wait -n: $?"
+(exit 10) & sleep 0.2; (exit 11) & sleep 0.2; wait; wait -n; echo "two plain-waited, wait -n: $?"; wait -n; echo "then: $?"; wait -n; echo "then: $?"
+(exit 12) & sleep 0.2; wait -n -p v; echo "finished first, -p: $? [$([ -n "$v" ] && echo set)]"
+echo done
