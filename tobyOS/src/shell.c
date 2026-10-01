@@ -3878,6 +3878,26 @@ static bool shell_hosted_builtin(const char *name) {
 
 static bool shell_builtin_disabled(const char *name);
 
+/* Is NAME a builtin of THIS shell -- the set lookup, `enable` and Tab
+ * completion all answer for? In /bin/tsh: the POSIX/bash list, less `sh`.
+ *
+ * `sh` IS NOT A BUILTIN IN /bin/tsh (S8, 2026-10-01). It ran as cmd_sh in
+ * the CALLER's process: `sh -c 'echo $$'` printed the caller's pid, `type
+ * sh` said "a shell builtin", a script run as `sh script` shared the
+ * caller's traps and variables, and `sh -c 'kill -9 $$'` killed the caller.
+ * bash has no sh builtin -- it is /bin/sh through PATH, and now so it is
+ * here. It stays in shell_hosted_builtin's list, which the kernel shell
+ * also reads to route a POSIX builtin's diagnostics to stderr; the kernel
+ * shell keeps cmd_sh, having no /bin/sh of its own. */
+static bool shell_builtin_in_this_shell(const char *name) {
+#ifdef SHELL_HOSTED
+    return shell_hosted_builtin(name) && strcmp(name, "sh") != 0;
+#else
+    (void)name;
+    return true;
+#endif
+}
+
 static const struct cmd *shell_cmd_lookup(const char *name) {
     if (!name) return 0;
     /* `enable -n NAME` makes the builtin invisible HERE, so the word
@@ -3885,9 +3905,7 @@ static const struct cmd *shell_cmd_lookup(const char *name) {
      * the intent without acting on it would be a lie the user could
      * only discover by the command still being handled internally. */
     if (shell_builtin_disabled(name)) return 0;
-#ifdef SHELL_HOSTED
-    if (!shell_hosted_builtin(name)) return 0;
-#endif
+    if (!shell_builtin_in_this_shell(name)) return 0;
     for (const struct cmd *c = cmds; c->name; c++) {
         if (strcmp(c->name, name) == 0) return c;
     }
@@ -16028,8 +16046,13 @@ static void cmd_enable(int argc, char **argv) {
             }
         } else { first = i; break; }
     }
+    /* Only THIS shell's builtins (S8): /bin/tsh listed all 123 entries of
+     * the table -- the kernel console's cat, ls, mkdir among them, and sh --
+     * and `enable sh` succeeded; bash lists 61 and says "not a shell
+     * builtin". */
     if (first >= argc) {
         for (const struct cmd *c = cmds; c->name; c++) {
+            if (!shell_builtin_in_this_shell(c->name)) continue;
             bool off = shell_builtin_disabled(c->name);
             if (off && !disable && !list_all) continue;
             if (!off && disable) continue;
@@ -16042,7 +16065,8 @@ static void cmd_enable(int argc, char **argv) {
     for (int i = first; i < argc; i++) {
         const struct cmd *found = 0;
         for (const struct cmd *c = cmds; c->name; c++)
-            if (strcmp(c->name, argv[i]) == 0) { found = c; break; }
+            if (strcmp(c->name, argv[i]) == 0 &&
+                shell_builtin_in_this_shell(c->name)) { found = c; break; }
         if (!found) {
             kprintf("enable: %s: not a shell builtin\n", argv[i]);
             rc = 1;
@@ -32473,9 +32497,7 @@ const char *tsh_builtin_name_at(int i) {
      * a builtin that is not one here. */
     int seen = 0;
     for (const struct cmd *c = cmds; c->name; c++) {
-#ifdef SHELL_HOSTED
-        if (!shell_hosted_builtin(c->name)) continue;
-#endif
+        if (!shell_builtin_in_this_shell(c->name)) continue;
         if (seen++ == i) return c->name;
     }
     return 0;
