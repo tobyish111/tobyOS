@@ -4731,6 +4731,33 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
     if (vpid > 0) {
         pid = pid_knr(vpid);
         if (!pid) return -ABI_ENOENT;
+    } else {
+        /* K2 (2026-09-30): -1 = any child, 0 = any in the caller's group,
+         * -N = any in group N -- POSIX waitpid, and exactly what LX_wait4
+         * does. This used to fall through to proc_lookup(-1) and return
+         * ENOENT, so libtoby's wait() -- waitpid(-1, ...) -- failed in
+         * EVERY native program. The child picked is the first with an
+         * event (proc_wait_any); the single-child code below then answers
+         * it at once, with the native status encoding unchanged. */
+        struct proc *self = current_proc();
+        if (!self) return -ABI_ECHILD;
+        if (vpid == -2147483647 - 1) return -ABI_ESRCH;
+        int pgid = vpid == 0 ? proc_pgid_of(self) : vpid < -1 ? -vpid : 0;
+        int lxopt = ((flags & ABI_WNOHANG)    ? 0x1 : 0) |
+                    ((flags & ABI_WUNTRACED)  ? 0x2 : 0) |
+                    ((flags & ABI_WCONTINUED) ? 0x8 : 0);
+        for (;;) {
+            int k = proc_wait_any(pgid, lxopt);
+            if (k < 0) return -ABI_ECHILD;
+            if (k > 0) { pid = k; break; }
+            if (flags & ABI_WNOHANG) return 0;
+            /* stop/continue mode polls, as the single-child arm does */
+            if (self->pending_signals & ~SLEEP_UNINTERRUPTING)
+                return -ABI_EINTR;
+            sched_yield();
+        }
+        vpid = pid_vnr_of_kpid(pid);
+        if (!vpid) vpid = pid;
     }
 
     /* ABI_WUNTRACED: report a job-control stop once, without reaping.
@@ -11687,28 +11714,133 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return fd;
     }
 
-    /* waitid(idtype, id, infop, options, rusage). Mapped onto the existing
-     * wait4 machinery: P_PID(1)/P_ALL(0) cover everything real callers use
-     * (posix_spawn's reaper, and glibc's system()). The siginfo_t out-param
-     * is what distinguishes it from wait4 -- callers read si_pid/si_status
-     * from it rather than decoding a status word. */
+    /* waitid(idtype, id, infop, options, rusage) -- K2 (2026-09-30).
+     *
+     * This used to call the NATIVE sys_waitpid with a KERNEL stack address
+     * as its status pointer: put_user refused it with EFAULT after
+     * proc_wait had already reaped the child, every idtype but P_PID became
+     * pid -1 (ENOENT, since native waitpid(-1) did not exist), the options
+     * were handed over as native flags, and every event was reported as
+     * CLD_EXITED -- even "WNOHANG, nothing yet". Measured on the box:
+     * P_ALL -> -2, P_PID|WNOWAIT -> -14 and the child gone, P_PGID -> -2.
+     *
+     * Now its own implementation, on the same primitives as LX_wait4:
+     *   idtype  P_ALL(0), P_PID(1), P_PGID(2; id 0 = the caller's group);
+     *           P_PIDFD(3) -> EINVAL (this kernel has no pidfds)
+     *   options WEXITED 4, WSTOPPED 2, WCONTINUED 8 (at least one), WNOHANG
+     *           1, WNOWAIT 0x01000000 (report, leave the child waitable),
+     *           and the __W* flags Linux accepts; anything else EINVAL
+     *   infop   si_signo SIGCHLD, si_code CLD_EXITED 1 / CLD_KILLED 2 /
+     *           CLD_TRAPPED 4 / CLD_STOPPED 5 / CLD_CONTINUED 6, si_pid in
+     *           the caller's pid namespace, si_uid, si_status = exit code
+     *           or signal. Written field by field exactly as Linux's
+     *           waitid() does -- all six are zero when WNOHANG finds
+     *           nothing (return 0) or nothing matches (-ECHILD). */
     case LX_waitid: {
-        int idtype = (int)a1;
-        int pid    = (idtype == 1 /*P_PID*/) ? (int)a2 : -1;
-        int status = 0;
-        long r = sys_waitpid(pid, &status, (int)a4);
-        if (r < 0) return r;
-        if (a3) {                              /* siginfo_t */
-            uint8_t si[128];
-            memset(si, 0, sizeof si);
-            *(int32_t *)&si[0]  = 17;                  /* si_signo = SIGCHLD */
-            *(int32_t *)&si[8]  = 1;                   /* si_code = CLD_EXITED */
-            *(int32_t *)&si[16] = (int32_t)r;          /* si_pid    */
-            *(int32_t *)&si[24] = (status >> 8) & 0xff;/* si_status */
-            if (copy_to_user((void *)a3, si, sizeof si) != 0)
+        int idtype = (int)a1, id = (int)a2;
+        long opt = (long)a4;
+        void *uinfo = (void *)a3;
+        enum { W_NOHANG = 1, W_STOPPED = 2, W_EXITED = 4, W_CONTINUED = 8,
+               W_NOWAIT = 0x01000000 };
+        const long w_known = W_NOHANG | W_STOPPED | W_EXITED | W_CONTINUED |
+                             W_NOWAIT | 0x20000000L /* __WNOTHREAD */ |
+                             0x40000000L /* __WALL */ | 0x80000000L /* __WCLONE */;
+        if ((opt & ~w_known) || !(opt & (W_EXITED | W_STOPPED | W_CONTINUED)))
+            return -ABI_EINVAL;
+        if (idtype < 0 || idtype > 3 || idtype == 3) return -ABI_EINVAL;
+        struct proc *self = current_proc();
+        if (!self) return -ABI_ECHILD;
+        extern struct proc g_proc[];
+        int want_pid = 0, want_pgid = 0;
+        if (idtype == 1) {
+            if (id <= 0) return -ABI_EINVAL;
+            want_pid = pid_knr(id);
+            if (!want_pid) want_pid = -1;       /* matches nothing: ECHILD */
+        } else if (idtype == 2) {
+            if (id < 0) return -ABI_EINVAL;
+            want_pgid = id ? id : proc_pgid_of(self);
+        }
+        /* The six fields Linux writes, and nothing else of siginfo_t. */
+        int32_t si_signo = 0, si_code = 0, si_pid = 0, si_uid = 0,
+                si_status = 0;
+        long ret;
+        for (;;) {
+            bool any = false;
+            struct proc *hit = 0;
+            int code = 0;
+            for (int i = 0; i < PROC_MAX && !hit; i++) {
+                struct proc *q = &g_proc[i];
+                if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+                    q->is_thread || q->ppid != self->pid) continue;
+                if (want_pid && q->pid != want_pid) continue;
+                if (want_pgid && proc_pgid_of(q) != want_pgid) continue;
+                any = true;
+                if ((opt & W_EXITED) && q->state == PROC_TERMINATED) {
+                    hit = q;
+                    code = q->term_sig > 0 ? 2 : 1;       /* KILLED : EXITED */
+                } else if ((opt & W_STOPPED) && q->state == PROC_STOPPED &&
+                           !q->stop_reported) {
+                    hit = q; code = 5;                    /* CLD_STOPPED */
+                } else if ((opt & W_CONTINUED) && q->cont_pending) {
+                    hit = q; code = 6;                    /* CLD_CONTINUED */
+                } else if (q->ptrace_stopped && q->tracer_pid == self->pid &&
+                           (opt & W_STOPPED)) {
+                    hit = q; code = 4;                    /* CLD_TRAPPED */
+                }
+            }
+            if (!any) { ret = -ABI_ECHILD; break; }
+            if (hit) {
+                si_signo = 17;                            /* SIGCHLD */
+                si_code  = code;
+                si_pid   = pid_vnr_of_kpid(hit->pid);
+                if (!si_pid) si_pid = hit->pid;
+                si_uid   = (int32_t)userns_cur_uid(hit->uid);
+                if (code == 1)      si_status = hit->exit_code & 0xff;
+                else if (code == 2) si_status = hit->term_sig;
+                else if (code == 5) si_status = hit->stop_sig > 0 ? hit->stop_sig
+                                                                  : SIGSTOP;
+                else if (code == 6) si_status = SIGCONT;
+                else                si_status = ptrace_stop_signal(hit);
+                if (!(opt & W_NOWAIT)) {
+                    if (code == 1 || code == 2) (void)proc_wait(hit->pid);
+                    else if (code == 5) hit->stop_reported = true;
+                    else if (code == 6) hit->cont_pending = false;
+                }
+                ret = 0;
+                break;
+            }
+            if (opt & W_NOHANG) { ret = 0; break; }
+            if (self->pending_signals & ~SLEEP_UNINTERRUPTING) {
+                ret = -ABI_EINTR;
+                break;
+            }
+            if (opt & (W_STOPPED | W_CONTINUED)) {
+                sched_yield();          /* stops/continues are polled, as in wait4 */
+            } else {
+                /* Any child's exit (or ptrace-stop) wakes a PROC_WAIT_ANY
+                 * waiter -- see wakeup_waiters. */
+                self->wait_pid = PROC_WAIT_ANY;
+                self->state    = PROC_BLOCKED;
+                sched_yield();
+                self->wait_pid = -1;
+            }
+        }
+        if (uinfo) {
+            int32_t z = 0;
+            if (put_user_u32((uint32_t *)uinfo + 0, (uint32_t)si_signo) ||
+                put_user_u32((uint32_t *)uinfo + 1, (uint32_t)z)        ||
+                put_user_u32((uint32_t *)uinfo + 2, (uint32_t)si_code)  ||
+                put_user_u32((uint32_t *)uinfo + 4, (uint32_t)si_pid)   ||
+                put_user_u32((uint32_t *)uinfo + 5, (uint32_t)si_uid)   ||
+                put_user_u32((uint32_t *)uinfo + 6, (uint32_t)si_status))
                 return -ABI_EFAULT;
         }
-        return 0;
+        if (ret == 0 && si_signo && a5) {        /* rusage: none is kept */
+            uint8_t ru[144];
+            memset(ru, 0, sizeof ru);
+            if (copy_to_user((void *)a5, ru, sizeof ru) != 0) return -ABI_EFAULT;
+        }
+        return ret;
     }
 
     /* preadv/pwritev: the vectored positional pair. Implemented as a loop of
