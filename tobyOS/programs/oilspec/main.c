@@ -233,6 +233,18 @@ static long ms_since(const struct timespec *t0) {
            (long)(now.tv_nsec - t0->tv_nsec) / 1000000L;
 }
 
+/* Until nothing is left in process group `pgid`, at most GROUP_WAIT_MS.
+ * 1 ms naps, for the reason wait_bounded gives below. */
+#define GROUP_WAIT_MS 3000
+static void wait_for_group(pid_t pgid) {
+    struct timespec t0;
+    if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0) return;
+    while (kill(-pgid, 0) == 0 && ms_since(&t0) < GROUP_WAIT_MS) {
+        struct timespec nap = { 0, 1000 * 1000 };
+        nanosleep(&nap, 0);
+    }
+}
+
 static int wait_bounded(pid_t pid, int timeout_ms) {
     struct timespec t0;
     if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0) {
@@ -250,6 +262,9 @@ static int wait_bounded(pid_t pid, int timeout_ms) {
         if (r < 0) return -105;
 
         if (ms_since(&t0) > timeout_ms) {
+            /* `pid` leads the case's process group (see run_shell): the
+             * shell and every job it started go with it. */
+            kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             /* Reap it, but do not block on the reap either: a child that will
              * not die must not become the hang we just removed. */
@@ -315,13 +330,40 @@ static int run_shell(const char *shell, char *const argv[], const char *workdir,
      * otherwise block on a keyboard that is never going to type, and hang the
      * whole gate somewhere in the middle with no indication of where. The host
      * oracle redirects stdin the same way, so both see EOF. */
-    pid_t pid = toby_spawn(shell, argv, envp, devnull, fo, fe);
+    /* A BACKGROUND JOB CAN STILL BE WRITING WHEN THE SHELL HAS EXITED (M1,
+     * finding 33): neither shell waits for it, and reading the files the
+     * moment the shell was gone lost its line -- the two bash runs of 2271
+     * (`echo word word &`) gave "word word" and nothing, and of 2272 the
+     * background "word_a" and nothing, so both were scored oracle-nondet in
+     * every run (logs/b7/oils-nondet-excerpt.txt). As in shparity: the
+     * shell runs in a process group of its own, and the case ends when the
+     * group is empty, bounded by GROUP_WAIT_MS.
+     *
+     * The shell itself leads the group and is still OUR child: a forked
+     * leader that spawned it gave $PPID a new number every run, and 2653
+     * ("$PPID") went oracle-nondet. fds 0-2 only, as toby_spawn passes, and
+     * a fresh process's signal state. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        if (dup2(devnull, 0) < 0 || dup2(fo, 1) < 0 || dup2(fe, 2) < 0)
+            _exit(126);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        sigset_t none;
+        sigemptyset(&none);
+        (void)sigprocmask(SIG_SETMASK, &none, 0);
+        for (int s = 1; s < 32; s++) (void)signal(s, SIG_DFL);
+        execve(shell, argv, envp);
+        _exit(127);
+    }
 
     if (saved[0]) (void)chdir(saved);
     close(fo);
     close(fe);
     if (pid < 0) return -104;
-    return wait_bounded(pid, CASE_TIMEOUT_MS);
+    int rc = wait_bounded(pid, CASE_TIMEOUT_MS);
+    if (rc != -106) wait_for_group(pid);
+    return rc;
 }
 
 /* ---- diffing ------------------------------------------------------------ */

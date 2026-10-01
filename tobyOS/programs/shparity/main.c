@@ -172,14 +172,14 @@ static int wipe_dir(const char *dir) {
  * tsh), so its output can land after waitpid() on the shell has returned,
  * and reading the files at once lost it: gates-s12cA's first run failed 71
  * with no "trailing" from tsh (finding 31). So the shell runs in a process
- * group of its own -- a forked child takes a new group and spawns it -- and
+ * group of its own -- forked, it takes a new group and execs -- and
  * after the shell has exited, the case is over only when nothing is left
  * in that group: a job started with `&` stays in its shell's group unless
  * `set -m` gives it one. Bounded by GROUP_WAIT_MS, so a job that outlives
  * the case on purpose cannot hold the gate. (Orphans are re-marked ppid -1
  * when their parent exits, so the group, not the parent link, is what
  * still ties them to the case.) */
-#define GROUP_STEP_MS  10
+#define GROUP_STEP_MS  1     /* < 2 ms: a nap that spins, see oilspec's wait_bounded */
 #define GROUP_WAIT_MS  3000
 static void wait_for_group(pid_t pgid) {
     for (int waited = 0; waited < GROUP_WAIT_MS; waited += GROUP_STEP_MS) {
@@ -209,16 +209,23 @@ static int run_shell(const char *shell, char *const argv[],
     if (!getcwd(saved, sizeof saved)) saved[0] = '\0';
     if (chdir(workdir) != 0) { close(fo); close(fe); return -103; }
 
-    /* The group leader: a child that takes a group of its own, spawns the
-     * shell into it, waits for it and exits with its status. */
+    /* The shell leads a process group of its own and is still OUR child, so
+     * everything a case can see is what toby_spawn gave it -- above all
+     * $PPID, which a forked leader in between made a new number on every
+     * run (Oils 2653 turned oracle-nondet that way). fork, take the group,
+     * fds 0-2 only (toby_spawn passes exactly three), the signal state a
+     * fresh process has, exec. */
     pid_t pid = fork();
     if (pid == 0) {
         (void)setpgid(0, 0);
-        pid_t sh = toby_spawn(shell, argv, envp, 0, fo, fe);
-        if (sh < 0) _exit(104);
-        int st = 0;
-        if (waitpid(sh, &st, 0) < 0) _exit(105);
-        _exit(WEXITSTATUS(st));
+        if (dup2(fo, 1) < 0 || dup2(fe, 2) < 0) _exit(126);
+        for (int fd = 3; fd < 256; fd++) close(fd);
+        sigset_t none;
+        sigemptyset(&none);
+        (void)sigprocmask(SIG_SETMASK, &none, 0);
+        for (int s = 1; s < 32; s++) (void)signal(s, SIG_DFL);
+        execve(shell, argv, envp);
+        _exit(127);
     }
 
     if (saved[0]) (void)chdir(saved);
