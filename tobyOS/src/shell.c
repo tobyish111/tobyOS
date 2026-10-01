@@ -31389,48 +31389,24 @@ void shell_init_hosted(const char *argv0) {
     (void)shell_set_positional_params(0, 0);
 }
 
-/* Run a script file to completion; returns its exit status. */
-/* ---- a backgrounded child gets to run before the shell leaves -------- *
+/* Run a script file to completion; returns its exit status.
  *
- *     echo word_a & echo word_b        bash and dash:  word_b
- *                                                      word_a
- *
- * The parent writes first and the child writes after, because the child is
- * still runnable when the shell exits and Linux reparents it to init. tobyOS
- * never reparents an orphan in the initial namespace, so a child that had not
- * been scheduled yet simply never ran: all three shell-grammar cases ending
- * in `&` printed NOTHING for the backgrounded half.
- *
- * So the shell yields until its jobs are done -- BOUNDED, because a script
- * that backgrounds something long-running has to exit rather than hang, which
- * is what bash does. A child that is still going after the last round is left
- * running, exactly as before. */
-#ifndef SHELL_HOSTED
-/* The kernel shell has no fork and no orphans to strand: its background jobs
- * are kernel processes that outlive the command either way. */
-static void shell_drain_background(void) { }
-#else
-static void shell_drain_background(void) {
-    /* AN INTERACTIVE SHELL NEVER WAITS. `sleep 60 &` at a prompt has to come
-     * straight back, which is the whole point of `&`. This runs only when a
-     * SCRIPT or a `-c` line has finished. */
-    if (g_interactive) return;
-    for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i].id == 0) continue;
-        (void)proc_wait(g_jobs[i].pid);
-        jobs_remove(&g_jobs[i]);
-    }
-}
-#endif
-
+ * THE SHELL DOES NOT WAIT FOR ITS BACKGROUND JOBS WHEN IT LEAVES (S1,
+ * 2026-09-30). It used to: shell_drain_background() did a blocking
+ * proc_wait on every job at the end of a script or a -c line, under a
+ * comment calling it bounded -- it was not. `tsh -c 'sleep 3 &'` took
+ * 3004 ms where bash takes 3, and a script that starts a daemon hung until
+ * the daemon exited. The drain existed because tobyOS once never scheduled
+ * an orphan in the initial namespace, so `echo word_a & echo word_b` at the
+ * end of a script lost word_a; orphans are reparented and run now (0eaad61,
+ * PROC_PPID_ORPHAN + proc_reap_orphans), so the job simply outlives the
+ * shell, as it does under bash, and the kernel reaps it. */
 int shell_run_script_hosted(const char *path) {
     /* `tsh script args`: $0 is the script, as it is in bash -- it was the
      * shell's own argv[0] until 2026-09-01, so a script run through the
      * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
     (void)shell_set_param0(path);
-    int st = shell_run_script_path(path, true);
-    shell_drain_background();
-    return st;
+    return shell_run_script_path(path, true);
 }
 
 /* Run one command line (the `-c` form); returns its exit status. */
@@ -31460,7 +31436,6 @@ int shell_run_line_hosted(const char *text) {
         rc = 1;
     }
     (void)shell_take_interrupt();
-    shell_drain_background();
     return rc;
 }
 
