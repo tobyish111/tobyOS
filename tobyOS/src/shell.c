@@ -32760,11 +32760,55 @@ void shell_init_hosted(const char *argv0) {
  * end of a script lost word_a; orphans are reparented and run now (0eaad61,
  * PROC_PPID_ORPHAN + proc_reap_orphans), so the job simply outlives the
  * shell, as it does under bash, and the kernel reaps it. */
+/* bash 5.2's check_binary_file: an ELF header, or a NUL in the first line
+ * (the first TWO when it starts with #!), within the first 80 bytes. */
+static bool shell_script_is_binary(const char *s, size_t n) {
+    if (n > 80) n = 80;
+    if (n >= 4 && (unsigned char)s[0] == 0x7f && s[1] == 'E' && s[2] == 'L' &&
+        s[3] == 'F')
+        return true;
+    int lines = (n >= 2 && s[0] == '#' && s[1] == '!') ? 2 : 1;
+    for (size_t k = 0; k < n; k++) {
+        if (s[k] == '\n' && --lines == 0) return false;
+        if (s[k] == '\0') return true;
+    }
+    return false;
+}
+
 int shell_run_script_hosted(const char *path) {
+    /* A SCRIPT THAT CANNOT BE RUN IS bash's 127 OR 126 (S11, 2026-10-01).
+     * tsh said "sh: '/tmp/nope.sh': no such file or directory" and exited 1
+     * for a missing one, and ran a BINARY's bytes as shell text ("spawn:
+     * failed to launch '/bin/ELF'", 127). bash's open_shell_script, as
+     * measured (logs/s8/before-s11.bash): a file it cannot open is "SHELL:
+     * FILE: REASON", SHELL being its own argv[0], and exits 127 for a
+     * missing one, 126 otherwise; a directory or a binary is found out
+     * after $0 has become the script, so that message begins with the
+     * script's name -- "FILE: FILE: Is a directory", "FILE: FILE: cannot
+     * execute binary file" -- and exits 126. */
+    SH_SB(me);
+    if (sb_puts(&me, g_param0 ? g_param0 : "tsh") < 0) return 2;
+    struct vfs_stat st;
+    int sr = vfs_stat(path, &st);
+    void *head = 0;
+    size_t hsz = 0;
+    if (sr == VFS_OK && st.type != VFS_TYPE_DIR)
+        sr = vfs_read_all(path, &head, &hsz);
+    if (sr != VFS_OK) {
+        kprintf("%s: %s: %s\n", me.p, path, shell_errno_text(sr));
+        return sr == VFS_ERR_NOENT ? 127 : 126;
+    }
+    bool binary = head && shell_script_is_binary((const char *)head, hsz);
+    if (head) kfree(head);
     /* `tsh script args`: $0 is the script, as it is in bash -- it was the
      * shell's own argv[0] until 2026-09-01, so a script run through the
      * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
     (void)shell_set_param0(path);
+    if (st.type == VFS_TYPE_DIR || binary) {
+        kprintf("%s: %s: %s\n", path, path,
+                binary ? "cannot execute binary file" : "Is a directory");
+        return 126;
+    }
     g_reader_main_script = true;              /* see hist_reader */
     int rc = shell_run_script_path(path, true);
     g_reader_main_script = false;
