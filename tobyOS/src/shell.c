@@ -1608,6 +1608,18 @@ static void shell_getopts_note_external_optind_write(const char *key,
 static char **g_tokpfx;
 static int  g_tokpfx_n;
 static int  g_tokpfx_cap;
+/* EACH READ OWNS ONLY THE SLOTS FROM HERE UP (S5, 2026-09-30). A command
+ * substitution in a prefix value tokenizes its own text in the middle of
+ * reading the outer line, and that run used to start at slot 0:
+ *
+ *     A=1 B=$(C=2 true; echo x) D="[$A][$B]" env    bash: D=[1][x]
+ *                                                   tsh:  D=[][]
+ *
+ * -- the inner `C=2` overwrote the outer `A=1`, and the outer count was put
+ * back over slots the inner run had rewritten, so A and B were lost and the
+ * inner prefixes leaked out (`${E-u}` read the substitution's E=5). A run
+ * now starts at the outer run's count and resets to there, never below. */
+static int  g_tokpfx_base;
 
 /* A NAMEREF MAY NAME AN ARRAY ELEMENT, not just a variable:
  *
@@ -21283,10 +21295,23 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     tv.cap = 32;
     /* Each read gets its own prefix overlay; a command substitution re-enters
      * here and must not clear the one belonging to the line around it. */
-    int saved_tokpfx = g_tokpfx_n;
-    g_tokpfx_n = 0;
+    int saved_tokpfx = g_tokpfx_n, saved_base = g_tokpfx_base;
+    /* ...and so does the state of the WORD the outer read is in the middle
+     * of (S5). `B=$(echo x)` sets g_tok_word_assign_src at the `=`, then the
+     * substitution's own read cleared it word by word, so the outer word
+     * came back looking like no assignment at all: it was never recorded
+     * as a prefix, and a later `"[$B]"` read nothing. Plain `B=$A` and
+     * `B=$((2+3))` worked because they do not re-enter the tokenizer. */
+    bool saved_assign_src = g_tok_word_assign_src;
+    bool saved_expanded = g_tok_word_expanded;
+    const char *saved_fdvar = g_tok_fdvar;
+    g_tokpfx_base = g_tokpfx_n;
     int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
     g_tokpfx_n = saved_tokpfx;
+    g_tokpfx_base = saved_base;
+    g_tok_word_assign_src = saved_assign_src;
+    g_tok_word_expanded = saved_expanded;
+    g_tok_fdvar = saved_fdvar;
     *out_tok = tv.v;
     return rc_outer;
 }
@@ -21412,7 +21437,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             decl_util_cmd = false;
             decl_util_cmd = false;
             decl_util_cmd = false;
-            g_tokpfx_n = 0;
+            g_tokpfx_n = g_tokpfx_base;
             p++;
             continue;
         }
@@ -21421,7 +21446,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             if (p[1] == '&') { t = SH_TOK_AND_IF; p++; }
             if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
             prefix_ok = true;
-            g_tokpfx_n = 0;
+            g_tokpfx_n = g_tokpfx_base;
             p++;
             continue;
         }
@@ -21430,7 +21455,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             if (p[1] == '|') { t = SH_TOK_OR_IF; p++; }
             if (shell_emit_token(tok, &ntok, t, 0, false) < 0) return -1;
             prefix_ok = true;
-            g_tokpfx_n = 0;
+            g_tokpfx_n = g_tokpfx_base;
             p++;
             continue;
         }
@@ -21439,13 +21464,13 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              * block: the construct is a word, and the word is a path. */
             if (shell_tokenize_procsub(tok, &ntok, &p, true, words) < 0) return -1;
             prefix_ok = false;
-            g_tokpfx_n = 0;
+            g_tokpfx_n = g_tokpfx_base;
             continue;
         }
         if (*p == '>' && p[1] == '(') {
             if (shell_tokenize_procsub(tok, &ntok, &p, false, words) < 0) return -1;
             prefix_ok = false;
-            g_tokpfx_n = 0;
+            g_tokpfx_n = g_tokpfx_base;
             continue;
         }
         if (*p == '<') {
