@@ -14972,10 +14972,29 @@ static void cmd_kill(int argc, char **argv) {
         }
         return;
     }
-    if (first == 1 && strcmp(argv[1], "-s") == 0 && argc > 2) {
-        int num = shell_signal_by_name(argv[2]);
+    if (first == 1 &&
+        (strcmp(argv[1], "-s") == 0 || strcmp(argv[1], "-n") == 0)) {
+        /* bash's -s and -n are the same option: each takes a signal NAME
+         * or NUMBER (decode_signal: a number 0..NSIG-1). tsh had only -s,
+         * by name -- `kill -n 9 PID` and `kill -s 9 PID` were both refused
+         * (S14, Oils 0931). The words are bash 5.2's
+         * (logs/s8/before-s9.bash). */
+        if (argc < 3) {
+            kprintf("kill: %s: option requires an argument\n", argv[1]);
+            shell_set_status(1);
+            return;
+        }
+        int num = -1;
+        const char *s = argv[2];
+        if (*s >= '0' && *s <= '9') {
+            int v = 0;
+            for (; *s >= '0' && *s <= '9' && v < 1000; s++) v = v * 10 + (*s - '0');
+            if (!*s && v < 65) num = v;
+        } else {
+            num = shell_signal_by_name(s);
+        }
         if (num < 0) {
-            kprintf("kill: unknown signal '%s'\n", argv[2]);
+            kprintf("kill: %s: invalid signal specification\n", argv[2]);
             shell_set_status(1);
             return;
         }
