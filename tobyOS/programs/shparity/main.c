@@ -252,6 +252,75 @@ static int count_lines(const char *buf, long len) {
     return n;
 }
 
+/* THE SHELL'S OWN NAME IS NOT BEHAVIOUR (S12). A diagnostic starts with
+ * where it came from -- "SCRIPT: line N: " in a script, which both shells
+ * spell the same, but "bash: " / "tsh: " (or "/bin/bash: ", "sh: ") for a
+ * nested -c or a startup error, and tsh cannot call itself bash. Such a
+ * line-leading name becomes "SH: " on both sides before stderr is compared;
+ * every other byte must match. In place; returns the new length. */
+static long norm_progname(char *t, long len) {
+    static const char *const pfx[] = { "/bin/bash: ", "/bin/tsh: ", "/bin/sh: ",
+                                        "bash: ", "tsh: ", "sh: ", 0 };
+    long r = 0, w = 0;
+    while (r < len) {
+        if (r == 0 || t[r - 1] == '\n') {
+            for (int i = 0; pfx[i]; i++) {
+                long pl = (long)strlen(pfx[i]);
+                if (r + pl <= len && memcmp(t + r, pfx[i], (size_t)pl) == 0) {
+                    memcpy(t + w, "SH: ", 4);
+                    w += 4;
+                    r += pl;
+                    break;
+                }
+            }
+            if (r >= len) break;
+        }
+        t[w++] = t[r++];
+    }
+    return w;
+}
+
+/* ...and a PID is not behaviour either: the two shells' children get
+ * different ones. Two shapes carry one: kill's "kill: (-38) - No such
+ * process", and a job's death report, "SCRIPT: line 3:    79 Killed ..."
+ * (bash's %5d). The number becomes "#" on both sides. Only ever shortens,
+ * so it works in place; returns the new length. */
+static long norm_pids(char *t, long len) {
+    long r = 0, w = 0;
+    while (r < len) {
+        if (r + 7 <= len && memcmp(t + r, "kill: (", 7) == 0) {
+            memmove(t + w, t + r, 7);
+            w += 7;
+            r += 7;
+            if (r < len && t[r] == '-') t[w++] = t[r++];
+            if (r < len && t[r] >= '0' && t[r] <= '9') {
+                while (r < len && t[r] >= '0' && t[r] <= '9') r++;
+                t[w++] = '#';
+            }
+            continue;
+        }
+        if (r + 7 <= len && memcmp(t + r, ": line ", 7) == 0) {
+            long q = r + 7;
+            while (q < len && t[q] >= '0' && t[q] <= '9') q++;
+            if (q > r + 7 && q + 2 <= len && t[q] == ':' && t[q + 1] == ' ') {
+                long d = q + 2, e;
+                while (d < len && t[d] == ' ') d++;
+                e = d;
+                while (e < len && t[e] >= '0' && t[e] <= '9') e++;
+                if (e > d && e < len && t[e] == ' ') {
+                    memmove(t + w, t + r, (size_t)(q + 2 - r));
+                    w += q + 2 - r;
+                    t[w++] = '#';
+                    r = e;
+                    continue;
+                }
+            }
+        }
+        t[w++] = t[r++];
+    }
+    return w;
+}
+
 static void show_diff(const char *a, long na, const char *b, long nb) {
     int la = count_lines(a, na), lb = count_lines(b, nb);
     emitf("[shparity]     lines bash=%d tsh=%d\n", la, lb);
@@ -367,7 +436,7 @@ int main(void) {
     emitf("[shparity] corpus: %d case(s) from %s\n", g_ncases, CORPUS_DIR);
 
     /* --- run every case under both shells. --- */
-    int pass = 0, fail = 0, broke = 0, errdiff = 0;
+    int pass = 0, fail = 0, broke = 0, errdiff = 0, errneq = 0;
 
     for (int i = 0; i < g_ncases; i++) {
         char cpath[MAX_PATH];
@@ -434,6 +503,21 @@ int main(void) {
         long eb_n = read_all(be, g_buf_b, sizeof g_buf_b);
         if (ea_n > 0 || eb_n > 0) {
             errdiff++;
+            /* Compared with the program name and pids normalised (S12):
+             * still informational, but counted, so the number can be driven
+             * to zero. The lines printed below are the normalised ones. */
+            {
+                long na = norm_pids(g_buf_a,
+                                    norm_progname(g_buf_a, ea_n < 0 ? 0 : ea_n));
+                long nb = norm_pids(g_buf_b,
+                                    norm_progname(g_buf_b, eb_n < 0 ? 0 : eb_n));
+                if (na != nb || memcmp(g_buf_a, g_buf_b, (size_t)na) != 0) {
+                    errneq++;
+                    emitf("[shparity]     stderr DIFFERS (program name and pids normalised)\n");
+                }
+                ea_n = na;
+                eb_n = nb;
+            }
             emitf("[shparity]     (stderr bytes bash=%ld tsh=%ld -- informational)\n",
                   ea_n < 0 ? 0 : ea_n, eb_n < 0 ? 0 : eb_n);
             for (int side = 0; side < 2; side++) {
@@ -459,9 +543,9 @@ int main(void) {
 
     /* One line, one write: this is what the host harness greps for. */
     emitf("[SHPARITY] VERDICT: %s %d/%d pass fail=%d broken=%d stderr-cases=%d "
-          "(stdout+exit must match GNU bash 5.2 exactly)\n",
+          "stderr-differ=%d (stdout+exit must match GNU bash 5.2 exactly)\n",
           (fail == 0 && broke == 0) ? "PASS" : "FAIL",
-          pass, g_ncases, fail, broke, errdiff);
+          pass, g_ncases, fail, broke, errdiff, errneq);
 
     return (fail == 0 && broke == 0) ? 0 : 1;
 }

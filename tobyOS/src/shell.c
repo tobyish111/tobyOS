@@ -65,6 +65,20 @@
 #include <tobyos/sectest.h>
 #include <tobyos/spinlock.h>
 
+/* A diagnostic's own old prefix ("tsh: ", "shell: ", "sh: "): the kernel
+ * console keeps the words, /bin/tsh drops them for bash's (S12, see
+ * shell_diagf). The few kprintf calls above shell_diagf's declaration --
+ * the buffer helpers' out-of-memory lines -- go out plainly. */
+#ifndef SHELL_HOSTED
+#define SH_PFX_TSH   "tsh: "
+#define SH_PFX_SHELL "shell: "
+#define SH_PFX_SH    "sh: "
+#else
+#define SH_PFX_TSH   ""
+#define SH_PFX_SHELL ""
+#define SH_PFX_SH    ""
+#endif
+
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 512
@@ -231,7 +245,7 @@ static int sb_grow(struct shell_sb *b, size_t need) {
 #endif
     char *n = (char *)kmalloc(ncap);
     if (!n) {
-        kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)ncap);
+        kprintf(SH_PFX_SHELL "out of memory (%lu bytes)\n", (unsigned long)ncap);
         return -1;
     }
     memcpy(n, b->p, b->len + 1);
@@ -395,7 +409,7 @@ static char *words_store(struct shell_words *w, const char *s, size_t n) {
 #endif
         c = (struct shell_words_chunk *)kmalloc(sizeof *c + cap);
         if (!c) {
-            kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)cap);
+            kprintf(SH_PFX_SHELL "out of memory (%lu bytes)\n", (unsigned long)cap);
             return 0;
         }
         c->used = 0;
@@ -426,7 +440,7 @@ static void *words_alloc(struct shell_words *w, size_t n) {
 #endif
         c = (struct shell_words_chunk *)kmalloc(sizeof *c + cap);
         if (!c) {
-            kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)cap);
+            kprintf(SH_PFX_SHELL "out of memory (%lu bytes)\n", (unsigned long)cap);
             return 0;
         }
         c->used = 0;
@@ -492,6 +506,15 @@ static void shell_err(const char *fmt, ...);   /* fd 2, even in the kernel */
 __attribute__((format(printf, 1, 2)))
 static void shell_kprintf(const char *fmt, ...);
 #define kprintf(...) shell_kprintf(__VA_ARGS__)
+/* The kernel console keeps its own words: no bash prefix there (S12). */
+#define kprintf_raw(...) shell_kprintf(__VA_ARGS__)
+#else
+/* /bin/tsh's diagnostics carry bash's prefix: see shell_diagf. kprintf_raw
+ * is the plain fd-2 write, for the lines bash prints bare. */
+__attribute__((format(printf, 1, 2)))
+static void shell_diagf(const char *fmt, ...);
+#define kprintf(...) shell_diagf(__VA_ARGS__)
+#define kprintf_raw(...) (kprintf)(__VA_ARGS__)
 #endif
 
 /* Command history: what `history` lists, `fc` re-runs and both line editors
@@ -607,7 +630,7 @@ static bool shell_accum_room(char **acc, size_t *cap, size_t need) {
     while (ncap < need) ncap *= 2;
     char *n = (char *)kmalloc(ncap);
     if (!n) {
-        kprintf("sh: out of memory reading a compound command\n");
+        kprintf(SH_PFX_SH "out of memory reading a compound command\n");
         return false;
     }
     if (*acc) {
@@ -947,6 +970,77 @@ static bool g_opt_history = true;
  * the hosted entry points clear it. */
 static bool g_interactive = true;
 
+/* ---- where a diagnostic says it came from (S12, 2026-10-01) -------------
+ * bash begins every diagnostic with its origin, and tsh began them with
+ * "tsh: ", "shell: ", "sh: " or nothing at all. bash's rule
+ * (get_name_for_error, error_prolog), measured on the guest
+ * (logs/s8/before-s12.bash):
+ *   - in a script, "FILE: line N: " -- FILE the file being read: a sourced
+ *     file's own name inside it, the file a function was DEFINED in inside
+ *     the function, and N the line of the command (no "line" while N is 0);
+ *   - with -c, "$0: line N: " -- and inside a function the -c text defined,
+ *     "environment: line N: ";
+ *   - at a terminal, "NAME: ", NAME being the shell's own name.
+ * g_diag_source is the file the reader is on (the main script's or a
+ * sourced file's name as given), 0 for -c; g_diag_fn_source is the running
+ * function's defining file while g_diag_in_fn. Kept in both builds, since
+ * a function records where it was defined either way. */
+static const char *g_diag_source;
+static const char *g_diag_fn_source;
+static bool g_diag_in_fn;
+static char *g_diag_progname;          /* the shell's own name, at a terminal */
+
+#ifdef SHELL_HOSTED
+static bool  g_diag_midline;           /* the last diagnostic left a line open */
+
+static int shell_diag_prefix(struct shell_sb *b) {
+    if (g_interactive)
+        return (sb_puts(b, g_diag_progname ? g_diag_progname : "tsh") < 0 ||
+                sb_puts(b, ": ") < 0) ? -1 : 0;
+    const char *name;
+    if (g_diag_in_fn)
+        name = g_diag_fn_source ? g_diag_fn_source : "environment";
+    else if (g_diag_source)
+        name = g_diag_source;
+    else
+        name = g_param0 ? g_param0 : "tsh";
+    if (sb_puts(b, name) < 0) return -1;
+    if (g_shell_lineno > 0 &&
+        (sb_puts(b, ": line ") < 0 || sb_put_uint(b, g_shell_lineno) < 0))
+        return -1;
+    return sb_puts(b, ": ");
+}
+
+/* Every kprintf in /bin/tsh: a diagnostic, on fd 2, with bash's prefix --
+ * unless it continues a line an earlier one left open. */
+static void shell_diagf(const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    char small[256];
+    SH_SB(msg);
+    int n = kvsnprintf(small, sizeof small, fmt, ap);
+    if (n >= 0 && (size_t)n < sizeof small) {
+        (void)sb_puts(&msg, small);
+    } else if (n >= 0) {
+        char *big = (char *)kmalloc((size_t)n + 1);
+        if (big) {
+            (void)kvsnprintf(big, (size_t)n + 1, fmt, ap2);
+            (void)sb_puts(&msg, big);
+            kfree(big);
+        }
+    }
+    va_end(ap2);
+    va_end(ap);
+    if (!msg.len) return;
+    SH_SB(out);
+    if (!g_diag_midline) (void)shell_diag_prefix(&out);
+    (void)sb_puts(&out, msg.p);
+    g_diag_midline = (msg.p[msg.len - 1] != '\n');
+    (kprintf)("%s", out.p);
+}
+#endif
+
 struct shell_alias {
     char *name;
     char *value;
@@ -972,6 +1066,7 @@ struct shell_function {
     char **heredoc;
     bool  *heredoc_expand;                          /* see shell_heredoc */
     int    nheredoc;
+    char  *src;          /* the file it was defined in, 0 for -c (S12) */
     /* WHERE EACH LINE OF THE BODY IS, from the definition: lm_line[i] is
      * the source line from body offset lm_off[i] on. A call runs the body
      * with this map, so $LINENO -- and a diagnostic -- name the line in the
@@ -1534,17 +1629,23 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
         if (!fg) return;
         if (sig == SIGINT) { shell_write("\n"); return; }
         if (sig == SIGPIPE) return;
-        kprintf("%s\n", shell_signal_desc(sig));
+        kprintf_raw("%s\n", shell_signal_desc(sig));
         return;
     }
     if (sig == SIGINT || sig == SIGPIPE) return;
     if (sig == SIGTERM) {
-        if (fg) kprintf("Terminated\n");
+        if (fg) kprintf_raw("Terminated\n");
         return;
     }
+    /* "FILE: line N: " is the diagnostic prefix (S12); the kernel console
+     * spells it out itself. */
+#ifdef SHELL_HOSTED
+    kprintf("%5d %-24s%s\n", pid, shell_signal_desc(sig), cmd ? cmd : "");
+#else
     kprintf("%s: line %lu: %5d %-24s%s\n", g_param0 ? g_param0 : "tsh",
             (unsigned long)g_shell_lineno, pid, shell_signal_desc(sig),
             cmd ? cmd : "");
+#endif
 }
 
 #ifdef SHELL_HOSTED
@@ -2305,7 +2406,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 if (globbed < 0) return -1;
                 if (globbed == 0 && g_shopt_failglob) {
                     shell_strip_nosplit_inplace(field);
-                    kprintf("shell: no match: %s\n", field);
+                    kprintf(SH_PFX_SHELL "no match: %s\n", field);
                     g_bad_subst_soft = true;
                     if (g_shell_flow == SHELL_FLOW_NONE) {
                         g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
@@ -2877,7 +2978,7 @@ static int env_set(const char *key, const char *val) {
     char small[256];
     char *tmp = (need <= sizeof small) ? small : (char *)kmalloc(need);
     if (!tmp) {
-        kprintf("shell: out of memory (%lu bytes)\n", (unsigned long)need);
+        kprintf(SH_PFX_SHELL "out of memory (%lu bytes)\n", (unsigned long)need);
         return -1;
     }
     memcpy(tmp, key, klen);
@@ -3296,6 +3397,8 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
+    if (g_functions[idx].src) kfree(g_functions[idx].src);
+    g_functions[idx].src = g_diag_source ? shell_strdup(g_diag_source) : 0;
 
     /* ...and the line map the definer captured (see shell_fndef_capture_map),
      * which belongs to this body and no other. */
@@ -3367,6 +3470,8 @@ static void shell_function_unset(const char *name) {
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = 0;
     g_functions[idx].body = 0;
+    if (g_functions[idx].src) kfree(g_functions[idx].src);
+    g_functions[idx].src = 0;
 }
 
 /* Signal names for `kill -l`, `kill -NAME` and `trap NAME`. Indexed by
@@ -3635,7 +3740,7 @@ static void shell_run_debug_trap(void) {
     /* `return` in a top-level DEBUG trap is bash's "can only return from a
      * function or sourced script": reported, and nothing else happens. */
     if (g_shell_flow == SHELL_FLOW_RETURN) {
-        kprintf("shell: return: can only `return' from a function or sourced script\n");
+        kprintf(SH_PFX_SHELL "return: can only `return' from a function or sourced script\n");
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
     }
@@ -3957,7 +4062,7 @@ static void shell_hd_strip_tags(char *s) {
  * taken, overwrote a body a command parsed earlier still pointed at. */
 static const char *shell_hd_text_for(int id, struct shell_words *words) {
     if (id < 0 || id >= g_hd_cap || !g_hd_store[id].live) {
-        kprintf("shell: here-document body missing\n");
+        kprintf(SH_PFX_SHELL "here-document body missing\n");
         return 0;
     }
     struct shell_hd_entry *e = &g_hd_store[id];
@@ -4245,7 +4350,7 @@ static bool shell_special_builtin_name(const char *name) {
 static void cmd_setenv(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 3) {
-        kprintf("usage: setenv KEY VALUE\n");
+        kprintf_raw("usage: setenv KEY VALUE\n");
         shell_set_status(1);
         return;
     }
@@ -4258,7 +4363,7 @@ static void cmd_setenv(int argc, char **argv) {
 static void cmd_unsetenv(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
-        kprintf("usage: unsetenv KEY\n");
+        kprintf_raw("usage: unsetenv KEY\n");
         shell_set_status(1);
         return;
     }
@@ -5530,7 +5635,7 @@ static void cmd_declare(int argc, char **argv) {
              * its usage line and exits 2. tsh took the word for a NAME,
              * called it bad, and exited 1. */
             kprintf("%s: -%c: invalid option\n", argv[0], bad);
-            kprintf("%s: usage: %s [-aAfFgiIlnrtux] [name[=value] ...] or "
+            kprintf_raw("%s: usage: %s [-aAfFgiIlnrtux] [name[=value] ...] or "
                     "%s -p [-aAfFilnrtux] [name ...]\n",
                     argv[0], argv[0], argv[0]);
             shell_set_status(2);
@@ -5883,7 +5988,7 @@ static void cmd_readonly(int argc, char **argv) {
         }
         if (!ok) {
             kprintf("readonly: %s: invalid option\n", argv[first]);
-            kprintf("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p\n");
+            kprintf_raw("readonly: usage: readonly [-aAf] [name[=value] ...] or readonly -p\n");
             shell_set_status(2);
             return;
         }
@@ -6067,7 +6172,7 @@ done:
 static void cmd_unset(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        kprintf("usage: unset [-f|-v] NAME [NAME...]\n");
+        kprintf_raw("usage: unset [-f|-v] NAME [NAME...]\n");
         shell_set_status(1);
         return;
     }
@@ -6663,7 +6768,7 @@ static void shell_getopts_finish_end(const char *name, int optind) {
 static void cmd_getopts(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 3) {
-        kprintf("usage: getopts optstring NAME [ARG...]\n");
+        kprintf_raw("usage: getopts optstring NAME [ARG...]\n");
         shell_set_status(2);
         return;
     }
@@ -7100,7 +7205,7 @@ static void cmd_read(int argc, char **argv) {
                 else if (first + 1 < argc) { arg = argv[first + 1]; consumed_next = true; }
                 else {
                     kprintf("read: -%c: option requires an argument\n", o);
-                    kprintf("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
+                    kprintf_raw("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
                             "[-n nchars] [-N nchars] [-p prompt] [-t timeout] "
                             "[-u fd] [name ...]\n");
                     shell_set_status(2);
@@ -7172,7 +7277,7 @@ static void cmd_read(int argc, char **argv) {
             }
             default:
                 kprintf("read: -%c: invalid option\n", o);
-                kprintf("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
+                kprintf_raw("read: usage: read [-ers] [-a array] [-d delim] [-i text] "
                         "[-n nchars] [-N nchars] [-p prompt] [-t timeout] "
                         "[-u fd] [name ...]\n");
                 shell_set_status(2);
@@ -7199,7 +7304,7 @@ static void cmd_read(int argc, char **argv) {
         if (!in) {
             tmp_console = console_file_make();
             in = tmp_console;
-            if (want_prompt && prompt && in) kprintf("%s", prompt);
+            if (want_prompt && prompt && in) kprintf_raw("%s", prompt);
         }
     }
     if (!in) {
@@ -7582,7 +7687,7 @@ static int parse_hex(const char *s, uint64_t *out) {
 
 static void cmd_peek(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: peek <hex-phys-addr>\n");
+        kprintf_raw("usage: peek <hex-phys-addr>\n");
         return;
     }
     uint64_t phys;
@@ -7689,7 +7794,7 @@ static bool shell_word_is_keyword(const char *name) {
 
 static void cmd_run(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: run [--sandbox <profile>] <path> [args...]\n");
+        kprintf_raw("usage: run [--sandbox <profile>] <path> [args...]\n");
         kprintf("       (try 'run /bin/hello' or just 'hello')\n");
         kprintf("       'caps' lists available sandbox profiles\n");
         shell_set_status(1);
@@ -8170,7 +8275,7 @@ static void cmd_wait(int argc, char **argv) {
                 else if (first + 1 < argc) pvar = argv[++first];
                 else {
                     kprintf("wait: -p: option requires an argument\n");
-                    kprintf("wait: usage: wait [-fn] [-p var] [id ...]\n");
+                    kprintf_raw("wait: usage: wait [-fn] [-p var] [id ...]\n");
                     shell_set_status(2);
                     return;
                 }
@@ -8184,7 +8289,7 @@ static void cmd_wait(int argc, char **argv) {
          * corpus tries against every shell; bash rejects them with 2. */
         if (bad) {
             kprintf("wait: %s: invalid option\n", argv[first]);
-            kprintf("wait: usage: wait [-fn] [-p var] [id ...]\n");
+            kprintf_raw("wait: usage: wait [-fn] [-p var] [id ...]\n");
             shell_set_status(2);
             return;
         }
@@ -8349,7 +8454,7 @@ static void cmd_top(int argc, char **argv) {
             int v = tiny_atoi(argv[++i]);
             if (v > 0) ms = v;
         } else {
-            kprintf("usage: top [-n iters] [-d ms]\n");
+            kprintf_raw("usage: top [-n iters] [-d ms]\n");
             return;
         }
     }
@@ -8380,7 +8485,7 @@ static void cmd_time(int argc, char **argv) {
      * there's no separate PCB to measure -- use `perf reset; ...;
      * perf` for that). */
     if (argc < 2) {
-        kprintf("usage: time <command> [args...]\n");
+        kprintf_raw("usage: time <command> [args...]\n");
         return;
     }
     char path_buf[64];
@@ -8454,7 +8559,7 @@ static void cmd_perf(int argc, char **argv) {
             perf_set_enabled(false);
             return;
         }
-        kprintf("usage: perf [reset|on|off]\n");
+        kprintf_raw("usage: perf [reset|on|off]\n");
         return;
     }
     perf_dump_sys();
@@ -8499,7 +8604,7 @@ static void cmd_log(int argc, char **argv) {
             return;
         }
     }
-    kprintf("usage: log [enable|disable <sched|syscall|proc|vfs|gui|perf|net|all>]\n");
+    kprintf_raw("usage: log [enable|disable <sched|syscall|proc|vfs|gui|perf|net|all>]\n");
 }
 
 /* ---- VFS-backed builtins (milestone 4) ---- */
@@ -8597,7 +8702,7 @@ static void users_print_one(const struct user *u, void *ctx) {
 static void cmd_users(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "add") == 0) {
         if (argc != 5) {
-            kprintf("usage: users add <name> <uid> <gid>\n");
+            kprintf_raw("usage: users add <name> <uid> <gid>\n");
             shell_set_status(1);
             return;
         }
@@ -8699,7 +8804,7 @@ static void cmd_chown(int argc, char **argv) {
  * (root), so its commands always succeed otherwise. */
 static void cmd_su(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: su <user>                (changes the SHELL's uid/gid)\n");
+        kprintf_raw("usage: su <user>                (changes the SHELL's uid/gid)\n");
         shell_set_status(1);
         return;
     }
@@ -9103,7 +9208,7 @@ static void cmd_rm(int argc, char **argv) {
  * No newline is appended -- so `cat` will print the bytes verbatim. */
 static void cmd_write(int argc, char **argv) {
     if (argc < 3) {
-        kprintf("usage: write <path> <text>\n");
+        kprintf_raw("usage: write <path> <text>\n");
         kprintf("       e.g. write /data/notes/todo buy groceries\n");
         shell_set_status(1);
         return;
@@ -9145,7 +9250,7 @@ static void cmd_mounts(int argc, char **argv) {
 
 static void cmd_page(int argc, char **argv) {
     if (argc < 2) {
-        kprintf("usage: page <hex-virt-addr>\n");
+        kprintf_raw("usage: page <hex-virt-addr>\n");
         return;
     }
     uint64_t virt;
@@ -9243,7 +9348,7 @@ static void cmd_nslookup(int argc, char **argv) {
         return;
     }
     if (argc < 2) {
-        kprintf("usage: nslookup <hostname>\n");
+        kprintf_raw("usage: nslookup <hostname>\n");
         return;
     }
     if (g_my_dns_be == 0) {
@@ -9327,7 +9432,7 @@ static int parse_port(const char *s) {
 static void cmd_tcpconn(int argc, char **argv) {
     if (!net_is_up()) { kprintf("tcpconn: no NIC -- networking disabled\n"); return; }
     if (argc < 3) {
-        kprintf("usage: tcpconn <ip|host> <port>\n");
+        kprintf_raw("usage: tcpconn <ip|host> <port>\n");
         return;
     }
     int port = parse_port(argv[2]);
@@ -9374,7 +9479,7 @@ static void cmd_tcpconn(int argc, char **argv) {
 static void cmd_httpget(int argc, char **argv) {
     if (!net_is_up()) { kprintf("httpget: no NIC -- networking disabled\n"); return; }
     if (argc < 2) {
-        kprintf("usage: httpget <url> [vfs-path]\n");
+        kprintf_raw("usage: httpget <url> [vfs-path]\n");
         kprintf("       httpget http://10.0.2.2:8000/foo.txt\n");
         kprintf("       httpget http://10.0.2.2:8000/foo.bin /data/foo.bin\n");
         return;
@@ -9470,7 +9575,7 @@ static void cmd_install(int argc, char **argv) {
             devname = argv[i];
         } else {
             kprintf("install: unknown option '%s'\n", argv[i]);
-            kprintf("usage: install [DEVICE] [--yes]\n");
+            kprintf_raw("usage: install [DEVICE] [--yes]\n");
             shell_set_status(2);
             return;
         }
@@ -9699,7 +9804,7 @@ static void cmd_hwinfo(int argc, char **argv) {
             do_persist = true;
         } else if (!strcmp(argv[1], "help") ||
                    !strcmp(argv[1], "--help")) {
-            kprintf("usage: hwinfo [persist]\n");
+            kprintf_raw("usage: hwinfo [persist]\n");
             return;
         }
     }
@@ -9727,7 +9832,7 @@ static void cmd_hwinfo(int argc, char **argv) {
 static void cmd_drvmatch(int argc, char **argv) {
     if (argc >= 2 && (!strcmp(argv[1], "help") ||
                       !strcmp(argv[1], "--help"))) {
-        kprintf("usage: drvmatch [list|disable <drv>|reenable <drv>]\n");
+        kprintf_raw("usage: drvmatch [list|disable <drv>|reenable <drv>]\n");
         return;
     }
     if (argc >= 3 && !strcmp(argv[1], "disable")) {
@@ -9826,7 +9931,7 @@ static void cmd_partprobe(int argc, char **argv) {
  * (e.g. 'ide0:master.p2', 'nvme0:n1.p1'). */
 static void cmd_mountfs(int argc, char **argv) {
     if (argc < 3) {
-        kprintf("usage: mountfs <mountpoint> <blkdev> [type]\n");
+        kprintf_raw("usage: mountfs <mountpoint> <blkdev> [type]\n");
         kprintf("       e.g. mountfs /data ide0:master.p2\n");
         kprintf("            mountfs /fat ide0:master.p3 fat32\n");
         kprintf("       known types: tobyfs, fat32 (auto-detected if omitted)\n");
@@ -9898,7 +10003,7 @@ static void cmd_mountfs(int argc, char **argv) {
  * Every subcommand is idempotent w.r.t. the launcher: the pkg module
  * refreshes the desktop's dynamic entries after any change. */
 static void pkg_usage(void) {
-    kprintf("usage: pkg <subcmd> [args]\n");
+    kprintf_raw("usage: pkg <subcmd> [args]\n");
     kprintf("  pkg install <name-or-path>   install from /data/repo, /repo, or an explicit .tpkg\n");
     kprintf("  pkg remove  <name>           uninstall by package name\n");
     kprintf("  pkg list                     list installed packages\n");
@@ -9914,7 +10019,7 @@ static void cmd_pkg(int argc, char **argv) {
     const char *sub = argv[1];
 
     if (!strcmp(sub, "install")) {
-        if (argc < 3) { kprintf("usage: pkg install <name|path|http://url>\n"); return; }
+        if (argc < 3) { kprintf_raw("usage: pkg install <name|path|http://url>\n"); return; }
         const char *arg = argv[2];
 
         /* Milestone 24D: detect http:// URLs and route through the
@@ -9942,7 +10047,7 @@ static void cmd_pkg(int argc, char **argv) {
         return;
     }
     if (!strcmp(sub, "remove")) {
-        if (argc < 3) { kprintf("usage: pkg remove <name>\n"); return; }
+        if (argc < 3) { kprintf_raw("usage: pkg remove <name>\n"); return; }
         if (pkg_remove(argv[2]) != 0) kprintf("pkg remove: failed\n");
         return;
     }
@@ -9952,7 +10057,7 @@ static void cmd_pkg(int argc, char **argv) {
         return;
     }
     if (!strcmp(sub, "info")) {
-        if (argc < 3) { kprintf("usage: pkg info <name>\n"); return; }
+        if (argc < 3) { kprintf_raw("usage: pkg info <name>\n"); return; }
         (void)pkg_info(argv[2]);
         return;
     }
@@ -9973,7 +10078,7 @@ static void cmd_pkg(int argc, char **argv) {
         return;
     }
     if (!strcmp(sub, "rollback")) {
-        if (argc < 3) { kprintf("usage: pkg rollback <name>\n"); return; }
+        if (argc < 3) { kprintf_raw("usage: pkg rollback <name>\n"); return; }
         (void)pkg_rollback(argv[2]);
         return;
     }
@@ -10025,7 +10130,7 @@ static void cmd_trace(int argc, char **argv) {
         case GUI_TRACE_VERBOSE: name = "verbose"; break;
         }
         kprintf("trace: level=%d (%s)\n", gui_trace_level(), name);
-        kprintf("usage: trace [on|off|verbose|status]\n");
+        kprintf_raw("usage: trace [on|off|verbose|status]\n");
         kprintf("  on      desktop control flow (clicks, launches, reaps)\n");
         kprintf("  verbose on + per-call GUI syscalls (gui_fill / flip / poll)\n");
         kprintf("  off     disable\n");
@@ -10072,7 +10177,7 @@ static void cmd_caps(int argc, char **argv) {
         if (me) {
             char mask[96];
             cap_mask_to_string(me->caps, mask, sizeof(mask));
-            kprintf("shell: pid=%d name='%s' caps=0x%08x [%s]\n",
+            kprintf(SH_PFX_SHELL "pid=%d name='%s' caps=0x%08x [%s]\n",
                     me->pid, me->name, (unsigned)me->caps, mask);
             if (me->sandbox_root[0]) {
                 kprintf("       sandbox_root='%s'\n", me->sandbox_root);
@@ -10178,7 +10283,7 @@ static void cmd_auditlog(int argc, char **argv) {
             }
             tail_n = v;
         } else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
-            kprintf("usage: auditlog [--all] [--sub=NAME] [--level=warn|info|debug]\n");
+            kprintf_raw("usage: auditlog [--all] [--sub=NAME] [--level=warn|info|debug]\n");
             kprintf("                [--since=SEQ] [-n N]\n");
             kprintf("default subs: audit sysprot sec pkg (M34F)\n");
             return;
@@ -10261,7 +10366,7 @@ static void cmd_securitytest(int argc, char **argv) {
  * user-program invocation with a narrow capability set. */
 static void cmd_sandbox(int argc, char **argv) {
     if (argc < 3) {
-        kprintf("usage: sandbox <profile> <cmd> [args...]\n");
+        kprintf_raw("usage: sandbox <profile> <cmd> [args...]\n");
         kprintf("       'caps' lists profile names\n");
         return;
     }
@@ -10479,7 +10584,7 @@ static bool shell_collect_line_heredocs(const char *line, const char *from,
     int *ids __attribute__((cleanup(shell_kfree_ptr))) =
         (int *)kmalloc((size_t)maxhd * sizeof *ids);
     if (!hd || !ids) {
-        kprintf("sh: out of memory reading here-documents\n");
+        kprintf(SH_PFX_SH "out of memory reading here-documents\n");
         return false;
     }
     int nhd = shell_line_find_heredocs(from, hd, maxhd);
@@ -10494,7 +10599,7 @@ static bool shell_collect_line_heredocs(const char *line, const char *from,
     size_t ll = strlen(line);
     char *out = (char *)kmalloc(ll + (size_t)nhd * 16 + 1);
     if (!out) {
-        kprintf("sh: out of memory tagging here-documents\n");
+        kprintf(SH_PFX_SH "out of memory tagging here-documents\n");
         return false;
     }
     size_t o = 0, r = 0;
@@ -10533,7 +10638,7 @@ static int shell_collect_heredoc(char **pp, const char *delim,
             /* Into the store, raw -- an unquoted body is expanded when it is
              * USED (shell_hd_text_for). The id comes back: SHELL_HD_TAG. */
             int id = shell_hd_store(body.p ? body.p : "", body.len, !quoted);
-            if (id < 0) kprintf("sh: out of memory storing a here-document\n");
+            if (id < 0) kprintf(SH_PFX_SH "out of memory storing a here-document\n");
             return id;
         }
 
@@ -10558,12 +10663,12 @@ static int shell_collect_heredoc(char **pp, const char *delim,
          * "bad command substitution" for a here-document bash reads without
          * complaint. The expansion moved to the end of the collection loop. */
         if (sb_puts(&body, raw) < 0 || sb_putc(&body, '\n') < 0) {
-            kprintf("sh: out of memory reading a here-document\n");
+            kprintf(SH_PFX_SH "out of memory reading a here-document\n");
             return -1;
         }
     }
 
-    kprintf("sh: here-document delimited by EOF (wanted '%s')\n", delim);
+    kprintf(SH_PFX_SH "here-document delimited by EOF (wanted '%s')\n", delim);
     return -1;
 }
 
@@ -12003,7 +12108,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     const char *hist_raw_base = 0;
     if (shell_stack_exhausted(eval_mode ? g_eval_reader_depth
                                         : g_script_depth)) {
-        kprintf("sh: script nesting too deep\n");
+        kprintf(SH_PFX_SH "script nesting too deep\n");
         return 2;
     }
 
@@ -12360,7 +12465,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             }
             if (overflow || shell_scan_incomplete(&scan)) {
                 if (!overflow)
-                    kprintf("sh: unexpected end of file (unterminated compound)\n");
+                    kprintf(SH_PFX_SH "unexpected end of file (unterminated compound)\n");
                 kfree(accum);
                 /* A SCRIPT THAT DOES NOT PARSE DOES NOT RUN, and a CALLER has
                  * to be able to tell: `echo $(if true)` is a parse error
@@ -12460,7 +12565,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
     int rc = vfs_read_all(path, &buf, &sz);
     (void)sz;
     if (rc != VFS_OK) {
-        kprintf("sh: '%s': %s\n", path_arg, vfs_strerror(rc));
+        kprintf(SH_PFX_SH "'%s': %s\n", path_arg, vfs_strerror(rc));
         return 1;
     }
     int st = shell_run_script_text((char *)buf, run_exit_trap);
@@ -12524,13 +12629,13 @@ static void shell_reset_opts(void) {
 static void cmd_sh(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
-        kprintf("usage: sh [-c command] [script]\n");
+        kprintf_raw("usage: sh [-c command] [script]\n");
         shell_set_status(1);
         return;
     }
     if (strcmp(argv[1], "-c") == 0) {
         if (argc < 3) {
-            kprintf("sh: -c requires a command string\n");
+            kprintf(SH_PFX_SH "-c requires a command string\n");
             shell_set_status(2);
             return;
         }
@@ -12539,7 +12644,7 @@ static void cmd_sh(int argc, char **argv) {
         int pargc = (argc >= 5) ? argc - 4 : 0;
         char **pargv = (argc >= 5) ? &argv[4] : &argv[argc];
         if (shell_enter_script_params(&frame, param0, pargc, pargv) < 0) {
-            kprintf("sh: failed to set positional parameters\n");
+            kprintf(SH_PFX_SH "failed to set positional parameters\n");
             shell_set_status(1);
             return;
         }
@@ -12581,7 +12686,7 @@ static void cmd_sh(int argc, char **argv) {
     int pargc = argc - 2;
     char **pargv = (argc >= 3) ? &argv[2] : &argv[argc];
     if (shell_enter_script_params(&frame, argv[1], pargc, pargv) < 0) {
-        kprintf("sh: failed to set positional parameters\n");
+        kprintf(SH_PFX_SH "failed to set positional parameters\n");
         shell_set_status(1);
         return;
     }
@@ -12651,17 +12756,29 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
 static void cmd_dot(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
-        kprintf("usage: . script\n");
+        kprintf_raw("usage: . script\n");
         shell_set_status(2);
         return;
     }
     char resolved[VFS_PATH_MAX];
     if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) return;
+    /* Diagnostics inside name the file (S12): as written when it has a
+     * slash, else where the PATH search found it. */
+    bool slash = false;
+    for (const char *c = argv[1]; *c && !slash; c++) slash = (*c == '/');
+    char *src_name __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_strdup(slash ? argv[1] : resolved);
+    const char *saved_src = g_diag_source;
+    bool saved_in_fn = g_diag_in_fn;
+    g_diag_source = src_name;
+    g_diag_in_fn = false;
     argv[1] = resolved;
     if (argc <= 2) {
         g_source_depth++;                  /* `return` is legal in here */
         int st1 = shell_run_script_path(argv[1], false);
         g_source_depth--;
+        g_diag_source = saved_src;
+        g_diag_in_fn = saved_in_fn;
         shell_set_status(st1);
         shell_run_return_trap();       /* a sourced script finished */
         return;
@@ -12676,6 +12793,8 @@ static void cmd_dot(int argc, char **argv) {
     g_source_depth++;                      /* `return` is legal in here */
     int st = shell_run_script_path(argv[1], false);
     g_source_depth--;
+    g_diag_source = saved_src;
+    g_diag_in_fn = saved_in_fn;
     shell_set_status(st);
     shell_run_return_trap();           /* a sourced script finished */
     shell_restore_params_from_frame(&frame);
@@ -12739,7 +12858,7 @@ static void cmd_alias(int argc, char **argv) {
 static void cmd_unalias(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
-        kprintf("usage: unalias [-a] NAME [NAME...]\n");
+        kprintf_raw("usage: unalias [-a] NAME [NAME...]\n");
         shell_set_status(1);
         return;
     }
@@ -13016,7 +13135,7 @@ static void cmd_trap(int argc, char **argv) {
 
     /* An action with no condition is an error, not a silent success. */
     if (first_cond >= argc) {
-        kprintf("trap: usage: trap [-] ACTION CONDITION...\n");
+        kprintf_raw("trap: usage: trap [-] ACTION CONDITION...\n");
         shell_set_status(2);
         return;
     }
@@ -13051,7 +13170,7 @@ static void cmd_eval(int argc, char **argv) {
             argc--;
         } else {
             kprintf("eval: -%c: invalid option\n", argv[1][1]);
-            kprintf("eval: usage: eval [arg ...]\n");
+            kprintf_raw("eval: usage: eval [arg ...]\n");
             shell_set_status(2);
             return;
         }
@@ -13065,7 +13184,7 @@ static void cmd_eval(int argc, char **argv) {
      * shell died of SIGSEGV -- as bash does (both exit 139, measured); this
      * stops while the reserve is still free. */
     if (shell_stack_exhausted(0)) {
-        kprintf("sh: script nesting too deep\n");
+        kprintf(SH_PFX_SH "script nesting too deep\n");
         shell_set_status(2);
         return;
     }
@@ -13583,7 +13702,7 @@ static void cmd_type(int argc, char **argv) {
              * one output sink. kprintf IS the diagnostic channel here, and
              * the hosted build routes it through the shell's current fd 2,
              * so `type zz 2>err.txt` captures it. */
-            kprintf("tsh: type: %s: not found\n", name);
+            kprintf(SH_PFX_TSH "type: %s: not found\n", name);
             shell_set_status(1);
         }
     }
@@ -14586,7 +14705,7 @@ static int shell_q_render(const char *s, bool emit) {
 static void cmd_printf(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
-        kprintf("usage: printf FORMAT [ARG...]\n");
+        kprintf_raw("usage: printf FORMAT [ARG...]\n");
         shell_set_status(2);      /* usage error, not a runtime failure */
         return;
     }
@@ -14601,7 +14720,7 @@ static void cmd_printf(int argc, char **argv) {
         base = 2;
     }
     if (base >= argc) {
-        kprintf("usage: printf [-v NAME] FORMAT [ARG...]\n");
+        kprintf_raw("usage: printf [-v NAME] FORMAT [ARG...]\n");
         shell_set_status(2);
         return;
     }
@@ -15166,7 +15285,7 @@ static void cmd_hash(int argc, char **argv) {
                 break;
             default:
                 kprintf("hash: -%c: invalid option\n", *f);
-                kprintf("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n");
+                kprintf_raw("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n");
                 shell_set_status(2);
                 return;
             }
@@ -15228,7 +15347,7 @@ static void cmd_hash(int argc, char **argv) {
 static void cmd_kill(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) {
-        kprintf("usage: kill [-SIGNAL] PID...\n");
+        kprintf_raw("usage: kill [-SIGNAL] PID...\n");
         shell_set_status(2);
         return;
     }
@@ -15571,7 +15690,8 @@ static void cmd_getconf(int argc, char **argv) {
     }
     if (strcmp(argv[1], "PATH") == 0) {
         const char *pv = env_get("PATH");
-        kprintf("%s\n", pv ? pv : "/bin");
+        /* An answer, so stdout -- this went to fd 2 (S12). */
+        shell_printf("%s\n", pv ? pv : "/bin");
         shell_set_status(0);
         return;
     }
@@ -15594,7 +15714,7 @@ static void cmd_pathchk(int argc, char **argv) {
         }
     }
     if (i >= argc) {
-        kprintf("usage: pathchk [-p] pathname...\n");
+        kprintf_raw("usage: pathchk [-p] pathname...\n");
         shell_set_status(2);
         return;
     }
@@ -16038,7 +16158,7 @@ static void cmd_fc(int argc, char **argv) {
             return;
         }
         char *buf = bufb.p;
-        kprintf("%s\n", buf);
+        kprintf_raw("%s\n", buf);          /* the command, echoed bare */
         shell_history_add(buf);
         execute_line_text(buf);
         return;
@@ -16062,15 +16182,16 @@ static void cmd_fc(int argc, char **argv) {
     if (first > last) { int t = first; first = last; last = t; }
     /* bash's listing byte layout is TAB THEN A SPACE before the text --
      * measured on the interactive gate's pty, one byte per line of diff. */
+    /* A LISTING IS OUTPUT: stdout, as bash's (S12) -- it went to fd 2. */
     if (reverse) {
         for (int k = last; k >= first; k--) {
-            if (no_numbers) kprintf("\t %s\n", g_hist[k]);
-            else kprintf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+            if (no_numbers) shell_printf("\t %s\n", g_hist[k]);
+            else shell_printf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
         }
     } else {
         for (int k = first; k <= last; k++) {
-            if (no_numbers) kprintf("\t %s\n", g_hist[k]);
-            else kprintf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
+            if (no_numbers) shell_printf("\t %s\n", g_hist[k]);
+            else shell_printf("%lu\t %s\n", g_hist_base + (unsigned long)k + 1, g_hist[k]);
         }
     }
     shell_set_status(0);
@@ -16207,7 +16328,7 @@ static int dirstack_opts(const char *who, int argc, char **argv, bool *nocd) {
             break;
         if (a[0] == '-' && a[1]) {
             kprintf("%s: %s: invalid number\n", who, a);
-            kprintf("%s: usage: %s\n", who,
+            kprintf_raw("%s: usage: %s\n", who,
                     who[0] == 'p' && who[1] == 'u'
                         ? "pushd [-n] [+N | -N | dir]" : "popd [-n] [+N | -N]");
             shell_set_status(2);
@@ -16290,7 +16411,7 @@ static void cmd_popd(int argc, char **argv) {
     if (first < argc && argv[first][0] && argv[first][0] != '+' &&
         argv[first][0] != '-') {
         kprintf("popd: %s: invalid argument\n", argv[first]);
-        kprintf("popd: usage: popd [-n] [+N | -N]\n");
+        kprintf_raw("popd: usage: popd [-n] [+N | -N]\n");
         shell_set_status(2);
         return;
     }
@@ -16328,7 +16449,7 @@ static void cmd_popd(int argc, char **argv) {
  *                                   all; FILE defaults to $HISTFILE, then
  *                                   ~/.history */
 static void history_usage(void) {
-    kprintf("history: usage: history [-c] [-d offset] [n] or history -anrw "
+    kprintf_raw("history: usage: history [-c] [-d offset] [n] or history -anrw "
             "[filename] or history -ps arg [arg...]\n");
 }
 
@@ -17450,10 +17571,10 @@ static int shell_report_unrunnable(const char *as_typed, int status) {
     for (const char *c = as_typed; *c && !slash; c++) slash = (*c == '/');
     if (!slash) {
         if (g_spawn_for) kprintf("%s: %s: not found\n", g_spawn_for, as_typed);
-        else kprintf("tsh: %s: command not found\n", as_typed);
+        else kprintf(SH_PFX_TSH "%s: command not found\n", as_typed);
         return 127;
     }
-    kprintf("tsh: %s: %s\n", as_typed,
+    kprintf(SH_PFX_TSH "%s: %s\n", as_typed,
             shell_errno_text(status == 126 ? VFS_ERR_NAMETOOLONG
                                            : VFS_ERR_NOENT));
     return status;
@@ -17471,7 +17592,7 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
     {
         extern int host_spawn_was_e2big(void);
         if (host_spawn_was_e2big()) {
-            kprintf("tsh: %s: Argument list too long\n", as_typed);
+            kprintf(SH_PFX_TSH "%s: Argument list too long\n", as_typed);
             *status = 126;
             return 0;
         }
@@ -17485,12 +17606,12 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
     if (sr != VFS_OK) { *status = 127; return -1; }
     *status = 126;
     if (est.type == VFS_TYPE_DIR) {
-        kprintf("tsh: %s: Is a directory\n", as_typed);
+        kprintf(SH_PFX_TSH "%s: Is a directory\n", as_typed);
         return 0;
     }
     if (est.type != VFS_TYPE_FILE) return -1;
     if (est.mode != 0 && (est.mode & 0111) == 0) {
-        kprintf("tsh: %s: Permission denied\n", as_typed);
+        kprintf(SH_PFX_TSH "%s: Permission denied\n", as_typed);
         return 0;
     }
     char chain[2][SHELL_EXEC_HEAD];
@@ -17499,15 +17620,15 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
         char *interp = chain[depth & 1];
         int h = shell_exec_head(cur, interp, SHELL_EXEC_HEAD);
         if (h == -2) {
-            kprintf("tsh: %s: Permission denied\n", as_typed);
+            kprintf(SH_PFX_TSH "%s: Permission denied\n", as_typed);
             return 0;
         }
         if (h == -1) {
             if (depth == 0)
-                kprintf("tsh: %s: cannot execute binary file: "
+                kprintf(SH_PFX_TSH "%s: cannot execute binary file: "
                         "Exec format error\n", as_typed);
             else
-                kprintf("tsh: %s: %s: bad interpreter: Exec format error\n",
+                kprintf(SH_PFX_TSH "%s: %s: bad interpreter: Exec format error\n",
                         as_typed, cur);
             return 0;
         }
@@ -17516,18 +17637,18 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
              * way): the script is ours to run -- unless it is somebody's
              * interpreter, which cannot be a plain text file. */
             if (depth == 0) return 1;
-            kprintf("tsh: %s: %s: bad interpreter: Exec format error\n",
+            kprintf(SH_PFX_TSH "%s: %s: bad interpreter: Exec format error\n",
                     as_typed, cur);
             return 0;
         }
         struct vfs_stat ist;
         if (vfs_stat(interp, &ist) != VFS_OK) {
-            kprintf("tsh: %s: %s: bad interpreter: No such file or directory\n",
+            kprintf(SH_PFX_TSH "%s: %s: bad interpreter: No such file or directory\n",
                     as_typed, interp);
             return 0;
         }
         if (depth == SHELL_SHEBANG_DEPTH - 1) {
-            kprintf("tsh: %s: %s: bad interpreter: "
+            kprintf(SH_PFX_TSH "%s: %s: bad interpreter: "
                     "Too many levels of symbolic links\n", as_typed, interp);
             return 0;
         }
@@ -17578,7 +17699,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     struct file *spawn_diag_saved = g_shell_fd[2];
     if (fd2) g_shell_fd[2] = fd2;
     if (!path_arg || !path_arg[0]) {
-        kprintf("tsh: : command not found\n");
+        kprintf(SH_PFX_TSH ": command not found\n");
         g_shell_fd[2] = spawn_diag_saved;
         return 127;
     }
@@ -18205,7 +18326,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
                             out->p[out->len - 1] == '\r'))
         sb_truncate(out, out->len - 1);
     if (cap.failed) {
-        kprintf("shell: command substitution: out of memory\n");
+        kprintf(SH_PFX_SHELL "command substitution: out of memory\n");
         return -1;
     }
     return 0;
@@ -18397,7 +18518,7 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     SH_SB(cmd);
     if (sb_grow(&cmd, strlen(*pp) + 1) < 0) return -1;
     if (shell_parse_command_subst(pp, cmd.p, cmd.cap) < 0) {
-        kprintf("shell: bad command substitution\n");
+        kprintf(SH_PFX_SHELL "bad command substitution\n");
         return -1;
     }
     SH_SB(out);
@@ -18435,19 +18556,19 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
             p++;                          /* removed: the next byte is data */
         } else if (*p == '\\' && p[1]) {
             if (cpos + 2 >= cmd.cap) {
-                kprintf("shell: command substitution too long\n");
+                kprintf(SH_PFX_SHELL "command substitution too long\n");
                 return -1;
             }
             cmd.p[cpos++] = *p++;         /* retained: BOTH bytes are data */
         }
         if (cpos + 1 >= cmd.cap) {
-            kprintf("shell: command substitution too long\n");
+            kprintf(SH_PFX_SHELL "command substitution too long\n");
             return -1;
         }
         cmd.p[cpos++] = *p++;
     }
     if (*p != '`') {
-        kprintf("shell: unmatched backquote\n");
+        kprintf(SH_PFX_SHELL "unmatched backquote\n");
         return -1;
     }
     p++;
@@ -19853,7 +19974,7 @@ static int shell_expand_at_transform(const char *name, char opch,
         }
         break;
     default:
-        kprintf("shell: bad substitution\n");
+        kprintf(SH_PFX_SHELL "bad substitution\n");
         return -1;
     }
     /* As a C string, as before: an @E that decoded a NUL ends the value. */
@@ -19886,7 +20007,7 @@ static int shell_expand_at_transform(const char *name, char opch,
 static int shell_expand_substring(const char *name, const char *spec,
                                   struct shell_sb *b) {
     if (!spec || !*spec) {
-        kprintf("shell: bad substitution\n");
+        kprintf(SH_PFX_SHELL "bad substitution\n");
         return -1;
     }
     SH_SB(sbuf);                    /* an arithmetic spec, not a value */
@@ -20035,7 +20156,7 @@ static int shell_expand_element_op(const char *nm, const char *sub,
         v = sh_array_get_key(nm, key.p);
     } else {
         if (!sh_subscript_eval(subbuf.p, nm, false, &idx)) {
-            kprintf("shell: bad substitution\n");
+            kprintf(SH_PFX_SHELL "bad substitution\n");
             return -1;
         }
         if (idx >= 0) v = sh_array_get(nm, idx);
@@ -20072,7 +20193,7 @@ static int shell_expand_element_op(const char *nm, const char *sub,
         else if (assoc) {
             if (sh_array_set_key(nm, key.p, nvb.p) < 0) rc = -1;
         } else if (idx < 0) {
-            kprintf("shell: %s: bad array subscript\n", display.p);
+            kprintf(SH_PFX_SHELL "%s: bad array subscript\n", display.p);
             rc = -1;
         } else if (sh_array_set(nm, idx, nvb.p) < 0) {
             rc = -1;
@@ -20198,10 +20319,10 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                      * status 1, the command is skipped, and the script
                      * carries on -- which is what g_bad_subst_soft means. */
                     if (!ref_set)
-                        kprintf("shell: %s: invalid indirect expansion\n",
+                        kprintf(SH_PFX_SHELL "%s: invalid indirect expansion\n",
                                 rname.p);
                     else
-                        kprintf("shell: %s: invalid variable name\n", refval.p);
+                        kprintf(SH_PFX_SHELL "%s: invalid variable name\n", refval.p);
                     g_bad_subst_soft = true;
                     return -1;
                 }
@@ -20418,7 +20539,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
          * after the brace separates the two forms; the array-literal and
          * `${|...}` shapes keep the tokenizer's own 2, which aborts. */
         if (*expr == ' ' || *expr == '\t') g_bad_subst_soft = true;
-        kprintf("shell: bad substitution\n");
+        kprintf(SH_PFX_SHELL "bad substitution\n");
         return -1;
     }
 
@@ -20684,7 +20805,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
              * the corpus's ${x:n} cases used to die. */
             return shell_expand_substring(name, op, b);
         } else {
-            kprintf("shell: bad substitution\n");
+            kprintf(SH_PFX_SHELL "bad substitution\n");
             return -1;
         }
     }
@@ -20803,14 +20924,14 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
             return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
         if (!shell_var_start(name[0])) {
-            kprintf("shell: cannot assign to special parameter\n");
+            kprintf(SH_PFX_SHELL "cannot assign to special parameter\n");
             return -1;
         }
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         if (env_set(name, ewb.p) < 0) {
-            kprintf("shell: failed to assign '%s'\n", name);
+            kprintf(SH_PFX_SHELL "failed to assign '%s'\n", name);
             return -1;
         }
         return sb_puts(b, ewb.p);
@@ -20822,7 +20943,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
         /* `?` and `:?` say different things when there is no word: bash
          * reports "parameter not set" for the first, since an empty value
          * does not trigger it. */
-        kprintf("shell: %s: %s\n", shell_param_display(name),
+        kprintf(SH_PFX_SHELL "%s: %s\n", shell_param_display(name),
                 ewb.p[0] ? ewb.p
                          : (colon ? "parameter null or not set"
                                   : "parameter not set"));
@@ -20926,7 +21047,7 @@ static long shell_arith_eval_str(struct shell_arith *a, const char *vstr,
         if (!*q) return 0;
     }
     if (g_arith_depth >= SHELL_ARITH_MAX_DEPTH) {
-        kprintf("shell: %s: expression recursion level exceeded\n", what);
+        kprintf(SH_PFX_SHELL "%s: expression recursion level exceeded\n", what);
         a->ok = false;
         return 0;
     }
@@ -21502,7 +21623,7 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
                 long v = shell_arith_expr(&a);
                 shell_arith_skip(&a);
                 if (!a.ok || *a.p != '\0' || quoted_operand) {
-                    kprintf("shell: bad arithmetic expansion\n");
+                    kprintf(SH_PFX_SHELL "bad arithmetic expansion\n");
                     /* AN EXPANSION ERROR, status 1 and the rest of the line
                      * discarded -- not the tokenizer's syntax-error 2. bash
                      * (evalexp): `echo $((1/0)); echo $?` prints nothing,
@@ -21517,12 +21638,12 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
             if (paren_depth > 0) paren_depth--;
         }
         if (epos + 1 >= expr_cap) {
-            kprintf("shell: arithmetic expression too long\n");
+            kprintf(SH_PFX_SHELL "arithmetic expression too long\n");
             return -1;
         }
         expr[epos++] = *p++;
     }
-    kprintf("shell: unterminated arithmetic expansion\n");
+    kprintf(SH_PFX_SHELL "unterminated arithmetic expansion\n");
     return -1;
 }
 
@@ -21672,7 +21793,7 @@ static bool shell_procsub_make(const char *text, bool input,
         struct shell_procsub *nt =
             (struct shell_procsub *)kmalloc((size_t)ncap * sizeof *nt);
         if (!nt) {
-            kprintf("tsh: process substitution: out of memory\n");
+            kprintf(SH_PFX_TSH "process substitution: out of memory\n");
             return false;
         }
         if (g_procsub_n)
@@ -21723,7 +21844,7 @@ static bool shell_procsub_make(const char *text, bool input,
 
     struct file *r = 0, *w = 0;
     if (pipe_create(&r, &w) < 0) {
-        kprintf("tsh: process substitution: cannot create a pipe\n");
+        kprintf(SH_PFX_TSH "process substitution: cannot create a pipe\n");
         return false;
     }
     /* `<(cmd)` reads what the command WRITES, so the command owns the write
@@ -21734,7 +21855,7 @@ static bool shell_procsub_make(const char *text, bool input,
     int want = shell_procsub_fd_for(keep);
     if (want < 0 || host_file_move_fd(keep, want) < 0) {
         file_close(r); file_close(w);
-        kprintf("tsh: process substitution: no descriptor %d\n", want);
+        kprintf(SH_PFX_TSH "process substitution: no descriptor %d\n", want);
         return false;
     }
 
@@ -21774,7 +21895,7 @@ static bool shell_procsub_make(const char *text, bool input,
     kfree(copy);
     if (pid < 0) {
         file_close(r); file_close(w);
-        kprintf("tsh: process substitution: cannot fork\n");
+        kprintf(SH_PFX_TSH "process substitution: cannot fork\n");
         return false;
     }
     file_close(child_end);
@@ -21793,7 +21914,7 @@ static bool shell_procsub_make(const char *text, bool input,
     (void)text; (void)input; (void)out; (void)cap;
     /* Stated, not faked -- the same answer the console shell gives for `=~`.
      * It has no fork, which is why its pipeline stages run differently too. */
-    kprintf("tsh: process substitution needs fork, which the console "
+    kprintf(SH_PFX_TSH "process substitution needs fork, which the console "
             "shell does not have\n");
     return false;
 }
@@ -21909,7 +22030,7 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
         while (*p && csp > 0) {
             char c = *p;
             if (n + 2 >= expr_cap) {
-                kprintf("shell: ${...} too long\n");
+                kprintf(SH_PFX_SHELL "${...} too long\n");
                 return -1;
             }
             if (sq) {
@@ -21964,7 +22085,7 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
             expr[n++] = *p++;
         }
         if (csp > 0) {
-            kprintf("shell: unterminated ${...}\n");
+            kprintf(SH_PFX_SHELL "unterminated ${...}\n");
             return -1;
         }
         expr[n] = '\0';
@@ -22708,7 +22829,7 @@ static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
         if (*q == ')') { if (--depth == 0) break; }
     }
     if (depth != 0 || *q != ')') {
-        kprintf("tsh: unterminated process substitution\n");
+        kprintf(SH_PFX_TSH "unterminated process substitution\n");
         return -1;
     }
     size_t blen = (size_t)(q - body);
@@ -22892,7 +23013,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 else if (*p == '\\' && p[1]) { p++; }
                 got = true;
                 if (sb_putc(&wb,*p++) < 0) {
-                    kprintf("shell: word too long\n");
+                    kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
             }
@@ -23161,14 +23282,14 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 size_t sq_start = wb.len;
                 while (*p && *p != '\'') {
                     if (sb_putc(&wb,*p++) < 0) {
-                        kprintf("shell: word too long\n");
+                        kprintf(SH_PFX_SHELL "word too long\n");
                         return -1;
                     }
                 }
                 if (shell_escape_glob_range(&wb,sq_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '\'') {
-                    kprintf("shell: unmatched single quote\n");
+                    kprintf(SH_PFX_SHELL "unmatched single quote\n");
                     return -1;
                 }
                 p++;
@@ -23199,14 +23320,14 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         if (nxt != '$' && nxt != '`' && nxt != '"' &&
                             nxt != '\\' && nxt != '\n') {
                             if (sb_putc(&wb,*p++) < 0) {
-                                kprintf("shell: word too long\n");
+                                kprintf(SH_PFX_SHELL "word too long\n");
                                 return -1;
                             }
                             continue;
                         }
                         p++;
                         if (sb_putc(&wb,*p++) < 0) {
-                            kprintf("shell: word too long\n");
+                            kprintf(SH_PFX_SHELL "word too long\n");
                             return -1;
                         }
                     } else if (*p == '$') {
@@ -23216,7 +23337,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         g_tok_word_expanded = true;
                     } else {
                         if (sb_putc(&wb,*p++) < 0) {
-                            kprintf("shell: word too long\n");
+                            kprintf(SH_PFX_SHELL "word too long\n");
                             return -1;
                         }
                     }
@@ -23225,7 +23346,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 if (shell_escape_glob_range(&wb,dq_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
-                    kprintf("shell: unmatched double quote\n");
+                    kprintf(SH_PFX_SHELL "unmatched double quote\n");
                     return -1;
                 }
                 p++;
@@ -23236,7 +23357,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 word_quoted = true;
                 p++;
                 if (!*p) {
-                    kprintf("shell: trailing escape\n");
+                    kprintf(SH_PFX_SHELL "trailing escape\n");
                     return -1;
                 }
                 /* AN ESCAPED METACHARACTER KEEPS ITS MARKER so the globber
@@ -23245,11 +23366,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                  * where the word becomes an argument. */
                 if ((shell_glob_meta(*p) || *p == '=') &&
                     sb_putc(&wb,SHELL_GLOB_ESC) < 0) {
-                    kprintf("shell: word too long\n");
+                    kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
                 if (sb_putc(&wb,*p++) < 0) {
-                    kprintf("shell: word too long\n");
+                    kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
                 continue;
@@ -23275,7 +23396,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 lit_open = true;
             }
             if (sb_putc(&wb,*p++) < 0) {
-                kprintf("shell: word too long\n");
+                kprintf(SH_PFX_SHELL "word too long\n");
                 return -1;
             }
         }
@@ -23629,7 +23750,7 @@ static int shell_simple_argv_room(struct shell_simple *s) {
     char **na = s->arena
         ? (char **)words_alloc(s->arena, (size_t)ncap * sizeof(char *)) : 0;
     if (!na) {
-        kprintf("shell: out of memory for arguments\n");
+        kprintf(SH_PFX_SHELL "out of memory for arguments\n");
         return -1;
     }
     if (s->argc) memcpy(na, s->argv, (size_t)s->argc * sizeof(char *));
@@ -23652,7 +23773,7 @@ static struct shell_redir *shell_simple_redir_new(struct shell_simple *s) {
                                                 (size_t)ncap * sizeof *nr)
             : 0;
         if (!nr) {
-            kprintf("shell: out of memory for redirections\n");
+            kprintf(SH_PFX_SHELL "out of memory for redirections\n");
             return 0;
         }
         if (s->redir_count)
@@ -24727,7 +24848,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
          *
          * failglob wins when both are set, which is bash's order. */
         if (g_shopt_failglob) {
-            kprintf("shell: no match: %s\n", word);
+            kprintf(SH_PFX_SHELL "no match: %s\n", word);
             /* STATUS 1, NOT 2. bash does not run the command and leaves 1;
              * a bare -1 here reaches the tokenizer's failure path and
              * becomes the generic syntax-error 2. g_bad_subst_soft is the
@@ -24752,7 +24873,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                     ? 0
                     : shell_expand_tilde_word(pl, word, &expanded);
         if (trc < 0) {
-            kprintf("shell: expansion too long\n");
+            kprintf(SH_PFX_SHELL "expansion too long\n");
             return -1;
         }
         if (trc > 0) {
@@ -25243,7 +25364,7 @@ static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
                            int fd, const char *path, const char *text,
                            int target_fd) {
     if (fd < 0 || fd >= SHELL_FD_LIMIT) {
-        kprintf("shell: %d: bad file descriptor\n", fd);
+        kprintf(SH_PFX_SHELL "%d: bad file descriptor\n", fd);
         return -1;
     }
     struct shell_redir *r = shell_simple_redir_new(cur);
@@ -25302,7 +25423,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             if (fdvar) expl_fd = fd;        /* `{v}>&word` is one descriptor */
             (*io)++;
             if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
-                kprintf("shell: redirection needs a path\n");
+                kprintf(SH_PFX_SHELL "redirection needs a path\n");
                 return -1;
             }
             /* A redirect operand is a FILENAME, never a field to split, so the
@@ -25344,7 +25465,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                     if (!hd_text) return -1;
                 } else {
                     if (g_heredoc_head >= g_heredoc_count) {
-                        kprintf("shell: here-document body missing\n");
+                        kprintf(SH_PFX_SHELL "here-document body missing\n");
                         return -1;
                     }
                     const struct shell_heredoc *h = shell_heredoc_take();
@@ -25411,7 +25532,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         }
 
         if (t != SH_TOK_WORD) {
-            kprintf("shell: unexpected token\n");
+            kprintf(SH_PFX_SHELL "unexpected token\n");
             return -1;
         }
         if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
@@ -25527,7 +25648,7 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
     size_t slots = (size_t)g_envc + (size_t)assignc + 1;
     char **out_env = (char **)kmalloc(slots * sizeof(char *) + extra);
     if (!out_env) {
-        kprintf("shell: out of memory building the environment\n");
+        kprintf(SH_PFX_SHELL "out of memory building the environment\n");
         return 0;
     }
     char *pool = (char *)(out_env + slots);
@@ -26262,7 +26383,7 @@ static int shell_apply_redirs(struct shell_simple *cmd,
              * console-sink recursion described at shell_file_output. */
             if ((!target && r->target_fd > 2) ||
                 (target && target->kind == FILE_KIND_NULL)) {
-                kprintf("tsh: %d: Bad file descriptor\n", r->target_fd);
+                kprintf(SH_PFX_TSH "%d: Bad file descriptor\n", r->target_fd);
                 shell_set_status(1);
                 return -1;
             }
@@ -26452,7 +26573,7 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
     if (assignc <= 0) return;
     sv->v = (struct shell_prefix_one *)kmalloc((size_t)assignc * sizeof *sv->v);
     if (!sv->v) {
-        kprintf("shell: out of memory saving prefix assignments\n");
+        kprintf(SH_PFX_SHELL "out of memory saving prefix assignments\n");
         return;
     }
     for (int i = 0; i < assignc; i++) {
@@ -26657,7 +26778,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         long fmax = shell_funcnest_max();
         bool over = fmax > 0 && g_fn_depth >= fmax;
         if (over || shell_stack_exhausted(g_script_depth)) {
-            kprintf("tsh: %s: maximum function nesting level exceeded (%ld)\n",
+            kprintf(SH_PFX_TSH "%s: maximum function nesting level exceeded (%ld)\n",
                     cmd->argv[0], over ? fmax : (long)g_fn_depth);
             shell_set_status(1);
             if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -26734,7 +26855,14 @@ static int shell_run_function(struct shell_simple *cmd) {
      * defined. */
     char *run_body = shell_strdup(fn->body);
     char *run_name = shell_strdup(fn->name);
+    /* Diagnostics in the body name the file it was defined in (S12). */
+    char *run_src __attribute__((cleanup(shell_kfree_ptr))) =
+        fn->src ? shell_strdup(fn->src) : 0;
+    const char *saved_src = g_diag_fn_source;
+    bool saved_in = g_diag_in_fn;
     if (run_body && run_name) {
+        g_diag_fn_source = run_src;
+        g_diag_in_fn = true;
         shell_hd_pin_text(run_body, +1);
         shell_callframe_push(run_name, g_shell_lineno);
         /* The body's own lines for $LINENO, and the caller's back after. */
@@ -26747,8 +26875,10 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_shell_lineno = call_line;
         shell_callframe_pop();
         shell_hd_pin_text(run_body, -1);
+        g_diag_fn_source = saved_src;
+        g_diag_in_fn = saved_in;
     } else {
-        kprintf("shell: out of memory calling a function\n");
+        kprintf(SH_PFX_SHELL "out of memory calling a function\n");
         shell_set_status(1);
     }
     kfree(run_body);
@@ -27524,7 +27654,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
         if (last_pid) {
             g_last_bg_pid = last_pid;
             int jid = jobs_add(last_pid, pl->stage[0].argv[0]);
-            if (jid > 0) kprintf("[%d] %d\n", jid, last_pid);
+            if (jid > 0) kprintf_raw("[%d] %d\n", jid, last_pid);
         }
         return 0;
     }
@@ -28566,7 +28696,7 @@ static int shell_dbr_regex(const char *subj, const char *pat) {
 static int shell_dbr_regex(const char *subj, const char *pat) {
     (void)subj; (void)pat;
     /* Stated, not faked: the console shell does not link the engine. */
-    kprintf("tsh: [[: =~ needs a regular-expression engine, "
+    kprintf(SH_PFX_TSH "[[: =~ needs a regular-expression engine, "
             "which the in-kernel shell does not link\n");
     return -1;
 }
@@ -28738,7 +28868,7 @@ static bool shell_try_dbracket_command(const char *src) {
         }
     }
     if (!end) {
-        kprintf("tsh: [[: expected ']]'\n");
+        kprintf(SH_PFX_TSH "[[: expected ']]'\n");
         shell_parse_error();
         return true;
     }
@@ -28752,7 +28882,7 @@ static bool shell_try_dbracket_command(const char *src) {
 
     struct shell_dbr *d = (struct shell_dbr *)kmalloc(sizeof *d);
     if (!d) {
-        kprintf("tsh: [[: out of memory\n");
+        kprintf(SH_PFX_TSH "[[: out of memory\n");
         shell_set_status(2);
         return true;
     }
@@ -28795,7 +28925,7 @@ static bool shell_try_dbracket_command(const char *src) {
          * "unexpected token" to stderr, runs no more of the file, and exits
          * with the status it already had -- not 2, which is what setting a
          * status here would produce. */
-        kprintf("tsh: [[: syntax error in conditional expression\n");
+        kprintf(SH_PFX_TSH "[[: syntax error in conditional expression\n");
         g_parse_error = true;   /* not an `exit` -- see g_parse_error */
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
@@ -30210,7 +30340,7 @@ static bool shell_try_function_definition(const char *src) {
         size_t bn = name_len < sizeof bad - 1 ? name_len : sizeof bad - 1;
         memcpy(bad, name_start, bn);
         bad[bn] = '\0';
-        kprintf("tsh: `%s': not a valid identifier\n", bad);
+        kprintf(SH_PFX_TSH "`%s': not a valid identifier\n", bad);
         shell_set_status(1);
         return true;
     }
@@ -31134,7 +31264,7 @@ static bool shell_run_list_line(const char *src) {
          * long". */
         char *seg = shell_dup_segment(cur, end);
         if (!seg) {
-            kprintf("shell: out of memory\n");
+            kprintf(SH_PFX_SHELL "out of memory\n");
             shell_set_status(2);
             return true;
         }
@@ -31748,7 +31878,7 @@ static int shell_syntax_check(const char *s) {
         }
     }
     if (what) {
-        kprintf("sh: syntax error: %s\n", what);
+        kprintf(SH_PFX_SH "syntax error: %s\n", what);
         return 2;
     }
     return 0;
@@ -31768,7 +31898,7 @@ static void execute_line_text_inner(const char *src) {
         if (ln) g_shell_lineno = ln;
     }
     if (g_shell_flow != SHELL_FLOW_NONE) return;
-    if (g_opt_verbose) kprintf("%s\n", src);
+    if (g_opt_verbose) kprintf_raw("%s\n", src);    /* bash: no prefix */
     /* ^C ABORTS THE WHOLE CONSTRUCT, not just the current command. Checked
      * here because this is the one point every command in every nesting
      * level passes through -- a loop body, a function call, a `&&` chain.
@@ -31935,7 +32065,7 @@ static void execute_line_text_inner(const char *src) {
                 }
                 if (body) kfree(body);
 #else
-                kprintf("shell: a compound cannot be backgrounded in the "
+                kprintf(SH_PFX_SHELL "a compound cannot be backgrounded in the "
                         "kernel shell\n");
                 shell_set_status(1);
                 return;
@@ -32026,7 +32156,7 @@ static void execute_line_text_inner(const char *src) {
         const char *w = shell_skip_blanks(src);
         for (int m = 0; misplaced[m]; m++) {
             if (!shell_starts_with_word(w, misplaced[m])) continue;
-            kprintf("shell: syntax error near unexpected token `%s'\n",
+            kprintf(SH_PFX_SHELL "syntax error near unexpected token `%s'\n",
                     misplaced[m]);
             shell_parse_error();   /* a PARSE error: see g_parse_error */
             return;
@@ -32156,7 +32286,7 @@ static void execute_line_text_inner(const char *src) {
                 for (int k = 0; closer[k]; k++)
                     if (shell_starts_with_word(r, closer[k])) { bad = closer[k]; break; }
                 if (!bad) break;
-                kprintf("shell: syntax error near unexpected token `%s'\n", bad);
+                kprintf(SH_PFX_SHELL "syntax error near unexpected token `%s'\n", bad);
                 shell_parse_error();
                 return;
             }
@@ -32257,7 +32387,7 @@ static void execute_line_text_inner(const char *src) {
             return;
         }
         if (parsed == 0) {
-            kprintf("shell: expected command\n");
+            kprintf(SH_PFX_SHELL "expected command\n");
             shell_set_status(2);
             shell_pipeline_free(plp);
             return;
@@ -32351,7 +32481,7 @@ static bool shell_line_syntax_ok(const char *src) {
     shell_scan_line(&st, src ? src : "");
     if (!st.bad_paren && !st.bad_semi && !st.bad_rparen && !st.bad_kw)
         return true;
-    kprintf("shell: syntax error near unexpected token `%s'\n",
+    kprintf(SH_PFX_SHELL "syntax error near unexpected token `%s'\n",
             st.bad_paren ? "(" : st.bad_semi ? ";;" :
             st.bad_rparen ? ")" : st.bad_kw_word);
     shell_parse_error();
@@ -32522,7 +32652,7 @@ static void execute_line_body(void) {
                     emit = expanded.p;
             }
             if (shell_heredoc_body_append(emit, strlen(emit)) < 0)
-                kprintf("sh: out of memory reading a here-document\n");
+                kprintf(SH_PFX_SH "out of memory reading a here-document\n");
         }
         return;
     }
@@ -32753,7 +32883,7 @@ void shell_init(void) {
     g_getopts_char_index = 1;
     shell_trap_clear_all();
     g_shell_start_secs = shell_wall_secs();
-    if (shell_set_param0("tobysh") < 0) kprintf("shell: failed to set $0\n");
+    if (shell_set_param0("tobysh") < 0) kprintf(SH_PFX_SHELL "failed to set $0\n");
     (void)shell_set_positional_params(0, 0);
     kprintf("type 'help' to list commands.\n");
     prompt();
@@ -32772,7 +32902,7 @@ void shell_run_test_line(const char *in) {
         n++;
     }
     if (in[n]) {
-        kprintf("shell: test line truncated at %u bytes\n",
+        kprintf(SH_PFX_SHELL "test line truncated at %u bytes\n",
                 (unsigned)(LINE_MAX - 1));
     }
     line[n]  = '\0';
@@ -33075,6 +33205,15 @@ const char *shell_history_get_hosted(int i) {
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
+    {
+        /* The name a terminal diagnostic starts with: bash's
+         * base_pathname(shell_name), a login shell's `-` dropped (S12). */
+        const char *b = argv0 ? argv0 : "tsh";
+        for (const char *c = b; *c; c++) if (*c == '/') b = c + 1;
+        if (*b == '-') b++;
+        if (g_diag_progname) kfree(g_diag_progname);
+        g_diag_progname = shell_strdup(*b ? b : "tsh");
+    }
     /* $$ IS THIS SHELL'S PID, latched here, so a forked child -- a pipeline
      * stage, a background job -- still says its parent's, as bash's does,
      * while $BASHPID says its own (S13). /bin/tsh never latched it (only
@@ -33208,16 +33347,16 @@ int shell_run_script_hosted(const char *path) {
      * after $0 has become the script, so that message begins with the
      * script's name -- "FILE: FILE: Is a directory", "FILE: FILE: cannot
      * execute binary file" -- and exits 126. */
-    SH_SB(me);
-    if (sb_puts(&me, g_param0 ? g_param0 : "tsh") < 0) return 2;
     struct vfs_stat st;
     int sr = vfs_stat(path, &st);
     void *head = 0;
     size_t hsz = 0;
     if (sr == VFS_OK && st.type != VFS_TYPE_DIR)
         sr = vfs_read_all(path, &head, &hsz);
+    /* Before $0 is the script, the diagnostic prefix is the shell's own
+     * name -- bash's "SHELL: FILE: REASON" (S12). */
     if (sr != VFS_OK) {
-        kprintf("%s: %s: %s\n", me.p, path, shell_errno_text(sr));
+        kprintf("%s: %s\n", path, shell_errno_text(sr));
         return sr == VFS_ERR_NOENT ? 127 : 126;
     }
     bool binary = head && shell_script_is_binary((const char *)head, hsz);
@@ -33227,10 +33366,11 @@ int shell_run_script_hosted(const char *path) {
      * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
     (void)shell_set_param0(path);
     if (st.type == VFS_TYPE_DIR || binary) {
-        kprintf("%s: %s: %s\n", path, path,
+        kprintf("%s: %s\n", path,
                 binary ? "cannot execute binary file" : "Is a directory");
         return 126;
     }
+    g_diag_source = path;                     /* see shell_diag_prefix */
     g_reader_main_script = true;              /* see hist_reader */
     int rc = shell_run_script_path(path, true);
     g_reader_main_script = false;
