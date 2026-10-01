@@ -30,7 +30,9 @@ wait 99999 2>/dev/null; echo "not a child: $?"
 wait %9 2>/dev/null; echo "no such job: $?"
 wait bad 2>/dev/null; echo "not a pid: $?"
 wait -- 99999 2>/dev/null; echo "after --: $?"
-false & sleep 0.2; jobs; wait -n; echo "after jobs listed it: $?"
+# bash's mark on a FINISHED job is "+" or, under load, " " (NEW-FINDINGS 19),
+# so it is blanked; `jobs` writes to a file, not a pipe, to run in THIS shell.
+false & sleep 0.2; jobs > /tmp/fx167.j; sed 's/^\(\[[0-9]*\]\)[-+ ]/\1 /' /tmp/fx167.j; rm -f /tmp/fx167.j; wait -n; echo "after jobs listed it: $?"
 # A job a SIGNAL killed is dropped as soon as bash notices; its status stays.
 sleep 5 & k=$!; kill $k; sleep 0.2; wait -n; echo "wait -n after a killed job: $?"
 sleep 5 & k=$!; kill $k; sleep 0.2; wait $k; echo "wait PID of a killed job: $?"
