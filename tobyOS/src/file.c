@@ -786,6 +786,10 @@ long file_write(struct file *f, const void *buf, size_t n) {
     case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
         file_pos_load(f);
+        /* O_APPEND for a driver that does not track the live size itself:
+         * the furthest this description knows of. ramfs/tmpfs/tobyfs then
+         * move it to the true end (see vfs_file.append). */
+        if (f->vfs.append && f->vfs.pos < f->vfs.size) f->vfs.pos = f->vfs.size;
         long w = f->vfs.ops->write(&f->vfs, buf, n);
         file_pos_store(f);
         /* fd-addressed IN_MODIFY, possible since handles carry their

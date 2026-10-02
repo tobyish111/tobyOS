@@ -357,6 +357,7 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
             m = &g_tmpfs[i];
     if (!m) return VFS_ERR_IO;
 
+    if (f->append) f->pos = nd->size;              /* O_APPEND: the live end */
     size_t end = f->pos + n;
     int rc = tgrow(m, nd, end);
     if (rc != VFS_OK) return rc;

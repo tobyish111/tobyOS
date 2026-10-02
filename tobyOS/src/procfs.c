@@ -670,10 +670,11 @@ static int gen_pid_fdinfo(int pid, int fd, char *buf, size_t cap) {
     struct file *f = tab[fd];
 
     uint64_t pos = (f->kind == FILE_KIND_VFS) ? (uint64_t)file_pos_get(f) : 0;
-    /* Linux prints the open flags in OCTAL with a leading 0. We keep only the
-     * access mode on the descriptor, so that is what goes out -- the value is
+    /* Linux prints the open flags in OCTAL with a leading 0. We keep the
+     * access mode and O_APPEND on the descriptor, so that is what goes out -- the value is
      * right as far as it goes, and no bit is invented to pad it. */
     unsigned flags = (unsigned)f->o_accmode;
+    if (f->kind == FILE_KIND_VFS && f->vfs.append) flags |= 02000;   /* O_APPEND */
 
     int off = 0;
     char tmp[24];

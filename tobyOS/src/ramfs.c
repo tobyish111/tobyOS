@@ -756,6 +756,7 @@ static long ramfs_write(struct vfs_file *f, const void *buf, size_t n) {
     if (!nd) return VFS_ERR_INVAL;
     if (nd->type != VFS_TYPE_FILE) return VFS_ERR_ISDIR;
     if (n == 0) return 0;
+    if (f->append) f->pos = nd->size;                 /* O_APPEND: the live end */
     size_t need = f->pos + n;
     if (need < f->pos) return VFS_ERR_INVAL;          /* offset overflow */
     int rc = ramfs_cow(nd, need);

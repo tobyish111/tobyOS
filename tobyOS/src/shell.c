@@ -1307,6 +1307,9 @@ static bool shell_declare_print(const char *name);
 static void shell_print_vars_set_format(void);
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
+#ifdef SHELL_HOSTED
+int vfs_open_append(const char *path, struct vfs_file *out);   /* host.c */
+#endif
 static void shell_putc_raw(char c);
 static int shell_case_unquote(struct shell_sb *pb);
 static char *shell_unquoted_newline(char *s);
@@ -26531,14 +26534,25 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         f->vfs_refs = &ofd->refs;   /* refs is first; see struct vfs_ofd */
     }
 
+#ifdef SHELL_HOSTED
+    /* /bin/tsh: `>>` opens a real O_APPEND descriptor (see host.c's
+     * vfs_open_append) -- the shell and its children write through it,
+     * and an offset kept here cannot follow the children's writes. */
+    int rc = (write && append) ? vfs_open_append(path, &f->vfs)
+                               : vfs_open(path, &f->vfs);
+#else
     int rc = vfs_open(path, &f->vfs);
+#endif
     if (rc != VFS_OK) {
         kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(rc));
         kfree(f->vfs_refs);
         kfree(f);
         return 0;
     }
-    if (write && append) file_pos_set(f, f->vfs.size);
+    if (write && append) {
+        f->vfs.append = true;           /* every write at the end, as O_APPEND */
+        file_pos_set(f, f->vfs.size);
+    }
     return f;
 }
 

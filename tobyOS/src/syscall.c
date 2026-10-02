@@ -3057,8 +3057,14 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
      * which is what shells and log writers do. It is NOT the full atomic
      * seek-to-end-per-write that two processes appending to one file need;
      * that wants a flag in struct file, and changing that struct's layout
-     * requires a full rebuild of every object that includes it. */
-    if (want_append) file_pos_set(f, f->vfs.size);
+     * requires a full rebuild of every object that includes it.
+     *
+     * 2026-10-01: it is the full thing now -- vfs_file.append makes every
+     * write go to the end, and it fit in existing padding. */
+    if (want_append) {
+        f->vfs.append = true;
+        file_pos_set(f, f->vfs.size);
+    }
 
     file_set_open_path(f, kpath);
 
@@ -14087,6 +14093,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * work (or re-derives flags later) sees a blocking socket. */
             if (ff->kind == FILE_KIND_SOCKET && ff->sock && ff->sock->nonblock)
                 return ff->o_accmode | SOCK_NONBLOCK;
+            if (ff->kind == FILE_KIND_VFS && ff->vfs.append)
+                return ff->o_accmode | ABI_O_APPEND;   /* tracked since 2026-10-01 */
             return ff->o_accmode;
         }
         if ((int)a2 == 4 /* F_SETFL */) {

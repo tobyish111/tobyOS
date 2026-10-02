@@ -300,15 +300,21 @@ long file_write(struct file *f, const void *buf, size_t n) {
     return (long)done;
 }
 
-/* The kernel keeps the offset in a shared open file description so that
- * fork/dup2 siblings advance one cursor; here every handle is its own, so the
- * embedded cursor IS the description and these are plain accessors. They exist
- * because src/shell.c calls them (for `>>`), and it is the same source file in
- * both builds. */
-/* The descriptor owns the offset here, exactly as it does in a real process:
- * handles produced by file_clone() share one fd, so they share one position
- * and appending from either of them lands after the other. */
-size_t file_pos_get(struct file *f) { return f ? f->vfs.pos : 0; }
+/* They exist because src/shell.c calls them (for `>>`), and it is the same
+ * source file in both builds. The descriptor owns the offset here, exactly
+ * as it does in a real process: handles produced by file_clone() share one
+ * fd, so they share one position -- and so do the children it is handed to.
+ * ->vfs.pos is only what this copy has counted, so it is never the answer
+ * for a descriptor that can say where it is. */
+size_t file_pos_get(struct file *f) {
+    if (!f) return 0;
+    int fd = VF_FD(&f->vfs);
+    if (hf_seekable(f, fd)) {           /* ->vfs.pos is this COPY's count */
+        off_t at = lseek(fd, 0, SEEK_CUR);
+        if (at >= 0) return (size_t)at;
+    }
+    return f->vfs.pos;
+}
 
 void file_pos_set(struct file *f, size_t pos) {
     if (!f) return;
@@ -417,6 +423,28 @@ int vfs_open(const char *path, struct vfs_file *out) {
      * read-only initrd), which are the read-side cases. */
     int fd = open(path, O_RDWR);
     if (fd < 0) fd = open(path, O_RDONLY);
+    if (fd < 0) return errno_to_vfs();
+    memset(out, 0, sizeof *out);
+    VF_SET(out, fd);
+    struct stat st;
+    out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
+    out->mode = 0644;
+    return VFS_OK;
+}
+
+/* `>>` IS A REAL O_APPEND DESCRIPTOR, as bash's is: every write through it
+ * -- the shell's own, every child's, and anyone else's who opened the file
+ * separately -- goes to the end of the file. A plain descriptor seeked to
+ * the size at open only appends while nobody else writes:
+ *
+ *     { echo one; echo two >> f; echo three; } >> f
+ *         bash: one two three
+ *
+ * The kernel honours it on every write since vfs_file.append. Write-only,
+ * as bash opens it: reading a `>>` descriptor is an error there. */
+int vfs_open_append(const char *path, struct vfs_file *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    int fd = open(path, O_WRONLY | O_APPEND);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
     VF_SET(out, fd);
@@ -606,14 +634,18 @@ int proc_spawn(const struct proc_spec *spec) {
     int fd1 = spec->fd1 ? VF_FD(&spec->fd1->vfs) : 1;
     int fd2 = spec->fd2 ? VF_FD(&spec->fd2->vfs) : 2;
 
-    /* A redirect target opened by shell_open_vfs_file() carries the shell's
-     * own offset in ->vfs.pos (that is how `>>` works). The child inherits the
-     * DESCRIPTOR, whose offset is independent, so hand it over positioned
-     * where the shell thinks it is -- otherwise `echo a >> f` from a child
-     * lands at byte 0 and overwrites what the parent appended. */
-    if (spec->fd1 && fd1 > 2) (void)lseek(fd1, (off_t)spec->fd1->vfs.pos, SEEK_SET);
-    if (spec->fd2 && fd2 > 2) (void)lseek(fd2, (off_t)spec->fd2->vfs.pos, SEEK_SET);
-    if (spec->fd0 && fd0 > 2) (void)lseek(fd0, (off_t)spec->fd0->vfs.pos, SEEK_SET);
+    /* The child gets the DESCRIPTOR exactly where it is. This used to seek
+     * it to ->vfs.pos first, the offset the shell had counted for itself --
+     * but that is a per-copy count (file_clone copies it) that never sees a
+     * child's writes, so the second child of a group was put back over the
+     * first child's output:
+     *
+     *     { echo one; cat f; echo two; cat f; echo three; } >> out
+     *         bash: one xx two xx three      tsh: one xx txx three
+     *
+     * The descriptor's own offset is shared by the shell and every child
+     * (one open file description), and `>>` is O_APPEND (vfs_open_append),
+     * so there is nothing to correct. */
 
     /* proc_spec carries argv WITHOUT a NULL terminator (argc says how many);
      * toby_spawn wants the NULL-terminated POSIX shape. */
@@ -703,10 +735,7 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     int fd0 = spec->fd0 ? VF_FD(&spec->fd0->vfs) : 0;
     int fd1 = spec->fd1 ? VF_FD(&spec->fd1->vfs) : 1;
     int fd2 = spec->fd2 ? VF_FD(&spec->fd2->vfs) : 2;
-    /* Same offset rule as proc_spawn: `>>` lives in ->vfs.pos. */
-    if (spec->fd1 && fd1 > 2) (void)lseek(fd1, (off_t)spec->fd1->vfs.pos, SEEK_SET);
-    if (spec->fd2 && fd2 > 2) (void)lseek(fd2, (off_t)spec->fd2->vfs.pos, SEEK_SET);
-    if (spec->fd0 && fd0 > 2) (void)lseek(fd0, (off_t)spec->fd0->vfs.pos, SEEK_SET);
+    /* Descriptors go over where they are -- see proc_spawn. */
     /* Extras first, then 0/1/2: an extra that targets 0/1/2 would otherwise
      * be clobbered, and dup2 onto itself is a no-op so the common case is
      * untouched. */

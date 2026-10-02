@@ -1099,6 +1099,7 @@ static long tobyfs_write(struct vfs_file *f, const void *buf, size_t n) {
      * Without this a second handle re-allocates blocks the first already
      * owns and writes its stale size back over the first's growth. */
     (void)handle_reload(fs, h);
+    if (f->append) f->pos = h->node.size;        /* O_APPEND: the live end */
 
     /* Writing past EOF leaves a gap, and the gap must read as zeroes rather
      * than as whatever those blocks hold. Same class as the grow-truncate

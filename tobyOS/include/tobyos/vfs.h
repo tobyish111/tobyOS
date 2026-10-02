@@ -307,6 +307,15 @@ struct vfs_file {
      * read mode would otherwise be able to write through it if it
      * also held CAP_FILE_WRITE). */
     bool                  sysprot;
+    /* O_APPEND (2026-10-01): EVERY write goes to the current end of the
+     * file, not just the first. This used to be honoured only at open (the
+     * offset set to the size then), so two descriptions appending to one
+     * file overwrote each other -- `{ echo one; echo two >> f; echo three;
+     * } >> f` left "one three" where bash leaves all three lines. Drivers
+     * that know the live size (ramfs, tmpfs, tobyfs) move the offset there;
+     * file_write() does it for the rest from what the description knows.
+     * Sits in sysprot's padding: sizeof(struct vfs_file) does not move. */
+    bool                  append;
 };
 
 struct vfs_dir {
