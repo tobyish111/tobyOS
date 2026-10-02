@@ -20351,9 +20351,13 @@ static int shell_pattern_lead_byte(const char *pat, const char *pend);
  * guest's bash consults, which is what makes the two shells agree. bash
  * does NOT stat the directory: a passwd entry expands whether or not the
  * path exists, and a name with no entry stays exactly as written.
- * Returns 0 with the home in `out`, -1 for an unknown name. */
-static int shell_passwd_home(const char *name, size_t nlen,
-                             char *out, size_t cap) {
+ * Returns 0 with the home in `out`, -1 for an unknown name.
+ *
+ * `key_field` says which field `name` is matched against: 0, the login
+ * name, for `~user`; 2, the uid in decimal, for a bare `~` when HOME is
+ * unset (bash's sh_get_home_dir: the CURRENT user's entry). */
+static int shell_passwd_lookup(int key_field, const char *name, size_t nlen,
+                               char *out, size_t cap) {
     void *buf = 0;
     size_t sz = 0;
     if (nlen == 0 || vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK)
@@ -20366,18 +20370,19 @@ static int shell_passwd_home(const char *name, size_t nlen,
         const char *eol = p;
         if (p < end) p++;
         /* name:pass:uid:gid:gecos:HOME:shell -- home is field 5 */
-        if ((size_t)(eol - line) <= nlen || line[nlen] != ':' ||
-            memcmp(line, name, nlen) != 0)
-            continue;
         int field = 0;
+        bool match = false;
         const char *f = line, *home = 0, *home_end = 0;
         for (const char *q = line; q <= eol; q++) {
             if (q == eol || *q == ':') {
+                if (field == key_field)
+                    match = (size_t)(q - f) == nlen && memcmp(f, name, nlen) == 0;
                 if (field == 5) { home = f; home_end = q; }
                 field++;
                 f = q + 1;
             }
         }
+        if (!match) continue;
         if (home && home_end > home &&
             (size_t)(home_end - home) + 1 <= cap) {
             memcpy(out, home, (size_t)(home_end - home));
@@ -20390,6 +20395,49 @@ static int shell_passwd_home(const char *name, size_t nlen,
     return rc;
 }
 
+static int shell_passwd_home(const char *name, size_t nlen,
+                             char *out, size_t cap) {
+    return shell_passwd_lookup(0, name, nlen, out, cap);
+}
+
+/* WHAT A TILDE-PREFIX STANDS FOR -- the text between `~` and the first `/`
+ * (or `:` where that ends it too) -- by bash's rules (lib/tilde/tilde.c and
+ * general.c's bash_special_tilde_expansions), measured on the box
+ * (tools/agent/probes/tilde-rules.sh):
+ *
+ *   ~        $HOME AS IT IS. HOME='' makes it empty -- tsh used "/" -- and
+ *            only an UNSET HOME falls back to the current user's passwd
+ *            entry (root: /root; tsh used "/" there too);
+ *   ~+ ~-    $PWD and $OLDPWD, when set -- tsh left both as written;
+ *   ~name    name's passwd home.
+ *
+ * The home is appended exactly: bash glues `~/x` with HOME=/home/bob/ into
+ * `/home/bob//x`, and tsh dropped a slash. Returns 1 having appended the
+ * expansion to `out`, 0 when the prefix does not expand (the word stays as
+ * written), -1 on allocation failure. */
+static int shell_tilde_prefix_home(const char *pre, size_t plen,
+                                   struct shell_sb *out) {
+    const char *v = 0;
+    char hb[VFS_PATH_MAX];
+    if (plen == 0) {
+        v = env_get("HOME");
+        if (!v) {
+            char ub[16];
+            struct proc *me = current_proc();
+            ksnprintf(ub, sizeof ub, "%u", me ? (unsigned)me->uid : 0u);
+            v = shell_passwd_lookup(2, ub, strlen(ub), hb, sizeof hb) == 0
+                    ? hb : "/";
+        }
+    } else if (plen == 1 && (pre[0] == '+' || pre[0] == '-')) {
+        v = env_get(pre[0] == '+' ? "PWD" : "OLDPWD");
+        if (!v) return 0;
+    } else {
+        if (shell_passwd_home(pre, plen, hb, sizeof hb) != 0) return 0;
+        v = hb;
+    }
+    return sb_puts(out, v) < 0 ? -1 : 1;
+}
+
 /* TILDE EXPANSION INSIDE A `${x-word}` DEFAULT.
  *
  *     HOME=/home/bar ; x=~:${undef-~:~} ; echo $x
@@ -20400,8 +20448,6 @@ static int shell_passwd_home(const char *name, size_t nlen,
  * expansion is expanded as if it were one. `~user` resolves through
  * /etc/passwd now that the repo ships one; an unknown name stays literal. */
 static int shell_word_tilde(struct shell_sb *wb) {
-    const char *hm = env_get("HOME");
-    if (!hm || !*hm) hm = "/";
     const char *w = wb->p;
     SH_SB(out);
     bool seg_start = true;
@@ -20409,13 +20455,9 @@ static int shell_word_tilde(struct shell_sb *wb) {
         if (seg_start && w[i] == '~') {
             size_t j = i + 1;
             while (w[j] && w[j] != '/' && w[j] != ':') j++;
-            const char *rep = 0;
-            char hb[VFS_PATH_MAX];
-            if (j == i + 1) rep = hm;
-            else if (shell_passwd_home(w + i + 1, j - (i + 1),
-                                       hb, sizeof hb) == 0) rep = hb;
-            if (rep) {
-                if (sb_puts(&out, rep) < 0) return -1;
+            int r = shell_tilde_prefix_home(w + i + 1, j - (i + 1), &out);
+            if (r < 0) return -1;
+            if (r > 0) {
                 i = j - 1;
                 seg_start = false;
                 continue;
@@ -24747,31 +24789,16 @@ static int shell_expand_tilde_word(struct shell_pipeline *pl,
     const char *slash = word + 1;
     while (*slash && *slash != '/') slash++;
 
-    const char *home = 0;
-    if (slash == word + 1) {
-        home = env_get("HOME");
-        if (!home || !*home) home = "/";
-    } else {
-        size_t ulen = (size_t)(slash - (word + 1));
-        /* ~name resolves through /etc/passwd -- the file the guest's bash
-         * reads -- and is NOT stat'ed: a passwd entry expands whether or
-         * not the directory exists. `echo ~nonexistent` stays exactly as
-         * written in every shell; the old /home/<name> guess both invented
-         * homes and missed real ones (root's is /root). */
-        static char ubuf[VFS_PATH_MAX];
-        if (shell_passwd_home(word + 1, ulen, ubuf, sizeof ubuf) != 0)
-            return 0;
-        home = ubuf;
-    }
-
-    /* The word after the tilde is any length -- it was capped at a path's,
-     * and a longer one was "expansion too long". */
+    /* ~name resolves through /etc/passwd -- the file the guest's bash
+     * reads -- and is NOT stat'ed: a passwd entry expands whether or not
+     * the directory exists. `echo ~nonexistent` stays exactly as written
+     * in every shell; the old /home/<name> guess both invented homes and
+     * missed real ones (root's is /root). The rest of the rules are
+     * shell_tilde_prefix_home's. The word after the tilde is any length. */
     SH_SB(tmp);
-    size_t hlen = strlen(home);
-    bool drop_slash = (hlen > 1 && home[hlen - 1] == '/' && *slash == '/');
-    const char *tail = slash;
-    if (drop_slash) tail++;
-    if (sb_putmem(&tmp, home, hlen) < 0 || sb_puts(&tmp, tail) < 0) return -1;
+    int r = shell_tilde_prefix_home(word + 1, (size_t)(slash - (word + 1)), &tmp);
+    if (r <= 0) return r;
+    if (sb_puts(&tmp, slash) < 0) return -1;
     return shell_pipeline_save_word(pl, tmp.p, out) < 0 ? -1 : 1;
 }
 
