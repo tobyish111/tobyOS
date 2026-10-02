@@ -10798,8 +10798,14 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         }
     }
 
-    kprintf(SH_PFX_SH "here-document delimited by EOF (wanted '%s')\n", delim);
-    return -1;
+    /* THE END OF THE INPUT ENDS THE DOCUMENT. bash warns ("here-document at
+     * line N delimited by end-of-file (wanted `EOF')" -- the grammar check
+     * says it, while reading the command) and runs the command with what
+     * it got. tsh called it an error and ran nothing, status 2. */
+    *pp = p;
+    int id = shell_hd_store(body.p ? body.p : "", body.len, !quoted);
+    if (id < 0) kprintf(SH_PFX_SH "out of memory storing a here-document\n");
+    return id;
 }
 
 /* ---- multi-line compound commands ---------------------------------------
@@ -13398,6 +13404,12 @@ static void cmd_eval(int argc, char **argv) {
     bool eval_multiline = false;
     for (const char *q = cmd; *q; q++)
         if (*q == '\n') { eval_multiline = true; break; }
+    /* ...and so does a here-document operator on the string's one line:
+     * the reader is what collects bodies, and with no lines after it the
+     * body is empty -- `eval 'cat <<EOF'` is bash's warning and an empty
+     * cat, where the line path found "here-document body missing", 2. */
+    for (const char *q = cmd; !eval_multiline && q[0] && q[1]; q++)
+        if (q[0] == '<' && q[1] == '<') eval_multiline = true;
     if (eval_multiline) {
         char *copy = shell_strdup(cmd);
         if (!copy) {
