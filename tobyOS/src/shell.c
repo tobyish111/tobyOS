@@ -18549,6 +18549,39 @@ static struct callframe *g_callframes;
 static int g_callframe_cap;
 static int g_callframe_n;
 
+/* FUNCNAME, BASH_LINENO, BASH_SOURCE: the call stack as bash shows it.
+ *
+ *     f() { argv.py "${FUNCNAME[@]}" "${BASH_LINENO[@]}"; }; f
+ *         bash: ['f', 'main', '9', '0']
+ *
+ * FUNCNAME[0] is the running function and the bottom is `main` (unset at
+ * the top level); BASH_LINENO[i] is the line FUNCNAME[i] was called from,
+ * over a bottom 0; BASH_SOURCE is the file of each frame -- the script.
+ * tsh kept the stack (for `caller`) but none of the three existed, so they
+ * read empty (Oils 1789 1791-1798). Rebuilt on each call and return. */
+static const char *g_main_source;       /* the script being run, or 0 */
+
+static void shell_callstack_sync(void) {
+    int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
+    if (depth < 0) depth = 0;
+    sh_array_unset_literal("FUNCNAME");
+    sh_array_unset_literal("BASH_LINENO");
+    sh_array_unset_literal("BASH_SOURCE");
+    char nb[24];
+    for (int i = 0; i < depth; i++) {
+        const struct callframe *f = &g_callframes[depth - 1 - i];
+        (void)sh_array_set("FUNCNAME", i, f->name ? f->name : "");
+        ksnprintf(nb, sizeof nb, "%lu", f->line);
+        (void)sh_array_set("BASH_LINENO", i, nb);
+        (void)sh_array_set("BASH_SOURCE", i, g_main_source ? g_main_source : "");
+    }
+    if (depth > 0) (void)sh_array_set("FUNCNAME", depth, "main");
+    if (depth > 0 || g_main_source) {
+        (void)sh_array_set("BASH_LINENO", depth, "0");
+        if (g_main_source) (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
+    }
+}
+
 static void shell_callframe_push(const char *name, unsigned long line) {
     if (g_callframe_n >= g_callframe_cap) {
         int ncap = g_callframe_cap ? g_callframe_cap * 2 : 16;
@@ -18564,9 +18597,11 @@ static void shell_callframe_push(const char *name, unsigned long line) {
     g_callframes[g_callframe_n].line = line;
     g_callframes[g_callframe_n].name = name;
     g_callframe_n++;
+    shell_callstack_sync();
 }
 static void shell_callframe_pop(void) {
     if (g_callframe_n > 0) g_callframe_n--;
+    shell_callstack_sync();
 }
 
 static void cmd_caller(int argc, char **argv) {
@@ -35015,6 +35050,8 @@ int shell_run_script_hosted(const char *path) {
      * shell's own argv[0] until 2026-09-01, so a script run through the
      * ENOEXEC fallback (execvp, or the shell's own) saw $0=/bin/tsh. */
     (void)shell_set_param0(path);
+    g_main_source = path;
+    shell_callstack_sync();
     if (st.type == VFS_TYPE_DIR || binary) {
         kprintf("%s: %s\n", path,
                 binary ? "cannot execute binary file" : "Is a directory");
