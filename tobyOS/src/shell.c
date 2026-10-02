@@ -2897,6 +2897,29 @@ static int sh_array_absorb_scalar(const char *name) {
  *     a[2]=v       element
  *     a[2]+=v      append to that element's text
  */
+/* A VALUE THAT BEGINS WITH `(` IS A STRING unless the `(` was written there.
+ *
+ *     x='(a b)'; declare -p x        bash: declare -- x="(a b)"
+ *     read r <<< "(c d)"             r="(c d)"     (and for, printf -v,
+ *     y=$x                           y="(a b)"      getopts, `$_`, ...)
+ *
+ * tsh decided "array literal" from the finished text, after quotes and
+ * expansion were gone, so every one of those made an ARRAY with (a b)
+ * split into elements -- `echo "(( x"; echo $_` printed `(` (Oils 2674).
+ * bash knows it from the parser (W_COMPASSIGN): only `NAME=(` as written.
+ * The builtins' own setters (env_set) are never literals; an assignment
+ * word is one unless its command lists it in scalar_paren (the scanner
+ * saw no `(` there; tools/agent/probes/paren-values.sh). One exception,
+ * bash's declare.def: with -a/-A, or when NAME is already an array,
+ * `declare` takes a whole `(...)` value as a list even from an expansion:
+ *     declare -a c="$x"              c=([0]="1" [1]="2")
+ */
+static bool g_env_value_scalar;             /* set by env_set */
+static bool g_decl_paren_array;             /* declare -a/-A, or an array */
+struct shell_simple;
+static const struct shell_simple *g_assign_cmd;   /* the command running */
+static bool shell_kv_scalar_paren(const char *kv, const char *val);
+
 static int sh_try_array_assignment(const char *kv) {
     size_t klen = env_key_len(kv);
     if (klen == 0) return 0;
@@ -2955,7 +2978,7 @@ static int sh_try_array_assignment(const char *kv) {
         return sh_array_set(name, idx, val) == 0 ? 1 : 0;
     }
 
-    if (val[0] == '(') {
+    if (val[0] == '(' && !shell_kv_scalar_paren(kv, val)) {
         char nm[128];
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
@@ -3291,7 +3314,10 @@ static int env_set(const char *key, const char *val) {
     memcpy(tmp, key, klen);
     tmp[klen] = '=';
     memcpy(tmp + klen + 1, val, vlen + 1);
+    bool was_scalar = g_env_value_scalar;
+    g_env_value_scalar = true;          /* a value, never a literal */
     int rc = env_set_kv(tmp);
+    g_env_value_scalar = was_scalar;
     if (tmp != small) kfree(tmp);
     return rc;
 }
@@ -6149,7 +6175,9 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
     if (!has_value) return true;
     const char *val = word + nlen + (append ? 2 : 1);
     size_t vl = strlen(val);
-    if (vl >= 2 && val[0] == '(' && val[vl - 1] == ')') {
+    /* a `(...)` that came from a quote or an expansion is just a value */
+    if (vl >= 2 && val[0] == '(' && val[vl - 1] == ')' &&
+        !shell_kv_scalar_paren(word, val)) {
         kprintf("%.*s: cannot assign list to array member\n", (int)nlen, word);
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -6324,7 +6352,9 @@ static void cmd_local(int argc, char **argv) {
             shell_decl_attrs(name, l_attr_on, 0, l_array);
         }
         if (has_value) {
+            g_decl_paren_array = l_array || sh_array_find(name) != 0;
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
+            g_decl_paren_array = false;
         } else if (!already && !l_attr_on && !inherit) {
             /* `local x` DECLARES x, without a value: `declare -p x` is
              * `declare -- x` and every read sees it unset (SHVAR_NOVALUE).
@@ -7039,7 +7069,10 @@ static void cmd_declare(int argc, char **argv) {
 
         if (has_value) {
             g_readonly_hit = false;
-            if (env_set_kv(argv[i]) < 0) {
+            g_decl_paren_array = set_array || sh_array_find(name) != 0;
+            int dsrc = env_set_kv(argv[i]);
+            g_decl_paren_array = false;
+            if (dsrc < 0) {
                 shell_set_status(1);
                 /* A COMPOUND value `NAME=(...)` refused for a readonly NAME
                  * ends the rest of the line at top level, like an
@@ -19183,6 +19216,13 @@ struct shell_simple {
      * from the front -- so 32 bits is all there is; see
      * shell_simple_noassign. */
     unsigned char arg_noassign[4];
+    /* Assignment words whose VALUE begins with a `(` that was not written
+     * there: `x='(a b)'`, `y=$x`, `declare d="$v"` (shell_kv_scalar_paren).
+     * By pointer: an exec view of the command (argv shifted past its
+     * prefix) shares the very same words. */
+    const char **scalar_paren;
+    int nscalar_paren;
+    int scalar_paren_cap;
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -25513,6 +25553,70 @@ static bool shell_simple_noassign(const struct shell_simple *s, int i) {
     return i >= 0 && i < 32 && (s->arg_noassign[i >> 3] & (1u << (i & 7)));
 }
 
+static bool shell_kv_scalar_paren(const char *kv, const char *val) {
+    if (g_env_value_scalar) return true;
+    const struct shell_simple *c = g_assign_cmd;
+    if (!c) return false;
+    for (int i = 0; i < c->nscalar_paren; i++)
+        if (c->scalar_paren[i] == kv) {
+            if (g_decl_paren_array) {
+                size_t vl = strlen(val);
+                if (vl >= 2 && val[vl - 1] == ')') return false;
+            }
+            return true;
+        }
+    return false;
+}
+
+/* `NAME=`, `NAME+=`, `NAME[...]=` at the front of `w`: the length up to and
+ * including the `=`, or 0. */
+static size_t shell_assign_prefix_len(const char *w) {
+    const char *p = w;
+    if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
+        return 0;
+    while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+           (*p >= '0' && *p <= '9') || *p == '_')
+        p++;
+    if (*p == '[') {
+        int d = 0;
+        for (; *p; p++) {
+            if (*p == '[') d++;
+            else if (*p == ']' && --d == 0) break;
+        }
+        if (*p != ']') return 0;
+        p++;
+    }
+    if (*p == '+') p++;
+    return *p == '=' ? (size_t)(p - w) + 1 : 0;
+}
+
+/* After a word token went into `cur` as argv[before..]: when it was written
+ * as an assignment with no `(` after the `=`, note each resulting word whose
+ * value nevertheless begins with one (see shell_kv_scalar_paren). */
+static int shell_note_scalar_paren(struct shell_simple *cur, const char *raw,
+                                   int before) {
+    if (!raw) return 0;
+    size_t rl = shell_assign_prefix_len(raw);
+    if (rl == 0 || raw[rl] == '(') return 0;
+    for (int k = before; k < cur->argc; k++) {
+        const char *w = cur->argv[k];
+        size_t wl = w ? shell_assign_prefix_len(w) : 0;
+        if (wl == 0 || w[wl] != '(') continue;
+        if (cur->nscalar_paren >= cur->scalar_paren_cap) {
+            int ncap = cur->scalar_paren_cap ? cur->scalar_paren_cap * 2 : 4;
+            const char **na = cur->arena
+                ? (const char **)words_alloc(cur->arena, (size_t)ncap * sizeof *na) : 0;
+            if (!na) return -1;
+            if (cur->nscalar_paren)
+                memcpy(na, cur->scalar_paren, (size_t)cur->nscalar_paren * sizeof *na);
+            cur->scalar_paren = na;
+            cur->scalar_paren_cap = ncap;
+        }
+        cur->scalar_paren[cur->nscalar_paren++] = w;
+    }
+    return 0;
+}
+
 /* A new, zeroed redirection slot at the end of the command's list. */
 static struct shell_redir *shell_simple_redir_new(struct shell_simple *s) {
     if (s->redir_count >= s->redir_cap) {
@@ -27330,10 +27434,12 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             kprintf(SH_PFX_SHELL "unexpected token\n");
             return -1;
         }
+        int before = cur->argc;
         if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
                              tok[*io].expanded, tok[*io].assign_src) < 0) {
             return -1;
         }
+        if (shell_note_scalar_paren(cur, tok[*io].raw, before) < 0) return -1;
         (*io)++;
     }
 
@@ -28897,7 +29003,10 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
+    const struct shell_simple *saved_assign_cmd = g_assign_cmd;
+    g_assign_cmd = cmd;
     int rc = shell_run_single_in(cmd, background);
+    g_assign_cmd = saved_assign_cmd;
     if (!background) shell_bind_lastarg(cmd, assignc);
     return rc;
 }
