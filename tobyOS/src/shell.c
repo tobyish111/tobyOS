@@ -23090,7 +23090,36 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
                 }
                 size_t slen = rb ? (size_t)(rb - rest - 1) : 0;
-                if (rb && !(slen == 1 &&
+                /* `${!a[@]OP}` -- an OPERATOR after the `[@]` -- is not the
+                 * keys: it is an indirection through a's values joined by
+                 * blanks (bash; Oils 2563 2587-2589). One element names one
+                 * variable; `x y z` is "invalid variable name"; an unset a
+                 * is "a[@]: invalid indirect expansion". */
+                if (rb && slen == 1 && (rest[1] == '@' || rest[1] == '*') &&
+                    rb[1] != '\0') {
+                    struct sh_array *ja = sh_array_find(rname.p);
+                    if (ja) {
+                        for (int k = 0; k < ja->n; k++) {
+                            if (k && sb_putc(&refval, ' ') < 0) return -1;
+                            if (sb_puts(&refval, ja->e[k].val) < 0) return -1;
+                        }
+                        ref_set = true;
+                    } else {
+                        const char *sv1 = env_get(rname.p);
+                        if (sv1) {
+                            if (sb_puts(&refval, sv1) < 0) return -1;
+                            ref_set = true;
+                        }
+                    }
+                    if (!ref_set) {
+                        kprintf(SH_PFX_SHELL "%s[%c]: invalid indirect "
+                                "expansion\n", rname.p, rest[1]);
+                        g_bad_subst_soft = true;
+                        return -1;
+                    }
+                    have_ref = true;
+                    rest = rb + 1;
+                } else if (rb && !(slen == 1 &&
                             (rest[1] == '@' || rest[1] == '*'))) {
                     SH_SB(sub);
                     if (sb_putmem(&sub, rest + 1, slen) < 0) return -1;
@@ -23115,6 +23144,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     sb_truncate(&refval, 0);
                 if (!ref_set) sb_truncate(&refval, 0);
                 have_ref = true;
+                /* A reference that EXISTS but has no value -- an array with
+                 * no element 0, a declared-only name -- expands to nothing,
+                 * without a word (bash; Oils 2562). Only a name that is not
+                 * a variable at all is "invalid indirect expansion". */
+                if (!ref_set && !*rest) {
+                    int ri = env_find(rname.p, strlen(rname.p));
+                    if (sh_array_find(rname.p) || ri >= 0) return 0;
+                }
             }
             if (have_ref) {
                 if (!shell_indirect_target_ok(refval.p)) {
