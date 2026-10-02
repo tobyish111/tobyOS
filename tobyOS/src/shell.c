@@ -23767,8 +23767,10 @@ static int shell_brace_range(const char *body, size_t blen,
         if (hi[i] == '.' && hi[i + 1] == '.') {
             bool ok = false;
             long v = shell_parse_long_value(hi + i + 2, &ok);
-            if (!ok || v == 0) return 0;
-            step = v < 0 ? -v : v;
+            if (!ok) return 0;
+            /* bash's mkseq: a step of 0 is 1, and the step's sign is
+             * taken from the direction of the range, not the other way. */
+            step = v < 0 ? -v : (v == 0 ? 1 : v);
             hi[i] = '\0';
             hilen = i;
             break;
@@ -23784,6 +23786,18 @@ static int shell_brace_range(const char *body, size_t blen,
                   ((hi[0] >= 'a' && hi[0] <= 'z') || (hi[0] >= 'A' && hi[0] <= 'Z')));
     if (!numeric && !alpha) return 0;
     if (alpha) { a = lo[0]; b = hi[0]; }
+    /* ZERO-PADDED TERMS: a leading `0` (or `-0`) on either end makes every
+     * term as wide as the wider end, sign included -- `{01..3}` is 01 02
+     * 03, `{-01..2}` is -01 000 001 002 (bash's expand_seqterm, %0*d).
+     * tsh printed plain numbers (Oils 0604-0606). */
+    int width = 0;
+    if (numeric) {
+        bool z = (lolen > 1 && lo[0] == '0') ||
+                 (lolen > 2 && lo[0] == '-' && lo[1] == '0') ||
+                 (hilen > 1 && hi[0] == '0') ||
+                 (hilen > 2 && hi[0] == '-' && hi[1] == '0');
+        if (z) width = (int)(lolen > hilen ? lolen : hilen);
+    }
 
     long dir = (a <= b) ? step : -step;
     /* EVERY ITEM, as bash gives them. The loop used to stop at 4096 items,
@@ -23799,6 +23813,16 @@ static int shell_brace_range(const char *body, size_t blen,
         if (sb_putmem(&piece, pre, prelen) < 0) return -1;
         if (alpha) {
             if (sb_putc(&piece, (char)v) < 0) return -1;
+        } else if (width > 0) {
+            char digits[32];
+            unsigned long av = v < 0 ? (unsigned long)0 - (unsigned long)v
+                                     : (unsigned long)v;
+            int nd = ksnprintf(digits, sizeof digits, "%lu", av);
+            int pad = width - nd - (v < 0 ? 1 : 0);
+            if (v < 0 && sb_putc(&piece, '-') < 0) return -1;
+            for (int z = 0; z < pad; z++)
+                if (sb_putc(&piece, '0') < 0) return -1;
+            if (sb_puts(&piece, digits) < 0) return -1;
         } else {
             if (sb_put_long(&piece, v) < 0) return -1;
         }
@@ -23822,9 +23846,16 @@ static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
     size_t open = 0;
     size_t close = 0;
     bool have = false;
+    /* Where the search for a group starts: past any `{...}` already found
+     * to be neither a list nor a range, which stays as it is while the
+     * search goes on -- `{x}_{a,b}` is {x}_a {x}_b, not one literal word
+     * (Oils 0563). */
+    size_t from = 0;
+rescan:
+    have = false;
     {
         bool sq = false, dq = false;
-        for (size_t i = 0; i < wlen; i++) {
+        for (size_t i = from; i < wlen; i++) {
             char c = w[i];
             if (sq) { if (c == '\'') sq = false; continue; }
             /* `${...}` is a parameter, `$(...)` and backquotes a command;
@@ -23918,8 +23949,10 @@ static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
                                       out, depth);
             if (r < 0) return -1;
             if (r == 1) return 0;
-            /* Neither a list nor a range: the braces are ordinary characters. */
-            return shell_brace_emit(w, wlen, out);
+            /* Neither a list nor a range: the braces are ordinary
+             * characters, and a later group may still expand. */
+            from = close + 1;
+            goto rescan;
         }
         any_comma = true;
         sb_truncate(&piece, 0);
