@@ -895,6 +895,11 @@ static bool g_opt_errexit;   /* set -e */
  * than a flag because these nest -- a while condition may contain a pipeline
  * containing an if -- and the innermost scope must not clear the outer one. */
 static int g_errexit_suspend;
+/* errexit is OFF here -- a command substitution without inherit_errexit --
+ * but this is not a condition: a failure is still one, and the ERR trap
+ * (under `set -E`) sees it. Counting it in g_errexit_suspend silenced the
+ * trap inside `$( )` too. */
+static int g_errexit_off;
 /* A NEGATION'S exemption, kept apart from a CONDITION'S.
  *
  *     foo() { set -e; false; echo x; }
@@ -918,6 +923,10 @@ static bool g_bad_subst_soft;
 static bool g_status_exempt;
 static bool g_opt_nounset;   /* set -u */
 static bool g_opt_xtrace;    /* set -x */
+/* set -E / -o errtrace: the ERR trap reaches into shell functions, command
+ * substitutions and subshells (bash). Without it the trap is the top
+ * level's alone. tsh refused the option -- "unknown flag '-E'". */
+static bool g_opt_errtrace;
 static bool g_opt_noglob;    /* set -f */
 static bool g_opt_verbose;   /* set -v */
 static bool g_opt_noclobber; /* set -C */
@@ -3939,6 +3948,7 @@ static void shell_trap_clear_all(void) {
 static void shell_trap_clear_caught(void) {
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         bool ignored = (i > 0 && i < SIG_MAX && g_traps[i] && !g_traps[i][0]);
+        if (i == SHELL_TRAP_ERR && g_opt_errtrace) continue;   /* set -E */
         if (!ignored) shell_trap_unset(i);
     }
 }
@@ -3982,6 +3992,8 @@ static int shell_trap_enter_child(struct shell_trap_frame *frame) {
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         if (!g_traps[i]) continue;
         bool ignored = (i > 0 && i < SIG_MAX && !g_traps[i][0]);
+        /* errtrace: the ERR trap goes on working inside */
+        if (i == SHELL_TRAP_ERR && g_opt_errtrace) continue;
         if (!ignored) g_trap_shown[i] = true;
     }
     return 0;
@@ -4108,11 +4120,11 @@ static int  g_capture_depth;         /* defined with $( ) */
 static bool g_err_trap_running;
 static void shell_run_err_trap(int status) {
     if (g_err_trap_running) return;
-    /* Not inherited by a shell function. bash only runs it there under
-     * `set -o errtrace`, which this shell does not implement, so inside a
-     * function the trap stays silent. */
-    if (g_fn_depth > 0) return;
-    if (g_in_pipeline_stage || g_capture_depth > 0) return;
+    /* Not inherited by a shell function, a command substitution or a
+     * pipeline's stage -- unless `set -o errtrace` says so (bash). */
+    if (!g_opt_errtrace &&
+        (g_fn_depth > 0 || g_in_pipeline_stage || g_capture_depth > 0))
+        return;
     const char *act = shell_trap_live(SHELL_TRAP_ERR);
     if (!act || !*act) return;
 
@@ -6632,6 +6644,7 @@ static void shell_optvars_refresh(void) {
     const struct { const char *name; bool on; } so[] = {
         { "allexport", g_opt_allexport }, { "braceexpand", true },
         { "emacs", g_opt_emacs },         { "errexit", g_opt_errexit },
+        { "errtrace", g_opt_errtrace },
         { "hashall", g_opt_hashall },     { "history", g_opt_history },
         { "ignoreeof", g_opt_ignoreeof },
         { "interactive-comments", g_shopt_interactive_comments },
@@ -7780,6 +7793,7 @@ static bool shell_set_opt(char c, bool on) {
     case 'e': g_opt_errexit = on; return true;
     case 'u': g_opt_nounset = on; return true;
     case 'x': g_opt_xtrace = on; return true;
+    case 'E': g_opt_errtrace = on; return true;
     case 'f': g_opt_noglob = on; return true;
     case 'v': g_opt_verbose = on; return true;
     case 'C': g_opt_noclobber = on; return true;
@@ -7800,6 +7814,7 @@ static bool shell_set_opt(char c, bool on) {
 static void shell_print_options(bool reinput) {
     const struct { const char *name; bool on; } t[] = {
         { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
+        { "errtrace",  g_opt_errtrace },
         { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
         { "ignoreeof", g_opt_ignoreeof }, { "monitor",   g_opt_monitor },
         { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
@@ -7827,6 +7842,7 @@ static void shell_print_options(bool reinput) {
 static bool shell_opt_state_by_name(const char *name, bool *out) {
     const struct { const char *name; bool on; } t[] = {
         { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
+        { "errtrace",  g_opt_errtrace },
         { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
         { "ignoreeof", g_opt_ignoreeof },
         { "monitor",   g_opt_monitor },   { "noclobber", g_opt_noclobber },
@@ -7846,6 +7862,7 @@ static bool shell_opt_state_by_name(const char *name, bool *out) {
 static bool shell_set_opt_by_name(const char *name, bool on) {
     struct { const char *name; char flag; } map[] = {
         {"errexit", 'e'}, {"nounset", 'u'}, {"xtrace", 'x'},
+        {"errtrace", 'E'},
         {"noglob", 'f'}, {"verbose", 'v'}, {"noclobber", 'C'},
         {"notify", 'b'}, {"noexec", 'n'}, {"allexport", 'a'},
         {"monitor", 'm'}, {"hashall", 'h'},
@@ -13743,7 +13760,8 @@ static void shell_syn_env(struct bsyn_env *env, bool string, bool repl) {
 /* errexit as bash's exit_immediately_on_error has it: on, and not in a
  * condition or under `!`. */
 static bool shell_errexit_now(void) {
-    return g_opt_errexit && g_errexit_suspend == 0 && g_errexit_negate == 0;
+    return g_opt_errexit && g_errexit_suspend == 0 && g_errexit_negate == 0 &&
+           g_errexit_off == 0;
 }
 
 /* Print the check's messages as bash's parser_error and internal_warning
@@ -14492,7 +14510,7 @@ static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
 struct shell_opt_frame {
     bool errexit, nounset, xtrace, noglob, verbose, noclobber, notify, noexec, allexport;
     bool monitor, ignoreeof, nolog, hashall, posix;
-    bool emacs, vi;
+    bool emacs, vi, errtrace;
 };
 
 static void shell_save_opts(struct shell_opt_frame *f) {
@@ -14512,6 +14530,7 @@ static void shell_save_opts(struct shell_opt_frame *f) {
     f->posix     = g_opt_posix;
     f->emacs     = g_opt_emacs;
     f->vi        = g_opt_vi;
+    f->errtrace  = g_opt_errtrace;
 }
 
 static void shell_restore_opts(const struct shell_opt_frame *f) {
@@ -14531,6 +14550,7 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_posix     = f->posix;
     g_opt_emacs     = f->emacs;
     g_opt_vi        = f->vi;
+    g_opt_errtrace  = f->errtrace;
     shell_optvars_refresh();
 }
 
@@ -20349,7 +20369,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
      * and stops at its first failure. The parent still does not inherit the
      * failure -- the flow flag is absorbed below. */
     bool inherit_ee = g_shopt_inherit_errexit;
-    if (!inherit_ee) g_errexit_suspend++;
+    if (!inherit_ee) g_errexit_off++;
     /* A SUBSTITUTION CONTAINS A COMMAND LIST, NOT A LINE.
      *
      *     foo=`cat <<EOM
@@ -20418,7 +20438,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
             }
         }
     }
-    if (!inherit_ee) g_errexit_suspend--;
+    if (!inherit_ee) g_errexit_off--;
     if (!sub_frame) shell_alias_restore(&saved_aliases);
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
@@ -21259,7 +21279,9 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
         if (g_opt_nounset)   opts[oi++] = 'u';
         if (g_opt_verbose)   opts[oi++] = 'v';
         if (g_opt_xtrace)    opts[oi++] = 'x';
+        opts[oi++] = 'B';           /* braceexpand: bash's `hB` */
         if (g_opt_noclobber) opts[oi++] = 'C';
+        if (g_opt_errtrace)  opts[oi++] = 'E';
         opts[oi] = '\0';
         rc = sb_puts(out, opts);
     } else if (strcmp(name, "*") == 0) {
@@ -24006,7 +24028,9 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
         if (g_opt_nounset)   opts[oi++] = 'u';
         if (g_opt_verbose)   opts[oi++] = 'v';
         if (g_opt_xtrace)    opts[oi++] = 'x';
+        opts[oi++] = 'B';           /* braceexpand: bash's `hB` */
         if (g_opt_noclobber) opts[oi++] = 'C';
+        if (g_opt_errtrace)  opts[oi++] = 'E';
         opts[oi] = '\0';
         return sb_puts(b, opts);
     }
@@ -34850,6 +34874,7 @@ static void execute_line_text_inner(const char *src) {
             g_shell_flow == SHELL_FLOW_NONE)
             shell_run_err_trap(g_last_status);      /* ERR, same contexts */
         if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            g_errexit_off == 0 &&
             g_errexit_negate == 0 &&
             !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
@@ -34857,17 +34882,27 @@ static void execute_line_text_inner(const char *src) {
         }
         return;
     }
-    if (shell_try_background_line(src) ||
-        shell_try_dbracket_command(src) ||
-        shell_try_arith_command(src) ||
-        shell_try_if_command(src) ||
-        shell_try_arith_for_command(src) ||
-        shell_try_for_command(src) ||
-        shell_try_while_command(src) ||
-        shell_try_until_command(src) ||
-        shell_try_case_command(src) ||
-        shell_try_group_command(src) ||
-        shell_try_subshell_command(src)) {
+    /* Which one ran: the ERR trap fires for a failing `( )`, `[[ ]]` and
+     * `(( ))` as such -- `( exit 3 )` is a failure of this shell's, the
+     * `exit` in it is not -- where a group, a loop or an `if` only passes
+     * on what its own commands already reported (bash;
+     * tools/agent/probes/err-trap-contexts.sh, Oils 1214 1218). */
+    int ctry = 0;
+    if ((ctry = 1, shell_try_background_line(src)) ||
+        (ctry = 2, shell_try_dbracket_command(src)) ||
+        (ctry = 3, shell_try_arith_command(src)) ||
+        (ctry = 4, shell_try_if_command(src)) ||
+        (ctry = 5, shell_try_arith_for_command(src)) ||
+        (ctry = 6, shell_try_for_command(src)) ||
+        (ctry = 7, shell_try_while_command(src)) ||
+        (ctry = 8, shell_try_until_command(src)) ||
+        (ctry = 9, shell_try_case_command(src)) ||
+        (ctry = 10, shell_try_group_command(src)) ||
+        (ctry = 11, shell_try_subshell_command(src))) {
+        if ((ctry == 2 || ctry == 3 || ctry == 11) && g_last_status != 0 &&
+            g_errexit_suspend == 0 && g_errexit_negate == 0 &&
+            !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE)
+            shell_run_err_trap(g_last_status);
         /* ERREXIT APPLIES TO A COMPOUND COMMAND TOO. These are dispatched
          * before the token loop, which is where the check lives, so a failing
          * compound never triggered it:
@@ -34881,6 +34916,7 @@ static void execute_line_text_inner(const char *src) {
          * exiting: its non-zero status came from a command that was itself
          * exempt, and an exemption survives being handed upwards. */
         if (g_opt_errexit && g_last_status != 0 && g_errexit_suspend == 0 &&
+            g_errexit_off == 0 &&
             g_errexit_negate == 0 &&
             !g_status_exempt && g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
@@ -35201,7 +35237,7 @@ static void execute_line_text_inner(const char *src) {
                 g_errexit_suspend == 0 && g_errexit_negate == 0)
                 shell_run_err_trap(last);
             if (g_opt_errexit && last != 0 && !negate && !background &&
-                !in_and_or && g_errexit_suspend == 0 &&
+                !in_and_or && g_errexit_suspend == 0 && g_errexit_off == 0 &&
                 g_errexit_negate == 0) {
                 g_shell_flow = SHELL_FLOW_EXIT;
                 g_shell_flow_status = last;
