@@ -21819,6 +21819,12 @@ static const char *shell_param_display(const char *name) {
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b);
 static bool shell_glob_meta(char c);
 
+/* `shopt -s nocasematch`: `case`, `[[ == ]]` / `!=` and ${x/pat/rep} match
+ * without regard to (ASCII) case -- not ${x#pat} or ${x%pat}, measured.
+ * The option was accepted and ignored (Oils 1873 1876). Set by those three
+ * callers around their matching; every other match is exact. */
+static bool g_glob_nocase;
+
 
 static int shell_expand_element_op(const char *nm, const char *sub,
                                    size_t slen, const char *suffix,
@@ -22571,6 +22577,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * exact, so the answer cannot change -- only the work does. And
              * a candidate is a SLICE of the value handed to the matcher with
              * its end, not a copy: copying it was another O(n) per try. */
+            bool saved_nocase = g_glob_nocase;
+            g_glob_nocase = g_shopt_misc[3];          /* nocasematch */
             long fixed = shell_pattern_fixed_len(pattern, pat_end);
             int lead = shell_pattern_lead_byte(pattern, pat_end);
             SH_SB(out);
@@ -22610,19 +22618,29 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     }
                 }
                 if (matched) {
-                    if (sb_putmem(&out, repl.p, rlen) < 0) return -1;
+                    if (sb_putmem(&out, repl.p, rlen) < 0) {
+                        g_glob_nocase = saved_nocase;
+                        return -1;
+                    }
                     done_one = true;
                     if (mlen == 0) {           /* empty match: do not spin */
-                        if (i < vlen && sb_putc(&out, value[i]) < 0) return -1;
+                        if (i < vlen && sb_putc(&out, value[i]) < 0) {
+                            g_glob_nocase = saved_nocase;
+                            return -1;
+                        }
                         i++;
                     } else {
                         i += mlen;
                     }
                     continue;
                 }
-                if (i < vlen && sb_putc(&out, value[i]) < 0) return -1;
+                if (i < vlen && sb_putc(&out, value[i]) < 0) {
+                    g_glob_nocase = saved_nocase;
+                    return -1;
+                }
                 i++;
             }
+            g_glob_nocase = saved_nocase;
             return vjoin ? sh_put_join_value(b, out.p)
                          : sb_put_data_str(b, out.p);
         }
@@ -25527,6 +25545,16 @@ static const char *eg_next_alt(const char *p, const char *end) {
 static bool shell_glob_match_e(const char *pat, const char *pend,
                                const char *name, const char *nend);
 
+static char shell_ascii_other_case(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - 32);
+    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
+    return c;
+}
+
+static bool shell_glob_ch_eq(char a, char b) {
+    return a == b || (g_glob_nocase && shell_ascii_other_case(a) == b);
+}
+
 /* Zero or more repetitions of the alternation in [ls,le), then [rest,pend).
  * Shared by `*(...)` and, after one forced repetition, by `+(...)`. */
 static bool eg_match_star(const char *ls, const char *le,
@@ -25613,7 +25641,7 @@ static bool shell_glob_match_e(const char *pat, const char *pend,
          * `"*"` reaches here instead of being lost with the quotes. */
         if ((*pat == '\\' || *pat == SHELL_GLOB_ESC ||
              *pat == SHELL_DATA_ESC) && pat + 1 < pend) {
-            if (name >= nend || *name != pat[1]) return false;
+            if (name >= nend || !shell_glob_ch_eq(*name, pat[1])) return false;
             pat += 2;
             name++;
             continue;
@@ -25646,12 +25674,19 @@ static bool shell_glob_match_e(const char *pat, const char *pend,
         }
         if (*pat == '[') {
             const char *after = pat;
-            if (!shell_glob_bracket(&after, *name)) return false;
+            if (!shell_glob_bracket(&after, *name)) {
+                const char *after2 = pat;
+                char oc = shell_ascii_other_case(*name);
+                if (!(g_glob_nocase && oc != *name &&
+                      shell_glob_bracket(&after2, oc)))
+                    return false;
+                after = after2;
+            }
             pat = after;
             name++;
             continue;
         }
-        if (*pat != *name) return false;
+        if (!shell_glob_ch_eq(*name, *pat)) return false;
         pat++;
         name++;
     }
@@ -25731,6 +25766,7 @@ static long shell_pattern_fixed_len(const char *pat, const char *pend) {
  * shell_pattern_fixed_len. */
 static int shell_pattern_lead_byte(const char *pat, const char *pend) {
     if (pat >= pend) return -1;
+    if (g_glob_nocase) return -1;       /* either case may lead */
     char c = *pat;
     if ((c == '\\' || c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) &&
         pat + 1 < pend)
@@ -30467,13 +30503,19 @@ static int shell_dbr_primary(struct shell_dbr *d) {
 
     if (patrhs) {
         bool eq;
+        bool saved_nocase = g_glob_nocase;
+        g_glob_nocase = g_shopt_misc[3];                /* nocasematch */
         if (d->pat[rhs_index]) {
             /* AN UNQUOTED RIGHT-HAND SIDE IS A PATTERN. This is the one thing
              * `[[ ]]` does that `[` cannot express at all. */
             eq = shell_glob_match(b, a);
         } else {
-            eq = (strcmp(a, b) == 0);
+            /* quoted: a string, compared under nocasematch as bash does */
+            eq = strlen(a) == strlen(b);
+            for (size_t k = 0; eq && a[k]; k++)
+                eq = shell_glob_ch_eq(a[k], b[k]);
         }
+        g_glob_nocase = saved_nocase;
         if (strcmp(op, "!=") == 0) eq = !eq;
         return eq;
     }
@@ -31931,6 +31973,8 @@ static bool shell_try_case_command(const char *src) {
     if (*p == ';') p++;
     int last = 0;
     bool matched = false;
+    /* `;&` ran a body: the NEXT body runs without its patterns tested. */
+    bool fall = false;
 
     while (p < esac_at) {
         while (p < esac_at && (is_space(*p) || *p == ';')) p++;
@@ -31987,10 +32031,25 @@ static bool shell_try_case_command(const char *src) {
                         continue;
                     }
                 }
-                if (cdepth == 0 && q[0] == ';' && q[1] == ';') { sep = q; break; }
+                /* bash's three clause terminators: `;;` ends the case,
+                 * `;&` falls into the next body, `;;&` tests the next
+                 * patterns. Only `;;` was known, so `aa) echo aa ;&`
+                 * ran its `;&` as text and the next clause's `bb)` as a
+                 * command (Oils 1357 1358). */
+                if (cdepth == 0 && q[0] == ';' && (q[1] == ';' || q[1] == '&')) {
+                    sep = q;
+                    break;
+                }
             }
         }
         if (!sep || sep > esac_at) sep = esac_at;
+        int term_len = 0;               /* 0: the end; 2 `;;` / `;&`; 3 `;;&` */
+        char term = ';';
+        if (sep < esac_at) {
+            if (sep[1] == ';' && sep[2] == '&') { term_len = 3; term = '+'; }
+            else if (sep[1] == '&')             { term_len = 2; term = '&'; }
+            else                                { term_len = 2; term = ';'; }
+        }
 
         /* Heap, not stack -- see shell_dup_segment(). A clause body is
          * re-allocated per clause and dead at the end of the iteration. The
@@ -32005,8 +32064,15 @@ static bool shell_try_case_command(const char *src) {
             return true;
         }
 
-        bool hit = !matched && shell_case_pattern_match(pats, word);
+        bool hit = fall;
+        if (!hit) {
+            bool saved_nocase = g_glob_nocase;
+            g_glob_nocase = g_shopt_misc[3];            /* nocasematch */
+            hit = shell_case_pattern_match(pats, word);
+            g_glob_nocase = saved_nocase;
+        }
         kfree(pats);
+        fall = false;
         if (hit) {
             matched = true;
             shell_lmap_push_copy(body_text, body);
@@ -32015,14 +32081,17 @@ static bool shell_try_case_command(const char *src) {
             kfree(body_text);
             last = g_last_status;
             shell_set_status(last);
-            return true;
+            if (term == ';' || g_shell_flow != SHELL_FLOW_NONE) return true;
+            if (term == '&') fall = true;
+            p = sep + term_len;
+            continue;
         }
         kfree(body_text);
 
-        p = (sep < esac_at) ? sep + 2 : esac_at;
+        p = (sep < esac_at) ? sep + term_len : esac_at;
     }
 
-    shell_set_status(0);
+    shell_set_status(matched ? last : 0);
     return true;
 }
 
