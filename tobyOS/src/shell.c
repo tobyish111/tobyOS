@@ -4715,6 +4715,144 @@ static int sh_array_set(const char *name, long idx, const char *val) {
     return 0;
 }
 
+/* ---- a subshell's arrays are its own ---------------------------------- *
+ *
+ *     a=(1); ( a[1]=2 ); declare -p a        bash: declare -a a=([0]="1")
+ *     x=$( d=(p q); echo ); declare -p d     bash: d: not found
+ *
+ * A ( ) subshell and a $( ) substitution run IN-PROCESS in /bin/tsh, inside
+ * a frame that saves and restores what they may change -- variables,
+ * positional parameters, aliases, functions, traps, options, descriptors,
+ * the cwd. Not the ARRAYS: an element assigned, an array created or one
+ * unset in a subshell stayed that way in the parent. (Found when the
+ * arithmetic fixture, one subshell per case, saw an earlier case's array.)
+ *
+ * The capture is a deep copy. The restore is IN PLACE: an array that existed
+ * keeps its record and gets its old contents back, one created inside is
+ * freed, one unset inside is made again -- code above a substitution may
+ * hold a record's address across it (the array-literal builder does), and
+ * replacing every record would leave that pointing at freed memory. */
+struct sh_array_snap {
+    struct sh_array *rec;       /* the record, to be restored in place */
+    struct sh_array copy;       /* its name, kind and elements, deep */
+};
+
+struct shell_array_frame {
+    struct sh_array_snap *s;
+    int n;
+};
+
+static void sh_array_contents_free(struct sh_array *a) {
+    for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
+    kfree(a->e);
+    kfree(a->name);
+    a->e = 0;
+    a->name = 0;
+    a->n = a->cap = 0;
+}
+
+static char *sh_array_strdup(const char *v) {
+    size_t n = strlen(v) + 1;
+    char *c = (char *)kmalloc(n);
+    if (c) memcpy(c, v, n);
+    return c;
+}
+
+static int sh_array_copy_into(struct sh_array *dst, const struct sh_array *src) {
+    memset(dst, 0, sizeof *dst);
+    dst->assoc = src->assoc;
+    dst->name = sh_array_strdup(src->name ? src->name : "");
+    if (!dst->name) return -1;
+    if (src->n > 0) {
+        dst->e = (struct sh_arr_elem *)kmalloc((size_t)src->n * sizeof *dst->e);
+        if (!dst->e) { sh_array_contents_free(dst); return -1; }
+        dst->cap = src->n;
+        for (int i = 0; i < src->n; i++) {
+            struct sh_arr_elem *d = &dst->e[i];
+            d->idx = src->e[i].idx;
+            d->key = 0;
+            d->val = sh_array_strdup(src->e[i].val ? src->e[i].val : "");
+            if (src->e[i].key) d->key = sh_array_strdup(src->e[i].key);
+            dst->n = i + 1;
+            if (!d->val || (src->e[i].key && !d->key)) {
+                sh_array_contents_free(dst);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void shell_array_frame_clear(struct shell_array_frame *f) {
+    if (!f) return;
+    for (int i = 0; i < f->n; i++) sh_array_contents_free(&f->s[i].copy);
+    kfree(f->s);
+    f->s = 0;
+    f->n = 0;
+}
+
+static int shell_array_frame_capture(struct shell_array_frame *f) {
+    f->s = 0;
+    f->n = 0;
+    if (g_narrays == 0) return 0;
+    f->s = (struct sh_array_snap *)kmalloc((size_t)g_narrays * sizeof *f->s);
+    if (!f->s) return -1;
+    for (int i = 0; i < g_narrays; i++) {
+        f->s[i].rec = g_arrays[i];
+        if (sh_array_copy_into(&f->s[i].copy, g_arrays[i]) < 0) {
+            shell_array_frame_clear(f);
+            return -1;
+        }
+        f->n = i + 1;
+    }
+    return 0;
+}
+
+static bool sh_array_rec_live(const struct sh_array *a) {
+    for (int j = 0; j < g_narrays; j++) if (g_arrays[j] == a) return true;
+    return false;
+}
+
+static void shell_array_frame_restore(struct shell_array_frame *f) {
+    if (!f) return;
+    /* Everything that can fail first, so a failure changes nothing. */
+    int cap = f->n > 64 ? f->n : 64;
+    struct sh_array **nt = (struct sh_array **)kmalloc((size_t)cap * sizeof *nt);
+    if (!nt) { shell_array_frame_clear(f); return; }
+    for (int i = 0; i < f->n; i++) {
+        nt[i] = sh_array_rec_live(f->s[i].rec) ? f->s[i].rec : 0;
+        if (!nt[i]) {                       /* unset in the subshell */
+            nt[i] = (struct sh_array *)kmalloc(sizeof **nt);
+            if (!nt[i]) {
+                for (int k = 0; k < i; k++)
+                    if (!sh_array_rec_live(nt[k])) kfree(nt[k]);
+                kfree(nt);
+                shell_array_frame_clear(f);
+                return;
+            }
+            memset(nt[i], 0, sizeof **nt);
+        }
+    }
+    /* Arrays the subshell created go. */
+    for (int j = 0; j < g_narrays; ) {
+        bool kept = false;
+        for (int i = 0; i < f->n; i++) if (f->s[i].rec == g_arrays[j]) { kept = true; break; }
+        if (kept) { j++; continue; }
+        sh_array_unset_at(g_arrays[j]);
+    }
+    /* The rest get their old contents, in their old order. */
+    for (int i = 0; i < f->n; i++) {
+        sh_array_contents_free(nt[i]);
+        *nt[i] = f->s[i].copy;
+        memset(&f->s[i].copy, 0, sizeof f->s[i].copy);
+    }
+    kfree(g_arrays);
+    g_arrays = nt;
+    g_narrays = f->n;
+    g_arrays_cap = cap;
+    shell_array_frame_clear(f);
+}
+
 /* Evaluate an array SUBSCRIPT.
  *
  * A subscript is ARITHMETIC CONTEXT, not a literal integer: `${a[i]}` reads
@@ -27699,7 +27837,6 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
          * the function path did not, so the assignment was silently dropped
          * and the function saw the outer (or unset) value. */
         {
-            struct shell_env_frame env_frame;
             bool restore = false;
             /* Only when there IS a prefix. A function shares the caller's
              * environment, so `f() { g=1; }; f` must leave g set -- snapshotting
@@ -27709,16 +27846,28 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
             if (shell_function_lookup(exec_cmd.argv[0]) ||
                 shell_cmd_lookup(exec_cmd.argv[0]))
                 g_bg_exec_ok = false;
+            /* `x=1 f` binds x for the call ONLY -- and only x: what f
+             * itself sets stays set. This saved the WHOLE environment and
+             * put it all back, so every global f assigned was lost:
+             *
+             *     f() { y=2; }; x=1 f; echo "[$y]"       bash: [2]  tsh: []
+             *
+             * The builtin path learned this already (shell_prefix_capture,
+             * `IFS=: read a b`); a function is the same rule. */
+            struct shell_prefix_save fn_prefix;
+            fn_prefix.count = 0;
+            fn_prefix.v = 0;
             if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
-                if (shell_env_frame_capture(&env_frame) == 0) restore = true;
+                shell_prefix_capture(&fn_prefix, cmd->argv, assignc);
+                restore = true;
                 if (shell_apply_assignments_ex(cmd->argv, assignc, "shell",
                                                true) != 0) {
-                    if (restore) shell_env_frame_restore(&env_frame);
+                    shell_prefix_restore(&fn_prefix);
                     return 1;
                 }
             }
             int frc = shell_run_function(&exec_cmd);
-            if (restore) shell_env_frame_restore(&env_frame);
+            if (restore) shell_prefix_restore(&fn_prefix);
             if (frc >= 0) return frc;
         }
         const struct cmd *builtin = shell_cmd_lookup(exec_cmd.argv[0]);
@@ -27805,7 +27954,13 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     if (!builtin && !fn) return -1;
 
     struct shell_env_frame env_frame;
+    struct shell_array_frame arr_frame;     /* a stage is a subshell: above */
     if (shell_env_frame_capture(&env_frame) < 0) {
+        kprintf("pipeline: failed to save shell environment\n");
+        return 1;
+    }
+    if (shell_array_frame_capture(&arr_frame) < 0) {
+        shell_env_frame_restore(&env_frame);
         kprintf("pipeline: failed to save shell environment\n");
         return 1;
     }
@@ -27814,6 +27969,7 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     const char *cwd = shell_cwd();
     if (!cwd || strlen(cwd) + 1 > sizeof(saved_cwd)) {
         shell_env_frame_restore(&env_frame);
+        shell_array_frame_restore(&arr_frame);
         return 1;
     }
     memcpy(saved_cwd, cwd, strlen(cwd) + 1);
@@ -27827,16 +27983,19 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     if (pipe_in && shell_fd_state_replace(&fds, 0, pipe_in, false) < 0) {
         shell_fd_state_close_owned(&fds);
         shell_env_frame_restore(&env_frame);
+        shell_array_frame_restore(&arr_frame);
         return 1;
     }
     if (pipe_out && shell_fd_state_replace(&fds, 1, pipe_out, false) < 0) {
         shell_fd_state_close_owned(&fds);
         shell_env_frame_restore(&env_frame);
+        shell_array_frame_restore(&arr_frame);
         return 1;
     }
     if (shell_apply_redirs(&exec_cmd, &fds, exec_cmd.argv[0]) < 0) {
         shell_fd_state_close_owned(&fds);
         shell_env_frame_restore(&env_frame);
+        shell_array_frame_restore(&arr_frame);
         return 1;
     }
 
@@ -27844,6 +28003,8 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     memset(&io_frame, 0, sizeof(io_frame));
     if (shell_io_frame_install(&io_frame, &fds) < 0) {
         shell_fd_state_close_owned(&fds);
+        shell_env_frame_restore(&env_frame);
+        shell_array_frame_restore(&arr_frame);
         return 1;
     }
 
@@ -27871,6 +28032,7 @@ static int shell_run_pipeline_shell_stage(struct shell_simple *cmd,
     g_subshell_depth--;
     shell_restore_io_frame(&io_frame);
     shell_env_frame_restore(&env_frame);
+    shell_array_frame_restore(&arr_frame);
     shell_restore_cwd_only(saved_cwd);
     g_shell_flow = saved_flow;
     g_shell_flow_status = saved_flow_status;
@@ -31254,6 +31416,7 @@ static void shell_readonly_frame_restore(struct shell_readonly_frame *frame) {
 
 struct shell_subshell_frame {
     struct shell_env_frame env;
+    struct shell_array_frame arrays;
     struct shell_param_snapshot params;
     struct shell_alias_frame aliases;
     struct shell_function_frame functions;
@@ -31279,6 +31442,7 @@ struct shell_subshell_frame {
 static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     if (!frame) return;
     shell_env_frame_clear(&frame->env);
+    shell_array_frame_clear(&frame->arrays);
     shell_param_snapshot_clear(&frame->params);
     shell_alias_frame_clear(&frame->aliases);
     shell_function_frame_clear(&frame->functions);
@@ -31334,6 +31498,7 @@ static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
     shell_umask_sync();
     frame->umask = g_shell_umask;
     if (shell_env_frame_capture(&frame->env) < 0 ||
+        shell_array_frame_capture(&frame->arrays) < 0 ||
         shell_param_snapshot_capture(&frame->params) < 0 ||
         shell_alias_frame_capture(&frame->aliases) < 0 ||
         shell_function_frame_capture(&frame->functions) < 0 ||
@@ -31348,6 +31513,7 @@ static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
 static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     if (!frame) return;
     shell_env_frame_restore(&frame->env);
+    shell_array_frame_restore(&frame->arrays);
     shell_param_snapshot_restore(&frame->params);
     shell_alias_frame_restore(&frame->aliases);
     shell_function_frame_restore(&frame->functions);
