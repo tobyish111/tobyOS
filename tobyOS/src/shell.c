@@ -12131,8 +12131,10 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
                       KW("fi") || KW("done");
         bool opener = KW("if") || KW("while") || KW("until") || KW("then") ||
                       KW("do") || KW("else") || KW("elif");
-        bool neutral = KW("!") || KW("time") || *before == ';' ||
-                       *before == '&' || *before == '|';
+        /* `!` and `time` are not neutral: alone each is a command (of a null
+         * one), so `if !; then` and `if time; then` have a condition --
+         * bash's BANG / timespec list_terminator. */
+        bool neutral = *before == ';' || *before == '&' || *before == '|';
 #undef KW
         if (closer && st->list_empty && !st->bad_kw) {
             st->bad_kw = true;
@@ -32118,6 +32120,18 @@ static unsigned long shell_simple_cmd_lineno(const char *src) {
     return ln ? ln : shell_lineno_at(p);
 }
 
+/* The token's text is the word `!` -- the marks the tokenizer puts around
+ * an unquoted run of text do not count. */
+static bool shell_tok_is_bang(const char *s) {
+    bool seen = false;
+    for (; *s; s++) {
+        if (*s == SHELL_NOSPLIT_MARK) continue;
+        if (*s == '!' && !seen) { seen = true; continue; }
+        return false;
+    }
+    return seen;
+}
+
 static void execute_line_text_inner(const char *src) {
     struct shell_token *tok = 0;
     SH_WORDS(words);
@@ -32574,21 +32588,29 @@ static void execute_line_text_inner(const char *src) {
                           (prev_link == SH_TOK_OR_IF && last != 0);
 
         bool negate = false;
+        int bangs = 0;
         /* `!` is the negation KEYWORD only when it was written as one. A `!`
          * that arrived from an expansion is an ordinary word:
          *
          *     v='!'; $v echo hi        bash: /bin/! not found, status 127
          *
          * tsh negated instead and ran `echo hi`. tok[].expanded already
-         * records where the word came from. */
+         * records where the word came from -- and a quoted "!" is a word
+         * too. The text carries the tokenizer's literal-run marks around
+         * the `!`, which is why comparing it with "!" never matched and a
+         * `!` with nothing after it ran a command called `!` (B9). */
         while (i < ntok && tok[i].type == SH_TOK_WORD && !tok[i].expanded &&
-               strcmp(tok[i].text, "!") == 0) {
+               !tok[i].quoted && shell_tok_is_bang(tok[i].text)) {
             negate = !negate;
+            bangs++;
             i++;
         }
         if (i >= ntok || shell_is_list_sep(tok[i].type)) {
-            if (negate) {
-                last = g_last_status == 0 ? 1 : 0;
+            /* `!` ALONE NEGATES A NULL COMMAND, whose status is 0: `!` is 1
+             * and `! !` is 0 whatever $? was (bash's BANG list_terminator).
+             * It was "the previous status, inverted". */
+            if (bangs) {
+                last = negate ? 1 : 0;
                 shell_set_status(last);
             }
             enum shell_tok_type sep2 = shell_consume_separator(tok, ntok, &i);
