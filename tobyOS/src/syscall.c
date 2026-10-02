@@ -6899,6 +6899,21 @@ struct lx_dirent64 {
 #define LX_DT_REG  8
 #define LX_DT_CHR  2      /* slice 102: /dev/dri nodes are char devices */
 
+/* Linux's may_open(): a directory opens for READING. Write access, O_CREAT
+ * or O_TRUNC on one is EISDIR (O_PATH asks for no access and is exempt).
+ * Every open of a directory used to become a getdents fd, so bash's
+ * `echo x > /tmp` opened fine, ran echo, and failed at the write with
+ * "write error: Operation not permitted" -- where Linux says
+ * "/tmp: Is a directory" and runs nothing. An O_TMPFILE open carries
+ * O_DIRECTORY and write access, so it gets EISDIR too -- where it used to
+ * get a directory fd it could not write to. */
+#define LX_O_PATH_FLAG 0x200000
+static bool lx_dir_open_refused(long flags) {
+    if (flags & LX_O_PATH_FLAG) return false;
+    return (flags & ABI_O_ACCMODE) != 0 ||
+           (flags & (ABI_O_CREAT | ABI_O_TRUNC)) != 0;
+}
+
 /* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
  * has no native directory fd, so we just remember the path; getdents64
  * re-opens via vfs_opendir and resumes after dir_off entries. */
@@ -10516,6 +10531,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (got_kp) {
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+                if (lx_dir_open_refused((long)a2)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
                 if (dfd >= 0 && (a2 & LX_O_CLOEXEC))
                     fd_cloexec_set(current_proc(), (int)dfd, 1);
@@ -10556,6 +10572,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (got_kp) {
             struct vfs_stat vs;
             if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+                if (lx_dir_open_refused((long)a3)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
                 if (dfd >= 0 && (a3 & LX_O_CLOEXEC))
                     fd_cloexec_set(current_proc(), (int)dfd, 1);
