@@ -2203,9 +2203,14 @@ static void shell_dynvar_assign(int dv, const char *val) {
     }
 }
 
+static void shell_optvars_refresh(void);
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
+    /* SHELLOPTS and BASHOPTS say what the options ARE, whenever asked */
+    if ((key[0] == 'S' && strcmp(key, "SHELLOPTS") == 0) ||
+        (key[0] == 'B' && strcmp(key, "BASHOPTS") == 0))
+        shell_optvars_refresh();
     for (int i = g_tokpfx_n - 1; i >= 0; i--) {
         if (strncmp(g_tokpfx[i], key, klen) == 0 && g_tokpfx[i][klen] == '=')
             return g_tokpfx[i] + klen + 1;
@@ -3413,6 +3418,7 @@ static void env_init_defaults(void) {
      * nothing. Setting it makes the value observable and the fallback
      * redundant rather than load-bearing. */
     if (env_set("IFS", " \t\n")     < 0) kprintf("env: default IFS set failed\n");
+    shell_optvars_refresh();          /* SHELLOPTS, BASHOPTS: see there */
 
     /* PATH, HOME, PWD, SHELL and USER are exported: a child process is
      * expected to inherit them, and every real shell does. IFS and OPTIND are
@@ -6586,7 +6592,104 @@ static bool shell_set_opt_by_name(const char *name, bool on);
  * Exit status follows bash: with -q, 0 if every named option is set; without
  * it, 0 unless a name is unknown. An unknown name is status 1 plus a
  * diagnostic, which is what bash does and what several corpus cases check. */
+/* $SHELLOPTS AND $BASHOPTS, bash's readonly lists of the options that are
+ * on: the `set -o` names and the `shopt` names, each alphabetical and
+ * colon-separated. tsh had neither -- `${SHELLOPTS:?}` failed, `test -v`
+ * was false, `SHELLOPTS=x` succeeded (Oils 2196-2198). They are kept in
+ * the variable table, so `declare -p` and `test -v` see them, and brought
+ * up to date when read and after anything that changes an option. braceexpand
+ * is always on in tsh (no `set +B`); the `set -o` names tsh does not have
+ * (errtrace, functrace, histexpand, keyword, onecmd, physical, privileged)
+ * are off, which is what they are. */
+static void shell_optvar_put(const char *name, const char *val) {
+    size_t nl = strlen(name), vl = strlen(val);
+    int idx = env_find(name, nl);
+    if (idx >= 0 && strcmp(g_env[idx] + nl + 1, val) == 0) return;
+    char *blob = (char *)kmalloc(nl + 1 + vl + 1);
+    if (!blob) return;
+    memcpy(blob, name, nl);
+    blob[nl] = '=';
+    memcpy(blob + nl + 1, val, vl + 1);
+    if (idx >= 0) {
+        kfree(g_env[idx]);
+        g_env[idx] = blob;          /* the flags (export) stay */
+    } else if (env_reserve(g_envc + 1)) {
+        g_env_flags[g_envc] = 0;
+        g_env[g_envc++] = blob;
+        g_env[g_envc] = 0;
+    } else {
+        kfree(blob);
+    }
+}
+
+static void shell_optvars_refresh(void) {
+    static bool marked;
+    if (!marked) {
+        marked = true;
+        (void)shell_readonly_mark("SHELLOPTS", 9);
+        (void)shell_readonly_mark("BASHOPTS", 8);
+    }
+    const struct { const char *name; bool on; } so[] = {
+        { "allexport", g_opt_allexport }, { "braceexpand", true },
+        { "emacs", g_opt_emacs },         { "errexit", g_opt_errexit },
+        { "hashall", g_opt_hashall },     { "history", g_opt_history },
+        { "ignoreeof", g_opt_ignoreeof },
+        { "interactive-comments", g_shopt_interactive_comments },
+        { "monitor", g_opt_monitor },     { "noclobber", g_opt_noclobber },
+        { "noexec", g_opt_noexec },       { "noglob", g_opt_noglob },
+        { "nolog", g_opt_nolog },         { "notify", g_opt_notify },
+        { "nounset", g_opt_nounset },     { "pipefail", g_opt_pipefail },
+        { "posix", g_opt_posix },         { "verbose", g_opt_verbose },
+        { "vi", g_opt_vi },               { "xtrace", g_opt_xtrace },
+    };
+    SH_SB(sv);
+    (void)sb_puts(&sv, "");
+    for (size_t i = 0; i < sizeof so / sizeof so[0]; i++) {
+        if (!so[i].on) continue;
+        if (sv.len && sb_putc(&sv, ':') < 0) return;
+        if (sb_puts(&sv, so[i].name) < 0) return;
+    }
+    shell_optvar_put("SHELLOPTS", sv.p);
+    /* bash 5.2's shopt names, in order; the table holds some of its own */
+    static const char *const bash_shopts[] = {
+        "assoc_expand_once", "autocd", "cdable_vars", "cdspell", "checkhash",
+        "checkjobs", "checkwinsize", "cmdhist", "compat31", "compat32",
+        "compat40", "compat41", "compat42", "compat43", "compat44",
+        "complete_fullquote", "direxpand", "dirspell", "dotglob", "execfail",
+        "expand_aliases", "extdebug", "extglob", "extquote", "failglob",
+        "force_fignore", "globasciiranges", "globskipdots", "globstar",
+        "gnu_errfmt", "histappend", "histreedit", "histverify",
+        "hostcomplete", "huponexit", "inherit_errexit",
+        "interactive_comments", "lastpipe", "lithist", "localvar_inherit",
+        "localvar_unset", "login_shell", "mailwarn",
+        "no_empty_cmd_completion", "nocaseglob", "nocasematch",
+        "noexpand_translation", "nullglob", "patsub_replacement", "progcomp",
+        "progcomp_alias", "promptvars", "restricted_shell", "shift_verbose",
+        "sourcepath", "varredir_close", "xpg_echo",
+    };
+    SH_SB(bv);
+    (void)sb_puts(&bv, "");
+    for (size_t b = 0; b < sizeof bash_shopts / sizeof bash_shopts[0]; b++) {
+        bool on = false;
+        for (size_t i = 0; g_shopts[i].name; i++)
+            if (strcmp(g_shopts[i].name, bash_shopts[b]) == 0) {
+                on = g_shopts[i].slot && *g_shopts[i].slot;
+                break;
+            }
+        if (!on) continue;
+        if (bv.len && sb_putc(&bv, ':') < 0) return;
+        if (sb_puts(&bv, bash_shopts[b]) < 0) return;
+    }
+    shell_optvar_put("BASHOPTS", bv.p);
+}
+
+static void cmd_shopt_in(int argc, char **argv);
 static void cmd_shopt(int argc, char **argv) {
+    cmd_shopt_in(argc, argv);
+    shell_optvars_refresh();
+}
+
+static void cmd_shopt_in(int argc, char **argv) {
     bool set = false, unset = false, quiet = false, print = false;
     bool setopts = false;      /* -o: the `set -o` namespace, not shopt's */
     int i = 1;
@@ -7943,7 +8046,13 @@ static void shell_print_vars_set_format(void) {
     }
 }
 
+static void cmd_set_in(int argc, char **argv);
 static void cmd_set(int argc, char **argv) {
+    cmd_set_in(argc, argv);
+    shell_optvars_refresh();
+}
+
+static void cmd_set_in(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
         shell_print_vars_set_format();
@@ -14422,6 +14531,7 @@ static void shell_restore_opts(const struct shell_opt_frame *f) {
     g_opt_posix     = f->posix;
     g_opt_emacs     = f->emacs;
     g_opt_vi        = f->vi;
+    shell_optvars_refresh();
 }
 
 static void shell_reset_opts(void) {
@@ -35049,14 +35159,18 @@ static void execute_line_text_inner(const char *src) {
             for (int s = 0; s < plp->count; s++) shell_run_debug_trap();
             if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
             if (g_opt_xtrace) {
-                kprintf("+ ");
+                /* BARE, as bash prints it: `+ echo hi`. kprintf in /bin/tsh
+                 * is the DIAGNOSTIC channel, which puts the script and line
+                 * in front -- every trace line read `x.sh: line 2: + echo
+                 * hi`. */
+                kprintf_raw("+ ");
                 for (int s = 0; s < plp->count; s++) {
-                    if (s > 0) kprintf("| ");
+                    if (s > 0) kprintf_raw("| ");
                     for (int a = 0; a < plp->stage[s].argc; a++)
-                        kprintf("%s%s", plp->stage[s].argv[a],
-                                a + 1 < plp->stage[s].argc ? " " : "");
+                        kprintf_raw("%s%s", plp->stage[s].argv[a],
+                                    a + 1 < plp->stage[s].argc ? " " : "");
                 }
-                kprintf("\n");
+                kprintf_raw("\n");
             }
             last = shell_run_pipeline(plp, background);
             if (negate) last = last == 0 ? 1 : 0;
