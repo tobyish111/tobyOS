@@ -6916,17 +6916,23 @@ static void cmd_export(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-        } else if (!env_get(argv[i])) {
+        } else if (env_find(argv[i], nlen) < 0) {
             /* `export X` on a name that does not exist marks it exported
              * WITHOUT creating a value: POSIX says the attribute is set, and
              * bash keeps `${X-unset}` reporting unset until X is assigned.
-             * Creating it empty here would make the two indistinguishable, so
-             * the name is registered with an empty value and the export bit,
-             * which is the closest this table can represent. */
-            if (env_set(argv[i], "") < 0) {
+             * It is DECLARED, with no value (SHVAR_NOVALUE): it reads as
+             * unset and is not passed to a child. tsh created it EMPTY --
+             * and for an ARRAY, whose element 0 was missing, that empty
+             * value became a new element 0: `export a` on a=([1]=x) made
+             * a=([0]="" [1]="x") (fixture 210). */
+            if (env_set_attr_holder(argv[i]) < 0) {
                 kprintf("export: failed to create '%s'\n", argv[i]);
                 shell_set_status(1);
                 continue;
+            }
+            if (sh_array_find(argv[i])) {
+                int ax = env_find(argv[i], nlen);
+                if (ax >= 0) g_env_flags[ax] |= SHVAR_ARRAY;
             }
         }
         int idx = env_find(argv[i], nlen);

@@ -22,4 +22,5 @@ myvar=typeset; v='a b'; $myvar v2=$v; declare -p v2
 p=1 export e1=$v; declare -p e1
 command export e2=$v; declare -p e2
 builtin export e3=$v; declare -p e3
+b[1]=$x; declare -p b
 let lx=( 1 ); let ly=( lx + 2 ); echo $lx $ly
