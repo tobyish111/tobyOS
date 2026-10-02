@@ -22517,6 +22517,110 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
  * integer flag here, and inventing one to satisfy a letter would be a lie in
  * the table rather than a fix.
  */
+/* bash's sh_contains_shell_metas: would this key need quoting as input? */
+static bool shell_has_shell_metas(const char *k) {
+    for (const char *q = k; *q; q++) {
+        switch (*q) {
+        case ' ': case '\t': case '\n': case '\'': case '"': case '\\':
+        case '|': case '&': case ';': case '(': case ')': case '<': case '>':
+        case '!': case '{': case '}': case '*': case '[': case '?': case ']':
+        case '^': case '$': case '`':
+            return true;
+        case '~':
+            if (q == k || q[-1] == '=' || q[-1] == ':') return true;
+            break;
+        case '#':
+            if (q == k) return true;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static bool shell_has_ctl(const char *v) {
+    for (const char *q = v; *q; q++)
+        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f) return true;
+    return false;
+}
+
+/* bash's sh_double_quote: "..." with \ before " \ $ and ` */
+static int shell_double_quote(const char *v, struct shell_sb *out) {
+    if (sb_putc(out, '"') < 0) return -1;
+    for (const char *q = v; *q; q++) {
+        if ((*q == '"' || *q == '\\' || *q == '$' || *q == '`') &&
+            sb_putc(out, '\\') < 0)
+            return -1;
+        if (sb_putc(out, *q) < 0) return -1;
+    }
+    return sb_putc(out, '"');
+}
+
+/* ${a[@]@K}: KEY "VALUE" pairs, one string -- bash's array_to_kvpair and
+ * assoc_to_kvpair (a value with a control byte is $'...'; an associative
+ * key is quoted when it would need it, and every assoc pair is followed by
+ * a blank, the last one too). ${a[@]@k}: the same keys and values as
+ * separate WORDS, unquoted. tsh had neither: "bad substitution" (Oils
+ * 2434). */
+static int shell_expand_array_kv(const char *nm, bool words, bool star,
+                                 struct shell_sb *b) {
+    struct sh_array *arr = sh_array_find(nm);
+    if (!arr || arr->n == 0) return 0;
+    if (words) {
+        char sep = ' ';
+        const char *ifs2 = env_get("IFS");
+        if (ifs2 && *ifs2) sep = ifs2[0];
+        else if (ifs2) sep = '\0';
+        if (!star && sh_put_lead_mark(b) < 0) return -1;
+        for (int i = 0; i < arr->n; i++) {
+            for (int half = 0; half < 2; half++) {
+                if (i > 0 || half > 0) {
+                    if (!star) {
+                        if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+                    } else if (sep && sb_putc(b, sep) < 0) {
+                        return -1;
+                    }
+                }
+                if (half == 0) {
+                    if (arr->e[i].key) {
+                        if (sb_put_data_str(b, arr->e[i].key) < 0) return -1;
+                    } else if (sb_put_uint(b, (unsigned long)arr->e[i].idx) < 0) {
+                        return -1;
+                    }
+                } else if (sb_put_data_str(b, arr->e[i].val) < 0) {
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
+    SH_SB(kv);
+    for (int i = 0; i < arr->n; i++) {
+        const char *v = arr->e[i].val ? arr->e[i].val : "";
+        if (arr->assoc) {
+            const char *k = arr->e[i].key ? arr->e[i].key : "";
+            if (shell_has_ctl(k)) {
+                if (shell_quote_ansic(k, &kv) < 0) return -1;
+            } else if (shell_has_shell_metas(k) ||
+                       ((k[0] == '@' || k[0] == '*') && !k[1])) {
+                if (shell_double_quote(k, &kv) < 0) return -1;
+            } else if (sb_puts(&kv, k) < 0) {
+                return -1;
+            }
+        } else {
+            if (i > 0 && sb_putc(&kv, ' ') < 0) return -1;
+            if (sb_put_uint(&kv, (unsigned long)arr->e[i].idx) < 0) return -1;
+        }
+        if (sb_putc(&kv, ' ') < 0) return -1;
+        if (shell_has_ctl(v) ? shell_quote_ansic(v, &kv) < 0
+                             : shell_double_quote(v, &kv) < 0)
+            return -1;
+        if (arr->assoc && sb_putc(&kv, ' ') < 0) return -1;
+    }
+    return sb_put_data_str(b, kv.p ? kv.p : "");
+}
+
 static int shell_expand_at_transform(const char *name, char opch,
                                      struct shell_sb *b) {
     SH_SB(value);
@@ -22534,9 +22638,12 @@ static int shell_expand_at_transform(const char *name, char opch,
         struct sh_array *arr = sh_array_find(name);
         if (arr && arr->assoc)             at[an++] = 'A';
         else if ((f & SHVAR_ARRAY) || arr) at[an++] = 'a';
+        if (f & SHVAR_INTEGER)             at[an++] = 'i';
         if (f & SHVAR_NAMEREF)             at[an++] = 'n';
         if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
         if (f & SHVAR_EXPORTED)            at[an++] = 'x';
+        if (f & SHVAR_LOWER)               at[an++] = 'l';
+        if (f & SHVAR_UPPER)               at[an++] = 'u';
         at[an] = '\0';
         if (opch == 'a') return sb_put_data_str(b, at);
         /* @A -- the assignment statement. bash prints NOTHING for a name
@@ -22554,7 +22661,11 @@ static int shell_expand_at_transform(const char *name, char opch,
     switch (opch) {
     case 'P':
         return shell_expand_prompt(value.p, b);
-    case 'Q':
+    case 'Q': case 'K': case 'k':
+        /* An UNSET name quotes to nothing, not to '' (bash; Oils 2434).
+         * @K and @k of a scalar are @Q; of an array see
+         * shell_expand_array_kv. */
+        if (!is_set) return 0;
         if (shell_quote_ansic(value.p, &out) < 0) return -1;
         break;
     case 'E':
@@ -22776,6 +22887,10 @@ static bool g_glob_nocase;
 static int shell_expand_element_op(const char *nm, const char *sub,
                                    size_t slen, const char *suffix,
                                    struct shell_sb *b) {
+    /* ${a[0]@a}: the ARRAY's attributes, not the scratch copy's (Oils 2436
+     * 2437) */
+    if (strcmp(suffix, "@a") == 0 && sh_array_find(nm))
+        return shell_expand_at_transform(nm, 'a', b);
     SH_SB(subbuf);
     if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
     SH_SB(display);
@@ -23277,6 +23392,15 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         struct sh_array *arr = sh_array_find(nm);
                         int an = arr ? arr->n : 0;
                         bool star = (sub[0] == '*');
+                        if (strcmp(suffix, "@K") == 0 || strcmp(suffix, "@k") == 0)
+                            return shell_expand_array_kv(nm, suffix[1] == 'k',
+                                                         star, b);
+                        /* @a is the ARRAY's attributes, once per element --
+                         * the scratch scalar has none (Oils 2440) */
+                        SH_SB(attrs);
+                        bool at_a = strcmp(suffix, "@a") == 0;
+                        if (at_a && shell_expand_at_transform(nm, 'a', &attrs) < 0)
+                            return -1;
                         char sep = ' ';
                         const char *ifs2 = env_get("IFS");
                         if (ifs2 && *ifs2) sep = ifs2[0];
@@ -23296,6 +23420,12 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                                     sb_putc(b, sep) < 0) {
                                     return -1;
                                 }
+                            }
+                            if (at_a) {
+                                if (sb_putmem(b, attrs.p ? attrs.p : "",
+                                              attrs.len) < 0)
+                                    return -1;
+                                continue;
                             }
                             /* SHELL_ARRAY_ELEM is a scratch scalar: set it to
                              * this element, then expand "${SHELL_ARRAY_ELEM<op>}"
