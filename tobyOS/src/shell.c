@@ -21682,8 +21682,28 @@ static int shell_expand_substring(const char *name, const char *spec,
     bool have_len = (split != 0);
     if (split) *split = '\0';
     long off = 0, cnt = 0;
-    if (!sh_subscript_eval(sbuf.p, name, false, &off)) off = 0;
-    if (have_len && !sh_subscript_eval(split + 1, name, false, &cnt)) cnt = 0;
+    /* PLAIN ARITHMETIC. These went through the array-subscript evaluator,
+     * whose negative index means "count back from the end of the ARRAY" --
+     * and a scalar is not one, so every negative number came back -1:
+     * `${foo: -4:3}` was "g" and `${foo:3:-2}` "def" (bash: def, de --
+     * Oils 2479 2481 2482). An empty part is 0; an error is the
+     * expansion's (status 1, line dropped). */
+    {
+        int k = sh_subscript_value(sbuf.p, &off);
+        if (k == SARITH_ERROR || k == SARITH_UNBOUND) {
+            if (k == SARITH_ERROR) g_bad_subst_soft = true;
+            return -1;
+        }
+        if (k != SARITH_OK) off = 0;
+        if (have_len) {
+            k = sh_subscript_value(split + 1, &cnt);
+            if (k == SARITH_ERROR || k == SARITH_UNBOUND) {
+                if (k == SARITH_ERROR) g_bad_subst_soft = true;
+                return -1;
+            }
+            if (k != SARITH_OK) cnt = 0;
+        }
+    }
 
     if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
         bool star = (name[0] == '*');
@@ -21797,6 +21817,8 @@ static const char *shell_param_display(const char *name) {
 }
 
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b);
+static bool shell_glob_meta(char c);
+
 
 static int shell_expand_element_op(const char *nm, const char *sub,
                                    size_t slen, const char *suffix,
@@ -21991,7 +22013,48 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     return rc;
 }
 
+/* ${@OP} and ${*OP}, OP one of # % / ^ , @: THE OPERATOR APPLIES TO EACH
+ * POSITIONAL PARAMETER, exactly as ${a[@]OP} does to each element:
+ *
+ *     set -- 1a 2a 3a; argv.py ${@%a}      bash: ['1', '2', '3']
+ *
+ * tsh applied it to the joined text, so only the end of the last one moved
+ * (Oils 2385 2389 2500). They go through the array path on a scratch array
+ * of the parameters (one per nesting level). Returns 1 when handled. */
+static int g_posargs_depth;
+static int shell_expand_posargs_op(const char *expr, struct shell_sb *b, int *rc) {
+    if (!((expr[0] == '@' || expr[0] == '*') && expr[1] &&
+          (expr[1] == '#' || expr[1] == '%' || expr[1] == '/' ||
+           expr[1] == '^' || expr[1] == ',' || expr[1] == '@'))) return 0;
+    char tmp[32];
+    ksnprintf(tmp, sizeof tmp, "SHELL_POSARGS_%d", g_posargs_depth);
+    sh_array_unset_literal(tmp);
+    if (!sh_array_create(tmp)) { *rc = -1; return 1; }
+    for (int i = 0; i < g_positional_count; i++)
+        if (g_positional[i] && sh_array_set(tmp, i, g_positional[i]) < 0) {
+            sh_array_unset_literal(tmp);
+            *rc = -1;
+            return 1;
+        }
+    SH_SB(ex);
+    if (sb_puts(&ex, tmp) < 0 || sb_putc(&ex, '[') < 0 || sb_putc(&ex, expr[0]) < 0 ||
+        sb_putc(&ex, ']') < 0 || sb_puts(&ex, expr + 1) < 0) {
+        sh_array_unset_literal(tmp);
+        *rc = -1;
+        return 1;
+    }
+    g_posargs_depth++;
+    *rc = shell_expand_braced_parameter(ex.p, b);
+    g_posargs_depth--;
+    sh_array_unset_literal(tmp);
+    return 1;
+}
+
 static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b) {
+    {
+        int prc = 0;
+        if (shell_expand_posargs_op(expr, b, &prc)) return prc;
+    }
     if (!expr) return -1;
 
     /* `${##...}` IS `$#` WITH A STRIP OPERATOR, NOT A LENGTH.
@@ -22199,6 +22262,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         if (!sh_subscript_eval(spec.p, nm, false, &off)) off = 0;
                         if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
                             cnt = -1;
+                        /* An EMPTY length is 0, not "the rest": bash's
+                         * `${a[@]::}` and `${a[@]:0:}` are nothing (Oils
+                         * 2496). */
+                        if (colon) {
+                            const char *lq = colon + 1;
+                            while (*lq == ' ' || *lq == '\t') lq++;
+                            if (!*lq) cnt = 0;
+                        }
                         return shell_append_array_slice(b, nm,
                                                         star, off, cnt);
                     }
@@ -22414,12 +22485,57 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * so `${v//$'\n'/|}` matched a pattern wrapped in mark bytes
              * (nothing), a quoted `$'*'` stayed a wildcard, and a `$'\t'`
              * replacement was inserted with its marks still around it. */
-            const char *div = shell_patsub_divider(op);
+            /* A PATTERN THAT BEGINS WITH `/` KEEPS IT: bash looks for the
+             * divider from the pattern's SECOND character, so `${x////c}`
+             * replaces every `/` with c and `${x///}` deletes them (Oils
+             * 2458 2459 2473). Not after a `#`/`%` anchor, which bash
+             * counts as the pattern's first character. */
+            bool lead_slash = (!at_start && !at_end && *op == '/');
+            const char *div = shell_patsub_divider(lead_slash ? op + 1 : op);
             const char *pend = div ? div : op + strlen(op);
             SH_SB(patraw);
             if (sb_putmem(&patraw, op, (size_t)(pend - op)) < 0) return -1;
             op = pend;
             const char *rep = div ? div + 1 : "";
+            /* A TILDE STARTS EACH OF THEM AS A WORD: `${path//~/z}` replaces
+             * $HOME, `${x/b/~}` inserts it (Oils 2355 2474) -- but not after
+             * an anchor (`${x/#~/T}` leaves the ~). The home is literal in
+             * the pattern. */
+            SH_SB(reptl);
+            {
+                if (!at_start && !at_end && patraw.p[0] == '~') {
+                    size_t e = 1;
+                    while (e < patraw.len && patraw.p[e] != '/') e++;
+                    SH_SB(home);
+                    if (shell_tilde_prefix_home(patraw.p + 1, e - 1, &home) > 0) {
+                        SH_SB(np);
+                        for (size_t k = 0; k < home.len; k++) {
+                            char hc = home.p[k];
+                            if ((shell_glob_meta(hc) || hc == '\\' || hc == '\'' ||
+                                 hc == '"' || hc == '$') &&
+                                sb_putc(&np, '\\') < 0) return -1;
+                            if (sb_putc(&np, hc) < 0) return -1;
+                        }
+                        if (sb_putmem(&np, patraw.p + e, patraw.len - e) < 0 ||
+                            sb_set(&patraw, np.p) < 0) return -1;
+                    }
+                }
+                if (rep[0] == '~') {
+                    size_t e = 1;
+                    while (rep[e] && rep[e] != '/') e++;
+                    SH_SB(home);
+                    if (shell_tilde_prefix_home(rep + 1, e - 1, &home) > 0) {
+                        for (size_t k = 0; k < home.len; k++) {
+                            char hc = home.p[k];
+                            if ((hc == '\\' || hc == '\'' || hc == '"' || hc == '$' ||
+                                 hc == '`') && sb_putc(&reptl, '\\') < 0) return -1;
+                            if (sb_putc(&reptl, hc) < 0) return -1;
+                        }
+                        if (sb_puts(&reptl, rep + e) < 0) return -1;
+                        rep = reptl.p;
+                    }
+                }
+            }
 
             SH_SB(patexp);
             if (shell_expand_word_ex(patraw.p, &patexp, true, true) < 0)
