@@ -16904,7 +16904,8 @@ static void cmd_kill(int argc, char **argv) {
      * what the first monitor-mode case tripped over. */
     if (strcmp(argv[1], "--") == 0) {
         first = 2;
-    } else if (strcmp(argv[1], "-l") == 0) {
+    } else if (strcmp(argv[1], "-l") == 0 || strcmp(argv[1], "-L") == 0) {
+        /* -L is bash's other spelling of -l (Oils 0936 0938). */
         if (argc == 2) {
             /* `kill -l` ANSWERS A QUESTION, so its answer belongs on stdout.
              * These went to the diagnostic stream, where `kill -l 134` printed
@@ -16925,17 +16926,19 @@ static void cmd_kill(int argc, char **argv) {
                 if (*q < '0' || *q > '9') { numeric = false; break; }
                 v = v * 10 + (*q - '0');
             }
+            /* bash's words for both kinds of bad operand, and 0 is the
+             * EXIT pseudo-signal (Oils 0938 0941 0942). */
             if (numeric) {
                 /* A status from `wait` encodes the signal in the low bits. */
                 if (v > 128) v -= 128;
-                const char *nm = shell_signal_name(v);
+                const char *nm = v == 0 ? "EXIT" : shell_signal_name(v);
                 if (nm) shell_printf("%s\n", nm);
-                else { kprintf("kill: %s: invalid signal number\n", a);
+                else { kprintf("kill: %s: invalid signal specification\n", a);
                        shell_set_status(1); }
             } else {
                 int num = shell_signal_by_name(a);
                 if (num > 0) shell_printf("%d\n", num);
-                else { kprintf("kill: %s: invalid signal name\n", a);
+                else { kprintf("kill: %s: invalid signal specification\n", a);
                        shell_set_status(1); }
             }
         }
