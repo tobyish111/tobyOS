@@ -4797,6 +4797,22 @@ static struct sh_array **g_arrays;
 static int g_narrays;
 static int g_arrays_cap;
 
+/* Put a whole record into the table (it must not be there already). */
+static int sh_array_table_add(struct sh_array *a) {
+    if (g_narrays >= g_arrays_cap) {
+        int ncap = g_arrays_cap ? g_arrays_cap * 2 : 64;
+        struct sh_array **nt =
+            (struct sh_array **)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) return -1;
+        if (g_narrays) memcpy(nt, g_arrays, (size_t)g_narrays * sizeof *nt);
+        kfree(g_arrays);
+        g_arrays = nt;
+        g_arrays_cap = ncap;
+    }
+    g_arrays[g_narrays++] = a;
+    return 0;
+}
+
 /* Room for one more element. */
 static bool sh_array_reserve(struct sh_array *a) {
     if (a->n < a->cap) return true;
@@ -5696,8 +5712,95 @@ static void shell_print_export_entry(const char *entry) {
  * variables" -- a deep recursion hit that with one local per frame. It moves
  * when it grows; an entry's address is used only inside push and pop. */
 
+struct shell_prefix_one {
+    char *name;
+    char *prev;                 /* strdup of the old value, or NULL */
+    bool  had;
+    bool  was_exported;
+    unsigned char prev_flags;   /* the old entry's flags, when `had` */
+    bool  dead;                 /* removed by `unset`; see g_tempenv */
+    unsigned long seq;          /* g_scope_seq when it was bound */
+};
+
+struct shell_prefix_save {
+    struct shell_prefix_one *v;     /* heap, assignc slots */
+    int   count;
+    int   level;                    /* the scope it belongs to; g_tempenv */
+};
+
+/* SCOPES, AS BASH HAS THEM (variables.c: a stack of VAR_CONTEXTs).
+ *
+ * tsh keeps one flat table of variables. What a scope HID is kept beside
+ * it: a `local` saves the outer value on g_locals, and a prefix assignment
+ * (`v=x f`, `v=x eval ...` -- bash's temporary environment) saves it in a
+ * shell_prefix_save, which g_tempenv now lists while its command runs.
+ * Both are stacks in time order, and scopes nest in time order, so the
+ * entry with the larger g_scope_seq is the INNER one. bash's unset
+ * (makunbound) removes the innermost binding of a name, with one
+ * exception, and tools/agent/probes/dynamic-unset.sh measures each case:
+ *
+ *   - a local of the CURRENT function stays local, with no value;
+ *   - a local of a CALLER is removed, and what it hid comes back:
+ *       l1() { local h=xx; l2; }  l2() { unset h; echo $h; }   -> global
+ *   - a prefix binding is removed the same way, at any depth:
+ *       f() { unset v; echo $v; }; v=global; v=tmp f           -> global
+ *
+ * tsh unset whatever the flat table held, so the caller's local, and the
+ * prefix value, simply vanished until the function returned (Oils 1339,
+ * 0489-0493, 0525-0528). And `local v` with no value TAKES a prefix
+ * binding's value (bash's was_tmpvar in make_local_variable) -- when the
+ * prefix is the function's own, the local IS that binding, so what the
+ * local must give back at the end is what the prefix hid. */
+static unsigned long g_scope_seq;
+static struct shell_prefix_save **g_tempenv;
+static int g_tempenvc;
+static int g_tempenv_cap;
+/* The g_script_depth of the innermost function call's body (its locals),
+ * or 0 outside every function. */
+static int g_fn_local_depth;
+
+static void shell_tempenv_register(struct shell_prefix_save *sv) {
+    if (g_tempenvc >= g_tempenv_cap) {
+        int ncap = g_tempenv_cap ? g_tempenv_cap * 2 : 16;
+        struct shell_prefix_save **nt =
+            (struct shell_prefix_save **)kmalloc((size_t)ncap * sizeof *nt);
+        if (!nt) return;            /* unlisted: unset just won't see it */
+        if (g_tempenvc) memcpy(nt, g_tempenv, (size_t)g_tempenvc * sizeof *nt);
+        kfree(g_tempenv);
+        g_tempenv = nt;
+        g_tempenv_cap = ncap;
+    }
+    g_tempenv[g_tempenvc++] = sv;
+}
+
+static void shell_tempenv_unregister(struct shell_prefix_save *sv) {
+    for (int i = g_tempenvc - 1; i >= 0; i--)
+        if (g_tempenv[i] == sv) {
+            for (int k = i; k + 1 < g_tempenvc; k++) g_tempenv[k] = g_tempenv[k + 1];
+            g_tempenvc--;
+            return;
+        }
+}
+
+/* The innermost live prefix binding of `name`, or 0. */
+static struct shell_prefix_one *shell_tempenv_find(const char *name, int *level) {
+    for (int i = g_tempenvc - 1; i >= 0; i--) {
+        struct shell_prefix_save *sv = g_tempenv[i];
+        for (int k = sv->count - 1; k >= 0; k--) {
+            struct shell_prefix_one *o = &sv->v[k];
+            if (!o->dead && o->name && strcmp(o->name, name) == 0) {
+                if (level) *level = sv->level;
+                return o;
+            }
+        }
+    }
+    return 0;
+}
+
 struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
+    unsigned long seq;    /* g_scope_seq when it was made */
+    bool  dead;           /* removed by a callee's `unset`: no restore */
     char *name;           /* variable name, NUL-terminated */
     /* An ARRAY of the same name is part of the same variable and must be
      * scoped with it -- arrays live in their own table, so saving only the
@@ -5730,13 +5833,45 @@ static int shell_locals_push(const char *name, int depth) {
         g_locals = nl;
         g_local_cap = ncap;
     }
+    /* The innermost binding BEFORE this one: a live prefix binding of the
+     * same scope becomes this local (see g_tempenv). */
+    int tlevel = 0;
+    struct shell_prefix_one *tb = shell_tempenv_find(name, &tlevel);
+    if (tb) {
+        for (int i = g_localc - 1; i >= 0; i--)
+            if (!g_locals[i].dead && g_locals[i].name &&
+                strcmp(g_locals[i].name, name) == 0) {
+                if (g_locals[i].seq > tb->seq) tb = 0;
+                break;
+            }
+    }
+    if (tb && tlevel != depth) tb = 0;
     struct shell_local_save *sv = &g_locals[g_localc];
     sv->name = shell_strdup(name);
     if (!sv->name) return -1;
+    sv->seq = ++g_scope_seq;
+    sv->dead = false;
 
     size_t klen = strlen(name);
     int idx = env_find(name, klen);
-    if (idx >= 0) {
+    if (tb) {
+        /* What the local gives back is what the PREFIX hid; the prefix
+         * binding is now this local and is not restored on its own. */
+        sv->kv = 0;
+        sv->flags = 0;
+        sv->existed = false;
+        if (tb->had && tb->prev) {
+            size_t pl = strlen(tb->prev);
+            sv->kv = (char *)kmalloc(klen + 1 + pl + 1);
+            if (!sv->kv) { kfree(sv->name); sv->name = 0; return -1; }
+            memcpy(sv->kv, name, klen);
+            sv->kv[klen] = '=';
+            memcpy(sv->kv + klen + 1, tb->prev, pl + 1);
+            sv->flags = tb->prev_flags;
+            sv->existed = true;
+        }
+        tb->dead = true;
+    } else if (idx >= 0) {
         sv->kv = shell_strdup(g_env[idx]);
         if (!sv->kv) { kfree(sv->name); sv->name = 0; return -1; }
         sv->flags = g_env_flags[idx];
@@ -5788,16 +5923,85 @@ static int shell_locals_push(const char *name, int depth) {
  * already local in the same function is a no-op. Re-pushing also left two save
  * slots for one variable, so the restore ran twice on the way out. */
 static bool shell_local_declared_here(const char *name, int depth) {
-    for (int i = 0; i < g_localc; i++)
-        if (g_locals[i].depth == depth && strcmp(g_locals[i].name, name) == 0)
-            return true;
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (g_locals[i].depth == depth && !g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0) {
+            /* ...unless a prefix binding made since hides it: `v=x eval
+             * 'local v=y'` in a function is a NEW local, the one that
+             * binding becomes (bash; Oils 0525 0526) */
+            struct shell_prefix_one *tb = shell_tempenv_find(name, 0);
+            return !(tb && tb->seq > g_locals[i].seq);
+        }
     return false;
+}
+
+/* Put back the scalar a local hid (the second half of the restore). */
+static void shell_local_restore_scalar(const struct shell_local_save *sv) {
+    size_t klen = strlen(sv->name);
+    int idx = env_find(sv->name, klen);
+    if (sv->existed) {
+        char *blob = shell_strdup(sv->kv);
+        if (blob) {
+            if (idx >= 0) {
+                kfree(g_env[idx]);
+                g_env[idx] = blob;
+                g_env_flags[idx] = sv->flags;
+            } else if (env_reserve(g_envc + 1)) {
+                g_env_flags[g_envc] = sv->flags;
+                g_env[g_envc++] = blob;
+                g_env[g_envc] = 0;
+            } else {
+                kfree(blob);
+            }
+        }
+    } else if (idx >= 0) {
+        /* It did not exist before the function ran, so it must not exist
+         * after. This is what makes `local x` (no value) mean "unset and
+         * mine" rather than "empty and mine". */
+        env_remove_at(idx);
+    }
+}
+
+static int sh_array_table_add(struct sh_array *a);
+
+/* `unset` of a CALLER's local: what it hid comes back now, and the entry
+ * stays on the stack, dead, so a subshell can revive it (the kernel shell
+ * runs `( )` in place -- shell_scope_frame) -- the saved array is COPIED
+ * back, not moved. */
+static void shell_local_unbind(struct shell_local_save *sv) {
+    sh_array_unset_literal(sv->name);
+    if (sv->arr_existed && sv->arr_saved) {
+        struct sh_array *cp = (struct sh_array *)kmalloc(sizeof *cp);
+        if (cp) {
+            if (sh_array_copy_into(cp, sv->arr_saved) < 0 ||
+                sh_array_table_add(cp) < 0) {
+                sh_array_contents_free(cp);
+                kfree(cp);
+            }
+        }
+    }
+    shell_local_restore_scalar(sv);
+    sv->dead = true;
 }
 
 /* Undo every localisation made at `depth`, newest first. */
 static void shell_locals_pop(int depth) {
     while (g_localc > 0 && g_locals[g_localc - 1].depth >= depth) {
         struct shell_local_save *sv = &g_locals[--g_localc];
+        if (sv->dead) {
+            /* a callee unset it: the outer value is already back, and
+             * whatever was assigned since belongs to the outer scope */
+            if (sv->arr_saved) {
+                sh_array_contents_free(sv->arr_saved);
+                kfree(sv->arr_saved);
+                sv->arr_saved = 0;
+            }
+            kfree(sv->name);
+            kfree(sv->kv);
+            sv->name = 0;
+            sv->kv = 0;
+            continue;
+        }
         /* Drop whatever the function built, then put the caller's array back
          * (if it had one). Mirrors the scalar restore below. */
         sh_array_unset_literal(sv->name);
@@ -5824,34 +6028,54 @@ static void shell_locals_pop(int depth) {
             kfree(sv->arr_saved);
             sv->arr_saved = 0;
         }
-        size_t klen = strlen(sv->name);
-        int idx = env_find(sv->name, klen);
-        if (sv->existed) {
-            char *blob = shell_strdup(sv->kv);
-            if (blob) {
-                if (idx >= 0) {
-                    kfree(g_env[idx]);
-                    g_env[idx] = blob;
-                    g_env_flags[idx] = sv->flags;
-                } else if (env_reserve(g_envc + 1)) {
-                    g_env_flags[g_envc] = sv->flags;
-                    g_env[g_envc++] = blob;
-                    g_env[g_envc] = 0;
-                } else {
-                    kfree(blob);
-                }
-            }
-        } else if (idx >= 0) {
-            /* It did not exist before the function ran, so it must not exist
-             * after. This is what makes `local x` (no value) mean "unset and
-             * mine" rather than "empty and mine". */
-            env_remove_at(idx);
-        }
+        shell_local_restore_scalar(sv);
         kfree(sv->name);
         kfree(sv->kv);
         sv->name = 0;
         sv->kv = 0;
     }
+}
+
+/* The dynamic part of `unset NAME` (see g_scope_seq). True when it removed
+ * a caller's local or a prefix binding; false leaves the ordinary unset,
+ * which is also what a local of the current function gets. */
+static bool shell_unset_dynamic(const char *name) {
+    struct shell_local_save *lv = 0;
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0) {
+            lv = &g_locals[i];
+            break;
+        }
+    struct shell_prefix_one *tb = shell_tempenv_find(name, 0);
+    if (tb && (!lv || tb->seq > lv->seq)) {
+        if (tb->had && tb->prev) {
+            if (env_set(name, tb->prev) < 0) return false;
+            int oi = env_find(name, strlen(name));
+            if (oi >= 0) g_env_flags[oi] = tb->prev_flags;
+        } else {
+            (void)env_unset(name);
+        }
+        tb->dead = true;
+        return true;
+    }
+    if (lv && g_fn_local_depth > 0 && lv->depth < g_fn_local_depth) {
+        shell_local_unbind(lv);
+        return true;
+    }
+    return false;
+}
+
+/* Does `local NAME` (no value) take its value from a prefix binding -- is
+ * the innermost binding of NAME one? */
+static bool shell_local_inherits(const char *name) {
+    struct shell_prefix_one *tb = shell_tempenv_find(name, 0);
+    if (!tb) return false;
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0)
+            return g_locals[i].seq < tb->seq;
+    return true;
 }
 
 /* `local NAME[=VALUE] ...`
@@ -5984,7 +6208,8 @@ static void cmd_local(int argc, char **argv) {
             if (!ln) { shell_set_status(1); return; }
             int n = 0;
             for (int i = 0; i < g_localc; i++) {
-                if (g_locals[i].depth != g_script_depth || !g_locals[i].name)
+                if (g_locals[i].depth != g_script_depth || !g_locals[i].name ||
+                    g_locals[i].dead)
                     continue;
                 bool dup = false;
                 for (int k = 0; k < n; k++)
@@ -6079,6 +6304,7 @@ static void cmd_local(int argc, char **argv) {
         }
 
         bool already = shell_local_declared_here(name, g_script_depth);
+        bool inherit = !already && !has_value && shell_local_inherits(name);
         if (!already && shell_locals_push(name, g_script_depth) < 0) {
             shell_set_status(1);
             continue;
@@ -6091,7 +6317,7 @@ static void cmd_local(int argc, char **argv) {
         }
         if (l_attr_on) {
             /* a fresh local takes the attribute before its value */
-            if (!already) {
+            if (!already && !inherit) {
                 int ox = env_find(name, klen);
                 if (ox >= 0 && !has_value) env_remove_at(ox);
             }
@@ -6099,7 +6325,7 @@ static void cmd_local(int argc, char **argv) {
         }
         if (has_value) {
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
-        } else if (!already && !l_attr_on) {
+        } else if (!already && !l_attr_on && !inherit) {
             /* `local x` DECLARES x, without a value: `declare -p x` is
              * `declare -- x` and every read sees it unset (SHVAR_NOVALUE).
              * It was removed outright, so nothing knew it was local. */
@@ -6770,13 +6996,14 @@ static void cmd_declare(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            bool inherit = !has_value && shell_local_inherits(name);
             if (shell_locals_push(name, g_script_depth) < 0) {
                 shell_set_status(1);
                 continue;
             }
             /* a fresh local starts with no value (bash, without
-             * localvar_inherit) */
-            if (!has_value) {
+             * localvar_inherit) -- unless a prefix binding gives it one */
+            if (!has_value && !inherit) {
                 int ox = env_find(name, klen);
                 if (ox >= 0) env_remove_at(ox);
             }
@@ -7235,6 +7462,14 @@ static void cmd_unset(int argc, char **argv) {
                 kprintf("unset: %s: cannot unset: readonly variable\n", nmb);
                 shell_set_status(1);
                 continue;
+            }
+            /* A whole variable, not a nameref: bash's makunbound decides
+             * which binding goes (see g_scope_seq). */
+            if (bl && !argv[i][bl]) {
+                int ni = env_find(argv[i], bl);
+                bool nref = ni >= 0 && (g_env_flags[ni] & SHVAR_NAMEREF);
+                if ((!nref || ref_only) && shell_unset_dynamic(argv[i]))
+                    continue;
             }
         }
         /* `unset a[1]` drops ONE element and leaves the rest numbered as they
@@ -28156,22 +28391,16 @@ static void shell_printk_bridge_char(void *ctx, char c) {
  * Every one of them, whatever its length: there were 16 slots of 63-byte
  * names, and the 17th prefix -- or a longer name -- was not saved, so it
  * was never put back and outlived the command it belonged to. */
-struct shell_prefix_one {
-    char *name;
-    char *prev;                 /* strdup of the old value, or NULL */
-    bool  had;
-    bool  was_exported;
-};
-
-struct shell_prefix_save {
-    struct shell_prefix_one *v;     /* heap, assignc slots */
-    int   count;
-};
+/* (struct shell_prefix_one and shell_prefix_save are defined with the
+ * `local` stack, which has to see them -- see g_tempenv.) */
 
 static void shell_prefix_capture(struct shell_prefix_save *sv,
                                  char **assignv, int assignc) {
     sv->count = 0;
     sv->v = 0;
+    /* a builtin's prefix is in the caller's scope; a function call sets
+     * its own body's (see the call in shell_run_simple) */
+    sv->level = g_script_depth;
     if (assignc <= 0) return;
     sv->v = (struct shell_prefix_one *)kmalloc((size_t)assignc * sizeof *sv->v);
     if (!sv->v) {
@@ -28195,6 +28424,13 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
         const char *old = env_get(name);
         o->had  = (old != 0);
         o->prev = old ? shell_strdup(old) : 0;
+        o->dead = false;
+        o->seq  = g_scope_seq + 1;
+        o->prev_flags = 0;
+        {
+            int pi = env_find(name, klen);
+            if (pi >= 0) o->prev_flags = g_env_flags[pi];
+        }
         /* The EXPORT ATTRIBUTE is restored too. A prefix assignment exports
          * for the duration of the command; putting the value back while
          * leaving the variable exported would leak it into every later
@@ -28205,11 +28441,21 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
                 (oi >= 0) && (g_env_flags[oi] & SHVAR_EXPORTED) != 0;
         }
     }
+    g_scope_seq++;
+    shell_tempenv_register(sv);
 }
 
 static void shell_prefix_restore(struct shell_prefix_save *sv) {
+    shell_tempenv_unregister(sv);
     for (int i = 0; i < sv->count; i++) {
         struct shell_prefix_one *o = &sv->v[i];
+        /* `unset` removed it (shell_unset_dynamic), or a local of the same
+         * scope took it over: what it hid is already back. */
+        if (o->dead) {
+            kfree(o->prev);
+            kfree(o->name);
+            continue;
+        }
         /* A readonly name was never assigned by its prefix (S4: the
          * assignment is refused and the command runs anyway), so there is
          * nothing to put back -- and trying said "readonly variable" a
@@ -28426,6 +28672,8 @@ static int shell_run_function(struct shell_simple *cmd) {
      * function (regression)"). bash's rule here is finer than "in or out",
      * and until someone can state it, the suspension stays inherited. */
     int local_depth = g_script_depth;
+    int saved_fn_local_depth = g_fn_local_depth;
+    g_fn_local_depth = local_depth;
     /* Re-queue the here-documents the definition swallowed, so the body's
      * `<<EOF` finds its text on THIS call and every later one. Saved and
      * restored around the call because the caller may have a queue of its own
@@ -28505,6 +28753,7 @@ static int shell_run_function(struct shell_simple *cmd) {
      * from the middle of a function reaches here too, which is the whole
      * reason the unwind is here rather than at the end of the body. */
     shell_locals_pop(local_depth);
+    g_fn_local_depth = saved_fn_local_depth;
     g_script_depth--;
     shell_restore_params_from_frame(&frame);
     if (io_active) shell_restore_io_frame(&io_frame);
@@ -28767,6 +29016,7 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             fn_prefix.v = 0;
             if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
                 shell_prefix_capture(&fn_prefix, cmd->argv, assignc);
+                fn_prefix.level = g_script_depth + 1;    /* the body's */
                 restore = true;
                 if (shell_apply_assignments_ex(cmd->argv, assignc, "shell",
                                                true) != 0) {
@@ -32573,7 +32823,67 @@ struct shell_subshell_frame {
      * for its parent: `( shopt -s nullglob )` and `( umask 077 )` stuck. */
     bool *shopt;                    /* heap, one per g_shopts entry */
     int umask;
+    /* The scope stacks' DEAD marks (shell_unset_dynamic): `( unset v )`
+     * of a caller's local must not outlive the parentheses here, where a
+     * subshell runs in place. */
+    int scope_localc;
+    unsigned char *scope_ldead;
+    int scope_nt;
+    unsigned char *scope_tdead;
 };
+
+static void shell_scope_frame_capture(struct shell_subshell_frame *f) {
+    f->scope_localc = g_localc;
+    f->scope_ldead = 0;
+    f->scope_tdead = 0;
+    f->scope_nt = 0;
+    if (g_localc) {
+        f->scope_ldead = (unsigned char *)kmalloc((size_t)g_localc);
+        if (f->scope_ldead)
+            for (int i = 0; i < g_localc; i++) f->scope_ldead[i] = g_locals[i].dead;
+    }
+    int nt = 0;
+    for (int i = 0; i < g_tempenvc; i++) nt += g_tempenv[i]->count;
+    if (nt) {
+        f->scope_tdead = (unsigned char *)kmalloc((size_t)nt);
+        if (f->scope_tdead) {
+            int k = 0;
+            for (int i = 0; i < g_tempenvc; i++)
+                for (int j = 0; j < g_tempenv[i]->count; j++)
+                    f->scope_tdead[k++] = g_tempenv[i]->v[j].dead;
+            f->scope_nt = nt;
+        }
+    }
+}
+
+static void shell_scope_frame_restore(struct shell_subshell_frame *f) {
+    /* Locals made inside go with it, unrestored: the variables themselves
+     * come back with the environment frame. */
+    while (g_localc > f->scope_localc) {
+        struct shell_local_save *sv = &g_locals[--g_localc];
+        if (sv->arr_saved) {
+            sh_array_contents_free(sv->arr_saved);
+            kfree(sv->arr_saved);
+            sv->arr_saved = 0;
+        }
+        kfree(sv->name);
+        kfree(sv->kv);
+        sv->name = 0;
+        sv->kv = 0;
+    }
+    if (f->scope_ldead)
+        for (int i = 0; i < g_localc; i++) g_locals[i].dead = f->scope_ldead[i];
+    if (f->scope_tdead) {
+        int k = 0;
+        for (int i = 0; i < g_tempenvc; i++)
+            for (int j = 0; j < g_tempenv[i]->count && k < f->scope_nt; j++)
+                g_tempenv[i]->v[j].dead = f->scope_tdead[k++];
+    }
+    kfree(f->scope_ldead);
+    kfree(f->scope_tdead);
+    f->scope_ldead = 0;
+    f->scope_tdead = 0;
+}
 
 static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     if (!frame) return;
@@ -32593,6 +32903,10 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     frame->nfd = 0;
     kfree(frame->shopt);
     frame->shopt = 0;
+    kfree(frame->scope_ldead);
+    kfree(frame->scope_tdead);
+    frame->scope_ldead = 0;
+    frame->scope_tdead = 0;
 }
 
 static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
@@ -32633,6 +32947,7 @@ static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
     }
     shell_umask_sync();
     frame->umask = g_shell_umask;
+    shell_scope_frame_capture(frame);
     if (shell_env_frame_capture(&frame->env) < 0 ||
         shell_array_frame_capture(&frame->arrays) < 0 ||
         shell_param_snapshot_capture(&frame->params) < 0 ||
@@ -32655,6 +32970,7 @@ static void shell_subshell_frame_restore(struct shell_subshell_frame *frame) {
     shell_function_frame_restore(&frame->functions);
     shell_readonly_frame_restore(&frame->readonly);
     shell_trap_restore(&frame->traps);
+    shell_scope_frame_restore(frame);
     shell_restore_opts(&frame->opts);
     if (frame->shopt) {
         for (size_t i = 0; g_shopts[i].name; i++)
