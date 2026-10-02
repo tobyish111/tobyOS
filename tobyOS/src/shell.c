@@ -18955,12 +18955,15 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
             while (wcopy.len > 0 && (wcopy.p[wcopy.len - 1] == ' ' ||
                                      wcopy.p[wcopy.len - 1] == '\t'))
                 sb_truncate(&wcopy, wcopy.len - 1);
+            /* The SUBSTITUTION's status, as the forked path records it
+             * below: `x=$(< missing)` is status 1 in bash, and tsh set $?
+             * instead -- which the assignment then overwrote with 0. */
             if (shell_capture_read_file(wcopy.p, out) < 0) {
                 sb_truncate(out, 0);
-                shell_set_status(1);
+                g_capture_last_status = 1;
                 return 0;
             }
-            shell_set_status(0);
+            g_capture_last_status = 0;
             return 0;
         }
     }
@@ -26360,6 +26363,14 @@ static struct file *shell_open_dev_node(const char *path) {
 #endif
 }
 
+/* A FAILED OPEN IS REPORTED IN BASH'S WORDS: "FILE: Strerror", whatever
+ * the command -- builtin, program, function or compound:
+ *
+ *     { echo x; } > /no/such/f     bash: /no/such/f: No such file or directory
+ *                                  tsh:  group: '/no/such/f': no such file ...
+ *
+ * The label stays for the path-resolution message; the redirection's own
+ * error never named the command in bash. */
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label) {
     char path[VFS_PATH_MAX];
@@ -26373,18 +26384,18 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         struct vfs_stat st;
         int sr = vfs_stat(path, &st);
         if (sr == VFS_OK && st.type == VFS_TYPE_DIR) {
-            kprintf("%s: '%s': is a directory\n", label, path_arg);
+            kprintf("%s: Is a directory\n", path_arg);
             return 0;
         }
         if (append) {
             if (sr == VFS_ERR_NOENT) {
                 int cr = vfs_create(path);
                 if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
-                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+                    kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
                     return 0;
                 }
             } else if (sr != VFS_OK) {
-                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+                kprintf("%s: %s\n", path_arg, shell_errno_text(sr));
                 return 0;
             }
         } else {
@@ -26402,18 +26413,17 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                 if (st.type == VFS_TYPE_FILE) {
                     int tr = vfs_truncate(path, 0);
                     if (tr != VFS_OK) {
-                        kprintf("%s: '%s': %s\n", label, path_arg,
-                                vfs_strerror(tr));
+                        kprintf("%s: %s\n", path_arg, shell_errno_text(tr));
                         return 0;
                     }
                 }
             } else if (sr != VFS_ERR_NOENT) {
-                kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+                kprintf("%s: %s\n", path_arg, shell_errno_text(sr));
                 return 0;
             } else {
                 int cr = vfs_create(path);
                 if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
-                    kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+                    kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
                     return 0;
                 }
             }
@@ -26445,7 +26455,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
     int rc = vfs_open(path, &f->vfs);
 #endif
     if (rc != VFS_OK) {
-        kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(rc));
+        kprintf("%s: %s\n", path_arg, shell_errno_text(rc));
         kfree(f->vfs_refs);
         kfree(f);
         return 0;
@@ -26707,11 +26717,11 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
     if (sr == VFS_ERR_NOENT) {
         int cr = vfs_create(path);
         if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
-            kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(cr));
+            kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
             return 0;
         }
     } else if (sr != VFS_OK) {
-        kprintf("%s: '%s': %s\n", label, path_arg, vfs_strerror(sr));
+        kprintf("%s: %s\n", path_arg, shell_errno_text(sr));
         return 0;
     }
     return shell_open_vfs_file(path_arg, false, false, label);
@@ -29616,8 +29626,6 @@ static bool shell_try_arith_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!(s[0] == '(' && s[1] == '(')) return false;
     s += 2;
-    shell_run_debug_trap();            /* `(( ))` is a command (1182) */
-    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     /* Find the `))` that closes it. A nested `(` inside the expression is
      * ordinary grouping and must not be mistaken for the end. */
@@ -29645,13 +29653,29 @@ static bool shell_try_arith_command(const char *src) {
     if (!end) return false;
 
     /* Anything after `))` other than a separator or a redirection means this
-     * was not an arithmetic command after all. */
+     * was not an arithmetic command after all. A redirection may start with
+     * a digit or `&` too -- `(( 2 )) 2>/dev/null` -- and tsh sent that to
+     * the subshell parser, which ran `2` as a command (127). */
     const char *tail = shell_skip_blanks(end + 2);
-    if (*tail && *tail != ';' && *tail != '\n' && *tail != '<' && *tail != '>')
+    if (*tail && *tail != ';' && *tail != '\n' && *tail != '<' && *tail != '>' &&
+        *tail != '&' && !(*tail >= '0' && *tail <= '9'))
         return false;
 
+    /* THE REDIRECTIONS ARE IN PLACE WHILE IT RUNS -- `(( x = 7 )) > f`
+     * creates f, `(( 1/0 )) 2>f` puts the error there. They were accepted
+     * and never applied. Entered the way [[ ]], `if` and `case` do it. */
+    if (*tail && *tail != ';' && *tail != '\n' &&
+        shell_compound_tail_redirs(src, end + 2, "(("))
+        return true;
+    shell_run_debug_trap();            /* `(( ))` is a command (1182) */
+    if (g_shell_flow != SHELL_FLOW_NONE) return true;
+
+    /* The text EXACTLY as written between the parentheses: bash's error
+     * message skips its leading blanks but keeps the trailing ones --
+     * "((: 1/0 : division by 0 (error token is "0 ")" -- and the segment
+     * copy trimmed both. */
     SH_SB(expr);
-    if (shell_copy_segment_sb(&expr, s, end) < 0) return false;
+    if (sb_putmem(&expr, s, (size_t)(end - s)) < 0) return false;
 
     /* The expression is expanded first, exactly as `$(( ))` is: the evaluator
      * resolves bare names itself but knows nothing about `$( )` or `${ }`.
@@ -30220,7 +30244,6 @@ static bool shell_try_arith_for_command(const char *src) {
     shell_run_debug_trap();                     /* init (1191) */
     if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
     if (!shell_arith_for_eval(exprs[0], &v)) {
-        kprintf("for: bad arithmetic expression: %s\n", exprs[0]);
         last = 1;
         goto done;
     }
@@ -30230,8 +30253,7 @@ static bool shell_try_arith_for_command(const char *src) {
         shell_run_debug_trap();                 /* the condition */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[1], &v)) {
-            kprintf("for: bad arithmetic expression: %s\n", exprs[1]);
-            last = 1;
+                last = 1;
             goto done;
         }
         if (v == 0) goto done;
@@ -30267,8 +30289,7 @@ static bool shell_try_arith_for_command(const char *src) {
         shell_run_debug_trap();                 /* the step */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[2], &v)) {
-            kprintf("for: bad arithmetic expression: %s\n", exprs[2]);
-            last = 1;
+                last = 1;
             goto done;
         }
     }
