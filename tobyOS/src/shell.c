@@ -3725,9 +3725,11 @@ static int shell_function_set(const char *name, const char *body) {
         return -1;
     /* -2: refused, and already said why -- the definition site must not
      * add "failed to define" under bash's "g: readonly function". */
-    if (shell_special_builtin_name(name)) {
-        kprintf("%s: cannot define a function with a special builtin name\n",
-                name);
+    /* A SPECIAL BUILTIN'S NAME IS FREE outside posix mode: bash defines
+     * `eval() { ...; }` and then runs it (Oils 1167 1168 1172). Under
+     * `set -o posix` it refuses, in its own words. */
+    if (g_opt_posix && shell_special_builtin_name(name)) {
+        kprintf("`%s': is a special builtin\n", name);
         return -2;
     }
     {
@@ -6803,11 +6805,54 @@ static void cmd_export(int argc, char **argv) {
                 shell_print_export_entry(g_env[i]);
         return;
     }
+    /* OPTIONS: -p lists, -n takes the export attribute AWAY (the value
+     * stays), -f names functions. tsh knew only a leading -p; `export -n x`
+     * called `-n` not a valid identifier (Oils 1316-1318). */
     int start = 1;
-    if (strcmp(argv[1], "-p") == 0) start = 2;
+    bool unexport = false, funcs = false, list = false;
+    for (; start < argc && argv[start][0] == '-' && argv[start][1]; start++) {
+        if (strcmp(argv[start], "--") == 0) { start++; break; }
+        for (const char *q = argv[start] + 1; *q; q++) {
+            if (*q == 'n') unexport = true;
+            else if (*q == 'f') funcs = true;
+            else if (*q == 'p') list = true;
+            else {
+                kprintf("export: -%c: invalid option\n", *q);
+                kprintf_raw("export: usage: export [-fn] [name[=value] ...] or "
+                            "export -p\n");
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    if (start >= argc && list) {
+        for (int i = 0; i < g_envc; i++)
+            if (g_env_flags[i] & SHVAR_EXPORTED)
+                shell_print_export_entry(g_env[i]);
+        return;
+    }
+    if (funcs) {
+        /* functions are not exported to children here; say which names are
+         * not functions, as bash does */
+        for (int i = start; i < argc; i++)
+            if (!shell_function_lookup(argv[i])) {
+                kprintf("export: %s: not a function\n", argv[i]);
+                shell_set_status(1);
+            }
+        return;
+    }
     for (int i = start; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
+        if (unexport && shell_name_is_valid(argv[i], nlen)) {
+            if (argv[i][klen] == '=' && env_set_kv(argv[i]) < 0) {
+                shell_set_status(1);
+                continue;
+            }
+            int ux = env_find(argv[i], nlen);
+            if (ux >= 0) g_env_flags[ux] &= ~(unsigned char)SHVAR_EXPORTED;
+            continue;
+        }
         if (!shell_name_is_valid(argv[i], nlen)) {
             /* bash names an ELEMENT by itself (`a[1]`), anything else by
              * the whole word (`1a=b`). */
@@ -8912,6 +8957,13 @@ static void cmd_pwd(int argc, char **argv) {
 
 static const char *shell_errno_text(int err);
 
+/* `-L`, `-P`, `-e`, `-@` and their combinations: cd's own options */
+static bool strchr_opt_ok(const char *a) {
+    for (const char *q = a + 1; *q; q++)
+        if (*q != 'L' && *q != 'P' && *q != 'e' && *q != '@') return false;
+    return true;
+}
+
 static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
@@ -8924,6 +8976,20 @@ static void cmd_cd(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--") == 0) {
         argv++;
         argc--;
+    }
+    /* ONE DIRECTORY: `cd foo bar` is "cd: too many arguments", status 1,
+     * and nothing changes (bash; Oils 0720 0721). tsh went to foo. The
+     * options -L / -P (and -e, -@) come before it. */
+    {
+        int k = 1;
+        while (k < argc && argv[k][0] == '-' && argv[k][1] &&
+               strcmp(argv[k], "-") != 0 && strchr_opt_ok(argv[k]))
+            k++;
+        if (argc - k > 1) {
+            kprintf("cd: too many arguments\n");
+            shell_set_status(1);
+            return;
+        }
     }
     if (argc <= 1) {
         target = env_get("HOME");
@@ -9028,11 +9094,41 @@ static void cmd_false(int argc, char **argv) {
     shell_set_status(1);
 }
 
+static bool shell_glob_match(const char *pat, const char *name);
 static void cmd_help(int argc, char **argv) {
-    (void)argc; (void)argv;
-    shell_write("commands:\n");
-    for (const struct cmd *c = cmds; c->name; c++) {
-        shell_printf("  %-8s  %s\n", c->name, c->help);
+    shell_set_status(0);
+    int first = 1;
+    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) { first++; break; }
+        first++;                        /* -d -m -s: one form here */
+    }
+    if (first >= argc) {
+        shell_write("commands:\n");
+        for (const struct cmd *c = cmds; c->name; c++) {
+            shell_printf("  %-8s  %s\n", c->name, c->help);
+        }
+        return;
+    }
+    /* `help PATTERN`: the builtins whose names it matches, as a glob or a
+     * prefix (bash: `help ec` is echo's), and when none does bash's words
+     * and status 1 (Oils 0645). It printed the whole list whatever it was
+     * asked. The text is tsh's own one line per builtin. */
+    for (int i = first; i < argc; i++) {
+        bool any = false;
+        size_t pl = strlen(argv[i]);
+        for (const struct cmd *c = cmds; c->name; c++) {
+            if (shell_cmd_lookup(c->name) != c) continue;   /* hidden here */
+            if (strncmp(c->name, argv[i], pl) != 0 &&
+                !shell_glob_match(argv[i], c->name))
+                continue;
+            shell_printf("%s: %s\n", c->name, c->help);
+            any = true;
+        }
+        if (!any) {
+            kprintf("help: no help topics match `%s'.  Try `help help' or "
+                    "`man -k %s' or `info %s'.\n", argv[i], argv[i], argv[i]);
+            shell_set_status(1);
+        }
     }
 }
 
@@ -14882,22 +14978,52 @@ static int shell_status_arg(int argc, char **argv, int def, const char *label,
                             bool *ok) {
     *ok = true;
     if (argc <= 1) return def;
-    int v = 0;
-    if (parse_int(argv[1], &v) < 0 || v < 0 || v > 255) {
-        kprintf("%s: numeric argument required\n", label);
+    /* bash's get_exitstat: any decimal number -- blanks around it, a sign,
+     * 64 bits -- and the status is its low byte: `exit 256` is 0, `exit -1`
+     * 255, `return 300` 44. tsh refused all but 0..255, and its message
+     * left out what it refused ("exit: abc: numeric argument required"). */
+    const char *a = argv[1];
+    const char *q = a;
+    while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+    bool neg = false;
+    if (*q == '-' || *q == '+') neg = (*q++ == '-');
+    unsigned long long mag = 0;
+    bool digits = false, over = false;
+    while (*q >= '0' && *q <= '9') {
+        unsigned long long nm = mag * 10ull + (unsigned long long)(*q - '0');
+        if (nm / 10ull != mag) over = true;
+        mag = nm;
+        digits = true;
+        q++;
+    }
+    while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+    if (!digits || *q || over) {
+        kprintf("%s: %s: numeric argument required\n", label, a);
         *ok = false;
         return 2;
     }
-    return v;
+    unsigned long long v = neg ? (0ull - mag) : mag;
+    return (int)(v & 0xFFull);
 }
 
 static int g_shell_break_depth;
 
 static void cmd_break(int argc, char **argv) {
+    /* TOO MANY ARGUMENTS ends the whole command, loop and all (bash's
+     * no_args: DISCARD) -- `continue 1 2 3` in a loop does not go round
+     * again (Oils 1823). A bad first operand is still its own error. */
     if (argc > 2) {
-        kprintf("break: too many arguments\n");
-        shell_set_status(2);
-        return;
+        int nn = 0;
+        if (parse_int(argv[1], &nn) == 0 && nn > 0) {
+            kprintf("break: too many arguments\n");
+            shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
+            return;
+        }
+        argc = 2;
     }
     /* BREAK OUTSIDE A LOOP IS NOT AN ERROR. bash and mksh do nothing and
      * return 0; tsh returned 1, which turned `if break; then echo hi; fi`
@@ -14929,10 +15055,21 @@ static void cmd_break(int argc, char **argv) {
 }
 
 static void cmd_continue(int argc, char **argv) {
+    /* TOO MANY ARGUMENTS ends the whole command, loop and all (bash's
+     * no_args: DISCARD) -- `continue 1 2 3` in a loop does not go round
+     * again (Oils 1823). A bad first operand is still its own error. */
     if (argc > 2) {
-        kprintf("continue: too many arguments\n");
-        shell_set_status(2);
-        return;
+        int nn = 0;
+        if (parse_int(argv[1], &nn) == 0 && nn > 0) {
+            kprintf("continue: too many arguments\n");
+            shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
+            return;
+        }
+        argc = 2;
     }
     if (g_shell_loop_depth <= 0) {          /* see cmd_break */
         shell_set_status(0);
@@ -14954,6 +15091,7 @@ static void cmd_continue(int argc, char **argv) {
 }
 
 static void cmd_return(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
     if (argc > 2) {
         kprintf("return: too many arguments\n");
         shell_set_status(2);
@@ -14971,25 +15109,30 @@ static void cmd_return(int argc, char **argv) {
     }
     bool ok = true;
     int st = shell_status_arg(argc, argv, g_shell_prev_status, "return", &ok);
-    if (!ok) {
-        shell_set_status(st);
-        return;
-    }
+    /* a bad operand is reported and the function STILL returns, with 2 */
     g_shell_flow = SHELL_FLOW_RETURN;
     g_shell_flow_status = st;
     shell_set_status(st);
 }
 
 static void cmd_exit(int argc, char **argv) {
-    if (argc > 2) {
-        kprintf("exit: too many arguments\n");
-        shell_set_status(2);
-        return;
-    }
+    if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
+    /* TOO MANY ARGUMENTS does not exit: bash (get_exitstat, no_args) says
+     * so, drops the rest of the line and goes on with status 1 -- once the
+     * first is a number; a non-number is still the error that exits 2
+     * (Oils 1056). tsh gave 2 and kept the line. */
     bool ok = true;
-    int st = shell_status_arg(argc, argv, g_shell_prev_status, "exit", &ok);
-    if (!ok) {
-        shell_set_status(st);
+    /* A bad operand is reported and the shell STILL exits, with 2 (bash) --
+     * tsh set $? and carried on. Only the first operand is looked at. */
+    int st = shell_status_arg(argc > 2 ? 2 : argc, argv, g_shell_prev_status,
+                              "exit", &ok);
+    if (ok && argc > 2) {
+        kprintf("exit: too many arguments\n");
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
         return;
     }
     shell_set_status(st);
@@ -15326,10 +15469,27 @@ static void cmd_exec(int argc, char **argv) {
     /* `--` ends exec's options, as for every builtin: `exec -- ls` runs ls,
      * where this looked for a program called `--`. */
     int i = 1;
+    /* `exec -a NAME cmd` runs cmd with NAME as its argv[0] (bash; Oils
+     * 1053) -- tsh looked for a program called `-a`. */
+    const char *as_name = 0;
+    if (i + 1 < argc && strcmp(argv[i], "-a") == 0) {
+        as_name = argv[i + 1];
+        i += 2;
+    }
     if (i < argc && strcmp(argv[i], "--") == 0) i++;
     if (i >= argc) return;
     g_spawn_for = "exec";
-    shell_spawn_program(argv[i], argc - i, &argv[i], /*background=*/false);
+    if (as_name) {
+        char **av = (char **)kmalloc((size_t)(argc - i + 1) * sizeof(char *));
+        if (!av) { g_spawn_for = 0; shell_set_status(1); return; }
+        for (int k = i; k < argc; k++) av[k - i] = argv[k];
+        av[argc - i] = 0;
+        av[0] = (char *)as_name;
+        shell_spawn_program(argv[i], argc - i, av, /*background=*/false);
+        kfree(av);
+    } else {
+        shell_spawn_program(argv[i], argc - i, &argv[i], /*background=*/false);
+    }
     g_spawn_for = 0;
     if (g_last_status == 0 && g_script_depth > 0) {
         g_shell_flow = SHELL_FLOW_EXIT;
@@ -15351,14 +15511,29 @@ static void cmd_command(int argc, char **argv) {
         else if (strcmp(argv[i], "-p") == 0) { use_default_path = true; i++; }
         else break;
     }
-    (void)use_default_path;
     if (i >= argc) {
         shell_set_status(0);
         return;
     }
 
+    /* `command -p` looks the name up in the standard path, not $PATH (Oils
+     * 0970): the variable is swapped for the lookup alone. */
+    SH_SB(saved_path);
+    bool had_path = false;
+    if (use_default_path) {
+        const char *pv = env_get("PATH");
+        had_path = pv != 0;
+        if (had_path && sb_puts(&saved_path, pv) < 0) return;
+        (void)env_set("PATH", "/bin:/usr/bin");
+    }
+#define COMMAND_P_RESTORE() do { if (use_default_path) { \
+        if (had_path) (void)env_set("PATH", saved_path.p); \
+        else (void)env_unset("PATH"); } } while (0)
+
     if (locate || verbose) {
-        int rc = 0;
+        /* bash: success when ANY name was found, and -V says which were
+         * not -- "command: NAME: not found" (Oils 0962 0966). */
+        bool any_found = false;
         for (; i < argc; i++) {
             bool found = false;
             int aidx = shell_alias_find(argv[i]);
@@ -15372,7 +15547,7 @@ static void cmd_command(int argc, char **argv) {
                 }
                 found = true;
             }
-            if (found) continue;
+            if (found) { any_found = true; continue; }
             /* A RESERVED WORD IS A COMMAND NAME TOO. `command -v for`
              * prints "for" and `command -V for` calls it a shell keyword;
              * this knew nothing about keywords and went looking for a
@@ -15380,6 +15555,7 @@ static void cmd_command(int argc, char **argv) {
             if (shell_word_is_keyword(argv[i])) {
                 shell_printf(verbose ? "%s is a shell keyword\n" : "%s\n",
                              argv[i]);
+                any_found = true;
                 continue;
             }
             struct shell_function *fn = shell_function_lookup(argv[i]);
@@ -15389,7 +15565,7 @@ static void cmd_command(int argc, char **argv) {
                 if (verbose) shell_print_function_def(argv[i], fn->body);
                 found = true;
             }
-            if (found) continue;
+            if (found) { any_found = true; continue; }
             /* Classify through shell_cmd_lookup, not the raw table: the
              * hosted build's allow-list is part of what "is a builtin"
              * MEANS there, and scanning cmds[] made `command -v newgrp`
@@ -15404,7 +15580,7 @@ static void cmd_command(int argc, char **argv) {
                     found = true;
                 }
             }
-            if (found) continue;
+            if (found) { any_found = true; continue; }
             char path_buf[64];
             int how = CMDRES_NONE;
             const char *path = resolve_program_ex(argv[i], path_buf,
@@ -15415,11 +15591,13 @@ static void cmd_command(int argc, char **argv) {
                  * /bin/newgrp in every shell. */
                 if (verbose) shell_printf("%s is %s\n", argv[i], path);
                 else         shell_printf("%s\n", path);
-            } else {
-                rc = 1;
+                any_found = true;
+            } else if (verbose) {
+                kprintf("command: %s: not found\n", argv[i]);
             }
         }
-        shell_set_status(rc);
+        COMMAND_P_RESTORE();
+        shell_set_status(any_found ? 0 : 1);
         return;
     }
 
@@ -15434,13 +15612,28 @@ static void cmd_command(int argc, char **argv) {
     {
         const struct cmd *c = shell_cmd_lookup(argv[i]);
         if (c) {
+            COMMAND_P_RESTORE();
             c->fn(argc - i, &argv[i]);
             return;
         }
     }
+    if (use_default_path) {
+        /* resolved in the standard path; run with the caller's $PATH */
+        char pbuf[VFS_PATH_MAX];
+        int how = CMDRES_NONE;
+        const char *rp = resolve_program_ex(argv[i], pbuf, sizeof pbuf, &how);
+        SH_SB(found_at);
+        bool okp = cmd_res_is_file(how) && rp && sb_puts(&found_at, rp) == 0;
+        COMMAND_P_RESTORE();
+        shell_spawn_program_profile(okp ? found_at.p : argv[i], argc - i,
+                                    &argv[i], /*background=*/false,
+                                    /*profile=*/0);
+        return;
+    }
     shell_spawn_program_profile(argv[i], argc - i, &argv[i],
                                 /*background=*/false, /*profile=*/0);
 }
+#undef COMMAND_P_RESTORE
 
 /* Every $PATH match for `name`, in $PATH order -- what `type -a` reports,
  * as against the FIRST match that every other caller wants.
@@ -18772,6 +18965,20 @@ static void cmd_history(int argc, char **argv) {
  * lets `cd() { builtin cd "$@"; ...; }` work instead of recursing forever,
  * which is the only reason this builtin exists. */
 static void cmd_builtin(int argc, char **argv) {
+    /* `--` ends the options and an option is an error (bash): `builtin --`
+     * is status 0 and `builtin -- false` runs false (Oils 0976); tsh looked
+     * for a builtin called `--`. */
+    if (argc >= 2 && argv[1][0] == '-' && argv[1][1]) {
+        if (strcmp(argv[1], "--") == 0) {
+            argc--;
+            argv++;
+        } else {
+            kprintf("builtin: %s: invalid option\n", argv[1]);
+            kprintf_raw("builtin: usage: builtin [shell-builtin [arg ...]]\n");
+            shell_set_status(2);
+            return;
+        }
+    }
     if (argc < 2) { shell_set_status(0); return; }
     const struct cmd *c = shell_cmd_lookup(argv[1]);
     if (!c) {
@@ -29438,8 +29645,12 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             return 0;
         }
 
+        /* ...and outside posix mode a FUNCTION of that name is found
+         * first, as for any builtin; posix mode finds the special builtin
+         * (POSIX's order) whatever is defined. */
         const struct cmd *special = shell_cmd_lookup(exec_cmd.argv[0]);
-        if (special && shell_special_builtin_name(special->name)) {
+        if (special && shell_special_builtin_name(special->name) &&
+            (g_opt_posix || !shell_function_lookup(exec_cmd.argv[0]))) {
             /* A PREFIX ON A SPECIAL BUILTIN DOES NOT PERSIST -- in bash.
              *
              *     pre=1 readonly x=x
@@ -31715,10 +31926,24 @@ static bool shell_try_for_command(const char *src) {
     s = shell_skip_blanks(s + 3);
 
     const char *name_start = s;
-    if (!shell_var_start(*s)) {
-        kprintf("for: bad variable name\n");
-        shell_set_status(2);
-        return true;
+    /* NOT A NAME: bash's words, status 1, and the script goes on (Oils
+     * 1808) -- tsh said "for: bad variable name" and gave 2. The word is
+     * everything up to the next blank or separator. */
+    {
+        const char *e = s;
+        while (shell_var_char(*e)) e++;
+        bool bad = !shell_var_start(*s) ||
+                   !(*e == ' ' || *e == '\t' || *e == '\n' || *e == ';' ||
+                     *e == '\0');
+        if (bad) {
+            const char *we = s;
+            while (*we && *we != ' ' && *we != '\t' && *we != '\n' &&
+                   *we != ';')
+                we++;
+            kprintf("`%.*s': not a valid identifier\n", (int)(we - s), s);
+            shell_set_status(1);
+            return true;
+        }
     }
     while (shell_var_char(*s)) s++;
     size_t name_len = (size_t)(s - name_start);
