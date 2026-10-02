@@ -2567,8 +2567,23 @@ static int sh_array_store_expanded(const char *name, const char *ex,
 /* The elements of the literal at `p` (just past its `(`), into the array
  * `dst`. `name` is the array being assigned, which the elements' own
  * expansions read -- see sh_array_assign_literal. */
+static int sh_array_literal_fill_ex(const char *dst, const char *name,
+                                    const char *p, bool append, long *nextp,
+                                    bool plain_only);
+static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
+                            int depth);
 static int sh_array_literal_fill(const char *dst, const char *name,
                                  const char *p, bool append, long next) {
+    return sh_array_literal_fill_ex(dst, name, p, append, &next, false);
+}
+
+/* `plain_only`: every word is an ordinary element, even one that looks
+ * like `[k]=v` -- the words a brace expansion made of one. `*nextp` is the
+ * index the next ordinary element takes, and comes back advanced. */
+static int sh_array_literal_fill_ex(const char *dst, const char *name,
+                                    const char *p, bool append, long *nextp,
+                                    bool plain_only) {
+    long next = *nextp;
     /* An element's text is a piece of the literal, so the literal's length
      * always holds one; it was 512 bytes, and a longer element was cut
      * short without a word. */
@@ -2648,14 +2663,39 @@ static int sh_array_literal_fill(const char *dst, const char *name,
          * VALUE: the count came out right (2) while every lookup returned
          * empty, which is the failure mode a count-only assertion misses. */
         if (elem[0] == '[') {
+            /* THE `]` THAT CLOSES THE `[`: a key may index the array itself,
+             * `[a[0]]=10` (Oils 0245), and the first `]` cut it short. */
             char *rb = 0;
-            for (char *q = elem + 1; *q; q++) if (*q == ']') { rb = q; break; }
+            {
+                int bd = 0;
+                for (char *q = elem; *q; q++) {
+                    if (*q == '[') bd++;
+                    else if (*q == ']' && --bd == 0) { rb = q; break; }
+                }
+            }
             /* AN ELEMENT MAY APPEND: `a=([k]=1 [k]+=2)` leaves `12` there.
              * Only `]=` was accepted, so `[k]+=2` matched nothing and fell
              * through to the bare-word path -- it became the literal VALUE
              * `[hello]+=2` at the next free index, which reads like the
              * feature working until you look at what is in the array. */
             bool eplus = (rb && rb[1] == '+' && rb[2] == '=');
+            /* AN INDEXED ARRAY'S `[k]=v` IS BRACE-EXPANDED, and what that
+             * makes are ordinary elements: `a=([k2]=-{a,b}-)` is
+             * ([0]="[k2]=-a-" [1]="[k2]=-b-") in bash (Oils 0250). An
+             * associative literal leaves the braces alone, as tsh did for
+             * both. */
+            if (rb && (rb[1] == '=' || eplus) && !sh_array_is_assoc(dst) &&
+                !plain_only) {
+                SH_SB(bx);
+                if (shell_brace_word(elem, n, &bx, 0) < 0) return -1;
+                if (bx.len != n || memcmp(bx.p, elem, n) != 0) {
+                    if (sh_array_literal_fill_ex(dst, name, bx.p, append,
+                                                 &next, true) < 0)
+                        return -1;
+                    continue;
+                }
+            }
+            if (plain_only) rb = 0;
             if (rb && (rb[1] == '=' || eplus)) {
                 *rb = '\0';
                 const char *k = elem + 1, *v = rb + (eplus ? 3 : 2);
@@ -2675,8 +2715,11 @@ static int sh_array_literal_fill(const char *dst, const char *name,
                 if (shell_argmarks_to_spaces(vraw.p, &vx) < 0)
                     return -1;
                 /* An assignment's RHS tilde-expands, after the `=` and
-                 * after each `:` -- shell_word_tilde owns that rule. */
-                if (shell_word_tilde(&vx) < 0) return -1;
+                 * after each `:` -- shell_word_tilde owns that rule. Not in
+                 * an associative literal: bash 5.2 leaves `([h]=~)` alone
+                 * there (Oils 0237). */
+                if (!sh_array_is_assoc(dst) && shell_word_tilde(&vx) < 0)
+                    return -1;
                 if (sh_array_is_assoc(dst)) {
                     SH_SB(kraw);
                     SH_SB(kx);
@@ -2792,6 +2835,7 @@ static int sh_array_literal_fill(const char *dst, const char *name,
     }
     /* An odd number of bare words leaves the last KEY holding "". */
     if (pend_key && sh_array_set_key(dst, pend.p, "") < 0) return -1;
+    *nextp = next;
     return 0;
 }
 
@@ -5498,6 +5542,50 @@ static bool sh_array_is_assoc(const char *name) {
     return a && a->assoc;
 }
 
+/* `declare -a NAME` / `declare -A NAME` ON A VARIABLE THAT EXISTS, as bash's
+ * declare_internal (tools/agent/probes/literal-declare-edges.sh):
+ *
+ *     q=(1 2); declare -A q    "q: cannot convert indexed to associative
+ *                              array", status 1, q unchanged (and -a on an
+ *                              associative one the other way round)
+ *     x=v; declare -A x        x=([0]="v")    convert_var_to_assoc
+ *     w=v; declare -a w        w=([0]="v")    convert_var_to_array
+ *
+ * tsh turned the indexed array associative in place -- its elements were
+ * left with no keys, `declare -p` printed `[]="1"` -- and a scalar's value
+ * was dropped (Oils 0251 0253). */
+static int sh_array_absorb_scalar(const char *name);
+static int shell_decl_convert(const char *name, bool assoc, const char *label) {
+    struct sh_array *a = sh_array_find(name);
+    if (a) {
+        if (assoc && !a->assoc) {
+            kprintf("%s: %s: cannot convert indexed to associative array\n",
+                    label, name);
+            return -1;
+        }
+        if (!assoc && a->assoc) {
+            kprintf("%s: %s: cannot convert associative to indexed array\n",
+                    label, name);
+            return -1;
+        }
+        return 0;
+    }
+    int si = env_find(name, strlen(name));
+    bool scalar = si >= 0 &&
+        !(g_env_flags[si] & (SHVAR_NOVALUE | SHVAR_ARRAY | SHVAR_NAMEREF));
+    if (!assoc) return scalar ? sh_array_absorb_scalar(name) : 0;
+    SH_SB(old);
+    if (scalar && sb_puts(&old, env_get(name) ? env_get(name) : "") < 0)
+        return -1;
+    if (sh_array_make_assoc(name) < 0) return -1;
+    if (scalar) {
+        if (sh_array_set_key(name, "0", old.p) < 0) return -1;
+        si = env_find(name, strlen(name));
+        if (si >= 0) env_remove_at(si);
+    }
+    return 0;
+}
+
 /* AN ASSOCIATIVE ARRAY ITERATES IN BASH'S HASH-TABLE ORDER -- ${!m[@]},
  * ${m[@]}, declare -p, @Q, for loops:
  *
@@ -7043,7 +7131,7 @@ static void cmd_declare(int argc, char **argv) {
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
          * The other attributes go on afterwards (see the nameref note below),
          * but this one has to lead. */
-        if (set_assoc && sh_array_make_assoc(name) < 0) {
+        if (set_array && shell_decl_convert(name, set_assoc, argv[0]) < 0) {
             shell_set_status(1);
             continue;
         }
@@ -19223,6 +19311,12 @@ struct shell_simple {
     const char **scalar_paren;
     int nscalar_paren;
     int scalar_paren_cap;
+    /* The COMMAND word -- the first that was not written as an assignment
+     * -- once it has been added: where it is, and whether it was written
+     * out (no expansion). See shell_assign_ctx. */
+    bool cmd_word_set;
+    bool cmd_word_literal;
+    int cmd_word_index;
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -26742,7 +26836,17 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
          * `PATH=~/bin:~/tools` work, and without the first `x=~` stored a
          * literal tilde that every later use of $x carried around. */
         size_t klen = akey;
-        if (assign_word && !g_arg_from_expansion) {
+        /* Not across an ARRAY LITERAL: its elements are words of their own
+         * and sh_array_literal_fill gives each the rule that fits it -- an
+         * associative literal expands no tilde at all, `(['h']=~:~:~)`
+         * (Oils 0237), and this pass expanded the middle one. */
+        bool arr_literal = false;
+        if (assign_word) {          /* only then is word[klen] its `=` */
+            const char *v = word + klen + 1;
+            size_t vl = strlen(v);
+            arr_literal = vl >= 2 && v[0] == '(' && v[vl - 1] == ')';
+        }
+        if (assign_word && !g_arg_from_expansion && !arr_literal) {
             SH_SB(asg);
             bool changed = false;
             const char *q = word;
@@ -26819,6 +26923,27 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
 /* The utilities whose arguments are variable assignments rather than words.
  * POSIX names export and readonly; the rest are the bash spellings tsh already
  * implements, and they follow the same rule. */
+static bool shell_is_declaration_utility(const char *name);
+
+/* IS THIS WORD AN ASSIGNMENT, whose value is not split? When it was
+ * written as one (`assign_src`) and either no command word has come yet --
+ * the whole prefix, `x=1 y=$v cmd`, not just its first word -- or the
+ * command word is a declaration utility WRITTEN AS SUCH. bash decides at
+ * parse time (tools/agent/probes/literal-declare-edges.sh):
+ *
+ *     m=typeset; $m v=$x            split: v=a        tsh: v="a b"
+ *     p=1 export e=$x               one word          tsh: split, e=a
+ *     command export e=$x           split (bash 5.2)
+ *
+ * tsh asked whether argv[0] -- whatever it was, an expansion's result or
+ * the prefix's first assignment -- spelled a declaration utility. */
+static bool shell_assign_ctx(const struct shell_simple *cur, bool assign_src) {
+    if (!assign_src) return false;
+    if (!cur->cmd_word_set) return true;
+    return cur->cmd_word_literal &&
+           shell_is_declaration_utility(cur->argv[cur->cmd_word_index]);
+}
+
 static bool shell_is_declaration_utility(const char *name) {
     if (!name) return false;
     return strcmp(name, "export")  == 0 || strcmp(name, "readonly") == 0 ||
@@ -27071,9 +27196,7 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
         sh0[so] = '\0';
         size_t k0 = env_key_len(sh0);
         bool assign0 = (sh0[k0] == '=' && shell_name_is_valid(sh0, k0));
-        bool nosplit_ctx = assign0 &&
-            (cur->argc == 0 ||
-             (assign_src && shell_is_declaration_utility(cur->argv[0])));
+        bool nosplit_ctx = assign0 && shell_assign_ctx(cur, assign_src);
         if (nosplit_ctx && shell_word_has_argmark(word)) {
             SH_SB(joined);
             if (shell_argmarks_to_spaces(word, &joined) < 0)
@@ -27121,18 +27244,18 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * text, not the annotations. A name is short, so a small buffer is
      * enough -- and this is on the stack of a function that already carries
      * three kilobyte-sized ones. */
-    char shape[80];
-    {
-        size_t so = 0;
-        for (const char *q = word; *q && so + 1 < sizeof shape; q++)
-            if (*q != SHELL_NOSPLIT_MARK) shape[so++] = *q;
-        shape[so] = '\0';
-    }
-    size_t klen = env_key_len(shape);
-    bool assign_shaped = (shape[klen] == '=' && shell_name_is_valid(shape, klen));
-    if (assign_shaped &&
-        (cur->argc == 0 ||
-         (assign_src && shell_is_declaration_utility(cur->argv[0])))) {
+    /* `NAME+=` AND `NAME[SUB]=` ARE ASSIGNMENTS TOO, and their values are
+     * not split either: with x='a b', `s+=$x` and `a[1]=$x` are each one
+     * assignment (bash). The shape test took the name up to the `=` --
+     * `s+`, `a[1]` -- found it no name, and split the word: `s+=a` and
+     * then `b: command not found` (tools/agent/probes/paren-declare.sh).
+     * shell_assign_prefix_len knows all three shapes; the copy is the
+     * whole word, marks dropped, so a long subscript is still read. */
+    SH_SB(shape);
+    for (const char *q = word; *q; q++)
+        if (*q != SHELL_NOSPLIT_MARK && sb_putc(&shape, *q) < 0) return -1;
+    bool assign_shaped = shape.p && shell_assign_prefix_len(shape.p) > 0;
+    if (assign_shaped && shell_assign_ctx(cur, assign_src)) {
         return shell_add_one_arg(pl, cur, word, false);
     }
 
@@ -27435,9 +27558,18 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             return -1;
         }
         int before = cur->argc;
+        /* written as ANY assignment: `NAME=`, `NAME+=`, `NAME[SUB]=` */
+        bool asrc = tok[*io].assign_src ||
+            shell_assign_prefix_len(tok[*io].raw ? tok[*io].raw
+                                                 : tok[*io].text) > 0;
         if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
-                             tok[*io].expanded, tok[*io].assign_src) < 0) {
+                             tok[*io].expanded, asrc) < 0) {
             return -1;
+        }
+        if (!cur->cmd_word_set && !asrc && cur->argc > before) {
+            cur->cmd_word_set = true;
+            cur->cmd_word_literal = !tok[*io].expanded;
+            cur->cmd_word_index = before;
         }
         if (shell_note_scalar_paren(cur, tok[*io].raw, before) < 0) return -1;
         (*io)++;
