@@ -18888,6 +18888,9 @@ enum shell_redir_op {
     SH_RD_DUP_IN,
     SH_RD_DUP_OUT,
     SH_RD_CLOSE,
+    /* A target that did not expand to exactly one word: applying it is
+     * bash's "WORD: ambiguous redirect" (path holds WORD as written). */
+    SH_RD_AMBIG,
 };
 
 struct shell_token {
@@ -18908,6 +18911,9 @@ struct shell_token {
     /* `{name}>file`: the operator names a VARIABLE, not a descriptor. See
      * shell_redir.fdvar. Only ever set on a redirection operator. */
     const char *fdvar;
+    /* The word as WRITTEN, for messages that quote it (`$file: ambiguous
+     * redirect`). Only the main word path sets it; 0 elsewhere. */
+    const char *raw;
 };
 
 struct shell_redir {
@@ -23460,6 +23466,8 @@ struct shell_tokv {
     struct shell_words *arena;
 };
 
+static const char *g_tok_word_raw;      /* see shell_token.raw */
+
 static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
                                enum shell_tok_type type, char *text,
                                bool quoted, int fd) {
@@ -23481,6 +23489,8 @@ static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
     t->fd = fd;
     t->fdvar = g_tok_fdvar;
     g_tok_fdvar = 0;
+    t->raw = g_tok_word_raw;
+    g_tok_word_raw = 0;
     (*ntok)++;
     return 0;
 }
@@ -24348,6 +24358,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             continue;
         }
         bool word_quoted = false;
+        const char *raw_word_start = p;      /* shell_token.raw */
         g_tok_word_expanded = false;
         /* Look at the RAW text: a leading `name=` makes this an assignment
          * word. After expansion the same shape can arrive from a variable's
@@ -24743,6 +24754,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              * next one. */
             char *start = words_store(words, wb.p, wb.len);
             if (!start) return -1;
+            g_tok_word_raw = words_store(words, raw_word_start,
+                                         (size_t)(p - raw_word_start));
             if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
             /* A PREFIX ASSIGNMENT IS IN FORCE FOR THE WORDS AFTER IT. See
              * g_tokpfx. `prefix_ok` is the same command-position rule the
@@ -26696,6 +26709,38 @@ static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
     return 0;
 }
 
+/* A REDIRECTION'S WORD AS bash's redirection_expand SEES IT: expanded like
+ * an argument -- tilde, split, globbed -- and then it must be exactly ONE
+ * word (measured, Oils 2084-2096 2635):
+ *
+ *     echo hi > one-*        (one match)     writes one-bar
+ *     echo hi > foo-*        (two matches)   "foo-*: ambiguous redirect", 1
+ *     file='a b'; > $file                    "$file: ambiguous redirect"
+ *     set -- 'a' 'b'; >& "$@"                "\"$@\": ambiguous redirect"
+ *     shopt -s failglob; > zz-*              "no match: zz-*", status 1
+ *
+ * tsh took the expanded text whole: no glob, no split, never ambiguous.
+ * Returns the word, or 0 with *ambiguous set, or 0 after an error that
+ * has been reported (failglob). */
+static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
+                            const char *word, bool quoted, bool expanded,
+                            bool assign_src);
+static const char *shell_redir_word(struct shell_pipeline *pl,
+                                    const struct shell_token *t,
+                                    bool *ambiguous) {
+    *ambiguous = false;
+    struct shell_simple *tmp = (struct shell_simple *)kmalloc(sizeof *tmp);
+    if (!tmp) return 0;
+    shell_simple_init(tmp, &pl->words);
+    const char *res = 0;
+    if (shell_add_arg_ex(pl, tmp, t->text, t->quoted, t->expanded, false) >= 0) {
+        if (tmp->argc == 1) res = tmp->argv[0];
+        else *ambiguous = true;
+    }
+    kfree(tmp);
+    return res;
+}
+
 static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                 struct shell_pipeline *pl) {
     words_free(&pl->words);         /* from shell_pipeline_new, or reused */
@@ -26749,8 +26794,19 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
              * tokenizer's quote marks have to come off before anyone opens it.
              * `> "$f"` otherwise tried to create a file whose name began with
              * a 0x02 byte. */
+            bool r_amb = false;
+            if (t != SH_TOK_HERESTRING && t != SH_TOK_HEREDOC &&
+                t != SH_TOK_HEREDOC_TABS) {
+                const char *rw = shell_redir_word(pl, &tok[*io], &r_amb);
+                if (!rw && !r_amb) return -1;          /* reported */
+                if (rw) tok[*io].text = (char *)rw;
+            }
             shell_strip_nosplit_inplace(tok[*io].text);
-            if (t == SH_TOK_REDIR_IN) {
+            if (r_amb) {
+                if (shell_add_redir(cur, SH_RD_AMBIG, fd,
+                                    tok[*io].raw ? tok[*io].raw : tok[*io].text,
+                                    0, -1) < 0) return -1;
+            } else if (t == SH_TOK_REDIR_IN) {
                 cur->stdin_path = tok[*io].text;
                 if (shell_add_redir(cur, SH_RD_OPEN_IN, fd, tok[*io].text,
                                     0, -1) < 0) return -1;
@@ -27594,6 +27650,11 @@ static int shell_apply_redirs(struct shell_simple *cmd,
         shell_fd_commit_var(st, pending_var);
         pending_var = -1;
         struct shell_redir *r = &cmd->redir[i];
+        if (r->op == SH_RD_AMBIG) {
+            kprintf("%s: ambiguous redirect\n", r->path ? r->path : "");
+            shell_set_status(1);
+            return -1;
+        }
         /* `{name}...`: resolve the descriptor first, then carry on with an
          * ordinary redirection on it. */
         struct shell_redir vr;
