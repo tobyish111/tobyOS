@@ -5,6 +5,7 @@
 exec 2>&1
 printf '[%5b][%-5b][%.2b]\n' 'a\tb' x 'abc'
 printf '%d|%i|%u|%x|%o|%s|\n' '' '' '' '' '' ''
+printf '[%c]' '' | od -An -c
 printf '%d\n' ' '; echo st=$?
 printf '%z'; echo st=$?
 printf 'a%-zb'; echo st=$?

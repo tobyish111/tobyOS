@@ -17058,7 +17058,9 @@ static void cmd_printf(int argc, char **argv) {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int pad = width > 1 ? width - 1 : 0;
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                /* an empty operand is a NUL byte, as bash writes it */
                 if (s[0]) shell_putc(s[0]);
+                else shell_putc_raw(0);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'o' || spec == 'x' || spec == 'X') {
                 long v = printf_arg_int(argc, argv, &argi);
