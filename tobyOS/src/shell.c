@@ -16080,6 +16080,20 @@ static bool g_printf_stop;
  * \x, and \c. */
 static bool g_printf_b_mode;
 
+/* An escape that is MORE than one byte -- \u and \U, written by the one
+ * ANSI-C decoder (shell_ansic_escape) -- comes back as PRINTF_ESC_MULTI
+ * with its bytes here. */
+#define PRINTF_ESC_MULTI (-2)
+static char g_printf_esc_buf[16];
+static int g_printf_esc_len;
+
+/* bash's conversions; `(` starts %(fmt)T */
+static bool printf_is_conv(char c) {
+    for (const char *v = "diouxXfFeEgGaAcsbq("; *v; v++)
+        if (*v == c) return true;
+    return false;
+}
+
 static int printf_parse_escape(const char **pp) {
     const char *p = *pp;
     g_printf_escape_raw = false;
@@ -16102,9 +16116,29 @@ static int printf_parse_escape(const char **pp) {
         return v & 0xFF;
     }
 
-    if (g_printf_b_mode && (c == 'x' || c == 'X') &&
+    /* \xHH in the FORMAT as well as in %b (Oils 1017), and only a lower
+     * case x: bash prints `\X42` as it stands. With no hex digit it says
+     * so and the two characters stand. */
+    if (c == 'x' &&
+        !(((p[1] >= '0' && p[1] <= '9')) || ((p[1] | 0x20) >= 'a' &&
+                                             (p[1] | 0x20) <= 'f'))) {
+        kprintf("printf: missing hex digit for \\x\n");
+        g_printf_escape_raw = true;
+        *pp = p + 1;
+        return 'x';
+    }
+    /* \uHHHH and \UHHHHHHHH, in the format and in %b (Oils 1019 1040):
+     * what a code point becomes depends on the locale, and the one decoder
+     * knows the rules bash follows. */
+    if ((c == 'u' || c == 'U') &&
         (((p[1] >= '0' && p[1] <= '9')) || ((p[1] | 0x20) >= 'a' &&
                                             (p[1] | 0x20) <= 'f'))) {
+        const char *q = p;
+        g_printf_esc_len = shell_ansic_escape(&q, g_printf_esc_buf);
+        *pp = q;
+        return PRINTF_ESC_MULTI;
+    }
+    if (c == 'x') {
         p++;                                   /* past the x */
         int v = 0;
         for (int i = 0; i < 2; i++) {
@@ -16131,6 +16165,7 @@ static int printf_parse_escape(const char **pp) {
     switch (c) {
     case 'a':  return '\a';
     case 'b':  return '\b';
+    case 'e': case 'E': return 0x1B;           /* bash's tescape has both */
     case 'f':  return '\f';
     case 'n':  return '\n';
     case 'r':  return '\r';
@@ -16197,6 +16232,10 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
         g_printf_last_u64 = v;
         return (long)v;
     }
+
+    /* AN EMPTY OPERAND IS 0, without a word: `printf '%d' ''` prints 0 and
+     * succeeds (bash; Oils 1008). Blanks alone are still "invalid number". */
+    if (!*s) return 0;
 
     while (printf_is_blank(*s)) s++;            /* LEADING blanks are fine */
 
@@ -16662,7 +16701,10 @@ static void cmd_printf(int argc, char **argv) {
         while (*p) {
             if (*p == '\\') {
                 int c = printf_parse_escape(&p);
-                if (c >= 0) {
+                if (c == PRINTF_ESC_MULTI) {
+                    for (int k = 0; k < g_printf_esc_len; k++)
+                        shell_putc_raw(g_printf_esc_buf[k]);
+                } else if (c >= 0) {
                     if (g_printf_escape_raw) shell_putc('\\');
                     shell_putc_raw((char)c);        /* \0 is a byte too */
                 }
@@ -16730,6 +16772,26 @@ static void cmd_printf(int argc, char **argv) {
 
             char spec = *p;
             if (spec) p++;
+            /* NO CONVERSION, OR NOT ONE: bash stops there with status 1
+             * (Oils 1024) --
+             *     printf '%z'     "`%z': missing format character"
+             *     printf '%y'     "`y': invalid format character"
+             * tsh printed the `%` and the letter and carried on. (%a and %A
+             * are bash's, and stay what tsh did with them.) */
+            if (!spec) {
+                const char *st = p;
+                while (st > fmt && *st != '%') st--;
+                kprintf("printf: `%s': missing format character\n", st);
+                g_printf_bad_num = true;
+                g_printf_stop = true;
+                break;
+            }
+            if (!printf_is_conv(spec)) {
+                kprintf("printf: `%c': invalid format character\n", spec);
+                g_printf_bad_num = true;
+                g_printf_stop = true;
+                break;
+            }
 
             if (spec == '(') {
                 /* bash: %(datefmt)T -- strftime(3) of the operand, which is
@@ -16759,6 +16821,9 @@ static void cmd_printf(int argc, char **argv) {
                 if (civil_strftime(tbuf, sizeof tbuf, dn ? dfmt : "%X", &ct) == 0)
                     tbuf[0] = '\0';
                 int slen = (int)strlen(tbuf);
+                /* `%10.5(%Y-%m-%d)T` is `     2019-`: the precision cuts
+                 * the formatted time, as for %s (Oils 1034) */
+                if (prec >= 0 && slen > prec) slen = prec;
                 int pad = width > slen ? width - slen : 0;
                 if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
                 for (int i = 0; i < slen; i++) shell_putc(tbuf[i]);
@@ -16849,20 +16914,35 @@ static void cmd_printf(int argc, char **argv) {
             } else if (spec == 'b') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 const char *bp = s;
+                /* The operand's text is made first and then padded and cut
+                 * like %s's -- `%5b`, `%-5b`, `%.2b` (bash). It was written
+                 * straight out, so a width or precision did nothing. */
+                SH_SB(bt);
                 g_printf_b_mode = true;
                 while (*bp) {
                     if (*bp == '\\') {
                         int c = printf_parse_escape(&bp);
                         if (g_printf_stop) break;      /* \c: emit nothing more */
-                        if (c >= 0) {
-                            if (g_printf_escape_raw) shell_putc('\\');
-                            shell_putc((char)c);
+                        if (c == PRINTF_ESC_MULTI) {
+                            for (int k = 0; k < g_printf_esc_len; k++)
+                                (void)sb_putc(&bt, g_printf_esc_buf[k]);
+                        } else if (c >= 0) {
+                            if (g_printf_escape_raw) (void)sb_putc(&bt, '\\');
+                            (void)sb_putc(&bt, (char)c);
                         }
                     } else {
-                        shell_putc(*bp++);
+                        (void)sb_putc(&bt, *bp++);
                     }
                 }
                 g_printf_b_mode = false;
+                {
+                    int blen2 = (int)bt.len;
+                    if (prec >= 0 && blen2 > prec) blen2 = prec;
+                    int pad = width > blen2 ? width - blen2 : 0;
+                    if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                    for (int i = 0; i < blen2; i++) shell_putc(bt.p[i]);
+                    if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                }
                 if (g_printf_stop) break;              /* and abandon the format */
             } else if (spec == 'c') {
                 const char *s = printf_arg_str(argc, argv, &argi);
@@ -16908,6 +16988,9 @@ static void cmd_printf(int argc, char **argv) {
                 if (spec) shell_putc(spec);
             }
         }
+        /* `\c` in %b, or a bad conversion, ends the WHOLE printf -- not
+         * just this pass over the format */
+        if (g_printf_stop) break;
         if (argi == argi_at_pass_start) break;   /* consumed nothing: stop */
     } while (argi < argc);
 
@@ -16919,7 +17002,12 @@ static void cmd_printf(int argc, char **argv) {
     if (vname) {
         g_shell_out = saved_out;
         g_shell_out_ctx = saved_ctx;
-        if (!shell_name_is_valid(vname, strlen(vname))) {
+        /* An ELEMENT is a valid target: `printf -v 'a[1]' ...` (bash;
+         * Oils 0988) -- the subscript is checked by the assignment. */
+        size_t vnl = 0;
+        while (vname[vnl] && vname[vnl] != '[') vnl++;
+        bool velem = vname[vnl] == '[' && vname[strlen(vname) - 1] == ']';
+        if (!shell_name_is_valid(vname, velem ? vnl : strlen(vname))) {
             kprintf("printf: `%s': not a valid identifier\n", vname);
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
             return;
