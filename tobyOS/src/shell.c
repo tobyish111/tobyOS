@@ -31101,7 +31101,13 @@ static bool shell_try_subshell_command(const char *src) {
 
     unsigned long ln_save = g_shell_lineno;
     if (body_line) g_shell_lineno = body_line;
+    /* The body is a COPY: say which original it is, or nothing inside it
+     * maps to a line and every command in a multi-line ( ) reports the
+     * line the ( opened on (`( eval '...' )` numbered eval's body from
+     * there: 54 where bash says 56, shparity 120). */
+    shell_lmap_push_copy(body, body_start);
     execute_line_text(body);
+    shell_lmap_pop_copy();
     /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
      * line made every line after the compound short by the number
      * of lines the body spanned. */
@@ -31269,7 +31275,9 @@ static bool shell_try_group_command(const char *src) {
 
     unsigned long ln_save = g_shell_lineno;
     if (body_line) g_shell_lineno = body_line;
+    shell_lmap_push_copy(body, body_start);      /* see the ( ) runner */
     execute_line_text(body);
+    shell_lmap_pop_copy();
     /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
      * line made every line after the compound short by the number
      * of lines the body spanned. */
@@ -31990,6 +31998,48 @@ static int shell_syntax_check(const char *s) {
     return 0;
 }
 
+/* THE LINE OF A SIMPLE COMMAND, as bash keeps it. bash's parser records it
+ * when it reduces the command's FIRST word (make_bare_simple_command takes
+ * line_number then), and by that time the lexer has already read the NEXT
+ * token -- so the line is the one on which the SECOND token ends, or the
+ * first token when there is no second on its line. Measured on the guest's
+ * bash 5.2.15 (logs/b8/lineno-lookahead-before.*):
+ *
+ *     echo "A1          $LINENO is 5, the line "A1⏎A2" ends on; tsh said 4
+ *     A2" $LINENO
+ *     eval 'x           the body counts from 11 (parse_and_execute takes
+ *     y'                line_number - 1); tsh numbered it from 10
+ *
+ * A compound command, a function definition and `!`/`time` keep the line
+ * they start on -- bash records those its own way. 0 when unmapped. */
+static unsigned long shell_simple_cmd_lineno(const char *src) {
+    const char *p = shell_skip_blanks(src ? src : "");
+    if (!*p) return 0;
+    static const char *const starts[] = {
+        "if", "while", "until", "for", "case", "select", "function",
+        "coproc", "time", "!", "{", "[[", 0
+    };
+    for (int i = 0; starts[i]; i++)
+        if (shell_starts_with_word(p, starts[i])) return shell_lineno_at(p);
+    if (*p == '(') return shell_lineno_at(p);
+    struct shell_scan st;
+    shell_scan_init(&st);
+    const char *q = p;
+    shell_scan_token(&st, &q);
+    if (q <= p) return shell_lineno_at(p);
+    const char *last = q - 1;
+    const char *r = q;
+    while (*r == ' ' || *r == '\t') r++;
+    if (*r == '(') return shell_lineno_at(p);          /* `name ()` */
+    if (*r && *r != '\n' && *r != '\r') {
+        const char *r0 = r;
+        shell_scan_token(&st, &r);
+        if (r > r0) last = r - 1;
+    }
+    unsigned long ln = shell_lineno_at(last);
+    return ln ? ln : shell_lineno_at(p);
+}
+
 static void execute_line_text_inner(const char *src) {
     struct shell_token *tok = 0;
     SH_WORDS(words);
@@ -31997,10 +32047,11 @@ static void execute_line_text_inner(const char *src) {
 
     src = src ? src : "";
     /* $LINENO for THIS piece of the line, when the text can be traced back
-     * to the buffer the reader mapped (see the copy layers). A piece that
-     * cannot -- a trap action, a function body -- keeps the current one. */
+     * to the buffer the reader mapped (see the copy layers) -- bash's line
+     * for it, see shell_simple_cmd_lineno. A piece that cannot -- a trap
+     * action, a function body -- keeps the current one. */
     {
-        unsigned long ln = shell_lineno_at(shell_skip_blanks(src));
+        unsigned long ln = shell_simple_cmd_lineno(src);
         if (ln) g_shell_lineno = ln;
     }
     if (g_shell_flow != SHELL_FLOW_NONE) return;
