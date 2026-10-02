@@ -20927,6 +20927,94 @@ static int shell_expand_element_op(const char *nm, const char *sub,
     return rc;
 }
 
+/* ${a[@]OP word} and ${a[*]OP word}, OP one of - = ? + with or without the
+ * colon: bash tests the WHOLE array (parameter_brace_expand: the value is
+ * the elements' expansion -- "set" when there is an element, "null" when
+ * they join to nothing, by a space for @ and IFS's first character for *).
+ * Measured in tools/agent/probes/array-default-ops.sh:
+ *
+ *     e=(); "${e[@]-d}" -> d          n=(''); "${n[@]:-d}" -> d
+ *     nn=('' ''); "${nn[@]:-d}" -> two empty words (they join to " ")
+ *     "${v[@]:-9}" is the default operator, not a slice from -9
+ *     "${u[@]=x}" -> "u[@]: bad array subscript"; "${u[@]:?gone}" -> "u[@]: gone"
+ *
+ * tsh handed `:-` `:+` `:=` `:?` to the SLICE code -- `${a[@]:+foo}` under
+ * set -u evaluated the offset `+foo` and ended the shell on an unbound
+ * foo -- and the rest to the per-element operator code, so an empty or
+ * unset array never took its default. The word goes through the scalar
+ * machinery on a scratch name that reports itself as "a[@]". */
+static bool shell_array_test_op(const char *suffix) {
+    const char *o = suffix[0] == ':' ? suffix + 1 : suffix;
+    return *o == '-' || *o == '=' || *o == '?' || *o == '+';
+}
+
+static int shell_expand_array_test_op(struct shell_sb *b, const char *nm,
+                                      bool star, const char *suffix) {
+    struct sh_array *arr = sh_array_find(nm);
+    const char *sv = arr ? 0 : env_get(nm);
+    bool is_set = arr ? arr->n > 0 : sv != 0;
+    bool colon = (suffix[0] == ':');
+    char opc = colon ? suffix[1] : suffix[0];
+    bool is_null = false;
+    if (colon && is_set) {
+        if (!arr) {
+            is_null = (*sv == '\0');
+        } else {
+            char sep = ' ';
+            if (star) {
+                const char *ifs = env_get("IFS");
+                if (ifs && *ifs) sep = ifs[0];
+                else if (ifs) sep = '\0';
+            }
+            is_null = true;
+            for (int i = 0; i < arr->n && is_null; i++)
+                if ((arr->e[i].val && arr->e[i].val[0]) || (i > 0 && sep))
+                    is_null = false;
+        }
+    }
+    bool use_value = is_set && !is_null;
+
+    if (opc == '=' && !use_value) {
+        kprintf("%s[%c]: bad array subscript\n", nm, star ? '*' : '@');
+        g_bad_subst_soft = true;
+        return -1;
+    }
+    if (opc != '+' && use_value) {
+        if (arr) return shell_append_array_join(b, nm, star, false);
+        if (!star && sh_put_lead_mark(b) < 0) return -1;     /* a scalar */
+        return sb_put_data_str(b, sv);
+    }
+    if (opc == '+' && !use_value) {
+        if (is_set) return 0;                   /* null: "" when quoted */
+        return star ? 0 : sh_put_lead_mark(b);  /* unset: no word at all */
+    }
+    /* The word: `-` and `?` with no value, `+` with one. */
+    char scratch[32];
+    ksnprintf(scratch, sizeof scratch, "SHELL_ELEM_%d", g_elem_depth);
+    SH_SB(display);
+    if (sb_puts(&display, nm) < 0 || sb_putc(&display, '[') < 0 ||
+        sb_putc(&display, star ? '*' : '@') < 0 || sb_putc(&display, ']') < 0)
+        return -1;
+    if (opc == '+') {
+        if (env_set(scratch, "x") < 0) return -1;
+    } else {
+        (void)env_unset(scratch);
+    }
+    SH_SB(ex);
+    if (sb_puts(&ex, scratch) < 0 || sb_puts(&ex, suffix) < 0) {
+        (void)env_unset(scratch);
+        return -1;
+    }
+    struct shell_elem_frame fr = { scratch, display.p, g_elem_frames };
+    g_elem_frames = &fr;
+    g_elem_depth++;
+    int rc = shell_expand_braced_parameter(ex.p, b);
+    g_elem_depth--;
+    g_elem_frames = fr.up;
+    (void)env_unset(scratch);
+    return rc;
+}
+
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     if (!expr) return -1;
 
@@ -21106,6 +21194,13 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                     const char *sub = lb + 1;
                     size_t slen = (size_t)(rb - lb - 1);
                     const char *suffix = rb + 1;   /* "", ":1:2", "#pat", ... */
+                    /* ${a[@]-word} ${a[*]:+word} ... test the whole array
+                     * (shell_expand_array_test_op) -- before the slice,
+                     * which `:-` and friends must never reach. */
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
+                        !count && !indices && shell_array_test_op(suffix))
+                        return shell_expand_array_test_op(b, nm, sub[0] == '*',
+                                                          suffix);
                     /* ${a[@]:off:len} -- a slice is still a join, just over
                      * a window. Quoted, it must STILL yield one word per
                      * element, so it goes through the same ARG_MARK path
