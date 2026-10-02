@@ -6588,7 +6588,7 @@ static struct shell_shopt g_shopts[] = {
     { "inherit_errexit",      &g_shopt_inherit_errexit,      true,  false },
     { "strict_errexit",       &g_shopt_misc[1],              false, false },
     { "command_sub_errexit",  &g_shopt_misc[2],              false, false },
-    { "nocasematch",          &g_shopt_misc[3],              false, false },
+    { "nocasematch",          &g_shopt_misc[3],              true,  false },
     { "autocd",               &g_shopt_misc[4],              false, false },
     { "cdable_vars",          &g_shopt_misc[5],              false, false },
     { "cdspell",              &g_shopt_misc[6],              false, false },
