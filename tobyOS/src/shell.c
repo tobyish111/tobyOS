@@ -24250,6 +24250,17 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 if (*a == '=') g_tok_word_assign_src = true;
             }
         }
+        /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
+         * assignment words after them (`A=q B=$A env` gives B=q) and to
+         * nothing else on the line: bash expands the command word and the
+         * arguments before it makes the assignments, so
+         *
+         *     A=w echo "$A"       bash: ""     tsh: w
+         *     A=x readonly v=$A   bash: v=""   tsh: v=x
+         *
+         * (tools/agent/probes/prefix-visibility.sh). The command itself sees
+         * them -- its frame applies them -- but its words do not. */
+        if (!(prefix_ok && g_tok_word_assign_src)) g_tokpfx_n = g_tokpfx_base;
         /* LITERAL TEXT IS NEVER A FIELD DELIMITER. POSIX 2.6.5 splits the
          * RESULTS of expansion, never the characters that were written down:
          *
