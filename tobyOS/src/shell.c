@@ -1268,6 +1268,11 @@ static int shell_read_line_from_file(struct file *in, bool raw,
 static struct file *shell_builtin_fd(int n);
 static int   sh_subscript_assign_index(const char *name, const char *sub,
                                       long *out);
+struct shell_sb;
+static unsigned shell_value_attrs(const char *name);
+static int   shell_attr_value(unsigned attrs, const char *val, struct shell_sb *out);
+static int   shell_attr_append(unsigned attrs, const char *old, const char *add,
+                               struct shell_sb *out);
 static int   sh_subscript_read_index(const char *nm, const char *sub,
                                     long *out);
 static bool  sh_subscript_eval(const char *sub, const char *name,
@@ -1802,6 +1807,20 @@ static int   g_nreadonly;            /* slots, used or free */
  * child's environment, so `typeset -A a; export a; printenv.py a` reports it
  * unset rather than empty. */
 #define SHVAR_ARRAY     0x08u
+/* DECLARED, NO VALUE YET -- bash's "invisible" variable. `local x`,
+ * `declare x`, `declare -a a`: the name exists and carries its attributes,
+ * but every READ sees it unset (`${x-u}` is u, `set -u` says unbound, `-v`
+ * is false, `set` and `${!x*}` leave it out, no child gets it) until an
+ * assignment gives it one. `declare -p` shows it without a value:
+ * `declare -- x`. tsh stored an empty string, so all of those saw "". */
+#define SHVAR_NOVALUE   0x10u
+/* `declare -i`, `-l`, `-u`: every value on its way in is evaluated as
+ * arithmetic, or folded to lower or upper case (shell_attr_apply). tsh
+ * parsed the letters and dropped them: `declare -i x=1+2` stored "1+2". */
+#define SHVAR_INTEGER   0x20u
+#define SHVAR_LOWER     0x40u
+#define SHVAR_UPPER     0x80u
+#define SHVAR_VALUE_ATTRS (SHVAR_INTEGER | SHVAR_LOWER | SHVAR_UPPER)
 static unsigned char *g_env_flags;   /* g_env_cap entries */
 
 /* Room for `want` variables. False only when memory ran out. */
@@ -2218,7 +2237,9 @@ static const char *env_get(const char *key) {
     int hops = 0;
     while ((g_env_flags[idx] & SHVAR_NAMEREF) && hops++ < 16) {
         const char *target = g_env[idx] + klen + 1;
-        if (!*target) return "";
+        /* `typeset -n ref` with no target: ref is unset, so `set -u` calls
+         * it unbound (Oils 1847) -- it read as "". */
+        if (!*target) return (g_env_flags[idx] & SHVAR_NOVALUE) ? 0 : "";
         /* A REFERENCE TO SOMETHING THAT IS NOT A NAME IS NOT A REFERENCE.
          *
          *     ref=1 ; typeset -n ref ; echo $ref      bash: 1
@@ -2242,7 +2263,17 @@ static const char *env_get(const char *key) {
         if (!shell_name_is_valid(target, strlen(target))) return target;
         klen = strlen(target);
         int nx = env_find(target, klen);
-        if (nx < 0) return "";           /* names something that is not set */
+        /* names something that is not set: so is the reference -- `${ref-d}`
+         * is d and `set -u` calls it unbound (Oils 1847). It read as "".
+         * (An array target has its element 0.) */
+        if (nx < 0) {
+            char tn[128];
+            if (klen + 1 > sizeof tn) return 0;
+            memcpy(tn, target, klen);
+            tn[klen] = '\0';
+            return sh_array_is_assoc(tn) ? sh_array_get_key(tn, "0")
+                                         : sh_array_get(tn, 0);
+        }
         if (nx == idx) return "";        /* names itself */
         idx = nx;
     }
@@ -2251,6 +2282,16 @@ static const char *env_get(const char *key) {
     if (hops >= 16) {
         kprintf("warning: %s: circular name reference\n", key);
         return "";
+    }
+    /* Declared, no value: unset -- unless it is an array that has an
+     * element 0 now (`local -a a; a[0]=x; echo $a`). */
+    if (g_env_flags[idx] & SHVAR_NOVALUE) {
+        char nm[128];
+        if (klen + 1 > sizeof nm) return 0;
+        memcpy(nm, g_env[idx], klen);
+        nm[klen] = '\0';
+        return sh_array_is_assoc(nm) ? sh_array_get_key(nm, "0")
+                                     : sh_array_get(nm, 0);
     }
     return g_env[idx] + klen + 1;
 }
@@ -2895,6 +2936,14 @@ static int sh_try_array_assignment(const char *kv) {
         long idx = 0;
         if (sh_subscript_assign_index(name, sub, &idx) < 0) return -1;
         if (sh_array_absorb_scalar(name) < 0) return -1;
+        {
+            unsigned at = shell_value_attrs(name);
+            SH_SB(tv);
+            int ar = append ? shell_attr_append(at, sh_array_get(name, idx), val, &tv)
+                            : shell_attr_value(at, val, &tv);
+            if (ar < 0) return -1;
+            if (ar > 0) return sh_array_set(name, idx, tv.p) == 0 ? 1 : 0;
+        }
         if (append) {
             const char *old = sh_array_get(name, idx);
             SH_SB(joined);                      /* any length -- see above */
@@ -2910,10 +2959,16 @@ static int sh_try_array_assignment(const char *kv) {
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
         if (!shell_name_is_valid(nm, keylen)) return 0;
-        /* `r=(3)` and `r+=(4)` on a readonly array (S4). */
-        if (shell_readonly_key(nm, keylen)) {
-            shell_readonly_print_error(nm, keylen, "shell");
-            return -1;
+        /* `r=(3)` and `r+=(4)` on a readonly array (S4) -- also through a
+         * nameref: `declare -n r=a; r+=(4)` on a readonly a (Oils 0461). */
+        {
+            char rtgt[128];
+            const char *rn = env_deref_name_ex(nm, rtgt, sizeof rtgt, false);
+            if (!rn || !*rn) rn = nm;
+            if (shell_readonly_key(rn, strlen(rn))) {
+                shell_readonly_print_error(rn, strlen(rn), "shell");
+                return -1;
+            }
         }
         /* APPENDING A LITERAL TO A SCALAR KEEPS THE SCALAR, as element 0:
          *
@@ -2939,6 +2994,69 @@ static int sh_try_array_assignment(const char *kv) {
  * attributes (export, readonly, the array flag): that is not an assignment
  * to the variable, so it must not become one to an array's element 0. */
 static bool g_env_attr_only;
+
+static int shell_arith_eval(const char *expr, const char *cmdname, long *out);
+
+/* The value-changing attributes of NAME (after its nameref), or 0. */
+static unsigned shell_value_attrs(const char *name) {
+    char tgt[128];
+    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    if (!real || !*real) real = name;
+    int ix = env_find(real, strlen(real));
+    return ix >= 0 ? (g_env_flags[ix] & SHVAR_VALUE_ATTRS) : 0u;
+}
+
+/* VAL as it is stored in a variable with attributes ATTRS (bash's
+ * make_variable_value): -i evaluates it as arithmetic, -l / -u fold its
+ * case. Returns 1 with the result in OUT, 0 when there is nothing to do,
+ * -1 when the arithmetic failed -- reported, status 1 and the line
+ * discarded, as bash's evalerror does. */
+static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *out) {
+    if (!(attrs & SHVAR_VALUE_ATTRS)) return 0;
+    if (attrs & SHVAR_INTEGER) {
+        long v = 0;
+        int k = shell_arith_eval(val ? val : "", 0, &v);
+        if (k != SARITH_OK) {
+            if (k != SARITH_UNBOUND) {
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+            }
+            return -1;
+        }
+        char nb[32];
+        ksnprintf(nb, sizeof nb, "%ld", v);
+        return sb_set(out, nb) < 0 ? -1 : 1;
+    }
+    if (sb_set(out, val ? val : "") < 0) return -1;
+    for (size_t i = 0; i < out->len; i++) {
+        char c = out->p[i];
+        if ((attrs & SHVAR_LOWER) && c >= 'A' && c <= 'Z') out->p[i] = (char)(c + 32);
+        if ((attrs & SHVAR_UPPER) && c >= 'a' && c <= 'z') out->p[i] = (char)(c - 32);
+    }
+    return 1;
+}
+
+/* `+=` on an integer variable ADDS: `declare -i i=1; i+=' 2 '` is 3. */
+static int shell_attr_append(unsigned attrs, const char *old, const char *add,
+                             struct shell_sb *out) {
+    if (!(attrs & SHVAR_INTEGER)) return 0;
+    long a = 0, b = 0;
+    if (old && *old && shell_arith_eval(old, 0, &a) != SARITH_OK) return -1;
+    if (shell_arith_eval(add ? add : "", 0, &b) != SARITH_OK) {
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
+        return -1;
+    }
+    char nb[32];
+    ksnprintf(nb, sizeof nb, "%ld", a + b);
+    return sb_set(out, nb) < 0 ? -1 : 1;
+}
 
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
@@ -2978,6 +3096,18 @@ static int env_set_kv(const char *kv_in) {
         const char *add = kv_in + klen + 1;
         struct sh_array *arr = sh_array_find(nm);
         const char *old_val = arr ? sh_array_get(nm, 0) : env_get(nm);
+        {
+            SH_SB(sum);
+            int ar = shell_attr_append(shell_value_attrs(nm), old_val, add, &sum);
+            if (ar < 0) return -1;
+            if (ar > 0) {
+                if (arr) return sh_array_set(nm, 0, sum.p) == 0 ? 0 : -1;
+                SH_SB(rb);
+                if (sb_puts(&rb, nm) < 0 || sb_putc(&rb, '=') < 0 ||
+                    sb_puts(&rb, sum.p) < 0) return -1;
+                return env_set_kv(rb.p);
+            }
+        }
         size_t ol = old_val ? strlen(old_val) : 0, al = strlen(add);
 
         if (arr) {
@@ -3070,6 +3200,22 @@ static int env_set_kv(const char *kv_in) {
         }
     }
 
+    SH_SB(attrkv);
+    if (!g_env_attr_only) {
+        int ax = env_find(kv_in, klen);
+        unsigned at = ax >= 0 ? (g_env_flags[ax] & SHVAR_VALUE_ATTRS) : 0u;
+        if (at) {
+            SH_SB(tv);
+            int ar = shell_attr_value(at, kv_in + klen + 1, &tv);
+            if (ar < 0) return -1;
+            if (ar > 0) {
+                if (sb_putmem(&attrkv, kv_in, klen) < 0 || sb_putc(&attrkv, '=') < 0 ||
+                    sb_puts(&attrkv, tv.p) < 0) return -1;
+                kv_in = attrkv.p;
+            }
+        }
+    }
+
     size_t total = strlen(kv_in);
     char *blob = (char *)kcalloc(1, total + 1);
     if (!blob) return -1;
@@ -3083,6 +3229,8 @@ static int env_set_kv(const char *kv_in) {
         kfree(g_env[idx]);
         g_env[idx] = blob;
         if (g_opt_allexport) g_env_flags[idx] |= SHVAR_EXPORTED;
+        if (g_env_attr_only) g_env_flags[idx] |= SHVAR_NOVALUE;
+        else                 g_env_flags[idx] &= ~(unsigned char)SHVAR_NOVALUE;
         shell_getopts_note_external_optind_write(kv_in, klen);
         shell_hist_var_written(kv_in, klen);
         return 0;
@@ -3092,7 +3240,8 @@ static int env_set_kv(const char *kv_in) {
         return -1;
     }
     /* A brand-new variable is NOT exported unless `set -a` is in force. */
-    g_env_flags[g_envc] = g_opt_allexport ? SHVAR_EXPORTED : 0u;
+    g_env_flags[g_envc] = (unsigned char)((g_opt_allexport ? SHVAR_EXPORTED : 0u) |
+                                          (g_env_attr_only ? SHVAR_NOVALUE : 0u));
     g_env[g_envc++] = blob;
     g_env[g_envc]   = 0;
     shell_getopts_note_external_optind_write(kv_in, klen);
@@ -4679,10 +4828,35 @@ static void sh_array_unset_literal(const char *name) {
 /* The last step of sh_array_assign_literal: the finished elements under
  * `tmp` become `name`'s -- the whole array for `=`, merged in for `+=`.
  * `name` is followed through a reference, as sh_array_create follows it. */
+/* An array that has been ASSIGNED is no longer only declared: `aa=()`
+ * prints `declare -a aa=()`, where `declare -a aa` alone printed none. */
+static void sh_array_clear_novalue(const char *name) {
+    char tgt[128];
+    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    if (!real || !*real) real = name;
+    int ix = env_find(real, strlen(real));
+    if (ix >= 0) g_env_flags[ix] &= ~(unsigned char)SHVAR_NOVALUE;
+}
+
 static int sh_array_literal_commit(const char *tmp, const char *name,
                                    bool append) {
     struct sh_array *t = sh_array_find_literal(tmp);
     if (!t) return -1;
+    sh_array_clear_novalue(name);
+    {
+        unsigned at = shell_value_attrs(name);
+        for (int i = 0; at && i < t->n; i++) {
+            SH_SB(tv);
+            int ar = shell_attr_value(at, t->e[i].val, &tv);
+            if (ar < 0) { sh_array_unset_literal(tmp); return -1; }
+            if (ar > 0) {
+                char *nv = shell_strdup(tv.p);
+                if (!nv) { sh_array_unset_literal(tmp); return -1; }
+                kfree(t->e[i].val);
+                t->e[i].val = nv;
+            }
+        }
+    }
     if (append) {
         int rc = sh_array_create(name) ? 0 : -1;
         for (int i = 0; rc == 0 && i < t->n; i++) {
@@ -4990,9 +5164,11 @@ static int sh_array_set_key(const char *name, const char *key, const char *val);
 static bool shell_stack_exhausted(int depth);
 static int sh_subscript_value(const char *sub, long *out);
 
-/* set -u met an unbound variable in arithmetic: bash's err_unboundvar,
- * then a non-interactive shell ENDS (FORCE_EOF) and a prompt drops the
- * line. NAME is 0 when an inner evaluation has already said it. */
+/* set -u met an unbound variable -- in arithmetic, or in any expansion
+ * (bash: err_unboundvar, then expand_wdesc_fatal): a non-interactive shell
+ * ENDS with status 1 (FORCE_EOF) and a prompt drops the line. tsh's
+ * expansions printed the message and went on to the next command. NAME is
+ * 0 when an inner evaluation has already said it. */
 static void shell_arith_unbound(const char *name) {
     if (name) kprintf("%s: unbound variable\n", name);
     shell_set_status(1);
@@ -5608,6 +5784,94 @@ static void shell_locals_pop(int depth) {
  * Bare `local x` leaves x UNSET but local, which is what bash and dash both
  * do: `f() { local x; echo "${x-unset}"; }` prints `unset`. Setting it empty
  * instead would make an unset local indistinguishable from an empty one. */
+/* `declare`/`typeset`/`local` with an ARRAY ELEMENT as the name -- bash's
+ * declare_internal with making_array_special, measured in
+ * tools/agent/probes/declare-elem.sh:
+ *
+ *     declare a[1]=x    a=([1]="x")       declare e[1]     declare -a e
+ *     local d[1]=q      a LOCAL array     declare -A m[k]=v   m=([k]="v")
+ *     declare -a k[0]=(1 2)   "k[0]: cannot assign list to array member",
+ *                             and the rest of the line is dropped
+ *
+ * tsh called every such word "not a valid identifier". NAME must be a
+ * name; the element assignment is the ordinary one (env_set_kv), so a bad
+ * subscript fails, and discards, exactly as `a[SUB]=v` does. A scalar NAME
+ * becomes an array whose element 0 is the old value. Returns false after a
+ * failure has been reported. */
+/* Put attributes ON / take them OFF a variable, making the entry that
+ * carries them if there is none yet (declared, no value). -l and -u
+ * exclude each other: setting one clears the other, as in bash. */
+static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
+                             bool is_array) {
+    if (!on && !off) return;
+    size_t nl = strlen(name);
+    int ix = env_find(name, nl);
+    if (ix < 0) {
+        if (!on) return;
+        if (env_set_attr_holder(name) < 0) return;
+        ix = env_find(name, nl);
+        if (ix < 0) return;
+        if (is_array) g_env_flags[ix] |= SHVAR_ARRAY;
+    }
+    if (on & SHVAR_LOWER) off |= SHVAR_UPPER;
+    if (on & SHVAR_UPPER) off |= SHVAR_LOWER;
+    g_env_flags[ix] = (unsigned char)((g_env_flags[ix] & ~off) | on);
+}
+
+static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
+                               bool has_value, bool append, bool make_local,
+                               bool assoc, unsigned attr_on, unsigned attr_off,
+                               const char *label) {
+    char base[128];
+    size_t bl = (size_t)(lb - word);
+    if (bl == 0 || bl >= sizeof base || !shell_name_is_valid(word, bl)) {
+        kprintf("%s: `%.*s': not a valid identifier\n", label, (int)nlen, word);
+        return false;
+    }
+    memcpy(base, word, bl);
+    base[bl] = '\0';
+    if (make_local && !shell_local_declared_here(base, g_script_depth)) {
+        if (shell_locals_push(base, g_script_depth) < 0) return false;
+        int ix = env_find(base, bl);
+        if (ix >= 0) env_remove_at(ix);
+    }
+    if (assoc && sh_array_make_assoc(base) < 0) return false;
+    if (!sh_array_find(base)) {
+        if (env_get(base)) {
+            if (sh_array_absorb_scalar(base) < 0) return false;
+        } else if (!has_value) {
+            if (env_find(base, bl) < 0 && env_set_attr_holder(base) < 0)
+                return false;
+            int ix = env_find(base, bl);
+            if (ix >= 0) g_env_flags[ix] |= SHVAR_ARRAY;
+        }
+    }
+    shell_decl_attrs(base, attr_on, attr_off, true);
+    if (!has_value) return true;
+    const char *val = word + nlen + (append ? 2 : 1);
+    size_t vl = strlen(val);
+    if (vl >= 2 && val[0] == '(' && val[vl - 1] == ')') {
+        kprintf("%.*s: cannot assign list to array member\n", (int)nlen, word);
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
+        return false;
+    }
+    g_assign_fail_hit = false;
+    return env_set_kv(word) >= 0;
+}
+
+/* The `[` of an element operand `NAME[SUB]` (with or without a value), or
+ * 0. `nlen` is the operand's name part, as env_assign_name_len gives it. */
+static const char *shell_decl_element_lb(const char *w, size_t nlen) {
+    if (nlen < 3 || w[nlen - 1] != ']') return 0;
+    for (size_t i = 0; i < nlen; i++)
+        if (w[i] == '[') return i > 0 ? w + i : 0;
+    return 0;
+}
+
 static void cmd_local(int argc, char **argv) {
     shell_set_status(0);
     /* IN A FUNCTION, not merely in a script. This tested g_script_depth,
@@ -5665,6 +5929,7 @@ static void cmd_local(int argc, char **argv) {
         }
     }
     bool l_array = false, l_assoc = false, l_nameref = false;
+    unsigned l_attr_on = 0;
     for (int i = 1; i < argc; i++) {
         /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
          * flag as a variable NAME produced "local: bad name '-a'" and left
@@ -5694,13 +5959,26 @@ static void cmd_local(int argc, char **argv) {
             if (argv[i][1] == 'a') l_array = true;
             if (argv[i][1] == 'A') { l_array = true; l_assoc = true; }
             if (argv[i][1] == 'n') l_nameref = true;
+            if (argv[i][1] == 'i') l_attr_on |= SHVAR_INTEGER;
             continue;
         }
         if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
+        bool l_append = has_value && klen > 1 && argv[i][klen - 1] == '+';
         if (has_value) klen = env_assign_name_len(argv[i]);  /* `s+=v` */
         else klen = strlen(argv[i]);
+        {
+            const char *lb = shell_decl_element_lb(argv[i], klen);
+            if (lb) {
+                if (!shell_decl_element(argv[i], klen, lb, has_value, l_append,
+                                        true, l_assoc, l_attr_on, 0, "local")) {
+                    if (g_shell_flow != SHELL_FLOW_NONE) return;
+                    shell_set_status(1);
+                }
+                continue;
+            }
+        }
         if (!shell_name_is_valid(argv[i], klen)) {
             kprintf("local: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
@@ -5736,11 +6014,23 @@ static void cmd_local(int argc, char **argv) {
             int pre = env_find(name, klen);
             if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
         }
+        if (l_attr_on) {
+            /* a fresh local takes the attribute before its value */
+            if (!already) {
+                int ox = env_find(name, klen);
+                if (ox >= 0 && !has_value) env_remove_at(ox);
+            }
+            shell_decl_attrs(name, l_attr_on, 0, l_array);
+        }
         if (has_value) {
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
-        } else if (!already) {
+        } else if (!already && !l_attr_on) {
+            /* `local x` DECLARES x, without a value: `declare -p x` is
+             * `declare -- x` and every read sees it unset (SHVAR_NOVALUE).
+             * It was removed outright, so nothing knew it was local. */
             int idx = env_find(name, klen);
             if (idx >= 0) env_remove_at(idx);
+            if (!l_nameref) (void)env_set_attr_holder(name);
         }
         if (l_array) {
             if (!env_get(name)) (void)env_set_attr_holder(name);
@@ -5984,7 +6274,12 @@ static void cmd_export(int argc, char **argv) {
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
         if (!shell_name_is_valid(argv[i], nlen)) {
-            kprintf("export: `%s': not a valid identifier\n", argv[i]);
+            /* bash names an ELEMENT by itself (`a[1]`), anything else by
+             * the whole word (`1a=b`). */
+            if (shell_decl_element_lb(argv[i], nlen))
+                kprintf("export: `%.*s': not a valid identifier\n", (int)nlen, argv[i]);
+            else
+                kprintf("export: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
@@ -6110,14 +6405,24 @@ static bool shell_declare_print(const char *name) {
 
     /* bash's own letter order is a A i l n r t u x; tsh tracks the five it
      * can honestly answer for. No attribute at all prints as `--`. */
-    char fl[8];
+    char fl[12];
     size_t fn = 0;
     if (arr && arr->assoc)  fl[fn++] = 'A';
     else if (is_arr)        fl[fn++] = 'a';
+    if (f & SHVAR_INTEGER)  fl[fn++] = 'i';
     if (f & SHVAR_NAMEREF)  fl[fn++] = 'n';
     if (shell_readonly_find(name, klen) >= 0) fl[fn++] = 'r';
     if (f & SHVAR_EXPORTED) fl[fn++] = 'x';
+    if (f & SHVAR_LOWER)    fl[fn++] = 'l';    /* bash: after x, c l u */
+    if (f & SHVAR_UPPER)    fl[fn++] = 'u';
     fl[fn] = '\0';
+    /* Declared, no value: the attributes alone (`declare -- x`,
+     * `declare -a a`) -- until an array has a record of its own, which
+     * `a=()` gives it (`declare -a a=()`). */
+    if ((f & SHVAR_NOVALUE) && (!arr || arr->n == 0)) {
+        shell_printf("declare -%s %s\n", fn ? fl : "-", name);
+        return true;
+    }
     shell_printf("declare -%s %s=", fn ? fl : "-", name);
 
     if (is_arr) {
@@ -6171,6 +6476,8 @@ static void cmd_declare(int argc, char **argv) {
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
     bool set_assoc = false;
+    bool set_global = false;   /* -g: never a local, even in a function */
+    unsigned attr_on = 0, attr_off = 0;   /* -i -l -u (+i +l +u) */
     bool print_mode = false;
     bool any_opt = false;      /* any option letter at all was given */
     bool func_mode = false;    /* -f or -F: this is about FUNCTIONS */
@@ -6205,8 +6512,11 @@ static void cmd_declare(int argc, char **argv) {
              * variable listing and printed the environment. */
             case 'f': if (on) func_mode = true; break;
             case 'F': if (on) { func_mode = true; func_names = true; } break;
-            case 'i': case 'I': case 'u': case 'l':
-            case 'g': case 't': break;
+            case 'g': if (on) set_global = true; break;
+            case 'i': if (on) attr_on |= SHVAR_INTEGER; else attr_off |= SHVAR_INTEGER; break;
+            case 'l': if (on) attr_on |= SHVAR_LOWER;   else attr_off |= SHVAR_LOWER;   break;
+            case 'u': if (on) attr_on |= SHVAR_UPPER;   else attr_off |= SHVAR_UPPER;   break;
+            case 'I': case 't': break;
             default:  bad = *f; break;
             }
         }
@@ -6343,8 +6653,28 @@ static void cmd_declare(int argc, char **argv) {
     for (; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
+        bool d_append = has_value && klen > 1 && argv[i][klen - 1] == '+';
         if (has_value) klen = env_assign_name_len(argv[i]);  /* `d+=v` */
         else klen = strlen(argv[i]);
+        /* IN A FUNCTION, `declare` and `typeset` MAKE LOCALS, as `local`
+         * does -- unless -g. tsh's declare always wrote the variable it
+         * could see, so `f() { declare v=in; }` changed the caller's v. */
+        bool make_local = (g_fn_depth > 0) && !set_global;
+        {
+            const char *lb = shell_decl_element_lb(argv[i], klen);
+            if (lb) {
+                if (!shell_decl_element(argv[i], klen, lb, has_value, d_append,
+                                        make_local, set_assoc, attr_on, attr_off,
+                                        argv[0])) {
+                    if (g_shell_flow != SHELL_FLOW_NONE) return;
+                    shell_set_status(1);
+                    continue;
+                }
+                if (set_readonly)
+                    (void)shell_readonly_mark(argv[i], (size_t)(lb - argv[i]));
+                continue;
+            }
+        }
         if (!shell_name_is_valid(argv[i], klen)) {
             kprintf("declare: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
@@ -6358,6 +6688,24 @@ static void cmd_declare(int argc, char **argv) {
         }
         memcpy(name, argv[i], klen);
         name[klen] = '\0';
+
+        if (make_local && !shell_local_declared_here(name, g_script_depth)) {
+            if (shell_readonly_key(name, klen)) {
+                shell_readonly_print_error(name, klen, argv[0]);
+                shell_set_status(1);
+                continue;
+            }
+            if (shell_locals_push(name, g_script_depth) < 0) {
+                shell_set_status(1);
+                continue;
+            }
+            /* a fresh local starts with no value (bash, without
+             * localvar_inherit) */
+            if (!has_value) {
+                int ox = env_find(name, klen);
+                if (ox >= 0) env_remove_at(ox);
+            }
+        }
 
         /* BEFORE the assignment: the literal parser asks whether the array is
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
@@ -6383,6 +6731,10 @@ static void cmd_declare(int argc, char **argv) {
             if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
         }
 
+        /* -i -l -u go on BEFORE the value: `declare -i x=1+2` stores 3. */
+        shell_decl_attrs(name, attr_on, attr_off,
+                         set_array || sh_array_find(name) != 0);
+
         if (has_value) {
             g_readonly_hit = false;
             if (env_set_kv(argv[i]) < 0) {
@@ -6406,11 +6758,14 @@ static void cmd_declare(int argc, char **argv) {
         } else if (!env_get(name)) {
             if (env_set_attr_holder(name) < 0) { shell_set_status(1); continue; }
         }
+        /* READONLY IS ON THE NAME, scalar or array. It was marked only
+         * when a scalar entry existed, so `typeset -ar a=(1 2)` -- an array
+         * has none -- stayed writable (Oils 0400). */
+        if (set_readonly) (void)shell_readonly_mark(name, klen);
         int idx = env_find(name, klen);
         if (idx < 0) continue;
         if (set_export)   g_env_flags[idx] |= SHVAR_EXPORTED;
         if (clear_export) g_env_flags[idx] &= ~(unsigned)SHVAR_EXPORTED;
-        if (set_readonly) (void)shell_readonly_mark(name, klen);
         /* The attribute goes on AFTER the value, because the value is the
          * name being referred to and setting it must not go through the
          * reference that does not exist yet. */
@@ -6605,7 +6960,10 @@ static void cmd_readonly(int argc, char **argv) {
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `r+=bar` -> `r` */
         if (!shell_name_is_valid(argv[i], nlen)) {
-            kprintf("readonly: `%s': not a valid identifier\n", argv[i]);
+            if (shell_decl_element_lb(argv[i], nlen))
+                kprintf("readonly: `%.*s': not a valid identifier\n", (int)nlen, argv[i]);
+            else
+                kprintf("readonly: `%s': not a valid identifier\n", argv[i]);
             shell_set_status(1);
             continue;
         }
@@ -6626,14 +6984,9 @@ static void cmd_readonly(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-        } else if (opt_A) {
-            char nm[128];
-            if (nlen < sizeof nm) {
-                memcpy(nm, argv[i], nlen);
-                nm[nlen] = '\0';
-                if (!sh_array_find(nm)) (void)sh_array_make_assoc(nm);
-            }
         }
+        /* `readonly -a/-A NAME` with no value makes no array: bash shows
+         * `declare -r NAME` (Oils 0459). It made an empty assoc array. */
 
         /* Marked under the NAME, not `r+`: the append form must make the
          * same variable read-only that it just wrote. */
@@ -7135,6 +7488,7 @@ static void shell_print_vars_set_format(void) {
         for (int i = 0; i < g_envc; i++) {
             size_t kl = env_key_len(g_env[i]);
             if (kl == 0) continue;
+            if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* not set */
             char *k = words_store(&keys, g_env[i], kl);
             if (!k) { kfree(names); shell_set_status(1); return; }
             names[n++] = k;
@@ -14974,7 +15328,10 @@ static int test_unary(const char *op, const char *operand) {
             if (!sh_subscript_eval(sub, nm, false, &ix)) return 1;
             return sh_array_get(nm, ix) ? 0 : 1;
         }
-        if (env_find(operand, strlen(operand)) >= 0) return 0;
+        {
+            int vx = env_find(operand, strlen(operand));
+            if (vx >= 0 && !(g_env_flags[vx] & SHVAR_NOVALUE)) return 0;
+        }
         if (sh_array_is_assoc(operand))
             return sh_array_get_key(operand, "0") ? 0 : 1;
         return sh_array_get(operand, 0) ? 0 : 1;
@@ -20728,6 +21085,7 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
         if (!e) continue;
         size_t klen = env_key_len(e);
         if (klen < plen || memcmp(e, prefix, plen) != 0) continue;
+        if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* declared, not set */
         idxs[n++] = i;
     }
     /* Insertion sort on the KEY only -- the blob continues into the value,
@@ -22168,7 +22526,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
 
     if (opch == '\0') {
         if (!is_set && g_opt_nounset) {
-            kprintf("%s: unbound variable\n", shell_param_display(name));
+            shell_arith_unbound(shell_param_display(name));
             return -1;
         }
         return is_join ? sh_put_join_value(b, value)
@@ -22876,7 +23234,7 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
     if (!val && strcmp(name, "LINENO") == 0)
         return sb_put_uint(b, g_shell_lineno);
     if (!val && g_opt_nounset) {
-        kprintf("%s: unbound variable\n", name);
+        shell_arith_unbound(name);
         return -1;
     }
     return sb_put_data_str(b, val);
@@ -26412,6 +26770,7 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
          * one there, so `export a` on an array marks it and exports nothing;
          * printenv reports it unset, not empty. */
         if (g_env_flags[i] & SHVAR_ARRAY) continue;
+        if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* nothing to pass */
         if (!shell_assignment_overrides(g_env[i], assignv, assignc))
             out_env[n++] = g_env[i];
     }
