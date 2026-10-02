@@ -11564,6 +11564,8 @@ struct shell_scan {
     bool assign_prefix; /* ...and it was a NAME= assignment prefix */
     bool redir;         /* the next word is a redirection target, not a command */
     bool func_hdr;      /* the text so far ends in `name ( )`, body still owed */
+    bool func_kw;       /* the last token was the reserved word `function`:
+                         * the next word is a NAME, whatever it spells */
     bool bad_paren;     /* a `(` that cannot legally be there -- see below */
     /* Inside `name=( ... )`. NOT the same as being inside a subshell:
      * an array literal takes WORDS, so a control operator there is a
@@ -11619,6 +11621,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->assign_prefix = false;
     st->redir = false;
     st->func_hdr = false;
+    st->func_kw = false;
     st->bad_paren = false;
     st->in_array_lit = false;
     st->array_lit_depth = 0;
@@ -11699,7 +11702,7 @@ static bool shell_scan_incomplete(const struct shell_scan *st) {
      * parser `[[ -n x` -- which is also why the accumulator would not join
      * `[[ a &&` to the line that finishes it. */
     return st->compound > 0 || st->paren > 0 || st->brace > 0 ||
-           st->func_hdr || st->cont_op || st->nest > 0 || st->dbracket ||
+           st->func_hdr || st->func_kw || st->cont_op || st->nest > 0 || st->dbracket ||
            st->in_sq || st->in_dq;     /* the line ended inside a string */
 }
 
@@ -12375,6 +12378,21 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * either: the word's head was already counted on its own line. */
     if (resumed_quote) return;
 
+    /* `function NAME`: this word is the NAME (bash takes any word there --
+     * `function ble/is-array`, `function test-suffixes`), and a body or a
+     * `( )` comes next, on this line or a later one. Exactly the state the
+     * `name ( )` header leaves behind, plus a `(` still allowed. */
+    if (st->func_kw) {
+        st->func_kw = false;
+        st->func_hdr = true;
+        st->cmd_pos = true;
+        st->prev_word_cmd = true;
+        st->prev_word_name = true;
+        st->assign_prefix = false;
+        st->no_sep = true;
+        return;
+    }
+
     /* `[[` and `]]` bracket a CONDITIONAL EXPRESSION with its own grammar.
      *
      * ONLY WHERE A COMMAND MAY START. `echo [[` is an argument that happens
@@ -12479,6 +12497,16 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->cmd_pos = false; st->prev_word_cmd = false;
         st->no_sep = false;
         st->cmd_seen = true;            /* a closed group is a command */
+        return;
+    }
+    /* THE `function` KEYWORD. tsh had no such word: `function f { ...; }`
+     * ran a command called `function`, split the line at the `;` inside the
+     * braces, and died on the `}` -- every script in that style stopped at
+     * its first definition (Oils 0394 0508 0511 1977 2587-2589). */
+    if (resv && shell_word_eq(w, n, "function")) {
+        st->func_kw = true;
+        st->cmd_pos = false; st->prev_word_cmd = false;
+        st->no_sep = true;
         return;
     }
     if (resv && (shell_word_eq(w, n, "if")   || shell_word_eq(w, n, "while") ||
@@ -31154,8 +31182,23 @@ static bool shell_try_case_command(const char *src) {
 
 static bool shell_line_syntax_ok(const char *src);
 
+/* Blanks AND newlines: bash's grammar allows a newline_list between a
+ * function's header and its body (`f()` and `function f` on one line, the
+ * `{` on the next). */
+static const char *shell_skip_blanks_nl(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    return s;
+}
+
 static bool shell_try_function_definition(const char *src) {
     const char *s = shell_skip_blanks(src);
+    /* `function NAME [()] BODY` -- bash's other spelling, where the
+     * parentheses are optional and the name is any word. */
+    bool kw = false;
+    if (shell_starts_with_word(s, "function")) {
+        kw = true;
+        s = shell_skip_blanks(s + 8);
+    }
     if (!shell_func_name_char(*s)) return false;
 
     const char *name_start = s;
@@ -31175,7 +31218,9 @@ static bool shell_try_function_definition(const char *src) {
             s = q;
             continue;
         }
-        if (!shell_func_name_char(*s)) break;
+        /* `#` starts a comment only at the start of a word: inside one it
+         * is a character -- `function ble/array#unshift { ...; }`. */
+        if (!shell_func_name_char(*s) && !(*s == '#' && s > name_start)) break;
         s++;
     }
     size_t name_len = (size_t)(s - name_start);
@@ -31183,15 +31228,19 @@ static bool shell_try_function_definition(const char *src) {
      * either, which is the `$`/backtick case that has to keep going so it
      * can be reported. What is left is an ordinary word like `a=`, and it
      * belongs to the assignment path. */
-    if (!shell_word_is_func_name(name_start, name_len) &&
+    if (!kw && !shell_word_is_func_name(name_start, name_len) &&
         shell_func_name_is_valid(name_start, name_len)) return false;
     const char *after_name = shell_skip_blanks(s);
     /* `( )` and `()` are the same header: POSIX makes `(` and `)` separate
      * tokens, so `fun ( ) { ...; }` is legal and was reported as
-     * "/bin/fun not found". */
-    if (after_name[0] != '(') return false;
-    const char *close = shell_skip_blanks(after_name + 1);
-    if (*close != ')') return false;
+     * "/bin/fun not found". After `function` they are optional. */
+    const char *close = 0;
+    if (after_name[0] == '(' &&
+        *shell_skip_blanks(after_name + 1) == ')') {
+        close = shell_skip_blanks(after_name + 1);
+    } else if (!kw) {
+        return false;
+    }
 
     /* From here it IS a function definition, so a name this shell cannot
      * accept is reported as one -- bash answers `$foo-bar() { ls; }` with
@@ -31207,7 +31256,7 @@ static bool shell_try_function_definition(const char *src) {
         return true;
     }
 
-    s = shell_skip_blanks(close + 1);
+    s = shell_skip_blanks_nl(close ? close + 1 : after_name);
     /* `f() ( return 42 )` -- a subshell body. POSIX allows any compound
      * command as a function body; a group and a subshell are the two that
      * matter, and only the group was accepted. */
