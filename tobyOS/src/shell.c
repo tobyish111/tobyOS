@@ -8443,7 +8443,26 @@ static void shell_getopts_finish_end(const char *name, int optind) {
     shell_set_status(1);
 }
 
+static void cmd_getopts_in(int argc, char **argv);
+/* A BAD NAME DOES NOT STOP THE PARSE: bash moves OPTIND and sets OPTARG and
+ * only then fails to bind NAME -- "`opt-': not a valid identifier", status
+ * 1 (Oils 0887). tsh refused before parsing, status 2, OPTIND untouched.
+ * The parse runs on a scratch name that is dropped afterwards. */
 static void cmd_getopts(int argc, char **argv) {
+    if (argc >= 3 && argv[2] && !shell_name_is_valid(argv[2], strlen(argv[2]))) {
+        const char *bad = argv[2];
+        argv[2] = (char *)"TSH_GETOPTS_NAME";
+        cmd_getopts_in(argc, argv);
+        argv[2] = (char *)bad;
+        (void)env_unset("TSH_GETOPTS_NAME");
+        kprintf("getopts: `%s': not a valid identifier\n", bad);
+        shell_set_status(1);
+        return;
+    }
+    cmd_getopts_in(argc, argv);
+}
+
+static void cmd_getopts_in(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 3) {
         kprintf_raw("usage: getopts optstring NAME [ARG...]\n");
@@ -8486,9 +8505,12 @@ static void cmd_getopts(int argc, char **argv) {
              * all, which cannot mean anything, so bash starts the scan over.
              * A loop that simply consumed its last option leaves OPTIND one
              * past the end, and the caller wants that number -- `getopts` in
-             * a function that was called with `-c bar` must report 3. */
-            shell_getopts_finish_end(name,
-                                     (optind > arg_count + 1) ? 1 : optind);
+             * a function that was called with `-c bar` must report 3.
+             *
+             * That rule is bash's sh_getopt: past the end, OPTIND becomes
+             * argc -- $#+1 -- which is 1 only when there are no arguments.
+             * A second loop over ONE argument ends at 2 (Oils 0895). */
+            shell_getopts_finish_end(name, arg_count + 1);
             return;
         }
         arg = args[optind - 1] ? args[optind - 1] : "";
@@ -14886,8 +14908,10 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
         memcpy(out, p, dlen);
         out[dlen] = '/';
         memcpy(out + dlen + 1, arg, alen + 1);
+        /* a DIRECTORY of that name is not the script: the search goes on
+         * (bash; Oils 0866) */
         struct vfs_stat st;
-        if (vfs_stat(out, &st) == VFS_OK) return 0;
+        if (vfs_stat(out, &st) == VFS_OK && st.type != VFS_TYPE_DIR) return 0;
         p = *end ? end + 1 : end;
     }
     /* Not on PATH: the working directory is the fallback, not the first try. */
@@ -14937,6 +14961,8 @@ static void cmd_dot(int argc, char **argv) {
     /* The dispatcher pre-set $? to 0; this is what it replaced. */
     int status_in = g_shell_prev_status;
     shell_set_status(0);
+    /* `--` ends the options (bash; Oils 0852): `. -- file` sources file */
+    if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
     if (argc < 2) {
         kprintf(".: filename argument required\n");
         kprintf_raw(".: usage: . filename [arguments]\n");
@@ -15380,6 +15406,15 @@ static void cmd_trap(int argc, char **argv) {
     {
         int probe = 0;
         if (!reset && parse_int(action, &probe) == 0 && probe >= 0) {
+            reset = true;
+            first_cond = 1;
+        }
+    }
+    /* ONE OPERAND THAT NAMES A CONDITION RESETS IT: `trap EXIT`, `trap INT`
+     * (bash, outside posix mode; Oils 1231). tsh printed the usage. */
+    if (!reset && argc == 2 && !g_opt_posix) {
+        int sig = -1;
+        if (shell_trap_parse_condition(action, &sig) == 0) {
             reset = true;
             first_cond = 1;
         }
