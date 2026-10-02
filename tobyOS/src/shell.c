@@ -5290,6 +5290,20 @@ static void shell_arith_unbound(const char *name) {
     }
 }
 
+/* AN ASSOCIATIVE KEY IN ARITHMETIC IS A WORD: expanded, quotes removed --
+ * `(( x = A['x'] ))` reads key x, not 'x' (bash's expand of the subscript;
+ * Oils 1489 1492). The text is copied out because it is expanded in place
+ * of nothing the caller owns. */
+static int shell_expand_word_ex(const char *word, struct shell_sb *out,
+                                bool dq_syntax, bool sq_syntax);
+static int shell_argmarks_to_spaces(const char *s, struct shell_sb *out);
+static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx) {
+    SH_SB(kraw);
+    if (shell_expand_word_ex(sub, &kraw, true, true) < 0) return 0;
+    if (shell_argmarks_to_spaces(kraw.p ? kraw.p : "", kx) < 0) return 0;
+    return kx->p ? kx->p : "";
+}
+
 static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
                      bool *set, long *ind) {
     (void)ctx;
@@ -5309,7 +5323,15 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
         if (arr) v = arr->assoc ? sh_array_get_key(name, "0") : sh_array_get(name, 0);
         else v = sv;
     } else if (arr && arr->assoc) {
-        v = sh_array_get_key(name, sub);
+        SH_SB(kx);
+        const char *key = sh_ar_assoc_key(sub, &kx);
+        if (!key) return SARITH_CB_FAIL;
+        v = sh_array_get_key(name, key);
+        if (v) {
+            *val = shell_strdup(v);
+            if (!*val) return SARITH_CB_FAIL;
+        }
+        return SARITH_CB_OK;
     } else {
         /* bash reads an unset array's subscript too -- except under set -u,
          * where the unset array is the error */
@@ -5345,8 +5367,12 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
         else rc = env_set(name, val);       /* says "readonly variable" */
         return rc < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
     }
-    if (arr && arr->assoc)
-        return sh_array_set_key(name, sub, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
+    if (arr && arr->assoc) {
+        SH_SB(kx);
+        const char *key = sh_ar_assoc_key(sub, &kx);
+        if (!key) return SARITH_CB_FAIL;
+        return sh_array_set_key(name, key, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
+    }
     long i = ind;
     if (i < 0) {
         int k = sh_subscript_value(sub, &i);
@@ -7815,10 +7841,34 @@ static void cmd_unset(int argc, char **argv) {
                     (void)sh_array_create(nm);
                     continue;
                 }
-                if (arr && arr->assoc) { sh_array_unset_key(arr, sub); continue; }
+                /* the KEY is a word: `unset -v 'd["$k"]'` expands it, quotes
+                 * and all (bash; Oils 1348) -- it was looked up as written */
+                if (arr && arr->assoc) {
+                    SH_SB(kx);
+                    const char *key = sh_ar_assoc_key(sub, &kx);
+                    if (key) sh_array_unset_key(arr, key);
+                    continue;
+                }
                 long ix = 0;
                 if (arr && sh_subscript_eval(sub, nm, false, &ix)) {
                     sh_array_unset_idx(arr, ix);
+                    continue;
+                }
+                /* A SCALAR, set or only declared: element 0 is the whole
+                 * variable, any other "NAME: not an array variable",
+                 * status 1 (bash's unbind_array_element; Oils 1347). */
+                if (!arr && env_find(nm, strlen(nm)) >= 0) {
+                    long si = 0;
+                    if (!sh_subscript_eval(sub, nm, false, &si)) {
+                        shell_set_status(1);
+                        continue;
+                    }
+                    if (si == 0) {
+                        (void)env_unset(nm);
+                    } else {
+                        kprintf("unset: %s: not an array variable\n", nm);
+                        shell_set_status(1);
+                    }
                     continue;
                 }
             } else if (sh_array_find(argv[i])) {
