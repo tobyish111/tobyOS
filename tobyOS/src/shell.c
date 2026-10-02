@@ -29302,6 +29302,23 @@ static int shell_dbr_primary(struct shell_dbr *d) {
         return eq;
     }
 
+    /* -eq AND FRIENDS EVALUATE THEIR OPERANDS AS ARITHMETIC inside [[ ]]
+     * (bash's arithcomp with TEST_ARITHEXP): `e=1+2; [[ e -eq 3 ]]` is
+     * true, `[[ 0x10 -eq 16 ]]` too. An operand that does not evaluate
+     * says so -- "[[: ..." -- and the test is false. tsh compared them as
+     * plain integers and called anything else a syntax error, which ended
+     * the script. `[` keeps the integer rule (test_binary). */
+    if (strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
+        strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
+        strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0) {
+        long va = 0, vb = 0;
+        if (shell_arith_eval(a, "[[", &va) != SARITH_OK) return 0;
+        if (shell_arith_eval(b, "[[", &vb) != SARITH_OK) return 0;
+        if (op[1] == 'e') return va == vb;
+        if (op[1] == 'n') return va != vb;
+        if (op[1] == 'l') return op[2] == 't' ? va < vb : va <= vb;
+        return op[2] == 't' ? va > vb : va >= vb;
+    }
     bool err = false;
     int r = test_binary(a, op, b, &err);
     if (err) { d->err = true; return 0; }
