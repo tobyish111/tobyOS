@@ -7590,10 +7590,16 @@ static void cmd_readonly(int argc, char **argv) {
  * contents of the second read only. Reads through the same shell_in/fd[0]
  * handle `read` uses, so a redirection on the command applies.
  */
+static long shell_parse_long_value(const char *s, bool *ok);
 static void cmd_readarray(int argc, char **argv) {
     shell_set_status(0);
     bool trim = false;
     char delim = '\n';
+    /* -n COUNT (at most that many; 0 is all), -O ORIGIN (start there, and
+     * keep what the array held), -s COUNT (skip that many first) -- bash's
+     * mapfile; tsh refused all three (Oils 0654 0655). */
+    long max_lines = 0, origin = 0, skip = 0;
+    bool have_origin = false;
     int first = 1;
     while (first < argc && argv[first][0] == '-' && argv[first][1]) {
         if (strcmp(argv[first], "--") == 0) { first++; break; }
@@ -7615,9 +7621,33 @@ static void cmd_readarray(int argc, char **argv) {
                 shell_set_status(2);
                 return;
             }
-            /* -n, -O, -s, -c, -C remain unimplemented. Refusing is better
-             * than silently ignoring a count or origin and handing back an
-             * array that quietly differs from what was asked for. */
+            if (*q == 'n' || *q == 'O' || *q == 's') {
+                const char *v = 0;
+                if (q[1]) v = q + 1;
+                else if (first + 1 < argc) v = argv[++first];
+                if (!v) {
+                    kprintf("%s: -%c: option requires an argument\n",
+                            argv[0], *q);
+                    shell_set_status(2);
+                    return;
+                }
+                bool okn = true;
+                long nv = shell_parse_long_value(v, &okn);
+                if (!okn || nv < 0) {
+                    kprintf("%s: %s: %s\n", argv[0], v,
+                            *q == 'O' ? "invalid array origin"
+                                      : "invalid line count");
+                    shell_set_status(1);
+                    return;
+                }
+                if (*q == 'n') max_lines = nv;
+                else if (*q == 's') skip = nv;
+                else { origin = nv; have_origin = true; }
+                break;
+            }
+            /* -u, -c and -C remain unimplemented. Refusing is better than
+             * silently ignoring them and handing back an array that quietly
+             * differs from what was asked for. */
             kprintf("%s: -%c not supported\n", argv[0], *q);
             shell_set_status(2);
             return;
@@ -7645,13 +7675,16 @@ static void cmd_readarray(int argc, char **argv) {
         return;
     }
 
-    sh_array_unset(name);                 /* REPLACE, do not append */
+    /* REPLACE, do not append -- unless -O names where to start */
+    if (!have_origin) sh_array_unset(name);
     if (!sh_array_create(name)) { shell_set_status(1); goto done; }
 
     {
         SH_SB(linesb);
-        long idx = 0;
+        long idx = origin;
+        long stored = 0, skipped = 0;
         for (;;) {
+            if (max_lines > 0 && stored >= max_lines) break;
             bool got_any = false;
             int rr = shell_read_line_from_file(in, true, &linesb, &got_any,
                                                delim, 0, -1, false);
@@ -7681,7 +7714,9 @@ static void cmd_readarray(int argc, char **argv) {
                     line = linesb.p;
                 }
             }
+            if (skipped < skip) { skipped++; continue; }
             if (sh_array_set(name, idx++, line) < 0) { shell_set_status(1); break; }
+            stored++;
         }
     }
 done:
