@@ -1268,19 +1268,9 @@ static int shell_read_line_from_file(struct file *in, bool raw,
 static struct file *shell_builtin_fd(int n);
 static bool  sh_subscript_eval(const char *sub, const char *name,
                                bool for_write, long *out);
-/* Moved up from beside the evaluator: an array SUBSCRIPT is arithmetic
- * context, so sh_subscript_eval() below needs the COMPLETE type. */
-struct shell_arith {
-    const char *p;
-    bool ok;
-};
-/* The real entry point. `shell_arith_expr` is a MACRO alias for this,
- * #defined ~10k lines below -- so calling it up here compiles fine and
- * then fails at LINK with "undefined symbol: shell_arith_expr".
- * -fsyntax-only cannot see that, which is why it went unnoticed while
- * the gate quietly re-ran a stale ISO. */
-static long shell_arith_comma(struct shell_arith *a);
-static void shell_arith_skip(struct shell_arith *a);
+/* Arithmetic is bash's evaluator (B10): see shell_arith.inc, and
+ * shell_arith_eval for how the shell's variables reach it. */
+#include "shell_arith.inc"
 static const char *sh_split_subscript(const char *key, size_t klen,
                                       char *name, size_t namecap,
                                       char *sub, size_t subcap);
@@ -2780,6 +2770,32 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
     }
     return sh_array_literal_commit(tmp, name, append);
+}
+
+/* AN ELEMENT ASSIGNMENT TO A SCALAR MAKES IT AN ARRAY whose element 0 is the
+ * old value (bash's convert_var_to_array):
+ *
+ *     t=str; t[1]=q; echo "$t ${t[1]} ${#t[@]}"     bash: str q 2
+ *     s=str; s[0]=q; echo "$s"                      bash: q
+ *
+ * tsh made a new array BESIDE the scalar, so ${t[0]} was empty and the
+ * count 1, and the scalar went on shadowing element 0: $s still read "str".
+ * The scalar goes the way the array-literal path removes it (above). */
+static int sh_array_absorb_scalar(const char *name) {
+    if (sh_array_find(name)) return 0;
+    char tgt[128];
+    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    if (!real || !*real) real = name;
+    int si = env_find(real, strlen(real));
+    if (si < 0 || (g_env_flags[si] & SHVAR_ARRAY)) return 0;
+    const char *old = env_get(real);
+    SH_SB(vb);
+    if (sb_puts(&vb, old ? old : "") < 0) return -1;
+    if (!sh_array_create(real)) return -1;
+    if (sh_array_set(real, 0, vb.p) < 0) return -1;
+    si = env_find(real, strlen(real));
+    if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
+    return 0;
 }
 
 /* Intercept the assignment forms that mean ARRAY before the scalar path sees
@@ -4868,9 +4884,150 @@ static void shell_array_frame_restore(struct shell_array_frame *f) {
  *
  * `for_write` suppresses the negative rewrite for assignment targets, where
  * bash rejects a negative subscript on an array that has no elements yet. */
+/* ---- bash's arithmetic over tsh's variables (B10) -----------------------
+ * The evaluator is shell_arith.inc's -- bash's expr.c, written from it and
+ * compared with bash on the host (tools/agent/sarith). It reaches the
+ * shell's variables only through these. */
+static long sh_array_max_idx(const struct sh_array *a);
+static int sh_array_set_key(const char *name, const char *key, const char *val);
+static bool shell_stack_exhausted(int depth);
+static int sh_subscript_value(const char *sub, long *out);
+
+/* set -u met an unbound variable in arithmetic: bash's err_unboundvar,
+ * then a non-interactive shell ENDS (FORCE_EOF) and a prompt drops the
+ * line. NAME is 0 when an inner evaluation has already said it. */
+static void shell_arith_unbound(const char *name) {
+    if (name) kprintf("%s: unbound variable\n", name);
+    shell_set_status(1);
+    if (g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = g_interactive ? SHELL_FLOW_DISCARD : SHELL_FLOW_EXIT;
+        g_shell_flow_status = 1;
+    }
+}
+
+static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
+                     bool *set, long *ind) {
+    (void)ctx;
+    *val = 0;
+    *set = false;
+    *ind = -1;
+    struct sh_array *arr = sh_array_find(name);
+    const char *sv = arr ? 0 : env_get(name);
+    char lineno[24];
+    if (!arr && !sv && strcmp(name, "LINENO") == 0) {
+        ksnprintf(lineno, sizeof lineno, "%lu", g_shell_lineno);
+        sv = lineno;
+    }
+    *set = arr || sv;
+    const char *v = 0;
+    if (!sub) {
+        if (arr) v = arr->assoc ? sh_array_get_key(name, "0") : sh_array_get(name, 0);
+        else v = sv;
+    } else if (arr && arr->assoc) {
+        v = sh_array_get_key(name, sub);
+    } else {
+        /* bash reads an unset array's subscript too -- except under set -u,
+         * where the unset array is the error */
+        if (!*set && g_opt_nounset) return SARITH_CB_OK;
+        long i = 0;
+        int k = sh_subscript_value(sub, &i);
+        if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
+        if (k != SARITH_OK) return SARITH_CB_FAIL;
+        if (i < 0 && arr) i = sh_array_max_idx(arr) + 1 + i;
+        if (i < 0) {
+            kprintf("%s: bad array subscript\n", name);
+            return SARITH_CB_OK;            /* read as nothing */
+        }
+        *ind = i;
+        if (arr) v = sh_array_get(name, i);
+        else if (sv && i == 0) v = sv;
+    }
+    if (v) {
+        *val = shell_strdup(v);
+        if (!*val) return SARITH_CB_FAIL;
+    }
+    return SARITH_CB_OK;
+}
+
+static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
+                     const char *val) {
+    (void)ctx;
+    struct sh_array *arr = sh_array_find(name);
+    if (!sub) {
+        int rc;
+        if (arr) rc = arr->assoc ? sh_array_set_key(name, "0", val)
+                                 : sh_array_set(name, 0, val);
+        else rc = env_set(name, val);       /* says "readonly variable" */
+        return rc < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
+    }
+    if (arr && arr->assoc)
+        return sh_array_set_key(name, sub, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
+    long i = ind;
+    if (i < 0) {
+        int k = sh_subscript_value(sub, &i);
+        if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
+        if (k != SARITH_OK) return SARITH_CB_FAIL;
+        if (i < 0 && arr) i = sh_array_max_idx(arr) + 1 + i;
+        if (i < 0) {
+            kprintf("%s[%s]: bad array subscript\n", name, sub);
+            return SARITH_CB_OK;            /* nothing is assigned */
+        }
+    }
+    /* an element of a SCALAR makes it an array (sh_array_absorb_scalar):
+     * `x=5; (( x[1] = 3 ))` leaves x=([0]="5" [1]="3") */
+    if (sh_array_absorb_scalar(name) < 0) return SARITH_CB_FAIL;
+    return sh_array_set(name, i, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
+}
+
+static bool sh_ar_stack_ok(void *ctx) {
+    (void)ctx;
+    return !shell_stack_exhausted(0);
+}
+
+/* EXPR's value by bash's rules. An error is reported as bash's evalerror
+ * words it, after "NAME: line N: " -- with CMDNAME first when the context
+ * has one ("((", "let"; 0 for $(( )) and a subscript) -- and an unbound
+ * variable under set -u as bash's, which ends a script. */
+static int shell_arith_eval(const char *expr, const char *cmdname, long *out) {
+    struct sarith_env env;
+    env.get = sh_ar_get;
+    env.set = sh_ar_set;
+    env.stack_ok = sh_ar_stack_ok;
+    env.ctx = 0;
+    env.nounset = g_opt_nounset;
+    char *msg = 0;
+    long v = 0;
+    int k = sarith_eval(expr, &env, &v, &msg);
+    if (k == SARITH_ERROR && msg)
+        kprintf("%s%s%s\n", cmdname ? cmdname : "", cmdname ? ": " : "", msg);
+    else if (k == SARITH_UNBOUND)
+        shell_arith_unbound(msg);
+    if (msg) kfree(msg);
+    *out = v;
+    return k;
+}
+
 static bool sh_subscript_eval(const char *sub, const char *name,
                               bool for_write, long *out) {
+    long v = 0;
     if (!sub || !*sub) return false;
+    if (sh_subscript_value(sub, &v) != SARITH_OK) return false;
+    if (v < 0) {
+        struct sh_array *arr = sh_array_find(name);
+        long top = sh_array_max_idx(arr);
+        if (top < 0) { if (for_write) return false; *out = -1; return true; }
+        v = top + 1 + v;                    /* -1 -> the last element */
+        if (v < 0) { *out = -1; return true; }   /* out of range: unset */
+    }
+    *out = v;
+    return true;
+}
+
+/* A subscript's VALUE, as bash's array code computes it: the text expanded,
+ * then evaluated as arithmetic with no command name in its errors
+ * (array_expand_index). Negative values are the caller's to interpret. */
+static int sh_subscript_value(const char *sub, long *outv) {
+    if (!sub || !*sub) return SARITH_FAILED;
     SH_SB(expanded);
     const char *src = sub;
     if (shell_expand_literal_quotes(sub, &expanded) == 0)
@@ -4897,7 +5054,7 @@ static bool sh_subscript_eval(const char *sub, const char *name,
         for (const char *q = src; *q; q++)
             if (*q == '"') { quoted = true; open = !open; }
         if (quoted && !open) {
-            if (src != expanded.p && sb_set(&expanded, src) < 0) return false;
+            if (src != expanded.p && sb_set(&expanded, src) < 0) return SARITH_FAILED;
             char *w = expanded.p;
             size_t o = 0;
             for (const char *q = expanded.p; *q; q++)
@@ -4907,19 +5064,11 @@ static bool sh_subscript_eval(const char *sub, const char *name,
             src = expanded.p;
         }
     }
-    struct shell_arith a = { .p = src, .ok = true };
-    long v = shell_arith_comma(&a);
-    shell_arith_skip(&a);
-    if (!a.ok || *a.p != '\0') return false;
-    if (v < 0) {
-        struct sh_array *arr = sh_array_find(name);
-        long top = sh_array_max_idx(arr);
-        if (top < 0) { if (for_write) return false; *out = -1; return true; }
-        v = top + 1 + v;                    /* -1 -> the last element */
-        if (v < 0) { *out = -1; return true; }   /* out of range: unset */
-    }
-    *out = v;
-    return true;
+    long v = 0;
+    int k = shell_arith_eval(src, 0, &v);
+    if (k != SARITH_OK) return k;
+    *outv = v;
+    return SARITH_OK;
 }
 
 /* `declare -A m` must mark the array BEFORE any assignment is parsed --
@@ -16916,12 +17065,9 @@ static void cmd_let(int argc, char **argv) {
     }
     long last = 0;
     for (int i = 1; i < argc; i++) {
-        struct shell_arith a;
-        a.p  = argv[i];
-        a.ok = true;
-        last = shell_arith_comma(&a);
-        if (!a.ok) {
-            kprintf("let: %s: syntax error\n", argv[i]);
+        /* bash's let_builtin: an error is evalerror's, named "let", and
+         * ends the builtin with status 1 */
+        if (shell_arith_eval(argv[i], "let", &last) != SARITH_OK) {
             shell_set_status(1);
             return;
         }
@@ -21789,18 +21935,6 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
 #undef SH_WORD_TILDE
 }
 
-/* struct shell_arith is defined up with the array store -- an array
- * SUBSCRIPT is arithmetic context, so sh_subscript_eval() needs the
- * complete type long before this point. */
-
-static void shell_arith_skip(struct shell_arith *a) {
-    while (*a->p == ' ' || *a->p == '\t') a->p++;
-}
-
-static long shell_arith_or(struct shell_arith *a);
-static long shell_arith_ternary(struct shell_arith *a);
-static int shell_append_long(char *buf, size_t *pos, size_t cap, long v);
-
 static long shell_parse_long_value(const char *s, bool *ok) {
     long v = 0;
     bool neg = false;
@@ -21818,533 +21952,6 @@ static long shell_parse_long_value(const char *s, bool *ok) {
     if (*s) return 0;
     *ok = true;
     return neg ? -v : v;
-}
-
-/* THE VALUE OF A VARIABLE IN ARITHMETIC IS ITSELF AN EXPRESSION.
- *
- *     x="1+1" ; echo $((x))        bash: 2    tsh was: 0
- *     y=x     ; echo $((y))        bash: 2    -- it chains
- *     a=(0 1 2); e="a[1]"
- *     echo $((e))  ${b[e]}         bash: 1    -- and a subscript is
- *                                               arithmetic context too
- *
- * tsh ran the value through shell_parse_long_value() and took 0 when that
- * failed, so every one of these answered 0. The rule is POSIX's as much as
- * bash's, and it is why `${b[expr]}` with expr='a[$(echo 2)]' reads b[2].
- *
- * ONE HELPER, FOUR CALLERS. The bare name, `++x`, `--x` and the post-forms
- * each had their own copy of the lookup; this file has already paid twice
- * for a decoder that existed twice and drifted three times, so the lookup
- * exists once now.
- *
- * THE DEPTH CAP IS THE SEMANTICS, not a safety net. `x=x` and `a=b; b=a`
- * are infinite by construction, and bash answers them with
- * "expression recursion level exceeded" and abandons the command -- so
- * exceeding the cap sets a->ok, exactly like a syntax error, rather than
- * quietly returning 0.
- *
- * There is deliberately NO integer fast path. Sending "010" straight to
- * shell_parse_long_value() would read ten where arithmetic means eight, and
- * "0x10" sixteen; re-entering the real parser gets the bases right for free.
- */
-#define SHELL_ARITH_MAX_DEPTH 32
-static int g_arith_depth;
-
-/* Evaluate a stored VALUE as an arithmetic expression. Split out of
- * shell_arith_name_value() so an array ELEMENT gets the identical rule --
- * `a[0]=1+1; echo $(( a[0] ))` is 2 for the same reason `x=1+1` is. */
-static long shell_arith_eval_str(struct shell_arith *a, const char *vstr,
-                                 const char *what) {
-    if (!vstr) return 0;
-    /* EMPTY *OR BLANK* IS ZERO, and the difference is a POSIX case. `a=''`
-     * and `a2=' '` must both give 0; re-entering the parser on " " runs it
-     * off the end of the string and reports a syntax error, which is how
-     * the first cut of this helper broke 0154 while fixing 24 others. */
-    {
-        const char *q = vstr;
-        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
-        if (!*q) return 0;
-    }
-    if (g_arith_depth >= SHELL_ARITH_MAX_DEPTH) {
-        kprintf(SH_PFX_SHELL "%s: expression recursion level exceeded\n", what);
-        a->ok = false;
-        return 0;
-    }
-    g_arith_depth++;
-    struct shell_arith inner;
-    inner.p = vstr;
-    inner.ok = true;
-    long r = shell_arith_comma(&inner);
-    shell_arith_skip(&inner);
-    if (!inner.ok || *inner.p) { a->ok = false; r = 0; }
-    g_arith_depth--;
-    return r;
-}
-
-static long shell_arith_name_value(struct shell_arith *a, const char *name) {
-    return shell_arith_eval_str(a, env_get(name), name);
-}
-
-/* An ARRAY ELEMENT as an arithmetic target. `(( A[5] = 10 ))` and
- * `(( A[5] += 6 ))` are ordinary bash, and tsh had no element lvalue at
- * all: the name parser read `A`, stopped at the `[`, and the leftover
- * `[5] = 10` failed the expression -- so the whole `((...))` reported a
- * syntax error and the assignment never happened.
- *
- * The subscript follows the table it belongs to: a literal KEY for an
- * associative array, an arithmetic expression for an indexed one, which
- * is what sh_subscript_eval() already decides everywhere else. */
-static long sh_arith_elem_get(struct shell_arith *a, const char *name,
-                              const char *sub) {
-    const char *v = 0;
-    if (sh_array_is_assoc(name)) {
-        v = sh_array_get_key(name, sub);
-    } else {
-        long ix = 0;
-        if (sh_subscript_eval(sub, name, false, &ix)) v = sh_array_get(name, ix);
-    }
-    return shell_arith_eval_str(a, v, name);
-}
-
-/* Returns false when the SUBSCRIPT itself is not an expression, so the
- * caller can fail the whole `$(( ))` the way bash does:
- *
- *     x='a[<(echo 42)]=1' ; echo $(( x ))
- *     bash: syntax error, and the echo prints NOTHING
- *
- * Silently doing nothing and still returning the RHS made tsh print `1`
- * for that -- an answer bash refuses to give. (It never RAN the process
- * substitution, so this was a correctness gap, not the injection the
- * case is named for.) */
-static bool sh_arith_elem_set(const char *name, const char *sub, long v) {
-    char tmp[32];
-    size_t tpos = 0;
-    tmp[0] = '\0';
-    if (shell_append_long(tmp, &tpos, sizeof tmp, v) < 0) return false;
-    tmp[tpos] = '\0';
-    if (sh_array_is_assoc(name)) return sh_array_set_key(name, sub, tmp) >= 0;
-    long ix = 0;
-    if (!sh_subscript_eval(sub, name, true, &ix)) return false;
-    return sh_array_set(name, ix, tmp) >= 0;
-}
-
-static long shell_arith_factor(struct shell_arith *a) {
-    shell_arith_skip(a);
-    if (*a->p == '!') {
-        a->p++;
-        return !shell_arith_factor(a);
-    }
-    if (*a->p == '~') {
-        a->p++;
-        return ~shell_arith_factor(a);
-    }
-    if (a->p[0] == '+' && a->p[1] == '+' && shell_var_start(a->p[2])) {
-        a->p += 2;
-        char name[64]; size_t n = 0;
-        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
-        name[n] = '\0';
-        long v = shell_arith_name_value(a, name);
-        if (!a->ok) return 0;
-        v++;
-        char tmp[32]; size_t tpos = 0;
-        shell_append_long(tmp, &tpos, sizeof(tmp), v);
-        env_set(name, tmp);
-        return v;
-    }
-    if (a->p[0] == '-' && a->p[1] == '-' && shell_var_start(a->p[2])) {
-        a->p += 2;
-        char name[64]; size_t n = 0;
-        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) name[n++] = *a->p++;
-        name[n] = '\0';
-        long v = shell_arith_name_value(a, name);
-        if (!a->ok) return 0;
-        v--;
-        char tmp[32]; size_t tpos = 0;
-        shell_append_long(tmp, &tpos, sizeof(tmp), v);
-        env_set(name, tmp);
-        return v;
-    }
-    if (*a->p == '+') {
-        a->p++;
-        return shell_arith_factor(a);
-    }
-    if (*a->p == '-') {
-        a->p++;
-        return -shell_arith_factor(a);
-    }
-    if (*a->p == '(') {
-        a->p++;
-        long v = shell_arith_ternary(a);
-        shell_arith_skip(a);
-        if (*a->p != ')') {
-            a->ok = false;
-            return 0;
-        }
-        a->p++;
-        return v;
-    }
-    if (*a->p >= '0' && *a->p <= '9') {
-        long v = 0;
-        if (*a->p == '0' && (a->p[1] == 'x' || a->p[1] == 'X')) {
-            a->p += 2;
-            while (1) {
-                int d = -1;
-                if (*a->p >= '0' && *a->p <= '9') d = *a->p - '0';
-                else if (*a->p >= 'a' && *a->p <= 'f') d = *a->p - 'a' + 10;
-                else if (*a->p >= 'A' && *a->p <= 'F') d = *a->p - 'A' + 10;
-                if (d < 0) break;
-                v = v * 16 + d;
-                a->p++;
-            }
-        } else if (*a->p == '0' && a->p[1] >= '0' && a->p[1] <= '7') {
-            while (*a->p >= '0' && *a->p <= '7') {
-                v = v * 8 + (*a->p - '0');
-                a->p++;
-            }
-        } else {
-            while (*a->p >= '0' && *a->p <= '9') {
-                v = v * 10 + (*a->p - '0');
-                a->p++;
-            }
-        }
-        return v;
-    }
-    if (shell_var_start(*a->p)) {
-        char name[64];
-        size_t n = 0;
-        const char *name_start = a->p;
-        while (shell_var_char(*a->p) && n + 1 < sizeof(name)) {
-            name[n++] = *a->p++;
-        }
-        name[n] = '\0';
-        /* A SUBSCRIPT MAKES THE TARGET AN ELEMENT, for reading and for
-         * every assignment form below. Captured balanced so `a[b[1]]`
-         * works, and left empty when there is no `[`. */
-        char sub[128];
-        bool is_elem = false;
-        sub[0] = '\0';
-        if (*a->p == '[') {
-            const char *q = a->p;
-            int bd = 0;
-            for (; *q; q++) {
-                if (*q == '[') bd++;
-                else if (*q == ']') { bd--; if (bd == 0) break; }
-            }
-            if (bd == 0 && *q == ']') {
-                size_t sl = (size_t)(q - a->p - 1);
-                if (sl + 1 <= sizeof sub) {
-                    memcpy(sub, a->p + 1, sl);
-                    sub[sl] = '\0';
-                    is_elem = true;
-                    a->p = q + 1;
-                }
-            }
-        }
-        shell_arith_skip(a);
-        if (*a->p == '=' && a->p[1] != '=') {
-            a->p++;
-            long rhs = shell_arith_ternary(a);
-            if (!a->ok) return 0;
-            if (is_elem) {
-                if (!sh_arith_elem_set(name, sub, rhs)) { a->ok = false; return 0; }
-                return rhs;
-            }
-            char tmp[32];
-            size_t tpos = 0;
-            shell_append_long(tmp, &tpos, sizeof(tmp), rhs);
-            env_set(name, tmp);
-            return rhs;
-        }
-        char assign_op = 0;
-        if (a->p[1] == '=' &&
-            (*a->p == '+' || *a->p == '-' || *a->p == '*' ||
-             *a->p == '/' || *a->p == '%')) {
-            assign_op = *a->p;
-            a->p += 2;
-        }
-        long v = is_elem ? sh_arith_elem_get(a, name, sub)
-                         : shell_arith_name_value(a, name);
-        if (!a->ok) return 0;
-        if (assign_op) {
-            long rhs = shell_arith_ternary(a);
-            if (!a->ok) return 0;
-            if (assign_op == '+') v += rhs;
-            else if (assign_op == '-') v -= rhs;
-            else if (assign_op == '*') v *= rhs;
-            else if (assign_op == '/') { if (rhs == 0) { a->ok = false; return 0; } v /= rhs; }
-            else if (assign_op == '%') { if (rhs == 0) { a->ok = false; return 0; } v %= rhs; }
-            if (is_elem) {
-                if (!sh_arith_elem_set(name, sub, v)) { a->ok = false; return 0; }
-            }
-            else {
-                char tmp[32];
-                size_t tpos = 0;
-                shell_append_long(tmp, &tpos, sizeof(tmp), v);
-                env_set(name, tmp);
-            }
-        }
-        shell_arith_skip(a);
-        if (a->p[0] == '+' && a->p[1] == '+') {
-            a->p += 2;
-            long ret = v;
-            if (is_elem) {
-                if (!sh_arith_elem_set(name, sub, v + 1)) { a->ok = false; return 0; }
-                return ret;
-            }
-            char tmp[32]; size_t tpos = 0;
-            shell_append_long(tmp, &tpos, sizeof(tmp), v + 1);
-            env_set(name, tmp);
-            return ret;
-        }
-        if (a->p[0] == '-' && a->p[1] == '-') {
-            a->p += 2;
-            long ret = v;
-            if (is_elem) {
-                if (!sh_arith_elem_set(name, sub, v - 1)) { a->ok = false; return 0; }
-                return ret;
-            }
-            char tmp[32]; size_t tpos = 0;
-            shell_append_long(tmp, &tpos, sizeof(tmp), v - 1);
-            env_set(name, tmp);
-            return ret;
-        }
-        return v;
-    }
-    a->ok = false;
-    return 0;
-}
-
-/* Exponentiation. Binds tighter than * / %, and is RIGHT-associative, so
- * 2 ** 3 ** 2 is 2 ** 9, not 8 ** 2 -- hence the recursion into itself for
- * the exponent rather than a loop. Sits between factor and mul so that
- * `2 ** 3 * 4` groups as `(2 ** 3) * 4`, which is what bash computes.
- *
- * Without this `$((2 ** 8))` reached the `*` case, consumed one star, and
- * then failed on the second with "bad arithmetic expansion". */
-static long shell_arith_pow(struct shell_arith *a) {
-    long base = shell_arith_factor(a);
-    if (!a->ok) return 0;
-    shell_arith_skip(a);
-    if (a->p[0] != '*' || a->p[1] != '*') return base;
-    a->p += 2;
-    long exp = shell_arith_pow(a);
-    if (!a->ok) return 0;
-    if (exp < 0) {                 /* bash: "exponent less than 0" */
-        a->ok = false;
-        return 0;
-    }
-    long r = 1;
-    while (exp-- > 0) r *= base;
-    return r;
-}
-
-static long shell_arith_mul(struct shell_arith *a) {
-    long v = shell_arith_pow(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        char op = *a->p;
-        if (op != '*' && op != '/' && op != '%') break;
-        a->p++;
-        long rhs = shell_arith_pow(a);
-        if (!a->ok) return 0;
-        if ((op == '/' || op == '%') && rhs == 0) {
-            a->ok = false;
-            return 0;
-        }
-        if (op == '*') v *= rhs;
-        else if (op == '/') v /= rhs;
-        else v %= rhs;
-    }
-    return v;
-}
-
-static long shell_arith_add(struct shell_arith *a) {
-    long v = shell_arith_mul(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        char op = *a->p;
-        if (op != '+' && op != '-') break;
-        a->p++;
-        long rhs = shell_arith_mul(a);
-        if (!a->ok) return 0;
-        if (op == '+') v += rhs;
-        else v -= rhs;
-    }
-    return v;
-}
-
-static long shell_arith_shift(struct shell_arith *a) {
-    long v = shell_arith_add(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '<' && a->p[1] == '<') {
-            a->p += 2;
-            long rhs = shell_arith_add(a);
-            if (!a->ok) return 0;
-            v <<= rhs;
-        } else if (a->p[0] == '>' && a->p[1] == '>') {
-            a->p += 2;
-            long rhs = shell_arith_add(a);
-            if (!a->ok) return 0;
-            v >>= rhs;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_rel(struct shell_arith *a) {
-    long v = shell_arith_shift(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '<' && a->p[1] == '=') {
-            a->p += 2;
-            long rhs = shell_arith_shift(a);
-            if (!a->ok) return 0;
-            v = (v <= rhs) ? 1 : 0;
-        } else if (a->p[0] == '>' && a->p[1] == '=') {
-            a->p += 2;
-            long rhs = shell_arith_shift(a);
-            if (!a->ok) return 0;
-            v = (v >= rhs) ? 1 : 0;
-        } else if (a->p[0] == '<' && a->p[1] != '<') {
-            a->p++;
-            long rhs = shell_arith_shift(a);
-            if (!a->ok) return 0;
-            v = (v < rhs) ? 1 : 0;
-        } else if (a->p[0] == '>' && a->p[1] != '>') {
-            a->p++;
-            long rhs = shell_arith_shift(a);
-            if (!a->ok) return 0;
-            v = (v > rhs) ? 1 : 0;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_eq(struct shell_arith *a) {
-    long v = shell_arith_rel(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '=' && a->p[1] == '=') {
-            a->p += 2;
-            long rhs = shell_arith_rel(a);
-            if (!a->ok) return 0;
-            v = (v == rhs) ? 1 : 0;
-        } else if (a->p[0] == '!' && a->p[1] == '=') {
-            a->p += 2;
-            long rhs = shell_arith_rel(a);
-            if (!a->ok) return 0;
-            v = (v != rhs) ? 1 : 0;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_bitand(struct shell_arith *a) {
-    long v = shell_arith_eq(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '&' && a->p[1] != '&') {
-            a->p++;
-            long rhs = shell_arith_eq(a);
-            if (!a->ok) return 0;
-            v &= rhs;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_bitxor(struct shell_arith *a) {
-    long v = shell_arith_bitand(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '^') {
-            a->p++;
-            long rhs = shell_arith_bitand(a);
-            if (!a->ok) return 0;
-            v ^= rhs;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_bitor(struct shell_arith *a) {
-    long v = shell_arith_bitxor(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '|' && a->p[1] != '|') {
-            a->p++;
-            long rhs = shell_arith_bitxor(a);
-            if (!a->ok) return 0;
-            v |= rhs;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_and(struct shell_arith *a) {
-    long v = shell_arith_bitor(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '&' && a->p[1] == '&') {
-            a->p += 2;
-            long rhs = shell_arith_bitor(a);
-            if (!a->ok) return 0;
-            v = (v && rhs) ? 1 : 0;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_or(struct shell_arith *a) {
-    long v = shell_arith_and(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (a->p[0] == '|' && a->p[1] == '|') {
-            a->p += 2;
-            long rhs = shell_arith_and(a);
-            if (!a->ok) return 0;
-            v = (v || rhs) ? 1 : 0;
-        } else break;
-    }
-    return v;
-}
-
-static long shell_arith_ternary(struct shell_arith *a) {
-    long v = shell_arith_or(a);
-    shell_arith_skip(a);
-    if (*a->p == '?') {
-        a->p++;
-        long if_true = shell_arith_ternary(a);
-        shell_arith_skip(a);
-        if (*a->p != ':') { a->ok = false; return 0; }
-        a->p++;
-        long if_false = shell_arith_ternary(a);
-        if (!a->ok) return 0;
-        return v ? if_true : if_false;
-    }
-    return v;
-}
-
-static long shell_arith_comma(struct shell_arith *a) {
-    long v = shell_arith_ternary(a);
-    while (a->ok) {
-        shell_arith_skip(a);
-        if (*a->p != ',') break;
-        a->p++;
-        v = shell_arith_ternary(a);
-    }
-    return v;
-}
-
-#define shell_arith_expr shell_arith_comma
-
-static int shell_append_long(char *buf, size_t *pos, size_t cap, long v) {
-    if (v < 0) {
-        if (shell_append_char(buf, pos, cap, '-') < 0) return -1;
-        return shell_append_uint(buf, pos, cap, (unsigned long)(-v));
-    }
-    return shell_append_uint(buf, pos, cap, (unsigned long)v);
 }
 
 /* THE TWO KINDS OF QUOTE ARE NOT THE SAME THING INSIDE ARITHMETIC. bash
@@ -22371,6 +21978,7 @@ static int shell_append_long(char *buf, size_t *pos, size_t cap, long v) {
  * re-evaluated on every iteration. */
 static bool shell_arith_dequote(char *expr) {
     char *w = expr;
+    bool squote = false;
     for (const char *p = expr; *p; p++) {
         if (*p == '\\' && p[1]) { *w++ = *p++; *w++ = *p; continue; }
         if (*p == '`') {                      /* legacy substitution */
@@ -22400,11 +22008,14 @@ static bool shell_arith_dequote(char *expr) {
         }
         if (*p == '$' && p[1] == '"') continue;   /* $"..." is its own text */
         if (*p == '"') continue;
-        if (*p == '\'') return false;
+        /* A `'` stays, and the evaluator rejects it as bash's does
+         * ("syntax error: operand expected (error token is "'3'...")").
+         * Returning here left the text half rewritten. */
+        if (*p == '\'') squote = true;
         *w++ = *p;
     }
     *w = '\0';
-    return true;
+    return !squote;
 }
 
 static int shell_expand_arith(const char **pp, struct shell_sb *b) {
@@ -22429,7 +22040,7 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
                 p += 2;
                 expr[epos] = '\0';
                 *pp = p;
-                bool quoted_operand = !shell_arith_dequote(expr);
+                (void)shell_arith_dequote(expr);
                 /* Expand the expression text before evaluating it. The
                  * evaluator resolves bare names itself, but knows nothing
                  * about `$( )` or `${ }`, so `$(( $(echo 4) + 1 ))` reached
@@ -22438,18 +22049,17 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
                  * inside arithmetic for free. */
                 SH_SB(xexpr);
                 if (shell_expand_literal_quotes(expr, &xexpr) == 0) expr = xexpr.p;
-                struct shell_arith a = { .p = expr, .ok = true };
-                long v = shell_arith_expr(&a);
-                shell_arith_skip(&a);
-                if (!a.ok || *a.p != '\0' || quoted_operand) {
-                    kprintf(SH_PFX_SHELL "bad arithmetic expansion\n");
+                long v = 0;
+                int k = shell_arith_eval(expr, 0, &v);   /* bash's words */
+                if (k != SARITH_OK) {
                     /* AN EXPANSION ERROR, status 1 and the rest of the line
                      * discarded -- not the tokenizer's syntax-error 2. bash
                      * (evalexp): `echo $((1/0)); echo $?` prints nothing,
                      * the NEXT line sees 1. In /bin/tsh the error came out
                      * as 2 and, inside `[[ ]]`, as a syntax error that ended
-                     * the script. */
-                    g_bad_subst_soft = true;
+                     * the script. (An unbound variable under set -u has
+                     * ended the script already: shell_arith_unbound.) */
+                    if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
                     return -1;
                 }
                 return sb_put_long(b, v);
@@ -29868,19 +29478,25 @@ static bool shell_try_arith_command(const char *src) {
     if (shell_copy_segment_sb(&expr, s, end) < 0) return false;
 
     /* The expression is expanded first, exactly as `$(( ))` is: the evaluator
-     * resolves bare names itself but knows nothing about `$( )` or `${ }`. */
+     * resolves bare names itself but knows nothing about `$( )` or `${ }`.
+     * Its double quotes come off as there. */
+    (void)shell_arith_dequote(expr.p);
     SH_SB(xexpr);
-    if (shell_expand_literal_quotes(expr.p, &xexpr) != 0)
-        return false;
+    if (shell_expand_literal_quotes(expr.p, &xexpr) != 0) {
+        shell_set_status(1);
+        return true;
+    }
 
-    struct shell_arith a;
-    a.p = xexpr.p;
-    a.ok = true;
-    long v = shell_arith_expr(&a);
-    if (!a.ok) return false;
-    shell_arith_skip(&a);
-    if (*a.p) return false;                 /* trailing junk: not arithmetic */
-
+    /* IT IS ARITHMETIC: bash's parser decided that, and an expression that
+     * does not evaluate is an arithmetic error -- "((: 1[2] = 3 : syntax
+     * error ..." and status 1. tsh fell through and ran the text as a
+     * COMMAND ("1[2]: command not found", 127). */
+    long v = 0;
+    int k = shell_arith_eval(xexpr.p, "((", &v);
+    if (k != SARITH_OK) {
+        if (k != SARITH_UNBOUND) shell_set_status(1);
+        return true;
+    }
     shell_set_status(v != 0 ? 0 : 1);
     return true;
 }
@@ -30277,19 +29893,12 @@ done:
 static bool shell_arith_for_eval(char *expr, long *out) {
     while (*expr == ' ' || *expr == '\t') expr++;
     if (!*expr) { *out = 1; return true; }
-    if (!shell_arith_dequote(expr)) return false;
+    (void)shell_arith_dequote(expr);
     if (!*expr) { *out = 1; return true; }
     SH_SB(xexpr);
     if (shell_expand_literal_quotes(expr, &xexpr) != 0) return false;
-    struct shell_arith a;
-    a.p = xexpr.p;
-    a.ok = true;
-    long v = shell_arith_expr(&a);
-    if (!a.ok) return false;
-    shell_arith_skip(&a);
-    if (*a.p) return false;
-    *out = v;
-    return true;
+    /* bash names the command "((" here too */
+    return shell_arith_eval(xexpr.p, "((", out) == SARITH_OK;
 }
 
 static bool shell_try_arith_for_command(const char *src) {
