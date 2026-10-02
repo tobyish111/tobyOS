@@ -32983,7 +32983,15 @@ static int shell_case_unquote(struct shell_sb *pb) {
         }
         if (*r == '\'') { in_sq = true;  continue; }
         if (*r == '"')  { in_dq = true;  continue; }
-        if (*r == '\\' && r[1]) { SH_CU_PUT(*++r); continue; }
+        /* AN ESCAPED CHARACTER STAYS ESCAPED for the matcher: `\(` is a
+         * literal paren, `\*` a literal star. Dropping the backslash made
+         * `*\(\)` the extglob `*()` -- it matched nothing (Oils 1367) --
+         * and `\*` match everything. */
+        if (*r == '\\' && r[1]) {
+            SH_CU_PUT('\\');
+            SH_CU_PUT(*++r);
+            continue;
+        }
         SH_CU_PUT(*r);
     }
 #undef SH_CU_PUT
