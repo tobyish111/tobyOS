@@ -28750,8 +28750,32 @@ static struct file *shell_stage_spill_reader(char *path) {
 }
 #endif
 
+/* PIPESTATUS: the exit status of each process of the most recent
+ * foreground pipeline, one element for a simple command (bash: execute_cmd.c
+ * set_pipestatus_from_exit, jobs.c set_pipestatus_array). tsh had no such
+ * variable -- `echo ${PIPESTATUS[@]}` was empty everywhere (Oils 0474 0475
+ * 1219 1942-1944 2654). Set after each pipeline, simple command, (( )),
+ * [[ ]], ( ) subshell and wait; a compound command leaves what its last
+ * inner command set, as in bash. */
+static void shell_set_pipestatus(const int *st, int n) {
+    sh_array_unset("PIPESTATUS");
+    for (int i = 0; i < n; i++) {
+        char nb[16];
+        ksnprintf(nb, sizeof nb, "%d", st[i] & 0xff);
+        (void)sh_array_set("PIPESTATUS", i, nb);
+    }
+}
+
+static void shell_set_pipestatus1(int status) {
+    shell_set_pipestatus(&status, 1);
+}
+
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
-    if (pl->count == 1) return shell_run_single(&pl->stage[0], background);
+    if (pl->count == 1) {
+        int rc1 = shell_run_single(&pl->stage[0], background);
+        shell_set_pipestatus1(background ? 0 : rc1);
+        return rc1;
+    }
 
     /* Sized from the pipeline; they were eight-stage arrays. */
     size_t ns = (size_t)pl->count;
@@ -28929,6 +28953,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             int jid = jobs_add(last_pid, pl->stage[0].argv[0]);
             if (jid > 0) kprintf_raw("[%d] %d\n", jid, last_pid);
         }
+        shell_set_pipestatus1(0);
         return 0;
     }
 
@@ -28940,9 +28965,11 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             signal_set_foreground(pids[i]);
             stage_rc = proc_wait(pids[i]);
         }
+        stage_status[i] = stage_rc;
         if (stage_rc != 0) failed = stage_rc;
         if (i + 1 == pl->count) rc = stage_rc;
     }
+    shell_set_pipestatus(stage_status, pl->count);
     /* `set -o pipefail`: the rightmost FAILING stage decides. */
     if (g_opt_pipefail && failed != 0) rc = failed;
     signal_set_foreground(0);
@@ -30339,6 +30366,7 @@ static bool shell_try_dbracket_command(const char *src) {
     }
 
     shell_set_status(value ? 0 : 1);
+    shell_set_pipestatus1(value ? 0 : 1);
     return true;
 }
 
@@ -30434,6 +30462,7 @@ static bool shell_try_arith_command(const char *src) {
         return true;
     }
     shell_set_status(v != 0 ? 0 : 1);
+    shell_set_pipestatus1(v != 0 ? 0 : 1);
     return true;
 }
 
@@ -32449,6 +32478,7 @@ static bool shell_try_subshell_command(const char *src) {
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
+    shell_set_pipestatus1(rc);          /* bash: a ( ) is a job of its own */
     kfree(body);
     shell_pipeline_free(plp);
     return true;
@@ -33084,6 +33114,9 @@ static bool shell_try_compound_pipeline(const char *src) {
     int last = 0;
     int failed = 0;                       /* rightmost non-zero, for pipefail */
     for (int i = 0; i < nst; i++) cpids[i] = 0;
+    int *pst __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc((size_t)nst * sizeof(int));     /* PIPESTATUS */
+    for (int i = 0; pst && i < nst; i++) pst[i] = 0;
 
     /* THE DEBUG TRAP, once per stage, BEFORE any stage starts: bash fires it
      * per pipeline element (`false | false | false` is three lines, 1194),
@@ -33218,12 +33251,14 @@ static bool shell_try_compound_pipeline(const char *src) {
             last = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
             if (last != 0) failed = last;
+            if (pst) pst[i] = last;
         }
 #else
         execute_line_text(stages[i]);
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
         if (last != 0) failed = last;
+        if (pst) pst[i] = last;
 #endif
 
         g_subshell_depth--;
@@ -33255,8 +33290,10 @@ static bool shell_try_compound_pipeline(const char *src) {
         int wrc = proc_wait(cpids[i]);
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
+        if (pst) pst[i] = wrc;
     }
     shell_stages_free(stages, nst);
+    if (pst) shell_set_pipestatus(pst, n);
     if (g_opt_pipefail && failed != 0) last = failed;
     shell_set_status(last);
     return true;
