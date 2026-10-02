@@ -1246,6 +1246,7 @@ static int   sh_array_literal_commit(const char *tmp, const char *name,
  * expander and the marker cleanup 12k lines below. */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
+static void shell_bad_subst(bool fatal);
 static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
 static int shell_word_tilde(struct shell_sb *wb);
@@ -12644,6 +12645,15 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             p += 3;
             continue;
         }
+        if (d == '$' && p[1] == '[') {          /* `$[ ... ]`: one unit */
+            int bd = 0;
+            const char *q = p + 1;
+            for (; *q && *q != '\n'; q++) {
+                if (*q == '[') bd++;
+                else if (*q == ']' && --bd == 0) break;
+            }
+            if (*q == ']') { p = q + 1; continue; }
+        }
         if (d == '$' && (p[1] == '(' || p[1] == '{')) {
             /* A SUBSTITUTION HAS ITS OWN QUOTE STATE.
              *
@@ -21511,7 +21521,7 @@ static int shell_expand_at_transform(const char *name, char opch,
         }
         break;
     default:
-        kprintf(SH_PFX_SHELL "bad substitution\n");
+        shell_bad_subst(true);          /* bash: expand_wdesc_fatal */
         return -1;
     }
     /* As a C string, as before: an @E that decoded a NUL ends the value. */
@@ -21544,7 +21554,7 @@ static int shell_expand_at_transform(const char *name, char opch,
 static int shell_expand_substring(const char *name, const char *spec,
                                   struct shell_sb *b) {
     if (!spec || !*spec) {
-        kprintf(SH_PFX_SHELL "bad substitution\n");
+        shell_bad_subst(false);
         return -1;
     }
     SH_SB(sbuf);                    /* an arithmetic spec, not a value */
@@ -21827,7 +21837,43 @@ static int shell_expand_array_test_op(struct shell_sb *b, const char *nm,
     return rc;
 }
 
+/* THE ${...} BEING EXPANDED, for bash's "${TEXT}: bad substitution" --
+ * tsh said a bare "bad substitution", status 2. Set around each real
+ * expansion (shell_expand_braced_parameter), not the synthetic ones an
+ * element or per-element operator runs on a scratch name. */
+static const char *g_bsub_text;
+
+/* Report a bad substitution as bash does (measured,
+ * tools/agent/probes/bad-subst.sh): status 1 and the rest of the line
+ * dropped (expand_wdesc_error) -- or, for an unknown `@` transform,
+ * the end of a non-interactive shell (expand_wdesc_fatal). */
+static void shell_bad_subst(bool fatal) {
+    if (g_bsub_text) kprintf("${%s}: bad substitution\n", g_bsub_text);
+    else             kprintf(SH_PFX_SHELL "bad substitution\n");
+    shell_set_status(1);
+    if (fatal) {
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = g_interactive ? SHELL_FLOW_DISCARD : SHELL_FLOW_EXIT;
+            g_shell_flow_status = 1;
+        }
+    } else {
+        g_bad_subst_soft = true;
+    }
+}
+
+static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b);
+
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
+    const char *saved = g_bsub_text;
+    if (strncmp(expr, "SHELL_ELEM_", 11) != 0 &&
+        strncmp(expr, "SHELL_ARRAY_ELEM", 16) != 0)
+        g_bsub_text = expr;
+    int rc = shell_expand_braced_parameter_in(expr, b);
+    g_bsub_text = saved;
+    return rc;
+}
+
+static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b) {
     if (!expr) return -1;
 
     /* `${##...}` IS `$#` WITH A STRIP OPERATOR, NOT A LENGTH.
@@ -22006,6 +22052,12 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                     const char *sub = lb + 1;
                     size_t slen = (size_t)(rb - lb - 1);
                     const char *suffix = rb + 1;   /* "", ":1:2", "#pat", ... */
+                    /* ONE SUBSCRIPT: `${a[0][0]}` is bash's bad
+                     * substitution (Oils 0330); tsh read a[0]. */
+                    if (*suffix == '[') {
+                        shell_bad_subst(false);
+                        return -1;
+                    }
                     /* ${a[@]-word} ${a[*]:+word} ... test the whole array
                      * (shell_expand_array_test_op) -- before the slice,
                      * which `:-` and friends must never reach. */
@@ -22199,8 +22251,10 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
          * wrong -- the status was right the second time. A blank right
          * after the brace separates the two forms; the array-literal and
          * `${|...}` shapes keep the tokenizer's own 2, which aborts. */
-        if (*expr == ' ' || *expr == '\t') g_bad_subst_soft = true;
-        kprintf(SH_PFX_SHELL "bad substitution\n");
+        /* ...and bash 5.2.15 (in WSL, tools/agent/probes/bad-subst.sh)
+         * gives every shape here -- `${|REPLY=hi}` included -- status 1
+         * and the rest of the line dropped. */
+        shell_bad_subst(false);
         return -1;
     }
 
@@ -22466,7 +22520,7 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
              * the corpus's ${x:n} cases used to die. */
             return shell_expand_substring(name, op, b);
         } else {
-            kprintf(SH_PFX_SHELL "bad substitution\n");
+            shell_bad_subst(false);
             return -1;
         }
     }
@@ -22714,6 +22768,54 @@ static bool shell_arith_dequote(char *expr) {
     return !squote;
 }
 
+/* The text of a `$(( ))` or `$[ ]`, evaluated into B. */
+static int shell_arith_subst_eval(char *expr, struct shell_sb *b) {
+    (void)shell_arith_dequote(expr);
+    /* Expand the expression text before evaluating it. The evaluator
+     * resolves bare names itself, but knows nothing about `$( )` or `${ }`,
+     * so `$(( $(echo 4) + 1 ))` reached it as literal text and died as "bad
+     * arithmetic expansion". Expanding first also makes `$(($x + 1))` and
+     * `${#a}` work inside arithmetic for free. */
+    SH_SB(xexpr);
+    if (shell_expand_literal_quotes(expr, &xexpr) == 0) expr = xexpr.p;
+    long v = 0;
+    int k = shell_arith_eval(expr, 0, &v);   /* bash's words */
+    if (k != SARITH_OK) {
+        /* AN EXPANSION ERROR, status 1 and the rest of the line discarded --
+         * not the tokenizer's syntax-error 2. bash (evalexp): `echo $((1/0));
+         * echo $?` prints nothing, the NEXT line sees 1. In /bin/tsh the
+         * error came out as 2 and, inside `[[ ]]`, as a syntax error that
+         * ended the script. (An unbound variable under set -u has ended the
+         * script already: shell_arith_unbound.) */
+        if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
+        return -1;
+    }
+    return sb_put_long(b, v);
+}
+
+/* `$[EXPR]` -- bash's older spelling of `$((EXPR))`, still accepted (and
+ * still in scripts: Oils 0081-0083, 0642). tsh left it as text: `echo
+ * $[1+2]` printed `$[1+2]`. The brackets nest: `$[b[0]]`. */
+static int shell_expand_arith_bracket(const char **pp, struct shell_sb *b) {
+    const char *p = *pp + 2;
+    const char *start = p;
+    int depth = 1;
+    for (; *p; p++) {
+        if (*p == '[') depth++;
+        else if (*p == ']' && --depth == 0) break;
+    }
+    if (!*p) {
+        /* unterminated: the text stays as it is */
+        if (sb_putc(b, '$') < 0) return -1;
+        *pp = *pp + 1;
+        return 0;
+    }
+    SH_SB(exprb);
+    if (sb_putmem(&exprb, start, (size_t)(p - start)) < 0) return -1;
+    *pp = p + 1;
+    return shell_arith_subst_eval(exprb.p, b);
+}
+
 static int shell_expand_arith(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
     if (p[0] != '$' || p[1] != '(' || p[2] != '(') return -1;
@@ -22736,29 +22838,7 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
                 p += 2;
                 expr[epos] = '\0';
                 *pp = p;
-                (void)shell_arith_dequote(expr);
-                /* Expand the expression text before evaluating it. The
-                 * evaluator resolves bare names itself, but knows nothing
-                 * about `$( )` or `${ }`, so `$(( $(echo 4) + 1 ))` reached
-                 * it as literal text and died as "bad arithmetic expansion".
-                 * Expanding first also makes `$(($x + 1))` and `${#a}` work
-                 * inside arithmetic for free. */
-                SH_SB(xexpr);
-                if (shell_expand_literal_quotes(expr, &xexpr) == 0) expr = xexpr.p;
-                long v = 0;
-                int k = shell_arith_eval(expr, 0, &v);   /* bash's words */
-                if (k != SARITH_OK) {
-                    /* AN EXPANSION ERROR, status 1 and the rest of the line
-                     * discarded -- not the tokenizer's syntax-error 2. bash
-                     * (evalexp): `echo $((1/0)); echo $?` prints nothing,
-                     * the NEXT line sees 1. In /bin/tsh the error came out
-                     * as 2 and, inside `[[ ]]`, as a syntax error that ended
-                     * the script. (An unbound variable under set -u has
-                     * ended the script already: shell_arith_unbound.) */
-                    if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
-                    return -1;
-                }
-                return sb_put_long(b, v);
+                return shell_arith_subst_eval(expr, b);
             }
             if (paren_depth > 0) paren_depth--;
         }
@@ -23057,6 +23137,11 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
         p--;
         *pp = p;
         return shell_expand_arith(pp, b);
+    }
+    if (*p == '[') {
+        p--;
+        *pp = p;
+        return shell_expand_arith_bracket(pp, b);
     }
     if (*p == '(') {
         p--;
@@ -30447,6 +30532,23 @@ static bool shell_try_if_command(const char *src) {
     return true;
 }
 
+/* An expansion in a compound's word list failed. A soft failure -- a bad
+ * substitution, failglob, an arithmetic error -- is bash's expansion error:
+ * status 1 and the line dropped (or the shell ended under set -e); anything
+ * else is the tokenizer's syntax error, 2. */
+static void shell_wordlist_failed(void) {
+    if (g_bad_subst_soft) {
+        g_bad_subst_soft = false;
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
+    } else if (g_shell_flow == SHELL_FLOW_NONE) {
+        shell_set_status(2);
+    }
+}
+
 static bool shell_try_for_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "for")) return false;
@@ -30577,7 +30679,7 @@ static bool shell_try_for_command(const char *src) {
     if (shell_tokenize(list, &tok, &ntok, &words) < 0) {
         if (io_active) shell_restore_io_frame(&io_frame);
         kfree(list); kfree(body);
-        shell_set_status(2);
+        shell_wordlist_failed();        /* `for k in "${(@k)a}"`: 1 (2770) */
         return true;
     }
 
