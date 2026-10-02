@@ -5759,20 +5759,18 @@ static int shell_locals_push(const char *name, int depth) {
     {
         struct sh_array *a = sh_array_find(name);
         if (a) {
+            /* A WHOLE COPY -- keys, kind and table size. Only indices and
+             * values were kept, so a local shadowing an ASSOCIATIVE array
+             * gave the caller back an indexed array of its values, and an
+             * empty array came back as no array at all. */
             sv->arr_saved = (struct sh_array *)kmalloc(sizeof *sv->arr_saved);
             if (sv->arr_saved) {
-                memset(sv->arr_saved, 0, sizeof *sv->arr_saved);
-                for (int i = 0; i < a->n; i++) {
-                    if (!sh_array_reserve(sv->arr_saved)) break;
-                    size_t vn = strlen(a->e[i].val) + 1;
-                    char *cp = (char *)kmalloc(vn);
-                    if (!cp) break;
-                    memcpy(cp, a->e[i].val, vn);
-                    sv->arr_saved->e[sv->arr_saved->n].idx = a->e[i].idx;
-                    sv->arr_saved->e[sv->arr_saved->n].val = cp;
-                    sv->arr_saved->n++;
+                if (sh_array_copy_into(sv->arr_saved, a) < 0) {
+                    kfree(sv->arr_saved);
+                    sv->arr_saved = 0;
+                } else {
+                    sv->arr_existed = true;
                 }
-                sv->arr_existed = true;
             }
             sh_array_unset_literal(name);  /* the function starts fresh */
         }
@@ -5804,14 +5802,25 @@ static void shell_locals_pop(int depth) {
          * (if it had one). Mirrors the scalar restore below. */
         sh_array_unset_literal(sv->name);
         if (sv->arr_existed && sv->arr_saved) {
-            for (int i = 0; i < sv->arr_saved->n; i++)
-                (void)sh_array_set(sv->name, sv->arr_saved->e[i].idx,
-                                   sv->arr_saved->e[i].val);
+            /* the saved record goes back into the table as it is */
+            if (g_narrays >= g_arrays_cap) {
+                int ncap = g_arrays_cap ? g_arrays_cap * 2 : 64;
+                struct sh_array **nt =
+                    (struct sh_array **)kmalloc((size_t)ncap * sizeof *nt);
+                if (nt) {
+                    if (g_narrays) memcpy(nt, g_arrays, (size_t)g_narrays * sizeof *nt);
+                    kfree(g_arrays);
+                    g_arrays = nt;
+                    g_arrays_cap = ncap;
+                }
+            }
+            if (g_narrays < g_arrays_cap) {
+                g_arrays[g_narrays++] = sv->arr_saved;
+                sv->arr_saved = 0;
+            }
         }
         if (sv->arr_saved) {
-            for (int i = 0; i < sv->arr_saved->n; i++)
-                kfree(sv->arr_saved->e[i].val);
-            kfree(sv->arr_saved->e);
+            sh_array_contents_free(sv->arr_saved);
             kfree(sv->arr_saved);
             sv->arr_saved = 0;
         }
