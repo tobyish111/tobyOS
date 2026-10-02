@@ -28896,7 +28896,22 @@ struct shell_dbr_scratch {
     struct shell_sb seg;    /* the pending unquoted run, for the expander */
     struct shell_sb tmp;    /* one segment's expansion */
     struct shell_sb out;    /* the assembled word */
+    struct shell_sb join;   /* "$@" with its elements joined */
 };
+
+/* "$@" AND "${a[@]}" ARE ONE WORD HERE, the elements joined by a space:
+ * bash expands a conditional's operands without splitting them
+ * (cond_expand_word), so
+ *
+ *     a=('1 3' 5); set -- 1 '3 5'; [[ "$@" = "${a[@]}" ]]     bash: true
+ *
+ * The expander left its element marks in, and the comparison saw two
+ * different strings of marks. */
+static int shell_dbr_join(struct shell_dbr_scratch *sc) {
+    if (!shell_word_has_argmark(sc->tmp.p)) return 0;
+    if (shell_argmarks_to_spaces(sc->tmp.p, &sc->join) < 0) return -1;
+    return sb_set(&sc->tmp, sc->join.p);
+}
 
 /* An operator character of EITHER grammar a right-hand side can be read in,
  * the glob's or the ERE's. A quoted one is marked; see above. */
@@ -28921,7 +28936,7 @@ static int shell_dbr_flush(struct shell_dbr_scratch *sc) {
     if (sc->seg.len == 0) return 0;
     int rc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
     sb_truncate(&sc->seg, 0);
-    if (rc < 0) return -1;
+    if (rc < 0 || shell_dbr_join(sc) < 0) return -1;
     shell_strip_nosplit_inplace(sc->tmp.p);
     return sb_puts(&sc->out, sc->tmp.p);
 }
@@ -28989,6 +29004,37 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
                                     strcmp(pw, "!=") == 0);
         bool rhs_re  = prev_unq && strcmp(pw, "=~") == 0;
 
+        /* `&&`, `||`, `<` and `>` NEED NO BLANKS AROUND THEM: bash's lexer
+         * reads them here as it reads `;` outside, so `[[ b<a ]]` is three
+         * tokens and `[[ ''||! (1 == 2)&&(2 == 2)]]` is fourteen. tsh split
+         * on blanks only, made `b<a` one non-empty word -- true -- and the
+         * second a syntax error. `<` and `>` keep the shape a blank-separated
+         * one always had (an unquoted word, which is what makes it the
+         * comparison operator); `&&` and `||` are grammar operators. A lone
+         * `&`, `|` or `;` is bash's syntax error, which the grammar check
+         * reports before this runs -- consumed here as a word so the split
+         * cannot stall on it. */
+        if ((p[0] == '&' || p[0] == '|') && p[1] == p[0]) {
+            char two[3] = { p[0], p[1], '\0' };
+            char *st = shell_dbr_store(d, two);
+            if (!st) return -1;
+            d->pat[d->n] = false;
+            d->opr[d->n] = true;
+            d->w[d->n++] = st;
+            p += 2;
+            continue;
+        }
+        if (*p == '<' || *p == '>' || *p == '&' || *p == '|' || *p == ';') {
+            char one[2] = { *p, '\0' };
+            char *st = shell_dbr_store(d, one);
+            if (!st) return -1;
+            d->pat[d->n] = true;
+            d->opr[d->n] = false;
+            d->w[d->n++] = st;
+            p++;
+            continue;
+        }
+
         /* A bare parenthesis is a token of its own. On the right of `=~`
          * an opening one starts a regex group instead, so it is a word. */
         if ((*p == '(' && !rhs_re) || *p == ')') {
@@ -29011,6 +29057,45 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
         while (*p) {
             char c = *p;
             if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
+            /* ...and they end a word they are glued to. Not inside an
+             * extglob or regex group, where `|` is alternation; and on the
+             * right of `=~` a `|` is the regex's at any depth (bash's lexer,
+             * PST_REGEXP). */
+            if (eg_depth == 0 && re_depth == 0 &&
+                (c == '&' || c == '<' || c == '>' || c == ';' ||
+                 (c == '|' && !rhs_re)))
+                break;
+            /* A TILDE STARTING THE WORD EXPANDS, as in any word bash does not
+             * split: `HOME=/home/bob; [[ ~ == /home/b* ]]` is true, and with
+             * HOME='' `[[ ~ ]]` is false. The prefix runs to the first `/`;
+             * a quote anywhere in it means no expansion (bash_tilde_find_word).
+             * The home comes back QUOTED -- a `*` or `^` in it is literal on
+             * either side of == and =~ (subst.c: add_quoted_string). */
+            if (c == '~' && sc->raw.len == 0) {
+                const char *e = p + 1;
+                bool quoted_pre = false;
+                while (*e && *e != '/' && *e != ' ' && *e != '\t' &&
+                       *e != '\n' && *e != '&' && *e != '|' && *e != '<' &&
+                       *e != '>' && *e != ';' && *e != '(' && *e != ')') {
+                    if (*e == '\\' || *e == '\'' || *e == '"') quoted_pre = true;
+                    e++;
+                }
+                if (!quoted_pre) {
+                    sb_truncate(&sc->tmp, 0);
+                    int tr = shell_tilde_prefix_home(p + 1, (size_t)(e - (p + 1)),
+                                                     &sc->tmp);
+                    if (tr < 0) return -1;
+                    if (tr > 0) {
+                        any_u = true;
+                        if (sb_putmem(&sc->raw, p, (size_t)(e - p)) < 0 ||
+                            shell_dbr_put_quoted(&sc->out, sc->tmp.p,
+                                                 strlen(sc->tmp.p)) < 0)
+                            return -1;
+                        p = e;
+                        continue;
+                    }
+                }
+            }
             if (c == '\'') {
                 any_q = true;
                 if (shell_dbr_flush(sc) < 0) return -1;
@@ -29053,7 +29138,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
                 }
                 int xrc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
                 sb_truncate(&sc->seg, 0);
-                if (xrc < 0) return -1;
+                if (xrc < 0 || shell_dbr_join(sc) < 0) return -1;
                 shell_strip_nosplit_inplace(sc->tmp.p);
                 if (shell_dbr_put_quoted(&sc->out, sc->tmp.p,
                                          strlen(sc->tmp.p)) < 0) return -1;
@@ -29140,11 +29225,13 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     sb_init(&sc->seg);
     sb_init(&sc->tmp);
     sb_init(&sc->out);
+    sb_init(&sc->join);
     int rc = shell_dbr_split_in(d, src, sc);
     sb_free(&sc->raw);
     sb_free(&sc->seg);
     sb_free(&sc->tmp);
     sb_free(&sc->out);
+    sb_free(&sc->join);
     kfree(sc);
     return rc;
 }
@@ -29391,8 +29478,6 @@ static bool shell_try_dbracket_command(const char *src) {
           (s[2] == ' ' || s[2] == '\t' || s[2] == '\n' || s[2] == '\0')))
         return false;
     s += 2;
-    shell_run_debug_trap();            /* `[[ ]]` is a command (1182) */
-    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     /* Find the `]]` that closes it, ignoring one inside quotes. */
     const char *end = 0;
@@ -29416,6 +29501,22 @@ static bool shell_try_dbracket_command(const char *src) {
         shell_parse_error();
         return true;
     }
+
+    /* A REDIRECTION ON THE COMMAND IS IN PLACE WHILE ITS WORDS EXPAND:
+     *
+     *     [[ $(cmd) == x ]] 2>err      bash: cmd's stderr goes to err
+     *
+     * tsh parsed the redirections after evaluating and then dropped them,
+     * so the file was never even created. Enter them and run the command
+     * again without its tail, the way `if` and `case` do. */
+    {
+        const char *t = shell_skip_blanks(end + 2);
+        if (*t && *t != ';' && *t != '\n' &&
+            shell_compound_tail_redirs(src, end + 2, "[["))
+            return true;
+    }
+    shell_run_debug_trap();            /* `[[ ]]` is a command (1182) */
+    if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
     SH_SB(exprb);
     if (shell_copy_segment_sb(&exprb, s, end) < 0) {
