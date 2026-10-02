@@ -1266,6 +1266,10 @@ static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *esc, long maxchars,
                                      bool ignore_delim);
 static struct file *shell_builtin_fd(int n);
+static int   sh_subscript_assign_index(const char *name, const char *sub,
+                                      long *out);
+static int   sh_subscript_read_index(const char *nm, const char *sub,
+                                    long *out);
 static bool  sh_subscript_eval(const char *sub, const char *name,
                                bool for_write, long *out);
 /* Arithmetic is bash's evaluator (B10): see shell_arith.inc, and
@@ -1873,6 +1877,12 @@ static int shell_readonly_find(const char *key, size_t klen) {
  * assignment-statement path reads it to tell that refusal -- which discards
  * the rest of the line, as bash does -- from any other failure. */
 static bool g_readonly_hit;
+
+/* Set when an array ELEMENT assignment fails on its subscript -- one that
+ * does not evaluate, or one that is still negative after counting back
+ * (sh_subscript_assign_index). An assignment statement then discards the
+ * rest of its line, as for a readonly name. */
+static bool g_assign_fail_hit;
 
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
@@ -2846,7 +2856,8 @@ static int sh_try_array_assignment(const char *kv) {
             }
         }
         long idx = 0;
-        if (!sh_subscript_eval(sub, name, true, &idx)) return 0;
+        if (sh_subscript_assign_index(name, sub, &idx) < 0) return -1;
+        if (sh_array_absorb_scalar(name) < 0) return -1;
         if (append) {
             const char *old = sh_array_get(name, idx);
             SH_SB(joined);                      /* any length -- see above */
@@ -2875,10 +2886,10 @@ static int sh_try_array_assignment(const char *kv) {
          * nothing to append TO and produced `d e f`. bash promotes the
          * scalar first -- the same rule that makes `$b` on an array mean
          * element 0, read in the other direction. */
-        if (append && !sh_array_find(nm)) {
-            const char *scalar = env_get(nm);
-            if (scalar) (void)sh_array_set(nm, 0, scalar);
-        }
+        /* ...and the scalar GOES: it was copied into element 0 and left in
+         * place, where it shadowed the array's element 0 for `$b`. */
+        if (append && !sh_array_find(nm) && sh_array_absorb_scalar(nm) < 0)
+            return -1;
         /* -1: it WAS an array literal and it FAILED (failglob, no memory).
          * Returning 0 here let env_set_kv store the text `(*.ZZ)` as a
          * scalar and report success. */
@@ -2886,6 +2897,11 @@ static int sh_try_array_assignment(const char *kv) {
     }
     return 0;
 }
+
+/* Set while declare/local create the EMPTY entry that carries a name's
+ * attributes (export, readonly, the array flag): that is not an assignment
+ * to the variable, so it must not become one to an array's element 0. */
+static bool g_env_attr_only;
 
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
@@ -2945,6 +2961,40 @@ static int env_set_kv(const char *kv_in) {
         int rc = env_set_kv(rebuilt);
         kfree(rebuilt);
         return rc;
+    }
+
+    /* A PLAIN ASSIGNMENT TO AN ARRAY'S NAME SETS ITS ELEMENT 0 (bash):
+     *
+     *     a=(1 2); a=x; declare -p a     bash: declare -a a=([0]="x" [1]="2")
+     *
+     * tsh made a SCALAR beside the array. It shadowed element 0 for `$a`,
+     * while ${a[0]}, ${a[-1]}, ${#a[@]}, declare -p and unset all saw the
+     * array -- one name answering two ways, and `unset a` removed only the
+     * scalar. (A nameref to an array lands here too: sh_array_find follows
+     * it.) An associative array's element 0 is the key "0". */
+    if (kv_in[klen] == '=' && !g_env_attr_only) {
+        char nm[128];
+        if (klen + 1 <= sizeof nm) {
+            memcpy(nm, kv_in, klen);
+            nm[klen] = '\0';
+            if (shell_name_is_valid(nm, klen) && sh_array_find(nm)) {
+                if (shell_readonly_key(nm, klen)) {
+                    shell_readonly_print_error(nm, klen, "shell");
+                    return -1;
+                }
+                const char *v = kv_in + klen + 1;
+                int rc = sh_array_is_assoc(nm) ? sh_array_set_key(nm, "0", v)
+                                               : sh_array_set(nm, 0, v);
+                if (rc < 0) return -1;
+                char tgt[128];
+                const char *real = env_deref_name_ex(nm, tgt, sizeof tgt, false);
+                if (!real || !*real) real = nm;
+                int si = env_find(real, strlen(real));
+                if (si >= 0 && !(g_env_flags[si] & (SHVAR_ARRAY | SHVAR_NAMEREF)))
+                    env_remove_at(si);
+                return 0;
+            }
+        }
     }
 
     /* AN ASSIGNMENT TO A NAMEREF WRITES THROUGH IT.
@@ -3029,6 +3079,16 @@ static void shell_mark_exported(const char *key) {
  * goes straight to env_set_kv and never noticed, so `x=$(...)` stored a
  * long line and `read x` of the same line said "failed to set 'x'". The
  * short case keeps its stack buffer; env_set_kv copies either way. */
+static int env_set(const char *key, const char *val);
+
+/* The attribute-holding entry for NAME (see g_env_attr_only). */
+static int env_set_attr_holder(const char *name) {
+    g_env_attr_only = true;
+    int rc = env_set(name, "");
+    g_env_attr_only = false;
+    return rc;
+}
+
 static int env_set(const char *key, const char *val) {
     if (!key || !val) return -1;
     size_t klen = strlen(key);
@@ -5023,6 +5083,96 @@ static bool sh_subscript_eval(const char *sub, const char *name,
     return true;
 }
 
+/* bash's report_error(): under set -e the shell ENDS right after the
+ * message -- "bad array subscript" is one, an arithmetic error is not. */
+static void shell_report_error_errexit(void) {
+    if (g_opt_errexit && g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = g_last_status ? g_last_status : 1;
+    }
+}
+
+/* THE INDEX AN ASSIGNMENT `NAME[SUB]=v` WRITES, by bash's
+ * assign_array_element (arrayfunc.c), measured on the box
+ * (tools/agent/probes/assign-fail*.sh):
+ *
+ *   - a SUB that does not evaluate has had its error printed; the command
+ *     is DISCARDED -- status 1, nothing more of the line runs, set -e or
+ *     not (array_expand_index: jump_to_top_level (DISCARD));
+ *   - an empty SUB, or one still negative after counting back from the end
+ *     of an existing array (from element 0 of a scalar: `s=str; s[-1]=q`
+ *     makes s "q"), is "NAME[SUB]: bad array subscript" -- report_error,
+ *     which ends the shell under set -e -- and the assignment fails.
+ *
+ * tsh printed the arithmetic error and then fell through to the SCALAR
+ * path, which quietly did nothing: status 0, the rest of the line ran,
+ * and `t[-2]=q` / `a[]=x` / `nosuch[-1]=q` said nothing at all.
+ * Returns 0 with *out set, or -1 (reported; g_assign_fail_hit set). */
+static int sh_subscript_assign_index(const char *name, const char *sub,
+                                     long *out) {
+    long v = 0;
+    if (!sub || !*sub) {
+        kprintf("%s[]: bad array subscript\n", name);
+        g_assign_fail_hit = true;
+        shell_set_status(1);
+        shell_report_error_errexit();
+        return -1;
+    }
+    int k = sh_subscript_value(sub, &v);
+    if (k != SARITH_OK) {
+        g_assign_fail_hit = true;
+        if (k != SARITH_UNBOUND) {          /* unbound has ended the shell */
+            shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_DISCARD;
+                g_shell_flow_status = 1;
+            }
+        }
+        return -1;
+    }
+    if (v < 0) {
+        struct sh_array *arr = sh_array_find(name);
+        if (arr) v = sh_array_max_idx(arr) + 1 + v;
+        else if (env_get(name)) v = 1 + v;      /* a scalar is element 0 */
+    }
+    if (v < 0) {
+        kprintf("%s[%s]: bad array subscript\n", name, sub);
+        g_assign_fail_hit = true;
+        shell_set_status(1);
+        shell_report_error_errexit();
+        return -1;
+    }
+    *out = v;
+    return 0;
+}
+
+/* THE INDEX A READ `${NAME[SUB]}` LOOKS AT, by bash's array_value_internal:
+ * a SUB that does not evaluate DISCARDS the command (status 1, as `$(( ))`
+ * does -- tsh said "bad substitution" as well and ran the rest of the
+ * line); a negative one counts back from the end of an indexed array, and
+ * one still negative -- or any negative index of a scalar or an unset
+ * name -- is "NAME: bad array subscript" (report_error) and reads as
+ * unset: *out is -1. Returns 0, or -1 for the discard. */
+static int sh_subscript_read_index(const char *nm, const char *sub, long *out) {
+    long v = 0;
+    int k = sh_subscript_value(sub, &v);
+    if (k != SARITH_OK) {
+        if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
+        return -1;
+    }
+    if (v < 0) {
+        struct sh_array *arr = sh_array_find(nm);
+        if (arr) v = sh_array_max_idx(arr) + 1 + v;
+        if (v < 0) {
+            kprintf("%s: bad array subscript\n", nm);
+            shell_report_error_errexit();
+            v = -1;
+        }
+    }
+    *out = v;
+    return 0;
+}
+
 /* A subscript's VALUE, as bash's array code computes it: the text expanded,
  * then evaluated as arithmetic with no command name in its errors
  * (array_expand_index). Negative values are the caller's to interpret. */
@@ -5556,7 +5706,7 @@ static void cmd_local(int argc, char **argv) {
             if (idx >= 0) env_remove_at(idx);
         }
         if (l_array) {
-            if (!env_get(name)) (void)env_set(name, "");
+            if (!env_get(name)) (void)env_set_attr_holder(name);
             int aidx = env_find(name, strlen(name));
             if (aidx >= 0) g_env_flags[aidx] |= SHVAR_ARRAY;
         }
@@ -6217,7 +6367,7 @@ static void cmd_declare(int argc, char **argv) {
                 continue;
             }
         } else if (!env_get(name)) {
-            if (env_set(name, "") < 0) { shell_set_status(1); continue; }
+            if (env_set_attr_holder(name) < 0) { shell_set_status(1); continue; }
         }
         int idx = env_find(name, klen);
         if (idx < 0) continue;
@@ -21101,11 +21251,10 @@ static int shell_expand_element_op(const char *nm, const char *sub,
             return -1;
         v = sh_array_get_key(nm, key.p);
     } else {
-        if (!sh_subscript_eval(subbuf.p, nm, false, &idx)) {
-            kprintf(SH_PFX_SHELL "bad substitution\n");
-            return -1;
-        }
+        if (sh_subscript_read_index(nm, subbuf.p, &idx) < 0) return -1;
         if (idx >= 0) v = sh_array_get(nm, idx);
+        /* a SCALAR is element 0 of itself: ${s[0]-d} is $s */
+        if (!v && idx == 0 && !sh_array_find(nm)) v = env_get(nm);
     }
     bool had = (v != 0);
     SH_SB(old);
@@ -21546,12 +21695,42 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                     bool num = false;
                     if (suffix[0] == '\0') {
                         if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
-                        num = sh_subscript_eval(subbuf.p, nm, false, &idx);
+                        if (count) {
+                            /* ${#a[i]} is bash's array_length_reference: an
+                             * UNSET name is length 0 without a look at the
+                             * subscript; a negative index still negative
+                             * after counting back is "SUB]: bad array
+                             * subscript" and an expansion ERROR -- the line
+                             * is discarded, status 1. */
+                            if (!sh_array_find(nm) && !env_get(nm))
+                                return sb_put_uint(b, 0);
+                            long cv = 0;
+                            int ck = sh_subscript_value(subbuf.p, &cv);
+                            if (ck != SARITH_OK) {
+                                if (ck != SARITH_UNBOUND) g_bad_subst_soft = true;
+                                return -1;
+                            }
+                            struct sh_array *ca = sh_array_find(nm);
+                            if (cv < 0 && ca) cv = sh_array_max_idx(ca) + 1 + cv;
+                            if (cv < 0) {
+                                kprintf("%s]: bad array subscript\n", subbuf.p);
+                                shell_report_error_errexit();
+                                g_bad_subst_soft = true;
+                                return -1;
+                            }
+                            const char *v = ca ? sh_array_get(nm, cv)
+                                               : (cv == 0 ? env_get(nm) : 0);
+                            return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
+                        }
+                        if (sh_subscript_read_index(nm, subbuf.p, &idx) < 0)
+                            return -1;
+                        num = true;
                     }
                     if (num) {
-                        const char *v = sh_array_get(nm, idx);
-                        if (count)                   /* ${#a[i]} -- LENGTH */
-                            return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
+                        const char *v = idx >= 0 ? sh_array_get(nm, idx) : 0;
+                        /* A SCALAR IS ELEMENT 0 OF ITSELF: `s=str` makes
+                         * ${s[0]} "str" and ${#s[0]} 3 -- tsh read nothing. */
+                        if (!v && idx == 0 && !sh_array_find(nm)) v = env_get(nm);
                         if (!v) return 0;            /* unset element: empty */
                         return sb_put_data_str(b, v);
                     }
@@ -26266,6 +26445,21 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
     int rc = 0;
     for (int i = 0; i < assignc; i++) {
         g_readonly_hit = false;
+        g_assign_fail_hit = false;
+        /* AN ARRAY ELEMENT CANNOT GO INTO A COMMAND'S ENVIRONMENT: bash's
+         * assign_in_env says "`c[1]': not a valid identifier", assigns
+         * nothing and runs the command. tsh assigned the element -- for
+         * good, not just for the command. */
+        if (exported) {
+            size_t ak = env_assign_name_len(assignv[i]);
+            const char *lbk = 0;
+            for (size_t q = 0; q < ak; q++)
+                if (assignv[i][q] == '[') { lbk = assignv[i] + q; break; }
+            if (lbk) {
+                kprintf("`%.*s': not a valid identifier\n", (int)ak, assignv[i]);
+                continue;
+            }
+        }
         if (env_set_kv(assignv[i]) < 0) {
             /* A READONLY NAME (S4), measured against bash -- env_set_kv has
              * already said "NAME: readonly variable":
@@ -26273,11 +26467,14 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
              *     command still runs;
              *   a STATEMENT (`x=2; echo hi`): the rest of the line is
              *     discarded, status 1 -- jump_to_top_level, as failglob. */
-            if (g_readonly_hit) {
+            /* ...AND A BAD SUBSCRIPT the same way (g_assign_fail_hit): the
+             * message is out, set -e has been dealt with where it was
+             * printed (report_error or not), and the line is discarded. */
+            if (g_readonly_hit || g_assign_fail_hit) {
                 if (exported) continue;
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
-                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow = (g_opt_errexit && g_readonly_hit)
+                                       ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
                     g_shell_flow_status = 1;
                 }
                 return 1;
