@@ -28612,7 +28612,48 @@ static int shell_background_forked(const char *text, const char *label) {
 }
 #endif
 
+static int shell_run_single_in(struct shell_simple *cmd, bool background);
+
+/* $_ -- THE LAST ARGUMENT OF THE LAST SIMPLE COMMAND this shell ran (bash's
+ * bind_lastarg), measured in WSL bash:
+ *
+ *     echo "hi $name"; echo "$_"     hi world       : $x  (x='a b')  b
+ *     f p q; echo $_                 q (after f returns, whatever f ran)
+ *     x=$(cmd); echo "[$_]"          []             : ; echo $_   :
+ *     (( ... )), [[ ... ]], for, a pipeline's forked stages: unchanged
+ *
+ * tsh had no `_` at all (Oils 2669-2676). An array literal in a
+ * declaration (`declare a=(1 2)`) leaves its NAME. */
+static void shell_bind_lastarg(const struct shell_simple *cmd, int assignc) {
+    if (assignc >= cmd->argc) { (void)env_set("_", ""); return; }
+    const char *w = cmd->argv[cmd->argc - 1];
+    if (!w) return;
+    SH_SB(lb);
+    size_t nl = 0;
+    while ((w[nl] >= 'A' && w[nl] <= 'Z') || (w[nl] >= 'a' && w[nl] <= 'z') ||
+           (w[nl] >= '0' && w[nl] <= '9') || w[nl] == '_') nl++;
+    size_t eq = nl;
+    if (w[eq] == '+') eq++;
+    if (nl > 0 && w[eq] == '=' && w[eq + 1] == '(') {
+        if (sb_putmem(&lb, w, nl) < 0) return;
+        w = lb.p;
+    }
+    (void)env_set("_", w);
+}
+
 static int shell_run_single(struct shell_simple *cmd, bool background) {
+    int assignc = 0;
+    while (assignc < cmd->argc &&
+           !shell_simple_noassign(cmd, assignc) &&
+           shell_is_assignment_word(cmd->argv[assignc])) {
+        assignc++;
+    }
+    int rc = shell_run_single_in(cmd, background);
+    if (!background) shell_bind_lastarg(cmd, assignc);
+    return rc;
+}
+
+static int shell_run_single_in(struct shell_simple *cmd, bool background) {
     int assignc = 0;
     while (assignc < cmd->argc &&
            !shell_simple_noassign(cmd, assignc) &&
