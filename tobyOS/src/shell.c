@@ -25907,7 +25907,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         strcmp(plain, "typeset") == 0 ||
                         strcmp(plain, "local")   == 0 ||
                         strcmp(plain, "export")  == 0 ||
-                        strcmp(plain, "readonly") == 0)
+                        strcmp(plain, "readonly") == 0 ||
+                        /* `let x=( 1 + 2 )`: bash reads `x=( ... )` as
+                         * ONE word for let as well (Oils 1805), and let
+                         * evaluates it -- the parens are arithmetic's */
+                        strcmp(plain, "let") == 0)
                         decl_util_cmd = true;
                 }
                 prefix_ok = false;
