@@ -4788,6 +4788,10 @@ struct sh_array {
     struct sh_arr_elem *e;      /* cap slots on the heap */
     int  n;                     /* used slots; sorted by idx when indexed */
     int  cap;
+    /* An associative array's bash hash-table size (0 = bash's
+     * ASSOC_HASH_BUCKETS, 1024): its elements are kept in the order
+     * bash's table iterates them -- see sh_array_set_key. */
+    int  nbuckets;
 };
 static struct sh_array **g_arrays;
 static int g_narrays;
@@ -5049,6 +5053,7 @@ static char *sh_array_strdup(const char *v) {
 static int sh_array_copy_into(struct sh_array *dst, const struct sh_array *src) {
     memset(dst, 0, sizeof *dst);
     dst->assoc = src->assoc;
+    dst->nbuckets = src->nbuckets;
     dst->name = sh_array_strdup(src->name ? src->name : "");
     if (!dst->name) return -1;
     if (src->n > 0) {
@@ -5451,6 +5456,54 @@ static bool sh_array_is_assoc(const char *name) {
     return a && a->assoc;
 }
 
+/* AN ASSOCIATIVE ARRAY ITERATES IN BASH'S HASH-TABLE ORDER -- ${!m[@]},
+ * ${m[@]}, declare -p, @Q, for loops:
+ *
+ *     declare -A A=([a]=1 [b]=2 [c]=3); declare -p A
+ *         bash: declare -A A=([c]="3" [b]="2" [a]="1" )
+ *
+ * tsh listed them in insertion order (Oils 0179 0218 0253 0254 0384 0386
+ * 0523 2398 2438 2439 2769). bash's table (hashlib.c) is FNV-1 over the
+ * key's bytes as SIGNED chars, 1024 buckets for a `declare -A`, walked
+ * bucket by bucket, each bucket newest-first; it grows x4 when an insert
+ * finds nentries >= 2 * nbuckets, re-linking each old bucket head-first.
+ * So the elements are KEPT in that order: a new key goes in front of its
+ * bucket's others, and growth re-sorts exactly as the rehash does. The
+ * full hash rides in the element's idx, unused by an associative array. */
+static unsigned sh_bash_hash(const char *k) {
+    unsigned i = 2166136261u;
+    for (; *k; k++) {
+        i += (i << 1) + (i << 4) + (i << 7) + (i << 8) + (i << 24);
+        i ^= (unsigned)(int)(signed char)*k;
+    }
+    return i;
+}
+
+static unsigned sh_assoc_nbuckets(const struct sh_array *a) {
+    return a->nbuckets > 0 ? (unsigned)a->nbuckets : 1024u;
+}
+
+/* bash's hash_rehash into NB buckets: old buckets in order, each list from
+ * its head, every item pushed onto the head of its new bucket -- so each
+ * new bucket holds its items in REVERSE of the old walk. */
+static bool sh_assoc_rehash(struct sh_array *a, unsigned nb) {
+    int *cnt = (int *)kmalloc((size_t)nb * sizeof(int));
+    struct sh_arr_elem *ne =
+        (struct sh_arr_elem *)kmalloc((size_t)(a->cap > 0 ? a->cap : 1) * sizeof *ne);
+    if (!cnt || !ne) { kfree(cnt); kfree(ne); return false; }
+    for (unsigned b = 0; b < nb; b++) cnt[b] = 0;
+    for (int i = 0; i < a->n; i++) cnt[(unsigned)a->e[i].idx & (nb - 1)]++;
+    int pos = 0;
+    for (unsigned b = 0; b < nb; b++) { int c = cnt[b]; cnt[b] = pos; pos += c; }
+    for (int i = a->n - 1; i >= 0; i--)
+        ne[cnt[(unsigned)a->e[i].idx & (nb - 1)]++] = a->e[i];
+    kfree(a->e);
+    a->e = ne;
+    kfree(cnt);
+    a->nbuckets = (int)nb;
+    return true;
+}
+
 static int sh_array_set_key(const char *name, const char *key,
                             const char *val) {
     struct sh_array *a = sh_array_create(name);
@@ -5471,10 +5524,22 @@ static int sh_array_set_key(const char *name, const char *key,
     char *kc = (char *)kmalloc(kn);
     if (!kc) { kfree(copy); return -1; }
     memcpy(kc, key, kn);
-    a->e[a->n].idx = 0;
-    a->e[a->n].key = kc;
-    a->e[a->n].val = copy;
-    a->n++;                       /* insertion order; see the note above */
+    unsigned nb = sh_assoc_nbuckets(a);
+    if ((unsigned)a->n >= nb * 2u && sh_assoc_rehash(a, nb * 4u))
+        nb = sh_assoc_nbuckets(a);
+    unsigned hv = sh_bash_hash(key);
+    unsigned b = hv & (nb - 1);
+    int lo = 0, hi = a->n;          /* first element in a bucket >= b */
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (((unsigned)a->e[mid].idx & (nb - 1)) < b) lo = mid + 1;
+        else hi = mid;
+    }
+    for (int j = a->n; j > lo; j--) a->e[j] = a->e[j - 1];
+    a->e[lo].idx = (long)hv;
+    a->e[lo].key = kc;
+    a->e[lo].val = copy;
+    a->n++;
     return 0;
 }
 
