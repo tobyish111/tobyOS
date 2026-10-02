@@ -5907,6 +5907,13 @@ struct shell_prefix_save {
     struct shell_prefix_one *v;     /* heap, assignc slots */
     int   count;
     int   level;                    /* the scope it belongs to; g_tempenv */
+    /* The prefix of `eval`, `.`/`source`, `unset` or `mapfile`: bash makes
+     * it a SCOPE of its own (execute_builtin's isbltinenv, push_scope), and
+     * a local made in it ends with it -- `v=x eval 'local v=y'` leaves v as
+     * it was once eval returns (Oils 0524). Any other builtin's prefix is
+     * only a temporary binding: `v=4 local v` makes a local of the
+     * function's that outlives it. */
+    bool  scope;
 };
 
 /* SCOPES, AS BASH HAS THEM (variables.c: a stack of VAR_CONTEXTs).
@@ -5982,6 +5989,9 @@ struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
     unsigned long seq;    /* g_scope_seq when it was made */
     bool  dead;           /* removed by a callee's `unset`: no restore */
+    /* The prefix binding this local took over (see shell_locals_push), or
+     * 0 -- see shell_prefix_save.scope. */
+    struct shell_prefix_one *owner;
     char *name;           /* variable name, NUL-terminated */
     /* An ARRAY of the same name is part of the same variable and must be
      * scoped with it -- arrays live in their own table, so saving only the
@@ -6032,6 +6042,7 @@ static int shell_locals_push(const char *name, int depth) {
     if (!sv->name) return -1;
     sv->seq = ++g_scope_seq;
     sv->dead = false;
+    sv->owner = tb;
 
     size_t klen = strlen(name);
     int idx = env_find(name, klen);
@@ -29484,6 +29495,7 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
     /* a builtin's prefix is in the caller's scope; a function call sets
      * its own body's (see the call in shell_run_simple) */
     sv->level = g_script_depth;
+    sv->scope = false;
     if (assignc <= 0) return;
     sv->v = (struct shell_prefix_one *)kmalloc((size_t)assignc * sizeof *sv->v);
     if (!sv->v) {
@@ -29528,8 +29540,17 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
     shell_tempenv_register(sv);
 }
 
+static void shell_local_unbind(struct shell_local_save *sv);
 static void shell_prefix_restore(struct shell_prefix_save *sv) {
     shell_tempenv_unregister(sv);
+    /* a builtin's SCOPE ends here, and the locals made in it with it */
+    for (int i = 0; sv->scope && i < sv->count; i++) {
+        if (!sv->v[i].dead) continue;
+        for (int k = g_localc - 1; k >= 0; k--)
+            if (g_locals[k].owner == &sv->v[i] && !g_locals[k].dead &&
+                g_locals[k].name)
+                shell_local_unbind(&g_locals[k]);
+    }
     for (int i = 0; i < sv->count; i++) {
         struct shell_prefix_one *o = &sv->v[i];
         /* `unset` removed it (shell_unset_dynamic), or a local of the same
@@ -29603,6 +29624,12 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     }
     if (assignc > 0 && !persist_assignments) {
         shell_prefix_capture(&prefix_save, assignv, assignc);
+        prefix_save.scope = strcmp(c->name, "eval") == 0 ||
+                            strcmp(c->name, ".") == 0 ||
+                            strcmp(c->name, "source") == 0 ||
+                            strcmp(c->name, "unset") == 0 ||
+                            strcmp(c->name, "mapfile") == 0 ||
+                            strcmp(c->name, "readarray") == 0;
         restore_env = true;
     }
     if (assignc > 0 &&

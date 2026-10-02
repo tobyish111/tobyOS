@@ -53,3 +53,5 @@ v=global; v=tempenv d1
 a1() { local -a arr=(x y); a2; echo "a1: ${arr[*]-(unset)}"; }
 a2() { unset arr; echo "a2: ${arr[*]-(unset)}"; }
 arr=(g1 g2); a1; echo "top arr: ${arr[*]}"
+f6() { local v=local1; v=tempenv2 eval 'local v=local2; echo "in eval: $v"'; echo "after eval: $v"; }
+v=global; v=tempenv1 f6; echo "after f6: $v"
