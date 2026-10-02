@@ -6,7 +6,9 @@
 # OUT with, per case, each shell's stdout, stderr and exit status, and a
 # SAME/DIFF line on stdout+exit (the gate's rule). The driver runs under the
 # guest's BASH (so a tsh bug cannot garble the report -- one did: `>>` from
-# a group), writes a file on the guest, and it comes back 10 lines at a time.
+# a group), writes a file on the guest, and it comes back gzipped and
+# base64'd 45 lines a call (an edremote reply is cut short after a few KB),
+# checked against the guest's md5sum.
 cd "$(dirname "$0")/../.." || exit 1
 OUT=$1; shift
 cat > /tmp/oilcases-driver.$$ <<'EOF'
@@ -22,15 +24,22 @@ for id in "$@"; do
   { echo "######## $id $v (exit bash=$brc tsh=$trc)"; echo "--- bash stdout"; cat /tmp/oc.bo; echo "--- tsh stdout"; cat /tmp/oc.out
     echo "--- bash stderr"; cat /tmp/oc.be; echo "--- tsh stderr"; cat /tmp/oc.err; } >> /tmp/ocres
 done
-wc -l < /tmp/ocres
+gzip -c /tmp/ocres | base64 > /tmp/ocres.b64
+echo "$(wc -l < /tmp/ocres.b64) $(md5sum < /tmp/ocres | cut -c1-32)"
 EOF
 bash logs/edremote.sh "cat > /tmp/ocdriver.sh" < /tmp/oilcases-driver.$$ >/dev/null 2>&1
 rm -f /tmp/oilcases-driver.$$
-lines=$(ED_TIMEOUT=${ED_TIMEOUT:-900} bash logs/edremote.sh "bash /tmp/ocdriver.sh $*" 2>/dev/null | tr -d '\r ')
-: > "$OUT"
+info=$(ED_TIMEOUT=${ED_TIMEOUT:-900} bash logs/edremote.sh "bash /tmp/ocdriver.sh $*" 2>/dev/null | tr -d '\r' | tail -1)
+lines=${info%% *}; sum=${info##* }
+B64=$(mktemp)
+: > "$B64"
 start=1
 while [ "$start" -le "${lines:-0}" ]; do
-  bash logs/edremote.sh "sed -n '${start},$((start+9))p' /tmp/ocres" 2>/dev/null | tr -d '\r' >> "$OUT"
-  start=$((start+10))
+  bash logs/edremote.sh "sed -n '${start},$((start+44))p' /tmp/ocres.b64" 2>/dev/null | tr -d '\r' >> "$B64"
+  start=$((start+45))
 done
+base64 -d < "$B64" | gzip -dc > "$OUT"
+rm -f "$B64"
+got=$(md5sum < "$OUT" | cut -c1-32)
+if [ "$got" != "$sum" ]; then echo "oilcases: TRANSFER MISMATCH (guest $sum, host $got)" >&2; exit 2; fi
 grep -a "^######## " "$OUT"
