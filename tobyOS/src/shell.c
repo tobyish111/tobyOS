@@ -3402,6 +3402,26 @@ static int env_unset(const char *key) {
 
 /* Stamp the boot-time defaults. Called once from shell_init. Failures
  * are logged but non-fatal -- a degraded env is still usable. */
+/* bash sets UID and EUID (readonly), HOSTNAME and OSTYPE at startup; tsh
+ * had none of them, so `echo $UID | grep -q '[0-9]'` failed a script under
+ * set -e (Oils 2656-2658). EUID is UID: the shell is never set-id.
+ * HOSTNAME is what `hostname` says, from the same file. OSTYPE names this
+ * system, not Linux. */
+static const char *shell_prompt_host(char *buf, size_t cap);
+static void shell_init_identity_vars(void) {
+    char nb[24];
+    struct proc *cur = current_proc();
+    ksnprintf(nb, sizeof nb, "%u", cur ? (unsigned)cur->uid : 0u);
+    (void)env_set("UID", nb);
+    (void)env_set("EUID", nb);
+    (void)shell_readonly_mark("UID", 3);
+    (void)shell_readonly_mark("EUID", 4);
+    char hb[256];
+    const char *h = shell_prompt_host(hb, sizeof hb);
+    (void)env_set("HOSTNAME", h);
+    (void)env_set("OSTYPE", "tobyos");
+}
+
 static void env_init_defaults(void) {
     g_envc = 0;
     if (env_reserve(64)) {
@@ -3428,6 +3448,7 @@ static void env_init_defaults(void) {
      * redundant rather than load-bearing. */
     if (env_set("IFS", " \t\n")     < 0) kprintf("env: default IFS set failed\n");
     shell_optvars_refresh();          /* SHELLOPTS, BASHOPTS: see there */
+    shell_init_identity_vars();       /* UID EUID HOSTNAME OSTYPE: see there */
 
     /* PATH, HOME, PWD, SHELL and USER are exported: a child process is
      * expected to inherit them, and every real shell does. IFS and OPTIND are
