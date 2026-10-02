@@ -11166,9 +11166,38 @@ static void shell_strip_comment(char *s) { shell_strip_comment_from(s, false); }
 
 static void shell_strip_comment_from(char *s, bool mid_word) {
     bool in_sq = false, in_dq = false, sq_ansi = false;
+    /* WHERE A `#` IS AN OPERATOR, NOT A COMMENT: inside arithmetic -- $(( )),
+     * (( )), and parentheses nested in them -- and inside ${ }, the text
+     * goes to the evaluator or the expansion whole, and bash's lexer never
+     * sees a comment there:
+     *
+     *     (( a = 3 + 4  # comment          bash: "syntax error: invalid
+     *     ))                                arithmetic operator", a unset
+     *
+     * tsh cut the line at the `#`, ran `(( a = 3 + 4 ))` and set a. One
+     * kind per open parenthesis ('a' arithmetic, 'c' commands -- where a
+     * comment still is one -- and 'v' for ${). */
+    char kinds[64];
+    int nk = 0;
+#define SC_PUSH(k) do { if (nk < (int)sizeof kinds) kinds[nk] = (k); nk++; } while (0)
+#define SC_TOP() (nk > 0 && nk <= (int)sizeof kinds ? kinds[nk - 1] : (nk > 0 ? 'a' : 0))
     /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Same rule as
      * shell_line_incomplete -- see the comment there for what went wrong. */
     for (char *p = s; *p; p++) {
+        if (!in_sq && !in_dq) {
+            if (*p == '$' && p[1] == '(' && p[2] == '(') {
+                SC_PUSH('a'); SC_PUSH('a'); p += 2; continue;
+            }
+            if (*p == '$' && p[1] == '(') { SC_PUSH('c'); p++; continue; }
+            if (*p == '$' && p[1] == '{') { SC_PUSH('v'); p++; continue; }
+            if (*p == '(' && p[1] == '(' && SC_TOP() != 'v') {
+                SC_PUSH('a'); SC_PUSH('a'); p++; continue;
+            }
+            if (*p == '(') { SC_PUSH(SC_TOP() == 'a' ? 'a' : 'c'); continue; }
+            if (*p == ')' && nk > 0 && SC_TOP() != 'v') { nk--; continue; }
+            if (*p == '}' && nk > 0 && SC_TOP() == 'v') { nk--; continue; }
+            if (*p == '#' && (SC_TOP() == 'a' || SC_TOP() == 'v')) continue;
+        }
         if (in_sq) {
             if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
             if (*p == '\'') { in_sq = false; sq_ansi = false; }
@@ -11192,6 +11221,8 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
             return;
         }
     }
+#undef SC_PUSH
+#undef SC_TOP
 }
 
 /* Collapse `;` + run-of-blanks to exactly `; `, in place, outside quotes.
