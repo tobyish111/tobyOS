@@ -1833,6 +1833,43 @@ static bool env_reserve(int want) {
  * byte count, 0 if `kv` doesn't start with at least one non-'=' char. */
 static size_t env_key_len(const char *kv) {
     if (!kv) return 0;
+    /* `NAME[SUB]=v`: the `=` that matters is the one AFTER the subscript.
+     * bash finds it with skipsubscript, so `a[x=1]=one` assigns a[1] (and
+     * x) and `a[a[0]=1]=X` is one assignment; the first `=` cut both inside
+     * the brackets. Only for a NAME followed by a closed `[...]` and `=` --
+     * a "KEY=VALUE" blob never has one, so nothing else moves. */
+    {
+        const char *q = kv;
+        if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') || *q == '_') {
+            while ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
+                   (*q >= '0' && *q <= '9') || *q == '_') q++;
+            if (*q == '[') {
+                int depth = 0;
+                const char *r = q;
+                for (; *r; r++) {
+                    if (*r == '\\' && r[1]) { r++; continue; }
+                    if (*r == '\'') {
+                        r++;
+                        while (*r && *r != '\'') r++;
+                        if (!*r) break;
+                        continue;
+                    }
+                    if (*r == '"') {
+                        r++;
+                        while (*r && *r != '"') { if (*r == '\\' && r[1]) r++; r++; }
+                        if (!*r) break;
+                        continue;
+                    }
+                    if (*r == '[') depth++;
+                    else if (*r == ']' && --depth == 0) { r++; break; }
+                }
+                if (depth == 0 && r > q && r[-1] == ']') {
+                    if (r[0] == '=') return (size_t)(r - kv);
+                    if (r[0] == '+' && r[1] == '=') return (size_t)(r + 1 - kv);
+                }
+            }
+        }
+    }
     const char *eq = kv;
     while (*eq && *eq != '=') eq++;
     if (eq == kv) return 0;
@@ -12273,6 +12310,24 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
             nest++;
             p += 2;
             continue;
+        }
+        /* AN ASSIGNMENT'S SUBSCRIPT IS PART OF ITS WORD, operators and all:
+         *
+         *     a[5&3]=hello      a[1|2]=x      a[ (1+2)*3 ]=9
+         *
+         * bash's lexer reads a command-position `NAME[` through its matching
+         * `]` (parse_matched_pair), so the `&` and `|` there are arithmetic.
+         * The scanner cut the line at them -- `a[5&3]=hello` became a
+         * background job `a[5` and a command `3]=hello` (Oils 0517 0518). */
+        if (d == '[' && nest == 0 && st->cmd_pos && !st->dbracket && p > w &&
+            shell_name_is_valid(w, (size_t)(p - w))) {
+            int bd = 0;
+            const char *q = p;
+            for (; *q && *q != '\n'; q++) {
+                if (*q == '[') bd++;
+                else if (*q == ']' && --bd == 0) break;
+            }
+            if (bd == 0 && *q == ']') { p = q + 1; continue; }
         }
         if (nest > 0) {
             /* A `case` PATTERN'S `)` IS NOT A NESTING PAREN.
@@ -23824,10 +23879,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                     if (nmlen + 1 >= sizeof nmbuf) { nmok = false; break; }
                     nmbuf[nmlen++] = *z;
                 }
+                /* ...through `&`, `|` and `;` too: inside the brackets they
+                 * are arithmetic (`a[5&3]=x`), as the scanner now agrees. */
                 int bd = 0;
                 const char *q = p;
-                for (; *q && *q != '\n' && *q != ';' && *q != '&' &&
-                       *q != '|'; q++) {
+                for (; *q && *q != '\n'; q++) {
                     if (*q == '[') bd++;
                     else if (*q == ']') { bd--; if (bd == 0) break; }
                 }
@@ -32296,6 +32352,35 @@ static const char *shell_find_pipe_at(const char *s) {
         if (vbrace > 0) {                       /* see vbrace above */
             if (*p == '}') vbrace--;
             continue;
+        }
+        /* `$[ ... ]` and an ASSIGNMENT'S SUBSCRIPT own their `|` as well:
+         * `echo $[1|2]`, `a[1|2]=x` (bash reads both as one word; Oils
+         * 0517 0518 were cut into "a[1" and "2]=x"). A subscript counts
+         * when its `[` follows a NAME that starts a word and the matching
+         * `]` is followed by `=` or `+=`. */
+        if (*p == '[' && p > start) {
+            const char *nb = p;
+            while (nb > start && ((nb[-1] >= 'a' && nb[-1] <= 'z') ||
+                                  (nb[-1] >= 'A' && nb[-1] <= 'Z') ||
+                                  (nb[-1] >= '0' && nb[-1] <= '9') || nb[-1] == '_'))
+                nb--;
+            bool word_start = (nb == start || nb[-1] == ' ' || nb[-1] == '\t' ||
+                               nb[-1] == ';' || nb[-1] == '&' || nb[-1] == '|' ||
+                               nb[-1] == '(' || nb[-1] == '\n');
+            bool is_dollar = (p - 1 >= start && p[-1] == '$');
+            if (is_dollar || (nb < p && word_start && !(*nb >= '0' && *nb <= '9'))) {
+                int bd = 0;
+                const char *q = p;
+                for (; *q && *q != '\n'; q++) {
+                    if (*q == '[') bd++;
+                    else if (*q == ']' && --bd == 0) break;
+                }
+                if (*q == ']' && (is_dollar || q[1] == '=' ||
+                                  (q[1] == '+' && q[2] == '='))) {
+                    p = q;
+                    continue;
+                }
+            }
         }
         if (*p == '$' && p[1] == '(') { paren++; p++; continue; }
         if (*p == '(') { paren++; continue; }
