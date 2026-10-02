@@ -470,6 +470,14 @@ static int g_last_status;
  *     echo $(if true)      bash: nothing, exit 2
  * tsh printed the empty substitution and carried on. */
 static bool g_parse_error;
+/* ...and one that ends the whole input, eval or not: see shell_syn_fail. */
+static bool g_syntax_fatal;
+/* Depth of running text that bash's grammar check has READ (shell_syn_*):
+ * its syntax errors were the check's to report, in bash's words, so the
+ * older scanner checks (shell_line_syntax_ok) stand down for it -- they
+ * could only add false ones, `declare -a q=(1) r=(9)` among them. A trap's
+ * action is not read by the check, and runs with the old checks. */
+static int g_syn_checked;
 static int g_last_bg_pid;
 /* Set in a background child whose text is ONE simple command: the external
  * it runs may REPLACE this process rather than be spawned and waited on. */
@@ -1204,6 +1212,7 @@ static bool g_heredoc_collecting;
 static bool g_continuation_active;
 static void prompt(void);
 static void execute_line_text(const char *src);
+static void shell_trap_text(const char *action);
 static void execute_line_text_inner(const char *src);
 static void shell_parse_error(void);
 
@@ -1344,6 +1353,7 @@ static void shell_interactive_line_done(void) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
         g_parse_error = false;
+        g_syntax_fatal = false;
         shell_set_status(2);
     }
 }
@@ -3674,7 +3684,7 @@ static void shell_run_trap(int sig) {
     g_shell_flow_status = 0;
     g_shell_lineno = 1;                /* the action is its own script (1195) */
 
-    execute_line_text(action);
+    shell_trap_text(action);
     g_shell_lineno = saved_line;
 
     if (g_shell_flow != SHELL_FLOW_EXIT) {
@@ -3771,7 +3781,7 @@ static void shell_run_err_trap(int status) {
     g_err_trap_running = true;
     g_trap_running = true;
     shell_set_status(status);
-    execute_line_text(action);
+    shell_trap_text(action);
     g_trap_running = was_running;
     g_err_trap_running = false;
     shell_set_status(status);
@@ -3800,7 +3810,7 @@ static void shell_run_debug_trap(void) {
     bool was_running = g_trap_running;
     g_debug_trap_running = true;
     g_trap_running = true;
-    execute_line_text(action);
+    shell_trap_text(action);
     g_trap_running = was_running;
     g_debug_trap_running = false;
     g_shell_lineno = saved_line;
@@ -3825,7 +3835,7 @@ static void shell_run_return_trap(void) {
     int saved_status = g_last_status;
     unsigned long saved_line = g_shell_lineno;
     g_trap_running = true;
-    execute_line_text(action);
+    shell_trap_text(action);
     g_trap_running = false;
     g_shell_lineno = saved_line;
     if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(saved_status);
@@ -3845,7 +3855,7 @@ static int shell_run_exit_trap(int status) {
     g_shell_flow_status = 0;
     shell_set_status(status);
 
-    execute_line_text(action);
+    shell_trap_text(action);
 
     int final_status = status;
     if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -12216,8 +12226,274 @@ static int  g_eval_reader_depth;
  * started on -- the one reader that records history (see hist_reader). */
 static bool g_reader_main_script;
 
+/* ---- bash's grammar in front of the executor (B9) ----------------------
+ *
+ * Every command the reader is about to run is first read by a recognizer
+ * of bash's grammar (shell_bashsyn.inc), as bash reads a whole command
+ * before running any of it. When it does not parse, nothing of it runs and
+ * the shell says what bash says -- the token, the line, and the line again
+ * -- with bash's consequences (see shell_syn_fail). */
+#include "shell_bashsyn.inc"
+
+/* What the NEXT reader reads, set by its caller for that one call and
+ * consumed at the reader's entry, like g_reader_eval_pending:
+ *   - the name bash puts between the file and the line ("eval", "-c",
+ *     "command substitution"), 0 for a file read for itself;
+ *   - text rather than a file (eval, -c, a substitution);
+ *   - a line typed at an interactive prompt. */
+static const char *g_reader_syn_iname;
+static bool g_reader_syn_string;
+static bool g_reader_syn_repl;
+/* g_syntax_fatal (declared with g_parse_error) is set by a syntax error
+ * that ends the WHOLE shell input -- one inside a $( ), which bash's
+ * parse_comsub answers by jumping to the top level -- so that eval and
+ * `.`, which take an ordinary syntax error as their own status 2, let this
+ * one through. A substitution, being a subshell, stops it. */
+/* The last syntax error was one report_syntax_error made ($? 2). In POSIX
+ * mode a script exits on such an error inside eval or `.` (bash's
+ * parse_and_execute, EX_BADSYNTAX + posixly_correct); a [[ ]] error is not
+ * one. */
+static bool g_syntax_report;
+/* bash's parser state is one global, and a [[ ]] error leaves "inside [["
+ * set in it for whatever is read next (bsyn_set_leak): carried here from
+ * one check to the next. A substitution gets a copy, as bash's child does. */
+static unsigned g_syn_leak;
+
+static bool shell_syn_posix_exits(void) {
+    return g_opt_posix && !g_interactive && g_syntax_report;
+}
+
+static const char *shell_syn_alias(void *ctx, const char *name, bool *expand_next) {
+    (void)ctx;
+    const char *v = shell_alias_value(name);
+    if (!v) return 0;
+    size_t n = strlen(v);
+    *expand_next = n && (v[n - 1] == ' ' || v[n - 1] == '\t');
+    return v;
+}
+
+static void shell_syn_env(struct bsyn_env *env, bool string, bool repl) {
+    memset(env, 0, sizeof *env);
+    env->posix = g_opt_posix;
+    env->extglob = g_shopt_extglob;
+    env->expand_aliases = g_interactive || g_opt_expand_aliases;
+    env->interactive = repl;
+    env->is_string = string;
+    env->alias = shell_syn_alias;
+    env->max_depth = 400;
+}
+
+/* errexit as bash's exit_immediately_on_error has it: on, and not in a
+ * condition or under `!`. */
+static bool shell_errexit_now(void) {
+    return g_opt_errexit && g_errexit_suspend == 0 && g_errexit_negate == 0;
+}
+
+/* Print the check's messages as bash's parser_error and internal_warning
+ * do: "NAME: [INAME: ]line N: TEXT", INAME left out when it is NAME;
+ * "NAME: line N: warning: TEXT"; at a prompt just "NAME: TEXT". Under
+ * set -e bash exits on its first parser_error, before the echo of the line
+ * -- true is returned when that happened. */
+static bool shell_syn_print(const struct bsyn_result *r, const char *iname, bool repl) {
+    bool errexit = shell_errexit_now();
+    for (int i = 0; i < r->nmsg; i++) {
+        const struct bsyn_msg *m = &r->msg[i];
+#ifdef SHELL_HOSTED
+        const char *name;
+        if (repl)
+            name = g_diag_progname ? g_diag_progname : "tsh";
+        else if (g_diag_in_fn)
+            name = g_diag_fn_source ? g_diag_fn_source : "environment";
+        else if (g_diag_source)
+            name = g_diag_source;
+        else
+            name = g_param0 ? g_param0 : "tsh";
+        SH_SB(out);
+        (void)sb_puts(&out, name);
+        (void)sb_puts(&out, ": ");
+        if (!repl) {
+            if (m->kind == BSYN_MSG_PARSER && iname && strcmp(iname, name) != 0) {
+                (void)sb_puts(&out, iname);
+                (void)sb_puts(&out, ": ");
+            }
+            (void)sb_puts(&out, "line ");
+            (void)sb_put_uint(&out, m->line);
+            (void)sb_puts(&out, ": ");
+        }
+        if (m->kind == BSYN_MSG_WARNING) (void)sb_puts(&out, "warning: ");
+        (void)sb_puts(&out, m->text);
+        (void)sb_putc(&out, '\n');
+        if (out.p) kprintf_raw("%s", out.p);
+#else
+        (void)iname; (void)repl;
+        kprintf(SH_PFX_SHELL "%s%s\n", m->kind == BSYN_MSG_WARNING ? "warning: " : "", m->text);
+#endif
+        if (errexit && m->kind == BSYN_MSG_PARSER) return true;
+    }
+    return false;
+}
+
+/* A command that does not parse, and what it ends. The status is bash's
+ * last_command_exit_value: 2 from report_syntax_error, unchanged after a
+ * [[ ]] error -- unless the input then ended, which makes a 0 a 2. The
+ * reader stops (SHELL_FLOW_EXIT, g_parse_error): a script ends there; eval
+ * and `.` take it as their own status 2 and go on; a prompt goes on. An
+ * error inside a $( ) is FATAL: the whole input ends, eval or not -- with
+ * 257 & 255 = 1 when it happened inside eval or `.` (bash's EX_BADSYNTAX).
+ * Under set -e bash exits 2 at once (parser_error). */
+static void shell_syn_fail(const struct bsyn_result *r, bool exited, bool in_builtin) {
+    int st;
+    if (r->status_set) st = r->status;
+    else if (r->status_ifzero && g_last_status == 0) st = r->status_ifzero;
+    else st = g_last_status;
+    if (exited) {
+        shell_set_status(2);
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = 2;
+        g_syntax_fatal = true;          /* no eval or `.` takes it back */
+        g_parse_error = true;
+        return;
+    }
+    if (r->fatal && in_builtin && r->status_set && r->status == 2) st = 1;
+    g_syntax_report = r->status_set && r->status == 2;
+    shell_set_status(st);
+    g_parse_error = true;
+    if (r->fatal) g_syntax_fatal = true;
+    if (g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = st;
+    }
+}
+
+/* The check, over a script reader's text. The text is read in place and
+ * cut up as it goes, so the check reads its own copy. */
+struct shell_syn {
+    struct bsyn *h;
+    char *copy;
+    size_t len;
+    size_t pos;               /* checked up to here */
+    struct bsyn_env env;
+    const char *iname;
+    bool string, repl, builtin;
+    bool done;                /* read to the end: all of it was checked */
+};
+
+static void shell_syn_open(struct shell_syn *s, const char *text, unsigned long line_before,
+                           const char *iname, bool string, bool repl, bool builtin) {
+    memset(s, 0, sizeof *s);
+    s->iname = iname;
+    s->string = string;
+    s->repl = repl;
+    s->builtin = builtin;
+    s->len = strlen(text);
+    s->copy = shell_strdup(text);
+    if (!s->copy) return;            /* no memory: run unchecked, as before */
+    shell_syn_env(&s->env, string, repl);
+    s->h = bsyn_open(s->copy, s->len, 0, line_before, &s->env);
+}
+
+static void shell_syn_close(struct shell_syn *s) {
+    if (s->h) bsyn_close(s->h);
+    if (s->copy) kfree(s->copy);
+    s->h = 0;
+    s->copy = 0;
+}
+
+#define SHELL_SYN_RUN     0      /* run the unit */
+#define SHELL_SYN_SKIP    1      /* do not run it, read on (a discarded line) */
+#define SHELL_SYN_STOP    2      /* stop reading: a syntax error */
+
+/* Check every command that starts before offset UPTO. */
+static int shell_syn_upto(struct shell_syn *s, size_t upto) {
+    int verdict = SHELL_SYN_RUN;
+    while (s->h && s->pos < upto) {
+        shell_syn_env(&s->env, s->string, s->repl);
+        struct bsyn_result r;
+        bsyn_set_leak(s->h, g_syn_leak);
+        int k = bsyn_next(s->h, &r);
+        g_syn_leak = bsyn_get_leak(s->h);
+        bool exited = false;
+        if (k != BSYN_SKIP) exited = shell_syn_print(&r, s->iname, s->repl);
+        if (exited) {
+            shell_syn_fail(&r, true, s->builtin);
+            bsyn_result_free(&r);
+            shell_syn_close(s);
+            return SHELL_SYN_STOP;
+        }
+        if (k == BSYN_OK) {
+            s->pos = r.end > s->pos ? r.end : s->pos;
+            bsyn_result_free(&r);
+            continue;
+        }
+        if (k == BSYN_DISCARD) {
+            /* the array literal's line is dropped and $? is 1; reading goes
+             * on after it */
+            shell_set_status(1);
+            s->pos = r.end > s->pos ? r.end : s->pos;
+            bsyn_result_free(&r);
+            verdict = SHELL_SYN_SKIP;
+            continue;
+        }
+        if (k == BSYN_ERROR) {
+            shell_syn_fail(&r, false, s->builtin);
+            bsyn_result_free(&r);
+            shell_syn_close(s);
+            return SHELL_SYN_STOP;
+        }
+        /* BSYN_EOF: the rest is blank; BSYN_SKIP: out of memory or too
+         * deep to check -- run the rest as before */
+        if (k == BSYN_EOF) s->done = true;
+        bsyn_result_free(&r);
+        shell_syn_close(s);
+        break;
+    }
+    return verdict;
+}
+
+/* Is the text at offset OFF (and before) checked? */
+static bool shell_syn_covers(const struct shell_syn *s, size_t off) {
+    return s->done || (s->h && s->pos >= off);
+}
+
+/* One string, checked whole before it runs: eval's and a substitution's
+ * one-line paths. false: it does not parse (reported, status set). *checked:
+ * it was read to the end -- not given up on for memory or depth. */
+static bool shell_syn_check_string(const char *text, const char *iname,
+                                   unsigned long line_before, bool builtin,
+                                   bool *checked) {
+    struct shell_syn s;
+    shell_syn_open(&s, text, line_before, iname, true, false, builtin);
+    int v = shell_syn_upto(&s, s.len + 1);
+    *checked = shell_syn_covers(&s, s.len);
+    shell_syn_close(&s);
+    return v == SHELL_SYN_RUN;
+}
+
+/* A trap's action is not read by the check: it runs with the old checks. */
+static void shell_trap_text(const char *action) {
+    int saved = g_syn_checked;
+    g_syn_checked = 0;
+    execute_line_text(action);
+    g_syn_checked = saved;
+}
+
+/* The line the next reader's first line follows, when its caller knows it
+ * better than the reader does: a substitution's text continues the line
+ * numbering of the command it is in, as bash's does. */
+static bool g_reader_syn_base_set;
+static unsigned long g_reader_syn_base;
+
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
+    const char *syn_iname = g_reader_syn_iname;
+    bool syn_string = g_reader_syn_string;
+    bool syn_repl = g_reader_syn_repl;
+    bool syn_base_set = g_reader_syn_base_set;
+    unsigned long syn_base = g_reader_syn_base;
+    g_reader_syn_iname = 0;
+    g_reader_syn_string = false;
+    g_reader_syn_repl = false;
+    g_reader_syn_base_set = false;
     /* EVAL MODE. A multi-line eval string is shell input, so it goes through
      * this reader -- the only code that knows here-documents, compounds that
      * span lines, and continuation -- with four differences from a script:
@@ -12259,6 +12535,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     int last = 0;
     char *p = text;
     bool first_line = true;
+    /* bash's grammar reads each command before it runs (see shell_syn_upto).
+     * eval and `.` are builtins: bash's status for an error inside them that
+     * ends everything is EX_BADSYNTAX, 257, which leaves the shell as 1. */
+    struct shell_syn syn;
+    shell_syn_open(&syn, text, syn_base_set ? syn_base : g_shell_lineno,
+                   eval_mode ? "eval" : syn_iname, eval_mode || syn_string,
+                   syn_repl, eval_mode || g_source_depth > 0);
     /* The here-document unit being read and run (see SHELL_HD_TAG), and a
      * tagged copy of the unit's first line, both released per unit and once
      * more on the way out for the paths that `break`. */
@@ -12271,6 +12554,26 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         g_shell_lineno++;
         unsigned long line_first = g_shell_lineno;
         char *line_start = p;
+        /* BASH READS THE WHOLE COMMAND FIRST. Check the command that starts
+         * here before any of it is assembled or run: one that does not parse
+         * stops the reader with bash's words, and one whose array literal
+         * did not parse is dropped up to where bash reads on. */
+        if (syn.h) {
+            int v = shell_syn_upto(&syn, (size_t)(line_start - text) + 1);
+            if (v == SHELL_SYN_STOP) {
+                last = g_last_status;
+                if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
+                break;
+            }
+            if (v == SHELL_SYN_SKIP && syn.pos > (size_t)(line_start - text)) {
+                char *resume = text + (syn.pos <= syn.len ? syn.pos : syn.len);
+                for (char *q = line_start; q < resume && *q; q++)
+                    if (*q == '\n') g_shell_lineno++;
+                g_shell_lineno--;               /* this line was counted */
+                p = resume;
+                continue;
+            }
+        }
         if (hist_reader && g_opt_history && !hist_raw) {
             hist_raw = shell_strdup(p);
             hist_raw_base = p;
@@ -12642,9 +12945,25 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         if (hist_reader)
             shell_history_add_raw(hist_raw, hist_raw_base, line_start, p,
                                   unit_heredoc);
+        /* ...and any further command the reader's unit took in with it. */
+        if (syn.h) {
+            int v = shell_syn_upto(&syn, (size_t)(p - text));
+            if (v != SHELL_SYN_RUN) {
+                if (accum) kfree(accum);
+                if (v == SHELL_SYN_STOP) {
+                    last = g_last_status;
+                    if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
+                    break;
+                }
+                last = g_last_status;
+                continue;
+            }
+        }
         unsigned long line_last = g_shell_lineno;
         g_shell_lineno = line_first;
         if (!accum) shell_lmap_reset(line, line_first);
+        bool unit_checked = shell_syn_covers(&syn, (size_t)(p - text));
+        if (unit_checked) g_syn_checked++;
         if (eval_mode) {
             /* Aliases, as cmd_eval's one-line path expands them. */
             SH_SB(abuf);
@@ -12653,6 +12972,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         } else {
             execute_line_text(line);
         }
+        if (unit_checked) g_syn_checked--;
         g_shell_lineno = line_last;
         if (accum) { kfree(accum); accum = 0; line = 0; }
         /* eval's DISCARD and RETURN are not this reader's to settle -- see
@@ -12682,6 +13002,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
     }
+    shell_syn_close(&syn);
     if (hd_unit) shell_hd_release_unit(hd_unit);
     if (hd_tline) kfree(hd_tline);
     if (hist_raw) kfree(hist_raw);
@@ -12807,6 +13128,8 @@ static void cmd_sh(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
+        g_reader_syn_string = true;
+        g_reader_syn_iname = "-c";
         int st = shell_run_script_text(copy, true);
         kfree(copy);
         shell_restore_opts(&opt_frame);
@@ -12904,6 +13227,26 @@ static void shell_dot_failed(int status_in) {
     shell_set_status(1);
 }
 
+/* A SYNTAX ERROR IN A SOURCED FILE ENDS THE FILE, NOT THE SCRIPT: bash's `.`
+ * returns 2 and the script goes on (parse_and_execute), as eval does. tsh
+ * let the parse error's EXIT through, so the whole script stopped. Not an
+ * error that ends everything (g_syntax_fatal), and in a POSIX-mode script
+ * bash exits 2. */
+static int shell_syn_absorb(int st) {
+    if (!(g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) || g_syntax_fatal)
+        return st;
+    if (shell_syn_posix_exits()) {
+        g_shell_flow_status = 2;
+        shell_set_status(2);
+        return 2;
+    }
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    g_parse_error = false;
+    shell_set_status(2);
+    return 2;
+}
+
 static void cmd_dot(int argc, char **argv) {
     /* The dispatcher pre-set $? to 0; this is what it replaced. */
     int status_in = g_shell_prev_status;
@@ -12951,7 +13294,7 @@ static void cmd_dot(int argc, char **argv) {
     argv[1] = resolved;
     if (argc <= 2) {
         g_source_depth++;                  /* `return` is legal in here */
-        int st1 = shell_run_script_path(argv[1], false);
+        int st1 = shell_syn_absorb(shell_run_script_path(argv[1], false));
         g_source_depth--;
         g_diag_source = saved_src;
         g_diag_in_fn = saved_in_fn;
@@ -12967,7 +13310,7 @@ static void cmd_dot(int argc, char **argv) {
         return;
     }
     g_source_depth++;                      /* `return` is legal in here */
-    int st = shell_run_script_path(argv[1], false);
+    int st = shell_syn_absorb(shell_run_script_path(argv[1], false));
     g_source_depth--;
     g_diag_source = saved_src;
     g_diag_in_fn = saved_in_fn;
@@ -13436,6 +13779,13 @@ static void cmd_eval(int argc, char **argv) {
      * defined and `inside` was reported as an unknown one. Newlines inside
      * quotes still belong to the string, which is why this uses the same
      * quote-aware scan the alias expander does. */
+    /* ...and like any input, it is read whole before it runs: a string that
+     * does not parse runs not at all (`eval 'echo in; fi'` printed "in"). */
+    bool eval_checked = false;
+    if (!shell_syn_check_string(cmd, "eval", g_shell_lineno ? g_shell_lineno - 1 : 0, true,
+                                &eval_checked))
+        goto eval_done;
+    if (eval_checked) g_syn_checked++;
     char *p = cmd;
     while (p && *p) {
         char *nl = shell_unquoted_newline(p);
@@ -13460,14 +13810,22 @@ static void cmd_eval(int argc, char **argv) {
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
     }
+    if (eval_checked) g_syn_checked--;
 eval_done:
-    /* See saved_parse_error above: a parse error's EXIT ends only the eval. */
-    if (g_parse_error && g_shell_flow == SHELL_FLOW_EXIT &&
-        g_shell_flow_status == 2) {
+    /* See saved_parse_error above: a parse error's EXIT ends only the eval,
+     * whose status is then 2 whatever the error left in $? (bash's
+     * parse_and_execute returns EX_BADUSAGE). Not one that ends everything
+     * (g_syntax_fatal), and not in a POSIX-mode script, where bash exits. */
+    if (g_parse_error && g_shell_flow == SHELL_FLOW_EXIT && !g_syntax_fatal &&
+        !shell_syn_posix_exits()) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
         shell_set_status(2);
         g_parse_error = false;                /* absorbed: eval's, not ours */
+    } else if (g_parse_error && g_shell_flow == SHELL_FLOW_EXIT &&
+               !g_syntax_fatal && shell_syn_posix_exits()) {
+        g_shell_flow_status = 2;
+        shell_set_status(2);
     }
     /* As command substitution does: restore the caller's flag, keeping one
      * raised here that was NOT absorbed. */
@@ -18360,7 +18718,10 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
      * `echo $?` report the substitution's failure. */
     int saved_status = g_last_status;
     bool saved_parse_error = g_parse_error;
+    bool saved_syntax_fatal = g_syntax_fatal;
+    unsigned saved_syn_leak = g_syn_leak;
     g_parse_error = false;
+    g_syntax_fatal = false;
     /* A COMMAND SUBSTITUTION IS A SUBSHELL, and nothing it changes reaches
      * the shell that ran it (POSIX 2.6.3, 2.12). /bin/tsh runs it in its
      * own process, and put back only the alias table and $? -- every other
@@ -18424,10 +18785,24 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
             const char *line = cmd;
             const char *ex = shell_expand_aliases_nested(cmd, &abuf);
             if (ex) line = ex;
-            execute_line_text(line);
+            /* Read whole before it runs, as any input: a `...` that does not
+             * parse runs nothing ("command substitution: line N: ..."). A
+             * $( ) was already read with the command around it. */
+            bool cs_checked = false;
+            if (shell_syn_check_string(cmd, "command substitution",
+                                       g_shell_lineno ? g_shell_lineno - 1 : 0, false,
+                                       &cs_checked)) {
+                if (cs_checked) g_syn_checked++;
+                execute_line_text(line);
+                if (cs_checked) g_syn_checked--;
+            }
         } else {
             char *copy = shell_strdup(cmd);
             if (copy) {
+                g_reader_syn_iname = "command substitution";
+                g_reader_syn_string = true;
+                g_reader_syn_base_set = true;
+                g_reader_syn_base = g_shell_lineno ? g_shell_lineno - 1 : 0;
                 (void)shell_run_script_text(copy, false);
                 kfree(copy);
             } else {
@@ -18449,11 +18824,14 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     g_capture_last_status = g_last_status;
     if (g_shell_flow == SHELL_FLOW_EXIT) {
         g_capture_last_status = g_shell_flow_status;
-        /* ...but a PARSE error is not an exit -- see g_parse_error. */
-        if (!g_parse_error) {
-            g_shell_flow = SHELL_FLOW_NONE;
-            g_shell_flow_status = 0;
-        }
+        /* ...and so is a syntax error inside it: bash finds an error in a
+         * $( ) while READING the command around it, which never runs
+         * (g_syntax_fatal, before any of this), and one in `...` when the
+         * subshell reads its text -- which ends that subshell only. (A
+         * parse error used to be let through here, so that `echo $(if
+         * true)` stopped the script; the reader does that now.) */
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
     } else if (g_shell_flow == SHELL_FLOW_DISCARD) {
         /* ...and a DISCARD (failglob, an expansion error) ends the
          * SUBSTITUTION with status 1, as it ends bash's subshell. It used to
@@ -18468,6 +18846,8 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     }
     g_last_status = saved_status;
     g_parse_error = saved_parse_error;
+    g_syntax_fatal = saved_syntax_fatal;
+    g_syn_leak = saved_syn_leak;
     /* The state goes back now -- after the flow above has been settled,
      * which is what the frame must not undo (a parse error inside still
      * stops the caller's line). */
@@ -32745,6 +33125,7 @@ static char *shell_unquoted_newline(char *s) {
  * the `(` branch of shell_scan_token for what those are and why the scanner
  * is the only place that can tell them apart. */
 static bool shell_line_syntax_ok(const char *src) {
+    if (g_syn_checked > 0) return true;     /* bash's grammar has read it */
     struct shell_scan st;
     shell_scan_init(&st);
     shell_scan_line(&st, src ? src : "");
@@ -32968,6 +33349,8 @@ static void execute_line_body(void) {
         {
             char *copy = shell_strdup(g_continuation_buf);
             if (copy) {
+                g_reader_syn_string = true;
+                g_reader_syn_repl = true;
                 (void)shell_run_script_text(copy, false);
                 kfree(copy);
             } else {
@@ -33651,6 +34034,11 @@ int shell_run_line_hosted(const char *text) {
     if (!text) return 0;
     char *copy = shell_strdup(text);
     if (!copy) return 2;
+    /* -c text, or a line typed at the prompt -- which bash words without a
+     * line number or the line echoed (see shell_syn_print) */
+    g_reader_syn_string = true;
+    if (g_interactive) g_reader_syn_repl = true;
+    else g_reader_syn_iname = "-c";
     int rc = shell_run_script_text(copy, true);
     kfree(copy);
     if (g_interactive && g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) {
