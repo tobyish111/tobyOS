@@ -19744,6 +19744,8 @@ enum shell_tok_type {
     SH_TOK_DUP_IN,
     SH_TOK_DUP_OUT,
     SH_TOK_REDIR_RW,
+    SH_TOK_REDIR_BOTH,          /* &>word: stdout and stderr */
+    SH_TOK_REDIR_BOTH_APPEND,   /* &>>word */
 };
 
 enum shell_redir_op {
@@ -24941,6 +24943,26 @@ static size_t shell_arr_literal_close(const char *s, size_t len, int *depth) {
 /* Rewrite a whole line, expanding the braces in each word. Words are split on
  * unquoted blanks and on the operator characters, so `echo a;echo {x,y}`
  * keeps its `;` and `> {a,b}` keeps its redirection. */
+/* How many words brace expansion makes of w[0..wlen): the blanks outside
+ * quotes in what shell_brace_word returns, plus one. */
+static int shell_redir_brace_words_n(const char *w, size_t wlen) {
+    bool brace = false;
+    for (size_t i = 0; i < wlen; i++) if (w[i] == '{') { brace = true; break; }
+    if (!brace) return 1;
+    SH_SB(bx);
+    if (shell_brace_word(w, wlen, &bx, 0) < 0 || !bx.p) return 1;
+    int n = 1;
+    bool sq = false, dq = false;
+    for (size_t i = 0; i < bx.len; i++) {
+        char c = bx.p[i];
+        if (c == '\\' && !sq && i + 1 < bx.len) { i++; continue; }
+        if (c == '\'' && !dq) sq = !sq;
+        else if (c == '"' && !sq) dq = !dq;
+        else if (c == ' ' && !sq && !dq) n++;
+    }
+    return n;
+}
+
 static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
     const char *p = src;
     const char *src_end = src + strlen(src);
@@ -24962,12 +24984,25 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
      * held for the REST of that command: `declare`'s options sit between the
      * name and the assignments and must not clear it. */
     bool assign_cmd = false;
+    /* THE WORD AFTER A REDIRECTION OPERATOR is one filename: brace
+     * expansion that makes TWO of it is an ambiguous redirect, which
+     * shell_redir_word reports from the word as written -- so such a word
+     * is left alone here (it made `a-one` the file and `a-two` an ARGUMENT,
+     * Oils 2095). One word out is fine. A here-document delimiter is not
+     * expanded at all. 1: a redirect target follows; 2: a delimiter. */
+    int redir_next = 0;
     sb_truncate(out, 0);
     while (*p) {
         if (*p == ' ' || *p == '\t' || *p == '\n') {
             if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
+        if (*p == '<' || *p == '>')
+            redir_next = (*p == '<' && p > src && p[-1] == '<') ? 2 : 1;
+        else if (*p == '&' && p[1] != '>' && !(p > src && p[-1] == '>'))
+            redir_next = 0;
+        else if (*p == ';' || *p == '|' || *p == '(' || *p == ')')
+            redir_next = 0;
         if (*p == ';' || *p == '|' || *p == '&' || *p == '<' || *p == '>' ||
             *p == '(' || *p == ')') {
             /* A standalone paren closes the literal `a=( ... )` opened,
@@ -25006,6 +25041,13 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
             p++;
         }
         size_t wlen = (size_t)(p - w);
+        int this_redir = redir_next;
+        redir_next = 0;
+        if (this_redir == 2 ||
+            (this_redir == 1 && shell_redir_brace_words_n(w, wlen) > 1)) {
+            if (sb_putmem(out, w, wlen) < 0) return -1;
+            continue;
+        }
 
         /* In command position, a NAME= word is an assignment PREFIX, and one
          * assignment may follow another. Anything else ends the prefix. */
@@ -25296,6 +25338,19 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             decl_util_cmd = false;
             decl_util_cmd = false;
             g_tokpfx_n = g_tokpfx_base;
+            p++;
+            continue;
+        }
+        /* `&>word` AND `&>>word` send stdout and stderr to the file (bash).
+         * tsh had neither: the `&` was a background operator, so
+         * `cmd &> log` ran cmd as a JOB and then truncated `log` with an
+         * empty `> log` -- and `2&>1` backgrounded a command called 2
+         * (Oils 2100 2120). */
+        if (*p == '&' && p[1] == '>') {
+            enum shell_tok_type t = SH_TOK_REDIR_BOTH;
+            p++;
+            if (p[1] == '>') { t = SH_TOK_REDIR_BOTH_APPEND; p++; }
+            if (shell_emit_token_fd(tok, &ntok, t, 0, false, -1) < 0) return -1;
             p++;
             continue;
         }
@@ -27888,10 +27943,24 @@ static int shell_add_redir(struct shell_simple *cur, enum shell_redir_op op,
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
                             const char *word, bool quoted, bool expanded,
                             bool assign_src);
+/* How many words brace expansion makes of `raw` (the word as written):
+ * the blanks outside quotes in what shell_brace_word returns, plus one. */
+static int shell_redir_brace_words(const char *raw) {
+    return shell_redir_brace_words_n(raw, strlen(raw));
+}
+
 static const char *shell_redir_word(struct shell_pipeline *pl,
                                     const struct shell_token *t,
                                     bool *ambiguous) {
     *ambiguous = false;
+    /* BRACE EXPANSION COMES FIRST, and two words are as ambiguous as any:
+     * `echo hi > a-{one,two}` is "a-{one,two}: ambiguous redirect", status
+     * 1 (bash; Oils 2095). The word as written is what it applies to --
+     * tsh wrote a file called `a-{one,two}`. */
+    if (t->raw && shell_redir_brace_words(t->raw) > 1) {
+        *ambiguous = true;
+        return 0;
+    }
     struct shell_simple *tmp = (struct shell_simple *)kmalloc(sizeof *tmp);
     if (!tmp) return 0;
     shell_simple_init(tmp, &pl->words);
@@ -27942,7 +28011,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             t == SH_TOK_REDIR_OUT ||
             t == SH_TOK_REDIR_APPEND || t == SH_TOK_REDIR_CLOBBER ||
             t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT ||
-            t == SH_TOK_REDIR_RW) {
+            t == SH_TOK_REDIR_RW || t == SH_TOK_REDIR_BOTH ||
+            t == SH_TOK_REDIR_BOTH_APPEND) {
             int fd = shell_default_redir_fd(t, tok[*io].fd);
             int expl_fd = tok[*io].fd;
             const char *fdvar = tok[*io].fdvar;
@@ -28052,16 +28122,24 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                         fd, 0, 0, target) < 0) return -1;
                 }
             } else {
+                bool both = (t == SH_TOK_REDIR_BOTH ||
+                             t == SH_TOK_REDIR_BOTH_APPEND);
                 cur->stdout_path = tok[*io].text;
-                cur->stdout_append = (t == SH_TOK_REDIR_APPEND);
+                cur->stdout_append = (t == SH_TOK_REDIR_APPEND ||
+                                      t == SH_TOK_REDIR_BOTH_APPEND);
                 enum shell_redir_op rk;
-                if (t == SH_TOK_REDIR_APPEND) rk = SH_RD_OPEN_APPEND;
+                if (cur->stdout_append) rk = SH_RD_OPEN_APPEND;
                 else if (t == SH_TOK_REDIR_CLOBBER) rk = SH_RD_OPEN_OUT;
                 else rk = SH_RD_OPEN_OUT;
-                if (t == SH_TOK_REDIR_OUT && g_opt_noclobber) {
+                if ((t == SH_TOK_REDIR_OUT || t == SH_TOK_REDIR_BOTH) &&
+                    g_opt_noclobber) {
                     rk = SH_RD_OPEN_EXCL;
                 }
-                if (shell_add_redir(cur, rk, fd, tok[*io].text, 0, -1) < 0) return -1;
+                if (shell_add_redir(cur, rk, both ? 1 : fd, tok[*io].text, 0,
+                                    -1) < 0) return -1;
+                /* `&>` is `>word 2>&1`: fd 2 DUPS fd 1, one open, one offset */
+                if (both && shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
+                    return -1;
             }
             for (int ri = rbefore; ri < cur->redir_count; ri++)
                 cur->redir[ri].fdvar = fdvar;
