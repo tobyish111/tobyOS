@@ -20889,8 +20889,11 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
         (void)vfs_unlink(spill);
     }
 
-    while (out->len > 0 && (out->p[out->len - 1] == '\n' ||
-                            out->p[out->len - 1] == '\r'))
+    /* NEWLINES come off the end, nothing else: `$(printf '\r')` is a CR
+     * (bash). Stripping CRs as well -- a rule from the serial console's
+     * line endings -- made it empty, and Oils 1366 (every byte matches
+     * itself) lost bytes 10 and 13 once printf learnt `\x0d`. */
+    while (out->len > 0 && out->p[out->len - 1] == '\n')
         sb_truncate(out, out->len - 1);
     if (cap.failed) {
         kprintf(SH_PFX_SHELL "command substitution: out of memory\n");
@@ -33306,7 +33309,11 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
                             sb_putc(&pat, '\\') < 0) return false;
                         if (sb_putc(&pat, *q) < 0) return false;
                     }
-                    if (pat.p[0] && shell_glob_match(pat.p, word)) return true;
+                    /* An EMPTY pattern is a pattern too: `case "" in "$c")`
+                     * with c='' matches, quoted or not (bash). It was
+                     * skipped -- Oils 1366's byte 10, whose `$(printf
+                     * '\n')` is empty. */
+                    if (shell_glob_match(pat.p ? pat.p : "", word)) return true;
                     if (*p == '|') p++;
                     continue;
                 }
