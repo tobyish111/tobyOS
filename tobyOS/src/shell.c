@@ -1179,6 +1179,16 @@ static int g_heredoc_head;
 #define SHELL_TRAP_RETURN (SIG_MAX + 2)
 #define SHELL_TRAP_LAST   SHELL_TRAP_RETURN
 static char *g_traps[SHELL_TRAP_LAST + 1];
+/* A SUBSHELL SHOWS ITS PARENT'S TRAPS BUT DOES NOT RUN THEM, as bash 5.2
+ * does (SUBSHELL_RESETTRAP: the signals go back to the default, the strings
+ * stay for `trap -p`, and the first `trap` the subshell sets frees them).
+ * An IGNORED trap stays in force. A slot with g_trap_shown set is listed
+ * and never run -- shell_trap_live() is what every runner asks. */
+static bool g_trap_shown[SHELL_TRAP_LAST + 1];
+static const char *shell_trap_live(int i) {
+    if (i < 0 || i > SHELL_TRAP_LAST || g_trap_shown[i]) return 0;
+    return g_traps[i];
+}
 
 /* Depth of shell-function calls in progress. The ERR trap is NOT inherited by
  * a function unless `set -o errtrace`, which this shell does not have -- so
@@ -1635,6 +1645,16 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
     if (sig == SIGINT || sig == SIGPIPE) return;
     if (sig == SIGTERM) {
         if (fg) kprintf_raw("Terminated\n");
+        return;
+    }
+    /* A SIGNAL THE SHELL TRAPS -- caught or ignored -- is reported bare for a
+     * foreground job and not at all for a background one (bash's jobs.c:
+     * the full line is only for `signal_is_trapped (termsig) == 0`, and
+     * trap.c's change_signal marks an ignore as trapped too). Measured:
+     * `trap 'echo caught' USR1; sh -c 'kill -USR1 $$'` -> "User defined
+     * signal 1" (logs/b8/trap-ignore-before.bash). */
+    if (sig < SIG_MAX && g_traps[sig]) {
+        if (fg) kprintf_raw("%s\n", shell_signal_desc(sig));
         return;
     }
     /* "FILE: line N: " is the diagnostic prefix (S12); the kernel console
@@ -3546,16 +3566,37 @@ static const char *shell_trap_name(int sig) {
     return shell_signal_name(sig);
 }
 
+static void shell_trap_sync_kernel(int sig);
+
 static void shell_trap_unset(int sig) {
     if (sig < 0 || sig > SHELL_TRAP_LAST) return;
     if (g_traps[sig]) {
         kfree(g_traps[sig]);
         g_traps[sig] = 0;
     }
+    g_trap_shown[sig] = false;
+    shell_trap_sync_kernel(sig);
 }
 
 static void shell_trap_clear_all(void) {
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) shell_trap_unset(i);
+}
+
+#ifdef SHELL_HOSTED
+/* Every trap but an IGNORED signal: what a forked child keeps. */
+static void shell_trap_clear_caught(void) {
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        bool ignored = (i > 0 && i < SIG_MAX && g_traps[i] && !g_traps[i][0]);
+        if (!ignored) shell_trap_unset(i);
+    }
+}
+#endif
+
+/* The first trap a subshell sets frees the parent's that it was only
+ * showing (bash's free_trap_strings under SUBSHELL_RESETTRAP). */
+static void shell_trap_drop_shown(void) {
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++)
+        if (g_trap_shown[i]) shell_trap_unset(i);
 }
 
 /* EVERY slot, conditions included. This held SIG_MAX entries, so a frame
@@ -3563,12 +3604,19 @@ static void shell_trap_clear_all(void) {
  * the trap -- and the same for DEBUG and RETURN once they existed. */
 struct shell_trap_frame {
     char *trap[SHELL_TRAP_LAST + 1];
+    bool shown[SHELL_TRAP_LAST + 1];
 };
 
+/* Entering a subshell -- ( ), $( ): the traps are saved for the way out,
+ * and inside it an IGNORED signal stays ignored while every other trap is
+ * only SHOWN (see g_trap_shown). They used to be cleared, so `trap "" USR1;
+ * ( trap -p USR1 )` printed nothing where bash prints the ignore
+ * (logs/b8/trap-ignore-before.*). */
 static int shell_trap_enter_child(struct shell_trap_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        frame->shown[i] = g_trap_shown[i];
         if (!g_traps[i]) continue;
         frame->trap[i] = shell_strdup(g_traps[i]);
         if (!frame->trap[i]) {
@@ -3579,16 +3627,22 @@ static int shell_trap_enter_child(struct shell_trap_frame *frame) {
             return -1;
         }
     }
-    shell_trap_clear_all();
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        if (!g_traps[i]) continue;
+        bool ignored = (i > 0 && i < SIG_MAX && !g_traps[i][0]);
+        if (!ignored) g_trap_shown[i] = true;
+    }
     return 0;
 }
 
 static void shell_trap_restore(struct shell_trap_frame *frame) {
     if (!frame) return;
-    shell_trap_clear_all();
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        if (g_traps[i]) kfree(g_traps[i]);
         g_traps[i] = frame->trap[i];
         frame->trap[i] = 0;
+        g_trap_shown[i] = frame->shown[i];
+        shell_trap_sync_kernel(i);
     }
 }
 
@@ -3597,7 +3651,7 @@ static volatile int g_pending_signals[SIG_MAX];
 static void shell_run_trap(int sig) {
     if (g_trap_running) return;
     if (sig < 0 || sig >= SIG_MAX) return;
-    if (!g_traps[sig] || !*g_traps[sig]) return;
+    if (!shell_trap_live(sig) || !*shell_trap_live(sig)) return;
 
     char *action = shell_strdup(g_traps[sig]);
     if (!action) return;
@@ -3707,7 +3761,7 @@ static void shell_run_err_trap(int status) {
      * function the trap stays silent. */
     if (g_fn_depth > 0) return;
     if (g_in_pipeline_stage || g_capture_depth > 0) return;
-    const char *act = g_traps[SHELL_TRAP_ERR];
+    const char *act = shell_trap_live(SHELL_TRAP_ERR);
     if (!act || !*act) return;
 
     char *action = shell_strdup(act);
@@ -3737,7 +3791,7 @@ static void shell_run_debug_trap(void) {
      * accounted for by the parent, once per stage, before it starts them
      * (`false | false | false` is three firings on the same line). */
     if (g_capture_depth > 0 || g_in_pipeline_stage) return;
-    const char *act = g_traps[SHELL_TRAP_DEBUG];
+    const char *act = shell_trap_live(SHELL_TRAP_DEBUG);
     if (!act || !*act) return;
     char *action = shell_strdup(act);
     if (!action) return;
@@ -3764,7 +3818,7 @@ static void shell_run_debug_trap(void) {
 /* The RETURN trap, after a function or a sourced script finishes. */
 static void shell_run_return_trap(void) {
     if (g_trap_running || g_in_pipeline_stage || g_capture_depth > 0) return;
-    const char *act = g_traps[SHELL_TRAP_RETURN];
+    const char *act = shell_trap_live(SHELL_TRAP_RETURN);
     if (!act || !*act) return;
     char *action = shell_strdup(act);
     if (!action) return;
@@ -3779,7 +3833,7 @@ static void shell_run_return_trap(void) {
 }
 
 static int shell_run_exit_trap(int status) {
-    if (g_trap_running || !g_traps[0] || !*g_traps[0]) return status;
+    if (g_trap_running || !shell_trap_live(0) || !*shell_trap_live(0)) return status;
 
     char *action = shell_strdup(g_traps[0]);
     if (!action) return status;
@@ -4194,12 +4248,40 @@ extern char *getcwd(char *buf, unsigned long size);
 extern void (*signal(int signum, void (*handler)(int)))(int);
 void shell_deliver_signal(int sig);
 static void shell_hosted_sigrelay(int sig) { shell_deliver_signal(sig); }
-#define SHELL_TRAP_ARM(sig) do { \
-        if ((sig) > 0 && (sig) < SIG_MAX) \
-            (void)signal((sig), shell_hosted_sigrelay); \
-    } while (0)
+/* THE PROCESS'S OWN DISPOSITION FOLLOWS THE TRAP, as in bash
+ * (trap.c: set_signal / ignore_signal / restore_default_signal):
+ *
+ *     trap 'cmd' SIG     a handler -- the relay, which only records it;
+ *                        an exec'd child gets the default back, as POSIX
+ *                        says a caught signal does
+ *     trap '' SIG        SIG_IGN -- which children INHERIT and exec keeps
+ *     trap - SIG         whatever was there before the first trap
+ *
+ * `trap ''` installed the relay too, so the ignore lived only in this
+ * process: `trap "" USR1; sh -c 'kill -USR1 $$; echo alive'` killed the sh
+ * (138; bash's lives), and `sleep 3 &` caught a USR1 sent at once only when
+ * it had not exec'd yet -- shparity 156 failed 1 run in 40
+ * (logs/b8/usr1-loop.txt, trap-ignore-before.*). */
+static void (*g_sig_orig[SIG_MAX])(int);
+static bool g_sig_orig_saved[SIG_MAX];
+static void shell_trap_sync_kernel(int sig) {
+    if (sig <= 0 || sig >= SIG_MAX) return;
+    void (*want)(int);
+    if (!g_traps[sig]) {
+        if (!g_sig_orig_saved[sig]) return;       /* never touched */
+        (void)signal(sig, g_sig_orig[sig]);
+        g_sig_orig_saved[sig] = false;
+        return;
+    }
+    want = g_traps[sig][0] ? shell_hosted_sigrelay : SIG_IGN;
+    void (*prev)(int) = signal(sig, want);
+    if (!g_sig_orig_saved[sig]) {
+        g_sig_orig[sig] = prev;
+        g_sig_orig_saved[sig] = true;
+    }
+}
 #else
-#define SHELL_TRAP_ARM(sig) do { } while (0)
+static void shell_trap_sync_kernel(int sig) { (void)sig; }
 #endif
 
 static int shell_set_cwd(const char *path) {
@@ -13226,6 +13308,9 @@ static void cmd_trap(int argc, char **argv) {
         return;
     }
 
+    /* In a subshell, setting any trap drops the parent's it was showing. */
+    shell_trap_drop_shown();
+
     for (int i = first_cond; i < argc; i++) {
         int sig = -1;
         if (shell_trap_parse_condition(argv[i], &sig) < 0) {
@@ -13233,15 +13318,15 @@ static void cmd_trap(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
-        shell_trap_unset(sig);
+        shell_trap_unset(sig);       /* `trap -`: the disposition goes back */
         if (reset) continue;
-        /* EXIT/ERR/DEBUG are not signals; SHELL_TRAP_ARM ignores those. */
-        SHELL_TRAP_ARM(sig);
         g_traps[sig] = shell_strdup(action);
         if (!g_traps[sig]) {
             shell_set_status(1);
             return;
         }
+        /* EXIT/ERR/DEBUG/RETURN are not signals; the sync ignores them. */
+        shell_trap_sync_kernel(sig);
     }
 }
 
@@ -18270,8 +18355,9 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
      * trap, an export, the umask, a shopt, readonly, `set -- a b c` and
      * `exec 3>...`. It now runs inside the same state frame `( ... )` uses,
      * put back below once the substitution's status has been taken. The
-     * caller's traps stay in force inside it -- bash shows them to
-     * `$(trap -p)` -- and are restored as they were. */
+     * caller's traps are SHOWN inside it -- `$(trap -p)` lists them, as
+     * bash's does -- but only an ignored one is in force (see
+     * shell_trap_enter_child). */
     struct shell_subshell_frame *sub_frame = shell_subshell_frame_open(false);
     struct shell_alias_save saved_aliases;
     if (!sub_frame) shell_alias_save(&saved_aliases);   /* out of memory */
@@ -27090,8 +27176,13 @@ static int shell_background_forked(const char *text, const char *label) {
          * it ran the parent's ERR trap and printed a line number the parent
          * never reached. The exemption at the dispatch site only covers the
          * parent's view of a backgrounded pipeline; the copy inside the fork
-         * needs its own. */
-        shell_trap_clear_all();
+         * needs its own.
+         *
+         * An IGNORED signal stays ignored (POSIX; bash's async children
+         * keep SIG_IGN): clearing it too handed `sleep 3 &` the default for
+         * a USR1 the script had ignored, and it died of it (138) every time
+         * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
+        shell_trap_clear_caught();
         /* ONE simple external may replace this process -- see
          * shell_bg_text_is_simple and proc_exec_in_place. */
         g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
@@ -30784,7 +30875,8 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     shell_alias_frame_clear(&frame->aliases);
     shell_function_frame_clear(&frame->functions);
     shell_readonly_frame_clear(&frame->readonly);
-    for (int i = 0; i < SIG_MAX; i++) {
+    /* Every slot, ERR/DEBUG/RETURN too: they were left behind. */
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         if (frame->traps.trap[i]) kfree(frame->traps.trap[i]);
         frame->traps.trap[i] = 0;
     }
@@ -30795,23 +30887,6 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     frame->shopt = 0;
 }
 
-/* The traps, copied and LEFT IN FORCE -- a command substitution's frame. */
-static int shell_trap_keep_copy(struct shell_trap_frame *frame) {
-    memset(frame, 0, sizeof(*frame));
-    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
-        if (!g_traps[i]) continue;
-        frame->trap[i] = shell_strdup(g_traps[i]);
-        if (!frame->trap[i]) {
-            for (int j = 0; j < i; j++) {
-                kfree(frame->trap[j]);
-                frame->trap[j] = 0;
-            }
-            return -1;
-        }
-    }
-    return 0;
-}
-
 static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
                                            bool reset_traps);
 static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
@@ -30820,6 +30895,10 @@ static int shell_subshell_frame_capture(struct shell_subshell_frame *frame) {
 
 static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
                                            bool reset_traps) {
+    /* ( ) and $( ) treat traps alike, as bash does: an ignored signal stays
+     * ignored, every other trap is shown but not run (shell_trap_enter_child).
+     * A $( ) kept the caller's traps IN FORCE until 2026-10-01. */
+    (void)reset_traps;
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
     const char *cwd = shell_cwd();
@@ -30851,8 +30930,7 @@ static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
         shell_alias_frame_capture(&frame->aliases) < 0 ||
         shell_function_frame_capture(&frame->functions) < 0 ||
         shell_readonly_frame_capture(&frame->readonly) < 0 ||
-        (reset_traps ? shell_trap_enter_child(&frame->traps)
-                     : shell_trap_keep_copy(&frame->traps)) < 0) {
+        shell_trap_enter_child(&frame->traps) < 0) {
         shell_subshell_frame_clear(frame);
         return -1;
     }

@@ -818,6 +818,23 @@ static int spawn_body(const char *path, const char *name,
     p->user_arg     = 0;
     /* Phase 1 M1.3: init signal state for new process */
     signal_init_proc(&p->sigstate);
+    /* AN IGNORED SIGNAL STAYS IGNORED IN A SPAWNED PROGRAM -- POSIX's rule
+     * for posix_spawn without POSIX_SPAWN_SETSIGDEF, and what fork + exec
+     * gives (signal_exec_reset keeps SIG_IGN). A caught one starts at its
+     * default, as it would after exec. Spawn started every signal at its
+     * default, so `trap "" USR1` in /bin/tsh -- a native shell, which
+     * spawns -- did not reach its commands: `sh -c 'kill -USR1 $$'` died
+     * (138) where bash's child lives (logs/b8/trap-ignore-*). The blocked
+     * mask is not carried over (posix_spawn would): nothing has needed it. */
+    {
+        struct proc *parent = current_proc();
+        struct sigaction *pa = (parent && parent->pid != 0)
+                             ? sig_actions_of(parent) : 0;
+        if (pa)
+            for (int i = 1; i < SIG_MAX; i++)
+                if (pa[i].sa_handler == SIG_IGN)
+                    p->sigstate.actions[i].sa_handler = SIG_IGN;
+    }
     /* Inherit session tag + user identity from the parent
      * (current_proc()). pid 0 has session_id == 0 / uid == 0 unless
      * the desktop launcher temporarily flipped them to the active
