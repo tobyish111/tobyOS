@@ -25592,6 +25592,21 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             p++;
             continue;
         }
+        /* `|&` IS `2>&1 |` -- stderr joins stdout in the pipe, after the
+         * stage's own redirections (bash). tsh read `|` and then `&`, a
+         * background operator (Oils 1945). */
+        if (*p == '|' && p[1] == '&') {
+            char *one = words_store(words, "1", 1);
+            if (!one) return -1;
+            if (shell_emit_token_fd(tok, &ntok, SH_TOK_DUP_OUT, 0, false, 2) < 0 ||
+                shell_emit_token(tok, &ntok, SH_TOK_WORD, one, false) < 0 ||
+                shell_emit_token(tok, &ntok, SH_TOK_PIPE, 0, false) < 0)
+                return -1;
+            prefix_ok = true;
+            g_tokpfx_n = g_tokpfx_base;
+            p += 2;
+            continue;
+        }
         if (*p == '|') {
             enum shell_tok_type t = SH_TOK_PIPE;
             if (p[1] == '|') { t = SH_TOK_OR_IF; p++; }
@@ -34812,7 +34827,7 @@ static const char *shell_find_bg_at(const char *s) {
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         if (!*p) break;
         if (!shell_scan_incomplete(&st) && *p == '&' && p[1] != '&' &&
-            p[1] != '>') {
+            p[1] != '>' && !(p > s && p[-1] == '|')) {      /* `|&` */
             /* `a &` and `a & b`, but not `a && b` and not `2>&1`. A `&` that
              * follows a redirection operator is part of it, and the scanner
              * has already consumed those as one token. */
@@ -34900,6 +34915,17 @@ static bool shell_try_compound_pipeline(const char *src) {
         const char *end = sep ? sep : cur + strlen(cur);
         if (n >= nst) { overflow = true; break; }
         stages[n] = shell_dup_segment(cur, end);
+        if (stages[n] && sep && sep[1] == '&') {
+            /* `|&`: the stage's stderr goes down the pipe too */
+            size_t sl = strlen(stages[n]);
+            char *w = (char *)kmalloc(sl + 6);
+            if (w) {
+                memcpy(w, stages[n], sl);
+                memcpy(w + sl, " 2>&1", 6);
+            }
+            kfree(stages[n]);
+            stages[n] = w;
+        }
         if (!stages[n]) {
             overflow = true;
             break;
@@ -34909,7 +34935,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (!stage_simple[n]) any_compound = true;
         n++;
         if (!sep) break;
-        cur = sep + 1;
+        cur = sep + (sep[1] == '&' ? 2 : 1);
     }
     /* EVERY pipeline, not just one with a compound stage. A stage is a
      * subshell, and the only way its EXPANSIONS can be isolated too is for
