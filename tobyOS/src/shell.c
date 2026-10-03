@@ -38407,6 +38407,66 @@ static bool shell_tok_is_bang(const char *s) {
     return seen;
 }
 
+/* `time`'s report, as bash's print_formatted_time writes it: $TIMEFORMAT,
+ * or bash's own "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS", or with -p the
+ * POSIX "real %2R\nuser %2U\nsys %2S"; %[p][l]R U S, %P, %%. An empty
+ * TIMEFORMAT prints nothing. It goes to stderr bare: it carried the
+ * diagnostic prefix ("FILE: line N: ") and ignored -p and TIMEFORMAT.
+ * User and system time are 0 -- the kernel keeps one CPU total per
+ * process and nothing for children. */
+static void shell_time_mkfmt(struct shell_sb *b, int prec, bool lng,
+                             unsigned long sec, unsigned frac) {
+    char t[48];
+    if (lng) {
+        ksnprintf(t, sizeof t, "%lum", sec / 60);
+        (void)sb_puts(b, t);
+        sec %= 60;
+    }
+    ksnprintf(t, sizeof t, "%lu", sec);
+    (void)sb_puts(b, t);
+    if (prec) {
+        static const unsigned precs[4] = { 0, 100, 10, 1 };
+        (void)sb_putc(b, '.');
+        for (int k = 1; k <= prec; k++) {
+            (void)sb_putc(b, (char)('0' + frac / precs[k]));
+            frac %= precs[k];
+        }
+    }
+    if (lng) (void)sb_putc(b, 's');
+}
+
+static void shell_time_report(bool posix_fmt, unsigned long real_ms) {
+    const char *fmt = posix_fmt ? "real %2R\nuser %2U\nsys %2S"
+                                : env_get("TIMEFORMAT");
+    if (!fmt) fmt = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
+    if (!*fmt) return;
+    SH_SB(out);
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%' || !f[1]) { (void)sb_putc(&out, *f); continue; }
+        if (f[1] == '%') { (void)sb_putc(&out, '%'); f++; continue; }
+        if (f[1] == 'P') {                 /* (user+sys)/real: 0 here */
+            shell_time_mkfmt(&out, 2, false, 0, 0);
+            f++;
+            continue;
+        }
+        int prec = 3;
+        bool lng = false;
+        f++;
+        if (*f >= '0' && *f <= '9') { prec = *f++ - '0'; if (prec > 3) prec = 3; }
+        if (*f == 'l') { lng = true; f++; }
+        if (*f == 'R' || *f == 'E') {
+            shell_time_mkfmt(&out, prec, lng, real_ms / 1000, (unsigned)(real_ms % 1000));
+        } else if (*f == 'U' || *f == 'S') {
+            shell_time_mkfmt(&out, prec, lng, 0, 0);
+        } else {
+            kprintf("TIMEFORMAT: `%c': invalid format character\n", *f ? *f : ' ');
+            return;
+        }
+        if (!*f) break;
+    }
+    kprintf_raw("%s\n", out.p ? out.p : "");
+}
+
 static void execute_line_text_inner(const char *src) {
     struct shell_token *tok = 0;
     SH_WORDS(words);
@@ -38465,9 +38525,12 @@ static void execute_line_text_inner(const char *src) {
         const char *q = shell_skip_blanks(src);
         if (shell_starts_with_word(q, "time")) {
             const char *rest = shell_skip_blanks(q + 4);
+            bool posix_fmt = false;
             if (rest[0] == '-' && rest[1] == 'p' &&
-                (rest[2] == ' ' || rest[2] == '\t'))
+                (rest[2] == ' ' || rest[2] == '\t' || rest[2] == '\0')) {
                 rest = shell_skip_blanks(rest + 2);
+                posix_fmt = true;
+            }
             /* pit_ticks() counts in the host's own units; pit_hz() converts.
              * Only the printed number depends on it, and that goes to stderr,
              * which the gate does not compare. */
@@ -38483,8 +38546,7 @@ static void execute_line_text_inner(const char *src) {
             }
             unsigned long ms =
                 (unsigned long)((pit_ticks() - t0) * 1000ull / hz);
-            kprintf("\nreal\t0m%lu.%03lus\nuser\t0m0.000s\nsys\t0m0.000s\n",
-                    ms / 1000, ms % 1000);
+            shell_time_report(posix_fmt, ms);
             return;
         }
     }
