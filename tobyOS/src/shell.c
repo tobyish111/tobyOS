@@ -7168,6 +7168,43 @@ static void cmd_local(int argc, char **argv) {
             continue;
         }
 
+        /* A REFERENCE MUST NAME A VARIABLE -- the checks `declare -n`
+         * makes (bash's local is declare_internal): `local -n q='#'` is
+         * "`#': invalid variable name for name reference", status 1, and q
+         * is not made. tsh made it (logs/b12 p28, p68). */
+        if (l_nameref) {
+            const char *nv = 0;
+            if (has_value && !l_append) {
+                nv = argv[i] + env_key_len(argv[i]) + 1;
+            } else if (!has_value) {
+                int ox = env_find(name, klen);
+                if (ox >= 0 && !(g_env_flags[ox] & (SHVAR_NOVALUE | SHVAR_NAMEREF)))
+                    nv = g_env[ox] + klen + 1;
+            }
+            if (nv && !*nv && has_value) {
+                /* made, without a value or the attribute */
+                kprintf("local: `': not a valid identifier\n");
+                shell_set_status(1);
+                if (!shell_local_declared_here(name, g_script_depth) &&
+                    shell_locals_push(name, g_script_depth) == 0) {
+                    int ox = env_find(name, klen);
+                    if (ox >= 0) env_remove_at(ox);
+                    (void)env_set_attr_holder(name);
+                }
+                continue;
+            }
+            if (nv && *nv && !shell_valid_nameref_value(nv)) {
+                kprintf("local: `%s': invalid variable name for name "
+                        "reference\n", nv);
+                shell_set_status(1);
+                continue;
+            }
+            if (nv && has_value && strcmp(nv, name) == 0) {
+                kprintf("local: warning: %s: circular name reference\n", name);
+                kprintf("warning: %s: circular name reference\n", name);
+            }
+        }
+
         bool already = shell_local_declared_here(name, g_script_depth);
         bool inherit = !already && !has_value && shell_local_inherits(name);
         if (!already && shell_locals_push(name, g_script_depth) < 0) {
@@ -8088,15 +8125,36 @@ static void cmd_declare(int argc, char **argv) {
                     if (has_value) {
                         kprintf("%s: `': not a valid identifier\n", argv[0]);
                         ok = false;
+                        /* ...but in a function the LOCAL is made first, and
+                         * stays, without a value: `local -n u=` leaves
+                         * `declare -- u` (logs/b12 p68) */
+                        if (make_local &&
+                            !shell_local_declared_here(name, g_script_depth) &&
+                            !shell_readonly_key(name, klen) &&
+                            shell_locals_push(name, g_script_depth) == 0) {
+                            int ox = env_find(name, klen);
+                            if (ox >= 0) env_remove_at(ox);
+                            (void)env_set_attr_holder(name);
+                        }
                     }
                 } else if (!shell_valid_nameref_value(nv)) {
                     kprintf("%s: `%s': invalid variable name for name "
                             "reference\n", argv[0], nv);
                     ok = false;
-                } else if (strcmp(nv, name) == 0) {
-                    kprintf("%s: %s: nameref variable self references not "
-                            "allowed\n", argv[0], name);
-                    ok = false;
+                } else if (has_value && strcmp(nv, name) == 0) {
+                    /* "disallow self references at global scope, warn at
+                     * function scope" (bash, declare.def): in a function the
+                     * name may resolve to the caller's variable. Two
+                     * warnings there -- the builtin's and the assignment's. */
+                    if (g_fn_depth > 0) {
+                        kprintf("%s: warning: %s: circular name reference\n",
+                                argv[0], name);
+                        kprintf("warning: %s: circular name reference\n", name);
+                    } else {
+                        kprintf("%s: %s: nameref variable self references not "
+                                "allowed\n", argv[0], name);
+                        ok = false;
+                    }
                 }
                 if (!ok) {
                     shell_set_status(1);
