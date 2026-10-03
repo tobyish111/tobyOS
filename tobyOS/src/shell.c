@@ -10681,7 +10681,10 @@ static void cmd_jobs(int argc, char **argv) {
 #ifdef SHELL_HOSTED
     for (int i = 0; i < JOB_MAX; i++)
         if (g_jobs[i]->id && !g_jobs[i]->dead) (void)shell_job_poll(g_jobs[i]);
-    shell_jobs_drop_killed();      /* reported already; bash lists them not */
+    /* A job a signal ended is listed too, until a notify has taken it:
+     * `sleep 1 & kill -15 %%; jobs` on one line is "[1]+  Terminated" in
+     * bash (logs/b12 p49) -- the notify after each line and a plain `wait`
+     * are what drop it, not `jobs`. */
 #endif
     /* bash's list_all_jobs begins with cleanup_dead_jobs: a finished job an
      * earlier `jobs` listed is gone now -- `jobs; jobs` on one line lists
