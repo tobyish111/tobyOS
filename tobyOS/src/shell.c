@@ -32830,6 +32830,21 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
                 shell_fd_state_close_owned(&fds);
                 return 1;
             }
+            /* WHAT A DESCRIPTOR HELD BEFORE IS CLOSED when exec replaces
+             * it -- `exec 3>&-`, `exec 3>other`. It was dropped from the
+             * table and never closed, so a pipe's writer stayed open in the
+             * shell and its reader never saw the end: `exec 60>&-` on a
+             * coprocess's input left `cat` waiting for good (logs/b12 p80).
+             * Not a file the new table still names (`exec 4>&3` keeps 3),
+             * and not 0-2, whose empty slot means the process's own. */
+            for (int i = 3; i < fds.n && i < g_shell_fd_cap; i++) {
+                struct file *old = g_shell_fd[i];
+                if (!old || old == fds.fd[i]) continue;
+                bool kept = false;
+                for (int k = 0; k < fds.n && !kept; k++)
+                    if (fds.fd[k] == old) kept = true;
+                if (!kept) file_close(old);
+            }
             for (int i = 0; i < fds.n; i++) {
                 g_shell_fd[i] = fds.fd[i];
                 fds.owned[i] = false;   /* the shell keeps them now */
