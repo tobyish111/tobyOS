@@ -361,7 +361,10 @@ static int fd_alloc_into(struct proc *p, struct file *f) {
 /* One bounce-buffered write of at most SYS_MAX_RW bytes. */
 static long sys_write_one(int fd, const void *buf, size_t len) {
     struct file *f = fd_lookup(fd);
-    if (!f) return -1;
+    /* a descriptor that is not open is EBADF (it was a bare -1, which
+     * both libtoby and the Linux personality read as errno 1, EPERM:
+     * bash's `echo x >&-`-style failures said "Operation not permitted") */
+    if (!f) return -ABI_EBADF;
     void *k = bounce_in(buf, len);
     if (!k) return -ABI_EFAULT;
 #ifdef CHROMIUM_BOOT
@@ -513,7 +516,7 @@ static long sys_read(int fd, void *buf, size_t len) {
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
-    if (!f) return -1;
+    if (!f) return -ABI_EBADF;          /* not -1 (EPERM): see sys_write_one */
     if (f->kind == FILE_KIND_EVDEV)      /* /dev/input/event<N>: input_event stream */
         return evdev_read((unsigned)f->dir_off, (uint64_t)(uintptr_t)buf, len);
     void *k = kmalloc(len);
