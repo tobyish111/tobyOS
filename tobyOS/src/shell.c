@@ -27834,9 +27834,22 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              *
              * tsh read `{fd}` as a word and ran it: "failed to launch
              * '/bin/{fd}'". Anything else keeps being a word -- a brace group
-             * is `{ `, a brace expansion has no `}<`. */
+             * is `{ `, a brace expansion has no `}<`.
+             *
+             * The name may be an ELEMENT, `{COPROC[1]}>&-` (bash's
+             * valid_array_reference): tsh stopped at the `[` and ran
+             * "{COPROC[1]}" as a command (logs/b12 p80). */
             const char *d = redir_p + 1;
             while (shell_var_char(*d)) d++;
+            if (*d == '[' && d[1] != ']') {
+                const char *e = d;
+                int depth = 0;
+                for (; *e; e++) {
+                    if (*e == '[') depth++;
+                    else if (*e == ']' && --depth == 0) break;
+                }
+                if (*e == ']' && e[1] == '}') d = e + 1;
+            }
             if (*d == '}' && (d[1] == '<' || d[1] == '>')) {
                 g_tok_fdvar = words_store(words, redir_p + 1,
                                           (size_t)(d - redir_p - 1));
@@ -31771,6 +31784,13 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
 /* A `{name}` descriptor OUTLIVES ITS COMMAND (bash: the script manages its
  * lifetime), so once opened it moves from the command's table to the
  * shell's, which owns it until `{name}>&-`. */
+/* Is a `{name}` redirection's name an element, `{a[i]}`? */
+static bool shell_fdvar_is_elem(const char *v) {
+    for (; *v; v++)
+        if (*v == '[') return true;
+    return false;
+}
+
 static void shell_fd_commit_var(struct shell_fd_state *st, int fd) {
     if (fd < 0 || fd >= st->n || !st->fd[fd]) return;
     if (!shell_fd_table_reserve(fd)) return;
@@ -31804,8 +31824,15 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             vr = *r;
             if (r->op == SH_RD_CLOSE) {
                 /* `{name}>&-` closes the descriptor NAMED BY $name, in the
-                 * shell itself -- it was opened for the script to manage. */
-                const char *v = env_get(r->fdvar);
+                 * shell itself -- it was opened for the script to manage.
+                 * `{a[i]}>&-` by the element's value. */
+                SH_SB(ev);
+                const char *v;
+                if (shell_fdvar_is_elem(r->fdvar))
+                    v = shell_expand_braced_parameter(r->fdvar, &ev) == 0 &&
+                        ev.p ? ev.p : 0;
+                else
+                    v = env_get(r->fdvar);
                 long n = -1;
                 bool ok = false;
                 if (v && *v) n = shell_parse_long_value(v, &ok);
@@ -31840,7 +31867,9 @@ static int shell_apply_redirs(struct shell_simple *cmd,
                 }
                 char num[16];
                 ksnprintf(num, sizeof num, "%d", fd);
-                if (env_set(r->fdvar, num) < 0) return -1;
+                if (shell_fdvar_is_elem(r->fdvar) ? shell_set_named(r->fdvar, num) < 0
+                                          : env_set(r->fdvar, num) < 0)
+                    return -1;
                 vr.fdvar = 0;
                 vr.fd = fd;
                 r = &vr;
