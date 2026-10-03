@@ -1031,6 +1031,7 @@ int main(int argc, char **argv) {
         if (!cont) shell_notify_jobs_hosted();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
+        ps = shell_decode_prompt_hosted(ps);    /* bash's decode_prompt_string */
         size_t n = 0;
         g_tsh_sigint = 0;
         int interrupted = 0;
@@ -1128,6 +1129,14 @@ int main(int argc, char **argv) {
             continue;
         }
         shell_history_add_hosted(accum);
+        {
+            /* PS0: after the command is read, before it runs (bash 4.4+) */
+            const char *p0 = shell_get_var_hosted("PS0");
+            if (p0 && *p0) {
+                const char *d0 = shell_decode_prompt_hosted(p0);
+                (void)!write(2, d0, strlen(d0));
+            }
+        }
         last = shell_run_line_hosted(accum);
         /* ^C that landed DURING the command, rather than at the prompt.
          * The tty echoed "^C" with no newline of its own and the read loop

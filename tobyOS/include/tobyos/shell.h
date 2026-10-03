@@ -88,6 +88,7 @@ bool shell_opt_ignoreeof_hosted(void);
 /* Read a shell variable (PS1/PS2 are rarely exported, so getenv cannot see
  * them). NULL when unset. */
 const char *shell_get_var_hosted(const char *name);
+const char *shell_decode_prompt_hosted(const char *ps);
 
 /* Set a shell variable from the host wrapper (PPID at startup). */
 void shell_set_var_hosted(const char *name, const char *value);

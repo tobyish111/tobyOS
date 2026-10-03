@@ -886,6 +886,14 @@ static int g_shell_loop_depth;
 static int g_script_depth;
 static int g_subshell_depth;
 static int g_comsub_level;      /* command substitutions running, nested */
+/* bash's current_command_number: 1 at startup, one more for each command
+ * the top-level reader runs (eval.c's reader_loop -- not eval, `.`, a
+ * substitution or -c). \# shows it -- less one in ${var@P} and PS4, which
+ * are decoded after the command was counted (y.tab.c). It answered with
+ * the history count, constant in a script (Oils 2019). */
+static unsigned long g_command_number = 1;
+static bool g_prompt_real;              /* decoding PS0/PS1/PS2 itself */
+static bool g_reader_repl_count;        /* the next reader counts commands */
 /* One while a pipeline's stage that is a SIMPLE command runs in its child:
  * bash expands such a command's words before it forks, so $BASH_SUBSHELL
  * there is the parent's (`echo $BASH_SUBSHELL | cat` is 0), where a { }
@@ -14849,7 +14857,9 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
      * most of them with "; " (its cmdhist rules), which this does not
      * reproduce. */
     bool hist_reader = g_reader_main_script && !eval_mode;
+    bool counts_cmds = (g_reader_main_script || g_reader_repl_count) && !eval_mode;
     g_reader_main_script = false;
+    g_reader_repl_count = false;
     char *hist_raw = 0;
     const char *hist_raw_base = 0;
     if (shell_stack_exhausted(eval_mode ? g_eval_reader_depth
@@ -15308,6 +15318,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         if (!accum) shell_lmap_reset(line, line_first);
         bool unit_checked = shell_syn_covers(&syn, (size_t)(p - text));
         if (unit_checked) g_syn_checked++;
+        if (counts_cmds) g_command_number++;
         if (eval_mode) {
             /* Aliases, as cmd_eval's one-line path expands them. */
             SH_SB(abuf);
@@ -23270,6 +23281,7 @@ static int shell_prompt_put(struct shell_sb *out, const char *s,
     return 0;
 }
 
+
 static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
     SH_SB(dec);
     char scratch[128];
@@ -23353,11 +23365,11 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
         case 's':
             if (shell_prompt_put(&dec, "tsh", true) < 0) return -1;
             break;
-        case 'v':
-            if (shell_prompt_put(&dec, "1.0", true) < 0) return -1;
+        case 'v':                   /* the bash tsh is: BASH_VERSION */
+            if (shell_prompt_put(&dec, "5.2", true) < 0) return -1;
             break;
         case 'V':
-            if (shell_prompt_put(&dec, "1.0.0", true) < 0) return -1;
+            if (shell_prompt_put(&dec, "5.2.15", true) < 0) return -1;
             break;
         case 'l':
             /* bash falls back to "tty" when stdin is not a terminal, which
@@ -23384,7 +23396,8 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
              * 1 with history off; else the next history number -- one less,
              * unless that is 1, for every prompt but PS1, and ${var@P} is
              * the only prompt this decodes. */
-            unsigned long num = (unsigned long)g_hist_count + 1;
+            unsigned long num = g_command_number;
+            if (c == '#' && !g_prompt_real && num > 1) num--;
             if (c == '!') {
                 num = g_opt_history
                     ? g_hist_base + (unsigned long)g_hist_count + 1 : 1;
@@ -38523,10 +38536,31 @@ int shell_run_script_hosted(const char *path) {
 }
 
 /* Run one command line (the `-c` form); returns its exit status. */
+/* A prompt string as the interactive shell shows it -- PS0, PS1, PS2:
+ * bash's decode_prompt_string, the escapes and then (promptvars) the
+ * expansions. /bin/tsh wrote PS1 as it stood, so `PS1='\u@\h:\w\$ '`
+ * printed those nine characters. The answer lives until the next call. */
+const char *shell_decode_prompt_hosted(const char *ps) {
+    static char *last;
+    SH_SB(out);
+    bool saved = g_prompt_real;
+    g_prompt_real = true;
+    int rc = shell_expand_prompt(ps ? ps : "", &out);
+    g_prompt_real = saved;
+    if (rc < 0) return ps ? ps : "";
+    shell_strip_glob_escapes(out.p);
+    char *d = shell_strdup(out.p);
+    if (!d) return ps ? ps : "";
+    kfree(last);
+    last = d;
+    return d;
+}
+
 int shell_run_line_hosted(const char *text) {
     if (!text) return 0;
     char *copy = shell_strdup(text);
     if (!copy) return 2;
+    if (g_interactive) g_reader_repl_count = true;  /* bash's reader_loop */
     /* -c text, or a line typed at the prompt -- which bash words without a
      * line number or the line echoed (see shell_syn_print) */
     g_reader_syn_string = true;
