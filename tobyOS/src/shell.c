@@ -7595,6 +7595,32 @@ static void cmd_shopt_in(int argc, char **argv) {
     shell_set_status(status);
 }
 
+static void shell_declare_print_function(const struct shell_function *fn);
+
+/* `export -f` with no names, `declare -fx` likewise: every exported
+ * function, by name, its definition followed by its declaration. */
+static void shell_print_exported_functions(void) {
+    int *idx = g_nfunctions ? (int *)kmalloc((size_t)g_nfunctions * sizeof *idx) : 0;
+    int n = 0;
+    if (g_nfunctions && !idx) return;
+    for (int k = 0; k < g_nfunctions; k++)
+        if (g_functions[k].name && g_functions[k].exported) idx[n++] = k;
+    for (int a = 1; a < n; a++) {
+        int v = idx[a], b = a - 1;
+        while (b >= 0 && strcmp(g_functions[idx[b]].name, g_functions[v].name) > 0) {
+            idx[b + 1] = idx[b];
+            b--;
+        }
+        idx[b + 1] = v;
+    }
+    for (int a = 0; a < n; a++) {
+        shell_declare_print_function(&g_functions[idx[a]]);
+        shell_printf("declare -f%sx %s\n", g_functions[idx[a]].readonly ? "r" : "",
+                     g_functions[idx[a]].name);
+    }
+    kfree(idx);
+}
+
 static void cmd_export(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
@@ -7632,13 +7658,24 @@ static void cmd_export(int argc, char **argv) {
         return;
     }
     if (funcs) {
-        /* functions are not exported to children here; say which names are
-         * not functions, as bash does */
-        for (int i = start; i < argc; i++)
-            if (!shell_function_lookup(argv[i])) {
+        /* `export -f NAME` passes the FUNCTION to children (BASH_FUNC_NAME%%
+         * in their environment, see shell_build_env_overlay); -n takes that
+         * away. No names lists the exported ones as bash does: each
+         * definition, then `declare -fx NAME` (logs/b12 p77). tsh only said
+         * which names were not functions. */
+        if (start >= argc) {
+            shell_print_exported_functions();
+            return;
+        }
+        for (int i = start; i < argc; i++) {
+            int fi = shell_function_find(argv[i]);
+            if (fi < 0) {
                 kprintf("export: %s: not a function\n", argv[i]);
                 shell_set_status(1);
+                continue;
             }
+            g_functions[fi].exported = !unexport;
+        }
         return;
     }
     for (int i = start; i < argc; i++) {
@@ -8013,8 +8050,17 @@ static void cmd_declare(int argc, char **argv) {
             }
             for (int a = 0; a < n; a++) {
                 const struct shell_function *fn = &g_functions[idx[a]];
-                if (func_names) shell_printf("declare -f %s\n", fn->name);
-                else            shell_declare_print_function(fn);
+                /* `declare -fx`/`-Fx` list only the exported ones */
+                if (set_export && !fn->exported) continue;
+                if (func_names)
+                    shell_printf("declare -f%s%s %s\n", fn->readonly ? "r" : "",
+                                 fn->exported ? "x" : "", fn->name);
+                else {
+                    shell_declare_print_function(fn);
+                    if (set_export)
+                        shell_printf("declare -f%sx %s\n", fn->readonly ? "r" : "",
+                                     fn->name);
+                }
             }
             kfree(idx);
             return;
@@ -8023,6 +8069,12 @@ static void cmd_declare(int argc, char **argv) {
         for (; i < argc; i++) {
             const struct shell_function *fn = shell_function_lookup(argv[i]);
             if (!fn) { missing = true; continue; }
+            /* `declare -fx NAME` / `+fx` set the attribute and print nothing */
+            if (set_export || clear_export) {
+                int fi = shell_function_find(argv[i]);
+                if (fi >= 0) g_functions[fi].exported = set_export;
+                continue;
+            }
             /* under `shopt -s extdebug`, `declare -F NAME` gives the line
              * and file the function was defined at: "add 7 /x/y.sh"
              * (bash; Oils 0379) -- "main" when no file says */
@@ -31037,9 +31089,33 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
             }
         }
     }
-    size_t slots = (size_t)g_envc + (size_t)assignc + 1;
+    /* EXPORTED FUNCTIONS GO TOO, as bash passes them: BASH_FUNC_NAME%%=
+     * and the definition printed on one line without its name -- what a
+     * bash child imports, and what tsh imports at start (logs/b12 p77). */
+    int nfx = 0;
+    for (int k = 0; k < g_nfunctions; k++)
+        if (g_functions[k].name && g_functions[k].exported) nfx++;
+    char **fxs __attribute__((cleanup(shell_kfree_ptr))) =
+        nfx ? (char **)kmalloc((size_t)nfx * sizeof(char *)) : 0;
+    int nfxs = 0;
+    if (nfx && fxs) {
+        for (int k = 0; k < g_nfunctions && nfxs < nfx; k++) {
+            if (!g_functions[k].name || !g_functions[k].exported) continue;
+            char *def = shell_function_printed_as(&g_functions[k], false, "");
+            if (!def) continue;
+            SH_SB(ent);
+            if (sb_puts(&ent, "BASH_FUNC_") == 0 && sb_puts(&ent, g_functions[k].name) == 0 &&
+                sb_puts(&ent, "%%=") == 0 && sb_puts(&ent, def) == 0) {
+                fxs[nfxs] = sb_steal(&ent);
+                if (fxs[nfxs]) { extra += strlen(fxs[nfxs]) + 1; nfxs++; }
+            }
+            kfree(def);
+        }
+    }
+    size_t slots = (size_t)g_envc + (size_t)assignc + (size_t)nfxs + 1;
     char **out_env = (char **)kmalloc(slots * sizeof(char *) + extra);
     if (!out_env) {
+        for (int k = 0; k < nfxs; k++) kfree(fxs[k]);
         kprintf(SH_PFX_SHELL "out of memory building the environment\n");
         return 0;
     }
@@ -31077,6 +31153,13 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
             }
         }
         out_env[n++] = assignv[i];
+    }
+    for (int k = 0; k < nfxs; k++) {
+        size_t fl = strlen(fxs[k]);
+        memcpy(pool, fxs[k], fl + 1);
+        out_env[n++] = pool;
+        pool += fl + 1;
+        kfree(fxs[k]);
     }
     out_env[n] = 0;
     *out_envc = n;
@@ -39840,6 +39923,76 @@ const char *shell_history_get_hosted(int i) {
     return g_hist[i];
 }
 
+/* BASH_FUNC_NAME%%=() { ... }: how bash passes an exported function, and
+ * how tsh passes one (shell_build_env_overlay). */
+static bool shell_env_is_function(const char *kv) {
+    if (strncmp(kv, "BASH_FUNC_", 10) != 0) return false;
+    const char *eq = kv;
+    while (*eq && *eq != '=') eq++;
+    return *eq == '=' && eq - kv > 12 && eq[-1] == '%' && eq[-2] == '%';
+}
+
+/* Define the exported functions the environment holds, as bash does at
+ * start: the text must be ONE function definition of that name -- anything
+ * more is refused with bash's two warnings (its SEVAL_FUNCDEF|SEVAL_ONECMD
+ * guard against code smuggled in after the body). They are not variables,
+ * and are exported again to this shell's children. */
+static void shell_import_env_functions(void) {
+    extern char **environ;
+    for (char **e = environ; e && *e; e++) {
+        if (!shell_env_is_function(*e)) continue;
+        const char *eq = *e;
+        while (*eq != '=') eq++;
+        const char *val = eq + 1;
+        SH_SB(name);
+        if (sb_putmem(&name, *e + 10, (size_t)(eq - 2 - (*e + 10))) < 0) continue;
+        if (strncmp(val, "() {", 4) != 0) continue;     /* not a definition */
+        SH_SB(text);
+        if (sb_puts(&text, name.p) < 0 || sb_putc(&text, ' ') < 0 ||
+            sb_puts(&text, val) < 0) continue;
+        /* exactly one command, the definition of NAME */
+        bool ok = false;
+        {
+            struct bsyn_env env;
+            shell_syn_env(&env, true, false);
+            env.build = true;
+            env.expand_aliases = false;
+            struct bsyn *h = bsyn_open(text.p, text.len, 0, 0, &env);
+            if (h) {
+                struct bsyn_result r;
+                int k = bsyn_next(h, &r);
+                ok = k == BSYN_OK && r.tree && r.tree->type == BN_FUNC &&
+                     r.tree->name && strcmp(r.tree->name, name.p) == 0;
+                bsyn_result_free(&r);
+                if (ok) {
+                    int k2 = bsyn_next(h, &r);
+                    ok = (k2 == BSYN_EOF);
+                    bsyn_result_free(&r);
+                }
+                bsyn_close(h);
+            }
+        }
+        if (!ok || !shell_func_name_is_valid(name.p, name.len)) {
+            kprintf_raw("%s: warning: %s: ignoring function definition attempt\n",
+                        g_param0 ? g_param0 : "tsh", name.p);
+            kprintf_raw("%s: error importing function definition for `%s'\n",
+                        g_param0 ? g_param0 : "tsh", name.p);
+            continue;
+        }
+        {
+            /* through the reader: the printed body spans lines and may
+             * carry here-documents after them */
+            char *copy = shell_strdup(text.p);
+            if (copy) {
+                (void)shell_run_script_text(copy, false);
+                kfree(copy);
+            }
+        }
+        int fi = shell_function_find(name.p);
+        if (fi >= 0) g_functions[fi].exported = true;
+    }
+}
+
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
@@ -39910,6 +40063,8 @@ void shell_init_hosted(const char *argv0) {
     {
         extern char **environ;
         for (char **e = environ; e && *e; e++) {
+            /* an exported FUNCTION is imported as one, below */
+            if (shell_env_is_function(*e)) continue;
             if (env_set_kv(*e) != 0) continue;
             size_t klen = env_key_len(*e);
             int idx = env_find(*e, klen);
@@ -39978,6 +40133,7 @@ void shell_init_hosted(const char *argv0) {
         }
         shell_init_bash_vars(self.p);
     }
+    shell_import_env_functions();
 }
 
 /* Run a script file to completion; returns its exit status.
