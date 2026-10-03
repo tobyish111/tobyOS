@@ -30164,9 +30164,15 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * then `b: command not found` (tools/agent/probes/paren-declare.sh).
      * shell_assign_prefix_len knows all three shapes; the copy is the
      * whole word, marks dropped, so a long subscript is still read. */
+    /* ...and the GLOB escapes: an element's subscript is copied as
+     * written, `[` and `]` escaped (see the tokenizer's raw subscript), so
+     * `a[0]=$x` arrived as a \x03[ 0 \x03] = ..., matched no shape, and
+     * x='a b' split it -- "b: command not found" (shparity 210, logs/b12
+     * p75). An `=` is never glob-escaped, so dropping them adds no shape. */
     SH_SB(shape);
     for (const char *q = word; *q; q++)
-        if (*q != SHELL_NOSPLIT_MARK && sb_putc(&shape, *q) < 0) return -1;
+        if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC &&
+            sb_putc(&shape, *q) < 0) return -1;
     bool assign_shaped = shape.p && shell_assign_prefix_len(shape.p) > 0;
     if (assign_shaped && shell_assign_ctx(cur, assign_src)) {
         return shell_add_one_arg(pl, cur, word, false);
