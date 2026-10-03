@@ -7819,7 +7819,10 @@ static bool shell_declare_filter_ok(const char *name, bool want_array,
     struct sh_array *arr = sh_array_find_literal(name);
     unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
     if (want_assoc && !(arr && arr->assoc)) return false;
-    if (want_array && !want_assoc && !(arr && !arr->assoc)) return false;
+    /* `declare -a x` with nothing in it has no record yet, only the
+     * attribute: still an indexed array to `declare -a` (logs/b12 p85) */
+    bool indexed = arr ? !arr->assoc : (f & SHVAR_ARRAY) != 0;
+    if (want_array && !want_assoc && !indexed) return false;
     if (want_nameref && !(f & SHVAR_NAMEREF)) return false;
     if (want_readonly && shell_readonly_find(name, klen) < 0) return false;
     if (want_export && !(f & SHVAR_EXPORTED)) return false;
@@ -8125,28 +8128,44 @@ static void cmd_declare(int argc, char **argv) {
          * AN ARRAY IS NOT IN g_env. It lives in g_arrays, so walking the
          * environment alone left every array out of the listing -- which is
          * why `declare -pa` printed nothing at all rather than printing too
-         * much. Same omission the bare `set` listing had. */
+         * much. Same omission the bare `set` listing had.
+         *
+         * SORTED BY NAME, as bash's is (all_shell_variables, sort_variables)
+         * and as the `set` listing already was: it came out in the order
+         * the variables were made, the arrays after every scalar
+         * (logs/b12 p86). */
+        int cap = g_envc + g_narrays + 1;
+        const char **names = (const char **)kmalloc((size_t)cap * sizeof *names);
+        SH_WORDS(keys);
+        if (!names) { shell_set_status(1); return; }
+        int n = 0;
         for (int k = 0; k < g_envc; k++) {
             size_t kl = env_key_len(g_env[k]);
-            SH_SB(nmb);
-            if (kl == 0 || sb_putmem(&nmb, g_env[k], kl) < 0) continue;
-            const char *nm = nmb.p;
-            if (!shell_declare_filter_ok(nm, set_array, set_assoc,
-                                         set_nameref, set_readonly,
-                                         set_export))
-                continue;
-            (void)shell_declare_print(nm);
+            if (kl == 0) continue;
+            char *nm = words_store(&keys, g_env[k], kl);
+            if (!nm) { kfree(names); shell_set_status(1); return; }
+            names[n++] = nm;
         }
         for (int k = 0; k < g_narrays; k++) {
             const char *nm = g_arrays[k]->name;
             if (!nm || nm[0] == SH_ARRAY_TMP_MARK) continue;
-            if (env_find(nm, strlen(nm)) >= 0) continue;   /* already done */
-            if (!shell_declare_filter_ok(nm, set_array, set_assoc,
+            if (env_find(nm, strlen(nm)) >= 0) continue;   /* listed above */
+            names[n++] = nm;
+        }
+        for (int k = 1; k < n; k++) {                 /* insertion sort */
+            const char *v = names[k];
+            int j = k - 1;
+            while (j >= 0 && strcmp(names[j], v) > 0) { names[j + 1] = names[j]; j--; }
+            names[j + 1] = v;
+        }
+        for (int k = 0; k < n; k++) {
+            if (!shell_declare_filter_ok(names[k], set_array, set_assoc,
                                          set_nameref, set_readonly,
                                          set_export))
                 continue;
-            (void)shell_declare_print(nm);
+            (void)shell_declare_print(names[k]);
         }
+        kfree(names);
         return;
     }
 
