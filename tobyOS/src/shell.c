@@ -4384,6 +4384,30 @@ static const struct shell_heredoc *shell_heredoc_pop(void) {
 
 static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
 
+/* A BODY THAT DOES NOT EXPAND FAILS ITS REDIRECTION, NOT THE SCRIPT. bash
+ * expands a here-document as it sets the redirection up, and an error there
+ * -- a bad ${...}, 1/0, an unbound name under set -u, even ${u:?msg} -- is
+ * the redirection failing: the message, the command not run, status 1, and
+ * the rest of the line and the script going on (measured, p19/p20):
+ *
+ *     cat <<E; echo "s=$?"          bash: "${a[]}\n: bad substitution",
+ *     ${a[]}                              then s=1
+ *     E
+ *
+ * tsh dropped the rest of the line (and of a function), and ${u:?} ended
+ * the shell. The expansion's own verdict on the line is taken back here;
+ * the caller fails the command (SH_RD_FAILED). */
+static int shell_hd_expand(const char *body, struct shell_sb *x) {
+    enum shell_flow flow = g_shell_flow;
+    int flow_status = g_shell_flow_status;
+    bool soft = g_bad_subst_soft;
+    if (shell_expand_literal_quotes(body, x) == 0) return 0;
+    g_bad_subst_soft = soft;
+    g_shell_flow = flow;
+    g_shell_flow_status = flow_status;
+    return -1;
+}
+
 /* Pop the next body and, for an unquoted delimiter, EXPAND IT NOW.
  *
  * THE BODY WAS EXPANDED WHEN IT WAS READ, NOT WHEN IT WAS USED:
@@ -4404,11 +4428,11 @@ static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
  * expanded here, where the redirect is set up for the command about to run.
  * The slot is consumed, so expanding in place loses nothing: a function
  * re-queues its own raw copies on every call. */
-static const struct shell_heredoc *shell_heredoc_take(void) {
+static const struct shell_heredoc *shell_heredoc_take(bool *bad) {
     struct shell_heredoc *h = (struct shell_heredoc *)shell_heredoc_pop();
     if (!h || !h->expand) return h;
     SH_SB(x);
-    if (shell_expand_literal_quotes(h->body, &x) < 0) return 0;
+    if (shell_hd_expand(h->body, &x) < 0) { *bad = true; return 0; }
     char *nb = (char *)kmalloc(x.len + 1);
     if (!nb) return 0;
     memcpy(nb, x.p, x.len + 1);
@@ -4591,7 +4615,8 @@ static void shell_hd_strip_tags(char *s) {
  * It went through four recycled queue slots, and the fifth `<<` in one
  * command was "too many here-documents" -- or, once the slots had all been
  * taken, overwrote a body a command parsed earlier still pointed at. */
-static const char *shell_hd_text_for(int id, struct shell_words *words) {
+static const char *shell_hd_text_for(int id, struct shell_words *words,
+                                     bool *bad) {
     if (id < 0 || id >= g_hd_cap || !g_hd_store[id].live) {
         kprintf(SH_PFX_SHELL "here-document body missing\n");
         return 0;
@@ -4599,7 +4624,7 @@ static const char *shell_hd_text_for(int id, struct shell_words *words) {
     struct shell_hd_entry *e = &g_hd_store[id];
     if (!e->expand) return e->body;
     SH_SB(x);
-    if (shell_expand_literal_quotes(e->body, &x) < 0) return 0;
+    if (shell_hd_expand(e->body, &x) < 0) { *bad = true; return 0; }
     return words_store(words, x.p, x.len);
 }
 
@@ -14435,8 +14460,16 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         hd_unit = ++g_hd_unit_seq;
         if (!hd_unit) hd_unit = ++g_hd_unit_seq;      /* never 0 */
         g_hd_unit_cur = hd_unit;
+        /* A BODY'S LINES ARE LINES: they are counted as they are consumed,
+         * so the command after `cat <<E`/body/`E` is three lines on, not
+         * one -- tsh never counted them, and every $LINENO and error line
+         * after a here-document was short by its body and terminator.
+         * (The command itself still runs as line_first.) Each line the
+         * collector consumed had its terminator overwritten with a NUL. */
+        char *hd_before = p;
         if (!shell_collect_line_heredocs(line, line, &p, &hd_tline))
             hd_failed = true;
+        for (char *q = hd_before; q < p; q++) if (!*q) g_shell_lineno++;
         if (hd_tline) line = hd_tline;
         bool unit_heredoc = (hd_tline != 0);
 
@@ -14467,7 +14500,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 /* The offset map is keyed on THIS buffer; see
                  * shell_lineno_at. A continuation-joined line arrives with
                  * its map already built. */
-                shell_lmap_reset(accum, g_shell_lineno);
+                shell_lmap_reset(accum, line_first);
             }
             shell_lmap_rebase(accum, accum, accum_cap);
             /* The newline that ended this line's comment is about to be
@@ -14616,10 +14649,13 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 char *tnl = 0;
                 const char *hd_from = in_q ? (qclose ? qclose : nl + strlen(nl))
                                            : nl;
+                char *hd_before2 = p;
                 if (!shell_collect_line_heredocs(nl, hd_from, &p, &tnl)) {
                     hd_failed = true;
                     break;
                 }
+                unsigned long hd_lines = 0;     /* counted once nl is placed */
+                for (char *q = hd_before2; q < p; q++) if (!*q) hd_lines++;
                 if (tnl) unit_heredoc = true;
                 const char *app = tnl ? tnl : nl;
                 size_t seplen = strlen(sep), nllen = strlen(app);
@@ -14633,6 +14669,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 /* The counter was advanced where the line was CONSUMED, a
                  * few lines up: this only records where it landed. */
                 shell_lmap_add(alen, g_shell_lineno);
+                g_shell_lineno += hd_lines;
                 memcpy(accum + alen, app, nllen);   alen += nllen;
                 accum[alen] = '\0';
                 shell_scan_line(&scan, app);
@@ -19973,6 +20010,9 @@ enum shell_redir_op {
     /* A target that did not expand to exactly one word: applying it is
      * bash's "WORD: ambiguous redirect" (path holds WORD as written). */
     SH_RD_AMBIG,
+    /* A here-document whose body did not expand (shell_hd_expand, which
+     * said why): applying it fails the command, status 1. */
+    SH_RD_FAILED,
 };
 
 struct shell_token {
@@ -29107,22 +29147,28 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                  * untagged one -- the interactive reader, which collects one
                  * body per line itself -- takes the next queued body. */
                 const char *hd_text = 0;
+                bool hd_bad = false;    /* reported: the command fails */
                 int hd_id;
                 if (shell_hd_tag_scan(tok[*io].text, &hd_id)) {
-                    hd_text = shell_hd_text_for(hd_id, &pl->words);
-                    if (!hd_text) return -1;
+                    hd_text = shell_hd_text_for(hd_id, &pl->words, &hd_bad);
+                    if (!hd_text && !hd_bad) return -1;
                 } else {
                     if (g_heredoc_head >= g_heredoc_count) {
                         kprintf(SH_PFX_SHELL "here-document body missing\n");
                         return -1;
                     }
-                    const struct shell_heredoc *h = shell_heredoc_take();
-                    if (!h) return -1;     /* the expansion reported it */
-                    hd_text = h->body;
+                    const struct shell_heredoc *h = shell_heredoc_take(&hd_bad);
+                    if (!h && !hd_bad) return -1;
+                    if (h) hd_text = h->body;
                 }
-                cur->stdin_text = hd_text;
-                if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, hd_text,
-                                    -1) < 0) return -1;
+                if (hd_bad) {
+                    if (shell_add_redir(cur, SH_RD_FAILED, fd, 0, 0, -1) < 0)
+                        return -1;
+                } else {
+                    cur->stdin_text = hd_text;
+                    if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, hd_text,
+                                        -1) < 0) return -1;
+                }
             } else if (t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
                 int target = -1;
                 if (strcmp(tok[*io].text, "-") == 0) {
@@ -29965,6 +30011,10 @@ static int shell_apply_redirs(struct shell_simple *cmd,
         struct shell_redir *r = &cmd->redir[i];
         if (r->op == SH_RD_AMBIG) {
             kprintf("%s: ambiguous redirect\n", r->path ? r->path : "");
+            shell_set_status(1);
+            return -1;
+        }
+        if (r->op == SH_RD_FAILED) {
             shell_set_status(1);
             return -1;
         }
