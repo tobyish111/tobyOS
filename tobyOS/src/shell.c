@@ -4700,8 +4700,15 @@ static void shell_check_pending_signals(void) {
 static bool g_in_pipeline_stage;     /* defined with the pipeline runner */
 static int  g_capture_depth;         /* defined with $( ) */
 static bool g_err_trap_running;
+/* Set in the child of `cmd &` when cmd is one SIMPLE command: its own
+ * status is the job's, and bash runs no ERR trap for it -- `set -E; trap
+ * ... ERR; false & wait` prints nothing, where `{ false; } &` traps for
+ * the `false` inside (Oils 1210). A function it calls still traps inside. */
+static bool g_bg_simple_child;
+
 static void shell_run_err_trap(int status) {
     if (g_err_trap_running) return;
+    if (g_bg_simple_child && g_fn_depth == 0) return;
     /* Not inherited by a shell function, a command substitution or a
      * pipeline's stage -- unless `set -o errtrace` says so (bash). */
     if (!g_opt_errtrace &&
@@ -31712,6 +31719,7 @@ static int shell_background_forked(const char *text, const char *label) {
         /* ONE simple external may replace this process -- see
          * shell_bg_text_is_simple and proc_exec_in_place. */
         g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
+        g_bg_simple_child = g_bg_exec_ok;
         execute_line_text(text);
         int st = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
@@ -36665,6 +36673,12 @@ static void shell_stages_free(char **st, int n) {
     kfree(st);
 }
 
+/* Set by shell_try_compound_pipeline: its LAST stage was a `( )` subshell
+ * that failed. bash runs that stage as a command of its own, and its ERR
+ * trap fires for it -- then again for the pipeline: `(false) | (false)`
+ * prints the trap twice, `(false) | false` once (Oils 1204; p45). */
+static bool g_cpl_last_subshell_failed;
+
 static bool shell_try_compound_pipeline(const char *src) {
     if (!shell_find_pipe_at(src)) return false;
 
@@ -36947,6 +36961,11 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
         if (pst) pst[i] = wrc;
+    }
+    {
+        const char *ls = n > 0 ? stages[n - 1] : "";
+        while (*ls == ' ' || *ls == '\t') ls++;
+        g_cpl_last_subshell_failed = last != 0 && ls[0] == '(' && ls[1] != '(';
     }
     shell_stages_free(stages, nst);
     if (pst) shell_set_pipestatus(pst, n);
@@ -37301,7 +37320,12 @@ static void execute_line_text_inner(const char *src) {
     if (shell_try_background_line(src)) return;
     /* A pipeline with a compound stage must be split while the stages are
      * still TEXT; the tokenizer would reduce `while` to an ordinary word. */
+    g_cpl_last_subshell_failed = false;
     if (shell_try_compound_pipeline(src)) {
+        if (g_cpl_last_subshell_failed && g_errexit_suspend == 0 &&
+            g_errexit_negate == 0 && !g_status_exempt &&
+            g_shell_flow == SHELL_FLOW_NONE)
+            shell_run_err_trap(g_last_status);      /* the ( ) stage's own */
         /* ERREXIT APPLIES TO A PIPELINE WITH COMPOUND STAGES TOO. This
          * dispatcher returned straight to the caller, skipping the check the
          * compound dispatchers below all make, so
