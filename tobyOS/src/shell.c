@@ -35105,10 +35105,113 @@ static void shell_wordlist_failed(void) {
     }
 }
 
+/* ---- select -------------------------------------------------------------
+ *
+ * tsh had no `select` at all: `select v in a b; do ...; done` ran a program
+ * called select ("select: command not found", logs/b12 p76). It is bash's
+ * execute_select_command and select_query, on the `for` loop's parsing:
+ * the menu goes to stderr in columns, the PS3 prompt ("#? ") after it, a
+ * line is read as `read` reads one into REPLY; a blank line shows the menu
+ * again, anything that is not a number in range sets the variable empty,
+ * and at the end of input a newline goes to stdout and the status is 1.
+ * Only break or return ends it. After the first pass the menu is shown
+ * again only when REPLY was empty (bash is built KSH_COMPATIBLE_SELECT). */
+
+#define SH_SEL_NUMBER_LEN(n) ((n) < 10 ? 1 : (n) < 100 ? 2 : (n) < 1000 ? 3 : \
+                              (n) < 10000 ? 4 : (n) < 100000 ? 5 : 6)
+
+/* bash's indent: blanks and tabs (tabsize 8) from column FROM to TO */
+static void shell_select_indent(int from, int to) {
+    while (from < to) {
+        if ((to / 8) > (from / 8)) {
+            kprintf_raw("\t");
+            from += 8 - from % 8;
+        } else {
+            kprintf_raw(" ");
+            from++;
+        }
+    }
+}
+
+/* print_select_list */
+static void shell_select_menu(char **list, int n, int max_elem_len, int indices_len) {
+    const char *cv = env_get("COLUMNS");
+    long cols_env = 0;
+    if (cv && *cv) {
+        for (const char *q = cv; *q >= '0' && *q <= '9'; q++)
+            cols_env = cols_env * 10 + (*q - '0');
+    }
+    int COLS = cols_env > 0 && cols_env < 100000 ? (int)cols_env : 80;
+    if (n == 0) { kprintf_raw("\n"); return; }
+    int cols = max_elem_len ? COLS / max_elem_len : 1;
+    if (cols == 0) cols = 1;
+    int rows = n ? n / cols + (n % cols != 0) : 1;
+    cols = n ? n / rows + (n % rows != 0) : 1;
+    if (rows == 1) { rows = cols; cols = 1; }
+    int first_len = SH_SEL_NUMBER_LEN(rows), other_len = indices_len;
+    for (int row = 0; row < rows; row++) {
+        int ind = row, pos = 0;
+        for (;;) {
+            int il = (pos == 0) ? first_len : other_len;
+            kprintf_raw("%*d) %s", il, ind + 1, list[ind]);
+            int elem_len = (int)strlen(list[ind]) + il + 2;
+            ind += rows;
+            if (ind >= n) break;
+            shell_select_indent(pos + elem_len, pos + max_elem_len);
+            pos += max_elem_len;
+        }
+        kprintf_raw("\n");
+    }
+}
+
+static void cmd_read(int argc, char **argv);
+
+/* select_query: the chosen word, "" for a bad answer, 0 at end of input */
+static const char *shell_select_query(char **list, int n, const char *prompt,
+                                      bool print_menu) {
+    int max_elem_len = 0;
+    for (int i = 0; i < n; i++) {
+        int l = (int)strlen(list[i]);
+        if (l > max_elem_len) max_elem_len = l;
+    }
+    int indices_len = SH_SEL_NUMBER_LEN(n);
+    max_elem_len += indices_len + 2 + 2;
+    for (;;) {
+        if (print_menu) shell_select_menu(list, n, max_elem_len, indices_len);
+        kprintf_raw("%s", prompt);
+        char *rargv[2] = { (char *)"read", 0 };
+        cmd_read(1, rargv);
+        if (g_last_status != 0) {
+            shell_write("\n");
+            return 0;
+        }
+        const char *r = env_get("REPLY");
+        if (!r) return 0;
+        if (!*r) { print_menu = true; continue; }
+        /* legal_number: blanks around an optional sign and digits */
+        const char *q = r;
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        bool neg = false;
+        if (*q == '+' || *q == '-') neg = (*q++ == '-');
+        if (!(*q >= '0' && *q <= '9')) return "";
+        long v = 0;
+        while (*q >= '0' && *q <= '9') {
+            if (v < 100000000L) v = v * 10 + (*q - '0');
+            q++;
+        }
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (*q) return "";
+        if (neg) v = -v;
+        if (v < 1 || v > n) return "";
+        return list[v - 1];
+    }
+}
+
 static bool shell_try_for_command(const char *src) {
     const char *s = shell_skip_blanks(src);
-    if (!shell_starts_with_word(s, "for")) return false;
-    s = shell_skip_blanks(s + 3);
+    bool is_select = shell_starts_with_word(s, "select");
+    if (!is_select && !shell_starts_with_word(s, "for")) return false;
+    s = shell_skip_blanks(s + (is_select ? 6 : 3));
 
     const char *name_start = s;
     /* NOT A NAME: bash's words, status 1, and the script goes on (Oils
@@ -35326,6 +35429,59 @@ static bool shell_try_for_command(const char *src) {
     bool set_last = true;
     struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
     shell_heredoc_mark_take(&hd_mark);
+    if (is_select) {
+        /* the head is printed and DEBUG fires once, before the menu */
+        shell_bashcmd_set(src, strlen(src), SHPR_SELECT_HEAD);
+        shell_run_debug_trap();
+        if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
+        if (items->argc == 0) goto done;               /* nothing to offer */
+        bool show_menu = true;
+        for (int pass = 0; ; pass++) {
+            if (pass > 0) shell_heredoc_mark_rewind(&hd_mark);
+            const char *ps3 = env_get("PS3");
+            const char *sel = shell_select_query(items->argv, items->argc,
+                                                 ps3 ? ps3 : "#? ", show_menu);
+            if (!sel) { last = 1; goto done; }         /* end of input */
+            if (shell_readonly_key(name, strlen(name))) {
+                shell_readonly_print_error(name, strlen(name), "shell");  /* bare, as bind_variable says it */
+                last = 1;
+                goto done;
+            }
+            if (env_set(name, sel) < 0) { last = 1; goto done; }
+            unsigned long ln_save = g_shell_lineno;
+            if (body_line) g_shell_lineno = body_line;
+            shell_lmap_push_copy(body, do_end);
+            execute_line_text(body);
+            shell_lmap_pop_copy();
+            g_shell_lineno = ln_save;
+            last = g_last_status;
+            if (g_shell_flow == SHELL_FLOW_RETURN ||
+                g_shell_flow == SHELL_FLOW_INTERRUPT ||
+                g_shell_flow == SHELL_FLOW_DISCARD ||
+                g_shell_flow == SHELL_FLOW_EXIT) {
+                set_last = false;
+                goto done;
+            }
+            if (g_shell_flow == SHELL_FLOW_BREAK) {
+                if (--g_shell_break_depth <= 0) {
+                    g_shell_flow = SHELL_FLOW_NONE;
+                    g_shell_flow_status = 0;
+                }
+                goto done;
+            }
+            if (g_shell_flow == SHELL_FLOW_CONTINUE) {
+                if (--g_shell_break_depth <= 0) {
+                    g_shell_flow = SHELL_FLOW_NONE;
+                    g_shell_flow_status = 0;
+                } else {
+                    set_last = false;
+                    goto done;
+                }
+            }
+            const char *rp = env_get("REPLY");
+            show_menu = !rp || !*rp;
+        }
+    }
     for (int i = 0; i < items->argc; i++) {
         if (i > 0) shell_heredoc_mark_rewind(&hd_mark);
         /* bash fires DEBUG for the `for` head on EVERY iteration, with the
@@ -38631,7 +38787,7 @@ static void execute_line_text_inner(const char *src) {
         }
         if (saw_prefix) {
             static const char *const compound_kw[] = {
-                "for", "while", "until", "if", "case", 0
+                "for", "while", "until", "if", "case", "select", 0
             };
             for (int m = 0; compound_kw[m]; m++) {
                 if (!shell_starts_with_word(a, compound_kw[m])) continue;
