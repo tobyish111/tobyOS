@@ -16030,6 +16030,11 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             execute_line_text(ex ? ex : line);
         } else {
             execute_line_text(line);
+            /* bash notifies as it reads the NEXT line (parse.y shell_getc:
+             * line_number++, then notify_and_cleanup), so a report names
+             * that line: a job killed on line 8 is "line 10" once line 9
+             * has run (logs/b12 p67). */
+            g_shell_lineno = line_last + 1;
             shell_jobs_notify_script();
         }
         if (unit_checked) g_syn_checked--;
