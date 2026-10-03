@@ -4153,8 +4153,12 @@ static bool shell_alias_name_char(char c);
 
 static bool shell_alias_name_ok(const char *name) {
     if (!name || !*name) return false;
+    /* ...nor an expansion character: bash's legal_alias_name refuses `$`
+     * and a backquote too */
     for (const char *p = name; *p; p++)
-        if (*p == '=' || *p == '/' || !shell_alias_name_char(*p)) return false;
+        if (*p == '=' || *p == '/' || *p == '$' || *p == '`' ||
+            !shell_alias_name_char(*p))
+            return false;
     return true;
 }
 
@@ -15749,7 +15753,9 @@ static void cmd_colon(int argc, char **argv) {
 
 static void shell_print_alias(const struct shell_alias *a) {
     if (!a || !a->name || !a->value) return;
-    shell_printf("alias %s='", a->name);
+    /* a name that starts with `-` is reusable only after `--` (bash's
+     * print_alias) */
+    shell_printf("alias %s%s='", a->name[0] == '-' ? "-- " : "", a->name);
     for (const char *p = a->value; *p; p++) {
         if (*p == '\'') shell_printf("'\\''");
         else shell_putc(*p);
@@ -15757,27 +15763,50 @@ static void shell_print_alias(const struct shell_alias *a) {
     shell_printf("'\n");
 }
 
+static void sh_builtin_usage(const char *name);
+static void shell_help_topic(const char *name);
+
+/* `alias [-p] [name[=value] ...]` and `unalias [-a] name ...` with bash's
+ * option reading (internal_getopt): `--` ends the options, so `alias --
+ * foo=echo` defines foo -- tsh took `--` for a NAME, "alias: --: not
+ * found", status 1 (Oils 0001) -- an unknown option is the usage and
+ * status 2, and `-p` lists every alias before the operands. */
 static void cmd_alias(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) {
-        for (int i = 0; i < g_naliases; i++) {
-            if (g_aliases[i].name) shell_print_alias(&g_aliases[i]);
-        }
+    struct sh_igo g;
+    sh_igo_init(&g, "alias", argc, argv);
+    bool pflag = false;
+    int c;
+    while ((c = sh_igo_next(&g, "p")) != -1) {
+        if (c == 'p') { pflag = true; continue; }
+        if (c == SH_IGO_HELP) shell_help_topic("alias");
+        else sh_builtin_usage("alias");
+        shell_set_status(2);
         return;
     }
+    int i = g.ind;
+    if (i >= argc || pflag) {
+        for (int k = 0; k < g_naliases; k++)
+            if (g_aliases[k].name) shell_print_alias(&g_aliases[k]);
+        if (i >= argc) return;
+    }
 
-    for (int i = 1; i < argc; i++) {
+    for (; i < argc; i++) {
         const char *eq = argv[i];
         while (*eq && *eq != '=') eq++;
-        if (*eq == '=') {
+        if (*eq == '=' && eq != argv[i]) {
             size_t nlen = (size_t)(eq - argv[i]);
             SH_SB(nameb);               /* any length (it was 63) */
-            if (nlen == 0 || sb_putmem(&nameb, argv[i], nlen) < 0) {
-                kprintf("alias: bad name '%s'\n", argv[i]);
+            if (sb_putmem(&nameb, argv[i], nlen) < 0) {
                 shell_set_status(1);
                 continue;
             }
             const char *name = nameb.p;
+            if (!shell_alias_name_ok(name)) {
+                kprintf("alias: `%s': invalid alias name\n", name);
+                shell_set_status(1);
+                continue;
+            }
             if (shell_alias_set(name, eq + 1) < 0) {
                 kprintf("alias: failed to set '%s'\n", name);
                 shell_set_status(1);
@@ -15797,16 +15826,28 @@ static void cmd_alias(int argc, char **argv) {
 
 static void cmd_unalias(int argc, char **argv) {
     shell_set_status(0);
-    if (argc <= 1) {
-        kprintf_raw("usage: unalias [-a] NAME [NAME...]\n");
-        shell_set_status(1);
+    struct sh_igo g;
+    sh_igo_init(&g, "unalias", argc, argv);
+    bool aflag = false;
+    int c;
+    while ((c = sh_igo_next(&g, "a")) != -1) {
+        if (c == 'a') { aflag = true; continue; }
+        if (c == SH_IGO_HELP) shell_help_topic("unalias");
+        else sh_builtin_usage("unalias");
+        shell_set_status(2);
         return;
     }
-    if (strcmp(argv[1], "-a") == 0) {
+    if (aflag) {
         shell_alias_clear_all();
         return;
     }
-    for (int i = 1; i < argc; i++) {
+    int i = g.ind;
+    if (i >= argc) {
+        sh_builtin_usage("unalias");
+        shell_set_status(2);
+        return;
+    }
+    for (; i < argc; i++) {
         if (shell_alias_find(argv[i]) < 0) {
             kprintf("unalias: %s: not found\n", argv[i]);
             shell_set_status(1);
