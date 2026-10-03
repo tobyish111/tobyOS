@@ -501,8 +501,9 @@ struct shell_coproc {
     char *name;
     int rfd, wfd;               /* shell descriptors, -1 when closed */
     struct file *rf, *wf;
+    bool dead;                  /* reaped, not yet disposed (COPROC_DEAD) */
 };
-static struct shell_coproc g_coproc = { 0, 0, -1, -1, 0, 0 };
+static struct shell_coproc g_coproc = { 0, 0, -1, -1, 0, 0, false };
 
 static bool shell_fd_table_reserve(int fd) {
     if (fd < g_shell_fd_cap) return true;
@@ -1518,9 +1519,20 @@ static int g_bgstat_n, g_bgstat_cap;
 
 static void shell_coproc_dispose(void);
 
+/* A REAPED COPROCESS IS MARKED, NOT DISPOSED -- bash's coproc_setstatus
+ * (COPROC_DEAD); its variables and descriptors go at the next cleanup,
+ * coproc_reap from cleanup_dead_jobs: the next line's notify, a `jobs`, the
+ * end of a `wait`. Disposing here, where tsh's notify reaps it, took them
+ * away before the next line could read what the coprocess wrote: `coproc
+ * { echo x; }` then `read r <&"${COPROC[0]}"` on the next line read
+ * nothing (shparity 245b under the runner, debug case 001). bash reaps on
+ * SIGCHLD and disposes at the line read AFTER that. */
+static void shell_coproc_reap(void) {
+    if (g_coproc.pid > 0 && g_coproc.dead) shell_coproc_dispose();
+}
+
 static void shell_bgstat_add(int pid, int code) {
-    /* a reaped coprocess takes its variables and descriptors with it */
-    if (g_coproc.pid > 0 && pid == g_coproc.pid) shell_coproc_dispose();
+    if (g_coproc.pid > 0 && pid == g_coproc.pid) g_coproc.dead = true;
     for (int k = 0; k < g_bgstat_n; k++)
         if (g_bgstats[k].pid == pid) { g_bgstats[k].code = code; return; }
     if (g_bgstat_n >= g_bgstat_cap) {
@@ -1901,6 +1913,7 @@ void shell_notify_jobs_hosted(void) {
 static void shell_jobs_notify_script(void) {
     extern int proc_try_reap(int pid, int *code);
     if (g_interactive) return;
+    shell_coproc_reap();               /* cleanup_dead_jobs: coproc_reap */
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
         /* listed by `jobs`, or collected by `wait` -- in a script there is
@@ -10699,7 +10712,8 @@ static void cmd_jobs(int argc, char **argv) {
 #endif
     /* bash's list_all_jobs begins with cleanup_dead_jobs: a finished job an
      * earlier `jobs` listed is gone now -- `jobs; jobs` on one line lists
-     * it once (logs/b12 p88). */
+     * it once (logs/b12 p88) -- and a dead coprocess is disposed. */
+    shell_coproc_reap();
     for (int i = 0; i < JOB_MAX; i++)
         if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->notified)
             jobs_remove(g_jobs[i]);
@@ -11128,7 +11142,16 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
 
 /* wait [-fn] [-p VAR] [ID...]. -f waits for the job to TERMINATE rather
  * than stop, which is what this wait does. */
+/* bash's wait ends in cleanup_dead_jobs (wait_for_background_pids) or
+ * notify_and_cleanup (wait_for): a coprocess it reaped is disposed now --
+ * `wait $COPROC_PID; echo ${COPROC_PID-unset}` says unset (logs/b12 p80). */
+static void cmd_wait_in(int argc, char **argv);
 static void cmd_wait(int argc, char **argv) {
+    cmd_wait_in(argc, argv);
+    shell_coproc_reap();
+}
+
+static void cmd_wait_in(int argc, char **argv) {
     shell_set_status(0);
     bool opt_n = false;
     const char *pvar = 0;
@@ -38889,6 +38912,7 @@ static void shell_coproc_dispose(void) {
     g_coproc.name = 0;
     g_coproc.rfd = g_coproc.wfd = -1;
     g_coproc.rf = g_coproc.wf = 0;
+    g_coproc.dead = false;
 }
 
 #ifdef SHELL_HOSTED
@@ -39026,6 +39050,7 @@ static bool shell_try_coproc(const char *src) {
     g_shell_fd[rfd] = rr;
     g_shell_fd[wfd] = ww;
     g_coproc.pid = pid;
+    g_coproc.dead = false;
     g_coproc.name = shell_strdup(name.p);
     g_coproc.rfd = rfd;
     g_coproc.wfd = wfd;
