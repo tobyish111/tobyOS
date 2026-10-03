@@ -1257,6 +1257,7 @@ static void  sh_array_clear_novalue(const char *name);
 static inline long sh_count_back(long top, long v) {
     return (long)((unsigned long)top + 1ul + (unsigned long)v);
 }
+static int   sh_array_join(const char *name, char sep, struct shell_sb *out);
 static char *shell_strdup(const char *s);
 static void  shell_strip_glob_escapes(char *s);
 static int   sh_subscript_value(const char *sub, long *out);
@@ -2293,6 +2294,29 @@ static const char *env_get(const char *key) {
             SH_SB(esubb);
             if (shell_nameref_element(target, &enmb, &esubb)) {
                 const char *enm = enmb.p, *esub = esubb.p;
+                /* `a[@]` / `a[*]`: the elements JOINED, by a space or by
+                 * IFS's first character -- what bash's braced ${ref} reads
+                 * (the bare $ref is "${a[@]}" itself: shell_expand_var).
+                 * It read "", the subscript being no number. */
+                if ((esub[0] == '@' || esub[0] == '*') && !esub[1]) {
+                    /* a ring, so a caller holding the last few answers
+                     * never holds a freed one */
+                    static char *ring[8];
+                    static unsigned ri;
+                    char sep = ' ';
+                    if (esub[0] == '*') {
+                        const char *ifs = env_get("IFS");
+                        sep = ifs ? ifs[0] : ' ';
+                    }
+                    SH_SB(jb);
+                    if (sh_array_join(enm, sep, &jb) < 0) return "";
+                    char *nj = shell_strdup(jb.p);
+                    if (!nj) return "";
+                    ri = (ri + 1) % 8;
+                    kfree(ring[ri]);
+                    ring[ri] = nj;
+                    return nj;
+                }
                 if (sh_array_is_assoc(enm)) {
                     /* the key is a WORD, expanded each time the reference
                      * is used: `declare -n r='A["K"]'` reads A[K], and
@@ -2358,15 +2382,33 @@ static const char *env_get(const char *key) {
     return g_env[idx] + klen + 1;
 }
 
+/* Set when the last env_deref_name_ex walked a CYCLE of references (16
+ * hops without leaving them), which it has reported as bash does. */
+static bool g_nameref_circular;
+
 /* The name a nameref resolves to, or the name itself when it is not one.
- * An ASSIGNMENT to a nameref writes THROUGH it. */
-static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
+ * An ASSIGNMENT to a nameref writes THROUGH it. The resolved name is put in
+ * `buf` when it is not `key` itself: any length (it was a 128-byte array,
+ * and a longer target was silently not followed). */
+static const char *env_deref_name_ex(const char *key, struct shell_sb *buf,
                                      bool writing) {
+    g_nameref_circular = false;
     if (!key) return key;
+    const char *key0 = key;
     size_t klen = strlen(key);
     int idx = env_find(key, klen);
     int hops = 0;
-    while (idx >= 0 && (g_env_flags[idx] & SHVAR_NAMEREF) && hops++ < 16) {
+    while (idx >= 0 && (g_env_flags[idx] & SHVAR_NAMEREF)) {
+        /* A CYCLE IS bash's "warning: ref1: circular name reference" --
+         * named by what was asked for -- and a WRITE through it fails
+         * (Oils 1857: `ref1=z` is status 1). It went round 16 times and
+         * wrote to whichever name the walk stopped on. */
+        if (hops++ >= 16) {
+            g_nameref_circular = true;
+            if (writing)
+                kprintf("warning: %s: circular name reference\n", key0);
+            return key0;
+        }
         const char *target = g_env[idx] + klen + 1;
         if (!*target) break;
         /* ASSIGNING THROUGH A REFERENCE THAT IS NOT ONE DROPS THE ATTRIBUTE.
@@ -2385,10 +2427,10 @@ static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
             SH_SB(enmb);
             SH_SB(esubb);
             if (shell_nameref_element(target, &enmb, &esubb)) {
-                size_t tl = strlen(target);
-                if (tl + 1 > cap) break;
-                memcpy(buf, target, tl + 1);
-                return buf;
+                SH_SB(tcopy);                   /* target may sit in buf */
+                if (sb_set(&tcopy, target) < 0 || sb_set(buf, tcopy.p) < 0)
+                    break;
+                return buf->p;
             }
         }
         if (!shell_name_is_valid(target, strlen(target))) {
@@ -2399,19 +2441,44 @@ static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
             break;
         }
         size_t n = strlen(target);
-        if (n + 1 > cap) break;
-        memcpy(buf, target, n + 1);
-        key = buf;
+        {
+            SH_SB(tcopy);                       /* target may sit in buf */
+            if (sb_set(&tcopy, target) < 0 || sb_set(buf, tcopy.p) < 0)
+                break;
+        }
+        key = buf->p;
         klen = n;
-        int nx = env_find(target, n);
+        int nx = env_find(key, n);
         if (nx == idx) break;
         idx = nx;
     }
     return key;
 }
 
-static const char *env_deref_name(const char *key, char *buf, size_t cap) {
-    return env_deref_name_ex(key, buf, cap, true);
+static const char *env_deref_name(const char *key, struct shell_sb *buf) {
+    return env_deref_name_ex(key, buf, true);
+}
+
+static bool shell_valid_nameref_value(const char *v);
+
+/* The ELEMENT a chain of references ends at -- `a[1]`, `a[@]` -- into
+ * `out`; false when it ends at a plain name, or nowhere. */
+static bool shell_nameref_elem_target(const char *name, struct shell_sb *out) {
+    SH_SB(cur);
+    if (sb_set(&cur, name) < 0) return false;
+    for (int hops = 0; hops < 16; hops++) {
+        int ix = env_find(cur.p, cur.len);
+        if (ix < 0 || !(g_env_flags[ix] & SHVAR_NAMEREF)) return false;
+        const char *t = g_env[ix] + cur.len + 1;
+        if (!*t) return false;
+        size_t n = 0;
+        while (t[n] && t[n] != '[') n++;
+        if (t[n] == '[')
+            return shell_valid_nameref_value(t) && sb_set(out, t) == 0;
+        SH_SB(tc);
+        if (sb_set(&tc, t) < 0 || sb_set(&cur, tc.p) < 0) return false;
+    }
+    return false;
 }
 
 /* Drop entry at index `idx` (free its blob, shift the tail down). */
@@ -2430,7 +2497,7 @@ static void env_remove_at(int idx) {
 /* Install a fully-formed "KEY=VALUE" string. `kv_in` is COPIED -- the
  * caller retains ownership of its storage. Replaces an existing key
  * in place (frees the previous slot) so the table stays compact. */
-static const char *env_deref_name(const char *key, char *buf, size_t cap);
+static const char *env_deref_name(const char *key, struct shell_sb *buf);
 
 /* Split "name[sub]" / "name" out of an assignment word's key part.
  * Returns the subscript text (sub->p) or NULL when there is none.
@@ -3054,8 +3121,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
          * control, and that case diverged too. A fix aimed only at the
          * reference path would have left the plain one wrong and looked
          * complete. */
-        char tgt[128];
-        const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+        SH_SB(tgt);
+        const char *real = env_deref_name_ex(name, &tgt, false);
         if (!real || !*real) real = name;
         int si = env_find(real, strlen(real));
         if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
@@ -3142,8 +3209,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
  * The scalar goes the way the array-literal path removes it (above). */
 static int sh_array_absorb_scalar(const char *name) {
     if (sh_array_find(name)) return 0;
-    char tgt[128];
-    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    SH_SB(tgt);
+    const char *real = env_deref_name_ex(name, &tgt, false);
     if (!real || !*real) real = name;
     int si = env_find(real, strlen(real));
     if (si < 0 || (g_env_flags[si] & SHVAR_ARRAY)) return 0;
@@ -3198,6 +3265,43 @@ static bool shell_kv_scalar_paren(const char *kv, const char *val);
  * be expanded twice. */
 static bool g_assign_expand_sub;
 
+static bool shell_nameref_elem_target(const char *name, struct shell_sb *out);
+
+/* An assignment that bash refuses as a whole ends the logical line: status
+ * 1, the rest dropped (the shell itself under set -e). */
+static void shell_assign_refused(void) {
+    shell_set_status(1);
+    if (g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+        g_shell_flow_status = 1;
+    }
+}
+
+/* WRITING THROUGH A REFERENCE TO AN ELEMENT (measured, logs/b12/p29):
+ *
+ *     typeset -n r='a[0]'; r=v      a[0]=v, as an element assignment
+ *     r[0]=v  /  r=(1 2)            "`a[0]': not a valid identifier"
+ *     typeset -n r='a[@]'; r=v      "a[@]: bad array subscript"
+ *
+ * each refusal dropping the rest of the line. NAME is the reference, LIST
+ * says the assignment is subscripted or a compound one. -1: refused (and
+ * reported); 0: nothing to say. */
+static int shell_nameref_elem_write(const char *name, bool list) {
+    SH_SB(nrt);
+    if (!shell_nameref_elem_target(name, &nrt)) return 0;
+    if (list) {
+        kprintf("`%s': not a valid identifier\n", nrt.p);
+    } else {
+        size_t L = nrt.len;
+        if (!(L >= 3 && nrt.p[L - 3] == '[' &&
+              (nrt.p[L - 2] == '@' || nrt.p[L - 2] == '*')))
+            return 0;
+        kprintf("%s: bad array subscript\n", nrt.p);
+    }
+    shell_assign_refused();
+    return -1;
+}
+
 static int sh_try_array_assignment(const char *kv) {
     size_t klen = env_key_len(kv);
     if (klen == 0) return 0;
@@ -3217,6 +3321,7 @@ static int sh_try_array_assignment(const char *kv) {
             if (k) sub = k;
         }
         if (!shell_name_is_valid(name, strlen(name))) return 0;
+        if (!expand_sub && shell_nameref_elem_write(name, true) < 0) return -1;
         /* A LIST IS NO MEMBER'S VALUE: `a[-1]+=(4 5)` is bash's "a[-1]:
          * cannot assign list to array member", status 1 and the rest of
          * the line dropped (Oils 0060) -- as `declare a[0]=(1 2)` already
@@ -3288,6 +3393,13 @@ static int sh_try_array_assignment(const char *kv) {
     }
 
     if (val[0] == '(' && !shell_kv_scalar_paren(kv, val)) {
+        {
+            SH_SB(lnm);
+            if (sb_putmem(&lnm, kv, keylen) < 0) return -1;
+            if (shell_name_is_valid(lnm.p, lnm.len) &&
+                shell_nameref_elem_write(lnm.p, true) < 0)
+                return -1;
+        }
         char nm[128];
         if (keylen + 1 > sizeof nm) return 0;
         memcpy(nm, kv, keylen); nm[keylen] = '\0';
@@ -3295,8 +3407,8 @@ static int sh_try_array_assignment(const char *kv) {
         /* `r=(3)` and `r+=(4)` on a readonly array (S4) -- also through a
          * nameref: `declare -n r=a; r+=(4)` on a readonly a (Oils 0461). */
         {
-            char rtgt[128];
-            const char *rn = env_deref_name_ex(nm, rtgt, sizeof rtgt, false);
+            SH_SB(rtgt);
+            const char *rn = env_deref_name_ex(nm, &rtgt, false);
             if (!rn || !*rn) rn = nm;
             if (shell_readonly_key(rn, strlen(rn))) {
                 shell_readonly_print_error(rn, strlen(rn), "shell");
@@ -3332,8 +3444,8 @@ static int shell_arith_eval(const char *expr, const char *cmdname, long *out);
 
 /* The value-changing attributes of NAME (after its nameref), or 0. */
 static unsigned shell_value_attrs(const char *name) {
-    char tgt[128];
-    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    SH_SB(tgt);
+    const char *real = env_deref_name_ex(name, &tgt, false);
     if (!real || !*real) real = name;
     int ix = env_find(real, strlen(real));
     return ix >= 0 ? (g_env_flags[ix] & SHVAR_VALUE_ATTRS) : 0u;
@@ -3397,6 +3509,15 @@ static int env_set_kv(const char *kv_in) {
         int ar = sh_try_array_assignment(kv_in);
         if (ar > 0) return 0;
         if (ar < 0) return -1;
+    }
+    {
+        size_t k0 = env_key_len(kv_in);
+        size_t n0 = (k0 > 1 && kv_in[k0 - 1] == '+') ? k0 - 1 : k0;
+        SH_SB(rnm);
+        if (kv_in[k0] == '=' && sb_putmem(&rnm, kv_in, n0) == 0 &&
+            shell_name_is_valid(rnm.p, rnm.len) &&
+            shell_nameref_elem_write(rnm.p, false) < 0)
+            return -1;
     }
     size_t klen = env_key_len(kv_in);
     if (klen == 0) return -1;             /* "=value" or "" -- reject */
@@ -3493,8 +3614,8 @@ static int env_set_kv(const char *kv_in) {
                 int rc = sh_array_is_assoc(nm) ? sh_array_set_key(nm, "0", v)
                                                : sh_array_set(nm, 0, v);
                 if (rc < 0) return -1;
-                char tgt[128];
-                const char *real = env_deref_name_ex(nm, tgt, sizeof tgt, false);
+                SH_SB(tgt);
+                const char *real = env_deref_name_ex(nm, &tgt, false);
                 if (!real || !*real) real = nm;
                 int si = env_find(real, strlen(real));
                 if (si >= 0 && !(g_env_flags[si] & (SHVAR_ARRAY | SHVAR_NAMEREF)))
@@ -3512,11 +3633,15 @@ static int env_set_kv(const char *kv_in) {
      * assignment that CREATES the reference does not come through here as a
      * write to its own target. */
     {
-        char nm[128], target[128];
-        if (klen + 1 <= sizeof nm) {
-            memcpy(nm, kv_in, klen);
-            nm[klen] = '\0';
-            const char *real = env_deref_name(nm, target, sizeof target);
+        SH_SB(nmb);
+        SH_SB(target);
+        if (sb_putmem(&nmb, kv_in, klen) == 0) {
+            const char *nm = nmb.p;
+            const char *real = env_deref_name(nm, &target);
+            if (g_nameref_circular) {            /* reported */
+                g_assign_fail_hit = true;
+                return -1;
+            }
             if (real != nm && strcmp(real, nm) != 0) {
                 /* The value is any length. It was a 256-byte array, and a
                  * longer value set the REFERENCE ITSELF, not its target. */
@@ -5265,8 +5390,8 @@ static void sh_array_unset_literal(const char *name) {
 /* An array that has been ASSIGNED is no longer only declared: `aa=()`
  * prints `declare -a aa=()`, where `declare -a aa` alone printed none. */
 static void sh_array_clear_novalue(const char *name) {
-    char tgt[128];
-    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    SH_SB(tgt);
+    const char *real = env_deref_name_ex(name, &tgt, false);
     if (!real || !*real) real = name;
     int ix = env_find(real, strlen(real));
     if (ix >= 0) g_env_flags[ix] &= ~(unsigned char)SHVAR_NOVALUE;
@@ -5302,8 +5427,8 @@ static int sh_array_literal_commit(const char *tmp, const char *name,
         sh_array_unset_literal(tmp);
         return rc;
     }
-    char tgt[128];
-    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    SH_SB(tgt);
+    const char *real = env_deref_name_ex(name, &tgt, false);
     if (!real || !*real) real = name;
     size_t rn = strlen(real) + 1;
     char *nn = (char *)kmalloc(rn);
@@ -5330,12 +5455,24 @@ static struct sh_array *sh_array_find(const char *name) {
      *
      * Read-only: resolving the is-it-really-a-reference question belongs
      * to a write, and a lookup is not one. */
-    char target[128];
-    const char *real = env_deref_name_ex(name, target, sizeof target, false);
+    SH_SB(target);
+    const char *real = env_deref_name_ex(name, &target, false);
     if (!real || !*real) real = name;
     for (int i = 0; i < g_narrays; i++)
         if (g_arrays[i]->name && strcmp(g_arrays[i]->name, real) == 0)
             return g_arrays[i];
+    return 0;
+}
+
+/* NAME's elements in its own order, `sep` between them (none for NUL);
+ * a scalar is its one element. */
+static int sh_array_join(const char *name, char sep, struct shell_sb *out) {
+    struct sh_array *a = sh_array_find(name);
+    if (!a) return sb_puts(out, env_get(name));
+    for (int i = 0; i < a->n; i++) {
+        if (i && sep && sb_putc(out, sep) < 0) return -1;
+        if (sb_puts(out, a->e[i].val) < 0) return -1;
+    }
     return 0;
 }
 
@@ -5362,8 +5499,8 @@ static struct sh_array *sh_array_create(const char *name) {
      * under `r` where nothing would ever look for it again -- the read
      * back through `r` resolved to `z`, found no array, and answered
      * empty. */
-    char tgt[128];
-    const char *real = env_deref_name_ex(name, tgt, sizeof tgt, false);
+    SH_SB(tgt);
+    const char *real = env_deref_name_ex(name, &tgt, false);
     if (real && *real) name = real;
     a = (struct sh_array *)kmalloc(sizeof *a);
     if (!a) return 0;
@@ -7461,6 +7598,17 @@ static void shell_declare_print_function(const struct shell_function *fn) {
     if (shown) kfree(shown);
 }
 
+/* bash's valid_nameref_value: a NAME, or an element NAME[SUB] with a
+ * subscript there and the `]` that closes it last. */
+static bool shell_valid_nameref_value(const char *v) {
+    size_t n = 0;
+    while (v[n] && v[n] != '[') n++;
+    if (!shell_name_is_valid(v, n)) return false;
+    if (!v[n]) return true;
+    size_t k = sa_skip_subscript(v + n);
+    return k > 1 && v[n + k] == ']' && v[n + k + 1] == '\0';
+}
+
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
@@ -7667,18 +7815,59 @@ static void cmd_declare(int argc, char **argv) {
             }
         }
         if (!shell_name_is_valid(argv[i], klen)) {
-            kprintf("declare: `%s': not a valid identifier\n", argv[i]);
+            kprintf("%s: `%s': not a valid identifier\n", argv[0], argv[i]);
             shell_set_status(1);
             continue;
         }
-        char name[128];
-        if (klen >= sizeof name) {
-            kprintf("declare: name too long\n");
+        /* any length: it was a 128-byte array, "declare: name too long" */
+        SH_SB(nameb);
+        if (sb_putmem(&nameb, argv[i], klen) < 0) {
             shell_set_status(1);
             continue;
         }
-        memcpy(name, argv[i], klen);
-        name[klen] = '\0';
+        const char *name = nameb.p;
+
+        /* A REFERENCE MUST NAME A VARIABLE (bash's declare.def), and
+         * nothing is made when it does not -- status 1:
+         *
+         *     declare -n r='@'    "`@': invalid variable name for name reference"
+         *     declare -n x=x      "x: nameref variable self references not allowed"
+         *     declare -n u=       "`': not a valid identifier"
+         *     r=1; declare -n r   the value it has is checked the same way
+         *
+         * tsh made all of these references (Oils 1865). A name or an
+         * element (`a[1]`, `a[@]`) is a name. */
+        if (set_nameref) {
+            const char *nv = 0;
+            if (has_value && !d_append) {
+                nv = argv[i] + env_key_len(argv[i]) + 1;
+            } else if (!has_value) {
+                int ox = env_find(name, klen);
+                if (ox >= 0 && !(g_env_flags[ox] & (SHVAR_NOVALUE | SHVAR_NAMEREF)))
+                    nv = g_env[ox] + klen + 1;
+            }
+            if (nv) {
+                bool ok = true;
+                if (!*nv) {
+                    if (has_value) {
+                        kprintf("%s: `': not a valid identifier\n", argv[0]);
+                        ok = false;
+                    }
+                } else if (!shell_valid_nameref_value(nv)) {
+                    kprintf("%s: `%s': invalid variable name for name "
+                            "reference\n", argv[0], nv);
+                    ok = false;
+                } else if (strcmp(nv, name) == 0) {
+                    kprintf("%s: %s: nameref variable self references not "
+                            "allowed\n", argv[0], name);
+                    ok = false;
+                }
+                if (!ok) {
+                    shell_set_status(1);
+                    continue;
+                }
+            }
+        }
 
         if (make_local && !shell_local_declared_here(name, g_script_depth)) {
             if (shell_readonly_key(name, klen)) {
@@ -8057,6 +8246,19 @@ static void cmd_unset(int argc, char **argv) {
             shell_function_unset(argv[i]);
             continue;
         }
+        /* `unset ref` ON A REFERENCE TO AN ELEMENT unsets that element --
+         * `typeset -n r='a[@]'; unset r` empties a (bash; logs/b12/p29);
+         * tsh looked for a variable called "a[@]". */
+        if (!ref_only) {
+            SH_SB(eltgt);
+            if (shell_nameref_elem_target(argv[i], &eltgt)) {
+                int prev = g_last_status;
+                char *sv[2] = { argv[0], eltgt.p };
+                cmd_unset(2, sv);
+                if (prev != 0 && g_last_status == 0) shell_set_status(prev);
+                continue;
+            }
+        }
         /* A READONLY NAME CANNOT BE UNSET, whole or by element (S4): bash
          * says so and returns 1; tsh dropped `r[0]` and then `r`. */
         {
@@ -8162,9 +8364,8 @@ static void cmd_unset(int argc, char **argv) {
          * itself. tsh dropped `r` and left `y` standing, so the name
          * the caller meant to clear survived. */
         if (!ref_only) {
-            char tgt[128];
-            const char *real = env_deref_name_ex(argv[i], tgt,
-                                                 sizeof tgt, false);
+            SH_SB(tgt);
+            const char *real = env_deref_name_ex(argv[i], &tgt, false);
             if (real && *real && real != argv[i] &&
                 strcmp(real, argv[i]) != 0) {
                 if (sh_array_find_literal(real)) sh_array_unset_literal(real);
@@ -23908,6 +24109,47 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     rest = rb + 1;
                 }
             } else {
+                /* ${!ref} ON A NAMEREF IS THE NAME IT REFERS TO: bash
+                 * inverts the two, as ksh93 does (parameter_brace_expand_
+                 * indir) -- the last reference in a chain gives its
+                 * target, and any operator applies to that NAME:
+                 *
+                 *     x=foo; ref=x; typeset -n ref
+                 *     echo $ref ${!ref}             bash: foo x
+                 *
+                 * tsh went through the target and printed its value's
+                 * value (Oils 1841). A reference with no target is
+                 * "invalid indirect expansion". */
+                int ni = env_find(rname.p, rname.len);
+                if (ni >= 0 && (g_env_flags[ni] & SHVAR_NAMEREF)) {
+                    const char *t = g_env[ni] + rname.len + 1;
+                    if (!*t) {
+                        kprintf(SH_PFX_SHELL "%s: invalid indirect expansion\n",
+                                rname.p);
+                        g_bad_subst_soft = true;
+                        return -1;
+                    }
+                    SH_SB(tn);
+                    if (sb_set(&tn, t) < 0) return -1;
+                    for (int hops = 0; hops < 16; hops++) {
+                        if (!shell_name_is_valid(tn.p, tn.len)) break;
+                        int nj = env_find(tn.p, tn.len);
+                        if (nj < 0 || !(g_env_flags[nj] & SHVAR_NAMEREF)) break;
+                        const char *t2 = g_env[nj] + tn.len + 1;
+                        if (!*t2) break;
+                        SH_SB(t2b);
+                        if (sb_set(&t2b, t2) < 0 || sb_set(&tn, t2b.p) < 0)
+                            return -1;
+                    }
+                    SH_SB(ne);
+                    if (env_set("SHELL_INDIR_NREF", tn.p) < 0 ||
+                        sb_puts(&ne, "SHELL_INDIR_NREF") < 0 ||
+                        sb_puts(&ne, rest) < 0)
+                        return -1;
+                    int nrc = shell_expand_braced_parameter(ne.p, b);
+                    (void)env_unset("SHELL_INDIR_NREF");
+                    return nrc;
+                }
                 bool vjoin = false;
                 ref_set = true;
                 if (shell_parameter_value(rname.p, &refval,
@@ -24027,6 +24269,19 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     if (*suffix == '[' || slen == 0) {
                         shell_bad_subst(false);
                         return -1;
+                    }
+                    /* A REFERENCE TO AN ELEMENT HAS NO ELEMENTS OF ITS OWN:
+                     * `typeset -n r='a[0]'` (or 'a[@]') then ${r[0]} is
+                     * "", "${r[@]}" no word, ${#r[@]} 0 (logs/b12/p29) --
+                     * tsh read through to the element. */
+                    {
+                        SH_SB(nrt);
+                        if (shell_nameref_elem_target(nm, &nrt)) {
+                            if (count) return sb_put_uint(b, 0);
+                            if (slen == 1 && sub[0] == '@')
+                                return sh_put_lead_mark(b);
+                            return 0;
+                        }
                     }
                     /* ${a[@]-word} ${a[*]:+word} ... test the whole array
                      * (shell_expand_array_test_op) -- before the slice,
@@ -24738,6 +24993,13 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
 
     if (length_mode && at_or_star)          /* ${#@} ${#*}: $#, bash's rule */
         return sb_put_uint(b, (unsigned long)g_positional_count);
+    /* ${#ref} on a reference to an ELEMENT is 0 in bash, whatever the
+     * element holds (`typeset -n r='a[0]'`, or 'a[@]') -- measured,
+     * logs/b12/p29: its length code asks the reference, not the element. */
+    if (length_mode) {
+        SH_SB(nrt);
+        if (shell_nameref_elem_target(name, &nrt)) return sb_put_uint(b, 0);
+    }
     if (length_mode) {
         /* ${#x} COUNTS CHARACTERS, AND AN ESCAPE IS NOT ONE. A value that
          * reached here through an expansion may carry SHELL_DATA_ESC in front
@@ -25603,6 +25865,17 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
     const char *name = nameb.p;
     p += n;
     *pp = p;
+    /* A REFERENCE TO `a[@]` IS "${a[@]}" when it is written bare -- $ref,
+     * not ${ref} (which reads the elements joined: env_get). bash's
+     * param_expand takes that path for a plain $NAME: `typeset -n r='a[@]'`
+     * then "$r" is one word per element (Oils 1862). */
+    {
+        SH_SB(nrt);
+        if (shell_nameref_elem_target(name, &nrt) && nrt.len >= 3 &&
+            nrt.p[nrt.len - 3] == '[' &&
+            (nrt.p[nrt.len - 2] == '@' || nrt.p[nrt.len - 2] == '*'))
+            return shell_expand_braced_parameter(nrt.p, b);
+    }
     const char *val = env_get(name);
     if (!val && strcmp(name, "LINENO") == 0)
         return sb_put_uint(b, g_shell_lineno);
