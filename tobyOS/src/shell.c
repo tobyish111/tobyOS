@@ -10413,11 +10413,15 @@ static struct job *jobs_by_spec(const char *s) {
     if (strcmp(s, "%-") == 0) {
         struct job *newest = jobs_newest_any(), *second = 0;
         for (int i = 0; i < JOB_MAX; i++) {
-            if (!g_jobs[i]->id) continue;
+            if (!g_jobs[i]->id || g_jobs[i]->waited) continue;
             if (newest && g_jobs[i]->id == newest->id) continue;
             if (!second || g_jobs[i]->id > second->id) second = g_jobs[i];
         }
-        return second;
+        /* "There is only a single job, and it is both `+' and `-'" (bash,
+         * jobs.c set_current_job): `sleep .1 & sleep .2 & kill %-` leaves
+         * one job once the killed one is cleaned up, and `wait %-` waits
+         * for it -- status 0. tsh said "%-: no such job" (Oils 0945). */
+        return second ? second : newest;
     }
     int id = 0;
     if (parse_int(s + 1, &id) < 0 || id <= 0) return 0;
