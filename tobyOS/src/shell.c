@@ -23833,6 +23833,46 @@ static int shell_expand_at_transform(const char *name, char opch,
  *     ${@:2}    q r s   ${@:0}     $0 p q r s  -- INDEX 0 IS $0, not $1,
  *                                  which is why the list length is N+1
  */
+static size_t sh_arith_dollar_span(const char *p);
+
+/* Where ${v:OFF:LEN} divides OFF from LEN: bash's skiparith -- the first
+ * `:` that no `?` before it has claimed (a ternary has one each), outside
+ * parentheses, quotes and substitutions. `${s: 0 < 1 ? 2 : 0 : 1}` is
+ * offset `0 < 1 ? 2 : 0`, length 1 (Oils 0078); tsh cut at the first `:`. */
+static char *sh_slice_colon(char *s) {
+    int skipcol = 0, paren = 0;
+    for (char *q = s; *q; q++) {
+        char c = *q;
+        if (c == '\\' && q[1]) { q++; continue; }
+        if (c == '\'') {
+            q++;
+            while (*q && *q != '\'') q++;
+            if (!*q) break;
+            continue;
+        }
+        if (c == '"') {
+            q++;
+            while (*q && *q != '"') { if (*q == '\\' && q[1]) q++; q++; }
+            if (!*q) break;
+            continue;
+        }
+        if (c == '$' && (q[1] == '(' || q[1] == '{' || q[1] == '[')) {
+            q += sh_arith_dollar_span(q) - 1;
+            if (!*q) break;
+            continue;
+        }
+        if (c == '(') { paren++; continue; }
+        if (c == ')') { if (paren) paren--; continue; }
+        if (paren) continue;
+        if (c == '?') { skipcol++; continue; }
+        if (c == ':') {
+            if (skipcol) { skipcol--; continue; }
+            return q;
+        }
+    }
+    return 0;
+}
+
 static int shell_expand_substring(const char *name, const char *spec,
                                   struct shell_sb *b) {
     if (!spec || !*spec) {
@@ -23841,8 +23881,7 @@ static int shell_expand_substring(const char *name, const char *spec,
     }
     SH_SB(sbuf);                    /* an arithmetic spec, not a value */
     if (sb_puts(&sbuf, spec) < 0) return -1;
-    char *split = 0;
-    for (char *q = sbuf.p; *q; q++) if (*q == ':') { split = q; break; }
+    char *split = sh_slice_colon(sbuf.p);
     bool have_len = (split != 0);
     if (split) *split = '\0';
     long off = 0, cnt = 0;
@@ -24655,8 +24694,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         }
                         SH_SB(spec);
                         if (sb_puts(&spec, suffix + 1) < 0) return -1;
-                        char *colon = 0;
-                        for (char *q = spec.p; *q; q++) if (*q == ':') { colon = q; break; }
+                        char *colon = sh_slice_colon(spec.p);
                         if (colon) *colon = '\0';
                         long off = 0, cnt = -1;
                         if (sh_array_is_assoc(nm)) {
