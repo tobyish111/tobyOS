@@ -1262,6 +1262,15 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
 static bool g_expand_literal_ifs_data;      /* see shell_expand_word_ex */
 static bool g_tok_word_assign_ctx;          /* see its definition */
 static void shell_bad_subst(bool fatal);
+/* THE TEXT bash NAMES IN "TEXT: bad substitution": the string its expansion
+ * pass was working through when it met the bad ${...} -- the whole word
+ * (`pre${a[]}post`), or the inside of the double quotes it was in
+ * (`echo x "2 ${a[]} t"` names `2 ${a[]} t`), or an operator's word, or a
+ * here-document's body. Where it starts and what kind of span it is; the
+ * end is found only when there is an error to report (shell_bad_subst). */
+enum { SH_BSUB_STRING, SH_BSUB_WORD, SH_BSUB_DQ };
+static const char *g_bsub_unit;
+static int g_bsub_unit_kind;
 static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
 static int shell_word_tilde(struct shell_sb *wb);
@@ -21953,8 +21962,24 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
  * entry, so the substitutions inside the word never see it. */
 static bool g_expand_literal_ifs_data;
 
+static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
+                                   bool dq_syntax, bool sq_syntax);
+
+/* The string expanded is what a bad substitution in it names (g_bsub_unit). */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                bool dq_syntax, bool sq_syntax) {
+    const char *su = g_bsub_unit;
+    int sk = g_bsub_unit_kind;
+    g_bsub_unit = word ? word : "";
+    g_bsub_unit_kind = SH_BSUB_STRING;
+    int rc = shell_expand_word_ex_in(word, out, dq_syntax, sq_syntax);
+    g_bsub_unit = su;
+    g_bsub_unit_kind = sk;
+    return rc;
+}
+
+static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
+                                   bool dq_syntax, bool sq_syntax) {
     const char *p = word ? word : "";
     if (!out) return -1;
     sb_truncate(out, 0);
@@ -22036,6 +22061,10 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
         if (dq_syntax && *p == '"') {            /* expands, quotes removed */
             p++;
             g_dq_depth++;
+            const char *su = g_bsub_unit;
+            int sk = g_bsub_unit_kind;
+            g_bsub_unit = p;
+            g_bsub_unit_kind = SH_BSUB_DQ;
             if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
                 if (*p == '$') {
@@ -22052,6 +22081,8 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                 if (sb_putc(out, *p++) < 0) return -1;
             }
             g_dq_depth--;
+            g_bsub_unit = su;
+            g_bsub_unit_kind = sk;
             if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '"') p++;
             continue;
@@ -23346,9 +23377,64 @@ static const char *g_bsub_text;
  * tools/agent/probes/bad-subst.sh): status 1 and the rest of the line
  * dropped (expand_wdesc_error) -- or, for an unknown `@` transform,
  * the end of a non-interactive shell (expand_wdesc_fatal). */
+static size_t sh_arith_dollar_span(const char *p);
+
+/* Where the unit g_bsub_unit starts ends: a word at the first unquoted
+ * blank or operator, a double-quoted span at its closing quote -- each
+ * stepping over quotes, escapes and the substitutions inside -- and a
+ * string at its end. */
+static size_t sh_bsub_unit_len(const char *u, int kind) {
+    if (kind == SH_BSUB_STRING) return strlen(u);
+    const char *q = u;
+    while (*q) {
+        char c = *q;
+        if (c == '\\' && q[1]) { q += 2; continue; }
+        if (c == '$' && (q[1] == '(' || q[1] == '{' || q[1] == '[')) {
+            q += sh_arith_dollar_span(q);
+            continue;
+        }
+        if (c == '`') {
+            q++;
+            while (*q && *q != '`') q += (*q == '\\' && q[1]) ? 2 : 1;
+            if (*q) q++;
+            continue;
+        }
+        if (kind == SH_BSUB_DQ) {
+            if (c == '"') break;
+            q++;
+            continue;
+        }
+        if (c == '\'') {
+            q++;
+            while (*q && *q != '\'') q++;
+            if (*q) q++;
+            continue;
+        }
+        if (c == '"') {
+            q++;
+            q += sh_bsub_unit_len(q, SH_BSUB_DQ);
+            if (*q) q++;
+            continue;
+        }
+        if (c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' ||
+            c == '|' || c == '<' || c == '>' || c == '(' || c == ')')
+            break;
+        q++;
+    }
+    return (size_t)(q - u);
+}
+
 static void shell_bad_subst(bool fatal) {
-    if (g_bsub_text) kprintf("${%s}: bad substitution\n", g_bsub_text);
-    else             kprintf(SH_PFX_SHELL "bad substitution\n");
+    if (g_bsub_unit) {
+        SH_SB(u);
+        if (sb_putmem(&u, g_bsub_unit,
+                      sh_bsub_unit_len(g_bsub_unit, g_bsub_unit_kind)) == 0)
+            kprintf("%s: bad substitution\n", u.p);
+    } else if (g_bsub_text) {
+        kprintf("${%s}: bad substitution\n", g_bsub_text);
+    } else {
+        kprintf(SH_PFX_SHELL "bad substitution\n");
+    }
     shell_set_status(1);
     if (fatal) {
         if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -23967,6 +24053,31 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         }
     }
     if (*op) {
+        /* AN OPERATOR ON A PARAMETER WITH NO VALUE GIVES NOTHING, and its
+         * words are never expanded nor its spelling checked: bash's
+         * parameter_brace_substring/patsub/casemod/transform/remove_pattern
+         * all return before they look at them.
+         *
+         *     unset u; echo "${u/x/$(date >&2)}" "${u:$(date >&2)}"
+         *     echo "${u#${a[]}}" "${u@Z}"         bash: nothing at all
+         *
+         * tsh expanded the words first, so a substitution in them ran and
+         * a bad one ended the line. ${u@a} and ${u@A} still describe a
+         * declared, unset u. The tests (- = ? +) are another matter. */
+        if (!at_or_star && shell_dynvar_index(name, strlen(name)) < 0) {
+            char o = op[0], o1 = op[1];
+            bool valued = o == '/' || o == '#' || o == '%' || o == '^' ||
+                          o == ',' || (o == '@' && o1 != 'a' && o1 != 'A') ||
+                          (o == ':' && o1 != '-' && o1 != '=' && o1 != '?' &&
+                           o1 != '+');
+            if (valued) {
+                SH_SB(probe);
+                bool pset = false, pjoin = false;
+                if (shell_parameter_value(name, &probe, &pset, &pjoin) < 0)
+                    return -1;
+                if (!pset) return 0;
+            }
+        }
         /* ${v@op} -- a ONE-LETTER TRANSFORM of the value, and the only
          * operator here that is a single character with nothing after it. */
         if (op[0] == '@' && op[1] && op[2] == '\0')
@@ -25981,8 +26092,12 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     bool saved_assign_src = g_tok_word_assign_src;
     bool saved_expanded = g_tok_word_expanded;
     const char *saved_fdvar = g_tok_fdvar;
+    const char *saved_bsub = g_bsub_unit;     /* points into this read */
+    int saved_bsub_kind = g_bsub_unit_kind;
     g_tokpfx_base = g_tokpfx_n;
     int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
+    g_bsub_unit = saved_bsub;
+    g_bsub_unit_kind = saved_bsub_kind;
     g_tokpfx_n = saved_tokpfx;
     g_tokpfx_base = saved_base;
     g_tok_word_assign_src = saved_assign_src;
@@ -26053,6 +26168,7 @@ static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
     *pp = q + 1;
     return 0;
 }
+static size_t shell_assign_prefix_len(const char *w);
 static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
     int ntok = 0;
@@ -26257,6 +26373,13 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         }
         bool word_quoted = false;
         const char *raw_word_start = p;      /* shell_token.raw */
+        /* an ASSIGNMENT's value is expanded on its own, and is what a bad
+         * substitution in it names (`x=${a[]}` names `${a[]}`); a
+         * declaration utility's operand is a word like any other */
+        const char *bsub_word = p;
+        if (prefix_ok) bsub_word += shell_assign_prefix_len(p);
+        g_bsub_unit = bsub_word;
+        g_bsub_unit_kind = SH_BSUB_WORD;
         g_tok_word_expanded = false;
         /* Look at the RAW text: a leading `name=` makes this an assignment
          * word. After expansion the same shape can arrive from a variable's
@@ -26544,6 +26667,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 word_quoted = true;
                 p++;
                 g_dq_depth++;
+                g_bsub_unit = p;
+                g_bsub_unit_kind = SH_BSUB_DQ;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 size_t dq_start = wb.len;
                 while (*p && *p != '"') {
@@ -26587,6 +26712,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                     }
                 }
                 g_dq_depth--;
+                g_bsub_unit = bsub_word;
+                g_bsub_unit_kind = SH_BSUB_WORD;
                 if (shell_escape_glob_range(&wb,dq_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
