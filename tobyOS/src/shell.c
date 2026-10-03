@@ -1297,8 +1297,8 @@ static bool  sh_subscript_eval(const char *sub, const char *name,
  * shell_arith_eval for how the shell's variables reach it. */
 #include "shell_arith.inc"
 static const char *sh_split_subscript(const char *key, size_t klen,
-                                      char *name, size_t namecap,
-                                      char *sub, size_t subcap);
+                                      struct shell_sb *name,
+                                      struct shell_sb *sub);
 
 static bool shell_name_is_valid(const char *s, size_t n);
 /* The WORD rule for a FUNCTION name -- not shell_name_is_valid, which is
@@ -2061,12 +2061,12 @@ static int  g_tokpfx_base;
  * "not really a reference" -- the read handed back the literal text `a[2]`
  * and the write dropped the attribute. Splits the target when it is one,
  * so the two callers can tell the two cases apart. */
-static bool shell_nameref_element(const char *target, char *name, size_t ncap,
-                                  char *sub, size_t scap) {
+static bool shell_nameref_element(const char *target, struct shell_sb *name,
+                                  struct shell_sb *sub) {
     if (!target || !*target) return false;
-    if (!sh_split_subscript(target, strlen(target), name, ncap, sub, scap))
+    if (!sh_split_subscript(target, strlen(target), name, sub))
         return false;
-    return shell_name_is_valid(name, strlen(name));
+    return shell_name_is_valid(name->p, name->len);
 }
 
 /* ---- bash's dynamic variables (S13, 2026-10-01) ---------------------------
@@ -2219,6 +2219,7 @@ static void shell_dynvar_assign(int dv, const char *val) {
 }
 
 static void shell_optvars_refresh(void);
+static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
@@ -2268,11 +2269,17 @@ static const char *env_get(const char *key) {
          * `1` and `#` cannot name a variable, so bash leaves the value
          * alone rather than resolving to nothing. */
         {
-            char enm[128], esub[128];
-            if (shell_nameref_element(target, enm, sizeof enm,
-                                      esub, sizeof esub)) {
+            SH_SB(enmb);
+            SH_SB(esubb);
+            if (shell_nameref_element(target, &enmb, &esubb)) {
+                const char *enm = enmb.p, *esub = esubb.p;
                 if (sh_array_is_assoc(enm)) {
-                    const char *v = sh_array_get_key(enm, esub);
+                    /* the key is a WORD, expanded each time the reference
+                     * is used: `declare -n r='A["K"]'` reads A[K], and
+                     * r='A[$key]' follows $key (bash; Oils 0208) */
+                    SH_SB(kx);
+                    const char *k = sh_ar_assoc_key(esub, &kx);
+                    const char *v = sh_array_get_key(enm, k ? k : esub);
                     return v ? v : "";
                 }
                 long ix = 0;
@@ -2314,6 +2321,20 @@ static const char *env_get(const char *key) {
         return sh_array_is_assoc(nm) ? sh_array_get_key(nm, "0")
                                      : sh_array_get(nm, 0);
     }
+    /* AN ARRAY'S NAME IS ITS ELEMENT 0 even when the table still holds an
+     * entry for it: `declare -A a; a=([0]=zzz); echo $a` is zzz (Oils
+     * 0187) -- the declaration left `a=` here, and that empty value
+     * shadowed the element. */
+    if (g_env_flags[idx] & SHVAR_ARRAY) {
+        char nm[128];
+        if (klen + 1 <= sizeof nm) {
+            memcpy(nm, g_env[idx], klen);
+            nm[klen] = '\0';
+            if (sh_array_find(nm))
+                return sh_array_is_assoc(nm) ? sh_array_get_key(nm, "0")
+                                             : sh_array_get(nm, 0);
+        }
+    }
     return g_env[idx] + klen + 1;
 }
 
@@ -2341,9 +2362,9 @@ static const char *env_deref_name_ex(const char *key, char *buf, size_t cap,
             /* An ELEMENT target ends the walk and is handed back whole:
              * the caller rebuilds `a[2]=value`, which the array
              * assignment path already understands. */
-            char enm[128], esub[128];
-            if (shell_nameref_element(target, enm, sizeof enm,
-                                      esub, sizeof esub)) {
+            SH_SB(enmb);
+            SH_SB(esubb);
+            if (shell_nameref_element(target, &enmb, &esubb)) {
                 size_t tl = strlen(target);
                 if (tl + 1 > cap) break;
                 memcpy(buf, target, tl + 1);
@@ -2392,19 +2413,25 @@ static void env_remove_at(int idx) {
 static const char *env_deref_name(const char *key, char *buf, size_t cap);
 
 /* Split "name[sub]" / "name" out of an assignment word's key part.
- * Returns the subscript text (into `sub`) or NULL when there is none. */
+ * Returns the subscript text (sub->p) or NULL when there is none.
+ *
+ * Any length: name and subscript were 128-byte arrays, so an associative
+ * key of 127 bytes or more was no subscript at all and `A[$long]=v` fell
+ * through to the scalar path (bash's keys are unlimited). */
 static const char *sh_split_subscript(const char *key, size_t klen,
-                                      char *name, size_t namecap,
-                                      char *sub, size_t subcap) {
+                                      struct shell_sb *name,
+                                      struct shell_sb *sub) {
     const char *lb = 0;
     for (size_t i = 0; i < klen; i++) if (key[i] == '[') { lb = key + i; break; }
     if (!lb || key[klen - 1] != ']') return 0;
     size_t nlen = (size_t)(lb - key);
-    size_t slen = klen - nlen - 2;               /* strip '[' and ']' */
-    if (nlen == 0 || nlen + 1 > namecap || slen + 1 > subcap) return 0;
-    memcpy(name, key, nlen); name[nlen] = '\0';
-    memcpy(sub, lb + 1, slen); sub[slen] = '\0';
-    return sub;
+    if (nlen == 0) return 0;
+    sb_truncate(name, 0);
+    sb_truncate(sub, 0);
+    if (sb_putmem(name, key, nlen) < 0 ||
+        sb_putmem(sub, lb + 1, klen - nlen - 2) < 0)      /* strip [ and ] */
+        return 0;
+    return sub->p;
 }
 
 /* Parse "( a b 'c d' )" into elements. Reuses the shell's own field splitter
@@ -2985,15 +3012,32 @@ struct shell_simple;
 static const struct shell_simple *g_assign_cmd;   /* the command running */
 static bool shell_kv_scalar_paren(const char *kv, const char *val);
 
+/* Set for ONE assignment whose text was never expanded -- a write through
+ * a nameref, `printf -v`, `read`: an associative subscript there is a WORD
+ * expanded at the assignment, as bash's assign_array_element expands it
+ * (`printf -v 'A[$k]'`, `declare -n r='A["K"]'; r=v`; Oils 0208 0210). An
+ * assignment WORD arrives with its subscript already expanded and must not
+ * be expanded twice. */
+static bool g_assign_expand_sub;
+
 static int sh_try_array_assignment(const char *kv) {
     size_t klen = env_key_len(kv);
     if (klen == 0) return 0;
     const char *val = kv + klen + 1;
     bool append = (klen > 0 && kv[klen - 1] == '+');
     size_t keylen = append ? klen - 1 : klen;
+    bool expand_sub = g_assign_expand_sub;
+    g_assign_expand_sub = false;
 
-    char name[128], sub[128];
-    if (sh_split_subscript(kv, keylen, name, sizeof name, sub, sizeof sub)) {
+    SH_SB(nameb);
+    SH_SB(subb);
+    if (sh_split_subscript(kv, keylen, &nameb, &subb)) {
+        const char *name = nameb.p, *sub = subb.p;
+        SH_SB(subx);
+        if (expand_sub && sh_array_is_assoc(name)) {
+            const char *k = sh_ar_assoc_key(sub, &subx);
+            if (k) sub = k;
+        }
         if (!shell_name_is_valid(name, strlen(name))) return 0;
         /* A READONLY ARRAY'S ELEMENTS ARE READONLY TOO (S4): `r[0]=9`,
          * `r[1]+=x`, `m[k]=w`. They all went through. */
@@ -3273,7 +3317,10 @@ static int env_set_kv(const char *kv_in) {
                 if (sb_puts(&rebuilt, real) < 0 || sb_putc(&rebuilt, '=') < 0 ||
                     sb_puts(&rebuilt, kv_in + klen + 1) < 0)
                     return -1;
-                return env_set_kv(rebuilt.p);
+                g_assign_expand_sub = true;     /* r='A[$k]': expanded now */
+                int nrc = env_set_kv(rebuilt.p);
+                g_assign_expand_sub = false;
+                return nrc;
             }
         }
     }
@@ -3384,6 +3431,20 @@ static int env_set(const char *key, const char *val) {
     int rc = env_set_kv(tmp);
     g_env_value_scalar = was_scalar;
     if (tmp != small) kfree(tmp);
+    return rc;
+}
+
+/* Assign VAL to NAME the way `read`, `printf -v` and the like do: NAME may
+ * be an ELEMENT, `a[i]` or `A[key]`, whose subscript is expanded now (bash's
+ * valid_array_reference + assign_array_element). -2: not a name. */
+static int shell_set_named(const char *name, const char *val) {
+    size_t nl = strlen(name), b = 0;
+    while (name[b] && name[b] != '[') b++;
+    bool elem = name[b] == '[' && nl > b + 1 && name[nl - 1] == ']';
+    if (!shell_name_is_valid(name, elem ? b : nl)) return -2;
+    if (elem) g_assign_expand_sub = true;
+    int rc = env_set(name, val);
+    g_assign_expand_sub = false;
     return rc;
 }
 
@@ -5325,15 +5386,24 @@ static void shell_arith_unbound(const char *name) {
 /* AN ASSOCIATIVE KEY IN ARITHMETIC IS A WORD: expanded, quotes removed --
  * `(( x = A['x'] ))` reads key x, not 'x' (bash's expand of the subscript;
  * Oils 1489 1492). The text is copied out because it is expanded in place
- * of nothing the caller owns. */
+ * of nothing the caller owns.
+ *
+ * PLAIN TEXT: the expander marks an escaped byte (`\\` is SHELL_DATA_ESC
+ * and `\`), and those pairs reached the key -- `printf -v 'A[a\ b]'` set
+ * a key with a 0x04 byte in it. bash's expand_subscript_string dequotes. */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
 static int shell_argmarks_to_spaces(const char *s, struct shell_sb *out);
+static void shell_strip_glob_escapes(char *s);
+static void shell_report_error_errexit(void);
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx) {
     SH_SB(kraw);
     if (shell_expand_word_ex(sub, &kraw, true, true) < 0) return 0;
     if (shell_argmarks_to_spaces(kraw.p ? kraw.p : "", kx) < 0) return 0;
-    return kx->p ? kx->p : "";
+    if (!kx->p) return "";
+    shell_strip_glob_escapes(kx->p);
+    kx->len = strlen(kx->p);
+    return kx->p;
 }
 
 static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
@@ -5351,6 +5421,16 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
     }
     *set = arr || sv;
     const char *v = 0;
+    /* AN EMPTY SUBSCRIPT IS bash's "bad array subscript", said twice (its
+     * reference is checked once to find the variable and once to read
+     * it), and reads as nothing: the expression goes on -- `$(( a[] + 5 ))`
+     * is 5, status 0 -- unless set -e, which the report ends. tsh failed
+     * the whole expansion without a word. */
+    if (sub && !*sub) {
+        for (int t = 0; t < 2; t++) kprintf("%s[]: bad array subscript\n", name);
+        shell_report_error_errexit();
+        return SARITH_CB_OK;
+    }
     if (!sub) {
         if (arr) v = arr->assoc ? sh_array_get_key(name, "0") : sh_array_get(name, 0);
         else v = sv;
@@ -5390,8 +5470,16 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
 
 static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
                      const char *val) {
-    (void)ctx;
     struct sh_array *arr = sh_array_find(name);
+    /* ...and assigning to one is bash's "`a[]': not a valid identifier"
+     * (bind_int_variable), from the command the arithmetic belongs to --
+     * `((`, `let`, none for $(( )) -- and nothing is assigned. */
+    if (sub && !*sub) {
+        const char *cmd = (const char *)ctx;
+        kprintf("%s%s`%s[]': not a valid identifier\n",
+                cmd ? cmd : "", cmd ? ": " : "", name);
+        return SARITH_CB_OK;
+    }
     if (!sub) {
         int rc;
         if (arr) rc = arr->assoc ? sh_array_set_key(name, "0", val)
@@ -5436,7 +5524,7 @@ static int shell_arith_eval(const char *expr, const char *cmdname, long *out) {
     env.get = sh_ar_get;
     env.set = sh_ar_set;
     env.stack_ok = sh_ar_stack_ok;
-    env.ctx = 0;
+    env.ctx = (void *)cmdname;          /* sh_ar_set's messages name it */
     env.nounset = g_opt_nounset;
     char *msg = 0;
     long v = 0;
@@ -7761,9 +7849,10 @@ static void cmd_unset(int argc, char **argv) {
          * path so a name that is an array is not left behind in g_env. */
         {
             size_t al = strlen(argv[i]);
-            char nm[128], sub[128];
-            if (sh_split_subscript(argv[i], al, nm, sizeof nm,
-                                   sub, sizeof sub)) {
+            SH_SB(nmb);
+            SH_SB(subb);
+            if (sh_split_subscript(argv[i], al, &nmb, &subb)) {
+                const char *nm = nmb.p, *sub = subb.p;
                 struct sh_array *arr = sh_array_find(nm);
                 /* `unset a[@]` and `unset a[*]` empty an INDEXED array --
                  * every element, the array itself kept. tsh fell through
@@ -8597,15 +8686,25 @@ static int shell_read_line_from_file(struct file *in, bool raw,
     return hit_eof ? 1 : 0;
 }
 
+/* One of read's names gets VAL. An element (`a[1]`, `A[$k]`) is a name to
+ * bash too; anything else is bash's "not a valid identifier". 0 or 1. */
+static int shell_read_set(const char *name, const char *val) {
+    int r = shell_set_named(name, val);
+    if (r == -2) {
+        kprintf("read: `%s': not a valid identifier\n", name);
+        return 1;
+    }
+    if (r < 0) {
+        kprintf("read: failed to set '%s'\n", name);
+        return 1;
+    }
+    return 0;
+}
+
 static int shell_read_assign_empty(int argc, char **argv, int first) {
     int rc = 0;
-    for (int i = first; i < argc; i++) {
-        if (!shell_name_is_valid(argv[i], strlen(argv[i])) ||
-            env_set(argv[i], "") < 0) {
-            kprintf("read: failed to set '%s'\n", argv[i]);
-            rc = 1;
-        }
-    }
+    for (int i = first; i < argc; i++)
+        if (shell_read_set(argv[i], "") != 0) rc = 1;
     return rc;
 }
 
@@ -8615,11 +8714,7 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
     if (!ifs) ifs = " \t\n";
 
     if (ifs[0] == '\0') {
-        if (!shell_name_is_valid(argv[first], strlen(argv[first])) ||
-            env_set(argv[first], line) < 0) {
-            kprintf("read: failed to set '%s'\n", argv[first]);
-            return 1;
-        }
+        if (shell_read_set(argv[first], line) != 0) return 1;
         return shell_read_assign_empty(argc, argv, first + 1);
     }
 
@@ -8684,11 +8779,7 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
             }
         }
 
-        if (!shell_name_is_valid(argv[i], strlen(argv[i])) ||
-            env_set(argv[i], val) < 0) {
-            kprintf("read: failed to set '%s'\n", argv[i]);
-            rc = 1;
-        }
+        if (shell_read_set(argv[i], val) != 0) rc = 1;
     }
 #undef SH_RD_IFS
 #undef SH_RD_IFS_WS
@@ -16188,15 +16279,21 @@ static int test_unary(const char *op, const char *operand) {
      * element. A bare NAME on an array means element 0, which is why
      * `a=(); [[ -v a ]]` is false in bash while `a=(1)` is true. */
     if (strcmp(op, "-v") == 0) {
-        char nm[128], sub[128];
-        if (sh_split_subscript(operand, strlen(operand), nm, sizeof nm,
-                               sub, sizeof sub)) {
+        SH_SB(nmb);
+        SH_SB(subb);
+        if (sh_split_subscript(operand, strlen(operand), &nmb, &subb)) {
+            const char *nm = nmb.p, *sub = subb.p;
             if (sub[0] && !sub[1] && (sub[0] == '@' || sub[0] == '*')) {
                 struct sh_array *ar = sh_array_find(nm);
                 return (ar && ar->n > 0) ? 0 : 1;
             }
-            if (sh_array_is_assoc(nm))
-                return sh_array_get_key(nm, sub) ? 0 : 1;
+            if (sh_array_is_assoc(nm)) {
+                /* the key is a word, expanded now: test -v 'A[$k]' asks
+                 * about A's key $k (bash; Oils 0214) */
+                SH_SB(kx);
+                const char *k = sh_ar_assoc_key(sub, &kx);
+                return sh_array_get_key(nm, k ? k : sub) ? 0 : 1;
+            }
             long ix = 0;
             if (!sh_subscript_eval(sub, nm, false, &ix)) return 1;
             return sh_array_get(nm, ix) ? 0 : 1;
@@ -17447,7 +17544,8 @@ static void cmd_printf(int argc, char **argv) {
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
             return;
         }
-        if (cap.failed || env_set(vname, cap.sb.p) < 0) shell_set_status(1);
+        /* an element's subscript is expanded now: 'a[$k]' (Oils 0210) */
+        if (cap.failed || shell_set_named(vname, cap.sb.p) < 0) shell_set_status(1);
     }
 }
 
@@ -21708,9 +21806,16 @@ static int shell_append_array_slice(struct shell_sb *b,
             for (int i = 0; i < n; i++)
                 if (a->e[i].idx >= off) { first = i; break; }
         off = first;
-    } else if (off < 0) {
-        off = n + off;
-        if (off < 0) off = 0;
+    } else {
+        /* AN ASSOCIATIVE ARRAY COUNTS FROM 1, as bash's assoc_subrange
+         * does: offsets 0 and 1 both start at its first element, k at
+         * element k-1, a negative one counts back from n+1, and one past
+         * n+1 is nothing (verify_substring_values). With five elements
+         * ${S[@]:2} starts at the second and ${S[@]: -1} is the last; tsh
+         * started at element `off` and gave nothing for -1 (Oils 0198). */
+        long len = n + (off < 0);
+        if (off < 0) off += len;
+        off = (off > len || off < 0) ? n : (off > 0 ? off - 1 : 0);
     }
     long end = (cnt < 0) ? n : off + cnt;
     if (end > n) end = n;
@@ -23412,6 +23517,10 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
                 }
                 size_t slen = rb ? (size_t)(rb - rest - 1) : 0;
+                if (rb && slen == 0) {          /* ${!a[]}: see below */
+                    shell_bad_subst(false);
+                    return -1;
+                }
                 /* `${!a[@]OP}` -- an OPERATOR after the `[@]` -- is not the
                  * keys: it is an indirection through a's values joined by
                  * blanks (bash; Oils 2563 2587-2589). One element names one
@@ -23571,8 +23680,11 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     size_t slen = (size_t)(rb - lb - 1);
                     const char *suffix = rb + 1;   /* "", ":1:2", "#pat", ... */
                     /* ONE SUBSCRIPT: `${a[0][0]}` is bash's bad
-                     * substitution (Oils 0330); tsh read a[0]. */
-                    if (*suffix == '[') {
+                     * substitution (Oils 0330); tsh read a[0]. And a
+                     * subscript that is THERE: `${a[]}`, `${#a[]}`,
+                     * `${a[]:-x}` are bad substitutions too (no valid
+                     * array reference); tsh dropped the line silently. */
+                    if (*suffix == '[' || slen == 0) {
                         shell_bad_subst(false);
                         return -1;
                     }
@@ -23596,7 +23708,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         for (char *q = spec.p; *q; q++) if (*q == ':') { colon = q; break; }
                         if (colon) *colon = '\0';
                         long off = 0, cnt = -1;
-                        if (!sh_subscript_eval(spec.p, nm, false, &off)) off = 0;
+                        if (sh_array_is_assoc(nm)) {
+                            /* no subscripts to count back from: the number
+                             * as it is (shell_append_array_slice) */
+                            if (sh_subscript_value(spec.p, &off) != SARITH_OK)
+                                off = 0;
+                        } else if (!sh_subscript_eval(spec.p, nm, false, &off)) {
+                            off = 0;
+                        }
                         if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
                             cnt = -1;
                         /* An EMPTY length is 0, not "the rest": bash's
@@ -24444,16 +24563,119 @@ static bool shell_arith_dequote(char *expr) {
     return !squote;
 }
 
+/* The length of the `$(`, `${` or `$[` span at p, to its balanced close
+ * (quotes and escapes honoured), or of what there is. */
+static size_t sh_arith_dollar_span(const char *p) {
+    char open = p[1];
+    char close = open == '(' ? ')' : open == '{' ? '}' : ']';
+    size_t i = 2;
+    int d = 1;
+    while (p[i] && d) {
+        if (p[i] == '\\' && p[i + 1]) { i += 2; continue; }
+        if (p[i] == '\'') {
+            i++;
+            while (p[i] && p[i] != '\'') i++;
+            if (p[i]) i++;
+            continue;
+        }
+        if (p[i] == '"') {
+            i++;
+            while (p[i] && p[i] != '"') { if (p[i] == '\\' && p[i + 1]) i++; i++; }
+            if (p[i]) i++;
+            continue;
+        }
+        if (p[i] == open) d++;
+        else if (p[i] == close) d--;
+        i++;
+    }
+    return i;
+}
+
+/* THE TEXT OF AN ARITHMETIC EXPRESSION, EXPANDED FOR THE EVALUATOR -- and
+ * each subscript in it on its own, as bash 5.2 does (expand_array_subscript):
+ *
+ *     k='\'  ; (( B["$k"] = 42 ))     bash: key \       tsh: bad subscript
+ *     v='$x' ; (( B[$v] = 1 ))        bash: key $x      tsh: key ''
+ *     i='$(echo hi)'; (( a[$i] ))     bash: an error -- the text is not run
+ *
+ * The text between `[` and its `]` is a WORD, its quotes (single ones too)
+ * syntax, and what it expands to has [ ] $ ` ~ \ ' " and a leading #
+ * backslash-quoted, because the evaluator expands a subscript once more
+ * when it uses it. tsh expanded the whole text in one pass, so a key's
+ * backslash or $ reached the evaluator bare and was read again (Oils 0211).
+ * Everything else is as it was: double quotes off (shell_arith_dequote),
+ * then $ and ` expanded. EXPR is not changed -- a for head's expressions
+ * come back every iteration.
+ *
+ * ONLY AN EXPRESSION THAT EXPANDS AT ALL: bash's expand_arith_string runs
+ * the word expander only when the text has a $, ` or ~ in it, and hands
+ * anything else over with its quotes removed -- so in $(( a[a[0]/10] ))
+ * the inner brackets are not quoted, and the evaluator reads a[0]. */
+static int shell_arith_expand(const char *expr, struct shell_sb *out) {
+    sb_truncate(out, 0);
+    SH_SB(seg);
+    SH_SB(xs);
+    const char *p = expr;
+    bool expands = false;
+    for (const char *q = expr; *q && !expands; q++)
+        expands = *q == '$' || *q == '`' || *q == '~';
+    for (;;) {
+        bool sub = false;
+        size_t k = 0;
+        if (*p == '[' && expands) {
+            k = sa_skip_subscript(p);
+            sub = p[k] == ']' && k > 1;
+        }
+        if (!*p || sub) {
+            if (seg.len) {
+                (void)shell_arith_dequote(seg.p);
+                seg.len = strlen(seg.p);
+                if (shell_expand_literal_quotes(seg.p, &xs) != 0) return -1;
+                if (sb_puts(out, xs.p) < 0) return -1;
+                sb_truncate(&seg, 0);
+            }
+            if (!*p) return 0;
+            SH_SB(w);
+            SH_SB(kx);
+            if (sb_putmem(&w, p + 1, k - 1) < 0) return -1;
+            const char *t = sh_ar_assoc_key(w.p, &kx);
+            if (!t) return -1;
+            if (sb_putc(out, '[') < 0) return -1;
+            for (const char *q = t; *q; q++) {
+                char c = *q;
+                bool quote = c == '[' || c == ']' || c == '$' || c == '`' ||
+                             c == '~' || c == '\\' || c == '\'' || c == '"' ||
+                             (c == '#' && q == t);
+                if ((quote && sb_putc(out, '\\') < 0) || sb_putc(out, c) < 0)
+                    return -1;
+            }
+            if (sb_putc(out, ']') < 0) return -1;
+            p += k + 1;
+            continue;
+        }
+        size_t n = 1;
+        if (*p == '\\' && p[1]) {
+            n = 2;
+        } else if (*p == '`') {
+            while (p[n] && p[n] != '`') n += (p[n] == '\\' && p[n + 1]) ? 2 : 1;
+            if (p[n]) n++;
+        } else if (*p == '$' && (p[1] == '(' || p[1] == '{' || p[1] == '[')) {
+            n = sh_arith_dollar_span(p);
+        }
+        if (sb_putmem(&seg, p, n) < 0) return -1;
+        p += n;
+    }
+}
+
 /* The text of a `$(( ))` or `$[ ]`, evaluated into B. */
 static int shell_arith_subst_eval(char *expr, struct shell_sb *b) {
-    (void)shell_arith_dequote(expr);
     /* Expand the expression text before evaluating it. The evaluator
      * resolves bare names itself, but knows nothing about `$( )` or `${ }`,
      * so `$(( $(echo 4) + 1 ))` reached it as literal text and died as "bad
      * arithmetic expansion". Expanding first also makes `$(($x + 1))` and
      * `${#a}` work inside arithmetic for free. */
     SH_SB(xexpr);
-    if (shell_expand_literal_quotes(expr, &xexpr) == 0) expr = xexpr.p;
+    if (shell_arith_expand(expr, &xexpr) == 0) expr = xexpr.p;
     long v = 0;
     int k = shell_arith_eval(expr, 0, &v);   /* bash's words */
     if (k != SARITH_OK) {
@@ -28402,14 +28624,15 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * the word became `var=[x`, `y`, `z]` -- a prefix assignment followed by
      * the command `y`. Decide before shell_add_marked_words runs, because
      * that is what turns the markers into separate arguments. */
+    /* An ELEMENT is assigned the same way -- `d[k]="$@"`, `A["$@"]=v`
+     * (bash: one value, one key "1 2 3"; Oils 0195 0196) -- and the word's
+     * shape is read from all of it: the first 80 bytes, and a NAME= only,
+     * were what tsh looked at. */
     {
-        char sh0[80];
-        size_t so = 0;
-        for (const char *q = word; *q && so + 1 < sizeof sh0; q++)
-            if (*q != SHELL_NOSPLIT_MARK) sh0[so++] = *q;
-        sh0[so] = '\0';
-        size_t k0 = env_key_len(sh0);
-        bool assign0 = (sh0[k0] == '=' && shell_name_is_valid(sh0, k0));
+        SH_SB(sh0);
+        for (const char *q = word; *q; q++)
+            if (*q != SHELL_NOSPLIT_MARK && sb_putc(&sh0, *q) < 0) return -1;
+        bool assign0 = shell_assign_prefix_len(sh0.p) > 0;
         bool nosplit_ctx = assign0 && shell_assign_ctx(cur, assign_src);
         if (nosplit_ctx && shell_word_has_argmark(word)) {
             SH_SB(joined);
@@ -28905,9 +29128,10 @@ static bool shell_is_assignment_word(const char *s) {
      * this the whole word is taken for a COMMAND and the line dies with
      * "not found" -- which is what tsh did before arrays existed. */
     {
-        char nm[128], sub[128];
-        if (sh_split_subscript(s, nlen, nm, sizeof nm, sub, sizeof sub))
-            return shell_name_is_valid(nm, strlen(nm));
+        SH_SB(nm);
+        SH_SB(sub);
+        if (sh_split_subscript(s, nlen, &nm, &sub))
+            return shell_name_is_valid(nm.p, nm.len);
     }
     return false;
 }
@@ -32668,9 +32892,8 @@ static bool shell_try_arith_command(const char *src) {
     /* The expression is expanded first, exactly as `$(( ))` is: the evaluator
      * resolves bare names itself but knows nothing about `$( )` or `${ }`.
      * Its double quotes come off as there. */
-    (void)shell_arith_dequote(expr.p);
     SH_SB(xexpr);
-    if (shell_expand_literal_quotes(expr.p, &xexpr) != 0) {
+    if (shell_arith_expand(expr.p, &xexpr) != 0) {
         shell_set_status(1);
         return true;
     }
@@ -33113,10 +33336,8 @@ done:
 static bool shell_arith_for_eval(char *expr, long *out) {
     while (*expr == ' ' || *expr == '\t') expr++;
     if (!*expr) { *out = 1; return true; }
-    (void)shell_arith_dequote(expr);
-    if (!*expr) { *out = 1; return true; }
     SH_SB(xexpr);
-    if (shell_expand_literal_quotes(expr, &xexpr) != 0) return false;
+    if (shell_arith_expand(expr, &xexpr) != 0) return false;
     /* bash names the command "((" here too */
     return shell_arith_eval(xexpr.p, "((", out) == SARITH_OK;
 }
