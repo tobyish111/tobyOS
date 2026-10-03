@@ -14237,8 +14237,13 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 st->no_sep = false;
                 return;
             }
-            /* Unbalanced on this line: fall through and let the reader pull
-             * more input, exactly as an unclosed `(( ))` does. */
+            /* UNBALANCED ON THIS LINE: the substitution goes on on the next
+             * one. It was falling through to the redirection below, whose
+             * `(` the reader did not count as open, so `cat <(true` was run
+             * alone ("unterminated process substitution", and `)` on the
+             * next line "command not found"; logs/b12 p108). It is a word
+             * that opens a command nesting, as `$(` does. */
+            goto procsub_word;
         }
         while (*p == '<' || *p == '>' || *p == '&' || *p == '-') p++;
         st->redir = true; st->prev_word_cmd = false;
@@ -14511,6 +14516,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * (whose contents are commands) and " " inside arithmetic or `${ }`
      * (whose contents are one expression). Joining arithmetic with a
      * semicolon produces `$((1; + 2))`, which is not the same sum. */
+procsub_word:;
     const char *w = p;
     bool sq = st->in_sq, dq = st->in_dq;
     bool sq_ansi = st->in_sq_ansi;
@@ -14625,6 +14631,18 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 else if (*q == ']' && --bd == 0) break;
             }
             if (*q == ']') { p = q + 1; continue; }
+        }
+        if ((d == '<' || d == '>') && p == w && p[1] == '(' && nest == 0 &&
+            !sq && !dq) {
+            /* `<(` or `>(` left open by its line -- see procsub_word */
+            if (nest < (int)sizeof st->nest_kind) {
+                st->nest_kind[nest] = 'c';
+                st->nest_sq[nest] = sq;
+                st->nest_dq[nest] = dq;
+            }
+            nest++;
+            p += 2;
+            continue;
         }
         if (d == '$' && (p[1] == '(' || p[1] == '{')) {
             /* A SUBSTITUTION HAS ITS OWN QUOTE STATE.
@@ -27060,7 +27078,18 @@ static bool shell_procsub_make(const char *text, bool input,
         g_capture_depth = 0;
         g_in_pipeline_stage = true;
         g_procsub_n = 0;              /* the parent's table is not ours */
-        execute_line_text(copy);
+        /* TEXT THAT SPANS LINES IS A SCRIPT, as a $( )'s is (see
+         * shell_capture_body): `cat <(echo one<newline>echo two)` ran as one
+         * line and printed "one echo two" (logs/b12 fixture 254). */
+        bool ps_lines = false;
+        for (const char *q = copy; *q; q++)
+            if (*q == '\n') { ps_lines = true; break; }
+        if (ps_lines) {
+            g_reader_comsub_lines = true;
+            (void)shell_run_script_text(copy, false);
+        } else {
+            execute_line_text(copy);
+        }
         _exit(g_last_status & 0xff);
     }
     kfree(copy);
