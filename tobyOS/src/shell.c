@@ -38841,6 +38841,26 @@ static int shell_syntax_check(const char *s) {
  *
  * A compound command, a function definition and `!`/`time` keep the line
  * they start on -- bash records those its own way. 0 when unmapped. */
+/* `NAME=`, `NAME+=` or `NAME[...]=` at P, as written. */
+static bool shell_text_assign_word(const char *p, const char *end) {
+    if (p >= end || !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                      *p == '_'))
+        return false;
+    const char *q = p + 1;
+    while (q < end && ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                       (*q >= '0' && *q <= '9') || *q == '_'))
+        q++;
+    if (q < end && *q == '[') {
+        int d = 0;
+        for (; q < end; q++) {
+            if (*q == '[') d++;
+            else if (*q == ']' && --d == 0) { q++; break; }
+        }
+    }
+    if (q < end && *q == '+') q++;
+    return q < end && *q == '=';
+}
+
 static unsigned long shell_simple_cmd_lineno(const char *src) {
     const char *p = shell_skip_blanks(src ? src : "");
     if (!*p) return 0;
@@ -38856,6 +38876,14 @@ static unsigned long shell_simple_cmd_lineno(const char *src) {
     const char *q = p;
     shell_scan_token(&st, &q);
     if (q <= p) return shell_lineno_at(p);
+    /* AN ASSIGNMENT FIRST WORD TAKES NO LOOKAHEAD: there is no `name ()` to
+     * tell it from, so bash's parser reduces it at once and the line is the
+     * one it ends on -- `x=1 y=$(echo a<newline>echo b) z=$LINENO` is 1, and
+     * tsh read the next word too and said 2 (logs/b12 p107 p108, WSL bash). */
+    if (shell_text_assign_word(p, q)) {
+        unsigned long ln = shell_lineno_at(q - 1);
+        return ln ? ln : shell_lineno_at(p);
+    }
     const char *last = q - 1;
     const char *r = q;
     while (*r == ' ' || *r == '\t') r++;
