@@ -6559,11 +6559,18 @@ struct shell_shopt {
 static bool g_shopt_nullglob, g_shopt_failglob, g_shopt_dotglob;
 static bool g_shopt_extglob, g_shopt_globstar, g_shopt_nocaseglob;
 static bool g_shopt_xpg_echo, g_shopt_lastpipe, g_shopt_huponexit;
-static bool g_shopt_checkwinsize, g_shopt_shift_verbose, g_shopt_execfail;
-static bool g_shopt_histappend, g_shopt_cmdhist, g_shopt_progcomp;
+static bool g_shopt_shift_verbose, g_shopt_execfail, g_shopt_histappend;
 /* bash has these ON by default. */
-/* Backing store for the accepted-but-unwired option names above. */
-static bool g_shopt_misc[40];
+static bool g_shopt_checkwinsize = true, g_shopt_cmdhist = true;
+static bool g_shopt_progcomp = true;
+/* Backing store for the options without a variable of their own. bash
+ * starts complete_fullquote (35), extquote (11), force_fignore (12),
+ * globasciiranges (13), globskipdots (37), hostcomplete (17) and
+ * patsub_replacement (33) on. */
+static bool g_shopt_misc[64] = {
+    [11] = true, [12] = true, [13] = true, [17] = true, [33] = true,
+    [35] = true, [37] = true,
+};
 /* WIRED: with `set -e` on, a command substitution inherits errexit and stops
  * at its first failure. `echo $(echo one; false; echo two)` prints `one`
  * with it and `one two` without. Off by default, as in bash. */
@@ -6572,68 +6579,74 @@ static bool g_shopt_interactive_comments = true;
 static bool g_shopt_sourcepath = true;
 static bool g_shopt_promptvars = true;
 
+/* BASH'S 57 OPTIONS, IN BASH'S ORDER, WITH BASH'S DEFAULTS (shopt.def's
+ * shopt_vars; measured on the guest, logs/b12/shopt-guest.bash). The table
+ * had 57 rows that were not bash's: nullglob, shift_verbose and xpg_echo
+ * twice, Oils' strict_errexit and command_sub_errexit, tsh's own order --
+ * so `shopt` printed nullglob twice and `compgen -A shopt` listed it twice
+ * (Oils 0769 2222 2234 2243) -- and checkwinsize, cmdhist, extquote,
+ * force_fignore, globasciiranges, globskipdots, hostcomplete,
+ * complete_fullquote, patsub_replacement and progcomp were off where bash
+ * has them on. `wired` marks what tsh acts on; bash prints nothing either
+ * way, so neither does this (tsh said "accepted but not implemented"). */
 static struct shell_shopt g_shopts[] = {
-    { "expand_aliases",       &g_opt_expand_aliases,         true,  false },
-    { "nullglob",             &g_shopt_nullglob,             true , false },
-    { "failglob",             &g_shopt_failglob,             true , false },
-    { "dotglob",              &g_shopt_dotglob,              true , false },
-    { "extglob",              &g_shopt_extglob,              true,  false },
-    { "globstar",             &g_shopt_globstar,             true,  false },
-    { "nocaseglob",           &g_shopt_nocaseglob,           false, false },
-    { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
-    { "lastpipe",             &g_shopt_lastpipe,             false, false },
-    { "huponexit",            &g_shopt_huponexit,            false, false },
-    { "checkwinsize",         &g_shopt_checkwinsize,         false, false },
-    { "shift_verbose",        &g_shopt_shift_verbose,        true,  false },
-    { "execfail",             &g_shopt_execfail,             false, false },
-    { "histappend",           &g_shopt_histappend,           false, false },
-    { "cmdhist",              &g_shopt_cmdhist,              false, false },
-    { "progcomp",             &g_shopt_progcomp,             false, false },
-    { "interactive_comments", &g_shopt_interactive_comments, false, false },
-    { "sourcepath",           &g_shopt_sourcepath,           false, false },
-    { "promptvars",           &g_shopt_promptvars,           false, false },
-    /* The remainder of bash's set. None are wired; they are here because
-     * REFUSING a name bash accepts changes the exit status a script sees, and
-     * `shopt -s inherit_errexit` at the top of a file should not be an error.
-     * Each still announces itself once on stderr when switched on. */
-    { "inherit_errexit",      &g_shopt_inherit_errexit,      true,  false },
-    { "strict_errexit",       &g_shopt_misc[1],              false, false },
-    { "command_sub_errexit",  &g_shopt_misc[2],              false, false },
-    { "nocasematch",          &g_shopt_misc[3],              true,  false },
-    { "autocd",               &g_shopt_misc[4],              false, false },
-    { "cdable_vars",          &g_shopt_misc[5],              false, false },
-    { "cdspell",              &g_shopt_misc[6],              false, false },
-    { "checkhash",            &g_shopt_misc[7],              false, false },
-    { "checkjobs",            &g_shopt_misc[8],              false, false },
-    { "dirspell",             &g_shopt_misc[9],              false, false },
-    { "extdebug",             &g_shopt_misc[10],             false, false },
-    { "extquote",             &g_shopt_misc[11],             false, false },
-    { "force_fignore",        &g_shopt_misc[12],             false, false },
-    { "globasciiranges",      &g_shopt_misc[13],             false, false },
-    { "gnu_errfmt",           &g_shopt_misc[14],             false, false },
-    { "histreedit",           &g_shopt_misc[15],             false, false },
-    { "histverify",           &g_shopt_misc[16],             false, false },
-    { "hostcomplete",         &g_shopt_misc[17],             false, false },
-    { "lithist",              &g_shopt_misc[18],             false, false },
-    { "localvar_inherit",     &g_shopt_misc[19],             false, false },
-    { "localvar_unset",       &g_shopt_misc[20],             false, false },
-    { "login_shell",          &g_shopt_misc[21],             false, false },
-    { "mailwarn",             &g_shopt_misc[22],             false, false },
-    { "no_empty_cmd_completion", &g_shopt_misc[23],          false, false },
-    { "nullglob",             &g_shopt_nullglob,             false, false },
-    { "restricted_shell",     &g_shopt_misc[24],             false, false },
-    { "shift_verbose",        &g_shopt_shift_verbose,        true,  false },
-    { "xpg_echo",             &g_shopt_xpg_echo,             false, false },
-    { "assoc_expand_once",    &g_shopt_misc[25],             false, false },
-    { "compat31",             &g_shopt_misc[26],             false, false },
-    { "compat32",             &g_shopt_misc[27],             false, false },
-    { "compat40",             &g_shopt_misc[28],             false, false },
-    { "compat41",             &g_shopt_misc[29],             false, false },
-    { "compat42",             &g_shopt_misc[30],             false, false },
-    { "compat43",             &g_shopt_misc[31],             false, false },
-    { "compat44",             &g_shopt_misc[32],             false, false },
-    { "patsub_replacement",   &g_shopt_misc[33],             false, false },
-    { "varredir_close",       &g_shopt_misc[34],             false, false },
+    { "autocd",                &g_shopt_misc[4],               false, false },
+    { "assoc_expand_once",     &g_shopt_misc[25],              false, false },
+    { "cdable_vars",           &g_shopt_misc[5],               false, false },
+    { "cdspell",               &g_shopt_misc[6],               false, false },
+    { "checkhash",             &g_shopt_misc[7],               false, false },
+    { "checkjobs",             &g_shopt_misc[8],               false, false },
+    { "checkwinsize",          &g_shopt_checkwinsize,          false, false },
+    { "cmdhist",               &g_shopt_cmdhist,               false, false },
+    { "compat31",              &g_shopt_misc[26],              false, false },
+    { "compat32",              &g_shopt_misc[27],              false, false },
+    { "compat40",              &g_shopt_misc[28],              false, false },
+    { "compat41",              &g_shopt_misc[29],              false, false },
+    { "compat42",              &g_shopt_misc[30],              false, false },
+    { "compat43",              &g_shopt_misc[31],              false, false },
+    { "compat44",              &g_shopt_misc[32],              false, false },
+    { "complete_fullquote",    &g_shopt_misc[35],              false, false },
+    { "direxpand",             &g_shopt_misc[36],              false, false },
+    { "dirspell",              &g_shopt_misc[9],               false, false },
+    { "dotglob",               &g_shopt_dotglob,               true , false },
+    { "execfail",              &g_shopt_execfail,              false, false },
+    { "expand_aliases",        &g_opt_expand_aliases,          true , false },
+    { "extdebug",              &g_shopt_misc[10],              false, false },
+    { "extglob",               &g_shopt_extglob,               true , false },
+    { "extquote",              &g_shopt_misc[11],              false, false },
+    { "failglob",              &g_shopt_failglob,              true , false },
+    { "force_fignore",         &g_shopt_misc[12],              false, false },
+    { "globasciiranges",       &g_shopt_misc[13],              false, false },
+    { "globskipdots",          &g_shopt_misc[37],              false, false },
+    { "globstar",              &g_shopt_globstar,              true , false },
+    { "gnu_errfmt",            &g_shopt_misc[14],              false, false },
+    { "histappend",            &g_shopt_histappend,            false, false },
+    { "histreedit",            &g_shopt_misc[15],              false, false },
+    { "histverify",            &g_shopt_misc[16],              false, false },
+    { "hostcomplete",          &g_shopt_misc[17],              false, false },
+    { "huponexit",             &g_shopt_huponexit,             false, false },
+    { "inherit_errexit",       &g_shopt_inherit_errexit,       true , false },
+    { "interactive_comments",  &g_shopt_interactive_comments,  false, false },
+    { "lastpipe",              &g_shopt_lastpipe,              false, false },
+    { "lithist",               &g_shopt_misc[18],              false, false },
+    { "localvar_inherit",      &g_shopt_misc[19],              false, false },
+    { "localvar_unset",        &g_shopt_misc[20],              false, false },
+    { "login_shell",           &g_shopt_misc[21],              false, false },
+    { "mailwarn",              &g_shopt_misc[22],              false, false },
+    { "no_empty_cmd_completion", &g_shopt_misc[23],              false, false },
+    { "nocaseglob",            &g_shopt_nocaseglob,            false, false },
+    { "nocasematch",           &g_shopt_misc[3],               true , false },
+    { "noexpand_translation",  &g_shopt_misc[38],              false, false },
+    { "nullglob",              &g_shopt_nullglob,              true , false },
+    { "patsub_replacement",    &g_shopt_misc[33],              false, false },
+    { "progcomp",              &g_shopt_progcomp,              false, false },
+    { "progcomp_alias",        &g_shopt_misc[39],              false, false },
+    { "promptvars",            &g_shopt_promptvars,            false, false },
+    { "restricted_shell",      &g_shopt_misc[24],              false, false },
+    { "shift_verbose",         &g_shopt_shift_verbose,         true , false },
+    { "sourcepath",            &g_shopt_sourcepath,            false, false },
+    { "varredir_close",        &g_shopt_misc[34],              false, false },
+    { "xpg_echo",              &g_shopt_xpg_echo,              false, false },
     { 0, 0, false, false },
 };
 
@@ -6836,12 +6849,11 @@ static void cmd_shopt_in(int argc, char **argv) {
             continue;
         }
         if (set || unset) {
+            /* login_shell and restricted_shell report the shell's state:
+             * bash's setters put them back, without a word. */
+            if (o->slot == &g_shopt_misc[21] || o->slot == &g_shopt_misc[24])
+                continue;
             *o->slot = set;
-            if (!o->wired && set && !o->warned) {
-                o->warned = true;
-                kprintf("shopt: %s: accepted but not implemented -- "
-                        "behaviour is unchanged\n", o->name);
-            }
         } else {
             if (!quiet) {
                 if (print) shell_shopt_print_reinput(o);
