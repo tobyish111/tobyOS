@@ -1311,6 +1311,7 @@ static int shell_append_array_slice(struct shell_sb *b,
                                    const char *name, bool star,
                                    long off, long cnt);
 struct file;
+static bool g_rl_nul_cuts;       /* see shell_read_line_from_file */
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *out,
                                      bool *got_any, char delim,
@@ -8383,8 +8384,10 @@ static void cmd_readarray(int argc, char **argv) {
         for (;;) {
             if (max_lines > 0 && stored >= max_lines) break;
             bool got_any = false;
+            g_rl_nul_cuts = true;
             int rr = shell_read_line_from_file(in, true, &linesb, &got_any,
                                                delim, 0, -1, false);
+            g_rl_nul_cuts = false;
             char *line = linesb.p;
             /* !got_any IS end-of-input -- cmd_read uses exactly that test to
              * end `while read line`, and an EMPTY line still sets it, so a
@@ -9295,6 +9298,11 @@ static bool shell_ifs_is_ws(const char *ifs, char c) {
  * which is what a caller reads as its `const bool *` escape map. Both were
  * 512-byte arrays for `read` (1 KiB for mapfile), and a longer line was
  * "read: line too long" -- or, in mapfile, the silent end of the array. */
+/* Set by mapfile for its reads: a NUL ENDS what is kept of the line (the
+ * rest is still read, to the delimiter). bash's mapfile stores each line
+ * as a C string, so `printf '.\0.\n' | mapfile L` keeps "." -- where
+ * `read` skips a NUL and keeps ".." (Oils 1891). g_rl_nul_cuts. */
+
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *out,
                                      bool *got_any, char delim,
@@ -9305,8 +9313,10 @@ static int shell_read_line_from_file(struct file *in, bool raw,
     if (esc) sb_truncate(esc, 0);
     bool hit_eof = false;
     bool escaped = false;
+    bool cut = false;
 #define SH_RL_PUT(ch, e)                                                      \
     do {                                                                      \
+        if (cut) break;                                                       \
         if (sb_putc(out, (ch)) < 0) return -2;                                \
         if (esc && sb_putc(esc, (char)((e) ? 1 : 0)) < 0) return -2;          \
     } while (0)
@@ -9317,7 +9327,10 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         if (n < 0) return -1;
         if (n == 0) { hit_eof = true; break; }
         *got_any = true;
-        if (c == '\0' && delim != '\0') continue;
+        if (c == '\0' && delim != '\0') {
+            if (g_rl_nul_cuts) cut = true;
+            continue;
+        }
 
         if (!raw && escaped) {
             escaped = false;
