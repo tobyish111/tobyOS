@@ -1474,6 +1474,8 @@ struct job {
                                 * the prompt's announcement is left (S9) */
     char *name;                /* command text for display, on the heap; set
                                 * whenever id != 0 */
+    bool notified;             /* listed by `jobs` in a script: it goes at the
+                                * end of the command (shell_jobs_notify_script) */
 };
 
 static struct job **g_jobs;
@@ -1633,6 +1635,7 @@ static void jobs_remove(struct job *j) {
     if (!j) return;
     j->id  = 0;
     j->pid = 0;
+    j->notified = false;
     if (j->name) kfree(j->name);
     j->name = 0;
 }
@@ -1771,6 +1774,41 @@ void shell_notify_jobs_hosted(void) {
         jobs_remove(g_jobs[i]);
     }
 }
+#endif
+
+#ifdef SHELL_HOSTED
+/* bash's notify_and_cleanup for a SCRIPT, after each command it reads
+ * (jobs.c notify_of_job_status): a background job that a SIGNAL ended is
+ * reported -- "LINE: PID Killed  CMD", not for INT, TERM or PIPE, nor a
+ * trapped one -- and leaves the job table; one that exited stays in it,
+ * for `wait %N` to collect. tsh noticed nothing until a `wait`, so
+ * `sleep 1 & kill %%; sleep .2; wait %%` found the job (bash: "no such
+ * job", 127; Oils 0944; logs/b12 p49). Its status stays known by pid. */
+static void shell_jobs_notify_script(void) {
+    extern int proc_try_reap(int pid, int *code);
+    if (g_interactive) return;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        /* listed by `jobs`, or collected by `wait` -- in a script there is
+         * no prompt left to announce it at, and bash has deleted it */
+        if (j->id != 0 && (j->notified || j->waited)) { jobs_remove(j); continue; }
+        if (j->id == 0 || j->dead || j->stopped) continue;
+        int code = 0;
+        if (proc_try_reap(j->pid, &code) != 1) continue;
+        int sig = proc_last_term_sig();
+        shell_bgstat_add(j->pid, code);
+        if (sig > 0) {
+            shell_report_job_death(j->pid, sig, j->name, false);
+            jobs_remove(j);
+        } else {
+            j->dead = true;
+            j->code = code;
+            j->sig = 0;
+        }
+    }
+}
+#else
+static void shell_jobs_notify_script(void) {}
 #endif
 
 static void jobs_reap_finished(void) {
@@ -10234,9 +10272,15 @@ static void cmd_jobs(int argc, char **argv) {
         }
         if (!j) break;
         last_id = j->id;
+        /* ...and in a SCRIPT it leaves at the end of the command being
+         * run, bash's notify_and_cleanup: `jobs; wait %1` on one line
+         * still finds the job (status 0), on two lines it is gone. */
         if (pids_only) {
             shell_printf("%d\n", j->pid);
-            if (j->dead) jobs_remove(j);
+            if (j->dead) {
+                if (g_interactive) jobs_remove(j);
+                else j->notified = true;
+            }
             shown++;
             continue;
         }
@@ -10246,7 +10290,8 @@ static void cmd_jobs(int argc, char **argv) {
             shell_printf("[%d]%c  %-24s%s\n", j->id, mark,
                          shell_job_status_word(j->code, j->sig, wb, sizeof wb),
                          j->name);
-            jobs_remove(j);
+            if (g_interactive) jobs_remove(j);
+            else j->notified = true;
             shown++;
             continue;
         }
@@ -10298,12 +10343,26 @@ static int parse_int(const char *s, int *out) {
 
 /* bash job specs: %N, %% and %+ (current), %- (previous). NULL on a bad
  * or unknown spec; callers print their own diagnostic. */
+/* The CURRENT job for a jobspec: the newest one still in the table,
+ * finished or not -- bash's current job stays current until the job is
+ * cleaned up, so `sleep .1 & sleep .5; wait %%` collects it (status 0);
+ * tsh skipped a finished one and said "no such job". One a `wait` has
+ * already collected is gone, as bash deletes it. */
+static struct job *jobs_newest_any(void) {
+    struct job *best = 0;
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id && !g_jobs[i]->waited &&
+            (!best || g_jobs[i]->id > best->id))
+            best = g_jobs[i];
+    return best;
+}
+
 static struct job *jobs_by_spec(const char *s) {
     if (!s || s[0] != '%') return 0;
     if (!s[1] || strcmp(s, "%%") == 0 || strcmp(s, "%+") == 0)
-        return jobs_newest();
+        return jobs_newest_any();
     if (strcmp(s, "%-") == 0) {
-        struct job *newest = jobs_newest(), *second = 0;
+        struct job *newest = jobs_newest_any(), *second = 0;
         for (int i = 0; i < JOB_MAX; i++) {
             if (!g_jobs[i]->id) continue;
             if (newest && g_jobs[i]->id == newest->id) continue;
@@ -15326,6 +15385,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             execute_line_text(ex ? ex : line);
         } else {
             execute_line_text(line);
+            shell_jobs_notify_script();
         }
         if (unit_checked) g_syn_checked--;
         g_shell_lineno = line_last;
@@ -18700,10 +18760,22 @@ static void cmd_kill(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            /* ...ITS GROUP WHEN IT HAS ONE. Without job control -- every
+             * script -- a background job stays in the shell's own group
+             * (bash's kill_pid with group=0), and the group send reached
+             * nothing: `sleep 1 & kill %%; wait %%` was status 0, the
+             * sleep never signalled (Oils 0944; logs/b12 p49). */
             bool was_stopped = jb->stopped;
-            signal_send_to_pgrp(jb->pid, sig);
-            if (was_stopped && (sig == SIGTERM || sig == SIGHUP))
-                signal_send_to_pgrp(jb->pid, SIGCONT);
+            if (signal_send_to_pid_checked(-jb->pid, sig) != 0 &&
+                signal_send_to_pid_checked(jb->pid, sig) != 0) {
+                kprintf("kill: %s: no such job\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+            if (was_stopped && (sig == SIGTERM || sig == SIGHUP)) {
+                if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
+                    (void)signal_send_to_pid_checked(jb->pid, SIGCONT);
+            }
             continue;
         }
         int pid = 0;
@@ -21210,6 +21282,10 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             shell_report_job_death(pid, sig, text ? text : argv[0], true);
         }
     }
+    /* bash's wait_for ends with notify_and_cleanup: a background job that
+     * died meanwhile is reported and dropped now (`... kill %%; sleep .2;
+     * wait %%` on one line finds no job; logs/b12 p49) */
+    shell_jobs_notify_script();
     return rc;
 }
 
