@@ -30522,6 +30522,11 @@ static size_t shell_word_assign_eq(const char *w) {
     return w[i] == '=' ? i : (size_t)-1;
 }
 
+/* Whether the word shell_add_arg_ex is adding is in an ASSIGNMENT context
+ * (shell_assign_ctx): 1 or 0 while it runs, -1 elsewhere -- where the
+ * word's shape alone decides, as it always did. */
+static int g_arg_assign_ctx = -1;
+
 static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                              const char *word, bool quoted) {
     if (shell_simple_argv_room(cur) < 0) return -1;
@@ -30591,12 +30596,20 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     size_t aeq = shell_word_assign_eq(word);
     bool assign_word = aeq != (size_t)-1;
     size_t akey = assign_word ? aeq : env_key_len(word);
+    /* ...BUT ONLY WHERE IT IS AN ASSIGNMENT. An argument that merely LOOKS
+     * like one is globbed: `touch foo=1 foo=2; echo foo=*` is "foo=1 foo=2"
+     * in bash, and so is `v='foo=*'; echo $v`; a prefix assignment and one
+     * written after export, declare, local, readonly or typeset are not
+     * (logs/b12 p113, WSL bash and the guest's). tsh skipped every word of
+     * that shape (finding 54). Tilde expansion after the `=` stays with the
+     * shape: bash does that for assignment-like arguments too. */
+    bool assign_noglob = assign_word && g_arg_assign_ctx != 0;
 
     /* PATHNAME EXPANSION IS NOT GATED ON `quoted` ANY MORE. A word with a
      * quoted part is still globbed -- with that part LITERAL, which is what
      * the escapes the tokenizer added say. Only TILDE expansion below still
      * turns off inside quotes, because a quoted `~` really is data. */
-    if (!g_opt_noglob && !assign_word && shell_has_glob(word)) {
+    if (!g_opt_noglob && !assign_noglob && shell_has_glob(word)) {
         int n = shell_expand_globstar_word(pl, cur, word);
         if (n < 0) return -1;
         if (n > 0) return 0;
@@ -30974,9 +30987,23 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
     return 1;
 }
 
+static int shell_add_arg_ex_in(struct shell_pipeline *pl,
+                               struct shell_simple *cur, const char *word,
+                               bool quoted, bool expanded, bool assign_src);
+
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
                             const char *word, bool quoted, bool expanded,
                             bool assign_src) {
+    int saved_ctx = g_arg_assign_ctx;
+    g_arg_assign_ctx = shell_assign_ctx(cur, assign_src) ? 1 : 0;
+    int rc = shell_add_arg_ex_in(pl, cur, word, quoted, expanded, assign_src);
+    g_arg_assign_ctx = saved_ctx;
+    return rc;
+}
+
+static int shell_add_arg_ex_in(struct shell_pipeline *pl,
+                               struct shell_simple *cur, const char *word,
+                               bool quoted, bool expanded, bool assign_src) {
     /* TILDE EXPANSION COMES BEFORE PARAMETER EXPANSION, NOT AFTER.
      *
      *     HOME=/home/bob
@@ -36085,8 +36112,10 @@ static bool shell_try_for_command(const char *src) {
     } else {
         for (int i = 0; i < ntok; i++) {
             if (tok[i].type != SH_TOK_WORD) continue;
+            /* a word of the list is never an assignment, whatever its
+             * shape: `for i in foo=*` globs (logs/b12 p113) */
             if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
-                                 tok[i].expanded, tok[i].assign_src) < 0) {
+                                 tok[i].expanded, false) < 0) {
                 shell_pipeline_free(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
                 kfree(list); kfree(body);
