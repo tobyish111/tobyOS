@@ -34014,7 +34014,17 @@ static bool shell_try_dbracket_command(const char *src) {
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"')  { dq = true; continue; }
             if (*q == '\\' && q[1]) { q++; continue; }
-            if (q[0] == ']' && q[1] == ']') { end = q; break; }
+            /* ...and only a `]]` that is a WORD: the one inside
+             * `[[:space:]]+` is part of a regex (Oils 2173), and bash's
+             * lexer closes the command at a whole-word `]]` only */
+            if (q[0] == ']' && q[1] == ']' &&
+                (q == s || q[-1] == ' ' || q[-1] == '\t' || q[-1] == '\n') &&
+                (q[2] == '\0' || q[2] == ' ' || q[2] == '\t' || q[2] == '\n' ||
+                 q[2] == ';' || q[2] == '&' || q[2] == '|' || q[2] == ')' ||
+                 q[2] == '<' || q[2] == '>')) {
+                end = q;
+                break;
+            }
         }
     }
     if (!end) {
@@ -36753,7 +36763,14 @@ static const char *shell_find_pipe_at(const char *s) {
          * had no `]]`. The scanner already knows this (st->dbracket);
          * this walker did not. */
         if (dbr) {
-            if (p[0] == ']' && p[1] == ']') { dbr = false; p++; }
+            /* the WORD `]]` closes it, not the end of `[[:space:]]` */
+            if (p[0] == ']' && p[1] == ']' &&
+                (p == start || p[-1] == ' ' || p[-1] == '\t') &&
+                (p[2] == '\0' || p[2] == ' ' || p[2] == '\t' || p[2] == ';' ||
+                 p[2] == '&' || p[2] == '|' || p[2] == ')' || p[2] == '\n')) {
+                dbr = false;
+                p++;
+            }
             continue;
         }
         if (p[0] == '[' && p[1] == '[' &&
