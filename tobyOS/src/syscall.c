@@ -19,6 +19,7 @@
  * /bin/echo, /bin/cat) all use the new signature.
  */
 
+#include <tobyos/rlimit.h>
 #include <tobyos/syscall.h>
 #include <tobyos/kmath.h>      /* C20: kernel libm for the float-return shims */
 #include <tobyos/proc.h>
@@ -12946,12 +12947,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t oldp     = (uint64_t)a4;
         if (oldp) {
             struct { uint64_t cur, max; } rl;
-            rl.max = ~0ULL;                 /* RLIM64_INFINITY */
-            switch (resource) {
-            case 3:  rl.cur = 0x800000ULL; break;          /* RLIMIT_STACK 8 MiB */
-            case 7:  rl.cur = PROC_NFDS; rl.max = PROC_NFDS; break; /* RLIMIT_NOFILE (== fd table) */
-            default: rl.cur = ~0ULL; break;                /* AS/DATA/...: inf   */
-            }
+            /* include/tobyos/rlimit.h: the one table /bin/tsh reads too */
+            tobyos_rlimit(resource, PROC_NFDS, &rl.cur, &rl.max);
             if (copy_to_user((void *)(uintptr_t)oldp, &rl, sizeof rl) != 0)
                 return -ABI_EFAULT;
         }
@@ -12962,12 +12959,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t out      = (uint64_t)a2;
         if (out) {
             struct { uint64_t cur, max; } rl;
-            rl.max = ~0ULL;
-            switch (resource) {
-            case 3:  rl.cur = 0x800000ULL; break;
-            case 7:  rl.cur = 1024; rl.max = 4096; break;
-            default: rl.cur = ~0ULL; break;
-            }
+            tobyos_rlimit(resource, PROC_NFDS, &rl.cur, &rl.max);
             if (copy_to_user((void *)(uintptr_t)out, &rl, sizeof rl) != 0)
                 return -ABI_EFAULT;
         }

@@ -11,6 +11,7 @@
  * grammar expected from an everyday command shell.
  */
 
+#include <tobyos/rlimit.h>
 #include <tobyos/shell.h>
 #ifdef SHELL_HOSTED
 #include <regex.h>          /* libtoby's ERE engine, for `[[ =~ ]]` */
@@ -17997,158 +17998,176 @@ static bool shell_word_has(const char *word, char c) {
     return false;
 }
 
-/* POSIX `ulimit [-HS] [-acdfnstv] [value]`.
+/* ulimit -- bash's ulimit builtin over the limits tobyOS reports
+ * (include/tobyos/rlimit.h).
  *
- * The kernel does not police these yet, so nothing here constrains a running
- * process. What the shell CAN do correctly is be a faithful store: report a
- * value that was set, keep the soft/hard pair distinct, and enforce the two
- * rules that make the interface meaningful -- a soft limit may not exceed its
- * hard limit, and a hard limit may only ever be lowered. A script that reads
- * back what it set gets the right answer; one that tries to raise a hard
- * limit is refused, exactly as it would be on a system that did enforce them.
+ * bash asks the kernel (getrlimit, prlimit64) and prints what it is told,
+ * through its table of the limits Linux has: seventeen rows, `-a` printing
+ * each as "%-20s %20s" (description, then "(units, -x) "), sizes divided by
+ * the row's block factor. tsh kept a table of seven with its own layout and
+ * its own soft-over-hard checks (Oils 1062 1064 1072); on this kernel a set
+ * is accepted and changes nothing, so a read afterwards answers as before --
+ * which is what the Linux bash here prints, and so what this prints. Pipe
+ * size is no limit at all to bash (PIPE_BUF / 512), and setting it fails.
  */
-#define ULIMIT_INF (-1L)
-
-struct shell_rlimit {
-    char  opt;
-    const char *label;
+struct shell_ulim {
+    char opt;
+    int res;                    /* Linux RLIMIT_*, or -1 for the pipe size */
+    int factor;                 /* 1024 for the POSIX block ones (-2) */
+    const char *desc;
     const char *units;
-    long  soft;
-    long  hard;
+};
+#define ULIM_POSIXBLK (-2)
+static const struct shell_ulim g_ulims[] = {
+    { 'R', 15, 1,             "real-time non-blocking time", "microseconds" },
+    { 'c',  4, ULIM_POSIXBLK, "core file size",       "blocks" },
+    { 'd',  2, 1024,          "data seg size",        "kbytes" },
+    { 'e', 13, 1,             "scheduling priority",  0 },
+    { 'f',  1, ULIM_POSIXBLK, "file size",            "blocks" },
+    { 'i', 11, 1,             "pending signals",      0 },
+    { 'l',  8, 1024,          "max locked memory",    "kbytes" },
+    { 'm',  5, 1024,          "max memory size",      "kbytes" },
+    { 'n',  7, 1,             "open files",           0 },
+    { 'p', -1, 512,           "pipe size",            "512 bytes" },
+    { 'q', 12, 1,             "POSIX message queues", "bytes" },
+    { 'r', 14, 1,             "real-time priority",   0 },
+    { 's',  3, 1024,          "stack size",           "kbytes" },
+    { 't',  0, 1,             "cpu time",             "seconds" },
+    { 'u',  6, 1,             "max user processes",   0 },
+    { 'v',  9, 1024,          "virtual memory",       "kbytes" },
+    { 'x', 10, 1,             "file locks",           0 },
+    { 0, 0, 0, 0, 0 },
 };
 
-static struct shell_rlimit g_shell_rlimits[] = {
-    { 'c', "core file size",  "(blocks)", ULIMIT_INF, ULIMIT_INF },
-    { 'd', "data seg size",   "(kbytes)", ULIMIT_INF, ULIMIT_INF },
-    { 'f', "file size",       "(blocks)", ULIMIT_INF, ULIMIT_INF },
-    { 'n', "open files",      "",         ULIMIT_INF, ULIMIT_INF },
-    { 's', "stack size",      "(kbytes)", ULIMIT_INF, ULIMIT_INF },
-    { 't', "cpu time",        "(seconds)",ULIMIT_INF, ULIMIT_INF },
-    { 'v', "virtual memory",  "(kbytes)", ULIMIT_INF, ULIMIT_INF },
-};
+static int ulim_find(char opt) {
+    for (int i = 0; g_ulims[i].opt; i++) if (g_ulims[i].opt == opt) return i;
+    return -1;
+}
 
-static struct shell_rlimit *shell_rlimit_find(char opt) {
-    for (size_t i = 0; i < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]);
-         i++) {
-        if (g_shell_rlimits[i].opt == opt) return &g_shell_rlimits[i];
+static int ulim_factor(const struct shell_ulim *u) {
+    return u->factor == ULIM_POSIXBLK ? (g_opt_posix ? 512 : 1024) : u->factor;
+}
+
+static void ulim_get(const struct shell_ulim *u, uint64_t *soft, uint64_t *hard) {
+    if (u->res < 0) { *soft = *hard = 4096; return; }   /* PIPE_BUF */
+    tobyos_rlimit(u->res, PROC_NFDS, soft, hard);
+}
+
+static void ulim_printone(const struct shell_ulim *u, uint64_t v, bool desc) {
+    SH_SB(l);
+    if (desc) {
+        char unit[64], line[96];
+        if (u->units) ksnprintf(unit, sizeof unit, "(%s, -%c) ", u->units, u->opt);
+        else ksnprintf(unit, sizeof unit, "(-%c) ", u->opt);
+        ksnprintf(line, sizeof line, "%-20s %20s", u->desc, unit);
+        (void)sb_puts(&l, line);
+    }
+    if (v == TOBYOS_RLIM_INFINITY) {
+        (void)sb_puts(&l, "unlimited");
+    } else {
+        char nb[32];
+        ksnprintf(nb, sizeof nb, "%lu", (unsigned long)(v / (uint64_t)ulim_factor(u)));
+        (void)sb_puts(&l, nb);
+    }
+    shell_printf("%s\n", l.p);
+}
+
+#define ULIM_HARD 1
+#define ULIM_SOFT 2
+
+static int ulim_one(char opt, const char *arg, int mode, bool multiple) {
+    const struct shell_ulim *u = &g_ulims[ulim_find(opt)];
+    bool setting = arg != 0;
+    if (mode == 0) mode = setting ? (ULIM_HARD | ULIM_SOFT) : ULIM_SOFT;
+    uint64_t soft, hard;
+    ulim_get(u, &soft, &hard);
+    if (!setting) {
+        ulim_printone(u, (mode & ULIM_SOFT) ? soft : hard, multiple);
+        return 0;
+    }
+    if (strcmp(arg, "hard") && strcmp(arg, "soft") && strcmp(arg, "unlimited")) {
+        bool digits = *arg != 0;
+        for (const char *p = arg; *p; p++) if (*p < '0' || *p > '9') digits = false;
+        if (!digits) {
+            kprintf("ulimit: %s: invalid number\n", arg);
+            return 1;
+        }
+        uint64_t v = 0;
+        bool over = false;
+        for (const char *p = arg; *p; p++) {
+            uint64_t d = (uint64_t)(*p - '0');
+            if (v > (~0ULL - d) / 10) over = true;
+            v = v * 10 + d;
+        }
+        uint64_t f = (uint64_t)ulim_factor(u);
+        if (over || (f && v > (~0ULL >> 1) / f)) {
+            kprintf("ulimit: %s: limit out of range\n", arg);
+            return 1;
+        }
+    }
+    /* the pipe size cannot be set; everything else is accepted and, on
+     * this kernel, changes nothing */
+    if (u->res < 0) {
+        kprintf("ulimit: %s: cannot modify limit: Invalid argument\n", u->desc);
+        return 1;
     }
     return 0;
 }
 
-/* STDOUT. A reported limit is the ANSWER to the question `ulimit -f` asks, so
- * it belongs on stdout where `x=$(ulimit -f)` can see it -- it was going to
- * the diagnostic stream, which is also why every one of these cases showed
- * bash's value on stdout and tsh's on stderr. */
-static void shell_rlimit_print(const struct shell_rlimit *r, bool hard,
-                               bool with_label) {
-    long v = hard ? r->hard : r->soft;
-    /* REPORT WHAT IS IN FORCE, NOT WHAT WAS ASKED FOR.
-     *
-     * This kernel does not implement resource limits: setrlimit is accepted
-     * and discarded, getrlimit always answers RLIM_INFINITY. That is why the
-     * real bash in the initrd prints `unlimited` after `ulimit -f 4294967296`
-     * -- it set the limit, read it back, and got infinity.
-     *
-     * tsh kept its own table and printed the number back, which made
-     * `ulimit -f 1` look like it had done something while a 513-byte write
-     * went through unimpeded. The table is still used to VALIDATE the
-     * argument and to keep the hard-limit-only-comes-down rule, but a value
-     * nothing enforces is not a limit, and reporting it as one is the lie.
-     * Remove this override the day the kernel grows real per-process
-     * limits. */
-    (void)v;
-    if (with_label) shell_printf("%-24s%-10s", r->label, r->units);
-    shell_printf("unlimited\n");
-}
-
 static void cmd_ulimit(int argc, char **argv) {
-    shell_set_status(0);
-    bool show_all = false;
-    bool want_hard = false, want_soft = false;
-    char which = 'f';                       /* POSIX default resource */
-    int i = 1;
-
-    for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
-        for (const char *f = argv[i] + 1; *f; f++) {
-            if (*f == 'a') { show_all = true; continue; }
-            if (*f == 'H') { want_hard = true; continue; }
-            if (*f == 'S') { want_soft = true; continue; }
-            if (shell_rlimit_find(*f)) { which = *f; continue; }
-            kprintf("ulimit: -%c: invalid option\n", *f);
-            kprintf_raw("ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] "
-                        "[limit]\n");
+    struct sh_igo g;
+    sh_igo_init(&g, "ulimit", argc, argv);
+    char opts[64];
+    int oi = 0;
+    opts[oi++] = 'a'; opts[oi++] = 'S'; opts[oi++] = 'H';
+    for (int i = 0; g_ulims[i].opt; i++) { opts[oi++] = g_ulims[i].opt; opts[oi++] = ';'; }
+    opts[oi] = '\0';
+    int mode = 0, all = 0;
+    char cmds[64];
+    const char *args[64];
+    int ncmd = 0;
+    int c;
+    while ((c = sh_igo_next(&g, opts)) != -1) {
+        switch (c) {
+        case 'a': all++; break;
+        case 'S': mode |= ULIM_SOFT; break;
+        case 'H': mode |= ULIM_HARD; break;
+        case SH_IGO_HELP:
+            shell_help_topic("ulimit");
             shell_set_status(2);
             return;
+        case '?':
+            sh_builtin_usage("ulimit");
+            shell_set_status(2);
+            return;
+        default:
+            if (ncmd < 64) { cmds[ncmd] = (char)c; args[ncmd++] = g.optarg; }
+            break;
         }
     }
-    /* Neither -H nor -S: report the soft limit, set both. */
-    bool report_hard = want_hard && !want_soft;
-
-    if (show_all) {
-        for (size_t k = 0;
-             k < sizeof(g_shell_rlimits) / sizeof(g_shell_rlimits[0]); k++) {
-            shell_rlimit_print(&g_shell_rlimits[k], report_hard, true);
+    int i = g.ind;
+    if (all) {
+        int m = mode == 0 ? ULIM_SOFT : mode;
+        for (int k = 0; g_ulims[k].opt; k++) {
+            uint64_t soft, hard;
+            ulim_get(&g_ulims[k], &soft, &hard);
+            ulim_printone(&g_ulims[k], (m & ULIM_SOFT) ? soft : hard, true);
         }
+        shell_set_status(0);
         return;
     }
-
-    struct shell_rlimit *r = shell_rlimit_find(which);
-    if (!r) {
-        kprintf("ulimit: no such resource\n");
-        shell_set_status(2);
-        return;
+    if (ncmd == 0) {
+        cmds[ncmd] = 'f';
+        args[ncmd++] = i < argc ? argv[i++] : 0;
     }
-
-    if (i >= argc) {
-        shell_rlimit_print(r, report_hard, false);
-        return;
-    }
-
-    long val;
-    if (strcmp(argv[i], "unlimited") == 0) {
-        val = ULIMIT_INF;
-    } else {
-        /* 64-bit, with overflow detected rather than wrapped. parse_int went
-         * through an `int`, so 2**32 came back truncated and a value too big
-         * for 64 bits wrapped into a small positive number and was accepted. */
-        const char *s = argv[i];
-        unsigned long acc = 0;
-        bool any = false, over = false;
-        for (; *s >= '0' && *s <= '9'; s++) {
-            unsigned long d = (unsigned long)(*s - '0');
-            if (acc > (~0ul - d) / 10ul) over = true;
-            else acc = acc * 10ul + d;
-            any = true;
-        }
-        if (!any || *s || over || acc > (unsigned long)(~0ul >> 1)) {
-            /* bash answers 1 for a malformed VALUE (an unknown FLAG is the
-             * usage error that gets 2) -- measured in the guest. */
-            kprintf("ulimit: %s: invalid number\n", argv[i]);
+    /* POSIX: an operand after a last option that took none is its value */
+    if (i < argc && !args[ncmd - 1]) args[ncmd - 1] = argv[i++];
+    for (int k = 0; k < ncmd; k++)
+        if (ulim_one(cmds[k], args[k], mode, ncmd > 1) != 0) {
             shell_set_status(1);
             return;
         }
-        val = (long)acc;
-    }
-
-    bool set_hard = want_hard || !want_soft;
-    bool set_soft = want_soft || !want_hard;
-
-    /* A hard limit is a ceiling that only ever comes down. */
-    if (set_hard && r->hard != ULIMIT_INF &&
-        (val == ULIMIT_INF || val > r->hard)) {
-        kprintf("ulimit: cannot raise a hard limit\n");
-        shell_set_status(1);
-        return;
-    }
-    long ceiling = set_hard ? val : r->hard;
-    if (set_soft && ceiling != ULIMIT_INF &&
-        (val == ULIMIT_INF || val > ceiling)) {
-        kprintf("ulimit: soft limit exceeds hard limit\n");
-        shell_set_status(1);
-        return;
-    }
-    if (set_hard) r->hard = val;
-    if (set_soft) r->soft = val;
+    shell_set_status(0);
 }
 
 /* POSIX `logname`: the login name, which for this shell is the identity the
