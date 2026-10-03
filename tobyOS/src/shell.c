@@ -1906,7 +1906,18 @@ static void shell_jobs_notify_script(void) {
         /* listed by `jobs`, or collected by `wait` -- in a script there is
          * no prompt left to announce it at, and bash has deleted it */
         if (j->id != 0 && (j->notified || j->waited)) { jobs_remove(j); continue; }
-        if (j->id == 0 || j->dead || j->stopped) continue;
+        if (j->id == 0 || j->stopped) continue;
+        /* ONE ALREADY FOUND DEAD (by `jobs`, or by a plain `wait`, which
+         * keeps $!'s job) goes now if a signal ended it -- bash's
+         * notify_of_job_status skips only the background jobs of a script
+         * that EXITED (startup_state 0: POSIX keeps their statuses). So
+         * after `kill $(jobs -p); wait` the next jobs are [1] and [2]
+         * again (shparity 164; logs/b12 lt/w4.sh in WSL bash). Its death
+         * was reported when it was reaped. */
+        if (j->dead) {
+            if (j->sig > 0) jobs_remove(j);
+            continue;
+        }
         int code = 0;
         if (proc_try_reap(j->pid, &code) != 1) continue;
         int sig = proc_last_term_sig();
