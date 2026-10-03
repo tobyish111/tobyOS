@@ -15330,13 +15330,25 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                     sep = "\n";
                 } else if (scan.nest > 0) {
                     char kind = scan.nest_kind[scan.nest - 1];
-                    /* Arithmetic and `${ }` hold ONE expression, so their
-                     * lines join with a space. A command substitution holds a
-                     * command LIST and keeps its NEWLINES -- it is run as a
-                     * script, and a here-document inside it needs the lines
-                     * that follow the operator to still be lines. */
-                    sep = (kind == 'a' || kind == 'v') ? " "
-                        : (kind == 'c' || kind == 'b') ? "\n" : "; ";
+                    /* `${ }` holds ONE word, so its lines join with a
+                     * space. A command substitution holds a command LIST and
+                     * keeps its NEWLINES -- it is run as a script, and a
+                     * here-document inside it needs the lines that follow
+                     * the operator to still be lines. */
+                    /* ...AND SO DOES ARITHMETIC. A newline is whitespace to
+                     * the evaluator (sa_ws, as bash's expr.c), and `$((`
+                     * may turn out to be `$(` + `(` once `) )` closes it:
+                     *
+                     *     echo $(( echo 1          bash: 1 2 3
+                     *     echo 2                   tsh:  "syntax error near
+                     *     ...                            unexpected token `('"
+                     *     ) )
+                     *
+                     * -- the command substitution ran `( echo 1 echo 2 ...`,
+                     * its lines glued with blanks (Oils 1900). */
+                    sep = (kind == 'v') ? " "
+                        : (kind == 'a' || kind == 'c' || kind == 'b') ? "\n"
+                        : "; ";
                 } else if (scan.no_sep) {
                     sep = " ";
                 } else {
@@ -25824,6 +25836,12 @@ static int shell_expand_arith(const char **pp, struct shell_sb *b) {
                 *pp = p;
                 return shell_arith_subst_eval(expr, b);
             }
+            /* A `)` THAT CLOSES THE INNER PAREN ALONE -- `$(( cmd ) )` --
+             * makes it a command substitution of a SUBSHELL, as bash
+             * re-reads it (parse_dparen; Oils 1900): "unterminated
+             * arithmetic expansion" was tsh's answer. */
+            if (paren_depth == 0)
+                return shell_expand_command_subst(pp, b);
             if (paren_depth > 0) paren_depth--;
         }
         if (epos + 1 >= expr_cap) {
