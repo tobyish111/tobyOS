@@ -20752,6 +20752,9 @@ struct shell_redir {
      * SHELL_FD_BASE and its number goes into `name`; it outlives the command
      * (the script closes it with `{name}>&-`). See shell_apply_redirs. */
     const char *fdvar;
+    /* The CLOSE half of a move, `N>&M-` (see the parser): M is not put back
+     * after a command that runs in this shell -- shell_fd_moves_settle. */
+    bool move_src;
 };
 
 /* NO COUNT IS BOUNDED HERE. argv held ARG_MAX words (1024 hosted, 256 in
@@ -30138,9 +30141,29 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 }
             } else if (t == SH_TOK_DUP_IN || t == SH_TOK_DUP_OUT) {
                 int target = -1;
-                if (strcmp(tok[*io].text, "-") == 0) {
+                const char *dt = tok[*io].text;
+                size_t dl = strlen(dt);
+                bool mv = dl >= 2 && dt[dl - 1] == '-';
+                for (size_t q = 0; mv && q + 1 < dl; q++)
+                    if (dt[q] < '0' || dt[q] > '9') mv = false;
+                if (strcmp(dt, "-") == 0) {
                     if (shell_add_redir(cur, SH_RD_CLOSE, fd, 0, 0,
                                         -1) < 0) return -1;
+                } else if (mv) {
+                    /* `N>&M-`: dup M onto N, then close M (see
+                     * shell_fd_moves_settle) */
+                    long mv_fd = 0;
+                    for (size_t q = 0; q + 1 < dl && mv_fd < SHELL_FD_LIMIT; q++)
+                        mv_fd = mv_fd * 10 + (dt[q] - '0');
+                    if (shell_add_redir(cur,
+                                        t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
+                                                           : SH_RD_DUP_OUT,
+                                        fd, 0, 0, (int)mv_fd) < 0) return -1;
+                    if (mv_fd != fd) {
+                        if (shell_add_redir(cur, SH_RD_CLOSE, (int)mv_fd, 0, 0,
+                                            -1) < 0) return -1;
+                        cur->redir[cur->redir_count - 1].move_src = true;
+                    }
                 } else if (shell_parse_fd_word(tok[*io].text, &target) < 0) {
                     /* `N>&word` WHERE word IS NOT A DESCRIPTOR IS A FILENAME:
                      *
@@ -30853,6 +30876,7 @@ struct shell_io_frame {
     bool *owned;
     struct file *old_base[SHELL_FD_BASE];
     bool owned_base[SHELL_FD_BASE];
+    struct shell_simple *cmd;       /* whose redirections these are */
 };
 
 static void shell_fd_state_close_owned(struct shell_fd_state *st) {
@@ -31131,6 +31155,16 @@ static int shell_apply_redirs(struct shell_simple *cmd,
              * console-sink recursion described at shell_file_output. */
             if ((!target && r->target_fd > 2) ||
                 (target && target->kind == FILE_KIND_NULL)) {
+                /* a MOVE (`>&9-`) first tries to keep a copy of 9 to undo
+                 * the close, and bash says that failed too, with only its
+                 * name in front (add_undo_redirect) */
+                if (i + 1 < cmd->redir_count &&
+                    cmd->redir[i + 1].op == SH_RD_CLOSE &&
+                    cmd->redir[i + 1].move_src &&
+                    cmd->redir[i + 1].fd == r->target_fd)
+                    kprintf_raw("%s: redirection error: cannot duplicate fd: "
+                                "Bad file descriptor\n",
+                                g_param0 ? g_param0 : "tsh");
                 kprintf(SH_PFX_TSH "%d: Bad file descriptor\n", r->target_fd);
                 shell_set_status(1);
                 return -1;
@@ -31173,7 +31207,30 @@ static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
     }
     int rc = shell_io_frame_install(frame, &fds);
     shell_fd_state_close_owned(&fds);   /* frees; it owns nothing now */
+    frame->cmd = cmd;
     return rc;
+}
+
+/* `N>&M-` MOVES M TO N: N becomes what M was and M is closed (bash 2.04+;
+ * Oils 2123 -- tsh opened a FILE called "M-"). After a command that runs in
+ * this shell -- a builtin, a group, a function -- bash puts N back and NOT
+ * M, which stays closed: `: 6>&7-; echo x >&7` is "7: Bad file
+ * descriptor" (its undo list never records the close; Oils 2124 calls it
+ * a bug, and it is what scripts run against). An external command moves
+ * them in its own process. */
+static void shell_fd_moves_settle(struct shell_simple *cmd) {
+    if (!cmd) return;
+    for (int i = 0; i < cmd->redir_count; i++) {
+        struct shell_redir *r = &cmd->redir[i];
+        if (r->op != SH_RD_CLOSE || !r->move_src) continue;
+        int m = r->fd;
+        if (m < 0 || m >= SHELL_FD_LIMIT || !shell_fd_table_reserve(m)) continue;
+        struct file *f = shell_closed_file_make();
+        if (!f) continue;
+        struct file *old = g_shell_fd[m];
+        g_shell_fd[m] = f;
+        if (old && old->kind != FILE_KIND_NULL && m > 2) file_close(old);
+    }
 }
 
 #ifdef SHELL_HOSTED
@@ -31204,6 +31261,8 @@ static void shell_restore_io_frame(struct shell_io_frame *frame) {
     frame->old_fd = 0;
     frame->owned = 0;
     frame->n = 0;
+    shell_fd_moves_settle(frame->cmd);
+    frame->cmd = 0;
 }
 
 /* A write to a builtin's redirected stdout that FAILED.
@@ -31555,6 +31614,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
         g_shell_out_failed = false;
     }
     shell_fd_state_close_owned(&fds);
+    shell_fd_moves_settle(cmd);         /* `: 6>&7-` leaves 7 closed */
     return rc;
 }
 
