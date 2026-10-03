@@ -30506,8 +30506,13 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
              * printed (report_error or not), and the line is discarded. */
             if (g_readonly_hit || g_assign_fail_hit) {
                 if (exported) continue;
+                /* POSIX MODE MAKES IT FATAL for a non-interactive shell
+                 * (an assignment error, XCU 2.8.1): `set -o posix;
+                 * readonly x=1; x=2; echo hi` ends with status 1, also from
+                 * inside a function (Oils 0620; logs/b12 p44). */
                 if (g_shell_flow == SHELL_FLOW_NONE) {
-                    g_shell_flow = (g_opt_errexit && g_readonly_hit)
+                    g_shell_flow = ((g_opt_errexit || (g_opt_posix && !g_interactive))
+                                    && g_readonly_hit)
                                        ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
                     g_shell_flow_status = 1;
                 }
