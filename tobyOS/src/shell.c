@@ -6130,8 +6130,10 @@ static bool shell_local_declared_here(const char *name, int depth) {
 }
 
 /* Put back the scalar a local hid (the second half of the restore). */
+static void shell_path_var_written(const char *key, size_t klen);
 static void shell_local_restore_scalar(const struct shell_local_save *sv) {
     size_t klen = strlen(sv->name);
+    shell_path_var_written(sv->name, klen);     /* a local PATH ends */
     int idx = env_find(sv->name, klen);
     if (sv->existed) {
         char *blob = shell_strdup(sv->kv);
@@ -9419,7 +9421,20 @@ static const char *resolve_program(const char *name, char *out_buf,
                                    size_t out_sz);
 static const char *resolve_program_ex(const char *name, char *out_buf,
                                       size_t out_sz, int *how);
+static const char *resolve_program_run(const char *name, char *out_buf,
+                                       size_t out_sz, int *how);
 static bool        path_is_runnable(const char *path);
+static const char *phash_search(const char *name);
+static void        phash_insert(const char *name, const char *path, int hits,
+                                bool chkdot);
+/* The value of PATH in the command's own prefix assignments (`PATH=x cmd`),
+ * set by a spawn site around its lookup; 0 when the prefix has none. */
+static const char *g_spawn_temp_path;
+/* Set by the last $PATH walk: PATH was unset or empty (so a miss is "No
+ * such file or directory", not "command not found"), and a `.` entry came
+ * before the answer (bash's dot_found_in_search). */
+static bool        g_resolve_nopath;
+static bool        g_resolve_dot_seen;
 
 /* Is this how-code a file that `type`/`command -v` should NAME? */
 static inline bool cmd_res_is_file(int how) {
@@ -10146,7 +10161,7 @@ static void cmd_time(int argc, char **argv) {
         kprintf_raw("usage: time <command> [args...]\n");
         return;
     }
-    char path_buf[64];
+    char path_buf[VFS_PATH_MAX];
     const char *path = resolve_program(argv[1], path_buf, sizeof(path_buf));
     struct proc_spec spec = {
         .path = path,
@@ -11196,7 +11211,7 @@ static void cmd_gui(int argc, char **argv) {
      * so we don't need a separate "exit GUI" path here -- Ctrl+C the
      * foreground program (or close all its windows) to come back. */
     const char *prog = (argc >= 2) ? argv[1] : "gui_demo";
-    char path_buf[64];
+    char path_buf[VFS_PATH_MAX];
     const char *path = resolve_program(prog, path_buf, sizeof(path_buf));
     char *fake_argv[2] = { (char *)prog, 0 };
     shell_spawn_program(path, 1, fake_argv, false);
@@ -15628,7 +15643,20 @@ static void cmd_command(int argc, char **argv) {
                 }
             }
             if (found) { any_found = true; continue; }
-            char path_buf[64];
+            /* A hashed name: the remembered path (bash's describe_command
+             * asks the table before $PATH, and the asking counts a hit). */
+            {
+                bool slash = false;
+                for (const char *q = argv[i]; *q; q++) if (*q == '/') slash = true;
+                const char *h = (slash || use_default_path) ? 0 : phash_search(argv[i]);
+                if (h) {
+                    if (verbose) shell_printf("%s is hashed (%s)\n", argv[i], h);
+                    else         shell_printf("%s\n", h);
+                    any_found = true;
+                    continue;
+                }
+            }
+            char path_buf[VFS_PATH_MAX];
             int how = CMDRES_NONE;
             const char *path = resolve_program_ex(argv[i], path_buf,
                                                   sizeof(path_buf), &how);
@@ -15848,16 +15876,24 @@ static void cmd_type(int argc, char **argv) {
 
     for (int i = first; i < argc; i++) {
         const char *name = argv[i];
-        char path_buf[64];
+        char path_buf[VFS_PATH_MAX];
         int how = CMDRES_NONE;
         const char *path = resolve_program_ex(name, path_buf,
                                               sizeof(path_buf), &how);
         /* A file reached THROUGH $PATH counts even without the execute
          * bit; an explicit path does not. See enum cmd_res. */
         bool is_file = cmd_res_is_file(how);
+        /* A HASHED NAME is answered from the hash table, as bash's
+         * describe_command does once nothing shell-level matched -- and
+         * not under -a unless -P forces the path. The lookup counts a hit,
+         * as bash's does. */
+        bool name_slash = false;
+        for (const char *q = name; *q; q++) if (*q == '/') name_slash = true;
 
         /* -P skips every shell-level meaning and reports only the file. */
         if (f_P) {
+            const char *h = name_slash ? 0 : phash_search(name);
+            if (h) { shell_printf("%s\n", h); continue; }
             if (is_file) {
                 if (f_a) shell_type_print_paths(name, path, false);
                 else     shell_printf("%s\n", path);
@@ -15883,6 +15919,10 @@ static void cmd_type(int argc, char **argv) {
              * `type -ap pwd` prints the files even though the builtin
              * shadows them, while plain `type -p pwd` prints nothing. */
             bool shadowed = (aidx >= 0 || is_kw || fn || c);
+            if (!shadowed && !f_a && !name_slash) {
+                const char *h = phash_search(name);
+                if (h) { shell_printf("%s\n", h); continue; }
+            }
             if (is_file && (f_a || !shadowed)) {
                 if (f_a) shell_type_print_paths(name, path, false);
                 else     shell_printf("%s\n", path);
@@ -15897,6 +15937,8 @@ static void cmd_type(int argc, char **argv) {
             else if (is_kw)     shell_printf("keyword\n");
             else if (fn)        shell_printf("function\n");
             else if (c)         shell_printf("builtin\n");
+            else if (!f_a && !name_slash && phash_search(name))
+                                shell_printf("file\n");
             else if (is_file)   shell_printf("file\n");
             else                shell_set_status(1);
             continue;
@@ -15945,6 +15987,13 @@ static void cmd_type(int argc, char **argv) {
             any = true;
             if (!f_a) continue;
         }
+        if (!any && !f_a && !name_slash) {
+            const char *h = phash_search(name);
+            if (h) {
+                shell_printf("%s is hashed (%s)\n", name, h);
+                continue;
+            }
+        }
         if (is_file) {
             if (f_a) shell_type_print_paths(name, path, true);
             else     shell_printf("%s is %s\n", name, path);
@@ -15977,7 +16026,7 @@ static void cmd_which(int argc, char **argv) {
         return;
     }
     for (int i = 1; i < argc; i++) {
-        char path_buf[64];
+        char path_buf[VFS_PATH_MAX];
         const char *path = resolve_program(argv[i], path_buf, sizeof(path_buf));
         if (path_is_runnable(path)) {
             shell_printf("%s\n", path);
@@ -17557,152 +17606,237 @@ static void cmd_umask(int argc, char **argv) {
     }
 }
 
-/* THE COMMAND HASH TABLE bash keeps. `hash NAME` records NAME's PATH
- * lookup, `hash` lists the table in bash's format, -r clears it (and then,
- * as bash does, hashes any operands rather than refusing them), -d forgets
- * one, -t prints one, -l lists in a reusable form, -p PATH NAME records an
- * explicit path. tsh had no table: `hash NAME` printed "NAME=path" and
- * `hash` said the table was empty, which is the contract the conformance
- * corpus reads back (`hash whoami; hash | grep -o /whoami`).
+/* THE COMMAND HASH TABLE, bash's (hashcmd.c, builtins/hash.def).
  *
- * The table is what `hash` SHOWS; spawn does not consult it. That is the
- * observable contract, and it keeps a stale entry from ever running the
- * wrong binary.
+ * tsh kept a table only for `hash` to SHOW: a command was found by walking
+ * $PATH every time, so a program put EARLIER in $PATH ran at once where
+ * bash keeps running the one it remembered (Oils 1417), a remembered one
+ * that was deleted still ran nothing in tsh where bash runs the stale path
+ * and fails (1418), `hash` listed no hits (1420), and assigning PATH
+ * changed nothing (1477). What bash does, and so what this does:
  *
- * NO FIXED SIZE (S6, 2026-10-01): it held 64 entries with a 64-byte name and
- * a 256-byte path, and the 65th `hash -p` said nothing, returned 0 and
- * recorded nothing. Names and paths are heap strings now. */
-struct hashent { char *name; char *path; int hits; };
-static struct hashent *g_hashtab;
-static int g_hashtab_n;
-static int g_hashtab_cap;
+ *   - a command found through $PATH is remembered with one hit; every later
+ *     lookup of the name takes the remembered path WITHOUT looking again,
+ *     and counts a hit (bash's hash_search counts every search, `type` and
+ *     `command -v` included);
+ *   - a $PATH from the command's own prefix (`PATH=x cmd`) is searched
+ *     directly and remembers nothing; ANY assignment to PATH -- a prefix one
+ *     included -- empties the table (sv_path);
+ *   - the table walks in bash's hash order (256 buckets) for `hash`'s
+ *     listing, "hits\tcommand" then "%4d\t%s".
+ */
+static struct sh_htab g_phash = { 0, 0, 0, 0, 256 };
 
-static void hashtab_forget(int k) {
-    kfree(g_hashtab[k].name);
-    kfree(g_hashtab[k].path);
-    for (int m = k + 1; m < g_hashtab_n; m++) g_hashtab[m - 1] = g_hashtab[m];
-    g_hashtab_n--;
-}
-
-static int hashtab_find(const char *name) {
-    for (int i = 0; i < g_hashtab_n; i++)
-        if (strcmp(g_hashtab[i].name, name) == 0) return i;
-    return -1;
-}
-
-static bool hashtab_set(const char *name, const char *path) {
-    char *p = shell_strdup(path);
-    if (!p) return false;
-    int i = hashtab_find(name);
-    if (i < 0) {
-        char *n = shell_strdup(name);
-        if (!n) { kfree(p); return false; }
-        if (g_hashtab_n >= g_hashtab_cap) {
-            int ncap = g_hashtab_cap ? g_hashtab_cap * 2 : 32;
-            struct hashent *nv =
-                (struct hashent *)kmalloc((size_t)ncap * sizeof *nv);
-            if (!nv) { kfree(n); kfree(p); return false; }
-            for (int k = 0; k < g_hashtab_n; k++) nv[k] = g_hashtab[k];
-            if (g_hashtab) kfree(g_hashtab);
-            g_hashtab = nv;
-            g_hashtab_cap = ncap;
-        }
-        i = g_hashtab_n++;
-        g_hashtab[i].name = n;
-        g_hashtab[i].path = 0;
-        g_hashtab[i].hits = 0;
+static void phash_flush(void) {
+    while (g_phash.n > 0) {
+        kfree(g_phash.e[g_phash.n - 1].data);
+        sh_htab_remove_at(&g_phash, g_phash.n - 1);
     }
-    if (g_hashtab[i].path) kfree(g_hashtab[i].path);
-    g_hashtab[i].path = p;
+}
+
+static bool phash_remove(const char *name) {
+    int i = sh_htab_find(&g_phash, name);
+    if (i < 0) return false;
+    kfree(g_phash.e[i].data);
+    sh_htab_remove_at(&g_phash, i);
     return true;
 }
 
-static bool hashtab_add(const char *name) {
-    char path_buf[256];
-    const char *path = resolve_program(name, path_buf, sizeof path_buf);
-    if (!path_is_runnable(path)) return false;
-    return hashtab_set(name, path);
+/* `.` (or an empty entry) came before the directory it was found in. */
+#define PHASH_CHKDOT 1
+
+static void phash_insert(const char *name, const char *path, int hits,
+                         bool chkdot) {
+    if (!g_opt_hashall) return;
+    char *p = shell_strdup(path);
+    if (!p) return;
+    bool created;
+    int i = sh_htab_insert(&g_phash, name, &created);
+    if (i < 0) { kfree(p); return; }
+    kfree(g_phash.e[i].data);
+    g_phash.e[i].data = p;
+    g_phash.e[i].hits = hits;
+    g_phash.e[i].flags = chkdot ? PHASH_CHKDOT : 0;
 }
 
-static void cmd_hash(int argc, char **argv) {
-    shell_set_status(0);
-    bool clear = false, del = false, tpath = false, list = false;
-    const char *ppath = 0;
-    int i = 1;
-    for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
-        if (strcmp(argv[i], "--") == 0) { i++; break; }
-        bool stop = false;
-        for (const char *f = argv[i] + 1; *f && !stop; f++) {
-            switch (*f) {
-            case 'r': clear = true; break;
-            case 'd': del = true; break;
-            case 't': tpath = true; break;
-            case 'l': list = true; break;
-            case 'p':
-                if (f[1]) ppath = f + 1;
-                else if (i + 1 < argc) ppath = argv[++i];
-                else { kprintf("hash: -p: option requires an argument\n"); shell_set_status(2); return; }
-                stop = true;
-                break;
-            default:
-                kprintf("hash: -%c: invalid option\n", *f);
-                kprintf_raw("hash: usage: hash [-lr] [-p pathname] [-dt] [name ...]\n");
-                shell_set_status(2);
-                return;
+/* The path NAME was remembered under, its hit counted -- or 0. bash's
+ * phash_search: when `.` came first in the search, or the path is relative,
+ * ./NAME (./PATH) wins if it is executable now; a relative path that names
+ * the current directory and is no longer there is forgotten; otherwise the
+ * remembered path, unchecked -- `two/mycmd` deleted is still `two/mycmd`,
+ * and running it fails (Oils 1418). The answer lasts until the next call. */
+static const char *phash_search(const char *name) {
+    static char dotted[VFS_PATH_MAX];
+    if (!g_opt_hashall) return 0;
+    int i = sh_htab_find(&g_phash, name);
+    if (i < 0) return 0;
+    g_phash.e[i].hits++;
+    const char *path = (const char *)g_phash.e[i].data;
+    bool rel = path[0] != '/';
+    if ((g_phash.e[i].flags & PHASH_CHKDOT) || rel) {
+        const char *tail = rel ? path : name;
+        if (tail[0] == '.' && tail[1] == '/')
+            ksnprintf(dotted, sizeof dotted, "%s", tail);
+        else
+            ksnprintf(dotted, sizeof dotted, "./%s", tail);
+        if (path_is_runnable(dotted)) return dotted;
+        if (path[0] == '.') {
+            const char *slash = 0;
+            for (const char *q = path; *q; q++) if (*q == '/') slash = q;
+            if (slash) {
+                char d1[VFS_PATH_MAX], d2[VFS_PATH_MAX], dir[VFS_PATH_MAX];
+                size_t dl = (size_t)(slash - path);
+                if (dl >= sizeof dir) dl = sizeof dir - 1;
+                memcpy(dir, path, dl);
+                dir[dl] = '\0';
+                if (shell_canonicalize_path(".", d1, sizeof d1) >= 0 &&
+                    shell_canonicalize_path(dir, d2, sizeof d2) >= 0 &&
+                    strcmp(d1, d2) == 0)
+                    return 0;
             }
         }
     }
-    /* bash refuses every form while hashing is off (`set +h`). */
+    return path;
+}
+
+/* A PATH assignment empties the table. Called by every scalar write and
+ * unset (shell_hist_var_written). */
+static void shell_path_var_written(const char *key, size_t klen) {
+    if (klen == 4 && strncmp(key, "PATH", 4) == 0) phash_flush();
+}
+
+/* `hash -l`'s quoting: bash's printable_filename -- $'...' for a name
+ * with a control byte, single quotes for one with a shell metacharacter. */
+static int shell_quote_ansic(const char *v, struct shell_sb *out);
+static void hash_printable(struct shell_sb *b, const char *s) {
+    bool ctl = false;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f) ctl = true;
+    }
+    bool meta = sh_contains_shell_metas(s);
+    if (ctl) { (void)shell_quote_ansic(s, b); return; }
+    if (!meta) { (void)sb_puts(b, s); return; }
+    (void)sb_putc(b, '\'');
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') (void)sb_puts(b, "'\\''");
+        else (void)sb_putc(b, *p);
+    }
+    (void)sb_putc(b, '\'');
+}
+
+static void sh_builtin_usage(const char *name);
+static void shell_help_topic(const char *name);
+
+static void cmd_hash(int argc, char **argv) {
     if (!g_opt_hashall) {
         kprintf("hash: hashing disabled\n");
         shell_set_status(1);
         return;
     }
-    if (clear) while (g_hashtab_n > 0) hashtab_forget(g_hashtab_n - 1);
-    if (del) {
-        for (; i < argc; i++) {
-            int k = hashtab_find(argv[i]);
-            if (k < 0) { kprintf("hash: %s: not found\n", argv[i]); shell_set_status(1); continue; }
-            hashtab_forget(k);
-        }
-        return;
-    }
-    if (tpath) {
-        int many = (argc - i) > 1;
-        for (; i < argc; i++) {
-            int k = hashtab_find(argv[i]);
-            if (k < 0) { kprintf("hash: %s: not found\n", argv[i]); shell_set_status(1); continue; }
-            if (many) shell_printf("%s\t%s\n", argv[i], g_hashtab[k].path);
-            else      shell_printf("%s\n", g_hashtab[k].path);
-        }
-        return;
-    }
-    if (i >= argc) {
-        if (clear) return;                     /* bash prints nothing */
-        if (g_hashtab_n == 0) {
-            shell_printf("hash: hash table empty\n");
+    struct sh_igo g;
+    sh_igo_init(&g, "hash", argc, argv);
+    bool expunge = false, targets = false, portable = false, del = false;
+    const char *pathname = 0;
+    int c;
+    while ((c = sh_igo_next(&g, "dlp:rt")) != -1) {
+        switch (c) {
+        case 'd': del = true; break;
+        case 'l': portable = true; break;
+        case 'p': pathname = g.optarg; break;
+        case 'r': expunge = true; break;
+        case 't': targets = true; break;
+        case SH_IGO_HELP:
+            shell_help_topic("hash");
+            shell_set_status(2);
+            return;
+        default:
+            sh_builtin_usage("hash");
+            shell_set_status(2);
             return;
         }
-        if (list) {
-            for (int k = 0; k < g_hashtab_n; k++)
-                shell_printf("builtin hash -p %s %s\n", g_hashtab[k].path, g_hashtab[k].name);
-        } else {
-            shell_printf("hits\tcommand\n");
-            for (int k = 0; k < g_hashtab_n; k++)
-                shell_printf("%4d\t%s\n", g_hashtab[k].hits, g_hashtab[k].path);
-        }
+    }
+    int i = g.ind;
+    if (i >= argc && (del || targets)) {
+        kprintf("hash: %s: option requires an argument\n", del ? "-d" : "-t");
+        shell_set_status(1);
         return;
     }
+    /* `hash -r` is silent, `hash --` lists */
+    if (i >= argc && !expunge) {
+        if (g_phash.n == 0) {
+            if (!g_opt_posix && !portable) shell_printf("hash: hash table empty\n");
+        } else if (portable) {
+            for (int k = 0; k < g_phash.n; k++) {
+                SH_SB(l);
+                (void)sb_puts(&l, "builtin hash -p ");
+                hash_printable(&l, (const char *)g_phash.e[k].data);
+                (void)sb_putc(&l, ' ');
+                hash_printable(&l, g_phash.e[k].key);
+                shell_printf("%s\n", l.p);
+            }
+        } else {
+            shell_printf("hits\tcommand\n");
+            for (int k = 0; k < g_phash.n; k++)
+                shell_printf("%4d\t%s\n", g_phash.e[k].hits,
+                             (const char *)g_phash.e[k].data);
+        }
+        shell_set_status(0);
+        return;
+    }
+    if (expunge) phash_flush();
+    if (targets) {
+        bool all = true, many = argc - i > 1;
+        for (; i < argc; i++) {
+            const char *t = phash_search(argv[i]);
+            if (!t) {
+                kprintf("hash: %s: not found\n", argv[i]);
+                all = false;
+                continue;
+            }
+            if (portable) shell_printf("builtin hash -p %s %s\n", t, argv[i]);
+            else if (many) shell_printf("%s\t%s\n", argv[i], t);
+            else shell_printf("%s\n", t);
+        }
+        shell_set_status(all ? 0 : 1);
+        return;
+    }
+    int rc = 0;
     for (; i < argc; i++) {
-        if (ppath) {
-            if (!hashtab_set(argv[i], ppath)) shell_set_status(1);
+        const char *w = argv[i];
+        bool slash = false;
+        for (const char *q = w; *q; q++) if (*q == '/') slash = true;
+        if (slash) continue;
+        if (pathname) {
+            struct vfs_stat st;
+            if (vfs_stat(pathname, &st) == VFS_OK && st.type == VFS_TYPE_DIR) {
+                kprintf("hash: %s: Is a directory\n", pathname);
+                rc = 1;
+            } else {
+                phash_insert(w, pathname, 0, false);
+            }
             continue;
         }
-        if (!hashtab_add(argv[i])) {
-            kprintf("hash: %s: not found\n", argv[i]);
-            shell_set_status(1);
+        if (del) {
+            if (!phash_remove(w)) {
+                kprintf("hash: %s: not found\n", w);
+                rc = 1;
+            }
+            continue;
         }
+        /* add_hashed_command: not for a function or an enabled builtin */
+        if (shell_function_lookup(w)) continue;
+        if (shell_cmd_lookup(w) && shell_builtin_in_this_shell(w) &&
+            !shell_builtin_disabled(w))
+            continue;
+        (void)phash_remove(w);
+        char pbuf[VFS_PATH_MAX];
+        int how = CMDRES_NONE;
+        const char *full = resolve_program_ex(w, pbuf, sizeof pbuf, &how);
+        if (how == CMDRES_EXEC) phash_insert(w, full, 0, g_resolve_dot_seen);
+        else { kprintf("hash: %s: not found\n", w); rc = 1; }
     }
+    shell_set_status(rc);
 }
 
 static void cmd_kill(int argc, char **argv) {
@@ -18407,7 +18541,9 @@ static void shell_hist_truncate_file(long keep) {
  * negative N, or unsetting it, lifts the bound); HISTFILESIZE=N cuts the
  * history FILE to its last N lines at once. A value that is not a number
  * changes nothing. Called by every scalar write and unset. */
+static void shell_path_var_written(const char *key, size_t klen);
 static void shell_hist_var_written(const char *key, size_t klen) {
+    shell_path_var_written(key, klen);
     bool hsize = (klen == 8 && strncmp(key, "HISTSIZE", 8) == 0);
     bool fsize = (klen == 12 && strncmp(key, "HISTFILESIZE", 12) == 0);
     if (!hsize && !fsize) return;
@@ -19727,28 +19863,54 @@ static const char *resolve_program_ex(const char *name, char *out_buf,
 
     size_t nlen = strlen(name);
 
-    /* (2) PATH search. Treat empty/missing PATH as if it were "/bin"
-     * to keep behaviour stable when the user clears env unwisely. */
-    const char *path_var = env_get("PATH");
-    const char *cur = (path_var && *path_var) ? path_var : "/bin";
+    /* (2) PATH search -- the command's own prefix PATH when it has one
+     * (`PATH=x cmd` searches x, bash's find_variable_tempenv), else the
+     * shell's.
+     *
+     * AN UNSET OR EMPTY PATH SEARCHES NOTHING: the name is tried as it is,
+     * here (bash: `unset PATH; cmd` runs ./cmd, and when there is none says
+     * "cmd: No such file or directory", 127). AN EMPTY ENTRY IS THE CURRENT
+     * DIRECTORY (`PATH=/bin:` finds ./cmd as "./cmd"). tsh searched /bin
+     * for the first and skipped the second. */
+    g_resolve_nopath = false;
+    const char *path_var = g_spawn_temp_path ? g_spawn_temp_path : env_get("PATH");
+    if (!path_var || !*path_var) {
+        g_resolve_nopath = true;
+        struct vfs_stat st;
+        if (vfs_stat(name, &st) == VFS_OK && st.type == VFS_TYPE_FILE)
+            *how = test_access_ok(&st, 1u) ? CMDRES_EXEC : CMDRES_PATH_NOEXEC;
+        else
+            *how = CMDRES_NONE;
+        return name;
+    }
+    const char *cur = path_var;
     const char *keep_dir = 0;       /* first non-executable match, if any */
     size_t      keep_dlen = 0;
-    while (*cur) {
+    g_resolve_dot_seen = false;
+    for (;;) {
         const char *colon = cur;
         while (*colon && *colon != ':') colon++;
         size_t plen = (size_t)(colon - cur);
-        if (plen > 0) {
-            const char *cand = path_join(cur, plen, name, nlen,
-                                         out_buf, out_sz);
-            struct vfs_stat st;
-            if (cand && vfs_stat(cand, &st) == VFS_OK &&
-                st.type == VFS_TYPE_FILE) {
-                if (test_access_ok(&st, 1u)) { *how = CMDRES_EXEC; return cand; }
-                if (!keep_dir) { keep_dir = cur; keep_dlen = plen; }
-            }
+        const char *dir = plen ? cur : ".";
+        size_t dlen = plen ? plen : 1;
+        if (!g_resolve_dot_seen && dir[0] == '.') {
+            char d1[VFS_PATH_MAX], d2[VFS_PATH_MAX], db[VFS_PATH_MAX];
+            size_t cl = dlen < sizeof db ? dlen : sizeof db - 1;
+            memcpy(db, dir, cl);
+            db[cl] = '\0';
+            if (shell_canonicalize_path(".", d1, sizeof d1) >= 0 &&
+                shell_canonicalize_path(db, d2, sizeof d2) >= 0 &&
+                strcmp(d1, d2) == 0)
+                g_resolve_dot_seen = true;
         }
-        cur = colon;
-        if (*cur == ':') cur++;
+        const char *cand = path_join(dir, dlen, name, nlen, out_buf, out_sz);
+        struct vfs_stat st;
+        if (cand && vfs_stat(cand, &st) == VFS_OK && st.type == VFS_TYPE_FILE) {
+            if (test_access_ok(&st, 1u)) { *how = CMDRES_EXEC; return cand; }
+            if (!keep_dir) { keep_dir = dir; keep_dlen = dlen; }
+        }
+        if (!*colon) break;
+        cur = colon + 1;
     }
     if (keep_dir) {
         /* Remember the DIRECTORY and rebuild, rather than stashing the
@@ -19774,6 +19936,40 @@ static const char *resolve_program_ex(const char *name, char *out_buf,
 static const char *resolve_program(const char *name, char *out_buf,
                                    size_t out_sz) {
     return resolve_program_ex(name, out_buf, out_sz, 0);
+}
+
+/* The search a command that is about to RUN makes -- bash's
+ * search_for_command with CMDSRCH_HASH: a name without a slash, under the
+ * shell's own $PATH (no prefix PATH), is looked up in the hash table first
+ * and, when the walk finds it, remembered with one hit. See phash_search
+ * for what a remembered path means. */
+static const char *phash_search(const char *name);
+static void phash_insert(const char *name, const char *path, int hits,
+                         bool chkdot);
+static const char *resolve_program_run(const char *name, char *out_buf,
+                                       size_t out_sz, int *how) {
+    int ignored;
+    if (!how) how = &ignored;
+    bool slash = false;
+    for (const char *c = name; *c; c++) if (*c == '/') { slash = true; break; }
+    bool hashable = !slash && !g_spawn_temp_path && g_opt_hashall && *name;
+    if (hashable) {
+        const char *h = phash_search(name);
+        if (h) {
+            size_t l = strlen(h);
+            if (l + 1 <= out_sz) {
+                memcpy(out_buf, h, l + 1);
+                *how = CMDRES_EXEC;
+                g_resolve_nopath = false;
+                return out_buf;
+            }
+        }
+    }
+    const char *r = resolve_program_ex(name, out_buf, out_sz, how);
+    if (hashable && (*how == CMDRES_EXEC ||
+                     (*how == CMDRES_PATH_NOEXEC && !g_resolve_nopath)))
+        phash_insert(name, r, 1, g_resolve_dot_seen);
+    return r;
 }
 
 /* ---- why did the spawn fail? ------------------------------------------
@@ -19828,7 +20024,9 @@ static int shell_exec_head(const char *path, char *interp, size_t cap) {
 static int shell_report_unrunnable(const char *as_typed, int status) {
     bool slash = false;
     for (const char *c = as_typed; *c && !slash; c++) slash = (*c == '/');
-    if (!slash) {
+    /* With PATH unset or empty nothing is searched: the name was tried
+     * here and is not -- bash's file_error, "No such file or directory". */
+    if (!slash && !g_resolve_nopath) {
         if (g_spawn_for) kprintf("%s: %s: not found\n", g_spawn_for, as_typed);
         else kprintf(SH_PFX_TSH "%s: command not found\n", as_typed);
         return 127;
@@ -19841,6 +20039,7 @@ static int shell_report_unrunnable(const char *as_typed, int status) {
 
 static int shell_explain_spawn_failure(const char *path, const char *as_typed,
                                        int *status) {
+    (void)as_typed;             /* bash names the path it executed */
 #ifdef SHELL_HOSTED
     /* TOO MANY ARGUMENTS IS NOT A BAD FILE. The kernel refuses an argv or
      * environment past ABI_ARGS_TOTAL_MAX (or one string past
@@ -19851,7 +20050,7 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
     {
         extern int host_spawn_was_e2big(void);
         if (host_spawn_was_e2big()) {
-            kprintf(SH_PFX_TSH "%s: Argument list too long\n", as_typed);
+            kprintf(SH_PFX_TSH "%s: Argument list too long\n", path);
             *status = 126;
             return 0;
         }
@@ -19865,12 +20064,12 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
     if (sr != VFS_OK) { *status = 127; return -1; }
     *status = 126;
     if (est.type == VFS_TYPE_DIR) {
-        kprintf(SH_PFX_TSH "%s: Is a directory\n", as_typed);
+        kprintf(SH_PFX_TSH "%s: Is a directory\n", path);
         return 0;
     }
     if (est.type != VFS_TYPE_FILE) return -1;
     if (est.mode != 0 && (est.mode & 0111) == 0) {
-        kprintf(SH_PFX_TSH "%s: Permission denied\n", as_typed);
+        kprintf(SH_PFX_TSH "%s: Permission denied\n", path);
         return 0;
     }
     char chain[2][SHELL_EXEC_HEAD];
@@ -19879,16 +20078,16 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
         char *interp = chain[depth & 1];
         int h = shell_exec_head(cur, interp, SHELL_EXEC_HEAD);
         if (h == -2) {
-            kprintf(SH_PFX_TSH "%s: Permission denied\n", as_typed);
+            kprintf(SH_PFX_TSH "%s: Permission denied\n", path);
             return 0;
         }
         if (h == -1) {
             if (depth == 0)
                 kprintf(SH_PFX_TSH "%s: cannot execute binary file: "
-                        "Exec format error\n", as_typed);
+                        "Exec format error\n", path);
             else
                 kprintf(SH_PFX_TSH "%s: %s: bad interpreter: Exec format error\n",
-                        as_typed, cur);
+                        path, cur);
             return 0;
         }
         if (h == 0 || interp[0] == 0) {
@@ -19897,18 +20096,23 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
              * interpreter, which cannot be a plain text file. */
             if (depth == 0) return 1;
             kprintf(SH_PFX_TSH "%s: %s: bad interpreter: Exec format error\n",
-                    as_typed, cur);
+                    path, cur);
             return 0;
         }
         struct vfs_stat ist;
+        /* A MISSING INTERPRETER is execve's ENOENT on a file that exists,
+         * which bash 5.2 reports as "cannot execute: required file not
+         * found", 127 -- tsh said "bad interpreter", 126 (Oils 1423
+         * 1477). */
         if (vfs_stat(interp, &ist) != VFS_OK) {
-            kprintf(SH_PFX_TSH "%s: %s: bad interpreter: No such file or directory\n",
-                    as_typed, interp);
+            kprintf(SH_PFX_TSH "%s: cannot execute: required file not found\n",
+                    path);
+            *status = 127;
             return 0;
         }
         if (depth == SHELL_SHEBANG_DEPTH - 1) {
             kprintf(SH_PFX_TSH "%s: %s: bad interpreter: "
-                    "Too many levels of symbolic links\n", as_typed, interp);
+                    "Too many levels of symbolic links\n", path, interp);
             return 0;
         }
         cur = interp;
@@ -19931,6 +20135,22 @@ static char **shell_script_argv(const char *path, int argc, char **argv,
     out[n] = 0;
     *out_n = n;
     return out;
+}
+
+/* The PATH a command's prefix assignments give it -- the value in the
+ * environment built for it -- or 0 when none of them assigns PATH. A
+ * `PATH=x cmd` searches x (bash's find_variable_tempenv), and that search
+ * neither reads nor fills the hash table. */
+static const char *shell_prefix_path(char **assigns, int assignc,
+                                     char **envp, int envc) {
+    bool has = false;
+    for (int i = 0; i < assignc && !has; i++)
+        has = env_assign_name_len(assigns[i]) == 4 &&
+              strncmp(assigns[i], "PATH", 4) == 0;
+    if (!has) return 0;
+    for (int i = 0; i < envc; i++)
+        if (envp[i] && strncmp(envp[i], "PATH=", 5) == 0) return envp[i] + 5;
+    return "";
 }
 
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
@@ -19962,8 +20182,8 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         g_shell_fd[2] = spawn_diag_saved;
         return 127;
     }
-    char path_buf[64];
-    const char *path = resolve_program(path_arg, path_buf, sizeof(path_buf));
+    char path_buf[VFS_PATH_MAX];
+    const char *path = resolve_program_run(path_arg, path_buf, sizeof(path_buf), 0);
 
     struct proc_spec spec = {
         .path = path,
@@ -29913,11 +30133,13 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
         return 1;
     }
     int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
+    g_spawn_temp_path = shell_prefix_path(cmd->argv, assignc, envp, envc);
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
                                              fds.fd[0], fds.fd[1], fds.fd[2],
                                              envc, envp, xfd, nxfd);
+    g_spawn_temp_path = 0;
     shell_fd_state_close_owned(&fds);
     return rc;
 }
@@ -30071,8 +30293,10 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
         return 1;
     }
 
-    char path_buf[64];
-    const char *path = resolve_program(argv[0], path_buf, sizeof(path_buf));
+    char path_buf[VFS_PATH_MAX];
+    g_spawn_temp_path = shell_prefix_path(cmd->argv, assignc, envp, envc);
+    const char *path = resolve_program_run(argv[0], path_buf, sizeof(path_buf), 0);
+    g_spawn_temp_path = 0;
     struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
         (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n) *
                                       sizeof *xfd);
