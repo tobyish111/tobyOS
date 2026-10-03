@@ -7478,6 +7478,8 @@ static void cmd_export(int argc, char **argv) {
  * indexed form joins with a separator. Matching it is the difference between
  * passing these cases and looking like it.
  */
+static void shell_declare_quote_key(const char *k);
+
 static void shell_declare_quote(const char *v) {
     /* A VALUE WITH A NON-PRINTABLE BYTE GOES IN `$'...'`, not in quotes:
      * bash prints `declare -- zz=$'one\ntwo'` and `declare -a arr=([0]="a"
@@ -7564,8 +7566,13 @@ static bool shell_declare_print(const char *name) {
         int n = arr ? arr->n : 0;
         shell_printf("(");
         for (int k = 0; k < n; k++) {
-            if (arr->assoc) shell_printf("[%s]=", arr->e[k].key ? arr->e[k].key : "");
-            else            shell_printf("[%ld]=", arr->e[k].idx);
+            if (arr->assoc) {
+                shell_printf("[");
+                shell_declare_quote_key(arr->e[k].key);
+                shell_printf("]=");
+            } else {
+                shell_printf("[%ld]=", arr->e[k].idx);
+            }
             shell_declare_quote(arr->e[k].val);
             /* Indexed joins with a separator; associative appends one after
              * EVERY element, which is where the trailing space comes from. */
@@ -8562,50 +8569,32 @@ static void shell_set_quote(const char *v) {
     shell_printf("'");
 }
 
-/* An associative KEY is printed bare when it can be, double-quoted when it
- * cannot: bash writes `[a]=\"b\"` and `[\"k e y\"]=\"v a l\"`. */
+/* An associative KEY as bash's assoc_to_assign writes it: $'...' when it
+ * has a byte that needs it, double-quoted when it holds a shell
+ * metacharacter (sh_contains_shell_metas) or is `@` or `*`, bare
+ * otherwise -- `[q]`, `["r s"]`, `["\$y"]`, `[$'t\tu']`, `[a.b]`. tsh
+ * printed every key bare in `declare -p` (Oils-style probes p32/p33),
+ * and here quoted anything that was not a name character. */
 static void shell_declare_quote_key(const char *k) {
     const char *p = k ? k : "";
-    bool need = (*p == '\0');
-    for (const char *q = p; *q && !need; q++)
-        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
-              (*q >= '0' && *q <= '9') || *q == '_'))
-            need = true;
-    if (!need) { shell_printf("%s", p); return; }
-    shell_declare_quote(p);
+    if (shell_q_needs_ansi(p)) { (void)shell_ansi_render(p, true); return; }
+    if (sh_contains_shell_metas(p) || ((p[0] == '@' || p[0] == '*') && !p[1])) {
+        shell_declare_quote(p);
+        return;
+    }
+    shell_printf("%s", p);
 }
 
 /* One `set` line: `name=value`, or the array form for an array. */
 static void shell_set_print_one(const char *name) {
     struct sh_array *arr = sh_array_find_literal(name);
     if (arr) {
-        /* ASSOCIATIVE ORDER IS NOT REPRODUCIBLE. bash prints its own
-         * hash order -- `([zebra]=1 [apple]=2 [mango]=3 [banana]=4)`
-         * comes back apple, mango, zebra, banana, from either insertion
-         * order -- and nothing here can imitate that. Sorting by key is
-         * a DETERMINISTIC stand-in, not bash's rule: it agrees on small
-         * key sets and will differ on larger ones. Stated rather than
-         * hidden, because the alternative is insertion order, which
-         * agrees with bash even less often. */
-        int *ord = (int *)kmalloc((size_t)(arr->n > 0 ? arr->n : 1) * sizeof(int));
-        if (!ord) return;
-        for (int k = 0; k < arr->n; k++) ord[k] = k;
-        if (arr->assoc) {
-            for (int a = 1; a < arr->n; a++) {
-                int v = ord[a], b = a - 1;
-                const char *vk = arr->e[v].key ? arr->e[v].key : "";
-                while (b >= 0) {
-                    const char *bk = arr->e[ord[b]].key ? arr->e[ord[b]].key : "";
-                    if (strcmp(bk, vk) <= 0) break;
-                    ord[b + 1] = ord[b];
-                    b--;
-                }
-                ord[b + 1] = v;
-            }
-        }
+        /* bash's own order: an associative array's elements are KEPT in
+         * its hash-table order (sh_array_set_key), so they print as they
+         * stand -- the key sort that stood in for it is gone. */
         shell_printf("%s=(", name);
         for (int oi = 0; oi < arr->n; oi++) {
-            int k = ord[oi];
+            int k = oi;
             if (arr->assoc) {
                 shell_printf("[");
                 shell_declare_quote_key(arr->e[k].key ? arr->e[k].key : "");
@@ -8618,7 +8607,6 @@ static void shell_set_print_one(const char *name) {
             else if (oi + 1 < arr->n) shell_printf(" ");
         }
         shell_printf(")\n");
-        kfree(ord);
         return;
     }
     size_t klen = strlen(name);
