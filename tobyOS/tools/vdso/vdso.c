@@ -14,7 +14,8 @@
  *   - No libcalls. u64 multiply/divide only (single divq on x86-64), no
  *     memset/memcpy shapes the compiler could "optimise" into calls.
  *   - The time math is BIT-FOR-BIT the kernel's perf_now_ns():
- *     ns = (rdtsc - boot_tsc) * 1000000 / tsc_khz. Same formula, same
+ *     ns = (rdtsc - boot_tsc) * 1000000 / tsc_khz, taken in two steps
+ *     (whole ms, then the remainder) so it cannot overflow. Same formula, same
  *     published constants, so a vDSO read and a syscall read can never
  *     disagree by more than the rounding of one division.
  *   - Any clock we do not model falls back to the REAL SYSCALL from
@@ -80,7 +81,10 @@ static int read_clock(int clk, u64 *out) {
         __asm__ volatile("" ::: "memory");
         if (d->seq != s0) continue;
         if (khz == 0) return -1;
-        u64 mono = (rdtsc_ordered() - bt) * 1000000ull / khz;
+        /* in two steps, as perf_tsc_to_ns: the one product overflowed
+         * after 2^64/1e6 cycles (~72 min at 4.3 GHz) */
+        u64 dt = rdtsc_ordered() - bt;
+        u64 mono = (dt / khz) * 1000000ull + (dt % khz) * 1000000ull / khz;
         switch (clk) {
         case CLK_MONOTONIC:
         case CLK_MONOTONIC_RAW:
