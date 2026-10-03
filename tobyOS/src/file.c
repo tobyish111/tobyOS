@@ -676,6 +676,11 @@ long file_read(struct file *f, void *buf, size_t n) {
     }
     case FILE_KIND_DEVNULL:
         return 0;                                  /* always EOF */
+    case FILE_KIND_DIR:
+        /* read(2) on a directory is EISDIR, as on Linux -- it fell to the
+         * default's -1, which userland reads as EPERM: bash's `read x < dir`
+         * said "read error: 0: Operation not permitted" (logs/b12 p59). */
+        return -ABI_EISDIR;
     case FILE_KIND_DEVZERO:
     case FILE_KIND_DEVFULL:                        /* slice 6: reads as zeroes */
         memset(buf, 0, n);

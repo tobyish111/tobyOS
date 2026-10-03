@@ -2587,8 +2587,28 @@ static long sys_open(const char *path, int flags, int mode) {
     return sys_open_resolved(kpath, flags, mode);
 }
 
+/* O_DIRECTORY, at Linux's value. A NATIVE open of a directory is refused
+ * (EISDIR from the filesystem) unless the caller asks for a directory this
+ * way -- then it gets the same descriptor the Linux personality hands out
+ * for any directory (linux_open_dir): one getdents64 lists and read(2)
+ * refuses with EISDIR. /bin/tsh asks, for `cmd < dir`: bash opens that
+ * fine and its readers fail -- `read` says "read error: 0: Is a
+ * directory", `mapfile` reads nothing, status 0 (Oils 1122; logs/b12 p59).
+ * Opt-in, so no native caller that relies on the refusal changes. */
+#define SYS_O_DIRECTORY 0x10000
+static bool lx_dir_open_refused(long flags);
+static long linux_open_dir(const char *kpath);
+
 static long sys_open_resolved(const char *kpath, int flags, int mode) {
     (void)mode;     /* M25A: permissions on creation not honoured yet */
+
+    if (flags & SYS_O_DIRECTORY) {
+        struct vfs_stat ds;
+        if (vfs_stat(kpath, &ds) == VFS_OK && ds.type == VFS_TYPE_DIR) {
+            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+            return linux_open_dir(kpath);
+        }
+    }
 
     /* Slice 8: /proc/<pid>/ns/<kind> and /proc/self/ns/<kind>.
      *
