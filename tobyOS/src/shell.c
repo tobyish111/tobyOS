@@ -30162,6 +30162,10 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                 }
                 return 1;
             }
+            /* ...and a refusal that said why and dropped the line itself
+             * (shell_assign_refused: a list to an element, a write through
+             * a reference to one) needs no second message. */
+            if (g_shell_flow != SHELL_FLOW_NONE) return 1;
             kprintf("%s: failed to set '%s'\n",
                     label ? label : "shell", assignv[i]);
             rc = 1;
