@@ -4899,6 +4899,33 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
         if (child->state != PROC_TERMINATED) return 0;
     }
 
+    /* THE BLOCKING WAIT IS INTERRUPTIBLE, as the arms above and every other
+     * blocking call here are. It went straight into proc_wait_info, which
+     * sleeps until the child is gone and never looks at a signal: a signal
+     * woke it, it went back to sleep, and the signal landed only when the
+     * child died. So a subshell waiting for its command could not be
+     * killed -- `( sleep 4 ) & kill $!` took four seconds under tsh and none
+     * under bash, whose wait4(-1) polls (logs/b12 cpk3) -- and a killed
+     * coprocess subshell held its pipe open for good (p80). A signal that
+     * acts now ends the wait: a fatal one is delivered on the way out, a
+     * handler gets EINTR or the restart SA_RESTART asks for. The stop class
+     * and the default-ignored signals do not, as in the arms above. */
+    {
+        struct proc *self = current_proc();
+        for (;;) {
+            struct proc *child = proc_lookup(pid);
+            if (!self || !child || child->state == PROC_TERMINATED) break;
+            uint64_t pend = self->pending_signals & ~self->sigstate.mask;
+            pend |= self->pending_signals & SIGMASK(SIGKILL);
+            if ((pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self))
+                return -ABI_EINTR;
+            self->wait_pid = pid;
+            self->state    = PROC_BLOCKED;
+            sched_yield();
+            self->wait_pid = -1;        /* see proc_wait_any */
+        }
+    }
+
     struct proc_exit_info xi;
     memset(&xi, 0, sizeof xi);
     int code = proc_wait_info(pid, &xi);
