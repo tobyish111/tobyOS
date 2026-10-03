@@ -1,0 +1,9 @@
+# BASH_SUBSHELL in ( ), $( ), pipelines and & ; exporting long names and
+# unsetting an exported associative array.
+# (batch 12; probe p40 in C:\t\b12)
+exec 2>&1
+n=$(printf 'v%.0s' {1..200}); eval "export $n=e"; env | grep -c "^$n=e"
+m=$(printf 'w%.0s' {1..120}); eval "export $m=f"; env | grep -c "^$m=f"
+o=$(printf 'u%.0s' {1..60}); eval "export $o=g"; env | grep -c "^$o=g"
+export | grep -c "$n"
+eval "$n=h /usr/bin/env" | grep -c "^$n=h"

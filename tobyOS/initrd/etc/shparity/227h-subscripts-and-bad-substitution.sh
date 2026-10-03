@@ -1,0 +1,24 @@
+# Associative keys and arithmetic subscripts as bash expands them (once, at
+# assignment), the empty subscript's errors, and the text a bad substitution
+# names -- the expansion unit, as bash reports it.
+# (batch 12; probe p17 in C:\t\b12)
+exec 2>&1
+a=(1); v=abc; e=
+echo "1 ${u^^${a[]}} c"
+echo "2 ${u,${a[]}} c"
+echo "3 ${u:${a[]}} c"
+echo "4 ${u:1:${a[]}} c"
+echo "5 ${u%%${a[]}} c"
+echo "6 ${u//${a[]}} c"
+echo "7 ${u/#x/${a[]}} c"
+echo "8 ${e^^${a[]}} c"
+echo "9 ${u[@]/x/${a[]}} c"
+echo "10 ${a[@]/x/$(echo SIDE >&2)} c"
+echo "11 ${u/x/$(echo SIDE2 >&2)} c"
+echo "12 ${u#$(echo SIDE3 >&2)} c"
+echo "13 ${u:$(echo SIDE4 >&2; echo 1)} c"
+echo "14 ${u@Q} ${u@${a[]}} c"
+echo "15 ${!u/x/$(echo SIDE5 >&2)} c"
+r=u; echo "16 ${!r/x/$(echo SIDE6 >&2)} c"
+echo "17 ${#u} c"
+set --; echo "18 ${@/x/$(echo SIDE7 >&2)} c" "${1/x/$(echo SIDE8 >&2)}"
