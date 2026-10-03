@@ -31217,6 +31217,17 @@ static void shell_restore_io_frame(struct shell_io_frame *frame) {
  * after -- a flag rather than a return value because shell_write_fn_t is void
  * and every builtin writes through it. */
 static bool g_shell_out_failed;
+/* ...and why, for bash's "NAME: write error: REASON" */
+static const char *g_shell_out_why;
+
+static void shell_out_fail(const struct file *f, long rv) {
+    if (!g_shell_out_failed)
+        g_shell_out_why = (f && f->kind == FILE_KIND_NULL) ? "Bad file descriptor"
+                        : rv == -28 ? "No space left on device"
+                        : rv == -32 ? "Broken pipe"
+                        : "Input/output error";
+    g_shell_out_failed = true;
+}
 
 /* A BUILTIN WHOSE STDOUT IS THE CONSOLE TOOK THE WHOLE MACHINE DOWN.
  *
@@ -31250,7 +31261,8 @@ static void shell_file_output(const char *s, void *ctx) {
         return;
     }
 #endif
-    if (s && f && file_write(f, s, strlen(s)) < 0) g_shell_out_failed = true;
+    long wr = (s && f) ? file_write(f, s, strlen(s)) : 0;
+    if (wr < 0) shell_out_fail(f, wr);
 }
 
 static void shell_file_kputc(void *ctx, char c) {
@@ -31258,7 +31270,8 @@ static void shell_file_kputc(void *ctx, char c) {
 #ifndef SHELL_HOSTED
     if (f && f->kind == FILE_KIND_CONSOLE) { shell_term_putc(c); return; }
 #endif
-    if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
+    long wr = f ? file_write(f, &c, 1) : 0;
+    if (wr < 0) shell_out_fail(f, wr);
 }
 
 /* One byte, NUL included. shell_putc hands the sink a C string, so a NUL
@@ -31272,7 +31285,8 @@ static void shell_putc_raw(char c) {
 #ifndef SHELL_HOSTED
         if (f && f->kind == FILE_KIND_CONSOLE) { shell_term_putc(c); return; }
 #endif
-        if (f && file_write(f, &c, 1) < 0) g_shell_out_failed = true;
+        long wr = f ? file_write(f, &c, 1) : 0;
+        if (wr < 0) shell_out_fail(f, wr);
         return;
     }
     shell_putc(c);
@@ -31529,8 +31543,12 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     if (fds.fd[1]) {
         shell_set_output(old_fn, old_ctx);
         /* A builtin that could not write what it was asked to write did not
-         * succeed, whatever it thinks -- `echo hi > /dev/full` is status 1. */
+         * succeed, whatever it thinks -- `echo hi > /dev/full` is status 1 --
+         * and says so, as bash's does: "echo: write error: Bad file
+         * descriptor" after `exec >&-` or a moved stdout (logs/b12 p42). */
         if (g_shell_out_failed && rc == 0) {
+            kprintf("%s: write error: %s\n", c->name,
+                    g_shell_out_why ? g_shell_out_why : "Input/output error");
             rc = 1;
             shell_set_status(1);
         }

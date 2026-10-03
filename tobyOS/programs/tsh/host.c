@@ -282,7 +282,10 @@ long file_read(struct file *f, void *buf, size_t n) {
  * first pipe-full and the newline. Retried, as bash retries. */
 long file_write(struct file *f, const void *buf, size_t n) {
     if (!f) return -1;
-    if (f->kind == FILE_KIND_NULL) return (long)n;    /* `>&-` discards */
+    /* `>&-` CLOSED it: a write fails, as bash's does -- "echo: write
+     * error: Bad file descriptor", status 1. It returned success, so a
+     * builtin writing to a closed stdout said nothing (logs/b12 p50). */
+    if (f->kind == FILE_KIND_NULL) return -EBADF;
     if (f->kind != FILE_KIND_VFS) return -1;
     int fd = VF_FD(&f->vfs);
     const char *p = (const char *)buf;
@@ -291,7 +294,9 @@ long file_write(struct file *f, const void *buf, size_t n) {
         long put = write(fd, p + done, n - done);
         if (put < 0) {
             if (errno == EINTR) continue;
-            return done > 0 ? (long)done : put;
+            /* the errno, negated, for the caller's "write error: REASON"
+             * (/dev/full is ENOSPC) */
+            return done > 0 ? (long)done : -(long)errno;
         }
         if (put == 0) break;
         done += (size_t)put;
