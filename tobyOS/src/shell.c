@@ -1081,6 +1081,13 @@ struct shell_alias {
 struct shell_function {
     char *name;
     char *body;
+    /* The body is a WHOLE compound command -- `( ... )`, or `{ ...; }` with
+     * the redirections the definition carried -- rather than the text
+     * between its braces. The printer needs to know which. */
+    bool whole;
+    /* `export -f`: a child's environment carries it as BASH_FUNC_NAME%%,
+     * the definition printed on one line, as bash's does. */
+    bool exported;
     /* HERE-DOCUMENT BODIES THE DEFINITION SWALLOWED.
      *
      *     f() {
@@ -4320,7 +4327,13 @@ static struct shell_function *shell_function_lookup(const char *name) {
     return idx >= 0 ? &g_functions[idx] : 0;
 }
 
+/* Set by a definition site for the shell_function_set call that follows:
+ * the body it hands over is a whole compound command (see .whole). */
+static bool g_fndef_whole;
+
 static int shell_function_set(const char *name, const char *body) {
+    bool whole = g_fndef_whole;
+    g_fndef_whole = false;
     /* The WORD rule -- see shell_func_name_char. This held a function name
      * to the variable rule, so a definition the parser had accepted was
      * then refused here. */
@@ -4396,6 +4409,7 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
+    g_functions[idx].whole = whole;
     if (g_functions[idx].src) kfree(g_functions[idx].src);
     g_functions[idx].src = g_diag_source ? shell_strdup(g_diag_source) : 0;
 
@@ -4469,6 +4483,8 @@ static void shell_function_unset(const char *name) {
     g_functions[idx].nheredoc = 0;
     g_functions[idx].name = 0;
     g_functions[idx].body = 0;
+    g_functions[idx].whole = false;
+    g_functions[idx].exported = false;     /* the slot may be reused */
     if (g_functions[idx].src) kfree(g_functions[idx].src);
     g_functions[idx].src = 0;
 }
@@ -7856,8 +7872,23 @@ static bool shell_declare_print(const char *name) {
  * bash's trailing spaces so at least those match byte for byte. Stated
  * rather than hidden: a case that prints a body and compares it to bash
  * will still differ, and none of the ones this change closes does. */
+static char *shell_function_printed(const struct shell_function *fn, bool multiline);
+
 static void shell_declare_print_function(const struct shell_function *fn) {
     if (!fn || !fn->name) return;
+    /* bash's own rendering of the parse tree (see shell_print_text); the
+     * stored text below only if that cannot be had */
+    {
+        char *t = shell_function_printed(fn, true);
+        if (t) {
+            /* written whole: shell_printf's buffer is fixed, and a long
+             * body came out cut short (logs/b12 p71) */
+            shell_write(t);
+            shell_write("\n");
+            kfree(t);
+            return;
+        }
+    }
     shell_printf("%s () \n", fn->name);
     /* Without its here-document tags: see SHELL_HD_TAG. */
     char *shown = fn->body ? shell_strdup(fn->body) : 0;
@@ -14767,6 +14798,179 @@ static bool g_reader_main_script;
  * -- with bash's consequences (see shell_syn_fail). */
 #include "shell_bashsyn.inc"
 
+/* ---- printing a command as bash prints it --------------------------------
+ *
+ * bash shows a command by printing its parse tree (print_cmd.c), never the
+ * text that was typed: `declare -f` and `type` print a function that way,
+ * $BASH_COMMAND holds the command being run that way, `jobs` and the
+ * "Killed" report name a job that way. tsh kept text and re-indented it
+ * by hand, which matched bash only for a body of simple commands. The
+ * grammar check now builds bash's tree when asked (bsyn_env.build) and
+ * prints it with print_cmd.c's rules (bsp_*); this is the shell's door to
+ * that. A here-document's body is not in the text the shell keeps -- its
+ * operator carries a tag naming the stored body (SHELL_HD_TAG) -- so the
+ * tags are taken out and the bodies handed to the parser in order. */
+
+enum { SHPR_COMMAND, SHPR_FUNC, SHPR_FUNC_LINE, SHPR_FOR_HEAD, SHPR_SELECT_HEAD,
+       SHPR_CASE_HEAD, SHPR_ARITH_FOR_HEAD };
+
+struct shell_pr_hd {
+    int *ids;
+    int n, cap;
+    struct shell_sb tmp;
+};
+
+static int shell_ansi_cp_bytes(unsigned long cp, char *out);
+static const char *shell_hd_tag_scan(const char *s, int *id);
+
+/* The Nth body: as stored, except that an unquoted delimiter's document has
+ * its backslash-newlines joined -- bash reads it that way (read_secondary_line). */
+static const char *shell_pr_hd_body(void *ctx, int n, size_t *len) {
+    struct shell_pr_hd *h = (struct shell_pr_hd *)ctx;
+    *len = 0;
+    if (n < 0 || n >= h->n) return "";
+    int id = h->ids[n];
+    if (id < 0 || id >= g_hd_cap || !g_hd_store[id].live) return "";
+    const struct shell_hd_entry *e = &g_hd_store[id];
+    if (!e->expand) { *len = e->len; return e->body ? e->body : ""; }
+    sb_truncate(&h->tmp, 0);
+    for (size_t i = 0; i < e->len; i++) {
+        char c = e->body[i];
+        if (c == '\\' && i + 1 < e->len) {
+            if (e->body[i + 1] == '\n') { i++; continue; }
+            if (sb_putc(&h->tmp, c) < 0 || sb_putc(&h->tmp, e->body[++i]) < 0) return "";
+            continue;
+        }
+        if (sb_putc(&h->tmp, c) < 0) return "";
+    }
+    *len = h->tmp.len;
+    return h->tmp.p ? h->tmp.p : "";
+}
+
+static void shell_syn_env(struct bsyn_env *env, bool string, bool repl);
+
+static int shell_pr_ansi_u(void *ctx, unsigned long cp, char *out) {
+    (void)ctx;
+    return shell_ansi_cp_bytes(cp, out);
+}
+
+/* The head bash prints for a loop's DEBUG trap and $BASH_COMMAND:
+ * print_for_command_head and friends. */
+static void shell_pr_head(struct bsp *pp, const struct bsn *n, int mode) {
+    if ((mode == SHPR_FOR_HEAD || mode == SHPR_SELECT_HEAD) &&
+        (n->type == BN_FOR || n->type == BN_SELECT)) {
+        bsp_puts(pp, n->type == BN_FOR ? "for " : "select ");
+        bsp_puts(pp, n->name ? n->name : "");
+        bsp_puts(pp, " in ");
+        bsp_words(pp, n->words, " ");
+    } else if (mode == SHPR_CASE_HEAD && n->type == BN_CASE) {
+        bsp_puts(pp, "case ");
+        bsp_puts(pp, n->words && n->words->w ? n->words->w : "");
+        bsp_puts(pp, " in ");
+    } else if (mode == SHPR_ARITH_FOR_HEAD && n->type == BN_ARITH_FOR) {
+        bsp_puts(pp, "((");
+        bsp_puts(pp, n->ex[0] ? n->ex[0] : "1");
+        bsp_puts(pp, "; ");
+        bsp_puts(pp, n->ex[1] ? n->ex[1] : "1");
+        bsp_puts(pp, "; ");
+        bsp_puts(pp, n->ex[2] ? n->ex[2] : "1");
+        bsp_puts(pp, "))");
+    } else {
+        bsp_command_string(pp, n);
+    }
+}
+
+/* TEXT's first command as bash prints it -- the whole command
+ * (make_command_string), a function definition (named_function_string, as
+ * `declare -f` shows it or as one line for the environment, named FNAME),
+ * or a loop's head. A heap string, or 0 when the text does not parse. */
+static char *shell_print_text(const char *text, int mode, const char *fname) {
+    if (!text) return 0;
+    char *res = 0;
+    struct shell_pr_hd hd;
+    memset(&hd, 0, sizeof hd);
+    sb_init(&hd.tmp);
+    SH_SB(clean);
+    for (const char *q = text; *q; ) {
+        int id;
+        const char *e = shell_hd_tag_scan(q, &id);
+        if (e) {
+            if (hd.n >= hd.cap) {
+                int ncap = hd.cap ? hd.cap * 2 : 8;
+                int *ni = (int *)kmalloc((size_t)ncap * sizeof *ni);
+                if (!ni) goto out;
+                if (hd.n) memcpy(ni, hd.ids, (size_t)hd.n * sizeof *ni);
+                kfree(hd.ids);
+                hd.ids = ni;
+                hd.cap = ncap;
+            }
+            hd.ids[hd.n++] = id;
+            q = e;
+            continue;
+        }
+        if (sb_putc(&clean, *q++) < 0) goto out;
+    }
+    {
+        struct bsyn_env env;
+        shell_syn_env(&env, true, false);
+        env.build = true;
+        env.expand_aliases = false;     /* the text is what was defined */
+        env.hd_body = shell_pr_hd_body;
+        env.ansi_u = shell_pr_ansi_u;
+        env.ctx = &hd;
+        env.max_depth = 400;
+        struct bsyn *h = bsyn_open(clean.p ? clean.p : "", clean.len, 0, 0, &env);
+        if (h) {
+            struct bsyn_result r;
+            int k = bsyn_next(h, &r);
+            if (k == BSYN_OK && r.tree) {
+                struct bsp pp;
+                bsp_init(&pp, h);
+                pp.posix = g_opt_posix;
+                if (mode == SHPR_FUNC || mode == SHPR_FUNC_LINE) {
+                    if (r.tree->type == BN_FUNC)
+                        bsp_named_function(&pp, fname ? fname : r.tree->name,
+                                           r.tree->a, mode == SHPR_FUNC);
+                } else {
+                    shell_pr_head(&pp, r.tree, mode);
+                }
+                if (!h->oom && pp.out.p) res = shell_strdup(pp.out.p);
+                bsp_free(&pp);
+            }
+            bsyn_result_free(&r);
+            bsyn_close(h);
+        }
+    }
+out:
+    kfree(hd.ids);
+    sb_free(&hd.tmp);
+    return res;
+}
+
+/* A function as bash prints it: its stored text made a definition again --
+ * the text between its braces, or the whole compound when it was kept
+ * whole (`f() ( ... )`, `f() { ...; } >file`, see shell_function.whole). */
+static char *shell_function_printed_as(const struct shell_function *fn, bool multiline,
+                                       const char *shown_name);
+static char *shell_function_printed(const struct shell_function *fn, bool multiline) {
+    return shell_function_printed_as(fn, multiline, fn ? fn->name : 0);
+}
+
+/* SHOWN_NAME "" leaves the name out: the environment's "() { ... }" */
+static char *shell_function_printed_as(const struct shell_function *fn, bool multiline,
+                                       const char *shown_name) {
+    if (!fn || !fn->body) return 0;
+    SH_SB(def);
+    if (sb_puts(&def, "f () ") < 0) return 0;
+    if (fn->whole) {
+        if (sb_puts(&def, fn->body) < 0) return 0;
+    } else if (sb_puts(&def, "{ \n") < 0 || sb_puts(&def, fn->body) < 0 ||
+               sb_puts(&def, "\n}") < 0) {
+        return 0;
+    }
+    return shell_print_text(def.p, multiline ? SHPR_FUNC : SHPR_FUNC_LINE, shown_name);
+}
+
 /* What the NEXT reader reads, set by its caller for that one call and
  * consumed at the reader's entry, like g_reader_eval_pending:
  *   - the name bash puts between the file and the line ("eval", "-c",
@@ -16785,6 +16989,17 @@ static int shell_type_print_paths(const char *name, const char *first,
  * is the part that was missing, and a wrong indent is a smaller lie than
  * an absent body. */
 static void shell_print_function_def(const char *name, const char *body_raw) {
+    {
+        /* bash's rendering, as `declare -f` (shell_function_printed) */
+        int fi = shell_function_find(name);
+        char *t = fi >= 0 ? shell_function_printed(&g_functions[fi], true) : 0;
+        if (t) {
+            shell_write(t);             /* whole -- see shell_declare_print_function */
+            shell_write("\n");
+            kfree(t);
+            return;
+        }
+    }
     shell_printf("%s () \n{ \n", name);
     /* Printed without its here-document tags (SHELL_HD_TAG); freed at the
      * one exit below. */
@@ -22453,6 +22668,37 @@ static bool shell_locale_is_c(void) {
     return strcmp(v, "C") == 0 || strcmp(v, "POSIX") == 0;
 }
 
+/* WHAT $'\u...' MAKES OF A CODE POINT -- the table in shell_ansic_escape,
+ * measured against the bash on the box (musl): in the C locale a character
+ * above ASCII is `*`, elsewhere UTF-8. The command printer asks the same
+ * question when it prints a $'...' word back. OUT has room for 12. */
+static int shell_ansi_cp_bytes(unsigned long cp, char *out) {
+    if (cp == 0)          { out[0] = 0; return 1; }
+    if (cp < 0x80)        { out[0] = (char)cp; return 1; }
+    if (cp > 0x7FFFFFFFul) return 0;
+    if (shell_locale_is_c()) {
+        bool surrogate = (cp >= 0xD800 && cp <= 0xDFFF);
+        if (!surrogate && cp <= 0x10FFFF) { out[0] = '*'; return 1; }
+        static const char hx[] = "0123456789ABCDEF";
+        int w = (cp <= 0xFFFF) ? 4 : 8, o = 0;
+        out[o++] = '\\';
+        out[o++] = (cp <= 0xFFFF) ? 'u' : 'U';
+        for (int k = w - 1; k >= 0; k--) out[o++] = hx[(cp >> (4 * k)) & 0xF];
+        return o;
+    }
+    {
+        int nb = cp < 0x800 ? 2 : cp < 0x10000 ? 3 : cp < 0x200000 ? 4 :
+                 cp < 0x4000000 ? 5 : 6;
+        static const unsigned char lead[7] = {0, 0, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC};
+        for (int k = nb - 1; k > 0; k--) {
+            out[k] = (char)(0x80 | (cp & 0x3F));
+            cp >>= 6;
+        }
+        out[0] = (char)(lead[nb] | cp);
+        return nb;
+    }
+}
+
 static int shell_ansic_escape(const char **pp, char out[16]) {
     const char *p = *pp;
     unsigned char c;
@@ -22529,30 +22775,7 @@ static int shell_ansic_escape(const char **pp, char out[16]) {
          * tsh emitted UTF-8 whatever the locale, and both gates run under
          * LC_ALL=C, where bash answers `*`. The printed-back form is upper
          * case whatever the case of the input, \u up to FFFF and \U above. */
-        if (cp == 0)          { out[0] = 0; return 1; }
-        if (cp < 0x80)        { out[0] = (char)cp; return 1; }
-        if (cp > 0x7FFFFFFFul) return 0;
-        if (shell_locale_is_c()) {
-            bool surrogate = (cp >= 0xD800 && cp <= 0xDFFF);
-            if (!surrogate && cp <= 0x10FFFF) { out[0] = '*'; return 1; }
-            static const char hx[] = "0123456789ABCDEF";
-            int w = (cp <= 0xFFFF) ? 4 : 8, o = 0;
-            out[o++] = '\\';
-            out[o++] = (cp <= 0xFFFF) ? 'u' : 'U';
-            for (int k = w - 1; k >= 0; k--) out[o++] = hx[(cp >> (4 * k)) & 0xF];
-            return o;
-        }
-        {
-            int nb = cp < 0x800 ? 2 : cp < 0x10000 ? 3 : cp < 0x200000 ? 4 :
-                     cp < 0x4000000 ? 5 : 6;
-            static const unsigned char lead[7] = {0, 0, 0xC0, 0xE0, 0xF0, 0xF8, 0xFC};
-            for (int k = nb - 1; k > 0; k--) {
-                out[k] = (char)(0x80 | (cp & 0x3F));
-                cp >>= 6;
-            }
-            out[0] = (char)(lead[nb] | cp);
-            return nb;
-        }
+        return shell_ansi_cp_bytes(cp, out);
     }
     case 'c': {
         /* \cX: the control character for X.
@@ -36029,6 +36252,7 @@ static bool shell_try_function_definition(const char *src) {
                 return true;
             }
             shell_fndef_capture_map(s + 1, (size_t)(q - (s + 1)), 2);
+            g_fndef_whole = true;
             if (shell_function_set(fnameb.p, body.p) < 0) {
                 shell_set_status(1);
                 return true;
@@ -36093,6 +36317,7 @@ static bool shell_try_function_definition(const char *src) {
      * applies a trailing redirection to everything inside it, and the text is
      * what gets re-executed on each call. */
     size_t lm_shift = 0;                 /* see shell_fndef_capture_map */
+    bool body_whole = false;
     {
         const char *tail = shell_skip_blanks(body_end + 1);
         if (*tail && *tail != ';' && *tail != '&' && *tail != '|') {
@@ -36104,6 +36329,7 @@ static bool shell_try_function_definition(const char *src) {
                     kfree(body);
                     body = w;
                     lm_shift = 2;
+                    body_whole = true;
                 }
             }
         }
@@ -36124,6 +36350,7 @@ static bool shell_try_function_definition(const char *src) {
         shell_fndef_capture_map(bs, (size_t)(body_end - bs), lm_shift);
     }
     {
+        g_fndef_whole = body_whole;
         int frc = shell_function_set(name, body);
         if (frc < 0) {
             kfree(body);
@@ -36201,6 +36428,8 @@ struct shell_function_frame {
     int n;
     char **name;
     char **body;
+    bool *whole;                  /* shell_function.whole, per slot */
+    bool *exported;               /* ...and .exported */
 };
 
 static void shell_function_frame_clear(struct shell_function_frame *frame) {
@@ -36211,7 +36440,11 @@ static void shell_function_frame_clear(struct shell_function_frame *frame) {
     }
     kfree(frame->name);
     kfree(frame->body);
+    kfree(frame->whole);
+    kfree(frame->exported);
     frame->name = frame->body = 0;
+    frame->whole = 0;
+    frame->exported = 0;
     frame->n = 0;
 }
 
@@ -36221,19 +36454,29 @@ static int shell_function_frame_capture(struct shell_function_frame *frame) {
     if (g_nfunctions == 0) return 0;
     frame->name = (char **)kmalloc((size_t)g_nfunctions * sizeof(char *));
     frame->body = (char **)kmalloc((size_t)g_nfunctions * sizeof(char *));
-    if (!frame->name || !frame->body) {
+    frame->whole = (bool *)kmalloc((size_t)g_nfunctions * sizeof(bool));
+    frame->exported = (bool *)kmalloc((size_t)g_nfunctions * sizeof(bool));
+    if (!frame->name || !frame->body || !frame->whole || !frame->exported) {
         kfree(frame->name);
         kfree(frame->body);
+        kfree(frame->whole);
+        kfree(frame->exported);
         frame->name = frame->body = 0;
+        frame->whole = 0;
+        frame->exported = 0;
         return -1;
     }
     frame->n = g_nfunctions;
     memset(frame->name, 0, (size_t)frame->n * sizeof(char *));
     memset(frame->body, 0, (size_t)frame->n * sizeof(char *));
+    memset(frame->whole, 0, (size_t)frame->n * sizeof(bool));
+    memset(frame->exported, 0, (size_t)frame->n * sizeof(bool));
     for (int i = 0; i < frame->n; i++) {
         if (!g_functions[i].name) continue;
         frame->name[i] = shell_strdup(g_functions[i].name);
         frame->body[i] = shell_strdup(g_functions[i].body);
+        frame->whole[i] = g_functions[i].whole;
+        frame->exported[i] = g_functions[i].exported;
         if (!frame->name[i] || !frame->body[i]) {
             shell_function_frame_clear(frame);
             return -1;
@@ -36251,6 +36494,8 @@ static void shell_function_frame_restore(struct shell_function_frame *frame) {
         if (g_functions[i].body) kfree(g_functions[i].body);
         g_functions[i].name = (i < frame->n) ? frame->name[i] : 0;
         g_functions[i].body = (i < frame->n) ? frame->body[i] : 0;
+        g_functions[i].whole = (i < frame->n) ? frame->whole[i] : false;
+        g_functions[i].exported = (i < frame->n) ? frame->exported[i] : false;
         if (i < frame->n) {
             frame->name[i] = 0;
             frame->body[i] = 0;

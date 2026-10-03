@@ -58,6 +58,16 @@ struct bsyn_env {
     const char *(*alias)(void *ctx, const char *name, bool *expand_next);
     void *ctx;
     int max_depth;          /* nesting bound; beyond it, BSYN_SKIP */
+    bool build;             /* also build the command's tree (bsyn_result.tree) */
+    /* Here-document bodies the text does not contain: the shell keeps a
+     * function's bodies apart from its text. When set, the Nth document
+     * is this callback's Nth answer and no input is read for it. */
+    const char *(*hd_body)(void *ctx, int n, size_t *len);
+    bool c_locale;          /* $'\u...' beyond ASCII stays \uXXXX (else UTF-8) */
+    /* ...or the shell's own answer for a code point >= 0x80: the bytes it
+     * puts in OUT (room for 12), 0 for none. The shell's decoder follows
+     * the bash it is measured against, whose C library decides this. */
+    int (*ansi_u)(void *ctx, unsigned long cp, char *out);
 };
 
 #define BSYN_OK       0     /* one complete command was read */
@@ -87,6 +97,8 @@ struct bsyn_result {
     int status;
     int status_ifzero;
     bool fatal;               /* an error inside $( ): ends the shell input */
+    struct bsn *tree;         /* env->build: the command read, valid until the
+                               * next bsyn_next or bsyn_close */
     int nmsg;
     struct bsyn_msg msg[BSYN_MAX_MSG];
 };
@@ -186,7 +198,91 @@ struct bsyn_push {
     char *alias;            /* the alias being expanded, by name */
 };
 
-struct bsyn_heredoc { char *delim; bool quoted, strip; };
+/* ---- the command tree --------------------------------------------------
+ *
+ * Built only when the caller asks (bsyn_env.build), from the same parse:
+ * the shapes are bash's (parse.y's actions and make_cmd.c), because what is
+ * printed from them must be what bash prints -- `declare -f`, $BASH_COMMAND,
+ * a job's command, the text a $( ) runs. Lists are left-associative with
+ * && || binding tighter than ; & newline, a pipeline is right-associative,
+ * `a; b &` puts the & on b alone (connect_async_list), `|&` adds 2>&1 to
+ * the command on its left, a newline separates as `;` except inside $( ),
+ * and an elif is an if in the else part. All of it lives in an arena that
+ * the next command (or bsyn_close) frees. */
+
+enum { BN_SIMPLE = 1, BN_CONN, BN_FOR, BN_ARITH_FOR, BN_SELECT, BN_CASE,
+       BN_WHILE, BN_UNTIL, BN_IF, BN_GROUP, BN_SUBSHELL, BN_ARITH, BN_COND,
+       BN_FUNC, BN_COPROC };
+
+#define BN_INVERT        0x01   /* CMD_INVERT_RETURN: `!` */
+#define BN_TIME          0x02   /* CMD_TIME_PIPELINE */
+#define BN_TIME_POSIX    0x04   /* CMD_TIME_POSIX: `time -p` */
+#define BN_WANT_SUBSHELL 0x08   /* CMD_WANT_SUBSHELL: ( ), coproc */
+
+/* bash's r_instruction, by meaning */
+enum { BR_OUT = 1, BR_IN, BR_APPEND, BR_FORCE, BR_INOUT, BR_HEREDOC,
+       BR_HEREDOC_STRIP, BR_HERESTR, BR_DUP_IN, BR_DUP_OUT, BR_DUP_IN_W,
+       BR_DUP_OUT_W, BR_CLOSE, BR_ERR_OUT, BR_APPEND_ERR_OUT, BR_MOVE_IN,
+       BR_MOVE_OUT, BR_MOVE_IN_W, BR_MOVE_OUT_W };
+
+/* [[ ]] nodes */
+enum { BC_AND = 1, BC_OR, BC_UNARY, BC_BINARY, BC_TERM, BC_EXPR };
+
+struct bsn_word {
+    struct bsn_word *next;
+    char *w;
+    bool quoted;
+};
+
+struct bsn_redir {
+    struct bsn_redir *next;
+    int op;                   /* BR_* */
+    int fd;                   /* the redirector, when no {var} */
+    char *var;                /* {var}: the name (REDIR_VARASSIGN) */
+    int dest;                 /* the redirectee fd: dup, move, close */
+    char *word;               /* the redirectee word: file, dup word, string */
+    bool wquoted;             /* a here-document's delimiter was quoted */
+    char *eof;                /* a here-document's delimiter, quotes removed */
+    char *body;               /* ...and its body, as bash stores it */
+};
+
+struct bsn_cond {
+    int type;                 /* BC_* */
+    bool invert;
+    char *op;                 /* the operator word, or the term's word */
+    struct bsn_cond *l, *r;
+};
+
+struct bsn_clause {
+    struct bsn_clause *next;
+    struct bsn_word *pats;
+    struct bsn *action;
+    int term;                 /* 0 ;;   1 ;&   2 ;;& */
+};
+
+struct bsn {
+    int type;                 /* BN_* */
+    unsigned flags;           /* BN_INVERT ... */
+    struct bsn_redir *redirs;
+    struct bsn_word *words;   /* simple: its words; for/select: the list;
+                               * arith: the expression; case: the word */
+    char *name;               /* for/select variable, function, coproc */
+    struct bsn *a, *b, *c;    /* conn: first second; if: test then else;
+                               * while/until: test action; for/select/
+                               * arith-for/group/subshell/function/coproc: a */
+    int connector;            /* conn: '|' '&' ';' '\n' BT_AND_AND BT_OR_OR */
+    struct bsn_clause *clauses;
+    struct bsn_cond *cond;
+    char *ex[3];              /* arith-for: init test step */
+};
+
+struct bsn_blk {
+    struct bsn_blk *next;
+    size_t used, cap, pad;
+};
+
+struct bsyn_heredoc { char *delim; bool quoted, strip; struct bsn_redir *node; };
+
 
 struct bsyn {
     const struct bsyn_env *env;
@@ -235,6 +331,11 @@ struct bsyn {
     bool oom;                  /* give up: BSYN_SKIP */
     bool st_set;
     int st_val, st_ifzero;
+    /* the tree (env->build) */
+    bool build;
+    struct bsn_blk *arena;
+    struct bsn_cond *cond_tree;   /* the [[ ]] just read (BT_COND_CMD) */
+    int hd_supplied;              /* env->hd_body: the documents handed out */
 };
 
 /* ---- small helpers ------------------------------------------------------ */
@@ -263,6 +364,116 @@ static bool bsyn_var_start(int c) { return bsyn_alpha(c) || c == '_'; }
 static bool bsyn_var_char(int c) { return bsyn_alpha(c) || bsyn_digit(c) || c == '_'; }
 
 static void bsyn_nomem(struct bsyn *st) { st->oom = true; st->failed = true; }
+
+/* ---- the tree's storage: one arena per command read ------------------- */
+
+static void *bsn_alloc(struct bsyn *st, size_t n) {
+    n = (n + 15) & ~(size_t)15;
+    struct bsn_blk *b = st->arena;
+    if (!b || b->used + n > b->cap) {
+        size_t cap = n > 4096 ? n : 4096;
+        b = (struct bsn_blk *)BSYN_ALLOC(sizeof *b + cap);
+        if (!b) { bsyn_nomem(st); return 0; }
+        b->next = st->arena;
+        b->used = 0;
+        b->cap = cap;
+        st->arena = b;
+    }
+    char *p = (char *)(b + 1) + b->used;
+    b->used += n;
+    for (size_t i = 0; i < n; i++) p[i] = 0;
+    return p;
+}
+
+static void bsn_arena_free(struct bsyn *st) {
+    while (st->arena) {
+        struct bsn_blk *b = st->arena;
+        st->arena = b->next;
+        BSYN_FREE(b);
+    }
+}
+
+static char *bsn_strn(struct bsyn *st, const char *s, size_t n) {
+    char *d = (char *)bsn_alloc(st, n + 1);
+    if (!d) return 0;
+    for (size_t i = 0; i < n; i++) d[i] = s ? s[i] : 0;
+    d[n] = 0;
+    return d;
+}
+
+static struct bsn *bsn_new(struct bsyn *st, int type) {
+    if (!st->build) return 0;
+    struct bsn *n = (struct bsn *)bsn_alloc(st, sizeof *n);
+    if (n) n->type = type;
+    return n;
+}
+
+/* The word the lookahead holds -- taken BEFORE the shift, since reading
+ * the next token replaces wtext. */
+static struct bsn_word *bsn_word_cur(struct bsyn *st) {
+    if (!st->build) return 0;
+    struct bsn_word *w = (struct bsn_word *)bsn_alloc(st, sizeof *w);
+    if (!w) return 0;
+    w->w = bsn_strn(st, st->wtext.p ? st->wtext.p : "", st->wtext.len);
+    w->quoted = st->wquoted;
+    return w;
+}
+
+static struct bsn_word *bsn_word_lit(struct bsyn *st, const char *s) {
+    if (!st->build) return 0;
+    struct bsn_word *w = (struct bsn_word *)bsn_alloc(st, sizeof *w);
+    if (!w) return 0;
+    size_t n = 0;
+    while (s[n]) n++;
+    w->w = bsn_strn(st, s, n);
+    return w;
+}
+
+static void bsn_words_add(struct bsn_word **head, struct bsn_word *w) {
+    if (!w) return;
+    while (*head) head = &(*head)->next;
+    *head = w;
+}
+
+static void bsn_redir_add(struct bsn_redir **head, struct bsn_redir *r) {
+    if (!r) return;
+    while (*head) head = &(*head)->next;
+    *head = r;
+}
+
+/* command_connect */
+static struct bsn *bsn_connect(struct bsyn *st, struct bsn *a, struct bsn *b, int conn) {
+    struct bsn *n = bsn_new(st, BN_CONN);
+    if (!n) return 0;
+    n->a = a;
+    n->b = b;
+    n->connector = conn;
+    return n;
+}
+
+/* `LIST & ...`: bash's parser puts the & on the LAST command of a list
+ * joined by `;` (connect_async_list), unless the list is a ( ) unit. */
+static struct bsn *bsn_connect_async(struct bsyn *st, struct bsn *cmd, struct bsn *cmd2) {
+    if (!st->build) return 0;
+    if (!cmd || cmd->type != BN_CONN) return bsn_connect(st, cmd, cmd2, '&');
+    struct bsn *t1 = cmd, *t = cmd->b;
+    if (!t || (cmd->flags & BN_WANT_SUBSHELL) || cmd->connector != ';')
+        return bsn_connect(st, cmd, cmd2, '&');
+    while (!(t->flags & BN_WANT_SUBSHELL) && t->type == BN_CONN && t->connector == ';') {
+        t1 = t;
+        t = t->b;
+    }
+    t1->b = bsn_connect(st, t, cmd2, '&');
+    return cmd;
+}
+
+/* A list element joined to what came before it by SEP (; & or newline). */
+static struct bsn *bsn_fold(struct bsyn *st, struct bsn *acc, struct bsn *x, int sep) {
+    if (!st->build) return 0;
+    if (!acc) return x;
+    if (sep == '&') return bsn_connect_async(st, acc, x);
+    return bsn_connect(st, acc, x, sep);
+}
 
 static bool bsyn_room(struct bsyn *st, struct bsyn_buf *b, size_t more) {
     if (b->len + more + 1 <= b->cap) return true;
@@ -796,6 +1007,49 @@ static void bsyn_ansi_decode(struct bsyn *st, const char *s, size_t n, struct bs
             else bsyn_putc(st, out, v);
             break;
         }
+        case 'u': case 'U': {
+            /* \uHHHH \UHHHHHHHH: ASCII as itself; anything else as the C
+             * locale has it -- bash's u32cconv falls back to u32tocesc,
+             * "\u%04X" or "\U%08X" */
+            int maxd = (c == 'u') ? 4 : 8, k = 0;
+            unsigned long v = 0;
+            while (k < maxd && i + 1 < n && bsyn_hexval((unsigned char)s[i + 1]) >= 0) {
+                v = v * 16 + (unsigned long)bsyn_hexval((unsigned char)s[++i]);
+                k++;
+            }
+            if (!k) { bsyn_putc(st, out, '\\'); bsyn_putc(st, out, c); break; }
+            if (v <= 0x7f) { bsyn_putc(st, out, (int)v); break; }
+            if (st->env->ansi_u) {
+                char ub[16];
+                int nb = st->env->ansi_u(st->env->ctx, v, ub);
+                for (int q = 0; q < nb && q < 12; q++) bsyn_putc(st, out, (unsigned char)ub[q]);
+                break;
+            }
+            if (!st->env->c_locale && v <= 0x10ffff) {
+                /* a UTF-8 locale: the character's bytes (u32toutf8) */
+                if (v < 0x800) {
+                    bsyn_putc(st, out, (int)(0xc0 | (v >> 6)));
+                } else if (v < 0x10000) {
+                    bsyn_putc(st, out, (int)(0xe0 | (v >> 12)));
+                    bsyn_putc(st, out, (int)(0x80 | ((v >> 6) & 0x3f)));
+                } else {
+                    bsyn_putc(st, out, (int)(0xf0 | (v >> 18)));
+                    bsyn_putc(st, out, (int)(0x80 | ((v >> 12) & 0x3f)));
+                    bsyn_putc(st, out, (int)(0x80 | ((v >> 6) & 0x3f)));
+                }
+                bsyn_putc(st, out, (int)(0x80 | (v & 0x3f)));
+                break;
+            }
+            {
+                static const char hx[] = "0123456789ABCDEF";
+                int digits = v < 0x10000 ? 4 : 8;
+                bsyn_putc(st, out, '\\');
+                bsyn_putc(st, out, v < 0x10000 ? 'u' : 'U');
+                for (int d = digits - 1; d >= 0; d--)
+                    bsyn_putc(st, out, hx[(v >> (4 * d)) & 0xf]);
+            }
+            break;
+        }
         case 'c':
             if (i + 1 < n) { bsyn_putc(st, out, (unsigned char)s[++i] & 0x1f); break; }
             bsyn_putc(st, out, '\\');
@@ -811,6 +1065,12 @@ static void bsyn_ansi_decode(struct bsyn *st, const char *s, size_t n, struct bs
 
 /* sh_single_quote */
 static void bsyn_single_quote(struct bsyn *st, const char *s, size_t n, struct bsyn_buf *out) {
+    /* bash's walks a C STRING: a NUL the decoding produced ends it --
+     * $'x\0y' is 'x' -- and a lone quote is written \' */
+    size_t z = 0;
+    while (z < n && s[z]) z++;
+    n = z;
+    if (n == 1 && s[0] == '\'') { bsyn_puts(st, out, "\\'"); return; }
     bsyn_putc(st, out, '\'');
     for (size_t i = 0; i < n; i++) {
         if (s[i] == '\'') bsyn_puts(st, out, "'\\''");
@@ -1021,10 +1281,19 @@ static void bsyn_reset_parser(struct bsyn *st) {
 static void bsyn_gather_heredocs(struct bsyn *st) {
     for (int k = 0; k < st->nhd; k++) {
         struct bsyn_heredoc *h = &st->hd[k];
+        if (st->env->hd_body) {
+            size_t bl = 0;
+            const char *b = st->env->hd_body(st->env->ctx, st->hd_supplied++, &bl);
+            if (h->node) h->node->body = bsn_strn(st, b ? b : "", b ? bl : 0);
+            BSYN_FREE(h->delim);
+            h->delim = 0;
+            continue;
+        }
         unsigned long at = st->lineno;
         size_t dl = bsyn_strlen(h->delim);
         bool found = false;
         struct bsyn_buf line = {0, 0, 0};
+        struct bsyn_buf doc = {0, 0, 0};     /* the tree's copy of the body */
         for (;;) {
             /* read_a_line: raw input, a backslash-newline joins lines when
              * the delimiter was not quoted */
@@ -1065,6 +1334,7 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
             if (*l == 0) continue;
             size_t ll = bsyn_strlen(l);
             if (ll == dl + 1 && memcmp(l, h->delim, dl) == 0) { found = true; break; }
+            bool closes = false;
             /* inside $( ): "EOF)" ends the document and gives back ")" */
             if ((st->pst & BP_EOFTOKEN) && st->eof_tok && ll > dl &&
                 memcmp(l, h->delim, dl) == 0) {
@@ -1073,10 +1343,14 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
                 if (has) {
                     bsyn_push_string(st, l + dl, ll - dl, true, false, 0);
                     found = true;
-                    break;
+                    closes = true;
                 }
             }
+            if (closes) break;
+            if (h->node) bsyn_putn(st, &doc, l, ll);
         }
+        if (h->node) h->node->body = bsn_strn(st, doc.p ? doc.p : "", doc.len);
+        bsyn_buf_free(&doc);
         bsyn_buf_free(&line);
         if (!found && !st->oom) {
             struct bsyn_buf w = {0, 0, 0};
@@ -1095,7 +1369,7 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
     st->nhd = 0;
 }
 
-static void bsyn_push_heredoc(struct bsyn *st, bool strip) {
+static void bsyn_push_heredoc(struct bsyn *st, bool strip, struct bsn_redir *node) {
     if (st->nhd >= BSYN_HEREDOC_MAX) {
         bsyn_msg(st, st->lineno, BSYN_MSG_PARSER, "maximum here-document count exceeded", 0, 0);
         bsyn_status_set(st, 2);
@@ -1110,6 +1384,8 @@ static void bsyn_push_heredoc(struct bsyn *st, bool strip) {
     st->hd[st->nhd].delim = d.p;
     st->hd[st->nhd].quoted = st->wquoted;
     st->hd[st->nhd].strip = strip;
+    st->hd[st->nhd].node = node;
+    if (node) node->eof = bsn_strn(st, d.p, d.len);
     st->nhd++;
 }
 
@@ -1118,7 +1394,7 @@ static void bsyn_push_heredoc(struct bsyn *st, bool strip) {
 static int bsyn_read_token(struct bsyn *st);
 static bool bsyn_pmp(struct bsyn *st, int qc, int open, int close, int flags, struct bsyn_buf *out);
 static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out);
-static void bsyn_cond_or(struct bsyn *st);
+static struct bsn_cond *bsyn_cond_or(struct bsyn *st);
 
 #define BSYN_DEPTH_IN(st)  do { if (++(st)->depth > (st)->env->max_depth) { bsyn_nomem(st); } } while (0)
 #define BSYN_DEPTH_OUT(st) ((st)->depth--)
@@ -1284,10 +1560,11 @@ out:
     return ok;
 }
 
-static void bsyn_list(struct bsyn *st);
+static struct bsn *bsyn_list(struct bsyn *st);
 static int bsyn_la(struct bsyn *st);
 static void bsyn_shift(struct bsyn *st);
 static void bsyn_recover(struct bsyn *st);
+static void bsp_comsub_text(struct bsyn *st, struct bsn *cmd, struct bsyn_buf *out);
 
 /* parse_comsub: the text of a $( ) is a command list, parsed now, with
  * the whole grammar. */
@@ -1332,11 +1609,12 @@ static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out
     st->cap = &captured;
 
     /* comsub: DOLPAREN compound_list ')' | DOLPAREN newline_list ')' */
+    struct bsn *inner = 0;
     (void)bsyn_la(st);
     bsyn_shift(st);
     while (!st->failed && bsyn_la(st) == '\n') bsyn_shift(st);
     if (!st->failed && bsyn_la(st) != ')') {
-        bsyn_list(st);
+        inner = bsyn_list(st);
     }
     if (!st->failed) {
         if (bsyn_la(st) != ')') bsyn_syntax_error(st);
@@ -1404,7 +1682,17 @@ static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out
     }
     for (int i = 0; i < s_nhd; i++) if (s_hd[i].delim) BSYN_FREE(s_hd[i].delim);
     if (s_cap && captured.p) bsyn_putn(st, s_cap, captured.p, captured.len);
-    if (ok) {
+    if (ok && st->build) {
+        /* parse_comsub returns print_comsub's text of what it parsed, and
+         * that is what the word holds: `$( a|b )` is "$(a | b)" */
+        struct bsyn_buf pt = {0, 0, 0};
+        bsp_comsub_text(st, inner, &pt);
+        if (pt.p && pt.p[0] == '(') bsyn_putc(st, out, ' ');
+        bsyn_putn(st, out, pt.p ? pt.p : "", pt.len);
+        bsyn_putc(st, out, ')');
+        bsyn_buf_free(&pt);
+        ok = !st->oom;
+    } else if (ok) {
         if (captured.p && captured.p[0] == '(') bsyn_putc(st, out, ' ');
         bsyn_putn(st, out, captured.p ? captured.p : ")", captured.p ? captured.len : 1);
         ok = !st->oom;
@@ -1785,7 +2073,8 @@ static int bsyn_read_token(struct bsyn *st) {
         st->cond_lineno = st->lineno;
         st->pst |= BP_CONDEXPR;
         BSYN_DEPTH_IN(st);
-        if (!st->oom) bsyn_cond_or(st);
+        st->cond_tree = 0;
+        if (!st->oom) st->cond_tree = bsyn_cond_or(st);
         BSYN_DEPTH_OUT(st);
         if (st->oom || st->failed) return BT_ERROR;
         if (st->cond_token != BT_COND_END) {
@@ -1913,7 +2202,7 @@ static bool bsyn_test_binop(const char *op) {
     return false;
 }
 
-#define BSYN_COND_FAIL(st) do { (st)->cond_token = BT_COND_ERROR; return; } while (0)
+#define BSYN_COND_FAIL(st) do { (st)->cond_token = BT_COND_ERROR; return 0; } while (0)
 
 static int bsyn_cond_skip_nl(struct bsyn *st) {
     while ((st->cond_token = bsyn_read_token(st)) == '\n' && !st->oom)
@@ -1932,9 +2221,28 @@ static void bsyn_cond_msg_tok(struct bsyn *st, unsigned long line, int tok,
     }
 }
 
-static void bsyn_cond_term(struct bsyn *st) {
+/* make_cond_node */
+static struct bsn_cond *bsn_cnode(struct bsyn *st, int type, char *op,
+                                  struct bsn_cond *l, struct bsn_cond *r) {
+    if (!st->build) return 0;
+    struct bsn_cond *c = (struct bsn_cond *)bsn_alloc(st, sizeof *c);
+    if (!c) return 0;
+    c->type = type;
+    c->op = op;
+    c->l = l;
+    c->r = r;
+    return c;
+}
+
+static char *bsn_wtext(struct bsyn *st) {
+    if (!st->build) return 0;
+    return bsn_strn(st, st->wtext.p ? st->wtext.p : "", st->wtext.len);
+}
+
+static struct bsn_cond *bsyn_cond_term(struct bsyn *st) {
     int tok = bsyn_cond_skip_nl(st);
     unsigned long lineno = st->lineno;
+    struct bsn_cond *term = 0;
     /* A lexer error here (an unclosed quote) is not silent: bash's
      * cond_term takes the -1 as one more token it cannot use, and says so.
      * An error that ENDS the input (inside a $( )) leaves without a word. */
@@ -1942,7 +2250,8 @@ static void bsyn_cond_term(struct bsyn *st) {
     if (tok == BT_COND_END) BSYN_COND_FAIL(st);
     if (tok == '(') {
         BSYN_DEPTH_IN(st);
-        if (!st->oom) bsyn_cond_or(st);
+        struct bsn_cond *inner = 0;
+        if (!st->oom) inner = bsyn_cond_or(st);
         BSYN_DEPTH_OUT(st);
         if (st->oom || st->failed) BSYN_COND_FAIL(st);
         if (st->cond_token != ')') {
@@ -1950,17 +2259,20 @@ static void bsyn_cond_term(struct bsyn *st) {
                               "', expected `)'", "expected `)'");
             BSYN_COND_FAIL(st);
         }
+        term = bsn_cnode(st, BC_EXPR, 0, inner, 0);
         (void)bsyn_cond_skip_nl(st);
-        return;
+        return term;
     }
     if (tok == BT_BANG || (tok == BT_WORD && st->wtext.p && bsyn_streq(st->wtext.p, "!"))) {
         BSYN_DEPTH_IN(st);
-        if (!st->oom) bsyn_cond_term(st);
+        if (!st->oom) term = bsyn_cond_term(st);
         BSYN_DEPTH_OUT(st);
-        return;
+        if (term) term->invert = !term->invert;
+        return term;
     }
     if (tok == BT_WORD && st->wtext.p && st->wtext.p[0] == '-' && st->wtext.p[1] &&
         st->wtext.p[2] == 0 && bsyn_test_unop(st->wtext.p)) {
+        char *op = bsn_wtext(st);
         tok = bsyn_read_token(st);
         if (st->oom || st->failed) BSYN_COND_FAIL(st);
         if (tok != BT_WORD) {
@@ -1969,23 +2281,29 @@ static void bsyn_cond_term(struct bsyn *st) {
                               "unexpected argument to conditional unary operator");
             BSYN_COND_FAIL(st);
         }
+        term = bsn_cnode(st, BC_UNARY, op, bsn_cnode(st, BC_TERM, bsn_wtext(st), 0, 0), 0);
         (void)bsyn_cond_skip_nl(st);
-        return;
+        return term;
     }
     if (tok == BT_WORD) {
+        char *w1 = bsn_wtext(st);
+        char *op = 0;
         tok = bsyn_read_token(st);
         if (st->oom || st->failed) BSYN_COND_FAIL(st);
         if (tok == BT_WORD && st->wtext.p && bsyn_test_binop(st->wtext.p)) {
-            const char *op = st->wtext.p;
-            if ((op[0] == '=' && (op[1] == 0 || (op[1] == '=' && op[2] == 0))) ||
-                (op[0] == '!' && op[1] == '=' && op[2] == 0))
+            const char *o = st->wtext.p;
+            op = bsn_wtext(st);
+            if ((o[0] == '=' && (o[1] == 0 || (o[1] == '=' && o[2] == 0))) ||
+                (o[0] == '!' && o[1] == '=' && o[2] == 0))
                 st->pst |= BP_EXTPAT;
-            if (bsyn_streq(op, "=~")) st->pst |= BP_REGEXP;
+            if (bsyn_streq(o, "=~")) st->pst |= BP_REGEXP;
         } else if (tok == '<' || tok == '>') {
             /* a string comparison */
+            if (st->build) op = bsn_strn(st, tok == '<' ? "<" : ">", 1);
         } else if (tok == BT_COND_END || tok == BT_AND_AND || tok == BT_OR_OR || tok == ')') {
-            st->cond_token = tok;       /* [[ x ]] is [[ -n x ]] */
-            return;
+            st->cond_token = tok;       /* [[ x ]] is [[ -n x ]] -- in the tree too */
+            return bsn_cnode(st, BC_UNARY, st->build ? bsn_strn(st, "-n", 2) : 0,
+                             bsn_cnode(st, BC_TERM, w1, 0, 0), 0);
         } else {
             bsyn_cond_msg_tok(st, st->lineno, tok, "unexpected token `",
                               "', conditional binary operator expected",
@@ -2004,8 +2322,10 @@ static void bsyn_cond_term(struct bsyn *st) {
                               "unexpected argument to conditional binary operator");
             BSYN_COND_FAIL(st);
         }
+        term = bsn_cnode(st, BC_BINARY, op, bsn_cnode(st, BC_TERM, w1, 0, 0),
+                         bsn_cnode(st, BC_TERM, bsn_wtext(st), 0, 0));
         (void)bsyn_cond_skip_nl(st);
-        return;
+        return term;
     }
     if (tok < 256) {
         /* bash prints the token with %c: a lexer error's -1 is byte 0xff */
@@ -2029,22 +2349,28 @@ static void bsyn_cond_term(struct bsyn *st) {
     BSYN_COND_FAIL(st);
 }
 
-static void bsyn_cond_and(struct bsyn *st) {
-    bsyn_cond_term(st);
+static struct bsn_cond *bsyn_cond_and(struct bsyn *st) {
+    struct bsn_cond *term = bsyn_cond_term(st);
     if (st->cond_token == BT_AND_AND && !st->oom && !st->failed) {
         BSYN_DEPTH_IN(st);
-        if (!st->oom) bsyn_cond_and(st);
+        struct bsn_cond *r = 0;
+        if (!st->oom) r = bsyn_cond_and(st);
         BSYN_DEPTH_OUT(st);
+        term = bsn_cnode(st, BC_AND, 0, term, r);
     }
+    return term;
 }
 
-static void bsyn_cond_or(struct bsyn *st) {
-    bsyn_cond_and(st);
+static struct bsn_cond *bsyn_cond_or(struct bsyn *st) {
+    struct bsn_cond *term = bsyn_cond_and(st);
     if (st->cond_token == BT_OR_OR && !st->oom && !st->failed) {
         BSYN_DEPTH_IN(st);
-        if (!st->oom) bsyn_cond_or(st);
+        struct bsn_cond *r = 0;
+        if (!st->oom) r = bsyn_cond_or(st);
         BSYN_DEPTH_OUT(st);
+        term = bsn_cnode(st, BC_OR, 0, term, r);
     }
+    return term;
 }
 
 /* cond_error */
@@ -2129,56 +2455,132 @@ static void bsyn_newlines(struct bsyn *st) {
     while (!st->failed && bsyn_la(st) == '\n') bsyn_shift(st);
 }
 
-static void bsyn_pipeline_command(struct bsyn *st);
-static void bsyn_command(struct bsyn *st);
+static struct bsn *bsyn_pipeline_command(struct bsyn *st);
+static struct bsn *bsyn_command(struct bsyn *st);
+
+/* The tree's record of a redirection: what bash's grammar actions and
+ * make_redirection make of OP and its TARGET token (still the lookahead). */
+static void bsn_redir_fill(struct bsyn *st, struct bsn_redir *r, int op, int target) {
+    if (r->fd < 0 && !r->var) {
+        r->fd = (op == '<' || op == BT_LESS_GREATER || op == BT_LESS_LESS ||
+                 op == BT_LESS_LESS_MINUS || op == BT_LESS_LESS_LESS ||
+                 op == BT_LESS_AND) ? 0 : 1;
+    }
+    const char *wt = st->wtext.p ? st->wtext.p : "";
+    size_t wl = st->wtext.len;
+    switch (op) {
+    case '>': r->op = BR_OUT; break;
+    case '<': r->op = BR_IN; break;
+    case BT_GREATER_GREATER: r->op = BR_APPEND; break;
+    case BT_GREATER_BAR: r->op = BR_FORCE; break;
+    case BT_LESS_GREATER: r->op = BR_INOUT; break;
+    case BT_LESS_LESS: r->op = BR_HEREDOC; break;
+    case BT_LESS_LESS_MINUS: r->op = BR_HEREDOC_STRIP; break;
+    case BT_LESS_LESS_LESS: r->op = BR_HERESTR; break;
+    case BT_AND_GREATER: r->op = BR_ERR_OUT; break;
+    case BT_AND_GREATER_GREATER: r->op = BR_APPEND_ERR_OUT; break;
+    case BT_LESS_AND: case BT_GREATER_AND: {
+        bool in = (op == BT_LESS_AND);
+        if (target == '-') {
+            r->op = BR_CLOSE;
+            r->dest = 0;
+            return;
+        }
+        if (target == BT_NUMBER) {
+            r->op = in ? BR_DUP_IN : BR_DUP_OUT;
+            r->dest = (int)st->number;
+            return;
+        }
+        /* make_redirection: a word ending in `-' is a MOVE */
+        if (wl > 0 && wt[wl - 1] == '-') {
+            size_t n = wl - 1;
+            bool digits = n > 0;
+            long v = 0;
+            for (size_t i = 0; i < n && digits; i++) {
+                if (wt[i] < '0' || wt[i] > '9' || v > 214748364L) digits = false;
+                else v = v * 10 + (wt[i] - '0');
+            }
+            if (digits) {
+                r->op = in ? BR_MOVE_IN : BR_MOVE_OUT;
+                r->dest = (int)v;
+                return;
+            }
+            r->op = in ? BR_MOVE_IN_W : BR_MOVE_OUT_W;
+            r->word = bsn_strn(st, wt, n);
+            return;
+        }
+        r->op = in ? BR_DUP_IN_W : BR_DUP_OUT_W;
+        break;
+    }
+    }
+    r->word = bsn_strn(st, wt, wl);
+    r->wquoted = st->wquoted;
+}
 
 /* a redirection; the lookahead starts one */
-static void bsyn_redirection(struct bsyn *st) {
+static struct bsn_redir *bsyn_redirection(struct bsyn *st) {
     int t = bsyn_la(st);
     bool prefixed = false;
+    struct bsn_redir *r = 0;
+    if (st->build) {
+        r = (struct bsn_redir *)bsn_alloc(st, sizeof *r);
+        if (!r) return 0;
+        r->fd = -1;
+    }
     if (t == BT_NUMBER || t == BT_REDIR_WORD) {
+        if (r) {
+            if (t == BT_NUMBER) r->fd = (int)st->number;
+            else r->var = bsn_strn(st, st->wtext.p ? st->wtext.p : "", st->wtext.len);
+        }
         bsyn_shift(st);
         prefixed = true;
         t = bsyn_la(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
     }
     if (!bsyn_redir_op(t) || (prefixed && (t == BT_AND_GREATER || t == BT_AND_GREATER_GREATER))) {
         bsyn_syntax_error(st);
-        return;
+        return 0;
     }
     bsyn_shift(st);
     int target = bsyn_la(st);
-    if (st->failed) return;
+    if (st->failed) return 0;
     if (t == BT_LESS_AND || t == BT_GREATER_AND) {
         if (target != BT_NUMBER && target != BT_WORD && target != '-') {
             bsyn_syntax_error(st);
-            return;
+            return 0;
         }
     } else if (target != BT_WORD) {
         bsyn_syntax_error(st);
-        return;
+        return 0;
     }
+    if (r) bsn_redir_fill(st, r, t, target);
     bsyn_shift(st);
     if (t == BT_LESS_LESS || t == BT_LESS_LESS_MINUS)
-        bsyn_push_heredoc(st, t == BT_LESS_LESS_MINUS);
+        bsyn_push_heredoc(st, t == BT_LESS_LESS_MINUS, r);
+    return r;
 }
 
-static void bsyn_redirection_list_opt(struct bsyn *st) {
-    while (!st->failed && bsyn_redir_start(bsyn_la(st))) bsyn_redirection(st);
+static void bsyn_redirection_list_opt(struct bsyn *st, struct bsn *n) {
+    while (!st->failed && bsyn_redir_start(bsyn_la(st))) {
+        struct bsn_redir *r = bsyn_redirection(st);
+        if (n) bsn_redir_add(&n->redirs, r);
+    }
 }
 
 /* the rest of a simple command: (WORD | ASSIGNMENT_WORD | redirection)* */
-static void bsyn_simple_rest(struct bsyn *st) {
+static void bsyn_simple_rest(struct bsyn *st, struct bsn *s) {
     for (;;) {
         if (st->failed) return;
         int t = bsyn_la(st);
         if (t == BT_WORD || t == BT_ASSIGNMENT_WORD) {
+            if (s) bsn_words_add(&s->words, bsn_word_cur(st));
             bsyn_shift(st);
             st->pst &= ~BP_REDIRLIST;
             continue;
         }
         if (bsyn_redir_start(t)) {
-            bsyn_redirection(st);
+            struct bsn_redir *r = bsyn_redirection(st);
+            if (s) bsn_redir_add(&s->redirs, r);
             continue;
         }
         break;
@@ -2187,58 +2589,79 @@ static void bsyn_simple_rest(struct bsyn *st) {
 }
 
 /* a simple command whose first element is the lookahead */
-static void bsyn_simple_command(struct bsyn *st) {
+static struct bsn *bsyn_simple_command(struct bsyn *st) {
+    struct bsn *s = bsn_new(st, BN_SIMPLE);
     int t = bsyn_la(st);
     if (t == BT_WORD || t == BT_ASSIGNMENT_WORD) {
+        if (s) bsn_words_add(&s->words, bsn_word_cur(st));
         bsyn_shift(st);
         st->pst &= ~BP_REDIRLIST;
     } else {
-        bsyn_redirection(st);
+        struct bsn_redir *r = bsyn_redirection(st);
+        if (s) bsn_redir_add(&s->redirs, r);
         if (!st->failed) st->pst |= BP_REDIRLIST;
     }
-    bsyn_simple_rest(st);
+    bsyn_simple_rest(st, s);
+    return s;
 }
 
-static void bsyn_compound_list(struct bsyn *st) {
+static struct bsn *bsyn_list(struct bsyn *st);
+
+static struct bsn *bsyn_compound_list(struct bsyn *st) {
     bsyn_newlines(st);
-    if (st->failed) return;
-    bsyn_list(st);
+    if (st->failed) return 0;
+    return bsyn_list(st);
 }
 
 /* list1 [ list0's terminator ], with the leading newlines already gone:
- * pipelines joined by && || ; & newline. */
-static void bsyn_list(struct bsyn *st) {
+ * pipelines joined by && || ; & newline. The tree: && || bind tighter than
+ * ; & newline, both left-associative; a newline joins as `;' except inside
+ * $( ); a trailing & puts the last command in the background. */
+static struct bsn *bsyn_list(struct bsyn *st) {
     BSYN_DEPTH_IN(st);
+    struct bsn *acc = 0, *ao = 0;
+    int pend = 0, aop = 0;
     for (;;) {
         if (st->failed) break;
         if (!bsyn_pipeline_start(bsyn_la(st))) {
             if (!st->failed) bsyn_syntax_error(st);
             break;
         }
-        bsyn_pipeline_command(st);
+        struct bsn *p = bsyn_pipeline_command(st);
         if (st->failed) break;
+        ao = aop ? bsn_connect(st, ao, p, aop) : p;
+        aop = 0;
         int t = bsyn_la(st);
         if (t == BT_AND_AND || t == BT_OR_OR) {
+            aop = t;
             bsyn_shift(st);
             bsyn_newlines(st);
             continue;
         }
         if (t == ';' || t == '&' || t == '\n') {
+            int sep = (t == '\n') ? ((st->pst & BP_CMDSUBST) ? '\n' : ';') : t;
+            acc = bsn_fold(st, acc, ao, pend);
+            ao = 0;
             bsyn_shift(st);
             bsyn_newlines(st);
             if (st->failed) break;
-            if (bsyn_pipeline_start(bsyn_la(st))) continue;
+            if (bsyn_pipeline_start(bsyn_la(st))) { pend = sep; continue; }
+            if (sep == '&') acc = bsn_connect_async(st, acc, 0);
+            break;
         }
         break;
     }
+    if (ao) acc = bsn_fold(st, acc, ao, pend);
     BSYN_DEPTH_OUT(st);
+    return acc;
 }
 
-static void bsyn_body(struct bsyn *st, int open) {
+static struct bsn *bsyn_body(struct bsyn *st, int open) {
     /* DO compound_list DONE | '{' compound_list '}' */
     bsyn_shift(st);
-    bsyn_compound_list(st);
+    struct bsn *l = bsyn_compound_list(st);
     bsyn_expect(st, open == BT_DO ? BT_DONE : '}');
+    return l;
 }
 
 /* The parts of a for (( ; ; )), split as bash's skip_to_delim splits
@@ -2262,9 +2685,8 @@ static size_t bsyn_skip_group(const char *s, size_t i, char open, char close) {
     return i;
 }
 
-static int bsyn_arith_for_parts(const char *s) {
-    int parts = 1;
-    size_t i = 0;
+/* The end of one part from I: the next top-level `;', or the end. */
+static size_t bsyn_arith_for_part_end(const char *s, size_t i) {
     while (s[i]) {
         char c = s[i];
         if (c == '\\') { i += s[i + 1] ? 2 : 1; continue; }
@@ -2274,7 +2696,7 @@ static int bsyn_arith_for_parts(const char *s) {
             if (s[i]) i++;
             continue;
         }
-        if (c == ';') { parts++; i++; continue; }
+        if (c == ';') return i;
         if (c == '\'' || c == '"') {
             i++;
             while (s[i] && s[i] != c) { if (c == '"' && s[i] == '\\' && s[i + 1]) i++; i++; }
@@ -2287,14 +2709,38 @@ static int bsyn_arith_for_parts(const char *s) {
         }
         i++;
     }
+    return i;
+}
+
+static int bsyn_arith_for_parts(const char *s) {
+    int parts = 1;
+    size_t i = 0;
+    for (;;) {
+        i = bsyn_arith_for_part_end(s, i);
+        if (!s[i]) break;
+        parts++;
+        i++;
+    }
     return parts;
 }
 
-static void bsyn_for(struct bsyn *st, bool select) {
+/* make_arith_for_command: each part with its leading blanks skipped; an
+ * empty one is "1" */
+static void bsn_arith_for_split(struct bsyn *st, struct bsn *n, const char *s) {
+    size_t i = 0;
+    for (int k = 0; k < 3; k++) {
+        while (s[i] == ' ' || s[i] == '\t') i++;
+        size_t e = bsyn_arith_for_part_end(s, i);
+        n->ex[k] = (e > i) ? bsn_strn(st, s + i, e - i) : bsn_strn(st, "1", 1);
+        i = s[e] ? e + 1 : e;
+    }
+}
+
+static struct bsn *bsyn_for(struct bsyn *st, bool select) {
     unsigned long for_line = st->lineno;
     bsyn_shift(st);
     int t = bsyn_la(st);
-    if (st->failed) return;
+    if (st->failed) return 0;
     if (!select && t == BT_ARITH_FOR_EXPRS) {
         struct bsyn_buf ex = {0, 0, 0};
         bsyn_putn(st, &ex, st->wtext.p ? st->wtext.p : "", st->wtext.len);
@@ -2305,148 +2751,209 @@ static void bsyn_for(struct bsyn *st, bool select) {
             bsyn_newlines(st);
             t = bsyn_la(st);
         }
+        struct bsn *body = 0;
         if (!st->failed) {
-            if (t == BT_DO || t == '{') bsyn_body(st, t);
+            if (t == BT_DO || t == '{') body = bsyn_body(st, t);
             else bsyn_syntax_error(st);
         }
+        struct bsn *n = 0;
         if (!st->failed && ex.p) {
             /* make_arith_for_command: exactly three expressions */
-            int n = bsyn_arith_for_parts(ex.p);
-            if (n != 3) {
+            int k = bsyn_arith_for_parts(ex.p);
+            if (k != 3) {
                 bsyn_msg(st, for_line, BSYN_MSG_PARSER,
-                         n < 3 ? "syntax error: arithmetic expression required"
+                         k < 3 ? "syntax error: arithmetic expression required"
                                : "syntax error: `;' unexpected", 0, 0);
                 bsyn_msg(st, for_line, BSYN_MSG_PARSER, "syntax error: `((", ex.p, "))'");
                 bsyn_status_set(st, 2);
                 bsyn_lexfail(st);       /* YYERROR: recovery, no message */
+            } else if (st->build) {
+                n = bsn_new(st, BN_ARITH_FOR);
+                if (n) {
+                    bsn_arith_for_split(st, n, ex.p);
+                    n->a = body;
+                }
             }
         }
         bsyn_buf_free(&ex);
-        return;
+        return n;
     }
-    if (t != BT_WORD) { bsyn_syntax_error(st); return; }
+    if (t != BT_WORD) { bsyn_syntax_error(st); return 0; }
+    struct bsn *n = bsn_new(st, select ? BN_SELECT : BN_FOR);
+    if (n) {
+        struct bsn_word *nw = bsn_word_cur(st);
+        n->name = nw ? nw->w : 0;
+    }
     bsyn_shift(st);
     t = bsyn_la(st);
-    if (st->failed) return;
+    if (st->failed) return 0;
     if (t == ';') {
         bsyn_shift(st);
         bsyn_newlines(st);
         t = bsyn_la(st);
-        if (st->failed) return;
-        if (t == BT_DO || t == '{') bsyn_body(st, t);
+        if (st->failed) return 0;
+        if (n) n->words = bsn_word_lit(st, "\"$@\"");
+        if (t == BT_DO || t == '{') { struct bsn *b = bsyn_body(st, t); if (n) n->a = b; }
         else bsyn_syntax_error(st);
-        return;
+        return n;
     }
     bsyn_newlines(st);
     t = bsyn_la(st);
-    if (st->failed) return;
-    if (t == BT_DO || t == '{') { bsyn_body(st, t); return; }
-    if (t != BT_IN) { bsyn_syntax_error(st); return; }
+    if (st->failed) return 0;
+    if (t == BT_DO || t == '{') {
+        if (n) n->words = bsn_word_lit(st, "\"$@\"");
+        struct bsn *b = bsyn_body(st, t);
+        if (n) n->a = b;
+        return n;
+    }
+    if (t != BT_IN) { bsyn_syntax_error(st); return 0; }
     bsyn_shift(st);
-    while (!st->failed && bsyn_la(st) == BT_WORD) bsyn_shift(st);
+    while (!st->failed && bsyn_la(st) == BT_WORD) {
+        if (n) bsn_words_add(&n->words, bsn_word_cur(st));
+        bsyn_shift(st);
+    }
     t = bsyn_la(st);
-    if (st->failed) return;
-    if (t != ';' && t != '\n' && t != BT_EOF) { bsyn_syntax_error(st); return; }
+    if (st->failed) return 0;
+    if (t != ';' && t != '\n' && t != BT_EOF) { bsyn_syntax_error(st); return 0; }
     bsyn_shift(st);
     bsyn_newlines(st);
     t = bsyn_la(st);
-    if (st->failed) return;
-    if (t == BT_DO || t == '{') bsyn_body(st, t);
+    if (st->failed) return 0;
+    if (t == BT_DO || t == '{') { struct bsn *b = bsyn_body(st, t); if (n) n->a = b; }
     else bsyn_syntax_error(st);
+    return n;
 }
 
-static void bsyn_case(struct bsyn *st) {
+static struct bsn *bsyn_case(struct bsyn *st) {
     bsyn_shift(st);
-    if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return; }
+    if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return 0; }
+    struct bsn *n = bsn_new(st, BN_CASE);
+    if (n) n->words = bsn_word_cur(st);
     bsyn_shift(st);
     bsyn_newlines(st);
-    if (!bsyn_expect(st, BT_IN)) return;
+    if (!bsyn_expect(st, BT_IN)) return 0;
+    struct bsn_clause **tail = n ? &n->clauses : 0;
     for (;;) {
         bsyn_newlines(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
         int t = bsyn_la(st);
-        if (t == BT_ESAC) { bsyn_shift(st); return; }
+        if (t == BT_ESAC) { bsyn_shift(st); return n; }
         if (t == '(') { bsyn_shift(st); t = bsyn_la(st); }
-        if (st->failed) return;
-        if (t != BT_WORD) { bsyn_syntax_error(st); return; }
+        if (st->failed) return 0;
+        if (t != BT_WORD) { bsyn_syntax_error(st); return 0; }
+        struct bsn_clause *cl = 0;
+        if (n) cl = (struct bsn_clause *)bsn_alloc(st, sizeof *cl);
+        if (cl) bsn_words_add(&cl->pats, bsn_word_cur(st));
         bsyn_shift(st);
         while (!st->failed && bsyn_la(st) == '|') {
             bsyn_shift(st);
-            if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return; }
+            if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return 0; }
+            if (cl) bsn_words_add(&cl->pats, bsn_word_cur(st));
             bsyn_shift(st);
         }
-        if (!bsyn_expect(st, ')')) return;
+        if (!bsyn_expect(st, ')')) return 0;
         bsyn_newlines(st);
-        if (st->failed) return;
-        if (bsyn_pipeline_start(bsyn_la(st))) bsyn_list(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
+        struct bsn *action = 0;
+        if (bsyn_pipeline_start(bsyn_la(st))) action = bsyn_list(st);
+        if (st->failed) return 0;
+        if (cl) {
+            cl->action = action;
+            *tail = cl;
+            tail = &cl->next;
+        }
         t = bsyn_la(st);
         if (t == BT_SEMI_SEMI || t == BT_SEMI_AND || t == BT_SEMI_SEMI_AND) {
+            if (cl) cl->term = (t == BT_SEMI_AND) ? 1 : (t == BT_SEMI_SEMI_AND) ? 2 : 0;
             bsyn_shift(st);
             continue;
         }
-        if (t == BT_ESAC) { bsyn_shift(st); return; }
+        if (t == BT_ESAC) { bsyn_shift(st); return n; }
         bsyn_syntax_error(st);
-        return;
+        return 0;
     }
 }
 
-static void bsyn_if(struct bsyn *st) {
+/* IF ... [ELIF ...]* [ELSE ...] FI: an elif is an if in the else part */
+static struct bsn *bsyn_if(struct bsyn *st) {
     bsyn_shift(st);
-    bsyn_compound_list(st);
-    if (!bsyn_expect(st, BT_THEN)) return;
-    bsyn_compound_list(st);
+    struct bsn *top = bsn_new(st, BN_IF);
+    struct bsn *cur = top;
+    struct bsn *test = bsyn_compound_list(st);
+    if (!bsyn_expect(st, BT_THEN)) return 0;
+    struct bsn *yes = bsyn_compound_list(st);
+    if (cur) { cur->a = test; cur->b = yes; }
     for (;;) {
-        if (st->failed) return;
+        if (st->failed) return 0;
         int t = bsyn_la(st);
         if (t == BT_ELIF) {
             bsyn_shift(st);
-            bsyn_compound_list(st);
-            if (!bsyn_expect(st, BT_THEN)) return;
-            bsyn_compound_list(st);
+            struct bsn *e = bsn_new(st, BN_IF);
+            struct bsn *etest = bsyn_compound_list(st);
+            if (!bsyn_expect(st, BT_THEN)) return 0;
+            struct bsn *eyes = bsyn_compound_list(st);
+            if (e) { e->a = etest; e->b = eyes; }
+            if (cur) cur->c = e;
+            cur = e;
             continue;
         }
         if (t == BT_ELSE) {
             bsyn_shift(st);
-            bsyn_compound_list(st);
+            struct bsn *no = bsyn_compound_list(st);
+            if (cur) cur->c = no;
         }
         bsyn_expect(st, BT_FI);
-        return;
+        return top;
     }
 }
 
 /* shell_command: the lookahead starts one */
-static void bsyn_shell_command(struct bsyn *st) {
+static struct bsn *bsyn_shell_command(struct bsyn *st) {
     int t = bsyn_la(st);
+    struct bsn *n = 0;
     BSYN_DEPTH_IN(st);
     switch (t) {
-    case BT_FOR: bsyn_for(st, false); break;
-    case BT_SELECT: bsyn_for(st, true); break;
-    case BT_CASE: bsyn_case(st); break;
-    case BT_IF: bsyn_if(st); break;
-    case BT_WHILE: case BT_UNTIL:
+    case BT_FOR: n = bsyn_for(st, false); break;
+    case BT_SELECT: n = bsyn_for(st, true); break;
+    case BT_CASE: n = bsyn_case(st); break;
+    case BT_IF: n = bsyn_if(st); break;
+    case BT_WHILE: case BT_UNTIL: {
         bsyn_shift(st);
-        bsyn_compound_list(st);
+        struct bsn *test = bsyn_compound_list(st);
         if (!bsyn_expect(st, BT_DO)) break;
-        bsyn_compound_list(st);
-        bsyn_expect(st, BT_DONE);
+        struct bsn *action = bsyn_compound_list(st);
+        if (!bsyn_expect(st, BT_DONE)) break;
+        n = bsn_new(st, t == BT_WHILE ? BN_WHILE : BN_UNTIL);
+        if (n) { n->a = test; n->b = action; }
         break;
-    case '(':
+    }
+    case '(': {
         bsyn_shift(st);
-        bsyn_compound_list(st);
-        bsyn_expect(st, ')');
+        struct bsn *l = bsyn_compound_list(st);
+        if (!bsyn_expect(st, ')')) break;
+        n = bsn_new(st, BN_SUBSHELL);
+        if (n) { n->a = l; n->flags |= BN_WANT_SUBSHELL; }
         break;
-    case '{':
+    }
+    case '{': {
         bsyn_shift(st);
-        bsyn_compound_list(st);
-        bsyn_expect(st, '}');
+        struct bsn *l = bsyn_compound_list(st);
+        if (!bsyn_expect(st, '}')) break;
+        n = bsn_new(st, BN_GROUP);
+        if (n) n->a = l;
         break;
+    }
     case BT_ARITH_CMD:
+        n = bsn_new(st, BN_ARITH);
+        if (n) n->words = bsn_word_cur(st);
         bsyn_shift(st);
         break;
     case BT_COND_START:
         bsyn_shift(st);
         if (!bsyn_expect(st, BT_COND_CMD)) break;
+        n = bsn_new(st, BN_COND);
+        if (n) n->cond = st->cond_tree;
+        st->cond_tree = 0;
         bsyn_expect(st, BT_COND_END);
         break;
     default:
@@ -2454,116 +2961,156 @@ static void bsyn_shell_command(struct bsyn *st) {
         break;
     }
     BSYN_DEPTH_OUT(st);
+    return st->failed ? 0 : n;
 }
 
-static void bsyn_function_body(struct bsyn *st) {
+static struct bsn *bsyn_function_body(struct bsyn *st) {
     if (!bsyn_shell_cmd_start(bsyn_la(st))) {
         if (!st->failed) bsyn_syntax_error(st);
-        return;
+        return 0;
     }
-    bsyn_shell_command(st);
-    bsyn_redirection_list_opt(st);
+    struct bsn *b = bsyn_shell_command(st);
+    bsyn_redirection_list_opt(st, b);
+    return b;
 }
 
-static void bsyn_command(struct bsyn *st) {
+static struct bsn *bsn_function(struct bsyn *st, char *name, struct bsn *body) {
+    struct bsn *f = bsn_new(st, BN_FUNC);
+    if (f) { f->name = name; f->a = body; }
+    return f;
+}
+
+static struct bsn *bsyn_command(struct bsyn *st) {
     int t = bsyn_la(st);
-    if (st->failed) return;
+    if (st->failed) return 0;
     if (bsyn_shell_cmd_start(t)) {
-        bsyn_shell_command(st);
-        bsyn_redirection_list_opt(st);
-        return;
+        struct bsn *c = bsyn_shell_command(st);
+        bsyn_redirection_list_opt(st, c);
+        return c;
     }
     if (t == BT_FUNCTION) {
         bsyn_shift(st);
-        if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return; }
+        if (bsyn_la(st) != BT_WORD) { if (!st->failed) bsyn_syntax_error(st); return 0; }
+        struct bsn_word *nw = bsn_word_cur(st);
         bsyn_shift(st);
         t = bsyn_la(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
         if (t == '(') {
             bsyn_shift(st);
-            if (!bsyn_expect(st, ')')) return;
+            if (!bsyn_expect(st, ')')) return 0;
             bsyn_newlines(st);
         } else if (t == '\n') {
             bsyn_shift(st);
             bsyn_newlines(st);
         }
-        if (st->failed) return;
-        bsyn_function_body(st);
-        return;
+        if (st->failed) return 0;
+        struct bsn *b = bsyn_function_body(st);
+        return bsn_function(st, nw ? nw->w : 0, b);
     }
     if (t == BT_COPROC) {
         bsyn_shift(st);
         t = bsyn_la(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
+        struct bsn *cp = bsn_new(st, BN_COPROC);
+        if (cp) { cp->name = bsn_strn(st, "COPROC", 6); cp->flags |= BN_WANT_SUBSHELL; }
         if (bsyn_shell_cmd_start(t)) {
-            bsyn_shell_command(st);
-            bsyn_redirection_list_opt(st);
-            return;
+            struct bsn *c = bsyn_shell_command(st);
+            bsyn_redirection_list_opt(st, c);
+            if (cp) cp->a = c;
+            return cp;
         }
         if (t == BT_WORD) {
+            struct bsn_word *w = bsn_word_cur(st);
             bsyn_shift(st);
             t = bsyn_la(st);
-            if (st->failed) return;
+            if (st->failed) return 0;
             if (bsyn_shell_cmd_start(t)) {
-                bsyn_shell_command(st);
-                bsyn_redirection_list_opt(st);
-                return;
+                struct bsn *c = bsyn_shell_command(st);
+                bsyn_redirection_list_opt(st, c);
+                if (cp) { cp->name = w ? w->w : cp->name; cp->a = c; }
+                return cp;
             }
+            /* COPROC simple_command: the word was its first */
+            struct bsn *s = bsn_new(st, BN_SIMPLE);
+            if (s) bsn_words_add(&s->words, w);
             st->pst &= ~BP_REDIRLIST;
-            bsyn_simple_rest(st);
-            return;
+            bsyn_simple_rest(st, s);
+            if (cp) cp->a = s;
+            return cp;
         }
         if (t == BT_ASSIGNMENT_WORD || bsyn_redir_start(t)) {
-            bsyn_simple_command(st);
-            return;
+            struct bsn *s = bsyn_simple_command(st);
+            if (cp) cp->a = s;
+            return cp;
         }
         bsyn_syntax_error(st);
-        return;
+        return 0;
     }
     if (t == BT_WORD) {
+        struct bsn_word *w = bsn_word_cur(st);
         bsyn_shift(st);
         t = bsyn_la(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
         if (t == '(') {
             /* function_def: WORD '(' ')' newline_list function_body */
             bsyn_shift(st);
-            if (!bsyn_expect(st, ')')) return;
+            if (!bsyn_expect(st, ')')) return 0;
             bsyn_newlines(st);
-            if (st->failed) return;
-            bsyn_function_body(st);
-            return;
+            if (st->failed) return 0;
+            struct bsn *b = bsyn_function_body(st);
+            return bsn_function(st, w ? w->w : 0, b);
         }
+        struct bsn *s = bsn_new(st, BN_SIMPLE);
+        if (s) bsn_words_add(&s->words, w);
         st->pst &= ~BP_REDIRLIST;
-        bsyn_simple_rest(st);
-        return;
+        bsyn_simple_rest(st, s);
+        return s;
     }
-    bsyn_simple_command(st);
+    return bsyn_simple_command(st);
 }
 
-static void bsyn_pipeline(struct bsyn *st) {
+/* A pipeline is right-associative (`%right '|'`), so `a | b |& c` adds
+ * the 2>&1 to b alone. */
+static struct bsn *bsyn_pipeline(struct bsyn *st) {
+    struct bsn *first = 0, *last_conn = 0;
     for (;;) {
-        bsyn_command(st);
-        if (st->failed) return;
+        struct bsn *c = bsyn_command(st);
+        if (st->failed) return 0;
         int t = bsyn_la(st);
-        if (t != '|' && t != BT_BAR_AND) return;
+        if (t != '|' && t != BT_BAR_AND) {
+            if (!first) return c;
+            if (last_conn) last_conn->b = c;
+            return first;
+        }
+        if (t == BT_BAR_AND && c) {
+            struct bsn_redir *r = (struct bsn_redir *)bsn_alloc(st, sizeof *r);
+            if (r) { r->op = BR_DUP_OUT; r->fd = 2; r->dest = 1; bsn_redir_add(&c->redirs, r); }
+        }
+        struct bsn *conn = bsn_connect(st, c, 0, '|');
+        if (!first) first = conn;
+        else if (last_conn) last_conn->b = conn;
+        last_conn = conn;
         bsyn_shift(st);
         bsyn_newlines(st);
-        if (st->failed) return;
+        if (st->failed) return 0;
         if (!bsyn_cmd_start(bsyn_la(st))) {
             if (!st->failed) bsyn_syntax_error(st);
-            return;
+            return 0;
         }
     }
 }
 
-static void bsyn_pipeline_command(struct bsyn *st) {
+static struct bsn *bsyn_pipeline_command(struct bsyn *st) {
     BSYN_DEPTH_IN(st);
     int t = bsyn_la(st);
+    struct bsn *n = 0;
     if (!st->failed && (t == BT_BANG || t == BT_TIME)) {
+        unsigned fl = 0;
         bsyn_shift(st);
         if (t == BT_TIME) {
-            if (bsyn_la(st) == BT_TIMEOPT) bsyn_shift(st);
-            if (!st->failed && bsyn_la(st) == BT_TIMEIGN) bsyn_shift(st);
+            fl = BN_TIME;
+            if (bsyn_la(st) == BT_TIMEOPT) { bsyn_shift(st); fl |= BN_TIME_POSIX; }
+            if (!st->failed && bsyn_la(st) == BT_TIMEIGN) { bsyn_shift(st); fl |= BN_TIME_POSIX; }
         }
         int u = bsyn_la(st);
         if (!st->failed) {
@@ -2572,32 +3119,45 @@ static void bsyn_pipeline_command(struct bsyn *st) {
                 bsyn_shift(st);
                 if (u != BT_EOF) st->to_read = u;
                 st->pst &= ~BP_REDIRLIST;
+                n = bsn_new(st, BN_SIMPLE);
+                if (n) n->flags |= (t == BT_BANG) ? BN_INVERT : fl;
             } else if (bsyn_pipeline_start(u)) {
-                bsyn_pipeline_command(st);
+                n = bsyn_pipeline_command(st);
+                if (n) {
+                    if (t == BT_BANG) n->flags ^= BN_INVERT;
+                    else n->flags |= fl;
+                }
             } else {
                 bsyn_syntax_error(st);
             }
         }
         BSYN_DEPTH_OUT(st);
-        return;
+        return st->failed ? 0 : n;
     }
-    if (!st->failed) bsyn_pipeline(st);
+    if (!st->failed) n = bsyn_pipeline(st);
     BSYN_DEPTH_OUT(st);
+    return st->failed ? 0 : n;
 }
 
 /* inputunit: simple_list simple_list_terminator | '\n' | yacc_EOF */
-static int bsyn_inputunit(struct bsyn *st) {
+static int bsyn_inputunit(struct bsyn *st, struct bsn **tree) {
+    *tree = 0;
     int t = bsyn_la(st);
     if (st->failed) return BSYN_ERROR;
     if (t == '\n') { bsyn_shift(st); return BSYN_OK; }
     if (t == BT_EOF) return BSYN_EOF;
     if (!bsyn_pipeline_start(t)) { bsyn_syntax_error(st); return BSYN_ERROR; }
+    struct bsn *acc = 0, *ao = 0;
+    int pend = 0, aop = 0;
     for (;;) {
-        bsyn_pipeline_command(st);
+        struct bsn *p = bsyn_pipeline_command(st);
         if (st->failed) return BSYN_ERROR;
+        ao = aop ? bsn_connect(st, ao, p, aop) : p;
+        aop = 0;
         t = bsyn_la(st);
         if (st->failed) return BSYN_ERROR;
         if (t == BT_AND_AND || t == BT_OR_OR) {
+            aop = t;
             bsyn_shift(st);
             bsyn_newlines(st);
             if (st->failed) return BSYN_ERROR;
@@ -2608,13 +3168,19 @@ static int bsyn_inputunit(struct bsyn *st) {
             continue;
         }
         if (t == ';' || t == '&') {
+            int sep = t;
+            acc = bsn_fold(st, acc, ao, pend);
+            ao = 0;
             bsyn_shift(st);
             t = bsyn_la(st);
             if (st->failed) return BSYN_ERROR;
-            if (bsyn_pipeline_start(t)) continue;
+            if (bsyn_pipeline_start(t)) { pend = sep; continue; }
+            if (sep == '&') acc = bsn_connect_async(st, acc, 0);
         }
         break;
     }
+    if (ao) acc = bsn_fold(st, acc, ao, pend);
+    *tree = acc;
     t = bsyn_la(st);
     if (st->failed) return BSYN_ERROR;
     if (t == '\n') {
@@ -2681,6 +3247,7 @@ static struct bsyn *bsyn_open(const char *buf, size_t len, size_t off,
     st->cur = '\n';
     st->last = '\n';
     st->before = '\n';
+    st->build = env->build;
     return st;
 }
 
@@ -2703,6 +3270,7 @@ static void bsyn_close(struct bsyn *st) {
     bsyn_buf_free(&st->tok);
     bsyn_buf_free(&st->wtext);
     if (st->dstack) BSYN_FREE(st->dstack);
+    bsn_arena_free(st);
     BSYN_FREE(st);
 }
 
@@ -2711,6 +3279,8 @@ static void bsyn_close(struct bsyn *st) {
 static int bsyn_next(struct bsyn *st, struct bsyn_result *res) {
     memset(res, 0, sizeof *res);
     st->res = res;
+    bsn_arena_free(st);             /* the last command's tree */
+    st->cond_tree = 0;
     st->failed = st->lexfail = st->discard = st->fatal = false;
     st->st_set = false;
     st->st_val = st->st_ifzero = 0;
@@ -2728,7 +3298,9 @@ static int bsyn_next(struct bsyn *st, struct bsyn_result *res) {
     } else if (st->eof) {
         kind = BSYN_EOF;
     } else {
-        kind = bsyn_inputunit(st);
+        struct bsn *tree = 0;
+        kind = bsyn_inputunit(st, &tree);
+        if (kind == BSYN_OK && !st->failed) res->tree = tree;
         if (st->oom) {
             kind = BSYN_SKIP;
         } else if (st->failed) {
@@ -2753,7 +3325,7 @@ static int bsyn_next(struct bsyn *st, struct bsyn_result *res) {
     res->status_ifzero = st->st_ifzero;
     res->end = (kind == BSYN_EOF) ? st->len : bsyn_pos(st);
     res->end_line = st->lineno;
-    if (kind == BSYN_SKIP) bsyn_result_free(res);
+    if (kind == BSYN_SKIP) { bsyn_result_free(res); res->tree = 0; }
     st->res = 0;
     return kind;
 }
@@ -2770,3 +3342,555 @@ static void bsyn_set_leak(struct bsyn *st, unsigned bits) {
     st->pst = (st->pst & ~BSYN_LEAK_BITS) | (bits & BSYN_LEAK_BITS);
 }
 static unsigned bsyn_get_leak(struct bsyn *st) { return st->pst & BSYN_LEAK_BITS; }
+
+/* ---- printing a tree, as bash prints it ---------------------------------
+ *
+ * bash shows a command it has parsed by PRINTING ITS TREE (print_cmd.c),
+ * never the text that was typed: `declare -f`, `type`, the `set` listing,
+ * an exported function's environment string, $BASH_COMMAND, a job's
+ * command, and the text a $( ) runs are all this printer's output. So the
+ * layout is bash's, quirks included -- four-space indents, `;' after each
+ * command in a function body, `do' on its own line after a `for' head but
+ * not after `while', `elif' printed as `else if', a here-document's body
+ * after the connector that follows its command, `>&2' as `1>&2'.
+ *
+ * The state is print_cmd.c's: indentation, a count of indents to skip
+ * (the next command continues a line), whether a function body or a
+ * connection or a command substitution is being printed, and the
+ * here-documents waiting for their connector. */
+
+struct bsp {
+    struct bsyn *st;                 /* for the buffers' out-of-memory flag */
+    struct bsyn_buf out;
+    int indentation, indentation_amount;
+    int inside_function_def, skip_this_indent, was_heredoc;
+    int printing_connection, printing_comsub, group_command_nesting;
+    struct bsn_redir **deferred;     /* here-documents owed after a connector */
+    int ndeferred, capdeferred;
+    bool posix;                      /* print `name ()' rather than `function name ()' */
+};
+
+static void bsp_init(struct bsp *p, struct bsyn *st) {
+    for (size_t i = 0; i < sizeof *p; i++) ((char *)p)[i] = 0;
+    p->st = st;
+    p->indentation_amount = 4;
+}
+
+static void bsp_free(struct bsp *p) {
+    bsyn_buf_free(&p->out);
+    if (p->deferred) BSYN_FREE(p->deferred);
+    p->deferred = 0;
+    p->ndeferred = p->capdeferred = 0;
+}
+
+static void bsp_puts(struct bsp *p, const char *s) { bsyn_puts(p->st, &p->out, s); }
+static void bsp_putc(struct bsp *p, int c) { bsyn_putc(p->st, &p->out, c); }
+static void bsp_putint(struct bsp *p, long v) {
+    if (v < 0) { bsp_putc(p, '-'); v = -v; }
+    bsyn_put_ulong(p->st, &p->out, (unsigned long)v);
+}
+
+static void bsp_indent(struct bsp *p, int amount) {
+    while (amount-- > 0) bsp_putc(p, ' ');
+}
+
+static void bsp_newline(struct bsp *p, const char *s) {
+    bsp_putc(p, '\n');
+    bsp_indent(p, p->indentation);
+    if (s && *s) bsp_puts(p, s);
+}
+
+/* a `;' unless the line already ends a command */
+static void bsp_semicolon(struct bsp *p) {
+    if (p->out.len > 0 &&
+        (p->out.p[p->out.len - 1] == '&' || p->out.p[p->out.len - 1] == '\n'))
+        return;
+    bsp_putc(p, ';');
+}
+
+static void bsp_words(struct bsp *p, const struct bsn_word *w, const char *sep) {
+    for (; w; w = w->next) {
+        bsp_puts(p, w->w ? w->w : "");
+        if (w->next) bsp_puts(p, sep);
+    }
+}
+
+static void bsp_cmd(struct bsp *p, const struct bsn *n);
+
+static bool bsp_is_heredoc(const struct bsn_redir *r) {
+    return r->op == BR_HEREDOC || r->op == BR_HEREDOC_STRIP;
+}
+
+static void bsp_redirector(struct bsp *p, const struct bsn_redir *r, int dflt) {
+    if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+    else if (r->fd != dflt) bsp_putint(p, r->fd);
+}
+
+static void bsp_hd_header(struct bsp *p, const struct bsn_redir *r) {
+    bsp_redirector(p, r, 0);
+    bsp_puts(p, r->op == BR_HEREDOC_STRIP ? "<<-" : "<<");
+    if (r->wquoted) {
+        const char *e = r->eof ? r->eof : "";
+        size_t n = 0;
+        while (e[n]) n++;
+        bsyn_single_quote(p->st, e, n, &p->out);
+    } else {
+        bsp_puts(p, r->eof ? r->eof : "");
+    }
+}
+
+static void bsp_hd_body(struct bsp *p, const struct bsn_redir *r) {
+    bsp_puts(p, r->body ? r->body : "");
+    bsp_puts(p, r->eof ? r->eof : "");
+}
+
+static void bsp_redir(struct bsp *p, const struct bsn_redir *r) {
+    const char *w = r->word ? r->word : "";
+    switch (r->op) {
+    case BR_IN:     bsp_redirector(p, r, 0); bsp_puts(p, "< "); bsp_puts(p, w); break;
+    case BR_OUT:    bsp_redirector(p, r, 1); bsp_puts(p, "> "); bsp_puts(p, w); break;
+    case BR_FORCE:  bsp_redirector(p, r, 1); bsp_puts(p, ">| "); bsp_puts(p, w); break;
+    case BR_APPEND: bsp_redirector(p, r, 1); bsp_puts(p, ">> "); bsp_puts(p, w); break;
+    case BR_INOUT:  bsp_redirector(p, r, 1); bsp_puts(p, "<> "); bsp_puts(p, w); break;
+    case BR_HEREDOC: case BR_HEREDOC_STRIP:
+        bsp_hd_header(p, r);
+        bsp_putc(p, '\n');
+        bsp_hd_body(p, r);
+        break;
+    case BR_HERESTR: bsp_redirector(p, r, 0); bsp_puts(p, "<<< "); bsp_puts(p, w); break;
+    case BR_DUP_IN: case BR_DUP_OUT: case BR_MOVE_IN: case BR_MOVE_OUT: {
+        bool in = (r->op == BR_DUP_IN || r->op == BR_MOVE_IN);
+        if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+        else bsp_putint(p, r->fd);
+        bsp_puts(p, in ? "<&" : ">&");
+        bsp_putint(p, r->dest);
+        if (r->op == BR_MOVE_IN || r->op == BR_MOVE_OUT) bsp_putc(p, '-');
+        break;
+    }
+    case BR_DUP_IN_W:
+        if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+        else if (r->fd != 0) bsp_putint(p, r->fd);
+        bsp_puts(p, "<&");
+        bsp_puts(p, w);
+        break;
+    case BR_DUP_OUT_W:
+        if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+        else if (r->fd != 1) bsp_putint(p, r->fd);
+        bsp_puts(p, ">&");
+        bsp_puts(p, w);
+        break;
+    case BR_MOVE_IN_W: case BR_MOVE_OUT_W:
+        if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+        else bsp_putint(p, r->fd);
+        bsp_puts(p, r->op == BR_MOVE_IN_W ? "<&" : ">&");
+        bsp_puts(p, w);
+        bsp_putc(p, '-');
+        break;
+    case BR_CLOSE:
+        if (r->var) { bsp_putc(p, '{'); bsp_puts(p, r->var); bsp_putc(p, '}'); }
+        else bsp_putint(p, r->fd);
+        bsp_puts(p, ">&-");
+        break;
+    case BR_ERR_OUT:        bsp_puts(p, "&> "); bsp_puts(p, w); break;
+    case BR_APPEND_ERR_OUT: bsp_puts(p, "&>> "); bsp_puts(p, w); break;
+    }
+}
+
+static void bsp_heredoc_bodies(struct bsp *p, struct bsn_redir **hd, int n) {
+    bsp_putc(p, '\n');
+    for (int i = 0; i < n; i++) {
+        bsp_hd_body(p, hd[i]);
+        bsp_putc(p, '\n');
+    }
+    p->was_heredoc = 1;
+}
+
+/* print_deferred_heredocs: the connector, then the bodies owed */
+static void bsp_deferred(struct bsp *p, const char *cstring) {
+    bool show = cstring && cstring[0] && (cstring[0] != ';' || cstring[1]);
+    if (show) bsp_puts(p, cstring);
+    if (p->ndeferred) {
+        bsp_heredoc_bodies(p, p->deferred, p->ndeferred);
+        if (show) bsp_putc(p, ' ');
+        p->was_heredoc = 1;
+    }
+    p->ndeferred = 0;
+}
+
+#define BSP_DEFERRED(p, x) do { if ((p)->ndeferred) bsp_deferred((p), (x)); } while (0)
+
+static void bsp_redir_list(struct bsp *p, const struct bsn_redir *r) {
+    struct bsn_redir *hd[BSYN_HEREDOC_MAX * 4];
+    int nhd = 0;
+    p->was_heredoc = 0;
+    for (; r; r = r->next) {
+        if (bsp_is_heredoc(r)) {
+            bsp_hd_header(p, r);
+            if (nhd < (int)(sizeof hd / sizeof hd[0])) hd[nhd++] = (struct bsn_redir *)r;
+        } else {
+            bsp_redir(p, r);
+        }
+        if (r->next) bsp_putc(p, ' ');
+    }
+    if (nhd && p->printing_connection) {
+        /* deferred_heredocs = heredocs: bash REPLACES what was owed */
+        if (p->capdeferred < nhd) {
+            struct bsn_redir **nd =
+                (struct bsn_redir **)BSYN_ALLOC((size_t)nhd * sizeof *nd);
+            if (!nd) { bsyn_nomem(p->st); return; }
+            if (p->deferred) BSYN_FREE(p->deferred);
+            p->deferred = nd;
+            p->capdeferred = nhd;
+        }
+        for (int i = 0; i < nhd; i++) p->deferred[i] = hd[i];
+        p->ndeferred = nhd;
+    } else if (nhd) {
+        bsp_heredoc_bodies(p, hd, nhd);
+    }
+}
+
+static void bsp_cond(struct bsp *p, const struct bsn_cond *c) {
+    if (!c) return;
+    if (c->invert) bsp_puts(p, "! ");
+    switch (c->type) {
+    case BC_EXPR:
+        bsp_puts(p, "( ");
+        bsp_cond(p, c->l);
+        bsp_puts(p, " )");
+        break;
+    case BC_AND:
+        bsp_cond(p, c->l);
+        bsp_puts(p, " && ");
+        bsp_cond(p, c->r);
+        break;
+    case BC_OR:
+        bsp_cond(p, c->l);
+        bsp_puts(p, " || ");
+        bsp_cond(p, c->r);
+        break;
+    case BC_UNARY:
+        bsp_puts(p, c->op ? c->op : "");
+        bsp_putc(p, ' ');
+        bsp_cond(p, c->l);
+        break;
+    case BC_BINARY:
+        bsp_cond(p, c->l);
+        bsp_putc(p, ' ');
+        bsp_puts(p, c->op ? c->op : "");
+        bsp_putc(p, ' ');
+        bsp_cond(p, c->r);
+        break;
+    case BC_TERM:
+        bsp_puts(p, c->op ? c->op : "");
+        break;
+    }
+}
+
+static bool bsp_reserved(const char *w) {
+    static const char *const r[] = {
+        "if", "then", "else", "elif", "fi", "case", "esac", "for", "select",
+        "while", "until", "do", "done", "in", "function", "time", "{", "}",
+        "!", "[[", "]]", "coproc", 0
+    };
+    for (int i = 0; r[i]; i++) if (bsyn_streq(w, r[i])) return true;
+    return false;
+}
+
+/* print_function_def: a definition met while printing something else */
+static void bsp_function_def(struct bsp *p, const struct bsn *f) {
+    if (!p->posix) { bsp_puts(p, "function "); bsp_puts(p, f->name ? f->name : ""); bsp_puts(p, " () \n"); }
+    else { bsp_puts(p, f->name ? f->name : ""); bsp_puts(p, " () \n"); }
+    bsp_indent(p, p->indentation);
+    bsp_puts(p, "{ \n");
+    p->inside_function_def++;
+    p->indentation += p->indentation_amount;
+    const struct bsn *body = f->a;
+    const struct bsn_redir *fr = 0;
+    if (body && body->type == BN_GROUP) {
+        fr = body->redirs;
+        bsp_cmd(p, body->a);
+    } else {
+        bsp_cmd(p, body);
+    }
+    BSP_DEFERRED(p, "");
+    p->indentation -= p->indentation_amount;
+    p->inside_function_def--;
+    if (fr) {
+        bsp_newline(p, "} ");
+        bsp_redir_list(p, fr);
+    } else {
+        bsp_newline(p, "}");
+        p->was_heredoc = 0;
+    }
+}
+
+static void bsp_cmd(struct bsp *p, const struct bsn *n) {
+    if (p->st->oom) return;
+    if (!n) return;
+    if (p->skip_this_indent) p->skip_this_indent--;
+    else bsp_indent(p, p->indentation);
+    if (n->flags & BN_TIME) {
+        bsp_puts(p, "time ");
+        if (n->flags & BN_TIME_POSIX) bsp_puts(p, "-p ");
+    }
+    if (n->flags & BN_INVERT) bsp_puts(p, "! ");
+
+    switch (n->type) {
+    case BN_FOR: case BN_SELECT:
+        bsp_puts(p, n->type == BN_FOR ? "for " : "select ");
+        bsp_puts(p, n->name ? n->name : "");
+        bsp_puts(p, " in ");
+        bsp_words(p, n->words, " ");
+        bsp_putc(p, ';');
+        bsp_newline(p, "do\n");
+        p->indentation += p->indentation_amount;
+        bsp_cmd(p, n->a);
+        BSP_DEFERRED(p, "");
+        bsp_semicolon(p);
+        p->indentation -= p->indentation_amount;
+        bsp_newline(p, "done");
+        break;
+    case BN_ARITH_FOR:
+        bsp_puts(p, "for ((");
+        bsp_puts(p, n->ex[0] ? n->ex[0] : "1");
+        bsp_puts(p, "; ");
+        bsp_puts(p, n->ex[1] ? n->ex[1] : "1");
+        bsp_puts(p, "; ");
+        bsp_puts(p, n->ex[2] ? n->ex[2] : "1");
+        bsp_puts(p, "))");
+        bsp_newline(p, "do\n");
+        p->indentation += p->indentation_amount;
+        bsp_cmd(p, n->a);
+        BSP_DEFERRED(p, "");
+        bsp_semicolon(p);
+        p->indentation -= p->indentation_amount;
+        bsp_newline(p, "done");
+        break;
+    case BN_CASE: {
+        bsp_puts(p, "case ");
+        bsp_puts(p, n->words && n->words->w ? n->words->w : "");
+        bsp_puts(p, " in ");
+        if (n->clauses) {
+            p->indentation += p->indentation_amount;
+            for (const struct bsn_clause *c = n->clauses; c; c = c->next) {
+                bsp_newline(p, "");
+                bsp_words(p, c->pats, " | ");
+                bsp_puts(p, ")\n");
+                p->indentation += p->indentation_amount;
+                bsp_cmd(p, c->action);
+                p->indentation -= p->indentation_amount;
+                BSP_DEFERRED(p, "");
+                bsp_newline(p, c->term == 1 ? ";&" : c->term == 2 ? ";;&" : ";;");
+            }
+            p->indentation -= p->indentation_amount;
+        }
+        bsp_newline(p, "esac");
+        break;
+    }
+    case BN_WHILE: case BN_UNTIL:
+        bsp_puts(p, n->type == BN_WHILE ? "while " : "until ");
+        p->skip_this_indent++;
+        bsp_cmd(p, n->a);
+        BSP_DEFERRED(p, "");
+        bsp_semicolon(p);
+        bsp_puts(p, " do\n");
+        p->indentation += p->indentation_amount;
+        bsp_cmd(p, n->b);
+        BSP_DEFERRED(p, "");
+        p->indentation -= p->indentation_amount;
+        bsp_semicolon(p);
+        bsp_newline(p, "done");
+        break;
+    case BN_IF:
+        bsp_puts(p, "if ");
+        p->skip_this_indent++;
+        bsp_cmd(p, n->a);
+        bsp_semicolon(p);
+        bsp_puts(p, " then\n");
+        p->indentation += p->indentation_amount;
+        bsp_cmd(p, n->b);
+        BSP_DEFERRED(p, "");
+        p->indentation -= p->indentation_amount;
+        if (n->c) {
+            bsp_semicolon(p);
+            bsp_newline(p, "else\n");
+            p->indentation += p->indentation_amount;
+            bsp_cmd(p, n->c);
+            BSP_DEFERRED(p, "");
+            p->indentation -= p->indentation_amount;
+        }
+        bsp_semicolon(p);
+        bsp_newline(p, "fi");
+        break;
+    case BN_ARITH:
+        bsp_puts(p, "((");
+        bsp_words(p, n->words, " ");
+        bsp_puts(p, "))");
+        break;
+    case BN_COND:
+        bsp_puts(p, "[[ ");
+        bsp_cond(p, n->cond);
+        bsp_puts(p, " ]]");
+        break;
+    case BN_SIMPLE:
+        if (n->words) bsp_words(p, n->words, " ");
+        if (n->redirs) {
+            if (n->words) bsp_putc(p, ' ');
+            bsp_redir_list(p, n->redirs);
+        }
+        return;                         /* its redirections are printed */
+    case BN_CONN: {
+        p->skip_this_indent++;
+        p->printing_connection++;
+        bsp_cmd(p, n->a);
+        int c = n->connector;
+        if (c == '&' || c == '|') {
+            char s[3] = { ' ', (char)c, 0 };
+            bsp_deferred(p, s);
+            if (c != '&' || n->b) {
+                bsp_putc(p, ' ');
+                p->skip_this_indent++;
+            }
+        } else if (c == BT_AND_AND) {
+            bsp_deferred(p, " && ");
+            if (n->b) p->skip_this_indent++;
+        } else if (c == BT_OR_OR) {
+            bsp_deferred(p, " || ");
+            if (n->b) p->skip_this_indent++;
+        } else if (c == ';' || c == '\n') {
+            char s[2] = { (char)(p->printing_comsub ? c : ';'), 0 };
+            bool was_newline = p->ndeferred == 0 && p->was_heredoc == 0 && c == '\n';
+            if (p->ndeferred == 0) {
+                if (p->was_heredoc == 0) bsp_puts(p, s);
+                else p->was_heredoc = 0;
+            } else {
+                bsp_deferred(p, p->inside_function_def ? "" : ";");
+            }
+            if (p->inside_function_def) {
+                bsp_putc(p, '\n');
+            } else if (p->printing_comsub && c == '\n' && !was_newline) {
+                bsp_putc(p, '\n');
+            } else {
+                if (c == ';') bsp_putc(p, ' ');
+                if (n->b) p->skip_this_indent++;
+            }
+        }
+        bsp_cmd(p, n->b);
+        BSP_DEFERRED(p, "");
+        p->printing_connection--;
+        break;
+    }
+    case BN_FUNC:
+        bsp_function_def(p, n);
+        break;
+    case BN_GROUP:
+        p->group_command_nesting++;
+        bsp_puts(p, "{ ");
+        if (p->inside_function_def == 0) {
+            p->skip_this_indent++;
+        } else {
+            bsp_putc(p, '\n');
+            p->indentation += p->indentation_amount;
+        }
+        bsp_cmd(p, n->a);
+        BSP_DEFERRED(p, "");
+        if (p->inside_function_def) {
+            bsp_putc(p, '\n');
+            p->indentation -= p->indentation_amount;
+            bsp_indent(p, p->indentation);
+        } else {
+            bsp_semicolon(p);
+            bsp_putc(p, ' ');
+        }
+        bsp_putc(p, '}');
+        p->group_command_nesting--;
+        break;
+    case BN_SUBSHELL:
+        bsp_puts(p, "( ");
+        p->skip_this_indent++;
+        bsp_cmd(p, n->a);
+        BSP_DEFERRED(p, "");
+        bsp_puts(p, " )");
+        break;
+    case BN_COPROC:
+        bsp_puts(p, "coproc ");
+        bsp_puts(p, n->name ? n->name : "COPROC");
+        bsp_putc(p, ' ');
+        p->skip_this_indent++;
+        bsp_cmd(p, n->a);
+        break;
+    }
+    if (n->redirs) {
+        bsp_putc(p, ' ');
+        bsp_redir_list(p, n->redirs);
+    }
+}
+
+/* make_command_string */
+static void bsp_command_string(struct bsp *p, const struct bsn *n) {
+    p->out.len = 0;
+    if (p->out.p) p->out.p[0] = 0;
+    p->was_heredoc = 0;
+    p->ndeferred = 0;
+    bsp_cmd(p, n);
+}
+
+/* print_comsub: what a $( ) word holds and what its subshell runs */
+static void bsp_comsub_text(struct bsyn *st, struct bsn *cmd, struct bsyn_buf *out) {
+    struct bsp p;
+    bsp_init(&p, st);
+    p.printing_comsub = 1;
+    bsp_command_string(&p, cmd);
+    bsyn_putn(st, out, p.out.p ? p.out.p : "", p.out.len);
+    bsp_free(&p);
+}
+
+/* named_function_string: `declare -f' (MULTILINE) and an exported
+ * function's environment text (one line). F is the BN_FUNC node, or a
+ * body with NAME given separately. */
+static void bsp_named_function(struct bsp *p, const char *name, const struct bsn *body,
+                               bool multiline) {
+    int old_indent = p->indentation, old_amount = p->indentation_amount;
+    p->out.len = 0;
+    if (p->out.p) p->out.p[0] = 0;
+    p->was_heredoc = 0;
+    p->ndeferred = 0;
+    p->printing_comsub = 0;
+    if (name && *name) {
+        if (bsp_reserved(name)) bsp_puts(p, "function ");
+        bsp_puts(p, name);
+        bsp_putc(p, ' ');
+    }
+    bsp_puts(p, "() ");
+    if (!multiline) {
+        p->indentation = 1;
+        p->indentation_amount = 0;
+    } else {
+        bsp_putc(p, '\n');
+        p->indentation += p->indentation_amount;
+    }
+    p->inside_function_def++;
+    bsp_puts(p, multiline ? "{ \n" : "{ ");
+    const struct bsn_redir *fr = 0;
+    if (body && body->type == BN_GROUP) {
+        fr = body->redirs;
+        bsp_cmd(p, body->a);
+    } else {
+        bsp_cmd(p, body);
+    }
+    BSP_DEFERRED(p, "");
+    p->indentation = old_indent;
+    p->indentation_amount = old_amount;
+    p->inside_function_def--;
+    if (fr) {
+        bsp_newline(p, "} ");
+        bsp_redir_list(p, fr);
+    } else {
+        bsp_newline(p, "}");
+        p->was_heredoc = 0;
+    }
+    if (!multiline && p->out.len > 3 && p->out.p[2] == '\n') {
+        for (size_t i = 2; i + 1 <= p->out.len; i++) p->out.p[i] = p->out.p[i + 1];
+        p->out.len--;
+    }
+}
