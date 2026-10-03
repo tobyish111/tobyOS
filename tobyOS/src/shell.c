@@ -2178,11 +2178,15 @@ static bool shell_nameref_element(const char *target, struct shell_sb *name,
  * script, where nothing is recorded (logs/b12/p31). */
 /* ...and BASH_SUBSHELL: one more for each subshell -- ( ), a pipeline's
  * stage, $( ) -- the command is in; tsh had no such variable. */
+/* ...and BASH_COMMAND: the command being run, as bash prints it (see
+ * shell_bashcmd_set). tsh had none. */
 enum { DV_RANDOM, DV_SRANDOM, DV_SECONDS, DV_EPOCHSECONDS, DV_EPOCHREALTIME,
-       DV_BASHPID, DV_BASH_ARGV0, DV_HISTCMD, DV_BASH_SUBSHELL, DV_COUNT };
+       DV_BASHPID, DV_BASH_ARGV0, DV_HISTCMD, DV_BASH_SUBSHELL, DV_BASH_COMMAND,
+       DV_COUNT };
 static const char *const g_dynvar_names[DV_COUNT] = {
     "RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME",
-    "BASHPID", "BASH_ARGV0", "HISTCMD", "BASH_SUBSHELL" };
+    "BASHPID", "BASH_ARGV0", "HISTCMD", "BASH_SUBSHELL", "BASH_COMMAND" };
+static const char *shell_bashcmd_value(void);
 static bool     g_dynvar_gone[DV_COUNT];   /* unset: no longer special */
 static uint32_t g_rand_seed;               /* bash's rseed */
 static int      g_rand_last;               /* bash's last_random_value */
@@ -2290,6 +2294,8 @@ static const char *shell_dynvar_value(int dv) {
         ksnprintf(b, cap, "%d",
                   g_subshell_depth + g_comsub_level - g_simple_stage_adj);
         return b;
+    case DV_BASH_COMMAND:
+        return shell_bashcmd_value();
     case DV_HISTCMD:
         ksnprintf(b, cap, "%lu", g_opt_history && g_hist_count > 0
                                      ? (unsigned long)(g_hist_base + (unsigned long)g_hist_count)
@@ -14969,6 +14975,84 @@ static char *shell_function_printed_as(const struct shell_function *fn, bool mul
         return 0;
     }
     return shell_print_text(def.p, multiline ? SHPR_FUNC : SHPR_FUNC_LINE, shown_name);
+}
+
+/* $BASH_COMMAND. bash sets it to the printed form of each simple command
+ * before running it -- and to a `for`/`select`/`case` head, a [[ ]], a
+ * (( )), each of an arithmetic for's three expressions -- except while a
+ * trap runs, when it keeps the command the trap interrupted (bash's
+ * the_printed_command_except_trap; logs/b12 p70, p76). The text is kept as
+ * it comes; the printing waits until something reads the variable. */
+static struct shell_sb g_bashcmd_src;
+static struct shell_sb g_bashcmd_val;
+static int  g_bashcmd_mode;
+static bool g_bashcmd_have;              /* g_bashcmd_val is current */
+
+/* The command being run, traps or not -- what a "Killed" report names. */
+static struct shell_sb g_curcmd_src;
+
+/* A shell_sb at file scope starts zeroed, and a zero capacity never grows
+ * (sb_grow doubles it) -- these are made ready on first use. */
+static void shell_sb_ready(struct shell_sb *b) {
+    if (!b->cap) sb_init(b);
+}
+
+static void shell_bashcmd_set(const char *text, size_t len, int mode) {
+    if (!text) return;
+    shell_sb_ready(&g_curcmd_src);
+    shell_sb_ready(&g_bashcmd_src);
+    if (mode == SHPR_COMMAND) {
+        sb_truncate(&g_curcmd_src, 0);
+        (void)sb_putmem(&g_curcmd_src, text, len);
+    }
+    if (g_trap_running) return;
+    sb_truncate(&g_bashcmd_src, 0);
+    if (sb_putmem(&g_bashcmd_src, text, len) < 0) return;
+    g_bashcmd_mode = mode;
+    g_bashcmd_have = false;
+}
+
+/* One of an arithmetic for's expressions: bash shows "((EXPR))", the part
+ * with its leading blanks skipped and an empty one as 1 (make_arith_for_command). */
+static void shell_bashcmd_set_arith(const char *part) {
+    if (g_trap_running) return;
+    const char *e = part ? part : "";
+    while (*e == ' ' || *e == '\t') e++;
+    SH_SB(t);
+    if (sb_puts(&t, "((") < 0 || sb_puts(&t, *e ? e : "1") < 0 || sb_puts(&t, "))") < 0)
+        return;
+    shell_bashcmd_set(t.p, t.len, SHPR_COMMAND);
+}
+
+static const char *shell_bashcmd_value(void) {
+    shell_sb_ready(&g_bashcmd_src);
+    shell_sb_ready(&g_bashcmd_val);
+    if (!g_bashcmd_have) {
+        sb_truncate(&g_bashcmd_val, 0);
+        if (g_bashcmd_src.p) {
+            char *t = shell_print_text(g_bashcmd_src.p, g_bashcmd_mode, 0);
+            if (t) {
+                (void)sb_puts(&g_bashcmd_val, t);
+                kfree(t);
+            } else {
+                /* not bash's grammar: the text itself, tags out, trimmed */
+                char *c = shell_strdup(g_bashcmd_src.p);
+                if (c) {
+                    shell_hd_strip_tags(c);
+                    const char *a = c;
+                    while (*a == ' ' || *a == '\t' || *a == '\n') a++;
+                    size_t n = strlen(a);
+                    while (n && (a[n - 1] == ' ' || a[n - 1] == '\t' ||
+                                 a[n - 1] == '\n' || a[n - 1] == ';'))
+                        n--;
+                    (void)sb_putmem(&g_bashcmd_val, a, n);
+                    kfree(c);
+                }
+            }
+        }
+        g_bashcmd_have = true;
+    }
+    return g_bashcmd_val.p ? g_bashcmd_val.p : "";
 }
 
 /* What the NEXT reader reads, set by its caller for that one call and
@@ -34646,6 +34730,7 @@ static bool shell_try_dbracket_command(const char *src) {
             shell_compound_tail_redirs(src, end + 2, "[["))
             return true;
     }
+    shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
     shell_run_debug_trap();            /* `[[ ]]` is a command (1182) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -34791,6 +34876,7 @@ static bool shell_try_arith_command(const char *src) {
     if (*tail && *tail != ';' && *tail != '\n' &&
         shell_compound_tail_redirs(src, end + 2, "(("))
         return true;
+    shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
     shell_run_debug_trap();            /* `(( ))` is a command (1182) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -35173,6 +35259,7 @@ static bool shell_try_for_command(const char *src) {
         if (i > 0) shell_heredoc_mark_rewind(&hd_mark);
         /* bash fires DEBUG for the `for` head on EVERY iteration, with the
          * head's line, before the body's own commands fire (1190). */
+        shell_bashcmd_set(src, strlen(src), SHPR_FOR_HEAD);
         shell_run_debug_trap();
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (env_set(name, items->argv[i]) < 0) {
@@ -35392,6 +35479,7 @@ static bool shell_try_arith_for_command(const char *src) {
     unsigned long head_line = g_shell_lineno;
     struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
     shell_heredoc_mark_take(&hd_mark);
+    shell_bashcmd_set_arith(exprs[0]);
     shell_run_debug_trap();                     /* init (1191) */
     if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
     if (!shell_arith_for_eval(exprs[0], &v)) {
@@ -35401,6 +35489,7 @@ static bool shell_try_arith_for_command(const char *src) {
     for (long iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
         if (iter > 0) shell_heredoc_mark_rewind(&hd_mark);
         g_shell_lineno = head_line;
+        shell_bashcmd_set_arith(exprs[1]);
         shell_run_debug_trap();                 /* the condition */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[1], &v)) {
@@ -35437,6 +35526,7 @@ static bool shell_try_arith_for_command(const char *src) {
             }
         }
         g_shell_lineno = head_line;
+        shell_bashcmd_set_arith(exprs[2]);
         shell_run_debug_trap();                 /* the step */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[2], &v)) {
@@ -35964,6 +36054,7 @@ static bool shell_try_case_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!shell_starts_with_word(s, "case")) return false;
     s = shell_skip_blanks(s + 4);
+    shell_bashcmd_set(src, strlen(src), SHPR_CASE_HEAD);
     shell_run_debug_trap();            /* the case head fires once (1189) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -37741,6 +37832,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (!stage_simple[i]) continue;
         unsigned long ln = shell_lineno_at(src + stage_off[i]);
         if (ln) g_shell_lineno = ln;
+        shell_bashcmd_set(stages[i], strlen(stages[i]), SHPR_COMMAND);
         shell_run_debug_trap();
     }
     if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages, nst); return true; }
@@ -38520,6 +38612,7 @@ static void execute_line_text_inner(const char *src) {
         }
     }
 
+    shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
     if (shell_tokenize(src, &tok, &ntok, &words) < 0) {
         if (g_bad_subst_soft) {
             /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
