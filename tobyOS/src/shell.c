@@ -15065,6 +15065,13 @@ static void shell_bashcmd_set_arith(const char *part) {
     shell_bashcmd_set(t.p, t.len, SHPR_COMMAND);
 }
 
+/* The command being run, printed as bash names it in a job report
+ * ("LINE: PID Killed  bash -c 'kill -9 $$' arg \"$x\"", unexpanded); a heap
+ * string or 0. */
+static char *shell_curcmd_printed(void) {
+    return g_curcmd_src.p ? shell_print_text(g_curcmd_src.p, SHPR_COMMAND, 0) : 0;
+}
+
 static const char *shell_bashcmd_value(void) {
     shell_sb_ready(&g_bashcmd_src);
     shell_sb_ready(&g_bashcmd_val);
@@ -21826,9 +21833,12 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     {
         int sig = proc_last_term_sig();
         if (sig > 0) {
+            /* named as bash names it: the command as written, printed */
+            char *shown __attribute__((cleanup(shell_kfree_ptr))) =
+                shell_curcmd_printed();
             char *text __attribute__((cleanup(shell_kfree_ptr))) =
-                jobs_join_argv(argv);
-            shell_report_job_death(pid, sig, text ? text : argv[0], true);
+                shown ? 0 : jobs_join_argv(argv);
+            shell_report_job_death(pid, sig, shown ? shown : text ? text : argv[0], true);
         }
     }
     /* bash's wait_for ends with notify_and_cleanup: a background job that
@@ -32533,7 +32543,20 @@ static bool shell_bg_text_is_simple(const char *s, const char *end) {
     }
     return true;
 }
+static char *shell_print_text(const char *text, int mode, const char *fname);
+
+/* SHOWN: the command as written, for the job's name -- bash names a job by
+ * its PRINTED command (`sleep $t`, `( kill -9 $BASHPID )`, a for loop over
+ * four lines), where tsh used the label ("subshell", "group") or the
+ * command word alone (logs/b12 p74). */
+static int shell_background_forked_as(const char *text, const char *label,
+                                      const char *shown);
 static int shell_background_forked(const char *text, const char *label) {
+    return shell_background_forked_as(text, label, 0);
+}
+
+static int shell_background_forked_as(const char *text, const char *label,
+                                      const char *shown) {
     int pid = fork();
     if (pid < 0) {
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
@@ -32573,7 +32596,11 @@ static int shell_background_forked(const char *text, const char *label) {
     g_last_bg_pid = (int)pid;
     /* `set -m`: same rule as the spawn path -- the job is its own group. */
     if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
-    jobs_add((int)pid, label ? label : text);
+    {
+        char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
+        jobs_add((int)pid, pn ? pn : (label ? label : text));
+        kfree(pn);
+    }
     return 0;
 }
 #endif
@@ -37049,7 +37076,11 @@ static bool shell_try_subshell_command(const char *src) {
         const char *after = shell_skip_blanks(tail + 1);
         if (!*after || *after == ';') {
 #ifdef SHELL_HOSTED
-            shell_set_status(shell_background_forked(body, "subshell"));
+            SH_SB(shown);                      /* the job's name: "( BODY )" */
+            (void)sb_puts(&shown, "( ");
+            (void)sb_puts(&shown, body);
+            (void)sb_puts(&shown, "\n)");
+            shell_set_status(shell_background_forked_as(body, "subshell", shown.p));
 #else
             kprintf("subshell: can't be backgrounded in the kernel shell\n");
             shell_set_status(1);
@@ -37117,16 +37148,14 @@ static bool shell_try_subshell_command(const char *src) {
             if (rc < 0) rc = 1;
             int sig = proc_last_term_sig();
             if (sig > 0) {
+                /* "( kill -9 $BASHPID )": the subshell as bash prints it */
                 SH_SB(jt);
-                const char *bt = shell_skip_blanks(body);
-                size_t bl = strlen(bt);
-                while (bl > 0 && (bt[bl - 1] == ' ' || bt[bl - 1] == '\t' ||
-                                  bt[bl - 1] == '\n' || bt[bl - 1] == ';'))
-                    bl--;
                 (void)sb_puts(&jt, "( ");
-                (void)sb_putmem(&jt, bt, bl);
-                (void)sb_puts(&jt, " )");
-                shell_report_job_death(pid, sig, jt.p ? jt.p : "( )", true);
+                (void)sb_puts(&jt, body);
+                (void)sb_puts(&jt, "\n)");
+                char *pn = shell_print_text(jt.p, SHPR_COMMAND, 0);
+                shell_report_job_death(pid, sig, pn ? pn : "( )", true);
+                kfree(pn);
             }
             shell_set_status(rc);
             shell_set_pipestatus1(rc);
@@ -37295,7 +37324,11 @@ static bool shell_try_group_command(const char *src) {
         const char *after = shell_skip_blanks(tail + 1);
         if (!*after || *after == ';') {
 #ifdef SHELL_HOSTED
-            shell_set_status(shell_background_forked(body, "group"));
+            SH_SB(shown);                      /* the job's name: "{ BODY; }" */
+            (void)sb_puts(&shown, "{ ");
+            (void)sb_puts(&shown, body);
+            (void)sb_puts(&shown, "\n}");
+            shell_set_status(shell_background_forked_as(body, "group", shown.p));
 #else
             kprintf("group: can't be backgrounded in the kernel shell\n");
             shell_set_status(1);
