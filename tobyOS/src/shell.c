@@ -8484,6 +8484,14 @@ static void cmd_unset(int argc, char **argv) {
                 }
             } else if (sh_array_find(argv[i])) {
                 sh_array_unset(argv[i]);
+                /* ...and the declaration's own entry with it: `declare -A
+                 * q` left one carrying the array attribute, so after `unset
+                 * q` an `export q=e` made an ARRAY again (bash: declare -x
+                 * q="e"). A reference keeps its entry -- unset went through
+                 * it to the target. */
+                int hx = env_find(argv[i], strlen(argv[i]));
+                if (hx >= 0 && !(g_env_flags[hx] & SHVAR_NAMEREF))
+                    env_remove_at(hx);
                 continue;
             }
         }
@@ -9251,13 +9259,19 @@ static int shell_read_line_from_file(struct file *in, bool raw,
 /* One of read's names gets VAL. An element (`a[1]`, `A[$k]`) is a name to
  * bash too; anything else is bash's "not a valid identifier". 0 or 1. */
 static int shell_read_set(const char *name, const char *val) {
+    g_readonly_hit = false;
+    g_assign_fail_hit = false;
     int r = shell_set_named(name, val);
     if (r == -2) {
         kprintf("read: `%s': not a valid identifier\n", name);
         return 1;
     }
     if (r < 0) {
-        kprintf("read: failed to set '%s'\n", name);
+        /* a refusal that said why -- readonly, a bad subscript, a
+         * reference cycle -- is all bash prints */
+        if (!g_readonly_hit && !g_assign_fail_hit && !g_nameref_circular &&
+            g_shell_flow == SHELL_FLOW_NONE)
+            kprintf("read: failed to set '%s'\n", name);
         return 1;
     }
     return 0;
