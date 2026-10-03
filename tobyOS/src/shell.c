@@ -15015,6 +15015,21 @@ static void shell_trap_text(const char *action) {
  * numbering of the command it is in, as bash's does. */
 static bool g_reader_syn_base_set;
 static unsigned long g_reader_syn_base;
+/* A COMMAND SUBSTITUTION'S LINES COUNT FROM THE COMMAND'S. bash runs the
+ * text with parse_and_execute, which does not reset line_number: the first
+ * line of the body is the line of the command the substitution is in --
+ * the simple command's, the one $LINENO says there -- and each later line
+ * one more. And the text it runs is the PARSED command printed back
+ * (print_comsub), so a leading newline, a blank line and a comment line
+ * are not there to count:
+ *
+ *     echo g $(            bash: g 16 (the command's line), tsh said 2
+ *     echo $LINENO)
+ *
+ * Every substitution in a command starts again from that line (logs/b12
+ * p23, p69). A compound inside the body is printed in bash's own layout,
+ * which this does not reproduce -- lists of simple commands are exact. */
+static bool g_reader_comsub_lines;
 
 static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (!text) return 1;
@@ -15023,10 +15038,12 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     bool syn_repl = g_reader_syn_repl;
     bool syn_base_set = g_reader_syn_base_set;
     unsigned long syn_base = g_reader_syn_base;
+    bool comsub_lines = g_reader_comsub_lines;
     g_reader_syn_iname = 0;
     g_reader_syn_string = false;
     g_reader_syn_repl = false;
     g_reader_syn_base_set = false;
+    g_reader_comsub_lines = false;
     /* EVAL MODE. A multi-line eval string is shell input, so it goes through
      * this reader -- the only code that knows here-documents, compounds that
      * span lines, and continuation -- with four differences from a script:
@@ -15066,7 +15083,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     unsigned long saved_lineno = g_shell_lineno;
     int saved_noexec = g_noexec_error;
     g_noexec_error = 0;
-    g_shell_lineno = (eval_mode && saved_lineno > 0) ? saved_lineno - 1 : 0;
+    g_shell_lineno = ((eval_mode || comsub_lines) && saved_lineno > 0)
+                         ? saved_lineno - 1 : 0;
     int last = 0;
     char *p = text;
     bool first_line = true;
@@ -15128,7 +15146,10 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         /* bash records a comment line; a blank one it does not. */
         if (*line == '#' && hist_reader)
             shell_history_add_raw(hist_raw, hist_raw_base, line_start, p, false);
-        if (*line == '\0' || *line == '#') continue;
+        if (*line == '\0' || *line == '#') {
+            if (comsub_lines) g_shell_lineno--;      /* not in bash's text */
+            continue;
+        }
 
         /* If this line opens a compound, pull following lines until it closes
          * and hand the parser the single line it expects. See the comment
@@ -21829,6 +21850,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
                 g_reader_syn_string = true;
                 g_reader_syn_base_set = true;
                 g_reader_syn_base = g_shell_lineno ? g_shell_lineno - 1 : 0;
+                g_reader_comsub_lines = true;
                 (void)shell_run_script_text(copy, false);
                 kfree(copy);
             } else {
