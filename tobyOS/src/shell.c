@@ -3315,10 +3315,17 @@ static int sh_try_array_assignment(const char *kv) {
     SH_SB(subb);
     if (sh_split_subscript(kv, keylen, &nameb, &subb)) {
         const char *name = nameb.p, *sub = subb.p;
+        /* The KEY is expanded here, always: an assignment word brings it
+         * as written (the tokenizer copies it raw), and declare, printf
+         * -v, read and the like bring a word they expanded once already
+         * and bash expands again (`declare D[$k]=1` with k='$y' keys Y;
+         * logs/b12/p33). An indexed subscript is expanded where it is
+         * evaluated (sh_subscript_assign_index). */
         SH_SB(subx);
-        if (expand_sub && sh_array_is_assoc(name)) {
+        if (sh_array_is_assoc(name)) {
             const char *k = sh_ar_assoc_key(sub, &subx);
-            if (k) sub = k;
+            if (!k) return -1;
+            sub = k;
         }
         if (!shell_name_is_valid(name, strlen(name))) return 0;
         if (!expand_sub && shell_nameref_elem_write(name, true) < 0) return -1;
@@ -12963,6 +12970,7 @@ static void shell_strip_comment(char *s) { shell_strip_comment_from(s, false); }
 
 static void shell_strip_comment_from(char *s, bool mid_word) {
     bool in_sq = false, in_dq = false, sq_ansi = false;
+    bool assign_pos = !mid_word;     /* still in a command's assignments */
     /* WHERE A `#` IS AN OPERATOR, NOT A COMMENT: inside arithmetic -- $(( )),
      * (( )), and parentheses nested in them -- and inside ${ }, the text
      * goes to the evaluator or the expansion whole, and bash's lexer never
@@ -13011,6 +13019,36 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
         }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
+        /* AN ASSIGNMENT'S SUBSCRIPT IS PART OF ITS WORD, `#` and all: bash
+         * reads `a[5 # 1]=` as one word -- an arithmetic error -- where tsh
+         * cut the line at the `#` and ran a file named `a[5` (Oils 0171).
+         * Only while words are still assignments: `echo a[5 # 1]=` has a
+         * comment in it. */
+        if (*p == ';' || *p == '&' || *p == '|' || *p == '\n') {
+            assign_pos = true;
+        } else if (!is_space(*p) &&
+                   ((p == s && !mid_word) ||
+                    (p > s && (is_space(p[-1]) || p[-1] == ';' ||
+                               p[-1] == '&' || p[-1] == '|')))) {
+            size_t n = 0;
+            while ((p[n] >= 'A' && p[n] <= 'Z') || (p[n] >= 'a' && p[n] <= 'z') ||
+                   p[n] == '_' || (n > 0 && p[n] >= '0' && p[n] <= '9'))
+                n++;
+            bool shaped = false;
+            if (assign_pos && n > 0) {
+                if (p[n] == '[') {
+                    size_t k = sa_skip_subscript(p + n);
+                    const char *e = p + n + k;
+                    if (*e == ']' && (e[1] == '=' || (e[1] == '+' && e[2] == '='))) {
+                        p = (char *)e;          /* past it; the loop steps on */
+                        continue;
+                    }
+                } else if (p[n] == '=' || (p[n] == '+' && p[n + 1] == '=')) {
+                    shaped = true;
+                }
+            }
+            if (!shaped && *p != '#') assign_pos = false;
+        }
         if (*p == '#' && ((p == s && !mid_word) ||
                           (p > s && (is_space(p[-1]) || p[-1] == ';' ||
                           p[-1] == '&' || p[-1] == '|' || p[-1] == '(')))) {
@@ -26949,16 +26987,10 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         /* Look at the RAW text: a leading `name=` makes this an assignment
          * word. After expansion the same shape can arrive from a variable's
          * value, and that is NOT an assignment -- see g_tok_word_assign_src. */
-        g_tok_word_assign_src = false;
-        {
-            const char *a = p;
-            if ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') || *a == '_') {
-                a++;
-                while ((*a >= 'A' && *a <= 'Z') || (*a >= 'a' && *a <= 'z') ||
-                       (*a >= '0' && *a <= '9') || *a == '_') a++;
-                if (*a == '=') g_tok_word_assign_src = true;
-            }
-        }
+        /* ...and `NAME+=` and `NAME[SUB]=` are assignments too: only
+         * `NAME=` counted, so `a[0 + 1]= b[2 + 0]=x` ended the prefix at
+         * its first word and ran `b[2` as a command (Oils 0169). */
+        g_tok_word_assign_src = shell_assign_prefix_len(p) > 0;
         g_tok_word_assign_ctx = g_tok_word_assign_src && (prefix_ok || decl_util_cmd);
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
@@ -27050,6 +27082,35 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 for (; *q && *q != '\n'; q++) {
                     if (*q == '[') bd++;
                     else if (*q == ']') { bd--; if (bd == 0) break; }
+                }
+                /* AN ASSIGNMENT'S SUBSCRIPT IS TAKEN AS WRITTEN and
+                 * expanded when the element is assigned, AFTER the value
+                 * (bash's assign_array_element):
+                 *
+                 *     i=0; a[$i]=$((i+=5))        bash: a[5]=5
+                 *     a['2']=3                    an arithmetic error
+                 *     declare -A D; D[$k]=1       k='$y': key $y, once
+                 *
+                 * tsh expanded it here, before the value, with its quotes
+                 * removed (Oils 0173). The raw text is wrapped like a
+                 * quoted span, so nothing after this reads it as syntax;
+                 * sh_try_array_assignment expands it (sh_ar_assoc_key,
+                 * sh_subscript_assign_index). A word with no `=` after
+                 * its `]` is no assignment and expands as before. */
+                if (nmok && nmlen > 0 && shell_name_is_valid(nmbuf, nmlen)) {
+                    size_t rk = sa_skip_subscript(p);
+                    if (p[rk] == ']' && (p[rk + 1] == '=' ||
+                                         (p[rk + 1] == '+' && p[rk + 2] == '='))) {
+                        SH_LIT_CLOSE();
+                        if (sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0) return -1;
+                        size_t raw_start = wb.len;
+                        if (sb_putmem(&wb, p, rk + 1) < 0) return -1;
+                        if (shell_escape_glob_range(&wb, raw_start) < 0)
+                            return -1;
+                        if (sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0) return -1;
+                        p += rk + 1;
+                        continue;
+                    }
                 }
                 if (nmok && nmlen > 0 && shell_name_is_valid(nmbuf, nmlen) &&
                     bd == 0 && *q == ']') {
@@ -28840,6 +28901,49 @@ static int sh_array_glob_field(const char *name, const char *field,
 
 static bool g_arg_from_expansion;
 
+/* Where the `=` of an assignment-shaped word is -- NAME=, NAME+=,
+ * NAME[SUB]= -- reading across the in-band marks the tokenizer left
+ * (no-split runs; the escapes on a raw subscript's brackets), or
+ * (size_t)-1. A QUOTED `=` (the tokenizer escapes it) makes no assignment.
+ * Only NAME= was recognised, by env_key_len over plain text, so the value
+ * of `b[2 + 0]=~/src` and `x+=~/y` kept its tilde (Oils 0169). */
+static size_t shell_word_assign_eq(const char *w) {
+    size_t i = 0, n = 0;
+    while (w[i] == SHELL_NOSPLIT_MARK) i++;
+    for (;;) {
+        char c = w[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' ||
+            (n > 0 && c >= '0' && c <= '9')) {
+            i++;
+            n++;
+        } else if (c == SHELL_NOSPLIT_MARK && n > 0) {
+            i++;
+        } else {
+            break;
+        }
+    }
+    if (n == 0) return (size_t)-1;
+    if (w[i] == SHELL_GLOB_ESC && w[i + 1] == '[') i++;
+    if (w[i] == '[') {
+        int d = 0;
+        for (; w[i]; i++) {
+            if ((w[i] == SHELL_DATA_ESC || w[i] == SHELL_GLOB_ESC) && w[i + 1] &&
+                w[i + 1] != '[' && w[i + 1] != ']') {
+                i++;
+                continue;
+            }
+            if (w[i] == '[') d++;
+            else if (w[i] == ']' && --d == 0) break;
+        }
+        if (w[i] != ']') return (size_t)-1;
+        i++;
+        while (w[i] == SHELL_NOSPLIT_MARK) i++;
+    }
+    if (w[i] == '+') i++;
+    while (w[i] == SHELL_NOSPLIT_MARK) i++;
+    return w[i] == '=' ? i : (size_t)-1;
+}
+
 static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                              const char *word, bool quoted) {
     if (shell_simple_argv_room(cur) < 0) return -1;
@@ -28857,14 +28961,8 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
      * only point where the distinction still exists. */
     SH_SB(tw);
     if (shell_has_nosplit(word)) {
-        char shape0[80];
-        size_t so0 = 0;
-        for (const char *q = word; *q && so0 + 1 < sizeof shape0; q++)
-            if (*q != SHELL_NOSPLIT_MARK && *q != SHELL_GLOB_ESC)
-                shape0[so0++] = *q;
-        shape0[so0] = '\0';
-        size_t k0 = env_key_len(shape0);
-        if (shape0[k0] == '=' && shell_name_is_valid(shape0, k0)) {
+        size_t eq0 = shell_word_assign_eq(word);
+        if (eq0 != (size_t)-1) {
             const char *hm = env_get("HOME");
             if (!hm || !*hm) hm = "/";
             bool prot = false, seg_start = false, seen_eq = false;
@@ -28884,7 +28982,7 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                     continue;
                 }
                 if (sb_putc(&tw, *q) < 0) return -1;
-                if (!seen_eq && *q == '=') { seen_eq = true; seg_start = true; }
+                if (!seen_eq && q == word + eq0) { seen_eq = true; seg_start = true; }
                 else seg_start = (*q == ':') && seen_eq;
             }
             if (changed) {
@@ -28912,8 +29010,9 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
      *
      * The whole word `foo=*` was handed to the globber, which matched the two
      * files and assigned the last one. */
-    size_t akey = env_key_len(word);
-    bool assign_word = (word[akey] == '=' && shell_name_is_valid(word, akey));
+    size_t aeq = shell_word_assign_eq(word);
+    bool assign_word = aeq != (size_t)-1;
+    size_t akey = assign_word ? aeq : env_key_len(word);
 
     /* PATHNAME EXPANSION IS NOT GATED ON `quoted` ANY MORE. A word with a
      * quoted part is still globbed -- with that part LITERAL, which is what
@@ -29018,6 +29117,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
                     if (sb_putc(&asg, *q++) < 0) return -1;
             }
             if (changed) {
+                /* an assignment is never globbed, so its escapes -- a raw
+                 * subscript's brackets carry them -- come off here, as
+                 * they do below for every other word */
+                shell_strip_glob_escapes(asg.p);
                 char *saved = 0;
                 if (shell_pipeline_save_word(pl, asg.p, &saved) < 0) return -1;
                 cur->argv[cur->argc++] = saved;
@@ -29325,10 +29428,7 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * shape is read from all of it: the first 80 bytes, and a NAME= only,
      * were what tsh looked at. */
     {
-        SH_SB(sh0);
-        for (const char *q = word; *q; q++)
-            if (*q != SHELL_NOSPLIT_MARK && sb_putc(&sh0, *q) < 0) return -1;
-        bool assign0 = shell_assign_prefix_len(sh0.p) > 0;
+        bool assign0 = shell_word_assign_eq(word) != (size_t)-1;
         bool nosplit_ctx = assign0 && shell_assign_ctx(cur, assign_src);
         if (nosplit_ctx && shell_word_has_argmark(word)) {
             SH_SB(joined);
