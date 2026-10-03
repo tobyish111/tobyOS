@@ -10950,6 +10950,14 @@ static int shell_wait_job(struct job *j) {
             return 127;
         }
         shell_job_died(j, rc, proc_last_term_sig());
+        /* bash's waitchld reaps every child that has ended, not only the
+         * one it waited for -- so the others are known finished before
+         * this job leaves the table and the current job is chosen again
+         * (logs/b12 p88: `sleep .6 & sleep .1 & wait; jobs` is "[2]   Done",
+         * no `+`) */
+        for (int i = 0; i < JOB_MAX; i++)
+            if (g_jobs[i] != j && g_jobs[i]->id && !g_jobs[i]->dead)
+                (void)shell_job_poll(g_jobs[i]);
     }
     int rc = j->code;
     if (g_opt_monitor && g_interactive) j->waited = true;
@@ -11110,6 +11118,16 @@ static void cmd_wait(int argc, char **argv) {
         shell_jobs_drop_killed();
         int rc = 0;
         for (;;) {
+            /* WHAT FINISHED MEANWHILE IS NOT WAITED FOR. bash reaps every
+             * child that ends while it waits for one (waitchld), and only
+             * the job it waited for itself is marked done with (wait_for_job);
+             * the others -- $! among them -- are left for the cleanup below.
+             * tsh waited for each in turn, so `sleep 1 & ... ( sleep 1 ) &
+             * wait; jobs` listed nothing where bash lists $!'s job as Done
+             * (fixture 246, logs/b12 lt/w2.sh in WSL bash). */
+            for (int i = 0; i < JOB_MAX; i++)
+                if (g_jobs[i]->id != 0 && !g_jobs[i]->dead)
+                    (void)shell_job_poll(g_jobs[i]);
             struct job *j = 0;
             for (int i = 0; i < JOB_MAX; i++) {
                 if (g_jobs[i]->id != 0 && !g_jobs[i]->dead) {
