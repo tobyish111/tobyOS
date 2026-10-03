@@ -266,12 +266,17 @@ static bool hf_seekable(const struct file *f, int fd) {
 
 long file_read(struct file *f, void *buf, size_t n) {
     if (!f) return -1;
-    if (f->kind == FILE_KIND_NULL) return 0;          /* `<&-` reads as EOF */
+    /* `<&-` CLOSED it: a read fails, as bash's does -- `read` says "read
+     * error: 0: Bad file descriptor" and `mapfile` stores nothing (logs/b12
+     * p42, p73). It read as an empty input. */
+    if (f->kind == FILE_KIND_NULL) return -EBADF;
     if (f->kind != FILE_KIND_VFS) return -1;
     int fd = VF_FD(&f->vfs);
     long got = read(fd, buf, n);
     if (got > 0) f->vfs.pos += (size_t)got;
-    return got;
+    /* the errno, negated, for `read`'s "read error: FD: REASON" -- a
+     * directory is EISDIR */
+    return got < 0 ? -(long)errno : got;
 }
 
 /* ALL OF IT, OR AN ERROR. write(2) may stop short: a signal that arrives
@@ -447,6 +452,29 @@ int vfs_open(const char *path, struct vfs_file *out) {
  *
  * The kernel honours it on every write since vfs_file.append. Write-only,
  * as bash opens it: reading a `>>` descriptor is an error there. */
+/* `cmd < DIR` OPENS, as bash's does: a directory is opened for reading
+ * (O_DIRECTORY -- the kernel refuses a native open of one otherwise) and
+ * it is the READ that fails, with EISDIR. bash's readers each take that
+ * their own way -- `read` reports "read error: 0: Is a directory", `mapfile`
+ * stores nothing and succeeds, `cat` says "-: Is a directory" (Oils 1122;
+ * logs/b12 p59). tsh refused at the open: "DIR: Is a directory", status 1,
+ * command not run. Only the input redirection asks for this; `source DIR`
+ * and every other vfs_open keep the refusal. */
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0x10000
+#endif
+int vfs_open_input(const char *path, struct vfs_file *out) {
+    int rc = vfs_open(path, out);
+    if (rc != VFS_ERR_ISDIR) return rc;
+    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    if (fd < 0) return errno_to_vfs();
+    memset(out, 0, sizeof *out);
+    VF_SET(out, fd);
+    out->size = 0;
+    out->mode = 0644;
+    return VFS_OK;
+}
+
 int vfs_open_append(const char *path, struct vfs_file *out) {
     if (!path || !out) return VFS_ERR_INVAL;
     int fd = open(path, O_WRONLY | O_APPEND);

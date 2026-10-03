@@ -1312,6 +1312,9 @@ static int shell_append_array_slice(struct shell_sb *b,
                                    long off, long cnt);
 struct file;
 static bool g_rl_nul_cuts;       /* see shell_read_line_from_file */
+/* The failed read's return, for `read`'s "read error: FD: REASON". */
+static long g_rl_err;
+static const char *shell_io_errtext(const struct file *f, long rv);
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *out,
                                      bool *got_any, char delim,
@@ -1360,6 +1363,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label);
 #ifdef SHELL_HOSTED
 int vfs_open_append(const char *path, struct vfs_file *out);   /* host.c */
+int vfs_open_input(const char *path, struct vfs_file *out);    /* host.c */
 #endif
 static void shell_putc_raw(char c);
 static int shell_case_unquote(struct shell_sb *pb);
@@ -9324,7 +9328,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
         if (maxchars >= 0 && (long)out->len >= maxchars) { escaped = false; break; }
         char c = 0;
         long n = file_read(in, &c, 1);
-        if (n < 0) return -1;
+        if (n < 0) { g_rl_err = n; return -1; }
         if (n == 0) { hit_eof = true; break; }
         *got_any = true;
         if (c == '\0' && delim != '\0') {
@@ -9715,8 +9719,11 @@ static void cmd_read(int argc, char **argv) {
                                        raw ? 0 : &escsb, maxchars, exact);
     if (tmp_console) file_close(tmp_console);
     if (rr < 0) {
-        kprintf(rr == -2 ? "read: out of memory\n"
-                         : "read: input error\n");
+        /* bash: "read: read error: 0: Is a directory" -- the descriptor
+         * and why (logs/b12 p59: `read x < dir`, `read -u 3`) */
+        if (rr == -2) kprintf("read: out of memory\n");
+        else kprintf("read: read error: %d: %s\n", use_fd < 0 ? 0 : use_fd,
+                     shell_io_errtext(in, g_rl_err));
         shell_set_status(1);
         return;
     }
@@ -30751,6 +30758,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
      * vfs_open_append) -- the shell and its children write through it,
      * and an offset kept here cannot follow the children's writes. */
     int rc = (write && append) ? vfs_open_append(path, &f->vfs)
+           : !write            ? vfs_open_input(path, &f->vfs)
                                : vfs_open(path, &f->vfs);
 #else
     int rc = vfs_open(path, &f->vfs);
@@ -31326,12 +31334,26 @@ static bool g_shell_out_failed;
 /* ...and why, for bash's "NAME: write error: REASON" */
 static const char *g_shell_out_why;
 
+/* Why a read or write on `f` failed, in strerror's words. The hosted
+ * shell's file_read/file_write return the errno negated; the kernel shell's
+ * return the Linux ABI value for these kinds. */
+static const char *shell_io_errtext(const struct file *f, long rv) {
+    if (f && f->kind == FILE_KIND_NULL) return "Bad file descriptor";
+    switch (-rv) {
+    case 4:  return "Interrupted system call";
+    case 9:  return "Bad file descriptor";
+    case 11: return "Resource temporarily unavailable";
+    case 13: return "Permission denied";
+    case 21: return "Is a directory";
+    case 22: return "Invalid argument";
+    case 28: return "No space left on device";
+    case 32: return "Broken pipe";
+    default: return "Input/output error";
+    }
+}
+
 static void shell_out_fail(const struct file *f, long rv) {
-    if (!g_shell_out_failed)
-        g_shell_out_why = (f && f->kind == FILE_KIND_NULL) ? "Bad file descriptor"
-                        : rv == -28 ? "No space left on device"
-                        : rv == -32 ? "Broken pipe"
-                        : "Input/output error";
+    if (!g_shell_out_failed) g_shell_out_why = shell_io_errtext(f, rv);
     g_shell_out_failed = true;
 }
 
