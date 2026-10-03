@@ -4013,6 +4013,7 @@ static void shell_init_bash_vars(const char *self) {
     (void)env_set("BASH_VERSION", "5.2.15(1)-release");
     shell_set_if_not("HOSTTYPE", "x86_64");
     shell_set_if_not("MACHTYPE", "x86_64-pc-tobyos");
+    shell_set_if_not("TERM", "dumb");        /* bash's, not exported */
     if (!sh_array_find("BASH_VERSINFO")) {
         static const char *const vi[] = { "5", "2", "15", "1", "release", 0 };
         for (int i = 0; vi[i]; i++) (void)sh_array_set("BASH_VERSINFO", i, vi[i]);
@@ -4085,6 +4086,11 @@ static void env_init_defaults(void) {
     if (env_set("PWD",   "/")       < 0) kprintf("env: default PWD set failed\n");
     if (env_set("SHELL", "tobysh")  < 0) kprintf("env: default SHELL set failed\n");
     if (env_set("OPTIND", "1")      < 0) kprintf("env: default OPTIND set failed\n");
+    {
+        /* `declare -i OPTIND="1"`, as bash's is (logs/b12 p85) */
+        int ox = env_find("OPTIND", 6);
+        if (ox >= 0) g_env_flags[ox] |= SHVAR_INTEGER;
+    }
     /* POSIX 2.5.3: IFS shall be SET by default to <space><tab><newline>.
      *
      * Every splitting site here already falls back to those three when IFS is
@@ -40611,6 +40617,10 @@ void shell_init_hosted(const char *argv0) {
 #ifdef SHELL_HOSTED
     shell_import_env_functions();
 #endif
+    /* $_ starts as the environment's `_`, else the name the shell was run
+     * by (bash's set_if_not ("_", dollar_vars[0])); it was unset until the
+     * first command (logs/b12 p85) */
+    if (env_find("_", 1) < 0) (void)env_set("_", argv0 ? argv0 : "tsh");
 }
 
 /* Run a script file to completion; returns its exit status.
