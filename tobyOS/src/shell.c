@@ -22515,12 +22515,18 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
         }
         if (dq_syntax && *p == '"') {            /* expands, quotes removed */
             p++;
+            /* QUOTES INSIDE QUOTES PROTECT NOTHING MORE: in "${1+"$@"}" the
+             * inner pair sits in a word the outer pair already protects,
+             * and its marks -- a TOGGLE -- switched that protection OFF, so
+             * "x y" split into two (bash: one; logs/b12/p35 p36). Marked
+             * only when this is the outermost quoting. */
+            bool dq_mark = g_dq_depth == 0;
             g_dq_depth++;
             const char *su = g_bsub_unit;
             int sk = g_bsub_unit_kind;
             g_bsub_unit = p;
             g_bsub_unit_kind = SH_BSUB_DQ;
-            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (dq_mark && sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             while (*p && *p != '"') {
                 if (*p == '$') {
                     if (shell_expand_var(&p, out) < 0) return -1;
@@ -22538,7 +22544,7 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
             g_dq_depth--;
             g_bsub_unit = su;
             g_bsub_unit_kind = sk;
-            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (dq_mark && sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '"') p++;
             continue;
         }
@@ -24270,6 +24276,12 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         shell_bad_subst(false);
                         return -1;
                     }
+                    /* A SET SCALAR READ WITH [@] OR [*] IS ITSELF: bash's
+                     * get_var_and_type calls it a plain variable, so every
+                     * operator works on the value -- ${s[@]:1} is a
+                     * substring, not a slice -- while ${#s[@]} is 1 and
+                     * ${!s[@]} is 0 (logs/b12/p34). tsh found no array and
+                     * expanded nothing (Oils 0332 0338). */
                     /* A REFERENCE TO AN ELEMENT HAS NO ELEMENTS OF ITS OWN:
                      * `typeset -n r='a[0]'` (or 'a[@]') then ${r[0]} is
                      * "", "${r[@]}" no word, ${#r[@]} 0 (logs/b12/p29) --
@@ -24281,6 +24293,19 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             if (slen == 1 && sub[0] == '@')
                                 return sh_put_lead_mark(b);
                             return 0;
+                        }
+                    }
+                    if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
+                        !sh_array_find(nm)) {
+                        int sx = env_find(nm, strlen(nm));
+                        if (sx >= 0 && !(g_env_flags[sx] & SHVAR_NOVALUE) &&
+                            env_get(nm)) {
+                            if (count) return sb_put_uint(b, 1);
+                            if (indices) return sb_put_data_str(b, "0");
+                            SH_SB(se);
+                            if (sb_puts(&se, nm) < 0 || sb_puts(&se, suffix) < 0)
+                                return -1;
+                            return shell_expand_braced_parameter(se.p, b);
                         }
                     }
                     /* ${a[@]-word} ${a[*]:+word} ... test the whole array
@@ -25024,8 +25049,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
     bool missing = !is_set || (colon && is_null);
     SH_SB(ewb);                     /* the expanded WORD */
 
-/* The WORD of `${x-WORD}` is ONE value, so a `"$@"` inside it joins with a
- * space rather than making fields:
+/* The WORD of `${x=WORD}` is ONE value, so a `"$@"` inside it joins with a
+ * space rather than making fields (in `-` and `+` they stay fields:
+ * "${1+"$@"}" is the classic way to say "$@"):
  *
  *     set -- '1 2' '3 4'
  *     argv.py "X${unset=x"$@"x}X"      bash: ['Xx1 2 3 4xX']
@@ -25064,8 +25090,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (!missing)
             return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
+        /* the word's own fields stay fields: "${1+"$@"}" is "$@" -- only
+         * `=` joins them, its word being a value (logs/b12/p36) */
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
-        SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         return sb_puts(b, ewb.p);
     case '=':
@@ -25109,7 +25136,6 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
     case '+':
         if (missing) return 0;
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
-        SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         return sb_puts(b, ewb.p);
     default:
