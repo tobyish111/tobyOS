@@ -885,6 +885,12 @@ static int g_shell_flow_status;
 static int g_shell_loop_depth;
 static int g_script_depth;
 static int g_subshell_depth;
+static int g_comsub_level;      /* command substitutions running, nested */
+/* One while a pipeline's stage that is a SIMPLE command runs in its child:
+ * bash expands such a command's words before it forks, so $BASH_SUBSHELL
+ * there is the parent's (`echo $BASH_SUBSHELL | cat` is 0), where a { }
+ * stage is expanded inside its subshell (1). */
+static int g_simple_stage_adj;
 
 static bool g_opt_errexit;   /* set -e */
 
@@ -2097,11 +2103,16 @@ static bool shell_nameref_element(const char *target, struct shell_sb *name,
  * unset, and is an ordinary variable from then on even if set again, as in
  * bash. Assigning: RANDOM seeds its sequence, SECONDS counts on from the
  * value given, BASH_ARGV0 sets $0; the other four ignore it. */
+/* HISTCMD too (bash's get_histcmd): the history number of the command
+ * running -- history_number() less one while executing -- so 0 in a
+ * script, where nothing is recorded (logs/b12/p31). */
+/* ...and BASH_SUBSHELL: one more for each subshell -- ( ), a pipeline's
+ * stage, $( ) -- the command is in; tsh had no such variable. */
 enum { DV_RANDOM, DV_SRANDOM, DV_SECONDS, DV_EPOCHSECONDS, DV_EPOCHREALTIME,
-       DV_BASHPID, DV_BASH_ARGV0, DV_COUNT };
+       DV_BASHPID, DV_BASH_ARGV0, DV_HISTCMD, DV_BASH_SUBSHELL, DV_COUNT };
 static const char *const g_dynvar_names[DV_COUNT] = {
     "RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME",
-    "BASHPID", "BASH_ARGV0" };
+    "BASHPID", "BASH_ARGV0", "HISTCMD", "BASH_SUBSHELL" };
 static bool     g_dynvar_gone[DV_COUNT];   /* unset: no longer special */
 static uint32_t g_rand_seed;               /* bash's rseed */
 static int      g_rand_last;               /* bash's last_random_value */
@@ -2128,7 +2139,8 @@ static uint32_t shell_random_u32(void) {
 #endif
 
 static int shell_dynvar_index(const char *key, size_t klen) {
-    if (key[0] != 'R' && key[0] != 'S' && key[0] != 'E' && key[0] != 'B')
+    if (key[0] != 'R' && key[0] != 'S' && key[0] != 'E' && key[0] != 'B' &&
+        key[0] != 'H')
         return -1;
     for (int i = 0; i < DV_COUNT; i++)
         if (strlen(g_dynvar_names[i]) == klen &&
@@ -2204,6 +2216,15 @@ static const char *shell_dynvar_value(int dv) {
         return b;
     case DV_BASH_ARGV0:
         return g_param0 ? g_param0 : "tobysh";
+    case DV_BASH_SUBSHELL:
+        ksnprintf(b, cap, "%d",
+                  g_subshell_depth + g_comsub_level - g_simple_stage_adj);
+        return b;
+    case DV_HISTCMD:
+        ksnprintf(b, cap, "%lu", g_opt_history && g_hist_count > 0
+                                     ? (unsigned long)(g_hist_base + (unsigned long)g_hist_count)
+                                     : 0ul);
+        return b;
     }
     return 0;
 }
@@ -3823,10 +3844,97 @@ static void shell_init_identity_vars(void) {
     (void)env_set("EUID", nb);
     (void)shell_readonly_mark("UID", 3);
     (void)shell_readonly_mark("EUID", 4);
+    /* integers, as bash's are: `declare -ir UID="0"` */
+    {
+        int ui = env_find("UID", 3), ei = env_find("EUID", 4);
+        if (ui >= 0) g_env_flags[ui] |= SHVAR_INTEGER;
+        if (ei >= 0) g_env_flags[ei] |= SHVAR_INTEGER;
+    }
     char hb[256];
     const char *h = shell_prompt_host(hb, sizeof hb);
     (void)env_set("HOSTNAME", h);
     (void)env_set("OSTYPE", "tobyos");
+}
+
+/* THE VARIABLES bash SETS AT STARTUP (variables.c's initialize_shell_
+ * variables, set_machine_vars, adjust_shell_level), as the guest's bash
+ * 5.2.15 has them (logs/b12/p31):
+ *
+ *     BASH_VERSION="5.2.15(1)-release"   BASH_VERSINFO=(5 2 15 1 release
+ *     MACHTYPE)  readonly   BASH  OPTERR=1  PS4='+ '  SHLVL (exported, one
+ *     more than inherited)  COMP_WORDBREAKS  BASH_LOADABLES_PATH  HOSTTYPE
+ *     MACHTYPE  BASH_ARGC=(0)  BASH_ARGV=()  BASH_CMDS=()  BASH_ALIASES=()
+ *     GROUPS  DIRSTACK
+ *
+ * tsh had none of them, so a script that tests $BASH_VERSION before using
+ * bash's features -- the usual way to ask "am I in bash?" -- took its
+ * POSIX path or refused to run (Oils 1871). tsh claims the bash it
+ * implements: 5.2.15. MACHTYPE and OSTYPE name this system rather than the
+ * Linux the guest's bash was built for. The ones bash only sets when the
+ * environment did not (PS4, COMP_WORDBREAKS, BASH_LOADABLES_PATH, OPTERR,
+ * HOSTTYPE, MACHTYPE) keep an inherited value. */
+static void shell_set_if_not(const char *name, const char *val) {
+    if (!env_get(name)) (void)env_set(name, val);
+}
+
+static void shell_init_bash_vars(const char *self) {
+    (void)env_set("BASH", self ? self : "/bin/tsh");
+    (void)env_set("BASH_VERSION", "5.2.15(1)-release");
+    shell_set_if_not("HOSTTYPE", "x86_64");
+    shell_set_if_not("MACHTYPE", "x86_64-pc-tobyos");
+    if (!sh_array_find("BASH_VERSINFO")) {
+        static const char *const vi[] = { "5", "2", "15", "1", "release", 0 };
+        for (int i = 0; vi[i]; i++) (void)sh_array_set("BASH_VERSINFO", i, vi[i]);
+        const char *mt = env_get("MACHTYPE");
+        (void)sh_array_set("BASH_VERSINFO", 5, mt ? mt : "x86_64-pc-tobyos");
+        (void)shell_readonly_mark("BASH_VERSINFO", 13);
+    }
+    shell_set_if_not("BASH_LOADABLES_PATH",
+                     "/usr/local/lib/bash:/usr/lib/bash:/opt/local/lib/bash:"
+                     "/usr/pkg/lib/bash:/opt/pkg/lib/bash:.");
+    shell_set_if_not("OPTERR", "1");
+    shell_set_if_not("PS4", "+ ");
+    shell_set_if_not("COMP_WORDBREAKS", " \t\n\"'@><=;|&(:");
+    {
+        /* adjust_shell_level(1): a number inherited goes up by one, and
+         * anything else -- unset, empty, not a number, negative -- starts
+         * at 1; past 999 bash warns and resets to 1. */
+        const char *old = env_get("SHLVL");
+        long lv = 0;
+        bool num = old && *old;
+        for (const char *q = old ? old : ""; *q; q++)
+            if (*q < '0' || *q > '9') num = false;
+        if (num)
+            for (const char *q = old; *q && lv < 100000; q++) lv = lv * 10 + (*q - '0');
+        long nl = num ? lv + 1 : 1;
+        if (nl > 1000) {
+            kprintf("warning: shell level (%ld) too high, resetting to 1\n", nl);
+            nl = 1;
+        }
+        char b[24];
+        ksnprintf(b, sizeof b, "%ld", nl);
+        (void)env_set("SHLVL", b);
+        shell_mark_exported("SHLVL");
+    }
+    if (!sh_array_find("BASH_ARGC")) (void)sh_array_set("BASH_ARGC", 0, "0");
+    if (!sh_array_find("BASH_ARGV")) (void)sh_array_create("BASH_ARGV");
+    if (!sh_array_find("BASH_CMDS")) (void)sh_array_make_assoc("BASH_CMDS");
+    if (!sh_array_find("BASH_ALIASES")) (void)sh_array_make_assoc("BASH_ALIASES");
+    if (!sh_array_find("GROUPS")) {
+        /* the process's groups; none beyond its own is its own gid */
+        struct proc *cur = current_proc();
+        char b[24];
+        if (cur && cur->ngroups > 0) {
+            for (int i = 0; i < cur->ngroups; i++) {
+                ksnprintf(b, sizeof b, "%d", cur->groups[i]);
+                (void)sh_array_set("GROUPS", i, b);
+            }
+        } else {
+            ksnprintf(b, sizeof b, "%u", cur ? (unsigned)cur->gid : 0u);
+            (void)sh_array_set("GROUPS", 0, b);
+        }
+    }
+    shell_dirstack_sync();
 }
 
 static void env_init_defaults(void) {
@@ -7525,6 +7633,31 @@ static bool shell_declare_filter_ok(const char *name, bool want_array,
  * which is the caller's cue to report it and set status 1. */
 static bool shell_declare_print(const char *name) {
     size_t klen = strlen(name);
+    /* THE DYNAMIC VARIABLES PRINT AS bash's DO, with the value they have
+     * now: `declare -i RANDOM="..."` for the integers, `--` for the rest
+     * (logs/b12/p38) -- they have no entry here until assigned, and
+     * declare -p called them "not found". LINENO too, while unassigned. */
+    {
+        int dv = shell_dynvar_index(name, klen);
+        if (dv >= 0) {
+            const char *v = shell_dynvar_value(dv);
+            bool integer = dv == DV_RANDOM || dv == DV_SRANDOM ||
+                           dv == DV_SECONDS || dv == DV_BASHPID ||
+                           dv == DV_HISTCMD;
+            shell_printf("declare -%s %s=", integer ? "i" : "-", name);
+            shell_declare_quote(v ? v : "");
+            shell_printf("\n");
+            return true;
+        }
+        if (strcmp(name, "LINENO") == 0 && env_find(name, klen) < 0) {
+            char b[24];
+            ksnprintf(b, sizeof b, "%lu", g_shell_lineno);
+            shell_printf("declare -- LINENO=");
+            shell_declare_quote(b);
+            shell_printf("\n");
+            return true;
+        }
+    }
     int idx = env_find(name, klen);
     struct sh_array *arr = sh_array_find(name);
     unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
@@ -21441,6 +21574,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
      * failure -- the flow flag is absorbed below. */
     bool inherit_ee = g_shopt_inherit_errexit;
     if (!inherit_ee) g_errexit_off++;
+    g_comsub_level++;
     /* A SUBSTITUTION CONTAINS A COMMAND LIST, NOT A LINE.
      *
      *     foo=`cat <<EOM
@@ -21510,6 +21644,7 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
         }
     }
     if (!inherit_ee) g_errexit_off--;
+    g_comsub_level--;
     if (!sub_frame) shell_alias_restore(&saved_aliases);
 
     /* A SUBSTITUTION IS A SUBSHELL, so `exit` inside it ends THAT, not us:
@@ -31425,6 +31560,10 @@ static int shell_background_forked(const char *text, const char *label) {
          * a USR1 the script had ignored, and it died of it (138) every time
          * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
         shell_trap_clear_caught();
+        /* an asynchronous command is a subshell, its words expanded in it:
+         * `echo $BASH_SUBSHELL &` prints 1 */
+        g_subshell_depth++;
+        g_simple_stage_adj = 0;
         /* ONE simple external may replace this process -- see
          * shell_bg_text_is_simple and proc_exec_in_place. */
         g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
@@ -36598,6 +36737,7 @@ static bool shell_try_compound_pipeline(const char *src) {
             (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
         if (fpid == 0) {
             g_in_pipeline_stage = true;
+            g_simple_stage_adj = stage_simple[i] ? 1 : 0;
             /* A CHILD MUST NOT HOLD THE READ END OF THE PIPE IT WRITES TO.
              *
              *     cat /dev/urandom | sleep 0.1
@@ -36618,8 +36758,11 @@ static bool shell_try_compound_pipeline(const char *src) {
             cpids[i] = fpid;
         } else {
             bool saved_ps = g_in_pipeline_stage;
+            int saved_adj = g_simple_stage_adj;
             g_in_pipeline_stage = true;      /* lastpipe: parent runs it */
+            g_simple_stage_adj = saved_adj + (stage_simple[i] ? 1 : 0);
             execute_line_text(stages[i]);
+            g_simple_stage_adj = saved_adj;
             g_in_pipeline_stage = saved_ps;
             last = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
@@ -37847,6 +37990,7 @@ void shell_init(void) {
     g_shell_start_secs = shell_wall_secs();
     if (shell_set_param0("tobysh") < 0) kprintf(SH_PFX_SHELL "failed to set $0\n");
     (void)shell_set_positional_params(0, 0);
+    shell_init_bash_vars("tobysh");
     kprintf("type 'help' to list commands.\n");
     prompt();
 }
@@ -38098,6 +38242,13 @@ bool shell_opt_ignoreeof_hosted(void) { return g_opt_ignoreeof; }
 const char *shell_get_var_hosted(const char *name) { return env_get(name); }
 void shell_set_var_hosted(const char *name, const char *value) {
     (void)env_set(name, value);
+    /* PPID is bash's `declare -ir PPID` (logs/b12/p38): a plain variable
+     * here, which a script could overwrite */
+    if (strcmp(name, "PPID") == 0) {
+        int pi = env_find("PPID", 4);
+        if (pi >= 0) g_env_flags[pi] |= SHVAR_INTEGER;
+        (void)shell_readonly_mark("PPID", 4);
+    }
 }
 
 /* Is this text a complete command, or does the interactive loop need to
@@ -38269,6 +38420,39 @@ void shell_init_hosted(const char *argv0) {
     shell_trap_clear_all();
     (void)shell_set_param0(argv0 ? argv0 : "tsh");
     (void)shell_set_positional_params(0, 0);
+    {
+        /* BASH is the shell's own pathname: argv[0] as given when it has a
+         * slash (made absolute), else found on PATH */
+        SH_SB(self);
+        const char *a0 = argv0 ? argv0 : "tsh";
+        bool slash = false;
+        for (const char *c = a0; *c; c++) if (*c == '/') slash = true;
+        if (a0[0] == '/') {
+            (void)sb_puts(&self, a0);
+        } else if (slash) {
+            const char *pwd = env_get("PWD");
+            (void)sb_puts(&self, pwd ? pwd : "");
+            (void)sb_putc(&self, '/');
+            (void)sb_puts(&self, a0);
+        } else {
+            const char *path = env_get("PATH");
+            for (const char *d = path ? path : ""; d && !self.len; ) {
+                const char *e = d;
+                while (*e && *e != ':') e++;
+                SH_SB(cand);
+                if (e > d) (void)sb_putmem(&cand, d, (size_t)(e - d));
+                else (void)sb_putc(&cand, '.');
+                (void)sb_putc(&cand, '/');
+                (void)sb_puts(&cand, a0);
+                struct vfs_stat st;
+                if (vfs_stat(cand.p, &st) == VFS_OK && st.type != VFS_TYPE_DIR)
+                    (void)sb_puts(&self, cand.p);
+                d = *e ? e + 1 : 0;
+            }
+            if (!self.len) (void)sb_puts(&self, "/bin/tsh");
+        }
+        shell_init_bash_vars(self.p);
+    }
 }
 
 /* Run a script file to completion; returns its exit status.
