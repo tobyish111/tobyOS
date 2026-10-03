@@ -1249,6 +1249,17 @@ static int   sh_array_set_key(const char *name, const char *key,
 static const char *sh_array_get_key(const char *name, const char *key);
 static void  sh_array_unset_key(struct sh_array *a, const char *key);
 static void  sh_array_unset_literal(const char *name);
+static void  sh_array_clear_novalue(const char *name);
+/* bash's `max_index + 1 + i` for a negative subscript, wrapping as its
+ * 64-bit intmax_t arithmetic does: when the top index is INT64_MAX every
+ * negative subscript stays negative, so ${a[@]: -1} is empty there (Oils
+ * 0276) -- in C the plain sum is undefined. */
+static inline long sh_count_back(long top, long v) {
+    return (long)((unsigned long)top + 1ul + (unsigned long)v);
+}
+static char *shell_strdup(const char *s);
+static void  shell_strip_glob_escapes(char *s);
+static int   sh_subscript_value(const char *sub, long *out);
 static int   sh_array_literal_commit(const char *tmp, const char *name,
                                      bool append);
 /* The name an array literal is built under until it is complete: a byte no
@@ -2620,17 +2631,73 @@ static int sh_array_store_expanded(const char *name, const char *ex,
     return 0;
 }
 
+/* AN INDEXED LITERAL IS EXPANDED WHOLE, THEN ASSIGNED IN ORDER (bash's
+ * expand_compound_array_assignment + assign_compound_array_list): every
+ * value -- and each `[k]`'s text -- is expanded first, against the array
+ * as it was; then the array is emptied (for `=`) and the elements go in
+ * one by one, each `[k]` EVALUATED as it is reached, so it sees what the
+ * elements before it did:
+ *
+ *     i=1; a=([100+i++]=$((i++)) [200+i++]=$((i++)))   keys 104 205
+ *     a=([0]=1+2+3 [a[0]]=10 [a[6]]=hello)             keys 0 6 10
+ *
+ * tsh evaluated each key as it expanded each value, into a hidden array
+ * the keys could not see (Oils 0244 0245 0246). Phase one queues here. */
+struct sh_lit_ent {
+    char *key;                  /* the `[k]` text, expanded; 0: a bare value */
+    char *val;
+    bool plus;                  /* `[k]+=v` */
+};
+struct sh_litq {
+    struct sh_lit_ent *v;
+    int n, cap;
+};
+
+static int sh_litq_add(struct sh_litq *q, const char *key, const char *val,
+                       bool plus) {
+    if (q->n == q->cap) {
+        int ncap = q->cap ? q->cap * 2 : 16;
+        struct sh_lit_ent *nv =
+            (struct sh_lit_ent *)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) return -1;
+        if (q->n) memcpy(nv, q->v, (size_t)q->n * sizeof *nv);
+        kfree(q->v);
+        q->v = nv;
+        q->cap = ncap;
+    }
+    struct sh_lit_ent *e = &q->v[q->n];
+    e->key = key ? shell_strdup(key) : 0;
+    e->val = shell_strdup(val ? val : "");
+    e->plus = plus;
+    if ((key && !e->key) || !e->val) {
+        kfree(e->key);
+        kfree(e->val);
+        return -1;
+    }
+    q->n++;
+    return 0;
+}
+
+static void sh_litq_free(struct sh_litq *q) {
+    for (int i = 0; i < q->n; i++) { kfree(q->v[i].key); kfree(q->v[i].val); }
+    kfree(q->v);
+    q->v = 0;
+    q->n = q->cap = 0;
+}
+
 /* The elements of the literal at `p` (just past its `(`), into the array
- * `dst`. `name` is the array being assigned, which the elements' own
- * expansions read -- see sh_array_assign_literal. */
+ * `dst` -- or, for an indexed literal, onto `q` (above). `name` is the
+ * array being assigned, which the elements' own expansions read -- see
+ * sh_array_assign_literal. */
 static int sh_array_literal_fill_ex(const char *dst, const char *name,
                                     const char *p, bool append, long *nextp,
-                                    bool plain_only);
+                                    bool plain_only, struct sh_litq *q);
 static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
                             int depth);
 static int sh_array_literal_fill(const char *dst, const char *name,
-                                 const char *p, bool append, long next) {
-    return sh_array_literal_fill_ex(dst, name, p, append, &next, false);
+                                 const char *p, bool append, long next,
+                                 struct sh_litq *q) {
+    return sh_array_literal_fill_ex(dst, name, p, append, &next, false, q);
 }
 
 /* `plain_only`: every word is an ordinary element, even one that looks
@@ -2638,7 +2705,7 @@ static int sh_array_literal_fill(const char *dst, const char *name,
  * index the next ordinary element takes, and comes back advanced. */
 static int sh_array_literal_fill_ex(const char *dst, const char *name,
                                     const char *p, bool append, long *nextp,
-                                    bool plain_only) {
+                                    bool plain_only, struct sh_litq *q) {
     long next = *nextp;
     /* An element's text is a piece of the literal, so the literal's length
      * always holds one; it was 512 bytes, and a longer element was cut
@@ -2746,7 +2813,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                 if (shell_brace_word(elem, n, &bx, 0) < 0) return -1;
                 if (bx.len != n || memcmp(bx.p, elem, n) != 0) {
                     if (sh_array_literal_fill_ex(dst, name, bx.p, append,
-                                                 &next, true) < 0)
+                                                 &next, true, q) < 0)
                         return -1;
                     continue;
                 }
@@ -2812,6 +2879,16 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                     }
                     if (sh_array_set_key(dst, kx.p, vx.p) < 0) return -1;
                     saw_keyed = true;
+                } else if (q) {
+                    /* the key's text expands now, its value is taken when
+                     * the element goes in (sh_array_assign_literal) */
+                    SH_SB(kraw);
+                    SH_SB(kx);
+                    if (shell_expand_word_ex(k, &kraw, true, true) < 0 ||
+                        shell_argmarks_to_spaces(kraw.p, &kx) < 0)
+                        return -1;
+                    shell_strip_glob_escapes(kx.p);
+                    if (sh_litq_add(q, kx.p, vx.p, eplus) < 0) return -1;
                 } else {
                     long ix = 0;
                     if (sh_subscript_eval(k, append ? name : dst, false, &ix) &&
@@ -2886,8 +2963,28 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             if (!quoted && shell_word_tilde(&ex) < 0) return -1;
             /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
              * is three elements -- and a quoted one never does. */
-            if (sh_array_store_expanded(dst, ex.p, !quoted, quoted, &next) < 0)
+            if (q) {
+                /* the fields, in order, through a scratch array of their
+                 * own (the splitting and globbing live in the store) */
+                static unsigned scr_seq;
+                char scr[32];
+                ksnprintf(scr, sizeof scr, "%cscr%u", SH_ARRAY_TMP_MARK,
+                          scr_seq++);
+                if (!sh_array_create(scr)) return -1;
+                long sn = 0;
+                int rc = sh_array_store_expanded(scr, ex.p, !quoted, quoted,
+                                                 &sn);
+                /* the store numbered them 0.. as it went */
+                for (long i = 0; rc == 0 && i < sn; i++) {
+                    const char *fv = sh_array_get(scr, i);
+                    if (fv) rc = sh_litq_add(q, 0, fv, false);
+                }
+                sh_array_unset_literal(scr);
+                if (rc < 0) return -1;
+            } else if (sh_array_store_expanded(dst, ex.p, !quoted, quoted,
+                                               &next) < 0) {
                 return -1;
+            }
         }
     }
     /* An odd number of bare words leaves the last KEY holding "". */
@@ -2929,11 +3026,15 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (a) next = sh_array_max_idx(a) + 1;
     }
     if (!sh_array_create(tmp)) return -1;
-    if (sh_array_is_assoc(name) && sh_array_make_assoc(tmp) < 0) {
+    bool assoc = sh_array_is_assoc(name);
+    if (assoc && sh_array_make_assoc(tmp) < 0) {
         sh_array_unset_literal(tmp);
         return -1;
     }
-    if (sh_array_literal_fill(tmp, name, p, append, next) < 0) {
+    struct sh_litq q = { 0, 0, 0 };
+    if (sh_array_literal_fill(tmp, name, p, append, next,
+                              assoc ? 0 : &q) < 0) {
+        sh_litq_free(&q);
         sh_array_unset_literal(tmp);
         return -1;
     }
@@ -2959,7 +3060,75 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         int si = env_find(real, strlen(real));
         if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
     }
-    return sh_array_literal_commit(tmp, name, append);
+    if (assoc) return sh_array_literal_commit(tmp, name, append);
+    /* Phase two (sh_litq): the array as it will be -- emptied for `=` --
+     * then each element in order, through its attributes (-i -l -u), read
+     * before the empty array replaces the old one. */
+    unsigned at = shell_value_attrs(name);
+    if (sh_array_literal_commit(tmp, name, append) < 0) {
+        sh_litq_free(&q);
+        return -1;
+    }
+    int rc = 0;
+    struct sh_array *a = sh_array_find(name);
+    long last = append && a ? sh_array_max_idx(a) + 1 : 0;
+    for (int i = 0; rc == 0 && i < q.n; i++) {
+        struct sh_lit_ent *e = &q.v[i];
+        long ix = last;
+        if (e->key) {
+            /* bash's checks, in its order: `[]=`, then `[@]=`, then the
+             * value of the subscript counted back from the end */
+            if (!*e->key) {
+                kprintf("[]=%s: bad array subscript\n", e->val);
+                continue;
+            }
+            if ((e->key[0] == '@' || e->key[0] == '*') && !e->key[1]) {
+                kprintf("[%s]=%s: cannot assign to non-numeric index\n",
+                        e->key, e->val);
+                shell_set_status(1);
+                continue;
+            }
+            if (sh_subscript_value(e->key, &ix) != SARITH_OK) {
+                rc = -1;
+                break;
+            }
+            if (ix < 0) {
+                a = sh_array_find(name);
+                ix = sh_count_back(a ? sh_array_max_idx(a) : -1, ix);
+            }
+            if (ix < 0) {
+                kprintf("[%s]=%s: bad array subscript\n", e->key, e->val);
+                continue;
+            }
+        }
+        const char *v = e->val;
+        SH_SB(cat);
+        if (e->plus) {
+            const char *old = sh_array_get(name, ix);
+            SH_SB(tv);
+            int ar = shell_attr_append(at, old, v, &tv);
+            if (ar < 0) { rc = -1; break; }
+            if (ar > 0) {
+                if (sb_set(&cat, tv.p) < 0) { rc = -1; break; }
+            } else if (sb_puts(&cat, old) < 0 || sb_puts(&cat, v) < 0) {
+                rc = -1;
+                break;
+            }
+            v = cat.p;
+        } else {
+            SH_SB(tv);
+            int ar = shell_attr_value(at, v, &tv);
+            if (ar < 0) { rc = -1; break; }
+            if (ar > 0) {
+                if (sb_set(&cat, tv.p) < 0) { rc = -1; break; }
+                v = cat.p;
+            }
+        }
+        if (sh_array_set(name, ix, v) < 0) { rc = -1; break; }
+        last = ix + 1;
+    }
+    sh_litq_free(&q);
+    return rc;
 }
 
 /* AN ELEMENT ASSIGNMENT TO A SCALAR MAKES IT AN ARRAY whose element 0 is the
@@ -3048,6 +3217,28 @@ static int sh_try_array_assignment(const char *kv) {
             if (k) sub = k;
         }
         if (!shell_name_is_valid(name, strlen(name))) return 0;
+        /* A LIST IS NO MEMBER'S VALUE: `a[-1]+=(4 5)` is bash's "a[-1]:
+         * cannot assign list to array member", status 1 and the rest of
+         * the line dropped (Oils 0060) -- as `declare a[0]=(1 2)` already
+         * was (shell_decl_element). tsh appended the text "(4 5)". Only a
+         * `(` that was written: a value from a quote or an expansion, or
+         * one `read`/`printf -v` set, is just a value. */
+        {
+            size_t vl = strlen(val);
+            if (!expand_sub && !g_env_value_scalar && vl >= 2 &&
+                val[0] == '(' && val[vl - 1] == ')' &&
+                !shell_kv_scalar_paren(kv, val)) {
+                kprintf("%.*s: cannot assign list to array member\n",
+                        (int)keylen, kv);
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                return -1;
+            }
+        }
         /* A READONLY ARRAY'S ELEMENTS ARE READONLY TOO (S4): `r[0]=9`,
          * `r[1]+=x`, `m[k]=w`. They all went through. */
         if (shell_readonly_key(name, strlen(name))) {
@@ -3281,12 +3472,19 @@ static int env_set_kv(const char *kv_in) {
      * array -- one name answering two ways, and `unset a` removed only the
      * scalar. (A nameref to an array lands here too: sh_array_find follows
      * it.) An associative array's element 0 is the key "0". */
+    /* ...and so does one to a name only DECLARED an array, which has no
+     * record yet: `declare -a c; c=7` is c=([0]="7") -- tsh set a scalar
+     * the array attribute then hid, and `declare -p c` printed c=(). */
     if (kv_in[klen] == '=' && !g_env_attr_only) {
-        char nm[128];
-        if (klen + 1 <= sizeof nm) {
-            memcpy(nm, kv_in, klen);
-            nm[klen] = '\0';
-            if (shell_name_is_valid(nm, klen) && sh_array_find(nm)) {
+        SH_SB(nmb);
+        if (sb_putmem(&nmb, kv_in, klen) == 0) {
+            const char *nm = nmb.p;
+            int fi = env_find(nm, klen);
+            bool declared_arr = fi >= 0 && (g_env_flags[fi] & SHVAR_ARRAY) &&
+                                !(g_env_flags[fi] & SHVAR_NAMEREF);
+            if (shell_name_is_valid(nm, klen) &&
+                (sh_array_find(nm) || declared_arr)) {
+                if (declared_arr) sh_array_clear_novalue(nm);
                 if (shell_readonly_key(nm, klen)) {
                     shell_readonly_print_error(nm, klen, "shell");
                     return -1;
@@ -5486,7 +5684,7 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
         int k = sh_subscript_value(sub, &i);
         if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
         if (k != SARITH_OK) return SARITH_CB_FAIL;
-        if (i < 0 && arr) i = sh_array_max_idx(arr) + 1 + i;
+        if (i < 0 && arr) i = sh_count_back(sh_array_max_idx(arr), i);
         if (i < 0) {
             kprintf("%s: bad array subscript\n", name);
             return SARITH_CB_OK;            /* read as nothing */
@@ -5532,7 +5730,7 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
         int k = sh_subscript_value(sub, &i);
         if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
         if (k != SARITH_OK) return SARITH_CB_FAIL;
-        if (i < 0 && arr) i = sh_array_max_idx(arr) + 1 + i;
+        if (i < 0 && arr) i = sh_count_back(sh_array_max_idx(arr), i);
         if (i < 0) {
             kprintf("%s[%s]: bad array subscript\n", name, sub);
             return SARITH_CB_OK;            /* nothing is assigned */
@@ -5581,7 +5779,7 @@ static bool sh_subscript_eval(const char *sub, const char *name,
         struct sh_array *arr = sh_array_find(name);
         long top = sh_array_max_idx(arr);
         if (top < 0) { if (for_write) return false; *out = -1; return true; }
-        v = top + 1 + v;                    /* -1 -> the last element */
+        v = sh_count_back(top, v);          /* -1 -> the last element */
         if (v < 0) { *out = -1; return true; }   /* out of range: unset */
     }
     *out = v;
@@ -5637,7 +5835,7 @@ static int sh_subscript_assign_index(const char *name, const char *sub,
     }
     if (v < 0) {
         struct sh_array *arr = sh_array_find(name);
-        if (arr) v = sh_array_max_idx(arr) + 1 + v;
+        if (arr) v = sh_count_back(sh_array_max_idx(arr), v);
         else if (env_get(name)) v = 1 + v;      /* a scalar is element 0 */
     }
     if (v < 0) {
@@ -5667,7 +5865,7 @@ static int sh_subscript_read_index(const char *nm, const char *sub, long *out) {
     }
     if (v < 0) {
         struct sh_array *arr = sh_array_find(nm);
-        if (arr) v = sh_array_max_idx(arr) + 1 + v;
+        if (arr) v = sh_count_back(sh_array_max_idx(arr), v);
         if (v < 0) {
             kprintf("%s: bad array subscript\n", nm);
             shell_report_error_errexit();
@@ -7529,6 +7727,12 @@ static void cmd_declare(int argc, char **argv) {
         shell_decl_attrs(name, attr_on, attr_off,
                          set_array || sh_array_find(name) != 0);
 
+        /* `declare -a e=8` on a new name: the array exists before its
+         * value goes in, so the value is element 0 (bash: e=([0]="8")) --
+         * it went into a scalar the attribute then hid, and declare -p
+         * printed e=() (Oils 2397). */
+        if (set_array && has_value && !sh_array_find(name))
+            (void)sh_array_create(name);
         if (has_value) {
             g_readonly_hit = false;
             g_decl_paren_array = set_array || sh_array_find(name) != 0;
@@ -7912,8 +8116,18 @@ static void cmd_unset(int argc, char **argv) {
                     if (key) sh_array_unset_key(arr, key);
                     continue;
                 }
+                /* A NEGATIVE INDEX STILL NEGATIVE after counting back from
+                 * the end is bash's "unset: [-2]: bad array subscript",
+                 * status 1 (unbind_array_element; Oils 0266 0357). tsh
+                 * unset nothing and said nothing. */
                 long ix = 0;
-                if (arr && sh_subscript_eval(sub, nm, false, &ix)) {
+                if (arr && sh_subscript_value(sub, &ix) == SARITH_OK) {
+                    if (ix < 0) ix = sh_count_back(sh_array_max_idx(arr), ix);
+                    if (ix < 0) {
+                        kprintf("unset: [%s]: bad array subscript\n", sub);
+                        shell_set_status(1);
+                        continue;
+                    }
                     sh_array_unset_idx(arr, ix);
                     continue;
                 }
@@ -23839,8 +24053,20 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                              * as it is (shell_append_array_slice) */
                             if (sh_subscript_value(spec.p, &off) != SARITH_OK)
                                 off = 0;
-                        } else if (!sh_subscript_eval(spec.p, nm, false, &off)) {
+                        } else if (sh_subscript_value(spec.p, &off) != SARITH_OK) {
                             off = 0;
+                        } else if (off < 0) {
+                            /* bash's verify_substring_values, in its own
+                             * 64-bit arithmetic: len = top + 1, off += len,
+                             * nothing when off > len or off < 0 -- so a top
+                             * index of INT64_MAX, whose len wraps negative,
+                             * slices to nothing (Oils 0276). -1 asks
+                             * shell_append_array_slice for nothing. */
+                            struct sh_array *sa = sh_array_find(nm);
+                            long top = sa ? sh_array_max_idx(sa) : -1;
+                            long len = (long)((unsigned long)top + 1ul);
+                            long o2 = (long)((unsigned long)off + (unsigned long)len);
+                            off = (o2 > len || o2 < 0) ? -1 : o2;
                         }
                         if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
                             cnt = -1;
@@ -24004,7 +24230,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                                 return -1;
                             }
                             struct sh_array *ca = sh_array_find(nm);
-                            if (cv < 0 && ca) cv = sh_array_max_idx(ca) + 1 + cv;
+                            if (cv < 0 && ca) cv = sh_count_back(sh_array_max_idx(ca), cv);
                             if (cv < 0) {
                                 kprintf("%s]: bad array subscript\n", subbuf.p);
                                 shell_report_error_errexit();
@@ -27225,7 +27451,11 @@ static int shell_note_scalar_paren(struct shell_simple *cur, const char *raw,
                                    int before) {
     if (!raw) return 0;
     size_t rl = shell_assign_prefix_len(raw);
-    if (rl == 0 || raw[rl] == '(') return 0;
+    /* a `(` WRITTEN after the `=` is a compound assignment; any other one
+     * came from a quote or an expansion -- including a word that was not
+     * assignment-shaped as written at all: `declare +a 'x=(2 3)'` sets
+     * the string "(2 3)" (bash; Oils 2397) */
+    if (rl > 0 && raw[rl] == '(') return 0;
     for (int k = before; k < cur->argc; k++) {
         const char *w = cur->argv[k];
         size_t wl = w ? shell_assign_prefix_len(w) : 0;

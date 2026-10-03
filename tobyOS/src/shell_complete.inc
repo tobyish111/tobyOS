@@ -791,7 +791,7 @@ static void comp_expand_words(const struct sh_strv *words, struct sh_strv *out) 
     if (sb_puts(&lit, " )") < 0) return;
     if (!sh_array_create(tmp)) return;
     long next = 0;
-    if (sh_array_literal_fill_ex(tmp, tmp, lit.p, false, &next, true) == 0) {
+    if (sh_array_literal_fill_ex(tmp, tmp, lit.p, false, &next, true, 0) == 0) {
         struct sh_array *a = sh_array_find_literal(tmp);
         for (int i = 0; a && i < a->n; i++) (void)sv_add(out, a->e[i].val);
     }
