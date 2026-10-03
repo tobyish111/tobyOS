@@ -1645,6 +1645,20 @@ static void jobs_remove(struct job *j) {
     j->name = 0;
 }
 
+/* A SUBSHELL STARTS WITH NO JOBS. bash's execute_in_subshell calls
+ * without_job_control -- "Delete all traces that there were any jobs
+ * running. This is only for subshells." -- so in `( )` and in a compound
+ * pipeline stage, `jobs` lists nothing and `wait %1` is "no such job"
+ * (127). A command substitution keeps the table: `$(jobs)` lists the
+ * caller's jobs (logs/b12 p67). The forked child cannot reap the parent's
+ * children anyway; a table it inherited only answered wrongly. */
+#ifdef SHELL_HOSTED
+static void jobs_forget_all(void) {
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id) jobs_remove(g_jobs[i]);
+}
+#endif
+
 /* Called from shell_poll(): for every tracked bg job, ask the kernel
  * what state its PID is in. If TERMINATED, proc_wait() reaps it (no
  * blocking, since the child is already terminated) and we report the
@@ -21651,100 +21665,20 @@ struct shell_subshell_frame;
 static struct shell_subshell_frame *shell_subshell_frame_open(bool reset_traps);
 static void shell_subshell_frame_close(struct shell_subshell_frame *frame);
 
-static int shell_capture_command(const char *cmd, struct shell_sb *out) {
-    if (!cmd || !out) return -1;
-    sb_truncate(out, 0);
+#ifdef SHELL_HOSTED
+extern int  fork(void);
+extern void _exit(int status);
+void shell_host_builtin_done(void);              /* host.c: flush stdout */
+#endif
+static void shell_file_output(const char *s, void *ctx);
 
-    {
-        const char *fw = shell_capture_is_file_read(cmd);
-        if (fw) {
-            SH_SB(wcopy);
-            if (sb_puts(&wcopy, fw) < 0) return -1;
-            while (wcopy.len > 0 && (wcopy.p[wcopy.len - 1] == ' ' ||
-                                     wcopy.p[wcopy.len - 1] == '\t'))
-                sb_truncate(&wcopy, wcopy.len - 1);
-            /* The SUBSTITUTION's status, as the forked path records it
-             * below: `x=$(< missing)` is status 1 in bash, and tsh set $?
-             * instead -- which the assignment then overwrote with 0. */
-            if (shell_capture_read_file(wcopy.p, out) < 0) {
-                sb_truncate(out, 0);
-                g_capture_last_status = 1;
-                return 0;
-            }
-            g_capture_last_status = 0;
-            return 0;
-        }
-    }
-
-    struct shell_capture cap = { .sb = out, .failed = false };
-
-    shell_write_fn_t old_out = g_shell_out;
-    void *old_out_ctx = g_shell_out_ctx;
-    void (*old_sink)(void *ctx, char c) = 0;
-    void *old_sink_ctx = 0;
-    bool old_sink_suppress = false;
-
-    /* A SPAWNED CHILD DOES NOT WRITE THROUGH ANY OF THESE.
-     *
-     * Redirecting g_shell_out and the printk sink captures what the SHELL
-     * writes -- builtins. An external program writes to its own fd 1, which is
-     * the shell's real stdout, so
-     *
-     *     echo "[$(/bin/echo ext)]"      bash: [ext]
-     *                                    tsh : ext        <- leaked to stdout
-     *                                          []         <- captured nothing
-     *
-     * So fd 1 is pointed at a spill file for the duration, and the shell's own
-     * output goes to the SAME file rather than straight to the buffer -- which
-     * is what keeps `$(echo a; /bin/echo b)` in order. The file is read back
-     * afterwards. A pipe would deadlock instead: the command runs to
-     * completion before anything reads, so output past the pipe buffer would
-     * block the child forever.
-     *
-     * If the spill file cannot be opened, fall back to the old buffer-only
-     * capture: builtins still work, which is strictly better than failing. */
-    char spill[64];
-    ksnprintf(spill, sizeof spill, "/tmp/.tsh-capture-%d", g_capture_depth);
-    struct file *spill_w = shell_open_vfs_file(spill, true, false, "shell");
-    struct file *saved_fd1 = g_shell_fd[1];
-    struct shell_capture_file cf = { .f = spill_w, .failed = false };
-
-    printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+/* The substitution's text, run as the subshell it is: state framed, errexit
+ * off unless inherited, its status left in g_capture_last_status. FORKED:
+ * this is the child, and it exits here instead of returning. */
+static void shell_capture_body(const char *cmd, bool forked) {
 #ifndef SHELL_HOSTED
-    /* The kernel shell's diagnostics are its stderr, and a substitution
-     * captures stdout only -- see shell_diag_kputc. A kernel-only builtin
-     * run in here still reaches the spill through shell_run_builtin. */
-    struct shell_diag_save diag_save;
-    shell_diag_push(&diag_save);
-    (void)shell_capture_file_kputc; (void)shell_capture_kputc;
+    (void)forked;
 #endif
-    if (spill_w) {
-        g_shell_fd[1] = spill_w;
-        g_capture_depth++;
-        shell_set_output(shell_capture_file_write, &cf);
-#ifdef SHELL_HOSTED
-        printk_set_sink_mode(shell_capture_file_kputc, &cf, true);
-#endif
-    } else {
-        shell_set_output(shell_capture_write, &cap);
-#ifdef SHELL_HOSTED
-        printk_set_sink_mode(shell_capture_kputc, &cap, true);
-#endif
-    }
-
-    /* A failure INSIDE the substitution is not the parent's error.
-     *
-     *     set -e; echo $(echo one; false); echo status=$?
-     *
-     * prints `one` then `status=0` in bash, dash and ash: turning that
-     * failure into the parent's is what `shopt -s inherit_errexit` is
-     * for, and it is off by default. The substitution runs through
-     * execute_line_text, which is where the errexit trigger lives, so
-     * without this the script simply stopped.
-     *
-     * g_last_status is restored for the same reason: $? belongs to the
-     * ENCLOSING command, and letting the inner status leak out made
-     * `echo $?` report the substitution's failure. */
     int saved_status = g_last_status;
     bool saved_parse_error = g_parse_error;
     bool saved_syntax_fatal = g_syntax_fatal;
@@ -21875,6 +21809,17 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
     }
+#ifdef SHELL_HOSTED
+    if (forked) {
+        /* A FORKED SUBSTITUTION ENDS HERE, as its process. An EXIT trap it
+         * set runs now, its output part of the result -- bash: `x=$(trap
+         * 'echo bye' EXIT; echo hi)` is "hi<NL>bye"; in-process the frame
+         * dropped the trap unrun (logs/b12 p66). */
+        int st = shell_run_exit_trap(g_capture_last_status);
+        shell_host_builtin_done();
+        _exit(st & 0xff);
+    }
+#endif
     g_last_status = saved_status;
     g_parse_error = saved_parse_error;
     g_syntax_fatal = saved_syntax_fatal;
@@ -21889,6 +21834,183 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
         g_shell_flow = keep_flow;
         g_shell_flow_status = keep_flow_status;
     }
+}
+
+#ifdef SHELL_HOSTED
+/* A COMMAND SUBSTITUTION IS A PROCESS, as bash's is.
+ *
+ *     parent=$BASHPID; echo $(echo $BASHPID)     bash: another pid
+ *     x=$(kill -9 $BASHPID); echo $?             bash: 137, and on
+ *
+ * /bin/tsh ran it in its own process, inside a frame that put the state
+ * back afterwards: $BASHPID was the parent's (Oils 2651), and the kill
+ * above killed THE SHELL -- every byte it had buffered with it (logs/b12
+ * p66). The frame also could not hold what a process holds: an EXIT trap
+ * set inside never ran, and the state it did not know of leaked (I31).
+ * So the hosted shell forks: the child runs the text exactly as the
+ * in-process path does -- shell_capture_body, frame and all -- with its
+ * stdout the write end of a pipe, and this side reads the pipe to EOF and
+ * collects the child. A pipe and not the spill file: the reader runs while
+ * the child writes, so nothing waits on a full buffer.
+ *
+ * -2: no fork was possible; the caller runs it in-process. */
+static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
+    struct file *r = 0, *w = 0;
+    if (pipe_create(&r, &w) != 0) return -2;
+    int pid = fork();
+    if (pid < 0) {
+        file_close(r);
+        file_close(w);
+        return -2;
+    }
+    if (pid == 0) {
+        file_close(r);
+        g_shell_fd[1] = w;
+        shell_set_output(shell_file_output, w);
+        printk_set_sink_mode(0, 0, false);
+        shell_capture_body(cmd, true);           /* exits */
+        _exit(1);
+    }
+    file_close(w);
+    struct shell_capture cap = { .sb = out, .failed = false };
+    bool warned_nul = false;
+    for (;;) {
+        char chunk[4096];
+        long n = file_read(r, chunk, sizeof chunk);
+        if (n == -4) continue;          /* EINTR: the child's SIGCHLD */
+        if (n <= 0) break;
+        for (long i = 0; i < n; i++) {
+            /* a NUL is dropped, with bash's warning once -- see the
+             * in-process reader below */
+            if (chunk[i] == '\0') {
+                if (!warned_nul)
+                    kprintf("warning: command substitution: ignored "
+                            "null byte in input\n");
+                warned_nul = true;
+                continue;
+            }
+            shell_capture_char(&cap, chunk[i]);
+        }
+    }
+    file_close(r);
+    int st = proc_wait(pid);
+    g_capture_last_status = st < 0 ? 1 : st;
+    while (out->len > 0 && out->p[out->len - 1] == '\n')
+        sb_truncate(out, out->len - 1);
+    if (cap.failed) {
+        kprintf(SH_PFX_SHELL "command substitution: out of memory\n");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+static int shell_capture_command(const char *cmd, struct shell_sb *out) {
+    if (!cmd || !out) return -1;
+    sb_truncate(out, 0);
+
+    {
+        const char *fw = shell_capture_is_file_read(cmd);
+        if (fw) {
+            SH_SB(wcopy);
+            if (sb_puts(&wcopy, fw) < 0) return -1;
+            while (wcopy.len > 0 && (wcopy.p[wcopy.len - 1] == ' ' ||
+                                     wcopy.p[wcopy.len - 1] == '\t'))
+                sb_truncate(&wcopy, wcopy.len - 1);
+            /* The SUBSTITUTION's status, as the forked path records it
+             * below: `x=$(< missing)` is status 1 in bash, and tsh set $?
+             * instead -- which the assignment then overwrote with 0. */
+            if (shell_capture_read_file(wcopy.p, out) < 0) {
+                sb_truncate(out, 0);
+                g_capture_last_status = 1;
+                return 0;
+            }
+            g_capture_last_status = 0;
+            return 0;
+        }
+    }
+
+#ifdef SHELL_HOSTED
+    /* Forked -- see shell_capture_forked -- unless this shell is itself
+     * inside an in-process capture (its output fallback when no spill file
+     * opened), whose writer a child cannot reach, or here-document bodies
+     * are queued that a child would take its own copy of. */
+    if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
+        int frc = shell_capture_forked(cmd, out);
+        if (frc != -2) return frc;
+    }
+#endif
+
+    struct shell_capture cap = { .sb = out, .failed = false };
+
+    shell_write_fn_t old_out = g_shell_out;
+    void *old_out_ctx = g_shell_out_ctx;
+    void (*old_sink)(void *ctx, char c) = 0;
+    void *old_sink_ctx = 0;
+    bool old_sink_suppress = false;
+
+    /* A SPAWNED CHILD DOES NOT WRITE THROUGH ANY OF THESE.
+     *
+     * Redirecting g_shell_out and the printk sink captures what the SHELL
+     * writes -- builtins. An external program writes to its own fd 1, which is
+     * the shell's real stdout, so
+     *
+     *     echo "[$(/bin/echo ext)]"      bash: [ext]
+     *                                    tsh : ext        <- leaked to stdout
+     *                                          []         <- captured nothing
+     *
+     * So fd 1 is pointed at a spill file for the duration, and the shell's own
+     * output goes to the SAME file rather than straight to the buffer -- which
+     * is what keeps `$(echo a; /bin/echo b)` in order. The file is read back
+     * afterwards. A pipe would deadlock instead: the command runs to
+     * completion before anything reads, so output past the pipe buffer would
+     * block the child forever.
+     *
+     * If the spill file cannot be opened, fall back to the old buffer-only
+     * capture: builtins still work, which is strictly better than failing. */
+    char spill[64];
+    ksnprintf(spill, sizeof spill, "/tmp/.tsh-capture-%d", g_capture_depth);
+    struct file *spill_w = shell_open_vfs_file(spill, true, false, "shell");
+    struct file *saved_fd1 = g_shell_fd[1];
+    struct shell_capture_file cf = { .f = spill_w, .failed = false };
+
+    printk_get_sink(&old_sink, &old_sink_ctx, &old_sink_suppress);
+#ifndef SHELL_HOSTED
+    /* The kernel shell's diagnostics are its stderr, and a substitution
+     * captures stdout only -- see shell_diag_kputc. A kernel-only builtin
+     * run in here still reaches the spill through shell_run_builtin. */
+    struct shell_diag_save diag_save;
+    shell_diag_push(&diag_save);
+    (void)shell_capture_file_kputc; (void)shell_capture_kputc;
+#endif
+    if (spill_w) {
+        g_shell_fd[1] = spill_w;
+        g_capture_depth++;
+        shell_set_output(shell_capture_file_write, &cf);
+#ifdef SHELL_HOSTED
+        printk_set_sink_mode(shell_capture_file_kputc, &cf, true);
+#endif
+    } else {
+        shell_set_output(shell_capture_write, &cap);
+#ifdef SHELL_HOSTED
+        printk_set_sink_mode(shell_capture_kputc, &cap, true);
+#endif
+    }
+
+    /* A failure INSIDE the substitution is not the parent's error.
+     *
+     *     set -e; echo $(echo one; false); echo status=$?
+     *
+     * prints `one` then `status=0` in bash, dash and ash: turning that
+     * failure into the parent's is what `shopt -s inherit_errexit` is
+     * for, and it is off by default. The substitution runs through
+     * execute_line_text, which is where the errexit trigger lives, so
+     * without this the script simply stopped.
+     *
+     * g_last_status is restored for the same reason: $? belongs to the
+     * ENCLOSING command, and letting the inner status leak out made
+     * `echo $?` report the substitution's failure. */
+    shell_capture_body(cmd, false);
 
 #ifndef SHELL_HOSTED
     shell_diag_pop(&diag_save);
@@ -36407,9 +36529,54 @@ static bool shell_try_subshell_command(const char *src) {
         redirs = plp->stage[0];
     }
 
+    /* A ( ) IS A PROCESS -- see shell_capture_forked for what running it
+     * in this one cost: `( echo $BASHPID )` printed the shell's own pid
+     * (Oils 2651), `( kill -9 $BASHPID )` killed the shell. The child runs
+     * the body below, exactly as the in-process path does, and leaves with
+     * its status; this side reports a signal death as bash's wait_for does
+     * and takes the status. Not inside an in-process capture, nor with
+     * here-document bodies queued (the child would consume its own copy,
+     * and this shell's queue would hand the next command a body the child
+     * already used). */
+    bool forked_child = false;
+#ifdef SHELL_HOSTED
+    if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
+        int pid = fork();
+        if (pid > 0) {
+            int rc = proc_wait(pid);
+            if (rc < 0) rc = 1;
+            int sig = proc_last_term_sig();
+            if (sig > 0) {
+                SH_SB(jt);
+                const char *bt = shell_skip_blanks(body);
+                size_t bl = strlen(bt);
+                while (bl > 0 && (bt[bl - 1] == ' ' || bt[bl - 1] == '\t' ||
+                                  bt[bl - 1] == '\n' || bt[bl - 1] == ';'))
+                    bl--;
+                (void)sb_puts(&jt, "( ");
+                (void)sb_putmem(&jt, bt, bl);
+                (void)sb_puts(&jt, " )");
+                shell_report_job_death(pid, sig, jt.p ? jt.p : "( )", true);
+            }
+            shell_set_status(rc);
+            shell_set_pipestatus1(rc);
+            kfree(body);
+            shell_pipeline_free(plp);
+            return true;
+        }
+        if (pid == 0) {
+            forked_child = true;
+            jobs_forget_all();
+        }
+    }
+#endif
+
     struct shell_subshell_frame state;
     if (shell_subshell_frame_capture(&state) < 0) {
         kprintf("subshell: failed to save shell state\n");
+#ifdef SHELL_HOSTED
+        if (forked_child) _exit(1);
+#endif
         shell_set_status(1);
         kfree(body);
         shell_pipeline_free(plp);
@@ -36420,6 +36587,9 @@ static bool shell_try_subshell_command(const char *src) {
     bool io_active = false;
     if (redirs.redir_count > 0) {
         if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
+#ifdef SHELL_HOSTED
+            if (forked_child) _exit(1);
+#endif
             shell_subshell_frame_restore(&state);
             shell_set_status(1);
             kfree(body);
@@ -36452,6 +36622,14 @@ static bool shell_try_subshell_command(const char *src) {
         rc = g_shell_flow_status;
     }
     rc = shell_run_exit_trap(rc);
+#ifdef SHELL_HOSTED
+    if (forked_child) {
+        shell_host_builtin_done();
+        _exit(rc & 0xff);
+    }
+#else
+    (void)forked_child;
+#endif
 
     g_subshell_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
@@ -37228,6 +37406,7 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (fpid == 0) {
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
+            if (!stage_simple[i]) jobs_forget_all();     /* a subshell */
             /* A CHILD MUST NOT HOLD THE READ END OF THE PIPE IT WRITES TO.
              *
              *     cat /dev/urandom | sleep 0.1
