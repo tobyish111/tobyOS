@@ -22168,9 +22168,14 @@ static int shell_ansic_escape(const char **pp, char out[16]) {
         if (p[1] == '\'') { c = 'c'; p++; break; }
         p++;
         if (*p) {
+            /* bash's TOCTRL: the upper-cased byte MASKED with 0x1f, `?` is
+             * DEL -- `\c0` is 0x10 and `\c-` 0x0d, where XOR with 0x40
+             * gave 'p' and 'm' (Oils 2054) -- and `\c\\` takes both
+             * backslashes (POSIX, strtrans.c). */
             char x = *p++;
+            if (x == '\\' && *p == '\\') p++;
             if (x >= 'a' && x <= 'z') x = (char)(x - 'a' + 'A');
-            c = (unsigned char)(x ^ 0x40);
+            c = x == '?' ? 0x7f : (unsigned char)(x & 0x1f);
         } else {
             c = '\\';
         }
@@ -27323,6 +27328,14 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         return -1;
                     p++;
                 } while (*p && depth > 0);
+                continue;
+            }
+            /* `$"..."` IS bash's LOCALE-TRANSLATED STRING, and with no
+             * message catalog it is the string itself -- a "..." (Oils
+             * 2052; inside double quotes `$"` is no such thing). tsh read
+             * `$` as a lone dollar and printed `$foo`. */
+            if (*p == '$' && p[1] == '"') {
+                p++;
                 continue;
             }
             if (*p == '$' && p[1] == '\'') {
