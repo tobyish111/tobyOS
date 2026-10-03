@@ -21612,6 +21612,10 @@ enum shell_redir_op {
     /* A here-document whose body did not expand (shell_hd_expand, which
      * said why): applying it fails the command, status 1. */
     SH_RD_FAILED,
+    /* `<&""` and `>&""`: bash duplicates descriptor -1 -- "NAME: Bad file
+     * descriptor", NAME the word as written (path) or, when path is 0, the
+     * descriptor being redirected. */
+    SH_RD_BADFD,
 };
 
 struct shell_token {
@@ -31130,10 +31134,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             t == SH_TOK_REDIR_RW || t == SH_TOK_REDIR_BOTH ||
             t == SH_TOK_REDIR_BOTH_APPEND) {
             int fd = shell_default_redir_fd(t, tok[*io].fd);
-            int expl_fd = tok[*io].fd;
             const char *fdvar = tok[*io].fdvar;
             int rbefore = cur->redir_count;
-            if (fdvar) expl_fd = fd;        /* `{v}>&word` is one descriptor */
             (*io)++;
             if (*io >= ntok || tok[*io].type != SH_TOK_WORD) {
                 kprintf(SH_PFX_SHELL "redirection needs a path\n");
@@ -31240,7 +31242,9 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 int target = -1;
                 const char *dt = tok[*io].text;
                 size_t dl = strlen(dt);
-                bool mv = dl >= 2 && dt[dl - 1] == '-';
+                /* `M-` moves only as WRITTEN: bash's lexer makes the move
+                 * operator, and `>&$z` with z=7- is the file "7-" (p110) */
+                bool mv = !tok[*io].expanded && dl >= 2 && dt[dl - 1] == '-';
                 for (size_t q = 0; mv && q + 1 < dl; q++)
                     if (dt[q] < '0' || dt[q] > '9') mv = false;
                 if (strcmp(dt, "-") == 0) {
@@ -31262,32 +31266,42 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                         cur->redir[cur->redir_count - 1].move_src = true;
                     }
                 } else if (shell_parse_fd_word(tok[*io].text, &target) < 0) {
-                    /* `N>&word` WHERE word IS NOT A DESCRIPTOR IS A FILENAME:
+                    /* A WORD THAT IS NOT A DESCRIPTOR, as bash's redir.c
+                     * takes it (logs/b12 p109 p110, WSL bash):
                      *
-                     *     echo one 1>&$TMP/somefile     bash: writes the file
-                     *                                   tsh : "bad file descriptor"
+                     *   - an EMPTY one is all digits to bash, and it dups
+                     *     descriptor -1: "Bad file descriptor", naming the
+                     *     word as written for `<&` on 0 and `>&` on 1, the
+                     *     descriptor otherwise (redirection_error) -- tsh
+                     *     opened a file called "";
+                     *   - after `>&` on fd 1, written or not, it is a FILE
+                     *     taking stdout AND stderr, bash's `&>word`
+                     *     (`echo one 1>&$TMP/somefile`); tsh gave an
+                     *     explicit `1>&word` stdout alone;
+                     *   - anything else -- `<&word`, `2>&word` -- is "WORD:
+                     *     ambiguous redirect", WORD as written; tsh opened
+                     *     the file.
                      *
-                     * bash and mksh both treat it that way. Reporting an error
-                     * instead failed a redirect that was meant to succeed. */
-                    enum shell_redir_op fop = (t == SH_TOK_DUP_IN)
-                                                  ? SH_RD_OPEN_IN
-                                                  : SH_RD_OPEN_OUT;
-                    if (shell_add_redir(cur, fop, fd, tok[*io].text, 0,
-                                        -1) < 0) return -1;
-                    /* AND WITH NO fd IN FRONT OF IT, `>&word` TAKES STDERR
-                     * WITH IT -- it is bash's spelling of `&>word`:
-                     *
-                     *     stdout_stderr.py >&out.txt     both streams land
-                     *
-                     * With only fd 1 redirected, the stderr half went to the
-                     * terminal and the file held half of what it should. An
-                     * explicit `1>&word` is fd 1 alone, so this applies only
-                     * when the operator carried no descriptor. fd 2 DUPS fd 1
-                     * rather than opening the file a second time, so the two
-                     * share one offset and cannot overwrite each other. */
-                    if (t == SH_TOK_DUP_OUT && expl_fd < 0 &&
-                        shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
-                        return -1;
+                     * fd 2 DUPS fd 1 rather than opening the file a second
+                     * time, so the two share one offset. */
+                    const char *written = tok[*io].raw ? tok[*io].raw
+                                                       : tok[*io].text;
+                    int dflt = (t == SH_TOK_DUP_IN) ? 0 : 1;
+                    if (!*tok[*io].text) {
+                        /* `{v}<&""` names the variable (REDIR_VARASSIGN) */
+                        if (shell_add_redir(cur, SH_RD_BADFD, fd,
+                                            fdvar ? fdvar
+                                            : fd == dflt ? written : 0, 0,
+                                            -1) < 0) return -1;
+                    } else if (t == SH_TOK_DUP_OUT && fd == 1 && !fdvar) {
+                        if (shell_add_redir(cur, SH_RD_OPEN_OUT, 1,
+                                            tok[*io].text, 0, -1) < 0 ||
+                            shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
+                            return -1;
+                    } else {
+                        if (shell_add_redir(cur, SH_RD_AMBIG, fd, written, 0,
+                                            -1) < 0) return -1;
+                    }
                 } else {
                     if (shell_add_redir(cur,
                                         t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
@@ -32160,6 +32174,12 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             return -1;
         }
         if (r->op == SH_RD_FAILED) {
+            shell_set_status(1);
+            return -1;
+        }
+        if (r->op == SH_RD_BADFD) {
+            if (r->path) kprintf("%s: Bad file descriptor\n", r->path);
+            else kprintf("%d: Bad file descriptor\n", r->fd);
             shell_set_status(1);
             return -1;
         }
