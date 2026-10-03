@@ -33315,6 +33315,18 @@ struct shell_dbr {
     bool   *pat;                /* unquoted: the word may be a pattern */
     bool   *opr;                /* an OPERATOR of the grammar: ( ) && || ! --
                                  * a quoted "(" is a one-character string */
+    /* LITERAL: written unquoted, with nothing to expand. Only such a word
+     * can be an operator -- bash's parser decides that from the word as
+     * written, before any expansion:
+     *
+     *     var=-f; [[ $var == -f ]]      true: `$var` is an operand
+     *     [[ "-f" x ]]  [[ a "==" b ]]  "conditional binary operator
+     *     [[ a $op b ]]  [[ \-f x ]]     expected" -- parse errors
+     *
+     * tsh tested the EXPANDED word, so `$var` became the -f operator and
+     * `==` its file (Oils 1445; logs/b12 p61/p62r). */
+    bool   *lit;
+    const char *msg;            /* bash's words for the error, if not generic */
     int    cap;
     int    n;
     int    pos;
@@ -33334,15 +33346,18 @@ static int shell_dbr_room(struct shell_dbr *d) {
     char **nw = (char **)words_alloc(&d->store, (size_t)ncap * sizeof(char *));
     bool *np = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
     bool *no = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
-    if (!nw || !np || !no) return -1;
+    bool *nl = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
+    if (!nw || !np || !no || !nl) return -1;
     if (d->n) {
         memcpy(nw, d->w, (size_t)d->n * sizeof(char *));
         memcpy(np, d->pat, (size_t)d->n * sizeof(bool));
         memcpy(no, d->opr, (size_t)d->n * sizeof(bool));
+        memcpy(nl, d->lit, (size_t)d->n * sizeof(bool));
     }
     d->w = nw;
     d->pat = np;
     d->opr = no;
+    d->lit = nl;
     d->cap = ncap;
     return 0;
 }
@@ -33518,6 +33533,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             if (!st) return -1;
             d->pat[d->n] = false;
             d->opr[d->n] = true;
+            d->lit[d->n] = true;
             d->w[d->n++] = st;
             p += 2;
             continue;
@@ -33528,6 +33544,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             if (!st) return -1;
             d->pat[d->n] = true;
             d->opr[d->n] = false;
+            d->lit[d->n] = true;
             d->w[d->n++] = st;
             p++;
             continue;
@@ -33541,6 +33558,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             if (!st) return -1;
             d->pat[d->n] = false;
             d->opr[d->n] = true;
+            d->lit[d->n] = true;
             d->w[d->n++] = st;
             p++;
             continue;
@@ -33688,6 +33706,7 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
             if (!st) return -1;
             d->pat[d->n] = false;
             d->opr[d->n] = true;
+            d->lit[d->n] = true;
             d->w[d->n++] = st;
             continue;
         }
@@ -33701,6 +33720,12 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
         if (!st) return -1;
         d->pat[d->n] = any_u;
         d->opr[d->n] = false;
+        {
+            bool lit = !any_q;
+            for (const char *r = sc->raw.p; lit && *r; r++)
+                if (*r == '$' || *r == '`') lit = false;
+            d->lit[d->n] = lit;
+        }
         d->w[d->n++] = st;
     }
     return 0;
@@ -33710,6 +33735,8 @@ static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     d->w = 0;
     d->pat = 0;
     d->opr = 0;
+    d->lit = 0;
+    d->msg = 0;
     d->cap = 0;
     d->n = 0;
     d->pos = 0;
@@ -33854,7 +33881,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
      * operator" (logs/b12 p48; Oils 0559). tsh read `==` as the operator
      * of a binary test with no right side, a syntax error that ended the
      * script. */
-    if (test_is_unary_op(t) && d->pos + 1 < d->n) {
+    if (d->lit[d->pos] && test_is_unary_op(t) && d->pos + 1 < d->n) {
         const char *nxt = d->w[d->pos + 1];
         bool word = !(d->opr[d->pos + 1] && strcmp(nxt, "!") != 0) &&
                     !(d->pat[d->pos + 1] &&
@@ -33864,7 +33891,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
             return test_unary(t, nxt) == 0;
         }
     }
-    if (test_is_unary_op(t) && d->pos + 1 < d->n) {
+    if (d->lit[d->pos] && test_is_unary_op(t) && d->pos + 1 < d->n) {
         const char *nxt = d->w[d->pos + 1];
         /* ...AND WHAT FOLLOWS IT MUST BE AN OPERAND.
          *
@@ -33898,6 +33925,11 @@ static int shell_dbr_primary(struct shell_dbr *d) {
         return a[0] != '\0';               /* a bare word: true if non-empty */
     }
 
+    if (!d->lit[d->pos]) {          /* `[[ a "==" b ]]`, `[[ a $op b ]]` */
+        d->msg = "conditional binary operator expected";
+        d->err = true;
+        return 0;
+    }
     if (strcmp(op, "=~") == 0) {
         if (d->pos + 1 >= d->n) { d->err = true; return 0; }
         const char *re = d->w[d->pos + 1];
@@ -33910,6 +33942,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     bool patrhs = (strcmp(op, "==") == 0 || strcmp(op, "=") == 0 ||
                    strcmp(op, "!=") == 0);
     if (!patrhs && !test_is_binary_op(op)) {
+        d->msg = "conditional binary operator expected";
         d->err = true;
         return 0;
     }
@@ -33993,6 +34026,38 @@ static int shell_dbr_or(struct shell_dbr *d) {
     return v;
 }
 
+/* IS THE `]]` AT `p` A WORD OF ITS OWN -- the one that closes `[[`? bash's
+ * lexer ends `[[` at a `]]` TOKEN, and a token starts after a blank or after
+ * an operator. Inside `[[` that operator can be a grouping `)`:
+ *
+ *     [[ ''||! (1 == 2)&&(2 == 2)]]     closes (Oils 1437)
+ *     [[ (a)]]   [[ !(a == b)]]          close
+ *     [[ a == +(a)]]   [[ $(echo a)]]    do not: that `)` ends an extglob
+ *     [[ "(a)"]]   [[ x =~ [[:space:]]]] or a `$( )` -- part of a WORD, which
+ *                                        the `]]` only continues
+ *
+ * (measured: logs/b12 p60, p63). A `!(` that starts its word is negation
+ * and a group, not an extglob. */
+static bool shell_dbr_close_at(const char *start, const char *p) {
+    if (p == start) return true;
+    char b = p[-1];
+    if (b == ' ' || b == '\t' || b == '\n') return true;
+    if (b != ')') return false;
+    int depth = 0;
+    for (const char *q = p - 1; q >= start; q--) {
+        if (*q == ')') { depth++; continue; }
+        if (*q != '(' || --depth != 0) continue;
+        if (q == start) return true;
+        char c = q[-1];
+        if (c == '?' || c == '*' || c == '+' || c == '@' || c == '$') return false;
+        if (c == '!')
+            return q - 1 == start || q[-2] == ' ' || q[-2] == '\t' ||
+                   q[-2] == '\n' || q[-2] == '(' || q[-2] == '&' || q[-2] == '|';
+        return true;
+    }
+    return false;
+}
+
 static bool shell_try_dbracket_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!(s[0] == '[' && s[1] == '[' &&
@@ -34017,8 +34082,7 @@ static bool shell_try_dbracket_command(const char *src) {
             /* ...and only a `]]` that is a WORD: the one inside
              * `[[:space:]]+` is part of a regex (Oils 2173), and bash's
              * lexer closes the command at a whole-word `]]` only */
-            if (q[0] == ']' && q[1] == ']' &&
-                (q == s || q[-1] == ' ' || q[-1] == '\t' || q[-1] == '\n') &&
+            if (q[0] == ']' && q[1] == ']' && shell_dbr_close_at(s, q) &&
                 (q[2] == '\0' || q[2] == ' ' || q[2] == '\t' || q[2] == '\n' ||
                  q[2] == ';' || q[2] == '&' || q[2] == '|' || q[2] == ')' ||
                  q[2] == '<' || q[2] == '>')) {
@@ -34087,6 +34151,7 @@ static bool shell_try_dbracket_command(const char *src) {
         }
     }
     bool bad_re = d->bad_re;
+    const char *bad_msg = d->msg;
     shell_dbr_free(d);
     /* A REGEX THAT DOES NOT COMPILE IS STATUS 2, NOT A SYNTAX ERROR:
      * `[[ foo.py =~ * ]]` exits 2 in bash and the script continues. */
@@ -34101,7 +34166,8 @@ static bool shell_try_dbracket_command(const char *src) {
          * "unexpected token" to stderr, runs no more of the file, and exits
          * with the status it already had -- not 2, which is what setting a
          * status here would produce. */
-        kprintf(SH_PFX_TSH "[[: syntax error in conditional expression\n");
+        if (bad_msg) kprintf(SH_PFX_SHELL "%s\n", bad_msg);
+        else kprintf(SH_PFX_TSH "[[: syntax error in conditional expression\n");
         g_parse_error = true;   /* not an `exit` -- see g_parse_error */
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_EXIT;
@@ -36764,8 +36830,7 @@ static const char *shell_find_pipe_at(const char *s) {
          * this walker did not. */
         if (dbr) {
             /* the WORD `]]` closes it, not the end of `[[:space:]]` */
-            if (p[0] == ']' && p[1] == ']' &&
-                (p == start || p[-1] == ' ' || p[-1] == '\t') &&
+            if (p[0] == ']' && p[1] == ']' && shell_dbr_close_at(start, p) &&
                 (p[2] == '\0' || p[2] == ' ' || p[2] == '\t' || p[2] == ';' ||
                  p[2] == '&' || p[2] == '|' || p[2] == ')' || p[2] == '\n')) {
                 dbr = false;
