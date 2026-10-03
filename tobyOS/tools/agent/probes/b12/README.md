@@ -15,7 +15,7 @@ show (p49 p66 p67 p74 p80 print a pid in a job report and differ there only;
 p31 p77 print BASH/MACHTYPE and the environment order, which differ by
 design).
 
-The deterministic ones became shparity fixtures 220-255
+The deterministic ones became shparity fixtures 220-257
 (initrd/etc/shparity), one fixture per probe.
 
 ## Late in the batch: job notification, coprocess cleanup, redirections
@@ -42,6 +42,9 @@ the guest's put some reports in different places.
 t945/ (o945 is Oils 0945; t2-t5 variants) measure how soon bash sees a job
 the shell has just killed: on the guest, not at the next line read, but a
 line or two later; in WSL, later still.
+
+p113 globs words that only look like assignments (finding 54); p118
+puts `case` and `esac` where they are only words.
 
 wsib.c is a static Linux ELF (gcc -static in WSL): can a process reap its
 SIBLING with waitpid(pid)? Linux: ECHILD. This kernel said yes until this

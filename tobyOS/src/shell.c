@@ -36790,6 +36790,33 @@ static bool shell_word_boundary_before(const char *start, const char *p) {
     return p == start || is_space(p[-1]) || p[-1] == ';';
 }
 
+/* IS P WHERE A COMMAND MAY START -- the only place `case` and `esac` are
+ * reserved words. `x) echo case;;` and `x) echo esac;;` are arguments to
+ * echo in bash; counting them nested a case that was never opened ("case:
+ * expected 'esac'", status 2) or closed this one early (logs/b12 p118).
+ * Command position: the start of the text, or after a newline, `;`, `&`,
+ * `|`, `(`, `)` or `{`, or after then, do, else, elif, `!` or time. */
+static bool shell_case_cmd_pos(const char *start, const char *p) {
+    const char *b = p;
+    while (b > start && (b[-1] == ' ' || b[-1] == '\t')) b--;
+    if (b == start) return true;
+    char c = b[-1];
+    if (c == '\n' || c == '\r' || c == ';' || c == '&' || c == '|' ||
+        c == '(' || c == ')' || c == '{')
+        return true;
+    const char *w = b;
+    while (w > start && !is_space(w[-1]) && w[-1] != ';' && w[-1] != '&' &&
+           w[-1] != '|' && w[-1] != '(' && w[-1] != ')')
+        w--;
+    size_t n = (size_t)(b - w);
+    static const char *const kw[] = {
+        "then", "do", "else", "elif", "!", "time", 0
+    };
+    for (int i = 0; kw[i]; i++)
+        if (strlen(kw[i]) == n && strncmp(w, kw[i], n) == 0) return true;
+    return false;
+}
+
 static bool shell_word_boundary_after(const char *p) {
     return *p == '\0' || is_space(*p) || *p == ';' || *p == ')';
 }
@@ -37031,6 +37058,7 @@ static bool shell_try_case_command(const char *src) {
             const char *qs = shell_case_skip_quoted(q, qend);
             if (qs != q) { q = qs; continue; }
             if (!shell_word_boundary_before(in_at + 2, q)) continue;
+            if (!shell_case_cmd_pos(in_at + 2, q)) continue;
             if (shell_starts_with_word(q, "case")) { depth++; continue; }
             if (shell_starts_with_word(q, "esac")) {
                 /* `(esac)` is a PATTERN, not the terminator -- the paren
@@ -37120,7 +37148,8 @@ static bool shell_try_case_command(const char *src) {
             for (const char *q = body; *q && q < esac_at; q++) {
                 const char *qs = shell_case_skip_quoted(q, esac_at);
                 if (qs != q) { q = qs; continue; }
-                if (shell_word_boundary_before(body, q)) {
+                if (shell_word_boundary_before(body, q) &&
+                    shell_case_cmd_pos(body, q)) {
                     if (shell_starts_with_word(q, "case")) { cdepth++; continue; }
                     if (shell_starts_with_word(q, "esac")) {
                         if (cdepth > 0) cdepth--;
