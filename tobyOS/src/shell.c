@@ -3724,7 +3724,11 @@ static int env_set_kv(const char *kv_in) {
             }
         }
     }
-    if (shell_readonly_key(kv_in, klen)) {
+    /* An attribute-only entry (env_set_attr_holder) writes no value, so a
+     * readonly name may have one: `readonly r; export r` is declare -rx r
+     * in bash; tsh refused it as a write (logs/b12 p52, Oils 0385). */
+    if (shell_readonly_key(kv_in, klen) &&
+        !(g_env_attr_only && env_find(kv_in, klen) < 0)) {
         shell_readonly_print_error(kv_in, klen, "shell");
         return -1;
     }
@@ -7058,6 +7062,20 @@ static void cmd_local(int argc, char **argv) {
             return;
         }
     }
+    /* `local -p NAME...` PRINTS those NAMEs that are this function's locals
+     * and calls each other one "not found", status 1 (bash; logs/b12
+     * p51, Oils 0385) -- tsh called `-p` not a valid identifier and then
+     * tried to make the names local. */
+    if (argc > 2 && strcmp(argv[1], "-p") == 0) {
+        for (int i = 2; i < argc; i++) {
+            if (shell_local_declared_here(argv[i], g_script_depth) &&
+                shell_declare_print(argv[i]))
+                continue;
+            kprintf("local: %s: not found\n", argv[i]);
+            shell_set_status(1);
+        }
+        return;
+    }
     bool l_array = false, l_assoc = false, l_nameref = false;
     unsigned l_attr_on = 0;
     for (int i = 1; i < argc; i++) {
@@ -7912,7 +7930,14 @@ static void cmd_declare(int argc, char **argv) {
         for (; i < argc; i++) {
             const struct shell_function *fn = shell_function_lookup(argv[i]);
             if (!fn) { missing = true; continue; }
-            if (func_names) shell_printf("%s\n", fn->name);
+            /* under `shopt -s extdebug`, `declare -F NAME` gives the line
+             * and file the function was defined at: "add 7 /x/y.sh"
+             * (bash; Oils 0379) -- "main" when no file says */
+            if (func_names && g_shopt_misc[10])
+                shell_printf("%s %lu %s\n", fn->name,
+                             fn->lm_n > 0 ? fn->lm_line[0] : 0ul,
+                             fn->src ? fn->src : "main");
+            else if (func_names) shell_printf("%s\n", fn->name);
             else            shell_declare_print_function(fn);
         }
         if (missing) shell_set_status(1);
