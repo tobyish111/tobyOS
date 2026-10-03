@@ -24481,6 +24481,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
                         suffix[0] == ':') {
                         bool star = (sub[0] == '*');
+                        /* NO ELEMENTS, NO SLICE TO WORK OUT: bash returns
+                         * before it reads the offset or the length, so
+                         * `${b[@]:$(cmd)}` on b=() runs nothing (p17b). */
+                        {
+                            struct sh_array *sa0 = sh_array_find(nm);
+                            if (!sa0 || sa0->n == 0)
+                                return shell_append_array_slice(b, nm, star, 0, 0);
+                        }
                         SH_SB(spec);
                         if (sb_puts(&spec, suffix + 1) < 0) return -1;
                         char *colon = 0;
