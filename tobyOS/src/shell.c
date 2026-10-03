@@ -19418,80 +19418,7 @@ static void cmd_caller(int argc, char **argv) {
     shell_set_status(0);
 }
 
-/* ---- bind --------------------------------------------------------------
- * tsh has its own editor (programs/tsh/lineedit.c), not readline, so the
- * bindable set is the one that editor implements. The query forms answer
- * truthfully from that set; rebinding is not supported and says so instead
- * of accepting a binding it would never honour -- a `bind` that returns 0
- * and changes nothing is how a .inputrc silently stops working. */
-static const char *const g_bind_funcs[] = {
-    "beginning-of-line",      /* ^A */
-    "end-of-line",            /* ^E */
-    "backward-char",          /* ^B, Left */
-    "forward-char",           /* ^F, Right */
-    "previous-history",       /* ^P, Up */
-    "next-history",           /* ^N, Down */
-    "kill-line",              /* ^K */
-    "unix-line-discard",      /* ^U */
-    "unix-word-rubout",       /* ^W */
-    "yank",                   /* ^Y */
-    "backward-word",          /* ESC-b */
-    "forward-word",           /* ESC-f */
-    "delete-char",            /* ^D */
-    "backward-delete-char",   /* Backspace */
-    "complete",               /* Tab */
-    "reverse-search-history", /* ^R */
-    "accept-line",            /* Enter */
-    0
-};
-
-static void cmd_bind(int argc, char **argv) {
-    if (argc < 2) { shell_set_status(0); return; }
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "-l") == 0) {
-            for (int k = 0; g_bind_funcs[k]; k++)
-                shell_printf("%s\n", g_bind_funcs[k]);
-            shell_set_status(0);
-            return;
-        }
-        if (strcmp(a, "-p") == 0 || strcmp(a, "-P") == 0 ||
-            strcmp(a, "-s") == 0 || strcmp(a, "-S") == 0 ||
-            strcmp(a, "-v") == 0 || strcmp(a, "-V") == 0) {
-            /* Nothing is user-rebindable, so there are no bindings to dump
-             * beyond the built-in set -l already prints. */
-            shell_set_status(0);
-            return;
-        }
-        if (strcmp(a, "-q") == 0 && i + 1 < argc) {
-            const char *fn = argv[++i];
-            for (int k = 0; g_bind_funcs[k]; k++) {
-                if (strcmp(g_bind_funcs[k], fn) != 0) continue;
-                shell_printf("%s can be invoked via its default binding\n", fn);
-                shell_set_status(0);
-                return;
-            }
-            shell_printf("%s is not bound to any keys\n", fn);
-            shell_set_status(0);
-            return;
-        }
-        if (strcmp(a, "-m") == 0 && i + 1 < argc) { i++; continue; }
-        if (strcmp(a, "-f") == 0 && i + 1 < argc) {
-            kprintf("bind: -f: reading an inputrc is not supported\n");
-            shell_set_status(1);
-            return;
-        }
-        if (a[0] == '-') {
-            kprintf("bind: %s: invalid option\n", a);
-            shell_set_status(2);
-            return;
-        }
-        kprintf("bind: rebinding is not supported (see `bind -l`)\n");
-        shell_set_status(1);
-        return;
-    }
-    shell_set_status(0);
-}
+static void cmd_bind(int argc, char **argv);   /* shell_readline.inc */
 
 static void cmd_complete(int argc, char **argv);
 static void cmd_compgen(int argc, char **argv);
@@ -36908,6 +36835,7 @@ int shell_set_param0_hosted(const char *name) {
     return shell_set_param0(name);
 }
 
+#include "shell_readline.inc"
 #include "shell_complete.inc"
 
 /* The hosted line editor's seam to the builtin table. */

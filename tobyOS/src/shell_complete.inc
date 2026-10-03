@@ -286,54 +286,6 @@ static void sh_bash_signame(int n, char *buf, size_t cap) {
     else buf[0] = '\0';
 }
 
-/* readline's bindable function names (rl_funmap_names: sorted), as the
- * guest's bash lists them for `compgen -A binding` before line editing
- * has been initialised. */
-static const char *const g_rl_funmap_names[] = {
-    "abort", "accept-line", "arrow-key-prefix", "backward-byte",
-    "backward-char", "backward-delete-char", "backward-kill-line",
-    "backward-kill-word", "backward-word", "beginning-of-history",
-    "beginning-of-line", "bracketed-paste-begin", "call-last-kbd-macro",
-    "capitalize-word", "character-search", "character-search-backward",
-    "clear-display", "clear-screen", "complete", "copy-backward-word",
-    "copy-forward-word", "copy-region-as-kill", "delete-char",
-    "delete-char-or-list", "delete-horizontal-space", "digit-argument",
-    "do-lowercase-version", "downcase-word", "dump-functions", "dump-macros",
-    "dump-variables", "emacs-editing-mode", "end-kbd-macro", "end-of-history",
-    "end-of-line", "exchange-point-and-mark", "fetch-history",
-    "forward-backward-delete-char", "forward-byte", "forward-char",
-    "forward-search-history", "forward-word", "history-search-backward",
-    "history-search-forward", "history-substring-search-backward",
-    "history-substring-search-forward", "insert-comment",
-    "insert-completions", "kill-line", "kill-region", "kill-whole-line",
-    "kill-word", "menu-complete", "menu-complete-backward", "next-history",
-    "next-screen-line", "non-incremental-forward-search-history",
-    "non-incremental-forward-search-history-again",
-    "non-incremental-reverse-search-history",
-    "non-incremental-reverse-search-history-again", "old-menu-complete",
-    "operate-and-get-next", "overwrite-mode", "possible-completions",
-    "previous-history", "previous-screen-line", "print-last-kbd-macro",
-    "quoted-insert", "re-read-init-file", "redraw-current-line",
-    "reverse-search-history", "revert-line", "self-insert", "set-mark",
-    "skip-csi-sequence", "start-kbd-macro", "tab-insert", "tilde-expand",
-    "transpose-chars", "transpose-words", "tty-status", "undo",
-    "universal-argument", "unix-filename-rubout", "unix-line-discard",
-    "unix-word-rubout", "upcase-word", "vi-append-eol", "vi-append-mode",
-    "vi-arg-digit", "vi-bWord", "vi-back-to-indent", "vi-backward-bigword",
-    "vi-backward-word", "vi-bword", "vi-change-case", "vi-change-char",
-    "vi-change-to", "vi-char-search", "vi-column", "vi-complete",
-    "vi-delete", "vi-delete-to", "vi-eWord", "vi-editing-mode",
-    "vi-end-bigword", "vi-end-word", "vi-eof-maybe", "vi-eword", "vi-fWord",
-    "vi-fetch-history", "vi-first-print", "vi-forward-bigword",
-    "vi-forward-word", "vi-fword", "vi-goto-mark", "vi-insert-beg",
-    "vi-insertion-mode", "vi-match", "vi-movement-mode", "vi-next-word",
-    "vi-overstrike", "vi-overstrike-delete", "vi-prev-word", "vi-put",
-    "vi-redo", "vi-replace", "vi-rubout", "vi-search", "vi-search-again",
-    "vi-set-mark", "vi-subst", "vi-tilde-expand", "vi-undo",
-    "vi-unix-word-rubout", "vi-yank-arg", "vi-yank-pop", "vi-yank-to",
-    "yank", "yank-last-arg", "yank-nth-arg", "yank-pop", 0
-};
-
 /* ---- the generators ----------------------------------------------------- */
 
 /* A variable bash lists: set, or declared with a value (NOVALUE is bash's
@@ -703,7 +655,7 @@ static void comp_gen_actions(struct sh_strv *ret, unsigned long acts,
     do { if (acts & (flag)) { fill; comp_prefix_filter(ret, &all, t); sv_free(&all); } } while (0)
     COMP_ITEMS(CA_ALIAS, comp_collect_aliases(&all));
     COMP_ITEMS(CA_ARRAYVAR, comp_collect_vars(&all, false, true));
-    COMP_ITEMS(CA_BINDING, for (int i = 0; g_rl_funmap_names[i]; i++) (void)sv_add(&all, g_rl_funmap_names[i]));
+    COMP_ITEMS(CA_BINDING, rl_funmap_names(&all));
     COMP_ITEMS(CA_BUILTIN, comp_collect_builtins(&all, 0));
     COMP_ITEMS(CA_DISABLED, comp_collect_builtins(&all, 2));
     COMP_ITEMS(CA_ENABLED, comp_collect_builtins(&all, 1));
