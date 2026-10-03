@@ -2197,12 +2197,18 @@ static bool shell_nameref_element(const char *target, struct shell_sb *name,
  * stage, $( ) -- the command is in; tsh had no such variable. */
 /* ...and BASH_COMMAND: the command being run, as bash prints it (see
  * shell_bashcmd_set). tsh had none. */
+/* ...and COMP_WORDBREAKS, readline's word breaks: bash makes it dynamic
+ * (get_comp_wordbreaks), so it has no value until read -- `set` leaves it
+ * out and `declare -p` lists it bare (logs/b12 p89); assigning sets the
+ * breaks completion uses. */
 enum { DV_RANDOM, DV_SRANDOM, DV_SECONDS, DV_EPOCHSECONDS, DV_EPOCHREALTIME,
        DV_BASHPID, DV_BASH_ARGV0, DV_HISTCMD, DV_BASH_SUBSHELL, DV_BASH_COMMAND,
-       DV_COUNT };
+       DV_COMP_WORDBREAKS, DV_COUNT };
 static const char *const g_dynvar_names[DV_COUNT] = {
     "RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME",
-    "BASHPID", "BASH_ARGV0", "HISTCMD", "BASH_SUBSHELL", "BASH_COMMAND" };
+    "BASHPID", "BASH_ARGV0", "HISTCMD", "BASH_SUBSHELL", "BASH_COMMAND",
+    "COMP_WORDBREAKS" };
+static char *g_comp_wordbreaks;            /* assigned breaks, 0: readline's */
 static const char *shell_bashcmd_value(void);
 static bool     g_dynvar_gone[DV_COUNT];   /* unset: no longer special */
 static uint32_t g_rand_seed;               /* bash's rseed */
@@ -2238,7 +2244,7 @@ static uint32_t shell_random_u32(void) {
 
 static int shell_dynvar_index(const char *key, size_t klen) {
     if (key[0] != 'R' && key[0] != 'S' && key[0] != 'E' && key[0] != 'B' &&
-        key[0] != 'H')
+        key[0] != 'H' && key[0] != 'C')
         return -1;
     for (int i = 0; i < DV_COUNT; i++)
         if (strlen(g_dynvar_names[i]) == klen &&
@@ -2338,6 +2344,8 @@ static const char *shell_dynvar_compute(int dv) {
         return b;
     case DV_BASH_COMMAND:
         return shell_bashcmd_value();
+    case DV_COMP_WORDBREAKS:
+        return g_comp_wordbreaks ? g_comp_wordbreaks : " \t\n\"'@><=;|&(:";
     case DV_HISTCMD:
         ksnprintf(b, cap, "%lu", g_opt_history && g_hist_count > 0
                                      ? (unsigned long)(g_hist_base + (unsigned long)g_hist_count)
@@ -2375,6 +2383,9 @@ static void shell_dynvar_assign(int dv, const char *val) {
         g_seconds_from = (int64_t)(shell_dynvar_realtime_ns() / 1000000000ull);
     } else if (dv == DV_BASH_ARGV0) {
         (void)shell_set_param0(val);
+    } else if (dv == DV_COMP_WORDBREAKS) {
+        kfree(g_comp_wordbreaks);
+        g_comp_wordbreaks = shell_strdup(val);
     }
 }
 
@@ -4014,7 +4025,7 @@ static void shell_init_bash_vars(const char *self) {
                      "/usr/pkg/lib/bash:/opt/pkg/lib/bash:.");
     shell_set_if_not("OPTERR", "1");
     shell_set_if_not("PS4", "+ ");
-    shell_set_if_not("COMP_WORDBREAKS", " \t\n\"'@><=;|&(:");
+    /* COMP_WORDBREAKS is dynamic: see DV_COMP_WORDBREAKS */
     {
         /* adjust_shell_level(1): a number inherited goes up by one, and
          * anything else -- unset, empty, not a number, negative -- starts
