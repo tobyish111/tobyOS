@@ -22121,7 +22121,17 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
         cmd.p[cpos++] = *p++;
     }
     if (*p != '`') {
-        kprintf(SH_PFX_SHELL "unmatched backquote\n");
+        /* bash's expansion error, status 1 and the line dropped: "bad
+         * substitution: no closing "`" in `-", from the backquote to the
+         * word's end -- as a brace range through '`' makes one (Oils
+         * 0602). tsh said "unmatched backquote" and exited 2. */
+        const char *bq = *pp, *e = bq + 1;
+        while (*e && *e != ' ' && *e != '\t' && *e != '\n' && *e != ';' &&
+               *e != '&' && *e != '|' && *e != '<' && *e != '>')
+            e++;
+        kprintf("bad substitution: no closing \"`\" in %.*s\n", (int)(e - bq), bq);
+        shell_set_status(1);
+        g_bad_subst_soft = true;
         return -1;
     }
     p++;
