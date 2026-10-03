@@ -491,6 +491,19 @@ static struct file **g_shell_fd = g_shell_fd_base;
 static int g_shell_fd_cap = SHELL_FD_BASE;
 
 /* Room in the shell's table for descriptor `fd`. New slots are empty. */
+/* THE COPROCESS (coproc). One at a time, as bash is built
+ * (MULTIPLE_COPROCS off): its pid and name, and the shell's two ends --
+ * the descriptor it reads the coprocess's output from and the one it
+ * writes the coprocess's input to. Those two are close-on-exec, as bash
+ * makes them: a program the shell runs does not inherit them. */
+struct shell_coproc {
+    int pid;                    /* 0: none */
+    char *name;
+    int rfd, wfd;               /* shell descriptors, -1 when closed */
+    struct file *rf, *wf;
+};
+static struct shell_coproc g_coproc = { 0, 0, -1, -1, 0, 0 };
+
 static bool shell_fd_table_reserve(int fd) {
     if (fd < g_shell_fd_cap) return true;
     if (fd >= SHELL_FD_LIMIT) return false;
@@ -1503,7 +1516,11 @@ struct bgstat { int pid; int code; };
 static struct bgstat *g_bgstats;
 static int g_bgstat_n, g_bgstat_cap;
 
+static void shell_coproc_dispose(void);
+
 static void shell_bgstat_add(int pid, int code) {
+    /* a reaped coprocess takes its variables and descriptors with it */
+    if (g_coproc.pid > 0 && pid == g_coproc.pid) shell_coproc_dispose();
     for (int k = 0; k < g_bgstat_n; k++)
         if (g_bgstats[k].pid == pid) { g_bgstats[k].code = code; return; }
     if (g_bgstat_n >= g_bgstat_cap) {
@@ -10405,7 +10422,7 @@ static bool shell_word_is_keyword(const char *name) {
     static const char *const kw[] = {
         "if", "then", "else", "elif", "fi", "case", "esac", "for",
         "select", "while", "until", "do", "done", "in", "function",
-        "time", "{", "}", "!", "[[", "]]", 0 };
+        "time", "{", "}", "!", "[[", "]]", "coproc", 0 };
     for (int k = 0; kw[k]; k++)
         if (strcmp(name, kw[k]) == 0) return true;
     return false;
@@ -13661,6 +13678,11 @@ struct shell_scan {
     bool func_hdr;      /* the text so far ends in `name ( )`, body still owed */
     bool func_kw;       /* the last token was the reserved word `function`:
                          * the next word is a NAME, whatever it spells */
+    /* `coproc`: 1 right after the reserved word, 2 after `coproc WORD`.
+     * In both places bash reads a reserved word (parse.y's
+     * reserved_word_acceptable: last token WORD, the one before COPROC), so
+     * `coproc NAME { ...; }` and `coproc NAME ( ... )` open a compound. */
+    unsigned char coproc_kw;
     bool bad_paren;     /* a `(` that cannot legally be there -- see below */
     /* Inside `name=( ... )`. NOT the same as being inside a subshell:
      * an array literal takes WORDS, so a control operator there is a
@@ -13717,6 +13739,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->redir = false;
     st->func_hdr = false;
     st->func_kw = false;
+    st->coproc_kw = 0;
     st->bad_paren = false;
     st->in_array_lit = false;
     st->array_lit_depth = 0;
@@ -13998,6 +14021,11 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * where no command may start: the arithmetic for loop (1638-1646). */
         bool arith_for = st->for_head;
         st->for_head = false;
+        if (st->coproc_kw == 2) {          /* `coproc NAME ( ... )` */
+            st->cmd_pos = true;
+            st->prev_word_cmd = false;
+        }
+        st->coproc_kw = 0;
         if ((st->cmd_pos || arith_for) && p[1] == '(') {
             int depth = 0;
             bool sq = false, dq = false;
@@ -14500,6 +14528,25 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
      * either: the word's head was already counted on its own line. */
     if (resumed_quote) return;
 
+    /* After `coproc` the word is a NAME or the command; after `coproc NAME`
+     * a compound command may start. tsh had no `coproc` here: `coproc NAMED
+     * { read x; echo "$x"; }` was cut at its first `;` (logs/b12 p80). */
+    {
+        unsigned char ck = st->coproc_kw;
+        st->coproc_kw = 0;
+        bool opener = (n == 1 && w[0] == '{') ||
+                      (n == 2 && w[0] == '[' && w[1] == '[') ||
+                      shell_word_eq(w, n, "if") || shell_word_eq(w, n, "while") ||
+                      shell_word_eq(w, n, "until") || shell_word_eq(w, n, "for") ||
+                      shell_word_eq(w, n, "case") || shell_word_eq(w, n, "select");
+        if (ck == 1 && st->cmd_pos && !opener) st->coproc_kw = 2;
+        if (ck == 2 && opener) {
+            st->cmd_pos = true;
+            st->prev_word_cmd = false;
+            st->assign_prefix = false;
+        }
+    }
+
     /* `function NAME`: this word is the NAME (bash takes any word there --
      * `function ble/is-array`, `function test-suffixes`), and a body or a
      * `( )` comes next, on this line or a later one. Exactly the state the
@@ -14628,6 +14675,12 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     if (resv && shell_word_eq(w, n, "function")) {
         st->func_kw = true;
         st->cmd_pos = false; st->prev_word_cmd = false;
+        st->no_sep = true;
+        return;
+    }
+    if (resv && shell_word_eq(w, n, "coproc")) {
+        st->coproc_kw = 1;
+        st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = true;
         return;
     }
@@ -31638,6 +31691,10 @@ static int shell_fd_state_extra(const struct shell_fd_state *st,
     if (st) {
         for (int i = 3; i < st->n && n < max; i++) {
             if (!st->fd[i]) continue;
+            /* close-on-exec: the coprocess's ends (see g_coproc) */
+            if ((i == g_coproc.rfd && st->fd[i] == g_coproc.rf) ||
+                (i == g_coproc.wfd && st->fd[i] == g_coproc.wf))
+                continue;
             out[n].fd = i;
             out[n].f  = st->fd[i];
             n++;
@@ -38534,6 +38591,204 @@ static bool shell_tok_is_bang(const char *s) {
     return seen;
 }
 
+/* coproc_unsetvars + coproc_close: NAME_PID and NAME go, and the shell's
+ * ends are closed if they are still the ones the coprocess was given. */
+static void shell_coproc_dispose(void) {
+    if (g_coproc.name) {
+        SH_SB(pv);
+        if (sb_puts(&pv, g_coproc.name) == 0 && sb_puts(&pv, "_PID") == 0) {
+            int ix = env_find(pv.p, pv.len);
+            if (ix >= 0 && !shell_readonly_key(pv.p, pv.len)) env_remove_at(ix);
+        }
+        size_t nl = strlen(g_coproc.name);
+        if (!shell_readonly_key(g_coproc.name, nl)) {
+            sh_array_unset(g_coproc.name);
+            int ix = env_find(g_coproc.name, nl);
+            if (ix >= 0) env_remove_at(ix);
+        }
+        kfree(g_coproc.name);
+    }
+    if (g_coproc.rfd >= 0 && g_coproc.rfd < g_shell_fd_cap &&
+        g_shell_fd[g_coproc.rfd] == g_coproc.rf && g_coproc.rf) {
+        file_close(g_coproc.rf);
+        g_shell_fd[g_coproc.rfd] = 0;
+    }
+    if (g_coproc.wfd >= 0 && g_coproc.wfd < g_shell_fd_cap &&
+        g_shell_fd[g_coproc.wfd] == g_coproc.wf && g_coproc.wf) {
+        file_close(g_coproc.wf);
+        g_shell_fd[g_coproc.wfd] = 0;
+    }
+    g_coproc.pid = 0;
+    g_coproc.name = 0;
+    g_coproc.rfd = g_coproc.wfd = -1;
+    g_coproc.rf = g_coproc.wf = 0;
+}
+
+#ifdef SHELL_HOSTED
+extern int  fork(void);
+extern void _exit(int status);
+static void shell_trap_clear_caught(void);
+static void jobs_forget_all(void);
+#endif
+
+#ifdef SHELL_HOSTED
+/* Is shell descriptor FD free for the coprocess -- not in the table and
+ * not a live process substitution's? */
+static bool shell_coproc_fd_free(int fd) {
+    if (fd < g_shell_fd_cap && g_shell_fd[fd]) return false;
+    for (int i = 0; i < g_procsub_n; i++)
+        if (g_procsub[i].keep && g_procsub[i].fd == fd) return false;
+    return true;
+}
+#endif
+
+/* `coproc [NAME] COMMAND` -- bash's execute_coproc. tsh had none: `coproc
+ * cat` ran a program called coproc (logs/b12 p76). NAME is given only
+ * before a compound command; a simple command's coprocess is COPROC. The
+ * coprocess reads the pipe the shell writes to and writes the one the
+ * shell reads; the shell's ends sit at the highest free descriptors below
+ * 64 in the order bash's sh_openpipe takes them (read 63, write 60 when
+ * nothing else is open there), close-on-exec, in NAME[0] and NAME[1], with
+ * NAME_PID the pid -- all of which goes when it is reaped. A coprocess that
+ * still holds its descriptors is replaced with bash's warning. */
+static bool shell_try_coproc(const char *src) {
+    const char *s = shell_skip_blanks(src);
+    if (!shell_starts_with_word(s, "coproc")) return false;
+    const char *rest = shell_skip_blanks(s + 6);
+    if (!*rest) return false;                /* `coproc` alone: a word */
+    /* NAME: a word followed by a compound command */
+    SH_SB(name);
+    const char *cmd = rest;
+    {
+        const char *we = rest;
+        while (*we && *we != ' ' && *we != '\t' && *we != '\n' && *we != ';' &&
+               *we != '&' && *we != '|' && *we != '<' && *we != '>' &&
+               *we != '(' && *we != ')')
+            we++;
+        const char *after = shell_skip_blanks(we);
+        static const char *const kw[] = {
+            "{", "if", "while", "until", "for", "case", "select", "[[", 0
+        };
+        bool compound_after = (*after == '(');
+        for (int k = 0; !compound_after && kw[k]; k++)
+            if (shell_starts_with_word(after, kw[k])) compound_after = true;
+        bool compound_here = (*rest == '(');
+        for (int k = 0; !compound_here && kw[k]; k++)
+            if (shell_starts_with_word(rest, kw[k])) compound_here = true;
+        if (!compound_here && we > rest && compound_after) {
+            if (sb_putmem(&name, rest, (size_t)(we - rest)) < 0) return true;
+            cmd = after;
+        }
+    }
+    if (!name.len && sb_puts(&name, "COPROC") < 0) return true;
+    if (!shell_name_is_valid(name.p, name.len)) {
+        kprintf("`%s': not a valid identifier\n", name.p);
+        shell_set_status(1);
+        return true;
+    }
+#ifndef SHELL_HOSTED
+    (void)cmd;
+    kprintf("coproc: not available in the kernel shell\n");
+    shell_set_status(1);
+    return true;
+#else
+    if (g_coproc.pid > 0 && (g_coproc.rfd >= 0 || g_coproc.wfd >= 0))
+        kprintf("warning: execute_coproc: coproc [%d:%s] still exists\n",
+                g_coproc.pid, g_coproc.name ? g_coproc.name : "");
+    /* coproc_init: the old one is forgotten, its descriptors left open */
+    kfree(g_coproc.name);
+    g_coproc.pid = 0;
+    g_coproc.name = 0;
+    g_coproc.rfd = g_coproc.wfd = -1;
+    g_coproc.rf = g_coproc.wf = 0;
+
+    struct file *rr = 0, *rw = 0, *wr = 0, *ww = 0;   /* rpipe, wpipe */
+    if (pipe_create(&rr, &rw) != 0) {
+        kprintf("coproc: cannot make a pipe\n");
+        shell_set_status(1);
+        return true;
+    }
+    if (pipe_create(&wr, &ww) != 0) {
+        file_close(rr); file_close(rw);
+        kprintf("coproc: cannot make a pipe\n");
+        shell_set_status(1);
+        return true;
+    }
+    int pid = fork();
+    if (pid < 0) {
+        file_close(rr); file_close(rw); file_close(wr); file_close(ww);
+        kprintf("coproc: cannot fork\n");
+        shell_set_status(1);
+        return true;
+    }
+    if (pid == 0) {
+        /* the coprocess: a subshell reading wpipe, writing rpipe */
+        file_close(rr);
+        file_close(ww);
+        g_shell_fd[0] = wr;
+        g_shell_fd[1] = rw;
+        shell_trap_clear_caught();
+        jobs_forget_all();
+        g_subshell_depth++;
+        execute_line_text(cmd);
+        int st = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+        shell_host_builtin_done();
+        _exit(st & 0xff);
+    }
+    file_close(rw);
+    file_close(wr);
+    /* sh_openpipe's numbers: the four highest free below 64, in order;
+     * the shell keeps the first (read) and the last (write) */
+    int fds[4], nf = 0;
+    for (int fd = 63; fd > 3 && nf < 4; fd--)
+        if (shell_coproc_fd_free(fd)) fds[nf++] = fd;
+    int rfd = nf >= 1 ? fds[0] : -1, wfd = nf >= 4 ? fds[3] : (nf ? fds[nf - 1] : -1);
+    if (rfd < 0 || wfd < 0 || rfd == wfd || !shell_fd_table_reserve(rfd) ||
+        !shell_fd_table_reserve(wfd)) {
+        file_close(rr); file_close(ww);
+        kprintf("coproc: no descriptor free\n");
+        shell_set_status(1);
+        return true;
+    }
+    g_shell_fd[rfd] = rr;
+    g_shell_fd[wfd] = ww;
+    g_coproc.pid = pid;
+    g_coproc.name = shell_strdup(name.p);
+    g_coproc.rfd = rfd;
+    g_coproc.wfd = wfd;
+    g_coproc.rf = rr;
+    g_coproc.wf = ww;
+    g_last_bg_pid = pid;
+    /* coproc_setvars: NAME=(rfd wfd), NAME_PID */
+    if (shell_readonly_key(name.p, name.len)) {
+        shell_readonly_print_error(name.p, name.len, "shell");
+    } else {
+        char nb[24];
+        sh_array_unset(name.p);
+        ksnprintf(nb, sizeof nb, "%d", rfd);
+        (void)sh_array_set(name.p, 0, nb);
+        ksnprintf(nb, sizeof nb, "%d", wfd);
+        (void)sh_array_set(name.p, 1, nb);
+        SH_SB(pv);
+        if (sb_puts(&pv, name.p) == 0 && sb_puts(&pv, "_PID") == 0) {
+            ksnprintf(nb, sizeof nb, "%d", pid);
+            (void)env_set(pv.p, nb);
+        }
+    }
+    {
+        /* a job, named as bash prints the command: "coproc COPROC cat" */
+        /* from the text as written: printing `coproc cat` gives the
+         * default name back, "coproc COPROC cat" */
+        char *pn = shell_print_text(s, SHPR_COMMAND, 0);
+        jobs_add(pid, pn ? pn : s);
+        kfree(pn);
+    }
+    shell_set_status(0);
+    return true;
+#endif
+}
+
 /* `time`'s report, as bash's print_formatted_time writes it: $TIMEFORMAT,
  * or bash's own "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS", or with -p the
  * POSIX "real %2R\nuser %2U\nsys %2S"; %[p][l]R U S, %P, %%. An empty
@@ -38637,6 +38892,8 @@ static void execute_line_text_inner(const char *src) {
         return;
     }
     if (shell_run_list_line(src)) return;
+
+    if (shell_try_coproc(src)) return;
 
     /* `time` IS A RESERVED WORD, NOT A PROGRAM.
      *
