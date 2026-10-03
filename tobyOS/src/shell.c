@@ -21743,6 +21743,7 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
     if (strcmp(name, "?") == 0) {
         rc = sb_put_uint(out, (unsigned long)g_last_status);
     } else if (strcmp(name, "!") == 0) {
+        if (g_last_bg_pid <= 0) { *is_set = false; return 0; }   /* no job yet */
         rc = sb_put_uint(out, (unsigned long)g_last_bg_pid);
     } else if (strcmp(name, "$") == 0) {
         /* The SHELL's pid, as plain $$ is: see shell_init_hosted (S13). */
@@ -23284,6 +23285,27 @@ static int shell_expand_posargs_op(const char *expr, struct shell_sb *b, int *rc
     return 1;
 }
 
+/* Does NAME have a value at all -- a set scalar, or an array (even an
+ * empty one)? A name only declared (`declare -A A`, `local x`) has none,
+ * as bash's invisible variables have none. */
+static bool shell_var_has_value(const char *nm) {
+    int ix = env_find(nm, strlen(nm));
+    if (ix >= 0 && (g_env_flags[ix] & SHVAR_NOVALUE)) return false;
+    return sh_array_find(nm) != 0 || ix >= 0;
+}
+
+/* set -u on an array reference: "NAME[SUB]: unbound variable", or the
+ * bare NAME, and the expansion fails (shell_arith_unbound's rules). */
+static int shell_unbound_ref(const char *nm, const char *sub, size_t slen) {
+    SH_SB(m);
+    if (sb_puts(&m, nm) < 0) return -1;
+    if (sub && (sb_putc(&m, '[') < 0 || sb_putmem(&m, sub, slen) < 0 ||
+                sb_putc(&m, ']') < 0))
+        return -1;
+    shell_arith_unbound(m.p);
+    return -1;
+}
+
 static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b) {
     {
         int prc = 0;
@@ -23618,6 +23640,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         suffix[0] == '\0') {
                         bool star = (sub[0] == '*');
                         if (count) {                 /* ${#a[@]} -- COUNT */
+                            if (g_opt_nounset && !shell_var_has_value(nm))
+                                return shell_unbound_ref(nm, 0, 0);
                             struct sh_array *a = sh_array_find(nm);
                             return sb_put_uint(b, (unsigned long)(a ? a->n : 0));
                         }
@@ -23647,8 +23671,13 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                                 if (sb_set(&kbuf, kj.p) < 0) return -1;
                             }
                             const char *v = sh_array_get_key(nm, kbuf.p);
-                            if (count)
+                            if (count) {
+                                if (g_opt_nounset && !shell_var_has_value(nm))
+                                    return shell_unbound_ref(nm, 0, 0);
                                 return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
+                            }
+                            if (!v && g_opt_nounset)
+                                return shell_unbound_ref(nm, sub, slen);
                             if (!v) return 0;
                             return sb_put_data_str(b, v);
                         }
@@ -23670,6 +23699,13 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                              * after counting back is "SUB]: bad array
                              * subscript" and an expansion ERROR -- the line
                              * is discarded, status 1. */
+                            /* set -u: bash's array_length_reference wants
+                             * an array with a value -- a scalar, a name only
+                             * declared, or none at all is "NAME: unbound
+                             * variable" */
+                            if (g_opt_nounset && (!sh_array_find(nm) ||
+                                                  !shell_var_has_value(nm)))
+                                return shell_unbound_ref(nm, 0, 0);
                             if (!sh_array_find(nm) && !env_get(nm))
                                 return sb_put_uint(b, 0);
                             long cv = 0;
@@ -23699,6 +23735,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         /* A SCALAR IS ELEMENT 0 OF ITSELF: `s=str` makes
                          * ${s[0]} "str" and ${#s[0]} 3 -- tsh read nothing. */
                         if (!v && idx == 0 && !sh_array_find(nm)) v = env_get(nm);
+                        if (!v && g_opt_nounset)
+                            return shell_unbound_ref(nm, sub, slen);
                         if (!v) return 0;            /* unset element: empty */
                         return sb_put_data_str(b, v);
                     }
@@ -23741,6 +23779,30 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
     bool colon = false;
     char opch = '\0';
     const char *word = "";
+    /* SET -U IS EVERY EXPANSION OF AN UNSET NAME but the ones that ASK
+     * whether it is set -- `-` `=` `?` `+`, with or without a colon:
+     *
+     *     set -u; echo ${#u}  ${u/x/y}  ${u:1}  ${u@Q}  ${u#x}  ${u^}
+     *     bash: "u: unbound variable" for each      tsh: 0, then empties
+     *
+     * tsh checked only the bare ${u} (Oils 2435 2447 2451 2484). `$@` and
+     * `$*` are never unbound. */
+    bool at_or_star = (name[0] == '@' || name[0] == '*') && name[1] == '\0';
+    /* A dynamic variable is always set -- and reading it here would draw
+     * RANDOM twice. */
+    if (g_opt_nounset && !at_or_star && shell_dynvar_index(name, strlen(name)) < 0) {
+        const char *t = op[0] == ':' ? op + 1 : op;
+        bool tests = *op && (*t == '-' || *t == '=' || *t == '?' || *t == '+');
+        if (!tests) {
+            SH_SB(probe);
+            bool pset = false, pjoin = false;
+            if (shell_parameter_value(name, &probe, &pset, &pjoin) < 0) return -1;
+            if (!pset) {
+                shell_arith_unbound(shell_param_display(name));
+                return -1;
+            }
+        }
+    }
     if (*op) {
         /* ${v@op} -- a ONE-LETTER TRANSFORM of the value, and the only
          * operator here that is a single character with nothing after it. */
@@ -24098,6 +24160,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         is_null = (text == 0 && marks <= 1);
     }
 
+    if (length_mode && at_or_star)          /* ${#@} ${#*}: $#, bash's rule */
+        return sb_put_uint(b, (unsigned long)g_positional_count);
     if (length_mode) {
         /* ${#x} COUNTS CHARACTERS, AND AN ESCAPE IS NOT ONE. A value that
          * reached here through an expansion may carry SHELL_DATA_ESC in front
@@ -24688,6 +24752,12 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
     if (*p == '!') {
         p++;
         *pp = p;
+        /* No background job yet: $! is UNSET -- empty, and under set -u
+         * "$!: unbound variable" (bash). tsh printed 0. */
+        if (g_last_bg_pid <= 0) {
+            if (g_opt_nounset) { shell_arith_unbound("$!"); return -1; }
+            return 0;
+        }
         return sb_put_uint(b, (unsigned long)g_last_bg_pid);
     }
     if (*p == '$') {
@@ -24741,6 +24811,11 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
         }
         if (idx <= g_positional_count) {
             return sb_put_data_str(b, g_positional[idx - 1]);
+        }
+        if (g_opt_nounset) {            /* bash names it with its `$` */
+            char nm[4] = { '$', (char)('0' + idx), 0, 0 };
+            shell_arith_unbound(nm);
+            return -1;
         }
         return 0;
     }
