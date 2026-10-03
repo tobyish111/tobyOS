@@ -32786,9 +32786,15 @@ static int shell_copy_segment_sb(struct shell_sb *dst,
     if (!dst || !start || !end || end < start) return -1;
     while (start < end && (*start == ' ' || *start == '\t' || *start == ';'))
         start++;
+    /* ...but not an ESCAPED `;` or blank: `[[ ';' =~ \; ]]` lost its `;`
+     * here and handed the regex a lone backslash (status 2; Oils 2173) */
     while (end > start &&
-           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == ';'))
+           (end[-1] == ' ' || end[-1] == '\t' || end[-1] == ';')) {
+        size_t bs = 0;
+        for (const char *b = end - 1; b > start && b[-1] == '\\'; b--) bs++;
+        if (bs % 2) break;
         end--;
+    }
     sb_truncate(dst, 0);
     return sb_putmem(dst, start, (size_t)(end - start));
 }
