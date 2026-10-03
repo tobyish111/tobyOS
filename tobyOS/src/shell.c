@@ -1255,6 +1255,7 @@ static int   sh_array_literal_commit(const char *tmp, const char *name,
  * expander and the marker cleanup 12k lines below. */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
+static bool g_expand_literal_ifs_data;      /* see shell_expand_word_ex */
 static void shell_bad_subst(bool fatal);
 static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
@@ -2835,6 +2836,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         }
         {
             SH_SB(ex);
+            g_expand_literal_ifs_data = true;   /* its written text never splits */
             if (shell_expand_word_ex(elem, &ex, true, true) < 0)
                 return -1;
             /* A leading `~` on an UNQUOTED element expands, the same way
@@ -21635,13 +21637,27 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
  * needs a "do not split this span" marker through the splitter, the way
  * SHELL_ARG_MARK carries "$@" word boundaries; quote REMOVAL is correct on its
  * own and is what most of these expansions actually need. */
+/* Set by the array-literal expander for ONE call: the element's own
+ * unquoted characters are written text, and written text is never a field
+ * delimiter (POSIX 2.6.5 splits only what expansion produced):
+ *
+ *     IFS=:; a=(x:y); echo ${#a[@]}      bash: 1   tsh: 2
+ *
+ * The command-word reader wraps its literal runs in no-split marks for the
+ * same reason; an element comes here as written. Taken and cleared on
+ * entry, so the substitutions inside the word never see it. */
+static bool g_expand_literal_ifs_data;
+
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                bool dq_syntax, bool sq_syntax) {
     const char *p = word ? word : "";
     if (!out) return -1;
     sb_truncate(out, 0);
+    bool lit_ifs_data = g_expand_literal_ifs_data;
+    g_expand_literal_ifs_data = false;
 
     while (*p) {
+        bool escaped = false;           /* the byte below already carries one */
         /* `$'...'` IS ANSI-C QUOTING, and it is recognised inside a `${...}`
          * word even where a plain `'...'` is not:
          *
@@ -21771,11 +21787,26 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                  * again by shell_strip_glob_escapes at the end of word
                  * processing, so nothing else can observe it. */
                 p++;              /* unquoted word: escape, next byte literal */
+                /* ...AND NEVER A FIELD BOUNDARY. An escaped byte is quoted:
+                 *
+                 *     set -- ${u:-a\ b}          bash: 1 word   tsh: 2
+                 *     IFS=:; a=(x\:y)            bash: x:y      tsh: x y
+                 *
+                 * The command-word reader wraps its literal runs in
+                 * no-split marks, but a default value and an array element
+                 * come here as they were written, and the escaped blank or
+                 * IFS byte split. SHELL_DATA_ESC is what the splitters
+                 * already step over (and what shell_strip_glob_escapes
+                 * removes); a glob metacharacter keeps the escape the
+                 * matcher reads. */
                 if (*p == '*' || *p == '?' || *p == '[' || *p == ']' ||
                     *p == '(' || *p == ')') {
                     if (sb_putc(out, SHELL_GLOB_ESC) < 0)
                         return -1;
+                } else if (sb_putc(out, SHELL_DATA_ESC) < 0) {
+                    return -1;
                 }
+                escaped = true;
             } else if (p[1] == '$' || p[1] == '`' ||
                        p[1] == '\\' || p[1] == '\n') {
                 p++;              /* here-doc body: special only before these */
@@ -21786,6 +21817,9 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                 if (sb_putc(out, *p++) < 0) return -1;
             }
         }
+        if (lit_ifs_data && !escaped && sh_ifs_is_sep(*p) &&
+            sb_putc(out, SHELL_DATA_ESC) < 0)
+            return -1;
         if (sb_putc(out, *p++) < 0) return -1;
     }
     return 0;
