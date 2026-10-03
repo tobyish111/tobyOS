@@ -28330,6 +28330,24 @@ static bool shell_is_list_sep(enum shell_tok_type t) {
  * array. Never written -- argv_cap 0 means "not ours, allocate first". */
 static char *g_shell_no_args[1];
 
+/* Here-document expansion for a program -- see the `<<` case of the
+ * pipeline parser. */
+static void *shell_hd_snap_save(void);
+static void shell_hd_snap_restore(void *snap);
+static bool shell_stage_is_builtin(struct shell_simple *cmd);
+
+/* Can expanding this body ASSIGN? Only arithmetic and `${...}` can
+ * (`$((n+=1))`, `${x:=v}`); a `$( )` runs in its own process. */
+static bool shell_hd_may_assign(const char *body) {
+    for (const char *q = body; q && *q; q++)
+        if (q[0] == '$' && (q[1] == '{' || q[1] == '[' ||
+                            (q[1] == '(' && q[2] == '(')))
+            return true;
+    return false;
+}
+
+static bool shell_hd_cmd_is_program(struct shell_simple *cur);
+
 static void shell_simple_init(struct shell_simple *s,
                               struct shell_words *arena) {
     memset(s, 0, sizeof(*s));
@@ -30370,15 +30388,46 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 const char *hd_text = 0;
                 bool hd_bad = false;    /* reported: the command fails */
                 int hd_id;
-                if (shell_hd_tag_scan(tok[*io].text, &hd_id)) {
+                /* A PROGRAM'S HERE-DOCUMENT IS EXPANDED IN ITS CHILD. bash
+                 * performs an external command's redirections after the
+                 * fork, so what the body's expansion assigns never reaches
+                 * the shell -- and a builtin's, function's or group's does:
+                 *
+                 *     n=0; cat <<E          bash: 1, then n=0
+                 *     $((n+=1))             tsh:  1, then n=1
+                 *     E
+                 *
+                 * (logs/b12 p21; I38). The command word is known by now
+                 * unless the redirection comes first; when it names a
+                 * program and the body can assign at all, the expansion
+                 * runs inside a snapshot of the variables, put back at
+                 * once. */
+                const char *hd_raw = 0;
+                bool hd_tagged = shell_hd_tag_scan(tok[*io].text, &hd_id);
+                if (hd_tagged) {
+                    if (hd_id >= 0 && hd_id < g_hd_cap && g_hd_store[hd_id].live &&
+                        g_hd_store[hd_id].expand)
+                        hd_raw = g_hd_store[hd_id].body;
+                } else if (g_heredoc_head < g_heredoc_count &&
+                           g_heredocs[g_heredoc_head]->expand) {
+                    hd_raw = g_heredocs[g_heredoc_head]->body;
+                }
+                void *hd_snap = 0;
+                if (hd_raw && shell_hd_may_assign(hd_raw) &&
+                    shell_hd_cmd_is_program(cur))
+                    hd_snap = shell_hd_snap_save();
+                if (hd_tagged) {
                     hd_text = shell_hd_text_for(hd_id, &pl->words, &hd_bad);
+                    if (hd_snap) shell_hd_snap_restore(hd_snap);
                     if (!hd_text && !hd_bad) return -1;
                 } else {
                     if (g_heredoc_head >= g_heredoc_count) {
+                        if (hd_snap) shell_hd_snap_restore(hd_snap);
                         kprintf(SH_PFX_SHELL "here-document body missing\n");
                         return -1;
                     }
                     const struct shell_heredoc *h = shell_heredoc_take(&hd_bad);
+                    if (hd_snap) shell_hd_snap_restore(hd_snap);
                     if (!h && !hd_bad) return -1;
                     if (h) hd_text = h->body;
                 }
@@ -36330,6 +36379,49 @@ static void shell_subshell_frame_clear(struct shell_subshell_frame *frame) {
     kfree(frame->scope_tdead);
     frame->scope_ldead = 0;
     frame->scope_tdead = 0;
+}
+
+/* The variables, kept across a here-document expansion that belongs to a
+ * program's child (shell_hd_cmd_is_program). */
+struct shell_hd_snap {
+    struct shell_env_frame env;
+    struct shell_array_frame arrays;
+};
+
+static void *shell_hd_snap_save(void) {
+    struct shell_hd_snap *sn = (struct shell_hd_snap *)kmalloc(sizeof *sn);
+    if (!sn) return 0;
+    memset(sn, 0, sizeof *sn);
+    if (shell_env_frame_capture(&sn->env) < 0 ||
+        shell_array_frame_capture(&sn->arrays) < 0) {
+        shell_env_frame_clear(&sn->env);
+        shell_array_frame_clear(&sn->arrays);
+        kfree(sn);
+        return 0;
+    }
+    return sn;
+}
+
+/* Does the command parsed so far name a PROGRAM -- its command word known,
+ * and neither a builtin nor a function? */
+static bool shell_hd_cmd_is_program(struct shell_simple *cur) {
+    int assignc = 0;
+    while (assignc < cur->argc &&
+           !shell_simple_noassign(cur, assignc) &&
+           shell_is_assignment_word(cur->argv[assignc]))
+        assignc++;
+    if (assignc >= cur->argc) return false;
+    return !shell_stage_is_builtin(cur);
+}
+
+static void shell_hd_snap_restore(void *snap) {
+    struct shell_hd_snap *sn = (struct shell_hd_snap *)snap;
+    if (!sn) return;
+    shell_env_frame_restore(&sn->env);
+    shell_array_frame_restore(&sn->arrays);
+    shell_env_frame_clear(&sn->env);
+    shell_array_frame_clear(&sn->arrays);
+    kfree(sn);
 }
 
 static int shell_subshell_frame_capture_ex(struct shell_subshell_frame *frame,
