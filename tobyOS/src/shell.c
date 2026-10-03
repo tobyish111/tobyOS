@@ -3970,6 +3970,8 @@ static void shell_set_if_not(const char *name, const char *val) {
     if (!env_get(name)) (void)env_set(name, val);
 }
 
+static void shell_callstack_sync(void);
+
 static void shell_init_bash_vars(const char *self) {
     (void)env_set("BASH", self ? self : "/bin/tsh");
     (void)env_set("BASH_VERSION", "5.2.15(1)-release");
@@ -4028,6 +4030,7 @@ static void shell_init_bash_vars(const char *self) {
         }
     }
     shell_dirstack_sync();
+    shell_callstack_sync();             /* FUNCNAME, declared and invisible */
 }
 
 static void env_init_defaults(void) {
@@ -8624,6 +8627,11 @@ done:
     if (tmp_console) file_close(tmp_console);
 }
 
+/* `unset FUNCNAME` takes it away for good, as bash's does: its dynamic
+ * value goes with the variable, so no function call brings it back
+ * (logs/b12 fn1). */
+static bool g_funcname_gone;
+
 static void cmd_unset(int argc, char **argv) {
     shell_set_status(0);
     /* OPTIONS AS bash TAKES THEM: -f, -v and -n, together or apart, up to
@@ -8692,6 +8700,8 @@ static void cmd_unset(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            if (bl == 8 && !argv[i][bl] && memcmp(argv[i], "FUNCNAME", 8) == 0)
+                g_funcname_gone = true;
             /* A whole variable, not a nameref: bash's makunbound decides
              * which binding goes (see g_scope_seq). */
             if (bl && !argv[i][bl]) {
@@ -21079,21 +21089,44 @@ static int g_callframe_n;
  * read empty (Oils 1789 1791-1798). Rebuilt on each call and return. */
 static const char *g_main_source;       /* the script being run, or 0 */
 
+/* OUTSIDE A FUNCTION FUNCNAME IS DECLARED AND INVISIBLE (bash's
+ * make_funcname_visible(0)): `declare -p FUNCNAME` says `declare -a
+ * FUNCNAME` and so does the `declare -p` listing, while `set`, `-v` and
+ * every read see it unset. tsh dropped it, so declare said "not found"
+ * (logs/b12 p38, fn1). Inside one it is the call stack, as before. */
 static void shell_callstack_sync(void) {
     int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
     if (depth < 0) depth = 0;
     sh_array_unset_literal("FUNCNAME");
     sh_array_unset_literal("BASH_LINENO");
     sh_array_unset_literal("BASH_SOURCE");
+    {
+        /* an entry at every depth, as a declared array has one -- the
+         * listing orders by it -- with no value outside a function */
+        int fx = env_find("FUNCNAME", 8);
+        if (g_funcname_gone) {
+            if (fx >= 0) env_remove_at(fx);
+        } else {
+            if (fx < 0 && env_set_attr_holder("FUNCNAME") == 0)
+                fx = env_find("FUNCNAME", 8);
+            if (fx >= 0) {
+                g_env_flags[fx] |= SHVAR_ARRAY;
+                if (depth == 0) g_env_flags[fx] |= SHVAR_NOVALUE;
+                else g_env_flags[fx] &= ~(unsigned char)SHVAR_NOVALUE;
+            }
+        }
+    }
     char nb[24];
     for (int i = 0; i < depth; i++) {
         const struct callframe *f = &g_callframes[depth - 1 - i];
-        (void)sh_array_set("FUNCNAME", i, f->name ? f->name : "");
+        if (!g_funcname_gone)
+            (void)sh_array_set("FUNCNAME", i, f->name ? f->name : "");
         ksnprintf(nb, sizeof nb, "%lu", f->line);
         (void)sh_array_set("BASH_LINENO", i, nb);
         (void)sh_array_set("BASH_SOURCE", i, g_main_source ? g_main_source : "");
     }
-    if (depth > 0) (void)sh_array_set("FUNCNAME", depth, "main");
+    if (depth > 0 && !g_funcname_gone)
+        (void)sh_array_set("FUNCNAME", depth, "main");
     if (depth > 0 || g_main_source) {
         (void)sh_array_set("BASH_LINENO", depth, "0");
         if (g_main_source) (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
