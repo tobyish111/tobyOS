@@ -1238,6 +1238,9 @@ static struct sh_array *sh_array_create(const char *name);
 static void  sh_array_unset(const char *name);
 static void  sh_array_unset_idx(struct sh_array *a, long idx);
 static int   sh_array_set(const char *name, long idx, const char *val);
+static bool  shell_dirstack_assign(long idx, const char *val);
+static void  shell_dirstack_sync(void);
+static bool  g_dirstack_var_gone;
 static const char *sh_array_get(const char *name, long idx);
 static bool  sh_array_is_assoc(const char *name);
 static int   sh_array_make_assoc(const char *name);
@@ -4685,7 +4688,9 @@ static int shell_set_cwd(const char *path) {
         if (n + 1 > sizeof(p->cwd)) return -1;
         memcpy(p->cwd, path, n + 1);
     }
-    return env_set("PWD", path);
+    int rc = env_set("PWD", path);
+    shell_dirstack_sync();           /* DIRSTACK[0] is the current directory */
+    return rc;
 }
 
 static void shell_restore_cwd_only(const char *path) {
@@ -5113,6 +5118,8 @@ static void sh_array_unset(const char *name) {
 }
 
 static int sh_array_set(const char *name, long idx, const char *val) {
+    if (name && strcmp(name, "DIRSTACK") == 0 && shell_dirstack_assign(idx, val))
+        return 0;
     if (idx < 0) return -1;
     struct sh_array *a = sh_array_create(name);
     if (!a) return -1;
@@ -9003,6 +9010,9 @@ static bool strchr_opt_ok(const char *a) {
     return true;
 }
 
+/* The name cd's messages carry: pushd and popd run it under theirs. */
+static const char *g_cd_who = "cd";
+
 static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
@@ -9025,7 +9035,7 @@ static void cmd_cd(int argc, char **argv) {
                strcmp(argv[k], "-") != 0 && strchr_opt_ok(argv[k]))
             k++;
         if (argc - k > 1) {
-            kprintf("cd: too many arguments\n");
+            kprintf("%s: too many arguments\n", g_cd_who);
             shell_set_status(1);
             return;
         }
@@ -9036,7 +9046,7 @@ static void cmd_cd(int argc, char **argv) {
     } else if (strcmp(argv[1], "-") == 0) {
         target = env_get("OLDPWD");
         if (!target || !*target) {
-            kprintf("cd: OLDPWD not set\n");
+            kprintf("%s: OLDPWD not set\n", g_cd_who);
             shell_set_status(1);
             return;
         }
@@ -9096,12 +9106,12 @@ static void cmd_cd(int argc, char **argv) {
     /* bash's words (S12): "cd: DIR: No such file or directory", the operand
      * as typed and the C library's text. */
     if (rc != VFS_OK) {
-        kprintf("cd: %s: %s\n", target, shell_errno_text(rc));
+        kprintf("%s: %s: %s\n", g_cd_who, target, shell_errno_text(rc));
         shell_set_status(1);
         return;
     }
     if (st.type != VFS_TYPE_DIR) {
-        kprintf("cd: %s: %s\n", target, shell_errno_text(VFS_ERR_NOTDIR));
+        kprintf("%s: %s: %s\n", g_cd_who, target, shell_errno_text(VFS_ERR_NOTDIR));
         shell_set_status(1);
         return;
     }
@@ -9114,7 +9124,7 @@ static void cmd_cd(int argc, char **argv) {
      * variable that is not marked simply does not reach a child. */
     shell_mark_exported("OLDPWD");
     if (shell_set_cwd(path) < 0) {
-        kprintf("cd: failed to enter '%s'\n", path);
+        kprintf("%s: failed to enter '%s'\n", g_cd_who, path);
         shell_set_status(1);
         return;
     }
@@ -18791,167 +18801,389 @@ static void dirstack_drop_top(void) {
     if (g_dirstack_n > 0) kfree(g_dirstack[--g_dirstack_n]);
 }
 
-static void dirstack_print(bool per_line, bool with_index) {
-    for (int i = 0; i <= g_dirstack_n; i++) {
-        const char *d = (i == 0) ? shell_cwd() : g_dirstack[g_dirstack_n - i];
-        if (with_index)      shell_printf("%2d  %s\n", i, d);
-        else if (per_line)   shell_printf("%s\n", d);
-        else                 shell_printf(i == 0 ? "%s" : " %s", d);
+/* `~/x` for a path under $HOME, as bash's polite_directory_format writes
+ * it: dirs shows the stack that way unless -l asks for the long form. tsh
+ * printed every entry long (Oils 0808-0812). */
+static void dirstack_polite(const char *name, struct shell_sb *b) {
+    const char *home = env_get("HOME");
+    size_t l = home ? strlen(home) : 0;
+    if (l > 1 && strncmp(home, name, l) == 0 && (!name[l] || name[l] == '/')) {
+        (void)sb_putc(b, '~');
+        (void)sb_puts(b, name + l);
+    } else {
+        (void)sb_puts(b, name);
     }
-    if (!per_line && !with_index) shell_printf("\n");
+}
+
+/* bash's legal_number for +N / -N: digits, blanks around them allowed. */
+static bool dirstack_number(const char *s, long *out) {
+    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    bool neg = false;
+    if (*s == '-' || *s == '+') neg = *s++ == '-';
+    if (*s < '0' || *s > '9') return false;
+    long v = 0;
+    while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
+    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
+    if (*s) return false;
+    *out = neg ? -v : v;
+    return true;
+}
+
+/* get_dirstack_index: which slot +N / -N names (g_dirstack's index, or 0
+ * for the current directory -- *indexp says which: 1 the cwd side, 2 the
+ * stack side). -1 out of range. */
+static int dirstack_index(long ind, int sign, int *indexp) {
+    if (indexp) *indexp = sign > 0 ? 1 : 2;
+    if (ind == 0 && sign > 0) return 0;
+    if (ind == g_dirstack_n) {
+        if (indexp) *indexp = sign > 0 ? 2 : 1;
+        return 0;
+    }
+    if (ind >= 0 && ind <= g_dirstack_n) return (int)(sign > 0 ? g_dirstack_n - ind : ind);
+    return -1;
+}
+
+/* What `~N`, `~+N`, `~-N` stand for: a stack entry, or $PWD for 0; 0 when
+ * the number is not one or names no entry (the tilde stays as written). */
+static const char *dirstack_from_string(const char *s, size_t n) {
+    char buf[32];
+    if (n >= sizeof buf) return 0;
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    const char *p = buf;
+    int sign = 1;
+    if (*p == '-' || *p == '+') { sign = *p == '-' ? -1 : 1; p++; }
+    long i;
+    if (!dirstack_number(p, &i)) return 0;
+    int flag = 0;
+    int ind = dirstack_index(i, sign, &flag);
+    if (flag && (ind < 0 || ind > g_dirstack_n)) return 0;
+    if (flag == 0 || (flag == 1 && ind == 0)) return env_get("PWD");
+    return g_dirstack[ind];
+}
+
+/* DIRSTACK: the current directory, then the stack from the top -- kept in
+ * step whenever either changes, as bash computes it when read. Assigning an
+ * element changes that stack entry (element 0, the current directory, is
+ * left alone); `unset DIRSTACK` makes it an ordinary variable. */
+static bool g_dirstack_var_gone;
+static bool g_dirstack_syncing;
+static void shell_dirstack_sync(void) {
+    if (g_dirstack_var_gone) return;
+    g_dirstack_syncing = true;
+    sh_array_unset_literal("DIRSTACK");
+    const char *cwd = env_get("PWD");
+    (void)sh_array_set("DIRSTACK", 0, cwd ? cwd : shell_cwd());
+    for (int i = 1; i <= g_dirstack_n; i++)
+        (void)sh_array_set("DIRSTACK", i, g_dirstack[g_dirstack_n - i]);
+    g_dirstack_syncing = false;
+}
+
+/* An element written to DIRSTACK (sh_array_set's hook). True when it was
+ * taken -- the stack holds it now and the mirror is rebuilt. */
+static bool shell_dirstack_assign(long idx, const char *val) {
+    if (g_dirstack_var_gone || g_dirstack_syncing) return false;
+    int flag = 0;
+    int i = dirstack_index(idx, 1, &flag);
+    if (idx != 0 && i >= 0 && i <= g_dirstack_n && i < g_dirstack_n) {
+        char *nv = shell_strdup(val);
+        if (nv) { kfree(g_dirstack[i]); g_dirstack[i] = nv; }
+    }
+    shell_dirstack_sync();
+    return true;
+}
+
+/* dirs [-clpv] [+N] [-N] -- bash's dirs_builtin. */
+static int dirs_run(int argc, char **argv, int first) {
+    bool longform = false, clear = false;
+    int vflag = 0, index_flag = 0, desired = -1;
+    const char *w = "";
+    int i = first;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "-l")) longform = true;
+        else if (!strcmp(a, "-c")) clear = true;
+        else if (!strcmp(a, "-v")) vflag |= 2;
+        else if (!strcmp(a, "-p")) vflag |= 1;
+        else if (!strcmp(a, "--")) { i++; break; }
+        else if (a[0] == '+' || a[0] == '-') {
+            long n;
+            w = a + 1;
+            if (!dirstack_number(w, &n)) {
+                kprintf("dirs: %s: invalid number\n", a);
+                sh_builtin_usage("dirs");
+                return 2;
+            }
+            desired = dirstack_index(n, a[0] == '+' ? 1 : -1, &index_flag);
+        } else {
+            kprintf("dirs: %s: invalid option\n", a);
+            sh_builtin_usage("dirs");
+            return 2;
+        }
+    }
+    if (clear) {
+        while (g_dirstack_n > 0) dirstack_drop_top();
+        shell_dirstack_sync();
+        return 0;
+    }
+    if (index_flag && (desired < 0 || desired > g_dirstack_n)) {
+        if (g_dirstack_n == 0) kprintf("dirs: directory stack empty\n");
+        else kprintf("dirs: %s: directory stack index out of range\n", w);
+        return 1;
+    }
+    SH_SB(out);
+#define DS_FMT(s) do { if (longform) (void)sb_puts(&out, (s)); else dirstack_polite((s), &out); } while (0)
+    if (index_flag == 0 || (index_flag == 1 && desired == 0)) {
+        const char *cwd = shell_cwd();
+        if (vflag & 2) (void)sb_puts(&out, " 0  ");
+        DS_FMT(cwd);
+        if (index_flag) {
+            (void)sb_putc(&out, '\n');
+            shell_printf("%s", out.p);
+            return 0;
+        }
+    }
+    if (index_flag) {
+        if (vflag & 2) {
+            char nb[16];
+            ksnprintf(nb, sizeof nb, "%2d  ", g_dirstack_n - desired);
+            (void)sb_puts(&out, nb);
+        }
+        DS_FMT(g_dirstack[desired]);
+    } else {
+        for (int k = g_dirstack_n - 1; k >= 0; k--) {
+            if (vflag >= 2) {
+                char nb[16];
+                ksnprintf(nb, sizeof nb, "\n%2d  ", g_dirstack_n - k);
+                (void)sb_puts(&out, nb);
+            } else {
+                (void)sb_putc(&out, (vflag & 1) ? '\n' : ' ');
+            }
+            DS_FMT(g_dirstack[k]);
+        }
+    }
+#undef DS_FMT
+    (void)sb_putc(&out, '\n');
+    shell_printf("%s", out.p);
+    return 0;
 }
 
 static void cmd_dirs(int argc, char **argv) {
-    bool per_line = false, with_index = false;
-    for (int i = 1; i < argc; i++) {
-        /* An OPERAND is an error -- `dirs a` is a usage mistake, and this
-         * used to skip over it and print the stack as if it had been asked
-         * for nothing in particular. */
-        if (argv[i][0] != '-' || !argv[i][1]) {
-            kprintf("dirs: %s: invalid argument\n", argv[i]);
-            shell_set_status(2);
-            return;
-        }
-        for (const char *c = argv[i] + 1; *c; c++) {
-            if      (*c == 'l') { /* paths are already absolute here */ }
-            else if (*c == 'p') per_line = true;
-            else if (*c == 'v') { with_index = true; per_line = true; }
-            else if (*c == 'c') {
-                while (g_dirstack_n > 0) dirstack_drop_top();
-                shell_set_status(0);
-                return;
-            }
-            else {
-                kprintf("dirs: -%c: invalid option\n", *c);
-                shell_set_status(2);
-                return;
-            }
-        }
-    }
-    dirstack_print(per_line, with_index);
-    shell_set_status(0);
-}
-
-/* pushd's and popd's options, bash's pushd.def rules: -n (S6: "pushd -n"
- * was "too many arguments") and `--`. +N / -N name a stack position, which
- * tsh does not implement; such a word is left where it always went -- an
- * operand to pushd, ignored by popd. Any other word starting with `-` is
- * bash's usage error. Returns the index of the first operand, or -1 after
- * reporting the error (status 2). */
-static int dirstack_opts(const char *who, int argc, char **argv, bool *nocd) {
-    int i = 1;
-    for (; i < argc; i++) {
-        const char *a = argv[i];
-        if (strcmp(a, "-n") == 0) { *nocd = true; continue; }
-        if (strcmp(a, "--") == 0) { i++; break; }
-        if ((a[0] == '-' || a[0] == '+') && a[1] >= '0' && a[1] <= '9')
-            break;
-        if (a[0] == '-' && a[1]) {
-            kprintf("%s: %s: invalid number\n", who, a);
-            kprintf_raw("%s: usage: %s\n", who,
-                    who[0] == 'p' && who[1] == 'u'
-                        ? "pushd [-n] [+N | -N | dir]" : "popd [-n] [+N | -N]");
-            shell_set_status(2);
-            return -1;
-        }
-        break;
-    }
-    return i;
-}
-
-static void cmd_pushd(int argc, char **argv) {
-    bool nocd = false;
-    int first = dirstack_opts("pushd", argc, argv, &nocd);
-    if (first < 0) return;
-    /* bash: one operand at most, and it says so rather than quietly using
-     * the first and dropping the rest. -n takes the first and ignores the
-     * rest, as bash's does. */
-    if (argc - first > 1 && !nocd) {
-        kprintf("pushd: too many arguments\n");
-        shell_set_status(1);
-        return;
-    }
-    if (first >= argc) {
-        /* `pushd -n` with nothing to push: bash does nothing, status 0. */
-        if (nocd) { shell_set_status(0); return; }
-        /* Bare `pushd` swaps the top two entries. */
-        if (g_dirstack_n < 1) {
-            kprintf("pushd: no other directory\n");
-            shell_set_status(1);
-            return;
-        }
-        char *here = shell_strdup(shell_cwd());
-        if (!here) { shell_set_status(1); return; }
-        if (shell_set_cwd(g_dirstack[g_dirstack_n - 1]) < 0) {
-            kprintf("pushd: %s: cannot change directory\n",
-                    g_dirstack[g_dirstack_n - 1]);
-            kfree(here);
-            shell_set_status(1);
-            return;
-        }
-        kfree(g_dirstack[g_dirstack_n - 1]);
-        g_dirstack[g_dirstack_n - 1] = here;
-        dirstack_print(false, false);
-        shell_set_status(0);
-        return;
-    }
-    const char *dir = argv[first];
-    /* -n: the word goes in as written, unchecked, and the shell stays
-     * where it is -- `pushd -n usr` stacks "usr", as bash's does. */
-    if (nocd) {
-        if (!dirstack_push_owned(shell_strdup(dir))) {
-            shell_set_status(1);
-            return;
-        }
-        dirstack_print(false, false);
-        shell_set_status(0);
-        return;
-    }
-    /* Record where we ARE before moving, so popd can come back. */
-    char *here = shell_strdup(shell_cwd());
-    if (!here) { shell_set_status(1); return; }
-    if (shell_set_cwd(dir) < 0) {
-        kprintf("pushd: %s: No such file or directory\n", dir);
-        kfree(here);
-        shell_set_status(1);
-        return;
-    }
-    if (!dirstack_push_owned(here)) {
-        shell_set_status(1);
-        return;
-    }
-    dirstack_print(false, false);
-    shell_set_status(0);
-}
-
-static void cmd_popd(int argc, char **argv) {
-    bool nocd = false;
-    int first = dirstack_opts("popd", argc, argv, &nocd);
-    if (first < 0) return;
-    if (first < argc && argv[first][0] && argv[first][0] != '+' &&
-        argv[first][0] != '-') {
-        kprintf("popd: %s: invalid argument\n", argv[first]);
-        kprintf_raw("popd: usage: popd [-n] [+N | -N]\n");
+    if (argc > 1 && !strcmp(argv[1], "--help")) {
+        shell_help_topic("dirs");
         shell_set_status(2);
         return;
     }
-    if (g_dirstack_n < 1) {
-        kprintf("popd: directory stack empty\n");
-        shell_set_status(1);
+    shell_set_status(dirs_run(argc, argv, 1));
+}
+
+/* cd -- DIR under the given name (pushd's and popd's cd_to_string). */
+static void cmd_cd(int argc, char **argv);
+static int dirstack_cd(const char *who, const char *dir) {
+    const char *saved = g_cd_who;
+    g_cd_who = who;
+    char *av[4] = { (char *)"cd", (char *)"--", (char *)dir, 0 };
+    cmd_cd(3, av);
+    g_cd_who = saved;
+    return g_last_status == 0 ? 0 : 1;
+}
+
+/* change_to_temp: cd there and, when that worked, print the stack. */
+static int dirstack_change_to(const char *dir) {
+    int rc = dir ? dirstack_cd(g_cd_who, dir) : 1;
+    if (rc == 0) (void)dirs_run(0, 0, 0);
+    return rc;
+}
+
+static bool dirstack_is_opt(const char *s, char c) {
+    return s[0] == '-' && s[1] == c && s[2] == '\0';
+}
+
+/* pushd [-n] [+N | -N | dir] -- bash's pushd_builtin. */
+static int pushd_run(int argc, char **argv) {
+    int i = 1;
+    bool skipopt = false;
+    if (i < argc && dirstack_is_opt(argv[i], '-')) { i++; skipopt = true; }
+    int orig = i - (skipopt ? 1 : 0);
+    if (i >= argc) {
+        if (g_dirstack_n == 0) {
+            kprintf("pushd: no other directory\n");
+            return 1;
+        }
+        char *here = shell_strdup(shell_cwd());
+        if (!here) return 1;
+        int j = g_dirstack_n - 1;
+        char *temp = g_dirstack[j];
+        g_dirstack[j] = here;
+        const char *saved = g_cd_who;
+        g_cd_who = "pushd";
+        int rc = dirstack_change_to(temp);
+        g_cd_who = saved;
+        kfree(temp);
+        shell_dirstack_sync();
+        return rc;
+    }
+    bool nocd = false, rotate = false;
+    long num = 0;
+    for (; !skipopt && i < argc; i++) {
+        const char *a = argv[i];
+        if (dirstack_is_opt(a, 'n')) { nocd = true; continue; }
+        if (dirstack_is_opt(a, '-')) { i++; break; }
+        if (a[0] == '-' && a[1] == '\0') break;
+        if (a[0] == '+' || a[0] == '-') {
+            if (!dirstack_number(a + 1, &num)) {
+                kprintf("pushd: %s: invalid number\n", a);
+                sh_builtin_usage("pushd");
+                return 2;
+            }
+            if (a[0] == '-') num = g_dirstack_n - num;
+            if (num > g_dirstack_n || num < 0) {
+                if (g_dirstack_n == 0) kprintf("pushd: directory stack empty\n");
+                else kprintf("pushd: %s: directory stack index out of range\n", a);
+                return 1;
+            }
+            rotate = true;
+            continue;
+        }
+        if (a[0] == '-') {
+            kprintf("pushd: %s: invalid option\n", a);
+            sh_builtin_usage("pushd");
+            return 2;
+        }
+        break;
+    }
+    const char *saved = g_cd_who;
+    g_cd_who = "pushd";
+    if (rotate) {
+        char *temp = shell_strdup(shell_cwd());
+        if (!temp) { g_cd_who = saved; return 1; }
+        if (num == 0) {
+            int rc = nocd ? 0 : dirstack_change_to(temp);
+            kfree(temp);
+            g_cd_who = saved;
+            return rc;
+        }
+        do {
+            char *top = g_dirstack[g_dirstack_n - 1];
+            int j;
+            for (j = g_dirstack_n - 2; j > -1; j--) g_dirstack[j + 1] = g_dirstack[j];
+            g_dirstack[j + 1] = temp;
+            temp = top;
+            num--;
+        } while (num);
+        int rc = nocd ? 0 : dirstack_change_to(temp);
+        kfree(temp);
+        g_cd_who = saved;
+        shell_dirstack_sync();
+        return rc;
+    }
+    if (i >= argc) { g_cd_who = saved; return 0; }
+    char *current = shell_strdup(shell_cwd());
+    if (!current) { g_cd_who = saved; return 1; }
+    int rc = 0;
+    if (!nocd) {
+        /* cd_builtin with the rest of the words: its options, its "too
+         * many arguments", its CDPATH and `-`, under pushd's name */
+        int first = skipopt ? orig : i;
+        int cargc = argc - first + 1;
+        char **cargv = (char **)kmalloc((size_t)(cargc + 1) * sizeof *cargv);
+        if (!cargv) { kfree(current); g_cd_who = saved; return 1; }
+        cargv[0] = (char *)"cd";
+        for (int k = first; k < argc; k++) cargv[k - first + 1] = argv[k];
+        cargv[cargc] = 0;
+        cmd_cd(cargc, cargv);
+        kfree(cargv);
+        rc = g_last_status == 0 ? 0 : 1;
+    }
+    g_cd_who = saved;
+    if (rc != 0) { kfree(current); return 1; }
+    if (nocd) {
+        kfree(current);
+        current = shell_strdup(argv[i]);
+        if (!current) return 1;
+    }
+    if (!dirstack_push_owned(current)) return 1;
+    shell_dirstack_sync();
+    (void)dirs_run(0, 0, 0);
+    return 0;
+}
+
+static void cmd_pushd(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--help")) {
+        shell_help_topic("pushd");
+        shell_set_status(2);
         return;
     }
-    /* Change directory FIRST: bash leaves the stack alone when it cannot
-     * (this dropped the entry and then failed). -n removes position 1
-     * without moving at all. */
-    if (!nocd && shell_set_cwd(g_dirstack[g_dirstack_n - 1]) < 0) {
-        kprintf("popd: %s: cannot change directory\n",
-                g_dirstack[g_dirstack_n - 1]);
-        shell_set_status(1);
+    shell_set_status(pushd_run(argc, argv));
+}
+
+/* popd [-n] [+N | -N] -- bash's popd_builtin. */
+static int popd_run(int argc, char **argv) {
+    bool nocd = false;
+    long which = 0;
+    char direction = '+';
+    const char *which_word = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (dirstack_is_opt(a, 'n')) { nocd = true; continue; }
+        if (dirstack_is_opt(a, '-')) break;
+        if (a[0] == '+' || a[0] == '-') {
+            direction = a[0];
+            if (!dirstack_number(a + 1, &which)) {
+                kprintf("popd: %s: invalid number\n", a);
+                sh_builtin_usage("popd");
+                return 2;
+            }
+            which_word = a;
+            continue;
+        }
+        if (a[0] == '-') {
+            kprintf("popd: %s: invalid option\n", a);
+            sh_builtin_usage("popd");
+            return 2;
+        }
+        if (a[0]) {
+            kprintf("popd: %s: invalid argument\n", a);
+            sh_builtin_usage("popd");
+            return 2;
+        }
+        break;
+    }
+    if (which > g_dirstack_n || which < -(long)g_dirstack_n ||
+        (g_dirstack_n == 0 && which == 0)) {
+        if (g_dirstack_n == 0) kprintf("popd: directory stack empty\n");
+        else kprintf("popd: %s: directory stack index out of range\n",
+                     which_word ? which_word : "");
+        return 1;
+    }
+    if ((direction == '+' && which == 0) ||
+        (direction == '-' && which == g_dirstack_n)) {
+        if (!nocd && dirstack_cd("popd", g_dirstack[g_dirstack_n - 1]) != 0) return 1;
+        dirstack_drop_top();
+    } else {
+        long i = direction == '+' ? g_dirstack_n - which : which;
+        if (i < 0 || i > g_dirstack_n) {
+            if (g_dirstack_n == 0) kprintf("popd: directory stack empty\n");
+            else kprintf("popd: %s: directory stack index out of range\n",
+                         which_word ? which_word : "");
+            return 1;
+        }
+        kfree(g_dirstack[i]);
+        g_dirstack_n--;
+        for (; i < g_dirstack_n; i++) g_dirstack[i] = g_dirstack[i + 1];
+    }
+    shell_dirstack_sync();
+    (void)dirs_run(0, 0, 0);
+    return 0;
+}
+
+static void cmd_popd(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--help")) {
+        shell_help_topic("popd");
+        shell_set_status(2);
         return;
     }
-    dirstack_drop_top();
-    dirstack_print(false, false);
-    shell_set_status(0);
+    shell_set_status(popd_run(argc, argv));
 }
 
 /* ---- history -----------------------------------------------------------
@@ -22027,6 +22259,11 @@ static int shell_tilde_prefix_home(const char *pre, size_t plen,
         }
     } else if (plen == 1 && (pre[0] == '+' || pre[0] == '-')) {
         v = env_get(pre[0] == '+' ? "PWD" : "OLDPWD");
+        if (!v) return 0;
+    } else if (pre[0] == '+' || pre[0] == '-' || (pre[0] >= '0' && pre[0] <= '9')) {
+        /* ~N ~+N ~-N: the directory stack, as `dirs +N` / `dirs -N` name
+         * it (~0 is $PWD); a number that names nothing stays as written */
+        v = dirstack_from_string(pre, plen);
         if (!v) return 0;
     } else {
         if (shell_passwd_home(pre, plen, hb, sizeof hb) != 0) return 0;
