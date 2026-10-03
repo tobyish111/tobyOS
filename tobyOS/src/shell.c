@@ -28669,6 +28669,26 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                 }
                 return 1;
             }
+            /* AN EXPANSION ERROR INSIDE AN ARRAY LITERAL -- an arithmetic
+             * error, a bad substitution -- is bash's expansion error, as it
+             * is in a scalar's value: the message is out, and the line is
+             * dropped with status 1 (the shell ends under set -e).
+             *
+             *     f() { a+=( $((1/0)) ); echo after; }; f; echo st=$?
+             *     bash: the message, nothing else     tsh: also "failed
+             *     to set 'a+=( $((1/0)) )'", "after", "st=0"
+             *
+             * (Oils 0792, where the line was a `compgen -F`.) */
+            if (g_bad_subst_soft) {
+                g_bad_subst_soft = false;
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                return 1;
+            }
             kprintf("%s: failed to set '%s'\n",
                     label ? label : "shell", assignv[i]);
             rc = 1;
