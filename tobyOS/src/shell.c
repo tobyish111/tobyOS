@@ -21970,8 +21970,11 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                  * sq_syntax is already how this function is told which it is
                  * in (single quotes stop being syntax inside double ones). */
                 if (p[1] == '\n') { p += 2; continue; }   /* continuation */
+                /* ...and `}`: in "${v-\}}" the backslash kept the brace
+                 * from closing the expansion, and bash removes it there
+                 * (Oils 2628). */
                 if (p[1] == '$' || p[1] == '`' || p[1] == '"' ||
-                    p[1] == '\\') {
+                    p[1] == '\\' || p[1] == '}') {
                     p++;
                 } else if (sb_putc(out, *p++) < 0) {
                     return -1;
@@ -22196,6 +22199,7 @@ static bool shell_glob_match(const char *pat, const char *name);
 static bool shell_glob_match_e(const char *pat, const char *pend,
                                const char *name, const char *nend);
 static long shell_pattern_fixed_len(const char *pat, const char *pend);
+static long shell_pattern_matchlen_bash(const char *pat, const char *pend);
 static int shell_pattern_lead_byte(const char *pat, const char *pend);
 
 /* `~user` needs the home directory from /etc/passwd -- the SAME FILE the
@@ -22339,57 +22343,51 @@ static int shell_word_tilde(struct shell_sb *wb) {
 static int shell_expand_name_prefix(const char *prefix, bool star,
                                     struct shell_sb *b) {
     size_t plen = prefix ? strlen(prefix) : 0;
-    SH_SB(idxb);                    /* one int per variable, as many as there are */
-    if (sb_grow(&idxb, (size_t)(g_envc + 1) * sizeof(int)) < 0) return -1;
-    int *idxs = (int *)(void *)idxb.p;
-    int n = 0;
+    /* EVERY SET VARIABLE, ARRAYS INCLUDED: `hello=()` is a variable named
+     * hello, and ${!hello@} lists it (bash; Oils 2425). Only the scalar
+     * table was searched. Declared-only names (NOVALUE) are not set. */
+    struct sh_strv names = { 0, 0, 0 };
     for (int i = 0; i < g_envc; i++) {
         const char *e = g_env[i];
         if (!e) continue;
         size_t klen = env_key_len(e);
         if (klen < plen || memcmp(e, prefix, plen) != 0) continue;
         if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* declared, not set */
-        idxs[n++] = i;
+        if (!shell_name_is_valid(e, klen)) continue;
+        if (!sv_add_n(&names, e, klen)) { sv_free(&names); return -1; }
     }
-    /* Insertion sort on the KEY only -- the blob continues into the value,
-     * so a plain strcmp of g_env[i] would order by value on a shared name
-     * prefix. Small n, and the table is already nearly ordered. */
-    for (int i = 1; i < n; i++) {
-        int v = idxs[i], j = i - 1;
-        while (j >= 0) {
-            const char *a = g_env[idxs[j]], *b = g_env[v];
-            size_t al = env_key_len(a), bl = env_key_len(b);
-            size_t m = al < bl ? al : bl;
-            int c = memcmp(a, b, m);
-            if (c == 0) c = (al < bl) ? -1 : (al > bl ? 1 : 0);
-            if (c <= 0) break;
-            idxs[j + 1] = idxs[j];
-            j--;
+    for (int i = 0; i < g_narrays; i++) {
+        const struct sh_array *a = g_arrays[i];
+        if (!a || !a->name || strncmp(a->name, prefix, plen) != 0) continue;
+        if (!shell_name_is_valid(a->name, strlen(a->name))) continue;
+        int ix = env_find(a->name, strlen(a->name));
+        if (ix >= 0 && (g_env_flags[ix] & SHVAR_NOVALUE)) continue;
+        if (!sv_has(&names, a->name) && !sv_add(&names, a->name)) {
+            sv_free(&names);
+            return -1;
         }
-        idxs[j + 1] = v;
     }
+    sv_sort(&names);
 
     char sep = ' ';
     const char *ifs = env_get("IFS");
     if (ifs && *ifs) sep = ifs[0];
     else if (ifs) sep = '\0';
 
-    if (!star && sh_put_lead_mark(b) < 0)
-        return -1;
-    for (int i = 0; i < n; i++) {
+    int rc = 0;
+    if (!star && sh_put_lead_mark(b) < 0) rc = -1;
+    for (int i = 0; rc == 0 && i < names.n; i++) {
         if (i > 0) {
             if (!star) {
-                if (sb_putc(b, SHELL_ARG_MARK) < 0)
-                    return -1;
-            } else if (sep) {
-                if (sb_putc(b, sep) < 0) return -1;
+                if (sb_putc(b, SHELL_ARG_MARK) < 0) rc = -1;
+            } else if (sep && sb_putc(b, sep) < 0) {
+                rc = -1;
             }
         }
-        const char *e = g_env[idxs[i]];
-        if (sb_put_data_n(b, e, env_key_len(e)) < 0)
-            return -1;
+        if (rc == 0 && sb_put_data_str(b, names.v[i]) < 0) rc = -1;
     }
-    return 0;
+    sv_free(&names);
+    return rc;
 }
 
 /* Quote `v` the way bash's ${x@Q} does: reusable as shell input.
@@ -23472,9 +23470,34 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                  * no element 0, a declared-only name -- expands to nothing,
                  * without a word (bash; Oils 2562). Only a name that is not
                  * a variable at all is "invalid indirect expansion". */
-                if (!ref_set && !*rest) {
+                /* ...WHATEVER FOLLOWS: bash's parameter_brace_expand_indir
+                 * only refuses a name that is not a variable at all; one
+                 * with no value expands to nothing, operator or not --
+                 * ${!A@a} on an associative A with no A[0] is empty (Oils
+                 * 2433). The tests then see an unset parameter, and `=` is
+                 * "invalid indirect expansion" (there is nothing to assign
+                 * through). */
+                if (!ref_set) {
                     int ri = env_find(rname.p, strlen(rname.p));
-                    if (sh_array_find(rname.p) || ri >= 0) return 0;
+                    if (sh_array_find(rname.p) || ri >= 0) {
+                        if (!*rest) return 0;
+                        const char *t = rest[0] == ':' ? rest + 1 : rest;
+                        if (*t == '=') {
+                            kprintf(SH_PFX_SHELL "!%s: invalid indirect expansion\n",
+                                    rname.p);
+                            g_bad_subst_soft = true;
+                            return -1;
+                        }
+                        if (*t == '-' || *t == '+' || *t == '?') {
+                            SH_SB(ue);
+                            (void)env_unset("SHELL_INDIR_UNSET");
+                            if (sb_puts(&ue, "SHELL_INDIR_UNSET") < 0 ||
+                                sb_puts(&ue, rest) < 0)
+                                return -1;
+                            return shell_expand_braced_parameter(ue.p, b);
+                        }
+                        return 0;
+                    }
                 }
             }
             if (have_ref) {
@@ -23942,7 +23965,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * its end, not a copy: copying it was another O(n) per try. */
             bool saved_nocase = g_glob_nocase;
             g_glob_nocase = g_shopt_misc[3];          /* nocasematch */
-            long fixed = shell_pattern_fixed_len(pattern, pat_end);
+            long fixed = shell_pattern_matchlen_bash(pattern, pat_end);   /* bash measures here */
             int lead = shell_pattern_lead_byte(pattern, pat_end);
             SH_SB(out);
             size_t i = 0;
@@ -24007,19 +24030,55 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             return vjoin ? sh_put_join_value(b, out.p)
                          : sb_put_data_str(b, out.p);
         }
-        if (*op == '^' || *op == ',') {
+        if (*op == '^' || *op == ',' || *op == '~') {
+            /* ${v^pat} ${v^^pat} ${v,pat} ${v,,pat} ${v~} ${v~~}, by bash's
+             * sh_modcase: only a character the PATTERN matches changes (an
+             * empty one matches every character); the single forms touch
+             * the value's first character and nothing after it; `~` toggles
+             * the first letter of each run of letters and digits, `~~`
+             * every letter. tsh had no `~`, and ignored the pattern -- so
+             * ${x,,A} lowered every letter, not the A's (Oils 2419 2420). */
             char cop = *op++;
             bool all = (*op == cop);
+            if (all) op++;
+            SH_SB(patraw);
+            SH_SB(patbuf);
+            const char *pattern = 0, *pat_end = 0;
+            if (*op) {
+                if (shell_expand_word_ex(op, &patraw, true, true) < 0) return -1;
+                if (shell_pattern_from_marked(patraw.p, &patbuf) < 0) return -1;
+                pattern = patbuf.p;
+                pat_end = patbuf.p + patbuf.len;
+                if (pattern == pat_end) pattern = 0;
+            }
             SH_SB(valb);
             bool is_set = false, vjoin = false;
             if (shell_parameter_value(name, &valb, &is_set, &vjoin) < 0)
                 return -1;
             char *value = valb.p;
+            bool inword = false;
             for (size_t i = 0; value[i]; i++) {
                 char c = value[i];
-                if (cop == '^') { if (c >= 'a' && c <= 'z') value[i] = (char)(c - 32); }
-                else            { if (c >= 'A' && c <= 'Z') value[i] = (char)(c + 32); }
-                if (!all) break;          /* ${v^} touches the FIRST char only */
+                bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                             (c >= '0' && c <= '9');
+                if (!alnum) inword = false;
+                if (pattern && !shell_glob_match_e(pattern, pat_end, value + i,
+                                                   value + i + 1)) {
+                    inword = true;
+                    continue;
+                }
+                int act;                /* 1 upper, 2 lower, 3 toggle, 0 none */
+                if (cop == '~') {
+                    act = all ? 3 : (inword ? 0 : 3);
+                    inword = true;
+                } else if (all) {
+                    act = cop == '^' ? 1 : 2;
+                } else {
+                    act = i > 0 ? 0 : (cop == '^' ? 1 : 2);
+                    inword = true;
+                }
+                if ((act == 1 || act == 3) && c >= 'a' && c <= 'z') value[i] = (char)(c - 32);
+                else if ((act == 2 || act == 3) && c >= 'A' && c <= 'Z') value[i] = (char)(c + 32);
             }
             return vjoin ? sh_put_join_value(b, value)
                          : sb_put_data_str(b, value);
@@ -27302,6 +27361,81 @@ static long shell_pattern_fixed_len(const char *pat, const char *pend) {
         if (*p == '[') {
             const char *e = shell_glob_bracket_end(p);
             p = e ? e : p + 1;
+            n++;
+            continue;
+        }
+        p++;
+        n++;
+    }
+    return n;
+}
+
+/* BASH'S MATCHLEN: the one length ${x/pat/rep} tries, -1 for any.
+ *
+ * Every element shell_glob_match_e knows -- a literal, an escaped byte, `?`,
+ * a bracket expression, closed or not -- consumes exactly one character.
+ * Only `*` and an extglob group (a WELL-FORMED one: an unclosed `@(` is a
+ * literal `@`, and `*(` unclosed is still a star) consume a varying amount.
+ * The pattern operators use this to try one candidate length instead of
+ * all of them, which is the whole difference between linear and quadratic
+ * on a large value. It is bash's own measure (MATCHLEN), quirk included --
+ * see the bracket case -- because bash's answers come from it. */
+static long shell_pattern_matchlen_bash(const char *pat, const char *pend) {
+    long n = 0;
+    const char *p = pat;
+    while (p < pend) {
+        if ((*p == '?' || *p == '*' || *p == '+' || *p == '@' || *p == '!') &&
+            p + 1 < pend && p[1] == '(' && eg_close_paren(p + 1, pend))
+            return -1;
+        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
+            p + 1 < pend) {
+            p += 2;
+            n++;
+            continue;
+        }
+        if (*p == '*') return -1;
+        if (*p == '[') {
+            /* bash's MATCHLEN (lib/glob/gm_loop.c), and bash's ANSWER comes
+             * from it: the character after `[` is always taken, so in `[^]]`
+             * or `[!]]` the `]` after the negation ENDS the bracket here,
+             * though the matcher reads it as a member. That length (2) is
+             * the only one the pattern operators try, and the one-character
+             * matches are never found:
+             *
+             *     s='ab^cd^'; echo ${s//[^]]/z}     bash: ab^cd^
+             *
+             * (Oils 2470). `case` and [[ ]] do not measure, and match. An
+             * unclosed bracket is its characters. */
+            long bl = 1;
+            const char *q = p + 1;
+            bool cls = false, coll = false, equiv = false, bad = false;
+            if (q >= pend) { n += bl; p = q; continue; }
+            char c = *q++;
+            for (;;) {
+                if (q > pend) { bad = true; break; }
+                if ((c == '\\' || c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC)) {
+                    bl++;
+                    if (q + 1 >= pend) { bad = true; break; }   /* nothing after it */
+                    q++;
+                } else if (c == '[' && q < pend && *q == ':') { q++; bl++; cls = true; }
+                else if (cls && c == ':' && q < pend && *q == ']') { q++; bl++; cls = false; }
+                else if (c == '[' && q < pend && *q == '.') {
+                    q++; bl++;
+                    if (q < pend && *q == ']') { q++; bl++; }
+                    coll = true;
+                } else if (coll && c == '.' && q < pend && *q == ']') { q++; bl++; coll = false; }
+                else if (c == '[' && q < pend && *q == '=') {
+                    q++; bl++;
+                    if (q < pend && *q == ']') { q++; bl++; }
+                    equiv = true;
+                } else if (equiv && c == '=' && q < pend && *q == ']') { q++; bl++; equiv = false; }
+                else bl++;
+                if (q >= pend) { bad = true; break; }
+                c = *q++;
+                if (c == ']') break;
+            }
+            if (bad) { n += bl; p = pend; continue; }
+            p = q;
             n++;
             continue;
         }
