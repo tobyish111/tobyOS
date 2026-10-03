@@ -1594,6 +1594,79 @@ static struct job *jobs_newest(void) {
 }
 
 
+/* THE CURRENT AND PREVIOUS JOBS -- bash's js.j_current and js.j_previous
+ * (jobs.c), the `+` and `-` of a listing and what %% %+ and %- name. tsh
+ * gave `+` to the newest job and `-` to the newest running one below it,
+ * which is bash's answer until a job is deleted: bash moves them only when
+ * a job is started, stopped, brought to the foreground or put in the
+ * background, and when the current or previous one is deleted -- and then
+ * picks a STOPPED or RUNNING job, never a finished one, or none. So after
+ * `sleep 1 & sleep .2 & wait` (job 1 waited for and deleted, job 2 kept as
+ * $!), `jobs` is "[2]   Done": no `+` (logs/b12 p88, WSL bash). Job ids,
+ * 0 for none. */
+static int g_js_current, g_js_previous;
+
+static struct job *jobs_by_id(int id) {
+    for (int i = 0; id > 0 && i < JOB_MAX; i++)
+        if (g_jobs[i]->id == id) return g_jobs[i];
+    return 0;
+}
+static bool job_id_stopped(int id) {
+    struct job *j = jobs_by_id(id);
+    return j && j->stopped && !j->dead;
+}
+static bool job_id_running(int id) {
+    struct job *j = jobs_by_id(id);
+    return j && !j->stopped && !j->dead;
+}
+/* bash's job_last_stopped / job_last_running: the newest such job with an
+ * id below BELOW (0: any) */
+static int job_last_in_state(int below, bool stopped) {
+    int best = 0;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead || j->stopped != stopped) continue;
+        if (below > 0 && j->id >= below) continue;
+        if (j->id > best) best = j->id;
+    }
+    return best;
+}
+/* bash's set_current_job */
+static void jobs_set_current(int id) {
+    if (g_js_current != id) {
+        g_js_previous = g_js_current;
+        g_js_current = id;
+    }
+    if (g_js_previous != g_js_current && g_js_previous &&
+        job_id_stopped(g_js_previous))
+        return;
+    int cand = 0;
+    if (job_id_stopped(g_js_current)) {
+        cand = job_last_in_state(g_js_current, true);
+        if (cand) { g_js_previous = cand; return; }
+    }
+    cand = job_id_running(g_js_current) ? job_last_in_state(g_js_current, false)
+                                        : job_last_in_state(0, false);
+    if (cand) { g_js_previous = cand; return; }
+    g_js_previous = g_js_current;   /* a single job is both `+' and `-' */
+}
+/* bash's reset_current */
+static void jobs_reset_current(void) {
+    int cand = 0;
+    if (g_js_current && job_id_stopped(g_js_current)) {
+        cand = g_js_current;
+    } else {
+        if (g_js_previous && job_id_stopped(g_js_previous)) cand = g_js_previous;
+        if (!cand) cand = job_last_in_state(0, true);
+        if (!cand) cand = job_last_in_state(0, false);
+    }
+    if (cand) jobs_set_current(cand);
+    else g_js_current = g_js_previous = 0;
+}
+static char jobs_mark(const struct job *j) {
+    return j->id == g_js_current ? '+' : j->id == g_js_previous ? '-' : ' ';
+}
+
 /* Twice the slots when none is free. Old entries keep their addresses. */
 static bool jobs_grow(void) {
     int ncap = g_jobs_cap ? g_jobs_cap * 2 : 8;
@@ -1648,7 +1721,9 @@ static int jobs_add(int pid, const char *name) {
     j->waited = false;
     j->code = 0;
     j->sig  = 0;
+    j->notified = false;
     shell_bgstat_forget(pid);
+    jobs_reset_current();              /* bash's stop_pipeline, async */
     return j->id;
 }
 
@@ -1662,11 +1737,14 @@ static struct job *jobs_find(int id) {
 
 static void jobs_remove(struct job *j) {
     if (!j) return;
+    int id = j->id;
     j->id  = 0;
     j->pid = 0;
     j->notified = false;
     if (j->name) kfree(j->name);
     j->name = 0;
+    if (id && (id == g_js_current || id == g_js_previous))
+        jobs_reset_current();          /* bash's delete_job */
 }
 
 /* A SUBSHELL STARTS WITH NO JOBS. bash's execute_in_subshell calls
@@ -1680,6 +1758,7 @@ static void jobs_remove(struct job *j) {
 static void jobs_forget_all(void) {
     for (int i = 0; i < JOB_MAX; i++)
         if (g_jobs[i]->id) jobs_remove(g_jobs[i]);
+    g_js_current = g_js_previous = 0;
 }
 #endif
 
@@ -1802,16 +1881,8 @@ void shell_notify_jobs_hosted(void) {
         char wb[24];
         const char *what = (r < 0) ? "Done"
                          : shell_job_status_word(code, sig, wb, sizeof wb);
-        /* The mark reflects the job's standing WHEN ALIVE, so the newest
-         * scan here includes the corpse being announced (jobs_newest
-         * skips dead entries for every other caller). */
-        char mark = ' ';
-        {
-            int maxid = 0;
-            for (int k = 0; k < JOB_MAX; k++)
-                if (g_jobs[k]->id > maxid) maxid = g_jobs[k]->id;
-            if (g_jobs[i]->id == maxid) mark = '+';
-        }
+        /* bash's mark: the job is announced while still in the table */
+        char mark = jobs_mark(g_jobs[i]);
         shell_printf("[%d]%c  %-24s%s\n", g_jobs[i]->id, mark, what,
                      g_jobs[i]->name);
         jobs_remove(g_jobs[i]);
@@ -10612,18 +10683,13 @@ static void cmd_jobs(int argc, char **argv) {
         if (g_jobs[i]->id && !g_jobs[i]->dead) (void)shell_job_poll(g_jobs[i]);
     shell_jobs_drop_killed();      /* reported already; bash lists them not */
 #endif
-    /* `+` on the newest job, finished or not; `-` on the newest RUNNING one
-     * below it -- bash gives a finished job that is not the newest a blank
-     * (logs/s9/s9f.bash: "[1]   Exit 3", "[2]+  Running"). */
-    struct job *newest = 0, *prev = 0;
+    /* bash's list_all_jobs begins with cleanup_dead_jobs: a finished job an
+     * earlier `jobs` listed is gone now -- `jobs; jobs` on one line lists
+     * it once (logs/b12 p88). */
     for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && (!newest || g_jobs[i]->id > newest->id))
-            newest = g_jobs[i];
-    for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && !g_jobs[i]->dead && newest &&
-            g_jobs[i]->id < newest->id &&
-            (!prev || g_jobs[i]->id > prev->id))
-            prev = g_jobs[i];
+        if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->notified)
+            jobs_remove(g_jobs[i]);
+    /* `+` and `-` are bash's current and previous jobs (g_js_current) */
     /* In JOB-NUMBER order, as bash lists them: a slot freed and reused
      * holds a newer job than the slots after it. */
     int shown = 0;
@@ -10651,7 +10717,7 @@ static void cmd_jobs(int argc, char **argv) {
         }
         if (j->dead) {
             char wb[24];
-            char mark = (j == newest) ? '+' : (j == prev) ? '-' : ' ';
+            char mark = jobs_mark(j);
             shell_printf("[%d]%c  %-24s%s\n", j->id, mark,
                          shell_job_status_word(j->code, j->sig, wb, sizeof wb),
                          j->name);
@@ -10676,7 +10742,7 @@ static void cmd_jobs(int argc, char **argv) {
          * bash does, and the kernel console's own table below called
          * proc_lookup, which the hosted build does not have -- `jobs` in a
          * script said "proc_lookup: kernel-only" (S6). */
-        char mark = (j == newest) ? '+' : (j == prev) ? '-' : ' ';
+        char mark = jobs_mark(j);
         if (j->stopped)
             shell_printf("[%d]%c  Stopped                 %s\n",
                          j->id, mark, j->name);
@@ -10713,31 +10779,19 @@ static int parse_int(const char *s, int *out) {
  * cleaned up, so `sleep .1 & sleep .5; wait %%` collects it (status 0);
  * tsh skipped a finished one and said "no such job". One a `wait` has
  * already collected is gone, as bash deletes it. */
-static struct job *jobs_newest_any(void) {
-    struct job *best = 0;
-    for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && !g_jobs[i]->waited &&
-            (!best || g_jobs[i]->id > best->id))
-            best = g_jobs[i];
-    return best;
-}
-
 static struct job *jobs_by_spec(const char *s) {
     if (!s || s[0] != '%') return 0;
-    if (!s[1] || strcmp(s, "%%") == 0 || strcmp(s, "%+") == 0)
-        return jobs_newest_any();
+    /* bash's get_job_spec: %% %+ are js.j_current, %- js.j_previous --
+     * which is the current job when there is a single one ("it is both
+     * `+' and `-'", set_current_job: `sleep .1 & sleep .2 & kill %-`, then
+     * `wait %-` waits for the job that is left; Oils 0945). */
+    if (!s[1] || strcmp(s, "%%") == 0 || strcmp(s, "%+") == 0) {
+        struct job *j = jobs_by_id(g_js_current);
+        return (j && !j->waited) ? j : 0;
+    }
     if (strcmp(s, "%-") == 0) {
-        struct job *newest = jobs_newest_any(), *second = 0;
-        for (int i = 0; i < JOB_MAX; i++) {
-            if (!g_jobs[i]->id || g_jobs[i]->waited) continue;
-            if (newest && g_jobs[i]->id == newest->id) continue;
-            if (!second || g_jobs[i]->id > second->id) second = g_jobs[i];
-        }
-        /* "There is only a single job, and it is both `+' and `-'" (bash,
-         * jobs.c set_current_job): `sleep .1 & sleep .2 & kill %-` leaves
-         * one job once the killed one is cleaned up, and `wait %-` waits
-         * for it -- status 0. tsh said "%-: no such job" (Oils 0945). */
-        return second ? second : newest;
+        struct job *j = jobs_by_id(g_js_previous);
+        return (j && !j->waited) ? j : 0;
     }
     int id = 0;
     if (parse_int(s + 1, &id) < 0 || id <= 0) return 0;
@@ -10783,6 +10837,7 @@ static void cmd_fg(int argc, char **argv) {
     char *saved_heap __attribute__((cleanup(shell_kfree_ptr))) =
         shell_strdup(j->name);
     const char *saved_name = saved_heap ? saved_heap : "";
+    jobs_set_current(jid);             /* bash's start_job, foreground */
 
     if (g_opt_monitor) {
         /* bash: fg prints the command text, hands the tty to the job's
@@ -10797,6 +10852,7 @@ static void cmd_fg(int argc, char **argv) {
         if (ssig > 0) {
             struct job *js = jobs_find(jid);
             if (js) js->stopped = true;
+            jobs_set_current(jid);       /* bash's waitchld: a stop */
             shell_printf("\n[%d]+  Stopped                 %s\n",
                          jid, saved_name);
             shell_set_status(128 + ssig);
@@ -10864,6 +10920,7 @@ static void cmd_bg(int argc, char **argv) {
         signal_send_to_pgrp(j->pid, SIGCONT);
         j->stopped = false;
     }
+    jobs_reset_current();              /* bash's start_job, background */
     shell_set_status(0);
 }
 
@@ -22117,6 +22174,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             int jid = jobs_add(pid, jname ? jname : argv[0]);
             struct job *sj = jid > 0 ? jobs_find(jid) : 0;
             if (sj) sj->stopped = true;
+            if (jid > 0) jobs_set_current(jid);   /* bash's waitchld */
             shell_printf("\n[%d]+  Stopped                 %s\n",
                          jid > 0 ? jid : 0, jname ? jname : argv[0]);
             return 128 + ssig;
