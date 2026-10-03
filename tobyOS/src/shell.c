@@ -15820,8 +15820,9 @@ static void cmd_dot(int argc, char **argv) {
     /* `--` ends the options (bash; Oils 0852): `. -- file` sources file */
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
     if (argc < 2) {
-        kprintf(".: filename argument required\n");
-        kprintf_raw(".: usage: . filename [arguments]\n");
+        /* by the name it was called by (bash: "source: usage: source ...") */
+        kprintf("%s: filename argument required\n", argv[0]);
+        kprintf_raw("%s: usage: %s filename [arguments]\n", argv[0], argv[0]);
         shell_set_status(2);
         return;
     }
@@ -15844,7 +15845,8 @@ static void cmd_dot(int argc, char **argv) {
             return;
         }
         if (dst.type == VFS_TYPE_DIR) {
-            kprintf(".: %s: is a directory\n", argv[1]);
+            /* by the name it was called by: "source: DIR: is a directory" */
+            kprintf("%s: %s: is a directory\n", argv[0], argv[1]);
             shell_dot_failed(status_in);
             return;
         }
@@ -31232,6 +31234,14 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
         }
     } else if (sr != VFS_OK) {
         kprintf("%s: %s\n", path_arg, shell_errno_text(sr));
+        return 0;
+    }
+    /* A directory does not open for WRITING: `cmd 1<> dir` is "dir: Is a
+     * directory" and the command does not run, as bash's open(O_RDWR)
+     * fails. The read-only open below would now succeed on one (a `< dir`
+     * opens, logs/b12 p59). */
+    if (sr == VFS_OK && st.type == VFS_TYPE_DIR) {
+        kprintf("%s: Is a directory\n", path_arg);
         return 0;
     }
     return shell_open_vfs_file(path_arg, false, false, label);
