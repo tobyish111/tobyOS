@@ -22727,23 +22727,32 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
 static bool g_expand_literal_ifs_data;
 
 static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
-                                   bool dq_syntax, bool sq_syntax);
+                                   bool dq_syntax, bool sq_syntax,
+                                   bool value_word);
+
+/* Set by shell_expand_param_word for the ONE expansion it asks for: the
+ * word of ${x-W} ${x+W} ${x=W} ${x?W}, a value -- not a pattern, whose
+ * quoted spans the marks have to keep saying are quoted. */
+static bool g_value_word;
 
 /* The string expanded is what a bad substitution in it names (g_bsub_unit). */
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                bool dq_syntax, bool sq_syntax) {
     const char *su = g_bsub_unit;
     int sk = g_bsub_unit_kind;
+    bool vw = g_value_word;
+    g_value_word = false;
     g_bsub_unit = word ? word : "";
     g_bsub_unit_kind = SH_BSUB_STRING;
-    int rc = shell_expand_word_ex_in(word, out, dq_syntax, sq_syntax);
+    int rc = shell_expand_word_ex_in(word, out, dq_syntax, sq_syntax, vw);
     g_bsub_unit = su;
     g_bsub_unit_kind = sk;
     return rc;
 }
 
 static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
-                                   bool dq_syntax, bool sq_syntax) {
+                                   bool dq_syntax, bool sq_syntax,
+                                   bool value_word) {
     const char *p = word ? word : "";
     if (!out) return -1;
     sb_truncate(out, 0);
@@ -22828,8 +22837,10 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
              * inner pair sits in a word the outer pair already protects,
              * and its marks -- a TOGGLE -- switched that protection OFF, so
              * "x y" split into two (bash: one; logs/b12/p35 p36). Marked
-             * only when this is the outermost quoting. */
-            bool dq_mark = g_dq_depth == 0;
+             * only when this is the outermost quoting -- in a VALUE word:
+             * a pattern's quotes still have to say which `?` was quoted
+             * ("${v#"?"}", Oils 2514 2515). */
+            bool dq_mark = g_dq_depth == 0 || !value_word;
             g_dq_depth++;
             const char *su = g_bsub_unit;
             int sk = g_bsub_unit_kind;
@@ -22942,6 +22953,7 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
      *     "${Unset:-"a b c"}"   ->   a b c    double quotes are still syntax
      *
      * Unquoted, both are syntax. See g_dq_depth. */
+    g_value_word = true;
     return shell_expand_word_ex(word, out, true, g_dq_depth == 0);
 }
 
