@@ -2214,6 +2214,13 @@ static int64_t  g_shell_start_secs;        /* when the shell began: SECONDS
                                             * until assigned, printf %T's -2 */
 static char     g_dynvar_buf[4][32];       /* answers, in rotation */
 static int      g_dynvar_next;
+/* WHAT A DYNAMIC VARIABLE WAS LAST READ AS -- bash's value cell: each
+ * getter (get_random, get_seconds, ...) stores what it computed, and the
+ * `declare -p` and `set` listings print that, never computing anew. Never
+ * read: the listing shows `declare -i RANDOM`, no value, and `set` leaves
+ * it out (logs/b12 p85, lt/dl2.sh in WSL bash). LINENO is one too. */
+static char    *g_dynvar_cell[DV_COUNT];
+static char    *g_lineno_cell;
 
 extern uint64_t lx_realtime_ns(uint64_t mono_ns);
 static int shell_set_param0(const char *name);
@@ -2275,7 +2282,25 @@ static int shell_random_next(void) {
     return g_rand_last = rv;
 }
 
+static const char *shell_dynvar_compute(int dv);
 static const char *shell_dynvar_value(int dv) {
+    const char *v = shell_dynvar_compute(dv);
+    if (dv >= 0 && dv < DV_COUNT) {
+        kfree(g_dynvar_cell[dv]);
+        g_dynvar_cell[dv] = shell_strdup(v ? v : "");
+    }
+    return v;
+}
+
+/* $LINENO read: its value, and its cell (see g_dynvar_cell) */
+static const char *shell_lineno_read(char *buf, size_t cap) {
+    ksnprintf(buf, cap, "%lu", g_shell_lineno);
+    kfree(g_lineno_cell);
+    g_lineno_cell = shell_strdup(buf);
+    return buf;
+}
+
+static const char *shell_dynvar_compute(int dv) {
     char *b = g_dynvar_buf[g_dynvar_next];
     g_dynvar_next = (g_dynvar_next + 1) % 4;
     size_t cap = sizeof g_dynvar_buf[0];
@@ -6015,10 +6040,8 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
     struct sh_array *arr = sh_array_find(name);
     const char *sv = arr ? 0 : env_get(name);
     char lineno[24];
-    if (!arr && !sv && strcmp(name, "LINENO") == 0) {
-        ksnprintf(lineno, sizeof lineno, "%lu", g_shell_lineno);
-        sv = lineno;
-    }
+    if (!arr && !sv && strcmp(name, "LINENO") == 0)
+        sv = shell_lineno_read(lineno, sizeof lineno);
     *set = arr || sv;
     const char *v = 0;
     /* AN EMPTY SUBSCRIPT IS bash's "bad array subscript", said twice (its
@@ -7832,6 +7855,43 @@ static bool shell_declare_filter_ok(const char *name, bool want_array,
     return true;
 }
 
+/* A DYNAMIC VARIABLE IN A LISTING (`declare -p` with no names, `set`):
+ * no entry of its own, so it is listed by name -- 1 when NAME is one (a
+ * dynamic variable still special, or LINENO unassigned), with its cell. */
+static int shell_dyn_listed(const char *name, const char **cell, bool *integer) {
+    size_t n = strlen(name);
+    if (env_find(name, n) >= 0 || sh_array_find_literal(name)) return 0;
+    int dv = shell_dynvar_index(name, n);
+    if (dv >= 0) {
+        *cell = g_dynvar_cell[dv];
+        /* -i from the start, as bash makes them -- SECONDS once read
+         * (get_seconds sets att_integer) */
+        *integer = dv == DV_RANDOM || dv == DV_SRANDOM || dv == DV_BASHPID ||
+                   dv == DV_HISTCMD || (dv == DV_SECONDS && g_dynvar_cell[dv]);
+        return 1;
+    }
+    if (strcmp(name, "LINENO") == 0) {
+        *cell = g_lineno_cell;
+        *integer = false;
+        return 1;
+    }
+    return 0;
+}
+
+/* Every listed dynamic name not already in the table, appended to NAMES
+ * (the caller sorts); only those that were read when WITH_CELL (`set`). */
+static int shell_dyn_list_names(const char **names, int n, bool with_cell) {
+    for (int i = 0; i <= DV_COUNT; i++) {
+        const char *nm = i < DV_COUNT ? g_dynvar_names[i] : "LINENO";
+        const char *cell = 0;
+        bool integer = false;
+        if (!shell_dyn_listed(nm, &cell, &integer)) continue;
+        if (with_cell && !cell) continue;
+        names[n++] = nm;
+    }
+    return n;
+}
+
 /* Print one `declare` line. Returns false when the name is not set at all,
  * which is the caller's cue to report it and set status 1. */
 static bool shell_declare_print(const char *name) {
@@ -7854,7 +7914,7 @@ static bool shell_declare_print(const char *name) {
         }
         if (strcmp(name, "LINENO") == 0 && env_find(name, klen) < 0) {
             char b[24];
-            ksnprintf(b, sizeof b, "%lu", g_shell_lineno);
+            (void)shell_lineno_read(b, sizeof b);
             shell_printf("declare -- LINENO=");
             shell_declare_quote(b);
             shell_printf("\n");
@@ -8137,7 +8197,7 @@ static void cmd_declare(int argc, char **argv) {
          * and as the `set` listing already was: it came out in the order
          * the variables were made, the arrays after every scalar
          * (logs/b12 p86). */
-        int cap = g_envc + g_narrays + 1;
+        int cap = g_envc + g_narrays + DV_COUNT + 2;
         const char **names = (const char **)kmalloc((size_t)cap * sizeof *names);
         SH_WORDS(keys);
         if (!names) { shell_set_status(1); return; }
@@ -8155,6 +8215,9 @@ static void cmd_declare(int argc, char **argv) {
             if (env_find(nm, strlen(nm)) >= 0) continue;   /* listed above */
             names[n++] = nm;
         }
+        /* ...and the dynamic variables, which have no entry: bash lists
+         * them, with the value they were last read as or none */
+        n = shell_dyn_list_names(names, n, false);
         for (int k = 1; k < n; k++) {                 /* insertion sort */
             const char *v = names[k];
             int j = k - 1;
@@ -8166,6 +8229,14 @@ static void cmd_declare(int argc, char **argv) {
                                          set_nameref, set_readonly,
                                          set_export))
                 continue;
+            const char *cell = 0;
+            bool integer = false;
+            if (shell_dyn_listed(names[k], &cell, &integer)) {
+                shell_printf("declare -%s %s", integer ? "i" : "-", names[k]);
+                if (cell) { shell_printf("="); shell_declare_quote(cell); }
+                shell_printf("\n");
+                continue;
+            }
             (void)shell_declare_print(names[k]);
         }
         kfree(names);
@@ -9009,6 +9080,16 @@ static void shell_declare_quote_key(const char *k) {
 
 /* One `set` line: `name=value`, or the array form for an array. */
 static void shell_set_print_one(const char *name) {
+    {
+        const char *cell = 0;
+        bool integer = false;
+        if (shell_dyn_listed(name, &cell, &integer)) {
+            shell_printf("%s=", name);
+            shell_set_quote(cell ? cell : "");
+            shell_printf("\n");
+            return;
+        }
+    }
     struct sh_array *arr = sh_array_find_literal(name);
     if (arr) {
         /* bash's own order: an associative array's elements are KEPT in
@@ -9056,11 +9137,13 @@ static void shell_print_vars_set_format(void) {
         /* ON THE HEAP, sized from the tables: every variable and every
          * array, with names of any length. It was a static 512 + 64 slots
          * with 63-byte names, and a longer name was simply not listed. */
-        int cap = g_envc + g_narrays + 1;
+        int cap = g_envc + g_narrays + DV_COUNT + 2;
         const char **names = (const char **)kmalloc((size_t)cap * sizeof *names);
         SH_WORDS(keys);
         if (!names) { shell_set_status(1); return; }
         int n = 0;
+        /* a dynamic variable once read (see g_dynvar_cell) */
+        n = shell_dyn_list_names(names, n, true);
         for (int i = 0; i < g_envc; i++) {
             size_t kl = env_key_len(g_env[i]);
             if (kl == 0) continue;
@@ -17690,6 +17773,15 @@ static int test_unary(const char *op, const char *operand) {
         {
             int vx = env_find(operand, strlen(operand));
             if (vx >= 0 && !(g_env_flags[vx] & SHVAR_NOVALUE)) return 0;
+            /* a dynamic variable always has a value: asking computes it,
+             * as bash's find_variable runs the getter (logs/b12 p87) */
+            int dv = shell_dynvar_index(operand, strlen(operand));
+            if (dv >= 0) { (void)shell_dynvar_value(dv); return 0; }
+            if (vx < 0 && strcmp(operand, "LINENO") == 0) {
+                char lb[24];
+                (void)shell_lineno_read(lb, sizeof lb);
+                return 0;
+            }
         }
         if (sh_array_is_assoc(operand))
             return sh_array_get_key(operand, "0") ? 0 : 1;
@@ -23490,7 +23582,8 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
             return 0;
         }
     } else if (strcmp(name, "LINENO") == 0 && !env_get("LINENO")) {
-        rc = sb_put_uint(out, g_shell_lineno);
+        char lb[24];
+        rc = sb_puts(out, shell_lineno_read(lb, sizeof lb));
     } else {
         const char *v = env_get(name);
         if (!v) {
@@ -27079,8 +27172,10 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
             return shell_expand_braced_parameter(nrt.p, b);
     }
     const char *val = env_get(name);
-    if (!val && strcmp(name, "LINENO") == 0)
-        return sb_put_uint(b, g_shell_lineno);
+    if (!val && strcmp(name, "LINENO") == 0) {
+        char lb[24];
+        return sb_puts(b, shell_lineno_read(lb, sizeof lb));
+    }
     if (!val && g_opt_nounset) {
         shell_arith_unbound(name);
         return -1;
