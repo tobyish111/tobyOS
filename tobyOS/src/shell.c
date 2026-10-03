@@ -33803,6 +33803,23 @@ static int shell_dbr_primary(struct shell_dbr *d) {
 
     /* A unary operator, if a word follows it. `[[ -n ]]` is a one-word test
      * of the string "-n", which is true. */
+    /* ...AND ANY WORD IS ONE: bash's cond_term takes the next WORD as the
+     * operand whatever it spells -- `[[ -f == ]]` tests a file called `==`
+     * (status 1), `[[ -n -eq ]]` and `[[ -n ! ]]` are true; only a token
+     * that is no word is "unexpected argument ... to conditional unary
+     * operator" (logs/b12 p48; Oils 0559). tsh read `==` as the operator
+     * of a binary test with no right side, a syntax error that ended the
+     * script. */
+    if (test_is_unary_op(t) && d->pos + 1 < d->n) {
+        const char *nxt = d->w[d->pos + 1];
+        bool word = !(d->opr[d->pos + 1] && strcmp(nxt, "!") != 0) &&
+                    !(d->pat[d->pos + 1] &&
+                      (strcmp(nxt, "<") == 0 || strcmp(nxt, ">") == 0));
+        if (word) {
+            d->pos += 2;
+            return test_unary(t, nxt) == 0;
+        }
+    }
     if (test_is_unary_op(t) && d->pos + 1 < d->n) {
         const char *nxt = d->w[d->pos + 1];
         /* ...AND WHAT FOLLOWS IT MUST BE AN OPERAND.
