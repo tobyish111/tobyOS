@@ -12313,6 +12313,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * wait on (and learn the exit code of) something outside it. */
             pid = pid_knr(vpid);
             if (!pid) return -ABI_ECHILD;
+            /* ONLY ONE'S OWN CHILD (or a tracee), as the native waitpid and
+             * Linux. Any visible pid was accepted, and proc_wait_info reaps
+             * whatever it is given: a Linux program could collect its
+             * SIBLING, and the sibling's parent then got ECHILD for its own
+             * child. Measured (tools/agent/probes/b12/wsib.c, a static
+             * Linux ELF): the second child's waitpid(sibling, WNOHANG)
+             * "REAPED THE SIBLING", 3 of 3 on the guest; on Linux it is
+             * ECHILD and the parent collects its child (signal 9). */
+            struct proc *self = current_proc();
+            struct proc *c = proc_lookup(pid);
+            if (self && c && !waitpid_may_wait(self, c)) return -ABI_ECHILD;
         }
         /* Capture the caller-visible number NOW: proc_wait() reaps the child,
          * and reaping releases its vpid mapping, so translating afterwards
