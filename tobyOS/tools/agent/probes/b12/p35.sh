@@ -1,0 +1,17 @@
+exec 2>&1
+a=('1 2' 3); set -- 'x y' z
+printf '<%s>' "${u:-${a[@]}}"; echo " 1"
+printf '<%s>' "${u-${a[@]}}"; echo " 2"
+printf '<%s>' ${u:-${a[@]}}; echo " 3"
+printf '<%s>' "${undef[@]:-${a[@]}}"; echo " 4"
+printf '<%s>' "${a[@]:+${a[@]}}"; echo " 5"
+printf '<%s>' "${1+"$@"}"; echo " 6"
+printf '<%s>' ${1+"$@"}; echo " 7"
+printf '<%s>' "${u:-"$@"}"; echo " 8"
+printf '<%s>' "${u:-$@}"; echo " 9"
+printf '<%s>' "${u:-x${a[@]}y}"; echo " 10"
+printf '<%s>' "${undef[*]:-${a[@]}}"; echo " 11"
+printf '<%s>' "${u:-${a[*]}}"; echo " 12"
+printf '<%s>' "${a[@]:-q}"; echo " 13"
+v=$(printf '<%s>' "${u:-${a[@]}}"); echo "14 $v"
+x="${u:-${a[@]}}"; echo "15 [$x]"
