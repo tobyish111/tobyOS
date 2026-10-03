@@ -19,4 +19,13 @@ for sh in bash tsh; do
     start=$((start+40))
   done
 done
+# A run ends with its "exit=N" line. Without it the fetch failed -- an
+# upload or session flake, often the first run after installing a new
+# /bin/tsh -- and two EMPTY files would compare IDENTICAL: four probes were
+# once reported identical that way (logs/b12 p85 p86 fn1 p38, batch 12).
+for b in bash tsh; do
+  if ! tail -1 "$OUT.$b" 2>/dev/null | grep -q '^exit='; then
+    echo "$n NORESULT ($b side has no exit= line -- rerun)"; exit 3
+  fi
+done
 if cmp -s "$OUT.bash" "$OUT.tsh"; then echo "$n IDENTICAL"; else echo "$n DIFFERENT ($(diff "$OUT.bash" "$OUT.tsh" | grep -c '^[<>]') lines)"; fi
