@@ -14977,6 +14977,47 @@ static char *shell_function_printed_as(const struct shell_function *fn, bool mul
     return shell_print_text(def.p, multiline ? SHPR_FUNC : SHPR_FUNC_LINE, shown_name);
 }
 
+/* WHAT A $( ) RUNS: not the text between its parentheses but bash's
+ * PRINTED form of it -- parse_comsub keeps print_comsub's output, and the
+ * subshell parses and runs that. So its line numbers count the printed
+ * lines: a compound is laid out bash's way, comments and blank lines are
+ * gone (logs/b12 p23, p72). The word `x=$(BODY)` is parsed and the text
+ * taken back out of it; a heap string, or 0 when BODY does not parse. */
+static char *shell_print_comsub_body(const char *body) {
+    /* a tagged here-document's body is held apart from the text, and the
+     * parse would go looking for it inline: run such text as written */
+    for (const char *q = body; *q; q++)
+        if (*q == SHELL_HD_TAG) return 0;
+    SH_SB(t);
+    if (sb_puts(&t, "x=$(") < 0 || sb_puts(&t, body) < 0 || sb_puts(&t, "\n)") < 0)
+        return 0;
+    char *res = 0;
+    struct bsyn_env env;
+    shell_syn_env(&env, true, false);
+    env.build = true;
+    env.expand_aliases = false;
+    env.ansi_u = shell_pr_ansi_u;
+    struct bsyn *h = bsyn_open(t.p, t.len, 0, 0, &env);
+    if (!h) return 0;
+    struct bsyn_result r;
+    int k = bsyn_next(h, &r);
+    if (k == BSYN_OK && r.tree && r.tree->type == BN_SIMPLE && r.tree->words &&
+        !r.tree->words->next && r.tree->words->w) {
+        const char *w = r.tree->words->w;
+        size_t n = strlen(w);
+        if (n >= 5 && memcmp(w, "x=$(", 4) == 0 && w[n - 1] == ')') {
+            const char *b = w + 4;
+            size_t bl = n - 5;
+            if (bl && b[0] == ' ' && b[1] == '(') { b++; bl--; }  /* "$( (" */
+            res = (char *)kmalloc(bl + 1);
+            if (res) { memcpy(res, b, bl); res[bl] = 0; }
+        }
+    }
+    bsyn_result_free(&r);
+    bsyn_close(h);
+    return res;
+}
+
 /* $BASH_COMMAND. bash sets it to the printed form of each simple command
  * before running it -- and to a `for`/`select`/`case` head, a [[ ]], a
  * (( )), each of an arithmetic for's three expressions -- except while a
@@ -22143,7 +22184,10 @@ static void shell_capture_body(const char *cmd, bool forked) {
                 if (cs_checked) g_syn_checked--;
             }
         } else {
-            char *copy = shell_strdup(cmd);
+            /* bash's printed text of it, which is what bash runs (see
+             * shell_print_comsub_body); the text as written if that fails */
+            char *copy = shell_print_comsub_body(cmd);
+            if (!copy) copy = shell_strdup(cmd);
             if (copy) {
                 g_reader_syn_iname = "command substitution";
                 g_reader_syn_string = true;
