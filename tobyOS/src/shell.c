@@ -38994,6 +38994,11 @@ static bool shell_try_coproc(const char *src) {
         file_close(ww);
         g_shell_fd[0] = wr;
         g_shell_fd[1] = rw;
+        /* ...and not the input of the command that was running when it
+         * started: a `read` in the coprocess took g_shell_in before its
+         * own fd 0 and read the console under the shparity runner --
+         * "read: read error: 0: Is a directory" (shparity 245a). */
+        g_shell_in = 0;
         shell_trap_clear_caught();
         jobs_forget_all();
         g_subshell_depth++;
