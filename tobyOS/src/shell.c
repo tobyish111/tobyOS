@@ -15894,7 +15894,15 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
                 } else if (scan.in_sq || scan.in_dq) {
                     sep = "\n";
                 } else if (scan.nest > 0) {
-                    char kind = scan.nest_kind[scan.nest - 1];
+                    /* A `( )` or `{ }` INSIDE a substitution ('p') joins as
+                     * the substitution around it does: `x=$( (` then
+                     * `echo z` was glued into `( ; echo z ; )`, a syntax
+                     * error -- the innermost level was the paren, and only
+                     * a substitution kind kept the newline (logs/b12 p84). */
+                    char kind = 'p';
+                    for (int k = scan.nest - 1; k >= 0 && kind == 'p'; k--)
+                        if (k < (int)sizeof scan.nest_kind)
+                            kind = scan.nest_kind[k];
                     /* `${ }` holds ONE word, so its lines join with a
                      * space. A command substitution holds a command LIST and
                      * keeps its NEWLINES -- it is run as a script, and a
