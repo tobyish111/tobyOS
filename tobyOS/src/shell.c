@@ -37130,7 +37130,15 @@ static bool shell_try_compound_pipeline(const char *src) {
              * reader that was itself. Closing it here is what the fds= dance
              * in a real shell is for. */
             if (r) file_close(r);
+            /* A STAGE'S LINE IS ITS OWN. The stage runs from a copy, and a
+             * copy the line map cannot trace back keeps the line last set --
+             * the DEBUG loop above leaves the LAST stage's there:
+             *
+             *     $SH -c '...       bash: "line 1: -c: command not found";
+             *     ...' | sed        tsh said the line of `sed` (Oils 2200) */
+            shell_lmap_push_copy(stages[i], src + stage_off[i]);
             execute_line_text(stages[i]);
+            shell_lmap_pop_copy();
             int crc = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
             _exit(crc & 0xff);
@@ -37142,7 +37150,9 @@ static bool shell_try_compound_pipeline(const char *src) {
             int saved_adj = g_simple_stage_adj;
             g_in_pipeline_stage = true;      /* lastpipe: parent runs it */
             g_simple_stage_adj = saved_adj + (stage_simple[i] ? 1 : 0);
+            shell_lmap_push_copy(stages[i], src + stage_off[i]);
             execute_line_text(stages[i]);
+            shell_lmap_pop_copy();
             g_simple_stage_adj = saved_adj;
             g_in_pipeline_stage = saved_ps;
             last = g_last_status;
@@ -37151,7 +37161,9 @@ static bool shell_try_compound_pipeline(const char *src) {
             if (pst) pst[i] = last;
         }
 #else
+        shell_lmap_push_copy(stages[i], src + stage_off[i]);
         execute_line_text(stages[i]);
+        shell_lmap_pop_copy();
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
         if (last != 0) failed = last;
