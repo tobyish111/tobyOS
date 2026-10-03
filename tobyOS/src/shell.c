@@ -764,6 +764,9 @@ static unsigned long shell_lineno_at(const char *p) {
 static size_t        *g_fndef_lm_off;
 static unsigned long *g_fndef_lm_line;
 static int            g_fndef_lm_n;
+/* The line of the body's `{` or `(` -- bash's function_bstart, its
+ * line_number while the body runs (logs/b12 p94 p105). 0: unknown. */
+static unsigned long  g_fndef_body_ln;
 
 static void shell_fndef_drop_map(void) {
     kfree(g_fndef_lm_off);
@@ -1125,6 +1128,7 @@ struct shell_function {
      * with this map, so $LINENO -- and a diagnostic -- name the line in the
      * body, not the line the call is on. */
     size_t        *lm_off;
+    unsigned long  body_ln;                 /* see g_fndef_body_ln */
     unsigned long *lm_line;
     int            lm_n;
     /* `readonly -f` (S4): not redefined, not unset. */
@@ -1502,10 +1506,29 @@ struct job {
                                 * whenever id != 0 */
     bool notified;             /* listed by `jobs` in a script: it goes at the
                                 * end of the command (shell_jobs_notify_script) */
+    bool blind;                /* `kill` has just signalled it: the next look
+                                * that does not wait misses its death -- see
+                                * shell_job_poll */
 };
 
 static struct job **g_jobs;
 static int          g_jobs_cap;
+
+/* bash's line_number as its executor leaves it -- not $LINENO. A report
+ * made when a wait ends names it: the line the top-level command was read
+ * up to (a `while` or `if` its last line), the line a function's body
+ * starts on, the head of a `for`, `select` or `case` (logs/b12 p94 p102
+ * p105, WSL bash). 0: g_shell_lineno. */
+static unsigned long g_bash_lnum;
+#ifdef SHELL_HOSTED
+/* A forked $( ), <( ) or simple pipeline stage: bash reports no job's
+ * death there -- neither its own jobs nor a $( )'s copy of its parent's
+ * (startup state 2 and SUBSHELL_COMSUB in notify_of_job_status; measured
+ * for the others, logs/b12 p111). A ( ), a compound pipeline stage, a
+ * coprocess and a background child report their own. */
+static bool g_jobs_silent;
+#endif
+static int g_capture_depth;            /* defined with $( ) */
 
 /* THE STATUSES OF REAPED BACKGROUND JOBS, by pid -- bash's bgpids (S9).
  * `wait $!` answers with the job's status again and again, after the job
@@ -1518,6 +1541,7 @@ static struct bgstat *g_bgstats;
 static int g_bgstat_n, g_bgstat_cap;
 
 static void shell_coproc_dispose(void);
+static void shell_jobs_cleanup(void);
 
 /* A REAPED COPROCESS IS MARKED, NOT DISPOSED -- bash's coproc_setstatus
  * (COPROC_DEAD); its variables and descriptors go at the next cleanup,
@@ -1700,6 +1724,13 @@ static bool jobs_grow(void) {
 }
 
 static int jobs_add(int pid, const char *name) {
+    /* bash's stop_pipeline cleans up before the new job takes a slot: a
+     * finished job `jobs` listed is gone, so `sleep .1 & sleep .3; jobs;
+     * sleep 1 &` numbers the new job [1] (logs/b12 p96); and one that ended
+     * meanwhile is no longer a running job when the current and previous
+     * are chosen -- `sleep .1 & <builtins>; sleep 2 & jobs` gives the first
+     * job no `-` (p104). */
+    shell_jobs_cleanup();
     int slot = -1;
     for (int i = 0; i < JOB_MAX && slot < 0; i++)
         if (g_jobs[i]->id == 0) slot = i;
@@ -1734,6 +1765,7 @@ static int jobs_add(int pid, const char *name) {
     j->code = 0;
     j->sig  = 0;
     j->notified = false;
+    j->blind = false;
     shell_bgstat_forget(pid);
     jobs_reset_current();              /* bash's stop_pipeline, async */
     return j->id;
@@ -1903,51 +1935,95 @@ void shell_notify_jobs_hosted(void) {
 #endif
 
 #ifdef SHELL_HOSTED
-/* bash's notify_and_cleanup for a SCRIPT, after each command it reads
- * (jobs.c notify_of_job_status): a background job that a SIGNAL ended is
- * reported -- "LINE: PID Killed  CMD", not for INT, TERM or PIPE, nor a
- * trapped one -- and leaves the job table; one that exited stays in it,
- * for `wait %N` to collect. tsh noticed nothing until a `wait`, so
- * `sleep 1 & kill %%; sleep .2; wait %%` found the job (bash: "no such
- * job", 127; Oils 0944; logs/b12 p49). Its status stays known by pid. */
-static void shell_jobs_notify_script(void) {
-    extern int proc_try_reap(int pid, int *code);
-    if (g_interactive) return;
-    shell_coproc_reap();               /* cleanup_dead_jobs: coproc_reap */
+static int shell_job_poll(struct job *j);      /* see cmd_wait */
+
+/* bash's waitchld, which SIGCHLD runs as each child ends: a job that has
+ * finished is marked dead and nothing is said -- the report waits for a
+ * notify, and a cleanup drops the jobs already reported or listed. tsh has
+ * no SIGCHLD handler, so it looks wherever bash notifies or cleans up, and
+ * that is where bash would have known: after `sleep 1 & kill -9 $!` and a
+ * loop of builtins, `jobs` lists "[1]+  Killed" and no report is printed,
+ * `wait $!` prints the report (logs/b12 p104, WSL bash). tsh reported a
+ * death where it reaped it, so `jobs` printed both. */
+static void shell_jobs_reap(bool waited) {
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
-        /* listed by `jobs`, or collected by `wait` -- in a script there is
-         * no prompt left to announce it at, and bash has deleted it */
-        if (j->id != 0 && (j->notified || j->waited)) { jobs_remove(j); continue; }
-        if (j->id == 0 || j->stopped) continue;
-        /* ONE ALREADY FOUND DEAD (by `jobs`, or by a plain `wait`, which
-         * keeps $!'s job) goes now if a signal ended it -- bash's
-         * notify_of_job_status skips only the background jobs of a script
-         * that EXITED (startup_state 0: POSIX keeps their statuses). So
-         * after `kill $(jobs -p); wait` the next jobs are [1] and [2]
-         * again (shparity 164; logs/b12 lt/w4.sh in WSL bash). Its death
-         * was reported when it was reaped. */
-        if (j->dead) {
-            if (j->sig > 0) jobs_remove(j);
-            continue;
-        }
-        int code = 0;
-        if (proc_try_reap(j->pid, &code) != 1) continue;
-        int sig = proc_last_term_sig();
-        shell_bgstat_add(j->pid, code);
-        if (sig > 0) {
-            shell_report_job_death(j->pid, sig, j->name, false);
-            jobs_remove(j);
-        } else {
-            j->dead = true;
-            j->code = code;
-            j->sig = 0;
-        }
+        if (!j->id || j->dead || j->stopped) continue;
+        if (waited) j->blind = false;      /* time has passed: see shell_job_poll */
+        (void)shell_job_poll(j);
     }
 }
+
+/* bash's cleanup_dead_jobs: the finished jobs already reported or listed
+ * leave the table, and a coprocess found dead is disposed (coproc_reap).
+ * bash runs it when a job starts (stop_pipeline) and after each loop
+ * iteration (REAP: a for or select body, a while, until or arithmetic-for
+ * test) -- `coproc K { sleep 0.2; }` and a loop of builtins that outlasts
+ * it leave K_PID unset (p97). Not in an in-process $( ), whose table is
+ * the parent's: bash would be cleaning a child's copy. */
+static void shell_jobs_cleanup(void) {
+    if (g_interactive || g_capture_depth > 0) return;
+    shell_jobs_reap(false);
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (j->id && j->dead && (j->notified || j->waited)) jobs_remove(j);
+    }
+    shell_coproc_reap();
+}
+
+/* bash's notify_and_cleanup for a SCRIPT (jobs.c notify_of_job_status): a
+ * background job that a SIGNAL ended is reported -- "FILE: line N: PID
+ * Killed  CMD", not for INT, TERM or PIPE, nor a trapped one -- and leaves
+ * the table; one that exited stays, for `wait %N`, until it is listed or
+ * waited for. bash notifies
+ *   - each time its reader takes a line (shell_getc): of the script, a
+ *     sourced file, an eval string, a DEBUG, ERR, signal or EXIT trap's
+ *     action, and the text of each $( ) and <( ) as it expands it --
+ *     SHELL_NOTIFY_READ, where a coprocess found dead at an EARLIER look is
+ *     disposed first: bash's SIGCHLD handler has usually not yet run for
+ *     one that ended just now (shparity 245b);
+ *   - when the wait for a foreground job ends (wait_for), and in `wait` --
+ *     SHELL_NOTIFY_WAITED, where whatever ended meanwhile, a coprocess with
+ *     it, is reaped first.
+ * Measured in WSL bash (logs/b12 p93 p99-p106): tsh noticed only after a
+ * line and after a program, so a job killed before a ( ), a pipeline or a
+ * $( ) was reported a line late. LINE is the line the report names. */
+#define SHELL_NOTIFY_READ   0
+#define SHELL_NOTIFY_WAITED 1
+static void shell_jobs_notify(unsigned long line, int how) {
+    if (g_interactive || g_capture_depth > 0) return;
+    if (how == SHELL_NOTIFY_READ) shell_coproc_reap();
+    shell_jobs_reap(how == SHELL_NOTIFY_WAITED);
+    unsigned long saved_line = g_shell_lineno;
+    if (line) g_shell_lineno = line;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || !j->dead) continue;
+        /* listed by `jobs`, or collected by `wait`: bash has deleted it */
+        if (j->notified || j->waited) { jobs_remove(j); continue; }
+        if (j->sig > 0) {
+            if (!g_jobs_silent)
+                shell_report_job_death(j->pid, j->sig, j->name, false);
+            jobs_remove(j);
+        }
+    }
+    g_shell_lineno = saved_line;
+    if (how == SHELL_NOTIFY_WAITED) shell_coproc_reap();
+}
 #else
-static void shell_jobs_notify_script(void) {}
+#define SHELL_NOTIFY_READ   0
+#define SHELL_NOTIFY_WAITED 1
+static void shell_jobs_notify(unsigned long line, int how) {
+    (void)line;
+    (void)how;
+}
+static void shell_jobs_cleanup(void) {}
 #endif
+
+/* The line a report at the end of a wait names: bash's line_number. */
+static inline unsigned long shell_bash_lnum(void) {
+    return g_bash_lnum ? g_bash_lnum : g_shell_lineno;
+}
 
 static void jobs_reap_finished(void) {
     for (int i = 0; i < JOB_MAX; i++) {
@@ -4583,6 +4659,8 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].lm_off = g_fndef_lm_off;
     g_functions[idx].lm_line = g_fndef_lm_line;
     g_functions[idx].lm_n = g_fndef_lm_n;
+    g_functions[idx].body_ln = g_fndef_body_ln;
+    g_fndef_body_ln = 0;
     g_fndef_lm_off = 0;
     g_fndef_lm_line = 0;
     g_fndef_lm_n = 0;
@@ -4821,9 +4899,15 @@ static void shell_run_trap(int sig) {
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
     g_shell_lineno = 1;                /* the action is its own script (1195) */
+    unsigned long bl_save = g_bash_lnum;
+    g_bash_lnum = 0;
+    /* bash parses the action as a script of its own, and its reader
+     * notifies as it takes the action's line 1 (logs/b12 p99, p106) */
+    shell_jobs_notify(1, SHELL_NOTIFY_READ);
 
     shell_trap_text(action);
     g_shell_lineno = saved_line;
+    g_bash_lnum = bl_save;
 
     if (g_shell_flow != SHELL_FLOW_EXIT) {
         g_shell_flow = saved_flow;
@@ -4926,6 +5010,8 @@ static void shell_run_err_trap(int status) {
     g_err_trap_running = true;
     g_trap_running = true;
     shell_set_status(status);
+    /* the action's parse notifies, naming the current line (p106) */
+    shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_READ);
     shell_trap_text(action);
     g_trap_running = was_running;
     g_err_trap_running = false;
@@ -4955,6 +5041,9 @@ static void shell_run_debug_trap(void) {
     bool was_running = g_trap_running;
     g_debug_trap_running = true;
     g_trap_running = true;
+    /* the action's parse notifies, naming the current line (p106); a
+     * RETURN trap's does not */
+    shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_READ);
     shell_trap_text(action);
     g_trap_running = was_running;
     g_debug_trap_running = false;
@@ -4999,6 +5088,8 @@ static int shell_run_exit_trap(int status) {
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
     shell_set_status(status);
+    /* the action's parse notifies as it takes its line 1 (p106) */
+    shell_jobs_notify(1, SHELL_NOTIFY_READ);
 
     shell_trap_text(action);
 
@@ -10686,7 +10777,6 @@ static void cmd_run(int argc, char **argv) {
 }
 
 static int shell_job_poll(struct job *j);        /* see cmd_wait */
-static void shell_jobs_drop_killed(void);
 
 static void cmd_jobs(int argc, char **argv) {
     /* `jobs -p` PRINTS PIDS, ONE PER LINE, AND NOTHING ELSE. Scripts pipe it
@@ -10735,11 +10825,10 @@ static void cmd_jobs(int argc, char **argv) {
          * run, bash's notify_and_cleanup: `jobs; wait %1` on one line
          * still finds the job (status 0), on two lines it is gone. */
         if (pids_only) {
+            /* bash's pretty_print_job returns before it marks the job
+             * notified: a dead one is still reported later (p104) */
             shell_printf("%d\n", j->pid);
-            if (j->dead) {
-                if (g_interactive) jobs_remove(j);
-                else j->notified = true;
-            }
+            if (j->dead && g_interactive) jobs_remove(j);
             shown++;
             continue;
         }
@@ -10984,39 +11073,47 @@ static int shell_try_reap(int pid, int *code) {
 #endif
 }
 
-/* The job has finished: keep its status, save it by pid, and -- in a
- * script -- report a death by a signal now, as bash does when it reaps. */
+/* The job has finished: keep its status, save it by pid. /bin/tsh says
+ * nothing here -- the report waits for a notify (see shell_jobs_reap); the
+ * kernel's console, which has no notifies, reports it now. */
 static void shell_job_died(struct job *j, int code, int sig) {
     j->dead = true;
     j->code = code;
     j->sig  = sig;
+    j->notified = false;
     shell_bgstat_add(j->pid, code);
+#ifndef SHELL_HOSTED
     if (!(g_opt_monitor && g_interactive))
         shell_report_job_death(j->pid, sig, j->name, false);
+#endif
 }
 
 /* Without blocking: 1 if the job has finished (it is dead now), 0 while it
  * runs, -1 if it is not this process's child -- a forked subshell's view of
- * its parent's jobs, which it may list (`jobs | wc -l`) but never collect. */
+ * its parent's jobs, which it may list (`jobs | wc -l`) but never collect.
+ *
+ * A JOB `kill` HAS JUST SIGNALLED IS STILL RUNNING TO THE NEXT SUCH LOOK.
+ * bash learns of a death from SIGCHLD, once the child has actually gone;
+ * the guest's bash has not, when it reads the line after the `kill` --
+ * `sleep 1 & kill -HUP $!` then `wait $! 2>err.txt` puts the "Hangup" in
+ * err.txt, 5 of 5 (Oils 0488) -- and has a line or two later (Oils 0944
+ * 0945 and logs/b12 t945/t2, 5 of 5). tsh looks synchronously and this
+ * kernel kills fast: its very next look saw the job gone, and 0488 said
+ * "Hangup" outside err.txt. A look after a wait has blocked sees it
+ * (shell_jobs_reap with `waited`). Where bash's SIGCHLD is slower (WSL, the
+ * EliteDesk: 0945 is 143) it misses more looks than one; that is the race
+ * in bash, not followed (logs/b12 oilrep-*.txt, t945-*). */
 static int shell_job_poll(struct job *j) {
     if (j->dead) return 1;
+    if (j->blind) {
+        j->blind = false;
+        return 0;
+    }
     int code = 0;
     int r = shell_try_reap(j->pid, &code);
     if (r <= 0) return r;
     shell_job_died(j, code, proc_last_term_sig());
     return 1;
-}
-
-/* bash drops a job a SIGNAL killed as soon as it notices: it is reported
- * then, not kept -- `jobs` never lists it, a plain `wait` keeps nothing of
- * it, a later `wait -n` does not return it -- while its status stays among
- * the saved ones for `wait PID` (logs/s9/s9f.bash). At a terminal it waits
- * for the prompt's announcement instead. */
-static void shell_jobs_drop_killed(void) {
-    if (g_opt_monitor && g_interactive) return;
-    for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->sig > 0)
-            jobs_remove(g_jobs[i]);
 }
 
 /* The job's status, waiting for it if it is still running, and the job
@@ -11041,12 +11138,20 @@ static int shell_wait_job(struct job *j) {
          * (logs/b12 p88: `sleep .6 & sleep .1 & wait; jobs` is "[2]   Done",
          * no `+`) */
         for (int i = 0; i < JOB_MAX; i++)
-            if (g_jobs[i] != j && g_jobs[i]->id && !g_jobs[i]->dead)
+            if (g_jobs[i] != j && g_jobs[i]->id && !g_jobs[i]->dead) {
+                g_jobs[i]->blind = false;          /* see shell_job_poll */
                 (void)shell_job_poll(g_jobs[i]);
+            }
     }
     int rc = j->code;
-    if (g_opt_monitor && g_interactive) j->waited = true;
-    else jobs_remove(j);
+    /* bash's wait_for ends in notify_and_cleanup: `wait $!` for a job a
+     * signal killed reports it, naming the wait's own line, and so does a
+     * wait for anything else that finds it dead (logs/b12 p104) */
+    shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_WAITED);
+    if (j->id) {
+        if (g_opt_monitor && g_interactive) j->waited = true;
+        else jobs_remove(j);
+    }
     return rc;
 }
 
@@ -11094,7 +11199,6 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
         }
         if (nwant == 0) { shell_set_status(127); return; }
     }
-    bool first_pass = true;
     for (;;) {
         struct job *got = 0;
         bool any = false;
@@ -11109,10 +11213,8 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
             }
             if (shell_job_poll(j) >= 0) any = true;
         }
-        /* A job a signal killed BEFORE this wait began is gone; one that
-         * dies while it waits is its answer. */
-        if (first_pass) shell_jobs_drop_killed();
-        first_pass = false;
+        /* A job a signal killed is an answer too, until a notify has
+         * reported it (bash's wait_for_any_job: "unnotified dead jobs"). */
         for (int i = 0; i < JOB_MAX; i++) {
             struct job *j = g_jobs[i];
             if (!j->id || j->waited || !j->dead) continue;
@@ -11209,7 +11311,10 @@ static void cmd_wait_in(int argc, char **argv) {
             if (g_jobs[i]->id && !g_jobs[i]->dead &&
                 shell_job_poll(g_jobs[i]) < 0)
                 jobs_remove(g_jobs[i]);
-        shell_jobs_drop_killed();
+        /* One a signal killed before it began is reported by the first
+         * wait it makes (wait_for's notify); with nothing left to wait for,
+         * it goes unreported -- unless it is $!, kept for the next notify
+         * (bash's mark_dead_jobs_as_notified; logs/b12 p104). */
         int rc = 0;
         for (;;) {
             /* WHAT FINISHED MEANWHILE IS NOT WAITED FOR. bash reaps every
@@ -15781,10 +15886,18 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (eval_mode) g_eval_reader_depth++;
     else g_script_depth++;
     unsigned long saved_lineno = g_shell_lineno;
+    unsigned long saved_bash_lnum = g_bash_lnum;
     int saved_noexec = g_noexec_error;
     g_noexec_error = 0;
     g_shell_lineno = ((eval_mode || comsub_lines) && saved_lineno > 0)
                          ? saved_lineno - 1 : 0;
+    /* bash's reader notifies as it takes the FIRST line too: an eval
+     * string's names the eval's own line, a sourced file's its line 1
+     * (logs/b12 p99, WSL bash). tsh notified only after a line. */
+    if (eval_mode)
+        shell_jobs_notify(saved_lineno, SHELL_NOTIFY_READ);
+    else if (g_source_depth > 0 && !comsub_lines && !g_reader_main_script)
+        shell_jobs_notify(1, SHELL_NOTIFY_READ);
     int last = 0;
     char *p = text;
     bool first_line = true;
@@ -16249,6 +16362,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
         }
         unsigned long line_last = g_shell_lineno;
         g_shell_lineno = line_first;
+        g_bash_lnum = line_last;               /* see g_bash_lnum */
         if (!accum) shell_lmap_reset(line, line_first);
         bool unit_checked = shell_syn_covers(&syn, (size_t)(p - text));
         if (unit_checked) g_syn_checked++;
@@ -16260,12 +16374,14 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             execute_line_text(ex ? ex : line);
         } else {
             execute_line_text(line);
-            /* bash notifies as it reads the NEXT line (parse.y shell_getc:
-             * line_number++, then notify_and_cleanup), so a report names
-             * that line: a job killed on line 8 is "line 10" once line 9
-             * has run (logs/b12 p67). */
+        }
+        /* bash notifies as it reads the NEXT line (parse.y shell_getc:
+         * line_number++, then notify_and_cleanup), so a report names that
+         * line: a job killed on line 8 is "line 10" once line 9 has run
+         * (logs/b12 p67) -- an eval string's lines too (p99). */
+        if (!eval_mode || g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_lineno = line_last + 1;
-            shell_jobs_notify_script();
+            shell_jobs_notify(line_last + 1, SHELL_NOTIFY_READ);
         }
         if (unit_checked) g_syn_checked--;
         g_shell_lineno = line_last;
@@ -16308,6 +16424,7 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     if (eval_mode) g_eval_reader_depth--;
     else g_script_depth--;
     g_shell_lineno = saved_lineno;
+    g_bash_lnum = saved_bash_lnum;
     return last;
 }
 
@@ -17182,6 +17299,10 @@ static void cmd_eval(int argc, char **argv) {
                                 &eval_checked))
         goto eval_done;
     if (eval_checked) g_syn_checked++;
+    /* bash's reader notifies as it takes the string's line -- naming the
+     * eval's own line -- and again at its end (logs/b12 p99) */
+    unsigned long eval_ln = g_shell_lineno;
+    shell_jobs_notify(eval_ln, SHELL_NOTIFY_READ);
     char *p = cmd;
     while (p && *p) {
         char *nl = shell_unquoted_newline(p);
@@ -17206,6 +17327,8 @@ static void cmd_eval(int argc, char **argv) {
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
     }
+    if (g_shell_flow == SHELL_FLOW_NONE)
+        shell_jobs_notify(eval_ln + 1, SHELL_NOTIFY_READ);
     if (eval_checked) g_syn_checked--;
 eval_done:
     /* See saved_parse_error above: a parse error's EXIT ends only the eval,
@@ -19711,6 +19834,7 @@ static void cmd_kill(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            if (sig > 0) jb->blind = true;         /* see shell_job_poll */
             if (was_stopped && (sig == SIGTERM || sig == SIGHUP)) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
                     (void)signal_send_to_pid_checked(jb->pid, SIGCONT);
@@ -19736,6 +19860,12 @@ static void cmd_kill(int argc, char **argv) {
         if (signal_send_to_pid_checked(pid, sig) != 0) {
             kprintf("kill: (%d) - No such process\n", pid);
             shell_set_status(1);
+        } else if (sig > 0) {
+            /* a job it names, or whose group it names: see shell_job_poll */
+            int want = pid < 0 ? -pid : pid;
+            for (int k = 0; k < JOB_MAX; k++)
+                if (g_jobs[k]->id && g_jobs[k]->pid == want)
+                    g_jobs[k]->blind = true;
         }
     }
 }
@@ -22244,21 +22374,26 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     signal_set_foreground(pid);
     int rc = proc_wait(pid);
     signal_set_foreground(0);
-    {
-        int sig = proc_last_term_sig();
-        if (sig > 0) {
-            /* named as bash names it: the command as written, printed */
-            char *shown __attribute__((cleanup(shell_kfree_ptr))) =
-                shell_curcmd_printed();
-            char *text __attribute__((cleanup(shell_kfree_ptr))) =
-                shown ? 0 : jobs_join_argv(argv);
-            shell_report_job_death(pid, sig, shown ? shown : text ? text : argv[0], true);
-        }
-    }
+    int fsig = proc_last_term_sig();
     /* bash's wait_for ends with notify_and_cleanup: a background job that
      * died meanwhile is reported and dropped now (`... kill %%; sleep .2;
-     * wait %%` on one line finds no job; logs/b12 p49) */
-    shell_jobs_notify_script();
+     * wait %%` on one line finds no job; logs/b12 p49) -- before this
+     * command's own report, the older job being first in bash's table --
+     * and both name bash's line_number: in a function the line its body
+     * starts on, in a `for` the head (logs/b12 p105). */
+    unsigned long bl = shell_bash_lnum();
+    shell_jobs_notify(bl, SHELL_NOTIFY_WAITED);
+    if (fsig > 0) {
+        /* named as bash names it: the command as written, printed */
+        char *shown __attribute__((cleanup(shell_kfree_ptr))) =
+            shell_curcmd_printed();
+        char *text __attribute__((cleanup(shell_kfree_ptr))) =
+            shown ? 0 : jobs_join_argv(argv);
+        unsigned long sl = g_shell_lineno;
+        g_shell_lineno = bl;
+        shell_report_job_death(pid, fsig, shown ? shown : text ? text : argv[0], true);
+        g_shell_lineno = sl;
+    }
     return rc;
 }
 
@@ -22716,6 +22851,7 @@ static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
     }
     if (pid == 0) {
         file_close(r);
+        g_jobs_silent = true;
         g_shell_fd[1] = w;
         shell_set_output(shell_file_output, w);
         printk_set_sink_mode(0, 0, false);
@@ -23111,6 +23247,11 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
         kprintf(SH_PFX_SHELL "bad command substitution\n");
         return -1;
     }
+    /* bash parses the text again as it expands it (xparse_dolparen), and
+     * its reader counts a line and notifies before it takes it -- one past
+     * the simple command's own line (logs/b12 p99-p101). Backquotes are not
+     * parsed so, and do not. */
+    shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
     SH_SB(out);
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
     g_dq_depth = 0;
@@ -27053,8 +27194,11 @@ static bool shell_procsub_make(const char *text, bool input,
     if (!copy) { file_close(r); file_close(w); return false; }
     memcpy(copy, text, tl + 1);
 
+    /* parsed again as it is expanded, as a $( ) is: bash notifies (p99) */
+    shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
     int pid = fork();
     if (pid == 0) {
+        g_jobs_silent = true;
         /* The child IS the command. It must not keep the end the shell kept:
          * a reader still holding the write end never sees EOF. */
         file_close(keep);
@@ -32947,12 +33091,18 @@ static int shell_run_function(struct shell_simple *cmd) {
         shell_callframe_push(run_name, g_shell_lineno);
         /* The body's own lines for $LINENO, and the caller's back after. */
         unsigned long call_line = g_shell_lineno;
+        /* bash's line_number in a body: the line the body starts on, until
+         * a for, select or case says otherwise (logs/b12 p94 p105) */
+        unsigned long bl_save = g_bash_lnum;
+        g_bash_lnum = fn->body_ln ? fn->body_ln
+                    : (fn->lm_n > 0 && fn->lm_line) ? fn->lm_line[0] : call_line;
         struct shell_lmap_saved lm_sv;
         bool lm_in = shell_lmap_enter_body(fn->lm_off, fn->lm_line, fn->lm_n,
                                            run_body, &lm_sv);
         execute_line_text(run_body);
         if (lm_in) shell_lmap_leave_body(&lm_sv);
         g_shell_lineno = call_line;
+        g_bash_lnum = bl_save;
         shell_callframe_pop();
         shell_hd_pin_text(run_body, -1);
         g_diag_fn_source = saved_src;
@@ -33071,6 +33221,12 @@ static int shell_background_forked_as(const char *text, const char *label,
         return 1;
     }
     if (pid == 0) {
+#ifdef SHELL_HOSTED
+        /* An asynchronous child has no jobs of its parent's: `sleep 2 & {
+         * jobs; } &` lists nothing in bash, as `( jobs )` does (logs/b12
+         * p112); its own are reported as a ( )'s are (p111). */
+        jobs_forget_all();
+#endif
         /* TRAPS ARE CLEARED IN A SUBSHELL. POSIX 2.11: a subshell resets to
          * the default every trap the parent had caught.
          *
@@ -33809,6 +33965,9 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             int fpid = fork();
             if (fpid == 0) {
                 g_in_pipeline_stage = true;
+#ifdef SHELL_HOSTED
+                g_jobs_silent = true;
+#endif
                 /* Every pipe was created up front, so this child inherited
                  * ALL of their ends. It needs exactly two -- see the note in
                  * the compound path about a writer that is its own reader. */
@@ -33892,16 +34051,20 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
 
     int rc = 0;
     int failed = 0;
+    bool waited_any = false;
     for (int i = 0; i < pl->count; i++) {
         int stage_rc = stage_status[i];
         if (has_pid[i]) {
             signal_set_foreground(pids[i]);
             stage_rc = proc_wait(pids[i]);
+            waited_any = true;
         }
         stage_status[i] = stage_rc;
         if (stage_rc != 0) failed = stage_rc;
         if (i + 1 == pl->count) rc = stage_rc;
     }
+    /* the end of a foreground wait: bash's notify (p93 v7, p103) */
+    if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
     shell_set_pipestatus(stage_status, pl->count);
     /* `set -o pipefail`: the rightmost FAILING stage decides. */
     if (g_opt_pipefail && failed != 0) rc = failed;
@@ -35946,6 +36109,10 @@ static bool shell_try_for_command(const char *src) {
 
     int last = 0;
     g_shell_loop_depth++;
+    /* bash's line_number while a for or select runs is its head's line
+     * (execute_for_command), what a report at a wait's end names (p94) */
+    unsigned long bl_save = g_bash_lnum;
+    g_bash_lnum = g_shell_lineno;
 
     /* One exit path, so the redirection frame is always unwound. Every
      * `return true` inside the loop became a `goto done` for that reason. */
@@ -35978,6 +36145,7 @@ static bool shell_try_for_command(const char *src) {
             shell_lmap_pop_copy();
             g_shell_lineno = ln_save;
             last = g_last_status;
+            shell_jobs_cleanup();               /* bash's REAP */
             if (g_shell_flow == SHELL_FLOW_RETURN ||
                 g_shell_flow == SHELL_FLOW_INTERRUPT ||
                 g_shell_flow == SHELL_FLOW_DISCARD ||
@@ -36027,6 +36195,9 @@ static bool shell_try_for_command(const char *src) {
          * of lines the body spanned. */
         g_shell_lineno = ln_save;
         last = g_last_status;
+        /* bash's REAP after each body: a coprocess or job that ended in
+         * it is cleaned up now (p97) */
+        shell_jobs_cleanup();
         /* INTERRUPT propagates like EXIT: a loop that only tested
          * RETURN/EXIT/BREAK/CONTINUE would fall through and KEEP
          * ITERATING while every command inside it returned early --
@@ -36058,6 +36229,7 @@ static bool shell_try_for_command(const char *src) {
         }
     }
 done:
+    g_bash_lnum = bl_save;
     shell_heredoc_mark_free(&hd_mark);
     g_shell_loop_depth--;
     if (io_active) shell_restore_io_frame(&io_frame);
@@ -36246,6 +36418,7 @@ static bool shell_try_arith_for_command(const char *src) {
                 last = 1;
             goto done;
         }
+        shell_jobs_cleanup();                   /* bash's REAP (p97) */
         if (v == 0) goto done;
         if (body_line) g_shell_lineno = body_line;
         shell_lmap_push_copy(body, body_start);
@@ -36376,6 +36549,7 @@ static bool shell_try_while_command(const char *src) {
         g_errexit_suspend++;              /* the condition is a decision */
         execute_line_text(cond);
         g_errexit_suspend--;
+        shell_jobs_cleanup();             /* bash's REAP after the test (p97) */
         if (g_last_status != 0) {
             goto done;
         }
@@ -36521,6 +36695,7 @@ static bool shell_try_until_command(const char *src) {
         g_errexit_suspend++;
         execute_line_text(cond);
         g_errexit_suspend--;
+        shell_jobs_cleanup();             /* bash's REAP after the test (p97) */
         if (g_last_status == 0) {
             goto done;
         }
@@ -36805,6 +36980,7 @@ static bool shell_try_case_command(const char *src) {
     if (!shell_starts_with_word(s, "case")) return false;
     s = shell_skip_blanks(s + 4);
     shell_bashcmd_set(src, strlen(src), SHPR_CASE_HEAD);
+    unsigned long case_ln = g_shell_lineno;      /* see g_bash_lnum (p102) */
     shell_run_debug_trap();            /* the case head fires once (1189) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -36966,9 +37142,12 @@ static bool shell_try_case_command(const char *src) {
         fall = false;
         if (hit) {
             matched = true;
+            unsigned long bl_save = g_bash_lnum;
+            g_bash_lnum = case_ln;
             shell_lmap_push_copy(body_text, body);
             execute_line_text(body_text);
             shell_lmap_pop_copy();
+            g_bash_lnum = bl_save;
             kfree(body_text);
             last = g_last_status;
             shell_set_status(last);
@@ -37093,6 +37272,7 @@ static bool shell_try_function_definition(const char *src) {
                 return true;
             }
             shell_fndef_capture_map(s + 1, (size_t)(q - (s + 1)), 2);
+            g_fndef_body_ln = shell_lineno_at(s);
             g_fndef_whole = true;
             if (shell_function_set(fnameb.p, body.p) < 0) {
                 shell_set_status(1);
@@ -37189,6 +37369,7 @@ static bool shell_try_function_definition(const char *src) {
         const char *bs = body_start;
         while (bs < body_end && (*bs == ' ' || *bs == '\t' || *bs == ';')) bs++;
         shell_fndef_capture_map(bs, (size_t)(body_end - bs), lm_shift);
+        g_fndef_body_ln = shell_lineno_at(body_start - 1);
     }
     {
         g_fndef_whole = body_whole;
@@ -37826,6 +38007,9 @@ static bool shell_try_subshell_command(const char *src) {
             int rc = proc_wait(pid);
             if (rc < 0) rc = 1;
             int sig = proc_last_term_sig();
+            /* what died meanwhile first, as after a program (p93 v5) */
+            unsigned long bl = shell_bash_lnum();
+            shell_jobs_notify(bl, SHELL_NOTIFY_WAITED);
             if (sig > 0) {
                 /* "( kill -9 $BASHPID )": the subshell as bash prints it */
                 SH_SB(jt);
@@ -37833,7 +38017,10 @@ static bool shell_try_subshell_command(const char *src) {
                 (void)sb_puts(&jt, body);
                 (void)sb_puts(&jt, "\n)");
                 char *pn = shell_print_text(jt.p, SHPR_COMMAND, 0);
+                unsigned long sl = g_shell_lineno;
+                g_shell_lineno = bl;
                 shell_report_job_death(pid, sig, pn ? pn : "( )", true);
+                g_shell_lineno = sl;
                 kfree(pn);
             }
             shell_set_status(rc);
@@ -38690,6 +38877,14 @@ static bool shell_try_compound_pipeline(const char *src) {
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
             if (!stage_simple[i]) jobs_forget_all();     /* a subshell */
+#ifdef SHELL_HOSTED
+            /* A simple stage keeps its parent's table, for `jobs | cat`,
+             * and reports none of it; a compound one is a subshell that
+             * reports its own, as a ( ) does -- the guest's bash prints
+             * the death of a job killed inside `{ ...; } | cat` (logs/b12
+             * n3-p111; WSL's bash did not, p111.wsl1). */
+            else g_jobs_silent = true;
+#endif
             /* A CHILD MUST NOT HOLD THE READ END OF THE PIPE IT WRITES TO.
              *
              *     cat /dev/urandom | sleep 0.1
@@ -38765,13 +38960,17 @@ static bool shell_try_compound_pipeline(const char *src) {
     g_shell_fd[1] = saved1;
     /* Collect the children AFTER every write end is closed, or a stage that
      * is still writing has nobody to read it and none of them ever finish. */
+    bool waited_any = false;
     for (int i = 0; i < n; i++) {
         if (cpids[i] <= 0) continue;
         int wrc = proc_wait(cpids[i]);
+        waited_any = true;
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
         if (pst) pst[i] = wrc;
     }
+    /* the end of a foreground wait: bash's notify (p103) */
+    if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
     {
         const char *ls = n > 0 ? stages[n - 1] : "";
         while (*ls == ' ' || *ls == '\t') ls++;
