@@ -8,9 +8,13 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-/* Provided by src/shell.c: the completion specs registered by
- * `complete -W`, and the builtin names hosted tsh will run. */
-const char *tsh_complete_wordlist(const char *cmdname);
+/* Provided by src/shell.c: bash's programmable completion for the line
+ * being edited (shell_complete.inc), and the builtin names hosted tsh will
+ * run. */
+#include <stdbool.h>
+bool tsh_progcomp(const char *line, size_t point, const char *word,
+                  char ***out, int *nout, unsigned long *opts);
+void tsh_progcomp_free(char **v, int n);
 const char *tsh_builtin_name_at(int i);
 
 extern int         shell_history_count_hosted(void);
@@ -354,30 +358,19 @@ static void do_complete(struct le *s) {
     struct le_matches m;
     m.n = 0;
 
-    /* A `complete -W` spec for the COMMAND wins over the filesystem: that is
-     * the whole point of registering one. */
-    char cmdname[128];
-    cmdname[0] = 0;
-    if (!le_is_command_slot(s, start)) {
-        size_t i = 0;
-        while (i < s->len && (s->buf[i] == ' ' || s->buf[i] == '\t')) i++;
-        size_t k = 0;
-        while (i < s->len && s->buf[i] != ' ' && s->buf[i] != '\t' &&
-               k + 1 < sizeof cmdname) cmdname[k++] = s->buf[i++];
-        cmdname[k] = 0;
-    }
-    const char *wl_spec = cmdname[0] ? tsh_complete_wordlist(cmdname) : 0;
+    /* A COMPSPEC FOR THE COMMAND WINS over the editor's own completion:
+     * bash runs the spec -- its actions, -W words, -F function, -C command,
+     * -X filter -- and only falls back when no `complete` applies. */
+    char line[LE_MAX + 1];
+    memcpy(line, s->buf, s->len);
+    line[s->len] = 0;
+    char **pm = 0;
+    int pn = 0;
+    unsigned long popts = 0;
+    int wl_spec = tsh_progcomp(line, s->pos, word, &pm, &pn, &popts);
     if (wl_spec) {
-        size_t pl = strlen(word);
-        const char *p = wl_spec;
-        while (*p) {
-            while (*p == ' ') p++;
-            char tok[128];
-            size_t k = 0;
-            while (*p && *p != ' ' && k + 1 < sizeof tok) tok[k++] = *p++;
-            tok[k] = 0;
-            if (k && (!pl || strncmp(tok, word, pl) == 0)) le_add(&m, tok, 0);
-        }
+        for (int i = 0; i < pn; i++) le_add(&m, pm[i], 0);
+        tsh_progcomp_free(pm, pn);
     } else if (le_is_command_slot(s, start) && !strchr(word, '/')) {
         le_scan_commands(&m, word);
     } else {

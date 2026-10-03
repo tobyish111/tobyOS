@@ -5676,6 +5676,8 @@ static unsigned sh_bash_hash(const char *k) {
     return i;
 }
 
+#include "shell_htab.inc"
+
 static unsigned sh_assoc_nbuckets(const struct sh_array *a) {
     return a->nbuckets > 0 ? (unsigned)a->nbuckets : 1024u;
 }
@@ -7436,131 +7438,6 @@ static void cmd_declare(int argc, char **argv) {
          * declaration utility makes assignments like any other. */
         if (g_opt_allexport) g_env_flags[idx] |= SHVAR_EXPORTED;
     }
-}
-
-/* `compgen [-A TYPE] [-o OPT] [WORD]` -- the completion generator.
- *
- * Restricted to what a shell with no completion engine can honestly answer:
- * the names in the filesystem that begin with WORD, optionally filtered to
- * files or directories. Everything else bash's compgen can do -- variables,
- * function names, readline hooks -- is out of scope, and generating nothing
- * for those is what bash does too when nothing matches. Status is 0 when
- * something was printed and 1 when nothing was, which is compgen's contract
- * and the thing scripts test.
- *
- * Without it, `compgen -A file o | sort` was "failed to spawn '/bin/compgen'"
- * and the pipeline produced nothing where bash listed two names. */
-static void cmd_compgen(int argc, char **argv) {
-    const char *type = "file";
-    const char *word = "";
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-A") == 0 && i + 1 < argc) { type = argv[++i]; continue; }
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { i++; continue; }
-        if (strcmp(argv[i], "-d") == 0) { type = "directory"; continue; }
-        if (strcmp(argv[i], "-f") == 0) { type = "file"; continue; }
-        /* GENERATE NOTHING RATHER THAN THE WRONG THING. -W supplies its own
-         * word list, -X filters it, -F/-C call a generator: all of them mean
-         * the answer does not come from the filesystem, and listing files
-         * instead would be worse than the "compgen: not found" this builtin
-         * replaced. Same for the completion types that are not names on
-         * disk. */
-        if (strcmp(argv[i], "-W") == 0 || strcmp(argv[i], "-X") == 0 ||
-            strcmp(argv[i], "-F") == 0 || strcmp(argv[i], "-C") == 0 ||
-            strcmp(argv[i], "-G") == 0 || strcmp(argv[i], "-P") == 0 ||
-            strcmp(argv[i], "-S") == 0) {
-            shell_set_status(1);
-            return;
-        }
-        if (argv[i][0] == '-' && argv[i][1]) continue;
-        word = argv[i];
-    }
-    /* `compgen -A user [WORD]`: the names in /etc/passwd, in file order,
-     * filtered to those beginning with WORD -- what the guest's bash
-     * answers now that a passwd database exists. */
-    if (strcmp(type, "user") == 0) {
-        void *buf = 0;
-        size_t sz = 0;
-        bool printed = false;
-        size_t wl = strlen(word);
-        if (vfs_read_all("/etc/passwd", &buf, &sz) == VFS_OK) {
-            const char *p = (const char *)buf, *end = p + sz;
-            while (p < end) {
-                const char *line = p;
-                while (p < end && *p != '\n') p++;
-                const char *eol = p;
-                if (p < end) p++;
-                const char *c = line;
-                while (c < eol && *c != ':') c++;
-                size_t nl = (size_t)(c - line);
-                char nb[64];
-                if (nl == 0 || nl + 1 > sizeof nb) continue;
-                if (nl < wl || memcmp(line, word, wl) != 0) continue;
-                memcpy(nb, line, nl);
-                nb[nl] = '\0';
-                shell_printf("%s\n", nb);
-                printed = true;
-            }
-            kfree(buf);
-        }
-        shell_set_status(printed ? 0 : 1);
-        return;
-    }
-
-    if (strcmp(type, "file") != 0 && strcmp(type, "directory") != 0) {
-        shell_set_status(1);
-        return;
-    }
-
-    /* Split WORD into the directory to list and the prefix to match. */
-    const char *slash = 0;
-    for (const char *q = word; *q; q++) if (*q == '/') slash = q;
-    char dir_arg[VFS_PATH_MAX];
-    char shown[VFS_PATH_MAX];
-    const char *prefix = word;
-    if (!slash) {
-        memcpy(dir_arg, ".", 2);
-        shown[0] = '\0';
-    } else {
-        size_t dlen = (size_t)(slash - word);
-        size_t plen = dlen + 1;
-        if (plen + 1 > sizeof shown) { shell_set_status(1); return; }
-        if (dlen == 0) memcpy(dir_arg, "/", 2);
-        else {
-            if (dlen + 1 > sizeof dir_arg) { shell_set_status(1); return; }
-            memcpy(dir_arg, word, dlen);
-            dir_arg[dlen] = '\0';
-        }
-        memcpy(shown, word, plen);
-        shown[plen] = '\0';
-        prefix = slash + 1;
-    }
-
-    char dir_path[VFS_PATH_MAX];
-    if (shell_canonicalize_path(dir_arg, dir_path, sizeof dir_path) < 0) {
-        shell_set_status(1);
-        return;
-    }
-    struct vfs_dir d;
-    if (vfs_opendir(dir_path, &d) != VFS_OK) { shell_set_status(1); return; }
-
-    size_t plen = strlen(prefix);
-    int matches = 0;
-    struct vfs_dirent ent;
-    while (vfs_readdir(&d, &ent) == VFS_OK) {
-        if (strncmp(ent.name, prefix, plen) != 0) continue;
-        if (plen == 0 && ent.name[0] == '.') continue;
-        if (strcmp(type, "directory") == 0) {
-            char full[VFS_PATH_MAX];
-            if (ksnprintf(full, sizeof full, "%s/%s", dir_path, ent.name) < 0)
-                continue;
-            struct vfs_stat st;
-            if (vfs_stat(full, &st) != VFS_OK || st.type != VFS_TYPE_DIR) continue;
-        }
-        shell_printf("%s%s\n", shown, ent.name);
-        matches++;
-    }
-    vfs_closedir(&d);
-    shell_set_status(matches > 0 ? 0 : 1);
 }
 
 /* readonly [-aAfp] [NAME[=VALUE]...] (S4). The options were read as names --
@@ -19307,184 +19184,6 @@ static void cmd_enable(int argc, char **argv) {
 }
 
 
-/* ---- complete / compopt ------------------------------------------------
- *
- * These store per-command completion specs. They are only worth having
- * because the line editor now READS them (programs/tsh/lineedit.c calls
- * tsh_complete_wordlist below on Tab) -- a registry nothing consumes is the
- * dead-subsystem shape this tree has been bitten by more than once.
- *
- * -W (an explicit word list) is what actually drives completion here. The
- * generator forms (-F a function, -C a command, -G a glob) are PARSED and
- * stored so `complete -p` can print the spec back, but they are not run: to
- * run them the completer would have to execute shell code mid-keystroke, and
- * a half-working -F that silently produced nothing would be worse than
- * saying so. `complete -p` shows exactly what was registered either way.
- */
-/* NO FIXED SIZE (S6, 2026-10-01): 32 specs -- the 33rd `complete` said "too
- * many specifications" -- with every field cut short (a -W list at 255
- * bytes). The fields are heap strings, NULL when not given, and the table
- * grows. A pointer from compspec_find lasts until the next compspec_add. */
-struct compspec {
-    char *name;
-    char *words;        /* -W list */
-    char *opts;         /* -o options, recorded for -p */
-    char *gen;          /* -F/-C/-G text, recorded for -p */
-    char genkind;       /* 'F', 'C', 'G' or 0 */
-};
-static struct compspec *g_compspecs;
-static int g_compspec_n;
-static int g_compspec_cap;
-
-static struct compspec *compspec_find(const char *name) {
-    for (int i = 0; i < g_compspec_n; i++)
-        if (strcmp(g_compspecs[i].name, name) == 0) return &g_compspecs[i];
-    return 0;
-}
-
-static struct compspec *compspec_add(const char *name) {
-    struct compspec *c = compspec_find(name);
-    if (c) return c;
-    char *n = shell_strdup(name);
-    if (!n) return 0;
-    if (g_compspec_n >= g_compspec_cap) {
-        int ncap = g_compspec_cap ? g_compspec_cap * 2 : 16;
-        struct compspec *nv =
-            (struct compspec *)kmalloc((size_t)ncap * sizeof *nv);
-        if (!nv) { kfree(n); return 0; }
-        for (int i = 0; i < g_compspec_n; i++) nv[i] = g_compspecs[i];
-        if (g_compspecs) kfree(g_compspecs);
-        g_compspecs = nv;
-        g_compspec_cap = ncap;
-    }
-    c = &g_compspecs[g_compspec_n++];
-    memset(c, 0, sizeof *c);
-    c->name = n;
-    return c;
-}
-
-static void compspec_remove(struct compspec *c) {
-    int k = (int)(c - g_compspecs);
-    if (c->name)  kfree(c->name);
-    if (c->words) kfree(c->words);
-    if (c->opts)  kfree(c->opts);
-    if (c->gen)   kfree(c->gen);
-    for (int m = k + 1; m < g_compspec_n; m++) g_compspecs[m - 1] = g_compspecs[m];
-    g_compspec_n--;
-}
-
-/* Replace one field with a copy of `v`; the old value stays when out of
- * memory. */
-static bool compspec_store(char **field, const char *v) {
-    char *n = shell_strdup(v);
-    if (!n) return false;
-    if (*field) kfree(*field);
-    *field = n;
-    return true;
-}
-
-static void compspec_print(const struct compspec *c) {
-    shell_printf("complete");
-    if (c->opts && c->opts[0]) shell_printf(" -o %s", c->opts);
-    if (c->genkind)  shell_printf(" -%c '%s'", c->genkind, c->gen ? c->gen : "");
-    if (c->words && c->words[0]) shell_printf(" -W '%s'", c->words);
-    shell_printf(" %s\n", c->name);
-}
-
-static void cmd_complete(int argc, char **argv) {
-    bool remove = false, print = false;
-    const char *words = 0, *opts = 0, *gen = 0;
-    char genkind = 0;
-    int first = argc;
-
-    for (int i = 1; i < argc; i++) {
-        const char *a = argv[i];
-        if (a[0] != '-' || !a[1]) { first = i; break; }
-        if (strcmp(a, "-r") == 0) { remove = true; continue; }
-        if (strcmp(a, "-p") == 0) { print = true; continue; }
-        if (strcmp(a, "-W") == 0 && i + 1 < argc) { words = argv[++i]; continue; }
-        if (strcmp(a, "-o") == 0 && i + 1 < argc) { opts  = argv[++i]; continue; }
-        if (strcmp(a, "-F") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'F'; continue; }
-        if (strcmp(a, "-C") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'C'; continue; }
-        if (strcmp(a, "-G") == 0 && i + 1 < argc) { gen = argv[++i]; genkind = 'G'; continue; }
-        if (strcmp(a, "-A") == 0 && i + 1 < argc) { i++; continue; }
-        /* Single-letter action flags bash accepts (-a -b -c -d -f -v ...).
-         * Consumed so a real completion script does not abort on them. */
-        if (a[1] && !a[2]) continue;
-        kprintf("complete: %s: invalid option\n", a);
-        shell_set_status(2);
-        return;
-    }
-
-    if (first >= argc) {
-        if (remove) {
-            while (g_compspec_n > 0)
-                compspec_remove(&g_compspecs[g_compspec_n - 1]);
-            shell_set_status(0);
-            return;
-        }
-        for (int i = 0; i < g_compspec_n; i++)
-            compspec_print(&g_compspecs[i]);
-        shell_set_status(0);
-        return;
-    }
-
-    int rc = 0;
-    for (int i = first; i < argc; i++) {
-        if (remove) {
-            struct compspec *c = compspec_find(argv[i]);
-            if (c) compspec_remove(c);
-            continue;
-        }
-        if (print) {
-            struct compspec *c = compspec_find(argv[i]);
-            if (!c) { rc = 1; continue; }
-            compspec_print(c);
-            continue;
-        }
-        struct compspec *c = compspec_add(argv[i]);
-        if (!c) { rc = 1; continue; }            /* out of memory */
-        if (words && !compspec_store(&c->words, words)) rc = 1;
-        if (opts && !compspec_store(&c->opts, opts)) rc = 1;
-        if (gen) {
-            if (compspec_store(&c->gen, gen)) c->genkind = genkind;
-            else rc = 1;
-        }
-    }
-    shell_set_status(rc);
-}
-
-static void cmd_compopt(int argc, char **argv) {
-    /* compopt adjusts the -o options of an existing spec. With no name it
-     * applies to the completion in progress, which only exists inside a -F
-     * generator -- and those do not run here, so that form has nothing to
-     * act on and says so rather than pretending. */
-    const char *add = 0;
-    int first = argc;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { add = argv[++i]; continue; }
-        if (strcmp(argv[i], "+o") == 0 && i + 1 < argc) { i++; continue; }
-        if (argv[i][0] == '-' && argv[i][1]) continue;
-        first = i; break;
-    }
-    if (first >= argc) {
-        kprintf("compopt: not currently executing a completion function\n");
-        shell_set_status(1);
-        return;
-    }
-    int rc = 0;
-    for (int i = first; i < argc; i++) {
-        struct compspec *c = compspec_find(argv[i]);
-        if (!c) {
-            kprintf("compopt: %s: no completion specification\n", argv[i]);
-            rc = 1;
-            continue;
-        }
-        if (add && !compspec_store(&c->opts, add)) rc = 1;
-    }
-    shell_set_status(rc);
-}
-
 /* ---- caller ------------------------------------------------------------
  * Reports where the running function was called FROM. That needs a per-frame
  * record, which did not exist: tsh tracks $LINENO and the nesting depth, but
@@ -19655,6 +19354,10 @@ static void cmd_bind(int argc, char **argv) {
     }
     shell_set_status(0);
 }
+
+static void cmd_complete(int argc, char **argv);
+static void cmd_compgen(int argc, char **argv);
+static void cmd_compopt(int argc, char **argv);
 
 static const struct cmd cmds[] = {
     { "complete","complete [-W list] NAME...: completion spec", cmd_complete },
@@ -36927,16 +36630,9 @@ int shell_set_param0_hosted(const char *name) {
     return shell_set_param0(name);
 }
 
-/* Seams for the hosted line editor's Tab completion. Kept here because the
- * spec table and the builtin table both live in this file; lineedit.c has no
- * business reaching into either. */
-const char *tsh_complete_wordlist(const char *cmdname) {
-    if (!cmdname || !*cmdname) return 0;
-    struct compspec *c = compspec_find(cmdname);
-    if (!c || !c->words || !c->words[0]) return 0;
-    return c->words;
-}
+#include "shell_complete.inc"
 
+/* The hosted line editor's seam to the builtin table. */
 const char *tsh_builtin_name_at(int i) {
     /* Only names hosted tsh will actually run: offering `mkdir` as a builtin
      * completion when the hosted shell resolves it from PATH would advertise
