@@ -39923,6 +39923,7 @@ const char *shell_history_get_hosted(int i) {
     return g_hist[i];
 }
 
+#ifdef SHELL_HOSTED
 /* BASH_FUNC_NAME%%=() { ... }: how bash passes an exported function, and
  * how tsh passes one (shell_build_env_overlay). */
 static bool shell_env_is_function(const char *kv) {
@@ -39936,7 +39937,8 @@ static bool shell_env_is_function(const char *kv) {
  * start: the text must be ONE function definition of that name -- anything
  * more is refused with bash's two warnings (its SEVAL_FUNCDEF|SEVAL_ONECMD
  * guard against code smuggled in after the body). They are not variables,
- * and are exported again to this shell's children. */
+ * and are exported again to this shell's children. Hosted only: the kernel
+ * build has no environ (see shell_init_hosted). */
 static void shell_import_env_functions(void) {
     extern char **environ;
     for (char **e = environ; e && *e; e++) {
@@ -39992,6 +39994,7 @@ static void shell_import_env_functions(void) {
         if (fi >= 0) g_functions[fi].exported = true;
     }
 }
+#endif
 
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
@@ -40133,7 +40136,9 @@ void shell_init_hosted(const char *argv0) {
         }
         shell_init_bash_vars(self.p);
     }
+#ifdef SHELL_HOSTED
     shell_import_env_functions();
+#endif
 }
 
 /* Run a script file to completion; returns its exit status.
