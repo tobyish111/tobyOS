@@ -31929,6 +31929,21 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
     }
 
     if (assignc == cmd->argc) {
+        /* An assignment-only command takes the status of the LAST COMMAND
+         * SUBSTITUTION in its value, which is what makes
+         *
+         *     x=$(echo x; exit 33); echo $?      ->  33
+         *
+         * while `echo $(echo x; exit 33)` reports echo's own 0. Without this,
+         * an assignment always looked like a success.
+         *
+         * THE ASSIGNMENTS COME FIRST, then the redirections: bash makes
+         * them as it expands the words, so `abc=def >/nope` sets abc and
+         * then fails, status 1 (Oils 2365) -- tsh refused the redirection
+         * first and never assigned. */
+        int rc = shell_apply_assignments(cmd->argv, assignc, "shell");
+        if (rc == 0) rc = g_capture_last_status;
+        if (cmd->redir_count == 0 || g_shell_flow != SHELL_FLOW_NONE) return rc;
         SH_FD_STATE(fds);
         shell_fd_state_init_from_defaults(&fds);
         if (shell_apply_redirs(cmd, &fds, "shell") < 0) {
@@ -31936,15 +31951,6 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             return 1;
         }
         shell_fd_state_close_owned(&fds);
-        /* An assignment-only command takes the status of the LAST COMMAND
-         * SUBSTITUTION in its value, which is what makes
-         *
-         *     x=$(echo x; exit 33); echo $?      ->  33
-         *
-         * while `echo $(echo x; exit 33)` reports echo's own 0. Without this,
-         * an assignment always looked like a success. */
-        int rc = shell_apply_assignments(cmd->argv, assignc, "shell");
-        if (rc == 0) rc = g_capture_last_status;
         return rc;
     }
 
