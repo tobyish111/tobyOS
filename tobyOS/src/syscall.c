@@ -4788,6 +4788,16 @@ static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
     return (long)n;
 }
 
+/* May `self` wait for `c`? Its own child, a child of another thread of
+ * its group, or a tracee it traces -- what Linux's wait4 accepts. */
+static bool waitpid_may_wait(struct proc *self, struct proc *c) {
+    if (c->ppid == self->pid || c->tracer_pid == self->pid) return true;
+    int stg = self->is_thread ? self->tgid : self->pid;
+    struct proc *par = c->ppid > 0 ? proc_lookup(c->ppid) : 0;
+    if (par && (par->is_thread ? par->tgid : par->pid) == stg) return true;
+    return false;
+}
+
 static long sys_waitpid(int vpid, int *status_out, int flags) {
     /* Slice 10: the caller's number, translated in; the same number back out.
      * Identity in the initial namespace. */
@@ -4795,6 +4805,15 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
     if (vpid > 0) {
         pid = pid_knr(vpid);
         if (!pid) return -ABI_ENOENT;
+        /* ONLY ONE'S OWN CHILD. Any pid was accepted, and proc_wait_info
+         * reaps whatever it is given, so a process could collect another's
+         * child: a forked $( ) of /bin/tsh, polling the job table it
+         * inherited, reaped and reported its PARENT's killed background
+         * job -- on the wrong line, before the parent's own output, and
+         * gone from the parent's table (logs/b12 p67). ECHILD, as Linux. */
+        struct proc *self = current_proc();
+        struct proc *c = proc_lookup(pid);
+        if (self && c && !waitpid_may_wait(self, c)) return -ABI_ECHILD;
     } else {
         /* K2 (2026-09-30): -1 = any child, 0 = any in the caller's group,
          * -N = any in group N -- POSIX waitpid, and exactly what LX_wait4
