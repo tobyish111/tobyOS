@@ -1985,11 +1985,9 @@ static bool g_assign_fail_hit;
 
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
-    char name[64];
-    size_t n = klen;
-    if (n >= sizeof(name)) n = sizeof(name) - 1;
-    if (key && n > 0) memcpy(name, key, n);
-    name[n] = '\0';
+    SH_SB(nameb);                       /* any length: it was cut at 63 */
+    if (key && klen > 0) (void)sb_putmem(&nameb, key, klen);
+    const char *name = nameb.p;
     g_readonly_hit = true;
     /* An assignment's refusal is bash's bare "NAME: readonly variable",
      * after the diagnostic prefix; a builtin's carries its own name. The
@@ -2360,10 +2358,9 @@ static const char *env_get(const char *key) {
          * is d and `set -u` calls it unbound (Oils 1847). It read as "".
          * (An array target has its element 0.) */
         if (nx < 0) {
-            char tn[128];
-            if (klen + 1 > sizeof tn) return 0;
-            memcpy(tn, target, klen);
-            tn[klen] = '\0';
+            SH_SB(tnb);
+            if (sb_putmem(&tnb, target, klen) < 0) return 0;
+            const char *tn = tnb.p;
             return sh_array_is_assoc(tn) ? sh_array_get_key(tn, "0")
                                          : sh_array_get(tn, 0);
         }
@@ -2379,10 +2376,9 @@ static const char *env_get(const char *key) {
     /* Declared, no value: unset -- unless it is an array that has an
      * element 0 now (`local -a a; a[0]=x; echo $a`). */
     if (g_env_flags[idx] & SHVAR_NOVALUE) {
-        char nm[128];
-        if (klen + 1 > sizeof nm) return 0;
-        memcpy(nm, g_env[idx], klen);
-        nm[klen] = '\0';
+        SH_SB(nmb);
+        if (sb_putmem(&nmb, g_env[idx], klen) < 0) return 0;
+        const char *nm = nmb.p;
         return sh_array_is_assoc(nm) ? sh_array_get_key(nm, "0")
                                      : sh_array_get(nm, 0);
     }
@@ -2391,10 +2387,9 @@ static const char *env_get(const char *key) {
      * 0187) -- the declaration left `a=` here, and that empty value
      * shadowed the element. */
     if (g_env_flags[idx] & SHVAR_ARRAY) {
-        char nm[128];
-        if (klen + 1 <= sizeof nm) {
-            memcpy(nm, g_env[idx], klen);
-            nm[klen] = '\0';
+        SH_SB(nmb);
+        if (sb_putmem(&nmb, g_env[idx], klen) == 0) {
+            const char *nm = nmb.p;
             if (sh_array_find(nm))
                 return sh_array_is_assoc(nm) ? sh_array_get_key(nm, "0")
                                              : sh_array_get(nm, 0);
@@ -3428,9 +3423,9 @@ static int sh_try_array_assignment(const char *kv) {
                 shell_nameref_elem_write(lnm.p, true) < 0)
                 return -1;
         }
-        char nm[128];
-        if (keylen + 1 > sizeof nm) return 0;
-        memcpy(nm, kv, keylen); nm[keylen] = '\0';
+        SH_SB(nmb);                     /* any length (it was 127) */
+        if (sb_putmem(&nmb, kv, keylen) < 0) return -1;
+        const char *nm = nmb.p;
         if (!shell_name_is_valid(nm, keylen)) return 0;
         /* `r=(3)` and `r+=(4)` on a readonly array (S4) -- also through a
          * nameref: `declare -n r=a; r+=(4)` on a readonly a (Oils 0461). */
@@ -3568,11 +3563,10 @@ static int env_set_kv(const char *kv_in) {
      * A NAME THAT IS AN ARRAY appends to element 0, which is bash's answer
      * and is the same rule `$a` already follows for a bare array name. */
     if (klen > 1 && kv_in[klen - 1] == '+') {
-        char nm[128];
+        SH_SB(nmb);                     /* any length (it was 127) */
         size_t nlen = klen - 1;
-        if (nlen + 1 > sizeof nm) return -1;
-        memcpy(nm, kv_in, nlen);
-        nm[nlen] = '\0';
+        if (sb_putmem(&nmb, kv_in, nlen) < 0) return -1;
+        const char *nm = nmb.p;
         if (!shell_name_is_valid(nm, nlen)) return -1;
 
         const char *add = kv_in + klen + 1;
@@ -6461,11 +6455,9 @@ static void shell_print_export_entry(const char *entry) {
      * lines out of this against bash's own output. */
     size_t klen = env_key_len(entry);
     if (entry[klen] == '=') {
-        char name[64];
-        if (klen + 1 > sizeof(name)) return;
-        memcpy(name, entry, klen);
-        name[klen] = '\0';
-        shell_printf("declare -x %s=\"%s\"\n", name, entry + klen + 1);
+        SH_SB(nameb);                   /* a longer name was not listed */
+        if (sb_putmem(&nameb, entry, klen) < 0) return;
+        shell_printf("declare -x %s=\"%s\"\n", nameb.p, entry + klen + 1);
     } else {
         shell_printf("declare -x %s\n", entry);
     }
@@ -6900,14 +6892,14 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
                                bool has_value, bool append, bool make_local,
                                bool assoc, unsigned attr_on, unsigned attr_off,
                                const char *label) {
-    char base[128];
+    SH_SB(baseb);                       /* any length (it was 127) */
     size_t bl = (size_t)(lb - word);
-    if (bl == 0 || bl >= sizeof base || !shell_name_is_valid(word, bl)) {
+    if (bl == 0 || !shell_name_is_valid(word, bl) ||
+        sb_putmem(&baseb, word, bl) < 0) {
         kprintf("%s: `%.*s': not a valid identifier\n", label, (int)nlen, word);
         return false;
     }
-    memcpy(base, word, bl);
-    base[bl] = '\0';
+    const char *base = baseb.p;
     if (make_local && !shell_local_declared_here(base, g_script_depth)) {
         if (shell_locals_push(base, g_script_depth) < 0) return false;
         int ix = env_find(base, bl);
@@ -7065,14 +7057,12 @@ static void cmd_local(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
-        char name[128];
-        if (klen >= sizeof name) {
-            kprintf("local: name too long\n");
+        SH_SB(nameb);                   /* "local: name too long" past 127 */
+        if (sb_putmem(&nameb, argv[i], klen) < 0) {
             shell_set_status(1);
             continue;
         }
-        memcpy(name, argv[i], klen);
-        name[klen] = '\0';
+        const char *name = nameb.p;
 
         /* A READONLY NAME IS NOT MADE LOCAL (S4): bash refuses with status
          * 1 and the variable stays what it was. tsh pushed the local first,
@@ -7894,10 +7884,9 @@ static void cmd_declare(int argc, char **argv) {
          * much. Same omission the bare `set` listing had. */
         for (int k = 0; k < g_envc; k++) {
             size_t kl = env_key_len(g_env[k]);
-            char nm[128];
-            if (kl == 0 || kl + 1 > sizeof nm) continue;
-            memcpy(nm, g_env[k], kl);
-            nm[kl] = '\0';
+            SH_SB(nmb);
+            if (kl == 0 || sb_putmem(&nmb, g_env[k], kl) < 0) continue;
+            const char *nm = nmb.p;
             if (!shell_declare_filter_ok(nm, set_array, set_assoc,
                                          set_nameref, set_readonly,
                                          set_export))
@@ -7924,10 +7913,9 @@ static void cmd_declare(int argc, char **argv) {
         for (; i < argc; i++) {
             size_t kl = env_key_len(argv[i]);
             if (argv[i][kl] != '=') kl = strlen(argv[i]);
-            char nm[128];
-            if (kl == 0 || kl + 1 > sizeof nm) continue;
-            memcpy(nm, argv[i], kl);
-            nm[kl] = '\0';
+            SH_SB(nmb);
+            if (kl == 0 || sb_putmem(&nmb, argv[i], kl) < 0) continue;
+            const char *nm = nmb.p;
             if (!shell_declare_print(nm)) {
                 kprintf("declare: %s: not found\n", nm);
                 shell_set_status(1);
@@ -8182,10 +8170,9 @@ static void cmd_readonly(int argc, char **argv) {
 
         if (argv[i][klen] == '=') {
             if (opt_A && !shell_readonly_key(argv[i], nlen)) {
-                char nm[128];
-                if (nlen < sizeof nm) {
-                    memcpy(nm, argv[i], nlen);
-                    nm[nlen] = '\0';
+                SH_SB(nmb);
+                if (sb_putmem(&nmb, argv[i], nlen) == 0) {
+                    const char *nm = nmb.p;
                     if (!sh_array_is_assoc(nm)) {
                         sh_array_unset(nm);
                         (void)sh_array_make_assoc(nm);
@@ -8409,13 +8396,11 @@ static void cmd_unset(int argc, char **argv) {
         /* A READONLY NAME CANNOT BE UNSET, whole or by element (S4): bash
          * says so and returns 1; tsh dropped `r[0]` and then `r`. */
         {
-            char nmb[128];
+            SH_SB(nmbb);
             size_t bl = 0;
-            while (argv[i][bl] && argv[i][bl] != '[' && bl + 1 < sizeof nmb) {
-                nmb[bl] = argv[i][bl];
-                bl++;
-            }
-            nmb[bl] = '\0';
+            while (argv[i][bl] && argv[i][bl] != '[') bl++;
+            if (sb_putmem(&nmbb, argv[i], bl) < 0) continue;
+            const char *nmb = nmbb.p;
             if (bl && shell_readonly_key(nmb, bl)) {
                 kprintf("unset: %s: cannot unset: readonly variable\n", nmb);
                 shell_set_status(1);
@@ -15701,14 +15686,13 @@ static void cmd_alias(int argc, char **argv) {
         while (*eq && *eq != '=') eq++;
         if (*eq == '=') {
             size_t nlen = (size_t)(eq - argv[i]);
-            char name[64];
-            if (nlen == 0 || nlen + 1 > sizeof(name)) {
+            SH_SB(nameb);               /* any length (it was 63) */
+            if (nlen == 0 || sb_putmem(&nameb, argv[i], nlen) < 0) {
                 kprintf("alias: bad name '%s'\n", argv[i]);
                 shell_set_status(1);
                 continue;
             }
-            memcpy(name, argv[i], nlen);
-            name[nlen] = '\0';
+            const char *name = nameb.p;
             if (shell_alias_set(name, eq + 1) < 0) {
                 kprintf("alias: failed to set '%s'\n", name);
                 shell_set_status(1);
@@ -27189,15 +27173,15 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                  * 0x02 0x61 and a raw shell_name_is_valid() over those two
                  * bytes says no. That is the whole reason the first cut of
                  * this rule compiled, ran, and changed nothing. */
-                char nmbuf[64];
-                size_t nmlen = 0;
+                SH_SB(nmsb);                    /* any length (it was 63) */
                 bool nmok = true;
                 for (char *z = wb.p; z < wb.p + wb.len; z++) {
                     if (*z == SHELL_ARG_MARK || *z == SHELL_NOSPLIT_MARK ||
                         *z == SHELL_GLOB_ESC) continue;
-                    if (nmlen + 1 >= sizeof nmbuf) { nmok = false; break; }
-                    nmbuf[nmlen++] = *z;
+                    if (sb_putc(&nmsb, *z) < 0) { nmok = false; break; }
                 }
+                const char *nmbuf = nmsb.p;
+                size_t nmlen = nmsb.len;
                 /* ...through `&`, `|` and `;` too: inside the brackets they
                  * are arithmetic (`a[5&3]=x`), as the scanner now agrees. */
                 int bd = 0;
@@ -27728,10 +27712,9 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
             const char *start = p;
             while (shell_alias_name_char(*p)) p++;
             size_t n = (size_t)(p - start);
-            char name[64];
-            if (n + 1 <= sizeof(name)) {
-                memcpy(name, start, n);
-                name[n] = '\0';
+            SH_SB(nameb);               /* any length (it was 63) */
+            if (sb_putmem(&nameb, start, n) == 0) {
+                const char *name = nameb.p;
                 const char *q = shell_skip_blanks(p);
                 /* Not in a script unless asked. This is the rule, not an
                  * optimisation: `alias foo=bar; foo` runs bar interactively
@@ -30100,11 +30083,10 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
         const char *kv = assignv[i];
         size_t klen = env_key_len(kv);
         if (klen > 1 && kv[klen - 1] == '+') {
-            char nm[128];
+            SH_SB(nmb);
             size_t nlen = klen - 1;
-            if (nlen + 1 <= sizeof nm) {
-                memcpy(nm, kv, nlen);
-                nm[nlen] = '\0';
+            if (sb_putmem(&nmb, kv, nlen) == 0) {
+                const char *nm = nmb.p;
                 const char *old = env_get(nm);
                 extra += nlen + 1 + (old ? strlen(old) : 0) +
                          strlen(kv + klen + 1) + 1;
@@ -30133,12 +30115,11 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
         const char *kv = assignv[i];
         size_t klen = env_key_len(kv);
         if (klen > 1 && kv[klen - 1] == '+') {
-            char nm[128];
+            SH_SB(nmb);
             size_t nlen = klen - 1;
             const char *add = kv + klen + 1;
-            if (nlen + 1 <= sizeof nm) {
-                memcpy(nm, kv, nlen);
-                nm[nlen] = '\0';
+            if (sb_putmem(&nmb, kv, nlen) == 0) {
+                const char *nm = nmb.p;
                 const char *old = env_get(nm);
                 size_t ol = old ? strlen(old) : 0, al = strlen(add);
                 char *d = pool;
@@ -30308,10 +30289,9 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
         }
         if (exported) {
             size_t klen = env_key_len(assignv[i]);
-            char nm[64];
-            if (klen > 0 && klen + 1 <= sizeof nm) {
-                memcpy(nm, assignv[i], klen);
-                nm[klen] = '\0';
+            SH_SB(nmb);
+            if (klen > 0 && sb_putmem(&nmb, assignv[i], klen) == 0) {
+                const char *nm = nmb.p;
                 int idx = env_find(nm, klen);
                 if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
             }
@@ -34000,14 +33980,12 @@ static bool shell_try_for_command(const char *src) {
     }
     while (shell_var_char(*s)) s++;
     size_t name_len = (size_t)(s - name_start);
-    char name[64];
-    if (name_len + 1 > sizeof(name)) {
-        kprintf("for: variable name too long\n");
+    SH_SB(nameb);                       /* any length (it was 63) */
+    if (sb_putmem(&nameb, name_start, name_len) < 0) {
         shell_set_status(2);
         return true;
     }
-    memcpy(name, name_start, name_len);
-    name[name_len] = '\0';
+    const char *name = nameb.p;
 
     s = shell_skip_blanks(s);
     bool implicit_at = false;
@@ -35239,11 +35217,8 @@ static bool shell_try_function_definition(const char *src) {
      * "not a valid identifier" and status 1, where falling through to the
      * command path would have said "not found" and 127. */
     if (!shell_func_name_is_valid(name_start, name_len)) {
-        char bad[64];
-        size_t bn = name_len < sizeof bad - 1 ? name_len : sizeof bad - 1;
-        memcpy(bad, name_start, bn);
-        bad[bn] = '\0';
-        kprintf(SH_PFX_TSH "`%s': not a valid identifier\n", bad);
+        kprintf(SH_PFX_TSH "`%.*s': not a valid identifier\n",
+                (int)name_len, name_start);
         shell_set_status(1);
         return true;
     }
