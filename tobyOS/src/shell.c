@@ -1260,6 +1260,7 @@ static int   sh_array_literal_commit(const char *tmp, const char *name,
 static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
 static bool g_expand_literal_ifs_data;      /* see shell_expand_word_ex */
+static bool g_tok_word_assign_ctx;          /* see its definition */
 static void shell_bad_subst(bool fatal);
 static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
@@ -21586,7 +21587,7 @@ static int shell_append_positional_join(struct shell_sb *b,
      * answer for both. bash and dash agree on this, which is why the corpus
      * files it as POSIX even though it reads like a quirk. Quoted, the join is
      * still correct -- g_dq_depth is what tells the two apart. */
-    if (ifs && !*ifs && g_dq_depth == 0) {
+    if (ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
@@ -21644,6 +21645,20 @@ static int shell_append_array_join(struct shell_sb *b,
                     sh_join_empty_elem(b, before) < 0)
                     return -1;
             }
+        }
+        return 0;
+    }
+    /* ${a[*]} UNQUOTED UNDER A NULL IFS is a field per element, as $* is
+     * (bash; Oils 2731) -- run together only in an assignment. ${!a[*]}
+     * there is bash's own: the subscripts as ONE word, joined by a space
+     * (Oils 2733). */
+    bool null_unquoted = ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx;
+    if (null_unquoted && indices) sep = ' ';
+    else if (null_unquoted) {
+        if (sh_put_lead_mark(b) < 0) return -1;
+        for (int i = 0; i < n; i++) {
+            if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+            if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
         }
         return 0;
     }
@@ -21720,8 +21735,14 @@ static int shell_append_array_slice(struct shell_sb *b,
         return 0;
     }
     bool first = true;
+    /* unquoted under a null IFS: a field each, as ${a[*]} itself */
+    bool fields = ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx;
+    if (fields && sh_put_lead_mark(b) < 0) return -1;
     for (long i = off; i < end; i++) {
-        if (!first && sep && sb_putc(b, sep) < 0) return -1;
+        if (!first) {
+            if (fields) { if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1; }
+            else if (sep && sb_putc(b, sep) < 0) return -1;
+        }
         first = false;
         if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
     }
@@ -21770,12 +21791,12 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
         if (g_opt_errtrace)  opts[oi++] = 'E';
         opts[oi] = '\0';
         rc = sb_puts(out, opts);
-    } else if (strcmp(name, "*") == 0) {
+    } else if (strcmp(name, "*") == 0 || strcmp(name, "@") == 0) {
+        /* $@ and $* are SET only when there is a parameter: with none,
+         * ${@-minus} is minus and ${@+plus} nothing (bash; Oils 2544). */
         if (is_join) *is_join = true;
-        rc = shell_append_positional_join(out, true);
-    } else if (strcmp(name, "@") == 0) {
-        if (is_join) *is_join = true;
-        rc = shell_append_positional_join(out, false);
+        *is_set = g_positional_count > 0;
+        rc = shell_append_positional_join(out, name[0] == '*');
     } else if (name[0] >= '0' && name[0] <= '9') {
         int idx = 0;
         for (const char *d = name; *d >= '0' && *d <= '9'; d++)
@@ -24941,6 +24962,10 @@ static bool g_tok_word_expanded;
  * expanded text, where `ex=a b c` from a variable is indistinguishable
  * from a literal `ex=a b c` -- and bash splits the first, not the second. */
 static bool g_tok_word_assign_src;
+/* ...and is in ASSIGNMENT POSITION: the command's prefix, or an argument of
+ * a declaration builtin. There bash expands a `$*` under a null IFS to the
+ * parameters run together (string_list_dollar_star), not to fields. */
+static bool g_tok_word_assign_ctx;
 
 /* The `{name}` read in front of the redirection operator about to be
  * emitted; the operator's token takes it (shell_emit_token_fd). */
@@ -25965,6 +25990,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 if (*a == '=') g_tok_word_assign_src = true;
             }
         }
+        g_tok_word_assign_ctx = g_tok_word_assign_src && (prefix_ok || decl_util_cmd);
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
          * nothing else on the line: bash expands the command word and the
@@ -28026,8 +28052,6 @@ static bool shell_is_ifs_white(char c) {
     return (c == ' ' || c == '\t' || c == '\n') && shell_is_ifs_char(c);
 }
 
-static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
-                         const char *word, bool quoted);
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
                             const char *word, bool quoted, bool expanded,
                             bool assign_src);
@@ -28097,6 +28121,8 @@ static bool shell_word_has_quoted_null(const char *w) {
     return false;
 }
 
+static int shell_split_add(struct shell_pipeline *pl, struct shell_simple *cur,
+                           const char *word, bool quoted);
 static int shell_add_marked_words(struct shell_pipeline *pl,
                                   struct shell_simple *cur,
                                   const char *word, bool quoted) {
@@ -28146,53 +28172,47 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
             if (!*tail) break;
         }
 
+        /* EACH FIELD IS SPLIT WHERE IT IS NOT QUOTED. A field cut out of the
+         * word carries only part of its quote marks -- they are toggles, and
+         * "$@" holds one pair for all its parameters -- so the state at the
+         * field's start is worked out and the field is given balanced marks
+         * of its own; shell_split_add then splits what was not quoted:
+         *
+         *     s='1 2'; set -- x y; argv.py $s"$@"
+         *     bash: ['1', '2x', 'y']        tsh: ['1 2x', 'y']
+         *
+         * tsh handed a quoted word's fields over whole, so the unquoted
+         * prefix never split (Oils 2688). An empty element's body
+         * (SHELL_EMPTY_ELEM) and a seam between two "@" expansions
+         * (SHELL_ARG_JOIN) are no text; a quoted empty element keeps its
+         * marks and so stays one empty field, while an unquoted empty field
+         * is no field (under a null IFS -- see shell_add_arg_ex). */
         size_t glue = (emitted == 0) ? prefix_len : 0;
-        sb_truncate(&tmp, 0);
-        if (sb_putmem(&tmp, word, glue) < 0 ||
-            sb_putmem(&tmp, start, n) < 0)
-            return -1;
-
-        /* The tokenizer's quote marks travel with the text; strip them here or
-         * they reach the program as raw 0x02 bytes in argv. */
-        SH_SB(clean);
-        if (shell_strip_nosplit(&clean, tmp.p) < 0) return -1;
-        {   /* an empty element's body (SHELL_EMPTY_ELEM) is no text, and
-             * a seam between two "@" expansions (SHELL_ARG_JOIN) none */
-            char *w = clean.p;
-            for (const char *r = clean.p; *r; r++) {
-                if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
-                if (*r != SHELL_EMPTY_ELEM && *r != SHELL_ARG_JOIN) *w++ = *r;
+        bool prot0 = false;
+        for (const char *q = word; q < (glue ? word : start); q++) {
+            if (*q == SHELL_DATA_ESC && q[1]) { q++; continue; }
+            if (*q == SHELL_NOSPLIT_MARK) prot0 = !prot0;
+        }
+        SH_SB(field);
+        bool prot = prot0;
+        if (prot0 && sb_putc(&field, SHELL_NOSPLIT_MARK) < 0) return -1;
+        const char *segs[2][2] = { { word, word + glue }, { start, start + n } };
+        for (int sg = 0; sg < 2; sg++) {
+            for (const char *q = segs[sg][0]; q < segs[sg][1]; q++) {
+                if (*q == SHELL_DATA_ESC && q + 1 < segs[sg][1]) {
+                    if (sb_putc(&field, *q) < 0 || sb_putc(&field, q[1]) < 0) return -1;
+                    q++;
+                    continue;
+                }
+                if (*q == SHELL_EMPTY_ELEM || *q == SHELL_ARG_JOIN) continue;
+                if (*q == SHELL_NOSPLIT_MARK) prot = !prot;
+                if (sb_putc(&field, *q) < 0) return -1;
             }
-            *w = '\0';
-            clean.len = (size_t)(w - clean.p);
         }
-
+        if (prot && sb_putc(&field, SHELL_NOSPLIT_MARK) < 0) return -1;
         char *saved = 0;
-        if (shell_pipeline_save_word(pl, clean.p, &saved) < 0) return -1;
-        /* An unquoted "$@" still field-splits each parameter; a quoted one
-         * keeps each parameter whole, spaces and all. */
-        if (quoted) {
-            if (shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
-        } else if (!*saved) {
-            /* AN EMPTY PARAMETER IS STILL A FIELD -- UNLESS IT IS THE LAST.
-             *
-             *     set -- one "" two    argv.py $@  ->  ['one', '', 'two']
-             *     set -- 'a b' c ''    argv.py $@  ->  ['a', 'b', 'c']
-             *
-             * The fields of `$@` are already split, so running an empty one
-             * back through the splitter produces nothing and the middle
-             * argument vanished. A TRAILING empty field is a different thing:
-             * field splitting discards it, which is why bash's answers differ
-             * between those two lines. (The ZERO-parameter case never reaches
-             * here -- it is one bare marker with no text, and the check above
-             * breaks out of the loop for it.) */
-            const char *tail = p;
-            while (*tail == SHELL_NOSPLIT_MARK) tail++;
-            if (*tail != '\0' &&
-                shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
-        } else {
-            if (shell_add_arg(pl, cur, saved, false) < 0) return -1;
-        }
+        if (shell_pipeline_save_word(pl, field.p, &saved) < 0) return -1;
+        if (shell_split_add(pl, cur, saved, quoted) < 0) return -1;
         emitted++;
     }
 
@@ -28267,6 +28287,54 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
         }
     }
 
+    /* AN UNQUOTED "@" LIST JOINS ON IFS AND SPLITS LIKE ANY OTHER TEXT.
+     *
+     *     set -- a 'b c' '' dxe ''
+     *     printf '<%s>' $@         IFS default: <a><b><c><dxe>
+     *                              IFS=x:       <a><b c><><d><e>
+     *     printf '<%s>' =$@=       IFS default: <=a><b><c><dxe><=>
+     *
+     * bash joins unquoted $@ with IFS's first character and splits the
+     * result (string_list_dollar_at): with blank IFS an empty parameter is
+     * no field, with IFS=x an empty one in the middle is. tsh kept every
+     * parameter a field of its own, so empties survived under any IFS.
+     * Under a set, non-null IFS the marks outside quotes become that
+     * character (the expansion's own leading mark and a seam between two
+     * expansions become nothing); a NULL IFS splits nothing, so there each
+     * parameter stays a field and only empty ones go (below). */
+    {
+        const char *ifs = env_get("IFS");
+        if ((!ifs || *ifs) && shell_word_has_argmark(word)) {
+            char sep = ifs ? ifs[0] : ' ';
+            SH_SB(norm);
+            bool prot = false, lead_seen = false, left = false;
+            for (const char *q = word; *q; q++) {
+                char c = *q;
+                if (c == SHELL_DATA_ESC && q[1]) {
+                    if (sb_putc(&norm, c) < 0 || sb_putc(&norm, q[1]) < 0) return -1;
+                    q++;
+                    continue;
+                }
+                if (c == SHELL_NOSPLIT_MARK) prot = !prot;
+                else if (!prot && c == SHELL_ARG_MARK) {
+                    if (lead_seen && sb_putc(&norm, sep) < 0) return -1;
+                    lead_seen = true;
+                    continue;
+                } else if (!prot && (c == SHELL_ARG_JOIN || c == SHELL_EMPTY_ELEM)) {
+                    continue;
+                } else if (c == SHELL_ARG_MARK) {
+                    lead_seen = true;
+                    left = true;
+                }
+                if (sb_putc(&norm, c) < 0) return -1;
+            }
+            char *nsaved = 0;
+            if (shell_pipeline_save_word(pl, norm.p, &nsaved) < 0) return -1;
+            word = nsaved;
+            if (!left) return shell_split_add(pl, cur, word, quoted);
+        }
+    }
+
     int mrc = shell_add_marked_words(pl, cur, word, quoted);
     if (mrc != 0) return mrc < 0 ? -1 : 0;
 
@@ -28319,15 +28387,21 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
         return shell_add_one_arg(pl, cur, word, false);
     }
 
-    /* IFS splitting, POSIX rules -- and the two rules are different.
-     *
-     * A run of IFS WHITESPACE is a single delimiter, and leading/trailing
-     * runs produce no fields, so "  x   y  " is two fields. But each IFS
-     * NON-whitespace character delimits on its own, so with IFS=':' the
-     * string "a::b" is THREE fields, the middle one empty. Collapsing both
-     * kinds (which is what the loop here used to do) silently drops empty
-     * fields, and `IFS=: read a b c` is exactly how scripts parse
-     * /etc/passwd-shaped data. */
+    return shell_split_add(pl, cur, word, quoted);
+}
+
+/* IFS splitting, POSIX rules -- and the two rules are different.
+ *
+ * A run of IFS WHITESPACE is a single delimiter, and leading/trailing
+ * runs produce no fields, so "  x   y  " is two fields. But each IFS
+ * NON-whitespace character delimits on its own, so with IFS=':' the
+ * string "a::b" is THREE fields, the middle one empty. Collapsing both
+ * kinds (which is what the loop here used to do) silently drops empty
+ * fields, and `IFS=: read a b c` is exactly how scripts parse
+ * /etc/passwd-shaped data. Each field goes to shell_add_one_arg with the
+ * no-split marks gone; the WORD's `quoted` decides globbing. */
+static int shell_split_add(struct shell_pipeline *pl, struct shell_simple *cur,
+                           const char *word, bool quoted) {
     /* `prot` tracks the SHELL_NOSPLIT_MARK toggle: while it is on, no
      * character is a delimiter, which is what keeps `${x:-'a b c'}` one word. */
     bool prot = false;
@@ -28368,13 +28442,6 @@ static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
      * `x=""; f $x` passes nothing, while `f ""` passes one empty argument --
      * and the quoted form never reaches here. */
     return 0;
-}
-
-/* Compatibility entry for callers that have no token to ask. The "$@"
- * re-entry below is one: its words ARE expansion results by construction. */
-static int shell_add_arg(struct shell_pipeline *pl, struct shell_simple *cur,
-                         const char *word, bool quoted) {
-    return shell_add_arg_ex(pl, cur, word, quoted, true, false);
 }
 
 static int shell_default_redir_fd(enum shell_tok_type t, int explicit_fd) {
