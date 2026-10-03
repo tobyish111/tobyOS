@@ -9748,7 +9748,9 @@ static void cmd_read(int argc, char **argv) {
     if (use_fd >= 0) {
         in = shell_builtin_fd(use_fd);
         if (use_fd == 0 && !in) in = g_shell_in;
-        if (!in) {
+        /* a CLOSED one too (`exec 6<&-` leaves a closed holder): bash
+         * checks the -u descriptor before reading (logs/b12 p73) */
+        if (!in || in->kind == FILE_KIND_NULL) {
             kprintf("read: %d: invalid file descriptor: Bad file descriptor\n", use_fd);
             shell_set_status(1);
             return;

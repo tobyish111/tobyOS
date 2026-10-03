@@ -658,8 +658,32 @@ struct proc *current_proc(void) {
     return &g_self;
 }
 
+int proc_exec_in_place(const struct proc_spec *spec);
+
+/* A standard descriptor the command has CLOSED (`cmd <&-`, `cmd >&-`). */
+static bool host_slot_closed(const struct file *f) {
+    return f && f->kind == FILE_KIND_NULL;
+}
+
 int proc_spawn(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
+
+    /* ...AND A CLOSED ONE STAYS CLOSED. The kernel's spawn hands a child
+     * either a descriptor or the console, never nothing, and a closed
+     * handle has no descriptor -- so `cat <&-` got the shell's own fd 0, the
+     * SSH session, and sat reading it (logs/b12 p73 never finished). bash
+     * runs the program with fd 0 closed. That is fork, close, exec -- what
+     * proc_exec_in_place does -- for the rare command that asks for it. */
+    if (host_slot_closed(spec->fd0) || host_slot_closed(spec->fd1) ||
+        host_slot_closed(spec->fd2)) {
+        pid_t pid = fork();
+        if (pid < 0) return -1;
+        if (pid == 0) {
+            (void)proc_exec_in_place(spec);
+            _exit(127);
+        }
+        return (int)pid;
+    }
 
     /* A NULL fd in the spec means "inherit"; the kernel would hand the child
      * the console. Here the standard descriptors already are that. */
@@ -780,9 +804,13 @@ int proc_exec_in_place(const struct proc_spec *spec) {
         if (pfd < 0 || cfd < 0 || pfd == cfd) continue;
         if (dup2(pfd, cfd) < 0) return -1;
     }
-    if (fd0 != 0 && dup2(fd0, 0) < 0) return -1;
-    if (fd1 != 1 && dup2(fd1, 1) < 0) return -1;
-    if (fd2 != 2 && dup2(fd2, 2) < 0) return -1;
+    if (fd0 != 0 && !host_slot_closed(spec->fd0) && dup2(fd0, 0) < 0) return -1;
+    if (fd1 != 1 && !host_slot_closed(spec->fd1) && dup2(fd1, 1) < 0) return -1;
+    if (fd2 != 2 && !host_slot_closed(spec->fd2) && dup2(fd2, 2) < 0) return -1;
+    /* closed last: a slot another was copied from must still be there */
+    if (host_slot_closed(spec->fd0)) close(0);
+    if (host_slot_closed(spec->fd1)) close(1);
+    if (host_slot_closed(spec->fd2)) close(2);
 
     char **argv = host_strvec(spec->argv, spec->argc);
     char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
