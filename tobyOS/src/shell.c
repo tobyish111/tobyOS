@@ -9074,6 +9074,12 @@ static void cmd_unset(int argc, char **argv) {
                     continue;
                 }
             } else if (sh_array_find(argv[i])) {
+                /* DIRSTACK unset is DIRSTACK no longer: bash's dynamic
+                 * variable is gone, and pushd/popd stop writing one
+                 * (logs/b13 q11). The flag was there; nothing set it. */
+                const struct sh_array *ua = sh_array_find(argv[i]);
+                if (ua->name && strcmp(ua->name, "DIRSTACK") == 0)
+                    g_dirstack_var_gone = true;
                 sh_array_unset(argv[i]);
                 /* ...and the declaration's own entry with it: `declare -A
                  * q` left one carrying the array attribute, so after `unset
