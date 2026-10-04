@@ -41357,6 +41357,38 @@ static const char *shell_find_list_sep(const char *s, enum shell_list_link *link
     return 0;
 }
 
+#ifdef SHELL_HOSTED
+static const char *shell_find_bg_at(const char *s);
+
+/* AN AND-OR LIST ENDED BY `&` IS ONE ASYNCHRONOUS LIST. In bash's grammar
+ * `&` and `;` separate and-or lists, `&&` and `||` join pipelines inside
+ * one, so `sleep 1 && echo done &` puts the sleep AND the echo in the
+ * background. This line was split on `;`, `&&` and `||` first and the `&`
+ * found afterwards, so the sleep ran in front and only the echo went behind
+ * (logs/b14 r1: "after & : 1s" where bash says 0s). The list starting at S
+ * ends at its first top-level `;` or lone `&`: when that is a `&` with an
+ * `&&` or `||` before it, return the `&`; otherwise 0, and the list runner
+ * goes on as before. */
+static const char *shell_andor_async_end(const char *s) {
+    const char *amp = shell_find_bg_at(s);
+    if (!amp) return 0;
+    bool andor = false;
+    const char *c = s;
+    for (;;) {
+        enum shell_list_link lk = SH_LINK_SEMI;
+        int ol = 0;
+        const char *sp = shell_find_list_sep(c, &lk, &ol);
+        if (!sp || sp > amp) break;
+        if (lk == SH_LINK_SEMI) return 0;       /* a `;` ends it first */
+        andor = true;
+        c = sp + ol;
+    }
+    return andor ? amp : 0;
+}
+
+static int shell_background_forked(const char *text, const char *label);
+#endif
+
 /* Returns false if `src` has no top-level separator, so the caller runs it
  * exactly as it did before -- single-command lines take an identical path. */
 static bool shell_run_list_line(const char *src) {
@@ -41401,6 +41433,26 @@ static bool shell_run_list_line(const char *src) {
     const char *cur = src;
     enum shell_list_link prev = SH_LINK_SEMI;
     for (;;) {
+#ifdef SHELL_HOSTED
+        /* a new and-or list that `&` ends goes to the background whole */
+        if (prev == SH_LINK_SEMI) {
+            const char *amp = shell_andor_async_end(cur);
+            if (amp) {
+                char *left = shell_dup_segment(cur, amp);
+                if (!left) {
+                    kprintf(SH_PFX_SHELL "out of memory\n");
+                    shell_set_status(2);
+                    return true;
+                }
+                shell_set_status(shell_background_forked(left, left));
+                kfree(left);
+                if (g_shell_flow != SHELL_FLOW_NONE) return true;
+                nofork_piece = -1;      /* the pieces no longer line up */
+                cur = amp + 1;
+                continue;
+            }
+        }
+#endif
         link = SH_LINK_SEMI;
         oplen = 0;
         const char *sep = shell_find_list_sep(cur, &link, &oplen);
