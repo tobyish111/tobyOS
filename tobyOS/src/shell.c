@@ -23205,9 +23205,10 @@ static void cmd_logout(int argc, char **argv) {
  * (`enable -n test` then runs /bin/test). shell_cmd_lookup() consults the
  * disabled set, so disabling really does change resolution rather than just
  * bookkeeping the intent. */
-#define BUILTIN_OFF_MAX 32
-static char g_builtin_off[BUILTIN_OFF_MAX][24];
-static int  g_builtin_off_n;
+/* NO FIXED SIZE: the set held 32 names of 23 bytes, and `enable -n` of a
+ * 33rd builtin was dropped without a word -- bash has more than 60 */
+static char **g_builtin_off;
+static int  g_builtin_off_n, g_builtin_off_cap;
 
 static bool shell_builtin_disabled(const char *name) {
     for (int i = 0; i < g_builtin_off_n; i++)
@@ -23219,17 +23220,25 @@ static void shell_builtin_set_disabled(const char *name, bool off) {
     for (int i = 0; i < g_builtin_off_n; i++) {
         if (strcmp(g_builtin_off[i], name) != 0) continue;
         if (off) return;
+        kfree(g_builtin_off[i]);
         for (int k = i; k < g_builtin_off_n - 1; k++)
-            memcpy(g_builtin_off[k], g_builtin_off[k + 1], sizeof(g_builtin_off[0]));
+            g_builtin_off[k] = g_builtin_off[k + 1];
         g_builtin_off_n--;
         return;
     }
-    if (!off || g_builtin_off_n >= BUILTIN_OFF_MAX) return;
-    size_t i = 0;
-    for (; name[i] && i + 1 < sizeof(g_builtin_off[0]); i++)
-        g_builtin_off[g_builtin_off_n][i] = name[i];
-    g_builtin_off[g_builtin_off_n][i] = '\0';
-    g_builtin_off_n++;
+    if (!off) return;
+    if (g_builtin_off_n == g_builtin_off_cap) {
+        int ncap = g_builtin_off_cap ? g_builtin_off_cap * 2 : 16;
+        char **nv = (char **)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) return;
+        for (int k = 0; k < g_builtin_off_n; k++) nv[k] = g_builtin_off[k];
+        if (g_builtin_off) kfree(g_builtin_off);
+        g_builtin_off = nv;
+        g_builtin_off_cap = ncap;
+    }
+    char *copy = shell_strdup(name);
+    if (!copy) return;
+    g_builtin_off[g_builtin_off_n++] = copy;
 }
 
 /* `enable` AS bash's (builtins/enable.def; logs/b13 q38-q40): options
@@ -31049,14 +31058,41 @@ static bool shell_alias_name_char(char c) {
  *     e two; e three
  *
  * expands both. A per-line set got the second one wrong. */
-#define SHELL_ALIAS_DEPTH_MAX 16
-static char g_alias_active[SHELL_ALIAS_DEPTH_MAX][64];
-static int  g_alias_depth;
+/* NO FIXED DEPTH: the set held 16 names of 63 bytes, so a chain of
+ * seventeen aliases stopped expanding and a longer name was cut -- bash has
+ * neither bound (each alias can be active once, which bounds a chain). A
+ * nested expansion (a $( ) in the text) starts its own set above the outer
+ * one, at g_alias_base, and leaves the outer names alone: it used to start
+ * again at 0 and write over them. */
+static char **g_alias_active;
+static int  g_alias_depth, g_alias_cap, g_alias_base;
 
 static bool shell_alias_already_used(const char *name) {
-    for (int i = 0; i < g_alias_depth; i++)
+    for (int i = g_alias_base; i < g_alias_depth; i++)
         if (strcmp(g_alias_active[i], name) == 0) return true;
     return false;
+}
+
+/* Mark NAME active (false when memory ran out). */
+static bool shell_alias_push(const char *name) {
+    if (g_alias_depth == g_alias_cap) {
+        int ncap = g_alias_cap ? g_alias_cap * 2 : 16;
+        char **nv = (char **)kmalloc((size_t)ncap * sizeof *nv);
+        if (!nv) return false;
+        for (int i = 0; i < g_alias_depth; i++) nv[i] = g_alias_active[i];
+        if (g_alias_active) kfree(g_alias_active);
+        g_alias_active = nv;
+        g_alias_cap = ncap;
+    }
+    char *c = shell_strdup(name);
+    if (!c) return false;
+    g_alias_active[g_alias_depth++] = c;
+    return true;
+}
+
+/* Unmark down to DEPTH. */
+static void shell_alias_pop_to(int depth) {
+    while (g_alias_depth > depth) kfree(g_alias_active[--g_alias_depth]);
 }
 
 static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
@@ -31196,19 +31232,17 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                     /* Expand the replacement NOW, with this name marked
                      * active, then carry on through the rest of the line with
                      * the outer set restored. One pass, correct scoping. */
-                    if (g_alias_depth < SHELL_ALIAS_DEPTH_MAX) {
-                        ksnprintf(g_alias_active[g_alias_depth], 64, "%s", name);
-                        g_alias_depth++;
+                    {
+                        int depth0 = g_alias_depth;
+                        if (!shell_alias_push(name)) return -1;
                         SH_SB(sub_buf);
                         bool sub_changed = false;
                         int rc = shell_expand_aliases_once(av, &sub_buf,
                                                            &sub_changed);
-                        g_alias_depth--;
+                        shell_alias_pop_to(depth0);
                         if (rc < 0) return -1;
                         if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
                             return -1;
-                    } else if (sb_puts(out, av) < 0) {
-                        return -1;
                     }
                     *changed = true;
                     /* POSIX: a replacement ending in a blank means the NEXT
@@ -31252,9 +31286,12 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
 static const char *shell_expand_aliases_nested(const char *src,
                                                struct shell_sb *buf) {
     int saved_alias_depth = g_alias_depth;
+    int saved_alias_base = g_alias_base;
     int saved_dq_depth = g_dq_depth;
+    g_alias_base = g_alias_depth;
     const char *r = shell_expand_aliases(src, buf);
-    g_alias_depth = saved_alias_depth;
+    shell_alias_pop_to(saved_alias_depth);
+    g_alias_base = saved_alias_base;
     g_dq_depth = saved_dq_depth;
     return r;
 }
@@ -31270,7 +31307,7 @@ static const char *shell_expand_aliases(const char *src,
      * the name it is replacing, so there is nothing left for a second pass to
      * find -- and no pass counter to run out, which used to be the only
      * symptom of `alias echo='echo foo'`. */
-    g_alias_depth = 0;
+    shell_alias_pop_to(g_alias_base);
     /* Alias expansion runs once per line, before anything else, so this is the
      * one place that reliably sees a line boundary. An expansion that failed
      * mid-way through a double-quoted span -- an unmatched quote, a word that
@@ -32318,7 +32355,15 @@ static bool shell_globignored(const char *path) {
  * `*` means, which is what the ordinary path below already does.
  */
 
+/* How deep `**` goes. bash has no bound; /bin/tsh goes as deep as a path
+ * can (a level takes two bytes at the least), so it is never what stops
+ * it. It stopped at 24 levels and missed what was below. The kernel
+ * console, on a small stack, keeps 24. */
+#ifdef SHELL_HOSTED
+#define SH_GLOB_DEPTH_MAX (VFS_PATH_MAX / 2)
+#else
 #define SH_GLOB_DEPTH_MAX 24
+#endif
 
 struct shell_globstar {
     struct shell_pipeline *pl;
