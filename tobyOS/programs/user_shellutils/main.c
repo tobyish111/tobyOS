@@ -703,7 +703,7 @@ static int do_dd(int argc, char **argv) {
 
     int ifd = inf ? open(inf, O_RDONLY) : 0;
     if (ifd < 0) { fprintf(stderr, "dd: %s: %s\n", inf, strerror(errno)); return 1; }
-    int ofd = outf ? open(outf, O_WRONLY | O_CREAT | O_TRUNC, 0644) : 1;
+    int ofd = outf ? open(outf, O_WRONLY | O_CREAT | O_TRUNC, 0666) : 1;
     if (ofd < 0) { fprintf(stderr, "dd: %s: %s\n", outf, strerror(errno)); return 1; }
 
     char *buf = (char *)malloc((size_t)bs);
@@ -976,7 +976,7 @@ static int do_truncate(int argc, char **argv) {
         any = 1;
         if (size < 0) { fprintf(stderr, "truncate: -s is required\n"); return 1; }
         /* Created if absent, as truncate does. */
-        int fd = open(argv[i], O_WRONLY | O_CREAT, 0644);
+        int fd = open(argv[i], O_WRONLY | O_CREAT, 0666);
         if (fd >= 0) close(fd);
         if (truncate(argv[i], (off_t)size) != 0) {
             fprintf(stderr, "truncate: %s: %s\n", argv[i], strerror(errno));

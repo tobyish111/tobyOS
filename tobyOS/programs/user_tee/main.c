@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
     else
         flags |= 0x200; /* O_TRUNC */
 
-    int fd = open(path, flags);
+    int fd = open(path, flags, 0666);     /* the mode was missing: garbage */
     if (fd < 0) {
         fprintf(stderr, "tee: cannot open '%s': %s\n", path, strerror(errno));
         return 1;

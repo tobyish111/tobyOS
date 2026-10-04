@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
 
         if (!exists) {
             if (no_create) continue;          /* -c: not an error */
-            int fd = open(path, O_WRONLY | O_CREAT, 0644);
+            int fd = open(path, O_WRONLY | O_CREAT, 0666);   /* touch(1): 0666 less the umask */
             if (fd < 0) {
                 fprintf(stderr, "touch: cannot create '%s': %s\n",
                         path, strerror(errno));

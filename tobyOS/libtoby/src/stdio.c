@@ -990,7 +990,7 @@ static int fopen_mode_to_flags(const char *mode) {
 FILE *fopen(const char *path, const char *mode) {
     int flags = fopen_mode_to_flags(mode);
     if (flags < 0) { errno = EINVAL; return 0; }
-    int fd = open(path, flags, 0644);
+    int fd = open(path, flags, 0666);     /* C's fopen: 0666 less the umask */
     if (fd < 0) return 0;
     FILE *f = stream_new(fd, -1);
     if (!f) { close(fd); return 0; }
