@@ -6916,19 +6916,6 @@ static bool shell_word_is_func_name(const char *w, size_t n) {
     return true;
 }
 
-static void shell_print_export_entry(const char *entry) {
-    /* bash's reinput form is `declare -x`, not `export`, and the gate greps
-     * lines out of this against bash's own output. */
-    size_t klen = env_key_len(entry);
-    if (entry[klen] == '=') {
-        SH_SB(nameb);                   /* a longer name was not listed */
-        if (sb_putmem(&nameb, entry, klen) < 0) return;
-        shell_printf("declare -x %s=\"%s\"\n", nameb.p, entry + klen + 1);
-    } else {
-        shell_printf("declare -x %s\n", entry);
-    }
-}
-
 /* ---- `local`: function-scoped variables ---------------------------------
  *
  * See the note above shell_locals_push. The stack is global and GROWS: it
@@ -8022,14 +8009,49 @@ static void shell_print_exported_functions(void) {
     kfree(idx);
 }
 
+/* `export` and `export -p`: bash's set_or_show_attributes -- every
+ * exported variable, SORTED (sort_variables: the first bytes as signed
+ * chars, then strcmp), each as `declare -p` prints it:
+ *
+ *     env -i bash -c 'export -p'
+ *         declare -x OLDPWD / declare -x PWD="/tmp" / declare -x SHLVL="1"
+ *
+ * tsh walked its table in the order the variables were made, and printed a
+ * variable that has no value as `OLDPWD=""` (logs/b13 q13). */
+static void shell_print_exported_sorted(void) {
+    const char **names __attribute__((cleanup(shell_kfree_ptr))) =
+        (const char **)kmalloc((size_t)(g_envc + 1) * sizeof *names);
+    if (!names) return;
+    SH_WORDS(keys);
+    int n = 0;
+    for (int i = 0; i < g_envc; i++) {
+        if (!(g_env_flags[i] & SHVAR_EXPORTED)) continue;
+        size_t kl = env_key_len(g_env[i]);
+        if (kl == 0 || !shell_name_is_valid(g_env[i], kl)) continue;
+        const char *k = words_store(&keys, g_env[i], kl);
+        if (k) names[n++] = k;
+    }
+    for (int a = 1; a < n; a++) {
+        const char *v = names[a];
+        int b = a - 1;
+        while (b >= 0) {
+            int r = (int)(signed char)names[b][0] - (int)(signed char)v[0];
+            if (r == 0) r = strcmp(names[b], v);
+            if (r <= 0) break;
+            names[b + 1] = names[b];
+            b--;
+        }
+        names[b + 1] = v;
+    }
+    for (int a = 0; a < n; a++) (void)shell_declare_print(names[a]);
+}
+
 static void cmd_export(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
         /* Only exported names. `export` with no arguments is defined to list
          * the exported ones; it used to list the whole variable table. */
-        for (int i = 0; i < g_envc; i++)
-            if (g_env_flags[i] & SHVAR_EXPORTED)
-                shell_print_export_entry(g_env[i]);
+        shell_print_exported_sorted();
         return;
     }
     /* OPTIONS: -p lists, -n takes the export attribute AWAY (the value
@@ -8053,9 +8075,7 @@ static void cmd_export(int argc, char **argv) {
         }
     }
     if (start >= argc && list) {
-        for (int i = 0; i < g_envc; i++)
-            if (g_env_flags[i] & SHVAR_EXPORTED)
-                shell_print_export_entry(g_env[i]);
+        shell_print_exported_sorted();
         return;
     }
     if (funcs) {
