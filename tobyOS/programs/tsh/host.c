@@ -593,22 +593,31 @@ int vfs_read_all(const char *path, void **out_buf, size_t *out_size) {
     return VFS_OK;
 }
 
+/* The shell writes whole files only as its history file, which a missing one
+ * is created 0600 for, as readline's write_history makes it; the kernel takes
+ * the umask off every mode below. */
 int vfs_write_all(const char *path, const void *buf, size_t n) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return errno_to_vfs();
     long w = write(fd, buf, n);
     close(fd);
     return (w == (long)n) ? VFS_OK : VFS_ERR_IO;
 }
 
-int vfs_create(const char *path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+int vfs_create_mode(const char *path, uint32_t mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)(mode & 07777u));
     if (fd < 0) return errno_to_vfs();
     close(fd);
     return VFS_OK;
 }
 
-int vfs_mkdir(const char *path)  { return mkdir(path, 0755) == 0 ? VFS_OK : errno_to_vfs(); }
+/* bash's redirections open with 0666; so does every caller of this */
+int vfs_create(const char *path) { return vfs_create_mode(path, 0666u); }
+
+int vfs_mkdir_mode(const char *path, uint32_t mode) {
+    return mkdir(path, (int)(mode & 07777u)) == 0 ? VFS_OK : errno_to_vfs();
+}
+int vfs_mkdir(const char *path)  { return vfs_mkdir_mode(path, 0777u); }
 int vfs_unlink(const char *path) { return unlink(path)      == 0 ? VFS_OK : errno_to_vfs(); }
 
 /* Truncate in place. The kernel has a real vfs_truncate; here it is an open

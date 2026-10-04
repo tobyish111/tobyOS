@@ -495,6 +495,28 @@ static int g_last_bg_pid;
 /* Set in a background child whose text is ONE simple command: the external
  * it runs may REPLACE this process rather than be spawned and waited on. */
 static bool g_bg_exec_ok;
+/* The shell's umask (see shell_umask_sync). A program the kernel shell
+ * starts gets it through its proc_spec -- pid 0's own umask serves every
+ * console, TCP and network task at once and stays 0022; /bin/tsh's is its
+ * process umask, which a spawn inherits by itself. */
+static int g_shell_umask;
+#ifdef SHELL_HOSTED
+#define SH_SPEC_UMASK .set_umask = false
+#else
+#define SH_SPEC_UMASK .set_umask = true, .umask = (uint32_t)g_shell_umask & 0777u
+#endif
+/* The mode a file the shell creates is asked for with, as bash's open(2)s
+ * ask: 0666 for a redirection's target, 0600 for the history file. The
+ * kernel takes /bin/tsh's process umask off by itself; the kernel shell's
+ * umask is its own, taken off here. Files were 0644 whatever the umask
+ * (logs/b14 r2). */
+static uint32_t shell_new_file_mode(uint32_t mode) {
+#ifdef SHELL_HOSTED
+    return mode & 07777u;
+#else
+    return mode & ~(uint32_t)g_shell_umask & 07777u;
+#endif
+}
 /* BASH'S ONESHOT. The last command of a `-c` string, of a `( )` or of a
  * `$( )` is EXEC'D, not forked, when it is a simple command with no
  * redirection that is not timed, not inverted and not run under a trap --
@@ -12807,6 +12829,7 @@ static void cmd_time(int argc, char **argv) {
         .envc = g_envc,
         .envp = g_env,
         .sandbox_profile = 0,
+        SH_SPEC_UMASK,
     };
     int pid = proc_spawn(&spec);
     if (pid < 0) {
@@ -13394,7 +13417,7 @@ static void cmd_touch(int argc, char **argv) {
     }
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(argv[1], path, sizeof(path), "touch") < 0) return;
-    int rc = vfs_create(path);
+    int rc = vfs_create_mode(path, shell_new_file_mode(0666u));   /* touch(1)'s mode */
     if (rc == VFS_ERR_EXIST) {
         /* `touch` of an existing file is a no-op success in classic
          * shells; surface that politely. */
@@ -13418,7 +13441,7 @@ static void cmd_mkdir(int argc, char **argv) {
     }
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(argv[1], path, sizeof(path), "mkdir") < 0) return;
-    int rc = vfs_mkdir(path);
+    int rc = vfs_mkdir_mode(path, shell_new_file_mode(0777u));    /* mkdir(1)'s mode */
     if (rc != VFS_OK) {
         shell_err("mkdir: '%s': %s\n", argv[1], vfs_strerror(rc));
         shell_set_status(1);
@@ -20873,7 +20896,7 @@ static void cmd_printf(int argc, char **argv) {
     }
 }
 
-static int g_shell_umask = 022;
+static int g_shell_umask = 022;      /* declared near the top */
 
 /* The shell's umask is the PROCESS umask, inherited like every other
  * shell's. It used to be a number this file kept to itself: initialised to
@@ -22105,8 +22128,12 @@ static long shell_hist_read(const char *path, long from) {
     return line;
 }
 
-/* The whole list, one entry a line (readline's write_history). */
+/* The whole list, one entry a line (readline's write_history), into a file
+ * created 0600 when it is not there, as readline's open(2) makes it. */
 static int shell_hist_write(const char *path) {
+    struct vfs_stat hst;
+    if (vfs_stat(path, &hst) == VFS_ERR_NOENT)
+        (void)vfs_create_mode(path, shell_new_file_mode(0600u));
     SH_SB(b);
     for (int k = 0; k < g_hist_count; k++)
         if (sb_puts(&b, g_hist[k]) < 0 || sb_putc(&b, '\n') < 0) return 1;
@@ -22125,7 +22152,7 @@ static int shell_hist_append_file(const char *path, const char *shown) {
         kfree(old);
         if (rc < 0) return 1;
     } else {
-        int cr = vfs_create(path);
+        int cr = vfs_create_mode(path, shell_new_file_mode(0600u));
         if (cr != VFS_OK) {
             kprintf("history: %s: cannot create: %s\n", shown,
                     shell_errno_text(cr));
@@ -24185,6 +24212,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         .envp = envp,
         .sandbox_profile = profile,
         .cwd = shell_cwd(),
+        SH_SPEC_UMASK,
     };
 #ifdef SHELL_HOSTED
     /* THE BACKGROUND CHILD EXECS ITS ONE EXTERNAL instead of spawning it
@@ -34538,7 +34566,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         }
         if (append) {
             if (sr == VFS_ERR_NOENT) {
-                int cr = vfs_create(path);
+                int cr = vfs_create_mode(path, shell_new_file_mode(0666u));
                 if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
                     kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
                     return 0;
@@ -34570,7 +34598,7 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                 kprintf("%s: %s\n", path_arg, shell_errno_text(sr));
                 return 0;
             } else {
-                int cr = vfs_create(path);
+                int cr = vfs_create_mode(path, shell_new_file_mode(0666u));
                 if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
                     kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
                     return 0;
@@ -34870,7 +34898,7 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
     struct vfs_stat st;
     int sr = vfs_stat(path, &st);
     if (sr == VFS_ERR_NOENT) {
-        int cr = vfs_create(path);
+        int cr = vfs_create_mode(path, shell_new_file_mode(0666u));
         if (cr != VFS_OK && cr != VFS_ERR_EXIST) {
             kprintf("%s: %s\n", path_arg, shell_errno_text(cr));
             return 0;
@@ -36398,6 +36426,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
         .argc = argc, .argv = argv,
         .envc = envc, .envp = envp,
         .cwd = shell_cwd(),
+        SH_SPEC_UMASK,
     };
     int pid = proc_spawn(&spec);
     int status = 127, why = -1;
