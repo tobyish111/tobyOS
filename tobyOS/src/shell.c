@@ -31592,6 +31592,18 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                              tok[*io].expanded, asrc) < 0) {
             return -1;
         }
+        /* A WORD THAT WAS NOT WRITTEN AS AN ASSIGNMENT IS NOT ONE, whatever
+         * it expands to. bash decides on the word as written, and only an
+         * unquoted NAME before the `=` makes one:
+         *
+         *     "x"=y echo hi     \x=y echo hi     x""=y echo hi
+         *     bash: x=y: command not found, 127      tsh: hi
+         *
+         * The quotes are gone by the time argv is scanned for the prefix,
+         * so that decision travels in the noassign bits (logs/b13 q9). */
+        if (!asrc)
+            for (int k = before; k < cur->argc; k++)
+                if (shell_simple_mark_noassign(cur, k) < 0) return -1;
         if (!cur->cmd_word_set && !asrc && cur->argc > before) {
             cur->cmd_word_set = true;
             cur->cmd_word_literal = !tok[*io].expanded;
