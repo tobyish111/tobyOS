@@ -9693,10 +9693,18 @@ static void cmd_readonly(int argc, char **argv) {
  * handle `read` uses, so a redirection on the command applies.
  */
 static long shell_parse_long_value(const char *s, bool *ok);
+static void cmd_eval(int argc, char **argv);
+
 static void cmd_readarray(int argc, char **argv) {
     shell_set_status(0);
     bool trim = false;
     char delim = '\n';
+    /* -u FD reads that descriptor; -C CALLBACK is run as `CALLBACK INDEX
+     * 'LINE'` before every QUANTUMth line is stored, QUANTUM -c's or 5000
+     * (bash's mapfile.def). tsh refused all three. */
+    int use_fd = -1;
+    const char *callback = 0;
+    long quantum = 5000;
     /* -n COUNT (at most that many; 0 is all), -O ORIGIN (start there, and
      * keep what the array held), -s COUNT (skip that many first) -- bash's
      * mapfile; tsh refused all three (Oils 0654 0655). */
@@ -9747,16 +9755,65 @@ static void cmd_readarray(int argc, char **argv) {
                 else { origin = nv; have_origin = true; }
                 break;
             }
-            /* -u, -c and -C remain unimplemented. Refusing is better than
-             * silently ignoring them and handing back an array that quietly
-             * differs from what was asked for. */
-            kprintf("%s: -%c not supported\n", argv[0], *q);
+            if (*q == 'u' || *q == 'c' || *q == 'C') {
+                const char *v = 0;
+                if (q[1]) v = q + 1;
+                else if (first + 1 < argc) v = argv[++first];
+                if (!v) {
+                    kprintf("%s: -%c: option requires an argument\n",
+                            argv[0], *q);
+                    kprintf_raw("%s: usage: %s [-d delim] [-n count] [-O origin] "
+                                "[-s count] [-t] [-u fd] [-C callback] "
+                                "[-c quantum] [array]\n", argv[0], argv[0]);
+                    shell_set_status(2);
+                    return;
+                }
+                if (*q == 'C') { callback = v; break; }
+                bool okn = true;
+                long nv = shell_parse_long_value(v, &okn);
+                if (*q == 'c') {
+                    if (!okn || nv <= 0) {
+                        kprintf("%s: %s: invalid callback quantum\n", argv[0], v);
+                        shell_set_status(1);
+                        return;
+                    }
+                    quantum = nv;
+                    break;
+                }
+                if (!okn || nv < 0 || nv > 2147483647L) {
+                    kprintf("%s: %s: invalid file descriptor specification\n",
+                            argv[0], v);
+                    shell_set_status(1);
+                    return;
+                }
+                use_fd = (int)nv;
+                struct file *uf = use_fd == 0 && !shell_builtin_fd(0)
+                                      ? (g_shell_in ? g_shell_in : g_shell_fd[0])
+                                      : shell_builtin_fd(use_fd);
+                if (use_fd != 0 && (!uf || uf->kind == FILE_KIND_NULL)) {
+                    kprintf("%s: %d: invalid file descriptor: Bad file descriptor\n",
+                            argv[0], use_fd);
+                    shell_set_status(1);
+                    return;
+                }
+                break;
+            }
+            /* any other letter: bash's usage error */
+            kprintf("%s: -%c: invalid option\n", argv[0], *q);
+            kprintf_raw("%s: usage: %s [-d delim] [-n count] [-O origin] "
+                        "[-s count] [-t] [-u fd] [-C callback] [-c quantum] "
+                        "[array]\n", argv[0], argv[0]);
             shell_set_status(2);
             return;
         }
         first++;
     }
     const char *name = (first < argc) ? argv[first] : "MAPFILE";
+    if (!*name) {
+        kprintf("%s: empty array variable name\n", argv[0]);
+        shell_set_status(2);
+        return;
+    }
     if (!shell_name_is_valid(name, strlen(name))) {
         kprintf("%s: `%s': not a valid identifier\n", argv[0], name);
         shell_set_status(1);
@@ -9769,7 +9826,8 @@ static void cmd_readarray(int argc, char **argv) {
     }
 
     struct file *tmp_console = 0;
-    struct file *in = g_shell_in ? g_shell_in : g_shell_fd[0];
+    struct file *in = use_fd > 0 ? shell_builtin_fd(use_fd)
+                                 : (g_shell_in ? g_shell_in : g_shell_fd[0]);
     if (!in) { tmp_console = console_file_make(); in = tmp_console; }
     if (!in) {
         kprintf("%s: failed to open stdin\n", argv[0]);
@@ -9819,6 +9877,26 @@ static void cmd_readarray(int argc, char **argv) {
                 }
             }
             if (skipped < skip) { skipped++; continue; }
+            /* the callback first, with the index the line is about to take
+             * and the line single-quoted (bash's run_callback) */
+            if (callback && ((stored + 1) % quantum) == 0) {
+                SH_SB(cb);
+                char nb[24];
+                ksnprintf(nb, sizeof nb, " %ld '", idx);
+                (void)sb_puts(&cb, callback);
+                (void)sb_puts(&cb, nb);
+                for (const char *c = line; *c; c++)
+                    (void)(*c == '\'' ? sb_puts(&cb, "'\\''") : sb_putc(&cb, *c));
+                (void)sb_putc(&cb, '\'');
+                if (cb.p) {
+                    /* the callback's status is not mapfile's */
+                    int saved_st = g_last_status;
+                    char *av[3] = { (char *)"eval", cb.p, 0 };
+                    cmd_eval(2, av);
+                    shell_set_status(saved_st);
+                }
+                if (g_shell_flow != SHELL_FLOW_NONE) break;
+            }
             if (sh_array_set(name, idx++, line) < 0) { shell_set_status(1); break; }
             stored++;
         }
