@@ -495,6 +495,14 @@ static int g_last_bg_pid;
 /* Set in a background child whose text is ONE simple command: the external
  * it runs may REPLACE this process rather than be spawned and waited on. */
 static bool g_bg_exec_ok;
+/* bash's stdin_redir: set when a control structure runs with redirections
+ * -- to whether they redirect standard input -- and when a forked command
+ * reads a pipe, and LEFT so. While it is set an asynchronous command keeps
+ * the shell's stdin; otherwise, without job control or in a subshell, it
+ * reads /dev/null (shell_note_compound_stdin, shell_background_forked_as;
+ * logs/b14 r7: `while false; do :; done < /dev/null; cat &` reads the
+ * shell's stdin in bash, `( cat & wait )` reads nothing). */
+static bool g_stdin_redir;
 /* The shell's umask (see shell_umask_sync). A program the kernel shell
  * starts gets it through its proc_spec -- pid 0's own umask serves every
  * console, TCP and network task at once and stays 0022; /bin/tsh's is its
@@ -24090,6 +24098,33 @@ struct shell_simple {
     struct shell_redir *redir;
 };
 
+/* Do these redirections alter standard input, as bash's stdin_redirects
+ * counts it? Every input one (<, <>, a here-document or here-string) on any
+ * descriptor, a duplication or close of descriptor 0; never an output one,
+ * a move, or a {name} redirection. A control structure run with
+ * redirections sets g_stdin_redir to the answer (bash's
+ * execute_command_internal), and it stays. */
+static bool shell_redirs_touch_stdin(const struct shell_redir *r, int n) {
+    for (int k = 0; k < n; k++) {
+        if (r[k].fdvar || r[k].move_src) continue;
+        switch (r[k].op) {
+        case SH_RD_OPEN_IN: case SH_RD_HEREDOC: case SH_RD_OPEN_RW:
+            return true;
+        case SH_RD_DUP_IN: case SH_RD_CLOSE:
+            if (r[k].fd == 0) return true;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static void shell_note_compound_stdin(const struct shell_simple *redirs) {
+    if (redirs && redirs->redir_count > 0)
+        g_stdin_redir = shell_redirs_touch_stdin(redirs->redir, redirs->redir_count);
+}
+
 struct shell_pipeline {
     int count;
     int stage_cap;
@@ -36216,6 +36251,51 @@ static bool shell_stage_is_compound(const char *s);
 static void shell_stages_free(char **st, int n);
 static char *shell_dup_segment(const char *start, const char *end);
 
+/* Does the async command's OWN text redirect standard input, as bash's
+ * stdin_redirects counts it on the command's redirections? A top-level
+ * redirection of a simple command, or one after a compound's end -- not
+ * one inside it, which belongs to an inner command; an and-or list has
+ * none of its own. Read from the text, as the child has not parsed it. */
+static bool shell_text_stdin_redirected(const char *s) {
+    struct shell_scan st;
+    shell_scan_init(&st);
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+        if (!*p) break;
+        if (!shell_scan_incomplete(&st)) {
+            if ((p[0] == '&' && p[1] == '&') || (p[0] == '|' && p[1] == '|'))
+                return false;
+            const char *q = p;
+            int fd = -1;
+            bool var = false;
+            if (*q >= '0' && *q <= '9') {
+                fd = 0;
+                while (*q >= '0' && *q <= '9') { fd = fd * 10 + (*q - '0'); q++; }
+            } else if (*q == '{') {
+                const char *e = q + 1;
+                while (*e && *e != '}' && *e != ' ' && *e != '\t') e++;
+                if (*e == '}' && (e[1] == '<' || e[1] == '>')) { var = true; q = e + 1; }
+            }
+            if (!var && *q == '<' && q[1] != '(') {
+                if (q[1] != '&') return true;           /* <, <<, <<<, <> */
+                if (fd <= 0) {                          /* <&M, 0<&M, <&- */
+                    const char *e = q + 2;
+                    while (*e && *e != ' ' && *e != '\t' && *e != '\n') e++;
+                    /* N<&M- is a MOVE, which bash does not count */
+                    if (!(e > q + 3 && e[-1] == '-')) return true;
+                }
+            }
+            if (!var && *q == '>' && q[1] == '&' && q[2] == '-' && fd == 0)
+                return true;                            /* 0>&- */
+        }
+        const char *before = p;
+        shell_scan_token(&st, &p);
+        if (p <= before) p = before + 1;
+    }
+    return false;
+}
+
 /* AN ASYNCHRONOUS PIPELINE IS A JOB OF ONE PROCESS AN ELEMENT, every one a
  * child of the shell -- bash's execute_pipeline forks each element from
  * the shell, all into one process group (the first element's) under job
@@ -36337,6 +36417,7 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             g_subshell_depth++;
             g_simple_stage_adj = 0;
             g_in_pipeline_stage = true;
+            if (i > 0) g_stdin_redir = true;   /* it reads a pipe */
             g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
                                                    stages[i] + strlen(stages[i]));
             g_bg_simple_child = g_bg_exec_ok;
@@ -36429,6 +36510,14 @@ static int shell_background_forked_as(const char *text, const char *label,
         int prc = 0;
         if (shell_background_pipeline(text, &prc)) return prc;
     }
+    /* bash's async stdin: without job control, or in a subshell, an
+     * asynchronous command reads /dev/null -- unless it redirects stdin
+     * itself or a control structure around it did (g_stdin_redir). tsh
+     * gave it the shell's stdin: `printf L | sh -c '( cat & wait )'`
+     * printed L, which bash's does not (logs/b14 r6 r7). A pipeline is
+     * not one command here, and its first element keeps stdin (r6). */
+    bool null_stdin = (g_subshell_depth > 0 || !shell_job_control()) &&
+                      !g_stdin_redir && !shell_text_stdin_redirected(text);
     int pid = shell_fork();
     if (pid < 0) {
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
@@ -36458,6 +36547,10 @@ static int shell_background_forked_as(const char *text, const char *label,
          * a USR1 the script had ignored, and it died of it (138) every time
          * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
         shell_trap_clear_caught();
+        if (null_stdin) {
+            struct file *dn = shell_open_vfs_file("/dev/null", false, false, "shell");
+            if (dn) g_shell_fd[0] = dn;
+        }
         /* an asynchronous command is a subshell, its words expanded in it:
          * `echo $BASH_SUBSHELL &` prints 1 */
         g_subshell_depth++;
@@ -37879,6 +37972,7 @@ static bool shell_compound_tail_redirs(const char *src, const char *tail,
     buf[n] = '\0';
 
     struct shell_io_frame io;
+    shell_note_compound_stdin(&redirs);            /* bash's stdin_redir */
     if (shell_enter_io_frame(&redirs, label, &io) < 0) {
         kfree(buf);
         shell_set_status(1);
@@ -39473,6 +39567,7 @@ static bool shell_try_for_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (tail_redirs.redir_count > 0) {
+        shell_note_compound_stdin(&tail_redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&tail_redirs, "for", &io_frame) < 0) {
             kfree(list); kfree(body);
             shell_set_status(1);
@@ -39868,6 +39963,7 @@ static bool shell_try_arith_for_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (tail_redirs.redir_count > 0) {
+        shell_note_compound_stdin(&tail_redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&tail_redirs, label, &io_frame) < 0) {
             g_shell_loop_depth--;
             kfree(body);
@@ -39999,6 +40095,7 @@ static bool shell_try_while_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (tail_redirs.redir_count > 0) {
+        shell_note_compound_stdin(&tail_redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&tail_redirs, "while", &io_frame) < 0) {
             g_shell_loop_depth--;
             kfree(cond);
@@ -40141,6 +40238,7 @@ static bool shell_try_until_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (tail_redirs.redir_count > 0) {
+        shell_note_compound_stdin(&tail_redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&tail_redirs, "until", &io_frame) < 0) {
             g_shell_loop_depth--;
             kfree(cond);
@@ -41574,6 +41672,7 @@ static bool shell_try_subshell_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (redirs.redir_count > 0) {
+        shell_note_compound_stdin(&redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&redirs, "subshell", &io_frame) < 0) {
 #ifdef SHELL_HOSTED
             if (forked_child) _exit(1);
@@ -41782,6 +41881,7 @@ static bool shell_try_group_command(const char *src) {
     struct shell_io_frame io_frame;
     bool io_active = false;
     if (redirs.redir_count > 0) {
+        shell_note_compound_stdin(&redirs);            /* bash's stdin_redir */
         if (shell_enter_io_frame(&redirs, "group", &io_frame) < 0) {
             shell_set_status(1);
             kfree(body);
@@ -42500,6 +42600,9 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (fpid == 0) {
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
+            /* a stage that reads a pipe: an async command in it keeps that
+             * stdin (bash: stdin_redir |= pipe_in; logs/b14 r7 e3) */
+            if (i > 0) g_stdin_redir = true;
             if (!stage_simple[i]) jobs_forget_all();     /* a subshell */
 #ifdef SHELL_HOSTED
             /* A simple stage keeps its parent's table, for `jobs | cat`,
