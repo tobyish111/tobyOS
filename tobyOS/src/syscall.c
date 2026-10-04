@@ -2690,6 +2690,16 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
         const char *fdnum = 0;
         if (strncmp(kpath, "/dev/fd/", 8) == 0) {
             fdnum = kpath + 8;
+        } else if (strcmp(kpath, "/dev/stdin") == 0) {
+            /* /dev/stdin, /dev/stdout, /dev/stderr: Linux's links to
+             * /proc/self/fd/0..2, opened the same way. They did not
+             * exist, so `cat < /dev/stdin` failed in bash and tsh alike
+             * (logs/b14 r6: "/dev/stdin: No such file or directory"). */
+            fdnum = "0";
+        } else if (strcmp(kpath, "/dev/stdout") == 0) {
+            fdnum = "1";
+        } else if (strcmp(kpath, "/dev/stderr") == 0) {
+            fdnum = "2";
         } else if (strncmp(kpath, "/proc/self/fd/", 14) == 0) {
             fdnum = kpath + 14;
         } else if (strncmp(kpath, "/proc/", 6) == 0) {
