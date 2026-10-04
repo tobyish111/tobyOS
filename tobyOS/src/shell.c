@@ -1360,7 +1360,30 @@ static void  sh_array_clear_novalue(const char *name);
 static inline long sh_count_back(long top, long v) {
     return (long)((unsigned long)top + 1ul + (unsigned long)v);
 }
-static int   sh_array_join(const char *name, char sep, struct shell_sb *out);
+/* WHAT "$*" PUTS BETWEEN WORDS: the first CHARACTER of $IFS -- in UTF-8 a
+ * multibyte one whole, as bash's ifs_firstchar -- nothing when IFS is set
+ * and empty, a space when it is unset. It was the first BYTE, so
+ * IFS=$'\u00e9' joined words with half a character (logs/b13 q31). */
+struct sh_sep { char c[8]; size_t n; };
+#define SH_SEP_SPACE { { ' ' }, 1 }
+static void sh_sep_from_ifs(struct sh_sep *s, const char *ifs);
+static int  sb_put_sep(struct shell_sb *b, const struct sh_sep *s);
+/* FIELD SPLITTING BY CHARACTER -- see sh_ifsx_init. */
+struct sh_ifsx {
+    const char *s, *e;          /* IFS (" \t\n" when unset) */
+    unsigned char map[256];     /* every byte of IFS: bash's ifs_cmap */
+    bool sh_style;              /* exactly " \t\n" */
+    bool u8;                    /* the locale is UTF-8 */
+    bool wide_ok;               /* IFS decodes: a multibyte one can match */
+};
+static void   sh_ifsx_init(struct sh_ifsx *x, const char *ifs);
+static bool   sh_ifsx_byte(const struct sh_ifsx *x, char c);
+static bool   sh_ifsx_white(const struct sh_ifsx *x, char c);
+static bool   sh_ifsx_space(char c);
+static size_t sh_ifsx_clen(const struct sh_ifsx *x, const char *p, const char *end);
+static size_t sh_ifsx_sep(const struct sh_ifsx *x, const char *p, const char *end);
+static int   sh_array_join(const char *name, const struct sh_sep *sep,
+                           struct shell_sb *out);
 static char *shell_strdup(const char *s);
 static void  shell_strip_glob_escapes(char *s);
 static int   sh_subscript_value(const char *sub, long *out);
@@ -2713,13 +2736,10 @@ static const char *env_get(const char *key) {
                      * never holds a freed one */
                     static char *ring[8];
                     static unsigned ri;
-                    char sep = ' ';
-                    if (esub[0] == '*') {
-                        const char *ifs = env_get("IFS");
-                        sep = ifs ? ifs[0] : ' ';
-                    }
+                    struct sh_sep sep = SH_SEP_SPACE;
+                    if (esub[0] == '*') sh_sep_from_ifs(&sep, env_get("IFS"));
                     SH_SB(jb);
-                    if (sh_array_join(enm, sep, &jb) < 0) return "";
+                    if (sh_array_join(enm, &sep, &jb) < 0) return "";
                     char *nj = shell_strdup(jb.p);
                     if (!nj) return "";
                     ri = (ri + 1) % 8;
@@ -3017,6 +3037,9 @@ static int sh_array_store_expanded(const char *name, const char *ex,
      * precedes it onto the first element, and a word that is ONE mark with
      * no text at all -- "${e[@]}" of an empty array -- is no element. */
     bool first_mark = true;
+    struct sh_ifsx ifsx;
+    sh_ifsx_init(&ifsx, env_get("IFS"));
+    const char *exend = ex + strlen(ex);
     {
         int marks = 0;
         size_t real = 0;
@@ -3036,9 +3059,12 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         }
         has_marks = (marks > 0);
     }
+    if (split)
+        while (*ex && sh_ifsx_byte(&ifsx, *ex) && sh_ifsx_white(&ifsx, *ex)) ex++;
     for (const char *q = ex; ; q++) {
         bool end = (*q == '\0');
         bool boundary = false;
+        size_t sl = 0;
         if (!end) {
             if (*q == SHELL_DATA_ESC && q[1]) {
                 if (f + 2 < field_cap) { field[f++] = *q; field[f++] = q[1]; }
@@ -3055,7 +3081,14 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 if (first_mark) { first_mark = false; continue; }
                 boundary = true;
             }
-            else if (split && !in_nosplit && sh_ifs_is_sep(*q)) boundary = true;
+            else if (split && !in_nosplit && (sl = sh_ifsx_sep(&ifsx, q, exend)) > 0)
+                boundary = true;
+            else if (split && !in_nosplit && (unsigned char)*q >= 0x80) {
+                /* a multibyte character that is not a separator: whole */
+                size_t cl = sh_ifsx_clen(&ifsx, q, exend);
+                for (size_t k = 0; k + 1 < cl; k++)
+                    if (f + 1 < field_cap) field[f++] = *q++;
+            }
         }
         if (end || boundary) {
             field[f] = '\0';
@@ -3097,6 +3130,20 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             f = 0;
             elem = false;
             if (end) break;
+            if (sl > 0) {
+                /* the rest of the delimiter, as shell_split_add takes it */
+                bool whitesep = sh_ifsx_white(&ifsx, *q);
+                q += sl;
+                while (*q && sh_ifsx_white(&ifsx, *q) && sh_ifsx_byte(&ifsx, *q)) q++;
+                if (*q && whitesep && sh_ifsx_byte(&ifsx, *q) &&
+                    !sh_ifsx_white(&ifsx, *q)) {
+                    q++;
+                    while (*q && sh_ifsx_white(&ifsx, *q) && sh_ifsx_byte(&ifsx, *q))
+                        q++;
+                }
+                if (!*q) break;          /* a trailing delimiter: no field */
+                q--;                     /* the loop steps onto it */
+            }
             continue;
         }
         if (f + 1 < field_cap) field[f++] = *q;
@@ -4359,6 +4406,84 @@ static long sh_value_char_count(const char *s) {
     long c = 0;
     while (p < end) { p += sh_cl(p, end, u8); c++; }
     return c;
+}
+
+static void sh_sep_from_ifs(struct sh_sep *s, const char *ifs) {
+    if (!ifs) { s->c[0] = ' '; s->n = 1; return; }
+    if (!*ifs) { s->n = 0; return; }
+    size_t n = shell_utf8() ? sh_cl(ifs, ifs + strlen(ifs), true) : 1;
+    if (n > sizeof s->c) n = 1;
+    memcpy(s->c, ifs, n);
+    s->n = n;
+}
+
+static int sb_put_sep(struct shell_sb *b, const struct sh_sep *s) {
+    return s->n ? sb_putmem(b, s->c, s->n) : 0;
+}
+
+/* FIELD SPLITTING BY CHARACTER (batch 13). bash finds a separator one
+ * CHARACTER at a time: in UTF-8 a multibyte character separates when it is
+ * one of IFS's characters, and a single byte -- ASCII, or one that starts
+ * no valid character -- when it is one of IFS's BYTES; an IFS holding an
+ * invalid sequence matches no multibyte character at all (its mbstowcs
+ * fails). IFS WHITESPACE is isspace -- \v \f and \r as well as space, tab
+ * and newline. The skips after a separator stay byte-wise, which is where
+ * bash's quirks live:
+ *
+ *     IFS=" \u00e9"; v="a \u00e9 b"; set -- $v      bash: [a][][b]
+ *     IFS=$'\r';     v=$'a\r\rb';  set -- $v      bash: [a][b]
+ *
+ * (logs/b13 q31). tsh compared bytes and knew three whitespace characters,
+ * so an IFS of e-acute split a word at each of its two bytes. */
+static void sh_ifsx_init(struct sh_ifsx *x, const char *ifs) {
+    if (!ifs) ifs = " \t\n";
+    x->s = ifs;
+    x->e = ifs + strlen(ifs);
+    memset(x->map, 0, sizeof x->map);
+    for (const char *q = ifs; *q; q++) x->map[(unsigned char)*q] = 1;
+    x->sh_style = strcmp(ifs, " \t\n") == 0;
+    x->u8 = shell_utf8();
+    x->wide_ok = true;
+    if (x->u8)
+        for (const char *q = ifs; q < x->e; ) {
+            size_t n = sh_cl(q, x->e, true);
+            if (n == 1 && (unsigned char)*q >= 0x80) { x->wide_ok = false; break; }
+            q += n;
+        }
+}
+
+/* one of IFS's bytes (issep, isifs) */
+static bool sh_ifsx_byte(const struct sh_ifsx *x, char c) {
+    return x->map[(unsigned char)c] != 0;
+}
+
+/* isspace, as the shell's locales have it */
+static bool sh_ifsx_space(char c) {
+    return c == ' ' || (c >= '\t' && c <= '\r');
+}
+
+/* bash's ifs_whitesep: the three under the default IFS, isspace otherwise */
+static bool sh_ifsx_white(const struct sh_ifsx *x, char c) {
+    if (x->sh_style) return c == ' ' || c == '\t' || c == '\n';
+    return sh_ifsx_space(c);
+}
+
+/* The length of the character at P, for stepping over it. */
+static size_t sh_ifsx_clen(const struct sh_ifsx *x, const char *p, const char *end) {
+    return (x->u8 && (unsigned char)*p >= 0x80) ? sh_cl(p, end, true) : 1;
+}
+
+/* The separator at P: its length, or 0 when P's character is not one. */
+static size_t sh_ifsx_sep(const struct sh_ifsx *x, const char *p, const char *end) {
+    size_t n = sh_ifsx_clen(x, p, end);
+    if (n == 1) return sh_ifsx_byte(x, *p) ? 1 : 0;
+    if (!x->wide_ok) return 0;
+    for (const char *q = x->s; q < x->e; ) {
+        size_t m = sh_cl(q, x->e, true);
+        if (m == n && memcmp(q, p, n) == 0) return n;
+        q += m;
+    }
+    return 0;
 }
 
 /* The byte offset of character K of S (N bytes); N for K past the end. */
@@ -6263,11 +6388,12 @@ static struct sh_array *sh_array_find(const char *name) {
 
 /* NAME's elements in its own order, `sep` between them (none for NUL);
  * a scalar is its one element. */
-static int sh_array_join(const char *name, char sep, struct shell_sb *out) {
+static int sh_array_join(const char *name, const struct sh_sep *sep,
+                         struct shell_sb *out) {
     struct sh_array *a = sh_array_find(name);
     if (!a) return sb_puts(out, env_get(name));
     for (int i = 0; i < a->n; i++) {
-        if (i && sep && sb_putc(out, sep) < 0) return -1;
+        if (i && sb_put_sep(out, sep) < 0) return -1;
         if (sb_puts(out, a->e[i].val) < 0) return -1;
     }
     return 0;
@@ -10192,23 +10318,56 @@ static void cmd_getopts_in(int argc, char **argv) {
     shell_set_status(rc ? 1 : 0);
 }
 
-static bool shell_ifs_has(const char *ifs, char c) {
-    if (!ifs) ifs = " \t\n";
-    for (const char *p = ifs; *p; p++) {
-        if (*p == c) return true;
-    }
-    return false;
-}
-
 /* IFS WHITESPACE IS NOT THE SAME AS AN IFS DELIMITER, and `read` treated them
  * as one thing. POSIX 2.6.5: leading and trailing IFS *whitespace* is
  * discarded, and a run of it separates fields; an IFS *non-whitespace*
  * character is a single delimiter that creates a field even when that field is
  * empty. With IFS='x ' and the line `a ax  x  `, bash gives ['a', 'ax  x'] --
  * the trailing spaces go, the x's stay. tsh stripped every trailing IFS
- * character from the last field and produced ['a', 'a']. */
-static bool shell_ifs_is_ws(const char *ifs, char c) {
-    return (c == ' ' || c == '\t' || c == '\n') && shell_ifs_has(ifs, c);
+ * character from the last field and produced ['a', 'a'].
+ *
+ * READ SPLITS AS BASH'S DOES, which is not quite word splitting (batch 13):
+ * a separator is a CHARACTER (sh_ifsx_sep), the leading skip takes isspace
+ * under a non-default IFS but the skip after a separator only space, tab
+ * and newline -- so with IFS=$'\r' the rest of `a\r\rb\rc` keeps its \r --
+ * and the last variable, when more than one field is left, gets the rest
+ * less trailing space/tab/newline in IFS, escaped or not (`a b c\ ` gives
+ * the second of two variables "b c"). An escaped character never
+ * separates and stops every skip (logs/b13 q31). */
+#define SH_RD_ESC(q)  (escmap && escmap[(q) - line])
+#define SH_SPCTABNL(c) ((c) == ' ' || (c) == '\t' || (c) == '\n')
+
+/* bash's get_word_from_string: the next field at *PP, [*W, *WEND), and *PP
+ * after it and its delimiter; false when only IFS whitespace was left. */
+static bool shell_read_word(const struct sh_ifsx *x, const char *line,
+                            const bool *escmap, char **pp, char **w, char **wend) {
+    char *s = *pp;
+    const char *end = s + strlen(s);
+    if (x->sh_style)
+        while (*s && !SH_RD_ESC(s) && SH_SPCTABNL(*s) && sh_ifsx_byte(x, *s)) s++;
+    else
+        while (*s && !SH_RD_ESC(s) && sh_ifsx_space(*s) && sh_ifsx_byte(x, *s)) s++;
+    if (!*s) { *pp = s; *w = *wend = s; return false; }
+    *w = s;
+    size_t sl = 0;
+    while (*s) {
+        if (!SH_RD_ESC(s) && (sl = sh_ifsx_sep(x, s, end)) > 0) break;
+        s += sh_ifsx_clen(x, s, end);
+    }
+    *wend = s;
+    if (*s) {
+        bool whitesep = sh_ifsx_white(x, *s);
+        s += sl;
+        while (*s && !SH_RD_ESC(s) && SH_SPCTABNL(*s) && sh_ifsx_byte(x, *s)) s++;
+        if (*s && whitesep && !SH_RD_ESC(s) && sh_ifsx_byte(x, *s) &&
+            !sh_ifsx_white(x, *s)) {
+            s++;
+            while (*s && !SH_RD_ESC(s) && sh_ifsx_white(x, *s) && sh_ifsx_byte(x, *s))
+                s++;
+        }
+    }
+    *pp = s;
+    return true;
 }
 
 /* Returns 0 when the line ended at a NEWLINE, 1 when it ended at EOF with
@@ -10367,71 +10526,45 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
         return shell_read_assign_empty(argc, argv, first + 1);
     }
 
-    /* A character the input escaped is data, whatever IFS says about it. */
-#define SH_RD_IFS(q)    (!(escmap && escmap[(q) - line]) && shell_ifs_has(ifs, *(q)))
-#define SH_RD_IFS_WS(q) (!(escmap && escmap[(q) - line]) && shell_ifs_is_ws(ifs, *(q)))
-
+    struct sh_ifsx x;
+    sh_ifsx_init(&x, ifs);
     char *p = line;
-    while (*p && SH_RD_IFS_WS(p)) p++;
+    while (*p && !SH_RD_ESC(p) && SH_SPCTABNL(*p) && sh_ifsx_byte(&x, *p)) p++;
 
     int rc = 0;
     for (int i = first; i < argc; i++) {
         char *val = p;
-        if (i + 1 == argc) {
-            char *end = p + strlen(p);
-            while (end > p && SH_RD_IFS_WS(end - 1)) end--;
-            /* THE LAST FIELD DROPS ONE TRAILING DELIMITER, AND ONLY ONE.
+        SH_SB(lastb);
+        if (i + 1 < argc) {
+            char *w, *we;
+            if (*p && shell_read_word(&x, line, escmap, &p, &w, &we)) {
+                *we = '\0';
+                val = w;
+            }
+        } else if (*p) {
+            /* THE LAST VARIABLE: the one field left, or else the rest of
+             * the line less its trailing space/tab/newline in IFS (bash's
+             * strip_trailing_ifs_whitespace -- it never takes the first
+             * character, and it takes an escaped one too). A single
+             * trailing delimiter goes with the field before it:
              *
              *     IFS='x '                read a b       bash
-             *     xx                      ->  ['',  '']
-             *     xxx                     ->  ['',  'xx']
              *     xax                     ->  ['',  'a']
-             *     xaxx                    ->  ['',  'axx']
-             *
-             * Measured across thirteen inputs, and this is the only rule
-             * that fits all of them: after the trailing IFS WHITESPACE goes,
-             * a single trailing IFS non-whitespace character is a delimiter
-             * that ended an empty field and comes off -- but only when what
-             * precedes it is ORDINARY DATA (or nothing). Preceded by any
-             * other IFS character, whitespace or not, it stays:
-             *
-             *     'a ax  x  x'            ->  ['a', 'ax  x  x']
-             *
-             * tsh handed the raw remainder over and kept the `x` in every
-             * case.
-             *
-             * It was recorded as "no rule fits" for several rounds. What was
-             * missing was the whole table: the runner printed three diff
-             * lines per case, so the rows that discriminate never appeared
-             * together. */
-            if (end > p && SH_RD_IFS(end - 1) && !SH_RD_IFS_WS(end - 1) &&
-                (end - 1 == p || !SH_RD_IFS(end - 2))) {
-                end--;
-                while (end > p && SH_RD_IFS_WS(end - 1)) end--;
-            }
-            *end = '\0';
-            p = end;
-        } else {
-            while (*p && !SH_RD_IFS(p)) p++;
-            if (*p) {
-                /* A field is ended by a run of IFS whitespace, optionally
-                 * around ONE IFS non-whitespace delimiter. Skipping the whole
-                 * run of any IFS character collapsed `a::b` (IFS=':') to two
-                 * fields where POSIX gives three. */
-                bool was_ws = SH_RD_IFS_WS(p);
-                *p++ = '\0';
-                while (*p && SH_RD_IFS_WS(p)) p++;
-                if (was_ws && *p && SH_RD_IFS(p) && !SH_RD_IFS_WS(p)) {
-                    p++;
-                    while (*p && SH_RD_IFS_WS(p)) p++;
-                }
+             *     xaxx                    ->  ['',  'axx'] */
+            char *t1 = p, *w, *we;
+            bool got = shell_read_word(&x, line, escmap, &p, &w, &we);
+            if (!*p) {
+                if (got && sb_putmem(&lastb, w, (size_t)(we - w)) < 0) return 1;
+                val = lastb.p ? lastb.p : p;
+            } else {
+                char *e = t1 + strlen(t1) - 1;
+                while (e > t1 && SH_SPCTABNL(*e) && sh_ifsx_byte(&x, *e)) e--;
+                e[1] = '\0';
+                val = t1;
             }
         }
-
         if (shell_read_set(argv[i], val) != 0) rc = 1;
     }
-#undef SH_RD_IFS
-#undef SH_RD_IFS_WS
     return rc;
 }
 
@@ -10456,8 +10589,6 @@ static int shell_read_assign_array(const char *name, const char *line,
     if (sb_grow(&fieldb, strlen(line) + 1) < 0) return 1;
     char *field = fieldb.p;
     size_t f = 0;
-#define SH_RA_IFS(q)    (!(escmap && escmap[(q) - line]) && shell_ifs_has(ifs, *(q)))
-#define SH_RA_IFS_WS(q) (!(escmap && escmap[(q) - line]) && shell_ifs_is_ws(ifs, *(q)))
     const char *p = line;
     if (ifs[0] == '\0') {
         /* The whole line is one field -- and an EMPTY line is none:
@@ -10470,41 +10601,36 @@ static int shell_read_assign_array(const char *name, const char *line,
         if (!*line) return 0;
         return sh_array_set(name, 0, line) < 0 ? 1 : 0;
     }
-    while (*p && SH_RA_IFS_WS(p)) p++;
+    /* bash's list_string, the escaped characters data (see
+     * shell_split_add): a field per separator character, an empty one
+     * kept unless IFS whitespace ends it. */
+    struct sh_ifsx x;
+    sh_ifsx_init(&x, ifs);
+    const char *lend = line + strlen(line);
+    while (*p && !SH_RD_ESC(p) && sh_ifsx_byte(&x, *p) && sh_ifsx_white(&x, *p)) p++;
     while (*p) {
-        f = 0;
-        while (*p && !SH_RA_IFS(p)) {
-            field[f++] = *p;
-            p++;
+        const char *start = p;
+        size_t sl = 0;
+        while (*p) {
+            if (!SH_RD_ESC(p) && (sl = sh_ifsx_sep(&x, p, lend)) > 0) break;
+            p += sh_ifsx_clen(&x, p, lend);
         }
+        f = (size_t)(p - start);
+        memcpy(field, start, f);
         field[f] = '\0';
-        if (!*p) {                       /* last field, no separator after */
+        if (f > 0 || (*p && !x.sh_style && !sh_ifsx_space(*p)))
             if (sh_array_set(name, idx++, field) < 0) return 1;
-            break;
-        }
-        /* a separator: whitespace run, optionally one non-ws byte, ws run */
-        bool was_ws = SH_RA_IFS_WS(p);
-        if (was_ws) {
-            while (*p && SH_RA_IFS_WS(p)) p++;
-            if (*p && SH_RA_IFS(p) && !SH_RA_IFS_WS(p)) {
-                p++;
-                while (*p && SH_RA_IFS_WS(p)) p++;
-            } else if (!*p) {            /* trailing whitespace ends nothing */
-                if (sh_array_set(name, idx++, field) < 0) return 1;
-                break;
-            }
-        } else {
+        if (!*p) break;
+        bool whitesep = sh_ifsx_white(&x, *p);
+        p += sl;
+        while (*p && !SH_RD_ESC(p) && sh_ifsx_white(&x, *p) && sh_ifsx_byte(&x, *p)) p++;
+        if (*p && whitesep && !SH_RD_ESC(p) && sh_ifsx_byte(&x, *p) &&
+            !sh_ifsx_white(&x, *p)) {
             p++;
-            while (*p && SH_RA_IFS_WS(p)) p++;
+            while (*p && !SH_RD_ESC(p) && sh_ifsx_white(&x, *p) && sh_ifsx_byte(&x, *p))
+                p++;
         }
-        if (sh_array_set(name, idx++, field) < 0) return 1;
-        /* a non-ws separator at the very end delimits a final EMPTY field only
-         * when nothing else follows -- `a bx` is a, b; `a b x x` is a, b, '', ''.
-         * That falls out of the loop: at end of input the loop exits with the
-         * field already stored. */
     }
-#undef SH_RA_IFS
-#undef SH_RA_IFS_WS
     return 0;
 }
 
@@ -24520,10 +24646,9 @@ static int shell_append_positional_join(struct shell_sb *b,
         }
         return 0;
     }
-    char sep = ' ';
     const char *ifs = env_get("IFS");
-    if (ifs && *ifs) sep = ifs[0];
-    else if (ifs) sep = '\0';
+    struct sh_sep sep;
+    sh_sep_from_ifs(&sep, ifs);
 
     /* IFS SET AND EMPTY, UNQUOTED: `$*` yields one field per parameter, the
      * same as `$@`.
@@ -24548,7 +24673,7 @@ static int shell_append_positional_join(struct shell_sb *b,
     }
 
     for (int i = 0; i < g_positional_count; i++) {
-        if (i > 0 && sep && sb_putc(b, sep) < 0) return -1;
+        if (i > 0 && sb_put_sep(b, &sep) < 0) return -1;
         if (sb_put_data_str(b, g_positional[i]) < 0)
             return -1;
     }
@@ -24570,10 +24695,9 @@ static int shell_append_array_join(struct shell_sb *b,
                                    const char *name, bool star, bool indices) {
     struct sh_array *a = sh_array_find(name);
     int n = a ? a->n : 0;
-    char sep = ' ';
     const char *ifs = env_get("IFS");
-    if (ifs && *ifs) sep = ifs[0];
-    else if (ifs) sep = '\0';
+    struct sh_sep sep;
+    sh_sep_from_ifs(&sep, ifs);
 
     if (!star) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -24602,7 +24726,7 @@ static int shell_append_array_join(struct shell_sb *b,
      * there is bash's own: the subscripts as ONE word, joined by a space
      * (Oils 2733). */
     bool null_unquoted = ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx;
-    if (null_unquoted && indices) sep = ' ';
+    if (null_unquoted && indices) { sep.c[0] = ' '; sep.n = 1; }
     else if (null_unquoted) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < n; i++) {
@@ -24612,7 +24736,7 @@ static int shell_append_array_join(struct shell_sb *b,
         return 0;
     }
     for (int i = 0; i < n; i++) {
-        if (i > 0 && sep && sb_putc(b, sep) < 0) return -1;
+        if (i > 0 && sb_put_sep(b, &sep) < 0) return -1;
         if (indices) {
             if (a->e[i].key) {
                 if (sb_put_data_str(b, a->e[i].key) < 0)
@@ -24671,10 +24795,9 @@ static int shell_append_array_slice(struct shell_sb *b,
     long end = (cnt < 0) ? n : off + cnt;
     if (end > n) end = n;
 
-    char sep = ' ';
     const char *ifs = env_get("IFS");
-    if (ifs && *ifs) sep = ifs[0];
-    else if (ifs) sep = '\0';
+    struct sh_sep sep;
+    sh_sep_from_ifs(&sep, ifs);
 
     if (!star) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -24697,7 +24820,7 @@ static int shell_append_array_slice(struct shell_sb *b,
     for (long i = off; i < end; i++) {
         if (!first) {
             if (fields) { if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1; }
-            else if (sep && sb_putc(b, sep) < 0) return -1;
+            else if (sb_put_sep(b, &sep) < 0) return -1;
         }
         first = false;
         if (sb_put_data_str(b, a->e[i].val) < 0) return -1;
@@ -25360,10 +25483,9 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
     }
     sv_sort(&names);
 
-    char sep = ' ';
     const char *ifs = env_get("IFS");
-    if (ifs && *ifs) sep = ifs[0];
-    else if (ifs) sep = '\0';
+    struct sh_sep sep;
+    sh_sep_from_ifs(&sep, ifs);
 
     int rc = 0;
     if (!star && sh_put_lead_mark(b) < 0) rc = -1;
@@ -25371,7 +25493,7 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
         if (i > 0) {
             if (!star) {
                 if (sb_putc(b, SHELL_ARG_MARK) < 0) rc = -1;
-            } else if (sep && sb_putc(b, sep) < 0) {
+            } else if (sb_put_sep(b, &sep) < 0) {
                 rc = -1;
             }
         }
@@ -25756,17 +25878,15 @@ static int shell_expand_array_kv(const char *nm, bool words, bool star,
     struct sh_array *arr = sh_array_find(nm);
     if (!arr || arr->n == 0) return 0;
     if (words) {
-        char sep = ' ';
-        const char *ifs2 = env_get("IFS");
-        if (ifs2 && *ifs2) sep = ifs2[0];
-        else if (ifs2) sep = '\0';
+        struct sh_sep sep;
+        sh_sep_from_ifs(&sep, env_get("IFS"));
         if (!star && sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < arr->n; i++) {
             for (int half = 0; half < 2; half++) {
                 if (i > 0 || half > 0) {
                     if (!star) {
                         if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
-                    } else if (sep && sb_putc(b, sep) < 0) {
+                    } else if (sb_put_sep(b, &sep) < 0) {
                         return -1;
                     }
                 }
@@ -25998,10 +26118,8 @@ static int shell_expand_substring(const char *name, const char *spec,
         if (off < 0) { off = n + off; if (off < 0) off = 0; }
         long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
         if (end > n) end = n;
-        char sep = ' ';
-        const char *ifs = env_get("IFS");
-        if (ifs && *ifs) sep = ifs[0];
-        else if (ifs) sep = '\0';
+        struct sh_sep sep;
+        sh_sep_from_ifs(&sep, env_get("IFS"));
         if (!star && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
@@ -26013,8 +26131,8 @@ static int shell_expand_substring(const char *name, const char *spec,
                 if (!star) {
                     if (sb_putc(b, SHELL_ARG_MARK) < 0)
                         return -1;
-                } else if (sep) {
-                    if (sb_putc(b, sep) < 0) return -1;
+                } else if (sb_put_sep(b, &sep) < 0) {
+                    return -1;
                 }
             }
             first = false;
@@ -26228,15 +26346,11 @@ static int shell_expand_array_test_op(struct shell_sb *b, const char *nm,
         if (!arr) {
             is_null = (*sv == '\0');
         } else {
-            char sep = ' ';
-            if (star) {
-                const char *ifs = env_get("IFS");
-                if (ifs && *ifs) sep = ifs[0];
-                else if (ifs) sep = '\0';
-            }
+            struct sh_sep sep = SH_SEP_SPACE;
+            if (star) sh_sep_from_ifs(&sep, env_get("IFS"));
             is_null = true;
             for (int i = 0; i < arr->n && is_null; i++)
-                if ((arr->e[i].val && arr->e[i].val[0]) || (i > 0 && sep))
+                if ((arr->e[i].val && arr->e[i].val[0]) || (i > 0 && sep.n))
                     is_null = false;
         }
     }
@@ -26846,10 +26960,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         bool at_a = strcmp(suffix, "@a") == 0;
                         if (at_a && shell_expand_at_transform(nm, 'a', &attrs) < 0)
                             return -1;
-                        char sep = ' ';
-                        const char *ifs2 = env_get("IFS");
-                        if (ifs2 && *ifs2) sep = ifs2[0];
-                        else if (ifs2) sep = '\0';
+                        struct sh_sep sep;
+                        sh_sep_from_ifs(&sep, env_get("IFS"));
                         if (!star && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
@@ -26861,8 +26973,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             if (i > 0) {
                                 if (!star) {
                                     if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
-                                } else if (sep &&
-                                    sb_putc(b, sep) < 0) {
+                                } else if (sb_put_sep(b, &sep) < 0) {
                                     return -1;
                                 }
                             }
@@ -31846,21 +31957,6 @@ static bool shell_is_declaration_utility(const char *name) {
            strcmp(name, "typeset") == 0;
 }
 
-static bool shell_is_ifs_char(char c) {
-    const char *ifs = env_get("IFS");
-    if (!ifs) ifs = " \t\n";
-    for (; *ifs; ifs++) {
-        if (*ifs == c) return true;
-    }
-    return false;
-}
-
-/* IFS whitespace, as POSIX means it: space/tab/newline, and only when they
- * are actually in IFS. With IFS=':' a space is an ordinary character. */
-static bool shell_is_ifs_white(char c) {
-    return (c == ' ' || c == '\t' || c == '\n') && shell_is_ifs_char(c);
-}
-
 static int shell_add_arg_ex(struct shell_pipeline *pl, struct shell_simple *cur,
                             const char *word, bool quoted, bool expanded,
                             bool assign_src);
@@ -32126,7 +32222,8 @@ static int shell_add_arg_ex_in(struct shell_pipeline *pl,
     {
         const char *ifs = env_get("IFS");
         if ((!ifs || *ifs) && shell_word_has_argmark(word)) {
-            char sep = ifs ? ifs[0] : ' ';
+            struct sh_sep sep;
+            sh_sep_from_ifs(&sep, ifs);
             SH_SB(norm);
             bool prot = false, lead_seen = false, left = false;
             for (const char *q = word; *q; q++) {
@@ -32138,7 +32235,7 @@ static int shell_add_arg_ex_in(struct shell_pipeline *pl,
                 }
                 if (c == SHELL_NOSPLIT_MARK) prot = !prot;
                 else if (!prot && c == SHELL_ARG_MARK) {
-                    if (lead_seen && sb_putc(&norm, sep) < 0) return -1;
+                    if (lead_seen && sb_put_sep(&norm, &sep) < 0) return -1;
                     lead_seen = true;
                     continue;
                 } else if (!prot && (c == SHELL_ARG_JOIN || c == SHELL_EMPTY_ELEM)) {
@@ -32230,36 +32327,49 @@ static int shell_add_arg_ex_in(struct shell_pipeline *pl,
 static int shell_split_add(struct shell_pipeline *pl, struct shell_simple *cur,
                            const char *word, bool quoted) {
     /* `prot` tracks the SHELL_NOSPLIT_MARK toggle: while it is on, no
-     * character is a delimiter, which is what keeps `${x:-'a b c'}` one word. */
+     * character is a delimiter, which is what keeps `${x:-'a b c'}` one word.
+     * Separators are found by CHARACTER, the skips after one go by byte, as
+     * bash's list_string does (see sh_ifsx_init). */
+    struct sh_ifsx x;
+    sh_ifsx_init(&x, env_get("IFS"));
+    const char *wend = word + strlen(word);
     bool prot = false;
     const char *p = word;
-    while (!prot && shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+    while (sh_ifsx_byte(&x, *p) && *p && sh_ifsx_white(&x, *p)) p++;
 
     while (*p) {
         const char *start = p;
+        size_t sl = 0;
         while (*p) {
             /* escape-aware: an escaped byte is data, and never a delimiter */
             if (*p == SHELL_DATA_ESC && p[1]) { p += 2; continue; }
             if (*p == SHELL_NOSPLIT_MARK) { prot = !prot; p++; continue; }
-            if (!prot && shell_is_ifs_char(*p)) break;
-            p++;
+            if (!prot && (sl = sh_ifsx_sep(&x, p, wend)) > 0) break;
+            p += sh_ifsx_clen(&x, p, wend);
         }
         size_t n = (size_t)(p - start);
-        SH_SB(tmp);
-        if (shell_strip_nosplit_n(&tmp, start, n) < 0) return -1;
-        char *saved = 0;
-        if (shell_pipeline_save_word(pl, tmp.p, &saved) < 0) return -1;
-        /* The WORD's flag, not the field's: globbing behaviour is left exactly
-         * as it was, so this change is about splitting only. */
-        if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
-
+        /* an empty field before IFS whitespace is none (list_string) */
+        if (n > 0 || !(x.sh_style || sh_ifsx_space(*p))) {
+            SH_SB(tmp);
+            if (shell_strip_nosplit_n(&tmp, start, n) < 0) return -1;
+            char *saved = 0;
+            if (shell_pipeline_save_word(pl, tmp.p, &saved) < 0) return -1;
+            /* The WORD's flag, not the field's: globbing behaviour is left
+             * exactly as it was, so this change is about splitting only. */
+            if (shell_add_one_arg(pl, cur, saved, quoted) < 0) return -1;
+        }
         if (!*p) break;
-        /* One delimiter: optional whitespace, at most one non-whitespace
-         * IFS character, optional whitespace. */
-        while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
-        if (shell_is_ifs_char(*p) && !shell_is_ifs_white(*p)) {
-            p++;
-            while (shell_is_ifs_char(*p) && shell_is_ifs_white(*p)) p++;
+        /* One delimiter: the separator character, any IFS whitespace, and
+         * -- after whitespace -- one more IFS byte that is not whitespace
+         * with the whitespace after it. */
+        {
+            bool whitesep = sh_ifsx_white(&x, *p);
+            p += sl;
+            while (*p && sh_ifsx_white(&x, *p) && sh_ifsx_byte(&x, *p)) p++;
+            if (*p && whitesep && sh_ifsx_byte(&x, *p) && !sh_ifsx_white(&x, *p)) {
+                p++;
+                while (*p && sh_ifsx_white(&x, *p) && sh_ifsx_byte(&x, *p)) p++;
+            }
         }
         /* A trailing delimiter does not introduce an empty final field. */
         if (!*p) break;
