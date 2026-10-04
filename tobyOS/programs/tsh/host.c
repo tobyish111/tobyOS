@@ -130,6 +130,24 @@ void printk_get_sink(void (**cb)(void *ctx, char c), void **ctx,
     if (suppress) *suppress = g_sink_suppress;
 }
 
+/* A DIAGNOSTIC DOES NOT PUSH THE BUFFERED STDOUT OUT AHEAD OF IT. libtoby
+ * writes pending stdout before every syscall (K5); bash's stdio does not,
+ * so within one builtin bash's error lines come BEFORE the output the
+ * builtin had buffered -- `printf '%d %d\n' 1 x >file 2>&1` is "printf: x:
+ * invalid number" and then "1 0" (logs/b13 q53). The shell's own
+ * diagnostics are written straight to the kernel; stdout still goes out at
+ * the end of the builtin, as bash's does. */
+static bool g_diag_nosync;
+static long host_write_nosync(int fd, const void *buf, size_t n) {
+    extern long toby_sc_raw3(long num, long a, long b, long c);
+    long r = toby_sc_raw3(1 /* ABI_SYS_WRITE */, fd, (long)(uintptr_t)buf, (long)n);
+    if (r < 0) {
+        errno = (unsigned long)r > (unsigned long)-4096L ? (int)-r : EIO;
+        return -1;
+    }
+    return r;
+}
+
 /* STDOUT IS BUFFERED, AS BASH'S IS (S2, 2026-09-30). This was
  * write(1, &c, 1): one syscall per character of every builtin's output,
  * so two shells printing at once interleaved INSIDE words -- 28 of 30 runs
@@ -169,9 +187,16 @@ void kprintf(const char *fmt, ...) {
     {
         extern struct file *shell_current_diag_file(void);
         struct file *diag = shell_current_diag_file();
-        if (diag) { (void)file_write(diag, buf, (size_t)n); return; }
+        if (diag) {
+            g_diag_nosync = true;
+            (void)file_write(diag, buf, (size_t)n);
+            g_diag_nosync = false;
+            return;
+        }
     }
-    write(2, buf, (size_t)n);           /* diagnostics -> stderr. See header. */
+    /* diagnostics -> stderr (see header), not flushing stdout first (see
+     * file_write) */
+    (void)host_write_nosync(2, buf, (size_t)n);
 }
 
 int ksnprintf(char *dst, size_t cap, const char *fmt, ...) {
@@ -297,7 +322,8 @@ long file_write(struct file *f, const void *buf, size_t n) {
     const char *p = (const char *)buf;
     size_t done = 0;
     while (done < n) {
-        long put = write(fd, p + done, n - done);
+        long put = g_diag_nosync ? host_write_nosync(fd, p + done, n - done)
+                                 : write(fd, p + done, n - done);
         if (put < 0) {
             if (errno == EINTR) continue;
             /* the errno, negated, for the caller's "write error: REASON"
@@ -1121,6 +1147,13 @@ int host_getpgrp(void) { return (int)getpgrp(); }
 #define TSH_STACK_RESERVE (512ul << 10)
 
 int main(int argc, char **argv) {
+    /* STDOUT IS LINE-BUFFERED, whatever it is: bash's shell_initialize does
+     * sh_setlinebuf(stdout) before anything else. A diagnostic in the
+     * middle of a builtin's output therefore follows the last whole line
+     * and precedes a part line -- `printf '%d|' 1 x 2` to a file is the
+     * error, then "1|0|2|", and a builtin printing lines then failing has
+     * them out first (logs/b13 q53). libtoby buffered a file fully. */
+    (void)setvbuf(stdout, 0, _IOLBF, BUFSIZ);
     shell_init_hosted(argv[0]);
     /* HOW DEEP THE SHELL MAY NEST IS SET BY THE STACK (g_stack_floor in
      * src/shell.c). A native process's stack tops out at the end of the

@@ -110,19 +110,25 @@ int unlink(const char *path) {
  *   - sbrk(0)       -> current break.
  *   - sbrk(inc)     -> previous break, or (void*)-1 + errno=ENOMEM. */
 
+/* MEMORY IS NOT AN EFFECT: the break moves without flushing stdio first
+ * (K5, syscall.c, writes pending output before every other syscall). A
+ * program's output has nothing to be ordered against here, and flushing
+ * made WHERE a buffered line broke depend on whether malloc happened to
+ * grow the heap: /bin/tsh's printf put half a line out ahead of its own
+ * warning, where bash's stdio holds the line (logs/b13 q53). */
 int brk(void *addr) {
-    long r = toby_sc1(ABI_SYS_BRK, (long)(uintptr_t)addr);
+    long r = toby_sc_raw3(ABI_SYS_BRK, (long)(uintptr_t)addr, 0, 0);
     if (r == 0 && addr != 0) { errno = ENOMEM; return -1; }
     return 0;
 }
 
 void *sbrk(long inc) {
     /* Read current. */
-    long cur = toby_sc1(ABI_SYS_BRK, 0);
+    long cur = toby_sc_raw3(ABI_SYS_BRK, 0, 0, 0);
     if (cur == 0) { errno = ENOMEM; return (void *)-1; }
     if (inc == 0) return (void *)(uintptr_t)cur;
     long want = cur + inc;
-    long got  = toby_sc1(ABI_SYS_BRK, want);
+    long got  = toby_sc_raw3(ABI_SYS_BRK, want, 0, 0);
     if (got != want) { errno = ENOMEM; return (void *)-1; }
     return (void *)(uintptr_t)cur;     /* POSIX: return PREVIOUS break */
 }
