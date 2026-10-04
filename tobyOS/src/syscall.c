@@ -2778,7 +2778,27 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
          * error handling can be tested, and costs one line here -- it reads as
          * zeroes (like /dev/zero) and fails every write. */
         if (strcmp(dev, "tty") == 0) {
-            struct file *f = console_file_make();
+            /* ...THE CALLER'S controlling terminal (struct proc's ctty):
+             * the console, its session's pty, or ENXIO when it has none
+             * -- after setsid(), in an SSH command's session. It was the
+             * console for everyone: an SSH session's `bash -i` read the
+             * CONSOLE's foreground group as its terminal's and stopped
+             * itself on SIGTTIN for good (finding 61). */
+            struct proc *me = current_proc();
+            struct file *f = 0;
+            if (!me || me->ctty_kind == PROC_CTTY_CONSOLE) {
+                f = console_file_make();
+            } else if (me->ctty_kind == PROC_CTTY_PTY &&
+                       pty_ctty_live(me->ctty_index, me->ctty_gen)) {
+                f = pty_open_slave(me->ctty_index);
+                if (!f) return -ABI_ENXIO;
+                f->o_accmode = 2;
+                int pfd = fd_alloc_into(me, f);
+                if (pfd < 0) { file_close(f); return -ABI_EMFILE; }
+                return pfd;
+            } else {
+                return -ABI_ENXIO;
+            }
             if (!f) return -ABI_ENOMEM;
             f->o_accmode = 2;                       /* O_RDWR */
             int fd = fd_alloc_into(current_proc(), f);
@@ -2828,6 +2848,15 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
             if (!any) return -ABI_ENOENT;
             struct file *f = pty_open_slave(idx);
             if (!f) return -ABI_ENOENT;
+            /* a session leader with no terminal takes the first it opens
+             * without O_NOCTTY (0400), as on Linux -- what getty and a
+             * terminal emulator's setsid()'d child rely on */
+            {
+                struct proc *me = current_proc();
+                if (me && !(flags & 0400) && me->sid == me->pid &&
+                    me->ctty_kind == PROC_CTTY_NONE)
+                    (void)pty_make_ctty(me, idx, false);
+            }
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
             return fd;
@@ -5590,6 +5619,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return lx_do_setpgid(a1, a2);
     case ABI_SYS_GETPGID:
         return lx_do_getpgid(a1);
+    case ABI_SYS_SETSID:
+        return proc_setsid(current_proc());
     case ABI_SYS_IOCTL:
         /* Forward to the Linux arm (LX_ioctl == 16): the tty/pty control
          * surface is one implementation for both ABIs. */
@@ -12584,11 +12615,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_getpgid: return lx_do_getpgid(a1);
     case LX_getpgrp: return lx_do_getpgid(0);
     case LX_setsid: {
-        /* A new session leads its own group. The session machinery itself
-         * (session_id) is unchanged -- this only stops the pgid lying. */
-        struct proc *me = current_proc();
-        if (me) me->pgid = me->pid;
+        /* A new session and group led by the caller, with no controlling
+         * terminal; EPERM for a group leader (proc_setsid). It only moved
+         * the pgid, and always said yes. */
+        long r = proc_setsid(current_proc());
+        if (r < 0) return r;
         return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
+    }
+    case 124: {                         /* getsid(pid) */
+        struct proc *t = a1 ? proc_lookup((int)a1) : current_proc();
+        if (!t) return -ABI_ESRCH;
+        return t->sid;
     }
 
     /* ---- readlink (B20): backs readlink(/proc/self/exe), realpath, etc. ---- */

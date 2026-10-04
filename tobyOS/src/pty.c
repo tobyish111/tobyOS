@@ -71,6 +71,9 @@ struct pty {
 };
 
 static struct pty g_ptys[PTY_MAX];
+/* Each allocation of a slot bumps its generation (see pty.h): a
+ * controlling-terminal reference names the pair, not the slot. */
+static uint32_t g_pty_gen[PTY_MAX];
 
 /* ---- wait queue (mirrors pipe.c) -------------------------------- */
 static void wq_add(struct proc **head, struct proc *p) {
@@ -147,6 +150,7 @@ struct file *pty_open_master(void) {
     memset(t, 0, sizeof(*t));
     t->used = true;
     t->index = idx;
+    g_pty_gen[idx]++;
     t->master_refs = 1;
     t->slave_refs = 0;
     pty_defaults(t);
@@ -578,8 +582,12 @@ long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
     }
     case PTY_TIOCSPTLCK:                  /* unlock slave: accept, no locking */
         return 0;
-    case PTY_TIOCSCTTY:                   /* set controlling tty: accept */
-        return 0;
+    case PTY_TIOCSCTTY:                   /* set controlling tty */
+        /* only for the session leader that has none -- a terminal
+         * emulator's child after setsid() -- as Linux has it; it was
+         * accepted and nothing was set */
+        if (f->kind != FILE_KIND_PTY_SLAVE) return -ABI_EINVAL;
+        return pty_make_ctty(current_proc(), t->index, false);
     case TTY_TCFLSH:
         return 0;
     default:
@@ -604,4 +612,32 @@ bool pty_hup(struct file *f) {
     if (!t) return true;
     if (f->kind == FILE_KIND_PTY_MASTER) return t->slave_refs == 0;
     return t->master_refs == 0;
+}
+
+/* ---- controlling terminals ------------------------------------- */
+
+uint32_t pty_gen_of(int index) {
+    return (index >= 0 && index < PTY_MAX) ? g_pty_gen[index] : 0;
+}
+
+bool pty_ctty_live(int index, uint32_t gen) {
+    return index >= 0 && index < PTY_MAX && g_ptys[index].used &&
+           g_ptys[index].master_refs > 0 && g_pty_gen[index] == gen;
+}
+
+long pty_make_ctty(struct proc *p, int index, bool force) {
+    if (!p || index < 0 || index >= PTY_MAX || !g_ptys[index].used)
+        return -ABI_EINVAL;
+    if (!force) {
+        if (p->ctty_kind == PROC_CTTY_PTY && p->ctty_index == index &&
+            p->ctty_gen == g_pty_gen[index])
+            return 0;                       /* this one already */
+        if (p->sid != p->pid || p->ctty_kind != PROC_CTTY_NONE)
+            return -ABI_EPERM;
+    }
+    p->ctty_kind = PROC_CTTY_PTY;
+    p->ctty_index = index;
+    p->ctty_gen = g_pty_gen[index];
+    g_ptys[index].pgrp = p->pgid > 0 ? p->pgid : p->pid;
+    return 0;
 }

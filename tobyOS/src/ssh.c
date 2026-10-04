@@ -1565,6 +1565,23 @@ static bool ssh_spawn_shell(void) {
         struct proc *cp = proc_lookup(pid);
         const struct user *u = users_lookup_by_name(g_auth_user);
         if (cp && u) { cp->uid = u->uid; cp->gid = u->gid; }
+        /* ITS OWN SESSION, as sshd's child is (setsid). A login session's
+         * controlling terminal is its pty -- /dev/tty in it is the pty, not
+         * the console it was -- and a command run without pty-req has
+         * none, as `ssh host cmd` on Linux: /dev/tty is ENXIO there, and a
+         * `bash -i` in it says it has no job control instead of stopping on
+         * the console's SIGTTIN (finding 61). The pty's foreground group is
+         * the session's either way. Not its own process GROUP: see
+         * proc_kill_tree for what that did. */
+        if (cp) {
+            cp->sid = pid;
+            (void)pty_make_ctty(cp, idx, true);
+            if (!g_chan.want_pty) {
+                cp->ctty_kind = PROC_CTTY_NONE;
+                cp->ctty_index = 0;
+                cp->ctty_gen = 0;
+            }
+        }
     }
     /* BISECT: proc_set_pgid removed for this experiment. */
 

@@ -287,7 +287,14 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
     case TTY_TIOCGPGRP: {
         if (!arg) return -ABI_EFAULT;
         int pg = signal_get_foreground();
-        if (pg <= 0) { struct proc *p = current_proc(); pg = p ? p->pid : 1; }
+        /* No foreground group set: the caller's own GROUP, so a shell's
+         * job-control start (bash's, /bin/tsh's: wait until tcgetpgrp is
+         * getpgrp) sees itself in front. It answered the caller's PID, and
+         * a shell that was not a group leader would SIGTTIN itself. */
+        if (pg <= 0) {
+            struct proc *p = current_proc();
+            pg = p ? (p->pgid > 0 ? p->pgid : p->pid) : 1;
+        }
         if (copy_to_user((void *)arg, &pg, sizeof(pg)) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -309,6 +316,18 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
         int navail = (int)(g_line_len - g_line_pos);
         if (copy_to_user((void *)arg, &navail, sizeof(navail)) != 0)
             return -ABI_EFAULT;
+        return 0;
+    }
+
+    case 0x540Eu: {                         /* TIOCSCTTY */
+        /* The console as the controlling terminal of a session leader that
+         * has none (Linux's rule); the one it already has is no change. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        if (me->ctty_kind == PROC_CTTY_CONSOLE) return 0;
+        if (me->sid != me->pid || me->ctty_kind != PROC_CTTY_NONE)
+            return -ABI_EPERM;
+        me->ctty_kind = PROC_CTTY_CONSOLE;
         return 0;
     }
 

@@ -535,6 +535,19 @@ struct proc {
      * signals to the whole group. 0 means "never set" and is read as
      * "own pid" everywhere, so pre-existing code paths stay valid. */
     int             pgid;
+    /* POSIX SESSION AND CONTROLLING TERMINAL. sid: the session, a setsid
+     * caller's pid, inherited (0: pid 0's, which every boot process is in).
+     * ctty: the session's terminal -- the console, a pty (ctty_index and
+     * ctty_gen name the pair, so a pty slot used again by another session is
+     * not this one's), or none. /dev/tty opens it, and is ENXIO without one;
+     * setsid() clears it; TIOCSCTTY, or a session leader's first open of a
+     * terminal, sets it. Inherited at spawn and fork. /dev/tty was the
+     * console for every process -- an SSH session's `bash -i` took the
+     * CONSOLE's foreground group for its own terminal's (finding 61). */
+    int             sid;
+    uint8_t         ctty_kind;
+    int             ctty_index;
+    uint32_t        ctty_gen;
     /* Job-control stop reporting (WUNTRACED): which signal stopped this
      * proc, and whether a wait has already reported that stop. Set when a
      * stop signal's default action runs, cleared by SIGCONT. */
@@ -1000,6 +1013,16 @@ struct proc *proc_lookup(int pid);
  * setpgid syscall). The shell's `set -m` uses this through a host seam:
  * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
 int proc_set_pgid(int pid, int pgid);
+
+/* proc.ctty_kind: the controlling terminal (see struct proc) */
+#define PROC_CTTY_NONE      0
+#define PROC_CTTY_CONSOLE   1
+#define PROC_CTTY_PTY       2
+
+/* setsid(2): a new session and process group led by the caller, with no
+ * controlling terminal. -EPERM (an ABI errno) for a process-group leader.
+ * Returns the caller's pid as the kernel numbers it. */
+long proc_setsid(struct proc *p);
 
 /* Signal `pid` and every process descended from it. Returns the count.
  * Uses live parent links, so it cannot follow a recycled pid. */

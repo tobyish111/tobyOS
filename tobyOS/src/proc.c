@@ -285,6 +285,8 @@ void proc_init(void) {
      * 0000, where a Linux session begins with 0022 (bash there says 0022,
      * here it said 0000). */
     k->umask       = 0022u;
+    /* the console is pid 0's terminal, and every boot process's after it */
+    k->ctty_kind   = PROC_CTTY_CONSOLE;
     k->state       = PROC_RUNNING;
     k->cr3         = vmm_kernel_pml4_phys();
     k->owns_pml4   = false;
@@ -694,6 +696,23 @@ int proc_set_pgid(int pid, int pgid) {
     return 0;
 }
 
+/* setsid(2). A process-group leader may not -- its group would be split
+ * between two sessions -- and a pgid of 0 reads as the process's own pid
+ * (see struct proc), so a process spawned by pid 0 is one until it moves:
+ * util-linux's setsid and busybox's fork first when getpgrp() == getpid(),
+ * for exactly this. The new session has no controlling terminal. */
+long proc_setsid(struct proc *p) {
+    if (!p) return -ABI_EPERM;
+    int pg = p->pgid > 0 ? p->pgid : p->pid;
+    if (pg == p->pid) return -ABI_EPERM;
+    p->sid = p->pid;
+    p->pgid = p->pid;
+    p->ctty_kind = PROC_CTTY_NONE;
+    p->ctty_index = 0;
+    p->ctty_gen = 0;
+    return p->pid;
+}
+
 /* Signal a process and everything descended from it.
  *
  * WHY NOT A PROCESS GROUP. The obvious way to reap an SSH session is to
@@ -861,6 +880,11 @@ static int spawn_body(const char *path, const char *name,
          * parentless (kernel-spawned) proc -- the conventional default --
          * and pid 0 carries 0022 itself (proc_init). */
         p->umask      = parent ? parent->umask      : 0022u;
+        /* the session and its terminal, as fork copies them */
+        p->sid        = parent ? parent->sid        : 0;
+        p->ctty_kind  = parent ? parent->ctty_kind  : PROC_CTTY_CONSOLE;
+        p->ctty_index = parent ? parent->ctty_index : 0;
+        p->ctty_gen   = parent ? parent->ctty_gen   : 0;
         /* Linux slice 2: the rest of the credential set is inherited too.
          * A plain spawn is not a privilege transition, so real/effective/saved
          * all agree on entry -- exactly what fork(2) gives you. execve may
@@ -1399,6 +1423,7 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
     /* pid 0's umask: a worker spawns too -- sshd's starts every SSH
      * session, and with the wiped 0 every session began at umask 0000 */
     p->umask = 0022u;
+    p->ctty_kind = PROC_CTTY_CONSOLE;     /* pid 0's, as a worker's spawns expect */
     name_copy(p->name, name ? name : "kworker", PROC_NAME_MAX);
     /* Kernel context: same ADMIN blanket as pid 0 / ap_idle so any
      * kernel-invoked VFS/net path sails through cap_check. */

@@ -43,6 +43,18 @@ struct file *pty_open_slave(int index);
  * pty_open_slave(index) would succeed. /dev/pts lists these (devfs.c). */
 bool pty_slave_live(int index);
 
+/* CONTROLLING TERMINALS (struct proc's ctty). Each allocation of a pair's
+ * slot bumps its generation, so a session's reference to a pair that has
+ * since closed never reaches the next session's. */
+struct proc;
+uint32_t pty_gen_of(int index);
+bool     pty_ctty_live(int index, uint32_t gen);   /* still that pair */
+/* Make pair INDEX P's controlling terminal and its foreground group P's --
+ * sshd for a session, TIOCSCTTY, a session leader's first open. -EPERM (an
+ * ABI errno) unless P leads its session and has no terminal (or this one);
+ * FORCE skips that check (sshd setting up a session it just spawned). */
+long     pty_make_ctty(struct proc *p, int index, bool force);
+
 /* file.c backend dispatch (read/write/close/clone reference-count). */
 long pty_master_read (struct file *f, void *buf, size_t n);
 /* Returns the number of bytes ACCEPTED, which may be less than n when the

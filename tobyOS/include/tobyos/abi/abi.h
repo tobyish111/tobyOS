@@ -115,6 +115,7 @@ extern "C" {
 #define ABI_ENOENT           2   /* no such file or directory */
 #define ABI_ESRCH            3   /* no such process */
 #define ABI_EIO              5   /* I/O error from underlying device */
+#define ABI_ENXIO            6   /* no such device: /dev/tty without a terminal */
 #define ABI_E2BIG            7   /* arg/env list too long */
 #define ABI_ENOEXEC          8   /* exec format error */
 #define ABI_ELOOP           40   /* too many levels (#! nesting) */
@@ -1258,7 +1259,11 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         native program: /bin/tsh's `times`
                                         and `time` printed wall-clock
                                         uptime and nothing. */
-#define ABI_SYS_NR_MAX          217
+#define ABI_SYS_SETSID          218  /* () -> the caller's pid, a new session
+                                        and group with no controlling
+                                        terminal; -EPERM for a process-
+                                        group leader. setsid(2). */
+#define ABI_SYS_NR_MAX          218
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {
