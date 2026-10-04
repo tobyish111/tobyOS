@@ -171,6 +171,78 @@ void shell_host_builtin_done(void) {
     (void)fflush(stdout);
 }
 
+/* BASH'S initialize_job_control (jobs.c), for an interactive shell or one
+ * given -m. Find the terminal -- fd 2's, or /dev/tty's when -i was forced
+ * and fd 2 is not one -- wait (SIGTTIN to its own group) until the shell's
+ * group is that terminal's foreground, lead a group of its own and make it
+ * the foreground. Where a step fails the shell says so in bash's words and
+ * has no job control:
+ *
+ *     setsid bash -i < /dev/null 2>&1 | cat
+ *     bash: cannot set terminal process group (-1): Not a tty
+ *     bash: no job control in this shell             ($- has no m)
+ *
+ * /bin/tsh looked at no terminal, kept job control on whatever it had, and
+ * never led its own group (finding 61). NAME is $0, which is how bash
+ * names itself in these. Returns whether job control is on. */
+static bool tsh_init_job_control(const char *name, bool forced_interactive) {
+    int tty = -1;
+    if (forced_interactive && !isatty(2)) tty = open("/dev/tty", O_RDWR);
+    if (tty < 0) tty = dup(2);
+    int shell_pgrp = (int)getpgrp();
+    int terminal_pgrp = -1, t_errno = -1, tty_sigs = 0;
+    bool jc = false;
+    for (;;) {
+        int pg = 0;
+        if (tty < 0 || ioctl(tty, 0x540FUL /* TIOCGPGRP */, &pg) != 0) {
+            terminal_pgrp = -1;
+            break;
+        }
+        terminal_pgrp = pg;
+        if (shell_pgrp == terminal_pgrp) break;
+        signal(SIGTTIN, SIG_DFL);
+        (void)kill(0, SIGTTIN);
+        if (tty_sigs++ > 16) {
+            fprintf(stderr, "%s: initialize_job_control: no job control in background: %s\n",
+                    name, strerror(errno));
+            if (tty >= 0) close(tty);
+            return false;
+        }
+    }
+    if (terminal_pgrp == -1) t_errno = errno;
+    int original = shell_pgrp;
+    shell_pgrp = (int)getpid();
+    if (original != shell_pgrp && setpgid(0, shell_pgrp) < 0) {
+        fprintf(stderr, "%s: initialize_job_control: setpgid: %s\n", name, strerror(errno));
+        shell_pgrp = original;
+    }
+    jc = true;
+    if (shell_pgrp != original && shell_pgrp != terminal_pgrp) {
+        int pg = shell_pgrp;
+        if (tty < 0 || ioctl(tty, 0x5410UL /* TIOCSPGRP */, &pg) != 0) {
+            int e = errno;
+            (void)setpgid(0, original);
+            shell_pgrp = original;
+            fprintf(stderr, "%s: cannot set terminal process group (%d): %s\n",
+                    name, shell_pgrp, strerror(e));
+            jc = false;
+        }
+    }
+    if (jc) {
+        int t = -1;
+        if (tty < 0 || ioctl(tty, 0x540FUL /* TIOCGPGRP */, &t) != 0) t = -1;
+        if (t == -1 || t != shell_pgrp) {
+            int e = (t_errno != -1) ? t_errno : errno;
+            fprintf(stderr, "%s: cannot set terminal process group (%d): %s\n",
+                    name, t, strerror(e));
+            jc = false;
+        }
+    }
+    if (!jc) fprintf(stderr, "%s: no job control in this shell\n", name);
+    if (tty >= 0) close(tty);
+    return jc;
+}
+
 /* bash's setup_async_signals: an asynchronous command started without job
  * control ignores SIGINT and SIGQUIT -- the keyboard's signals belong to
  * the foreground -- and so does the program it execs, since an ignore
@@ -461,6 +533,7 @@ static int errno_to_vfs(void) {
         case EACCES:  return VFS_ERR_PERM;
         case EPERM:   return VFS_ERR_NOTPERM;
         case ENAMETOOLONG: return VFS_ERR_NAMETOOLONG;
+        case ENXIO:   return SHELL_HOSTED_ERR_NXIO;   /* /dev/tty, no terminal */
         default:      return VFS_ERR_IO;
     }
 }
@@ -1347,8 +1420,12 @@ int main(int argc, char **argv) {
     int login = o_l ? -1 : (self[0] == '-' ? 1 : 0);
     if (login) shell_set_login_hosted(login == 1);
 
+    int m_req = 0;                      /* -m (1) or +m (-1) at invocation */
     for (int r = 0; r < nreq; r++) {
         struct inv_req *q = &reqs[r];
+        if ((q->kind == 'f' && q->flag == 'm') ||
+            (q->kind == 'o' && q->name && strcmp(q->name, "monitor") == 0))
+            m_req = q->on ? 1 : -1;
         if (q->kind == 'f') {
             (void)shell_set_flag_hosted(q->flag, q->on);
         } else if (q->kind == 'o') {
@@ -1373,6 +1450,15 @@ int main(int argc, char **argv) {
     /* -D: the $"..." strings would be listed and nothing run (bash: -n);
      * tsh translates none, so there are none to list */
     if (o_dump) (void)shell_set_flag_hosted('n', true);
+
+    /* JOB CONTROL as bash starts it, before the startup files (shell.c's
+     * shell_initialize): an interactive shell, or one given -m, takes its
+     * terminal or says it has none -- and then has no `m` (finding 61) */
+    if (interactive || m_req > 0) {
+        bool jc = tsh_init_job_control(self, o_i);
+        if (m_req < 0) jc = false;
+        (void)shell_set_flag_hosted('m', jc);
+    }
 
     shell_startup_files_hosted(login, interactive, o_norc, o_noprofile, rcfile,
                                act_like_sh);

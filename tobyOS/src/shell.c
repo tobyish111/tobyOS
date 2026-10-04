@@ -22423,6 +22423,7 @@ static const char *shell_errno_text(int err) {
     case VFS_ERR_NAMETOOLONG: return "Filename too long";
     case VFS_ERR_PERM:        return "Permission denied";
     case VFS_ERR_NOTPERM:     return "Operation not permitted";
+    case SHELL_HOSTED_ERR_NXIO: return "No such device or address";
     default:                  return "No error information";
     }
 }

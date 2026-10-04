@@ -113,4 +113,10 @@ int  shell_set_args_hosted(int argc, char **argv);
 /* Set $0 -- `sh -c CMD NAME` names the script NAME. */
 int  shell_set_param0_hosted(const char *name);
 
+/* /bin/tsh's file shims (programs/tsh/host.c) answer in VFS_ERR_* codes;
+ * this one is theirs alone -- ENXIO, as /dev/tty is without a controlling
+ * terminal -- out of reach of both the VFS codes and the ABI errnos, which
+ * share the small negatives. The kernel never returns it. */
+#define SHELL_HOSTED_ERR_NXIO (-200)
+
 #endif /* TOBYOS_SHELL_H */
