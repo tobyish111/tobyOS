@@ -171,6 +171,16 @@ void shell_host_builtin_done(void) {
     (void)fflush(stdout);
 }
 
+/* bash's setup_async_signals: an asynchronous command started without job
+ * control ignores SIGINT and SIGQUIT -- the keyboard's signals belong to
+ * the foreground -- and so does the program it execs, since an ignore
+ * survives exec. tsh's async children died of `kill -INT $!` (logs/b14
+ * r11). */
+void shell_host_async_signals(void) {
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+}
+
 void kprintf(const char *fmt, ...) {
     char buf[1024];
     va_list ap;

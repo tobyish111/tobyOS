@@ -24966,6 +24966,7 @@ static void shell_subshell_frame_close(struct shell_subshell_frame *frame);
 extern int  fork(void);
 extern void _exit(int status);
 void shell_host_builtin_done(void);              /* host.c: flush stdout */
+void shell_host_async_signals(void);             /* host.c: INT, QUIT ignored */
 /* fork(), and the child knows it may replace itself (g_replace_ok) */
 static int shell_fork(void) {
     int pid = fork();
@@ -36455,6 +36456,7 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             /* the element joins the job's group before it runs anything
              * (bash's make_child does it in both, against the race) */
             if (jc) (void)proc_set_pgid(0, leader);
+            else shell_host_async_signals();   /* bash's setup_async_signals */
             if (r) file_close(r);              /* the read end of its own output */
             jobs_forget_all();
             shell_trap_clear_caught();
@@ -36561,6 +36563,10 @@ static int shell_background_forked_as(const char *text, const char *label,
      * gave it the shell's stdin: `printf L | sh -c '( cat & wait )'`
      * printed L, which bash's does not (logs/b14 r6 r7). A pipeline is
      * not one command here, and its first element keeps stdin (r6). */
+    /* bash's setup_async_signals: without job control the child ignores
+     * SIGINT and SIGQUIT, and the program it execs keeps the ignore
+     * (logs/b14 r11: `sleep 3 & kill -INT $!` leaves it running) */
+    bool async_ign = !shell_job_control();
     bool null_stdin = (g_subshell_depth > 0 || !shell_job_control()) &&
                       !g_stdin_redir && !shell_text_stdin_redirected(text);
     int pid = shell_fork();
@@ -36592,6 +36598,7 @@ static int shell_background_forked_as(const char *text, const char *label,
          * a USR1 the script had ignored, and it died of it (138) every time
          * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
         shell_trap_clear_caught();
+        if (async_ign) shell_host_async_signals();
         if (null_stdin) {
             struct file *dn = shell_open_vfs_file("/dev/null", false, false, "shell");
             if (dn) g_shell_fd[0] = dn;
