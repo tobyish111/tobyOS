@@ -43254,6 +43254,15 @@ void shell_history_add_hosted(const char *line) { shell_history_add(line); }
  * OLDEST entry, matching g_hist's own order, so the editor walks backwards
  * from count-1 without needing to know the ring is compacted on overflow. */
 int shell_history_count_hosted(void) { return g_hist_count; }
+/* The line editor's mode is `set -o vi`/`emacs` (lineedit.c); its ^E and
+ * M-^J switch it, and `set -o` says so, as readline's do in bash. */
+bool shell_opt_vi_hosted(void) { return g_opt_vi; }
+void shell_set_editing_mode_hosted(bool vi) {
+    g_opt_vi = vi;
+    g_opt_emacs = !vi;
+}
+/* vi's G counts history NUMBERS: g_hist_base + 1 is slot 0's */
+unsigned long shell_history_base_hosted(void) { return g_hist_base; }
 const char *shell_history_get_hosted(int i) {
     if (i < 0 || i >= g_hist_count) return 0;
     return g_hist[i];

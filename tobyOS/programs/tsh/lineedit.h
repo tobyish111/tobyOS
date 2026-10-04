@@ -24,5 +24,7 @@ int  tsh_lineedit_available(void);
  * TSH_LE_EOF / TSH_LE_INTR. Raw mode is entered and restored inside, so the
  * tty is in its normal state whenever a command runs -- job control depends
  * on the terminal delivering ^C/^Z to the foreground job, not to us. */
-long tsh_readline(const char *prompt, char *buf, size_t cap);
+/* *BUFP (malloc'd, *CAPP bytes, either may be 0/NULL) grows as the line
+ * does; the caller keeps it between calls and frees it. */
+long tsh_readline(const char *prompt, char **bufp, size_t *capp);
 #endif

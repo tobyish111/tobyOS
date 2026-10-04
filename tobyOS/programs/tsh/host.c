@@ -1295,8 +1295,12 @@ int main(int argc, char **argv) {
      * interactive gate frames its whole protocol on prompt sentinels.
      * Multi-line commands accumulate under PS2 using the same continuation
      * test the script accumulator uses. */
-    static char line[4096];
-    static char accum[16384];
+    /* Both GROW: a line held 4096 bytes and a multi-line command 16384,
+     * and one past that was thrown away without a word (batch 13). */
+    char *line = 0;
+    size_t line_cap = 0;
+    char *accum = 0;
+    size_t acap = 0;
     size_t alen = 0;
     int last = 0;
     int eofs = 0;
@@ -1317,7 +1321,7 @@ int main(int argc, char **argv) {
          * because there is no cursor to move there and putting a non-tty
          * into raw mode would break it. */
         if (!noediting && tsh_lineedit_available()) {
-            long r = tsh_readline(ps, line, sizeof line);
+            long r = tsh_readline(ps, &line, &line_cap);
             if (r == TSH_LE_INTR) {
                 interrupted = 1;
                 n = 0;
@@ -1373,7 +1377,18 @@ int main(int argc, char **argv) {
                 break;
             }
             if (c == '\n') break;
-            if (n + 1 < sizeof line) line[n++] = c;
+            if (n + 2 > line_cap) {
+                size_t nc = line_cap ? line_cap * 2 : 256;
+                char *nl = (char *)realloc(line, nc);
+                if (!nl) break;
+                line = nl;
+                line_cap = nc;
+            }
+            line[n++] = c;
+        }
+        if (n + 1 > line_cap) {
+            char *nl = (char *)realloc(line, n + 1);
+            if (!nl) { n = 0; if (!line) continue; } else { line = nl; line_cap = n + 1; }
         }
         line[n] = '\0';
         /* READLINE ECHOES what it reads, terminal or not: bash edits every
@@ -1411,7 +1426,11 @@ int main(int argc, char **argv) {
                 line[0] = '\0';
             } else if (hr > 0) {
                 size_t xn = strlen(xl);
-                if (xn + 1 <= sizeof line) {
+                if (xn + 1 > line_cap) {
+                    char *nl = (char *)realloc(line, xn + 1);
+                    if (nl) { line = nl; line_cap = xn + 1; }
+                }
+                if (xn + 1 <= line_cap) {
                     memcpy(line, xl, xn + 1);
                     n = xn;
                 }
@@ -1419,7 +1438,14 @@ int main(int argc, char **argv) {
         }
         if (n == 0 && !cont) continue;
         eofs = 0;
-        if (alen + n + 2 > sizeof accum) { alen = 0; cont = 0; continue; }
+        if (alen + n + 2 > acap) {
+            size_t nc = acap ? acap : 1024;
+            while (nc < alen + n + 2) nc *= 2;
+            char *na = (char *)realloc(accum, nc);
+            if (!na) { alen = 0; cont = 0; continue; }
+            accum = na;
+            acap = nc;
+        }
         memcpy(accum + alen, line, n);
         alen += n;
         accum[alen] = '\0';
