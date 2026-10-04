@@ -444,6 +444,49 @@ static size_t norm_diag_prefix(char *t, size_t len) {
     return w;
 }
 
+/* A JOB'S PID IS NOT BEHAVIOUR EITHER.
+ *
+ * `cmd &` at an interactive shell announces "[N] PID", and the pid is
+ * whatever the kernel handed out -- never the same in two runs. So a LINE
+ * that is exactly "[N] DIGITS" (then \r or \n) has the digits replaced by
+ * "PID" on both sides; the job number, the brackets, the blank and every
+ * other byte still have to match. Returns the new length (the rewrite
+ * shortens a pid of more than three digits and lengthens a shorter one,
+ * so it is done into a copy, no longer than CAP). */
+static size_t norm_job_pids(char *t, size_t len, size_t cap) {
+    static char out[CAP_TRANS];
+    if (cap > sizeof out) cap = sizeof out;
+    size_t r = 0, w = 0;
+    while (r < len && w + 8 < cap) {
+        if (r == 0 || t[r - 1] == '\n') {
+            size_t q = r;
+            if (q < len && t[q] == '[') {
+                q++;
+                size_t d0 = q;
+                while (q < len && t[q] >= '0' && t[q] <= '9') q++;
+                if (q > d0 && q + 1 < len && t[q] == ']' && t[q + 1] == ' ') {
+                    size_t p0 = q + 2, p1 = p0;
+                    while (p1 < len && t[p1] >= '0' && t[p1] <= '9') p1++;
+                    if (p1 > p0 && p1 < len && (t[p1] == '\r' || t[p1] == '\n')) {
+                        size_t head = p0 - r;
+                        if (w + head + 3 >= cap) break;
+                        memcpy(out + w, t + r, head);
+                        w += head;
+                        memcpy(out + w, "PID", 3);
+                        w += 3;
+                        r = p1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out[w++] = t[r++];
+    }
+    while (r < len && w < cap) out[w++] = t[r++];
+    memcpy(t, out, w);
+    return w;
+}
+
 static int run_pair(const char *name, const char *shell_b, int *pass) {
     static char lines[MAX_LINES][256];
     int nlines = 0;
@@ -478,8 +521,10 @@ static int run_pair(const char *name, const char *shell_b, int *pass) {
 
     const char *a = g_ta + cut_a;
     size_t alen = norm_diag_prefix(g_ta + cut_a, sa.tlen - cut_a);
+    alen = norm_job_pids(g_ta + cut_a, alen, sizeof g_ta - cut_a);
     const char *b = g_tb + cut_b;
     size_t blen = norm_diag_prefix(g_tb + cut_b, sb.tlen - cut_b);
+    blen = norm_job_pids(g_tb + cut_b, blen, sizeof g_tb - cut_b);
 
     if (alen == blen && memcmp(a, b, alen) == 0 && st_a == st_b) {
         emitf("[ttyparity] %-26s PASS  (%u bytes, exit=%d)\n",

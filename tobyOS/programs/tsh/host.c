@@ -977,6 +977,24 @@ int proc_try_reap(int pid, int *code) {
     return 1;
 }
 
+/* ...and, with UNTRACED, a stop (2, its signal in *stopsig) or a continue
+ * (3), each reported once by the kernel -- what a job-control shell asks
+ * of its background jobs (bash's waitchld: WUNTRACED|WCONTINUED). */
+int proc_try_reap_state(int pid, int *code, int *stopsig, bool untraced) {
+    int st = 0;
+    pid_t r = waitpid(pid, &st, WNOHANG | (untraced ? WUNTRACED | WCONTINUED : 0));
+    if (r == 0) return 0;
+    if (r < 0) return -1;
+    if (WIFSTOPPED(st)) {
+        if (stopsig) *stopsig = WSTOPSIG(st);
+        return 2;
+    }
+    if (WIFCONTINUED(st)) return 3;
+    int c = host_reaped(st);
+    if (code) *code = c;
+    return 1;
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 /* bash's long options, as it lists them (shell.c's long_args) */
@@ -1006,6 +1024,8 @@ extern void shell_list_shopts_hosted(bool reinput);
 extern void shell_set_invocation_hosted(bool c, bool s);
 extern void shell_set_login_hosted(bool set_home);
 extern void shell_exit_notice_hosted(void);
+extern bool shell_eof_refused_hosted(void);
+extern void shell_exit_jobs_hosted(void);
 extern int  shell_exit_trap_hosted(int status);
 extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
@@ -1045,6 +1065,24 @@ static void tsh_sigint(int sig) {
 static void tsh_arm_sigint(void) {
     (void)signal_norestart(SIGINT, tsh_sigint);
 }
+
+/* A HANGUP at a terminal: noted, and the read it interrupts returns, so
+ * the loop can hang up the jobs and leave (shell_hangup_hosted). */
+static volatile int g_tsh_sighup;
+static void tsh_sighup(int sig) { (void)sig; g_tsh_sighup = 1; }
+
+/* The hangup, acted on: the jobs are hung up, the EXIT trap runs, and the
+ * shell dies of the signal, as bash's does (kill_shell). */
+extern int shell_hangup_hosted(void);
+static void tsh_hangup_exit(void) {
+    (void)shell_hangup_hosted();
+    signal(SIGHUP, SIG_DFL);
+    kill(getpid(), SIGHUP);
+    _exit(128 + SIGHUP);
+}
+
+/* The shell's process group, for `jobs -x` (shell_own_pgrp). */
+int host_getpgrp(void) { return (int)getpgrp(); }
 
 #include "lineedit.h"
 
@@ -1263,10 +1301,12 @@ int main(int argc, char **argv) {
     if (cmd) {
         int rc = shell_run_line_hosted(cmd);
         shell_logout_hosted();
+        shell_exit_jobs_hosted();
         return rc;
     }
     if (script) {
         int rc = shell_run_script_hosted(script);
+        shell_exit_jobs_hosted();
         return rc;
     }
 
@@ -1288,6 +1328,14 @@ int main(int argc, char **argv) {
     signal(SIGTSTP, tsh_job_signal);
     signal(SIGTTOU, tsh_job_signal);
     signal(SIGTTIN, tsh_job_signal);
+    /* bash at a terminal ignores SIGTERM -- `kill $$` does not end it --
+     * and a hangup hangs up its jobs before it goes (bash's
+     * set_signal_handlers, termsig_handler). A no-op handler, not SIG_IGN,
+     * for the reason above. */
+    if (interactive) {
+        signal(SIGTERM, tsh_job_signal);
+        (void)signal_norestart(SIGHUP, tsh_sighup);
+    }
 
     /* PS1/PS2 come from the SHELL's variable table (they are rarely
      * exported, so getenv cannot see them), and prompts are written with a
@@ -1306,6 +1354,7 @@ int main(int argc, char **argv) {
     int eofs = 0;
     int cont = 0;
     for (;;) {
+        if (g_tsh_sighup) tsh_hangup_exit();
         /* bash announces finished background jobs right before a prompt. */
         if (!cont) shell_notify_jobs_hosted();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
@@ -1333,9 +1382,14 @@ int main(int argc, char **argv) {
                                   : "Use \"exit\" to leave the shell.\n", stderr);
                         continue;
                     }
-                    if (interactive) shell_exit_notice_hosted();
+                    if (interactive) {
+                        shell_exit_notice_hosted();
+                        if (shell_eof_refused_hosted()) continue;
+                    }
                     shell_logout_hosted();
-                    return interactive ? shell_exit_trap_hosted(last) : last;
+                    int st = interactive ? shell_exit_trap_hosted(last) : last;
+                    shell_exit_jobs_hosted();
+                    return st;
                 }
                 n = 0;
             } else {
@@ -1370,9 +1424,14 @@ int main(int argc, char **argv) {
                     /* bash announces an EOF exit -- the "exit" you see
                      * when ^D ends an interactive shell is printed by the
                      * shell, not echoed by the terminal. */
-                    if (interactive) shell_exit_notice_hosted();
+                    if (interactive) {
+                        shell_exit_notice_hosted();
+                        if (shell_eof_refused_hosted()) break;
+                    }
                     shell_logout_hosted();
-                    return interactive ? shell_exit_trap_hosted(last) : last;
+                    int st = interactive ? shell_exit_trap_hosted(last) : last;
+                    shell_exit_jobs_hosted();
+                    return st;
                 }
                 break;
             }
@@ -1489,6 +1548,7 @@ int main(int argc, char **argv) {
                  * standard error and before any EXIT trap ran, as bash's
                  * does (shell_exit_notice_hosted); a shell ended any other
                  * way -- set -e -- says nothing. */
+                shell_exit_jobs_hosted();
                 return st;
             }
         }

@@ -1,0 +1,23 @@
+# BACKGROUND JOBS AT A TERMINAL. `cmd &` announces "[N] PID" on stderr
+# (the runner masks the pid); a job that finishes is reported before the
+# next prompt, with "(wd: DIR)" and "(wd now: DIR)" when the shell has
+# moved; `%1` is `fg %1`; and exit with a stopped job says "There are
+# stopped jobs." and stays -- the exit after `jobs` leaves. tsh announced
+# no `&`, reported on stdout, knew no directories, ran `%1` as a command
+# and left its stopped jobs behind (logs/b13 q43-q49).
+sleep 0 &
+sleep 1
+echo after
+cd /tmp
+sleep 30 &
+cd /
+jobs
+kill %1
+sleep 1
+sleep 1 &
+%1
+sleep 30
+%CTRLZ%
+exit
+jobs
+exit

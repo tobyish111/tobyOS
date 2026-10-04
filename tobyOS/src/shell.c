@@ -1028,6 +1028,23 @@ static bool g_in_pipeline_stage;
  * shell is always a terminal session); the hosted script/-c paths clear it
  * through shell_set_interactive_hosted(false), so no script sees a change. */
 static bool g_opt_monitor = true;
+/* bash's job_control, which is not quite `set -m`: a subshell starts
+ * without it (execute_in_subshell's without_job_control) though $- still
+ * shows the m, and a `set -m` run there turns it back on -- `set -m; (sleep
+ * 0 & sleep 1)` reports nothing, `(set -m; sleep 0 & sleep 1)` reports the
+ * job (logs/b13 q46). The subshell depth `set -m` was last turned on at. */
+static int g_jc_level;
+/* bash's this_shell_builtin and last_shell_builtin: the builtin the command
+ * now running is, and the one before it -- 0 for anything else. `exit`
+ * leaves despite stopped jobs when the command before it was exit, logout
+ * or jobs (exit.def). Commands with no words do not count. */
+typedef void (*shell_bi_fn)(int argc, char **argv);
+static shell_bi_fn g_this_builtin, g_last_builtin;
+static bool shell_reading_user(void);
+__attribute__((unused))
+static inline bool shell_job_control(void) {
+    return g_opt_monitor && g_jc_level == g_subshell_depth;
+}
 /* `set -o ignoreeof`: an interactive EOF must not exit the shell. Only the
  * hosted interactive loop can see an EOF; everywhere else the flag is just
  * settable state, which is all a script can observe. */
@@ -1613,7 +1630,22 @@ struct job {
     bool blind;                /* `kill` has just signalled it: the next look
                                 * that does not wait misses its death -- see
                                 * shell_job_poll */
+    char *wd;                  /* the shell's directory when it started (bash's
+                                * job->wd): a line about it names that
+                                * directory once the shell has moved */
+    bool jc;                   /* started under job control (J_JOBCONTROL):
+                                * fg and bg refuse a job that was not */
+    bool seen;                 /* its state has been reported -- by `jobs`,
+                                * by bg -- since it last changed (bash's
+                                * J_NOTIFIED for a live job: `jobs -n`) */
+    bool nohup;                /* `disown -h`: no SIGHUP when the shell
+                                * hangs up its jobs */
+    int  stopsig;              /* the signal that stopped it */
 };
+
+static const char *shell_cwd(void);
+static void dirstack_polite(const char *name, struct shell_sb *b);
+static bool g_flag_c;                  /* -c: bash's startup state 2 */
 
 static struct job **g_jobs;
 static int          g_jobs_cap;
@@ -1723,15 +1755,6 @@ static char *jobs_join_argv(char **argv) {
     return out;
 }
 
-/* The most recent job wears bash's `+`. */
-static struct job *jobs_newest(void) {
-    struct job *best = 0;
-    for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && !g_jobs[i]->dead &&
-            (!best || g_jobs[i]->id > best->id))
-            best = g_jobs[i];
-    return best;
-}
 
 
 /* THE CURRENT AND PREVIOUS JOBS -- bash's js.j_current and js.j_previous
@@ -1870,6 +1893,17 @@ static int jobs_add(int pid, const char *name) {
     j->sig  = 0;
     j->notified = false;
     j->blind = false;
+    j->jc = shell_job_control();
+    j->seen = false;
+    j->nohup = false;
+    j->stopsig = 0;
+    if (j->wd) kfree(j->wd);
+    {
+        const char *cwd = shell_cwd();
+        size_t wl = strlen(cwd);
+        j->wd = (char *)kmalloc(wl + 1);
+        if (j->wd) memcpy(j->wd, cwd, wl + 1);
+    }
     shell_bgstat_forget(pid);
     jobs_reset_current();              /* bash's stop_pipeline, async */
     return j->id;
@@ -1891,6 +1925,8 @@ static void jobs_remove(struct job *j) {
     j->notified = false;
     if (j->name) kfree(j->name);
     j->name = 0;
+    if (j->wd) kfree(j->wd);
+    j->wd = 0;
     if (id && (id == g_js_current || id == g_js_previous))
         jobs_reset_current();          /* bash's delete_job */
 }
@@ -1949,8 +1985,118 @@ static const char *shell_job_status_word(int code, int sig, char *buf,
                                          size_t cap) {
     if (sig > 0) return shell_signal_desc(sig);
     if (code == 0) return "Done";
-    ksnprintf(buf, cap, "Exit %d", code);
+    /* POSIX mode says Done(N) for what is otherwise Exit N (bash's
+     * printable_job_status; logs/b13 q49) */
+    ksnprintf(buf, cap, g_opt_posix ? "Done(%d)" : "Exit %d", code);
     return buf;
+}
+
+/* Has the shell moved since the job started? */
+static bool shell_job_moved(const struct job *j) {
+    return j->wd && strcmp(j->wd, shell_cwd()) != 0;
+}
+
+static const char *shell_signal_name(int num);
+
+/* What a job's line says of its state (bash's printable_job_status): its
+ * end -- Done, Exit N, a signal -- or Running, or Stopped: in the long form
+ * the stopping signal's description, under POSIX "Stopped(SIGTSTP)". */
+static const char *shell_job_state_word(const struct job *j, bool longform,
+                                        char *buf, size_t cap) {
+    if (j->dead) return shell_job_status_word(j->code, j->sig, buf, cap);
+    if (j->stopped) {
+        int ss = j->stopsig > 0 ? j->stopsig : SIGTSTP;
+        if (longform) return shell_signal_desc(ss);
+        if (g_opt_posix) {
+            const char *nm = shell_signal_name(ss);
+            ksnprintf(buf, cap, "Stopped(SIG%s)", nm ? nm : "TSTP");
+            return buf;
+        }
+        return "Stopped";
+    }
+    return "Running";
+}
+
+/* A job's line as bash's pretty_print_job writes it: "[N]+  STATUS  CMD",
+ * or in the long form (`jobs -l`) "[N]+ PID STATUS  CMD" with the pid in
+ * five columns; STATUS padded to 24, " &" for a running job, and
+ * "  (wd: DIR)" once the shell has moved -- DIR as polite_directory_format
+ * writes it, `~` for $HOME (print_pipeline). `jobs` lists these and a
+ * notice is one. tsh never kept the directory and had no long form
+ * (logs/b13 q44 q49). */
+static void shell_job_line(struct shell_sb *b, const struct job *j,
+                           bool longform) {
+    char wb[40];
+    const char *status = shell_job_state_word(j, longform, wb, sizeof wb);
+    char head[48];
+    if (longform)
+        ksnprintf(head, sizeof head, "[%d]%c %5d ", j->id, jobs_mark(j), j->pid);
+    else
+        ksnprintf(head, sizeof head, "[%d]%c  ", j->id, jobs_mark(j));
+    (void)sb_puts(b, head);
+    (void)sb_puts(b, status);
+    /* bash pads with "%*s" and 24 less the word: a longer word gets the
+     * difference as blanks the other way */
+    int pad = 24 - (int)strlen(status);
+    if (pad < 0) pad = -pad;
+    for (int k = 0; k < pad; k++) (void)sb_putc(b, ' ');
+    (void)sb_puts(b, j->name ? j->name : "");
+    if (!j->dead && !j->stopped) (void)sb_puts(b, " &");
+    if (shell_job_moved(j)) {
+        (void)sb_puts(b, "  (wd: ");
+        dirstack_polite(j->wd, b);
+        (void)sb_putc(b, ')');
+    }
+    (void)sb_putc(b, '\n');
+}
+
+/* bash's notice of a job a stop has just taken from the terminal: a
+ * newline, then its line -- on stderr in /bin/tsh, as bash writes it
+ * (notify_of_job_status, JSTOPPED); the kernel console keeps its one
+ * stream. */
+static void shell_job_stopped_notice(struct job *j) {
+    SH_SB(b);
+    (void)sb_putc(&b, '\n');
+    shell_job_line(&b, j, false);
+    if (shell_job_moved(j)) {
+        (void)sb_puts(&b, "(wd now: ");
+        dirstack_polite(shell_cwd(), &b);
+        (void)sb_puts(&b, ")\n");
+    }
+    j->seen = true;                         /* bash's J_NOTIFIED */
+#ifdef SHELL_HOSTED
+    if (b.p) kprintf_raw("%s", b.p);
+#else
+    if (b.p) shell_write(b.p);
+#endif
+}
+
+/* bash's notice of a job that has finished, under job control
+ * (notify_of_job_status): its line on stderr, then "(wd now: DIR)" when
+ * the shell has moved since it started. */
+__attribute__((unused))
+static void shell_job_notice(const struct job *j) {
+    SH_SB(b);
+    shell_job_line(&b, j, false);
+    if (shell_job_moved(j)) {
+        (void)sb_puts(&b, "(wd now: ");
+        dirstack_polite(shell_cwd(), &b);
+        (void)sb_puts(&b, ")\n");
+    }
+    if (b.p) kprintf_raw("%s", b.p);
+}
+
+/* bash's `interactive`: the shell is running what its user typed -- not a
+ * subshell, a $( ), a sourced file or a trap's action (execute_cmd.c,
+ * evalfile.c's FEVAL_NONINT, trap.c's SEVAL_NONINT). */
+static bool shell_reading_user(void);
+
+/* bash's DESCRIBE_PID: a job an interactive shell starts in the background
+ * is announced on stderr, "[N] PID" (execute_cmd.c; jobs.c describe_pid).
+ * /bin/tsh announced nothing (WSL bash, `printf 'sleep 0 &\n' | bash -i`). */
+__attribute__((unused))
+static void shell_describe_job(int jid, int pid) {
+    if (jid > 0 && shell_reading_user()) kprintf_raw("[%d] %d\n", jid, pid);
 }
 
 /* bash's report of a job a SIGNAL killed (`sig`, 0 = it exited: nothing).
@@ -2005,35 +2151,37 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
 }
 
 #ifdef SHELL_HOSTED
-/* Prompt-time job notification, bash's format and moment: reap finished
- * background jobs (host seam: waitpid WNOHANG) and announce each once,
- * right before a PS1 prints. tsh previously never reaped interactive bg
- * jobs at all. */
+static int shell_job_poll(struct job *j);      /* see cmd_wait */
+static void shell_job_died(struct job *j, int code, int sig);
+
+/* Prompt-time job notification, bash's format and moment: each job is
+ * asked how it is -- a prompt comes after time has passed, so a `kill`
+ * just made is not missed (see shell_job_poll) -- and what has finished is
+ * announced once, and what has STOPPED since it was last reported: a blank
+ * line and "[N]+  Stopped  CMD" (bash's notify_of_job_status; `cat &` stops
+ * at once on SIGTTIN). On stderr, and only under job control: an
+ * interactive shell with `set +m` drops a finished job silently. The marks
+ * are the table's before any job leaves it. tsh never saw a job stop. */
 void shell_notify_jobs_hosted(void) {
-    extern int proc_try_reap(int pid, int *code);
     for (int i = 0; i < JOB_MAX; i++) {
-        if (g_jobs[i]->id == 0) continue;
-        int code = 0, sig = 0;
-        int r;
-        if (g_jobs[i]->dead) {
-            /* Reaped by `wait`; bash still announces it here. */
-            r = 1;
-            code = g_jobs[i]->code;
-            sig  = g_jobs[i]->sig;
-        } else {
-            r = proc_try_reap(g_jobs[i]->pid, &code);
-            if (r == 1) sig = proc_last_term_sig();
-            if (r == 1) shell_bgstat_add(g_jobs[i]->pid, code);      /* S9 */
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead) continue;
+        j->blind = false;
+        /* not this shell's child to ask any more: it is gone, as Done */
+        if (shell_job_poll(j) < 0) shell_job_died(j, 0, 0);
+    }
+    bool jc = shell_job_control();
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id) continue;
+        if (j->dead) {
+            /* reaped by `wait` too: bash still announces it here */
+            if (jc) shell_job_notice(j);
+            j->notified = true;
+        } else if (j->stopped && !j->seen) {
+            if (jc) shell_job_stopped_notice(j);
+            j->seen = true;
         }
-        if (r == 0) continue;
-        char wb[24];
-        const char *what = (r < 0) ? "Done"
-                         : shell_job_status_word(code, sig, wb, sizeof wb);
-        /* bash's mark: the job is announced while still in the table */
-        char mark = jobs_mark(g_jobs[i]);
-        shell_printf("[%d]%c  %-24s%s\n", g_jobs[i]->id, mark, what,
-                     g_jobs[i]->name);
-        jobs_remove(g_jobs[i]);
     }
 }
 #endif
@@ -2052,7 +2200,7 @@ static int shell_job_poll(struct job *j);      /* see cmd_wait */
 static void shell_jobs_reap(bool waited) {
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
-        if (!j->id || j->dead || j->stopped) continue;
+        if (!j->id || j->dead) continue;
         if (waited) j->blind = false;      /* time has passed: see shell_job_poll */
         (void)shell_job_poll(j);
     }
@@ -2100,17 +2248,52 @@ static void shell_jobs_notify(unsigned long line, int how) {
     shell_jobs_reap(how == SHELL_NOTIFY_WAITED);
     unsigned long saved_line = g_shell_lineno;
     if (line) g_shell_lineno = line;
+    /* What bash says of each finished job (logs/b13 q42-q46):
+     *   - in a script (startup state 0), a job that exited stays, for
+     *     `jobs` or `wait`; one a signal ended is reported and goes;
+     *   - in -c (state 2), every finished job goes -- `wait %1` is then
+     *     "no such job" -- but under POSIX only $!'s stays, and nothing at
+     *     all is said;
+     *   - the report: "LINE: PID Killed  CMD" for a signal other than INT,
+     *     TERM or PIPE that is not trapped; otherwise, under job control,
+     *     the standard notice "[N]+  Terminated  CMD" (or "Done", "Exit N"
+     *     for a -c job that exited). tsh printed only the first kind.
+     * As bash's notify_and_cleanup, every notice is out before any of the
+     * jobs leaves the table: the marks are those of the full table. */
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
-        if (!j->id || !j->dead) continue;
-        /* listed by `jobs`, or collected by `wait`: bash has deleted it */
-        if (j->notified || j->waited) { jobs_remove(j); continue; }
-        if (j->sig > 0) {
-            if (!g_jobs_silent)
-                shell_report_job_death(j->pid, j->sig, j->name, false);
-            jobs_remove(j);
+        if (!j->id) continue;
+        /* A STOPPED JOB, in -c under job control: "\n[N]+  Stopped  CMD"
+         * (bash's JSTOPPED notice; a script, startup state 0, says nothing
+         * of it, and POSIX -c nothing at all) */
+        if (!j->dead) {
+            if (j->stopped && !j->seen && g_flag_c && !g_opt_posix &&
+                !g_jobs_silent && shell_job_control())
+                shell_job_stopped_notice(j);
+            continue;
         }
+        /* listed by `jobs`, or collected by `wait`: bash has deleted it */
+        if (j->notified || j->waited) { j->notified = true; continue; }
+        int sg = j->sig;
+        if (sg <= 0 && !g_flag_c) continue;
+        if (g_jobs_silent) {
+            if (sg > 0) j->notified = true;
+            continue;
+        }
+        if (g_flag_c && g_opt_posix) {
+            if (j->pid != g_last_bg_pid) j->notified = true;
+            continue;
+        }
+        if (sg > 0 && sg != SIGINT && sg != SIGTERM && sg != SIGPIPE &&
+            !(sg < SIG_MAX && g_traps[sg]))
+            shell_report_job_death(j->pid, sg, j->name, false);
+        else if (shell_job_control())
+            shell_job_notice(j);
+        j->notified = true;
     }
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->notified)
+            jobs_remove(g_jobs[i]);
     g_shell_lineno = saved_line;
     if (how == SHELL_NOTIFY_WAITED) shell_coproc_reap();
 }
@@ -5532,6 +5715,11 @@ static void shell_run_err_trap(int status) {
  * (bash without extdebug); `exit` inside it leaves the shell. Not inside
  * a function (no functrace), not in a forked child, never re-entrant. */
 static bool g_debug_trap_running;
+static bool shell_reading_user(void) {
+    return g_interactive && g_subshell_depth == 0 && g_comsub_level == 0 &&
+           g_capture_depth == 0 && g_source_depth == 0 && !g_trap_running &&
+           !g_err_trap_running && !g_debug_trap_running;
+}
 static void shell_run_debug_trap(void) {
     if (g_debug_trap_running) return;
     /* A function that does not inherit the trap runs without it: the call
@@ -9824,6 +10012,7 @@ static bool shell_set_opt(char c, bool on) {
     for (size_t i = 0; i < SHELL_NOPTDEFS; i++)
         if (g_optdefs[i].flag == c) {
             *g_optdefs[i].var = on;
+            if (on && g_optdefs[i].var == &g_opt_monitor) g_jc_level = g_subshell_depth;
             return true;
         }
     return false;
@@ -9859,6 +10048,7 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
          * the other off; turning one off leaves the other alone */
         if (on && g_optdefs[i].var == &g_opt_emacs) g_opt_vi = false;
         if (on && g_optdefs[i].var == &g_opt_vi) g_opt_emacs = false;
+        if (on && g_optdefs[i].var == &g_opt_monitor) g_jc_level = g_subshell_depth;
         return true;
     }
     return false;
@@ -11509,38 +11699,58 @@ static void cmd_run(int argc, char **argv) {
 
 static int shell_job_poll(struct job *j);        /* see cmd_wait */
 
-static void cmd_jobs(int argc, char **argv) {
-    /* `jobs -p` PRINTS PIDS, ONE PER LINE, AND NOTHING ELSE. Scripts pipe it
-     * into `kill` or count its words; tsh printed its whole human-readable
-     * table for -p as well, so `jobs -p | wc -w` said 8 where bash says 2. */
-    bool pids_only = false;
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "-p") == 0) pids_only = true;
+static struct job *jobs_spec(const char *word, const char *who, bool *dup);
+static int shell_own_pgrp(void);
 
-    /* A JOB THAT HAS FINISHED IS REPORTED, AND THAT COLLECTS IT (S9). bash's
-     * `jobs` lists it as "Done", "Exit N" or its signal and forgets it --
-     * a `wait -n` after it has nothing to return; tsh never looked, listed
-     * the job as "Running" and kept it (logs/s9/before-s9b.*, s9c.*). So
-     * every job is asked first, and the finished ones -- marked as bash
-     * marks them, among the live ones -- leave the table once listed. */
-#ifdef SHELL_HOSTED
-    for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id && !g_jobs[i]->dead) (void)shell_job_poll(g_jobs[i]);
-    /* A job a signal ended is listed too, until a notify has taken it:
-     * `sleep 1 & kill -15 %%; jobs` on one line is "[1]+  Terminated" in
-     * bash (logs/b12 p49) -- the notify after each line and a plain `wait`
-     * are what drop it, not `jobs`. */
+#define JL_STD     0
+#define JL_LONG    1
+#define JL_PID     2
+#define JL_CHANGED 3
+
+/* One job as `jobs` lists it in FORM. A finished job listed has been
+ * reported: it leaves the table at a terminal, and at the next cleanup in
+ * a script; a live one has been seen (`jobs -n`). False when -n skips it. */
+static bool jobs_list_one(struct job *j, int form) {
+    if (form == JL_CHANGED && (j->dead ? j->notified : j->seen)) return false;
+    if (form == JL_PID) {
+        /* bash's pretty_print_job returns before it marks the job
+         * notified: a dead one is still reported later (p104) */
+        shell_printf("%d\n", j->pid);
+        if (j->dead && g_interactive) jobs_remove(j);
+        return true;
+    }
+#ifndef SHELL_HOSTED
+    if (!g_opt_monitor && !j->dead) {
+        struct proc *p = proc_lookup(j->pid);
+        const char *st = p ? proc_state_name(p->state) : "GONE";
+        shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
+                j->id, j->pid, st, j->name);
+        return true;
+    }
 #endif
-    /* bash's list_all_jobs begins with cleanup_dead_jobs: a finished job an
-     * earlier `jobs` listed is gone now -- `jobs; jobs` on one line lists
-     * it once (logs/b12 p88) -- and a dead coprocess is disposed. */
-    shell_coproc_reap();
+    SH_SB(ln);
+    shell_job_line(&ln, j, form == JL_LONG);
+    if (ln.p) shell_write(ln.p);
+    if (j->dead) {
+        if (g_interactive) jobs_remove(j);
+        else j->notified = true;
+    } else {
+        j->seen = true;
+    }
+    return true;
+}
+
+/* bash's cleanup_dead_jobs: the finished jobs already reported leave. */
+static void jobs_cleanup_reported(void) {
     for (int i = 0; i < JOB_MAX; i++)
         if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->notified)
             jobs_remove(g_jobs[i]);
-    /* `+` and `-` are bash's current and previous jobs (g_js_current) */
-    /* In JOB-NUMBER order, as bash lists them: a slot freed and reused
-     * holds a newer job than the slots after it. */
+}
+
+/* Every job in JOB-NUMBER order, as bash lists them -- a slot freed and
+ * reused holds a newer job than the slots after it -- of STATE: 0 any, 1
+ * running, 2 stopped. */
+static int jobs_list_all(int form, int state) {
     int shown = 0;
     int last_id = 0;
     for (;;) {
@@ -11552,61 +11762,140 @@ static void cmd_jobs(int argc, char **argv) {
         }
         if (!j) break;
         last_id = j->id;
-        /* ...and in a SCRIPT it leaves at the end of the command being
-         * run, bash's notify_and_cleanup: `jobs; wait %1` on one line
-         * still finds the job (status 0), on two lines it is gone. */
-        if (pids_only) {
-            /* bash's pretty_print_job returns before it marks the job
-             * notified: a dead one is still reported later (p104) */
-            shell_printf("%d\n", j->pid);
-            if (j->dead && g_interactive) jobs_remove(j);
-            shown++;
-            continue;
-        }
-        if (j->dead) {
-            char wb[24];
-            char mark = jobs_mark(j);
-            shell_printf("[%d]%c  %-24s%s\n", j->id, mark,
-                         shell_job_status_word(j->code, j->sig, wb, sizeof wb),
-                         j->name);
-            if (g_interactive) jobs_remove(j);
-            else j->notified = true;
-            shown++;
-            continue;
-        }
-#ifndef SHELL_HOSTED
-        if (!g_opt_monitor) {
-            struct proc *p = proc_lookup(j->pid);
-            const char *st = p ? proc_state_name(p->state) : "GONE";
-            shell_printf("  [%d]  pid=%-3d  %-10s  %s\n",
-                    j->id, j->pid, st, j->name);
-            shown++;
-            continue;
-        }
-#endif
-        /* bash's table: no pids (a pid in the line would make every
-         * transcript comparison nondeterministic), `+` on the newest and
-         * `-` on the one before it. /bin/tsh prints it in a script too:
-         * bash does, and the kernel console's own table below called
-         * proc_lookup, which the hosted build does not have -- `jobs` in a
-         * script said "proc_lookup: kernel-only" (S6). */
-        char mark = jobs_mark(j);
-        if (j->stopped)
-            shell_printf("[%d]%c  Stopped                 %s\n",
-                         j->id, mark, j->name);
-        else
-            shell_printf("[%d]%c  Running                 %s &\n",
-                         j->id, mark, j->name);
-        shown++;
+        if (state == 1 && (j->dead || j->stopped)) continue;
+        if (state == 2 && (j->dead || !j->stopped)) continue;
+        if (jobs_list_one(j, form)) shown++;
     }
-    /* bash prints NOTHING for an empty table; the friendly line is the
-     * kernel console's, where there is no oracle to diverge from. */
-#ifndef SHELL_HOSTED
-    if (shown == 0 && !pids_only && !g_opt_monitor)
-        shell_printf("  (no background jobs)\n");
-#else
-    (void)shown;
+    return shown;
+}
+
+/* `jobs -x COMMAND ARGS`: the command, run with every argument that names
+ * a job replaced by the job's process group -- the shell's own for a job
+ * started without job control, as bash's j->pgrp is -- and expanded no
+ * further. A spec that names no job is passed as it is. */
+static void jobs_execute(int argc, char **argv) {
+    shell_set_status(0);
+    if (argc <= 0) return;
+    SH_SB(t);
+    for (int k = 0; k < argc; k++) {
+        const char *w = argv[k];
+        char nb[24];
+        if (w[0] == '%') {
+            struct job *j = jobs_spec(w, "jobs", 0);
+            if (j) {
+                ksnprintf(nb, sizeof nb, "%d", j->jc ? j->pid : shell_own_pgrp());
+                w = nb;
+            }
+        }
+        if (k && sb_putc(&t, ' ') < 0) return;
+        if (sb_putc(&t, '\'') < 0) return;
+        for (const char *q = w; *q; q++)
+            if ((*q == '\'' ? sb_puts(&t, "'\\''") : sb_putc(&t, *q)) < 0) return;
+        if (sb_putc(&t, '\'') < 0) return;
+    }
+    execute_line_text(t.p);
+}
+
+/* `jobs` (bash's jobs builtin): -l adds the pid, -p prints the pid alone,
+ * -n lists only the jobs whose state has changed since they were last
+ * reported, -r and -s only the running or the stopped ones -- the last of
+ * l, p and n wins; operands name the jobs to list, each a job spec with
+ * the `%` optional; -x runs a command with the job specs among its words
+ * replaced by process groups. tsh had -p alone and listed every job
+ * whatever it was asked (logs/b13 q48 q49).
+ *
+ * `jobs -p` PRINTS PIDS, ONE PER LINE, AND NOTHING ELSE. Scripts pipe it
+ * into `kill` or count its words; tsh printed its whole human-readable
+ * table for -p as well, so `jobs -p | wc -w` said 8 where bash says 2. */
+static void cmd_jobs(int argc, char **argv) {
+    int form = JL_STD, state = 0;
+    bool execute = false;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { i++; break; }
+        for (const char *q = a + 1; *q; q++) {
+            switch (*q) {
+            case 'l': form = JL_LONG; break;
+            case 'p': form = JL_PID; break;
+            case 'n': form = JL_CHANGED; break;
+            case 'r': state = 1; break;
+            case 's': state = 2; break;
+            case 'x':
+                if (form != JL_STD) {
+                    kprintf("jobs: no other options allowed with `-x'\n");
+                    shell_set_status(1);
+                    return;
+                }
+                execute = true;
+                break;
+            default:
+                kprintf("jobs: -%c: invalid option\n", *q);
+                kprintf_raw("jobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]\n");
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    shell_set_status(0);
+
+    /* A JOB THAT HAS FINISHED IS REPORTED, AND THAT COLLECTS IT (S9). bash's
+     * `jobs` lists it as "Done", "Exit N" or its signal and forgets it --
+     * a `wait -n` after it has nothing to return; tsh never looked, listed
+     * the job as "Running" and kept it (logs/s9/before-s9b.*, s9c.*). So
+     * every job is asked first, and the finished ones -- marked as bash
+     * marks them, among the live ones -- leave the table once listed. */
+#ifdef SHELL_HOSTED
+    for (int k = 0; k < JOB_MAX; k++)
+        if (g_jobs[k]->id && !g_jobs[k]->dead) (void)shell_job_poll(g_jobs[k]);
+    /* A job a signal ended is listed too, until a notify has taken it:
+     * `sleep 1 & kill -15 %%; jobs` on one line is "[1]+  Terminated" in
+     * bash (logs/b12 p49) -- the notify after each line and a plain `wait`
+     * are what drop it, not `jobs`. */
 #endif
+    if (execute) {
+        jobs_execute(argc - i, argv + i);
+        return;
+    }
+    if (i >= argc) {
+        /* bash's list_all_jobs begins with cleanup_dead_jobs: a finished
+         * job an earlier `jobs` listed is gone now -- `jobs; jobs` on one
+         * line lists it once (logs/b12 p88) -- and a dead coprocess is
+         * disposed. A finished job listed here leaves at the end of the
+         * command being run in a script (bash's notify_and_cleanup):
+         * `jobs; wait %1` on one line still finds the job. */
+        shell_coproc_reap();
+        jobs_cleanup_reported();
+        int shown = jobs_list_all(form, state);
+        /* bash prints NOTHING for an empty table; the friendly line is the
+         * kernel console's, where there is no oracle to diverge from. */
+#ifndef SHELL_HOSTED
+        if (shown == 0 && form != JL_PID && !g_opt_monitor)
+            shell_printf("  (no background jobs)\n");
+#else
+        (void)shown;
+#endif
+        return;
+    }
+    /* Named jobs, each listed whatever its state -- and a finished one
+     * listed leaves at once (bash's list_one_job ends in cleanup_dead_jobs).
+     * An ambiguous name has been reported and is no failure. */
+    int failed = 0;
+    for (; i < argc; i++) {
+        bool dup = false;
+        struct job *j = jobs_spec(argv[i], "jobs", &dup);
+        if (!j) {
+            if (!dup) {
+                kprintf("jobs: %s: no such job\n", argv[i]);
+                failed++;
+            }
+            continue;
+        }
+        (void)jobs_list_one(j, form);
+        jobs_cleanup_reported();
+    }
+    shell_set_status(failed ? 1 : 0);
 }
 
 static int parse_int(const char *s, int *out) {
@@ -11620,156 +11909,275 @@ static int parse_int(const char *s, int *out) {
     return 0;
 }
 
-/* bash job specs: %N, %% and %+ (current), %- (previous). NULL on a bad
- * or unknown spec; callers print their own diagnostic. */
-/* The CURRENT job for a jobspec: the newest one still in the table,
- * finished or not -- bash's current job stays current until the job is
- * cleaned up, so `sleep .1 & sleep .5; wait %%` collects it (status 0);
- * tsh skipped a finished one and said "no such job". One a `wait` has
- * already collected is gone, as bash deletes it. */
-static struct job *jobs_by_spec(const char *s) {
-    if (!s || s[0] != '%') return 0;
+/* Does one command of a job -- PROC, LEN bytes of its text -- answer NAME:
+ * start with it, or with SUB hold it anywhere, case ignored (bash's
+ * get_job_by_name: STREQN, strcasestr). */
+static bool jobs_cmd_matches(const char *proc, size_t len, const char *name,
+                             bool sub) {
+    size_t nl = strlen(name);
+    if (!sub) return nl <= len && strncmp(proc, name, nl) == 0;
+    for (size_t i = 0; i + nl <= len; i++) {
+        size_t k = 0;
+        while (k < nl) {
+            char a = proc[i + k], b = name[k];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+            if (a != b) break;
+            k++;
+        }
+        if (k == nl) return true;
+    }
+    return false;
+}
+
+/* How many commands of job J answer NAME. bash looks at each command of a
+ * pipeline on its own, and two of one job are as ambiguous as two jobs;
+ * tsh keeps a job's text whole, so it is cut at each " | " outside quotes,
+ * parentheses and braces. */
+static int jobs_name_hits(const struct job *j, const char *name, bool sub) {
+    const char *s = j->name ? j->name : "";
+    const char *start = s;
+    int hits = 0, depth = 0;
+    char q = 0;
+    for (const char *p = s;; p++) {
+        if (!*p || (!q && depth == 0 && p[0] == ' ' && p[1] == '|' &&
+                    p[2] == ' ')) {
+            if (jobs_cmd_matches(start, (size_t)(p - start), name, sub)) hits++;
+            if (!*p) break;
+            start = p + 3;
+            p += 2;
+            continue;
+        }
+        if (q) {
+            if (*p == '\\' && q != '\'' && p[1]) p++;
+            else if (*p == q) q = 0;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'' || *p == '"' || *p == '`') { q = *p; continue; }
+        if (*p == '(' || *p == '{') depth++;
+        else if ((*p == ')' || *p == '}') && depth > 0) depth--;
+    }
+    return hits;
+}
+
+/* Set when the last jobs_spec found its name ambiguous (and said so). */
+static bool g_jobspec_dup;
+
+/* bash's get_job_spec (jobs.c): the job WORD names, the `%` optional -- N;
+ * %%, %+, % or no word at all for the current job, %- for the previous
+ * (only the character after the `%` counts); %?STR for the job one of whose
+ * commands holds STR, case ignored, and %STR for the one one of whose
+ * commands starts with STR. A STR that fits more than one command is
+ * reported here, "WHO: STR: ambiguous job spec", with *DUP and
+ * g_jobspec_dup set. A finished job counts until it leaves the table (bash
+ * keeps it until a cleanup); one a `wait` collected does not. 0: no job.
+ * tsh knew %N %% %+ %- and nothing else (logs/b13 q48). */
+static struct job *jobs_spec(const char *word, const char *who, bool *dup) {
+    g_jobspec_dup = false;
+    if (dup) *dup = false;
+    const char *w = word ? word : "";
+    if (*w == '%') w++;
+    struct job *j = 0;
+    int id = 0;
+    if (*w >= '0' && *w <= '9' && parse_int(w, &id) == 0) {
+        j = id > 0 ? jobs_by_id(id) : 0;
+        return (j && !j->waited) ? j : 0;
+    }
     /* bash's get_job_spec: %% %+ are js.j_current, %- js.j_previous --
      * which is the current job when there is a single one ("it is both
      * `+' and `-'", set_current_job: `sleep .1 & sleep .2 & kill %-`, then
      * `wait %-` waits for the job that is left; Oils 0945). */
-    if (!s[1] || strcmp(s, "%%") == 0 || strcmp(s, "%+") == 0) {
-        struct job *j = jobs_by_id(g_js_current);
+    switch (*w) {
+    case 0: case '%': case '+':
+        j = jobs_by_id(g_js_current);
+        return (j && !j->waited) ? j : 0;
+    case '-':
+        j = jobs_by_id(g_js_previous);
         return (j && !j->waited) ? j : 0;
     }
-    if (strcmp(s, "%-") == 0) {
-        struct job *j = jobs_by_id(g_js_previous);
-        return (j && !j->waited) ? j : 0;
+    bool sub = false;
+    if (*w == '?') { sub = true; w++; }
+    struct job *found = 0;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *c = g_jobs[i];
+        if (!c->id || c->waited) continue;
+        int h = jobs_name_hits(c, w, sub);
+        if (h == 0) continue;
+        if (found || h > 1) {
+            kprintf("%s: %s: ambiguous job spec\n", who, w);
+            g_jobspec_dup = true;
+            if (dup) *dup = true;
+            return 0;
+        }
+        found = c;
     }
-    int id = 0;
-    if (parse_int(s + 1, &id) < 0 || id <= 0) return 0;
-    return jobs_find(id);
+    return found;
 }
 
-static void cmd_fg(int argc, char **argv) {
-    struct job *j = 0;
-    int jid = 0;
-    /* bash: `fg` with no operand means the CURRENT job. */
-    if (argc < 2) {
-        j = jobs_newest();
-        if (!j) {
-            kprintf("fg: current: no such job\n");
-            shell_set_status(1);
-            return;
-        }
-        jid = j->id;
-    } else if (argv[1][0] == '%') {
-        j = jobs_by_spec(argv[1]);
-        if (!j) {
-            kprintf("fg: %s: no such job\n", argv[1]);
-            shell_set_status(1);
-            return;
-        }
-        jid = j->id;
-    } else {
-        if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
-            kprintf("fg: bad job id '%s'\n", argv[1]);
-            shell_set_status(1);
-            return;
-        }
-        j = jobs_find(jid);
-        if (!j) {
-            kprintf("fg: no such job [%d]\n", jid);
-            shell_set_status(1);
-            return;
-        }
+/* The shell's own process group: what bash's j->pgrp is for a job started
+ * without job control. */
+static int shell_own_pgrp(void) {
+#ifdef SHELL_HOSTED
+    extern int host_getpgrp(void);
+    return host_getpgrp();
+#else
+    struct proc *p = current_proc();
+    return p ? p->pgid : 0;
+#endif
+}
+
+/* ONE JOB TO THE FOREGROUND, OR TO THE BACKGROUND -- bash's fg_bg and
+ * start_job, measured against the guest's bash (logs/b13 q47-q49):
+ *   - a job started without job control is refused: "job N started
+ *     without job control";
+ *   - a finished job: "job has terminated", 1;
+ *   - bg of a running job: "job N already in background", and success;
+ *   - bg prints "[N]+ CMD &" (the mark is the job's, a blank under POSIX),
+ *     fg prints "CMD"; either adds "<TAB>(wd: DIR)" when the shell has
+ *     moved; bg makes the job $!;
+ * tsh's bg said "[N]+" of every job and continued a running one, fg and bg
+ * named no finished job, and neither knew the directory. The status: fg's
+ * is the job's. */
+static int shell_fg_bg_one(const char *spec, bool fg) {
+    const char *who = fg ? "fg" : "bg";
+    bool dup = false;
+    struct job *j = jobs_spec(spec, who, &dup);
+    if (!j) {
+        if (!dup) kprintf("%s: %s: no such job\n", who, spec ? spec : "current");
+        return 1;
     }
+    if (!j->jc) {
+        kprintf("%s: job %d started without job control\n", who, j->id);
+        return 1;
+    }
+    int old_bg = g_last_bg_pid;
+    if (!fg) g_last_bg_pid = j->pid;          /* POSIX: bg's job is $! */
+    if (j->dead) {
+        kprintf("%s: job has terminated\n", who);
+        g_last_bg_pid = old_bg;
+        return 1;
+    }
+    if (!fg && !j->stopped) {
+        kprintf("bg: job %d already in background\n", j->id);
+        return 0;
+    }
+    j->seen = false;
+    {
+        SH_SB(ln);
+        if (!fg) {
+            char head[24];
+            ksnprintf(head, sizeof head, "[%d]%s", j->id,
+                      g_opt_posix ? " "
+                      : j->id == g_js_current ? "+ "
+                      : j->id == g_js_previous ? "- " : " ");
+            (void)sb_puts(&ln, head);
+        }
+        (void)sb_puts(&ln, j->name ? j->name : "");
+        if (!fg) (void)sb_puts(&ln, " &");
+        if (shell_job_moved(j)) {
+            (void)sb_puts(&ln, "\t(wd: ");
+            dirstack_polite(j->wd, &ln);
+            (void)sb_putc(&ln, ')');
+        }
+        (void)sb_putc(&ln, '\n');
+        if (ln.p) shell_write(ln.p);
+    }
+    if (!fg) {
+        /* bash prints the line, then CONTINUES the whole group. The old
+         * version printed and sent nothing -- the "backgrounded" job
+         * stayed stopped forever. */
+        signal_send_to_pgrp(j->pid, SIGCONT);
+        j->stopped = false;
+        j->seen = true;                    /* start_job: J_NOTIFIED */
+        jobs_reset_current();              /* bash's start_job, background */
+        return 0;
+    }
+    int jid = j->id;
     int pid = j->pid;
+    if (j->stopped) j->seen = true;
     /* Snapshot the name because the job slot may be cleared during
      * proc_wait/reap and we still want to print it. */
     char *saved_heap __attribute__((cleanup(shell_kfree_ptr))) =
         shell_strdup(j->name);
     const char *saved_name = saved_heap ? saved_heap : "";
     jobs_set_current(jid);             /* bash's start_job, foreground */
-
-    if (g_opt_monitor) {
-        /* bash: fg prints the command text, hands the tty to the job's
-         * group, SIGCONTs the group, and waits WUNTRACED -- a second ^Z
-         * re-stops it and keeps the job. One path, both hosts. */
-        shell_printf("%s\n", saved_name);
-        shell_tty_set_fg_pgrp(pid);
-        signal_send_to_pgrp(pid, SIGCONT);
-        int ssig = 0;
-        int frc = proc_wait_fg(pid, &ssig);
-        shell_tty_set_fg_pgrp(0);
-        if (ssig > 0) {
-            struct job *js = jobs_find(jid);
-            if (js) js->stopped = true;
-            jobs_set_current(jid);       /* bash's waitchld: a stop */
-            shell_printf("\n[%d]+  Stopped                 %s\n",
-                         jid, saved_name);
-            shell_set_status(128 + ssig);
-            return;
+    /* bash: fg hands the tty to the job's group, SIGCONTs the group, and
+     * waits WUNTRACED -- a second ^Z re-stops it and keeps the job. One
+     * path, both hosts. */
+    shell_tty_set_fg_pgrp(pid);
+    signal_send_to_pgrp(pid, SIGCONT);
+    j->stopped = false;
+    int ssig = 0;
+    int frc = proc_wait_fg(pid, &ssig);
+    shell_tty_set_fg_pgrp(0);
+    if (ssig > 0) {
+        struct job *js = jobs_find(jid);
+        if (js) {
+            js->stopped = true;
+            js->stopsig = ssig;
+            js->seen = false;
         }
-        shell_report_job_death(pid, proc_last_term_sig(), saved_name, true);
-        struct job *j2 = jobs_find(jid);
-        if (j2) jobs_remove(j2);
-        shell_set_status(frc);
+        jobs_set_current(jid);       /* bash's waitchld: a stop */
+        if (js) shell_job_stopped_notice(js);
+        return 128 + ssig;
+    }
+    shell_report_job_death(pid, proc_last_term_sig(), saved_name, true);
+    struct job *j2 = jobs_find(jid);
+    if (j2) jobs_remove(j2);
+    return frc;
+}
+
+/* fg and bg: no job control is an error; an option is a usage error; fg
+ * takes the first operand (or the current job), bg each in turn. */
+static void shell_fg_bg(int argc, char **argv, bool fg) {
+    const char *who = fg ? "fg" : "bg";
+    if (!shell_job_control()) {
+        kprintf("%s: no job control\n", who);
+        shell_set_status(1);
         return;
     }
-    kprintf("fg: bringing [%d] pid=%d '%s' to foreground\n",
-            jid, pid, saved_name);
-
-    /* Take ownership of Ctrl+C until this proc finishes. */
-    signal_set_foreground(pid);
-    int rc = proc_wait(pid);
-    signal_set_foreground(0);
-
-    /* proc_wait already reaped, so the job entry no longer points at a
-     * live PCB. Just clear our table slot. */
-    struct job *j2 = jobs_find(jid);   /* re-find: pointer may be stale */
-    if (j2) jobs_remove(j2);
-
-    kprintf("fg: '%s' (pid=%d) returned %d (0x%x)\n",
-            saved_name, pid, rc, (unsigned)rc);
+    int first = 1;
+    if (first < argc && argv[first][0] == '-' && argv[first][1]) {
+        if (strcmp(argv[first], "--") == 0) {
+            first++;
+        } else {
+            kprintf("%s: -%c: invalid option\n", who, argv[first][1]);
+            kprintf_raw(fg ? "fg: usage: fg [job_spec]\n"
+                           : "bg: usage: bg [job_spec ...]\n");
+            shell_set_status(2);
+            return;
+        }
+    }
+    if (fg) {
+        shell_set_status(shell_fg_bg_one(first < argc ? argv[first] : 0, true));
+        return;
+    }
+    int rc = 0;
+    int k = first;
+    do {
+        if (shell_fg_bg_one(k < argc ? argv[k] : 0, false) != 0) rc = 1;
+        k++;
+    } while (k < argc);
     shell_set_status(rc);
 }
 
-static void cmd_bg(int argc, char **argv) {
-    struct job *j = 0;
-    if (argc < 2) {
-        j = jobs_newest();               /* bash: bare bg = current job */
-        if (!j) {
-            kprintf("bg: current: no such job\n");
-            shell_set_status(1);
-            return;
-        }
-    } else if (argv[1][0] == '%') {
-        j = jobs_by_spec(argv[1]);
-        if (!j) {
-            kprintf("bg: %s: no such job\n", argv[1]);
-            shell_set_status(1);
-            return;
-        }
-    } else {
-        int jid;
-        if (parse_int(argv[1], &jid) < 0 || jid <= 0) {
-            kprintf("bg: bad job id '%s'\n", argv[1]);
-            shell_set_status(1);
-            return;
-        }
-        j = jobs_find(jid);
-        if (!j) {
-            kprintf("bg: no such job [%d]\n", jid);
-            shell_set_status(1);
-            return;
-        }
-    }
-    /* bash prints the reinput form, then CONTINUES the whole group. The
-     * old version printed and sent nothing -- the "backgrounded" job
-     * stayed stopped forever. */
-    shell_printf("[%d]+ %s &\n", j->id, j->name);
-    if (j->stopped) {
-        signal_send_to_pgrp(j->pid, SIGCONT);
-        j->stopped = false;
-    }
-    jobs_reset_current();              /* bash's start_job, background */
-    shell_set_status(0);
+static void cmd_fg(int argc, char **argv) { shell_fg_bg(argc, argv, true); }
+static void cmd_bg(int argc, char **argv) { shell_fg_bg(argc, argv, false); }
+
+/* A COMMAND THAT STARTS WITH `%` IS fg -- or bg, run with `&` -- given the
+ * command's words: `%1`, `%vi`, `%% &` (bash's execute_simple_command, which
+ * looks at the expanded first word). tsh said "%1: command not found". */
+static int shell_job_word_command(int argc, char **argv, bool bg) {
+    char **av = (char **)kmalloc((size_t)(argc + 2) * sizeof *av);
+    if (!av) return 1;
+    av[0] = (char *)(bg ? "bg" : "fg");
+    for (int k = 0; k < argc; k++) av[k + 1] = argv[k];
+    av[argc + 1] = 0;
+    g_this_builtin = bg ? cmd_bg : cmd_fg;
+    shell_fg_bg(argc + 1, av, !bg);
+    kfree(av);
+    return g_last_status;
 }
 
 /* ---- wait (S9, 2026-10-01) ---------------------------------------------
@@ -11788,8 +12196,24 @@ static void cmd_bg(int argc, char **argv) {
  *     shell" (127), "%N: no such job" (127), "`x': not a pid or valid job
  *     spec" (1); with -n, "ID: no such job". */
 
+/* ...and with UNTRACED, 2 when it has stopped (the signal in *stopsig) and
+ * 3 when it has been continued -- each told once. The kernel console asks
+ * only for the end. */
+static int shell_try_reap(int pid, int *code);
+static int shell_try_reap_state(int pid, int *code, int *stopsig, bool untraced) {
+#ifdef SHELL_HOSTED
+    extern int proc_try_reap_state(int pid, int *code, int *stopsig, bool untraced);
+    return proc_try_reap_state(pid, code, stopsig, untraced);
+#else
+    (void)stopsig;
+    (void)untraced;
+    return shell_try_reap(pid, code);
+#endif
+}
+
 /* Reap `pid` if it has finished: 1 (its status in *code), 0 when it is still
  * running, -1 when there is no such child. The same answer from both hosts. */
+__attribute__((unused))
 static int shell_try_reap(int pid, int *code) {
 #ifdef SHELL_HOSTED
     extern int proc_try_reap(int pid, int *code);
@@ -11812,6 +12236,7 @@ static void shell_job_died(struct job *j, int code, int sig) {
     j->code = code;
     j->sig  = sig;
     j->notified = false;
+    j->seen = false;
     shell_bgstat_add(j->pid, code);
 #ifndef SHELL_HOSTED
     if (!(g_opt_monitor && g_interactive))
@@ -11834,14 +12259,37 @@ static void shell_job_died(struct job *j, int code, int sig) {
  * (shell_jobs_reap with `waited`). Where bash's SIGCHLD is slower (WSL, the
  * EliteDesk: 0945 is 143) it misses more looks than one; that is the race
  * in bash, not followed (logs/b12 oilrep-*.txt, t945-*). */
+static int shell_try_reap_state(int pid, int *code, int *stopsig, bool untraced);
 static int shell_job_poll(struct job *j) {
     if (j->dead) return 1;
     if (j->blind) {
         j->blind = false;
         return 0;
     }
-    int code = 0;
-    int r = shell_try_reap(j->pid, &code);
+    int code = 0, ss = 0;
+    /* A STOP, AND A CONTINUE, ARE CHANGES OF STATE TOO -- seen under job
+     * control only, as bash's waitchld asks with WUNTRACED|WCONTINUED only
+     * then. A job that stops becomes the current job; one continued from
+     * outside gives the choice back (set_job_status_and_cleanup). tsh knew
+     * of no stop but its own ^Z: `jobs` said Running of a stopped job. */
+    int r = shell_try_reap_state(j->pid, &code, &ss, shell_job_control());
+    if (r == 2) {
+        if (!j->stopped) {
+            j->stopped = true;
+            j->stopsig = ss;
+            j->seen = false;
+            jobs_set_current(j->id);
+        }
+        return 0;
+    }
+    if (r == 3) {
+        if (j->stopped) {
+            j->stopped = false;
+            j->seen = false;
+            jobs_reset_current();
+        }
+        return 0;
+    }
     if (r <= 0) return r;
     shell_job_died(j, code, proc_last_term_sig());
     return 1;
@@ -11899,7 +12347,7 @@ static struct job *shell_wait_lookup(const char *arg, int *kind) {
                 if (g_jobs[i]->id == id && id > 0) return g_jobs[i];
             return 0;
         }
-        return jobs_by_spec(arg);                  /* %%, %+, %- */
+        return jobs_spec(arg, "wait", 0);          /* %%, %+, %-, names */
     }
     int n = 0;
     if (parse_int(arg, &n) < 0 || n <= 0) { *kind = 1; return 0; }
@@ -12038,6 +12486,19 @@ static void cmd_wait_in(int argc, char **argv) {
          * that is not this process's child -- a subshell's copy of its
          * parent's table -- cannot be waited for, and bash's subshell does
          * not try. */
+        /* A JOB `kill` HAS JUST SIGNALLED is as a rule dead by the time
+         * bash's wait looks -- its SIGCHLD has been handled -- so wait has
+         * nothing to wait for and reports nothing: `kill %1; wait` on one
+         * line prints no "Terminated" (logs/b13 q44). An ordinary look
+         * misses it (see shell_job_poll); it is given a moment, a few ms,
+         * to die. */
+        for (int i = 0; i < JOB_MAX; i++) {
+            struct job *bj = g_jobs[i];
+            if (!bj->id || bj->dead || !bj->blind) continue;
+            bj->blind = false;
+            for (int k = 0; k < 20 && shell_job_poll(bj) == 0; k++)
+                pit_sleep_ms(1);
+        }
         for (int i = 0; i < JOB_MAX; i++)
             if (g_jobs[i]->id && !g_jobs[i]->dead &&
                 shell_job_poll(g_jobs[i]) < 0)
@@ -12090,7 +12551,8 @@ static void cmd_wait_in(int argc, char **argv) {
             rc = 1;
             continue;
         } else if (argv[i][0] == '%') {
-            kprintf("wait: %s: no such job\n", argv[i]);
+            /* an ambiguous name has been reported already */
+            if (!g_jobspec_dup) kprintf("wait: %s: no such job\n", argv[i]);
             rc = 127;
             continue;
         } else {
@@ -15994,6 +16456,8 @@ static int  g_eval_reader_depth;
 /* Set by shell_run_script_hosted for the reader of the script /bin/tsh was
  * started on -- the one reader that records history (see hist_reader). */
 static bool g_reader_main_script;
+/* The next reader is -c's string (shell_run_line_hosted). */
+static bool g_reader_c_main;
 
 /* ---- bash's grammar in front of the executor (B9) ----------------------
  *
@@ -16619,6 +17083,8 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
      * reproduce. */
     bool hist_reader = g_reader_main_script && !eval_mode;
     bool counts_cmds = (g_reader_main_script || g_reader_repl_count) && !eval_mode;
+    bool c_main = g_reader_c_main && !eval_mode;
+    g_reader_c_main = false;
     g_reader_main_script = false;
     g_reader_repl_count = false;
     char *hist_raw = 0;
@@ -17176,7 +17642,17 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
          * line_number++, then notify_and_cleanup), so a report names that
          * line: a job killed on line 8 is "line 10" once line 9 has run
          * (logs/b12 p67) -- an eval string's lines too (p99). */
-        if (!eval_mode || g_shell_flow == SHELL_FLOW_NONE) {
+        /* ...but -c's string has no line after its last: bash's
+         * parse_and_execute stops when the string is used up, where a
+         * script reads on to its EOF -- `bash -c 'set -m; sleep 0 &
+         * x=$(sleep 1)'` reports nothing (logs/b13 q43). */
+        bool c_done = false;
+        if (c_main) {
+            const char *r = p;
+            while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+            c_done = !*r;
+        }
+        if ((!eval_mode || g_shell_flow == SHELL_FLOW_NONE) && !c_done) {
             g_shell_lineno = line_last + 1;
             shell_jobs_notify(line_last + 1, SHELL_NOTIFY_READ);
         }
@@ -17861,10 +18337,98 @@ void shell_exit_notice_hosted(void) {
 bool shell_is_login_hosted(void) { return g_shopt_misc[21]; }
 #endif
 
+#ifdef SHELL_HOSTED
+static void cmd_logout(int argc, char **argv);
+static void cmd_exit(int argc, char **argv);
+int shell_exit_trap_hosted(int status);
+
+/* AN INTERACTIVE SHELL WITH A STOPPED JOB DOES NOT LEAVE at the first exit
+ * or ^D (bash's exit_or_logout): it says "There are stopped jobs." -- or,
+ * under `shopt -s checkjobs`, "There are running jobs." for a running one,
+ * and lists the jobs -- and $? is 1. It leaves at the next exit or ^D if
+ * nothing ran between, and at once after `jobs`. tsh left, and the stopped
+ * jobs stayed stopped behind it. True when the exit is refused. */
+static bool shell_exit_refused(void) {
+    if (!shell_reading_user()) return false;
+    if (g_last_builtin == cmd_exit || g_last_builtin == cmd_logout ||
+        g_last_builtin == cmd_jobs)
+        return false;
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id && !g_jobs[i]->dead) (void)shell_job_poll(g_jobs[i]);
+    int stopmsg = 0;                    /* 2 stopped, 1 running */
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead) continue;
+        if (j->stopped) stopmsg = 2;
+        else if (g_shopt_misc[8] && stopmsg == 0) stopmsg = 1;
+    }
+    if (!stopmsg) return false;
+    kprintf_raw("%s", stopmsg == 2 ? "There are stopped jobs.\n"
+                                   : "There are running jobs.\n");
+    if (g_shopt_misc[8]) {
+        jobs_cleanup_reported();
+        (void)jobs_list_all(JL_STD, 0);
+    }
+    g_this_builtin = g_last_builtin = cmd_exit;
+    shell_set_status(1);
+    return true;
+}
+
+/* ^D at the prompt goes through the exit builtin (bash's
+ * handle_eof_input_unit), after the caller has printed "exit": true when it
+ * does not leave. */
+bool shell_eof_refused_hosted(void) {
+    g_last_builtin = g_this_builtin;
+    g_this_builtin = cmd_exit;
+    return shell_exit_refused();
+}
+
+/* bash's hangup_all_jobs: SIGHUP to each job but the ones `disown -h`
+ * kept, and SIGCONT to a stopped one so that it can act on it. A job
+ * started without job control shares the shell's group: only its process
+ * is signalled. */
+static void shell_hangup_jobs(void) {
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead || j->nohup) continue;
+        if (j->jc) signal_send_to_pgrp(j->pid, SIGHUP);
+        else (void)signal_send_to_pid_checked(j->pid, SIGHUP);
+        if (j->stopped) signal_send_to_pgrp(j->pid, SIGCONT);
+    }
+}
+
+/* WHAT BASH DOES TO ITS JOBS AS IT EXITS (exit_shell): an interactive login
+ * shell under `shopt -s huponexit` hangs them all up; then, with job
+ * control on, each stopped job gets SIGTERM and SIGCONT (end_job_control's
+ * terminate_stopped_jobs) -- nothing is left stopped for good. huponexit
+ * was a setting that did nothing, and tsh left stopped jobs stopped. */
+void shell_exit_jobs_hosted(void) {
+    if (g_subshell_depth > 0) return;
+    if (g_interactive && g_shopt_misc[21] && g_shopt_huponexit)
+        shell_hangup_jobs();
+    if (!shell_job_control()) return;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead || !j->stopped) continue;
+        signal_send_to_pgrp(j->pid, SIGTERM);
+        signal_send_to_pgrp(j->pid, SIGCONT);
+    }
+}
+
+/* A HANGUP AT A TERMINAL (bash's termsig_handler for SIGHUP): every job is
+ * hung up, whatever huponexit says, and the shell leaves -- the EXIT trap
+ * first. The caller re-raises the signal. */
+int shell_hangup_hosted(void) {
+    shell_hangup_jobs();
+    return shell_exit_trap_hosted(128 + SIGHUP);
+}
+#endif
+
 static void cmd_exit(int argc, char **argv) {
 #ifdef SHELL_HOSTED
     if (g_interactive && g_subshell_depth == 0 && g_comsub_level == 0)
         shell_exit_notice_hosted();
+    if (shell_exit_refused()) return;
     shell_logout_hosted();
 #endif
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
@@ -18514,6 +19078,8 @@ static void cmd_command(int argc, char **argv) {
         const struct cmd *c = shell_cmd_lookup(argv[i]);
         if (c) {
             COMMAND_P_RESTORE();
+            g_last_builtin = g_this_builtin;
+            g_this_builtin = c->fn;
             c->fn(argc - i, &argv[i]);
             return;
         }
@@ -20986,9 +21552,18 @@ static void cmd_kill(int argc, char **argv) {
          * act on a process that would otherwise sit stopped with it
          * pending forever. */
         if (argv[i][0] == '%') {
-            struct job *jb = jobs_by_spec(argv[i]);
+            bool dup = false;
+            struct job *jb = jobs_spec(argv[i], "kill", &dup);
             if (!jb) {
-                kprintf("kill: %s: no such job\n", argv[i]);
+                if (!dup) kprintf("kill: %s: no such job\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
+            /* A FINISHED JOB IS STILL A JOB until it leaves the table, and
+             * bash signals it -- its process is gone: "(PID) - No such
+             * process". Not sent: the pid may be another process's now. */
+            if (jb->dead) {
+                kprintf("kill: (%d) - No such process\n", jb->pid);
                 shell_set_status(1);
                 continue;
             }
@@ -22460,6 +23035,7 @@ static void cmd_builtin(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    g_this_builtin = c->fn;                 /* builtin.def: as itself */
     c->fn(argc - 1, argv + 1);
 }
 
@@ -22468,34 +23044,72 @@ static void cmd_builtin(int argc, char **argv) {
  * for. The PROCESS is deliberately untouched: disown is bookkeeping, not a
  * kill, and conflating the two would silently destroy a long-running job. */
 static void cmd_disown(int argc, char **argv) {
-    bool all = false;
-    int  taken = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "-r") == 0) { all = true; continue; }
-        if (strcmp(argv[i], "-h") == 0) continue;   /* nothing here sends SIGHUP */
-        struct job *j = jobs_by_spec(argv[i]);
-        if (!j) {
-            kprintf("disown: %s: no such job\n", argv[i]);
-            shell_set_status(1);
-            return;
+    /* bash's disown (jobs.def): -a every job, -r the running ones -- when
+     * no operand is given -- and -h marks a job to keep, not dropping it,
+     * so that no SIGHUP reaches it when the shell hangs up its jobs. An
+     * operand is a pid or a job spec, `%` optional; a bad one is reported
+     * and the rest are still done. tsh took -r for -a, ignored -h, stopped
+     * at the first bad operand and knew no pids (logs/b13 q49). */
+    bool all = false, running = false, nohup = false;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { i++; break; }
+        for (const char *q = a + 1; *q; q++) {
+            if (*q == 'a') all = true;
+            else if (*q == 'r') running = true;
+            else if (*q == 'h') nohup = true;
+            else {
+                kprintf("disown: -%c: invalid option\n", *q);
+                kprintf_raw("disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]\n");
+                shell_set_status(2);
+                return;
+            }
         }
-        j->id = 0;
-        taken++;
     }
-    if (all) {
-        for (int i = 0; i < JOB_MAX; i++) g_jobs[i]->id = 0;
-        taken++;
-    }
-    if (!taken) {
-        struct job *j = jobs_newest();
-        if (!j) {
-            kprintf("disown: current: no such job\n");
-            shell_set_status(1);
-            return;
-        }
-        j->id = 0;
-    }
+#ifdef SHELL_HOSTED
+    for (int k = 0; k < JOB_MAX; k++)
+        if (g_jobs[k]->id && !g_jobs[k]->dead) (void)shell_job_poll(g_jobs[k]);
+#endif
     shell_set_status(0);
+    if (i >= argc && (all || running)) {
+        for (int k = 0; k < JOB_MAX; k++) {
+            struct job *j = g_jobs[k];
+            if (!j->id) continue;
+            if (running && (j->dead || j->stopped)) continue;
+            if (nohup) j->nohup = true;
+            else jobs_remove(j);
+        }
+        return;
+    }
+    int rc = 0;
+    do {
+        const char *w = i < argc ? argv[i] : 0;
+        struct job *j = 0;
+        int pid = 0;
+        if (w && parse_int(w, &pid) == 0) {
+            for (int k = 0; k < JOB_MAX && pid > 0; k++)
+                if (g_jobs[k]->id && !g_jobs[k]->waited && g_jobs[k]->pid == pid)
+                    j = g_jobs[k];
+        } else {
+            j = jobs_spec(w, "disown", 0);
+        }
+        /* bash says "no such job" after an ambiguous name too */
+        if (!j) {
+            kprintf("disown: %s: no such job\n", w ? w : "current");
+            rc = 1;
+        } else if (nohup) {
+            j->nohup = true;
+        } else {
+            if (j->stopped && !j->dead && g_subshell_depth == 0)
+                kprintf("warning: deleting stopped job %d with process group %d\n",
+                        j->id, j->pid);
+            jobs_remove(j);
+        }
+        i++;
+    } while (i < argc);
+    shell_set_status(rc);
 }
 
 /* ---- suspend -----------------------------------------------------------
@@ -23629,10 +24243,13 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                 jobs_join_argv(argv);
             int jid = jobs_add(pid, jname ? jname : argv[0]);
             struct job *sj = jid > 0 ? jobs_find(jid) : 0;
-            if (sj) sj->stopped = true;
+            if (sj) {
+                sj->stopped = true;
+                sj->stopsig = ssig;
+                sj->jc = true;
+            }
             if (jid > 0) jobs_set_current(jid);   /* bash's waitchld */
-            shell_printf("\n[%d]+  Stopped                 %s\n",
-                         jid > 0 ? jid : 0, jname ? jname : argv[0]);
+            if (sj) shell_job_stopped_notice(sj);
             return 128 + ssig;
         }
         shell_report_job_death(pid, proc_last_term_sig(), 0, true);
@@ -34852,6 +35469,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     shell_set_status(0);
     struct shell_fd_state *old_bfds = g_builtin_fds;
     g_builtin_fds = &fds;
+    g_this_builtin = c->fn;
     c->fn(cmd->argc, cmd->argv);
 #ifdef SHELL_HOSTED
     /* One write per builtin, like bash's flush at the end of each one (S2;
@@ -35165,6 +35783,44 @@ static int shell_background_forked(const char *text, const char *label) {
 
 static int shell_background_forked_as(const char *text, const char *label,
                                       const char *shown) {
+    /* `%1 &` IS bg %1, run by this shell, not a child (bash's
+     * execute_simple_command, before it forks): a simple command of plain
+     * words. One with anything to expand is left to the child, where it is
+     * a command like any other. */
+    {
+        const char *t = shell_skip_blanks(text);
+        bool plain = *t == '%' && shell_bg_text_is_simple(text, text + strlen(text));
+        for (const char *q = t; plain && *q; q++)
+            if (*q == '\'' || *q == '"' || *q == '\\' || *q == '$' ||
+                *q == '`' || *q == '<' || *q == '>' || *q == '*' ||
+                *q == '?' || *q == '[' || *q == '~' || *q == '=')
+                plain = q == t + 1 && *q == '?';   /* %?str is a spec */
+        if (plain) {
+            char *copy __attribute__((cleanup(shell_kfree_ptr))) = shell_strdup(t);
+            if (!copy) return 1;
+            int wc = 0;
+            for (char *q = copy; *q;) {
+                while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+                if (!*q) break;
+                wc++;
+                while (*q && *q != ' ' && *q != '\t' && *q != '\n') q++;
+            }
+            char **wv __attribute__((cleanup(shell_kfree_ptr))) =
+                (char **)kmalloc((size_t)(wc + 1) * sizeof *wv);
+            if (!wv) return 1;
+            int n = 0;
+            for (char *q = copy; *q;) {
+                while (*q == ' ' || *q == '\t' || *q == '\n') *q++ = 0;
+                if (!*q) break;
+                wv[n++] = q;
+                while (*q && *q != ' ' && *q != '\t' && *q != '\n') q++;
+            }
+            wv[n] = 0;
+            g_last_builtin = g_this_builtin;
+            g_this_builtin = 0;
+            return shell_job_word_command(n, wv, true);
+        }
+    }
     int pid = shell_fork();
     if (pid < 0) {
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
@@ -35212,7 +35868,8 @@ static int shell_background_forked_as(const char *text, const char *label,
     if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
     {
         char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
-        jobs_add((int)pid, pn ? pn : (label ? label : text));
+        shell_describe_job(jobs_add((int)pid, pn ? pn : (label ? label : text)),
+                           (int)pid);
         kfree(pn);
     }
     return 0;
@@ -35315,6 +35972,13 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
     exec_cmd.argv = cmd->argv + assignc;
     exec_cmd.argv_cap = cmd->argv_cap - assignc;
     exec_cmd.arena = 0;
+
+    /* bash's last_shell_builtin and this_shell_builtin (g_this_builtin) */
+    g_last_builtin = g_this_builtin;
+    g_this_builtin = 0;
+    /* `%1`, `%vi &`: fg or bg (shell_job_word_command) */
+    if (exec_cmd.argc > 0 && exec_cmd.argv[0][0] == '%')
+        return shell_job_word_command(exec_cmd.argc, exec_cmd.argv, background);
 
     if (!background) {
         /* `exec` with redirections and NO command applies them to the SHELL
@@ -41646,7 +42310,7 @@ static bool shell_try_coproc(const char *src) {
         /* from the text as written: printing `coproc cat` gives the
          * default name back, "coproc COPROC cat" */
         char *pn = shell_print_text(s, SHPR_COMMAND, 0);
-        jobs_add(pid, pn ? pn : s);
+        shell_describe_job(jobs_add(pid, pn ? pn : s), pid);
         kfree(pn);
     }
     shell_set_status(0);
@@ -43651,6 +44315,7 @@ int shell_run_line_hosted(const char *text) {
     g_reader_syn_string = true;
     if (g_interactive) g_reader_syn_repl = true;
     else g_reader_syn_iname = "-c";
+    if (!g_interactive) g_reader_c_main = true;
     if (!g_interactive) g_reader_nofork_scope = true;   /* bash's ONESHOT */
     /* AN INTERACTIVE SHELL'S EXIT TRAP RUNS WHEN IT EXITS -- here, once
      * `exit` has said so, or at EOF (shell_exit_trap_hosted) -- not after
