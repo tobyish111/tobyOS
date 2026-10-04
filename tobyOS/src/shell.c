@@ -1313,7 +1313,6 @@ static void  sh_array_unset(const char *name);
 static void  sh_array_unset_idx(struct sh_array *a, long idx);
 static int   sh_array_set(const char *name, long idx, const char *val);
 static bool  shell_dirstack_assign(long idx, const char *val);
-static void  shell_dirstack_sync(void);
 static bool  g_dirstack_var_gone;
 static const char *sh_array_get(const char *name, long idx);
 static bool  sh_array_is_assoc(const char *name);
@@ -4307,26 +4306,16 @@ static void shell_init_bash_vars(const char *self) {
         (void)env_set("SHLVL", b);
         shell_mark_exported("SHLVL");
     }
-    if (!sh_array_find("BASH_ARGC")) (void)sh_array_set("BASH_ARGC", 0, "0");
+    /* bash's dynamic arrays start EMPTY and are built when first read by
+     * name -- `set` lists them as last built, () until then (logs/b13
+     * q23 q24); see sh_dynarr_rebuild. */
+    if (!sh_array_find("BASH_ARGC")) (void)sh_array_create("BASH_ARGC");
     if (!sh_array_find("BASH_ARGV")) (void)sh_array_create("BASH_ARGV");
     if (!sh_array_find("BASH_CMDS")) (void)sh_array_make_assoc("BASH_CMDS");
     if (!sh_array_find("BASH_ALIASES")) (void)sh_array_make_assoc("BASH_ALIASES");
+    if (!sh_array_find("GROUPS")) (void)sh_array_create("GROUPS");
+    if (!sh_array_find("DIRSTACK")) (void)sh_array_create("DIRSTACK");
     sh_dynarr_init();
-    if (!sh_array_find("GROUPS")) {
-        /* the process's groups; none beyond its own is its own gid */
-        struct proc *cur = current_proc();
-        char b[24];
-        if (cur && cur->ngroups > 0) {
-            for (int i = 0; i < cur->ngroups; i++) {
-                ksnprintf(b, sizeof b, "%d", cur->groups[i]);
-                (void)sh_array_set("GROUPS", i, b);
-            }
-        } else {
-            ksnprintf(b, sizeof b, "%u", cur ? (unsigned)cur->gid : 0u);
-            (void)sh_array_set("GROUPS", 0, b);
-        }
-    }
-    shell_dirstack_sync();
     shell_callstack_sync();             /* FUNCNAME, declared and invisible */
 }
 
@@ -5657,7 +5646,6 @@ static int shell_set_cwd(const char *path) {
         memcpy(p->cwd, path, n + 1);
     }
     int rc = env_set("PWD", path);
-    shell_dirstack_sync();           /* DIRSTACK[0] is the current directory */
     return rc;
 }
 
@@ -5879,13 +5867,16 @@ struct sh_array {
      * ASSOC_HASH_BUCKETS, 1024): its elements are kept in the order
      * bash's table iterates them -- see sh_array_set_key. */
     int  nbuckets;
-    /* BASH_ALIASES or BASH_CMDS while it is still bash's dynamic variable:
-     * SH_DYN_ALIASES / SH_DYN_CMDS, else 0. See sh_dynarr_rebuild. */
+    /* One of bash's dynamic arrays while it still is one (SH_DYN_*), else
+     * 0: built when it is read by name. See sh_dynarr_rebuild. */
     unsigned char dyn;
 };
 
-#define SH_DYN_ALIASES 1
-#define SH_DYN_CMDS    2
+#define SH_DYN_ALIASES  1
+#define SH_DYN_CMDS     2
+#define SH_DYN_ARGV     3       /* BASH_ARGC and BASH_ARGV */
+#define SH_DYN_DIRSTACK 4
+#define SH_DYN_GROUPS   5
 static void sh_dynarr_rebuild(struct sh_array *a);
 /* Nonzero while `set` or `declare` lists the variables: they print a
  * dynamic array as it was last read, as bash's listings do. */
@@ -6733,12 +6724,17 @@ static int sh_dynarr_assign(struct sh_array *a, const char *key,
 
 static int sh_assoc_put(struct sh_array *a, const char *key, const char *val);
 
-/* The two arrays as made at startup become the dynamic ones. */
+/* The arrays as made at startup become the dynamic ones. */
 static void sh_dynarr_init(void) {
-    struct sh_array *d = sh_array_find_literal("BASH_CMDS");
-    if (d) d->dyn = SH_DYN_CMDS;
-    d = sh_array_find_literal("BASH_ALIASES");
-    if (d) d->dyn = SH_DYN_ALIASES;
+    static const struct { const char *name; unsigned char kind; } t[] = {
+        { "BASH_CMDS", SH_DYN_CMDS }, { "BASH_ALIASES", SH_DYN_ALIASES },
+        { "BASH_ARGC", SH_DYN_ARGV }, { "BASH_ARGV", SH_DYN_ARGV },
+        { "DIRSTACK", SH_DYN_DIRSTACK }, { "GROUPS", SH_DYN_GROUPS },
+    };
+    for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) {
+        struct sh_array *d = sh_array_find_literal(t[i].name);
+        if (d) d->dyn = t[i].kind;
+    }
 }
 
 static int sh_array_set_key(const char *name, const char *key,
@@ -19894,7 +19890,88 @@ static void phash_insert(const char *name, const char *path, int hits,
  * array of the table's size -- so a new key goes in front of its bucket, as
  * bash's assoc_insert puts it. Unsetting an element changes nothing the
  * next read can see; `unset` or `local` leaves an ordinary variable. */
+/* Element `idx` of an indexed array, appended (callers go in order). */
+static char **g_dirstack;         /* see DIRSTACK below */
+static int    g_dirstack_n;
+static void sh_array_put_idx(struct sh_array *a, long idx, const char *val) {
+    if (!sh_array_reserve(a)) return;
+    char *v = shell_strdup(val ? val : "");
+    if (!v) return;
+    a->e[a->n].idx = idx;
+    a->e[a->n].key = 0;
+    a->e[a->n].val = v;
+    a->n++;
+}
+
+static void sh_array_clear_elems(struct sh_array *a) {
+    for (int i = 0; i < a->n; i++) {
+        kfree(a->e[i].key);
+        kfree(a->e[i].val);
+    }
+    a->n = 0;
+}
+
+/* BASH_ARGC and BASH_ARGV (bash's get_bashargcv -> init_bash_argv): read
+ * at the top level, outside every function, they take the positional
+ * parameters ONCE -- BASH_ARGC=($#), BASH_ARGV the parameters last first:
+ *
+ *     bash -c 'declare -p BASH_ARGC' _ a b      BASH_ARGC=([0]="2")
+ *     f() { declare -p BASH_ARGC; }; f x        BASH_ARGC=()  (not yet)
+ *
+ * tsh held ([0]="0") and () from the start. Once is "BASH_ARGC has an
+ * element": nothing else pushes one without extdebug, and a subshell
+ * running in place gets its arrays back with them. */
+static void sh_dynarr_argv(void) {
+    if (g_fn_depth != 0) return;
+    struct sh_array *ac = sh_array_find_literal("BASH_ARGC");
+    struct sh_array *av = sh_array_find_literal("BASH_ARGV");
+    if (!ac || !av || ac->dyn != SH_DYN_ARGV || av->dyn != SH_DYN_ARGV || ac->n > 0)
+        return;
+    char nb[24];
+    ksnprintf(nb, sizeof nb, "%d", g_positional_count);
+    sh_array_put_idx(ac, 0, nb);
+    sh_array_clear_elems(av);
+    for (int i = 0; i < g_positional_count; i++)
+        sh_array_put_idx(av, i, g_positional[g_positional_count - 1 - i]);
+}
+
 static void sh_dynarr_rebuild(struct sh_array *a) {
+    if (a->dyn == SH_DYN_ARGV) {
+        g_dynarr_busy = true;
+        sh_dynarr_argv();
+        g_dynarr_busy = false;
+        return;
+    }
+    if (a->dyn == SH_DYN_DIRSTACK) {
+        /* bash's get_dirstack: the current directory, then the stack from
+         * the top, as it is NOW -- `set` shows it as last read */
+        g_dynarr_busy = true;
+        sh_array_clear_elems(a);
+        const char *cwd = env_get("PWD");
+        sh_array_put_idx(a, 0, cwd ? cwd : shell_cwd());
+        for (int i = 1; i <= g_dirstack_n; i++)
+            sh_array_put_idx(a, i, g_dirstack[g_dirstack_n - i]);
+        g_dynarr_busy = false;
+        return;
+    }
+    if (a->dyn == SH_DYN_GROUPS) {
+        /* bash's get_groupset: built the first time, then kept */
+        if (a->n > 0) return;
+        g_dynarr_busy = true;
+        struct proc *cur = current_proc();
+        char b[24];
+        if (cur && cur->ngroups > 0) {
+            for (int i = 0; i < cur->ngroups; i++) {
+                ksnprintf(b, sizeof b, "%d", cur->groups[i]);
+                sh_array_put_idx(a, i, b);
+            }
+        } else {
+            ksnprintf(b, sizeof b, "%u", cur ? (unsigned)cur->gid : 0u);
+            sh_array_put_idx(a, 0, b);
+        }
+        g_dynarr_busy = false;
+        return;
+    }
     const struct sh_htab *t = a->dyn == SH_DYN_ALIASES ? &g_alias_tab : &g_phash;
     g_dynarr_busy = true;
     for (int i = 0; i < a->n; i++) {
@@ -19913,6 +19990,7 @@ static void sh_dynarr_rebuild(struct sh_array *a) {
  * hits -- a bad alias name is reported and the status is left alone. */
 static int sh_dynarr_assign(struct sh_array *a, const char *key,
                             const char *val) {
+    if (a->dyn != SH_DYN_ALIASES && a->dyn != SH_DYN_CMDS) return 0;
     if (a->dyn == SH_DYN_ALIASES) {
         if (!shell_alias_name_ok(key)) {
             kprintf("`%s': invalid alias name\n", key);
@@ -21135,34 +21213,23 @@ static const char *dirstack_from_string(const char *s, size_t n) {
     return g_dirstack[ind];
 }
 
-/* DIRSTACK: the current directory, then the stack from the top -- kept in
- * step whenever either changes, as bash computes it when read. Assigning an
- * element changes that stack entry (element 0, the current directory, is
- * left alone); `unset DIRSTACK` makes it an ordinary variable. */
+/* DIRSTACK: the current directory, then the stack from the top -- built
+ * when it is read (sh_dynarr_rebuild), as bash's get_dirstack builds it.
+ * Assigning an element changes that stack entry (element 0, the current
+ * directory, is left alone); `unset DIRSTACK` makes it an ordinary
+ * variable. */
 static bool g_dirstack_var_gone;
-static bool g_dirstack_syncing;
-static void shell_dirstack_sync(void) {
-    if (g_dirstack_var_gone) return;
-    g_dirstack_syncing = true;
-    sh_array_unset_literal("DIRSTACK");
-    const char *cwd = env_get("PWD");
-    (void)sh_array_set("DIRSTACK", 0, cwd ? cwd : shell_cwd());
-    for (int i = 1; i <= g_dirstack_n; i++)
-        (void)sh_array_set("DIRSTACK", i, g_dirstack[g_dirstack_n - i]);
-    g_dirstack_syncing = false;
-}
 
 /* An element written to DIRSTACK (sh_array_set's hook). True when it was
- * taken -- the stack holds it now and the mirror is rebuilt. */
+ * taken -- the stack holds it now, and the next read shows it. */
 static bool shell_dirstack_assign(long idx, const char *val) {
-    if (g_dirstack_var_gone || g_dirstack_syncing) return false;
+    if (g_dirstack_var_gone) return false;
     int flag = 0;
     int i = dirstack_index(idx, 1, &flag);
     if (idx != 0 && i >= 0 && i <= g_dirstack_n && i < g_dirstack_n) {
         char *nv = shell_strdup(val);
         if (nv) { kfree(g_dirstack[i]); g_dirstack[i] = nv; }
     }
-    shell_dirstack_sync();
     return true;
 }
 
@@ -21196,7 +21263,6 @@ static int dirs_run(int argc, char **argv, int first) {
     }
     if (clear) {
         while (g_dirstack_n > 0) dirstack_drop_top();
-        shell_dirstack_sync();
         return 0;
     }
     if (index_flag && (desired < 0 || desired > g_dirstack_n)) {
@@ -21293,7 +21359,6 @@ static int pushd_run(int argc, char **argv) {
         int rc = dirstack_change_to(temp);
         g_cd_who = saved;
         kfree(temp);
-        shell_dirstack_sync();
         return rc;
     }
     bool nocd = false, rotate = false;
@@ -21347,7 +21412,6 @@ static int pushd_run(int argc, char **argv) {
         int rc = nocd ? 0 : dirstack_change_to(temp);
         kfree(temp);
         g_cd_who = saved;
-        shell_dirstack_sync();
         return rc;
     }
     if (i >= argc) { g_cd_who = saved; return 0; }
@@ -21376,7 +21440,6 @@ static int pushd_run(int argc, char **argv) {
         if (!current) return 1;
     }
     if (!dirstack_push_owned(current)) return 1;
-    shell_dirstack_sync();
     (void)dirs_run(0, 0, 0);
     return 0;
 }
@@ -21445,7 +21508,6 @@ static int popd_run(int argc, char **argv) {
         g_dirstack_n--;
         for (; i < g_dirstack_n; i++) g_dirstack[i] = g_dirstack[i + 1];
     }
-    shell_dirstack_sync();
     (void)dirs_run(0, 0, 0);
     return 0;
 }
@@ -21886,6 +21948,10 @@ static void shell_callstack_sync(void) {
     sh_array_unset_literal("FUNCNAME");
     sh_array_unset_literal("BASH_LINENO");
     sh_array_unset_literal("BASH_SOURCE");
+    /* declared even when empty: `bash -c 'declare -p BASH_SOURCE'` is
+     * `declare -a BASH_SOURCE=()` (logs/b13 q23) */
+    (void)sh_array_create("BASH_LINENO");
+    (void)sh_array_create("BASH_SOURCE");
     {
         /* an entry at every depth, as a declared array has one -- the
          * listing orders by it -- with no value outside a function */
