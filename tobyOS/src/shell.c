@@ -21833,11 +21833,12 @@ struct shell_simple {
     /* Bit i: argv[i] LOOKS like an assignment and is not one, because the
      * `=` was quoted. `foo\=bar` is a command NAME -- bash reports 127, not
      * a variable called foo. The quoting is gone by the time argv exists, so
-     * the answer has to be carried alongside it. Only the first 32 words
-     * are ever marked (shell_add_one_arg) -- an assignment prefix is read
-     * from the front -- so 32 bits is all there is; see
-     * shell_simple_noassign. */
-    unsigned char arg_noassign[4];
+     * the answer has to be carried alongside it: a bit per word, in the
+     * words' arena, as many as there are words (shell_simple_mark_noassign).
+     * It held 32, and the 33rd word of a long assignment prefix lost the
+     * mark. See shell_simple_noassign. */
+    unsigned char *arg_noassign;
+    int arg_noassign_cap;               /* bytes */
     /* Assignment words whose VALUE begins with a `(` that was not written
      * there: `x='(a b)'`, `y=$x`, `declare d="$v"` (shell_kv_scalar_paren).
      * By pointer: an exec view of the command (argv shifted past its
@@ -29362,7 +29363,30 @@ static int shell_simple_argv_room(struct shell_simple *s) {
 }
 
 static bool shell_simple_noassign(const struct shell_simple *s, int i) {
-    return i >= 0 && i < 32 && (s->arg_noassign[i >> 3] & (1u << (i & 7)));
+    return i >= 0 && s->arg_noassign && (i >> 3) < s->arg_noassign_cap &&
+           (s->arg_noassign[i >> 3] & (1u << (i & 7)));
+}
+
+/* Mark word I's `=` as quoted: the bitmap grows in the arena, as argv does. */
+static int shell_simple_mark_noassign(struct shell_simple *s, int i) {
+    if (i < 0) return 0;
+    if ((i >> 3) >= s->arg_noassign_cap) {
+        int ncap = s->arg_noassign_cap ? s->arg_noassign_cap * 2 : 8;
+        while (ncap <= (i >> 3)) ncap *= 2;
+        unsigned char *nb = s->arena
+            ? (unsigned char *)words_alloc(s->arena, (size_t)ncap) : 0;
+        if (!nb) {
+            kprintf(SH_PFX_SHELL "out of memory for arguments\n");
+            return -1;
+        }
+        memset(nb, 0, (size_t)ncap);
+        if (s->arg_noassign_cap)
+            memcpy(nb, s->arg_noassign, (size_t)s->arg_noassign_cap);
+        s->arg_noassign = nb;
+        s->arg_noassign_cap = ncap;
+    }
+    s->arg_noassign[i >> 3] |= (unsigned char)(1u << (i & 7));
+    return 0;
 }
 
 static bool shell_kv_scalar_paren(const char *kv, const char *val) {
@@ -30750,13 +30774,14 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             has_esc = true;
             break;
         }
-    if (has_esc && cur->argc < 32) {
+    if (has_esc) {
         const char *e = word;
         while ((*e >= 'A' && *e <= 'Z') || (*e >= 'a' && *e <= 'z') ||
                (*e >= '0' && *e <= '9') || *e == '_')
             e++;
-        if (e > word && *e == SHELL_GLOB_ESC && e[1] == '=')
-            cur->arg_noassign[cur->argc >> 3] |= (unsigned char)(1u << (cur->argc & 7));
+        if (e > word && *e == SHELL_GLOB_ESC && e[1] == '=' &&
+            shell_simple_mark_noassign(cur, cur->argc) < 0)
+            return -1;
     }
     if (has_esc) {
         /* A copy in the pipeline's store, stripped where it lies: the
