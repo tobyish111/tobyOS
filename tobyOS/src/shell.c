@@ -1128,7 +1128,12 @@ struct shell_function {
     int            lm_n;
     /* `readonly -f` (S4): not redefined, not unset. */
     bool   readonly;
+    /* When the NAME was defined (g_fn_seq): bash's function table puts a
+     * new name in front of its bucket and a redefinition where it was, and
+     * the exported ones reach a child in that table's order. */
+    unsigned long seq;
 };
+static unsigned long g_fn_seq;
 
 /* One queued body. Each is its own heap record and the queue holds
  * POINTERS: a command holds `body` from the moment its redirect is parsed
@@ -4593,6 +4598,7 @@ static int shell_function_set(const char *name, const char *body) {
     }
 
     int idx = shell_function_find(name);
+    bool fresh = idx < 0;
     if (idx < 0) {
         for (int i = 0; i < g_nfunctions; i++) {
             if (!g_functions[i].name) {
@@ -4638,6 +4644,7 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].name = ncopy;
     g_functions[idx].body = bcopy;
     g_functions[idx].whole = whole;
+    if (fresh) g_functions[idx].seq = ++g_fn_seq;
     if (g_functions[idx].src) kfree(g_functions[idx].src);
     g_functions[idx].src = g_diag_source ? shell_strdup(g_diag_source) : 0;
 
@@ -6856,6 +6863,9 @@ struct shell_prefix_save {
      * only a temporary binding: `v=4 local v` makes a local of the
      * function's that outlives it. */
     bool  scope;
+    /* The prefix of a FUNCTION CALL (`v=x f`): bash makes it the table of
+     * the function's own scope, the one its locals then join. */
+    bool  fncall;
 };
 
 /* SCOPES, AS BASH HAS THEM (variables.c: a stack of VAR_CONTEXTs).
@@ -22362,6 +22372,11 @@ static const char *shell_prefix_path(char **assigns, int assignc,
     return "";
 }
 
+/* Set by the one caller whose child is an ordinary command: it gets `_`
+ * (see shell_env_put_command_name); `exec`'s does not. Read once. */
+static bool g_spawn_put_command_name;
+static void shell_env_put_command_name(char **envp, int *envc,
+                                       const char *path);
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            char **argv, bool background,
                                            const char *profile,
@@ -22371,6 +22386,8 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            int envc, char **envp,
                                            const struct proc_fd_map *extra,
                                            int nextra) {
+    bool put_name = g_spawn_put_command_name;
+    g_spawn_put_command_name = false;
     /* AN EMPTY COMMAND NAME IS "command not found", status 127 -- bash's
      * answer for `"$SH" -c x` with $SH unset. resolve_program("") walked
      * PATH, joined "" onto each directory, landed on the directory itself
@@ -22394,6 +22411,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     char path_buf[VFS_PATH_MAX];
     const char *path = resolve_program_run(path_arg, path_buf, sizeof(path_buf), 0);
     const char *report_as = g_resolve_hashed ? path : path_arg;
+    if (put_name && path) shell_env_put_command_name(envp, &envc, path);
 
     struct proc_spec spec = {
         .path = path,
@@ -22538,6 +22556,8 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
  * the overlay is built with an empty assignment list. */
 static char **shell_build_env_overlay(char **assignv, int assignc,
                                       int *out_envc);
+static void shell_env_put_command_name(char **envp, int *envc,
+                                       const char *path);
 
 static void shell_spawn_program(const char *path_arg, int argc, char **argv,
                                 bool background) {
@@ -31803,98 +31823,382 @@ static bool shell_assignment_overrides(const char *kv, char **assignv,
  * table, then any strings built here, so nothing else needs freeing. It was
  * a caller's stack array of ENV_MAX + ARG_MAX slots. Returns 0 when memory
  * ran out. */
+/* ---- bash's export order -------------------------------------------------
+ *
+ *     export ZED=1 ALPHA=2 mid=3 B_2=4 a=5 LONGERNAME_X=6 Q=7; env
+ *         bash: ZED Q a LONGERNAME_X mid B_2 ALPHA
+ *         tsh:  ZED ALPHA mid B_2 a LONGERNAME_X Q
+ *     X1=a X2=b env         bash: X1 X2 first      tsh: last
+ *
+ * bash builds a child's environment by walking its variable tables
+ * (maybe_make_export_env): the command's temporary environment first, then
+ * each scope from the innermost out -- a function's own (its call's prefix
+ * and its locals), an eval's or a source's prefix -- then the globals, each
+ * table in its hash order, a name taken at its first binding that is
+ * exported and set (an unexported or valueless local does NOT hide an
+ * exported global); then the exported functions; and `_`, the command's
+ * path, last. tsh handed them over in the order they were made (logs/b13
+ * q4 q13 q15). The tables are bash's hashlib ones (sh_htab): 4 buckets for
+ * a scope or a temporary environment, growing as they fill -- replayed here
+ * in the order the names were bound -- and 1024 for the globals, 512 for
+ * the functions, which grow only past 2048 and 1024 names: a name's place
+ * there is its bucket and, within the bucket, newest first. */
+
+/* One live binding that hides an outer one: a `local`, or a prefix
+ * assignment's (see g_tempenv). */
+struct sh_xbind {
+    const char *name;
+    unsigned long seq;
+    const struct shell_local_save *ls;          /* a local, or */
+    const struct shell_prefix_save *ps;         /* the prefix it is in */
+    const struct shell_prefix_one *po;
+};
+
+/* Merge sort of N bindings by name, then newest (largest seq) first. */
+static int sh_xbind_cmp(const struct sh_xbind *a, const struct sh_xbind *b) {
+    int c = strcmp(a->name, b->name);
+    if (c) return c;
+    return a->seq > b->seq ? -1 : a->seq < b->seq ? 1 : 0;
+}
+
+static bool sh_xbind_sort(struct sh_xbind *v, int n) {
+    if (n < 2) return true;
+    struct sh_xbind *tmp = (struct sh_xbind *)kmalloc((size_t)n * sizeof *tmp);
+    if (!tmp) return false;
+    for (int w = 1; w < n; w *= 2) {
+        for (int lo = 0; lo < n; lo += 2 * w) {
+            int mid = lo + w < n ? lo + w : n;
+            int hi = lo + 2 * w < n ? lo + 2 * w : n;
+            int i = lo, j = mid, k = lo;
+            while (i < mid && j < hi)
+                tmp[k++] = sh_xbind_cmp(&v[i], &v[j]) <= 0 ? v[i++] : v[j++];
+            while (i < mid) tmp[k++] = v[i++];
+            while (j < hi) tmp[k++] = v[j++];
+        }
+        for (int i = 0; i < n; i++) v[i] = tmp[i];
+    }
+    kfree(tmp);
+    return true;
+}
+
+/* The binding's scope, as a walk-order key: group 1 a builtin's temporary
+ * environment, 2 a scope -- deeper first, and at one depth an eval's or a
+ * source's prefix (newest first) before the function's own table. */
+static void sh_xbind_ctx(const struct sh_xbind *b, long key[3]) {
+    if (b->ls) {
+        key[0] = 2; key[1] = -(long)b->ls->depth; key[2] = 0;
+        return;
+    }
+    const struct shell_prefix_save *ps = b->ps;
+    long id = (long)(ps->count > 0 ? ps->v[0].seq : 0);
+    if (ps->fncall) {
+        key[0] = 2; key[1] = -(long)ps->level; key[2] = 0;
+    } else if (ps->scope) {
+        key[0] = 2; key[1] = -(long)ps->level; key[2] = -id - 1;
+    } else {
+        key[0] = 1; key[1] = -id; key[2] = 0;
+    }
+}
+
+/* Where NAME sits in the walk of the scope KEY's table: its bindings
+ * replayed, oldest first, into a bash table of four buckets. */
+static long sh_xbind_pos(const struct sh_xbind *all, int nall,
+                         const long key[3], const char *name) {
+    struct sh_xbind *mine = (struct sh_xbind *)kmalloc((size_t)(nall > 0 ? nall : 1) *
+                                                       sizeof *mine);
+    if (!mine) return 0;
+    int m = 0;
+    for (int i = 0; i < nall; i++) {
+        long k[3];
+        sh_xbind_ctx(&all[i], k);
+        if (k[0] == key[0] && k[1] == key[1] && k[2] == key[2]) mine[m++] = all[i];
+    }
+    for (int i = 1; i < m; i++) {                   /* by seq, oldest first */
+        struct sh_xbind t = mine[i];
+        int j = i - 1;
+        while (j >= 0 && mine[j].seq > t.seq) { mine[j + 1] = mine[j]; j--; }
+        mine[j + 1] = t;
+    }
+    struct sh_htab t = { 0, 0, 0, 0, 4 };
+    for (int i = 0; i < m; i++) (void)sh_htab_insert(&t, mine[i].name, 0);
+    long pos = sh_htab_find(&t, name);
+    for (int i = 0; i < t.n; i++) kfree(t.e[i].key);
+    kfree(t.e);
+    kfree(mine);
+    return pos;
+}
+
+/* One variable a child gets. */
+struct sh_xent {
+    const char *kv;             /* "NAME=value" as it is, or 0: build it */
+    const char *name;           /* ...from these */
+    size_t nlen;
+    const char *val;
+    long key[4];
+};
+
+static int sh_xent_cmp(const struct sh_xent *a, const struct sh_xent *b) {
+    for (int i = 0; i < 4; i++)
+        if (a->key[i] != b->key[i]) return a->key[i] < b->key[i] ? -1 : 1;
+    return 0;
+}
+
+/* Build the environment a child process receives.
+ *
+ * ONLY EXPORTED VARIABLES GO. This is the point of the export flag: before it
+ * existed this loop copied the entire shell variable table, so
+ *     x=1; printenv x
+ * printed 1 where POSIX, bash and dash all print nothing. `assignv` carries
+ * the one-shot `VAR=v cmd` prefix assignments, which ARE in the child's
+ * environment by definition regardless of the export attribute.
+ *
+ * The array is ONE allocation the caller frees with kfree: the pointer
+ * table, then any strings built here, so nothing else needs freeing. It was
+ * a caller's stack array of ENV_MAX + ARG_MAX slots. Returns 0 when memory
+ * ran out. One slot past the terminator holds the room for `_` (see
+ * shell_env_put_command_name). */
+static char **sh_env_oom(void) {
+    kprintf(SH_PFX_SHELL "out of memory building the environment\n");
+    return 0;
+}
+
 static char **shell_build_env_overlay(char **assignv, int assignc,
                                       int *out_envc) {
-    /* `A+=a cmd` IS A PREFIX ASSIGNMENT THAT APPENDS, and it must append
-     * to the value the shell has now while leaving that value alone:
+    /* THE LIVE BINDINGS THAT HIDE OTHERS, sorted by name. */
+    int nb = 0, nbcap = g_localc;
+    for (int i = 0; i < g_tempenvc; i++) nbcap += g_tempenv[i]->count;
+    struct sh_xbind *binds __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct sh_xbind *)kmalloc((size_t)(nbcap > 0 ? nbcap : 1) * sizeof *binds);
+    if (!binds) return sh_env_oom();
+    for (int i = 0; i < g_localc; i++) {
+        const struct shell_local_save *ls = &g_locals[i];
+        if (ls->dead || !ls->name) continue;
+        binds[nb].name = ls->name;
+        binds[nb].seq = ls->seq;
+        binds[nb].ls = ls;
+        binds[nb].ps = 0;
+        binds[nb].po = 0;
+        nb++;
+    }
+    for (int i = 0; i < g_tempenvc; i++) {
+        const struct shell_prefix_save *ps = g_tempenv[i];
+        for (int k = 0; k < ps->count; k++) {
+            const struct shell_prefix_one *po = &ps->v[k];
+            if (po->dead || !po->name) continue;
+            binds[nb].name = po->name;
+            binds[nb].seq = po->seq;
+            binds[nb].ls = 0;
+            binds[nb].ps = ps;
+            binds[nb].po = po;
+            nb++;
+        }
+    }
+    if (!sh_xbind_sort(binds, nb)) return sh_env_oom();
+
+    /* THE PREFIX: `A+=a cmd` APPENDS -- to the value before it on the line,
+     * or the shell's -- and leaves the shell's alone:
      *
      *     A=a; A+=a printenv.py A   ->  aa, and the shell still has A=a
      *
-     * So it is resolved HERE and not by env_set_kv, which would write it
-     * back. The rebuilt strings live in the same block as the table. They
-     * lived in a static pool of eight 256-byte slots, and a ninth, or a
-     * longer value, went through unresolved as the literal `A+=a`. */
-    size_t extra = 0;
-    for (int i = 0; i < assignc; i++) {
-        const char *kv = assignv[i];
-        size_t klen = env_key_len(kv);
-        if (klen > 1 && kv[klen - 1] == '+') {
+     * A name given twice is one entry, the last value, where the first was
+     * (bash's temporary environment is a table too). */
+    int nx = 0;
+    int xcap = g_envc + nb + assignc + 1;
+    struct sh_xent *xs __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct sh_xent *)kmalloc((size_t)xcap * sizeof *xs);
+    if (!xs) return sh_env_oom();
+    SH_WORDS(vals);                 /* values the prefix builds */
+    {
+        struct sh_htab t = { 0, 0, 0, 0, 4 };
+        int first = nx;
+        for (int i = 0; i < assignc; i++) {
+            const char *kv = assignv[i];
+            size_t klen = env_key_len(kv);
+            bool app = klen > 1 && kv[klen - 1] == '+';
+            size_t nlen = app ? klen - 1 : klen;
             SH_SB(nmb);
-            size_t nlen = klen - 1;
-            if (sb_putmem(&nmb, kv, nlen) == 0) {
-                const char *nm = nmb.p;
-                const char *old = env_get(nm);
-                extra += nlen + 1 + (old ? strlen(old) : 0) +
-                         strlen(kv + klen + 1) + 1;
+            if (sb_putmem(&nmb, kv, nlen) < 0) continue;
+            const char *val = kv + klen + 1;
+            int at = -1;
+            for (int j = first; j < nx; j++)
+                if (xs[j].nlen == nlen && memcmp(xs[j].name, kv, nlen) == 0) at = j;
+            if (app) {
+                const char *old = at >= 0 ? xs[at].val : env_get(nmb.p);
+                SH_SB(nv);
+                if (sb_puts(&nv, old ? old : "") < 0 || sb_puts(&nv, val) < 0)
+                    continue;
+                val = words_store(&vals, nv.p, nv.len);
+                if (!val) return sh_env_oom();
             }
+            if (at < 0) {
+                (void)sh_htab_insert(&t, nmb.p, 0);
+                at = nx++;
+                xs[at].name = kv;
+                xs[at].nlen = nlen;
+            }
+            xs[at].kv = 0;
+            xs[at].val = val;
         }
+        for (int j = first; j < nx; j++) {
+            SH_SB(nmb);
+            (void)sb_putmem(&nmb, xs[j].name, xs[j].nlen);
+            xs[j].key[0] = 0; xs[j].key[1] = 0; xs[j].key[2] = 0;
+            xs[j].key[3] = nmb.p ? sh_htab_find(&t, nmb.p) : 0;
+        }
+        for (int i = 0; i < t.n; i++) kfree(t.e[i].key);
+        kfree(t.e);
     }
+
+    /* THE VARIABLES. A name with no binding hiding another is a global; one
+     * with some is followed from its innermost binding outward. */
+    for (int i = 0; i < g_envc; i++) {
+        size_t klen = env_key_len(g_env[i]);
+        if (klen == 0 || g_env[i][klen] != '=') continue;
+        if (klen == 1 && g_env[i][0] == '_') continue;  /* see below */
+        if (shell_assignment_overrides(g_env[i], assignv, assignc)) continue;
+        SH_SB(nmb);
+        if (sb_putmem(&nmb, g_env[i], klen) < 0) continue;
+        int lo = 0, hi = nb;                        /* any binding? */
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (strcmp(binds[mid].name, nmb.p) < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < nb && strcmp(binds[lo].name, nmb.p) == 0) continue;
+        unsigned fl = g_env_flags[i];
+        if (!(fl & SHVAR_EXPORTED) || (fl & (SHVAR_ARRAY | SHVAR_NOVALUE)))
+            continue;
+        xs[nx].kv = g_env[i];
+        xs[nx].key[0] = 3;
+        xs[nx].key[1] = (long)(sh_bash_hash(nmb.p) & 1023u);
+        xs[nx].key[2] = -(long)i;
+        xs[nx].key[3] = 0;
+        nx++;
+    }
+    for (int b = 0; b < nb; ) {
+        int e = b;
+        while (e < nb && strcmp(binds[e].name, binds[b].name) == 0) e++;
+        const char *name = binds[b].name;
+        size_t nlen = strlen(name);
+        bool over = false;
+        for (int a = 0; a < assignc && !over; a++)
+            over = env_assign_name_len(assignv[a]) == nlen &&
+                   memcmp(assignv[a], name, nlen) == 0;
+        /* elem 0 is the variable as it is now; elem k (1..) what binding
+         * k-1 hid, which lives in binding k's scope, or the globals'. */
+        for (int k = b; !over && k <= e; k++) {
+            const char *kv = 0, *val = 0;
+            unsigned fl = 0;
+            bool have = false;
+            if (k == b) {
+                int ix = env_find(name, nlen);
+                if (ix >= 0) { kv = g_env[ix]; fl = g_env_flags[ix]; have = true; }
+            } else if (binds[k - 1].ls) {
+                const struct shell_local_save *ls = binds[k - 1].ls;
+                if (ls->existed && ls->kv) { kv = ls->kv; fl = ls->flags; have = true; }
+            } else {
+                const struct shell_prefix_one *po = binds[k - 1].po;
+                if (po->had && po->prev) {
+                    val = po->prev;
+                    fl = po->prev_flags | (po->was_exported ? SHVAR_EXPORTED : 0u);
+                    have = true;
+                }
+            }
+            if (!have || !(fl & SHVAR_EXPORTED) ||
+                (fl & (SHVAR_ARRAY | SHVAR_NOVALUE)))
+                continue;
+            if (kv && kv[nlen] != '=') continue;
+            xs[nx].kv = kv;
+            xs[nx].name = name;
+            xs[nx].nlen = nlen;
+            xs[nx].val = val;
+            if (k < e) {
+                long ck[3];
+                sh_xbind_ctx(&binds[k], ck);
+                xs[nx].key[0] = ck[0];
+                xs[nx].key[1] = ck[1];
+                xs[nx].key[2] = ck[2];
+                xs[nx].key[3] = sh_xbind_pos(binds, nb, ck, name);
+            } else {
+                xs[nx].key[0] = 3;
+                xs[nx].key[1] = (long)(sh_bash_hash(name) & 1023u);
+                xs[nx].key[2] = -(long)env_find(name, nlen);
+                xs[nx].key[3] = 0;
+            }
+            nx++;
+            break;
+        }
+        b = e;
+    }
+    for (int i = 1; i < nx; i++) {                  /* insertion: stable */
+        struct sh_xent t = xs[i];
+        int j = i - 1;
+        while (j >= 0 && sh_xent_cmp(&xs[j], &t) > 0) { xs[j + 1] = xs[j]; j--; }
+        xs[j + 1] = t;
+    }
+
     /* EXPORTED FUNCTIONS GO TOO, as bash passes them: BASH_FUNC_NAME%%=
      * and the definition printed on one line without its name -- what a
-     * bash child imports, and what tsh imports at start (logs/b12 p77). */
+     * bash child imports, and what tsh imports at start (logs/b12 p77) --
+     * in the function table's order. */
     int nfx = 0;
     for (int k = 0; k < g_nfunctions; k++)
         if (g_functions[k].name && g_functions[k].exported) nfx++;
+    int *fxo __attribute__((cleanup(shell_kfree_ptr))) =
+        nfx ? (int *)kmalloc((size_t)nfx * sizeof(int)) : 0;
     char **fxs __attribute__((cleanup(shell_kfree_ptr))) =
         nfx ? (char **)kmalloc((size_t)nfx * sizeof(char *)) : 0;
+    if (nfx && (!fxo || !fxs)) return sh_env_oom();
     int nfxs = 0;
-    if (nfx && fxs) {
-        for (int k = 0; k < g_nfunctions && nfxs < nfx; k++) {
-            if (!g_functions[k].name || !g_functions[k].exported) continue;
-            char *def = shell_function_printed_as(&g_functions[k], false, "");
-            if (!def) continue;
-            SH_SB(ent);
-            if (sb_puts(&ent, "BASH_FUNC_") == 0 && sb_puts(&ent, g_functions[k].name) == 0 &&
-                sb_puts(&ent, "%%=") == 0 && sb_puts(&ent, def) == 0) {
-                fxs[nfxs] = sb_steal(&ent);
-                if (fxs[nfxs]) { extra += strlen(fxs[nfxs]) + 1; nfxs++; }
-            }
-            kfree(def);
+    for (int k = 0; k < g_nfunctions; k++)
+        if (g_functions[k].name && g_functions[k].exported) fxo[nfxs++] = k;
+    for (int i = 1; i < nfxs; i++) {
+        int t = fxo[i], j = i - 1;
+        unsigned bt = sh_bash_hash(g_functions[t].name) & 511u;
+        while (j >= 0) {
+            unsigned bj = sh_bash_hash(g_functions[fxo[j]].name) & 511u;
+            if (bj < bt || (bj == bt && g_functions[fxo[j]].seq > g_functions[t].seq))
+                break;
+            fxo[j + 1] = fxo[j];
+            j--;
         }
+        fxo[j + 1] = t;
     }
-    size_t slots = (size_t)g_envc + (size_t)assignc + (size_t)nfxs + 1;
+    size_t extra = VFS_PATH_MAX + 3;                /* `_` */
+    int nf = 0;
+    for (int i = 0; i < nfxs; i++) {
+        const struct shell_function *fn = &g_functions[fxo[i]];
+        char *def = shell_function_printed_as(fn, false, "");
+        if (!def) continue;
+        SH_SB(ent);
+        if (sb_puts(&ent, "BASH_FUNC_") == 0 && sb_puts(&ent, fn->name) == 0 &&
+            sb_puts(&ent, "%%=") == 0 && sb_puts(&ent, def) == 0) {
+            fxs[nf] = sb_steal(&ent);
+            if (fxs[nf]) { extra += strlen(fxs[nf]) + 1; nf++; }
+        }
+        kfree(def);
+    }
+    for (int i = 0; i < nx; i++)
+        if (!xs[i].kv) extra += xs[i].nlen + 1 + strlen(xs[i].val) + 1;
+
+    size_t slots = (size_t)nx + (size_t)nf + 2;
     char **out_env = (char **)kmalloc(slots * sizeof(char *) + extra);
     if (!out_env) {
-        for (int k = 0; k < nfxs; k++) kfree(fxs[k]);
-        kprintf(SH_PFX_SHELL "out of memory building the environment\n");
-        return 0;
+        for (int k = 0; k < nf; k++) kfree(fxs[k]);
+        return sh_env_oom();
     }
     char *pool = (char *)(out_env + slots);
     int n = 0;
-    for (int i = 0; i < g_envc; i++) {
-        if (!(g_env_flags[i] & SHVAR_EXPORTED)) continue;
-        /* AN ARRAY DOES NOT GO INTO THE ENVIRONMENT. bash cannot represent
-         * one there, so `export a` on an array marks it and exports nothing;
-         * printenv reports it unset, not empty. */
-        if (g_env_flags[i] & SHVAR_ARRAY) continue;
-        if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* nothing to pass */
-        if (!shell_assignment_overrides(g_env[i], assignv, assignc))
-            out_env[n++] = g_env[i];
+    for (int i = 0; i < nx; i++) {
+        if (xs[i].kv) { out_env[n++] = (char *)xs[i].kv; continue; }
+        size_t vl = strlen(xs[i].val);
+        memcpy(pool, xs[i].name, xs[i].nlen);
+        pool[xs[i].nlen] = '=';
+        memcpy(pool + xs[i].nlen + 1, xs[i].val, vl + 1);
+        out_env[n++] = pool;
+        pool += xs[i].nlen + 1 + vl + 1;
     }
-    for (int i = 0; i < assignc; i++) {
-        const char *kv = assignv[i];
-        size_t klen = env_key_len(kv);
-        if (klen > 1 && kv[klen - 1] == '+') {
-            SH_SB(nmb);
-            size_t nlen = klen - 1;
-            const char *add = kv + klen + 1;
-            if (sb_putmem(&nmb, kv, nlen) == 0) {
-                const char *nm = nmb.p;
-                const char *old = env_get(nm);
-                size_t ol = old ? strlen(old) : 0, al = strlen(add);
-                char *d = pool;
-                memcpy(d, nm, nlen);
-                d[nlen] = '=';
-                if (ol) memcpy(d + nlen + 1, old, ol);
-                memcpy(d + nlen + 1 + ol, add, al + 1);
-                pool += nlen + 1 + ol + al + 1;
-                out_env[n++] = d;
-                continue;
-            }
-        }
-        out_env[n++] = assignv[i];
-    }
-    for (int k = 0; k < nfxs; k++) {
+    for (int k = 0; k < nf; k++) {
         size_t fl = strlen(fxs[k]);
         memcpy(pool, fxs[k], fl + 1);
         out_env[n++] = pool;
@@ -31902,8 +32206,26 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
         kfree(fxs[k]);
     }
     out_env[n] = 0;
+    out_env[n + 1] = pool;          /* room for `_` */
     *out_envc = n;
     return out_env;
+}
+
+/* bash's put_command_name_into_env: an ordinary command's environment ends
+ * with `_`, the path it was run by (logs/b13 q13 q15) -- `_=/bin/env`, or
+ * `_=./env` as typed with a slash. `exec`'s gets none. The room is the
+ * slot past the overlay's terminator. */
+static void shell_env_put_command_name(char **envp, int *envc,
+                                       const char *path) {
+    if (!envp || !path) return;
+    char *buf = envp[*envc + 1];
+    size_t l = strlen(path);
+    if (!buf || l > VFS_PATH_MAX) return;
+    buf[0] = '_';
+    buf[1] = '=';
+    memcpy(buf + 2, path, l + 1);
+    envp[(*envc)++] = buf;
+    envp[*envc] = 0;
 }
 
 /* A copy of every variable, however many there are. */
@@ -32952,6 +33274,7 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
      * its own body's (see the call in shell_run_simple) */
     sv->level = g_script_depth;
     sv->scope = false;
+    sv->fncall = false;
     if (assignc <= 0) return;
     sv->v = (struct shell_prefix_one *)kmalloc((size_t)assignc * sizeof *sv->v);
     if (!sv->v) {
@@ -33650,6 +33973,7 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             if (assignc > 0 && shell_function_lookup(exec_cmd.argv[0])) {
                 shell_prefix_capture(&fn_prefix, cmd->argv, assignc);
                 fn_prefix.level = g_script_depth + 1;    /* the body's */
+                fn_prefix.fncall = true;
                 restore = true;
                 if (shell_apply_assignments_ex(cmd->argv, assignc, "shell",
                                                true) != 0) {
@@ -33715,6 +34039,7 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
     }
     int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
     g_spawn_temp_path = shell_prefix_path(cmd->argv, assignc, envp, envc);
+    g_spawn_put_command_name = true;
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
@@ -33879,6 +34204,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     const char *path = resolve_program_run(argv[0], path_buf, sizeof(path_buf), 0);
     const char *report_as = g_resolve_hashed ? path : argv[0];
     g_spawn_temp_path = 0;
+    if (path) shell_env_put_command_name(envp, &envc, path);
     struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
         (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n) *
                                       sizeof *xfd);
@@ -37681,6 +38007,7 @@ struct shell_function_frame {
     char **body;
     bool *whole;                  /* shell_function.whole, per slot */
     bool *exported;               /* ...and .exported */
+    unsigned long *seq;           /* ...and .seq */
 };
 
 static void shell_function_frame_clear(struct shell_function_frame *frame) {
@@ -37693,9 +38020,11 @@ static void shell_function_frame_clear(struct shell_function_frame *frame) {
     kfree(frame->body);
     kfree(frame->whole);
     kfree(frame->exported);
+    kfree(frame->seq);
     frame->name = frame->body = 0;
     frame->whole = 0;
     frame->exported = 0;
+    frame->seq = 0;
     frame->n = 0;
 }
 
@@ -37707,14 +38036,19 @@ static int shell_function_frame_capture(struct shell_function_frame *frame) {
     frame->body = (char **)kmalloc((size_t)g_nfunctions * sizeof(char *));
     frame->whole = (bool *)kmalloc((size_t)g_nfunctions * sizeof(bool));
     frame->exported = (bool *)kmalloc((size_t)g_nfunctions * sizeof(bool));
-    if (!frame->name || !frame->body || !frame->whole || !frame->exported) {
+    frame->seq = (unsigned long *)kmalloc((size_t)g_nfunctions *
+                                          sizeof(unsigned long));
+    if (!frame->name || !frame->body || !frame->whole || !frame->exported ||
+        !frame->seq) {
         kfree(frame->name);
         kfree(frame->body);
         kfree(frame->whole);
         kfree(frame->exported);
+        kfree(frame->seq);
         frame->name = frame->body = 0;
         frame->whole = 0;
         frame->exported = 0;
+        frame->seq = 0;
         return -1;
     }
     frame->n = g_nfunctions;
@@ -37728,6 +38062,7 @@ static int shell_function_frame_capture(struct shell_function_frame *frame) {
         frame->body[i] = shell_strdup(g_functions[i].body);
         frame->whole[i] = g_functions[i].whole;
         frame->exported[i] = g_functions[i].exported;
+        frame->seq[i] = g_functions[i].seq;
         if (!frame->name[i] || !frame->body[i]) {
             shell_function_frame_clear(frame);
             return -1;
@@ -37747,6 +38082,7 @@ static void shell_function_frame_restore(struct shell_function_frame *frame) {
         g_functions[i].body = (i < frame->n) ? frame->body[i] : 0;
         g_functions[i].whole = (i < frame->n) ? frame->whole[i] : false;
         g_functions[i].exported = (i < frame->n) ? frame->exported[i] : false;
+        g_functions[i].seq = (i < frame->n) ? frame->seq[i] : 0;
         if (i < frame->n) {
             frame->name[i] = 0;
             frame->body[i] = 0;
