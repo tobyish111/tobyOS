@@ -3844,6 +3844,7 @@ void kvec_free(char **arr) {
 
 static void free_kvec(char **arr) { kvec_free(arr); }
 
+long lx_access_kpath(const char *kpath, int mode);
 static long sys_spawn(const struct abi_spawn_req *req) {
     if (!cap_check(current_proc(), CAP_EXEC, "sys_spawn")) return -ABI_EPERM;
 
@@ -3868,6 +3869,13 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     {
         int rr = resolve_user_path(kreq.path, kpath, sizeof kpath);
         if (rr) return rr;
+    }
+    /* ...AND IT MUST BE EXECUTABLE, as execve's must (lx_access_kpath, the
+     * one rule): a mode-0644 copy of /bin/true ran, where bash's execve
+     * says "Permission denied", 126 (logs/b13 q17). */
+    {
+        long ar = lx_access_kpath(kpath, 1 /* X_OK */);
+        if (ar < 0) return ar;
     }
 
     char **kargv = 0; int kargc = 0;
