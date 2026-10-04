@@ -22547,40 +22547,93 @@ static void shell_builtin_set_disabled(const char *name, bool off) {
     g_builtin_off_n++;
 }
 
+/* `enable` AS bash's (builtins/enable.def; logs/b13 q38-q40): options
+ * a d n p s and f FILE, a bad one followed by the usage line (status 2);
+ * a listing -- no names, or -p -- in the table's order, which is bash's
+ * sorted one, -s keeping the special builtins (bash counts `source` among
+ * them). -f loads nothing -- the guest's bash is static and says why, in
+ * these words -- and -d unloads nothing: a builtin here is "not dynamically
+ * loaded". A restricted shell may neither, nor turn a disabled builtin
+ * back on. tsh had -a -n -p only, listed in its own table order and
+ * called -s, -f and -d invalid. */
+static bool shell_enable_special(const char *n) {
+    return shell_special_builtin_name(n) || strcmp(n, "source") == 0;
+}
+
 static void cmd_enable(int argc, char **argv) {
-    bool disable = false, list_all = false;
-    int  first = argc;
-    for (int i = 1; i < argc; i++) {
-        if (argv[i][0] == '-' && argv[i][1]) {
-            for (const char *c = argv[i] + 1; *c; c++) {
-                if      (*c == 'n') disable = true;
-                else if (*c == 'a') list_all = true;
-                else if (*c == 'p') { /* print form is the default below */ }
-                else {
-                    kprintf("enable: -%c: invalid option\n", *c);
+    bool fa = false, fn = false, fp = false, fs = false, ff = false, fd = false;
+    const char *fname = 0;
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { i++; break; }
+        for (const char *c = a + 1; *c; c++) {
+            if (*c == 'a') fa = true;
+            else if (*c == 'n') fn = true;
+            else if (*c == 'p') fp = true;
+            else if (*c == 's') fs = true;
+            else if (*c == 'd') fd = true;
+            else if (*c == 'f') {
+                ff = true;
+                if (c[1]) {
+                    fname = c + 1;
+                } else if (i + 1 < argc) {
+                    fname = argv[++i];
+                } else {
+                    kprintf("enable: -f: option requires an argument\n");
+                    kprintf_raw("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]\n");
                     shell_set_status(2);
                     return;
                 }
+                break;
+            } else {
+                kprintf("enable: -%c: invalid option\n", *c);
+                kprintf_raw("enable: usage: enable [-a] [-dnps] [-f filename] [name ...]\n");
+                shell_set_status(2);
+                return;
             }
-        } else { first = i; break; }
+        }
     }
-    /* Only THIS shell's builtins (S8): /bin/tsh listed all 123 entries of
-     * the table -- the kernel console's cat, ls, mkdir among them, and sh --
-     * and `enable sh` succeeded; bash lists 61 and says "not a shell
-     * builtin". */
-    if (first >= argc) {
+    if (g_restricted && (ff || fd)) {
+        kprintf("enable: restricted\n");
+        shell_set_status(1);
+        return;
+    }
+    if (i >= argc || fp) {
+        int n = 0;
+        for (const struct cmd *c = cmds; c->name; c++) n++;
+        const char **v = (const char **)kmalloc((size_t)(n ? n : 1) * sizeof *v);
+        if (!v) { shell_set_status(1); return; }
+        int m = 0;
         for (const struct cmd *c = cmds; c->name; c++) {
             if (!shell_builtin_in_this_shell(c->name)) continue;
-            bool off = shell_builtin_disabled(c->name);
-            if (off && !disable && !list_all) continue;
-            if (!off && disable) continue;
-            shell_printf("enable %s%s\n", off ? "-n " : "", c->name);
+            bool dup = false;
+            for (int k = 0; k < m && !dup; k++) dup = strcmp(v[k], c->name) == 0;
+            if (dup) continue;
+            int at = m++;
+            while (at > 0 && strcmp(v[at - 1], c->name) > 0) { v[at] = v[at - 1]; at--; }
+            v[at] = c->name;
         }
+        bool want_on = fa || !fn, want_off = fa || fn;
+        for (int k = 0; k < m; k++) {
+            if (fs && !shell_enable_special(v[k])) continue;
+            bool off = shell_builtin_disabled(v[k]);
+            if (!off && want_on) shell_printf("enable %s\n", v[k]);
+            else if (off && want_off) shell_printf("enable -n %s\n", v[k]);
+        }
+        kfree(v);
         shell_set_status(0);
         return;
     }
+    if (ff) {
+        kprintf("enable: cannot open shared object %s: Dynamic loading not supported\n",
+                fname);
+        shell_set_status(1);
+        return;
+    }
     int rc = 0;
-    for (int i = first; i < argc; i++) {
+    for (; i < argc; i++) {
         const struct cmd *found = 0;
         for (const struct cmd *c = cmds; c->name; c++)
             if (strcmp(c->name, argv[i]) == 0 &&
@@ -22590,7 +22643,17 @@ static void cmd_enable(int argc, char **argv) {
             rc = 1;
             continue;
         }
-        shell_builtin_set_disabled(argv[i], disable);
+        if (fd) {
+            kprintf("enable: %s: not dynamically loaded\n", argv[i]);
+            rc = 1;
+            continue;
+        }
+        if (!fn && g_restricted && shell_builtin_disabled(argv[i])) {
+            kprintf("enable: restricted\n");
+            rc = 1;
+            continue;
+        }
+        shell_builtin_set_disabled(argv[i], fn);
     }
     shell_set_status(rc);
 }
