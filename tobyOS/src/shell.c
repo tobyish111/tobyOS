@@ -17848,8 +17848,23 @@ static void cmd_return(int argc, char **argv) {
 #ifdef SHELL_HOSTED
 void shell_logout_hosted(void);
 #endif
+/* bash's exit builtin announces itself at an interactive shell's top
+ * level -- "exit", or "logout" in a login shell -- on standard error, FIRST:
+ * before an error in its operands, the logout file and the EXIT trap
+ * (exit.def). ^D comes through it too. /bin/tsh printed "exit" on standard
+ * output once the line had finished, after the trap's output. */
+#ifdef SHELL_HOSTED
+void shell_exit_notice_hosted(void) {
+    kprintf_raw("%s", g_shopt_misc[21] ? "logout\n" : "exit\n");
+}
+
+bool shell_is_login_hosted(void) { return g_shopt_misc[21]; }
+#endif
+
 static void cmd_exit(int argc, char **argv) {
 #ifdef SHELL_HOSTED
+    if (g_interactive && g_subshell_depth == 0 && g_comsub_level == 0)
+        shell_exit_notice_hosted();
     shell_logout_hosted();
 #endif
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
@@ -43140,6 +43155,9 @@ void shell_startup_files_hosted(int login, bool interactive, bool norc,
 
 /* A login shell that exits -- at EOF when interactive, or by `exit` --
  * reads ~/.bash_logout (bash's exit_builtin and reader loop). Once. */
+/* An interactive shell's end at EOF: the EXIT trap, $? its status. */
+int shell_exit_trap_hosted(int status) { return shell_run_exit_trap(status); }
+
 void shell_logout_hosted(void) {
     static bool done;
     if (done || !g_shopt_misc[21]) return;
@@ -43623,12 +43641,18 @@ int shell_run_line_hosted(const char *text) {
     if (g_interactive) g_reader_syn_repl = true;
     else g_reader_syn_iname = "-c";
     if (!g_interactive) g_reader_nofork_scope = true;   /* bash's ONESHOT */
-    int rc = shell_run_script_text(copy, true);
+    /* AN INTERACTIVE SHELL'S EXIT TRAP RUNS WHEN IT EXITS -- here, once
+     * `exit` has said so, or at EOF (shell_exit_trap_hosted) -- not after
+     * every line it reads: it ran at the end of each one, and never at ^D
+     * (logs/b13 q41). -c is one reader, and the trap ends it. */
+    int rc = shell_run_script_text(copy, !g_interactive);
     kfree(copy);
     if (g_interactive && g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) {
         shell_interactive_line_done();
         rc = 2;
     }
+    if (g_interactive && g_shell_flow == SHELL_FLOW_EXIT)
+        (void)shell_run_exit_trap(g_shell_flow_status);
     /* An interrupt unwound the whole construct to get here. Clear BOTH the
      * flow and the flag, or the shell arrives at its next prompt already
      * refusing to run anything -- a ^C that permanently bricks the session

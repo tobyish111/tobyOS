@@ -1005,6 +1005,9 @@ extern bool shell_shopt_hosted(const char *name, bool on);
 extern void shell_list_shopts_hosted(bool reinput);
 extern void shell_set_invocation_hosted(bool c, bool s);
 extern void shell_set_login_hosted(void);
+extern void shell_exit_notice_hosted(void);
+extern int  shell_exit_trap_hosted(int status);
+extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
 extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
 extern void shell_startup_files_hosted(int login, bool interactive, bool norc,
@@ -1321,12 +1324,14 @@ int main(int argc, char **argv) {
             } else if (r == TSH_LE_EOF) {
                 if (!cont) {
                     if (shell_opt_ignoreeof_hosted() && ++eofs < 10) {
-                        fputs("Use \"exit\" to leave the shell.\n", stderr);
+                        fputs(shell_is_login_hosted()
+                                  ? "Use \"logout\" to leave the shell.\n"
+                                  : "Use \"exit\" to leave the shell.\n", stderr);
                         continue;
                     }
-                    if (interactive) write(1, "exit\n", 5);
+                    if (interactive) shell_exit_notice_hosted();
                     shell_logout_hosted();
-                    return last;
+                    return interactive ? shell_exit_trap_hosted(last) : last;
                 }
                 n = 0;
             } else {
@@ -1335,7 +1340,9 @@ int main(int argc, char **argv) {
             goto have_line;
         }
 
-        if (interactive) write(1, ps, strlen(ps));
+        /* ON STANDARD ERROR, as bash prints its prompts (and readline its
+         * whole line) -- `tsh -i >file` keeps the prompt on the terminal */
+        if (interactive) write(2, ps, strlen(ps));
         for (;;) {
             char c;
             long r = read(0, &c, 1);
@@ -1351,15 +1358,17 @@ int main(int argc, char **argv) {
                      * not exit an interactive shell. bash gives up after ten
                      * in a row so a closed stdin cannot spin forever. */
                     if (shell_opt_ignoreeof_hosted() && ++eofs < 10) {
-                        fputs("Use \"exit\" to leave the shell.\n", stderr);
+                        fputs(shell_is_login_hosted()
+                                  ? "Use \"logout\" to leave the shell.\n"
+                                  : "Use \"exit\" to leave the shell.\n", stderr);
                         break;
                     }
                     /* bash announces an EOF exit -- the "exit" you see
                      * when ^D ends an interactive shell is printed by the
                      * shell, not echoed by the terminal. */
-                    if (interactive) write(1, "exit\n", 5);
+                    if (interactive) shell_exit_notice_hosted();
                     shell_logout_hosted();
-                    return last;
+                    return interactive ? shell_exit_trap_hosted(last) : last;
                 }
                 break;
             }
@@ -1367,13 +1376,21 @@ int main(int argc, char **argv) {
             if (n + 1 < sizeof line) line[n++] = c;
         }
         line[n] = '\0';
+        /* READLINE ECHOES what it reads, terminal or not: bash edits every
+         * line of an interactive shell (only --noediting stops it), and with
+         * a pipe for input the line it displays is the whole echo there is
+         * -- on standard error, after the prompt (logs/b13 q41). */
+        if (interactive && !noediting && !g_tsh_sigint) {
+            (void)!write(2, line, n);
+            (void)!write(2, "\n", 1);
+        }
     have_line:
         if (interrupted) {
             /* The tty already echoed "^C" with no newline, so the next
              * prompt would run on from it. bash prints the newline; so do
              * we. Everything accumulated (including a half-finished PS2
              * continuation) is discarded, and $? becomes 130. */
-            write(1, "\n", 1);
+            write(2, "\n", 1);
             alen = 0;
             cont = 0;
             /* Consume it HERE. Leaving the flag set for the interpreter to
@@ -1436,15 +1453,16 @@ int main(int argc, char **argv) {
          * runs on from the "^C". Measured against bash on the gate's pty:
          * two bytes, and the only thing between a passing case and a
          * failing one. */
-        if (g_tsh_sigint) { write(1, "\n", 1); g_tsh_sigint = 0; }
+        if (g_tsh_sigint) { write(2, "\n", 1); g_tsh_sigint = 0; }
         alen = 0;
         cont = 0;
         {
             int st;
             if (shell_wants_exit_hosted(&st)) {
-                /* Measured on the gate's pty: interactive bash announces
-                 * "exit" for the exit BUILTIN too, not only for ^D. */
-                write(1, "exit\n", 5);
+                /* The exit BUILTIN has announced itself already, on
+                 * standard error and before any EXIT trap ran, as bash's
+                 * does (shell_exit_notice_hosted); a shell ended any other
+                 * way -- set -e -- says nothing. */
                 return st;
             }
         }
