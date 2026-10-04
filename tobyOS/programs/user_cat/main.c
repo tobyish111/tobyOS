@@ -164,9 +164,27 @@ int main(int argc, char **argv) {
 
         int fd = sys_open(argv[i], O_RDONLY, 0);
         if (fd < 0) {
+            /* the open's own errno, in musl's words: every failure said "No
+             * such file or directory" -- a directory, a file it may not
+             * read, /dev/tty without a terminal (ENXIO) */
+            const char *why;
+            switch (-fd) {
+            case 1:  why = "Operation not permitted"; break;
+            case 2:  why = "No such file or directory"; break;
+            case 6:  why = "No such device or address"; break;
+            case 13: why = "Permission denied"; break;
+            case 20: why = "Not a directory"; break;
+            case 21: why = "Is a directory"; break;
+            case 24: why = "No file descriptors available"; break;
+            case 36: why = "Filename too long"; break;
+            case 40: why = "Symbolic link loop"; break;
+            default: why = "I/O error"; break;
+            }
             put_str(2, "cat: ");
             put_str(2, argv[i]);
-            put_str(2, ": No such file or directory\n");
+            put_str(2, ": ");
+            put_str(2, why);
+            put_str(2, "\n");
             status = 1;
             continue;
         }
