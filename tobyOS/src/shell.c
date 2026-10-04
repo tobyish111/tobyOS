@@ -976,6 +976,20 @@ static bool g_bad_subst_soft;
 static bool g_status_exempt;
 static bool g_opt_nounset;   /* set -u */
 static bool g_opt_xtrace;    /* set -x */
+/* bash's indirection_level: readers nested -- the script, an eval, a
+ * sourced file, a substitution, a trap action. PS4's first character
+ * repeats once per level (shell_xtrace.inc). */
+static int g_xtrace_level;
+/* A declaration builtin's trace, held while it runs (shell_xt_simple): the
+ * literals' lines, the command's, and export's/readonly's assignments. */
+static struct {
+    bool pending;
+    int level;                  /* g_xtrace_level when it was held */
+    struct shell_sb pre, cmd, post;
+} g_xtd;
+static int  shell_xt_single_quote(struct shell_sb *o, const char *t);
+static void shell_xt_decl_literal(const char *name, bool append, const char *elems);
+static void shell_xt_decl_assign(const char *word, size_t klen);
 /* set -E / -o errtrace: the ERR trap reaches into shell functions, command
  * substitutions and subshells (bash). Without it the trap is the top
  * level's alone. tsh refused the option -- "unknown flag '-E'". */
@@ -3187,6 +3201,22 @@ static int sh_array_store_expanded(const char *name, const char *ex,
  *
  * tsh evaluated each key as it expanded each value, into a hidden array
  * the keys could not see (Oils 0244 0245 0246). Phase one queues here. */
+/* A declaration builtin's literal, as the trace shows it: each element
+ * single-quoted, a keyed one ['k']='v' (bash's quote_compound_array_word),
+ * in the order written -- collected here while it expands (g_xtd). */
+static struct shell_sb *g_xt_litd;
+
+static void sh_xt_lit_note(const char *key, const char *val, bool plus) {
+    struct shell_sb *b = g_xt_litd;
+    if (!b) return;
+    if (b->len && sb_putc(b, ' ') < 0) return;
+    if (key && (sb_putc(b, '[') < 0 || shell_xt_single_quote(b, key) < 0 ||
+                sb_putc(b, ']') < 0 || (plus && sb_putc(b, '+') < 0) ||
+                sb_putc(b, '=') < 0))
+        return;
+    (void)shell_xt_single_quote(b, val ? val : "");
+}
+
 struct sh_lit_ent {
     char *key;                  /* the `[k]` text, expanded; 0: a bare value */
     char *val;
@@ -3394,6 +3424,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                         return -1;
                     if (shell_argmarks_to_spaces(kraw.p, &kx) < 0)
                         return -1;
+                    sh_xt_lit_note(kx.p, vx.p, eplus);
                     /* `[k]+=v` IS HONOURED IN AN APPENDING LITERAL AND
                      * IGNORED IN A REPLACING ONE. Measured against bash
                      * 5.2, because the asymmetry is not guessable:
@@ -3432,6 +3463,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                         shell_argmarks_to_spaces(kraw.p, &kx) < 0)
                         return -1;
                     shell_strip_glob_escapes(kx.p);
+                    sh_xt_lit_note(kx.p, vx.p, eplus);
                     if (sh_litq_add(q, kx.p, vx.p, eplus) < 0) return -1;
                 } else {
                     long ix = 0;
@@ -3487,6 +3519,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             if (shell_expand_word_ex(elem, &kx, true, true) < 0)
                 return -1;
             if (shell_argmarks_to_spaces(kx.p, &kj) < 0) return -1;
+            sh_xt_lit_note(0, kj.p, false);
             if (!pend_key) {
                 if (sb_set(&pend, kj.p) < 0) return -1;
                 pend_key = true;
@@ -3522,7 +3555,10 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                 /* the store numbered them 0.. as it went */
                 for (long i = 0; rc == 0 && i < sn; i++) {
                     const char *fv = sh_array_get(scr, i);
-                    if (fv) rc = sh_litq_add(q, 0, fv, false);
+                    if (fv) {
+                        sh_xt_lit_note(0, fv, false);
+                        rc = sh_litq_add(q, 0, fv, false);
+                    }
                 }
                 sh_array_unset_literal(scr);
                 if (rc < 0) return -1;
@@ -3577,12 +3613,19 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         return -1;
     }
     struct sh_litq q = { 0, 0, 0 };
-    if (sh_array_literal_fill(tmp, name, p, append, next,
-                              assoc ? 0 : &q) < 0) {
+    SH_SB(xtd);                         /* see g_xtd and sh_xt_lit_note */
+    struct shell_sb *xtd_saved = g_xt_litd;
+    bool xt_cap = g_xtd.pending && g_xtd.level == g_xtrace_level;
+    g_xt_litd = xt_cap ? &xtd : 0;
+    int frc = sh_array_literal_fill(tmp, name, p, append, next,
+                                    assoc ? 0 : &q);
+    g_xt_litd = xtd_saved;
+    if (frc < 0) {
         sh_litq_free(&q);
         sh_array_unset_literal(tmp);
         return -1;
     }
+    if (xt_cap) shell_xt_decl_literal(name, append, xtd.p ? xtd.p : "");
     if (!append) {
         /* AN ARRAY LITERAL REPLACES A SCALAR OF THE SAME NAME.
          *
@@ -8572,6 +8615,7 @@ static void cmd_export(int argc, char **argv) {
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
         if (unexport && shell_name_is_valid(argv[i], nlen)) {
+            shell_xt_decl_assign(argv[i], klen);
             if (argv[i][klen] == '=' && env_set_kv(argv[i]) < 0) {
                 shell_set_status(1);
                 continue;
@@ -8592,6 +8636,7 @@ static void cmd_export(int argc, char **argv) {
         }
         if (argv[i][klen] == '=') {
             g_readonly_hit = false;
+            shell_xt_decl_assign(argv[i], klen);
             if (env_set_kv(argv[i]) < 0) {
                 /* a readonly name has said so in bash's words already --
                  * "PATH: readonly variable" -- and that is all bash says */
@@ -9399,6 +9444,7 @@ static void cmd_readonly(int argc, char **argv) {
                     }
                 }
             }
+            shell_xt_decl_assign(argv[i], klen);
             if (env_set_kv(argv[i]) < 0) {
                 shell_set_status(1);
                 continue;
@@ -16494,7 +16540,9 @@ static bool shell_syn_check_string(const char *text, const char *iname,
 static void shell_trap_text(const char *action) {
     int saved = g_syn_checked;
     g_syn_checked = 0;
+    g_xtrace_level++;                   /* traced a level deeper: `++ ` */
     execute_line_text(action);
+    g_xtrace_level--;
     g_syn_checked = saved;
 }
 
@@ -16519,7 +16567,18 @@ static unsigned long g_reader_syn_base;
  * which this does not reproduce -- lists of simple commands are exact. */
 static bool g_reader_comsub_lines;
 
+static int shell_run_script_text_in(char *text, bool run_exit_trap);
+
+/* A reader is one level deeper in the trace: `++ ` in an eval or a
+ * substitution (bash's parse_and_execute). */
 static int shell_run_script_text(char *text, bool run_exit_trap) {
+    g_xtrace_level++;
+    int rc = shell_run_script_text_in(text, run_exit_trap);
+    g_xtrace_level--;
+    return rc;
+}
+
+static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     if (!text) return 1;
     const char *syn_iname = g_reader_syn_iname;
     bool syn_string = g_reader_syn_string;
@@ -18102,6 +18161,7 @@ static void cmd_eval(int argc, char **argv) {
      * eval's own line -- and again at its end (logs/b12 p99) */
     unsigned long eval_ln = g_shell_lineno;
     shell_jobs_notify(eval_ln, SHELL_NOTIFY_READ);
+    g_xtrace_level++;                   /* a reader's level (shell_xt_prefix) */
     char *p = cmd;
     while (p && *p) {
         char *nl = shell_unquoted_newline(p);
@@ -18126,6 +18186,7 @@ static void cmd_eval(int argc, char **argv) {
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
     }
+    g_xtrace_level--;
     if (g_shell_flow == SHELL_FLOW_NONE)
         shell_jobs_notify(eval_ln + 1, SHELL_NOTIFY_READ);
     if (eval_checked) g_syn_checked--;
@@ -23822,7 +23883,9 @@ static void shell_capture_body(const char *cmd, bool forked) {
                                        &cs_checked)) {
                 if (cs_checked) g_syn_checked++;
                 g_nofork_pending = true;        /* a ONESHOT text, as -c is */
+                g_xtrace_level++;               /* a reader's level (`++ `) */
                 execute_line_text(line);
+                g_xtrace_level--;
                 g_nofork_pending = false;
                 if (cs_checked) g_syn_checked--;
             }
@@ -23841,7 +23904,9 @@ static void shell_capture_body(const char *cmd, bool forked) {
                 (void)shell_run_script_text(copy, false);
                 kfree(copy);
             } else {
+                g_xtrace_level++;
                 execute_line_text(cmd);
+                g_xtrace_level--;
             }
         }
     }
@@ -25917,11 +25982,9 @@ static bool shell_has_shell_metas(const char *k) {
     return false;
 }
 
-static bool shell_has_ctl(const char *v) {
-    for (const char *q = v; *q; q++)
-        if ((unsigned char)*q < 0x20 || (unsigned char)*q == 0x7f) return true;
-    return false;
-}
+static bool shell_has_ctl(const char *v) { return shell_q_needs_ansi(v); }
+
+#include "shell_xtrace.inc"
 
 /* bash's sh_double_quote: "..." with \ before " \ $ and ` */
 static int shell_double_quote(const char *v, struct shell_sb *out) {
@@ -28361,6 +28424,7 @@ static bool shell_procsub_make(const char *text, bool input,
             g_reader_comsub_lines = true;
             (void)shell_run_script_text(copy, false);
         } else {
+            g_xtrace_level++;               /* a reader's level (`++ `) */
             execute_line_text(copy);
         }
         _exit(g_last_status & 0xff);
@@ -36410,10 +36474,15 @@ static void shell_parse_error(void) {
  * was a syntax error bash does not report. The three arrays live in
  * `store` beside the text and grow together (shell_dbr_room). */
 struct shell_dbr {
-    char  **w;                  /* expanded operand / operator text */
+    char  **w;                  /* the operand's VALUE, once expanded (0: not yet) */
+    char  **raw;                /* the word as written -- the value comes from
+                                 * it when it is first needed (shell_dbr_val) */
+    char  **disp;               /* a pattern's form in the trace */
     bool   *pat;                /* unquoted: the word may be a pattern */
     bool   *opr;                /* an OPERATOR of the grammar: ( ) && || ! --
                                  * a quoted "(" is a one-character string */
+    bool   *rp;                 /* the right of ==, = or != */
+    bool   *rr;                 /* the right of =~ */
     /* LITERAL: written unquoted, with nothing to expand. Only such a word
      * can be an operator -- bash's parser decides that from the word as
      * written, before any expansion:
@@ -36429,7 +36498,10 @@ struct shell_dbr {
     int    cap;
     int    n;
     int    pos;
+    int    skip;                /* >0: a side of && or || that is not run */
+    bool   inv;                 /* a `!` applies to the next test (trace) */
     bool   err;
+    bool   xerr;                /* an operand's expansion failed */
     bool   bad_re;              /* `=~` with a pattern that does not compile */
     struct shell_words store;   /* the words' text; it was an 8 KiB array */
 };
@@ -36443,20 +36515,32 @@ static int shell_dbr_room(struct shell_dbr *d) {
     if (d->n < d->cap) return 0;
     int ncap = d->cap ? d->cap * 2 : 64;
     char **nw = (char **)words_alloc(&d->store, (size_t)ncap * sizeof(char *));
+    char **nr = (char **)words_alloc(&d->store, (size_t)ncap * sizeof(char *));
+    char **nd = (char **)words_alloc(&d->store, (size_t)ncap * sizeof(char *));
     bool *np = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
     bool *no = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
     bool *nl = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
-    if (!nw || !np || !no || !nl) return -1;
+    bool *nrp = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
+    bool *nrr = (bool *)words_alloc(&d->store, (size_t)ncap * sizeof(bool));
+    if (!nw || !nr || !nd || !np || !no || !nl || !nrp || !nrr) return -1;
     if (d->n) {
         memcpy(nw, d->w, (size_t)d->n * sizeof(char *));
+        memcpy(nr, d->raw, (size_t)d->n * sizeof(char *));
+        memcpy(nd, d->disp, (size_t)d->n * sizeof(char *));
         memcpy(np, d->pat, (size_t)d->n * sizeof(bool));
         memcpy(no, d->opr, (size_t)d->n * sizeof(bool));
         memcpy(nl, d->lit, (size_t)d->n * sizeof(bool));
+        memcpy(nrp, d->rp, (size_t)d->n * sizeof(bool));
+        memcpy(nrr, d->rr, (size_t)d->n * sizeof(bool));
     }
     d->w = nw;
+    d->raw = nr;
+    d->disp = nd;
     d->pat = np;
     d->opr = no;
     d->lit = nl;
+    d->rp = nrp;
+    d->rr = nrr;
     d->cap = ncap;
     return 0;
 }
@@ -36509,6 +36593,9 @@ struct shell_dbr_scratch {
     struct shell_sb tmp;    /* one segment's expansion */
     struct shell_sb out;    /* the assembled word */
     struct shell_sb join;   /* "$@" with its elements joined */
+    struct shell_sb disp;   /* the word as the trace shows it */
+    bool expand;            /* false: find where the word ends, no more */
+    bool rhs_re;            /* the word is the right of =~ */
 };
 
 /* "$@" AND "${a[@]}" ARE ONE WORD HERE, the elements joined by a space:
@@ -36532,24 +36619,44 @@ static bool shell_dbr_special(char c) {
            c == '}' || c == '^' || c == '$';
 }
 
-/* Append a QUOTED span of n bytes, every operator character marked. */
-static int shell_dbr_put_quoted(struct shell_sb *out, const char *s, size_t n) {
+/* bash's ere_char: what a quoted character on the right of =~ is shown
+ * backslashed for in the trace */
+static bool shell_dbr_ere_char(char c) {
+    switch (c) {
+    case '.': case '[': case '\\': case '(': case ')': case '*': case '+':
+    case '?': case '{': case '|': case '^': case '$':
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Append a QUOTED span of n bytes, every operator character marked -- and
+ * to the trace's form, every character backslashed (on the right of =~,
+ * the ones the ERE grammar reads): bash's quote_string_for_globbing. */
+static int shell_dbr_put_quoted(struct shell_dbr_scratch *sc, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (shell_dbr_special(s[i]) &&
-            sb_putc(out, SHELL_GLOB_ESC) < 0) return -1;
-        if (sb_putc(out, s[i]) < 0) return -1;
+            sb_putc(&sc->out, SHELL_GLOB_ESC) < 0) return -1;
+        if (sb_putc(&sc->out, s[i]) < 0) return -1;
+        if ((!sc->rhs_re || shell_dbr_ere_char(s[i])) &&
+            sb_putc(&sc->disp, '\\') < 0) return -1;
+        if (sb_putc(&sc->disp, s[i]) < 0) return -1;
     }
     return 0;
 }
 
 /* Expand the pending unquoted run and append whatever it yields as it is:
- * an unquoted `$pat` IS a pattern in bash. */
+ * an unquoted `$pat` IS a pattern in bash. Finding the word's end only, it
+ * is dropped unexpanded. */
 static int shell_dbr_flush(struct shell_dbr_scratch *sc) {
     if (sc->seg.len == 0) return 0;
+    if (!sc->expand) { sb_truncate(&sc->seg, 0); return 0; }
     int rc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
     sb_truncate(&sc->seg, 0);
     if (rc < 0 || shell_dbr_join(sc) < 0) return -1;
     shell_strip_nosplit_inplace(sc->tmp.p);
+    if (sb_puts(&sc->disp, sc->tmp.p) < 0) return -1;
     return sb_puts(&sc->out, sc->tmp.p);
 }
 
@@ -36600,6 +36707,211 @@ static int shell_dbr_copy_subst(const char **pp, struct shell_dbr_scratch *sc) {
     return 0;
 }
 
+/* ONE WORD from *PP: its text as written into sc->raw, whether any of it was
+ * quoted or unquoted, and -- when sc->expand -- its value into sc->out and
+ * its trace form into sc->disp.
+ *
+ * OPERANDS ARE EXPANDED WHEN THEY ARE EVALUATED, as bash's are (batch 13).
+ * The expression is first cut into words as written -- that is all the
+ * grammar needs, an operator being a word written unquoted -- and a word is
+ * expanded the first time a test needs its value (shell_dbr_val). Expanding
+ * them all up front ran what bash never does:
+ *
+ *     [[ -n x || $(touch f) ]]       bash: no f     tsh: f
+ *     [[ a == b && ${v:=7} ]]        bash: v unset  tsh: v=7
+ *
+ * (logs/b13 q35). */
+static int shell_dbr_word(const char **pp, struct shell_dbr_scratch *sc,
+                          bool rhs_pat, bool rhs_re, bool *pq, bool *pu) {
+    const char *p = *pp;
+    sb_truncate(&sc->raw, 0);
+    sb_truncate(&sc->seg, 0);
+    sb_truncate(&sc->out, 0);
+    sb_truncate(&sc->disp, 0);
+    sc->rhs_re = rhs_re;
+    bool any_q = false, any_u = false;
+    int eg_depth = 0;          /* inside an extglob group X( ... ) */
+    int re_depth = 0;          /* inside a regex group ( ... ) */
+    while (*p) {
+        char c = *p;
+        if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
+        /* ...and they end a word they are glued to. Not inside an
+         * extglob or regex group, where `|` is alternation; and on the
+         * right of `=~` a `|` is the regex's at any depth (bash's lexer,
+         * PST_REGEXP). */
+        if (eg_depth == 0 && re_depth == 0 &&
+            (c == '&' || c == '<' || c == '>' || c == ';' ||
+             (c == '|' && !rhs_re)))
+            break;
+        /* A TILDE STARTING THE WORD EXPANDS, as in any word bash does not
+         * split: `HOME=/home/bob; [[ ~ == /home/b* ]]` is true, and with
+         * HOME='' `[[ ~ ]]` is false. The prefix runs to the first `/`;
+         * a quote anywhere in it means no expansion (bash_tilde_find_word).
+         * The home comes back QUOTED -- a `*` or `^` in it is literal on
+         * either side of == and =~ (subst.c: add_quoted_string). */
+        if (sc->expand && c == '~' && sc->raw.len == 0) {
+            const char *e = p + 1;
+            bool quoted_pre = false;
+            while (*e && *e != '/' && *e != ' ' && *e != '\t' &&
+                   *e != '\n' && *e != '&' && *e != '|' && *e != '<' &&
+                   *e != '>' && *e != ';' && *e != '(' && *e != ')') {
+                if (*e == '\\' || *e == '\'' || *e == '"') quoted_pre = true;
+                e++;
+            }
+            if (!quoted_pre) {
+                sb_truncate(&sc->tmp, 0);
+                int tr = shell_tilde_prefix_home(p + 1, (size_t)(e - (p + 1)),
+                                                 &sc->tmp);
+                if (tr < 0) return -1;
+                if (tr > 0) {
+                    any_u = true;
+                    if (sb_putmem(&sc->raw, p, (size_t)(e - p)) < 0 ||
+                        shell_dbr_put_quoted(sc, sc->tmp.p,
+                                             strlen(sc->tmp.p)) < 0)
+                        return -1;
+                    p = e;
+                    continue;
+                }
+            }
+        }
+        if (c == '\'') {
+            any_q = true;
+            if (shell_dbr_flush(sc) < 0) return -1;
+            if (sb_putc(&sc->raw, c) < 0) return -1;
+            p++;
+            const char *q = p;
+            while (*p && *p != '\'') p++;
+            if (shell_dbr_put_quoted(sc, q, (size_t)(p - q)) < 0)
+                return -1;
+            if (sb_putmem(&sc->raw, q, (size_t)(p - q)) < 0) return -1;
+            if (*p == '\'') {
+                if (sb_putc(&sc->raw, *p) < 0) return -1;
+                p++;
+            }
+            continue;
+        }
+        if (c == '"' || (c == '$' && (p[1] == '"' || p[1] == '\''))) {
+            /* A double-quoted span (or $"..." / $'...') is ONE segment,
+             * expanded on its own so its result can be marked literal. */
+            any_q = true;
+            if (shell_dbr_flush(sc) < 0) return -1;
+            if (c == '$') {
+                if (shell_dbr_put2(sc, c) < 0) return -1;
+                p++;
+            }
+            char qc = *p;
+            if (shell_dbr_put2(sc, qc) < 0) return -1;
+            p++;
+            while (*p && *p != qc) {
+                if (*p == '\\' && p[1]) {
+                    if (shell_dbr_put2(sc, *p) < 0) return -1;
+                    p++;
+                }
+                if (shell_dbr_put2(sc, *p) < 0) return -1;
+                p++;
+            }
+            if (*p == qc) {
+                if (shell_dbr_put2(sc, qc) < 0) return -1;
+                p++;
+            }
+            if (!sc->expand) {
+                sb_truncate(&sc->seg, 0);
+                continue;
+            }
+            int xrc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
+            sb_truncate(&sc->seg, 0);
+            if (xrc < 0 || shell_dbr_join(sc) < 0) return -1;
+            shell_strip_nosplit_inplace(sc->tmp.p);
+            if (shell_dbr_put_quoted(sc, sc->tmp.p, strlen(sc->tmp.p)) < 0)
+                return -1;
+            continue;
+        }
+        if (c == '\\' && p[1]) {
+            /* `\x` quotes x, whatever x is. */
+            any_q = true;
+            if (shell_dbr_flush(sc) < 0) return -1;
+            if (sb_putc(&sc->raw, c) < 0 ||
+                sb_putc(&sc->raw, p[1]) < 0 ||
+                sb_putc(&sc->out, SHELL_GLOB_ESC) < 0 ||
+                sb_putc(&sc->out, p[1]) < 0)
+                return -1;
+            if ((!sc->rhs_re || shell_dbr_ere_char(p[1])) &&
+                sb_putc(&sc->disp, '\\') < 0) return -1;
+            if (sb_putc(&sc->disp, p[1]) < 0) return -1;
+            p += 2;
+            continue;
+        }
+        if ((c == '$' && (p[1] == '(' || p[1] == '{')) || c == '`') {
+            any_u = true;
+            if (shell_dbr_copy_subst(&p, sc) < 0) return -1;
+            continue;
+        }
+        if (c == '(') {
+            char prevc = sc->raw.len > 0 ? sc->raw.p[sc->raw.len - 1] : '\0';
+            bool eg_op = (prevc == '?' || prevc == '*' || prevc == '+' ||
+                          prevc == '@' || prevc == '!');
+            if (eg_depth > 0) eg_depth++;
+            else if (re_depth > 0) re_depth++;
+            else if (eg_op && (g_shopt_extglob || rhs_pat || rhs_re)) eg_depth = 1;
+            else if (rhs_re) re_depth = 1;
+            else break;                     /* bare: the word ends here */
+        } else if (c == ')') {
+            if (eg_depth > 0) eg_depth--;
+            else if (re_depth > 0) re_depth--;
+            else break;
+        }
+        any_u = true;
+        if (shell_dbr_put2(sc, c) < 0) return -1;
+        p++;
+    }
+    if (shell_dbr_flush(sc) < 0) return -1;
+    *pp = p;
+    *pq = any_q;
+    *pu = any_u;
+    return 0;
+}
+
+static struct shell_dbr_scratch *shell_dbr_scratch_new(bool expand) {
+    struct shell_dbr_scratch *sc =
+        (struct shell_dbr_scratch *)kmalloc(sizeof *sc);
+    if (!sc) return 0;
+    sb_init(&sc->raw);
+    sb_init(&sc->seg);
+    sb_init(&sc->tmp);
+    sb_init(&sc->out);
+    sb_init(&sc->join);
+    sb_init(&sc->disp);
+    sc->expand = expand;
+    sc->rhs_re = false;
+    return sc;
+}
+
+static void shell_dbr_scratch_free(struct shell_dbr_scratch *sc) {
+    sb_free(&sc->raw);
+    sb_free(&sc->seg);
+    sb_free(&sc->tmp);
+    sb_free(&sc->out);
+    sb_free(&sc->join);
+    sb_free(&sc->disp);
+    kfree(sc);
+}
+
+/* Store word N as an operator: its text is its value. */
+static int shell_dbr_put_op(struct shell_dbr *d, const char *text, bool pat) {
+    char *st = shell_dbr_store(d, text);
+    if (!st) return -1;
+    d->w[d->n] = st;
+    d->raw[d->n] = st;
+    d->disp[d->n] = 0;
+    d->pat[d->n] = pat;
+    d->opr[d->n] = !pat;
+    d->lit[d->n] = true;
+    d->rp[d->n] = false;
+    d->rr[d->n] = false;
+    d->n++;
+    return 0;
+}
+
 static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
                               struct shell_dbr_scratch *sc) {
     const char *p = src;
@@ -36608,9 +36920,10 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
         if (!*p) break;
         if (shell_dbr_room(d) < 0) return -1;
 
-        /* The previous token decides what THIS one may contain. */
-        bool prev_unq = d->n > 0 && d->pat[d->n - 1];
-        const char *pw = d->n > 0 ? d->w[d->n - 1] : "";
+        /* The previous token decides what THIS one may contain -- as it
+         * was WRITTEN: an operator is a literal word. */
+        bool prev_unq = d->n > 0 && d->pat[d->n - 1] && d->lit[d->n - 1];
+        const char *pw = d->n > 0 ? d->raw[d->n - 1] : "";
         bool rhs_pat = prev_unq && (strcmp(pw, "==") == 0 ||
                                     strcmp(pw, "=") == 0 ||
                                     strcmp(pw, "!=") == 0);
@@ -36628,23 +36941,13 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
          * cannot stall on it. */
         if ((p[0] == '&' || p[0] == '|') && p[1] == p[0]) {
             char two[3] = { p[0], p[1], '\0' };
-            char *st = shell_dbr_store(d, two);
-            if (!st) return -1;
-            d->pat[d->n] = false;
-            d->opr[d->n] = true;
-            d->lit[d->n] = true;
-            d->w[d->n++] = st;
+            if (shell_dbr_put_op(d, two, false) < 0) return -1;
             p += 2;
             continue;
         }
         if (*p == '<' || *p == '>' || *p == '&' || *p == '|' || *p == ';') {
             char one[2] = { *p, '\0' };
-            char *st = shell_dbr_store(d, one);
-            if (!st) return -1;
-            d->pat[d->n] = true;
-            d->opr[d->n] = false;
-            d->lit[d->n] = true;
-            d->w[d->n++] = st;
+            if (shell_dbr_put_op(d, one, true) < 0) return -1;
             p++;
             continue;
         }
@@ -36653,211 +36956,102 @@ static int shell_dbr_split_in(struct shell_dbr *d, const char *src,
          * an opening one starts a regex group instead, so it is a word. */
         if ((*p == '(' && !rhs_re) || *p == ')') {
             char one[2] = { *p, '\0' };
-            char *st = shell_dbr_store(d, one);
-            if (!st) return -1;
-            d->pat[d->n] = false;
-            d->opr[d->n] = true;
-            d->lit[d->n] = true;
-            d->w[d->n++] = st;
+            if (shell_dbr_put_op(d, one, false) < 0) return -1;
             p++;
             continue;
         }
 
-        sb_truncate(&sc->raw, 0);
-        sb_truncate(&sc->seg, 0);
-        sb_truncate(&sc->out, 0);
         bool any_q = false, any_u = false;
-        int eg_depth = 0;          /* inside an extglob group X( ... ) */
-        int re_depth = 0;          /* inside a regex group ( ... ) */
-        while (*p) {
-            char c = *p;
-            if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
-            /* ...and they end a word they are glued to. Not inside an
-             * extglob or regex group, where `|` is alternation; and on the
-             * right of `=~` a `|` is the regex's at any depth (bash's lexer,
-             * PST_REGEXP). */
-            if (eg_depth == 0 && re_depth == 0 &&
-                (c == '&' || c == '<' || c == '>' || c == ';' ||
-                 (c == '|' && !rhs_re)))
-                break;
-            /* A TILDE STARTING THE WORD EXPANDS, as in any word bash does not
-             * split: `HOME=/home/bob; [[ ~ == /home/b* ]]` is true, and with
-             * HOME='' `[[ ~ ]]` is false. The prefix runs to the first `/`;
-             * a quote anywhere in it means no expansion (bash_tilde_find_word).
-             * The home comes back QUOTED -- a `*` or `^` in it is literal on
-             * either side of == and =~ (subst.c: add_quoted_string). */
-            if (c == '~' && sc->raw.len == 0) {
-                const char *e = p + 1;
-                bool quoted_pre = false;
-                while (*e && *e != '/' && *e != ' ' && *e != '\t' &&
-                       *e != '\n' && *e != '&' && *e != '|' && *e != '<' &&
-                       *e != '>' && *e != ';' && *e != '(' && *e != ')') {
-                    if (*e == '\\' || *e == '\'' || *e == '"') quoted_pre = true;
-                    e++;
-                }
-                if (!quoted_pre) {
-                    sb_truncate(&sc->tmp, 0);
-                    int tr = shell_tilde_prefix_home(p + 1, (size_t)(e - (p + 1)),
-                                                     &sc->tmp);
-                    if (tr < 0) return -1;
-                    if (tr > 0) {
-                        any_u = true;
-                        if (sb_putmem(&sc->raw, p, (size_t)(e - p)) < 0 ||
-                            shell_dbr_put_quoted(&sc->out, sc->tmp.p,
-                                                 strlen(sc->tmp.p)) < 0)
-                            return -1;
-                        p = e;
-                        continue;
-                    }
-                }
-            }
-            if (c == '\'') {
-                any_q = true;
-                if (shell_dbr_flush(sc) < 0) return -1;
-                if (sb_putc(&sc->raw, c) < 0) return -1;
-                p++;
-                const char *q = p;
-                while (*p && *p != '\'') p++;
-                if (shell_dbr_put_quoted(&sc->out, q, (size_t)(p - q)) < 0)
-                    return -1;
-                if (sb_putmem(&sc->raw, q, (size_t)(p - q)) < 0) return -1;
-                if (*p == '\'') {
-                    if (sb_putc(&sc->raw, *p) < 0) return -1;
-                    p++;
-                }
-                continue;
-            }
-            if (c == '"' || (c == '$' && (p[1] == '"' || p[1] == '\''))) {
-                /* A double-quoted span (or $"..." / $'...') is ONE segment,
-                 * expanded on its own so its result can be marked literal. */
-                any_q = true;
-                if (shell_dbr_flush(sc) < 0) return -1;
-                if (c == '$') {
-                    if (shell_dbr_put2(sc, c) < 0) return -1;
-                    p++;
-                }
-                char qc = *p;
-                if (shell_dbr_put2(sc, qc) < 0) return -1;
-                p++;
-                while (*p && *p != qc) {
-                    if (*p == '\\' && p[1]) {
-                        if (shell_dbr_put2(sc, *p) < 0) return -1;
-                        p++;
-                    }
-                    if (shell_dbr_put2(sc, *p) < 0) return -1;
-                    p++;
-                }
-                if (*p == qc) {
-                    if (shell_dbr_put2(sc, qc) < 0) return -1;
-                    p++;
-                }
-                int xrc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
-                sb_truncate(&sc->seg, 0);
-                if (xrc < 0 || shell_dbr_join(sc) < 0) return -1;
-                shell_strip_nosplit_inplace(sc->tmp.p);
-                if (shell_dbr_put_quoted(&sc->out, sc->tmp.p,
-                                         strlen(sc->tmp.p)) < 0) return -1;
-                continue;
-            }
-            if (c == '\\' && p[1]) {
-                /* `\x` quotes x, whatever x is. */
-                any_q = true;
-                if (shell_dbr_flush(sc) < 0) return -1;
-                if (sb_putc(&sc->raw, c) < 0 ||
-                    sb_putc(&sc->raw, p[1]) < 0 ||
-                    sb_putc(&sc->out, SHELL_GLOB_ESC) < 0 ||
-                    sb_putc(&sc->out, p[1]) < 0)
-                    return -1;
-                p += 2;
-                continue;
-            }
-            if ((c == '$' && (p[1] == '(' || p[1] == '{')) || c == '`') {
-                any_u = true;
-                if (shell_dbr_copy_subst(&p, sc) < 0) return -1;
-                continue;
-            }
-            if (c == '(') {
-                char prevc = sc->raw.len > 0 ? sc->raw.p[sc->raw.len - 1] : '\0';
-                bool eg_op = (prevc == '?' || prevc == '*' || prevc == '+' ||
-                              prevc == '@' || prevc == '!');
-                if (eg_depth > 0) eg_depth++;
-                else if (re_depth > 0) re_depth++;
-                else if (eg_op && (g_shopt_extglob || rhs_pat || rhs_re)) eg_depth = 1;
-                else if (rhs_re) re_depth = 1;
-                else break;                     /* bare: the word ends here */
-            } else if (c == ')') {
-                if (eg_depth > 0) eg_depth--;
-                else if (re_depth > 0) re_depth--;
-                else break;
-            }
-            any_u = true;
-            if (shell_dbr_put2(sc, c) < 0) return -1;
-            p++;
-        }
-        if (shell_dbr_flush(sc) < 0) return -1;
+        if (shell_dbr_word(&p, sc, rhs_pat, rhs_re, &any_q, &any_u) < 0)
+            return -1;
+        const char *rawp = sc->raw.p ? sc->raw.p : "";
 
         /* The operators are recognised only as WHOLE words, and only when
          * they were not quoted -- `[[ "&&" ]]` is a one-word test of a
          * two-character string. */
-        if (!any_q && (strcmp(sc->raw.p, "&&") == 0 || strcmp(sc->raw.p, "||") == 0 ||
-                       strcmp(sc->raw.p, "!") == 0)) {
-            char *st = shell_dbr_store(d, sc->raw.p);
-            if (!st) return -1;
-            d->pat[d->n] = false;
-            d->opr[d->n] = true;
-            d->lit[d->n] = true;
-            d->w[d->n++] = st;
+        if (!any_q && (strcmp(rawp, "&&") == 0 || strcmp(rawp, "||") == 0 ||
+                       strcmp(rawp, "!") == 0)) {
+            if (shell_dbr_put_op(d, rawp, false) < 0) return -1;
             continue;
         }
 
-        /* Only a PATTERN keeps its marks: the right of == / != with an
-         * unquoted part, or the right of =~. A wholly quoted right-hand
-         * side is a string and is compared as one. */
-        bool keep = rhs_re || (rhs_pat && any_u);
-        if (!keep) shell_strip_glob_escapes(sc->out.p);
-        char *st = shell_dbr_store(d, sc->out.p);
+        char *st = shell_dbr_store(d, rawp);
         if (!st) return -1;
+        d->w[d->n] = 0;                 /* expanded when it is needed */
+        d->raw[d->n] = st;
+        d->disp[d->n] = 0;
         d->pat[d->n] = any_u;
         d->opr[d->n] = false;
+        d->rp[d->n] = rhs_pat;
+        d->rr[d->n] = rhs_re;
         {
             bool lit = !any_q;
-            for (const char *r = sc->raw.p; lit && *r; r++)
+            for (const char *r = rawp; lit && *r; r++)
                 if (*r == '$' || *r == '`') lit = false;
             d->lit[d->n] = lit;
         }
-        d->w[d->n++] = st;
+        d->n++;
     }
     return 0;
 }
 
 static int shell_dbr_split(struct shell_dbr *d, const char *src) {
     d->w = 0;
+    d->raw = 0;
+    d->disp = 0;
     d->pat = 0;
     d->opr = 0;
     d->lit = 0;
+    d->rp = 0;
+    d->rr = 0;
     d->msg = 0;
     d->cap = 0;
     d->n = 0;
     d->pos = 0;
+    d->skip = 0;
+    d->inv = false;
     d->err = false;
+    d->xerr = false;
     d->bad_re = false;
     d->store.head = 0;              /* d is fresh from kmalloc */
-    struct shell_dbr_scratch *sc =
-        (struct shell_dbr_scratch *)kmalloc(sizeof *sc);
+    struct shell_dbr_scratch *sc = shell_dbr_scratch_new(false);
     if (!sc) return -1;
-    sb_init(&sc->raw);
-    sb_init(&sc->seg);
-    sb_init(&sc->tmp);
-    sb_init(&sc->out);
-    sb_init(&sc->join);
     int rc = shell_dbr_split_in(d, src, sc);
-    sb_free(&sc->raw);
-    sb_free(&sc->seg);
-    sb_free(&sc->tmp);
-    sb_free(&sc->out);
-    sb_free(&sc->join);
-    kfree(sc);
+    shell_dbr_scratch_free(sc);
     return rc;
+}
+
+/* Operand I's VALUE, expanded now if it has not been: the marks a pattern
+ * keeps stay only on the right of == / != with an unquoted part, or of =~
+ * -- a wholly quoted right-hand side is a string and is compared as one.
+ * A failed expansion sets d->xerr (the caller reports it) and reads "". */
+static const char *shell_dbr_val(struct shell_dbr *d, int i) {
+    if (i < 0 || i >= d->n) return "";
+    if (d->w[i]) return d->w[i];
+    if (d->xerr) return "";
+    struct shell_dbr_scratch *sc = shell_dbr_scratch_new(true);
+    if (!sc) { d->xerr = true; return ""; }
+    const char *p = d->raw[i];
+    bool any_q = false, any_u = false;
+    char *st = 0, *ds = 0;
+    if (shell_dbr_word(&p, sc, d->rp[i], d->rr[i], &any_q, &any_u) == 0) {
+        bool keep = d->rr[i] || (d->rp[i] && any_u);
+        if (!keep && sc->out.p) shell_strip_glob_escapes(sc->out.p);
+        st = shell_dbr_store(d, sc->out.p ? sc->out.p : "");
+        ds = shell_dbr_store(d, sc->disp.p ? sc->disp.p : "");
+    }
+    shell_dbr_scratch_free(sc);
+    if (!st || !ds) { d->xerr = true; return ""; }
+    d->w[i] = st;
+    d->disp[i] = ds;
+    return st;
+}
+
+/* Operand I as the trace shows it: a pattern with its quoted characters
+ * backslashed, anything else its value. */
+static const char *shell_dbr_disp(struct shell_dbr *d, int i) {
+    const char *v = shell_dbr_val(d, i);
+    return (d->rp[i] || d->rr[i]) && d->disp[i] ? d->disp[i] : v;
 }
 
 /* `[[ subject =~ regex ]]`: 1 on a match, 0 on none, -1 when the pattern
@@ -36943,21 +37137,26 @@ static int shell_dbr_regex(const char *subj, const char *pat) {
 }
 #endif
 
+/* The word at the cursor AS WRITTEN: what the grammar reads. */
 static const char *shell_dbr_peek(struct shell_dbr *d) {
-    return d->pos < d->n ? d->w[d->pos] : 0;
+    return d->pos < d->n ? d->raw[d->pos] : 0;
 }
 
 /* Is the token at `i` the grammar operator `op`? A quoted "(" spells the
  * same text and is a string -- `[[ "(" =~ "(" ]]` is a match, not a group. */
 static bool shell_dbr_is_op(struct shell_dbr *d, int i, const char *op) {
-    return i < d->n && d->opr[i] && strcmp(d->w[i], op) == 0;
+    return i < d->n && d->opr[i] && strcmp(d->raw[i], op) == 0;
 }
 
 static int shell_dbr_or(struct shell_dbr *d);
 
+/* One test: parsed always, evaluated -- its operands expanded, the trace
+ * line printed -- only outside a side && or || leaves unrun (d->skip). */
 static int shell_dbr_primary(struct shell_dbr *d) {
     const char *t = shell_dbr_peek(d);
     if (!t) { d->err = true; return 0; }
+    bool inv = d->inv;              /* a `!` before THIS test (the trace) */
+    d->inv = false;
 
     if (shell_dbr_is_op(d, d->pos, "(")) {
         d->pos++;
@@ -36984,17 +37183,22 @@ static int shell_dbr_primary(struct shell_dbr *d) {
      * of a binary test with no right side, a syntax error that ended the
      * script. */
     if (d->lit[d->pos] && test_is_unary_op(t) && d->pos + 1 < d->n) {
-        const char *nxt = d->w[d->pos + 1];
+        const char *nxt = d->raw[d->pos + 1];
         bool word = !(d->opr[d->pos + 1] && strcmp(nxt, "!") != 0) &&
-                    !(d->pat[d->pos + 1] &&
+                    !(d->pat[d->pos + 1] && d->lit[d->pos + 1] &&
                       (strcmp(nxt, "<") == 0 || strcmp(nxt, ">") == 0));
         if (word) {
+            int at = d->pos + 1;
             d->pos += 2;
-            return test_unary(t, nxt) == 0;
+            if (d->skip) return 0;
+            const char *v = shell_dbr_val(d, at);
+            if (d->xerr) return 0;
+            if (g_opt_xtrace) shell_xt_cond(inv, t, v, 0, false);
+            return test_unary(t, v) == 0;
         }
     }
     if (d->lit[d->pos] && test_is_unary_op(t) && d->pos + 1 < d->n) {
-        const char *nxt = d->w[d->pos + 1];
+        const char *nxt = d->raw[d->pos + 1];
         /* ...AND WHAT FOLLOWS IT MUST BE AN OPERAND.
          *
          *     [[ -f < ]]      bash: parse error
@@ -37007,24 +37211,34 @@ static int shell_dbr_primary(struct shell_dbr *d) {
          * the word arrived unquoted, which is the same flag that decides
          * whether the right-hand side of `==` is a pattern. */
         bool nxt_is_op = d->opr[d->pos + 1] ||
-                         (d->pat[d->pos + 1] &&
+                         (d->pat[d->pos + 1] && d->lit[d->pos + 1] &&
                          (strcmp(nxt, "<") == 0 ||
                           strcmp(nxt, ">") == 0 || strcmp(nxt, "=~") == 0 ||
                           strcmp(nxt, "==") == 0 || strcmp(nxt, "!=") == 0 ||
                           strcmp(nxt, "=") == 0 || test_is_binary_op(nxt)));
         if (!nxt_is_op) {
+            int at = d->pos + 1;
             d->pos += 2;
-            return test_unary(t, nxt) == 0;
+            if (d->skip) return 0;
+            const char *v = shell_dbr_val(d, at);
+            if (d->xerr) return 0;
+            if (g_opt_xtrace) shell_xt_cond(inv, t, v, 0, false);
+            return test_unary(t, v) == 0;
         }
     }
 
     /* WORD [ binop WORD ] */
-    const char *a = t;
+    int ai = d->pos;
     d->pos++;
     const char *op = shell_dbr_peek(d);
     if (!op || shell_dbr_is_op(d, d->pos, ")") || shell_dbr_is_op(d, d->pos, "&&") ||
         shell_dbr_is_op(d, d->pos, "||")) {
-        return a[0] != '\0';               /* a bare word: true if non-empty */
+        /* a bare word: true if non-empty -- bash's parser makes it `-n` */
+        if (d->skip) return 0;
+        const char *a = shell_dbr_val(d, ai);
+        if (d->xerr) return 0;
+        if (g_opt_xtrace) shell_xt_cond(inv, "-n", a, 0, false);
+        return a[0] != '\0';
     }
 
     if (!d->lit[d->pos]) {          /* `[[ a "==" b ]]`, `[[ a $op b ]]` */
@@ -37034,8 +37248,13 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     }
     if (strcmp(op, "=~") == 0) {
         if (d->pos + 1 >= d->n) { d->err = true; return 0; }
-        const char *re = d->w[d->pos + 1];
+        int ri = d->pos + 1;
         d->pos += 2;
+        if (d->skip) return 0;
+        const char *a = shell_dbr_val(d, ai);
+        const char *re = shell_dbr_val(d, ri);
+        if (d->xerr) return 0;
+        if (g_opt_xtrace) shell_xt_cond(inv, op, a, shell_dbr_disp(d, ri), true);
         int r = shell_dbr_regex(a, re);
         if (r < 0) { d->bad_re = true; return 0; }
         return r;
@@ -37050,8 +37269,13 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     }
     if (d->pos + 1 >= d->n) { d->err = true; return 0; }
     int rhs_index = d->pos + 1;
-    const char *b = d->w[rhs_index];
     d->pos += 2;
+    if (d->skip) return 0;
+    const char *a = shell_dbr_val(d, ai);
+    const char *b = shell_dbr_val(d, rhs_index);
+    if (d->xerr) return 0;
+    if (g_opt_xtrace)
+        shell_xt_cond(inv, op, a, patrhs ? shell_dbr_disp(d, rhs_index) : b, true);
 
     if (patrhs) {
         bool eq;
@@ -37108,20 +37332,26 @@ static int shell_dbr_primary(struct shell_dbr *d) {
 static int shell_dbr_not(struct shell_dbr *d) {
     if (shell_dbr_is_op(d, d->pos, "!")) {
         d->pos++;
+        d->inv = !d->inv;
         return !shell_dbr_not(d);
     }
     return shell_dbr_primary(d);
 }
 
+/* Both sides are always PARSED, so that a syntax error on the right is
+ * reported either way and d->pos ends up past the whole expression -- but
+ * the right is RUN only when the left has not decided (bash's
+ * execute_cond_node): its operands are not expanded and it prints no
+ * trace. */
 static int shell_dbr_and(struct shell_dbr *d) {
     int v = shell_dbr_not(d);
     for (;;) {
         if (!shell_dbr_is_op(d, d->pos, "&&")) break;
         d->pos++;
-        /* Both sides are still PARSED even when the left is false, so that a
-         * syntax error on the right is reported either way and d->pos ends
-         * up past the whole expression. */
+        bool sk = !v;
+        if (sk) d->skip++;
         int r = shell_dbr_not(d);
+        if (sk) d->skip--;
         v = v && r;
     }
     return v;
@@ -37132,7 +37362,10 @@ static int shell_dbr_or(struct shell_dbr *d) {
     for (;;) {
         if (!shell_dbr_is_op(d, d->pos, "||")) break;
         d->pos++;
+        bool sk = v;
+        if (sk) d->skip++;
         int r = shell_dbr_and(d);
+        if (sk) d->skip--;
         v = v || r;
     }
     return v;
@@ -37265,7 +37498,20 @@ static bool shell_try_dbracket_command(const char *src) {
     }
     bool bad_re = d->bad_re;
     const char *bad_msg = d->msg;
+    bool xerr = d->xerr;
     shell_dbr_free(d);
+    /* AN OPERAND'S EXPANSION FAILED as it was evaluated: reported there;
+     * as above, the line is discarded with status 1 -- unless the
+     * expansion ended the shell itself (`${v?}`). */
+    if (!bad && xerr) {
+        g_bad_subst_soft = false;
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            shell_set_status(1);
+            g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
+        return true;
+    }
     /* A REGEX THAT DOES NOT COMPILE IS STATUS 2, NOT A SYNTAX ERROR:
      * `[[ foo.py =~ * ]]` exits 2 in bash and the script continues. */
     if (!bad && bad_re) {
@@ -37387,6 +37633,8 @@ static bool shell_try_arith_command(const char *src) {
         shell_set_status(1);
         return true;
     }
+    /* the trace: `+ ((  5 + 1  ))`, the expression expanded, blanks kept */
+    if (g_opt_xtrace) shell_xt_arith(xexpr.p ? xexpr.p : "");
 
     /* IT IS ARITHMETIC: bash's parser decided that, and an expression that
      * does not evaluate is an arithmetic error -- "((: 1[2] = 3 : syntax
@@ -37811,7 +38059,10 @@ static bool shell_try_for_command(const char *src) {
          * once per matching file (logs/b13 q33). */
         for (int i = 0; i < g_positional_count; i++) {
             char *saved = 0;
-            if (shell_pipeline_save_word(wl, g_positional[i], &saved) < 0 ||
+            SH_SB(lit);
+            if (sb_put_data_str(&lit, g_positional[i]) < 0 ||
+                shell_escape_glob_range(&lit, 0) < 0 ||
+                shell_pipeline_save_word(wl, lit.p ? lit.p : "", &saved) < 0 ||
                 shell_add_one_arg(wl, items, saved, true) < 0) {
                 shell_pipeline_free(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
@@ -37847,6 +38098,17 @@ static bool shell_try_for_command(const char *src) {
         }
     }
 
+    /* THE TRACE'S HEAD, the list as written: `+ for i in $l` before each
+     * iteration, `+ select x in a b` once -- `"$@"` with no list at all
+     * (xtrace_print_for_command_head; logs/b13 q30 q34). */
+    static const char xt_at[] = "\"$@\"";
+    const char *xt_ws = implicit_at ? xt_at : s;
+    const char *xt_we = implicit_at ? xt_at + sizeof xt_at - 1 : do_at;
+    SH_SB(xt_head);
+    if (sb_puts(&xt_head, is_select ? "select " : "for ") < 0 ||
+        sb_puts(&xt_head, name) < 0 || sb_puts(&xt_head, " in ") < 0)
+        sb_truncate(&xt_head, 0);
+
     int last = 0;
     g_shell_loop_depth++;
     /* bash's line_number while a for or select runs is its head's line
@@ -37862,6 +38124,7 @@ static bool shell_try_for_command(const char *src) {
     if (is_select) {
         /* the head is printed and DEBUG fires once, before the menu */
         shell_bashcmd_set(src, strlen(src), SHPR_SELECT_HEAD);
+        if (g_opt_xtrace && xt_head.p) shell_xt_head(xt_head.p, xt_ws, xt_we, 0);
         shell_run_debug_trap();
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (items->argc == 0) goto done;               /* nothing to offer */
@@ -37918,6 +38181,7 @@ static bool shell_try_for_command(const char *src) {
         /* bash fires DEBUG for the `for` head on EVERY iteration, with the
          * head's line, before the body's own commands fire (1190). */
         shell_bashcmd_set(src, strlen(src), SHPR_FOR_HEAD);
+        if (g_opt_xtrace && xt_head.p) shell_xt_head(xt_head.p, xt_ws, xt_we, 0);
         shell_run_debug_trap();
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (env_set(name, items->argv[i]) < 0) {
@@ -37992,11 +38256,18 @@ done:
  * (1640). bash fires the DEBUG trap once per expression evaluation, with
  * the head's line (1191). break/continue/return and the tail redirection
  * frame behave as in the list form. */
+/* ...and each is traced as it runs -- leading blanks gone, trailing ones
+ * kept, an empty one `1`: `+ (( i = 0  ))`, `+ (( 1 ))` (logs/b13 q34). */
 static bool shell_arith_for_eval(char *expr, long *out) {
     while (*expr == ' ' || *expr == '\t') expr++;
-    if (!*expr) { *out = 1; return true; }
+    if (!*expr) {
+        if (g_opt_xtrace) shell_xt_arith("1");
+        *out = 1;
+        return true;
+    }
     SH_SB(xexpr);
     if (shell_arith_expand(expr, &xexpr) != 0) return false;
+    if (g_opt_xtrace) shell_xt_arith(xexpr.p ? xexpr.p : "");
     /* bash names the command "((" here too */
     return shell_arith_eval(xexpr.p, "((", out) == SARITH_OK;
 }
@@ -38748,6 +39019,10 @@ static bool shell_try_case_command(const char *src) {
     s = shell_skip_blanks(s + 4);
     shell_bashcmd_set(src, strlen(src), SHPR_CASE_HEAD);
     unsigned long case_ln = g_shell_lineno;      /* see g_bash_lnum (p102) */
+    if (g_opt_xtrace) {                /* `+ case $v in`: the word as written */
+        const char *xin = shell_find_word_marker(s, "in");
+        if (xin) shell_xt_head("case ", s, xin, " in");
+    }
     shell_run_debug_trap();            /* the case head fires once (1189) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -41842,21 +42117,13 @@ static void execute_line_text_inner(const char *src) {
              * outside (1194). $LINENO is the command's own line here. */
             for (int s = 0; s < plp->count; s++) shell_run_debug_trap();
             if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
-            if (g_opt_xtrace) {
-                /* BARE, as bash prints it: `+ echo hi`. kprintf in /bin/tsh
-                 * is the DIAGNOSTIC channel, which puts the script and line
-                 * in front -- every trace line read `x.sh: line 2: + echo
-                 * hi`. */
-                kprintf_raw("+ ");
-                for (int s = 0; s < plp->count; s++) {
-                    if (s > 0) kprintf_raw("| ");
-                    for (int a = 0; a < plp->stage[s].argc; a++)
-                        kprintf_raw("%s%s", plp->stage[s].argv[a],
-                                    a + 1 < plp->stage[s].argc ? " " : "");
-                }
-                kprintf_raw("\n");
-            }
+            /* THE TRACE, as bash prints it (shell_xtrace.inc): each stage's
+             * assignments a line each, then its words, quoted as input --
+             * no diagnostic prefix, which kprintf in /bin/tsh would add. */
+            if (g_opt_xtrace)
+                for (int s = 0; s < plp->count; s++) shell_xt_simple(&plp->stage[s]);
             last = shell_run_pipeline(plp, background);
+            shell_xt_decl_flush();
             if (negate) last = last == 0 ? 1 : 0;
             shell_set_status(last);
             if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
