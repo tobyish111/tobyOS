@@ -2020,6 +2020,20 @@ static void shell_jobs_notify(unsigned long line, int how) {
 static void shell_jobs_cleanup(void) {}
 #endif
 
+/* Does TEXT hold a $( ) or a <( ) / >( ) -- not $(( )) -- outside single
+ * quotes? What bash's parser would have to read. */
+static bool shell_text_has_comsub(const char *t) {
+    bool sq = false;
+    for (; t && *t; t++) {
+        if (sq) { if (*t == '\'') sq = false; continue; }
+        if (*t == '\\' && t[1]) { t++; continue; }
+        if (*t == '\'') { sq = true; continue; }
+        if (*t == '$' && t[1] == '(' && t[2] != '(') return true;
+        if ((*t == '<' || *t == '>') && t[1] == '(') return true;
+    }
+    return false;
+}
+
 /* The line a report at the end of a wait names: bash's line_number. */
 static inline unsigned long shell_bash_lnum(void) {
     return g_bash_lnum ? g_bash_lnum : g_shell_lineno;
@@ -26520,6 +26534,12 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (*op == '-' || *op == '=' || *op == '?' || *op == '+') {
             opch = *op++;
             word = op;
+            /* bash parses the WORD as it extracts the ${ }, before it knows
+             * whether the word is used, and its parse of each $( ) or <( )
+             * in it notifies (xparse_dolparen) -- so a job killed before
+             * `echo ${set:-$(cmd)}` is reported there (logs/b13 q6). */
+            if (shell_text_has_comsub(word))
+                shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
         } else if (colon) {
             /* A colon NOT followed by one of - = ? + is a SUBSTRING,
              * not a malformed default. This `else` is where all 31 of
