@@ -29563,6 +29563,7 @@ static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
     return 0;
 }
 static size_t shell_assign_prefix_len(const char *w);
+static size_t shell_assign_prefix_len_raw(const char *w);
 static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
     int ntok = 0;
@@ -29794,7 +29795,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         /* ...and `NAME+=` and `NAME[SUB]=` are assignments too: only
          * `NAME=` counted, so `a[0 + 1]= b[2 + 0]=x` ended the prefix at
          * its first word and ran `b[2` as a command (Oils 0169). */
-        g_tok_word_assign_src = shell_assign_prefix_len(p) > 0;
+        g_tok_word_assign_src = shell_assign_prefix_len_raw(p) > 0;
         g_tok_word_assign_ctx = g_tok_word_assign_src && (prefix_ok || decl_util_cmd);
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
@@ -30641,6 +30642,44 @@ static bool shell_kv_scalar_paren(const char *kv, const char *val) {
 
 /* `NAME=`, `NAME+=`, `NAME[...]=` at the front of `w`: the length up to and
  * including the `=`, or 0. */
+/* The same question of a word AS WRITTEN: inside the subscript a quoted
+ * string, an escaped character and a backquoted command are skipped whole,
+ * as bash's skipsubscript does -- `A[']']=7` is an assignment to the key
+ * `]`. The plain scan ended the subscript at the quoted `]`, called the
+ * word a command, and tsh then ran it as one (shparity 227b). */
+static size_t shell_assign_prefix_len_raw(const char *w) {
+    const char *p = w;
+    if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
+        return 0;
+    while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+           (*p >= '0' && *p <= '9') || *p == '_')
+        p++;
+    if (*p == '[') {
+        int d = 0;
+        for (; *p; p++) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'' || *p == '`') {
+                char q = *p;
+                for (p++; *p && *p != q; p++) {}
+                if (!*p) return 0;
+                continue;
+            }
+            if (*p == '"') {
+                for (p++; *p && *p != '"'; p++)
+                    if (*p == '\\' && p[1]) p++;
+                if (!*p) return 0;
+                continue;
+            }
+            if (*p == '[') d++;
+            else if (*p == ']' && --d == 0) break;
+        }
+        if (*p != ']') return 0;
+        p++;
+    }
+    if (*p == '+') p++;
+    return *p == '=' ? (size_t)(p - w) + 1 : 0;
+}
+
 static size_t shell_assign_prefix_len(const char *w) {
     const char *p = w;
     if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
@@ -32918,8 +32957,8 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         int before = cur->argc;
         /* written as ANY assignment: `NAME=`, `NAME+=`, `NAME[SUB]=` */
         bool asrc = tok[*io].assign_src ||
-            shell_assign_prefix_len(tok[*io].raw ? tok[*io].raw
-                                                 : tok[*io].text) > 0;
+            (tok[*io].raw ? shell_assign_prefix_len_raw(tok[*io].raw)
+                          : shell_assign_prefix_len(tok[*io].text)) > 0;
         if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
                              tok[*io].expanded, asrc) < 0) {
             return -1;
