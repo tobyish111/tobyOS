@@ -944,11 +944,19 @@ int signal_send_to_pid_checked(int pid, int sig) { return kill(pid, sig); }
 int proc_set_pgid(int pid, int pgid) { return setpgid(pid, pgid); }
 
 /* Job-control seams for the monitor-mode foreground path. */
+/* While this is set the shell is parked in a read at its prompt or in the
+ * wait for a foreground command: what `set -b`'s SIGCHLD handler may report
+ * at (see tsh_sigchld). */
+volatile int g_tsh_async_ok;
+
 int proc_wait_fg(int pid, int *stop_sig) {
     int st = 0;
     if (stop_sig) *stop_sig = 0;
     for (int tries = 0; tries < 1000; tries++) {
-        if (waitpid(pid, &st, WUNTRACED) < 0) continue;   /* EINTR retry */
+        g_tsh_async_ok = 1;
+        pid_t r = waitpid(pid, &st, WUNTRACED);
+        g_tsh_async_ok = 0;
+        if (r < 0) continue;                              /* EINTR retry */
         if (WIFSTOPPED(st)) {
             if (stop_sig) *stop_sig = WSTOPSIG(st);
             return 0;
@@ -1079,6 +1087,29 @@ static void tsh_hangup_exit(void) {
     signal(SIGHUP, SIG_DFL);
     kill(getpid(), SIGHUP);
     _exit(128 + SIGHUP);
+}
+
+/* `set -b`: a child that ends or stops is reported at once -- when the
+ * shell is parked at its prompt or in a foreground wait (g_tsh_async_ok),
+ * where nothing it is doing can be disturbed; it is not in the middle of a
+ * malloc there. Installed only while `set -b` is on (tsh_sigchld_arm), with
+ * SA_RESTART, so no other read or wait sees an EINTR it did not expect. */
+extern volatile int g_tsh_async_ok;
+/* The line editor's reads may be reported at too, but not the work it
+ * does between them: lineedit.c sets g_tsh_async_ok around each read(). */
+volatile int g_tsh_le_async;
+extern bool shell_opt_notify_hosted(void);
+extern void shell_async_notify_hosted(void);
+static void tsh_sigchld(int sig) {
+    (void)sig;
+    if (g_tsh_async_ok) shell_async_notify_hosted();
+}
+static void tsh_sigchld_arm(void) {
+    static int armed;
+    int want = shell_opt_notify_hosted();
+    if (want == armed) return;
+    signal(SIGCHLD, want ? tsh_sigchld : SIG_DFL);
+    armed = want;
 }
 
 /* The shell's process group, for `jobs -x` (shell_own_pgrp). */
@@ -1357,6 +1388,7 @@ int main(int argc, char **argv) {
         if (g_tsh_sighup) tsh_hangup_exit();
         /* bash announces finished background jobs right before a prompt. */
         if (!cont) shell_notify_jobs_hosted();
+        if (interactive) tsh_sigchld_arm();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
         ps = shell_decode_prompt_hosted(ps);    /* bash's decode_prompt_string */
@@ -1370,7 +1402,9 @@ int main(int argc, char **argv) {
          * because there is no cursor to move there and putting a non-tty
          * into raw mode would break it. */
         if (!noediting && tsh_lineedit_available()) {
+            g_tsh_le_async = interactive;     /* around its reads alone */
             long r = tsh_readline(ps, &line, &line_cap);
+            g_tsh_le_async = 0;
             if (r == TSH_LE_INTR) {
                 interrupted = 1;
                 n = 0;
@@ -1403,7 +1437,9 @@ int main(int argc, char **argv) {
         if (interactive) write(2, ps, strlen(ps));
         for (;;) {
             char c;
+            g_tsh_async_ok = interactive;
             long r = read(0, &c, 1);
+            g_tsh_async_ok = 0;
             /* ^C while waiting for input: throw the half-typed line away
              * and start a fresh prompt, which is what every shell does.
              * Checked BEFORE the r<=0 EOF arm -- an interrupted read also

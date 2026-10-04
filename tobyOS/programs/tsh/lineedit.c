@@ -129,6 +129,8 @@ static void vi_commit(void) {
 static int g_pushback = -1;
 
 /* One key: -1 at end of input. */
+extern volatile int g_tsh_async_ok, g_tsh_le_async;
+
 static int read_key(void) {
     if (g_pushback >= 0) {
         int k = g_pushback;
@@ -142,7 +144,11 @@ static int read_key(void) {
         return -1;
     }
     char c;
-    if (read(0, &c, 1) <= 0) return -1;
+    /* `set -b` may report a job while this read waits (host.c) */
+    g_tsh_async_ok = g_tsh_le_async;
+    long r = read(0, &c, 1);
+    g_tsh_async_ok = 0;
+    if (r <= 0) return -1;
     rec_key(c);
     return (unsigned char)c;
 }

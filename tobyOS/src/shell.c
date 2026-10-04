@@ -2047,6 +2047,9 @@ static void shell_job_line(struct shell_sb *b, const struct job *j,
         dirstack_polite(j->wd, b);
         (void)sb_putc(b, ')');
     }
+    /* `set -b` at a terminal ends the line with a carriage return too --
+     * the notice may land in the middle of a typed line (print_pipeline) */
+    if (g_opt_notify && shell_reading_user()) (void)sb_putc(b, '\r');
     (void)sb_putc(b, '\n');
 }
 
@@ -2183,6 +2186,22 @@ void shell_notify_jobs_hosted(void) {
             j->seen = true;
         }
     }
+    for (int i = 0; i < JOB_MAX; i++)
+        if (g_jobs[i]->id && g_jobs[i]->dead && g_jobs[i]->notified)
+            jobs_remove(g_jobs[i]);
+}
+#endif
+
+#ifdef SHELL_HOSTED
+/* `set -b`, ASYNCHRONOUS NOTIFICATION (bash's waitchld): at a terminal, a
+ * job that finishes or stops is reported the moment it does -- while the
+ * shell waits at its prompt or for a foreground command, not in the middle
+ * of a builtin -- instead of before the next prompt. host.c's SIGCHLD
+ * handler calls this, and only at those moments. tsh accepted the option
+ * and did nothing with it. */
+bool shell_opt_notify_hosted(void) { return g_opt_notify; }
+void shell_async_notify_hosted(void) {
+    if (g_opt_notify && g_interactive) shell_notify_jobs_hosted();
 }
 #endif
 

@@ -1,0 +1,11 @@
+# `set -b`: a background job's end is reported THE MOMENT it comes -- here
+# while a foreground `sleep 2` runs -- and its line ends in a carriage
+# return as well (bash's asynchronous notification, print_pipeline). tsh
+# accepted -b and did nothing with it.
+set -b
+sleep 1 &
+sleep 2
+echo after
+jobs
+set +b
+exit 0
