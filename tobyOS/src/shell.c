@@ -43367,12 +43367,14 @@ static void shell_hosted_default_vars(void) {
     }
 }
 
-/* A LOGIN SHELL (`-l`, `--login`, or a `-` before the name): bash's
- * set_home_var gives it a HOME from /etc/passwd when it has none, "/" for
- * an unknown user; `shopt login_shell` says so. */
-void shell_set_login_hosted(void) {
+/* A LOGIN SHELL (`-l`, `--login`, or a `-` before the name): `shopt
+ * login_shell` says so; and bash's set_home_var gives it a HOME from
+ * /etc/passwd when it has none, "/" for an unknown user -- only for the
+ * `-` form without -l, where its login_shell is 1 (-l makes it negative):
+ * `env -i bash -l -c 'echo ${HOME-unset}'` is unset (logs/b13 q14). */
+void shell_set_login_hosted(bool set_home) {
     g_shopt_misc[21] = true;
-    if (!env_get("HOME")) {
+    if (set_home && !env_get("HOME")) {
         char home[VFS_PATH_MAX];
         const char *uid = env_get("UID");
         if (!uid || shell_passwd_field(2, uid, strlen(uid), 5, home,

@@ -1004,7 +1004,7 @@ extern void shell_list_options_hosted(bool reinput);
 extern bool shell_shopt_hosted(const char *name, bool on);
 extern void shell_list_shopts_hosted(bool reinput);
 extern void shell_set_invocation_hosted(bool c, bool s);
-extern void shell_set_login_hosted(void);
+extern void shell_set_login_hosted(bool set_home);
 extern void shell_exit_notice_hosted(void);
 extern int  shell_exit_trap_hosted(int status);
 extern bool shell_is_login_hosted(void);
@@ -1220,7 +1220,7 @@ int main(int argc, char **argv) {
     }
     if (o_posix) shell_set_posix_hosted(true);
     int login = o_l ? -1 : (self[0] == '-' ? 1 : 0);
-    if (login) shell_set_login_hosted();
+    if (login) shell_set_login_hosted(login == 1);
 
     for (int r = 0; r < nreq; r++) {
         struct inv_req *q = &reqs[r];
