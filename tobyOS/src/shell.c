@@ -2298,6 +2298,16 @@ static int shell_readonly_mark(const char *key, size_t klen) {
     return 0;
 }
 
+/* The name is not readonly any more (a readonly local has ended). */
+static void shell_readonly_unmark(const char *key, size_t klen) {
+    for (int i = 0; i < g_nreadonly; i++)
+        if (g_readonly[i] && strlen(g_readonly[i]) == klen &&
+            memcmp(g_readonly[i], key, klen) == 0) {
+            kfree(g_readonly[i]);
+            g_readonly[i] = 0;
+        }
+}
+
 static bool shell_key_eq(const char *key, size_t klen, const char *lit) {
     return key && lit && strlen(lit) == klen && memcmp(key, lit, klen) == 0;
 }
@@ -6953,6 +6963,10 @@ struct shell_local_save {
     char *kv;             /* prior "KEY=VALUE" blob, or 0 if it did not exist */
     unsigned char flags;  /* prior flags */
     bool  existed;
+    /* Was the NAME readonly before? A `local -r` (or `declare -r` in a
+     * function) is the local's, and goes with it: bash's readonly is an
+     * attribute of the variable, not of the name. */
+    bool  was_readonly;
 };
 
 static struct shell_local_save *g_locals;
@@ -6995,6 +7009,7 @@ static int shell_locals_push(const char *name, int depth) {
     sv->seq = ++g_scope_seq;
     sv->dead = false;
     sv->owner = tb;
+    sv->was_readonly = shell_readonly_key(name, strlen(name));
 
     size_t klen = strlen(name);
     int idx = env_find(name, klen);
@@ -7081,9 +7096,13 @@ static bool shell_local_declared_here(const char *name, int depth) {
 
 /* Put back the scalar a local hid (the second half of the restore). */
 static void shell_path_var_written(const char *key, size_t klen);
+static void shell_readonly_unmark(const char *key, size_t klen);
 static void shell_local_restore_scalar(const struct shell_local_save *sv) {
     size_t klen = strlen(sv->name);
     shell_path_var_written(sv->name, klen);     /* a local PATH ends */
+    /*     f() { local -r x=1; }; f; x=2; echo $x      bash: 2
+     * tsh: "x: readonly variable" -- the mark outlived the local. */
+    if (!sv->was_readonly) shell_readonly_unmark(sv->name, klen);
     int idx = env_find(sv->name, klen);
     if (sv->existed) {
         char *blob = shell_strdup(sv->kv);
@@ -7319,6 +7338,7 @@ static const char *shell_decl_element_lb(const char *w, size_t nlen) {
     return 0;
 }
 
+static void cmd_declare(int argc, char **argv);
 static void cmd_local(int argc, char **argv) {
     shell_set_status(0);
     /* IN A FUNCTION, not merely in a script. This tested g_script_depth,
@@ -7390,41 +7410,55 @@ static void cmd_local(int argc, char **argv) {
         }
         return;
     }
+    /* THE OPTIONS ARE declare's (bash's local is declare_internal), in a
+     * cluster or apart, `+` to turn one off, up to `--` or the first name:
+     *
+     *     f() { local -x a=1; local -xr h=5; local -l e=ABC; }
+     *         bash: a exported, h exported and readonly, e is "abc"
+     *         tsh:  a and h plain; `-xr' and `-l' "not a valid identifier"
+     *
+     * tsh knew -a -A -i -n -r -x, one per word, and of those dropped -r and
+     * -x; any other word that started with `-` was skipped as if it were
+     * not there (logs/b13 q16 q18). -g, -f and -F are declare's business. */
     bool l_array = false, l_assoc = false, l_nameref = false;
-    unsigned l_attr_on = 0;
-    for (int i = 1; i < argc; i++) {
-        /* Attribute flags. `local -a g=(p q)` is ordinary bash; treating the
-         * flag as a variable NAME produced "local: bad name '-a'" and left
-         * the array unscoped.
-         *
-         * The old comment here said the flag only had to be SKIPPED, on the
-         * grounds that the assignment carries the attribute -- an array
-         * literal makes an array. That stopped being true for `local -a x`
-         * with NO value: nothing downstream could then tell a declared-empty
-         * ARRAY from an empty scalar, and `"${x[@]}"` interpolated one
-         * empty word where bash interpolates none. The flag is recorded
-         * now, exactly as declare records it. */
-        /* `-n` MAKES A NAMEREF, and `local -n` is how almost every real
-         * use of the feature is written:
-         *
-         *     show() { local -n r=$1; echo "${r[2]}"; }
-         *     a=(ga bu zo meu); show a            bash: zo
-         *
-         * declare and typeset took the flag; local did not, so it fell
-         * through to the name check and said "local: bad name '-n'".
-         * The reference was never created, which is why every nameref
-         * case that went through a function read empty. */
-        if (argv[i][0] == '-' && argv[i][1] &&
-            (argv[i][1] == 'a' || argv[i][1] == 'A' || argv[i][1] == 'i' ||
-             argv[i][1] == 'r' || argv[i][1] == 'x' ||
-             argv[i][1] == 'n') && !argv[i][2]) {
-            if (argv[i][1] == 'a') l_array = true;
-            if (argv[i][1] == 'A') { l_array = true; l_assoc = true; }
-            if (argv[i][1] == 'n') l_nameref = true;
-            if (argv[i][1] == 'i') l_attr_on |= SHVAR_INTEGER;
-            continue;
+    bool l_export = false, l_unexport = false, l_readonly = false;
+    unsigned l_attr_on = 0, l_attr_off = 0;
+    int first = 1;
+    for (; first < argc; first++) {
+        char sign = argv[first][0];
+        if ((sign != '-' && sign != '+') || argv[first][1] == '\0') break;
+        if (sign == '-' && argv[first][1] == '-' && argv[first][2] == '\0') {
+            first++;
+            break;
         }
-        if (argv[i][0] == '-' && argv[i][1] && !env_key_len(argv[i])) continue;
+        bool on = sign == '-';
+        for (const char *f = argv[first] + 1; *f; f++) {
+            switch (*f) {
+            case 'a': if (on) l_array = true; break;
+            case 'A': if (on) { l_array = true; l_assoc = true; } break;
+            case 'n': if (on) l_nameref = true; break;
+            case 'i': if (on) l_attr_on |= SHVAR_INTEGER; else l_attr_off |= SHVAR_INTEGER; break;
+            case 'l': if (on) l_attr_on |= SHVAR_LOWER;   else l_attr_off |= SHVAR_LOWER;   break;
+            case 'u': if (on) l_attr_on |= SHVAR_UPPER;   else l_attr_off |= SHVAR_UPPER;   break;
+            case 'x': if (on) l_export = true; else l_unexport = true; break;
+            case 'r': if (on) l_readonly = true; break;
+            case 'p': case 't': case 'I': break;
+            case 'g': case 'f': case 'F': {
+                char *a0 = argv[0];
+                argv[0] = (char *)"local";
+                cmd_declare(argc, argv);
+                argv[0] = a0;
+                return;
+            }
+            default:
+                kprintf("local: %c%c: invalid option\n", sign, *f);
+                kprintf_raw("local: usage: local [option] name[=value] ...\n");
+                shell_set_status(2);
+                return;
+            }
+        }
+    }
+    for (int i = first; i < argc; i++) {
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
         bool l_append = has_value && klen > 1 && argv[i][klen - 1] == '+';
@@ -7512,13 +7546,13 @@ static void cmd_local(int argc, char **argv) {
             int pre = env_find(name, klen);
             if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
         }
-        if (l_attr_on) {
+        if (l_attr_on || l_attr_off) {
             /* a fresh local takes the attribute before its value */
-            if (!already && !inherit) {
+            if (!already && !inherit && l_attr_on) {
                 int ox = env_find(name, klen);
                 if (ox >= 0 && !has_value) env_remove_at(ox);
             }
-            shell_decl_attrs(name, l_attr_on, 0, l_array);
+            shell_decl_attrs(name, l_attr_on, l_attr_off, l_array);
         }
         if (has_value) {
             g_decl_paren_array = l_array || sh_array_find(name) != 0;
@@ -7543,6 +7577,16 @@ static void cmd_local(int argc, char **argv) {
             int nidx = env_find(name, strlen(name));
             if (nidx >= 0) g_env_flags[nidx] |= SHVAR_NAMEREF;
         }
+        if (l_export || l_unexport) {
+            if (!env_get(name) && env_find(name, klen) < 0)
+                (void)env_set_attr_holder(name);
+            int xi = env_find(name, klen);
+            if (xi >= 0) {
+                if (l_export) g_env_flags[xi] |= SHVAR_EXPORTED;
+                else g_env_flags[xi] &= ~(unsigned char)SHVAR_EXPORTED;
+            }
+        }
+        if (l_readonly) (void)shell_readonly_mark(name, klen);
     }
 }
 
