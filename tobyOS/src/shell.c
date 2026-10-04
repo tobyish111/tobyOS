@@ -483,6 +483,27 @@ static int g_last_bg_pid;
 /* Set in a background child whose text is ONE simple command: the external
  * it runs may REPLACE this process rather than be spawned and waited on. */
 static bool g_bg_exec_ok;
+/* BASH'S ONESHOT. The last command of a `-c` string, of a `( )` or of a
+ * `$( )` is EXEC'D, not forked, when it is a simple command with no
+ * redirection that is not timed, not inverted and not run under a trap --
+ * and SHLVL goes down by one for it, as for `exec`:
+ *
+ *     env -i bash -c 'cd /tmp; env'      PWD=/tmp SHLVL=0 _=/bin/env
+ *     bash -c 'sh -c "echo \$PPID"'      bash's parent: bash is gone
+ *
+ * tsh spawned and waited, SHLVL=1 (logs/b13 q13 q15 q21). The script reader
+ * marks the last unit of such a text (g_reader_nofork_scope), the list
+ * runner passes the mark to the list's last command, and the line that
+ * takes it (g_nofork_gen) execs its command if nothing ran in between --
+ * see shell_nofork_here. */
+static bool g_reader_nofork_scope;   /* the next script reader's text is one */
+static bool g_nofork_pending;        /* the next line to start is the last */
+static unsigned long g_line_gen;     /* execute_line_text_inner entries */
+static unsigned long g_nofork_gen;   /* ...the one whose command may exec */
+/* May this process REPLACE itself? The main /bin/tsh and a forked child
+ * may; a subshell running in place may not -- it would take its parent
+ * with it -- and neither may the kernel shell. */
+static bool g_replace_ok;
 static int g_getopts_last_optind;
 static int g_getopts_char_index;
 static bool g_getopts_internal_optind_write;
@@ -1237,6 +1258,24 @@ static char *g_traps[SHELL_TRAP_LAST + 1];
  * An IGNORED trap stays in force. A slot with g_trap_shown set is listed
  * and never run -- shell_trap_live() is what every runner asks. */
 static bool g_trap_shown[SHELL_TRAP_LAST + 1];
+
+/* A trap with an action stops the ONESHOT exec (bash's should_optimize_fork:
+ * EXIT, ERR or any signal trapped); an ignored one (`trap '' INT`) does
+ * not, and neither do DEBUG and RETURN. */
+static bool shell_traps_block_nofork(void) {
+    for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
+        if (i == SHELL_TRAP_DEBUG || i == SHELL_TRAP_RETURN) continue;
+        if (g_traps[i] && g_traps[i][0]) return true;
+    }
+    return false;
+}
+
+/* Is the command being run the last one of a ONESHOT text, with nothing run
+ * since its line started? (See g_reader_nofork_scope.) */
+static bool shell_nofork_here(void) {
+    return g_nofork_gen != 0 && g_nofork_gen == g_line_gen &&
+           !shell_traps_block_nofork();
+}
 static const char *shell_trap_live(int i) {
     if (i < 0 || i > SHELL_TRAP_LAST || g_trap_shown[i]) return 0;
     return g_traps[i];
@@ -4197,6 +4236,35 @@ static void shell_set_if_not(const char *name, const char *val) {
     if (!env_get(name)) (void)env_set(name, val);
 }
 
+/* bash's adjust_shell_level: SHLVL by CHANGE -- a value that is not a
+ * number counts as 0, the result is never below 0 -- and exported. */
+static void shell_adjust_shlvl(int change) {
+    const char *old = env_get("SHLVL");
+    long lv = 0;
+    if (old) {
+        const char *q = old;
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        bool neg = false;
+        if (*q == '-' || *q == '+') neg = *q++ == '-';
+        bool any = false;
+        long v = 0;
+        while (*q >= '0' && *q <= '9') {
+            if (v < 100000000) v = v * 10 + (*q - '0');
+            q++;
+            any = true;
+        }
+        while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+        if (any && !*q) lv = neg ? -v : v;
+    }
+    lv += change;
+    if (lv < 0) lv = 0;
+    else if (lv >= 1000) lv = 1;
+    char b[24];
+    ksnprintf(b, sizeof b, "%ld", lv);
+    (void)env_set("SHLVL", b);
+    shell_mark_exported("SHLVL");
+}
+
 static void shell_callstack_sync(void);
 
 static void shell_init_bash_vars(const char *self) {
@@ -4272,11 +4340,23 @@ static void env_init_defaults(void) {
         if (g_readonly[i]) kfree(g_readonly[i]);
         g_readonly[i] = 0;
     }
+    /* THE KERNEL SHELL'S DEFAULTS. /bin/tsh takes bash's instead, once it
+     * has its environment (shell_hosted_default_vars): bash invents no HOME
+     * or USER and exports no PATH or SHELL --
+     *
+     *     env -i bash -c env       PWD SHLVL _
+     *     env -i tsh -c env        PATH HOME=/ USER=admin PWD SHELL=tobysh SHLVL
+     *
+     * (logs/b13 q13 q14). */
+#ifndef SHELL_HOSTED
     if (env_set("PATH",  "/bin")    < 0) kprintf("env: default PATH set failed\n");
     if (env_set("HOME",  "/")       < 0) kprintf("env: default HOME set failed\n");
     if (env_set("USER",  "admin")   < 0) kprintf("env: default USER set failed\n");
+#endif
     if (env_set("PWD",   "/")       < 0) kprintf("env: default PWD set failed\n");
+#ifndef SHELL_HOSTED
     if (env_set("SHELL", "tobysh")  < 0) kprintf("env: default SHELL set failed\n");
+#endif
     if (env_set("OPTIND", "1")      < 0) kprintf("env: default OPTIND set failed\n");
     {
         /* `declare -i OPTIND="1"`, as bash's is (logs/b12 p85) */
@@ -4301,8 +4381,12 @@ static void env_init_defaults(void) {
      * keeps them out of the child environment unless asked. Before the export
      * flag existed the distinction could not be expressed and all seven were
      * shipped to every child. */
+#ifndef SHELL_HOSTED
     static const char *const exported[] = { "PATH", "HOME", "USER", "PWD",
                                             "SHELL", 0 };
+#else
+    static const char *const exported[] = { "PWD", 0 };
+#endif
     for (int e = 0; exported[e]; e++) {
         int idx = env_find(exported[e], strlen(exported[e]));
         if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
@@ -10745,6 +10829,7 @@ static void cmd_modules(int argc, char **argv) {
 /* Forward decls: shared spawn helper used by both `run` and the
  * implicit-ELF dispatch path below, and the program-name resolver
  * (whose definition lives down in the pipeline section). */
+static bool g_spawn_put_command_name;      /* see its definition */
 static void        shell_spawn_program(const char *path, int argc, char **argv,
                                        bool background);
 static void        shell_spawn_program_profile(const char *path, int argc,
@@ -15927,6 +16012,8 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
     bool syn_base_set = g_reader_syn_base_set;
     unsigned long syn_base = g_reader_syn_base;
     bool comsub_lines = g_reader_comsub_lines;
+    bool nofork_scope = g_reader_nofork_scope;
+    g_reader_nofork_scope = false;
     g_reader_syn_iname = 0;
     g_reader_syn_string = false;
     g_reader_syn_repl = false;
@@ -16456,7 +16543,11 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             const char *ex = shell_expand_aliases(line, &abuf);
             execute_line_text(ex ? ex : line);
         } else {
+            /* the text's LAST unit: nothing at all after it, not even a
+             * blank line (bash: *bash_input.location.string == '\0') */
+            g_nofork_pending = nofork_scope && *p == '\0';
             execute_line_text(line);
+            g_nofork_pending = false;
         }
         /* bash notifies as it reads the NEXT line (parse.y shell_getc:
          * line_number++, then notify_and_cleanup), so a report names that
@@ -17532,6 +17623,10 @@ eval_done:
  * cannot find "exec: NAME: not found" (S10). */
 static const char *g_spawn_for;
 
+/* `( )` subshells running now: `exec` leaves SHLVL alone in one (bash's
+ * SUBSHELL_PAREN test). */
+static int g_paren_depth;
+
 static void cmd_exec(int argc, char **argv) {
     shell_set_status(0);
     /* `--` ends exec's options, as for every builtin: `exec -- ls` runs ls,
@@ -17565,6 +17660,7 @@ static void cmd_exec(int argc, char **argv) {
     }
 }
 
+static bool shell_cur_cmd_redirected(void);
 static void cmd_command(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 2) return;
@@ -17706,10 +17802,24 @@ static void cmd_command(int argc, char **argv) {
         SH_SB(found_at);
         bool okp = cmd_res_is_file(how) && rp && sb_puts(&found_at, rp) == 0;
         COMMAND_P_RESTORE();
+        g_spawn_put_command_name = true;
+        if (shell_nofork_here() && !shell_cur_cmd_redirected()) {
+            shell_adjust_shlvl(-1);
+            if (g_replace_ok) g_bg_exec_ok = true;
+        }
         shell_spawn_program_profile(okp ? found_at.p : argv[i], argc - i,
                                     &argv[i], /*background=*/false,
                                     /*profile=*/0);
         return;
+    }
+    /* a program run by `command` is an ordinary command: it gets `_`
+     * (bash: execute_disk_command; logs/b13 q15) -- and is a ONESHOT one
+     * as the command it stands for would be (bash runs `command`'s words
+     * in place of it) */
+    g_spawn_put_command_name = true;
+    if (shell_nofork_here() && !shell_cur_cmd_redirected()) {
+        shell_adjust_shlvl(-1);
+        if (g_replace_ok) g_bg_exec_ok = true;
     }
     shell_spawn_program_profile(argv[i], argc - i, &argv[i],
                                 /*background=*/false, /*profile=*/0);
@@ -22889,6 +22999,12 @@ static void shell_subshell_frame_close(struct shell_subshell_frame *frame);
 extern int  fork(void);
 extern void _exit(int status);
 void shell_host_builtin_done(void);              /* host.c: flush stdout */
+/* fork(), and the child knows it may replace itself (g_replace_ok) */
+static int shell_fork(void) {
+    int pid = fork();
+    if (pid == 0) g_replace_ok = true;
+    return pid;
+}
 #endif
 static void shell_file_output(const char *s, void *ctx);
 
@@ -22899,6 +23015,8 @@ static void shell_capture_body(const char *cmd, bool forked) {
 #ifndef SHELL_HOSTED
     (void)forked;
 #endif
+    bool saved_replace = g_replace_ok;
+    if (!forked) g_replace_ok = false;
     int saved_status = g_last_status;
     bool saved_parse_error = g_parse_error;
     bool saved_syntax_fatal = g_syntax_fatal;
@@ -22977,7 +23095,9 @@ static void shell_capture_body(const char *cmd, bool forked) {
                                        g_shell_lineno ? g_shell_lineno - 1 : 0, false,
                                        &cs_checked)) {
                 if (cs_checked) g_syn_checked++;
+                g_nofork_pending = true;        /* a ONESHOT text, as -c is */
                 execute_line_text(line);
+                g_nofork_pending = false;
                 if (cs_checked) g_syn_checked--;
             }
         } else {
@@ -22991,6 +23111,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
                 g_reader_syn_base_set = true;
                 g_reader_syn_base = g_shell_lineno ? g_shell_lineno - 1 : 0;
                 g_reader_comsub_lines = true;
+                g_reader_nofork_scope = true;
                 (void)shell_run_script_text(copy, false);
                 kfree(copy);
             } else {
@@ -23058,6 +23179,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
         g_shell_flow = keep_flow;
         g_shell_flow_status = keep_flow_status;
     }
+    g_replace_ok = saved_replace;
 }
 
 #ifdef SHELL_HOSTED
@@ -23081,7 +23203,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
 static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
     struct file *r = 0, *w = 0;
     if (pipe_create(&r, &w) != 0) return -2;
-    int pid = fork();
+    int pid = shell_fork();
     if (pid < 0) {
         file_close(r);
         file_close(w);
@@ -27449,7 +27571,7 @@ static bool shell_procsub_make(const char *text, bool input,
 
     /* parsed again as it is expanded, as a $( ) is: bash notifies (p99) */
     shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
-    int pid = fork();
+    int pid = shell_fork();
     if (pid == 0) {
         g_jobs_silent = true;
         /* The child IS the command. It must not keep the end the shell kept:
@@ -29592,6 +29714,11 @@ static int shell_simple_argv_room(struct shell_simple *s) {
     s->argv = na;
     s->argv_cap = ncap;
     return 0;
+}
+
+/* Does the simple command running now carry a redirection? */
+static bool shell_cur_cmd_redirected(void) {
+    return g_assign_cmd && g_assign_cmd->redir_count > 0;
 }
 
 static bool shell_simple_noassign(const struct shell_simple *s, int i) {
@@ -33834,7 +33961,7 @@ static int shell_background_forked(const char *text, const char *label) {
 
 static int shell_background_forked_as(const char *text, const char *label,
                                       const char *shown) {
-    int pid = fork();
+    int pid = shell_fork();
     if (pid < 0) {
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
         return 1;
@@ -34109,6 +34236,17 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
                     exec_cmd.argv[0], is_fn ? "shell functions" : "builtins");
             return 1;
 #endif
+        }
+    }
+
+    /* A ONESHOT command (shell_nofork_here) or an async child's one command
+     * REPLACES the process, and SHLVL is one less for it -- bash's
+     * adjust_shell_level(-1) in execute_disk_command. */
+    {
+        bool nofork = !background && cmd->redir_count == 0 && shell_nofork_here();
+        if (nofork || (g_bg_exec_ok && !background)) {
+            shell_adjust_shlvl(-1);
+            if (nofork && g_replace_ok) g_bg_exec_ok = true;
         }
     }
 
@@ -34585,7 +34723,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
          * variables, which is the thing lastpipe exists to turn ON. */
         if ((i + 1 < pl->count || !g_shopt_lastpipe) &&
             shell_stage_is_builtin(&pl->stage[i])) {
-            int fpid = fork();
+            int fpid = shell_fork();
             if (fpid == 0) {
                 g_in_pipeline_stage = true;
 #ifdef SHELL_HOSTED
@@ -38666,7 +38804,7 @@ static bool shell_try_subshell_command(const char *src) {
     bool forked_child = false;
 #ifdef SHELL_HOSTED
     if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
-        int pid = fork();
+        int pid = shell_fork();
         if (pid > 0) {
             int rc = proc_wait(pid);
             if (rc < 0) rc = 1;
@@ -38740,7 +38878,19 @@ static bool shell_try_subshell_command(const char *src) {
      * line the ( opened on (`( eval '...' )` numbered eval's body from
      * there: 54 where bash says 56, shparity 120). */
     shell_lmap_push_copy(body, body_start);
-    execute_line_text(body);
+    {
+        /* bash's optimize_subshell_command: the body's last command execs
+         * -- in a subshell of its own; one that runs in place must not
+         * replace this process */
+        bool saved_replace = g_replace_ok;
+        if (!forked_child) g_replace_ok = false;
+        g_nofork_pending = true;
+        g_paren_depth++;
+        execute_line_text(body);
+        g_paren_depth--;
+        g_nofork_pending = false;
+        g_replace_ok = saved_replace;
+    }
     shell_lmap_pop_copy();
     /* THE COUNTER BELONGS TO THE READER. Leaving it on the body's
      * line made every line after the compound short by the number
@@ -39011,6 +39161,40 @@ static bool shell_run_list_line(const char *src) {
     int oplen = 0;
     if (!shell_find_list_sep(src, &link, &oplen)) return false;
 
+    /* A ONESHOT line's last command execs (g_nofork_pending) when bash's
+     * tree has it as the list's last element: after a `;` or the line's
+     * first, or after `&&`/`||` with no `;` before it -- `a; b && env` is
+     * `a ; (b && env)`, whose last element is not simple (logs/b13 q21).
+     * A `;` with nothing after it ends the line and separates nothing. */
+    int nofork_piece = -1;
+    if (g_nofork_gen != 0 && g_nofork_gen == g_line_gen) {
+        const char *c2 = src;
+        enum shell_list_link pv = SH_LINK_SEMI, last_prev = SH_LINK_SEMI;
+        bool semi_seen = false, semi_before = false;
+        int idx = 0, last = -1;
+        for (;;) {
+            enum shell_list_link lk = SH_LINK_SEMI;
+            int ol = 0;
+            const char *sp = shell_find_list_sep(c2, &lk, &ol);
+            const char *en = sp ? sp : c2 + strlen(c2);
+            bool blank = true;
+            for (const char *q = c2; q < en; q++)
+                if (*q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') {
+                    blank = false;
+                    break;
+                }
+            if (!blank) { last = idx; last_prev = pv; semi_before = semi_seen; }
+            if (!sp) break;
+            if (!blank && lk == SH_LINK_SEMI) semi_seen = true;
+            pv = lk;
+            idx++;
+            c2 = sp + ol;
+        }
+        if (last >= 0 && (last_prev == SH_LINK_SEMI || !semi_before))
+            nofork_piece = last;
+    }
+    int piece = 0;
+
     const char *cur = src;
     enum shell_list_link prev = SH_LINK_SEMI;
     for (;;) {
@@ -39053,7 +39237,9 @@ static bool shell_run_list_line(const char *src) {
                 g_status_exempt = false;
                 if (exempt) g_errexit_suspend++;
                 shell_lmap_push_copy(seg, cur);
+                g_nofork_pending = piece == nofork_piece;
                 execute_line_text(seg);
+                g_nofork_pending = false;
                 shell_lmap_pop_copy();
                 if (exempt) g_errexit_suspend--;
                 /* Remember that this failure was exempt, so a COMPOUND that
@@ -39067,6 +39253,7 @@ static bool shell_run_list_line(const char *src) {
         if (!sep) break;
         prev = link;
         cur = sep + oplen;
+        piece++;
     }
     return true;
 }
@@ -39536,7 +39723,7 @@ static bool shell_try_compound_pipeline(const char *src) {
          * backquote" once the stages stopped being this process. */
         if (!bg_tail && g_heredoc_head >= g_heredoc_count &&
             g_capture_depth == 0 &&
-            (i + 1 < n || !g_shopt_lastpipe)) fpid = fork();
+            (i + 1 < n || !g_shopt_lastpipe)) fpid = shell_fork();
         if (fpid == 0) {
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
@@ -39945,7 +40132,7 @@ static bool shell_try_coproc(const char *src) {
         shell_set_status(1);
         return true;
     }
-    int pid = fork();
+    int pid = shell_fork();
     if (pid < 0) {
         file_close(rr); file_close(rw); file_close(wr); file_close(ww);
         kprintf("coproc: cannot fork\n");
@@ -40111,6 +40298,13 @@ static void shell_time_report(bool posix_fmt, uint64_t real_us,
 }
 
 static void execute_line_text_inner(const char *src) {
+    {
+        unsigned long gen = ++g_line_gen;
+        if (g_nofork_pending) {
+            g_nofork_pending = false;
+            g_nofork_gen = gen;
+        }
+    }
     struct shell_token *tok = 0;
     SH_WORDS(words);
     int ntok = 0;
@@ -41633,6 +41827,9 @@ void shell_init_hosted(const char *argv0) {
     for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
     g_shell_start_secs = shell_wall_secs();
+#ifdef SHELL_HOSTED
+    g_replace_ok = true;            /* /bin/tsh is a process of its own */
+#endif
 
     /* ADOPT THE DESCRIPTORS WE WERE GIVEN.
      *
@@ -41865,6 +42062,7 @@ int shell_run_line_hosted(const char *text) {
     g_reader_syn_string = true;
     if (g_interactive) g_reader_syn_repl = true;
     else g_reader_syn_iname = "-c";
+    if (!g_interactive) g_reader_nofork_scope = true;   /* bash's ONESHOT */
     int rc = shell_run_script_text(copy, true);
     kfree(copy);
     if (g_interactive && g_parse_error && g_shell_flow == SHELL_FLOW_EXIT) {
