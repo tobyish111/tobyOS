@@ -20995,11 +20995,17 @@ static bool phash_remove(const char *name) {
 /* `.` (or an empty entry) came before the directory it was found in. */
 #define PHASH_CHKDOT 1
 
+/* bash makes its table at the first insert and keeps it (phash_insert's
+ * hash_create); before that, `hash -d NAME` has nothing to report: success,
+ * silently (phash_remove; logs/b13 q54). */
+static bool g_phash_made;
+
 static void phash_insert(const char *name, const char *path, int hits,
                          bool chkdot) {
     if (!g_opt_hashall) return;
     char *p = shell_strdup(path);
     if (!p) return;
+    g_phash_made = true;
     bool created;
     int i = sh_htab_insert(&g_phash, name, &created);
     if (i < 0) { kfree(p); return; }
@@ -21305,7 +21311,7 @@ static void cmd_hash(int argc, char **argv) {
             continue;
         }
         if (del) {
-            if (!phash_remove(w)) {
+            if (!phash_remove(w) && g_phash_made) {
                 kprintf("hash: %s: not found\n", w);
                 rc = 1;
             }
