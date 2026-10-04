@@ -421,9 +421,13 @@ int pipe_create(struct file **out_r, struct file **out_w) {
     return 0;
 }
 
-/* The kernel hands out a console handle; here stdout already is one. */
+/* The kernel hands out a console handle; here the shell's own STDIN is the
+ * one: shell.c asks for it only as the input of `read` and `mapfile` when
+ * nothing redirected theirs. It was fd 1 -- which a terminal also reads,
+ * so every interactive test passed, while `echo ab | tsh -c 'read x'` and
+ * `tsh -c 'read x' < file` read nothing at all (logs/b13 q56 q57). */
 struct file *console_file_make(void) {
-    struct file *f = hf_make(1);
+    struct file *f = hf_make(0);
     if (f) f->vfs.size = VF_UNSEEKABLE;
     return f;
 }
