@@ -36296,6 +36296,50 @@ static bool shell_text_stdin_redirected(const char *s) {
     return false;
 }
 
+/* DOES A FORKED CHILD RUN THE EXIT TRAP IT SET, as it ends? bash's forked
+ * subshells end in subshell_exit (which runs it) or sh_exit (which does
+ * not), by what the child runs (execute_command_internal; measured on the
+ * guest and on Linux, logs/b14 r8 r9 r10):
+ *   - a simple command -- a function or builtin forked as an async command
+ *     or as any pipeline element: yes;
+ *   - a ( ) subshell: yes, it runs its own;
+ *   - a { } group: yes when it is asynchronous on its own, or an element of
+ *     a FOREGROUND pipeline; not as an element of an asynchronous one;
+ *   - if, for, while, until, case, select, and an and-or list: no.
+ * ASYNC and PIPED say how the child was started. */
+static bool shell_child_runs_exit_trap(const char *text, bool async, bool piped) {
+    const char *t = shell_skip_blanks(text);
+    {
+        /* an and-or list (or a `;` list) is no command of its own */
+        struct shell_scan sc;
+        shell_scan_init(&sc);
+        for (const char *p = t; *p; ) {
+            while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+            if (!*p) break;
+            if (!shell_scan_incomplete(&sc) &&
+                ((p[0] == '&' && p[1] == '&') || (p[0] == '|' && p[1] == '|') ||
+                 p[0] == ';'))
+                return false;
+            const char *before = p;
+            shell_scan_token(&sc, &p);
+            if (p <= before) p = before + 1;
+        }
+    }
+    if (t[0] == '(' && t[1] != '(') return true;
+    if (t[0] == '{' && (t[1] == ' ' || t[1] == '\t' || t[1] == '\n'))
+        return async ? !piped : piped;
+    static const char *const kw[] = { "if", "for", "while", "until", "case",
+                                      "select", "[[", "((", 0 };
+    for (int k = 0; kw[k]; k++) {
+        size_t l = strlen(kw[k]);
+        if (strncmp(t, kw[k], l) == 0 &&
+            (t[l] == ' ' || t[l] == '\t' || t[l] == '\n' || t[l] == '\0' ||
+             (kw[k][0] == '(' )))
+            return false;
+    }
+    return true;
+}
+
 /* AN ASYNCHRONOUS PIPELINE IS A JOB OF ONE PROCESS AN ELEMENT, every one a
  * child of the shell -- bash's execute_pipeline forks each element from
  * the shell, all into one process group (the first element's) under job
@@ -36424,7 +36468,8 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             execute_line_text(stages[i]);
             int st = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
-            st = shell_run_exit_trap(st);
+            if (shell_child_runs_exit_trap(stages[i], true, true))
+                st = shell_run_exit_trap(st);
             shell_host_builtin_done();
             _exit(st & 0xff);
         }
@@ -36562,12 +36607,14 @@ static int shell_background_forked_as(const char *text, const char *label,
         execute_line_text(text);
         int st = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
-        /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS, as a ( )'s does: `{
+        /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
          * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
-         * one print bye in bash; this child just exited (logs/b14 r1). The
-         * parent's own traps were cleared above, so only one set here
-         * runs. And what it wrote goes out before it does. */
-        st = shell_run_exit_trap(st);
+         * one print bye in bash; an async `for` or and-or list does not
+         * (shell_child_runs_exit_trap; logs/b14 r1 r10). The parent's own
+         * traps were cleared above, so only one set here runs. And what
+         * it wrote goes out before it does. */
+        if (shell_child_runs_exit_trap(text, true, false))
+            st = shell_run_exit_trap(st);
         shell_host_builtin_done();
         _exit(st & 0xff);
     }
@@ -42634,6 +42681,11 @@ static bool shell_try_compound_pipeline(const char *src) {
             shell_lmap_pop_copy();
             int crc = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
+            /* a function or a { } as a stage runs the EXIT trap it set;
+             * a loop or an if does not (logs/b14 r8 r10) */
+            if (shell_child_runs_exit_trap(stages[i], false, true))
+                crc = shell_run_exit_trap(crc);
+            shell_host_builtin_done();
             _exit(crc & 0xff);
         }
         if (fpid > 0) {
