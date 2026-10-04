@@ -7,7 +7,16 @@
 cd "$(dirname "$0")/../.." || exit 1
 OUT=$1; F=$2
 n=$(basename "$F")
-bash logs/edremote.sh "mkdir -p /tmp/pr; cat > /tmp/pr/$n" < "$F" >/dev/null 2>&1
+# The upload is checked: a session that drops its stdin (the first ones
+# after /bin/tsh is replaced, now and then) left NO file, and both shells
+# then said "No such file" -- two identical outputs (batch 13, q57).
+want=$(md5sum < "$F" | cut -c1-32)
+for t in 1 2 3 4 5; do
+  bash logs/edremote.sh "mkdir -p /tmp/pr; cat > /tmp/pr/$n" < "$F" >/dev/null 2>&1
+  got=$(bash logs/edremote.sh "md5sum < /tmp/pr/$n" 2>/dev/null | tr -d '' | cut -c1-32)
+  [ "$got" = "$want" ] && break
+done
+[ "$got" = "$want" ] || { echo "$n NORESULT (upload failed)"; exit 3; }
 mkdir -p "$(dirname "$OUT")"
 for sh in bash tsh; do
   b=$(basename "$sh")
