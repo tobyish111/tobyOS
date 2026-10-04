@@ -1048,7 +1048,13 @@ static bool g_opt_keyword;
 static bool g_opt_onecmd;
 static bool g_opt_physical;
 static bool g_opt_privileged;
+/* THE RESTRICTED SHELL (bash -r, --restricted, `rbash`, `set -r`): no cd,
+ * no `/` in a command name or in `.`'s or `hash -p`'s file, no output
+ * redirection, no `exec CMD` or `command -p`, and PATH SHELL ENV BASH_ENV
+ * HISTFILE are readonly -- once the startup files have run. It cannot be
+ * turned off (logs/b13 q28). tsh had none of it. */
 static bool g_restricted;
+static void shell_make_restricted(void);
 static void sh_builtin_usage(const char *name);
 /* `set -o history`: record the lines the shell reads. On at a terminal, off
  * in a script and for -c, as in bash -- shell_set_interactive_hosted. It was
@@ -8170,8 +8176,12 @@ static void cmd_export(int argc, char **argv) {
             continue;
         }
         if (argv[i][klen] == '=') {
+            g_readonly_hit = false;
             if (env_set_kv(argv[i]) < 0) {
-                kprintf("export: failed to set '%s'\n", argv[i]);
+                /* a readonly name has said so in bash's words already --
+                 * "PATH: readonly variable" -- and that is all bash says */
+                if (!g_readonly_hit)
+                    kprintf("export: failed to set '%s'\n", argv[i]);
                 shell_set_status(1);
                 continue;
             }
@@ -9396,6 +9406,25 @@ static bool shell_option_is_set(const char *name) {
     return name && shell_opt_state_by_name(name, &on) && on;
 }
 
+/* bash's maybe_make_restricted: the variables a restricted shell may not
+ * change are made readonly -- declared when unset (`declare -r ENV`) --
+ * and the mode is on for good. */
+static void shell_make_restricted(void) {
+    static const char *const ro[] = { "PATH", "SHELL", "ENV", "BASH_ENV",
+                                      "HISTFILE", 0 };
+    g_restricted = true;
+    g_shopt_misc[24] = true;                    /* shopt restricted_shell */
+    for (int k = 0; ro[k]; k++) {
+        size_t l = strlen(ro[k]);
+        if (env_find(ro[k], l) < 0) (void)env_set_attr_holder(ro[k]);
+        (void)shell_readonly_mark(ro[k], l);
+    }
+}
+
+#ifdef SHELL_HOSTED
+void shell_make_restricted_hosted(void) { shell_make_restricted(); }
+#endif
+
 /* $-: bash's which_set_flags -- the set flags in its table's order, `i`
  * for an interactive shell, then `c` for -c and `s` for commands read from
  * standard input. */
@@ -9622,10 +9651,16 @@ static void cmd_set_in(int argc, char **argv) {
             first = i + 1;
             continue;
         }
+        /* A flag set does not have is bash's usage error: "set: -z: invalid
+         * option" and the usage line, status 2 -- tsh said "unknown flag
+         * '-z'". `set -r` makes the shell restricted; `set +r` is not an
+         * option at all (logs/b13 q25 q28). */
         if (argv[i][0] == '-' && argv[i][1] != '\0') {
             for (const char *f = argv[i] + 1; *f; f++) {
+                if (*f == 'r') { shell_make_restricted(); continue; }
                 if (!shell_set_opt(*f, true)) {
-                    kprintf("set: unknown flag '-%c'\n", *f);
+                    kprintf("set: -%c: invalid option\n", *f);
+                    sh_builtin_usage("set");
                     shell_set_status(2);
                     return;
                 }
@@ -9636,7 +9671,8 @@ static void cmd_set_in(int argc, char **argv) {
         if (argv[i][0] == '+' && argv[i][1] != '\0') {
             for (const char *f = argv[i] + 1; *f; f++) {
                 if (!shell_set_opt(*f, false)) {
-                    kprintf("set: unknown flag '+%c'\n", *f);
+                    kprintf("set: +%c: invalid option\n", *f);
+                    sh_builtin_usage("set");
                     shell_set_status(2);
                     return;
                 }
@@ -10463,6 +10499,11 @@ static bool strchr_opt_ok(const char *a) {
 static const char *g_cd_who = "cd";
 
 static void cmd_cd(int argc, char **argv) {
+    if (g_restricted) {                         /* bash: "cd: restricted" */
+        kprintf("cd: restricted\n");
+        shell_set_status(1);
+        return;
+    }
     shell_set_status(0);
     const char *target = 0;
     bool print_new = false;
@@ -16879,6 +16920,14 @@ static void cmd_dot(int argc, char **argv) {
         shell_set_status(2);
         return;
     }
+    if (g_restricted) {                 /* no `/` in a restricted shell's */
+        for (const char *c = argv[1]; *c; c++)
+            if (*c == '/') {
+                kprintf("%s: %s: restricted\n", argv[0], argv[1]);
+                shell_set_status(1);
+                return;
+            }
+    }
     char resolved[VFS_PATH_MAX];
     if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) {
         shell_dot_failed(status_in);
@@ -17694,6 +17743,11 @@ static void cmd_exec(int argc, char **argv) {
     }
     int i = g.ind;
     if (i >= argc) return;
+    if (g_restricted) {
+        kprintf("exec: restricted\n");
+        shell_set_status(1);
+        return;
+    }
 
     /* argv[0]: -a's NAME, and -l puts a `-` in front of it */
     SH_SB(a0);
@@ -17756,7 +17810,15 @@ static void cmd_command(int argc, char **argv) {
     while (i < argc && argv[i][0] == '-' && argv[i][1]) {
         if (strcmp(argv[i], "-v") == 0) { locate = true; i++; }
         else if (strcmp(argv[i], "-V") == 0) { verbose = true; i++; }
-        else if (strcmp(argv[i], "-p") == 0) { use_default_path = true; i++; }
+        else if (strcmp(argv[i], "-p") == 0) {
+            if (g_restricted) {
+                kprintf("command: -p: restricted\n");
+                shell_set_status(1);
+                return;
+            }
+            use_default_path = true;
+            i++;
+        }
         else break;
     }
     if (i >= argc) {
@@ -20098,7 +20160,17 @@ static void cmd_hash(int argc, char **argv) {
         switch (c) {
         case 'd': del = true; break;
         case 'l': portable = true; break;
-        case 'p': pathname = g.optarg; break;
+        case 'p':
+            pathname = g.optarg;
+            if (g_restricted && pathname) {
+                for (const char *c = pathname; *c; c++)
+                    if (*c == '/') {
+                        kprintf("hash: %s: restricted\n", pathname);
+                        shell_set_status(1);
+                        return;
+                    }
+            }
+            break;
         case 'r': expunge = true; break;
         case 't': targets = true; break;
         case SH_IGO_HELP:
@@ -22757,6 +22829,16 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
      * redirection said. Point fd 2 at the command's for the explanation. */
     struct file *spawn_diag_saved = g_shell_fd[2];
     if (fd2) g_shell_fd[2] = fd2;
+    if (g_restricted && path_arg) {
+        for (const char *c = path_arg; *c; c++)
+            if (*c == '/') {
+                kprintf(SH_PFX_TSH "%s: restricted: cannot specify `/' in "
+                        "command names\n", path_arg);
+                g_shell_fd[2] = spawn_diag_saved;
+                g_spawn_launch_failed = true;
+                return 1;
+            }
+    }
     if (!path_arg || !path_arg[0]) {
         kprintf(SH_PFX_TSH ": command not found\n");
         g_shell_fd[2] = spawn_diag_saved;
@@ -33275,6 +33357,16 @@ static int shell_apply_redirs(struct shell_simple *cmd,
         struct shell_redir *r = &cmd->redir[i];
         if (r->op == SH_RD_AMBIG) {
             kprintf("%s: ambiguous redirect\n", r->path ? r->path : "");
+            shell_set_status(1);
+            return -1;
+        }
+        /* a restricted shell writes no file: >, >>, >|, <>, &> (bash's
+         * WRITE_REDIRECT; duplicating a descriptor is allowed) */
+        if (g_restricted &&
+            (r->op == SH_RD_OPEN_OUT || r->op == SH_RD_OPEN_APPEND ||
+             r->op == SH_RD_OPEN_EXCL || r->op == SH_RD_OPEN_RW)) {
+            kprintf("%s: restricted: cannot redirect output\n",
+                    r->path ? r->path : "");
             shell_set_status(1);
             return -1;
         }
