@@ -1,0 +1,21 @@
+exec 2>&1
+"x"=y echo hi; echo "rc=$?"
+'x'=y echo hi; echo "rc=$?"
+x""=y echo hi; echo "rc=$?"
+\x=y echo hi; echo "rc=$?"
+a"b"=y echo hi; echo "rc=$?"
+"x"=y; echo "rc=$? x=${x-unset}"
+"x"+=y; echo "rc=$?"
+x[0]"=y" ; echo "rc=$?"
+"a[0]"=y; echo "rc=$?"
+$'x'=y; echo "rc=$?"
+declare "x"=1; echo "rc=$? x=$x"
+echo end
+v='x=y'; $v echo hi; echo "rc=$?"
+v='x=y echo'; $v hi; echo "rc=$?"
+a["k"]=1; echo "rc=$?"
+declare -A A; A["k"]=2 A['j']=3; echo "rc=$? ${A[k]}${A[j]}"
+x=1 "y"=2 echo hi; echo "rc=$?"
+f() { echo "f $*"; }; z=1 f 'q=r'; echo "rc=$?"
+{a,b}=X; echo "rc=$?"
+echo end2
