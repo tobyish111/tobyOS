@@ -24508,8 +24508,17 @@ static int shell_pattern_lead_byte(const char *pat, const char *pend);
  * `key_field` says which field `name` is matched against: 0, the login
  * name, for `~user`; 2, the uid in decimal, for a bare `~` when HOME is
  * unset (bash's sh_get_home_dir: the CURRENT user's entry). */
+static int shell_passwd_field(int key_field, const char *name, size_t nlen,
+                              int want, char *out, size_t cap);
 static int shell_passwd_lookup(int key_field, const char *name, size_t nlen,
                                char *out, size_t cap) {
+    return shell_passwd_field(key_field, name, nlen, 5, out, cap);
+}
+
+/* Field `want` (5 the home, 6 the shell) of the entry whose field
+ * `key_field` is `name`. */
+static int shell_passwd_field(int key_field, const char *name, size_t nlen,
+                              int want, char *out, size_t cap) {
     void *buf = 0;
     size_t sz = 0;
     if (nlen == 0 || vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK)
@@ -24529,13 +24538,13 @@ static int shell_passwd_lookup(int key_field, const char *name, size_t nlen,
             if (q == eol || *q == ':') {
                 if (field == key_field)
                     match = (size_t)(q - f) == nlen && memcmp(f, name, nlen) == 0;
-                if (field == 5) { home = f; home_end = q; }
+                if (field == want) { home = f; home_end = q; }
                 field++;
                 f = q + 1;
             }
         }
         if (!match) continue;
-        if (home && home_end > home &&
+        if (home && home_end >= home &&
             (size_t)(home_end - home) + 1 <= cap) {
             memcpy(out, home, (size_t)(home_end - home));
             out[home_end - home] = '\0';
@@ -41479,6 +41488,57 @@ static void shell_import_env_functions(void) {
 }
 #endif
 
+#ifdef SHELL_HOSTED
+/* WHAT bash SETS WHEN ITS ENVIRONMENT DID NOT (initialize_shell_variables,
+ * set_pwd, set_shell_var), none of it exported but OLDPWD:
+ *
+ *   PATH    bash's DEFAULT_PATH_VALUE, as the guest's bash has it;
+ *   SHELL   the user's login shell from /etc/passwd, else /bin/sh;
+ *   OLDPWD  exported with no value, unless a directory was inherited;
+ *   TERM    "dumb" (shell_init_bash_vars).
+ *
+ * No HOME (only a login shell sets one -- shell_set_login_hosted) and no
+ * USER: bash has neither under `env -i`, and neither did a script that
+ * tested for them (logs/b13 q13 q14). */
+static void shell_hosted_default_vars(void) {
+    shell_set_if_not("PATH",
+                     "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.");
+    if (!env_get("SHELL")) {
+        char sh[VFS_PATH_MAX];
+        const char *uid = env_get("UID");
+        if (!uid || shell_passwd_field(2, uid, strlen(uid), 6, sh, sizeof sh) < 0 ||
+            !sh[0])
+            ksnprintf(sh, sizeof sh, "%s", "/bin/sh");
+        (void)env_set("SHELL", sh);
+    }
+    {
+        const char *op = env_get("OLDPWD");
+        struct vfs_stat st;
+        if (!op || vfs_stat(op, &st) != VFS_OK || st.type != VFS_TYPE_DIR) {
+            int ix = env_find("OLDPWD", 6);
+            if (ix >= 0) env_remove_at(ix);
+            (void)env_set_attr_holder("OLDPWD");
+            shell_mark_exported("OLDPWD");
+        }
+    }
+}
+
+/* A LOGIN SHELL (`-l`, `--login`, or a `-` before the name): bash's
+ * set_home_var gives it a HOME from /etc/passwd when it has none, "/" for
+ * an unknown user; `shopt login_shell` says so. */
+void shell_set_login_hosted(void) {
+    g_shopt_misc[21] = true;
+    if (!env_get("HOME")) {
+        char home[VFS_PATH_MAX];
+        const char *uid = env_get("UID");
+        if (!uid || shell_passwd_field(2, uid, strlen(uid), 5, home,
+                                       sizeof home) < 0)
+            ksnprintf(home, sizeof home, "%s", "/");
+        (void)env_set("HOME", home);
+    }
+}
+#endif
+
 void shell_init_hosted(const char *argv0) {
     line_len = 0;
     line[0]  = '\0';
@@ -41557,6 +41617,10 @@ void shell_init_hosted(const char *argv0) {
             if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
         }
     }
+#endif
+
+#ifdef SHELL_HOSTED
+    shell_hosted_default_vars();
 #endif
 
 #ifdef SHELL_HOSTED

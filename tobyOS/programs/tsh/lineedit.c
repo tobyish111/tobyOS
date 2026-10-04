@@ -17,6 +17,7 @@ bool tsh_progcomp(const char *line, size_t point, const char *word,
 void tsh_progcomp_free(char **v, int n);
 const char *tsh_builtin_name_at(int i);
 
+extern const char *shell_get_var_hosted(const char *name);
 extern int         shell_history_count_hosted(void);
 extern const char *shell_history_get_hosted(int i);
 
@@ -308,7 +309,9 @@ static void le_scan_dir(struct le_matches *m, const char *dir, const char *pre) 
 
 /* Commands: every executable name on PATH, plus the shell's own builtins. */
 static void le_scan_commands(struct le_matches *m, const char *pre) {
-    const char *path = getenv("PATH");
+    /* the shell's PATH, which need not be exported (bash's completion
+     * searches the variable; `env -i tsh` has PATH unexported) */
+    const char *path = shell_get_var_hosted("PATH");
     if (!path || !*path) path = "/bin";
     size_t pl = strlen(pre);
     char dir[256];
