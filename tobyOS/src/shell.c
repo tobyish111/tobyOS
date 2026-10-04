@@ -25469,10 +25469,13 @@ static bool shell_has_nosplit(const char *s) {
     return false;
 }
 
+/* ...`!` among the specials: `${!}` is $!, as `${!:-x}`, `${!%x}` and `${#!}`
+ * are -- only a `!` before a name, a digit or one of # ? @ * is
+ * indirection (logs/b13 q37). They were "bad substitution". */
 static int shell_parse_braced_name(const char *expr, size_t *name_len) {
     if (!expr || !*expr || !name_len) return -1;
     if (expr[0] == '?' || expr[0] == '$' || expr[0] == '#' ||
-        expr[0] == '@' || expr[0] == '*' || expr[0] == '-') {
+        expr[0] == '@' || expr[0] == '*' || expr[0] == '-' || expr[0] == '!') {
         *name_len = 1;
         return 0;
     }
@@ -26793,7 +26796,11 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
      * another `!`. bash agrees: `a='!a'; echo ${!a}` is an error, not a loop.
      * The reference's name and value, and the spliced expression, are all
      * growable: none of them has a length limit in bash. */
-    if (expr[0] == '!' && expr[1] && !length_mode) {
+    /* bash's want_indir: what follows the `!` names a parameter -- a name,
+     * a digit, or # ? @ * -- else this is $! itself (shell_parse_braced_name) */
+    if (expr[0] == '!' && expr[1] && !length_mode &&
+        (shell_var_start(expr[1]) || (expr[1] >= '0' && expr[1] <= '9') ||
+         expr[1] == '#' || expr[1] == '?' || expr[1] == '@' || expr[1] == '*')) {
         size_t inlen = 0;
         if (shell_parse_braced_name(expr + 1, &inlen) == 0) {
             const char *rest = expr + 1 + inlen;
@@ -26918,6 +26925,15 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                                           &ref_set, &vjoin) < 0)
                     sb_truncate(&refval, 0);
                 if (!ref_set) sb_truncate(&refval, 0);
+                /* `${!@}`, `${!*}`: the parameters joined by a blank name
+                 * the target -- "one two: invalid variable name" in bash;
+                 * the join's marks read as nothing at all */
+                if (vjoin && shell_word_has_argmark(refval.p)) {
+                    SH_SB(jv);
+                    if (shell_argmarks_to_spaces(refval.p, &jv) < 0 ||
+                        sb_set(&refval, jv.p ? jv.p : "") < 0)
+                        return -1;
+                }
                 have_ref = true;
                 /* A reference that EXISTS but has no value -- an array with
                  * no element 0, a declared-only name -- expands to nothing,
