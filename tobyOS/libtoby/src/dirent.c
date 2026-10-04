@@ -1,22 +1,24 @@
 /* libtoby/src/dirent.c -- POSIX-shape directory enumeration.
  *
- * Strategy: each opendir() allocates a DIR plus a buffer of
- * vfs_dirent_user[] records. readdir() serves entries from that
- * buffer; when exhausted it re-issues SYS_FS_READDIR with the
- * current offset to refill. closedir() frees the DIR.
+ * Strategy: opendir() reads the WHOLE listing (SYS_FS_READDIR, a window at
+ * a time) into a buffer the DIR owns; readdir() serves entries from it;
+ * rewinddir() reads it again; closedir() frees it.
  *
- * The buffer window is intentionally small (16 entries) so DIR
- * stays cheap to allocate in restricted heaps (init/initrd-only
- * workflows). 16 also makes the typical /bin enumeration finish
- * in 2-3 syscalls.
+ * It used to read one 16-entry window and ask for the next at the next
+ * OFFSET when that ran out. The kernel's offset is an entry INDEX, so a
+ * caller that removes what it reads -- `rm -r`, the commonest one -- had
+ * the directory shift under it: after it unlinked entries 0..15 the next
+ * window began at index 16 of what was left, sixteen entries were never
+ * seen, and the final rmdir found the directory not empty ("rm: cannot
+ * remove dir"; findings 56, logs/b14 r2). A listing taken at opendir is what
+ * POSIX allows -- whether readdir reports entries added or removed after
+ * opendir is unspecified -- and what a remover needs.
  *
  * Caveats:
  *   - We do not deduplicate or sort. Order is whatever the kernel
  *     VFS produces.
- *   - rewinddir() resets the offset and forces a refill.
- *   - The dirent returned by readdir() points into the DIR's buffer
- *     and is invalidated by the next readdir() / closedir(). This
- *     matches POSIX. */
+ *   - The dirent returned by readdir() is invalidated by the next
+ *     readdir() / closedir(). This matches POSIX. */
 
 #include <dirent.h>
 #include <stdlib.h>
@@ -24,34 +26,45 @@
 #include <errno.h>
 #include "libtoby_internal.h"
 
-#define DIR_WINDOW  16
+#define DIR_WINDOW  64
 
 struct __libtoby_DIR {
     char                  path[ABI_PATH_MAX];
-    int                   next_kernel_off;   /* abs offset to ask kernel */
-    int                   have;              /* entries currently buffered */
+    int                   have;              /* entries in the listing */
     int                   pos;               /* next entry to serve */
+    int                   cap;
     struct dirent         view;              /* most recently returned */
-    struct abi_dirent     buf[DIR_WINDOW];
+    struct abi_dirent    *ents;              /* the listing */
 };
 
-static int refill(DIR *d) {
-    long r = toby_sc4(ABI_SYS_FS_READDIR,
-                      (long)(uintptr_t)d->path,
-                      (long)(uintptr_t)d->buf,
-                      (long)DIR_WINDOW,
-                      (long)d->next_kernel_off);
-    if (r < 0) {
-        /* SYS_FS_READDIR returns -1 on any error (legacy). Best
-         * guess at errno -- we can't tell apart NOENT vs IO from
-         * the kernel today. */
-        errno = ENOENT;
-        return -1;
-    }
-    d->have = (int)r;
+/* The whole listing of d->path into d->ents. 0, or -1 with errno. */
+static int load(DIR *d) {
+    d->have = 0;
     d->pos  = 0;
-    d->next_kernel_off += d->have;
-    return 0;
+    for (;;) {
+        if (d->cap - d->have < DIR_WINDOW) {
+            int ncap = d->cap ? d->cap * 2 : DIR_WINDOW;
+            struct abi_dirent *ne = (struct abi_dirent *)realloc(d->ents,
+                                         (size_t)ncap * sizeof *ne);
+            if (!ne) { errno = ENOMEM; return -1; }
+            d->ents = ne;
+            d->cap  = ncap;
+        }
+        long r = toby_sc4(ABI_SYS_FS_READDIR,
+                          (long)(uintptr_t)d->path,
+                          (long)(uintptr_t)(d->ents + d->have),
+                          (long)DIR_WINDOW,
+                          (long)d->have);
+        if (r < 0) {
+            /* SYS_FS_READDIR returns -1 on any error (legacy). Best
+             * guess at errno -- we can't tell apart NOENT vs IO from
+             * the kernel today. */
+            errno = ENOENT;
+            return -1;
+        }
+        d->have += (int)r;
+        if (r < DIR_WINDOW) return 0;
+    }
 }
 
 DIR *opendir(const char *path) {
@@ -62,16 +75,16 @@ DIR *opendir(const char *path) {
     DIR *d = (DIR *)malloc(sizeof(*d));
     if (!d) { errno = ENOMEM; return 0; }
     memcpy(d->path, path, plen);
-    d->path[plen]       = '\0';
-    d->next_kernel_off  = 0;
-    d->have             = 0;
-    d->pos              = 0;
+    d->path[plen] = '\0';
+    d->have = d->pos = d->cap = 0;
+    d->ents = 0;
 
-    /* Eagerly load the first window. This catches non-existent or
-     * non-directory paths at opendir() time, matching POSIX
-     * (which only lets readdir() report EBADF). */
-    if (refill(d) != 0) {
+    /* Reading it now also catches non-existent or non-directory paths at
+     * opendir() time, matching POSIX (which only lets readdir() report
+     * EBADF). */
+    if (load(d) != 0) {
         int saved = errno;
+        free(d->ents);
         free(d);
         errno = saved;
         return 0;
@@ -81,14 +94,9 @@ DIR *opendir(const char *path) {
 
 struct dirent *readdir(DIR *d) {
     if (!d) { errno = EBADF; return 0; }
+    if (d->pos >= d->have) return 0;               /* end-of-stream */
 
-    if (d->pos >= d->have) {
-        if (d->have < DIR_WINDOW) return 0;       /* end-of-stream */
-        if (refill(d) != 0)       return 0;
-        if (d->have == 0)         return 0;
-    }
-
-    struct abi_dirent *src = &d->buf[d->pos++];
+    struct abi_dirent *src = &d->ents[d->pos++];
     d->view.d_ino  = 0;                            /* tobyfs has no inode # */
     d->view.d_type = (src->type == ABI_DT_DIR) ? DT_DIR : DT_REG;
     size_t i = 0;
@@ -99,14 +107,12 @@ struct dirent *readdir(DIR *d) {
 
 int closedir(DIR *d) {
     if (!d) { errno = EBADF; return -1; }
+    free(d->ents);
     free(d);
     return 0;
 }
 
 void rewinddir(DIR *d) {
     if (!d) return;
-    d->next_kernel_off = 0;
-    d->have            = 0;
-    d->pos             = 0;
-    (void)refill(d);
+    (void)load(d);
 }
