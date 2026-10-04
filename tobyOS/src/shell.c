@@ -1675,7 +1675,42 @@ struct job {
     bool nohup;                /* `disown -h`: no SIGHUP when the shell
                                 * hangs up its jobs */
     int  stopsig;              /* the signal that stopped it */
+    /* THE JOB'S PROCESSES, in pipeline order (bash's job->pipe): one for a
+     * command, one for each element of a pipeline -- bash forks every
+     * element from the shell, and /bin/tsh now does too. `pid` above is
+     * proc[0]'s, the job's process group under job control and what `jobs
+     * -p` prints; `$!` and "[N] PID" are the LAST one's. The fields above
+     * are the whole job's: dead when every process is, stopped when none
+     * runs and one is stopped, code and sig the last process's (the
+     * rightmost failure under pipefail). */
+    int  nproc;
+    struct job_proc *proc;
 };
+
+struct job_proc {
+    int   pid;
+    bool  dead;
+    bool  stopped;
+    int   code;                /* exit status when dead, 128+N for a signal */
+    int   sig;                 /* the signal that killed it, or 0 */
+    char *cmd;                 /* its command, as `jobs -l` shows it */
+};
+
+static void job_final_status(const struct job *j, int *code, int *sig);
+
+/* The pid `$!`, "[N] PID" and a saved status name: the last process's. */
+static int job_last_pid(const struct job *j) {
+    return (j->nproc > 0 && j->proc) ? j->proc[j->nproc - 1].pid : j->pid;
+}
+
+/* Is PID one of the job's processes? (bash's find_pipeline) */
+static bool job_has_pid(const struct job *j, int pid) {
+    if (!j->id || pid <= 0) return false;
+    if (j->pid == pid) return true;
+    for (int k = 0; k < j->nproc && j->proc; k++)
+        if (j->proc[k].pid == pid) return true;
+    return false;
+}
 
 static const char *shell_cwd(void);
 static void dirstack_polite(const char *name, struct shell_sb *b);
@@ -1884,7 +1919,27 @@ static bool jobs_grow(void) {
     return true;
 }
 
+static void jobs_free_procs(struct job *j) {
+    for (int k = 0; k < j->nproc && j->proc; k++)
+        if (j->proc[k].cmd) kfree(j->proc[k].cmd);
+    if (j->proc) kfree(j->proc);
+    j->proc = 0;
+    j->nproc = 0;
+}
+
+/* A job of N processes, PIDS in pipeline order, CMDS their commands (0:
+ * the one process is NAME). The job number, -1 when out of memory. */
+static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
+                          const char *name);
+
 static int jobs_add(int pid, const char *name) {
+    return jobs_add_procs(&pid, 0, 1, name);
+}
+
+static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
+                          const char *name) {
+    if (n < 1) return -1;
+    int pid = pids[0];
     /* bash's stop_pipeline cleans up before the new job takes a slot: a
      * finished job `jobs` listed is gone, so `sleep .1 & sleep .3; jobs;
      * sleep 1 &` numbers the new job [1] (logs/b12 p96); and one that ended
@@ -1899,11 +1954,11 @@ static int jobs_add(int pid, const char *name) {
         slot = g_jobs_cap;
         if (!jobs_grow()) return -1;          /* out of memory */
     }
-    size_t n = name ? strlen(name) : 0;
-    char *copy = (char *)kmalloc(n + 1);
+    size_t nlen = name ? strlen(name) : 0;
+    char *copy = (char *)kmalloc(nlen + 1);
     if (!copy) return -1;
-    if (n) memcpy(copy, name, n);
-    copy[n] = '\0';
+    if (nlen) memcpy(copy, name, nlen);
+    copy[nlen] = '\0';
     shell_hd_strip_tags(copy);                 /* see SHELL_HD_TAG */
     /* bash's job number: one past the highest job still in the table, and
      * 1 again once the table is empty -- tsh counted up forever, so the
@@ -1938,7 +1993,28 @@ static int jobs_add(int pid, const char *name) {
         j->wd = (char *)kmalloc(wl + 1);
         if (j->wd) memcpy(j->wd, cwd, wl + 1);
     }
-    shell_bgstat_forget(pid);
+    jobs_free_procs(j);
+    j->proc = (struct job_proc *)kmalloc((size_t)n * sizeof *j->proc);
+    if (j->proc) {
+        j->nproc = n;
+        for (int k = 0; k < n; k++) {
+            const char *c = (cmds && cmds[k]) ? cmds[k] : (n == 1 ? copy : "");
+            size_t cl = strlen(c);
+            j->proc[k].pid = pids[k];
+            j->proc[k].dead = false;
+            j->proc[k].stopped = false;
+            j->proc[k].code = 0;
+            j->proc[k].sig = 0;
+            j->proc[k].cmd = (char *)kmalloc(cl + 1);
+            if (j->proc[k].cmd) {
+                memcpy(j->proc[k].cmd, c, cl + 1);
+                shell_hd_strip_tags(j->proc[k].cmd);
+            }
+            shell_bgstat_forget(pids[k]);
+        }
+    } else {
+        shell_bgstat_forget(pid);       /* a job of one, as it always was */
+    }
     jobs_reset_current();              /* bash's stop_pipeline, async */
     return j->id;
 }
@@ -1961,6 +2037,7 @@ static void jobs_remove(struct job *j) {
     j->name = 0;
     if (j->wd) kfree(j->wd);
     j->wd = 0;
+    jobs_free_procs(j);
     if (id && (id == g_js_current || id == g_js_previous))
         jobs_reset_current();          /* bash's delete_job */
 }
@@ -2058,10 +2135,91 @@ static const char *shell_job_state_word(const struct job *j, bool longform,
  * writes it, `~` for $HOME (print_pipeline). `jobs` lists these and a
  * notice is one. tsh never kept the directory and had no long form
  * (logs/b13 q44 q49). */
+/* A PROCESS's state word in a job's long form (printable_job_status for
+ * one PROCESS): Running while the job runs, else its own end or stop. */
+static const char *job_proc_word(const struct job *j, const struct job_proc *p,
+                                 char *buf, size_t cap) {
+    if (!j->dead && !j->stopped) return "Running";
+    if (p->stopped) return shell_signal_desc(j->stopsig > 0 ? j->stopsig : SIGTSTP);
+    if (p->dead) return shell_job_status_word(p->code, p->sig, buf, cap);
+    return "Running";
+}
+
+/* Do two processes of a job read the same in the long form? (bash blanks
+ * a later process's state when its running flag and status are the
+ * first's.) */
+static bool job_proc_same(const struct job_proc *a, const struct job_proc *b) {
+    int ca = a->dead ? 2 : a->stopped ? 1 : 0;
+    int cb = b->dead ? 2 : b->stopped ? 1 : 0;
+    if (ca != cb) return false;
+    return ca != 2 || (a->code == b->code && a->sig == b->sig);
+}
+
+/* The status word, padded as print_pipeline pads it: to 24 (the longest
+ * signal description in the guest's musl), and a longer word gets the
+ * difference as blanks the other way ("%*s" with a negative width). */
+static void job_put_padded(struct shell_sb *b, const char *w, int len_for_pad) {
+    (void)sb_puts(b, w);
+    int pad = 24 - len_for_pad;
+    if (pad < 0) pad = -pad;
+    for (int k = 0; k < pad; k++) (void)sb_putc(b, ' ');
+}
+
+/* A JOB OF SEVERAL PROCESSES IN THE LONG FORM -- `jobs -l`, and a script's
+ * report of a job a signal killed (HEAD "" there) -- one line a process,
+ * as bash's print_pipeline writes JLIST_LONG:
+ *
+ *     [1]+   112 Running                 sleep 2
+ *            113                       | sleep 1 &
+ *
+ * the first line the job's head, the pid in five columns, the state; each
+ * later one five blanks, its pid, its state -- blank when it is the first
+ * process's -- and "| " before its command; " &" and the directory note
+ * after the last (logs/b14 r4 r5 r7). */
+static void shell_job_lines_long(struct shell_sb *b, const struct job *j,
+                                 const char *head) {
+    char wb[40], hb[24];
+    const struct job_proc *first = &j->proc[0];
+    for (int k = 0; k < j->nproc; k++) {
+        const struct job_proc *p = &j->proc[k];
+        if (k == 0) (void)sb_puts(b, head);
+        else (void)sb_puts(b, "     ");
+        ksnprintf(hb, sizeof hb, "%5d ", p->pid);
+        (void)sb_puts(b, hb);
+        const char *w = job_proc_word(j, p, wb, sizeof wb);
+        if (k > 0 && job_proc_same(p, first)) w = "";
+        job_put_padded(b, w, *w ? (int)strlen(w) : 2);
+        if (k > 0) (void)sb_puts(b, "| ");
+        (void)sb_puts(b, p->cmd ? p->cmd : "");
+        if (k + 1 == j->nproc) {
+            if (!j->dead && !j->stopped) (void)sb_puts(b, " &");
+            if (shell_job_moved(j)) {
+                (void)sb_puts(b, "  (wd: ");
+                dirstack_polite(j->wd, b);
+                (void)sb_putc(b, ')');
+            }
+        }
+        if (g_opt_notify && shell_reading_user()) (void)sb_putc(b, '\r');
+        (void)sb_putc(b, '\n');
+    }
+}
+
 static void shell_job_line(struct shell_sb *b, const struct job *j,
                            bool longform) {
     char wb[40];
+    if (longform && j->nproc > 1 && j->proc) {
+        char hd[32];
+        ksnprintf(hd, sizeof hd, "[%d]%c ", j->id, jobs_mark(j));
+        shell_job_lines_long(b, j, hd);
+        return;
+    }
     const char *status = shell_job_state_word(j, longform, wb, sizeof wb);
+    /* the short form names the LAST process's end (print_pipeline's show =
+     * last), which under pipefail is not the job's status */
+    if (j->dead && j->nproc > 1 && j->proc) {
+        const struct job_proc *lp = &j->proc[j->nproc - 1];
+        status = shell_job_status_word(lp->code, lp->sig, wb, sizeof wb);
+    }
     char head[48];
     if (longform)
         ksnprintf(head, sizeof head, "[%d]%c %5d ", j->id, jobs_mark(j), j->pid);
@@ -2186,6 +2344,28 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
             cmd ? cmd : "");
 #endif
 }
+
+#ifdef SHELL_HOSTED
+/* A script's report of a job of several processes a signal killed: the
+ * diagnostic prefix, then the job in the long form with no "[N]" (bash's
+ * JLIST_NONINTERACTIVE) -- one line a process (logs/b14 r7):
+ *
+ *     r7.sh: line 17:    58 Killed                  sleep 5
+ *             59                       | sleep 5
+ *
+ * The caller has applied shell_report_job_death's filters already. */
+static void shell_report_job_death_procs(const struct job *j) {
+    SH_SB(b);
+    shell_job_lines_long(&b, j, "");
+    if (!b.p) return;
+    char *nl = b.p;
+    while (*nl && *nl != '\n') nl++;
+    if (!*nl) nl = 0;
+    if (nl) *nl = '\0';
+    kprintf("%s\n", b.p);                    /* with the "FILE: line N: " */
+    if (nl && nl[1]) kprintf_raw("%s", nl + 1);
+}
+#endif
 
 #ifdef SHELL_HOSTED
 static int shell_job_poll(struct job *j);      /* see cmd_wait */
@@ -2334,13 +2514,14 @@ static void shell_jobs_notify(unsigned long line, int how) {
             continue;
         }
         if (g_flag_c && g_opt_posix) {
-            if (j->pid != g_last_bg_pid) j->notified = true;
+            if (job_last_pid(j) != g_last_bg_pid) j->notified = true;
             continue;
         }
         if (sg > 0 && sg != SIGINT && sg != SIGTERM && sg != SIGPIPE &&
-            !(sg < SIG_MAX && g_traps[sg]))
-            shell_report_job_death(j->pid, sg, j->name, false);
-        else if (shell_job_control())
+            !(sg < SIG_MAX && g_traps[sg])) {
+            if (j->nproc > 1 && j->proc) shell_report_job_death_procs(j);
+            else shell_report_job_death(j->pid, sg, j->name, false);
+        } else if (shell_job_control())
             shell_job_notice(j);
         j->notified = true;
     }
@@ -12238,7 +12419,28 @@ static int shell_fg_bg_one(const char *spec, bool fg) {
     signal_send_to_pgrp(pid, SIGCONT);
     j->stopped = false;
     int ssig = 0;
-    int frc = proc_wait_fg(pid, &ssig);
+    int frc = 0, fsig = -1;
+    if (j->nproc > 1 && j->proc) {
+        /* every process of the job, until one stops (bash's wait_for:
+         * while the job runs) */
+        for (int k = 0; k < j->nproc; k++) {
+            struct job *jj = jobs_find(jid);
+            if (!jj || !jj->proc) break;
+            struct job_proc *p = &jj->proc[k];
+            if (p->dead) continue;
+            p->stopped = false;
+            int ps = 0;
+            int rc = proc_wait_fg(p->pid, &ps);
+            if (ps > 0) { p->stopped = true; ssig = ps; break; }
+            p->dead = true;
+            p->code = rc < 0 ? 0 : rc;
+            p->sig = proc_last_term_sig();
+        }
+        struct job *jj = jobs_find(jid);
+        if (!ssig && jj && jj->proc) job_final_status(jj, &frc, &fsig);
+    } else {
+        frc = proc_wait_fg(pid, &ssig);
+    }
     shell_tty_set_fg_pgrp(0);
     if (ssig > 0) {
         struct job *js = jobs_find(jid);
@@ -12251,7 +12453,8 @@ static int shell_fg_bg_one(const char *spec, bool fg) {
         if (js) shell_job_stopped_notice(js);
         return 128 + ssig;
     }
-    shell_report_job_death(pid, proc_last_term_sig(), saved_name, true);
+    shell_report_job_death(pid, fsig >= 0 ? fsig : proc_last_term_sig(),
+                           saved_name, true);
     struct job *j2 = jobs_find(jid);
     if (j2) jobs_remove(j2);
     return frc;
@@ -12366,7 +12569,15 @@ static void shell_job_died(struct job *j, int code, int sig) {
     j->sig  = sig;
     j->notified = false;
     j->seen = false;
-    shell_bgstat_add(j->pid, code);
+    for (int k = 0; k < j->nproc && j->proc; k++)
+        if (!j->proc[k].dead) {         /* a job of one, reaped as a whole */
+            j->proc[k].dead = true;
+            j->proc[k].stopped = false;
+            j->proc[k].code = code;
+            j->proc[k].sig = sig;
+        }
+    /* bash's bgp_add: the status is saved under the LAST process's pid */
+    shell_bgstat_add(job_last_pid(j), code);
 #ifndef SHELL_HOSTED
     if (!(g_opt_monitor && g_interactive))
         shell_report_job_death(j->pid, sig, j->name, false);
@@ -12389,12 +12600,85 @@ static void shell_job_died(struct job *j, int code, int sig) {
  * EliteDesk: 0945 is 143) it misses more looks than one; that is the race
  * in bash, not followed (logs/b12 oilrep-*.txt, t945-*). */
 static int shell_try_reap_state(int pid, int *code, int *stopsig, bool untraced);
+
+/* A finished job's status from its processes (bash's raw_job_exit_status):
+ * the last one's, or under pipefail the rightmost that failed. */
+static void job_final_status(const struct job *j, int *code, int *sig) {
+    const struct job_proc *last = &j->proc[j->nproc - 1];
+    *code = last->code;
+    *sig = last->sig;
+    if (g_opt_pipefail) {
+        for (int k = j->nproc - 1; k >= 0; k--)
+            if (j->proc[k].code != 0) {
+                *code = j->proc[k].code;
+                *sig = j->proc[k].sig;
+                break;
+            }
+    }
+}
+
+/* shell_job_poll for a job of several processes: each one's state, then
+ * the job's -- dead when all are, stopped when none runs and one stopped,
+ * continued when one runs again. */
+static int shell_job_poll_procs(struct job *j) {
+    bool untraced = shell_job_control();
+    int polled = 0, foreign = 0;
+    for (int k = 0; k < j->nproc; k++) {
+        struct job_proc *p = &j->proc[k];
+        if (p->dead) continue;
+        polled++;
+        int code = 0, ss = 0;
+        int r = shell_try_reap_state(p->pid, &code, &ss, untraced);
+        if (r == 1) {
+            p->dead = true;
+            p->stopped = false;
+            p->code = code;
+            p->sig = proc_last_term_sig();
+        } else if (r == -1) {
+            /* not this process's child: a forked subshell's view of its
+             * parent's job (see shell_job_poll) -- its state as it was
+             * (`jobs -l | sed` lists from a pipeline stage; logs/b14 r4) */
+            foreign++;
+        } else if (r == 2) {
+            if (!p->stopped) { p->stopped = true; j->stopsig = ss; }
+        } else if (r == 3) {
+            p->stopped = false;
+        }
+    }
+    bool running = false, stopped = false, all_dead = true;
+    for (int k = 0; k < j->nproc; k++) {
+        if (!j->proc[k].dead) all_dead = false;
+        if (!j->proc[k].dead && !j->proc[k].stopped) running = true;
+        if (!j->proc[k].dead && j->proc[k].stopped) stopped = true;
+    }
+    if (polled > 0 && foreign == polled) return -1;
+    if (all_dead) {
+        int code = 0, sig = 0;
+        job_final_status(j, &code, &sig);
+        shell_job_died(j, code, sig);
+        return 1;
+    }
+    if (!running && stopped) {
+        if (!j->stopped) {
+            j->stopped = true;
+            j->seen = false;
+            jobs_set_current(j->id);
+        }
+    } else if (running && j->stopped) {
+        j->stopped = false;
+        j->seen = false;
+        jobs_reset_current();
+    }
+    return 0;
+}
+
 static int shell_job_poll(struct job *j) {
     if (j->dead) return 1;
     if (j->blind) {
         j->blind = false;
         return 0;
     }
+    if (j->nproc > 1 && j->proc) return shell_job_poll_procs(j);
     int code = 0, ss = 0;
     /* A STOP, AND A CONTINUE, ARE CHANGES OF STATE TOO -- seen under job
      * control only, as bash's waitchld asks with WUNTRACED|WCONTINUED only
@@ -12429,7 +12713,36 @@ static int shell_job_poll(struct job *j) {
  * marked as already waited for. */
 static int shell_wait_job(struct job *j) {
     if (!j || j->id == 0) return 127;
-    if (!j->dead) {
+    if (!j->dead && j->nproc > 1 && j->proc) {
+        /* every process of the job, in order (bash's wait_for: until the
+         * job is no longer running) */
+        int foreign = 0;
+        for (int k = 0; k < j->nproc; k++) {
+            struct job_proc *p = &j->proc[k];
+            if (p->dead) continue;
+            signal_set_foreground(p->pid);
+            int rc = proc_wait(p->pid);
+            signal_set_foreground(0);
+            p->dead = true;
+            p->stopped = false;
+            if (rc < 0) { foreign++; continue; }
+            p->code = rc;
+            p->sig = proc_last_term_sig();
+        }
+        if (foreign == j->nproc) {
+            kprintf("wait: pid %d is not a child of this shell\n", job_last_pid(j));
+            jobs_remove(j);
+            return 127;
+        }
+        int code = 0, sig = 0;
+        job_final_status(j, &code, &sig);
+        shell_job_died(j, code, sig);
+        for (int i = 0; i < JOB_MAX; i++)
+            if (g_jobs[i] != j && g_jobs[i]->id && !g_jobs[i]->dead) {
+                g_jobs[i]->blind = false;
+                (void)shell_job_poll(g_jobs[i]);
+            }
+    } else if (!j->dead) {
         int pid = j->pid;
         signal_set_foreground(pid);
         int rc = proc_wait(pid);
@@ -12481,7 +12794,7 @@ static struct job *shell_wait_lookup(const char *arg, int *kind) {
     int n = 0;
     if (parse_int(arg, &n) < 0 || n <= 0) { *kind = 1; return 0; }
     for (int i = 0; i < JOB_MAX; i++)
-        if (g_jobs[i]->id != 0 && g_jobs[i]->pid == n) return g_jobs[i];
+        if (job_has_pid(g_jobs[i], n)) return g_jobs[i];   /* any of its processes */
     return 0;
 }
 
@@ -12535,7 +12848,7 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
             if (!got || j->id < got->id) got = j;
         }
         if (got) {
-            int pid = got->pid;
+            int pid = job_last_pid(got);              /* bash's find_last_pid */
             if (pvar) {
                 char nb[24];
                 ksnprintf(nb, sizeof nb, "%d", pid);
@@ -12661,7 +12974,7 @@ static void cmd_wait_in(int argc, char **argv) {
         if (!(g_opt_monitor && g_interactive))
             for (int i = 0; i < JOB_MAX; i++)
                 if (g_jobs[i]->id && g_jobs[i]->dead &&
-                    g_jobs[i]->pid != g_last_bg_pid)
+                    job_last_pid(g_jobs[i]) != g_last_bg_pid)
                     jobs_remove(g_jobs[i]);
         g_bgstat_n = 0;                /* bash's bgp_clear */
         shell_set_status(rc == 127 ? 127 : 0);
@@ -12672,7 +12985,10 @@ static void cmd_wait_in(int argc, char **argv) {
     for (int i = first; i < argc; i++) {
         int kind = 0;
         struct job *j = shell_wait_lookup(argv[i], &kind);
-        int pid = j ? j->pid : 0;
+        /* -p's pid: the operand's, or a job spec's last process's */
+        int pid = 0;
+        if (j && argv[i][0] == '%') pid = job_last_pid(j);
+        else if (j) (void)parse_int(argv[i], &pid);
         if (j) {
             rc = shell_wait_job(j);
         } else if (kind == 1) {
@@ -18522,7 +18838,11 @@ static void shell_hangup_jobs(void) {
         struct job *j = g_jobs[i];
         if (!j->id || j->dead || j->nohup) continue;
         if (j->jc) signal_send_to_pgrp(j->pid, SIGHUP);
-        else (void)signal_send_to_pid_checked(j->pid, SIGHUP);
+        else if (j->nproc > 1 && j->proc) {
+            for (int k = 0; k < j->nproc; k++)       /* each, as kill_pid */
+                if (!j->proc[k].dead)
+                    (void)signal_send_to_pid_checked(j->proc[k].pid, SIGHUP);
+        } else (void)signal_send_to_pid_checked(j->pid, SIGHUP);
         if (j->stopped) signal_send_to_pgrp(j->pid, SIGCONT);
     }
 }
@@ -21576,6 +21896,26 @@ static void cmd_kill(int argc, char **argv) {
              * nothing: `sleep 1 & kill %%; wait %%` was status 0, the
              * sleep never signalled (Oils 0944; logs/b12 p49). */
             bool was_stopped = jb->stopped;
+            /* ...AND WITHOUT ONE, EACH OF ITS PROCESSES THAT LIVES: bash's
+             * kill_pid for a job in the shell's own group signals every
+             * live process of the pipeline itself (logs/b14 r4: `sleep 5 |
+             * sleep 5 & kill %1; wait %1` is 143, both gone). */
+            if (!jb->jc && jb->nproc > 1 && jb->proc) {
+                bool any = false;
+                for (int k = 0; k < jb->nproc; k++) {
+                    if (jb->proc[k].dead) continue;
+                    if (signal_send_to_pid_checked(jb->proc[k].pid, sig) == 0) any = true;
+                    if (was_stopped && (sig == SIGTERM || sig == SIGHUP))
+                        (void)signal_send_to_pid_checked(jb->proc[k].pid, SIGCONT);
+                }
+                if (!any) {
+                    kprintf("kill: %s: no such job\n", argv[i]);
+                    shell_set_status(1);
+                    continue;
+                }
+                if (sig > 0) jb->blind = true;
+                continue;
+            }
             if (signal_send_to_pid_checked(-jb->pid, sig) != 0 &&
                 signal_send_to_pid_checked(jb->pid, sig) != 0) {
                 kprintf("kill: %s: no such job\n", argv[i]);
@@ -21612,7 +21952,7 @@ static void cmd_kill(int argc, char **argv) {
             /* a job it names, or whose group it names: see shell_job_poll */
             int want = pid < 0 ? -pid : pid;
             for (int k = 0; k < JOB_MAX; k++)
-                if (g_jobs[k]->id && g_jobs[k]->pid == want)
+                if (job_has_pid(g_jobs[k], want))
                     g_jobs[k]->blind = true;
         }
     }
@@ -23097,7 +23437,7 @@ static void cmd_disown(int argc, char **argv) {
         int pid = 0;
         if (w && parse_int(w, &pid) == 0) {
             for (int k = 0; k < JOB_MAX && pid > 0; k++)
-                if (g_jobs[k]->id && !g_jobs[k]->waited && g_jobs[k]->pid == pid)
+                if (!g_jobs[k]->waited && job_has_pid(g_jobs[k], pid))
                     j = g_jobs[k];
         } else {
             j = jobs_spec(w, "disown", 0);
@@ -35871,6 +36211,180 @@ static int shell_background_forked(const char *text, const char *label) {
     return shell_background_forked_as(text, label, 0);
 }
 
+static const char *shell_find_pipe_at(const char *s);
+static bool shell_stage_is_compound(const char *s);
+static void shell_stages_free(char **st, int n);
+static char *shell_dup_segment(const char *start, const char *end);
+
+/* AN ASYNCHRONOUS PIPELINE IS A JOB OF ONE PROCESS AN ELEMENT, every one a
+ * child of the shell -- bash's execute_pipeline forks each element from
+ * the shell, all into one process group (the first element's) under job
+ * control. /bin/tsh forked ONE child that ran the pipeline, and it forked
+ * the elements and spawned their programs in turn: `a | b &` was five
+ * processes, `jobs -l` showed one pid, `$!` was that child's, `jobs -p`
+ * the same, `kill $!` killed the child and left the programs, and the job
+ * ended with the child (logs/b14 r4 r5 r6 r7). Each element here is
+ * forked from this shell, is its own subshell -- $BASH_SUBSHELL one deeper
+ * whatever the element (r6) -- and execs its program when it is a simple
+ * command, so its pid is the program's; the job holds them all, `$!` is
+ * the last one's and "[N] PID" names it.
+ *
+ * False when TEXT is not a plain pipeline -- an and-or list, `!` or `time`
+ * in front -- or the elements cannot be forked from here: here-documents
+ * queued for the whole line (the copies would each take the first body),
+ * or inside an in-process capture. The single child does those, as before. */
+static bool shell_background_pipeline(const char *text, int *rcp) {
+    if (!shell_find_pipe_at(text)) return false;
+    const char *t = shell_skip_blanks(text);
+    if (*t == '!') return false;
+    if (strncmp(t, "time", 4) == 0 && (t[4] == ' ' || t[4] == '\t')) return false;
+    if (g_heredoc_head < g_heredoc_count || g_capture_depth > 0) return false;
+    {
+        /* an and-or or ; list is not a plain pipeline */
+        struct shell_scan sc;
+        shell_scan_init(&sc);
+        for (const char *p = text; *p; ) {
+            while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+            if (!*p) break;
+            if (!shell_scan_incomplete(&sc) &&
+                ((p[0] == '&' && p[1] == '&') || (p[0] == '|' && p[1] == '|') ||
+                 (p[0] == ';')))
+                return false;
+            const char *before = p;
+            shell_scan_token(&sc, &p);
+            if (p <= before) p = before + 1;
+        }
+    }
+
+    int nst = 0;
+    for (const char *q = text; q; ) {
+        const char *s = shell_find_pipe_at(q);
+        nst++;
+        q = s ? s + 1 : 0;
+    }
+    if (nst < 2) return false;
+    char **stages = (char **)kmalloc((size_t)nst * sizeof(char *));
+    char **shown = (char **)kmalloc((size_t)nst * sizeof(char *));
+    int *pids __attribute__((cleanup(shell_kfree_ptr))) =
+        (int *)kmalloc((size_t)nst * sizeof(int));
+    if (!stages || !shown || !pids) {
+        kfree(stages);
+        kfree(shown);
+        return false;
+    }
+    memset(stages, 0, (size_t)nst * sizeof(char *));
+    memset(shown, 0, (size_t)nst * sizeof(char *));
+
+    int n = 0;
+    bool bad = false;
+    for (const char *cur = text; ; ) {
+        const char *sep = shell_find_pipe_at(cur);
+        const char *end = sep ? sep : cur + strlen(cur);
+        if (n >= nst) { bad = true; break; }
+        stages[n] = shell_dup_segment(cur, end);
+        if (stages[n] && sep && sep[1] == '&') {
+            /* `|&`: the element's stderr goes down the pipe too, and bash
+             * shows the element so (`a 2>&1 | b`) */
+            size_t sl = strlen(stages[n]);
+            char *w = (char *)kmalloc(sl + 6);
+            if (w) {
+                memcpy(w, stages[n], sl);
+                memcpy(w + sl, " 2>&1", 6);
+            }
+            kfree(stages[n]);
+            stages[n] = w;
+        }
+        if (!stages[n] || !*shell_skip_blanks(stages[n])) { bad = true; break; }
+        shown[n] = shell_print_text(stages[n], SHPR_COMMAND, 0);
+        n++;
+        if (!sep) break;
+        cur = sep + (sep[1] == '&' ? 2 : 1);
+    }
+    if (bad || n != nst) {
+        shell_stages_free(stages, nst);
+        shell_stages_free(shown, nst);
+        return false;
+    }
+
+    bool jc = shell_job_control();
+    struct file *saved0 = g_shell_fd[0], *saved1 = g_shell_fd[1];
+    struct file *prev_in = 0;
+    int leader = 0, started = 0;
+    for (int i = 0; i < n; i++) {
+        struct file *r = 0, *w = 0;
+        if (i + 1 < n && pipe_create(&r, &w) != 0) {
+            kprintf("pipeline: pipe_create failed\n");
+            break;
+        }
+        if (prev_in) g_shell_fd[0] = prev_in;
+        if (w)       g_shell_fd[1] = w;
+        int pid = shell_fork();
+        if (pid < 0) {
+            kprintf("shell: cannot fork to background\n");
+            g_shell_fd[0] = saved0;
+            g_shell_fd[1] = saved1;
+            if (r) file_close(r);
+            if (w) file_close(w);
+            break;
+        }
+        if (pid == 0) {
+            /* the element joins the job's group before it runs anything
+             * (bash's make_child does it in both, against the race) */
+            if (jc) (void)proc_set_pgid(0, leader);
+            if (r) file_close(r);              /* the read end of its own output */
+            jobs_forget_all();
+            shell_trap_clear_caught();
+            g_subshell_depth++;
+            g_simple_stage_adj = 0;
+            g_in_pipeline_stage = true;
+            g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
+                                                   stages[i] + strlen(stages[i]));
+            g_bg_simple_child = g_bg_exec_ok;
+            execute_line_text(stages[i]);
+            int st = g_last_status;
+            if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+            st = shell_run_exit_trap(st);
+            shell_host_builtin_done();
+            _exit(st & 0xff);
+        }
+        if (jc) (void)proc_set_pgid(pid, leader ? leader : pid);
+        if (!leader) leader = pid;
+        pids[started++] = pid;
+        g_shell_fd[0] = saved0;
+        g_shell_fd[1] = saved1;
+        if (w) file_close(w);
+        if (prev_in) file_close(prev_in);
+        prev_in = r;
+    }
+    if (prev_in) file_close(prev_in);
+    g_shell_fd[0] = saved0;
+    g_shell_fd[1] = saved1;
+
+    if (started == 0) {
+        shell_stages_free(stages, nst);
+        shell_stages_free(shown, nst);
+        *rcp = 1;
+        return true;
+    }
+    /* the job's name: its elements as bash joins them */
+    SH_SB(name);
+    for (int i = 0; i < started; i++) {
+        if (i) (void)sb_puts(&name, " | ");
+        (void)sb_puts(&name, shown[i] ? shown[i] : stages[i]);
+    }
+    const char **cmds = (const char **)kmalloc((size_t)started * sizeof *cmds);
+    if (cmds)
+        for (int i = 0; i < started; i++) cmds[i] = shown[i] ? shown[i] : stages[i];
+    g_last_bg_pid = pids[started - 1];
+    int jid = jobs_add_procs(pids, cmds, started, name.p ? name.p : text);
+    kfree(cmds);
+    shell_describe_job(jid, pids[started - 1]);
+    shell_stages_free(stages, nst);
+    shell_stages_free(shown, nst);
+    *rcp = 0;
+    return true;
+}
+
 static int shell_background_forked_as(const char *text, const char *label,
                                       const char *shown) {
     /* `%1 &` IS bg %1, run by this shell, not a child (bash's
@@ -35910,6 +36424,10 @@ static int shell_background_forked_as(const char *text, const char *label,
             g_this_builtin = 0;
             return shell_job_word_command(n, wv, true);
         }
+    }
+    {
+        int prc = 0;
+        if (shell_background_pipeline(text, &prc)) return prc;
     }
     int pid = shell_fork();
     if (pid < 0) {
