@@ -23135,13 +23135,47 @@ static void cmd_disown(int argc, char **argv) {
  * SIGSTOP to ourselves. A login shell refuses without -f: stopping it can
  * leave the user with nothing running that could resume it. */
 static void cmd_suspend(int argc, char **argv) {
+    /* bash 5.2's suspend (suspend.def): -f is its one option, and an
+     * operand is "too many arguments" -- the rest of the line goes. Unless
+     * forced, a shell without job control says "cannot suspend: no job
+     * control" and a login shell "cannot suspend a login shell"; forced,
+     * neither is asked and the shell's process group is stopped. tsh
+     * stopped itself in a script, unforced, where nothing could ever
+     * continue it. */
     bool force = false;
-    for (int i = 1; i < argc; i++)
-        if (strcmp(argv[i], "-f") == 0) force = true;
-    if (g_shopt_misc[21] && !force) {
-        kprintf("suspend: cannot suspend a login shell (use -f)\n");
+    int i = 1;
+    for (; i < argc; i++) {
+        const char *a = argv[i];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { i++; break; }
+        for (const char *q = a + 1; *q; q++) {
+            if (*q == 'f') { force = true; continue; }
+            kprintf("suspend: -%c: invalid option\n", *q);
+            kprintf_raw("suspend: usage: suspend [-f]\n");
+            shell_set_status(2);
+            return;
+        }
+    }
+    if (i < argc) {
+        kprintf("suspend: too many arguments\n");
         shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
         return;
+    }
+    if (!force) {
+        if (!shell_job_control()) {
+            kprintf("suspend: cannot suspend: no job control\n");
+            shell_set_status(1);
+            return;
+        }
+        if (g_shopt_misc[21]) {
+            kprintf("suspend: cannot suspend a login shell\n");
+            shell_set_status(1);
+            return;
+        }
     }
     if (g_shell_pid < 0) {
         kprintf("suspend: cannot determine shell pid\n");
@@ -23149,7 +23183,10 @@ static void cmd_suspend(int argc, char **argv) {
         return;
     }
     shell_set_status(0);
-    (void)signal_send_to_pid_checked(g_shell_pid, SIGSTOP);
+    /* bash: killpg(shell_pgrp, SIGSTOP) */
+    int pg = shell_own_pgrp();
+    if (pg > 0) signal_send_to_pgrp(pg, SIGSTOP);
+    else (void)signal_send_to_pid_checked(g_shell_pid, SIGSTOP);
 }
 
 /* ---- logout ------------------------------------------------------------ */
