@@ -35951,6 +35951,13 @@ static int shell_background_forked_as(const char *text, const char *label,
         execute_line_text(text);
         int st = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+        /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS, as a ( )'s does: `{
+         * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
+         * one print bye in bash; this child just exited (logs/b14 r1). The
+         * parent's own traps were cleared above, so only one set here
+         * runs. And what it wrote goes out before it does. */
+        st = shell_run_exit_trap(st);
+        shell_host_builtin_done();
         _exit(st & 0xff);
     }
     g_last_bg_pid = (int)pid;
