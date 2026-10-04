@@ -3017,7 +3017,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
     /* A field is a piece of `ex`, so ex's length always holds one. It was a
      * 512-byte array that cut every longer element short without a word. */
     SH_SB(fieldb);
-    if (sb_grow(&fieldb, strlen(ex) + 1) < 0) return -1;
+    if (sb_grow(&fieldb, 2 * strlen(ex) + 2) < 0) return -1;   /* + escapes */
     char *field = fieldb.p;
     const size_t field_cap = fieldb.cap;
     size_t f = 0;
@@ -3037,9 +3037,15 @@ static int sh_array_store_expanded(const char *name, const char *ex,
      * precedes it onto the first element, and a word that is ONE mark with
      * no text at all -- "${e[@]}" of an empty array -- is no element. */
     bool first_mark = true;
+    /* IFS SPLITTING HERE IS WORD SPLITTING (shell_split_add): a field per
+     * separator CHARACTER, an empty one kept when a non-whitespace IFS
+     * character ends it or a quoted null is all it holds -- with IFS=:,
+     * a=($v) of "a::b" is three elements and of ":a" two (logs/b13 q31).
+     * Every boundary dropped an empty field, so empties all vanished. */
     struct sh_ifsx ifsx;
     sh_ifsx_init(&ifsx, env_get("IFS"));
     const char *exend = ex + strlen(ex);
+    bool seg_quoted = false;    /* a quoted part is in this field */
     {
         int marks = 0;
         size_t real = 0;
@@ -3071,7 +3077,11 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 q++;
                 continue;
             }
-            if (*q == SHELL_NOSPLIT_MARK) { in_nosplit = !in_nosplit; continue; }
+            if (*q == SHELL_NOSPLIT_MARK) {
+                in_nosplit = !in_nosplit;
+                seg_quoted = true;
+                continue;
+            }
             if (*q == SHELL_EMPTY_ELEM) { elem = true; continue; }
             if (*q == SHELL_ARG_JOIN) continue;          /* S3: no boundary */
             /* A `$@`/`${a[@]}` mark is a field boundary even inside quotes --
@@ -3092,6 +3102,13 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         }
         if (end || boundary) {
             field[f] = '\0';
+            /* kept although empty: a quoted null, or a field a non-white
+             * IFS character ends (bash's list_string) */
+            bool keep_this = sl > 0 && f == 0 &&
+                             (seg_quoted ||
+                              (!ifsx.sh_style && !sh_ifsx_space(*q)));
+            if (end && f == 0 && seg_quoted && keep_empty && any)
+                keep_this = true;
             /* AN UNQUOTED FIELD IS GLOBBED, as it is in bash: `a=(*.py)` is
              * the files. This parser expanded and split each element and
              * never globbed, so it stored the pattern. Decided BEFORE the
@@ -3118,7 +3135,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             if (globbed > 0) {
                 any = true;
             } else if (globbed == 0 &&
-                       (field[0] ||
+                       (field[0] || keep_this ||
                         (keep_empty && (has_marks ? elem : !any)))) {
                 /* In a quoted word every `$@` element is an element, empty
                  * or not: ("${s[@]}") with s=(a "" b) is three. A field
@@ -3129,6 +3146,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             }
             f = 0;
             elem = false;
+            seg_quoted = false;
             if (end) break;
             if (sl > 0) {
                 /* the rest of the delimiter, as shell_split_add takes it */
@@ -3146,6 +3164,11 @@ static int sh_array_store_expanded(const char *name, const char *ex,
             }
             continue;
         }
+        /* A QUOTED METACHARACTER IS LITERAL to the globber below: the
+         * no-split marks wrap exactly the quoted spans here (the written
+         * text's IFS bytes are escaped instead, see g_expand_literal_ifs_data). */
+        if (in_nosplit && shell_glob_meta(*q) && f + 1 < field_cap)
+            field[f++] = SHELL_GLOB_ESC;
         if (f + 1 < field_cap) field[f++] = *q;
         elem = true;
     }
@@ -3482,8 +3505,10 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
              * the ordinary word path does it after expansion. `a=(~/src)`
              * was storing the tilde. */
             if (!quoted && shell_word_tilde(&ex) < 0) return -1;
-            /* An UNQUOTED element field splits -- `a=($v)` with v='1 2 3'
-             * is three elements -- and a quoted one never does. */
+            /* An element field splits -- `a=($v)` with v='1 2 3' is three
+             * elements -- outside its quoted spans: `a=($v"")` splits $v,
+             * and `a=(*"x")` globs. A quote anywhere in the element turned
+             * both off for all of it (logs/b13 q32). */
             if (q) {
                 /* the fields, in order, through a scratch array of their
                  * own (the splitting and globbing live in the store) */
@@ -3493,8 +3518,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                           scr_seq++);
                 if (!sh_array_create(scr)) return -1;
                 long sn = 0;
-                int rc = sh_array_store_expanded(scr, ex.p, !quoted, quoted,
-                                                 &sn);
+                int rc = sh_array_store_expanded(scr, ex.p, true, quoted, &sn);
                 /* the store numbered them 0.. as it went */
                 for (long i = 0; rc == 0 && i < sn; i++) {
                     const char *fv = sh_array_get(scr, i);
@@ -3502,7 +3526,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                 }
                 sh_array_unset_literal(scr);
                 if (rc < 0) return -1;
-            } else if (sh_array_store_expanded(dst, ex.p, !quoted, quoted,
+            } else if (sh_array_store_expanded(dst, ex.p, true, quoted,
                                                &next) < 0) {
                 return -1;
             }
