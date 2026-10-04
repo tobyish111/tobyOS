@@ -22145,10 +22145,19 @@ static const char *resolve_program(const char *name, char *out_buf,
 static const char *phash_search(const char *name);
 static void phash_insert(const char *name, const char *path, int hits,
                          bool chkdot);
+/* Did the last resolve_program_run answer from the table? Then a path
+ * that is not there is reported by that PATH, as bash's execve error is:
+ *
+ *     BASH_CMDS[nosuch]=/no/such; nosuch
+ *         bash: /no/such: No such file or directory      (127)
+ *
+ * tsh said "nosuch: command not found" (logs/b13 q10). */
+static bool g_resolve_hashed;
 static const char *resolve_program_run(const char *name, char *out_buf,
                                        size_t out_sz, int *how) {
     int ignored;
     if (!how) how = &ignored;
+    g_resolve_hashed = false;
     bool slash = false;
     for (const char *c = name; *c; c++) if (*c == '/') { slash = true; break; }
     bool hashable = !slash && !g_spawn_temp_path && g_opt_hashall && *name;
@@ -22160,6 +22169,7 @@ static const char *resolve_program_run(const char *name, char *out_buf,
                 memcpy(out_buf, h, l + 1);
                 *how = CMDRES_EXEC;
                 g_resolve_nopath = false;
+                g_resolve_hashed = true;
                 return out_buf;
             }
         }
@@ -22383,6 +22393,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
     }
     char path_buf[VFS_PATH_MAX];
     const char *path = resolve_program_run(path_arg, path_buf, sizeof(path_buf), 0);
+    const char *report_as = g_resolve_hashed ? path : path_arg;
 
     struct proc_spec spec = {
         .path = path,
@@ -22433,7 +22444,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             }
         }
         if (pid < 0) {
-            if (why != 0) status = shell_report_unrunnable(path_arg, status);
+            if (why != 0) status = shell_report_unrunnable(report_as, status);
             g_shell_fd[2] = spawn_diag_saved;
             return status;
         }
@@ -33866,6 +33877,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     char path_buf[VFS_PATH_MAX];
     g_spawn_temp_path = shell_prefix_path(cmd->argv, assignc, envp, envc);
     const char *path = resolve_program_run(argv[0], path_buf, sizeof(path_buf), 0);
+    const char *report_as = g_resolve_hashed ? path : argv[0];
     g_spawn_temp_path = 0;
     struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
         (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n) *
@@ -33905,7 +33917,7 @@ static int shell_spawn_pipeline_stage(struct shell_simple *cmd,
     }
     shell_fd_state_close_owned(&fds);
     if (pid < 0) {
-        if (why != 0) status = shell_report_unrunnable(argv[0], status);
+        if (why != 0) status = shell_report_unrunnable(report_as, status);
         return status;
     }
     *out_pid = pid;
