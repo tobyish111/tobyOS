@@ -1031,6 +1031,25 @@ static bool g_opt_hashall = true;
 static bool g_opt_emacs;
 static bool g_opt_vi;
 static bool g_opt_expand_aliases;
+/* THE REST OF bash's `set` OPTIONS (logs/b13 q25 q26). tsh had none of
+ * them, so `set -k` and the rest were "unknown flag" and `set -o` was short:
+ *   -B braceexpand  on by default; off turns brace expansion off
+ *   -T functrace    functions (and $( )) inherit the DEBUG and RETURN traps
+ *   -H histexpand   `!` history expansion (a terminal's; kept as state)
+ *   -k keyword      every assignment word is environment for the command
+ *   -t onecmd       a script ends after the command that set it
+ *   -P physical     cd and pwd follow no symlinks (tobyOS has none)
+ *   -p privileged   kept as state
+ * interactive-comments is the shopt of that name. */
+static bool g_opt_braceexpand = true;
+static bool g_opt_functrace;
+static bool g_opt_histexpand;
+static bool g_opt_keyword;
+static bool g_opt_onecmd;
+static bool g_opt_physical;
+static bool g_opt_privileged;
+static bool g_restricted;
+static void sh_builtin_usage(const char *name);
 /* `set -o history`: record the lines the shell reads. On at a terminal, off
  * in a script and for -c, as in bash -- shell_set_interactive_hosted. It was
  * not an option at all until S6. */
@@ -1149,6 +1168,9 @@ struct shell_function {
     int            lm_n;
     /* `readonly -f` (S4): not redefined, not unset. */
     bool   readonly;
+    /* `declare -ft` (bash's trace attribute): the function inherits the
+     * DEBUG and RETURN traps, as every function does under `set -T`. */
+    bool   traced;
     /* When the NAME was defined (g_fn_seq): bash's function table puts a
      * new name in front of its bucket and a redefinition where it was, and
      * the exported ones reach a child in that table's order. */
@@ -1297,6 +1319,8 @@ static void prompt(void);
 static void execute_line_text(const char *src);
 static void shell_trap_text(const char *action);
 static void execute_line_text_inner(const char *src);
+struct shell_simple;
+static int shell_keyword_hoist(struct shell_simple *cmd);
 static void shell_parse_error(void);
 
 /* 0 while no line is executing; 1 inside an input line; >1 inside a segment,
@@ -5105,12 +5129,15 @@ static void shell_run_err_trap(int status) {
 static bool g_debug_trap_running;
 static void shell_run_debug_trap(void) {
     if (g_debug_trap_running) return;
-    if (g_fn_depth > 0) return;
-    /* Not inside `$( )` and not in a pipeline stage's child: bash runs no
-     * DEBUG trap in a command substitution, and a pipeline's stages are
-     * accounted for by the parent, once per stage, before it starts them
-     * (`false | false | false` is three firings on the same line). */
-    if (g_capture_depth > 0 || g_in_pipeline_stage) return;
+    /* A function that does not inherit the trap runs without it: the call
+     * takes it away for the body and puts it back (shell_run_function), as
+     * bash's execute_function does -- so it is simply not set in there. */
+    /* Not inside `$( )` -- unless `set -T` -- and not in a pipeline stage's
+     * child: bash runs no DEBUG trap in a command substitution, and a
+     * pipeline's stages are accounted for by the parent, once per stage,
+     * before it starts them (`false | false | false` is three firings on
+     * the same line). */
+    if ((g_capture_depth > 0 && !g_opt_functrace) || g_in_pipeline_stage) return;
     const char *act = shell_trap_live(SHELL_TRAP_DEBUG);
     if (!act || !*act) return;
     char *action = shell_strdup(act);
@@ -7821,6 +7848,45 @@ static void shell_optvar_put(const char *name, const char *val) {
     }
 }
 
+/* bash's `set -o` table, in its order: the name, the variable, and the
+ * flag letter (0 for none). One table for the setters, the listings, the
+ * questions and $SHELLOPTS -- it was five lists, each missing different
+ * options. */
+static const struct shell_optdef {
+    const char *name;
+    bool *var;
+    char flag;
+} g_optdefs[] = {
+    { "allexport",   &g_opt_allexport,   'a' },
+    { "braceexpand", &g_opt_braceexpand, 'B' },
+    { "emacs",       &g_opt_emacs,       0 },
+    { "errexit",     &g_opt_errexit,     'e' },
+    { "errtrace",    &g_opt_errtrace,    'E' },
+    { "functrace",   &g_opt_functrace,   'T' },
+    { "hashall",     &g_opt_hashall,     'h' },
+    { "histexpand",  &g_opt_histexpand,  'H' },
+    { "history",     &g_opt_history,     0 },
+    { "ignoreeof",   &g_opt_ignoreeof,   0 },
+    { "interactive-comments", &g_shopt_interactive_comments, 0 },
+    { "keyword",     &g_opt_keyword,     'k' },
+    { "monitor",     &g_opt_monitor,     'm' },
+    { "noclobber",   &g_opt_noclobber,   'C' },
+    { "noexec",      &g_opt_noexec,      'n' },
+    { "noglob",      &g_opt_noglob,      'f' },
+    { "nolog",       &g_opt_nolog,       0 },
+    { "notify",      &g_opt_notify,      'b' },
+    { "nounset",     &g_opt_nounset,     'u' },
+    { "onecmd",      &g_opt_onecmd,      't' },
+    { "physical",    &g_opt_physical,    'P' },
+    { "pipefail",    &g_opt_pipefail,    0 },
+    { "posix",       &g_opt_posix,       0 },
+    { "privileged",  &g_opt_privileged,  'p' },
+    { "verbose",     &g_opt_verbose,     'v' },
+    { "vi",          &g_opt_vi,          0 },
+    { "xtrace",      &g_opt_xtrace,      'x' },
+};
+#define SHELL_NOPTDEFS (sizeof g_optdefs / sizeof g_optdefs[0])
+
 static void shell_optvars_refresh(void) {
     static bool marked;
     if (!marked) {
@@ -7828,26 +7894,12 @@ static void shell_optvars_refresh(void) {
         (void)shell_readonly_mark("SHELLOPTS", 9);
         (void)shell_readonly_mark("BASHOPTS", 8);
     }
-    const struct { const char *name; bool on; } so[] = {
-        { "allexport", g_opt_allexport }, { "braceexpand", true },
-        { "emacs", g_opt_emacs },         { "errexit", g_opt_errexit },
-        { "errtrace", g_opt_errtrace },
-        { "hashall", g_opt_hashall },     { "history", g_opt_history },
-        { "ignoreeof", g_opt_ignoreeof },
-        { "interactive-comments", g_shopt_interactive_comments },
-        { "monitor", g_opt_monitor },     { "noclobber", g_opt_noclobber },
-        { "noexec", g_opt_noexec },       { "noglob", g_opt_noglob },
-        { "nolog", g_opt_nolog },         { "notify", g_opt_notify },
-        { "nounset", g_opt_nounset },     { "pipefail", g_opt_pipefail },
-        { "posix", g_opt_posix },         { "verbose", g_opt_verbose },
-        { "vi", g_opt_vi },               { "xtrace", g_opt_xtrace },
-    };
     SH_SB(sv);
     (void)sb_puts(&sv, "");
-    for (size_t i = 0; i < sizeof so / sizeof so[0]; i++) {
-        if (!so[i].on) continue;
+    for (size_t i = 0; i < SHELL_NOPTDEFS; i++) {
+        if (!*g_optdefs[i].var) continue;
         if (sv.len && sb_putc(&sv, ':') < 0) return;
-        if (sb_puts(&sv, so[i].name) < 0) return;
+        if (sb_puts(&sv, g_optdefs[i].name) < 0) return;
     }
     shell_optvar_put("SHELLOPTS", sv.p);
     /* bash 5.2's shopt names, in order; the table holds some of its own */
@@ -8419,6 +8471,7 @@ static void cmd_declare(int argc, char **argv) {
     bool print_mode = false;
     bool any_opt = false;      /* any option letter at all was given */
     bool func_mode = false;    /* -f or -F: this is about FUNCTIONS */
+    bool set_trace = false, clear_trace = false;   /* -t / +t */
     bool func_names = false;   /* -F: names only, no bodies */
     int i = 1;
     for (; i < argc; i++) {
@@ -8454,7 +8507,8 @@ static void cmd_declare(int argc, char **argv) {
             case 'i': if (on) attr_on |= SHVAR_INTEGER; else attr_off |= SHVAR_INTEGER; break;
             case 'l': if (on) attr_on |= SHVAR_LOWER;   else attr_off |= SHVAR_LOWER;   break;
             case 'u': if (on) attr_on |= SHVAR_UPPER;   else attr_off |= SHVAR_UPPER;   break;
-            case 'I': case 't': break;
+            case 't': if (on) set_trace = true; else clear_trace = true; break;
+            case 'I': break;
             default:  bad = *f; break;
             }
         }
@@ -8526,10 +8580,14 @@ static void cmd_declare(int argc, char **argv) {
         for (; i < argc; i++) {
             const struct shell_function *fn = shell_function_lookup(argv[i]);
             if (!fn) { missing = true; continue; }
-            /* `declare -fx NAME` / `+fx` set the attribute and print nothing */
-            if (set_export || clear_export) {
+            /* `declare -fx NAME` / `+fx` set the attribute and print nothing,
+             * and so do -ft / +ft (the trace attribute) */
+            if (set_export || clear_export || set_trace || clear_trace) {
                 int fi = shell_function_find(argv[i]);
-                if (fi >= 0) g_functions[fi].exported = set_export;
+                if (fi >= 0 && (set_export || clear_export))
+                    g_functions[fi].exported = set_export;
+                if (fi >= 0 && (set_trace || clear_trace))
+                    g_functions[fi].traced = set_trace;
                 continue;
             }
             /* under `shopt -s extdebug`, `declare -F NAME` gives the line
@@ -9287,106 +9345,46 @@ static void cmd_unset(int argc, char **argv) {
     }
 }
 
+
 static bool shell_set_opt(char c, bool on) {
-    switch (c) {
-    case 'e': g_opt_errexit = on; return true;
-    case 'u': g_opt_nounset = on; return true;
-    case 'x': g_opt_xtrace = on; return true;
-    case 'E': g_opt_errtrace = on; return true;
-    case 'f': g_opt_noglob = on; return true;
-    case 'v': g_opt_verbose = on; return true;
-    case 'C': g_opt_noclobber = on; return true;
-    case 'b': g_opt_notify = on; return true;
-    case 'n': g_opt_noexec = on; return true;
-    case 'a': g_opt_allexport = on; return true;
-    case 'm': g_opt_monitor = on; return true;
-    case 'h': g_opt_hashall = on; return true;
-    default: return false;
-    }
+    for (size_t i = 0; i < SHELL_NOPTDEFS; i++)
+        if (g_optdefs[i].flag == c) {
+            *g_optdefs[i].var = on;
+            return true;
+        }
+    return false;
 }
 
-/* `set -o` (table) and `set +o` (reinput form). Both use bash's exact line
- * formats -- "%-15s\ton" and "set -o name" -- because the parity gate greps
- * single lines out of this output against real bash's. The table is shorter
- * than bash's (tsh carries fewer options); a case must therefore filter to a
- * named option, never compare the whole listing. */
+/* `set -o` (table) and `set +o` (reinput form), bash's lines exactly --
+ * "%-15s\ton" and "set -o name" -- and now bash's whole table. */
 static void shell_print_options(bool reinput) {
-    const struct { const char *name; bool on; } t[] = {
-        { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
-        { "errtrace",  g_opt_errtrace },
-        { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
-        { "ignoreeof", g_opt_ignoreeof }, { "monitor",   g_opt_monitor },
-        { "noclobber", g_opt_noclobber }, { "noexec",    g_opt_noexec },
-        { "noglob",    g_opt_noglob },    { "nolog",     g_opt_nolog },
-        { "notify",    g_opt_notify },    { "nounset",   g_opt_nounset },
-        { "pipefail",  g_opt_pipefail },  { "posix",     g_opt_posix },
-        { "verbose",   g_opt_verbose },
-        { "xtrace",    g_opt_xtrace },
-        /* The line-editing modes must be LISTED even though nothing here
-         * reads them: a name missing from the listing is not the same
-         * answer as a name that is off. */
-        { "emacs",     g_opt_emacs },    { "vi",        g_opt_vi },
-    };
-    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++) {
+    for (size_t i = 0; i < SHELL_NOPTDEFS; i++) {
+        bool on = *g_optdefs[i].var;
         if (reinput)
-            shell_printf("set %co %s\n", t[i].on ? '-' : '+', t[i].name);
+            shell_printf("set %co %s\n", on ? '-' : '+', g_optdefs[i].name);
         else
-            shell_printf("%-15s\t%s\n", t[i].name, t[i].on ? "on" : "off");
+            shell_printf("%-15s\t%s\n", g_optdefs[i].name, on ? "on" : "off");
     }
 }
 
-/* The state of a `set -o` option by NAME. The printer above walks the
- * whole table and the setter takes a name, but nothing could ASK about
- * one -- which is what `shopt -o NAME` and `shopt -po NAME` need. */
+/* The state of a `set -o` option by NAME -- `shopt -o NAME`. */
 static bool shell_opt_state_by_name(const char *name, bool *out) {
-    const struct { const char *name; bool on; } t[] = {
-        { "allexport", g_opt_allexport }, { "errexit",   g_opt_errexit },
-        { "errtrace",  g_opt_errtrace },
-        { "hashall",   g_opt_hashall },   { "history",   g_opt_history },
-        { "ignoreeof", g_opt_ignoreeof },
-        { "monitor",   g_opt_monitor },   { "noclobber", g_opt_noclobber },
-        { "noexec",    g_opt_noexec },    { "noglob",    g_opt_noglob },
-        { "nolog",     g_opt_nolog },     { "notify",    g_opt_notify },
-        { "nounset",   g_opt_nounset },   { "pipefail",  g_opt_pipefail },
-        { "posix",     g_opt_posix },     { "verbose",   g_opt_verbose },
-        { "xtrace",    g_opt_xtrace },
-    };
-    for (size_t i = 0; i < sizeof(t)/sizeof(t[0]); i++)
-        if (strcmp(name, t[i].name) == 0) { *out = t[i].on; return true; }
-    if (strcmp(name, "emacs") == 0) { *out = g_opt_emacs; return true; }
-    if (strcmp(name, "vi")    == 0) { *out = g_opt_vi;    return true; }
+    for (size_t i = 0; i < SHELL_NOPTDEFS; i++)
+        if (strcmp(name, g_optdefs[i].name) == 0) {
+            *out = *g_optdefs[i].var;
+            return true;
+        }
     return false;
 }
 
 static bool shell_set_opt_by_name(const char *name, bool on) {
-    struct { const char *name; char flag; } map[] = {
-        {"errexit", 'e'}, {"nounset", 'u'}, {"xtrace", 'x'},
-        {"errtrace", 'E'},
-        {"noglob", 'f'}, {"verbose", 'v'}, {"noclobber", 'C'},
-        {"notify", 'b'}, {"noexec", 'n'}, {"allexport", 'a'},
-        {"monitor", 'm'}, {"hashall", 'h'},
-    };
-    if (strcmp(name, "pipefail")  == 0) { g_opt_pipefail  = on; return true; }
-    if (strcmp(name, "posix")     == 0) { g_opt_posix     = on; return true; }
-    if (strcmp(name, "ignoreeof") == 0) { g_opt_ignoreeof = on; return true; }
-    if (strcmp(name, "nolog")     == 0) { g_opt_nolog     = on; return true; }
-    if (strcmp(name, "history")   == 0) { g_opt_history   = on; return true; }
-    for (size_t i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
-        if (strcmp(name, map[i].name) == 0)
-            return shell_set_opt(map[i].flag, on);
-    }
-    /* The line-editing modes. Nothing in tsh reads them, but they are
-     * state, not a no-op: a script sets one and reads it back. Turning
-     * one ON turns the other OFF -- bash allows only one mode at a time.
-     * Turning one OFF leaves the other alone; +o emacs does not mean vi. */
-    if (strcmp(name, "emacs") == 0) {
-        g_opt_emacs = on;
-        if (on) g_opt_vi = false;
-        return true;
-    }
-    if (strcmp(name, "vi") == 0) {
-        g_opt_vi = on;
-        if (on) g_opt_emacs = false;
+    for (size_t i = 0; i < SHELL_NOPTDEFS; i++) {
+        if (strcmp(name, g_optdefs[i].name) != 0) continue;
+        *g_optdefs[i].var = on;
+        /* the line-editing modes are one at a time: turning one ON turns
+         * the other off; turning one off leaves the other alone */
+        if (on && g_optdefs[i].var == &g_opt_emacs) g_opt_vi = false;
+        if (on && g_optdefs[i].var == &g_opt_vi) g_opt_emacs = false;
         return true;
     }
     return false;
@@ -9394,26 +9392,29 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
 
 /* Is a `set -o` option currently on? Used by `test -o NAME`. */
 static bool shell_option_is_set(const char *name) {
-    if (!name) return false;
-    if (strcmp(name, "errexit")   == 0) return g_opt_errexit;
-    if (strcmp(name, "nounset")   == 0) return g_opt_nounset;
-    if (strcmp(name, "xtrace")    == 0) return g_opt_xtrace;
-    if (strcmp(name, "noglob")    == 0) return g_opt_noglob;
-    if (strcmp(name, "verbose")   == 0) return g_opt_verbose;
-    if (strcmp(name, "noclobber") == 0) return g_opt_noclobber;
-    if (strcmp(name, "notify")    == 0) return g_opt_notify;
-    if (strcmp(name, "noexec")    == 0) return g_opt_noexec;
-    if (strcmp(name, "allexport") == 0) return g_opt_allexport;
-    if (strcmp(name, "pipefail")  == 0) return g_opt_pipefail;
-    if (strcmp(name, "posix")     == 0) return g_opt_posix;
-    if (strcmp(name, "monitor")   == 0) return g_opt_monitor;
-    if (strcmp(name, "ignoreeof") == 0) return g_opt_ignoreeof;
-    if (strcmp(name, "nolog")     == 0) return g_opt_nolog;
-    if (strcmp(name, "hashall")   == 0) return g_opt_hashall;
-    if (strcmp(name, "history")   == 0) return g_opt_history;
-    if (strcmp(name, "emacs")     == 0) return g_opt_emacs;
-    if (strcmp(name, "vi")        == 0) return g_opt_vi;
-    return false;
+    bool on = false;
+    return name && shell_opt_state_by_name(name, &on) && on;
+}
+
+/* $-: bash's which_set_flags -- the set flags in its table's order, `i`
+ * for an interactive shell, then `c` for -c and `s` for commands read from
+ * standard input. */
+static bool g_flag_c, g_flag_s;     /* -c, and commands read from stdin */
+static void shell_dollar_dash(struct shell_sb *out) {
+    static const char order[] = "abefhikmnprtuvxBCEHPT";
+    for (const char *o = order; *o; o++) {
+        bool on;
+        if (*o == 'i') on = g_interactive;
+        else if (*o == 'r') on = g_restricted;
+        else {
+            on = false;
+            for (size_t i = 0; i < SHELL_NOPTDEFS; i++)
+                if (g_optdefs[i].flag == *o) { on = *g_optdefs[i].var; break; }
+        }
+        if (on) (void)sb_putc(out, *o);
+    }
+    if (g_flag_c) (void)sb_putc(out, 'c');
+    if (g_flag_s) (void)sb_putc(out, 's');
 }
 
 /* `set` with no arguments prints every variable as you would TYPE it.
@@ -16566,6 +16567,15 @@ static int shell_run_script_text(char *text, bool run_exit_trap) {
             g_nofork_pending = nofork_scope && *p == '\0';
             execute_line_text(line);
             g_nofork_pending = false;
+            /* `set -t` (onecmd): bash's reader_loop stops after the command
+             * that is running when it is set -- in a script; -c and `.`
+             * read their text otherwise (logs/b13 q26) */
+            if (g_opt_onecmd && !syn_string && !comsub_lines &&
+                g_source_depth == 0 && g_script_depth == 1 &&
+                g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = g_last_status;
+            }
         }
         /* bash notifies as it reads the NEXT line (parse.y shell_getc:
          * line_number++, then notify_and_cleanup), so a report names that
@@ -24343,23 +24353,8 @@ static int shell_parameter_value(const char *name, struct shell_sb *out,
     } else if (strcmp(name, "#") == 0) {
         rc = sb_put_uint(out, (unsigned long)g_positional_count);
     } else if (strcmp(name, "-") == 0) {
-        char opts[16];
-        int oi = 0;
-        if (g_opt_allexport) opts[oi++] = 'a';
-        if (g_opt_notify)    opts[oi++] = 'b';
-        if (g_opt_errexit)   opts[oi++] = 'e';
-        if (g_opt_noglob)    opts[oi++] = 'f';
-        if (g_opt_hashall)   opts[oi++] = 'h';
-        if (g_opt_monitor)   opts[oi++] = 'm';
-        if (g_opt_noexec)    opts[oi++] = 'n';
-        if (g_opt_nounset)   opts[oi++] = 'u';
-        if (g_opt_verbose)   opts[oi++] = 'v';
-        if (g_opt_xtrace)    opts[oi++] = 'x';
-        opts[oi++] = 'B';           /* braceexpand: bash's `hB` */
-        if (g_opt_noclobber) opts[oi++] = 'C';
-        if (g_opt_errtrace)  opts[oi++] = 'E';
-        opts[oi] = '\0';
-        rc = sb_puts(out, opts);
+        shell_dollar_dash(out);
+        rc = 0;
     } else if (strcmp(name, "*") == 0 || strcmp(name, "@") == 0) {
         /* $@ and $* are SET only when there is a parameter: with none,
          * ${@-minus} is minus and ${@+plus} nothing (bash; Oils 2544). */
@@ -27838,23 +27833,8 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
     if (*p == '-') {
         p++;
         *pp = p;
-        char opts[16];
-        int oi = 0;
-        if (g_opt_allexport) opts[oi++] = 'a';
-        if (g_opt_notify)    opts[oi++] = 'b';
-        if (g_opt_errexit)   opts[oi++] = 'e';
-        if (g_opt_noglob)    opts[oi++] = 'f';
-        if (g_opt_hashall)   opts[oi++] = 'h';
-        if (g_opt_monitor)   opts[oi++] = 'm';
-        if (g_opt_noexec)    opts[oi++] = 'n';
-        if (g_opt_nounset)   opts[oi++] = 'u';
-        if (g_opt_verbose)   opts[oi++] = 'v';
-        if (g_opt_xtrace)    opts[oi++] = 'x';
-        opts[oi++] = 'B';           /* braceexpand: bash's `hB` */
-        if (g_opt_noclobber) opts[oi++] = 'C';
-        if (g_opt_errtrace)  opts[oi++] = 'E';
-        opts[oi] = '\0';
-        return sb_puts(b, opts);
+        shell_dollar_dash(b);
+        return 0;
     }
     if (*p == '*') {
         p++;
@@ -28277,7 +28257,8 @@ static int shell_brace_range(const char *body, size_t blen,
  * each result, which is what makes `{a,b}{c,d}` produce four words. */
 static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
                             int depth) {
-    if (depth >= SH_BRACE_DEPTH_MAX)
+    /* `set +B`: no brace expansion at all -- {a,b} is itself */
+    if (depth >= SH_BRACE_DEPTH_MAX || !g_opt_braceexpand)
         return shell_brace_emit(w, wlen, out);
 
     size_t open = 0;
@@ -32148,7 +32129,60 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             continue;
         }
     }
+    if (g_opt_keyword)
+        for (int i = 0; i < pl->count; i++)
+            if (shell_keyword_hoist(&pl->stage[i]) < 0) return -1;
     return pl->count;
+}
+
+/* `set -k` (bash's place_keywords_in_env): EVERY word written as an
+ * assignment is environment for the command, not only the ones before
+ * its name:
+ *
+ *     set -k; echo a=1 b          bash: b
+ *     set -k; f v=3               f sees v=3
+ *
+ * They move to the front, after the prefix, in the order written; the
+ * other words keep theirs, and their noassign marks (logs/b13 q26). */
+static bool shell_is_assignment_word(const char *s);
+static int shell_keyword_hoist(struct shell_simple *cmd) {
+    int n = cmd->argc, pre = 0;
+    while (pre < n && !shell_simple_noassign(cmd, pre) &&
+           shell_is_assignment_word(cmd->argv[pre]))
+        pre++;
+    if (pre >= n) return 0;
+    int moves = 0;
+    for (int k = pre + 1; k < n; k++)
+        if (!shell_simple_noassign(cmd, k) && shell_is_assignment_word(cmd->argv[k]))
+            moves++;
+    if (!moves) return 0;
+    char **nv = (char **)kmalloc((size_t)n * sizeof(char *));
+    bool *nna = (bool *)kmalloc((size_t)n * sizeof(bool));
+    if (!nv || !nna) { kfree(nv); kfree(nna); return -1; }
+    int o = 0;
+    for (int k = 0; k < pre; k++) { nv[o] = cmd->argv[k]; nna[o++] = false; }
+    for (int k = pre + 1; k < n; k++)
+        if (!shell_simple_noassign(cmd, k) && shell_is_assignment_word(cmd->argv[k])) {
+            nv[o] = cmd->argv[k];
+            nna[o++] = false;
+        }
+    for (int k = pre; k < n; k++) {
+        if (k > pre && !shell_simple_noassign(cmd, k) &&
+            shell_is_assignment_word(cmd->argv[k]))
+            continue;
+        nv[o] = cmd->argv[k];
+        nna[o++] = shell_simple_noassign(cmd, k);
+    }
+    cmd->arg_noassign = 0;
+    cmd->arg_noassign_cap = 0;
+    int rc = 0;
+    for (int k = 0; k < n; k++) {
+        cmd->argv[k] = nv[k];
+        if (nna[k] && shell_simple_mark_noassign(cmd, k) < 0) rc = -1;
+    }
+    kfree(nv);
+    kfree(nna);
+    return rc;
 }
 
 static bool shell_is_assignment_word(const char *s) {
@@ -33988,6 +34022,23 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_diag_in_fn = true;
         shell_hd_pin_text(run_body, +1);
         shell_callframe_push(run_name, g_shell_lineno);
+        /* THE TRAPS A FUNCTION DOES NOT INHERIT ARE TAKEN AWAY for its body
+         * and put back after -- unless it set its own -- as bash's
+         * execute_function does: DEBUG and RETURN, unless `set -T` or
+         * `declare -ft`. Inheriting, the DEBUG trap also fires once as the
+         * body starts. And a RETURN trap fires when the body ends, in the
+         * function's context (logs/b13 q26: `g() { trap 'echo R2' RETURN; }`
+         * printed nothing). */
+        bool traced = g_opt_functrace || fn->traced;
+        char *saved_dbg = 0, *saved_ret = 0;
+        if (!traced) {
+            saved_dbg = g_traps[SHELL_TRAP_DEBUG];
+            g_traps[SHELL_TRAP_DEBUG] = 0;
+            if (!g_debug_trap_running) {
+                saved_ret = g_traps[SHELL_TRAP_RETURN];
+                g_traps[SHELL_TRAP_RETURN] = 0;
+            }
+        }
         /* The body's own lines for $LINENO, and the caller's back after. */
         unsigned long call_line = g_shell_lineno;
         /* bash's line_number in a body: the line the body starts on, until
@@ -33998,8 +34049,34 @@ static int shell_run_function(struct shell_simple *cmd) {
         struct shell_lmap_saved lm_sv;
         bool lm_in = shell_lmap_enter_body(fn->lm_off, fn->lm_line, fn->lm_n,
                                            run_body, &lm_sv);
-        execute_line_text(run_body);
+        if (traced) shell_run_debug_trap();
+        if (g_shell_flow == SHELL_FLOW_NONE) execute_line_text(run_body);
+        if (g_traps[SHELL_TRAP_RETURN]) {
+            /* $? is the function's status in it; a `return` already
+             * underway is put back after */
+            enum shell_flow fl = g_shell_flow;
+            int fls = g_shell_flow_status;
+            if (fl == SHELL_FLOW_RETURN) {
+                shell_set_status(fls);
+                g_shell_flow = SHELL_FLOW_NONE;
+            }
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                shell_run_return_trap();
+                if (g_shell_flow == SHELL_FLOW_NONE && fl == SHELL_FLOW_RETURN) {
+                    g_shell_flow = fl;
+                    g_shell_flow_status = fls;
+                }
+            }
+        }
         if (lm_in) shell_lmap_leave_body(&lm_sv);
+        if (saved_dbg) {
+            if (!g_traps[SHELL_TRAP_DEBUG]) g_traps[SHELL_TRAP_DEBUG] = saved_dbg;
+            else kfree(saved_dbg);
+        }
+        if (saved_ret) {
+            if (!g_traps[SHELL_TRAP_RETURN]) g_traps[SHELL_TRAP_RETURN] = saved_ret;
+            else kfree(saved_ret);
+        }
         g_shell_lineno = call_line;
         g_bash_lnum = bl_save;
         shell_callframe_pop();
