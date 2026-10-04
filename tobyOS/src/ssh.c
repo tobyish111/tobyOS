@@ -25,6 +25,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/vfs.h>
 #include <tobyos/pit.h>
 #include <tobyos/perf.h>
 #include <tobyos/signal.h>
@@ -133,6 +134,7 @@ struct ssh_channel {
     /* The client asked for a terminal. Without pty-req the channel is
      * a byte pipe and the line discipline has to stay out of the way. */
     bool         want_pty;
+    char         term[64];      /* pty-req's TERM, "" when none */
 };
 
 struct ssh_chachapoly_ctx {
@@ -1222,6 +1224,7 @@ static void ssh_handle_channel_request_payload(const uint8_t *payload,
             if (read_string(payload, n, &o, &term_s, &term_n) && o + 8u <= n) {
                 g_chan.win_cols = (uint16_t)get_u32_be(payload + o);
                 g_chan.win_rows = (uint16_t)get_u32_be(payload + o + 4u);
+                copy_ssh_string(g_chan.term, sizeof g_chan.term, term_s, term_n);
             }
         }
         if (want_reply && !ssh_send_channel_success(g_cli, recipient)) {
@@ -1413,6 +1416,47 @@ static void ssh_handle_channel_control_payload(const uint8_t *payload,
     }
 }
 
+/* The home directory /etc/passwd gives `user`, if it is a directory that
+ * exists; "/" otherwise. */
+static void ssh_passwd_home(const char *user, char *out, size_t cap) {
+    ksnprintf(out, cap, "%s", "/");
+    void *buf = 0;
+    size_t sz = 0;
+    size_t ul = strlen(user);
+    if (!ul || vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK) return;
+    const char *p = (const char *)buf, *end = p + sz;
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        const char *eol = p;
+        if (p < end) p++;
+        if ((size_t)(eol - line) <= ul || memcmp(line, user, ul) != 0 ||
+            line[ul] != ':')
+            continue;
+        int field = 0;
+        const char *f = line;
+        for (const char *q = line; q <= eol; q++) {
+            if (q != eol && *q != ':') continue;
+            if (field == 5 && q > f && (size_t)(q - f) < cap) {
+                char home[256];
+                size_t hl = (size_t)(q - f);
+                if (hl < sizeof home) {
+                    memcpy(home, f, hl);
+                    home[hl] = '\0';
+                    struct vfs_stat st;
+                    if (vfs_stat(home, &st) == VFS_OK && st.type == VFS_TYPE_DIR)
+                        ksnprintf(out, cap, "%s", home);
+                }
+                break;
+            }
+            field++;
+            f = q + 1;
+        }
+        break;
+    }
+    kfree(buf);
+}
+
 /* Start /bin/tsh on a fresh pty for this channel.
  *
  * Called ONLY from a tick where current_proc() is pid 0 -- see the note on
@@ -1425,6 +1469,7 @@ static void ssh_handle_channel_control_payload(const uint8_t *payload,
  * ours. Dropping it here leaves slave_refs == 3, all owned by the child, so
  * its exit takes them to zero -- which is exactly the EOF the pump below
  * watches for to close the channel. */
+
 static bool ssh_spawn_shell(void) {
     g_chan.want_spawn = false;
 
@@ -1456,6 +1501,38 @@ static bool ssh_spawn_shell(void) {
         argc = 3;
     }
 
+    /* THE LOGIN ENVIRONMENT, as sshd sets one up for a session: USER,
+     * LOGNAME, HOME, SHELL, PATH, and TERM when the client asked for a
+     * terminal. The session got NONE, and /bin/tsh made up HOME=/ and
+     * USER=admin and exported PATH for it; bash invents none of those under
+     * an empty environment, and /bin/tsh no longer does (logs/b13 q13).
+     * HOME is the account's /etc/passwd home when that directory exists --
+     * tobyOS makes none, and a HOME that is not there breaks `cd` -- and "/"
+     * otherwise, which is where sessions have always been; PATH is the
+     * /bin /bin/tsh always searched. */
+    char e_user[8 + USER_NAME_MAX], e_logname[8 + USER_NAME_MAX];
+    char e_home[8 + 256], e_term[8 + sizeof g_chan.term];
+    char e_shell[] = "SHELL=/bin/tsh", e_path[] = "PATH=/bin";
+    char *envp[8];
+    int envc = 0;
+    {
+        char home[256];
+        ssh_passwd_home(g_auth_user, home, sizeof home);
+        ksnprintf(e_user, sizeof e_user, "USER=%s", g_auth_user);
+        ksnprintf(e_logname, sizeof e_logname, "LOGNAME=%s", g_auth_user);
+        ksnprintf(e_home, sizeof e_home, "HOME=%s", home);
+        envp[envc++] = e_user;
+        envp[envc++] = e_logname;
+        envp[envc++] = e_home;
+        envp[envc++] = e_shell;
+        envp[envc++] = e_path;
+        if (g_chan.want_pty && g_chan.term[0]) {
+            ksnprintf(e_term, sizeof e_term, "TERM=%s", g_chan.term);
+            envp[envc++] = e_term;
+        }
+        envp[envc] = 0;
+    }
+
     struct proc_spec spec;
     memset(&spec, 0, sizeof(spec));
     spec.path = "/bin/tsh";
@@ -1463,6 +1540,8 @@ static bool ssh_spawn_shell(void) {
     spec.fd0 = sl; spec.fd1 = sl; spec.fd2 = sl;
     spec.argc = argc;
     spec.argv = argv;
+    spec.envc = envc;
+    spec.envp = envp;
     spec.cwd  = "/";
 
     int pid = proc_spawn(&spec);
