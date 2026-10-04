@@ -1491,11 +1491,15 @@ static bool ssh_spawn_shell(void) {
      * discipline out of the path entirely -- see pty_set_raw(). */
     if (!g_chan.want_pty) pty_set_raw(m);
 
-    char a0[] = "tsh", a1[] = "-c";
+    /* A SHELL SESSION IS A LOGIN SHELL, as sshd starts one: its name
+     * begins with `-` ("-tsh"), so it reads the login profiles (bash's
+     * run_startup_files). A command (`ssh host cmd`) is `tsh -c cmd`. */
+    char a0[] = "-tsh", a0c[] = "tsh", a1[] = "-c";
     char *argv[3];
     int   argc = 1;
     argv[0] = a0;
     if (g_chan.exec_mode && g_chan.exec_cmd[0]) {
+        argv[0] = a0c;
         argv[1] = a1;
         argv[2] = g_chan.exec_cmd;
         argc = 3;

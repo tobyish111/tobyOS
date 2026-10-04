@@ -962,12 +962,37 @@ int proc_try_reap(int pid, int *code) {
 
 /* ---- main --------------------------------------------------------------- */
 
-static void usage(void) {
-    fprintf(stderr,
-        "usage: tsh [script [args...]]\n"
-        "       tsh -c 'command'\n"
-        "       tsh              (interactive)\n");
+/* bash's long options, as it lists them (shell.c's long_args) */
+static const char *const g_long_opts[] = {
+    "debug", "debugger", "dump-po-strings", "dump-strings", "help",
+    "init-file", "login", "noediting", "noprofile", "norc", "posix",
+    "pretty-print", "rcfile", "restricted", "verbose", "version", 0 };
+
+static void usage(FILE *f, bool extra) {
+    fprintf(f, "Usage:\ttsh [long option] [option] ...\n"
+               "\ttsh [long option] [option] script-file ...\n");
+    fprintf(f, "Long options:\n");
+    for (int i = 0; g_long_opts[i]; i++) fprintf(f, "\t--%s\n", g_long_opts[i]);
+    fprintf(f, "Shell options:\n"
+               "\t-ilrsD or -c command or -O shopt_option\t\t(invocation only)\n"
+               "\t-abefhkmnptuvxBCEHPT or -o option\n");
+    if (extra)
+        fprintf(f, "\n`tsh -c \"help set\"' describes the shell options, and "
+                   "`tsh -c help' the builtins.\n");
 }
+
+extern bool shell_set_flag_hosted(char flag, bool on);
+extern bool shell_set_option_hosted(const char *name, bool on);
+extern void shell_list_options_hosted(bool reinput);
+extern bool shell_shopt_hosted(const char *name, bool on);
+extern void shell_list_shopts_hosted(bool reinput);
+extern void shell_set_invocation_hosted(bool c, bool s);
+extern void shell_set_login_hosted(void);
+extern void shell_startup_files_hosted(int login, bool interactive, bool norc,
+                                       bool noprofile, const char *rcfile,
+                                       bool act_like_sh);
+extern void shell_logout_hosted(void);
+extern void shell_make_restricted_hosted(void);
 
 /* Absorb tty job-control signals that reach the shell itself. A handler,
  * not SIG_IGN -- see the interactive setup below for why. */
@@ -1032,45 +1057,195 @@ int main(int argc, char **argv) {
         shell_set_var_hosted("PPID", pb);
     }
 
-    /* `-c` and a script file are NOT terminal sessions. Only the loop at the
-     * bottom of this function is, and it leaves the default alone. Getting
-     * this backwards makes a script expand aliases where bash does not. */
-    if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
-        shell_set_interactive_hosted(false);
-        /* `sh -c CMD NAME ARGS...`: NAME is $0 and ARGS are $1.., as POSIX
-         * and bash have it. NAME was taken as $1:
-         *
-         *     find . -exec sh -c 'echo "$1"' _ {} \;     printed `_`
-         *     sh -c 'echo $#' _ a b                       bash: 2, tsh: 3
-         */
-        if (argc > 3) {
-            (void)shell_set_param0_hosted(argv[3]);
-            if (argc > 4) (void)shell_set_args_hosted(argc - 4, argv + 4);
-        }
-        return shell_run_line_hosted(argv[2]);
-    }
-    /* --noediting: read the tty COOKED, no line editor. Same spelling and
-     * same meaning as bash, because the reasons to want it are the same --
-     * a harness comparing terminal byte streams, a terminal that mangles the
-     * escape sequences, or simply preferring the line discipline. Consumed
-     * here so it never reaches the script/-c arms below. */
+    /* BASH'S COMMAND LINE (shell.c's main, parse_long_options and
+     * parse_shell_options): long options first -- `--name`, or `-name` for a
+     * name on the list -- then clustered flags, `-` or `+` each: -c, -s, -l,
+     * -i, -r, -D, `-o NAME` / `-O NAME` (with no NAME, the listing), and any
+     * flag `set` takes; `-` or `--` ends them. Then the -c string and its $0
+     * and arguments, or a script and its arguments, or -- with -s, or with
+     * nothing left -- commands from standard input.
+     *
+     * tsh knew `-c`, a script and --noediting: `tsh -e script` -- which is
+     * what `#!/bin/bash -e` runs -- was a usage error, and so were -x, -o
+     * pipefail, -O extglob, -l, -s and the rest (logs/b13 q14 q27). */
+    const char *self = argv[0] ? argv[0] : "tsh";
+    bool o_c = false, o_s = false, o_l = false, o_i = false;
+    bool o_norc = false, o_noprofile = false, o_posix = false, o_restricted = false;
+    bool o_version = false, o_help = false, o_dump = false;
+    const char *rcfile = 0;
     int noediting = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--noediting") != 0) continue;
-        noediting = 1;
-        for (int j = i; j < argc - 1; j++) argv[j] = argv[j + 1];
-        argc--; argv[argc] = 0;
-        i--;
+    /* -o/-O requests and flags, applied in order once the line is read */
+    struct inv_req { char kind; bool on; const char *name; char flag; };
+    struct inv_req *reqs = (struct inv_req *)malloc((size_t)(argc + 1) * sizeof *reqs);
+    int nreq = 0;
+    if (!reqs) return 2;
+    int ai = 1;
+    while (ai < argc && argv[ai][0] == '-' && argv[ai][1]) {
+        const char *a = argv[ai];
+        bool dbl = a[1] == '-' && a[2];
+        const char *nm = dbl ? a + 2 : a + 1;
+        int k = 0;
+        while (g_long_opts[k] && strcmp(nm, g_long_opts[k]) != 0) k++;
+        if (!g_long_opts[k]) {
+            if (dbl) {
+                fprintf(stderr, "%s: %s: invalid option\n", self, a);
+                usage(stderr, false);
+                return 2;
+            }
+            break;                          /* a flag cluster: below */
+        }
+        if (!strcmp(nm, "init-file") || !strcmp(nm, "rcfile")) {
+            if (ai + 1 >= argc) {
+                fprintf(stderr, "%s: %s: option requires an argument\n", self, nm);
+                return 2;
+            }
+            rcfile = argv[++ai];
+        } else if (!strcmp(nm, "login")) o_l = true;
+        else if (!strcmp(nm, "noediting")) noediting = 1;
+        else if (!strcmp(nm, "noprofile")) o_noprofile = true;
+        else if (!strcmp(nm, "norc")) o_norc = true;
+        else if (!strcmp(nm, "posix")) o_posix = true;
+        else if (!strcmp(nm, "restricted")) o_restricted = true;
+        else if (!strcmp(nm, "verbose")) reqs[nreq++] = (struct inv_req){ 'f', true, 0, 'v' };
+        else if (!strcmp(nm, "version")) o_version = true;
+        else if (!strcmp(nm, "help")) o_help = true;
+        else if (!strcmp(nm, "debugger"))
+            reqs[nreq++] = (struct inv_req){ 'O', true, "extdebug", 0 };
+        else if (!strcmp(nm, "dump-strings") || !strcmp(nm, "dump-po-strings"))
+            o_dump = true;
+        /* --debug and --pretty-print: accepted, as bash accepts them */
+        ai++;
+    }
+    while (ai < argc && (argv[ai][0] == '-' || argv[ai][0] == '+')) {
+        const char *a = argv[ai];
+        if (a[1] == '\0' || (a[0] == '-' && a[1] == '-' && a[2] == '\0')) {
+            ai++;
+            break;
+        }
+        bool on = a[0] == '-';
+        int next = ai + 1;
+        for (const char *f = a + 1; *f; f++) {
+            switch (*f) {
+            case 'c': o_c = true; break;
+            case 's': o_s = true; break;
+            case 'l': o_l = true; break;
+            case 'i': o_i = on; break;
+            case 'r': o_restricted = true; break;
+            case 'D': o_dump = true; break;
+            case 'o':
+            case 'O':
+                if (next >= argc) {
+                    reqs[nreq++] = (struct inv_req){ (char)(*f == 'o' ? 'L' : 'S'), on, 0, 0 };
+                } else {
+                    reqs[nreq++] = (struct inv_req){ *f, on, argv[next], 0 };
+                    next++;
+                }
+                break;
+            default:
+                if (*f && strchr("abefhkmnptuvxBCEHPT", *f)) {
+                    reqs[nreq++] = (struct inv_req){ 'f', on, 0, *f };
+                } else {
+                    fprintf(stderr, "%s: %c%c: invalid option\n", self, a[0], *f);
+                    usage(stderr, false);
+                    return 2;
+                }
+            }
+        }
+        ai = next;
+    }
+    if (o_version) {
+        printf("tsh (tobyOS), GNU bash 5.2.15(1)-release compatible (x86_64-pc-tobyos)\n");
+        return 0;
+    }
+    if (o_help) {
+        usage(stdout, true);
+        return 0;
     }
 
-    if (argc >= 2 && argv[1][0] == '-' && argv[1][1] != '\0') {
-        usage();
-        return 2;
+    /* what to run, and is it interactive (bash's main: -i, or no -c and
+     * nothing left -- or -s -- with a terminal on stdin and stderr) */
+    const char *cmd = 0, *script = 0;
+    if (o_c) {
+        if (ai >= argc) {
+            fprintf(stderr, "%s: -c: option requires an argument\n", self);
+            return 2;
+        }
+        cmd = argv[ai++];
+        /* `sh -c CMD NAME ARGS...`: NAME is $0 and ARGS are $1.., and an
+         * option after the string is one of them (bash: `-c 'echo $-' -x`
+         * makes $0 "-x") */
+        if (ai < argc) {
+            (void)shell_set_param0_hosted(argv[ai++]);
+            if (ai < argc) (void)shell_set_args_hosted(argc - ai, argv + ai);
+        }
+    } else if (o_s || ai >= argc) {
+        o_s = true;
+        if (ai < argc) (void)shell_set_args_hosted(argc - ai, argv + ai);
+    } else {
+        script = argv[ai++];
+        if (ai < argc) (void)shell_set_args_hosted(argc - ai, argv + ai);
     }
-    if (argc >= 2) {
-        shell_set_interactive_hosted(false);
-        if (argc > 2) (void)shell_set_args_hosted(argc - 2, argv + 2);
-        return shell_run_script_hosted(argv[1]);
+    bool interactive = o_i || (!cmd && !script && isatty(0) && isatty(2));
+    shell_set_interactive_hosted(interactive);
+    shell_set_invocation_hosted(cmd != 0, o_s);
+
+    bool act_like_sh = false;
+    {
+        const char *b = strrchr(self, '/');
+        b = b ? b + 1 : self;
+        if (*b == '-') b++;
+        act_like_sh = strcmp(b, "sh") == 0;
+    }
+    if (o_posix) shell_set_posix_hosted(true);
+    int login = o_l ? -1 : (self[0] == '-' ? 1 : 0);
+    if (login) shell_set_login_hosted();
+
+    for (int r = 0; r < nreq; r++) {
+        struct inv_req *q = &reqs[r];
+        if (q->kind == 'f') {
+            (void)shell_set_flag_hosted(q->flag, q->on);
+        } else if (q->kind == 'o') {
+            if (!shell_set_option_hosted(q->name, q->on)) {
+                fprintf(stderr, "%s: line 0: %s: %s: invalid option name\n",
+                        self, self, q->name);
+                return 2;
+            }
+        } else if (q->kind == 'O') {
+            if (!shell_shopt_hosted(q->name, q->on)) {
+                fprintf(stderr, "%s: line 0: %s: invalid shell option name\n",
+                        self, q->name);
+                return 2;
+            }
+        } else if (q->kind == 'L') {
+            shell_list_options_hosted(!q->on);
+        } else if (q->kind == 'S') {
+            shell_list_shopts_hosted(!q->on);
+        }
+    }
+    free(reqs);
+    /* -D: the $"..." strings would be listed and nothing run (bash: -n);
+     * tsh translates none, so there are none to list */
+    if (o_dump) (void)shell_set_flag_hosted('n', true);
+
+    shell_startup_files_hosted(login, interactive, o_norc, o_noprofile, rcfile,
+                               act_like_sh);
+    /* restricted -- by -r, --restricted or the name rbash -- once the
+     * startup files have run (bash's maybe_make_restricted) */
+    {
+        const char *b = strrchr(self, '/');
+        b = b ? b + 1 : self;
+        if (*b == '-') b++;
+        if (o_restricted || strcmp(b, "rbash") == 0) shell_make_restricted_hosted();
+    }
+
+    if (cmd) {
+        int rc = shell_run_line_hosted(cmd);
+        shell_logout_hosted();
+        return rc;
+    }
+    if (script) {
+        int rc = shell_run_script_hosted(script);
+        return rc;
     }
 
     /* bash gives a shell at a terminal HISTSIZE=500 when it has none, and
@@ -1130,7 +1305,8 @@ int main(int argc, char **argv) {
                         fputs("Use \"exit\" to leave the shell.\n", stderr);
                         continue;
                     }
-                    write(1, "exit\n", 5);
+                    if (interactive) write(1, "exit\n", 5);
+                    shell_logout_hosted();
                     return last;
                 }
                 n = 0;
@@ -1140,7 +1316,7 @@ int main(int argc, char **argv) {
             goto have_line;
         }
 
-        write(1, ps, strlen(ps));
+        if (interactive) write(1, ps, strlen(ps));
         for (;;) {
             char c;
             long r = read(0, &c, 1);
@@ -1162,7 +1338,8 @@ int main(int argc, char **argv) {
                     /* bash announces an EOF exit -- the "exit" you see
                      * when ^D ends an interactive shell is printed by the
                      * shell, not echoed by the terminal. */
-                    write(1, "exit\n", 5);
+                    if (interactive) write(1, "exit\n", 5);
+                    shell_logout_hosted();
                     return last;
                 }
                 break;

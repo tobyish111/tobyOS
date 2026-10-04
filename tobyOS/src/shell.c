@@ -7032,6 +7032,22 @@ static void shell_tempenv_unregister(struct shell_prefix_save *sv) {
         }
 }
 
+/* Is NAME there only because a builtin's prefix assignment made it --
+ * bash's temporary environment, which `set`, `declare` and `export` do not
+ * list? (`set -k; export ka=1` listed ka; logs/b13 q26.) */
+static bool shell_name_only_in_tempenv(const char *name) {
+    for (int i = g_tempenvc - 1; i >= 0; i--) {
+        const struct shell_prefix_save *sv = g_tempenv[i];
+        if (sv->fncall || sv->scope) continue;
+        for (int k = sv->count - 1; k >= 0; k--) {
+            const struct shell_prefix_one *o = &sv->v[k];
+            if (!o->dead && o->name && strcmp(o->name, name) == 0)
+                return !o->had;
+        }
+    }
+    return false;
+}
+
 /* The innermost live prefix binding of `name`, or 0. */
 static struct shell_prefix_one *shell_tempenv_find(const char *name, int *level) {
     for (int i = g_tempenvc - 1; i >= 0; i--) {
@@ -8083,7 +8099,7 @@ static void shell_print_exported_sorted(void) {
         size_t kl = env_key_len(g_env[i]);
         if (kl == 0 || !shell_name_is_valid(g_env[i], kl)) continue;
         const char *k = words_store(&keys, g_env[i], kl);
-        if (k) names[n++] = k;
+        if (k && !shell_name_only_in_tempenv(k)) names[n++] = k;
     }
     for (int a = 1; a < n; a++) {
         const char *v = names[a];
@@ -8651,6 +8667,7 @@ static void cmd_declare(int argc, char **argv) {
             if (kl == 0) continue;
             char *nm = words_store(&keys, g_env[k], kl);
             if (!nm) { kfree(names); shell_set_status(1); return; }
+            if (shell_name_only_in_tempenv(nm)) continue;
             names[n++] = nm;
         }
         for (int k = 0; k < g_narrays; k++) {
@@ -9564,6 +9581,7 @@ static void shell_print_vars_set_format(void) {
             if (g_env_flags[i] & SHVAR_NOVALUE) continue;   /* not set */
             char *k = words_store(&keys, g_env[i], kl);
             if (!k) { kfree(names); shell_set_status(1); return; }
+            if (shell_name_only_in_tempenv(k)) continue;
             names[n++] = k;
         }
         for (int i = 0; i < g_narrays; i++) {
@@ -17290,7 +17308,13 @@ static void cmd_return(int argc, char **argv) {
     shell_set_status(st);
 }
 
+#ifdef SHELL_HOSTED
+void shell_logout_hosted(void);
+#endif
 static void cmd_exit(int argc, char **argv) {
+#ifdef SHELL_HOSTED
+    shell_logout_hosted();
+#endif
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
     /* TOO MANY ARGUMENTS does not exit: bash (get_exitstat, no_args) says
      * so, drops the rest of the line and goes on with status 1 -- once the
@@ -34349,8 +34373,18 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background);
  *
  * tsh had no `_` at all (Oils 2669-2676). An array literal in a
  * declaration (`declare a=(1 2)`) leaves its NAME. */
+/* bash's bind_lastarg takes the export attribute off `_` every time: one
+ * that came in from the environment -- a parent tsh hands its child `_`
+ * (shell_env_put_command_name) -- is not passed on, nor listed by `export`
+ * (logs/b13 q26). */
+static void shell_set_lastarg(const char *w) {
+    (void)env_set("_", w);
+    int ux = env_find("_", 1);
+    if (ux >= 0) g_env_flags[ux] &= ~(unsigned char)SHVAR_EXPORTED;
+}
+
 static void shell_bind_lastarg(const struct shell_simple *cmd, int assignc) {
-    if (assignc >= cmd->argc) { (void)env_set("_", ""); return; }
+    if (assignc >= cmd->argc) { shell_set_lastarg(""); return; }
     const char *w = cmd->argv[cmd->argc - 1];
     if (!w) return;
     SH_SB(lb);
@@ -34363,7 +34397,7 @@ static void shell_bind_lastarg(const struct shell_simple *cmd, int assignc) {
         if (sb_putmem(&lb, w, nl) < 0) return;
         w = lb.p;
     }
-    (void)env_set("_", w);
+    shell_set_lastarg(w);
 }
 
 static int shell_run_single(struct shell_simple *cmd, bool background) {
@@ -41907,6 +41941,136 @@ void shell_set_interactive_hosted(bool on) {
     g_opt_monitor = on;
     /* ...and history the same way (S6). */
     g_opt_history = on;
+}
+
+/* ---- bash's command line (host.c's main) ----------------------------------
+ *
+ * The options are bash's, applied after the shell is set up: a flag or a
+ * `-o` name as `set` takes it, a `-O` name as `shopt -s` does. Each answers
+ * false for a name that is not one, and the caller says so in bash's words. */
+bool shell_set_flag_hosted(char flag, bool on) {
+    bool ok = shell_set_opt(flag, on);
+    if (ok) shell_optvars_refresh();
+    return ok;
+}
+
+bool shell_set_option_hosted(const char *name, bool on) {
+    bool ok = shell_set_opt_by_name(name, on);
+    if (ok) shell_optvars_refresh();
+    return ok;
+}
+
+void shell_list_options_hosted(bool reinput) { shell_print_options(reinput); }
+
+bool shell_shopt_hosted(const char *name, bool on) {
+    if (!shell_shopt_find(name)) return false;
+    char *av[] = { (char *)"shopt", (char *)(on ? "-s" : "-u"), (char *)name, 0 };
+    cmd_shopt(3, av);
+    return true;
+}
+
+void shell_list_shopts_hosted(bool reinput) {
+    char *av[] = { (char *)"shopt", (char *)"-p", 0 };
+    cmd_shopt(reinput ? 2 : 1, av);
+}
+
+/* $-'s `c` (-c) and `s` (commands read from standard input) */
+void shell_set_invocation_hosted(bool c, bool s) {
+    g_flag_c = c;
+    g_flag_s = s;
+}
+
+/* bash's maybe_execute_file: `~/` is HOME's (or the passwd home's), and a
+ * file that is not there is not an error. True when it was run. */
+static bool shell_source_if_exists(const char *file) {
+    SH_SB(path);
+    if (file[0] == '~' && file[1] == '/') {
+        const char *h = env_get("HOME");
+        char pw[VFS_PATH_MAX];
+        if (!h) {
+            const char *uid = env_get("UID");
+            if (uid && shell_passwd_field(2, uid, strlen(uid), 5, pw, sizeof pw) == 0)
+                h = pw;
+        }
+        if (!h) return false;
+        if (sb_puts(&path, h) < 0 || sb_puts(&path, file + 1) < 0) return false;
+    } else if (sb_puts(&path, file) < 0) {
+        return false;
+    }
+    struct vfs_stat st;
+    if (vfs_stat(path.p, &st) != VFS_OK || st.type != VFS_TYPE_FILE) return false;
+    char *av[] = { (char *)".", path.p, 0 };
+    cmd_dot(2, av);
+    return true;
+}
+
+/* bash's execute_env_file: $BASH_ENV or $ENV, expanded as a word is --
+ * parameters, command substitution, arithmetic -- then sourced if there. */
+static void shell_source_env_file(const char *name) {
+    const char *v = env_get(name);
+    if (!v || !*v) return;
+    SH_SB(out);
+    if (shell_expand_word_ex(v, &out, false, false) < 0 || !out.p) return;
+    shell_strip_glob_escapes(out.p);
+    if (*out.p) (void)shell_source_if_exists(out.p);
+}
+
+static void shell_source_profiles(bool act_like_sh) {
+    (void)shell_source_if_exists("/etc/profile");
+    if (act_like_sh) (void)shell_source_if_exists("~/.profile");
+    else if (!shell_source_if_exists("~/.bash_profile") &&
+             !shell_source_if_exists("~/.bash_login"))
+        (void)shell_source_if_exists("~/.profile");
+}
+
+/* bash's run_startup_files. LOGIN is -1 for -l/--login, 1 for a name that
+ * starts with `-`, 0 otherwise.
+ *
+ *   -l/--login (not posix)   /etc/profile, then ~/.bash_profile,
+ *                            ~/.bash_login or ~/.profile -- interactive or not
+ *   not interactive          $BASH_ENV (not as sh, not posix, not -p)
+ *   interactive, login       the same profiles
+ *   interactive, not login   ~/.bashrc (--rcfile FILE), unless --norc;
+ *                            as sh, $ENV
+ *   posix, interactive       $ENV
+ *
+ * tsh read none of them (logs/b13 q27). */
+void shell_startup_files_hosted(int login, bool interactive, bool norc,
+                                bool noprofile, const char *rcfile,
+                                bool act_like_sh) {
+    bool posix = g_opt_posix;
+    bool sourced_login = false;
+    if (login < 0 && !posix) {
+        norc = true;
+        if (!noprofile) shell_source_profiles(act_like_sh);
+        sourced_login = true;
+    }
+    if (!interactive) {
+        if (!posix && !act_like_sh && !g_opt_privileged)
+            shell_source_env_file("BASH_ENV");
+        return;
+    }
+    if (!posix) {
+        if (login && !sourced_login) {
+            norc = true;
+            if (!noprofile) shell_source_profiles(act_like_sh);
+        }
+        if (!act_like_sh && !norc)
+            (void)shell_source_if_exists(rcfile ? rcfile : "~/.bashrc");
+        else if (act_like_sh && !g_opt_privileged)
+            shell_source_env_file("ENV");
+    } else if (!g_opt_privileged) {
+        shell_source_env_file("ENV");
+    }
+}
+
+/* A login shell that exits -- at EOF when interactive, or by `exit` --
+ * reads ~/.bash_logout (bash's exit_builtin and reader loop). Once. */
+void shell_logout_hosted(void) {
+    static bool done;
+    if (done || !g_shopt_misc[21]) return;
+    done = true;
+    (void)shell_source_if_exists("~/.bash_logout");
 }
 
 /* `sh` is tsh in POSIX mode (2026-09-03): /bin/sh is a link to /bin/tsh and
