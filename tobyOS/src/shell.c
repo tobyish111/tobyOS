@@ -83,6 +83,18 @@
 extern volatile struct limine_module_request module_req;
 
 #define LINE_MAX 512
+/* A CARRIAGE RETURN IS AN ORDINARY CHARACTER to bash: not a blank, not a
+ * line end -- `echo a\r` prints a and a CR, a CRLF script's `then\r` is
+ * no keyword, `eval "echo q\rw"` is one command (logs/b13 q55). /bin/tsh
+ * read it as a line end and a blank, so CRLF scripts ran where bash's
+ * break, and a CR in the middle of a line split it into two commands. The
+ * kernel console still takes it as one: what its TCP clients send ends in
+ * CRLF. */
+#ifdef SHELL_HOSTED
+#define SH_CR_BLANK 0
+#else
+#define SH_CR_BLANK 1
+#endif
 /* There is no parse or expansion buffer size any more. SHELL_PARSE_BUF_MAX
  * was the size of seventy fixed arrays -- the word being built, each
  * expansion's output, a joined compound, a `$( )`'s capture -- first 1 KiB,
@@ -14846,10 +14858,10 @@ static int shell_collect_heredoc(char **pp, const char *delim,
 
     while (*p) {
         char *line_start = p;
-        while (*p && *p != '\n' && *p != '\r') p++;
+        while (*p && *p != '\n' && !(SH_CR_BLANK && *p == '\r')) p++;
         char saved = *p;
         if (*p) *p++ = '\0';
-        if (saved == '\r' && *p == '\n') p++;
+        if ((SH_CR_BLANK && saved == '\r') && *p == '\n') p++;
 
         const char *match_line = line_start;
         if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
@@ -15337,7 +15349,7 @@ static void shell_scan_init(struct shell_scan *st) {
 /* Blank, newline, or one of the operator characters that can stand next to a
  * reserved word. */
 static bool shell_sep_or_blank(char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+    return c == ' ' || c == '\t' || c == '\n' || (SH_CR_BLANK && c == '\r') ||
            c == ';' || c == '&' || c == '|' || c == '(' || c == ')';
 }
 
@@ -15510,7 +15522,7 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         *pp = p;
         return;
     }
-    if (c == '\n' || c == '\r') {
+    if (c == '\n' || (SH_CR_BLANK && c == '\r')) {
         p++;
         st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
@@ -16381,7 +16393,7 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
     st->assign_prefix = false;
     st->redir = false;
     while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
         if (!*p) break;
         const char *before = p;
         /* THE EMPTY LIST (see bad_kw). Judged here, around the token, because
@@ -16452,7 +16464,7 @@ static long shell_funcnest_max(void) {
     const char *s = env_get("FUNCNEST");
     if (!s) return 0;
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
-           *s == '\f' || *s == '\r') s++;
+           *s == '\f' || (SH_CR_BLANK && *s == '\r')) s++;
     bool neg = false;
     if (*s == '+' || *s == '-') neg = (*s++ == '-');
     if (*s < '0' || *s > '9') return 0;
@@ -16462,7 +16474,7 @@ static long shell_funcnest_max(void) {
         s++;
     }
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\v' ||
-           *s == '\f' || *s == '\r') s++;
+           *s == '\f' || (SH_CR_BLANK && *s == '\r')) s++;
     if (*s) return 0;
     return neg ? 0 : v;
 }
@@ -17213,10 +17225,10 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             hist_raw = shell_strdup(p);
             hist_raw_base = p;
         }
-        while (*p && *p != '\n' && *p != '\r') p++;
+        while (*p && *p != '\n' && !(SH_CR_BLANK && *p == '\r')) p++;
         char saved = *p;
         if (*p) *p++ = '\0';
-        if (saved == '\r' && *p == '\n') p++;
+        if ((SH_CR_BLANK && saved == '\r') && *p == '\n') p++;
 
         char *line = line_start;
         while (*line == ' ' || *line == '\t') line++;
@@ -17277,10 +17289,10 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                     }
 
                     char *nstart = p;
-                    while (*p && *p != '\n' && *p != '\r') p++;
+                    while (*p && *p != '\n' && !(SH_CR_BLANK && *p == '\r')) p++;
                     char nsaved = *p;
                     if (*p) *p++ = '\0';
-                    if (nsaved == '\r' && *p == '\n') p++;
+                    if ((SH_CR_BLANK && nsaved == '\r') && *p == '\n') p++;
                     /* A JOINED LINE IS STILL A LINE. This path never counted
                      * them, so `echo x \` + `| cat` left every $LINENO after
                      * it one short; the compound path always did. */
@@ -17394,10 +17406,10 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             while ((shell_scan_incomplete(&scan) ||
                     shell_text_ends_in_continuation(accum, alen)) && *p) {
                 char *nstart = p;
-                while (*p && *p != '\n' && *p != '\r') p++;
+                while (*p && *p != '\n' && !(SH_CR_BLANK && *p == '\r')) p++;
                 char nsaved = *p;
                 if (*p) *p++ = '\0';
-                if (nsaved == '\r' && *p == '\n') p++;
+                if ((SH_CR_BLANK && nsaved == '\r') && *p == '\n') p++;
                 /* A PHYSICAL LINE IS A LINE WHETHER IT IS JOINED OR SKIPPED.
                  * Counting only the ones that get appended left every
                  * `$LINENO` after a compound containing a blank or comment
@@ -17668,7 +17680,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         bool c_done = false;
         if (c_main) {
             const char *r = p;
-            while (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') r++;
+            while (*r == ' ' || *r == '\t' || *r == '\n' || (SH_CR_BLANK && *r == '\r')) r++;
             c_done = !*r;
         }
         if ((!eval_mode || g_shell_flow == SHELL_FLOW_NONE) && !c_done) {
@@ -19231,7 +19243,7 @@ static void shell_print_function_def(const char *name, const char *body_raw) {
     bool printed_any = false;
     while (p && *p) {
         /* Blanks and separators ahead of the next statement. */
-        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ';')
+        while (*p == ' ' || *p == '\t' || (SH_CR_BLANK && *p == '\r') || *p == '\n' || *p == ';')
             p++;
         if (!*p) break;
 
@@ -19257,7 +19269,7 @@ static void shell_print_function_def(const char *name, const char *body_raw) {
                 break;
             }
             p++;
-            if (*cs != ' ' && *cs != '\t' && *cs != '\r') end = p;
+            if (*cs != ' ' && *cs != '\t' && !(SH_CR_BLANK && *cs == '\r')) end = p;
         }
         if (end > st) {
             if (printed_any) shell_printf(";\n");
@@ -21860,7 +21872,7 @@ static void shell_history_add_raw(const char *raw, const char *raw_base,
     if (!raw || !g_opt_history || from < raw_base || to < from) return;
     const char *s = raw + (from - raw_base);
     size_t n = (size_t)(to - from);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) n--;
+    while (n > 0 && (s[n - 1] == '\n' || (SH_CR_BLANK && s[n - 1] == '\r'))) n--;
     SH_SB(t);
     if (sb_putmem(&t, s, n) < 0) return;
     if (heredoc && sb_putc(&t, '\n') < 0) return;
@@ -21987,7 +21999,7 @@ static long shell_hist_read(const char *path, long from) {
         const char *e = s;
         while (e < end && *e != '\n') e++;
         size_t n = (size_t)(e - s);
-        if (n > 0 && s[n - 1] == '\r') n--;
+        if (n > 0 && (SH_CR_BLANK && s[n - 1] == '\r')) n--;
         bool stamp = g_interactive &&
                      (n >= 2 && s[0] == '#' && s[1] >= '0' && s[1] <= '9');
         if (!stamp) {
@@ -23471,7 +23483,7 @@ static const struct cmd cmds[] = {
 /* ---- line editing + dispatch ---- */
 
 static inline bool is_space(char c) {
-    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+    return c == ' ' || c == '\t' || (SH_CR_BLANK && c == '\r') || c == '\n';
 }
 
 static void prompt(void) {
@@ -23868,7 +23880,7 @@ static int shell_exec_head(const char *path, char *interp, size_t cap) {
         while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
         size_t s = i;
         while (i < n && p[i] != ' ' && p[i] != '\t' &&
-               p[i] != '\n' && p[i] != '\r') i++;
+               p[i] != '\n' && !(SH_CR_BLANK && p[i] == '\r')) i++;
         size_t l = i - s;
         if (l >= cap) l = cap - 1;
         memcpy(interp, p + s, l);
@@ -36691,7 +36703,7 @@ static bool shell_starts_with_word(const char *s, const char *word) {
     size_t n = strlen(word);
     return strncmp(s, word, n) == 0 &&
            (s[n] == '\0' || s[n] == ' ' || s[n] == '\t' ||
-            s[n] == ';' || s[n] == '\n' || s[n] == '\r');
+            s[n] == ';' || s[n] == '\n' || (SH_CR_BLANK && s[n] == '\r'));
 }
 
 static int shell_copy_segment(char *dst, size_t cap,
@@ -39596,7 +39608,7 @@ static bool shell_case_cmd_pos(const char *start, const char *p) {
     while (b > start && (b[-1] == ' ' || b[-1] == '\t')) b--;
     if (b == start) return true;
     char c = b[-1];
-    if (c == '\n' || c == '\r' || c == ';' || c == '&' || c == '|' ||
+    if (c == '\n' || (SH_CR_BLANK && c == '\r') || c == ';' || c == '&' || c == '|' ||
         c == '(' || c == ')' || c == '{')
         return true;
     const char *w = b;
@@ -40028,7 +40040,7 @@ static bool shell_line_syntax_ok(const char *src);
  * function's header and its body (`f()` and `function f` on one line, the
  * `{` on the next). */
 static const char *shell_skip_blanks_nl(const char *s) {
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    while (*s == ' ' || *s == '\t' || *s == '\n' || (SH_CR_BLANK && *s == '\r')) s++;
     return s;
 }
 
@@ -40159,7 +40171,7 @@ static bool shell_try_function_definition(const char *src) {
         bs.brace = 1;
         const char *q = body_start;
         while (*q) {
-            while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+            while (*q == ' ' || *q == '\t' || *q == '\n' || (SH_CR_BLANK && *q == '\r')) q++;
             if (!*q) break;
             const char *tok = q;
             shell_scan_token(&bs, &q);
@@ -41197,7 +41209,7 @@ static const char *shell_find_list_sep(const char *s, enum shell_list_link *link
 
     const char *p = s;
     while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
         if (!*p) break;
 
         /* A separator only separates at the OUTERMOST level. Everything the
@@ -41244,7 +41256,7 @@ static bool shell_run_list_line(const char *src) {
             const char *en = sp ? sp : c2 + strlen(c2);
             bool blank = true;
             for (const char *q = c2; q < en; q++)
-                if (*q != ' ' && *q != '\t' && *q != '\n' && *q != '\r') {
+                if (*q != ' ' && *q != '\t' && *q != '\n' && !(SH_CR_BLANK && *q == '\r')) {
                     blank = false;
                     break;
                 }
@@ -41515,7 +41527,7 @@ static const char *shell_find_bg_at(const char *s) {
 
     const char *p = s;
     while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
         if (!*p) break;
         if (!shell_scan_incomplete(&st) && *p == '&' && p[1] != '&' &&
             p[1] != '>' && !(p > s && p[-1] == '|')) {      /* `|&` */
@@ -42052,7 +42064,7 @@ static unsigned long shell_simple_cmd_lineno(const char *src) {
     const char *r = q;
     while (*r == ' ' || *r == '\t') r++;
     if (*r == '(') return shell_lineno_at(p);          /* `name ()` */
-    if (*r && *r != '\n' && *r != '\r') {
+    if (*r && *r != '\n' && !(SH_CR_BLANK && *r == '\r')) {
         const char *r0 = r;
         shell_scan_token(&st, &r);
         if (r > r0) last = r - 1;
@@ -42527,7 +42539,7 @@ static void execute_line_text_inner(const char *src) {
             st.start = q;
             const char *p = q, *amp = 0, *rest = 0;
             while (*p) {
-                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+                while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
                 if (!*p) break;
                 const char *tok = p;
                 bool lone_amp = (*p == '&' && p[1] != '&');

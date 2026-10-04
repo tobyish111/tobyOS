@@ -600,10 +600,9 @@ static void bsyn_read_line(struct bsyn *st, int rmnl) {
     bool had_nl = (e < st->len && st->buf[e] == '\n');
     st->next = had_nl ? e + 1 : (e < st->len ? st->len : e);
     size_t n = e - s;
-    /* A CRLF line is a line: tsh's reader has always taken "\r\n" as a line
-     * end, and bash would choke on the `\r`. Kept, so the check never
-     * rejects a script tsh ran before. */
-    if (had_nl && n && st->buf[s + n - 1] == '\r') n--;
+    /* A CRLF line is a line only to the kernel console, which reads it
+     * that way (SH_CR_BLANK); to /bin/tsh, as to bash, the `\r` is text. */
+    if (SH_CR_BLANK && had_nl && n && st->buf[s + n - 1] == '\r') n--;
     st->sl = st->buf + s;
     st->slen = n;
     st->seof = false;
@@ -1320,8 +1319,8 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
             }
             if (st->oom) break;
             if (!line.len || line.p[line.len - 1] != '\n') bsyn_putc(st, &line, '\n');
-            /* CRLF, as the reader */
-            if (line.len >= 2 && line.p[line.len - 2] == '\r') {
+            /* CRLF, as the reader (the kernel console's only) */
+            if (SH_CR_BLANK && line.len >= 2 && line.p[line.len - 2] == '\r') {
                 line.p[line.len - 2] = '\n';
                 line.p[--line.len] = '\0';
             }
