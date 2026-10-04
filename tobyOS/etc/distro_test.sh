@@ -664,6 +664,9 @@ echo @@sh_posix_mode
 sh -c 'set -o | grep posix'
 tsh -c 'set -o | grep posix'
 echo @@sh_script
+# `[` tries a value the script made itself: this test runs with an empty
+# environment, and /bin/tsh no longer invents HOME=/ there (bash invents
+# none either) -- `[ -n "${HOME:-}" ]` stopped saying "test ok" (batch 13).
 cat > /tmp/posix.sh <<'EOF'
 #!/bin/sh
 f() { return $(( $1 * 2 )); }
@@ -672,7 +675,7 @@ case "$r" in 42) echo "case ok" ;; *) echo "case bad $r" ;; esac
 cat <<EOT
 heredoc $r
 EOT
-[ -n "${HOME:-}" ] && echo "test ok"
+[ "$r" -eq 42 ] && echo "test ok"
 echo "$0 $#"
 EOF
 chmod +x /tmp/posix.sh
