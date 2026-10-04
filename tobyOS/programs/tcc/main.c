@@ -20,6 +20,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 /* ---- Limits --------------------------------------------------------- */
 
@@ -1682,6 +1683,17 @@ int main(int argc, char **argv) {
 
     int rc = write_elf(s);
     free(s->src);
+    /* AN EXECUTABLE IS MADE EXECUTABLE: a compiler creates its output with
+     * mode 0777 less the umask (tcc's open(..., 0777)). This one wrote it
+     * with fopen and never asked, so the binary was 0644 -- runnable only
+     * because spawn checked no X bit; spawn checks it now, as execve
+     * always did, and `cc -o x x.c; ./x` was "Permission denied" (126)
+     * (distrotail, batch 13). */
+    if (rc == 0 && !s->had_error) {
+        mode_t um = umask(0);
+        umask(um);
+        (void)chmod(s->outfile, 0777 & ~um);
+    }
     if (rc == 0 && !s->had_error) {
         printf("tcc: wrote %s (%d bytes code, %d bytes data)\n",
                s->outfile, s->code_len, s->data_len);
