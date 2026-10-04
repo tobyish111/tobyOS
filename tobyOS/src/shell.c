@@ -16784,6 +16784,45 @@ static void shell_print_alias(int idx) {
     shell_printf("'\n");
 }
 
+/* bash's qsort_alias_compare: the first bytes as (signed) chars, then
+ * strcmp -- so a name starting with a byte past 0x7f sorts FIRST. */
+static int shell_alias_cmp(const char *a, const char *b) {
+    int r = (int)(signed char)a[0] - (int)(signed char)b[0];
+    return r ? r : strcmp(a, b);
+}
+
+/* `alias` and `alias -p` LIST SORTED, as bash's all_aliases does:
+ *
+ *     alias zb=1 ab=2 mm=3; unalias ab; alias b2=4; alias
+ *         bash: b2 mm zb      tsh: zb b2 mm
+ *
+ * tsh walked its table, whose order was the order the slots were filled
+ * -- a freed slot taken again by the next name (logs/b13 q11). */
+static void shell_print_aliases_sorted(void) {
+    int n = g_alias_tab.n;
+    if (n <= 0) return;
+    int *ord = (int *)kmalloc((size_t)n * 2 * sizeof(int));
+    if (!ord) return;
+    int *tmp = ord + n;
+    for (int k = 0; k < n; k++) ord[k] = k;
+    for (int w = 1; w < n; w *= 2) {               /* merge sort */
+        for (int lo = 0; lo < n; lo += 2 * w) {
+            int mid = lo + w < n ? lo + w : n;
+            int hi = lo + 2 * w < n ? lo + 2 * w : n;
+            int a = lo, b = mid, k = lo;
+            while (a < mid && b < hi)
+                tmp[k++] = shell_alias_cmp(g_alias_tab.e[ord[a]].key,
+                                           g_alias_tab.e[ord[b]].key) <= 0
+                               ? ord[a++] : ord[b++];
+            while (a < mid) tmp[k++] = ord[a++];
+            while (b < hi) tmp[k++] = ord[b++];
+        }
+        for (int k = 0; k < n; k++) ord[k] = tmp[k];
+    }
+    for (int k = 0; k < n; k++) shell_print_alias(ord[k]);
+    kfree(ord);
+}
+
 static void sh_builtin_usage(const char *name);
 static void shell_help_topic(const char *name);
 
@@ -16807,8 +16846,7 @@ static void cmd_alias(int argc, char **argv) {
     }
     int i = g.ind;
     if (i >= argc || pflag) {
-        for (int k = 0; k < g_alias_tab.n; k++)
-            shell_print_alias(k);
+        shell_print_aliases_sorted();
         if (i >= argc) return;
     }
 
