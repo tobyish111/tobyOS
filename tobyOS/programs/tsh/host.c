@@ -805,9 +805,26 @@ int proc_exec_in_place(const struct proc_spec *spec) {
         if (pfd < 0 || cfd < 0 || pfd == cfd) continue;
         if (dup2(pfd, cfd) < 0) return -1;
     }
-    if (fd0 != 0 && !host_slot_closed(spec->fd0) && dup2(fd0, 0) < 0) return -1;
-    if (fd1 != 1 && !host_slot_closed(spec->fd1) && dup2(fd1, 1) < 0) return -1;
-    if (fd2 != 2 && !host_slot_closed(spec->fd2) && dup2(fd2, 2) < 0) return -1;
+    /* THE SOURCES ARE TAKEN BEFORE ANY TARGET CHANGES. A source that is
+     * itself 0, 1 or 2 -- fd 2 copying fd 1 after `exec 2>&1` -- was read
+     * after the dup2 onto 1 had replaced it, so `$(cmd)` with stderr on
+     * stdout sent the command's stderr into the substitution's pipe
+     * (shparity 228b, once $( ) began to exec its last command). The
+     * spawn path never had this: the kernel takes all three at once. */
+    int src[3] = { fd0, fd1, fd2 };
+    int tmp[3] = { -1, -1, -1 };
+    struct file *const slots[3] = { spec->fd0, spec->fd1, spec->fd2 };
+    for (int t = 0; t < 3; t++) {
+        if (host_slot_closed(slots[t]) || src[t] == t || src[t] > 2) continue;
+        tmp[t] = dup(src[t]);
+        if (tmp[t] < 0) return -1;
+        src[t] = tmp[t];
+    }
+    for (int t = 0; t < 3; t++) {
+        if (host_slot_closed(slots[t]) || src[t] == t) continue;
+        if (dup2(src[t], t) < 0) return -1;
+    }
+    for (int t = 0; t < 3; t++) if (tmp[t] >= 0) close(tmp[t]);
     /* closed last: a slot another was copied from must still be there */
     if (host_slot_closed(spec->fd0)) close(0);
     if (host_slot_closed(spec->fd1)) close(1);
