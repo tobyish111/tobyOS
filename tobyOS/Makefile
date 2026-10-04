@@ -536,6 +536,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_find/user_find.elf \
             programs/user_sort/user_sort.elf \
             programs/user_tee/user_tee.elf \
+            programs/user_setsid/user_setsid.elf \
             programs/user_env/user_env.elf \
             programs/user_chmod/user_chmod.elf \
             programs/user_vncpasswd/user_vncpasswd.elf \
@@ -1856,6 +1857,7 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_rm,user_rm))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_find,user_find))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_sort,user_sort))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_tee,user_tee))
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_setsid,user_setsid))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_env,user_env))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_chmod,user_chmod))
 # vncpasswd compiles src/des.c in, so it needs the kernel include path.
@@ -3249,6 +3251,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
 	cp programs/user_sort/user_sort.elf             $(INITRD_STAGE)/bin/sort
 	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
+	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
 	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
 	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
 	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
@@ -4213,6 +4216,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/shutdown bin/poweroff bin/halt bin/reboot bin/patch bin/locate bin/updatedb bin/ln                     \
 	    bin/rmdir bin/yes bin/tac bin/seq bin/whoami bin/which bin/uname   \
 	    bin/free bin/sync bin/stat bin/du bin/xargs bin/nohup bin/timeout  \
+	    bin/setsid \
 	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
 	    bin/printenv bin/nice bin/pgrep bin/pkill bin/tty bin/stty        \
 	    bin/cksum bin/truncate bin/install bin/mkfifo                     \
@@ -5983,6 +5987,7 @@ clean:
 	       programs/user_find/user_find.o programs/user_find/user_find.elf \
 	       programs/user_sort/user_sort.o programs/user_sort/user_sort.elf \
 	       programs/user_tee/user_tee.o programs/user_tee/user_tee.elf \
+	       programs/user_setsid/user_setsid.o programs/user_setsid/user_setsid.elf \
 	       programs/user_env/user_env.o programs/user_env/user_env.elf \
 	       programs/user_chmod/user_chmod.o programs/user_chmod/user_chmod.elf \
 	       programs/user_vncpasswd/user_vncpasswd.o programs/user_vncpasswd/user_vncpasswd.elf \
