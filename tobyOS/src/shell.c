@@ -19619,7 +19619,7 @@ static bool test_is_unary_op(const char *s) {
     static const char *const u[] = {
         "-a", "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-n", "-o",
         "-p", "-r", "-s", "-t", "-u", "-v", "-w", "-x", "-z", "-G", "-L", "-N",
-        "-O", "-S", 0
+        "-O", "-S", "-R", 0
     };
     for (int i = 0; u[i]; i++) if (strcmp(s, u[i]) == 0) return true;
     return false;
@@ -19689,6 +19689,14 @@ static bool test_access_ok(const struct vfs_stat *st, unsigned want) {
 }
 
 static int test_unary(const char *op, const char *operand) {
+    /* `-R NAME`: is NAME a nameref with a value -- the reference itself,
+     * not what it names (bash's find_variable_noref). A unary operator tsh
+     * did not have: `[ -R HOME ]` was a syntax error, 2 (logs/b13 q54). */
+    if (strcmp(op, "-R") == 0) {
+        int ix = env_find(operand, strlen(operand));
+        return (ix >= 0 && (g_env_flags[ix] & SHVAR_NAMEREF) &&
+                !(g_env_flags[ix] & SHVAR_NOVALUE)) ? 0 : 1;
+    }
     /* `-v NAME` -- is that parameter SET? It was missing from the unary
      * table entirely, so `[[ -v x ]]` was a syntax error even for a plain
      * scalar, and every `[[ -v a[k] ]]` in the corpus died the same way.
