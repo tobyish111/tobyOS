@@ -741,6 +741,17 @@ struct proc {
      * `perf` can show something interesting. */
     uint64_t        cpu_ns;
     uint64_t        last_switch_tsc;
+    /* USER AND SYSTEM TIME, as Linux splits them without per-entry
+     * accounting (cputime_adjust): every timer tick that finds this proc
+     * running counts once, in `utick` when it interrupted ring 3 and in
+     * `stick` otherwise, and cpu_ns -- the exact total -- is divided in
+     * that ratio (proc_cputimes). times(2), getrusage(2), wait4's rusage
+     * and /proc/<pid>/stat all read the split. */
+    uint64_t        utick, stick;
+    /* Reaped children's times, theirs included (Linux's cutime/cstime), and
+     * the times of this thread group's members that have gone. ns. */
+    uint64_t        cutime_ns, cstime_ns;
+    uint64_t        tg_dead_utime_ns, tg_dead_stime_ns;
     uint64_t        syscall_count;
     uint64_t        created_ns;
     uint64_t        user_pages;
@@ -778,6 +789,9 @@ struct proc_exit_info {
     int      exit_code;
     int      term_sig;      /* K3: killing signal, 0 = exited (see struct proc) */
     uint64_t cpu_ns;
+    /* The child's user and system time, its own reaped children's added --
+     * what wait4 reports in its rusage (Linux: getrusage RUSAGE_BOTH). */
+    uint64_t utime_ns, stime_ns;
     uint64_t syscall_count;
     uint64_t wall_ns;       /* perf_now_ns() delta from proc_wait_info() call */
     char     name[PROC_NAME_MAX];
@@ -787,6 +801,12 @@ struct proc_exit_info {
  * right before the child is reaped. out may be NULL (then it's a
  * plain proc_wait). Returns exit_code or -1. */
 int proc_wait_info(int pid, struct proc_exit_info *out);
+
+/* One proc's user and system time in ns (cpu_ns split by its tick ratio;
+ * the slice it is running now included when it is the caller). */
+void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st);
+/* The whole thread group of `p`: its live members and its exited ones. */
+void proc_group_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st);
 
 /* Globals (defined in proc.c). */
 extern struct proc *g_current_proc;     /* last proc switched-to on any CPU */

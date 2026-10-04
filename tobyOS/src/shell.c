@@ -17157,21 +17157,67 @@ static void cmd_exit(int argc, char **argv) {
     }
 }
 
+/* This shell's user and system time, then its reaped children's, in ns
+ * (bash: getrusage RUSAGE_SELF and RUSAGE_CHILDREN). */
+static void shell_cputimes(uint64_t t[4]) {
+    t[0] = t[1] = t[2] = t[3] = 0;
+#ifdef SHELL_HOSTED
+    extern int host_cputimes(uint64_t *out);
+    if (host_cputimes(t) != 0) t[0] = t[1] = t[2] = t[3] = 0;
+#else
+    struct proc *p = current_proc();
+    if (!p) return;
+    proc_group_cputimes(p, &t[0], &t[1]);
+    t[2] = p->cutime_ns;
+    t[3] = p->cstime_ns;
+#endif
+}
+
+/* bash's timeval_to_secs: microseconds to seconds and thousandths, the
+ * thousandths ROUNDED, not cut. */
+static void sh_us_to_secs(uint64_t us, unsigned long *sec, unsigned *ms) {
+    unsigned long s = (unsigned long)(us / 1000000u);
+    unsigned long frac = (unsigned long)(us % 1000000u);
+    unsigned m = (unsigned)(frac / 1000u);
+    if (frac % 1000u >= 500u) m++;
+    if (m >= 1000u) { s++; m -= 1000u; }
+    *sec = s;
+    *ms = m;
+}
+
+/* `times`: bash's two lines, the shell's user and system time and then its
+ * children's, each "%ldm%d.%03ds" (print_timeval):
+ *
+ *     times        bash: 0m0.004s 0m0.002s / 0m0.011s 0m0.007s
+ *                  tsh:  0m0.00s 0m<uptime>s / 0m0.00s 0m0.00s
+ *
+ * tsh printed the machine's uptime as the shell's system time, with two
+ * decimals, and zeros for the rest: the kernel kept no user/system split
+ * and nothing for children (logs/b13). It does now (proc_cputimes). */
 static void cmd_times(int argc, char **argv) {
-    (void)argv;
-    if (argc > 1) {
-        kprintf("times: too many arguments\n");
+    /* bash's no_options: an option is an error, an operand is ignored */
+    if (argc > 1 && argv[1][0] == '-' && argv[1][1] &&
+        strcmp(argv[1], "--") != 0) {
+        if (strcmp(argv[1], "--help") == 0) {
+            shell_help_topic("times");
+            shell_set_status(0);
+            return;
+        }
+        kprintf("times: %s: invalid option\n", argv[1]);
+        kprintf_raw("times: usage: times\n");
         shell_set_status(2);
         return;
     }
-    uint32_t hz = pit_hz();
-    if (hz == 0) hz = 1;
-    uint64_t t = pit_ticks();
-    uint64_t cs = t * 100 / hz;
-    shell_printf("0m0.00s 0m%lu.%02lus\n",
-                 (unsigned long)(cs / 100),
-                 (unsigned long)(cs % 100));
-    shell_printf("0m0.00s 0m0.00s\n");
+    uint64_t t[4];
+    shell_cputimes(t);
+    char f[4][48];
+    for (int i = 0; i < 4; i++) {
+        unsigned long sec;
+        unsigned ms;
+        sh_us_to_secs(t[i] / 1000u, &sec, &ms);
+        ksnprintf(f[i], sizeof f[i], "%lum%lu.%03us", sec / 60, sec % 60, ms);
+    }
+    shell_printf("%s %s\n%s %s\n", f[0], f[1], f[2], f[3]);
     shell_set_status(0);
 }
 
@@ -39985,8 +40031,8 @@ static bool shell_try_coproc(const char *src) {
  * POSIX "real %2R\nuser %2U\nsys %2S"; %[p][l]R U S, %P, %%. An empty
  * TIMEFORMAT prints nothing. It goes to stderr bare: it carried the
  * diagnostic prefix ("FILE: line N: ") and ignored -p and TIMEFORMAT.
- * User and system time are 0 -- the kernel keeps one CPU total per
- * process and nothing for children. */
+ * User and system time are the shell's and its children's over the
+ * command (bash's time_command); they were 0, and %P with them. */
 static void shell_time_mkfmt(struct shell_sb *b, int prec, bool lng,
                              unsigned long sec, unsigned frac) {
     char t[48];
@@ -40008,7 +40054,27 @@ static void shell_time_mkfmt(struct shell_sb *b, int prec, bool lng,
     if (lng) (void)sb_putc(b, 's');
 }
 
-static void shell_time_report(bool posix_fmt, unsigned long real_ms) {
+/* bash's timeval_to_cpu: (user + sys) / real as hundredths of a percent,
+ * by its decimal shifting -- %P is this over 100. */
+static long sh_time_cpu(uint64_t real_us, uint64_t cpu_us) {
+    long long t1s = (long long)(cpu_us / 1000000u), t1u = (long long)(cpu_us % 1000000u);
+    long long t2s = (long long)(real_us / 1000000u), t2u = (long long)(real_us % 1000000u);
+    for (int i = 0; i < 6; i++) {
+        if (t1s > 99999999 || t2s > 99999999) break;
+        t1s = t1s * 10 + t1u / 100000;
+        t1u = (t1u * 10) % 1000000;
+        t2s = t2s * 10 + t2u / 100000;
+        t2u = (t2u * 10) % 1000000;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (t1s < 100000000) t1s *= 10;
+        else t2s /= 10;
+    }
+    return t2s == 0 ? 0 : (long)(t1s / t2s);
+}
+
+static void shell_time_report(bool posix_fmt, uint64_t real_us,
+                              uint64_t user_us, uint64_t sys_us) {
     const char *fmt = posix_fmt ? "real %2R\nuser %2U\nsys %2S"
                                 : env_get("TIMEFORMAT");
     if (!fmt) fmt = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
@@ -40017,8 +40083,10 @@ static void shell_time_report(bool posix_fmt, unsigned long real_ms) {
     for (const char *f = fmt; *f; f++) {
         if (*f != '%' || !f[1]) { (void)sb_putc(&out, *f); continue; }
         if (f[1] == '%') { (void)sb_putc(&out, '%'); f++; continue; }
-        if (f[1] == 'P') {                 /* (user+sys)/real: 0 here */
-            shell_time_mkfmt(&out, 2, false, 0, 0);
+        if (f[1] == 'P') {                 /* (user+sys)/real */
+            long cpu = sh_time_cpu(real_us, user_us + sys_us);
+            shell_time_mkfmt(&out, 2, false, (unsigned long)(cpu / 100),
+                             (unsigned)((cpu % 100) * 10));
             f++;
             continue;
         }
@@ -40027,10 +40095,12 @@ static void shell_time_report(bool posix_fmt, unsigned long real_ms) {
         f++;
         if (*f >= '0' && *f <= '9') { prec = *f++ - '0'; if (prec > 3) prec = 3; }
         if (*f == 'l') { lng = true; f++; }
-        if (*f == 'R' || *f == 'E') {
-            shell_time_mkfmt(&out, prec, lng, real_ms / 1000, (unsigned)(real_ms % 1000));
-        } else if (*f == 'U' || *f == 'S') {
-            shell_time_mkfmt(&out, prec, lng, 0, 0);
+        if (*f == 'R' || *f == 'E' || *f == 'U' || *f == 'S') {
+            uint64_t us = *f == 'U' ? user_us : *f == 'S' ? sys_us : real_us;
+            unsigned long sec;
+            unsigned ms;
+            sh_us_to_secs(us, &sec, &ms);
+            shell_time_mkfmt(&out, prec, lng, sec, ms);
         } else {
             kprintf("TIMEFORMAT: `%c': invalid format character\n", *f ? *f : ' ');
             return;
@@ -40106,12 +40176,11 @@ static void execute_line_text_inner(const char *src) {
                 rest = shell_skip_blanks(rest + 2);
                 posix_fmt = true;
             }
-            /* pit_ticks() counts in the host's own units; pit_hz() converts.
-             * Only the printed number depends on it, and that goes to stderr,
-             * which the gate does not compare. */
-            uint32_t hz = pit_hz();
-            if (hz == 0) hz = 1;
-            uint64_t t0 = pit_ticks();
+            /* bash's time_command: the wall clock, and the shell's and its
+             * children's user and system time, before and after. */
+            uint64_t t0 = perf_now_ns();
+            uint64_t c0[4], c1[4];
+            shell_cputimes(c0);
             if (*rest) {
                 g_exec_line_depth++;
                 execute_line_text_inner(rest);
@@ -40119,9 +40188,12 @@ static void execute_line_text_inner(const char *src) {
             } else {
                 shell_set_status(0);
             }
-            unsigned long ms =
-                (unsigned long)((pit_ticks() - t0) * 1000ull / hz);
-            shell_time_report(posix_fmt, ms);
+            uint64_t t1 = perf_now_ns();
+            shell_cputimes(c1);
+            uint64_t un = (c1[0] - c0[0]) + (c1[2] - c0[2]);
+            uint64_t sn = (c1[1] - c0[1]) + (c1[3] - c0[3]);
+            shell_time_report(posix_fmt, (t1 - t0) / 1000u, un / 1000u,
+                              sn / 1000u);
             return;
         }
     }

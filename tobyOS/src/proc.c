@@ -1595,6 +1595,8 @@ bool proc_wait_off_cpu_bounded(struct proc *p) {
 /* Linux exit_group(2): terminate every task in the caller's thread group.
  * A non-leader chrome thread used to call exit_group(191) and only kill
  * itself, leaving the browser zombie'd on X11 recvmsg with no GPU. */
+static void proc_fold_thread_times(struct proc *t);
+
 __attribute__((noreturn)) void proc_exit_group(int code) {
     struct proc *p = current_proc();
     if (!p) proc_exit(code);
@@ -1656,6 +1658,7 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
                  * proc_reap, so it owes the namespace release itself -- a
                  * thread holds its own reference (sys_clone_thread takes one). */
                 nsproxy_release(q);
+                proc_fold_thread_times(q);      /* ...and its CPU time */
                 q->state = PROC_UNUSED;
             } else {
                 /* Leader: close shared fds; leave TERMINATED for wait/reap.
@@ -1743,6 +1746,7 @@ void proc_reap_group_threads(struct proc *p, int code) {
             q->kstack_base = 0;
             q->kstack_top  = 0;
             nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
+            proc_fold_thread_times(q);
             q->state = PROC_UNUSED;
         }
     }
@@ -1959,8 +1963,69 @@ void proc_reap_orphans(void) {
 }
 
 /* Free everything owned by a TERMINATED process and recycle the slot. */
+void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
+    uint64_t total = p->cpu_ns;
+    if (p == current_proc() && p->last_switch_tsc)
+        total += perf_tsc_to_ns(rdtsc() - p->last_switch_tsc);
+    uint64_t u = p->utick, s = p->stick;
+    uint64_t sys;
+    if (s == 0)      sys = 0;               /* Linux: all of it is user */
+    else if (u == 0) sys = total;
+    else {
+        /* total * s / (u + s), without overflowing 64 bits */
+        uint64_t d = u + s;
+        sys = (total / d) * s + ((total % d) * s) / d;
+    }
+    *st = sys;
+    *ut = total - sys;
+}
+
+void proc_group_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
+    uint64_t u = p->tg_dead_utime_ns, s = p->tg_dead_stime_ns;
+    int tgid = p->tgid ? p->tgid : p->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        const struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO) continue;
+        if (q != p && (q->tgid ? q->tgid : q->pid) != tgid) continue;
+        uint64_t qu, qs;
+        proc_cputimes(q, &qu, &qs);
+        u += qu;
+        s += qs;
+    }
+    *ut = u;
+    *st = s;
+}
+
+/* A thread's time goes to its group when it goes (Linux's __exit_signal):
+ * the leader keeps it for times(2) and for the parent that reaps it. */
+static void proc_fold_thread_times(struct proc *t) {
+    if (!t || !t->is_thread) return;
+    struct proc *l = proc_lookup(t->tgid);
+    if (!l || l == t || l->state == PROC_UNUSED) return;
+    uint64_t u, s;
+    proc_cputimes(t, &u, &s);
+    l->tg_dead_utime_ns += u;
+    l->tg_dead_stime_ns += s;
+}
+
+/* A reaped process's times, its group's and its own reaped children's, go
+ * to its parent's cutime/cstime (Linux's wait_task_zombie). */
+static void proc_reap_account(struct proc *p) {
+    if (p->is_thread) {
+        proc_fold_thread_times(p);
+        return;
+    }
+    uint64_t u, s;
+    proc_group_cputimes(p, &u, &s);
+    struct proc *par = p->ppid > 0 ? proc_lookup(p->ppid) : 0;
+    if (!par || par == p || par->state == PROC_UNUSED) return;
+    par->cutime_ns += u + p->cutime_ns;
+    par->cstime_ns += s + p->cstime_ns;
+}
+
 static void proc_reap(struct proc *p) {
     if (!p || p->state != PROC_TERMINATED) return;
+    proc_reap_account(p);
 
     /* Unlink from any ready queue before we free its stack and zero the slot.
      * The same reachable-after-teardown hazard the thread-group-exit path had. */
@@ -2153,6 +2218,12 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
         out->exit_code     = code;
         out->term_sig      = child->term_sig;
         out->cpu_ns        = child->cpu_ns;
+        {
+            uint64_t u, s;
+            proc_group_cputimes(child, &u, &s);
+            out->utime_ns = u + child->cutime_ns;
+            out->stime_ns = s + child->cstime_ns;
+        }
         out->syscall_count = child->syscall_count;
         out->wall_ns       = perf_now_ns() - wait_start_ns;
         size_t n = strlen(child->name);

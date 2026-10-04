@@ -5139,6 +5139,20 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return p ? (long)p->ruid : 0;
     }
 
+    case ABI_SYS_TIMES: {
+        struct proc *p = current_proc();
+        struct abi_times t;
+        memset(&t, 0, sizeof t);
+        if (p) {
+            if (a1 == 1) proc_cputimes(p, &t.utime_ns, &t.stime_ns);
+            else proc_group_cputimes(p, &t.utime_ns, &t.stime_ns);
+            t.cutime_ns = p->cutime_ns;
+            t.cstime_ns = p->cstime_ns;
+        }
+        if (copy_to_user((void *)a2, &t, sizeof t) != 0) return -ABI_EFAULT;
+        return 0;
+    }
+
     case ABI_SYS_STATFS: {
         /* The Linux personality's statfs(2), for native programs: the same
          * vfs_statfs numbers busybox's df reads. vfs_statfs answers for any
@@ -11397,24 +11411,31 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return 0;
     }
 
-    /* getrusage(2)/times(2). Both report the process CPU time the scheduler
-     * already accumulates in p->cpu_ns.
-     *
-     * LIMITATION, stated: the kernel tracks ONE total, not a user/system
-     * split, so the whole figure is reported as user time and system time is
-     * zero. That is why bash's `times` builtin previously printed garbage --
-     * it read uninitialised stack after the -ENOSYS -- and why it will now
-     * print a real user figure and 0m0.000s system. */
+    /* getrusage(2)/times(2): user and system time, the process's (its
+     * thread group's) and its reaped children's -- proc_cputimes splits
+     * the scheduler's exact total by its user/system tick sample, as
+     * Linux's cputime_adjust does. It used to be the one total as user
+     * time, and `who` was not looked at: RUSAGE_CHILDREN answered the
+     * caller's own time, so bash's `time` of an external command printed
+     * the SHELL's time (logs/b13). */
     case LX_getrusage: {
         /* struct rusage: two timevals (ru_utime, ru_stime) then 14 longs. */
         struct { long us, uu, ss, su; long rest[14]; } ru;
         struct proc *rp = current_proc();
-        uint64_t ns = rp ? rp->cpu_ns : 0;
+        uint64_t un = 0, sn = 0;
+        long who = (long)(int)a1;
+        if (rp) {
+            if (who == 0) proc_group_cputimes(rp, &un, &sn);       /* SELF */
+            else if (who == -1) { un = rp->cutime_ns; sn = rp->cstime_ns; }
+            else if (who == 1) proc_cputimes(rp, &un, &sn);       /* THREAD */
+            else return -ABI_EINVAL;
+        }
         for (unsigned i = 0; i < sizeof(ru.rest)/sizeof(ru.rest[0]); i++)
             ru.rest[i] = 0;
-        ru.us = (long)(ns / 1000000000ull);
-        ru.uu = (long)((ns % 1000000000ull) / 1000ull);
-        ru.ss = 0; ru.su = 0;
+        ru.us = (long)(un / 1000000000ull);
+        ru.uu = (long)((un % 1000000000ull) / 1000ull);
+        ru.ss = (long)(sn / 1000000000ull);
+        ru.su = (long)((sn % 1000000000ull) / 1000ull);
         if (a2 && copy_to_user((void *)a2, &ru, sizeof ru) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -11424,9 +11445,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * in CLOCKS-PER-SEC units; glibc/musl report USER_HZ == 100. */
         struct { long ut, st, cut, cst; } tms;
         struct proc *tp = current_proc();
-        uint64_t ns = tp ? tp->cpu_ns : 0;
-        tms.ut  = (long)(ns / 10000000ull);        /* ns -> 1/100 s */
-        tms.st  = 0; tms.cut = 0; tms.cst = 0;
+        uint64_t un = 0, sn = 0;
+        if (tp) proc_group_cputimes(tp, &un, &sn);
+        tms.ut  = (long)(un / 10000000ull);        /* ns -> 1/100 s */
+        tms.st  = (long)(sn / 10000000ull);
+        tms.cut = tp ? (long)(tp->cutime_ns / 10000000ull) : 0;
+        tms.cst = tp ? (long)(tp->cstime_ns / 10000000ull) : 0;
         if (a1 && copy_to_user((void *)a1, &tms, sizeof tms) != 0)
             return -ABI_EFAULT;
         /* Return value is ticks since an arbitrary epoch; use boot time. */
@@ -12456,6 +12480,19 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                              ? ((uint32_t)xi.term_sig & 0x7f)
                              : ((uint32_t)code & 0xff) << 8;
             if (put_user_u32(ustatus, wstatus) != 0) return -ABI_EFAULT;
+        }
+        if (a4) {
+            /* THE CHILD'S RUSAGE: its user and system time with its own
+             * children's (Linux fills it from RUSAGE_BOTH). It was not
+             * written at all, so a caller read whatever it had there. */
+            struct { long us, uu, ss, su; long rest[14]; } ru;
+            memset(&ru, 0, sizeof ru);
+            ru.us = (long)(xi.utime_ns / 1000000000ull);
+            ru.uu = (long)((xi.utime_ns % 1000000000ull) / 1000ull);
+            ru.ss = (long)(xi.stime_ns / 1000000000ull);
+            ru.su = (long)((xi.stime_ns % 1000000000ull) / 1000ull);
+            if (copy_to_user((void *)a4, &ru, sizeof ru) != 0)
+                return -ABI_EFAULT;
         }
 #ifdef CHROMIUM_BOOT
         { static int w4 = 0; if (w4 < 16) { w4++;

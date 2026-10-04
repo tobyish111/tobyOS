@@ -1765,6 +1765,11 @@ void sched_tick(struct regs *r) {
          * idle (kernel-mode) ticks are counted in the denominator too. */
         struct proc *c = me->current;
         if (c && !c->is_idle) me->sched_busy_ticks++;
+        /* ...and for the proc: user or system (see struct proc's utick) */
+        if (c && !c->is_idle) {
+            if (r && (r->cs & 3) == 3) c->utick++;
+            else c->stick++;
+        }
         /* /proc/stat: the same sample, split three ways. */
         if (me->cpu_idx < MAX_CPUS) {
             int k = (c && c->is_idle) ? 2

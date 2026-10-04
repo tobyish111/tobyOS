@@ -547,6 +547,9 @@ long sys_fork(void) {
     child->cpu_ns         = 0;
     child->syscall_count  = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
     child->sysprot_priv   = 0;
     /* Slice 8: the memcpy copied the parent's namespace POINTERS, which is the
      * correct inheritance -- but each one now has a second user, so take the
@@ -955,6 +958,9 @@ long sys_fork_share(void) {
     child->cpu_ns          = 0;
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;
@@ -1190,6 +1196,9 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->cpu_ns          = 0;
     child->syscall_count   = 0;
     child->last_switch_tsc = 0;
+    child->utick = child->stick = 0;
+    child->cutime_ns = child->cstime_ns = 0;
+    child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;

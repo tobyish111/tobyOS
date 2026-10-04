@@ -46,6 +46,7 @@
 #include <tobyos/file.h>
 #include <tobyos/pipe.h>
 #include <tobyos/proc.h>
+#include <tobyos/abi/abi.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -866,6 +867,22 @@ uint64_t pit_ticks(void) {
 }
 
 uint32_t pit_hz(void) { return 1000; }        /* pit_ticks() counts in ms */
+
+/* The shell's user and system time and its reaped children's, ns:
+ * ABI_SYS_TIMES (times(2) and getrusage(2) for a native program). */
+int host_cputimes(uint64_t *out) {
+    struct abi_times t;
+    long r;
+    __asm__ volatile("syscall" : "=a"(r)
+                     : "0"((long)ABI_SYS_TIMES), "D"(0L), "S"((long)&t)
+                     : "rcx", "r11", "memory");
+    if (r < 0) return -1;
+    out[0] = t.utime_ns;
+    out[1] = t.stime_ns;
+    out[2] = t.cutime_ns;
+    out[3] = t.cstime_ns;
+    return 0;
+}
 
 void pit_sleep_ms(uint64_t ms) {
     struct timespec req = { (time_t)(ms / 1000), (long)((ms % 1000) * 1000000L) };

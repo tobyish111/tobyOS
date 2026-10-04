@@ -1070,7 +1070,17 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
      * So: emit all 52, with honest values where we have them and 0 elsewhere.
      * Field numbers below are 1-based and match proc(5). */
     {
-        uint64_t hz100 = p->cpu_ns / 10000000ull;   /* ns -> USER_HZ (100/s) */
+        /* utime/stime: this thread's split (Linux reports the thread for
+         * task/<tid>/stat and the group for <pid>/stat; the group here,
+         * as for a single-threaded process they are the same); cutime and
+         * cstime the reaped children's. ns -> USER_HZ (100/s). */
+        uint64_t ut_ns, st_ns;
+        if (p->is_thread) proc_cputimes(p, &ut_ns, &st_ns);
+        else proc_group_cputimes(p, &ut_ns, &st_ns);
+        uint64_t hz100 = ut_ns / 10000000ull;
+        uint64_t st100 = st_ns / 10000000ull;
+        uint64_t cut100 = p->cutime_ns / 10000000ull;
+        uint64_t cst100 = p->cstime_ns / 10000000ull;
         uint64_t rss_pages = p->user_pages;
         uint64_t vsize = rss_pages * 4096ull;
 
@@ -1091,9 +1101,9 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         APPEND_STR(" 0");                    /* 12 majflt      */
         APPEND_STR(" 0");                    /* 13 cmajflt     */
         APPEND_STR(" "); APPEND_INT(hz100);  /* 14 utime       */
-        APPEND_STR(" 0");                    /* 15 stime       */
-        APPEND_STR(" 0");                    /* 16 cutime      */
-        APPEND_STR(" 0");                    /* 17 cstime      */
+        APPEND_STR(" "); APPEND_INT(st100);  /* 15 stime       */
+        APPEND_STR(" "); APPEND_INT(cut100); /* 16 cutime      */
+        APPEND_STR(" "); APPEND_INT(cst100); /* 17 cstime      */
         APPEND_STR(" 20");                   /* 18 priority    */
         APPEND_STR(" 0");                    /* 19 nice        */
         APPEND_STR(" "); APPEND_INT(nthreads);   /* 20 num_threads */

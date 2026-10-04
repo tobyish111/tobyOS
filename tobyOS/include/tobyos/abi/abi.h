@@ -1250,7 +1250,21 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         /bin/df read a filesystem CHECKER's
                                         report through a struct that did not
                                         match it (M3). */
-#define ABI_SYS_NR_MAX          216
+#define ABI_SYS_TIMES           217  /* (int who, struct abi_times *out) ->
+                                        0|-E. who 0 = this process (its
+                                        thread group) with its reaped
+                                        children, 1 = this thread alone.
+                                        times(2) and getrusage(2) for a
+                                        native program: /bin/tsh's `times`
+                                        and `time` printed wall-clock
+                                        uptime and nothing. */
+#define ABI_SYS_NR_MAX          217
+
+/* ABI_SYS_TIMES's answer, in ns. */
+struct abi_times {
+    uint64_t utime_ns, stime_ns;        /* the caller */
+    uint64_t cutime_ns, cstime_ns;      /* its reaped children, theirs incl. */
+};
 
 /* ABI_SYS_STATFS's answer: vfs_statfs, in bsize units. */
 struct abi_statfs {
