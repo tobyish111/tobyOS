@@ -57,6 +57,7 @@
 #include <regex.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tobyos/wctab.h>
 
 /* ---- NFA node types --------------------------------------------- */
 
@@ -88,6 +89,11 @@ typedef struct nd {
     int           ch;             /* ND_LIT char, or group index, or backref */
     unsigned char cclass[CLASS_BITMAP_SIZE];
     int           greedy;
+    /* REG_UTF8 classes: code-point ranges past 0x7f (in the compile's pool,
+     * shared by clones) and a mask of wctab classes; cclass holds 0..0x7f. */
+    uint32_t    (*wr)[2];
+    int           nwr;
+    unsigned      wcls;
     /* ND_REPEAT only: the body it repeats, folded into this node. */
     int           btype;
     int           rmin, rmax;     /* rmax < 0 == unbounded */
@@ -118,7 +124,71 @@ typedef struct {
     const char  *pat;      /* the whole pattern, for BRE ^/$ position rules */
     int          has_alt;  /* pattern contains alternation */
     int          has_lazy; /* pattern contains a non-greedy quantifier */
+    int          utf8;     /* REG_UTF8 */
+    void       **pool;     /* the wide range arrays, freed by regfree */
+    int          npool, cappool;
 } compiled_t;
+
+/* ---- REG_UTF8 ---------------------------------------------------- */
+
+/* The character at P: its bytes and code point -- a valid UTF-8 sequence
+ * (musl's rules: no overlong form, no surrogate, nothing past U+10FFFF),
+ * else one byte whose value is its code point. AVAIL bounds the read. */
+static size_t rx_mbdec(const char *p, size_t avail, uint32_t *cp) {
+    const unsigned char *s = (const unsigned char *)p;
+    if (!avail) { *cp = 0; return 0; }
+    unsigned c = s[0];
+    *cp = c;
+    if (c < 0x80) return 1;
+    size_t n;
+    uint32_t v;
+    unsigned lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; v = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3; v = c & 0x0F;
+        if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4; v = c & 0x07;
+        if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F;
+    } else return 1;
+    if (avail < n) return 1;
+    for (size_t k = 1; k < n; k++) {
+        unsigned b = s[k];
+        if (b < lo || b > hi) return 1;
+        lo = 0x80; hi = 0xBF;
+        v = (v << 6) | (b & 0x3F);
+    }
+    *cp = v;
+    return n;
+}
+
+static size_t rx_avail(const char *p) {
+    size_t n = 0;
+    while (n < 4 && p[n]) n++;
+    return n;
+}
+
+/* Add the code-point range [lo,hi] (>= 0x80) to a class node. */
+static int rx_wide_add(compiled_t *c, nd_t *node, uint32_t lo, uint32_t hi) {
+    uint32_t (*nw)[2] = (uint32_t (*)[2])malloc((size_t)(node->nwr + 1) * sizeof *nw);
+    if (!nw) { c->err = REG_ESPACE; return 0; }
+    for (int i = 0; i < node->nwr; i++) { nw[i][0] = node->wr[i][0]; nw[i][1] = node->wr[i][1]; }
+    nw[node->nwr][0] = lo;
+    nw[node->nwr][1] = hi;
+    if (c->npool >= c->cappool) {
+        int ncap = c->cappool ? c->cappool * 2 : 8;
+        void **np = (void **)malloc((size_t)ncap * sizeof *np);
+        if (!np) { free(nw); c->err = REG_ESPACE; return 0; }
+        for (int i = 0; i < c->npool; i++) np[i] = c->pool[i];
+        free(c->pool);
+        c->pool = np;
+        c->cappool = ncap;
+    }
+    c->pool[c->npool++] = nw;
+    node->wr = nw;
+    node->nwr++;
+    return 1;
+}
 
 /* ---- bit helpers for character classes --------------------------- */
 
@@ -136,6 +206,26 @@ static void cls_add(unsigned char *c, int ch, int icase) {
         if (ch >= 'a' && ch <= 'z') cls_set(c, ch - 32);
         if (ch >= 'A' && ch <= 'Z') cls_set(c, ch + 32);
     }
+}
+
+/* Code point CP into a class node: the bitmap below 0x80, the wide list
+ * above; under REG_ICASE its other case too. */
+static int rx_class_cp(compiled_t *c, nd_t *node, uint32_t lo, uint32_t hi, int icase) {
+    if (lo < 0x80) {
+        uint32_t top = hi < 0x7F ? hi : 0x7F;
+        for (uint32_t ch = lo; ch <= top; ch++) cls_add(node->cclass, (int)ch, icase);
+        if (hi < 0x80) return 1;
+        lo = 0x80;
+    }
+    if (!rx_wide_add(c, node, lo, hi)) return 0;
+    if (icase && hi - lo < 1024) {
+        for (uint32_t ch = lo; ch <= hi; ch++) {
+            uint32_t u = wc_toupper(ch), l = wc_tolower(ch);
+            if (u != ch) { if (u < 0x80) cls_set(node->cclass, (int)u); else if (!rx_wide_add(c, node, u, u)) return 0; }
+            if (l != ch) { if (l < 0x80) cls_set(node->cclass, (int)l); else if (!rx_wide_add(c, node, l, l)) return 0; }
+        }
+    }
+    return 1;
 }
 
 /* ---- ctype, spelled out ------------------------------------------
@@ -402,6 +492,12 @@ static int quantify(compiled_t *c, frag_t body, int min, int max, int greedy,
  * awk wants them, sed and grep must not have them). */
 static int bracket_char(compiled_t *c, const char **pp) {
     const char *p = *pp;
+    if (c->utf8 && (unsigned char)*p >= 0x80) {          /* a whole character */
+        uint32_t cp;
+        size_t n = rx_mbdec(p, rx_avail(p), &cp);
+        *pp = p + n;
+        return (int)cp;
+    }
     if ((c->cflags & REG_ESCBRACKET) && *p == '\\' && p[1]) {
         p++;
         int v;
@@ -452,6 +548,17 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
                 if (!add_named_class(node->cclass, nm, nlen, icase)) {
                     c->err = REG_ECTYPE; return 0;
                 }
+                if (c->utf8) {
+                    int k = wc_class_id(nm, (unsigned long)nlen);
+                    if (k >= 0) node->wcls |= 1u << k;
+                    /* [:upper:] / [:lower:] under -i admit the other */
+                    if (icase && (k == WC_UPPER || k == WC_LOWER))
+                        node->wcls |= (1u << WC_UPPER) | (1u << WC_LOWER);
+                }
+            } else if (c->utf8 && nlen > 1 && (unsigned char)nm[0] >= 0x80) {
+                uint32_t cp;
+                if (rx_mbdec(nm, nlen, &cp) != nlen) { c->err = REG_ECOLLATE; return 0; }
+                if (!rx_class_cp(c, node, cp, cp, icase)) return 0;
             } else {
                 /* Single characters collate to themselves in the C
                  * locale, which is the only locale this system has. */
@@ -469,6 +576,10 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
             hi = bracket_char(c, &p);
         }
         if (hi < lo) { c->err = REG_ERANGE; return 0; }
+        if (c->utf8 && hi >= 0x80) {
+            if (!rx_class_cp(c, node, (uint32_t)lo, (uint32_t)hi, icase)) return 0;
+            continue;
+        }
         for (int ch = lo; ch <= hi; ch++) cls_add(node->cclass, ch, icase);
     }
     /* An unterminated class is an ERROR. It used to compile and match
@@ -655,6 +766,37 @@ static int parse_atom(compiled_t *c, const char **pp, int ere, frag_t *out) {
     literal:
         if (*p && !(ere && (*p == '|' || *p == ')')) &&
             *p != '*' && !(ere && (*p == '+' || *p == '?'))) {
+            /* REG_UTF8: a multibyte character is ONE atom, so a
+             * quantifier after it repeats all of it -- its bytes as a
+             * chain of literals, or under REG_ICASE a class of both
+             * cases (musl's towupper/towlower) */
+            uint32_t cp;
+            size_t mb = c->utf8 ? rx_mbdec(p, rx_avail(p), &cp) : 1;
+            if (mb > 1 && (c->cflags & REG_ICASE)) {
+                node = new_node(c);
+                if (!node) return 0;
+                node->type = ND_CLASS;
+                memset(node->cclass, 0, CLASS_BITMAP_SIZE);
+                if (!rx_class_cp(c, node, cp, cp, 1)) return 0;
+                p += mb;
+                break;
+            }
+            if (mb > 1) {
+                nd_t *first = 0, *prev = 0;
+                for (size_t k = 0; k < mb; k++) {
+                    nd_t *b = new_node(c);
+                    if (!b) return 0;
+                    b->type = ND_LIT;
+                    b->ch = (unsigned char)p[k];
+                    if (prev) prev->out = b; else first = b;
+                    prev = b;
+                }
+                p += mb;
+                *pp = p;
+                out->entry = first;
+                out->exit = prev;
+                return 1;
+            }
             node = new_node(c);
             if (!node) return 0;
             node->type = ND_LIT;
@@ -860,6 +1002,63 @@ typedef struct {
 
 static int rx_is_word_at(const char *p) { return rx_word((unsigned char)*p); }
 
+/* REG_UTF8's word characters: [[:alnum:]_], wide (musl's regex). */
+static int rx_wword(uint32_t cp) {
+    return cp < 0x80 ? rx_word((int)cp) : wc_class(WC_ALNUM, cp);
+}
+
+/* Is the character starting at P / ending at P a word character? */
+static int rx_word_after(const match_ctx *ctx, const char *p) {
+    if (!(ctx->cflags & REG_UTF8)) return rx_is_word_at(p);
+    uint32_t cp;
+    if (!*p) return 0;
+    rx_mbdec(p, rx_avail(p), &cp);
+    return rx_wword(cp);
+}
+
+static int rx_word_before(const match_ctx *ctx, const char *p) {
+    if (p == ctx->bol) return 0;
+    if (!(ctx->cflags & REG_UTF8)) return rx_is_word_at(p - 1);
+    const char *q = p - 1;
+    while (q > ctx->bol && ((unsigned char)*q & 0xC0) == 0x80 && p - q < 4) q--;
+    uint32_t cp;
+    if (rx_mbdec(q, (size_t)(p - q), &cp) != (size_t)(p - q)) {
+        rx_mbdec(p - 1, 1, &cp);
+    }
+    return rx_wword(cp);
+}
+
+/* A class node against code point CP (a REG_UTF8 character): the bitmap
+ * below 0x80, the wide ranges and classes above. */
+static int rx_set_has(const nd_t *n, uint32_t cp) {
+    if (cp < 0x80) return cls_test(n->cclass, (int)cp);
+    for (int i = 0; i < n->nwr; i++)
+        if (cp >= n->wr[i][0] && cp <= n->wr[i][1]) return 1;
+    for (int k = 0; k < WC_NCLASS; k++)
+        if ((n->wcls >> k) & 1 && wc_class(k, cp)) return 1;
+    return 0;
+}
+
+/* One REG_UTF8 character at SP against a DOT or class: its length, or 0
+ * when it does not match. */
+static size_t rx_match_wide(const match_ctx *ctx, const nd_t *n, int btype,
+                            const char *sp) {
+    if (!*sp) return 0;
+    uint32_t cp;
+    size_t l = rx_mbdec(sp, rx_avail(sp), &cp);
+    switch (btype) {
+    case ND_DOT:
+        return ((ctx->cflags & REG_NEWLINE) && cp == '\n') ? 0 : l;
+    case ND_CLASS:
+        return rx_set_has(n, cp) ? l : 0;
+    case ND_NCLASS:
+        if ((ctx->cflags & REG_NEWLINE) && cp == '\n') return 0;
+        return rx_set_has(n, cp) ? 0 : l;
+    default:
+        return 0;
+    }
+}
+
 static int match_body(const match_ctx *ctx, const nd_t *n, int btype, int c) {
     if (c == '\0') return 0;
     switch (btype) {
@@ -915,10 +1114,18 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             }
             node = node->out;
             continue;
-        case ND_LIT:
         case ND_DOT:
         case ND_CLASS:
         case ND_NCLASS:
+            if (ctx->cflags & REG_UTF8) {
+                size_t l = rx_match_wide(ctx, node, node->type, sp);
+                if (!l) { ctx->depth--; return 0; }
+                sp += l;
+                node = node->out;
+                continue;
+            }
+            /* fall through */
+        case ND_LIT:
             if (!match_body(ctx, node, node->type, (unsigned char)*sp)) {
                 ctx->depth--; return 0;
             }
@@ -926,6 +1133,42 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             node = node->out;
             continue;
         case ND_REPEAT: {
+            if ((ctx->cflags & REG_UTF8) && node->btype != ND_LIT) {
+                /* Characters vary in length: consume them greedily, noting
+                 * where each ends, and backtrack over those positions. */
+                const char *buf[64];
+                const char **pos = buf;
+                long cap = 64, n = 0;
+                const char *q = sp;
+                pos[0] = sp;
+                while (node->rmax < 0 || n < node->rmax) {
+                    size_t l = rx_match_wide(ctx, node, node->btype, q);
+                    if (!l) break;
+                    q += l;
+                    if (n + 1 >= cap) {
+                        const char **np = (const char **)malloc((size_t)cap * 2 * sizeof *np);
+                        if (!np) break;
+                        for (long i = 0; i <= n; i++) np[i] = pos[i];
+                        if (pos != buf) free(pos);
+                        pos = np;
+                        cap *= 2;
+                    }
+                    pos[++n] = q;
+                }
+                int r = 0;
+                if (n >= node->rmin) {
+                    if (node->greedy) {
+                        for (long k = n; k >= node->rmin && !r; k--)
+                            r = match_node(ctx, node->out, pos[k]);
+                    } else {
+                        for (long k = node->rmin; k <= n && !r; k++)
+                            r = match_node(ctx, node->out, pos[k]);
+                    }
+                }
+                if (pos != buf) free(pos);
+                ctx->depth--;
+                return r;
+            }
             /* Consume greedily by COUNTING, then hand the continuation
              * successively shorter prefixes. One frame per attempt
              * instead of one per character. */
@@ -970,22 +1213,22 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             continue;
         case ND_WORDB:
         case ND_NWORDB: {
-            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
-            int after  = rx_is_word_at(sp);
+            int before = rx_word_before(ctx, sp);
+            int after  = rx_word_after(ctx, sp);
             int b = (before != after);
             if ((node->type == ND_WORDB) != (b != 0)) { ctx->depth--; return 0; }
             node = node->out;
             continue;
         }
         case ND_WSTART: {
-            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
-            if (before || !rx_is_word_at(sp)) { ctx->depth--; return 0; }
+            int before = rx_word_before(ctx, sp);
+            if (before || !rx_word_after(ctx, sp)) { ctx->depth--; return 0; }
             node = node->out;
             continue;
         }
         case ND_WEND: {
-            int before = (sp != ctx->bol) && rx_is_word_at(sp - 1);
-            if (!before || rx_is_word_at(sp)) { ctx->depth--; return 0; }
+            int before = rx_word_before(ctx, sp);
+            if (!before || rx_word_after(ctx, sp)) { ctx->depth--; return 0; }
             node = node->out;
             continue;
         }
@@ -1080,6 +1323,7 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
     if (!comp) return REG_ESPACE;
     comp->cflags = cflags;
     comp->pat    = pattern;
+    comp->utf8   = (cflags & REG_UTF8) != 0;
 
     const char *p = pattern;
     int ere = (cflags & REG_EXTENDED) != 0;
@@ -1103,6 +1347,8 @@ int regcomp(regex_t *preg, const char *pattern, int cflags) {
     }
     if (!ok || comp->err) {
         int e = comp->err ? comp->err : REG_BADPAT;
+        for (int i = 0; i < comp->npool; i++) free(comp->pool[i]);
+        free(comp->pool);
         free(comp->nodes);
         free(comp);
         return e;
@@ -1214,7 +1460,13 @@ int regexec(const regex_t *preg, const char *string,
             return 0;
         }
         if (!*sp) break;
-        sp++;
+        /* the next start is the next CHARACTER under REG_UTF8 */
+        if (comp->cflags & REG_UTF8) {
+            uint32_t cp;
+            sp += rx_mbdec(sp, rx_avail(sp), &cp);
+        } else {
+            sp++;
+        }
     }
     return REG_NOMATCH;
 }
@@ -1222,6 +1474,8 @@ int regexec(const regex_t *preg, const char *string,
 void regfree(regex_t *preg) {
     if (!preg || !preg->priv) return;
     compiled_t *comp = (compiled_t *)preg->priv;
+    for (int i = 0; i < comp->npool; i++) free(comp->pool[i]);
+    free(comp->pool);
     free(comp->nodes);
     free(comp);
     preg->priv = 0;

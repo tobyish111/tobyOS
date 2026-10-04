@@ -57,6 +57,13 @@ typedef struct {
  * The callers that want glibc's answer -- tsh's `=~` and sed -E -- pass
  * this flag; grep, awk and the editors keep the literal brace. */
 #define REG_STRICTBRACE 0x200
+/* tobyOS extension: the pattern and the strings are UTF-8, and a character
+ * is a whole multibyte one -- `.` and a bracket expression take one, a
+ * multibyte literal is one atom, [[:alpha:]] and the rest and REG_ICASE
+ * are musl's for code points past 0x7f (tobyos/wctab.h). What musl's
+ * regcomp does in a UTF-8 locale; /bin/tsh asks for it for `=~` when its
+ * locale is UTF-8. Without the flag every byte is a character, as ever. */
+#define REG_UTF8        0x400
 
 /* eflags for regexec */
 #define REG_NOTBOL    1

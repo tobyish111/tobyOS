@@ -1391,6 +1391,7 @@ static bool shell_word_has_quoted_null(const char *w);
 static int shell_word_tilde(struct shell_sb *wb);
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
+static bool shell_glob_meta(char c);
 static bool g_shopt_nullglob, g_shopt_failglob;   /* defined with the shopt table */
 static int  sh_array_glob_field(const char *name, const char *field,
                                 long *next);
@@ -3869,6 +3870,9 @@ static unsigned shell_value_attrs(const char *name) {
  * case. Returns 1 with the result in OUT, 0 when there is nothing to do,
  * -1 when the arithmetic failed -- reported, status 1 and the line
  * discarded, as bash's evalerror does. */
+static bool shell_utf8(void);
+static size_t sh_case_put(struct shell_sb *out, const char *p, const char *end,
+                          int op, bool u8, int *rc);
 static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *out) {
     if (!(attrs & SHVAR_VALUE_ATTRS)) return 0;
     if (attrs & SHVAR_INTEGER) {
@@ -3888,12 +3892,20 @@ static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *ou
         ksnprintf(nb, sizeof nb, "%ld", v);
         return sb_set(out, nb) < 0 ? -1 : 1;
     }
-    if (sb_set(out, val ? val : "") < 0) return -1;
-    for (size_t i = 0; i < out->len; i++) {
-        char c = out->p[i];
-        if ((attrs & SHVAR_LOWER) && c >= 'A' && c <= 'Z') out->p[i] = (char)(c + 32);
-        if ((attrs & SHVAR_UPPER) && c >= 'a' && c <= 'z') out->p[i] = (char)(c - 32);
+    /* -l and -u map every character, multibyte ones too (sh_case1) */
+    if (attrs & (SHVAR_LOWER | SHVAR_UPPER)) {
+        const char *v = val ? val : "";
+        const char *e = v + strlen(v);
+        bool u8 = shell_utf8();
+        int op = (attrs & SHVAR_LOWER) ? 2 : 1;
+        SH_SB(m);
+        int rc = 0;
+        for (const char *q = v; q < e && rc == 0; )
+            q += sh_case_put(&m, q, e, op, u8, &rc);
+        if (rc < 0 || sb_set(out, m.p ? m.p : "") < 0) return -1;
+        return 1;
     }
+    if (sb_set(out, val ? val : "") < 0) return -1;
     return 1;
 }
 
@@ -4263,6 +4275,199 @@ static void shell_init_identity_vars(void) {
  * HOSTTYPE, MACHTYPE) keep an inherited value. */
 static void shell_set_if_not(const char *name, const char *val) {
     if (!env_get(name)) (void)env_set(name, val);
+}
+
+/* ---- the character set ---------------------------------------------------
+ *
+ * THE SHELL'S LC_CTYPE, as bash under musl has it (logs/b13 q1 q2): the
+ * first of LC_ALL, LC_CTYPE and LANG that is set and not empty names it,
+ * and with none of them it is musl's default, C.UTF-8. Only "C" and
+ * "POSIX" are single-byte; every other name -- C.UTF-8, en_US.UTF-8,
+ * xx_YY.whatever -- is UTF-8, which is all musl has. Read from the
+ * variables each time, so a prefix assignment (`LC_ALL=C printf %q ...`)
+ * and a `local LC_ALL=C` hold for exactly as long as the binding does.
+ *
+ * In UTF-8 a character is a valid UTF-8 sequence -- musl's mbrtowc: no
+ * overlong form, no surrogate, nothing past U+10FFFF -- and any byte that
+ * does not start one is a character by itself, as bash's ADVANCE_CHAR
+ * steps over it. tsh counted, sliced, matched and quoted BYTES whatever
+ * the locale: ${#s} of $'h\u00e9llo' was 6 where bash says 5. */
+static bool shell_utf8(void) {
+    const char *v = env_get("LC_ALL");
+    if (!v || !*v) v = env_get("LC_CTYPE");
+    if (!v || !*v) v = env_get("LANG");
+    if (!v || !*v) return true;
+    return strcmp(v, "C") != 0 && strcmp(v, "POSIX") != 0;
+}
+
+/* The bytes of the character at P (before END), and its code point: a
+ * valid UTF-8 sequence when U8, else -- or when invalid -- one byte, whose
+ * value is its code point (bash's wide conversion keeps the byte). */
+static size_t sh_mbdec(const char *p, const char *end, bool u8, uint32_t *cp) {
+    const unsigned char *s = (const unsigned char *)p;
+    size_t avail = (size_t)(end - p);
+    if (avail == 0) { if (cp) *cp = 0; return 0; }
+    unsigned c = s[0];
+    if (cp) *cp = c;
+    if (!u8 || c < 0x80) return 1;
+    size_t n;
+    uint32_t v;
+    unsigned lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) { n = 2; v = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3; v = c & 0x0F;
+        if (c == 0xE0) lo = 0xA0;
+        else if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4; v = c & 0x07;
+        if (c == 0xF0) lo = 0x90;
+        else if (c == 0xF4) hi = 0x8F;
+    } else return 1;
+    if (avail < n) return 1;
+    for (size_t k = 1; k < n; k++) {
+        unsigned b = s[k];
+        if (b < lo || b > hi) return 1;
+        lo = 0x80; hi = 0xBF;
+        v = (v << 6) | (b & 0x3F);
+    }
+    if (cp) *cp = v;
+    return n;
+}
+
+static size_t sh_cl(const char *p, const char *end, bool u8) {
+    return sh_mbdec(p, end, u8, 0);
+}
+
+/* Characters in S (N bytes); a SHELL_DATA_ESC and the byte it marks are
+ * one. */
+static long sh_char_count(const char *s, size_t n, bool u8) {
+    const char *p = s, *end = s + n;
+    long c = 0;
+    while (p < end) {
+        if (*p == SHELL_DATA_ESC && p + 1 < end) p += 2;
+        else p += sh_cl(p, end, u8);
+        c++;
+    }
+    return c;
+}
+
+/* Characters in a stored value -- an array element, which carries no
+ * escapes: ${#a[i]} of $'h\u00e9llo' is 5 in UTF-8 (logs/b13 q1). */
+static long sh_value_char_count(const char *s) {
+    bool u8 = shell_utf8();
+    const char *p = s, *end = s + strlen(s);
+    long c = 0;
+    while (p < end) { p += sh_cl(p, end, u8); c++; }
+    return c;
+}
+
+/* The byte offset of character K of S (N bytes); N for K past the end. */
+static size_t sh_char_off(const char *s, size_t n, long k, bool u8) {
+    const char *p = s, *end = s + n;
+    while (k > 0 && p < end) {
+        if (*p == SHELL_DATA_ESC && p + 1 < end) p += 2;
+        else p += sh_cl(p, end, u8);
+        k--;
+    }
+    return (size_t)(p - s);
+}
+
+#include "shell_wctab.inc"
+
+/* Code point C as UTF-8, onto OUT. */
+static int sh_utf8_put(struct shell_sb *out, uint32_t c) {
+    char b[4];
+    int n;
+    if (c < 0x80) { b[0] = (char)c; n = 1; }
+    else if (c < 0x800) {
+        b[0] = (char)(0xC0 | (c >> 6)); b[1] = (char)(0x80 | (c & 0x3F)); n = 2;
+    } else if (c < 0x10000) {
+        b[0] = (char)(0xE0 | (c >> 12)); b[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+        b[2] = (char)(0x80 | (c & 0x3F)); n = 3;
+    } else {
+        b[0] = (char)(0xF0 | (c >> 18)); b[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+        b[2] = (char)(0x80 | ((c >> 6) & 0x3F)); b[3] = (char)(0x80 | (c & 0x3F)); n = 4;
+    }
+    return sb_putmem(out, b, (size_t)n);
+}
+
+/* bash's sh_modcase on one character: OP 1 upper, 2 lower, 3 toggle --
+ * musl's towupper and towlower in UTF-8 (ss upper-cases to the capital
+ * sharp s there, logs/b13 q2), ASCII's in a single-byte locale, where a
+ * byte past 0x7f is left alone. */
+static uint32_t sh_case1(uint32_t c, int op, bool u8) {
+    if (c < 0x80) {
+        bool up = c >= 'A' && c <= 'Z', lo = c >= 'a' && c <= 'z';
+        if ((op == 1 || (op == 3 && lo)) && lo) return c - 32;
+        if ((op == 2 || (op == 3 && up)) && up) return c + 32;
+        return c;
+    }
+    if (!u8) return c;
+    if (op == 1) return sh_wc_toupper(c);
+    if (op == 2) return sh_wc_tolower(c);
+    if (sh_wc_class(SH_WC_UPPER, c)) return sh_wc_tolower(c);
+    if (sh_wc_class(SH_WC_LOWER, c)) return sh_wc_toupper(c);
+    return c;
+}
+
+/* One character of S at P (before END), case-mapped by OP onto OUT: a
+ * byte that is not a valid character goes across as it is. Returns the
+ * bytes it took from S. */
+static size_t sh_case_put(struct shell_sb *out, const char *p, const char *end,
+                          int op, bool u8, int *rc) {
+    uint32_t c;
+    size_t n = sh_mbdec(p, end, u8, &c);
+    if (op == 0 || (n == 1 && (unsigned char)*p >= 0x80)) {
+        if (sb_putmem(out, p, n) < 0) *rc = -1;
+        return n;
+    }
+    uint32_t m = sh_case1(c, op, u8);
+    if (m == c) { if (sb_putmem(out, p, n) < 0) *rc = -1; }
+    else if (sh_utf8_put(out, m) < 0) *rc = -1;
+    return n;
+}
+
+/* THE CHARACTER BOUNDARIES of S (N bytes) for the pattern operators, which
+ * try prefixes, suffixes and slices a CHARACTER at a time -- bash matches
+ * wide strings in a multibyte locale: ${s%?} takes the last character off,
+ * not its last byte. In a single-byte locale every byte is one and no
+ * table is made. sh_bnd_at(t, k) is the byte offset of character K. */
+struct sh_bnd {
+    size_t *off;                /* nch + 1 offsets, or 0: byte = character */
+    long nch;
+};
+
+static int sh_bnd_make(struct sh_bnd *t, const char *s, size_t n, bool u8) {
+    t->off = 0;
+    t->nch = (long)n;
+    if (!u8) return 0;
+    long c = sh_char_count(s, n, true);
+    t->off = (size_t *)kmalloc((size_t)(c + 1) * sizeof(size_t));
+    if (!t->off) return -1;
+    const char *p = s, *end = s + n;
+    long k = 0;
+    while (p < end) {
+        t->off[k++] = (size_t)(p - s);
+        if (*p == SHELL_DATA_ESC && p + 1 < end) p += 2;
+        else p += sh_cl(p, end, true);
+    }
+    t->off[k] = n;
+    t->nch = k;
+    return 0;
+}
+
+static size_t sh_bnd_at(const struct sh_bnd *t, long k) {
+    return t->off ? t->off[k] : (size_t)k;
+}
+
+static void sh_bnd_free(struct sh_bnd *t) { kfree(t->off); t->off = 0; }
+
+/* musl's iswprint: past ASCII, its table (wctab.h) -- every code point but
+ * the C1 controls, the line and paragraph separators, the interlinear
+ * annotation controls, the surrogates and the noncharacters. */
+static bool sh_wc_print(uint32_t wc) {
+    if (wc < 0x80) return wc >= 0x20 && wc < 0x7f;
+    return wc_class(WC_PRINT, wc) != 0;
 }
 
 /* bash's adjust_shell_level: SHLVL by CHANGE -- a value that is not a
@@ -10038,6 +10243,31 @@ static bool shell_ifs_is_ws(const char *ifs, char c) {
  * as a C string, so `printf '.\0.\n' | mapfile L` keeps "." -- where
  * `read` skips a NUL and keeps ".." (Oils 1891). g_rl_nul_cuts. */
 
+/* Are the HAVE bytes at P the start of a valid UTF-8 sequence that more
+ * bytes could complete? (musl's rules, as sh_mbdec's.) */
+static bool sh_mb_prefix_ok(const char *p, size_t have) {
+    const unsigned char *s = (const unsigned char *)p;
+    unsigned c = s[0];
+    size_t n;
+    unsigned lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3;
+        if (c == 0xE0) lo = 0xA0;
+        else if (c == 0xED) hi = 0x9F;
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4;
+        if (c == 0xF0) lo = 0x90;
+        else if (c == 0xF4) hi = 0x8F;
+    } else return false;
+    if (have >= n) return false;
+    for (size_t k = 1; k < have; k++) {
+        if (s[k] < lo || s[k] > hi) return false;
+        lo = 0x80; hi = 0xBF;
+    }
+    return true;
+}
+
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *out,
                                      bool *got_any, char delim,
@@ -10049,14 +10279,27 @@ static int shell_read_line_from_file(struct file *in, bool raw,
     bool hit_eof = false;
     bool escaped = false;
     bool cut = false;
+    /* -n and -N count CHARACTERS: in UTF-8 a multibyte one is read whole
+     * (bash: `read -n 2` of $'h\u00e9llo' is h and e-acute, 3 bytes) */
+    bool u8 = maxchars >= 0 && shell_utf8();
+    long nch = 0;
+    size_t cs = 0;              /* where the character being read starts */
 #define SH_RL_PUT(ch, e)                                                      \
     do {                                                                      \
         if (cut) break;                                                       \
         if (sb_putc(out, (ch)) < 0) return -2;                                \
         if (esc && sb_putc(esc, (char)((e) ? 1 : 0)) < 0) return -2;          \
+        if (!u8) { nch++; cs = out->len; break; }                             \
+        /* whole characters from cs on; a valid start still short of its */   \
+        /* bytes waits for them */                                            \
+        while (cs < out->len &&                                               \
+               !sh_mb_prefix_ok(out->p + cs, out->len - cs)) {                \
+            cs += sh_cl(out->p + cs, out->p + out->len, true);                \
+            nch++;                                                            \
+        }                                                                     \
     } while (0)
     for (;;) {
-        if (maxchars >= 0 && (long)out->len >= maxchars) { escaped = false; break; }
+        if (maxchars >= 0 && nch >= maxchars) { escaped = false; break; }
         char c = 0;
         long n = file_read(in, &c, 1);
         if (n < 0) { g_rl_err = n; return -1; }
@@ -19280,9 +19523,26 @@ static void printf_capture_free(struct printf_capture *c) {
  * as an `## OK` variant in four of these six cases -- its canonical
  * answer for `one two` is `'one two'` and for U+03BC is the character
  * itself, and bash gives neither. */
+/* Does S need the $'...' form? A control byte always; a byte past 0x7f
+ * in a single-byte locale; in UTF-8 only a character that is not a valid,
+ * printable one (bash's ansic_shouldquote -> iswprint):
+ *
+ *     printf %q $'\u00e9t\u00e9'     UTF-8: ete-with-accents as it is
+ *                                    C:     $'\303\251t\303\251'
+ *
+ * (logs/b13 q1 q2) -- %q, @Q, declare -p, set and set -x alike. */
 static bool shell_q_needs_ansi(const char *s) {
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
-        if (*p < 0x20 || *p == 0x7f || *p >= 0x80) return true;
+    bool u8 = shell_utf8();
+    const char *end = s + strlen(s);
+    for (const char *p = s; p < end; ) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f) return true;
+        if (c < 0x80) { p++; continue; }
+        uint32_t cp;
+        size_t n = sh_mbdec(p, end, u8, &cp);
+        if (!u8 || n == 1 || !sh_wc_print(cp)) return true;
+        p += n;
+    }
     return false;
 }
 
@@ -19317,6 +19577,10 @@ static bool shell_q_backslash(unsigned char c, bool first) {
  * double-quotes it -- and agree completely here. */
 static int shell_ansi_render(const char *s, bool emit) {
     int n = 0;
+    bool u8 = shell_utf8();
+    const char *send = s + strlen(s);
+    size_t mbn;
+    uint32_t mcp;
 #define Q_PUT(ch) do { if (emit) shell_putc((char)(ch)); n++; } while (0)
     {
         Q_PUT('$'); Q_PUT('\'');
@@ -19343,6 +19607,13 @@ static int shell_ansi_render(const char *s, bool emit) {
              * against bytes rather than reasoned about. */
             if (e) { Q_PUT('\\'); Q_PUT(e); }
             else if (c >= 0x20 && c < 0x7f) { Q_PUT(c); }
+            else if (c >= 0x80 && u8 &&
+                     (mbn = sh_mbdec((const char *)p, send, true, &mcp)) > 1 &&
+                     sh_wc_print(mcp)) {
+                /* a printable character, in UTF-8: itself (ansic_quote) */
+                for (size_t k = 0; k < mbn; k++) Q_PUT(p[k]);
+                p += mbn - 1;
+            }
             else {
                 /* Three-digit OCTAL, not hex: bash gives $'\377', and a
                  * high byte goes octal per byte -- U+03BC is $'\316\274',
@@ -25119,13 +25390,12 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
  * answer, not a detail. Anything else unprintable goes out as three-digit
  * OCTAL, which is what bash prints for $'\001\E\177'.
  */
-/* Appends to `out`. */
+/* Appends to `out`. The choice of form and the bytes past 0x7f follow the
+ * locale, as `declare -p` and %q do (shell_q_needs_ansi): in C, an e-acute is two
+ * octal escapes and makes the whole value $'...'; in UTF-8 it is itself
+ * (logs/b13 q2: @Q, @A, @K and the set -x trace all go through here). */
 static int shell_quote_ansic(const char *v, struct shell_sb *out) {
-    bool ctl = false;
-    for (const char *p = v; *p; p++)
-        if ((unsigned char)*p < 0x20 || (unsigned char)*p == 0x7f) ctl = true;
-
-    if (!ctl) {
+    if (!shell_q_needs_ansi(v)) {
         if (sb_putc(out, '\'') < 0) return -1;
         for (const char *p = v; *p; p++) {
             if (*p == '\'') {
@@ -25138,6 +25408,10 @@ static int shell_quote_ansic(const char *v, struct shell_sb *out) {
         return sb_putc(out, '\'');
     }
 
+    bool u8 = shell_utf8();
+    const char *vend = v + strlen(v);
+    size_t mn;
+    uint32_t mcp;
     if (sb_puts(out, "$'") < 0) return -1;
     for (const char *p = v; *p; p++) {
         unsigned char c = (unsigned char)*p;
@@ -25160,7 +25434,13 @@ static int shell_quote_ansic(const char *v, struct shell_sb *out) {
             if (sb_puts(out, e) < 0) return -1;
             continue;
         }
-        if (c < 0x20 || c == 0x7f) {
+        if (c >= 0x80 && u8 &&
+            (mn = sh_mbdec(p, vend, true, &mcp)) > 1 && sh_wc_print(mcp)) {
+            if (sb_putmem(out, p, mn) < 0) return -1;
+            p += mn - 1;
+            continue;
+        }
+        if (c < 0x20 || c >= 0x7f) {
             char e[5] = { '\\', (char)('0' + ((c >> 6) & 7)),
                           (char)('0' + ((c >> 3) & 7)),
                           (char)('0' + (c & 7)), '\0' };
@@ -25595,15 +25875,17 @@ static int shell_expand_at_transform(const char *name, char opch,
             if (n > 0 && sb_putmem(&out, eb, (size_t)n) < 0) return -1;
         }
         break;
-    case 'U': case 'L': case 'u':
-        for (const char *p = value.p; *p; p++) {
-            char c = *p;
-            if (opch == 'L')      { if (c >= 'A' && c <= 'Z') c = (char)(c + 32); }
-            else if (opch == 'U') { if (c >= 'a' && c <= 'z') c = (char)(c - 32); }
-            else if (p == value.p && c >= 'a' && c <= 'z') c = (char)(c - 32);
-            if (sb_putc(&out, c) < 0) return -1;
+    case 'U': case 'L': case 'u': {
+        bool u8 = shell_utf8();
+        const char *e = value.p + strlen(value.p);
+        int rc = 0;
+        for (const char *p = value.p; p < e && rc == 0; ) {
+            int op = opch == 'L' ? 2 : opch == 'U' ? 1 : (p == value.p ? 1 : 0);
+            p += sh_case_put(&out, p, e, op, u8, &rc);
         }
+        if (rc < 0) return -1;
         break;
+    }
     default:
         shell_bad_subst(true);          /* bash: expand_wdesc_fatal */
         return -1;
@@ -25747,15 +26029,19 @@ static int shell_expand_substring(const char *name, const char *spec,
     bool is_set = false, vjoin = false;
     if (shell_parameter_value(name, &value, &is_set, &vjoin) < 0) return -1;
     (void)is_set;                   /* an unset parameter slices to empty */
-    long n = (long)value.len;
+    /* in CHARACTERS (an escaped byte is one; a multibyte one in UTF-8) */
+    bool u8 = shell_utf8();
+    long n = sh_char_count(value.p, value.len, u8);
     if (off < 0) { off = n + off; if (off < 0) off = 0; }
     if (off > n) off = n;
     long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
     if (end > n) end = n;
     if (end < off) end = off;
+    size_t boff = sh_char_off(value.p, value.len, off, u8);
+    size_t bend = boff + sh_char_off(value.p + boff, value.len - boff, end - off, u8);
     return vjoin
-        ? sb_putn(b, value.p + off, (size_t)(end - off))
-        : sb_put_data_n(b, value.p + off, (size_t)(end - off));
+        ? sb_putn(b, value.p + boff, bend - boff)
+        : sb_put_data_n(b, value.p + boff, bend - boff);
 }
 
 /* Is `t` something bash will accept as the TARGET of an indirection?
@@ -25829,6 +26115,11 @@ static bool shell_glob_meta(char c);
  * The option was accepted and ignored (Oils 1873 1876). Set by those three
  * callers around their matching; every other match is exact. */
 static bool g_glob_nocase;
+/* The locale of the match in progress: UTF-8 or bytes (shell_glob_begin). */
+static bool g_glob_u8;
+static void shell_glob_begin(void);
+static void shell_glob_end(void);
+static bool shell_glob_cp_eq(uint32_t pc, uint32_t nc);
 
 
 static int shell_expand_element_op(const char *nm, const char *sub,
@@ -26640,7 +26931,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             if (count) {
                                 if (g_opt_nounset && !shell_var_has_value(nm))
                                     return shell_unbound_ref(nm, 0, 0);
-                                return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
+                                return sb_put_uint(b, (unsigned long)(v ? sh_value_char_count(v) : 0));
                             }
                             if (!v && g_opt_nounset)
                                 return shell_unbound_ref(nm, sub, slen);
@@ -26690,7 +26981,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             }
                             const char *v = ca ? sh_array_get(nm, cv)
                                                : (cv == 0 ? env_get(nm) : 0);
-                            return sb_put_uint(b, (unsigned long)(v ? strlen(v) : 0));
+                            return sb_put_uint(b, (unsigned long)(v ? sh_value_char_count(v) : 0));
                         }
                         if (sh_subscript_read_index(nm, subbuf.p, &idx) < 0)
                             return -1;
@@ -26912,6 +27203,18 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * its end, not a copy: copying it was another O(n) per try. */
             bool saved_nocase = g_glob_nocase;
             g_glob_nocase = g_shopt_misc[3];          /* nocasematch */
+            /* positions and lengths are CHARACTERS (sh_bnd); vlen and i
+             * below count them, and sh_bnd_at turns one into a byte */
+            shell_glob_begin();
+            struct sh_bnd bd;
+            if (sh_bnd_make(&bd, value, vlen, g_glob_u8) < 0) {
+                shell_glob_end();
+                g_glob_nocase = saved_nocase;
+                return -1;
+            }
+            const size_t vbytes = vlen;
+            vlen = (size_t)bd.nch;
+#define SH_VB(k) (value + sh_bnd_at(&bd, (long)(k)))
             long fixed = shell_pattern_matchlen_bash(pattern, pat_end);   /* bash measures here */
             int lead = shell_pattern_lead_byte(pattern, pat_end);
             SH_SB(out);
@@ -26927,7 +27230,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                 size_t mlen = 0;
                 if ((!done_one || all) && !(at_start && i != 0) &&
                     (lead < 0 ||
-                     (i < vlen && (unsigned char)value[i] == (unsigned)lead))) {
+                     (i < vlen && (unsigned char)*SH_VB(i) == (unsigned)lead))) {
                     /* Longest match at this position, so a pattern ending in
                      * a star replaces as much as it can -- bash's behaviour --
                      * rather than a single character. (Deliberately not
@@ -26944,35 +27247,41 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     }
                     for (size_t L = lmax; any; L--) {
                         if (shell_glob_match_e(pattern, pat_end,
-                                               value + i, value + i + L)) {
+                                               SH_VB(i), SH_VB(i + L))) {
                             matched = true; mlen = L; break;
                         }
                         if (L == lmin) break;
                     }
                 }
+                bool oom = false;
                 if (matched) {
-                    if (sb_putmem(&out, repl.p, rlen) < 0) {
-                        g_glob_nocase = saved_nocase;
-                        return -1;
-                    }
+                    if (sb_putmem(&out, repl.p, rlen) < 0) oom = true;
                     done_one = true;
                     if (mlen == 0) {           /* empty match: do not spin */
-                        if (i < vlen && sb_putc(&out, value[i]) < 0) {
-                            g_glob_nocase = saved_nocase;
-                            return -1;
-                        }
+                        if (!oom && i < vlen &&
+                            sb_putmem(&out, SH_VB(i), (size_t)(SH_VB(i + 1) - SH_VB(i))) < 0)
+                            oom = true;
                         i++;
                     } else {
                         i += mlen;
                     }
-                    continue;
+                } else {
+                    if (i < vlen &&
+                        sb_putmem(&out, SH_VB(i), (size_t)(SH_VB(i + 1) - SH_VB(i))) < 0)
+                        oom = true;
+                    i++;
                 }
-                if (i < vlen && sb_putc(&out, value[i]) < 0) {
+                if (oom) {
+                    sh_bnd_free(&bd);
+                    shell_glob_end();
                     g_glob_nocase = saved_nocase;
                     return -1;
                 }
-                i++;
             }
+#undef SH_VB
+            (void)vbytes;
+            sh_bnd_free(&bd);
+            shell_glob_end();
             g_glob_nocase = saved_nocase;
             return vjoin ? sh_put_join_value(b, out.p)
                          : sb_put_data_str(b, out.p);
@@ -27002,33 +27311,44 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             bool is_set = false, vjoin = false;
             if (shell_parameter_value(name, &valb, &is_set, &vjoin) < 0)
                 return -1;
-            char *value = valb.p;
+            const char *value = valb.p;
+            const char *vend = value + strlen(value);
+            /* CHARACTER by character, multibyte ones whole: the pattern is
+             * matched against one, and the case maps are musl's in UTF-8
+             * (sh_case1); a mapped character may change its length */
+            bool u8 = shell_utf8();
+            shell_glob_begin();
+            SH_SB(mod);
+            int mrc = 0;
             bool inword = false;
-            for (size_t i = 0; value[i]; i++) {
-                char c = value[i];
-                bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                             (c >= '0' && c <= '9');
+            for (const char *q = value; q < vend && mrc == 0; ) {
+                uint32_t c;
+                size_t cl = sh_mbdec(q, vend, u8, &c);
+                bool alnum = c < 0x80
+                    ? ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9'))
+                    : (u8 && cl > 1 && sh_wc_class(SH_WC_ALNUM, c));
                 if (!alnum) inword = false;
-                if (pattern && !shell_glob_match_e(pattern, pat_end, value + i,
-                                                   value + i + 1)) {
-                    inword = true;
-                    continue;
-                }
                 int act;                /* 1 upper, 2 lower, 3 toggle, 0 none */
-                if (cop == '~') {
+                if (pattern && !shell_glob_match_e(pattern, pat_end, q, q + cl)) {
+                    inword = true;
+                    act = 0;
+                } else if (cop == '~') {
                     act = all ? 3 : (inword ? 0 : 3);
                     inword = true;
                 } else if (all) {
                     act = cop == '^' ? 1 : 2;
                 } else {
-                    act = i > 0 ? 0 : (cop == '^' ? 1 : 2);
+                    act = q > value ? 0 : (cop == '^' ? 1 : 2);
                     inword = true;
                 }
-                if ((act == 1 || act == 3) && c >= 'a' && c <= 'z') value[i] = (char)(c - 32);
-                else if ((act == 2 || act == 3) && c >= 'A' && c <= 'Z') value[i] = (char)(c + 32);
+                q += sh_case_put(&mod, q, vend, act, u8, &mrc);
             }
-            return vjoin ? sh_put_join_value(b, value)
-                         : sb_put_data_str(b, value);
+            shell_glob_end();
+            if (mrc < 0) return -1;
+            const char *mv = mod.p ? mod.p : "";
+            return vjoin ? sh_put_join_value(b, mv)
+                         : sb_put_data_str(b, mv);
         }
         if (*op == '#' || *op == '%') {
             char strip_op = *op++;
@@ -27083,47 +27403,59 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * pattern can only match one prefix or suffix length. */
             size_t vlen = valb.len;
             const char *vend = value + vlen;
+            /* prefixes and suffixes a CHARACTER at a time (sh_bnd) */
+            shell_glob_begin();
+            struct sh_bnd bd;
+            if (sh_bnd_make(&bd, value, vlen, g_glob_u8) < 0) {
+                shell_glob_end();
+                return -1;
+            }
+            long nch = bd.nch;
             long fixed = shell_pattern_fixed_len(pattern, pat_end);
+            long cut = -1;                  /* the byte the kept part starts/ends at */
             if (strip_op == '#') {
                 if (greedy) {
-                    for (size_t i = vlen; i > 0; i--) {
-                        if (fixed >= 0 && i != (size_t)fixed) continue;
-                        if (shell_glob_match_e(pattern, pat_end, value, value + i))
-                            return vjoin
-                                ? sb_puts(b, value + i)
-                                : sb_put_data_str(b, value + i);
+                    for (long k = nch; k > 0 && cut < 0; k--) {
+                        if (fixed >= 0 && k != fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value,
+                                               value + sh_bnd_at(&bd, k)))
+                            cut = (long)sh_bnd_at(&bd, k);
                     }
                 } else {
-                    for (size_t i = 0; i <= vlen; i++) {
-                        if (fixed >= 0 && i != (size_t)fixed) continue;
-                        if (shell_glob_match_e(pattern, pat_end, value, value + i))
-                            return vjoin
-                                ? sb_puts(b, value + i)
-                                : sb_put_data_str(b, value + i);
+                    for (long k = 0; k <= nch && cut < 0; k++) {
+                        if (fixed >= 0 && k != fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end, value,
+                                               value + sh_bnd_at(&bd, k)))
+                            cut = (long)sh_bnd_at(&bd, k);
                     }
                 }
             } else {
                 if (greedy) {
-                    for (size_t i = 0; i <= vlen; i++) {
-                        if (fixed >= 0 && vlen - i != (size_t)fixed) continue;
-                        if (shell_glob_match_e(pattern, pat_end, value + i, vend))
-                            return vjoin
-                                ? sb_putn(b, value, i)
-                                : sb_put_data_n(b, value, i);
+                    for (long k = 0; k <= nch && cut < 0; k++) {
+                        if (fixed >= 0 && nch - k != fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end,
+                                               value + sh_bnd_at(&bd, k), vend))
+                            cut = (long)sh_bnd_at(&bd, k);
                     }
                 } else {
-                    for (size_t i = vlen; i > 0; i--) {
-                        if (fixed >= 0 && vlen - i != (size_t)fixed) continue;
-                        if (shell_glob_match_e(pattern, pat_end, value + i, vend))
-                            return vjoin
-                                ? sb_putn(b, value, i)
-                                : sb_put_data_n(b, value, i);
+                    for (long k = nch; k > 0 && cut < 0; k--) {
+                        if (fixed >= 0 && nch - k != fixed) continue;
+                        if (shell_glob_match_e(pattern, pat_end,
+                                               value + sh_bnd_at(&bd, k), vend))
+                            cut = (long)sh_bnd_at(&bd, k);
                     }
-                    if (shell_glob_match_e(pattern, pat_end, value, vend))
-                        return vjoin
-                            ? sb_putn(b, value, 0)
-                            : sb_put_data_n(b, value, 0);
+                    if (cut < 0 && shell_glob_match_e(pattern, pat_end, value, vend))
+                        cut = 0;
                 }
+            }
+            sh_bnd_free(&bd);
+            shell_glob_end();
+            if (cut >= 0) {
+                if (strip_op == '#')
+                    return vjoin ? sb_puts(b, value + cut)
+                                 : sb_put_data_str(b, value + cut);
+                return vjoin ? sb_putn(b, value, (size_t)cut)
+                             : sb_put_data_n(b, value, (size_t)cut);
             }
             return vjoin ? sh_put_join_value(b, value)
                          : sb_put_data_str(b, value);
@@ -27205,12 +27537,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
     if (length_mode) {
         /* ${#x} COUNTS CHARACTERS, AND AN ESCAPE IS NOT ONE. A value that
          * reached here through an expansion may carry SHELL_DATA_ESC in front
-         * of a byte that collides with a marker; strlen would count both. */
-        size_t vlen = 0;
-        for (const char *q = value; *q; q++) {
-            if (*q == SHELL_DATA_ESC && q[1]) q++;
-            vlen++;
-        }
+         * of a byte that collides with a marker; strlen would count both.
+         * In a UTF-8 locale a character is a multibyte one (shell_utf8). */
+        long vlen = sh_char_count(value, strlen(value), shell_utf8());
         return sb_put_uint(b, (unsigned long)vlen);
     }
 
@@ -30187,9 +30516,16 @@ static bool shell_has_glob(const char *s) {
     return false;
 }
 
-/* The twelve POSIX character classes, matched by name. ASCII only, which is
- * what this shell's byte-oriented patterns can express. */
-static bool shell_class_match(const char *name, size_t n, char c) {
+/* The twelve POSIX character classes, matched by name, for code point C:
+ * musl's iswalpha and the rest in a UTF-8 locale (shell_wctab.inc), its
+ * ASCII-only ctype in a single-byte one -- where a byte past 0x7f is in no
+ * class at all, as bash finds it there. */
+static bool shell_class_match(const char *name, size_t n, uint32_t c) {
+    if (c >= 0x80) {
+        if (!g_glob_u8) return false;
+        int k = sh_wc_class_id(name, n);
+        return k >= 0 && sh_wc_class(k, c);
+    }
     unsigned char u = (unsigned char)c;
     bool upper = (u >= 'A' && u <= 'Z');
     bool lower = (u >= 'a' && u <= 'z');
@@ -30219,8 +30555,46 @@ static bool shell_class_match(const char *name, size_t n, char c) {
     return false;                       /* unknown class matches nothing */
 }
 
-static bool shell_glob_bracket(const char **pp, char c) {
+/* ONE CHARACTER OF A PATTERN at P: an escape-marked byte is data, and in
+ * UTF-8 the bytes of a multibyte character -- each of which may carry its
+ * own escape mark, quoted text is marked byte by byte -- are one. Returns
+ * the pattern bytes it spans; *CP is its code point, BUF (4 bytes, may be
+ * 0) its bytes, *BL how many. */
+static size_t sh_pat_char(const char *p, const char *pend, uint32_t *cp,
+                          char *buf, size_t *bl) {
+    const char *q = p;
+    char raw[4];
+    size_t n = 0;
+    bool esc = (*q == '\\' || *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) &&
+               q + 1 < pend;
+    if (esc) q++;
+    raw[n++] = *q++;
+    unsigned char c0 = (unsigned char)raw[0];
+    size_t want = 1;
+    if (g_glob_u8 && c0 >= 0xC2 && c0 <= 0xF4)
+        want = c0 <= 0xDF ? 2 : c0 <= 0xEF ? 3 : 4;
+    while (n < want && q < pend) {
+        const char *r = q;
+        if ((*r == SHELL_GLOB_ESC || *r == SHELL_DATA_ESC) && r + 1 < pend) r++;
+        unsigned char b = (unsigned char)*r;
+        if (b < 0x80 || b > 0xBF) break;
+        raw[n++] = (char)b;
+        q = r + 1;
+    }
+    size_t got = sh_mbdec(raw, raw + n, g_glob_u8, cp);
+    if (got < n) {                      /* not one character: just the byte */
+        q = p + (esc ? 2 : 1);
+        n = 1;
+        *cp = c0;
+    }
+    if (buf) memcpy(buf, raw, n);
+    if (bl) *bl = n;
+    return (size_t)(q - p);
+}
+
+static bool shell_glob_bracket(const char **pp, uint32_t c) {
     const char *p = *pp + 1;   /* skip '[' */
+    const char *pend = p + strlen(p);
     bool negate = false;
     bool matched = false;
 
@@ -30259,22 +30633,30 @@ static bool shell_glob_bracket(const char **pp, char c) {
          * `[\\\\[z]` is the set { '[', 'z' }. Both spellings appear -- a case
          * pattern is escaped with a real backslash by shell_case_unquote, an
          * ordinary word with SHELL_GLOB_ESC by the tokenizer. */
+        /* A member is one CHARACTER (sh_pat_char: an escaped byte, or in
+         * UTF-8 a whole multibyte one), and a range compares CODE POINTS
+         * -- bash 5.2's globasciiranges, on by default: [a-z] does not
+         * take e-acute and [a-grave - y-diaeresis] does (logs/b13 q2). */
         if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
             p[1]) {
-            p++;
-            if (*p == c) matched = true;
-            p++;
+            uint32_t m;
+            p += sh_pat_char(p, pend, &m, 0, 0);
+            if (m == c) matched = true;
             continue;
         }
-        if (p[1] == '-' && p[2] && p[2] != ']') {
-            char lo = p[0];
-            char hi = p[2];
-            if (lo <= c && c <= hi) matched = true;
-            p += 3;
-            continue;
+        {
+            uint32_t lo;
+            size_t ln = sh_pat_char(p, pend, &lo, 0, 0);
+            if (p[ln] == '-' && p[ln + 1] && p[ln + 1] != ']') {
+                uint32_t hi;
+                size_t hn = sh_pat_char(p + ln + 1, pend, &hi, 0, 0);
+                if (lo <= c && c <= hi) matched = true;
+                p += ln + 1 + hn;
+                continue;
+            }
+            if (lo == c) matched = true;
+            p += ln;
         }
-        if (*p == c) matched = true;
-        p++;
     }
 
     if (!closed) {
@@ -30347,16 +30729,40 @@ static const char *eg_next_alt(const char *p, const char *end) {
 
 static bool shell_glob_match_e(const char *pat, const char *pend,
                                const char *name, const char *nend);
+static bool g_glob_u8;
 
-static char shell_ascii_other_case(char c) {
-    if (c >= 'a' && c <= 'z') return (char)(c - 32);
-    if (c >= 'A' && c <= 'Z') return (char)(c + 32);
-    return c;
+/* A character's other case, for nocasematch and nocaseglob: musl's
+ * towlower and towupper in UTF-8 (shell_wctab.inc), ASCII's otherwise. */
+static uint32_t shell_other_case(uint32_t c) {
+    if (c < 0x80) {
+        if (c >= 'a' && c <= 'z') return c - 32;
+        if (c >= 'A' && c <= 'Z') return c + 32;
+        return c;
+    }
+    if (!g_glob_u8) return c;
+    uint32_t l = sh_wc_tolower(c);
+    return l != c ? l : sh_wc_toupper(c);
 }
 
-static bool shell_glob_ch_eq(char a, char b) {
-    return a == b || (g_glob_nocase && shell_ascii_other_case(a) == b);
+/* Are pattern character PC and text character NC the same, under
+ * nocase (bash's FOLD: towlower on both) too? */
+static bool shell_glob_cp_eq(uint32_t pc, uint32_t nc) {
+    if (pc == nc) return true;
+    if (!g_glob_nocase) return false;
+    if (pc < 0x80 && nc < 0x80)
+        return shell_other_case(pc) == nc;
+    if (!g_glob_u8) return false;
+    return sh_wc_tolower(pc) == sh_wc_tolower(nc);
 }
+
+/* The matcher reads the locale once per match (shell_utf8 reads three
+ * variables): an outermost caller brackets its work with these, and
+ * shell_glob_match_e does for anyone else. */
+static int g_glob_depth;
+static void shell_glob_begin(void) {
+    if (g_glob_depth++ == 0) g_glob_u8 = shell_utf8();
+}
+static void shell_glob_end(void) { g_glob_depth--; }
 
 /* Zero or more repetitions of the alternation in [ls,le), then [rest,pend).
  * Shared by `*(...)` and, after one forced repetition, by `+(...)`. */
@@ -30369,7 +30775,8 @@ static bool eg_match_star(const char *ls, const char *le,
         const char *ae = eg_next_alt(as, le);
         /* A repetition must consume at least one character, or `*(a|)` on a
          * non-matching name would recurse on the same position forever. */
-        for (const char *n = name + 1; n <= nend; n++) {
+        for (const char *n = name + (name < nend ? sh_cl(name, nend, g_glob_u8) : 1);
+             n <= nend; n += n < nend ? sh_cl(n, nend, g_glob_u8) : 1) {
             if (shell_glob_match_e(as, ae, name, n) &&
                 eg_match_star(ls, le, rest, pend, n, nend))
                 return true;
@@ -30394,7 +30801,8 @@ static bool eg_try(char op, const char *lp, const char *pend,
     if (op == '!') {
         /* Any split whose prefix the list does NOT match, and whose
          * remainder matches the rest of the pattern. */
-        for (const char *n = name; n <= nend; n++) {
+        for (const char *n = name; n <= nend;
+             n += n < nend ? sh_cl(n, nend, g_glob_u8) : 1) {
             bool hit = false;
             for (const char *as = ls; as <= le; ) {
                 const char *ae = eg_next_alt(as, le);
@@ -30411,7 +30819,8 @@ static bool eg_try(char op, const char *lp, const char *pend,
 
     for (const char *as = ls; as <= le; ) {
         const char *ae = eg_next_alt(as, le);
-        for (const char *n = name; n <= nend; n++) {
+        for (const char *n = name; n <= nend;
+             n += n < nend ? sh_cl(n, nend, g_glob_u8) : 1) {
             if (!shell_glob_match_e(as, ae, name, n)) continue;
             bool ok = (op == '+')
                         ? eg_match_star(ls, le, rest, pend, n, nend)
@@ -30425,7 +30834,17 @@ static bool eg_try(char op, const char *lp, const char *pend,
     return true;
 }
 
+static bool shell_glob_match_r(const char *pat, const char *pend,
+                               const char *name, const char *nend);
 static bool shell_glob_match_e(const char *pat, const char *pend,
+                               const char *name, const char *nend) {
+    shell_glob_begin();
+    bool r = shell_glob_match_r(pat, pend, name, nend);
+    shell_glob_end();
+    return r;
+}
+
+static bool shell_glob_match_r(const char *pat, const char *pend,
                                const char *name, const char *nend) {
     while (pat < pend) {
         /* EXTGLOB FIRST, and that ordering is the whole bug if you get it
@@ -30444,9 +30863,13 @@ static bool shell_glob_match_e(const char *pat, const char *pend,
          * `"*"` reaches here instead of being lost with the quotes. */
         if ((*pat == '\\' || *pat == SHELL_GLOB_ESC ||
              *pat == SHELL_DATA_ESC) && pat + 1 < pend) {
-            if (name >= nend || !shell_glob_ch_eq(*name, pat[1])) return false;
-            pat += 2;
-            name++;
+            if (name >= nend) return false;
+            uint32_t pc, nc;
+            size_t pl = sh_pat_char(pat, pend, &pc, 0, 0);
+            size_t nl = sh_mbdec(name, nend, g_glob_u8, &nc);
+            if (!shell_glob_cp_eq(pc, nc)) return false;
+            pat += pl;
+            name += nl;
             continue;
         }
         if (*pat == '*') {
@@ -30464,34 +30887,39 @@ static bool shell_glob_match_e(const char *pat, const char *pend,
                 pat++;
             }
             if (pat >= pend) return true;
-            for (const char *n = name; ; n++) {
-                if (shell_glob_match_e(pat, pend, n, nend)) return true;
+            /* every CHARACTER boundary: a star never splits one */
+            for (const char *n = name; ; n += sh_cl(n, nend, g_glob_u8)) {
+                if (shell_glob_match_r(pat, pend, n, nend)) return true;
                 if (n >= nend) return false;
             }
         }
         if (name >= nend) return false;
-        if (*pat == '?') {
+        uint32_t nc;
+        size_t nl = sh_mbdec(name, nend, g_glob_u8, &nc);
+        if (*pat == '?') {                      /* one character */
             pat++;
-            name++;
+            name += nl;
             continue;
         }
         if (*pat == '[') {
             const char *after = pat;
-            if (!shell_glob_bracket(&after, *name)) {
+            if (!shell_glob_bracket(&after, nc)) {
                 const char *after2 = pat;
-                char oc = shell_ascii_other_case(*name);
-                if (!(g_glob_nocase && oc != *name &&
+                uint32_t oc = shell_other_case(nc);
+                if (!(g_glob_nocase && oc != nc &&
                       shell_glob_bracket(&after2, oc)))
                     return false;
                 after = after2;
             }
             pat = after;
-            name++;
+            name += nl;
             continue;
         }
-        if (!shell_glob_ch_eq(*name, *pat)) return false;
-        pat++;
-        name++;
+        uint32_t pc;
+        size_t pl = sh_pat_char(pat, pend, &pc, 0, 0);
+        if (!shell_glob_cp_eq(pc, nc)) return false;
+        pat += pl;
+        name += nl;
     }
     return name == nend;
 }
@@ -30543,12 +30971,6 @@ static long shell_pattern_fixed_len(const char *pat, const char *pend) {
         if ((*p == '?' || *p == '*' || *p == '+' || *p == '@' || *p == '!') &&
             p + 1 < pend && p[1] == '(' && eg_close_paren(p + 1, pend))
             return -1;
-        if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
-            p + 1 < pend) {
-            p += 2;
-            n++;
-            continue;
-        }
         if (*p == '*') return -1;
         if (*p == '[') {
             const char *e = shell_glob_bracket_end(p);
@@ -30556,7 +30978,9 @@ static long shell_pattern_fixed_len(const char *pat, const char *pend) {
             n++;
             continue;
         }
-        p++;
+        if (*p == '?') { p++; n++; continue; }
+        uint32_t cp;
+        p += sh_pat_char(p, pend, &cp, 0, 0);       /* a CHARACTER */
         n++;
     }
     return n;
@@ -30581,7 +31005,8 @@ static long shell_pattern_matchlen_bash(const char *pat, const char *pend) {
             return -1;
         if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
             p + 1 < pend) {
-            p += 2;
+            uint32_t cp;
+            p += sh_pat_char(p, pend, &cp, 0, 0);
             n++;
             continue;
         }
@@ -30631,7 +31056,9 @@ static long shell_pattern_matchlen_bash(const char *pat, const char *pend) {
             n++;
             continue;
         }
-        p++;
+        if (*p == '?') { p++; n++; continue; }
+        uint32_t cp;
+        p += sh_pat_char(p, pend, &cp, 0, 0);       /* a CHARACTER */
         n++;
     }
     return n;
@@ -36294,6 +36721,9 @@ static int shell_dbr_regex(const char *subj, const char *pat) {
      * because GNU grep and awk are. */
     int cflags = REG_EXTENDED | REG_STRICTBRACE;
     if (g_shopt_misc[3]) cflags |= REG_ICASE;          /* nocasematch */
+    /* a character is a multibyte one in a UTF-8 locale, as for musl's
+     * regcomp under bash: `.` takes e-acute whole (logs/b13 q2) */
+    if (shell_utf8()) cflags |= REG_UTF8;
     if (regcomp(&re, ere, cflags) != 0) {
         kfree(ere);
         return -1;
@@ -36454,10 +36884,20 @@ static int shell_dbr_primary(struct shell_dbr *d) {
              * `[[ ]]` does that `[` cannot express at all. */
             eq = shell_glob_match(b, a);
         } else {
-            /* quoted: a string, compared under nocasematch as bash does */
-            eq = strlen(a) == strlen(b);
-            for (size_t k = 0; eq && a[k]; k++)
-                eq = shell_glob_ch_eq(a[k], b[k]);
+            /* quoted: a string, compared under nocasematch as bash does --
+             * a character at a time, multibyte ones folded too */
+            shell_glob_begin();
+            const char *ae = a + strlen(a), *be = b + strlen(b);
+            const char *x = a, *y = b;
+            eq = true;
+            while (eq && x < ae && y < be) {
+                uint32_t xc, yc;
+                x += sh_mbdec(x, ae, g_glob_u8, &xc);
+                y += sh_mbdec(y, be, g_glob_u8, &yc);
+                eq = shell_glob_cp_eq(yc, xc);
+            }
+            if (x < ae || y < be) eq = false;
+            shell_glob_end();
         }
         g_glob_nocase = saved_nocase;
         if (strcmp(op, "!=") == 0) eq = !eq;
@@ -41973,6 +42413,9 @@ void shell_list_shopts_hosted(bool reinput) {
     char *av[] = { (char *)"shopt", (char *)"-p", 0 };
     cmd_shopt(reinput ? 2 : 1, av);
 }
+
+/* The line editor reads the shell's locale (shell_utf8). */
+bool shell_utf8_hosted(void) { return shell_utf8(); }
 
 /* $-'s `c` (-c) and `s` (commands read from standard input) */
 void shell_set_invocation_hosted(bool c, bool s) {
