@@ -988,6 +988,8 @@ extern bool shell_shopt_hosted(const char *name, bool on);
 extern void shell_list_shopts_hosted(bool reinput);
 extern void shell_set_invocation_hosted(bool c, bool s);
 extern void shell_set_login_hosted(void);
+extern bool shell_hist_active_hosted(void);
+extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
 extern void shell_startup_files_hosted(int login, bool interactive, bool norc,
                                        bool noprofile, const char *rcfile,
                                        bool act_like_sh);
@@ -1363,6 +1365,23 @@ int main(int argc, char **argv) {
             (void)shell_take_interrupt();
             last = 130;
             continue;
+        }
+        /* HISTORY EXPANSION, a line at a time as bash's reader does it
+         * (shell_histexp.inc): the expanded line is echoed and is what is
+         * read; one that fails is reported and read as empty. */
+        if (n > 0 && shell_hist_active_hosted()) {
+            int hr = 0;
+            const char *xl = shell_hist_line_hosted(line, cont ? accum : "", &hr);
+            if (hr < 0) {
+                n = 0;
+                line[0] = '\0';
+            } else if (hr > 0) {
+                size_t xn = strlen(xl);
+                if (xn + 1 <= sizeof line) {
+                    memcpy(line, xl, xn + 1);
+                    n = xn;
+                }
+            }
         }
         if (n == 0 && !cont) continue;
         eofs = 0;

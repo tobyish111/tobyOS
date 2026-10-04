@@ -584,6 +584,8 @@ static void shell_hist_var_written(const char *key, size_t klen);
 static void shell_history_add_raw(const char *raw, const char *raw_base,
                                   const char *from, const char *to,
                                   bool heredoc);
+static bool shell_hist_expanding(void);           /* shell_histexp.inc */
+static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used);
 
 /* $LINENO: line number of the command currently executing, counted within the
  * script (or from shell start for interactive input). */
@@ -16649,9 +16651,15 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
      * eval and `.` are builtins: bash's status for an error inside them that
      * ends everything is EX_BADSYNTAX, 257, which leaves the shell as 1. */
     struct shell_syn syn;
-    shell_syn_open(&syn, text, syn_base_set ? syn_base : g_shell_lineno,
+    unsigned long syn_base0 = syn_base_set ? syn_base : g_shell_lineno;
+    shell_syn_open(&syn, text, syn_base0,
                    eval_mode ? "eval" : syn_iname, eval_mode || syn_string,
                    syn_repl, eval_mode || g_source_depth > 0);
+    /* HISTORY EXPANSION in the main script (`set -o history -H`): the text
+     * with each command's lines expanded as they are read, once read
+     * (shell_hist_unit). hx_upto is how far into it that has gone. */
+    char *hx_text = 0;
+    size_t hx_upto = 0;
     /* The here-document unit being read and run (see SHELL_HD_TAG), and a
      * tagged copy of the unit's first line, both released per unit and once
      * more on the way out for the paths that `break`. */
@@ -16661,6 +16669,38 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     while (*p) {
         if (hd_unit) { shell_hd_release_unit(hd_unit); hd_unit = 0; }
         if (hd_tline) { kfree(hd_tline); hd_tline = 0; }
+        /* The next command's lines, history-expanded as bash reads them --
+         * echoed, or reported and emptied -- spliced over the text as
+         * written; what is before them stays put, so every offset into the
+         * text so far still holds. */
+        if (hist_reader && shell_hist_expanding() && (size_t)(p - text) >= hx_upto) {
+            SH_SB(xu);
+            size_t used = 0, off = (size_t)(p - text);
+            shell_hist_unit(p, &xu, &used);
+            if (xu.len != used || (xu.len && memcmp(xu.p, p, used) != 0)) {
+                size_t rest = strlen(p + used);
+                char *nt = (char *)kmalloc(off + xu.len + rest + 1);
+                if (nt) {
+                    memcpy(nt, text, off);
+                    memcpy(nt + off, xu.p, xu.len);
+                    memcpy(nt + off + xu.len, p + used, rest + 1);
+                    kfree(hx_text);
+                    hx_text = nt;
+                    text = nt;
+                    p = nt + off;
+                    hx_upto = off + xu.len;
+                    shell_syn_close(&syn);
+                    shell_syn_open(&syn, text, syn_base0,
+                                   eval_mode ? "eval" : syn_iname,
+                                   eval_mode || syn_string, syn_repl,
+                                   eval_mode || g_source_depth > 0);
+                    if (hist_raw) { kfree(hist_raw); hist_raw = 0; }
+                    if (!xu.len) continue;      /* all dropped: read on */
+                }
+            } else {
+                hx_upto = off + used;
+            }
+        }
         g_shell_lineno++;
         unsigned long line_first = g_shell_lineno;
         char *line_start = p;
@@ -17174,6 +17214,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     if (hd_unit) shell_hd_release_unit(hd_unit);
     if (hd_tline) kfree(hd_tline);
     if (hist_raw) kfree(hist_raw);
+    kfree(hx_text);
     g_hd_unit_cur = hd_saved_unit;
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
@@ -21358,6 +21399,8 @@ static void shell_history_add_raw(const char *raw, const char *raw_base,
     shell_history_add(t.p);
 }
 
+#include "shell_histexp.inc"
+
 /* Drop the newest entry (bash_delete_last_history). `fc` uses this to take
  * its own invocation back out of the history before it looks at it, which
  * is what POSIX means by the re-executed command replacing the fc command. */
@@ -22162,7 +22205,8 @@ static void cmd_popd(int argc, char **argv) {
  *   history -d N | -d START-END     delete; negative counts from the end
  *   history -s ARG...               ARGs as one entry, IN PLACE of the
  *                                   line that ran it (once per line)
- *   history -p ARG...               print ARGs (tsh has no `!` expansion)
+ *   history -p ARG...               print ARGs history-expanded, set -H
+ *                                   or not (shell_histexp.inc)
  *   history -a|-n|-r|-w [FILE]      append this session's lines / read the
  *                                   lines not yet read / read all / write
  *                                   all; FILE defaults to $HISTFILE, then
@@ -22292,7 +22336,19 @@ static void cmd_history(int argc, char **argv) {
             shell_set_status(1);
             return;
         }
-        for (int k = i; k < argc; k++) shell_printf("%s\n", argv[k]);
+        int st = 0;
+        for (int k = i; k < argc; k++) {
+            SH_SB(xo);
+            SH_SB(xe);
+            int r = shell_hist_expand(argv[k], 0, &xo, &xe);
+            if (r < 0) {
+                kprintf("history: %s: history expansion failed\n", argv[k]);
+                st = 1;
+                continue;
+            }
+            shell_printf("%s\n", r == 0 ? argv[k] : (xo.p ? xo.p : ""));
+        }
+        shell_set_status(st);
         return;
     }
     if (flags & HD) {
@@ -42827,8 +42883,17 @@ void shell_set_interactive_hosted(bool on) {
     /* bash enables job control only for interactive shells; follow it, so a
      * script never inherits monitor from the way the binary was invoked. */
     g_opt_monitor = on;
-    /* ...and history the same way (S6). */
+    /* ...and history the same way (S6) -- and `!` expansion: bash's -H is
+     * on at a terminal, off in a script (shell_histexp.inc). */
     g_opt_history = on;
+    g_opt_histexpand = on;
+    /* bash's prompts exist in an interactive shell only, PS1 '\s-\v\$ '
+     * and PS2 '> ' unless the environment brought its own (variables.c).
+     * /bin/tsh had neither and drew "tsh$ " (logs/b13 q41). */
+    if (on) {
+        shell_set_if_not("PS1", "\\s-\\v\\$ ");
+        shell_set_if_not("PS2", "> ");
+    }
 }
 
 /* ---- bash's command line (host.c's main) ----------------------------------

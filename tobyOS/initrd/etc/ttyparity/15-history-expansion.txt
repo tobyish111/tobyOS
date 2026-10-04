@@ -1,0 +1,17 @@
+# HISTORY EXPANSION AT A TERMINAL (batch 13). bash turns -H on for an
+# interactive shell: each line is expanded as it is read, the expanded line
+# is echoed before it runs, ^old^new is a substitution on the last command,
+# a failed event is reported and nothing runs, and :p prints without
+# running. tsh had no expansion at all -- `!!` was two characters -- and
+# its $- had no H. (The diagnostic's program-name prefix is normalised by
+# the runner.)
+echo one two three
+!!
+echo !$ !^
+^three^four
+!nosuch
+echo "st=$?"
+echo !echo:2-3 '!!' "!-1:0"
+!!:p
+case $- in *H*) echo histexpand-on;; esac
+exit 0
