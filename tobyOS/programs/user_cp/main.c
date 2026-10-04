@@ -134,6 +134,13 @@ static int copy_file(const char *src, const char *dst) {
         fprintf(stderr, "cp: cannot open '%s': %s\n", src, strerror(errno));
         return -1;
     }
+    /* A NEW FILE TAKES THE SOURCE'S PERMISSION BITS, less the umask (POSIX
+     * cp; GNU's too): `cp /bin/true x` makes an executable x. It was always
+     * 0644 -- the kernel does not apply open's mode -- so a copied program
+     * would not run (logs/b13 q17). A file that already exists keeps its
+     * own mode. */
+    struct stat dst_st;
+    int existed = stat(dst, &dst_st) == 0;
     int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (out < 0) {
         fprintf(stderr, "cp: cannot create '%s': %s\n", dst, strerror(errno));
@@ -164,6 +171,13 @@ done:
     if (rc == 0 && f_preserve) {
         struct stat st;
         if (stat(src, &st) == 0) (void)chmod(dst, st.st_mode & 07777);
+    } else if (rc == 0 && !existed) {
+        struct stat st;
+        if (stat(src, &st) == 0) {
+            mode_t um = umask(0);
+            (void)umask(um);
+            (void)chmod(dst, (st.st_mode & 0777) & ~um);
+        }
     }
     if (rc == 0 && f_verbose) printf("'%s' -> '%s'\n", src, dst);
     return rc;
