@@ -11213,12 +11213,6 @@ static void cmd_pwd(int argc, char **argv) {
 static const char *shell_errno_text(int err);
 
 /* `-L`, `-P`, `-e`, `-@` and their combinations: cd's own options */
-static bool strchr_opt_ok(const char *a) {
-    for (const char *q = a + 1; *q; q++)
-        if (*q != 'L' && *q != 'P' && *q != 'e' && *q != '@') return false;
-    return true;
-}
-
 /* The name cd's messages carry: pushd and popd run it under theirs. */
 static const char *g_cd_who = "cd";
 
@@ -11231,28 +11225,36 @@ static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
     bool print_new = false;
-    /* `--` ENDS THE OPTIONS. `cd -- /` is how a script says "the next word is
-     * a directory even if it starts with a dash", and tsh took the `--`
-     * itself as the directory and reported "no such file or directory". It
-     * only surfaced once $PWD stopped defaulting to `/`, because before that
-     * the failed cd left PWD reading the same as a successful one. */
-    if (argc > 1 && strcmp(argv[1], "--") == 0) {
-        argv++;
-        argc--;
-    }
-    /* ONE DIRECTORY: `cd foo bar` is "cd: too many arguments", status 1,
-     * and nothing changes (bash; Oils 0720 0721). tsh went to foo. The
-     * options -L / -P (and -e, -@) come before it. */
-    {
-        int k = 1;
-        while (k < argc && argv[k][0] == '-' && argv[k][1] &&
-               strcmp(argv[k], "-") != 0 && strchr_opt_ok(argv[k]))
-            k++;
-        if (argc - k > 1) {
-            kprintf("%s: too many arguments\n", g_cd_who);
-            shell_set_status(1);
+    /* bash's options, as internal_getopt reads them ("eLP"): -L and -P,
+     * the last winning, and -e, combined as they like -- `-Pe`, `-L -P`;
+     * `--` ends them and `-` alone is the operand. Any other letter is
+     * "invalid option" and the usage line, status 2: this bash is built
+     * without -@ (logs/b13 q54). tsh took only a lone -L or -P as argv[1],
+     * so `cd -e dir` and `cd -@ dir` went looking for a directory "-e".
+     * `--` ENDS THE OPTIONS: `cd -- /` is how a script says "the next word
+     * is a directory even if it starts with a dash". */
+    int k = 1;
+    for (; k < argc; k++) {
+        const char *a = argv[k];
+        if (a[0] != '-' || !a[1]) break;
+        if (strcmp(a, "--") == 0) { k++; break; }
+        for (const char *q = a + 1; *q; q++) {
+            if (*q == 'L' || *q == 'P' || *q == 'e') continue;
+            kprintf("%s: -%c: invalid option\n", g_cd_who, *q);
+            if (strcmp(g_cd_who, "cd") == 0)
+                kprintf_raw("cd: usage: cd [-L|[-P [-e]] [-@]] [dir]\n");
+            shell_set_status(2);
             return;
         }
+    }
+    argv += k - 1;
+    argc -= k - 1;
+    /* ONE DIRECTORY: `cd foo bar` is "cd: too many arguments", status 1,
+     * and nothing changes (bash; Oils 0720 0721). tsh went to foo. */
+    if (argc > 2) {
+        kprintf("%s: too many arguments\n", g_cd_who);
+        shell_set_status(1);
+        return;
     }
     if (argc <= 1) {
         target = env_get("HOME");
@@ -11265,13 +11267,9 @@ static void cmd_cd(int argc, char **argv) {
             return;
         }
         print_new = true;
-    } else if (strcmp(argv[1], "-L") == 0 || strcmp(argv[1], "-P") == 0) {
-        /* -L is the default and -P differs only where symlinks exist, which
-         * this VFS does not resolve; both are accepted so a script that says
-         * `cd -P "$dir"` is not left one argument short. */
-        target = (argc > 2) ? argv[2] : env_get("HOME");
-        if (!target || !*target) target = "/";
     } else {
+        /* -L is the default and -P differs only where symlinks exist, which
+         * this VFS does not resolve */
         target = argv[1];
     }
 
