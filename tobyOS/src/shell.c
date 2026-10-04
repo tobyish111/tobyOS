@@ -6462,16 +6462,34 @@ static struct sh_array *sh_array_create(const char *name) {
 
 /* Drop one element, keeping the remaining indices EXACTLY as they were --
  * `unset a[1]` leaves a hole, it does not renumber. */
+/* ELEMENT LOOKUP IS A SEARCH, NOT A SCAN (batch 13). An indexed array's
+ * elements are kept in index order, so this is a binary search: the first
+ * element whose index is >= IDX, and whether it is IDX. Every ${a[i]} and
+ * a[i]=v walked the whole array, which made a loop over a large one
+ * quadratic. */
+static int sh_arr_lower(const struct sh_array *a, long idx) {
+    int lo = 0, hi = a->n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (a->e[mid].idx < idx) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static int sh_arr_find_idx(const struct sh_array *a, long idx) {
+    int i = sh_arr_lower(a, idx);
+    return (i < a->n && a->e[i].idx == idx) ? i : -1;
+}
+
 static void sh_array_unset_idx(struct sh_array *a, long idx) {
     if (!a) return;
-    for (int i = 0; i < a->n; i++) {
-        if (a->e[i].idx != idx) continue;
-        kfree(a->e[i].key);
-        kfree(a->e[i].val);
-        for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
-        a->n--;
-        return;
-    }
+    int i = sh_arr_find_idx(a, idx);
+    if (i < 0) return;
+    kfree(a->e[i].key);
+    kfree(a->e[i].val);
+    for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
+    a->n--;
 }
 
 static void sh_array_unset_at(struct sh_array *a) {
@@ -6505,16 +6523,14 @@ static int sh_array_set(const char *name, long idx, const char *val) {
     char *copy = (char *)kmalloc(vn);
     if (!copy) return -1;
     memcpy(copy, val, vn);
-    for (int i = 0; i < a->n; i++) {                 /* replace in place */
-        if (a->e[i].idx == idx) {
-            kfree(a->e[i].val);
-            a->e[i].val = copy;
-            return 0;
-        }
+    int at = sh_arr_lower(a, idx);
+    if (at < a->n && a->e[at].idx == idx) {          /* replace in place */
+        kfree(a->e[at].val);
+        a->e[at].val = copy;
+        return 0;
     }
     if (!sh_array_reserve(a)) { kfree(copy); return -1; }
-    int at = a->n;                                   /* keep sorted by idx */
-    while (at > 0 && a->e[at - 1].idx > idx) { a->e[at] = a->e[at - 1]; at--; }
+    for (int j = a->n; j > at; j--) a->e[j] = a->e[j - 1];   /* sorted by idx */
     a->e[at].idx = idx;
     a->e[at].key = 0;          /* indexed element: no string key */
     a->e[at].val = copy;
@@ -7133,13 +7149,40 @@ static int sh_array_set_key(const char *name, const char *key,
     return sh_assoc_put(a, key, val);
 }
 
+/* An associative array's elements are kept in bash's table order: by
+ * bucket, the full hash in idx. So a key is found by binary search for its
+ * bucket and a walk of that bucket alone -- it was a strcmp of every key,
+ * quadratic over a loop that fills a large array. */
+static int sh_assoc_find(const struct sh_array *a, const char *key) {
+    if (!a->assoc) {
+        for (int i = 0; i < a->n; i++)
+            if (a->e[i].key && strcmp(a->e[i].key, key) == 0) return i;
+        return -1;
+    }
+    unsigned nb = sh_assoc_nbuckets(a);
+    unsigned hv = sh_bash_hash(key);
+    unsigned b = hv & (nb - 1);
+    int lo = 0, hi = a->n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (((unsigned)a->e[mid].idx & (nb - 1)) < b) lo = mid + 1;
+        else hi = mid;
+    }
+    for (int i = lo; i < a->n && ((unsigned)a->e[i].idx & (nb - 1)) == b; i++)
+        if ((unsigned)a->e[i].idx == hv && a->e[i].key &&
+            strcmp(a->e[i].key, key) == 0)
+            return i;
+    return -1;
+}
+
 static int sh_assoc_put(struct sh_array *a, const char *key, const char *val) {
     size_t vn = strlen(val) + 1;
     char *copy = (char *)kmalloc(vn);
     if (!copy) return -1;
     memcpy(copy, val, vn);
-    for (int i = 0; i < a->n; i++) {
-        if (a->e[i].key && strcmp(a->e[i].key, key) == 0) {
+    {
+        int i = sh_assoc_find(a, key);
+        if (i >= 0) {
             kfree(a->e[i].val);
             a->e[i].val = copy;
             return 0;
@@ -7172,29 +7215,30 @@ static int sh_assoc_put(struct sh_array *a, const char *key, const char *val) {
 static const char *sh_array_get_key(const char *name, const char *key) {
     struct sh_array *a = sh_array_find(name);
     if (!a) return 0;
-    for (int i = 0; i < a->n; i++)
-        if (a->e[i].key && strcmp(a->e[i].key, key) == 0) return a->e[i].val;
-    return 0;
+    int i = sh_assoc_find(a, key);
+    return i >= 0 ? a->e[i].val : 0;
 }
 
 static void sh_array_unset_key(struct sh_array *a, const char *key) {
     if (!a) return;
-    for (int i = 0; i < a->n; i++) {
-        if (!a->e[i].key || strcmp(a->e[i].key, key) != 0) continue;
-        kfree(a->e[i].key);
-        kfree(a->e[i].val);
-        for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
-        a->n--;
-        return;
-    }
+    int i = sh_assoc_find(a, key);
+    if (i < 0) return;
+    kfree(a->e[i].key);
+    kfree(a->e[i].val);
+    for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
+    a->n--;
 }
 
 static const char *sh_array_get(const char *name, long idx) {
     struct sh_array *a = sh_array_find(name);
     if (!a) return 0;
-    for (int i = 0; i < a->n; i++)
-        if (a->e[i].idx == idx) return a->e[i].val;
-    return 0;
+    if (a->assoc) {
+        for (int i = 0; i < a->n; i++)
+            if (a->e[i].idx == idx) return a->e[i].val;
+        return 0;
+    }
+    int i = sh_arr_find_idx(a, idx);
+    return i >= 0 ? a->e[i].val : 0;
 }
 
 /* Highest index in use, or -1 when empty. `a+=(v)` appends at this + 1, which
