@@ -333,8 +333,8 @@ static void comp_collect_vars(struct sh_strv *out, bool exported_only,
 
 static void comp_collect_aliases(struct sh_strv *out) {
     struct sh_strv a = { 0, 0, 0 };
-    for (int i = 0; i < g_naliases; i++)
-        if (g_aliases[i].name) (void)sv_add(&a, g_aliases[i].name);
+    for (int i = 0; i < g_alias_tab.n; i++)
+        (void)sv_add(&a, g_alias_tab.e[i].key);
     sv_sort(&a);
     for (int i = 0; i < a.n; i++) (void)sv_add(out, a.v[i]);
     sv_free(&a);

@@ -1090,11 +1090,6 @@ static void shell_diagf(const char *fmt, ...) {
 }
 #endif
 
-struct shell_alias {
-    char *name;
-    char *value;
-};
-
 struct shell_function {
     char *name;
     char *body;
@@ -1209,11 +1204,6 @@ static unsigned g_hd_unit_cur;
 static void shell_hd_pin_text(const char *text, int delta);
 static void shell_hd_strip_tags(char *s);
 
-/* GROWABLE: it held 32, and the 33rd `alias` was "failed to set". Entries
- * are found by index and only their string pointers are handed out, so the
- * table may move when it grows. */
-static struct shell_alias *g_aliases;
-static int g_naliases;                  /* slots, used or free */
 /* GROWABLE. It held 32, so a script's 33rd function was "failed to define"
  * and every call to it went looking for /bin/<name>. A slot is found by
  * index and a lookup's pointer is used only until the body starts running
@@ -1274,6 +1264,7 @@ static int g_exec_line_depth;
 struct sh_array;
 static struct sh_array *sh_array_find(const char *name);
 static struct sh_array *sh_array_create(const char *name);
+static void sh_dynarr_init(void);
 static void  sh_array_unset(const char *name);
 static void  sh_array_unset_idx(struct sh_array *a, long idx);
 static int   sh_array_set(const char *name, long idx, const char *val);
@@ -4237,6 +4228,7 @@ static void shell_init_bash_vars(const char *self) {
     if (!sh_array_find("BASH_ARGV")) (void)sh_array_create("BASH_ARGV");
     if (!sh_array_find("BASH_CMDS")) (void)sh_array_make_assoc("BASH_CMDS");
     if (!sh_array_find("BASH_ALIASES")) (void)sh_array_make_assoc("BASH_ALIASES");
+    sh_dynarr_init();
     if (!sh_array_find("GROUPS")) {
         /* the process's groups; none beyond its own is its own gid */
         struct proc *cur = current_proc();
@@ -4410,19 +4402,40 @@ static int shell_enter_dot_params(struct shell_param_frame *frame,
     return 0;
 }
 
+/* bash's hash_string (hashlib.c): FNV-1 over the key's bytes as SIGNED
+ * chars. Its tables -- aliases, remembered commands, associative arrays,
+ * completion specs -- iterate in the order this puts their keys in. */
+static unsigned sh_bash_hash(const char *k) {
+    unsigned i = 2166136261u;
+    for (; *k; k++) {
+        i += (i << 1) + (i << 4) + (i << 7) + (i << 8) + (i << 24);
+        i ^= (unsigned)(int)(signed char)*k;
+    }
+    return i;
+}
+
+#include "shell_htab.inc"
+
 /* ---- aliases, functions, and here-doc state ------------------------ */
+
+/* THE ALIAS TABLE IS bash's: a hash table of 64 buckets (alias.c), kept in
+ * the order bash walks it, because that walk is BASH_ALIASES' order:
+ *
+ *     alias x='echo x' y='echo y'; echo "${!BASH_ALIASES[@]}"
+ *         bash: y x
+ *
+ * It was a list of slots, in the order they were filled. An entry's data is
+ * the alias's value. */
+static struct sh_htab g_alias_tab = { 0, 0, 0, 0, 64 };
 
 static int shell_alias_find(const char *name) {
     if (!name || !*name) return -1;
-    for (int i = 0; i < g_naliases; i++) {
-        if (g_aliases[i].name && strcmp(g_aliases[i].name, name) == 0) return i;
-    }
-    return -1;
+    return sh_htab_find(&g_alias_tab, name);
 }
 
 static const char *shell_alias_value(const char *name) {
     int idx = shell_alias_find(name);
-    return idx >= 0 ? g_aliases[idx].value : 0;
+    return idx >= 0 ? (const char *)g_alias_tab.e[idx].data : 0;
 }
 
 /* An alias NAME is not a variable name. bash accepts anything that is not
@@ -4445,106 +4458,75 @@ static bool shell_alias_name_ok(const char *name) {
     return true;
 }
 
+/* A new name goes in at the front of its bucket; a redefinition keeps its
+ * place (bash's add_alias replaces the value). */
 static int shell_alias_set(const char *name, const char *value) {
     if (!name || !value || !shell_alias_name_ok(name)) return -1;
-
-    char *ncopy = shell_strdup(name);
     char *vcopy = shell_strdup(value);
-    if (!ncopy || !vcopy) {
-        kfree(ncopy);
+    if (!vcopy) return -1;
+    int idx = sh_htab_insert(&g_alias_tab, name, 0);
+    if (idx < 0) {
         kfree(vcopy);
         return -1;
     }
-
-    int idx = shell_alias_find(name);
-    if (idx < 0) {
-        for (int i = 0; i < g_naliases; i++) {
-            if (!g_aliases[i].name) {
-                idx = i;
-                break;
-            }
-        }
-    }
-    if (idx < 0) {
-        int ncap = g_naliases ? g_naliases * 2 : 32;
-        struct shell_alias *nt =
-            (struct shell_alias *)kmalloc((size_t)ncap * sizeof *nt);
-        if (!nt) {
-            kfree(ncopy);
-            kfree(vcopy);
-            return -1;
-        }
-        if (g_naliases)
-            memcpy(nt, g_aliases, (size_t)g_naliases * sizeof *nt);
-        memset(nt + g_naliases, 0, (size_t)(ncap - g_naliases) * sizeof *nt);
-        kfree(g_aliases);
-        g_aliases = nt;
-        idx = g_naliases;
-        g_naliases = ncap;
-    }
-
-    kfree(g_aliases[idx].name);
-    kfree(g_aliases[idx].value);
-    g_aliases[idx].name = ncopy;
-    g_aliases[idx].value = vcopy;
+    kfree(g_alias_tab.e[idx].data);
+    g_alias_tab.e[idx].data = vcopy;
     return 0;
 }
 
 static void shell_alias_unset(const char *name) {
     int idx = shell_alias_find(name);
     if (idx < 0) return;
-    kfree(g_aliases[idx].name);
-    kfree(g_aliases[idx].value);
-    g_aliases[idx].name = 0;
-    g_aliases[idx].value = 0;
+    kfree(g_alias_tab.e[idx].data);
+    sh_htab_remove_at(&g_alias_tab, idx);
 }
 
+/* `unalias -a`: bash's hash_flush, which keeps the table's size. */
 static void shell_alias_clear_all(void) {
-    for (int i = 0; i < g_naliases; i++) {
-        shell_alias_unset(g_aliases[i].name);
+    while (g_alias_tab.n > 0) {
+        kfree(g_alias_tab.e[g_alias_tab.n - 1].data);
+        sh_htab_remove_at(&g_alias_tab, g_alias_tab.n - 1);
     }
 }
 
-/* A COPY OF THE ALIAS TABLE, as many slots as it had when taken -- for a
- * subshell and for a command substitution, which is one. */
+/* A COPY OF THE ALIAS TABLE -- order and size too -- for a subshell and for
+ * a command substitution, which is one. */
 struct shell_alias_frame {
-    int n;
-    char **name;
-    char **value;
+    struct sh_htab t;
 };
+
+static void shell_alias_tab_free(struct sh_htab *t) {
+    for (int i = 0; i < t->n; i++) {
+        kfree(t->e[i].key);
+        kfree(t->e[i].data);
+    }
+    kfree(t->e);
+    t->e = 0;
+    t->n = t->cap = 0;
+}
 
 static void shell_alias_frame_clear(struct shell_alias_frame *frame) {
     if (!frame) return;
-    for (int i = 0; i < frame->n; i++) {
-        if (frame->name && frame->name[i]) kfree(frame->name[i]);
-        if (frame->value && frame->value[i]) kfree(frame->value[i]);
-    }
-    kfree(frame->name);
-    kfree(frame->value);
-    frame->name = frame->value = 0;
-    frame->n = 0;
+    shell_alias_tab_free(&frame->t);
 }
 
 static int shell_alias_frame_capture(struct shell_alias_frame *frame) {
     if (!frame) return -1;
     memset(frame, 0, sizeof(*frame));
-    if (g_naliases == 0) return 0;
-    frame->name = (char **)kmalloc((size_t)g_naliases * sizeof(char *));
-    frame->value = (char **)kmalloc((size_t)g_naliases * sizeof(char *));
-    if (!frame->name || !frame->value) {
-        kfree(frame->name);
-        kfree(frame->value);
-        frame->name = frame->value = 0;
-        return -1;
-    }
-    frame->n = g_naliases;
-    memset(frame->name, 0, (size_t)frame->n * sizeof(char *));
-    memset(frame->value, 0, (size_t)frame->n * sizeof(char *));
-    for (int i = 0; i < frame->n; i++) {
-        if (!g_aliases[i].name) continue;
-        frame->name[i] = shell_strdup(g_aliases[i].name);
-        frame->value[i] = shell_strdup(g_aliases[i].value);
-        if (!frame->name[i] || !frame->value[i]) {
+    frame->t.nb = g_alias_tab.nb;
+    frame->t.nb0 = g_alias_tab.nb0;
+    if (g_alias_tab.n == 0) return 0;
+    frame->t.e = (struct sh_hent *)kmalloc((size_t)g_alias_tab.n *
+                                           sizeof *frame->t.e);
+    if (!frame->t.e) return -1;
+    frame->t.cap = g_alias_tab.n;
+    for (int i = 0; i < g_alias_tab.n; i++) {
+        struct sh_hent *d = &frame->t.e[i];
+        *d = g_alias_tab.e[i];
+        d->key = shell_strdup(g_alias_tab.e[i].key);
+        d->data = shell_strdup((const char *)g_alias_tab.e[i].data);
+        frame->t.n = i + 1;
+        if (!d->key || !d->data) {
             shell_alias_frame_clear(frame);
             return -1;
         }
@@ -4552,19 +4534,12 @@ static int shell_alias_frame_capture(struct shell_alias_frame *frame) {
     return 0;
 }
 
+/* What was added or changed inside goes; the copy becomes the table. */
 static void shell_alias_frame_restore(struct shell_alias_frame *frame) {
     if (!frame) return;
-    /* Slots past the saved ones were added inside, and go. */
-    for (int i = 0; i < g_naliases; i++) {
-        if (g_aliases[i].name) kfree(g_aliases[i].name);
-        if (g_aliases[i].value) kfree(g_aliases[i].value);
-        g_aliases[i].name = (i < frame->n) ? frame->name[i] : 0;
-        g_aliases[i].value = (i < frame->n) ? frame->value[i] : 0;
-        if (i < frame->n) {
-            frame->name[i] = 0;
-            frame->value[i] = 0;
-        }
-    }
+    shell_alias_tab_free(&g_alias_tab);
+    g_alias_tab = frame->t;
+    memset(&frame->t, 0, sizeof frame->t);
 }
 
 static int shell_function_find(const char *name) {
@@ -5803,7 +5778,18 @@ struct sh_array {
      * ASSOC_HASH_BUCKETS, 1024): its elements are kept in the order
      * bash's table iterates them -- see sh_array_set_key. */
     int  nbuckets;
+    /* BASH_ALIASES or BASH_CMDS while it is still bash's dynamic variable:
+     * SH_DYN_ALIASES / SH_DYN_CMDS, else 0. See sh_dynarr_rebuild. */
+    unsigned char dyn;
 };
+
+#define SH_DYN_ALIASES 1
+#define SH_DYN_CMDS    2
+static void sh_dynarr_rebuild(struct sh_array *a);
+/* Nonzero while `set` or `declare` lists the variables: they print a
+ * dynamic array as it was last read, as bash's listings do. */
+static int g_dynarr_quiet;
+static bool g_dynarr_busy;              /* rebuilding: no hooks */
 static struct sh_array **g_arrays;
 static int g_narrays;
 static int g_arrays_cap;
@@ -5889,7 +5875,11 @@ static int sh_array_literal_commit(const char *tmp, const char *name,
             }
         }
     }
-    if (append) {
+    /* BASH_ALIASES=(...) and BASH_CMDS=(...) define each element and
+     * clear nothing: bash empties the variable, then the next read
+     * rebuilds it from the tables (logs/b13 q3 q10). */
+    struct sh_array *dst = sh_array_find(name);
+    if (append || (dst && dst->dyn)) {
         int rc = sh_array_create(name) ? 0 : -1;
         for (int i = 0; rc == 0 && i < t->n; i++) {
             if (t->e[i].key)
@@ -5932,8 +5922,12 @@ static struct sh_array *sh_array_find(const char *name) {
     const char *real = env_deref_name_ex(name, &target, false);
     if (!real || !*real) real = name;
     for (int i = 0; i < g_narrays; i++)
-        if (g_arrays[i]->name && strcmp(g_arrays[i]->name, real) == 0)
-            return g_arrays[i];
+        if (g_arrays[i]->name && strcmp(g_arrays[i]->name, real) == 0) {
+            struct sh_array *a = g_arrays[i];
+            if (a->dyn && !g_dynarr_quiet && !g_dynarr_busy)
+                sh_dynarr_rebuild(a);
+            return a;
+        }
     return 0;
 }
 
@@ -6095,6 +6089,7 @@ static int sh_array_copy_into(struct sh_array *dst, const struct sh_array *src) 
     memset(dst, 0, sizeof *dst);
     dst->assoc = src->assoc;
     dst->nbuckets = src->nbuckets;
+    dst->dyn = src->dyn;
     dst->name = sh_array_strdup(src->name ? src->name : "");
     if (!dst->name) return -1;
     if (src->n > 0) {
@@ -6605,18 +6600,8 @@ static int shell_decl_convert(const char *name, bool assoc, const char *label) {
  * finds nentries >= 2 * nbuckets, re-linking each old bucket head-first.
  * So the elements are KEPT in that order: a new key goes in front of its
  * bucket's others, and growth re-sorts exactly as the rehash does. The
- * full hash rides in the element's idx, unused by an associative array. */
-static unsigned sh_bash_hash(const char *k) {
-    unsigned i = 2166136261u;
-    for (; *k; k++) {
-        i += (i << 1) + (i << 4) + (i << 7) + (i << 8) + (i << 24);
-        i ^= (unsigned)(int)(signed char)*k;
-    }
-    return i;
-}
-
-#include "shell_htab.inc"
-
+ * full hash rides in the element's idx, unused by an associative array
+ * (sh_bash_hash). */
 static unsigned sh_assoc_nbuckets(const struct sh_array *a) {
     return a->nbuckets > 0 ? (unsigned)a->nbuckets : 1024u;
 }
@@ -6642,10 +6627,28 @@ static bool sh_assoc_rehash(struct sh_array *a, unsigned nb) {
     return true;
 }
 
+static int sh_dynarr_assign(struct sh_array *a, const char *key,
+                            const char *val);
+
+static int sh_assoc_put(struct sh_array *a, const char *key, const char *val);
+
+/* The two arrays as made at startup become the dynamic ones. */
+static void sh_dynarr_init(void) {
+    struct sh_array *d = sh_array_find_literal("BASH_CMDS");
+    if (d) d->dyn = SH_DYN_CMDS;
+    d = sh_array_find_literal("BASH_ALIASES");
+    if (d) d->dyn = SH_DYN_ALIASES;
+}
+
 static int sh_array_set_key(const char *name, const char *key,
                             const char *val) {
     struct sh_array *a = sh_array_create(name);
     if (!a) return -1;
+    if (a->dyn && !g_dynarr_busy) return sh_dynarr_assign(a, key, val);
+    return sh_assoc_put(a, key, val);
+}
+
+static int sh_assoc_put(struct sh_array *a, const char *key, const char *val) {
     size_t vn = strlen(val) + 1;
     char *copy = (char *)kmalloc(vn);
     if (!copy) return -1;
@@ -8395,7 +8398,9 @@ static void cmd_declare(int argc, char **argv) {
      * -r or -x that switches to the reinput form below. tsh sent both
      * spellings down the same path. */
     if (i >= argc && !any_opt) {
+        g_dynarr_quiet++;
         shell_print_vars_set_format();
+        g_dynarr_quiet--;
         return;
     }
 
@@ -8441,6 +8446,7 @@ static void cmd_declare(int argc, char **argv) {
             while (j >= 0 && strcmp(names[j], v) > 0) { names[j + 1] = names[j]; j--; }
             names[j + 1] = v;
         }
+        g_dynarr_quiet++;
         for (int k = 0; k < n; k++) {
             if (!shell_declare_filter_ok(names[k], set_array, set_assoc,
                                          set_nameref, set_readonly,
@@ -8456,6 +8462,7 @@ static void cmd_declare(int argc, char **argv) {
             }
             (void)shell_declare_print(names[k]);
         }
+        g_dynarr_quiet--;
         kfree(names);
         return;
     }
@@ -9397,7 +9404,9 @@ static void cmd_set(int argc, char **argv) {
 static void cmd_set_in(int argc, char **argv) {
     shell_set_status(0);
     if (argc <= 1) {
+        g_dynarr_quiet++;
         shell_print_vars_set_format();
+        g_dynarr_quiet--;
         return;
     }
 
@@ -16760,12 +16769,15 @@ static void cmd_colon(int argc, char **argv) {
     shell_set_status(0);
 }
 
-static void shell_print_alias(const struct shell_alias *a) {
-    if (!a || !a->name || !a->value) return;
+static void shell_print_alias(int idx) {
+    if (idx < 0 || idx >= g_alias_tab.n) return;
+    const char *name = g_alias_tab.e[idx].key;
+    const char *value = (const char *)g_alias_tab.e[idx].data;
+    if (!name || !value) return;
     /* a name that starts with `-` is reusable only after `--` (bash's
      * print_alias) */
-    shell_printf("alias %s%s='", a->name[0] == '-' ? "-- " : "", a->name);
-    for (const char *p = a->value; *p; p++) {
+    shell_printf("alias %s%s='", name[0] == '-' ? "-- " : "", name);
+    for (const char *p = value; *p; p++) {
         if (*p == '\'') shell_printf("'\\''");
         else shell_putc(*p);
     }
@@ -16795,8 +16807,8 @@ static void cmd_alias(int argc, char **argv) {
     }
     int i = g.ind;
     if (i >= argc || pflag) {
-        for (int k = 0; k < g_naliases; k++)
-            if (g_aliases[k].name) shell_print_alias(&g_aliases[k]);
+        for (int k = 0; k < g_alias_tab.n; k++)
+            shell_print_alias(k);
         if (i >= argc) return;
     }
 
@@ -16828,7 +16840,7 @@ static void cmd_alias(int argc, char **argv) {
             kprintf("alias: %s: not found\n", argv[i]);
             shell_set_status(1);
         } else {
-            shell_print_alias(&g_aliases[idx]);
+            shell_print_alias(idx);
         }
     }
 }
@@ -17452,10 +17464,10 @@ static void cmd_command(int argc, char **argv) {
             if (aidx >= 0) {
                 if (verbose) {
                     /* bash's wording -- see cmd_type. */
-                    shell_printf("%s is aliased to `%s'\n",
-                                 argv[i], g_aliases[aidx].value);
+                    shell_printf("%s is aliased to `%s'\n", argv[i],
+                                 (const char *)g_alias_tab.e[aidx].data);
                 } else {
-                    shell_print_alias(&g_aliases[aidx]);
+                    shell_print_alias(aidx);
                 }
                 found = true;
             }
@@ -17811,7 +17823,8 @@ static void cmd_type(int argc, char **argv) {
              * apostrophe after. tsh printed OSH's "is an alias for": a
              * different sentence for the same fact, and `type` output is
              * exactly what a script greps. */
-            shell_printf("%s is aliased to `%s'\n", name, g_aliases[aidx].value);
+            shell_printf("%s is aliased to `%s'\n", name,
+                         (const char *)g_alias_tab.e[aidx].data);
             any = true;
             if (!f_a) continue;
         }
@@ -19534,6 +19547,51 @@ static void phash_insert(const char *name, const char *path, int hits,
     g_phash.e[i].data = p;
     g_phash.e[i].hits = hits;
     g_phash.e[i].flags = chkdot ? PHASH_CHKDOT : 0;
+}
+
+/* BASH_ALIASES AND BASH_CMDS ARE THE ALIAS AND COMMAND TABLES, read and
+ * written through two associative arrays (bash's build_aliasvar,
+ * build_hashcmd and their assign functions):
+ *
+ *     alias ll='ls -l'; echo "${BASH_ALIASES[ll]}"     bash: ls -l
+ *     BASH_ALIASES[hi]='echo hello'; alias hi         alias hi='echo hello'
+ *     BASH_CMDS[foo]=/bin/echo; foo x                  x
+ *
+ * tsh had two empty arrays (logs/b13 q3 q10). Every lookup by name rebuilds
+ * the array from its table, in the table's walk order, into an associative
+ * array of the table's size -- so a new key goes in front of its bucket, as
+ * bash's assoc_insert puts it. Unsetting an element changes nothing the
+ * next read can see; `unset` or `local` leaves an ordinary variable. */
+static void sh_dynarr_rebuild(struct sh_array *a) {
+    const struct sh_htab *t = a->dyn == SH_DYN_ALIASES ? &g_alias_tab : &g_phash;
+    g_dynarr_busy = true;
+    for (int i = 0; i < a->n; i++) {
+        kfree(a->e[i].key);
+        kfree(a->e[i].val);
+    }
+    a->n = 0;
+    a->nbuckets = (int)(t->nb ? t->nb : t->nb0);
+    for (int i = 0; i < t->n; i++)
+        if (sh_assoc_put(a, t->e[i].key, (const char *)t->e[i].data) < 0)
+            break;
+    g_dynarr_busy = false;
+}
+
+/* An element assigned: an alias defined, or a command remembered with no
+ * hits -- a bad alias name is reported and the status is left alone. */
+static int sh_dynarr_assign(struct sh_array *a, const char *key,
+                            const char *val) {
+    if (a->dyn == SH_DYN_ALIASES) {
+        if (!shell_alias_name_ok(key)) {
+            kprintf("`%s': invalid alias name\n", key);
+            return 0;
+        }
+        if (shell_alias_set(key, val) < 0) return -1;
+    } else {
+        phash_insert(key, val, 0, false);
+    }
+    sh_dynarr_rebuild(a);
+    return 0;
 }
 
 /* The path NAME was remembered under, its hit counted -- or 0. bash's
