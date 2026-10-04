@@ -68,6 +68,7 @@ int toby_arp_request(unsigned int ip_be);
 int     setpgid(pid_t pid, pid_t pgid);
 pid_t   getpgid(pid_t pid);
 pid_t   getpgrp(void);
+pid_t   setsid(void);
 /* tty/pty control. Declared here rather than a separate <sys/ioctl.h>;
  * the request constants live with the caller. */
 int     ioctl(int fd, unsigned long req, void *argp);

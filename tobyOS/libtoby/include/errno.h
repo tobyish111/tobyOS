@@ -57,6 +57,11 @@ extern int errno;
  * follow. */
 #define ENOEXEC          8
 #define ELOOP           40
+/* 2026-10-04: /dev/tty without a controlling terminal is ENXIO, and the
+ * terminal ioctls on a non-terminal ENOTTY; ESPIPE is lseek on a pipe. */
+#define ENXIO            6
+#define ENOTTY          25
+#define ESPIPE          29
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

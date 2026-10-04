@@ -403,6 +403,14 @@ pid_t getpgid(pid_t pid) {
 }
 pid_t getpgrp(void) { return getpgid(0); }
 
+/* setsid(2): a new session and group led by the caller, with no
+ * controlling terminal; EPERM for a process-group leader (fork first). */
+pid_t setsid(void) {
+    long r = toby_sc0(ABI_SYS_SETSID);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return (pid_t)r;
+}
+
 int ioctl(int fd, unsigned long req, void *argp) {
     long r = toby_sc3(ABI_SYS_IOCTL, fd, (long)req, (long)argp);
     if (r < 0) { errno = (int)-r; return -1; }

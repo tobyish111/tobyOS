@@ -145,10 +145,21 @@ char *strndup(const char *s, size_t n) {
 
 const char *strerror(int err) {
     switch (err) {
+    /* musl's words: the C library every Linux program on the system speaks
+     * (bash, busybox), so a native tool says what they say. Unlisted ones
+     * printed "Unknown error" -- rm of a full directory among them. */
     case 0:  return "Success";
     case 1:  return "Operation not permitted";
     case 2:  return "No such file or directory";
+    case 3:  return "No such process";
+    case 4:  return "Interrupted system call";
     case 5:  return "I/O error";
+    case 6:  return "No such device or address";
+    case 11: return "Resource temporarily unavailable";
+    case 18: return "Cross-device link";
+    case 25: return "Not a tty";
+    case 29: return "Invalid seek";
+    case 39: return "Directory not empty";
     case 7:  return "Argument list too long";
     case 8:  return "Exec format error";
     case 9:  return "Bad file descriptor";
