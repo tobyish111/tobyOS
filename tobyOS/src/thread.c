@@ -121,6 +121,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     t->session_id = tg_leader->session_id;
     t->uid        = tg_leader->uid;
     t->gid        = tg_leader->gid;
+    t->umask      = tg_leader->umask;     /* a thread creates files as its process */
     t->caps       = tg_leader->caps;
     memcpy(t->sandbox_root, tg_leader->sandbox_root, PROC_SANDBOX_MAX);
 

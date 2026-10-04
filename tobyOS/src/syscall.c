@@ -2599,9 +2599,23 @@ static long sys_open(const char *path, int flags, int mode) {
 static bool lx_dir_open_refused(long flags);
 static long linux_open_dir(const char *kpath);
 
-static long sys_open_resolved(const char *kpath, int flags, int mode) {
-    (void)mode;     /* M25A: permissions on creation not honoured yet */
+/* THE MODE A PROCESS'S NEW FILE OR DIRECTORY GETS: the mode it asked for
+ * less its umask (POSIX open, creat, mknod, mkdir). Every file used to be
+ * 0644 whatever was asked -- `umask 000; > f` was 0644 where Linux gives
+ * 0666, `umask 077; > f` 0644 for 0600 (logs/b14 r2). A NATIVE caller's
+ * mode 0 means "unspecified" (the GUI programs and the in-kernel
+ * personalities pass it) and takes DEFLT, 0666 for a file and 0777 for a
+ * directory -- 0644 and 0755 under the usual umask, the old defaults; a
+ * Linux program's 0 is a real 0000. */
+static uint32_t sys_creation_mode(int mode, uint32_t deflt) {
+    struct proc *p = current_proc();
+    uint32_t m = (uint32_t)mode & 07777u;
+    if (m == 0 && !(p && p->personality == ABI_PERS_LINUX)) m = deflt;
+    if (p) m &= ~(p->umask & 0777u);
+    return m;
+}
 
+static long sys_open_resolved(const char *kpath, int flags, int mode) {
     if (flags & SYS_O_DIRECTORY) {
         struct vfs_stat ds;
         if (vfs_stat(kpath, &ds) == VFS_OK && ds.type == VFS_TYPE_DIR) {
@@ -2972,12 +2986,13 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
     bool want_append = (flags & ABI_O_APPEND)!= 0;
 
     /* Optionally create. Returns EEXIST if O_EXCL set and present. */
+    bool created = false;
     if (want_create) {
         struct vfs_stat st;
         int sr = vfs_stat(kpath, &st);
         if (sr == VFS_OK && want_excl) return -ABI_EEXIST;
         if (sr == VFS_ERR_NOENT) {
-            int cr = vfs_create(kpath);
+            int cr = vfs_create_mode(kpath, sys_creation_mode(mode, 0666u));
             /* Slice 61c: map the REAL failure. The old blanket EACCES made
              * a FULL /data volume report "Permission denied" -- chrome's
              * shared-memory allocator logged 64k of those while the actual
@@ -2994,7 +3009,22 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
              * -- bash, /bin/tsh, every libc caller. vfs_err_to_abi is the
              * one converter for this, and it keeps PERM as EACCES. */
             if (cr != VFS_OK)               return vfs_err_to_abi(cr);
+            created = true;
         }
+    }
+
+    /* The permission this open needs: none for the file it has just made
+     * (Linux never refuses that open, whatever mode it gave the file), else
+     * what the access mode asks -- checked BEFORE O_TRUNC, which used to
+     * empty a file its caller could not write and only then fail the open. */
+    int want = 0;
+    if (!created) {
+        if (access == ABI_O_RDONLY) want = VFS_WANT_READ;
+        else if (access == ABI_O_WRONLY) want = VFS_WANT_WRITE;
+        else want = VFS_WANT_READ | VFS_WANT_WRITE;
+        if (want_trunc && access == ABI_O_RDONLY) want |= VFS_WANT_WRITE;
+        int pc = vfs_perm_check(kpath, want);
+        if (pc != VFS_OK && pc != VFS_ERR_NOENT) return vfs_err_to_abi(pc);
     }
 
     if (want_trunc) {
@@ -3022,8 +3052,11 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
         if (vfs_stat(kpath, &st) == VFS_OK) {
             int tr = vfs_truncate(kpath, 0);
             if (tr != VFS_OK) {
+                /* the file keeps its mode through the recreate */
+                uint32_t keep = (st.mode & VFS_MODE_VALID) ? (st.mode & 07777u)
+                                                           : 0644u;
                 vfs_unlink(kpath);
-                (void)vfs_create(kpath);
+                (void)vfs_create_mode(kpath, keep);
             }
         }
     }
@@ -3046,7 +3079,7 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
         f->vfs_refs = &ofd->refs;   /* refs is first; see struct vfs_ofd */
     }
 
-    int rc = vfs_open(kpath, &f->vfs);
+    int rc = vfs_open_access(kpath, &f->vfs, want);
     if (rc != VFS_OK) {
         kfree(f->vfs_refs);
         kfree(f);
@@ -3159,8 +3192,10 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
      * reported it as an ordinary 0755 file -- the one place you would look
      * to find out. */
     dst->mode = typ | (src->mode & ABI_S_IFMT ? src->mode : (src->mode & 07777));
-    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755. */
-    if ((src->mode & 0777) == 0) {
+    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755.
+     * VFS_MODE_VALID says it does: a VALID 0000 (umask 777, chmod 000) is
+     * enforced as 0000 and must be REPORTED as 0000, not 0644. */
+    if (!(src->mode & VFS_MODE_VALID) && (src->mode & 0777) == 0) {
         dst->mode |= (src->type == VFS_TYPE_DIR) ? 0755 : 0644;
     }
     /* Slice 11: the native stat path reports through the caller's user
@@ -3491,21 +3526,11 @@ static long sys_mkdir(const char *path, int mode) {
      * directory and then verifies it (chrome's ProcessSingleton CHECKs for
      * exactly 0700) must not be told 0755. Mode 0 means "unspecified" from
      * in-kernel callers, which keep the old default. */
-    uint32_t m = (uint32_t)mode & 07777u;
     /* Linux slice 1: apply the process umask. POSIX clears the umask bits
-     * from the requested mode. Only a CALLER-SUPPLIED mode is masked -- mode
-     * 0 still means "unspecified" from in-kernel callers and keeps the old
-     * default, so boot-time mkdirs are unaffected by whatever umask pid 0
-     * happens to carry.
-     *
-     * Note this is the only creation path that carries a mode at all:
-     * vfs_create() (the open(O_CREAT) path) takes no mode argument, so files
-     * are not umask-filtered yet. Closing that needs a vfs_create_mode()
-     * across every filesystem -- deliberately not in this slice. */
-    if (m) {
-        struct proc *mp = current_proc();
-        if (mp) m &= ~(mp->umask & 07777u);
-    }
+     * from the requested mode. A native caller's mode 0 is "unspecified"
+     * and means 0777 less the umask -- 0755 under pid 0's 0022, the old
+     * default; a Linux program's 0 is a real 0000 (sys_creation_mode). */
+    uint32_t m = sys_creation_mode(mode, 0777u);
     /* Linux slice 1: an ALREADY-EXISTING path is EEXIST, even on a read-only
      * mount. The VFS checks writability before existence, so mkdir("/") --
      * which is on the read-only ramfs -- used to report EROFS. That broke
@@ -3521,7 +3546,7 @@ static long sys_mkdir(const char *path, int mode) {
         struct vfs_stat exvs;
         if (vfs_stat(kpath, &exvs) == VFS_OK) return -ABI_EEXIST;
     }
-    int rc = m ? vfs_mkdir_mode(kpath, m) : vfs_mkdir(kpath);
+    int rc = vfs_mkdir_mode(kpath, m);
 #ifdef CHROMIUM_BOOT
     { static int mk = 0; if (mk < 24) { mk++;
         struct vfs_stat vs; int sr = vfs_stat(kpath, &vs);
@@ -6689,7 +6714,8 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     memset(&st, 0, sizeof st);
     uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u; /* S_IFDIR/REG */
     uint32_t perm = vs->mode & 0xFFFu;
-    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
+        perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
     st.st_mode    = typ | perm;
     st.st_dev     = 1;
     st.st_ino     = ino ? ino : 1;
@@ -6731,7 +6757,8 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     memset(&sx, 0, sizeof sx);
     uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u;
     uint32_t perm = vs->mode & 0xFFFu;
-    if (perm == 0) perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+    if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
+        perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
     sx.mask      = 0x000007ffu;              /* STATX_BASIC_STATS */
     sx.blksize   = 512;
     sx.nlink     = vs->nlink ? vs->nlink
@@ -11116,8 +11143,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
         return (rc == VFS_ERR_PERM) ? -ABI_EACCES : 0;
     }
-    case LX_fchmod:
-        return fd_lookup((int)a1) ? 0 : -ABI_EBADF;
+    case LX_fchmod: {
+        /* fchmod(fd, mode) changes the file the descriptor was opened on --
+         * found by its stamped path (dirpath for a directory handle), with
+         * fchdir's limit: the NAME, not the inode. It was a no-op that said
+         * 0, so a program that opens and then fchmods (install -m, cp -p,
+         * git's objects) kept whatever mode its open gave. A descriptor with
+         * no path (a pipe, a socket) keeps saying 0, as Linux does for one. */
+        struct file *ff = fd_lookup((int)a1);
+        if (!ff) return -ABI_EBADF;
+        const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                       ? ff->dirpath : ff->open_path;
+        if (!kp || !kp[0]) return 0;
+        int rc = vfs_chmod(kp, (uint32_t)a2 & 07777u);
+        if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
+        return (rc == VFS_ERR_PERM) ? -ABI_EPERM : vfs_err_to_abi(rc);
+    }
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
 
     /* ==================================================================
@@ -11309,9 +11350,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * "regular") really creates the file; FIFOs and device nodes have no
      * VFS representation, so those return EPERM -- the same errno an
      * unprivileged caller gets for device nodes on Linux, and the one
-     * tar/rsync already know to downgrade to a warning. mode&~umask is
-     * not applied to the created file (vfs_create fixes 0644); chmod
-     * after create is the documented workaround. */
+     * tar/rsync already know to downgrade to a warning. The file's mode is
+     * the one asked for less the umask, as open's is. */
     case LX_mknod: case LX_mknodat: {
         bool at = (n == LX_mknodat);
         const char *upath = (const char *)(at ? a2 : a1);
@@ -11324,7 +11364,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (fmt != 0 && fmt != 0100000u) return -ABI_EPERM;
         struct vfs_stat ms;
         if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
-        int cr = vfs_create(kpath);
+        int cr = vfs_create_mode(kpath, sys_creation_mode((int)(mode & 07777u), 0666u));
         if (cr != VFS_OK) return vfs_err_to_abi(cr);
         return 0;
     }

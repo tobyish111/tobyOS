@@ -436,10 +436,16 @@ void vfs_iter_mounts(vfs_mount_walk_cb cb, void *cookie);
 /* ---- per-call wrappers ---- */
 
 int  vfs_open    (const char *path, struct vfs_file *out);
+/* WANT: VFS_WANT_READ / VFS_WANT_WRITE bits the access mode needs, 0 for
+ * none (the open that just created the file). vfs_open = WANT_READ. */
+int  vfs_open_access(const char *path, struct vfs_file *out, int want);
 int  vfs_close   (struct vfs_file *f);
 long vfs_read    (struct vfs_file *f, void *buf, size_t n);
 long vfs_write   (struct vfs_file *f, const void *buf, size_t n);
-int  vfs_create  (const char *path);
+int  vfs_create  (const char *path);          /* mode 0644 */
+/* MODE is the new file's permission bits, used as given: the caller has
+ * taken the umask off (the syscall layer, for a process's open). */
+int  vfs_create_mode(const char *path, uint32_t mode);
 int  vfs_unlink  (const char *path);
 /* Phase G: hard link newpath -> oldpath's inode. Both paths must resolve
  * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the

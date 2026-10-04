@@ -775,6 +775,16 @@ void pathfail_trace(const char *what, const char *path, int rc) {
 #endif
 
 int vfs_open(const char *path, struct vfs_file *out) {
+    return vfs_open_access(path, out, VFS_WANT_READ);
+}
+
+/* vfs_open with the permission the caller's access mode asks for (POSIX
+ * open: O_RDONLY needs r, O_WRONLY w, O_RDWR both), or WANT 0 for none --
+ * the open(2) that has just created the file, which Linux never refuses
+ * whatever mode it gave the file (open("f", O_CREAT|O_WRONLY, 0444) writes
+ * a read-only file). vfs_open itself keeps the read check every in-kernel
+ * caller was written against. */
+int vfs_open_access(const char *path, struct vfs_file *out, int want) {
     /* Milestone 19: wrap the whole open path in a perf zone. The
      * PERM/sandbox check below short-circuits before the driver call
      * but that still shows up as a sample -- useful for spotting
@@ -812,10 +822,14 @@ int vfs_open(const char *path, struct vfs_file *out) {
         perf_zone_end(PERF_Z_VFS_OPEN, t_v);
         return VFS_ERR_PERM;
     }
-    /* Require read permission to open. We don't take an O_WRONLY-style
-     * flag in this VFS, so "open" is always at least a read intent. */
-    int prc = vfs_perm_check(path, VFS_WANT_READ);
-    if (prc != VFS_OK) return prc;
+    /* The permission the open asks for. It was READ whatever the access
+     * mode, so a non-root `echo x > f` onto a 0444 file it could read went
+     * through (writes through a descriptor are not checked again) and a
+     * write-only open of a 0200 file was refused. */
+    if (want) {
+        int prc = vfs_perm_check(path, want);
+        if (prc != VFS_OK) { perf_zone_end(PERF_Z_VFS_OPEN, t_v); return prc; }
+    }
     /* Cache owner + mode on the handle so vfs_write can enforce W
      * without re-stat'ing every call. The driver may overwrite these
      * with the authoritative inode values inside its open hook (it
@@ -1075,7 +1089,16 @@ void vfs_notify_modify(const char *path) {
     vfs_notify(path, VFS_IN_MODIFY, 0);
 }
 
+/* A new file gets MODE (its permission bits; the caller has already taken
+ * the umask off -- the syscall layer does, for a process's open(2), since
+ * an in-kernel writer may run in any process's context and must not inherit
+ * that process's umask). vfs_create is the historical owner-rw world-r
+ * default that every in-kernel writer relies on. */
 int vfs_create(const char *path) {
+    return vfs_create_mode(path, 00644u);
+}
+
+int vfs_create_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
@@ -1101,12 +1124,14 @@ int vfs_create(const char *path) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
-    /* Default new-file mode: owner-rw + world-r. Owner = current uid.
-     * Root spawning during boot leaves uid 0 / gid 0, which is what we
-     * want for kernel-installed system files (settings.conf, users). */
+    /* Owner = current uid. Root spawning during boot leaves uid 0 / gid 0,
+     * which is what we want for kernel-installed system files (settings.conf,
+     * users). VFS_MODE_VALID always: a mode of 0000 is a real mode, not "no
+     * permission information" -- the drivers' `mode ? mode : default` idiom
+     * sees it non-zero and stores it. */
     int crc = m->ops->create(m->data, rel,
                              (uint32_t)current_uid(), (uint32_t)current_gid(),
-                             00644u | VFS_MODE_VALID);
+                             (mode & 07777u) | VFS_MODE_VALID);
     if (crc == VFS_OK) vfs_notify(path, VFS_IN_CREATE, 0);
     return crc;
 }

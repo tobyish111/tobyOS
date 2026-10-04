@@ -279,6 +279,12 @@ void proc_init(void) {
     struct proc *k = &g_proc[0];
     k->pid         = 0;
     k->ppid        = 0;            /* kernel has no parent */
+    /* The umask every process spawned from pid 0 starts with -- login, SSH
+     * sessions, the desktop's programs. It was 0 (the memset), and the
+     * spawn path copies the spawner's: every user process began with umask
+     * 0000, where a Linux session begins with 0022 (bash there says 0022,
+     * here it said 0000). */
+    k->umask       = 0022u;
     k->state       = PROC_RUNNING;
     k->cr3         = vmm_kernel_pml4_phys();
     k->owns_pml4   = false;
@@ -852,7 +858,8 @@ static int spawn_body(const char *path, const char *name,
         p->uid        = parent ? parent->uid        : 0;
         p->gid        = parent ? parent->gid        : 0;
         /* Linux slice 1: umask is inherited, like uid/gid. 0022 for a
-         * parentless (kernel-spawned) proc -- the conventional default. */
+         * parentless (kernel-spawned) proc -- the conventional default --
+         * and pid 0 carries 0022 itself (proc_init). */
         p->umask      = parent ? parent->umask      : 0022u;
         /* Linux slice 2: the rest of the credential set is inherited too.
          * A plain spawn is not a privilege transition, so real/effective/saved
@@ -1389,6 +1396,9 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
     p->is_kernel  = true;
     p->user_entry = (uint64_t)entry;      /* kernel fn, CALLed on entry */
     p->cwd[0] = '/'; p->cwd[1] = '\0';
+    /* pid 0's umask: a worker spawns too -- sshd's starts every SSH
+     * session, and with the wiped 0 every session began at umask 0000 */
+    p->umask = 0022u;
     name_copy(p->name, name ? name : "kworker", PROC_NAME_MAX);
     /* Kernel context: same ADMIN blanket as pid 0 / ap_idle so any
      * kernel-invoked VFS/net path sails through cap_check. */
@@ -1413,6 +1423,12 @@ int proc_spawn(const struct proc_spec *spec) {
     /* Milestone 19: span the whole spawn pipeline so `perf` can show
      * elf_load (inner zone) vs the spawn bookkeeping around it. */
     uint64_t t_spawn = perf_rdtsc();
+    /* spec->umask: the child inherits it as it would the spawner's own --
+     * set on the spawner for the length of the build (spawn_body copies
+     * it), so the child never runs a moment with the wrong one. */
+    struct proc *spawner = current_proc();
+    uint32_t spawner_umask = spawner ? spawner->umask : 0;
+    if (spec->set_umask && spawner) spawner->umask = spec->umask & 0777u;
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
                              spec->fd3, spec->fd4,
@@ -1420,6 +1436,7 @@ int proc_spawn(const struct proc_spec *spec) {
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);
+    if (spec->set_umask && spawner) spawner->umask = spawner_umask;
     perf_zone_end(PERF_Z_PROC_SPAWN, t_spawn);
     if (pid < 0) return pid;
 

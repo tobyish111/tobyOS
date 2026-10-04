@@ -896,6 +896,11 @@ struct proc_spec {
      * directory. NULL or "" = inherit from parent (default). Otherwise
      * an absolute path that becomes the child's `cwd`. */
     const char  *cwd;
+    /* The child's umask when set_umask, the spawner's otherwise. The kernel
+     * shell keeps its `umask` to itself (pid 0 serves every console, TCP and
+     * network task at once) and hands it to the programs it starts here. */
+    bool         set_umask;
+    uint32_t     umask;
 };
 int proc_spawn(const struct proc_spec *spec);
 
