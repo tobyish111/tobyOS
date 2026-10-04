@@ -3853,8 +3853,22 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
     if (kreq.flags != 0) return -ABI_EINVAL;
 
+    /* A RELATIVE PATH IS THE CALLER'S CWD's, as execve's is (sys_execve
+     * resolves; this did not):
+     *
+     *     cd /bin && ./true          bash: 0
+     *     /bin/tsh: ./true: cannot execute binary file, 126
+     *
+     * The string went to vfs_read_all as written, which takes only a whole
+     * path -- "[proc] cannot read './true': no filesystem mounted at that
+     * path" -- so no program and no #! script was ever run by a relative
+     * path from /bin/tsh, which spawns (logs/b13 q16 q17; the batch 12 gate
+     * logs have './zcmd'). */
     char kpath[ABI_PATH_MAX];
-    if (!user_str_in(kpath, sizeof(kpath), kreq.path)) return -ABI_EFAULT;
+    {
+        int rr = resolve_user_path(kreq.path, kpath, sizeof kpath);
+        if (rr) return rr;
+    }
 
     char **kargv = 0; int kargc = 0;
     char **kenvp = 0; int kenvc = 0;
