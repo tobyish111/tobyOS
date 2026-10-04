@@ -3108,6 +3108,24 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
 static long sys_lseek(int fd, int64_t off, int whence) {
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
+    /* WHAT CANNOT SEEK SAYS ESPIPE, as Linux's no_llseek does -- a pipe, a
+     * socket, a terminal -- and the character devices that ignore a seek
+     * answer 0 (noop_llseek). Every non-file was EINVAL, and bash tells a
+     * pipe by ESPIPE alone (read.def: input_is_pipe): it then read a piped
+     * script's input ahead in a buffer, could not seek back, and lost the
+     * rest -- `printf 'read v\nx\necho $v\n' | bash` printed nothing
+     * (logs/b13 q58, fx272). */
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R: case FILE_KIND_PIPE_W: case FILE_KIND_SOCKET:
+    case FILE_KIND_CONSOLE: case FILE_KIND_TERM: case FILE_KIND_PTY_MASTER:
+    case FILE_KIND_PTY_SLAVE: case FILE_KIND_EPOLL:
+        return -ABI_ESPIPE;
+    case FILE_KIND_DEVNULL: case FILE_KIND_DEVZERO: case FILE_KIND_DEVRANDOM:
+    case FILE_KIND_EVENTFD:
+        return 0;
+    default:
+        break;
+    }
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
     int64_t cur  = (int64_t)file_pos_get(f);
     int64_t size = (int64_t)f->vfs.size;
