@@ -10830,6 +10830,8 @@ static void cmd_modules(int argc, char **argv) {
  * implicit-ELF dispatch path below, and the program-name resolver
  * (whose definition lives down in the pipeline section). */
 static bool g_spawn_put_command_name;      /* see its definition */
+static bool g_spawn_launch_failed;         /* see cmd_exec */
+static bool g_spawn_clean_env;
 static void        shell_spawn_program(const char *path, int argc, char **argv,
                                        bool background);
 static void        shell_spawn_program_profile(const char *path, int argc,
@@ -17623,41 +17625,97 @@ eval_done:
  * cannot find "exec: NAME: not found" (S10). */
 static const char *g_spawn_for;
 
+/* Set around `exec`'s one spawn: -c hands it an EMPTY environment
+ * (shell_build_env_overlay), and the spawn says whether it launched. */
+static bool g_spawn_clean_env;
+static bool g_spawn_launch_failed;
 /* `( )` subshells running now: `exec` leaves SHLVL alone in one (bash's
  * SUBSHELL_PAREN test). */
 static int g_paren_depth;
 
+/* exec [-cl] [-a name] [command [argument ...]] -- bash's exec_builtin.
+ *
+ * THE COMMAND REPLACES THE SHELL. tsh spawned it, waited, and ended the
+ * shell only if it SUCCEEDED, so whatever followed a failing `exec` ran:
+ *
+ *     sh -c 'exec false; echo after'      bash: nothing, 1   tsh: after, 0
+ *     sh -c 'exec nosuch; echo after'     bash: not found, 127
+ *                                         tsh: not found, after, 0
+ *
+ * and -c (an empty environment) and -l (a `-` before argv[0]) were taken
+ * for command names (logs/b13 q22). Now: SHLVL goes down by one (bash's
+ * adjust_shell_level -- not for -c, not in a `( )`), and /bin/tsh execs in
+ * place (proc_exec_in_place); where it may not replace itself -- the kernel
+ * shell, a subshell running in place -- the command runs as a child and the
+ * shell then ends as if it had been replaced. A command that cannot be run
+ * is an error that ends a non-interactive shell unless `shopt -s
+ * execfail`, and puts SHLVL back. */
 static void cmd_exec(int argc, char **argv) {
     shell_set_status(0);
-    /* `--` ends exec's options, as for every builtin: `exec -- ls` runs ls,
-     * where this looked for a program called `--`. */
-    int i = 1;
-    /* `exec -a NAME cmd` runs cmd with NAME as its argv[0] (bash; Oils
-     * 1053) -- tsh looked for a program called `-a`. */
+    struct sh_igo g;
+    sh_igo_init(&g, "exec", argc, argv);
+    bool clean = false, login = false;
     const char *as_name = 0;
-    if (i + 1 < argc && strcmp(argv[i], "-a") == 0) {
-        as_name = argv[i + 1];
-        i += 2;
+    int c;
+    while ((c = sh_igo_next(&g, "cla:")) != -1) {
+        if (c == 'c') { clean = true; continue; }
+        if (c == 'l') { login = true; continue; }
+        if (c == 'a') { as_name = g.optarg; continue; }
+        if (c == SH_IGO_HELP) shell_help_topic("exec");
+        else sh_builtin_usage("exec");
+        shell_set_status(2);
+        return;
     }
-    if (i < argc && strcmp(argv[i], "--") == 0) i++;
+    int i = g.ind;
     if (i >= argc) return;
+
+    /* argv[0]: -a's NAME, and -l puts a `-` in front of it */
+    SH_SB(a0);
+    if (login && sb_putc(&a0, '-') < 0) { shell_set_status(1); return; }
+    if (sb_puts(&a0, as_name ? as_name : argv[i]) < 0) { shell_set_status(1); return; }
+    char **av __attribute__((cleanup(shell_kfree_ptr))) =
+        (char **)kmalloc((size_t)(argc - i + 1) * sizeof(char *));
+    if (!av) { shell_set_status(1); return; }
+    for (int k = i; k < argc; k++) av[k - i] = argv[k];
+    av[argc - i] = 0;
+    av[0] = a0.p;
+
+    bool shlvl = !clean && g_paren_depth == 0;
+    if (shlvl) shell_adjust_shlvl(-1);
     g_spawn_for = "exec";
-    if (as_name) {
-        char **av = (char **)kmalloc((size_t)(argc - i + 1) * sizeof(char *));
-        if (!av) { g_spawn_for = 0; shell_set_status(1); return; }
-        for (int k = i; k < argc; k++) av[k - i] = argv[k];
-        av[argc - i] = 0;
-        av[0] = (char *)as_name;
-        shell_spawn_program(argv[i], argc - i, av, /*background=*/false);
-        kfree(av);
-    } else {
-        shell_spawn_program(argv[i], argc - i, &argv[i], /*background=*/false);
-    }
+    g_spawn_clean_env = clean;
+    g_spawn_launch_failed = false;
+    if (g_replace_ok) g_bg_exec_ok = true;
+    shell_spawn_program(argv[i], argc - i, av, /*background=*/false);
+    /* Still here: it could not replace this process. */
+    g_bg_exec_ok = false;
     g_spawn_for = 0;
-    if (g_last_status == 0 && g_script_depth > 0) {
-        g_shell_flow = SHELL_FLOW_EXIT;
-        g_shell_flow_status = 0;
+    g_spawn_clean_env = false;
+    int st = g_last_status;
+    if (g_spawn_launch_failed) {
+        if (shlvl) shell_adjust_shlvl(+1);
+        /* bash: a file that is there but cannot be run says so in exec's
+         * own words as well -- "exec: /tmp: cannot execute: Is a
+         * directory" -- after the error that named it */
+        if (st == 126) {
+            char pb[VFS_PATH_MAX];
+            int how = CMDRES_NONE;
+            const char *rp = resolve_program_ex(argv[i], pb, sizeof pb, &how);
+            struct vfs_stat est;
+            if (rp && vfs_stat(rp, &est) == VFS_OK)
+                kprintf("exec: %s: cannot execute: %s\n", rp,
+                        est.type == VFS_TYPE_DIR ? "Is a directory"
+                                                 : "Permission denied");
+        }
+        if (!g_interactive && !g_shopt_execfail) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = st;
+        }
+        return;
     }
+    /* it ran, as a child: the shell is over, as if it had been replaced */
+    g_shell_flow = SHELL_FLOW_EXIT;
+    g_shell_flow_status = st;
 }
 
 static bool shell_cur_cmd_redirected(void);
@@ -22664,6 +22722,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         if (pid < 0) {
             if (why != 0) status = shell_report_unrunnable(report_as, status);
             g_shell_fd[2] = spawn_diag_saved;
+            g_spawn_launch_failed = true;
             return status;
         }
     }
@@ -32190,6 +32249,14 @@ static char **sh_env_oom(void) {
 
 static char **shell_build_env_overlay(char **assignv, int assignc,
                                       int *out_envc) {
+    if (g_spawn_clean_env) {                    /* `exec -c` */
+        char **e = (char **)kmalloc(2 * sizeof(char *) + VFS_PATH_MAX + 3);
+        if (!e) return sh_env_oom();
+        e[0] = 0;
+        e[1] = (char *)(e + 2);
+        *out_envc = 0;
+        return e;
+    }
     /* THE LIVE BINDINGS THAT HIDE OTHERS, sorted by name. */
     int nb = 0, nbcap = g_localc;
     for (int i = 0; i < g_tempenvc; i++) nbcap += g_tempenv[i]->count;
