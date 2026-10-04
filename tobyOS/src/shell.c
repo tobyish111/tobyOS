@@ -37708,13 +37708,12 @@ static bool shell_try_for_command(const char *src) {
      * built from "$@" had it too. */
     char *list = 0;
     if (implicit_at) {
-        SH_SB(lb);
-        bool ok = true;
-        for (int i = 0; i < g_positional_count && ok; i++) {
-            if (i > 0 && sb_putc(&lb, ' ') < 0) ok = false;
-            else if (sb_puts(&lb, g_positional[i]) < 0) ok = false;
-        }
-        if (ok) list = sb_steal(&lb);
+        /* NOTHING TO PARSE: the parameters are iterated as they are (see
+         * implicit_at below). They were joined into a list here and that
+         * list was TOKENIZED -- parsed as shell text -- so a parameter was
+         * CODE: `set -- '$(touch f)'; for w; do :; done` created f, and one
+         * holding a lone `"` was "unmatched double quote" (logs/b13 q35). */
+        list = shell_strdup("");
     } else {
         list = shell_dup_segment(s, do_at);
     }
@@ -37806,6 +37805,10 @@ static bool shell_try_for_command(const char *src) {
          * Flattening them into a string and re-splitting (which is what
          * building `list` above does) turns `set -- "one two"` into two
          * iterations, losing exactly the quoting the caller preserved. */
+        /* ...and QUOTED, so a parameter's glob characters are literal: each
+         * value goes in as "$@" would put it, escaped. It went in raw and
+         * shell_add_one_arg globbed it -- `set -- 'a*x'; for w; do` ran
+         * once per matching file (logs/b13 q33). */
         for (int i = 0; i < g_positional_count; i++) {
             char *saved = 0;
             if (shell_pipeline_save_word(wl, g_positional[i], &saved) < 0 ||
