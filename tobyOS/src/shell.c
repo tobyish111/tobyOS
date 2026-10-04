@@ -20058,13 +20058,34 @@ static bool g_printf_bad_num;
 
 static bool printf_is_blank(char c) { return c == ' ' || c == '\t'; }
 
+/* bash's sh_invalidnum: an operand that starts 0 and a digit is an
+ * "invalid octal number", one that starts 0x an "invalid hex number", any
+ * other "invalid number" (logs/b13 q53). */
+static void printf_invalid_num(const char *s) {
+    const char *what = (s[0] == '0' && s[1] >= '0' && s[1] <= '9') ? "invalid octal number"
+                     : (s[0] == '0' && s[1] == 'x') ? "invalid hex number"
+                     : "invalid number";
+    kprintf("printf: %s: %s\n", s, what);
+}
+
 /* The unsigned view of the last operand printf_arg_int parsed. %u wants the
  * two's complement of the magnitude, which is why
  * `printf '%u' -18446744073709551615` is 1 rather than an error. */
 static unsigned long g_printf_last_u64;
 
-/* The last operand did not fit a SIGNED 64-bit conversion. Only %d and %i care;
- * %u happily prints values above 2^63. */
+/* The last operand did not fit a SIGNED 64-bit conversion (strtoimax's
+ * ERANGE), or not even an unsigned one (strtoumax's) -- bash says so, "printf:
+ * warning: N: Result not representable", for the conversion that reads it:
+ * %d and %i the first, %u %o %x %X the second. The value printed is the
+ * saturated one either way. tsh printed it and said nothing (logs/b13 q50).
+ * g_printf_last_arg is the operand as given. */
+static bool g_printf_erange_s, g_printf_erange_u;
+static const char *g_printf_last_arg;
+
+static void printf_erange_warn(bool which) {
+    if (which && g_printf_last_arg)
+        kprintf("printf: warning: %s: Result not representable\n", g_printf_last_arg);
+}
 
 /* The wall clock, for printf's %(fmt)T. In the kernel build this is the
  * RTC-anchored realtime clock every Linux-personality program reads; the
@@ -20079,9 +20100,12 @@ static int64_t shell_wall_secs(void) {
 
 static long printf_arg_int(int argc, char **argv, int *argi) {
     g_printf_last_u64 = 0;
+    g_printf_erange_s = g_printf_erange_u = false;
+    g_printf_last_arg = 0;
     if (*argi >= argc) return 0;
     const char *s = argv[(*argi)++];
     const char *as_given = s;
+    g_printf_last_arg = s;
 
     /* POSIX XCU: a leading ' or " means "the numeric value of the next
      * character". Extra characters after it are ignored, not an error. */
@@ -20125,9 +20149,12 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
          (s[2] >= 'A' && s[2] <= 'F'))) {
         base = 16ul;
         s += 2;
-    } else if (s[0] == '0' && s[1] >= '0' && s[1] <= '7') {
+    } else if (s[0] == '0') {
+        /* strtoimax's base 0: a leading 0 is octal whatever follows --
+         * `08` is 0 and then "invalid octal number", where tsh read 8 */
         base = 8ul;
         s += 1;
+        any = true;
     }
 
     for (;;) {
@@ -20147,9 +20174,18 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     /* NO trailing-blank skip. bash accepts ` -123` and rejects ` -123 `, and
      * skipping them here reported success for both. */
     /* ...and says so, as bash does: "printf: 3abc: invalid number". */
-    if (*s != '\0' || !any) {
+    bool invalid = *s != '\0' || !any;
+    if (invalid) {
         g_printf_bad_num = true;
-        kprintf("printf: %s: invalid number\n", as_given);
+        printf_invalid_num(as_given);
+    }
+
+    /* out of range -- told only for a number (bash looks at the end of the
+     * conversion first) */
+    if (!invalid) {
+        const unsigned long SMX = ~0ul >> 1;
+        g_printf_erange_u = over;
+        g_printf_erange_s = over || (!neg && mag > SMX) || (neg && mag > SMX + 1ul);
     }
 
     if (over) {
@@ -20178,211 +20214,38 @@ static long printf_arg_int(int argc, char **argv, int *argi) {
     return neg ? -(long)mag : (long)mag;
 }
 
-/* printf's %f/%e/%g without floating point.
- *
- * The kernel is built -mno-sse, so there is no `double` to convert to. There
- * does not need to be: printf's argument arrives as decimal TEXT, so the
- * significant digits can be carried straight through as digits and rounded in
- * base 10. That is both simpler than a soft-float path and exact for the
- * values a shell script actually prints.
- *
- * Representation: value = 0.d[0]d[1]... * 10^exp, sign held separately. */
-#define PF_DIG_MAX 40
+#include "shell_ldouble.inc"
 
-struct printf_dec {
-    bool neg;
-    bool zero;
-    char dig[PF_DIG_MAX];
-    int  ndig;
-    int  exp;
-};
-
-static void printf_dec_parse(const char *s, struct printf_dec *d) {
-    memset(d, 0, sizeof(*d));
-    d->zero = true;
-    if (!s) return;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { d->neg = true; s++; }
-    else if (*s == '+') s++;
-
-    int pointexp = 0;      /* digits seen before the '.' */
-    bool seen_point = false;
-    bool leading = true;
-    for (; *s; s++) {
-        if (*s == '.' && !seen_point) { seen_point = true; continue; }
-        if (*s < '0' || *s > '9') break;
-        if (!seen_point) pointexp++;
-        if (leading && *s == '0') {
-            /* A leading zero is not a significant digit: undo the increment
-             * above for one before the point, and push the exponent down for
-             * one after it. Both cases are the same decrement. */
-            pointexp--;
-            continue;
+/* bash's getfloatmax: the operand as strtold reads it -- a leading ' or "
+ * is the next character's code, as for the integer conversions; what is
+ * left over is "invalid number" (the value read so far is printed, and the
+ * status is 1); a value out of range is the warning "Result not
+ * representable". No operand at all is 0. */
+static long printf_arg_int(int argc, char **argv, int *argi);
+static void printf_arg_ld(int argc, char **argv, int *argi, struct sh_ld *v) {
+    v->cls = LD_ZERO;
+    v->neg = false;
+    if (*argi >= argc) return;
+    const char *s = argv[*argi];
+    if (*s == '\'' || *s == '"') {
+        long c = printf_arg_int(argc, argv, argi);
+        if (c != 0) {
+            v->cls = LD_FIN;
+            v->neg = c < 0;
+            v->m = c < 0 ? (uint64_t)(-c) : (uint64_t)c;
+            v->e = 0;
         }
-        leading = false;
-        d->zero = false;
-        if (d->ndig < PF_DIG_MAX) d->dig[d->ndig++] = *s;
-    }
-    d->exp = pointexp;
-
-    if (*s == 'e' || *s == 'E') {
-        s++;
-        bool eneg = false;
-        if (*s == '-') { eneg = true; s++; }
-        else if (*s == '+') s++;
-        int ev = 0;
-        while (*s >= '0' && *s <= '9' && ev < 100000) {
-            ev = ev * 10 + (*s - '0');
-            s++;
-        }
-        d->exp += eneg ? -ev : ev;
-    }
-    if (d->zero) { d->ndig = 0; d->exp = 0; }
-}
-
-/* Round to `keep` significant digits, half away from zero. `keep` may be <= 0,
- * meaning the value rounds down to nothing or up to a single 1 a decade
- * higher. */
-static void printf_dec_round(struct printf_dec *d, int keep) {
-    if (d->zero) return;
-    if (keep >= d->ndig) return;
-    if (keep < 0) {
-        d->zero = true;
-        d->ndig = 0;
-        d->exp = 0;
         return;
     }
-    bool round_up = d->dig[keep] >= '5';
-    d->ndig = keep;
-    if (!round_up) {
-        while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
-        if (d->ndig == 0) { d->zero = true; d->exp = 0; }
-        return;
+    (*argi)++;
+    bool erange = false;
+    const char *end = ld_scan(s, v, &erange);
+    if (*end) {
+        g_printf_bad_num = true;
+        printf_invalid_num(s);
+    } else if (erange) {
+        kprintf("printf: warning: %s: Result not representable\n", s);
     }
-    int i = keep - 1;
-    while (i >= 0) {
-        if (d->dig[i] != '9') { d->dig[i]++; break; }
-        d->dig[i] = '0';
-        i--;
-    }
-    if (i < 0) {
-        /* Carried out of the top: 999 -> 1000, one decade higher. */
-        d->dig[0] = '1';
-        d->ndig = 1;
-        d->exp++;
-        d->zero = false;
-        return;
-    }
-    while (d->ndig > 0 && d->dig[d->ndig - 1] == '0') d->ndig--;
-}
-
-static char printf_dec_at(const struct printf_dec *d, int i) {
-    if (i < 0 || i >= d->ndig) return '0';
-    return d->dig[i];
-}
-
-static void printf_buf_put(char *buf, size_t cap, size_t *n, char c) {
-    if (*n + 1 < cap) buf[(*n)++] = c;
-}
-
-/* Render `d` in %f style with `prec` fraction digits (already rounded). */
-static void printf_dec_fixed(const struct printf_dec *d, int prec,
-                             char *buf, size_t cap, size_t *n) {
-    if (d->exp <= 0) {
-        printf_buf_put(buf, cap, n, '0');
-    } else {
-        for (int i = 0; i < d->exp; i++)
-            printf_buf_put(buf, cap, n, printf_dec_at(d, i));
-    }
-    if (prec > 0) {
-        printf_buf_put(buf, cap, n, '.');
-        for (int j = 1; j <= prec; j++)
-            printf_buf_put(buf, cap, n, printf_dec_at(d, d->exp + j - 1));
-    }
-}
-
-/* Render `d` in %e style with `prec` fraction digits (already rounded). */
-static void printf_dec_sci(const struct printf_dec *d, int prec, char espec,
-                           char *buf, size_t cap, size_t *n) {
-    printf_buf_put(buf, cap, n, d->zero ? '0' : printf_dec_at(d, 0));
-    if (prec > 0) {
-        printf_buf_put(buf, cap, n, '.');
-        for (int j = 1; j <= prec; j++)
-            printf_buf_put(buf, cap, n, printf_dec_at(d, j));
-    }
-    printf_buf_put(buf, cap, n, espec);
-    int e = d->zero ? 0 : d->exp - 1;
-    printf_buf_put(buf, cap, n, e < 0 ? '-' : '+');
-    if (e < 0) e = -e;
-    if (e >= 100) {
-        printf_buf_put(buf, cap, n, (char)('0' + e / 100));
-        printf_buf_put(buf, cap, n, (char)('0' + (e / 100) % 10));
-    }
-    printf_buf_put(buf, cap, n, (char)('0' + (e / 10) % 10));
-    printf_buf_put(buf, cap, n, (char)('0' + e % 10));
-}
-
-static void printf_strip_trailing_zeros(char *buf, size_t *n) {
-    size_t dot = 0;
-    bool has_dot = false;
-    for (size_t i = 0; i < *n; i++) {
-        if (buf[i] == '.') { dot = i; has_dot = true; }
-        if (buf[i] == 'e' || buf[i] == 'E') return;   /* handled by caller */
-    }
-    if (!has_dot) return;
-    while (*n > dot + 1 && buf[*n - 1] == '0') (*n)--;
-    if (*n == dot + 1) (*n)--;
-}
-
-/* Format one floating conversion into `buf`; returns its length. */
-static size_t printf_format_float(const char *arg, char spec, int prec,
-                                  bool alt, char *buf, size_t cap) {
-    struct printf_dec d;
-    printf_dec_parse(arg, &d);
-    size_t n = 0;
-
-    if (spec == 'f' || spec == 'F') {
-        if (prec < 0) prec = 6;
-        printf_dec_round(&d, d.exp + prec);
-        printf_dec_fixed(&d, prec, buf, cap, &n);
-        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
-    } else if (spec == 'e' || spec == 'E') {
-        if (prec < 0) prec = 6;
-        printf_dec_round(&d, prec + 1);
-        printf_dec_sci(&d, prec, spec == 'E' ? 'E' : 'e', buf, cap, &n);
-        if (prec == 0 && alt) printf_buf_put(buf, cap, &n, '.');
-    } else {                                            /* g / G */
-        int P = (prec < 0) ? 6 : (prec == 0 ? 1 : prec);
-        printf_dec_round(&d, P);
-        int X = d.zero ? 0 : d.exp - 1;
-        if (X < -4 || X >= P) {
-            printf_dec_sci(&d, P - 1, spec == 'G' ? 'E' : 'e', buf, cap, &n);
-            if (!alt) {
-                /* Strip trailing zeros in the mantissa only. */
-                size_t epos = n;
-                for (size_t i = 0; i < n; i++)
-                    if (buf[i] == 'e' || buf[i] == 'E') { epos = i; break; }
-                size_t mant = epos;
-                bool has_dot = false;
-                size_t dot = 0;
-                for (size_t i = 0; i < mant; i++)
-                    if (buf[i] == '.') { dot = i; has_dot = true; }
-                if (has_dot) {
-                    size_t end = mant;
-                    while (end > dot + 1 && buf[end - 1] == '0') end--;
-                    if (end == dot + 1) end--;
-                    size_t tail = n - epos;
-                    for (size_t i = 0; i < tail; i++) buf[end + i] = buf[epos + i];
-                    n = end + tail;
-                }
-            }
-        } else {
-            printf_dec_fixed(&d, P - 1 - X, buf, cap, &n);
-            if (!alt) printf_strip_trailing_zeros(buf, &n);
-        }
-    }
-    buf[n < cap ? n : cap - 1] = '\0';
-    return n;
 }
 
 static const char *printf_arg_str(int argc, char **argv, int *argi) {
@@ -20750,6 +20613,7 @@ static void cmd_printf(int argc, char **argv) {
                  * the UNSIGNED view -- the signed return has been saturated
                  * for %d's benefit and would print the wrong thing here. */
                 (void)printf_arg_int(argc, argv, &argi);
+                printf_erange_warn(g_printf_erange_u);
                 unsigned long uv = g_printf_last_u64;
                 char buf[32];
                 int blen = 0;
@@ -20765,6 +20629,7 @@ static void cmd_printf(int argc, char **argv) {
                 if (left) for (int k = 0; k < pad; k++) shell_putc(' ');
             } else if (spec == 'd' || spec == 'i') {
                 long v = printf_arg_int(argc, argv, &argi);
+                printf_erange_warn(g_printf_erange_s);
                 char buf[32];
                 int blen = 0;
                 bool neg = (spec != 'u') && v < 0;
@@ -20791,25 +20656,15 @@ static void cmd_printf(int argc, char **argv) {
                 while (blen > 0) shell_putc(buf[--blen]);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'f' || spec == 'F' || spec == 'e' ||
-                       spec == 'E' || spec == 'g' || spec == 'G') {
-                const char *s = printf_arg_str(argc, argv, &argi);
-                char buf[PF_DIG_MAX * 2 + 32];
-                size_t blen = printf_format_float(s, spec, prec, alt,
-                                                  buf, sizeof(buf));
-                bool neg = false;
-                for (const char *q = s; *q; q++) {
-                    if (*q == ' ' || *q == '\t') continue;
-                    neg = (*q == '-');
-                    break;
-                }
-                char sign = neg ? '-' : (plus ? '+' : (space ? ' ' : '\0'));
-                int numlen = (int)blen + (sign ? 1 : 0);
-                int pad = width > numlen ? width - numlen : 0;
-                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
-                if (sign) shell_putc(sign);
-                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
-                for (size_t i = 0; i < blen; i++) shell_putc(buf[i]);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                       spec == 'E' || spec == 'g' || spec == 'G' ||
+                       spec == 'a' || spec == 'A') {
+                /* bash's long double (shell_ldouble.inc) */
+                struct sh_ld fv;
+                printf_arg_ld(argc, argv, &argi, &fv);
+                SH_SB(fb);
+                ld_format(&fb, &fv, spec, prec, alt, plus, space, left, zero_pad,
+                          width);
+                for (size_t i = 0; i < fb.len; i++) shell_putc(fb.p[i]);
             } else if (spec == 'b') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 const char *bp = s;
@@ -20852,8 +20707,12 @@ static void cmd_printf(int argc, char **argv) {
                 else shell_putc_raw(0);
                 if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
             } else if (spec == 'o' || spec == 'x' || spec == 'X') {
-                long v = printf_arg_int(argc, argv, &argi);
-                unsigned long uv = (unsigned long)v;
+                /* bash reads these with strtoumax: 18446744073709551615 is
+                 * ffffffffffffffff, where the signed view had saturated it
+                 * to 7fffffffffffffff */
+                (void)printf_arg_int(argc, argv, &argi);
+                printf_erange_warn(g_printf_erange_u);
+                unsigned long uv = g_printf_last_u64;
                 const char *hex = (spec == 'X') ? "0123456789ABCDEF"
                                                 : "0123456789abcdef";
                 int base = (spec == 'o') ? 8 : 16;
@@ -20866,7 +20725,7 @@ static void cmd_printf(int argc, char **argv) {
                 }
                 char pre[3];
                 int prelen = 0;
-                if (alt && v != 0) {
+                if (alt && g_printf_last_u64 != 0) {
                     if (spec == 'o') {
                         pre[prelen++] = '0';
                     } else {
