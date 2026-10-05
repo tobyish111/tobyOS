@@ -1197,6 +1197,9 @@ extern void shell_startup_files_hosted(int login, bool interactive, bool norc,
                                        bool act_like_sh);
 extern void shell_logout_hosted(void);
 extern void shell_make_restricted_hosted(void);
+extern void shell_async_child_hosted(const char *snap, const char *state,
+                                     const char *text)
+    __attribute__((noreturn));
 
 /* Absorb tty job-control signals that reach the shell itself. A handler,
  * not SIG_IGN -- see the interactive setup below for why. */
@@ -1292,6 +1295,22 @@ int main(int argc, char **argv) {
      * error, then "1|0|2|", and a builtin printing lines then failing has
      * them out first (logs/b13 q53). libtoby buffered a file fully. */
     (void)setvbuf(stdout, 0, _IOLBF, BUFSIZ);
+    /* THE KERNEL SHELL'S ASYNCHRONOUS CHILD (finding 63): the kernel shell
+     * cannot fork, so it backgrounds a function, a builtin or a compound
+     * by starting `tsh -c TEXT [NAME ARGS...]` with its state in these two
+     * (see shell_async_child_hosted). They leave the environment before
+     * the shell imports it, so neither is ever a variable. */
+    char *async_snap = 0, *async_state = 0;
+    {
+        const char *s = getenv("TOBYOS_TSH_ASYNC");
+        const char *t = getenv("TOBYOS_TSH_ASYNC_STATE");
+        if (s && t && argc >= 3 && strcmp(argv[1], "-c") == 0) {
+            async_snap = strdup(s);
+            async_state = strdup(t);
+        }
+        if (s) (void)unsetenv("TOBYOS_TSH_ASYNC");
+        if (t) (void)unsetenv("TOBYOS_TSH_ASYNC_STATE");
+    }
     shell_init_hosted(argv[0]);
     /* HOW DEEP THE SHELL MAY NEST IS SET BY THE STACK (g_stack_floor in
      * src/shell.c). A native process's stack tops out at the end of the
@@ -1304,6 +1323,11 @@ int main(int argc, char **argv) {
         if (sp > USER_STACK_FLOOR_VA && sp <= USER_STACK_TOP_LIMIT_VA)
             shell_set_stack_floor_hosted(USER_STACK_FLOOR_VA +
                                          TSH_STACK_RESERVE);
+    }
+    if (async_snap && async_state) {
+        if (argc > 3) (void)shell_set_param0_hosted(argv[3]);
+        if (argc > 4) (void)shell_set_args_hosted(argc - 4, argv + 4);
+        shell_async_child_hosted(async_snap, async_state, argv[2]);
     }
     /* Invoked as `sh` -- /bin/sh is a link to this binary -- means POSIX
      * mode, as it does for bash. */

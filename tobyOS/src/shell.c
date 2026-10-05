@@ -36201,21 +36201,6 @@ static int shell_run_function(struct shell_simple *cmd) {
     return rc;
 }
 
-#ifdef SHELL_HOSTED
-/* Run `text` in a forked copy of this shell, in the background.
- *
- * This is how a shell backgrounds anything it cannot hand to exec: a builtin,
- * a function, a brace group. The child inherits the whole shell state by
- * virtue of being a copy, runs the text, and _exits with its status; the
- * parent records the job so `wait`, `wait $!` and `wait %1` can find it.
- *
- * Hosted only. The kernel shell is a kernel thread and forking it would not
- * mean the same thing, so it keeps refusing -- loudly, as before. */
-/* pid_t is not in scope here -- this file speaks the kernel headers.
- * libtoby's pid_t is int, so the declaration is ABI-identical. */
-extern int fork(void);
-extern void _exit(int status);
-
 /* Is `text` ONE SIMPLE COMMAND -- no unquoted metacharacter, no leading
  * compound keyword? Decides whether the background child may EXEC it.
  *
@@ -36273,6 +36258,44 @@ static int shell_background_forked_as(const char *text, const char *label,
 static int shell_background_forked(const char *text, const char *label) {
     return shell_background_forked_as(text, label, 0);
 }
+
+/* THE VARIABLES AN ASYNCHRONOUS /bin/tsh DOES NOT TAKE FROM THE KERNEL
+ * SHELL (finding 63; see shell_background_forked_as below): bash's dynamic
+ * variables, which a subshell answers for itself -- its own $BASHPID,
+ * $RANDOM, $LINENO, call stack and $PIPESTATUS -- and the ones /bin/tsh
+ * sets as it starts: the shell's name and version, the machine, the ids
+ * and options it keeps readonly. Every other variable goes across. */
+static bool shell_async_var_is_own(const char *name, size_t len) {
+    static const char *const own[] = {
+        "BASH", "BASHOPTS", "BASHPID", "BASH_ALIASES", "BASH_ARGC",
+        "BASH_ARGV", "BASH_ARGV0", "BASH_CMDS", "BASH_COMMAND",
+        "BASH_EXECUTION_STRING", "BASH_LINENO", "BASH_SOURCE",
+        "BASH_SUBSHELL", "BASH_VERSINFO", "BASH_VERSION", "COMP_WORDBREAKS",
+        "DIRSTACK", "EPOCHREALTIME", "EPOCHSECONDS", "EUID", "FUNCNAME",
+        "GROUPS", "HISTCMD", "HOSTTYPE", "LINENO", "MACHTYPE", "OSTYPE",
+        "PIPESTATUS", "PPID", "RANDOM", "SECONDS", "SHELLOPTS", "SRANDOM",
+        "UID", "_", 0 };
+    for (int i = 0; own[i]; i++)
+        if (strlen(own[i]) == len && memcmp(own[i], name, len) == 0)
+            return true;
+    return false;
+}
+
+#ifdef SHELL_HOSTED
+/* Run `text` in a forked copy of this shell, in the background.
+ *
+ * This is how a shell backgrounds anything it cannot hand to exec: a builtin,
+ * a function, a brace group. The child inherits the whole shell state by
+ * virtue of being a copy, runs the text, and _exits with its status; the
+ * parent records the job so `wait`, `wait $!` and `wait %1` can find it.
+ *
+ * The kernel shell is a kernel thread and cannot fork: it starts /bin/tsh
+ * with a copy of its state instead (the #else below), and the copy runs
+ * the text as this child does (shell_async_child_hosted). */
+/* pid_t is not in scope here -- this file speaks the kernel headers.
+ * libtoby's pid_t is int, so the declaration is ABI-identical. */
+extern int fork(void);
+extern void _exit(int status);
 
 static const char *shell_find_pipe_at(const char *s);
 static bool shell_stage_is_compound(const char *s);
@@ -36540,6 +36563,67 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
     return true;
 }
 
+/* THE ASYNCHRONOUS CHILD, once it exists: a fork of this shell, or the
+ * /bin/tsh the kernel shell starts with a copy of its state
+ * (shell_async_child_hosted). It runs TEXT as the subshell it is and
+ * exits with its status. */
+static void shell_async_child_body(const char *text, bool async_ign,
+                                   bool null_stdin)
+    __attribute__((noreturn));
+static void shell_async_child_body(const char *text, bool async_ign,
+                                   bool null_stdin) {
+#ifdef SHELL_HOSTED
+    /* An asynchronous child has no jobs of its parent's: `sleep 2 & {
+     * jobs; } &` lists nothing in bash, as `( jobs )` does (logs/b12
+     * p112); its own are reported as a ( )'s are (p111). */
+    jobs_forget_all();
+#endif
+    /* TRAPS ARE CLEARED IN A SUBSHELL. POSIX 2.11: a subshell resets to
+     * the default every trap the parent had caught.
+     *
+     *     trap 'echo line=$LINENO' ERR
+     *     false & wait                      bash: nothing
+     *
+     * The child re-parses `false` as an ordinary foreground command, so
+     * it ran the parent's ERR trap and printed a line number the parent
+     * never reached. The exemption at the dispatch site only covers the
+     * parent's view of a backgrounded pipeline; the copy inside the fork
+     * needs its own.
+     *
+     * An IGNORED signal stays ignored (POSIX; bash's async children
+     * keep SIG_IGN): clearing it too handed `sleep 3 &` the default for
+     * a USR1 the script had ignored, and it died of it (138) every time
+     * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
+    shell_trap_clear_caught();
+    if (async_ign) shell_host_async_signals();
+    if (null_stdin) {
+        struct file *dn = shell_open_vfs_file("/dev/null", false, false, "shell");
+        if (dn) g_shell_fd[0] = dn;
+    }
+    /* an asynchronous command is a subshell, its words expanded in it:
+     * `echo $BASH_SUBSHELL &` prints 1 */
+    g_subshell_depth++;
+    g_simple_stage_adj = 0;
+    /* ONE simple external may replace this process -- see
+     * shell_bg_text_is_simple and proc_exec_in_place. */
+    g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
+    g_bg_simple_child = g_bg_exec_ok;
+    execute_line_text(text);
+    int st = g_last_status;
+    if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+    /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
+     * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
+     * one print bye in bash; an async `for` or and-or list does not
+     * (shell_child_runs_exit_trap; logs/b14 r1 r10). The parent's own
+     * traps were cleared above, so only one set here runs. And what
+     * it wrote goes out before it does. */
+    if (shell_child_runs_exit_trap(text, true, false))
+        st = shell_run_exit_trap(st);
+    shell_host_builtin_done();
+    _exit(st & 0xff);
+    __builtin_unreachable();
+}
+
 static int shell_background_forked_as(const char *text, const char *label,
                                       const char *shown) {
     /* `%1 &` IS bg %1, run by this shell, not a child (bash's
@@ -36601,57 +36685,7 @@ static int shell_background_forked_as(const char *text, const char *label,
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
         return 1;
     }
-    if (pid == 0) {
-#ifdef SHELL_HOSTED
-        /* An asynchronous child has no jobs of its parent's: `sleep 2 & {
-         * jobs; } &` lists nothing in bash, as `( jobs )` does (logs/b12
-         * p112); its own are reported as a ( )'s are (p111). */
-        jobs_forget_all();
-#endif
-        /* TRAPS ARE CLEARED IN A SUBSHELL. POSIX 2.11: a subshell resets to
-         * the default every trap the parent had caught.
-         *
-         *     trap 'echo line=$LINENO' ERR
-         *     false & wait                      bash: nothing
-         *
-         * The child re-parses `false` as an ordinary foreground command, so
-         * it ran the parent's ERR trap and printed a line number the parent
-         * never reached. The exemption at the dispatch site only covers the
-         * parent's view of a backgrounded pipeline; the copy inside the fork
-         * needs its own.
-         *
-         * An IGNORED signal stays ignored (POSIX; bash's async children
-         * keep SIG_IGN): clearing it too handed `sleep 3 &` the default for
-         * a USR1 the script had ignored, and it died of it (138) every time
-         * once the trap became a real SIG_IGN (logs/b8/usr1-loop.txt). */
-        shell_trap_clear_caught();
-        if (async_ign) shell_host_async_signals();
-        if (null_stdin) {
-            struct file *dn = shell_open_vfs_file("/dev/null", false, false, "shell");
-            if (dn) g_shell_fd[0] = dn;
-        }
-        /* an asynchronous command is a subshell, its words expanded in it:
-         * `echo $BASH_SUBSHELL &` prints 1 */
-        g_subshell_depth++;
-        g_simple_stage_adj = 0;
-        /* ONE simple external may replace this process -- see
-         * shell_bg_text_is_simple and proc_exec_in_place. */
-        g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
-        g_bg_simple_child = g_bg_exec_ok;
-        execute_line_text(text);
-        int st = g_last_status;
-        if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
-        /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
-         * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
-         * one print bye in bash; an async `for` or and-or list does not
-         * (shell_child_runs_exit_trap; logs/b14 r1 r10). The parent's own
-         * traps were cleared above, so only one set here runs. And what
-         * it wrote goes out before it does. */
-        if (shell_child_runs_exit_trap(text, true, false))
-            st = shell_run_exit_trap(st);
-        shell_host_builtin_done();
-        _exit(st & 0xff);
-    }
+    if (pid == 0) shell_async_child_body(text, async_ign, null_stdin);
     g_last_bg_pid = (int)pid;
     /* `set -m`: same rule as the spawn path -- the job is its own group. */
     if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
@@ -36659,6 +36693,350 @@ static int shell_background_forked_as(const char *text, const char *label,
         char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
         shell_describe_job(jobs_add((int)pid, pn ? pn : (label ? label : text)),
                            (int)pid);
+        kfree(pn);
+    }
+    return 0;
+}
+
+/* THE KERNEL SHELL'S ASYNCHRONOUS CHILD (finding 63). The kernel shell
+ * cannot fork; for `f &`, `{ ...; } &` and the like it starts /bin/tsh -c
+ * TEXT with SNAP -- its state, as commands -- and STATE -- what a forked
+ * child would simply have -- in the environment (the kernel build's
+ * shell_background_forked_as, below). host.c hands them here before
+ * anything else runs: no startup file and no BASH_ENV, as for a fork.
+ *
+ * The variables this shell set as it started are dropped first, so the
+ * child has the kernel shell's and no others -- an unset HOME stays unset
+ * -- then SNAP runs, and TEXT runs as a forked child runs it. STATE is
+ * "$$ PPID $? $! LINENO BASH_SUBSHELL FLAGS": FLAGS has j when the kernel
+ * shell has job control and r when its stdin was redirected around the
+ * command, which decide the child's signals and stdin as bash's do. */
+void shell_async_child_hosted(const char *snap, const char *state,
+                              const char *text) __attribute__((noreturn));
+void shell_async_child_hosted(const char *snap, const char *state,
+                              const char *text) {
+    long v[6] = { 0, 0, 0, 0, 0, 0 };
+    const char *p = state ? state : "";
+    for (int i = 0; i < 6; i++) {
+        while (*p == ' ') p++;
+        bool neg = *p == '-' && p[1] >= '0' && p[1] <= '9';
+        if (neg) p++;
+        long n = 0;
+        while (*p >= '0' && *p <= '9') n = n * 10 + (*p++ - '0');
+        v[i] = neg ? -n : n;
+    }
+    bool jc = false, redir = false;
+    for (; *p; p++) {
+        if (*p == 'j') jc = true;
+        else if (*p == 'r') redir = true;
+    }
+
+    for (int i = g_envc - 1; i >= 0; i--) {
+        size_t kl = env_key_len(g_env[i]);
+        if (kl == 0 || shell_async_var_is_own(g_env[i], kl) ||
+            shell_readonly_key(g_env[i], kl) ||
+            shell_dynvar_index(g_env[i], kl) >= 0)
+            continue;
+        env_remove_at(i);
+    }
+    /* $$ is the kernel shell's, as a fork's is its parent's */
+    g_shell_pid = (int)v[0];
+    {
+        char b[24];
+        ksnprintf(b, sizeof b, "%ld", v[1]);
+        shell_set_var_hosted("PPID", b);
+    }
+    if (snap && *snap) {
+        char *copy = shell_strdup(snap);
+        if (copy) {
+            (void)shell_run_script_text(copy, false);
+            kfree(copy);
+        }
+    }
+    g_shell_flow = SHELL_FLOW_NONE;
+    g_shell_flow_status = 0;
+    shell_set_status((int)v[2]);
+    g_last_bg_pid = (int)v[3];
+    g_shell_lineno = (unsigned long)v[4];
+    g_subshell_depth = (int)v[5];
+    bool async_ign = !jc;
+    bool null_stdin = (v[5] > 0 || !jc) && !redir &&
+                      !shell_text_stdin_redirected(text);
+    shell_async_child_body(text, async_ign, null_stdin);
+}
+#else
+/* THE KERNEL SHELL BACKGROUNDS THROUGH /bin/tsh WHAT IT CANNOT SPAWN
+ * (finding 63). It is a kernel thread and has no fork, so a function, a
+ * builtin, `{ ...; } &`, `( ... ) &`, a loop and an and-or list were all
+ * refused -- "'f': shell functions can't be backgrounded with '&'" --
+ * where /bin/tsh forks. Now it starts /bin/tsh -c TEXT $0 "$@" in its
+ * working directory, with its descriptors, umask and exported environment
+ * and two more variables, which the child takes out of its environment
+ * before anything else (shell_async_child_hosted):
+ *   TOBYOS_TSH_ASYNC, this shell's state as commands: its shell options
+ *     (shopt -p), aliases, variables with their attributes (declare -p,
+ *     less those the child answers for itself: shell_async_var_is_own),
+ *     functions with theirs, the signals it ignores (a caught trap is
+ *     reset in a subshell), and last its set -o options -- monitor too:
+ *     $- shows it in a subshell, which has no job control all the same
+ *     (shell_job_control);
+ *   TOBYOS_TSH_ASYNC_STATE, what a fork would simply have: $$, PPID, $?,
+ *     $!, the line number, $BASH_SUBSHELL, and whether this shell has job
+ *     control and a redirected stdin.
+ * The job is that process: `$!`, `jobs`, `wait` and `kill %N` reach it,
+ * and with job control on it leads its own group, so a kill reaches what
+ * it runs too.
+ *
+ * Not carried: the directory stack, the command hash table, history, and
+ * here-document bodies queued for the line (the child reads its text, not
+ * this shell's input) -- with one pending it still refuses. A name that
+ * is a builtin only in the kernel shell (ls, mem) is /bin/tsh's to
+ * resolve in the child, as any command inside a group or a loop is. */
+static const char *shell_find_pipe_at(const char *s);
+
+/* Set while shell_try_background_line hands one `CMD &` back to the
+ * token path, which spawns a program in the background as it always has. */
+static bool g_kbg_direct;
+
+/* IS THIS ASYNCHRONOUS TEXT ONE THE KERNEL SHELL SPAWNS ITSELF? A simple
+ * command naming a program, or a pipeline of them, with nothing to expand:
+ * those were always backgrounded here and still are. A builtin only the
+ * kernel shell has (ls, mem) stays here too, where it is refused. Anything
+ * else -- a function, a builtin /bin/tsh also has, an alias, a compound,
+ * an and-or list, an assignment or redirection first, a word to expand
+ * (which a subshell expands, not this shell: `echo ${x=1} &`) -- goes to
+ * a /bin/tsh child. `%1 &` is bg %1, here. */
+static bool shell_kbg_spawns_itself(const char *text) {
+    const char *cur = text;
+    for (;;) {
+        const char *sep = shell_find_pipe_at(cur);
+        const char *end = sep ? sep : cur + strlen(cur);
+        if (!shell_bg_text_is_simple(cur, end)) return false;
+        for (const char *q = cur; q < end; q++)
+            if (*q == '$' || *q == '`') return false;
+        const char *w = shell_skip_blanks(cur);
+        if (w >= end) return false;
+        if (*w == '%' && !sep && cur == text) return true;
+        const char *we = w;
+        while (we < end && *we != ' ' && *we != '\t') we++;
+        char name[256];
+        size_t wl = (size_t)(we - w);
+        if (wl == 0 || wl >= sizeof name) return false;
+        for (size_t i = 0; i < wl; i++) {
+            char c = w[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '.' ||
+                  c == '/' || c == '-' || c == '+' || c == ',' ||
+                  c == ':' || c == '@'))
+                return false;
+            name[i] = c;
+        }
+        name[wl] = '\0';
+        if (strcmp(name, "coproc") == 0 || shell_function_lookup(name) ||
+            shell_alias_find(name) >= 0)
+            return false;
+        if (shell_cmd_lookup(name) && shell_hosted_builtin(name)) return false;
+        if (!sep) return true;
+        cur = sep + (sep[1] == '&' ? 2 : 1);
+    }
+}
+
+/* The lines of a listing the child takes. */
+typedef bool (*shell_snap_keep_fn)(const char *l, size_t n);
+static bool shell_snap_ends(const char *l, size_t n, const char *tail) {
+    size_t t = strlen(tail);
+    return n >= t && memcmp(l + n - t, tail, t) == 0;
+}
+/* not the two a shell cannot set: they say how it was started */
+static bool shell_snap_keep_shopt(const char *l, size_t n) {
+    return !shell_snap_ends(l, n, " login_shell") &&
+           !shell_snap_ends(l, n, " restricted_shell");
+}
+/* `declare -F`: a function's attributes, past the plain `declare -f` */
+static bool shell_snap_keep_fattr(const char *l, size_t n) {
+    return n > 11 && memcmp(l, "declare -f", 10) == 0 && l[10] != ' ';
+}
+/* `trap -p`: an ignored signal; a caught one is reset in a subshell */
+static bool shell_snap_keep_trap(const char *l, size_t n) {
+    return n > 11 && memcmp(l, "trap -- '' ", 11) == 0;
+}
+static void shell_snap_lines(struct shell_sb *snap, const struct shell_sb *out,
+                             shell_snap_keep_fn keep) {
+    const char *l = out->p ? out->p : "";
+    while (*l) {
+        const char *e = l;
+        while (*e && *e != '\n') e++;
+        size_t n = (size_t)(e - l);
+        if (!keep || keep(l, n)) {
+            (void)sb_putmem(snap, l, n);
+            (void)sb_putc(snap, '\n');
+        }
+        l = *e ? e + 1 : e;
+    }
+}
+/* `declare -p`, one RECORD at a time: a value may hold a newline, so a
+ * record ends at a newline outside quotes -- the listing is shell input,
+ * and the scanner reads it as such. */
+static void shell_snap_vars(struct shell_sb *snap, const char *text) {
+    struct shell_scan st;
+    shell_scan_init(&st);
+    const char *rec = text, *p = text;
+    for (;;) {
+        if (!*p || (*p == '\n' && !shell_scan_incomplete(&st))) {
+            size_t n = (size_t)(p - rec);
+            if (n > 8 && memcmp(rec, "declare ", 8) == 0) {
+                const char *q = rec + 8, *e = p;
+                while (q < e && *q != ' ') q++;          /* the attributes */
+                while (q < e && *q == ' ') q++;
+                const char *nm = q;
+                while (q < e && *q != '=' && *q != ' ') q++;
+                if (q > nm && !shell_async_var_is_own(nm, (size_t)(q - nm))) {
+                    (void)sb_putmem(snap, rec, n);
+                    (void)sb_putc(snap, '\n');
+                }
+            }
+            if (!*p) break;
+            rec = ++p;
+            shell_scan_init(&st);
+            continue;
+        }
+        if (*p == ' ' || *p == '\t') { p++; continue; }
+        const char *before = p;
+        shell_scan_token(&st, &p);
+        if (p <= before) p = before + 1;
+    }
+}
+/* `set +o` as ONE `set` command, so nothing after it is traced or echoed */
+static void shell_snap_set(struct shell_sb *snap, const struct shell_sb *out) {
+    (void)sb_puts(snap, "set");
+    const char *l = out->p ? out->p : "";
+    while (*l) {
+        const char *e = l;
+        while (*e && *e != '\n') e++;
+        if (e - l > 7 && memcmp(l, "set ", 4) == 0 &&
+            (l[4] == '-' || l[4] == '+') && l[5] == 'o' && l[6] == ' ') {
+            (void)sb_putc(snap, ' ');
+            (void)sb_putc(snap, l[4]);
+            (void)sb_puts(snap, "o ");
+            (void)sb_putmem(snap, l + 7, (size_t)(e - (l + 7)));
+        }
+        l = *e ? e + 1 : e;
+    }
+    (void)sb_putc(snap, '\n');
+}
+static void shell_async_snapshot(struct shell_sb *snap) {
+    SH_SB(out);
+    int saved_status = g_last_status;
+    if (shell_capture_command("shopt -p", &out) == 0)
+        shell_snap_lines(snap, &out, shell_snap_keep_shopt);
+    if (shell_capture_command("alias -p", &out) == 0)
+        shell_snap_lines(snap, &out, 0);
+    if (shell_capture_command("declare -p", &out) == 0)
+        shell_snap_vars(snap, out.p ? out.p : "");
+    if (shell_capture_command("declare -f", &out) == 0)
+        shell_snap_lines(snap, &out, 0);
+    if (shell_capture_command("declare -F", &out) == 0)
+        shell_snap_lines(snap, &out, shell_snap_keep_fattr);
+    if (shell_capture_command("trap -p", &out) == 0)
+        shell_snap_lines(snap, &out, shell_snap_keep_trap);
+    if (shell_capture_command("set +o", &out) == 0)
+        shell_snap_set(snap, &out);
+    shell_set_status(saved_status);
+}
+
+static int shell_background_forked_as(const char *text, const char *label,
+                                      const char *shown) {
+    const char *what = label ? label : "shell";
+    struct vfs_stat vst;
+    if (vfs_stat("/bin/tsh", &vst) != VFS_OK) {
+        kprintf("%s: can't be backgrounded with '&' without /bin/tsh\n", what);
+        return 1;
+    }
+    if (g_heredoc_head < g_heredoc_count) {
+        kprintf("%s: can't be backgrounded with '&' with a here-document "
+                "in the kernel shell\n", what);
+        return 1;
+    }
+    SH_SB(snap);
+    if (sb_puts(&snap, "TOBYOS_TSH_ASYNC=") < 0) return 1;
+    shell_async_snapshot(&snap);
+    char state[160];
+    {
+        struct proc *cur = current_proc();
+        int self = g_shell_pid >= 0 ? g_shell_pid : (cur ? cur->pid : 0);
+        int ppid = cur ? cur->ppid : 0;
+        if (ppid < 0) ppid = 1;                 /* reparented: see proc.h */
+        const char *pv = env_get("PPID");
+        if (pv && *pv >= '0' && *pv <= '9') {
+            ppid = 0;
+            for (const char *q = pv; *q >= '0' && *q <= '9'; q++)
+                ppid = ppid * 10 + (*q - '0');
+        }
+        ksnprintf(state, sizeof state,
+                  "TOBYOS_TSH_ASYNC_STATE=%d %d %d %d %lu %d %s%s-",
+                  self, ppid, g_last_status, g_last_bg_pid,
+                  g_shell_lineno, g_subshell_depth,
+                  shell_job_control() ? "j" : "", g_stdin_redir ? "r" : "");
+    }
+
+    int envc = 0;
+    char **envp __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_build_env_overlay(0, 0, &envc);
+    if (!envp || !snap.p) return 1;
+    char **env2 __attribute__((cleanup(shell_kfree_ptr))) =
+        (char **)kmalloc((size_t)(envc + 3) * sizeof(char *));
+    int argc = 4 + g_positional_count;
+    char **argv __attribute__((cleanup(shell_kfree_ptr))) =
+        (char **)kmalloc((size_t)(argc + 1) * sizeof(char *));
+    if (!env2 || !argv) return 1;
+    int n2 = 0;
+    for (int i = 0; i < envc; i++)
+        if (strncmp(envp[i], "TOBYOS_TSH_ASYNC", 16) != 0) env2[n2++] = envp[i];
+    env2[n2++] = snap.p;
+    env2[n2++] = state;
+    env2[n2] = 0;
+    argv[0] = (char *)"tsh";
+    argv[1] = (char *)"-c";
+    argv[2] = (char *)text;
+    argv[3] = g_param0 ? g_param0 : (char *)"tobysh";
+    for (int i = 0; i < g_positional_count; i++) argv[4 + i] = g_positional[i];
+    argv[argc] = 0;
+
+    SH_FD_STATE(fds);
+    shell_fd_state_init_from_defaults(&fds);
+    struct proc_fd_map *xfd __attribute__((cleanup(shell_kfree_ptr))) =
+        (struct proc_fd_map *)kmalloc((size_t)(fds.n + g_procsub_n + 1) *
+                                      sizeof *xfd);
+    if (!xfd) {
+        shell_fd_state_close_owned(&fds);
+        return 1;
+    }
+    int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
+    struct proc_spec spec = {
+        .path = "/bin/tsh",
+        .name = "tsh",
+        .fd0  = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
+        .extra_fds = nxfd ? xfd : 0,
+        .extra_nfds = nxfd,
+        .argc = argc,
+        .argv = argv,
+        .envc = n2,
+        .envp = env2,
+        .cwd = shell_cwd(),
+        SH_SPEC_UMASK,
+    };
+    int pid = proc_spawn(&spec);
+    shell_fd_state_close_owned(&fds);
+    if (pid < 0) {
+        kprintf("%s: can't be backgrounded with '&': /bin/tsh did not "
+                "start\n", what);
+        return 1;
+    }
+    g_last_bg_pid = pid;
+    if (g_opt_monitor) (void)proc_set_pgid(pid, pid);
+    {
+        char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
+        shell_describe_job(jobs_add(pid, pn ? pn : (label ? label : text)), pid);
         kfree(pn);
     }
     return 0;
@@ -36899,8 +37277,20 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             }
             return shell_background_forked(line.p, exec_cmd.argv[0]);
 #else
-            kprintf("'%s': %s can't be backgrounded with '&'\n",
-                    exec_cmd.argv[0], is_fn ? "shell functions" : "builtins");
+            /* A /bin/tsh child runs it (shell_background_forked_as): the
+             * words already expanded here, so each goes across quoted. A
+             * builtin only this shell has is not /bin/tsh's to run. */
+            if (is_fn || shell_hosted_builtin(exec_cmd.argv[0])) {
+                SH_SB(line);
+                for (int i = 0; i < exec_cmd.argc; i++) {
+                    if ((i && sb_putc(&line, ' ') < 0) ||
+                        shell_quote_ansic(exec_cmd.argv[i], &line) < 0)
+                        return 1;
+                }
+                return shell_background_forked(line.p, exec_cmd.argv[0]);
+            }
+            kprintf("'%s': a kernel shell builtin can't be backgrounded "
+                    "with '&'\n", exec_cmd.argv[0]);
             return 1;
 #endif
         }
@@ -41637,16 +42027,11 @@ static bool shell_try_subshell_command(const char *src) {
     if (tail[0] == '&' && tail[1] != '&') {
         const char *after = shell_skip_blanks(tail + 1);
         if (!*after || *after == ';') {
-#ifdef SHELL_HOSTED
             SH_SB(shown);                      /* the job's name: "( BODY )" */
             (void)sb_puts(&shown, "( ");
             (void)sb_puts(&shown, body);
             (void)sb_puts(&shown, "\n)");
             shell_set_status(shell_background_forked_as(body, "subshell", shown.p));
-#else
-            kprintf("subshell: can't be backgrounded in the kernel shell\n");
-            shell_set_status(1);
-#endif
             kfree(body);
             shell_pipeline_free(plp);
             return true;
@@ -41904,16 +42289,11 @@ static bool shell_try_group_command(const char *src) {
     if (tail[0] == '&' && tail[1] != '&') {
         const char *after = shell_skip_blanks(tail + 1);
         if (!*after || *after == ';') {
-#ifdef SHELL_HOSTED
             SH_SB(shown);                      /* the job's name: "{ BODY; }" */
             (void)sb_puts(&shown, "{ ");
             (void)sb_puts(&shown, body);
             (void)sb_puts(&shown, "\n}");
             shell_set_status(shell_background_forked_as(body, "group", shown.p));
-#else
-            kprintf("group: can't be backgrounded in the kernel shell\n");
-            shell_set_status(1);
-#endif
             kfree(body);
             shell_pipeline_free(plp);
             return true;
@@ -42056,7 +42436,6 @@ static const char *shell_find_list_sep(const char *s, enum shell_list_link *link
     return 0;
 }
 
-#ifdef SHELL_HOSTED
 static const char *shell_find_bg_at(const char *s);
 
 /* AN AND-OR LIST ENDED BY `&` IS ONE ASYNCHRONOUS LIST. In bash's grammar
@@ -42086,7 +42465,6 @@ static const char *shell_andor_async_end(const char *s) {
 }
 
 static int shell_background_forked(const char *text, const char *label);
-#endif
 
 /* Returns false if `src` has no top-level separator, so the caller runs it
  * exactly as it did before -- single-command lines take an identical path. */
@@ -42132,8 +42510,8 @@ static bool shell_run_list_line(const char *src) {
     const char *cur = src;
     enum shell_list_link prev = SH_LINK_SEMI;
     for (;;) {
-#ifdef SHELL_HOSTED
-        /* a new and-or list that `&` ends goes to the background whole */
+        /* a new and-or list that `&` ends goes to the background whole --
+         * in the kernel shell, to a /bin/tsh child */
         if (prev == SH_LINK_SEMI) {
             const char *amp = shell_andor_async_end(cur);
             if (amp) {
@@ -42151,7 +42529,6 @@ static bool shell_run_list_line(const char *src) {
                 continue;
             }
         }
-#endif
         link = SH_LINK_SEMI;
         oplen = 0;
         const char *sep = shell_find_list_sep(cur, &link, &oplen);
@@ -42395,8 +42772,10 @@ static bool shell_stage_is_compound(const char *s) {
  * it is too late. Everything up to it goes to a child; whatever follows is an
  * ordinary command and runs here.
  *
- * Hosted only -- the kernel shell has no fork, and its token-level path still
- * handles `&` the way it always did.
+ * The kernel shell has no fork: it hands the text to a /bin/tsh child
+ * (shell_background_forked_as), except a program or a pipeline of programs
+ * with nothing to expand, which its token-level path still spawns in the
+ * background the way it always did (shell_kbg_spawns_itself).
  */
 static const char *shell_find_bg_at(const char *s) {
     struct shell_scan st;
@@ -42422,9 +42801,8 @@ static const char *shell_find_bg_at(const char *s) {
 
 static bool shell_try_background_line(const char *src) {
 #ifndef SHELL_HOSTED
-    (void)src;
-    return false;
-#else
+    if (g_kbg_direct) return false;
+#endif
     const char *amp = shell_find_bg_at(src);
     if (!amp) return false;
 
@@ -42440,17 +42818,34 @@ static bool shell_try_background_line(const char *src) {
     char *left = shell_dup_segment(src, left_end);
     if (!left) return false;
 
-    /* A compound is backgrounded the same way, and this is the one path that
-     * can do it without the token parser seeing the keyword first. */
-    int rc = shell_background_forked(left, left);
-    kfree(left);
-    shell_set_status(rc);
+#ifndef SHELL_HOSTED
+    if (shell_kbg_spawns_itself(left)) {
+        /* this `CMD &` alone, on the token path, which spawns it */
+        SH_SB(one);
+        if (sb_puts(&one, left) < 0 || sb_puts(&one, " &") < 0) {
+            kfree(left);
+            return false;
+        }
+        kfree(left);
+        bool saved_direct = g_kbg_direct;
+        g_kbg_direct = true;
+        execute_line_text(one.p);
+        g_kbg_direct = saved_direct;
+    } else
+#endif
+    {
+        /* A compound is backgrounded the same way, and this is the one path
+         * that can do it without the token parser seeing the keyword
+         * first. */
+        int rc = shell_background_forked(left, left);
+        kfree(left);
+        shell_set_status(rc);
+    }
 
     const char *rest = shell_skip_blanks(amp + 1);
     while (*rest == ';') rest = shell_skip_blanks(rest + 1);
     if (*rest) execute_line_text(rest);
     return true;
-#endif
 }
 
 /* Returns false when this is not a pipeline, or when no stage is compound --
@@ -43445,9 +43840,7 @@ static void execute_line_text_inner(const char *src) {
                 if (p <= tok) p = tok + 1;
                 if (lone_amp && top) { amp = tok; rest = p; break; }
             }
-            (void)rest;                  /* unused in the kernel build */
             if (amp && amp > q) {
-#ifdef SHELL_HOSTED
                 size_t n = (size_t)(amp - q);
                 char *body = kmalloc(n + 1);    /* its own length: no limit */
                 if (body) {
@@ -43465,12 +43858,6 @@ static void execute_line_text_inner(const char *src) {
                     return;
                 }
                 if (body) kfree(body);
-#else
-                kprintf(SH_PFX_SHELL "a compound cannot be backgrounded in the "
-                        "kernel shell\n");
-                shell_set_status(1);
-                return;
-#endif
             }
         }
     }
