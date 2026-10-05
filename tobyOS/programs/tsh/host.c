@@ -1233,6 +1233,16 @@ static void tsh_arm_sigint(void) {
 static volatile int g_tsh_sighup;
 static void tsh_sighup(int sig) { (void)sig; g_tsh_sighup = 1; }
 
+/* Set when this shell made SIGTERM a no-op, as an interactive shell does
+ * (main, below): its forks must not keep that (shell_fork's child, in
+ * src/shell.c, takes it once with shell_host_take_term_noop). */
+static bool g_tsh_term_noop;
+bool shell_host_take_term_noop(void) {
+    bool was = g_tsh_term_noop;
+    g_tsh_term_noop = false;
+    return was;
+}
+
 /* The hangup, acted on: the jobs are hung up, the EXIT trap runs, and the
  * shell dies of the signal, as bash's does (kill_shell). */
 extern int shell_hangup_hosted(void);
@@ -1539,6 +1549,7 @@ int main(int argc, char **argv) {
      * for the reason above. */
     if (interactive) {
         signal(SIGTERM, tsh_job_signal);
+        g_tsh_term_noop = true;
         (void)signal_norestart(SIGHUP, tsh_sighup);
     }
 

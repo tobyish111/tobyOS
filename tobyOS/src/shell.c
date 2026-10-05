@@ -24978,10 +24978,26 @@ extern int  fork(void);
 extern void _exit(int status);
 void shell_host_builtin_done(void);              /* host.c: flush stdout */
 void shell_host_async_signals(void);             /* host.c: INT, QUIT ignored */
-/* fork(), and the child knows it may replace itself (g_replace_ok) */
+bool shell_host_take_term_noop(void);            /* host.c */
+/* fork(), and the child knows it may replace itself (g_replace_ok).
+ *
+ * A CHILD OF AN INTERACTIVE SHELL DIES OF SIGTERM, as every child bash's
+ * make_child forks does: an interactive shell survives SIGTERM (host.c
+ * makes it a no-op), and bash sets it back to SIG_DFL across each fork.
+ * tsh's forks kept the no-op, so `kill %1` -- SIGTERM to the job's group
+ * -- left an async child running: it reported "Terminated" for the
+ * program inside and exited 143, where bash's job is "Terminated" itself
+ * (ttyparity 18). With a TERM trap set the trap keeps its handler, and
+ * what `trap - TERM` would go back to becomes the default. */
 static int shell_fork(void) {
     int pid = fork();
-    if (pid == 0) g_replace_ok = true;
+    if (pid == 0) {
+        g_replace_ok = true;
+        if (shell_host_take_term_noop()) {
+            if (g_sig_orig_saved[SIGTERM]) g_sig_orig[SIGTERM] = SIG_DFL;
+            else (void)signal(SIGTERM, SIG_DFL);
+        }
+    }
     return pid;
 }
 #endif

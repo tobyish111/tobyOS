@@ -1,0 +1,14 @@
+# AN ASYNC GROUP HAS NO JOB CONTROL OF ITS OWN: its subshell runs what it
+# runs in the JOB's process group (bash's without_job_control), so `kill
+# %1` -- a signal to that group -- reaches the program inside, and nothing
+# is left to print "survived". /bin/tsh's child kept job control on, moved
+# the program into a group of its own and gave it the terminal: the kill
+# reached the child alone (finding 63). `wait %1` on the same line reaps
+# the job, so no announcement races the prompt.
+{ /bin/sh -c 'sleep 3; echo survived'; } &
+sleep 1
+kill %1; wait %1
+echo "w=$?"
+sleep 4
+echo done
+exit 0
