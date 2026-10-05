@@ -42682,6 +42682,18 @@ static bool shell_try_compound_pipeline(const char *src) {
              * reader that was itself. Closing it here is what the fds= dance
              * in a real shell is for. */
             if (r) file_close(r);
+            /* THE PARENT'S TRAPS ARE SHOWN HERE, NOT RUN: a stage is a
+             * subshell, where `trap` lists them (Oils 1221: `trap | cat`)
+             * but the EXIT trap that runs is only one the stage sets. A
+             * stage that ran its own trap ran the PARENT's too -- `trap
+             * 'echo X' EXIT; echo p | cat` printed X three times (Oils
+             * 1177 1221 1243). The frame is never restored: the child
+             * ends here. */
+            {
+                struct shell_trap_frame tf;
+                if (shell_trap_enter_child(&tf) == 0)
+                    for (int k = 0; k <= SHELL_TRAP_LAST; k++) kfree(tf.trap[k]);
+            }
             /* A STAGE'S LINE IS ITS OWN. The stage runs from a copy, and a
              * copy the line map cannot trace back keeps the line last set --
              * the DEBUG loop above leaves the LAST stage's there:
