@@ -2584,6 +2584,10 @@ static void jobs_reap_finished(void) {
             int rc  = proc_wait(pid);   /* doesn't block; just reaps */
             kprintf("\n[%d] done  pid=%d  '%s'  exit=%d (0x%x)\n",
                     jid, pid, g_jobs[i]->name, rc, (unsigned)rc);
+            /* ...and its status is kept, as bash's bgp_add keeps it: `wait
+             * $!` after the notice still answers it, where it said "pid N
+             * is not a child of this shell", 127 (logs/b14 k63) */
+            shell_bgstat_add(job_last_pid(g_jobs[i]), rc);
             jobs_remove(g_jobs[i]);
             /* Reprint the prompt so the user gets a clean line back. */
             prompt();
