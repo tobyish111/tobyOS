@@ -1407,6 +1407,9 @@ static void shell_parse_error(void);
 /* 0 while no line is executing; 1 inside an input line; >1 inside a segment,
  * body or condition re-entering the executor. Only depth 0 is a NEW line. */
 static int g_exec_line_depth;
+/* The line level whose redirections a forked child keeps (see struct
+ * shell_io_frame); 0 when none. */
+static int g_io_keep_depth;
 /* Indexed arrays. The store is defined further down, next to the name
  * validator it uses, but env_set_kv() -- which sits above it -- has to
  * intercept the array assignment forms, so the accessors are declared here. */
@@ -29505,10 +29508,17 @@ static void shell_procsub_release(int mark) {
          *
          * `<(cmd)` is a PRODUCER and must NOT be waited for: the reader
          * may have stopped early, leaving it blocked on a pipe nobody
-         * will drain, and `cat <(yes) | head -1` would never return. */
-        if (!ps->input && ps->pid > 0) (void)proc_wait(ps->pid);
+         * will drain, and `cat <(yes) | head -1` would never return.
+         *
+         * Nor is a `>(cmd)` of the command a forked child keeps its
+         * redirections for (g_io_keep_depth): the kept descriptor is
+         * that consumer's input, so it cannot end while this process
+         * waits for it -- `f 2> >(grep x) | tac` hung for good (Oils
+         * 1983). bash waits for neither; the child is about to exit. */
+        bool kept = g_io_keep_depth > 0 && g_exec_line_depth == g_io_keep_depth;
+        if (!ps->input && !kept && ps->pid > 0) (void)proc_wait(ps->pid);
 #ifdef SHELL_HOSTED
-        if (ps->input && ps->pid > 0) shell_procsub_note_unreaped(ps->pid);
+        if ((ps->input || kept) && ps->pid > 0) shell_procsub_note_unreaped(ps->pid);
 #endif
         ps->keep = 0;
         ps->fd = -1;
@@ -35208,7 +35218,24 @@ struct shell_io_frame {
     struct file *old_base[SHELL_FD_BASE];
     bool owned_base[SHELL_FD_BASE];
     struct shell_simple *cmd;       /* whose redirections these are */
+    int line_depth;                 /* g_exec_line_depth it was installed at */
 };
+
+/* A FORKED CHILD'S COMMAND KEEPS ITS REDIRECTIONS FOR THE EXIT TRAP. bash's
+ * subshell applies the command's own redirections for good, not undoably
+ * (execute_in_subshell, execute_subshell_builtin_or_function), and runs its
+ * EXIT trap with them still in force:
+ *
+ *     f() { trap 'echo bye' EXIT; echo hi; }
+ *     f > out &                   bash: hi and bye in out
+ *     { trap 'echo bye' EXIT; echo hi; } > out &       the same
+ *
+ * tsh put its descriptors back as the command returned, and the trap wrote
+ * to the child's stdout (logs/b14 r13 r14). A child that will run its EXIT
+ * trap sets this to the line level its command runs at; the frames
+ * installed there -- the outermost command's, as everything inside runs a
+ * level deeper -- are not undone. 0: every frame is undone. */
+static int g_io_keep_depth;
 
 static void shell_fd_state_close_owned(struct shell_fd_state *st) {
     if (!st) return;
@@ -35247,6 +35274,7 @@ static int shell_io_frame_install(struct shell_io_frame *frame,
         g_shell_fd[i] = (i < fds->n) ? fds->fd[i] : 0;
         if (i < fds->n) fds->owned[i] = false;
     }
+    frame->line_depth = g_exec_line_depth;
     return 0;
 }
 
@@ -35619,6 +35647,16 @@ struct file *shell_current_diag_file(void) { return g_shell_fd[2]; }
 
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
     if (!frame || !frame->old_fd) return;
+    if (g_io_keep_depth > 0 && frame->line_depth == g_io_keep_depth) {
+        /* kept: the table stays as the frame made it, and owns its files */
+        if (frame->old_fd != frame->old_base) kfree(frame->old_fd);
+        if (frame->owned != frame->owned_base) kfree(frame->owned);
+        frame->old_fd = 0;
+        frame->owned = 0;
+        frame->n = 0;
+        frame->cmd = 0;
+        return;
+    }
     for (int i = 0; i < g_shell_fd_cap; i++) {
         if (i < frame->n) {
             if (frame->owned[i]) file_close(g_shell_fd[i]);
@@ -35999,6 +36037,17 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
             shell_set_status(1);
         }
         g_shell_out_failed = false;
+    }
+    if (g_io_keep_depth > 0 && g_exec_line_depth == g_io_keep_depth) {
+        /* a forked child's whole command, whose EXIT trap runs next with
+         * its redirections in force: `trap 'echo bye' EXIT > out &` puts
+         * bye in out (g_io_keep_depth). The table takes them for good. */
+        struct shell_io_frame keep;
+        memset(&keep, 0, sizeof keep);
+        if (shell_io_frame_install(&keep, &fds) == 0) {
+            if (keep.old_fd != keep.old_base) kfree(keep.old_fd);
+            if (keep.owned != keep.owned_base) kfree(keep.owned);
+        }
     }
     shell_fd_state_close_owned(&fds);
     shell_fd_moves_settle(cmd);         /* `: 6>&7-` leaves 7 closed */
@@ -36517,11 +36566,13 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
                                                    stages[i] + strlen(stages[i]));
             g_bg_simple_child = g_bg_exec_ok;
+            bool exit_trap = shell_child_runs_exit_trap(stages[i], true, true);
+            if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
             execute_line_text(stages[i]);
+            g_io_keep_depth = 0;
             int st = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
-            if (shell_child_runs_exit_trap(stages[i], true, true))
-                st = shell_run_exit_trap(st);
+            if (exit_trap) st = shell_run_exit_trap(st);
             shell_host_builtin_done();
             _exit(st & 0xff);
         }
@@ -36608,17 +36659,20 @@ static void shell_async_child_body(const char *text, bool async_ign,
      * shell_bg_text_is_simple and proc_exec_in_place. */
     g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
     g_bg_simple_child = g_bg_exec_ok;
-    execute_line_text(text);
-    int st = g_last_status;
-    if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
     /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
      * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
      * one print bye in bash; an async `for` or and-or list does not
-     * (shell_child_runs_exit_trap; logs/b14 r1 r10). The parent's own
-     * traps were cleared above, so only one set here runs. And what
-     * it wrote goes out before it does. */
-    if (shell_child_runs_exit_trap(text, true, false))
-        st = shell_run_exit_trap(st);
+     * (shell_child_runs_exit_trap; logs/b14 r1 r10) -- and with the
+     * command's redirections still in force (g_io_keep_depth). The
+     * parent's own traps were cleared above, so only one set here runs.
+     * And what it wrote goes out before it does. */
+    bool exit_trap = shell_child_runs_exit_trap(text, true, false);
+    if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
+    execute_line_text(text);
+    g_io_keep_depth = 0;
+    int st = g_last_status;
+    if (g_shell_flow == SHELL_FLOW_EXIT) st = g_shell_flow_status;
+    if (exit_trap) st = shell_run_exit_trap(st);
     shell_host_builtin_done();
     _exit(st & 0xff);
     __builtin_unreachable();
@@ -43111,6 +43165,11 @@ static bool shell_try_compound_pipeline(const char *src) {
                 if (shell_trap_enter_child(&tf) == 0)
                     for (int k = 0; k <= SHELL_TRAP_LAST; k++) kfree(tf.trap[k]);
             }
+            /* a function or a { } as a stage runs the EXIT trap it set,
+             * its redirections still in force (g_io_keep_depth); a loop or
+             * an if does not (logs/b14 r8 r10) */
+            bool exit_trap = shell_child_runs_exit_trap(stages[i], false, true);
+            if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
             /* A STAGE'S LINE IS ITS OWN. The stage runs from a copy, and a
              * copy the line map cannot trace back keeps the line last set --
              * the DEBUG loop above leaves the LAST stage's there:
@@ -43120,12 +43179,10 @@ static bool shell_try_compound_pipeline(const char *src) {
             shell_lmap_push_copy(stages[i], src + stage_off[i]);
             execute_line_text(stages[i]);
             shell_lmap_pop_copy();
+            g_io_keep_depth = 0;
             int crc = g_last_status;
             if (g_shell_flow == SHELL_FLOW_EXIT) crc = g_shell_flow_status;
-            /* a function or a { } as a stage runs the EXIT trap it set;
-             * a loop or an if does not (logs/b14 r8 r10) */
-            if (shell_child_runs_exit_trap(stages[i], false, true))
-                crc = shell_run_exit_trap(crc);
+            if (exit_trap) crc = shell_run_exit_trap(crc);
             shell_host_builtin_done();
             _exit(crc & 0xff);
         }
