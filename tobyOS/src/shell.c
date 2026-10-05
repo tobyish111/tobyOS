@@ -24661,12 +24661,18 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         return 0;
     }
 
-    if (g_opt_monitor && g_interactive && !g_in_pipeline_stage) {
+    if (shell_job_control() && g_interactive && !g_in_pipeline_stage) {
         /* Real job control, BOTH hosts: the foreground job leads its own
          * group and OWNS the terminal while it runs, so ^C/^Z from the tty
          * hit the JOB and not the shell. On a ^Z the shell takes the tty
          * back, registers a stopped job, and reports it the way bash does.
-         * $? after a stop is 128+SIGTSTP, like bash. */
+         * $? after a stop is 128+SIGTSTP, like bash.
+         *
+         * Only where this shell HAS job control: a subshell -- an async
+         * job's child above all -- has none, though $- still shows the m
+         * (bash's without_job_control). It moved its command into a group
+         * of its own, and `kill %1` of `{ sleep 30; } &` signalled the
+         * job's group and missed the sleep (finding 63, logs/b14 k63). */
         (void)proc_set_pgid(pid, pid);
         shell_tty_set_fg_pgrp(pid);
         int ssig = 0;
