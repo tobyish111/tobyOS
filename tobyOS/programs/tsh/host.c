@@ -853,7 +853,11 @@ int proc_spawn(const struct proc_spec *spec) {
     unsigned nextra = 0;
     for (int i = 0; i < spec->extra_nfds && nextra < ABI_SPAWN_EXTRA_MAX; i++) {
         struct file *f = spec->extra_fds[i].f;
-        if (!f) continue;
+        /* a slot the shell has closed (`exec 3>&-`) is not passed: the
+         * child does not have it. Its handle names no descriptor, and
+         * VF_FD read 0 -- so the child's fd 3 was the shell's STDIN
+         * (logs/b14 r18). */
+        if (!f || host_slot_closed(f)) continue;
         int pfd = VF_FD(&f->vfs);
         if (pfd < 0) continue;
         extra[nextra].child_fd  = spec->extra_fds[i].fd;
@@ -919,45 +923,66 @@ int host_input_ready(struct file *f, long timeout_ms) {
 
 int proc_exec_in_place(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
-    int fd0 = spec->fd0 ? VF_FD(&spec->fd0->vfs) : 0;
-    int fd1 = spec->fd1 ? VF_FD(&spec->fd1->vfs) : 1;
-    int fd2 = spec->fd2 ? VF_FD(&spec->fd2->vfs) : 2;
-    /* Descriptors go over where they are -- see proc_spawn. */
-    /* Extras first, then 0/1/2: an extra that targets 0/1/2 would otherwise
-     * be clobbered, and dup2 onto itself is a no-op so the common case is
-     * untouched. */
-    for (int i = 0; i < spec->extra_nfds; i++) {
-        struct file *f = spec->extra_fds[i].f;
-        if (!f) continue;
-        int pfd = VF_FD(&f->vfs);
-        int cfd = spec->extra_fds[i].fd;
-        if (pfd < 0 || cfd < 0 || pfd == cfd) continue;
-        if (dup2(pfd, cfd) < 0) return -1;
+    /* Descriptors go over where they are -- see proc_spawn.
+     *
+     * EVERY SOURCE IS TAKEN BEFORE ANY TARGET CHANGES. A source can sit on
+     * a number another slot is about to be given: fd 2 copying fd 1 after
+     * `exec 2>&1` (shparity 228b), or -- once `exec 3>&-` had freed 3 --
+     * the read end of a background pipeline's pipe, which the next pipe
+     * took as fd 3: the extra for slot 3 went in first and the element's
+     * stdin was then copied from what had replaced it, the shell's own
+     * stdin (logs/b14 r18: `echo hi | cat > f &` read the SSH session).
+     * So each source is copied above every number in play, and the targets
+     * are filled from the copies -- the extras first, so a slot 0, 1 or 2
+     * wins over an extra that names it. A slot the shell has CLOSED is
+     * closed here. One that is already where it goes stays as it is,
+     * uncopied: it may name a descriptor that is no longer open -- a
+     * process substitution's child closes the shell's end of it -- and
+     * copying that failed the exec, so `f 2> >(grep x) | tac` left a tsh
+     * holding tac's pipe and deadlocked (Oils 1983). */
+    int nx = spec->extra_nfds > 0 ? spec->extra_nfds : 0;
+    int n = nx + 3;
+    int *tgt = (int *)malloc((size_t)n * sizeof *tgt);
+    int *src = (int *)malloc((size_t)n * sizeof *src);
+    if (!tgt || !src) { free(tgt); free(src); return -1; }
+    int top = 2;
+    for (int i = 0; i < n; i++) {
+        struct file *f;
+        int t;
+        if (i < nx) {
+            f = spec->extra_fds[i].f;
+            t = spec->extra_fds[i].fd;
+        } else {
+            t = i - nx;
+            f = t == 0 ? spec->fd0 : t == 1 ? spec->fd1 : spec->fd2;
+        }
+        tgt[i] = t;
+        if (host_slot_closed(f)) src[i] = -1;                   /* close it */
+        else if (f) src[i] = VF_FD(&f->vfs);
+        else src[i] = t;                         /* none: as it is */
+        if (src[i] < -1 || (src[i] < 0 && !host_slot_closed(f))) {
+            if (i >= nx) { free(tgt); free(src); return -1; }
+            tgt[i] = -1;                         /* an extra with no fd */
+        }
+        if (src[i] == tgt[i]) tgt[i] = -1;       /* already in place */
+        if (tgt[i] > top) top = tgt[i];
+        if (src[i] > top) top = src[i];
     }
-    /* THE SOURCES ARE TAKEN BEFORE ANY TARGET CHANGES. A source that is
-     * itself 0, 1 or 2 -- fd 2 copying fd 1 after `exec 2>&1` -- was read
-     * after the dup2 onto 1 had replaced it, so `$(cmd)` with stderr on
-     * stdout sent the command's stderr into the substitution's pipe
-     * (shparity 228b, once $( ) began to exec its last command). The
-     * spawn path never had this: the kernel takes all three at once. */
-    int src[3] = { fd0, fd1, fd2 };
-    int tmp[3] = { -1, -1, -1 };
-    struct file *const slots[3] = { spec->fd0, spec->fd1, spec->fd2 };
-    for (int t = 0; t < 3; t++) {
-        if (host_slot_closed(slots[t]) || src[t] == t || src[t] > 2) continue;
-        tmp[t] = dup(src[t]);
-        if (tmp[t] < 0) return -1;
-        src[t] = tmp[t];
+    if (top + 1 + n >= 1024) { free(tgt); free(src); return -1; }
+    for (int i = 0; i < n; i++)
+        if (tgt[i] >= 0 && src[i] >= 0 && dup2(src[i], top + 1 + i) < 0) {
+            free(tgt); free(src);
+            return -1;
+        }
+    for (int i = 0; i < n; i++) {
+        if (tgt[i] < 0) continue;
+        if (src[i] == -1) (void)close(tgt[i]);
+        else (void)dup2(top + 1 + i, tgt[i]);
     }
-    for (int t = 0; t < 3; t++) {
-        if (host_slot_closed(slots[t]) || src[t] == t) continue;
-        if (dup2(src[t], t) < 0) return -1;
-    }
-    for (int t = 0; t < 3; t++) if (tmp[t] >= 0) close(tmp[t]);
-    /* closed last: a slot another was copied from must still be there */
-    if (host_slot_closed(spec->fd0)) close(0);
-    if (host_slot_closed(spec->fd1)) close(1);
-    if (host_slot_closed(spec->fd2)) close(2);
+    for (int i = 0; i < n; i++)
+        if (tgt[i] >= 0 && src[i] >= 0) (void)close(top + 1 + i);
+    free(tgt);
+    free(src);
 
     char **argv = host_strvec(spec->argv, spec->argc);
     char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
