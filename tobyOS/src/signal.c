@@ -262,6 +262,26 @@ int signal_send_to_pid_checked(int pid, int sig) {
      * the shell dispatches pending traps at the next command boundary, which
      * is where POSIX says a trap action runs. */
     if (shell_owns_pid(pid)) { shell_deliver_signal(sig); return 0; }
+    /* A PID BELOW -1 IS A PROCESS GROUP, as kill(2)'s is: every process
+     * in it, and -1 when there is none. It was looked up as a process,
+     * found nothing and failed, so the kernel shell's `kill %N` and `kill
+     * -- -PGID` reached only the job's leader: `{ sleep 30; } &` then
+     * `kill %1` killed the /bin/tsh running the group and left the sleep
+     * (finding 63, logs/b14 k63). The hosted shell sends through kill(2). */
+    if (pid < -1) {
+        extern struct proc g_proc[];
+        int hits = 0;
+        for (int i = 1; i < PROC_MAX; i++) {
+            if (g_proc[i].state == PROC_UNUSED ||
+                g_proc[i].state == PROC_EMBRYO) continue;
+            int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
+            if (gp != -pid) continue;
+            if (shell_owns_pid(g_proc[i].pid)) shell_deliver_signal(sig);
+            else signal_send(&g_proc[i], sig);
+            hits++;
+        }
+        return hits ? 0 : -1;
+    }
     struct proc *p = proc_lookup(pid);
     if (!p) return -1;
     signal_send(p, sig);
