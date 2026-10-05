@@ -627,8 +627,15 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
      * Masking to 07777 here silently declassed every device node, which
      * went unnoticed exactly as long as the kernel's own stat did too --
      * the fidelity arc fixed the kernel side and the oilspec oracle
-     * (in-guest bash) immediately diverged on `test -c /dev/zero`. */
-    out->mode = st.st_mode & 0177777;
+     * (in-guest bash) immediately diverged on `test -c /dev/zero`.
+     *
+     * AND THE BITS ARE REAL: stat(2) answers for a filesystem that keeps
+     * no modes with 0644/0755 itself, so what comes back is the file's
+     * mode -- VFS_MODE_VALID, which test_access_ok reads. Without it a
+     * file chmod'ed 000 looked like "no permission information" and
+     * `test -x` said yes to root; it was hidden while the kernel reported
+     * a 0000 as 0644 (until 25225d94; distrotail tt_test_perm). */
+    out->mode = (st.st_mode & 0177777) | VFS_MODE_VALID;
     out->uid  = st.st_uid;
     out->gid  = st.st_gid;
     /* EVERYTHING struct stat CARRIES, not just the fields the shim happened
