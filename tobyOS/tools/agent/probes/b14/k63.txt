@@ -1,0 +1,56 @@
+rm -f /tmp/o*
+f() { echo "in-f [$1] [$2] [$#]"; return 3; }
+f a "b c" > /tmp/o1 &
+wait $!; echo "st=$?"; cat /tmp/o1
+echo ${y=2} > /tmp/o2 &
+wait; echo "y=[$y]"; cat /tmp/o2
+a=(1 "2 3"); declare -A m=([k]=v); declare -i n=5; declare -r RO=ro; export EX=ex
+g() { echo "${a[1]}|${m[k]}|$n|$RO|$EX|$(declare -p n RO)"; }
+g > /tmp/o3 &
+wait; cat /tmp/o3
+alias hi='echo hello-alias'
+{ hi; } > /tmp/o4 &
+wait; cat /tmp/o4
+shopt -s extglob
+h() { [[ x == @(x|y) ]] && echo extglob-ok; }
+h > /tmp/o5 &
+wait; cat /tmp/o5
+trap '' USR1
+{ kill -USR1 $BASHPID; echo survived-usr1; } > /tmp/o6 &
+wait $!; echo "st=$?"; cat /tmp/o6
+trap 'echo caught' USR2
+{ kill -USR2 $BASHPID; echo after-usr2; } > /tmp/o7 &
+wait $!; echo "st=$?"; cat /tmp/o7
+trap - USR1 USR2
+PARENT=$$; { echo "pid-same=$([ "$$" = "$PARENT" ] && echo y || echo n) sub=$BASH_SUBSHELL bashpid-differs=$([ "$BASHPID" != "$$" ] && echo y || echo n)"; } > /tmp/o8 &
+wait; cat /tmp/o8
+set -- p1 "p 2"; { echo "$# [$1] [$2] [$0]"; } > /tmp/o9 &
+wait; cat /tmp/o9; set --
+cd /tmp; { pwd; } > /tmp/o10 &
+wait; cd /; cat /tmp/o10
+umask 077; { umask; } > /tmp/o11 &
+wait; umask 022; cat /tmp/o11
+exec 3>/tmp/o12; { echo via-fd3 >&3; } &
+wait; exec 3>&-; cat /tmp/o12
+{ trap 'echo bye' EXIT; echo hi; } > /tmp/o13 &
+wait; cat /tmp/o13
+false; { echo "st-in=$?"; } > /tmp/o14 &
+wait; cat /tmp/o14
+unset QQ; QQ2=set; unset QQ2; { echo "[${QQ-unset}] [${QQ2-unset}]"; } > /tmp/o15 &
+wait; cat /tmp/o15
+echo hi-pipe | cat > /tmp/o16 &
+wait; cat /tmp/o16
+k() { sleep 1 & wait; echo k-done; }; k > /tmp/o17 &
+wait; cat /tmp/o17
+true && echo ao-1 > /tmp/o18 && echo ao-2 >> /tmp/o18 &
+wait; cat /tmp/o18
+for i in 1 2; do echo "loop-$i"; done > /tmp/o19 &
+wait; cat /tmp/o19
+{ sleep 30; echo never; } > /tmp/o20 &
+jobs
+kill %1; wait %1; echo "killed-st=$?"
+ps
+echo a b; f > /dev/null &
+echo "lastarg=[$_]"
+wait
+echo end-k63
