@@ -42501,21 +42501,33 @@ static const char *shell_find_bg_at(const char *s);
  * ends at its first top-level `;` or lone `&`: when that is a `&` with an
  * `&&` or `||` before it, return the `&`; otherwise 0, and the list runner
  * goes on as before. */
+/* ONE PASS, TO THE END OF THIS LIST ONLY. The runner asks at every list it
+ * starts, and this looked for a `&` in the whole REST of the text first:
+ * a body of N `;`-separated commands was scanned N times over, and the
+ * kernel shell's 2500-command function in kbigcap stalled pid 0 past its
+ * 10 s watchdog. The scan stops at the list's own end -- a top-level `;`
+ * or the lone `&` (as shell_find_bg_at tells one: not `&&`, `&>` or the
+ * `&` of `|&`) -- and counts the `&&` and `||` on the way. */
 static const char *shell_andor_async_end(const char *s) {
-    const char *amp = shell_find_bg_at(s);
-    if (!amp) return 0;
+    struct shell_scan st;
+    shell_scan_init(&st);
     bool andor = false;
-    const char *c = s;
-    for (;;) {
-        enum shell_list_link lk = SH_LINK_SEMI;
-        int ol = 0;
-        const char *sp = shell_find_list_sep(c, &lk, &ol);
-        if (!sp || sp > amp) break;
-        if (lk == SH_LINK_SEMI) return 0;       /* a `;` ends it first */
-        andor = true;
-        c = sp + ol;
+    const char *p = s;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
+        if (!*p) break;
+        if (!shell_scan_incomplete(&st)) {
+            if (*p == ';' && p[1] != ';') return 0;     /* a `;` ends it first */
+            if ((p[0] == '&' && p[1] == '&') || (p[0] == '|' && p[1] == '|'))
+                andor = true;
+            else if (*p == '&' && p[1] != '>' && !(p > s && p[-1] == '|'))
+                return andor ? p : 0;
+        }
+        const char *before = p;
+        shell_scan_token(&st, &p);
+        if (p <= before) p = before + 1;
     }
-    return andor ? amp : 0;
+    return 0;
 }
 
 static int shell_background_forked(const char *text, const char *label);
