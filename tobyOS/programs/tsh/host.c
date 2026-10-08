@@ -82,6 +82,44 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 extern pid_t toby_spawn_ex(const char *path, char *const argv[],
                            char *const envp[], int fd0, int fd1, int fd2,
                            const struct abi_spawn_fd *extra, unsigned nextra);
+extern pid_t toby_spawn_flags(const char *path, char *const argv[],
+                              char *const envp[], int fd0, int fd1, int fd2,
+                              const struct abi_spawn_fd *extra, unsigned nextra,
+                              unsigned flags);
+/* libtoby's, declared for the reason signal() is: its sigset_t is an
+ * unsigned long with signal N at bit N; SIG_UNBLOCK is 1. */
+extern int sigprocmask(int how, const unsigned long *set, unsigned long *old);
+
+/* A blocking call that a signal interrupted (EINTR) asks the shell what
+ * to do: act on a fatal signal the EXIT trap waits for (which does not
+ * return), stop a `wait` a trapped signal ends (1), or go on (0). See
+ * shell_host_eintr in src/shell.c. */
+extern int shell_host_eintr(void);
+uint64_t perf_now_ns(void);              /* below */
+
+/* Two of this file's handlers must not restart what they interrupt: ^C's
+ * and the hangup's at a terminal (tsh_arm_sigint). Putting one back must
+ * keep that -- shell.c's own non-restarting one (the EXIT trap's fatal
+ * signals) it puts back itself. */
+static void tsh_sigint(int sig);
+static void tsh_sighup(int sig);
+bool shell_host_norestart_handler(tsh_sighandler_fn h) {
+    return h == tsh_sigint || h == tsh_sighup;
+}
+static void host_sig_put(int sig, tsh_sighandler_fn h) {
+    if (shell_host_norestart_handler(h)) (void)signal_norestart(sig, h);
+    else (void)signal(sig, h);
+}
+
+/* The spawn request's ABI_SPAWN_F_* for a spec's sig_default/sig_ignore. */
+static unsigned host_spawn_sigflags(const struct proc_spec *spec) {
+    unsigned fl = 0;
+    if (spec->sig_ignore & SIGMASK(SIGINT))        fl |= ABI_SPAWN_F_IGN_INT;
+    else if (spec->sig_default & SIGMASK(SIGINT))  fl |= ABI_SPAWN_F_DFL_INT;
+    if (spec->sig_ignore & SIGMASK(SIGQUIT))       fl |= ABI_SPAWN_F_IGN_QUIT;
+    else if (spec->sig_default & SIGMASK(SIGQUIT)) fl |= ABI_SPAWN_F_DFL_QUIT;
+    return fl;
+}
 
 /* Did the last proc_spawn fail because the arguments were too big? The
  * shell asks straight after the failure (shell_explain_spawn_failure);
@@ -381,6 +419,13 @@ long file_read(struct file *f, void *buf, size_t n) {
     if (f->kind != FILE_KIND_VFS) return -1;
     int fd = VF_FD(&f->vfs);
     long got = read(fd, buf, n);
+    /* An interruption is not an error: the shell acts on a fatal signal
+     * the EXIT trap waits for (shell_host_eintr does not return then), and
+     * the read goes on -- `read` reported "Interrupted system call". */
+    while (got < 0 && errno == EINTR) {
+        (void)shell_host_eintr();
+        got = read(fd, buf, n);
+    }
     if (got > 0) f->vfs.pos += (size_t)got;
     /* the errno, negated, for `read`'s "read error: FD: REASON" -- a
      * directory is EISDIR */
@@ -407,10 +452,16 @@ long file_write(struct file *f, const void *buf, size_t n) {
         long put = g_diag_nosync ? host_write_nosync(fd, p + done, n - done)
                                  : write(fd, p + done, n - done);
         if (put < 0) {
-            if (errno == EINTR) continue;
+            int e = errno;
+            /* a fatal signal the EXIT trap waits for is acted on first --
+             * the SIGPIPE that came with an EPIPE above all: bash's
+             * `trap ... EXIT; while :; do echo y; done | head -1` runs the
+             * trap and dies of it, saying no "write error" (p4 h9) */
+            (void)shell_host_eintr();
+            if (e == EINTR) continue;
             /* the errno, negated, for the caller's "write error: REASON"
              * (/dev/full is ENOSPC) */
-            return done > 0 ? (long)done : -(long)errno;
+            return done > 0 ? (long)done : -(long)e;
         }
         if (put == 0) break;
         done += (size_t)put;
@@ -611,6 +662,10 @@ int vfs_close(struct vfs_file *f) {
 long vfs_read(struct vfs_file *f, void *buf, size_t n) {
     if (!f) return VFS_ERR_INVAL;
     long got = read(VF_FD(f), buf, n);
+    while (got < 0 && errno == EINTR) {          /* as file_read */
+        (void)shell_host_eintr();
+        got = read(VF_FD(f), buf, n);
+    }
     if (got > 0) f->pos += (size_t)got;
     return got;
 }
@@ -865,8 +920,9 @@ int proc_spawn(const struct proc_spec *spec) {
         nextra++;
     }
 
-    int rc = (int)toby_spawn_ex(spec->path, argv, spec->envp ? envp : 0,
-                                fd0, fd1, fd2, nextra ? extra : 0, nextra);
+    int rc = (int)toby_spawn_flags(spec->path, argv, spec->envp ? envp : 0,
+                                   fd0, fd1, fd2, nextra ? extra : 0, nextra,
+                                   host_spawn_sigflags(spec));
     int saved = errno;
     free(argv); free(envp); free(extra);
     errno = saved;
@@ -987,8 +1043,19 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     char **argv = host_strvec(spec->argv, spec->argc);
     char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
     if (!argv || !envp) { free(argv); free(envp); return -1; }
+    /* INT and QUIT as the shell asked (proc_spec.sig_default/sig_ignore),
+     * as proc_spawn's flags give them; exec keeps an ignore and resets a
+     * handler, so these are what the program starts with. */
+    tsh_sighandler_fn was[SIGQUIT + 1] = { 0 };
+    bool put[SIGQUIT + 1] = { false };
+    for (int s = SIGINT; s <= SIGQUIT; s++) {
+        if (spec->sig_ignore & SIGMASK(s))       { was[s] = signal(s, SIG_IGN); put[s] = true; }
+        else if (spec->sig_default & SIGMASK(s)) { was[s] = signal(s, SIG_DFL); put[s] = true; }
+    }
     (void)execve(spec->path, argv, spec->envp ? envp : 0);
     int saved = errno;
+    for (int s = SIGINT; s <= SIGQUIT; s++)     /* the exec failed: put back */
+        if (put[s]) host_sig_put(s, was[s]);
     free(argv); free(envp);         /* only reached when the exec failed */
     errno = saved;
     return -1;
@@ -1008,9 +1075,18 @@ static int host_reaped(int status) {
 int proc_wait(int pid) {
     int status = 0;
     /* Retry EINTR: the parent now receives SIGCHLD, and a wait must not
-     * fail because the signal it exists to consume arrived. */
-    for (int tries = 0; tries < 1000; tries++) {
+     * fail because the signal it exists to consume arrived. An interruption
+     * is the shell's to judge first (shell_host_eintr): a fatal signal the
+     * EXIT trap waits for is acted on at once, as bash's termsig handler
+     * does mid-wait (logs/b15 p4 h1), and `wait` stops for a trapped one
+     * -- -2, which only the `wait` builtin ever asks for. */
+    for (int tries = 0; tries < 1000; ) {
         if (waitpid(pid, &status, 0) >= 0) return host_reaped(status);
+        if (errno == EINTR) {
+            if (shell_host_eintr()) return -2;
+            continue;
+        }
+        tries++;
     }
     return -1;
 }
@@ -1110,7 +1186,10 @@ int proc_wait_fg(int pid, int *stop_sig) {
         g_tsh_async_ok = 1;
         pid_t r = waitpid(pid, &st, WUNTRACED);
         g_tsh_async_ok = 0;
-        if (r < 0) continue;                              /* EINTR retry */
+        if (r < 0) {                                      /* EINTR retry */
+            if (errno == EINTR) (void)shell_host_eintr();
+            continue;
+        }
         if (WIFSTOPPED(st)) {
             if (stop_sig) *stop_sig = WSTOPSIG(st);
             return 0;
@@ -1188,6 +1267,45 @@ static long host_proc_status(int pid, char *buf, size_t cap) {
     return n;
 }
 
+/* THE SIGNALS THIS SHELL WAS STARTED WITH IGNORED (SIGMASK bits), from
+ * /proc/self/status. bash's SIG_HARD_IGNORE: a non-interactive shell may
+ * neither trap nor reset one, and lists it as `trap -- '' SIGX` (POSIX
+ * 2.14 trap; logs/b15 p3 b1-b5, c, e). 0 if /proc cannot say. */
+static uint64_t host_entry_ignored(void) {
+    char buf[4096];
+    if (!host_proc_status(0, buf, sizeof buf)) return 0;
+    const char *f = strstr(buf, "\nSigIgn:");
+    if (!f) return 0;
+    f += 8;
+    while (*f == ' ' || *f == '\t') f++;
+    uint64_t m = 0;
+    for (int s = 1; s < SIG_MAX; s++)
+        if (host_hexbit(f, s)) m |= SIGMASK(s);
+    return m;
+}
+
+/* EVERY bash IGNORES SIGQUIT (sig.c initialize_shell_signals), and
+ * `trap - QUIT` puts that back: `bash -c 'kill -QUIT $$; echo alive'`
+ * prints alive where tsh died, 131 (logs/b15 p5 q1 q2 q5). A no-op
+ * handler, not SIG_IGN, so that what the shell runs starts with the
+ * default -- an exec resets a handler and keeps an ignore -- and a
+ * subshell sets the default itself (shell_child_signals in shell.c),
+ * as bash's restore_original_signals gives both. */
+static void tsh_quit(int sig) { (void)sig; }
+void shell_host_quit_ignore(void) { (void)signal(SIGQUIT, tsh_quit); }
+
+/* bash's kill_shell: die OF the signal -- its default action, unblocked
+ * -- so the parent sees the death; the exit status it would give if that
+ * somehow fails. Called once the EXIT trap has run (shell.c
+ * shell_termsig_act). */
+void shell_host_kill_self(int sig) {
+    unsigned long m = 1UL << sig;
+    (void)signal(sig, SIG_DFL);
+    (void)sigprocmask(1 /* SIG_UNBLOCK */, &m, 0);
+    (void)kill(getpid(), sig);
+    _exit(128 + sig);
+}
+
 bool proc_signal_default(int pid, int sig) {
     char buf[4096];
     if (pid <= 0 || !host_proc_status(pid, buf, sizeof buf)) return false;
@@ -1252,6 +1370,7 @@ extern void shell_make_restricted_hosted(void);
 extern void shell_async_child_hosted(const char *snap, const char *state,
                                      const char *text)
     __attribute__((noreturn));
+extern void shell_note_entry_ignores_hosted(uint64_t mask);
 
 /* Absorb tty job-control signals that reach the shell itself. A handler,
  * not SIG_IGN -- see the interactive setup below for why. */
@@ -1380,6 +1499,15 @@ int main(int argc, char **argv) {
         if (argc > 3) (void)shell_set_param0_hosted(argv[3]);
         if (argc > 4) (void)shell_set_args_hosted(argc - 4, argv + 4);
         shell_async_child_hosted(async_snap, async_state, argv[2]);
+    }
+    /* What was ignored at entry is ignored for good (host_entry_ignored),
+     * and the shell itself ignores QUIT (tsh_quit). Not for the kernel
+     * shell's asynchronous child above: its signals are its parent's, and
+     * the kernel shell ignores nothing at entry. */
+    {
+        uint64_t ign = host_entry_ignored();
+        shell_note_entry_ignores_hosted(ign);
+        if (!(ign & SIGMASK(SIGQUIT))) shell_host_quit_ignore();
     }
     /* Invoked as `sh` -- /bin/sh is a link to this binary -- means POSIX
      * mode, as it does for bash. */

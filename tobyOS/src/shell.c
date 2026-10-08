@@ -5935,7 +5935,13 @@ int shell_take_interrupt(void) {
     return 1;
 }
 
+#ifdef SHELL_HOSTED
+static void shell_termsig_check(void);
+#endif
 static void shell_check_pending_signals(void) {
+#ifdef SHELL_HOSTED
+    shell_termsig_check();          /* the EXIT trap and a fatal signal */
+#endif
     for (int i = 1; i < SIG_MAX; i++) {
         if (g_pending_signals[i]) {
             g_pending_signals[i] = 0;
@@ -6510,12 +6516,54 @@ static void shell_hosted_sigrelay(int sig) { shell_deliver_signal(sig); }
  * (logs/b8/usr1-loop.txt, trap-ignore-before.*). */
 static void (*g_sig_orig[SIG_MAX])(int);
 static bool g_sig_orig_saved[SIG_MAX];
+extern void (*signal_norestart(int signum, void (*handler)(int)))(int);
+bool shell_host_norestart_handler(void (*h)(int));            /* host.c */
+void shell_host_quit_ignore(void);                              /* host.c */
+void shell_host_kill_self(int sig) __attribute__((noreturn));   /* host.c */
+void shell_host_builtin_done(void);                             /* host.c */
+
+/* SIGNALS IGNORED WHEN THE SHELL STARTED (bash's SIG_HARD_IGNORE; POSIX
+ * 2.14 trap: one "ignored on entry to a non-interactive shell cannot be
+ * trapped or reset, although no error need be reported"). bash refuses
+ * `trap CMD`, `trap ''` and `trap -` on one without a word, lists it as
+ * `trap -- '' SIGX`, and so does every subshell of it. tsh did not know
+ * which they were: with INT ignored, `bash -c 'trap "echo got" INT; kill
+ * -INT $$'` lives on in bash and printed got in tsh (logs/b15 p3 b1-b5, c,
+ * e; finding 72). host.c reads them at entry (host_entry_ignored). A shell
+ * at a terminal keeps none of them: bash's interactive start takes most of
+ * them back (initialize_terminating_signals), and nothing measured asks
+ * for the rest. */
+static bool g_sig_hard_ign[SIG_MAX];
+void shell_note_entry_ignores_hosted(uint64_t mask) {
+    for (int s = 1; s < SIG_MAX; s++) g_sig_hard_ign[s] = (mask & SIGMASK(s)) != 0;
+}
+static bool shell_sig_hard(int s) {
+    return s > 0 && s < SIG_MAX && g_sig_hard_ign[s] && !g_interactive;
+}
+/* A signal's ORIGINAL disposition, bash's original_signals: what it was
+ * when the shell started -- what a child gets back for one the shell caught
+ * or handles itself (restore_original_signals). */
+static void (*shell_sig_original(int s))(int) {
+    return (s > 0 && s < SIG_MAX && g_sig_hard_ign[s]) ? SIG_IGN : SIG_DFL;
+}
+
+static void shell_hosted_termsig(int sig);
+/* A handler goes back on with the restart behaviour it went on with: the
+ * fatal-signal one below and host.c's ^C and hangup ones do not restart
+ * what they interrupt. */
+static void shell_sig_put(int sig, void (*h)(int)) {
+    if (h == shell_hosted_termsig || shell_host_norestart_handler(h))
+        (void)signal_norestart(sig, h);
+    else
+        (void)signal(sig, h);
+}
+
 static void shell_trap_sync_kernel(int sig) {
     if (sig <= 0 || sig >= SIG_MAX) return;
     void (*want)(int);
     if (!g_traps[sig]) {
         if (!g_sig_orig_saved[sig]) return;       /* never touched */
-        (void)signal(sig, g_sig_orig[sig]);
+        shell_sig_put(sig, g_sig_orig[sig]);
         g_sig_orig_saved[sig] = false;
         return;
     }
@@ -6525,6 +6573,201 @@ static void shell_trap_sync_kernel(int sig) {
         g_sig_orig[sig] = prev;
         g_sig_orig_saved[sig] = true;
     }
+}
+
+/* THE EXIT TRAP RUNS WHEN A FATAL SIGNAL ENDS THE SHELL (bash's
+ * initialize_terminating_signals, termsig_sighandler, termsig_handler).
+ * Once a non-interactive shell has an EXIT trap, each signal bash calls
+ * terminating that is neither trapped nor ignored gets a handler; when one
+ * arrives the shell runs the EXIT trap and then dies OF the signal:
+ *
+ *     bash -c 'trap "echo bye" EXIT; kill -TERM $$'    bye, Terminated, 143
+ *     tsh                                               Terminated, 143
+ *
+ * -- at once, even in the middle of waiting for a foreground child (which
+ * is left running) or of a `read`; in a function, a loop, a subshell or a
+ * $( ) that set its own; with $? the last command's (logs/b15 p4, p6 x,
+ * p7 e; WSL's bash 5.3 the same). Another terminating signal while it runs
+ * ends the shell at once (p4 h15). One ignored when they are armed stays
+ * ignored for good, as in bash 5.2: an asynchronous child's INT (h7). Not
+ * armed: the fault signals (SEGV BUS ILL FPE TRAP SYS), whose handler
+ * would return into the fault -- so `kill -SEGV $$` dies without running
+ * the EXIT trap, where bash runs it. */
+static const int g_termsigs[] = { SIGHUP, SIGINT, SIGABRT, SIGPIPE, SIGALRM,
+                                  SIGTERM, SIGXCPU, SIGXFSZ, SIGVTALRM,
+                                  SIGUSR1, SIGUSR2 };
+#define SH_NTERMSIGS ((int)(sizeof g_termsigs / sizeof g_termsigs[0]))
+static bool g_termsig_init;                 /* armed, in this process */
+static volatile int g_termsig_pending;      /* the one that arrived */
+static volatile int g_termsig_handling;     /* the one being acted on */
+static void shell_hosted_termsig(int sig) {
+    if (g_termsig_handling) shell_host_kill_self(sig);      /* kill_shell */
+    if (!g_termsig_pending) g_termsig_pending = sig;
+}
+static void shell_termsig_init(void) {
+    if (g_termsig_init || g_interactive) return;
+    g_termsig_init = true;
+    for (int i = 0; i < SH_NTERMSIGS; i++) {
+        int s = g_termsigs[i];
+        if (shell_trap_live(s)) continue;              /* trapped: its own */
+        void (*prev)(int) = signal_norestart(s, shell_hosted_termsig);
+        if (prev == SIG_IGN) {
+            (void)signal(s, SIG_IGN);
+            g_sig_hard_ign[s] = true;
+        }
+    }
+}
+static void shell_termsig_act(int sig) __attribute__((noreturn));
+static void shell_termsig_act(int sig) {
+    g_termsig_handling = sig;
+    g_termsig_pending = 0;
+    g_trap_running = false;          /* it runs even from inside another trap */
+    g_shell_flow = SHELL_FLOW_NONE;
+    (void)shell_run_exit_trap(g_last_status);
+    shell_host_builtin_done();
+    shell_host_kill_self(sig);
+}
+static void shell_termsig_check(void) {
+    int s = g_termsig_pending;
+    if (s && !g_termsig_handling) shell_termsig_act(s);
+}
+
+/* `wait` IS ENDED BY A TRAPPED SIGNAL (POSIX 2.11: it returns at once with
+ * a status above 128, and then the trap runs). bash's does; tsh's sat until
+ * the job finished and returned 0 -- `trap 'echo t' USR1; sleep 3 & ( sleep
+ * 1; kill -USR1 $$ ) & wait $!` took three seconds where bash takes one
+ * and says 138 (logs/b15 p5 w1 w2). For the length of a `wait` the relay of
+ * every trapped signal does not restart, so the wait's own wait4 returns
+ * EINTR, and host.c asks shell_host_eintr. Not SIGCHLD: a CHLD trap runs
+ * from the reaping in bash and ends no wait. */
+static bool g_wait_intr_on;
+static int g_wait_intr_sig;
+static bool shell_wait_intr_hit(void) {
+    if (!g_wait_intr_on) return false;
+    for (int s = 1; s < SIG_MAX; s++) {
+        if (s == SIGCHLD || !g_pending_signals[s]) continue;
+        const char *t = shell_trap_live(s);
+        if (t && *t) { g_wait_intr_sig = s; return true; }
+    }
+    return false;
+}
+static void shell_wait_intr(bool on) {
+    g_wait_intr_on = on;
+    g_wait_intr_sig = 0;
+    for (int s = 1; s < SIG_MAX; s++) {
+        const char *t = shell_trap_live(s);
+        if (s == SIGCHLD || !t || !*t) continue;
+        if (on) (void)signal_norestart(s, shell_hosted_sigrelay);
+        else    (void)signal(s, shell_hosted_sigrelay);
+    }
+}
+
+/* A blocking call a signal interrupted (host.c): act on a fatal signal the
+ * EXIT trap is waiting for, which does not return; say whether a `wait` is
+ * over (1). */
+int shell_host_eintr(void) {
+    shell_termsig_check();
+    return shell_wait_intr_hit() ? 1 : 0;
+}
+
+/* SIGINT WHILE A SCRIPT WAITS FOR A FOREGROUND COMMAND (bash's
+ * wait_sigint_handler and the end of wait_for -- "wait and cooperative
+ * exit"). Run without job control, a command shares the shell's process
+ * group, and a ^C reaches both. bash notes the SIGINT and goes on waiting;
+ * then, if the command died OF it, the shell acts on it too (the INT trap,
+ * or the EXIT trap and death by SIGINT), and if the command caught it and
+ * ended otherwise -- an editor, a pager, a program with its own ^C -- the
+ * script goes on. tsh died the moment the signal came: with a kill -INT
+ * to the shell alone, or to the group with a child that caught it, bash
+ * finished the command and the script and tsh was gone (logs/b15 p6
+ * i1-i4). Not when INT is ignored; not for a shell at a terminal or under
+ * set -m. */
+static volatile int g_wait_sigint;
+static void shell_hosted_wait_sigint(int sig) { (void)sig; g_wait_sigint = 1; }
+struct shell_wce { bool on; void (*prev)(int); };
+static void shell_wce_begin(struct shell_wce *w) {
+    w->on = false;
+    w->prev = 0;
+    if (g_interactive || shell_job_control()) return;
+    g_wait_sigint = 0;
+    void (*prev)(int) = signal(SIGINT, shell_hosted_wait_sigint);
+    if (prev == SIG_IGN) {
+        (void)signal(SIGINT, SIG_IGN);
+        return;
+    }
+    w->on = true;
+    w->prev = prev;
+}
+static void shell_wce_end(struct shell_wce *w, bool died_of_int) {
+    if (!w->on) return;
+    w->on = false;
+    shell_sig_put(SIGINT, w->prev);
+    if (!g_wait_sigint) return;
+    g_wait_sigint = 0;
+    const char *t = shell_trap_live(SIGINT);
+    if (t && *t) {                       /* the trap runs, either way */
+        g_pending_signals[SIGINT] = 1;
+        return;
+    }
+    if (!died_of_int) return;            /* the command caught it */
+    shell_termsig_act(SIGINT);
+}
+
+/* WHAT A FORKED CHILD STARTS WITH (bash's restore_original_signals and
+ * reset_terminating_signals, in every subshell, $( ), pipeline element and
+ * asynchronous child): a signal the parent caught goes back to its original
+ * disposition, as do the INT and QUIT the shell handles itself, and the
+ * fatal-signal handlers are gone until the child sets an EXIT trap of its
+ * own. tsh's children kept the parent's relay while its trap was only on
+ * show, so the signal was swallowed: `trap 'echo t' USR1; ( kill -USR1
+ * $BASHPID; echo alive )` printed alive, where bash's subshell dies of it
+ * (138) -- the same for $( ) and a pipeline element (logs/b15 p7 s1 s2 s4);
+ * and every subshell of a script ignored QUIT (p5 q3 is bash's 131). */
+static void shell_child_signals(void) {
+    for (int s = 1; s < SIG_MAX; s++) {
+        if (!g_traps[s] || !g_traps[s][0]) continue;   /* caught ones */
+        void (*o)(int) = shell_sig_original(s);
+        (void)signal(s, o);
+        g_sig_orig[s] = o;
+        g_sig_orig_saved[s] = true;
+    }
+    if (!g_traps[SIGQUIT]) (void)signal(SIGQUIT, shell_sig_original(SIGQUIT));
+    if (!g_interactive && !g_traps[SIGINT])
+        (void)signal(SIGINT, shell_sig_original(SIGINT));
+    if (g_termsig_init) {
+        for (int i = 0; i < SH_NTERMSIGS; i++)
+            if (!g_traps[g_termsigs[i]])
+                (void)signal(g_termsigs[i], shell_sig_original(g_termsigs[i]));
+        g_termsig_init = false;
+    }
+    g_termsig_pending = 0;
+    g_termsig_handling = 0;
+    g_wait_intr_on = false;
+}
+
+/* INT AND QUIT IN A COMMAND THIS SHELL RUNS (bash's
+ * restore_original_signals, then setup_async_signals): each starts as it
+ * was when the shell started -- ignored if it was ignored then, or if
+ * `trap ''` ignores it now; the default otherwise -- and an asynchronous
+ * command run without job control ignores both. Only the async command
+ * ITSELF: what an async { } or ( ) runs inside gets the default, where
+ * tsh's spawns inherited the async child's ignore (logs/b15 p3 a3-a9:
+ * bash 0, tsh 6 in SigIgn). PAYLOAD says the spawn is that command, run
+ * where there was no job control at the `&` -- the async child's own
+ * shell_job_control() is off whatever its parent had (bash's
+ * without_job_control), so it cannot say; under `set -m` the job has its
+ * own group and keeps INT (logs/b15 p6 i3). */
+static bool g_async_payload;
+static void shell_spec_sigs(struct proc_spec *spec, bool payload) {
+    uint64_t dfl = 0, ign = 0;
+    for (int s = SIGINT; s <= SIGQUIT; s++) {
+        bool keep = g_sig_hard_ign[s] || (g_traps[s] && !g_traps[s][0]) ||
+                    payload;
+        if (keep) ign |= SIGMASK(s);
+        else      dfl |= SIGMASK(s);
+    }
+    spec->sig_default = dfl;
+    spec->sig_ignore = ign;
 }
 #else
 static void shell_trap_sync_kernel(int sig) { (void)sig; }
@@ -12812,8 +13055,14 @@ static int shell_job_poll_now(struct job *j) {
 /* The job's status, waiting for it if it is still running, and the job
  * leaves the table -- at a terminal it stays for the prompt to announce,
  * marked as already waited for. */
+/* shell_wait_job's answer when a trapped signal ended the wait (see
+ * g_wait_intr_on): the job is still running, and `wait` returns 128+N. */
+#define SHELL_WAIT_INTR (-1000)
 static int shell_wait_job(struct job *j) {
     if (!j || j->id == 0) return 127;
+#ifdef SHELL_HOSTED
+    if (!j->dead && shell_wait_intr_hit()) return SHELL_WAIT_INTR;
+#endif
     if (!j->dead && j->nproc > 1 && j->proc) {
         /* every process of the job, in order (bash's wait_for: until the
          * job is no longer running) */
@@ -12824,6 +13073,9 @@ static int shell_wait_job(struct job *j) {
             signal_set_foreground(p->pid);
             int rc = proc_wait(p->pid);
             signal_set_foreground(0);
+#ifdef SHELL_HOSTED
+            if (rc == -2) return SHELL_WAIT_INTR;      /* host.c's EINTR stop */
+#endif
             p->dead = true;
             p->stopped = false;
             if (rc < 0) { foreign++; continue; }
@@ -12848,6 +13100,9 @@ static int shell_wait_job(struct job *j) {
         signal_set_foreground(pid);
         int rc = proc_wait(pid);
         signal_set_foreground(0);
+#ifdef SHELL_HOSTED
+        if (rc == -2) return SHELL_WAIT_INTR;          /* host.c's EINTR stop */
+#endif
         if (rc < 0) {
             kprintf("wait: pid %d is not a child of this shell\n", pid);
             jobs_remove(j);
@@ -12960,6 +13215,13 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
         }
         if (!any) { shell_set_status(127); return; }
         if (g_shell_flow != SHELL_FLOW_NONE) return;     /* ^C, errexit */
+#ifdef SHELL_HOSTED
+        /* a fatal signal the EXIT trap waits for; a trapped one ends it */
+        if (shell_host_eintr()) {
+            shell_set_status(128 + g_wait_intr_sig);
+            return;
+        }
+#endif
         pit_sleep_ms(5);
     }
 }
@@ -12971,7 +13233,13 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
  * `wait $COPROC_PID; echo ${COPROC_PID-unset}` says unset (logs/b12 p80). */
 static void cmd_wait_in(int argc, char **argv);
 static void cmd_wait(int argc, char **argv) {
+#ifdef SHELL_HOSTED
+    shell_wait_intr(true);         /* a trapped signal ends it (POSIX) */
+#endif
     cmd_wait_in(argc, argv);
+#ifdef SHELL_HOSTED
+    shell_wait_intr(false);
+#endif
     shell_coproc_reap();
 }
 
@@ -13063,6 +13331,12 @@ static void cmd_wait_in(int argc, char **argv) {
             }
             if (!j) break;
             rc = shell_wait_job(j);
+#ifdef SHELL_HOSTED
+            if (rc == SHELL_WAIT_INTR) {
+                shell_set_status(128 + g_wait_intr_sig);
+                return;
+            }
+#endif
         }
         if (!(g_opt_monitor && g_interactive))
             for (int i = 0; i < JOB_MAX; i++)
@@ -13084,6 +13358,12 @@ static void cmd_wait_in(int argc, char **argv) {
         else if (j) (void)parse_int(argv[i], &pid);
         if (j) {
             rc = shell_wait_job(j);
+#ifdef SHELL_HOSTED
+            if (rc == SHELL_WAIT_INTR) {
+                shell_set_status(128 + g_wait_intr_sig);
+                return;
+            }
+#endif
         } else if (kind == 1) {
             kprintf("wait: `%s': not a pid or valid job spec\n", argv[i]);
             rc = 1;
@@ -18231,6 +18511,26 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     if (hist_raw) kfree(hist_raw);
     kfree(hx_text);
     g_hd_unit_cur = hd_saved_unit;
+#ifdef SHELL_HOSTED
+    /* a fatal signal that came with the last command still ends the shell
+     * by it: `trap ... EXIT; kill -TERM $$` as a script's last line */
+    if (run_exit_trap) shell_termsig_check();
+#endif
+    /* AND A TRAPPED ONE IS STILL TAKEN: bash runs the traps pending after
+     * every command, the last included -- `bash -c 'trap "echo t" USR1;
+     * kill -USR1 $$'` prints t, and a trap's `exit 4` is the status; tsh
+     * looked for them only before a NEXT command, so it said nothing and
+     * 0 -- and `trap "exit 0" INT; sleep 3 & wait` hit by ^C ended 130
+     * (logs/b15 p6 i4). */
+    if (run_exit_trap && g_shell_flow == SHELL_FLOW_NONE) {
+        g_last_status = last;
+        shell_check_pending_signals();
+        if (g_shell_flow == SHELL_FLOW_EXIT) {
+            last = g_shell_flow_status;
+            g_shell_flow = SHELL_FLOW_NONE;
+            g_shell_flow_status = 0;
+        }
+    }
     if (run_exit_trap) last = shell_run_exit_trap(last);
     if (g_noexec_error) last = g_noexec_error;
     g_noexec_error = saved_noexec;
@@ -19106,6 +19406,29 @@ static void shell_print_quoted_trap_action(const char *action) {
     shell_putc('\'');
 }
 
+/* What a listing shows for condition I: its trap, or -- for a signal
+ * ignored when the shell started -- the ignore (bash's showtrap). */
+static const char *shell_trap_listed(int i) {
+    if (g_traps[i]) return g_traps[i];
+#ifdef SHELL_HOSTED
+    if (shell_sig_hard(i)) return "";
+#endif
+    return 0;
+}
+
+#ifdef SHELL_HOSTED
+/* bash's `trap - INT` in a non-interactive shell: INT is the shell's to
+ * die of again -- with the EXIT trap once one has armed the fatal signals
+ * -- even where it was ignored, in an asynchronous child (p2 v2: bash's
+ * child dies of `kill -INT $BASHPID`, tsh's said after) or at entry (p3
+ * c1 c2, 130: trap.def's REVERT case asks "should we do this if original
+ * disposition was SIG_IGN?" and does). */
+static void shell_int_revert(void) {
+    if (g_termsig_init) (void)signal_norestart(SIGINT, shell_hosted_termsig);
+    else (void)signal(SIGINT, SIG_DFL);
+}
+#endif
+
 static void cmd_trap(int argc, char **argv) {
     shell_set_status(0);
     /* `trap -- ACTION COND...`: the separator is accepted and ignored. It was
@@ -19139,24 +19462,26 @@ static void cmd_trap(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-            if (!g_traps[sig]) continue;
+            const char *act = shell_trap_listed(sig);
+            if (!act) continue;
             bool pseudo = (sig == 0 || sig >= SHELL_TRAP_ERR);
             shell_printf("trap -- ");
-            shell_print_quoted_trap_action(g_traps[sig]);
+            shell_print_quoted_trap_action(act);
             shell_printf(" %s%s\n", pseudo ? "" : "SIG", shell_trap_name(sig));
         }
         return;
     }
     if (argc <= 1 || print_only) {
         for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
-            if (!g_traps[i]) continue;
+            const char *act = shell_trap_listed(i);
+            if (!act) continue;
             const char *name = shell_trap_name(i);
             if (!name) continue;
             /* bash prints real signals with the SIG prefix (SIGUSR1, not
              * USR1); the pseudo-conditions EXIT and ERR carry none. */
             bool pseudo = (i == 0 || i >= SHELL_TRAP_ERR);
             shell_printf("trap -- ");
-            shell_print_quoted_trap_action(g_traps[i]);
+            shell_print_quoted_trap_action(act);
             shell_printf(" %s%s\n", pseudo ? "" : "SIG", name);
         }
         return;
@@ -19203,8 +19528,26 @@ static void cmd_trap(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+#ifdef SHELL_HOSTED
+        /* IGNORED AT ENTRY: neither trapped nor reset, and nothing said
+         * (see g_sig_hard_ign) -- bar bash's `trap - INT`. */
+        if (shell_sig_hard(sig)) {
+            if (reset && sig == SIGINT) shell_int_revert();
+            continue;
+        }
+#endif
         shell_trap_unset(sig);       /* `trap -`: the disposition goes back */
-        if (reset) continue;
+        if (reset) {
+#ifdef SHELL_HOSTED
+            /* ...to what bash puts back for the two it handles itself:
+             * INT to die of (shell_int_revert), and QUIT ignored -- every
+             * bash ignores it, and `trap - QUIT` says so again (p3 d1 d2:
+             * bash lives through kill -QUIT $$, tsh died 131). */
+            if (sig == SIGINT && !g_interactive) shell_int_revert();
+            else if (sig == SIGQUIT) shell_host_quit_ignore();
+#endif
+            continue;
+        }
         g_traps[sig] = shell_strdup(action);
         if (!g_traps[sig]) {
             shell_set_status(1);
@@ -19212,6 +19555,9 @@ static void cmd_trap(int argc, char **argv) {
         }
         /* EXIT/ERR/DEBUG/RETURN are not signals; the sync ignores them. */
         shell_trap_sync_kernel(sig);
+#ifdef SHELL_HOSTED
+        if (sig == 0 && action[0]) shell_termsig_init();
+#endif
     }
 }
 
@@ -24729,6 +25075,15 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         SH_SPEC_UMASK,
     };
 #ifdef SHELL_HOSTED
+    /* INT and QUIT as bash's child has them: the asynchronous command
+     * itself -- the async child's one simple command, not one a function
+     * or `exec` runs -- ignores both (shell_spec_sigs). */
+    {
+        bool payload = (background && !shell_job_control()) ||
+                       (g_async_payload && g_fn_depth == 0 && !g_spawn_for);
+        g_async_payload = false;
+        shell_spec_sigs(&spec, payload);
+    }
     /* THE BACKGROUND CHILD EXECS ITS ONE EXTERNAL instead of spawning it
      * and waiting -- so the job is one process and `$!` names it. Only
      * when the child's whole text was that one simple command, only in the
@@ -24831,6 +25186,10 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         return frc;
     }
     signal_set_foreground(pid);
+#ifdef SHELL_HOSTED
+    struct shell_wce wce;
+    shell_wce_begin(&wce);
+#endif
     int rc = proc_wait(pid);
     signal_set_foreground(0);
     int fsig = proc_last_term_sig();
@@ -24853,6 +25212,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         shell_report_job_death(pid, fsig, shown ? shown : text ? text : argv[0], true);
         g_shell_lineno = sl;
     }
+#ifdef SHELL_HOSTED
+    shell_wce_end(&wce, fsig == SIGINT);      /* a ^C the shell saw too */
+#endif
     return rc;
 }
 
@@ -25128,6 +25490,8 @@ static int shell_fork(void) {
     int pid = fork();
     if (pid == 0) {
         g_replace_ok = true;
+        g_async_payload = false;
+        shell_child_signals();
         if (shell_host_take_term_noop()) {
             if (g_sig_orig_saved[SIGTERM]) g_sig_orig[SIGTERM] = SIG_DFL;
             else (void)signal(SIGTERM, SIG_DFL);
@@ -25374,7 +25738,10 @@ static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
         }
     }
     file_close(r);
+    struct shell_wce wce;
+    shell_wce_begin(&wce);
     int st = proc_wait(pid);
+    shell_wce_end(&wce, proc_last_term_sig() == SIGINT);
     g_capture_last_status = st < 0 ? 1 : st;
     while (out->len > 0 && out->p[out->len - 1] == '\n')
         sb_truncate(out, out->len - 1);
@@ -36698,6 +37065,9 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
             g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
                                                    stages[i] + strlen(stages[i]));
             g_bg_simple_child = g_bg_exec_ok;
+#ifdef SHELL_HOSTED
+            g_async_payload = g_bg_exec_ok && !jc;   /* see shell_spec_sigs */
+#endif
             bool exit_trap = shell_child_runs_exit_trap(stages[i], true, true);
             if (exit_trap) g_io_keep_depth = g_exec_line_depth + 1;
             execute_line_text(stages[i]);
@@ -36791,6 +37161,11 @@ static void shell_async_child_body(const char *text, bool async_ign,
      * shell_bg_text_is_simple and proc_exec_in_place. */
     g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
     g_bg_simple_child = g_bg_exec_ok;
+#ifdef SHELL_HOSTED
+    /* see shell_spec_sigs: only where INT and QUIT are ignored here, i.e.
+     * the parent had no job control when it started this one */
+    g_async_payload = g_bg_exec_ok && async_ign;
+#endif
     /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
      * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
      * one print bye in bash; an async `for` or and-or list does not
@@ -38057,12 +38432,20 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     int rc = 0;
     int failed = 0;
     bool waited_any = false;
+#ifdef SHELL_HOSTED
+    struct shell_wce wce;
+    shell_wce_begin(&wce);
+    bool any_int = false;               /* any element died of SIGINT */
+#endif
     for (int i = 0; i < pl->count; i++) {
         int stage_rc = stage_status[i];
         if (has_pid[i]) {
             signal_set_foreground(pids[i]);
             stage_rc = proc_wait(pids[i]);
             waited_any = true;
+#ifdef SHELL_HOSTED
+            if (proc_last_term_sig() == SIGINT) any_int = true;
+#endif
         }
         stage_status[i] = stage_rc;
         if (stage_rc != 0) failed = stage_rc;
@@ -38070,6 +38453,9 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     }
     /* the end of a foreground wait: bash's notify (p93 v7, p103) */
     if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
+#ifdef SHELL_HOSTED
+    shell_wce_end(&wce, any_int);
+#endif
     shell_set_pipestatus(stage_status, pl->count);
     /* `set -o pipefail`: the rightmost FAILING stage decides. */
     if (g_opt_pipefail && failed != 0) rc = failed;
@@ -42277,9 +42663,12 @@ static bool shell_try_subshell_command(const char *src) {
     if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
         int pid = shell_fork();
         if (pid > 0) {
+            struct shell_wce wce;
+            shell_wce_begin(&wce);
             int rc = proc_wait(pid);
             if (rc < 0) rc = 1;
             int sig = proc_last_term_sig();
+            shell_wce_end(&wce, sig == SIGINT);
             /* what died meanwhile first, as after a program (p93 v5) */
             unsigned long bl = shell_bash_lnum();
             shell_jobs_notify(bl, SHELL_NOTIFY_WAITED);
@@ -43382,16 +43771,27 @@ static bool shell_try_compound_pipeline(const char *src) {
     /* Collect the children AFTER every write end is closed, or a stage that
      * is still writing has nobody to read it and none of them ever finish. */
     bool waited_any = false;
+#ifdef SHELL_HOSTED
+    struct shell_wce wce;
+    shell_wce_begin(&wce);
+    bool any_int = false;               /* any element died of SIGINT */
+#endif
     for (int i = 0; i < n; i++) {
         if (cpids[i] <= 0) continue;
         int wrc = proc_wait(cpids[i]);
         waited_any = true;
+#ifdef SHELL_HOSTED
+        if (proc_last_term_sig() == SIGINT) any_int = true;
+#endif
         if (wrc != 0) failed = wrc;
         if (i + 1 == n) last = wrc;
         if (pst) pst[i] = wrc;
     }
     /* the end of a foreground wait: bash's notify (p103) */
     if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
+#ifdef SHELL_HOSTED
+    shell_wce_end(&wce, any_int);
+#endif
     {
         const char *ls = n > 0 ? stages[n - 1] : "";
         while (*ls == ' ' || *ls == '\t') ls++;
