@@ -971,10 +971,24 @@ int host_file_move_fd(struct file *f, int want) {
 int host_input_ready(struct file *f, long timeout_ms) {
     int fd = f ? VF_FD(&f->vfs) : -1;
     if (fd < 0) return 1;
-    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-    int r = poll(&pfd, 1, (int)timeout_ms);
-    if (r < 0) return 1;
-    return r > 0 ? 1 : 0;
+    /* A signal ends the poll (it is never restarted, as on Linux): the
+     * shell acts on a fatal one the EXIT trap waits for, and the wait goes
+     * on for what is left of the timeout -- bash's `read -t 3` with a
+     * trapped USR1 at 1 s still times out at 3 (logs/b15 p6 r3, WSL). */
+    uint64_t end = perf_now_ns() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0) * 1000000ull;
+    for (;;) {
+        long left = timeout_ms;
+        if (timeout_ms > 0) {
+            uint64_t now = perf_now_ns();
+            left = now >= end ? 0 : (long)((end - now + 999999ull) / 1000000ull);
+        }
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int r = poll(&pfd, 1, (int)left);
+        if (r > 0) return 1;
+        if (r == 0) return 0;
+        if (errno != EINTR) return 1;
+        (void)shell_host_eintr();
+    }
 }
 
 int proc_exec_in_place(const struct proc_spec *spec) {

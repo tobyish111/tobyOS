@@ -1505,6 +1505,10 @@ struct file;
 static bool g_rl_nul_cuts;       /* see shell_read_line_from_file */
 /* The failed read's return, for `read`'s "read error: FD: REASON". */
 static long g_rl_err;
+/* `read -t`: when the line must be in by (perf_now_ns), 0 for no limit;
+ * shell_read_line_from_file returns 2 when it passes. */
+static uint64_t g_rl_deadline_ns;
+static int shell_read_wait_ready(struct file *in, long timeout_ms);
 static const char *shell_io_errtext(const struct file *f, long rv);
 static int shell_read_line_from_file(struct file *in, bool raw,
                                      struct shell_sb *out,
@@ -11360,8 +11364,17 @@ static int shell_read_line_from_file(struct file *in, bool raw,
             nch++;                                                            \
         }                                                                     \
     } while (0)
+    bool timed_out = false;
     for (;;) {
         if (maxchars >= 0 && nch >= maxchars) { escaped = false; break; }
+        /* `read -t`: the line's deadline (g_rl_deadline_ns) -- each byte
+         * waits only for what is left of it */
+        if (g_rl_deadline_ns) {
+            uint64_t now = perf_now_ns();
+            long left = now >= g_rl_deadline_ns ? 0
+                      : (long)((g_rl_deadline_ns - now + 999999ull) / 1000000ull);
+            if (!shell_read_wait_ready(in, left)) { timed_out = true; break; }
+        }
         char c = 0;
         long n = file_read(in, &c, 1);
         if (n < 0) { g_rl_err = n; return -1; }
@@ -11388,6 +11401,7 @@ static int shell_read_line_from_file(struct file *in, bool raw,
 
     if (!raw && escaped) SH_RL_PUT('\\', false);
 #undef SH_RL_PUT
+    if (timed_out) return 2;
     return hit_eof ? 1 : 0;
 }
 
@@ -11715,6 +11729,11 @@ static void cmd_read(int argc, char **argv) {
             shell_set_status(142);          /* 128 + SIGALRM, as bash */
             return;
         }
+        /* THE TIMEOUT IS FOR THE WHOLE LINE, not its first byte: with
+         * `{ printf ab; sleep 3; echo c; } | read -t 1 x` bash gives up at
+         * one second with x=ab and 142; tsh waited for the newline and
+         * said x=abc, 0 (shell_read_line_from_file) */
+        g_rl_deadline_ns = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
     }
 
     SH_SB(linesb);
@@ -11722,6 +11741,9 @@ static void cmd_read(int argc, char **argv) {
     bool got_any = false;
     int rr = shell_read_line_from_file(in, raw, &linesb, &got_any, delim,
                                        raw ? 0 : &escsb, maxchars, exact);
+    g_rl_deadline_ns = 0;
+    bool timed_out = rr == 2;
+    if (timed_out) rr = 0;
     if (tmp_console) file_close(tmp_console);
     if (rr < 0) {
         /* bash: "read: read error: 0: Is a directory" -- the descriptor
@@ -11749,7 +11771,7 @@ static void cmd_read(int argc, char **argv) {
         if (array_name) { sh_array_unset(array_name); (void)sh_array_create(array_name); }
         else if (reply_mode) (void)env_set("REPLY", "");
         else (void)shell_read_assign_empty(argc, argv, first);
-        shell_set_status(1);
+        shell_set_status(timed_out ? 142 : 1);
         return;
     }
 
@@ -11767,7 +11789,8 @@ static void cmd_read(int argc, char **argv) {
         rc = shell_read_assign_fields(argc, argv, first, linebuf,
                                       raw ? 0 : escmap);
     }
-    shell_set_status(rc ? rc : (rr == 1 ? 1 : 0));
+    /* timed out: what had come is assigned, and the status is 142 */
+    shell_set_status(rc ? rc : timed_out ? 142 : (rr == 1 ? 1 : 0));
 }
 
 static void cmd_pwd(int argc, char **argv) {
