@@ -12027,6 +12027,49 @@ static const char *shell_errno_text(int err);
 /* The name cd's messages carry: pushd and popd run it under theirs. */
 static const char *g_cd_who = "cd";
 
+/* bash's PATH_CHECKDOTDOT, for a logical cd: walking TARGET by its text --
+ * from LPWD when it is relative -- each `..` must back out of a directory
+ * (a link to one will do). VFS_OK, or why not: a missing component is
+ * ENOENT, a file ENOTDIR. A path too long to check is let through. */
+static int shell_cd_check_dotdot(const char *target, const char *lpwd) {
+    if (!target || target[0] == '~') return VFS_OK;
+    char full[VFS_PATH_MAX];
+    if (target[0] == '/') {
+        if (ksnprintf(full, sizeof full, "%s", target) >= (int)sizeof full) return VFS_OK;
+    } else if (ksnprintf(full, sizeof full, "%s/%s", lpwd, target) >= (int)sizeof full) {
+        return VFS_OK;
+    }
+    char cur[VFS_PATH_MAX];
+    size_t cl = 0;                             /* cur[0..cl) -- "" is "/" */
+    for (const char *s = full; *s; ) {
+        while (*s == '/') s++;
+        if (!*s) break;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t n = (size_t)(e - s);
+        if (n == 2 && s[0] == '.' && s[1] == '.') {
+            struct vfs_stat st;
+            cur[cl] = '\0';
+#ifdef SHELL_HOSTED
+            int rc = vfs_stat(cl ? cur : "/", &st);
+#else
+            int rc = vfs_stat_follow(cl ? cur : "/", &st);
+#endif
+            if (rc != VFS_OK) return rc;
+            if (st.type != VFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+            while (cl > 0 && cur[cl - 1] != '/') cl--;
+            if (cl > 0) cl--;
+        } else if (!(n == 1 && s[0] == '.')) {
+            if (cl + 1 + n + 1 > sizeof cur) return VFS_OK;
+            cur[cl++] = '/';
+            memcpy(cur + cl, s, n);
+            cl += n;
+        }
+        s = e;
+    }
+    return VFS_OK;
+}
+
 static void cmd_cd(int argc, char **argv) {
     if (g_restricted) {                         /* bash: "cd: restricted" */
         kprintf("cd: restricted\n");
@@ -12152,6 +12195,16 @@ static void cmd_cd(int argc, char **argv) {
 #else
     int rc = vfs_stat_follow(path, &st);
 #endif
+    /* A LOGICAL `..` BACKS OUT OF A DIRECTORY, or the cd fails: bash's
+     * canonicalization checks what each `..` leaves (PATH_CHECKDOTDOT),
+     * and when that fails it tries the path as written, which the kernel
+     * walks -- `cd nonexistent_ZZ/..` is "No such file or directory", 1
+     * (Oils 0719, a POSIX case). tsh took the text alone and went to the
+     * directory it named. */
+    if (rc == VFS_OK && !cd_physical && !print_new) {
+        int dc = shell_cd_check_dotdot(target, lpwd);
+        if (dc != VFS_OK) rc = dc;
+    }
     /* bash's words (S12): "cd: DIR: No such file or directory", the operand
      * as typed and the C library's text. */
     if (rc != VFS_OK) {
