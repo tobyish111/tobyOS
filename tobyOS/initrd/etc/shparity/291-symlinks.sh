@@ -18,6 +18,10 @@ done
 test -c /dev/stdin < /dev/null && echo "stdin char"
 echo | { test -p /dev/stdin && echo "stdin pipe"; }
 test -f /dev/stdin < f && echo "stdin file"
+[ -e /dev/stdin ] && echo "stdin exists"; [ -e /dev/stderr ] && echo "stderr exists"
+[ -e /dev/fd/7 ] || echo "fd 7 is not open"
+[ -t 1 ] || echo "stdout not a tty"; [ -t 0 ] < f || echo "file not a tty"
+echo | { [ -t 0 ] || echo "pipe not a tty"; }; [ -t 7 ] || echo "fd 7 not a tty"
 echo "== readlink"; readlink l dang dl /dev/stdin /dev/stdout /dev/fd
 readlink /proc/self/fd/0 < f
 exec 3< f; readlink /proc/$$/fd/3; exec 3<&-

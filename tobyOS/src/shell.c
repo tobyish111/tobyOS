@@ -20542,16 +20542,23 @@ static int test_one(const char *a) { return a[0] != '\0' ? 0 : 1; }
 
 /* Is `fd` a terminal?
  *
- * The kernel has no tty syscall, so the hosted shell asks whether the
- * descriptor can SEEK: a file can, a console cannot. That is exactly right
- * for the two cases that matter -- `[ -t 1 ]` under the conformance gate,
- * whose stdout is a capture file, and at an interactive prompt -- and
- * over-reports a pipe as a terminal, which the previous answer ("fd 0, 1 and
- * 2 are always terminals") did as well, along with every file. */
+ * The hosted shell asks the terminal ioctl (isatty: TCGETS) about the
+ * BUILTIN's descriptor fd -- what a redirection on `test` or the pipe it
+ * stands in leaves there, which may not be this process's fd. It asked
+ * whether the process's fd could SEEK, taking a pipe for a terminal: under
+ * an SSH command, which now runs on pipes (finding 69), `[ -t 0 ]` said
+ * yes where bash says no. */
 static int test_fd_is_tty(long fd) {
     if (fd < 0) return 0;
 #ifdef SHELL_HOSTED
-    return lseek((int)fd, 0, 1 /* SEEK_CUR */) < 0 ? 1 : 0;
+    extern int host_file_fd(struct file *f);
+    extern int isatty(int fd);
+    if (fd > 100000) return 0;
+    struct file *f = shell_builtin_fd((int)fd);
+    /* an empty 0, 1 or 2 is the process's own (shell_init_hosted adopts
+     * only what is above them) */
+    int hfd = f ? host_file_fd(f) : (fd <= 2 ? (int)fd : -1);
+    return hfd >= 0 && isatty(hfd) ? 1 : 0;
 #else
     struct file *f = file_std_handle((int)fd);
     return (f && f->kind == FILE_KIND_CONSOLE) ? 1 : 0;
@@ -20615,7 +20622,17 @@ static int test_magic_fd(const char *p) {
  * and *out, an error for a closed descriptor, or 1 for "ask the path". */
 static int test_fd_stat(int n, struct vfs_stat *out) {
     struct file *f = shell_builtin_fd(n);
-    if (!f) return VFS_ERR_NOENT;
+    if (!f) {
+        if (n > 2) return VFS_ERR_NOENT;           /* not open */
+#ifdef SHELL_HOSTED
+        return 1;     /* the process's own 0, 1 or 2: the path says it all */
+#else
+        memset(out, 0, sizeof *out);               /* the console */
+        out->type = VFS_TYPE_FILE;
+        out->mode = 0020620u | VFS_MODE_VALID;
+        return VFS_OK;
+#endif
+    }
 #ifdef SHELL_HOSTED
     extern int host_file_vstat(struct file *f, struct vfs_stat *out);
     return host_file_vstat(f, out);
