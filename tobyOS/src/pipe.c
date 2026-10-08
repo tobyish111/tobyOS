@@ -305,7 +305,15 @@ static struct fifo *fifo_find(const char *kpath, uint32_t dev, uint64_t ino) {
 }
 
 /* Park on the FIFO until the other end has opened (its counter moves) or
- * is open; false when a signal that acts ended the wait. */
+ * is open; false when a signal that acts ended the wait.
+ *
+ * THE OTHER END'S COMING IS LOOKED AT BEFORE THE SIGNAL, after every wake,
+ * as Linux's wait_for_partner does. A writer that opened, wrote, closed
+ * and EXITED while the reader slept leaves the reader's SIGCHLD pending
+ * too; asked first, the signal ended the open with EINTR, SA_RESTART
+ * opened again, and the new open waited for a writer that had already
+ * been -- bash's `( ... > fifo ) & while read ...; done < fifo` hung for
+ * good in the shparity gate (fixture 297 f9). */
 static bool fifo_wait_other(struct fifo *ff, bool want_writer) {
     uint32_t start = want_writer ? ff->w_opens : ff->r_opens;
     struct proc *self = current_proc();
@@ -319,7 +327,6 @@ static bool fifo_wait_other(struct fifo *ff, bool want_writer) {
         wq_add(&ff->wq, self);
         self->state = PROC_BLOCKED;
         sched_yield();
-        if (SIG_SHOULD_EINTR(self)) { ff->waiting--; return false; }
     }
     ff->waiting--;
     return true;
