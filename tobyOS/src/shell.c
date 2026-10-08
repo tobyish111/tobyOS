@@ -11793,9 +11793,47 @@ static void cmd_read(int argc, char **argv) {
     shell_set_status(rc ? rc : timed_out ? 142 : (rr == 1 ? 1 : 0));
 }
 
+static void shell_help_topic(const char *name);
+
+/* The directory as the shell names it -- $PWD, the LOGICAL path `cd`
+ * took, symbolic links and all -- while it still names the directory the
+ * shell is in; the physical one otherwise. bash's
+ * the_current_working_directory. They were the same thing until tobyOS had
+ * symbolic links to directories. */
+static const char *shell_logical_pwd(void) {
+    const char *phys = shell_cwd();
+    const char *pwd = env_get("PWD");
+    if (!pwd || pwd[0] != '/') return phys;
+    if (strcmp(pwd, phys) == 0) return pwd;
+    struct vfs_stat a, b;
+#ifdef SHELL_HOSTED
+    if (vfs_stat(pwd, &a) != VFS_OK || vfs_stat(phys, &b) != VFS_OK) return phys;
+#else
+    if (vfs_stat_follow(pwd, &a) != VFS_OK || vfs_stat_follow(phys, &b) != VFS_OK)
+        return phys;
+#endif
+    if (a.ino && a.ino == b.ino && a.dev == b.dev) return pwd;
+    return phys;
+}
+
+/* pwd [-LP]: the logical directory, or with -P (or `set -P`) the
+ * physical one -- the last option winning; operands are ignored (bash). It
+ * printed the physical directory whatever was asked, which differs from
+ * bash's after `cd` through a link (logs/b15 lk3). */
 static void cmd_pwd(int argc, char **argv) {
-    (void)argc; (void)argv;
-    shell_printf("%s\n", shell_cwd());   /* a RESULT: stdout */
+    struct sh_igo g;
+    sh_igo_init(&g, "pwd", argc, argv);
+    bool physical = g_opt_physical;
+    int c;
+    while ((c = sh_igo_next(&g, "LP")) != -1) {
+        if (c == 'L') { physical = false; continue; }
+        if (c == 'P') { physical = true; continue; }
+        if (c == SH_IGO_HELP) shell_help_topic("pwd");
+        else sh_builtin_usage("pwd");
+        shell_set_status(2);
+        return;
+    }
+    shell_printf("%s\n", physical ? shell_cwd() : shell_logical_pwd());
     shell_set_status(0);
 }
 
@@ -11814,6 +11852,10 @@ static void cmd_cd(int argc, char **argv) {
     shell_set_status(0);
     const char *target = 0;
     bool print_new = false;
+    /* -P, or `set -P`: the physical path, every link resolved, becomes
+     * $PWD; -L (the default): the path as written, relative to $PWD. They
+     * differ now that tobyOS has links to directories. */
+    bool cd_physical = g_opt_physical;
     /* bash's options, as internal_getopt reads them ("eLP"): -L and -P,
      * the last winning, and -e, combined as they like -- `-Pe`, `-L -P`;
      * `--` ends them and `-` alone is the operand. Any other letter is
@@ -11828,7 +11870,9 @@ static void cmd_cd(int argc, char **argv) {
         if (a[0] != '-' || !a[1]) break;
         if (strcmp(a, "--") == 0) { k++; break; }
         for (const char *q = a + 1; *q; q++) {
-            if (*q == 'L' || *q == 'P' || *q == 'e') continue;
+            if (*q == 'L') { cd_physical = false; continue; }
+            if (*q == 'P') { cd_physical = true; continue; }
+            if (*q == 'e') continue;
             kprintf("%s: -%c: invalid option\n", g_cd_who, *q);
             if (strcmp(g_cd_who, "cd") == 0)
                 kprintf_raw("cd: usage: cd [-L|[-P [-e]] [-@]] [dir]\n");
@@ -11857,13 +11901,23 @@ static void cmd_cd(int argc, char **argv) {
         }
         print_new = true;
     } else {
-        /* -L is the default and -P differs only where symlinks exist, which
-         * this VFS does not resolve */
         target = argv[1];
     }
 
     char path[VFS_PATH_MAX];
-    if (shell_resolve_path_arg(target, path, sizeof(path), "cd") < 0) return;
+    /* LOGICAL: a relative operand is taken from $PWD -- `cd ..` from a
+     * linked directory goes to the link's parent, as bash's does -- unless
+     * -P asks for the physical one */
+    const char *lpwd = shell_logical_pwd();
+    if (!cd_physical && target[0] != '/' && target[0] != '~' &&
+        strcmp(lpwd, shell_cwd()) != 0) {
+        char rel[VFS_PATH_MAX];
+        if (ksnprintf(rel, sizeof rel, "%s/%s", lpwd, target) >= (int)sizeof rel ||
+            shell_resolve_path_arg(rel, path, sizeof(path), "cd") < 0)
+            return;
+    } else if (shell_resolve_path_arg(target, path, sizeof(path), "cd") < 0) {
+        return;
+    }
 
     /* CDPATH: a RELATIVE operand that is not `.` or `..` is looked for under
      * each CDPATH entry first, and when one of those is used the new
@@ -11903,7 +11957,11 @@ static void cmd_cd(int argc, char **argv) {
     }
 
     struct vfs_stat st;
-    int rc = vfs_stat(path, &st);
+#ifdef SHELL_HOSTED
+    int rc = vfs_stat(path, &st);              /* libtoby's stat follows */
+#else
+    int rc = vfs_stat_follow(path, &st);
+#endif
     /* bash's words (S12): "cd: DIR: No such file or directory", the operand
      * as typed and the C library's text. */
     if (rc != VFS_OK) {
@@ -11917,7 +11975,15 @@ static void cmd_cd(int argc, char **argv) {
         return;
     }
 
-    const char *old = shell_cwd();
+    /* the directory the shell was in AS IT NAMED IT -- the old $PWD */
+    char old[VFS_PATH_MAX];
+    {
+        const char *o = shell_logical_pwd();
+        size_t ol = strlen(o);
+        if (ol >= sizeof old) ol = sizeof old - 1;
+        memcpy(old, o, ol);
+        old[ol] = '\0';
+    }
     (void)env_set("OLDPWD", old);
     /* OLDPWD is in the ENVIRONMENT, not just the variable table -- POSIX says
      * cd exports it, and `env | grep OLDPWD` shows it in every shell. Since
@@ -11929,9 +11995,11 @@ static void cmd_cd(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    /* -P: $PWD is where it really is, links resolved */
+    if (cd_physical) (void)env_set("PWD", shell_cwd());
     /* STDOUT. `cd -` reports where it went, and that report is output, not a
      * diagnostic -- it was going to stderr, where a script cannot capture it. */
-    if (print_new) shell_printf("%s\n", path);
+    if (print_new) shell_printf("%s\n", cd_physical ? shell_cwd() : path);
 }
 
 static void cmd_true(int argc, char **argv) {
@@ -20493,6 +20561,53 @@ static bool test_access_ok(const struct vfs_stat *st, unsigned want) {
     return (bits & want) != 0;
 }
 
+/* /dev/stdin, /dev/stdout, /dev/stderr, /dev/fd/N and /proc/self/fd/N name
+ * the shell's descriptor N: its number, or -1. */
+static int test_magic_fd(const char *p) {
+    if (strcmp(p, "/dev/stdin") == 0)  return 0;
+    if (strcmp(p, "/dev/stdout") == 0) return 1;
+    if (strcmp(p, "/dev/stderr") == 0) return 2;
+    const char *q = 0;
+    if (strncmp(p, "/dev/fd/", 8) == 0) q = p + 8;
+    else if (strncmp(p, "/proc/self/fd/", 14) == 0) q = p + 14;
+    if (!q || !*q) return -1;
+    long n = 0;
+    for (; *q; q++) {
+        if (*q < '0' || *q > '9' || n > 100000) return -1;
+        n = n * 10 + (*q - '0');
+    }
+    return (int)n;
+}
+
+/* stat of what the BUILTIN's descriptor N is: bash's `test` runs in a
+ * process whose fds its redirections really moved, so `test -p
+ * /dev/stdin` in a pipe and `test -f /dev/stdin < f` are true there. tsh
+ * keeps a builtin's redirections and pipe ends in its own fd table, which
+ * stat(2) of the path never sees: both were false (logs/b15 291). VFS_OK
+ * and *out, an error for a closed descriptor, or 1 for "ask the path". */
+static int test_fd_stat(int n, struct vfs_stat *out) {
+    struct file *f = shell_builtin_fd(n);
+    if (!f) return VFS_ERR_NOENT;
+#ifdef SHELL_HOSTED
+    extern int host_file_vstat(struct file *f, struct vfs_stat *out);
+    return host_file_vstat(f, out);
+#else
+    memset(out, 0, sizeof *out);
+    out->type = VFS_TYPE_FILE;
+    if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W) {
+        out->mode = 0010600u | VFS_MODE_VALID;              /* S_IFIFO */
+        return VFS_OK;
+    }
+    if (f->kind == FILE_KIND_CONSOLE || f->kind == FILE_KIND_PTY_SLAVE ||
+        f->kind == FILE_KIND_PTY_MASTER) {
+        out->mode = 0020620u | VFS_MODE_VALID;              /* S_IFCHR */
+        return VFS_OK;
+    }
+    if (f->open_path) return vfs_stat_follow(f->open_path, out);
+    return 1;
+#endif
+}
+
 static int test_unary(const char *op, const char *operand) {
     /* `-R NAME`: is NAME a nameref with a value -- the reference itself,
      * not what it names (bash's find_variable_noref). A unary operator tsh
@@ -20567,7 +20682,24 @@ static int test_unary(const char *op, const char *operand) {
     if (shell_canonicalize_path(operand, resolved, sizeof(resolved)) < 0)
         return 1;
     struct vfs_stat st;
-    if (vfs_stat(resolved, &st) != VFS_OK) {
+    /* -h and -L ask about a LINK, every other operator about what it names
+     * (bash: lstat for those two, stat for the rest). Both were hard-wired
+     * false -- nothing could lstat -- and the rest asked about the link
+     * where it was the file in the kernel shell (finding 87). /bin/tsh's
+     * vfs_stat is libtoby's stat, which follows; vfs_lstat is lstat. */
+    bool want_link = (op2 == 'L' || op2 == 'h') && op[2] == '\0';
+    int mfd = want_link ? -1 : test_magic_fd(resolved);
+    int st_rc = mfd >= 0 ? test_fd_stat(mfd, &st) : 1;
+    if (st_rc == 1) {
+#ifdef SHELL_HOSTED
+        extern int vfs_lstat(const char *path, struct vfs_stat *out);
+        st_rc = want_link ? vfs_lstat(resolved, &st) : vfs_stat(resolved, &st);
+#else
+        st_rc = want_link ? vfs_stat(resolved, &st)
+                          : vfs_stat_follow(resolved, &st);
+#endif
+    }
+    if (st_rc != VFS_OK) {
 #ifndef SHELL_HOSTED
         /* THE KERNEL SHELL ASKS THE SAME TABLE sys_stat DOES.
          *
@@ -20597,7 +20729,7 @@ static int test_unary(const char *op, const char *operand) {
                             (fmt == 0 || fmt == 0100000u)) ? 0 : 1;
     if (op2 == 'd') return st.type == VFS_TYPE_DIR ? 0 : 1;
     if (op2 == 's') return st.size > 0 ? 0 : 1;
-    if (op2 == 'L' || op2 == 'h') return 1;         /* no symlinks in vfs_stat */
+    if (want_link) return st.type == VFS_TYPE_SYMLINK ? 0 : 1;
     if (op2 == 'c') return fmt == 0020000u ? 0 : 1; /* S_IFCHR */
     if (op2 == 'b') return fmt == 0060000u ? 0 : 1; /* S_IFBLK */
     if (op2 == 'p') return fmt == 0010000u ? 0 : 1; /* S_IFIFO */

@@ -670,13 +670,13 @@ long vfs_read(struct vfs_file *f, void *buf, size_t n) {
     return got;
 }
 
-int vfs_stat(const char *path, struct vfs_stat *out) {
-    if (!path || !out) return VFS_ERR_INVAL;
-    struct stat st;
-    if (stat(path, &st) != 0) return errno_to_vfs();
+/* struct stat into the shell's vfs_stat: for stat (vfs_stat, which
+ * follows a link, as libtoby's stat does now) and lstat (vfs_lstat). */
+static int host_vstat(const struct stat *stp, struct vfs_stat *out) {
     memset(out, 0, sizeof *out);
-    out->size = (size_t)st.st_size;
-    out->type = S_ISDIR(st.st_mode) ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    out->size = (size_t)stp->st_size;
+    out->type = S_ISDIR(stp->st_mode) ? VFS_TYPE_DIR :
+                S_ISLNK(stp->st_mode) ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
     /* Keep the S_IFMT bits (2026-08-23): sys_stat reports /dev nodes as
      * S_IFCHR, and test_unary's -c/-b/-p/-S read the format from mode.
      * Masking to 07777 here silently declassed every device node, which
@@ -690,9 +690,9 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
      * file chmod'ed 000 looked like "no permission information" and
      * `test -x` said yes to root; it was hidden while the kernel reported
      * a 0000 as 0644 (until 25225d94; distrotail tt_test_perm). */
-    out->mode = (st.st_mode & 0177777) | VFS_MODE_VALID;
-    out->uid  = st.st_uid;
-    out->gid  = st.st_gid;
+    out->mode = (stp->st_mode & 0177777) | VFS_MODE_VALID;
+    out->uid  = stp->st_uid;
+    out->gid  = stp->st_gid;
     /* EVERYTHING struct stat CARRIES, not just the fields the shim happened
      * to need first. Each omission here is silently wrong somewhere in the
      * shell rather than obviously missing:
@@ -703,13 +703,29 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
      *   - mtime/atime absent left `test -nt` and `-ot` comparing 0 with 0,
      *     which is FALSE for every pair of files in the system. They were
      *     implemented and gated, and this zeroed their input. */
-    out->nlink = (uint32_t)st.st_nlink;
-    out->ino   = (uint64_t)st.st_ino;
-    out->dev   = (uint32_t)st.st_dev;
-    out->mtime = (uint64_t)st.st_mtime;
-    out->atime = (uint64_t)st.st_atime;
-    out->ctime = (uint64_t)st.st_mtime;
+    out->nlink = (uint32_t)stp->st_nlink;
+    out->ino   = (uint64_t)stp->st_ino;
+    out->dev   = (uint32_t)stp->st_dev;
+    out->mtime = (uint64_t)stp->st_mtime;
+    out->atime = (uint64_t)stp->st_atime;
+    out->ctime = (uint64_t)stp->st_mtime;
     return VFS_OK;
+}
+
+int vfs_stat(const char *path, struct vfs_stat *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    struct stat st;
+    if (stat(path, &st) != 0) return errno_to_vfs();
+    return host_vstat(&st, out);
+}
+
+/* The link itself: `test -h` and `test -L` (src/shell.c). There was
+ * no lstat, and both were hard-wired false. */
+int vfs_lstat(const char *path, struct vfs_stat *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno_to_vfs();
+    return host_vstat(&st, out);
 }
 
 int vfs_read_all(const char *path, void **out_buf, size_t *out_size) {
@@ -953,6 +969,17 @@ int proc_spawn(const struct proc_spec *spec) {
  * end to a number it picked, rather than reading off whatever the pipe
  * happened to get. VF_FD and dup2 are the shim's, not the shell's. */
 int host_file_fd(struct file *f) { return f ? VF_FD(&f->vfs) : -1; }
+
+/* fstat of the descriptor behind a handle: `test -p /dev/stdin` asks about
+ * the BUILTIN's fd 0, which a redirection or a pipe may have set in the
+ * shell's own table and not in this process's (shell.c test_fd_stat). */
+int host_file_vstat(struct file *f, struct vfs_stat *out) {
+    int fd = host_file_fd(f);
+    if (fd < 0 || !out) return VFS_ERR_INVAL;
+    struct stat st;
+    if (fstat(fd, &st) != 0) return errno_to_vfs();
+    return host_vstat(&st, out);
+}
 
 int host_file_move_fd(struct file *f, int want) {
     if (!f || want < 0) return -1;
