@@ -9,8 +9,10 @@
 # seen the job die by the very next prompt is a race -- before it in QEMU,
 # after it on the EliteDesk (batch 15, logs/b15 tty-box) -- and the case
 # is about the report, not the race. The foreground sleep is the time.
-sleep 0 &
-sleep 1
+# `sleep 0 & sleep 1` likewise: whether `sleep 0` has died by the prompt
+# straight after it is the same race (bash after, tsh before in one gate
+# run of the batch, gate-b15f3-ttyparity).
+sleep 0 & sleep 1
 echo after
 cd /tmp
 sleep 30 &
