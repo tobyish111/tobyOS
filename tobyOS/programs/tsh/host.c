@@ -1323,10 +1323,8 @@ int proc_try_reap_state(int pid, int *code, int *stopsig, bool untraced) {
     return 1;
 }
 
-/* Is PID alive, and does it take SIG's default action -- neither blocking,
- * ignoring nor catching it? From /proc/PID/status, whose SigBlk, SigIgn and
- * SigCgt are hex masks in Linux numbering (bit SIG-1). A process that has
- * finished (state Z) or gone answers no. See shell_signal_ends. */
+/* Is SIG's bit set in a /proc/PID/status mask -- SigBlk, SigIgn and SigCgt
+ * are hex in Linux numbering (bit SIG-1)? */
 static bool host_hexbit(const char *s, int sig) {
     unsigned long long v = 0;
     for (; *s && *s != '\n'; s++) {
@@ -1391,27 +1389,6 @@ void shell_host_kill_self(int sig) {
     (void)sigprocmask(1 /* SIG_UNBLOCK */, &m, 0);
     (void)kill(getpid(), sig);
     _exit(128 + sig);
-}
-
-bool proc_signal_default(int pid, int sig) {
-    char buf[4096];
-    if (pid <= 0 || !host_proc_status(pid, buf, sizeof buf)) return false;
-    const char *st = strstr(buf, "\nState:");
-    if (st) {
-        st += 7;
-        while (*st == ' ' || *st == '\t') st++;
-        if (*st == 'Z' || *st == 'X' || !strncmp(st, "TERMINATED", 10)) return false;
-    }
-    if (sig == SIGKILL) return true;
-    static const char *const keys[] = { "\nSigBlk:", "\nSigIgn:", "\nSigCgt:" };
-    for (int k = 0; k < 3; k++) {
-        const char *f = strstr(buf, keys[k]);
-        if (!f) continue;
-        f += strlen(keys[k]);
-        while (*f == ' ' || *f == '\t') f++;
-        if (host_hexbit(f, sig)) return false;
-    }
-    return true;
 }
 
 /* ---- main --------------------------------------------------------------- */
@@ -1514,28 +1491,37 @@ static void tsh_hangup_exit(void) {
     _exit(128 + SIGHUP);
 }
 
-/* `set -b`: a child that ends or stops is reported at once -- when the
- * shell is parked at its prompt or in a foreground wait (g_tsh_async_ok),
- * where nothing it is doing can be disturbed; it is not in the middle of a
- * malloc there. Installed only while `set -b` is on (tsh_sigchld_arm), with
- * SA_RESTART, so no other read or wait sees an EINTR it did not expect. */
+/* SIGCHLD -- A CHILD HAS ENDED, STOPPED OR BEEN CONTINUED. What the shell
+ * knows of its jobs moves with this signal and only with it, as bash's
+ * does with the waitchld its handler runs: the handler counts it
+ * (g_tsh_chld_seq) and the shell's next look at its jobs collects what it
+ * says (shell.c shell_jobs_learn). tsh polled at each look instead, and
+ * saw a death bash had not yet been told of -- or, from a heuristic for
+ * that, one bash had already been told of where it had not: Oils 0945 is
+ * 143 in bash on the EliteDesk, whose SIGCHLD comes after the `wait`, and
+ * 0 in QEMU, whose comes before (finding 44).
+ *
+ * Installed for good at startup, with SA_RESTART, so no read or wait sees
+ * an EINTR it did not expect. A CHLD trap is relayed from here: it does
+ * not change the signal's disposition, which is the shell's (bash's
+ * SIG_NO_TRAP). `set -b` reports at once -- when the shell is parked at
+ * its prompt or in a foreground wait (g_tsh_async_ok), where nothing it is
+ * doing can be disturbed; it is not in the middle of a malloc there. */
 extern volatile int g_tsh_async_ok;
 /* The line editor's reads may be reported at too, but not the work it
  * does between them: lineedit.c sets g_tsh_async_ok around each read(). */
 volatile int g_tsh_le_async;
+volatile unsigned g_tsh_chld_seq;
 extern bool shell_opt_notify_hosted(void);
 extern void shell_async_notify_hosted(void);
+extern bool shell_chld_trapped_hosted(void);
+extern void shell_deliver_signal(int sig);
 static void tsh_sigchld(int sig) {
-    (void)sig;
-    if (g_tsh_async_ok) shell_async_notify_hosted();
+    g_tsh_chld_seq++;
+    if (shell_chld_trapped_hosted()) shell_deliver_signal(sig);
+    if (g_tsh_async_ok && shell_opt_notify_hosted()) shell_async_notify_hosted();
 }
-static void tsh_sigchld_arm(void) {
-    static int armed;
-    int want = shell_opt_notify_hosted();
-    if (want == armed) return;
-    signal(SIGCHLD, want ? tsh_sigchld : SIG_DFL);
-    armed = want;
-}
+static void tsh_sigchld_arm(void) { (void)signal(SIGCHLD, tsh_sigchld); }
 
 /* The shell's process group, for `jobs -x` (shell_own_pgrp). */
 int host_getpgrp(void) { return (int)getpgrp(); }
@@ -1570,6 +1556,7 @@ int main(int argc, char **argv) {
         if (t) (void)unsetenv("TOBYOS_TSH_ASYNC_STATE");
     }
     shell_init_hosted(argv[0]);
+    tsh_sigchld_arm();                  /* before any child: see tsh_sigchld */
     /* HOW DEEP THE SHELL MAY NEST IS SET BY THE STACK (g_stack_floor in
      * src/shell.c). A native process's stack tops out at the end of the
      * user half and grows on demand down to USER_STACK_FLOOR_VA, 8 MiB
@@ -1864,7 +1851,6 @@ int main(int argc, char **argv) {
         if (g_tsh_sighup) tsh_hangup_exit();
         /* bash announces finished background jobs right before a prompt. */
         if (!cont) shell_notify_jobs_hosted();
-        if (interactive) tsh_sigchld_arm();
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
         ps = shell_decode_prompt_hosted(ps);    /* bash's decode_prompt_string */
