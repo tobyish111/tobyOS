@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <poll.h>
 
 typedef unsigned char  u8;
 typedef unsigned short u16;
@@ -249,28 +250,40 @@ static int ask(const char *qname, int qtype, u8 *resp, size_t respcap,
         if (bind(fd, htons_((u16)(20000 + ((id + try * 137) & 0x3FFF)))) >= 0) bound = 1;
     if (!bound) { fprintf(stderr, "%s: cannot bind a local port\n", prog); close(fd); return -1; }
 
+    /* THREE TRIES OF FIVE SECONDS, as ISC dig's +tries=3 +time=5. A reply
+     * that never comes -- UDP is allowed to lose it, and QEMU's user
+     * network did, once, for an NXDOMAIN -- left recvfrom waiting for
+     * good: the text gate hung at its dig_nx step (logs/gate-b16c). Each
+     * try waits in poll(2), and the answer has to carry OUR id: a late
+     * reply to a previous query arriving on this port would otherwise be
+     * reported as this one's. */
     struct timeval t0, t1;
-    gettimeofday(&t0, NULL);
-    if (sendto(fd, q, len, server_be, htons_(53)) < 0) {
-        fprintf(stderr, "%s: send failed\n", prog);
-        close(fd);
-        return -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        gettimeofday(&t0, NULL);
+        if (sendto(fd, q, len, server_be, htons_(53)) < 0) {
+            fprintf(stderr, "%s: send failed\n", prog);
+            close(fd);
+            return -1;
+        }
+        for (;;) {
+            gettimeofday(&t1, NULL);
+            long spent = (t1.tv_sec - t0.tv_sec) * 1000
+                       + (t1.tv_usec - t0.tv_usec) / 1000;
+            if (spent >= 5000) break;
+            struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, (int)(5000 - spent)) <= 0) continue;
+            struct src_addr from;
+            long got = recvfrom(fd, resp, respcap, &from);
+            if (got < 12) continue;
+            if (((resp[0] << 8) | resp[1]) != id) continue;
+            gettimeofday(&t1, NULL);
+            *msec = (unsigned)((t1.tv_sec - t0.tv_sec) * 1000
+                             + (t1.tv_usec - t0.tv_usec) / 1000);
+            close(fd);
+            return (int)got;
+        }
     }
-
-    /* The answer has to carry OUR id: a late reply to a previous query
-     * arriving on this port would otherwise be reported as this one's. */
-    for (int i = 0; i < 4; i++) {
-        struct src_addr from;
-        long got = recvfrom(fd, resp, respcap, &from);
-        if (got < 12) continue;
-        if (((resp[0] << 8) | resp[1]) != id) continue;
-        gettimeofday(&t1, NULL);
-        *msec = (unsigned)((t1.tv_sec - t0.tv_sec) * 1000
-                         + (t1.tv_usec - t0.tv_usec) / 1000);
-        close(fd);
-        return (int)got;
-    }
-    fprintf(stderr, "%s: no answer from the server\n", prog);
+    printf(";; connection timed out; no servers could be reached\n");
     close(fd);
     return -1;
 }
