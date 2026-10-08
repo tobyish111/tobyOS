@@ -3684,6 +3684,16 @@ static long sys_getenv(const char *name, char *out, size_t cap) {
                               SIGMASK(SIGCONT) | SIGMASK(SIGCHLD) | \
                               SIGMASK(SIGURG)  | SIGMASK(SIGWINCH))
 
+/* A blocking wait for a child ends for a signal that acts now (see
+ * proc.h): a fatal one is delivered on the way out, a handler gets EINTR
+ * or the restart SA_RESTART asks for. */
+bool proc_wait_interrupted(struct proc *self) {
+    if (!self) return false;
+    uint64_t pend = self->pending_signals & ~self->sigstate.mask;
+    pend |= self->pending_signals & SIGMASK(SIGKILL);
+    return (pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self);
+}
+
 static long sys_nanosleep(uint64_t ns) {
     /* Resolution is set by the timer tick (~10 ms on QEMU) -- good enough
      * for the uses libc has in M25A (sleep, usleep).
@@ -4935,6 +4945,7 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
                     ((flags & ABI_WCONTINUED) ? 0x8 : 0);
         for (;;) {
             int k = proc_wait_any(pgid, lxopt);
+            if (k == PROC_WAIT_INTR) return -ABI_EINTR;
             if (k < 0) return -ABI_ECHILD;
             if (k > 0) { pid = k; break; }
             if (flags & ABI_WNOHANG) return 0;
@@ -5038,10 +5049,7 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
         for (;;) {
             struct proc *child = proc_lookup(pid);
             if (!self || !child || child->state == PROC_TERMINATED) break;
-            uint64_t pend = self->pending_signals & ~self->sigstate.mask;
-            pend |= self->pending_signals & SIGMASK(SIGKILL);
-            if ((pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self))
-                return -ABI_EINTR;
+            if (proc_wait_interrupted(self)) return -ABI_EINTR;
             self->wait_pid = pid;
             self->state    = PROC_BLOCKED;
             sched_yield();
@@ -12444,6 +12452,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                      : vpid < -1 ? -vpid : 0;
             for (;;) {
                 pid = proc_wait_any(pgid, options);
+                if (pid == PROC_WAIT_INTR) return -ABI_EINTR;
                 if (pid < 0) return -ABI_ECHILD;
                 if (pid > 0) break;
                 if (options & 0x1 /* WNOHANG */) return 0;
@@ -12533,6 +12542,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         if (!(options & 0x1 /* WNOHANG */)) {
             int pr = proc_wait_or_ptrace(pid);
+            if (pr == PROC_WAIT_INTR) return -ABI_EINTR;
             if (pr == 1) {
                 struct proc *c = proc_lookup(pid);
                 if (ustatus) {

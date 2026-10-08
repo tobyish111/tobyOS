@@ -1576,6 +1576,9 @@ int proc_wait_or_ptrace(int pid) {
     for (;;) {
         if (child->ptrace_stopped && child->tracer_pid == self->pid) return 1;
         if (child->state == PROC_TERMINATED) return 0;
+        /* ...and a signal that acts ends it, as the native waitpid's does
+         * (see proc_wait_any). */
+        if (proc_wait_interrupted(self)) return PROC_WAIT_INTR;
         self->wait_pid = pid;
         self->state    = PROC_BLOCKED;
         sched_yield();
@@ -2220,6 +2223,16 @@ int proc_wait_any(int pgid, int options) {
         if (!any) return -1;
         /* WNOHANG, or the stop/continue mode, which LX_wait4 polls. */
         if (options & (0x1 | 0x2 | 0x8)) return 0;
+        /* A SIGNAL THAT ACTS ENDS THE BLOCK. A signal woke this sleep and
+         * the loop went straight back to it, so the signal landed only
+         * when some child had an event: `bash -c 'trap "echo bye" EXIT;
+         * sleep 4' & kill -TERM $!` ran the EXIT trap and died after the
+         * sleep, where Linux's bash does both at once (logs/b15 p4 h1, and
+         * WSL: waited=0), and a bash with no trap at all could not be
+         * killed while it waited (h11). The native waitpid's single-child
+         * arm has done this since batch 12; wait(-1) and both of LX_wait4's
+         * blocking arms never did. */
+        if (proc_wait_interrupted(self)) return PROC_WAIT_INTR;
         self->wait_pid = PROC_WAIT_ANY;
         self->state    = PROC_BLOCKED;
         sched_yield();

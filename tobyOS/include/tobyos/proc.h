@@ -1066,9 +1066,18 @@ void proc_record_cmdline(struct proc *p, int argc, char **argv);
  * any group if `pgid` is 0 -- that has an event wait4 reports under
  * `options` (Linux WNOHANG/WUNTRACED/WCONTINUED bits). Without WNOHANG and
  * without WUNTRACED/WCONTINUED, blocks until one has. Returns its pid, 0 if
- * none has one yet, or -1 if the caller has no such child (ECHILD). */
+ * none has one yet, -1 if the caller has no such child (ECHILD), or
+ * PROC_WAIT_INTR if a signal ended the block (EINTR; see
+ * proc_wait_interrupted). */
 #define PROC_WAIT_ANY (-2)
+#define PROC_WAIT_INTR (-4)
 int proc_wait_any(int pgid, int options);
+
+/* Would a signal pending on `self` end a blocking wait now -- one that is
+ * delivered (not masked, or SIGKILL), acted on (SIG_SHOULD_EINTR), and not
+ * of the stop class or default-ignored (syscall.c's SLEEP_UNINTERRUPTING)?
+ * The one test every blocking wait arm uses (src/syscall.c). */
+bool proc_wait_interrupted(struct proc *self);
 
 /* For diagnostics. */
 const char *proc_state_name(enum proc_state s);
