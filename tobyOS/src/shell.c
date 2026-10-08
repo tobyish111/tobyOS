@@ -1672,9 +1672,12 @@ struct job {
                                 * whenever id != 0 */
     bool notified;             /* listed by `jobs` in a script: it goes at the
                                 * end of the command (shell_jobs_notify_script) */
-    bool blind;                /* `kill` has just signalled it: the next look
-                                * that does not wait misses its death -- see
-                                * shell_job_poll */
+    bool blind;                /* `kill` has just signalled it: the line read
+                                * straight after misses its death -- see
+                                * shell_jobs_reap */
+    bool dying;                /* ...with a signal that ends it: every later
+                                * look lets it finish dying first -- see
+                                * shell_job_settle */
     char *wd;                  /* the shell's directory when it started (bash's
                                 * job->wd): a line about it names that
                                 * directory once the shell has moved */
@@ -1993,6 +1996,7 @@ static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
     j->sig  = 0;
     j->notified = false;
     j->blind = false;
+    j->dying = false;
     j->jc = shell_job_control();
     j->seen = false;
     j->nohup = false;
@@ -2394,7 +2398,14 @@ void shell_notify_jobs_hosted(void) {
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
         if (!j->id || j->dead) continue;
-        j->blind = false;
+        /* the prompt straight after a `kill` is too early, as a script's
+         * next line is (shell_jobs_reap): on the EliteDesk bash reports
+         * `kill %1`'s job at the prompt after the next command, 5 of 5
+         * (logs/b15 tty-box) */
+        if (j->blind) {
+            j->blind = false;
+            continue;
+        }
         /* not this shell's child to ask any more: it is gone, as Done */
         if (shell_job_poll(j) < 0) shell_job_died(j, 0, 0);
     }
@@ -2441,11 +2452,21 @@ static int shell_job_poll(struct job *j);      /* see cmd_wait */
  * loop of builtins, `jobs` lists "[1]+  Killed" and no report is printed,
  * `wait $!` prints the report (logs/b12 p104, WSL bash). tsh reported a
  * death where it reaped it, so `jobs` printed both. */
+/* THE LOOK STRAIGHT AFTER A `kill` IS BLIND: bash's SIGCHLD for a job it
+ * has just signalled has not yet come when its reader takes the next line,
+ * though it has by the time that line has run (logs/b15 notice: on the
+ * EliteDesk `kill -HUP $!` then `jobs` lists "[1]+  Hangup", 5 of 5, and
+ * one more line first gets the report instead). So a reader's look -- not
+ * a wait's -- passes over such a job once; every look after it lets the
+ * job finish dying (shell_job_settle). */
 static void shell_jobs_reap(bool waited) {
     for (int i = 0; i < JOB_MAX; i++) {
         struct job *j = g_jobs[i];
         if (!j->id || j->dead) continue;
-        if (waited) j->blind = false;      /* time has passed: see shell_job_poll */
+        if (j->blind && !waited) {
+            j->blind = false;
+            continue;
+        }
         (void)shell_job_poll(j);
     }
 }
@@ -2487,6 +2508,12 @@ static void shell_jobs_cleanup(void) {
 #define SHELL_NOTIFY_READ   0
 #define SHELL_NOTIFY_WAITED 1
 static void shell_jobs_notify(unsigned long line, int how) {
+    /* An interactive shell reports at its prompt -- but what ended while
+     * it waited for a foreground command is known when the wait ends, as
+     * bash's SIGCHLD handler has reaped it meanwhile: the prompt after
+     * `kill %1; sleep 1` reports the job however soon the prompt comes. */
+    if (g_interactive && g_capture_depth == 0 && how == SHELL_NOTIFY_WAITED)
+        shell_jobs_reap(true);
     if (g_interactive || g_capture_depth > 0) return;
     if (how == SHELL_NOTIFY_READ) shell_coproc_reap();
     shell_jobs_reap(how == SHELL_NOTIFY_WAITED);
@@ -12687,12 +12714,71 @@ static int shell_job_poll_procs(struct job *j) {
     return 0;
 }
 
+static int shell_job_poll_now(struct job *j);
+
+/* DOES SIG END PROCESS PID, as it stands: SIGKILL, or a signal whose
+ * default action ends a process that it neither ignores, catches nor
+ * blocks. Every signal's default is to end the process except SIGCHLD,
+ * SIGURG and SIGWINCH (ignored) and the stop and continue signals. */
+static bool shell_signal_default_ends(int sig) {
+    switch (sig) {
+    case SIGCHLD: case SIGCONT: case SIGSTOP: case SIGTSTP:
+    case SIGTTIN: case SIGTTOU: case SIGURG: case SIGWINCH:
+        return false;
+    default:
+        return sig > 0 && sig < SIG_MAX;
+    }
+}
+/* proc_signal_default: is process PID alive, and does it take SIG's default
+ * action -- not blocking, ignoring or catching it? */
+#ifdef SHELL_HOSTED
+bool proc_signal_default(int pid, int sig);   /* host.c: /proc/PID/status */
+#else
+static bool proc_signal_default(int pid, int sig) {
+    struct proc *p = proc_lookup(pid);
+    if (!p || p->state == PROC_TERMINATED) return false;
+    if (sig == SIGKILL) return true;
+    if (p->sigstate.mask & SIGMASK(sig)) return false;
+    struct sigaction *acts = sig_actions_of(p);
+    return !acts || acts[sig].sa_handler == SIG_DFL;
+}
+#endif
+static bool shell_signal_ends(int pid, int sig) {
+    if (sig != SIGKILL && !shell_signal_default_ends(sig)) return false;
+    return proc_signal_default(pid, sig);
+}
+
+/* A JOB `kill` HAS SIGNALLED TO DEATH IS DEAD AT THE NEXT LOOK THAT IS NOT
+ * THE READER'S FIRST (see shell_jobs_reap). bash's SIGCHLD handler has
+ * reaped it by then: it is a slower shell than this one, and the dying
+ * process gets its CPU while bash runs the line. tsh looks synchronously,
+ * and fast enough to look before the process has finished exiting -- so
+ * `kill -15 %%; echo; wait %%` found the job still there and waited (143)
+ * where bash's job was gone (127, Oils 0944; on the EliteDesk 5 of 5 each
+ * way), and an interactive `kill %1` was reported a prompt late
+ * (ttyparity 16). Such a look now lets it finish: it polls until the job
+ * is dead, a millisecond apart, for at most a tenth of a second -- a job
+ * marked dying was sent a signal its every process takes by default
+ * (shell_signal_ends), so it does die, and at once. */
+static int shell_job_settle(struct job *j) {
+    j->dying = false;
+    int r = shell_job_poll_now(j);
+    for (int k = 0; k < 100 && r == 0 && !j->dead; k++) {
+        pit_sleep_ms(1);
+        r = shell_job_poll_now(j);
+    }
+    return r;
+}
+
 static int shell_job_poll(struct job *j) {
     if (j->dead) return 1;
-    if (j->blind) {
-        j->blind = false;
-        return 0;
-    }
+    j->blind = false;
+    if (j->dying) return shell_job_settle(j);
+    return shell_job_poll_now(j);
+}
+
+static int shell_job_poll_now(struct job *j) {
+    if (j->dead) return 1;
     if (j->nproc > 1 && j->proc) return shell_job_poll_procs(j);
     int code = 0, ss = 0;
     /* A STOP, AND A CONTINUE, ARE CHANGES OF STATE TOO -- seen under job
@@ -12946,16 +13032,8 @@ static void cmd_wait_in(int argc, char **argv) {
         /* A JOB `kill` HAS JUST SIGNALLED is as a rule dead by the time
          * bash's wait looks -- its SIGCHLD has been handled -- so wait has
          * nothing to wait for and reports nothing: `kill %1; wait` on one
-         * line prints no "Terminated" (logs/b13 q44). An ordinary look
-         * misses it (see shell_job_poll); it is given a moment, a few ms,
-         * to die. */
-        for (int i = 0; i < JOB_MAX; i++) {
-            struct job *bj = g_jobs[i];
-            if (!bj->id || bj->dead || !bj->blind) continue;
-            bj->blind = false;
-            for (int k = 0; k < 20 && shell_job_poll(bj) == 0; k++)
-                pit_sleep_ms(1);
-        }
+         * line prints no "Terminated" (logs/b13 q44). The look below lets
+         * such a job finish dying (shell_job_settle). */
         for (int i = 0; i < JOB_MAX; i++)
             if (g_jobs[i]->id && !g_jobs[i]->dead &&
                 shell_job_poll(g_jobs[i]) < 0)
@@ -21915,12 +21993,24 @@ static void cmd_kill(int argc, char **argv) {
              * kill_pid for a job in the shell's own group signals every
              * live process of the pipeline itself (logs/b14 r4: `sleep 5 |
              * sleep 5 & kill %1; wait %1` is 143, both gone). */
+            /* Before the send: what the signal will do to each process (a
+             * stopped one takes it only once continued -- bash continues a
+             * stopped job it TERMs or HUPs -- or for SIGKILL). */
+            bool cont = was_stopped && (sig == SIGTERM || sig == SIGHUP);
+            bool ends = sig > 0 && (!was_stopped || cont || sig == SIGKILL);
+            if (jb->nproc > 1 && jb->proc) {
+                for (int k = 0; ends && k < jb->nproc; k++)
+                    if (!jb->proc[k].dead && !shell_signal_ends(jb->proc[k].pid, sig))
+                        ends = false;
+            } else if (ends) {
+                ends = shell_signal_ends(jb->pid, sig);
+            }
             if (!jb->jc && jb->nproc > 1 && jb->proc) {
                 bool any = false;
                 for (int k = 0; k < jb->nproc; k++) {
                     if (jb->proc[k].dead) continue;
                     if (signal_send_to_pid_checked(jb->proc[k].pid, sig) == 0) any = true;
-                    if (was_stopped && (sig == SIGTERM || sig == SIGHUP))
+                    if (cont)
                         (void)signal_send_to_pid_checked(jb->proc[k].pid, SIGCONT);
                 }
                 if (!any) {
@@ -21929,6 +22019,7 @@ static void cmd_kill(int argc, char **argv) {
                     continue;
                 }
                 if (sig > 0) jb->blind = true;
+                jb->dying = ends;
                 continue;
             }
             if (signal_send_to_pid_checked(-jb->pid, sig) != 0 &&
@@ -21937,10 +22028,23 @@ static void cmd_kill(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-            if (sig > 0) jb->blind = true;         /* see shell_job_poll */
-            if (was_stopped && (sig == SIGTERM || sig == SIGHUP)) {
+            if (sig > 0) jb->blind = true;         /* see shell_jobs_reap */
+            jb->dying = ends;                      /* see shell_job_settle */
+            if (cont) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
                     (void)signal_send_to_pid_checked(jb->pid, SIGCONT);
+                /* THE CONTINUE IS SEEN FIRST. bash's SIGCHLD handler is
+                 * told of it before the death, and a job continued gives
+                 * up being current (set_job_status_and_cleanup): `kill %1;
+                 * wait %1` of a stopped job reports "[1]   Terminated", no
+                 * `+`. A look after the death sees only the death, so tsh
+                 * printed the `+` whenever the job died first (ttyparity
+                 * 07). The shell sent the continue: it records it. */
+                if (jb->jc && jb->stopped) {
+                    jb->stopped = false;
+                    jb->seen = false;
+                    jobs_reset_current();
+                }
             }
             continue;
         }
@@ -21958,18 +22062,45 @@ static void cmd_kill(int argc, char **argv) {
             continue;
         }
         if (neg) pid = -pid;
+        /* A job the send ends -- every live process of it, a group send
+         * reaching them all -- is dying (see shell_job_settle); asked
+         * before the send, while each process is there to be asked. */
+        int want = pid < 0 ? -pid : pid;
+        bool *ends = 0;
+        if (sig > 0 && JOB_MAX > 0)
+            ends = (bool *)kmalloc((size_t)JOB_MAX * sizeof *ends);
+        for (int k = 0; ends && k < JOB_MAX; k++) {
+            struct job *kj = g_jobs[k];
+            ends[k] = false;
+            if (!kj->id || kj->dead || !job_has_pid(kj, want)) continue;
+            if (kj->stopped && sig != SIGKILL) continue;
+            bool e = true;
+            if (kj->nproc > 1 && kj->proc) {
+                for (int q = 0; e && q < kj->nproc; q++) {
+                    if (kj->proc[q].dead) continue;
+                    if ((pid > 0 && kj->proc[q].pid != want) ||
+                        !shell_signal_ends(kj->proc[q].pid, sig))
+                        e = false;
+                }
+            } else {
+                e = shell_signal_ends(kj->pid, sig);
+            }
+            ends[k] = e;
+        }
         /* The send must REPORT a pid that does not exist -- tsh returned 0
          * for `kill 999999` where every shell answers 1. */
         if (signal_send_to_pid_checked(pid, sig) != 0) {
             kprintf("kill: (%d) - No such process\n", pid);
             shell_set_status(1);
         } else if (sig > 0) {
-            /* a job it names, or whose group it names: see shell_job_poll */
-            int want = pid < 0 ? -pid : pid;
+            /* a job it names, or whose group it names: see shell_jobs_reap */
             for (int k = 0; k < JOB_MAX; k++)
-                if (job_has_pid(g_jobs[k], want))
+                if (job_has_pid(g_jobs[k], want)) {
                     g_jobs[k]->blind = true;
+                    if (ends && ends[k]) g_jobs[k]->dying = true;
+                }
         }
+        kfree(ends);
     }
 }
 
@@ -24696,6 +24827,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             return 128 + ssig;
         }
         shell_report_job_death(pid, proc_last_term_sig(), 0, true);
+        shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
         return frc;
     }
     signal_set_foreground(pid);

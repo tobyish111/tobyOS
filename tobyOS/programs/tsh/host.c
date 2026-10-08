@@ -1157,6 +1157,58 @@ int proc_try_reap_state(int pid, int *code, int *stopsig, bool untraced) {
     return 1;
 }
 
+/* Is PID alive, and does it take SIG's default action -- neither blocking,
+ * ignoring nor catching it? From /proc/PID/status, whose SigBlk, SigIgn and
+ * SigCgt are hex masks in Linux numbering (bit SIG-1). A process that has
+ * finished (state Z) or gone answers no. See shell_signal_ends. */
+static bool host_hexbit(const char *s, int sig) {
+    unsigned long long v = 0;
+    for (; *s && *s != '\n'; s++) {
+        int d = (*s >= '0' && *s <= '9') ? *s - '0' :
+                (*s >= 'a' && *s <= 'f') ? *s - 'a' + 10 :
+                (*s >= 'A' && *s <= 'F') ? *s - 'A' + 10 : -1;
+        if (d < 0) break;
+        v = (v << 4) | (unsigned)d;
+    }
+    return sig >= 1 && sig <= 64 && ((v >> (sig - 1)) & 1u);
+}
+/* /proc/PID/status into BUF, NUL-terminated; its length, 0 if unreadable. */
+static long host_proc_status(int pid, char *buf, size_t cap) {
+    char path[48];
+    if (pid > 0) snprintf(path, sizeof path, "/proc/%d/status", pid);
+    else snprintf(path, sizeof path, "/proc/self/status");
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    long n = 0, r;
+    while (n < (long)cap - 1 && (r = read(fd, buf + n, cap - 1 - n)) > 0)
+        n += r;
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    return n;
+}
+
+bool proc_signal_default(int pid, int sig) {
+    char buf[4096];
+    if (pid <= 0 || !host_proc_status(pid, buf, sizeof buf)) return false;
+    const char *st = strstr(buf, "\nState:");
+    if (st) {
+        st += 7;
+        while (*st == ' ' || *st == '\t') st++;
+        if (*st == 'Z' || *st == 'X' || !strncmp(st, "TERMINATED", 10)) return false;
+    }
+    if (sig == SIGKILL) return true;
+    static const char *const keys[] = { "\nSigBlk:", "\nSigIgn:", "\nSigCgt:" };
+    for (int k = 0; k < 3; k++) {
+        const char *f = strstr(buf, keys[k]);
+        if (!f) continue;
+        f += strlen(keys[k]);
+        while (*f == ' ' || *f == '\t') f++;
+        if (host_hexbit(f, sig)) return false;
+    }
+    return true;
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 /* bash's long options, as it lists them (shell.c's long_args) */

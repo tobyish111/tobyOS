@@ -5,6 +5,10 @@
 # stopped jobs." and stays -- the exit after `jobs` leaves. tsh announced
 # no `&`, reported on stdout, knew no directories, ran `%1` as a command
 # and left its stopped jobs behind (logs/b13 q43-q49).
+# `kill %1; sleep 1` is one line: with the kill alone, whether bash has
+# seen the job die by the very next prompt is a race -- before it in QEMU,
+# after it on the EliteDesk (batch 15, logs/b15 tty-box) -- and the case
+# is about the report, not the race. The foreground sleep is the time.
 sleep 0 &
 sleep 1
 echo after
@@ -12,8 +16,7 @@ cd /tmp
 sleep 30 &
 cd /
 jobs
-kill %1
-sleep 1
+kill %1; sleep 1
 sleep 1 &
 %1
 sleep 30
