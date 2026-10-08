@@ -6751,19 +6751,32 @@ static void shell_trap_sync_kernel(int sig) {
  * $( ) that set its own; with $? the last command's (logs/b15 p4, p6 x,
  * p7 e; WSL's bash 5.3 the same). Another terminating signal while it runs
  * ends the shell at once (p4 h15). One ignored when they are armed stays
- * ignored for good, as in bash 5.2: an asynchronous child's INT (h7). Not
- * armed: the fault signals (SEGV BUS ILL FPE TRAP SYS), whose handler
- * would return into the fault -- so `kill -SEGV $$` dies without running
- * the EXIT trap, where bash runs it. */
-static const int g_termsigs[] = { SIGHUP, SIGINT, SIGABRT, SIGPIPE, SIGALRM,
-                                  SIGTERM, SIGXCPU, SIGXFSZ, SIGVTALRM,
-                                  SIGUSR1, SIGUSR2 };
+ * ignored for good, as in bash 5.2: an asynchronous child's INT (h7).
+ *
+ * THE FAULT SIGNALS TOO -- ILL TRAP FPE BUS SEGV SYS, and ABRT -- as in
+ * bash's terminating_signals: `kill -SEGV $$` runs the EXIT trap and dies
+ * of SEGV, 139 (logs/b16 faultsig). They were left out because a real
+ * fault's handler returns into the faulting instruction; bash's answer is
+ * terminate_immediately -- the SAME one of these coming again before it
+ * was acted on is that re-execution, and the shell acts then and there,
+ * from the handler, rather than return into the fault a third time. */
+static const int g_termsigs[] = { SIGHUP, SIGINT, SIGILL, SIGTRAP, SIGABRT,
+                                  SIGFPE, SIGBUS, SIGSEGV, SIGSYS, SIGPIPE,
+                                  SIGALRM, SIGTERM, SIGXCPU, SIGXFSZ,
+                                  SIGVTALRM, SIGUSR1, SIGUSR2 };
 #define SH_NTERMSIGS ((int)(sizeof g_termsigs / sizeof g_termsigs[0]))
 static bool g_termsig_init;                 /* armed, in this process */
 static volatile int g_termsig_pending;      /* the one that arrived */
 static volatile int g_termsig_handling;     /* the one being acted on */
+static void shell_termsig_act(int sig) __attribute__((noreturn));
+static bool shell_sig_acts_at_once(int s) {
+    return s == SIGILL || s == SIGTRAP || s == SIGABRT || s == SIGFPE ||
+           s == SIGBUS || s == SIGSEGV || s == SIGSYS;
+}
 static void shell_hosted_termsig(int sig) {
     if (g_termsig_handling) shell_host_kill_self(sig);      /* kill_shell */
+    if (shell_sig_acts_at_once(sig) && g_termsig_pending == sig)
+        shell_termsig_act(sig);                 /* terminate_immediately */
     if (!g_termsig_pending) g_termsig_pending = sig;
 }
 static void shell_termsig_init(void) {
@@ -6779,7 +6792,6 @@ static void shell_termsig_init(void) {
         }
     }
 }
-static void shell_termsig_act(int sig) __attribute__((noreturn));
 static void shell_termsig_act(int sig) {
     g_termsig_handling = sig;
     g_termsig_pending = 0;
