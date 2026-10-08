@@ -752,8 +752,23 @@ int proc_kill_tree(int pid, int sig) {
 /* Kernel-side WUNTRACED-style foreground wait (see proc.h). Yield-poll,
  * the same shape as the syscall arms; the kernel shell runs as a kernel
  * thread, so there is no syscall boundary to deliver an EINTR across. */
+/* PID 0 WAITING ON A CHILD, once the machine is up, is the kernel shell
+ * waiting on a foreground command: it does pid 0's duties between looks
+ * (kernel.c kernel_idle_service_nested) and sleeps at most 10 ms between
+ * them, the child's exit waking it at once. A plain block stopped them all
+ * for the length of the command: an idle_stall from the watchdog at 10 s,
+ * and the network waiting (finding 67). A boot harness's wait, before the
+ * idle loop, is a block as it always was. */
+extern bool g_idle_loop_running;
+extern void kernel_idle_service_nested(void);
+#define PID0_WAIT_SLICE_NS 10000000ull
+static bool pid0_serviced_wait(const struct proc *self) {
+    return self && self->pid == 0 && g_idle_loop_running;
+}
+
 int proc_wait_fg(int pid, int *stop_sig) {
     if (stop_sig) *stop_sig = 0;
+    struct proc *self = current_proc();
     for (;;) {
         struct proc *c = proc_lookup(pid);
         if (!c) return -1;
@@ -763,6 +778,16 @@ int proc_wait_fg(int pid, int *stop_sig) {
             return 0;
         }
         if (c->state == PROC_TERMINATED) return proc_wait(pid);
+        if (pid0_serviced_wait(self)) {
+            /* a stop wakes no waiter: look again within a slice */
+            kernel_idle_service_nested();
+            self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+            self->wait_pid = pid;
+            self->state = PROC_BLOCKED;
+            sched_yield();
+            self->sleep_deadline_ns = 0;
+            continue;
+        }
         sched_yield();
     }
 }
@@ -2273,9 +2298,15 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
     uint64_t wait_start_ns = perf_now_ns();
 
     while (child->state != PROC_TERMINATED) {
+        if (pid0_serviced_wait(self)) {           /* see proc_wait_fg */
+            kernel_idle_service_nested();
+            if (child->state == PROC_TERMINATED) break;
+            self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+        }
         self->wait_pid = pid;
         self->state    = PROC_BLOCKED;
         sched_yield();
+        self->sleep_deadline_ns = 0;
         /* When we resume here, the child should be TERMINATED (or some
          * other event woke us spuriously -- loop again). */
     }

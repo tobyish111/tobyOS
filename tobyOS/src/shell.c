@@ -5956,9 +5956,36 @@ int shell_take_interrupt(void) {
 #ifdef SHELL_HOSTED
 static void shell_termsig_check(void);
 #endif
+#ifndef SHELL_HOSTED
+/* THE KERNEL SHELL IS pid 0, and a long run of builtins -- a loop that
+ * starts nothing, a huge value worked over -- holds pid 0 as surely as a
+ * wait for a command did: no watchdog kick, no network. Its duties every
+ * 10 ms, from here, the boundary every command passes (finding 67; the
+ * wait itself is proc.c's). */
+extern bool g_idle_loop_running;
+extern void kernel_idle_service_nested(void);
+static void shell_kernel_breathe(void) {
+    static uint64_t last;
+    if (!g_idle_loop_running) return;
+    uint64_t now = perf_now_ns();
+    if (now - last < 10000000ull) return;
+    last = now;
+    struct proc *me = current_proc();
+    if (!me || me->pid != 0) return;
+    kernel_idle_service_nested();
+    /* ...and the BKL, which pid 0 holds through the whole loop: every
+     * syscall on every other CPU waited for it, the SSH session's shell
+     * among them (logs/b15 kbusy b2). sched_yield hands it on and lets
+     * whatever is ready here run. */
+    sched_yield();
+}
+#endif
+
 static void shell_check_pending_signals(void) {
 #ifdef SHELL_HOSTED
     shell_termsig_check();          /* the EXIT trap and a fatal signal */
+#else
+    shell_kernel_breathe();
 #endif
     for (int i = 1; i < SIG_MAX; i++) {
         if (g_pending_signals[i]) {

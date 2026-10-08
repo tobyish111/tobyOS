@@ -898,9 +898,37 @@ static void periodic_writeback(void) {
     bcache_sync(NULL);          /* all dirty blocks + per-device flush */
 }
 
+/* Set once pid 0 is in its idle loop: a wait of pid 0's from then on is the
+ * kernel shell's, not a boot harness's (proc.c pid0_serviced_wait). */
+bool g_idle_loop_running;
+
+/* PID 0 KEEPS ITS DUTIES WHILE THE KERNEL SHELL WAITS (finding 67). The
+ * kernel shell runs IN pid 0 -- from shell_poll, or the TCP shell inside
+ * net_service_tick -- and a foreground command blocked pid 0 for as long as
+ * it ran: the watchdog reported an idle_stall at 10 s, and the network (SSH
+ * sessions, TCP timers) waited for the command to end. proc_wait calls this
+ * between looks at the child, and the shell between commands of a long
+ * loop: the watchdog kick, input, the network but not the shells
+ * (net_service_nested: the TCP shell may be the one waiting, and no shell
+ * may start a second line meanwhile), the poll waiters, the serial drain.
+ * Not the GUI tick, which may have started the wait. Called with the BKL
+ * held, as the idle loop's phases are. */
+void kernel_idle_service_nested(void) {
+    extern void net_service_nested(void);
+    wdog_kick_idle();
+    net_service_nested();
+    usb_legacy_poll();
+    xhci_poll();
+    kbd_flush_pending();
+    mouse_flush_pending();
+    poll_tick();
+    serial_tx_pump();
+}
+
 static __attribute__((noreturn)) void idle_loop(void) {
     uint32_t hz = pit_hz();
     if (hz == 0) hz = 1;
+    g_idle_loop_running = true;
 
     /* Keep local input fresh without letting it monopolise pid 0.
      * Keyboard delivery is immediate in the HID/PS2 path; mouse keeps

@@ -609,6 +609,25 @@ void net_poll(void) {
     tcp_service_tick();
 }
 
+/* The network for pid 0 while the kernel shell waits on a command
+ * (kernel.c kernel_idle_service_nested): what net_service_tick does, minus
+ * the TCP shell -- which may be the one waiting, inside this very
+ * net_service_tick -- and the deferred bring-up. Guarded against itself. */
+void net_service_nested(void) {
+    static int busy;
+    if (busy || !g_net_up) return;
+    busy = 1;
+    for (size_t i = 0; i < g_net_dev_count; i++) {
+        struct net_dev *nd = g_net_devs[i];
+        if (nd && nd->rx_drain) nd->rx_drain(nd);
+    }
+    tcp_echo_poll();
+    tcp_service_tick();
+    ssh_poll();
+    vnc_poll();
+    busy = 0;
+}
+
 void net_service_tick(void) {
     if (__atomic_exchange_n(&g_net_service_busy, 1, __ATOMIC_ACQUIRE)) {
         return;
