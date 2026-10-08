@@ -37116,6 +37116,13 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
     return true;
 }
 
+#ifdef SHELL_HOSTED
+static bool shell_text_is_one_subshell(const char *text);
+/* The text of an asynchronous child that is one ( LIST ): the child runs
+ * it as itself (shell_try_subshell_command's merge). */
+static const char *g_subshell_merge_text;
+#endif
+
 /* THE ASYNCHRONOUS CHILD, once it exists: a fork of this shell, or the
  * /bin/tsh the kernel shell starts with a copy of its state
  * (shell_async_child_hosted). It runs TEXT as the subshell it is and
@@ -37165,6 +37172,22 @@ static void shell_async_child_body(const char *text, bool async_ign,
     /* see shell_spec_sigs: only where INT and QUIT are ignored here, i.e.
      * the parent had no job control when it started this one */
     g_async_payload = g_bg_exec_ok && async_ign;
+    /* `( LIST ) &` IS ONE PROCESS, the ( ) itself, as bash's
+     * execute_in_subshell makes it: this child runs the list, where it
+     * forked again to do so -- so `$!` named a wrapper, killing it left the
+     * list running, and $BASH_SUBSHELL inside said 2 (logs/b15 p6 j1-j5,
+     * bash 1). */
+    if (shell_text_is_one_subshell(text)) {
+        g_subshell_merge_text = text;
+        execute_line_text(text);
+        /* Only if the ( ) did not take it (it exits): it ran all the same,
+         * as a child of this one, and this one is done. */
+        g_subshell_merge_text = 0;
+        int mst = g_last_status;
+        if (g_shell_flow == SHELL_FLOW_EXIT) mst = g_shell_flow_status;
+        shell_host_builtin_done();
+        _exit(mst & 0xff);
+    }
 #endif
     /* THE SUBSHELL'S EXIT TRAP RUNS AS IT ENDS when bash's would: `{
      * trap 'echo bye' EXIT; echo hi; } &` and `f &` with an f that sets
@@ -42515,9 +42538,66 @@ static bool shell_subshell_tail_can_follow(const char *tail) {
     return false;
 }
 
+#ifdef SHELL_HOSTED
+/* Is TEXT exactly one ( LIST ), with nothing after it -- not (( )), not a
+ * pipeline or a list that starts with one? The scan is
+ * shell_try_subshell_command's. */
+static bool shell_text_is_one_subshell(const char *text) {
+    const char *s = shell_skip_blanks(text);
+    if (*s != '(' || s[1] == '(') return false;
+    int depth = 1;
+    bool in_single = false, in_double = false;
+    const char *p = s + 1;
+    for (; *p; p++) {
+        if (in_single) {
+            if (*p == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '"') in_double = false;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') { in_single = true; continue; }
+        if (*p == '"') { in_double = true; continue; }
+        if (*p == '(') { depth++; continue; }
+        if (*p == ')') {
+            if (depth > 1) { depth--; continue; }
+            if (shell_subshell_tail_can_follow(p + 1)) break;
+        }
+    }
+    if (!*p) return false;
+    for (const char *t = p + 1; *t; t++)
+        if (*t != ' ' && *t != '\t' && *t != '\n' && *t != '\r') return false;
+    return true;
+}
+
+/* The same text, give or take blanks and newlines at either end. */
+static bool shell_same_text_trimmed(const char *a, const char *b) {
+    a = shell_skip_blanks(a);
+    b = shell_skip_blanks(b);
+    size_t la = strlen(a), lb = strlen(b);
+    while (la && (a[la - 1] == ' ' || a[la - 1] == '\t' || a[la - 1] == '\n' ||
+                  a[la - 1] == '\r')) la--;
+    while (lb && (b[lb - 1] == ' ' || b[lb - 1] == '\t' || b[lb - 1] == '\n' ||
+                  b[lb - 1] == '\r')) lb--;
+    return la == lb && memcmp(a, b, la) == 0;
+}
+#endif
+
 static bool shell_try_subshell_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (*s != '(') return false;
+    /* An asynchronous child whose whole text this is runs it as itself
+     * (shell_async_child_body): no second fork, no second level. */
+    bool merge = false;
+#ifdef SHELL_HOSTED
+    if (g_subshell_merge_text && shell_same_text_trimmed(src, g_subshell_merge_text)) {
+        merge = true;
+        g_subshell_merge_text = 0;
+    }
+#endif
 
     const char *body_start = s + 1;
     const char *body_end = 0;
@@ -42660,7 +42740,9 @@ static bool shell_try_subshell_command(const char *src) {
      * already used). */
     bool forked_child = false;
 #ifdef SHELL_HOSTED
-    if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
+    if (merge) {
+        forked_child = true;          /* the asynchronous child IS the ( ) */
+    } else if (g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
         int pid = shell_fork();
         if (pid > 0) {
             struct shell_wce wce;
@@ -42727,7 +42809,7 @@ static bool shell_try_subshell_command(const char *src) {
         io_active = true;
     }
 
-    g_subshell_depth++;
+    if (!merge) g_subshell_depth++;    /* merged: the async fork counted it */
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
     g_shell_loop_depth = 0;
