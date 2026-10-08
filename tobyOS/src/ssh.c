@@ -17,6 +17,7 @@
 #include <tobyos/rng.h>
 #include <tobyos/users.h>
 #include <tobyos/pty.h>
+#include <tobyos/pipe.h>
 #include <tobyos/users.h>
 #include <tobyos/proc.h>
 #include <tobyos/sched.h>
@@ -55,6 +56,8 @@
 #define SSH_MSG_CHANNEL_OPEN_FAILURE 92u
 #define SSH_MSG_CHANNEL_WINDOW_ADJUST 93u
 #define SSH_MSG_CHANNEL_DATA 94u
+#define SSH_MSG_CHANNEL_EXTENDED_DATA 95u
+#define SSH_EXTENDED_DATA_STDERR 1u
 #define SSH_MSG_CHANNEL_EOF 96u
 #define SSH_MSG_CHANNEL_CLOSE 97u
 #define SSH_MSG_CHANNEL_REQUEST 98u
@@ -135,6 +138,15 @@ struct ssh_channel {
      * a byte pipe and the line discipline has to stay out of the way. */
     bool         want_pty;
     char         term[64];      /* pty-req's TERM, "" when none */
+    /* A COMMAND WITHOUT pty-req RUNS ON PIPES, as sshd runs one: its
+     * stdin, its stdout, and its stderr -- which goes back as
+     * EXTENDED_DATA, the client's stderr. It ran on a raw pty, so `ssh
+     * host tty` said /dev/pts/0 where Linux's says "not a tty", and
+     * every isatty in it was true (finding 69). The server's ends; all 0
+     * on a pty session. in_w closes on the client's EOF, the others at
+     * theirs. */
+    struct file *in_w, *out_r, *err_r;
+    bool         on_pipes;
 };
 
 struct ssh_chachapoly_ctx {
@@ -241,6 +253,10 @@ static void ssh_channel_teardown(void) {
         if (cp && !cp->is_thread) cp->ppid = PROC_PPID_ORPHAN;
     }
     if (g_chan.ptym) { pty_close(g_chan.ptym); kfree(g_chan.ptym); g_chan.ptym = 0; }
+    if (g_chan.in_w)  { file_close(g_chan.in_w);  g_chan.in_w = 0; }
+    if (g_chan.out_r) { file_close(g_chan.out_r); g_chan.out_r = 0; }
+    if (g_chan.err_r) { file_close(g_chan.err_r); g_chan.err_r = 0; }
+    g_chan.on_pipes = false;
     g_chan.pty_idx = -1;
     g_chan.child_pid = -1;
     g_chan.want_spawn = false;
@@ -739,6 +755,23 @@ static bool ssh_send_channel_data(struct tcp_conn *c, const void *data,
     return payload_put_u8(payload, sizeof(payload), &o,
                           SSH_MSG_CHANNEL_DATA) &&
            payload_put_u32(payload, sizeof(payload), &o, g_chan.remote_id) &&
+           payload_put_string_raw(payload, sizeof(payload), &o, data, n) &&
+           ssh_send_packet(c, payload, o);
+}
+
+/* The command's stderr: EXTENDED_DATA of type 1 (RFC 4254 5.2), which the
+ * client writes to its own stderr. Counted against the same window as
+ * CHANNEL_DATA. */
+static bool ssh_send_channel_extended_data(struct tcp_conn *c, const void *data,
+                                           size_t n) {
+    uint8_t payload[SSH_CHANNEL_PACKET + 20u];
+    size_t o = 0;
+    if (n > SSH_CHANNEL_PACKET) n = SSH_CHANNEL_PACKET;
+    return payload_put_u8(payload, sizeof(payload), &o,
+                          SSH_MSG_CHANNEL_EXTENDED_DATA) &&
+           payload_put_u32(payload, sizeof(payload), &o, g_chan.remote_id) &&
+           payload_put_u32(payload, sizeof(payload), &o,
+                           SSH_EXTENDED_DATA_STDERR) &&
            payload_put_string_raw(payload, sizeof(payload), &o, data, n) &&
            ssh_send_packet(c, payload, o);
 }
@@ -1333,7 +1366,10 @@ static void ssh_handle_channel_data_payload(const uint8_t *payload,
     if (o + 4u > n) goto malformed;
     recipient = get_u32_be(payload + o); o += 4u;
     if (!read_string(payload, n, &o, &data, &data_n)) goto malformed;
-    if (!g_chan.active || recipient != g_chan.local_id || !g_chan.ptym)
+    /* queued from the moment the command is asked for, so what the client
+     * sends ahead of the (deferred) spawn reaches it */
+    if (!g_chan.active || recipient != g_chan.local_id ||
+        (!g_chan.ptym && !g_chan.on_pipes && !g_chan.want_spawn))
         return;
     /* QUEUE it; ssh_feed_channel_input() moves it into the line discipline
      * as the pty accepts it, and only then tells the client it may send
@@ -1473,23 +1509,40 @@ static void ssh_passwd_home(const char *user, char *out, size_t cap) {
 static bool ssh_spawn_shell(void) {
     g_chan.want_spawn = false;
 
-    struct file *m = pty_open_master();
-    if (!m) {
-        kprintf("[ssh] no free pty for '%s'\n", g_auth_user);
-        return false;
+    struct file *m = 0, *sl = 0;
+    int idx = -1;
+    /* the command's ends of the three pipes (see ssh_channel.on_pipes) */
+    struct file *in_r = 0, *out_w = 0, *err_w = 0;
+    bool pipes = !g_chan.want_pty;
+    if (pipes) {
+        struct file *in_w = 0, *out_r = 0, *err_r = 0;
+        if (pipe_create(&in_r, &in_w) != 0 ||
+            pipe_create(&out_r, &out_w) != 0 ||
+            pipe_create(&err_r, &err_w) != 0) {
+            struct file *all[6] = { in_r, in_w, out_r, out_w, err_r, err_w };
+            for (int k = 0; k < 6; k++) if (all[k]) file_close(all[k]);
+            kprintf("[ssh] no pipes for '%s'\n", g_auth_user);
+            return false;
+        }
+        g_chan.in_w = in_w;
+        g_chan.out_r = out_r;
+        g_chan.err_r = err_r;
+    } else {
+        m = pty_open_master();
+        if (!m) {
+            kprintf("[ssh] no free pty for '%s'\n", g_auth_user);
+            return false;
+        }
+        idx = pty_index_of(m);
+        sl = (idx >= 0) ? pty_open_slave(idx) : 0;
+        if (!sl) {
+            pty_close(m); kfree(m);
+            kprintf("[ssh] pty slave open failed\n");
+            return false;
+        }
+        if (g_chan.win_cols || g_chan.win_rows)
+            pty_set_winsize(m, g_chan.win_cols, g_chan.win_rows);
     }
-    int idx = pty_index_of(m);
-    struct file *sl = (idx >= 0) ? pty_open_slave(idx) : 0;
-    if (!sl) {
-        pty_close(m); kfree(m);
-        kprintf("[ssh] pty slave open failed\n");
-        return false;
-    }
-    if (g_chan.win_cols || g_chan.win_rows)
-        pty_set_winsize(m, g_chan.win_cols, g_chan.win_rows);
-    /* No pty-req: this channel is a byte pipe, so take the line
-     * discipline out of the path entirely -- see pty_set_raw(). */
-    if (!g_chan.want_pty) pty_set_raw(m);
 
     /* A SHELL SESSION IS A LOGIN SHELL, as sshd starts one: its name
      * begins with `-` ("-tsh"), so it reads the login profiles (bash's
@@ -1541,7 +1594,11 @@ static bool ssh_spawn_shell(void) {
     memset(&spec, 0, sizeof(spec));
     spec.path = "/bin/tsh";
     spec.name = "tsh-ssh";
-    spec.fd0 = sl; spec.fd1 = sl; spec.fd2 = sl;
+    if (pipes) {
+        spec.fd0 = in_r; spec.fd1 = out_w; spec.fd2 = err_w;
+    } else {
+        spec.fd0 = sl; spec.fd1 = sl; spec.fd2 = sl;
+    }
     spec.argc = argc;
     spec.argv = argv;
     spec.envc = envc;
@@ -1549,10 +1606,22 @@ static bool ssh_spawn_shell(void) {
     spec.cwd  = "/";
 
     int pid = proc_spawn(&spec);
-    pty_close(sl); kfree(sl);        /* the child holds its own clones now */
+    /* the child holds its own clones now: ours go, so the command's exit
+     * is the EOF the pump watches for */
+    if (pipes) {
+        file_close(in_r); file_close(out_w); file_close(err_w);
+    } else {
+        pty_close(sl); kfree(sl);
+    }
 
     if (pid < 0) {
-        pty_close(m); kfree(m);
+        if (pipes) {
+            file_close(g_chan.in_w);  g_chan.in_w = 0;
+            file_close(g_chan.out_r); g_chan.out_r = 0;
+            file_close(g_chan.err_r); g_chan.err_r = 0;
+        } else {
+            pty_close(m); kfree(m);
+        }
         kprintf("[ssh] spawn of /bin/tsh FAILED rc=%d\n", pid);
         return false;
     }
@@ -1567,29 +1636,28 @@ static bool ssh_spawn_shell(void) {
         if (cp && u) { cp->uid = u->uid; cp->gid = u->gid; }
         /* ITS OWN SESSION, as sshd's child is (setsid). A login session's
          * controlling terminal is its pty -- /dev/tty in it is the pty, not
-         * the console it was -- and a command run without pty-req has
-         * none, as `ssh host cmd` on Linux: /dev/tty is ENXIO there, and a
-         * `bash -i` in it says it has no job control instead of stopping on
-         * the console's SIGTTIN (finding 61). The pty's foreground group is
-         * the session's either way. Not its own process GROUP: see
-         * proc_kill_tree for what that did. */
+         * the console it was -- and a command run without pty-req has no
+         * terminal at all, as `ssh host cmd` on Linux: /dev/tty is ENXIO
+         * there, and a `bash -i` in it says it has no job control instead
+         * of stopping on the console's SIGTTIN (finding 61). Not its own
+         * process GROUP: see proc_kill_tree for what that did. */
         if (cp) {
             cp->sid = pid;
-            (void)pty_make_ctty(cp, idx, true);
-            if (!g_chan.want_pty) {
-                cp->ctty_kind = PROC_CTTY_NONE;
-                cp->ctty_index = 0;
-                cp->ctty_gen = 0;
-            }
+            if (!pipes) (void)pty_make_ctty(cp, idx, true);
         }
     }
     /* BISECT: proc_set_pgid removed for this experiment. */
 
     g_chan.ptym = m;
     g_chan.pty_idx = idx;
+    g_chan.on_pipes = pipes;
     g_chan.child_pid = pid;
-    kprintf("[ssh] /bin/tsh pid=%d on pty%d for '%s'%s\n",
-            pid, idx, g_auth_user, g_chan.exec_mode ? " (exec)" : "");
+    if (pipes)
+        kprintf("[ssh] /bin/tsh pid=%d on pipes for '%s'%s\n",
+                pid, g_auth_user, g_chan.exec_mode ? " (exec)" : "");
+    else
+        kprintf("[ssh] /bin/tsh pid=%d on pty%d for '%s'%s\n",
+                pid, idx, g_auth_user, g_chan.exec_mode ? " (exec)" : "");
     return true;
 }
 
@@ -1599,15 +1667,29 @@ static bool ssh_spawn_shell(void) {
  * spoke about the window again, so a client was free to send 32 KiB into a
  * 4 KiB ring and nothing anywhere noticed the loss. */
 static void ssh_feed_channel_input(void) {
-    if (!g_cli || !g_chan.active || !g_chan.ptym) return;
+    if (!g_cli || !g_chan.active || (!g_chan.ptym && !g_chan.on_pipes)) return;
 
     while (g_chan.in_pend_tail != g_chan.in_pend_head) {
         size_t run = (g_chan.in_pend_head > g_chan.in_pend_tail)
                    ? g_chan.in_pend_head - g_chan.in_pend_tail
                    : SSH_CHANNEL_WINDOW - g_chan.in_pend_tail;
-        long w = pty_master_write(g_chan.ptym,
-                                  (const char *)&g_chan.in_pend[g_chan.in_pend_tail],
-                                  run);
+        const char *src = (const char *)&g_chan.in_pend[g_chan.in_pend_tail];
+        long w;
+        if (g_chan.ptym) {
+            w = pty_master_write(g_chan.ptym, src, run);
+        } else if (g_chan.in_w && g_chan.in_w->pipe->readers > 0) {
+            /* only what the pipe has room for, so the write never blocks
+             * the server (pipe_write would park it on a full ring) */
+            struct pipe *pp = g_chan.in_w->pipe;
+            size_t room = PIPE_BUF_SZ - pp->count;
+            if (room == 0) break;
+            if (run > room) run = room;
+            w = pipe_write(pp, src, run);
+        } else {
+            /* stdin closed, or nobody reads it any more: what the client
+             * sends goes nowhere, as into a pipe with no reader */
+            w = (long)run;
+        }
         if (w <= 0) break;                 /* ring full: try again next tick */
         g_chan.in_pend_tail = (g_chan.in_pend_tail + (size_t)w) % SSH_CHANNEL_WINDOW;
         if ((size_t)w < run) break;
@@ -1632,7 +1714,12 @@ static void ssh_feed_channel_input(void) {
      * data it was supposed to read. */
     if (g_chan.in_eof_pending && g_chan.in_pend_tail == g_chan.in_pend_head) {
         g_chan.in_eof_pending = false;
-        pty_master_input_eof(g_chan.ptym);
+        if (g_chan.ptym) {
+            pty_master_input_eof(g_chan.ptym);
+        } else if (g_chan.in_w) {          /* the command's stdin ends */
+            file_close(g_chan.in_w);
+            g_chan.in_w = 0;
+        }
     }
 }
 
@@ -1645,9 +1732,81 @@ static void ssh_feed_channel_input(void) {
  * for exec, which the old term-session version could not do -- it only ever
  * closed the channel in exec mode, because an empty ring and a finished
  * command looked identical to it. */
-static void ssh_drain_channel_output(void) {
-    if (!g_cli || !g_chan.active || !g_chan.ptym || g_chan.close_sent)
+/* The command is over: its status, EOF and CLOSE -- whether this was `ssh
+ * host cmd` or an interactive session the user typed `exit` into. */
+static void ssh_session_finished(void) {
+    int code = 0;
+    struct proc *cp = (g_chan.child_pid > 0)
+                    ? proc_lookup(g_chan.child_pid) : 0;
+    if (cp) code = cp->exit_code;
+    kprintf("[ssh] session shell pid=%d finished rc=%d\n",
+            g_chan.child_pid, code);
+    if (!ssh_send_channel_exit_status(g_cli, (uint32_t)code) ||
+        !ssh_send_channel_eof(g_cli) ||
+        !ssh_send_channel_close(g_cli)) {
+        ssh_close_client();
         return;
+    }
+    ssh_channel_teardown();
+    g_chan.active = false;
+}
+
+/* A command on pipes (ssh_channel.on_pipes): stdout goes as CHANNEL_DATA
+ * and stderr as EXTENDED_DATA, as far as the client's window and our own
+ * buffer allow, never blocking (pipe_tryread). Each pipe is done at its
+ * EOF -- every writer gone, the command's descendants included, as sshd
+ * waits for them -- and the session once both are and the command has
+ * exited. */
+static void ssh_drain_pipes(void) {
+    for (int rounds = 0; rounds < 4; rounds++) {
+        bool moved = false;
+        for (int k = 0; k < 2; k++) {
+            struct file **fp = (k == 0) ? &g_chan.out_r : &g_chan.err_r;
+            if (!*fp) continue;
+            if (g_chan.remote_window == 0) return;
+            size_t room = ssh_tx_space();
+            if (room < 1024u) return;
+            char out[512];
+            size_t cap = sizeof(out);
+            if (cap > room - 512u) cap = room - 512u;
+            if (cap > g_chan.remote_window) cap = g_chan.remote_window;
+            if (cap > g_chan.remote_max_packet && g_chan.remote_max_packet > 0)
+                cap = g_chan.remote_max_packet;
+            if (cap == 0) return;
+            long n = pipe_tryread((*fp)->pipe, out, cap);
+            if (n == -11) continue;                 /* nothing yet */
+            if (n <= 0) {                           /* EOF */
+                file_close(*fp);
+                *fp = 0;
+                continue;
+            }
+            g_last_client_ns = perf_now_ns();       /* output counts as life */
+            bool ok = (k == 0) ? ssh_send_channel_data(g_cli, out, (size_t)n)
+                               : ssh_send_channel_extended_data(g_cli, out,
+                                                                (size_t)n);
+            if (!ok) {
+                ssh_close_client();
+                return;
+            }
+            g_chan.remote_window -= (uint32_t)n;
+            moved = true;
+        }
+        if (!moved) break;
+    }
+    if (g_chan.out_r || g_chan.err_r) return;
+    struct proc *cp = (g_chan.child_pid > 0)
+                    ? proc_lookup(g_chan.child_pid) : 0;
+    if (cp && cp->state != PROC_TERMINATED) return;   /* not exited yet */
+    ssh_session_finished();
+}
+
+static void ssh_drain_channel_output(void) {
+    if (!g_cli || !g_chan.active || g_chan.close_sent) return;
+    if (g_chan.on_pipes) {
+        ssh_drain_pipes();
+        return;
+    }
+    if (!g_chan.ptym) return;
 
     for (int rounds = 0; rounds < 4; rounds++) {
         if (g_chan.remote_window == 0) return;
@@ -1675,23 +1834,8 @@ static void ssh_drain_channel_output(void) {
             return;
         }
         if (n == 0) {
-            /* The shell exited and the pty drained. Report its status and
-             * close, whether this was `ssh host cmd` or an interactive
-             * session the user typed `exit` into. */
-            int code = 0;
-            struct proc *cp = (g_chan.child_pid > 0)
-                            ? proc_lookup(g_chan.child_pid) : 0;
-            if (cp) code = cp->exit_code;
-            kprintf("[ssh] session shell pid=%d finished rc=%d\n",
-                    g_chan.child_pid, code);
-            if (!ssh_send_channel_exit_status(g_cli, (uint32_t)code) ||
-                !ssh_send_channel_eof(g_cli) ||
-                !ssh_send_channel_close(g_cli)) {
-                ssh_close_client();
-                return;
-            }
-            ssh_channel_teardown();
-            g_chan.active = false;
+            /* The shell exited and the pty drained. */
+            ssh_session_finished();
             return;
         }
 
