@@ -1,9 +1,9 @@
 /* libtoby/src/poll.c -- multiplexed I/O.
  *
- * Delegates to the kernel's SYS_POLL if available, otherwise falls
- * back to a naive busy-poll loop using read/write availability checks.
- * The fallback just marks everything ready (sufficient for single-fd
- * tty usage patterns). */
+ * ABI_SYS_POLL is the kernel's poll(2) (since batch 15). The fallback
+ * below is only for a kernel without it: it sleeps the timeout and then
+ * marks everything ready -- which is what every program got before, so
+ * `read -t 5` in tsh always waited the five seconds. */
 
 #include <poll.h>
 #include <errno.h>

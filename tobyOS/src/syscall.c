@@ -4912,6 +4912,8 @@ static bool waitpid_may_wait(struct proc *self, struct proc *c) {
     return false;
 }
 
+static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms);
+
 static long sys_waitpid(int vpid, int *status_out, int flags) {
     /* Slice 10: the caller's number, translated in; the same number back out.
      * Identity in the initial namespace. */
@@ -5629,6 +5631,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return lx_do_getpgid(a1);
     case ABI_SYS_SETSID:
         return proc_setsid(current_proc());
+    case ABI_SYS_POLL:
+        return lx_do_poll((uint64_t)a1, (unsigned long)a2, (long)(int)a3);
     case ABI_SYS_IOCTL:
         /* Forward to the Linux arm (LX_ioctl == 16): the tty/pty control
          * surface is one implementation for both ABIs. */

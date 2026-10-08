@@ -666,6 +666,8 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
             never_restart = true; break;
         default: break;
         }
+    } else if (num == ABI_SYS_POLL) {
+        never_restart = true;          /* the native poll(2), same reason */
     }
     if (!restored && rv == EINTR_RET && num >= 0 &&
         (sa->sa_flags & SA_RESTART) && !never_restart) {

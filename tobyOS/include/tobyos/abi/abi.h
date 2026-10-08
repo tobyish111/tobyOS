@@ -1263,7 +1263,18 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         and group with no controlling
                                         terminal; -EPERM for a process-
                                         group leader. setsid(2). */
-#define ABI_SYS_NR_MAX          218
+#define ABI_SYS_POLL            219  /* (struct pollfd *fds, nfds, timeout_ms)
+                                        -> ready count|0|-E: poll(2), the
+                                        Linux personality's own (same
+                                        struct, same POLL* bits). libtoby's
+                                        poll() had no syscall to call and
+                                        slept the whole timeout, then said
+                                        every fd was ready -- so tsh's
+                                        `read -t 5` always waited five
+                                        seconds and `sleep 4 | read -t 2`
+                                        four (logs/b15 rt). Never restarted
+                                        after a handler, as on Linux. */
+#define ABI_SYS_NR_MAX          219
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {
