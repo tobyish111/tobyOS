@@ -221,7 +221,11 @@ int system(const char *cmd) {
     sh_argv[1] = (char *)"-c";
     sh_argv[2] = (char *)cmd;
     sh_argv[3] = 0;
-    pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 0, 0);
+    /* The child's 0, 1 and 2 are ours. It was handed our fd 0 as all
+     * three -- which worked only while 0, 1 and 2 were one terminal: under
+     * an SSH command, on pipes now (finding 69), what it wrote went into
+     * its stdin pipe and was lost (hwgate sh_system). */
+    pid_t pid = toby_spawn("/bin/sh", sh_argv, environ, 0, 1, 2);
     if (pid < 0) return -1;
     int status = 0;
     pid_t rc = waitpid(pid, &status, 0);

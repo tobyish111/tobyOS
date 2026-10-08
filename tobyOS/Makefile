@@ -954,7 +954,12 @@ USER_CFLAGS := --target=x86_64-elf \
 programs/systest/systest.o: programs/systest/main.c
 	$(CC) $(LIBTOBY_CFLAGS) -c $< -o $@
 
-programs/systest/systest.elf: programs/systest/systest.o $(LIBTOBY_CRT0) $(LIBTOBY_AR) \
+# The libtoby prerequisites BY NAME: $(LIBTOBY_CRT0) and $(LIBTOBY_AR) are
+# defined below, and make expands a rule's prerequisites as it reads the
+# rule -- so they were empty here, systest.elf never relinked, and the image
+# carried the September build's system() through every libtoby fix since
+# (batch 15: hwgate sh_system).
+programs/systest/systest.elf: programs/systest/systest.o libtoby/crt0.o libtoby/libtoby.a \
                               programs/systest/program.ld
 	$(LD) $(PROG_LDFLAGS) -T programs/systest/program.ld -o $@ \
 	      $(LIBTOBY_CRT0) programs/systest/systest.o $(LIBTOBY_AR)
