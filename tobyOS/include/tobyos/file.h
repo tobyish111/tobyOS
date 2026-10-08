@@ -150,6 +150,10 @@ enum file_kind {
      * bare instance INDEX -- the first caller got 0 and then read stdin
      * believing it was watching the filesystem. */
     FILE_KIND_INOTIFY    = 25,
+    /* A FIFO opened for reading AND writing (`exec 8<> fifo`): one
+     * descriptor that is both ends of the FIFO's pipe, as Linux gives one,
+     * counted as a reader and a writer. See pipe.c fifo_open. */
+    FILE_KIND_PIPE_RW    = 26,
 };
 
 struct eventfd;
@@ -161,8 +165,11 @@ struct nsfd;
 
 struct file {
     enum file_kind  kind;
-    /* For PIPE_R / PIPE_W. */
+    /* For PIPE_R / PIPE_W / PIPE_RW. */
     struct pipe    *pipe;
+    /* O_NONBLOCK on a pipe end (pipe2, F_SETFL, a FIFO's open): a read
+     * with nothing to read and a write with no room are EAGAIN. */
+    bool            pipe_nonblock;
     /* For VFS-backed handles. */
     struct vfs_file vfs;
     /* Milestone 25A: side-allocated open-file-description refcount so

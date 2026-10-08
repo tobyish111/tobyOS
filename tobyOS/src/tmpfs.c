@@ -281,7 +281,7 @@ static int tmpfs_open(void *mnt, const char *path, struct vfs_file *out)
     out->size = nd->size;
     out->uid  = nd->uid;
     out->gid  = nd->gid;
-    out->mode = (nd->mode & 07777u) | VFS_MODE_VALID;
+    out->mode = (nd->mode & 0177777u) | VFS_MODE_VALID;
     return VFS_OK;
 }
 
@@ -393,7 +393,9 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
     nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
     nd->uid = uid; nd->gid = gid;
-    nd->mode = mode ? (mode & 07777u) : 0644u;
+    /* the format bits too: a FIFO is a file whose mode says S_IFIFO
+     * (vfs_mkfifo) */
+    nd->mode = mode ? (mode & 0177777u) : 0644u;
     nd->mtime = nd->atime = tmpfs_now_secs();
     return VFS_OK;
 }
@@ -582,7 +584,7 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
      * SILENTLY run unprivileged, while the identical binary on the initrd
      * ramfs (whose stat does set the flag) worked. tmpfs_open set it and
      * tmpfs_stat did not, so the two disagreed about the same file. */
-    out->mode  = (nd->mode & 07777u) | VFS_MODE_VALID;
+    out->mode  = (nd->mode & 0177777u) | VFS_MODE_VALID;
     out->mtime = nd->mtime;
     out->atime = nd->atime;
     out->nlink = nd->nlink ? nd->nlink : 1u;
@@ -653,7 +655,7 @@ static int tmpfs_chmod(void *mnt, const char *path, uint32_t mode)
     if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
-    nd->mode = mode & 07777u;
+    nd->mode = (nd->mode & 0170000u) | (mode & 07777u);   /* keeps its type */
     return VFS_OK;
 }
 

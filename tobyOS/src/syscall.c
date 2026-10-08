@@ -397,7 +397,7 @@ static long sys_write_one(int fd, const void *buf, size_t len) {
      * EPIPE as an ordinary short write and went round again -- and every
      * program in the "write until the reader goes away" shape ran forever
      * instead of dying with 141. */
-    if (rv == -3 && f->kind == FILE_KIND_PIPE_W) {
+    if (rv == -3 && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW)) {
         struct proc *me = current_proc();
         if (me) signal_send_to_pid(me->pid, SIGPIPE);
     }
@@ -543,7 +543,7 @@ static long sys_read_nb(int fd, void *buf, size_t len) {
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
-    if (f->kind != FILE_KIND_PIPE_R)
+    if (f->kind != FILE_KIND_PIPE_R && f->kind != FILE_KIND_PIPE_RW)
         return sys_read(fd, buf, len);           /* only pipes get the NB path */
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
@@ -3264,6 +3264,25 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
         if (pc != VFS_OK && pc != VFS_ERR_NOENT) return vfs_err_to_abi(pc);
     }
 
+    /* A FIFO is opened as its PIPE (pipe.c fifo_open): a reader waits for
+     * a writer and a writer for a reader -- O_NONBLOCK: the reader goes on,
+     * the writer is ENXIO -- and O_RDWR is both ends at once. Its path is
+     * the descriptor's, as /proc/PID/fd names a FIFO by it. */
+    {
+        struct vfs_stat fs;
+        if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            (fs.mode & 0170000u) == 0010000u) {
+            struct file *ff = 0;
+            long fr = fifo_open(kpath, fs.dev, fs.ino, access,
+                                (flags & ABI_O_NONBLOCK) != 0, &ff);
+            if (fr < 0) return fr;
+            file_set_open_path(ff, kpath);
+            int ffd = fd_alloc_into(current_proc(), ff);
+            if (ffd < 0) { file_close(ff); return -ABI_EMFILE; }
+            return ffd;
+        }
+    }
+
     if (want_trunc) {
         /* O_TRUNC truncates the file IN PLACE. It used to unlink and
          * recreate, with the note "the VFS doesn't expose a real truncate
@@ -3386,7 +3405,8 @@ static long sys_lseek(int fd, int64_t off, int whence) {
      * rest -- `printf 'read v\nx\necho $v\n' | bash` printed nothing
      * (logs/b13 q58, fx272). */
     switch (f->kind) {
-    case FILE_KIND_PIPE_R: case FILE_KIND_PIPE_W: case FILE_KIND_SOCKET:
+    case FILE_KIND_PIPE_R: case FILE_KIND_PIPE_W: case FILE_KIND_PIPE_RW:
+    case FILE_KIND_SOCKET:
     case FILE_KIND_CONSOLE: case FILE_KIND_TERM: case FILE_KIND_PTY_MASTER:
     case FILE_KIND_PTY_SLAVE: case FILE_KIND_EPOLL:
         return -ABI_ESPIPE;
@@ -6027,6 +6047,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_lseek((int)a1, (int64_t)a2, (int)a3);
     case SYS_STAT:
         return sys_stat((const char *)a1, (struct abi_stat *)a2);
+    case ABI_SYS_MKFIFO: {
+        char kpath[ABI_PATH_MAX];
+        int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (rr) return rr;
+        int fr = vfs_mkfifo(kpath, sys_creation_mode((int)a2, 0666u));
+        return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
+    }
     case ABI_SYS_LSTAT:
         return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
     case SYS_FSTAT:
@@ -7146,7 +7173,8 @@ static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
     if (!f) return 0;
     switch (f->kind) {
     case FILE_KIND_PIPE_R:
-    case FILE_KIND_PIPE_W:    return 0x1000u | 0600u;          /* S_IFIFO  */
+    case FILE_KIND_PIPE_W:
+    case FILE_KIND_PIPE_RW:   return 0x1000u | 0600u;          /* S_IFIFO  */
     case FILE_KIND_SOCKET:    return 0xC000u | 0777u;          /* S_IFSOCK */
     case FILE_KIND_DEVNULL:   return devfs_node_mode("/dev/null", maj, min);
     case FILE_KIND_DEVZERO:   return devfs_node_mode("/dev/zero", maj, min);
@@ -7439,7 +7467,8 @@ static uint64_t lx_obj_ino(char tag, const void *obj) {
 
 uint64_t file_object_ino(struct file *f) {
     if (!f) return 0;
-    if ((f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W) && f->pipe)
+    if ((f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+         f->kind == FILE_KIND_PIPE_RW) && f->pipe)
         return lx_obj_ino('p', f->pipe);
     if (f->kind == FILE_KIND_SOCKET && f->sock) return lx_obj_ino('s', f->sock);
     return 0;
@@ -7798,6 +7827,12 @@ static short file_poll_ready(struct file *f) {
         if (f->pipe) {
             if (f->pipe->readers == 0)             r |= LXP_POLLERR;
             else if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
+        }
+        break;
+    case FILE_KIND_PIPE_RW:                  /* a FIFO's both ends: never EOF */
+        if (f->pipe) {
+            if (f->pipe->count > 0)           r |= LXP_POLLIN;
+            if (f->pipe->count < PIPE_BUF_SZ) r |= LXP_POLLOUT;
         }
         break;
     case FILE_KIND_INOTIFY:
@@ -11459,13 +11494,17 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_pipe:   return do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
     case LX_pipe2: {
         long r = do_syscall(SYS_PIPE, a1, 0, 0, 0, 0);
-        if (r == 0 && (a2 & LX_O_CLOEXEC)) {
+        if (r == 0 && (a2 & (LX_O_CLOEXEC | ABI_O_NONBLOCK))) {
             /* sys_pipe just wrote the two fds into the user's int[2];
-             * read them back to mark them. */
+             * read them back to mark them -- close-on-exec, and
+             * O_NONBLOCK, which pipe2 dropped */
             int ufds[2];
             if (copy_from_user(ufds, (const void *)a1, sizeof ufds) == 0) {
-                fd_cloexec_set(current_proc(), ufds[0], 1);
-                fd_cloexec_set(current_proc(), ufds[1], 1);
+                for (int k = 0; k < 2; k++) {
+                    if (a2 & LX_O_CLOEXEC) fd_cloexec_set(current_proc(), ufds[k], 1);
+                    struct file *pf = fd_lookup(ufds[k]);
+                    if (pf && (a2 & ABI_O_NONBLOCK)) pf->pipe_nonblock = true;
+                }
             }
         }
         return r;
@@ -12021,6 +12060,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                      : resolve_user_path(upath, kpath, sizeof kpath);
         if (rr != 0) return -ABI_ENOENT;
         uint32_t fmt = mode & 0170000u;
+        /* S_IFIFO is a FIFO (vfs_mkfifo): mkfifo(3) is mknod with it */
+        if (fmt == 0010000u) {
+            int fr = vfs_mkfifo(kpath, sys_creation_mode((int)(mode & 07777u), 0666u));
+            return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
+        }
         if (fmt != 0 && fmt != 0100000u) return -ABI_EPERM;
         struct vfs_stat ms;
         if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
@@ -13545,6 +13589,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR
                         : (ent.type == VFS_TYPE_SYMLINK) ? LX_DT_LNK
                         : ((ent.mode & 0xF000u) == 0x2000u) ? LX_DT_CHR
+                        : ((ent.mode & 0xF000u) == 0x1000u) ? 1 /* DT_FIFO */
                         : LX_DT_REG;
             memcpy(de.d_name, ent.name, namelen);
             de.d_name[namelen] = '\0';
@@ -14934,6 +14979,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 return ff->o_accmode | SOCK_NONBLOCK;
             if (ff->kind == FILE_KIND_VFS && ff->vfs.append)
                 return ff->o_accmode | ABI_O_APPEND;   /* tracked since 2026-10-01 */
+            if ((ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+                 ff->kind == FILE_KIND_PIPE_RW) && ff->pipe_nonblock)
+                return ff->o_accmode | ABI_O_NONBLOCK;
             return ff->o_accmode;
         }
         if ((int)a2 == 4 /* F_SETFL */) {
@@ -14941,6 +14989,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (!ff) return -ABI_EBADF;
             if (ff->kind == FILE_KIND_SOCKET && ff->sock)
                 ff->sock->nonblock = ((unsigned long)a3 & SOCK_NONBLOCK) != 0;
+            /* a pipe's O_NONBLOCK: reads and writes that would wait are
+             * EAGAIN (file.c) -- it was accepted and dropped */
+            if (ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+                ff->kind == FILE_KIND_PIPE_RW)
+                ff->pipe_nonblock = ((unsigned long)a3 & ABI_O_NONBLOCK) != 0;
             return 0;
         }
         if ((int)a2 == 1033 /* F_ADD_SEALS */) {
@@ -15071,8 +15124,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case 275: {                        /* splice(fin,*offin,fout,*offout,len,fl) */
         struct file *sfi = fd_lookup((int)a1), *sfo = fd_lookup((int)a3);
         if (!sfi || !sfo) return -ABI_EBADF;
-        bool in_pipe  = (sfi->kind == FILE_KIND_PIPE_R);
-        bool out_pipe = (sfo->kind == FILE_KIND_PIPE_W);
+        bool in_pipe  = (sfi->kind == FILE_KIND_PIPE_R || sfi->kind == FILE_KIND_PIPE_RW);
+        bool out_pipe = (sfo->kind == FILE_KIND_PIPE_W || sfo->kind == FILE_KIND_PIPE_RW);
         if (!in_pipe && !out_pipe) return -ABI_EINVAL;  /* one side MUST be a pipe */
         return lx_copy_fds((int)a1, (uint64_t)a2, (int)a3, (uint64_t)a4,
                            (size_t)a5);

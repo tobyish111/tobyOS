@@ -72,6 +72,7 @@ struct pipe {
 
     struct proc *wq_read;   /* head of read-side block queue (proc.next_wait) */
     struct proc *wq_write;  /* head of write-side block queue */
+    void        *fifo;      /* the named FIFO this pipe is, or NULL (fifo_open) */
 };
 
 /* Allocate a pipe + the two file aliases. On success returns 0 and
@@ -86,5 +87,19 @@ long pipe_tryread(struct pipe *p, void *buf, size_t n);   /* non-blocking (slice
 long pipe_write(struct pipe *p, const void *buf, size_t n);
 void pipe_close_reader(struct pipe *p);
 void pipe_close_writer(struct pipe *p);
+/* As much as there is room for, never blocking: the bytes written, -11
+ * (-ABI_EAGAIN) when full, -3 (EPIPE) with no reader. */
+long pipe_trywrite(struct pipe *p, const void *buf, size_t n);
+
+/* OPEN A NAMED FIFO (mkfifo): attach to the pipe that is the FIFO KPATH
+ * -- one per FIFO, made at its first open and gone, with its data, when
+ * the last end closes, as Linux keeps one. DEV and INO name it when the
+ * filesystem has them (else KPATH does). ACCMODE is O_RDONLY, O_WRONLY or
+ * O_RDWR. A reader waits for a writer and a writer for a reader -- unless
+ * NONBLOCK: the reader goes on, the writer is ENXIO; O_RDWR never waits.
+ * 0 and *OUT, or a negative errno (EINTR_RET when a signal ended the
+ * wait). */
+long fifo_open(const char *kpath, uint32_t dev, uint64_t ino, int accmode,
+               bool nonblock, struct file **out);
 
 #endif /* TOBYOS_PIPE_H */

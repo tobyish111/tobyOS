@@ -1160,9 +1160,27 @@ int vfs_create_mode(const char *path, uint32_t mode) {
      * sees it non-zero and stores it. */
     int crc = m->ops->create(m->data, rel,
                              (uint32_t)current_uid(), (uint32_t)current_gid(),
-                             (mode & 07777u) | VFS_MODE_VALID);
+                             (mode & 0177777u) | VFS_MODE_VALID);
     if (crc == VFS_OK) vfs_notify(path, VFS_IN_CREATE, 0);
     return crc;
+}
+
+/* A FIFO (mkfifo(3), mknod S_IFIFO): a file whose mode carries S_IFIFO;
+ * opening one attaches to its pipe (pipe.c fifo_open). Only a filesystem
+ * that keeps the format bits can hold one -- tmpfs and tobyfs; on any
+ * other the file it made is taken back and the answer is EPERM, the errno
+ * Linux gives for a node a filesystem cannot make. There were no FIFOs:
+ * mkfifo refused, mknod S_IFIFO said EPERM everywhere. */
+int vfs_mkfifo(const char *path, uint32_t mode) {
+    struct vfs_stat st;
+    if (vfs_stat(path, &st) == VFS_OK) return VFS_ERR_EXIST;
+    int rc = vfs_create_mode(path, (mode & 07777u) | 0010000u);
+    if (rc != VFS_OK) return rc;
+    if (vfs_stat(path, &st) != VFS_OK || (st.mode & 0170000u) != 0010000u) {
+        (void)vfs_unlink(path);
+        return VFS_ERR_NOTPERM;                     /* EPERM, not EACCES */
+    }
+    return VFS_OK;
 }
 
 /* Defined with the symlink table further down; declared here because

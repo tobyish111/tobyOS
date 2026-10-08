@@ -446,6 +446,8 @@ int  vfs_create  (const char *path);          /* mode 0644 */
 /* MODE is the new file's permission bits, used as given: the caller has
  * taken the umask off (the syscall layer, for a process's open). */
 int  vfs_create_mode(const char *path, uint32_t mode);
+/* A FIFO at PATH, permissions MODE (the caller's umask already applied). */
+int  vfs_mkfifo(const char *path, uint32_t mode);
 int  vfs_unlink  (const char *path);
 /* Phase G: hard link newpath -> oldpath's inode. Both paths must resolve
  * inside the SAME mount (VFS_ERR_XDEV otherwise); VFS_ERR_ROFS when the

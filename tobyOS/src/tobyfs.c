@@ -1587,8 +1587,9 @@ static int tobyfs_chmod(void *mnt, const char *path, uint32_t mode) {
     int rc = path_walk(fs, path, &ino, &node);
     if (rc != VFS_OK) return rc;
     /* Preserve any high-bit flags (e.g. MODE_VALID) the caller asked for
-     * but mask everything else to perms only. */
-    node.mode = (mode & TFS_MODE_PERMS) | TFS_MODE_VALID;
+     * but mask everything else to perms only -- and keep the file's own
+     * format bits: chmod of a FIFO left a regular file (vfs_mkfifo). */
+    node.mode = (node.mode & 0170000u) | (mode & TFS_MODE_PERMS) | TFS_MODE_VALID;
     return write_inode(fs, ino, &node);
 }
 

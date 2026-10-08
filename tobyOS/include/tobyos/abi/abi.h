@@ -130,6 +130,7 @@ extern "C" {
 #define ABI_ENOTDIR         20   /* not a directory */
 #define ABI_EISDIR          21   /* is a directory */
 #define ABI_EINVAL          22   /* invalid argument */
+#define ABI_ENFILE          23   /* too many open files in the system */
 #define ABI_EMFILE          24   /* too many open files (per-proc cap) */
 #define ABI_ENOSPC          28   /* no space left on device */
 #define ABI_ESPIPE          29   /* illegal seek (pread/pwrite on pipe) */
@@ -1279,7 +1280,11 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         S_IFLNK. SYS_STAT follows one. There
                                         was no lstat, and stat called a link
                                         a regular file (finding 87). */
-#define ABI_SYS_NR_MAX          220
+#define ABI_SYS_MKFIFO          221  /* (path, mode) -> 0|-E: mkfifo(3), a
+                                        FIFO with mode less the umask; EEXIST,
+                                        EPERM where the filesystem cannot
+                                        hold one. There were no FIFOs. */
+#define ABI_SYS_NR_MAX          221
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {

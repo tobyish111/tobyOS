@@ -22,6 +22,8 @@
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+#include <tobyos/vfs.h>
+#include <tobyos/abi/abi.h>
 
 /* ---- wait-queue helpers ----------------------------------------- */
 
@@ -55,8 +57,11 @@ static void wq_wake_all(struct proc **head) {
 
 /* ---- pipe lifecycle --------------------------------------------- */
 
+static void fifo_pipe_gone(struct pipe *p);
+
 static void pipe_maybe_free(struct pipe *p) {
     if (p->readers == 0 && p->writers == 0) {
+        if (p->fifo) fifo_pipe_gone(p);    /* its FIFO forgets it, and the data */
         kfree(p);
     }
 }
@@ -236,4 +241,132 @@ long pipe_write(struct pipe *p, const void *buf, size_t n) {
         if (p->wq_read) wq_wake_all(&p->wq_read);
     }
     return (long)put;
+}
+
+long pipe_trywrite(struct pipe *p, const void *buf, size_t n) {
+    if (!p || !buf) return -1;
+    if (n == 0) return 0;
+    if (p->readers == 0) return -3;
+    if (p->count == PIPE_BUF_SZ) return -ABI_EAGAIN;
+    size_t put = pipe_fill(p, (const uint8_t *)buf, n);
+    if (p->wq_read) wq_wake_all(&p->wq_read);
+    return (long)put;
+}
+
+/* ---- named FIFOs (mkfifo) --------------------------------------------
+ *
+ * A FIFO is a file whose mode says S_IFIFO; opening one attaches to a
+ * kernel pipe kept here, one per FIFO, made at the first open and freed --
+ * its unread data with it -- when the last end closes (pipe_maybe_free),
+ * as Linux keeps one per inode. The opens are what the FIFO's open(2)
+ * rules count: a reader waits for a writer, a writer for a reader, so the
+ * counters let a waiter see an end that came and went while it slept. */
+#define FIFO_MAX 64
+struct fifo {
+    bool         used;
+    uint32_t     dev;
+    uint64_t     ino;
+    char         path[VFS_PATH_MAX];    /* when the filesystem has no inode */
+    struct pipe *p;
+    uint32_t     r_opens, w_opens;      /* opens of each end, ever */
+    int          waiting;               /* openers parked here */
+    struct proc *wq;
+};
+static struct fifo g_fifos[FIFO_MAX];
+
+static void fifo_pipe_gone(struct pipe *p) {
+    struct fifo *ff = (struct fifo *)p->fifo;
+    if (!ff) return;
+    ff->p = 0;
+    if (ff->waiting == 0) ff->used = false;
+}
+
+static struct fifo *fifo_find(const char *kpath, uint32_t dev, uint64_t ino) {
+    struct fifo *free_slot = 0;
+    for (int i = 0; i < FIFO_MAX; i++) {
+        struct fifo *ff = &g_fifos[i];
+        if (!ff->used) { if (!free_slot) free_slot = ff; continue; }
+        if (ino && dev) {
+            if (ff->ino == ino && ff->dev == dev) return ff;
+        } else if (!ff->ino && strcmp(ff->path, kpath) == 0) {
+            return ff;
+        }
+    }
+    if (!free_slot) return 0;
+    memset(free_slot, 0, sizeof *free_slot);
+    free_slot->used = true;
+    free_slot->dev = (ino && dev) ? dev : 0;
+    free_slot->ino = (ino && dev) ? ino : 0;
+    size_t kl = strlen(kpath);
+    if (kl >= sizeof free_slot->path) kl = sizeof free_slot->path - 1;
+    memcpy(free_slot->path, kpath, kl);
+    free_slot->path[kl] = 0;
+    return free_slot;
+}
+
+/* Park on the FIFO until the other end has opened (its counter moves) or
+ * is open; false when a signal that acts ended the wait. */
+static bool fifo_wait_other(struct fifo *ff, bool want_writer) {
+    uint32_t start = want_writer ? ff->w_opens : ff->r_opens;
+    struct proc *self = current_proc();
+    ff->waiting++;
+    for (;;) {
+        struct pipe *p = ff->p;
+        int other = !p ? 0 : (want_writer ? p->writers : p->readers);
+        uint32_t now = want_writer ? ff->w_opens : ff->r_opens;
+        if (other > 0 || now != start) break;
+        if (SIG_SHOULD_EINTR(self)) { ff->waiting--; return false; }
+        wq_add(&ff->wq, self);
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        if (SIG_SHOULD_EINTR(self)) { ff->waiting--; return false; }
+    }
+    ff->waiting--;
+    return true;
+}
+
+long fifo_open(const char *kpath, uint32_t dev, uint64_t ino, int accmode,
+               bool nonblock, struct file **out) {
+    struct fifo *ff = fifo_find(kpath, dev, ino);
+    if (!ff) return -ABI_ENFILE;
+    bool rd = (accmode == ABI_O_RDONLY || accmode == ABI_O_RDWR);
+    bool wr = (accmode == ABI_O_WRONLY || accmode == ABI_O_RDWR);
+    /* a writer that will not wait finds no reader: ENXIO, and nothing made */
+    if (accmode == ABI_O_WRONLY && nonblock && (!ff->p || ff->p->readers == 0)) {
+        if (!ff->p && ff->waiting == 0) ff->used = false;
+        return -ABI_ENXIO;
+    }
+    if (!ff->p) {
+        struct pipe *p = (struct pipe *)kmalloc(sizeof(*p));
+        if (!p) { if (ff->waiting == 0) ff->used = false; return -ABI_ENOMEM; }
+        memset(p, 0, sizeof(*p));
+        p->fifo = ff;
+        ff->p = p;
+    }
+    struct file *f = (struct file *)kmalloc(sizeof(*f));
+    if (!f) {
+        if (ff->p->readers == 0 && ff->p->writers == 0) {
+            struct pipe *dead = ff->p;
+            fifo_pipe_gone(dead);
+            kfree(dead);
+        }
+        return -ABI_ENOMEM;
+    }
+    memset(f, 0, sizeof(*f));
+    struct pipe *p = ff->p;
+    f->kind = (rd && wr) ? FILE_KIND_PIPE_RW : rd ? FILE_KIND_PIPE_R : FILE_KIND_PIPE_W;
+    f->pipe = p;
+    f->pipe_nonblock = nonblock;
+    f->o_accmode = accmode;
+    if (rd) { p->readers++; ff->r_opens++; }
+    if (wr) { p->writers++; ff->w_opens++; }
+    if (ff->wq) wq_wake_all(&ff->wq);           /* the other end has come */
+    if (!nonblock && accmode != ABI_O_RDWR) {
+        if (!fifo_wait_other(ff, /*want_writer=*/rd)) {
+            file_close(f);                       /* undoes the counts */
+            return EINTR_RET;
+        }
+    }
+    *out = f;
+    return 0;
 }

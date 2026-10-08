@@ -65,7 +65,7 @@ static void describe_fd_target(struct file *f, char *out, size_t cap) {
         extern uint64_t file_object_ino(struct file *f);
         char num[48];
         if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
-            f->kind == FILE_KIND_SOCKET) {
+            f->kind == FILE_KIND_PIPE_RW || f->kind == FILE_KIND_SOCKET) {
             ksnprintf(num, sizeof num, "%s:[%lu]",
                       f->kind == FILE_KIND_SOCKET ? "socket" : "pipe",
                       (unsigned long)file_object_ino(f));

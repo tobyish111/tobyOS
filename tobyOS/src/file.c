@@ -375,10 +375,18 @@ struct file *file_clone(struct file *src) {
     case FILE_KIND_PIPE_R:
         f->pipe = src->pipe;
         f->pipe->readers++;
+        f->pipe_nonblock = src->pipe_nonblock;
         break;
     case FILE_KIND_PIPE_W:
         f->pipe = src->pipe;
         f->pipe->writers++;
+        f->pipe_nonblock = src->pipe_nonblock;
+        break;
+    case FILE_KIND_PIPE_RW:                    /* a FIFO's both ends */
+        f->pipe = src->pipe;
+        f->pipe->readers++;
+        f->pipe->writers++;
+        f->pipe_nonblock = src->pipe_nonblock;
         break;
     case FILE_KIND_INOTIFY:
         /* dup/fork share the INSTANCE; the last close releases it. Found
@@ -528,6 +536,12 @@ void file_close(struct file *f) {
         pipe_close_reader(f->pipe);
         break;
     case FILE_KIND_PIPE_W:
+        pipe_close_writer(f->pipe);
+        break;
+    case FILE_KIND_PIPE_RW:
+        /* the reader first: the writer count it still holds keeps the
+         * pipe alive until the second close */
+        pipe_close_reader(f->pipe);
         pipe_close_writer(f->pipe);
         break;
     case FILE_KIND_VFS:
@@ -689,6 +703,8 @@ long file_read(struct file *f, void *buf, size_t n) {
         rng_fill(buf, n);
         return (long)n;                            /* never short, never blocks */
     case FILE_KIND_PIPE_R:
+    case FILE_KIND_PIPE_RW:
+        if (f->pipe_nonblock) return pipe_tryread(f->pipe, buf, n);
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
@@ -787,6 +803,8 @@ long file_write(struct file *f, const void *buf, size_t n) {
         rng_mix(buf, n);                           /* writes seed the pool */
         return (long)n;
     case FILE_KIND_PIPE_W:
+    case FILE_KIND_PIPE_RW:
+        if (f->pipe_nonblock) return pipe_trywrite(f->pipe, buf, n);
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
