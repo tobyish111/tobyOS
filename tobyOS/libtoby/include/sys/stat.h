@@ -72,6 +72,7 @@ struct stat {
 int stat (const char *path, struct stat *out);
 int fstat(int fd,           struct stat *out);
 int lstat(const char *path, struct stat *out);   /* the link itself */
+int mkfifo(const char *path, mode_t mode);        /* a named pipe */
 int mkdir(const char *path, mode_t mode);
 mode_t umask(mode_t mask);
 

@@ -98,9 +98,11 @@ static void mode_str(mode_t m, char *out) {
 /* A suffix that says what the entry IS, for -F. */
 static const char *classify(const struct ent *e) {
     if (!F_class || !e->have_stat) return "";
-    if (S_ISDIR(e->st.st_mode)) return "/";
-    if (S_ISLNK(e->st.st_mode)) return "@";
-    if (e->st.st_mode & 0111)   return "*";
+    if (S_ISDIR(e->st.st_mode))  return "/";
+    if (S_ISLNK(e->st.st_mode))  return "@";
+    if (S_ISFIFO(e->st.st_mode)) return "|";      /* GNU's, for a FIFO */
+    if (S_ISSOCK(e->st.st_mode)) return "=";
+    if (S_ISREG(e->st.st_mode) && (e->st.st_mode & 0111)) return "*";
     return "";
 }
 

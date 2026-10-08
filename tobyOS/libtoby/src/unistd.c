@@ -254,6 +254,12 @@ int fstat(int fd, struct stat *out) {
     return abi_stat_to_user(&k, out);
 }
 
+/* A FIFO at PATH, MODE less the umask (ABI_SYS_MKFIFO). */
+int mkfifo(const char *path, mode_t mode) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_MKFIFO, (long)(uintptr_t)path,
+                                      (long)mode));
+}
+
 /* The link itself, S_IFLNK; stat() follows it. There was no lstat, and
  * stat called a link a regular file, so nothing native could see one. */
 int lstat(const char *path, struct stat *out) {
