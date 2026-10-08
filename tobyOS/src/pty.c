@@ -532,15 +532,20 @@ static bool pty_pgrp_orphaned(int pg, int sid) {
     return true;
 }
 
-/* JOB CONTROL ON INPUT (POSIX XBD 11.1.4). A process in a BACKGROUND group
- * of the session whose controlling terminal this is, reading it, has
- * SIGTTIN sent to its group -- by default that stops the job, and the read
- * runs again once it is continued (signal_deliver restarts it) -- or gets
- * EIO when it ignores or blocks SIGTTIN, or its group is orphaned. None was
- * sent: `cat &` at a prompt read the keys typed at the shell, where bash's
- * job stops at once, "Stopped (tty input)" (finding 89). Only the
- * session's own terminal, as Linux checks; 0 when the read may go on. */
-static long pty_bg_read(struct pty *t) {
+/* JOB CONTROL AT THE TERMINAL (POSIX XBD 11.1.4; Linux's tty_check_change).
+ * A process in a BACKGROUND group of the session whose controlling
+ * terminal this is has SIG sent to its group when it READS the terminal
+ * (SIGTTIN), WRITES it under TOSTOP, or CHANGES it -- its modes, its
+ * foreground group, a flush (SIGTTOU): by default that stops the job, and
+ * the call runs again once it is continued (signal_deliver restarts it).
+ * A SIGTTIN ignored or blocked is EIO; a SIGTTOU ignored or blocked lets
+ * the call through, which is how a shell takes its terminal back from a
+ * finished job; an orphaned group, which nothing could continue, is EIO.
+ * None was sent: `cat &` at a prompt read the keys typed at the shell
+ * (finding 89), and a background `stty -echo` changed the terminal under
+ * it. Only the session's own terminal, as Linux checks; 0 when the call
+ * may go on. */
+static long pty_job_check(struct pty *t, int sig) {
     struct proc *p = current_proc();
     if (!p || p->pid == 0 || p->is_kernel) return 0;
     if (p->ctty_kind != PROC_CTTY_PTY || p->ctty_index != t->index ||
@@ -548,12 +553,15 @@ static long pty_bg_read(struct pty *t) {
     int pg = p->pgid > 0 ? p->pgid : p->pid;
     if (t->pgrp <= 0 || pg == t->pgrp) return 0;
     struct sigaction *act = sig_actions_of(p);
-    if ((act && act[SIGTTIN].sa_handler == SIG_IGN) ||
-        (p->sigstate.mask & SIGMASK(SIGTTIN)) || pty_pgrp_orphaned(pg, p->sid))
-        return -ABI_EIO;
-    signal_send_to_pgrp(pg, SIGTTIN);
+    if ((act && act[sig].sa_handler == SIG_IGN) ||
+        (p->sigstate.mask & SIGMASK(sig)))
+        return sig == SIGTTIN ? -ABI_EIO : 0;
+    if (pty_pgrp_orphaned(pg, p->sid)) return -ABI_EIO;
+    signal_send_to_pgrp(pg, sig);
     return EINTR_RET;
 }
+
+static long pty_bg_read(struct pty *t) { return pty_job_check(t, SIGTTIN); }
 
 long pty_slave_read(struct file *f, void *buf, size_t n) {
     struct pty *t = f->pty;
@@ -569,6 +577,10 @@ long pty_slave_read(struct file *f, void *buf, size_t n) {
 long pty_slave_write(struct file *f, const void *buf, size_t n) {
     struct pty *t = f->pty;
     if (!t) return -1;
+    if (t->tio.c_lflag & TTY_TOSTOP) {          /* see pty_job_check */
+        long jc = pty_job_check(t, SIGTTOU);
+        if (jc) return jc;
+    }
     const uint8_t *in = (const uint8_t *)buf;
     bool opost = (t->tio.c_oflag & TTY_OPOST) != 0;
     bool onlcr = (t->tio.c_oflag & TTY_ONLCR) != 0;
@@ -586,6 +598,16 @@ long pty_slave_write(struct file *f, const void *buf, size_t n) {
 long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
     struct pty *t = f->pty;
     if (!t) return -ABI_EBADF;
+    /* A CHANGE to the terminal from the background: SIGTTOU (see
+     * pty_job_check) -- its modes, its foreground group, a flush, as
+     * Linux's tty_check_change is asked for them. The slave's side only:
+     * the master is the emulator's. */
+    if (f->kind == FILE_KIND_PTY_SLAVE &&
+        (cmd == TTY_TCSETS || cmd == TTY_TCSETSW || cmd == TTY_TCSETSF ||
+         cmd == TTY_TIOCSPGRP || cmd == TTY_TCFLSH)) {
+        long jc = pty_job_check(t, SIGTTOU);
+        if (jc) return jc;
+    }
     switch (cmd) {
     case TTY_TCGETS:
         if (copy_to_user((void *)arg, &t->tio, sizeof(t->tio)) != 0) return -ABI_EFAULT;
