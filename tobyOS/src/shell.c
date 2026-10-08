@@ -20801,7 +20801,8 @@ static int test_fd_stat(int n, struct vfs_stat *out) {
 #else
     memset(out, 0, sizeof *out);
     out->type = VFS_TYPE_FILE;
-    if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W) {
+    if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+        f->kind == FILE_KIND_PIPE_RW) {
         out->mode = 0010600u | VFS_MODE_VALID;              /* S_IFIFO */
         return VFS_OK;
     }
@@ -35835,6 +35836,10 @@ static struct file *shell_open_dev_node(const char *path) {
  *
  * The label stays for the path-resolution message; the redirection's own
  * error never named the command in bash. */
+/* Set by `<>` (shell_open_vfs_file_rw) for the open it makes through here:
+ * O_RDWR, where `<` is O_RDONLY and `>` O_WRONLY. */
+static bool g_open_rdwr;
+
 static struct file *shell_open_vfs_file(const char *path_arg, bool write,
                                         bool append, const char *label) {
     char path[VFS_PATH_MAX];
@@ -35843,6 +35848,21 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         struct file *dev = shell_open_dev_node(path);   /* see above */
         if (dev) return dev;
     }
+#ifndef SHELL_HOSTED
+    /* THE KERNEL SHELL CANNOT OPEN A FIFO. The open waits for the other
+     * end and a read for a writer, and this shell runs on pid 0's poll
+     * loop, which must never wait. Opened as a file it read as empty and
+     * kept what was written in the node itself. /bin/tsh opens one as
+     * bash does. */
+    {
+        struct vfs_stat fst;
+        if (vfs_stat_follow(path, &fst) == VFS_OK &&
+            (fst.mode & 0170000u) == 0010000u) {
+            kprintf("%s: the kernel shell cannot open a FIFO\n", path_arg);
+            return 0;
+        }
+    }
+#endif
 
     if (write) {
         struct vfs_stat st;
@@ -35913,9 +35933,11 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
     /* /bin/tsh: `>>` opens a real O_APPEND descriptor (see host.c's
      * vfs_open_append) -- the shell and its children write through it,
      * and an offset kept here cannot follow the children's writes. */
+    extern int vfs_open_output(const char *path, struct vfs_file *out);
     int rc = (write && append) ? vfs_open_append(path, &f->vfs)
+           : g_open_rdwr       ? vfs_open(path, &f->vfs)       /* `<>` */
            : !write            ? vfs_open_input(path, &f->vfs)
-                               : vfs_open(path, &f->vfs);
+                               : vfs_open_output(path, &f->vfs);
 #else
     int rc = vfs_open(path, &f->vfs);
 #endif
@@ -36220,7 +36242,10 @@ static struct file *shell_open_vfs_file_rw(const char *path_arg,
         kprintf("%s: Is a directory\n", path_arg);
         return 0;
     }
-    return shell_open_vfs_file(path_arg, false, false, label);
+    g_open_rdwr = true;                  /* O_RDWR: a FIFO's both ends */
+    struct file *f = shell_open_vfs_file(path_arg, false, false, label);
+    g_open_rdwr = false;
+    return f;
 }
 
 /* A `{name}` descriptor OUTLIVES ITS COMMAND (bash: the script manages its

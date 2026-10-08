@@ -624,6 +624,22 @@ int vfs_open(const char *path, struct vfs_file *out) {
     return VFS_OK;
 }
 
+/* `<` opens O_RDONLY and `>` O_WRONLY, as bash's redirections do -- the
+ * O_RDWR that vfs_open tries first made a FIFO both of its ends at once:
+ * `while read x; do ...; done < fifo` never saw EOF, being a writer itself,
+ * and `echo x > fifo` never waited for a reader (logs/b16 fifo). */
+int vfs_open_output(const char *path, struct vfs_file *out) {
+    if (!path || !out) return VFS_ERR_INVAL;
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return errno_to_vfs();
+    memset(out, 0, sizeof *out);
+    VF_SET(out, fd);
+    struct stat st;
+    out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
+    out->mode = 0644;
+    return VFS_OK;
+}
+
 /* `>>` IS A REAL O_APPEND DESCRIPTOR, as bash's is: every write through it
  * -- the shell's own, every child's, and anyone else's who opened the file
  * separately -- goes to the end of the file. A plain descriptor seeked to
@@ -646,7 +662,20 @@ int vfs_open(const char *path, struct vfs_file *out) {
 #define O_DIRECTORY 0x10000
 #endif
 int vfs_open_input(const char *path, struct vfs_file *out) {
-    int rc = vfs_open(path, out);
+    if (!path || !out) return VFS_ERR_INVAL;
+    int rc;
+    {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            memset(out, 0, sizeof *out);
+            VF_SET(out, fd);
+            struct stat st;
+            out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
+            out->mode = 0644;
+            return VFS_OK;
+        }
+        rc = errno_to_vfs();
+    }
     if (rc != VFS_ERR_ISDIR) return rc;
     int fd = open(path, O_RDONLY | O_DIRECTORY);
     if (fd < 0) return errno_to_vfs();
