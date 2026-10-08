@@ -1641,9 +1641,19 @@ static bool ssh_spawn_shell(void) {
          * there, and a `bash -i` in it says it has no job control instead
          * of stopping on the console's SIGTTIN (finding 61). Not its own
          * process GROUP: see proc_kill_tree for what that did. */
+        /* ON PIPES THE CONSOLE IS NOT ITS TERMINAL EITHER: the session
+         * inherited the worker's -- pid 0's console -- and kept it when
+         * commands moved off the pty (fb0c7d77), so `cat /dev/tty` from
+         * `ssh host cmd` read the console where Linux says ENXIO. */
         if (cp) {
             cp->sid = pid;
-            if (!pipes) (void)pty_make_ctty(cp, idx, true);
+            if (!pipes) {
+                (void)pty_make_ctty(cp, idx, true);
+            } else {
+                cp->ctty_kind = PROC_CTTY_NONE;
+                cp->ctty_index = 0;
+                cp->ctty_gen = 0;
+            }
         }
     }
     /* BISECT: proc_set_pgid removed for this experiment. */
