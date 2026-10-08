@@ -1274,7 +1274,12 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         seconds and `sleep 4 | read -t 2`
                                         four (logs/b15 rt). Never restarted
                                         after a handler, as on Linux. */
-#define ABI_SYS_NR_MAX          219
+#define ABI_SYS_LSTAT           220  /* (path, struct abi_stat *out) -> 0|-E:
+                                        lstat(2) -- a symbolic link itself,
+                                        S_IFLNK. SYS_STAT follows one. There
+                                        was no lstat, and stat called a link
+                                        a regular file (finding 87). */
+#define ABI_SYS_NR_MAX          220
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {
@@ -1901,6 +1906,9 @@ _Static_assert(sizeof(struct abi_display_info) ==
 #define ABI_S_IFDIR     0x4000
 #define ABI_S_IFLNK     0xA000
 #define ABI_S_IFCHR     0x2000   /* character device (the /dev nodes) */
+#define ABI_S_IFIFO     0x1000   /* a pipe (fstat of one) */
+#define ABI_S_IFSOCK    0xC000   /* a socket (fstat of one) */
+#define ABI_S_IFBLK     0x6000
 
 #define ABI_S_ISLNK(m)  (((m) & ABI_S_IFMT) == ABI_S_IFLNK)
 

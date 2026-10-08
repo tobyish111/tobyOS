@@ -30,11 +30,12 @@ static const char *base_of(const char *p) {
 
 static int is_dir(const char *p) {
     /* -n asks for a symlink-to-a-directory to be treated as the LINK rather
-     * than as the directory, which needs lstat(2). libtoby has no lstat, so
-     * -n is accepted and has no effect: `ln -sfn new existing-link` will
-     * put the link INSIDE the directory rather than replacing the symlink.
-     * Said here rather than silently doing the wrong thing. */
+     * than as the directory -- `ln -sfn new existing-link` replaces the
+     * link. That needs lstat(2), which libtoby has had since batch 15; -n
+     * was accepted and did nothing until then. Without -n a link to a
+     * directory IS the directory (stat follows it), as GNU's ln has it. */
     struct stat st;
+    if (nflag && lstat(p, &st) == 0 && S_ISLNK(st.st_mode)) return 0;
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
 

@@ -51,6 +51,14 @@ static int is_dir(const char *p) {
     struct stat st;
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
+
+/* A symbolic link, for -r: copied as a link, as GNU cp -R does (-P). stat
+ * follows links since batch 15, so a recursive copy would otherwise have
+ * copied what every link names -- and looped on a link to an ancestor. */
+static int is_link(const char *p) {
+    struct stat st;
+    return lstat(p, &st) == 0 && S_ISLNK(st.st_mode);
+}
 static int exists(const char *p) {
     struct stat st;
     return stat(p, &st) == 0;
@@ -187,6 +195,24 @@ static int copy_tree(const char *src, const char *dst);
 
 /* One source onto one already-settled destination path. */
 static int copy_one(const char *src, const char *dst) {
+    if (f_recursive && is_link(src)) {      /* -r: a link stays a link */
+        char tgt[1024];
+        ssize_t n = readlink(src, tgt, sizeof tgt - 1);
+        if (n < 0) {
+            fprintf(stderr, "cp: cannot read symbolic link '%s': %s\n",
+                    src, strerror(errno));
+            return -1;
+        }
+        tgt[n] = '\0';
+        (void)unlink(dst);                  /* -f is the default here */
+        if (symlink(tgt, dst) != 0) {
+            fprintf(stderr, "cp: cannot create symbolic link '%s': %s\n",
+                    dst, strerror(errno));
+            return -1;
+        }
+        if (f_verbose) printf("'%s' -> '%s'\n", src, dst);
+        return 0;
+    }
     if (is_dir(src)) {
         if (!f_recursive) {
             fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);

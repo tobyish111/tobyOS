@@ -122,7 +122,7 @@ static void fill_header(struct ustar *h, const char *name,
     oct(h->mode,  8, (unsigned long long)(st->st_mode & 07777));
     oct(h->uid,   8, (unsigned long long)st->st_uid);
     oct(h->gid,   8, (unsigned long long)st->st_gid);
-    oct(h->size, 12, type == '5' ? 0ull : (unsigned long long)st->st_size);
+    oct(h->size, 12, (type == '5' || type == '2') ? 0ull : (unsigned long long)st->st_size);
     oct(h->mtime,12, (unsigned long long)st->st_mtime);
     h->typeflag = type;
     memcpy(h->magic, "ustar", 5);
@@ -158,12 +158,35 @@ static int add_dir(struct buf *b, const char *path) {
 
 static int add_path(struct buf *b, const char *path) {
     struct stat st;
-    if (stat(path, &st) != 0) {
+    /* lstat: a symbolic link is archived as itself (typeflag '2', its
+     * target in linkname) -- stat follows links since batch 15, and tar
+     * would have archived what each link names and looped on a link to
+     * an ancestor directory */
+    if (lstat(path, &st) != 0) {
         fprintf(stderr, "tar: %s: %s\n", path, strerror(errno));
         status = 2;
         return -1;
     }
     struct ustar h;
+    if (S_ISLNK(st.st_mode)) {
+        char tgt[256];
+        ssize_t tl = readlink(path, tgt, sizeof tgt - 1);
+        if (tl < 0 || (size_t)tl >= sizeof h.linkname) {
+            fprintf(stderr, "tar: %s: %s\n", path,
+                    tl < 0 ? strerror(errno) : "link target too long");
+            status = 2;
+            return -1;
+        }
+        fill_header(&h, path, &st, '2');
+        memcpy(h.linkname, tgt, (size_t)tl);
+        unsigned long s = hdr_sum(&h);              /* again, with linkname */
+        oct(h.chksum, 7, s);
+        h.chksum[6] = 0;
+        h.chksum[7] = ' ';
+        if (!buf_add(b, &h, BLK)) return -1;
+        if (v_verbose) printf("%s\n", path);
+        return 0;
+    }
     if (S_ISDIR(st.st_mode)) {
         char withslash[1024];
         snprintf(withslash, sizeof withslash, "%s/", path);
@@ -324,6 +347,9 @@ static int walk_archive(const uint8_t *d, size_t n, int argc, char **argv, int f
         if (want_member(name, argc, argv, first)) {
             if (t_list) {
                 if (v_verbose)
+                    if (h->typeflag == '2')
+                        printf("l %s -> %.100s\n", name, h->linkname);
+                    else
                     printf("%c %s %llu\n", h->typeflag == '5' ? 'd' : '-', name,
                            (unsigned long long)size);
                 else
@@ -332,6 +358,17 @@ static int walk_archive(const uint8_t *d, size_t n, int argc, char **argv, int f
                 if (h->typeflag == '5') {
                     mkdirs(name);
                     mkdir(name, 0755);
+                } else if (h->typeflag == '2') {        /* a symbolic link */
+                    char tgt[101];
+                    memcpy(tgt, h->linkname, 100);
+                    tgt[100] = '\0';
+                    mkdirs(name);
+                    (void)unlink(name);
+                    if (symlink(tgt, name) != 0) {
+                        fprintf(stderr, "tar: cannot create symlink %s: %s\n",
+                                name, strerror(errno));
+                        status = 2;
+                    }
                 } else {
                     mkdirs(name);
                     FILE *o = fopen(name, "wb");

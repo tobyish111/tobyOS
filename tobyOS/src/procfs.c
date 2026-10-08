@@ -24,6 +24,7 @@
 #include <tobyos/vfs.h>
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
+#include <tobyos/pty.h>       /* pty_file_index: /proc/PID/fd's /dev/pts/N */
 #include <tobyos/heap.h>
 #include "../build/kbuild_id.h"   /* TOBYOS_BUILD_ID -- see the Makefile */
 #include <tobyos/klibc.h>
@@ -56,6 +57,32 @@ static void describe_fd_target(struct file *f, char *out, size_t cap) {
         memcpy(out, f->open_path, sl);
         out[sl] = '\0';
         return;
+    }
+    /* A pipe or socket by its inode, as Linux names one -- the number
+     * fstat gives (file_object_ino) -- and a pty slave by its own number.
+     * They were pipe:[r], socket:[0] and /dev/pts/0 whatever the file. */
+    {
+        extern uint64_t file_object_ino(struct file *f);
+        char num[48];
+        if (f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+            f->kind == FILE_KIND_SOCKET) {
+            ksnprintf(num, sizeof num, "%s:[%lu]",
+                      f->kind == FILE_KIND_SOCKET ? "socket" : "pipe",
+                      (unsigned long)file_object_ino(f));
+            size_t nl = strlen(num);
+            if (nl >= cap) nl = cap - 1;
+            memcpy(out, num, nl);
+            out[nl] = '\0';
+            return;
+        }
+        if (f->kind == FILE_KIND_PTY_SLAVE && pty_file_index(f) >= 0) {
+            ksnprintf(num, sizeof num, "/dev/pts/%d", pty_file_index(f));
+            size_t nl = strlen(num);
+            if (nl >= cap) nl = cap - 1;
+            memcpy(out, num, nl);
+            out[nl] = '\0';
+            return;
+        }
     }
     switch (f->kind) {
     case FILE_KIND_CONSOLE:     s = "/dev/console";          break;

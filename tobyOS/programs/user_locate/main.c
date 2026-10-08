@@ -58,7 +58,7 @@ static long walk(const char *dir, FILE *out, int depth) {
         fprintf(out, "%s\n", path);
         n++;
         struct stat st;
-        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+        if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode))   /* links: not followed */
             n += walk(path, out, depth + 1);
     }
     closedir(d);

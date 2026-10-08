@@ -1525,6 +1525,17 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
      * once let execve run the HOST binary from inside a chroot. */
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
+    /* A link to a directory lists the directory, as opendir(3) follows it:
+     * `ls link/` and `find -L` failed with "No such file or directory".
+     * Resolved here, into a buffer that lives as long as this call does --
+     * the VFS's directory handle keeps the path's pointer. */
+    char followed[VFS_PATH_MAX];
+    {
+        struct vfs_stat lst;
+        if (vfs_stat(kpath, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+            vfs_follow_link(kpath, followed, sizeof followed) == VFS_OK)
+            memcpy(kpath, followed, strlen(followed) + 1);
+    }
 
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
@@ -2017,6 +2028,55 @@ static int lx_path_has(const char *h, const char *n) {
 #define PATHFAIL_LOG(...) ((void)0)
 #endif
 
+/* LINKS IN THE MIDDLE OF A PATH ARE FOLLOWED. The VFS resolves a path by
+ * mount and name, and a filesystem looks a name up whole, so "a/link/f"
+ * with link -> ../d found nothing: `cat link/f`, `cd link` then `ls`, a
+ * relative open under a linked directory -- all "No such file or directory"
+ * (finding 88; logs/b15 lk3). Each proper prefix that is a symbolic link is
+ * replaced by what it names (vfs_link_target: the caller's root, `..`
+ * cleaned), left to right, until the path resolves or nothing more can be
+ * substituted; the LAST component is never followed here -- lstat,
+ * readlink, unlink and symlink act on a link itself. Only when the path as
+ * given does not resolve, so a path with no links in it costs one stat. */
+static int resolve_mid_links(char *kpath, size_t cap) {
+    struct vfs_stat st;
+    if (vfs_stat(kpath, &st) == VFS_OK) return 0;
+    char work[VFS_PATH_MAX], tgt[VFS_PATH_MAX];
+    size_t kl = strlen(kpath);
+    if (kl >= sizeof work) return 0;
+    memcpy(work, kpath, kl + 1);
+    bool changed = false;
+    int hops = 0;
+    for (;;) {
+        bool sub = false;
+        for (size_t i = 1; work[i]; i++) {
+            if (work[i] != '/') continue;
+            work[i] = '\0';
+            int rc = vfs_stat(work, &st);
+            if (rc != VFS_OK) { work[i] = '/'; break; }   /* a missing component */
+            if (st.type == VFS_TYPE_SYMLINK) {
+                rc = vfs_link_target(work, tgt, sizeof tgt);
+                work[i] = '/';
+                if (rc != VFS_OK) break;
+                if (++hops > 40) return -ABI_ELOOP;
+                size_t tl = strlen(tgt), rest = strlen(work + i);
+                if (tl + rest + 1 > sizeof work) return -ABI_ENAMETOOLONG;
+                memmove(work + tl, work + i, rest + 1);
+                memcpy(work, tgt, tl);
+                changed = sub = true;
+                break;                          /* rescan the new path */
+            }
+            work[i] = '/';
+        }
+        if (!sub) break;
+    }
+    if (!changed) return 0;
+    size_t wl = strlen(work);
+    if (wl + 1 > cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, work, wl + 1);
+    return 0;
+}
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
@@ -2101,7 +2161,7 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
             if (jl + 1 > cap) return -ABI_ENAMETOOLONG;
             memcpy(out, joined, jl + 1);
         }
-        return 0;
+        return resolve_mid_links(out, cap);
     }
 }
 
@@ -2129,7 +2189,9 @@ static int resolve_user_path_at(int dirfd, const char *upath,
                 memcpy(joined, df->dirpath, dl);
                 if (dl && joined[dl - 1] != '/') joined[dl++] = '/';
                 memcpy(joined + dl, rawp, (size_t)rl + 1);
-                return path_lexical_clean(joined, out, cap);
+                int crc = path_lexical_clean(joined, out, cap);
+                if (crc != 0) return crc;
+                return resolve_mid_links(out, cap);
             }
         }
     }
@@ -2599,6 +2661,24 @@ static long sys_open(const char *path, int flags, int mode) {
 static bool lx_dir_open_refused(long flags);
 static long linux_open_dir(const char *kpath);
 
+#define LX_O_NOFOLLOW 0x20000              /* Linux x86-64's O_NOFOLLOW */
+/* Is KPATH a directory to open as one -- itself, or through a link in its
+ * last component (unless NOFOLLOW), KPATH then becoming where it leads?
+ * The open paths asked vfs_stat, which answers for the link, so a link to
+ * a directory was opened as a FILE: busybox's `ls link/` said "Is a
+ * directory" (logs/b15 lk3). */
+static bool open_dir_path(char *kpath, bool nofollow) {
+    struct vfs_stat vs;
+    if (vfs_stat(kpath, &vs) != VFS_OK) return false;
+    if (vs.type == VFS_TYPE_DIR) return true;
+    if (vs.type != VFS_TYPE_SYMLINK || nofollow) return false;
+    char t[VFS_PATH_MAX];
+    if (vfs_follow_link(kpath, t, sizeof t) != VFS_OK) return false;
+    if (vfs_stat(t, &vs) != VFS_OK || vs.type != VFS_TYPE_DIR) return false;
+    memcpy(kpath, t, strlen(t) + 1);
+    return true;
+}
+
 /* THE MODE A PROCESS'S NEW FILE OR DIRECTORY GETS: the mode it asked for
  * less its umask (POSIX open, creat, mknod, mkdir). Every file used to be
  * 0644 whatever was asked -- `umask 000; > f` was 0644 where Linux gives
@@ -2617,10 +2697,14 @@ static uint32_t sys_creation_mode(int mode, uint32_t deflt) {
 
 static long sys_open_resolved(const char *kpath, int flags, int mode) {
     if (flags & SYS_O_DIRECTORY) {
-        struct vfs_stat ds;
-        if (vfs_stat(kpath, &ds) == VFS_OK && ds.type == VFS_TYPE_DIR) {
-            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
-            return linux_open_dir(kpath);
+        char dk[VFS_PATH_MAX];
+        size_t kl = strlen(kpath);
+        if (kl < sizeof dk) {
+            memcpy(dk, kpath, kl + 1);
+            if (open_dir_path(dk, false)) {
+                if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+                return linux_open_dir(dk);
+            }
         }
     }
 
@@ -3223,19 +3307,28 @@ static long sys_lseek(int fd, int64_t off, int whence) {
 static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     memset(dst, 0, sizeof(*dst));
     dst->size = (uint64_t)src->size;
-    uint32_t typ = (src->type == VFS_TYPE_DIR) ? ABI_S_IFDIR : ABI_S_IFREG;
+    /* THE TYPE: the format bits a filesystem keeps in its mode (devfs's
+     * S_IFCHR), else what the VFS says -- a symbolic link included. A link
+     * was S_IFREG, so nothing native could tell one (finding 87); and a
+     * mode carrying S_IFCHR was OR'd onto S_IFREG, which is S_IFLNK's bit
+     * pattern -- unseen while no device path reached here. */
+    uint32_t fmt = src->mode & ABI_S_IFMT;
+    uint32_t typ = fmt ? fmt :
+                   (src->type == VFS_TYPE_DIR)     ? ABI_S_IFDIR :
+                   (src->type == VFS_TYPE_SYMLINK) ? ABI_S_IFLNK : ABI_S_IFREG;
     /* 07777, not 0777: the mask decides what userland can SEE, and 0777
      * silently drops setuid, setgid and sticky. ramfs preserves all three
      * from the USTAR header and execve reads S_ISUID straight from the VFS,
      * so a setuid binary WORKED while `ls -l` and every stat()-based check
      * reported it as an ordinary 0755 file -- the one place you would look
      * to find out. */
-    dst->mode = typ | (src->mode & ABI_S_IFMT ? src->mode : (src->mode & 07777));
-    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755.
-     * VFS_MODE_VALID says it does: a VALID 0000 (umask 777, chmod 000) is
-     * enforced as 0000 and must be REPORTED as 0000, not 0644. */
+    dst->mode = typ | (src->mode & 07777);
+    /* If the underlying fs doesn't carry mode info, default to 0644 / 0755
+     * (and a link's 0777). VFS_MODE_VALID says it does: a VALID 0000 (umask
+     * 777, chmod 000) is enforced as 0000 and must be REPORTED as 0000. */
     if (!(src->mode & VFS_MODE_VALID) && (src->mode & 0777) == 0) {
-        dst->mode |= (src->type == VFS_TYPE_DIR) ? 0755 : 0644;
+        dst->mode |= (src->type == VFS_TYPE_DIR)     ? 0755 :
+                     (src->type == VFS_TYPE_SYMLINK) ? 0777 : 0644;
     }
     /* Slice 11: the native stat path reports through the caller's user
      * namespace too -- a namespaced process must not see host ids on files just
@@ -3305,7 +3398,136 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
     out->size  = 0;
 }
 
-static long sys_stat(const char *path, struct abi_stat *out) {
+/* Defined with the Linux stat emitters, below. */
+static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj, uint32_t *min);
+uint64_t file_object_ino(struct file *f);
+
+/* LINUX'S MAGIC LINKS. /proc/PID/fd/N -- and so /proc/self/fd/N, /dev/fd/N,
+ * /dev/stdin, /dev/stdout and /dev/stderr, which are links to them -- name
+ * the OPEN FILE itself: stat() through one is fstat() of that descriptor,
+ * whatever its link text says ("pipe:[N]" is no path). The file, or NULL
+ * when KPATH is not one (or names no open descriptor); *fdno its number. */
+static struct file *stat_magic_fd(const char *kpath, int *fdno) {
+    const char *num = 0;
+    int kpid = -1;
+    if (strcmp(kpath, "/dev/stdin") == 0)        num = "0";
+    else if (strcmp(kpath, "/dev/stdout") == 0)  num = "1";
+    else if (strcmp(kpath, "/dev/stderr") == 0)  num = "2";
+    else if (strncmp(kpath, "/dev/fd/", 8) == 0) num = kpath + 8;
+    else if (strncmp(kpath, "/proc/self/fd/", 14) == 0) num = kpath + 14;
+    else if (strncmp(kpath, "/proc/", 6) == 0) {
+        const char *q = kpath + 6;
+        int v = 0;
+        while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0');
+        if (q == kpath + 6 || strncmp(q, "/fd/", 4) != 0) return 0;
+        kpid = pid_knr(v);
+        if (!kpid) return 0;
+        num = q + 4;
+    }
+    if (!num || !*num) return 0;
+    int n = 0;
+    const char *q = num;
+    while (*q >= '0' && *q <= '9') {
+        n = n * 10 + (*q++ - '0');
+        if (n >= PROC_NFDS) return 0;
+    }
+    if (*q || q == num) return 0;
+    struct proc *p = kpid < 0 ? current_proc() : proc_lookup(kpid);
+    struct file **tab = p ? proc_fds(p) : 0;
+    struct file *f = tab ? tab[n] : 0;
+    if (f) *fdno = n;
+    return f;
+}
+
+/* WHAT stat(2) ANSWERS FOR KPATH: the path's own vfs_stat with FOLLOW
+ * false (lstat); with it true a link in the last component is followed,
+ * hop by hop (vfs_link_target), up to 40 -- and a magic link stops at its
+ * descriptor, given back in *fdf (and *fdno) for the caller to emit as
+ * fstat would; a regular file there is stat'ed by the path it was opened
+ * by, when that still names it. FINAL gets the path answered for. */
+static int stat_resolve(const char *kpath, bool follow, char *final,
+                        size_t cap, struct vfs_stat *vs, struct file **fdf,
+                        int *fdno) {
+    char hop[2][VFS_PATH_MAX];
+    const char *cur = kpath;
+    *fdf = 0;
+    for (int n = 0; n < 40; n++) {
+        if (follow) {
+            int fdn = -1;
+            struct file *f = stat_magic_fd(cur, &fdn);
+            if (f) {
+                const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath
+                               : (f->kind == FILE_KIND_VFS) ? f->open_path : 0;
+                if (op && op[0] == '/' && vfs_stat(op, vs) == VFS_OK) {
+                    size_t l = strlen(op);
+                    if (l >= cap) return VFS_ERR_NAMETOOLONG;
+                    memcpy(final, op, l + 1);
+                    return VFS_OK;
+                }
+                *fdf = f;
+                *fdno = fdn;
+                return VFS_OK;
+            }
+        }
+        int rc = vfs_stat(cur, vs);
+        if (rc != VFS_OK) return rc;
+        if (!follow || vs->type != VFS_TYPE_SYMLINK) {
+            size_t l = strlen(cur);
+            if (l >= cap) return VFS_ERR_NAMETOOLONG;
+            memcpy(final, cur, l + 1);
+            return VFS_OK;
+        }
+        char *nx = hop[n & 1];                      /* never into `cur` */
+        rc = vfs_link_target(cur, nx, VFS_PATH_MAX);
+        if (rc != VFS_OK) return rc;
+        cur = nx;
+    }
+    return VFS_ERR_LOOP;
+}
+
+static long stat_errno(int vr) {
+    if (vr == VFS_ERR_NOENT)       return -ABI_ENOENT;
+    if (vr == VFS_ERR_LOOP)        return -ABI_ELOOP;
+    if (vr == VFS_ERR_NAMETOOLONG) return -ABI_ENAMETOOLONG;
+    return -ABI_EACCES;
+}
+
+/* The native stat of an open file: what sys_fstat answers. A pipe is a
+ * FIFO, a socket a socket, a terminal or device a character device, as
+ * the Linux personality's fstat says (lx_fd_special_mode); they were all
+ * "a regular file, 0666". */
+static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
+    memset(tmp, 0, sizeof *tmp);
+    if (f->kind == FILE_KIND_VFS) {
+        struct vfs_stat vs = {
+            .type = VFS_TYPE_FILE, .size = f->vfs.size,
+            .uid  = f->vfs.uid,    .gid  = f->vfs.gid,
+            .mode = f->vfs.mode,
+        };
+        fill_abi_stat(&vs, tmp);
+        return;
+    }
+    uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+    if (sm) {
+        tmp->mode = sm;
+        tmp->nlink = 1;
+        if ((sm & ABI_S_IFMT) != ABI_S_IFCHR) {
+            struct proc *p = current_proc();
+            tmp->uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
+            tmp->gid = userns_cur_gid(p ? (uint32_t)p->gid : 0);
+        }
+        tmp->ino = file_object_ino(f);
+        return;
+    }
+    /* The rest (a window, a term) report a minimal regular file. */
+    tmp->mode = ABI_S_IFREG | 0666;
+}
+
+/* stat and lstat: FOLLOW says which. A link was reported as the file it
+ * names by neither -- native stat called the LINK a regular file and
+ * there was no lstat (finding 87): `test -L` could not be answered and
+ * `ls -l` showed no link. */
+static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
@@ -3321,35 +3543,32 @@ static long sys_stat(const char *path, struct abi_stat *out) {
         }
     }
     struct vfs_stat vs;
-    int sr = vfs_stat(kpath, &vs);
-    if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
-    if (sr != VFS_OK)        return -ABI_EACCES;
-
+    struct file *ff = 0;
+    int fdn = -1;
+    char fin[VFS_PATH_MAX];
+    int sr = stat_resolve(kpath, follow, fin, sizeof fin, &vs, &ff, &fdn);
+    if (sr != VFS_OK) return stat_errno(sr);
     struct abi_stat tmp;
-    fill_abi_stat(&vs, &tmp);
+    if (ff) {
+        native_fd_stat(ff, &tmp);
+    } else {
+        uint32_t dm = (follow && strcmp(fin, kpath) != 0) ? dev_synth_mode(fin) : 0;
+        if (dm) dev_synth_stat(dm, &tmp);          /* a link to a device */
+        else fill_abi_stat(&vs, &tmp);
+    }
     if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
     return 0;
+}
+
+static long sys_stat(const char *path, struct abi_stat *out) {
+    return sys_stat_follow(path, out, true);
 }
 
 static long sys_fstat(int fd, struct abi_stat *out) {
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     struct abi_stat tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    if (f->kind == FILE_KIND_VFS) {
-        struct vfs_stat vs = {
-            .type = VFS_TYPE_FILE, .size = f->vfs.size,
-            .uid  = f->vfs.uid,    .gid  = f->vfs.gid,
-            .mode = f->vfs.mode,
-        };
-        fill_abi_stat(&vs, &tmp);
-    } else {
-        /* Pseudo-files (console, pipe, socket, window, term) report a
-         * minimal "character device"-like stat. We use ABI_S_IFREG
-         * because libc programs commonly only check ISDIR vs ISREG;
-         * the size is simply zero. */
-        tmp.mode = ABI_S_IFREG | 0666;
-    }
+    native_fd_stat(f, &tmp);
     if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
     return 0;
 }
@@ -3637,6 +3856,17 @@ static long chdir_kpath(const char *kpath) {
     int sr = vfs_stat(kpath, &st);
     if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
     if (sr != VFS_OK)        return -ABI_EACCES;
+    /* A LINK TO A DIRECTORY IS GONE THROUGH, and the working directory is
+     * where it leads -- getcwd and `pwd -P` say the physical path, as on
+     * Linux. `cd link` said "Not a directory" (logs/b15 lk3). */
+    char followed[VFS_PATH_MAX];
+    if (st.type == VFS_TYPE_SYMLINK) {
+        sr = vfs_follow_link(kpath, followed, sizeof followed);
+        if (sr == VFS_OK) sr = vfs_stat(followed, &st);
+        if (sr == VFS_ERR_NOENT) return -ABI_ENOENT;
+        if (sr != VFS_OK)        return -ABI_EACCES;
+        kpath = followed;
+    }
     if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
     struct proc *p = current_proc();
     if (!p) return -ABI_EINVAL;
@@ -5665,6 +5895,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_lseek((int)a1, (int64_t)a2, (int)a3);
     case SYS_STAT:
         return sys_stat((const char *)a1, (struct abi_stat *)a2);
+    case ABI_SYS_LSTAT:
+        return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
     case SYS_FSTAT:
         return sys_fstat((int)a1, (struct abi_stat *)a2);
     case SYS_DUP:           return sys_dup((int)a1);
@@ -6820,13 +7052,26 @@ static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
     return 0;
 }
 
+/* A stat's S_IFMT: the format bits the filesystem keeps in its mode, else
+ * the VFS type -- a symbolic link included, which both emitters reported
+ * as a regular file (finding 87: busybox stat said "regular file" of a
+ * link, and `ls -l` showed none). */
+static uint32_t lx_vfs_type_bits(const struct vfs_stat *vs) {
+    uint32_t fmt = vs->mode & 0xF000u;
+    if (fmt) return fmt;
+    if (vs->type == VFS_TYPE_DIR)     return 0x4000u;
+    if (vs->type == VFS_TYPE_SYMLINK) return 0xA000u;
+    return 0x8000u;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
-    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u; /* S_IFDIR/REG */
+    uint32_t typ  = lx_vfs_type_bits(vs);
     uint32_t perm = vs->mode & 0xFFFu;
     if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
-        perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+        perm = (vs->type == VFS_TYPE_DIR)     ? 0755u :
+               (vs->type == VFS_TYPE_SYMLINK) ? 0777u : 0644u;
     st.st_mode    = typ | perm;
     st.st_dev     = 1;
     st.st_ino     = ino ? ino : 1;
@@ -6834,6 +7079,10 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
      * count for /proc/<pid>/task/, which chrome's sandbox tests. */
     st.st_nlink   = vs->nlink ? vs->nlink
                               : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
+    /* A DIRECTORY HAS AT LEAST TWO LINKS -- its name and its "." -- as the
+     * native stat already says; tmpfs counts 1, and busybox's `find -links
+     * 1 -type d` matched directories GNU's never does (logs/b15 findbb). */
+    if (vs->type == VFS_TYPE_DIR && st.st_nlink < 2u) st.st_nlink = 2u;
     st.st_uid     = userns_cur_uid(vs->uid);   /* slice 11 */
     st.st_gid     = userns_cur_gid(vs->gid);   /* slice 11 */
     st.st_size    = (int64_t)vs->size;
@@ -6866,14 +7115,16 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
         uint64_t mnt_id, spare2; uint64_t spare3[12];
     } sx;
     memset(&sx, 0, sizeof sx);
-    uint32_t typ  = (vs->type == VFS_TYPE_DIR) ? 0x4000u : 0x8000u;
+    uint32_t typ  = lx_vfs_type_bits(vs);
     uint32_t perm = vs->mode & 0xFFFu;
     if (perm == 0 && !(vs->mode & VFS_MODE_VALID))      /* a VALID 0000 is 0000 */
-        perm = (vs->type == VFS_TYPE_DIR) ? 0755u : 0644u;
+        perm = (vs->type == VFS_TYPE_DIR)     ? 0755u :
+               (vs->type == VFS_TYPE_SYMLINK) ? 0777u : 0644u;
     sx.mask      = 0x000007ffu;              /* STATX_BASIC_STATS */
     sx.blksize   = 512;
     sx.nlink     = vs->nlink ? vs->nlink
                               : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
+    if (vs->type == VFS_TYPE_DIR && sx.nlink < 2u) sx.nlink = 2u;
     sx.uid       = userns_cur_uid(vs->uid);    /* slice 11 */
     sx.gid       = userns_cur_gid(vs->gid);    /* slice 11 */
     sx.mode      = (uint16_t)(typ | perm);
@@ -6892,13 +7143,150 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     return 0;
 }
 
+static uint64_t lx_fd_ino(struct file *f, int fd);
+
+/* fstat(2) of an open file, as struct stat: LX_fstat's answer, and
+ * newfstatat's with AT_EMPTY_PATH, and stat(2)'s through a magic link to
+ * it (stat_resolve). */
+static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
+    struct vfs_stat vs;
+    if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
+        return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
+                                      lx_fd_ino(f, fd), ubuf);
+    {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
+        uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+        if (sm) return linux_emit_special_stat(sm, mj, mn, lx_fd_ino(f, fd),
+                                               ubuf);
+    }
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK)
+            vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+    } else if (f->kind == FILE_KIND_VFS) {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                                .uid = f->vfs.uid, .gid = f->vfs.gid,
+                                .mode = f->vfs.mode };
+    } else if (f->kind == FILE_KIND_MEMFD) {
+        /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                                .size = (size_t)memfd_size(f->memfd),
+                                .mode = 0777 };
+    } else {
+        /* a window, a term: a minimal regular file */
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
+                                .mode = 0666 };
+    }
+    return linux_emit_stat(&vs, lx_fd_ino(f, fd), ubuf);
+}
+
+/* The same, in statx's layout: the generic emitter, then the type and the
+ * device stamped in place (mode at 0x1c, rdev at 0x80/0x84). */
+static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
+    if (f->kind == FILE_KIND_DRM) {           /* slice 103 */
+        struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0, .mode = 0666 };
+        long src = linux_emit_statx(&cvs, lx_fd_ino(f, fd), ubuf);
+        if (src == 0) {
+            uint16_t m = (uint16_t)(0x2000u | 0666u);
+            uint32_t rmaj = DRM_CHR_MAJOR, rmin = f->dir_off;
+            (void)copy_to_user((uint8_t *)ubuf + 0x1c, &m, sizeof m);
+            (void)copy_to_user((uint8_t *)ubuf + 0x80, &rmaj, sizeof rmaj);
+            (void)copy_to_user((uint8_t *)ubuf + 0x84, &rmin, sizeof rmin);
+        }
+        return src;
+    }
+    {
+        uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+        if (sm) {
+            struct proc *sp = current_proc();
+            bool chr = (sm & 0xF000u) == 0x2000u;
+            struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                    .mode = sm & 0xFFFu };
+            if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+            long src = linux_emit_statx(&cvs, lx_fd_ino(f, fd), ubuf);
+            if (src == 0 && ubuf) {
+                uint16_t m = (uint16_t)sm;
+                (void)copy_to_user((uint8_t *)ubuf + 0x1c, &m, sizeof m);
+                if (chr) {
+                    (void)copy_to_user((uint8_t *)ubuf + 0x80, &mj, sizeof mj);
+                    (void)copy_to_user((uint8_t *)ubuf + 0x84, &mn, sizeof mn);
+                }
+            }
+            return src;
+        }
+    }
+    struct vfs_stat vs;
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK)
+            vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+    } else if (f->kind == FILE_KIND_VFS) {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                                .uid = f->vfs.uid, .gid = f->vfs.gid,
+                                .mode = f->vfs.mode };
+    } else if (f->kind == FILE_KIND_MEMFD) {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                                .size = (size_t)memfd_size(f->memfd),
+                                .mode = 0777 };
+    } else {
+        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0, .mode = 0666 };
+    }
+    return linux_emit_statx(&vs, lx_fd_ino(f, fd), ubuf);
+}
+
+/* stat(2)'s FOLLOWING for the Linux path arms, ahead of their own logic:
+ * KPATH becomes what a link in its last component names (stat_resolve), or
+ * *fdf the descriptor a magic link -- /dev/stdin, /proc/PID/fd/N -- names.
+ * The arms stat'ed the path itself, so stat and lstat agreed and a link
+ * read as a regular file. 0, or -errno. */
+static long lx_stat_follow_first(char *kpath, size_t cap, struct file **fdf,
+                                 int *fdno) {
+    struct vfs_stat vs;
+    char fin[VFS_PATH_MAX];
+    int sr = stat_resolve(kpath, true, fin, sizeof fin, &vs, fdf, fdno);
+    if (sr != VFS_OK) {
+        /* a node the arms synthesise with no VFS entry is theirs to answer */
+        if (sr == VFS_ERR_NOENT &&
+            (lx_dev_dri_minor(kpath) >= 0 || dev_synth_mode(kpath)))
+            return 0;
+        return stat_errno(sr);
+    }
+    if (*fdf) return 0;
+    size_t l = strlen(fin);
+    if (l >= cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, fin, l + 1);
+    return 0;
+}
+
 /* Synthesize a stable per-fd inode for fstat(). For VFS handles we hash the
  * backing node pointer (f->vfs.priv) -- distinct files => distinct nodes =>
  * distinct inodes, while two handles onto the same file share a node (so
  * glibc's ld.so sees them as the same object, which is correct). Directories
  * hash their path; other kinds fall back to an fd-derived value. */
+/* One pipe or socket, one inode: its object, hashed -- so every descriptor
+ * onto it, in any process, reports the same st_ino, and /proc/PID/fd names
+ * it with the same number (pipe:[N], file_object_ino). It was the fd
+ * number, so a pipe's two ends -- and the same end in parent and child --
+ * looked like different files. */
+static uint64_t lx_obj_ino(char tag, const void *obj) {
+    uintptr_t p = (uintptr_t)obj;
+    char buf[2 + 16 + 1];
+    const char *hex = "0123456789abcdef";
+    buf[0] = tag; buf[1] = ':';
+    for (int i = 0; i < 16; i++) buf[2 + i] = hex[(p >> ((15 - i) * 4)) & 0xf];
+    buf[18] = '\0';
+    return lx_ino_hash(buf) & 0x7fffffffu;
+}
+
+uint64_t file_object_ino(struct file *f) {
+    if (!f) return 0;
+    if ((f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W) && f->pipe)
+        return lx_obj_ino('p', f->pipe);
+    if (f->kind == FILE_KIND_SOCKET && f->sock) return lx_obj_ino('s', f->sock);
+    return 0;
+}
+
 static uint64_t lx_fd_ino(struct file *f, int fd) {
     if (f) {
+        uint64_t oi = file_object_ino(f);
+        if (oi) return oi;
         if (f->kind == FILE_KIND_DIR && f->dirpath)
             return lx_ino_hash(f->dirpath);
         if (f->kind == FILE_KIND_VFS) {
@@ -7160,6 +7548,7 @@ struct lx_dirent64 {
 #define LX_DT_DIR  4
 #define LX_DT_REG  8
 #define LX_DT_CHR  2      /* slice 102: /dev/dri nodes are char devices */
+#define LX_DT_LNK 10      /* a symbolic link (finding 87) */
 
 /* Linux's may_open(): a directory opens for READING. Write access, O_CREAT
  * or O_TRUNC on one is EISDIR (O_PATH asks for no access and is exempt).
@@ -10791,8 +11180,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         bool got_kp = (resolve_user_path((const char *)a1, kpath, sizeof kpath) == 0);
         if (got_kp) {
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+            if (open_dir_path(kpath, (a2 & LX_O_NOFOLLOW) != 0)) {
                 if (lx_dir_open_refused((long)a2)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
                 if (dfd >= 0 && (a2 & LX_O_CLOEXEC))
@@ -10832,8 +11220,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         bool got_kp = (resolve_user_path_at((int)a1, (const char *)a2,
                                             kpath, sizeof kpath) == 0);
         if (got_kp) {
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) == VFS_OK && vs.type == VFS_TYPE_DIR) {
+            if (open_dir_path(kpath, (a3 & LX_O_NOFOLLOW) != 0)) {
                 if (lx_dir_open_refused((long)a3)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
                 if (dfd >= 0 && (a3 & LX_O_CLOEXEC))
@@ -12826,6 +13213,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
         if (rr) return rr;
+        if (n == LX_stat) {                /* stat follows; lstat does not */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_stat(ff, fdn, (void *)a2);
+        }
         {   /* slice 104: DRM nodes stat as char devices, by path too. */
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
@@ -12856,37 +13250,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char probe[2] = {0,0};
         if (upath) (void)strncpy_from_user(probe, upath, sizeof probe);
         if (!upath || probe[0] == '\0') {
-            /* AT_EMPTY_PATH-style: fall through to fstat on a1. */
+            /* AT_EMPTY_PATH-style: fstat on a1 (lx_emit_fd_stat; glibc's
+             * fstat() comes this way -- slice 103's DRM answer included). */
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
-            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                   .mode = f->vfs.mode };
-            /* Slice 103: a DRM fd must report S_IFCHR here too. glibc's
-             * fstat() goes through newfstatat(fd,"",AT_EMPTY_PATH), not
-             * LX_fstat -- so the slice-99 char-device fix never applied
-             * to libdrm, whose drmGetDevice2 checks S_ISCHR FIRST and
-             * returns -EINVAL before touching sysfs. MEASURED: the
-             * [gpupath] trace showed libdrm making ZERO sysfs accesses,
-             * which is only possible if it bailed at this stat. */
-            if (f->kind == FILE_KIND_DRM)
-                return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
-                                              lx_fd_ino(f, (int)a1),
-                                              (void *)a3);
-            {   /* the same answer as LX_fstat's (lx_fd_special_mode) */
-                uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
-                if (sm) return linux_emit_special_stat(sm, mj, mn,
-                                                       lx_fd_ino(f, (int)a1),
-                                                       (void *)a3);
-            }
-            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
-            return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
+            return lx_emit_fd_stat(f, (int)a1, (void *)a3);
         }
         /* Relative paths resolve against DIRFD -- chrome's sandbox stats
          * "self/task/" through a /proc dirfd (thread_helpers.cc:41). */
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
         if (rr) return rr;
+        if (!((int)a4 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_stat(ff, fdn, (void *)a3);
+        }
         {   /* slice 104: see the LX_stat note. */
             int dmin = lx_dev_dri_minor(kpath);
             if (dmin >= 0 && lxdrm_available()) {
@@ -12914,34 +13295,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!f) return -ABI_EBADF;
         { static int n; if (f->kind == FILE_KIND_DRM && n < 12) { n++;
             kprintf("[drmstat] LX_fstat on DRM fd=%d\n", (int)a1); } }
-        struct vfs_stat vs;
-        if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
-            return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
-                                          lx_fd_ino(f, (int)a1), (void *)a2);
-        {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
-            uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
-            if (sm) return linux_emit_special_stat(sm, mj, mn,
-                                                   lx_fd_ino(f, (int)a1),
-                                                   (void *)a2);
-        }
-        if (f->kind == FILE_KIND_DIR && f->dirpath) {
-            if (vfs_stat(f->dirpath, &vs) != VFS_OK)
-                vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
-        } else if (f->kind == FILE_KIND_VFS) {
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                    .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                    .mode = f->vfs.mode };
-        } else if (f->kind == FILE_KIND_MEMFD) {
-            /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
-                                    .size = (size_t)memfd_size(f->memfd),
-                                    .mode = 0777 };
-        } else {
-            /* console/pipe/socket: report a minimal regular-file stat. */
-            vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = 0,
-                                    .mode = 0666 };
-        }
-        return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a2);
+        return lx_emit_fd_stat(f, (int)a1, (void *)a2);
     }
     case LX_getdents64: {              /* (fd, void *dirp, count) */
         struct file *f = fd_lookup((int)a1);
@@ -13027,6 +13381,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             de.d_reclen = (uint16_t)reclen;
             /* A devfs node is a character device, not a regular file. */
             de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR
+                        : (ent.type == VFS_TYPE_SYMLINK) ? LX_DT_LNK
                         : ((ent.mode & 0xF000u) == 0x2000u) ? LX_DT_CHR
                         : LX_DT_REG;
             memcpy(de.d_name, ent.name, namelen);
@@ -13937,55 +14292,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!upath || probe[0] == '\0') {      /* AT_EMPTY_PATH: statx the fd */
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
-            struct vfs_stat vs = { .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                   .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                   .mode = f->vfs.mode };
-            /* Slice 103: same char-device answer for statx -- glibc may
-             * use either. See the newfstatat note above. */
-            if (f->kind == FILE_KIND_DRM) {
-                struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
-                                        .mode = 0666 };
-                long src = linux_emit_statx(&cvs, lx_fd_ino(f, (int)a1),
-                                            (void *)a5);
-                if (src == 0) {
-                    /* Patch mode to S_IFCHR and fill rdev in place: the
-                     * generic emitter only knows FILE/DIR. */
-                    uint16_t m = (uint16_t)(0x2000u | 0666u);
-                    uint32_t rmaj = DRM_CHR_MAJOR, rmin = f->dir_off;
-                    (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
-                    (void)copy_to_user((uint8_t *)a5 + 0x80, &rmaj, sizeof rmaj);
-                    (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
-                }
-                return src;
-            }
-            {   /* the same answer as LX_fstat's (lx_fd_special_mode), in the
-                 * statx layout: emit, then stamp the type and the device */
-                uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
-                if (sm) {
-                    struct proc *sp = current_proc();
-                    bool chr = (sm & 0xF000u) == 0x2000u;
-                    struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
-                                            .mode = sm & 0xFFFu };
-                    if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
-                    long src = linux_emit_statx(&cvs, lx_fd_ino(f, (int)a1),
-                                                (void *)a5);
-                    if (src == 0 && a5) {
-                        uint16_t m = (uint16_t)sm;
-                        (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
-                        if (chr) {
-                            (void)copy_to_user((uint8_t *)a5 + 0x80, &mj, sizeof mj);
-                            (void)copy_to_user((uint8_t *)a5 + 0x84, &mn, sizeof mn);
-                        }
-                    }
-                    return src;
-                }
-            }
-            if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
-            return linux_emit_statx(&vs, lx_fd_ino(f, (int)a1), (void *)a5);
+            return lx_emit_fd_statx(f, (int)a1, (void *)a5);
         }
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path(upath, kpath, sizeof kpath);
         if (rr) return rr;
+        if (!((int)a3 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
+            struct file *ff = 0;
+            int fdn = -1;
+            long fr = lx_stat_follow_first(kpath, sizeof kpath, &ff, &fdn);
+            if (fr) return fr;
+            if (ff) return lx_emit_fd_statx(ff, fdn, (void *)a5);
+        }
         {   /* Slice 104: DRM nodes stat as char devices here too -- and
              * TRACE it. glibc's stat() compiles to statx on modern
              * builds, so this branch was the blind spot that hid

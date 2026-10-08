@@ -18,7 +18,10 @@ static int force = 0;
 
 static int remove_path(const char *path) {
     struct stat st;
-    if (stat(path, &st) < 0) {
+    /* lstat: a symbolic link is removed as itself. With stat -- which
+     * follows links since batch 15 -- `rm -r` would have descended through
+     * a link to a directory and emptied what it names. */
+    if (lstat(path, &st) < 0) {
         if (force) return 0;      /* not there is not a failure under -f */
         fprintf(stderr, "rm: cannot stat '%s': %s\n", path, strerror(errno));
         return 1;

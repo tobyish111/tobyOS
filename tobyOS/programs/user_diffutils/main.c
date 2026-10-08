@@ -357,7 +357,18 @@ static void print_unified(struct filebuf *A, struct filebuf *B,
     }
 }
 
+/* The options as given, each after a space: GNU's header for a pair of
+ * files found in two directories is "diff" and these, then the two paths. */
+static char g_switches[256];
+
+/* HDR: inside a directory comparison, print that header when the two
+ * differ (not for -q's one line). */
+static int diff_files_hdr(const char *pa, const char *pb, int hdr);
 static int diff_files(const char *pa, const char *pb) {
+    return diff_files_hdr(pa, pb, 0);
+}
+
+static int diff_files_hdr(const char *pa, const char *pb, int hdr) {
     struct filebuf A, B;
     if (load(pa, &A) != 0) { fprintf(stderr, "%s: %s: No such file or directory\n", prog, pa); status = 2; return 2; }
     if (load(pb, &B) != 0) { fprintf(stderr, "%s: %s: No such file or directory\n", prog, pb); status = 2; return 2; }
@@ -381,8 +392,10 @@ static int diff_files(const char *pa, const char *pb) {
     } else if (qflag || capped) {
         printf("Files %s and %s differ\n", pa, pb);
     } else if (uflag) {
+        if (hdr) printf("diff%s %s %s\n", g_switches, pa, pb);
         print_unified(&A, &B, pa, pb);
     } else {
+        if (hdr) printf("diff%s %s %s\n", g_switches, pa, pb);
         print_normal(&A, &B);
     }
 
@@ -391,31 +404,144 @@ static int diff_files(const char *pa, const char *pb) {
     return differ;
 }
 
-static void diff_dirs(const char *da, const char *db) {
-    DIR *d = opendir(da);
-    if (!d) { fprintf(stderr, "%s: %s: cannot read directory\n", prog, da); status = 2; return; }
+/* A directory's names but `.` and `..`, sorted as GNU's are in the C
+ * locale; NULL (and a message) when it cannot be read. */
+static int name_cmp(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+static char **dir_names(const char *dir, size_t *n) {
+    *n = 0;
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "%s: %s: cannot read directory\n", prog, dir);
+        status = 2;
+        return NULL;
+    }
+    size_t cap = 16;
+    char **v = (char **)malloc(cap * sizeof *v);
     struct dirent *e;
-    while ((e = readdir(d)) != NULL) {
+    while (v && (e = readdir(d)) != NULL) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
-        char pa[1024], pb[1024];
-        snprintf(pa, sizeof pa, "%s/%s", da, e->d_name);
-        snprintf(pb, sizeof pb, "%s/%s", db, e->d_name);
-        struct stat sa, sb;
-        int hb = (stat(pb, &sb) == 0);
-        if (stat(pa, &sa) == 0 && S_ISDIR(sa.st_mode)) {
-            if (hb && S_ISDIR(sb.st_mode)) diff_dirs(pa, pb);
-            else printf("Only in %s: %s\n", da, e->d_name);
-            continue;
+        if (*n == cap) {
+            char **nv = (char **)realloc(v, (cap *= 2) * sizeof *v);
+            if (!nv) break;
+            v = nv;
         }
-        if (!hb) {
-            if (Nflag) diff_files(pa, pb);
-            else { printf("Only in %s: %s\n", da, e->d_name); if (status < 1) status = 1; }
-            continue;
-        }
-        printf("diff %s %s\n", pa, pb);
-        diff_files(pa, pb);
+        v[(*n)++] = strdup(e->d_name);
     }
     closedir(d);
+    if (v) qsort(v, *n, sizeof *v, name_cmp);
+    return v;
+}
+
+static void free_names(char **v, size_t n) {
+    for (size_t i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+/* GNU's words for a file's type, as in "File A is a directory while file
+ * B is a regular file". */
+static const char *file_kind(const struct stat *st) {
+    if (S_ISDIR(st->st_mode))  return "directory";
+    if (S_ISREG(st->st_mode))  return st->st_size ? "regular file" : "regular empty file";
+    if (S_ISLNK(st->st_mode))  return "symbolic link";
+    if (S_ISFIFO(st->st_mode)) return "fifo";
+    if (S_ISCHR(st->st_mode))  return "character special file";
+    if (S_ISBLK(st->st_mode))  return "block special file";
+    if (S_ISSOCK(st->st_mode)) return "socket";
+    return "weird file";
+}
+
+/* The directories being compared, outermost first: one that is its own
+ * ancestor -- through a symbolic link, now that tobyOS has them -- is a
+ * loop, reported and not entered, as GNU's is ("recursive directory
+ * loop"). This walk followed `up -> ..` until its paths overflowed. */
+#define DIFF_MAXDEPTH 256
+static struct { dev_t dev; ino_t ino; } g_anc[DIFF_MAXDEPTH];
+static int g_nanc;
+
+static int is_ancestor(const struct stat *st) {
+    if (!st->st_ino) return 0;
+    for (int i = 0; i < g_nanc; i++)
+        if (g_anc[i].ino == st->st_ino && g_anc[i].dev == st->st_dev) return 1;
+    return 0;
+}
+
+/* Two directories, as GNU's diff compares them: both listings, sorted and
+ * merged -- a name in one only is "Only in DIR: NAME" (or, with -N, a
+ * comparison with an empty file), a subdirectory in both is gone into with
+ * -r and otherwise "Common subdirectories: A and B", a directory against a
+ * file says so, and two files are compared, a header naming the options
+ * and the pair printed when they differ. It read only the first
+ * directory, so a name only in the second went unreported; it went into
+ * every subdirectory without -r; and it printed a header for every pair,
+ * the same ones included. */
+static void diff_dirs(const char *da, const char *db) {
+    int base = g_nanc;
+    struct stat sda, sdb;
+    /* a directory against ITSELF has nothing to report (GNU: no output) */
+    if (stat(da, &sda) == 0 && stat(db, &sdb) == 0 && sda.st_ino &&
+        sda.st_ino == sdb.st_ino && sda.st_dev == sdb.st_dev)
+        return;
+    if (stat(da, &sda) == 0 && g_nanc < DIFF_MAXDEPTH) {
+        g_anc[g_nanc].dev = sda.st_dev;
+        g_anc[g_nanc].ino = sda.st_ino;
+        g_nanc++;
+    }
+    size_t na = 0, nb = 0;
+    char **va = dir_names(da, &na);
+    char **vb = va ? dir_names(db, &nb) : NULL;
+    if (!va || !vb) {
+        if (va) free_names(va, na);
+        g_nanc = base;
+        return;
+    }
+    size_t i = 0, j = 0;
+    while (i < na || j < nb) {
+        int c = (i < na && j < nb) ? strcmp(va[i], vb[j]) : (i < na ? -1 : 1);
+        const char *name = c <= 0 ? va[i] : vb[j];
+        char pa[1024], pb[1024];
+        snprintf(pa, sizeof pa, "%s/%s", da, name);
+        snprintf(pb, sizeof pb, "%s/%s", db, name);
+        if (c != 0) {
+            if (c < 0) i++; else j++;
+            if (Nflag) { diff_files_hdr(pa, pb, 1); continue; }
+            printf("Only in %s: %s\n", c < 0 ? da : db, name);
+            if (status < 1) status = 1;
+            continue;
+        }
+        i++; j++;
+        struct stat sa, sb;
+        int ha = (stat(pa, &sa) == 0), hb = (stat(pb, &sb) == 0);
+        if (!ha || !hb) {
+            fprintf(stderr, "%s: %s: No such file or directory\n", prog, ha ? pb : pa);
+            status = 2;
+            continue;
+        }
+        int dira = S_ISDIR(sa.st_mode), dirb = S_ISDIR(sb.st_mode);
+        if (dira && dirb) {
+            if (!rflag) {
+                printf("Common subdirectories: %s and %s\n", pa, pb);
+            } else if (is_ancestor(&sa)) {
+                fprintf(stderr, "%s: %s: recursive directory loop\n", prog, pa);
+                status = 2;
+            } else {
+                diff_dirs(pa, pb);
+            }
+            continue;
+        }
+        if (dira || dirb) {
+            printf("File %s is a %s while file %s is a %s\n",
+                   pa, file_kind(&sa), pb, file_kind(&sb));
+            if (status < 1) status = 1;
+            continue;
+        }
+        diff_files_hdr(pa, pb, 1);
+    }
+    free_names(va, na);
+    free_names(vb, nb);
+    g_nanc = base;
 }
 
 
@@ -713,6 +839,13 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (a[0] == '-' && a[1] && strcmp(a, "-")) {
+            /* every option word, and -U's separate count, for the header */
+            size_t sl = strlen(g_switches);
+            snprintf(g_switches + sl, sizeof g_switches - sl, " %s", a);
+            if (!strcmp(a, "-U") && i + 1 < argc) {
+                sl = strlen(g_switches);
+                snprintf(g_switches + sl, sizeof g_switches - sl, " %s", argv[i + 1]);
+            }
             if (!strcmp(a, "--brief"))    { qflag = 1; continue; }
             if (!strcmp(a, "--unified"))  { uflag = 1; continue; }
             if (!strcmp(a, "--silent") || !strcmp(a, "--quiet")) { sflag = 1; continue; }

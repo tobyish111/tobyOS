@@ -154,6 +154,9 @@ static int chgrp_one(const char *path, int gid, int recursive, int verbose, int 
             while ((e = readdir(d))) {
                 if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
                 char sub[1024]; snprintf(sub, sizeof sub, "%s/%s", path, e->d_name);
+                /* a link met in the walk is not followed (GNU chgrp -R) */
+                struct stat lst;
+                if (lstat(sub, &lst) == 0 && S_ISLNK(lst.st_mode)) continue;
                 rc |= chgrp_one(sub, gid, 1, verbose, changes, quiet);
             }
             closedir(d);

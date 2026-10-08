@@ -413,7 +413,8 @@ static long du_walk(const char *path, int depth, int all, int summarise,
                     int human, long *total)
 {
     struct stat st;
-    if (stat(path, &st) != 0) {
+    /* lstat: du counts a link, it does not follow one (GNU's -P) */
+    if (lstat(path, &st) != 0) {
         fprintf(stderr, "du: cannot access '%s': %s\n", path, strerror(errno));
         return 0;
     }

@@ -254,6 +254,16 @@ int fstat(int fd, struct stat *out) {
     return abi_stat_to_user(&k, out);
 }
 
+/* The link itself, S_IFLNK; stat() follows it. There was no lstat, and
+ * stat called a link a regular file, so nothing native could see one. */
+int lstat(const char *path, struct stat *out) {
+    if (!out) { errno = EFAULT; return -1; }
+    struct abi_stat k;
+    long r = toby_sc2(ABI_SYS_LSTAT, (long)(uintptr_t)path, (long)(uintptr_t)&k);
+    if (__toby_check(r) < 0) return -1;
+    return abi_stat_to_user(&k, out);
+}
+
 int mkdir(const char *path, mode_t mode) {
     return (int)__toby_check(
         toby_sc2(ABI_SYS_MKDIR, (long)(uintptr_t)path, (long)mode));

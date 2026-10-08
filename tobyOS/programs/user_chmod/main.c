@@ -158,6 +158,15 @@ static void do_path(const char *path, const struct modespec *ms) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
             if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+            /* a link met in the walk is neither followed nor changed (GNU
+             * chmod -R); stat follows links since batch 15, so it would
+             * have reached whatever a link names */
+            {
+                char lp[1024];
+                struct stat lst;
+                snprintf(lp, sizeof lp, "%s/%s", path, e->d_name);
+                if (lstat(lp, &lst) == 0 && S_ISLNK(lst.st_mode)) continue;
+            }
             size_t pl = strlen(path), nl = strlen(e->d_name);
             char *sub = malloc(pl + 1 + nl + 1);
             if (!sub) break;

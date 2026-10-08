@@ -197,7 +197,7 @@ static int do_dir(const char *path) {
 
 static int do_path(const char *path) {
     struct stat st;
-    if (rflag && stat(path, &st) == 0 && S_ISDIR(st.st_mode)) return do_dir(path);
+    if (rflag && lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) return do_dir(path);
 
     uint8_t *in = NULL, *out = NULL;
     size_t inlen = 0, outlen = 0;

@@ -38,7 +38,20 @@ struct ent {
     char  *name;
     struct stat st;
     int    have_stat;
+    char  *link;          /* a symbolic link's target, for -l's " -> " */
 };
+
+/* A LINK IS LISTED AS ITSELF: lstat for what a directory holds, and its
+ * target after " -> " with -l. ls used stat, which libtoby made the link's
+ * own entry look like a regular file -- and with no lstat there was no
+ * other way to ask (finding 87). */
+static char *link_target(const char *path) {
+    char buf[1024];
+    ssize_t n = readlink(path, buf, sizeof buf - 1);
+    if (n < 0) return NULL;
+    buf[n] = '\0';
+    return strdup(buf);
+}
 
 static void human(long bytes, char *out, size_t cap) {
     /* Integer only: user programs here are built -mno-sse, so no floats.
@@ -86,6 +99,7 @@ static void mode_str(mode_t m, char *out) {
 static const char *classify(const struct ent *e) {
     if (!F_class || !e->have_stat) return "";
     if (S_ISDIR(e->st.st_mode)) return "/";
+    if (S_ISLNK(e->st.st_mode)) return "@";
     if (e->st.st_mode & 0111)   return "*";
     return "";
 }
@@ -224,7 +238,8 @@ static void print_long(const struct ent *e, const struct lwidths *w, time_t now)
     }
     putchar(' ');
     pad_to((int)strlen(sz), w->size); fputs(sz, stdout);
-    printf(" %s %s%s\n", tm, e->name, classify(e));
+    if (e->link) printf(" %s %s -> %s\n", tm, e->name, e->link);
+    else         printf(" %s %s%s\n", tm, e->name, classify(e));
 }
 
 /* Down-then-across, the layout ls has always used: the eye reads a column
@@ -305,12 +320,14 @@ static void list_dir(const char *path, int show_header) {
         char full[1024];
         if (!strcmp(path, "/")) snprintf(full, sizeof full, "/%s", e->d_name);
         else                    snprintf(full, sizeof full, "%s/%s", path, e->d_name);
-        v[n].have_stat = (stat(full, &v[n].st) == 0);
+        v[n].have_stat = (lstat(full, &v[n].st) == 0);
+        v[n].link = (v[n].have_stat && S_ISLNK(v[n].st.st_mode)) ? link_target(full)
+                                                                 : NULL;
         n++;
     }
     closedir(d);
     emit(v, n, path);
-    for (size_t i = 0; i < n; i++) free(v[i].name);
+    for (size_t i = 0; i < n; i++) { free(v[i].name); free(v[i].link); }
     free(v);
 }
 
@@ -372,9 +389,12 @@ int main(int argc, char **argv) {
     struct ent *plain = (struct ent *)calloc((size_t)nf, sizeof *plain);
     size_t np = 0;
     int ndirs = 0;
+    /* An operand that is a link is followed, unless -l, -d or -F asks
+     * about the link itself (GNU ls's default for the command line). */
+    int op_lstat = l_long || d_dir || F_class;
     for (int i = 0; i < nf; i++) {
         struct stat st;
-        int ok = stat(files[i], &st) == 0;
+        int ok = (op_lstat ? lstat(files[i], &st) : stat(files[i], &st)) == 0;
         if (!ok) {
             fprintf(stderr, "ls: cannot access '%s': %s\n",
                     files[i], strerror(errno));
@@ -385,16 +405,17 @@ int main(int argc, char **argv) {
         plain[np].name = strdup(files[i]);
         plain[np].st = st;
         plain[np].have_stat = 1;
+        plain[np].link = S_ISLNK(st.st_mode) ? link_target(files[i]) : NULL;
         np++;
     }
     if (np) emit(plain, np, NULL);
-    for (size_t i = 0; i < np; i++) free(plain[i].name);
+    for (size_t i = 0; i < np; i++) { free(plain[i].name); free(plain[i].link); }
     free(plain);
 
     int printed = np > 0;
     for (int i = 0; i < nf; i++) {
         struct stat st;
-        if (stat(files[i], &st) != 0) continue;
+        if ((op_lstat ? lstat(files[i], &st) : stat(files[i], &st)) != 0) continue;
         if (!S_ISDIR(st.st_mode) || d_dir) continue;
         if (printed) putchar('\n');
         list_dir(files[i], ndirs > 1 || np > 0);
