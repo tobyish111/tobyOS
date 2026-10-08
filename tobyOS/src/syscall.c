@@ -6758,6 +6758,58 @@ static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
     return 0;
 }
 
+/* WHAT AN FD THAT IS NOT A FILE IS, as Linux's fstat says: a pipe is a FIFO
+ * (0600, its creator's), a socket a socket, a terminal or a device a
+ * character device with its own numbers -- devfs's table, so the fd and the
+ * path agree. All of these said "a regular file, 0666", and bash's `read -t`
+ * turns its timeout OFF for a regular file: `sleep 4 | read -t 2` waited
+ * the four seconds under the guest's bash, where Linux's times out at two
+ * (logs/b15 rt; tools/agent/probes/b15/fst.c: mode 0100666 here, 010600 on
+ * Linux). 0 for the kinds that keep the regular-file answer. */
+static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
+                                   uint32_t *min) {
+    *maj = *min = 0;
+    if (!f) return 0;
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R:
+    case FILE_KIND_PIPE_W:    return 0x1000u | 0600u;          /* S_IFIFO  */
+    case FILE_KIND_SOCKET:    return 0xC000u | 0777u;          /* S_IFSOCK */
+    case FILE_KIND_DEVNULL:   return devfs_node_mode("/dev/null", maj, min);
+    case FILE_KIND_DEVZERO:   return devfs_node_mode("/dev/zero", maj, min);
+    case FILE_KIND_DEVRANDOM: return devfs_node_mode("/dev/urandom", maj, min);
+    case FILE_KIND_CONSOLE:   return devfs_node_mode("/dev/console", maj, min);
+    case FILE_KIND_PTY_MASTER: return devfs_node_mode("/dev/ptmx", maj, min);
+    case FILE_KIND_PTY_SLAVE: {
+        int idx = pty_file_index(f);
+        if (idx < 0) return 0;
+        *maj = 136; *min = (uint32_t)idx;
+        return 0x2000u | 0620u;                                /* /dev/pts/N */
+    }
+    default:                  return 0;
+    }
+}
+
+static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
+                                    uint64_t ino, void *ubuf) {
+    struct lx_stat st;
+    memset(&st, 0, sizeof st);
+    uint32_t fmt = mode & 0xF000u;
+    st.st_mode    = mode;
+    st.st_dev     = (fmt == 0x2000u) ? 6 : 12;    /* devtmpfs-ish / pipefs-ish */
+    st.st_ino     = ino ? ino : 1;
+    st.st_nlink   = 1;
+    if (fmt == 0x2000u) {
+        st.st_rdev = lx_makedev(maj, min);
+    } else {
+        struct proc *p = current_proc();
+        st.st_uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
+        st.st_gid = userns_cur_gid(p ? (uint32_t)p->gid : 0);
+    }
+    st.st_blksize = 4096;
+    if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
+    return 0;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
@@ -12811,6 +12863,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
                                               lx_fd_ino(f, (int)a1),
                                               (void *)a3);
+            {   /* the same answer as LX_fstat's (lx_fd_special_mode) */
+                uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+                if (sm) return linux_emit_special_stat(sm, mj, mn,
+                                                       lx_fd_ino(f, (int)a1),
+                                                       (void *)a3);
+            }
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
             return linux_emit_stat(&vs, lx_fd_ino(f, (int)a1), (void *)a3);
         }
@@ -12850,6 +12908,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
             return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
                                           lx_fd_ino(f, (int)a1), (void *)a2);
+        {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
+            uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+            if (sm) return linux_emit_special_stat(sm, mj, mn,
+                                                   lx_fd_ino(f, (int)a1),
+                                                   (void *)a2);
+        }
         if (f->kind == FILE_KIND_DIR && f->dirpath) {
             if (vfs_stat(f->dirpath, &vs) != VFS_OK)
                 vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
@@ -13883,6 +13947,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                     (void)copy_to_user((uint8_t *)a5 + 0x84, &rmin, sizeof rmin);
                 }
                 return src;
+            }
+            {   /* the same answer as LX_fstat's (lx_fd_special_mode), in the
+                 * statx layout: emit, then stamp the type and the device */
+                uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
+                if (sm) {
+                    struct proc *sp = current_proc();
+                    bool chr = (sm & 0xF000u) == 0x2000u;
+                    struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
+                                            .mode = sm & 0xFFFu };
+                    if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+                    long src = linux_emit_statx(&cvs, lx_fd_ino(f, (int)a1),
+                                                (void *)a5);
+                    if (src == 0 && a5) {
+                        uint16_t m = (uint16_t)sm;
+                        (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);
+                        if (chr) {
+                            (void)copy_to_user((uint8_t *)a5 + 0x80, &mj, sizeof mj);
+                            (void)copy_to_user((uint8_t *)a5 + 0x84, &mn, sizeof mn);
+                        }
+                    }
+                    return src;
+                }
             }
             if (f->kind != FILE_KIND_VFS) { vs.mode = 0666; vs.size = 0; }
             return linux_emit_statx(&vs, lx_fd_ino(f, (int)a1), (void *)a5);

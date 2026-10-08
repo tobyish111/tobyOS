@@ -382,6 +382,13 @@ int pty_index_of(struct file *f) {
     return f->pty->index;
 }
 
+int pty_file_index(struct file *f) {
+    if (!f || !f->pty) return -1;
+    if (f->kind != FILE_KIND_PTY_MASTER && f->kind != FILE_KIND_PTY_SLAVE)
+        return -1;
+    return f->pty->index;
+}
+
 long pty_master_read_nb(struct file *f, void *buf, size_t n) {
     struct pty *t = f ? f->pty : 0;
     if (!t) return -1;

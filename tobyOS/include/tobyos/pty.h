@@ -83,6 +83,9 @@ void pty_clone_ref     (struct file *f);   /* dup/fork: bump end refcount */
 /* Which pair does this master belong to? Needed to open the matching slave,
  * since `struct pty` is private to pty.c. Returns -1 if `f` is not a master. */
 int  pty_index_of(struct file *f);
+/* The pair a master OR a slave end belongs to (its /dev/pts number), for
+ * fstat; -1 for anything else. */
+int  pty_file_index(struct file *f);
 
 /* Like pty_master_read, but never parks the caller. Returns:
  *     > 0  bytes read
