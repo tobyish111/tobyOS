@@ -22564,7 +22564,7 @@ static void cmd_kill(int argc, char **argv) {
                     shell_set_status(1);
                     continue;
                 }
-                if (sig > 0) jb->blind = true;
+                if (sig > 0) jb->blind = !(was_stopped && sig == SIGKILL);
                 jb->dying = ends;
                 continue;
             }
@@ -22574,7 +22574,11 @@ static void cmd_kill(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-            if (sig > 0) jb->blind = true;         /* see shell_jobs_reap */
+            /* see shell_jobs_reap -- but a STOPPED job a SIGKILL ends is
+             * dead by the first look: bash reports `kill -9 %1` of a
+             * stopped `cat &` at the very next prompt, 3 runs of 3
+             * (logs/b15 ttin1-3) */
+            if (sig > 0) jb->blind = !(was_stopped && sig == SIGKILL);
             jb->dying = ends;                      /* see shell_job_settle */
             if (cont) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
@@ -22642,7 +22646,7 @@ static void cmd_kill(int argc, char **argv) {
             /* a job it names, or whose group it names: see shell_jobs_reap */
             for (int k = 0; k < JOB_MAX; k++)
                 if (job_has_pid(g_jobs[k], want)) {
-                    g_jobs[k]->blind = true;
+                    g_jobs[k]->blind = !(g_jobs[k]->stopped && sig == SIGKILL);
                     if (ends && ends[k]) g_jobs[k]->dying = true;
                 }
         }
