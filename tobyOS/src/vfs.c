@@ -1052,11 +1052,40 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
      * an unset field reads as the documented 0 ("this fs has no answer"). */
     memset(out, 0, sizeof(*out));
     int rc = m->ops->stat(m->data, rel, out);
+    /* A LINK IN THE RAM TABLE IS A LINK TOO. A filesystem that cannot hold
+     * one (the root ramfs) leaves it in the table below, where readlink and
+     * open found it and stat did not: `ln -s f l; stat l` said "No such
+     * file" while `readlink l` said f (logs/b15 lk). */
+    if (rc == VFS_ERR_NOENT) {
+        const char *tgt = vfs_symlink_table_target(path);
+        if (tgt) {
+            memset(out, 0, sizeof(*out));
+            out->type  = VFS_TYPE_SYMLINK;
+            out->size  = strlen(tgt);
+            out->mode  = 0777u | VFS_MODE_VALID;
+            out->nlink = 1;
+            rc = VFS_OK;
+        }
+    }
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
 #ifdef PATHFAIL_TRACE
     pathfail_trace("stat", path, rc);
 #endif
     return rc;
+}
+
+/* stat(2)'s answer, where vfs_stat gives lstat(2)'s: a symbolic link in
+ * the LAST component is followed to what it names (a dangling one is
+ * ENOENT). Links in the components before it are not followed here: the
+ * VFS resolves a path by mount prefix and name, and syscall.c's
+ * resolve_mid_links substitutes them for a user's path (finding 88). */
+int vfs_stat_follow(const char *path, struct vfs_stat *out) {
+    int rc = vfs_stat(path, out);
+    if (rc != VFS_OK || out->type != VFS_TYPE_SYMLINK) return rc;
+    char t[VFS_PATH_MAX];
+    rc = vfs_follow_link(path, t, sizeof t);
+    if (rc != VFS_OK) return rc;
+    return vfs_stat(t, out);
 }
 
 /* -------- write-side (each returns ROFS if the driver omits the op) -------- */
@@ -1398,6 +1427,85 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
 
 /* -------- helpers -------- */
 
+/* Lexically clean an absolute path in place: `//`, `/./` and `/x/..` go;
+ * `..` at the root stays at the root. Left alone if it would not fit. */
+static void vfs_path_clean(char *p) {
+    char out[VFS_PATH_MAX];
+    size_t o = 0;
+    const char *s = p;
+    while (*s) {
+        while (*s == '/') s++;
+        if (!*s) break;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t len = (size_t)(e - s);
+        if (len == 1 && s[0] == '.') { s = e; continue; }
+        if (len == 2 && s[0] == '.' && s[1] == '.') {
+            while (o > 0 && out[o - 1] != '/') o--;
+            if (o > 0) o--;
+            s = e;
+            continue;
+        }
+        if (o + 1 + len >= sizeof out) return;
+        out[o++] = '/';
+        memcpy(out + o, s, len);
+        o += len;
+        s = e;
+    }
+    if (o == 0) out[o++] = '/';
+    out[o] = '\0';
+    memcpy(p, out, o + 1);
+}
+
+/* ONE HOP: what the link LINK names, as a path -- an absolute target in
+ * the caller's root, a relative one against the link's own directory,
+ * either cleaned of `.` and `..` (in the caller's view, so `..` cannot
+ * climb out of a chroot). vfs_follow_link takes every hop; stat(2) takes
+ * them one at a time, because /dev/stdin -> /proc/self/fd/0 must stop at
+ * the descriptor (src/syscall.c stat_resolve).
+ *
+ * Both halves were bugs once, found by Alpine's rootfs (slice 7): a
+ * relative target resolved against the root, so `lib/libc.musl-x86_64.so.1
+ * -> ld-musl-x86_64.so.1` named "/ld-musl..." and tar reported "write: Is
+ * a directory"; and an absolute one against the KERNEL's root, so inside a
+ * chroot `/bin/sh -> /bin/busybox` reached the host's busybox and `su -s
+ * /bin/sh` said "can't execute". `..` was not cleaned at all, so a link
+ * to `../d/f` named a path no filesystem resolves (batch 15). */
+int vfs_link_target(const char *link, char *out, size_t outsz) {
+    if (!link || !out || outsz == 0) return VFS_ERR_INVAL;
+    char t[VFS_PATH_MAX];
+    int rc = vfs_readlink(link, t, sizeof t);
+    if (rc != VFS_OK) return rc;
+    struct proc *cp = current_proc();
+    const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+    size_t rl = strlen(root);
+    /* the link's path as the caller sees it */
+    const char *view = link;
+    if (rl && strncmp(link, root, rl) == 0 && (link[rl] == '/' || !link[rl]))
+        view = link[rl] ? link + rl : "/";
+    char joined[VFS_PATH_MAX];
+    size_t tl = strlen(t);
+    if (t[0] == '/') {
+        if (tl + 1 > sizeof joined) return VFS_ERR_NAMETOOLONG;
+        memcpy(joined, t, tl + 1);
+    } else {
+        size_t cl = strlen(view);
+        while (cl > 0 && view[cl - 1] != '/') cl--;      /* keep the '/' */
+        if (cl + tl + 1 > sizeof joined) return VFS_ERR_NAMETOOLONG;
+        memcpy(joined, view, cl);
+        memcpy(joined + cl, t, tl + 1);
+    }
+    vfs_path_clean(joined);
+    size_t jl = strlen(joined);
+    if (rl && jl == 1) jl = 0;                       /* "/" in the jail */
+    if (rl + jl + 1 > outsz) return VFS_ERR_NAMETOOLONG;
+    memcpy(out, root, rl);
+    memcpy(out + rl, joined, jl);
+    out[rl + jl] = '\0';
+    if (!out[0]) { out[0] = '/'; out[1] = '\0'; }
+    return VFS_OK;
+}
+
 int vfs_follow_link(const char *path, char *out, size_t outsz) {
     if (!path || !out || outsz == 0) return VFS_ERR_INVAL;
 
@@ -1410,52 +1518,12 @@ int vfs_follow_link(const char *path, char *out, size_t outsz) {
         if (rc != VFS_OK) return rc;
         if (st.type != VFS_TYPE_SYMLINK) break;
         if (depth >= 8) return VFS_ERR_INVAL;       /* symlink loop / too deep */
-        char *next = scratch[depth & 1];            /* never readlink into `cur` */
-        rc = vfs_readlink(cur, next, VFS_PATH_MAX);
+        char *next = scratch[depth & 1];            /* never into `cur` */
+        /* One hop: relative targets against the link's directory,
+         * absolute ones in the caller's root (vfs_link_target, whose
+         * comment carries the Alpine history of both), `..` cleaned. */
+        rc = vfs_link_target(cur, next, VFS_PATH_MAX);
         if (rc != VFS_OK) return rc;
-
-        /* A RELATIVE target resolves against the LINK'S OWN DIRECTORY, not
-         * against the root. This was missing, so `lib/libc.musl-x86_64.so.1
-         * -> ld-musl-x86_64.so.1` resolved to "/ld-musl-x86_64.so.1" and
-         * landed on whatever (if anything) sat there -- during the Alpine
-         * extraction it hit a directory and tar reported "write: Is a
-         * directory".
-         *
-         * It went unnoticed until now because the only previous symlinks were
-         * procfs's synthetic ones and a RAM table, both of which store
-         * ABSOLUTE targets. Real distributions use relative targets heavily
-         * (Alpine's rootfs is full of them), so this is the first workload
-         * that could expose it. */
-        /* An ABSOLUTE target is absolute in the CALLER'S root, not the
-         * kernel's. Inside a chroot, Alpine's `/bin/sh -> /bin/busybox`
-         * otherwise resolves to the HOST's /bin/busybox -- so `su -s /bin/sh`
-         * reported "can't execute '/bin/sh': No such file or directory" while
-         * the link and its target both plainly existed inside the jail.
-         * Re-apply the process root that resolve_user_path() already applied
-         * to the link's own path. */
-        if (next[0] == '/') {
-            struct proc *cp = current_proc();
-            if (cp && cp->fs_root[0]) {
-                char joined[VFS_PATH_MAX];
-                size_t rl = strlen(cp->fs_root), tl = strlen(next);
-                if (rl + tl + 1 <= sizeof(joined)) {
-                    memcpy(joined, cp->fs_root, rl);
-                    memcpy(joined + rl, next, tl + 1);
-                    memcpy(next, joined, strlen(joined) + 1);
-                }
-            }
-        }
-        if (next[0] != '/') {
-            char joined[VFS_PATH_MAX];
-            size_t cl = strlen(cur);
-            while (cl > 0 && cur[cl - 1] != '/') cl--;   /* keep trailing '/' */
-            size_t tl = strlen(next);
-            if (cl + tl + 1 > sizeof(joined)) return VFS_ERR_NAMETOOLONG;
-            memcpy(joined, cur, cl);
-            memcpy(joined + cl, next, tl + 1);
-            /* Copy back into the scratch slot so `cur` stays valid next loop. */
-            memcpy(next, joined, strlen(joined) + 1);
-        }
         cur = next;
     }
 
@@ -1608,6 +1676,12 @@ static struct vfs_symlink_entry *symlink_find(const char *path) {
             return &g_symlinks[i];
     }
     return 0;
+}
+
+/* The table's target for PATH, or NULL (see vfs_stat). */
+const char *vfs_symlink_table_target(const char *path) {
+    struct vfs_symlink_entry *e = symlink_find(path);
+    return e ? e->target : 0;
 }
 
 static int symlink_table_remove(const char *path) {

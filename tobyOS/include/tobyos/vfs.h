@@ -509,6 +509,18 @@ int  vfs_resolve_path(const char *path, char *resolved, size_t resolved_sz);
  * or the stat/readlink error. A non-symlink path is copied through unchanged. */
 int  vfs_follow_link(const char *path, char *out, size_t outsz);
 
+/* One hop of a link: the path it names (relative targets against the
+ * link's directory, absolute ones in the caller's root, `.`/`..` cleaned). */
+int  vfs_link_target(const char *link, char *out, size_t outsz);
+
+/* vfs_stat answers for a link ITSELF (lstat); this follows a link in the
+ * last component to what it names (stat). */
+int  vfs_stat_follow(const char *path, struct vfs_stat *out);
+
+/* The RAM symlink table's target for `path` (a link on a filesystem that
+ * cannot hold one), or NULL. */
+const char *vfs_symlink_table_target(const char *path);
+
 /* Pretty name for an error code (for diagnostics). */
 const char *vfs_strerror(int err);
 

@@ -45,6 +45,7 @@
 
 #define DEV_S_IFDIR 0x4000u
 #define DEV_S_IFCHR 0x2000u
+#define DEV_S_IFLNK 0xA000u
 
 enum dev_avail { AV_ALWAYS = 0, AV_DRM, AV_SND };
 
@@ -53,34 +54,43 @@ struct devfs_ent {
     uint32_t    mode;       /* S_IFDIR or S_IFCHR, plus permission bits */
     uint16_t    maj, min;   /* for a node: the Linux major/minor */
     uint8_t     avail;
+    const char *target;     /* for a link: what it names */
 };
 
 /* The Linux values (major/minor and permissions) as on a stock system, so a
  * program comparing st_rdev against its expectations finds what it expects.
  * /proc/devices lists the same majors. */
 static const struct devfs_ent g_devfs[] = {
-    { "",               DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS },
-    { "null",           DEV_S_IFCHR | 0666,   1,   3, AV_ALWAYS },
-    { "zero",           DEV_S_IFCHR | 0666,   1,   5, AV_ALWAYS },
-    { "full",           DEV_S_IFCHR | 0666,   1,   7, AV_ALWAYS },
-    { "random",         DEV_S_IFCHR | 0666,   1,   8, AV_ALWAYS },
-    { "urandom",        DEV_S_IFCHR | 0666,   1,   9, AV_ALWAYS },
-    { "tty",            DEV_S_IFCHR | 0666,   5,   0, AV_ALWAYS },
-    { "console",        DEV_S_IFCHR | 0600,   5,   1, AV_ALWAYS },
-    { "ptmx",           DEV_S_IFCHR | 0666,   5,   2, AV_ALWAYS },
-    { "fb0",            DEV_S_IFCHR | 0660,  29,   0, AV_ALWAYS },
-    { "pts",            DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS },
-    { "input",          DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS },
-    { "input/event0",   DEV_S_IFCHR | 0660,  13,  64, AV_ALWAYS },
-    { "input/event1",   DEV_S_IFCHR | 0660,  13,  65, AV_ALWAYS },
-    { "dri",            DEV_S_IFDIR | 0755,   0,   0, AV_DRM },
-    { "dri/card0",      DEV_S_IFCHR | 0666, 226,   0, AV_DRM },
-    { "dri/renderD128", DEV_S_IFCHR | 0666, 226, 128, AV_DRM },
-    { "snd",            DEV_S_IFDIR | 0755,   0,   0, AV_SND },
-    { "snd/controlC0",  DEV_S_IFCHR | 0666, 116,   0, AV_SND },
-    { "snd/pcmC0D0p",   DEV_S_IFCHR | 0666, 116,  16, AV_SND },
+    { "",               DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS, 0 },
+    { "null",           DEV_S_IFCHR | 0666,   1,   3, AV_ALWAYS, 0 },
+    { "zero",           DEV_S_IFCHR | 0666,   1,   5, AV_ALWAYS, 0 },
+    { "full",           DEV_S_IFCHR | 0666,   1,   7, AV_ALWAYS, 0 },
+    { "random",         DEV_S_IFCHR | 0666,   1,   8, AV_ALWAYS, 0 },
+    { "urandom",        DEV_S_IFCHR | 0666,   1,   9, AV_ALWAYS, 0 },
+    { "tty",            DEV_S_IFCHR | 0666,   5,   0, AV_ALWAYS, 0 },
+    { "console",        DEV_S_IFCHR | 0600,   5,   1, AV_ALWAYS, 0 },
+    { "ptmx",           DEV_S_IFCHR | 0666,   5,   2, AV_ALWAYS, 0 },
+    { "fb0",            DEV_S_IFCHR | 0660,  29,   0, AV_ALWAYS, 0 },
+    /* Linux's links to the caller's own descriptors. Opening one is
+     * sys_open's (it dups the descriptor, 959b5346); these make them stat,
+     * readlink and list as the links they are -- they did not exist to
+     * anything but open (finding 70). */
+    { "stdin",          DEV_S_IFLNK | 0777,   0,   0, AV_ALWAYS, "/proc/self/fd/0" },
+    { "stdout",         DEV_S_IFLNK | 0777,   0,   0, AV_ALWAYS, "/proc/self/fd/1" },
+    { "stderr",         DEV_S_IFLNK | 0777,   0,   0, AV_ALWAYS, "/proc/self/fd/2" },
+    { "fd",             DEV_S_IFLNK | 0777,   0,   0, AV_ALWAYS, "/proc/self/fd" },
+    { "pts",            DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS, 0 },
+    { "input",          DEV_S_IFDIR | 0755,   0,   0, AV_ALWAYS, 0 },
+    { "input/event0",   DEV_S_IFCHR | 0660,  13,  64, AV_ALWAYS, 0 },
+    { "input/event1",   DEV_S_IFCHR | 0660,  13,  65, AV_ALWAYS, 0 },
+    { "dri",            DEV_S_IFDIR | 0755,   0,   0, AV_DRM, 0 },
+    { "dri/card0",      DEV_S_IFCHR | 0666, 226,   0, AV_DRM, 0 },
+    { "dri/renderD128", DEV_S_IFCHR | 0666, 226, 128, AV_DRM, 0 },
+    { "snd",            DEV_S_IFDIR | 0755,   0,   0, AV_SND, 0 },
+    { "snd/controlC0",  DEV_S_IFCHR | 0666, 116,   0, AV_SND, 0 },
+    { "snd/pcmC0D0p",   DEV_S_IFCHR | 0666, 116,  16, AV_SND, 0 },
     /* A real tmpfs mount (kernel.c): listed here, answered there. */
-    { "shm",            DEV_S_IFDIR | 01777,  0,   0, AV_ALWAYS },
+    { "shm",            DEV_S_IFDIR | 01777,  0,   0, AV_ALWAYS, 0 },
 };
 #define DEVFS_N (sizeof g_devfs / sizeof g_devfs[0])
 
@@ -188,8 +198,27 @@ static int devfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     uint32_t mode, a, b;
     if (!devfs_lookup(devfs_rel(path), &mode, &a, &b)) return VFS_ERR_NOENT;
     memset(out, 0, sizeof *out);
-    out->type = ((mode & 0xF000u) == DEV_S_IFDIR) ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    out->type = ((mode & 0xF000u) == DEV_S_IFDIR) ? VFS_TYPE_DIR :
+                ((mode & 0xF000u) == DEV_S_IFLNK) ? VFS_TYPE_SYMLINK :
+                                                    VFS_TYPE_FILE;
     out->mode = mode | VFS_MODE_VALID;       /* S_IFCHR stays in the mode */
+    if (out->type == VFS_TYPE_SYMLINK) {
+        const struct devfs_ent *e = devfs_find(devfs_rel(path));
+        out->size = (e && e->target) ? strlen(e->target) : 0;
+        out->nlink = 1;
+    }
+    return VFS_OK;
+}
+
+static int devfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz) {
+    (void)mnt;
+    const struct devfs_ent *e = devfs_find(devfs_rel(path));
+    if (!e) return VFS_ERR_NOENT;
+    if ((e->mode & 0xF000u) != DEV_S_IFLNK || !e->target) return VFS_ERR_INVAL;
+    size_t n = strlen(e->target);
+    if (n >= bufsz) n = bufsz - 1;
+    memcpy(buf, e->target, n);
+    buf[n] = '\0';
     return VFS_OK;
 }
 
@@ -227,7 +256,9 @@ static void devfs_fill(struct vfs_dirent *out, const char *name, uint32_t mode) 
     if (n >= VFS_NAME_MAX) n = VFS_NAME_MAX - 1;
     memcpy(out->name, name, n);
     out->name[n] = '\0';
-    out->type = ((mode & 0xF000u) == DEV_S_IFDIR) ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    out->type = ((mode & 0xF000u) == DEV_S_IFDIR) ? VFS_TYPE_DIR :
+                ((mode & 0xF000u) == DEV_S_IFLNK) ? VFS_TYPE_SYMLINK :
+                                                    VFS_TYPE_FILE;
     out->mode = mode | VFS_MODE_VALID;
 }
 
@@ -284,6 +315,7 @@ static const struct vfs_ops devfs_ops = {
     .closedir = devfs_closedir,
     .readdir  = devfs_readdir,
     .stat     = devfs_stat,
+    .readlink = devfs_readlink,
     .chmod    = 0,
     .chown    = 0,
     .umount   = 0,

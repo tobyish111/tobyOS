@@ -44,6 +44,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/proc.h>       /* a link's owner: the caller (tmpfs_symlink) */
 
 /* Same source tobyfs uses for a wall-clock timestamp (see tfs_now_secs). */
 static uint64_t tmpfs_now_secs(void) {
@@ -466,6 +467,56 @@ static int tmpfs_unlink(void *mnt, const char *path)
     return VFS_OK;
 }
 
+/* A SYMBOLIC LINK IS A NODE OF ITS OWN, its target held as its data. tmpfs
+ * had no symlink op, so a link made in /tmp went to the VFS's RAM table:
+ * readlink found it, but `ls` never listed it, stat said it did not exist,
+ * and `rm -rf` of its directory left it behind (logs/b15 lk). */
+static int tmpfs_symlink(void *mnt, const char *path, const char *target)
+{
+    struct tmpfs_mount *m = mnt;
+    char norm[VFS_PATH_MAX];
+    if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
+    if (!*norm) return VFS_ERR_EXIST;
+    if (tfind_name(m, norm)) return VFS_ERR_EXIST;
+    if (!tparent_ok(m, norm)) return VFS_ERR_NOENT;
+    size_t tl = strlen(target);
+    if (tl >= VFS_PATH_MAX) return VFS_ERR_NAMETOOLONG;
+    struct tmpfs_node *nd = talloc(m);
+    if (!nd) return VFS_ERR_NOSPC;
+    memset(nd, 0, sizeof *nd);
+    nd->used = true;
+    nd->type = VFS_TYPE_SYMLINK;
+    nd->nlink = 1;
+    tcopy(nd->path, norm, sizeof nd->path);
+    struct proc *cp = current_proc();
+    nd->uid = cp ? (uint32_t)cp->uid : 0;
+    nd->gid = cp ? (uint32_t)cp->gid : 0;
+    nd->mode = 0777u;
+    int rc = tgrow(m, nd, tl ? tl : 1);
+    if (rc != VFS_OK) {
+        memset(nd, 0, sizeof *nd);
+        return rc;
+    }
+    memcpy(nd->data, target, tl);
+    nd->size = tl;
+    nd->mtime = nd->atime = tmpfs_now_secs();
+    return VFS_OK;
+}
+
+static int tmpfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
+{
+    struct tmpfs_mount *m = mnt;
+    char norm[VFS_PATH_MAX];
+    if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
+    struct tmpfs_node *nd = tfind(m, norm);
+    if (!nd) return VFS_ERR_NOENT;
+    if (nd->type != VFS_TYPE_SYMLINK) return VFS_ERR_INVAL;
+    size_t n = nd->size < bufsz - 1 ? nd->size : bufsz - 1;
+    memcpy(buf, nd->data, n);
+    buf[n] = '\0';
+    return VFS_OK;
+}
+
 /* Phase G: a second directory entry for the same bytes. */
 static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
 {
@@ -499,15 +550,24 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     struct tmpfs_mount *m = mnt;
     char norm[VFS_PATH_MAX];
     if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
+    /* AN IDENTITY: the owning node's slot (shared by its hard links), and
+     * the mount's number for the device. tmpfs reported none, so two names
+     * for one file -- or $PWD and the cwd it names, through a link -- could
+     * not be told the same (test -ef; tsh's logical pwd, logs/b15 cdl). */
+    uint32_t dev = 0x7700u + (uint32_t)(m - g_tmpfs);
     if (!*norm) {                                  /* the mount root */
         memset(out, 0, sizeof *out);
         out->type = VFS_TYPE_DIR;
         out->mode = 0777u | VFS_MODE_VALID;
+        out->ino  = TMPFS_MAX_NODES + 1u;
+        out->dev  = dev;
         return VFS_OK;
     }
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     memset(out, 0, sizeof *out);
+    out->ino   = (uint64_t)(tresolve(m, nd) - m->nodes) + 1u;
+    out->dev   = dev;
     out->type  = nd->type;
     out->size  = nd->size;
     out->uid   = nd->uid;
@@ -742,7 +802,8 @@ static const struct vfs_ops tmpfs_ops = {
     .truncate  = tmpfs_truncate,
     .ftruncate = tmpfs_ftruncate,
     .link      = tmpfs_link,
-    .readlink  = 0,
+    .symlink   = tmpfs_symlink,
+    .readlink  = tmpfs_readlink,
     .umount    = 0,
     .statfs    = tmpfs_statfs,   /* Phase H */
 };
