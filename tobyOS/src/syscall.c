@@ -2077,6 +2077,103 @@ static int resolve_mid_links(char *kpath, size_t cap) {
     return 0;
 }
 
+/* Does PATH have a `..` component? */
+static bool path_has_dotdot(const char *p) {
+    for (const char *s = p; *s; ) {
+        while (*s == '/') s++;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        if (e - s == 2 && s[0] == '.' && s[1] == '.') return true;
+        s = e;
+    }
+    return false;
+}
+
+/* `..` IS THE PHYSICAL PARENT. A path with `..` in it is walked as Linux's
+ * namei walks one: component by component from "/", a symbolic link before
+ * the last component replaced by its target as it is met, `..` taking the
+ * parent of where the walk IS -- so `a/lx/../f`, lx a link to ../t/x, is
+ * t/f, not a/f -- and a component before the last that is missing or not a
+ * directory ending it with ENOENT or ENOTDIR, where a lexical `..` skipped
+ * over it. FULL is the caller's view of the path, absolute; ROOT its chroot
+ * ("" for none), which the walk never climbs above; the result, ROOT +
+ * the walked path, goes to OUT. The LAST component is not followed: that
+ * is the syscall's to decide, as for resolve_mid_links. Lexical cleaning
+ * took `..` before any link was looked at (finding 88). */
+static int path_walk_physical(const char *root, const char *full,
+                              char *out, size_t cap) {
+    char cur[ABI_PATH_MAX];               /* where the walk is: caller view */
+    char rest[ABI_PATH_MAX * 2];          /* what is left to walk */
+    char kp[ABI_PATH_MAX * 2], tgt[VFS_PATH_MAX];
+    size_t rl = strlen(root);
+    size_t fl = strlen(full);
+    if (fl >= sizeof rest) return -ABI_ENAMETOOLONG;
+    memcpy(rest, full, fl + 1);
+    cur[0] = '/'; cur[1] = '\0';
+    size_t cl = 1;
+    int hops = 0;
+    size_t r = 0;                         /* read position in rest */
+    for (;;) {
+        while (rest[r] == '/') r++;
+        if (!rest[r]) break;
+        size_t s = r;
+        while (rest[r] && rest[r] != '/') r++;
+        size_t n = r - s;
+        size_t q = r;
+        while (rest[q] == '/') q++;
+        bool last = rest[q] == '\0';
+        if (n == 1 && rest[s] == '.') continue;
+        if (n == 2 && rest[s] == '.' && rest[s + 1] == '.') {
+            while (cl > 1 && cur[cl - 1] != '/') cl--;
+            if (cl > 1) cl--;                     /* and its '/' */
+            cur[cl] = '\0';
+            continue;
+        }
+        size_t prev = cl;                         /* to drop it again */
+        if (cl > 1) {
+            if (cl + 1 >= sizeof cur) return -ABI_ENAMETOOLONG;
+            cur[cl++] = '/';
+        }
+        if (cl + n >= sizeof cur) return -ABI_ENAMETOOLONG;
+        memcpy(cur + cl, rest + s, n);
+        cl += n;
+        cur[cl] = '\0';
+        if (last) break;
+        if (rl + cl + 1 > sizeof kp) return -ABI_ENAMETOOLONG;
+        memcpy(kp, root, rl);
+        memcpy(kp + rl, cur, cl + 1);
+        struct vfs_stat st;
+        if (vfs_stat(kp, &st) != VFS_OK) return -ABI_ENOENT;
+        if (st.type == VFS_TYPE_SYMLINK) {
+            if (++hops > 40) return -ABI_ELOOP;
+            if (vfs_readlink(kp, tgt, sizeof tgt) != VFS_OK) return -ABI_ENOENT;
+            /* the target, then what was left after the link */
+            size_t tl = strlen(tgt), left = strlen(rest + r);
+            if (tl + 1 + left + 1 > sizeof rest) return -ABI_ENAMETOOLONG;
+            memmove(rest + tl + 1, rest + r, left + 1);
+            memcpy(rest, tgt, tl);
+            rest[tl] = '/';
+            r = 0;
+            if (tgt[0] == '/') {                  /* absolute: from the root */
+                cl = 1;
+            } else {                              /* relative: the link's dir */
+                cl = prev;
+            }
+            cur[cl] = '\0';
+            continue;
+        }
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    }
+    /* the root itself is ROOT, the root's "/" when there is none */
+    size_t ol = (rl && cl == 1) ? 0 : cl;
+    if (rl + ol + 1 > cap) return -ABI_ENAMETOOLONG;
+    memcpy(out, root, rl);
+    memcpy(out + rl, cur, ol);
+    out[rl + ol] = '\0';
+    if (!out[0]) { out[0] = '/'; out[1] = '\0'; }
+    return 0;
+}
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
@@ -2128,6 +2225,11 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
         if (need_slash) full[o++] = '/';
         memcpy(full + o, up, (size_t)plen);
         full[o + plen] = '\0';
+    }
+    if (path_has_dotdot(up)) {                     /* see path_walk_physical */
+        struct proc *cp = current_proc();
+        return path_walk_physical((cp && cp->fs_root[0]) ? cp->fs_root : "",
+                                  full, out, cap);
     }
     {
         int rc = path_lexical_clean(full, out, cap);
@@ -2189,6 +2291,18 @@ static int resolve_user_path_at(int dirfd, const char *upath,
                 memcpy(joined, df->dirpath, dl);
                 if (dl && joined[dl - 1] != '/') joined[dl++] = '/';
                 memcpy(joined + dl, rawp, (size_t)rl + 1);
+                if (path_has_dotdot(rawp)) {       /* see path_walk_physical */
+                    /* the directory's path is the kernel's: the caller's
+                     * view is what follows its root */
+                    struct proc *cp = current_proc();
+                    const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+                    size_t rtl = strlen(root);
+                    const char *view = joined;
+                    if (rtl && strncmp(joined, root, rtl) == 0 &&
+                        (joined[rtl] == '/' || !joined[rtl]))
+                        view = joined[rtl] ? joined + rtl : "/";
+                    return path_walk_physical(root, view, out, cap);
+                }
                 int crc = path_lexical_clean(joined, out, cap);
                 if (crc != 0) return crc;
                 return resolve_mid_links(out, cap);
