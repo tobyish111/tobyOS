@@ -26286,9 +26286,16 @@ static int shell_capture_command(const char *cmd, struct shell_sb *out) {
     return 0;
 }
 
+/* `p` is at `$(`. Copies the command text into CMD and leaves *pp past
+ * the `)` that closes it -- or, with CMD null, only finds that `)`: the
+ * pipeline splitter asks where a substitution ends, and one rule for it
+ * is the point. Its own walk ended a `"$( )"` at the first `"` inside it
+ * and took the `|` of `$(echo "a|b")` for a pipe. */
 static int shell_parse_command_subst(const char **pp, char *cmd,
                                      size_t cmd_cap) {
     const char *p = *pp;
+    /* one byte of the substitution: copied, or with no CMD only passed */
+#define CS_TAKE() do { if (cmd) cmd[pos] = *p; pos++; p++; } while (0)
     if (p[0] != '$' || p[1] != '(') return -1;
     p += 2;
 
@@ -26318,21 +26325,21 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
     while (*p) {
         if (in_sq) {
             if (sq_ansi && *p == '\\' && p[1]) {
-                if (pos + 2 >= cmd_cap) return -1;
-                cmd[pos++] = *p++;
-                cmd[pos++] = *p++;
+                if (cmd && pos + 2 >= cmd_cap) return -1;
+                CS_TAKE();
+                CS_TAKE();
                 continue;
             }
             if (*p == '\'') { in_sq = false; sq_ansi = false; }
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) {
-                if (pos + 2 >= cmd_cap) return -1;
-                cmd[pos++] = *p++;
-                cmd[pos++] = *p++;
+                if (cmd && pos + 2 >= cmd_cap) return -1;
+                CS_TAKE();
+                CS_TAKE();
                 continue;
             }
             if (p[0] == '$' && p[1] == '(') {
@@ -26340,14 +26347,14 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
                 in_sq = false;
                 in_dq = false;
                 depth++;
-                if (pos + 2 >= cmd_cap) return -1;
-                cmd[pos++] = *p++;
-                cmd[pos++] = *p++;
+                if (cmd && pos + 2 >= cmd_cap) return -1;
+                CS_TAKE();
+                CS_TAKE();
                 continue;
             }
             if (*p == '"') in_dq = false;
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         if (*p == '\\' && p[1]) {
@@ -26359,37 +26366,37 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
              * double quote. Copying the backslash and then letting the `"`
              * set the flag left the matcher inside a string that never ended,
              * and it ran past the `)` that closes the substitution. */
-            if (pos + 2 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 2 >= cmd_cap) return -1;
+            CS_TAKE();
+            CS_TAKE();
             continue;
         }
         if (*p == '$' && p[1] == '\'') {
             in_sq = true;
             sq_ansi = true;
-            if (pos + 2 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 2 >= cmd_cap) return -1;
+            CS_TAKE();
+            CS_TAKE();
             continue;
         }
         if (*p == '\'') {
             in_sq = true;
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         if (*p == '"') {
             in_dq = true;
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         if (p[0] == '$' && p[1] == '(') {
             if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
             depth++;
-            if (pos + 2 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 2 >= cmd_cap) return -1;
+            CS_TAKE();
+            CS_TAKE();
             continue;
         }
         /* THE `)` OF A `case` PATTERN CLOSES THE PATTERN, NOT THIS WORD --
@@ -26400,8 +26407,8 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
          * pattern's. */
         if (shell_word_boundary_at(sub_start, p, "case")) {
             case_open++; case_want_in = true;
-            if (pos + 4 >= cmd_cap) return -1;
-            for (int k = 0; k < 4; k++) cmd[pos++] = *p++;
+            if (cmd && pos + 4 >= cmd_cap) return -1;
+            for (int k = 0; k < 4; k++) CS_TAKE();
             continue;
         }
         if (case_open > 0 && shell_word_boundary_at(sub_start, p, "esac")) {
@@ -26413,27 +26420,27 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             if (!case_want_in && !pat_pos) {
                 case_open--; case_pat = false;
             }
-            if (pos + 4 >= cmd_cap) return -1;
-            for (int k = 0; k < 4; k++) cmd[pos++] = *p++;
+            if (cmd && pos + 4 >= cmd_cap) return -1;
+            for (int k = 0; k < 4; k++) CS_TAKE();
             continue;
         }
         if (case_open > 0 && case_want_in &&
             shell_word_boundary_at(sub_start, p, "in")) {
             case_want_in = false; case_pat = true;
-            if (pos + 2 >= cmd_cap) return -1;
-            cmd[pos++] = *p++; cmd[pos++] = *p++;
+            if (cmd && pos + 2 >= cmd_cap) return -1;
+            CS_TAKE(); CS_TAKE();
             continue;
         }
         if (case_open > 0 && p[0] == ';' && p[1] == ';') {
             case_pat = true;
-            if (pos + 2 >= cmd_cap) return -1;
-            cmd[pos++] = *p++; cmd[pos++] = *p++;
+            if (cmd && pos + 2 >= cmd_cap) return -1;
+            CS_TAKE(); CS_TAKE();
             continue;
         }
         if (case_open > 0 && case_pat && (*p == '(' || *p == ')')) {
             if (*p == ')') case_pat = false;
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         /* A BARE `(` -- a subshell inside the substitution -- nests too. Only
@@ -26442,8 +26449,8 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
         if (*p == '(') {
             if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
             depth++;
-            if (pos + 1 >= cmd_cap) return -1;
-            cmd[pos++] = *p++;
+            if (cmd && pos + 1 >= cmd_cap) return -1;
+            CS_TAKE();
             continue;
         }
         if (*p == ')') {
@@ -26454,15 +26461,16 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             }
             if (depth == 0) {
                 p++;
-                cmd[pos] = '\0';
+                if (cmd) cmd[pos] = '\0';
                 *pp = p;
                 return 0;
             }
         }
-        if (pos + 1 >= cmd_cap) return -1;
-        cmd[pos++] = *p++;
+        if (cmd && pos + 1 >= cmd_cap) return -1;
+        CS_TAKE();
     }
     return -1;
+#undef CS_TAKE
 }
 
 /* THE COMMAND TEXT IS SIZED FROM THE SOURCE, not from LINE_MAX: it is a
@@ -43676,6 +43684,7 @@ static const char *shell_find_pipe_at(const char *s) {
      * next REAL pipe. */
     int vbrace = 0;
     const char *start = s;
+    const char *send = s + strlen(s);
 
     for (const char *p = s; *p; p++) {
         if (in_sq) {
@@ -43685,6 +43694,23 @@ static const char *shell_find_pipe_at(const char *s) {
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            /* A SUBSTITUTION INSIDE THE STRING IS ANOTHER COMMAND, and its
+             * quotes are its own:
+             *
+             *     echo "x: $(echo "a|b")"          bash: x: a|b
+             *
+             * Ending the string at the inner `"` left `a|b` outside every
+             * quote, a pipe: the line was cut in two and each half was a
+             * "bad command substitution". The substitution is passed whole,
+             * by the reader that will run it. */
+            if (*p == '$' && p[1] == '(') {
+                const char *q = p;
+                if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+            }
+            if ((*p == '$' && p[1] == '{') || *p == '`') {
+                p = shell_brace_skip_subst(p, send) - 1;
+                continue;
+            }
             if (*p == '"') in_dq = false;
             continue;
         }
@@ -43742,7 +43768,15 @@ static const char *shell_find_pipe_at(const char *s) {
                 }
             }
         }
-        if (*p == '$' && p[1] == '(') { paren++; p++; continue; }
+        /* A `$( )` OUTSIDE QUOTES IS PASSED WHOLE TOO. Counting its parens
+         * took the `)` of a case pattern in
+         * `$(case x in x) echo a | tr a b;; esac)` for its end, and the `|`
+         * after it for a pipe. Unterminated, it is counted as before. */
+        if (*p == '$' && p[1] == '(') {
+            const char *q = p;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+            paren++; p++; continue;
+        }
         if (*p == '(') { paren++; continue; }
         if (*p == ')') { if (paren > 0) paren--; continue; }
         if (paren > 0) continue;
