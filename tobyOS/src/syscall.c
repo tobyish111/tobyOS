@@ -4190,6 +4190,10 @@ static long sys_nanosleep(uint64_t ns) {
     return 0;
 }
 
+/* nanosleep for a blocking call that polls, from inside the kernel: the
+ * caller is parked for NS with the BKL put down (see proc.h). */
+long proc_nap_ns(uint64_t ns) { return sys_nanosleep(ns); }
+
 static long sys_clock_ms(void) {
     return (long)(perf_now_ns() / 1000000ull);
 }

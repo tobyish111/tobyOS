@@ -1032,6 +1032,14 @@ int proc_set_pgid(int pid, int pgid);
  * Returns the caller's pid as the kernel numbers it. */
 long proc_setsid(struct proc *p);
 
+/* Park the calling process for NS nanoseconds -- a blocking call's wait
+ * for something no wait queue announces (the console's keyboard ring).
+ * The BKL is put down for the wait and taken back, as nanosleep does:
+ * a wait that held it stopped every other CPU's syscalls and pid 0.
+ * -EINTR (an ABI errno) when a signal that acts came first. Not for
+ * pid 0. */
+long proc_nap_ns(uint64_t ns);
+
 /* Signal `pid` and every process descended from it. Returns the count.
  * Uses live parent links, so it cannot follow a recycled pid. */
 int proc_kill_tree(int pid, int sig);

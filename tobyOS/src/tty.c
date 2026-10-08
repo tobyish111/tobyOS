@@ -112,13 +112,21 @@ bool tty_handle_isig(char c) {
 }
 
 /* ---- blocking single-char fetch from the keyboard ring ---------------- */
+/* THE WAIT FOR A KEY PUTS THE BKL DOWN. It was `sti(); hlt();` in a loop,
+ * inside the read syscall, holding the big kernel lock: every other CPU's
+ * syscalls, and pid 0 with the network, waited behind a process reading
+ * the console. One `cat /dev/tty` from an SSH command -- whose terminal was
+ * the console -- stopped the guest for good (logs/b16 qd4-wedge.log: the
+ * watchdog's idle_stall, cpu1 holding the lock in `cat`'s read). The ring
+ * has no wait queue, so the reader naps a few milliseconds at a time
+ * (proc_nap_ns) and looks again. */
+#define TTY_KEY_NAP_NS 5000000ull
 /* Returns 0..255, or <0 to mean "interrupted by a signal" (EINTR). */
 static int getc_block(void) {
     int c = tty_input_next();
     while (c < 0) {
         if (signal_pending_self()) return -1;
-        sti();
-        hlt();
+        (void)proc_nap_ns(TTY_KEY_NAP_NS);
         c = tty_input_next();
     }
     return c;
@@ -206,8 +214,7 @@ static long raw_read(char *buf, size_t n) {
         if (c < 0) {
             if (got >= vmin) break;   /* VMIN satisfied */
             if (signal_pending_self()) return got ? (long)got : EINTR_RET;
-            sti();
-            hlt();
+            (void)proc_nap_ns(TTY_KEY_NAP_NS);    /* see getc_block */
             continue;
         }
         buf[got++] = (char)c;
