@@ -38,6 +38,10 @@ pid_t fork(void) {
 pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
                     int fd0, int fd1, int fd2,
                     const struct abi_spawn_fd *extra, unsigned nextra);
+pid_t toby_spawn_flags(const char *path, char *const argv[], char *const envp[],
+                       int fd0, int fd1, int fd2,
+                       const struct abi_spawn_fd *extra, unsigned nextra,
+                       unsigned flags);
 
 pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
                  int fd0, int fd1, int fd2) {
@@ -50,6 +54,15 @@ pid_t toby_spawn(const char *path, char *const argv[], char *const envp[],
 pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
                     int fd0, int fd1, int fd2,
                     const struct abi_spawn_fd *extra, unsigned nextra) {
+    return toby_spawn_flags(path, argv, envp, fd0, fd1, fd2, extra, nextra, 0);
+}
+
+/* As toby_spawn_ex, with abi_spawn_req.flags (ABI_SPAWN_F_*: the child's
+ * SIGINT and SIGQUIT at the default or ignored, whatever the caller has). */
+pid_t toby_spawn_flags(const char *path, char *const argv[], char *const envp[],
+                       int fd0, int fd1, int fd2,
+                       const struct abi_spawn_fd *extra, unsigned nextra,
+                       unsigned flags) {
     struct abi_spawn_req req = {
         .path = path,
         .argv = argv,
@@ -57,7 +70,7 @@ pid_t toby_spawn_ex(const char *path, char *const argv[], char *const envp[],
         .fd0  = fd0,
         .fd1  = fd1,
         .fd2  = fd2,
-        .flags = 0,
+        .flags = flags,
         .nextra = nextra,
         .extra  = extra,
     };

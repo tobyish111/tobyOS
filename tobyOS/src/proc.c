@@ -1454,6 +1454,20 @@ int proc_spawn(const struct proc_spec *spec) {
     struct proc *spawner = current_proc();
     uint32_t spawner_umask = spawner ? spawner->umask : 0;
     if (spec->set_umask && spawner) spawner->umask = spec->umask & 0777u;
+    /* spec->sig_default / sig_ignore, by the same trick: the spawner's own
+     * action is SIG_DFL or SIG_IGN for the length of the build, and an
+     * ignore is all spawn_body copies from it. Put back before the
+     * spawner returns to user mode, where its signals are delivered. */
+    struct sigaction *sa_sp = (spawner && spawner->pid != 0 &&
+                                (spec->sig_default | spec->sig_ignore))
+                            ? sig_actions_of(spawner) : 0;
+    void (*sa_saved[SIG_MAX])(int);
+    if (sa_sp)
+        for (int i = 1; i < SIG_MAX; i++) {
+            sa_saved[i] = sa_sp[i].sa_handler;
+            if (spec->sig_ignore & SIGMASK(i))       sa_sp[i].sa_handler = SIG_IGN;
+            else if (spec->sig_default & SIGMASK(i)) sa_sp[i].sa_handler = SIG_DFL;
+        }
     int pid = spawn_internal(spec->path, spec->name,
                              spec->fd0, spec->fd1, spec->fd2,
                              spec->fd3, spec->fd4,
@@ -1461,6 +1475,8 @@ int proc_spawn(const struct proc_spec *spec) {
                              spec->argc, spec->argv,
                              spec->envc, spec->envp,
                              spec->cwd);
+    if (sa_sp)
+        for (int i = 1; i < SIG_MAX; i++) sa_sp[i].sa_handler = sa_saved[i];
     if (spec->set_umask && spawner) spawner->umask = spawner_umask;
     perf_zone_end(PERF_Z_PROC_SPAWN, t_spawn);
     if (pid < 0) return pid;

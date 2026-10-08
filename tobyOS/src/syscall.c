@@ -3944,7 +3944,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
      * user mutation can't change pointers we already validated. */
     struct abi_spawn_req kreq;
     if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
-    if (kreq.flags != 0) return -ABI_EINVAL;
+    if (kreq.flags & ~(ABI_SPAWN_F_DFL_INT | ABI_SPAWN_F_DFL_QUIT |
+                       ABI_SPAWN_F_IGN_INT | ABI_SPAWN_F_IGN_QUIT))
+        return -ABI_EINVAL;
 
     /* A RELATIVE PATH IS THE CALLER'S CWD's, as execve's is (sys_execve
      * resolves; this did not):
@@ -4077,6 +4079,10 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         .envc = kenvc, .envp = kenvp,
         .sandbox_profile = 0,
         .cwd = 0,
+        .sig_default = ((kreq.flags & ABI_SPAWN_F_DFL_INT)  ? SIGMASK(SIGINT)  : 0) |
+                       ((kreq.flags & ABI_SPAWN_F_DFL_QUIT) ? SIGMASK(SIGQUIT) : 0),
+        .sig_ignore  = ((kreq.flags & ABI_SPAWN_F_IGN_INT)  ? SIGMASK(SIGINT)  : 0) |
+                       ((kreq.flags & ABI_SPAWN_F_IGN_QUIT) ? SIGMASK(SIGQUIT) : 0),
     };
     int pid = proc_spawn(&spec);
     for (int i = 0; i < nextra; i++) file_close(kextra[i].f);

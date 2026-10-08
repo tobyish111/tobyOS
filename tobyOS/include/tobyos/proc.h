@@ -914,6 +914,14 @@ struct proc_spec {
      * network task at once) and hands it to the programs it starts here. */
     bool         set_umask;
     uint32_t     umask;
+    /* Signals (SIGMASK bits) the child starts at their DEFAULT, or
+     * IGNORED, whatever the spawner has -- posix_spawn's SETSIGDEF and its
+     * opposite. A shell's restore_original_signals: tsh ignores INT and
+     * QUIT in an asynchronous child, and the commands that child runs get
+     * them back (src/shell.c shell_spec_sigs). 0 and 0 (every existing
+     * caller) is the usual rule: an ignore is inherited, a handler is not. */
+    uint64_t     sig_default;
+    uint64_t     sig_ignore;
 };
 int proc_spawn(const struct proc_spec *spec);
 

@@ -1967,7 +1967,7 @@ struct abi_stat {
  *                    explicit fd is duped into the child's fd table
  *                    by the kernel, so the parent can close its own
  *                    copy independently after spawn returns.
- * `flags`          : reserved, must be 0 in v1.
+ * `flags`          : ABI_SPAWN_F_* below; 0 = none (every v1 caller).
  *
  * Returns: child pid (>0) on success; negative ABI_E* on failure.
  * Process is launched synchronously — when this call returns the
@@ -2006,6 +2006,16 @@ struct abi_spawn_req {
 /* fd0/fd1/fd2 sentinels for spawn_req. */
 #define ABI_SPAWN_FD_INHERIT   (-1)
 #define ABI_SPAWN_FD_CONSOLE   (-2)
+
+/* spawn_req.flags: the child starts with SIGINT / SIGQUIT at the default
+ * (DFL) or ignored (IGN) whatever the caller has -- posix_spawn's
+ * SETSIGDEF and its opposite, for a shell's restore_original_signals
+ * (proc_spec.sig_default / sig_ignore). Without them an ignore is
+ * inherited and a handler is not. Any other bit is -EINVAL. */
+#define ABI_SPAWN_F_DFL_INT    0x1u
+#define ABI_SPAWN_F_DFL_QUIT   0x2u
+#define ABI_SPAWN_F_IGN_INT    0x4u
+#define ABI_SPAWN_F_IGN_QUIT   0x8u
 
 /* ============================================================
  *  Networking helpers (already exported in older syscall.h, but
