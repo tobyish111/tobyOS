@@ -6458,6 +6458,101 @@ static int shell_copy_path(char *dst, size_t cap, const char *src) {
     return 0;
 }
 
+/* What PATH is, not following a link: 0 nothing, 1 a directory, 2 a link,
+ * 3 anything else; and a link's target as written (0, or -1). */
+static int shell_path_kind(const char *path) {
+    struct vfs_stat st;
+#ifdef SHELL_HOSTED
+    extern int vfs_lstat(const char *path, struct vfs_stat *out);
+    if (vfs_lstat(path, &st) != VFS_OK) return 0;
+#else
+    if (vfs_stat(path, &st) != VFS_OK) return 0;      /* the VFS's is lstat */
+#endif
+    return st.type == VFS_TYPE_DIR ? 1 : st.type == VFS_TYPE_SYMLINK ? 2 : 3;
+}
+
+static int shell_path_readlink(const char *path, char *buf, size_t cap) {
+#ifdef SHELL_HOSTED
+    extern long readlink(const char *path, char *buf, size_t bufsiz);
+    long n = readlink(path, buf, cap - 1);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    return 0;
+#else
+    return vfs_readlink(path, buf, cap) == VFS_OK ? 0 : -1;
+#endif
+}
+
+/* `..` IS THE PHYSICAL PARENT, for the paths the shell resolves itself --
+ * `test`'s operands, redirection targets, `source`, `cd -P`'s checks --
+ * as for every path the kernel resolves (syscall.c path_walk_physical):
+ * FULL, absolute, is walked from "/", a link before the last component
+ * replaced by its target as it is met and `..` taking the parent of where
+ * the walk is. 0 and the path in OUT, or -1 when a component before the
+ * last is missing or not a directory, or the walk does not fit. The lexical
+ * `..` it replaces made `[ -e a/lx/../f ]` ask about a/f where bash's
+ * stat(2) asks about the link target's parent (logs/b16 dotdot). */
+static int shell_walk_physical(const char *full, char *out, size_t cap) {
+    char cur[VFS_PATH_MAX], rest[2 * VFS_PATH_MAX], tgt[VFS_PATH_MAX];
+    size_t fl = strlen(full);
+    if (fl >= sizeof rest) return -1;
+    memcpy(rest, full, fl + 1);
+    size_t cl = 1, r = 0;
+    int hops = 0;
+    cur[0] = '/'; cur[1] = '\0';
+    for (;;) {
+        while (rest[r] == '/') r++;
+        if (!rest[r]) break;
+        size_t s = r;
+        while (rest[r] && rest[r] != '/') r++;
+        size_t n = r - s, q = r;
+        while (rest[q] == '/') q++;
+        bool last = rest[q] == '\0';
+        if (n == 1 && rest[s] == '.') continue;
+        if (n == 2 && rest[s] == '.' && rest[s + 1] == '.') {
+            while (cl > 1 && cur[cl - 1] != '/') cl--;
+            if (cl > 1) cl--;
+            cur[cl] = '\0';
+            continue;
+        }
+        size_t prev = cl;
+        if (cl > 1) {
+            if (cl + 1 >= sizeof cur) return -1;
+            cur[cl++] = '/';
+        }
+        if (cl + n >= sizeof cur) return -1;
+        memcpy(cur + cl, rest + s, n);
+        cl += n;
+        cur[cl] = '\0';
+        if (last) break;
+        int k = shell_path_kind(cur);
+        if (k == 2) {
+            if (++hops > 40 || shell_path_readlink(cur, tgt, sizeof tgt) < 0)
+                return -1;
+            size_t tl = strlen(tgt), left = strlen(rest + r);
+            if (tl + 1 + left + 1 > sizeof rest) return -1;
+            memmove(rest + tl + 1, rest + r, left + 1);
+            memcpy(rest, tgt, tl);
+            rest[tl] = '/';
+            r = 0;
+            cl = (tgt[0] == '/') ? 1 : prev;
+            cur[cl] = '\0';
+            continue;
+        }
+        if (k != 1) return -1;                  /* missing, or not a dir */
+    }
+    if (cl + 1 > cap) return -1;
+    memcpy(out, cur, cl + 1);
+    return 0;
+}
+
+/* Set while `cd` resolves a LOGICAL path: `..` by the text (cmd_cd). */
+static bool g_canon_lexical;
+static void shell_canon_physical_again(bool *unused) {
+    (void)unused;
+    g_canon_lexical = false;
+}
+
 static int shell_canonicalize_path(const char *in, char *out, size_t cap) {
     if (!out || cap == 0) return -1;
     const char *src = (in && *in) ? in : ".";
@@ -6483,6 +6578,28 @@ static int shell_canonicalize_path(const char *in, char *out, size_t cap) {
         size_t pos = clen;
         if (need_slash) tmp[pos++] = '/';
         memcpy(tmp + pos, src, slen + 1);
+    }
+
+    /* A `..` is the physical parent (shell_walk_physical). When the walk
+     * cannot be made -- a component before the last missing or not a
+     * directory -- the path goes on as written, `..` and all, so the stat
+     * or open that follows fails as bash's does, ENOENT or ENOTDIR. */
+    {
+        bool dd = false;
+        for (const char *s = tmp; *s && !dd; ) {
+            while (*s == '/') s++;
+            const char *e = s;
+            while (*e && *e != '/') e++;
+            if (e - s == 2 && s[0] == '.' && s[1] == '.') dd = true;
+            s = e;
+        }
+        if (dd && !g_canon_lexical) {
+            if (shell_walk_physical(tmp, out, cap) == 0) return 0;
+            size_t tl = strlen(tmp);
+            if (tl + 1 > cap) return -1;
+            memcpy(out, tmp, tl + 1);
+            return 0;
+        }
     }
 
     char *parts[48];
@@ -11963,6 +12080,12 @@ static void cmd_cd(int argc, char **argv) {
     /* LOGICAL: a relative operand is taken from $PWD -- `cd ..` from a
      * linked directory goes to the link's parent, as bash's does -- unless
      * -P asks for the physical one */
+    /* ...and its `..` is taken by the TEXT, as bash's canonicalization
+     * takes it, where every other path the shell resolves walks to the
+     * physical parent (shell_walk_physical) -- for the rest of this cd */
+    bool canon_guard __attribute__((cleanup(shell_canon_physical_again))) = true;
+    (void)canon_guard;
+    g_canon_lexical = !cd_physical;
     const char *lpwd = shell_logical_pwd();
     if (!cd_physical && target[0] != '/' && target[0] != '~' &&
         strcmp(lpwd, shell_cwd()) != 0) {
