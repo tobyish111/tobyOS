@@ -817,14 +817,19 @@ static bool signal_deliver(struct syscall_regs *regs, long rv, long num) {
 
     if (sa->sa_handler == SIG_DFL) {
         signal_apply_default(p, sig);
+        if (!regs || signal_default_action(sig) != 2) return false;
+        /* RESUMED FROM A STOP: what came meanwhile is taken now, as Linux's
+         * get_signal goes round again -- a SIGKILL that ended the stop
+         * above all. Taken one per return, `kill -9` of a stopped `cat &`
+         * let it see EINTR and exit 1 before the kill landed: "Exit 1",
+         * where bash says "Killed" (logs/b15 ttin). */
+        if (sig_should_eintr(p)) return signal_deliver(regs, rv, num);
         /* A STOP THAT INTERRUPTED A BLOCKING CALL: once continued, the call
          * goes on, as Linux restarts it when no handler ran (ERESTARTSYS,
          * ERESTARTNOHAND). It returned EINTR to a program that had asked
          * for no signal at all: `cat` reading a pipe, stopped by ^Z and
-         * continued by `fg`, failed with "Interrupted system call". Not
-         * when something that acts is pending by now -- that ends it. */
-        return regs && signal_default_action(sig) == 2 && rv == EINTR_RET &&
-               num >= 0 && !regs->pad && !sig_should_eintr(p);
+         * continued by `fg`, failed with "Interrupted system call". */
+        return rv == EINTR_RET && num >= 0 && !regs->pad;
     }
 
     /* User handler: set up the frame; fall back to default if we can't. */

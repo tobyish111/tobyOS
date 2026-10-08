@@ -514,9 +514,54 @@ static long slave_raw_read(struct pty *t, uint8_t *out, size_t n) {
     return (long)got;
 }
 
+/* Is process group PG of session SID ORPHANED -- no member with a parent
+ * in another group of the same session (POSIX XBD 3.265), so nothing is
+ * left that could continue it if it stopped? */
+static bool pty_pgrp_orphaned(int pg, int sid) {
+    extern struct proc g_proc[];
+    for (int i = 1; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+            q->state == PROC_TERMINATED || q->is_thread) continue;
+        if ((q->pgid > 0 ? q->pgid : q->pid) != pg) continue;
+        struct proc *par = q->ppid > 0 ? proc_lookup(q->ppid) : 0;
+        if (!par) continue;
+        if ((par->pgid > 0 ? par->pgid : par->pid) != pg && par->sid == sid)
+            return false;
+    }
+    return true;
+}
+
+/* JOB CONTROL ON INPUT (POSIX XBD 11.1.4). A process in a BACKGROUND group
+ * of the session whose controlling terminal this is, reading it, has
+ * SIGTTIN sent to its group -- by default that stops the job, and the read
+ * runs again once it is continued (signal_deliver restarts it) -- or gets
+ * EIO when it ignores or blocks SIGTTIN, or its group is orphaned. None was
+ * sent: `cat &` at a prompt read the keys typed at the shell, where bash's
+ * job stops at once, "Stopped (tty input)" (finding 89). Only the
+ * session's own terminal, as Linux checks; 0 when the read may go on. */
+static long pty_bg_read(struct pty *t) {
+    struct proc *p = current_proc();
+    if (!p || p->pid == 0 || p->is_kernel) return 0;
+    if (p->ctty_kind != PROC_CTTY_PTY || p->ctty_index != t->index ||
+        p->ctty_gen != g_pty_gen[t->index]) return 0;
+    int pg = p->pgid > 0 ? p->pgid : p->pid;
+    if (t->pgrp <= 0 || pg == t->pgrp) return 0;
+    struct sigaction *act = sig_actions_of(p);
+    if ((act && act[SIGTTIN].sa_handler == SIG_IGN) ||
+        (p->sigstate.mask & SIGMASK(SIGTTIN)) || pty_pgrp_orphaned(pg, p->sid))
+        return -ABI_EIO;
+    signal_send_to_pgrp(pg, SIGTTIN);
+    return EINTR_RET;
+}
+
 long pty_slave_read(struct file *f, void *buf, size_t n) {
     struct pty *t = f->pty;
     if (!t) return -1;
+    {
+        long jc = pty_bg_read(t);
+        if (jc) return jc;
+    }
     if (t->tio.c_lflag & TTY_ICANON) return slave_canonical_read(t, (uint8_t *)buf, n);
     return slave_raw_read(t, (uint8_t *)buf, n);
 }
