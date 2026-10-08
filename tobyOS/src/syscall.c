@@ -7082,6 +7082,20 @@ static uint32_t lx_vfs_type_bits(const struct vfs_stat *vs) {
     return 0x8000u;
 }
 
+/* A FILESYSTEM WITH INODES GIVES ITS OWN. tobyfs and tmpfs report an inode
+ * and a device (vfs_stat ino and dev), and a hard link is the same file
+ * only by them: the path hash made every name a file of its own, so `test
+ * a -ef hardlink` was false in the Linux personality -- the guest's bash,
+ * Oils 0707 -- where the native stat said true. The rest keep device 0:1
+ * and the path hash. The device split as Linux splits one, 12 bits of
+ * major over 20 of minor, the same in stat and statx. */
+static bool lx_fs_identity(const struct vfs_stat *vs, uint32_t *maj, uint32_t *min) {
+    if (!vs->ino || !vs->dev) return false;
+    *maj = ((uint32_t)vs->dev >> 20) & 0xfffu;
+    *min = (uint32_t)vs->dev & 0xfffffu;
+    return true;
+}
+
 static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
@@ -7093,6 +7107,14 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_mode    = typ | perm;
     st.st_dev     = 1;
     st.st_ino     = ino ? ino : 1;
+    {
+        uint32_t maj, min;
+        if (lx_fs_identity(vs, &maj, &min)) {
+            st.st_ino = vs->ino;
+            st.st_dev = ((uint64_t)maj << 8) | (min & 0xffu) |
+                        ((uint64_t)(min & ~0xffu) << 12);
+        }
+    }
     /* 0 = unset -> the usual default (dirs 2, files 1). procfs sets a real
      * count for /proc/<pid>/task/, which chrome's sandbox tests. */
     st.st_nlink   = vs->nlink ? vs->nlink
@@ -7157,6 +7179,14 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.ctime.sec = (int64_t)vs->ctime;
     sx.btime.sec = (int64_t)vs->ctime;       /* no separate birth time */
     sx.dev_minor = 1;
+    {
+        uint32_t maj, min;
+        if (lx_fs_identity(vs, &maj, &min)) {      /* see linux_emit_stat */
+            sx.ino = vs->ino;
+            sx.dev_major = maj;
+            sx.dev_minor = min;
+        }
+    }
     if (copy_to_user(ubuf, &sx, sizeof sx) != 0) return -ABI_EFAULT;
     return 0;
 }
