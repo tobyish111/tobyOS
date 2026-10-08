@@ -1856,6 +1856,13 @@ static char *jobs_join_argv(char **argv) {
  * 0 for none. */
 static int g_js_current, g_js_previous;
 
+/* PIPESTATUS IS A DEAD FOREGROUND JOB'S (bash's setjstatus, called from
+ * wait_for only for a job that is dead): a stop leaves it as it was. Set
+ * by the stop; the simple-command caller then does not overwrite it with
+ * the 128 + signal it was handed (shell_run_pipeline). `fg` is a builtin,
+ * and its status is PIPESTATUS, as any builtin's is (ttyparity 19). */
+static bool g_pipestatus_keep;
+
 static struct job *jobs_by_id(int id) {
     for (int i = 0; id > 0 && i < JOB_MAX; i++)
         if (g_jobs[i]->id == id) return g_jobs[i];
@@ -2333,7 +2340,14 @@ static void shell_report_job_death(int pid, int sig, const char *cmd,
     if (sig <= 0) return;
     if (g_interactive) {
         if (!fg) return;
-        if (sig == SIGINT) { shell_write("\n"); return; }
+        /* the newline after the terminal's "^C" is job control's (bash's
+         * wait_for: job_control, a job-control job, in the foreground) --
+         * not a subshell's: a pipeline element that stayed tsh printed a
+         * second one (ttyparity 19) */
+        if (sig == SIGINT) {
+            if (shell_job_control()) shell_write("\n");
+            return;
+        }
         if (sig == SIGPIPE) return;
         kprintf_raw("%s\n", shell_signal_desc(sig));
         return;
@@ -6747,6 +6761,20 @@ static void shell_child_signals(void) {
     g_termsig_pending = 0;
     g_termsig_handling = 0;
     g_wait_intr_on = false;
+}
+
+/* A CHILD IN A PROCESS GROUP OF ITS OWN, under job control (bash's
+ * make_child: default_tty_job_signals): ^Z stops it, as the terminal's
+ * TTIN and TTOU would -- unless the shell started with them ignored. An
+ * interactive tsh catches all three with no-op handlers, which an exec
+ * resets and a fork keeps: a job's element that stays tsh -- a { }, a
+ * loop -- could not be stopped, and the shell waiting for it never saw
+ * the job stop (finding 71). */
+static void shell_child_tty_job_signals(void) {
+    static const int sigs[] = { SIGTSTP, SIGTTIN, SIGTTOU };
+    for (int k = 0; k < 3; k++)
+        if (!g_traps[sigs[k]] || g_traps[sigs[k]][0])
+            (void)signal(sigs[k], shell_sig_original(sigs[k]));
 }
 
 /* INT AND QUIT IN A COMMAND THIS SHELL RUNS (bash's
@@ -25334,6 +25362,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             }
             if (jid > 0) jobs_set_current(jid);   /* bash's waitchld */
             if (sj) shell_job_stopped_notice(sj);
+            g_pipestatus_keep = true;             /* a stop: not dead */
             return 128 + ssig;
         }
         shell_report_job_death(pid, proc_last_term_sig(), 0, true);
@@ -37208,8 +37237,12 @@ static bool shell_background_pipeline(const char *text, int *rcp) {
         if (pid == 0) {
             /* the element joins the job's group before it runs anything
              * (bash's make_child does it in both, against the race) */
-            if (jc) (void)proc_set_pgid(0, leader);
-            else shell_host_async_signals();   /* bash's setup_async_signals */
+            if (jc) {
+                (void)proc_set_pgid(0, leader);
+                shell_child_tty_job_signals();  /* ^Z stops it */
+            } else {
+                shell_host_async_signals();    /* bash's setup_async_signals */
+            }
             if (r) file_close(r);              /* the read end of its own output */
             jobs_forget_all();
             shell_trap_clear_caught();
@@ -37424,7 +37457,15 @@ static int shell_background_forked_as(const char *text, const char *label,
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
         return 1;
     }
-    if (pid == 0) shell_async_child_body(text, async_ign, null_stdin);
+    if (pid == 0) {
+        /* `set -m`: the job's group from the child's side too, before it
+         * runs anything, and ^Z's default (shell_child_tty_job_signals) */
+        if (g_opt_monitor) {
+            (void)proc_set_pgid(0, 0);
+            shell_child_tty_job_signals();
+        }
+        shell_async_child_body(text, async_ign, null_stdin);
+    }
     g_last_bg_pid = (int)pid;
     /* `set -m`: same rule as the spawn path -- the job is its own group. */
     if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
@@ -38419,8 +38460,10 @@ static void shell_set_pipestatus1(int status) {
 
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) {
+        g_pipestatus_keep = false;
         int rc1 = shell_run_single(&pl->stage[0], background);
-        shell_set_pipestatus1(background ? 0 : rc1);
+        if (!g_pipestatus_keep) shell_set_pipestatus1(background ? 0 : rc1);
+        g_pipestatus_keep = false;
         return rc1;
     }
 
@@ -43803,6 +43846,32 @@ static bool shell_try_compound_pipeline(const char *src) {
         shell_run_debug_trap();
     }
     if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages, nst); return true; }
+#ifdef SHELL_HOSTED
+    /* UNDER JOB CONTROL A FOREGROUND PIPELINE IS ONE JOB: its elements are
+     * a process group of their own -- the first one's -- which owns the
+     * terminal while they run, and the wait sees a stop (bash's make_child,
+     * stop_pipeline, wait_for). They shared the shell's group and were
+     * waited for to the end, so ^Z stopped them and left the shell
+     * waiting: no job, no prompt, nothing `fg` could take (finding 71).
+     * Every element is forked then, the last one too -- bash's lastpipe is
+     * off while job control is on -- and none when one cannot be (queued
+     * here-documents, a capture, an `&` ending the last element). */
+    bool jc_fg = false;
+    int jc_leader = 0;
+    bool *jc_stop __attribute__((cleanup(shell_kfree_ptr))) = 0;
+    if (shell_job_control() && g_interactive && !g_in_pipeline_stage &&
+        g_capture_depth == 0 && g_heredoc_head >= g_heredoc_count) {
+        const char *t = stages[n - 1];
+        size_t tl = strlen(t);
+        while (tl > 0 && (t[tl - 1] == ' ' || t[tl - 1] == '\t')) tl--;
+        bool amp = tl > 0 && t[tl - 1] == '&' && !(tl > 1 && t[tl - 2] == '&');
+        jc_stop = amp ? 0 : (bool *)kmalloc((size_t)n * sizeof(bool));
+        if (jc_stop) {
+            memset(jc_stop, 0, (size_t)n * sizeof(bool));
+            jc_fg = true;
+        }
+    }
+#endif
     for (int i = 0; i < n; i++) {
         struct file *r = 0, *w = 0;
 #ifdef SHELL_HOSTED
@@ -43896,8 +43965,21 @@ static bool shell_try_compound_pipeline(const char *src) {
          * backquote" once the stages stopped being this process. */
         if (!bg_tail && g_heredoc_head >= g_heredoc_count &&
             g_capture_depth == 0 &&
-            (i + 1 < n || !g_shopt_lastpipe)) fpid = shell_fork();
+            (i + 1 < n || !g_shopt_lastpipe || jc_fg)) fpid = shell_fork();
         if (fpid == 0) {
+            /* the job's group before anything runs (bash's make_child does
+             * it in both, against the race), and ^Z's default */
+            if (jc_fg) {
+                (void)proc_set_pgid(0, jc_leader);
+                shell_child_tty_job_signals();
+                /* ...and an element that is one simple command BECOMES its
+                 * program, as bash's child execs it: the job's processes
+                 * are the programs, which die of ^C themselves -- the stage
+                 * that spawned one and waited exited 130, and the shell saw
+                 * no SIGINT to answer with its newline (ttyparity 19) */
+                g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
+                                                       stages[i] + strlen(stages[i]));
+            }
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
             /* a stage that reads a pipe: an async command in it keeps that
@@ -43958,6 +44040,10 @@ static bool shell_try_compound_pipeline(const char *src) {
         }
         if (fpid > 0) {
             cpids[i] = fpid;
+            if (jc_fg) {
+                if (!jc_leader) jc_leader = fpid;
+                (void)proc_set_pgid(fpid, jc_leader);
+            }
         } else {
             bool saved_ps = g_in_pipeline_stage;
             int saved_adj = g_simple_stage_adj;
@@ -44005,6 +44091,12 @@ static bool shell_try_compound_pipeline(const char *src) {
 
     g_shell_fd[0] = saved0;
     g_shell_fd[1] = saved1;
+#ifdef SHELL_HOSTED
+    /* the terminal to the job once EVERY element is in its group, so a ^Z
+     * from the moment it changes hands stops them all (no element can be
+     * stopped by reading the terminal first: the pty sends no SIGTTIN) */
+    if (jc_fg && jc_leader) shell_tty_set_fg_pgrp(jc_leader);
+#endif
     /* Collect the children AFTER every write end is closed, or a stage that
      * is still writing has nobody to read it and none of them ever finish. */
     bool waited_any = false;
@@ -44013,9 +44105,31 @@ static bool shell_try_compound_pipeline(const char *src) {
     shell_wce_begin(&wce);
     bool any_int = false;               /* any element died of SIGINT */
 #endif
+#ifdef SHELL_HOSTED
+    int jc_ssig = 0;                    /* the signal that stopped the job */
+    int *jc_sig __attribute__((cleanup(shell_kfree_ptr))) =
+        jc_fg ? (int *)kmalloc((size_t)n * sizeof(int)) : 0;
+    if (jc_sig) memset(jc_sig, 0, (size_t)n * sizeof(int));
+#endif
     for (int i = 0; i < n; i++) {
         if (cpids[i] <= 0) continue;
-        int wrc = proc_wait(cpids[i]);
+        int wrc;
+#ifdef SHELL_HOSTED
+        if (jc_fg) {
+            /* every element, until each has stopped or ended: ^Z stops the
+             * whole group, and bash's wait_for waits while any runs */
+            int ss = 0;
+            wrc = proc_wait_fg(cpids[i], &ss);
+            if (ss > 0) {
+                jc_stop[i] = true;
+                jc_ssig = ss;
+                wrc = 128 + ss;            /* a stopped element's status */
+            } else if (jc_sig) {
+                jc_sig[i] = proc_last_term_sig();
+            }
+        } else
+#endif
+        wrc = proc_wait(cpids[i]);
         waited_any = true;
 #ifdef SHELL_HOSTED
         if (proc_last_term_sig() == SIGINT) any_int = true;
@@ -44024,6 +44138,60 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (i + 1 == n) last = wrc;
         if (pst) pst[i] = wrc;
     }
+#ifdef SHELL_HOSTED
+    if (jc_fg && jc_leader) shell_tty_set_fg_pgrp(0);
+    if (jc_ssig > 0) {
+        /* STOPPED: a job of every element, the ended ones marked so, named
+         * as bash names a pipeline -- its elements joined by " | " -- and
+         * reported as a stop is ($? 128 + the signal, as for one command) */
+        int *jp __attribute__((cleanup(shell_kfree_ptr))) =
+            (int *)kmalloc((size_t)n * sizeof(int));
+        const char **jcmd __attribute__((cleanup(shell_kfree_ptr))) =
+            (const char **)kmalloc((size_t)n * sizeof(char *));
+        char **shown = (char **)kmalloc((size_t)n * sizeof(char *));
+        if (shown) memset(shown, 0, (size_t)n * sizeof(char *));
+        int *jix __attribute__((cleanup(shell_kfree_ptr))) =
+            (int *)kmalloc((size_t)n * sizeof(int));
+        int jn = 0;
+        SH_SB(jname);
+        if (jp && jcmd && shown && jix) {
+            for (int i = 0; i < n; i++) {
+                if (cpids[i] <= 0) continue;
+                shown[i] = shell_print_text(stages[i], SHPR_COMMAND, 0);
+                if (jn) (void)sb_puts(&jname, " | ");
+                (void)sb_puts(&jname, shown[i] ? shown[i] : stages[i]);
+                jp[jn] = cpids[i];
+                jcmd[jn] = shown[i] ? shown[i] : stages[i];
+                jix[jn] = i;
+                jn++;
+            }
+        }
+        int jid = jn ? jobs_add_procs(jp, jcmd, jn, jname.p ? jname.p : src) : -1;
+        struct job *sj = jid > 0 ? jobs_find(jid) : 0;
+        if (sj) {
+            for (int k = 0; k < jn && k < sj->nproc && sj->proc; k++) {
+                int i = jix[k];
+                if (jc_stop[i]) {
+                    sj->proc[k].stopped = true;
+                } else {
+                    sj->proc[k].dead = true;
+                    sj->proc[k].code = pst ? pst[i] : 0;
+                    sj->proc[k].sig = jc_sig ? jc_sig[i] : 0;
+                }
+            }
+            sj->stopped = true;
+            sj->stopsig = jc_ssig;
+            sj->jc = true;
+        }
+        if (shown) shell_stages_free(shown, n);
+        if (jid > 0) jobs_set_current(jid);       /* bash's waitchld: a stop */
+        if (sj) shell_job_stopped_notice(sj);
+        shell_stages_free(stages, nst);
+        g_cpl_last_subshell_failed = false;
+        shell_set_status(last);                  /* PIPESTATUS: as it was */
+        return true;
+    }
+#endif
     /* the end of a foreground wait: bash's notify (p103) */
     if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
 #ifdef SHELL_HOSTED

@@ -1,0 +1,29 @@
+# ^Z on a FOREGROUND PIPELINE: its elements are one job in a group of their
+# own, which owns the terminal; ^Z stops them all, the shell takes the
+# terminal back and reports the job by its elements; fg continues every one
+# and ^C ends them. An element that stays the shell (a { }) stops too. tsh's
+# elements shared the shell's group and were waited for to the end: ^Z left
+# the shell waiting, no job and no prompt (finding 71). PIPESTATUS is a DEAD
+# job's: a stop leaves it as it was -- for one command too -- and fg sets it
+# from every process of the job it finishes.
+sleep 30 | cat
+%CTRLZ%
+echo "rc=$? ps=${PIPESTATUS[*]}"
+jobs
+fg
+%CTRLC%
+echo "after=$? ps=${PIPESTATUS[*]}"
+true | false
+sleep 30
+%CTRLZ%
+echo "rc1=$? ps=${PIPESTATUS[*]}"
+fg
+%CTRLC%
+echo "after1=$? ps=${PIPESTATUS[*]}"
+{ sleep 30; echo no; } | cat
+%CTRLZ%
+jobs
+fg
+%CTRLC%
+echo "after2=$?"
+exit 0
