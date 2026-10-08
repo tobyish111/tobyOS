@@ -223,6 +223,24 @@ void shell_host_builtin_done(void) {
  * /bin/tsh looked at no terminal, kept job control on whatever it had, and
  * never led its own group (finding 61). NAME is $0, which is how bash
  * names itself in these. Returns whether job control is on. */
+/* TIOCSPGRP with SIGTTOU, SIGTTIN, SIGTSTP and SIGCHLD blocked, as bash's
+ * give_terminal_to: a change to the terminal from the background sends
+ * SIGTTOU (pty.c pty_job_check), and the shell is in the background
+ * exactly when it takes the terminal back from a job -- and when it first
+ * leads its own group. Blocked, the signal lets the call through; caught,
+ * its handler would restart the call into a second one, and a login
+ * shell's group is orphaned, which makes it EIO. */
+static int tsh_give_terminal(int fd, int pg) {
+    unsigned long m = (1UL << SIGTTOU) | (1UL << SIGTTIN) |
+                      (1UL << SIGTSTP) | (1UL << SIGCHLD), old = 0;
+    (void)sigprocmask(SIG_BLOCK, &m, &old);
+    int rc = ioctl(fd, 0x5410UL /* TIOCSPGRP */, &pg);
+    int e = errno;
+    (void)sigprocmask(SIG_SETMASK, &old, 0);
+    errno = e;
+    return rc;
+}
+
 static bool tsh_init_job_control(const char *name, bool forced_interactive) {
     int tty = -1;
     if (forced_interactive && !isatty(2)) tty = open("/dev/tty", O_RDWR);
@@ -256,8 +274,7 @@ static bool tsh_init_job_control(const char *name, bool forced_interactive) {
     }
     jc = true;
     if (shell_pgrp != original && shell_pgrp != terminal_pgrp) {
-        int pg = shell_pgrp;
-        if (tty < 0 || ioctl(tty, 0x5410UL /* TIOCSPGRP */, &pg) != 0) {
+        if (tty < 0 || tsh_give_terminal(tty, shell_pgrp) != 0) {
             int e = errno;
             (void)setpgid(0, original);
             shell_pgrp = original;
@@ -1242,7 +1259,7 @@ int proc_wait_fg(int pid, int *stop_sig) {
 
 void shell_tty_set_fg_pgrp(int pgrp) {
     int pg = pgrp > 0 ? pgrp : (int)getpgrp();
-    (void)ioctl(0, 0x5410UL /* TIOCSPGRP */, &pg);
+    (void)tsh_give_terminal(0, pg);
 }
 
 void signal_send_to_pgrp(int pgrp, int sig) { (void)kill(-pgrp, sig); }
