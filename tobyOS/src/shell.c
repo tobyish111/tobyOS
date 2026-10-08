@@ -35893,8 +35893,14 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
              *
              * A device node or fifo is opened as-is: there is nothing to
              * truncate. Only a missing file is created. */
+            /* ...and a FIFO is a VFS_TYPE_FILE whose mode says S_IFIFO.
+             * Truncating it opened it -- a writer that came and went, which
+             * let a reader waiting at its open go on to an EOF, and the
+             * real writer then died of SIGPIPE: `( exec 3> p ) & read l <
+             * p` lost the line 1 run in 60 (logs/b16 fifostress). */
             if (sr == VFS_OK) {
-                if (st.type == VFS_TYPE_FILE) {
+                uint32_t fmt = st.mode & 0170000u;
+                if (st.type == VFS_TYPE_FILE && (fmt == 0 || fmt == 0100000u)) {
                     int tr = vfs_truncate(path, 0);
                     if (tr != VFS_OK) {
                         kprintf("%s: %s\n", path_arg, shell_errno_text(tr));
