@@ -76,9 +76,17 @@
  * masks the STOP class. Stop handling is taken at a cooperative stop point,
  * and a read loop that neither returns nor reaches that point would hang a
  * ^Z'd process -- a different question, on a gate (ttyparity job control)
- * that was only just closed at 7/7. Not reopening it here. */
+ * that was only just closed at 7/7. Not reopening it here. (Batch 15:
+ * that EINTR no longer reaches the program -- signal_deliver restarts a
+ * call a stop interrupted once the process is continued.)
+ *
+ * SIGCONT is here too: its work is done when it is SENT (the stopped
+ * process resumes), and with no handler its delivery does nothing. Left
+ * out, the SIGCONT that resumed a reader made the read it went back to
+ * return EINTR -- `cat` on a pipe, stopped and continued, failed (logs/b15
+ * stopw). */
 #define SIG_DEFAULT_IGNORE_MASK \
-    (SIGMASK(SIGCHLD) | SIGMASK(SIGURG) | SIGMASK(SIGWINCH))
+    (SIGMASK(SIGCHLD) | SIGMASK(SIGURG) | SIGMASK(SIGWINCH) | SIGMASK(SIGCONT))
 
 /* Would any signal pending on `p` actually be ACTED ON, and therefore
  * legitimately interrupt a blocking call?
@@ -301,8 +309,10 @@ bool signal_deliver_irq(struct regs *r);
  * the saved user RIP to the `syscall` instruction with RAX = num). For a
  * signal with a user handler this pushes a signal frame onto the user stack
  * and rewrites the saved trapframe so the SYSRETQ lands in the handler;
- * sys_sigreturn later restores the context. */
-void signal_deliver_syscall(long rv, long num);
+ * sys_sigreturn later restores the context. Returns the value the call
+ * returns to user mode: RV, or NUM when a stop with no handler interrupted
+ * it and it is to run again (the saved RIP rewound). */
+long signal_deliver_syscall(long rv, long num);
 
 /* Deliver a SYNCHRONOUS CPU-fault signal (SIGSEGV/SIGFPE/SIGILL/...) to the
  * faulting user process from the exception path. `r` is the CPU exception

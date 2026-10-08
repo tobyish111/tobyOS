@@ -556,7 +556,20 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
     } while (0)
 
     { char cm[16]; APPEND_STR("Name:   "); APPEND_STR(proc_comm(p, cm, sizeof cm)); APPEND_STR("\n"); }
-    APPEND_STR("State:  "); APPEND_STR(proc_state_name(p->state)); APPEND_STR("\n");
+    /* Linux's words, as its /proc/PID/status gives them: "T (stopped)",
+     * not the scheduler's "STOPPED" -- a script reading the state letter
+     * read S for stopped and B for asleep (logs/b15 stopw). */
+    {
+        const char *sn = "R (running)";
+        switch (p->state) {
+        case PROC_BLOCKED:    sn = "S (sleeping)"; break;
+        case PROC_STOPPED:    sn = p->ptrace_stopped ? "t (tracing stop)"
+                                                     : "T (stopped)"; break;
+        case PROC_TERMINATED: sn = "Z (zombie)"; break;
+        default: break;
+        }
+        APPEND_STR("State:  "); APPEND_STR(sn); APPEND_STR("\n");
+    }
     /* Slice 10: report pids as the READER numbers them, not as the kernel
      * stores them. A process inside a pid namespace reading /proc must see its
      * own numbering, or `ps` shows pids that kill(2) then rejects. Identity in

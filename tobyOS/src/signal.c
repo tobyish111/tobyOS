@@ -352,7 +352,7 @@ bool sig_should_eintr(struct proc *p) {
     struct sigaction *act = sig_actions_of(p);
     if (!act) return false;
     /* Only the SIG_DEFAULT_IGNORE_MASK bits can still be set here, so scan
-     * exactly those three -- never all 64.
+     * exactly those four -- never all 64.
      *
      * The 64-wide loop this replaces was measurably expensive, and ttyparity
      * caught it: case 11-loop-1024 (a 5000-iteration shell loop) went from
@@ -360,7 +360,7 @@ bool sig_should_eintr(struct proc *p) {
      * SIGCHLD pending almost continuously and no handler for it, which is
      * precisely the path that falls through to here -- so the scan ran on
      * essentially every blocking call rather than in some rare corner. */
-    static const int ignorable[] = { SIGCHLD, SIGURG, SIGWINCH };
+    static const int ignorable[] = { SIGCHLD, SIGURG, SIGWINCH, SIGCONT };
     for (unsigned i = 0; i < sizeof ignorable / sizeof ignorable[0]; i++) {
         const int s = ignorable[i];
         if (!(pend & SIGMASK(s))) continue;
@@ -479,8 +479,13 @@ static void signal_apply_default(struct proc *p, int sig) {
  * handler can run at syscall exit. */
 bool signal_take_pending_stop(void) {
     struct proc *p = current_proc();
-    if (!p) return false;
-    uint64_t stops = p->pending_signals & SIGMASK_STOPS;
+    /* never a kernel context: there is no user to stop, and the scheduler's
+     * own procs must not park */
+    if (!p || p->pid == 0 || p->is_kernel || p->is_idle) return false;
+    /* A BLOCKED stop signal stops nothing (SIGSTOP cannot be blocked): it
+     * waits for the mask to open, as signal_deliver's does. */
+    uint64_t stops = p->pending_signals & SIGMASK_STOPS &
+                     (~p->sigstate.mask | SIGMASK(SIGSTOP));
     if (!stops) return false;
     int sig = 0;
     for (int i = 1; i < SIG_MAX; i++)
@@ -755,13 +760,14 @@ static bool signal_setup_user_frame(struct proc *p, int sig,
  * path, or NULL when called from an IRQ (PIT) where no such frame exists.
  * `rv` is the syscall return value and `num` the syscall number (only
  * meaningful when regs != NULL; pass num = -1 on the IRQ path). */
-static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
+/* True when the interrupted call is to be RESTARTED (see the SIG_DFL arm). */
+static bool signal_deliver(struct syscall_regs *regs, long rv, long num) {
     struct proc *p = current_proc();
-    if (!p || p->pending_signals == 0) return;
+    if (!p || p->pending_signals == 0) return false;
     if (p->pid == 0) {
         p->pending_signals = 0;
         p->sigstate.pending = 0;
-        return;
+        return false;
     }
 
     /* Lowest-numbered deliverable signal (unblocked, plus the two that can
@@ -778,13 +784,13 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
         }
     }
     deliverable |= p->pending_signals & (SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
-    if (deliverable == 0) return;
+    if (deliverable == 0) return false;
 
     int sig = 0;
     for (int i = 1; i < SIG_MAX; i++) {
         if (deliverable & SIGMASK(i)) { sig = i; break; }
     }
-    if (sig == 0) return;
+    if (sig == 0) return false;
 
     struct sigaction *sa = &sig_actions_of(p)[sig];
 
@@ -793,7 +799,7 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
      * syscall return delivers it -- do NOT consume it here. */
     bool caught = (sig != SIGKILL &&
                    sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
-    if (caught && !regs) return;
+    if (caught && !regs) return false;
 
     /* Committed to acting on this signal -- consume it. */
     p->pending_signals  &= ~SIGMASK(sig);
@@ -807,16 +813,24 @@ static void signal_deliver(struct syscall_regs *regs, long rv, long num) {
         proc_exit_group(128 + sig);
     }
 
-    if (sa->sa_handler == SIG_IGN) return;
+    if (sa->sa_handler == SIG_IGN) return false;
 
     if (sa->sa_handler == SIG_DFL) {
         signal_apply_default(p, sig);
-        return;
+        /* A STOP THAT INTERRUPTED A BLOCKING CALL: once continued, the call
+         * goes on, as Linux restarts it when no handler ran (ERESTARTSYS,
+         * ERESTARTNOHAND). It returned EINTR to a program that had asked
+         * for no signal at all: `cat` reading a pipe, stopped by ^Z and
+         * continued by `fg`, failed with "Interrupted system call". Not
+         * when something that acts is pending by now -- that ends it. */
+        return regs && signal_default_action(sig) == 2 && rv == EINTR_RET &&
+               num >= 0 && !regs->pad && !sig_should_eintr(p);
     }
 
     /* User handler: set up the frame; fall back to default if we can't. */
     if (!signal_setup_user_frame(p, sig, sa, regs, rv, num))
         signal_apply_default(p, sig);
+    return false;
 }
 
 /* IRQ-context entry (PIT). Handles fatal/default dispositions; caught
@@ -871,7 +885,7 @@ void signal_tick_alarms(void) {
 }
 
 void signal_deliver_if_pending(void) {
-    signal_deliver(0, 0, -1);
+    (void)signal_deliver(0, 0, -1);
 }
 
 /* CAUGHT signals, delivered from the TIMER IRQ.
@@ -930,8 +944,16 @@ bool signal_deliver_irq(struct regs *r) {
 
 /* SYSCALL-return entry. Has access to the saved trapframe, so it can deliver
  * caught handlers by pushing a signal frame and redirecting the return. */
-void signal_deliver_syscall(long rv, long num) {
-    signal_deliver(current_syscall_regs(), rv, num);
+long signal_deliver_syscall(long rv, long num) {
+    struct syscall_regs *r = current_syscall_regs();
+    /* a restart: back to the `syscall` instruction (0F 05), RAX the call's
+     * number again; the argument registers are the entry's, restored by
+     * the unwind */
+    if (signal_deliver(r, rv, num) && r) {
+        r->rcx -= 2;
+        return num;
+    }
+    return rv;
 }
 
 /* SYNCHRONOUS CPU-fault delivery (B15). Called from the exception dispatcher

@@ -3919,9 +3919,27 @@ static long sys_getenv(const char *name, char *out, size_t cap) {
  * or the restart SA_RESTART asks for. */
 bool proc_wait_interrupted(struct proc *self) {
     if (!self) return false;
+    /* A STOP SIGNAL STOPS THE WAITER WHERE IT WAITS, and the wait goes on
+     * once it is continued (Linux: wait4 restarts). The stop class was only
+     * excluded here, so a process blocked waiting for a child could not be
+     * stopped at all -- not by SIGSTOP: a subshell of `{ sleep 30; } | cat`
+     * ran on through ^Z, and the shell waited for it for good (logs/b15
+     * stopw: state B after STOP, T on Linux). */
+    while (signal_take_pending_stop()) { }
     uint64_t pend = self->pending_signals & ~self->sigstate.mask;
     pend |= self->pending_signals & SIGMASK(SIGKILL);
-    return (pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self);
+    /* ...and a CAUGHT one acts: its handler runs (EINTR, or the restart
+     * SA_RESTART asks for) */
+    uint64_t caught = 0;
+    struct sigaction *act = sig_actions_of(self);
+    static const int stops[] = { SIGTSTP, SIGTTIN, SIGTTOU };
+    for (int k = 0; act && k < 3; k++)
+        if ((pend & SIGMASK(stops[k])) &&
+            act[stops[k]].sa_handler != SIG_DFL &&
+            act[stops[k]].sa_handler != SIG_IGN)
+            caught |= SIGMASK(stops[k]);
+    return ((pend & ~SLEEP_UNINTERRUPTING) && SIG_SHOULD_EINTR(self)) ||
+           caught != 0;
 }
 
 static long sys_nanosleep(uint64_t ns) {
@@ -22458,7 +22476,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
      * the handler; for a fatal default it proc_exit()s and never returns.
      * `rv` is preserved as the to-be-restored RAX for the handler case
      * (or swapped for a syscall restart when the action has SA_RESTART). */
-    signal_deliver_syscall(rv, num);
+    rv = signal_deliver_syscall(rv, num);
 
     /* Slice 88: CoW-fork STW -- a sibling must not return to user while
      * vmm_cow_fork is stripping PTE_WRITABLE. Park until tg_vm_resume. */
