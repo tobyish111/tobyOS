@@ -2809,7 +2809,49 @@ static uint32_t sys_creation_mode(int mode, uint32_t deflt) {
     return m;
 }
 
+/* A LINK TO WHAT ONLY sys_open CAN OPEN. A symbolic link in the last
+ * component whose target is under /dev or /proc -- a device node, /dev/fd/N,
+ * /proc/self/fd/N -- names something this function makes BY NAME (the
+ * descriptor duplicates and device files below); vfs_open has none to hand
+ * back. devfs refuses an open (EACCES: `cat link-to-/dev/zero`), and where
+ * a hop failed vfs_open kept the LINK's path and opened the link node as a
+ * file: `echo a > link-to-/dev/null` wrote into it and `read < link` read
+ * its target text, under the guest's bash, where Linux opens the device
+ * (logs/b18 symdev). The link is followed here, hop by hop, and the open is
+ * made by the name it reaches, as an open of that name would be. Not for
+ * O_NOFOLLOW, nor O_CREAT|O_EXCL, which must fail on the link itself. */
+static bool open_link_to_synth(const char *kpath, int flags, char *out,
+                               size_t cap) {
+    if (flags & LX_O_NOFOLLOW) return false;
+    if ((flags & ABI_O_CREAT) && (flags & ABI_O_EXCL)) return false;
+    char hop[2][VFS_PATH_MAX];
+    const char *cur = kpath;
+    for (int n = 0; n < 40; n++) {
+        struct vfs_stat vs;
+        if (vfs_stat(cur, &vs) != VFS_OK || vs.type != VFS_TYPE_SYMLINK)
+            return false;
+        char *nx = hop[n & 1];                      /* never into `cur` */
+        if (vfs_link_target(cur, nx, VFS_PATH_MAX) != VFS_OK) return false;
+        if (strncmp(nx, "/dev/", 5) == 0 || strncmp(nx, "/proc/", 6) == 0) {
+            size_t l = strlen(nx);
+            if (l >= cap) return false;
+            memcpy(out, nx, l + 1);
+            return true;
+        }
+        cur = nx;
+    }
+    return false;
+}
+
+static long sys_open_resolved_at(const char *kpath, int flags, int mode,
+                                 int depth);
+
 static long sys_open_resolved(const char *kpath, int flags, int mode) {
+    return sys_open_resolved_at(kpath, flags, mode, 0);
+}
+
+static long sys_open_resolved_at(const char *kpath, int flags, int mode,
+                                 int depth) {
     if (flags & SYS_O_DIRECTORY) {
         char dk[VFS_PATH_MAX];
         size_t kl = strlen(kpath);
@@ -2923,6 +2965,15 @@ static long sys_open_resolved(const char *kpath, int flags, int mode) {
                 if (nfd < 0) { file_close(cl); return -ABI_EMFILE; }
                 return nfd;
             }
+        }
+    }
+
+    /* a link to one of this function's own names: open that name */
+    {
+        char tgt[VFS_PATH_MAX];
+        if (open_link_to_synth(kpath, flags, tgt, sizeof tgt)) {
+            if (depth >= 8) return -ABI_ELOOP;
+            return sys_open_resolved_at(tgt, flags, mode, depth + 1);
         }
     }
 
