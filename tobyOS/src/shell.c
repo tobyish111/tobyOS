@@ -7095,7 +7095,15 @@ static bool shell_hosted_builtin(const char *name) {
          * newgrp is NOT here: bash has no newgrp builtin (ksh does), and the
          * kernel stub shadowing the real /bin/newgrp was exactly the
          * builtin-shares-a-name-not-a-behaviour sin described above. */
-        "ulimit", "fc", "getconf", "logname", "pathchk",
+        "ulimit", "fc",
+#ifndef SHELL_HOSTED
+        /* The kernel shell's own utilities, which it has no /bin to find:
+         * their kprintf is a diagnostic. NOT /bin/tsh's builtins -- bash has
+         * none of the three, so `type logname` said "a shell builtin" where
+         * bash names /bin/logname, and `getconf` ran where bash finds
+         * nothing (finding 18; logs/b17 a2). */
+        "getconf", "logname", "pathchk",
+#endif
         /* bash spells these as builtins too, and the corpus uses them for
          * plain `NAME=VALUE` with an export or readonly attribute. */
         "declare", "typeset", "compgen",
