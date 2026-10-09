@@ -83,10 +83,22 @@ static const char *tfind_opt(const char *hay, const char *needle)
     return 0;
 }
 
-#define TMPFS_MAX_NODES     512
 #define TMPFS_MAX_MOUNTS      8
 #define TMPFS_DEFAULT_BYTES  (16u * 1024u * 1024u)
 #define TMPFS_MIN_GROW       512u
+
+/* THE NODE TABLE GROWS, a chunk at a time, up to the mount's node limit.
+ * It was one fixed array of 512: /tmp said "No space left on device" at its
+ * 498th file with 16368 of its 16384 blocks free (finding 55, logs/b17
+ * audit). A chunk never moves once it is allocated -- an open file holds its
+ * node by ADDRESS and a hard link holds its owner by INDEX -- so growing adds
+ * a chunk and never copies one. The limit is Linux's `nr_inodes=` option; by
+ * default one node per KiB of the byte budget (16384 for the default 16 MiB),
+ * and never fewer than the 512 the fixed table had. */
+#define TMPFS_CHUNK_NODES    128u
+#define TMPFS_MIN_NODES      512u
+#define TMPFS_BYTES_PER_NODE 1024u
+#define TMPFS_LIMIT_NODES    (1u << 24)   /* link_to is a 32-bit index */
 
 struct tmpfs_node {
     bool          used;
@@ -113,14 +125,41 @@ struct tmpfs_node {
 };
 
 struct tmpfs_mount {
-    bool               used;
-    struct tmpfs_node *nodes;
-    size_t             bytes;      /* data bytes currently held */
-    size_t             max_bytes;
-    bool               reported_full;  /* census printed once, not per create */
+    bool                used;
+    struct tmpfs_node **chunks;    /* max_nodes / TMPFS_CHUNK_NODES slots */
+    size_t              nnodes;    /* nodes in the chunks allocated so far */
+    size_t              max_nodes; /* nr_inodes, a whole number of chunks */
+    size_t              bytes;     /* data bytes currently held */
+    size_t              max_bytes;
+    bool                reported_full;  /* census printed once, not per create */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
+
+/* Node I of a mount; I < m->nnodes. */
+static struct tmpfs_node *tnode(struct tmpfs_mount *m, size_t i)
+{
+    return &m->chunks[i / TMPFS_CHUNK_NODES][i % TMPFS_CHUNK_NODES];
+}
+
+/* A node's index in mount M, or (size_t)-1 when it is not one of M's. */
+static size_t tindex(struct tmpfs_mount *m, const struct tmpfs_node *nd)
+{
+    for (size_t c = 0; c < m->nnodes / TMPFS_CHUNK_NODES; c++)
+        if (nd >= m->chunks[c] && nd < m->chunks[c] + TMPFS_CHUNK_NODES)
+            return c * TMPFS_CHUNK_NODES + (size_t)(nd - m->chunks[c]);
+    return (size_t)-1;
+}
+
+/* The mount a node lives in, found by address: struct vfs_file carries the
+ * node, not the mount. Cheap (8 mounts) and keeps vfs_file unchanged. */
+static struct tmpfs_mount *tmount_of(const struct tmpfs_node *nd)
+{
+    for (size_t i = 0; i < TMPFS_MAX_MOUNTS; i++)
+        if (g_tmpfs[i].used && tindex(&g_tmpfs[i], nd) != (size_t)-1)
+            return &g_tmpfs[i];
+    return NULL;
+}
 
 /* ---- path helpers -------------------------------------------------------
  * The VFS hands drivers a path RELATIVE to the mount point, with a leading
@@ -142,10 +181,11 @@ static bool tnorm(const char *path, char *out, size_t cap)
  * unlink, rename, link -- want this one. */
 static struct tmpfs_node *tfind_name(struct tmpfs_mount *m, const char *norm)
 {
-    for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-        if (m->nodes[i].used && !m->nodes[i].unlinked &&
-            strcmp(m->nodes[i].path, norm) == 0)
-            return &m->nodes[i];
+    for (size_t i = 0; i < m->nnodes; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (nd->used && !nd->unlinked && strcmp(nd->path, norm) == 0)
+            return nd;
+    }
     return NULL;
 }
 
@@ -155,8 +195,8 @@ static struct tmpfs_node *tresolve(struct tmpfs_mount *m,
 {
     if (!nm || !nm->link_to) return nm;
     size_t idx = (size_t)nm->link_to - 1;
-    if (idx >= TMPFS_MAX_NODES) return nm;      /* corrupt: fail closed */
-    struct tmpfs_node *ino = &m->nodes[idx];
+    if (idx >= m->nnodes) return nm;            /* corrupt: fail closed */
+    struct tmpfs_node *ino = tnode(m, idx);
     return ino->used ? ino : nm;
 }
 
@@ -182,17 +222,12 @@ static const char *tchild_of(const char *dir, const char *norm)
 }
 
 /* Free a node and its data, returning the slot to talloc(). The mount is
- * found by pointer range so callers that only hold the node can reap. */
+ * found by address so callers that only hold the node can reap. */
 static void treap(struct tmpfs_node *nd)
 {
     if (!nd || !nd->used) return;
-    for (size_t i = 0; i < TMPFS_MAX_MOUNTS; i++) {
-        if (!g_tmpfs[i].used) continue;
-        if (nd >= g_tmpfs[i].nodes && nd < g_tmpfs[i].nodes + TMPFS_MAX_NODES) {
-            if (nd->data) g_tmpfs[i].bytes -= nd->cap;
-            break;
-        }
-    }
+    struct tmpfs_mount *m = tmount_of(nd);
+    if (m && nd->data) m->bytes -= nd->cap;
     if (nd->data) kfree(nd->data);
     memset(nd, 0, sizeof *nd);
 }
@@ -211,15 +246,16 @@ static void treap(struct tmpfs_node *nd)
 static void tmpfs_census(struct tmpfs_mount *m, const char *why)
 {
     size_t used = 0, orphan = 0, open_held = 0;
-    for (size_t i = 0; i < TMPFS_MAX_NODES; i++) {
-        if (!m->nodes[i].used) continue;
+    for (size_t i = 0; i < m->nnodes; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (!nd->used) continue;
         used++;
-        if (m->nodes[i].unlinked) orphan++;
-        if (m->nodes[i].open_count > 0) open_held++;
+        if (nd->unlinked) orphan++;
+        if (nd->open_count > 0) open_held++;
     }
-    kprintf("[tmpfs] %s: %lu/%d nodes used, %lu unlinked-but-held (leaked), "
+    kprintf("[tmpfs] %s: %lu/%lu nodes used, %lu unlinked-but-held (leaked), "
             "%lu with open handles, %lu/%lu KiB\n",
-            why, (unsigned long)used, TMPFS_MAX_NODES,
+            why, (unsigned long)used, (unsigned long)m->max_nodes,
             (unsigned long)orphan, (unsigned long)open_held,
             (unsigned long)(m->bytes / 1024u),
             (unsigned long)(m->max_bytes / 1024u));
@@ -229,22 +265,39 @@ static void tmpfs_census(struct tmpfs_mount *m, const char *why)
      * there is a bug and knowing where it is. Bounded -- this runs from an
      * allocation failure and must not become the next flood. */
     int shown = 0;
-    for (size_t i = 0; i < TMPFS_MAX_NODES && shown < 8; i++) {
-        if (!m->nodes[i].used || !m->nodes[i].unlinked) continue;
+    for (size_t i = 0; i < m->nnodes && shown < 8; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (!nd->used || !nd->unlinked) continue;
         kprintf("[tmpfs]   leaked: '%s' open_count=%d type=%d size=%lu\n",
-                m->nodes[i].path, m->nodes[i].open_count,
-                (int)m->nodes[i].type, (unsigned long)m->nodes[i].size);
+                nd->path, nd->open_count, (int)nd->type,
+                (unsigned long)nd->size);
         shown++;
     }
 }
 
 static struct tmpfs_node *talloc(struct tmpfs_mount *m)
 {
-    for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-        if (!m->nodes[i].used) return &m->nodes[i];
+    /* Slots past max_nodes in the last chunk are never handed out: the
+     * limit is the one asked for, not rounded up to a chunk. */
+    size_t lim = m->nnodes < m->max_nodes ? m->nnodes : m->max_nodes;
+    for (size_t i = 0; i < lim; i++)
+        if (!tnode(m, i)->used) return tnode(m, i);
+    /* Every slot is taken: one more chunk, while the limit allows. */
+    bool room = m->nnodes < m->max_nodes;
+    if (room) {
+        size_t sz = sizeof(struct tmpfs_node) * TMPFS_CHUNK_NODES;
+        struct tmpfs_node *c = kmalloc(sz);
+        if (c) {
+            memset(c, 0, sz);
+            m->chunks[m->nnodes / TMPFS_CHUNK_NODES] = c;
+            m->nnodes += TMPFS_CHUNK_NODES;
+            return c;
+        }
+    }
     if (!m->reported_full) {
         m->reported_full = true;
-        tmpfs_census(m, "node table FULL");
+        tmpfs_census(m, room ? "node table could not GROW (no memory)"
+                             : "node table FULL");
     }
     return NULL;
 }
@@ -349,13 +402,7 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
     struct tmpfs_node *nd = f->priv;
     if (!nd || !nd->used) return VFS_ERR_IO;
     if (!n) return 0;
-    /* The mount is found by walking the table: struct vfs_file carries the
-     * node, not the mount. Cheap (8 slots) and keeps vfs_file unchanged. */
-    struct tmpfs_mount *m = NULL;
-    for (size_t i = 0; i < TMPFS_MAX_MOUNTS && !m; i++)
-        if (g_tmpfs[i].used && nd >= g_tmpfs[i].nodes &&
-            nd <  g_tmpfs[i].nodes + TMPFS_MAX_NODES)
-            m = &g_tmpfs[i];
+    struct tmpfs_mount *m = tmount_of(nd);
     if (!m) return VFS_ERR_IO;
 
     if (f->append) f->pos = nd->size;              /* O_APPEND: the live end */
@@ -461,10 +508,11 @@ static int tmpfs_unlink(void *mnt, const char *path)
      * already-unlinked child does not count: its name is gone, so the
      * directory really is empty. */
     if (nd->type == VFS_TYPE_DIR)
-        for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-            if (m->nodes[i].used && !m->nodes[i].unlinked &&
-                tchild_of(norm, m->nodes[i].path))
+        for (size_t i = 0; i < m->nnodes; i++) {
+            struct tmpfs_node *c = tnode(m, i);
+            if (c->used && !c->unlinked && tchild_of(norm, c->path))
                 return VFS_ERR_EXIST;   /* ENOTEMPTY has no VFS code here */
+        }
     tdrop_name(m, nd);
     return VFS_OK;
 }
@@ -542,7 +590,7 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     nn->type = ino->type;
     tcopy(nn->path, nw, sizeof nn->path);
     nn->path[sizeof nn->path - 1] = '\0';
-    nn->link_to = (uint32_t)(ino - m->nodes) + 1u;
+    nn->link_to = (uint32_t)tindex(m, ino) + 1u;   /* talloc moved nothing */
     ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
     return VFS_OK;
 }
@@ -561,14 +609,14 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
         memset(out, 0, sizeof *out);
         out->type = VFS_TYPE_DIR;
         out->mode = 0777u | VFS_MODE_VALID;
-        out->ino  = TMPFS_MAX_NODES + 1u;
+        out->ino  = m->max_nodes + 1u;             /* past every node's */
         out->dev  = dev;
         return VFS_OK;
     }
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     memset(out, 0, sizeof *out);
-    out->ino   = (uint64_t)(tresolve(m, nd) - m->nodes) + 1u;
+    out->ino   = (uint64_t)tindex(m, tresolve(m, nd)) + 1u;
     out->dev   = dev;
     out->type  = nd->type;
     out->size  = nd->size;
@@ -623,8 +671,8 @@ static int tmpfs_readdir(struct vfs_dir *d, struct vfs_dirent *out)
 {
     struct tmpfs_dirh *dh = d->priv;
     if (!dh) return VFS_ERR_INVAL;
-    for (; dh->i < TMPFS_MAX_NODES; dh->i++) {
-        struct tmpfs_node *nd = &dh->m->nodes[dh->i];
+    for (; dh->i < dh->m->nnodes; dh->i++) {
+        struct tmpfs_node *nd = tnode(dh->m, dh->i);
         /* `unlinked` means the NAME is gone; the slot only survives to
          * keep open handles valid. Listing it made `ls` show files that
          * unlink() had already removed. */
@@ -718,11 +766,7 @@ static int tmpfs_ftruncate(struct vfs_file *f, uint64_t length)
 {
     struct tmpfs_node *nd = f->priv;
     if (!nd || !nd->used) return VFS_ERR_IO;
-    struct tmpfs_mount *m = NULL;
-    for (size_t i = 0; i < TMPFS_MAX_MOUNTS && !m; i++)
-        if (g_tmpfs[i].used && nd >= g_tmpfs[i].nodes &&
-            nd <  g_tmpfs[i].nodes + TMPFS_MAX_NODES)
-            m = &g_tmpfs[i];
+    struct tmpfs_mount *m = tmount_of(nd);
     if (!m) return VFS_ERR_IO;
     int rc = ttrunc(m, nd, length);
     if (rc == VFS_OK) f->size = nd->size;
@@ -749,8 +793,8 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     }
     size_t ol = strlen(o), nl = strlen(nw);
     if (src->type == VFS_TYPE_DIR) {
-        for (size_t i = 0; i < TMPFS_MAX_NODES; i++) {
-            struct tmpfs_node *c = &m->nodes[i];
+        for (size_t i = 0; i < m->nnodes; i++) {
+            struct tmpfs_node *c = tnode(m, i);
             if (!c->used || c == src) continue;
             if (strncmp(c->path, o, ol) != 0 || c->path[ol] != '/') continue;
             char moved[VFS_PATH_MAX];
@@ -772,14 +816,14 @@ static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
 {
     struct tmpfs_mount *m = (struct tmpfs_mount *)mnt;
     size_t files = 0;
-    for (size_t i = 0; i < TMPFS_MAX_NODES; i++)
-        if (m->nodes[i].used) files++;
+    for (size_t i = 0; i < m->nnodes; i++)
+        if (tnode(m, i)->used) files++;
     out->bsize      = 4096;
     out->blocks     = (m->max_bytes + 4095) / 4096;
     out->bfree      = (m->max_bytes > m->bytes)
                           ? (m->max_bytes - m->bytes) / 4096 : 0;
-    out->files      = TMPFS_MAX_NODES;
-    out->ffree      = TMPFS_MAX_NODES - files;
+    out->files      = m->max_nodes;
+    out->ffree      = m->max_nodes - files;
     out->type_magic = 0x01021994;           /* TMPFS_MAGIC */
     out->namelen    = VFS_PATH_MAX - 1;
     return VFS_OK;
@@ -810,17 +854,17 @@ static const struct vfs_ops tmpfs_ops = {
     .statfs    = tmpfs_statfs,   /* Phase H */
 };
 
-/* Parse the `size=` mount option. Accepts a plain byte count or a k/m/g
- * suffix, as mount(8) does. Returns 0 if absent, (size_t)-1 if present but
- * unparseable -- the caller REFUSES rather than falling back to the default,
- * because silently giving a different size than was asked for is the lie this
- * whole file is trying not to tell. */
-static size_t tmpfs_parse_size(const char *opts)
+/* Parse a numeric mount option, `size=` or `nr_inodes=`. Accepts a plain
+ * count or a k/m/g suffix, as mount(8) does. Returns 0 if absent, (size_t)-1
+ * if present but unparseable -- the caller REFUSES rather than falling back to
+ * the default, because silently giving a different size than was asked for is
+ * the lie this whole file is trying not to tell. */
+static size_t tmpfs_parse_num(const char *opts, const char *key)
 {
     if (!opts) return 0;
-    const char *p = tfind_opt(opts, "size=");
+    const char *p = tfind_opt(opts, key);
     if (!p) return 0;
-    p += 5;
+    p += strlen(key);
     if (*p < '0' || *p > '9') return (size_t)-1;
     size_t v = 0;
     while (*p >= '0' && *p <= '9') { v = v * 10u + (size_t)(*p - '0'); p++; }
@@ -836,10 +880,17 @@ static size_t tmpfs_parse_size(const char *opts)
 
 int tmpfs_mount_at(const char *path, const char *opts)
 {
-    size_t want = tmpfs_parse_size(opts);
+    size_t want = tmpfs_parse_num(opts, "size=");
     if (want == (size_t)-1) {
         kprintf("[tmpfs] unparseable size= option -- refusing rather than "
                 "mounting a different size than asked for\n");
+        return VFS_ERR_INVAL;
+    }
+    size_t want_nodes = tmpfs_parse_num(opts, "nr_inodes=");
+    if (want_nodes == (size_t)-1 || want_nodes > TMPFS_LIMIT_NODES) {
+        kprintf("[tmpfs] unparseable or too large nr_inodes= option -- "
+                "refusing rather than mounting a different limit than asked "
+                "for\n");
         return VFS_ERR_INVAL;
     }
 
@@ -848,20 +899,32 @@ int tmpfs_mount_at(const char *path, const char *opts)
         if (!g_tmpfs[i].used) m = &g_tmpfs[i];
     if (!m) return VFS_ERR_NOSPC;
 
-    m->nodes = kmalloc(sizeof(struct tmpfs_node) * TMPFS_MAX_NODES);
-    if (!m->nodes) return VFS_ERR_NOMEM;
-    memset(m->nodes, 0, sizeof(struct tmpfs_node) * TMPFS_MAX_NODES);
+    size_t max_bytes = want ? want : TMPFS_DEFAULT_BYTES;
+    size_t max_nodes = want_nodes;
+    if (!max_nodes) {
+        max_nodes = max_bytes / TMPFS_BYTES_PER_NODE;
+        if (max_nodes < TMPFS_MIN_NODES)   max_nodes = TMPFS_MIN_NODES;
+        if (max_nodes > TMPFS_LIMIT_NODES) max_nodes = TMPFS_LIMIT_NODES;
+    }
+    /* Only the chunk pointers now; talloc() adds the chunks as files come. */
+    size_t nchunks = (max_nodes + TMPFS_CHUNK_NODES - 1) / TMPFS_CHUNK_NODES;
+    m->chunks = kmalloc(sizeof(struct tmpfs_node *) * nchunks);
+    if (!m->chunks) return VFS_ERR_NOMEM;
+    memset(m->chunks, 0, sizeof(struct tmpfs_node *) * nchunks);
+    m->nnodes = 0;
+    m->max_nodes = max_nodes;
     m->bytes = 0;
-    m->max_bytes = want ? want : TMPFS_DEFAULT_BYTES;
+    m->max_bytes = max_bytes;
     m->used = true;
 
     int rc = vfs_mount(path, &tmpfs_ops, m);
     if (rc != VFS_OK) {
-        kfree(m->nodes);
+        kfree(m->chunks);
         memset(m, 0, sizeof *m);
         return rc;
     }
-    kprintf("[tmpfs] mounted at %s (%lu KiB max, %d nodes)\n", path,
-            (unsigned long)(m->max_bytes / 1024u), TMPFS_MAX_NODES);
+    kprintf("[tmpfs] mounted at %s (%lu KiB max, %lu nodes max)\n", path,
+            (unsigned long)(m->max_bytes / 1024u),
+            (unsigned long)m->max_nodes);
     return VFS_OK;
 }
