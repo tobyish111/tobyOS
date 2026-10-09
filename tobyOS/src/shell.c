@@ -40501,16 +40501,35 @@ static int shell_dbr_put_quoted(struct shell_dbr_scratch *sc, const char *s, siz
 
 /* Expand the pending unquoted run and append whatever it yields as it is:
  * an unquoted `$pat` IS a pattern in bash. Finding the word's end only, it
- * is dropped unexpanded. */
+ * is dropped unexpanded.
+ *
+ * ...BUT WHAT WAS QUOTED INSIDE IT STAYS QUOTED: the word of a ${x-WORD}
+ * (or ${x+WORD}) keeps its quotes' spans marked, and each byte of one is
+ * appended as a quoted byte is (shell_dbr_put_quoted) -- literal to the
+ * pattern and to the ERE alike:
+ *
+ *     [[ ab == ${u:-'a*'} ]]     bash: false     tsh: true
+ *     [[ ab =~ ${u:-'a.'} ]]     bash: false     tsh: true
+ *
+ * The marks were stripped with every escape in them (finding 111, logs/b18
+ * dbr). The rest of the value is live, as before. */
 static int shell_dbr_flush(struct shell_dbr_scratch *sc) {
     if (sc->seg.len == 0) return 0;
     if (!sc->expand) { sb_truncate(&sc->seg, 0); return 0; }
     int rc = shell_expand_word_ex(sc->seg.p, &sc->tmp, true, true);
     sb_truncate(&sc->seg, 0);
     if (rc < 0 || shell_dbr_join(sc) < 0) return -1;
-    shell_strip_nosplit_inplace(sc->tmp.p);
-    if (sb_puts(&sc->disp, sc->tmp.p) < 0) return -1;
-    return sb_puts(&sc->out, sc->tmp.p);
+    bool prot = false;
+    for (const char *q = sc->tmp.p ? sc->tmp.p : ""; *q; q++) {
+        if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
+        if ((*q == SHELL_DATA_ESC || *q == SHELL_GLOB_ESC) && q[1]) q++;
+        if (prot) {
+            if (shell_dbr_put_quoted(sc, q, 1) < 0) return -1;
+        } else if (sb_putc(&sc->disp, *q) < 0 || sb_putc(&sc->out, *q) < 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int shell_dbr_put2(struct shell_dbr_scratch *sc, char c) {
