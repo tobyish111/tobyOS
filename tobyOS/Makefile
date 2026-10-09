@@ -1054,6 +1054,7 @@ LIBTOBY_C_SRCS  := $(LIBTOBY_SRC)/init.c \
                    $(LIBTOBY_SRC)/errno.c \
                    $(LIBTOBY_SRC)/string.c \
                    $(LIBTOBY_SRC)/stdlib.c \
+                   $(LIBTOBY_SRC)/malloc.c \
                    $(LIBTOBY_SRC)/unistd.c \
                    $(LIBTOBY_SRC)/process.c \
                    $(LIBTOBY_SRC)/time.c \
