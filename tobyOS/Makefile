@@ -3771,6 +3771,12 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    echo "[initrd] staged linux-stat (statfs truth)";                  \
 	    EXTRA_FILES="$$EXTRA_FILES bin/linux-stat";                        \
 	fi;                                                                   \
+	if [ -f programs/linux-fdid/linux-fdid.elf ]; then                     \
+	    cp programs/linux-fdid/linux-fdid.elf                              \
+	         $(INITRD_STAGE)/bin/linux-fdid;                               \
+	    echo "[initrd] staged linux-fdid (fstat identity)";              \
+	    EXTRA_FILES="$$EXTRA_FILES bin/linux-fdid";                        \
+	fi;                                                                   \
 	if [ -f programs/linux-vfork/linux-vfork.elf ]; then                   \
 	    cp programs/linux-vfork/linux-vfork.elf                            \
 	         $(INITRD_STAGE)/bin/linux-vfork;                              \

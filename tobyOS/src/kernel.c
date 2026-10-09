@@ -9002,6 +9002,14 @@ void _start(void) {
              * when bytes are written. */
             { "/bin/linux-stat", "linux-stat", 0, 15,
               "statfs tells the truth" },
+            /* 2026-10-09 (finding 106): fstat answers from the file, not
+             * from the descriptor's copy -- the same (st_dev, st_ino) as
+             * stat of its name on every filesystem, through a hard link,
+             * a rename and /proc/self/fd/N; different files still differ;
+             * a named FIFO is its node, and a link to /dev/null opens the
+             * device (bits 6 7). */
+            { "/bin/linux-fdid", "linux-fdid", 0, 255,
+              "fstat identity == stat identity" },
             /* 2026-08-23: TRUE vfork -- the child runs on the PARENT's
              * stack while the parent is suspended (the private-stack shim
              * outlived the racy-suspension bug it worked around). */

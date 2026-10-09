@@ -1044,18 +1044,41 @@ int vfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
 #define VFS_ANON_DEVS 64
 static struct { const struct vfs_ops *ops; void *data; } g_anon_dev[VFS_ANON_DEVS];
 
-static uint32_t vfs_anon_dev(const struct vfs_mount *m) {
-    if (m->point[0] == '/' && m->point[1] == '\0') return 1u;
+static uint32_t vfs_anon_dev_of(const struct vfs_ops *ops, void *data) {
+    for (size_t i = 0; i < g_mount_count; i++)      /* the root's instance */
+        if (g_mounts[i].ops == ops && g_mounts[i].data == data &&
+            g_mounts[i].point[0] == '/' && g_mounts[i].point[1] == '\0')
+            return 1u;
     for (int i = 0; i < VFS_ANON_DEVS; i++) {
         if (!g_anon_dev[i].ops) {
-            g_anon_dev[i].ops  = m->ops;
-            g_anon_dev[i].data = m->data;
+            g_anon_dev[i].ops  = ops;
+            g_anon_dev[i].data = data;
             return 0x100u + (uint32_t)i;
         }
-        if (g_anon_dev[i].ops == m->ops && g_anon_dev[i].data == m->data)
+        if (g_anon_dev[i].ops == ops && g_anon_dev[i].data == data)
             return 0x100u + (uint32_t)i;
     }
     return 1u;
+}
+
+static uint32_t vfs_anon_dev(const struct vfs_mount *m) {
+    return vfs_anon_dev_of(m->ops, m->data);
+}
+
+/* AN OPEN FILE IS THE FILE ITS NAME IS. fstat reported a regular file with
+ * the handle's size, owner and mode and nothing else: no times, no link
+ * count, and an identity of its own -- device 1 and a hash -- so fstat(fd)
+ * and stat(name) of one file never agreed (finding 106): python's
+ * os.fstat(fd).st_ino != os.stat(path).st_ino on tmpfs, tobyfs and the
+ * initrd alike, and a same-file check saw two files. The driver answers
+ * for the handle now, through the node or inode it holds; the device is
+ * the one vfs_stat gives the same filesystem. */
+int vfs_fstat(struct vfs_file *f, struct vfs_stat *out) {
+    if (!f || !f->ops || !f->ops->fstat || !out) return VFS_ERR_INVAL;
+    memset(out, 0, sizeof *out);
+    int rc = f->ops->fstat(f, out);
+    if (rc == VFS_OK && !out->dev) out->dev = vfs_anon_dev_of(f->ops, f->mnt);
+    return rc;
 }
 
 int vfs_stat(const char *path, struct vfs_stat *out) {

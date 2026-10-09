@@ -651,6 +651,45 @@ static int ramfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_OK;
 }
 
+/* A node's slot in the mount: the tar's table, then the nodes made since. */
+static size_t ramfs_node_index(struct ramfs_mount *m,
+                               const struct ramfs_node *nd) {
+    if (nd >= m->nodes && nd < m->nodes + m->node_count)
+        return (size_t)(nd - m->nodes);
+    return m->node_count + (size_t)(nd - g_extra);
+}
+
+/* What stat says of node ND (the owner of its bytes) -- shared by stat and
+ * fstat. AN INODE NUMBER: the node's slot + 1, which its hard links share
+ * (they point at it by that index). The initrd's files had none, so the
+ * Linux stat hashed the path and the native one said 0: `[ /dev/fd/5 -ef
+ * /etc/passwd ]` was false in /bin/tsh, and fstat could not be made to
+ * agree with stat (finding 106). */
+static void ramfs_node_stat(struct ramfs_mount *m, struct ramfs_node *nd,
+                            struct vfs_stat *out) {
+    out->type = nd->type;
+    out->size = nd->size;
+    out->uid  = nd->uid;
+    out->gid  = nd->gid;
+    out->mode = nd->mode | VFS_MODE_VALID;
+    out->mtime = nd->mtime;
+    out->atime = nd->atime;
+    out->ctime = nd->mtime;
+    out->ino   = (uint64_t)ramfs_node_index(m, nd) + 1u;
+    /* A real count once hard links exist; 0 still means "no answer"
+     * for tar-loaded nodes, which routes through the shared default. */
+    out->nlink = nd->nlink > 1 ? nd->nlink : 0;
+}
+
+/* The open file's stat, through the node it holds (vfs_fstat). */
+static int ramfs_fstat(struct vfs_file *f, struct vfs_stat *out) {
+    struct ramfs_node *nd = f ? (struct ramfs_node *)f->priv : 0;
+    struct ramfs_mount *m = f ? (struct ramfs_mount *)f->mnt : 0;
+    if (!nd || !m) return VFS_ERR_IO;
+    ramfs_node_stat(m, nd, out);
+    return VFS_OK;
+}
+
 static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     struct ramfs_mount *m = (struct ramfs_mount *)mnt;
     char norm[VFS_PATH_MAX];
@@ -685,17 +724,7 @@ static int ramfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 
     struct ramfs_node *nd = find_node(m, norm);
     if (nd) {
-        out->type = nd->type;
-        out->size = nd->size;
-        out->uid  = nd->uid;
-        out->gid  = nd->gid;
-        out->mode = nd->mode | VFS_MODE_VALID;
-        out->mtime = nd->mtime;
-        out->atime = nd->atime;
-        out->ctime = nd->mtime;
-        /* A real count once hard links exist; 0 still means "no answer"
-         * for tar-loaded nodes, which routes through the shared default. */
-        if (nd->nlink > 1) out->nlink = nd->nlink;
+        ramfs_node_stat(m, nd, out);
         return VFS_OK;
     }
     /* Implicit directory? */
@@ -1123,6 +1152,7 @@ const struct vfs_ops ramfs_ops = {
     .readdir  = ramfs_readdir,
     .stat     = ramfs_stat,
     .statfs   = ramfs_statfs,   /* Phase H */
+    .fstat    = ramfs_fstat,
     /* 2026-08-24: the rest of the CRUD contract. Phase G gave the root
      * create/unlink/mkdir and stopped there, which left `mv`, `truncate`,
      * `chmod`, `chown` and `touch` on an existing file all answering EROFS

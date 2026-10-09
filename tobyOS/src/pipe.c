@@ -304,6 +304,16 @@ static struct fifo *fifo_find(const char *kpath, uint32_t dev, uint64_t ino) {
     return free_slot;
 }
 
+bool pipe_fifo_identity(struct pipe *p, uint32_t *dev, uint64_t *ino,
+                        const char **path) {
+    struct fifo *ff = p ? (struct fifo *)p->fifo : 0;
+    if (!ff) return false;
+    *dev = ff->dev;
+    *ino = ff->ino;
+    *path = ff->path;
+    return true;
+}
+
 /* Park on the FIFO until the other end has opened (its counter moves) or
  * is open; false when a signal that acts ended the wait.
  *

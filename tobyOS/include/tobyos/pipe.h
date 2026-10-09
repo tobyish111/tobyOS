@@ -102,4 +102,9 @@ long pipe_trywrite(struct pipe *p, const void *buf, size_t n);
 long fifo_open(const char *kpath, uint32_t dev, uint64_t ino, int accmode,
                bool nonblock, struct file **out);
 
+/* The named FIFO pipe P is: the DEV and INO it was opened by (0 when its
+ * filesystem has no inode) and its PATH. false for an unnamed pipe. */
+bool pipe_fifo_identity(struct pipe *p, uint32_t *dev, uint64_t *ino,
+                        const char **path);
+
 #endif /* TOBYOS_PIPE_H */

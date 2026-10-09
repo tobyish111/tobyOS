@@ -830,12 +830,25 @@ struct tobyfs_handle {
     bool                    counted;  /* holds a ref in fs->open_ino[] */
 };
 
+static void tobyfs_inode_stat(struct tobyfs *fs, uint32_t ino,
+                              const struct tfs_inode_disk *np,
+                              struct vfs_stat *out);
+
 static int tobyfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     struct tobyfs *fs = (struct tobyfs *)mnt;
     uint32_t ino;
     struct tfs_inode_disk node;
     int rc = path_walk(fs, path, &ino, &node);
     if (rc != VFS_OK) return rc;
+    tobyfs_inode_stat(fs, ino, &node, out);
+    return VFS_OK;
+}
+
+/* What stat says of inode INO -- shared by stat and fstat. */
+static void tobyfs_inode_stat(struct tobyfs *fs, uint32_t ino,
+                              const struct tfs_inode_disk *np,
+                              struct vfs_stat *out) {
+    struct tfs_inode_disk node = *np;
     /* Slice 7: report symlinks as such -- vfs_follow_link only engages when
      * stat says VFS_TYPE_SYMLINK, so getting this wrong makes every link
      * behave like a regular file containing its own target string. */
@@ -862,6 +875,18 @@ static int tobyfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
      * matter now that link(2) can raise them. Legacy inodes may carry 0;
      * the emitters' 0-means-default rule still covers those. */
     out->nlink = node.nlink;
+}
+
+/* The open file's stat, by the inode its handle holds -- renamed or
+ * unlinked since (an open inode is kept, open_ino_get), it is still itself
+ * (finding 106; vfs_fstat). The handle's copy answers if the inode has gone. */
+static int tobyfs_fstat(struct vfs_file *f, struct vfs_stat *out) {
+    struct tobyfs *fs = f ? (struct tobyfs *)f->mnt : 0;
+    struct tobyfs_handle *h = f ? (struct tobyfs_handle *)f->priv : 0;
+    if (!fs || !h) return VFS_ERR_IO;
+    struct tfs_inode_disk node;
+    if (read_inode(fs, h->ino, &node) != VFS_OK) node = h->node;
+    tobyfs_inode_stat(fs, h->ino, &node, out);
     return VFS_OK;
 }
 
@@ -2029,6 +2054,7 @@ const struct vfs_ops tobyfs_ops = {
     .link     = tobyfs_link,     /* Phase G: hard links */
     .statfs   = tobyfs_statfs,   /* Phase H: real numbers for df */
     .sync     = tobyfs_sync,
+    .fstat    = tobyfs_fstat,
 };
 
 /* M28E: identification helper used by sys_fs_check() to recognise

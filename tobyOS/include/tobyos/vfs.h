@@ -252,6 +252,12 @@ struct vfs_ops {
      * without it fsync(2) reports durable while the bytes are still in
      * RAM, and pulling the stick loses them. */
     int  (*sync)    (void *mnt);
+    /* (optional) stat of an open handle: what `stat` would say of the file
+     * it holds -- the same inode and device, and the metadata as it is now
+     * -- found through the handle, so a file renamed or unlinked while open
+     * is still itself. NULL => the caller falls back to the path the file
+     * was opened by. See vfs_fstat. */
+    int  (*fstat)   (struct vfs_file *f, struct vfs_stat *out);
 };
 
 /* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
@@ -518,6 +524,11 @@ int  vfs_link_target(const char *link, char *out, size_t outsz);
 /* vfs_stat answers for a link ITSELF (lstat); this follows a link in the
  * last component to what it names (stat). */
 int  vfs_stat_follow(const char *path, struct vfs_stat *out);
+
+/* What stat of an OPEN FILE answers -- the file the handle holds, renamed
+ * or unlinked since or not: the driver's fstat op, with the device filled
+ * in as vfs_stat fills it. VFS_ERR_INVAL when the driver has no fstat. */
+int  vfs_fstat(struct vfs_file *f, struct vfs_stat *out);
 
 /* The RAM symlink table's target for `path` (a link on a filesystem that
  * cannot hold one), or NULL. */

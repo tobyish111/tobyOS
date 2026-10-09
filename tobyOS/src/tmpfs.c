@@ -595,6 +595,9 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     return VFS_OK;
 }
 
+static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
+                       struct vfs_stat *out);
+
 static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
 {
     struct tmpfs_mount *m = mnt;
@@ -615,9 +618,18 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     }
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
+    tnode_stat(m, nd, out);
+    return VFS_OK;
+}
+
+/* What stat says of node ND (the owner of its bytes) -- shared by stat and
+ * fstat, so the name and the open file are one file. */
+static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
+                       struct vfs_stat *out)
+{
     memset(out, 0, sizeof *out);
-    out->ino   = (uint64_t)tindex(m, tresolve(m, nd)) + 1u;
-    out->dev   = dev;
+    out->ino   = (uint64_t)tindex(m, nd) + 1u;
+    out->dev   = 0x7700u + (uint32_t)(m - g_tmpfs);
     out->type  = nd->type;
     out->size  = nd->size;
     out->uid   = nd->uid;
@@ -636,6 +648,17 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     out->mtime = nd->mtime;
     out->atime = nd->atime;
     out->nlink = nd->nlink ? nd->nlink : 1u;
+}
+
+/* The open file's stat, through the node it holds -- renamed or unlinked
+ * since, it is still itself (finding 106; vfs_fstat). */
+static int tmpfs_fstat(struct vfs_file *f, struct vfs_stat *out)
+{
+    struct tmpfs_node *nd = f ? f->priv : 0;
+    if (!nd || !nd->used) return VFS_ERR_IO;
+    struct tmpfs_mount *m = tmount_of(nd);
+    if (!m) return VFS_ERR_IO;
+    tnode_stat(m, nd, out);
     return VFS_OK;
 }
 
@@ -852,6 +875,7 @@ static const struct vfs_ops tmpfs_ops = {
     .readlink  = tmpfs_readlink,
     .umount    = 0,
     .statfs    = tmpfs_statfs,   /* Phase H */
+    .fstat     = tmpfs_fstat,
 };
 
 /* Parse a numeric mount option, `size=` or `nr_inodes=`. Accepts a plain

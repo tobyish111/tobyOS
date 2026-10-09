@@ -3013,6 +3013,7 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
             f->o_accmode = 2;                       /* O_RDWR */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);           /* /proc/PID/fd names it */
             return fd;
         }
         /* Linux slice 6: /dev/tty and /dev/full.
@@ -3062,6 +3063,7 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
             f->o_accmode = 2;
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);
             return fd;
         }
         /* /dev/urandom and /dev/random: the kernel CSPRNG as a readable file.
@@ -3078,6 +3080,7 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
             f->o_accmode = 2;                       /* O_RDWR: writes are mixed in */
             int fd = fd_alloc_into(current_proc(), f);
             if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+            file_set_open_path(f, kpath);           /* random or urandom */
             return fd;
         }
         if (strcmp(dev, "ptmx") == 0) {
@@ -3587,6 +3590,66 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
 static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj, uint32_t *min);
 uint64_t file_object_ino(struct file *f);
 
+static uint64_t lx_ino_hash(const char *s);
+static uint64_t lx_fd_ino(struct file *f, int fd);
+
+/* WHAT stat(2) SAYS OF AN OPEN REGULAR FILE -- the one its name would say,
+ * identity included (finding 106): the driver's answer through the handle
+ * (vfs_fstat), which a rename or an unlink does not disturb; for a
+ * filesystem with no fstat, the stat of the path it was opened by while
+ * that names a regular file, the handle's own size kept (it is what a read
+ * gives -- a /proc file's); and only else what the handle itself knows, as
+ * before. *INO is the inode a filesystem with none of its own gets: the
+ * Linux stat's hash of the path, so the two agree there too. FD may be -1. */
+static void fd_vfs_stat(struct file *f, int fd, struct vfs_stat *vs,
+                        uint64_t *ino) {
+    const char *op = f->open_path;
+    bool have_path = op && op[0] == '/';
+    *ino = have_path ? lx_ino_hash(op) : lx_fd_ino(f, fd);
+    if (vfs_fstat(&f->vfs, vs) == VFS_OK) return;
+    if (have_path && vfs_stat_follow(op, vs) == VFS_OK &&
+        vs->type == VFS_TYPE_FILE) {
+        vs->size = f->vfs.size;
+        return;
+    }
+    *vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
+                             .uid = f->vfs.uid, .gid = f->vfs.gid,
+                             .mode = f->vfs.mode };
+    *ino = lx_fd_ino(f, fd);
+}
+
+/* A NAMED FIFO'S DESCRIPTOR IS ITS NODE, as Linux's fstat says: the
+ * filesystem's device and inode, and the node's owner, mode and times --
+ * what stat of its name gives. It said what an unnamed pipe says (a pipefs
+ * device, the pipe object's number), so the two never agreed, and bash's
+ * noclobber, which opens a file that is not regular and then checks that
+ * fstat and stat name one file, refused `echo x > fifo` (logs/b18
+ * noclob; Linux writes). The node is stat'ed by the name the FIFO was
+ * opened by while that still names it; renamed or gone, by what the FIFO
+ * table kept of it. false for an unnamed pipe. */
+static bool fd_fifo_stat(struct file *f, struct vfs_stat *vs) {
+    if (!(f->kind == FILE_KIND_PIPE_R || f->kind == FILE_KIND_PIPE_W ||
+          f->kind == FILE_KIND_PIPE_RW) || !f->pipe)
+        return false;
+    uint32_t dev = 0;
+    uint64_t ino = 0;
+    const char *path = 0;
+    if (!pipe_fifo_identity(f->pipe, &dev, &ino, &path)) return false;
+    const char *op = f->open_path ? f->open_path : path;
+    if (op && op[0] == '/' && vfs_stat_follow(op, vs) == VFS_OK &&
+        (vs->mode & 0170000u) == 0010000u &&
+        (!ino || (vs->dev == dev && vs->ino == ino)))
+        return true;
+    if (!ino) return false;
+    struct proc *p = current_proc();
+    *vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
+                             .mode = 0010000u | 0600u | VFS_MODE_VALID,
+                             .uid = p ? (uint32_t)p->uid : 0,
+                             .gid = p ? (uint32_t)p->gid : 0,
+                             .nlink = 1, .dev = dev, .ino = ino };
+    return true;
+}
+
 /* LINUX'S MAGIC LINKS. /proc/PID/fd/N -- and so /proc/self/fd/N, /dev/fd/N,
  * /dev/stdin, /dev/stdout and /dev/stderr, which are links to them -- name
  * the OPEN FILE itself: stat() through one is fstat() of that descriptor,
@@ -3641,8 +3704,13 @@ static int stat_resolve(const char *kpath, bool follow, char *final,
             int fdn = -1;
             struct file *f = stat_magic_fd(cur, &fdn);
             if (f) {
-                const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath
-                               : (f->kind == FILE_KIND_VFS) ? f->open_path : 0;
+                /* A DIRECTORY is stat'ed by its path, as its fstat is. A
+                 * file is the OPEN file, whatever its old name holds now:
+                 * it was stat'ed by that name while the name existed, so a
+                 * file renamed while open, or replaced, answered for the
+                 * wrong one -- the open file's identity was not stat's to
+                 * give before (fd_vfs_stat). */
+                const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath : 0;
                 if (op && op[0] == '/' && vfs_stat(op, vs) == VFS_OK) {
                     size_t l = strlen(op);
                     if (l >= cap) return VFS_ERR_NAMETOOLONG;
@@ -3684,13 +3752,15 @@ static long stat_errno(int vr) {
 static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
     memset(tmp, 0, sizeof *tmp);
     if (f->kind == FILE_KIND_VFS) {
-        struct vfs_stat vs = {
-            .type = VFS_TYPE_FILE, .size = f->vfs.size,
-            .uid  = f->vfs.uid,    .gid  = f->vfs.gid,
-            .mode = f->vfs.mode,
-        };
+        struct vfs_stat vs;
+        uint64_t ino;
+        fd_vfs_stat(f, -1, &vs, &ino);    /* the native ino is the fs's own */
         fill_abi_stat(&vs, tmp);
         return;
+    }
+    {
+        struct vfs_stat vs;
+        if (fd_fifo_stat(f, &vs)) { fill_abi_stat(&vs, tmp); return; }
     }
     uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
     if (sm) {
@@ -7214,6 +7284,35 @@ static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
     return 0;
 }
 
+/* THE /dev NODE A DEVICE DESCRIPTOR IS: the name it was opened by --
+ * /dev/random and /dev/urandom are one kind of file, and fstat of the
+ * first said the second's numbers (1,9 for 1,8) -- else its kind's node;
+ * a pty slave's in PTS (its own buffer). NULL for what is not a device.
+ * /dev/full was missing, so its fstat said a regular file (logs/b18
+ * devid; Linux: the node, as stat says). */
+static const char *lx_fd_dev_node(struct file *f, char *pts, size_t cap) {
+    switch (f->kind) {
+    case FILE_KIND_DEVNULL:
+    case FILE_KIND_DEVZERO:
+    case FILE_KIND_DEVFULL:
+    case FILE_KIND_DEVRANDOM:
+        if (f->open_path && strncmp(f->open_path, "/dev/", 5) == 0)
+            return f->open_path;
+        return f->kind == FILE_KIND_DEVNULL ? "/dev/null"
+             : f->kind == FILE_KIND_DEVZERO ? "/dev/zero"
+             : f->kind == FILE_KIND_DEVFULL ? "/dev/full" : "/dev/urandom";
+    case FILE_KIND_CONSOLE:    return "/dev/console";
+    case FILE_KIND_PTY_MASTER: return "/dev/ptmx";
+    case FILE_KIND_PTY_SLAVE: {
+        int idx = pty_file_index(f);
+        if (idx < 0) return 0;
+        ksnprintf(pts, cap, "/dev/pts/%d", idx);
+        return pts;
+    }
+    default:                   return 0;
+    }
+}
+
 /* WHAT AN FD THAT IS NOT A FILE IS, as Linux's fstat says: a pipe is a FIFO
  * (0600, its creator's), a socket a socket, a terminal or a device a
  * character device with its own numbers -- devfs's table, so the fd and the
@@ -7231,9 +7330,13 @@ static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
     case FILE_KIND_PIPE_W:
     case FILE_KIND_PIPE_RW:   return 0x1000u | 0600u;          /* S_IFIFO  */
     case FILE_KIND_SOCKET:    return 0xC000u | 0777u;          /* S_IFSOCK */
-    case FILE_KIND_DEVNULL:   return devfs_node_mode("/dev/null", maj, min);
-    case FILE_KIND_DEVZERO:   return devfs_node_mode("/dev/zero", maj, min);
-    case FILE_KIND_DEVRANDOM: return devfs_node_mode("/dev/urandom", maj, min);
+    case FILE_KIND_DEVNULL:
+    case FILE_KIND_DEVZERO:
+    case FILE_KIND_DEVFULL:
+    case FILE_KIND_DEVRANDOM: {
+        char pts[24];
+        return devfs_node_mode(lx_fd_dev_node(f, pts, sizeof pts), maj, min);
+    }
     case FILE_KIND_CONSOLE:   return devfs_node_mode("/dev/console", maj, min);
     case FILE_KIND_PTY_MASTER: return devfs_node_mode("/dev/ptmx", maj, min);
     case FILE_KIND_PTY_SLAVE: {
@@ -7400,6 +7503,8 @@ static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
     if (f->kind == FILE_KIND_DRM)         /* slice 99: S_IFCHR 226:128 */
         return linux_emit_chrdev_stat(DRM_CHR_MAJOR, f->dir_off,
                                       lx_fd_ino(f, fd), ubuf);
+    if (fd_fifo_stat(f, &vs))             /* a named FIFO: its node */
+        return linux_emit_stat(&vs, lx_fd_ino(f, fd), ubuf);
     {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
         uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
         if (sm) return linux_emit_special_stat(sm, mj, mn, lx_fd_ino(f, fd),
@@ -7409,9 +7514,9 @@ static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
         if (vfs_stat(f->dirpath, &vs) != VFS_OK)
             vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
     } else if (f->kind == FILE_KIND_VFS) {
-        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                .mode = f->vfs.mode };
+        uint64_t ino;
+        fd_vfs_stat(f, fd, &vs, &ino);
+        return linux_emit_stat(&vs, ino, ubuf);
     } else if (f->kind == FILE_KIND_MEMFD) {
         /* Chrome fstats the memfd to size its mapping + CHECK st_size. */
         vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
@@ -7441,6 +7546,11 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
         return src;
     }
     {
+        struct vfs_stat fvs;                  /* a named FIFO: its node */
+        if (fd_fifo_stat(f, &fvs))
+            return linux_emit_statx(&fvs, lx_fd_ino(f, fd), ubuf);
+    }
+    {
         uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
         if (sm) {
             struct proc *sp = current_proc();
@@ -7465,9 +7575,9 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
         if (vfs_stat(f->dirpath, &vs) != VFS_OK)
             vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
     } else if (f->kind == FILE_KIND_VFS) {
-        vs = (struct vfs_stat){ .type = VFS_TYPE_FILE, .size = f->vfs.size,
-                                .uid = f->vfs.uid, .gid = f->vfs.gid,
-                                .mode = f->vfs.mode };
+        uint64_t ino;
+        fd_vfs_stat(f, fd, &vs, &ino);
+        return linux_emit_statx(&vs, ino, ubuf);
     } else if (f->kind == FILE_KIND_MEMFD) {
         vs = (struct vfs_stat){ .type = VFS_TYPE_FILE,
                                 .size = (size_t)memfd_size(f->memfd),
@@ -7535,6 +7645,14 @@ static uint64_t lx_fd_ino(struct file *f, int fd) {
     if (f) {
         uint64_t oi = file_object_ino(f);
         if (oi) return oi;
+        /* A DEVICE's is its node's, as stat("/dev/null") hashes the path
+         * (linux_emit_devnode_stat): it was a per-descriptor number, so
+         * fstat of /dev/null was another file than stat of it (106). */
+        {
+            char pts[24];
+            const char *dp = lx_fd_dev_node(f, pts, sizeof pts);
+            if (dp) return lx_ino_hash(dp);
+        }
         if (f->kind == FILE_KIND_DIR && f->dirpath)
             return lx_ino_hash(f->dirpath);
         if (f->kind == FILE_KIND_VFS) {
