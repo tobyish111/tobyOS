@@ -1398,7 +1398,7 @@ static bool g_heredoc_collecting;
 static bool g_continuation_active;
 static void prompt(void);
 static void execute_line_text(const char *src);
-static void shell_trap_text(const char *action);
+static void shell_trap_text(const char *action, const char *name, bool resetline);
 static void execute_line_text_inner(const char *src);
 struct shell_simple;
 static int shell_keyword_hoist(struct shell_simple *cmd);
@@ -5921,7 +5921,7 @@ static void shell_run_trap(int sig) {
      * notifies as it takes the action's line 1 (logs/b12 p99, p106) */
     shell_jobs_notify(1, SHELL_NOTIFY_READ);
 
-    shell_trap_text(action);
+    shell_trap_text(action, "trap", true);
     g_shell_lineno = saved_line;
     g_bash_lnum = bl_save;
 
@@ -6061,7 +6061,7 @@ static void shell_run_err_trap(int status) {
     shell_set_status(status);
     /* the action's parse notifies, naming the current line (p106) */
     shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_READ);
-    shell_trap_text(action);
+    shell_trap_text(action, "error trap", false);
     g_trap_running = was_running;
     g_err_trap_running = false;
     shell_set_status(status);
@@ -6101,7 +6101,7 @@ static void shell_run_debug_trap(void) {
     /* the action's parse notifies, naming the current line (p106); a
      * RETURN trap's does not */
     shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_READ);
-    shell_trap_text(action);
+    shell_trap_text(action, "debug trap", false);
     g_trap_running = was_running;
     g_debug_trap_running = false;
     g_shell_lineno = saved_line;
@@ -6126,7 +6126,7 @@ static void shell_run_return_trap(void) {
     int saved_status = g_last_status;
     unsigned long saved_line = g_shell_lineno;
     g_trap_running = true;
-    shell_trap_text(action);
+    shell_trap_text(action, "return trap", false);
     g_trap_running = false;
     g_shell_lineno = saved_line;
     if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(saved_status);
@@ -6147,8 +6147,17 @@ static int shell_run_exit_trap(int status) {
     shell_set_status(status);
     /* the action's parse notifies as it takes its line 1 (p106) */
     shell_jobs_notify(1, SHELL_NOTIFY_READ);
+    /* ...and its lines are its own, from 1, as a signal's are: $LINENO and
+     * a "line N:" in it said the line the script ended on (bash:
+     * SEVAL_RESETLINE; logs/b17 trapsyn3) */
+    unsigned long saved_line = g_shell_lineno;
+    unsigned long bl_save = g_bash_lnum;
+    g_shell_lineno = 1;
+    g_bash_lnum = 0;
 
-    shell_trap_text(action);
+    shell_trap_text(action, "exit trap", true);
+    g_shell_lineno = saved_line;
+    g_bash_lnum = bl_save;
 
     int final_status = status;
     if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -17710,6 +17719,11 @@ static long shell_funcnest_max(void) {
  * ordinary reader. See eval_mode below. */
 static bool g_reader_eval_pending;
 static int  g_eval_reader_depth;
+/* ...and when that reader is a TRAP's action (shell_trap_text): the name its
+ * errors carry in eval's place, and whether its lines count from 1 (EXIT and
+ * a signal's) rather than on from the current line. Consumed with it. */
+static const char *g_reader_eval_name;
+static bool g_reader_eval_resetline;
 /* Set by shell_run_script_hosted for the reader of the script /bin/tsh was
  * started on -- the one reader that records history (see hist_reader). */
 static bool g_reader_main_script;
@@ -18259,14 +18273,65 @@ static bool shell_syn_check_string(const char *text, const char *iname,
     return v == SHELL_SYN_RUN;
 }
 
-/* A trap's action is not read by the check: it runs with the old checks. */
-static void shell_trap_text(const char *action) {
-    int saved = g_syn_checked;
-    g_syn_checked = 0;
-    g_xtrace_level++;                   /* traced a level deeper: `++ ` */
-    execute_line_text(action);
-    g_xtrace_level--;
-    g_syn_checked = saved;
+static int shell_run_script_text(char *text, bool run_exit_trap);
+
+/* A TRAP'S ACTION IS READ AS EVAL'S STRING IS, under the trap's own name, as
+ * bash's parse_and_execute reads it: "exit trap", "debug trap", "error trap",
+ * "return trap", and "trap" for a signal's. A command that does not parse is
+ * reported as bash reports it --
+ *
+ *     SHELL: exit trap: line 1: syntax error near unexpected token `then'
+ *     SHELL: exit trap: line 1: `if then'
+ *
+ * -- and does not run; the lines before it have (a multi-line action goes
+ * through the reader, as eval's does); and the shell goes on, its $? what
+ * it was (the runners restore it; an EXIT trap's status is the one before
+ * it). Only `set -e` makes the error end the shell, with 2. RESETLINE: the
+ * action's lines count from 1 -- EXIT's and a signal's, where bash passes
+ * SEVAL_RESETLINE -- else on from the current line, so a DEBUG or ERR
+ * action's error names the command's line. tsh ran the action with no
+ * check: no name, no text, and the shell stopped there with 2 (finding 36;
+ * logs/b17 trapsyn, trapsyn2). */
+static void shell_trap_text(const char *action, const char *name, bool resetline) {
+    bool saved_parse_error = g_parse_error;
+    g_parse_error = false;
+    bool multiline = false;
+    for (const char *q = action; *q && !multiline; q++)
+        if (*q == '\n' || (q[0] == '<' && q[1] == '<')) multiline = true;
+    if (multiline) {
+        char *copy = shell_strdup(action);
+        if (copy) {
+            g_reader_eval_pending = true;
+            g_reader_eval_name = name;
+            g_reader_eval_resetline = resetline;
+            (void)shell_run_script_text(copy, false);
+            g_reader_eval_pending = false;
+            g_reader_eval_name = 0;
+            g_reader_eval_resetline = false;
+            kfree(copy);
+        }
+    } else {
+        bool checked = false;
+        unsigned long before = resetline ? 0
+                             : (g_shell_lineno ? g_shell_lineno - 1 : 0);
+        if (shell_syn_check_string(action, name, before, true, &checked)) {
+            int saved = g_syn_checked;
+            g_syn_checked = checked ? saved + 1 : 0;
+            g_xtrace_level++;           /* traced a level deeper: `++ ` */
+            execute_line_text(action);
+            g_xtrace_level--;
+            g_syn_checked = saved;
+        }
+    }
+    /* A parse error's EXIT ends the action, not the shell -- unless it was
+     * fatal (set -e). */
+    if (g_parse_error && g_shell_flow == SHELL_FLOW_EXIT && !g_syntax_fatal) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        shell_set_status(2);
+        g_parse_error = false;
+    }
+    g_parse_error = saved_parse_error || g_parse_error;
 }
 
 /* The line the next reader's first line follows, when its caller knows it
@@ -18337,6 +18402,11 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
      *     nesting bound, and its lines count on from the caller's. */
     bool eval_mode = g_reader_eval_pending;
     g_reader_eval_pending = false;
+    const char *eval_name = g_reader_eval_name ? g_reader_eval_name : "eval";
+    bool trap_reader = eval_mode && g_reader_eval_name;
+    bool eval_resetline = eval_mode && g_reader_eval_resetline;
+    g_reader_eval_name = 0;
+    g_reader_eval_resetline = false;
     /* HISTORY (S6). The MAIN script's reader records each unit it reads
      * while `set -o history` is on, as bash's does; a sourced file, eval,
      * $(...) and -c do not. It records the unit as written in the file, so
@@ -18367,13 +18437,14 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     g_noexec_error = 0;
     g_shell_lineno = ((eval_mode || comsub_lines) && saved_lineno > 0)
                          ? saved_lineno - 1 : 0;
+    if (eval_resetline) g_shell_lineno = 0;
     if (stdin_unit) g_shell_lineno = g_reader_stdin_line;
     /* bash's reader notifies as it takes the FIRST line too: an eval
      * string's names the eval's own line, a sourced file's its line 1
      * (logs/b12 p99, WSL bash). tsh notified only after a line. */
-    if (eval_mode)
+    if (eval_mode && !trap_reader)      /* a trap's runner notified already */
         shell_jobs_notify(saved_lineno, SHELL_NOTIFY_READ);
-    else if (g_source_depth > 0 && !comsub_lines && !g_reader_main_script)
+    else if (!eval_mode && g_source_depth > 0 && !comsub_lines && !g_reader_main_script)
         shell_jobs_notify(1, SHELL_NOTIFY_READ);
     int last = 0;
     char *p = text;
@@ -18384,7 +18455,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     struct shell_syn syn;
     unsigned long syn_base0 = syn_base_set ? syn_base : g_shell_lineno;
     shell_syn_open(&syn, text, syn_base0,
-                   eval_mode ? "eval" : syn_iname, eval_mode || syn_string,
+                   eval_mode ? eval_name : syn_iname, eval_mode || syn_string,
                    syn_repl, eval_mode || g_source_depth > 0);
     /* HISTORY EXPANSION in the main script (`set -o history -H`): the text
      * with each command's lines expanded as they are read, once read
@@ -18422,7 +18493,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                     hx_upto = off + xu.len;
                     shell_syn_close(&syn);
                     shell_syn_open(&syn, text, syn_base0,
-                                   eval_mode ? "eval" : syn_iname,
+                                   eval_mode ? eval_name : syn_iname,
                                    eval_mode || syn_string, syn_repl,
                                    eval_mode || g_source_depth > 0);
                     if (hist_raw) { kfree(hist_raw); hist_raw = 0; }
@@ -19581,6 +19652,10 @@ static void cmd_continue(int argc, char **argv) {
     shell_set_status(0);
 }
 
+/* The line of the last `return` that ran: the RETURN trap's line_number
+ * when a function returns by it (shell_run_function). */
+static unsigned long g_return_line;
+
 static void cmd_return(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
     if (argc > 2) {
@@ -19603,6 +19678,7 @@ static void cmd_return(int argc, char **argv) {
     /* a bad operand is reported and the function STILL returns, with 2 */
     g_shell_flow = SHELL_FLOW_RETURN;
     g_shell_flow_status = st;
+    g_return_line = g_shell_lineno;
     shell_set_status(st);
 }
 
@@ -37325,6 +37401,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         unsigned long bl_save = g_bash_lnum;
         g_bash_lnum = fn->body_ln ? fn->body_ln
                     : (fn->lm_n > 0 && fn->lm_line) ? fn->lm_line[0] : call_line;
+        unsigned long body_start_ln = g_bash_lnum;   /* fn may be redefined */
         struct shell_lmap_saved lm_sv;
         bool lm_in = shell_lmap_enter_body(fn->lm_off, fn->lm_line, fn->lm_n,
                                            run_body, &lm_sv);
@@ -37340,7 +37417,20 @@ static int shell_run_function(struct shell_simple *cmd) {
                 g_shell_flow = SHELL_FLOW_NONE;
             }
             if (g_shell_flow == SHELL_FLOW_NONE) {
+                /* ON BASH'S LINE: a `return`'s own line -- it leaves at
+                 * once, from inside an `if` too -- or, the body having run
+                 * to its end, the line the body starts on, as
+                 * execute_function leaves it. tsh had the line the body
+                 * ended on, or the `if` a return was in (logs/b17
+                 * trapsyn3: R=4 and R=3 where bash says 1 and 4). */
+                unsigned long rt_line = g_shell_lineno;
+                if (fl == SHELL_FLOW_RETURN) {
+                    if (g_return_line) g_shell_lineno = g_return_line;
+                } else if (body_start_ln) {
+                    g_shell_lineno = body_start_ln;
+                }
                 shell_run_return_trap();
+                g_shell_lineno = rt_line;
                 if (g_shell_flow == SHELL_FLOW_NONE && fl == SHELL_FLOW_RETURN) {
                     g_shell_flow = fl;
                     g_shell_flow_status = fls;
@@ -45761,8 +45851,12 @@ static void execute_line_text_inner(const char *src) {
             if (g_opt_errexit && last != 0 && !negate && !background &&
                 !in_and_or && g_errexit_suspend == 0 && g_errexit_off == 0 &&
                 g_errexit_negate == 0) {
-                g_shell_flow = SHELL_FLOW_EXIT;
-                g_shell_flow_status = last;
+                /* ...unless the ERR trap already ended the shell: its own
+                 * `exit N`, or a syntax error in it under set -e (2) */
+                if (g_shell_flow != SHELL_FLOW_EXIT) {
+                    g_shell_flow = SHELL_FLOW_EXIT;
+                    g_shell_flow_status = last;
+                }
                 shell_pipeline_free(plp);
                 return;
             }
