@@ -35,6 +35,11 @@ sleep 1 &
 %sleep; echo "percent=$?"
 sleep 1 &
 %%; echo "percent2=$?"
+# The `sleep 1` left in the background by the ambiguous %sleep started a few
+# ms before the one %% waited for: whether it is done at the `jobs` below was
+# a race -- either shell printed "[5] Done" or not, run to run (logs/b17
+# gate-b17c, b17stress). Let it finish.
+sleep 1
 sleep 30 &
 p1=$!
 sleep 31 &
