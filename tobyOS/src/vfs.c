@@ -1031,6 +1031,33 @@ int vfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     return VFS_ERR_NOENT;
 }
 
+/* A FILESYSTEM WITH NO DEVICE NUMBER GETS ONE OF ITS OWN. Only tobyfs and
+ * tmpfs reported one, so /proc, /dev, /sys and every other mount said the
+ * root's 0:1: busybox `df /proc` named "/" with /'s numbers, and `find
+ * -xdev`, `du -x` and anything else that finds a file's filesystem by its
+ * device could not tell them apart (finding 32, logs/b7 stdev-mounts). The
+ * number belongs to the filesystem INSTANCE -- its ops and data -- so a bind
+ * mount and a namespace's copy of the table share it, as they share one on
+ * Linux; the root keeps the 1 it always had. An anonymous device, major 0,
+ * minors from 0x100 (tmpfs's are 0x77xx). Entries are never reused: a
+ * slot outlives an unmount, and a full table falls back to the root's. */
+#define VFS_ANON_DEVS 64
+static struct { const struct vfs_ops *ops; void *data; } g_anon_dev[VFS_ANON_DEVS];
+
+static uint32_t vfs_anon_dev(const struct vfs_mount *m) {
+    if (m->point[0] == '/' && m->point[1] == '\0') return 1u;
+    for (int i = 0; i < VFS_ANON_DEVS; i++) {
+        if (!g_anon_dev[i].ops) {
+            g_anon_dev[i].ops  = m->ops;
+            g_anon_dev[i].data = m->data;
+            return 0x100u + (uint32_t)i;
+        }
+        if (g_anon_dev[i].ops == m->ops && g_anon_dev[i].data == m->data)
+            return 0x100u + (uint32_t)i;
+    }
+    return 1u;
+}
+
 int vfs_stat(const char *path, struct vfs_stat *out) {
     uint64_t t_v = perf_rdtsc();
     if (!path || !out) { perf_zone_end(PERF_Z_VFS_STAT, t_v); return VFS_ERR_INVAL; }
@@ -1067,6 +1094,7 @@ int vfs_stat(const char *path, struct vfs_stat *out) {
             rc = VFS_OK;
         }
     }
+    if (rc == VFS_OK && !out->dev) out->dev = vfs_anon_dev(m);
     perf_zone_end(PERF_Z_VFS_STAT, t_v);
 #ifdef PATHFAIL_TRACE
     pathfail_trace("stat", path, rc);
