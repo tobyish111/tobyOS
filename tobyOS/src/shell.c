@@ -2858,6 +2858,14 @@ static bool g_readonly_hit;
  * rest of its line, as for a readonly name. */
 static bool g_assign_fail_hit;
 
+/* bash's this_command_name: the builtin or function a simple command runs,
+ * set as it starts and cleared as any simple command ends; `((` and `[[`
+ * set their own and leave it. g_decl_cmd_name is what it was while the
+ * running command's own words were expanded -- the name bash's internal
+ * declare of a compound assignment reports under (shell_run_single). */
+static const char *g_this_cmd_name;
+static const char *g_decl_cmd_name;
+
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
     SH_SB(nameb);                       /* any length: it was cut at 63 */
@@ -9005,6 +9013,13 @@ static void cmd_local(int argc, char **argv) {
          * so `local -a r=(9)` failed AND left an empty r shadowing the
          * readonly one for the rest of the function. */
         if (shell_readonly_key(name, klen)) {
+            /* a compound value: bash's own declare of it reports first,
+             * under the command it last named (see cmd_declare) */
+            size_t vk = env_key_len(argv[i]);
+            if (argv[i][vk] == '=' && argv[i][vk + 1] == '(')
+                shell_readonly_print_error(name, klen,
+                                           g_decl_cmd_name ? g_decl_cmd_name
+                                                           : "shell");
             shell_readonly_print_error(name, klen, "local");
             shell_set_status(1);
             continue;
@@ -9598,6 +9613,17 @@ static void cmd_export(int argc, char **argv) {
                 if (!g_readonly_hit)
                     kprintf("export: failed to set '%s'\n", argv[i]);
                 shell_set_status(1);
+                /* A COMPOUND value refused ends the line, in a function
+                 * too: export makes no locals, so bash's assignment of it
+                 * fails as a statement's does (logs/b17 rodecl). */
+                if (g_readonly_hit && argv[i][klen + 1] == '(') {
+                    if (g_shell_flow == SHELL_FLOW_NONE) {
+                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                     : SHELL_FLOW_DISCARD;
+                        g_shell_flow_status = 1;
+                    }
+                    return;
+                }
                 continue;
             }
         } else if (env_find(argv[i], nlen) < 0) {
@@ -10226,6 +10252,24 @@ static void cmd_declare(int argc, char **argv) {
 
         if (make_local && !shell_local_declared_here(name, g_script_depth)) {
             if (shell_readonly_key(name, klen)) {
+                /* A COMPOUND VALUE IS DECLARED FIRST, by bash itself
+                 * (expand_declaration_argument), as its words are
+                 * expanded: in a function that makes the local, which the
+                 * readonly name refuses, reported under the command bash
+                 * last named -- the function, while this is its first
+                 * command; nothing, after another -- and then the builtin
+                 * says it again:
+                 *
+                 *     f() { local -a r=(9); }     f: r: readonly variable
+                 *                                 local: r: readonly variable
+                 *
+                 * tsh said only the second (findings 10 26; logs/b17
+                 * rodecl). */
+                if (has_value &&
+                    argv[i][env_key_len(argv[i]) + 1] == '(')
+                    shell_readonly_print_error(name, klen,
+                                               g_decl_cmd_name ? g_decl_cmd_name
+                                                               : "shell");
                 shell_readonly_print_error(name, klen, argv[0]);
                 shell_set_status(1);
                 continue;
@@ -10289,8 +10333,11 @@ static void cmd_declare(int argc, char **argv) {
                  * assignment statement (S4) -- inside a function it is an
                  * ordinary status-1 failure, and a scalar value never ends
                  * the line. Measured: logs/s35/ro-decl.txt. */
+                /* ...and so does one with -g in a function: bash makes
+                 * no local there, and the assignment's failure discards
+                 * the line as at top level (logs/b17 rodecl). */
                 const char *v = argv[i] + env_key_len(argv[i]) + 1;
-                if (g_readonly_hit && *v == '(' && g_fn_depth == 0) {
+                if (g_readonly_hit && *v == '(' && (g_fn_depth == 0 || set_global)) {
                     if (g_shell_flow == SHELL_FLOW_NONE) {
                         g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
                                                      : SHELL_FLOW_DISCARD;
@@ -10400,8 +10447,19 @@ static void cmd_readonly(int argc, char **argv) {
                 }
             }
             shell_xt_decl_assign(argv[i], klen);
+            g_readonly_hit = false;
             if (env_set_kv(argv[i]) < 0) {
                 shell_set_status(1);
+                /* a COMPOUND value refused ends the line, as export's
+                 * does (logs/b17 rodecl) */
+                if (g_readonly_hit && argv[i][klen + 1] == '(') {
+                    if (g_shell_flow == SHELL_FLOW_NONE) {
+                        g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                     : SHELL_FLOW_DISCARD;
+                        g_shell_flow_status = 1;
+                    }
+                    return;
+                }
                 continue;
             }
         }
@@ -38651,7 +38709,10 @@ static int shell_run_single(struct shell_simple *cmd, bool background) {
     }
     const struct shell_simple *saved_assign_cmd = g_assign_cmd;
     g_assign_cmd = cmd;
+    g_decl_cmd_name = g_this_cmd_name;
+    if (assignc < cmd->argc) g_this_cmd_name = cmd->argv[assignc];
     int rc = shell_run_single_in(cmd, background);
+    g_this_cmd_name = 0;
     g_assign_cmd = saved_assign_cmd;
     if (!background) shell_bind_lastarg(cmd, assignc);
     return rc;
@@ -41063,6 +41124,7 @@ static bool shell_try_dbracket_command(const char *src) {
             return true;
     }
     shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
+    g_this_cmd_name = "[[";
     shell_run_debug_trap();            /* `[[ ]]` is a command (1182) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
@@ -41224,6 +41286,11 @@ static bool shell_try_arith_command(const char *src) {
         shell_compound_tail_redirs(src, end + 2, "(("))
         return true;
     shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
+    /* ON THE LINE OF ITS `))`, as bash's parser leaves an arithmetic
+     * command's: its error and $LINENO in it name where it ends, and a
+     * DEBUG trap sees that line (logs/b17 arithml: "line 4" for one opened
+     * on line 2). */
+    g_this_cmd_name = "((";             /* for error messages, as bash's */
     unsigned long arith_saved_line = g_shell_lineno;
     {
         unsigned long el = shell_lineno_at(end);
