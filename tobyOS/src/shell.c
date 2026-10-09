@@ -37002,6 +37002,39 @@ static void shell_fd_commit_var(struct shell_fd_state *st, int fd) {
     st->owned[fd] = false;
 }
 
+/* A REDIRECTION THAT CLOSES ONE OF THE COPROCESS'S DESCRIPTORS takes it
+ * off the coprocess (bash's coproc_fdchk): `{NAME[1]}>&-`, `exec 60>&-`,
+ * the source of a move -- even a close undone after its command. NAME[0]
+ * or NAME[1] says -1 from then on, and the reap leaves that end alone:
+ *
+ *     coproc cat; exec {COPROC[1]}>&-; echo ${COPROC[@]}   bash: 63 -1
+ *                                                          tsh:  63 60
+ *
+ * tsh kept the closed file's pointer, and its reap compared the slot with
+ * it -- a dangling pointer that matched only when the allocator handed the
+ * closed marker the freed address (finding 115; logs/b18 cpclose). */
+static void shell_coproc_fdchk(int fd) {
+    bool upd = false;
+    if (g_coproc.rfd >= 0 && g_coproc.rfd == fd) {
+        g_coproc.rfd = -1;
+        g_coproc.rf = 0;
+        upd = true;
+    }
+    if (g_coproc.wfd >= 0 && g_coproc.wfd == fd) {
+        g_coproc.wfd = -1;
+        g_coproc.wf = 0;
+        upd = true;
+    }
+    if (!upd || !g_coproc.name) return;
+    size_t nl = strlen(g_coproc.name);
+    if (shell_readonly_key(g_coproc.name, nl)) return;
+    char nb[24];
+    ksnprintf(nb, sizeof nb, "%d", g_coproc.rfd);
+    (void)sh_array_set(g_coproc.name, 0, nb);
+    ksnprintf(nb, sizeof nb, "%d", g_coproc.wfd);
+    (void)sh_array_set(g_coproc.name, 1, nb);
+}
+
 static int shell_apply_redirs(struct shell_simple *cmd,
                               struct shell_fd_state *st,
                               const char *label) {
@@ -37176,6 +37209,7 @@ static int shell_apply_redirs(struct shell_simple *cmd,
             continue;
         }
         if (r->op == SH_RD_CLOSE) {
+            shell_coproc_fdchk(r->fd);
             struct file *f = shell_closed_file_make();
             if (!f) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
@@ -45471,9 +45505,15 @@ static void jobs_forget_all(void);
 
 #ifdef SHELL_HOSTED
 /* Is shell descriptor FD free for the coprocess -- not in the table and
- * not a live process substitution's? */
+ * not a live process substitution's? A slot holding the CLOSED marker an
+ * `exec N>&-` leaves is free, as it is for a `{name}`: bash's next
+ * coprocess takes 63 and 60 again after its descriptors were closed. It
+ * took 62 and 58 in tsh, and 59 for 60 under the stress build (shparity
+ * 245a; logs/b18 cpclose, finding 115). */
 static bool shell_coproc_fd_free(int fd) {
-    if (fd < g_shell_fd_cap && g_shell_fd[fd]) return false;
+    if (fd < g_shell_fd_cap && g_shell_fd[fd] &&
+        g_shell_fd[fd]->kind != FILE_KIND_NULL)
+        return false;
     for (int i = 0; i < g_procsub_n; i++)
         if (g_procsub[i].keep && g_procsub[i].fd == fd) return false;
     return true;
