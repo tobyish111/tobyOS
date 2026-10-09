@@ -35710,7 +35710,11 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                             : fd == dflt ? written : 0, 0,
                                             -1) < 0) return -1;
                     } else if (t == SH_TOK_DUP_OUT && fd == 1 && !fdvar) {
-                        if (shell_add_redir(cur, SH_RD_OPEN_OUT, 1,
+                        /* ...and noclobber holds it as it holds `&>`
+                         * (finding 113: it truncated a regular file) */
+                        if (shell_add_redir(cur, g_opt_noclobber
+                                                 ? SH_RD_OPEN_EXCL
+                                                 : SH_RD_OPEN_OUT, 1,
                                             tok[*io].text, 0, -1) < 0 ||
                             shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
                             return -1;
@@ -37128,11 +37132,33 @@ static int shell_apply_redirs(struct shell_simple *cmd,
         if (r->op == SH_RD_OPEN_OUT || r->op == SH_RD_OPEN_APPEND ||
             r->op == SH_RD_OPEN_EXCL) {
             if (r->op == SH_RD_OPEN_EXCL) {
+                /* NOCLOBBER REFUSES A REGULAR FILE, not every name that is
+                 * there. bash stats the name and refuses only a regular file
+                 * (through a link too); anything else it opens as it is --
+                 * /dev/null, a FIFO, a terminal, and a directory, which then
+                 * fails as "Is a directory" -- and a name that is not there
+                 * it opens EXCLUSIVELY, so a dangling link is refused:
+                 *
+                 *     set -C; echo a > /dev/null    bash: 0
+                 *                                   tsh: cannot overwrite
+                 *
+                 * (finding 113, Oils 2134; logs/b18 noclob). */
                 char resolved[VFS_PATH_MAX];
                 if (shell_canonicalize_path(r->path, resolved,
                                             sizeof(resolved)) >= 0) {
-                    struct vfs_stat st2;
-                    if (vfs_stat(resolved, &st2) == VFS_OK) {
+                    struct vfs_stat st2, lst;
+#ifdef SHELL_HOSTED
+                    extern int vfs_lstat(const char *path, struct vfs_stat *out);
+                    int fr = vfs_stat(resolved, &st2);           /* follows */
+                    int lr = fr == VFS_OK ? VFS_OK : vfs_lstat(resolved, &lst);
+#else
+                    int fr = vfs_stat_follow(resolved, &st2);
+                    int lr = fr == VFS_OK ? VFS_OK : vfs_stat(resolved, &lst);
+#endif
+                    uint32_t fmt = fr == VFS_OK ? (st2.mode & 0170000u) : 0;
+                    bool regular = fr == VFS_OK && st2.type == VFS_TYPE_FILE &&
+                                   (fmt == 0 || fmt == 0100000u);
+                    if (regular || (fr != VFS_OK && lr == VFS_OK)) {
                         kprintf("%s: cannot overwrite existing file\n", r->path);
                         shell_set_status(1);
                         return -1;
