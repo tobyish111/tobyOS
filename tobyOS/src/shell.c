@@ -23413,16 +23413,179 @@ static void shell_hist_add_entry(const char *text) {
     g_hist_session++;
 }
 
+/* HISTCONTROL, as bash reads it: colon-separated words, of which
+ * ignorespace, ignoredups, ignoreboth and erasedups mean something. */
+#define SHELL_HC_IGNSPACE  1u
+#define SHELL_HC_IGNDUPS   2u
+#define SHELL_HC_ERASEDUPS 4u
+static unsigned shell_hist_control(void) {
+    const char *v = env_get("HISTCONTROL");
+    unsigned hc = 0;
+    while (v && *v) {
+        const char *e = v;
+        while (*e && *e != ':') e++;
+        size_t n = (size_t)(e - v);
+        if (n == 11 && strncmp(v, "ignorespace", n) == 0) hc |= SHELL_HC_IGNSPACE;
+        else if (n == 10 && strncmp(v, "ignoredups", n) == 0) hc |= SHELL_HC_IGNDUPS;
+        else if (n == 10 && strncmp(v, "ignoreboth", n) == 0)
+            hc |= SHELL_HC_IGNSPACE | SHELL_HC_IGNDUPS;
+        else if (n == 9 && strncmp(v, "erasedups", n) == 0) hc |= SHELL_HC_ERASEDUPS;
+        v = *e ? e + 1 : e;
+    }
+    return hc;
+}
+
+/* Does one HISTIGNORE pattern match LINE? An unescaped `&` in it stands for
+ * the previous history line, quoted so it matches only itself; `\&` is a
+ * literal `&`. The pattern is matched against the whole line, extglob as
+ * the shopt says (bash's history_should_ignore). */
+static bool shell_hist_ignore_one(const char *pat, size_t n, const char *line) {
+    SH_SB(pb);
+    const char *prev = g_hist_count > 0 ? g_hist[g_hist_count - 1] : 0;
+    for (size_t i = 0; i < n; i++) {
+        if (pat[i] == '\\' && i + 1 < n && pat[i + 1] == '&') {
+            if (sb_putc(&pb, '&') < 0) return false;
+            i++;
+            continue;
+        }
+        if (pat[i] == '&' && prev) {
+            for (const char *c = prev; *c; c++) {
+                if ((*c == '*' || *c == '?' || *c == '[' || *c == ']' ||
+                     *c == '\\' || *c == '(' || *c == ')' || *c == '|' ||
+                     *c == '@' || *c == '+' || *c == '!') &&
+                    sb_putc(&pb, '\\') < 0)
+                    return false;
+                if (sb_putc(&pb, *c) < 0) return false;
+            }
+            continue;
+        }
+        if (sb_putc(&pb, pat[i]) < 0) return false;
+    }
+    return shell_glob_match(pb.p ? pb.p : "", line);
+}
+
+/* HISTIGNORE: colon-separated patterns -- a colon inside a bracket
+ * expression or after a backslash is the pattern's own. */
+static bool shell_hist_ignored(const char *line) {
+    const char *v = env_get("HISTIGNORE");
+    while (v && *v) {
+        const char *e = v;
+        int br = 0;
+        while (*e && !(*e == ':' && br == 0)) {
+            if (*e == '\\' && e[1]) { e += 2; continue; }
+            if (*e == '[') br = 1;
+            else if (*e == ']') br = 0;
+            e++;
+        }
+        if (e > v && shell_hist_ignore_one(v, (size_t)(e - v), line)) return true;
+        v = *e ? e + 1 : e;
+    }
+    return false;
+}
+
 /* Record one line the shell READ -- typed at a prompt, or a unit of the main
  * script -- if `set -o history` is on (bash's maybe_add_history). A blank
- * line is not recorded. */
+ * line is not recorded, and neither is one HISTCONTROL or HISTIGNORE turns
+ * away: a line that starts with a space (ignorespace), the previous entry
+ * again (ignoredups), one a HISTIGNORE pattern matches; erasedups takes
+ * every earlier copy of the line out before it goes in. tsh read neither
+ * variable (finding 15; logs/b17 a4). */
 static void shell_history_add(const char *cmdline) {
     if (!g_opt_history) return;
     g_hist_line_added = false;
     if (!cmdline) return;
     const char *t = shell_skip_blanks(cmdline);
     if (!*t) return;
+    unsigned hc = shell_hist_control();
+    if ((hc & SHELL_HC_IGNSPACE) && cmdline[0] == ' ') return;
+    if ((hc & SHELL_HC_IGNDUPS) && g_hist_count > 0 &&
+        strcmp(g_hist[g_hist_count - 1], cmdline) == 0)
+        return;
+    if (shell_hist_ignored(cmdline)) return;
+    if (hc & SHELL_HC_ERASEDUPS) {
+        int w = 0;
+        for (int i = 0; i < g_hist_count; i++) {
+            if (strcmp(g_hist[i], cmdline) == 0) { kfree(g_hist[i]); continue; }
+            g_hist[w++] = g_hist[i];
+        }
+        g_hist_count = w;
+    }
     shell_hist_add_entry(cmdline);
+}
+
+/* A UNIT OVER SEVERAL LINES IS ONE ENTRY, its lines joined as bash's
+ * bash_add_history joins them (cmdhist): a line goes on after a space where
+ * the text so far wants more -- after `do`, `then`, `{`, `|`, `&&`, `in`, a
+ * blank line -- and after "; " where a command could end; a backslash-
+ * newline is taken out; a quoted or substituted span keeps its newline; a
+ * comment line is left out and the line after a comment goes on after a
+ * newline, so the comment cannot swallow it. Indentation is kept. tsh
+ * recorded the unit as typed, newlines and all (finding 13; logs/b17 a4). */
+static int shell_hist_join(const char *s, size_t n, struct shell_sb *out) {
+    struct shell_scan scan;
+    shell_scan_init(&scan);
+    SH_SB(lb);
+    bool first = true, after_comment = false, prev_blank = false;
+    const char *end = s + n, *p = s;
+    sb_truncate(out, 0);
+    while (p < end) {
+        const char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        size_t ll = (size_t)(nl - p);
+        if (SH_CR_BLANK && ll > 0 && p[ll - 1] == '\r') ll--;
+        sb_truncate(&lb, 0);
+        if (sb_putmem(&lb, p, ll) < 0) return -1;
+        const char *line = lb.p ? lb.p : "";
+        bool in_q = scan.in_sq || scan.in_dq;
+        bool in_nest = scan.nest > 0;
+        const char *fb = shell_skip_blanks(line);
+        bool blank = !*fb;
+        if (first) {
+            if (sb_puts(out, line) < 0) return -1;
+        } else if (!in_q && !in_nest && *fb == '#') {
+            after_comment = true;           /* not saved */
+            p = nl < end ? nl + 1 : end;
+            continue;
+        } else {
+            const char *sep;
+            size_t ol = out->len;
+            if (!in_q && ol >= 1 && out->p[ol - 1] == '\\' &&
+                (ol < 2 || out->p[ol - 2] != '\\')) {
+                sb_truncate(out, ol - 1);   /* backslash-newline: gone */
+                sep = "";
+            } else if (after_comment || in_q || in_nest) {
+                sep = "\n";
+            } else if (blank) {
+                /* a blank line adds "; " where a command could end, nothing
+                 * where more is owed or after another blank -- and none of
+                 * its own blanks (logs/b17 histblank) */
+                sep = (prev_blank || scan.no_sep || scan.in_array_lit) ? ""
+                                                                       : "; ";
+                line = "";
+            } else if (scan.in_array_lit || prev_blank || scan.no_sep) {
+                sep = " ";
+            } else {
+                sep = "; ";
+            }
+            if (*sep == ';' && !in_q && out->len > 0 &&
+                out->p[out->len - 1] == '\n')
+                sep++;
+            if (sb_puts(out, sep) < 0 || sb_puts(out, line) < 0) return -1;
+        }
+        /* a comment at the end of this line: the next goes after a newline */
+        after_comment = false;
+        if (!in_q && !blank) {
+            SH_SB(cc);
+            if (sb_puts(&cc, line) < 0) return -1;
+            shell_strip_comment(cc.p);
+            after_comment = strlen(cc.p) != ll;
+        }
+        shell_scan_line(&scan, lb.p ? lb.p : "");
+        prev_blank = blank && !first && !in_q && !in_nest;
+        first = false;
+        p = nl < end ? nl + 1 : end;
+    }
+    return 0;
 }
 
 /* The main script's reader records a unit as it is written in the file:
@@ -23438,8 +23601,11 @@ static void shell_history_add_raw(const char *raw, const char *raw_base,
     size_t n = (size_t)(to - from);
     while (n > 0 && (s[n - 1] == '\n' || (SH_CR_BLANK && s[n - 1] == '\r'))) n--;
     SH_SB(t);
-    if (sb_putmem(&t, s, n) < 0) return;
-    if (heredoc && sb_putc(&t, '\n') < 0) return;
+    if (heredoc) {
+        if (sb_putmem(&t, s, n) < 0 || sb_putc(&t, '\n') < 0) return;
+    } else if (shell_hist_join(s, n, &t) < 0) {
+        return;
+    }
     shell_history_add(t.p);
 }
 
@@ -46854,7 +47020,21 @@ bool shell_wants_exit_hosted(int *status) {
 /* Feed the interactive loop's lines into the history ring `fc` reads.
  * The ring and fc were both fully built -- and the hosted REPL never
  * called this, so interactive fc listed an empty history forever. */
-void shell_history_add_hosted(const char *line) { shell_history_add(line); }
+/* A line typed at a prompt -- several, when a command went on over them,
+ * joined as a script's unit is (shell_hist_join); one with a here-document
+ * keeps its lines. */
+void shell_history_add_hosted(const char *line) {
+    if (!line) return;
+    bool multi = false, hd = false;
+    for (const char *c = line; *c; c++) {
+        if (*c == '\n' && c[1]) multi = true;
+        if (c[0] == '<' && c[1] == '<') hd = true;
+    }
+    if (!multi || hd) { shell_history_add(line); return; }
+    SH_SB(t);
+    if (shell_hist_join(line, strlen(line), &t) < 0) return;
+    shell_history_add(t.p ? t.p : line);
+}
 /* Read access for the hosted line editor's Up/Down and ^R. The ring already
  * existed for `fc`; nothing could READ it from outside. Index 0 is the
  * OLDEST entry, matching g_hist's own order, so the editor walks backwards
