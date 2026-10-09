@@ -3645,6 +3645,17 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 if (globbed == 0 && g_shopt_nullglob) globbed = -2;
             }
             shell_strip_nosplit_inplace(field);
+            /* a glob escape -- the quoted part of a ${x-WORD}
+             * (shell_glob_escape_marked) -- has done its work */
+            {
+                char *w = field;
+                for (const char *r = field; *r; r++) {
+                    if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
+                    if (*r == SHELL_GLOB_ESC && r[1]) continue;
+                    *w++ = *r;
+                }
+                *w = '\0';
+            }
             if (globbed > 0) {
                 any = true;
             } else if (globbed == 0 &&
@@ -27541,6 +27552,11 @@ static int shell_pattern_from_marked(const char *raw, struct shell_sb *out) {
             if (sb_putc(out, *q++) < 0 || sb_putc(out, *q) < 0) return -1;
             continue;
         }
+        /* a quoted part of a ${x-WORD} (shell_glob_escape_marked) */
+        if (*q == SHELL_GLOB_ESC && q[1]) {
+            if (sb_putc(out, '\\') < 0 || sb_putc(out, *++q) < 0) return -1;
+            continue;
+        }
         if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
         if (prot && (*q == '*' || *q == '?' || *q == '[' ||
                      *q == ']' || *q == '\\'))
@@ -27624,6 +27640,36 @@ static int shell_strip_nosplit_n(struct shell_sb *dst, const char *src,
 
 static int shell_strip_nosplit(struct shell_sb *dst, const char *src) {
     return shell_strip_nosplit_n(dst, src, strlen(src));
+}
+
+/* THE QUOTED PART OF AN UNQUOTED ${x-WORD} IS LITERAL TO PATHNAME EXPANSION,
+ * as a quoted part of the command word is: each glob metacharacter inside a
+ * span the marks enclose takes the escape the matcher reads, unless it has
+ * one already. The command-word reader escapes its own quoted spans; the
+ * WORD of an expansion is quoted inside the expansion, where it never looks:
+ *
+ *     touch a b; echo ${u:-'*'} ${u:-"*"} ${u:-*}     bash: * * a b
+ *
+ * and tsh globbed all three (the open item from batch 9's `$'*'`). Only the
+ * word's own spans: the marks around the rest of the command word say "do
+ * not split", not "quoted", so escaping in the funnel stopped `foo.?($e|h)`
+ * from globbing at all (Oils 1583 1703, logs/b17 globreg). */
+static int shell_glob_escape_marked(struct shell_sb *w) {
+    if (!w->p) return 0;
+    SH_SB(o);
+    bool prot = false;
+    for (const char *q = w->p; *q; q++) {
+        if ((*q == SHELL_DATA_ESC || *q == SHELL_GLOB_ESC) && q[1]) {
+            if (sb_putc(&o, *q) < 0 || sb_putc(&o, q[1]) < 0) return -1;
+            q++;
+            continue;
+        }
+        if (*q == SHELL_NOSPLIT_MARK) prot = !prot;
+        else if (prot && shell_glob_meta(*q) && sb_putc(&o, SHELL_GLOB_ESC) < 0)
+            return -1;
+        if (sb_putc(&o, *q) < 0) return -1;
+    }
+    return sb_set(w, o.p ? o.p : "");
 }
 
 /* Strip the marks where they stand. The words buffer is writable and marks
@@ -30101,6 +30147,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
          * `=` joins them, its word being a value (logs/b12/p36) */
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_WORD_TILDE();
+        if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
         return sb_puts(b, ewb.p);
     case '=':
         if (!missing)
@@ -30113,16 +30160,43 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
-        if (env_set(name, ewb.p) < 0) {
-            kprintf(SH_PFX_SHELL "failed to assign '%s'\n", name);
-            return -1;
+        /* THE VARIABLE GETS THE VALUE, AND THE EXPANSION IS THE VARIABLE.
+         * The word's quoting decides what is stored, not how the result
+         * is read: bash substitutes the new value as it would `$name`,
+         *
+         *     touch q1 q2; echo ${v:='q*'} "[$v]"        bash: q1 q2 [q*]
+         *     printf '[%s]' ${w:='a  b'}                bash: [a][b]
+         *
+         * tsh stored the word with its quote marks and escapes in it --
+         * `${z:=\*}` left z holding 0x03 0x2a -- and handed the word on
+         * still quoted. The marks come off for the value. */
+        {
+            SH_SB(plain);
+            if (shell_strip_nosplit(&plain, ewb.p) < 0) return -1;
+            shell_strip_glob_escapes(plain.p);
+            plain.len = strlen(plain.p);
+            if (env_set(name, plain.p) < 0) {
+                kprintf(SH_PFX_SHELL "failed to assign '%s'\n", name);
+                return -1;
+            }
+            return sb_put_data_str(b, plain.p);
         }
-        return sb_puts(b, ewb.p);
     case '?':
         if (!missing)
             return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
-        if (shell_expand_param_word(word, &ewb) < 0) return -1;
+        /* THE MESSAGE IS THE WORD, ITS QUOTES SYNTAX EVEN INSIDE DOUBLE
+         * QUOTES (bash expands it as a string of its own): `"${e:?'msg*'}"`
+         * says "e: msg*". tsh printed the quotes there, and the marks of a
+         * quoted span as stray bytes everywhere. */
+        g_value_word = true;
+        if (shell_expand_word_ex(word, &ewb, true, true) < 0) return -1;
+        {
+            SH_SB(plain);
+            if (shell_strip_nosplit(&plain, ewb.p) < 0) return -1;
+            shell_strip_glob_escapes(plain.p);
+            if (sb_set(&ewb, plain.p) < 0) return -1;
+        }
         /* `?` and `:?` say different things when there is no word: bash
          * reports "parameter not set" for the first, since an empty value
          * does not trigger it. */
@@ -30144,6 +30218,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (missing) return 0;
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_WORD_TILDE();
+        if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
         return sb_puts(b, ewb.p);
     default:
         return -1;
@@ -42183,6 +42258,12 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
                         if (*q == SHELL_DATA_ESC && q[1]) {   /* escape-aware */
                             if (sb_putc(&pat, *q++) < 0 ||
                                 sb_putc(&pat, *q) < 0) return false;
+                            continue;
+                        }
+                        /* a quoted part of a ${x-WORD} (shell_glob_escape_marked) */
+                        if (*q == SHELL_GLOB_ESC && q[1]) {
+                            if (sb_putc(&pat, '\\') < 0 ||
+                                sb_putc(&pat, *++q) < 0) return false;
                             continue;
                         }
                         if (*q == SHELL_NOSPLIT_MARK) { prot = !prot; continue; }
