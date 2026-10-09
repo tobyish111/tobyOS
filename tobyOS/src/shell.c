@@ -16521,6 +16521,12 @@ struct shell_scan {
     bool after_in;      /* the last token was the `in` of a for/case */
     bool dbracket;      /* inside `[[ ... ]]`, where none of this applies */
     bool for_head;      /* the last token was `for`: `((` opens an arithmetic head */
+    /* The paren depth INSIDE a `(( ))` -- a command or a for head -- whose
+     * `))` is on a later line; 0: none. Its lines are an expression's
+     * (shell_scan_in_arith). */
+    int  arith_cmd;
+    bool arith_sub;     /* ...and it closed with `)` + something else, not
+                         * `))`: a nested subshell after all */
     bool await_body;    /* a for head just closed: a `{` opens its BODY */
     bool brace_body[16];/* per brace level: this `}` also ends a compound */
     bool no_sep;        /* the text so far cannot end a command: joining the
@@ -16583,6 +16589,13 @@ static void shell_scan_init(struct shell_scan *st) {
     st->in_case_in = false;
     st->in_case_pat = false;
     st->start = 0;
+    st->arith_cmd = 0;
+    st->arith_sub = false;
+}
+
+/* Inside a `(( ))` whose `))` is still to come? */
+static bool shell_scan_in_arith(const struct shell_scan *st) {
+    return st->arith_cmd > 0 && st->paren >= st->arith_cmd;
 }
 
 /* Is `w` the whole word starting at `p`? Used where a character loop has to
@@ -16823,6 +16836,13 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         *pp = p;
         return;
     }
+    if (c == '(' && shell_scan_in_arith(st)) {
+        /* the expression's own grouping (see arith_cmd) */
+        p++;
+        st->paren++;
+        *pp = p;
+        return;
+    }
     if (c == '(') {
         /* `(( expr ))` IS ONE TOKEN, AND ITS PARENTHESES ARE NOT THE SHELL'S.
          *
@@ -16878,6 +16898,15 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 st->no_sep = false;
                 return;
             }
+            /* ...AND ONE WHOSE `))` IS ON A LATER LINE IS ARITHMETIC TOO:
+             * the parens are counted as below, and the lines it takes in
+             * are an expression's -- joined with their newlines, their
+             * indentation and their `#`, as bash reads them. Joined with
+             * "; " as a subshell's, `(( c = 1 +` / `2 ))` was a syntax
+             * error where bash says c=3 (finding 42; logs/b17 arithml). A
+             * nested subshell that opens `((` loses nothing by it: a newline
+             * separates its commands as well as a `;` does. */
+            if (!st->arith_cmd) st->arith_cmd = st->paren + 2;
         }
         /* AN EXTGLOB GROUP IS PART OF THE WORD, not a subshell.
          * `echo @(*.cc|*.h)` reaches here as a `(` GLUED to a word, which
@@ -17029,6 +17058,10 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
                 st->array_lit_depth = 0;
             }
             st->paren--;
+            if (st->arith_cmd && st->paren < st->arith_cmd) {
+                st->arith_sub = (*p != ')');
+                st->arith_cmd = 0;
+            }
             st->cmd_pos = false;
             /* A CLOSED SUBSHELL IS A COMMAND, so `( ... ) || echo` has one in
              * front of its `||`. Without this the leading-operator check
@@ -18712,6 +18745,14 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             shell_strip_comment(accum);
             alen = strlen(accum);
             bool overflow = false;
+            /* Where an open `((`'s lines were joined with a newline, and the
+             * separator each would have had in a subshell -- put back if the
+             * `((` closes as `) )`, a nested subshell, whose body the newline
+             * would leave one command (`((echo a` / `echo b) )`). One byte
+             * for one, so the line map holds. */
+            size_t ar_off[64];
+            char ar_alt[64];
+            int ar_n = 0;
             /* ...OR THE TEXT SO FAR ENDS IN A BACKSLASH. `{ ...; } \` followed
              * by `| cat` is one pipeline: the group closes, the scanner is
              * satisfied, and the continuation still has to pull the next
@@ -18749,14 +18790,15 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                             nl[--nz] = '\0';
                     }
                 }
-                if (!in_q)
-                while (*nl == ' ' || *nl == '\t') nl++;
                 /* Inside arithmetic or `${ }` a `#` is an OPERATOR, not a
                  * comment, so the comment rules below apply only where a
-                 * command could start. */
-                bool expr_ctx = (scan.nest > 0 &&
-                                 (scan.nest_kind[scan.nest - 1] == 'a' ||
-                                  scan.nest_kind[scan.nest - 1] == 'v'));
+                 * command could start. An arithmetic expression keeps its
+                 * indentation too: it is the text bash's error shows. */
+                char ikind = scan.nest > 0 ? scan.nest_kind[scan.nest - 1]
+                           : shell_scan_in_arith(&scan) ? 'a' : 0;
+                bool expr_ctx = (ikind == 'a' || ikind == 'v');
+                if (!in_q && ikind != 'a')
+                while (*nl == ' ' || *nl == '\t') nl++;
                 if (in_q) {
                     /* taken as it stands -- see above */
                 } else if (!expr_ctx) {
@@ -18859,6 +18901,12 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                     sep = (kind == 'v') ? " "
                         : (kind == 'a' || kind == 'c' || kind == 'b') ? "\n"
                         : "; ";
+                } else if (shell_scan_in_arith(&scan)) {
+                    sep = "\n";                /* see arith_cmd */
+                    if (ar_n < 64) {
+                        ar_off[ar_n] = alen;
+                        ar_alt[ar_n++] = scan.no_sep ? ' ' : ';';
+                    }
                 } else if (scan.no_sep) {
                     sep = " ";
                 } else {
@@ -18898,6 +18946,12 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                 accum[alen] = '\0';
                 shell_scan_line(&scan, app);
                 if (tnl) kfree(tnl);
+                if (ar_n && !shell_scan_in_arith(&scan)) {
+                    if (scan.arith_sub)
+                        for (int k = 0; k < ar_n; k++)
+                            accum[ar_off[k]] = ar_alt[k];
+                    ar_n = 0;
+                }
             }
             if (overflow || shell_scan_incomplete(&scan)) {
                 if (!overflow)
@@ -41122,6 +41176,8 @@ static bool shell_try_dbracket_command(const char *src) {
  * an error, so a genuine nested subshell -- `( (echo a; echo b) | wc -l )` --
  * still reaches the subshell parser behind it.
  */
+static bool shell_run_arith_command(const char *s, const char *end);
+
 static bool shell_try_arith_command(const char *src) {
     const char *s = shell_skip_blanks(src);
     if (!(s[0] == '(' && s[1] == '(')) return false;
@@ -41168,6 +41224,19 @@ static bool shell_try_arith_command(const char *src) {
         shell_compound_tail_redirs(src, end + 2, "(("))
         return true;
     shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
+    unsigned long arith_saved_line = g_shell_lineno;
+    {
+        unsigned long el = shell_lineno_at(end);
+        if (el > g_shell_lineno) g_shell_lineno = el;
+    }
+    bool arith_r = shell_run_arith_command(s, end);
+    g_shell_lineno = arith_saved_line;
+    return arith_r;
+}
+
+/* shell_try_arith_command's body, once the command is known: the DEBUG
+ * trap, then the expression between S and END, expanded and evaluated. */
+static bool shell_run_arith_command(const char *s, const char *end) {
     shell_run_debug_trap();            /* `(( ))` is a command (1182) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
