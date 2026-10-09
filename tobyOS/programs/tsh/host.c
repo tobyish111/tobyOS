@@ -1423,6 +1423,7 @@ extern void shell_exit_notice_hosted(void);
 extern bool shell_eof_refused_hosted(void);
 extern void shell_exit_jobs_hosted(void);
 extern int  shell_exit_trap_hosted(int status);
+extern int  shell_run_stdin_unit_hosted(const char *text, unsigned long lines);
 extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
 extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
@@ -1847,6 +1848,16 @@ int main(int argc, char **argv) {
     int last = 0;
     int eofs = 0;
     int cont = 0;
+    /* The input ended in the middle of a command -- an open quote, a
+     * compound, a here-document owed: what has been read runs as it is,
+     * and the script reader says what bash says ("unexpected EOF while
+     * looking for matching", "delimited by end-of-file"). tsh read EOF
+     * again and again for good: `printf 'echo "x' | tsh` never ended. */
+    int at_eof = 0;
+    /* A script on stdin numbers its lines from the first (see
+     * shell_run_stdin_unit_hosted): lines read so far, and the first line of
+     * the command being read. */
+    unsigned long lines_read = 0, unit_line = 0;
     for (;;) {
         if (g_tsh_sighup) tsh_hangup_exit();
         /* bash announces finished background jobs right before a prompt. */
@@ -1883,7 +1894,8 @@ int main(int argc, char **argv) {
                         if (shell_eof_refused_hosted()) continue;
                     }
                     shell_logout_hosted();
-                    int st = interactive ? shell_exit_trap_hosted(last) : last;
+                    /* a script on stdin has ended too: its trap */
+                    int st = shell_exit_trap_hosted(last);
                     shell_exit_jobs_hosted();
                     return st;
                 }
@@ -1927,10 +1939,12 @@ int main(int argc, char **argv) {
                         if (shell_eof_refused_hosted()) break;
                     }
                     shell_logout_hosted();
-                    int st = interactive ? shell_exit_trap_hosted(last) : last;
+                    /* a script on stdin has ended too: its trap */
+                    int st = shell_exit_trap_hosted(last);
                     shell_exit_jobs_hosted();
                     return st;
                 }
+                if (cont) at_eof = 1;
                 break;
             }
             if (c == '\n') break;
@@ -1972,6 +1986,7 @@ int main(int argc, char **argv) {
             last = 130;
             continue;
         }
+        if (n > 0 || !at_eof) lines_read++;
         /* HISTORY EXPANSION, a line at a time as bash's reader does it
          * (shell_histexp.inc): the expanded line is echoed and is what is
          * read; one that fails is reported and read as empty. */
@@ -1993,6 +2008,7 @@ int main(int argc, char **argv) {
                 }
             }
         }
+        if (!cont) unit_line = lines_read;
         if (n == 0 && !cont) continue;
         eofs = 0;
         if (alen + n + 2 > acap) {
@@ -2006,7 +2022,8 @@ int main(int argc, char **argv) {
         memcpy(accum + alen, line, n);
         alen += n;
         accum[alen] = '\0';
-        int inc = shell_line_incomplete_hosted(accum);
+        int inc = at_eof ? 0 : shell_line_incomplete_hosted(accum);
+        at_eof = 0;
         if (inc == 2 && alen > 0 && accum[alen - 1] == '\\') {
             alen--;                        /* backslash-newline: splice */
             accum[alen] = '\0';
@@ -2028,7 +2045,8 @@ int main(int argc, char **argv) {
                 (void)!write(2, d0, strlen(d0));
             }
         }
-        last = shell_run_line_hosted(accum);
+        last = interactive ? shell_run_line_hosted(accum)
+                           : shell_run_stdin_unit_hosted(accum, unit_line ? unit_line - 1 : 0);
         /* ^C that landed DURING the command, rather than at the prompt.
          * The tty echoed "^C" with no newline of its own and the read loop
          * never saw it (it was not blocked -- the command was running), so

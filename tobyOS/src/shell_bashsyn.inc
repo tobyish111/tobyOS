@@ -1288,6 +1288,16 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
             h->delim = 0;
             continue;
         }
+        /* A TAGGED DELIMITER (the shell's SHELL_HD_TAG, 0x1e, at its start)
+         * names a body the reader has already collected -- a same-line
+         * $( )'s, read from the lines after the line: it is not in this
+         * text, so none of the text is read for it. */
+        if (h->delim && h->delim[0] == '\x1e') {
+            if (h->node) h->node->body = bsn_strn(st, "", 0);
+            BSYN_FREE(h->delim);
+            h->delim = 0;
+            continue;
+        }
         unsigned long at = st->lineno;
         size_t dl = bsyn_strlen(h->delim);
         bool found = false;

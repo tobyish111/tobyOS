@@ -15772,19 +15772,44 @@ struct shell_heredoc_spec {
     size_t word_off;      /* where the delimiter word starts in the line */
 };
 
-/* Find EVERY here-document operator on `line`, left to right, which is the
- * order their bodies follow the line in. Returns how many were found.
+static int shell_parse_command_subst(const char **pp, char *cmd, size_t cmd_cap);
+
+/* Find EVERY here-document operator on `line`, in the order their bodies
+ * follow the line. Returns how many were found.
  *
  * This used to stop at the first one, so `cat <<A | cat <<B` collected one
  * body and then ran a command still waiting for a second. The consumer side
- * (g_heredocs) was always a queue -- only the producer was singular. */
+ * (g_heredocs) was always a queue -- only the producer was singular.
+ *
+ * A `$( )` THAT CLOSES ON THE LINE OWES ITS HERE-DOCUMENTS TO THE LINES
+ * AFTER IT, and they come first. bash parses a substitution when it reaches
+ * its `)`, and one that ends with a here-document unread warns
+ * ("command substitution: 1 unterminated here-document") and reads the body
+ * from the input there and then (parse_comsub, gather_here_documents) --
+ * before the newline that collects the line's own:
+ *
+ *     x=$(cat <<EOF)                  bash: [hello]
+ *     hello
+ *     EOF
+ *     echo "[$x]"
+ *
+ * tsh skipped the substitution, so the body was read as commands -- `hello`
+ * ran -- and `cat` had none (finding 37). Such operators are listed first,
+ * substitution by substitution as each closes, then the line's own; their
+ * word_off is still where the word stands in LINE, for the tag. A
+ * backquote's here-document is not read so, in bash either. */
 static int shell_line_find_heredocs(const char *line,
                                     struct shell_heredoc_spec *out, int max) {
     bool in_single = false;
     bool in_double = false;
     int found = 0;
+    /* the line's own operators, placed after the substitutions' */
+    struct shell_heredoc_spec *top __attribute__((cleanup(shell_kfree_ptr))) =
+        max > 0 ? (struct shell_heredoc_spec *)kmalloc((size_t)max * sizeof *top) : 0;
+    int ntop = 0;
+    if (!top) return 0;
 
-    for (const char *p = line; *p && found < max; p++) {
+    for (const char *p = line; *p && found + ntop < max; p++) {
         if (in_single) {
             if (*p == '\'') in_single = false;
             continue;
@@ -15795,13 +15820,15 @@ static int shell_line_find_heredocs(const char *line,
                 continue;
             }
             if (*p == '"') in_double = false;
-            continue;
+            /* a `$( )` in the string is a command like any other:
+             * `echo "[$(cat <<A) $(cat <<B)]"` owes two bodies */
+            if (!(*p == '$' && p[1] == '(' && p[2] != '(')) continue;
         }
-        if (*p == '\'') {
+        if (!in_double && *p == '\'') {
             in_single = true;
             continue;
         }
-        if (*p == '"') {
+        if (!in_double && *p == '"') {
             in_double = true;
             continue;
         }
@@ -15809,7 +15836,35 @@ static int shell_line_find_heredocs(const char *line,
          * operator, and `$((1<<4))` was being read as a here-document
          * introduced by `<<` -- which swallowed the rest of the script
          * looking for a delimiter and took the whole shift family with
-         * it. Quotes were already skipped here; substitutions were not. */
+         * it. Quotes were already skipped here; substitutions were not.
+         * One that closes on this line is looked into (see above). */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *q = p;
+            /* ON THIS LINE: text that holds a newline is a substitution of
+             * several lines, whose here-documents' bodies are inside it */
+            bool one_line = false;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) {
+                one_line = true;
+                for (const char *c = p; c < q; c++)
+                    if (*c == '\n') { one_line = false; break; }
+            }
+            if (one_line) {
+                size_t il = (size_t)((q - 1) - (p + 2));
+                char *inner = (char *)kmalloc(il + 1);
+                if (inner) {
+                    memcpy(inner, p + 2, il);
+                    inner[il] = '\0';
+                    int got = shell_line_find_heredocs(inner, out + found,
+                                                       max - found - ntop);
+                    for (int k = 0; k < got; k++)
+                        out[found + k].word_off += (size_t)(p + 2 - line);
+                    found += got;
+                    kfree(inner);
+                }
+                p = q - 1;                 /* at its `)` */
+                continue;
+            }
+        }
         if (*p == '$' && p[1] == '(') {
             int depth = 0;
             p++;                       /* at the first '(' */
@@ -15860,7 +15915,7 @@ static int shell_line_find_heredocs(const char *line,
         if (p[0] == '<' && p[1] == '<' && p[2] == '<') { p += 2; continue; }
         if (p[0] != '<' || p[1] != '<') continue;
 
-        struct shell_heredoc_spec *sp = &out[found];
+        struct shell_heredoc_spec *sp = &top[ntop];
         sp->strip_tabs = false;
         sp->quoted = false;
         sp->delim = 0;
@@ -15878,28 +15933,32 @@ static int shell_line_find_heredocs(const char *line,
         bool tagged = (*p == SHELL_HD_TAG);
 
         SH_SB(dw);
+        bool oom = false;
         while (shell_heredoc_delim_char(*p)) {
             if (*p == '\'' || *p == '"') {
                 char q = *p++;
                 sp->quoted = true;
                 while (*p && *p != q) {
-                    if (sb_putc(&dw, *p++) < 0) return found;
+                    if (sb_putc(&dw, *p++) < 0) { oom = true; break; }
                 }
+                if (oom) break;
                 if (*p == q) p++;
                 continue;
             }
-            if (sb_putc(&dw, *p++) < 0) return found;
+            if (sb_putc(&dw, *p++) < 0) { oom = true; break; }
         }
-        if (dw.len == 0) return found;         /* `<<` with no word */
+        if (oom || dw.len == 0) break;  /* `<<` with no word */
         if (!tagged) {
             sp->delim = shell_strdup(dw.p);
-            if (!sp->delim) return found;
-            found++;
+            if (!sp->delim) break;
+            ntop++;
         }
         /* Keep scanning from here. The for-header's p++ would skip the
          * character the delimiter scan stopped on, so step back one. */
         p--;
     }
+    /* the line's own, after every substitution's */
+    for (int k = 0; k < ntop && found < max; k++) out[found++] = top[k];
     return found;
 }
 
@@ -15974,6 +16033,14 @@ static bool shell_collect_line_heredocs(const char *line, const char *from,
         if (ids[i] < 0) { shell_heredoc_specs_free(hd, nhd); return false; }
     }
     shell_heredoc_specs_free(hd, nhd);
+    /* The bodies were read in bash's order -- a same-line `$( )`'s first
+     * (shell_line_find_heredocs) -- and the tags go in where the words
+     * stand, left to right. */
+    for (int i = 1; i < nhd; i++)
+        for (int k = i; k > 0 && hd[k].word_off < hd[k - 1].word_off; k--) {
+            struct shell_heredoc_spec t = hd[k]; hd[k] = hd[k - 1]; hd[k - 1] = t;
+            int ti = ids[k]; ids[k] = ids[k - 1]; ids[k - 1] = ti;
+        }
     size_t base = (size_t)(from - line);
     size_t ll = strlen(line);
     char *out = (char *)kmalloc(ll + (size_t)nhd * 16 + 1);
@@ -18211,6 +18278,11 @@ static unsigned long g_reader_syn_base;
  * p23, p69). A compound inside the body is printed in bash's own layout,
  * which this does not reproduce -- lists of simple commands are exact. */
 static bool g_reader_comsub_lines;
+/* One command of a script read from standard input: its lines count on
+ * from the G_READER_STDIN_LINE lines read before it (shell_run_stdin_unit_
+ * hosted). */
+static bool g_reader_stdin_unit;
+static unsigned long g_reader_stdin_line;
 
 static int shell_run_script_text_in(char *text, bool run_exit_trap);
 
@@ -18231,6 +18303,8 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     bool syn_base_set = g_reader_syn_base_set;
     unsigned long syn_base = g_reader_syn_base;
     bool comsub_lines = g_reader_comsub_lines;
+    bool stdin_unit = g_reader_stdin_unit;
+    g_reader_stdin_unit = false;
     bool nofork_scope = g_reader_nofork_scope;
     g_reader_nofork_scope = false;
     g_reader_syn_iname = 0;
@@ -18282,6 +18356,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     g_noexec_error = 0;
     g_shell_lineno = ((eval_mode || comsub_lines) && saved_lineno > 0)
                          ? saved_lineno - 1 : 0;
+    if (stdin_unit) g_shell_lineno = g_reader_stdin_line;
     /* bash's reader notifies as it takes the FIRST line too: an eval
      * string's names the eval's own line, a sourced file's its line 1
      * (logs/b12 p99, WSL bash). tsh notified only after a line. */
@@ -34991,15 +35066,23 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                     if (hd_snap) shell_hd_snap_restore(hd_snap);
                     if (!hd_text && !hd_bad) return -1;
                 } else {
+                    /* NO BODY CAME -- the input ended first: the document is
+                     * EMPTY and the command runs, as bash's does once its
+                     * reader has warned "delimited by end-of-file" (the
+                     * grammar check says that here). tsh refused the command
+                     * with "here-document body missing", a line bash never
+                     * prints: `` t=`cat <<EOF` `` with the body after the
+                     * line, which bash does not gather for a backquote
+                     * (logs/b17 hdcs h9). */
                     if (g_heredoc_head >= g_heredoc_count) {
                         if (hd_snap) shell_hd_snap_restore(hd_snap);
-                        kprintf(SH_PFX_SHELL "here-document body missing\n");
-                        return -1;
+                        hd_text = "";
+                    } else {
+                        const struct shell_heredoc *h = shell_heredoc_take(&hd_bad);
+                        if (hd_snap) shell_hd_snap_restore(hd_snap);
+                        if (!h && !hd_bad) return -1;
+                        if (h) hd_text = h->body;
                     }
-                    const struct shell_heredoc *h = shell_heredoc_take(&hd_bad);
-                    if (hd_snap) shell_hd_snap_restore(hd_snap);
-                    if (!h && !hd_bad) return -1;
-                    if (h) hd_text = h->body;
                 }
                 if (hd_bad) {
                     if (shell_add_redir(cur, SH_RD_FAILED, fd, 0, 0, -1) < 0)
@@ -46458,7 +46541,91 @@ void shell_set_var_hosted(const char *name, const char *value) {
  * The first REPL version ran only the quote walker, so `if true` at a
  * prompt executed immediately and errored instead of prompting PS2.
  * 0 complete, 1 join-with-newline, 2 backslash continuation. */
+#ifdef SHELL_HOSTED
+/* A READER'S TEXT WITHOUT ITS HERE-DOCUMENTS' BODIES, and whether a body is
+ * still owed -- its delimiter line has not come. A body is data: an
+ * apostrophe in one is no open quote, and an `if` no compound. 0 when out
+ * of memory (the caller then looks at the text as it is). Lines that a
+ * quoted string spans from an earlier line open no here-document. */
+static char *shell_text_strip_heredoc_bodies(const char *s, bool *pending) {
+    *pending = false;
+    SH_SB(out);
+    SH_SB(lb);
+    struct shell_heredoc_spec *q = 0;
+    int nq = 0, qcap = 0, qh = 0;
+    struct shell_scan scan;
+    shell_scan_init(&scan);
+    bool oom = false;
+    for (const char *p = s; *p && !oom; ) {
+        size_t n = 0;
+        while (p[n] && p[n] != '\n') n++;
+        sb_truncate(&lb, 0);
+        if (sb_putmem(&lb, p, n) < 0) { oom = true; break; }
+        const char *line = lb.p ? lb.p : "";
+        if (qh < nq) {                            /* a body's line */
+            if (shell_heredoc_line_matches(line, q[qh].delim, q[qh].strip_tabs)) {
+                kfree(q[qh].delim);
+                q[qh].delim = 0;
+                qh++;
+            }
+        } else {
+            bool in_str = scan.in_sq || scan.in_dq;
+            if (sb_putmem(&out, p, n) < 0 || (p[n] && sb_putc(&out, '\n') < 0)) {
+                oom = true;
+                break;
+            }
+            if (!in_str) {
+                int maxhd = 0;
+                for (const char *c = line; c[0] && c[1]; c++)
+                    if (c[0] == '<' && c[1] == '<') maxhd++;
+                if (maxhd > 0) {
+                    if (nq + maxhd > qcap) {
+                        int nc = (nq + maxhd) * 2;
+                        struct shell_heredoc_spec *nqv = (struct shell_heredoc_spec *)
+                            kmalloc((size_t)nc * sizeof *nqv);
+                        if (!nqv) { oom = true; break; }
+                        for (int k = 0; k < nq; k++) nqv[k] = q[k];
+                        kfree(q);
+                        q = nqv;
+                        qcap = nc;
+                    }
+                    nq += shell_line_find_heredocs(line, q + nq, maxhd);
+                }
+            }
+            shell_scan_line(&scan, line);
+        }
+        p += n + (p[n] ? 1 : 0);
+    }
+    *pending = !oom && qh < nq;
+    for (int k = qh; k < nq; k++) kfree(q[k].delim);
+    kfree(q);
+    if (oom) return 0;
+    char *r = sb_steal(&out);
+    return r ? r : shell_strdup("");
+}
+#endif
+
+int shell_line_incomplete_text(const char *s);
+
+/* A HERE-DOCUMENT WHOSE BODY HAS NOT COME YET IS AN INCOMPLETE LINE -- for
+ * the reader of a script on stdin (`cmd | tsh`) and of the prompt, which
+ * reads on, as bash's parser does, until every delimiter line has: it ran
+ * `cat <<EOF` alone, with no body, and the body's lines as commands. The
+ * bodies are no part of what shell_line_incomplete_text looks at. A
+ * script's own reader collects bodies itself and asks the text alone
+ * (shell_hist_unit: a body is never history-expanded). */
 int shell_line_incomplete_hosted(const char *s) {
+#ifdef SHELL_HOSTED
+    bool hd_pending = false;
+    char *hd_free __attribute__((cleanup(shell_kfree_ptr))) =
+        shell_text_strip_heredoc_bodies(s, &hd_pending);
+    if (hd_pending) return 1;
+    if (hd_free) s = hd_free;
+#endif
+    return shell_line_incomplete_text(s);
+}
+
+int shell_line_incomplete_text(const char *s) {
     int inc = shell_line_incomplete(s);
     if (inc) return inc;
     struct shell_scan scan;
@@ -46927,6 +47094,41 @@ int shell_run_line_hosted(const char *text) {
      * is worse than one that does nothing. The flag is the source of truth
      * (a subshell frame restores the saved flow on the way out and would
      * otherwise swallow the interrupt), so it is cleared last and here. */
+    if (g_shell_flow == SHELL_FLOW_INTERRUPT) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        rc = 130;
+    } else if (g_shell_flow == SHELL_FLOW_DISCARD) {
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+        rc = 1;
+    }
+    (void)shell_take_interrupt();
+    return rc;
+}
+
+/* ONE COMMAND OF A SCRIPT READ FROM STANDARD INPUT -- `cmd | tsh`, `tsh <
+ * file` -- which bash reads as its main script, a command at a time: the
+ * lines counted from the start of the input (LINES came before this
+ * command), errors named "SHELL: line N:", history as the main script's,
+ * the EXIT trap when the script ends. Each command ran as a -c string of
+ * its own instead: a lone program as the last command of its line was
+ * EXEC'd in place (bash's ONESHOT), so `printf 'echo a\n/bin/echo b\necho
+ * c\n' | tsh` never said c; the EXIT trap ran after every line; and an
+ * error said "tsh: -c: line 1:" whatever the line (logs/b17 stdinhd). */
+int shell_run_stdin_unit_hosted(const char *text, unsigned long lines) {
+    if (!text) return 0;
+    char *copy = shell_strdup(text);
+    if (!copy) return 2;
+    g_reader_stdin_unit = true;
+    g_reader_stdin_line = lines;
+    g_reader_main_script = true;              /* see hist_reader */
+    int rc = shell_run_script_text(copy, false);
+    g_reader_main_script = false;
+    kfree(copy);
+    /* the script has ended -- `exit`, set -e, a syntax error: its trap */
+    if (g_shell_flow == SHELL_FLOW_EXIT)
+        (void)shell_run_exit_trap(g_shell_flow_status);
     if (g_shell_flow == SHELL_FLOW_INTERRUPT) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;

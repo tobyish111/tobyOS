@@ -860,7 +860,7 @@ static int shell_hist_preprocess(const char *line, char qs, struct shell_sb *out
     return 1;
 }
 
-int shell_line_incomplete_hosted(const char *s);
+int shell_line_incomplete_text(const char *s);
 
 /* A SCRIPT's command, read as bash reads it with expansion on: its lines,
  * from SRC, each expanded in the quote the one before left open, and
@@ -892,7 +892,7 @@ static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used)
         }
         if (sb_puts(out, r > 0 ? (xl.p ? xl.p : "") : phys.p) < 0) break;
         g_shell_lineno++;
-        bool more = nl && src[pos] && shell_line_incomplete_hosted(out->p);
+        bool more = nl && src[pos] && shell_line_incomplete_text(out->p);
         if (nl && sb_putc(out, '\n') < 0) break;
         if (!more) break;
     }
