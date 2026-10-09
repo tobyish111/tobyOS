@@ -7263,6 +7263,9 @@ struct sh_array {
     /* One of bash's dynamic arrays while it still is one (SH_DYN_*), else
      * 0: built when it is read by name. See sh_dynarr_rebuild. */
     unsigned char dyn;
+    /* The id of the open subshell frame this array's contents were last
+     * kept in (sh_array_touch); 0 = none. */
+    uint64_t cow;
 };
 
 #define SH_DYN_ALIASES  1
@@ -7322,6 +7325,7 @@ static struct sh_array *sh_array_find_literal(const char *name) {
 }
 
 static void sh_array_unset_at(struct sh_array *a);
+static void sh_array_touch(struct sh_array *a);
 
 /* Drop the array under exactly this name. See sh_array_find_literal. */
 static void sh_array_unset_literal(const char *name) {
@@ -7345,6 +7349,7 @@ static int sh_array_literal_commit(const char *tmp, const char *name,
                                    bool append) {
     struct sh_array *t = sh_array_find_literal(tmp);
     if (!t) return -1;
+    sh_array_touch(t);
     sh_array_clear_novalue(name);
     {
         unsigned at = shell_value_attrs(name);
@@ -7492,6 +7497,7 @@ static void sh_array_unset_idx(struct sh_array *a, long idx) {
     if (!a) return;
     int i = sh_arr_find_idx(a, idx);
     if (i < 0) return;
+    sh_array_touch(a);
     kfree(a->e[i].key);
     kfree(a->e[i].val);
     for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
@@ -7504,6 +7510,7 @@ static void sh_array_unset_at(struct sh_array *a) {
     for (int j = 0; j < g_narrays; j++)
         if (g_arrays[j] == a) { slot = j; break; }
     if (slot < 0) return;
+    sh_array_touch(a);
     for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
     kfree(a->e);
     kfree(a->name);
@@ -7525,6 +7532,7 @@ static int sh_array_set(const char *name, long idx, const char *val) {
     if (idx < 0) return -1;
     struct sh_array *a = sh_array_create(name);
     if (!a) return -1;
+    sh_array_touch(a);
     size_t vn = strlen(val) + 1;
     char *copy = (char *)kmalloc(vn);
     if (!copy) return -1;
@@ -7566,10 +7574,29 @@ struct sh_array_snap {
     struct sh_array copy;       /* its name, kind and elements, deep */
 };
 
+/* ...AND THE COPY IS MADE ON FIRST WRITE. Capturing copied every element of
+ * every array, so each `( )` and `$( )` cost the size of all the arrays the
+ * shell held -- 200 substitutions beside a 20000-element array took tsh
+ * 0.35 s more than without it, where bash's fork costs nothing per element
+ * (finding 41; logs/b17 audit). Now a frame records which arrays there were,
+ * in their order, and an array is copied the first time something inside
+ * the frame changes it (sh_array_touch, which every write goes through).
+ * The restore is what it was: one that existed gets its contents back in
+ * place, one made inside goes, one unset inside is made again. Frames nest;
+ * a frame dropped without a restore -- its changes kept -- hands its copies
+ * to the frame around it, which must still be able to undo them. */
 struct shell_array_frame {
-    struct sh_array_snap *s;
+    struct sh_array **rec;      /* the records at capture, in order */
     int n;
+    struct sh_array_snap *s;    /* the copies taken inside, first write each */
+    int ns, cap;
+    uint64_t id;
+    struct shell_array_frame *prev;     /* the frame around this one */
+    bool open;
 };
+
+static struct shell_array_frame *g_arr_frame;     /* the innermost open one */
+static uint64_t g_arr_frame_seq;
 
 static void sh_array_contents_free(struct sh_array *a) {
     for (int i = 0; i < a->n; i++) { kfree(a->e[i].key); kfree(a->e[i].val); }
@@ -7592,6 +7619,7 @@ static int sh_array_copy_into(struct sh_array *dst, const struct sh_array *src) 
     dst->assoc = src->assoc;
     dst->nbuckets = src->nbuckets;
     dst->dyn = src->dyn;
+    dst->cow = src->cow;
     dst->name = sh_array_strdup(src->name ? src->name : "");
     if (!dst->name) return -1;
     if (src->n > 0) {
@@ -7614,29 +7642,29 @@ static int sh_array_copy_into(struct sh_array *dst, const struct sh_array *src) 
     return 0;
 }
 
-static void shell_array_frame_clear(struct shell_array_frame *f) {
-    if (!f) return;
-    for (int i = 0; i < f->n; i++) sh_array_contents_free(&f->s[i].copy);
-    kfree(f->s);
-    f->s = 0;
-    f->n = 0;
-}
-
-static int shell_array_frame_capture(struct shell_array_frame *f) {
-    f->s = 0;
-    f->n = 0;
-    if (g_narrays == 0) return 0;
-    f->s = (struct sh_array_snap *)kmalloc((size_t)g_narrays * sizeof *f->s);
-    if (!f->s) return -1;
-    for (int i = 0; i < g_narrays; i++) {
-        f->s[i].rec = g_arrays[i];
-        if (sh_array_copy_into(&f->s[i].copy, g_arrays[i]) < 0) {
-            shell_array_frame_clear(f);
-            return -1;
-        }
-        f->n = i + 1;
+/* Keep a copy of A's contents in the open frame before they change -- once
+ * per frame. A failure to copy is reported: the subshell's change would
+ * then outlive it. */
+static void sh_array_touch(struct sh_array *a) {
+    struct shell_array_frame *f = g_arr_frame;
+    if (!a || !f || a->cow == f->id) return;
+    if (f->ns >= f->cap) {
+        int ncap = f->cap ? f->cap * 2 : 8;
+        struct sh_array_snap *ns =
+            (struct sh_array_snap *)kmalloc((size_t)ncap * sizeof *ns);
+        if (!ns) { kprintf("subshell: cannot save an array\n"); return; }
+        if (f->ns) memcpy(ns, f->s, (size_t)f->ns * sizeof *ns);
+        kfree(f->s);
+        f->s = ns;
+        f->cap = ncap;
     }
-    return 0;
+    if (sh_array_copy_into(&f->s[f->ns].copy, a) < 0) {
+        kprintf("subshell: cannot save an array\n");
+        return;
+    }
+    f->s[f->ns].rec = a;
+    f->ns++;
+    a->cow = f->id;
 }
 
 static bool sh_array_rec_live(const struct sh_array *a) {
@@ -7644,20 +7672,99 @@ static bool sh_array_rec_live(const struct sh_array *a) {
     return false;
 }
 
+/* Take F out of the chain of open frames. */
+static void shell_array_frame_unlink(struct shell_array_frame *f) {
+    if (!f->open) return;
+    f->open = false;
+    for (struct shell_array_frame **pp = &g_arr_frame; *pp; pp = &(*pp)->prev)
+        if (*pp == f) { *pp = f->prev; break; }
+}
+
+/* Drop the frame and KEEP what was done inside it. Each copy it took of an
+ * array the frame around it has not copied goes to that frame: the change
+ * happened inside it too. */
+static void shell_array_frame_clear(struct shell_array_frame *f) {
+    if (!f) return;
+    bool was_open = f->open;
+    shell_array_frame_unlink(f);
+    struct shell_array_frame *o = was_open ? f->prev : 0;
+    for (int i = 0; i < f->ns; i++) {
+        struct sh_array_snap *sn = &f->s[i];
+        bool live = sh_array_rec_live(sn->rec);
+        if (o && sn->copy.cow != o->id) {
+            if (o->ns >= o->cap) {
+                int ncap = o->cap ? o->cap * 2 : 8;
+                struct sh_array_snap *ns =
+                    (struct sh_array_snap *)kmalloc((size_t)ncap * sizeof *ns);
+                if (ns) {
+                    if (o->ns) memcpy(ns, o->s, (size_t)o->ns * sizeof *ns);
+                    kfree(o->s);
+                    o->s = ns;
+                    o->cap = ncap;
+                }
+            }
+            if (o->ns < o->cap) {
+                o->s[o->ns++] = *sn;
+                memset(&sn->copy, 0, sizeof sn->copy);
+                if (live) sn->rec->cow = o->id;
+                continue;
+            }
+            kprintf("subshell: cannot save an array\n");
+        }
+        if (live) sn->rec->cow = o ? o->id : 0;
+        sh_array_contents_free(&sn->copy);
+    }
+    kfree(f->s);
+    kfree(f->rec);
+    f->s = 0;
+    f->rec = 0;
+    f->n = f->ns = f->cap = 0;
+}
+
+static int shell_array_frame_capture(struct shell_array_frame *f) {
+    memset(f, 0, sizeof *f);
+    if (g_narrays > 0) {
+        f->rec = (struct sh_array **)kmalloc((size_t)g_narrays * sizeof *f->rec);
+        if (!f->rec) return -1;
+        memcpy(f->rec, g_arrays, (size_t)g_narrays * sizeof *f->rec);
+    }
+    f->n = g_narrays;
+    f->id = ++g_arr_frame_seq;
+    f->prev = g_arr_frame;
+    f->open = true;
+    g_arr_frame = f;
+    return 0;
+}
+
 static void shell_array_frame_restore(struct shell_array_frame *f) {
     if (!f) return;
+    if (!f->open) { shell_array_frame_clear(f); return; }
+    /* Nothing below is a change to keep: no frame takes copies of it. */
+    struct shell_array_frame *outer = f->prev;
+    shell_array_frame_unlink(f);
+    struct shell_array_frame *saved_top = g_arr_frame;
+    g_arr_frame = 0;
     /* Everything that can fail first, so a failure changes nothing. */
     int cap = f->n > 64 ? f->n : 64;
     struct sh_array **nt = (struct sh_array **)kmalloc((size_t)cap * sizeof *nt);
-    if (!nt) { shell_array_frame_clear(f); return; }
+    if (!nt) {
+        g_arr_frame = saved_top;
+        f->open = true;
+        f->prev = outer;
+        shell_array_frame_clear(f);     /* hands its copies outward */
+        return;
+    }
     for (int i = 0; i < f->n; i++) {
-        nt[i] = sh_array_rec_live(f->s[i].rec) ? f->s[i].rec : 0;
+        nt[i] = sh_array_rec_live(f->rec[i]) ? f->rec[i] : 0;
         if (!nt[i]) {                       /* unset in the subshell */
             nt[i] = (struct sh_array *)kmalloc(sizeof **nt);
             if (!nt[i]) {
                 for (int k = 0; k < i; k++)
                     if (!sh_array_rec_live(nt[k])) kfree(nt[k]);
                 kfree(nt);
+                g_arr_frame = saved_top;
+                f->open = true;
+                f->prev = outer;
                 shell_array_frame_clear(f);
                 return;
             }
@@ -7667,21 +7774,32 @@ static void shell_array_frame_restore(struct shell_array_frame *f) {
     /* Arrays the subshell created go. */
     for (int j = 0; j < g_narrays; ) {
         bool kept = false;
-        for (int i = 0; i < f->n; i++) if (f->s[i].rec == g_arrays[j]) { kept = true; break; }
+        for (int i = 0; i < f->n; i++) if (f->rec[i] == g_arrays[j]) { kept = true; break; }
         if (kept) { j++; continue; }
         sh_array_unset_at(g_arrays[j]);
     }
-    /* The rest get their old contents, in their old order. */
-    for (int i = 0; i < f->n; i++) {
+    /* The ones it changed get their old contents, in place. */
+    for (int k = 0; k < f->ns; k++) {
+        int i = -1;
+        for (int q = 0; q < f->n; q++) if (f->rec[q] == f->s[k].rec) { i = q; break; }
+        if (i < 0) {                        /* made inside: gone above */
+            sh_array_contents_free(&f->s[k].copy);
+            continue;
+        }
         sh_array_contents_free(nt[i]);
-        *nt[i] = f->s[i].copy;
-        memset(&f->s[i].copy, 0, sizeof f->s[i].copy);
+        *nt[i] = f->s[k].copy;
+        memset(&f->s[k].copy, 0, sizeof f->s[k].copy);
     }
     kfree(g_arrays);
     g_arrays = nt;
     g_narrays = f->n;
     g_arrays_cap = cap;
-    shell_array_frame_clear(f);
+    g_arr_frame = saved_top;
+    kfree(f->s);
+    kfree(f->rec);
+    f->s = 0;
+    f->rec = 0;
+    f->n = f->ns = f->cap = 0;
 }
 
 /* Evaluate an array SUBSCRIPT.
@@ -8036,6 +8154,7 @@ static int sh_subscript_value(const char *sub, long *outv) {
 static int sh_array_make_assoc(const char *name) {
     struct sh_array *a = sh_array_create(name);
     if (!a) return -1;
+    sh_array_touch(a);
     a->assoc = true;
     return 0;
 }
@@ -8112,6 +8231,7 @@ static unsigned sh_assoc_nbuckets(const struct sh_array *a) {
  * its head, every item pushed onto the head of its new bucket -- so each
  * new bucket holds its items in REVERSE of the old walk. */
 static bool sh_assoc_rehash(struct sh_array *a, unsigned nb) {
+    sh_array_touch(a);
     int *cnt = (int *)kmalloc((size_t)nb * sizeof(int));
     struct sh_arr_elem *ne =
         (struct sh_arr_elem *)kmalloc((size_t)(a->cap > 0 ? a->cap : 1) * sizeof *ne);
@@ -8182,6 +8302,7 @@ static int sh_assoc_find(const struct sh_array *a, const char *key) {
 }
 
 static int sh_assoc_put(struct sh_array *a, const char *key, const char *val) {
+    sh_array_touch(a);
     size_t vn = strlen(val) + 1;
     char *copy = (char *)kmalloc(vn);
     if (!copy) return -1;
@@ -8229,6 +8350,7 @@ static void sh_array_unset_key(struct sh_array *a, const char *key) {
     if (!a) return;
     int i = sh_assoc_find(a, key);
     if (i < 0) return;
+    sh_array_touch(a);
     kfree(a->e[i].key);
     kfree(a->e[i].val);
     for (int j = i; j + 1 < a->n; j++) a->e[j] = a->e[j + 1];
@@ -22624,6 +22746,7 @@ static void phash_insert(const char *name, const char *path, int hits,
 static char **g_dirstack;         /* see DIRSTACK below */
 static int    g_dirstack_n;
 static void sh_array_put_idx(struct sh_array *a, long idx, const char *val) {
+    sh_array_touch(a);
     if (!sh_array_reserve(a)) return;
     char *v = shell_strdup(val ? val : "");
     if (!v) return;
@@ -22634,6 +22757,7 @@ static void sh_array_put_idx(struct sh_array *a, long idx, const char *val) {
 }
 
 static void sh_array_clear_elems(struct sh_array *a) {
+    sh_array_touch(a);
     for (int i = 0; i < a->n; i++) {
         kfree(a->e[i].key);
         kfree(a->e[i].val);
@@ -22704,6 +22828,7 @@ static void sh_dynarr_rebuild(struct sh_array *a) {
     }
     const struct sh_htab *t = a->dyn == SH_DYN_ALIASES ? &g_alias_tab : &g_phash;
     g_dynarr_busy = true;
+    sh_array_touch(a);
     for (int i = 0; i < a->n; i++) {
         kfree(a->e[i].key);
         kfree(a->e[i].val);
