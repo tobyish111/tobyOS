@@ -26379,6 +26379,11 @@ static void shell_capture_kputc(void *ctx, char c) {
  * merely decremented -- across command substitution, whose body is a fresh
  * script with its own quoting context. */
 static int g_dq_depth;
+/* ...and whether the word being expanded sits inside double quotes at all:
+ * bash's parser flag P_DQUOTE, which a pattern's fresh quoting context
+ * (shell_expand_pat_word) clears g_dq_depth for but does not change.
+ * Cleared, like g_dq_depth, for a command substitution's body. */
+static bool g_dq_word;
 
 /* Depth of nested substitutions, so each gets its own spill file. */
 static int g_capture_depth;
@@ -27146,9 +27151,12 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
     SH_SB(out);
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
+    bool saved_dqw = g_dq_word;
     g_dq_depth = 0;
+    g_dq_word = false;
     int crc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
+    g_dq_word = saved_dqw;
     if (crc < 0) return -1;
     return sb_put_data_n(b, out.p, out.len);
 }
@@ -27213,9 +27221,12 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     /* The body is a fresh script. Whatever quotes enclose the backticks do not
      * enclose the commands inside them. */
     int saved_dq = g_dq_depth;
+    bool saved_dqw = g_dq_word;
     g_dq_depth = 0;
+    g_dq_word = false;
     int rc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
+    g_dq_word = saved_dqw;
     if (rc < 0) return -1;
     return sb_putmem(b, out.p, out.len);
 }
@@ -27829,10 +27840,23 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
          *
          * Without it the pattern was the six characters `$'b'*`, which match
          * nothing. The escape set is the tokenizer's; the result is quoted, so
-         * it is wrapped in no-split marks like any other quoted span. */
+         * it is wrapped in no-split marks like any other quoted span.
+         *
+         * ...EXCEPT IN A ${x-WORD} WORD INSIDE DOUBLE QUOTES: bash's parser
+         * puts the decoded text there as it is, unquoted (parse_matched_pair
+         * with P_DQUOTE outside a pattern's QUOTE state) -- so nested in a
+         * double-quoted pattern it is a pattern, and inside an inner "..."
+         * it is quoted by those; marked, it was quoted in the one and its
+         * marks switched the other's protection off:
+         *
+         *     v='a*b'; echo "${v#${u:-$'a*'}}"        bash: *b    tsh: b
+         *     echo "${v#"${u:-$'a*'}"}"              bash: b     tsh: *b
+         *
+         * (finding 112, logs/b18 dqansi) */
         if (*p == '$' && p[1] == '\'') {
             p += 2;
-            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
+            bool ansi_mark = !(value_word && (g_dq_depth > 0 || g_dq_word));
+            if (ansi_mark && sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             bool stop_nul = false;      /* a NUL ends the word; see below */
             while (*p && *p != '\'') {
                 char c = *p;
@@ -27878,7 +27902,7 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
                     if (sb_putc(out, c) < 0) return -1;
                 }
             }
-            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
+            if (ansi_mark && sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
             continue;
         }
@@ -28023,6 +28047,28 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
  * must print the apostrophe, and the arithmetic evaluator has always been
  * handed its text with quotes intact. Sharing one expander with the ${...}
  * word above is what briefly made both of those wrong. */
+/* A PATTERN OR A REPLACEMENT IS ITS OWN QUOTING CONTEXT. bash expands the
+ * PAT of ${v#PAT}, ${v%PAT}, ${v/PAT/REP} and ${v^PAT}, and the REP, with
+ * the double-quote flags taken off (getpattern's Q_PATQUOTE,
+ * parameter_brace_patsub's quoted & ~Q_DOUBLE_QUOTES): inside "...", a
+ * default word nested in them still reads its single quotes as quotes --
+ *
+ *     v='a*b'; echo "${v#${u:-'a*'}}"     bash: b     tsh: a*b
+ *     echo "${v/a/${u:-'R*'}}"            bash: R**b  tsh: 'R*'*b
+ *
+ * where tsh's nested word asked g_dq_depth, the OUTER quotes' (finding
+ * 112, logs/b18 patdq). */
+static int shell_expand_pat_word(const char *w, struct shell_sb *out) {
+    int saved = g_dq_depth;
+    bool saved_dqw = g_dq_word;
+    if (saved > 0) g_dq_word = true;
+    g_dq_depth = 0;
+    int rc = shell_expand_word_ex(w, out, true, true);
+    g_dq_depth = saved;
+    g_dq_word = saved_dqw;
+    return rc;
+}
+
 /* A PATTERN WORD, after expansion, as the matcher needs it.
  *
  * Quoting makes a metacharacter literal, and shell_expand_word_ex records the
@@ -30202,14 +30248,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             }
 
             SH_SB(patexp);
-            if (shell_expand_word_ex(patraw.p, &patexp, true, true) < 0)
+            if (shell_expand_pat_word(patraw.p, &patexp) < 0)
                 return -1;
             SH_SB(patb);
             if (shell_pattern_from_marked(patexp.p, &patb) < 0) return -1;
             const char *pattern = patb.p;
             const char *pat_end = patb.p + patb.len;
             SH_SB(repl);
-            if (shell_expand_word_ex(rep, &repl, true, true) < 0)
+            if (shell_expand_pat_word(rep, &repl) < 0)
                 return -1;
             shell_strip_nosplit_inplace(repl.p);
             size_t rlen = strlen(repl.p);
@@ -30335,7 +30381,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             SH_SB(patbuf);
             const char *pattern = 0, *pat_end = 0;
             if (*op) {
-                if (shell_expand_word_ex(op, &patraw, true, true) < 0) return -1;
+                if (shell_expand_pat_word(op, &patraw) < 0) return -1;
                 if (shell_pattern_from_marked(patraw.p, &patbuf) < 0) return -1;
                 pattern = patbuf.p;
                 pat_end = patbuf.p + patbuf.len;
@@ -30414,7 +30460,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * from the `${x:-WORD}` rule, where inside double quotes a single
              * quote is an ordinary byte, so this cannot share
              * shell_expand_param_word's answer. */
-            if (shell_expand_word_ex(op, &patraw, true, true) < 0)
+            if (shell_expand_pat_word(op, &patraw) < 0)
                 return -1;
             SH_SB(patbuf);
             if (shell_pattern_from_marked(patraw.p, &patbuf) < 0) return -1;
