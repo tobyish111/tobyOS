@@ -6,6 +6,7 @@
 #include <tobyos/shell.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/perf.h>
 
 #define TSH_LINE_MAX 256u
 
@@ -27,27 +28,55 @@ static size_t           g_len;
  *
  * Now everything -- the shell's output, the echo of typed keys, prompts --
  * collects here and is flushed by tsh_flush(): at the end of each poll pass,
- * before a close, and whenever the buffer fills. One send, one round trip. */
+ * before a close, and whenever the buffer fills. One send, one round trip.
+ *
+ * WHAT DID NOT GO STAYS. The flush was one tcp_send() of the buffer, and the
+ * buffer was emptied whatever it returned: when a segment could not be queued
+ * (-1 -- tcp_send waits for the window but not for a free pending slot) the
+ * command's whole output was lost with the connection still up -- kbigpipe p4
+ * on the EliteDesk, 98 bytes (finding 43). Now the buffer goes out through
+ * tcp_send_nb(), which says how much it took; the rest stays queued for the
+ * next poll pass, which sends it whether or not the client typed anything.
+ * Only a full buffer (the command is still writing) and a closing session
+ * WAIT for room, and that wait is bounded: a connection that takes nothing
+ * for TSH_SEND_WAIT_MS is reported and its queue dropped, as before. */
 #define TSH_OUT_MAX 4096u
+#define TSH_SEND_WAIT_MS 30000u
 static char   g_out[TSH_OUT_MAX];
 static size_t g_out_len;
 static bool   g_out_failed;
 
-static void tsh_flush(void) {
+static void tsh_flush_ex(bool wait) {
     if (!g_cli || g_out_len == 0) { g_out_len = 0; return; }
-    long w = tcp_send(g_cli, g_out, g_out_len);
-    if (w <= 0 && !g_out_failed) {
-        g_out_failed = true;              /* once per client, not per byte */
-        kprintf("[tcp-shell] send failed/stalled (rc=%ld, %u bytes)\n",
-                w, (unsigned)g_out_len);
+    size_t off = 0;
+    long w = 0;
+    uint64_t dl = perf_now_ns() + (uint64_t)TSH_SEND_WAIT_MS * 1000000ull;
+    while (off < g_out_len) {
+        w = tcp_send_nb(g_cli, g_out + off, g_out_len - off);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0) break;                       /* the connection is gone */
+        if (!wait) break;                       /* the next pass sends it */
+        if (perf_now_ns() >= dl) break;
+        if (tcp_wait_sendable(g_cli, 100) < 0) { w = -1; break; }
     }
-    g_out_len = 0;
+    if (off < g_out_len && (w < 0 || wait)) {
+        if (!g_out_failed) {
+            g_out_failed = true;          /* once per client, not per byte */
+            kprintf("[tcp-shell] send failed/stalled (rc=%ld, %u bytes "
+                    "dropped)\n", w, (unsigned)(g_out_len - off));
+        }
+        off = g_out_len;
+    }
+    if (off) memmove(g_out, g_out + off, g_out_len - off);
+    g_out_len -= off;
 }
+
+static void tsh_flush(void) { tsh_flush_ex(false); }
 
 static void tsh_out(const char *s) {
     if (!g_cli || !s) return;
     for (; *s; s++) {
-        if (g_out_len == TSH_OUT_MAX) tsh_flush();
+        if (g_out_len == TSH_OUT_MAX) tsh_flush_ex(true);
         g_out[g_out_len++] = *s;
     }
 }
@@ -98,6 +127,9 @@ void tcp_shell_poll(void) {
         }
     }
 
+    /* What an earlier pass could not send goes first, typed key or not. */
+    if (g_out_len) tsh_flush();
+
     uint8_t chunk[256];
     /* QUIET: this is a poller. tcp_recv logs "[tcp] RECV-TIMEOUT" on every
      * empty poll -- twice a millisecond while a client sat connected, far
@@ -136,7 +168,9 @@ void tcp_shell_poll(void) {
                  * for the next connection. */
                 if (shell_take_exit_request()) {
                     tsh_out("exit\r\n");
-                    tsh_flush();
+                    tsh_flush_ex(true);
+                    /* the FIN takes a pending slot of its own */
+                    (void)tcp_wait_sendable(g_cli, 5000);
                     kprintf("[tcp-shell] client ended the session (exit)\n");
                     tcp_close(g_cli);
                     g_cli = NULL;

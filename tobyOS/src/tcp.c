@@ -1749,6 +1749,26 @@ long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len) {
     return (long)sent;                            /* 0 == would block */
 }
 
+/* Room for tcp_send_nb to take a byte: the window AND a pending slot. The
+ * slots are the half tcp_send's own wait leaves out -- four small segments
+ * still unacknowledged fill them with the window nearly empty, and its next
+ * segment fails to queue (-1). */
+static int pred_sendable(const struct tcp_conn *c) {
+    if (!c->in_use || c->remote_rst_seen || c->state == TCP_CLOSED) return -2;
+    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT) return -2;
+    size_t wnd = c->cwnd_bytes < (size_t)c->snd_wnd
+                   ? c->cwnd_bytes : (size_t)c->snd_wnd;
+    if (pend_flight_bytes(c) >= wnd) return 0;
+    return pend_alloc((struct tcp_conn *)c) >= 0 ? 1 : 0;
+}
+
+int tcp_wait_sendable(struct tcp_conn *c, uint32_t timeout_ms) {
+    if (!c || !c->in_use) return -1;
+    uint64_t dl = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+    int r = tcp_poll_until(c, dl, pred_sendable);
+    return r == 1 ? 1 : r == 0 ? 0 : -1;
+}
+
 static int pred_recv(const struct tcp_conn *c) {
     if (c->rx_count > 0) return 1;
     if (c->remote_rst_seen) return -2;

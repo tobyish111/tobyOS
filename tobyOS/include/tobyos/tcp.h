@@ -100,6 +100,11 @@ void tcp6_icmp_error(uint16_t local_port_be, const struct ipv6_addr *peer,
  * until everything is acknowledged, which stalls an epoll-driven caller. */
 long tcp_send_nb(struct tcp_conn *c, const void *buf, size_t len);
 
+/* Wait, at most TIMEOUT_MS, until tcp_send_nb can take at least a byte:
+ * 1 = it can, 0 = timed out, -1 = the connection is gone. Runs the stack
+ * (RX, retransmits) while it waits, as the blocking calls do. */
+int tcp_wait_sendable(struct tcp_conn *c, uint32_t timeout_ms);
+
 /* Local/remote endpoint of a connection (network byte order), for
  * getsockname/getpeername. */
 uint16_t tcp_local_port_be(const struct tcp_conn *c);
