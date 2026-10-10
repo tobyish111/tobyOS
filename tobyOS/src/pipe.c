@@ -23,6 +23,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/vfs.h>
+#include <tobyos/perf.h>
 #include <tobyos/abi/abi.h>
 
 /* ---- wait-queue helpers ----------------------------------------- */
@@ -53,6 +54,48 @@ static void wq_wake_all(struct proc **head) {
      * exactly the event a parked poll/select/epoll waiter is waiting
      * for -- tell them instead of letting the timer sweep find it. */
     poll_event_notify();
+}
+
+/* Take `p` off whatever queue it is still on (a deadline woke it, not
+ * wq_wake_all) -- signal.c's wait_queue_unlink, for this file's queues. */
+static void wq_unlink(struct proc *p) {
+    if (!p || !p->wait_head) return;
+    struct proc **slot = p->wait_head;
+    while (*slot && *slot != p) slot = &(*slot)->next_wait;
+    if (*slot == p) *slot = p->next_wait;
+    p->next_wait = 0;
+    p->wait_head = 0;
+}
+
+/* PARK THE CALLER ON *HEAD UNTIL A WAKE -- and pid 0 the way it waits for a
+ * foreground command (proc.c pid0_serviced_wait). The kernel shell runs in
+ * pid 0, and its own FIFO redirections wait here: for the other end
+ * (fifo_open), for data (pipe_read), for room (pipe_write). A plain block
+ * stopped pid 0's duties -- the watchdog, the network, SSH, the poll
+ * waiters -- for as long as the other end took (finding 67's shape), which
+ * is why the kernel shell refused a FIFO at all. So pid 0, once the idle
+ * loop runs, does its duties first and then sleeps at most 10 ms on the
+ * queue, leaving it again if the deadline and not a wake ended the sleep;
+ * the caller's loop looks again either way. Everyone else blocks as
+ * before. */
+extern bool g_idle_loop_running;
+extern void kernel_idle_service_nested(void);
+#define PIPE_PID0_SLICE_NS 10000000ull
+
+static void pipe_park(struct proc **head, struct proc *self) {
+    if (self->pid == 0 && g_idle_loop_running) {
+        kernel_idle_service_nested();
+        wq_add(head, self);
+        self->sleep_deadline_ns = perf_now_ns() + PIPE_PID0_SLICE_NS;
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        self->sleep_deadline_ns = 0;
+        wq_unlink(self);
+        return;
+    }
+    wq_add(head, self);
+    self->state = PROC_BLOCKED;
+    sched_yield();
 }
 
 /* ---- pipe lifecycle --------------------------------------------- */
@@ -168,9 +211,7 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
         /* Signal arrived before we even parked? Bail immediately so
          * the syscall return path can deliver it. */
         if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
-        wq_add(&p->wq_read, self);
-        self->state = PROC_BLOCKED;
-        sched_yield();
+        pipe_park(&p->wq_read, self);
         /* Resumed. Two reasons to be back here:
          *   - wq_wake_all woke us (data arrived / writer closed) -- loop
          *     re-checks the predicate, normal case.
@@ -226,9 +267,7 @@ long pipe_write(struct pipe *p, const void *buf, size_t n) {
             if (SIG_SHOULD_EINTR(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
-            wq_add(&p->wq_write, self);
-            self->state = PROC_BLOCKED;
-            sched_yield();
+            pipe_park(&p->wq_write, self);
             if (SIG_SHOULD_EINTR(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
@@ -334,9 +373,7 @@ static bool fifo_wait_other(struct fifo *ff, bool want_writer) {
         uint32_t now = want_writer ? ff->w_opens : ff->r_opens;
         if (other > 0 || now != start) break;
         if (SIG_SHOULD_EINTR(self)) { ff->waiting--; return false; }
-        wq_add(&ff->wq, self);
-        self->state = PROC_BLOCKED;
-        sched_yield();
+        pipe_park(&ff->wq, self);
     }
     ff->waiting--;
     return true;

@@ -36626,17 +36626,32 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         if (dev) return dev;
     }
 #ifndef SHELL_HOSTED
-    /* THE KERNEL SHELL CANNOT OPEN A FIFO. The open waits for the other
-     * end and a read for a writer, and this shell runs on pid 0's poll
-     * loop, which must never wait. Opened as a file it read as empty and
-     * kept what was written in the node itself. /bin/tsh opens one as
-     * bash does. */
+    /* A FIFO IS ITS PIPE (pipe.c fifo_open), opened as bash opens it: `<`
+     * reads, `>` and `>>` write, `<>` both. A reader waits for a writer and
+     * a writer for a reader, as under /bin/tsh -- and this shell runs in
+     * pid 0, so the wait, and every read and write after it, is pid 0's
+     * serviced one (pipe.c pipe_park): its duties between looks of at most
+     * 10 ms, the network and SSH answering meanwhile. It refused a FIFO
+     * ("the kernel shell cannot open a FIFO") for want of that; before
+     * that it opened the node as a file, which read as empty and kept what
+     * was written in it. This shell has no ^C: only the other end ends the
+     * wait, as an SSH session can bring it. */
     {
         struct vfs_stat fst;
-        if (vfs_stat_follow(path, &fst) == VFS_OK &&
+        if (vfs_stat_follow(path, &fst) == VFS_OK && fst.type == VFS_TYPE_FILE &&
             (fst.mode & 0170000u) == 0010000u) {
-            kprintf("%s: the kernel shell cannot open a FIFO\n", path_arg);
-            return 0;
+            struct file *ff = 0;
+            long fr = fifo_open(path, fst.dev, fst.ino,
+                                g_open_rdwr ? 2 : write ? 1 : 0, false, &ff);
+            if (fr < 0 || !ff) {
+                kprintf("%s: %s\n", path_arg,
+                        fr == -ABI_ENFILE ? "Too many open files in system"
+                        : fr == -ABI_ENOMEM ? "Cannot allocate memory"
+                        : "Interrupted system call");
+                return 0;
+            }
+            file_set_open_path(ff, path);
+            return ff;
         }
     }
 #endif
