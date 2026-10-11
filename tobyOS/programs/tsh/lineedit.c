@@ -1845,10 +1845,22 @@ static int vi_command(struct le *s, int c) {
 
 /* ---- the line ------------------------------------------------------------ */
 
+/* ^C AT THE PROMPT echoes "^C" as readline's does: only when the terminal
+ * echoes control characters (ECHOCTL in the termios the line was read
+ * under -- readline's _rl_echoctl), then the line ends and the caller
+ * starts afresh. This printed "^C" whatever the terminal; on this system's
+ * ptys, which have no ECHOCTL, the guest's bash prints none (logs/b22
+ * rawintr). */
+static bool g_le_echoctl;
+static void le_echo_intr(void) {
+    if (g_le_echoctl) outs("^C");
+}
+
 long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
     struct termios orig, raw;
     if (!bufp || !capp) return TSH_LE_EOF;
     if (tcgetattr(0, &orig) != 0) return TSH_LE_EOF;
+    g_le_echoctl = (orig.c_lflag & ECHOCTL) != 0;
     raw = orig;
     /* ICANON off so every keystroke arrives; ECHO off because we paint the
      * line ourselves; ISIG off because ^C belongs to the editor while a line
@@ -1899,7 +1911,7 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
             int r = vi_command(&s, c);
             if (r == VI_ACCEPT) { le_below(&s); ret = (long)s.len; break; }
             if (r == VI_EOF) { le_below(&s); ret = s.len ? (long)s.len : TSH_LE_EOF; break; }
-            if (r == VI_INTR) { outs("^C"); le_below(&s); ret = TSH_LE_INTR; break; }
+            if (r == VI_INTR) { le_echo_intr(); le_below(&s); ret = TSH_LE_INTR; break; }
             if (!s.vcmd) refresh(&s);
             continue;
         }
@@ -1911,7 +1923,7 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
             ret = (long)s.len;
             break;
         }
-        if (c == 3) { outs("^C"); le_below(&s); ret = TSH_LE_INTR; break; }
+        if (c == 3) { le_echo_intr(); le_below(&s); ret = TSH_LE_INTR; break; }
         if (c == 4) {                                   /* ^D */
             if (s.len == 0) { le_below(&s); ret = TSH_LE_EOF; break; }
             if (s.vi) { le_below(&s); ret = (long)s.len; break; }
@@ -1932,7 +1944,7 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
         if (c == 9)  { do_complete(&s); continue; }     /* Tab */
         if (c == 18 || c == 19) {                       /* ^R ^S */
             int rs = isearch(&s, c == 18 ? -1 : 1);
-            if (rs < 0) { outs("^C"); le_below(&s); ret = TSH_LE_INTR; break; }
+            if (rs < 0) { le_echo_intr(); le_below(&s); ret = TSH_LE_INTR; break; }
             refresh(&s);
             if (rs == 1) { le_below(&s); ret = (long)s.len; break; }
             continue;

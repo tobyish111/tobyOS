@@ -1879,7 +1879,13 @@ int main(int argc, char **argv) {
             long r = tsh_readline(ps, &line, &line_cap);
             g_tsh_le_async = 0;
             if (r == TSH_LE_INTR) {
-                interrupted = 1;
+                /* The editor's ^C is a byte it read in raw mode, not the
+                 * signal the cooked reader's comes as, and only the signal
+                 * raised the interrupt -- so the line went but $? stayed
+                 * where bash's is 130 (an SSH session, the terminal window;
+                 * ttyparity runs --noediting, finding 123). */
+                shell_note_interrupt();
+                interrupted = 2;            /* the editor ended the line */
                 n = 0;
             } else if (r == TSH_LE_EOF) {
                 if (!cont) {
@@ -1975,8 +1981,11 @@ int main(int argc, char **argv) {
             /* The tty already echoed "^C" with no newline, so the next
              * prompt would run on from it. bash prints the newline; so do
              * we. Everything accumulated (including a half-finished PS2
-             * continuation) is discarded, and $? becomes 130. */
-            write(2, "\n", 1);
+             * continuation) is discarded, and $? becomes 130. The line
+             * editor's ^C (2) has moved below the line itself: one more
+             * newline was a blank line bash does not print (logs/b22
+             * rawintr: "^C\r\r\n\r\n" against bash's "\r\n"). */
+            if (interrupted == 1) write(2, "\n", 1);
             alen = 0;
             cont = 0;
             /* Consume it HERE. Leaving the flag set for the interpreter to
