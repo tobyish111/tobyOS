@@ -2609,9 +2609,24 @@ static void shell_jobs_notify(unsigned long line, int how) {
 #else
 #define SHELL_NOTIFY_READ   0
 #define SHELL_NOTIFY_WAITED 1
+static int shell_job_poll(struct job *j);      /* see cmd_wait */
 static void shell_jobs_notify(unsigned long line, int how) {
     (void)line;
-    (void)how;
+    if (how != SHELL_NOTIFY_WAITED) return;
+    /* A DEAD COPROCESS GOES AFTER A FOREGROUND WAIT, as /bin/tsh's notify
+     * disposes of it (bash's cleanup_dead_jobs) -- not at the next line,
+     * which would take its descriptors before a `read` could take what it
+     * wrote (see shell_coproc_reap). bash knows of its death from SIGCHLD,
+     * which this shell has not: it looks, the coprocess's job only -- the
+     * others are the idle loop's (jobs_reap_finished), as they were.
+     *     coproc { echo x; }; sleep 1      COPROC is gone after the sleep */
+    if (g_coproc.pid > 0 && !g_coproc.dead) {
+        for (int i = 0; i < JOB_MAX; i++)
+            if (g_jobs[i]->id && g_jobs[i]->pid == g_coproc.pid &&
+                !g_jobs[i]->dead)
+                (void)shell_job_poll(g_jobs[i]);
+    }
+    shell_coproc_reap();
 }
 static void shell_jobs_cleanup(void) {}
 #endif
@@ -38901,21 +38916,19 @@ static void shell_async_snapshot(struct shell_sb *snap) {
     shell_set_status(saved_status);
 }
 
-static int shell_background_forked_as(const char *text, const char *label,
-                                      const char *shown) {
-    const char *what = label ? label : "shell";
+/* A /bin/tsh CHILD OF THE KERNEL SHELL, running TEXT with this shell's
+ * state (shell_async_snapshot) -- the subshell pid 0 cannot fork. Standard
+ * input and output are IN and OUT when given (a coprocess's pipes), else
+ * this shell's own; its other descriptors go with it. The pid, or: -1 no
+ * /bin/tsh, -2 a here-document is queued (the child would read this
+ * shell's input), -3 it did not start, -4 no memory. */
+static int shell_kspawn_tsh(const char *text, struct file *in,
+                            struct file *out) {
     struct vfs_stat vst;
-    if (vfs_stat("/bin/tsh", &vst) != VFS_OK) {
-        kprintf("%s: can't be backgrounded with '&' without /bin/tsh\n", what);
-        return 1;
-    }
-    if (g_heredoc_head < g_heredoc_count) {
-        kprintf("%s: can't be backgrounded with '&' with a here-document "
-                "in the kernel shell\n", what);
-        return 1;
-    }
+    if (vfs_stat("/bin/tsh", &vst) != VFS_OK) return -1;
+    if (g_heredoc_head < g_heredoc_count) return -2;
     SH_SB(snap);
-    if (sb_puts(&snap, "TOBYOS_TSH_ASYNC=") < 0) return 1;
+    if (sb_puts(&snap, "TOBYOS_TSH_ASYNC=") < 0) return -4;
     shell_async_snapshot(&snap);
     char state[160];
     {
@@ -38939,13 +38952,13 @@ static int shell_background_forked_as(const char *text, const char *label,
     int envc = 0;
     char **envp __attribute__((cleanup(shell_kfree_ptr))) =
         shell_build_env_overlay(0, 0, &envc);
-    if (!envp || !snap.p) return 1;
+    if (!envp || !snap.p) return -4;
     char **env2 __attribute__((cleanup(shell_kfree_ptr))) =
         (char **)kmalloc((size_t)(envc + 3) * sizeof(char *));
     int argc = 4 + g_positional_count;
     char **argv __attribute__((cleanup(shell_kfree_ptr))) =
         (char **)kmalloc((size_t)(argc + 1) * sizeof(char *));
-    if (!env2 || !argv) return 1;
+    if (!env2 || !argv) return -4;
     int n2 = 0;
     for (int i = 0; i < envc; i++)
         if (strncmp(envp[i], "TOBYOS_TSH_ASYNC", 16) != 0) env2[n2++] = envp[i];
@@ -38972,7 +38985,8 @@ static int shell_background_forked_as(const char *text, const char *label,
     struct proc_spec spec = {
         .path = "/bin/tsh",
         .name = "tsh",
-        .fd0  = fds.fd[0], .fd1 = fds.fd[1], .fd2 = fds.fd[2],
+        .fd0  = in ? in : fds.fd[0], .fd1 = out ? out : fds.fd[1],
+        .fd2  = fds.fd[2],
         .extra_fds = nxfd ? xfd : 0,
         .extra_nfds = nxfd,
         .argc = argc,
@@ -38984,11 +38998,28 @@ static int shell_background_forked_as(const char *text, const char *label,
     };
     int pid = proc_spawn(&spec);
     shell_fd_state_close_owned(&fds);
-    if (pid < 0) {
+    return pid < 0 ? -3 : pid;
+}
+
+static int shell_background_forked_as(const char *text, const char *label,
+                                      const char *shown) {
+    const char *what = label ? label : "shell";
+    int pid = shell_kspawn_tsh(text, 0, 0);
+    if (pid == -1) {
+        kprintf("%s: can't be backgrounded with '&' without /bin/tsh\n", what);
+        return 1;
+    }
+    if (pid == -2) {
+        kprintf("%s: can't be backgrounded with '&' with a here-document "
+                "in the kernel shell\n", what);
+        return 1;
+    }
+    if (pid == -3) {
         kprintf("%s: can't be backgrounded with '&': /bin/tsh did not "
                 "start\n", what);
         return 1;
     }
+    if (pid < 0) return 1;
     g_last_bg_pid = pid;
     if (g_opt_monitor) (void)proc_set_pgid(pid, pid);
     {
@@ -45676,7 +45707,6 @@ static void shell_trap_clear_caught(void);
 static void jobs_forget_all(void);
 #endif
 
-#ifdef SHELL_HOSTED
 /* Is shell descriptor FD free for the coprocess -- not in the table and
  * not a live process substitution's? A slot holding the CLOSED marker an
  * `exec N>&-` leaves is free, as it is for a `{name}`: bash's next
@@ -45691,7 +45721,6 @@ static bool shell_coproc_fd_free(int fd) {
         if (g_procsub[i].keep && g_procsub[i].fd == fd) return false;
     return true;
 }
-#endif
 
 /* `coproc [NAME] COMMAND` -- bash's execute_coproc. tsh had none: `coproc
  * cat` ran a program called coproc (logs/b12 p76). NAME is given only
@@ -45737,12 +45766,6 @@ static bool shell_try_coproc(const char *src) {
         shell_set_status(1);
         return true;
     }
-#ifndef SHELL_HOSTED
-    (void)cmd;
-    kprintf("coproc: not available in the kernel shell\n");
-    shell_set_status(1);
-    return true;
-#else
     if (g_coproc.pid > 0 && (g_coproc.rfd >= 0 || g_coproc.wfd >= 0))
         kprintf("warning: execute_coproc: coproc [%d:%s] still exists\n",
                 g_coproc.pid, g_coproc.name ? g_coproc.name : "");
@@ -45765,6 +45788,23 @@ static bool shell_try_coproc(const char *src) {
         shell_set_status(1);
         return true;
     }
+#ifndef SHELL_HOSTED
+    /* THE KERNEL SHELL'S COPROCESS IS A /bin/tsh CHILD. pid 0 cannot fork,
+     * so the subshell is /bin/tsh running COMMAND with this shell's state
+     * (shell_kspawn_tsh, as for `&`), reading wpipe and writing rpipe; this
+     * side keeps the other two ends and reads and writes them as pid 0
+     * reads a FIFO (pipe.c pipe_park), ^C ending the wait. It said
+     * "coproc: not available in the kernel shell". */
+    int pid = shell_kspawn_tsh(cmd, wr, rw);
+    if (pid < 0) {
+        file_close(rr); file_close(rw); file_close(wr); file_close(ww);
+        kprintf(pid == -1 ? "coproc: the kernel shell needs /bin/tsh for it\n"
+                : pid == -2 ? "coproc: not with a here-document in the kernel shell\n"
+                : "coproc: /bin/tsh did not start\n");
+        shell_set_status(1);
+        return true;
+    }
+#else
     int pid = shell_fork();
     if (pid < 0) {
         file_close(rr); file_close(rw); file_close(wr); file_close(ww);
@@ -45792,6 +45832,7 @@ static bool shell_try_coproc(const char *src) {
         shell_host_builtin_done();
         _exit(st & 0xff);
     }
+#endif
     file_close(rw);
     file_close(wr);
     /* sh_openpipe's numbers: the four highest free below 64, in order;
@@ -45843,7 +45884,6 @@ static bool shell_try_coproc(const char *src) {
     }
     shell_set_status(0);
     return true;
-#endif
 }
 
 /* `time`'s report, as bash's print_formatted_time writes it: $TIMEFORMAT,
