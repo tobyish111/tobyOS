@@ -964,6 +964,12 @@ enum shell_flow {
 static enum shell_flow g_shell_flow;
 static int g_shell_flow_status;
 static int g_shell_loop_depth;
+/* Lists in progress -- bash's executing_list: one more while a list of two
+ * commands or more (`;` or a newline, `&&`, `||`) runs, the body of a
+ * function or a group being one. A foreground job ^C kills in a list makes
+ * the shell act as if it had the SIGINT (shell_fg_sigint_interrupts). Not
+ * reset in a function; `a;` alone is no list. */
+static int g_exec_list;
 static int g_script_depth;
 static int g_subshell_depth;
 static int g_comsub_level;      /* command substitutions running, nested */
@@ -5999,11 +6005,44 @@ void shell_note_interrupt(void) { g_sigint_flag = 1; }
  * Setting $? here rather than at the call sites keeps the two halves of
  * "an interrupt happened" together: bash reports 130 for the command that
  * was interrupted AND after a bare ^C at the prompt. */
+/* ...and PIPESTATUS is the one 130 then: bash's throw_to_top_level sets it
+ * from the exit status, after a list a ^C unwound and after a ^C at the
+ * prompt -- tsh kept the last pipeline's, `130 130` or `0 1` where bash says
+ * 130 (logs/b22 c15 c17). A pipeline alone keeps its own (c18). */
+static void shell_set_pipestatus1(int status);
 int shell_take_interrupt(void) {
     if (!g_sigint_flag) return 0;
     g_sigint_flag = 0;
     shell_set_status(130);            /* 128 + SIGINT, like bash */
+    shell_set_pipestatus1(130);
     return 1;
+}
+
+/* A FOREGROUND COMMAND ^C KILLED: is the shell interrupted too? It never had
+ * the SIGINT -- the command led its own process group and held the terminal
+ * (or, in the kernel shell, was the console's foreground) -- and bash's
+ * wait_for acts as if it had: with INT untrapped, in a loop or a list
+ * (g_shell_loop_depth, g_exec_list -- a function's body and a group being
+ * lists), and, interactive, while sourcing a file; with INT trapped, in a
+ * loop, and the trap does not run. Otherwise the shell goes on: an `if`
+ * alone takes its else, and a loop whose function body has no list of its
+ * own goes round again (a function starts at loop level 0). Measured on the
+ * guest's bash 5.2.15 on a pty (tools/agent/probes/b21/intr-pty.py,
+ * logs/b22): `sleep 30; echo after` and ^C printed after, and a `for` over
+ * sleeps took a ^C an iteration (finding 122). The caller makes it the
+ * interrupt flag, which the next command's boundary acts on. */
+static bool shell_fg_sigint_interrupts(void) {
+    bool trapped = shell_trap_live(SIGINT) != 0;
+    if (!trapped && (g_shell_loop_depth > 0 || g_exec_list > 0)) return true;
+    if (trapped && g_shell_loop_depth > 0) return true;
+    return g_interactive && !trapped && g_source_depth > 0;
+}
+
+/* A job-control wait's end (/bin/tsh: the job had the terminal): SIG is the
+ * signal that ended the job -- for a pipeline the first element's a signal
+ * ended (bash's job_signal_status) -- or 0. */
+static void shell_fg_job_signalled(int sig) {
+    if (sig == SIGINT && shell_fg_sigint_interrupts()) g_sigint_flag = 1;
 }
 
 #ifndef SHELL_HOSTED
@@ -6074,11 +6113,16 @@ void shell_console_isig(void) {
 }
 
 /* The command the ^C reached is over: did it die of the SIGINT? Asked at
- * the next command's boundary (execute_line_text_inner). */
+ * the next command's boundary (execute_line_text_inner), with the answer
+ * of shell_fg_sigint_interrupts as it stood when that command BEGAN --
+ * bash asks at the death, in the dead command's context. Asked afresh at
+ * the next boundary it said yes for a function called in a loop, whose
+ * body is at loop level 0 and where bash goes round again (c12). */
+static bool g_kfg_interrupts;
 static void shell_kernel_fg_intr_check(void) {
     if (!g_kintr_fg || signal_get_foreground() > 0) return;
     g_kintr_fg = false;
-    if (proc_last_term_sig() == SIGINT && !shell_trap_live(SIGINT))
+    if (proc_last_term_sig() == SIGINT && g_kfg_interrupts)
         g_sigint_flag = 1;
 }
 #endif
@@ -13404,6 +13448,19 @@ static int shell_fg_bg_one(const char *spec, bool fg) {
     shell_report_job_death(pid, fsig >= 0 ? fsig : proc_last_term_sig(),
                            saved_name, true);
     struct job *j2 = jobs_find(jid);
+    {
+        /* the first process a signal ended, as bash's job_signal_status */
+        int isig = proc_last_term_sig();
+        if (j2 && j2->nproc > 1 && j2->proc) {
+            isig = 0;
+            for (int k = 0; k < j2->nproc; k++)
+                if (j2->proc[k].dead && j2->proc[k].sig > 0) {
+                    isig = j2->proc[k].sig;
+                    break;
+                }
+        }
+        shell_fg_job_signalled(isig);
+    }
     if (j2) jobs_remove(j2);
     return frc;
 }
@@ -26319,7 +26376,9 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
             g_pipestatus_keep = true;             /* a stop: not dead */
             return 128 + ssig;
         }
-        shell_report_job_death(pid, proc_last_term_sig(), 0, true);
+        int jsig = proc_last_term_sig();
+        shell_report_job_death(pid, jsig, 0, true);
+        shell_fg_job_signalled(jsig);
         shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
         return frc;
     }
@@ -44609,7 +44668,7 @@ static int shell_background_forked(const char *text, const char *label);
 
 /* Returns false if `src` has no top-level separator, so the caller runs it
  * exactly as it did before -- single-command lines take an identical path. */
-static bool shell_run_list_line(const char *src) {
+static bool shell_run_list_line_body(const char *src) {
     enum shell_list_link link = SH_LINK_SEMI;
     int oplen = 0;
     if (!shell_find_list_sep(src, &link, &oplen)) return false;
@@ -44728,6 +44787,30 @@ static bool shell_run_list_line(const char *src) {
         piece++;
     }
     return true;
+}
+
+/* A list -- bash's executing_list -- is two commands or more: a separator
+ * with a command after it. `a;` and `a; # note` are one command. */
+static bool shell_list_has_second(const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' ||
+               (SH_CR_BLANK && *p == '\r'))
+            p++;
+        if (*p != '#') return *p != '\0';
+        while (*p && *p != '\n') p++;
+    }
+}
+
+static bool shell_run_list_line(const char *src) {
+    enum shell_list_link link = SH_LINK_SEMI;
+    int oplen = 0;
+    const char *sep = shell_find_list_sep(src, &link, &oplen);
+    if (!sep) return false;
+    bool list = shell_list_has_second(sep + oplen);
+    if (list) g_exec_list++;
+    bool ran = shell_run_list_line_body(src);
+    if (list) g_exec_list--;
+    return ran;
 }
 
 /* ---- pipelines whose stages are compound commands -----------------------
@@ -45496,6 +45579,18 @@ static bool shell_try_compound_pipeline(const char *src) {
     if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
 #ifdef SHELL_HOSTED
     shell_wce_end(&wce, any_int);
+    if (jc_fg && jc_sig) {
+        /* the first element a signal ended, as bash's job_signal_status */
+        int isig = 0;
+        for (int i = 0; i < n && !isig; i++)
+            if (cpids[i] > 0 && jc_sig[i] > 0) isig = jc_sig[i];
+        /* ...and after a ^C the newline the terminal's "^C" lacks, which
+         * bash's wait_for prints and shell_report_job_death does for one
+         * command: a pipeline's next prompt ran on from it, "^CP$ "
+         * (logs/b22 rawintr) */
+        if (isig == SIGINT && g_interactive) shell_write("\n");
+        shell_fg_job_signalled(isig);
+    }
 #endif
     {
         const char *ls = n > 0 ? stages[n - 1] : "";
@@ -46022,10 +46117,15 @@ static void execute_line_text_inner(const char *src) {
     if (g_sigint_flag) {
         g_shell_flow = SHELL_FLOW_INTERRUPT;
         shell_set_status(130);
+        shell_set_pipestatus1(130);      /* see shell_take_interrupt */
         return;
     }
     shell_check_pending_signals();
     if (g_shell_flow != SHELL_FLOW_NONE) return;
+#ifndef SHELL_HOSTED
+    /* this command's context, for a ^C that kills what it runs */
+    g_kfg_interrupts = shell_fg_sigint_interrupts();
+#endif
     /* Before tokenizing (which expands): split `;` / `&&` / `||` and run each
      * piece on its own, so expansion happens per command. See above. This
      * precedes the function-definition check so that `f() { ...; }; f` gives
@@ -46917,6 +47017,7 @@ void shell_kernel_prompt_interrupt(void) {
     g_sigint_flag = 0;
     g_kintr_fg = false;
     shell_set_status(130);
+    shell_set_pipestatus1(130);          /* see shell_take_interrupt */
 }
 #endif
 
@@ -46936,6 +47037,10 @@ static void shell_kernel_flow_done(void) {
 #endif
     switch (g_shell_flow) {
     case SHELL_FLOW_NONE:
+        /* ...and an interrupt raised at the last command's death and not
+         * yet acted on -- `sleep 30 && echo x`, the `&&` declining its
+         * right side -- is the line's too: kept, it dropped the next one */
+        (void)shell_take_interrupt();
         return;
     case SHELL_FLOW_EXIT:
         g_kshell_exit_pending = true;

@@ -1,0 +1,31 @@
+# A FOREGROUND JOB ^C KILLED: IS THE SHELL INTERRUPTED TOO? The job led its
+# own group and had the terminal, so the shell never had the SIGINT; bash's
+# wait_for acts as if it had in a list or a loop with INT untrapped, and in
+# a loop with INT trapped -- the trap does not run -- and not otherwise: an
+# `if` alone goes on to its else, and a function is at loop level 0, so the
+# loop that called it goes round again. tsh went on after every one: `sleep
+# 30; echo after` printed after, a loop took a ^C an iteration (finding
+# 122). PIPESTATUS after an interrupt is the one 130 (throw_to_top_level),
+# and a pipeline the ^C killed gets the newline the "^C" lacks.
+sleep 30; echo after-list
+%CTRLC%
+echo "list=$? ps=${PIPESTATUS[*]}"
+for i in 1 2; do sleep 30; echo "it $i"; done; echo after-loop
+%CTRLC%
+echo "loop=$?"
+if sleep 30; then echo yes; else echo else-ran; fi
+%CTRLC%
+echo "if=$?"
+f() { sleep $1; }
+for i in 30 1; do f $i; done
+%CTRLC%
+echo "fnloop=$?"
+sleep 30 | cat; echo after-pipe
+%CTRLC%
+echo "pipe=$? ps=${PIPESTATUS[*]}"
+trap 'echo T' INT
+for i in 1 2; do sleep 30; echo "tit $i"; done; echo after-tloop
+%CTRLC%
+trap - INT
+echo "tloop=$?"
+exit 0
