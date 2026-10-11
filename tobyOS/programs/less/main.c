@@ -2,7 +2,8 @@
  *
  * Reads a file (or stdin) and displays one screenful at a time.
  * Navigation: space/PgDn, b/PgUp, j/k, g/G, /pattern search, n/N, q.
- * Shows line numbers and percentage indicator in status bar.
+ * Line numbers with -N, as Linux's less; position and percentage in the
+ * status bar.
  */
 
 #include <stdio.h>
@@ -11,6 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <signal.h>
 
 /* The window's size, as tvi asks for it (src/tty.c, src/pty.c answer). */
 #define TIOCGWINSZ 0x5413u
@@ -30,6 +32,10 @@ static int g_cols = DEFAULT_COLS;
 static char g_search[256];
 static int g_search_dir = 1;
 static const char *g_filename = "(stdin)";
+/* -N: number the lines. Linux's less numbers them only when asked; this one
+ * numbered every line, whatever it was given -- `seq 100 | less` showed
+ * "     1 1" -- and -N, parsed to turn them OFF, was then thrown away. */
+static int g_show_lines;
 
 /* ---- Terminal raw I/O ------------------------------------------------ */
 
@@ -63,7 +69,11 @@ static void term_reverse(int on) {
  * key waited for Enter and echoed over the screen. */
 static int g_kfd = -1;
 static struct termios g_saved_tio;
+static struct termios g_raw_tio;
 static int g_raw;
+/* -K: ^C quits (status 2). Without it less only rings the bell, as
+ * Linux's does; more quits (status 0). */
+static int g_quit_on_intr;
 
 static void term_restore(void) {
     if (g_raw) tcsetattr(g_kfd, TCSANOW, &g_saved_tio);
@@ -82,14 +92,15 @@ static int term_open(void) {
         t.c_lflag &= ~(unsigned)(ICANON | ECHO | ISIG | IEXTEN);
         t.c_cc[VMIN] = 1;
         t.c_cc[VTIME] = 0;
-        if (tcsetattr(g_kfd, TCSANOW, &t) == 0) g_raw = 1;
+        if (tcsetattr(g_kfd, TCSANOW, &t) == 0) { g_raw = 1; g_raw_tio = t; }
     }
-    /* the window's size, not a fixed 24x80 */
+    /* the window's size, not a fixed 24x80 -- no wider than a line's
+     * buffer (draw_screen cuts each line at g_cols in one) */
     struct winsize ws;
     if ((ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 ||
          ioctl(g_kfd, TIOCGWINSZ, &ws) == 0) && ws.ws_row > 2 && ws.ws_col > 10) {
         g_rows = ws.ws_row;
-        g_cols = ws.ws_col;
+        g_cols = ws.ws_col < MAX_LINE_LEN ? ws.ws_col : MAX_LINE_LEN - 1;
     }
     return 0;
 }
@@ -98,6 +109,29 @@ static int term_readch(void) {
     unsigned char c;
     if (read(g_kfd, &c, 1) == 1) return c;
     return -1;
+}
+
+/* Is C the terminal's control character IDX (VINTR, VSUSP)? Raw mode turned
+ * ISIG off, so ^C and ^Z come as keys: the pager does what the terminal
+ * would have, as Linux's does (tools/agent/probes/b21/lessintr-linux.py,
+ * on a pty: less rings the bell on ^C and stays, less -K and more quit; ^Z
+ * stops the job either way, and `fg` brings the pager back). */
+static int term_is_cc(int c, int idx) {
+    return g_raw && g_saved_tio.c_cc[idx] && c == g_saved_tio.c_cc[idx];
+}
+
+static void draw_screen(void);
+
+/* ^Z: the terminal as the shell had it, the job -- the caller's process
+ * group, the whole pipeline -- stopped, as the terminal's SIGTSTP stops it;
+ * and on `fg`, raw again and the screen drawn again. */
+static void term_suspend(void) {
+    term_move(g_rows, 1);
+    term_write("\033[K");
+    tcsetattr(g_kfd, TCSANOW, &g_saved_tio);
+    kill(0, SIGTSTP);
+    tcsetattr(g_kfd, TCSANOW, &g_raw_tio);
+    draw_screen();
 }
 
 /* ---- File loading --------------------------------------------------- */
@@ -154,12 +188,15 @@ static void draw_screen(void) {
     for (int i = 0; i < visible; i++) {
         int idx = g_top + i;
         if (idx < g_nlines) {
-            char num[16];
-            snprintf(num, sizeof(num), "%6d ", idx + 1);
-            term_write(num);
+            int maxw = g_cols;
+            if (g_show_lines) {
+                char num[16];
+                snprintf(num, sizeof(num), "%6d ", idx + 1);
+                term_write(num);
+                maxw = g_cols - 8;
+            }
 
             const char *line = g_lines[idx];
-            int maxw = g_cols - 8;
             if (maxw < 1) maxw = 1;
             char truncated[MAX_LINE_LEN];
             strncpy(truncated, line, maxw);
@@ -233,7 +270,7 @@ static void prompt_search(void) {
     while (1) {
         int c = term_readch();
         if (c == '\n' || c == '\r') break;
-        if (c == 27 || c == -1) { len = 0; break; }
+        if (c == 27 || c == -1 || term_is_cc(c, VINTR)) { len = 0; break; }
         if (c == 127 || c == 8) {
             if (len > 0) len--;
         } else if (len < 255) {
@@ -268,16 +305,22 @@ int main(int argc, char **argv) {
     g_is_more = !strcmp(base, "more");
     int start_line = 0;
 
-    int show_lines = 1;
     const char *path = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-N") == 0) show_lines = 0;
+        if (!g_is_more && (strcmp(argv[i], "-N") == 0 ||
+                           strcmp(argv[i], "--LINE-NUMBERS") == 0))
+            g_show_lines = 1;
+        else if (!g_is_more && (strcmp(argv[i], "-n") == 0 ||
+                                strcmp(argv[i], "--line-numbers") == 0))
+            g_show_lines = 0;
+        else if (!g_is_more && (strcmp(argv[i], "-K") == 0 ||
+                                strcmp(argv[i], "--quit-on-intr") == 0))
+            g_quit_on_intr = 1;
         else if (argv[i][0] == '+' && argv[i][1] >= '0' && argv[i][1] <= '9')
             start_line = atoi(argv[i] + 1) - 1;   /* more +N starts at line N */
         else if (argv[i][0] != '-') path = argv[i];
     }
-    (void)show_lines;
 
     if (path) {
         if (load_file(path) != 0) return 1;
@@ -307,10 +350,21 @@ int main(int argc, char **argv) {
 
     draw_screen();
 
-    int running = 1;
+    int running = 1, status = 0;
     while (running) {
         int c = term_readch();
         if (c == -1) break;
+
+        if (term_is_cc(c, VINTR)) {
+            if (g_is_more) break;
+            term_write("\a");
+            if (g_quit_on_intr) { status = 2; break; }
+            continue;
+        }
+        if (term_is_cc(c, VSUSP)) {
+            term_suspend();
+            continue;
+        }
 
         /* Handle escape sequences for arrow keys / pgup / pgdn */
         if (c == 27) {
@@ -329,7 +383,6 @@ int main(int argc, char **argv) {
 
         switch (c) {
         case 'q': case 'Q':
-        case 0x03:                   /* ^C: raw mode makes it a key */
             running = 0;
             break;
         case ' ': case 'f':
@@ -393,5 +446,5 @@ int main(int argc, char **argv) {
 
     term_clear();
     term_restore();
-    return 0;
+    return status;
 }

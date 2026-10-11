@@ -68,11 +68,30 @@ send("\x1b[B\x1b[B\x1b[B"); b = take(1.5)
 send("q"); take(1.0)
 send('echo "m4 st=$?"\n'); c = take(1.5)
 res["arrows"] = (None, status(b), "m4 st=0" in vis(c))
-# 5. ^C quits, and the terminal is cooked again (the echo comes back)
+# 5. ^C: less rings the bell and stays (q quits it after, $? 0); more
+#    quits ($? 0); less -K quits ($? 2) -- Linux's, measured on a pty by
+#    lessintr-linux.py. The terminal is cooked again after: the echo is back.
 send("seq 1 200 | less\n"); take(2.5)
-send("\x03"); take(1.0)
+send("\x03"); a = take(1.0)
+send("j"); b = take(1.0)
+send("q"); take(1.0)
 send('echo "m5 st=$?"\n'); c = take(1.5)
-res["ctrlc"] = (None, None, "m5 st=0" in vis(c))
+res["ctrlc"] = (None, status(b), "\x07" in a and "m5 st=0" in vis(c))
+send("seq 1 200 | more\n"); take(2.5)
+send("\x03"); take(1.0)
+send('echo "m5b st=$?"\n'); c = take(1.5)
+res["ctrlc-more"] = (None, None, "m5b st=0" in vis(c))
+send("seq 1 200 | less -K\n"); take(2.5)
+send("\x03"); a = take(1.0)
+send('echo "m5c st=$?"\n'); c = take(1.5)
+res["ctrlc-K"] = (None, None, "\x07" in a and "m5c st=2" in vis(c))
+# 5d. ^Z stops the job; fg brings the pager back, drawn again
+send("seq 1 200 | less\n"); take(2.5)
+send("\x1a"); a = take(1.5)
+send("fg\n"); b = take(2.0)
+send("q"); take(1.0)
+send('echo "m5d st=$?"\n'); c = take(1.5)
+res["ctrlz"] = (None, status(b), "Stopped" in vis(a) and "m5d st=0" in vis(c))
 # 6. it fits the screen: printed, no pager
 send("seq 1 5 | less; echo m6-done\n"); c = take(2.5)
 res["fits"] = (None, None, "m6-done" in vis(c) and " 5 " in vis(c))
@@ -88,14 +107,18 @@ want = {
     "more":   lambda r: r[0] is not None and r[1] is not None and int(r[1][0]) > int(r[0][0]) and r[2],
     "search": lambda r: r[1] is not None and int(r[1][0]) == 150 and r[2],
     "arrows": lambda r: r[1] is not None and int(r[1][0]) == 4 and r[2],
-    "ctrlc":  lambda r: r[2],
+    "ctrlc":  lambda r: r[1] is not None and int(r[1][0]) == 2 and r[2],
+    "ctrlc-more": lambda r: r[2],
+    "ctrlc-K": lambda r: r[2],
+    "ctrlz":  lambda r: r[1] is not None and r[2],
     "fits":   lambda r: r[2],
     "notty":  lambda r: r[2],
 }
 bad = 0
-for k in ("file", "more", "search", "arrows", "ctrlc", "fits", "notty"):
+for k in ("file", "more", "search", "arrows", "ctrlc", "ctrlc-more", "ctrlc-K",
+          "ctrlz", "fits", "notty"):
     ok = want[k](res[k])
-    print("%s %-7s %s" % ("ok " if ok else "BAD", k, res[k]))
+    print("%s %-10s %s" % ("ok " if ok else "BAD", k, res[k]))
     if not ok: bad = 1
 print("LESSPTY2: " + ("ALL AS WANTED" if not bad else "MISMATCH"))
 sys.exit(bad)
