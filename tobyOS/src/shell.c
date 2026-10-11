@@ -19937,10 +19937,15 @@ static void cmd_break(int argc, char **argv) {
         }
         argc = 2;
     }
-    /* BREAK OUTSIDE A LOOP IS NOT AN ERROR. bash and mksh do nothing and
-     * return 0; tsh returned 1, which turned `if break; then echo hi; fi`
-     * inside a function into a silent no-op where bash prints `hi`. */
+    /* BREAK OUTSIDE A LOOP IS NOT AN ERROR: status 0. tsh returned 1, which
+     * turned `if break; then echo hi; fi` inside a function into a silent
+     * no-op where bash prints `hi`. bash does say "only meaningful in a
+     * loop" on stderr -- not in POSIX mode, which is where it was measured
+     * silent (logs/b22 brk2: the guest's bash 5.2.15 and its --posix). A
+     * function is outside its caller's loops (shell_run_function). */
     if (g_shell_loop_depth <= 0) {
+        if (!g_opt_posix)
+            kprintf("break: only meaningful in a `for', `while', or `until' loop\n");
         shell_set_status(0);
         return;
     }
@@ -19984,6 +19989,8 @@ static void cmd_continue(int argc, char **argv) {
         argc = 2;
     }
     if (g_shell_loop_depth <= 0) {          /* see cmd_break */
+        if (!g_opt_posix)
+            kprintf("continue: only meaningful in a `for', `while', or `until' loop\n");
         shell_set_status(0);
         return;
     }
@@ -37963,6 +37970,15 @@ static int shell_run_function(struct shell_simple *cmd) {
 
     g_script_depth++;
     g_fn_depth++;
+    /* A FUNCTION STARTS AT LOOP LEVEL 0, as bash's execute_function sets
+     * loop_level (compat > 43): a `break` in a function called from a loop
+     * is outside any loop there, and `break 2` in its own loop leaves that
+     * loop only. tsh's broke out of the CALLER's loops -- `k() { break; };
+     * for i in 1 2; do k; echo $i; done` printed nothing -- and so a ^C
+     * that killed the function's command broke a loop bash goes round again
+     * (shell_fg_sigint_interrupts; finding 126, logs/b22 brk2). */
+    int saved_loop_depth = g_shell_loop_depth;
+    g_shell_loop_depth = 0;
     /* The CONDITION exemption is inherited (g_errexit_suspend); the NEGATION
      * one is not -- see g_errexit_negate. */
     int saved_ee_negate = g_errexit_negate;
@@ -38107,6 +38123,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_heredoc_cap   = saved_hd_cap;
     }
     g_fn_depth--;
+    g_shell_loop_depth = saved_loop_depth;
     g_errexit_negate = saved_ee_negate;
     int rc = g_last_status;
     if (g_shell_flow == SHELL_FLOW_RETURN) {
