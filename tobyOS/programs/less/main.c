@@ -10,6 +10,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <termios.h>
+
+/* The window's size, as tvi asks for it (src/tty.c, src/pty.c answer). */
+#define TIOCGWINSZ 0x5413u
+struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
 
 #define MAX_LINES    65536
 #define MAX_LINE_LEN 4096
@@ -46,9 +51,52 @@ static void term_reverse(int on) {
     term_write(on ? "\033[7m" : "\033[0m");
 }
 
+/* KEYS COME FROM THE TERMINAL, NOT FROM STANDARD INPUT. `cmd | less` has
+ * the pipe there, already read to its end by load_stdin, so the first
+ * read for a key said EOF and the pager quit after one screen -- the keys
+ * typed then went to the shell (`seq 100 | less` in the desktop's terminal
+ * window, then `q`: "qecho: command not found"; tools/agent/probes/b21
+ * lesspty.py). Linux less reads its keys from /dev/tty for this; failing
+ * that, stderr, as the classic more did, when that is the terminal. And
+ * the terminal is put in raw mode -- a key at a time, not echoed, ^C a
+ * key -- and back as it was when the pager ends: it was left cooked, so a
+ * key waited for Enter and echoed over the screen. */
+static int g_kfd = -1;
+static struct termios g_saved_tio;
+static int g_raw;
+
+static void term_restore(void) {
+    if (g_raw) tcsetattr(g_kfd, TCSANOW, &g_saved_tio);
+    g_raw = 0;
+}
+
+static int term_open(void) {
+    if (isatty(STDIN_FILENO)) g_kfd = STDIN_FILENO;
+    else {
+        g_kfd = open("/dev/tty", O_RDONLY);
+        if (g_kfd < 0 && isatty(STDERR_FILENO)) g_kfd = STDERR_FILENO;
+    }
+    if (g_kfd < 0) return -1;
+    if (tcgetattr(g_kfd, &g_saved_tio) == 0) {
+        struct termios t = g_saved_tio;
+        t.c_lflag &= ~(unsigned)(ICANON | ECHO | ISIG | IEXTEN);
+        t.c_cc[VMIN] = 1;
+        t.c_cc[VTIME] = 0;
+        if (tcsetattr(g_kfd, TCSANOW, &t) == 0) g_raw = 1;
+    }
+    /* the window's size, not a fixed 24x80 */
+    struct winsize ws;
+    if ((ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 ||
+         ioctl(g_kfd, TIOCGWINSZ, &ws) == 0) && ws.ws_row > 2 && ws.ws_col > 10) {
+        g_rows = ws.ws_row;
+        g_cols = ws.ws_col;
+    }
+    return 0;
+}
+
 static int term_readch(void) {
     unsigned char c;
-    if (read(STDIN_FILENO, &c, 1) == 1) return c;
+    if (read(g_kfd, &c, 1) == 1) return c;
     return -1;
 }
 
@@ -240,9 +288,10 @@ int main(int argc, char **argv) {
     if (g_nlines == 0) return 0;
     if (start_line > 0) g_top = start_line < g_nlines ? start_line : g_nlines - 1;
 
-    /* Not a terminal: more copies its input through, which is what makes
-     * `cmd | more > file` and `more f | grep x` behave at all. */
-    if (g_is_more && !isatty(1)) {
+    /* Not a terminal: the input is copied through, which is what makes
+     * `cmd | more > file` and `less f | grep x` behave at all -- less does
+     * it too, as Linux's does. So with no terminal to read keys from. */
+    if (!isatty(1) || term_open() != 0) {
         for (int k = g_top; k < g_nlines; k++)
             printf("%s\n", g_lines[k]);
         return 0;
@@ -250,6 +299,7 @@ int main(int argc, char **argv) {
 
     int visible = g_rows - 1;
     if (g_nlines - g_top <= visible) {
+        term_restore();
         for (int k = g_top; k < g_nlines; k++)
             printf("%s\n", g_lines[k]);
         return 0;
@@ -279,6 +329,7 @@ int main(int argc, char **argv) {
 
         switch (c) {
         case 'q': case 'Q':
+        case 0x03:                   /* ^C: raw mode makes it a key */
             running = 0;
             break;
         case ' ': case 'f':
@@ -341,5 +392,6 @@ int main(int argc, char **argv) {
     }
 
     term_clear();
+    term_restore();
     return 0;
 }
