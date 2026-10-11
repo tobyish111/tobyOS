@@ -424,7 +424,7 @@ static bool do_elf_load(const void *image, size_t size, bool user_mode,
         info->phdr_va = 0;
     }
 
-    kprintf("[elf] load OK%s: type=%s, %d segment(s), base=%p, entry=%p, "
+    kprintf_log("[elf] load OK%s: type=%s, %d segment(s), base=%p, entry=%p, "
             "phdr=%p (%u entries)%s\n",
             user_mode ? " (user)" : "",
             (eh->e_type == ET_DYN) ? "ET_DYN" : "ET_EXEC",

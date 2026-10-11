@@ -46,6 +46,15 @@ void kprintf(const char *fmt, ...);
 __attribute__((format(printf, 1, 2)))
 void kprintf_serial(const char *fmt, ...);
 
+/* A KERNEL LOG LINE: everywhere kprintf's goes -- serial, the console, the
+ * boot log -- except a printk sink, which is a shell's stdout or stderr
+ * (the kernel shell's builtins, its $( ) captures). The lines pid 0 logs
+ * as it spawns and reaps a program were going into the sink of whatever
+ * builtin was running: `. file` in the kernel shell printed "[elf] load
+ * OK ..." and "[proc] created ..." in the session (finding 128). */
+__attribute__((format(printf, 1, 2)))
+void kprintf_log(const char *fmt, ...);
+
 void kvprintf(const char *fmt, va_list ap);
 
 /* Optional "mirror" sink for kprintf output. When installed, every

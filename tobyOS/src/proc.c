@@ -1397,7 +1397,7 @@ static int spawn_body(const char *path, const char *name,
     /* Milestone 19 metric: another proc spawned. */
     perf_count_proc_spawn();
 
-    kprintf("[proc] created pid=%d ppid=%d '%s' entry=%p rsp=%p cr3=0x%lx"
+    kprintf_log("[proc] created pid=%d ppid=%d '%s' entry=%p rsp=%p cr3=0x%lx"
             " kstack=%p argc=%d envc=%d cwd='%s'\n",
             p->pid, p->ppid, p->name, (void *)p->user_entry,
             (void *)p->user_rsp, p->cr3, p->kstack_top, argc, envc,
@@ -1519,7 +1519,7 @@ int proc_spawn(const struct proc_spec *spec) {
             (void)cap_profile_apply(p, spec->sandbox_profile);
             char caps_str[96];
             cap_mask_to_string(p->caps, caps_str, sizeof(caps_str));
-            kprintf("[cap] pid=%d '%s' sandbox='%s' caps=%s root=%s\n",
+            kprintf_log("[cap] pid=%d '%s' sandbox='%s' caps=%s root=%s\n",
                     p->pid, p->name, spec->sandbox_profile, caps_str,
                     p->sandbox_root[0] ? p->sandbox_root : "(none)");
         }
@@ -2224,7 +2224,7 @@ static void proc_reap(struct proc *p) {
 #endif
     memset(p, 0, sizeof(*p));
     p->state = PROC_UNUSED;
-    kprintf("[proc] reaped pid=%d, slot recycled\n", pid);
+    kprintf_log("[proc] reaped pid=%d, slot recycled\n", pid);
 }
 
 /* Would wait4(pid, options) on this one child report without blocking?

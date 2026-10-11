@@ -357,6 +357,18 @@ void kprintf(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* kprintf's line without the sink: see printk.h. */
+void kprintf_log(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    uint64_t flags = spin_lock_irqsave(&g_printk_lock);
+    g_emit_to_sink = false;
+    emit_ts_prefix();
+    kvprintf_unlocked(fmt, ap);
+    spin_unlock_irqrestore(&g_printk_lock, flags);
+    va_end(ap);
+}
+
 /* Like kprintf, but the formatted line goes ONLY to COM1 serial -- never
  * the framebuffer console, mirror sink, or boot log. Still timestamped and
  * serialised under g_printk_lock so it can't interleave with kprintf. */
