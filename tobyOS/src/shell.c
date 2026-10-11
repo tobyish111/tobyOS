@@ -7041,6 +7041,15 @@ static void shell_wait_intr(bool on) {
     }
 }
 
+/* An open a signal interrupted (host.c host_open -- a FIFO's, waiting for
+ * its other end): after acting on a fatal signal the EXIT trap is waiting
+ * for, give up (1) on a ^C, as bash's redir_open does with QUIT, the line
+ * then unwinding with 130 and no word about the file; else open again (0). */
+int shell_host_open_eintr(void) {
+    shell_termsig_check();
+    return g_sigint_flag ? 1 : 0;
+}
+
 /* A blocking call a signal interrupted (host.c): act on a fatal signal the
  * EXIT trap is waiting for, which does not return; say whether a `wait` is
  * over (1). */
@@ -24115,6 +24124,7 @@ static const char *shell_errno_text(int err) {
     case VFS_ERR_PERM:        return "Permission denied";
     case VFS_ERR_NOTPERM:     return "Operation not permitted";
     case SHELL_HOSTED_ERR_NXIO: return "No such device or address";
+    case SHELL_HOSTED_ERR_INTR: return "Interrupted system call";
     default:                  return "No error information";
     }
 }
@@ -36831,6 +36841,9 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
             long fr = fifo_open(path, fst.dev, fst.ino,
                                 g_open_rdwr ? 2 : write ? 1 : 0, false, &ff);
             if (fr < 0 || !ff) {
+                /* a ^C ended the wait: bash's redir_open throws to the top
+                 * level without a word (finding 124) */
+                if (fr < 0 && shell_kernel_interrupted()) return 0;
                 kprintf("%s: %s\n", path_arg,
                         fr == -ABI_ENFILE ? "Too many open files in system"
                         : fr == -ABI_ENOMEM ? "Cannot allocate memory"
@@ -36927,7 +36940,10 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
     int rc = vfs_open(path, &f->vfs);
 #endif
     if (rc != VFS_OK) {
-        kprintf("%s: %s\n", path_arg, shell_errno_text(rc));
+        /* ^C ended the open (a FIFO's): bash's redir_open throws to the
+         * top level without a word -- the line unwinds with 130 */
+        if (rc != SHELL_HOSTED_ERR_INTR)
+            kprintf("%s: %s\n", path_arg, shell_errno_text(rc));
         kfree(f->vfs_refs);
         kfree(f);
         return 0;

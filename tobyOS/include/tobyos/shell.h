@@ -126,5 +126,8 @@ int  shell_set_param0_hosted(const char *name);
  * terminal -- out of reach of both the VFS codes and the ABI errnos, which
  * share the small negatives. The kernel never returns it. */
 #define SHELL_HOSTED_ERR_NXIO (-200)
+/* ...and EINTR: an open a ^C ended (host.c host_open), which the shell
+ * reports no error for, as bash's redirections do not -- the line unwinds. */
+#define SHELL_HOSTED_ERR_INTR (-201)
 
 #endif /* TOBYOS_SHELL_H */

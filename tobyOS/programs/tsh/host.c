@@ -602,7 +602,28 @@ static int errno_to_vfs(void) {
         case EPERM:   return VFS_ERR_NOTPERM;
         case ENAMETOOLONG: return VFS_ERR_NAMETOOLONG;
         case ENXIO:   return SHELL_HOSTED_ERR_NXIO;   /* /dev/tty, no terminal */
+        case EINTR:   return SHELL_HOSTED_ERR_INTR;   /* host_open's ^C */
         default:      return VFS_ERR_IO;
+    }
+}
+
+/* AN OPEN A SIGNAL INTERRUPTS IS TRIED AGAIN, as bash's redir_open does. A
+ * FIFO's open waits for the other end, and a signal ends the wait with
+ * EINTR: ^C at a terminal (tsh_sigint does not restart), a hangup, a CHLD a
+ * finished job sends. errno_to_vfs made that "I/O error" -- `read x <
+ * fifo` and ^C printed "tsh: fifo: I/O error" where bash says nothing
+ * (finding 124). A ^C or a hangup ends it (SHELL_HOSTED_ERR_INTR: no word,
+ * the line unwinds), anything else opens again. */
+extern int shell_host_open_eintr(void);
+static volatile int g_tsh_sighup;
+static int host_open(const char *path, int flags, int mode) {
+    for (;;) {
+        int fd = open(path, flags, mode);
+        if (fd >= 0 || errno != EINTR) return fd;
+        if (g_tsh_sighup || shell_host_open_eintr()) {
+            errno = EINTR;
+            return -1;
+        }
     }
 }
 
@@ -613,8 +634,8 @@ int vfs_open(const char *path, struct vfs_file *out) {
      * redirection fail with nothing written and no error anyone can see.
      * Fall back to O_RDONLY for genuinely unwritable files (scripts on the
      * read-only initrd), which are the read-side cases. */
-    int fd = open(path, O_RDWR);
-    if (fd < 0) fd = open(path, O_RDONLY);
+    int fd = host_open(path, O_RDWR, 0);
+    if (fd < 0 && errno != EINTR) fd = host_open(path, O_RDONLY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
     VF_SET(out, fd);
@@ -630,7 +651,7 @@ int vfs_open(const char *path, struct vfs_file *out) {
  * and `echo x > fifo` never waited for a reader (logs/b16 fifo). */
 int vfs_open_output(const char *path, struct vfs_file *out) {
     if (!path || !out) return VFS_ERR_INVAL;
-    int fd = open(path, O_WRONLY);
+    int fd = host_open(path, O_WRONLY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
     VF_SET(out, fd);
@@ -665,7 +686,7 @@ int vfs_open_input(const char *path, struct vfs_file *out) {
     if (!path || !out) return VFS_ERR_INVAL;
     int rc;
     {
-        int fd = open(path, O_RDONLY);
+        int fd = host_open(path, O_RDONLY, 0);
         if (fd >= 0) {
             memset(out, 0, sizeof *out);
             VF_SET(out, fd);
@@ -677,7 +698,7 @@ int vfs_open_input(const char *path, struct vfs_file *out) {
         rc = errno_to_vfs();
     }
     if (rc != VFS_ERR_ISDIR) return rc;
-    int fd = open(path, O_RDONLY | O_DIRECTORY);
+    int fd = host_open(path, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
     VF_SET(out, fd);
@@ -688,7 +709,7 @@ int vfs_open_input(const char *path, struct vfs_file *out) {
 
 int vfs_open_append(const char *path, struct vfs_file *out) {
     if (!path || !out) return VFS_ERR_INVAL;
-    int fd = open(path, O_WRONLY | O_APPEND);
+    int fd = host_open(path, O_WRONLY | O_APPEND, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
     VF_SET(out, fd);
@@ -776,7 +797,7 @@ int vfs_lstat(const char *path, struct vfs_stat *out) {
 
 int vfs_read_all(const char *path, void **out_buf, size_t *out_size) {
     if (!path || !out_buf) return VFS_ERR_INVAL;
-    int fd = open(path, O_RDONLY);
+    int fd = host_open(path, O_RDONLY, 0);
     if (fd < 0) return errno_to_vfs();
     size_t cap = 8192, len = 0;
     char *buf = malloc(cap);
@@ -812,7 +833,7 @@ int vfs_write_all(const char *path, const void *buf, size_t n) {
 }
 
 int vfs_create_mode(const char *path, uint32_t mode) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)(mode & 07777u));
+    int fd = host_open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)(mode & 07777u));
     if (fd < 0) return errno_to_vfs();
     close(fd);
     return VFS_OK;
@@ -833,7 +854,7 @@ int vfs_unlink(const char *path) { return unlink(path)      == 0 ? VFS_OK : errn
  * someone else holds open keeps the same inode. */
 int vfs_truncate(const char *path, uint64_t len) {
     if (len != 0) return VFS_ERR_INVAL;      /* the shell only ever wants 0 */
-    int fd = open(path, O_WRONLY | O_TRUNC);
+    int fd = host_open(path, O_WRONLY | O_TRUNC, 0);
     if (fd < 0) return errno_to_vfs();
     close(fd);
     return VFS_OK;
@@ -1469,7 +1490,6 @@ static void tsh_arm_sigint(void) {
 
 /* A HANGUP at a terminal: noted, and the read it interrupts returns, so
  * the loop can hang up the jobs and leave (shell_hangup_hosted). */
-static volatile int g_tsh_sighup;
 static void tsh_sighup(int sig) { (void)sig; g_tsh_sighup = 1; }
 
 /* Set when this shell made SIGTERM a no-op, as an interactive shell does
