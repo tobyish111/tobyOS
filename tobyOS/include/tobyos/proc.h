@@ -1004,6 +1004,10 @@ __attribute__((noreturn)) void proc_exit_group(int code);
  * tries to wait on itself. */
 int proc_wait(int pid);
 
+/* pid 0's proc_wait that INTR can end (the kernel shell's `wait` and ^C):
+ * -2 when it did, with the child still alive and unreaped. */
+int proc_wait_intr(int pid, bool (*intr)(void));
+
 /* User stack geometry. The stack always TOPS OUT at the end of the user half
  * (both the ELF and PE execve arms anchor there) and grows DOWN on demand; the
  * fault handler expands it a page at a time (page_fault.c) as far as

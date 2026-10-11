@@ -915,8 +915,11 @@ bool g_idle_loop_running;
  * held, as the idle loop's phases are. */
 void kernel_idle_service_nested(void) {
     extern void net_service_nested(void);
+    extern void tcp_shell_poll_interrupt(void);
     wdog_kick_idle();
     net_service_nested();
+    /* a ^C the TCP shell's client typed while its line runs (tcp_shell.c) */
+    tcp_shell_poll_interrupt();
     usb_legacy_poll();
     xhci_poll();
     kbd_flush_pending();

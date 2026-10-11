@@ -2344,6 +2344,32 @@ int proc_wait(int pid) {
     return proc_wait_info(pid, 0);
 }
 
+/* PID 0'S WAIT THAT ^C CAN END -- the kernel shell's `wait` builtin. A job
+ * it waits for is not the terminal's, so a ^C interrupts the SHELL, and
+ * bash's `wait` returns 130 with the job still running. INTR is asked
+ * between slices of pid 0's serviced wait (pid0_serviced_wait); -2 when it
+ * said stop and the child is still alive, unreaped. Anyone else -- and pid
+ * 0 before the idle loop runs -- waits as proc_wait does. */
+int proc_wait_intr(int pid, bool (*intr)(void)) {
+    struct proc *self = current_proc();
+    if (!intr || !pid0_serviced_wait(self)) return proc_wait(pid);
+    for (;;) {
+        struct proc *ch = proc_lookup(pid);
+        if (!ch) return -1;
+        if (ch->state == PROC_TERMINATED) return proc_wait(pid);
+        if (intr()) return -2;
+        kernel_idle_service_nested();
+        if (ch->state == PROC_TERMINATED) continue;
+        if (intr()) return -2;
+        self->sleep_deadline_ns = perf_now_ns() + PID0_WAIT_SLICE_NS;
+        self->wait_pid = pid;
+        self->state = PROC_BLOCKED;
+        sched_yield();
+        self->sleep_deadline_ns = 0;
+        self->wait_pid = -1;        /* no stale wake when we leave early */
+    }
+}
+
 int proc_last_term_sig(void) {
     struct proc *self = current_proc();
     return self ? self->last_reap_term_sig : 0;

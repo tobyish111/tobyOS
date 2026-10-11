@@ -44,6 +44,14 @@ bool shell_take_exit_request(void);
  * here-document body: the caller should show the continuation prompt. */
 bool shell_input_pending(void);
 
+/* ^C typed while a kernel-shell line runs (tcp_shell.c): SIGINT to the
+ * foreground command, or the shell itself is interrupted. */
+void shell_kernel_interrupt(void);
+
+/* ^C typed at the kernel shell's prompt: the command being collected is
+ * thrown away and $? is 130. The caller discards its own typed line. */
+void shell_kernel_prompt_interrupt(void);
+
 /* Deliver an asynchronous signal to the shell (called from interrupt context
  * or the signal subsystem). The trap handler will run at the next safe point. */
 void shell_deliver_signal(int sig);

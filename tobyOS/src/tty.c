@@ -106,6 +106,13 @@ bool tty_handle_isig(char c) {
     /* Deliver to the foreground GROUP: ^C/^Z must reach every stage of a
      * foreground pipeline, and a ^Z'd job's WHOLE group must stop. */
     signal_send_to_foreground(sig);
+    /* ...and the kernel shell at the console hears its ^C: a line it runs
+     * is interrupted, or the line being typed is thrown away (shell.c
+     * shell_console_isig -- flags only, safe from the keyboard's IRQ). */
+    if (sig == SIGINT) {
+        extern void shell_console_isig(void);
+        shell_console_isig();
+    }
     /* Consume the control char either way: a tty never delivers ^C as data
      * while ISIG is on, and we don't want it lingering in the input ring. */
     return true;

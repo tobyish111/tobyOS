@@ -82,6 +82,15 @@ extern bool g_idle_loop_running;
 extern void kernel_idle_service_nested(void);
 #define PIPE_PID0_SLICE_NS 10000000ull
 
+/* ...and a ^C at the kernel shell ends them, as SIGINT ends a process's
+ * (shell.c shell_kernel_interrupted: an untrapped ^C; a trapped one runs
+ * its trap after the wait, as bash's resumes the wait after the trap). */
+extern bool shell_kernel_interrupted(void);
+static bool pipe_intr(struct proc *self) {
+    if (SIG_SHOULD_EINTR(self)) return true;
+    return self->pid == 0 && g_idle_loop_running && shell_kernel_interrupted();
+}
+
 static void pipe_park(struct proc **head, struct proc *self) {
     if (self->pid == 0 && g_idle_loop_running) {
         kernel_idle_service_nested();
@@ -210,14 +219,14 @@ long pipe_read(struct pipe *p, void *buf, size_t n) {
         struct proc *self = current_proc();
         /* Signal arrived before we even parked? Bail immediately so
          * the syscall return path can deliver it. */
-        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
+        if (pipe_intr(self)) return EINTR_RET;
         pipe_park(&p->wq_read, self);
         /* Resumed. Two reasons to be back here:
          *   - wq_wake_all woke us (data arrived / writer closed) -- loop
          *     re-checks the predicate, normal case.
          *   - signal_send() spliced us off the queue and made us
          *     READY because a SIGINT/SIGTERM hit us -- bail with EINTR. */
-        if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
+        if (pipe_intr(self)) return EINTR_RET;
     }
 
     if (p->count == 0) {
@@ -264,11 +273,11 @@ long pipe_write(struct pipe *p, const void *buf, size_t n) {
         /* Block while the buffer is full. */
         while (p->count == PIPE_BUF_SZ && p->readers > 0) {
             struct proc *self = current_proc();
-            if (SIG_SHOULD_EINTR(self)) {
+            if (pipe_intr(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
             pipe_park(&p->wq_write, self);
-            if (SIG_SHOULD_EINTR(self)) {
+            if (pipe_intr(self)) {
                 return put > 0 ? (long)put : EINTR_RET;
             }
         }
@@ -372,7 +381,7 @@ static bool fifo_wait_other(struct fifo *ff, bool want_writer) {
         int other = !p ? 0 : (want_writer ? p->writers : p->readers);
         uint32_t now = want_writer ? ff->w_opens : ff->r_opens;
         if (other > 0 || now != start) break;
-        if (SIG_SHOULD_EINTR(self)) { ff->waiting--; return false; }
+        if (pipe_intr(self)) { ff->waiting--; return false; }
         pipe_park(&ff->wq, self);
     }
     ff->waiting--;

@@ -932,12 +932,11 @@ static int g_positional_count;
  *
  * /bin/tsh HAS ^C, so it has no cap, as bash has none: a loop that means to
  * run for a long time -- a poller, a counter past a million -- was stopped
- * at 1e6 with "while: iteration limit reached". __LONG_MAX__ is out of reach. */
-#ifdef SHELL_HOSTED
+ * at 1e6 with "while: iteration limit reached". __LONG_MAX__ is out of reach.
+ *
+ * ...and the kernel shell has ^C too now (shell_kernel_interrupt), so it has
+ * no cap either. */
 #define SHELL_LOOP_ITER_MAX __LONG_MAX__
-#else
-#define SHELL_LOOP_ITER_MAX 1000000L
-#endif
 
 enum shell_flow {
     SHELL_FLOW_NONE = 0,
@@ -5991,6 +5990,83 @@ int shell_take_interrupt(void) {
     shell_set_status(130);            /* 128 + SIGINT, like bash */
     return 1;
 }
+
+#ifndef SHELL_HOSTED
+/* ^C AT THE KERNEL SHELL. It had none: it runs in pid 0 with no terminal
+ * driver of its own, so a loop of builtins ran to the iteration cap, a wait
+ * of pid 0's -- a FIFO, a `wait` -- until the other end came, and over TCP
+ * the 0x03 sat unread behind the running line. Its terminals now do what a
+ * tty's ISIG does (tcp_shell.c while a line runs; tty.c at the console) and
+ * call here; this does what bash does with the SIGINT, measured on a pty
+ * (tools/agent/probes/b20/intr-bash.py):
+ *
+ *   - a foreground command gets SIGINT, its group -- the shell is not in
+ *     front then -- and when it DIES of it with INT untrapped, the shell
+ *     acts as if interrupted too: the rest of the line or loop is dropped
+ *     (`sleep 30; echo after` prints nothing, a `for` stops), $? 130;
+ *     trapped, the line goes on and the trap does not run;
+ *   - with no command in front the SHELL is interrupted: untrapped, the
+ *     line unwinds to the prompt (SHELL_FLOW_INTERRUPT, $? 130) and a wait
+ *     of pid 0's ends (pipe.c pipe_intr, proc_wait_intr); trapped, its
+ *     action runs at the next command, '' ignores it.
+ *
+ * Set from a terminal's poll, read at the boundaries; no lock beyond the
+ * BKL the kernel shell runs under. */
+static const char *shell_trap_live(int i);
+static volatile bool g_kintr_fg;          /* the ^C went to a command */
+static volatile bool g_kcon_busy;         /* the console's line is running */
+static volatile bool g_kcon_prompt_intr;  /* a ^C at the console's prompt */
+
+static void shell_kernel_self_interrupt(void) {
+    const char *t = shell_trap_live(SIGINT);
+    if (t) {
+        if (*t) g_pending_signals[SIGINT] = 1;
+        return;
+    }
+    g_sigint_flag = 1;
+}
+
+void shell_kernel_interrupt(void) {
+    if (signal_get_foreground() > 0) {
+        signal_send_to_foreground(SIGINT);
+        g_kintr_fg = true;
+        return;
+    }
+    shell_kernel_self_interrupt();
+}
+
+/* An untrapped ^C: what ends a wait of pid 0's on a pipe (pipe.c). */
+bool shell_kernel_interrupted(void) { return g_sigint_flag != 0; }
+
+/* ...and `wait`'s, which a trapped one ends too (bash's wait returns at a
+ * trapped signal; the trap then runs). */
+static bool shell_kernel_wait_interrupted(void) {
+    return g_sigint_flag != 0 || g_pending_signals[SIGINT] != 0;
+}
+
+/* tty.c's ^C at the console, from the keyboard's interrupt: flags only.
+ * The signal to the foreground group is tty.c's own. */
+void shell_console_isig(void) {
+    if (!g_kcon_busy) {
+        g_kcon_prompt_intr = true;
+        return;
+    }
+    if (signal_get_foreground() > 0) {
+        g_kintr_fg = true;
+        return;
+    }
+    shell_kernel_self_interrupt();
+}
+
+/* The command the ^C reached is over: did it die of the SIGINT? Asked at
+ * the next command's boundary (execute_line_text_inner). */
+static void shell_kernel_fg_intr_check(void) {
+    if (!g_kintr_fg || signal_get_foreground() > 0) return;
+    g_kintr_fg = false;
+    if (proc_last_term_sig() == SIGINT && !shell_trap_live(SIGINT))
+        g_sigint_flag = 1;
+}
+#endif
 
 #ifdef SHELL_HOSTED
 static void shell_termsig_check(void);
@@ -13646,12 +13722,17 @@ static int shell_wait_job(struct job *j) {
         for (int k = 0; k < j->nproc; k++) {
             struct job_proc *p = &j->proc[k];
             if (p->dead) continue;
+#ifdef SHELL_HOSTED
             signal_set_foreground(p->pid);
             int rc = proc_wait(p->pid);
             signal_set_foreground(0);
-#ifdef SHELL_HOSTED
-            if (rc == -2) return SHELL_WAIT_INTR;      /* host.c's EINTR stop */
+#else
+            /* not the terminal's: a ^C interrupts the shell (bash's `wait`
+             * returns 130 and the job runs on) -- the console's made the
+             * job foreground, and its ^C killed what was only waited for */
+            int rc = proc_wait_intr(p->pid, shell_kernel_wait_interrupted);
 #endif
+            if (rc == -2) return SHELL_WAIT_INTR;      /* an EINTR stop */
             p->dead = true;
             p->stopped = false;
             if (rc < 0) { foreign++; continue; }
@@ -13669,12 +13750,14 @@ static int shell_wait_job(struct job *j) {
         shell_jobs_after_wait();
     } else if (!j->dead) {
         int pid = j->pid;
+#ifdef SHELL_HOSTED
         signal_set_foreground(pid);
         int rc = proc_wait(pid);
         signal_set_foreground(0);
-#ifdef SHELL_HOSTED
-        if (rc == -2) return SHELL_WAIT_INTR;          /* host.c's EINTR stop */
+#else
+        int rc = proc_wait_intr(pid, shell_kernel_wait_interrupted);
 #endif
+        if (rc == -2) return SHELL_WAIT_INTR;          /* an EINTR stop */
         if (rc < 0) {
             kprintf("wait: pid %d is not a child of this shell\n", pid);
             jobs_remove(j);
@@ -13904,6 +13987,11 @@ static void cmd_wait_in(int argc, char **argv) {
                 shell_set_status(128 + g_wait_intr_sig);
                 return;
             }
+#else
+            if (rc == SHELL_WAIT_INTR) {
+                shell_set_status(130);
+                return;
+            }
 #endif
         }
         if (!(g_opt_monitor && g_interactive))
@@ -13929,6 +14017,11 @@ static void cmd_wait_in(int argc, char **argv) {
 #ifdef SHELL_HOSTED
             if (rc == SHELL_WAIT_INTR) {
                 shell_set_status(128 + g_wait_intr_sig);
+                return;
+            }
+#else
+            if (rc == SHELL_WAIT_INTR) {
+                shell_set_status(130);
                 return;
             }
 #endif
@@ -45866,6 +45959,9 @@ static void execute_line_text_inner(const char *src) {
      * Setting the flow makes each enclosing construct unwind on its own
      * existing test, so no loop needs its own interrupt check. $? is 130
      * (128 + SIGINT), which is what bash reports. */
+#ifndef SHELL_HOSTED
+    shell_kernel_fg_intr_check();
+#endif
     if (g_sigint_flag) {
         g_shell_flow = SHELL_FLOW_INTERRUPT;
         shell_set_status(130);
@@ -46751,6 +46847,22 @@ bool shell_input_pending(void) {
     return g_heredoc_collecting || g_continuation_active;
 }
 
+#ifndef SHELL_HOSTED
+/* ^C AT THE PROMPT: the command being collected goes -- an `if` waiting
+ * for its `fi`, a here-document's body -- and $? is 130, as bash's (the
+ * terminal throws the typed line away; its caller does). */
+void shell_kernel_prompt_interrupt(void) {
+    g_heredoc_collecting = false;
+    g_continuation_active = false;
+    g_continuation_len = 0;
+    g_continuation_buf[0] = '\0';
+    shell_heredoc_reset();
+    g_sigint_flag = 0;
+    g_kintr_fg = false;
+    shell_set_status(130);
+}
+#endif
+
 bool shell_take_exit_request(void) {
     bool r = g_kshell_exit_pending;
     g_kshell_exit_pending = false;
@@ -46758,6 +46870,13 @@ bool shell_take_exit_request(void) {
 }
 
 static void shell_kernel_flow_done(void) {
+#ifndef SHELL_HOSTED
+    /* a ^C that reached the line's last command is over with the line: its
+     * status is the command's 130, and nothing is left to drop. Kept, it
+     * dropped the NEXT line's first command (the last child had died of
+     * SIGINT) -- before the switch, which returns when no flow is set. */
+    g_kintr_fg = false;
+#endif
     switch (g_shell_flow) {
     case SHELL_FLOW_NONE:
         return;
@@ -46996,6 +47115,23 @@ void shell_poll(void) {
      * child returns immediately. */
     jobs_reap_finished();
 
+#ifndef SHELL_HOSTED
+    /* ^C at the console's prompt (tty.c -> shell_console_isig): the typed
+     * line and anything being collected go, $? 130, a fresh prompt. */
+    if (g_kcon_prompt_intr) {
+        g_kcon_prompt_intr = false;
+        kputc('^');
+        kputc('C');
+        kputc('\n');
+        line_len = 0;
+        line[0] = '\0';
+        g_kline_pos = 0;
+        g_kline_hist = g_hist_count;
+        shell_kernel_prompt_interrupt();
+        prompt();
+    }
+#endif
+
     int c;
     while ((c = kbd_trygetc()) >= 0) {
         char ch = (char)c;
@@ -47005,7 +47141,13 @@ void shell_poll(void) {
             kputc('\n');
             {
                 uint64_t irqf = spin_lock_irqsave(&g_shell_line_lock);
+#ifndef SHELL_HOSTED
+                g_kcon_busy = true;
+#endif
                 execute_line();
+#ifndef SHELL_HOSTED
+                g_kcon_busy = false;
+#endif
                 line_len = 0;
                 g_kline_pos = 0;
                 g_kline_hist = g_hist_count;
