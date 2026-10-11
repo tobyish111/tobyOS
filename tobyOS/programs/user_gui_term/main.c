@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/wait.h>
+#include <tobyos/abi/abi.h>
 
 #define SYS_CLOCK_MS   48
 static inline uint32_t sys_clock_ms(void){ long r; __asm__ volatile("syscall":"=a"(r):"0"((long)SYS_CLOCK_MS):"rcx","r11","memory"); return (uint32_t)r; }
@@ -40,13 +41,14 @@ static inline uint32_t sys_clock_ms(void){ long r; __asm__ volatile("syscall":"=
  * This is only possible because tcsetattr() now actually reaches the
  * kernel (libtoby/src/termios.c) -- before that fix a shell on a pty
  * could not have put the line discipline where it needs it. */
-extern pid_t toby_spawn(const char *path, char *const argv[],
-                        char *const envp[], int fd0, int fd1, int fd2);
+extern pid_t toby_spawn_flags(const char *path, char *const argv[],
+                              char *const envp[], int fd0, int fd1, int fd2,
+                              const struct abi_spawn_fd *extra, unsigned nextra,
+                              unsigned flags);
 
 #define TIOCSPTLCK  0x40045431UL
 #define TIOCGPTN    0x80045430UL
 #define TIOCSWINSZ  0x5414UL
-#define TIOCSPGRP   0x5410UL
 #define FIONREAD    0x541BUL
 struct winsize_t { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; };
 
@@ -270,17 +272,21 @@ static int shell_start(void){
     struct winsize_t ws={ (unsigned short)ROWS,(unsigned short)COLS,0,0 };
     (void)ioctl(sfd,TIOCSWINSZ,&ws);
 
-    /* Make our process group the pty's foreground group BEFORE the shell
-     * exists, so its job-control init sees itself foreground from its
-     * first instruction and never stops. Same etiquette /bin/ttyparity
-     * needs. */
-    pid_t self_pg=getpgrp();
-    (void)ioctl(sfd,TIOCSPGRP,&self_pg);
-
+    /* THE SHELL LEADS A SESSION WHOSE TERMINAL IS THIS PTY, as a Linux
+     * terminal emulator's does (forkpty, login_tty): ABI_SPAWN_F_SETSID.
+     * It inherited ours -- the CONSOLE, pid 0's, as the desktop launched us
+     * -- so /dev/tty in this window was the console: `tty < /dev/tty` said
+     * /dev/console, and `seq 100 | less`, which reads its keys from
+     * /dev/tty, set the console raw and waited there while the keys typed
+     * here went to the pty (tools/agent/probes/b21/guiterm.py). The new
+     * session's group is the pty's foreground group from the start, so the
+     * shell's job-control init sees itself foreground and never stops --
+     * what a TIOCSPGRP to our own group before the spawn did. */
     char *const envp[]={ (char *)"PATH=/bin",(char *)"HOME=/",
                          (char *)"TERM=vt100",(char *)"LANG=C",0 };
     char *argv[]={ (char *)"tsh",0 };
-    pid_t pid=toby_spawn("/bin/tsh",argv,envp,sfd,sfd,sfd);
+    pid_t pid=toby_spawn_flags("/bin/tsh",argv,envp,sfd,sfd,sfd,0,0,
+                               ABI_SPAWN_F_SETSID);
     close(sfd);
     if(pid<0){ close(mfd); return -4; }
     g_mfd=mfd; g_shell_pid=pid;

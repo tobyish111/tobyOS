@@ -4452,7 +4452,8 @@ static long sys_spawn(const struct abi_spawn_req *req) {
     struct abi_spawn_req kreq;
     if (copy_from_user(&kreq, req, sizeof(kreq)) != 0) return -ABI_EFAULT;
     if (kreq.flags & ~(ABI_SPAWN_F_DFL_INT | ABI_SPAWN_F_DFL_QUIT |
-                       ABI_SPAWN_F_IGN_INT | ABI_SPAWN_F_IGN_QUIT))
+                       ABI_SPAWN_F_IGN_INT | ABI_SPAWN_F_IGN_QUIT |
+                       ABI_SPAWN_F_SETSID))
         return -ABI_EINVAL;
 
     /* A RELATIVE PATH IS THE CALLER'S CWD's, as execve's is (sys_execve
@@ -4592,6 +4593,23 @@ static long sys_spawn(const struct abi_spawn_req *req) {
                        ((kreq.flags & ABI_SPAWN_F_IGN_QUIT) ? SIGMASK(SIGQUIT) : 0),
     };
     int pid = proc_spawn(&spec);
+    /* ABI_SPAWN_F_SETSID: a session of the child's own, whose terminal is
+     * the pty on its fd 0 (abi.h). Set before the child's first system
+     * call, which waits for the BKL this one holds -- as ssh.c gives an SSH
+     * session its pty. */
+    if (pid >= 0 && (kreq.flags & ABI_SPAWN_F_SETSID)) {
+        struct proc *cp = proc_lookup(pid);
+        if (cp) {
+            cp->sid = pid;
+            cp->pgid = pid;
+            cp->ctty_kind = PROC_CTTY_NONE;
+            cp->ctty_index = 0;
+            cp->ctty_gen = 0;
+            int idx = (f0 && f0->kind == FILE_KIND_PTY_SLAVE)
+                    ? pty_file_index(f0) : -1;
+            if (idx >= 0) (void)pty_make_ctty(cp, idx, false);
+        }
+    }
     for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
     kfree(kextra);
 

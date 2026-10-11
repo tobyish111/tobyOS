@@ -2029,6 +2029,14 @@ struct abi_spawn_req {
 #define ABI_SPAWN_F_DFL_QUIT   0x2u
 #define ABI_SPAWN_F_IGN_INT    0x4u
 #define ABI_SPAWN_F_IGN_QUIT   0x8u
+/* The child leads a NEW SESSION and process group (posix_spawn's
+ * POSIX_SPAWN_SETSID), and the pty on its fd 0, when that is one, is its
+ * controlling terminal -- as a session leader's first open of a terminal
+ * makes it, and as login_tty(3) leaves a terminal emulator's shell. Without
+ * it the child keeps its spawner's session and terminal: /bin/gui_term's
+ * shell had the CONSOLE's, so /dev/tty in the desktop's terminal window
+ * opened the console, and `cmd | less` there waited on it for its keys. */
+#define ABI_SPAWN_F_SETSID     0x10u
 
 /* ============================================================
  *  Networking helpers (already exported in older syscall.h, but
