@@ -1724,6 +1724,19 @@ struct job_proc {
 
 static void job_final_status(const struct job *j, int *code, int *sig);
 
+/* $? WHEN A FOREGROUND JOB STOPS: bash's wait_for, 128 + WSTOPSIG of the
+ * status of the job's FIRST process -- its stop signal when it is stopped
+ * too, but the byte WSTOPSIG reads in an exit status when it had ended (its
+ * exit code; 0 for a signal's). ^Z on `seq 1 200 | less`, seq gone with 0:
+ * 128; on `sh -c 'exit 3' | sleep 30`: 131. tsh said 128 + the stop signal
+ * whatever the first process was (finding 125; logs/b22 intrz-bash-*.out).
+ * One process, or J NULL: 128 + SSIG. */
+static int shell_stopped_status(const struct job *j, int ssig) {
+    if (j && j->nproc > 1 && j->proc && j->proc[0].dead)
+        return 128 + (j->proc[0].sig > 0 ? 0 : (j->proc[0].code & 0xff));
+    return 128 + ssig;
+}
+
 /* The pid `$!`, "[N] PID" and a saved status name: the last process's. */
 static int job_last_pid(const struct job *j) {
     return (j->nproc > 0 && j->proc) ? j->proc[j->nproc - 1].pid : j->pid;
@@ -13443,7 +13456,7 @@ static int shell_fg_bg_one(const char *spec, bool fg) {
         }
         jobs_set_current(jid);       /* bash's waitchld: a stop */
         if (js) shell_job_stopped_notice(js);
-        return 128 + ssig;
+        return shell_stopped_status(js, ssig);
     }
     shell_report_job_death(pid, fsig >= 0 ? fsig : proc_last_term_sig(),
                            saved_name, true);
@@ -45571,7 +45584,8 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (sj) shell_job_stopped_notice(sj);
         shell_stages_free(stages, nst);
         g_cpl_last_subshell_failed = false;
-        shell_set_status(last);                  /* PIPESTATUS: as it was */
+        /* PIPESTATUS: as it was; $? from the first process */
+        shell_set_status(sj ? shell_stopped_status(sj, jc_ssig) : last);
         return true;
     }
 #endif
