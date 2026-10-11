@@ -14789,7 +14789,9 @@ static bool shell_cat_stdin(void) {
      * console file reads as empty rather than blocking -- see file.h). */
     if (!in) return true;
     if (!shell_cat_copy_file(in)) {
-        shell_err("cat: -: read error\n");
+        /* a ^C ended the read: cat dies of it without a word, as bash's
+         * cat does of the SIGINT (finding 127) */
+        if (!g_sigint_flag) shell_err("cat: -: read error\n");
         return false;
     }
     return true;
@@ -39774,6 +39776,26 @@ static void shell_set_pipestatus1(int status) {
     shell_set_pipestatus(&status, 1);
 }
 
+#ifndef SHELL_HOSTED
+/* ONE FOREGROUND GROUP FOR A KERNEL PIPELINE'S PROCESSES, as a job-control
+ * shell's job: the first process spawned leads it and is the terminal's
+ * foreground from then on, the others join it. Each stage was made the
+ * foreground in turn as it was waited for, so a ^C reached that one stage
+ * alone, and while a builtin stage ran here -- the kernel's cat -- nothing
+ * was: the ^C interrupted the shell, the builtin's read failed ("cat: -:
+ * read error"), and `sleep 30 | cat` ran out its 30 s while the next
+ * line's ^C threw away what was typed meanwhile (finding 127, probes/b22
+ * kintr2.py c5). bash's ^C reaches every process of the pipeline. */
+static void shell_kpipe_join(int *leader, int pid) {
+    if (!*leader) {
+        *leader = pid;
+        signal_set_foreground(pid);
+    } else {
+        (void)proc_set_pgid(pid, *leader);
+    }
+}
+#endif
+
 static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (pl->count == 1) {
         g_pipestatus_keep = false;
@@ -39812,6 +39834,7 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     memset(stage_status, 0, ns * sizeof(int));
 #ifndef SHELL_HOSTED
     memset(spill, 0, ns * sizeof *spill);
+    int kleader = 0;                    /* see shell_kpipe_join */
 #endif
 
     for (int i = 0; i < pl->count - 1; i++) {
@@ -39906,9 +39929,20 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
             /* fork failed: fall through and run it here, as before. */
         }
 #endif
+#ifndef SHELL_HOSTED
+        bool kint_before = g_kintr_fg || g_sigint_flag;
+#endif
         int shell_rc = shell_run_pipeline_shell_stage(&pl->stage[i], in, out);
         if (shell_rc >= 0) {
             stage_status[i] = shell_rc;
+#ifndef SHELL_HOSTED
+            /* the terminal's ^C came while this builtin stage ran here:
+             * bash's stage, a process of the job, died of it -- 130 in
+             * PIPESTATUS, where the kernel's cat read on to the end and
+             * said 0 (logs/b22 c18) */
+            if (!kint_before && (g_kintr_fg || g_sigint_flag) && !background)
+                stage_status[i] = 130;
+#endif
         } else {
             /* ONE STAGE FAILING DOES NOT CANCEL THE PIPELINE. bash runs every
              * stage it can and the one that could not start simply exits 127:
@@ -39927,6 +39961,9 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
                                                  &pids[i]);
             if (rcs == 0) has_pid[i] = true;
             else          stage_status[i] = rcs;
+#ifndef SHELL_HOSTED
+            if (rcs == 0 && !background) shell_kpipe_join(&kleader, pids[i]);
+#endif
         }
 
         if (in) {
@@ -39972,17 +40009,19 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
 #ifdef SHELL_HOSTED
     struct shell_wce wce;
     shell_wce_begin(&wce);
-    bool any_int = false;               /* any element died of SIGINT */
 #endif
+    bool any_int = false;               /* any element died of SIGINT */
     for (int i = 0; i < pl->count; i++) {
         int stage_rc = stage_status[i];
         if (has_pid[i]) {
+#ifndef SHELL_HOSTED
+            signal_set_foreground(kleader ? kleader : pids[i]);
+#else
             signal_set_foreground(pids[i]);
+#endif
             stage_rc = proc_wait(pids[i]);
             waited_any = true;
-#ifdef SHELL_HOSTED
             if (proc_last_term_sig() == SIGINT) any_int = true;
-#endif
         }
         stage_status[i] = stage_rc;
         if (stage_rc != 0) failed = stage_rc;
@@ -39992,6 +40031,11 @@ static int shell_run_pipeline(struct shell_pipeline *pl, bool background) {
     if (waited_any) shell_jobs_notify(shell_bash_lnum(), SHELL_NOTIFY_WAITED);
 #ifdef SHELL_HOSTED
     shell_wce_end(&wce, any_int);
+#else
+    /* a stage the terminal's ^C killed: decided here, where the pipeline
+     * ends -- the boundary's look at the last stage waited for misses a
+     * `sleep 30 | true` (shell_kernel_fg_intr_check) */
+    if (any_int && g_kintr_fg && g_kfg_interrupts) g_sigint_flag = 1;
 #endif
     shell_set_pipestatus(stage_status, pl->count);
     /* `set -o pipefail`: the rightmost FAILING stage decides. */
