@@ -41,6 +41,23 @@ CASES = [
      'echo "c9 st=$?"\n'),
     ("c10", "", "for i in 1 2; do if sleep 30; then :; else echo else-c10-$i; fi; done; echo after-c10\n",
      1.0, 'echo "c10 st=$?"\n'),
+    ("c11", "", "( sleep 30 ); echo after-c11\n", 1.0, 'echo "c11 st=$?"\n'),
+    # a function resets the loop level: no list, no loop inside f12 -- the
+    # loop goes on to `sleep 2` (bash's loop_level = 0 in a function)
+    ("c12", "f12() { sleep $1; }\n", "for i in 30 2; do f12 $i; done\n", 1.0,
+     'echo "c12 st=$?"\n'),
+    ("c13", "", "{ sleep 30; } | cat; echo after-c13\n", 1.0, 'echo "c13 st=$?"\n'),
+    ("c14", "", "sleep 30 && echo and-c14\n", 1.0, 'echo "c14 st=$?"\n'),
+    ("c15", "", "sleep 30 | /bin/cat; echo after-c15\n", 1.0,
+     'echo "c15 st=$? ps=${PIPESTATUS[*]}"\n'),
+    ("c16", "", "sleep 30 | true; echo after-c16\n", 1.0, 'echo "c16 st=$?"\n'),
+    # PIPESTATUS after the shell is interrupted: bash's throw_to_top_level
+    # makes it the one 130; a pipeline alone keeps its own
+    ("c17", "true | false\n", "echo partial-c17", 0.5, 'echo "c17 ps=${PIPESTATUS[*]}"\n'),
+    ("c18", "", "sleep 30 | cat\n", 1.0, 'echo "c18 ps=${PIPESTATUS[*]}"\n'),
+    ("t5", "printf 'sleep 30\\necho in-t5\\n' > /tmp/t5.sh; trap 'echo T-t5' INT\n",
+     ". /tmp/t5.sh; echo after-t5\n", 1.0,
+     'trap - INT; echo "t5 st=$?"\n'),
     ("t1", "trap 'echo T-t1' INT\n",
      "for i in 1 2; do sleep 30; echo it-t1-$i; done; echo after-t1\n", 1.0,
      'trap - INT; echo "t1 st=$?"\n'),
@@ -57,10 +74,20 @@ CASES = [
 # `intr-pty.py HOST PORT SHELL z`: the ^Z cases instead -- $? after a stop
 if len(sys.argv) > 4 and sys.argv[4] == "z":
     CASES = [
-        ("z1", "", "sleep 30\n", 1.0, 'echo "z1 st=$?"; kill -9 %1; wait\n'),
-        ("z2", "", "seq 1 200 | less\n", 2.0, 'echo "z2 st=$?"; kill -9 %1; wait\n'),
-        ("z3", "", "sleep 30 | cat\n", 1.0, 'echo "z3 st=$?"; kill -9 %1; wait\n'),
+        ("z1", "", "sleep 30\n", 1.0, 'echo "z1 st=$? ps=${PIPESTATUS[*]}"; kill -9 %1; wait\n'),
+        ("z2", "", "seq 1 200 | less\n", 2.0, 'echo "z2 st=$? ps=${PIPESTATUS[*]}"; kill -9 %1; wait\n'),
+        ("z3", "", "sleep 30 | cat\n", 1.0, 'echo "z3 st=$? ps=${PIPESTATUS[*]}"; kill -9 %1; wait\n'),
+        # the first element ended 3: bash's 128 + WSTOPSIG of its exit status
+        ("z4", "", "sh -c 'exit 3' | sleep 30\n", 1.0, 'echo "z4 st=$? ps=${PIPESTATUS[*]}"; kill -9 %1; wait\n'),
+        # stopped again under fg
+        ("z5", "", "seq 1 200 | less\n", 2.0, 'fg\n'),
+        ("z6", "", "", 0.1, 'echo "z6 st=$? ps=${PIPESTATUS[*]}"; kill -9 %1; wait\n'),
     ]
+
+# CASES=c17,c18 runs those alone
+if os.environ.get("CASES"):
+    _only = set(os.environ["CASES"].split(","))
+    CASES = [c for c in CASES if c[0] in _only]
 
 env = dict(os.environ)
 env.setdefault("ProgramData", r"C:\ProgramData")
