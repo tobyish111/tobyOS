@@ -1117,6 +1117,37 @@ echo @@sleep_time
 s0=$SECONDS; sleep 0.0005h 0.01m 0.4; echo "dur=$((SECONDS - s0))"
 timeout 1 sleep inf; echo rc=$?
 
+echo @@timeout_status
+# GNU coreutils' timeout (finding 130): the command's own status, a quick
+# failure too; 124 when it times out, the command's with -p; 137 for a KILL
+# (-f: timeout is not in the line of fire); 0 is no timeout; 126 and 127 for
+# a command that cannot run.
+timeout 1 false; echo rc=$?
+timeout 1 sh -c 'exit 3'; echo rc=$?
+timeout 0.3 sleep 2; echo rc=$?
+timeout -p 0.3 sleep 2; echo rc=$?
+timeout -f -s KILL 0.3 sleep 2; echo rc=$?
+timeout -f -k 0.3 0.3 sh -c 'trap "" TERM; sleep 2'; echo rc=$?
+timeout 0 sleep 0.2; echo rc=$?
+timeout 1 /etc/passwd 2>&1; echo rc=$?
+timeout 1 nosuchcmd 2>&1; echo rc=$?
+echo @@timeout_msgs
+# getopt's messages and the Try line, status 125; options stop at DURATION
+timeout 2>&1; echo rc=$?
+timeout abc true 2>&1; echo rc=$?
+timeout -s FOO 1 true 2>&1; echo rc=$?
+timeout --v 1 true 2>&1; echo rc=$?
+timeout -s 2>&1; echo rc=$?
+timeout -v -s int 0.3 sleep 2 2>&1; echo rc=$?
+timeout 1 -- echo hi 2>&1; echo rc=$?
+timeout --help | head -1
+echo @@timeout_group
+# the command's whole group is signalled; a signal sent to timeout is passed
+# on; a command a signal killed takes timeout with it ("Terminated").
+timeout 0.3 sh -c 'sleep 2; echo after'; echo rc=$?
+timeout 5 sleep 3 & p=$!; sleep 0.3; kill -INT $p; wait $p; echo rc=$?
+sh -c 'timeout 1 sh -c "kill -TERM \$\$"; echo rc=$?' 2>&1
+
 echo @@diag_redir
 # INFORMATIONAL (no check): `cmd > f 2>&1` followed by `tail -1 f` printed
 # nothing in gate run 3 while sed/grep read the same file. Characterise it.
