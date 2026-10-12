@@ -91,6 +91,7 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 static char g_out_a[CAP_OUT];
 static char g_out_b[CAP_OUT];
 static char g_out_a2[CAP_OUT];      /* the oracle, asked a second time */
+static char g_out_shaky[CAP_OUT];   /* ...and an answer unlike its first */
 static char g_err_a[8192];
 static char g_err_b[8192];
 
@@ -109,16 +110,40 @@ static char g_err_b[8192];
  * (a case whose two host bash runs differ is UNUSABLE); it simply had never
  * been applied to the GUEST, where the timing is different.
  *
- * Two properties keep this from becoming a way to hide failures:
- *   - it only ever runs on a case that ALREADY MISMATCHED, and only for
- *     POSIX-classified cases, so it cannot turn a pass into anything;
- *   - every exclusion is printed with the two differing bash outputs, and the
- *     verdict line carries the count. An exclusion you cannot see is a lie.
+ * AND A RACE IS JUDGED BY BASH'S OWN ANSWERS (batch 24, finding 74). Some
+ * cases race inside bash: `{ echo hi; exit 55; } | false` is 55 or 141 as
+ * echo writes before or after false is gone, `kill` then `wait` is 143 or
+ * 127 as the job is or is not reaped first. tsh gave bash's usual answer
+ * every time, and the gate still flipped whenever bash's first run gave
+ * its rarer one -- or, in a BASH-ONLY case, which was never re-checked,
+ * failed outright. So the reruns now ask whether bash ITSELF gives tsh's
+ * answer: if one of them does, tsh's answer is bash's and the case passes
+ * ('R', counted as race). If tsh's lines are bash's in another order --
+ * `echo a & echo b`, two processes writing at once -- tsh is run again too,
+ * and it passes only if tsh then gives one of bash's own answers exactly:
+ * the shells differ in which process the scheduler let write first, not in
+ * what either one prints.
  *
- * Eight probes: a 50/50 case survives all eight undetected once in 256 runs.
- * The budget bounds a broken build, where hundreds of cases mismatch at once
- * and re-running each eight times would turn a 10-minute gate into an hour. */
-#define NONDET_PROBES  8
+ * Three properties keep this from becoming a way to hide failures:
+ *   - it only ever runs on a case that ALREADY MISMATCHED, so it cannot turn
+ *     a pass into anything;
+ *   - a pass needs an exact answer -- stdout and status -- that the guest's
+ *     own bash gave in this run; a reordering alone is never enough;
+ *   - every exclusion and every race is printed with the differing outputs,
+ *     and the verdict line carries both counts. An exclusion you cannot see
+ *     is a lie.
+ *
+ * Up to 24 reruns of bash, stopping at tsh's answer: tsh's can be bash's
+ * RARER one. Oils 0944 (`kill %%` then `wait %%`) is 143 when wait finds
+ * the job still alive -- Linux bash's answer, and tsh's two times in three
+ * -- but 127 from the guest's bash four times in five, its job reaped
+ * sooner (logs/b24/racedist2-0944.out). Eight reruns missed a one-in-five
+ * answer 17% of the time; 24 miss it 0.5%. Then up to 8 of tsh for a
+ * reordering. A case bash always answers one way costs all 24, which is why
+ * the budget bounds a broken build, where hundreds of cases mismatch at
+ * once and re-running each would turn a 10-minute gate into hours. */
+#define NONDET_PROBES  24
+#define ORDER_PROBES   8
 #define NONDET_BUDGET  400
 
 static char g_cases[MAX_CASES][32];     /* case id, e.g. "0123" */
@@ -428,6 +453,43 @@ static void show_diff(const char *a, long na, const char *b, long nb) {
     show_diff_named(a, na, b, nb, "bash", "tsh");
 }
 
+/* One answer -- stdout and the status -- as a number to compare answers by
+ * (FNV-1a, 64 bits). */
+static unsigned long long answer_hash(int rc, const char *buf, long n) {
+    unsigned long long h = 1469598103934665603ULL;
+    for (long i = 0; i < n; i++) {
+        h ^= (unsigned char)buf[i];
+        h *= 1099511628211ULL;
+    }
+    h ^= (unsigned long long)(unsigned)rc;
+    h *= 1099511628211ULL;
+    return h;
+}
+
+/* The same lines, as many of each, in any order. Quadratic, so for short
+ * outputs only -- the ones two processes' lines interleave in. */
+static int line_count_of(const char *buf, long n, const char *line, long len) {
+    int c = 0;
+    for (long i = 0; i < n;) {
+        long e = i;
+        while (e < n && buf[e] != '\n') e++;
+        if (e - i == len && memcmp(buf + i, line, (size_t)len) == 0) c++;
+        i = e + 1;
+    }
+    return c;
+}
+static int same_lines_any_order(const char *a, long na, const char *b, long nb) {
+    if (na != nb || na > 16384) return 0;
+    for (long i = 0; i < na;) {
+        long e = i;
+        while (e < na && a[e] != '\n') e++;
+        if (line_count_of(a, na, a + i, e - i) != line_count_of(b, nb, a + i, e - i))
+            return 0;
+        i = e + 1;
+    }
+    return 1;
+}
+
 /* Free memory, in MiB, from /proc/meminfo.
  *
  * The run died at case ~2700 with pmm_alloc_page() OOM and 4 MiB free of
@@ -730,8 +792,9 @@ int main(void) {
     mkdir(SCRATCH_TMP, 0755);        /* the $TMP the cases write into */
 
     char out_a[MAX_PATH], out_b[MAX_PATH], err_a[MAX_PATH], err_b[MAX_PATH];
-    char out_a2[MAX_PATH];
+    char out_a2[MAX_PATH], err_x[MAX_PATH];
     snprintf(out_a2, sizeof out_a2, "%s/out.a2", scratch);
+    snprintf(err_x, sizeof err_x, "%s/err.x", scratch);
     snprintf(out_a, sizeof out_a, "%s/out.a", scratch);
     snprintf(out_b, sizeof out_b, "%s/out.b", scratch);
     snprintf(err_a, sizeof err_a, "%s/err.a", scratch);
@@ -750,7 +813,7 @@ int main(void) {
              "UNAIMED up to the budget\n");
 
     int pass = 0, fail = 0, skip = 0, broken = 0, detail = 0;
-    int nondet = 0, nondet_budget = NONDET_BUDGET;
+    int nondet = 0, nondet_budget = NONDET_BUDGET, race = 0;
     int diagnosed = 0;
     int recreated_a = 0, recreated_b = 0;
 
@@ -858,33 +921,85 @@ int main(void) {
         if (same_out && same_rc) { g_result[i] = 'P'; pass++; continue; }
 
         /* Ask the oracle again before charging this to tsh -- see the note at
-         * NONDET_PROBES. POSIX-classified only: the compliance number is what
-         * this protects, and a BASH-ONLY case is not scored either way. */
-        if ((g_nposix == 0 || is_posix(id)) && nondet_budget > 0) {
-            int shaky = 0;
-            long na2 = 0;
-            int rc_a2 = 0;
+         * NONDET_PROBES. Every class: tsh follows bash in BASH-ONLY cases
+         * too, and a race there flipped the census as much as in POSIX. */
+        if (nondet_budget > 0) {
+            /* 1. Does bash itself give tsh's answer? */
+            unsigned long long seen[1 + NONDET_PROBES];
+            int nseen = 0, runs = 0, found = 0, shaky = 0;
+            long nshaky = 0;
+            seen[nseen++] = answer_hash(rc_a, g_out_a, na);
             for (int k = 0; k < NONDET_PROBES && nondet_budget > 0; k++) {
                 nondet_budget--;
                 wipe_dir(dir_w); mkdir(dir_w, 0755);
                 wipe_dir(SCRATCH_TMP); mkdir(SCRATCH_TMP, 0755);
-                rc_a2 = run_shell(BASH_PATH, av_bash, dir_w, out_a2, err_a,
-                                  devnull);
+                int rc_a2 = run_shell(BASH_PATH, av_bash, dir_w, out_a2, err_x,
+                                      devnull);
                 if (rc_a2 < -100) break;      /* harness trouble, not evidence */
-                na2 = read_all(out_a2, g_out_a2, sizeof g_out_a2);
+                long na2 = read_all(out_a2, g_out_a2, sizeof g_out_a2);
                 if (na2 < 0) break;
-                if (rc_a2 != rc_a || na2 != na ||
-                    memcmp(g_out_a, g_out_a2, (size_t)na) != 0) {
+                runs++;
+                seen[nseen++] = answer_hash(rc_a2, g_out_a2, na2);
+                if (!shaky && (rc_a2 != rc_a || na2 != na ||
+                               memcmp(g_out_a, g_out_a2, (size_t)na) != 0)) {
                     shaky = 1;
+                    memcpy(g_out_shaky, g_out_a2, (size_t)na2);
+                    nshaky = na2;
+                }
+                if (rc_a2 == rc_b && na2 == nb &&
+                    memcmp(g_out_b, g_out_a2, (size_t)nb) == 0) {
+                    found = runs;
                     break;
+                }
+            }
+            if (found) {
+                g_result[i] = 'R';
+                race++;
+                pass++;
+                emitf("[oilspec] RACE %s  bash gave tsh's answer too (its "
+                      "rerun %d; status bash=%d tsh=%d) -- a pass, counted "
+                      "as race\n", id, found, rc_a, rc_b);
+                show_diff_named(g_out_a, na, g_out_b, nb, "bash", "tsh");
+                continue;
+            }
+            /* 2. The same lines as bash's, in another order: which of two
+             * processes running at once wrote first. Only a pass if tsh
+             * gives one of bash's own answers when asked again. */
+            if (same_rc && same_lines_any_order(g_out_a, na, g_out_b, nb)) {
+                int truns = 0, tfound = 0;
+                for (int k = 0; k < ORDER_PROBES && nondet_budget > 0; k++) {
+                    nondet_budget--;
+                    wipe_dir(dir_w); mkdir(dir_w, 0755);
+                    wipe_dir(SCRATCH_TMP); mkdir(SCRATCH_TMP, 0755);
+                    int rc_b2 = run_shell(TSH_PATH, av_tsh, dir_w, out_a2, err_x,
+                                          devnull);
+                    if (rc_b2 < -100) break;
+                    long nb2 = read_all(out_a2, g_out_a2, sizeof g_out_a2);
+                    if (nb2 < 0) break;
+                    truns++;
+                    unsigned long long h = answer_hash(rc_b2, g_out_a2, nb2);
+                    for (int s = 0; s < nseen && !tfound; s++)
+                        if (seen[s] == h) tfound = truns;
+                    if (tfound) break;
+                }
+                if (tfound) {
+                    g_result[i] = 'R';
+                    race++;
+                    pass++;
+                    emitf("[oilspec] RACE %s  bash's lines in another order, and "
+                          "tsh gave bash's own answer (its rerun %d) -- a pass, "
+                          "counted as race\n", id, tfound);
+                    show_diff_named(g_out_a, na, g_out_b, nb, "bash", "tsh");
+                    continue;
                 }
             }
             if (shaky) {
                 g_result[i] = 'N';
                 nondet++;
                 emitf("[oilspec] ORACLE-NONDET %s  bash disagrees with ITSELF "
-                      "-- case is undecidable, excluded from the score\n", id);
-                show_diff_named(g_out_a, na, g_out_a2, na2,
+                      "and never gave tsh's answer -- case is undecidable, "
+                      "excluded from the score\n", id);
+                show_diff_named(g_out_a, na, g_out_shaky, nshaky,
                                 "run1", "run2");
                 continue;
             }
@@ -943,9 +1058,10 @@ int main(void) {
      * the prose above is only for eyeballing a run in progress.
      *   P pass   O stdout differs   X exit differs   D both differ
      *   E could not run   S excluded by the host oracle
-     *   N the guest's bash disagreed with ITSELF -- undecidable */
+     *   N the guest's bash disagreed with ITSELF -- undecidable
+     *   R a pass: tsh's answer is one the guest's bash gave too (a race) */
     emit("[oilspec] MAP legend P=pass O=stdout-diff X=exit-diff D=both "
-         "T=timeout E=broken S=skipped N=oracle-nondet\n");
+         "T=timeout E=broken S=skipped N=oracle-nondet R=race-pass\n");
     for (int i = 0; i < g_ncases; i += MAP_COLS) {
         char chunk[MAP_COLS + 1];
         int n = g_ncases - i;
@@ -962,9 +1078,9 @@ int main(void) {
               recreated_a, recreated_b);
 
     emitf("[OILSPEC] VERDICT: %s %d/%d pass fail=%d skipped=%d broken=%d "
-          "oracle-nondet=%d "
+          "oracle-nondet=%d race=%d "
           "(stdout+exit must match GNU bash 5.2 exactly)\n",
           fail == 0 && broken == 0 ? "PASS" : "FAIL",
-          pass, decided, fail, skip, broken, nondet);
+          pass, decided, fail, skip, broken, nondet, race);
     return (fail == 0 && broken == 0) ? 0 : 1;
 }
