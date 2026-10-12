@@ -1100,6 +1100,23 @@ echo @@mkfs_guard
 sudo -u pcall /bin/mkfs.vfat $DEV > /tmp/mg.out 2>&1; echo rc=$?; grep 'mkfs.vfat:' /tmp/mg.out
 /bin/mkfs.ext2 -q $DEV > /dev/null; e2fsck -n $DEV > /tmp/e2.out 2>&1; echo rc=$?; grep 'files (' /tmp/e2.out
 
+echo @@sleep_msgs
+# GNU coreutils' sleep, as typed (finding 129): every bad operand named, one
+# Try line, status 1; options wherever they stand; `--` alone sleeps nothing.
+sleep 2>&1; echo rc=$?
+sleep abc 0.1 def 2>&1; echo rc=$?
+sleep -x 2>&1; echo rc=$?
+sleep 0 --bogus 2>&1; echo rc=$?
+sleep --help=1 2>&1; echo rc=$?
+sleep 0x1p 2>&1; echo rc=$?
+sleep --help | head -1; sleep abc --he | head -1
+sleep 0 0s .0 0x0p0 +0 ' 0' -- -0; echo rc=$?
+sleep --; echo rc=$?
+echo @@sleep_time
+# 0.0005h + 0.01m + 0.4 = 1.8 + 0.6 + 0.4 = 2.8 s; inf does not end by itself
+s0=$SECONDS; sleep 0.0005h 0.01m 0.4; echo "dur=$((SECONDS - s0))"
+timeout 1 sleep inf; echo rc=$?
+
 echo @@diag_redir
 # INFORMATIONAL (no check): `cmd > f 2>&1` followed by `tail -1 f` printed
 # nothing in gate run 3 while sed/grep read the same file. Characterise it.
