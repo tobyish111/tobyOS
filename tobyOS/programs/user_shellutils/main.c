@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "nice"))     return do_nice(argc, argv);
     if (!strcmp(base, "pgrep"))    return do_pgrep(argc, argv, 0);
     if (!strcmp(base, "pkill"))    return do_pgrep(argc, argv, 1);
-    if (!strcmp(base, "tty"))      return do_tty();
+    if (!strcmp(base, "tty"))      return do_tty(argc, argv);
     if (!strcmp(base, "stty"))     return do_stty(argc, argv);
     if (!strcmp(base, "cksum"))    return do_cksum(argc, argv);
     if (!strcmp(base, "truncate")) return do_truncate(argc, argv);
