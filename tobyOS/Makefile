@@ -3255,7 +3255,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_mv/user_mv.elf                 $(INITRD_STAGE)/bin/mv
 	cp programs/user_rm/user_rm.elf                 $(INITRD_STAGE)/bin/rm
 	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
-	cp programs/user_sort/user_sort.elf             $(INITRD_STAGE)/bin/sort
 	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
 	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
 	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
@@ -3372,7 +3371,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
-	           cksum truncate install mkfifo date touch; do \
+	           cksum truncate install mkfifo date touch sort; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3528,7 +3527,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp $(PORTS_SBASE_DIR)/cut.elf                       $(INITRD_STAGE)/bin/cut
 	cp $(PORTS_SBASE_DIR)/uniq.elf                      $(INITRD_STAGE)/bin/uniq
 	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
-	cp $(PORTS_SBASE_DIR)/sort.elf                      $(INITRD_STAGE)/bin/sort
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
 	mkdir -p $(INITRD_STAGE)/lib/modules
