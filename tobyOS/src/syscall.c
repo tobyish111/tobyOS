@@ -12128,7 +12128,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
         int rc = vfs_chmod(kpath, md);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
-        return (rc == VFS_ERR_PERM) ? -ABI_EACCES : 0;
+        /* a non-owner's chmod is EPERM; any other failure is its own
+         * errno (it was EACCES, and 0 -- success -- for the rest) */
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
     }
     case LX_fchmod: {
         /* fchmod(fd, mode) changes the file the descriptor was opened on --
@@ -12144,7 +12147,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!kp || !kp[0]) return 0;
         int rc = vfs_chmod(kp, (uint32_t)a2 & 07777u);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
-        return (rc == VFS_ERR_PERM) ? -ABI_EPERM : vfs_err_to_abi(rc);
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
     }
     case LX_unlink: return do_syscall(SYS_UNLINK, a1, 0, 0, 0, 0);
 
@@ -12192,7 +12196,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                if (!mok) return -ABI_EINVAL; }
         int rc = vfs_chown(kpath, uid, gid);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
-        return (rc == VFS_ERR_PERM) ? -ABI_EPERM : 0;
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
     }
 
     /* truncate(2) by path -- REAL as of slice 6.

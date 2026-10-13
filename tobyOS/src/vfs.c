@@ -1461,9 +1461,11 @@ int vfs_chmod(const char *path, uint32_t mode) {
         struct vfs_stat st;
         int rc = vfs_stat(path, &st);
         if (rc != VFS_OK) return rc;
+        /* EPERM, as Linux's chmod(2) says it to a non-owner -- not
+         * EACCES, which is for a search or access that was refused */
         if ((st.mode & VFS_MODE_VALID) &&
             (uint32_t)current_uid() != st.uid) {
-            return VFS_ERR_PERM;
+            return VFS_ERR_NOTPERM;
         }
     }
     /* Always set MODE_VALID so the caller can't accidentally "downgrade"
@@ -1489,8 +1491,27 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
         int sp = sysprot_check_write(current_proc(), path, "vfs_chown");
         if (sp != VFS_OK) return sp;
     }
-    /* Only root may change ownership in this milestone. */
-    if (current_uid() != 0) return VFS_ERR_PERM;
+    /* chown(2) as Linux rules it. (uid_t)-1 and (gid_t)-1 leave that id
+     * as it is. Root gives a file to anyone; anyone else, on a file of
+     * their own, may set the owner it already has and a group they are in
+     * -- their gid: there are no supplementary groups here -- and asking
+     * for no change at all is no change, whoever asks. Anything else is
+     * EPERM. It was root or EACCES for everything, so `install -o $USER`
+     * and `chgrp $(id -g)` failed with the wrong words (logs/utilgate
+     * install_owner). */
+    struct vfs_stat st;
+    int rc = vfs_stat(path, &st);
+    if (rc != VFS_OK) return rc;
+    bool set_uid = uid != 0xFFFFFFFFu, set_gid = gid != 0xFFFFFFFFu;
+    if (!set_uid) uid = st.uid;
+    if (!set_gid) gid = st.gid;
+    if (current_uid() != 0) {
+        bool owner = (uint32_t)current_uid() == st.uid;
+        if (set_uid && !(owner && uid == st.uid)) return VFS_ERR_NOTPERM;
+        if (set_gid && !(owner && (gid == st.gid || gid == (uint32_t)current_gid())))
+            return VFS_ERR_NOTPERM;
+        if (!set_uid && !set_gid) return VFS_OK;
+    }
     return m->ops->chown(m->data, rel, uid, gid);
 }
 
