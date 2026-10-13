@@ -59,6 +59,15 @@ struct pty {
 
     struct proc *wq_master_read;   /* parked waiting for slave output */
     struct proc *wq_slave_read;    /* parked waiting for master input */
+    struct proc *wq_slave_write;   /* parked waiting for room in `out` */
+
+    /* IXON: output stopped by VSTOP (or TCOOFF) until VSTART -- what the
+     * master reads waits in `out`, and a writer that fills it waits */
+    bool   stopped;
+    /* IEXTEN's VLNEXT: the next input byte is taken as itself */
+    bool   lnext;
+    /* the output column, for ONOCR and tab3 (n_tty's) */
+    unsigned column;
 
     /* The master says no more input will ever arrive, while the pty stays
      * open for OUTPUT. That is what an SSH client means by
@@ -121,12 +130,18 @@ static int ring_pop(uint8_t *buf, size_t head, size_t *tail) {
 }
 
 /* ---- lifecycle -------------------------------------------------- */
+/* A Linux pty's settings (tty_std_termios, the pty slave's cflag): `stty`
+ * on a fresh one lists "speed 38400 baud; line = 0;" and "-brkint
+ * -imaxbel" and nothing else. Until batch 26 (finding 133) c_cflag was 0
+ * -- "speed 0 baud ... cs5 -cread" -- and ixon, echoctl, echoke and iexten
+ * were off, with the line discipline doing none of them. */
 static void pty_defaults(struct pty *t) {
     memset(&t->tio, 0, sizeof(t->tio));
-    t->tio.c_iflag = TTY_ICRNL;
+    t->tio.c_iflag = TTY_ICRNL | TTY_IXON;
     t->tio.c_oflag = TTY_OPOST | TTY_ONLCR;
-    t->tio.c_cflag = 0;
-    t->tio.c_lflag = TTY_ISIG | TTY_ICANON | TTY_ECHO | TTY_ECHOE | TTY_ECHOK;
+    t->tio.c_cflag = TTY_B38400 | TTY_CS8 | TTY_CREAD | (TTY_B38400 << TTY_IBSHIFT);
+    t->tio.c_lflag = TTY_ISIG | TTY_ICANON | TTY_ECHO | TTY_ECHOE | TTY_ECHOK |
+                     TTY_ECHOCTL | TTY_ECHOKE | TTY_IEXTEN;
     t->tio.c_cc[TTY_VINTR]  = 3;     /* ^C */
     t->tio.c_cc[TTY_VQUIT]  = 0x1c;  /* ^\ */
     t->tio.c_cc[TTY_VERASE] = 0x7f;  /* DEL */
@@ -134,7 +149,13 @@ static void pty_defaults(struct pty *t) {
     t->tio.c_cc[TTY_VEOF]   = 4;     /* ^D */
     t->tio.c_cc[TTY_VMIN]   = 1;
     t->tio.c_cc[TTY_VTIME]  = 0;
+    t->tio.c_cc[TTY_VSTART] = 0x11;  /* ^Q */
+    t->tio.c_cc[TTY_VSTOP]  = 0x13;  /* ^S */
     t->tio.c_cc[TTY_VSUSP]  = 0x1a;  /* ^Z */
+    t->tio.c_cc[TTY_VREPRINT] = 0x12; /* ^R */
+    t->tio.c_cc[TTY_VDISCARD] = 0x0f; /* ^O (kept, as Linux keeps it: unused) */
+    t->tio.c_cc[TTY_VWERASE] = 0x17; /* ^W */
+    t->tio.c_cc[TTY_VLNEXT] = 0x16;  /* ^V */
     t->win.ws_row = 24; t->win.ws_col = 80;
     t->win.ws_xpixel = 0; t->win.ws_ypixel = 0;
     t->pgrp = 0;
@@ -197,7 +218,10 @@ void pty_close(struct file *f) {
     if (!t) return;
     if (f->kind == FILE_KIND_PTY_MASTER) {
         if (t->master_refs > 0) t->master_refs--;
-        if (t->master_refs == 0) wq_wake_all(&t->wq_slave_read);  /* slave EOF */
+        if (t->master_refs == 0) {
+            wq_wake_all(&t->wq_slave_read);   /* slave EOF */
+            wq_wake_all(&t->wq_slave_write);  /* and a writer's EIO */
+        }
     } else {
         if (t->slave_refs > 0) t->slave_refs--;
         if (t->slave_refs == 0) wq_wake_all(&t->wq_master_read);  /* master HUP */
@@ -241,8 +265,12 @@ void pty_clone_ref(struct file *f) {
  * echo as two ("^C"); tab is echoed literally and its width depends on
  * the column, so it counts as one -- the conservative choice, since
  * over-erasing would eat the prompt. */
-static int echo_width(uint8_t c) {
-    return (c < 0x20 && c != '\t') ? 2 : 1;
+static bool echo_ctl(const struct pty *t, uint8_t c) {
+    return (t->tio.c_lflag & TTY_ECHOCTL) && ((c < 0x20 && c != '\t') || c == 0x7f);
+}
+
+static int echo_width(const struct pty *t, uint8_t c) {
+    return echo_ctl(t, c) ? 2 : 1;
 }
 
 /* Is the current, still-unterminated line empty? Everything after the
@@ -260,7 +288,7 @@ static void erase_one(struct pty *t) {
     uint8_t victim = t->in[prev];
     t->in_head = prev;                            /* un-push */
     if ((t->tio.c_lflag & TTY_ECHO) && (t->tio.c_lflag & TTY_ECHOE)) {
-        int w = echo_width(victim);
+        int w = echo_width(t, victim);
         for (int i = 0; i < w; i++) {
             ring_push(t->out, &t->out_head, t->out_tail, '\b');
             ring_push(t->out, &t->out_head, t->out_tail, ' ');
@@ -270,17 +298,83 @@ static void erase_one(struct pty *t) {
 }
 
 /* ---- echo (master-write time, slave ECHO set) ------------------- */
+static void echo_out(struct pty *t, uint8_t c) {
+    ring_push(t->out, &t->out_head, t->out_tail, c);
+}
+
+/* A control character echoes as ^X (DEL as ^?) under ECHOCTL, as itself
+ * without it -- it was ^X whatever the flag said. A newline is a new line
+ * only in canonical mode (n_tty); otherwise it is a control character like
+ * the others, ^J -- and \r, which was a new line too, is ^M. EXTPROC: the
+ * other side echoes. */
 static void echo_to_master(struct pty *t, uint8_t c) {
-    if (!(t->tio.c_lflag & TTY_ECHO)) return;
-    if (c == '\r' || c == '\n') {
-        ring_push(t->out, &t->out_head, t->out_tail, '\r');
-        ring_push(t->out, &t->out_head, t->out_tail, '\n');
-    } else if (c < 0x20 && c != '\t') {
-        ring_push(t->out, &t->out_head, t->out_tail, '^');
-        ring_push(t->out, &t->out_head, t->out_tail, (uint8_t)('@' + c));
+    uint32_t lf = t->tio.c_lflag;
+    if (!(lf & TTY_ECHO) || (lf & TTY_EXTPROC)) return;
+    if (c == '\n' && (lf & TTY_ICANON)) {
+        uint32_t of = t->tio.c_oflag;
+        if ((of & TTY_OPOST) && (of & TTY_ONLCR)) echo_out(t, '\r');
+        echo_out(t, '\n');
+    } else if (echo_ctl(t, c)) {
+        echo_out(t, '^');
+        echo_out(t, (uint8_t)(c ^ 0x40));
     } else {
-        ring_push(t->out, &t->out_head, t->out_tail, c);
+        echo_out(t, c);
     }
+}
+
+/* The start of the line still being typed: after the last newline (or
+ * other line end) in the input ring. */
+static size_t pending_line_start(struct pty *t) {
+    size_t i = t->in_head;
+    while (i != t->in_tail) {
+        size_t prev = (i - 1) & (PTY_BUF - 1);
+        uint8_t c = t->in[prev];
+        if (c == '\n' || (c && (c == t->tio.c_cc[TTY_VEOF] || c == t->tio.c_cc[TTY_VEOL] ||
+                                c == t->tio.c_cc[TTY_VEOL2])))
+            break;
+        i = prev;
+    }
+    return i;
+}
+
+/* IEXTEN's VWERASE: back over what is not a word (letters, digits, _),
+ * then over the word -- Linux's (BSD's ALTWERASE) rule */
+static void werase(struct pty *t) {
+    int seen = 0;
+    while (!pending_line_empty(t)) {
+        uint8_t c = t->in[(t->in_head - 1) & (PTY_BUF - 1)];
+        bool word = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                    (c >= 'A' && c <= 'Z') || c == '_';
+        if (word) seen++;
+        else if (seen) break;
+        erase_one(t);
+    }
+}
+
+/* IEXTEN's VREPRINT: the character, a new line, the line so far */
+static void reprint(struct pty *t, uint8_t c) {
+    if (!(t->tio.c_lflag & TTY_ECHO)) return;
+    echo_to_master(t, c);
+    echo_out(t, '\r');
+    echo_out(t, '\n');
+    for (size_t i = pending_line_start(t); i != t->in_head; i = (i + 1) & (PTY_BUF - 1))
+        echo_to_master(t, t->in[i]);
+}
+
+/* What a signal character does to the input not yet read: gone, unless
+ * NOFLSH (Linux's isig). */
+static void flush_input(struct pty *t) {
+    t->in_tail = t->in_head;
+    t->line_len = t->line_pos = 0;
+    t->lnext = false;
+}
+
+/* Output may go on (VSTART, IXANY, TCOON, a signal character). */
+static void start_output(struct pty *t) {
+    if (!t->stopped) return;
+    t->stopped = false;
+    wq_wake_all(&t->wq_master_read);
+    wq_wake_all(&t->wq_slave_write);
 }
 
 /* ---- master end ------------------------------------------------- */
@@ -289,43 +383,89 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
     if (!t) return -1;
     const uint8_t *in = (const uint8_t *)buf;
     size_t put = 0;
+    /* where this write's echoes begin: n_tty commits a write's echoes when
+     * it has processed the whole of it, and a signal character's flush
+     * drops the ones not yet out -- "xyz^C" echoes "^C" alone */
+    size_t echo_from = t->out_head;
     for (; put < n; put++) {
         uint8_t c = in[put];
-        if ((t->tio.c_iflag & TTY_ICRNL) && c == '\r') c = '\n';
-        else if ((t->tio.c_iflag & TTY_INLCR) && c == '\n') c = '\r';
-        /* ISIG: ^C and ^Z are SIGNALS to the foreground group, not input
-         * bytes. They echo (^C / ^Z) like every control char, and never
-         * reach the input ring -- exactly n_tty. Nothing acted on these
-         * before this slice; ^Z on a pty was two bytes of data. */
-        if ((t->tio.c_lflag & TTY_ISIG) && t->pgrp > 0) {
-            if (c == t->tio.c_cc[TTY_VINTR]) {
+        uint32_t lf = t->tio.c_lflag, ifl = t->tio.c_iflag;
+        const uint8_t *cc = t->tio.c_cc;
+        /* the byte after IEXTEN's VLNEXT: itself, whatever it is */
+        if (t->lnext) {
+            if (!ring_push(t->in, &t->in_head, t->in_tail, c)) break;
+            t->lnext = false;
+            echo_to_master(t, c);
+            continue;
+        }
+        if ((ifl & TTY_IGNCR) && c == '\r') continue;
+        if ((ifl & TTY_ICRNL) && c == '\r') c = '\n';
+        else if ((ifl & TTY_INLCR) && c == '\n') c = '\r';
+        if ((ifl & TTY_IUCLC) && (lf & TTY_IEXTEN) && c >= 'A' && c <= 'Z') c = (uint8_t)(c + 32);
+        /* IXON: VSTOP and VSTART are not input; IXANY lets any byte
+         * restart the output. A 0 in c_cc is a character switched off. */
+        if (ifl & TTY_IXON) {
+            if (c && c == cc[TTY_VSTOP]) { t->stopped = true; continue; }
+            if (c && c == cc[TTY_VSTART]) { start_output(t); continue; }
+            if (ifl & TTY_IXANY) start_output(t);
+        }
+        /* ISIG: ^C, ^\ and ^Z are SIGNALS to the foreground group, not input
+         * bytes. They echo (^C ...) like every control char, and never
+         * reach the input ring -- exactly n_tty -- and what was typed ahead
+         * goes, unless NOFLSH; output stopped by IXON starts again. ^\ was
+         * input here, and typed-ahead lines outlived a ^C. */
+        if (lf & TTY_ISIG) {
+            int sig = 0;
+            if (c && c == cc[TTY_VINTR]) sig = SIGINT;
+            else if (c && c == cc[TTY_VQUIT]) sig = SIGQUIT;
+            else if (c && c == cc[TTY_VSUSP]) sig = SIGTSTP;
+            if (sig) {
+                if (!(lf & TTY_NOFLSH)) {
+                    flush_input(t);
+                    t->out_head = echo_from;
+                }
+                if (ifl & TTY_IXON) start_output(t);
                 echo_to_master(t, c);
-                signal_send_to_pgrp(t->pgrp, SIGINT);
-                continue;
-            }
-            if (c == t->tio.c_cc[TTY_VSUSP]) {
-                echo_to_master(t, c);
-                signal_send_to_pgrp(t->pgrp, SIGTSTP);
+                if (t->pgrp > 0) signal_send_to_pgrp(t->pgrp, sig);
                 continue;
             }
         }
         /* ICANON editing, applied HERE rather than at line-assembly time
          * so the rub-out can be echoed. See erase_one() above. */
-        if (t->tio.c_lflag & TTY_ICANON) {
-            if (c == t->tio.c_cc[TTY_VERASE]) { erase_one(t); continue; }
-            if (c == t->tio.c_cc[TTY_VKILL]) {
-                /* ECHOKE rubs the line out column by column; plain ECHOK
-                 * (what our defaults set, and what POSIX specifies for the
-                 * flag) just moves to a fresh line. Either way the line
-                 * itself goes. */
-                bool ke = (t->tio.c_lflag & TTY_ECHOKE) != 0;
+        if (lf & TTY_ICANON) {
+            if (c && c == cc[TTY_VERASE]) { erase_one(t); continue; }
+            if ((lf & TTY_IEXTEN) && c) {
+                if (c == cc[TTY_VWERASE]) { werase(t); continue; }
+                if (c == cc[TTY_VREPRINT]) { reprint(t, c); continue; }
+                if (c == cc[TTY_VLNEXT]) {
+                    t->lnext = true;
+                    if ((lf & TTY_ECHO) && (lf & TTY_ECHOCTL)) {
+                        echo_out(t, '^');
+                        echo_out(t, '\b');
+                    }
+                    continue;
+                }
+            }
+            /* end of file is not echoed (n_tty) */
+            if (c && c == cc[TTY_VEOF]) {
+                if (!ring_push(t->in, &t->in_head, t->in_tail, c)) break;
+                continue;
+            }
+            if (c && c == t->tio.c_cc[TTY_VKILL]) {
+                /* ECHOK ECHOKE ECHOE (a Linux pty's defaults) rub the line
+                 * out column by column; otherwise the kill character is
+                 * echoed (^U) and, under ECHOK, a new line follows -- n_tty's
+                 * rule. Either way the line itself goes. */
+                uint32_t kf = TTY_ECHOK | TTY_ECHOKE | TTY_ECHOE;
+                bool ke = (t->tio.c_lflag & kf) == kf;
                 while (!pending_line_empty(t)) {
                     if (ke) erase_one(t);
                     else { t->in_head = (t->in_head - 1) & (PTY_BUF - 1); }
                 }
-                if (!ke && (t->tio.c_lflag & TTY_ECHO) &&
-                    (t->tio.c_lflag & TTY_ECHOK))
-                    echo_to_master(t, '\n');
+                if (!ke) {
+                    echo_to_master(t, c);
+                    if (t->tio.c_lflag & TTY_ECHOK) echo_to_master(t, '\n');
+                }
                 continue;
             }
         }
@@ -334,11 +474,16 @@ long pty_master_write(struct file *f, const void *buf, size_t n) {
          * pressure, and pretending the byte landed is how an upload
          * larger than PTY_BUF lost its middle. */
         if (!ring_push(t->in, &t->in_head, t->in_tail, c)) break;
-        echo_to_master(t, c);
+        if ((lf & TTY_ECHO) || !(lf & TTY_ICANON) || !(lf & TTY_ECHONL) || c != '\n')
+            echo_to_master(t, c);
+        else {                                   /* ECHONL: the newline only */
+            echo_out(t, '\r');
+            echo_out(t, '\n');
+        }
     }
     if (put) {
         wq_wake_all(&t->wq_slave_read);   /* slave has input */
-        if (t->tio.c_lflag & TTY_ECHO) wq_wake_all(&t->wq_master_read);
+        wq_wake_all(&t->wq_master_read);  /* an echo, or output restarted */
     }
     return (long)put;
 }
@@ -357,7 +502,8 @@ long pty_master_read(struct file *f, void *buf, size_t n) {
     struct pty *t = f->pty;
     if (!t) return -1;
     uint8_t *out = (uint8_t *)buf;
-    while (t->out_head == t->out_tail) {
+    /* IXON: stopped output waits (until the slave side has gone) */
+    while (t->out_head == t->out_tail || (t->stopped && t->slave_refs > 0)) {
         if (t->slave_refs == 0) return 0;          /* slave gone -> EOF */
         struct proc *self = current_proc();
         if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
@@ -372,6 +518,7 @@ long pty_master_read(struct file *f, void *buf, size_t n) {
         if (c < 0) break;
         out[got++] = (uint8_t)c;
     }
+    if (got) wq_wake_all(&t->wq_slave_write);      /* room again */
     return (long)got;
 }
 
@@ -397,6 +544,7 @@ long pty_master_read_nb(struct file *f, void *buf, size_t n) {
      * departed slave is EOF, which is how the SSH server learns the shell
      * it spawned has exited. */
     if (t->out_head == t->out_tail) return (t->slave_refs == 0) ? 0 : -2;
+    if (t->stopped && t->slave_refs > 0) return -2;      /* IXON */
     uint8_t *out = (uint8_t *)buf;
     size_t got = 0;
     while (got < n) {
@@ -404,6 +552,7 @@ long pty_master_read_nb(struct file *f, void *buf, size_t n) {
         if (c < 0) break;
         out[got++] = (uint8_t)c;
     }
+    if (got) wq_wake_all(&t->wq_slave_write);
     return (long)got;
 }
 
@@ -438,10 +587,14 @@ void pty_set_winsize(struct file *f, uint16_t cols, uint16_t rows) {
 /* ---- slave end -------------------------------------------------- */
 /* True if the input ring already holds a complete canonical line (a '\n' or a
  * VEOF byte), so a canonical read can return without blocking. */
+static bool line_end(const struct pty *t, uint8_t c) {
+    return c == '\n' || (c && (c == t->tio.c_cc[TTY_VEOF] || c == t->tio.c_cc[TTY_VEOL] ||
+                              c == t->tio.c_cc[TTY_VEOL2]));
+}
+
 static bool in_has_line(struct pty *t) {
-    uint8_t veof = t->tio.c_cc[TTY_VEOF];
     for (size_t i = t->in_tail; i != t->in_head; i = (i + 1) & (PTY_BUF - 1)) {
-        if (t->in[i] == '\n' || t->in[i] == veof) return true;
+        if (line_end(t, t->in[i])) return true;
     }
     return false;
 }
@@ -466,9 +619,10 @@ static long slave_canonical_read(struct pty *t, uint8_t *out, size_t n) {
         sched_yield();
         if (SIG_SHOULD_EINTR(self)) return EINTR_RET;
     }
-    /* Assemble one line into t->line[], applying VERASE/VKILL editing. */
-    uint8_t verase = t->tio.c_cc[TTY_VERASE];
-    uint8_t vkill  = t->tio.c_cc[TTY_VKILL];
+    /* Assemble one line into t->line[]. It was edited as it was typed
+     * (pty_master_write); a VERASE or VKILL byte here is one taken as
+     * itself -- after VLNEXT, or before ICANON came on -- and stays, as
+     * n_tty keeps it. (They were applied again here, so ^V^U killed.) */
     uint8_t veof   = t->tio.c_cc[TTY_VEOF];
     size_t  len = 0;
     bool    eof_line = false;
@@ -476,11 +630,9 @@ static long slave_canonical_read(struct pty *t, uint8_t *out, size_t n) {
         int ci = ring_pop(t->in, t->in_head, &t->in_tail);
         if (ci < 0) break;
         uint8_t c = (uint8_t)ci;
-        if (c == verase) { if (len) len--; continue; }
-        if (c == vkill)  { len = 0; continue; }
-        if (c == veof)   { eof_line = true; break; }   /* terminate (no NL) */
+        if (c && c == veof)   { eof_line = true; break; }   /* terminate (no NL) */
         if (len < PTY_BUF) t->line[len++] = c;
-        if (c == '\n') break;
+        if (line_end(t, c)) break;                /* \n, VEOL, VEOL2 */
     }
     (void)eof_line;
     t->line_len = len;
@@ -582,13 +734,61 @@ long pty_slave_write(struct file *f, const void *buf, size_t n) {
         if (jc) return jc;
     }
     const uint8_t *in = (const uint8_t *)buf;
-    bool opost = (t->tio.c_oflag & TTY_OPOST) != 0;
-    bool onlcr = (t->tio.c_oflag & TTY_ONLCR) != 0;
-    for (size_t i = 0; i < n; i++) {
+    uint32_t of = t->tio.c_oflag;
+    bool opost = (of & TTY_OPOST) != 0;
+    /* A FULL RING WAITS for the master to read (batch 26): the bytes were
+     * dropped and counted as written, which output stopped by ^S would
+     * have made routine. pid 0 (an in-kernel writer) cannot wait on the
+     * reader it may itself be, and keeps the old way. */
+    struct proc *self = current_proc();
+    bool can_wait = self && self->pid != 0 && !self->is_kernel;
+    size_t i = 0;
+    while (i < n) {
         uint8_t c = in[i];
-        if (opost && onlcr && c == '\n')
-            ring_push(t->out, &t->out_head, t->out_tail, '\r');
-        ring_push(t->out, &t->out_head, t->out_tail, c);
+        unsigned col0 = t->column;            /* for a retry after a wait */
+        /* OPOST, as n_tty's do_output_char: what this byte becomes */
+        uint8_t o[8];
+        size_t need = 0;
+        if (!opost) o[need++] = c;
+        else if (c == '\n') {
+            if (of & TTY_ONLRET) t->column = 0;
+            if (of & TTY_ONLCR) { o[need++] = '\r'; t->column = 0; }
+            o[need++] = '\n';
+        } else if (c == '\r') {
+            if ((of & TTY_ONOCR) && t->column == 0) { i++; continue; }
+            if (of & TTY_OCRNL) {
+                if (of & TTY_ONLRET) t->column = 0;
+                o[need++] = '\n';
+            } else {
+                t->column = 0;
+                o[need++] = '\r';
+            }
+        } else if (c == '\t' && (of & TTY_TABDLY) == TTY_XTABS) {
+            unsigned sp = 8 - (t->column & 7);
+            for (unsigned k = 0; k < sp; k++) o[need++] = ' ';
+            t->column += sp;
+        } else {
+            if (c == '\t') t->column = (t->column | 7) + 1;
+            else if (c == '\b') { if (t->column) t->column--; }
+            else if (c >= 0x20 && c != 0x7f) {
+                if ((of & TTY_OLCUC) && c >= 'a' && c <= 'z') c = (uint8_t)(c - 32);
+                if ((c & 0xc0) != 0x80) t->column++;     /* not a UTF-8 continuation */
+            }
+            o[need++] = c;
+        }
+        if (can_wait && (t->stopped || PTY_BUF - 1 - ring_count(t->out_head, t->out_tail) < need)) {
+            t->column = col0;
+            if (t->master_refs == 0) return i ? (long)i : -ABI_EIO;
+            if (i) wq_wake_all(&t->wq_master_read);
+            if (SIG_SHOULD_EINTR(self)) return i ? (long)i : EINTR_RET;
+            wq_add(&t->wq_slave_write, self);
+            self->state = PROC_BLOCKED;
+            sched_yield();
+            if (SIG_SHOULD_EINTR(self)) return i ? (long)i : EINTR_RET;
+            continue;
+        }
+        for (size_t k = 0; k < need; k++) ring_push(t->out, &t->out_head, t->out_tail, o[k]);
+        i++;
     }
     if (n) wq_wake_all(&t->wq_master_read);
     return (long)n;
@@ -615,7 +815,24 @@ long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
     case TTY_TCSETS: case TTY_TCSETSW: case TTY_TCSETSF: {
         struct ktermios nt;
         if (copy_from_user(&nt, (const void *)arg, sizeof(nt)) != 0) return -ABI_EFAULT;
+        /* What a Linux pty takes (pty_set_termios, tty_ioctl): its bytes
+         * are 8 bits and always read -- CS8 and CREAD forced, PARENB
+         * cleared -- and an input speed of 0 is the output speed. Asked
+         * for nothing it can do, it says EINVAL and changes nothing, as
+         * POSIX has tcsetattr when "no part of the request can be honored";
+         * GNU stty then says "Invalid argument", and "unable to perform
+         * all requested operations" when only part was. They were stored
+         * as given. */
+        bool asked = memcmp(&nt, &t->tio, sizeof nt) != 0;
+        nt.c_cflag = (nt.c_cflag & ~(TTY_CSIZE | TTY_PARENB)) | TTY_CS8 | TTY_CREAD;
+        if (asked && memcmp(&nt, &t->tio, sizeof nt) == 0) return -ABI_EINVAL;
+        /* (an input speed of 0 is honoured -- it becomes the output's) */
+        if (!(nt.c_cflag & TTY_CIBAUD))
+            nt.c_cflag |= (nt.c_cflag & TTY_CBAUD) << TTY_IBSHIFT;
+        if (cmd == TTY_TCSETSF) flush_input(t);
         t->tio = nt;
+        if (!(t->tio.c_iflag & TTY_IXON)) start_output(t);
+        if (!(t->tio.c_lflag & TTY_ICANON)) t->lnext = false;
         return 0;
     }
     case TTY_TIOCGWINSZ:
@@ -641,7 +858,8 @@ long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
     case TTY_FIONREAD: {
         int navail;
         if (f->kind == FILE_KIND_PTY_MASTER)
-            navail = (int)ring_count(t->out_head, t->out_tail);
+            navail = (t->stopped && t->slave_refs > 0) ? 0
+                     : (int)ring_count(t->out_head, t->out_tail);
         else
             navail = (int)ring_count(t->in_head, t->in_tail) +
                      (int)(t->line_len - t->line_pos);
@@ -662,7 +880,18 @@ long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
          * accepted and nothing was set */
         if (f->kind != FILE_KIND_PTY_SLAVE) return -ABI_EINVAL;
         return pty_make_ctty(current_proc(), t->index, false);
-    case TTY_TCFLSH:
+    case TTY_TCFLSH:                      /* TCIFLUSH 0, TCOFLUSH 1, TCIOFLUSH 2 */
+        if (arg > 2) return -ABI_EINVAL;
+        if (arg != 1) flush_input(t);
+        if (arg != 0) {
+            t->out_tail = t->out_head;
+            wq_wake_all(&t->wq_slave_write);
+        }
+        return 0;
+    case TTY_TCXONC:                      /* TCOOFF 0, TCOON 1, TCIOFF 2, TCION 3 */
+        if (arg > 3) return -ABI_EINVAL;
+        if (arg == 0) t->stopped = true;
+        else if (arg == 1) start_output(t);
         return 0;
     default:
         return -ABI_ENOTTY;
@@ -674,7 +903,7 @@ bool pty_readable(struct file *f) {
     struct pty *t = f->pty;
     if (!t) return false;
     if (f->kind == FILE_KIND_PTY_MASTER)
-        return t->out_head != t->out_tail;
+        return t->out_head != t->out_tail && (!t->stopped || t->slave_refs == 0);
     /* slave */
     if (t->line_pos < t->line_len) return true;
     if (t->tio.c_lflag & TTY_ICANON) return in_has_line(t);

@@ -112,6 +112,7 @@ static char *first_line(char *s) {
 #include "su_date.c"
 #include "su_touch.c"
 #include "su_sort.c"
+#include "su_script.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -150,6 +151,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "date"))     return do_date(argc, argv);
     if (!strcmp(base, "touch"))    return do_touch(argc, argv);
     if (!strcmp(base, "sort"))     return do_sort(argc, argv);
+    if (!strcmp(base, "script"))   return do_script(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;
