@@ -1633,7 +1633,18 @@ static bool ssh_spawn_shell(void) {
     {
         struct proc *cp = proc_lookup(pid);
         const struct user *u = users_lookup_by_name(g_auth_user);
-        if (cp && u) { cp->uid = u->uid; cp->gid = u->gid; }
+        /* THE WHOLE CREDENTIAL SET, as login's setgid/setuid leave one: the
+         * spawn seeded real and saved ids from pid 0's root, and granted
+         * root's Linux capabilities, and only the effective ids were
+         * switched here. So an SSH session's real uid was 0, anything it
+         * exec'd kept it -- and setuid(0), going back to one's real uid,
+         * is always allowed: any user could become root. Found in batch 25
+         * by pgrep -U: a session's sleep read "Uid: 0 1000 0 1000". */
+        if (cp && u) {
+            cp->uid = cp->ruid = cp->suid = u->uid;
+            cp->gid = cp->rgid = cp->sgid = u->gid;
+            if (u->uid != 0) cp->lcap_eff = cp->lcap_perm = cp->lcap_inh = 0;
+        }
         /* ITS OWN SESSION, as sshd's child is (setsid). A login session's
          * controlling terminal is its pty -- /dev/tty in it is the pty, not
          * the console it was -- and a command run without pty-req has no
