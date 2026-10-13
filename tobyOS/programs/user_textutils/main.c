@@ -326,11 +326,11 @@ static void od_put_items(const unsigned char *b, size_t n, char tcode,
         int used = 1;
         switch (tcode) {
         case 'c': {
+            /* GNU od -c's escapes, all eight: \a \b \v \f were printed as
+             * 007 010 013 014 (logs/utilgate stat_printf) */
+            static const char esc[14] = { '0', 0, 0, 0, 0, 0, 0, 'a', 'b', 't', 'n', 'v', 'f', 'r' };
             unsigned char c = b[k];
-            if (c == 10)      snprintf(it, sizeof it, "\\n");
-            else if (c == 9)  snprintf(it, sizeof it, "\\t");
-            else if (c == 13) snprintf(it, sizeof it, "\\r");
-            else if (c == 0)  snprintf(it, sizeof it, "\\0");
+            if (c < 14 && esc[c]) snprintf(it, sizeof it, "\\%c", esc[c]);
             else if (c >= 32 && c < 127) snprintf(it, sizeof it, "%c", c);
             else              snprintf(it, sizeof it, "%03o", c);
             break;
