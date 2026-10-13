@@ -102,7 +102,7 @@ static void collect_absolute(struct abi_system_metrics *out) {
 
     uint64_t now_tsc = perf_rdtsc();
     for (int i = 0; i < PROC_MAX; i++) {
-        struct proc *p = proc_lookup(i);
+        struct proc *p = proc_at_slot(i);   /* by slot: pids are not slots */
         if (!p) continue;
 
         out->process_count++;

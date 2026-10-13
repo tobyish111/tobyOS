@@ -3189,8 +3189,9 @@ static void winpe_autologin_clear(void) {
             lr, (int)session_active());
     service_stop("login");
     winpe8_pump_ms(400);
-    for (int pid = 1; pid < 64; pid++) {
-        struct proc *p = proc_lookup(pid);
+    for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+        struct proc *p = proc_at_slot(ps_i);
+        int pid = p ? p->pid : 0;
         if (p && p->name[0] && strcmp(p->name, "login") == 0) {
             kprintf("[boot] WINPE: SIGKILL lingering login pid=%d\n", pid);
             signal_send_to_pid(pid, SIGKILL);
@@ -3263,8 +3264,9 @@ static void es_pump_ms(uint64_t ms) {
  * Scanning by name asks the question we actually care about -- "is a
  * gui_edit still on screen?" -- and survives the launch being deferred. */
 static int es_find_gui_edit(void) {
-    for (int pid = 1; pid < PROC_MAX; pid++) {
-        struct proc *p = proc_lookup(pid);
+    for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+        struct proc *p = proc_at_slot(ps_i);
+        int pid = p ? p->pid : 0;
         if (!p) continue;
         if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
         const char *n = p->name;
@@ -3430,8 +3432,9 @@ static const unsigned char ft_bmp[] = {
 };
 
 static int ft_find_proc(const char *want) {
-    for (int pid = 1; pid < PROC_MAX; pid++) {
-        struct proc *p = proc_lookup(pid);
+    for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+        struct proc *p = proc_at_slot(ps_i);
+        int pid = p ? p->pid : 0;
         if (!p) continue;
         if (p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
         const char *n = p->name; int i = 0;
@@ -12244,8 +12247,9 @@ void _start(void) {
 
         /* dismiss login now that the app keeps the proc count >= 1 */
         service_stop("login");
-        for (int pid = 1; pid < 64; pid++) {
-            struct proc *p = proc_lookup(pid);
+        for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+            struct proc *p = proc_at_slot(ps_i);
+            int pid = p ? p->pid : 0;
             if (p && p->name[0] && strcmp(p->name, "login") == 0)
                 signal_send_to_pid(pid, SIGKILL);
         }
@@ -12372,8 +12376,9 @@ void _start(void) {
         /* Now dismiss login: stop its service (no restart) + SIGKILL it (it
          * ignores SIGTERM). gui_settings is alive, so procs never hit zero. */
         service_stop("login");
-        for (int pid = 1; pid < 64; pid++) {
-            struct proc *p = proc_lookup(pid);
+        for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+            struct proc *p = proc_at_slot(ps_i);
+            int pid = p ? p->pid : 0;
             if (p && p->name[0] && strcmp(p->name, "login") == 0)
                 signal_send_to_pid(pid, SIGKILL);
         }

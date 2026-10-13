@@ -486,7 +486,7 @@ long sys_fork(void) {
     }
 
     /* Copy parent's proc struct as a starting point. */
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
 
     child->pid       = child_pid;
@@ -909,7 +909,7 @@ long sys_fork_share(void) {
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
 
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
     memcpy(child, parent, sizeof(*child));
 
     child->pid       = child_pid;
@@ -1136,7 +1136,7 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     { long cgrc = cgroup_can_fork(parent); if (cgrc != 0) return cgrc; }
     struct proc *child = proc_slot_claim();
     if (!child) return -ABI_ENOMEM;
-    int child_pid = (int)(child - g_proc);
+    int child_pid = proc_pid_alloc(child);
 
     memcpy(child, parent, sizeof(*child));
     child->pid        = child_pid;

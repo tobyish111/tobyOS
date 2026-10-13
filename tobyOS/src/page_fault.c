@@ -199,9 +199,11 @@ bool cow_copy_page(uint64_t old_phys, uint64_t *pte) {
 
 struct vm_space *vm_space_for_proc(struct proc *p) {
     if (!p) return NULL;
-    int pid = p->pid;
-    if (pid < 0 || pid >= PROC_MAX) return NULL;
-    return &g_vm_spaces[pid];
+    /* by slot: a pid is not a slot index (batch 26) */
+    extern struct proc g_proc[];
+    long slot = p - g_proc;
+    if (slot < 0 || slot >= PROC_MAX) return NULL;
+    return &g_vm_spaces[slot];
 }
 
 struct vma *vma_find(struct vm_space *vms, uint64_t addr) {

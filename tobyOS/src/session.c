@@ -273,8 +273,9 @@ int session_logout(void) {
      * the current session. We start at pid 1 because pid 0 (the boot
      * idle thread / shell) must never be killed. */
     int n_killed = 0;
-    for (int pid = 1; pid < 64; pid++) {
-        struct proc *p = proc_lookup(pid);
+    for (int ps_i = 1; ps_i < PROC_MAX; ps_i++) {   /* by slot: pids are not slots */
+        struct proc *p = proc_at_slot(ps_i);
+        int pid = p ? p->pid : 0;
         if (!p) continue;
         if (p->state == PROC_TERMINATED) continue;
         if (p->session_id != sid) continue;

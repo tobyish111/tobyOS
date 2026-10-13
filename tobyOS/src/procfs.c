@@ -318,11 +318,7 @@ extern uint64_t g_intr_vec[256];
  * decayed exactly as Linux's calc_load), "running/total" and the last pid. */
 static int gen_loadavg(char *buf, size_t cap) {
     int total = live_proc_count();
-    int lastpid = 0;
-    for (int i = 0; i < PROC_MAX; i++)
-        if (g_proc[i].state != PROC_UNUSED &&
-            g_proc[i].state != PROC_EMBRYO && g_proc[i].pid > lastpid)
-            lastpid = g_proc[i].pid;
+    int lastpid = proc_last_pid();         /* the last one handed out, as Linux's */
     int off = 0;
     char tmp[24];
     #define APPEND_STR(s) do { size_t sl = strlen(s); \
@@ -824,7 +820,16 @@ static int gen_sys(const char *rest, char *buf, size_t cap) {
         memcpy(t, dn, l); t[l] = '\n'; t[l + 1] = 0;
         SYS_OUT(t);
     }
-    if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("256\n");
+    if (strcmp(rest, "kernel/pid_max") == 0)   SYS_OUT("32768\n");   /* PID_MAX */
+    if (strcmp(rest, "kernel/ns_last_pid") == 0) {
+        /* the last pid handed out in the reader's pid namespace; root in the
+         * initial one may write it (procfs_write), as CRIU does on Linux */
+        struct proc *me = current_proc();
+        char t[16];
+        int_to_str(t, sizeof t - 1, pid_ns_last_pid(me ? me->pid_ns : 0));
+        size_t l = strlen(t); t[l] = '\n'; t[l + 1] = 0;
+        SYS_OUT(t);
+    }
     /* Which kernel is this? The commit it was built from (Makefile). Its own
      * file, not /proc/version: uname -v and -a print that file's first line
      * and gates compare uname across implementations. */
@@ -1321,7 +1326,8 @@ static int gen_net_arp(char *buf, size_t cap) {
 /* Slice 11: which writable procfs file a handle refers to (PW_NONE for the
  * read-only majority). Recorded at open because procfs_write() only receives
  * the handle, not the path. */
-enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS };
+enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS,
+                    PW_NS_LAST_PID };
 
 struct procfs_handle {
     char *data;
@@ -1345,7 +1351,9 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     enum procfs_wkind wkind = PW_NONE;
 
     if (strncmp(rel, "sys/", 4) == 0) { len = gen_sys(rel + 4, buf, sizeof(buf));
-                                        if (len < 0) return VFS_ERR_NOENT; }
+                                        if (len < 0) return VFS_ERR_NOENT;
+                                        if (strcmp(rel, "sys/kernel/ns_last_pid") == 0)
+                                            wkind = PW_NS_LAST_PID; }
     else if (strncmp(rel, "net/", 4) == 0) { len = gen_net(rel + 4, buf, sizeof(buf));
                                         if (len < 0) return VFS_ERR_NOENT; }
     else if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
@@ -1478,6 +1486,23 @@ static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
 static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
     struct procfs_handle *h = f->priv;
     if (!h || h->wkind == PW_NONE) return VFS_ERR_ROFS;
+    if (h->wkind == PW_NS_LAST_PID) {
+        /* Linux: a number 0..pid_max-1, EINVAL else; root (CAP_SYS_ADMIN /
+         * CAP_CHECKPOINT_RESTORE) only, EPERM else. Writable in the initial
+         * pid namespace only here. The next pid is the number + 1. */
+        struct proc *me = current_proc();
+        if (!me || me->uid != 0 || me->pid_ns) return VFS_ERR_NOTPERM;   /* uid: effective */
+        const char *c = (const char *)buf;
+        size_t i = 0;
+        long v = 0;
+        while (i < n && (c[i] == ' ' || c[i] == '\t')) i++;
+        size_t d0 = i;
+        while (i < n && c[i] >= '0' && c[i] <= '9' && v < PID_MAX) v = v * 10 + (c[i++] - '0');
+        while (i < n && (c[i] == ' ' || c[i] == '\t' || c[i] == '\n')) i++;
+        if (i == d0 || i != n || v >= PID_MAX) return VFS_ERR_INVAL;
+        proc_set_last_pid((int)v);
+        return (long)n;
+    }
     struct proc *target = proc_lookup(h->wpid);
     if (!target) return VFS_ERR_NOENT;
 
@@ -1822,9 +1847,16 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             dh->index++;
             return VFS_OK;
         }
-        int pidx = dh->index - nglobals;
+        /* In ascending pid order, as Linux lists /proc: the cursor is the
+         * smallest number not listed yet, and each call takes the smallest
+         * visible pid at or above it. It was the slot index, which was the
+         * pid until batch 26 (finding 146); slot order is not pid order now,
+         * and a cursor by number does not skip or repeat a process when a
+         * slot changes hands between two calls. */
+        int want = dh->index - nglobals;
+        int best = -1;
         struct proc *me = current_proc();
-        for (int i = pidx; i < PROC_MAX; i++) {
+        for (int i = 0; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
                 /* Slice 10: list only what the READER's pid namespace can see,
@@ -1870,19 +1902,20 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                     vp = pid_vnr_in(me->pid_ns, g_proc[i].pid);
                     if (!vp) continue;
                 }
-                memset(out->name, 0, VFS_NAME_MAX);
-                char tmp[16];
-                int_to_str(tmp, sizeof(tmp), vp);
-                size_t tl = strlen(tmp);
-                memcpy(out->name, tmp, tl);
-                out->type = VFS_TYPE_DIR;
-                out->size = 0;
-                out->uid = 0; out->gid = 0; out->mode = 0;
-                dh->index = nglobals + i + 1;
-                return VFS_OK;
+                if (vp >= want && (best < 0 || vp < best)) best = vp;
             }
         }
-        return VFS_ERR_NOENT;
+        if (best < 0) return VFS_ERR_NOENT;
+        memset(out->name, 0, VFS_NAME_MAX);
+        char tmp[16];
+        int_to_str(tmp, sizeof(tmp), best);
+        size_t tl = strlen(tmp);
+        memcpy(out->name, tmp, tl);
+        out->type = VFS_TYPE_DIR;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0;
+        dh->index = nglobals + best + 1;
+        return VFS_OK;
     }
 
     /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are

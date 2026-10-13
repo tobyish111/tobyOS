@@ -142,6 +142,7 @@ KSTUB(pmm_total_pages)
 KSTUB(pmm_used_pages)
 KSTUB(proc_dump_table)
 KSTUB(proc_lookup)
+KSTUB(proc_at_slot)
 KSTUB(sectest_run)
 /* NOT a complaining stub: the shell calls this for every foreground
  * pipeline, and hosted tsh legitimately cannot own the console foreground

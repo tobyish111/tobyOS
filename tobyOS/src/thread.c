@@ -74,7 +74,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     if (!t) return -1;
 
     proc_slot_wipe(t);       /* stays EMBRYO; upgraded to READY at end */
-    t->pid   = (int)(t - g_proc);
+    proc_pid_alloc(t);
     t->ppid  = tg_leader->ppid;
 
     /* Copy name with "+T" suffix */

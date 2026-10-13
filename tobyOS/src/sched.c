@@ -82,7 +82,7 @@ uint32_t g_nr_running;                   /* last sample: runnable, non-idle */
 static void loadavg_sample(void) {
     uint32_t n = 0;
     for (int i = 1; i < PROC_MAX; i++) {
-        struct proc *p = proc_lookup(i);
+        struct proc *p = proc_at_slot(i);   /* by slot: pids are not slots */
         if (p && p->state == PROC_RUNNING && !p->is_idle) n++;
     }
     g_nr_running = n;

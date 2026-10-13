@@ -157,10 +157,12 @@ void ns_file_close(struct file *f);
 /* =====================================================================
  * PID namespaces (slice 10) -- src/pid_ns.c owns `struct pid_ns`.
  *
- * THE CONSTRAINT THAT SHAPES ALL OF THIS: in tobyOS a process's pid IS its
- * index into `g_proc[PROC_MAX]`, and `proc_lookup()` is a direct array index.
- * A pid therefore cannot be reassigned, and `struct proc`, the ready queues,
- * wait queues and every internal reference keep using it.
+ * THE CONSTRAINT THAT SHAPED ALL OF THIS: in tobyOS a process's pid WAS its
+ * index into `g_proc[PROC_MAX]`, and `proc_lookup()` a direct array index.
+ * (Since batch 26 pids run to PID_MAX and proc_lookup goes through a map --
+ * proc.h -- but there is still one stored pid per process.) A pid therefore
+ * cannot be reassigned, and `struct proc`, the ready queues, wait queues and
+ * every internal reference keep using it.
  *
  * So pids follow the shape slice 2 chose for uids: **the stored pid is always
  * the host / initial-namespace number (call it the kpid), and namespace-local
@@ -176,6 +178,10 @@ void ns_file_close(struct file *f);
  * itself the visibility test: `pid_vnr_in(ns, kpid) == 0` means "not visible
  * from ns", with no separate ancestry walk.
  * ===================================================================== */
+
+/* The last pid handed out in pid namespace NS (NULL: the initial one) --
+ * /proc/sys/kernel/ns_last_pid. */
+int pid_ns_last_pid(void *ns);
 
 /* Called from every process-creation path AFTER the namespace pointers have
  * been inherited. Places `child` in the correct pid namespace -- which is

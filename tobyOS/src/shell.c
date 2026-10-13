@@ -14179,7 +14179,11 @@ static int tiny_atoi(const char *s) {
 /* Shared "one top iteration" print. Walks every live PCB and renders
  * a row with CPU% computed as (delta_cpu_ns / delta_wall_ns) * 100.
  * The caller owns the delta bookkeeping (a snapshot array of
- * previous cpu_ns values keyed by pid). */
+ * previous cpu_ns values keyed by slot, with g_top_prev_pid the pid each
+ * slot held then: a slot that changed hands starts its delta again -- pids
+ * are not slots since batch 26). */
+static int g_top_prev_pid[PROC_MAX];
+
 static void top_print_iter(uint64_t wall_dns, uint64_t prev_cpu[PROC_MAX]) {
     struct perf_sys sys;
     perf_sys_snapshot(&sys);
@@ -14192,9 +14196,10 @@ static void top_print_iter(uint64_t wall_dns, uint64_t prev_cpu[PROC_MAX]) {
     kprintf("  %-3s  %-10s  %-16s  %-5s  %-8s  %-10s  %-6s\n",
             "pid", "state", "name", "uid", "cpu%", "cpu_ms", "sys");
     for (int i = 0; i < PROC_MAX; i++) {
-        struct proc *p = proc_lookup(i);
+        struct proc *p = proc_at_slot(i);
         if (!p) { prev_cpu[i] = 0; continue; }
         uint64_t cur = p->cpu_ns;
+        if (g_top_prev_pid[i] != p->pid) { prev_cpu[i] = cur; g_top_prev_pid[i] = p->pid; }
         uint64_t dcpu = cur > prev_cpu[i] ? cur - prev_cpu[i] : 0;
         unsigned pct = 0;
         if (wall_dns > 0) {
@@ -14237,8 +14242,9 @@ static void cmd_top(int argc, char **argv) {
      * (delta since we sampled). */
     uint64_t prev_cpu[PROC_MAX];
     for (int i = 0; i < PROC_MAX; i++) {
-        struct proc *p = proc_lookup(i);
+        struct proc *p = proc_at_slot(i);
         prev_cpu[i] = p ? p->cpu_ns : 0;
+        g_top_prev_pid[i] = p ? p->pid : -1;
     }
     uint64_t prev_wall_ns = perf_now_ns();
 

@@ -14532,7 +14532,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * spins -- ever ran. */
             {   static unsigned char am[PROC_MAX];
                 struct proc *me = current_proc();
-                int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+                int mp = proc_pid_slot(me ? (me->is_thread ? me->tgid : me->pid) : 0);
                 if (mp >= 0 && mp < PROC_MAX && am[mp] < 80) { am[mp]++;
                     kprintf("[amap] pid=%d mmap hint=0x%lx len=0x%lx prot=0x%x fl=0x%x -> 0x%lx\n",
                             me ? me->pid : -1, (unsigned long)a1,
@@ -14556,7 +14556,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #ifdef CHROMIUM_BOOT
         {   static unsigned char um[PROC_MAX];
             struct proc *me = current_proc();
-            int mp = me ? (me->is_thread ? me->tgid : me->pid) : 0;
+            int mp = proc_pid_slot(me ? (me->is_thread ? me->tgid : me->pid) : 0);
             if (mp >= 0 && mp < PROC_MAX && um[mp] < 80) { um[mp]++;
                 kprintf("[amap] pid=%d munmap  addr=0x%lx len=0x%lx -> %ld\n",
                         me ? me->pid : -1, (unsigned long)a1,
@@ -14609,9 +14609,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         {   static uint32_t cgt_count[PROC_MAX];
             static uint8_t  cgt_dumped[PROC_MAX];
             struct proc *me = current_proc();
-            if (me && me->pid > 0 && me->pid < PROC_MAX &&
-                !cgt_dumped[me->pid] && ++cgt_count[me->pid] > 150000) {
-                cgt_dumped[me->pid] = 1;
+            int ms = me ? proc_pid_slot_live(me->pid) : -1;   /* by slot */
+            if (ms > 0 && !cgt_dumped[ms] && ++cgt_count[ms] > 150000) {
+                cgt_dumped[ms] = 1;
                 extern void bt_dump_self(const char *why);
                 bt_dump_self("clock_gettime-storm");
             }

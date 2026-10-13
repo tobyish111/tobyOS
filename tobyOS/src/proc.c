@@ -2,8 +2,9 @@
  *
  * See proc.h for the high-level model. Implementation notes:
  *
- *   - Fixed-size table (PROC_MAX). PIDs are dense ints starting at 0
- *     (kernel_main). Slot index == PID for simplicity.
+ *   - Fixed-size table (PROC_MAX). Slot 0 is kernel_main, pid 0. Every
+ *     other pid comes from proc_pid_alloc, rising to PID_MAX as Linux's;
+ *     g_slot_of_pid maps it back (batch 26 -- the pid was the slot index).
  *
  *   - Address-space construction sequence in spawn_internal:
  *       a. allocate fresh PML4 (kernel half mirrored by reference)
@@ -71,6 +72,7 @@
 #include <tobyos/perf.h>
 #include <tobyos/rng.h>
 #include <tobyos/nsproxy.h>   /* nsproxy_release (slice 8) */
+#include <tobyos/spinlock.h>
 
 /* Asm helpers from proc_switch.S. */
 extern __attribute__((noreturn)) void proc_enter_user_asm(uint64_t rip,
@@ -174,10 +176,86 @@ const char *proc_state_name(enum proc_state s) {
     return "?";
 }
 
+/* ---- pids (batch 26, finding 146) ---------------------------------------
+ *
+ * g_slot_of_pid[pid] is the slot a pid was last given to; it is never
+ * cleared, only overwritten when the number comes round again, so a key
+ * that outlives its process (a thread group's mm owner) still finds its
+ * slot. g_pid_of_slot[slot] is what the allocator gave that slot -- written
+ * only here, under g_pid_lock, so it holds while fork's memcpy of the
+ * parent passes through the child's p->pid. A lookup checks both ways. */
+static int16_t g_slot_of_pid[PID_MAX];
+static int     g_pid_of_slot[PROC_MAX];
+static int     g_pid_last;                 /* 0 before the first */
+static spinlock_t g_pid_lock = SPINLOCK_INIT;
+
+int proc_pid_slot(int pid) {
+    if (pid < 0 || pid >= PID_MAX) return -1;
+    if (pid == 0) return 0;
+    int s = g_slot_of_pid[pid];
+    return s > 0 ? s : -1;
+}
+
+int proc_pid_slot_live(int pid) {
+    int s = proc_pid_slot(pid);
+    if (s < 0) return -1;
+    return __atomic_load_n(&g_pid_of_slot[s], __ATOMIC_ACQUIRE) == pid ? s : -1;
+}
+
+int proc_last_pid(void) {
+    return __atomic_load_n(&g_pid_last, __ATOMIC_RELAXED);
+}
+
+void proc_set_last_pid(int v) {
+    if (v < 0 || v >= PID_MAX) return;
+    uint64_t f = spin_lock_irqsave(&g_pid_lock);
+    g_pid_last = v;
+    spin_unlock_irqrestore(&g_pid_lock, f);
+}
+
 struct proc *proc_lookup(int pid) {
-    if (pid < 0 || pid >= PROC_MAX) return 0;
-    struct proc *p = &g_proc[pid];
+    int s = proc_pid_slot_live(pid);
+    if (s < 0) return 0;
+    struct proc *p = &g_proc[s];
+    if (p->pid != pid) return 0;
     return (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) ? 0 : p;
+}
+
+struct proc *proc_at_slot(int slot) {
+    if (slot < 0 || slot >= PROC_MAX) return 0;
+    struct proc *p = &g_proc[slot];
+    return (p->state == PROC_UNUSED || p->state == PROC_EMBRYO) ? 0 : p;
+}
+
+/* In use: a live process's pid, or the process group, session, thread
+ * group or address space it names -- Linux keeps a struct pid while any of
+ * them points at it, so `kill -- -PGID` cannot reach a stranger who took
+ * the leader's number. */
+static bool pid_in_use(int pid) {
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED) continue;
+        if (g_pid_of_slot[i] == pid || q->pgid == pid || q->sid == pid ||
+            q->tgid == pid || q->mm_owner == pid)
+            return true;
+    }
+    return false;
+}
+
+int proc_pid_alloc(struct proc *p) {
+    int slot = (int)(p - g_proc);
+    uint64_t f = spin_lock_irqsave(&g_pid_lock);
+    int pid = g_pid_last;
+    for (int n = 0; n < PID_MAX; n++) {
+        pid = pid + 1 >= PID_MAX ? PID_RESERVED : pid + 1;
+        if (!pid_in_use(pid)) break;
+    }
+    g_pid_last = pid;
+    g_slot_of_pid[pid] = (int16_t)slot;
+    __atomic_store_n(&g_pid_of_slot[slot], pid, __ATOMIC_RELEASE);
+    p->pid = pid;
+    spin_unlock_irqrestore(&g_pid_lock, f);
+    return pid;
 }
 
 void proc_dump_table(void) {
@@ -211,25 +289,13 @@ void proc_dump_table(void) {
  * (mongrel pid/tgid/is_thread), executed a demand-zeroed text page and
  * died at NULL, while the victim process lost the thread (the mp
  * bootstrap flake, gpuperf_viz_anim.001.log). */
-/* The search STARTS AFTER THE LAST SLOT CLAIMED, and wraps. It used to take
- * the lowest free slot, so a pid came back the moment its process was
- * reaped. Linux hands out pids in rising order and reuses one only after
- * wrapping, and shells rely on it: bash keeps finished jobs' pids in its
- * job table, and a pid of one background pipeline reappearing in the next
- * had bash credit exits to the wrong job --
- *     for i in 3 2 1; do sleep 0.0$i | ( exit $i ) & ...; wait $pid
- * gave 1 2 1 where Linux gives 3 2 1. The cursor is only a hint: the CAS
- * below is still what makes a claim exclusive, so a race on it costs
- * nothing but order. */
+/* The search starts after the last slot claimed, and wraps -- once the
+ * pid, now only so a slot is not refilled the instant it is freed. The
+ * cursor is only a hint: the CAS below is what makes a claim exclusive.
+ * The rising pids bash relies on (a finished job's pid not reappearing in
+ * the next pipeline), and pid 1 being handed out once, are proc_pid_alloc's
+ * now (batch 26). */
 static int g_slot_next = 1;
-
-/* PID 1 IS HANDED OUT ONCE. It went to 'hello-boot', which exits within
- * the first second, and then came back round like any other slot once the
- * cursor wrapped at 255 -- to an ordinary background job, whose
- * `kill -- -$!` is then kill(-1): it took down the shell, login and the
- * shparity gate (logs/s12a/pid1-killall-excerpt.txt). On Linux pid 1 is
- * init for the life of the system and is never reused. */
-static bool g_slot1_taken;
 
 struct proc *proc_slot_claim(void) {
     /* Slot 0 is reserved for kernel_main. Search 1..PROC_MAX-1. */
@@ -237,13 +303,10 @@ struct proc *proc_slot_claim(void) {
     if (start < 1 || start >= PROC_MAX) start = 1;
     for (int n = 0; n < PROC_MAX - 1; n++) {
         int i = 1 + (start - 1 + n) % (PROC_MAX - 1);
-        if (i == 1 && __atomic_load_n(&g_slot1_taken, __ATOMIC_ACQUIRE))
-            continue;
         enum proc_state expected = PROC_UNUSED;
         if (__atomic_compare_exchange_n(&g_proc[i].state, &expected,
                                         PROC_EMBRYO, false,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            if (i == 1) __atomic_store_n(&g_slot1_taken, true, __ATOMIC_RELEASE);
             __atomic_store_n(&g_slot_next, i + 1 < PROC_MAX ? i + 1 : 1,
                              __ATOMIC_RELAXED);
             /* The wake-after-death tombstone must not outlive the slot's
@@ -826,7 +889,7 @@ static int spawn_body(const char *path, const char *name,
     }
 
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the very end */
-    p->pid       = (int)(p - g_proc);
+    proc_pid_alloc(p);
     p->wait_pid  = -1;
     proc_record_cmdline(p, argc, argv);   /* /proc/<pid>/cmdline */
     /* Slice 64c: "not inside a syscall" is -1, but memset leaves 0, which
@@ -1438,7 +1501,7 @@ int proc_create_kernel(void (*entry)(void), const char *name) {
         return -1;
     }
     proc_slot_wipe(p);                /* stays EMBRYO; READY at the end */
-    p->pid        = (int)(p - g_proc);
+    proc_pid_alloc(p);
     p->wait_pid   = -1;
     p->exit_code  = -1;
     p->ppid       = 0;

@@ -1028,6 +1028,30 @@ int proc_wait_intr(int pid, bool (*intr)(void));
 /* Look up a PCB by PID. Returns NULL if not found or slot is UNUSED/EMBRYO. */
 struct proc *proc_lookup(int pid);
 
+/* PIDS ARE NOT SLOTS (batch 26, finding 146). A pid is handed out by
+ * proc_pid_alloc in rising order up to PID_MAX - 1, then from PID_RESERVED
+ * again, skipping any number still in use as a live process's pid, process
+ * group, session, thread group or mm owner -- Linux's default pid_max and
+ * its wrap. They were the slot index, so they wrapped at 256 and a pid came
+ * back within seconds on a busy system. Pid 0 is kernel_main in slot 0;
+ * pid 1 is handed out once. */
+#define PID_MAX         32768
+#define PID_RESERVED    300
+/* The live process in slot SLOT (0..PROC_MAX-1), or NULL -- for walking
+ * the table; proc_lookup takes a pid. */
+struct proc *proc_at_slot(int slot);
+/* Give P (a claimed slot) its pid; returns it. */
+int proc_pid_alloc(struct proc *p);
+/* The slot PID was last given to, or -1 -- whatever lives there now. For
+ * keys that outlive their process (the VMA table's mm owner). */
+int proc_pid_slot(int pid);
+/* The slot PID was given to if it still holds PID (any state), or -1. */
+int proc_pid_slot_live(int pid);
+/* The pid handed out last (/proc/loadavg's last field), and Linux's
+ * /proc/sys/kernel/ns_last_pid write: the next pid is V + 1. */
+int proc_last_pid(void);
+void proc_set_last_pid(int v);
+
 /* Assign PID's process group (kernel-trusted; the checked path is the
  * setpgid syscall). The shell's `set -m` uses this through a host seam:
  * kernel build calls it directly, /bin/tsh's host.c maps it to setpgid(2). */
