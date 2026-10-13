@@ -344,9 +344,12 @@ int main(int argc, char **argv) {
 
     const char *files[256];
     int nf = 0;
+    int opts_done = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (a[0] == '-' && a[1]) {
+        /* "--" ends the options: `ls -- -x` lists a file named -x */
+        if (!opts_done && !strcmp(a, "--")) { opts_done = 1; continue; }
+        if (!opts_done && a[0] == '-' && a[1]) {
             if (!strcmp(a, "--help")) {
                 printf("usage: ls [-1aAdFgGhilnorRSt] [file ...]\n");
                 return 0;
