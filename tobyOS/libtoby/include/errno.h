@@ -62,6 +62,10 @@ extern int errno;
 #define ENXIO            6
 #define ENOTTY          25
 #define ESPIPE          29
+/* 2026-10-12 (batch 25): a value too large for its type -- GNU truncate
+ * says it of a size past the largest. Linux's number, musl's words in
+ * strerror. */
+#define EOVERFLOW       75
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

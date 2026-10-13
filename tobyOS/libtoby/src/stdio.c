@@ -357,7 +357,12 @@ static int do_format(sink_fn sink, void *ctx, const char *fmt, va_list ap) {
          * long long are both 64-bit and are passed identically in varargs,
          * and conv_int already works in 64-bit. On an ABI where they differ
          * this would need its own case. */
-        if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 'L') {
+        /* j (intmax_t) and t (ptrdiff_t) are 64-bit too, so 'l' (batch
+         * 25: GNU truncate's "%jd bytes" printed "%jd"). */
+        if (*fmt == 'j' || *fmt == 't') {
+            f.length = 'l';
+            fmt++;
+        } else if (*fmt == 'l' || *fmt == 'h' || *fmt == 'z' || *fmt == 'L') {
             f.length = *fmt;
             fmt++;
             if ((f.length == 'l' && *fmt == 'l') ||

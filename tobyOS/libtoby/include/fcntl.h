@@ -24,6 +24,11 @@ extern "C" {
 #define O_EXCL      0x080
 #define O_TRUNC     0x200
 #define O_APPEND    0x400
+/* A directory, opened as one: the native open refuses a directory
+ * unless asked this way, and then hands out the descriptor the Linux
+ * personality gives -- getdents lists it, read(2) says EISDIR. Linux's
+ * value (the kernel's SYS_O_DIRECTORY). */
+#define O_DIRECTORY 0x10000
 
 int open(const char *path, int flags, ...);
 
