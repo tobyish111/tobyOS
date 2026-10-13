@@ -34,6 +34,14 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <regex.h>
+
+/* The native open has no non-blocking flag: where GNU opens O_NONBLOCK
+ * (sync, truncate) so a FIFO with no reader cannot hang it, this open
+ * blocks as a plain one. */
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0
+#endif
 
 #ifndef SU_HOST
 #include <tobyos/abi/abi.h>
@@ -67,6 +75,7 @@ static char *first_line(char *s) {
 
 /* ------------------------------------------------------------- trivial */
 
+#include "su_common.c"
 #include "su_rmdir.c"
 #include "su_yes.c"
 #include "su_tac.c"
@@ -99,6 +108,7 @@ int main(int argc, char **argv) {
     const char *base = argv[0] ? argv[0] : "";
     for (const char *p = base; *p; p++) if (*p == '/') base = p + 1;
     prog = base;
+    su_set_name(argv[0]);
 
     if (!strcmp(base, "rmdir"))   return do_rmdir(argc, argv);
     if (!strcmp(base, "yes"))     return do_yes(argc, argv);

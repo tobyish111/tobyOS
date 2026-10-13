@@ -5,7 +5,7 @@
  *     timeout [OPTION] DURATION COMMAND [ARG]...
  *
  * AS GNU COREUTILS' TIMEOUT, measured on 9.7 in the C locale (tools/agent/
- * probes/b24/timeoutcases*.sh; logs/b24-gnu-timeout*.out):
+ * probes/b24/timeoutcases*.sh; logs/b24/gnu-timeout*.out):
  *
  *   - DURATION as sleep reads one (a number as strtod reads it, one suffix
  *     of s m h d; 0 or inf: no timeout); -k DURATION also KILLs the command
