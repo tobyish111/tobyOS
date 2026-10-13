@@ -282,6 +282,10 @@ static long vfs_err_to_abi(long rv) {
  * bug is not a missing conversion but an INAPPLICABLE one.) */
 static long file_err_to_abi(const struct file *f, long rv) {
     if (rv >= 0) return rv;
+    /* pipe_write's "no reader" is its own -3, which as an errno is ESRCH
+     * (batch 25: a process ignoring SIGPIPE was told "No such process") */
+    if (rv == -3 && f && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW))
+        return -ABI_EPIPE;
     return (f && f->kind == FILE_KIND_VFS) ? vfs_err_to_abi(rv) : rv;
 }
 
@@ -400,6 +404,7 @@ static long sys_write_one(int fd, const void *buf, size_t len) {
     if (rv == -3 && (f->kind == FILE_KIND_PIPE_W || f->kind == FILE_KIND_PIPE_RW)) {
         struct proc *me = current_proc();
         if (me) signal_send_to_pid(me->pid, SIGPIPE);
+        /* ...and EPIPE is what it then sees (file_err_to_abi, below) */
     }
     /* Same POSIX rule for a socket whose write side was shutdown(2): the
      * signal comes first, EPIPE is what a process that ignores it sees. */
