@@ -37657,15 +37657,38 @@ static const char *g_shell_out_why;
  * return the Linux ABI value for these kinds. */
 static const char *shell_io_errtext(const struct file *f, long rv) {
     if (f && f->kind == FILE_KIND_NULL) return "Bad file descriptor";
+#ifndef SHELL_HOSTED
+    /* the kernel shell's file_write gives a VFS file's VFS code */
+    if (f && f->kind == FILE_KIND_VFS) {
+        switch (rv) {
+        case VFS_ERR_NOTPERM: return "Operation not permitted";
+        case VFS_ERR_PERM:    return "Permission denied";
+        case VFS_ERR_ISDIR:   return "Is a directory";
+        case VFS_ERR_INVAL:   return "Invalid argument";
+        case VFS_ERR_ROFS:    return "Read-only file system";
+        case VFS_ERR_NOSPC:   return "No space left on device";
+        default:              return "Input/output error";
+        }
+    }
+#endif
+    /* every errno a write can give (batch 26: EPERM from a /proc file was
+     * "Input/output error", where bash names it) */
     switch (-rv) {
+    case 1:  return "Operation not permitted";
     case 4:  return "Interrupted system call";
+    case 6:  return "No such device or address";
     case 9:  return "Bad file descriptor";
     case 11: return "Resource temporarily unavailable";
     case 13: return "Permission denied";
+    case 14: return "Bad address";
     case 21: return "Is a directory";
     case 22: return "Invalid argument";
+    case 27: return "File too large";
     case 28: return "No space left on device";
+    case 29: return "Illegal seek";
+    case 30: return "Read-only file system";
     case 32: return "Broken pipe";
+    case 122: return "Disk quota exceeded";
     default: return "Input/output error";
     }
 }
