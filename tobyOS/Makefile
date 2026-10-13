@@ -3263,7 +3263,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
 	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
 	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
-	cp programs/user_touch/user_touch.elf           $(INITRD_STAGE)/bin/touch
 	cp programs/user_kill/user_kill.elf             $(INITRD_STAGE)/bin/kill
 	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
 	cp programs/user_coreutil/user_coreutil.elf     $(INITRD_STAGE)/bin/coreutil
@@ -3373,7 +3372,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
-	           cksum truncate install mkfifo date; do \
+	           cksum truncate install mkfifo date touch; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done

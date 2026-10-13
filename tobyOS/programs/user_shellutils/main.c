@@ -110,6 +110,7 @@ static char *first_line(char *s) {
 #include "su_mkfifo.c"
 #include "su_time.c"
 #include "su_date.c"
+#include "su_touch.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -146,6 +147,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "install"))  return do_install(argc, argv);
     if (!strcmp(base, "mkfifo"))   return do_mkfifo(argc, argv);
     if (!strcmp(base, "date"))     return do_date(argc, argv);
+    if (!strcmp(base, "touch"))    return do_touch(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;
