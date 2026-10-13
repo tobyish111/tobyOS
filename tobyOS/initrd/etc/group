@@ -3,3 +3,4 @@ wheel:x:10:root,toby
 crew:x:20:root
 outcast:x:30:
 users:x:100:toby
+toby:x:1000:
