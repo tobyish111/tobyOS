@@ -213,6 +213,23 @@ static int copy_one(const char *src, const char *dst) {
         if (f_verbose) printf("'%s' -> '%s'\n", src, dst);
         return 0;
     }
+    /* -r: a FIFO is made anew, as GNU cp -R makes one -- opening it to
+     * copy what it holds waits for a writer that never comes (utilgate's
+     * stat fixture, whose setup has a FIFO, hung in its `cp -Rp`). */
+    struct stat fst;
+    if (f_recursive && lstat(src, &fst) == 0 && S_ISFIFO(fst.st_mode)) {
+        mode_t um = umask(0);
+        (void)umask(um);
+        mode_t m = f_preserve ? (fst.st_mode & 07777) : ((fst.st_mode & 0777) & ~um);
+        (void)unlink(dst);
+        if (mkfifo(dst, m) != 0) {
+            fprintf(stderr, "cp: cannot create fifo '%s': %s\n", dst, strerror(errno));
+            return -1;
+        }
+        (void)chmod(dst, m);
+        if (f_verbose) printf("'%s' -> '%s'\n", src, dst);
+        return 0;
+    }
     if (is_dir(src)) {
         if (!f_recursive) {
             fprintf(stderr, "cp: -r not specified; omitting directory '%s'\n", src);
@@ -224,7 +241,8 @@ static int copy_one(const char *src, const char *dst) {
 }
 
 static int copy_tree(const char *src, const char *dst) {
-    if (mkdir(dst, 0755) != 0 && !is_dir(dst)) {
+    int made = mkdir(dst, 0755) == 0;
+    if (!made && !is_dir(dst)) {
         fprintf(stderr, "cp: cannot create directory '%s': %s\n", dst, strerror(errno));
         return -1;
     }
@@ -256,6 +274,16 @@ static int copy_tree(const char *src, const char *dst) {
         if (copy_one(s, t) != 0) rc = -1;
     }
     closedir(d);
+    /* The directory's mode, set once it is filled, as GNU cp sets it: -p
+     * gives it the source's (sticky and set-gid too), and a directory made
+     * here gets the source's less the umask. It was always 0755 -- a 1777
+     * directory came back drwxr-xr-x (logs/utilgate stat_fmt). */
+    struct stat sst;
+    if ((f_preserve || made) && stat(src, &sst) == 0) {
+        mode_t um = umask(0);
+        (void)umask(um);
+        (void)chmod(dst, f_preserve ? (sst.st_mode & 07777) : ((sst.st_mode & 0777) & ~um));
+    }
     return rc;
 }
 
