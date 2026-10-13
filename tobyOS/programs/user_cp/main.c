@@ -33,6 +33,18 @@
 
 static int f_recursive, f_noclobber, f_force, f_interactive;
 static int f_preserve, f_verbose, f_unique;
+
+/* -p: what GNU's keeps -- the owner (left as it is, quietly, where it may
+ * not be given), the mode, the access and modification times. It kept the
+ * mode alone: the copy was dated now (batch 26, with utimensat). */
+static void preserve(const char *dst, const struct stat *st) {
+    (void)chown(dst, st->st_uid, st->st_gid);
+    (void)chmod(dst, st->st_mode & 07777);
+    struct timespec ts[2];
+    ts[0].tv_sec = st->st_atime; ts[0].tv_nsec = 0;
+    ts[1].tv_sec = st->st_mtime; ts[1].tv_nsec = 0;
+    (void)utimensat(AT_FDCWD, dst, ts, 0);
+}
 static int had_error;
 
 static void usage(void) {
@@ -42,7 +54,7 @@ static void usage(void) {
         "  -n      never overwrite an existing file\n"
         "  -f      overwrite without asking (default)\n"
         "  -i      ask before overwriting\n"
-        "  -p      preserve the source's permission bits\n"
+        "  -p      keep the source's mode, owner and times\n"
         "  -v      say what is being copied\n"
         "  -U      on a clash, pick a free name (report.txt -> report_1.txt)\n");
 }
@@ -178,7 +190,7 @@ done:
     close(out);
     if (rc == 0 && f_preserve) {
         struct stat st;
-        if (stat(src, &st) == 0) (void)chmod(dst, st.st_mode & 07777);
+        if (stat(src, &st) == 0) preserve(dst, &st);
     } else if (rc == 0 && !existed) {
         struct stat st;
         if (stat(src, &st) == 0) {
@@ -226,7 +238,8 @@ static int copy_one(const char *src, const char *dst) {
             fprintf(stderr, "cp: cannot create fifo '%s': %s\n", dst, strerror(errno));
             return -1;
         }
-        (void)chmod(dst, m);
+        if (f_preserve) preserve(dst, &fst);
+        else (void)chmod(dst, m);
         if (f_verbose) printf("'%s' -> '%s'\n", src, dst);
         return 0;
     }
@@ -282,7 +295,8 @@ static int copy_tree(const char *src, const char *dst) {
     if ((f_preserve || made) && stat(src, &sst) == 0) {
         mode_t um = umask(0);
         (void)umask(um);
-        (void)chmod(dst, f_preserve ? (sst.st_mode & 07777) : ((sst.st_mode & 0777) & ~um));
+        if (f_preserve) preserve(dst, &sst);
+        else (void)chmod(dst, (sst.st_mode & 0777) & ~um);
     }
     return rc;
 }
