@@ -4179,6 +4179,78 @@ static long sys_utimes_native(const char *path, uint64_t mtime, uint64_t atime) 
     return vfs_err_to_abi(vfs_utimes(kpath, mtime, atime));
 }
 
+/* ---- utimensat(2), both personalities (batch 26) -----------------------
+ *
+ * KPATH's access and modification times (A, M: seconds and ns; an ns of
+ * ABI_UTIME_NOW or ABI_UTIME_OMIT means now or leave it; !HAVE: now for
+ * both), Linux's rules: a link is followed unless NOFOLLOW; an explicit time
+ * needs the owner (or root) -- EPERM; now needs the owner or write
+ * permission -- EACCES; a read-only mount EROFS. The disk keeps whole
+ * seconds; the ns go. A filesystem that keeps no times at all (the initrd's
+ * ramfs) says yes, as the Linux personality always has.
+ *
+ * It was two half-answers: SYS_UTIMES, unsigned with -1 for now, so 1969
+ * could not be set and one time could not be left alone (touch -a had to
+ * read and rewrite the other); and the Linux utime family, which read the
+ * seconds and dropped UTIME_NOW/UTIME_OMIT -- an explicit 1970-01-01 there
+ * was taken for now -- and set a link's own times when asked for its
+ * target's. */
+static long do_utimensat(const char *kpath, bool have, int64_t a_s, long a_ns,
+                         int64_t m_s, long m_ns, bool nofollow) {
+    char hop[ABI_PATH_MAX];
+    const char *path = kpath;
+    struct vfs_stat vs;
+    int sr = vfs_stat(path, &vs);
+    for (int hops = 0; sr == VFS_OK && vs.type == VFS_TYPE_SYMLINK && !nofollow; hops++) {
+        if (hops >= 40) return -ABI_ELOOP;
+        char next[ABI_PATH_MAX];
+        if (vfs_link_target(path, next, sizeof next) != VFS_OK) return -ABI_ENOENT;
+        memcpy(hop, next, sizeof hop);
+        path = hop;
+        sr = vfs_stat(path, &vs);
+    }
+    if (sr != VFS_OK) return vfs_err_to_abi(sr);
+    if (vfs_path_mount_flags(path) & VFS_MNT_RDONLY) return -ABI_EROFS;
+    if (!have) { a_ns = m_ns = ABI_UTIME_NOW; }
+    bool a_omit = a_ns == ABI_UTIME_OMIT, m_omit = m_ns == ABI_UTIME_OMIT;
+    bool a_now = a_ns == ABI_UTIME_NOW, m_now = m_ns == ABI_UTIME_NOW;
+    if ((!a_omit && !a_now && (a_ns < 0 || a_ns > 999999999)) ||
+        (!m_omit && !m_now && (m_ns < 0 || m_ns > 999999999)))
+        return -ABI_EINVAL;
+    if (a_omit && m_omit) return 0;
+    struct proc *me = current_proc();
+    bool root = !me || me->uid == 0;
+    bool owner = root || (uint32_t)me->uid == vs.uid;
+    bool only_now = (a_now || a_omit) && (m_now || m_omit);
+    if (!only_now && !owner) return -ABI_EPERM;
+    if (only_now && !owner) {
+        uint32_t mode = vs.mode, bits;
+        if (!(mode & VFS_MODE_VALID)) bits = 7;
+        else if (me && (uint32_t)me->gid == vs.gid) bits = (mode >> 3) & 7u;
+        else bits = mode & 7u;
+        if (!(bits & 2u)) return -ABI_EACCES;
+    }
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    int64_t now = (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+    int64_t na = a_omit ? (int64_t)vs.atime : a_now ? now : a_s;
+    int64_t nm = m_omit ? (int64_t)vs.mtime : m_now ? now : m_s;
+    int rc = vfs_utimes(path, (uint64_t)nm, (uint64_t)na);
+    if (rc == VFS_ERR_ROFS) return 0;          /* keeps no times (ramfs) */
+    return vfs_err_to_abi(rc);
+}
+
+static long sys_utimensat_native(const char *upath, const void *utimes2, int flags) {
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(upath, kpath, sizeof(kpath));
+    if (rr) return rr;
+    if (flags & ~ABI_AT_SYMLINK_NOFOLLOW) return -ABI_EINVAL;
+    struct { int64_t a_s, a_ns, m_s, m_ns; } tv;
+    if (utimes2 && copy_from_user(&tv, utimes2, sizeof tv) != 0) return -ABI_EFAULT;
+    return do_utimensat(kpath, utimes2 != 0, utimes2 ? tv.a_s : 0, utimes2 ? (long)tv.a_ns : 0,
+                        utimes2 ? tv.m_s : 0, utimes2 ? (long)tv.m_ns : 0,
+                        (flags & ABI_AT_SYMLINK_NOFOLLOW) != 0);
+}
+
 static long sys_truncate_path(const char *path, uint64_t len) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
@@ -6366,6 +6438,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
     case ABI_SYS_LSTAT:
         return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
+    case ABI_SYS_UTIMENSAT:
+        return sys_utimensat_native((const char *)a1, (const void *)a2, (int)a3);
     case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
     case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
     case ABI_SYS_XSTAT:
@@ -12452,69 +12526,51 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * real means adding times to vfs_stat + a ->utimes op across tobyfs/
      * ext2/ext4/fat32, which is its own slice. */
     case LX_utime: case LX_utimes: case LX_futimesat: case LX_utimensat: {
+        /* All four through do_utimensat (batch 26): utime's utimbuf
+         * (actime, modtime), utimes' and futimesat's timeval pairs, and
+         * utimensat's timespec pairs with UTIME_NOW/UTIME_OMIT and
+         * AT_SYMLINK_NOFOLLOW; NULL times is now for both. A NULL path for
+         * utimensat is the descriptor itself (futimens), by its path. */
         const char *up = (n == LX_futimesat || n == LX_utimensat)
                          ? (const char *)a2 : (const char *)a1;
-        /* utimensat(dirfd, NULL, ...) legally means "the dirfd itself". */
+        uint64_t tp = (n == LX_utimensat || n == LX_futimesat) ? (uint64_t)a3 : (uint64_t)a2;
+        bool nofollow = n == LX_utimensat && ((int)a4 & 0x100);
+        if (n == LX_utimensat && ((int)a4 & ~0x100)) return -ABI_EINVAL;
+        char kpath[ABI_PATH_MAX];
         if (up) {
-            char kpath[ABI_PATH_MAX];
-            if (resolve_user_path(up, kpath, sizeof kpath) != 0)
-                return -ABI_EFAULT;
-            struct vfs_stat vs;
-            if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-            /* Slice 5: a read-only mount must refuse this even though we do
-             * not persist timestamps. The slice-1 "accept and succeed" stub
-             * was reporting success on a ro mount, which let `touch` claim it
-             * had modified a read-only filesystem -- a stub may decline to do
-             * work, but it must not contradict a mount flag. */
-            if (vfs_path_mount_flags(kpath) & VFS_MNT_RDONLY)
-                return -ABI_EROFS;
-            /* Slice 6: actually STORE the timestamp. Slice 1 could not --
-             * struct vfs_stat had no time fields and no filesystem had a
-             * ->utimes -- so this accepted-and-discarded. Both now exist.
-             *
-             * A NULL times argument means "now" for every one of the four
-             * variants, which is the case `touch` uses. The layouts differ:
-             * utimensat/futimesat take timespec (sec,nsec) pairs, utimes/utime
-             * take timeval/utimbuf, but all start with seconds -- and seconds
-             * is the resolution the on-disk inode has, so read that and let
-             * the sub-second part go. */
-            uint64_t mt = 0, at = 0;
-            uint64_t tp = (n == LX_utimensat || n == LX_futimesat)
-                        ? (uint64_t)a3 : (uint64_t)a2;
-            if (tp) {
-                struct { int64_t a_sec, a_sub, m_sec, m_sub; } tv;
-                if (copy_from_user(&tv, (const void *)(uintptr_t)tp,
-                                   sizeof tv) != 0)
-                    return -ABI_EFAULT;
-                at = (uint64_t)tv.a_sec;
-                mt = (uint64_t)tv.m_sec;
-            }
-            if (!mt && !at) {
-                uint64_t nowsec = lx_realtime_ns(perf_now_ns()) / 1000000000ull;
-                mt = at = nowsec;
-            }
-            int urc = vfs_utimes(kpath, mt, at);
-            if (urc == VFS_OK) return 0;
-            /* VFS_ERR_ROFS here means "this filesystem cannot store times"
-             * (e.g. the read-only initrd ramfs), not a caller error. Report
-             * success so `touch`/`cp -p` on such a mount still work, exactly
-             * as they did before -- but only AFTER genuinely trying. */
-            if (urc == VFS_ERR_ROFS) return 0;
-            return vfs_err_to_abi(urc);
+            int rr = resolve_user_path(up, kpath, sizeof kpath);
+            if (rr) return rr;
         } else if (n == LX_utimensat) {
-            if (!fd_lookup((int)a1) && (int)a1 != -100 /*AT_FDCWD*/)
-                return -ABI_EBADF;
-        }
-        {   /* Say it once per boot so the limitation is discoverable in a log
-             * rather than only in this comment. */
-            static int warned = 0;
-            if (!warned) {
-                warned = 1;
-                kprintf("[linux] utime family: accepted but NOT persisted "
-                        "(vfs_stat carries no timestamps) -- see slice 1\n");
+            struct file *ff = fd_lookup((int)a1);
+            if (!ff) return -ABI_EBADF;
+            const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath) ? ff->dirpath : ff->open_path;
+            if (!kp || !kp[0]) return 0;           /* a pipe or a socket: nothing to set */
+            size_t kl = strlen(kp);
+            if (kl >= sizeof kpath) return -ABI_ENAMETOOLONG;
+            memcpy(kpath, kp, kl + 1);
+            nofollow = true;                       /* the open file itself */
+        } else
+            return -ABI_EFAULT;
+        int64_t as = 0, ms = 0;
+        long ans = 0, mns = 0;
+        if (tp) {
+            if (n == LX_utime) {
+                struct { int64_t ac, mo; } ub;
+                if (copy_from_user(&ub, (const void *)(uintptr_t)tp, sizeof ub) != 0) return -ABI_EFAULT;
+                as = ub.ac; ms = ub.mo;
+            } else {
+                struct { int64_t a_s, a_sub, m_s, m_sub; } tv;
+                if (copy_from_user(&tv, (const void *)(uintptr_t)tp, sizeof tv) != 0) return -ABI_EFAULT;
+                as = tv.a_s; ms = tv.m_s;
+                if (n == LX_utimensat) { ans = (long)tv.a_sub; mns = (long)tv.m_sub; }
+                else {
+                    if (tv.a_sub < 0 || tv.a_sub > 999999 || tv.m_sub < 0 || tv.m_sub > 999999)
+                        return -ABI_EINVAL;
+                    ans = (long)tv.a_sub * 1000; mns = (long)tv.m_sub * 1000;
+                }
             }
         }
-        return 0;
+        return do_utimensat(kpath, tp != 0, as, ans, ms, mns, nofollow);
     }
 
     /* sync(2)/syncfs(2). Real: walk the block registry and flush each cache.

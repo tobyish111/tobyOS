@@ -21,6 +21,7 @@
 
 #include <time.h>
 #include <sys/time.h>
+#include <sys/stat.h>      /* utimensat, AT_FDCWD (batch 26) */
 #include <string.h>
 #include <errno.h>
 #include "libtoby_internal.h"
@@ -211,12 +212,27 @@ char *ctime(const time_t *tp) { return ctime_r(tp, g_asc); }
 
 int utimes(const char *path, const struct timeval times[2])
 {
-    unsigned long long at = ~0ull, mt = ~0ull;   /* both mean "now" */
+    /* through utimensat (batch 26): SYS_UTIMES took unsigned seconds with
+     * -1 for now, so 1969-12-31 23:59:59 could not be set */
+    if (!times) return utimensat(AT_FDCWD, path, 0, 0);
+    struct timespec ts[2];
+    ts[0].tv_sec = times[0].tv_sec; ts[0].tv_nsec = (long)times[0].tv_usec * 1000;
+    ts[1].tv_sec = times[1].tv_sec; ts[1].tv_nsec = (long)times[1].tv_usec * 1000;
+    return utimensat(AT_FDCWD, path, ts, 0);
+}
+
+/* utimensat(2): at AT_FDCWD only (a path relative to the working directory
+ * or absolute); TIMES[0] the access time, [1] the modification time, each
+ * tv_nsec UTIME_NOW or UTIME_OMIT if so; NULL is now for both;
+ * AT_SYMLINK_NOFOLLOW for a link itself. The disk keeps whole seconds. */
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags)
+{
+    if (dirfd != AT_FDCWD) { errno = EBADF; return -1; }
+    long long k[4];
     if (times) {
-        at = (unsigned long long)times[0].tv_sec;
-        mt = (unsigned long long)times[1].tv_sec;
+        k[0] = times[0].tv_sec; k[1] = times[0].tv_nsec;
+        k[2] = times[1].tv_sec; k[3] = times[1].tv_nsec;
     }
-    return (int)__toby_check(toby_sc3(ABI_SYS_UTIMES,
-                                      (long)(uintptr_t)path,
-                                      (long)mt, (long)at));
+    return (int)__toby_check(toby_sc3(ABI_SYS_UTIMENSAT, (long)(uintptr_t)path,
+                                      times ? (long)(uintptr_t)k : 0, flags));
 }

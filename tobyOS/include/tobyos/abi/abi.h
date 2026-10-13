@@ -1310,7 +1310,26 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         not SETPRIORITY's scheduling CLASS
                                         (165) -- though a niceness moves the
                                         class with it. (batch 25) */
-#define ABI_SYS_NR_MAX          224
+#define ABI_SYS_UTIMENSAT       225  /* (path, const struct abi_timespec
+                                        times[2] | NULL, int flags) -> 0|-E:
+                                        utimensat(2) at AT_FDCWD. times[0]
+                                        the access time, times[1] the
+                                        modification time, either one's
+                                        tv_nsec ABI_UTIME_NOW or
+                                        ABI_UTIME_OMIT; NULL is now for both.
+                                        Seconds are signed (1969 is a time).
+                                        flags ABI_AT_SYMLINK_NOFOLLOW: the
+                                        link itself. EPERM to set an explicit
+                                        time on another user's file, EACCES
+                                        to set now on one not writable.
+                                        SYS_UTIMES could not say 1969-12-31
+                                        23:59:59 -- its -1 meant now -- nor
+                                        leave one time as it was. (batch 26) */
+#define ABI_SYS_NR_MAX          225
+
+#define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
+#define ABI_UTIME_OMIT          ((1L << 30) - 2L)
+#define ABI_AT_SYMLINK_NOFOLLOW 0x100
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {

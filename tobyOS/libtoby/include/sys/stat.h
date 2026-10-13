@@ -85,6 +85,18 @@ int mkfifo(const char *path, mode_t mode);        /* a named pipe */
 int mkdir(const char *path, mode_t mode);
 mode_t umask(mode_t mask);
 
+/* utimensat(2) (batch 26): at AT_FDCWD only; Linux's values. */
+#ifndef AT_FDCWD
+#define AT_FDCWD            (-100)
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+#define UTIME_NOW           ((1L << 30) - 1L)
+#define UTIME_OMIT          ((1L << 30) - 2L)
+#include <time.h>   /* struct timespec, as POSIX has sys/stat.h give it */
+int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
+
 #ifdef __cplusplus
 }
 #endif
