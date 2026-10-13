@@ -1602,6 +1602,12 @@ static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out
     for (int i = 0; i < s_nhd; i++) s_hd[i] = st->hd[i];
     struct bsyn_buf *s_cap = st->cap;
     struct bsyn_buf captured = {0, 0, 0};
+    /* The tree, even when only checking: bash's word holds print_comsub's
+     * text of what it parsed, and that is what a syntax error names --
+     * `<( sh)` is "<(sh)", `$( a|b )` "$(a | b)" (finding 35). It lives in
+     * the arena of the command being read, freed with the rest. */
+    bool s_build = st->build;
+    st->build = true;
 
     st->tok.p = 0; st->tok.len = st->tok.cap = 0;
     st->wtext.p = 0; st->wtext.len = st->wtext.cap = 0;
@@ -1691,7 +1697,8 @@ static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out
     }
     for (int i = 0; i < s_nhd; i++) if (s_hd[i].delim) BSYN_FREE(s_hd[i].delim);
     if (s_cap && captured.p) bsyn_putn(st, s_cap, captured.p, captured.len);
-    if (ok && st->build) {
+    st->build = s_build;
+    if (ok) {
         /* parse_comsub returns print_comsub's text of what it parsed, and
          * that is what the word holds: `$( a|b )` is "$(a | b)" */
         struct bsyn_buf pt = {0, 0, 0};
@@ -1700,10 +1707,6 @@ static bool bsyn_comsub(struct bsyn *st, int qc, int flags, struct bsyn_buf *out
         bsyn_putn(st, out, pt.p ? pt.p : "", pt.len);
         bsyn_putc(st, out, ')');
         bsyn_buf_free(&pt);
-        ok = !st->oom;
-    } else if (ok) {
-        if (captured.p && captured.p[0] == '(') bsyn_putc(st, out, ' ');
-        bsyn_putn(st, out, captured.p ? captured.p : ")", captured.p ? captured.len : 1);
         ok = !st->oom;
     }
     bsyn_buf_free(&captured);
