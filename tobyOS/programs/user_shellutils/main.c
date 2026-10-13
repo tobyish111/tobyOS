@@ -108,6 +108,8 @@ static char *first_line(char *s) {
 #include "su_truncate.c"
 #include "su_install.c"
 #include "su_mkfifo.c"
+#include "su_time.c"
+#include "su_date.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -143,6 +145,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "truncate")) return do_truncate(argc, argv);
     if (!strcmp(base, "install"))  return do_install(argc, argv);
     if (!strcmp(base, "mkfifo"))   return do_mkfifo(argc, argv);
+    if (!strcmp(base, "date"))     return do_date(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;

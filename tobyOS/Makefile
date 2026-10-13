@@ -3370,10 +3370,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	      cp $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
-	@# sixteen names that were busybox applets until now, one binary
+	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
-	           cksum truncate install mkfifo; do \
+	           cksum truncate install mkfifo date; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3467,7 +3467,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
-	cp programs/user_date/user_date.elf             $(INITRD_STAGE)/bin/date
 	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
 	cp programs/user_nc/user_nc.elf                 $(INITRD_STAGE)/bin/nc
 	@# netcat is nc under its long name

@@ -27,7 +27,7 @@ gcc -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -DSU_HOST \
     third_party/monocypher-4.0.2/src/monocypher.c -lm
 for n in rmdir yes tac seq whoami which uname free sync stat du xargs nohup \
          timeout watch dd printenv nice pgrep pkill tty stty cksum truncate \
-         install mkfifo; do
+         install mkfifo date; do
     ln -sf /tmp/suhost/shellutils /tmp/suhost/bin/$n
 done
 echo "suhost: built /tmp/suhost/shellutils"
