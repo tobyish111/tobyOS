@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -29,12 +30,17 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#ifdef SU_HOST
+#include <sys/ioctl.h>      /* libtoby declares ioctl in unistd.h */
+#endif
 #include <termios.h>
 #include <time.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <regex.h>
+#include <limits.h>
 
 /* The native open has no non-blocking flag: where GNU opens O_NONBLOCK
  * (sync, truncate) so a FIFO with no reader cannot hang it, this open
@@ -76,6 +82,7 @@ static char *first_line(char *s) {
 /* ------------------------------------------------------------- trivial */
 
 #include "su_common.c"
+#include "su_num.c"
 #include "su_rmdir.c"
 #include "su_yes.c"
 #include "su_tac.c"
