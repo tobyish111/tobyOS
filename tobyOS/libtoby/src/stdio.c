@@ -838,6 +838,33 @@ int fgetc(FILE *f) {
 int getc(FILE *f)   { return fgetc(f); }
 int getchar(void)   { return fgetc(stdin); }
 
+/* POSIX getdelim (batch 25: GNU cksum -c and others read lines of any
+ * length). */
+ssize_t getdelim(char **linep, size_t *capp, int delim, FILE *f) {
+    if (!linep || !capp || !f) { errno = EINVAL; return -1; }
+    size_t n = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (!*linep || n + 2 > *capp) {
+            size_t cap = *capp ? *capp * 2 : 128;
+            while (cap < n + 2) cap *= 2;
+            char *nb = (char *)realloc(*linep, cap);
+            if (!nb) { errno = ENOMEM; return -1; }
+            *linep = nb;
+            *capp = cap;
+        }
+        (*linep)[n++] = (char)c;
+        if (c == delim) break;
+    }
+    if (n == 0) return -1;
+    (*linep)[n] = 0;
+    return (ssize_t)n;
+}
+
+ssize_t getline(char **linep, size_t *capp, FILE *f) {
+    return getdelim(linep, capp, '\n', f);
+}
+
 char *fgets(char *s, int cap, FILE *f) {
     if (!s || cap <= 0 || !f) return 0;
     flock_(f);

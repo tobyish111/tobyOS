@@ -58,6 +58,10 @@ int    getchar (void);
 int    getc    (FILE *f);
 int    fgetc   (FILE *f);
 char  *fgets   (char *s, int cap, FILE *f);
+/* POSIX getline/getdelim: a whole line (or up to DELIM), *LINEP grown
+ * with realloc as needed; the count, or -1 at end of file. */
+ssize_t getdelim(char **linep, size_t *capp, int delim, FILE *f);
+ssize_t getline (char **linep, size_t *capp, FILE *f);
 
 /* ---- file streams ------------------------------------------------- */
 FILE  *fopen   (const char *path, const char *mode);
