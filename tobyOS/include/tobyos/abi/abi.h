@@ -1295,7 +1295,22 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         so a binary built before the struct
                                         grew is never written past; libtoby
                                         asks through this one (batch 25). */
-#define ABI_SYS_NR_MAX          222
+#define ABI_SYS_GETNICE         223  /* (int which, int who) -> 20 less the
+                                        lowest niceness among the processes
+                                        WHICH and WHO name, or -ABI_E*:
+                                        getpriority(2) as the raw Linux call
+                                        answers it. which 0 a process, 1 a
+                                        process group, 2 a user (by real
+                                        uid); who 0 is the caller's own. */
+#define ABI_SYS_SETNICE         224  /* (int which, int who, int nice) -> 0
+                                        |-E: setpriority(2). The niceness is
+                                        clamped to -20..19; EPERM for another
+                                        user's process, EACCES for a lower one
+                                        unless root, ESRCH for none. This is
+                                        not SETPRIORITY's scheduling CLASS
+                                        (165) -- though a niceness moves the
+                                        class with it. (batch 25) */
+#define ABI_SYS_NR_MAX          224
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {

@@ -1144,8 +1144,10 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
         APPEND_STR(" "); APPEND_INT(st100);  /* 15 stime       */
         APPEND_STR(" "); APPEND_INT(cut100); /* 16 cutime      */
         APPEND_STR(" "); APPEND_INT(cst100); /* 17 cstime      */
-        APPEND_STR(" 20");                   /* 18 priority    */
-        APPEND_STR(" 0");                    /* 19 nice        */
+        /* 18 priority, 19 nice: 20 + niceness and the niceness, as Linux
+         * gives them for a normal process (batch 25; they were 20 and 0) */
+        APPEND_STR(" "); APPEND_INT(20 + p->nice);
+        APPEND_STR(" "); APPEND_INT(p->nice);
         APPEND_STR(" "); APPEND_INT(nthreads);   /* 20 num_threads */
         APPEND_STR(" 0");                    /* 21 itrealvalue */
         /* 22 starttime: clock ticks (USER_HZ = 100) after boot, from the

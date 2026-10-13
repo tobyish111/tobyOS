@@ -486,3 +486,31 @@ int toby_arp_resolve(unsigned int ip_be, unsigned char mac[6]) {
 int toby_arp_request(unsigned int ip_be) {
     return (int)__toby_check(toby_sc3(ABI_SYS_ARP, 1, (long)ip_be, 0));
 }
+
+/* ---- niceness (batch 25): getpriority/setpriority/nice -------------------
+ * The raw call answers 20 less the niceness, as Linux's does, so a
+ * niceness of -1 is never mistaken for an error there. */
+int getpriority(int which, int who) {
+    long r = toby_sc2(ABI_SYS_GETNICE, which, who);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 20 - (int)r;
+}
+
+int setpriority(int which, int who, int prio) {
+    long r = toby_sc3(ABI_SYS_SETNICE, which, who, prio);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return 0;
+}
+
+/* nice(3): add INC to the caller's niceness; the new one, or -1 with errno
+ * (EPERM for a lower one without the privilege -- POSIX's word for it). */
+int nice(int inc) {
+    errno = 0;
+    int cur = getpriority(0, 0);
+    if (cur == -1 && errno) return -1;
+    if (setpriority(0, 0, cur + inc) != 0) {
+        if (errno == EACCES) errno = EPERM;
+        return -1;
+    }
+    return getpriority(0, 0);
+}

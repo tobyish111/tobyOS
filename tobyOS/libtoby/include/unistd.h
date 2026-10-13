@@ -96,6 +96,7 @@ int     brk    (void *addr);
 
 unsigned int sleep (unsigned int seconds);
 int          usleep(unsigned int usecs);
+int          nice(int inc);                 /* the new niceness, or -1 (batch 25) */
 
 void    _exit  (int code) __attribute__((noreturn));
 

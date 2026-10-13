@@ -720,6 +720,13 @@ struct proc {
      * *effective* priority upward from this stamp so a busy high-priority proc
      * can never starve a low-priority one. */
     int             prio;
+    /* POSIX niceness, -20..19 (batch 25): what nice(1), setpriority(2) and
+     * /proc/PID/stat's fields 18 and 19 speak. Inherited as the umask is
+     * (fork copies the PCB, spawn copies it in proc.c), and it carries
+     * `prio` with it: a positive niceness is the LOW class, a negative one
+     * HIGH (nice_class, syscall.c) -- `nice -n 19 make` really does give
+     * the CPU away. Struct grew: CLEAN BUILD required. */
+    int             nice;
     int32_t         quantum_left;
     uint64_t        enq_tick;
     /* Slice 94: perf_now_ns() stamp of the last enqueue, consumed by

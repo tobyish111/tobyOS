@@ -905,6 +905,9 @@ static int spawn_body(const char *path, const char *name,
          * parentless (kernel-spawned) proc -- the conventional default --
          * and pid 0 carries 0022 itself (proc_init). */
         p->umask      = parent ? parent->umask      : 0022u;
+        /* niceness too, and the scheduling class that goes with it */
+        p->nice       = parent ? parent->nice       : 0;
+        if (p->nice) p->prio = p->nice > 0 ? PRIO_LOW : PRIO_HIGH;
         /* the session and its terminal, as fork copies them */
         p->sid        = parent ? parent->sid        : 0;
         p->ctty_kind  = parent ? parent->ctty_kind  : PROC_CTTY_CONSOLE;

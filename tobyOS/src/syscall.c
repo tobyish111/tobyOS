@@ -1990,6 +1990,83 @@ static long sys_getpriority(int pid) {
     return sched_get_prio(pid);
 }
 
+/* ---- POSIX niceness (batch 25) ------------------------------------------
+ *
+ * getpriority(2) and setpriority(2) as Linux defines them, for both
+ * personalities (LX_getpriority/LX_setpriority, ABI_SYS_GETNICE/SETNICE).
+ * WHICH is a process (0), a process group (1) or a user (2, by real uid);
+ * WHO 0 is the caller's own. get answers 20 less the lowest niceness among
+ * the matches -- the raw call's convention, which libc turns back -- or
+ * ESRCH. set clamps to -20..19 and, for each match: EPERM unless root or
+ * one of the target's uids (real or effective) is the caller's effective
+ * uid; EACCES for a niceness below the target's own, unless root; else it
+ * is set, and the scheduling class with it. One failure is the call's
+ * answer even if another match took the value, as on Linux.
+ *
+ * The Linux personality said "nice 0" for everything and took every set
+ * without doing it; the native ABI had only the scheduling class, so
+ * nice(1) could not say or change a niceness at all. */
+static int nice_class(int nice) {
+    return nice > 0 ? PRIO_LOW : nice < 0 ? PRIO_HIGH : PRIO_NORMAL;
+}
+
+/* WHO as a kernel id for WHICH (0: the caller's own), or -1 for none */
+static int nice_target(int which, int who) {
+    struct proc *me = current_proc();
+    if (which == 2) return who ? who : (me ? (int)me->ruid : 0);
+    if (!who) return me ? (which == 0 ? me->pid : me->pgid) : -1;
+    int k = pid_knr(who);                           /* slice 10: a vpid */
+    return k ? k : -1;
+}
+
+static bool nice_match(const struct proc *q, int which, int id) {
+    if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
+        q->state == PROC_TERMINATED || q->pid == 0) return false;
+    if (which == 0) return q->pid == id;
+    if (which == 1) return q->pgid == id;
+    return (int)q->ruid == id;
+}
+
+static long nice_get(int which, int who) {
+    if (which < 0 || which > 2) return -ABI_EINVAL;
+    int id = nice_target(which, who);
+    if (id < 0) return -ABI_ESRCH;
+    extern struct proc g_proc[];
+    int best = 100;
+    for (int i = 0; i < PROC_MAX; i++)
+        if (nice_match(&g_proc[i], which, id) && g_proc[i].nice < best)
+            best = g_proc[i].nice;
+    return best == 100 ? -ABI_ESRCH : 20 - best;
+}
+
+static long nice_set(int which, int who, long niceval) {
+    if (which < 0 || which > 2) return -ABI_EINVAL;
+    if (niceval < -20) niceval = -20;
+    if (niceval > 19) niceval = 19;
+    int id = nice_target(which, who);
+    if (id < 0) return -ABI_ESRCH;
+    struct proc *me = current_proc();
+    bool root = me && me->uid == 0;
+    extern struct proc g_proc[];
+    long err = -ABI_ESRCH;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *q = &g_proc[i];
+        if (!nice_match(q, which, id)) continue;
+        if (!root && (!me || (q->ruid != me->uid && q->uid != me->uid))) {
+            err = -ABI_EPERM;
+            continue;
+        }
+        if (!root && niceval < q->nice) {
+            err = -ABI_EACCES;
+            continue;
+        }
+        q->nice = (int)niceval;
+        (void)sched_set_prio(q->pid, nice_class(q->nice));
+        if (err == -ABI_ESRCH) err = 0;
+    }
+    return err;
+}
+
 /* Copy a user-provided path into the kernel and resolve it against the
  * calling proc's cwd. The result lives in `out` (caller-owned buffer of
  * size `cap`). Returns 0 on success, -ABI_E* on failure. Absolute paths
@@ -6289,6 +6366,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
     case ABI_SYS_LSTAT:
         return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
+    case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
+    case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
     case ABI_SYS_XSTAT:
         if (a1 == 2) return sys_fstat_sz((int)a2, (struct abi_stat *)a3, (size_t)a4);
         if (a1 != 0 && a1 != 1) return -ABI_EINVAL;
@@ -14550,8 +14629,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return (long)len;
     }
 
-    case LX_getpriority:  return 20;         /* nice 0 (kernel returns 20-nice) */
-    case LX_setpriority:  return 0;          /* accept */
+    case LX_getpriority:  return nice_get((int)a1, (int)a2);    /* 20 - nice */
+    case LX_setpriority:  return nice_set((int)a1, (int)a2, (long)(int)a3);
 
     /* ==================================================================
      * Linux slice 2 -- credential transitions.
