@@ -516,7 +516,7 @@ static void rdchk_verify(struct tcp_conn *tc, int fd, const void *kbuf,
 }
 #endif
 
-static long sys_read(int fd, void *buf, size_t len) {
+static long sys_read_one(int fd, void *buf, size_t len) {
     if (len == 0) return 0;
     if (len > SYS_MAX_RW) len = SYS_MAX_RW;
     if (!user_buf_ok((uint64_t)(uintptr_t)buf, len)) return -ABI_EFAULT;
@@ -537,6 +537,35 @@ static long sys_read(int fd, void *buf, size_t len) {
     return file_err_to_abi(f, rv);
 }
 
+/* READ ALL OF IT WHERE LINUX DOES (batch 25). The kernel bounces at most
+ * SYS_MAX_RW (64 KiB) per pass, and read(2) RETURNED after one pass: a
+ * 1 MiB read of a regular file or of /dev/zero came back 65536. Linux
+ * gives a regular file's read all it asks for up to the end of the file,
+ * and /dev/zero /dev/full /dev/urandom all of it -- and programs count on
+ * that: `dd if=/dev/zero bs=1M count=1` said "0+1 records in, 65536 bytes"
+ * (logs/utilgate dd_sizes). So for those kinds the passes repeat until the
+ * buffer is full or a pass comes back short (the end of the file). A pipe,
+ * a socket, a terminal still return what one pass found: a second pass
+ * there could wait for data the caller never asked to wait for. */
+static long sys_read(int fd, void *buf, size_t len) {
+    if (len <= SYS_MAX_RW) return sys_read_one(fd, buf, len);
+    struct file *f = fd_lookup(fd);
+    if (!f) return -ABI_EBADF;
+    if (f->kind != FILE_KIND_VFS && f->kind != FILE_KIND_DEVZERO &&
+        f->kind != FILE_KIND_DEVFULL && f->kind != FILE_KIND_DEVRANDOM)
+        return sys_read_one(fd, buf, SYS_MAX_RW);
+    size_t done = 0;
+    while (done < len) {
+        size_t n = len - done;
+        if (n > SYS_MAX_RW) n = SYS_MAX_RW;
+        long rv = sys_read_one(fd, (char *)buf + done, n);
+        if (rv < 0) return done ? (long)done : rv;
+        done += (size_t)rv;
+        if ((size_t)rv < n) break;
+    }
+    return (long)done;
+}
+
 /* Non-blocking read (slice 45, ABI_SYS_READ_NB): on a pipe, drains what is
  * buffered and returns -ABI_EAGAIN instead of parking when momentarily empty.
  * Native apps have no fcntl(O_NONBLOCK)/working poll on pipe fds; chromewin uses
@@ -549,7 +578,7 @@ static long sys_read_nb(int fd, void *buf, size_t len) {
     struct file *f = fd_lookup(fd);
     if (!f) return -1;
     if (f->kind != FILE_KIND_PIPE_R && f->kind != FILE_KIND_PIPE_RW)
-        return sys_read(fd, buf, len);           /* only pipes get the NB path */
+        return sys_read_one(fd, buf, len);       /* only pipes get the NB path */
     void *k = kmalloc(len);
     if (!k) return -ABI_ENOMEM;
     long rv = pipe_tryread(f->pipe, k, len);     /* >0 / 0 EOF / -ABI_EAGAIN */
