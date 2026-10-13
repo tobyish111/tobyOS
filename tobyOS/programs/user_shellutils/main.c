@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "which"))   return do_which(argc, argv);
     if (!strcmp(base, "uname"))   return do_uname(argc, argv);
     if (!strcmp(base, "free"))    return do_free(argc, argv);
-    if (!strcmp(base, "sync"))    return do_sync();
+    if (!strcmp(base, "sync"))    return do_sync(argc, argv);
     if (!strcmp(base, "stat"))    return do_stat(argc, argv);
     if (!strcmp(base, "du"))      return do_du(argc, argv);
     if (!strcmp(base, "xargs"))   return do_xargs(argc, argv);
