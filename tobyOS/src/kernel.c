@@ -617,6 +617,138 @@ static void banner(void) {
  *     sees the wallpaper + taskbar before the login screen pops up.
  *   - session_init() registers + starts the /bin/login PROGRAM
  *     service. The login window will appear on the next gui_tick(). */
+/* ---- /etc/passwd and /etc/group from /data, MERGED (finding 136) --------
+ *
+ * Three copies meet at boot: the initrd's (what this build ships, in /etc
+ * now), /data's (what the account tools last wrote) and /data's .base (what
+ * the initrd held when this was last done -- so it can tell a user's change
+ * from a system one). Entry by entry, by name (the text before the first
+ * ':'):
+ *   - only in /data            a user added it: kept;
+ *   - in /data and the initrd  /data's, unless /data still has the old
+ *                              initrd's version (base) -- then the new one;
+ *   - new in the initrd        added (not in base, not in /data);
+ *   - dropped from the initrd  dropped if /data had not changed it.
+ * With no .base yet (a /data written before this existed) every entry of
+ * /data is kept as it is and only the initrd's missing names are added.
+ * /data's order first, the new names after. The result goes to /etc AND
+ * back to /data, and the .base becomes the initrd's file: /data has to hold
+ * what /etc holds, or at the next boot a name the initrd added this time
+ * would be in the .base and not in /data -- "the user removed it" -- and go. */
+struct etc_lines { char **v; int n, cap; };
+
+static char *etc_dup0(const void *b, size_t n) {
+    char *c = kmalloc(n + 1);
+    if (!c) return 0;
+    if (n) memcpy(c, b, n);
+    c[n] = 0;
+    return c;
+}
+
+/* BUF is NUL-terminated (etc_dup0): each line is cut at its newline */
+static void etc_lines_split(char *buf, size_t sz, struct etc_lines *out) {
+    out->v = 0; out->n = out->cap = 0;
+    size_t i = 0;
+    while (i < sz) {
+        size_t j = i;
+        while (j < sz && buf[j] != '\n') j++;
+        if (j > i) {                                    /* skip empty lines */
+            if (out->n == out->cap) {
+                int nc = out->cap ? out->cap * 2 : 32;
+                char **nv = kmalloc((size_t)nc * sizeof(char *));
+                if (!nv) return;
+                if (out->v) { memcpy(nv, out->v, (size_t)out->n * sizeof(char *)); kfree(out->v); }
+                out->v = nv; out->cap = nc;
+            }
+            out->v[out->n++] = buf + i;
+        }
+        if (j < sz) buf[j] = 0;
+        i = j + 1;
+    }
+}
+
+static size_t etc_name_len(const char *l) {
+    size_t n = 0;
+    while (l[n] && l[n] != ':') n++;
+    return n;
+}
+
+static const char *etc_find(const struct etc_lines *L, const char *line) {
+    size_t n = etc_name_len(line);
+    for (int i = 0; i < L->n; i++)
+        if (etc_name_len(L->v[i]) == n && memcmp(L->v[i], line, n) == 0) return L->v[i];
+    return 0;
+}
+
+static void etc_put(char *out, size_t *len, const char *line) {
+    size_t n = strlen(line);
+    memcpy(out + *len, line, n);
+    *len += n;
+    out[(*len)++] = '\n';
+}
+
+static void etc_restore_merged(const char *src, const char *dst, const char *basep) {
+    void *db = 0, *ib = 0, *bb = 0;
+    size_t dsz = 0, isz = 0, bsz = 0;
+    if (vfs_read_all(src, &db, &dsz) != VFS_OK) return;      /* no mirror */
+    if (vfs_read_all(dst, &ib, &isz) != VFS_OK) { ib = 0; isz = 0; }
+    bool have_base = vfs_read_all(basep, &bb, &bsz) == VFS_OK;
+    /* the initrd's text, kept whole for the .base, before it is split */
+    char *initrd_copy = isz ? kmalloc(isz) : 0;
+    if (initrd_copy) memcpy(initrd_copy, ib, isz);
+    char *dt = etc_dup0(db, dsz), *it = etc_dup0(ib, isz), *bt = have_base ? etc_dup0(bb, bsz) : 0;
+    struct etc_lines D = {0, 0, 0}, I = {0, 0, 0}, B = {0, 0, 0};
+    if (dt) etc_lines_split(dt, dsz, &D);
+    if (it) etc_lines_split(it, isz, &I);
+    if (bt) etc_lines_split(bt, bsz, &B);
+    if (!dt || !it || (have_base && !bt)) { kfree(dt); kfree(it); kfree(bt); dt = it = bt = 0; D.n = 0; }
+    char *out = kmalloc(dsz + isz + 2);
+    size_t len = 0;
+    int added = 0, updated = 0, dropped = 0;
+    if (out) {
+        for (int k = 0; k < D.n; k++) {
+            const char *d = D.v[k];
+            const char *in = etc_find(&I, d);
+            const char *b = have_base ? etc_find(&B, d) : 0;
+            if (have_base && b && strcmp(b, d) == 0) {
+                /* unchanged by the user: the initrd decides */
+                if (in) { etc_put(out, &len, in); if (strcmp(in, d)) updated++; }
+                else dropped++;
+                continue;
+            }
+            etc_put(out, &len, d);
+        }
+        for (int k = 0; k < I.n; k++) {
+            const char *in = I.v[k];
+            if (etc_find(&D, in)) continue;
+            if (have_base && etc_find(&B, in)) continue;   /* the user removed it */
+            etc_put(out, &len, in);
+            added++;
+        }
+        if (len && vfs_write_all(dst, out, len) == VFS_OK) {
+            kprintf("[users] restored %s from %s (%lu bytes; %d new from the initrd, "
+                    "%d updated, %d dropped)\n", dst, src, (unsigned long)len,
+                    added, updated, dropped);
+            if ((added || updated || dropped) && vfs_write_all(src, out, len) != VFS_OK)
+                kprintf("[users] could not write the merged %s back\n", src);
+        }
+        kfree(out);
+    }
+    if (initrd_copy) {
+        (void)vfs_write_all(basep, initrd_copy, isz);
+        kfree(initrd_copy);
+    }
+    if (D.v) kfree(D.v);
+    if (I.v) kfree(I.v);
+    if (B.v) kfree(B.v);
+    if (dt) kfree(dt);
+    if (it) kfree(it);
+    if (bt) kfree(bt);
+    kfree(db);
+    if (ib) kfree(ib);
+    if (have_base) kfree(bb);
+}
+
 static void m14_init(void) {
     settings_init();
 
@@ -637,20 +769,19 @@ static void m14_init(void) {
      *
      * Only OVERWRITES files that already exist in the ramfs -- the mirror
      * is a copy of /etc/passwd, not a way to introduce new files into a
-     * directory the ramfs will not extend. */
+     * directory the ramfs will not extend.
+     *
+     * MERGED, not copied (batch 26, finding 136): the mirror replaced the
+     * initrd's file whole, so whatever a newer initrd added -- the `toby`
+     * group of batch 25 -- never appeared on a machine whose /data had an
+     * older copy. See etc_restore_merged. */
     {
-        static const struct { const char *src, *dst; } restore[] = {
-            { "/data/etc/passwd", "/etc/passwd" },
-            { "/data/etc/group",  "/etc/group"  },
+        static const struct { const char *src, *dst, *base; } restore[] = {
+            { "/data/etc/passwd", "/etc/passwd", "/data/etc/passwd.base" },
+            { "/data/etc/group",  "/etc/group",  "/data/etc/group.base"  },
         };
-        for (unsigned i = 0; i < sizeof(restore)/sizeof(restore[0]); i++) {
-            void *buf = 0; size_t sz = 0;
-            if (vfs_read_all(restore[i].src, &buf, &sz) != VFS_OK) continue;
-            if (sz && vfs_write_all(restore[i].dst, buf, sz) == VFS_OK)
-                kprintf("[users] restored %s from %s (%lu bytes)\n",
-                        restore[i].dst, restore[i].src, (unsigned long)sz);
-            kfree(buf);
-        }
+        for (unsigned i = 0; i < sizeof(restore)/sizeof(restore[0]); i++)
+            etc_restore_merged(restore[i].src, restore[i].dst, restore[i].base);
     }
 
     /* Milestone 31: pick the active UI palette from settings BEFORE
