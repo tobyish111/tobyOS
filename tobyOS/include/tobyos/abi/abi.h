@@ -1284,7 +1284,18 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         FIFO with mode less the umask; EEXIST,
                                         EPERM where the filesystem cannot
                                         hold one. There were no FIFOs. */
-#define ABI_SYS_NR_MAX          221
+#define ABI_SYS_XSTAT           222  /* (int kind, long path_or_fd, struct
+                                        abi_stat *out, size_t size) -> 0|-E:
+                                        kind 0 stat, 1 lstat, 2 fstat, the
+                                        whole struct abi_stat as it is now,
+                                        written to at most SIZE bytes of OUT.
+                                        SYS_STAT/LSTAT/FSTAT write exactly
+                                        the layout up to its ctime field
+                                        (ABI_STAT_V1_SIZE) and nothing after,
+                                        so a binary built before the struct
+                                        grew is never written past; libtoby
+                                        asks through this one (batch 25). */
+#define ABI_SYS_NR_MAX          222
 
 /* ABI_SYS_TIMES's answer, in ns. */
 struct abi_times {
@@ -1960,7 +1971,19 @@ struct abi_stat {
      * two hard links name one file. */
     uint64_t ino;
     uint64_t dev;
+    /* 2026-10-12 (batch 25), reached only through ABI_SYS_XSTAT: what GNU
+     * stat, du and truncate -o ask of a file. The numbers are the Linux
+     * personality's, so a native tool and a Linux one agree about one
+     * file: 512-byte blocks for the size rounded up, an I/O block of 512
+     * (4096 for a device), and a device node's major and minor. */
+    uint64_t ctime;      /* last inode change, epoch seconds; 0 no answer */
+    uint64_t blocks;     /* 512-byte blocks */
+    uint32_t blksize;    /* the I/O block size */
+    uint32_t rdev_major; /* a device node's numbers; 0 for anything else */
+    uint32_t rdev_minor;
+    uint32_t _pad;
 };
+#define ABI_STAT_V1_SIZE 56  /* sizeof the struct up to and excluding ctime */
 
 /* ============================================================
  *  spawn()

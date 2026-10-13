@@ -9,6 +9,8 @@
  * fcntl.h's open() lives here (rather than in a separate fcntl.c)
  * because there's no good reason to split it out. */
 
+#include <sys/sysmacros.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -234,24 +236,38 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
     u->st_atime = (time_t)k->atime;
     u->st_nlink = (nlink_t)k->nlink;
     u->st_ino   = (ino_t)k->ino;
-    u->st_dev   = (dev_t)k->dev;
+    /* the mount's number split as the Linux personality splits it, 12 bits
+     * of major over 20 of minor, so a native `stat -c %d` and a Linux one
+     * agree; 0 stays 0, "no answer" */
+    u->st_dev   = k->dev ? (dev_t)makedev((unsigned)(k->dev >> 20) & 0xfffu,
+                                          (unsigned)k->dev & 0xfffffu) : 0;
+    u->st_ctime   = (time_t)k->ctime;
+    u->st_blocks  = (blkcnt_t)k->blocks;
+    u->st_blksize = (blksize_t)k->blksize;
+    u->st_rdev    = (k->rdev_major || k->rdev_minor)
+                  ? (dev_t)makedev(k->rdev_major, k->rdev_minor) : 0;
     return 0;
 }
 
-int stat(const char *path, struct stat *out) {
+/* stat, lstat and fstat ask through ABI_SYS_XSTAT, which writes the whole
+ * struct abi_stat this libtoby was built with (batch 25); the old calls
+ * write only its first ABI_STAT_V1_SIZE bytes. KIND 0 stat, 1 lstat, 2
+ * fstat. */
+static int xstat(int kind, long what, struct stat *out) {
     if (!out) { errno = EFAULT; return -1; }
     struct abi_stat k;
-    long r = toby_sc2(ABI_SYS_STAT, (long)(uintptr_t)path, (long)(uintptr_t)&k);
+    memset(&k, 0, sizeof k);
+    long r = toby_sc4(ABI_SYS_XSTAT, kind, what, (long)(uintptr_t)&k, (long)sizeof k);
     if (__toby_check(r) < 0) return -1;
     return abi_stat_to_user(&k, out);
 }
 
+int stat(const char *path, struct stat *out) {
+    return xstat(0, (long)(uintptr_t)path, out);
+}
+
 int fstat(int fd, struct stat *out) {
-    if (!out) { errno = EFAULT; return -1; }
-    struct abi_stat k;
-    long r = toby_sc2(ABI_SYS_FSTAT, fd, (long)(uintptr_t)&k);
-    if (__toby_check(r) < 0) return -1;
-    return abi_stat_to_user(&k, out);
+    return xstat(2, fd, out);
 }
 
 /* A FIFO at PATH, MODE less the umask (ABI_SYS_MKFIFO). */
@@ -263,11 +279,7 @@ int mkfifo(const char *path, mode_t mode) {
 /* The link itself, S_IFLNK; stat() follows it. There was no lstat, and
  * stat called a link a regular file, so nothing native could see one. */
 int lstat(const char *path, struct stat *out) {
-    if (!out) { errno = EFAULT; return -1; }
-    struct abi_stat k;
-    long r = toby_sc2(ABI_SYS_LSTAT, (long)(uintptr_t)path, (long)(uintptr_t)&k);
-    if (__toby_check(r) < 0) return -1;
-    return abi_stat_to_user(&k, out);
+    return xstat(1, (long)(uintptr_t)path, out);
 }
 
 int mkdir(const char *path, mode_t mode) {

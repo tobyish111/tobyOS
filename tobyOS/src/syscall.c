@@ -3545,7 +3545,14 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     if (src->type == VFS_TYPE_DIR && dst->nlink < 2u) dst->nlink = 2u;
     dst->ino = src->ino;
     dst->dev = (uint64_t)src->dev;
+    /* Batch 25 (ABI_SYS_XSTAT): the Linux personality's numbers, so a
+     * native tool and a Linux one agree (linux_emit_stat). */
+    dst->ctime = src->ctime;
+    dst->blocks = ((uint64_t)src->size + 511) / 512;
+    dst->blksize = 512;
 }
+_Static_assert(offsetof(struct abi_stat, ctime) == ABI_STAT_V1_SIZE,
+               "SYS_STAT/FSTAT/LSTAT write the struct up to ctime");
 
 
 /* ---- the synthetic /dev nodes, in ONE place ------------------------------
@@ -3589,6 +3596,20 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
     memset(out, 0, sizeof *out);
     out->mode  = mode;
     out->size  = 0;
+    out->nlink = 1;
+    out->blksize = 4096;              /* as linux_emit_special_stat */
+}
+
+/* ...and a device node's numbers, devfs's (batch 25: stat's %t %T). */
+static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_stat *out)
+{
+    dev_synth_stat(mode, out);
+    uint32_t maj = 0, min = 0;
+    (void)devfs_node_mode(kpath, &maj, &min);
+    if ((mode & ABI_S_IFMT) == ABI_S_IFCHR || (mode & ABI_S_IFMT) == ABI_S_IFBLK) {
+        out->rdev_major = maj;
+        out->rdev_minor = min;
+    }
 }
 
 /* Defined with the Linux stat emitters, below. */
@@ -3775,8 +3796,12 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
             struct proc *p = current_proc();
             tmp->uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
             tmp->gid = userns_cur_gid(p ? (uint32_t)p->gid : 0);
+        } else {
+            tmp->rdev_major = mj;
+            tmp->rdev_minor = mn;
         }
         tmp->ino = file_object_ino(f);
+        tmp->blksize = 4096;          /* as linux_emit_special_stat */
         return;
     }
     /* The rest (a window, a term) report a minimal regular file. */
@@ -3787,7 +3812,11 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
  * names by neither -- native stat called the LINK a regular file and
  * there was no lstat (finding 87): `test -L` could not be answered and
  * `ls -l` showed no link. */
-static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow) {
+/* OUTSZ is how much of OUT the caller has: ABI_STAT_V1_SIZE through the
+ * old calls, its own sizeof through ABI_SYS_XSTAT (batch 25). */
+static long sys_stat_follow_sz(const char *path, struct abi_stat *out, bool follow,
+                               size_t outsz) {
+    if (outsz > sizeof(struct abi_stat)) outsz = sizeof(struct abi_stat);
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
@@ -3797,8 +3826,8 @@ static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow)
     {   uint32_t dm = dev_synth_mode(kpath);
         if (dm) {
             struct abi_stat dtmp;
-            dev_synth_stat(dm, &dtmp);
-            if (copy_to_user(out, &dtmp, sizeof dtmp) != 0) return -ABI_EFAULT;
+            dev_synth_stat_path(kpath, dm, &dtmp);
+            if (copy_to_user(out, &dtmp, outsz) != 0) return -ABI_EFAULT;
             return 0;
         }
     }
@@ -3813,24 +3842,33 @@ static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow)
         native_fd_stat(ff, &tmp);
     } else {
         uint32_t dm = (follow && strcmp(fin, kpath) != 0) ? dev_synth_mode(fin) : 0;
-        if (dm) dev_synth_stat(dm, &tmp);          /* a link to a device */
+        if (dm) dev_synth_stat_path(fin, dm, &tmp);   /* a link to a device */
         else fill_abi_stat(&vs, &tmp);
     }
-    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
+    if (copy_to_user(out, &tmp, outsz) != 0) return -ABI_EFAULT;
     return 0;
+}
+
+static long sys_stat_follow(const char *path, struct abi_stat *out, bool follow) {
+    return sys_stat_follow_sz(path, out, follow, ABI_STAT_V1_SIZE);
 }
 
 static long sys_stat(const char *path, struct abi_stat *out) {
     return sys_stat_follow(path, out, true);
 }
 
-static long sys_fstat(int fd, struct abi_stat *out) {
+static long sys_fstat_sz(int fd, struct abi_stat *out, size_t outsz) {
+    if (outsz > sizeof(struct abi_stat)) outsz = sizeof(struct abi_stat);
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
     struct abi_stat tmp;
     native_fd_stat(f, &tmp);
-    if (copy_to_user(out, &tmp, sizeof(tmp)) != 0) return -ABI_EFAULT;
+    if (copy_to_user(out, &tmp, outsz) != 0) return -ABI_EFAULT;
     return 0;
+}
+
+static long sys_fstat(int fd, struct abi_stat *out) {
+    return sys_fstat_sz(fd, out, ABI_STAT_V1_SIZE);
 }
 
 static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5);
@@ -6222,6 +6260,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
     case ABI_SYS_LSTAT:
         return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
+    case ABI_SYS_XSTAT:
+        if (a1 == 2) return sys_fstat_sz((int)a2, (struct abi_stat *)a3, (size_t)a4);
+        if (a1 != 0 && a1 != 1) return -ABI_EINVAL;
+        return sys_stat_follow_sz((const char *)a2, (struct abi_stat *)a3, a1 == 0,
+                                  (size_t)a4);
     case SYS_FSTAT:
         return sys_fstat((int)a1, (struct abi_stat *)a2);
     case SYS_DUP:           return sys_dup((int)a1);

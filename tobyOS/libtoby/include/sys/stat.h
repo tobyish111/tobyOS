@@ -67,6 +67,15 @@ struct stat {
     nlink_t st_nlink;
     ino_t   st_ino;
     dev_t   st_dev;
+    /* 2026-10-12 (batch 25): what GNU stat, du and truncate -o ask -- the
+     * inode-change time, 512-byte blocks, the I/O block size, and a device
+     * node's numbers (major() and minor(), <sys/sysmacros.h>). The
+     * kernel's answers through ABI_SYS_XSTAT, the Linux personality's
+     * numbers. */
+    time_t    st_ctime;
+    blkcnt_t  st_blocks;
+    blksize_t st_blksize;
+    dev_t     st_rdev;
 };
 
 int stat (const char *path, struct stat *out);
