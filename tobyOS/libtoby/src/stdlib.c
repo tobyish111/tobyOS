@@ -48,56 +48,77 @@ void abort(void) {
 int atoi(const char *s) { return (int)strtol(s, 0, 10); }
 long atol(const char *s) { return strtol(s, 0, 10); }
 
-static int hexval(int c) {
+/* The C rules for strtol and its kin, in one place: leading white space,
+ * a sign, "0x" for base 16 (and base 0) only when a hex digit follows, a
+ * leading 0 for base 0's octal, digits up to base 36; *ENDP back at the
+ * string itself when there were no digits; the magnitude saturates and
+ * *OVER says so. They had no overflow (a too-large number wrapped, with no
+ * ERANGE -- `du -t 99999999999999999999` took a wrapped threshold and said
+ * nothing), strtoull ignored a minus ("-1" was 1, not ULLONG_MAX), and a
+ * number-less string left *ENDP after its blanks, so `end == s` missed it. */
+static int digval(int c) {
     if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-    return -1;
+    if (c >= 'a' && c <= 'z') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'Z') return 10 + c - 'A';
+    return 99;
 }
 
-long strtol(const char *s, char **endp, int base) {
-    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    int sign = 1;
-    if (*s == '-') { sign = -1; s++; }
-    else if (*s == '+') { s++; }
-    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        s += 2; base = 16;
-    } else if (base == 0 && s[0] == '0') {
-        s++; base = 8;
-    } else if (base == 0) {
-        base = 10;
+static unsigned long long strtou_core(const char *s0, char **endp, int base,
+                                      int *neg, int *over) {
+    const char *s = s0;
+    *neg = *over = 0;
+    while (*s == ' ' || (*s >= 9 && *s <= 13)) s++;     /* isspace */
+    if (*s == '-') { *neg = 1; s++; }
+    else if (*s == '+') s++;
+    if (base < 0 || base == 1 || base > 36) {
+        errno = EINVAL;
+        if (endp) *endp = (char *)s0;
+        return 0;
     }
-    long v = 0;
-    while (*s) {
-        int d = hexval(*s);
-        if (d < 0 || d >= base) break;
-        v = v * base + d;
-        s++;
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+        digval((unsigned char)s[2]) < 16) {
+        s += 2;
+        base = 16;
+    } else if (base == 0)
+        base = s[0] == '0' ? 8 : 10;
+    const char *digits = s;
+    unsigned long long v = 0, lim = ~0ULL / (unsigned)base;
+    for (;; s++) {
+        int d = digval((unsigned char)*s);
+        if (d >= base) break;
+        if (v > lim || v * (unsigned)base > ~0ULL - (unsigned)d) *over = 1;
+        else v = v * (unsigned)base + (unsigned)d;
     }
-    if (endp) *endp = (char *)s;
-    return sign * v;
-}
-
-unsigned long long strtoull(const char *s, char **endp, int base) {
-    while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-    if (*s == '+') s++;
-    else if (*s == '-') s++;      /* C allows a sign; result wraps mod 2^64 */
-    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
-        s += 2; base = 16;
-    } else if (base == 0 && s[0] == '0') {
-        s++; base = 8;
-    } else if (base == 0) {
-        base = 10;
-    }
-    unsigned long long v = 0;
-    while (*s) {
-        int d = hexval(*s);
-        if (d < 0 || d >= base) break;
-        v = v * (unsigned)base + (unsigned)d;
-        s++;
+    if (s == digits) {
+        if (endp) *endp = (char *)s0;
+        return 0;
     }
     if (endp) *endp = (char *)s;
     return v;
+}
+
+long strtol(const char *s, char **endp, int base) {
+    int neg, over;
+    unsigned long long v = strtou_core(s, endp, base, &neg, &over);
+    if (over || v > (neg ? 0x8000000000000000ULL : 0x7fffffffffffffffULL)) {
+        errno = ERANGE;
+        return neg ? (long)0x8000000000000000ULL : 0x7fffffffffffffffL;
+    }
+    return neg ? (long)(0 - v) : (long)v;
+}
+
+long long strtoll(const char *s, char **endp, int base) {
+    return strtol(s, endp, base);
+}
+
+unsigned long long strtoull(const char *s, char **endp, int base) {
+    int neg, over;
+    unsigned long long v = strtou_core(s, endp, base, &neg, &over);
+    if (over) {
+        errno = ERANGE;
+        return ~0ULL;
+    }
+    return neg ? 0 - v : v;
 }
 
 unsigned long strtoul(const char *s, char **endp, int base) {
