@@ -3979,7 +3979,28 @@ static long sys_rename(const char *oldp, const char *newp) {
  * The type check is the only thing rmdir adds over unlink here -- the
  * drivers already refuse to remove a non-empty directory -- but it is the
  * whole point of having a separate call. */
-static long sys_rmdir(const char *path) {
+/* rmdir(2), for both personalities (batch 25, logs/utilgate/rmdir.sh).
+ *
+ * THE LAST COMPONENT IS LOOKED AT BEFORE THE PATH IS RESOLVED, as Linux
+ * does: resolving folds "." away, so `rmdir a/.` removed a -- where Linux
+ * refuses it, EINVAL -- and `rmdir .` tried the working directory. ".."
+ * last is ENOTEMPTY, as Linux says.
+ *
+ * A NON-EMPTY DIRECTORY IS ENOTEMPTY whichever way the driver says it:
+ * most report VFS_ERR_INVAL, tmpfs VFS_ERR_EXIST, and EXIST fell to the
+ * default here -- "Permission denied" for `rmdir a` on a /tmp directory
+ * with a file in it. Anything else is the VFS's own errno, not EACCES. */
+static long rmdir_path(const char *path) {
+    char up[ABI_PATH_MAX];
+    long plen = strncpy_from_user(up, path, sizeof up);
+    if (plen < 0) return -ABI_EFAULT;
+    up[sizeof up - 1] = 0;
+    size_t n = strlen(up);
+    while (n > 1 && up[n - 1] == '/') n--;
+    size_t s = n;
+    while (s > 0 && up[s - 1] != '/') s--;
+    if (n - s == 1 && up[s] == '.') return -ABI_EINVAL;
+    if (n - s == 2 && up[s] == '.' && up[s + 1] == '.') return -ABI_ENOTEMPTY;
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
@@ -3988,16 +4009,13 @@ static long sys_rmdir(const char *path) {
     if (sr != VFS_OK) return vfs_err_to_abi(sr);
     if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
     int rc = vfs_unlink(kpath);
-    switch (rc) {
-    case VFS_OK:        return 0;
-    case VFS_ERR_NOENT: return -ABI_ENOENT;
-    case VFS_ERR_ROFS:  return -ABI_EROFS;
-    case VFS_ERR_PERM:  return -ABI_EACCES;
-    /* Drivers report a non-empty directory as INVAL; POSIX names it
-     * ENOTEMPTY, and callers (busybox rmdir, CPython) test for it. */
-    case VFS_ERR_INVAL: return -ABI_ENOTEMPTY;
-    default:            return -ABI_EACCES;
-    }
+    if (rc == VFS_OK) return 0;
+    if (rc == VFS_ERR_INVAL || rc == VFS_ERR_EXIST) return -ABI_ENOTEMPTY;
+    return vfs_err_to_abi(rc);
+}
+
+static long sys_rmdir(const char *path) {
+    return rmdir_path(path);
 }
 
 /* utimes(2), native. (uint64_t)-1 means "now" in either field -- that is
@@ -12075,20 +12093,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* rmdir(2). tobyfs_unlink already removes EMPTY directories and refuses
      * non-empty ones (VFS_ERR_INVAL), so the only thing rmdir adds over
      * unlink is POSIX's type check: rmdir on a non-directory is ENOTDIR. */
-    case LX_rmdir: {
-        char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-            return -ABI_EFAULT;
-        struct vfs_stat vs;
-        if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-        if (vs.type != VFS_TYPE_DIR)        return -ABI_ENOTDIR;
-        int rc = vfs_unlink(kpath);
-        if (rc == VFS_OK)        return 0;
-        if (rc == VFS_ERR_INVAL) return -ABI_ENOTEMPTY;   /* non-empty dir */
-        if (rc == VFS_ERR_PERM)  return -ABI_EACCES;
-        if (rc == VFS_ERR_ROFS)  return -ABI_EROFS;
-        return -ABI_EIO;
-    }
+    case LX_rmdir:
+        return rmdir_path((const char *)a1);
 
     /* chown/lchown/fchownat. vfs_chown() is real, so these are too. We do not
      * follow symlinks differently for lchown -- the VFS resolves links at
@@ -13100,6 +13106,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_unlinkat:               /* (dirfd, path, flags) -- AT_FDCWD; tobyfs
                                      * unlink removes files AND empty dirs, so it
                                      * serves AT_REMOVEDIR too. */
+        if ((long)a3 & 0x200)       /* AT_REMOVEDIR: rmdir(2)'s rules, errnos */
+            return rmdir_path((const char *)a2);
         return do_syscall(SYS_UNLINK, a2, 0, 0, 0, 0);
     case LX_fsync:
     case LX_fdatasync: {
