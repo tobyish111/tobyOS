@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "yes"))     return do_yes(argc, argv);
     if (!strcmp(base, "tac"))     return do_tac(argc, argv);
     if (!strcmp(base, "seq"))     return do_seq(argc, argv);
-    if (!strcmp(base, "whoami"))  return do_whoami();
+    if (!strcmp(base, "whoami"))  return do_whoami(argc, argv);
     if (!strcmp(base, "which"))   return do_which(argc, argv);
     if (!strcmp(base, "uname"))   return do_uname(argc, argv);
     if (!strcmp(base, "free"))    return do_free(argc, argv);
