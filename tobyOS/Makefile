@@ -4310,10 +4310,19 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 # it -- 327 cases reporting a shell divergence that was a permission bit.
 # No './' prefix: gate 0 matches exact tar paths and './etc/...' is not
 # the same name as 'etc/...'.
-	cd $(INITRD_STAGE) && tar --format=ustar --mode=0644 \
-	    --owner=0 --group=0 --numeric-owner \
-	    --exclude='etc/oilspec/bin' --exclude='etc/oilspec/bin/*' \
-	    -rf ../initrd.tar etc/oilspec
+# Its DIRECTORIES 0755, its files 0644 (finding 131): one --mode=0644 for the
+# tree gave etc/oilspec and every directory under it 0644, so only root
+# could list them. Two lists, each without recursion, the directories
+# first; through -T, as the busybox applets go, for the same 75 KB reason.
+	cd $(INITRD_STAGE) && find etc/oilspec -path etc/oilspec/bin -prune \
+	    -o -type d -print > .oilspec.dirs \
+	  && find etc/oilspec -path etc/oilspec/bin -prune \
+	    -o -type f -print > .oilspec.files \
+	  && tar --format=ustar --mode=0755 --owner=0 --group=0 --numeric-owner \
+	    --no-recursion -rf ../initrd.tar -T .oilspec.dirs \
+	  && tar --format=ustar --mode=0644 --owner=0 --group=0 --numeric-owner \
+	    --no-recursion -rf ../initrd.tar -T .oilspec.files \
+	  && rm -f .oilspec.dirs .oilspec.files
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
 	    etc/oilspec/bin
