@@ -5672,14 +5672,19 @@ static long sys_svc_list(struct abi_service_info *out, uint32_t cap) {
     return (long)n;
 }
 
-/* May `self` wait for `c`? Its own child, a child of another thread of
- * its group, or a tracee it traces -- what Linux's wait4 accepts. */
-static bool waitpid_may_wait(struct proc *self, struct proc *c) {
-    if (c->ppid == self->pid || c->tracer_pid == self->pid) return true;
+/* Is `c` a child of `self`'s process -- of `self`, or of another thread of
+ * its group? Any thread may wait for its process's children on Linux. */
+static bool wait_child_of(struct proc *self, struct proc *c) {
+    if (c->ppid == self->pid) return true;
     int stg = self->is_thread ? self->tgid : self->pid;
     struct proc *par = c->ppid > 0 ? proc_lookup(c->ppid) : 0;
-    if (par && (par->is_thread ? par->tgid : par->pid) == stg) return true;
-    return false;
+    return par && (par->is_thread ? par->tgid : par->pid) == stg;
+}
+
+/* May `self` wait for `c`? Its process's child, or a tracee it traces --
+ * what Linux's wait4 accepts. */
+static bool waitpid_may_wait(struct proc *self, struct proc *c) {
+    return wait_child_of(self, c) || c->tracer_pid == self->pid;
 }
 
 static long lx_do_poll(uint64_t ufds, unsigned long nfds, long timeout_ms);
@@ -13164,7 +13169,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             for (int i = 0; i < PROC_MAX && !hit; i++) {
                 struct proc *q = &g_proc[i];
                 if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
-                    q->is_thread || q->ppid != self->pid) continue;
+                    q->is_thread || !wait_child_of(self, q)) continue;
                 if (want_pid && q->pid != want_pid) continue;
                 if (want_pgid && proc_pgid_of(q) != want_pgid) continue;
                 any = true;

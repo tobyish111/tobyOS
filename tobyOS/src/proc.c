@@ -1636,6 +1636,22 @@ __attribute__((noreturn)) void proc_first_user_entry(void) {
 /* Wake any process blocked on `pid` -- and its parent or tracer if that is
  * blocked on any child (PROC_WAIT_ANY). Marks them READY and re-enqueues
  * onto the scheduler. */
+/* The process a proc belongs to: its thread group's leader's pid. */
+static int proc_tg(const struct proc *p) {
+    return p->is_thread ? p->tgid : p->pid;
+}
+
+/* Is the parent PPID (a pid) in the same process as SELF? A child is its
+ * whole process's on Linux: any of its threads may wait for it (wait4 and
+ * waitpid without __WNOTHREAD). Only the very thread that started it could
+ * here -- a waiter thread's waitpid(-1) said "no children" (script(1), batch
+ * 26). */
+static bool proc_parent_is(int ppid, const struct proc *self) {
+    if (ppid == self->pid) return true;
+    struct proc *par = ppid > 0 ? proc_lookup(ppid) : 0;
+    return par && proc_tg(par) == proc_tg(self);
+}
+
 static void wakeup_waiters(int pid) {
     struct proc *t = proc_lookup(pid);
     int par = t ? t->ppid : 0, tr = t ? t->tracer_pid : 0;
@@ -1644,7 +1660,7 @@ static void wakeup_waiters(int pid) {
         if (q->state == PROC_BLOCKED &&
             (q->wait_pid == pid ||
              (q->wait_pid == PROC_WAIT_ANY && q->pid > 0 &&
-              (q->pid == par || q->pid == tr)))) {
+              (proc_parent_is(par, q) || q->pid == tr)))) {
             q->wait_pid = -1;
             q->state    = PROC_READY;
             sched_enqueue(q);
@@ -2322,7 +2338,7 @@ int proc_wait_any(int pgid, int options) {
         for (int i = 0; i < PROC_MAX; i++) {
             struct proc *q = &g_proc[i];
             if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO ||
-                q->is_thread || q->ppid != self->pid) continue;
+                q->is_thread || !proc_parent_is(q->ppid, self)) continue;
             if (pgid > 0 && (q->pgid > 0 ? q->pgid : q->pid) != pgid) continue;
             any = true;
             if (wait_any_ready(self, q, options)) return q->pid;
