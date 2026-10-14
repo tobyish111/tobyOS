@@ -1736,6 +1736,7 @@ int main(int argc, char **argv) {
          * option after the string is one of them (bash: `-c 'echo $-' -x`
          * makes $0 "-x") */
         if (ai < argc) {
+            shell_set_shell_name_hosted(argv[ai]);
             (void)shell_set_param0_hosted(argv[ai++]);
             if (ai < argc) (void)shell_set_args_hosted(argc - ai, argv + ai);
         }

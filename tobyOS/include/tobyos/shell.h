@@ -120,6 +120,8 @@ void shell_notify_jobs_hosted(void);
 int  shell_set_args_hosted(int argc, char **argv);
 /* Set $0 -- `sh -c CMD NAME` names the script NAME. */
 int  shell_set_param0_hosted(const char *name);
+/* ...and the shell's own name (the prompt's \s), as bash's -c does. */
+void shell_set_shell_name_hosted(const char *name);
 
 /* /bin/tsh's file shims (programs/tsh/host.c) answer in VFS_ERR_* codes;
  * this one is theirs alone -- ENXIO, as /dev/tty is without a controlling

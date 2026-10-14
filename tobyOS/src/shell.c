@@ -1164,6 +1164,13 @@ static const char *g_diag_source;
 static const char *g_diag_fn_source;
 static bool g_diag_in_fn;
 static char *g_diag_progname;          /* the shell's own name, at a terminal */
+/* bash's shell_name, which the prompt's \s names the last part of:
+ * argv[0] as given -- a login shell's `-` kept -- or the program's own
+ * name when that is empty or a lone `-` (set_shell_name); and for `-c
+ * CMD NAME`, NAME (bind_args). Not $0: a script does not change it.
+ * Measured on the guest (logs/b27/shname-hw.out): bash run as `tsh`
+ * says tsh, as `-bash` says -bash, as `a/b/` says nothing. */
+static char *g_shell_name;
 
 #ifdef SHELL_HOSTED
 static bool  g_diag_midline;           /* the last diagnostic left a line open */
@@ -28933,7 +28940,8 @@ static const char *shell_prompt_host(char *buf, size_t cap) {
  * copy of $(...) handling.
  *
  * WHAT THIS SHELL CANNOT ANSWER HONESTLY, and so does not pretend to: \s is
- * "tsh", not "bash", and the clock escapes (\t \T \@ \A \d \D) read
+ * the shell's name, "tsh" when it is run as tsh (bash's rule: the last part
+ * of the name it was run as), and the clock escapes (\t \T \@ \A \d \D) read
  * shell_wall_secs(), which is SECONDS SINCE BOOT on a hardcoded epoch --
  * see the native-time note. Those cases stay failing on purpose rather than
  * being tuned to the oracle.
@@ -29030,9 +29038,15 @@ static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
             if (shell_prompt_put(&dec, cwd, true) < 0) return -1;
             break;
         }
-        case 's':
-            if (shell_prompt_put(&dec, "tsh", true) < 0) return -1;
+        case 's': {
+            /* base_pathname(shell_name): after the last `/`, except a
+             * name that is `/` alone (Oils 2015: it was always "tsh") */
+            const char *n = g_shell_name ? g_shell_name : "tsh", *b = n;
+            if (!(n[0] == '/' && !n[1]))
+                for (const char *c = n; *c; c++) if (*c == '/') b = c + 1;
+            if (shell_prompt_put(&dec, b, true) < 0) return -1;
             break;
+        }
         case 'v':                   /* the bash tsh is: BASH_VERSION */
             if (shell_prompt_put(&dec, "5.2", true) < 0) return -1;
             break;
@@ -48257,6 +48271,11 @@ void shell_init_hosted(const char *argv0) {
     g_getopts_char_index  = 1;
     shell_trap_clear_all();
     (void)shell_set_param0(argv0 ? argv0 : "tsh");
+    {
+        const char *n = argv0 && *argv0 && strcmp(argv0, "-") != 0 ? argv0 : "tsh";
+        if (g_shell_name) kfree(g_shell_name);
+        g_shell_name = shell_strdup(n);
+    }
     (void)shell_set_positional_params(0, 0);
     {
         /* BASH is the shell's own pathname: argv[0] as given when it has a
@@ -48477,6 +48496,15 @@ int shell_set_args_hosted(int argc, char **argv) {
 /* `sh -c CMD NAME ARGS...`: NAME is $0 (see host.c). */
 int shell_set_param0_hosted(const char *name) {
     return shell_set_param0(name);
+}
+
+/* ...and the shell's name too, as bash's bind_args makes it: what \s
+ * names (host.c, for -c only -- an async child's $0 is not its name). */
+void shell_set_shell_name_hosted(const char *name) {
+    char *d = name ? shell_strdup(name) : 0;
+    if (!d) return;
+    if (g_shell_name) kfree(g_shell_name);
+    g_shell_name = d;
 }
 
 #include "shell_readline.inc"
