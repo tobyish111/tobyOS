@@ -5802,6 +5802,8 @@ static const struct shell_signal_name g_shell_signals[] = {
     { SIGURG, "URG" },   { SIGXCPU, "XCPU" }, { SIGXFSZ, "XFSZ" },
     { SIGVTALRM, "VTALRM" }, { SIGPROF, "PROF" }, { SIGWINCH, "WINCH" },
     { SIGIO, "IO" },     { SIGSYS, "SYS" },
+    /* Linux's, which bash lists (`kill -l`, `trap -l`) and tsh had not */
+    { 16, "STKFLT" },    { 30, "PWR" },
 };
 
 /* Signal names are matched CASE-INSENSITIVELY: `trap - int 0 3` is how the
@@ -5836,6 +5838,132 @@ static const char *shell_signal_name(int num) {
         if (g_shell_signals[i].num == num) return g_shell_signals[i].name;
     }
     return 0;
+}
+
+/* bash's legal_number: strtoimax's number -- blanks, a sign, digits --
+ * then only blanks. */
+static bool sh_legal_number(const char *s, long long *out) {
+    if (out) *out = 0;
+    if (!s || !*s) return false;
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\v' ||
+           *p == '\f' || *p == '\r')
+        p++;
+    bool neg = *p == '-';
+    if (*p == '-' || *p == '+') p++;
+    if (*p < '0' || *p > '9') return false;
+    unsigned long long v = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+        if (v > (0x7fffffffffffffffULL - (unsigned)(*p - '0')) / 10) return false;
+        v = v * 10 + (unsigned)(*p - '0');
+    }
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return false;
+    if (out) *out = neg ? -(long long)v : (long long)v;
+    return true;
+}
+
+/* bash's signal_name(I) as the guest's C library (musl) numbers them: the
+ * table above, then the real-time signals -- SIGRTMIN 35, SIGRTMAX 64, and
+ * between them RTMIN+1..+14 and RTMAX-14..-1 (mksignames). 0 is EXIT; 32-34
+ * have no name (bash's SIGJUNK) and give 0. BUF holds a built name. */
+#define SH_NSIG 65
+static const char *shell_signal_fullname(int i, char *buf, size_t cap) {
+    if (i == 0) return "EXIT";
+    if (i >= 1 && i <= 31) {
+        const char *n = shell_signal_name(i);
+        if (!n) return 0;
+        ksnprintf(buf, cap, "SIG%s", n);
+        return buf;
+    }
+    if (i == 35) return "SIGRTMIN";
+    if (i == 64) return "SIGRTMAX";
+    if (i > 35 && i <= 49) { ksnprintf(buf, cap, "SIGRTMIN+%d", i - 35); return buf; }
+    if (i >= 50 && i < 64) { ksnprintf(buf, cap, "SIGRTMAX-%d", 64 - i); return buf; }
+    return 0;
+}
+
+static bool sh_strcase_prefix(const char *s, const char *pre) {
+    for (; *pre; s++, pre++) {
+        char a = *s, b = *pre;
+        if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+/* bash's decode_signal, case-blind (DSIG_NOCASE): a number 0..64, RTMIN+N,
+ * a name with or without its SIG (without only, when SIGPREFIX is false),
+ * or DEBUG ERR RETURN, which follow the signals (65 66 67). -1: none. */
+static int shell_decode_signal(const char *s, bool sigprefix) {
+    long long v;
+    if (sh_legal_number(s, &v)) return v >= 0 && v < SH_NSIG ? (int)v : -1;
+    const char *n = sh_strcase_prefix(s, "SIGRTMIN+") ? s + 9
+                  : sh_strcase_prefix(s, "RTMIN+") ? s + 6 : 0;
+    if (n) return sh_legal_number(n, &v) && v >= 0 && v <= 64 - 35 ? 35 + (int)v : -1;
+    char b[24];
+    for (int i = 0; i < SH_NSIG + 3; i++) {
+        const char *nm = i == SH_NSIG ? "DEBUG" : i == SH_NSIG + 1 ? "ERR"
+                       : i == SH_NSIG + 2 ? "RETURN" : shell_signal_fullname(i, b, sizeof b);
+        if (!nm) continue;
+        if (nm[0] == 'S' && nm[1] == 'I' && nm[2] == 'G') {
+            if (shell_signal_name_eq(s, nm + 3)) return i;
+            if (!sigprefix) continue;
+        }
+        if (shell_signal_name_eq(s, nm)) return i;
+    }
+    return -1;
+}
+
+/* bash's display_signal_list: with no words the table, "%2d) NAME" five to
+ * a line (POSIX kill: the names without SIG, on one line); with words, each
+ * number's name (kill: without SIG; above 128 less 128; one without a name
+ * says nothing) and each name's number. WHO names the builtin in errors.
+ * The status: 1 when a word was no signal. */
+static int shell_signal_list(int n, char **w, const char *who) {
+    bool for_kill = strcmp(who, "kill") == 0;
+    char b[24];
+    if (n == 0) {
+        int column = 0;
+        bool posix_line = g_opt_posix && for_kill;
+        for (int i = 1; i < SH_NSIG; i++) {
+            const char *nm = shell_signal_fullname(i, b, sizeof b);
+            if (!nm) continue;
+            if (posix_line) {
+                shell_printf("%s%s", nm + 3, i == SH_NSIG - 1 ? "" : " ");
+                continue;
+            }
+            shell_printf("%2d) %s", i, nm);
+            if (++column < 5) shell_write("\t");
+            else { shell_write("\n"); column = 0; }
+        }
+        if (posix_line || column != 0) shell_write("\n");
+        return 0;
+    }
+    int rc = 0;
+    for (int k = 0; k < n; k++) {
+        long long v;
+        if (sh_legal_number(w[k], &v)) {
+            if (v > 128) v -= 128;
+            if (v < 0 || v >= SH_NSIG) {
+                kprintf("%s: %s: invalid signal specification\n", who, w[k]);
+                rc = 1;
+                continue;
+            }
+            const char *nm = shell_signal_fullname((int)v, b, sizeof b);
+            if (!nm) continue;
+            shell_printf("%s\n", for_kill && v > 0 ? nm + 3 : nm);
+        } else {
+            int sg = shell_decode_signal(w[k], !(g_opt_posix && for_kill));
+            if (sg < 0) {
+                kprintf("%s: %s: invalid signal specification\n", who, w[k]);
+                rc = 1;
+                continue;
+            }
+            shell_printf("%d\n", sg);
+        }
+    }
+    return rc;
 }
 
 static const char *shell_trap_name(int sig) {
@@ -20404,16 +20532,10 @@ static void cmd_trap(int argc, char **argv) {
         argv = &argv[1];
         argc--;
     }
-    /* trap -l: the signal table, bash's layout (five to a line). */
+    /* trap -l: the signal table, bash's layout (five to a line) -- the
+     * whole of it, the real-time signals too (display_signal_list) */
     if (argc > 1 && strcmp(argv[1], "-l") == 0) {
-        int col = 0;
-        for (int i = 1; i < SIG_MAX; i++) {
-            const char *nm = shell_signal_name(i);
-            if (!nm) continue;
-            shell_printf("%2d) SIG%s", i, nm);
-            if (++col % 5 == 0) shell_printf("\n"); else shell_printf("\t");
-        }
-        if (col % 5) shell_printf("\n");
+        (void)shell_signal_list(0, 0, "trap");
         return;
     }
     /* trap -p [COND...]: print the traps, all of them or the named ones.
@@ -23253,113 +23375,79 @@ static void cmd_hash(int argc, char **argv) {
 
 static void cmd_kill(int argc, char **argv) {
     shell_set_status(0);
+    /* bash's kill_builtin, its option loop step for step: -l/-L lists, -s
+     * and -n take a signal (as do -sNAME and -nNUM), `--` ends the options,
+     * `-?` is the usage, and the FIRST other -WORD is a signal -- a later one
+     * is a process group. A signal that is none is "SPEC: invalid signal
+     * specification", 1 -- unless listing, which ignores it. tsh read only
+     * argv[1]: `kill -l` after another word, and these words, were its own
+     * ("bad signal", "unknown signal", "invalid pid"), as was the usage
+     * (logs/b27/pair/help-option.*). */
     if (argc < 2) {
-        kprintf_raw("usage: kill [-SIGNAL] PID...\n");
+        sh_builtin_usage("kill");
         shell_set_status(2);
         return;
     }
     int sig = SIGTERM;
+    const char *sigspec = "TERM";
+    bool listing = false, saw_signal = false;
     int first = 1;
-    /* `--` ends the options -- `kill -- -123` and `kill -TERM -- -123` are
-     * how a NEGATIVE pid (a process group) gets past option parsing. tsh
-     * fed the literal `--` to the pid parser and errored, which is exactly
-     * what the first monitor-mode case tripped over. */
-    if (strcmp(argv[1], "--") == 0) {
-        first = 2;
-    } else if (strcmp(argv[1], "-l") == 0 || strcmp(argv[1], "-L") == 0) {
-        /* -L is bash's other spelling of -l (Oils 0936 0938). */
-        if (argc == 2) {
-            /* `kill -l` ANSWERS A QUESTION, so its answer belongs on stdout.
-             * These went to the diagnostic stream, where `kill -l 134` printed
-             * ABRT that no caller could capture. */
-            size_t n = sizeof(g_shell_signals) / sizeof(g_shell_signals[0]);
-            for (size_t i = 0; i < n; i++) {
-                shell_printf("%2d) SIG%-7s%s", g_shell_signals[i].num,
-                        g_shell_signals[i].name, (i % 4 == 3) ? "\n" : " ");
-            }
-            if (n % 4 != 0) shell_printf("\n");
-            return;
-        }
-        for (int i = 2; i < argc; i++) {
-            const char *a = argv[i];
-            bool numeric = true;
-            int v = 0;
-            for (const char *q = a; *q; q++) {
-                if (*q < '0' || *q > '9') { numeric = false; break; }
-                v = v * 10 + (*q - '0');
-            }
-            /* bash's words for both kinds of bad operand, and 0 is the
-             * EXIT pseudo-signal (Oils 0938 0941 0942). */
-            if (numeric) {
-                /* A status from `wait` encodes the signal in the low bits. */
-                if (v > 128) v -= 128;
-                const char *nm = v == 0 ? "EXIT" : shell_signal_name(v);
-                if (nm) shell_printf("%s\n", nm);
-                else { kprintf("kill: %s: invalid signal specification\n", a);
-                       shell_set_status(1); }
-            } else {
-                int num = shell_signal_by_name(a);
-                if (num > 0) shell_printf("%d\n", num);
-                else { kprintf("kill: %s: invalid signal specification\n", a);
-                       shell_set_status(1); }
-            }
-        }
-        return;
-    }
-    if (first == 1 &&
-        (strcmp(argv[1], "-s") == 0 || strcmp(argv[1], "-n") == 0)) {
-        /* bash's -s and -n are the same option: each takes a signal NAME
-         * or NUMBER (decode_signal: a number 0..NSIG-1). tsh had only -s,
-         * by name -- `kill -n 9 PID` and `kill -s 9 PID` were both refused
-         * (S14, Oils 0931). The words are bash 5.2's
-         * (logs/s8/before-s9.bash). */
-        if (argc < 3) {
-            kprintf("kill: %s: option requires an argument\n", argv[1]);
-            shell_set_status(1);
-            return;
-        }
-        int num = -1;
-        const char *s = argv[2];
-        if (*s >= '0' && *s <= '9') {
-            int v = 0;
-            for (; *s >= '0' && *s <= '9' && v < 1000; s++) v = v * 10 + (*s - '0');
-            if (!*s && v < 65) num = v;
-        } else {
-            num = shell_signal_by_name(s);
-        }
-        if (num < 0) {
-            kprintf("kill: %s: invalid signal specification\n", argv[2]);
-            shell_set_status(1);
-            return;
-        }
-        sig = num;
-        first = 3;
-    } else if (first == 1 &&
-               argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
-        int v = 0;
-        for (const char *p = argv[1] + 1; *p; p++) {
-            if (*p < '0' || *p > '9') {
-                kprintf("kill: bad signal '%s'\n", argv[1] + 1);
-                shell_set_status(2);
+    while (first < argc) {
+        const char *w = argv[first], *spec;
+        if (!strcmp(w, "-l") || !strcmp(w, "-L")) { listing = true; first++; continue; }
+        if (!strcmp(w, "-s") || !strcmp(w, "-n")) {
+            if (first + 1 >= argc) {
+                kprintf("kill: %s: option requires an argument\n", w);
+                shell_set_status(1);
                 return;
             }
-            v = v * 10 + (*p - '0');
-        }
-        sig = v;
-        first = 2;
-    } else if (first == 1 && argv[1][0] == '-' && argv[1][1] != '\0') {
-        int num = shell_signal_by_name(argv[1] + 1);
-        if (num < 0) {
-            kprintf("kill: unknown signal '%s'\n", argv[1] + 1);
-            shell_set_status(1);
+            spec = argv[first + 1];
+            first += 2;
+        } else if (w[0] == '-' && w[1] == 's' &&
+                   ((w[2] >= 'a' && w[2] <= 'z') || (w[2] >= 'A' && w[2] <= 'Z'))) {
+            spec = w + 2;
+            first++;
+        } else if (w[0] == '-' && w[1] == 'n' && w[2] >= '0' && w[2] <= '9') {
+            spec = w + 2;
+            first++;
+        } else if (!strcmp(w, "--")) {
+            first++;
+            break;
+        } else if (!strcmp(w, "-?")) {
+            sh_builtin_usage("kill");
+            shell_set_status(2);
             return;
+        } else if (w[0] == '-' && !saw_signal) {
+            spec = w + 1;
+            first++;
+        } else {
+            break;
         }
-        sig = num;
-        first = 2;
+        sigspec = spec;
+        sig = strcmp(spec, "0") == 0 ? 0 : shell_decode_signal(spec, !g_opt_posix);
+        saw_signal = true;
     }
-    /* A `--` may also FOLLOW the signal option: `kill -TERM -- -123`. */
-    if (first < argc && strcmp(argv[first], "--") == 0) first++;
+    if (listing) {
+        shell_set_status(shell_signal_list(argc - first, argv + first, "kill"));
+        return;
+    }
+    if (sig < 0) {
+        kprintf("kill: %s: invalid signal specification\n", sigspec);
+        shell_set_status(1);
+        return;
+    }
+    if (first >= argc) {
+        sh_builtin_usage("kill");
+        shell_set_status(2);
+        return;
+    }
+    /* 0 when any send worked (bash: any_succeeded), each failure said */
+    int sent = 0;
+    bool counted = true;
     for (int i = first; i < argc; i++) {
+        if (!counted && g_last_status == 0) sent++;
+        counted = false;
+        shell_set_status(0);
         /* %jobspec: the signal goes to the job's GROUP. bash also
          * CONTinues a stopped job it TERMs or HUPs, so the signal can
          * act on a process that would otherwise sit stopped with it
@@ -23449,20 +23537,18 @@ static void cmd_kill(int argc, char **argv) {
             }
             continue;
         }
-        int pid = 0;
-        const char *p = argv[i];
-        bool neg = false;
-        if (*p == '-') { neg = true; p++; }
-        while (*p >= '0' && *p <= '9') {
-            pid = pid * 10 + (*p - '0');
-            p++;
-        }
-        if (*p) {
-            kprintf("kill: invalid pid '%s'\n", argv[i]);
+        /* a pid -- a group when negative -- or else bash's words */
+        long long pv = 0;
+        const char *word = argv[i][0] == '-' ? argv[i] + 1 : argv[i];
+        if (!*word || !sh_legal_number(argv[i], &pv) || pv != (int)pv) {
+            if (*argv[i])
+                kprintf("kill: %s: arguments must be process or job IDs\n", argv[i]);
+            else
+                kprintf("kill: `%s': not a pid or valid job spec\n", argv[i]);
             shell_set_status(1);
             continue;
         }
-        if (neg) pid = -pid;
+        int pid = (int)pv;
 #ifndef SHELL_HOSTED
         /* A job the send ends -- every live process of it, a group send
          * reaching them all -- is dying (see shell_job_settle); asked
@@ -23506,6 +23592,8 @@ static void cmd_kill(int argc, char **argv) {
         kfree(ends);
 #endif
     }
+    if (!counted && g_last_status == 0) sent++;
+    shell_set_status(sent ? 0 : 1);
 }
 
 static bool shell_word_has(const char *word, char c) {
