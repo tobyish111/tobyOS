@@ -95,8 +95,21 @@ static bool s_tx_irq_mode = false;
 
 unsigned serial_baud(void) { return COM1_BAUD; }
 
+/* QEMU's debugcon (port 0xE9) exists only in a virtual machine -- CPUID
+ * leaf 1, ECX bit 31. On real hardware an outb there is an LPC bus cycle to
+ * nothing, on the order of a microsecond, and it was paid for EVERY BYTE
+ * the kernel logs: with the UART's status read and interrupt-enable write
+ * below, three port accesses a byte. A fork, exec and exit log some 400
+ * bytes ([fork], [elf], [execve], [proc] ... exit, reaped), and on the
+ * EliteDesk a process cost five times Linux's to end (finding 156). */
+static int s_dbgcon = -1;
 static inline void dbgcon_putc(char c) {
-    outb(DBGCON_PORT, (uint8_t)c);
+    if (s_dbgcon < 0) {
+        uint32_t a = 1, b, cx = 0, d;
+        __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(cx), "=d"(d));
+        s_dbgcon = (int)((cx >> 31) & 1u);
+    }
+    if (s_dbgcon) outb(DBGCON_PORT, (uint8_t)c);
 }
 
 static inline bool txr_empty(void) { return g_txr_head == g_txr_tail; }
@@ -116,7 +129,12 @@ void serial_init(void) {
 }
 
 /* Toggle the THR-empty interrupt (only IRQ source we use). */
+/* The THR-empty interrupt's enable, as last written: the register is
+ * written only when it changes (it was written after every byte). */
+static bool s_etbei = false;
 static inline void tx_set_etbei(bool on) {
+    if (on == s_etbei) return;
+    s_etbei = on;
     outb(COM1_INT_EN, on ? IER_ETBEI : 0x00);
 }
 
@@ -158,13 +176,18 @@ void serial_putc(char c) {
         return;
     }
 
-    /* Async mode: enqueue + kick the FIFO, never spin. */
+    /* Async mode: enqueue, never spin -- and touch the UART only when it
+     * is not already draining the ring by itself. While the THR-empty
+     * interrupt is armed, it (or the idle pump) moves the next 16 bytes as
+     * the FIFO empties; a byte queued meanwhile needs no port access. Every
+     * 64th byte still tops the FIFO up, for a board whose IRQ4 never comes
+     * while every CPU is busy (so the pump never runs either). */
     uint64_t flags = spin_lock_irqsave(&g_tx_lock);
     if (txr_full()) {
         /* Make room without spinning (one non-blocking FIFO top-up). If
          * still full, drop the byte -- responsiveness over a stall. The
          * dropped byte only loses log fidelity, never correctness. */
-        tx_drain_fifo_locked();
+        if (!s_etbei || (g_txr_dropped & 63u) == 0) tx_drain_fifo_locked();
         if (txr_full()) {
             g_txr_dropped++;      /* SILENT loss -- see serial_dropped() */
             spin_unlock_irqrestore(&g_tx_lock, flags);
@@ -173,7 +196,7 @@ void serial_putc(char c) {
     }
     g_txr[g_txr_head] = c;
     g_txr_head = (g_txr_head + 1u) & TXR_MASK;
-    tx_drain_fifo_locked();
+    if (!s_etbei || (g_txr_head & 63u) == 0) tx_drain_fifo_locked();
     spin_unlock_irqrestore(&g_tx_lock, flags);
 }
 
