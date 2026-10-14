@@ -186,13 +186,14 @@ struct sh_igo {
     const char *optarg;
     char opttype;               /* '-' or '+' */
     const char *name;           /* the builtin, for messages */
+    bool quiet;                 /* no messages: only looking (--help) */
 };
 
 #define SH_IGO_HELP (-2)
 
 static void sh_igo_init(struct sh_igo *g, const char *name, int argc, char **argv) {
     g->argc = argc; g->argv = argv; g->ind = 1; g->sp = 1;
-    g->optarg = 0; g->opttype = '-'; g->name = name;
+    g->optarg = 0; g->opttype = '-'; g->name = name; g->quiet = false;
 }
 
 static int sh_igo_next(struct sh_igo *g, const char *opts) {
@@ -211,7 +212,7 @@ static int sh_igo_next(struct sh_igo *g, const char *opts) {
     char c = w[g->sp];
     const char *cp = c && c != ':' ? comp_strchr(opts, c) : 0;
     if (!cp) {
-        kprintf("%s: %c%c: invalid option\n", g->name, g->opttype, c);
+        if (!g->quiet) kprintf("%s: %c%c: invalid option\n", g->name, g->opttype, c);
         if (w[++g->sp] == '\0') { g->ind++; g->sp = 1; }
         return '?';
     }
@@ -229,7 +230,8 @@ static int sh_igo_next(struct sh_igo *g, const char *opts) {
         } else if (cp[1] == ';') {
             g->ind++;
         } else {
-            kprintf("%s: %c%c: option requires an argument\n", g->name, g->opttype, c);
+            if (!g->quiet)
+                kprintf("%s: %c%c: option requires an argument\n", g->name, g->opttype, c);
             g->sp = 1;
             return '?';
         }

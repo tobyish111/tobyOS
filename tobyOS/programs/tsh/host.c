@@ -1037,6 +1037,21 @@ int proc_spawn(const struct proc_spec *spec) {
  * happened to get. VF_FD and dup2 are the shim's, not the shell's. */
 int host_file_fd(struct file *f) { return f ? VF_FD(&f->vfs) : -1; }
 
+/* bash's get_new_window_size for `help`'s columns (shell_help.inc): the
+ * TIOCGWINSZ size of FD, or of the shell's terminal (/dev/tty) when FD is
+ * -2. 0 with ROWS and COLS, or -1 when there is no size to have. */
+int host_winsize(int fd, int *rows, int *cols) {
+    struct { unsigned short row, col, x, y; } ws;
+    int t = fd == -2 ? open("/dev/tty", O_RDWR) : fd;
+    if (t < 0) return -1;
+    int rc = ioctl(t, 0x5413UL /* TIOCGWINSZ */, &ws);
+    if (fd == -2) close(t);
+    if (rc != 0) return -1;
+    *rows = ws.row;
+    *cols = ws.col;
+    return 0;
+}
+
 /* fstat of the descriptor behind a handle: `test -p /dev/stdin` asks about
  * the BUILTIN's fd 0, which a redirection or a pipe may have set in the
  * shell's own table and not in this process's (shell.c test_fd_stat). */

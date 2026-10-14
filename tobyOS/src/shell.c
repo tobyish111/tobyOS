@@ -7361,6 +7361,8 @@ struct cmd {
 };
 
 static const struct cmd cmds[];   /* forward */
+/* a builtin, called -- its --help first, as bash's (shell_help.inc) */
+static void shell_call_builtin(const struct cmd *c, int argc, char **argv);
 
 /* In userspace the builtin set is exactly the POSIX/bash one -- no more.
  *
@@ -12820,42 +12822,7 @@ static void cmd_false(int argc, char **argv) {
 }
 
 static bool shell_glob_match(const char *pat, const char *name);
-static void cmd_help(int argc, char **argv) {
-    shell_set_status(0);
-    int first = 1;
-    while (first < argc && argv[first][0] == '-' && argv[first][1]) {
-        if (strcmp(argv[first], "--") == 0) { first++; break; }
-        first++;                        /* -d -m -s: one form here */
-    }
-    if (first >= argc) {
-        shell_write("commands:\n");
-        for (const struct cmd *c = cmds; c->name; c++) {
-            shell_printf("  %-8s  %s\n", c->name, c->help);
-        }
-        return;
-    }
-    /* `help PATTERN`: the builtins whose names it matches, as a glob or a
-     * prefix (bash: `help ec` is echo's), and when none does bash's words
-     * and status 1 (Oils 0645). It printed the whole list whatever it was
-     * asked. The text is tsh's own one line per builtin. */
-    for (int i = first; i < argc; i++) {
-        bool any = false;
-        size_t pl = strlen(argv[i]);
-        for (const struct cmd *c = cmds; c->name; c++) {
-            if (shell_cmd_lookup(c->name) != c) continue;   /* hidden here */
-            if (strncmp(c->name, argv[i], pl) != 0 &&
-                !shell_glob_match(argv[i], c->name))
-                continue;
-            shell_printf("%s: %s\n", c->name, c->help);
-            any = true;
-        }
-        if (!any) {
-            kprintf("help: no help topics match `%s'.  Try `help help' or "
-                    "`man -k %s' or `info %s'.\n", argv[i], argv[i], argv[i]);
-            shell_set_status(1);
-        }
-    }
-}
+static void cmd_help(int argc, char **argv);     /* shell_help.inc */
 
 static void cmd_clear(int argc, char **argv) {
     (void)argc; (void)argv;
@@ -21109,7 +21076,7 @@ static void cmd_command(int argc, char **argv) {
             COMMAND_P_RESTORE();
             g_last_builtin = g_this_builtin;
             g_this_builtin = c->fn;
-            c->fn(argc - i, &argv[i]);
+            shell_call_builtin(c, argc - i, &argv[i]);
             return;
         }
     }
@@ -25258,7 +25225,7 @@ static void cmd_builtin(int argc, char **argv) {
         return;
     }
     g_this_builtin = c->fn;                 /* builtin.def: as itself */
-    c->fn(argc - 1, argv + 1);
+    shell_call_builtin(c, argc - 1, argv + 1);
 }
 
 /* ---- disown ------------------------------------------------------------
@@ -38152,7 +38119,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     struct shell_fd_state *old_bfds = g_builtin_fds;
     g_builtin_fds = &fds;
     g_this_builtin = c->fn;
-    c->fn(cmd->argc, cmd->argv);
+    shell_call_builtin(c, cmd->argc, cmd->argv);
 #ifdef SHELL_HOSTED
     /* One write per builtin, like bash's flush at the end of each one (S2;
      * see kputc in programs/tsh/host.c). */
@@ -48509,6 +48476,7 @@ void shell_set_shell_name_hosted(const char *name) {
 
 #include "shell_readline.inc"
 #include "shell_complete.inc"
+#include "shell_help.inc"
 
 /* The hosted line editor's seam to the builtin table. */
 const char *tsh_builtin_name_at(int i) {

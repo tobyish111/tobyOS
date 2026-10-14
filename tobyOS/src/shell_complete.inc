@@ -151,90 +151,13 @@ static void progcomp_flush(void) {
 
 /* ---- bash's builtin table and help topics, in its order -----------------
  * Every `help` topic with its synopsis; `bi` when it is a builtin (bash's
- * table has a function for it) rather than a reserved word's topic.
- * Measured from the guest's bash 5.2.15 (`help -s` for each `compgen -A
- * helptopic`, logs/b12/guest-bash-helps.txt). The synopsis is also the
- * usage line a builtin prints on a bad option. */
-struct sh_bash_topic { const char *name; const char *syn; bool bi; };
-static const struct sh_bash_topic g_bash_topics[] = {
-    { "%", "job_spec [&]", false },
-    { "(( ... ))", "(( expression ))", false },
-    { ".", ". filename [arguments]", true },
-    { ":", ":", true },
-    { "[", "[ arg... ]", true },
-    { "[[ ... ]]", "[[ expression ]]", false },
-    { "alias", "alias [-p] [name[=value] ... ]", true },
-    { "bg", "bg [job_spec ...]", true },
-    { "bind", "bind [-lpsvPSVX] [-m keymap] [-f filename] [-q name] [-u name] [-r keyseq] [-x keyseq:shell-command] [keyseq:readline-function or readline-command]", true },
-    { "break", "break [n]", true },
-    { "builtin", "builtin [shell-builtin [arg ...]]", true },
-    { "caller", "caller [expr]", true },
-    { "case", "case WORD in [PATTERN [| PATTERN]...) COMMANDS ;;]... esac", false },
-    { "cd", "cd [-L|[-P [-e]] [-@]] [dir]", true },
-    { "command", "command [-pVv] command [arg ...]", true },
-    { "compgen", "compgen [-abcdefgjksuv] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [word]", true },
-    { "complete", "complete [-abcdefgjksuv] [-pr] [-DEI] [-o option] [-A action] [-G globpat] [-W wordlist] [-F function] [-C command] [-X filterpat] [-P prefix] [-S suffix] [name ...]", true },
-    { "compopt", "compopt [-o|+o option] [-DEI] [name ...]", true },
-    { "continue", "continue [n]", true },
-    { "coproc", "coproc [NAME] command [redirections]", false },
-    { "declare", "declare [-aAfFgiIlnrtux] [name[=value] ...] or declare -p [-aAfFilnrtux] [name ...]", true },
-    { "dirs", "dirs [-clpv] [+N] [-N]", true },
-    { "disown", "disown [-h] [-ar] [jobspec ... | pid ...]", true },
-    { "echo", "echo [-neE] [arg ...]", true },
-    { "enable", "enable [-a] [-dnps] [-f filename] [name ...]", true },
-    { "eval", "eval [arg ...]", true },
-    { "exec", "exec [-cl] [-a name] [command [argument ...]] [redirection ...]", true },
-    { "exit", "exit [n]", true },
-    { "export", "export [-fn] [name[=value] ...] or export -p", true },
-    { "false", "false", true },
-    { "fc", "fc [-e ename] [-lnr] [first] [last] or fc -s [pat=rep] [command]", true },
-    { "fg", "fg [job_spec]", true },
-    { "for", "for NAME [in WORDS ... ] ; do COMMANDS; done", false },
-    { "for ((", "for (( exp1; exp2; exp3 )); do COMMANDS; done", false },
-    { "function", "function name { COMMANDS ; } or name () { COMMANDS ; }", false },
-    { "getopts", "getopts optstring name [arg ...]", true },
-    { "hash", "hash [-lr] [-p pathname] [-dt] [name ...]", true },
-    { "help", "help [-dms] [pattern ...]", true },
-    { "history", "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]", true },
-    { "if", "if COMMANDS; then COMMANDS; [ elif COMMANDS; then COMMANDS; ]... [ else COMMANDS; ] fi", false },
-    { "jobs", "jobs [-lnprs] [jobspec ...] or jobs -x command [args]", true },
-    { "kill", "kill [-s sigspec | -n signum | -sigspec] pid | jobspec ... or kill -l [sigspec]", true },
-    { "let", "let arg [arg ...]", true },
-    { "local", "local [option] name[=value] ...", true },
-    { "logout", "logout [n]", true },
-    { "mapfile", "mapfile [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", true },
-    { "popd", "popd [-n] [+N | -N]", true },
-    { "printf", "printf [-v var] format [arguments]", true },
-    { "pushd", "pushd [-n] [+N | -N | dir]", true },
-    { "pwd", "pwd [-LP]", true },
-    { "read", "read [-ers] [-a array] [-d delim] [-i text] [-n nchars] [-N nchars] [-p prompt] [-t timeout] [-u fd] [name ...]", true },
-    { "readarray", "readarray [-d delim] [-n count] [-O origin] [-s count] [-t] [-u fd] [-C callback] [-c quantum] [array]", true },
-    { "readonly", "readonly [-aAf] [name[=value] ...] or readonly -p", true },
-    { "return", "return [n]", true },
-    { "select", "select NAME [in WORDS ... ;] do COMMANDS; done", false },
-    { "set", "set [-abefhkmnptuvxBCEHPT] [-o option-name] [--] [-] [arg ...]", true },
-    { "shift", "shift [n]", true },
-    { "shopt", "shopt [-pqsu] [-o] [optname ...]", true },
-    { "source", "source filename [arguments]", true },
-    { "suspend", "suspend [-f]", true },
-    { "test", "test [expr]", true },
-    { "time", "time [-p] pipeline", false },
-    { "times", "times", true },
-    { "trap", "trap [-lp] [[arg] signal_spec ...]", true },
-    { "true", "true", true },
-    { "type", "type [-afptP] name [name ...]", true },
-    { "typeset", "typeset [-aAfFgiIlnrtux] name[=value] ... or typeset -p [-aAfFilnrtux] [name ...]", true },
-    { "ulimit", "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]", true },
-    { "umask", "umask [-p] [-S] [mode]", true },
-    { "unalias", "unalias [-a] name [name ...]", true },
-    { "unset", "unset [-f] [-v] [-n] [name ...]", true },
-    { "until", "until COMMANDS; do COMMANDS-2; done", false },
-    { "variables", "variables - Names and meanings of some shell variables", false },
-    { "wait", "wait [-fn] [-p var] [id ...]", true },
-    { "while", "while COMMANDS; do COMMANDS-2; done", false },
-    { "{ ... }", "{ COMMANDS ; }", false },
-    { 0, 0, false },
-};
+ * table has a function for it) rather than a reserved word's topic; and
+ * its long doc. Generated from bash 5.2.15's own table by
+ * tools/agent/mkbashhelp.py: the synopses are what the hand-made table
+ * here measured from the guest (logs/b12/guest-bash-helps.txt), and the
+ * long docs are bash's text, carried by the user's decision (Oils 0644).
+ * The synopsis is also the usage line a builtin prints on a bad option. */
+#include "shell_bashhelp.inc"
 
 /* The usage line for builtin NAME: "NAME: usage: SYNOPSIS", no prefix --
  * bash's builtin_usage writes it bare. */
@@ -1122,17 +1045,21 @@ static bool shell_function_name_ok(const char *s) {
     return !digits;
 }
 
-/* `NAME --help`: bash's builtin_help -- the synopsis line, then the
- * description, indented. */
+/* `NAME --help`: bash's builtin_help -- "NAME: SYNOPSIS", then the long
+ * doc after four spaces. NAME is the builtin as it was called (bash's
+ * this_command_name), and readarray and mapfile, typeset and declare,
+ * source and . each have an entry of their own. The doc goes out whole:
+ * shell_printf stops at 512 bytes and set's runs to 4 KB. */
 static void shell_help_topic(const char *name) {
     for (int i = 0; g_bash_topics[i].name; i++) {
-        if (strcmp(g_bash_topics[i].name, name) != 0) continue;
-        shell_printf("%s: %s\n", name, g_bash_topics[i].syn);
-        for (const struct cmd *c = cmds; c->name; c++)
-            if (strcmp(c->name, name) == 0) {
-                shell_printf("    %s\n", c->help);
-                break;
-            }
+        const struct sh_bash_topic *t = &g_bash_topics[i];
+        if (!t->bi || strcmp(t->name, name) != 0) continue;
+        shell_write(name);
+        shell_write(": ");
+        shell_write(t->syn);
+        shell_write("\n    ");
+        shell_write(t->doc);
+        shell_write("\n");
         return;
     }
 }

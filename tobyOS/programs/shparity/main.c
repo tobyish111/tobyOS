@@ -78,10 +78,13 @@ extern pid_t toby_spawn(const char *path, char *const argv[],
 #define TSH_PATH     "/bin/tsh"
 
 #define MAX_PATH     256
-#define CAP_OUT      65536      /* per-stream capture cap */
+/* Per-stream capture cap. 64 KiB was outgrown by batch 27's help cases --
+ * every help topic in four forms is ~200 KB -- which came back "BROKEN
+ * capture" rather than compared. */
+#define CAP_OUT      (1024 * 1024)
 
 /* Captured output lives in .bss, not on the stack: two CAP_OUT buffers is
- * 128 KiB and user stacks here are far smaller than that. */
+ * 2 MiB and user stacks here are far smaller than that. */
 static char g_buf_a[CAP_OUT];
 static char g_buf_b[CAP_OUT];
 /* The case list grows with the corpus. It was a fixed 160 rows, and the
