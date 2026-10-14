@@ -12181,10 +12181,37 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
                 if (got && sb_putmem(&lastb, w, (size_t)(we - w)) < 0) return 1;
                 val = lastb.p ? lastb.p : p;
             } else {
-                char *e = t1 + strlen(t1) - 1;
-                while (e > t1 && SH_SPCTABNL(*e) && sh_ifsx_byte(&x, *e)) e--;
-                e[1] = '\0';
-                val = t1;
+                /* bash strips its OWN copy of the line, where an escaped
+                 * byte is CTLESC and the byte (and so is a CTLESC or CTLNUL
+                 * byte read as data): back over IFS space/tab/newline, over
+                 * a CTLESC before one, never the FIRST byte -- and when the
+                 * rest begins with an escaped blank that byte is the CTLESC.
+                 * dequote_string passes a lone CTLESC through, so with
+                 * IFS='x ' `read a b` of `x\  \ ` makes b $'\001' (Oils
+                 * 1137, "read bash bug"; tsh said ' '). Rebuilt that way. */
+                SH_SB(q);
+                bool saw = false;
+                for (char *k = t1; *k; k++) {
+                    bool e = SH_RD_ESC(k) ||
+                             ((*k == '\001' || *k == '\177') && !sh_ifsx_byte(&x, *k));
+                    if (e) saw = true;
+                    if ((e && sb_putc(&q, '\001') < 0) || sb_putc(&q, *k) < 0) return 1;
+                }
+                char *s = q.p + q.len - 1;
+                while (s > q.p && ((SH_SPCTABNL(*s) && sh_ifsx_byte(&x, *s)) ||
+                                   (saw && *s == '\001' && SH_SPCTABNL(s[1]))))
+                    s--;
+                s[1] = '\0';
+                if (!(q.p[0] == '\001' && q.p[1] == '\0')) {
+                    char *w = q.p;
+                    for (char *r = q.p; *r; r++) {
+                        if (*r == '\001' && !*++r) break;
+                        *w++ = *r;
+                    }
+                    *w = '\0';
+                }
+                if (sb_puts(&lastb, q.p) < 0) return 1;
+                val = lastb.p;
             }
         }
         if (shell_read_set(argv[i], val) != 0) rc = 1;
@@ -12483,6 +12510,13 @@ static void cmd_read(int argc, char **argv) {
     }
 
     int rc;
+    /* An IFS holding CTLESC (\001): bash marks no escaped byte at all
+     * (read.def's skip_ctlesc) -- the backslash still goes, but what it
+     * escaped splits like any other byte. */
+    {
+        const char *ifs = env_get("IFS");
+        if (ifs && comp_strchr(ifs, '\001')) raw = true;
+    }
     if (array_name) {
         rc = shell_read_assign_array(array_name, linebuf, raw ? 0 : escmap);
     } else if (reply_mode) {
