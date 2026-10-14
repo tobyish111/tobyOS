@@ -2029,17 +2029,7 @@ __attribute__((noreturn)) void proc_exit(int code) {
         }
     }
 
-    /* SIGCHLD to the parent. The header of signal.c has promised this
-     * since M1 and NOTHING ever sent it. bash's job table only updates
-     * through its SIGCHLD handler; without the signal a job killed while
-     * stopped stayed "stopped" in bash's books and an interactive `exit`
-     * refused with "There are stopped jobs." forever. Default disposition
-     * is ignore, so parents that don't care see nothing. Same
-     * before-cli() reasoning as the namespace block above. */
-    if (p && !p->is_thread && p->ppid > 0) {
-        struct proc *par = proc_lookup(p->ppid);
-        if (par) signal_send(par, SIGCHLD);
-    }
+    /* (SIGCHLD to the parent is sent below, once this process is a zombie.) */
 
     cli();
 
@@ -2106,6 +2096,28 @@ __attribute__((noreturn)) void proc_exit(int code) {
      * (even though we don't preempt today, the new process may itself
      * sti+hlt and rely on IRQs to wake it). */
     sti();
+
+    /* SIGCHLD to the parent. The header of signal.c has promised this
+     * since M1 and NOTHING ever sent it. bash's job table only updates
+     * through its SIGCHLD handler; without the signal a job killed while
+     * stopped stayed "stopped" in bash's books and an interactive `exit`
+     * refused with "There are stopped jobs." forever. Default disposition
+     * is ignore, so parents that don't care see nothing.
+     *
+     * NOW, NOT BEFORE THE TEARDOWN (batch 26, finding 148). Linux signals
+     * from exit_notify, when the child is already a zombie, so a SIGCHLD
+     * handler's waitpid(WNOHANG) always finds it. This was sent before the
+     * descriptors were closed and the state set, and on the EliteDesk a
+     * parent on another CPU could take the signal, look, find its child
+     * still running -- and have used up its news: tsh then reached `wait
+     * %%` with the job "alive" and said 143 where bash says 127 (Oils
+     * 0944, 18 of 30). Here interrupts are on again, as signal_send needs
+     * (see the namespace block above), and signal_send neither locks nor
+     * yields; it touches only the parent. */
+    if (!p->is_thread && p->ppid > 0) {
+        struct proc *par = proc_lookup(p->ppid);
+        if (par) signal_send(par, SIGCHLD);
+    }
 
     sched_yield();          /* never returns: nothing puts us back ready */
     kpanic("proc_exit: sched_yield returned for terminated pid=%d", p->pid);
