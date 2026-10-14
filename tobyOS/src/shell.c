@@ -20230,9 +20230,22 @@ static unsigned long g_return_line;
 
 static void cmd_return(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
-    if (argc > 2) {
+    /* bash's order (return.def, get_exitstat): the operand first -- not a
+     * number is "numeric argument required", 2 -- then a second operand is
+     * "too many arguments", which drops the rest of the line with status 1
+     * (no_args' DISCARD), in a function or not; only then the function
+     * test. tsh said "too many" first, with 2, and kept the line (logs/b27
+     * pair/help-option: `return 3 --help`). */
+    bool ok = true;
+    int st = shell_status_arg(argc > 2 ? 2 : argc, argv, g_shell_prev_status,
+                              "return", &ok);
+    if (ok && argc > 2) {
         kprintf("return: too many arguments\n");
-        shell_set_status(2);
+        shell_set_status(1);
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_DISCARD;
+            g_shell_flow_status = 1;
+        }
         return;
     }
     /* A FUNCTION OR A SOURCED FILE, not any script. This tested
@@ -20245,8 +20258,6 @@ static void cmd_return(int argc, char **argv) {
         shell_set_status(2);
         return;
     }
-    bool ok = true;
-    int st = shell_status_arg(argc, argv, g_shell_prev_status, "return", &ok);
     /* a bad operand is reported and the function STILL returns, with 2 */
     g_shell_flow = SHELL_FLOW_RETURN;
     g_shell_flow_status = st;
@@ -21933,7 +21944,7 @@ static void cmd_test(int argc, char **argv) {
     int end = argc;
     if (bracket) {
         if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
-            kprintf("[: missing ']'\n");
+            kprintf("[: missing `]'\n");
             shell_set_status(2);
             return;
         }
@@ -22452,23 +22463,40 @@ static int shell_q_render(const char *s, bool emit) {
 
 static void cmd_printf(int argc, char **argv) {
     shell_set_status(0);
-    if (argc < 2) {
-        kprintf_raw("usage: printf FORMAT [ARG...]\n");
-        shell_set_status(2);      /* usage error, not a runtime failure */
+    /* `printf -v NAME FORMAT [ARG...]` assigns instead of printing. The
+     * options as bash reads them (printf.def, internal_getopt "v:"): -v's
+     * name in the next word or attached, checked AS IT IS READ ("`NAME':
+     * not a valid identifier", 2 -- before a missing format is noticed),
+     * `--` ends them, any other letter is the usage. tsh took -v only as
+     * argv[1] with a format after it: `printf -v --help` printed "-v"
+     * (logs/b27 pair/help-option), and its usage lines were its own. */
+    const char *vname = 0;
+    struct sh_igo g;
+    sh_igo_init(&g, "printf", argc, argv);
+    int oc;
+    while ((oc = sh_igo_next(&g, "v:")) != -1) {
+        if (oc == 'v') {
+            const char *v = g.optarg;
+            size_t bl = 0;
+            while (v[bl] && v[bl] != '[') bl++;
+            size_t vl = strlen(v);
+            if (!shell_name_is_valid(v, bl) ||
+                (v[bl] == '[' && (vl < bl + 3 || v[vl - 1] != ']'))) {
+                kprintf("printf: `%s': not a valid identifier\n", v);
+                shell_set_status(2);
+                return;
+            }
+            vname = v;
+            continue;
+        }
+        if (oc == SH_IGO_HELP) shell_help_topic("printf");
+        else sh_builtin_usage("printf");
+        shell_set_status(2);
         return;
     }
-
-    /* `printf -v NAME FORMAT [ARG...]` assigns instead of printing. */
-    const char *vname = 0;
-    int base = 1;
-    if (argc >= 4 && strcmp(argv[1], "-v") == 0) {
-        vname = argv[2];
-        base = 3;
-    } else if (argc >= 2 && strcmp(argv[1], "--") == 0) {
-        base = 2;
-    }
+    int base = g.ind;
     if (base >= argc) {
-        kprintf_raw("usage: printf [-v NAME] FORMAT [ARG...]\n");
+        sh_builtin_usage("printf");
         shell_set_status(2);
         return;
     }
