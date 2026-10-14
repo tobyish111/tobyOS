@@ -117,11 +117,18 @@ void apic_eoi(void) {
  * parked with IRQs off can't ack; we warn instead of deadlocking). */
 static volatile uint32_t g_tlb_gen[MAX_CPUS];
 
-/* Slice 94: wake-kick receiver -- nothing to do; the interrupt itself
- * broke the target's hlt, and its idle loop re-scans the queues next. */
+/* Slice 94: wake-kick receiver -- the interrupt itself broke the target's
+ * hlt, and its idle loop re-scans the queues next. It is also a signal's
+ * kick (signal.c signal_kick, finding 165): a process it interrupted at
+ * ring 3 takes its pending signals now, as the timer handler would give
+ * them at its next tick -- caught ones first, on the interrupted frame;
+ * EOI before, as there, since a default action may never return. */
 static void sched_wake_isr(struct regs *r) {
-    (void)r;
     apic_eoi();
+    if (r && (r->cs & 3) == 3) {
+        if (!signal_deliver_irq(r))
+            signal_deliver_if_pending();
+    }
 }
 
 void apic_sched_wake(uint8_t target_apic_id) {

@@ -18,6 +18,9 @@
 #include <tobyos/isr.h>
 #include <tobyos/nsproxy.h>   /* pid_knr / pid_vnr_in / pid_ns_can_see (slice 10) */
 #include <tobyos/abi/abi.h>
+#include <tobyos/smp.h>
+#include <tobyos/percpu.h>
+#include <tobyos/apic.h>       /* apic_sched_wake: signal_kick */
 
 static int g_foreground_pid = 0;
 
@@ -160,6 +163,31 @@ static void wait_queue_unlink(struct proc *p) {
 #define SIGMASK_STOPS (SIGMASK(SIGSTOP) | SIGMASK(SIGTSTP) | \
                        SIGMASK(SIGTTIN) | SIGMASK(SIGTTOU))
 
+/* A TARGET RUNNING ON ANOTHER CPU IS INTERRUPTED, so it takes the signal
+ * now (finding 165). A pending signal reaches ring 3 when a system call or
+ * an interrupt returns there -- and a process busy in user code on another
+ * CPU takes no interrupt before its next timer tick. On the EliteDesk a
+ * SIGCHLD reached a parent spinning in user code a median 9903 us after the
+ * kill, one tick; a parent making system calls had it in 30
+ * (logs/hw-2a5fa1b/sigdelay-hw-2a5fa1b.out). tsh between `kill %%` and
+ * `wait %%` makes almost none, so it met `wait` with its job still "alive"
+ * (Oils 0944: 143 in 30 of 30, bash 127 in 30). Linux kicks the target's
+ * CPU (signal_wake_up -> kick_process); so does this, with the wake IPI,
+ * whose handler delivers to a ring-3 process it interrupts (apic.c). A
+ * stale `current` read only costs a spare interrupt. */
+static void signal_kick(struct proc *p) {
+    uint32_t n = smp_cpu_count(), me = smp_current_cpu_idx();
+    for (uint32_t i = 0; i < n && i < MAX_CPUS; i++) {
+        if (i == me) continue;
+        struct percpu *c = smp_cpu_mut(i);
+        if (!c || !c->online) continue;
+        if (__atomic_load_n(&c->current, __ATOMIC_ACQUIRE) == p) {
+            apic_sched_wake((uint8_t)c->apic_id);
+            return;
+        }
+    }
+}
+
 void signal_send(struct proc *p, int sig) {
     if (!p) return;
     if (sig <= 0 || sig >= SIG_MAX) return;
@@ -252,6 +280,8 @@ void signal_send(struct proc *p, int sig) {
         p->state = PROC_READY;
         sched_enqueue(p);
     }
+
+    signal_kick(p);
 }
 
 int signal_send_to_pid_checked(int pid, int sig) {
