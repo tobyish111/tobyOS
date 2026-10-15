@@ -8,7 +8,8 @@
 #   logs/b27/sigdelay -- kill to the SIGCHLD handler of a parent busy in user
 #                        code (finding 165: one 10 ms timer tick before the
 #                        signal kick; Linux a few hundred us).
-# And the box's wall clock within 5 s of this host's (finding 157).
+# And the box's wall clock within 5 s of this host's (finding 157), and its
+# RTC within a second of that clock (finding 168, the write-back).
 # A mark missed prints FAIL and the script exits 1. ED_HOST must be set.
 cd "$(dirname "$0")/../.." || exit 1
 export ED_HOST=${ED_HOST:?}
@@ -33,6 +34,18 @@ if [ -n "$bs" ] && [ "$bs" -ge $((hs - 5)) ] && [ "$bs" -le $((he + 5)) ]; then
   echo "  ok   wall clock within 5 s of this host's ($bs vs $hs)"
 else
   echo "  FAIL wall clock ${bs:-?} vs this host's $hs"; rc=1
+fi
+# the RTC against the box's clock (finding 168: timesyncd writes it back
+# after each sync; an Intel RTC's write restarts its divider, so the two
+# agree to milliseconds -- hwclock prints the RTC's time at its own start,
+# a few ms after date's). The mark is a second.
+r=$(bash logs/edremote.sh 'd=$(date -u +%s.%N); h=$(sudo -n hwclock -r --utc); echo "$d|$h"' 2>/dev/null | tr -d '\r')
+hr=$(date -d "${r#*|}" +%s.%N 2>/dev/null)
+dm=$(awk -v a="$hr" -v b="${r%%|*}" 'BEGIN { if (a == "" || b == "") exit; d = (a - b) * 1000; if (d < 0) d = -d; printf "%d", d }')
+if [ -n "$dm" ] && [ "$dm" -le 1000 ]; then
+  echo "  ok   RTC within $dm ms of the box's clock (mark 1000; $r)"
+else
+  echo "  FAIL RTC ${dm:-?} ms from the box's clock ($r)"; rc=1
 fi
 echo "HWLATENCY: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc

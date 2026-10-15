@@ -16,7 +16,14 @@
  *     STEP_MS or more, steps the clock with clock_settime (smaller ones it
  *     leaves: there is no slewing adjtimex here), saying so as timesyncd
  *     does ("Initial clock synchronization to ...");
- *   - asks again every POLL_S seconds (timesyncd's longest poll, 2048 s).
+ *   - asks again every POLL_S seconds (timesyncd's longest poll, 2048 s);
+ *   - after each sync, sets the RTC from the system clock. On Linux the
+ *     kernel does that, every 11 minutes once timesyncd's adjtimex marks
+ *     the clock synchronized; there is no adjtimex here, so timesyncd writes
+ *     it through /dev/rtc0 as hwclock --systohc does, and says so when the
+ *     RTC was a second or more off ("RTC set from the system clock"). The
+ *     RTC keeps UTC. Without this the next boot started from the RTC's
+ *     wrong time again until the network answered.
  *
  * Servers: NTP= in /etc/timesyncd.conf (space-separated, timesyncd.conf's
  * syntax), else FallbackNTP= there, else pool.ntp.org then
@@ -28,6 +35,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <time.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <toby/net.h>
 
@@ -105,6 +113,80 @@ static void read_conf(void) {
     if (g_nserv == 0) add_servers("pool.ntp.org time.cloudflare.com");
 }
 
+/* ---- the RTC (/dev/rtc0, Linux's ioctls) ---- */
+#define RTC_RD_TIME   0x80247009ul
+#define RTC_SET_TIME  0x4024700aul
+struct rtc_tm { int sec, min, hour, mday, mon, year, wday, yday, isdst; };
+
+/* days from 1970-01-01 to Y-M-D */
+static i64 days_from_civil(i64 y, int m, int d) {
+    y -= m <= 2;
+    i64 era = (y >= 0 ? y : y - 399) / 400;
+    i64 yoe = y - era * 400;
+    i64 doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+/* Set the RTC from the system clock. First how far off it is: read it until
+ * its second turns (1.5 s at most), and that second against the system
+ * clock then. Then the write, as hwclock --systohc makes it: second S at
+ * S + 0.5, the kernel's write putting the RTC's next tick 500 ms later. */
+static void rtc_writeback(void) {
+    int fd = open("/dev/rtc0", O_RDONLY);
+    if (fd < 0) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "timesyncd: /dev/rtc0: %s; the RTC is left as it is.\n",
+                    strerror(errno));
+        return;
+    }
+    struct rtc_tm a, b;
+    i64 off = 0;
+    int have = 0;
+    if (ioctl(fd, RTC_RD_TIME, &a) == 0) {
+        i64 start = now_ns();
+        while (now_ns() - start < 1500000000LL) {
+            if (ioctl(fd, RTC_RD_TIME, &b) != 0) break;
+            if (b.sec != a.sec) {
+                i64 at = now_ns();
+                i64 rs = days_from_civil((i64)b.year + 1900, b.mon + 1, b.mday) * 86400 +
+                         b.hour * 3600 + b.min * 60 + b.sec;
+                off = rs * 1000000000LL - at;
+                have = 1;
+                break;
+            }
+            struct timespec d = { 0, 1000000 };
+            nanosleep(&d, NULL);
+        }
+    }
+    /* sleep to 20 ms before the half second, spin to it; a write up to
+     * 10 ms late is taken (the RTC then ticks that much late). A busy boot
+     * preempts the spin: with a 2 ms window the write took 6 s to land. */
+    i64 t;
+    for (;;) {
+        t = now_ns();
+        long frac = (long)(t % 1000000000LL);
+        if (frac >= 500000000L && frac < 510000000L) break;
+        long wait = frac < 500000000L ? 500000000L - frac : 1500000000L - frac;
+        if (wait > 20000000L) {
+            struct timespec d = { 0, wait - 20000000L };
+            nanosleep(&d, NULL);
+        }
+    }
+    time_t sec = (time_t)(t / 1000000000LL);
+    struct tm tm;
+    gmtime_r(&sec, &tm);
+    struct rtc_tm w = { tm.tm_sec, tm.tm_min, tm.tm_hour, tm.tm_mday, tm.tm_mon, tm.tm_year, 0, 0, 0 };
+    if (ioctl(fd, RTC_SET_TIME, &w) != 0)
+        fprintf(stderr, "timesyncd: Failed to set the RTC: %s\n", strerror(errno));
+    else if (!have)
+        fprintf(stderr, "timesyncd: RTC set from the system clock (it could not be read first).\n");
+    else if (off >= 1000000000LL || off <= -1000000000LL)
+        fprintf(stderr, "timesyncd: RTC set from the system clock (it was %+lld s off).\n",
+                off / 1000000000LL);
+    close(fd);
+}
+
 static void fmt_time(i64 ns, char *out, size_t cap) {
     time_t t = (time_t)(ns / 1000000000LL);
     struct tm tm;
@@ -174,6 +256,7 @@ static int sync_once(const char *server, int *first) {
         fprintf(stderr, "timesyncd: Clock is %+lld ms off; left as it is.\n", offset / 1000000LL);
     }
     *first = 0;
+    rtc_writeback();
     return 1;
 }
 
