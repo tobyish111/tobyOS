@@ -8,6 +8,7 @@
 #   logs/b27/sigdelay -- kill to the SIGCHLD handler of a parent busy in user
 #                        code (finding 165: one 10 ms timer tick before the
 #                        signal kick; Linux a few hundred us).
+# And the box's wall clock within 5 s of this host's (finding 157).
 # A mark missed prints FAIL and the script exits 1. ED_HOST must be set.
 cd "$(dirname "$0")/../.." || exit 1
 export ED_HOST=${ED_HOST:?}
@@ -25,5 +26,13 @@ chk() { if [ -n "$2" ] && [ "$2" -le "$3" ]; then echo "  ok   $1 $2 us (mark $3
 chk "fork+exit+reap" "$fe" 400
 chk "exit to reap" "$ex" 300
 chk "kill to SIGCHLD, busy parent" "$sp" 2000
+# the wall clock against this machine's (finding 157: the box's RTC was 7
+# hours behind UTC until timesyncd); the round trip is a second at most
+hs=$(date +%s); bs=$(bash logs/edremote.sh 'date +%s' 2>/dev/null | tr -d '\r'); he=$(date +%s)
+if [ -n "$bs" ] && [ "$bs" -ge $((hs - 5)) ] && [ "$bs" -le $((he + 5)) ]; then
+  echo "  ok   wall clock within 5 s of this host's ($bs vs $hs)"
+else
+  echo "  FAIL wall clock ${bs:-?} vs this host's $hs"; rc=1
+fi
 echo "HWLATENCY: $([ $rc = 0 ] && echo PASS || echo FAIL)"
 exit $rc

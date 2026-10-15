@@ -567,6 +567,7 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_zstd/user_zstd.elf \
             programs/user_zip/user_zip.elf \
             programs/user_dig/user_dig.elf \
+            programs/user_timesyncd/user_timesyncd.elf \
             programs/user_strip/user_strip.elf \
             programs/user_at/user_at.elf \
             programs/user_archive/user_archive.elf \
@@ -1887,6 +1888,8 @@ $(eval $(call LIBTOBY_PROGRAM_RULES,user_ls,user_ls))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_textutils,user_textutils))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_zstd,user_zstd))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_dig,user_dig))
+# /bin/timesyncd -- the clock from the network, a boot service (finding 157)
+$(eval $(call LIBTOBY_PROGRAM_RULES,user_timesyncd,user_timesyncd))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_strip,user_strip))
 $(eval $(call LIBTOBY_PROGRAM_RULES,user_at,user_at))
 $(eval $(call LIBTOBY_KABI_PROGRAM_RULES,user_archive,user_archive))
@@ -3294,6 +3297,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
 	cp programs/user_zip/user_zip.elf               $(INITRD_STAGE)/bin/zip
 	cp programs/user_dig/user_dig.elf               $(INITRD_STAGE)/bin/dig
+	cp programs/user_timesyncd/user_timesyncd.elf   $(INITRD_STAGE)/bin/timesyncd
 	cp programs/user_strip/user_strip.elf           $(INITRD_STAGE)/bin/strip
 	cp programs/user_at/user_at.elf                 $(INITRD_STAGE)/bin/at
 	cp programs/user_setpci/user_setpci.elf         $(INITRD_STAGE)/bin/setpci
@@ -4234,7 +4238,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/mount bin/umount                                               \
 	    bin/zstd bin/unzstd bin/zstdcat                                    \
 	    bin/zip bin/unzip                                  \
-	    bin/dig bin/host                                    \
+	    bin/dig bin/host bin/timesyncd                      \
 	    bin/strip bin/cc bin/mkfs bin/domainname            \
 	    bin/at bin/batch bin/atq bin/atrm                   \
 	       bin/archive bin/ar bin/cpio bin/xz bin/unxz bin/xzcat \
@@ -6034,6 +6038,7 @@ clean:
 	       programs/user_zip/user_zip.o programs/user_zip/puff.o \
 	       programs/user_zip/user_zip.elf \
 	       programs/user_dig/user_dig.o programs/user_dig/user_dig.elf \
+	       programs/user_timesyncd/user_timesyncd.o programs/user_timesyncd/user_timesyncd.elf \
 	       programs/user_strip/user_strip.o programs/user_strip/user_strip.elf \
 	       programs/user_at/user_at.o programs/user_at/user_at.elf \
 	       programs/user_archive/user_archive.o programs/user_archive/user_archive.elf \

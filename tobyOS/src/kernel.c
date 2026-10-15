@@ -806,6 +806,13 @@ static void m14_init(void) {
     gui_set_desktop_mode(true);
 
     session_init();
+
+    /* The clock from the network (finding 157): /bin/timesyncd, an SNTP
+     * client like a distribution's systemd-timesyncd. It waits for the
+     * network itself, so it starts with the rest. The RTC alone left the
+     * EliteDesk 7 hours behind UTC. */
+    if (service_register_program("timesyncd", "/bin/timesyncd", true, NULL) == 0)
+        (void)service_start("timesyncd");
     service_dump();
 
     /* Milestone 31: kernel-emitted welcome toast. Lands in the
