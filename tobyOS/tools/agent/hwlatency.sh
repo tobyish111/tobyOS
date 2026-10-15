@@ -16,6 +16,7 @@ up logs/b26/killlat2 killlat2 > /dev/null
 up logs/b27/sigdelay sigdelay > /dev/null
 k=$(ED_TIMEOUT=300 bash logs/edremote.sh '/tmp/killlat2' 2>/dev/null | tr -d '\r')
 s=$(ED_TIMEOUT=300 bash logs/edremote.sh '/tmp/sigdelay 20' 2>/dev/null | tr -d '\r')
+bash logs/edremote.sh 'rm -f /tmp/killlat2 /tmp/sigdelay' > /dev/null 2>&1   # /tmp is 16 MB
 printf '%s\n%s\n' "$k" "$s"
 med() { printf '%s\n' "$1" | awk -v k="$2" '$1 == k { for (i = 2; i <= NF; i++) if ($i == "med") { print $(i + 1); exit } if ($2 ~ /^[0-9]+$/) { print $2; exit } }'; }
 fe=$(med "$k" forkexit); ex=$(med "$k" exitself); sp=$(med "$s" spin)

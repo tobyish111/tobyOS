@@ -18,6 +18,9 @@ echo "oilspec:"; grep -a -E "POSIX  |BASH-ONLY|^  [0-9]{4} |gained|LOST" logs/hw
 echo "== latency (fork/exit, signal delivery)"
 bash tools/agent/hwlatency.sh > logs/hwchain-latency.log 2>&1
 grep -a -E "^  (ok|FAIL)|HWLATENCY" logs/hwchain-latency.log
+echo "== 841 KB uploads over SSH (finding 166)"
+bash tools/agent/hwupstress.sh 40 > logs/hwchain-upstress.log 2>&1
+grep -a -E "FAILED|UPSTRESS" logs/hwchain-upstress.log
 echo "== kernel-shell probes"
 KPORT=7777 bash logs/kprobechain.sh
 echo "chain rc=$?"
