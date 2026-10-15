@@ -47,7 +47,12 @@ int tls_x509_validate_chain(const uint8_t *msg, size_t msglen,
     br_x509_minimal_set_hash(xc, br_sha256_ID, &br_sha256_vtable);
     br_x509_minimal_set_hash(xc, br_sha384_ID, &br_sha384_vtable);
     br_x509_minimal_set_hash(xc, br_sha512_ID, &br_sha512_vtable);
-    uint64_t ut = rtc_unix_time();
+    /* The wall clock, not the RTC: the clock timesyncd sets (finding 157).
+     * The EliteDesk's RTC is 7 hours behind UTC -- read raw, a certificate
+     * issued that morning was "not yet valid" until the afternoon. */
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    extern uint64_t perf_now_ns(void);
+    uint64_t ut = lx_realtime_ns(perf_now_ns()) / 1000000000ull;
     br_x509_minimal_set_time(xc, (uint32_t)(ut / 86400) + 719528,
                                  (uint32_t)(ut % 86400));
 

@@ -23,6 +23,7 @@ struct timezone {
 };
 
 int gettimeofday(struct timeval *tv, struct timezone *tz);
+int settimeofday(const struct timeval *tv, const struct timezone *tz);   /* root only */
 
 /* utimes(2). times[0] = atime, times[1] = mtime; NULL means "now", which
  * is touch(1)'s default and the only form it needs. Added 2026-08-24 --

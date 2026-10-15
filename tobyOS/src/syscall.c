@@ -51,6 +51,7 @@ void ptrace_syscall_stop(struct proc *p, bool entering, long nr, long ret);
 bool ptrace_stopped_for(struct proc *me, struct proc *t);
 int  ptrace_stop_signal(struct proc *t);
 int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
+#include <tobyos/civiltime.h> /* w32_GetSystemTime (finding 157) */
 #include <tobyos/nsproxy.h>   /* namespaces: unshare/setns/uts (slice 8) */
 #include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
@@ -2038,6 +2039,8 @@ static long nice_get(int which, int who) {
             best = g_proc[i].nice;
     return best == 100 ? -ABI_ESRCH : 20 - best;
 }
+
+static long lx_clock_settime(int clk, const void *uts);   /* finding 157 */
 
 static long nice_set(int which, int who, long niceval) {
     if (which < 0 || which > 2) return -ABI_EINVAL;
@@ -6445,6 +6448,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_stat_follow((const char *)a1, (struct abi_stat *)a2, false);
     case ABI_SYS_UTIMENSAT:
         return sys_utimensat_native((const char *)a1, (const void *)a2, (int)a3);
+    case ABI_SYS_CLOCK_SETTIME:     /* as Linux's clock_settime (finding 157) */
+        return lx_clock_settime((int)a1, (const void *)a2);
     case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
     case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
     case ABI_SYS_XSTAT:
@@ -7325,6 +7330,7 @@ enum {
     LX_setsockopt = 54,
     LX_getsockopt = 55, LX_accept4 = 288,
     LX_gettimeofday = 96, LX_sysinfo = 99, LX_getresuid = 118,
+    LX_settimeofday = 164, LX_clock_settime = 227,
     LX_getresgid = 120, LX_statfs = 137, LX_fstatfs = 138,
     LX_getpriority = 140, LX_setpriority = 141,
     LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
@@ -8407,14 +8413,98 @@ struct lx_pollfd { int fd; short events; short revents; };  /* 8 bytes, Linux AB
 /* Slice 6: no longer static -- tobyfs stamps inode times from the SAME
  * anchored realtime clock CLOCK_REALTIME uses, so an on-disk mtime and a
  * userspace clock_gettime() cannot disagree. */
+/* THE ANCHOR CAN BE MOVED (finding 157): clock_settime(CLOCK_REALTIME) and
+ * settimeofday set the wall clock by moving it, so CLOCK_MONOTONIC -- the
+ * other end -- never jumps. 0 means not anchored yet; the clock is read from
+ * the lock-free time fast path, so the anchor is read and written whole. */
+static uint64_t g_epoch_base_ns;           /* unix_ns - mono_ns */
 uint64_t lx_realtime_ns(uint64_t mono_ns) {
-    static uint64_t s_epoch_base_ns = 0;   /* unix_ns - mono_ns at anchor time */
-    if (s_epoch_base_ns == 0) {
+    uint64_t b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
+    if (b == 0) {
         uint64_t secs = rtc_unix_time();
         if (secs == 0) return mono_ns;     /* no RTC: monotonic is all we have */
-        s_epoch_base_ns = secs * 1000000000ull - mono_ns;
+        uint64_t want = secs * 1000000000ull - mono_ns, unset = 0;
+        if (want == 0) want = 1;
+        (void)__atomic_compare_exchange_n(&g_epoch_base_ns, &unset, want, false,
+                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
     }
-    return s_epoch_base_ns + mono_ns;
+    return b + mono_ns;
+}
+
+/* Setting the wall clock, as Linux's settimeofday paths judge it (measured
+ * as user and as root in WSL: logs/b28/settime-wsl-*.out):
+ *   - the time is valid for setting (timespec64_valid_settod): nsec in
+ *     [0, 1e9), sec >= 0 and below TIME_SETTOD_SEC_MAX -- else EINVAL,
+ *     before any privilege is asked;
+ *   - the caller has CAP_SYS_TIME in the initial user namespace (capable(),
+ *     not ns_capable: a container's root may not set the host's clock) --
+ *     else EPERM;
+ *   - the new time is not before CLOCK_MONOTONIC (do_settimeofday64's
+ *     wall_to_monotonic test: 1970 plus the uptime) -- else EINVAL. */
+#define LX_TIME_SETTOD_SEC_MAX 8277292036LL   /* KTIME_SEC_MAX - 30 years */
+#define LCAP_SYS_TIME 25
+static struct { int minuteswest, dsttime; } g_sys_tz;   /* settimeofday's tz */
+
+static bool lx_settod_valid(int64_t sec, int64_t nsec) {
+    return nsec >= 0 && nsec < 1000000000LL && sec >= 0 &&
+           sec < LX_TIME_SETTOD_SEC_MAX;
+}
+
+static bool lx_may_set_time(void) {
+    struct proc *p = current_proc();
+    if (!p) return true;                       /* the kernel itself */
+    return !p->user_ns && userns_capable(LCAP_SYS_TIME);
+}
+
+static long lx_realtime_set(int64_t sec, int64_t nsec) {
+    uint64_t mono = perf_now_ns();
+    uint64_t want = (uint64_t)sec * 1000000000ull + (uint64_t)nsec;
+    if (want < mono) return -ABI_EINVAL;
+    uint64_t base = want - mono;
+    if (base == 0) base = 1;
+    uint64_t was = lx_realtime_ns(mono);
+    __atomic_store_n(&g_epoch_base_ns, base, __ATOMIC_RELEASE);
+    struct proc *p = current_proc();
+    int64_t step_ms = (int64_t)(want - was) / 1000000;
+    kprintf("[time] clock set to %lld.%09lld by pid %d (step %lld ms)\n",
+            (long long)sec, (long long)nsec, p ? p->pid : 0, (long long)step_ms);
+    return 0;
+}
+
+/* clock_settime(2): only CLOCK_REALTIME is settable; the id is judged
+ * before the pointer, as posix_clock_realtime_set's caller does. */
+static long lx_clock_settime(int clk, const void *uts) {
+    if (clk != 0) return -ABI_EINVAL;
+    struct lx_timespec ts;
+    if (!uts || copy_from_user(&ts, uts, sizeof ts) != 0) return -ABI_EFAULT;
+    if (!lx_settod_valid(ts.tv_sec, ts.tv_nsec)) return -ABI_EINVAL;
+    if (!lx_may_set_time()) return -ABI_EPERM;
+    return lx_realtime_set(ts.tv_sec, ts.tv_nsec);
+}
+
+/* settimeofday(2): TV (a timeval) and TZ each optional. The timezone is
+ * checked after the privilege, as do_sys_settimeofday64 does; it is kept
+ * for gettimeofday to give back, and moves no clock (no RTC in local time
+ * here, so there is nothing for timekeeping_warp_clock to warp). */
+static long lx_settimeofday(const void *utv, const void *utz) {
+    int64_t tv[2] = { 0, 0 };
+    int tz[2] = { 0, 0 };
+    if (utv) {
+        if (copy_from_user(tv, utv, sizeof tv) != 0) return -ABI_EFAULT;
+        if (tv[1] < 0 || tv[1] > 1000000) return -ABI_EINVAL;
+        tv[1] *= 1000;
+    }
+    if (utz && copy_from_user(tz, utz, sizeof tz) != 0) return -ABI_EFAULT;
+    if (utv && !lx_settod_valid(tv[0], tv[1])) return -ABI_EINVAL;
+    if (!lx_may_set_time()) return -ABI_EPERM;
+    if (utz) {
+        if (tz[0] > 15 * 60 || tz[0] < -15 * 60) return -ABI_EINVAL;
+        g_sys_tz.minuteswest = tz[0];
+        g_sys_tz.dsttime = tz[1];
+    }
+    if (utv) return lx_realtime_set(tv[0], tv[1]);
+    return 0;
 }
 
 /* Slice 56: CLOCK_REALTIME minus CLOCK_MONOTONIC, for converting an absolute
@@ -8509,7 +8599,12 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
 #ifdef CHROMIUM_BOOT
         clkchk_probe(mono);
 #endif
-        if (a1 == 0) { *out = 0; return 1; }     /* tz (a2) ignored, matches slow path */
+        if (a2) {                                /* tz: settimeofday's, as Linux's sys_tz */
+            int tz[2] = { g_sys_tz.minuteswest, g_sys_tz.dsttime };
+            if (copy_to_user_nofault((void *)a2, tz, sizeof tz) != 0)
+                return 0;
+        }
+        if (a1 == 0) { *out = 0; return 1; }
         uint64_t ns = lx_realtime_ns(mono);
         int64_t tv[2] = { (int64_t)(ns / 1000000000ull),
                           (int64_t)((ns / 1000ull) % 1000000ull) };
@@ -12051,7 +12146,15 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                            (long)((ns / 1000ull) % 1000000ull) };
             if (copy_to_user((void *)a1, tv, sizeof tv) != 0) return -ABI_EFAULT;
         }
+        if (a2) {                     /* tz: settimeofday's (Linux's sys_tz) */
+            int tz[2] = { g_sys_tz.minuteswest, g_sys_tz.dsttime };
+            if (copy_to_user((void *)a2, tz, sizeof tz) != 0) return -ABI_EFAULT;
+        }
         return 0;
+    case LX_settimeofday:          /* (tv, tz) -- finding 157 */
+        return lx_settimeofday((const void *)a1, (const void *)a2);
+    case LX_clock_settime:         /* (clockid, tp) -- finding 157 */
+        return lx_clock_settime((int)a1, (const void *)a2);
 
     /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
     case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
@@ -21327,12 +21430,19 @@ static void win32_put_filetime(uint64_t uft, uint64_t unix_secs) {
     (void)copy_to_user((void *)(uintptr_t)(uft + 4), &hi, 4);
 }
 static long w32_GetSystemTimeAsFileTime(uint64_t *a) {
-    if (a[0]) win32_put_filetime(a[0], rtc_unix_time());
+    if (a[0]) win32_put_filetime(a[0], lx_realtime_ns(perf_now_ns()) / 1000000000ull);
     return 0;
 }
 static long w32_GetSystemTime(uint64_t *a) {     /* SYSTEMTIME: 8 WORDs */
-    struct rtc_time t; rtc_read_time(&t);
-    uint16_t st[8] = { t.year, t.month, t.weekday, t.day, t.hour, t.minute, t.second, 0 };
+    /* The wall clock (finding 157: the one timesyncd sets), not the CMOS --
+     * which also gave wDayOfWeek as the RTC counts it, Sunday 1, where
+     * Windows counts Sunday 0 -- with its milliseconds. */
+    uint64_t ns = lx_realtime_ns(perf_now_ns());
+    struct civil_time ct;
+    civil_from_unix((int64_t)(ns / 1000000000ull), &ct);
+    uint16_t st[8] = { (uint16_t)ct.year, (uint16_t)(ct.mon + 1), (uint16_t)ct.wday,
+                       (uint16_t)ct.mday, (uint16_t)ct.hour, (uint16_t)ct.min,
+                       (uint16_t)ct.sec, (uint16_t)(ns / 1000000ull % 1000ull) };
     if (a[0]) (void)copy_to_user((void *)(uintptr_t)a[0], st, sizeof(st));
     return 0;
 }
@@ -21869,7 +21979,7 @@ static void win32_fill_stat(uint64_t out, const struct vfs_stat *vs) {
     uint16_t mode = (vs->type==VFS_TYPE_DIR) ? 0x4000|0x1FF : 0x8000|0x1B6;  /* S_IFDIR / S_IFREG */
     memcpy(&b[6],&mode,2);
     int32_t sz=(int32_t)vs->size; memcpy(&b[20],&sz,4);
-    int64_t mt=(int64_t)rtc_unix_time(); memcpy(&b[24],&mt,8); memcpy(&b[32],&mt,8); memcpy(&b[40],&mt,8);
+    int64_t mt=(int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull); memcpy(&b[24],&mt,8); memcpy(&b[32],&mt,8); memcpy(&b[40],&mt,8);
     (void)copy_to_user((void*)(uintptr_t)out,b,sizeof(b));
 }
 static long w32_stat64i32(uint64_t *a){

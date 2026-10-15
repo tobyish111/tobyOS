@@ -52,6 +52,7 @@ clock_t    clock(void);
 time_t     time(time_t *t);
 int        nanosleep(const struct timespec *req, struct timespec *rem);
 int        clock_gettime(int clk, struct timespec *ts);
+int        clock_settime(int clk, const struct timespec *ts);   /* root only */
 int        clock_getres(int clk, struct timespec *res);
 double     difftime(time_t end, time_t start);
 struct tm *gmtime(const time_t *tp);

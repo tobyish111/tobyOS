@@ -216,10 +216,15 @@ static int do_date(int argc, char **argv) {
             if (!dt_posix(posix_set, now_s, &s)) su_error(1, 0, "invalid date %s", su_quote(posix_set));
             ns = 0;
         }
-        /* nothing here sets the clock: refused as it is on Linux for anyone
-         * but root, and for root too */
-        su_error(0, EPERM, "cannot set date");
-        rc = 1;
+        /* GNU's settime: the clock is set (clock_settime, root only), and
+         * either way the date is printed; a refusal is "cannot set date:
+         * ERROR" and status 1. (Until finding 157 there was no call that
+         * set the clock, and root was refused too.) */
+        struct timespec ts = { (time_t)s, (long)ns };
+        if (clock_settime(CLOCK_REALTIME, &ts) != 0) {
+            su_error(0, errno, "cannot set date");
+            rc = 1;
+        }
     }
     dt_show(fmt, s, ns, utc);
     return rc;

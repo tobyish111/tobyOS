@@ -1325,7 +1325,16 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         SYS_UTIMES could not say 1969-12-31
                                         23:59:59 -- its -1 meant now -- nor
                                         leave one time as it was. (batch 26) */
-#define ABI_SYS_NR_MAX          225
+#define ABI_SYS_CLOCK_SETTIME   226  /* (int clk, const struct abi_timespec
+                                        *ts) -> 0|-E: clock_settime(2),
+                                        Linux's rules: only CLOCK_REALTIME
+                                        (else EINVAL), a valid time (EINVAL),
+                                        CAP_SYS_TIME in the initial user
+                                        namespace (EPERM), not before
+                                        CLOCK_MONOTONIC (EINVAL). Moves the
+                                        wall clock; monotonic never jumps.
+                                        (finding 157) */
+#define ABI_SYS_NR_MAX          226
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

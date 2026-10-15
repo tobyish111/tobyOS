@@ -107,6 +107,26 @@ int gettimeofday(struct timeval *tv, struct timezone *tz) {
     return 0;
 }
 
+/* clock_settime(2), the kernel's (ABI_SYS_CLOCK_SETTIME) with Linux's
+ * rules: only CLOCK_REALTIME, CAP_SYS_TIME, not before the monotonic clock.
+ * Before it the native ABI had no way to set the clock at all, so `date
+ * -s` could only refuse and no time service could exist (finding 157). */
+int clock_settime(int clk, const struct timespec *ts) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_CLOCK_SETTIME, (long)clk,
+                                      (long)(uintptr_t)ts));
+}
+
+/* settimeofday(2) over it. The timezone is not kept natively (gettimeofday
+ * gives 0, 0, as Linux's default sys_tz); with no timeval there is nothing
+ * to set. */
+int settimeofday(const struct timeval *tv, const struct timezone *tz) {
+    (void)tz;
+    if (!tv) return 0;
+    if (tv->tv_usec < 0 || tv->tv_usec >= 1000000) { errno = EINVAL; return -1; }
+    struct timespec t = { tv->tv_sec, tv->tv_usec * 1000L };
+    return clock_settime(CLOCK_REALTIME, &t);
+}
+
 int nanosleep(const struct timespec *req, struct timespec *rem) {
     if (!req) return 0;
     uint64_t ns = (uint64_t)req->tv_sec * 1000000000ull

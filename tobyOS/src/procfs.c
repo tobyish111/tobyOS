@@ -391,8 +391,13 @@ static int gen_stat(char *buf, size_t cap) {
          * the machine outright, every time. src/rtc.c now locks and bounds
          * its side of it; caching here keeps the common path away from the
          * hardware altogether. */
-        static uint64_t s_btime;
-        if (s_btime == 0) {
+        /* NOT CACHED any more: btime moves when the clock is set, as
+         * Linux's (getboottime64) does -- timesyncd's first step at boot
+         * would otherwise leave every ps start time and `uptime -s` as far
+         * off as the RTC was (finding 157). The clock read is cheap and
+         * touches no hardware now that lx_realtime_ns is anchored. */
+        uint64_t s_btime = 0;
+        {
             /* The same anchored clock CLOCK_REALTIME reports, minus the same
              * uptime /proc/uptime reports, so btime + starttime/HZ is a
              * process's real start instant the way ps computes it. The CMOS
