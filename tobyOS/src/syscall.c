@@ -3169,6 +3169,23 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
             if (fd < 0) { file_close(f); return -ABI_EMFILE; }
             return fd;
         }
+        /* /dev/rtc0 and its /dev/rtc link (finding 157): the node is
+         * root's 0600, so anyone else is EACCES, and it is one
+         * opener's at a time (EBUSY), as Linux's. */
+        if (strcmp(dev, "rtc0") == 0 || strcmp(dev, "rtc") == 0) {
+            struct proc *op = current_proc();
+            if (op && op->uid != 0) return -ABI_EACCES;
+            if (!rtc_dev_claim()) return -ABI_EBUSY;
+            struct file *f = (struct file *)kmalloc(sizeof(*f));
+            if (!f) { rtc_dev_release(); return -ABI_ENOMEM; }
+            memset(f, 0, sizeof(*f));
+            f->kind = FILE_KIND_RTC;
+            f->o_accmode = 2;
+            int fd = fd_alloc_into(current_proc(), f);
+            if (fd < 0) { kfree(f); rtc_dev_release(); return -ABI_EMFILE; }
+            file_set_open_path(f, "/dev/rtc0");
+            return fd;
+        }
         if (strcmp(dev, "full") == 0) {
             struct file *f = (struct file *)kmalloc(sizeof(*f));
             if (!f) return -ABI_ENOMEM;
@@ -7579,6 +7596,7 @@ static const char *lx_fd_dev_node(struct file *f, char *pts, size_t cap) {
              : f->kind == FILE_KIND_DEVZERO ? "/dev/zero"
              : f->kind == FILE_KIND_DEVFULL ? "/dev/full" : "/dev/urandom";
     case FILE_KIND_CONSOLE:    return "/dev/console";
+    case FILE_KIND_RTC:        return "/dev/rtc0";
     case FILE_KIND_PTY_MASTER: return "/dev/ptmx";
     case FILE_KIND_PTY_SLAVE: {
         int idx = pty_file_index(f);
@@ -7615,6 +7633,7 @@ static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
         return devfs_node_mode(lx_fd_dev_node(f, pts, sizeof pts), maj, min);
     }
     case FILE_KIND_CONSOLE:   return devfs_node_mode("/dev/console", maj, min);
+    case FILE_KIND_RTC:       return devfs_node_mode("/dev/rtc0", maj, min);
     case FILE_KIND_PTY_MASTER: return devfs_node_mode("/dev/ptmx", maj, min);
     case FILE_KIND_PTY_SLAVE: {
         int idx = pty_file_index(f);
@@ -8481,6 +8500,55 @@ static long lx_clock_settime(int clk, const void *uts) {
     if (!lx_settod_valid(ts.tv_sec, ts.tv_nsec)) return -ABI_EINVAL;
     if (!lx_may_set_time()) return -ABI_EPERM;
     return lx_realtime_set(ts.tv_sec, ts.tv_nsec);
+}
+
+/* /dev/rtc0's ioctls, as Linux's rtc-dev answers them (logs/b28/
+ * rtcprobe-wsl-*.out): RTC_RD_TIME gives the RTC's time with wday, yday and
+ * isdst 0 (the core zeroes them); RTC_SET_TIME asks CAP_SYS_TIME first
+ * (EACCES), then copies (EFAULT), then rtc_valid_tm (EINVAL: a field out of
+ * range, a year before 1970), then the device's range (ERANGE); anything
+ * else is ENOTTY. The RTC holds what it is given -- UTC, unless hwclock
+ * --localtime wrote it. */
+#define LX_RTC_RD_TIME  0x80247009ul
+#define LX_RTC_SET_TIME 0x4024700aul
+struct lx_rtc_time {
+    int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year, tm_wday, tm_yday, tm_isdst;
+};
+static bool lx_may_set_time(void);
+static long lx_rtc_ioctl(unsigned long rq, unsigned long arg) {
+    if (rq == LX_RTC_RD_TIME) {
+        struct rtc_time t;
+        rtc_read_time(&t);
+        struct lx_rtc_time lt;
+        memset(&lt, 0, sizeof lt);
+        lt.tm_sec = t.second; lt.tm_min = t.minute; lt.tm_hour = t.hour;
+        lt.tm_mday = t.day; lt.tm_mon = (int)t.month - 1; lt.tm_year = (int)t.year - 1900;
+        if (!arg || copy_to_user((void *)arg, &lt, sizeof lt) != 0) return -ABI_EFAULT;
+        return 0;
+    }
+    if (rq == LX_RTC_SET_TIME) {
+        if (!lx_may_set_time()) return -ABI_EACCES;
+        struct lx_rtc_time lt;
+        if (!arg || copy_from_user(&lt, (const void *)arg, sizeof lt) != 0) return -ABI_EFAULT;
+        static const unsigned char mdays[12] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+        long year = (long)lt.tm_year + 1900;
+        if (lt.tm_year < 70 || (unsigned)lt.tm_mon >= 12 || lt.tm_mday < 1 ||
+            (unsigned)lt.tm_hour >= 24 || (unsigned)lt.tm_min >= 60 ||
+            (unsigned)lt.tm_sec >= 60)
+            return -ABI_EINVAL;
+        bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        int dim = mdays[lt.tm_mon] + (lt.tm_mon == 1 && leap ? 1 : 0);
+        if (lt.tm_mday > dim) return -ABI_EINVAL;
+        struct rtc_time t = { (uint8_t)lt.tm_sec, (uint8_t)lt.tm_min, (uint8_t)lt.tm_hour,
+                              (uint8_t)lt.tm_mday, (uint8_t)(lt.tm_mon + 1),
+                              (uint16_t)(year > 65535 ? 65535 : year), 0 };
+        if (rtc_write_time(&t) != 0) return -ABI_ERANGE;
+        struct proc *p = current_proc();
+        kprintf("[rtc] set to %04ld-%02d-%02d %02d:%02d:%02d by pid %d\n", year,
+                lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec, p ? p->pid : 0);
+        return 0;
+    }
+    return -ABI_ENOTTY;
 }
 
 /* settimeofday(2): TV (a timeval) and TZ each optional. The timezone is
@@ -14587,6 +14655,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return lxdrm_ioctl(f, (unsigned long)a2, (unsigned long)a3);
         if (f->kind == FILE_KIND_SND)                 /* audio slice 3 */
             return lxsnd_ioctl(f, (unsigned long)a2, (unsigned long)a3);
+        if (f->kind == FILE_KIND_RTC)                 /* finding 157 */
+            return lx_rtc_ioctl((unsigned long)a2, (unsigned long)a3);
         /* Slice 12 cut 4: the SIOC* interface ioctls. Answered for the
          * SOCKET's network namespace, matching every other network operation
          * here -- and note libc's if_nametoindex() opens an AF_UNIX socket for

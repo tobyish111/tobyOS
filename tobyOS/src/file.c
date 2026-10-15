@@ -527,6 +527,11 @@ struct file *file_clone(struct file *src) {
 void file_close(struct file *f) {
     if (!f) return;
     switch (f->kind) {
+    case FILE_KIND_RTC: {                      /* finding 157 */
+        extern void rtc_dev_release(void);
+        rtc_dev_release();
+        break;
+    }
     case FILE_KIND_SND:
         /* Audio slice 3: release the substream and stop the DAC, or the
          * next open sees in_use and returns ENOENT forever. */

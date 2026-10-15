@@ -71,6 +71,10 @@ static const struct devfs_ent g_devfs[] = {
     { "console",        DEV_S_IFCHR | 0600,   5,   1, AV_ALWAYS, 0 },
     { "ptmx",           DEV_S_IFCHR | 0666,   5,   2, AV_ALWAYS, 0 },
     { "fb0",            DEV_S_IFCHR | 0660,  29,   0, AV_ALWAYS, 0 },
+    /* The RTC (finding 157): root's, as on a stock system, and the
+     * /dev/rtc link udev makes. 249 is the major Linux gave it in WSL. */
+    { "rtc0",           DEV_S_IFCHR | 0600, 249,   0, AV_ALWAYS, 0 },
+    { "rtc",            DEV_S_IFLNK | 0777,   0,   0, AV_ALWAYS, "rtc0" },
     /* Linux's links to the caller's own descriptors. Opening one is
      * sys_open's (it dups the descriptor, 959b5346); these make them stat,
      * readlink and list as the links they are -- they did not exist to

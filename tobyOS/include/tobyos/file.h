@@ -154,6 +154,9 @@ enum file_kind {
      * descriptor that is both ends of the FIFO's pipe, as Linux gives one,
      * counted as a reader and a writer. See pipe.c fifo_open. */
     FILE_KIND_PIPE_RW    = 26,
+    /* /dev/rtc0, the RTC as Linux's rtc-cmos gives it: RTC_RD_TIME and
+     * RTC_SET_TIME; one opener at a time (finding 157's write-back). */
+    FILE_KIND_RTC        = 27,
 };
 
 struct eventfd;
