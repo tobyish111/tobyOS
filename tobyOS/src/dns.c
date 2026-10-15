@@ -27,6 +27,7 @@
 #include <tobyos/cpu.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
+#include <tobyos/sched.h>   /* bkl_held: dns_wait_irq */
 
 /* ---- transaction state ----------------------------------------- */
 
@@ -215,7 +216,22 @@ static uint16_t dns_make_id(void) {
     return (uint16_t)(t ^ (t >> 16));
 }
 
-bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) {
+/* Sleep until the next interrupt WITHOUT the big kernel lock, as
+ * tcp_poll_until does: the resolver is called from syscalls
+ * (ABI_SYS_DNS_RESOLVE), which hold it, and an hlt that kept it starved
+ * every other core of the kernel for the whole lookup. The network work
+ * (rx_drain) is done with it taken back. (finding 157: the time service
+ * resolves its server through here.) */
+static void dns_wait_irq(void) {
+    bool had = bkl_held();
+    if (had) bkl_exit();
+    sti();
+    hlt();
+    if (had) bkl_enter();
+}
+
+static bool dns_resolve_one(const char *name, uint32_t timeout_ms,
+                            struct dns_result *out) {
     if (!out)              return false;
     if (!name || !*name)   return false;
 #ifdef TLS_TEST_CA
@@ -265,7 +281,7 @@ bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) 
         uint64_t arp_deadline = pit_ticks() + hz0 / 2;        /* ~500 ms */
         while (pit_ticks() < arp_deadline) {
             if (nd0 && nd0->rx_drain) nd0->rx_drain(nd0);
-            sti(); hlt();
+            dns_wait_irq();
         }
         sent = udp_send(htons(DNS_PORT_CLIENT), g_my_dns_be,
                         htons(DNS_PORT_SERVER), qbuf, qlen);
@@ -285,8 +301,7 @@ bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) 
         if (nd && nd->rx_drain) nd->rx_drain(nd);
         if (g_dns.got_reply) break;
         if (g_dns.got_error) break;
-        sti();
-        hlt();
+        dns_wait_irq();
     }
     g_dns.in_flight = false;
 
@@ -308,4 +323,18 @@ bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) 
                 name, (unsigned)timeout_ms);
     }
     return false;
+}
+
+/* ONE LOOKUP AT A TIME. The request state (g_dns) is shared and
+ * dns_resolve_one starts by clearing it; the BKL kept two lookups
+ * apart until the wait learned to let it go (dns_wait_irq). A second
+ * caller now waits, the same way, for the first to finish. The flag is
+ * tested and set with the BKL held, as every caller holds it. */
+static bool g_dns_busy;
+bool dns_resolve(const char *name, uint32_t timeout_ms, struct dns_result *out) {
+    while (g_dns_busy) dns_wait_irq();
+    g_dns_busy = true;
+    bool ok = dns_resolve_one(name, timeout_ms, out);
+    g_dns_busy = false;
+    return ok;
 }
