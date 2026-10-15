@@ -125,6 +125,13 @@ void bkl_exit(void);
  * period and reacquire it afterwards, so it never starves the other cores. */
 bool bkl_held(void);
 
+/* Take the BKL only if nobody holds it or waits for it -- never spins. False
+ * also when this CPU holds it: in an interrupt, that is the code it
+ * interrupted, which may be halfway through the very state the handler
+ * wants. For an interrupt handler that must not run BKL-guarded code
+ * unguarded (a NIC's receive drain); release with bkl_exit. */
+bool bkl_try_enter(void);
+
 /* Allow secondary CPUs to start stealing + running user procs. Called once by
  * the BSP after its boot sequence, right before entering the GUI idle loop --
  * before this, APs idle so they can't race kernel_main's unlocked boot work. */

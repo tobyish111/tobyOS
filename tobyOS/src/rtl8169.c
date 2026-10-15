@@ -35,6 +35,7 @@
  * one page per per-descriptor RX/TX buffer.
  */
 
+#include <tobyos/sched.h>    /* bkl_try_enter: the IRQ's receive drain */
 #include <tobyos/net.h>
 #include <tobyos/pci.h>
 #include <tobyos/pmm.h>
@@ -385,8 +386,18 @@ static void rtl_irq_handler(void *ctx) {
     g_irq_count++;
     uint16_t isr = mmio_r16(RTL_ISR);
     if (isr) mmio_w16(RTL_ISR, isr);
-    if (isr & (ISR_ROK | ISR_RDU | ISR_FOVW)) {
+    /* THE RECEIVE PATH IS THE BKL'S (finding 166). eth_recv runs IP and
+     * TCP, whose state -- a connection's receive ring above all -- tcp.c
+     * guards with the BKL alone. Run from this interrupt unguarded, it
+     * raced the reader: rx_push here against rx_pop in the SSH worker,
+     * and on the EliteDesk 4 of 40 841 KB uploads were cut off or
+     * garbled ("invalid encrypted packet_length"). With the BKL free the
+     * frames are taken now; otherwise they wait on the ring for the next
+     * drain under the BKL -- every pass of tcp_poll_until, pid 0's
+     * service tick. */
+    if ((isr & (ISR_ROK | ISR_RDU | ISR_FOVW)) && bkl_try_enter()) {
         rtl_rx_drain_op(0);
+        bkl_exit();
     }
 }
 

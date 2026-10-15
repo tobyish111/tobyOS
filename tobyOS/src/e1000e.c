@@ -39,6 +39,7 @@
  * one bound for that PCI function.
  */
 
+#include <tobyos/sched.h>    /* bkl_try_enter: the IRQ's receive drain */
 #include <tobyos/net.h>
 #include <tobyos/pci.h>
 #include <tobyos/pmm.h>
@@ -404,7 +405,19 @@ static void e1000e_irq_handler(void *ctx) {
     if (!g_mmio) return;
     g_irq_count++;
     (void)mmio_read32(E1000E_ICR);
-    e1000e_rx_drain_op(0);
+    /* THE RECEIVE PATH IS THE BKL'S (finding 166). eth_recv runs IP and
+     * TCP, whose state -- a connection's receive ring above all -- tcp.c
+     * guards with the BKL alone. Run from this interrupt unguarded, it
+     * raced the reader: rx_push here against rx_pop in the SSH worker,
+     * and on the EliteDesk 4 of 40 841 KB uploads were cut off or
+     * garbled ("invalid encrypted packet_length"). With the BKL free the
+     * frames are taken now; otherwise they wait on the ring for the next
+     * drain under the BKL -- every pass of tcp_poll_until, pid 0's
+     * service tick. */
+    if (bkl_try_enter()) {
+        e1000e_rx_drain_op(0);
+        bkl_exit();
+    }
 }
 
 /* Dump the MAC's hardware packet counters. Called after the boot-time

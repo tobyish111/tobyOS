@@ -398,6 +398,31 @@ bool bkl_held(void) {
     return me && me->holds_bkl;
 }
 
+/* The ticket lock is free exactly when `next` == `serving`: claiming the
+ * next ticket by CAS from that value takes it with no one ahead -- and fails,
+ * without queueing, when anyone holds it or waits. (finding 166) */
+bool bkl_try_enter(void) {
+    struct percpu *me = smp_this_cpu();
+    if (!me || me->holds_bkl) return false;
+    uint32_t s = __atomic_load_n(&g_bkl.serving, __ATOMIC_ACQUIRE);
+    uint32_t want = s;
+    if (!__atomic_compare_exchange_n(&g_bkl.next, &want, s + 1u, false,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return false;
+    if (me->cpu_idx < MAX_CPUS) {
+        g_bkl_acqs[me->cpu_idx]++;
+        g_bkl_t0[me->cpu_idx] = bkl_rdtsc();
+    }
+    me->holds_bkl = true;
+#ifdef SMP_DIAG
+    g_bkl_owner   = (int)me->cpu_idx;
+    g_bkl_acq_ra  = (unsigned long)__builtin_return_address(0);
+    g_bkl_acq_pid = me->current ? me->current->pid : -1;
+    g_bkl_acq_cpu = (int)me->cpu_idx;
+#endif
+    return true;
+}
+
 void sched_init(void) {
     /* Per-CPU queues live in g_percpu[]; smp.c memset-zeroed them
      * during build_percpu_table, which happens to be the right
