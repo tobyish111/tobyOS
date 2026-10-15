@@ -3375,7 +3375,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
-	           cksum truncate install mkfifo date touch sort script; do \
+	           cksum truncate install mkfifo date touch sort script hwclock; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -4231,7 +4231,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/setsid \
 	    bin/watch bin/dd bin/dmesg bin/vi bin/ls bin/tar                                                   \
 	    bin/printenv bin/nice bin/pgrep bin/pkill bin/tty bin/stty        \
-	    bin/cksum bin/truncate bin/install bin/mkfifo bin/script                  \
+	    bin/cksum bin/truncate bin/install bin/mkfifo bin/script bin/hwclock      \
 	    bin/comm bin/expand bin/unexpand bin/fold bin/nl bin/od bin/hexdump \
 	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
 	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
