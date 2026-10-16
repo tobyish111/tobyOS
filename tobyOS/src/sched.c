@@ -445,6 +445,18 @@ void sched_init(void) {
  * boost guarantees a starved low-priority proc eventually out-ranks a busy
  * high-priority one (anti-starvation), bounding worst-case wait. `now` is the
  * global PIT tick. */
+/* THE AGING CLOCK: milliseconds of the TSC monotonic clock (perf_now_ns),
+ * not the PIT tick count, which loses ticks under emulation -- procfs
+ * measured 42 s of ticks in 123 s of wall clock, worse on a busy host --
+ * so aging ran at a third of its speed or less: the 300 ms starvation
+ * bound of a cross-CPU pull (pull_ok) took over a second, and under
+ * SCHEDPRIO one LOW worker sat READY for 1.5 s without running (finding
+ * 169). /proc/uptime, CLOCK_MONOTONIC and the rest moved off the PIT for
+ * the same reason; the scheduler was the one left. */
+static inline uint64_t sched_clock_ms(void) {
+    return perf_now_ns() / 1000000ull;
+}
+
 static inline int eff_prio(const struct proc *p, uint64_t now) {
     uint64_t waited = (now > p->enq_tick) ? (now - p->enq_tick) : 0;
     int boost = (int)(waited / (uint64_t)SCHED_AGE_STEP_TICKS);
@@ -541,7 +553,7 @@ static bool queue_push_locked(struct percpu *cpu, struct proc *p) {
      * doing so on a second CPU's list made two CPUs pop one proc (K1). */
     if (!rq_mark(p)) return false;
     p->next_ready = 0;
-    p->enq_tick   = pit_ticks();       /* start the aging clock for this wait */
+    p->enq_tick   = sched_clock_ms();       /* start the aging clock for this wait */
 #ifdef CHROMIUM_BOOT
     p->enq_ns     = perf_now_ns();     /* slice 94: [wlat] wake->run stamp */
 #endif
@@ -556,7 +568,7 @@ static bool queue_push_locked(struct percpu *cpu, struct proc *p) {
 
 static bool queue_push_front_locked(struct percpu *cpu, struct proc *p) {
     if (!p || !rq_mark(p)) return false;
-    p->enq_tick   = pit_ticks();
+    p->enq_tick   = sched_clock_ms();
 #ifdef CHROMIUM_BOOT
     p->enq_ns     = perf_now_ns();     /* slice 94: [wlat] wake->run stamp */
 #endif
@@ -590,7 +602,7 @@ static void queue_unlink_locked(struct percpu *cpu, struct proc *prev,
 static bool pull_ok(const struct proc *p, int floor, uint64_t now);
 static struct proc *queue_take_locked(struct percpu *cpu, uint8_t tag,
                                       bool steal, int floor) {
-    uint64_t now = pit_ticks();
+    uint64_t now = sched_clock_ms();
     for (int pass = 0; pass < 4; pass++) {
         struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
         int best_eff = 0, hops = 0;
@@ -816,7 +828,7 @@ static struct percpu *remote_better(struct percpu *me, int than, uint64_t now,
  * bound. NULL when nothing outranks ours. The proc comes back claimed
  * (on_cpu = us). */
 static struct proc *pull_better(struct percpu *me, int floor) {
-    uint64_t now = pit_ticks();
+    uint64_t now = sched_clock_ms();
     uint64_t f = spin_lock_irqsave(&me->ready_lock);
     int mine = queue_best_eff_locked(me, false, now, EFF_NONE);
     spin_unlock_irqrestore(&me->ready_lock, f);
@@ -1112,7 +1124,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
         __atomic_fetch_add(&g_wlat_hist[b], 1, __ATOMIC_RELAXED);
         if (b >= 4 && g_wtail_logged < 6) {
             g_wtail_logged++;
-            uint64_t nt = pit_ticks();
+            uint64_t nt = sched_clock_ms();
             kprintf("[wtail] pid=%d '%s' pickable %lums (prio=%d io=%d "
                     "aged=%lums onrq=%d)\n",
                     to->pid, to->name, (unsigned long)(wl / 1000000ull),
@@ -1554,7 +1566,7 @@ static inline __attribute__((always_inline)) void sched_yield_common(bool rotate
          * outranks cur as it would be requeued (aging 0): then the slow path
          * below requeues cur and pulls that one (finding 169). */
         !(rotate && g_ap_run_enabled && !cur->is_idle &&
-          remote_better(me, cur->prio + cur->io_boost, pit_ticks(), cur->prio))) {
+          remote_better(me, cur->prio + cur->io_boost, sched_clock_ms(), cur->prio))) {
         /* Slice 88: this early return used to skip the futex-timeout sweep
          * and poll_tick ENTIRELY -- they were only driven from the slow
          * path below and from sched_yield_fast's decline window. That held
@@ -2026,8 +2038,8 @@ void sched_tick(struct regs *r) {
             if (now - last_deep > 60000000000ull) {
             last_deep = now;
             extern struct proc g_proc[];
-            uint64_t nt = pit_ticks();
-            kprintf("[hb %lu ms] chrome thread states (pit=%lu) logdrop=%lu:\n",
+            uint64_t nt = sched_clock_ms();
+            kprintf("[hb %lu ms] chrome thread states (age-ms=%lu) logdrop=%lu:\n",
                     now / 1000000ull, nt, (unsigned long)serial_dropped());
             for (int i = 0; i < PROC_MAX; i++) {
                 struct proc *p = &g_proc[i];

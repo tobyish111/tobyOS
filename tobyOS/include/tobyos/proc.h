@@ -715,7 +715,8 @@ struct proc {
      * timer interrupts ring 3 forces a preemptive yield -- this is what gives
      * CPU-bound procs fair timeslicing on the APs (which have no PIT).
      *
-     * `enq_tick` is the global tick at which this proc was last made READY and
+     * `enq_tick` is the time (sched_clock_ms, the TSC's milliseconds -- the
+     * name is from when it was a PIT tick) at which this proc was last made READY and
      * pushed onto a ready queue. The dispatcher ages a long-waiting proc's
      * *effective* priority upward from this stamp so a busy high-priority proc
      * can never starve a low-priority one. */

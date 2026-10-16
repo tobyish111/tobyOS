@@ -47,8 +47,9 @@ struct regs;
 /* ---- Timeslice + anti-starvation tunables ----------------------------------
  * Quantum is counted in LAPIC-timer ticks (the per-CPU 100 Hz periodic timer,
  * 10 ms/tick). Higher-priority classes get a longer slice, but every class is
- * preemptible so nothing monopolises a core. Aging is counted in PIT ticks
- * (the global 1000 Hz wall clock, pit_ticks(), 1 ms/tick): a READY proc's
+ * preemptible so nothing monopolises a core. Aging is counted in milliseconds
+ * of the TSC clock (sched.c sched_clock_ms -- not the PIT, which loses ticks
+ * under emulation; finding 169): a READY proc's
  * effective priority climbs one level for every SCHED_AGE_STEP_TICKS it has
  * waited without running, capped at SCHED_AGE_MAX_BOOST -- enough for a starved
  * IDLE proc to eventually out-rank a running RT proc, which bounds worst-case
