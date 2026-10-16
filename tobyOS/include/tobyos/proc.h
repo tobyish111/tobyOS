@@ -742,6 +742,12 @@ struct proc {
      * burns a whole quantum (CPU-bound) has the boost cleared. Bounded to one
      * priority class so it can't starve anything; aging still applies on top. */
     int             io_boost;
+    /* Finding 169: the quantum ran out while this proc was in the kernel (a
+     * system call, a fault). The tick cannot switch there -- the proc may
+     * hold the BKL or a lock -- so it leaves this for the system call's way
+     * out (syscall_dispatch), which rotates then: Linux's TIF_NEED_RESCHED.
+     * Cleared when the proc is switched in. Struct grew: CLEAN BUILD. */
+    uint8_t         need_resched;
 
     /* ---- Milestone 19: performance metrics ---------------------
      *

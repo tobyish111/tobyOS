@@ -23269,6 +23269,19 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         syscall_service_input();
     }
 
+    /* Finding 169: the time slice ran out inside this system call (the
+     * tick marked need_resched; it cannot switch in kernel mode). Rotate
+     * now, holding only the BKL, which sched_rotate drops for the switch --
+     * Linux's exit-to-user check. Before the signal check below, so a signal
+     * that arrives while we wait for the CPU still goes out on this return. */
+    {
+        struct proc *rp = current_proc();
+        if (rp && !rp->is_idle && rp->need_resched) {
+            rp->need_resched = 0;
+            sched_rotate();
+        }
+    }
+
     /* Safe point #1: every syscall return runs through here. If the
      * kernel (or another proc, or the keyboard IRQ) sent us a signal
      * during the body, deliver it now -- for a caught signal this pushes a

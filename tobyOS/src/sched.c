@@ -586,8 +586,10 @@ static void queue_unlink_locked(struct percpu *cpu, struct proc *prev,
  *
  * The returned proc's on_cpu is already `tag`: the caller MUST either switch
  * into it (do_switch) or release it. */
+#define EFF_NONE (-1000)     /* no candidate; as a floor, no class limit */
+static bool pull_ok(const struct proc *p, int floor, uint64_t now);
 static struct proc *queue_take_locked(struct percpu *cpu, uint8_t tag,
-                                      bool steal) {
+                                      bool steal, int floor) {
     uint64_t now = pit_ticks();
     for (int pass = 0; pass < 4; pass++) {
         struct proc *best = 0, *best_prev = 0, *prev = 0, *p = cpu->ready_head;
@@ -638,6 +640,9 @@ static struct proc *queue_take_locked(struct percpu *cpu, uint8_t tag,
                 p = nx;                                     /* prev unchanged */
                 continue;
             }
+            /* finding 169's pull: a class below `floor` only at the
+             * starvation bound (pull_ok) */
+            if (!pull_ok(p, floor, now)) { prev = p; p = nx; continue; }
             int eff = eff_prio(p, now);
             if (!best || eff > best_eff) { best = p; best_prev = prev; best_eff = eff; }
             prev = p;
@@ -659,12 +664,12 @@ static struct proc *queue_take_locked(struct percpu *cpu, uint8_t tag,
 
 static inline struct proc *queue_pop_locked(struct percpu *cpu,
                                             struct percpu *me) {
-    return queue_take_locked(cpu, cpu_tag(me), false);
+    return queue_take_locked(cpu, cpu_tag(me), false, EFF_NONE);
 }
 
 static inline struct proc *queue_steal_locked(struct percpu *cpu,
                                               struct percpu *me) {
-    return queue_take_locked(cpu, cpu_tag(me), true);
+    return queue_take_locked(cpu, cpu_tag(me), true, EFF_NONE);
 }
 
 static bool queue_remove_locked(struct percpu *cpu, struct proc *p) {
@@ -737,6 +742,90 @@ static struct proc *steal_one(struct percpu *me) {
         if (p) return p;
     }
     return 0;
+}
+
+/* ---- Finding 169: a busy CPU's end of slice looks at the other queues ----
+ *
+ * Every new or woken proc is queued on the BSP (enq_target_for), and only a
+ * CPU with nothing of its own ever took from another queue: a busy AP, at
+ * the end of a slice, put its proc back on its own (empty) queue and popped
+ * it again. With three busy procs and sshd on four CPUs, a spawned `date`
+ * sat on the BSP's queue behind whatever the BSP ran -- for 74 s under
+ * QEMU. Now the end of a slice (sched_rotate) takes the best proc waiting on
+ * ANY queue when it outranks the best on its own; aging (+1 per 60 ms
+ * waited) and the interactivity boost do the ranking, so a waiting proc
+ * reaches the next CPU whose slice ends. Linux balances the same way,
+ * pulling to the CPU that reschedules. */
+
+/* May a proc waiting on another CPU's queue displace one of class
+ * `floor` there? Within a class, or above, aging and the interactivity
+ * boost decide as on any queue. A LOWER class only once its aging is
+ * maxed out -- SCHED_AGE_MAX_BOOST steps, 300 ms waited: the starvation
+ * bound -- so classes keep their weight where a spare CPU serves the
+ * lower one. Without this, three HIGH and three LOW hogs on four CPUs
+ * (kernel.c SCHEDPRIO_BOOT) gave HIGH 2.0x LOW's CPU where the old
+ * scheduler gave 2.7x and Linux (nice -10 / 10) 2.9x: aged LOW procs were
+ * pulled onto the HIGH procs' CPUs. Linux's balancer does not move nice 10
+ * work onto a CPU busy with nice -10 work either. */
+static bool pull_ok(const struct proc *p, int floor, uint64_t now) {
+    if (floor == EFF_NONE || p->prio >= floor) return true;
+    uint64_t waited = now > p->enq_tick ? now - p->enq_tick : 0;
+    return waited >= (uint64_t)SCHED_AGE_STEP_TICKS * SCHED_AGE_MAX_BOOST;
+}
+
+/* The best effective priority a pop (steal = false) or a steal of cpu's
+ * queue would take now -- the candidates queue_take_locked weighs, `floor`
+ * as pull_ok has it -- or EFF_NONE. Unlinks and claims nothing. Caller
+ * holds cpu's ready_lock. */
+static int queue_best_eff_locked(struct percpu *cpu, bool steal, uint64_t now,
+                                 int floor) {
+    int best = EFF_NONE, hops = 0;
+    for (struct proc *p = cpu->ready_head; p && hops++ < 2 * PROC_MAX; p = p->next_ready) {
+        if (p->dying || p->state != PROC_READY) continue;
+        if (__atomic_load_n(&p->on_cpu, __ATOMIC_ACQUIRE)) continue;
+        if (steal && p->is_idle) continue;
+        if (!pull_ok(p, floor, now)) continue;
+        int e = eff_prio(p, now);
+        if (e > best) best = e;
+    }
+    return best;
+}
+
+/* The other CPU whose queue holds the best stealable proc allowed past
+ * `floor` (pull_ok), if that proc's effective priority is above `than`;
+ * else NULL. One lock at a time, never two. */
+static struct percpu *remote_better(struct percpu *me, int than, uint64_t now,
+                                    int floor) {
+    uint32_t n = smp_online_count();
+    struct percpu *victim = 0;
+    int best = than;
+    for (uint32_t i = 1; i < n; i++) {
+        struct percpu *o = smp_cpu_mut((me->cpu_idx + i) % n);
+        if (!o || !__atomic_load_n(&o->ready_head, __ATOMIC_ACQUIRE)) continue;
+        uint64_t f = spin_lock_irqsave(&o->ready_lock);
+        int e = queue_best_eff_locked(o, true, now, floor);
+        spin_unlock_irqrestore(&o->ready_lock, f);
+        if (e > best) { best = e; victim = o; }
+    }
+    return victim;
+}
+
+/* Take the best proc waiting on another CPU's queue if it outranks the best
+ * on our own (which, at a rotation, includes the proc that just ran), a
+ * lower class than `floor` (the proc that just ran) only at the starvation
+ * bound. NULL when nothing outranks ours. The proc comes back claimed
+ * (on_cpu = us). */
+static struct proc *pull_better(struct percpu *me, int floor) {
+    uint64_t now = pit_ticks();
+    uint64_t f = spin_lock_irqsave(&me->ready_lock);
+    int mine = queue_best_eff_locked(me, false, now, EFF_NONE);
+    spin_unlock_irqrestore(&me->ready_lock, f);
+    struct percpu *victim = remote_better(me, mine, now, floor);
+    if (!victim) return 0;
+    uint64_t f2 = spin_lock_irqsave(&victim->ready_lock);
+    struct proc *p = queue_take_locked(victim, cpu_tag(me), true, floor);
+    spin_unlock_irqrestore(&victim->ready_lock, f2);
+    return p;
 }
 
 /* Context-switch from `from` to `to` on CPU `me`: per-CPU current/TSS RSP0/
@@ -1036,6 +1125,7 @@ static void do_switch(struct percpu *me, struct proc *from, struct proc *to,
 #endif
     to->state       = PROC_RUNNING;
     to->quantum_left = sched_quantum_for(to->prio);  /* fresh timeslice */
+    to->need_resched = 0;                            /* finding 169 */
     /* Slice 39: `to` is live-on-CPU (claimed above, before it could possibly
      * be picked again). Remember `from` so the code that runs AFTER the
      * register switch (post-switch line below, or a first-entry trampoline)
@@ -1384,13 +1474,28 @@ int sched_yield_fast(void) {
     return 1;
 }
 
-void sched_yield(void) {
+/* sched_yield and sched_rotate share this body. `rotate` is the end of a
+ * time slice (sched_tick, a system call's need_resched): the one place a
+ * busy CPU also weighs the other CPUs' queues (pull_better, finding 169) --
+ * a check too costly for every yield, which kernel wait loops make by the
+ * hundred thousand. Inlined so __builtin_return_address(0) below still
+ * names sched_yield's caller in the [dsched] trace. */
+static inline __attribute__((always_inline)) void sched_yield_common(bool rotate) {
     struct proc   *cur = current_proc();
     struct percpu *me  = smp_this_cpu();
 
     /* M28C: scheduler heartbeat for the watchdog. Single store -- safe
      * even on the fast path below. */
     wdog_kick_sched();
+
+    /* Finding 169: a rotation is the end of cur's slice. If cur keeps the
+     * CPU (nothing outranks it anywhere), it keeps it for a fresh slice --
+     * do_switch would have given one -- or every later tick would mark it
+     * need_resched again and every system call it makes would rotate. */
+    if (rotate && cur) {
+        cur->need_resched = 0;
+        cur->quantum_left = sched_quantum_for(cur->prio);
+    }
 
     /* Linux slice 3: fire due alarm(2) deadlines.
      *
@@ -1444,7 +1549,12 @@ void sched_yield(void) {
      * worst case we miss a concurrent enqueue and yield on the next
      * tick, which is fine. */
     if (cur && cur->state == PROC_RUNNING &&
-        __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0) {
+        __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE) == 0 &&
+        /* ...unless, at the end of a slice, another queue holds a proc that
+         * outranks cur as it would be requeued (aging 0): then the slow path
+         * below requeues cur and pulls that one (finding 169). */
+        !(rotate && g_ap_run_enabled && !cur->is_idle &&
+          remote_better(me, cur->prio + cur->io_boost, pit_ticks(), cur->prio))) {
         /* Slice 88: this early return used to skip the futex-timeout sweep
          * and poll_tick ENTIRELY -- they were only driven from the slow
          * path below and from sched_yield_fast's decline window. That held
@@ -1498,7 +1608,9 @@ void sched_yield(void) {
      * tick (quantum_left == 0, after sched_tick already cleared the boost), so
      * they get no credit. We're past the fast path, so a RUNNING proc here is
      * genuinely ceding the core to a waiting peer. */
-    if (cur && cur->quantum_left > 0 &&
+    /* (Never for a rotation: its slice is spent; the fresh quantum set at
+     * the top is for keeping the CPU, not credit -- finding 169.) */
+    if (!rotate && cur && cur->quantum_left > 0 &&
         (cur->state == PROC_BLOCKED || cur->state == PROC_RUNNING))
         cur->io_boost = SCHED_IO_BOOST;
 
@@ -1558,8 +1670,12 @@ void sched_yield(void) {
         spin_unlock_irqrestore(&me->ready_lock, f);
     }
 
-    struct proc *next;
-    {
+    struct proc *next = 0;
+    /* Finding 169: at the end of a slice, a better proc waiting on another
+     * CPU's queue goes first -- cur is already back on ours. */
+    if (rotate && g_ap_run_enabled && smp_online_count() > 1)
+        next = pull_better(me, cur ? cur->prio : EFF_NONE);
+    if (!next) {
         uint64_t f = spin_lock_irqsave(&me->ready_lock);
         next = queue_pop_locked(me, me);
         spin_unlock_irqrestore(&me->ready_lock, f);
@@ -1679,6 +1795,12 @@ void sched_yield(void) {
     do_switch(me, cur, next, had_bkl);   /* releases-already / reacquires BKL */
 #undef YIELD_RETURN
 }
+
+void sched_yield(void)  { sched_yield_common(false); }
+
+/* The end of a time slice: sched_tick's, or a system call's way out with
+ * need_resched set (finding 169). */
+void sched_rotate(void) { sched_yield_common(true); }
 
 /* ---------- AP idle loop ---------- */
 
@@ -2047,8 +2169,28 @@ void sched_tick(struct regs *r) {
      * blocked or exited, monopolising that core. Now its per-CPU LAPIC timer
      * burns down its quantum and rotates it for the next runnable proc. The
      * quantum was sized by class in do_switch (sched_quantum_for), so higher-
-     * priority procs get a proportionally longer slice. */
-    if (!r || (r->cs & 3) != 3) return;
+     * priority procs get a proportionally longer slice.
+     *
+     * FINDING 169: the quantum is spent in the kernel too. It used to count
+     * down on ring-3 ticks alone, so a proc that lives in system calls --
+     * `yes > /dev/null`, nearly all of it write(2) under QEMU -- almost never
+     * finished a slice: three of them on four CPUs kept their cores for
+     * seconds at a time, everything queued behind them waited (a `date`
+     * waited 74 s) and pid 0 with it. A kernel-mode tick now burns the slice
+     * as well and, when it is gone, marks the proc need_resched; the system
+     * call's way out rotates it (syscall_dispatch), Linux's
+     * exit-to-user check. */
+    if (!r || (r->cs & 3) != 3) {
+        struct proc *kc = me ? me->current : 0;
+        if (kc && !kc->is_idle && kc->state == PROC_RUNNING) {
+            if (kc->quantum_left > 0) kc->quantum_left--;
+            if (kc->quantum_left <= 0) {
+                kc->need_resched = 1;
+                kc->io_boost = 0;        /* a whole slice burned: CPU-bound */
+            }
+        }
+        return;
+    }
 
     struct proc *cur = current_proc();
     if (!cur || cur->is_idle) return;        /* never preempt pid 0 / ap_idle */
@@ -2093,6 +2235,8 @@ void sched_tick(struct regs *r) {
      * effective-priority runnable proc -- which also lets a higher-priority
      * proc that became ready mid-slice preempt cur here. do_switch resets the
      * winner's quantum on the way in. The user trap frame is already saved on
-     * this kstack; we resume here and iretq normally when cur is rescheduled. */
-    sched_yield();
+     * this kstack; we resume here and iretq normally when cur is rescheduled.
+     * sched_rotate, not sched_yield: the end of a slice is where a busy CPU
+     * also looks at the other CPUs' queues (finding 169). */
+    sched_rotate();
 }

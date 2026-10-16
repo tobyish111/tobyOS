@@ -105,6 +105,12 @@ void sched_boost_pid(int pid);
  * spins doing `sti; hlt` until an IRQ wakes someone up. */
 void sched_yield(void);
 
+/* The end of a time slice (sched_tick, or a system call's way out with
+ * need_resched set): sched_yield that also takes a better proc waiting on
+ * another CPU's queue, so work queued on the BSP reaches a busy AP whose
+ * slice ends (finding 169). */
+void sched_rotate(void);
+
 /* Slice 39: clear the on_cpu latch of the proc this CPU last switched away
  * from. Must be the FIRST scheduler-visible action of any code that starts
  * running via proc_context_switch's resume path -- do_switch calls it after
