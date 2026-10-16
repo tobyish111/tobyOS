@@ -22990,11 +22990,26 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
         struct proc *ftp = current_proc();
         if (ftp && ftp->personality == ABI_PERS_LINUX && !ftp->pending_signals) {
             long frv;
+            /* Finding 169: these ways out honour need_resched as the normal
+             * one does. A proc that lives on clock_gettime, stale futex
+             * WAITs or empty-queue yields spends its slice in here, and
+             * otherwise rotated only when a tick caught it in ring 3: on
+             * the EliteDesk three raw clock_gettime loops left a spawn at
+             * 15-18 ms where three CPU loops leave 1.8. No BKL is held, and
+             * sched_rotate needs none to switch. */
+#define FAST_EXIT_RESCHED()                                           \
+            do {                                                      \
+                if (ftp->need_resched && !ftp->is_idle) {             \
+                    ftp->need_resched = 0;                            \
+                    sched_rotate();                                   \
+                }                                                     \
+            } while (0)
             if (linux_fast_time_syscall(num, a1, a2, &frv)) {
                 { extern volatile uint64_t g_lx_fast_time; g_lx_fast_time++; }
                 ftp->syscall_count++;
                 perf_inc_total_syscalls();
                 wdog_kick_proc(ftp->pid);
+                FAST_EXIT_RESCHED();
                 cli();      /* match the normal return: mask before the .S unwind */
                 return frv;
             }
@@ -23012,6 +23027,7 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
                     ftp->syscall_count++;
                     perf_inc_total_syscalls();
                     wdog_kick_proc(ftp->pid);
+                    FAST_EXIT_RESCHED();
                     cli();
                     return frv;
                 }
@@ -23028,10 +23044,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
                     ftp->syscall_count++;
                     perf_inc_total_syscalls();
                     wdog_kick_proc(ftp->pid);
+                    FAST_EXIT_RESCHED();
                     cli();
                     return 0;
                 }
             }
+#undef FAST_EXIT_RESCHED
         }
     }
 
