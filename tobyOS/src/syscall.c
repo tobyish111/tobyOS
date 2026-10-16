@@ -23000,8 +23000,10 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
 #define FAST_EXIT_RESCHED()                                           \
             do {                                                      \
                 if (ftp->need_resched && !ftp->is_idle) {             \
+                    uint8_t why = ftp->need_resched;                  \
                     ftp->need_resched = 0;                            \
-                    sched_rotate();                                   \
+                    if (why == NEED_RESCHED_SLICE) sched_rotate();    \
+                    else sched_yield();                               \
                 }                                                     \
             } while (0)
             if (linux_fast_time_syscall(num, a1, a2, &frv)) {
@@ -23295,8 +23297,12 @@ long syscall_dispatch(long num, long a1, long a2, long a3, long a4, long a5) {
     {
         struct proc *rp = current_proc();
         if (rp && !rp->is_idle && rp->need_resched) {
+            /* the slice is over: rotate; the PIT wants this CPU's queue to
+             * run (pit.c): a plain yield */
+            uint8_t why = rp->need_resched;
             rp->need_resched = 0;
-            sched_rotate();
+            if (why == NEED_RESCHED_SLICE) sched_rotate();
+            else sched_yield();
         }
     }
 

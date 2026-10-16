@@ -21,6 +21,8 @@
 #include <tobyos/proc.h>
 #include <tobyos/xhci.h>
 #include <tobyos/perf.h>
+#include <tobyos/percpu.h>   /* finding 169: the BSP queue, need_resched */
+#include <tobyos/smp.h>      /* smp_this_cpu */
 
 #define PIT_CH0_DATA  0x40
 #define PIT_CMD       0x43
@@ -87,6 +89,23 @@ static void pit_irq(struct regs *r) {
         if (cur && cur->pid != 0) {
             sched_yield();
         }
+    } else {
+        /* FINDING 169: the same for a proc this tick caught in the kernel.
+         * It cannot be switched here (it may hold the BKL or a lock), so it
+         * is marked to yield -- when anything is waiting on this CPU's
+         * queue, pid 0 above all -- and does on its system call's way out:
+         * a plain sched_yield, as above, not the end-of-slice rotation (a
+         * rotation every tick also took work from other CPUs' queues, a
+         * thousand times a second; SCHEDPRIO lost its weighting once in two
+         * runs). Without it a proc living in system calls on the BSP kept
+         * pid 0, its sweeps and everything queued there waiting for its
+         * whole slice: on the EliteDesk three raw clock_gettime loops left
+         * spawns at 12-17 ms in one run of four, 2 ms in the others. */
+        struct proc *cur = current_proc();
+        struct percpu *me = smp_this_cpu();
+        if (cur && cur->pid != 0 && !cur->is_idle && me && !cur->need_resched &&
+            __atomic_load_n(&me->ready_head, __ATOMIC_ACQUIRE))
+            cur->need_resched = NEED_RESCHED_YIELD;
     }
 }
 

@@ -747,8 +747,14 @@ struct proc {
      * system call, a fault). The tick cannot switch there -- the proc may
      * hold the BKL or a lock -- so it leaves this for the system call's way
      * out (syscall_dispatch), which rotates then: Linux's TIF_NEED_RESCHED.
-     * Cleared when the proc is switched in. Struct grew: CLEAN BUILD. */
+     * Cleared when the proc is switched in. Struct grew: CLEAN BUILD.
+     * The value says why: NEED_RESCHED_SLICE, the slice is over (rotate:
+     * sched_rotate, which may take work from other CPUs' queues), or
+     * NEED_RESCHED_YIELD, the PIT wants this CPU's own queue to run -- pid
+     * 0 above all -- which is a plain sched_yield, as its ring-3 rule is. */
     uint8_t         need_resched;
+#define NEED_RESCHED_SLICE 1
+#define NEED_RESCHED_YIELD 2
 
     /* ---- Milestone 19: performance metrics ---------------------
      *

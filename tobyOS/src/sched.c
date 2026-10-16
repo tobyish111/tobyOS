@@ -2197,7 +2197,7 @@ void sched_tick(struct regs *r) {
         if (kc && !kc->is_idle && kc->state == PROC_RUNNING) {
             if (kc->quantum_left > 0) kc->quantum_left--;
             if (kc->quantum_left <= 0) {
-                kc->need_resched = 1;
+                kc->need_resched = NEED_RESCHED_SLICE;   /* over a YIELD */
                 kc->io_boost = 0;        /* a whole slice burned: CPU-bound */
             }
         }
