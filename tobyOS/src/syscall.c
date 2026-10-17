@@ -1574,7 +1574,11 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
 
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
-    if (rc != VFS_OK) return -1;
+    /* WHY, not -1: a directory without read permission is EACCES, a file
+     * is ENOTDIR, as opendir(3) says them on Linux -- -1 was every error,
+     * and libtoby called it ENOENT, so `ls` of a 0700 directory not one's
+     * own said "No such file or directory" (batch 30, logs/utilgate/ls.sh) */
+    if (rc != VFS_OK) return vfs_err_to_abi(rc);
 
     struct vfs_dirent ent;
     int written = 0;
@@ -3683,7 +3687,10 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
      * native tool and a Linux one agree (linux_emit_stat). */
     dst->ctime = src->ctime;
     dst->blocks = ((uint64_t)src->size + 511) / 512;
-    dst->blksize = 512;
+    /* the preferred I/O size, as Linux gives a file on ext4 or tmpfs: GNU
+     * shred rounds a file up to it, and cp and stat %o read it (512 made
+     * `shred f` of a 2-byte file 512 bytes where Linux makes it 4096) */
+    dst->blksize = 4096;
 }
 _Static_assert(offsetof(struct abi_stat, ctime) == ABI_STAT_V1_SIZE,
                "SYS_STAT/FSTAT/LSTAT write the struct up to ctime");
@@ -7755,7 +7762,7 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_uid     = userns_cur_uid(vs->uid);   /* slice 11 */
     st.st_gid     = userns_cur_gid(vs->gid);   /* slice 11 */
     st.st_size    = (int64_t)vs->size;
-    st.st_blksize = 512;
+    st.st_blksize = 4096;                      /* as the native stat */
     st.st_blocks  = (int64_t)((vs->size + 511) / 512);
     /* Slice 6: report the real timestamps. These were left at 0, so every
      * file in the system claimed 1970-01-01 -- `ls -l` showed it, and

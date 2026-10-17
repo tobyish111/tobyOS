@@ -39,6 +39,14 @@ extern "C" {
 #define S_IROTH     0004
 #define S_IWOTH     0002
 #define S_IXOTH     0001
+/* The rest of POSIX's mode bits (batch 30: ls is GNU's now, and asks for
+ * them by name; programs spelled out 04000). */
+#define S_ISUID     04000
+#define S_ISGID     02000
+#define S_ISVTX     01000
+#define S_IRWXU     0700
+#define S_IRWXG     0070
+#define S_IRWXO     0007
 
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)

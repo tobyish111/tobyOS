@@ -308,10 +308,14 @@ int unsetenv(const char *name) {
     return 0;
 }
 
+/* putenv as glibc's: STRING itself goes in. A STRING with no '=' takes its
+ * name out (unsetenv), and an empty name is a name -- "=x" goes in as it is,
+ * which `env -i =x` shows (batch 30, logs/utilgate/env.sh); this refused
+ * both with EINVAL. */
 int putenv(char *string) {
     if (!string) { errno = EINVAL; return -1; }
     size_t klen = env_keylen(string);
-    if (klen == 0 || string[klen] != '=') { errno = EINVAL; return -1; }
+    if (string[klen] != '=') return klen ? unsetenv(string) : 0;
     if (env_take_ownership() < 0) { errno = ENOMEM; return -1; }
     int idx = env_find_index(string, klen);
     if (idx >= 0) {

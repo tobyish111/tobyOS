@@ -56,10 +56,9 @@ static int load(DIR *d) {
                           (long)DIR_WINDOW,
                           (long)d->have);
         if (r < 0) {
-            /* SYS_FS_READDIR returns -1 on any error (legacy). Best
-             * guess at errno -- we can't tell apart NOENT vs IO from
-             * the kernel today. */
-            errno = ENOENT;
+            /* SYS_FS_READDIR says why now (EACCES, ENOTDIR, ENOENT); it
+             * said -1 for everything, and this called that ENOENT */
+            errno = (int)-r;
             return -1;
         }
         d->have += (int)r;

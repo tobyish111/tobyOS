@@ -1503,6 +1503,13 @@ long sys_execve(const char *path, char *const argv[], char *const envp[]) {
     }
     long plen = (long)strlen(kpath);
     if (plen == 0) return -ABI_EINVAL;
+    /* The path as the caller wrote it: a script's interpreter is given
+     * THAT, as Linux's binfmt_script gives bprm->filename -- `./script`
+     * sees $0 as "./script", not the absolute path this resolved it to
+     * (batch 30, logs/utilgate/env.sh). */
+    char upath[ABI_PATH_MAX];
+    if (strncpy_from_user(upath, path, sizeof upath) < 0) return -ABI_EFAULT;
+    upath[sizeof upath - 1] = 0;
 
     /* THE EXECUTE BIT. execve checked none at all, so `touch f; ./f` as root
      * ran a mode-0644 file: the exec succeeded, bash fell back to treating
@@ -1657,8 +1664,8 @@ reread:;
             char **nargv = (char **)kmalloc((size_t)(nmax + 1) * sizeof(char *));
             if (!nargv) EXEC_RETURN(-ABI_ENOMEM);
             int nargc = binfmt_shebang_argv(interp, optarg[0] ? optarg : NULL,
-                                            kpath, kargc, kargv_buf,
-                                            nargv, nmax);
+                                            shebang_depth == 0 ? upath : kpath,
+                                            kargc, kargv_buf, nargv, nmax);
             if (nargc < 0) { kfree(nargv); EXEC_RETURN(-ABI_E2BIG); }
             char **packed = kvec_pack(nargv, nargc);
             kfree(nargv);                           /* borrowed pointers only */

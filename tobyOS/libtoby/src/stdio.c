@@ -584,13 +584,17 @@ static int ftrylock_(FILE *f) {
     return !__atomic_exchange_n(&f->lock, 1, __ATOMIC_ACQUIRE);
 }
 
-/* write(2) until done, WITHOUT the pending-output hook (this IS the flush). */
+/* write(2) until done, WITHOUT the pending-output hook (this IS the flush).
+ * A failure leaves errno saying why, as fflush's must: it said nothing, so
+ * `uniq f > /dev/full` reported "write error" where GNU's says "write
+ * error: No space left on device" (batch 30, logs/utilgate/uniq.sh). */
 static long raw_write_all(int fd, const void *buf, size_t n) {
     const char *p = (const char *)buf;
     size_t left = n;
     while (left > 0) {
         long r = toby_sc_raw3(ABI_SYS_WRITE, fd, (long)(uintptr_t)p, (long)left);
-        if (r <= 0) return -1;
+        if (r < 0) { errno = (int)-r; return -1; }
+        if (r == 0) { errno = EIO; return -1; }
         p += r;
         left -= (size_t)r;
     }
