@@ -20,6 +20,7 @@
 #include <tobyos/pipe.h>
 #include <tobyos/users.h>
 #include <tobyos/proc.h>
+#include <tobyos/utmp.h>
 #include <tobyos/sched.h>
 #include <tobyos/cpu.h>
 #include <tobyos/file.h>
@@ -203,6 +204,8 @@ static uint32_t        g_recv_seq;
 /* Release the pty master. The child's own fds are closed by its exit path;
  * dropping this reference is what lets the pair be reused. */
 static void ssh_channel_teardown(void) {
+    /* the login is over: its utmp record is a dead process's */
+    if (g_chan.child_pid > 0) utmp_logout(g_chan.child_pid);
 #ifdef SSH_PTY_DIAG
     kprintf("[ptydiag] ssh teardown idx=%d child=%d\n",
             g_chan.pty_idx, g_chan.child_pid);
@@ -1691,6 +1694,17 @@ static bool ssh_spawn_shell(void) {
     g_chan.pty_idx = idx;
     g_chan.on_pipes = pipes;
     g_chan.child_pid = pid;
+    /* A LOGIN WITH A TERMINAL IS IN utmp, as sshd records one: the line,
+     * the user, the client's address (a command on pipes is not a login) */
+    if (!pipes) {
+        char line[16], host[20];
+        uint32_t ip = g_cli ? tcp_remote_ip_be(g_cli) : 0;
+        ksnprintf(line, sizeof line, "pts/%d", idx);
+        host[0] = 0;
+        if (ip) ksnprintf(host, sizeof host, "%u.%u.%u.%u", ip & 0xffu,
+                          (ip >> 8) & 0xffu, (ip >> 16) & 0xffu, ip >> 24);
+        utmp_login(pid, line, g_auth_user, host, ip);
+    }
     if (pipes)
         kprintf("[ssh] /bin/tsh pid=%d on pipes for '%s'%s\n",
                 pid, g_auth_user, g_chan.exec_mode ? " (exec)" : "");

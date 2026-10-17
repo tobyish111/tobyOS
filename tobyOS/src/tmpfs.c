@@ -132,6 +132,8 @@ struct tmpfs_mount {
     size_t              bytes;     /* data bytes currently held */
     size_t              max_bytes;
     bool                reported_full;  /* census printed once, not per create */
+    uint32_t            root_mode; /* the mount root's permissions (mode=) */
+    uint64_t            root_time; /* when it was mounted: the root's times */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
@@ -611,7 +613,10 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
     if (!*norm) {                                  /* the mount root */
         memset(out, 0, sizeof *out);
         out->type = VFS_TYPE_DIR;
-        out->mode = 0777u | VFS_MODE_VALID;
+        out->mode = m->root_mode | VFS_MODE_VALID;
+        /* its times are the mount's, as Linux's tmpfs root has (they
+         * were 0, so `ls -ld /tmp` said Jan 1 1970) */
+        out->mtime = out->atime = out->ctime = m->root_time;
         out->ino  = m->max_nodes + 1u;             /* past every node's */
         out->dev  = dev;
         return VFS_OK;
@@ -918,6 +923,24 @@ int tmpfs_mount_at(const char *path, const char *opts)
         return VFS_ERR_INVAL;
     }
 
+    /* mode=OCTAL, as mount(8) takes it: the root's permissions. 0777
+     * without it, as every tmpfs here has been; /run and /var are 0755 */
+    uint32_t root_mode = 0777u;
+    {
+        const char *mp = opts ? tfind_opt(opts, "mode=") : 0;
+        if (mp) {
+            mp += 5;
+            uint32_t v = 0;
+            int nd = 0;
+            for (; *mp >= '0' && *mp <= '7'; mp++, nd++) v = v * 8u + (uint32_t)(*mp - '0');
+            if (!nd || (*mp && *mp != ',') || v > 07777u) {
+                kprintf("[tmpfs] unparseable mode= option -- refusing\n");
+                return VFS_ERR_INVAL;
+            }
+            root_mode = v;
+        }
+    }
+
     struct tmpfs_mount *m = NULL;
     for (size_t i = 0; i < TMPFS_MAX_MOUNTS && !m; i++)
         if (!g_tmpfs[i].used) m = &g_tmpfs[i];
@@ -939,6 +962,8 @@ int tmpfs_mount_at(const char *path, const char *opts)
     m->max_nodes = max_nodes;
     m->bytes = 0;
     m->max_bytes = max_bytes;
+    m->root_mode = root_mode;
+    m->root_time = tmpfs_now_secs();
     m->used = true;
 
     int rc = vfs_mount(path, &tmpfs_ops, m);

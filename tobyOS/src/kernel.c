@@ -5014,6 +5014,11 @@ void _start(void) {
             extern int devfs_init(void);
             (void)devfs_init();
         }
+        /* /run (with utmp) and /var, and /var/run -> /run: src/utmp.c */
+        {
+            extern void utmp_init(void);
+            utmp_init();
+        }
         rc = tmpfs_mount_at("/dev/shm", 0);
         kprintf("[boot] /dev/shm: %s\n",
                 rc == VFS_OK ? "tmpfs mounted (POSIX shm live)"

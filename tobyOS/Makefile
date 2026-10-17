@@ -257,6 +257,7 @@ C_SRCS := src/kernel.c \
           src/service.c \
           src/session.c \
           src/users.c \
+          src/utmp.c \
           src/pkg.c \
           src/cap.c \
           src/perf.c \

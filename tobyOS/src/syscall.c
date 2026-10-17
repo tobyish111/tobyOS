@@ -8519,6 +8519,12 @@ static long lx_realtime_set(int64_t sec, int64_t nsec) {
     int64_t step_ms = (int64_t)(want - was) / 1000000;
     kprintf("[time] clock set to %lld.%09lld by pid %d (step %lld ms)\n",
             (long long)sec, (long long)nsec, p ? p->pid : 0, (long long)step_ms);
+    /* the boot time moved with the clock (/proc/stat's btime does): so does
+     * utmp's boot record, which `who -b` reads */
+    {
+        extern void utmp_refresh(void);
+        utmp_refresh();
+    }
     return 0;
 }
 

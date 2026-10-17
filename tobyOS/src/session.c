@@ -35,6 +35,7 @@
 #include <tobyos/slog.h>
 #include <tobyos/pit.h>
 #include <tobyos/abi/abi.h>
+#include <tobyos/utmp.h>
 
 #define LOGIN_SERVICE_NAME "login"
 #define LOGIN_PROGRAM_PATH "/bin/login"
@@ -222,8 +223,13 @@ int session_login(const char *username, const char *password) {
      * automatically de-tagged from the new session. */
     g.id += 1;
     g.active = true;
-    { extern uint64_t lx_realtime_ns(void);
-      g.login_epoch_s = lx_realtime_ns() / 1000000000ull; }
+    /* the wall clock's seconds: lx_realtime_ns takes the monotonic now,
+     * and was called here with nothing, so the login time was whatever
+     * the register held */
+    { extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+      extern uint64_t perf_now_ns(void);
+      g.login_epoch_s = lx_realtime_ns(perf_now_ns()) / 1000000000ull; }
+    utmp_login(0, ":0", u->name, ":0", 0);
     g.uid    = u->uid;
     g.gid    = u->gid;
     copy_capped(g.username, u->name, SESSION_USER_MAX);
@@ -293,6 +299,7 @@ int session_logout(void) {
     g.username[0] = '\0';
     g.uid = 0;
     g.gid = 0;
+    utmp_logout(0);
     kprintf("[session] session %d closed (%d procs signalled)\n", sid, n_killed);
 
     {
