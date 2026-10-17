@@ -25,6 +25,7 @@
 #include <tobyos/proc.h>
 #include <tobyos/file.h>
 #include <tobyos/pty.h>       /* pty_file_index: /proc/PID/fd's /dev/pts/N */
+#include <tobyos/signal.h>    /* signal_get_foreground: stat tpgid on the console */
 #include <tobyos/heap.h>
 #include "../build/kbuild_id.h"   /* TOBYOS_BUILD_ID -- see the Makefile */
 #include <tobyos/klibc.h>
@@ -1141,10 +1142,35 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
          * the session is the login session id (there is no setsid(2)
          * session distinct from it here), which is also what a bare `ps`
          * uses in place of "the invoker's terminal". */
-        APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(p->pgid));  /*  5 pgrp */
-        APPEND_STR(" "); APPEND_INT(p->session_id);            /*  6 session */
-        APPEND_STR(" 0");                    /*  7 tty_nr      */
-        APPEND_STR(" -1");                   /*  8 tpgid       */
+        /* Batch 30: fields 5-8 are what the system calls say, as on Linux
+         * (logs/b30/pidprobe-*.out). pgrp is getpgrp()'s answer -- a pgid
+         * of 0 reads as the process's own pid everywhere else, so it does
+         * here (sshd's said 0); session is getsid()'s, the POSIX session
+         * setsid(2) makes -- it was session_id, the GUI login session, so
+         * every process said 0 beside getsid's 7; tty_nr and tpgid are the
+         * controlling terminal's device (Linux's encoding: a pty is 136,N;
+         * the console 5,1, as /dev has them) and foreground group, 0 and
+         * -1 with no terminal -- they were 0 and -1 always, under script(1)'s
+         * pty too. */
+        {
+            int pg = p->pgid > 0 ? p->pgid : p->pid;
+            APPEND_STR(" "); APPEND_INT(pid_vnr_of_kpid(pg));           /*  5 pgrp */
+            APPEND_STR(" "); APPEND_INT(p->sid > 0 ? pid_vnr_of_kpid(p->sid) : 0); /* 6 session */
+            int tty_nr = 0, tpgid = -1;
+            if (p->ctty_kind == PROC_CTTY_PTY &&
+                pty_ctty_live(p->ctty_index, p->ctty_gen)) {
+                uint32_t mn = (uint32_t)p->ctty_index;
+                tty_nr = (int)((mn & 0xffu) | (136u << 8) | ((mn & ~0xffu) << 12));
+                int fg = pty_fg_pgrp(p->ctty_index);
+                if (fg > 0) tpgid = pid_vnr_of_kpid(fg);
+            } else if (p->ctty_kind == PROC_CTTY_CONSOLE) {
+                tty_nr = (int)(1u | (5u << 8));
+                int fg = signal_get_foreground();
+                if (fg > 0) tpgid = pid_vnr_of_kpid(fg);
+            }
+            APPEND_STR(" "); APPEND_INT(tty_nr);                         /*  7 tty_nr */
+            APPEND_STR(" "); APPEND_INT(tpgid);                          /*  8 tpgid */
+        }
         APPEND_STR(" 0");                    /*  9 flags       */
         APPEND_STR(" 0");                    /* 10 minflt      */
         APPEND_STR(" 0");                    /* 11 cminflt     */
@@ -1956,21 +1982,20 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
     (void)mnt;
     if (!path || path[0] != '/' || !buf || bufsz == 0) return VFS_ERR_INVAL;
 
-    /* Bare /proc/self -> /proc/<pid> -- the pid in the READER's namespace
+    /* Bare /proc/self -> <pid> -- the pid in the READER's namespace
      * (2026-08-22: this was the one site still writing the HOST pid,
      * against slice 10's rule; inside a pid namespace the link then named
-     * a process the reader cannot even see). */
+     * a process the reader cannot even see). Relative, as Linux's: the
+     * link says "1234", not "/proc/1234" (batch 30, logs/b30/pidprobe-
+     * wsl.out) -- a program that reads it for its own pid got a path. The
+     * VFS resolves a relative target against the link's directory. */
     if (strcmp(path, "/self") == 0) {
         struct proc *p = current_proc();
         char pidstr[16];
         int pl = int_to_str(pidstr, sizeof(pidstr), p ? pid_vnr(p) : 0);
-        int n = 0;
-        const char *pre = "/proc/";
-        size_t prelen = strlen(pre);
-        if (prelen + (size_t)pl + 1 > bufsz) return VFS_ERR_INVAL;
-        memcpy(buf, pre, prelen); n = (int)prelen;
-        memcpy(buf + n, pidstr, (size_t)pl); n += pl;
-        buf[n] = '\0';
+        if ((size_t)pl + 1 > bufsz) return VFS_ERR_INVAL;
+        memcpy(buf, pidstr, (size_t)pl);
+        buf[pl] = '\0';
         return VFS_OK;
     }
 

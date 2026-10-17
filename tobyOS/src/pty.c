@@ -923,6 +923,12 @@ uint32_t pty_gen_of(int index) {
     return (index >= 0 && index < PTY_MAX) ? g_pty_gen[index] : 0;
 }
 
+/* The foreground process group of pair INDEX (TIOCGPGRP's answer), 0 if
+ * the pair is not in use. /proc/PID/stat's tpgid (procfs.c). */
+int pty_fg_pgrp(int index) {
+    return (index >= 0 && index < PTY_MAX && g_ptys[index].used) ? g_ptys[index].pgrp : 0;
+}
+
 bool pty_ctty_live(int index, uint32_t gen) {
     return index >= 0 && index < PTY_MAX && g_ptys[index].used &&
            g_ptys[index].master_refs > 0 && g_pty_gen[index] == gen;

@@ -37,7 +37,9 @@ int main(int argc, char **argv) {
     {
         char lnk[64] = {0}, want[32];
         ssize_t n = readlink("/proc/self", lnk, sizeof lnk - 1);
-        snprintf(want, sizeof want, "/proc/%d", (int)getpid());
+        /* Linux's link is RELATIVE -- "1234", not "/proc/1234" (batch 30,
+         * logs/b30/pidprobe-wsl.out); this asked for tobyOS's old answer */
+        snprintf(want, sizeof want, "%d", (int)getpid());
         printf("procdev: readlink(/proc/self)='%s' want='%s'\n", lnk, want);
         if (n > 0 && strcmp(lnk, want) == 0) bits |= 1;
     }

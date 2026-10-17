@@ -49,6 +49,7 @@ bool pty_slave_live(int index);
 struct proc;
 uint32_t pty_gen_of(int index);
 bool     pty_ctty_live(int index, uint32_t gen);   /* still that pair */
+int      pty_fg_pgrp(int index);   /* its foreground group, 0 if unused */
 /* Make pair INDEX P's controlling terminal and its foreground group P's --
  * sshd for a session, TIOCSCTTY, a session leader's first open. -EPERM (an
  * ABI errno) unless P leads its session and has no terminal (or this one);

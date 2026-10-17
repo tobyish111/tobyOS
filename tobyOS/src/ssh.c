@@ -1658,6 +1658,19 @@ static bool ssh_spawn_shell(void) {
          * `ssh host cmd` read the console where Linux says ENXIO. */
         if (cp) {
             cp->sid = pid;
+            /* ...AND ITS OWN PROCESS GROUP, as setsid() makes it on Linux
+             * (batch 30): the shell's pgid was the worker's, 4, while its
+             * session was its own, so every session process said pgrp 4,
+             * sid 7 -- a group outside its session, which POSIX does not
+             * have -- and an interactive session's foreground group was
+             * sshd's. The note above ("not its own process GROUP") dates
+             * from the teardown that killed the group: a recycled pid then
+             * matched a newcomer. Teardown walks the live tree now
+             * (proc_kill_tree) and signals no group, and the pid 0 stall of
+             * that time had two causes since fixed (tcp_close parking pid
+             * 0, finding 169). Set before pty_make_ctty, which makes this
+             * the terminal's foreground group. */
+            cp->pgid = pid;
             if (!pipes) {
                 (void)pty_make_ctty(cp, idx, true);
             } else {
