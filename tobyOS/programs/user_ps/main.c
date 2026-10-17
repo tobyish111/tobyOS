@@ -14,15 +14,23 @@
  * /proc/<pid>/stat reported pgrp, session and starttime as 0, so ELAPSED,
  * START and %CPU could not exist; that is fixed in the same commit.
  *
- * Supported: ps, ps ax, ps aux, ps -e/-A, ps -ef, ps -el, -o/--format with
- * every common column name and the `name=HEADER` form, -p/--pid, -C,
- * -u/-U/--user, --ppid, -L/-T (threads), -h/--no-headers, -w, --sort by
- * a numeric or string column (a leading - reverses), --version, --help.
+ * Supported: ps, ps ax, ps aux, ps -e/-A, ps -ef, ps -eF, ps -el, ps -ej,
+ * ps j, -o/--format with every common column name and the `name=HEADER`
+ * form, -p/--pid, -C, -u/-U/--user, --ppid, -L/-T (threads),
+ * -h/--no-headers, -w, --sort by a numeric or string column (a leading -
+ * reverses), --version, --help.
  *
  * Without a selection option procps shows "the invoker's processes on the
- * invoker's terminal". There is no controlling-tty record here, so the
- * terminal is approximated by the login session (/proc/<pid>/stat field 6),
- * which is what a tty stands for.
+ * invoker's terminal": the same effective uid and the same controlling
+ * terminal (/proc/<pid>/stat field 7, 0 for none -- so from a session with
+ * no terminal, the user's processes that have none either). Batch 30: that
+ * field is real now; it was approximated by the login session.
+ *
+ * The command column, as procps has it (logs/b30/ps-procps-wsl.out): the
+ * default, -l and -j formats end in CMD, the command's NAME (ucmd); -f, -F
+ * and the BSD formats show the whole command line (cmd, args). This ps
+ * showed the command line everywhere, so `ps -e | grep x` matched every
+ * shell whose -c string mentioned x (finding 170).
  *
  * Widths are classic procps (pid_max 32768): scripts do not depend on them,
  * eyes do. Exit status is procps's: 0 if at least one process was listed,
@@ -37,7 +45,7 @@
 #define HZ 100
 
 struct pinfo {
-    int  pid, ppid, pgrp, session, tty, tgid, nthreads;
+    int  pid, ppid, pgrp, session, tty, tpgid, tgid, nthreads;
     int  uid;
     char state;
     long utime, stime;          /* ticks */
@@ -58,7 +66,7 @@ static int g_nprocs, g_cap;
 static long   g_uptime_cs;      /* centiseconds since boot */
 static long   g_btime;          /* epoch seconds of boot */
 static long   g_memtotal_kb = 1;
-static int    g_self_pid, g_self_uid, g_self_session;
+static int    g_self_pid, g_self_uid, g_self_tty;
 
 /* ---- small readers ------------------------------------------------- */
 
@@ -131,6 +139,7 @@ static int read_stat(int pid, struct pinfo *pi) {
     pi->pgrp      = (int)f[4];
     pi->session   = (int)f[5];
     pi->tty       = (int)f[6];
+    pi->tpgid     = (int)f[7];
     pi->utime     = f[13];
     pi->stime     = f[14];
     pi->prio      = (int)f[17];
@@ -302,6 +311,8 @@ static void fmt_stat(const struct pinfo *pi, char *out, size_t cap) {
     else if (pi->nice > 0) out[n++] = 'N';
     if (pi->session == pi->pid) out[n++] = 's';
     if (pi->nthreads > 1) out[n++] = 'l';
+    /* '+': in its terminal's foreground group (procps: pgrp == tpgid) */
+    if (pi->tty && pi->tpgid > 0 && pi->pgrp == pi->tpgid) out[n++] = '+';
     out[n] = '\0';
     (void)cap;
 }
@@ -335,7 +346,8 @@ enum {
     C_PID, C_PPID, C_PGID, C_SID, C_USER, C_UID, C_RUSER, C_PCPU, C_PMEM, C_VSZ,
     C_RSS, C_TTY, C_STAT, C_S, C_START, C_LSTART, C_TIME, C_BSDTIME, C_ETIME,
     C_ETIMES, C_COMM, C_ARGS, C_CMD, C_NLWP, C_LWP, C_TGID, C_PRI, C_NI, C_C,
-    C_F, C_SZ, C_WCHAN, C_ADDR, C_CLS, C_RTPRIO, C_PSR, C_GID, C_GROUP
+    C_F, C_SZ, C_WCHAN, C_ADDR, C_CLS, C_RTPRIO, C_PSR, C_GID, C_GROUP,
+    C_UCMD, C_TPGID
 };
 
 static const struct col g_cols[] = {
@@ -360,7 +372,9 @@ static const struct col g_cols[] = {
     { "bsdtime",               "TIME",    6, 1, C_BSDTIME },
     { "etime",                 "ELAPSED", 11, 1, C_ETIME },
     { "etimes",                "ELAPSED", 7, 1, C_ETIMES },
-    { "comm,ucomm,ucmd",       "COMMAND", 15, 0, C_COMM },
+    { "comm,ucomm",            "COMMAND", 15, 0, C_COMM },
+    { "ucmd",                  "CMD",     15, 0, C_UCMD },
+    { "tpgid",                 "TPGID",   5, 1, C_TPGID },
     { "args,command",          "COMMAND", 0, 0, C_ARGS },
     { "cmd",                   "CMD",     0, 0, C_CMD },
     { "nlwp,thcount",          "NLWP",    4, 1, C_NLWP },
@@ -441,6 +455,22 @@ static void add_format(const char *fmt) {
     }
 }
 
+/* The terminal's name from /proc/<pid>/stat's tty_nr, as procps finds it in
+ * /dev: Linux's encoding (major in bits 8-19, minor in 0-7 and 20-31); a
+ * pty is 136-143 (pts/N), a VT 4 (ttyN, ttySN from 64), 5,0 tty and 5,1
+ * console; anything else, and no terminal at all, is "?". */
+static void tty_name(int tty_nr, char *out, size_t cap) {
+    unsigned nr = (unsigned)tty_nr;
+    unsigned maj = (nr >> 8) & 0xfffu, mn = (nr & 0xffu) | ((nr >> 12) & 0xfff00u);
+    if (nr == 0)                       snprintf(out, cap, "?");
+    else if (maj >= 136 && maj <= 143) snprintf(out, cap, "pts/%u", (maj - 136) * 256 + mn);
+    else if (maj == 4 && mn < 64)      snprintf(out, cap, "tty%u", mn);
+    else if (maj == 4)                 snprintf(out, cap, "ttyS%u", mn - 64);
+    else if (maj == 5 && mn == 0)      snprintf(out, cap, "tty");
+    else if (maj == 5 && mn == 1)      snprintf(out, cap, "console");
+    else                               snprintf(out, cap, "?");
+}
+
 static void render(const struct pinfo *pi, int id, char *out, size_t cap) {
     switch (id) {
     case C_PID:     snprintf(out, cap, "%d", pi->tgid ? pi->tgid : pi->pid); break;
@@ -464,7 +494,8 @@ static void render(const struct pinfo *pi, int id, char *out, size_t cap) {
     case C_VSZ:     snprintf(out, cap, "%ld", pi->vsize / 1024); break;
     case C_SZ:      snprintf(out, cap, "%ld", pi->vsize / 4096); break;
     case C_RSS:     snprintf(out, cap, "%ld", pi->rss_kb); break;
-    case C_TTY:     snprintf(out, cap, "%s", pi->tty ? "tty" : "?"); break;
+    case C_TTY:     tty_name(pi->tty, out, cap); break;
+    case C_TPGID:   snprintf(out, cap, "%d", pi->tpgid); break;
     case C_STAT:    fmt_stat(pi, out, cap); break;
     case C_S:       snprintf(out, cap, "%c", pi->state); break;
     case C_START:   fmt_start(pi, out, cap); break;
@@ -478,7 +509,7 @@ static void render(const struct pinfo *pi, int id, char *out, size_t cap) {
     case C_BSDTIME: fmt_hms((pi->utime + pi->stime) / HZ, 1, out, cap); break;
     case C_ETIME:   fmt_etime(elapsed_secs(pi), out, cap); break;
     case C_ETIMES:  snprintf(out, cap, "%ld", elapsed_secs(pi)); break;
-    case C_COMM:    snprintf(out, cap, "%s", pi->comm); break;
+    case C_COMM: case C_UCMD: snprintf(out, cap, "%s", pi->comm); break;
     case C_ARGS: case C_CMD: snprintf(out, cap, "%s", pi->args); break;
     case C_NLWP:    snprintf(out, cap, "%d", pi->nthreads > 0 ? pi->nthreads : 1); break;
     case C_PRI:     snprintf(out, cap, "%d", 80 - pi->prio); break;
@@ -567,8 +598,8 @@ static int selected(const struct pinfo *pi) {
             if (strcmp(g_cmds[i], pi->comm) == 0) return 1;
         return 0;
     }
-    /* the default: my processes, on my "terminal" */
-    return pi->uid == g_self_uid && pi->session == g_self_session;
+    /* the default: my processes, on my terminal (none counts as one) */
+    return pi->uid == g_self_uid && pi->tty == g_self_tty;
 }
 
 /* ---- sorting ------------------------------------------------------- */
@@ -714,8 +745,9 @@ int main(int argc, char **argv) {
                       else if (i + 1 < argc) add_user_list(argv[++i]);
                       break;
             case 'f': if (unix_style) fmt_f = 1; /* BSD f = forest: ignored */ break;
+            case 'F': if (unix_style) fmt_f = 2; break;
             case 'l': fmt_l = 1; break;
-            case 'j': fmt_l = 2; break;
+            case 'j': fmt_l = unix_style ? 2 : 3; break;
             case 'w': break;
             case 'h': g_no_header = 1; break;
             case 'H': if (unix_style) { /* forest */ } else g_show_threads = 1; break;
@@ -768,17 +800,22 @@ int main(int argc, char **argv) {
         if (fmt_u) {
             add_format("user,pid,%cpu,%mem,vsz,rss,tty,stat,start,bsdtime,args");
         } else if (fmt_l == 1) {
-            add_format("f,s,uid,pid,ppid,c,pri,ni,addr,sz,wchan,tty,time,cmd");
+            add_format("f,s,uid,pid,ppid,c,pri,ni,addr,sz,wchan,tty,time,ucmd");
         } else if (fmt_l == 2) {
-            add_format("pid,pgid,sid,tty,time,cmd");
+            add_format("pid,pgid,sid,tty,time,ucmd");
+        } else if (fmt_l == 3) {
+            add_format("ppid,pid,pgid,sid,tty,tpgid,stat,uid,bsdtime,args");
+        } else if (fmt_f == 2) {
+            add_format("user=UID,pid,ppid,c,sz,rss,psr,stime,tty,time,cmd");
         } else if (fmt_f) {
             add_format("user=UID,pid,ppid,c,stime,tty,time,cmd");
         } else if (bsd_a || fmt_x) {
             add_format("pid,tty,stat,bsdtime,args");
         } else {
-            add_format("pid,tty,time,cmd");
+            add_format("pid,tty,time,ucmd");
         }
-        /* the tty column is TTY, not TT, in these classic layouts */
+        /* the tty column is TTY, not TT, in these classic layouts (BSD
+         * j's too) */
         for (int i = 0; i < g_nout; i++)
             if (g_out[i].c->id == C_TTY && !g_out[i].fixed_header)
                 snprintf(g_out[i].header, sizeof g_out[i].header, "TTY");
@@ -804,7 +841,7 @@ int main(int argc, char **argv) {
     {
         struct pinfo me;
         memset(&me, 0, sizeof me);
-        if (read_stat(g_self_pid, &me) == 0) g_self_session = me.session;
+        if (read_stat(g_self_pid, &me) == 0) g_self_tty = me.tty;
     }
     read_procs();
     qsort(g_procs, (size_t)g_nprocs, sizeof g_procs[0], cmp_procs);
