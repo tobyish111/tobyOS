@@ -1,7 +1,7 @@
 /* rmdir yes tac seq whoami which uname free sync nohup timeout watch
  * stat du xargs dd printenv nice pgrep pkill tty stty cksum truncate
  * install mkfifo hwclock arch nproc hostid logname link unlink pwd sum factor test [ printf chgrp
- * shred uniq who users uptime true false
+ * shred uniq who users uptime true false ls env
  *
  * One multi-call binary, dispatching on argv[0]. Every one of these names
  * previously resolved to a busybox applet -- and busybox in this tree is a
@@ -131,6 +131,8 @@ static char *first_line(char *s) {
 #include "su_who.c"
 #include "su_uptime.c"
 #include "su_true.c"
+#include "su_ls.c"
+#include "su_env.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -190,6 +192,8 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "uptime"))    return do_uptime(argc, argv);
     if (!strcmp(base, "true"))      return do_true(argc, argv, 0);
     if (!strcmp(base, "false"))     return do_true(argc, argv, 1);
+    if (!strcmp(base, "ls"))        return do_ls(argc, argv);
+    if (!strcmp(base, "env"))       return do_env(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;

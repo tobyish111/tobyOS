@@ -29,7 +29,7 @@ for n in rmdir yes tac seq whoami which uname free sync stat du xargs nohup \
          timeout watch dd printenv nice pgrep pkill tty stty cksum truncate \
          install mkfifo date touch sort script hwclock \
          arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-         shred uniq who users uptime true false; do
+         shred uniq who users uptime true false ls env; do
     ln -sf /tmp/suhost/shellutils /tmp/suhost/bin/$n
 done
 echo "suhost: built /tmp/suhost/shellutils"

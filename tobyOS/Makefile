@@ -538,7 +538,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_sort/user_sort.elf \
             programs/user_tee/user_tee.elf \
             programs/user_setsid/user_setsid.elf \
-            programs/user_env/user_env.elf \
             programs/user_chmod/user_chmod.elf \
             programs/user_vncpasswd/user_vncpasswd.elf \
             programs/user_df/user_df.elf \
@@ -562,7 +561,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_locate/user_locate.elf \
             programs/user_ln/user_ln.elf \
             programs/user_shellutils/user_shellutils.elf \
-            programs/user_ls/user_ls.elf \
             programs/user_tar/user_tar.elf \
             programs/user_textutils/user_textutils.elf \
             programs/user_zstd/user_zstd.elf \
@@ -3260,7 +3258,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
 	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
 	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
-	cp programs/user_env/user_env.elf               $(INITRD_STAGE)/bin/env
 	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
 	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
 	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
@@ -3292,7 +3289,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
 	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
 	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
-	cp programs/user_ls/user_ls.elf                 $(INITRD_STAGE)/bin/ls
 	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
 	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
 	cp programs/user_zip/user_zip.elf               $(INITRD_STAGE)/bin/zip
@@ -3377,7 +3373,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
 	           cksum truncate install mkfifo date touch sort script hwclock \
            arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-           shred uniq who users uptime true false; do \
+           shred uniq who users uptime true false ls env; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
