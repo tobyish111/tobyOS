@@ -21453,22 +21453,37 @@ static void cmd_which(int argc, char **argv) {
 
 /* ---- POSIX `test` / `[` builtin --------------------------------- */
 
+/* An integer as bash's test reads one (legal_number): blanks -- spaces and
+ * tabs -- before and after the digits are allowed, a sign before them, and
+ * nothing out of range (strtoimax's ERANGE). tsh took digits alone, so
+ * `test "$(ps -o pgid= -p $$)" -eq $$` -- ps right-aligns its numbers --
+ * was a syntax error where bash, dash and every script expect an answer
+ * (batch 30, logs/utilgate/ps.sh). */
 static bool test_is_int(const char *s, long *out) {
-    if (!s || !*s) return false;
-    long v = 0;
-    bool neg = false;
+    if (!s) return false;
     const char *p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    bool neg = false;
     if (*p == '-') { neg = true; p++; }
     else if (*p == '+') p++;
-    if (!*p) return false;
-    while (*p) {
-        if (*p < '0' || *p > '9') return false;
-        v = v * 10 + (*p - '0');
+    if (*p < '0' || *p > '9') return false;
+    const unsigned long lim = neg ? 0x8000000000000000UL : 0x7fffffffffffffffUL;
+    unsigned long v = 0;
+    while (*p >= '0' && *p <= '9') {
+        unsigned long d = (unsigned long)(*p - '0');
+        if (v > (lim - d) / 10) return false;
+        v = v * 10 + d;
         p++;
     }
-    if (out) *out = neg ? -v : v;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) return false;
+    if (out) *out = neg ? (long)(0UL - v) : (long)v;
     return true;
 }
+
+/* The operand an arithmetic comparison could not read, for bash's
+ * "test: X: integer expression expected" (it was "syntax error near"). */
+static const char *s_test_badint;
 
 /* WHY THIS IS A PARSER AND NOT A CHAIN OF strcmp()s
  *
@@ -21828,6 +21843,7 @@ static int test_binary(const char *a, const char *op, const char *b, bool *err) 
 
     long va = 0, vb = 0;
     if (!test_is_int(a, &va) || !test_is_int(b, &vb)) {
+        if (!s_test_badint) s_test_badint = test_is_int(a, 0) ? b : a;
         if (err) *err = true;
         return 1;
     }
@@ -21949,6 +21965,7 @@ static int test_three(char **a) {
 
 static void cmd_test(int argc, char **argv) {
     bool bracket = (argc > 0 && strcmp(argv[0], "[") == 0);
+    s_test_badint = 0;
     int end = argc;
     if (bracket) {
         if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
@@ -21994,8 +22011,12 @@ static void cmd_test(int argc, char **argv) {
     }
 
     if (r < 0) {
-        kprintf("%s: syntax error near '%s'\n", bracket ? "[" : "test",
-                n > 0 ? a[n - 1] : "");
+        if (s_test_badint)
+            kprintf("%s: %s: integer expression expected\n", bracket ? "[" : "test",
+                    s_test_badint);
+        else
+            kprintf("%s: syntax error near '%s'\n", bracket ? "[" : "test",
+                    n > 0 ? a[n - 1] : "");
         shell_set_status(2);
         return;
     }
