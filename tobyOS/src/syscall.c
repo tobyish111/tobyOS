@@ -4110,18 +4110,37 @@ static long sys_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
+/* unlink(2), for both personalities (LX_unlink and unlinkat without
+ * AT_REMOVEDIR come here).
+ *
+ * A DIRECTORY IS EISDIR. The drivers' unlink removes files and empty
+ * directories alike, and this passed it straight through, so `unlink d`
+ * removed an empty directory where Linux refuses: rmdir(2) is the call
+ * for that (batch 30, logs/utilgate/unlink.sh). The last component is not
+ * followed -- unlinking a symlink to a directory removes the link -- and a
+ * path ending in '/' is judged by that same unfollowed name, as Linux's
+ * do_unlinkat judges it: a directory is EISDIR, anything else ENOTDIR
+ * (`unlink file/`, and `unlink link-to-dir/` too, which following the
+ * link made EISDIR). And the errors go through the shared mapper: the
+ * hand-written switch here turned every code it did not list -- ENOTDIR,
+ * ENAMETOOLONG, ELOOP -- into EACCES. */
 static long sys_unlink(const char *path) {
+    char up[ABI_PATH_MAX];
+    long plen = strncpy_from_user(up, path, sizeof up);
+    if (plen < 0) return -ABI_EFAULT;
+    up[sizeof up - 1] = 0;
+    size_t ul = strlen(up);
+    bool slash = ul > 1 && up[ul - 1] == '/';
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
     if (rr) return rr;
-    int rc = vfs_unlink(kpath);
-    switch (rc) {
-    case VFS_OK:        return 0;
-    case VFS_ERR_NOENT: return -ABI_ENOENT;
-    case VFS_ERR_ROFS:  return -ABI_EROFS;
-    case VFS_ERR_PERM:  return -ABI_EACCES;
-    default:            return -ABI_EACCES;
+    struct vfs_stat st;
+    int sr = vfs_stat(kpath, &st);
+    if (sr == VFS_OK) {
+        if (st.type == VFS_TYPE_DIR) return -ABI_EISDIR;
+        if (slash) return -ABI_ENOTDIR;
     }
+    return vfs_err_to_abi(vfs_unlink(kpath));
 }
 
 static long sys_rename(const char *oldp, const char *newp) {

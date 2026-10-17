@@ -1318,6 +1318,15 @@ int vfs_link(const char *oldpath, const char *newpath) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
+    /* A directory cannot be hard-linked: EPERM, as Linux's vfs_link says
+     * it -- after the target's EEXIST and the directory's permissions, so
+     * those come first, as there. The drivers said EISDIR (`link d e`,
+     * logs/utilgate/link.sh, batch 30). */
+    {
+        struct vfs_stat ost, nst;
+        if (vfs_stat(oldpath, &ost) == VFS_OK && ost.type == VFS_TYPE_DIR)
+            return vfs_stat(newpath, &nst) == VFS_OK ? VFS_ERR_EXIST : VFS_ERR_NOTPERM;
+    }
     int rc = om->ops->link(om->data, orel, nrel);
     if (rc == VFS_OK) vfs_notify(newpath, VFS_IN_CREATE, 0);
     return rc;
