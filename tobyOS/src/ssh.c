@@ -1643,6 +1643,11 @@ static bool ssh_spawn_shell(void) {
         if (cp && u) {
             cp->uid = cp->ruid = cp->suid = u->uid;
             cp->gid = cp->rgid = cp->sgid = u->gid;
+            /* and the supplementary groups /etc/group gives the user, as
+             * login's initgroups sets them: a session was in no group but
+             * its own, so `chgrp users f` from a member of users was
+             * EPERM where Linux lets it (logs/utilgate/chgrp.sh) */
+            cp->ngroups = users_initgroups(u->name, u->gid, cp->groups, PROC_NGROUPS_MAX);
             if (u->uid != 0) cp->lcap_eff = cp->lcap_perm = cp->lcap_inh = 0;
         }
         /* ITS OWN SESSION, as sshd's child is (setsid). A login session's

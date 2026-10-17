@@ -1905,6 +1905,14 @@ static long sys_chown(const char *path, uint32_t uid, uint32_t gid) {
     return vfs_err_to_abi(vfs_chown(kpath, uid, gid));
 }
 
+static long sys_lchown(const char *path, uint32_t uid, uint32_t gid) {
+    if (!cap_check(current_proc(), CAP_SETTINGS_WRITE, "sys_lchown")) return -ABI_EPERM;
+    char kpath[ABI_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    return vfs_err_to_abi(vfs_lchown(kpath, uid, gid));
+}
+
 /* ============================================================
  * Milestone 25A: libc-shape syscalls.
  *
@@ -6457,6 +6465,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_chmod((const char *)a1, (uint32_t)a2);
     case SYS_CHOWN:
         return sys_chown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
+    case ABI_SYS_LCHOWN:
+        return sys_lchown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
+    case ABI_SYS_GETGROUPS:         /* one implementation: the Linux arm */
+        return linux_syscall_impl(115, a1, a2, 0, 0, 0);
 
     /* ---- Milestone 25A: libc-shape calls ------------------------ */
     case SYS_GETPID:        return sys_getpid();
@@ -12091,10 +12103,26 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * way; ENOSYS here was the only thing between a successfully captured
          * SwiftShader frame and /data/shot.png (slice 38 iter 3). */
         return do_syscall(SYS_OPEN, a1, 0x241, a2, 0, 0);
-    case LX_fchown:                    /* (fd, owner, group) */
-        /* Single-user OS: ownership is a no-op; report success so file
-         * writers that chown their output don't error out. */
-        return 0;
+    case LX_fchown: {                  /* (fd, owner, group) */
+        /* The file the descriptor was opened on, found by its stamped
+         * path as fchmod finds it (the NAME, not the inode). It was a
+         * no-op that said 0, from when ownership meant nothing here; a
+         * descriptor with no path (a pipe, a socket) still says 0. */
+        struct file *ff = fd_lookup((int)a1);
+        if (!ff) return -ABI_EBADF;
+        const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                       ? ff->dirpath : ff->open_path;
+        if (!kp || !kp[0]) return 0;
+        uint32_t uid = (uint32_t)a2, gid = (uint32_t)a3;
+        if (uid != 0xFFFFFFFFu) { bool mok = false; uid = userns_v2k_uid(uid, &mok);
+               if (!mok) return -ABI_EINVAL; }
+        if (gid != 0xFFFFFFFFu) { bool mok = false; gid = userns_v2k_gid(gid, &mok);
+               if (!mok) return -ABI_EINVAL; }
+        int rc = vfs_lchown(kp, uid, gid);
+        if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
+        if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
+        return vfs_err_to_abi(rc);
+    }
     case LX_sched_getparam: {          /* (pid, struct sched_param *) */
         int zero = 0;
         if (a2 && copy_to_user((void *)a2, &zero, sizeof zero) != 0)
@@ -12471,7 +12499,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         const char *up = (const char *)(LX_chmod == n ? a1 : a2);
         uint32_t    md = (uint32_t)(LX_chmod == n ? a2 : a3) & 07777u;
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
+        /* fchmodat's path is relative to its dirfd, as every *at's is */
+        int prr = LX_chmod == n ? resolve_user_path(up, kpath, sizeof kpath)
+                                : resolve_user_path_at((int)a1, up, kpath, sizeof kpath);
+        if (prr != 0) return -ABI_EFAULT;
         struct vfs_stat vs;
         if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
         int rc = vfs_chmod(kpath, md);
@@ -12520,29 +12551,51 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_rmdir:
         return rmdir_path((const char *)a1);
 
-    /* chown/lchown/fchownat. vfs_chown() is real, so these are too. We do not
-     * follow symlinks differently for lchown -- the VFS resolves links at
-     * lookup and has no O_NOFOLLOW-style stat -- which only matters for a
-     * chown aimed AT a symlink itself, a case nothing in the census hits. */
+    /* chown/lchown/fchownat. chown follows a symbolic link in the last
+     * component and lchown changes the link itself, as fchownat does with
+     * AT_SYMLINK_NOFOLLOW (0x100); fchownat's path is relative to its
+     * dirfd, and AT_EMPTY_PATH (0x1000) with "" is the dirfd's own file.
+     * All three were one call that changed whatever node the name was --
+     * the link, for a link -- and fchownat ignored its dirfd and flags. */
     case LX_chown: case LX_lchown: case LX_fchownat: {
         const char *up = (n == LX_fchownat) ? (const char *)a2
                                             : (const char *)a1;
         uint32_t uid = (uint32_t)((n == LX_fchownat) ? a3 : a2);
         uint32_t gid = (uint32_t)((n == LX_fchownat) ? a4 : a3);
+        int atfl = n == LX_fchownat ? (int)a5 : 0;
+        if (atfl & ~(0x100 | 0x1000)) return -ABI_EINVAL;
+        bool nofollow = n == LX_lchown || (atfl & 0x100);
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path(up, kpath, sizeof kpath) != 0) return -ABI_EFAULT;
+        if (n == LX_fchownat) {
+            char probe[2];
+            if (strncpy_from_user(probe, up, sizeof probe) < 0) return -ABI_EFAULT;
+            if (!probe[0]) {
+                if (!(atfl & 0x1000)) return -ABI_ENOENT;
+                struct file *ff = fd_lookup((int)a1);
+                if (!ff) return -ABI_EBADF;
+                const char *kp = (ff->kind == FILE_KIND_DIR && ff->dirpath)
+                               ? ff->dirpath : ff->open_path;
+                if (!kp || !kp[0] || strlen(kp) >= sizeof kpath) return 0;
+                memcpy(kpath, kp, strlen(kp) + 1);
+                nofollow = true;
+            } else if (resolve_user_path_at((int)a1, up, kpath, sizeof kpath) != 0) {
+                return -ABI_EFAULT;
+            }
+        } else if (resolve_user_path(up, kpath, sizeof kpath) != 0) {
+            return -ABI_EFAULT;
+        }
         struct vfs_stat vs;
-        if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
-        /* (uid_t)-1 means "leave unchanged" in POSIX. Note this uses the
-         * on-disk (host) id directly, which is right: nothing is being
-         * translated in that case. */
-        if (uid == 0xFFFFFFFFu) uid = vs.uid;
-        else { bool mok = false; uid = userns_v2k_uid(uid, &mok);   /* slice 11 */
+        int src = nofollow ? vfs_stat(kpath, &vs) : vfs_stat_follow(kpath, &vs);
+        if (src != VFS_OK) return vfs_err_to_abi(src);
+        /* (uid_t)-1 means "leave unchanged" in POSIX, and goes through as
+         * that: vfs_lchown keeps the id and lets anyone ask for no change
+         * (it was swapped for the file's own id here, which made a
+         * non-owner's chown(f, -1, -1) an EPERM). */
+        if (uid != 0xFFFFFFFFu) { bool mok = false; uid = userns_v2k_uid(uid, &mok);   /* slice 11 */
                if (!mok) return -ABI_EINVAL; }
-        if (gid == 0xFFFFFFFFu) gid = vs.gid;
-        else { bool mok = false; gid = userns_v2k_gid(gid, &mok);
+        if (gid != 0xFFFFFFFFu) { bool mok = false; gid = userns_v2k_gid(gid, &mok);
                if (!mok) return -ABI_EINVAL; }
-        int rc = vfs_chown(kpath, uid, gid);
+        int rc = nofollow ? vfs_lchown(kpath, uid, gid) : vfs_chown(kpath, uid, gid);
         if (rc == VFS_OK || rc == VFS_ERR_ROFS) return 0;
         if (rc == VFS_ERR_PERM || rc == VFS_ERR_NOTPERM) return -ABI_EPERM;
         return vfs_err_to_abi(rc);

@@ -702,6 +702,20 @@ static int current_gid(void) {
     return p ? p->gid : 0;
 }
 
+/* Whether the caller is in group GID: its effective gid, or one of its
+ * supplementary groups -- Linux's in_group_p. The group bits of a mode
+ * and chgrp's "a group you are in" both mean this; they went by the
+ * effective gid alone, so a user in `users` (/etc/group, set at login)
+ * could neither use a file's group bits for it nor chgrp to it. */
+static bool current_in_group(uint32_t gid) {
+    struct proc *p = current_proc();
+    if (!p) return gid == 0;
+    if ((uint32_t)p->gid == gid) return true;
+    for (int i = 0; i < p->ngroups && i < PROC_NGROUPS_MAX; i++)
+        if ((uint32_t)p->groups[i] == gid) return true;
+    return false;
+}
+
 static bool mode_allows(uint32_t mode, uint32_t uid, uint32_t gid, int want) {
     if (!(mode & VFS_MODE_VALID)) return true;        /* legacy */
     int who_uid = current_uid();
@@ -711,7 +725,7 @@ static bool mode_allows(uint32_t mode, uint32_t uid, uint32_t gid, int want) {
     if ((uint32_t)who_uid == uid) {
         /* owner: bits 6..8 */
         bits = (int)((mode >> 6) & 7u);
-    } else if ((uint32_t)current_gid() == gid) {
+    } else if (current_in_group(gid)) {
         /* group: bits 3..5 */
         bits = (int)((mode >> 3) & 7u);
     } else {
@@ -1448,8 +1462,15 @@ int vfs_mkdir(const char *path) {
     return vfs_mkdir_mode(path, 00755u);      /* historical default */
 }
 
-/* chmod / chown: only the owner or root may change ownership/perms. */
-int vfs_chmod(const char *path, uint32_t mode) {
+/* chmod / chown: only the owner or root may change ownership/perms.
+ *
+ * chmod(2) and chown(2) FOLLOW a symbolic link in the last component, as
+ * Linux's do, and act on what it names (a dangling one is ENOENT);
+ * lchown(2) acts on the link itself. Every driver's chmod/chown acts on
+ * the node it is given, so both followed nothing: `chmod 600 lnk` set the
+ * link's mode, and `chgrp users lnk` regrouped the link and left the file
+ * it names alone (logs/utilgate/chgrp.sh). */
+static int chmod_node(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
@@ -1483,7 +1504,15 @@ int vfs_chmod(const char *path, uint32_t mode) {
                         (mode & VFS_MODE_PERMS) | VFS_MODE_VALID);
 }
 
-int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
+int vfs_chmod(const char *path, uint32_t mode) {
+    if (!path) return VFS_ERR_INVAL;
+    char t[VFS_PATH_MAX];
+    int rc = vfs_follow_link(path, t, sizeof t);
+    if (rc != VFS_OK) return rc;
+    return chmod_node(t, mode);
+}
+
+int vfs_lchown(const char *path, uint32_t uid, uint32_t gid) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
@@ -1503,11 +1532,10 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     /* chown(2) as Linux rules it. (uid_t)-1 and (gid_t)-1 leave that id
      * as it is. Root gives a file to anyone; anyone else, on a file of
      * their own, may set the owner it already has and a group they are in
-     * -- their gid: there are no supplementary groups here -- and asking
-     * for no change at all is no change, whoever asks. Anything else is
-     * EPERM. It was root or EACCES for everything, so `install -o $USER`
-     * and `chgrp $(id -g)` failed with the wrong words (logs/utilgate
-     * install_owner). */
+     * -- their gid or a supplementary one -- and asking for no change at
+     * all is no change, whoever asks. Anything else is EPERM. It was root
+     * or EACCES for everything, so `install -o $USER` and `chgrp $(id -g)`
+     * failed with the wrong words (logs/utilgate install_owner). */
     struct vfs_stat st;
     int rc = vfs_stat(path, &st);
     if (rc != VFS_OK) return rc;
@@ -1517,11 +1545,19 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
     if (current_uid() != 0) {
         bool owner = (uint32_t)current_uid() == st.uid;
         if (set_uid && !(owner && uid == st.uid)) return VFS_ERR_NOTPERM;
-        if (set_gid && !(owner && (gid == st.gid || gid == (uint32_t)current_gid())))
+        if (set_gid && !(owner && (gid == st.gid || current_in_group(gid))))
             return VFS_ERR_NOTPERM;
         if (!set_uid && !set_gid) return VFS_OK;
     }
     return m->ops->chown(m->data, rel, uid, gid);
+}
+
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid) {
+    if (!path) return VFS_ERR_INVAL;
+    char t[VFS_PATH_MAX];
+    int rc = vfs_follow_link(path, t, sizeof t);
+    if (rc != VFS_OK) return rc;
+    return vfs_lchown(t, uid, gid);
 }
 
 /* -------- helpers -------- */

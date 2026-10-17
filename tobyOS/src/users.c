@@ -189,6 +189,43 @@ const struct user *users_lookup_by_name(const char *name) {
     return 0;
 }
 
+int users_initgroups(const char *name, int gid, int *out, int max) {
+    int n = 0;
+    if (!out || max <= 0) return 0;
+    out[n++] = gid;
+    if (!name || !name[0]) return n;
+    void *buf = 0; size_t sz = 0;
+    if (vfs_read_all("/etc/group", &buf, &sz) != VFS_OK || !buf) return n;
+    const char *s = (const char *)buf, *end = s + sz;
+    size_t nl = strlen(name);
+    while (s < end && n < max) {
+        const char *e = s;
+        while (e < end && *e != '\n') e++;
+        /* NAME:PASSWORD:GID:MEMBER,MEMBER... */
+        const char *c[3];
+        int k = 0;
+        for (const char *p = s; p < e && k < 3; p++) if (*p == ':') c[k++] = p;
+        int g;
+        if (k == 3 && parse_int(c[1] + 1, (size_t)(c[2] - c[1] - 1), &g)) {
+            const char *m = c[2] + 1;
+            while (m < e) {
+                const char *me = m;
+                while (me < e && *me != ',' && *me != '\r') me++;
+                if ((size_t)(me - m) == nl && strncmp(m, name, nl) == 0) {
+                    bool have = false;
+                    for (int i = 0; i < n; i++) if (out[i] == g) have = true;
+                    if (!have) out[n++] = g;
+                    break;
+                }
+                m = me + 1;
+            }
+        }
+        s = e + 1;
+    }
+    kfree(buf);
+    return n;
+}
+
 const struct user *users_lookup_by_uid(int uid) {
     for (int i = 0; i < g_count; i++) {
         if (g_users[i].uid == uid) return &g_users[i];

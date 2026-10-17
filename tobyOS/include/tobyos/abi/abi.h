@@ -1334,7 +1334,20 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         CLOCK_MONOTONIC (EINVAL). Moves the
                                         wall clock; monotonic never jumps.
                                         (finding 157) */
-#define ABI_SYS_NR_MAX          226
+#define ABI_SYS_LCHOWN          227  /* (path, uid, gid) -> 0|-E: lchown(2),
+                                        SYS_CHOWN's rules for the node the
+                                        path names -- a symbolic link is
+                                        changed, not followed, where
+                                        SYS_CHOWN now follows one (chgrp
+                                        -h, chgrp -R, finding 151) */
+#define ABI_SYS_GETGROUPS       228  /* (int size, gid_t *list) -> how many:
+                                        getgroups(2), Linux's rules (size 0
+                                        asks how many; too small is EINVAL).
+                                        The supplementary groups a login
+                                        gives (users_initgroups) were real
+                                        and no native program could ask for
+                                        them: id said groups=1000 alone. */
+#define ABI_SYS_NR_MAX          228
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

@@ -480,6 +480,9 @@ int  vfs_stat    (const char *path, struct vfs_stat *out);
  * filesystem doesn't support it (e.g. the read-only ramfs root). */
 int  vfs_chmod   (const char *path, uint32_t mode);
 int  vfs_chown   (const char *path, uint32_t uid, uint32_t gid);
+/* chown's answer for the link itself: a symbolic link in the last
+ * component is changed, not followed (vfs_chmod and vfs_chown follow) */
+int  vfs_lchown  (const char *path, uint32_t uid, uint32_t gid);
 
 /* Permission check used internally by the VFS wrappers and by the
  * proc subsystem before exec'ing a binary. `want` is a bitwise OR of

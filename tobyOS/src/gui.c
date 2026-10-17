@@ -52,6 +52,7 @@
 #include <tobyos/pit.h>
 #include <tobyos/service.h>
 #include <tobyos/session.h>
+#include <tobyos/users.h>
 #include <tobyos/settings.h>
 #include <tobyos/cap.h>
 #include <tobyos/pkg.h>
@@ -4799,10 +4800,17 @@ static void drain_launch_queue(void) {
         int sid = session_active() ? session_current_id() : 0;
         int uid = session_active() ? session_current_uid() : 0;
         int gid = session_active() ? session_current_gid() : 0;
+        /* the user's supplementary groups too, as a login gives them
+         * (users_initgroups): the app inherits pid 0's for the spawn */
+        int saved_ngroups = self ? self->ngroups : 0;
+        int saved_groups[PROC_NGROUPS_MAX];
+        if (self) memcpy(saved_groups, self->groups, sizeof saved_groups);
         if (self) {
             self->session_id = sid;
             self->uid        = uid;
             self->gid        = gid;
+            const struct user *su = session_active() ? users_lookup_by_uid(uid) : 0;
+            self->ngroups = su ? users_initgroups(su->name, gid, self->groups, PROC_NGROUPS_MAX) : 0;
         }
 
         /* Milestone 18: pick the sandbox profile for this spawn. If
@@ -4851,6 +4859,8 @@ static void drain_launch_queue(void) {
             self->session_id = saved_sid;
             self->uid        = saved_uid;
             self->gid        = saved_gid;
+            self->ngroups    = saved_ngroups;
+            memcpy(self->groups, saved_groups, sizeof saved_groups);
         }
 
         if (pid < 0) {

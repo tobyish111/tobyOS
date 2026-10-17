@@ -4,10 +4,10 @@
  *
  * With a USER operand the answer comes from the DATABASE (/etc/passwd for
  * uid and login gid, /etc/group for the groups that list the user as a
- * member). With no operand it describes the CALLING PROCESS: this kernel's
- * native ABI has no getgroups, so the process form reports the primary gid
- * as the whole `groups=` list -- the honest answer, since a supplementary
- * set the kernel cannot report cannot be claimed either.
+ * member). With no operand it describes the CALLING PROCESS: the effective
+ * gid, then getgroups(2)'s supplementary groups (which a login sets from
+ * /etc/group), as GNU's id lists them. It had only the primary gid until
+ * batch 30 gave the native ABI a getgroups.
  *
  * Names come from the database; an id with no entry prints bare numbers,
  * the way coreutils does.
@@ -180,6 +180,13 @@ int main(int argc, char **argv) {
         have_pw = (pw_lookup(0, uid, &pw) == 0);
         gids[0] = gid;
         ngids = 1;
+        gid_t sup[32];
+        int ns = getgroups(32, sup);
+        for (int i = 0; i < ns && ngids < 32; i++) {
+            int dup = 0;
+            for (int j = 0; j < ngids; j++) if (gids[j] == (long)sup[i]) dup = 1;
+            if (!dup) gids[ngids++] = (long)sup[i];
+        }
     }
 
     char uname[64], gname[64];

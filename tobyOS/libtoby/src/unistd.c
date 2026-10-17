@@ -353,6 +353,18 @@ int chown(const char *path, uid_t owner, gid_t group) {
         toby_sc3(ABI_SYS_CHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
 }
 
+/* getgroups(2): the supplementary groups, as a login set them */
+int getgroups(int size, gid_t list[]) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_GETGROUPS, (long)size, (long)(uintptr_t)list));
+}
+
+/* lchown(2): a symbolic link itself, where chown follows one */
+int lchown(const char *path, uid_t owner, gid_t group) {
+    return (int)__toby_check(
+        toby_sc3(ABI_SYS_LCHOWN, (long)(uintptr_t)path, (long)owner, (long)group));
+}
+
 /* Always succeeds; the kernel answers with the previous mask. */
 mode_t umask(mode_t mask) {
     return (mode_t)toby_sc1(ABI_SYS_UMASK, (long)mask);

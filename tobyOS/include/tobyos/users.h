@@ -100,4 +100,9 @@ int users_del(const char *username);
 typedef void (*users_visit_fn)(const struct user *u, void *ctx);
 void users_visit(users_visit_fn cb, void *ctx);
 
+/* The groups a login gives NAME, as initgroups(3) does: GID first, then
+ * each group /etc/group lists NAME as a member of. Into OUT, at most MAX
+ * of them; returns how many. */
+int users_initgroups(const char *name, int gid, int *out, int max);
+
 #endif /* TOBYOS_USERS_H */
