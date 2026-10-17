@@ -222,6 +222,15 @@ static int copy_one(const char *src, const char *dst) {
                     dst, strerror(errno));
             return -1;
         }
+        /* -p: the link's own times, as GNU's lutimes keeps them (the
+         * copy was dated now -- ls -t of a cp -Rp'd tree, batch 30) */
+        struct stat lst;
+        if (f_preserve && lstat(src, &lst) == 0) {
+            struct timespec ts[2];
+            ts[0].tv_sec = lst.st_atime; ts[0].tv_nsec = 0;
+            ts[1].tv_sec = lst.st_mtime; ts[1].tv_nsec = 0;
+            (void)utimensat(AT_FDCWD, dst, ts, AT_SYMLINK_NOFOLLOW);
+        }
         if (f_verbose) printf("'%s' -> '%s'\n", src, dst);
         return 0;
     }

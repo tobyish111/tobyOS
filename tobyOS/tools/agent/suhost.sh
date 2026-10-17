@@ -27,7 +27,9 @@ gcc -std=gnu11 -O1 -g -Wall -Wextra -Wno-unused-parameter -DSU_HOST \
     third_party/monocypher-4.0.2/src/monocypher.c -lm -lpthread
 for n in rmdir yes tac seq whoami which uname free sync stat du xargs nohup \
          timeout watch dd printenv nice pgrep pkill tty stty cksum truncate \
-         install mkfifo date touch sort script hwclock; do
+         install mkfifo date touch sort script hwclock \
+         arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
+         shred uniq who users uptime true false; do
     ln -sf /tmp/suhost/shellutils /tmp/suhost/bin/$n
 done
 echo "suhost: built /tmp/suhost/shellutils"

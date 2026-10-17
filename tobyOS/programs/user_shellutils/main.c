@@ -1,6 +1,7 @@
 /* rmdir yes tac seq whoami which uname free sync nohup timeout watch
  * stat du xargs dd printenv nice pgrep pkill tty stty cksum truncate
- * install mkfifo hwclock
+ * install mkfifo hwclock arch nproc hostid logname link unlink pwd sum factor test [ printf chgrp
+ * shred uniq who users uptime true false
  *
  * One multi-call binary, dispatching on argv[0]. Every one of these names
  * previously resolved to a busybox applet -- and busybox in this tree is a
@@ -114,6 +115,22 @@ static char *first_line(char *s) {
 #include "su_sort.c"
 #include "su_script.c"
 #include "su_hwclock.c"
+#include "su_arch.c"
+#include "su_nproc.c"
+#include "su_hostid.c"
+#include "su_logname.c"
+#include "su_link.c"
+#include "su_pwd.c"
+#include "su_sum.c"
+#include "su_factor.c"
+#include "su_test.c"
+#include "su_printf.c"
+#include "su_chgrp.c"
+#include "su_shred.c"
+#include "su_uniq.c"
+#include "su_who.c"
+#include "su_uptime.c"
+#include "su_true.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -154,6 +171,25 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "sort"))     return do_sort(argc, argv);
     if (!strcmp(base, "script"))   return do_script(argc, argv);
     if (!strcmp(base, "hwclock"))  return do_hwclock(argc, argv);
+    if (!strcmp(base, "arch"))      return do_arch(argc, argv);
+    if (!strcmp(base, "nproc"))     return do_nproc(argc, argv);
+    if (!strcmp(base, "hostid"))    return do_hostid(argc, argv);
+    if (!strcmp(base, "logname"))   return do_logname(argc, argv);
+    if (!strcmp(base, "link"))      return do_link(argc, argv);
+    if (!strcmp(base, "unlink"))    return do_unlink(argc, argv);
+    if (!strcmp(base, "pwd"))       return do_pwd(argc, argv);
+    if (!strcmp(base, "sum"))       return do_sum(argc, argv);
+    if (!strcmp(base, "factor"))    return do_factor(argc, argv);
+    if (!strcmp(base, "test") || !strcmp(base, "[")) return do_test(argc, argv);
+    if (!strcmp(base, "printf"))    return do_printf(argc, argv);
+    if (!strcmp(base, "chgrp"))     return do_chgrp(argc, argv);
+    if (!strcmp(base, "shred"))     return do_shred(argc, argv);
+    if (!strcmp(base, "uniq"))      return do_uniq(argc, argv);
+    if (!strcmp(base, "who"))       return do_who(argc, argv);
+    if (!strcmp(base, "users"))     return do_users(argc, argv);
+    if (!strcmp(base, "uptime"))    return do_uptime(argc, argv);
+    if (!strcmp(base, "true"))      return do_true(argc, argv, 0);
+    if (!strcmp(base, "false"))     return do_true(argc, argv, 1);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;

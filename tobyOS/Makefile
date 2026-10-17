@@ -442,7 +442,7 @@ HEADERS := $(wildcard include/tobyos/*.h)
 # here so PROGRAMS (built with := immediate-expansion) can reference it.
 PORTS_SBASE_DIR    := ports/sbase
 PORTS_SBASE_TOOLS  := echo cat wc head ls grep \
-                      basename dirname sleep tee expr tr cut uniq sort
+                      basename dirname sleep tee expr tr cut sort
 PORTS_SBASE_ELFS   := $(addprefix $(PORTS_SBASE_DIR)/,$(addsuffix .elf,$(PORTS_SBASE_TOOLS)))
 
 # Programs built and bundled into the boot initrd. Each is a tiny
@@ -585,7 +585,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_sudo/user_sudo.elf \
             programs/user_ranlib/user_ranlib.elf \
             programs/user_addr2line/user_addr2line.elf \
-            programs/user_uniq/user_uniq.elf \
             programs/user_date/user_date.elf \
             programs/user_wget/user_wget.elf \
             programs/user_nc/user_nc.elf \
@@ -3337,7 +3336,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_su/user_su.elf                $(INITRD_STAGE)/bin/su
 	cp programs/user_moreutils/user_moreutils.elf  $(INITRD_STAGE)/bin/moreutils
 	@# moreutils family, one binary dispatched on argv[0]
-	@for ap in arch chgrp factor false link logname nproc printf pwd shred sum test "[" true unlink uptime users who hostid init passwd; do \
+	@for ap in init passwd; do \
 	    ln -f $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3376,7 +3375,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
-	           cksum truncate install mkfifo date touch sort script hwclock; do \
+	           cksum truncate install mkfifo date touch sort script hwclock \
+           arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
+           shred uniq who users uptime true false; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3469,7 +3470,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    ln -f $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
 	done
-	cp programs/user_uniq/user_uniq.elf             $(INITRD_STAGE)/bin/uniq
 	cp programs/user_wget/user_wget.elf             $(INITRD_STAGE)/bin/wget
 	cp programs/user_nc/user_nc.elf                 $(INITRD_STAGE)/bin/nc
 	@# netcat is nc under its long name
@@ -3530,7 +3530,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp $(PORTS_SBASE_DIR)/expr.elf                      $(INITRD_STAGE)/bin/expr
 	cp $(PORTS_SBASE_DIR)/tr.elf                        $(INITRD_STAGE)/bin/tr
 	cp $(PORTS_SBASE_DIR)/cut.elf                       $(INITRD_STAGE)/bin/cut
-	cp $(PORTS_SBASE_DIR)/uniq.elf                      $(INITRD_STAGE)/bin/uniq
 	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
