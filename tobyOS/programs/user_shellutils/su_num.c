@@ -244,31 +244,58 @@ static long double sn_make(int sign, uint64_t m, long e) {
     return u.v;
 }
 
-/* N (consumed) * 2^E, rounded half-even to 64 bits (STICKY: bits already
- * lost below N were not all zero) */
+/* Set by su_strtold when what it read is out of long double's range, as
+ * strtold's ERANGE: past the largest (infinity), or below the smallest
+ * normal and not exact there -- a denormal that lost bits, or zero.
+ * Tininess is judged after rounding, as x86 does: a value just below the
+ * smallest normal that 64 bits would round up to it is not tiny. GNU
+ * printf reports it; the other callers read the value alone. */
+static int sn_range;
+
+/* N (consumed) * 2^E, rounded half-even ONCE to the bits a long double
+ * has there: 64, or fewer below the smallest normal, where the last place
+ * is 2^-16445 (STICKY: bits already lost below N were not all zero) */
 static long double sn_round_big(int sign, struct sn_big *n, long e, int sticky) {
     if (sn_is_zero(n)) return sn_make(sign, 0, 0);
-    size_t L = sn_bitlen(n);
-    if (L <= 64) {
-        uint64_t m = 0;
-        for (size_t i = n->n; i-- > 0;) m = (m << 32) | n->d[i];
-        m <<= 64 - L;
-        e -= (long)(64 - L);
-        return sn_make(sign, m, e);
+    long L = (long)sn_bitlen(n);
+    long top = L - 1 + e;                  /* the place of the leading bit */
+    if (top > 16383) { sn_range = 1; return sn_make(sign, 0x8000000000000000ULL, 20000); }
+    long lsb = top - 63;
+    if (lsb < -16445) lsb = -16445;
+    long sh = lsb - e;                     /* bits of N below the last place */
+    int tiny = top < -16382;
+    if (tiny && top == -16383 && sh >= 2) {
+        /* 64 bits from the leading one, all ones, and a one after them:
+         * rounding to 64 bits would carry up to the smallest normal */
+        int ones = 1;
+        for (long i = sh - 1; i < L && ones; i++) ones = sn_bit(n, (size_t)i);
+        if (ones && sn_bit(n, (size_t)(sh - 2))) tiny = 0;
     }
-    size_t sh = L - 64;
-    int rb = sn_bit(n, sh - 1);
-    int below = 0;
-    for (size_t i = 0; i + 1 < sh; i++) if (sn_bit(n, i)) { below = 1; break; }
-    sn_shr(n, sh);
     uint64_t m = 0;
-    for (size_t i = n->n; i-- > 0;) m = (m << 32) | n->d[i];
-    e += (long)sh;
-    if (rb && (below || sticky || (m & 1))) {
-        m++;
-        if (m == 0) { m = 0x8000000000000000ULL; e++; }
+    int inexact = sticky;
+    if (sh <= 0) {
+        for (size_t i = n->n; i-- > 0;) m = (m << 32) | n->d[i];
+        m <<= -sh;
+    } else {
+        int rb = sh - 1 < L ? sn_bit(n, (size_t)(sh - 1)) : 0;
+        int below = sticky;
+        for (long i = 0; i < sh - 1 && i < L && !below; i++) if (sn_bit(n, (size_t)i)) below = 1;
+        inexact = rb || below;
+        sn_shr(n, (size_t)sh);
+        for (size_t i = n->n; i-- > 0;) m = (m << 32) | n->d[i];
+        if (rb && (below || (m & 1))) {
+            m++;
+            if (m == 0) { m = 0x8000000000000000ULL; lsb++; }
+        }
     }
-    return sn_make(sign, m, e);
+    if (tiny && inexact) sn_range = 1;
+    union sn_ld u;
+    memset(&u, 0, sizeof u);
+    if (lsb + 63 > 16383) { sn_range = 1; return sn_make(sign, 0x8000000000000000ULL, 20000); }
+    u.p.m = m;
+    /* a denormal (top bit clear) keeps the zero exponent field */
+    u.p.se = (uint16_t)(((m >> 63) ? lsb + 63 + 16383 : 0) | (sign ? 0x8000 : 0));
+    return u.v;
 }
 
 /* strtold: blanks, a sign, then inf/infinity/nan (any case), a hex float
@@ -276,6 +303,7 @@ static long double sn_round_big(int sign, struct sn_big *n, long e, int sticky) 
  * what was read (S itself when nothing was). */
 static long double su_strtold(const char *s, char **end) {
     const char *p = s;
+    sn_range = 0;
     while (isspace((unsigned char)*p)) p++;
     int sign = 0;
     if (*p == '+' || *p == '-') { sign = *p == '-'; p++; }
@@ -307,16 +335,27 @@ static long double su_strtold(const char *s, char **end) {
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
         (isxdigit((unsigned char)p[2]) || (p[2] == '.' && isxdigit((unsigned char)p[3])))) {
         const char *q = p + 2;
-        long e2 = 0;
+        long e2 = 0, sig = 0;
+        int lost = 0;
+        /* 40 significant digits are 160 bits; past them a digit only says
+         * whether the rest was zero (the rounding's sticky bit) */
         for (; isxdigit((unsigned char)*q); q++, digits++) {
-            sn_mul_small(&n, 16);
-            sn_add_small(&n, (uint32_t)(isdigit((unsigned char)*q) ? *q - '0' : (tolower(*q) - 'a' + 10)));
+            if (!sig && *q == '0') continue;
+            if (sig < 40) {
+                sn_mul_small(&n, 16);
+                sn_add_small(&n, (uint32_t)(isdigit((unsigned char)*q) ? *q - '0' : (tolower(*q) - 'a' + 10)));
+                sig++;
+            } else { e2 += 4; if (*q != '0') lost = 1; }
         }
         if (*q == '.') {
             for (q++; isxdigit((unsigned char)*q); q++, digits++) {
-                sn_mul_small(&n, 16);
-                sn_add_small(&n, (uint32_t)(isdigit((unsigned char)*q) ? *q - '0' : (tolower(*q) - 'a' + 10)));
-                e2 -= 4;
+                if (!sig && *q == '0') { e2 -= 4; continue; }
+                if (sig < 40) {
+                    sn_mul_small(&n, 16);
+                    sn_add_small(&n, (uint32_t)(isdigit((unsigned char)*q) ? *q - '0' : (tolower(*q) - 'a' + 10)));
+                    sig++;
+                    e2 -= 4;
+                } else if (*q != '0') lost = 1;
             }
         }
         if ((*q == 'p' || *q == 'P') &&
@@ -330,21 +369,32 @@ static long double su_strtold(const char *s, char **end) {
             q = r;
         }
         if (end) *end = (char *)q;
-        long double v = sn_round_big(sign, &n, e2, 0);
+        long double v = sn_round_big(sign, &n, e2, lost);
         sn_free(&n);
         return v;
     }
-    long e10 = 0;
+    /* The significant digits as an integer, to SN_KEEP of them: past that
+     * a digit only says whether the rest was zero, kept as one more digit
+     * 1 -- which sits strictly between the cut value and the next one up,
+     * and so rounds as the whole string would (a tie between two long
+     * doubles has fewer than 11,500 significant digits). */
+    enum { SN_KEEP = 12000 };
+    long e10 = 0, sig = 0;
+    int lost = 0;
     const char *q = p;
     for (; isdigit((unsigned char)*q); q++, digits++) {
-        if (n.n || *q != '0') { sn_mul_small(&n, 10); sn_add_small(&n, (uint32_t)(*q - '0')); }
+        if (!sig && *q == '0') continue;
+        if (sig < SN_KEEP) { sn_mul_small(&n, 10); sn_add_small(&n, (uint32_t)(*q - '0')); sig++; }
+        else { e10++; if (*q != '0') lost = 1; }
     }
     if (*q == '.') {
         for (q++; isdigit((unsigned char)*q); q++, digits++) {
-            if (n.n || *q != '0') { sn_mul_small(&n, 10); sn_add_small(&n, (uint32_t)(*q - '0')); }
-            e10--;
+            if (!sig && *q == '0') { e10--; continue; }
+            if (sig < SN_KEEP) { sn_mul_small(&n, 10); sn_add_small(&n, (uint32_t)(*q - '0')); sig++; e10--; }
+            else if (*q != '0') lost = 1;
         }
     }
+    if (lost) { sn_mul_small(&n, 10); sn_add_small(&n, 1); sig++; e10--; }
     if (!digits) {
         if (end) *end = (char *)s;
         sn_free(&n);
@@ -362,16 +412,18 @@ static long double su_strtold(const char *s, char **end) {
     }
     if (end) *end = (char *)q;
     long double v;
+    /* the value is below 10^(SIG + E10) and at least a tenth of that */
     if (sn_is_zero(&n)) {
         v = sn_make(sign, 0, 0);
-    } else if (e10 >= 0) {
-        if (e10 > 5000) v = sn_make(sign, 0x8000000000000000ULL, 20000);
-        else {
-            sn_pow_mul(&n, 10, e10);
-            v = sn_round_big(sign, &n, 0, 0);
-        }
-    } else if (e10 < -5100) {
+    } else if (sig + e10 > 4933) {
+        sn_range = 1;
+        v = sn_make(sign, 0x8000000000000000ULL, 20000);
+    } else if (sig + e10 < -4951) {
+        sn_range = 1;
         v = sn_make(sign, 0, 0);
+    } else if (e10 >= 0) {
+        sn_pow_mul(&n, 10, e10);
+        v = sn_round_big(sign, &n, 0, 0);
     } else {
         struct sn_big den = { 0, 0, 0 }, qt = { 0, 0, 0 }, rm = { 0, 0, 0 };
         sn_set_u64(&den, 1);
