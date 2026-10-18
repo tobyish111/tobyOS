@@ -754,6 +754,23 @@ static int parent_path(const char *path, char *out, size_t out_max) {
     return VFS_OK;
 }
 
+/* THE STICKY BIT: in a directory with S_ISVTX (/tmp), an entry may be
+ * removed or renamed only by its owner, the directory's owner, or root --
+ * Linux's check_sticky, EPERM otherwise. Nothing read the bit, so with
+ * write on /tmp any user could delete any other's files there. PARENT is
+ * PATH's directory. VFS_OK when the rule does not apply or allows it. */
+static int sticky_ok(const char *parent, const char *path) {
+    int uid = current_uid();
+    if (uid == 0) return VFS_OK;
+    struct vfs_stat dst, st;
+    if (vfs_stat(parent, &dst) != VFS_OK) return VFS_OK;
+    if (!(dst.mode & VFS_MODE_VALID) || !(dst.mode & VFS_MODE_STICKY))
+        return VFS_OK;
+    if (vfs_stat(path, &st) != VFS_OK) return VFS_OK;   /* the op says why */
+    if ((uint32_t)uid == st.uid || (uint32_t)uid == dst.uid) return VFS_OK;
+    return VFS_ERR_NOTPERM;
+}
+
 int vfs_perm_check(const char *path, int want) {
     if (!path) return VFS_ERR_INVAL;
     /* Root short-circuit: skip the stat entirely. */
@@ -763,6 +780,14 @@ int vfs_perm_check(const char *path, int want) {
     if (rc != VFS_OK) return rc;
     if (mode_allows(st.mode, st.uid, st.gid, want)) return VFS_OK;
     return VFS_ERR_PERM;
+}
+
+/* The same question of a stat already made -- the path walk's search check
+ * stats each directory once (finding 188). */
+int vfs_perm_check_st(const struct vfs_stat *st, int want) {
+    if (!st) return VFS_ERR_INVAL;
+    if (current_uid() == 0) return VFS_OK;
+    return mode_allows(st->mode, st->uid, st->gid, want) ? VFS_OK : VFS_ERR_PERM;
 }
 
 /* -------- read-side -------- */
@@ -943,7 +968,12 @@ int vfs_opendir(const char *path, struct vfs_dir *out) {
     if (!cap_check_path(current_proc(), path, CAP_FILE_READ, "vfs_opendir")) {
         return VFS_ERR_PERM;
     }
-    int prc = vfs_perm_check(path, VFS_WANT_READ | VFS_WANT_EXEC);
+    /* READ, as Linux's open(O_RDONLY|O_DIRECTORY) asks: listing a
+     * directory's names needs r alone -- x is what reaching THROUGH it
+     * needs, and the path walk asks that (finding 188). With both asked
+     * here, `ls d` of a 0600 directory said "Permission denied" where
+     * Linux lists it (and `ls -l` shows its entries as ?????????). */
+    int prc = vfs_perm_check(path, VFS_WANT_READ);
     if (prc != VFS_OK) return prc;
     out->ops   = m->ops;
     out->mnt   = m->data;
@@ -1276,6 +1306,8 @@ int vfs_unlink(const char *path) {
     if (parent_path(path, par, sizeof(par)) == VFS_OK) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
+        prc = sticky_ok(par, path);
+        if (prc != VFS_OK) return prc;
     }
     /* A symlink held in the in-RAM table has no backing file for the
      * filesystem to unlink, and nothing here ever looked in the table --
@@ -1400,9 +1432,13 @@ int vfs_rename(const char *oldpath, const char *newpath) {
         if (parent_path(oldpath, par, sizeof(par)) == VFS_OK) {
             int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
             if (prc != VFS_OK) return prc;
+            prc = sticky_ok(par, oldpath);        /* moving it out */
+            if (prc != VFS_OK) return prc;
         }
         if (parent_path(newpath, par, sizeof(par)) == VFS_OK) {
             int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+            prc = sticky_ok(par, newpath);        /* replacing someone's */
             if (prc != VFS_OK) return prc;
         }
     }
@@ -1834,6 +1870,21 @@ int vfs_symlink(const char *path, const char *target) {
     if (strlen(path) >= VFS_PATH_MAX || strlen(target) >= VFS_PATH_MAX)
         return VFS_ERR_NAMETOOLONG;
     if (symlink_find(path)) return VFS_ERR_EXIST;
+    /* W+X on the directory the link goes in, as every other creation asks
+     * (vfs_create, vfs_mkdir, vfs_link): this asked nothing, so any user
+     * could put a link into any directory -- /etc, someone else's home --
+     * where Linux says "Permission denied". */
+    if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_symlink"))
+        return VFS_ERR_PERM;
+    {
+        int sp = sysprot_check_write(current_proc(), path, "vfs_symlink");
+        if (sp != VFS_OK) return sp;
+        char par[VFS_PATH_MAX];
+        if (parent_path(path, par, sizeof(par)) == VFS_OK) {
+            int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+            if (prc != VFS_OK) return prc;
+        }
+    }
 
     /* Linux slice 7: prefer a PERSISTENT, per-filesystem symlink.
      *

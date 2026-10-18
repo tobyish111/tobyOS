@@ -489,6 +489,9 @@ int  vfs_lchown  (const char *path, uint32_t uid, uint32_t gid);
  * VFS_WANT_READ / VFS_WANT_WRITE / VFS_WANT_EXEC. Returns VFS_OK or
  * VFS_ERR_PERM (or a propagated stat error). uid 0 always passes. */
 int  vfs_perm_check(const char *path, int want);
+/* The same of a stat already in hand (batch 31: the path walk's search
+ * check, finding 188). */
+int  vfs_perm_check_st(const struct vfs_stat *st, int want);
 
 /* Convenience: read the entire file into a kmalloc'd buffer. The
  * caller owns *out_buf and must kfree() it. Returns VFS_OK on success;

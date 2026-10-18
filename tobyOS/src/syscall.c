@@ -2434,6 +2434,60 @@ static int path_walk_physical(const char *root, const char *full,
     return 0;
 }
 
+/* SEARCH PERMISSION ON THE WAY THROUGH (finding 188). Linux's path walk
+ * asks for x on every directory it passes: the one it starts in -- the
+ * root, the working directory for a relative path, a dirfd's directory
+ * for an *at() call -- and each one after it, up to the last component's
+ * parent; never anything above where it starts, so a relative lookup
+ * from a directory whose parent has since lost its x still works. tobyOS
+ * looked at the last component alone: `cat d/f` with d at 0000 read the
+ * file, and a 0644 file under someone else's 0700 directory was anyone's.
+ * KPATH is absolute; the walk starts at FROM (0: the root), and stops at
+ * the first component that is not a directory -- a missing one, or a
+ * link, whose target the caller checks after resolving it -- leaving the
+ * call to say what is wrong there. Root searches anything, as Linux's
+ * CAP_DAC_READ_SEARCH does. */
+static int path_search_ok(const char *kpath, size_t from) {
+    struct proc *p = current_proc();
+    if (!p || p->uid == 0) return 0;
+    size_t n = strlen(kpath);
+    while (n > 1 && kpath[n - 1] == '/') n--;        /* a trailing slash */
+    size_t last = n;
+    while (last > 0 && kpath[last - 1] != '/') last--;
+    char dir[VFS_PATH_MAX];
+    for (size_t i = from; i < last; i++) {
+        if (kpath[i] != '/') continue;
+        size_t len = i ? i : 1;                      /* "/" for the root */
+        if (len >= sizeof dir) return -ABI_ENAMETOOLONG;
+        memcpy(dir, kpath, len);
+        dir[len] = '\0';
+        struct vfs_stat st;
+        if (vfs_stat(dir, &st) != VFS_OK || st.type != VFS_TYPE_DIR) return 0;
+        if (vfs_perm_check_st(&st, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
+    }
+    return 0;
+}
+
+/* resolve_mid_links, with the search permission asked first of the path as
+ * written (up to its first link), then -- when links were followed -- of
+ * the path they led to, from the caller's root: Linux checks both the
+ * directories on the way to a link and those on the way through its
+ * target. */
+static int resolve_mid_links(char *kpath, size_t cap);
+static int resolve_links_searched(char *kpath, size_t cap, size_t from,
+                                  size_t root_len) {
+    int s = path_search_ok(kpath, from);
+    if (s) return s;
+    char before[VFS_PATH_MAX];
+    size_t bl = strlen(kpath);
+    if (bl >= sizeof before) return resolve_mid_links(kpath, cap);
+    memcpy(before, kpath, bl + 1);
+    int r = resolve_mid_links(kpath, cap);
+    if (r) return r;
+    if (strcmp(before, kpath) != 0) return path_search_ok(kpath, root_len);
+    return 0;
+}
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
     char up[ABI_PATH_MAX];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
@@ -2488,8 +2542,11 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
     }
     if (path_has_dotdot(up)) {                     /* see path_walk_physical */
         struct proc *cp = current_proc();
-        return path_walk_physical((cp && cp->fs_root[0]) ? cp->fs_root : "",
-                                  full, out, cap);
+        const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+        int wr = path_walk_physical(root, full, out, cap);
+        if (wr) return wr;
+        /* walked from the root (or its chroot), so searched from there */
+        return path_search_ok(out, strlen(root));
     }
     {
         int rc = path_lexical_clean(full, out, cap);
@@ -2523,7 +2580,17 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
             if (jl + 1 > cap) return -ABI_ENAMETOOLONG;
             memcpy(out, joined, jl + 1);
         }
-        return resolve_mid_links(out, cap);
+        /* where the walk starts: the root, or the working directory */
+        size_t rootl = (cp && cp->fs_root[0]) ? strlen(cp->fs_root) : 0;
+        size_t from = rootl;
+        if (up[0] != '/') {
+            struct proc *wp = current_proc();
+            const char *cwd = (wp && wp->cwd[0]) ? wp->cwd : "/";
+            size_t cl = strlen(cwd);
+            while (cl > 1 && cwd[cl - 1] == '/') cl--;
+            if (cl > 1) from += cl;
+        }
+        return resolve_links_searched(out, cap, from, rootl);
     }
 }
 
@@ -2565,7 +2632,13 @@ static int resolve_user_path_at(int dirfd, const char *upath,
                 }
                 int crc = path_lexical_clean(joined, out, cap);
                 if (crc != 0) return crc;
-                return resolve_mid_links(out, cap);
+                /* an *at() walk starts in the dirfd's directory */
+                struct proc *dp = current_proc();
+                size_t rootl = (dp && dp->fs_root[0]) ? strlen(dp->fs_root) : 0;
+                size_t from = strlen(df->dirpath);
+                while (from > 1 && df->dirpath[from - 1] == '/') from--;
+                if (from == 1) from = 0;
+                return resolve_links_searched(out, cap, from, rootl);
             }
         }
     }
@@ -4585,6 +4658,9 @@ static long chdir_kpath(const char *kpath) {
         kpath = followed;
     }
     if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    /* and SEARCH permission on it, as Linux's chdir asks (finding 188):
+     * `cd d` into a 0600 directory went in */
+    if (vfs_perm_check_st(&st, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
     struct proc *p = current_proc();
     if (!p) return -ABI_EINVAL;
     size_t n = strlen(kpath);
@@ -6186,7 +6262,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         char kold[ABI_PATH_MAX], knew[ABI_PATH_MAX];
         long orr = resolve_user_path((const char *)a1, kold, sizeof kold);
         long nrr = resolve_user_path((const char *)a2, knew, sizeof knew);
-        if (orr != 0 || nrr != 0) return -ABI_ENOENT;
+        /* the walk's own error -- EACCES for a directory not searchable
+         * (finding 188), ENAMETOOLONG -- not always ENOENT */
+        if (orr != 0) return orr;
+        if (nrr != 0) return nrr;
         long lr = vfs_link(kold, knew);
         if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
         return vfs_err_to_abi(lr);
@@ -6249,8 +6328,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * path inside a mount, so the path is stat()ed first -- statfs on a
          * missing file is ENOENT on Linux. */
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-            return -ABI_ENOENT;
+        {   int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr != 0) return rr;            /* EACCES too (finding 188) */
+        }
         struct vfs_stat st;
         int src = vfs_stat(kpath, &st);
         if (src != VFS_OK) return vfs_err_to_abi(src);
@@ -7269,10 +7349,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
                                    klink, sizeof klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
-        if (rc == VFS_OK) return 0;
-        if (rc == VFS_ERR_EXIST) return -ABI_EEXIST;
-        if (rc == VFS_ERR_NOSPC) return -ABI_ENOSPC;
-        return -ABI_EINVAL;
+        /* every error as itself: a directory without write permission is
+         * EACCES now that vfs_symlink asks (finding 188) -- this said
+         * EINVAL for all but two */
+        return rc == VFS_OK ? 0 : vfs_err_to_abi(rc);
     }
 
     case ABI_SYS_READLINK: {
@@ -11132,8 +11212,9 @@ long lx_access_kpath(const char *kpath, int mode) {
 
 static long lx_faccess(const char *upath, int mode) {
     char kpath[ABI_PATH_MAX];
-    if (resolve_user_path(upath, kpath, sizeof kpath) != 0)
-        return -ABI_EFAULT;
+    {   int rr_ = resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+    }
     return lx_access_kpath(kpath, mode);
 }
 
@@ -12819,8 +12900,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * VFS_ERR_ROFS on filesystems that still cannot. */
     case LX_truncate: {
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         if ((long)a2 < 0) return -ABI_EINVAL;
         struct vfs_stat vs;
         if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
@@ -12856,7 +12938,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         long nrr = at ? resolve_user_path_at((int)a3, (const char *)a4,
                                              knew, sizeof knew)
                       : resolve_user_path((const char *)a2, knew, sizeof knew);
-        if (orr != 0 || nrr != 0) return -ABI_ENOENT;
+        /* the walk's own error -- EACCES for a directory not searchable
+         * (finding 188), ENAMETOOLONG -- not always ENOENT */
+        if (orr != 0) return orr;
+        if (nrr != 0) return nrr;
         long lr = vfs_link(kold, knew);
         if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
         return vfs_err_to_abi(lr);
@@ -12895,8 +12980,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (pl >= sizeof kpath) return -ABI_ENAMETOOLONG;
             memcpy(kpath, p, pl + 1);
         } else {
-            if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-                return -ABI_ENOENT;
+            int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr != 0) return rr;            /* EACCES too (finding 188) */
             struct vfs_stat xs;
             if (vfs_stat(kpath, &xs) != VFS_OK) return -ABI_ENOENT;
         }
@@ -12949,7 +13034,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char kpath[ABI_PATH_MAX];
         long rr = at ? resolve_user_path_at((int)a1, upath, kpath, sizeof kpath)
                      : resolve_user_path(upath, kpath, sizeof kpath);
-        if (rr != 0) return -ABI_ENOENT;
+        if (rr != 0) return rr;                /* EACCES too (finding 188) */
         uint32_t fmt = mode & 0170000u;
         /* S_IFIFO is a FIFO (vfs_mkfifo): mkfifo(3) is mknod with it */
         if (fmt == 0010000u) {
@@ -13179,8 +13264,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
 
         char ksrc[ABI_PATH_MAX], ktgt[ABI_PATH_MAX], kfs[32];
-        if (resolve_user_path((const char *)a2, ktgt, sizeof ktgt) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a2, ktgt, sizeof ktgt);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         /* `source` is a device NAME (e.g. "ide0:master.p1"), not a path, so it
          * is copied verbatim rather than path-resolved. For a bind mount it IS
          * a path and gets resolved below. */
@@ -13237,8 +13323,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * rewriting the VFS cannot express, so refuse rather than pretend. */
         if (msflags & 0x1000u) {                          /* MS_BIND */
             char kbind[ABI_PATH_MAX];
-            if (resolve_user_path((const char *)a1, kbind, sizeof kbind) != 0)
-                return -ABI_EFAULT;
+            {   int rr_ = resolve_user_path((const char *)a1, kbind, sizeof kbind);
+                if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+            }
             /* Slice 9: MS_UNBINDABLE means what it says. A propagation flag that
              * is stored and never enforced is the same class of lie as a no-op
              * syscall returning success, so the refusal is real and tested. */
@@ -13346,8 +13433,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (!mp || !userns_capable(LCAP_SYS_ADMIN)) return -ABI_EPERM;
         if (!userns_owns_mnt_ns(mp)) return -ABI_EPERM;   /* see LX_mount */
         char ktgt[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, ktgt, sizeof ktgt) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, ktgt, sizeof ktgt);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         int rc = vfs_unmount(ktgt);
         return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
     }
@@ -13362,8 +13450,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * authority over anything outside the caller. */
         if (!cp || !userns_capable(LCAP_SYS_CHROOT)) return -ABI_EPERM;
         char knew[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, knew, sizeof knew) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, knew, sizeof knew);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         struct vfs_stat st;
         if (vfs_stat(knew, &st) != VFS_OK) return -ABI_ENOENT;
         if (st.type != VFS_TYPE_DIR)         return -ABI_ENOTDIR;
@@ -13395,10 +13484,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * the ownership rule so a user-ns caller cannot pivot someone else's. */
         if (!userns_owns_mnt_ns(pv)) return -ABI_EPERM;
         char knew[ABI_PATH_MAX], kold[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a1, knew, sizeof knew) != 0)
-            return -ABI_EFAULT;
-        if (resolve_user_path((const char *)a2, kold, sizeof kold) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a1, knew, sizeof knew);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
+        {   int rr_ = resolve_user_path((const char *)a2, kold, sizeof kold);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         int rc = vfs_pivot_root(knew, kold);
         return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
     }
@@ -14278,14 +14369,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         int rr = resolve_user_path(ulink, klink, sizeof klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
-        switch (rc) {
-        case VFS_OK:               return 0;
-        case VFS_ERR_EXIST:        return -ABI_EEXIST;
-        case VFS_ERR_NAMETOOLONG:  return -ABI_ENAMETOOLONG;
-        case VFS_ERR_NOSPC:        return -ABI_ENOSPC;
-        case VFS_ERR_INVAL:        return -ABI_EINVAL;
-        default:                   return -ABI_EIO;
-        }
+        /* every error as itself -- EACCES, EROFS, ENOENT were EIO */
+        return rc == VFS_OK ? 0 : vfs_err_to_abi(rc);
     }
 
     /* ---- stat family: translate tobyOS vfs_stat -> Linux struct stat ---- */
@@ -15372,8 +15457,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct vfs_statfs vs;
         char kpath[ABI_PATH_MAX];
         if (n == LX_statfs) {
-            if (resolve_user_path((const char *)a1, kpath, sizeof kpath) != 0)
-                return -ABI_ENOENT;
+            int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+            if (rr != 0) return rr;            /* EACCES too (finding 188) */
         } else {
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
@@ -15529,8 +15614,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct file *inf = fd_lookup((int)a1);
         if (!inf || inf->kind != FILE_KIND_INOTIFY) return -ABI_EINVAL;
         char kpath[ABI_PATH_MAX];
-        if (resolve_user_path((const char *)a2, kpath, sizeof kpath) != 0)
-            return -ABI_EFAULT;
+        {   int rr_ = resolve_user_path((const char *)a2, kpath, sizeof kpath);
+            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        }
         return sys_inotify_add_watch(inf->inotify_id, kpath, (uint32_t)a3);
     }
     case LX_inotify_rm_watch: {

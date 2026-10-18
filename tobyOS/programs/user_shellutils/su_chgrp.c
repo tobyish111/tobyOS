@@ -209,9 +209,13 @@ static int cg_walk(char *path, size_t cap, int top) {
         }
         DIR *d = opendir(path);
         if (!d) {
+            /* a directory that cannot be read is LEFT AS IT IS, as GNU's
+             * walk leaves it (-v: "failed to change"); this changed it
+             * after saying it could not be read (batch 31) */
             int e = errno;
             if (!cg.force) su_error(0, e, "cannot read directory %s", su_quote(path));
-            rc = 1;
+            if (cg.verbose == 2) cg_report("failed", path, 0);
+            return 1;
         } else {
             size_t len = strlen(path);
             struct dirent *de;

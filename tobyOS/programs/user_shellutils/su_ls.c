@@ -60,6 +60,8 @@ struct ls_ent {
     struct stat lst;        /* what the target is, when link_ok */
     int link_ok;
     int is_dir;             /* to be listed as a directory (an operand) */
+    int typed;              /* st.st_mode's TYPE is known: from st, or readdir */
+    int failed;             /* its stat failed: printed with ?s */
     char *q;                /* the quoted name */
     size_t qw;              /* its width in columns */
     int quoted;             /* it starts with a quote */
@@ -84,6 +86,8 @@ static struct {
     int first_out;          /* nothing written yet */
     int print_dirname;
     int align_quotes;
+    int context;            /* -Z: a '?' context column (no SELinux here) */
+    int tfmt_custom;        /* --time-style=+FORMAT */
 } ls;
 
 /* ---- names and ids ---------------------------------------------------- */
@@ -347,8 +351,15 @@ static void ls_color_init(void) {
 }
 
 static const char *ls_color_of(const struct ls_ent *e) {
-    if (!e->ok) return ls_color_get("mi");
+    if (!e->ok && !e->typed) return ls_color_get("mi");
     mode_t m = e->st.st_mode;
+    if (!e->ok) {
+        /* known by readdir's type alone (not statted, or the stat failed):
+         * its type's colour, as GNU gives it -- nothing a mode says */
+        const char *k = S_ISLNK(m) ? "ln" : S_ISDIR(m) ? "di" : S_ISFIFO(m) ? "pi" :
+                        S_ISSOCK(m) ? "so" : S_ISBLK(m) ? "bd" : S_ISCHR(m) ? "cd" : "fi";
+        return ls_color_get(k);
+    }
     const char *k = 0;
     if (S_ISLNK(m)) k = e->link_ok ? "ln" : (ls_color_get("or") ? "or" : "ln");
     else if (S_ISDIR(m)) {
@@ -473,7 +484,7 @@ static void ls_time_of(const struct stat *st, int64_t *sec, long *nsec) {
 }
 
 static int ls_isdirish(const struct ls_ent *e) {
-    if (!e->ok) return 0;
+    if (!e->ok) return e->typed && S_ISDIR(e->st.st_mode);
     if (S_ISDIR(e->st.st_mode)) return 1;
     return S_ISLNK(e->st.st_mode) && e->link_ok && S_ISDIR(e->lst.st_mode);
 }
@@ -527,14 +538,14 @@ static int ls_hidden(const char *name) {
 /* stat E's path: lstat, or stat where links are followed */
 static int ls_stat(struct ls_ent *e, int follow, int cmdline) {
     int r;
-    if (follow) {
-        r = stat(e->path, &e->st);
-        if (r != 0 && (errno == ENOENT || errno == ELOOP) && !cmdline) r = lstat(e->path, &e->st);
-    } else {
-        r = lstat(e->path, &e->st);
-    }
+    (void)cmdline;
+    /* under -L a dangling link or a loop is an entry whose stat failed --
+     * GNU lists it with ?s and says why; it is not lstatted instead */
+    if (follow) r = stat(e->path, &e->st);
+    else        r = lstat(e->path, &e->st);
     if (r != 0) return -1;
     e->ok = 1;
+    e->typed = 1;
     if (S_ISLNK(e->st.st_mode)) {
         char buf[4096];
         ssize_t n = readlink(e->path, buf, sizeof buf - 1);
@@ -578,14 +589,14 @@ static void ls_quote_all(struct ls_ent **v, size_t n) {
 /* ---- output -------------------------------------------------------------- */
 
 static char ls_indicator(const struct ls_ent *e) {
-    if (ls.ind == LI_NONE || !e->ok) return 0;
+    if (ls.ind == LI_NONE || (!e->ok && !e->typed)) return 0;
     mode_t m = e->st.st_mode;
     if (S_ISDIR(m)) return '/';
     if (ls.ind == LI_SLASH) return 0;
     if (S_ISLNK(m)) return ls.fmt == LF_LONG ? 0 : '@';
     if (S_ISFIFO(m)) return '|';
     if (S_ISSOCK(m)) return '=';
-    if (ls.ind == LI_CLASSIFY && S_ISREG(m) && (m & 0111)) return '*';
+    if (ls.ind == LI_CLASSIFY && e->ok && S_ISREG(m) && (m & 0111)) return '*';
     return 0;
 }
 
@@ -748,7 +759,42 @@ static void ls_long_widths(struct ls_ent **v, size_t n, struct ls_widths *w) {
     if (w->major && w->major + 2 + w->minor > w->size) w->size = w->major + 2 + w->minor;
 }
 
+/* the width a time takes in the long format, for a failed stat's '?':
+ * what the style gives now -- 12 for the default, 16 long-iso -- and none
+ * for a +FORMAT of the caller's, as GNU pads it */
+static int ls_time_width(void) {
+    if (ls.tfmt_custom) return 0;
+    char *t = tx_strftime(ls.tfmt_recent, (int64_t)time(0), 0, 0);
+    int n = t ? (int)strlen(t) : 0;
+    free(t);
+    return n;
+}
+
+/* A FAILED STAT IN THE LONG FORMAT: the type readdir gave, '?' for
+ * everything else, each at its column's width and side (GNU's) */
+static void ls_print_long_failed(const struct ls_ent *e, const struct ls_widths *w) {
+    char line[512];
+    size_t n = 0;
+    if (ls.dired) n += (size_t)snprintf(line + n, sizeof line - n, "  ");
+    if (ls.inode) n += (size_t)snprintf(line + n, sizeof line - n, "%*s ", (int)w->ino, "?");
+    if (ls.blocks) n += (size_t)snprintf(line + n, sizeof line - n, "%*s ", (int)w->blk, "?");
+    char mode[12];
+    ls_mode_str(e->st.st_mode, mode);
+    n += (size_t)snprintf(line + n, sizeof line - n, "%c????????? %*s ", mode[0], (int)w->nlink, "?");
+    if (!ls.no_owner) n += (size_t)snprintf(line + n, sizeof line - n, "%-*s ", (int)w->owner, "?");
+    if (!ls.no_group) n += (size_t)snprintf(line + n, sizeof line - n, "%-*s ", (int)w->group, "?");
+    if (ls.author) n += (size_t)snprintf(line + n, sizeof line - n, "%-*s ", (int)w->author, "?");
+    if (ls.context) n += (size_t)snprintf(line + n, sizeof line - n, "? ");
+    n += (size_t)snprintf(line + n, sizeof line - n, "%*s ", (int)w->size, "?");
+    n += (size_t)snprintf(line + n, sizeof line - n, "%*s ", ls_time_width(), "?");
+    if (n >= sizeof line) n = sizeof line - 1;
+    ls_emit(line, n);
+    ls_print_name(e, 1);
+    ls_emitc(ls.zero ? 0 : '\n');
+}
+
 static void ls_print_long(const struct ls_ent *e, const struct ls_widths *w) {
+    if (e->failed) { ls_print_long_failed(e, w); return; }
     char line[512], b[64];
     size_t n = 0;
     if (ls.dired) n += (size_t)snprintf(line + n, sizeof line - n, "  ");
@@ -772,6 +818,7 @@ static void ls_print_long(const struct ls_ent *e, const struct ls_widths *w) {
         else snprintf(b, sizeof b, "%s", ls_idname("/etc/passwd", (unsigned long)e->st.st_uid, &ls_users));
         n += (size_t)snprintf(line + n, sizeof line - n, "%-*s ", (int)w->author, b);
     }
+    if (ls.context) n += (size_t)snprintf(line + n, sizeof line - n, "? ");
     if (S_ISCHR(e->st.st_mode) || S_ISBLK(e->st.st_mode)) {
         char mm[48];
         snprintf(mm, sizeof mm, "%*lu, %*lu", (int)w->major, ls_major(e->st.st_rdev),
@@ -825,6 +872,7 @@ static size_t ls_ent_width(const struct ls_ent *e, const struct ls_widths *w) {
     if (ls_indicator(e)) n++;
     if (ls.inode) n += w->ino + 1;
     if (ls.blocks) n += w->blk + 1;
+    if (ls.context) n += 2;
     return n;
 }
 
@@ -833,17 +881,20 @@ static size_t ls_print_short(const struct ls_ent *e, const struct ls_widths *w) 
     size_t n = 0;
     char b[64];
     if (ls.inode) {
-        int k = snprintf(b, sizeof b, "%*lu ", (int)w->ino, (unsigned long)e->st.st_ino);
+        int k = e->failed ? snprintf(b, sizeof b, "%*s ", (int)w->ino, "?")
+                          : snprintf(b, sizeof b, "%*lu ", (int)w->ino, (unsigned long)e->st.st_ino);
         ls_emit(b, (size_t)k);
         n += (size_t)k;
     }
     if (ls.blocks) {
         char bl[48];
-        ls_blocks_str((uint64_t)e->st.st_blocks, bl, sizeof bl);
+        if (e->failed) snprintf(bl, sizeof bl, "?");
+        else ls_blocks_str((uint64_t)e->st.st_blocks, bl, sizeof bl);
         int k = snprintf(b, sizeof b, "%*s ", (int)w->blk, bl);
         ls_emit(b, (size_t)k);
         n += (size_t)k;
     }
+    if (ls.context) { ls_emits("? "); n += 2; }
     return n + ls_print_name(e, 1);
 }
 
@@ -996,7 +1047,43 @@ static void ls_heading(const char *shown) {
 }
 
 /* an entry NAME of directory PATH, stat'ed, onto *V */
-static void ls_add(const char *path, const char *name, struct ls_ent ***v, size_t *n, size_t *cap) {
+/* WHETHER A LISTED ENTRY IS STATTED, as GNU's ls decides it (measured over
+ * a directory it may read but not search, where every stat fails and so
+ * shows: logs/b31/lsstat-gnu.out). Everything for -l -i -s -Z and the
+ * time and size sorts; otherwise only what readdir's type cannot tell --
+ * whether a regular file is executable (-F, colours), a directory's
+ * sticky and other-writable bits (colours), where a link leads (-L with
+ * indicators, colours or -R; --group-directories-first; colours that
+ * look at the target). A plain `ls` stats nothing, so it lists a
+ * directory it cannot search without an error, as GNU's does. */
+static int ls_needs_stat(unsigned char dt) {
+    if (ls.fmt == LF_LONG || ls.inode || ls.blocks || ls.context ||
+        ls.sort == LS_SIZE || ls.sort == LS_TIME) return 1;
+    int wants_type = ls.ind != LI_NONE || ls.color || ls.group_dirs || ls.recursive;
+    if (dt == DT_UNKNOWN) return wants_type;
+    if (dt == DT_LNK) {
+        if (ls.deref == LD_ALWAYS && wants_type) return 1;
+        if (ls.group_dirs) return 1;
+        if (ls.color) {
+            const char *lnc = ls_color_get("ln");
+            if ((lnc && !strcmp(lnc, "target")) || ls_color_get("or") || ls_color_get("mi"))
+                return 1;
+        }
+        return 0;
+    }
+    if (dt == DT_REG) return ls.ind == LI_CLASSIFY || ls.color;
+    if (dt == DT_DIR) return ls.color;
+    return 0;
+}
+
+static void ls_type_from_dt(struct ls_ent *e, unsigned char dt) {
+    if (dt == DT_UNKNOWN) return;
+    e->st.st_mode = (mode_t)((unsigned)dt << 12);  /* DTTOIF */
+    e->typed = 1;
+}
+
+static void ls_add(const char *path, const char *name, unsigned char dt,
+                   struct ls_ent ***v, size_t *n, size_t *cap) {
     struct ls_ent *e = (struct ls_ent *)calloc(1, sizeof *e);
     if (!e) su_error(2, ENOMEM, "memory exhausted");
     e->name = strdup(name);
@@ -1007,9 +1094,14 @@ static void ls_add(const char *path, const char *name, struct ls_ent ***v, size_
     size_t k = pl;
     if (k && e->path[k - 1] != '/') e->path[k++] = '/';
     memcpy(e->path + k, name, nl + 1);
-    if (ls_stat(e, ls.deref == LD_ALWAYS, 0) != 0) {
+    if (!ls_needs_stat(dt)) {
+        ls_type_from_dt(e, dt);
+    } else if (ls_stat(e, ls.deref == LD_ALWAYS, 0) != 0) {
         su_error(0, errno, "cannot access %s", su_quote(e->path));
         ls.status = ls.status > 1 ? ls.status : 1;
+        memset(&e->st, 0, sizeof e->st);
+        e->failed = 1;
+        ls_type_from_dt(e, dt);
     }
     if (*n == *cap) {
         *cap = *cap ? *cap * 2 : 64;
@@ -1036,15 +1128,15 @@ static void ls_dir(const char *path, const char *shown, int top) {
         if (!strcmp(de->d_name, ".")) dots |= 1;
         if (!strcmp(de->d_name, "..")) dots |= 2;
         if (ls_hidden(de->d_name)) continue;
-        ls_add(path, de->d_name, &v, &n, &cap);
+        ls_add(path, de->d_name, de->d_type, &v, &n, &cap);
     }
     /* . AND .. ARE ENTRIES, as Linux's readdir always gives them; tobyOS's
      * gives neither (a finding of its own: native tools would recurse into
      * them), so -a adds them, first, as Linux lists them */
     if (ls.all == 2 && dots != 3) {
         size_t before = n;
-        if (!(dots & 1) && !ls_hidden(".")) ls_add(path, ".", &v, &n, &cap);
-        if (!(dots & 2) && !ls_hidden("..")) ls_add(path, "..", &v, &n, &cap);
+        if (!(dots & 1) && !ls_hidden(".")) ls_add(path, ".", DT_DIR, &v, &n, &cap);
+        if (!(dots & 2) && !ls_hidden("..")) ls_add(path, "..", DT_DIR, &v, &n, &cap);
         size_t added = n - before;
         struct ls_ent *t[2];
         for (size_t i = 0; i < added; i++) t[i] = v[before + i];
@@ -1058,7 +1150,7 @@ static void ls_dir(const char *path, const char *shown, int top) {
     if (ls.recursive) {
         for (size_t i = 0; i < n; i++) {
             struct ls_ent *e = v[i];
-            if (!e->ok || !S_ISDIR(e->st.st_mode)) continue;
+            if (!(e->ok || e->typed) || !S_ISDIR(e->st.st_mode)) continue;
             if (!strcmp(e->name, ".") || !strcmp(e->name, "..")) continue;
             char *sh = (char *)malloc(strlen(shown) + strlen(e->name) + 2);
             if (!sh) su_error(2, ENOMEM, "memory exhausted");
@@ -1121,6 +1213,7 @@ static void ls_set_time_style(const char *style) {
     if (!strncmp(style, "posix-", 6)) style += 6;
     if (style[0] == '+') {
         static char buf[512];
+        ls.tfmt_custom = 1;
         snprintf(buf, sizeof buf, "%s", style + 1);
         char *nl = strchr(buf, '\n');
         if (nl) { *nl = 0; ls.tfmt_old = buf; ls.tfmt_recent = nl + 1; }
@@ -1301,7 +1394,7 @@ static int do_ls(int argc, char **argv) {
         case 'U': ls.sort = LS_NONE; ls.sort_given = 1; break;
         case 'v': ls.sort = LS_VERSION; ls.sort_given = 1; break;
         case 'X': ls.sort = LS_EXT; ls.sort_given = 1; break;
-        case 'Z': break;            /* no security contexts here */
+        case 'Z': ls.context = 1; break;   /* "?": no security contexts here */
         case 'T': {
             char *e;
             unsigned long v = strtoul(su_optarg, &e, 10);
@@ -1500,6 +1593,16 @@ static int do_ls(int argc, char **argv) {
         if (!e) su_error(2, ENOMEM, "memory exhausted");
         e->name = strdup(ops[i]);
         e->path = strdup(ops[i]);
+        /* THE "." OF NO OPERANDS IS NOT STATTED: GNU lists it as the
+         * directory it is, so in a directory one may not search, `ls`
+         * says "cannot open directory '.'" -- where `ls .` and `ls -d`,
+         * which stat it, say "cannot access '.'" */
+        if (!(argc - su_optind) && !ls.dirs) {
+            e->st.st_mode = S_IFDIR;
+            e->typed = 1;
+            dirs[nd++] = e;
+            continue;
+        }
         int follow = ls.deref == LD_ALWAYS || ls.deref == LD_CMDLINE;
         int r = ls_stat(e, follow, 1);
         if (r == 0 && ls.deref == LD_CMDLINE_DIR && S_ISLNK(e->st.st_mode) && e->link_ok &&

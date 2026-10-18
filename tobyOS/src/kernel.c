@@ -4999,7 +4999,10 @@ void _start(void) {
      * mount(2) -- a working filesystem nothing had mounted. */
     {
         extern int tmpfs_mount_at(const char *path, const char *opts);
-        int rc = tmpfs_mount_at("/tmp", 0);
+        /* 1777, as Linux's: anyone may make a file, and only its owner
+         * (or the directory's, or root) remove it -- vfs.c's sticky rule.
+         * It was 0777, so any user could delete any other's files here. */
+        int rc = tmpfs_mount_at("/tmp", "mode=1777");
         kprintf("[boot] /tmp: %s\n",
                 rc == VFS_OK ? "tmpfs mounted (writable)"
                              : "MOUNT FAILED -- temp files will not work");
@@ -5019,7 +5022,7 @@ void _start(void) {
             extern void utmp_init(void);
             utmp_init();
         }
-        rc = tmpfs_mount_at("/dev/shm", 0);
+        rc = tmpfs_mount_at("/dev/shm", "mode=1777");   /* as Linux's */
         kprintf("[boot] /dev/shm: %s\n",
                 rc == VFS_OK ? "tmpfs mounted (POSIX shm live)"
                              : "MOUNT FAILED -- shm_open will ENOENT");
