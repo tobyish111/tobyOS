@@ -531,9 +531,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_svcctl/user_svcctl.elf \
             programs/user_ps/user_ps.elf \
             programs/user_top/user_top.elf \
-            programs/user_cp/user_cp.elf \
-            programs/user_mv/user_mv.elf \
-            programs/user_rm/user_rm.elf \
             programs/user_find/user_find.elf \
             programs/user_sort/user_sort.elf \
             programs/user_tee/user_tee.elf \
@@ -562,7 +559,6 @@ PROGRAMS := programs/awk/awk.elf \
             programs/user_ln/user_ln.elf \
             programs/user_shellutils/user_shellutils.elf \
             programs/user_tar/user_tar.elf \
-            programs/user_textutils/user_textutils.elf \
             programs/user_zstd/user_zstd.elf \
             programs/user_zip/user_zip.elf \
             programs/user_dig/user_dig.elf \
@@ -3255,9 +3251,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
 	cp programs/user_top/user_top.elf               $(INITRD_STAGE)/bin/top
-	cp programs/user_cp/user_cp.elf                 $(INITRD_STAGE)/bin/cp
-	cp programs/user_mv/user_mv.elf                 $(INITRD_STAGE)/bin/mv
-	cp programs/user_rm/user_rm.elf                 $(INITRD_STAGE)/bin/rm
 	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
 	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
 	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
@@ -3362,21 +3355,13 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    ln -f $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/zstd "$(INITRD_STAGE)/bin/$$ap"; \
 	done
-	cp programs/user_textutils/user_textutils.elf  $(INITRD_STAGE)/bin/comm
-	@# twenty more names that were busybox applets, one binary
-	@for ap in expand unexpand fold nl od hexdump paste rev shuf split \
-	           readlink realpath mktemp groups hostname chown killall \
-	           mount umount domainname getent; do \
-	    ln -f $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
-	      cp $(INITRD_STAGE)/bin/comm "$(INITRD_STAGE)/bin/$$ap"; \
-	done
 	cp programs/user_shellutils/user_shellutils.elf $(INITRD_STAGE)/bin/rmdir
 	@# the names that were busybox applets or programs of their own, one binary
 	@for ap in yes tac seq whoami which uname free sync stat du xargs \
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
 	           cksum truncate install mkfifo date touch sort script hwclock \
            arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-           shred uniq who users uptime true false ls env; do \
+           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -4235,6 +4220,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
 	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
 	    bin/mount bin/umount                                               \
+	    bin/hd bin/dnsdomainname bin/nisdomainname bin/ypdomainname        \
 	    bin/zstd bin/unzstd bin/zstdcat                                    \
 	    bin/zip bin/unzip                                  \
 	    bin/dig bin/host bin/timesyncd                      \

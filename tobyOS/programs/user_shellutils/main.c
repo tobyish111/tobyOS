@@ -133,6 +133,26 @@ static char *first_line(char *s) {
 #include "su_true.c"
 #include "su_ls.c"
 #include "su_env.c"
+#include "su_readlink.c"
+#include "su_mktemp.c"
+#include "su_getent.c"
+#include "su_hostname.c"
+#include "su_chown.c"
+#include "su_killall.c"
+#include "su_mount.c"
+#include "su_od.c"
+#include "su_hexdump.c"
+#include "su_comm.c"
+#include "su_expand.c"
+#include "su_fold.c"
+#include "su_nl.c"
+#include "su_paste.c"
+#include "su_rev.c"
+#include "su_shuf.c"
+#include "su_split.c"
+#include "su_rm.c"
+#include "su_cp.c"
+#include "su_mv.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -194,6 +214,35 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "false"))     return do_true(argc, argv, 1);
     if (!strcmp(base, "ls"))        return do_ls(argc, argv);
     if (!strcmp(base, "env"))       return do_env(argc, argv);
+    if (!strcmp(base, "readlink"))  return do_readlink(argc, argv);
+    if (!strcmp(base, "realpath"))  return do_realpath(argc, argv);
+    if (!strcmp(base, "mktemp"))    return do_mktemp(argc, argv);
+    if (!strcmp(base, "getent"))    return do_getent(argc, argv);
+    if (!strcmp(base, "groups"))    return do_groups(argc, argv);
+    if (!strcmp(base, "hostname"))  return do_hostname(argc, argv);
+    if (!strcmp(base, "domainname")) return do_domainname(argc, argv);
+    if (!strcmp(base, "dnsdomainname")) return do_hostname(argc, argv);
+    if (!strcmp(base, "nisdomainname")) return do_hostname(argc, argv);
+    if (!strcmp(base, "ypdomainname")) return do_hostname(argc, argv);
+    if (!strcmp(base, "chown"))     return do_chown(argc, argv);
+    if (!strcmp(base, "killall"))   return do_killall(argc, argv);
+    if (!strcmp(base, "mount"))     return do_mount(argc, argv);
+    if (!strcmp(base, "umount"))    return do_umount(argc, argv);
+    if (!strcmp(base, "od"))        return do_od(argc, argv);
+    if (!strcmp(base, "hexdump"))   return do_hexdump(argc, argv);
+    if (!strcmp(base, "hd"))        return do_hexdump(argc, argv);
+    if (!strcmp(base, "comm"))      return do_comm(argc, argv);
+    if (!strcmp(base, "expand"))    return do_expand(argc, argv);
+    if (!strcmp(base, "unexpand"))  return do_unexpand(argc, argv);
+    if (!strcmp(base, "fold"))      return do_fold(argc, argv);
+    if (!strcmp(base, "nl"))        return do_nl(argc, argv);
+    if (!strcmp(base, "paste"))     return do_paste(argc, argv);
+    if (!strcmp(base, "rev"))       return do_rev(argc, argv);
+    if (!strcmp(base, "shuf"))      return do_shuf(argc, argv);
+    if (!strcmp(base, "split"))     return do_split(argc, argv);
+    if (!strcmp(base, "rm"))        return do_rm(argc, argv);
+    if (!strcmp(base, "cp"))        return do_cp(argc, argv);
+    if (!strcmp(base, "mv"))        return do_mv(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;

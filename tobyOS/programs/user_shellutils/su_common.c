@@ -372,8 +372,10 @@ static int su_getopt_long(int argc, char **argv, const char *shorts,
             }
             if (ambig && !exact) {
                 if (su_opterr) {
-                    fprintf(stderr, "%s: option '--%.*s' is ambiguous; possibilities:",
-                            argv[0], (int)len, name);
+                    /* the option as written, =VALUE and all, as GNU's
+                     * getopt names it (`--relative=d` is ambiguous) */
+                    fprintf(stderr, "%s: option '--%s' is ambiguous; possibilities:",
+                            argv[0], name);
                     for (int i = 0; longs[i].name; i++)
                         if (strncmp(longs[i].name, name, len) == 0)
                             fprintf(stderr, " '--%s'", longs[i].name);
