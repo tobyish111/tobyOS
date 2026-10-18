@@ -697,7 +697,10 @@ static long stream_fill(FILE *f) {
      * before this process can block for input (a prompt, a coprocess). */
     long r = toby_sc3(ABI_SYS_READ, f->fd, (long)(uintptr_t)dst, (long)want);
     if (r <= 0) {
-        if (r < 0) f->err = 1;
+        /* a failed read leaves errno saying why, as the write side does
+         * (finding 185): `uniq dir` said "error reading 'dir'" and no
+         * more once a directory opened as Linux's does (batch 31) */
+        if (r < 0) { f->err = 1; errno = (int)-r; }
         else       f->eof = 1;
         return r < 0 ? -1 : 0;
     }
@@ -923,7 +926,7 @@ size_t fread(void *buf, size_t sz, size_t n, FILE *f) {
             /* big (or unbuffered) read: straight into the caller's memory */
             long r = toby_sc3(ABI_SYS_READ, f->fd,
                               (long)(uintptr_t)(out + got), (long)left);
-            if (r < 0) { f->err = 1; break; }
+            if (r < 0) { f->err = 1; errno = (int)-r; break; }
             if (r == 0) { f->eof = 1; break; }
             got += (size_t)r;
             continue;

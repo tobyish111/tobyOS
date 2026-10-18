@@ -216,7 +216,8 @@ static int do_uniq(int argc, char **argv) {
     if (strcmp(in, "-")) {
         f = fopen(in, "r");
         /* a directory: Linux opens it and the read fails, which is what
-         * GNU reports; the native open refuses it outright */
+         * GNU reports (the native open does the same since batch 31; a
+         * filesystem that refuses the open is said the same way) */
         if (!f && errno == EISDIR) su_error(1, EISDIR, "error reading %s", su_quote(in));
         if (!f) su_error(1, errno, "%s", su_quotef(in));
     }

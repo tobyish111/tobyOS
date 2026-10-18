@@ -717,6 +717,15 @@ uint32_t vfs_path_mount_flags(const char *path) {
     return m ? m->flags : 0;
 }
 
+/* Do A and B resolve through one mount? (renameat2's EXDEV comes before
+ * its flags' answers, as Linux's does -- batch 31) */
+bool vfs_same_mount(const char *a, const char *b) {
+    const char *ra, *rb;
+    struct vfs_mount *ma = resolve(a, &ra);
+    struct vfs_mount *mb = resolve(b, &rb);
+    return ma && ma == mb;
+}
+
 /* -------- permission helpers (milestone 15) --------
  *
  * The model is intentionally tiny:
@@ -1327,7 +1336,6 @@ int vfs_unlink(const char *path) {
      * it -- a flag that is accepted and ignored is the same class of lie as a
      * no-op syscall that reports success. */
     if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
-    if (!m->ops->unlink) return VFS_ERR_ROFS;
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_unlink")) {
         return VFS_ERR_PERM;
     }
@@ -1354,6 +1362,13 @@ int vfs_unlink(const char *path) {
         vfs_notify(path, VFS_IN_DELETE, 0);
         return VFS_OK;
     }
+    /* A filesystem that cannot remove names (devfs) says so only AFTER the
+     * permission checks, as a writable mount's would: `unlink /dev/null`
+     * as a user is EACCES on Linux (/dev is 0755 root), and this said
+     * EROFS to everyone (batch 31, mv's fixture: "unable to remove
+     * target: Permission denied"). A read-only MOUNT is still EROFS
+     * first, as Linux's mnt_want_write is. */
+    if (!m->ops->unlink) return VFS_ERR_ROFS;
     int urc = m->ops->unlink(m->data, rel);
     if (urc == VFS_OK) {
         vfs_notify(path, VFS_IN_DELETE, 0);
@@ -1445,7 +1460,6 @@ int vfs_rename(const char *oldpath, const char *newpath) {
      * so the wrong code turned `mv /tmp/x /data/x` into a hard failure.
      * VFS_ERR_XDEV already existed (Phase G added it for hard links). */
     if (om != nm)   return VFS_ERR_XDEV;
-    if (!om->ops->rename) return VFS_ERR_ROFS;
     /* Need write on both old and new (source is unlinked, dest is created). */
     if (!cap_check_path(current_proc(), oldpath, CAP_FILE_WRITE, "vfs_rename") ||
         !cap_check_path(current_proc(), newpath, CAP_FILE_WRITE, "vfs_rename"))
@@ -1478,6 +1492,44 @@ int vfs_rename(const char *oldpath, const char *newpath) {
             if (prc != VFS_OK) return prc;
         }
     }
+    /* RENAME'S RULES OF KIND, AS LINUX'S: a directory over a non-directory
+     * is ENOTDIR, a non-directory over a directory EISDIR, a directory over
+     * one with entries ENOTEMPTY, a directory into itself or under itself
+     * EINVAL, and a name onto another name of the same file does nothing.
+     * The drivers did not check: tmpfs replaced a directory full of files
+     * with whatever was renamed onto it, dropping them, and ramfs said
+     * EINVAL for an occupied target (batch 31, the cp/mv/rm audit). Here,
+     * once, for every filesystem. */
+    {
+        struct vfs_stat os, ns;
+        int src = vfs_stat(oldpath, &os);
+        if (src != VFS_OK) return src;
+        bool odir = os.type == VFS_TYPE_DIR;
+        if (odir) {
+            size_t ol = strlen(oldpath);
+            if (strncmp(newpath, oldpath, ol) == 0 && newpath[ol] == '/')
+                return VFS_ERR_INVAL;
+        }
+        if (vfs_stat(newpath, &ns) == VFS_OK) {
+            if (strcmp(oldpath, newpath) == 0 ||
+                (os.ino && os.dev == ns.dev && os.ino == ns.ino))
+                return VFS_OK;
+            bool ndir = ns.type == VFS_TYPE_DIR;
+            if (odir && !ndir) return VFS_ERR_NOTDIR;
+            if (!odir && ndir) return VFS_ERR_ISDIR;
+            if (odir && ndir) {
+                struct vfs_dir dd;
+                if (vfs_opendir(newpath, &dd) == VFS_OK) {
+                    struct vfs_dirent de;
+                    bool has = vfs_readdir(&dd, &de) == VFS_OK;
+                    vfs_closedir(&dd);
+                    if (has) return VFS_ERR_NOTEMPTY;
+                }
+            }
+        }
+    }
+    /* after the permissions, as vfs_unlink's: EACCES for a user, not EROFS */
+    if (!om->ops->rename) return VFS_ERR_ROFS;
     int rrc = om->ops->rename(om->data, orel, nrel);
     if (rrc == VFS_OK) {
         /* The FROM/TO pair shares a cookie so a watcher can correlate the
@@ -1718,14 +1770,29 @@ int vfs_follow_link(const char *path, char *out, size_t outsz) {
 
     char scratch[2][VFS_PATH_MAX];
     const char *cur = path;
+    bool need_dir = false;
 
     for (int depth = 0; ; depth++) {
         struct vfs_stat st;
         int rc = vfs_stat(cur, &st);
         if (rc != VFS_OK) return rc;
-        if (st.type != VFS_TYPE_SYMLINK) break;
-        if (depth >= 8) return VFS_ERR_INVAL;       /* symlink loop / too deep */
+        if (st.type != VFS_TYPE_SYMLINK) {
+            /* a target written with a trailing '/' ("lf/") names a
+             * directory, as Linux's lookup reads it: ENOTDIR else */
+            if (need_dir && st.type != VFS_TYPE_DIR) return VFS_ERR_NOTDIR;
+            break;
+        }
+        /* Linux's limit, and its error: 40 links, ELOOP -- this stopped
+         * at 8 and said EINVAL (batch 31) */
+        if (depth >= 40) return VFS_ERR_LOOP;
         char *next = scratch[depth & 1];            /* never into `cur` */
+        {
+            char raw[VFS_PATH_MAX];
+            if (vfs_readlink(cur, raw, sizeof raw) == VFS_OK) {
+                size_t rl = strlen(raw);
+                if (rl > 0 && raw[rl - 1] == '/') need_dir = true;   /* any hop's */
+            }
+        }
         /* One hop: relative targets against the link's directory,
          * absolute ones in the caller's root (vfs_link_target, whose
          * comment carries the Alpine history of both), `..` cleaned. */

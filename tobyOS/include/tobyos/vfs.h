@@ -113,6 +113,7 @@ enum vfs_type {
 #define VFS_SYMLINK_MAX   8   /* max symlink hops before ELOOP */
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
 #define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
+#define VFS_ERR_NOTEMPTY  -16 /* a directory with entries -> ENOTEMPTY (batch 31) */
 
 struct vfs_stat {
     enum vfs_type type;
@@ -396,6 +397,8 @@ int  vfs_mount_lookup(const char *mount_point,
  * The enforcement points -- execve's setuid transition today, open/write and
  * mknod later -- ask this rather than tracking mounts themselves. */
 uint32_t vfs_path_mount_flags(const char *path);
+/* Batch 31: whether two paths resolve through one mount (EXDEV's test). */
+bool vfs_same_mount(const char *a, const char *b);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 

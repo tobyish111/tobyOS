@@ -254,8 +254,9 @@ static long vfs_err_to_abi(long rv) {
     case VFS_ERR_NAMETOOLONG: return -ABI_ENAMETOOLONG;
     case VFS_ERR_PERM:        return -ABI_EACCES;
     case VFS_ERR_NOTPERM:     return -ABI_EPERM;    /* slice 11 -- see vfs.h */
-    case VFS_ERR_LOOP:        return -ABI_EINVAL;   /* no ABI_ELOOP yet */
+    case VFS_ERR_LOOP:        return -ABI_ELOOP;    /* "Too many levels of symbolic links" */
     case VFS_ERR_XDEV:        return -ABI_EXDEV;    /* Phase G: hard links */
+    case VFS_ERR_NOTEMPTY:    return -ABI_ENOTEMPTY; /* batch 31: rename */
     default:                  return rv;            /* already an ABI errno */
     }
 }
@@ -2314,6 +2315,11 @@ static int resolve_mid_links(char *kpath, size_t cap) {
             work[i] = '\0';
             int rc = vfs_stat(work, &st);
             if (rc != VFS_OK) { work[i] = '/'; break; }   /* a missing component */
+            /* THROUGH A NON-DIRECTORY IS ENOTDIR, as Linux's walk says it:
+             * `cat f/x` with f a file said ENOENT, and tmpfs made a file
+             * under a file for `mktemp f/XXX` (batch 31) */
+            if (st.type != VFS_TYPE_SYMLINK && st.type != VFS_TYPE_DIR)
+                return -ABI_ENOTDIR;
             if (st.type == VFS_TYPE_SYMLINK) {
                 rc = vfs_link_target(work, tgt, sizeof tgt);
                 work[i] = '/';
@@ -2507,7 +2513,10 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
                      (int)sizeof(up) - 1, 64, up);
         return -ABI_ENAMETOOLONG;
     }
-    if (plen == 0 || cap == 0) return -ABI_EINVAL;
+    /* an empty path names nothing: ENOENT, as Linux's (EINVAL for a
+     * zero-sized buffer, which only the kernel can pass) */
+    if (plen == 0) return -ABI_ENOENT;
+    if (cap == 0) return -ABI_EINVAL;
 #ifdef CHROMIUM_BOOT
     /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
      * DIR_ASSETS (resolved via /proc/self/exe) to serve
@@ -2544,6 +2553,21 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
         struct proc *cp = current_proc();
         const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
         int wr = path_walk_physical(root, full, out, cap);
+        /* A WORKING DIRECTORY THAT WAS REMOVED STILL HAS A "..": Linux's
+         * walk climbs from the directory it holds, whose parent link
+         * outlives its name -- `rm -r ../e` from inside e, then `ls ..`,
+         * lists the parent there (batch 31, rm's fixture). The walk here
+         * starts at the cwd's NAME, which is gone, so for a cwd that no
+         * longer exists the path is cleaned lexically instead: the cwd is
+         * a physical path (chdir resolved it). Outside a chroot only. */
+        if (wr == -ABI_ENOENT && up[0] != '/' && !root[0] && cp && cp->cwd[0]) {
+            struct vfs_stat cst;
+            if (vfs_stat(cp->cwd, &cst) != VFS_OK) {
+                wr = path_lexical_clean(full, out, cap);
+                if (wr) return wr;
+                return path_search_ok(out, 0);
+            }
+        }
         if (wr) return wr;
         /* walked from the root (or its chroot), so searched from there */
         return path_search_ok(out, strlen(root));
@@ -2643,6 +2667,39 @@ static int resolve_user_path_at(int dirfd, const char *upath,
         }
     }
     return resolve_user_path(upath, out, cap);
+}
+
+/* A PATH THAT ENDS IN '/' NAMES A DIRECTORY, as Linux's lookup takes one:
+ * its last component is followed through any links and must be a
+ * directory -- ENOTDIR else -- for the calls that look a name up (stat,
+ * lstat, statx, readlink, access). The walk cleans the slash away, so
+ * `readlink lf/` (lf a link to a file) gave lf's target and `stat f/` the
+ * file (batch 31, readlink's and realpath's fixtures). URAW is the
+ * caller's string, KPATH what resolve_user_path made of it; a link there
+ * is replaced by the directory it leads to, so lstat("ld/") is the
+ * directory and readlink("ld/") EINVAL. NOT for unlink, rmdir or rename:
+ * they judge the link itself (sys_unlink, rmdir_path). */
+static int trailing_slash_dir(const char *uraw, char *kpath, size_t cap) {
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    if (n < 2 || raw[n - 1] != '/') return 0;
+    struct vfs_stat st;
+    if (vfs_stat(kpath, &st) != VFS_OK) return 0;      /* the call says why */
+    if (st.type == VFS_TYPE_SYMLINK) {
+        char t[VFS_PATH_MAX];
+        int fr = vfs_follow_link(kpath, t, sizeof t);
+        if (fr != VFS_OK) return (int)vfs_err_to_abi(fr);
+        if (vfs_stat(t, &st) != VFS_OK) return -ABI_ENOENT;
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+        size_t tl = strlen(t);
+        if (tl + 1 > cap) return -ABI_ENAMETOOLONG;
+        memcpy(kpath, t, tl + 1);
+        return 0;
+    }
+    return st.type == VFS_TYPE_DIR ? 0 : -ABI_ENOTDIR;
 }
 
 /* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------
@@ -3626,6 +3683,57 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
     bool want_trunc  = (flags & ABI_O_TRUNC) != 0;
     bool want_append = (flags & ABI_O_APPEND)!= 0;
 
+    /* THE LAST COMPONENT'S LINK IS FOLLOWED FIRST, as Linux's open follows
+     * it (not with O_NOFOLLOW, nor for O_CREAT|O_EXCL, which fail on the
+     * link): what is created, truncated and opened is what the link names.
+     * Only the open itself followed (vfs_open_access), so O_TRUNC truncated
+     * the LINK's path, failed, and took its unlink-and-create fallback --
+     * `cp b la`, la a link to a, replaced the link with a regular file and
+     * left a as it was -- and O_CREAT through a dangling link made nothing
+     * (batch 31, cp's fixture). A dangling link's target is where O_CREAT
+     * makes the file. */
+    char lk[VFS_PATH_MAX];
+    if (!(flags & LX_O_NOFOLLOW) && !(want_create && want_excl)) {
+        struct vfs_stat lst;
+        size_t kl = strlen(kpath);
+        if (kl < sizeof lk && vfs_stat(kpath, &lst) == VFS_OK &&
+            lst.type == VFS_TYPE_SYMLINK) {
+            char hop[2][VFS_PATH_MAX];
+            const char *cur = kpath;
+            int n = 0;
+            for (;;) {
+                struct vfs_stat hs;
+                if (vfs_stat(cur, &hs) != VFS_OK || hs.type != VFS_TYPE_SYMLINK)
+                    break;                       /* there, or where to make it */
+                if (++n > 40) return -ABI_ELOOP;
+                char *nx = hop[n & 1];           /* never into `cur` */
+                if (vfs_link_target(cur, nx, VFS_PATH_MAX) != VFS_OK) break;
+                cur = nx;
+            }
+            size_t cl = strlen(cur);
+            if (cl >= sizeof lk) return -ABI_ENAMETOOLONG;
+            memcpy(lk, cur, cl + 1);
+            kpath = lk;
+        }
+    }
+
+    /* A DIRECTORY IS OPENED AS LINUX OPENS ONE, by every caller: EISDIR
+     * for writing, O_CREAT or O_TRUNC, else the descriptor the Linux
+     * personality gives (linux_open_dir) -- read(2) is EISDIR on it,
+     * fstat says directory. A native open of a directory used to reach
+     * the filesystem: tmpfs opened it as an empty file (`split -n 3 dir`
+     * read nothing and said nothing), and O_TRUNC's unlink-and-create
+     * fallback REPLACED an empty directory with a regular file (`shuf -o
+     * dir` wrote its output there) (batch 31, shuf's and split's
+     * fixtures). O_CREAT|O_EXCL is EEXIST, below. */
+    if (!(want_create && want_excl)) {
+        struct vfs_stat dvs;
+        if (vfs_stat(kpath, &dvs) == VFS_OK && dvs.type == VFS_TYPE_DIR) {
+            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+            return linux_open_dir(kpath);
+        }
+    }
+
     /* Optionally create. Returns EEXIST if O_EXCL set and present. */
     bool created = false;
     if (want_create) {
@@ -4100,6 +4208,7 @@ static int stat_resolve(const char *kpath, bool follow, char *final,
                         int *fdno) {
     char hop[2][VFS_PATH_MAX];
     const char *cur = kpath;
+    bool need_dir = false;
     *fdf = 0;
     for (int n = 0; n < 40; n++) {
         if (follow) {
@@ -4127,10 +4236,21 @@ static int stat_resolve(const char *kpath, bool follow, char *final,
         int rc = vfs_stat(cur, vs);
         if (rc != VFS_OK) return rc;
         if (!follow || vs->type != VFS_TYPE_SYMLINK) {
+            /* a link whose target ends in '/' ("f/") names a directory:
+             * stat -L of one to a file is ENOTDIR, as Linux's walk says
+             * (batch 31, realpath -s's fixture) */
+            if (need_dir && vs->type != VFS_TYPE_DIR) return VFS_ERR_NOTDIR;
             size_t l = strlen(cur);
             if (l >= cap) return VFS_ERR_NAMETOOLONG;
             memcpy(final, cur, l + 1);
             return VFS_OK;
+        }
+        {
+            char raw[VFS_PATH_MAX];
+            if (vfs_readlink(cur, raw, sizeof raw) == VFS_OK) {
+                size_t rl = strlen(raw);
+                if (rl > 0 && raw[rl - 1] == '/') need_dir = true;   /* any hop's */
+            }
         }
         char *nx = hop[n & 1];                      /* never into `cur` */
         rc = vfs_link_target(cur, nx, VFS_PATH_MAX);
@@ -4142,6 +4262,7 @@ static int stat_resolve(const char *kpath, bool follow, char *final,
 
 static long stat_errno(int vr) {
     if (vr == VFS_ERR_NOENT)       return -ABI_ENOENT;
+    if (vr == VFS_ERR_NOTDIR)      return -ABI_ENOTDIR;
     if (vr == VFS_ERR_LOOP)        return -ABI_ELOOP;
     if (vr == VFS_ERR_NAMETOOLONG) return -ABI_ENAMETOOLONG;
     return -ABI_EACCES;
@@ -4153,6 +4274,15 @@ static long stat_errno(int vr) {
  * "a regular file, 0666". */
 static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
     memset(tmp, 0, sizeof *tmp);
+    if (f->kind == FILE_KIND_DIR && f->dirpath) {
+        /* a directory's descriptor is its directory (a native open of one
+         * makes it since batch 31): it said "a regular file, 0666" */
+        struct vfs_stat vs;
+        if (vfs_stat(f->dirpath, &vs) == VFS_OK) { fill_abi_stat(&vs, tmp); return; }
+        tmp->mode = ABI_S_IFDIR | 0755;
+        tmp->nlink = 2;
+        return;
+    }
     if (f->kind == FILE_KIND_VFS) {
         struct vfs_stat vs;
         uint64_t ino;
@@ -4202,6 +4332,8 @@ static long sys_stat_follow_sz(const char *path, struct abi_stat *out, bool foll
     if (outsz > sizeof(struct abi_stat)) outsz = sizeof(struct abi_stat);
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    rr = trailing_slash_dir(path, kpath, sizeof kpath);
     if (rr) return rr;
     /* A synthesised /dev node has no VFS entry -- see dev_synth_mode. Checked
      * BEFORE the VFS so a real file of the same name could never shadow the
@@ -6732,6 +6864,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return linux_syscall_impl(165, a1, a2, a3, a4, a5);
     case ABI_SYS_UMOUNT2:           /* batch 31: umount(8); the Linux arm */
         return linux_syscall_impl(166, a1, a2, 0, 0, 0);
+    case ABI_SYS_RENAMEAT2:         /* batch 31: mv --exchange; the Linux arm */
+        return linux_syscall_impl(316, a1, a2, a3, a4, a5);
 
     /* ---- Milestone 25A: libc-shape calls ------------------------ */
     case SYS_GETPID:        return sys_getpid();
@@ -7367,6 +7501,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * vfs_readlink only understands absolute paths. */
         { int rr = resolve_user_path((const char *)(uintptr_t)a1,
                                      kpath, sizeof kpath);
+          if (rr) return rr;
+          rr = trailing_slash_dir((const char *)(uintptr_t)a1, kpath, sizeof kpath);
           if (rr) return rr; }
         if (!buf || bufsz == 0) return -ABI_EFAULT;
         if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
@@ -8550,7 +8686,10 @@ static bool lx_dir_open_refused(long flags) {
  * re-opens via vfs_opendir and resumes after dir_off entries. */
 static long linux_open_dir(const char *kpath) {
     struct vfs_dir probe;
-    if (vfs_opendir(kpath, &probe) != VFS_OK) return -ABI_ENOENT;
+    /* the opendir's own error: EACCES for a directory without r (finding
+     * 188's opendir asks r alone) -- it said ENOENT for every failure */
+    int orc = vfs_opendir(kpath, &probe);
+    if (orc != VFS_OK) return vfs_err_to_abi(orc);
     vfs_closedir(&probe);
     struct file *f = (struct file *)kmalloc(sizeof *f);
     if (!f) return -ABI_ENOMEM;
@@ -11190,8 +11329,14 @@ long lx_access_kpath(const char *kpath, int mode) {
             return (dm & 0111u) ? 0 : -ABI_EACCES;
         }
     }
+    /* THROUGH A LINK, as access(2) looks: what it names is what is asked
+     * about -- `test -w lnk` judged the link's own 0777, and a dangling
+     * link "existed" (batch 31) */
     struct vfs_stat vs;
-    if (vfs_stat(kpath, &vs) != VFS_OK) return -ABI_ENOENT;
+    {
+        int sr = vfs_stat_follow(kpath, &vs);
+        if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    }
 
     unsigned want = (unsigned)mode & 7u;
     if (want == 0) return 0;               /* F_OK: existence only */
@@ -11207,17 +11352,25 @@ long lx_access_kpath(const char *kpath, int mode) {
         if (!(want & LX_X_OK)) return 0;
         return (perm & 0111u) ? 0 : -ABI_EACCES;
     }
+    /* the group bits for a member of the file's group by a supplementary
+     * group too, as the VFS's own check counts them (finding 174) */
+    bool in_group = vs.gid == gid;
+    for (int i = 0; me && !in_group && i < me->ngroups && i < PROC_NGROUPS_MAX; i++)
+        if ((uint32_t)me->groups[i] == vs.gid) in_group = true;
     unsigned bits;
     if      (vs.uid == uid) bits = (perm >> 6) & 7u;
-    else if (vs.gid == gid) bits = (perm >> 3) & 7u;
+    else if (in_group)      bits = (perm >> 3) & 7u;
     else                    bits = perm & 7u;
     return ((bits & want) == want) ? 0 : -ABI_EACCES;
 }
 
+static int trailing_slash_dir(const char *uraw, char *kpath, size_t cap);
 static long lx_faccess(const char *upath, int mode) {
     char kpath[ABI_PATH_MAX];
     {   int rr_ = resolve_user_path(upath, kpath, sizeof kpath);
         if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
+        rr_ = trailing_slash_dir(upath, kpath, sizeof kpath);
+        if (rr_ != 0) return rr_;
     }
     return lx_access_kpath(kpath, mode);
 }
@@ -13877,8 +14030,72 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_rename:                 /* (oldpath, newpath) */
         return sys_rename((const char *)a1, (const char *)a2);
     case LX_renameat:               /* (olddirfd, oldpath, newdirfd, newpath) */
-    case LX_renameat2:              /* (..., flags) -- AT_FDCWD + flags ignored */
-        return sys_rename((const char *)a2, (const char *)a4);
+    case LX_renameat2: {            /* (..., flags) */
+        /* EACH PATH FROM ITS OWN DIRFD, AND THE FLAGS AS LINUX TAKES THEM
+         * (batch 31). Both dirfds were ignored -- a relative path resolved
+         * from the cwd -- and so were the flags: RENAME_NOREPLACE replaced,
+         * and RENAME_EXCHANGE did a plain rename that destroyed the
+         * target. NOREPLACE is EEXIST for a target that is there; EXCHANGE
+         * swaps the two (below); WHITEOUT, which no filesystem here can do,
+         * is EINVAL, as a Linux filesystem without it says; so are unknown
+         * flags and NOREPLACE with EXCHANGE. */
+        long fl = (n == LX_renameat2) ? (long)a5 : 0;
+        if (fl & ~7L) return -ABI_EINVAL;
+        if ((fl & 1) && (fl & 2)) return -ABI_EINVAL;
+        if (fl & 4) return -ABI_EINVAL;
+        char ko[ABI_PATH_MAX], kn[ABI_PATH_MAX];
+        int rr = resolve_user_path_at((int)a1, (const char *)a2, ko, sizeof ko);
+        if (rr) return rr;
+        rr = resolve_user_path_at((int)a3, (const char *)a4, kn, sizeof kn);
+        if (rr) return rr;
+        /* two filesystems are EXDEV before anything the flags ask, as
+         * Linux's: mv's NOREPLACE try onto another disk must learn to copy
+         * (it said EEXIST, and mv reported the wrong failure) */
+        if (!vfs_same_mount(ko, kn)) return -ABI_EXDEV;
+        if (fl & 1) {
+            struct vfs_stat ns;
+            if (vfs_stat(kn, &ns) == VFS_OK) return -ABI_EEXIST;
+        }
+        if (fl & 2) {
+            /* RENAME_EXCHANGE: both names must be there (ENOENT), on one
+             * filesystem (EXDEV), neither inside the other (EINVAL). Done
+             * as three renames through a name of the kernel's own beside
+             * the first, all under the BKL: no other system call runs
+             * between them unless a driver sleeps for I/O (the RAM
+             * filesystems never do; a disk's wait could show another
+             * caller the middle, which Linux's swap never shows). A step
+             * that fails puts back what had moved. */
+            struct vfs_stat as, bs;
+            if (vfs_stat(ko, &as) != VFS_OK || vfs_stat(kn, &bs) != VFS_OK)
+                return -ABI_ENOENT;
+            if (strcmp(ko, kn) == 0) return 0;
+            size_t ol = strlen(ko), nl2 = strlen(kn);
+            if ((strncmp(kn, ko, ol) == 0 && kn[ol] == '/') ||
+                (strncmp(ko, kn, nl2) == 0 && ko[nl2] == '/'))
+                return -ABI_EINVAL;
+            char tmp[ABI_PATH_MAX];
+            struct proc *xp = current_proc();
+            int k = 0;
+            struct vfs_stat ts;
+            do {
+                int w = ksnprintf(tmp, sizeof tmp, "%s.~xchg.%d.%d~", ko,
+                                  xp ? xp->pid : 0, k);
+                if (w <= 0 || (size_t)w >= sizeof tmp) return -ABI_ENAMETOOLONG;
+            } while (vfs_stat(tmp, &ts) == VFS_OK && ++k < 100);
+            int r = vfs_rename(ko, tmp);
+            if (r != VFS_OK) return vfs_err_to_abi(r);
+            r = vfs_rename(kn, ko);
+            if (r != VFS_OK) { (void)vfs_rename(tmp, ko); return vfs_err_to_abi(r); }
+            r = vfs_rename(tmp, kn);
+            if (r != VFS_OK) {
+                (void)vfs_rename(ko, kn);
+                (void)vfs_rename(tmp, ko);
+                return vfs_err_to_abi(r);
+            }
+            return 0;
+        }
+        return vfs_err_to_abi(vfs_rename(ko, kn));
+    }
     case LX_unlinkat:               /* (dirfd, path, flags) -- AT_FDCWD; tobyfs
                                      * unlink removes files AND empty dirs, so it
                                      * serves AT_REMOVEDIR too. */
@@ -14283,7 +14500,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char *ubuf        = is_at ? (char *)a3       : (char *)a2;
         size_t bufsz      = is_at ? (size_t)a4       : (size_t)a3;
         char kpath[ABI_PATH_MAX], ktmp[ABI_PATH_MAX];
-        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        /* readlinkat's path from its dirfd; it was the cwd (batch 31) */
+        int rr = is_at ? resolve_user_path_at((int)a1, upath, kpath, sizeof kpath)
+                       : resolve_user_path(upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
         if (rr) return rr;
         if (!ubuf || bufsz == 0) return -ABI_EINVAL;
         size_t cap = bufsz < sizeof(ktmp) ? bufsz : sizeof(ktmp);
@@ -14382,7 +14603,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
         if (strncpy_from_user(ktarget, utarget, sizeof ktarget) < 0)
             return -ABI_EFAULT;
-        int rr = resolve_user_path(ulink, klink, sizeof klink);
+        /* symlinkat's link path is relative to NEWDIRFD; it was the cwd */
+        int rr = is_at ? resolve_user_path_at((int)a2, ulink, klink, sizeof klink)
+                       : resolve_user_path(ulink, klink, sizeof klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
         /* every error as itself -- EACCES, EROFS, ENOENT were EIO */
@@ -14394,6 +14617,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_lstat: {                   /* (path, struct stat*) */
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (rr) return rr;
+        rr = trailing_slash_dir((const char *)a1, kpath, sizeof kpath);
         if (rr) return rr;
         if (n == LX_stat) {                /* stat follows; lstat does not */
             struct file *ff = 0;
@@ -14442,6 +14667,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * "self/task/" through a /proc dirfd (thread_helpers.cc:41). */
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
         if (rr) return rr;
         if (!((int)a4 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
             struct file *ff = 0;
@@ -15514,7 +15741,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return lx_emit_fd_statx(f, (int)a1, (void *)a5);
         }
         char kpath[ABI_PATH_MAX];
-        int rr = resolve_user_path(upath, kpath, sizeof kpath);
+        int rr = resolve_user_path_at((int)a1, upath, kpath, sizeof kpath);
+        if (rr) return rr;
+        rr = trailing_slash_dir(upath, kpath, sizeof kpath);
         if (rr) return rr;
         if (!((int)a3 & 0x100)) {          /* no AT_SYMLINK_NOFOLLOW */
             struct file *ff = 0;

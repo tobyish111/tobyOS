@@ -93,7 +93,37 @@ static void put_uint(int fd, unsigned v) {
     sys_write(fd, buf, (size_t)i);
 }
 
-static int cat_fd(int fd, int number_lines) {
+/* An errno in musl's words (libtoby's, the guest's bash's). */
+static const char *why(long e) {
+    switch (e) {
+    case 1:  return "Operation not permitted";
+    case 2:  return "No such file or directory";
+    case 5:  return "I/O error";
+    case 6:  return "No such device or address";
+    case 13: return "Permission denied";
+    case 20: return "Not a directory";
+    case 21: return "Is a directory";
+    case 24: return "No file descriptors available";
+    case 28: return "No space left on device";
+    case 32: return "Broken pipe";
+    case 36: return "Filename too long";
+    case 40: return "Symbolic link loop";
+    default: return "I/O error";
+    }
+}
+
+static void complain(const char *name, long e) {
+    put_str(2, "cat: ");
+    if (name) { put_str(2, name); put_str(2, ": "); }
+    put_str(2, why(e));
+    put_str(2, "\n");
+}
+
+/* 0; 1 for a read error, said, and the next file is tried; 2 for a write
+ * error, said, and GNU's cat stops there with status 1. Both were silent:
+ * `cat dir` said nothing once a directory opened as Linux's does (batch
+ * 31), and `cat > /dev/full` exited 2 without a word. */
+static int cat_fd(int fd, const char *name, int number_lines) {
     char buf[4096];
     unsigned line_no = 1;
     int at_line_start = 1;
@@ -101,13 +131,18 @@ static int cat_fd(int fd, int number_lines) {
     for (;;) {
         ssize_t n = sys_read(fd, buf, sizeof(buf));
         if (n == 0) return 0;
-        if (n < 0)  return 1;
+        if (n < 0)  { complain(name, -n); return 1; }
 
         if (!number_lines) {
             ssize_t off = 0;
             while (off < n) {
                 ssize_t w = sys_write(1, buf + off, (size_t)(n - off));
-                if (w <= 0) return 2;
+                if (w <= 0) {
+                    put_str(2, "cat: write error: ");
+                    put_str(2, why(w < 0 ? -w : 28));
+                    put_str(2, "\n");
+                    return 2;
+                }
                 off += w;
             }
         } else {
@@ -151,13 +186,15 @@ int main(int argc, char **argv) {
     }
 
     if (!first_file) {
-        return cat_fd(0, number_lines);
+        return cat_fd(0, "-", number_lines) ? 1 : 0;
     }
 
     int status = 0;
     for (int i = first_file; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] == '\0') {
-            if (cat_fd(0, number_lines) != 0) status = 1;
+            int r = cat_fd(0, "-", number_lines);
+            if (r == 2) return 1;
+            if (r) status = 1;
             continue;
         }
         if (argv[i][0] == '-' && argv[i][1] != '\0') continue;
@@ -167,29 +204,14 @@ int main(int argc, char **argv) {
             /* the open's own errno, in musl's words: every failure said "No
              * such file or directory" -- a directory, a file it may not
              * read, /dev/tty without a terminal (ENXIO) */
-            const char *why;
-            switch (-fd) {
-            case 1:  why = "Operation not permitted"; break;
-            case 2:  why = "No such file or directory"; break;
-            case 6:  why = "No such device or address"; break;
-            case 13: why = "Permission denied"; break;
-            case 20: why = "Not a directory"; break;
-            case 21: why = "Is a directory"; break;
-            case 24: why = "No file descriptors available"; break;
-            case 36: why = "Filename too long"; break;
-            case 40: why = "Symbolic link loop"; break;
-            default: why = "I/O error"; break;
-            }
-            put_str(2, "cat: ");
-            put_str(2, argv[i]);
-            put_str(2, ": ");
-            put_str(2, why);
-            put_str(2, "\n");
+            complain(argv[i], -fd);
             status = 1;
             continue;
         }
-        if (cat_fd(fd, number_lines) != 0) status = 1;
+        int r = cat_fd(fd, argv[i], number_lines);
         sys_close(fd);
+        if (r == 2) return 1;
+        if (r) status = 1;
     }
     return status;
 }
