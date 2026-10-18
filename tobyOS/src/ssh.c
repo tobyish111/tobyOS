@@ -328,12 +328,26 @@ static size_t ssh_tx_space(void) {
     return SSH_TX_MAX - g_tx_tail;
 }
 
+/* WHETHER A PASS OF THE WORKER GOT ANYWHERE: bytes from the client, out to
+ * the wire, from the shell, into its input, a shell started, a session
+ * ended. A pass that moved nothing parks the worker until an event (see
+ * ssh_worker); one that moved something goes round again, since what is
+ * left -- the rest of a pty ring it reads 2 KiB of a pass -- will not
+ * announce itself a second time. */
+static bool g_pass_moved;
+/* The pty output linger (ssh_drain_channel_output): when it began, 0 for
+ * none; how much output ends it at once, and how long it may last. */
+static uint64_t g_linger_since;
+#define SSH_LINGER_BYTES 1024u
+#define SSH_LINGER_NS    1000000ull
+
 /* Drain whatever the send window will take right now. Never blocks. */
 static void ssh_tx_flush(void) {
     while (g_cli && g_tx_head < g_tx_tail) {
         long s = tcp_send_nb(g_cli, g_tx + g_tx_head, ssh_tx_pending());
         if (s <= 0) break;
         g_tx_head += (size_t)s;
+        g_pass_moved = true;
     }
     if (g_tx_head == g_tx_tail) g_tx_head = g_tx_tail = 0;
 }
@@ -1744,6 +1758,7 @@ static void ssh_feed_channel_input(void) {
             w = (long)run;
         }
         if (w <= 0) break;                 /* ring full: try again next tick */
+        g_pass_moved = true;
         g_chan.in_pend_tail = (g_chan.in_pend_tail + (size_t)w) % SSH_CHANNEL_WINDOW;
         if ((size_t)w < run) break;
     }
@@ -1831,6 +1846,7 @@ static void ssh_drain_pipes(void) {
             if (n <= 0) {                           /* EOF */
                 file_close(*fp);
                 *fp = 0;
+                g_pass_moved = true;
                 continue;
             }
             g_last_client_ns = perf_now_ns();       /* output counts as life */
@@ -1843,6 +1859,7 @@ static void ssh_drain_pipes(void) {
             }
             g_chan.remote_window -= (uint32_t)n;
             moved = true;
+            g_pass_moved = true;
         }
         if (!moved) break;
     }
@@ -1860,6 +1877,27 @@ static void ssh_drain_channel_output(void) {
         return;
     }
     if (!g_chan.ptym) return;
+
+    /* A LITTLE OUTPUT WAITS A MOMENT FOR MORE. A worker that wakes on
+     * every write sent one SSH packet -- encrypted, MAC'd, a TCP segment
+     * -- per line a program wrote: `seq 1 60000` on a pty took 6.3 s
+     * where the old 20 ms pacing, which batched by accident, took 4.1
+     * (finding 191). While the shell is alive and less than a packet's
+     * worth is waiting, the pass goes round (yielding) for up to 1 ms
+     * before sending: a keystroke's echo is a millisecond later at most. */
+    {
+        bool open;
+        size_t pend = pty_master_pending(g_chan.ptym, &open);
+        if (pend > 0 && pend < SSH_LINGER_BYTES && open) {
+            uint64_t now = perf_now_ns();
+            if (!g_linger_since) g_linger_since = now;
+            if (now - g_linger_since < SSH_LINGER_NS) {
+                g_pass_moved = true;      /* not parked: going round */
+                return;
+            }
+        }
+        g_linger_since = 0;
+    }
 
     for (int rounds = 0; rounds < 4; rounds++) {
         if (g_chan.remote_window == 0) return;
@@ -1906,6 +1944,7 @@ static void ssh_drain_channel_output(void) {
             return;
         }
         g_chan.remote_window -= (uint32_t)n;
+        g_pass_moved = true;
     }
 }
 
@@ -2143,6 +2182,7 @@ static void ssh_service(void) {
                 "preempted for a waiting client)\n",
                 (unsigned)(SSH_PREEMPT_NS / 1000000000ull));
         ssh_close_client();
+        g_pass_moved = true;
         return;
     }
     if (g_last_client_ns &&
@@ -2150,6 +2190,7 @@ static void ssh_service(void) {
         kprintf("[ssh] session idle for %us -- closing\n",
                 (unsigned)(SSH_IDLE_REAP_NS / 1000000000ull));
         ssh_close_client();
+        g_pass_moved = true;
         return;
     }
 
@@ -2163,17 +2204,21 @@ static void ssh_service(void) {
             (void)ssh_send_channel_close(g_cli);
             g_chan.active = false;
         }
+        g_pass_moved = true;
     }
 
     ssh_feed_channel_input();
 
-    /* A real timeout is affordable here, and wanted. In the old idle-tick
-     * context any wait froze the machine, so this was 0 and the loop spun;
-     * on the worker tcp_yield_wait turns the wait into a yield, which paces
-     * the loop and cuts round-trip latency at the same time. */
+    /* NO WAIT HERE. This waited up to 20 ms -- and on the worker
+     * tcp_yield_wait turns a wait into sched_yield, which returns at once
+     * on a CPU with nothing else to run, so the wait was a spin: one CPU
+     * 100% in the kernel from the first connection on, session or none
+     * (finding 191). The worker parks between passes instead, on the
+     * events that can give it work, and TCP input is one of them. */
     uint8_t buf[128];
-    long n = tcp_recv_quiet(g_cli, buf, sizeof(buf), 20);
+    long n = tcp_recv_quiet(g_cli, buf, sizeof(buf), 0);
     if (n > 0) {
+        g_pass_moved = true;
         g_last_client_ns = perf_now_ns();
         if (g_state == SSH_WAIT_IDENT) {
             for (long i = 0; i < n; i++) {
@@ -2203,6 +2248,7 @@ static void ssh_service(void) {
     if (n < 0) {
         kprintf("[ssh] client disconnected/error\n");
         ssh_close_client();
+        g_pass_moved = true;
         return;
     }
 
@@ -2210,6 +2256,7 @@ static void ssh_service(void) {
     if (g_state == SSH_SENT_DISCONNECT ||
         (st != TCP_ESTABLISHED && st != TCP_CLOSE_WAIT)) {
         ssh_close_client();
+        g_pass_moved = true;
     }
 }
 
@@ -2221,12 +2268,32 @@ static void ssh_worker(void) {
     if (self) self->tcp_yield_wait = true;   /* yield, never hlt, in tcp waits */
     kprintf("[ssh] worker up (pid=%d)\n", self ? self->pid : -1);
 
+    /* Each pass serves whatever is ready, never waiting inside. A pass that
+     * moved nothing PARKS the worker on the poll wait list until something
+     * that could give it work happens: a TCP segment on its connection
+     * (tcp.c), the shell's pty or pipes becoming readable or writable
+     * (pty.c, pipe.c), the shell's exit (its SIGCHLD to us, its parent), or
+     * ssh_poll handing over a connection or a reap. The list's 20 ms sweep
+     * wakes it besides, which is what the idle-reap and preempt clocks
+     * need. The count is read BEFORE the pass, so an event during it makes
+     * the park return at once rather than wait for the next one.
+     *
+     * It used to yield and go round, and with nothing else on its CPU a
+     * yield returns at once: one CPU 100% busy in the kernel from the first
+     * connection until the next boot, session or none, and a load average
+     * that never fell below 1.00 (finding 191, since 956e2a79). */
     for (;;) {
+        uint64_t seen = poll_event_seq();
+        g_pass_moved = false;
         ssh_service();
-        /* Never yield holding the BKL. */
-        bkl_exit();
-        sched_yield();
-        bkl_enter();
+        if (g_pass_moved) {
+            /* Never yield holding the BKL. */
+            bkl_exit();
+            sched_yield();
+            bkl_enter();
+            continue;
+        }
+        poll_wait_block_since(seen);   /* drops the BKL while parked */
     }
 }
 
@@ -2270,6 +2337,7 @@ void ssh_poll(void) {
             perf_now_ns() - g_last_client_ns > SSH_PREEMPT_NS) {
             tcp_close_nowait(extra);      /* it will reconnect into the slot */
             g_reap_request = true;
+            poll_wake_all();              /* the worker does the reaping */
             kprintf("[ssh] preempting a session silent for %us -- another "
                     "client is waiting\n",
                     (unsigned)(SSH_PREEMPT_NS / 1000000000ull));
@@ -2321,4 +2389,5 @@ void ssh_poll(void) {
         if (g_worker_pid < 0)
             kprintf("[ssh] could not start worker; session dropped\n");
     }
+    poll_wake_all();               /* a parked worker has a session again */
 }

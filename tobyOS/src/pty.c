@@ -100,6 +100,11 @@ static void wq_wake_all(struct proc **head) {
         if (p->state == PROC_BLOCKED) { p->state = PROC_READY; sched_enqueue(p); }
         p = next;
     }
+    /* As pipe.c's and socket.c's do (slice 67): a wake here is a pty end
+     * becoming ready, which a parked poll()er -- and the SSH worker,
+     * waiting on its session's master (finding 191) -- is waiting for.
+     * Without it they found out at the 20 ms sweep. */
+    poll_event_notify();
 }
 
 /* ---- ring helpers ----------------------------------------------- */
@@ -554,6 +559,15 @@ long pty_master_read_nb(struct file *f, void *buf, size_t n) {
     }
     if (got) wq_wake_all(&t->wq_slave_write);
     return (long)got;
+}
+
+/* What the master could read now without waiting, and whether the slave
+ * end is still open -- the SSH server's linger asks (finding 191). */
+size_t pty_master_pending(struct file *f, bool *slave_open) {
+    struct pty *t = f ? f->pty : 0;
+    if (slave_open) *slave_open = t && t->slave_refs > 0;
+    if (!t || (t->stopped && t->slave_refs > 0)) return 0;
+    return ring_count(t->out_head, t->out_tail);
 }
 
 /* Put the line discipline in RAW mode: no canonical line assembly, no

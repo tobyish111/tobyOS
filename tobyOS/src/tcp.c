@@ -947,6 +947,7 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
             !(h->flags & TCP_FLAG_ACK)) {
             passive_syn(lsn, src_ip_be, NULL, srcp, dstp, ntohl(h->seq),
                         tcp_packet, hlen);
+            poll_event_notify();       /* a connection to accept */
             return;
         }
         /* CLOSED port: answer RST (2026-08-22; was a silent drop). RFC
@@ -979,6 +980,12 @@ void tcp_recv_packet(uint32_t src_ip_be, const void *tcp_packet, size_t len) {
     }
 
     tcp_recv_segment(c, h, tcp_packet, len, hlen);
+    /* Whatever the segment was -- data, an ACK opening the window, a FIN, a
+     * RST -- it may have made the connection ready for someone parked in
+     * poll(), or for a kernel worker parked on its own connection (the SSH
+     * server, finding 191). Coalesced, and free with nobody parked. They
+     * learnt it at the 20 ms sweep. */
+    poll_event_notify();
 }
 
 /* TCP-over-IPv6 entry (2026-08-23), called from ipv6.c's demux with the
@@ -1013,6 +1020,7 @@ void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
             !(h->flags & TCP_FLAG_ACK)) {
             passive_syn(lsn, 0, src, srcp, dstp, ntohl(h->seq),
                         tcp_packet, hlen);
+            poll_event_notify();       /* a connection to accept */
             return;
         }
         /* CLOSED port: RST, same rule and shape as v4 -- this is what
@@ -1043,6 +1051,12 @@ void tcp_recv_packet6(const struct ipv6_addr *src, const struct ipv6_addr *dst,
     }
 
     tcp_recv_segment(c, h, tcp_packet, len, hlen);
+    /* Whatever the segment was -- data, an ACK opening the window, a FIN, a
+     * RST -- it may have made the connection ready for someone parked in
+     * poll(), or for a kernel worker parked on its own connection (the SSH
+     * server, finding 191). Coalesced, and free with nobody parked. They
+     * learnt it at the 20 ms sweep. */
+    poll_event_notify();
 }
 
 static void tcp_recv_segment(struct tcp_conn *c, const struct tcp_hdr *h,

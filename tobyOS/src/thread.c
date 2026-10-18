@@ -1324,6 +1324,31 @@ void poll_wait_block(void) {
     /* On return we've been spliced out (by poll_wake_all or signal_send). */
 }
 
+/* EVERY NOTIFY, COUNTED -- coalesced or not, with waiters or without -- so
+ * a waiter that looks at its sources and THEN parks can tell whether an
+ * event came in between: poll_wait_block_since(the count it read before
+ * looking) parks only if none did. Parking unconditionally after a scan
+ * lost that event until the 20 ms sweep. A kernel worker that serves
+ * several sources (the SSH server: its TCP connection, the shell's pty or
+ * pipes) parks this way instead of spinning on sched_yield (finding 191).
+ * The count is atomic; the check and the park are BKL-serialised with
+ * every notify, as the list is. */
+static uint64_t g_poll_seq;
+/* A notify the 100 us coalescer held back: poll_tick wakes for it at its
+ * next call instead of at the next 20 ms sweep. Without this, a source that
+ * became ready just after a waiter re-scanned and parked again -- inside
+ * the coalescing window -- waited out the sweep (finding 191). */
+static bool g_poll_deferred;
+
+uint64_t poll_event_seq(void) {
+    return __atomic_load_n(&g_poll_seq, __ATOMIC_ACQUIRE);
+}
+
+void poll_wait_block_since(uint64_t seen) {
+    if (poll_event_seq() != seen) return;   /* something happened: re-scan */
+    poll_wait_block();
+}
+
 /* Requeue every blocked poller so it re-scans. BKL-held by every caller
  * (poll_tick's sites), so no extra lock is needed -- same convention as
  * pipe.c/socket.c wq_wake_all. The CURRENT proc is left parked: poll_tick runs
@@ -1396,12 +1421,37 @@ int poll_unpark_current(void) {
  * lost wakeup). Notifies are coalesced at 100us so a burst of arriving
  * packets cannot turn into a wake storm of its own.
  * Callers MUST hold the BKL (same convention as poll_wake_all). */
+/* A coalesced notify still wakes the KERNEL workers parked on the list (the
+ * SSH server): the coalescer exists for user pollers, each of which
+ * re-scans every descriptor it watches under the BKL; a worker's pass is
+ * cheap, and holding its wake until poll_tick -- up to a timer tick on an
+ * idle BSP -- made every SSH round trip and every pty write wait for one
+ * (finding 191: 1 MB through a pty 28% slower, a session 19 ms longer). */
+static void poll_wake_kernel_waiters(void) {
+    struct proc *cur = current_proc();
+    struct proc **pp = &g_poll_waiters;
+    while (*pp) {
+        struct proc *w = *pp;
+        if (w == cur || !w->is_kernel) { pp = &w->next_wait; continue; }
+        *pp = w->next_wait;
+        w->next_wait = 0;
+        w->wait_head = 0;
+        if (w->state == PROC_BLOCKED) { w->state = PROC_READY; sched_enqueue(w); }
+    }
+}
+
 void poll_event_notify(void) {
     static uint64_t last_ns;
+    __atomic_fetch_add(&g_poll_seq, 1, __ATOMIC_ACQ_REL);
     if (!g_poll_waiters) return;              /* nobody parked: free */
     uint64_t now = perf_now_ns();
-    if (now - last_ns < 100000ull) return;    /* coalesce bursts (100us) */
+    if (now - last_ns < 100000ull) {          /* coalesce bursts (100us) */
+        g_poll_deferred = true;               /* ...to poll_tick, not lost */
+        poll_wake_kernel_waiters();
+        return;
+    }
     last_ns = now;
+    g_poll_deferred = false;
 #ifdef CHROMIUM_BOOT
     g_poll_event_wakes++;
 #endif
@@ -1416,8 +1466,10 @@ void poll_tick(void) {
     static uint64_t last_ns;
     if (!g_poll_waiters) return;
     uint64_t now = perf_now_ns();
-    if (now - last_ns < 20000000ull) return;  /* >= ~20 ms since last sweep */
+    /* >= ~20 ms since the last sweep -- or a notify was held back */
+    if (now - last_ns < 20000000ull && !g_poll_deferred) return;
     last_ns = now;
+    g_poll_deferred = false;
 #ifdef CHROMIUM_BOOT
     g_poll_tick_wakes++;
 #endif

@@ -1221,6 +1221,11 @@ void poll_tick(void);
  * woken by EVENTS instead of a 1ms timer sweep. BKL-held, coalesced. */
 void poll_event_notify(void);
 void poll_forget_proc(struct proc *p);
+/* Batch 31 (finding 191): the count of every poll_event_notify, and a park
+ * that happens only if the count is still SEEN -- read it, look at the
+ * sources, then park on it, and an event in between is not lost. BKL-held. */
+uint64_t poll_event_seq(void);
+void poll_wait_block_since(uint64_t seen);
 
 /* Set the calling thread's TLS base (loaded into FS.base). */
 void thread_set_tls(uint64_t base);
