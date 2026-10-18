@@ -13,7 +13,8 @@
  * is "Name or service not known", status 1. -I is every address of the
  * machine's interfaces but loopback and link-local, -A the name each of
  * those resolves back to, each followed by a blank. -y is the NIS domain,
- * "(none)" being "Local domain name not set", status 1. The last of
+ * "(none)" being "Local domain name not set", status 1 -- but domainname
+ * with no option shows "(none)" as it is, status 0. The last of
  * -a -A -d -f -i -I -s -y wins.
  *
  * SETTING: a NAME operand, or -F FILE's first line that is neither empty
@@ -228,6 +229,10 @@ static int do_hostname(int argc, char **argv) {
     };
     int type = HNM_DEFAULT, boot = 0, c;
     const char *file = 0;
+    /* domainname alone shows the name as the kernel has it, "(none)"
+     * included, status 0; -y, nisdomainname and ypdomainname call "(none)"
+     * unset (measured, hostname 3.25 in a WSL UTS namespace) */
+    int raw_dom = !strcmp(su_short, "domainname");
     if (!strcmp(su_short, "domainname") || !strcmp(su_short, "nisdomainname") ||
         !strcmp(su_short, "ypdomainname"))
         type = HNM_NIS;
@@ -246,7 +251,7 @@ static int do_hostname(int argc, char **argv) {
         case 'i': type = HNM_IP; break;
         case 'I': type = HNM_ALLIP; break;
         case 's': type = HNM_SHORT; break;
-        case 'y': type = HNM_NIS; break;
+        case 'y': type = HNM_NIS; raw_dom = 0; break;
         case 'V': return su_version();
         case 'h': hnm_usage(stdout); return 255;
         default:                 /* '?': -? itself, or a bad option */
@@ -302,7 +307,7 @@ static int do_hostname(int argc, char **argv) {
     if (type == HNM_NIS) {
         char *d = hnm_proc("domainname");
         if (!d) { fprintf(stderr, "%s: %s\n", su_short, strerror(errno)); return 1; }
-        if (!strcmp(d, "(none)")) {
+        if (!raw_dom && !strcmp(d, "(none)")) {
             fflush(stdout);
             fprintf(stderr, "%s: Local domain name not set\n", su_short);
             return 1;
