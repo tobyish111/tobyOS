@@ -382,7 +382,8 @@ groups | head -1 | wc -w
 echo @@b3_hostname
 hostname
 echo @@b3_hostname_set
-hostname newname 2>&1; echo rc=$?
+# root sets it, as on Linux (batch 31) -- and puts it back for what follows
+OLDHN=$(hostname); hostname newname 2>&1; echo rc=$?; hostname; hostname "$OLDHN"
 echo @@b3_readlink
 ln -sf /tmp/c1 /tmp/lnk3; readlink /tmp/lnk3
 echo @@b3_killall
@@ -392,6 +393,8 @@ killall sleep; echo "rc=$?"
 echo @@b3_mount
 mount | head -1 | wc -w
 echo @@b3_umount
+# this shell's cwd is /tmp: Linux's umount says it is busy (batch 31: it
+# took /tmp away from every later test once umount could reach the VFS)
 umount /tmp 2>&1; echo rc=$?
 
 # --- zstd ---------------------------------------------------------------

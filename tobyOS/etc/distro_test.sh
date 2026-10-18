@@ -58,8 +58,8 @@ mkfs -t nosuchfs /tmp/img > /dev/null 2>&1; echo rc=$?
 echo @@dn_read
 domainname
 echo @@dn_set
-domainname newdomain 2>&1 | head -1
-domainname newdomain > /dev/null 2>&1; echo rc=$?
+# root sets it, as on Linux (batch 31) -- and puts it back for what follows
+OLDDN=$(domainname); domainname newdomain 2>&1; echo rc=$?; domainname; domainname "$OLDDN"
 
 # --- cc -----------------------------------------------------------------
 echo @@cc_same
@@ -208,8 +208,10 @@ getent hosts localhost
 echo @@getent_missing
 getent passwd nosuchuser; echo rc=$?
 echo @@getent_unknown
-getent shadow 2>&1 | head -1
-getent shadow > /dev/null 2>&1; echo rc=$?
+# shadow is a database getent has since batch 31, as glibc's: ask one no
+# system has
+getent nosuchdb 2>&1 | head -1
+getent nosuchdb > /dev/null 2>&1; echo rc=$?
 echo @@getent_all
 getent passwd | wc -l
 

@@ -44,15 +44,22 @@ int main(int argc, char **argv) {
         if (n > 0 && strcmp(lnk, want) == 0) bits |= 1;
     }
 
-    /* ---- bit1: /proc/self/mounts readable, mentions a mount ---- */
+    /* ---- bit1: /proc/self/mounts readable, mentions a mount: /proc's own
+     * line, as Linux's table has it (it looked for "tobyos", which only the
+     * old table of tobyOS's own shape held -- batch 31) ---- */
     {
-        char mb[512] = {0};
+        static char mb[16384];              /* the whole table, as read */
         int fd = open("/proc/self/mounts", O_RDONLY);
-        ssize_t n = fd >= 0 ? read(fd, mb, sizeof mb - 1) : -1;
+        ssize_t n = 0, r = -1;
+        while (fd >= 0 && n < (ssize_t)sizeof mb - 1 &&
+               (r = read(fd, mb + n, sizeof mb - 1 - (size_t)n)) > 0)
+            n += r;
+        if (fd < 0 || r < 0) n = -1;
+        mb[n > 0 ? n : 0] = '\0';
         if (fd >= 0) close(fd);
-        printf("procdev: self/mounts fd=%d n=%zd has-tobyos=%d\n",
-               fd, n, strstr(mb, "tobyos") != 0);
-        if (fd >= 0 && n > 0 && strstr(mb, "tobyos")) bits |= 2;
+        printf("procdev: self/mounts fd=%d n=%zd has-proc=%d\n",
+               fd, n, strstr(mb, " /proc proc ") != 0);
+        if (fd >= 0 && n > 0 && strstr(mb, " /proc proc ")) bits |= 2;
     }
 
     /* ---- bit2: raw stat(2) on a synthesised node ---- */

@@ -8681,6 +8681,47 @@ static bool lx_dir_open_refused(long flags) {
            (flags & (ABI_O_CREAT | ABI_O_TRUNC)) != 0;
 }
 
+/* Is the filesystem mounted at MNT in use, as Linux's umount judges it: a
+ * live process whose working directory or root is on it, a descriptor
+ * open on it (a file by the path it was opened by, a directory by its
+ * own), or another mount below it. "/" always is. */
+static bool umount_path_under(const char *p, const char *mnt, size_t ml) {
+    if (!p || p[0] != '/') return false;
+    if (ml == 1) return true;
+    return strncmp(p, mnt, ml) == 0 && (p[ml] == '\0' || p[ml] == '/');
+}
+
+struct umount_sub_ctx { const char *mnt; size_t ml; bool found; };
+static bool umount_sub_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct umount_sub_ctx *c = (struct umount_sub_ctx *)cookie;
+    size_t pl = strlen(mi->point);
+    if (pl > c->ml && umount_path_under(mi->point, c->mnt, c->ml)) c->found = true;
+    return !c->found;                       /* on until one is found */
+}
+
+static bool umount_target_busy(const char *mnt) {
+    size_t ml = strlen(mnt);
+    while (ml > 1 && mnt[ml - 1] == '/') ml--;
+    if (ml == 1) return true;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct proc *p = proc_at_slot(i);
+        if (!p || p->state == PROC_UNUSED || p->state == PROC_TERMINATED) continue;
+        if (umount_path_under(p->cwd, mnt, ml)) return true;
+        if (p->fs_root[0] && umount_path_under(p->fs_root, mnt, ml)) return true;
+        struct file **fds = proc_fds(p);
+        if (!fds) continue;
+        for (int fd = 0; fd < PROC_NFDS; fd++) {
+            struct file *f = fds[fd];
+            if (!f) continue;
+            const char *op = (f->kind == FILE_KIND_DIR) ? f->dirpath : f->open_path;
+            if (umount_path_under(op, mnt, ml)) return true;
+        }
+    }
+    struct umount_sub_ctx c = { mnt, ml, false };
+    vfs_iter_mounts_info(umount_sub_cb, &c);
+    return c.found;
+}
+
 /* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
  * has no native directory fd, so we just remember the path; getdents64
  * re-opens via vfs_opendir and resumes after dir_off entries. */
@@ -13605,6 +13646,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         {   int rr_ = resolve_user_path((const char *)a1, ktgt, sizeof ktgt);
             if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
         }
+        /* A MOUNT IN USE IS EBUSY, as Linux's umount says ("target is
+         * busy"), unless MNT_DETACH asks for it lazily: once mount(8)
+         * could reach this, the boot harness's `umount /tmp` -- run from
+         * a shell whose cwd was /tmp -- took /tmp away from every test
+         * after it (batch 31's textgate). */
+        if (!((long)a2 & 2) && umount_target_busy(ktgt)) return -ABI_EBUSY;
         int rc = vfs_unmount(ktgt);
         return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
     }
