@@ -3741,6 +3741,27 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
     out->blksize = 4096;              /* as linux_emit_special_stat */
 }
 
+/* A PTY SLAVE'S OWNER AND TIMES, by its name (/dev/pts/N) or an open
+ * slave descriptor (finding 190): what the pair keeps (pty.c), as Linux's
+ * devpts gives them -- the device nodes said root and 1970, and GNU who's
+ * IDLE column said "old" for every login. T is atime, mtime, ctime. False
+ * for anything that is not a live slave. */
+static bool pts_node_times(const char *kpath, struct file *f, uint32_t *uid,
+                           uint32_t *gid, uint64_t t[3]) {
+    int idx = -1;
+    if (f) {
+        if (f->kind == FILE_KIND_PTY_SLAVE) idx = pty_file_index(f);
+    } else if (kpath && strncmp(kpath, "/dev/pts/", 9) == 0 && kpath[9]) {
+        idx = 0;
+        for (const char *q = kpath + 9; *q; q++) {
+            if (*q < '0' || *q > '9' || idx > 9999) { idx = -1; break; }
+            idx = idx * 10 + (*q - '0');
+        }
+    }
+    if (idx < 0) return false;
+    return pty_node_info(idx, uid, gid, &t[0], &t[1], &t[2]);
+}
+
 /* ...and a device node's numbers, devfs's (batch 25: stat's %t %T). */
 static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_stat *out)
 {
@@ -3750,6 +3771,13 @@ static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_sta
     if ((mode & ABI_S_IFMT) == ABI_S_IFCHR || (mode & ABI_S_IFMT) == ABI_S_IFBLK) {
         out->rdev_major = maj;
         out->rdev_minor = min;
+    }
+    uint32_t pu, pg;
+    uint64_t pt[3];
+    if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
+        out->uid = userns_cur_uid(pu);
+        out->gid = userns_cur_gid(pg);
+        out->atime = pt[0]; out->mtime = pt[1]; out->ctime = pt[2];
     }
 }
 
@@ -3940,6 +3968,13 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
         } else {
             tmp->rdev_major = mj;
             tmp->rdev_minor = mn;
+            uint32_t pu, pg;
+            uint64_t pt[3];
+            if (pts_node_times(0, f, &pu, &pg, pt)) {
+                tmp->uid = userns_cur_uid(pu);
+                tmp->gid = userns_cur_gid(pg);
+                tmp->atime = pt[0]; tmp->mtime = pt[1]; tmp->ctime = pt[2];
+            }
         }
         tmp->ino = file_object_ino(f);
         tmp->blksize = 4096;          /* as linux_emit_special_stat */
@@ -7612,6 +7647,16 @@ static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
     st.st_nlink   = 1;
     st.st_rdev    = lx_makedev(maj, min);
     st.st_blksize = 4096;
+    {   uint32_t pu, pg;
+        uint64_t pt[3];
+        if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
+            st.st_uid = userns_cur_uid(pu);
+            st.st_gid = userns_cur_gid(pg);
+            st.st_atime = (int64_t)pt[0];
+            st.st_mtime = (int64_t)pt[1];
+            st.st_ctime = (int64_t)pt[2];
+        }
+    }
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
     return 0;
 }
@@ -7684,7 +7729,7 @@ static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
 }
 
 static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
-                                    uint64_t ino, void *ubuf) {
+                                    uint64_t ino, struct file *f, void *ubuf) {
     struct lx_stat st;
     memset(&st, 0, sizeof st);
     uint32_t fmt = mode & 0xF000u;
@@ -7694,6 +7739,15 @@ static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
     st.st_nlink   = 1;
     if (fmt == 0x2000u) {
         st.st_rdev = lx_makedev(maj, min);
+        uint32_t pu, pg;
+        uint64_t pt[3];
+        if (pts_node_times(0, f, &pu, &pg, pt)) {
+            st.st_uid = userns_cur_uid(pu);
+            st.st_gid = userns_cur_gid(pg);
+            st.st_atime = (int64_t)pt[0];
+            st.st_mtime = (int64_t)pt[1];
+            st.st_ctime = (int64_t)pt[2];
+        }
     } else {
         struct proc *p = current_proc();
         st.st_uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
@@ -7841,7 +7895,7 @@ static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
         return linux_emit_stat(&vs, lx_fd_ino(f, fd), ubuf);
     {   /* a pipe, a socket, a terminal, a device: see lx_fd_special_mode */
         uint32_t mj, mn, sm = lx_fd_special_mode(f, &mj, &mn);
-        if (sm) return linux_emit_special_stat(sm, mj, mn, lx_fd_ino(f, fd),
+        if (sm) return linux_emit_special_stat(sm, mj, mn, lx_fd_ino(f, fd), f,
                                                ubuf);
     }
     if (f->kind == FILE_KIND_DIR && f->dirpath) {
@@ -7892,6 +7946,11 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
             struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
                                     .mode = sm & 0xFFFu };
             if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+            {   uint64_t pt[3];                 /* a pty slave's (finding 190) */
+                if (chr && pts_node_times(0, f, &cvs.uid, &cvs.gid, pt)) {
+                    cvs.atime = pt[0]; cvs.mtime = pt[1]; cvs.ctime = pt[2];
+                }
+            }
             long src = linux_emit_statx(&cvs, lx_fd_ino(f, fd), ubuf);
             if (src == 0 && ubuf) {
                 uint16_t m = (uint16_t)sm;
@@ -15239,6 +15298,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 struct vfs_stat dvs = { .type = VFS_TYPE_FILE, .size = 0,
                                         .uid = 0, .gid = 0,
                                         .mode = dm & 0xFFFu };
+                {   uint64_t pt[3];             /* a pty slave's (finding 190) */
+                    if (pts_node_times(kpath, 0, &dvs.uid, &dvs.gid, pt)) {
+                        dvs.atime = pt[0]; dvs.mtime = pt[1]; dvs.ctime = pt[2];
+                    }
+                }
                 long src = linux_emit_statx(&dvs, lx_ino_hash(kpath),
                                             (void *)a5);
                 if (src == 0 && a5) {

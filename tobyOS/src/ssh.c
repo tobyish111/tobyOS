@@ -1718,6 +1718,10 @@ static bool ssh_spawn_shell(void) {
         if (ip) ksnprintf(host, sizeof host, "%u.%u.%u.%u", ip & 0xffu,
                           (ip >> 8) & 0xffu, (ip >> 16) & 0xffu, ip >> 24);
         utmp_login(pid, line, g_auth_user, host, ip);
+        /* ...and its terminal is the user's, group tty, as sshd's
+         * pty_setowner leaves it (finding 190: /dev/pts/N said root) */
+        const struct user *ou = users_lookup_by_name(g_auth_user);
+        if (ou) pty_set_owner(idx, (uint32_t)ou->uid, 5);
     }
     if (pipes)
         kprintf("[ssh] /bin/tsh pid=%d on pipes for '%s'%s\n",

@@ -50,6 +50,11 @@ struct proc;
 uint32_t pty_gen_of(int index);
 bool     pty_ctty_live(int index, uint32_t gen);   /* still that pair */
 int      pty_fg_pgrp(int index);   /* its foreground group, 0 if unused */
+/* Batch 31 (finding 190): /dev/pts/N's owner and wall-clock times, and
+ * a login's chown of it (sshd's pty_setowner). */
+bool     pty_node_info(int index, uint32_t *uid, uint32_t *gid,
+                       uint64_t *atime, uint64_t *mtime, uint64_t *ctime);
+void     pty_set_owner(int index, uint32_t uid, uint32_t gid);
 /* Bytes the master can read now, and whether the slave is still open. */
 size_t   pty_master_pending(struct file *f, bool *slave_open);
 /* Make pair INDEX P's controlling terminal and its foreground group P's --

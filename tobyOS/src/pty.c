@@ -26,6 +26,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
 #include <tobyos/cpu.h>
+#include <tobyos/perf.h>
 
 /* -DSSH_PTY_DIAG traces pty open/clone/close with refcounts. Useful for
  * lifecycle and refcount questions -- but DO NOT reach for it on a timing
@@ -77,9 +78,35 @@ struct pty {
      * `ssh host 'cat > file' < local` -- how edremote uploads a script --
      * left cat blocked on a stdin that never ended, forever. */
     bool   in_eof;
+
+    /* THE SLAVE NODE'S OWNER AND TIMES, /dev/pts/N's stat (finding 190).
+     * Every device node said 1970 and root, so GNU who's IDLE column --
+     * now less the line's atime -- said "old" for every login. Linux's
+     * devpts: the opener's uid, group tty, 0620 (as systemd mounts it),
+     * the three times the creation's; a read of the slave moves the
+     * atime and a write the mtime -- only when the second has left its
+     * 8-second bucket, so the node does not time keystrokes for anyone
+     * who can stat it (measured: logs/b31/ptytime-wsl.out). sshd then
+     * gives the node to the user who logged in (pty_set_owner). */
+    uint32_t uid, gid;
+    uint64_t atime, mtime, ctime;     /* wall-clock seconds */
 };
 
 static struct pty g_ptys[PTY_MAX];
+
+#define PTY_TTY_GID 5                  /* the tty group, as on Linux */
+
+static uint64_t pty_wall_now(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+}
+
+/* Linux's tty_update_time rule: store NOW only once it differs from what
+ * is stored in more than the low three bits. */
+static void pty_touch(uint64_t *t) {
+    uint64_t now = pty_wall_now();
+    if ((now ^ *t) & ~(uint64_t)7) *t = now;
+}
 /* Each allocation of a slot bumps its generation (see pty.h): a
  * controlling-terminal reference names the pair, not the slot. */
 static uint32_t g_pty_gen[PTY_MAX];
@@ -180,6 +207,12 @@ struct file *pty_open_master(void) {
     t->master_refs = 1;
     t->slave_refs = 0;
     pty_defaults(t);
+    {
+        struct proc *op = current_proc();
+        t->uid = op ? (uint32_t)op->uid : 0;
+        t->gid = PTY_TTY_GID;
+        t->atime = t->mtime = t->ctime = pty_wall_now();
+    }
     memset(f, 0, sizeof(*f));
     f->kind = FILE_KIND_PTY_MASTER;
     f->pty  = t;
@@ -736,8 +769,11 @@ long pty_slave_read(struct file *f, void *buf, size_t n) {
         long jc = pty_bg_read(t);
         if (jc) return jc;
     }
-    if (t->tio.c_lflag & TTY_ICANON) return slave_canonical_read(t, (uint8_t *)buf, n);
-    return slave_raw_read(t, (uint8_t *)buf, n);
+    long r = (t->tio.c_lflag & TTY_ICANON)
+           ? slave_canonical_read(t, (uint8_t *)buf, n)
+           : slave_raw_read(t, (uint8_t *)buf, n);
+    if (r > 0) pty_touch(&t->atime);      /* tty_read's update, Linux's */
+    return r;
 }
 
 long pty_slave_write(struct file *f, const void *buf, size_t n) {
@@ -804,8 +840,34 @@ long pty_slave_write(struct file *f, const void *buf, size_t n) {
         for (size_t k = 0; k < need; k++) ring_push(t->out, &t->out_head, t->out_tail, o[k]);
         i++;
     }
-    if (n) wq_wake_all(&t->wq_master_read);
+    if (n) {
+        wq_wake_all(&t->wq_master_read);
+        pty_touch(&t->mtime);             /* tty_write's update, Linux's */
+    }
     return (long)n;
+}
+
+/* /dev/pts/INDEX's owner and times, for stat (finding 190); false if the
+ * pair is not live. */
+bool pty_node_info(int index, uint32_t *uid, uint32_t *gid, uint64_t *atime,
+                   uint64_t *mtime, uint64_t *ctime) {
+    if (index < 0 || index >= PTY_MAX || !g_ptys[index].used) return false;
+    const struct pty *t = &g_ptys[index];
+    if (uid) *uid = t->uid;
+    if (gid) *gid = t->gid;
+    if (atime) *atime = t->atime;
+    if (mtime) *mtime = t->mtime;
+    if (ctime) *ctime = t->ctime;
+    return true;
+}
+
+/* Give the slave node to a login, as sshd's pty_setowner does: the user,
+ * the tty group, 0620 -- a chown, so its ctime moves. */
+void pty_set_owner(int index, uint32_t uid, uint32_t gid) {
+    if (index < 0 || index >= PTY_MAX || !g_ptys[index].used) return;
+    g_ptys[index].uid = uid;
+    g_ptys[index].gid = gid;
+    g_ptys[index].ctime = pty_wall_now();
 }
 
 /* ---- ioctl ------------------------------------------------------ */
