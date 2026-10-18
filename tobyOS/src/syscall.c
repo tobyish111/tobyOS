@@ -1610,6 +1610,140 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
     return written;
 }
 
+/* ---- readdir as Linux's (batch 31, finding 187) ------------------------
+ * Linux's readdir gives "." and ".." first, each entry's inode -- the one
+ * lstat of it says -- and its type whole. Neither personality did: the
+ * native listing had no dots, two types and an index for an inode; the
+ * Linux one (getdents64) no dots and an index too. GNU ls -a listed what
+ * readdir gave (su_ls added the two itself), and `ls -i`, find -inum and
+ * fts's cycle check read d_ino. */
+
+/* Linux's d_type of a VFS entry: the format its mode keeps (devfs's
+ * S_IFCHR, a FIFO's), else its VFS type. */
+static uint8_t vfs_entry_dt(enum vfs_type type, uint32_t mode) {
+    if (type == VFS_TYPE_DIR)     return ABI_DT2_DIR;
+    if (type == VFS_TYPE_SYMLINK) return ABI_DT2_LNK;
+    switch (mode & 0xF000u) {
+    case 0x1000u: return ABI_DT2_FIFO;
+    case 0x2000u: return ABI_DT2_CHR;
+    case 0x6000u: return ABI_DT2_BLK;
+    case 0xC000u: return ABI_DT2_SOCK;
+    case 0x4000u: return ABI_DT2_DIR;
+    case 0xA000u: return ABI_DT2_LNK;
+    default:      return ABI_DT2_REG;
+    }
+}
+
+/* The directory a listing's ".." is: KPATH's parent, but never above the
+ * caller's root (a chroot's "/.." is itself, as "/..'s" is "/"). */
+static void readdir_parent(const char *kpath, char *out, size_t cap) {
+    struct proc *p = current_proc();
+    const char *root = (p && p->fs_root[0]) ? p->fs_root : "";
+    size_t rl = strlen(root), n = strlen(kpath);
+    while (n > 1 && kpath[n - 1] == '/') n--;
+    bool at_root = (n == 1 && kpath[0] == '/') ||
+                   (rl && n == rl && strncmp(kpath, root, rl) == 0);
+    if (!at_root) {
+        while (n > 0 && kpath[n - 1] != '/') n--;     /* drop the leaf */
+        while (n > 1 && kpath[n - 1] == '/') n--;     /* and its slash */
+        if (rl && n < rl) n = rl;
+    }
+    if (n == 0) n = 1;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, kpath, n);
+    out[n] = '\0';
+}
+
+static uint64_t lx_ino_hash(const char *s);
+static bool lx_fs_identity(const struct vfs_stat *vs, uint32_t *maj,
+                           uint32_t *min);
+
+/* An entry's inode, as each personality's lstat reports it: the native
+ * stat gives the filesystem's own (0 where it keeps none), the Linux one
+ * that, or the path's hash where there is none. */
+static uint64_t readdir_ino(const char *path, bool linux_rule) {
+    struct vfs_stat vs;
+    if (vfs_stat(path, &vs) != VFS_OK) return linux_rule ? lx_ino_hash(path) : 0;
+    if (!linux_rule) return vs.ino;
+    uint32_t maj, min;
+    if (lx_fs_identity(&vs, &maj, &min) && vs.ino) return vs.ino;
+    return lx_ino_hash(path);
+}
+
+/* DIR + "/" + NAME into OUT; false if it does not fit. */
+static bool readdir_join(char *out, size_t cap, const char *dir, const char *name) {
+    size_t dl = strlen(dir), nl = strlen(name);
+    bool slash = !(dl && dir[dl - 1] == '/');
+    if (dl + (slash ? 1 : 0) + nl + 1 > cap) return false;
+    memcpy(out, dir, dl);
+    if (slash) out[dl++] = '/';
+    memcpy(out + dl, name, nl + 1);
+    return true;
+}
+
+static long sys_fs_readdir2(const char *path, struct abi_dirent2 *out,
+                            int cap, int offset) {
+    if (cap <= 0) return 0;
+    if (offset < 0) offset = 0;
+    if (!user_buf_ok((uint64_t)(uintptr_t)out, (size_t)cap * sizeof(*out)))
+        return -ABI_EFAULT;
+    char kpath[VFS_PATH_MAX];
+    int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    char followed[VFS_PATH_MAX];                /* a link to a directory */
+    {
+        struct vfs_stat lst;
+        if (vfs_stat(kpath, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+            vfs_follow_link(kpath, followed, sizeof followed) == VFS_OK)
+            memcpy(kpath, followed, strlen(followed) + 1);
+    }
+    struct vfs_dir d;
+    int rc = vfs_opendir(kpath, &d);
+    if (rc != VFS_OK) return vfs_err_to_abi(rc);
+
+    int written = 0, index = 0;
+    struct abi_dirent2 u;
+    char child[VFS_PATH_MAX];
+    /* "." and ".." are entries 0 and 1 */
+    for (int k = 0; k < 2 && written < cap; k++, index++) {
+        if (index < offset) continue;
+        memset(&u, 0, sizeof u);
+        u.name[0] = '.';
+        if (k == 1) u.name[1] = '.';
+        u.type = ABI_DT2_DIR;
+        if (k == 0) {
+            u.ino = readdir_ino(kpath, false);
+        } else {
+            readdir_parent(kpath, child, sizeof child);
+            u.ino = readdir_ino(child, false);
+        }
+        if (copy_to_user(&out[written], &u, sizeof u) != 0) {
+            vfs_closedir(&d);
+            return -ABI_EFAULT;
+        }
+        written++;
+    }
+    struct vfs_dirent ent;
+    while (written < cap && vfs_readdir(&d, &ent) == VFS_OK) {
+        if (index++ < offset) continue;
+        memset(&u, 0, sizeof u);
+        size_t i = 0;
+        for (; i + 1 < ABI_DIRENT2_NAME_MAX && ent.name[i]; i++)
+            u.name[i] = ent.name[i];
+        u.name[i] = '\0';
+        u.type = vfs_entry_dt(ent.type, ent.mode);
+        u.ino = readdir_join(child, sizeof child, kpath, ent.name)
+              ? readdir_ino(child, false) : 0;
+        if (copy_to_user(&out[written], &u, sizeof u) != 0) {
+            vfs_closedir(&d);
+            return -ABI_EFAULT;
+        }
+        written++;
+    }
+    vfs_closedir(&d);
+    return written;
+}
+
 static long sys_fs_readfile(const char *path, void *out, size_t cap) {
     if (cap == 0) return 0;
     if (cap > SYS_MAX_RW) cap = SYS_MAX_RW;
@@ -6454,6 +6588,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_fs_readdir((const char *)a1,
                               (struct vfs_dirent_user *)a2,
                               (int)a3, (int)a4);
+    case ABI_SYS_FS_READDIR2:
+        return sys_fs_readdir2((const char *)a1, (struct abi_dirent2 *)a2,
+                               (int)a3, (int)a4);
     case SYS_FS_READFILE:
         return sys_fs_readfile((const char *)a1, (void *)a2, (size_t)a3);
     case SYS_EXEC:
@@ -14280,18 +14417,23 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (names) {
                 size_t written = 0;
                 uint32_t emitted = 0;
-                while (f->dir_off + emitted < cnt) {
-                    const char *nm = names[f->dir_off + emitted];
+                /* "." and ".." first (finding 187), then the nodes */
+                while (f->dir_off + emitted < cnt + 2) {
+                    uint32_t vi = f->dir_off + emitted;
+                    const char *nm = vi == 0 ? "." : vi == 1 ? ".."
+                                   : names[vi - 2];
                     size_t namelen = strlen(nm);
                     size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;
                     if (written + reclen > cap) break;
                     struct lx_dirent64 de;
                     memset(&de, 0, reclen);
-                    de.d_ino    = 100 + f->dir_off + emitted;
-                    de.d_off    = (int64_t)(f->dir_off + emitted + 1);
+                    de.d_ino    = vi == 0 ? lx_ino_hash(f->dirpath)
+                                : vi == 1 ? lx_ino_hash("/dev")
+                                          : 100 + vi - 2;
+                    de.d_off    = (int64_t)(vi + 1);
                     de.d_reclen = (uint16_t)reclen;
-                    de.d_type   = types ? types[f->dir_off + emitted]
-                                        : LX_DT_CHR;
+                    de.d_type   = vi < 2 ? LX_DT_DIR
+                                : types ? types[vi - 2] : LX_DT_CHR;
                     memcpy(de.d_name, nm, namelen);
                     if (copy_to_user(ubuf + written, &de, reclen) != 0)
                         return -ABI_EFAULT;
@@ -14305,12 +14447,44 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct vfs_dir d;
         if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;
         struct vfs_dirent ent;
-        uint32_t idx = 0, emitted = 0;
+        uint32_t emitted = 0;
         size_t   written = 0;
         bool     toosmall = false;
+        char     child[VFS_PATH_MAX];
+        /* "." and ".." are entries 0 and 1, then the directory's own, each
+         * with the inode stat would give it and its type whole (finding
+         * 187: no dots, d_ino an index, no block devices or sockets) */
+        while (f->dir_off + emitted < 2) {
+            uint32_t vi = f->dir_off + emitted;
+            const char *nm = vi == 0 ? "." : "..";
+            size_t reclen = (19 + strlen(nm) + 1 + 7) & ~(size_t)7;
+            if (written + reclen > cap) { if (written == 0) toosmall = true; break; }
+            struct lx_dirent64 de;
+            memset(&de, 0, reclen);
+            if (vi == 0) {
+                de.d_ino = readdir_ino(f->dirpath, true);
+            } else {
+                readdir_parent(f->dirpath, child, sizeof child);
+                de.d_ino = readdir_ino(child, true);
+            }
+            de.d_off    = (int64_t)(vi + 1);
+            de.d_reclen = (uint16_t)reclen;
+            de.d_type   = LX_DT_DIR;
+            memcpy(de.d_name, nm, strlen(nm));
+            if (copy_to_user(ubuf + written, &de, reclen) != 0) {
+                vfs_closedir(&d);
+                return -ABI_EFAULT;
+            }
+            written += reclen;
+            emitted++;
+        }
         /* Skip the entries already returned by earlier getdents64 calls. */
-        while (idx < f->dir_off && vfs_readdir(&d, &ent) == VFS_OK) idx++;
-        while (vfs_readdir(&d, &ent) == VFS_OK) {
+        {
+            uint32_t skip = f->dir_off > 2 ? f->dir_off - 2 : 0, idx = 0;
+            while (idx < skip && vfs_readdir(&d, &ent) == VFS_OK) idx++;
+        }
+        while (!toosmall && f->dir_off + emitted >= 2 &&
+               vfs_readdir(&d, &ent) == VFS_OK) {
             size_t namelen = 0;
             while (namelen < VFS_NAME_MAX && ent.name[namelen]) namelen++;
             size_t reclen = (19 + namelen + 1 + 7) & ~(size_t)7;  /* hdr=19, 8-align */
@@ -14320,15 +14494,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
             struct lx_dirent64 de;
             memset(&de, 0, reclen);
-            de.d_ino    = (uint64_t)(f->dir_off + emitted + 1);
+            de.d_ino    = readdir_join(child, sizeof child, f->dirpath, ent.name)
+                        ? readdir_ino(child, true)
+                        : (uint64_t)(f->dir_off + emitted + 1);
             de.d_off    = (int64_t)(f->dir_off + emitted + 1);
             de.d_reclen = (uint16_t)reclen;
-            /* A devfs node is a character device, not a regular file. */
-            de.d_type   = (ent.type == VFS_TYPE_DIR) ? LX_DT_DIR
-                        : (ent.type == VFS_TYPE_SYMLINK) ? LX_DT_LNK
-                        : ((ent.mode & 0xF000u) == 0x2000u) ? LX_DT_CHR
-                        : ((ent.mode & 0xF000u) == 0x1000u) ? 1 /* DT_FIFO */
-                        : LX_DT_REG;
+            de.d_type   = vfs_entry_dt(ent.type, ent.mode);
             memcpy(de.d_name, ent.name, namelen);
             de.d_name[namelen] = '\0';
             if (copy_to_user(ubuf + written, &de, reclen) != 0) {

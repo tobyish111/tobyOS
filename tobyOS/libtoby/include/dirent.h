@@ -11,7 +11,8 @@
  * frees the returned struct dirent; closedir() reclaims everything.
  *
  * Limits:
- *   - NAME_MAX is 63 (kernel's SYS_FS_NAME_MAX is 64 incl. NUL).
+ *   - NAME_MAX is 255, as Linux's (batch 31: ABI_SYS_FS_READDIR2 gives
+ *     names whole; SYS_FS_READDIR cut them at 63).
  *   - Re-entrancy: DIR has internal state; not thread-safe (we
  *     have no threads anyway).
  *   - readdir() refills its window when exhausted, so directories
@@ -27,11 +28,18 @@
 extern "C" {
 #endif
 
-#define NAME_MAX  63
+#define NAME_MAX  255
 
+/* Linux's d_type values. readdir gives "." and ".." first, each entry's
+ * d_ino as lstat would give its st_ino, and its type whole (finding 187). */
 #define DT_UNKNOWN 0
-#define DT_REG     8
+#define DT_FIFO    1
+#define DT_CHR     2
 #define DT_DIR     4
+#define DT_BLK     6
+#define DT_REG     8
+#define DT_LNK     10
+#define DT_SOCK    12
 
 struct dirent {
     ino_t          d_ino;

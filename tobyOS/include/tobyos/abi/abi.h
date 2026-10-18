@@ -1347,7 +1347,17 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         gives (users_initgroups) were real
                                         and no native program could ask for
                                         them: id said groups=1000 alone. */
-#define ABI_SYS_NR_MAX          228
+#define ABI_SYS_FS_READDIR2     229  /* (path, struct abi_dirent2 *out, int
+                                        cap, int offset) -> how many: a
+                                        directory as Linux's readdir gives
+                                        it -- "." and ".." first, each
+                                        entry's inode (what stat would say)
+                                        and full type, names whole.
+                                        SYS_FS_READDIR (no dots, two types,
+                                        63-byte names) is kept unchanged
+                                        for the programs that call it
+                                        directly (finding 187). */
+#define ABI_SYS_NR_MAX          229
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)
@@ -2147,6 +2157,24 @@ struct abi_dirent {
     uint32_t uid;
     uint32_t gid;
     uint32_t mode;
+};
+
+/* ABI_SYS_FS_READDIR2's entry (batch 31, finding 187). TYPE is Linux's
+ * d_type; INO is what lstat of the entry says its st_ino is. */
+#define ABI_DIRENT2_NAME_MAX 256
+#define ABI_DT2_UNKNOWN 0
+#define ABI_DT2_FIFO    1
+#define ABI_DT2_CHR     2
+#define ABI_DT2_DIR     4
+#define ABI_DT2_BLK     6
+#define ABI_DT2_REG     8
+#define ABI_DT2_LNK     10
+#define ABI_DT2_SOCK    12
+struct abi_dirent2 {
+    uint64_t ino;
+    uint32_t type;
+    uint32_t pad;
+    char     name[ABI_DIRENT2_NAME_MAX];
 };
 
 /* ============================================================

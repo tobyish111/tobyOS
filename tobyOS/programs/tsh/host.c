@@ -876,7 +876,15 @@ int vfs_opendir(const char *path, struct vfs_dir *out) {
 
 int vfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     if (!d || !d->priv || !out) return VFS_ERR_INVAL;
-    struct dirent *de = readdir((DIR *)d->priv);
+    struct dirent *de;
+    /* readdir gives "." and ".." since batch 31 (finding 187), as Linux's
+     * does; the kernel's vfs_readdir -- what the shell was written against,
+     * in its other build -- has neither, and the globbing and completion
+     * above it expect none (bash 5.2's globskipdots: `.*` matches neither) */
+    do {
+        de = readdir((DIR *)d->priv);
+    } while (de && de->d_name[0] == '.' &&
+             (!de->d_name[1] || (de->d_name[1] == '.' && !de->d_name[2])));
     if (!de) return VFS_ERR_NOENT;              /* end of directory */
     memset(out, 0, sizeof *out);
     snprintf(out->name, sizeof out->name, "%s", de->d_name);

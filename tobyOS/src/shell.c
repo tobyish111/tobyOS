@@ -34678,6 +34678,34 @@ static bool shell_glob_dot_ok(const char *name, const char *comp) {
     return !(name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
 
+/* THE NEXT GLOB CANDIDATE IN D: "." and ".." first when globskipdots is
+ * off (bash 5.2's shopt, on by default), then the directory's entries.
+ * Neither readdir the shell has gives the two -- the kernel's VFS has
+ * none, and the hosted build's shim skips them (host.c) -- so they are
+ * offered here, to be matched like any name: `.*` takes them, `*` with
+ * dotglob never does (shell_glob_dot_ok). With GLOBIGNORE set and not
+ * empty they are always left out, as bash leaves them. *DOTS counts the
+ * two given; start it at 0. The guest's bash lists them since readdir
+ * gives them (finding 187): Oils 1705 and 1718. */
+static int shell_glob_next(struct vfs_dir *d, struct vfs_dirent *ent, int *dots) {
+    while (*dots < 2 && !g_shopt_misc[37]) {
+        int k = (*dots)++;
+        const char *gi = env_get("GLOBIGNORE");
+        if (gi && *gi) continue;
+        memset(ent, 0, sizeof *ent);
+        ent->name[0] = '.';
+        if (k == 1) ent->name[1] = '.';
+        ent->type = VFS_TYPE_DIR;
+        return VFS_OK;
+    }
+    int rc;
+    do {
+        rc = vfs_readdir(d, ent);
+    } while (rc == VFS_OK && ent->name[0] == '.' &&
+             (!ent->name[1] || (ent->name[1] == '.' && !ent->name[2])));
+    return rc;
+}
+
 static bool shell_glob_match_path(const char *pat, const char *path) {
     for (;;) {
         const char *pe = pat, *ne = path;
@@ -34840,7 +34868,8 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
     struct vfs_dir d;
     if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
     struct vfs_dirent ent;
-    while (vfs_readdir(&d, &ent) == VFS_OK) {
+    int dots = 0;
+    while (shell_glob_next(&d, &ent, &dots) == VFS_OK) {
         if (!shell_glob_dot_ok(ent.name, comps[ci])) continue;
         if (!shell_glob_match(comps[ci], ent.name)) continue;
         char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
@@ -35002,7 +35031,8 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,                    
     int matches = 0;
     int first_arg = cur->argc;
     struct vfs_dirent ent;
-    while ((rc = vfs_readdir(&d, &ent)) == VFS_OK) {
+    int dots = 0;
+    while ((rc = shell_glob_next(&d, &ent, &dots)) == VFS_OK) {
         /* A leading dot needs a leading dot in the pattern -- unless
          * dotglob is on or GLOBIGNORE is set, when only `.` and `..` stay
          * hidden. dotglob was a table entry the globber never read. */

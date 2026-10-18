@@ -34,7 +34,7 @@ struct __libtoby_DIR {
     int                   pos;               /* next entry to serve */
     int                   cap;
     struct dirent         view;              /* most recently returned */
-    struct abi_dirent    *ents;              /* the listing */
+    struct abi_dirent2   *ents;              /* the listing */
 };
 
 /* The whole listing of d->path into d->ents. 0, or -1 with errno. */
@@ -44,13 +44,15 @@ static int load(DIR *d) {
     for (;;) {
         if (d->cap - d->have < DIR_WINDOW) {
             int ncap = d->cap ? d->cap * 2 : DIR_WINDOW;
-            struct abi_dirent *ne = (struct abi_dirent *)realloc(d->ents,
+            struct abi_dirent2 *ne = (struct abi_dirent2 *)realloc(d->ents,
                                          (size_t)ncap * sizeof *ne);
             if (!ne) { errno = ENOMEM; return -1; }
             d->ents = ne;
             d->cap  = ncap;
         }
-        long r = toby_sc4(ABI_SYS_FS_READDIR,
+        /* READDIR2 (batch 31, finding 187): ".", "..", inodes, types and
+         * names whole, as Linux's readdir gives them */
+        long r = toby_sc4(ABI_SYS_FS_READDIR2,
                           (long)(uintptr_t)d->path,
                           (long)(uintptr_t)(d->ents + d->have),
                           (long)DIR_WINDOW,
@@ -95,9 +97,9 @@ struct dirent *readdir(DIR *d) {
     if (!d) { errno = EBADF; return 0; }
     if (d->pos >= d->have) return 0;               /* end-of-stream */
 
-    struct abi_dirent *src = &d->ents[d->pos++];
-    d->view.d_ino  = 0;                            /* tobyfs has no inode # */
-    d->view.d_type = (src->type == ABI_DT_DIR) ? DT_DIR : DT_REG;
+    struct abi_dirent2 *src = &d->ents[d->pos++];
+    d->view.d_ino  = (ino_t)src->ino;              /* what lstat would say */
+    d->view.d_type = (unsigned char)src->type;     /* Linux's DT_ values */
     size_t i = 0;
     for (; i < NAME_MAX && src->name[i]; i++) d->view.d_name[i] = src->name[i];
     d->view.d_name[i] = '\0';
