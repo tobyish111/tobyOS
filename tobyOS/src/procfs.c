@@ -311,12 +311,15 @@ static int live_proc_count(void) {
 extern uint64_t g_cpu_jiffies[MAX_CPUS][3];
 extern uint64_t g_ctxt_switches;
 extern uint64_t g_loadavg_fixed[3];
-extern uint32_t g_nr_running;
+extern uint32_t sched_nr_runnable(void);
 extern uint64_t g_intr_total;
 extern uint64_t g_intr_vec[256];
 
 /* /proc/loadavg -- three real moving averages (sampled every 5 s on the BSP,
- * decayed exactly as Linux's calc_load), "running/total" and the last pid. */
+ * decayed as Linux's calc_load), "running/total" and the last pid. Each
+ * average is rounded to two places, as Linux prints it (half a hundredth
+ * added first, FIXED_1/200); it was truncated, so 0.909 read 0.90 (finding
+ * 192). The running count is the moment's, the reader among it. */
 static int gen_loadavg(char *buf, size_t cap) {
     int total = live_proc_count();
     int lastpid = proc_last_pid();         /* the last one handed out, as Linux's */
@@ -329,11 +332,11 @@ static int gen_loadavg(char *buf, size_t cap) {
     #define APPEND_FRAC2(v) do { char f[3]; f[0] = (char)('0' + (int)(((v)/10)%10)); \
         f[1] = (char)('0' + (int)((v)%10)); f[2] = 0; APPEND_STR(f); } while (0)
     for (int i = 0; i < 3; i++) {
-        uint64_t lv = g_loadavg_fixed[i];
+        uint64_t lv = g_loadavg_fixed[i] + 2048u / 200u;
         APPEND_INT(lv >> 11); APPEND_STR(".");
         APPEND_FRAC2(((lv & 2047u) * 100u) >> 11); APPEND_STR(" ");
     }
-    APPEND_INT(g_nr_running); APPEND_STR("/");
+    APPEND_INT(sched_nr_runnable()); APPEND_STR("/");
     APPEND_INT(total); APPEND_STR(" "); APPEND_INT(lastpid); APPEND_STR("\n");
     buf[off] = '\0';
     return off;
@@ -418,7 +421,7 @@ static int gen_stat(char *buf, size_t cap) {
         perf_sys_snapshot(&ps);
         APPEND_STR("processes "); APPEND_U64(ps.proc_spawns); APPEND_STR("\n");
     }
-    APPEND_STR("procs_running "); APPEND_INT(g_nr_running); APPEND_STR("\n");
+    APPEND_STR("procs_running "); APPEND_INT(sched_nr_runnable()); APPEND_STR("\n");
     APPEND_STR("procs_blocked 0\n");
     buf[off] = '\0';
     return off;

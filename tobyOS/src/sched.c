@@ -68,7 +68,6 @@
 uint64_t g_cpu_jiffies[MAX_CPUS][3];     /* [cpu][0 user, 1 system, 2 idle] */
 uint64_t g_ctxt_switches;
 uint64_t g_loadavg_fixed[3];             /* FSHIFT 11, as Linux's avenrun[] */
-uint32_t g_nr_running;                   /* last sample: runnable, non-idle */
 
 #define LOAD_FSHIFT  11
 #define LOAD_FIXED_1 (1u << LOAD_FSHIFT)
@@ -76,22 +75,37 @@ uint32_t g_nr_running;                   /* last sample: runnable, non-idle */
 #define LOAD_EXP_5   2014                /* 1/exp(5s/5min)  */
 #define LOAD_EXP_15  2037                /* 1/exp(5s/15min) */
 
-/* Every 5 s on the BSP, as Linux's calc_load: the runnable count decays
- * into three moving averages. Reads the table without a lock -- a sample
- * that is off by one for one period is what a load average tolerates. */
-static void loadavg_sample(void) {
+/* What Linux's load counts: the procs that could run now -- on a CPU or
+ * queued for one (its nr_running) -- other than the idle tasks. Only the
+ * ones ON a CPU were counted, so a queued proc was no load. Reads the
+ * table without a lock: off by one for a moment is what a count of this
+ * kind tolerates. /proc/loadavg's fourth field and /proc/stat's
+ * procs_running ask it at the moment they are read, as Linux's do; they
+ * gave the last 5 s sample. */
+uint32_t sched_nr_runnable(void) {
     uint32_t n = 0;
     for (int i = 1; i < PROC_MAX; i++) {
         struct proc *p = proc_at_slot(i);   /* by slot: pids are not slots */
-        if (p && p->state == PROC_RUNNING && !p->is_idle) n++;
+        if (p && !p->is_idle &&
+            (p->state == PROC_RUNNING || p->state == PROC_READY)) n++;
     }
-    g_nr_running = n;
-    uint64_t active = (uint64_t)n << LOAD_FSHIFT;
+    return n;
+}
+
+/* Every 5 s on the BSP: the runnable count decays into three moving
+ * averages, by Linux's rule -- which rounds a step UP while the load is
+ * rising to meet the count (finding 192). Floored every step, an average
+ * stopped short of a steady count once the step's gain fell under one
+ * unit: a constant load of 1 left the 15-minute figure at 0.909 forever
+ * (and the 5-minute at 0.97), where Linux's reaches 1.00. */
+static void loadavg_sample(void) {
+    uint64_t active = (uint64_t)sched_nr_runnable() << LOAD_FSHIFT;
     static const uint64_t exp[3] = { LOAD_EXP_1, LOAD_EXP_5, LOAD_EXP_15 };
     for (int i = 0; i < 3; i++) {
         uint64_t load = g_loadavg_fixed[i];
-        load = load * exp[i] + active * (LOAD_FIXED_1 - exp[i]);
-        g_loadavg_fixed[i] = load >> LOAD_FSHIFT;
+        uint64_t next = load * exp[i] + active * (LOAD_FIXED_1 - exp[i]);
+        if (active >= load) next += LOAD_FIXED_1 - 1;
+        g_loadavg_fixed[i] = next >> LOAD_FSHIFT;
     }
 }
 
