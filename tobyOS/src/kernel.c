@@ -782,6 +782,7 @@ static void m14_init(void) {
         };
         for (unsigned i = 0; i < sizeof(restore)/sizeof(restore[0]); i++)
             etc_restore_merged(restore[i].src, restore[i].dst, restore[i].base);
+        users_sync_passwd();         /* logins take /etc/passwd's ids (194) */
     }
 
     /* Milestone 31: pick the active UI palette from settings BEFORE

@@ -104,5 +104,8 @@ void users_visit(users_visit_fn cb, void *ctx);
  * each group /etc/group lists NAME as a member of. Into OUT, at most MAX
  * of them; returns how many. */
 int users_initgroups(const char *name, int gid, int *out, int max);
+/* Batch 31 (finding 194): each known name's uid and gid from /etc/passwd,
+ * the account database; after /etc is restored at boot, and per login. */
+void users_sync_passwd(void);
 
 #endif /* TOBYOS_USERS_H */

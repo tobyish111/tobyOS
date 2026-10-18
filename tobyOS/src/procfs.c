@@ -1473,7 +1473,7 @@ static int gen_net_arp(char *buf, size_t cap) {
  * read-only majority). Recorded at open because procfs_write() only receives
  * the handle, not the path. */
 enum procfs_wkind { PW_NONE = 0, PW_UID_MAP, PW_GID_MAP, PW_SETGROUPS,
-                    PW_NS_LAST_PID };
+                    PW_NS_LAST_PID, PW_HOSTNAME, PW_DOMAINNAME };
 
 struct procfs_handle {
     char *data;
@@ -1499,7 +1499,13 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     if (strncmp(rel, "sys/", 4) == 0) { len = gen_sys(rel + 4, buf, sizeof(buf));
                                         if (len < 0) return VFS_ERR_NOENT;
                                         if (strcmp(rel, "sys/kernel/ns_last_pid") == 0)
-                                            wkind = PW_NS_LAST_PID; }
+                                            wkind = PW_NS_LAST_PID;
+                                        /* batch 31: writable, as Linux's -- how
+                                         * hostname(1) sets the name here */
+                                        if (strcmp(rel, "sys/kernel/hostname") == 0)
+                                            wkind = PW_HOSTNAME;
+                                        if (strcmp(rel, "sys/kernel/domainname") == 0)
+                                            wkind = PW_DOMAINNAME; }
     else if (strncmp(rel, "net/", 4) == 0) { len = gen_net(rel + 4, buf, sizeof(buf));
                                         if (len < 0) return VFS_ERR_NOENT; }
     else if (strcmp(rel, "uptime") == 0)  { len = gen_uptime(buf, sizeof(buf));  }
@@ -1649,6 +1655,21 @@ static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
         while (i < n && (c[i] == ' ' || c[i] == '\t' || c[i] == '\n')) i++;
         if (i == d0 || i != n || v >= PID_MAX) return VFS_ERR_INVAL;
         proc_set_last_pid((int)v);
+        return (long)n;
+    }
+    if (h->wkind == PW_HOSTNAME || h->wkind == PW_DOMAINNAME) {
+        /* THE HOST AND DOMAIN NAME, AS LINUX'S /proc/sys/kernel FILES SET
+         * THEM: what is written, less one trailing newline, through the
+         * same rule sethostname(2) has (uts_set_*: CAP_SYS_ADMIN in the
+         * UTS namespace's owner, under 65 bytes). There was no way for a
+         * native program to set either (batch 31: hostname, domainname). */
+        size_t len = n;
+        const char *c = (const char *)buf;
+        if (len && c[len - 1] == '\n') len--;
+        long r = (h->wkind == PW_HOSTNAME) ? uts_set_nodename(c, len)
+                                           : uts_set_domainname(c, len);
+        if (r == -ABI_EPERM) return VFS_ERR_NOTPERM;
+        if (r < 0) return VFS_ERR_INVAL;
         return (long)n;
     }
     struct proc *target = proc_lookup(h->wpid);

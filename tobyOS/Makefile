@@ -3227,6 +3227,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
 	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
 	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
+	@# the files databases getent, hostname and the resolver read (batch 31)
+	for f in hosts services protocols rpc networks; do \
+	    cp initrd/etc/$$f $(INITRD_STAGE)/etc/$$f; done
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
 	cp programs/waittest/waittest.elf               $(INITRD_STAGE)/bin/waittest
@@ -4295,6 +4298,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    etc/passwd etc/group \
+	    etc/hosts etc/services etc/protocols etc/rpc etc/networks \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    etc/shparity/*.sh \
 	    etc/ttyparity/*.txt \

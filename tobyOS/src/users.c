@@ -179,10 +179,58 @@ static void parse_buffer(const char *text, size_t n) {
     }
 }
 
+/* /etc/passwd IS THE ACCOUNT DATABASE, as on Linux: a login takes its uid
+ * and gid from it. This cache (/data/users) and /etc/passwd were two
+ * stores that drifted -- usermod changes the second -- so a login could
+ * come up with gid 1000 while /etc/passwd said 100: `id -g` and
+ * `getent passwd $(id -un)` disagreed, and chown's "OWNER:" (the login
+ * group) took the file's group from one where id took it from the other
+ * (batch 31, finding 194). Each name this cache knows takes its uid and
+ * gid from /etc/passwd when /etc/passwd has the name; the cache keeps the
+ * password and the set of names that may log in. */
+void users_sync_passwd(void) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK || !buf) return;
+    const char *t = (const char *)buf, *end = t + sz;
+    while (t < end) {
+        const char *nl = t;
+        while (nl < end && *nl != '\n') nl++;
+        /* name:passwd:uid:gid:... */
+        const char *f[4];
+        size_t fl[4];
+        int nf = 0;
+        const char *p = t;
+        while (nf < 4 && p <= nl) {
+            const char *q = p;
+            while (q < nl && *q != ':') q++;
+            f[nf] = p;
+            fl[nf] = (size_t)(q - p);
+            nf++;
+            p = q + 1;
+            if (q >= nl) break;
+        }
+        int uid, gid;
+        if (nf == 4 && fl[0] && fl[0] < USER_NAME_MAX && t[0] != '#' &&
+            parse_int(f[2], fl[2], &uid) && parse_int(f[3], fl[3], &gid)) {
+            for (int i = 0; i < g_count; i++) {
+                if (strlen(g_users[i].name) == fl[0] &&
+                    memcmp(g_users[i].name, f[0], fl[0]) == 0) {
+                    g_users[i].uid = uid;
+                    g_users[i].gid = gid;
+                }
+            }
+        }
+        t = nl + 1;
+    }
+    kfree(buf);
+}
+
 /* ---- public API ---- */
 
 const struct user *users_lookup_by_name(const char *name) {
     if (!name || !name[0]) return 0;
+    users_sync_passwd();            /* a usermod since boot counts */
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_users[i].name, name) == 0) return &g_users[i];
     }
