@@ -6728,6 +6728,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_lchown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
     case ABI_SYS_GETGROUPS:         /* one implementation: the Linux arm */
         return linux_syscall_impl(115, a1, a2, 0, 0, 0);
+    case ABI_SYS_MOUNT:             /* batch 31: mount(8); the Linux arm */
+        return linux_syscall_impl(165, a1, a2, a3, a4, a5);
+    case ABI_SYS_UMOUNT2:           /* batch 31: umount(8); the Linux arm */
+        return linux_syscall_impl(166, a1, a2, 0, 0, 0);
 
     /* ---- Milestone 25A: libc-shape calls ------------------------ */
     case SYS_GETPID:        return sys_getpid();
@@ -13430,6 +13434,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 
     case LX_umount2: {                        /* (target, flags) */
         struct proc *mp = current_proc();
+        /* THE FLAGS, AS LINUX JUDGES THEM: only MNT_FORCE, MNT_DETACH,
+         * MNT_EXPIRE and UMOUNT_NOFOLLOW, and MNT_EXPIRE with neither of
+         * the others -- else EINVAL, before the permission check, as
+         * Linux's ksys_umount does. They were not looked at. A force or
+         * a lazy unmount is an ordinary one here (nothing holds a mount
+         * busy); MNT_EXPIRE's "mark, then unmount on the second call" has
+         * no marks to keep, so it unmounts. */
+        {
+            long fl = a2;
+            if (fl & ~0xFL) return -ABI_EINVAL;
+            if ((fl & 4) && (fl & 3)) return -ABI_EINVAL;
+        }
         if (!mp || !userns_capable(LCAP_SYS_ADMIN)) return -ABI_EPERM;
         if (!userns_owns_mnt_ns(mp)) return -ABI_EPERM;   /* see LX_mount */
         char ktgt[ABI_PATH_MAX];

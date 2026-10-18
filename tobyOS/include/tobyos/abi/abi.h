@@ -1357,7 +1357,15 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         63-byte names) is kept unchanged
                                         for the programs that call it
                                         directly (finding 187). */
-#define ABI_SYS_NR_MAX          229
+#define ABI_SYS_MOUNT           230  /* (source, target, fstype, flags, data)
+                                        -> 0|-E: mount(2), the Linux
+                                        personality's (root, CAP_SYS_ADMIN
+                                        in the mount namespace's owner) --
+                                        mount(8) had no native way in */
+#define ABI_SYS_UMOUNT2         231  /* (target, flags) -> 0|-E: umount2(2),
+                                        MNT_FORCE 1, MNT_DETACH 2,
+                                        MNT_EXPIRE 4, UMOUNT_NOFOLLOW 8 */
+#define ABI_SYS_NR_MAX          231
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

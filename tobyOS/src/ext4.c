@@ -2401,6 +2401,7 @@ static int ext4_sync(void *mnt) {
 }
 
 static const struct vfs_ops ext4_ops = {
+    .fsname   = "ext4",          /* batch 31: /proc/mounts */
     .open     = ext4_open,
     .close    = ext4_close,
     .read     = ext4_read,
@@ -2617,6 +2618,7 @@ int ext4_mount(const char *mount_point, struct blk_dev *dev) {
     if (!fs) return VFS_ERR_INVAL;
 
     int rc = vfs_mount(mount_point, &ext4_ops, fs);
+    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
     if (rc != VFS_OK) {
         kprintf("[ext4] vfs_mount('%s') failed: %d\n", mount_point, rc);
         ext4_free(fs);

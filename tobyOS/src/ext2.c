@@ -1675,6 +1675,7 @@ static int ext2_sync(void *mnt) {
 }
 
 const struct vfs_ops ext2_ops = {
+    .fsname   = "ext2",          /* batch 31: /proc/mounts */
     .open     = ext2_open,
     .close    = ext2_close,
     .read     = ext2_read,
@@ -1817,6 +1818,7 @@ int ext2_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     rc = vfs_mount(mount_point, &ext2_ops, fs);
+    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
     if (rc != VFS_OK) {
         kprintf("[ext2] vfs_mount('%s') failed: %d\n", mount_point, rc);
         kfree(fs->blk_buf);

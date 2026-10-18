@@ -1140,6 +1140,7 @@ static int ramfs_statfs(void *mnt, struct vfs_statfs *out) {
 }
 
 const struct vfs_ops ramfs_ops = {
+    .fsname   = "rootfs",          /* batch 31: /proc/mounts */
     .open     = ramfs_open,
     .close    = ramfs_close,
     .read     = ramfs_read,

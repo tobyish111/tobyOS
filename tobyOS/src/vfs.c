@@ -36,6 +36,9 @@ struct vfs_mount {
     uint32_t              prop;
     uint32_t              peer_id;
     uint32_t              master_id;
+    /* batch 31: what it was mounted from -- a block device's name, else
+     * empty and the type stands in (vfs_iter_mounts_info) */
+    char                  source[48];
 };
 
 /* ---- Linux slice 5: the mount NAMESPACE seam ------------------------------
@@ -396,6 +399,7 @@ int vfs_mount_flags(const char *mount_point, const struct vfs_ops *ops,
     m->ops       = ops;
     m->data      = mount_data;
     m->flags     = flags;
+    m->source[0] = '\0';
     /* Slice 9: a fresh mount is PRIVATE unless it inherits a peer group by
      * propagating to the peers of the mount it sits under. Note the ordering --
      * propagate_mount() reads the table to find the parent, so the entry above
@@ -568,6 +572,38 @@ void vfs_iter_mounts(vfs_mount_walk_cb cb, void *cookie) {
             return;
         }
     }
+}
+
+void vfs_iter_mounts_info(vfs_mount_info_cb cb, void *cookie) {
+    if (!cb) return;
+    size_t n = g_mount_count;
+    for (size_t i = 0; i < n && i < g_mount_count; i++) {
+        const struct vfs_mount *m = &g_mounts[i];
+        struct vfs_mount_info mi = {
+            .point = m->point, .ops = m->ops, .data = m->data,
+            .flags = m->flags,
+            .source = m->source[0] ? m->source
+                    : (m->ops && m->ops->fsname) ? m->ops->fsname : "none",
+            .prop = m->prop, .peer_id = m->peer_id, .master_id = m->master_id,
+            .index = (int)i,
+        };
+        if (!cb(&mi, cookie)) return;
+    }
+}
+
+int vfs_mount_set_source(const char *mount_point, const char *source) {
+    if (!mount_point || !source) return VFS_ERR_INVAL;
+    char norm[VFS_PATH_MAX];
+    if (!normalise_mount(mount_point, norm)) return VFS_ERR_INVAL;
+    for (size_t i = 0; i < g_mount_count; i++) {
+        if (strcmp(g_mounts[i].point, norm) != 0) continue;
+        size_t l = strlen(source);
+        if (l >= sizeof g_mounts[i].source) l = sizeof g_mounts[i].source - 1;
+        memcpy(g_mounts[i].source, source, l);
+        g_mounts[i].source[l] = '\0';
+        return VFS_OK;
+    }
+    return VFS_ERR_NOMOUNT;
 }
 
 void vfs_dump_mounts(void) {

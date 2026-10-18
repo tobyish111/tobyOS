@@ -2032,6 +2032,7 @@ static int tobyfs_sync(void *mnt) {
 }
 
 const struct vfs_ops tobyfs_ops = {
+    .fsname   = "tobyfs",          /* batch 31: /proc/mounts */
     .open     = tobyfs_open,
     .close    = tobyfs_close,
     .read     = tobyfs_read,
@@ -2256,6 +2257,7 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     int rc = vfs_mount(mount_point, &tobyfs_ops, fs);
+    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
     if (rc != VFS_OK) {
         kprintf("[tobyfs] vfs_mount('%s') failed: %d\n", mount_point, rc);
         kfree(fs->ibitmap); kfree(fs->dbm_win); kfree(fs->dbm_free); if (fs->ino_gen) kfree(fs->ino_gen); kfree(fs);

@@ -846,6 +846,7 @@ static int cgfs_readdir(struct vfs_dir *dd, struct vfs_dirent *out) {
 }
 
 static const struct vfs_ops cgroupfs_ops = {
+    .fsname   = "cgroup2",          /* batch 31: /proc/mounts */
     .open = cgfs_open, .close = cgfs_close, .read = cgfs_read,
     .write = cgfs_write, .create = 0, .unlink = cgfs_unlink,
     .mkdir = cgfs_mkdir, .opendir = cgfs_opendir, .closedir = cgfs_closedir,

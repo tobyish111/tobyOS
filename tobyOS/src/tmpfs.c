@@ -858,6 +858,7 @@ static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
 }
 
 static const struct vfs_ops tmpfs_ops = {
+    .fsname   = "tmpfs",          /* batch 31: /proc/mounts */
     .open      = tmpfs_open,
     .close     = tmpfs_close,
     .read      = tmpfs_read,

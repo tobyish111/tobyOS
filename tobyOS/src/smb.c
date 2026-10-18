@@ -759,6 +759,7 @@ static int smb_vfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 }
 
 static const struct vfs_ops smb_vfs_ops = {
+    .fsname   = "cifs",          /* batch 31: /proc/mounts */
     .open    = smb_vfs_open,
     .close   = smb_vfs_close,
     .read    = smb_vfs_read,

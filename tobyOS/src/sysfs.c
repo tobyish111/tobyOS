@@ -1038,6 +1038,7 @@ static int sysfs_readlink(void *mnt, const char *path, char *buf,
 }
 
 static const struct vfs_ops sysfs_ops = {
+    .fsname   = "sysfs",          /* batch 31: /proc/mounts */
     .open    = sysfs_open,
     .close   = sysfs_close,
     .read    = sysfs_read,

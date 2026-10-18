@@ -1737,6 +1737,7 @@ static int fat32_sync(void *mnt) {
 }
 
 const struct vfs_ops fat32_ops = {
+    .fsname   = "vfat",          /* batch 31: /proc/mounts */
     .open     = fat32_open,
     .close    = fat32_close,
     .read     = fat32_read,
@@ -2041,6 +2042,7 @@ int fat32_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     rc = vfs_mount(mount_point, &fat32_ops, fs);
+    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
     if (rc != VFS_OK) {
         kprintf("[fat32] vfs_mount('%s') failed: %d\n", mount_point, rc);
         kfree(fs->clus_buf);

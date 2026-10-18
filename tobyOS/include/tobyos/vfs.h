@@ -258,6 +258,10 @@ struct vfs_ops {
      * is still itself. NULL => the caller falls back to the path the file
      * was opened by. See vfs_fstat. */
     int  (*fstat)   (struct vfs_file *f, struct vfs_stat *out);
+    /* The filesystem's TYPE as Linux names it ("tmpfs", "proc", "ext4"):
+     * /proc/mounts' third field, mountinfo's, mount(8)'s "type". Every
+     * mount said "tobyos" (batch 31). NULL: "tobyos". */
+    const char *fsname;
 };
 
 /* Phase H: real per-mount statistics for statfs(2)/fstatfs(2). All
@@ -438,6 +442,23 @@ typedef bool (*vfs_mount_walk_cb)(const char *mount_point,
                                   void *mount_data,
                                   void *cookie);
 void vfs_iter_mounts(vfs_mount_walk_cb cb, void *cookie);
+
+/* Batch 31: the walk /proc/mounts and mountinfo need -- flags, the source
+ * a mount was made from (its block device's name, or the type for one
+ * without a device), propagation, and the slot as a stable id. */
+struct vfs_mount_info {
+    const char           *point;
+    const struct vfs_ops *ops;
+    void                 *data;
+    uint32_t              flags;       /* VFS_MNT_* */
+    const char           *source;
+    uint32_t              prop, peer_id, master_id;
+    int                   index;
+};
+typedef bool (*vfs_mount_info_cb)(const struct vfs_mount_info *mi, void *cookie);
+void vfs_iter_mounts_info(vfs_mount_info_cb cb, void *cookie);
+/* The source of the mount at MOUNT_POINT (a block filesystem's device). */
+int  vfs_mount_set_source(const char *mount_point, const char *source);
 
 /* ---- per-call wrappers ---- */
 

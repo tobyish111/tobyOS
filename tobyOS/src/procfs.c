@@ -431,23 +431,135 @@ static int gen_stat(char *buf, size_t cap) {
     #undef APPEND_CPU
 }
 
-/* /proc/mounts -- one line per VFS mount: "<dev> <point> <type> <opts> 0 0".
- * Built by walking the mount table. */
-struct mounts_ctx { char *buf; int off; size_t cap; };
-static bool mounts_cb(const char *point, const struct vfs_ops *ops,
-                      void *mnt, void *cookie) {
-    (void)ops; (void)mnt;
-    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
-    #define MAPP(s) do { size_t sl = strlen(s); \
-        if ((size_t)c->off + sl >= c->cap) return false; \
-        memcpy(c->buf + c->off, s, sl); c->off += (int)sl; } while (0)
-    MAPP("none "); MAPP(point); MAPP(" tobyos rw,relatime 0 0\n");
-    #undef MAPP
+/* /proc/mounts -- one line per mount, as Linux writes it: "SOURCE POINT
+ * TYPE OPTIONS 0 0", the options from the mount's flags (rw or ro, nosuid,
+ * nodev, noexec, relatime), a blank, tab, newline or backslash in a path
+ * as \NNN octal. Every line said "none POINT tobyos rw,relatime": mount(8)
+ * could list mount points and nothing else, `mount -t proc` found none
+ * (batch 31). /proc/PID/mountinfo has the rest. */
+struct mounts_ctx { char *buf; int off; size_t cap; bool full; };
+
+static bool mounts_put(struct mounts_ctx *c, const char *s) {
+    size_t sl = strlen(s);
+    if ((size_t)c->off + sl >= c->cap) return false;
+    memcpy(c->buf + c->off, s, sl);
+    c->off += (int)sl;
     return true;
 }
+
+static bool mounts_put_path(struct mounts_ctx *c, const char *s) {
+    char t[8];
+    for (; *s; s++) {
+        if (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\\') {
+            t[0] = '\\';
+            t[1] = (char)('0' + ((*s >> 6) & 7));
+            t[2] = (char)('0' + ((*s >> 3) & 7));
+            t[3] = (char)('0' + (*s & 7));
+            t[4] = 0;
+        } else {
+            t[0] = *s; t[1] = 0;
+        }
+        if (!mounts_put(c, t)) return false;
+    }
+    return true;
+}
+
+static bool mounts_put_opts(struct mounts_ctx *c, uint32_t flags) {
+    return mounts_put(c, (flags & VFS_MNT_RDONLY) ? "ro" : "rw") &&
+           ((flags & VFS_MNT_NOSUID) ? mounts_put(c, ",nosuid") : true) &&
+           ((flags & VFS_MNT_NODEV)  ? mounts_put(c, ",nodev")  : true) &&
+           ((flags & VFS_MNT_NOEXEC) ? mounts_put(c, ",noexec") : true) &&
+           mounts_put(c, ",relatime");
+}
+
+static const char *mounts_type(const struct vfs_mount_info *mi) {
+    return (mi->ops && mi->ops->fsname) ? mi->ops->fsname : "tobyos";
+}
+
+static bool mounts_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
+    return mounts_put_path(c, mi->source) && mounts_put(c, " ") &&
+           mounts_put_path(c, mi->point) && mounts_put(c, " ") &&
+           mounts_put(c, mounts_type(mi)) && mounts_put(c, " ") &&
+           mounts_put_opts(c, mi->flags) && mounts_put(c, " 0 0\n");
+}
+
 static int gen_mounts(char *buf, size_t cap) {
-    struct mounts_ctx c = { buf, 0, cap };
-    vfs_iter_mounts(mounts_cb, &c);
+    struct mounts_ctx c = { buf, 0, cap, false };
+    vfs_iter_mounts_info(mounts_cb, &c);
+    buf[c.off] = '\0';
+    return c.off;
+}
+
+/* /proc/PID/mountinfo, as Linux's: "ID PARENT MAJOR:MINOR ROOT POINT
+ * OPTIONS [shared:N|master:N] - TYPE SOURCE SUPER-OPTIONS". The id is the
+ * mount's slot (+21, as Linux's ids start past its internal mounts); the
+ * parent the mount whose point is the longest proper prefix of this one's
+ * (the root's is itself); the device what stat of the point says, as
+ * st_dev splits it; the root "/" (no bind of a subtree here). libmount --
+ * util-linux's mount, findmnt -- reads this before /proc/mounts. */
+struct minfo_ent { char point[VFS_PATH_MAX]; };
+static struct minfo_ent g_minfo[VFS_MAX_MOUNTS];
+static int g_minfo_n;
+
+static bool minfo_collect(const struct vfs_mount_info *mi, void *cookie) {
+    (void)cookie;
+    if (g_minfo_n >= VFS_MAX_MOUNTS) return false;
+    size_t l = strlen(mi->point);
+    if (l >= VFS_PATH_MAX) l = VFS_PATH_MAX - 1;
+    memcpy(g_minfo[g_minfo_n].point, mi->point, l);
+    g_minfo[g_minfo_n].point[l] = '\0';
+    g_minfo_n++;
+    return true;
+}
+
+static int minfo_parent(int self) {
+    const char *p = g_minfo[self].point;
+    size_t pl = strlen(p);
+    int best = self;
+    size_t bl = 0;
+    for (int i = 0; i < g_minfo_n; i++) {
+        if (i == self) continue;
+        const char *q = g_minfo[i].point;
+        size_t ql = strlen(q);
+        bool under = (ql == 1 && q[0] == '/' && pl > 1) ||
+                     (ql < pl && strncmp(p, q, ql) == 0 && p[ql] == '/');
+        if (under && ql >= bl) { best = i; bl = ql; }
+    }
+    return best;
+}
+
+static bool minfo_cb(const struct vfs_mount_info *mi, void *cookie) {
+    struct mounts_ctx *c = (struct mounts_ctx *)cookie;
+    char t[64];
+    struct vfs_stat st;
+    uint32_t maj = 0, min = 1;              /* stat's st_dev when there is none */
+    if (vfs_stat(mi->point, &st) == VFS_OK && st.dev) {
+        maj = ((uint32_t)st.dev >> 20) & 0xfffu;
+        min = (uint32_t)st.dev & 0xfffffu;
+    }
+    ksnprintf(t, sizeof t, "%d %d %u:%u / ", mi->index + 21,
+              minfo_parent(mi->index) + 21, (unsigned)maj, (unsigned)min);
+    if (!mounts_put(c, t) || !mounts_put_path(c, mi->point) ||
+        !mounts_put(c, " ") || !mounts_put_opts(c, mi->flags)) return false;
+    if (mi->prop == VFS_PROP_SHARED && mi->peer_id) {
+        ksnprintf(t, sizeof t, " shared:%u", (unsigned)mi->peer_id);
+        if (!mounts_put(c, t)) return false;
+    }
+    if (mi->master_id) {
+        ksnprintf(t, sizeof t, " master:%u", (unsigned)mi->master_id);
+        if (!mounts_put(c, t)) return false;
+    }
+    return mounts_put(c, " - ") && mounts_put(c, mounts_type(mi)) &&
+           mounts_put(c, " ") && mounts_put_path(c, mi->source) &&
+           mounts_put(c, (mi->flags & VFS_MNT_RDONLY) ? " ro\n" : " rw\n");
+}
+
+static int gen_mountinfo(char *buf, size_t cap) {
+    g_minfo_n = 0;
+    vfs_iter_mounts_info(minfo_collect, 0);
+    struct mounts_ctx c = { buf, 0, cap, false };
+    vfs_iter_mounts_info(minfo_cb, &c);
     buf[c.off] = '\0';
     return c.off;
 }
@@ -1435,6 +1547,8 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                  * already renders the READER's mount namespace). */
                 else if (strcmp(sub, "mounts") == 0)
                     len = gen_mounts(buf, sizeof(buf));
+                else if (strcmp(sub, "mountinfo") == 0)      /* batch 31 */
+                    len = gen_mountinfo(buf, sizeof(buf));
                 /* Slice 11: the user-namespace id maps. These are the first
                  * WRITABLE files in /proc -- see procfs_write(). The pid is
                  * stashed on the handle because a write has to know which
@@ -1955,12 +2069,12 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are
      * directories, the rest are files. */
     static const char *entries[] = { "status", "cmdline", "maps", "stat",
-                                     "mounts",
+                                     "mounts", "mountinfo",
                                      "exe", "fd", "ns",
                                      /* slice 11 */
                                      "uid_map", "gid_map", "setgroups",
                                      "fdinfo" };
-    const int nentries = 11;
+    const int nentries = 12;
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
     size_t nl = strlen(entries[dh->index]);
@@ -2076,6 +2190,7 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
 }
 
 static const struct vfs_ops procfs_ops = {
+    .fsname   = "proc",          /* batch 31: /proc/mounts */
     .open     = procfs_open,
     .close    = procfs_close,
     .read     = procfs_read,

@@ -60,6 +60,10 @@ extern int errno;
 /* 2026-10-04: /dev/tty without a controlling terminal is ENXIO, and the
  * terminal ioctls on a non-terminal ENOTTY; ESPIPE is lseek on a pipe. */
 #define ENXIO            6
+/* batch 31: mount(8)'s "no such device" (an unknown filesystem type) and
+ * "block device required" -- Linux's numbers; strerror had the words */
+#define ENOTBLK         15
+#define ENODEV          19
 #define ENOTTY          25
 #define ESPIPE          29
 /* 2026-10-12 (batch 25): a value too large for its type -- GNU truncate

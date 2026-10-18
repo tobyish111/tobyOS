@@ -308,6 +308,7 @@ static int devfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
 }
 
 static const struct vfs_ops devfs_ops = {
+    .fsname   = "devtmpfs",          /* batch 31: /proc/mounts */
     .open     = devfs_open,
     .close    = devfs_close,
     .read     = 0,
