@@ -985,6 +985,9 @@ typedef struct {
     const char  *group_start[MAX_GROUPS];
     const char  *group_end[MAX_GROUPS];
     int          depth;
+    /* On the main stack: the lowest the matcher's frames may reach (see
+     * MAX_DEPTH); 0 on any other, where MAX_DEPTH counts. */
+    uintptr_t    sp_floor;
     /* Where the accepting path ended. regexec used to try to discover
      * this by re-running the matcher, and got it wrong; the matcher
      * already knows, because ND_MATCH is reached with sp sitting exactly
@@ -1021,6 +1024,17 @@ static size_t rx_avail_ctx(const match_ctx *ctx, const char *p) {
  * whole class of recursion; what is left is one frame per group and per
  * repetition of a COMPOUND body, which no sane pattern drives to 1500. */
 #define MAX_DEPTH 1500
+
+/* THE MAIN STACK IS NOT 256 KiB. A native process's grows on demand from
+ * the top of the user half down to 8 MiB below it (page_fault.c's
+ * grow-down case, Linux's RLIMIT_STACK), so a matcher on it may recurse
+ * until RX_STACK_SPARE above that floor -- a group repeated 2000 times
+ * matched only its first ~400 at MAX_DEPTH: sed -E's (a\/)+ over 2046
+ * repetitions ended its match early, with no error (finding 232). A thread's stack
+ * (64 KiB, malloc'd) is elsewhere and keeps the frame limit. */
+#define RX_STACK_TOP   0x0000800000000000ULL
+#define RX_STACK_FLOOR (RX_STACK_TOP - 8ULL * 1024 * 1024)
+#define RX_STACK_SPARE (256ULL * 1024)
 
 static int rx_is_word_at(const char *p) { return rx_word((unsigned char)*p); }
 
@@ -1109,7 +1123,9 @@ static int match_body(const match_ctx *ctx, const nd_t *n, int btype, int c) {
 static int match_node(match_ctx *ctx, nd_t *node, const char *sp);
 
 static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
-    if (++ctx->depth > MAX_DEPTH) { ctx->depth--; return 0; }
+    ++ctx->depth;
+    if (ctx->sp_floor ? (uintptr_t)__builtin_frame_address(0) < ctx->sp_floor
+                      : ctx->depth > MAX_DEPTH) { ctx->depth--; return 0; }
     if (ctx->budget && ++ctx->steps > ctx->budget) { ctx->depth--; return 0; }
 
     while (node) {
@@ -1431,6 +1447,11 @@ int regexec(const regex_t *preg, const char *string,
     ctx.bol = string;
     ctx.eflags = eflags;
     ctx.cflags = comp->cflags;
+    {   /* on the main stack, as deep as it goes (see MAX_DEPTH) */
+        uintptr_t fsp = (uintptr_t)__builtin_frame_address(0);
+        if (fsp > RX_STACK_FLOOR + RX_STACK_SPARE && fsp <= RX_STACK_TOP)
+            ctx.sp_floor = (uintptr_t)(RX_STACK_FLOOR + RX_STACK_SPARE);
+    }
     const char *start = string;
     if ((eflags & REG_STARTEND) && pmatch) {
         if (pmatch[0].rm_so < 0 || pmatch[0].rm_eo < pmatch[0].rm_so) return REG_NOMATCH;
