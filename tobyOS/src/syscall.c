@@ -615,7 +615,7 @@ static long sys_pread64(int fd, void *buf, size_t len, int64_t offset) {
     if (!k) return -ABI_ENOMEM;
     size_t saved = file_pos_get(f);
     file_pos_set(f, (size_t)offset);
-    long rv = file_read(f, k, len);
+    long rv = file_err_to_abi(f, file_read(f, k, len));   /* a VFS code: an errno */
     file_pos_set(f, saved);      /* positioned read must not move the offset */
     if (rv > 0 && copy_to_user(buf, k, (size_t)rv) != 0) rv = -ABI_EFAULT;
     kfree(k);
@@ -638,7 +638,7 @@ static long sys_pwrite64(int fd, const void *buf, size_t len, int64_t offset) {
         void *k = bounce_in((const char *)buf + done, n);
         if (!k) { rv = -ABI_EFAULT; break; }
         file_pos_set(f, (size_t)offset + done);
-        rv = file_write(f, k, n);
+        rv = file_err_to_abi(f, file_write(f, k, n));       /* a VFS code: an errno */
         kfree(k);
         if (rv < 0) break;
         done += (size_t)rv;
@@ -671,10 +671,12 @@ static long sys_pipe(int *user_fds_out) {
 }
 
 static long sys_close(int fd) {
-    if (fd < 0 || fd >= PROC_NFDS) return -1;
+    /* no such descriptor: EBADF, as Linux's -- the -1 here read as EPERM
+     * ("closing standard input: Operation not permitted", finding 219) */
+    if (fd < 0 || fd >= PROC_NFDS) return -ABI_EBADF;
     struct proc *p = current_proc();
     struct file **t = proc_fds(p);
-    if (!t || !t[fd]) return -1;
+    if (!t || !t[fd]) return -ABI_EBADF;
     /* POSIX wart, faithfully kept: closing ANY descriptor for a file drops
      * the process's fcntl record locks on that file -- even locks placed
      * through a different, still-open descriptor. Software is written
