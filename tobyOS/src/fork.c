@@ -785,10 +785,6 @@ long sys_fork(void) {
         }
     }
 
-    /* Ready to run. */
-    child->state = PROC_READY;
-    sched_enqueue(child);
-
     /* SLICE 16: the child gets its OWN cr3 (vmm_cow_fork below), so it is its own
      * mm owner and is bulk-charged its parent's page count; cgroup_mem_charge bumps
      * child->user_pages itself, so assigning it as well would double it.
@@ -803,6 +799,15 @@ long sys_fork(void) {
 
     kprintf("[fork] parent pid=%d -> child pid=%d cr3=0x%lx\n",
             parent->pid, child->pid, child->cr3);
+
+    /* READY TO RUN -- LAST. The line above was logged after the enqueue,
+     * and on the box each logged byte is port I/O: the parent spent it with
+     * the child already running, so the child all but always wrote first
+     * where bash's parent all but always does (Oils 2272, finding 201). The
+     * charge belongs before the enqueue too: a runnable child could fault
+     * before it was charged. */
+    child->state = PROC_READY;
+    sched_enqueue(child);
 
     return child->pid;  /* parent gets child PID */
 }
@@ -1283,12 +1288,12 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->clear_child_tid =
         (flags & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? ctid : 0;
 
-    child->state = PROC_READY;
-    sched_enqueue(child);
     perf_count_proc_spawn();
-
     kprintf("[clone] thread tid=%d in tgid=%d (shared VM, stack=0x%lx)\n",
             child_pid, child->tgid, (unsigned long)stack);
+    /* runnable last, as sys_fork's child (finding 201) */
+    child->state = PROC_READY;
+    sched_enqueue(child);
     return child_pid;  /* caller gets the new tid */
 }
 

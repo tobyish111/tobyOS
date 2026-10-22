@@ -26875,6 +26875,7 @@ extern void _exit(int status);
 void shell_host_builtin_done(void);              /* host.c: flush stdout */
 void shell_host_async_signals(void);             /* host.c: INT, QUIT ignored */
 bool shell_host_take_term_noop(void);            /* host.c */
+void shell_host_forked(void);                    /* host.c: the child's pid */
 /* fork(), and the child knows it may replace itself (g_replace_ok).
  *
  * A CHILD OF AN INTERACTIVE SHELL DIES OF SIGTERM, as every child bash's
@@ -26888,6 +26889,7 @@ bool shell_host_take_term_noop(void);            /* host.c */
 static int shell_fork(void) {
     int pid = fork();
     if (pid == 0) {
+        shell_host_forked();
         g_replace_ok = true;
         g_async_payload = false;
         shell_child_signals();
@@ -38985,12 +38987,21 @@ static int shell_background_forked_as(const char *text, const char *label,
     bool async_ign = !shell_job_control();
     bool null_stdin = (g_subshell_depth > 0 || !shell_job_control()) &&
                       !g_stdin_redir && !shell_text_stdin_redirected(text);
+    /* THE JOB'S NAME IS MADE BEFORE THE FORK, as bash makes its command
+     * string before make_child: rendering it (a parse and a print) between
+     * fork() and the parent's next command gave the child that long a
+     * start, and `echo word_a & echo word_b` printed word_a first 12-23
+     * times in 40 here, 33-40 on the EliteDesk, where bash's parent all
+     * but always wins (Oils 2272, finding 201). */
+    char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
     int pid = shell_fork();
     if (pid < 0) {
+        kfree(pn);
         kprintf("%s: cannot fork to background\n", label ? label : "shell");
         return 1;
     }
     if (pid == 0) {
+        kfree(pn);
         /* `set -m`: the job's group from the child's side too, before it
          * runs anything, and ^Z's default (shell_child_tty_job_signals) */
         if (g_opt_monitor) {
@@ -39002,12 +39013,9 @@ static int shell_background_forked_as(const char *text, const char *label,
     g_last_bg_pid = (int)pid;
     /* `set -m`: same rule as the spawn path -- the job is its own group. */
     if (g_opt_monitor) (void)proc_set_pgid((int)pid, (int)pid);
-    {
-        char *pn = shell_print_text(shown ? shown : text, SHPR_COMMAND, 0);
-        shell_describe_job(jobs_add((int)pid, pn ? pn : (label ? label : text)),
-                           (int)pid);
-        kfree(pn);
-    }
+    shell_describe_job(jobs_add((int)pid, pn ? pn : (label ? label : text)),
+                       (int)pid);
+    kfree(pn);
     return 0;
 }
 

@@ -923,14 +923,27 @@ const char *vfs_strerror(int err) {
 
 /* shell.c reads exactly four fields off current_proc(): cwd, uid, gid, pid.
  * A single static instance kept in step with the real process is enough, and
- * is honest about being a view rather than pretending to be the kernel's. */
+ * is honest about being a view rather than pretending to be the kernel's.
+ *
+ * THE IDS ARE READ ONCE: the shell never changes its own, and a fork's
+ * child reads its pid afresh (shell_host_forked). They were three syscalls
+ * on every call, and the shell calls this twice a command -- eight
+ * syscalls with the getcwd between a fork and the parent's next write
+ * (Oils 2272, finding 201). The cwd is read every time: another process
+ * can remove the directory, and the shell must see it go (finding 200). */
 static struct proc g_self;
+static bool g_self_ids;
+
+void shell_host_forked(void) { g_self_ids = false; }
 
 struct proc *current_proc(void) {
     if (!getcwd(g_self.cwd, sizeof g_self.cwd)) g_self.cwd[0] = '\0';
-    g_self.pid = getpid();
-    g_self.uid = getuid();
-    g_self.gid = getgid();
+    if (!g_self_ids) {
+        g_self.pid = getpid();
+        g_self.uid = getuid();
+        g_self.gid = getgid();
+        g_self_ids = true;
+    }
     return &g_self;
 }
 
@@ -955,6 +968,7 @@ int proc_spawn(const struct proc_spec *spec) {
         pid_t pid = fork();
         if (pid < 0) return -1;
         if (pid == 0) {
+            shell_host_forked();
             (void)proc_exec_in_place(spec);
             _exit(127);
         }
