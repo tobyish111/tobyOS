@@ -13894,7 +13894,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (cap < have) return -ABI_EINVAL;
         if (have && a2) {
             for (int i = 0; i < have; i++) {
-                uint32_t g = (uint32_t)cp->groups[i];
+                /* as the caller's user namespace numbers it: one with no
+                 * mapping is the overflow gid, 65534 (finding 236) */
+                uint32_t g = userns_cur_gid((uint32_t)cp->groups[i]);
                 if (copy_to_user((void *)(uintptr_t)(a2 + (uint64_t)i * 4),
                                  &g, 4) != 0)
                     return -ABI_EFAULT;

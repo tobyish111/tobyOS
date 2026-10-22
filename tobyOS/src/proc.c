@@ -1122,6 +1122,15 @@ static int spawn_body(const char *path, const char *name,
             p->mnt_ns              = parent->mnt_ns;
             p->net_ns              = parent->net_ns;
             p->user_ns             = parent->user_ns;
+            /* ROOT IN ITS USER NAMESPACE HAS THE FULL SET, as Linux's
+             * execve gives it -- a forked child has it already (it copies
+             * its parent's). spawn asked for kernel uid 0 alone, so mount,
+             * spawned by sh inside `unshare -r`, could not bind-mount
+             * there (finding 236). The checks that matter ask for the
+             * namespace (userns_capable). */
+            if (p->user_ns && p->uid != 0 &&
+                userns_k2v_uid(p->user_ns, (uint32_t)p->uid) == 0)
+                p->lcap_eff = p->lcap_perm = p->lcap_inh = ~0ull;
             p->pid_ns              = parent->pid_ns;
             p->pid_ns_for_children = parent->pid_ns_for_children;
             p->seccomp_filter      = parent->seccomp_filter;
