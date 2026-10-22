@@ -135,7 +135,11 @@ struct tmpfs_node {
     uint32_t      link_to;
     uint32_t      nlink;                /* names pointing at this owner */
     uint32_t      nent;                 /* a directory's entries (238) */
+    size_t        pages;                /* its size's pages, charged (243) */
 };
+
+/* The pages of N bytes, which Linux's tmpfs charges a file (243) */
+#define TPAGES(n) (((size_t)(n) + 4095u) / 4096u)
 
 /* A directory's size, as Linux's tmpfs counts it: BOGO_DIRENT_SIZE (20)
  * for each entry and for . and .. -- it was 0 (finding 238) */
@@ -147,6 +151,7 @@ struct tmpfs_mount {
     size_t              nnodes;    /* nodes in the chunks allocated so far */
     size_t              max_nodes; /* nr_inodes, a whole number of chunks */
     size_t              bytes;     /* data bytes currently held */
+    size_t              pages;     /* the files' pages: what size= limits (243) */
     size_t              max_bytes;
     bool                reported_full;  /* census printed once, not per create */
     bool                no_byte_limit;  /* size=0: none, statfs says 0 (233) */
@@ -252,6 +257,7 @@ static void treap(struct tmpfs_node *nd)
     if (!nd || !nd->used) return;
     struct tmpfs_mount *m = tmount_of(nd);
     if (m && nd->data) m->bytes -= nd->cap;
+    if (m) m->pages -= nd->pages;
     if (nd->data) kfree(nd->data);
     memset(nd, 0, sizeof *nd);
 }
@@ -304,6 +310,8 @@ static struct tmpfs_node *talloc(struct tmpfs_mount *m)
     /* Slots past max_nodes in the last chunk are never handed out: the
      * limit is the one asked for, not rounded up to a chunk. */
     size_t lim = m->nnodes < m->max_nodes ? m->nnodes : m->max_nodes;
+    /* the root is one of nr_inodes, as Linux's: N allows N - 1 (243) */
+    if (lim >= m->max_nodes && lim) lim = m->max_nodes - 1;
     for (size_t i = 0; i < lim; i++)
         if (!tnode(m, i)->used) return tnode(m, i);
     /* Every slot is taken: one more chunk, while the limit allows. */
@@ -397,21 +405,22 @@ static long tmpfs_read(struct vfs_file *f, void *buf, size_t n)
     return (long)n;
 }
 
+/* The pages size= allows, rounded up as Linux's is (243) */
+static size_t tmax_pages(const struct tmpfs_mount *m)
+{
+    return TPAGES(m->max_bytes);
+}
+
 /* Grow to at least `want` bytes, charging the mount's budget. Doubling rather
  * than exact-fit because a write loop that appends a byte at a time would
- * otherwise copy the whole file on every call. */
+ * otherwise copy the whole file on every call. The budget is the size's
+ * PAGES, as Linux's tmpfs charges -- not the doubled buffer, which made a
+ * 100,000-byte file 128 KiB used and filled a mount early (finding 243). */
 static int tgrow(struct tmpfs_mount *m, struct tmpfs_node *nd, size_t want)
 {
-    if (want <= nd->cap) return VFS_OK;
-    size_t ncap = nd->cap ? nd->cap : TMPFS_MIN_GROW;
-    while (ncap < want) ncap *= 2;
-    size_t delta = ncap - nd->cap;
-    if (m->bytes + delta > m->max_bytes) {
-        /* Try an exact fit before giving up: the doubling, not the request,
-         * may be what crossed the limit. */
-        ncap = want;
-        delta = ncap - nd->cap;
-        if (m->bytes + delta > m->max_bytes) {
+    size_t np = TPAGES(want), was = nd->pages;
+    if (np > was) {
+        if (m->pages + (np - was) > tmax_pages(m)) {
             /* Say so. A tmpfs that has simply filled up returned a bare
              * NOSPC that every caller reported as a generic write failure,
              * which is indistinguishable from a broken filesystem -- the
@@ -422,9 +431,19 @@ static int tgrow(struct tmpfs_mount *m, struct tmpfs_node *nd, size_t want)
             }
             return VFS_ERR_NOSPC;
         }
+        m->pages += np - was;
+        nd->pages = np;
     }
+    if (want <= nd->cap) return VFS_OK;
+    size_t ncap = nd->cap ? nd->cap : TMPFS_MIN_GROW;
+    while (ncap < want) ncap *= 2;
+    size_t delta = ncap - nd->cap;
     uint8_t *nb = kmalloc(ncap);
-    if (!nb) return VFS_ERR_NOMEM;
+    if (!nb) {
+        m->pages -= nd->pages - was;          /* nothing grew after all */
+        nd->pages = was;
+        return VFS_ERR_NOMEM;
+    }
     if (nd->size && nd->data) memcpy(nb, nd->data, nd->size);
     if (ncap > nd->size) memset(nb + nd->size, 0, ncap - nd->size);
     if (nd->data) kfree(nd->data);
@@ -892,6 +911,10 @@ static int ttrunc(struct tmpfs_mount *m, struct tmpfs_node *nd, uint64_t len)
             memset(nd->data + from, 0, (size_t)len - from);
     }
     nd->size = (size_t)len;
+    if (TPAGES(len) < nd->pages) {              /* a shrink gives pages back */
+        m->pages -= nd->pages - TPAGES(len);
+        nd->pages = TPAGES(len);
+    }
     nd->mtime = nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
@@ -970,9 +993,10 @@ static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
     for (size_t i = 0; i < m->nnodes; i++)
         if (tnode(m, i)->used) files++;
     out->bsize      = 4096;
-    out->blocks     = (m->max_bytes + 4095) / 4096;
-    out->bfree      = (m->max_bytes > m->bytes)
-                          ? (m->max_bytes - m->bytes) / 4096 : 0;
+    /* pages, as Linux's: the files' sizes in whole pages, the limit too;
+     * the root is an inode (finding 243) */
+    out->blocks     = tmax_pages(m);
+    out->bfree      = out->blocks > m->pages ? out->blocks - m->pages : 0;
     out->files      = m->max_nodes;
     out->ffree      = m->max_nodes > files + 1 ? m->max_nodes - files - 1 : 0;
     /* no limit: Linux's statfs says 0 of each */
@@ -1122,6 +1146,7 @@ int tmpfs_mount_at(const char *path, const char *opts)
     m->nnodes = 0;
     m->max_nodes = max_nodes;
     m->bytes = 0;
+    m->pages = 0;
     m->max_bytes = max_bytes;
     m->root_mode = root_mode;
     m->root_time = tmpfs_now_secs();
