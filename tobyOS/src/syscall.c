@@ -228,6 +228,34 @@ static bool user_str_in(char *ks, size_t cap, const char *us) {
     return true;
 }
 
+/* A FILE'S ALLOCATION IN 512-BYTE BLOCKS, as Linux counts st_blocks: the
+ * filesystems here store a file in whole 4 KiB blocks or pages (tmpfs,
+ * the initrd, tobyfs, ext4), and a symbolic link under 60 bytes in its
+ * inode. It was the size in 512-byte steps, so a 1-byte file was 1 KiB
+ * where Linux's is 4 (finding 229). */
+static uint64_t vfs_stat_blocks(const struct vfs_stat *vs) {
+    if (vs->type == VFS_TYPE_SYMLINK && vs->size < 60) return 0;
+    return (vs->size + 4095) / 4096 * 8;
+}
+
+/* WHAT statfs(2) ANSWERS FOR: what the path names -- a final link
+ * followed, perhaps into another mount; a dangling one is ENOENT. The VFS
+ * picks a mount by prefix, so the link's own mount answered: `df` of a
+ * link into /mnt/a printed /mnt/a's name with the link's mount's numbers
+ * (finding 244). */
+static long vfs_err_to_abi(long rv);
+static int statfs_follow(char *kpath, size_t cap) {
+    struct vfs_stat lst;
+    if (vfs_stat(kpath, &lst) != VFS_OK || lst.type != VFS_TYPE_SYMLINK) return 0;
+    char to[ABI_PATH_MAX];
+    int r = vfs_follow_link(kpath, to, sizeof to);
+    if (r != VFS_OK) return vfs_err_to_abi(r);
+    size_t l = strlen(to);
+    if (l >= cap) return -ABI_ENAMETOOLONG;
+    memcpy(kpath, to, l + 1);
+    return 0;
+}
+
 /* A path string of the caller's that is not looked up -- a symbolic link's
  * target -- into KS, of ABI_PATH_MAX + 1 bytes: 0, -EFAULT, or
  * -ENAMETOOLONG for one of PATH_MAX bytes or more, as Linux's getname
@@ -4233,7 +4261,7 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
     /* Batch 25 (ABI_SYS_XSTAT): the Linux personality's numbers, so a
      * native tool and a Linux one agree (linux_emit_stat). */
     dst->ctime = src->ctime;
-    dst->blocks = ((uint64_t)src->size + 511) / 512;
+    dst->blocks = vfs_stat_blocks(src);              /* finding 229 */
     /* the preferred I/O size, as Linux gives a file on ext4 or tmpfs: GNU
      * shred rounds a file up to it, and cp and stat %o read it (512 made
      * `shred f` of a 2-byte file 512 bytes where Linux makes it 4096) */
@@ -8533,7 +8561,7 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_gid     = userns_cur_gid(vs->gid);   /* slice 11 */
     st.st_size    = (int64_t)vs->size;
     st.st_blksize = 4096;                      /* as the native stat */
-    st.st_blocks  = (int64_t)((vs->size + 511) / 512);
+    st.st_blocks  = (int64_t)vfs_stat_blocks(vs);   /* finding 229 */
     /* Slice 6: report the real timestamps. These were left at 0, so every
      * file in the system claimed 1970-01-01 -- `ls -l` showed it, and
      * anything comparing mtimes (make, tar, apk, rsync) saw every file as
@@ -8577,7 +8605,7 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.mode      = (uint16_t)(typ | perm);
     sx.ino       = ino ? ino : 1;
     sx.size      = vs->size;
-    sx.blocks    = (vs->size + 511) / 512;
+    sx.blocks    = vfs_stat_blocks(vs);              /* finding 229 */
     /* Slice 6: statx carries the times too. busybox and modern glibc prefer
      * statx over stat, so leaving these zero here would have kept `ls -l`
      * showing 1970 even after the stat(2) path was fixed. */
