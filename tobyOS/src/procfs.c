@@ -1555,6 +1555,16 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                 }
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
+                else if (strcmp(sub, "comm") == 0) {         /* finding 208 */
+                    /* the name, cut to TASK_COMM_LEN - 1 bytes, as Linux's */
+                    struct proc *cp = proc_lookup(pid);
+                    if (!cp) return VFS_ERR_NOENT;
+                    size_t cl = strlen(cp->name);
+                    if (cl > 15) cl = 15;
+                    memcpy(buf, cp->name, cl);
+                    buf[cl] = '\n';
+                    len = (int)cl + 1;
+                }
                 /* 2026-08-22: /proc/self/mounts is what libmount, findmnt,
                  * systemd and Go's mountinfo actually read -- /proc/mounts
                  * worked while the per-pid dispatch had no arm, so exactly
@@ -1748,7 +1758,9 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             }
             return VFS_ERR_NOENT;
         }
-        if (*s == '/' && strcmp(s + 1, "exe") == 0) {
+        if (*s == '/' && (strcmp(s + 1, "exe") == 0 ||
+                          strcmp(s + 1, "cwd") == 0 ||      /* finding 208 */
+                          strcmp(s + 1, "root") == 0)) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             if (proc_lookup(pid)) {
                 out->type = VFS_TYPE_SYMLINK;
@@ -2019,9 +2031,12 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);
             memcpy(out->name, globals[dh->index], nl);
-            /* the last entry ("self") is a symlink, the rest are files */
-            out->type = (dh->index == nglobals - 1) ? VFS_TYPE_SYMLINK
-                                                     : VFS_TYPE_FILE;
+            /* "self" is a symlink, the rest are files. This tested for the
+             * LAST entry, which "self" stopped being when the list grew:
+             * vmstat listed as the link and self as a file -- harmless
+             * until readdir's types reached programs (batch 32) */
+            out->type = (strcmp(globals[dh->index], "self") == 0)
+                        ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
             out->size = 0;
             out->uid = 0; out->gid = 0; out->mode = 0;
             dh->index++;
@@ -2098,24 +2113,28 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
         return VFS_OK;
     }
 
-    /* Per-pid directory listing. "exe" is a symlink, "fd" and "ns" are
-     * directories, the rest are files. */
-    static const char *entries[] = { "status", "cmdline", "maps", "stat",
-                                     "mounts", "mountinfo",
-                                     "exe", "fd", "ns",
-                                     /* slice 11 */
-                                     "uid_map", "gid_map", "setgroups",
-                                     "fdinfo" };
-    const int nentries = 12;
+    /* Per-pid directory listing, each name with its type. It was thirteen
+     * names counted as twelve -- fdinfo was never listed -- and the types
+     * went by positions that had moved: mounts came out a link, mountinfo
+     * and gid_map directories, exe a directory (finding 208). */
+    static const struct { const char *name; int type; } entries[] = {
+        { "status", VFS_TYPE_FILE }, { "cmdline", VFS_TYPE_FILE },
+        { "comm", VFS_TYPE_FILE },   { "maps", VFS_TYPE_FILE },
+        { "stat", VFS_TYPE_FILE },   { "mounts", VFS_TYPE_FILE },
+        { "mountinfo", VFS_TYPE_FILE },
+        { "exe", VFS_TYPE_SYMLINK }, { "cwd", VFS_TYPE_SYMLINK },
+        { "root", VFS_TYPE_SYMLINK },
+        { "fd", VFS_TYPE_DIR },      { "fdinfo", VFS_TYPE_DIR },
+        { "ns", VFS_TYPE_DIR },                          /* slice 8 */
+        { "uid_map", VFS_TYPE_FILE }, { "gid_map", VFS_TYPE_FILE },
+        { "setgroups", VFS_TYPE_FILE },                  /* slice 11 */
+    };
+    const int nentries = (int)(sizeof entries / sizeof entries[0]);
     if (dh->index >= nentries) return VFS_ERR_NOENT;
     memset(out->name, 0, VFS_NAME_MAX);
-    size_t nl = strlen(entries[dh->index]);
-    memcpy(out->name, entries[dh->index], nl);
-    if (dh->index == 4)      out->type = VFS_TYPE_SYMLINK;   /* exe */
-    else if (dh->index == 5) out->type = VFS_TYPE_DIR;       /* fd  */
-    else if (dh->index == 6) out->type = VFS_TYPE_DIR;       /* ns (slice 8) */
-    else if (dh->index == 10) out->type = VFS_TYPE_DIR;      /* fdinfo */
-    else                     out->type = VFS_TYPE_FILE;
+    size_t nl = strlen(entries[dh->index].name);
+    memcpy(out->name, entries[dh->index].name, nl);
+    out->type = entries[dh->index].type;
     out->size = 0;
     out->uid = 0; out->gid = 0; out->mode = 0;
     dh->index++;
@@ -2155,6 +2174,19 @@ static int procfs_readlink(void *mnt, const char *path, char *buf, size_t bufsz)
     if (rel[0] >= '0' && rel[0] <= '9') {
         const char *s = rel;
         while (*s >= '0' && *s <= '9') s++;
+        /* finding 208: the working directory and the root, as Linux's links */
+        if (*s == '/' && (strcmp(s + 1, "cwd") == 0 || strcmp(s + 1, "root") == 0)) {
+            int pid = procfs_kpid(rel);
+            struct proc *p = proc_lookup(pid);
+            if (!p) return VFS_ERR_NOENT;
+            const char *tgt = (s[1] == 'c') ? (p->cwd[0] ? p->cwd : "/")
+                                            : (p->fs_root[0] ? p->fs_root : "/");
+            size_t tl = strlen(tgt);
+            if (tl >= bufsz) tl = bufsz - 1;
+            memcpy(buf, tgt, tl);
+            buf[tl] = '\0';
+            return VFS_OK;
+        }
         if (*s == '/' && strcmp(s + 1, "exe") == 0) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
