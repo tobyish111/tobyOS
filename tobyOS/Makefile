@@ -3328,7 +3328,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_su/user_su.elf                $(INITRD_STAGE)/bin/su
 	cp programs/user_moreutils/user_moreutils.elf  $(INITRD_STAGE)/bin/moreutils
 	@# moreutils family, one binary dispatched on argv[0]
-	@for ap in init passwd; do \
+	@for ap in init passwd chpasswd; do \
 	    ln -f $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/moreutils "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -4232,7 +4232,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	       bin/moreutils bin/arch bin/chgrp bin/factor bin/false bin/link \
 	    bin/logname bin/nproc bin/printf bin/pwd bin/shred bin/sum bin/test \
 	    'bin/['  bin/true bin/unlink bin/uptime bin/users bin/who bin/hostid \
-	    bin/init bin/passwd \
+	    bin/init bin/passwd bin/chpasswd \
 	       bin/sysutils bin/insmod bin/rmmod bin/lsmod bin/modprobe bin/blkid \
 	    bin/fsck bin/fsck.ext2 bin/fsck.ext3 bin/fsck.ext4 bin/fsck.vfat \
 	    bin/fsck.fat bin/fsck.minix bin/mkfs.ext2 bin/mke2fs bin/mkfs.minix \

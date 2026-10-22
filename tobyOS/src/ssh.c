@@ -1165,6 +1165,12 @@ static void ssh_handle_userauth_request_payload(const uint8_t *payload,
                 name);
     } else if (!u) {
         kprintf("[ssh] auth rejected for unknown user '%s'\n", name);
+    } else if (u->password_hash[0] == '!') {
+        /* a LOCKED account -- a name only /etc/passwd has, until passwd
+         * gives it a password (finding 194) -- gets no session, as sshd
+         * refuses one */
+        kprintf("[ssh] auth rejected for locked user '%s'\n", name);
+        u = 0;
     }
 
     if (!u) {

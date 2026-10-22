@@ -1,7 +1,7 @@
-/* user_moreutils -- init and passwd (2026-09-04, native-parity batch; one
- * binary dispatched on argv[0]).
+/* user_moreutils -- init, passwd and chpasswd (2026-09-04, native-parity
+ * batch; one binary dispatched on argv[0]).
  *
- * passwd follows shadow-utils'. The rest of what was here -- arch chgrp
+ * passwd and chpasswd follow shadow-utils'. The rest of what was here -- arch chgrp
  * factor false link logname nproc printf pwd shred sum test [ true unlink
  * uptime users who hostid -- is user_shellutils' now, each measured
  * against GNU coreutils or procps (logs/utilgate/, finding 151). */
@@ -88,11 +88,153 @@ static int cmd_passwd(int argc, char **argv) {
     return 0;
 }
 
+/* ============================================================= chpasswd */
+/* chpasswd as shadow-utils' answers it (finding 194): NAME:PASSWORD lines
+ * on stdin, the password everything after the first colon. Every line is
+ * checked before any is set, so one bad line changes none. It was
+ * busybox's applet, which wrote an /etc/shadow that no login here reads:
+ * the account it "changed" stayed locked. The password goes to the
+ * kernel's account table as passwd's does; the kernel keeps one hash of
+ * its own, so -c and -s are taken and checked, not obeyed, and -e (a hash
+ * made elsewhere) is refused rather than stored unverifiable. */
+static void chp_usage(FILE *o) {
+    fputs("Usage: chpasswd [options]\n"
+          "\n"
+          "Options:\n"
+          "  -c, --crypt-method METHOD     hash with METHOD: NONE DES MD5 SHA256 SHA512 or\n"
+          "                                YESCRYPT\n"
+          "  -e, --encrypted               each password given is already a hash\n"
+          "  -h, --help                    print this help and exit\n"
+          "  -m, --md5                     hash with MD5 (as -c MD5)\n"
+          "  -R, --root CHROOT_DIR         work on the accounts under CHROOT_DIR\n"
+          "  -P, --prefix PREFIX_DIR       read the account files under PREFIX_DIR\n"
+          "  -s, --sha-rounds              rounds for the SHA, BCRYPT and YESCRYPT\n"
+          "                                methods\n"
+          "\n", o);
+}
+
+static int chp_known(const char *name) {
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return 0;
+    char line[512];
+    size_t n = strlen(name);
+    int hit = 0;
+    while (!hit && fgets(line, sizeof line, f))
+        hit = !strncmp(line, name, n) && line[n] == ':';
+    fclose(f);
+    return hit;
+}
+
+static int cmd_chpasswd(int argc, char **argv) {
+    static const char *const methods[] = { "NONE", "DES", "MD5", "SHA256",
+                                           "SHA512", "YESCRYPT", 0 };
+    int crypt = 0, rounds = 0, enc = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        const char *val = 0;
+        int need = !strcmp(a, "-c") || !strcmp(a, "--crypt-method") ||
+                   !strcmp(a, "-s") || !strcmp(a, "--sha-rounds") ||
+                   !strcmp(a, "-R") || !strcmp(a, "--root") ||
+                   !strcmp(a, "-P") || !strcmp(a, "--prefix");
+        if (!strcmp(a, "-h") || !strcmp(a, "--help")) { chp_usage(stdout); return 0; }
+        if (!strcmp(a, "-e") || !strcmp(a, "--encrypted")) { enc = 1; continue; }
+        if (!strcmp(a, "-m") || !strcmp(a, "--md5")) { crypt = 1; continue; }
+        if (a[0] != '-' || !a[1]) continue;          /* operands: ignored */
+        if (!need) {
+            if (a[1] == '-') fprintf(stderr, "chpasswd: unrecognized option '%s'\n", a);
+            else fprintf(stderr, "chpasswd: invalid option -- '%c'\n", a[1]);
+            chp_usage(stderr);
+            return 2;
+        }
+        if (i + 1 >= argc) {
+            if (a[1] == '-') fprintf(stderr, "chpasswd: option '%s' requires an argument\n", a);
+            else fprintf(stderr, "chpasswd: option requires an argument -- '%c'\n", a[1]);
+            chp_usage(stderr);
+            return 2;
+        }
+        val = argv[++i];
+        if (a[1] == 'c' || !strcmp(a, "--crypt-method")) {
+            int k = 0;
+            while (methods[k] && strcmp(methods[k], val)) k++;
+            if (!methods[k]) {
+                fprintf(stderr, "chpasswd: unsupported crypt method: %s\n", val);
+                chp_usage(stderr);
+                return 2;
+            }
+            crypt = 1;
+        } else if (a[1] == 's' || !strcmp(a, "--sha-rounds")) {
+            rounds = 1;
+        } else {
+            fprintf(stderr, "chpasswd: %s is not supported: the accounts are the "
+                    "kernel's, not a directory's\n", a);
+            return 1;
+        }
+    }
+    if (rounds && !crypt) {
+        fprintf(stderr, "chpasswd: -s flag is only allowed with the -c flag\n");
+        chp_usage(stderr);
+        return 2;
+    }
+    if (enc) {
+        fprintf(stderr, "chpasswd: -e is not supported: the kernel keeps its own "
+                "hash and cannot check one made elsewhere\n");
+        return 1;
+    }
+    /* read every line, then check every line, then set */
+    size_t cap = 16, n = 0;
+    char **v = malloc(cap * sizeof *v);
+    char line[4096];
+    int bad = 0;
+    while (v && fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (n == cap) {
+            char **nv = realloc(v, (cap *= 2) * sizeof *v);
+            if (!nv) break;
+            v = nv;
+        }
+        v[n++] = strdup(line);
+    }
+    if (!v) { fprintf(stderr, "chpasswd: out of memory\n"); return 1; }
+    for (size_t i = 0; i < n; i++) {
+        char *c = v[i] ? strchr(v[i], ':') : 0;
+        if (!c) {
+            fprintf(stderr, "chpasswd: line %zu: missing new password\n", i + 1);
+            bad = 1;
+            continue;
+        }
+        *c = '\0';
+        if (!chp_known(v[i])) {
+            fprintf(stderr, "chpasswd: line %zu: user '%s' does not exist\n", i + 1, v[i]);
+            bad = 1;
+        }
+        *c = ':';
+    }
+    if (bad) {
+        fprintf(stderr, "chpasswd: error detected, changes ignored\n");
+        return 1;
+    }
+    int rc = 0;
+    for (size_t i = 0; i < n; i++) {
+        char *c = strchr(v[i], ':');
+        *c = '\0';
+        long r = sc3(ABI_SYS_SETPASSWD, (long)(uintptr_t)v[i], (long)(uintptr_t)(c + 1), 0);
+        if (r != 0) {
+            fprintf(stderr, "chpasswd: (line %zu, user %s) password not changed\n", i + 1, v[i]);
+            rc = 1;
+        }
+        memset(c + 1, 0, strlen(c + 1));
+        free(v[i]);
+    }
+    free(v);
+    return rc;
+}
+
 /* ============================================================== dispatch */
 struct applet { const char *name; int (*fn)(int, char **); };
 static const struct applet g_applets[] = {
     { "init",    cmd_init },
     { "passwd",  cmd_passwd },
+    { "chpasswd", cmd_chpasswd },
     { 0, 0 }
 };
 

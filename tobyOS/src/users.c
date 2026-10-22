@@ -226,15 +226,85 @@ void users_sync_passwd(void) {
     kfree(buf);
 }
 
+/* /etc/passwd's record of NAME, or of UID when NAME is 0: its name, uid
+ * and gid into the out parameters. */
+static bool passwd_find(const char *name, int want_uid, char *oname,
+                        int *uid, int *gid) {
+    void *buf = 0;
+    size_t sz = 0;
+    if (vfs_read_all("/etc/passwd", &buf, &sz) != VFS_OK || !buf) return false;
+    const char *t = (const char *)buf, *end = t + sz;
+    bool found = false;
+    while (t < end && !found) {
+        const char *nl = t;
+        while (nl < end && *nl != '\n') nl++;
+        const char *f[4];
+        size_t fl[4];
+        int nf = 0;
+        const char *p = t;
+        while (nf < 4 && p <= nl) {
+            const char *q = p;
+            while (q < nl && *q != ':') q++;
+            f[nf] = p;
+            fl[nf] = (size_t)(q - p);
+            nf++;
+            p = q + 1;
+            if (q >= nl) break;
+        }
+        int u, g;
+        if (nf == 4 && fl[0] && fl[0] < USER_NAME_MAX && t[0] != '#' &&
+            parse_int(f[2], fl[2], &u) && parse_int(f[3], fl[3], &g)) {
+            bool hit = name ? (strlen(name) == fl[0] && memcmp(name, f[0], fl[0]) == 0)
+                            : (u == want_uid);
+            if (hit) {
+                memcpy(oname, f[0], fl[0]);
+                oname[fl[0]] = '\0';
+                *uid = u;
+                *gid = g;
+                found = true;
+            }
+        }
+        t = nl + 1;
+    }
+    kfree(buf);
+    return found;
+}
+
+/* The login cache's own entry for NAME. */
+static struct user *cache_find(const char *name) {
+    for (int i = 0; i < g_count; i++)
+        if (strcmp(g_users[i].name, name) == 0) return &g_users[i];
+    return 0;
+}
+
+/* A NAME ONLY /etc/passwd HAS (finding 194): an account a Linux tool or an
+ * edit of /etc/passwd made, which the login cache (/data/users) never
+ * heard of. As on Linux it is an account -- `id NAME`, chown NAME, a
+ * login's lookup all know it -- and LOCKED until `passwd NAME` gives it a
+ * password, as a Linux account made without one is ("!" in /etc/shadow):
+ * its hash here matches nothing. It was simply unknown to every login. */
+static struct user g_etc_user, g_etc_uid_user;
+
+static const struct user *etc_user(struct user *slot, const char *name, int uid) {
+    char nm[USER_NAME_MAX];
+    int u, g;
+    if (!passwd_find(name, uid, nm, &u, &g)) return 0;
+    memset(slot, 0, sizeof *slot);
+    copy_capped(slot->name, nm, USER_NAME_MAX);
+    slot->uid = u;
+    slot->gid = g;
+    copy_capped(slot->password_hash, "!", USER_PWHASH_MAX);   /* locked */
+    return slot;
+}
+
 /* ---- public API ---- */
 
 const struct user *users_lookup_by_name(const char *name) {
     if (!name || !name[0]) return 0;
     users_sync_passwd();            /* a usermod since boot counts */
-    for (int i = 0; i < g_count; i++) {
-        if (strcmp(g_users[i].name, name) == 0) return &g_users[i];
-    }
-    return 0;
+    struct user *c = cache_find(name);
+    if (c) return c;
+    return etc_user(&g_etc_user, name, 0);
 }
 
 int users_initgroups(const char *name, int gid, int *out, int max) {
@@ -278,7 +348,7 @@ const struct user *users_lookup_by_uid(int uid) {
     for (int i = 0; i < g_count; i++) {
         if (g_users[i].uid == uid) return &g_users[i];
     }
-    return 0;
+    return etc_user(&g_etc_uid_user, 0, uid);       /* finding 194 */
 }
 
 int users_add(const char *name, int uid, int gid) {
@@ -290,11 +360,13 @@ int users_add(const char *name, int uid, int gid) {
         kprintf("[users] cannot add '%s': cache full\n", name);
         return -1;
     }
-    if (users_lookup_by_name(name)) {
+    if (cache_find(name)) {
         kprintf("[users] cannot add '%s': name already taken\n", name);
         return -1;
     }
-    if (users_lookup_by_uid(uid)) {
+    bool uid_taken = false;
+    for (int i = 0; i < g_count; i++) if (g_users[i].uid == uid) uid_taken = true;
+    if (uid_taken) {
         kprintf("[users] cannot add '%s': uid %d already taken\n", name, uid);
         return -1;
     }
@@ -517,6 +589,7 @@ static bool pw_verify_legacy_djb2(const char *stored, const char *password) {
 bool users_check_password(const char *username, const char *password) {
     const struct user *u = users_lookup_by_name(username);
     if (!u) return false;
+    if (u->password_hash[0] == '!') return false;   /* locked (finding 194) */
     if (u->password_hash[0] == '\0') return true;   /* no password set */
 
     if (u->password_hash[0] == '$')
@@ -540,6 +613,14 @@ bool users_check_password(const char *username, const char *password) {
 }
 
 int users_set_password(const char *username, const char *password) {
+    /* a name only /etc/passwd has gets its login here, with its ids from
+     * there (finding 194) -- what `passwd NAME` does for a Linux account */
+    if (username && !cache_find(username)) {
+        char nm[USER_NAME_MAX];
+        int u, g;
+        if (passwd_find(username, 0, nm, &u, &g) && users_add(nm, u, g) != 0)
+            return -1;
+    }
     for (int i = 0; i < g_count; i++) {
         if (strcmp(g_users[i].name, username) == 0) {
             if (!password || !password[0]) {

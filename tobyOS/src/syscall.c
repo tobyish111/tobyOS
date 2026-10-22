@@ -6580,10 +6580,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * this the ONLY way to change a password was the GUI login screen. */
         struct proc *me = current_proc();
         if (!me) return -ABI_EPERM;
-        char user[64], newpw[128], oldpw[128];
+        char user[64], newpw[512], oldpw[512];
         if (!user_str_in(user, sizeof(user), (const char *)a1)) return -ABI_EFAULT;
         if (!user_str_in(newpw, sizeof(newpw), (const char *)a2)) return -ABI_EFAULT;
-        if (!user[0] || !newpw[0]) return -ABI_EINVAL;
+        /* root may set an empty one, as chpasswd does (finding 194) */
+        if (!user[0] || (!newpw[0] && me->uid != 0)) return -ABI_EINVAL;
         const struct user *u = users_lookup_by_name(user);
         if (!u) return -ABI_ENOENT;
         if (me->uid != 0) {
