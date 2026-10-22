@@ -551,6 +551,14 @@ static void expand_repl(struct str *out, const char *rep, const char *src,
     }
 }
 
+/* Does RE match the pattern space -- the whole of it, NULs and all? */
+static int sed_match(regex_t *re) {
+    regmatch_t m0[1];
+    m0[0].rm_so = 0;
+    m0[0].rm_eo = (regoff_t)pattern.len;
+    return regexec(re, pattern.p ? pattern.p : "", 1, m0, REG_STARTEND) == 0;
+}
+
 static int do_subst(struct cmd *c) {
     regmatch_t m[10];
     struct str out;
@@ -560,8 +568,12 @@ static int do_subst(struct cmd *c) {
     int    count = 0, did = 0;
 
     while (pos <= pattern.len) {
-        int eflags = pos ? REG_NOTBOL : 0;
-        if (regexec(&c->re, pattern.p + pos, 10, m, eflags) != 0) break;
+        /* the line's own length, NULs and all (finding 196): GNU sed
+         * edits `a\0a` whole where a C string stopped at the NUL */
+        int eflags = (pos ? REG_NOTBOL : 0) | REG_STARTEND;
+        m[0].rm_so = 0;
+        m[0].rm_eo = (regoff_t)(pattern.len - pos);
+        if (regexec(&c->re, pattern.p ? pattern.p + pos : "", 10, m, eflags) != 0) break;
 
         size_t mstart = pos + (size_t)m[0].rm_so;
         size_t mend   = pos + (size_t)m[0].rm_eo;
@@ -613,7 +625,7 @@ static int addr1_matches(struct cmd *c) {
         if (c->a2line <= 0) return lineno == c->a1line;
         return lineno >= c->a1line && ((lineno - c->a1line) % c->a2line) == 0;
     case A_RE:
-        return c->a1has && regexec(&c->a1re, pattern.p, 0, NULL, 0) == 0;
+        return c->a1has && sed_match(&c->a1re);
     }
     return 0;
 }
@@ -641,8 +653,7 @@ static int selected(struct cmd *c) {
                 }
                 if (c->a1type == A_ZERO) {
                     /* 0,/re/ tests the END address on this same line. */
-                    if (c->a2type == A_RE && c->a2has &&
-                        regexec(&c->a2re, pattern.p, 0, NULL, 0) == 0)
+                    if (c->a2type == A_RE && c->a2has && sed_match(&c->a2re))
                         c->active = 0;
                 }
                 r = 1;
@@ -656,7 +667,7 @@ static int selected(struct cmd *c) {
                 if (lineno >= c->range_end) c->active = 0;
                 break;
             case A_RE:
-                if (c->a2has && regexec(&c->a2re, pattern.p, 0, NULL, 0) == 0)
+                if (c->a2has && sed_match(&c->a2re))
                     c->active = 0;
                 break;
             default: c->active = 0;

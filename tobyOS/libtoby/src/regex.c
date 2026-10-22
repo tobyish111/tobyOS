@@ -990,7 +990,21 @@ typedef struct {
     long         budget;
     const char  *best_start[MAX_GROUPS];
     const char  *best_end[MAX_GROUPS];
+    /* REG_STARTEND's end of the string (finding 196); 0: a NUL ends it */
+    const char  *end;
 } match_ctx;
+
+/* Is P the end of the string being matched? */
+static int rx_at_end(const match_ctx *ctx, const char *p) {
+    return ctx->end ? p >= ctx->end : *p == '\0';
+}
+
+/* The bytes at P a multibyte character may take, short of the end. */
+static size_t rx_avail_ctx(const match_ctx *ctx, const char *p) {
+    if (!ctx->end) return rx_avail(p);
+    size_t n = (size_t)(ctx->end - p);
+    return n < 4 ? n : 4;
+}
 
 /* One frame is ~96 bytes and a native user stack is 64 pages (256 KiB),
  * so this ceiling is a hard safety property, not a tuning knob. It used
@@ -1009,10 +1023,10 @@ static int rx_wword(uint32_t cp) {
 
 /* Is the character starting at P / ending at P a word character? */
 static int rx_word_after(const match_ctx *ctx, const char *p) {
+    if (rx_at_end(ctx, p)) return 0;
     if (!(ctx->cflags & REG_UTF8)) return rx_is_word_at(p);
     uint32_t cp;
-    if (!*p) return 0;
-    rx_mbdec(p, rx_avail(p), &cp);
+    rx_mbdec(p, rx_avail_ctx(ctx, p), &cp);
     return rx_wword(cp);
 }
 
@@ -1043,9 +1057,9 @@ static int rx_set_has(const nd_t *n, uint32_t cp) {
  * when it does not match. */
 static size_t rx_match_wide(const match_ctx *ctx, const nd_t *n, int btype,
                             const char *sp) {
-    if (!*sp) return 0;
+    if (rx_at_end(ctx, sp)) return 0;
     uint32_t cp;
-    size_t l = rx_mbdec(sp, rx_avail(sp), &cp);
+    size_t l = rx_mbdec(sp, rx_avail_ctx(ctx, sp), &cp);
     switch (btype) {
     case ND_DOT:
         return ((ctx->cflags & REG_NEWLINE) && cp == '\n') ? 0 : l;
@@ -1060,7 +1074,9 @@ static size_t rx_match_wide(const match_ctx *ctx, const nd_t *n, int btype,
 }
 
 static int match_body(const match_ctx *ctx, const nd_t *n, int btype, int c) {
-    if (c == '\0') return 0;
+    /* the end of the string is the caller's test; a NUL is the end only
+     * without REG_STARTEND */
+    if (c == '\0' && !ctx->end) return 0;
     switch (btype) {
     case ND_LIT: {
         int a = c, b = n->ch;
@@ -1126,7 +1142,8 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             }
             /* fall through */
         case ND_LIT:
-            if (!match_body(ctx, node, node->type, (unsigned char)*sp)) {
+            if (rx_at_end(ctx, sp) ||
+                !match_body(ctx, node, node->type, (unsigned char)*sp)) {
                 ctx->depth--; return 0;
             }
             sp++;
@@ -1173,7 +1190,7 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
              * successively shorter prefixes. One frame per attempt
              * instead of one per character. */
             long n = 0;
-            while ((node->rmax < 0 || n < node->rmax) &&
+            while ((node->rmax < 0 || n < node->rmax) && !rx_at_end(ctx, sp + n) &&
                    match_body(ctx, node, node->btype, (unsigned char)sp[n]))
                 n++;
             if (n < node->rmin) { ctx->depth--; return 0; }
@@ -1202,7 +1219,7 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
             node = node->out;
             continue;
         case ND_ANCHOR_EOL:
-            if (*sp == '\0') {
+            if (rx_at_end(ctx, sp)) {
                 if (ctx->eflags & REG_NOTEOL) { ctx->depth--; return 0; }
             } else if ((ctx->cflags & REG_NEWLINE) && *sp == '\n') {
                 /* ok: end of an embedded line */
@@ -1252,6 +1269,8 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
                 ctx->depth--; return 0;
             }
             size_t len = (size_t)(ctx->group_end[gi] - ctx->group_start[gi]);
+            /* with REG_STARTEND the text may hold NULs and ends at END */
+            if (ctx->end && (size_t)(ctx->end - sp) < len) { ctx->depth--; return 0; }
             if (ctx->cflags & REG_ICASE) {
                 size_t i;
                 for (i = 0; i < len; i++) {
@@ -1259,10 +1278,11 @@ static int match_node(match_ctx *ctx, nd_t *node, const char *sp) {
                     int b = (unsigned char)ctx->group_start[gi][i];
                     if (rx_upper(a)) a += 32;
                     if (rx_upper(b)) b += 32;
-                    if (!a || a != b) break;
+                    if ((!a && !ctx->end) || a != b) break;
                 }
                 if (i != len) { ctx->depth--; return 0; }
-            } else if (strncmp(sp, ctx->group_start[gi], len) != 0) {
+            } else if (ctx->end ? memcmp(sp, ctx->group_start[gi], len) != 0
+                                : strncmp(sp, ctx->group_start[gi], len) != 0) {
                 ctx->depth--; return 0;
             }
             sp += len;
@@ -1403,6 +1423,13 @@ int regexec(const regex_t *preg, const char *string,
     ctx.bol = string;
     ctx.eflags = eflags;
     ctx.cflags = comp->cflags;
+    const char *start = string;
+    if ((eflags & REG_STARTEND) && pmatch) {
+        if (pmatch[0].rm_so < 0 || pmatch[0].rm_eo < pmatch[0].rm_so) return REG_NOMATCH;
+        start = string + pmatch[0].rm_so;
+        ctx.end = string + pmatch[0].rm_eo;
+        ctx.bol = start;
+    }
 
     /* POSIX says leftmost-LONGEST; a backtracking engine naturally gives
      * leftmost-FIRST. With greedy quantifiers the two agree, so the only
@@ -1413,7 +1440,7 @@ int regexec(const regex_t *preg, const char *string,
      * author asked for. */
     int want_longest = comp->has_alt && !comp->has_lazy;
 
-    const char *sp = string;
+    const char *sp = start;
     while (1) {
         run_from(&ctx, comp, sp, 0, 0);
         if (ctx.have_match) {
@@ -1459,11 +1486,11 @@ int regexec(const regex_t *preg, const char *string,
             }
             return 0;
         }
-        if (!*sp) break;
+        if (rx_at_end(&ctx, sp)) break;
         /* the next start is the next CHARACTER under REG_UTF8 */
         if (comp->cflags & REG_UTF8) {
             uint32_t cp;
-            sp += rx_mbdec(sp, rx_avail(sp), &cp);
+            sp += rx_mbdec(sp, rx_avail_ctx(&ctx, sp), &cp);
         } else {
             sp++;
         }

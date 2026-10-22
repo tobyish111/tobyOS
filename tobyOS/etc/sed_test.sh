@@ -138,4 +138,10 @@ echo @@rx_long_star;  sed 's/a*X/OK/' big
 echo @@rx_backref;   sed -E 's/(a)\1/D/' gq
 echo @@rx_nested;    sed -E 's/((a)*b)/<\1>/' gq
 
+# a line with NULs in it is edited whole, as GNU sed does (finding 196):
+# the native sed matched it as a C string and stopped at the first NUL
+echo @@s_nul;        printf 'a\0a\nb\0\0b\n' | sed 's/a/X/g; s/b$/Y/' | od -An -c
+echo @@s_nul_addr;   printf 'q\0z\nq\n' | sed -n '/z/p' | od -An -c
+echo @@s_nul_dot;    printf 'a\0b\n' | sed 's/a.b/M/' | od -An -c
+echo @@s_nul_bref;   printf 'x\0x\0\n' | sed -E 's/(x.)\1/D/' | od -An -c
 echo @@sed_END

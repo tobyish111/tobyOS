@@ -68,6 +68,11 @@ typedef struct {
 /* eflags for regexec */
 #define REG_NOTBOL    1
 #define REG_NOTEOL    2
+/* The string is STRING + pmatch[0].rm_so up to STRING + pmatch[0].rm_eo,
+ * NULs and all; the offsets given back are still from STRING. glibc's and
+ * the BSDs' (glibc's value). sed matches a line with NULs in it this way
+ * (finding 196). */
+#define REG_STARTEND  4
 
 /* error codes */
 #define REG_NOMATCH   1
