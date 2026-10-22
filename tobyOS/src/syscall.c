@@ -7048,8 +7048,12 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_GETPPID:       return sys_getppid();
     case ABI_SYS_SETPRIORITY: return sys_setpriority((int)a1, (int)a2);
     case ABI_SYS_GETPRIORITY: return sys_getpriority((int)a1);
-    case SYS_SPAWN:
-        return sys_spawn((const struct abi_spawn_req *)a1);
+    case SYS_SPAWN: {
+        /* the child as the caller's pid namespace numbers it (finding 207) */
+        long r = sys_spawn((const struct abi_spawn_req *)a1);
+        if (r > 0) { int v = pid_vnr_of_kpid((int)r); if (v) r = v; }
+        return r;
+    }
     case SYS_WAITPID:
         return sys_waitpid((int)a1, (int *)a2, (int)a3);
     case SYS_OPEN:
@@ -7742,8 +7746,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return clipboard_clear();
 
     /* ---- Phase 3 M3.2: Fork/Exec ----------------------------------- */
-    case ABI_SYS_FORK:
-        return sys_fork();
+    case ABI_SYS_FORK: {
+        /* the child as the caller's pid namespace numbers it, as getpid and
+         * waitpid speak (finding 207): it was the kernel's pid */
+        long r = sys_fork();
+        if (r > 0) { int v = pid_vnr_of_kpid((int)r); if (v) r = v; }
+        return r;
+    }
 
     case ABI_SYS_EXECVE:
         return sys_execve((const char *)(uintptr_t)a1,
@@ -14486,9 +14495,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     case LX_fork:
     case LX_vfork: {
         /* LX_vfork / CLONE_VFORK → share-until-exec. Plain fork → CoW copy. */
-        long fr = (n == LX_vfork) ? sys_fork_share()
-                                  : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
-        fr = lx_child_pid_ret(fr);
+        long fr = (n == LX_vfork) ? sys_fork_share() : sys_fork();
+        fr = lx_child_pid_ret(fr);          /* translated here, once (207) */
 #ifdef CHROMIUM_BOOT
         {   static int pf = 0;
             if (pf < 200) { pf++;
@@ -14607,7 +14615,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                     (cfl & 0x00200000u /* CLONE_CHILD_CLEARTID */) ? (uint64_t)a4 : 0;
             }
             long cr = share ? sys_fork_share()
-                            : do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+                            : sys_fork();    /* translated below, once (207) */
             if (nsme) { nsme->clone_ns_flags = 0; nsme->clone_child_stack = 0;
                         nsme->clone_child_settid = 0;
                         nsme->clone_child_cleartid = 0; }
@@ -15530,7 +15538,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 if (nsme) nsme->clone_ns_flags = nsf;
                 if (nsme && c3stk && c3stk < UACCESS_USER_END)
                     nsme->clone_child_stack = c3stk;
-                fr3 = do_syscall(ABI_SYS_FORK, 0, 0, 0, 0, 0);
+                fr3 = sys_fork();    /* translated below, once (207) */
             }
             if (nsme) { nsme->clone_ns_flags = 0;   /* fork may have bailed early */
                         nsme->clone_child_stack = 0; }

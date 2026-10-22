@@ -52,6 +52,7 @@
 #include <tobyos/signal.h>
 #include <tobyos/vmm.h>
 #include <tobyos/pmm.h>
+#include <tobyos/seccomp.h>
 #include <tobyos/cgroup.h>   /* slice 16: the user-page charge funnel */
 #include <tobyos/page_fault.h>   /* page_ref_* for CoW-aware brk shrink */
 #include <tobyos/apic.h>         /* tlb_shootdown_remote */
@@ -1041,8 +1042,48 @@ static int spawn_body(const char *path, const char *name,
             if (cn >= ABI_PATH_MAX) cn = ABI_PATH_MAX - 1;
             memcpy(p->cwd, cwd_override, cn);
             p->cwd[cn] = '\0';
+            proc_note_cwd(p);
         }
     }
+    /* ---- the parent's containment, as fork's child has it (finding 207) --
+     * its namespaces (the pid one its children go to), its chroot root, its
+     * seccomp filter and no_new_privs, its cgroup, and pids.max counting it.
+     * A spawned child had none of them: every native command run inside
+     * `unshare -r` was the host's uid in the host's /proc, and one run under
+     * chroot, seccomp or a cgroup was outside it. Before the program is
+     * loaded, so its pages are charged to the right cgroup; every failure
+     * below releases what this takes (nsproxy_release). */
+    {
+        struct proc *parent = current_proc();
+        if (parent) {
+            if (cgroup_can_fork(parent) != 0) {
+                memset(p, 0, sizeof(*p));
+                p->state = PROC_UNUSED;
+                return -1;
+            }
+            p->uts_ns              = parent->uts_ns;
+            p->ipc_ns              = parent->ipc_ns;
+            p->mnt_ns              = parent->mnt_ns;
+            p->net_ns              = parent->net_ns;
+            p->user_ns             = parent->user_ns;
+            p->pid_ns              = parent->pid_ns;
+            p->pid_ns_for_children = parent->pid_ns_for_children;
+            p->seccomp_filter      = parent->seccomp_filter;
+            p->seccomp_mode        = parent->seccomp_mode;
+            p->no_new_privs        = parent->no_new_privs;
+            p->cgroup              = parent->cgroup;
+            memcpy(p->fs_root, parent->fs_root, sizeof p->fs_root);
+            nsproxy_fork_inherit(p);
+            seccomp_fork_inherit(p);
+            if (pid_ns_place_child(p, parent, 0, false) != 0) {
+                nsproxy_release(p);
+                memset(p, 0, sizeof(*p));
+                p->state = PROC_UNUSED;
+                return -1;
+            }
+        }
+    }
+
     if (name) {
         name_copy(p->name, name, PROC_NAME_MAX);
     } else {
@@ -1064,6 +1105,7 @@ static int spawn_body(const char *path, const char *name,
     /* ---- 0. inherit fds (clone the explicit ones, default the rest) ---- */
     if (!install_initial_fds(p, fd0, fd1, fd2, fd3, fd4, extra, nextra)) {
         kprintf("[proc] '%s': OOM installing initial fds\n", path);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1076,6 +1118,7 @@ static int spawn_body(const char *path, const char *name,
     if (rc != VFS_OK) {
         kprintf("[proc] cannot read '%s': %s\n", path, vfs_strerror(rc));
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1094,6 +1137,7 @@ static int spawn_body(const char *path, const char *name,
         if (sb != 0) {
             kfree(image);
             close_all_fds(p);
+            nsproxy_release(p);   /* 207 */
             memset(p, 0, sizeof(*p));
             p->state = PROC_UNUSED;
             if (sb < 0) {
@@ -1126,6 +1170,7 @@ static int spawn_body(const char *path, const char *name,
     if (pml4 == 0) {
         kfree(image);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1428,6 +1473,7 @@ static int spawn_body(const char *path, const char *name,
     if (!ok) {
         vmm_destroy_user_pml4(pml4);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
@@ -1446,6 +1492,7 @@ static int spawn_body(const char *path, const char *name,
     if (!build_kstack(p)) {
         vmm_destroy_user_pml4(pml4);
         close_all_fds(p);
+        nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
         p->state = PROC_UNUSED;
         return -1;
