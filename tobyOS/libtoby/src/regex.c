@@ -905,6 +905,14 @@ static int parse_seq(compiled_t *c, const char **pp, int ere, frag_t *out) {
             p += ere ? 1 : 2;            /* past } or \} */
             if (ere && *p == '?') { greedy = 0; p++; c->has_lazy = 1; }
             if (qmax >= 0 && qmax < qmin) { c->err = REG_BADBR; return 0; }
+        } else if (!ere && p[0] == '\\' && p[1] == '{') {
+            /* A BRE's \{ after an atom that is not an interval is an
+             * error, as glibc's (finding 222): bad content before a \}
+             * is REG_BADBR, no \} at all REG_EBRACE */
+            const char *q = p + 2;
+            while (*q && !(q[0] == '\\' && q[1] == '}')) q += (*q == '\\' && q[1]) ? 2 : 1;
+            c->err = *q ? REG_BADBR : REG_EBRACE;
+            return 0;
         }
 
         if (qmin >= 0) {
