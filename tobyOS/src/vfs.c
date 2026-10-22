@@ -1278,6 +1278,21 @@ static bool new_name_too_long(const char *path) {
     return e - n > VFS_NAME_MAX - 1;
 }
 
+/* THE GROUP A NEW ENTRY IN PAR GETS, as Linux's inode_init_owner gives
+ * it: the creator's, or in a set-group-ID directory the directory's -- and
+ * *SGID says so, for a new directory there is set-group-ID too (finding
+ * 228: every entry took the creator's group). */
+static uint32_t new_entry_gid(const char *par, bool *sgid) {
+    struct vfs_stat ps;
+    *sgid = false;
+    if (par && vfs_stat(par, &ps) == VFS_OK && ps.type == VFS_TYPE_DIR &&
+        (ps.mode & 02000u)) {
+        *sgid = true;
+        return ps.gid;
+    }
+    return (uint32_t)current_gid();
+}
+
 int vfs_create_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
     if (new_name_too_long(path)) return VFS_ERR_NAMETOOLONG;
@@ -1301,17 +1316,19 @@ int vfs_create_mode(const char *path, uint32_t mode) {
     }
     /* Need W on the parent directory to add a new entry. */
     char par[VFS_PATH_MAX];
-    if (parent_path(path, par, sizeof(par)) == VFS_OK) {
+    bool have_par = parent_path(path, par, sizeof(par)) == VFS_OK;
+    if (have_par) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
+    bool sgid;
+    uint32_t gid = new_entry_gid(have_par ? par : 0, &sgid);
     /* Owner = current uid. Root spawning during boot leaves uid 0 / gid 0,
      * which is what we want for kernel-installed system files (settings.conf,
      * users). VFS_MODE_VALID always: a mode of 0000 is a real mode, not "no
      * permission information" -- the drivers' `mode ? mode : default` idiom
      * sees it non-zero and stores it. */
-    int crc = m->ops->create(m->data, rel,
-                             (uint32_t)current_uid(), (uint32_t)current_gid(),
+    int crc = m->ops->create(m->data, rel, (uint32_t)current_uid(), gid,
                              (mode & 0177777u) | VFS_MODE_VALID);
     if (crc == VFS_OK) vfs_notify(path, VFS_IN_CREATE, 0);
     return crc;
@@ -1600,13 +1617,20 @@ int vfs_mkdir_mode(const char *path, uint32_t mode) {
         if (sp != VFS_OK) return sp;
     }
     char par[VFS_PATH_MAX];
-    if (parent_path(path, par, sizeof(par)) == VFS_OK) {
+    bool have_par = parent_path(path, par, sizeof(par)) == VFS_OK;
+    if (have_par) {
         int prc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
         if (prc != VFS_OK) return prc;
     }
-    int mrc = m->ops->mkdir(m->data, rel,
-                            (uint32_t)current_uid(), (uint32_t)current_gid(),
-                            (mode & 07777u) | VFS_MODE_VALID);
+    /* The set-ID bits asked for are dropped, as Linux's mkdir drops them
+     * (mode & (S_IRWXUGO|S_ISVTX)); a set-group-ID parent sets the one
+     * (finding 228: they were kept, so GNU's mkdir -m g+s never chmodded
+     * and got 2755 for Linux's 2777). */
+    bool sgid;
+    uint32_t gid = new_entry_gid(have_par ? par : 0, &sgid);
+    uint32_t dmode = (mode & 01777u) | (sgid ? 02000u : 0);
+    int mrc = m->ops->mkdir(m->data, rel, (uint32_t)current_uid(), gid,
+                            dmode | VFS_MODE_VALID);
     if (mrc == VFS_OK) vfs_notify(path, VFS_IN_CREATE | VFS_IN_ISDIR, 0);
     return mrc;
 }
