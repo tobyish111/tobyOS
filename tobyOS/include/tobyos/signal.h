@@ -53,8 +53,18 @@
  * convention keeps bit s for signal s (bit 0 unused), so 64 bits carry
  * signals 1..63; Linux's signal 64 (SIGRTMAX) is the one casualty, refused
  * with EINVAL rather than silently aliased. */
-#define SIG_MAX  64
-#define SIGMASK(s) ((uint64_t)1ull << (s))
+#define SIG_MAX  65
+/* Batch 32 (finding 195): signal 64, Linux's SIGRTMAX, rides bit 0, which
+ * the bit-s convention never used -- so 1..63 keep their bits and every
+ * mask, table and loop that counts to SIG_MAX now holds all of Linux's
+ * signals. It was refused with EINVAL: psmisc's `killall -64` and
+ * `kill -64` work on Linux. */
+#define SIGMASK(s) ((uint64_t)((s) == 64 ? 1ull : (1ull << (s))))
+
+/* tobyOS's mask from and to a Linux sigset (signal s at bit s-1): a rotate
+ * by one -- signal 64 is Linux's bit 63 and tobyOS's bit 0. */
+static inline uint64_t sig_mask_from_linux(uint64_t l) { return (l << 1) | (l >> 63); }
+static inline uint64_t sig_mask_to_linux(uint64_t k)   { return (k >> 1) | ((k & 1ull) << 63); }
 
 /* Signals whose DEFAULT DISPOSITION IS IGNORE, as a mask.
  *

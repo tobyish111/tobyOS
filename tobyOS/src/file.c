@@ -315,10 +315,14 @@ static long signalfd_read(struct file *f, void *buf, size_t n) {
     for (;;) {
         uint64_t hit = p->pending_signals & s->mask;
         if (hit) {
+            /* the lowest signal pending, 1..64: it scanned bits 0..31, so
+             * a realtime signal (32..64) never came out of a signalfd
+             * (batch 32, with finding 195) */
             int signo = 0;
-            for (int i = 0; i < 32; i++)
-                if (hit & (1ull << i)) { signo = i; break; }
-            p->pending_signals   &= ~(1ull << signo);  /* 64-signal mask */
+            for (int i = 1; i < SIG_MAX; i++)
+                if (hit & SIGMASK(i)) { signo = i; break; }
+            if (!signo) return -ABI_EAGAIN;
+            p->pending_signals   &= ~SIGMASK(signo);   /* 64-signal mask */
             p->sigstate.pending  &= ~SIGMASK(signo);
             uint8_t si[128];
             memset(si, 0, sizeof si);

@@ -1428,7 +1428,7 @@ void shell_host_quit_ignore(void) { (void)signal(SIGQUIT, tsh_quit); }
  * somehow fails. Called once the EXIT trap has run (shell.c
  * shell_termsig_act). */
 void shell_host_kill_self(int sig) {
-    unsigned long m = 1UL << sig;
+    unsigned long m = SIGMASK(sig);          /* signal 64 too (finding 195) */
     (void)signal(sig, SIG_DFL);
     (void)sigprocmask(1 /* SIG_UNBLOCK */, &m, 0);
     (void)kill(getpid(), sig);

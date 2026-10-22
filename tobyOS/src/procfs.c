@@ -739,7 +739,7 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
             else if (acts[si].sa_handler != SIG_DFL) cgt |= SIGMASK(si);
         }
         #define APPEND_SIGHEX(name, v) do { \
-            char hx[20]; hex_to_str(hx, sizeof hx, (uint64_t)(v) >> 1); \
+            char hx[20]; hex_to_str(hx, sizeof hx, sig_mask_to_linux((uint64_t)(v))); \
             APPEND_STR(name); APPEND_STR(hx); APPEND_STR("\n"); } while (0)
         APPEND_SIGHEX("SigPnd:\t", p->pending_signals);
         APPEND_SIGHEX("SigBlk:\t", p->sigstate.mask);

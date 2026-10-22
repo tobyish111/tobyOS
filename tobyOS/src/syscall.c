@@ -13763,7 +13763,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * it wrong and callers test the neighbouring signal. */
     case LX_rt_sigpending: {
         struct proc *p = current_proc();
-        uint64_t lset = p ? ((uint64_t)p->sigstate.pending >> 1) : 0;
+        uint64_t lset = p ? sig_mask_to_linux((uint64_t)p->sigstate.pending) : 0;
         if (a1 && copy_to_user((void *)a1, &lset, sizeof lset) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -13780,7 +13780,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (a1 && copy_from_user(&umask_in, (const void *)a1,
                                  sizeof umask_in) != 0)
             return -ABI_EFAULT;
-        uint64_t newmask = umask_in << 1;               /* -> tobyOS numbering */
+        uint64_t newmask = sig_mask_from_linux(umask_in);   /* -> tobyOS numbering */
         uint64_t saved   = p->sigstate.mask;
         p->sigstate.mask = newmask;
         bool had_bkl = bkl_held();
@@ -13849,7 +13849,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t lmask = 0;
         if (a2 && copy_from_user(&lmask, (const void *)a2, sizeof lmask) != 0)
             return -ABI_EFAULT;
-        uint64_t kmask = lmask << 1;          /* Linux -> tobyOS numbering */
+        uint64_t kmask = sig_mask_from_linux(lmask);   /* Linux -> tobyOS numbering */
         if ((int)a1 >= 0) {                   /* update an existing signalfd */
             struct file *sf = fd_lookup((int)a1);
             if (!sf || sf->kind != FILE_KIND_SIGNALFD) return -ABI_EBADF;
@@ -16023,7 +16023,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             old.sa_restorer = p->sigstate.restorer;
             /* Slice 3: sa_mask crosses the same signo vs signo-1 boundary as
              * rt_sigprocmask -- convert out of tobyOS numbering. */
-            old.sa_mask     = (uint64_t)cur->sa_mask >> 1;
+            old.sa_mask     = sig_mask_to_linux((uint64_t)cur->sa_mask);
             if (copy_to_user((void *)a3, &old, sizeof old) != 0)
                 return -ABI_EFAULT;
         }
@@ -16032,7 +16032,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (copy_from_user(&na, (const void *)a2, sizeof na) != 0)
                 return -ABI_EFAULT;
             cur->sa_handler = (void (*)(int))(uintptr_t)na.sa_handler;
-            cur->sa_mask    = (sigset_t)(na.sa_mask << 1);  /* Linux -> tobyOS */
+            cur->sa_mask    = (sigset_t)sig_mask_from_linux(na.sa_mask);  /* Linux -> tobyOS */
             cur->sa_flags   = (int)na.sa_flags;
             if ((na.sa_flags & LX_SA_RESTORER) && na.sa_restorer)
                 p->sigstate.restorer = na.sa_restorer;
@@ -16070,7 +16070,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct proc *p = current_proc();
         if (!p) return -ABI_EINVAL;
         if (a3) {                       /* oldset: tobyOS -> Linux numbering */
-            uint64_t old = (uint64_t)p->sigstate.mask >> 1;
+            uint64_t old = sig_mask_to_linux((uint64_t)p->sigstate.mask);
             if (copy_to_user((void *)a3, &old, sizeof old) != 0)
                 return -ABI_EFAULT;
         }
@@ -16078,7 +16078,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             uint64_t lset = 0;
             if (copy_from_user(&lset, (const void *)a2, sizeof lset) != 0)
                 return -ABI_EFAULT;
-            uint64_t kset = lset << 1;               /* Linux -> tobyOS */
+            uint64_t kset = sig_mask_from_linux(lset);   /* Linux -> tobyOS */
             kset &= ~(uint64_t)(SIGMASK(SIGKILL) | SIGMASK(SIGSTOP));
             switch ((int)a1) {
             case 0: p->sigstate.mask |= kset; break;   /* SIG_BLOCK   */
@@ -16116,7 +16116,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * (signo-1); tobyOS's SIGMASK(s) is (1u << s), i.e. bit == signo
          * (see signal.h and oom.c's `1u << 9` for SIGKILL). Shift the
          * caller's set into OUR numbering once, here. */
-        uint64_t kset = uset << 1;
+        uint64_t kset = sig_mask_from_linux(uset);
         /* Deadline: NULL timeout means wait forever. */
         bool have_to = (a3 != 0);
         uint64_t deadline = 0;
@@ -16146,10 +16146,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * handler), so clear the bit before returning the number. */
             uint64_t hit = p->pending_signals & kset;
             if (hit) {
-                int signo = 0;      /* bit index IS the signal number here */
-                for (int i = 0; i < 64; i++)
-                    if (hit & (1ull << i)) { signo = i; break; }
-                p->pending_signals &= ~(1ull << signo);
+                /* the lowest signal pending, 1..64 (signal 64 rides bit
+                 * 0, finding 195) */
+                int signo = 0;
+                for (int i = 1; i < SIG_MAX; i++)
+                    if (hit & SIGMASK(i)) { signo = i; break; }
+                p->pending_signals &= ~SIGMASK(signo);
                 if (a2) {   /* siginfo_t: kernel-origin, minimal but valid */
                     uint8_t si[128];
                     memset(si, 0, sizeof si);

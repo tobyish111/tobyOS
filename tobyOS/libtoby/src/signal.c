@@ -77,6 +77,9 @@ sighandler_t signal_norestart(int signum, sighandler_t handler) {
 
 int sigemptyset(sigset_t *set)  { if (set) *set = 0; return 0; }
 int sigfillset(sigset_t *set)   { if (set) *set = ~0UL; return 0; }
-int sigaddset(sigset_t *set, int n) { if (set && n > 0 && n < 64) { *set |= (1UL << n); return 0; } return -1; }
-int sigdelset(sigset_t *set, int n) { if (set && n > 0 && n < 64) { *set &= ~(1UL << n); return 0; } return -1; }
-int sigismember(const sigset_t *set, int n) { if (set && n > 0 && n < 64) return (*set >> n) & 1; return -1; }
+/* bit n for signal n, and signal 64 (SIGRTMAX) in bit 0, as the kernel
+ * keeps them (finding 195) */
+#define LT_SIGBIT(n) ((n) == 64 ? 1UL : (1UL << (n)))
+int sigaddset(sigset_t *set, int n) { if (set && n > 0 && n <= 64) { *set |= LT_SIGBIT(n); return 0; } return -1; }
+int sigdelset(sigset_t *set, int n) { if (set && n > 0 && n <= 64) { *set &= ~LT_SIGBIT(n); return 0; } return -1; }
+int sigismember(const sigset_t *set, int n) { if (set && n > 0 && n <= 64) return (*set & LT_SIGBIT(n)) != 0; return -1; }
