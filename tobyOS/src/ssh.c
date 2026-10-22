@@ -1595,8 +1595,8 @@ static bool ssh_spawn_shell(void) {
     char e_shell[] = "SHELL=/bin/tsh", e_path[] = "PATH=/bin";
     char *envp[8];
     int envc = 0;
+    char home[256];
     {
-        char home[256];
         ssh_passwd_home(g_auth_user, home, sizeof home);
         ksnprintf(e_user, sizeof e_user, "USER=%s", g_auth_user);
         ksnprintf(e_logname, sizeof e_logname, "LOGNAME=%s", g_auth_user);
@@ -1626,7 +1626,9 @@ static bool ssh_spawn_shell(void) {
     spec.argv = argv;
     spec.envc = envc;
     spec.envp = envp;
-    spec.cwd  = "/";
+    /* in the home directory, as sshd starts a session (finding 204): it
+     * was "/" for everyone */
+    spec.cwd  = home;
 
     int pid = proc_spawn(&spec);
     /* the child holds its own clones now: ours go, so the command's exit
