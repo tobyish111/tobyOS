@@ -134,7 +134,12 @@ struct tmpfs_node {
      * by memset, so the safe value is the one memset produces. */
     uint32_t      link_to;
     uint32_t      nlink;                /* names pointing at this owner */
+    uint32_t      nent;                 /* a directory's entries (238) */
 };
+
+/* A directory's size, as Linux's tmpfs counts it: BOGO_DIRENT_SIZE (20)
+ * for each entry and for . and .. -- it was 0 (finding 238) */
+#define TDIR_SIZE(n) (40u + 20u * (uint64_t)(n))
 
 struct tmpfs_mount {
     bool                used;
@@ -148,6 +153,8 @@ struct tmpfs_mount {
     bool                no_node_limit;  /* nr_inodes=0: likewise */
     uint32_t            root_mode; /* the mount root's permissions (mode=) */
     uint64_t            root_time; /* when it was mounted: the root's times */
+    uint64_t            root_mtime;/* its last entry change, 0 for none (238) */
+    uint32_t            root_nent; /* the root's entries (238) */
     uint64_t            next_seq;  /* the next node's creation number */
 };
 
@@ -440,6 +447,32 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
     return (long)n;
 }
 
+/* A DIRECTORY CHANGES WHEN ITS ENTRIES DO: Linux's tmpfs sets the
+ * parent's mtime and ctime at every create, link, unlink and rename. This
+ * one's never moved -- tar --no-overwrite-dir left a directory @7 where
+ * Linux's says the time its last entry was made (finding 238). */
+static void tparent_touch(struct tmpfs_mount *m, const char *norm, int delta)
+{
+    uint64_t now = tmpfs_now_secs();
+    const char *slash = trchr(norm, '/');
+    if (!slash) {
+        m->root_mtime = now;
+        if (delta < 0 && m->root_nent) m->root_nent--;
+        else if (delta > 0) m->root_nent++;
+        return;
+    }
+    char parent[VFS_PATH_MAX];
+    size_t pl = (size_t)(slash - norm);
+    if (pl >= sizeof parent) return;
+    memcpy(parent, norm, pl);
+    parent[pl] = '\0';
+    struct tmpfs_node *pd = tfind(m, parent);
+    if (!pd) return;
+    pd->mtime = pd->ctime = now;
+    if (delta < 0 && pd->nent) pd->nent--;      /* and its size (238) */
+    else if (delta > 0) pd->nent++;
+}
+
 static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
                         uint32_t gid, uint32_t mode)
 {
@@ -462,6 +495,7 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
      * (vfs_mkfifo) */
     nd->mode = mode ? (mode & 0177777u) : 0644u;
     nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    tparent_touch(m, norm, 1);
     return VFS_OK;
 }
 
@@ -485,6 +519,7 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     nd->uid = uid; nd->gid = gid;
     nd->mode = mode ? (mode & 07777u) : 0755u;
     nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    tparent_touch(m, norm, 1);
     return VFS_OK;
 }
 
@@ -535,6 +570,7 @@ static int tmpfs_unlink(void *mnt, const char *path)
                 return VFS_ERR_EXIST;   /* ENOTEMPTY has no VFS code here */
         }
     tdrop_name(m, nd);
+    tparent_touch(m, norm, -1);
     return VFS_OK;
 }
 
@@ -572,6 +608,7 @@ static int tmpfs_symlink(void *mnt, const char *path, const char *target)
     memcpy(nd->data, target, tl);
     nd->size = tl;
     nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    tparent_touch(m, norm, 1);
     return VFS_OK;
 }
 
@@ -616,6 +653,7 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     nn->link_to = (uint32_t)tindex(m, ino) + 1u;   /* talloc moved nothing */
     ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
     ino->ctime  = tmpfs_now_secs();      /* a new link is a change (224) */
+    tparent_touch(m, nw, 1);
     return VFS_OK;
 }
 
@@ -638,7 +676,9 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
         out->mode = m->root_mode | VFS_MODE_VALID;
         /* its times are the mount's, as Linux's tmpfs root has (they
          * were 0, so `ls -ld /tmp` said Jan 1 1970) */
-        out->mtime = out->atime = out->ctime = m->root_time;
+        out->atime = m->root_time;
+        out->mtime = out->ctime = m->root_mtime ? m->root_mtime : m->root_time;
+        out->size = TDIR_SIZE(m->root_nent);
         out->ino  = m->max_nodes + 1u;             /* past every node's */
         out->dev  = dev;
         return VFS_OK;
@@ -658,7 +698,7 @@ static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
     out->ino   = (uint64_t)tindex(m, nd) + 1u;
     out->dev   = 0x7700u + (uint32_t)(m - g_tmpfs);
     out->type  = nd->type;
-    out->size  = nd->size;
+    out->size  = nd->type == VFS_TYPE_DIR ? TDIR_SIZE(nd->nent) : nd->size;
     out->uid   = nd->uid;
     out->gid   = nd->gid;
     /* VFS_MODE_VALID, and the same 07777 mask tmpfs_open already uses.
@@ -775,7 +815,7 @@ static int tmpfs_readdir(struct vfs_dir *d, struct vfs_dirent *out)
         /* A hard link takes its size and ownership from the owner. */
         struct tmpfs_node *ino = tresolve(dh->m, nd);
         out->type = ino->type;
-        out->size = ino->size;
+        out->size = ino->type == VFS_TYPE_DIR ? TDIR_SIZE(ino->nent) : ino->size;
         out->uid  = ino->uid;
         out->gid  = ino->gid;
         out->mode = ino->mode;
@@ -880,8 +920,10 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     if (!src) return VFS_ERR_NOENT;
     if (!tparent_ok(m, nw)) return VFS_ERR_NOENT;
     struct tmpfs_node *dst = tfind_name(m, nw);
+    bool replaced = false;
     if (dst && dst != src) {                    /* POSIX: replace */
         tdrop_name(m, dst);
+        replaced = true;
     }
     size_t ol = strlen(o), nl = strlen(nw);
     if (src->type == VFS_TYPE_DIR) {
@@ -901,6 +943,8 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     src->path[sizeof src->path - 1] = '\0';
     src->seq = ++m->next_seq;            /* newest where it now is (221) */
     src->ctime = tmpfs_now_secs();       /* a rename is a change (224) */
+    tparent_touch(m, o, -1);
+    tparent_touch(m, nw, replaced ? 0 : 1);
     return VFS_OK;
 }
 

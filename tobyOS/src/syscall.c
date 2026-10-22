@@ -235,6 +235,9 @@ static bool user_str_in(char *ks, size_t cap, const char *us) {
  * where Linux's is 4 (finding 229). */
 static uint64_t vfs_stat_blocks(const struct vfs_stat *vs) {
     if (vs->type == VFS_TYPE_SYMLINK && vs->size < 60) return 0;
+    /* a directory's whole blocks: ext4's 4096-byte ones, tmpfs's none (its
+     * 40 + 20 an entry is a count, not an allocation) */
+    if (vs->type == VFS_TYPE_DIR) return vs->size / 4096 * 8;
     return (vs->size + 4095) / 4096 * 8;
 }
 
