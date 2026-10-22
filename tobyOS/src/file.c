@@ -683,6 +683,8 @@ static void file_pos_store(struct file *f) {
 static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
     struct blk_dev *d = f->blkdev;
     if (!d || d->gone) return -ABI_EIO;
+    /* the open's access mode, as a file's (finding 216): EBADF */
+    if ((f->o_accmode & 3) == (write ? 0 : 1)) return -ABI_EBADF;
     uint64_t size = d->sector_count * (uint64_t)BLK_SECTOR_SIZE;
     if (f->blk_pos >= size) return write ? -ABI_ENOSPC : 0;
     if (n > size - f->blk_pos) n = (size_t)(size - f->blk_pos);
@@ -751,6 +753,8 @@ long file_read(struct file *f, void *buf, size_t n) {
         return pipe_read(f->pipe, buf, n);
     case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->read) return -1;
+        /* opened for writing only: EBADF, as Linux's (finding 216) */
+        if ((f->o_accmode & 3) == 1) return VFS_ERR_BADF;
         file_pos_load(f);
         long r = f->vfs.ops->read(&f->vfs, buf, n);
         file_pos_store(f);
@@ -853,6 +857,11 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return pipe_write(f->pipe, buf, n);
     case FILE_KIND_VFS: {
         if (!f->vfs.ops || !f->vfs.ops->write) return -1;
+        /* OPENED FOR READING ONLY: EBADF, as Linux's (finding 216). The
+         * write went through -- an open for reading is checked against
+         * read permission alone, so a file one may read and not write
+         * could be rewritten through it. */
+        if ((f->o_accmode & 3) == 0) return VFS_ERR_BADF;
         file_pos_load(f);
         /* O_APPEND for a driver that does not track the live size itself:
          * the furthest this description knows of. ramfs/tmpfs/tobyfs then

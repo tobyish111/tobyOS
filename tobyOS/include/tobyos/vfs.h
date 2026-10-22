@@ -118,6 +118,8 @@ enum vfs_type {
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
 #define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
 #define VFS_ERR_NOTEMPTY  -16 /* a directory with entries -> ENOTEMPTY (batch 31) */
+#define VFS_ERR_BADF      -17 /* a descriptor not open for the access asked ->
+                               * EBADF (finding 216) */
 
 struct vfs_stat {
     enum vfs_type type;

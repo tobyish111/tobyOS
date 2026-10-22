@@ -37165,6 +37165,9 @@ static struct file *shell_open_vfs_file(const char *path_arg, bool write,
         f->vfs.append = true;           /* every write at the end, as O_APPEND */
         file_pos_set(f, f->vfs.size);
     }
+    /* the mode it was opened for, which file_write checks (finding 216):
+     * none was recorded, which reads as O_RDONLY */
+    f->o_accmode = g_open_rdwr ? 2 : write ? 1 : 0;
     return f;
 }
 

@@ -258,6 +258,7 @@ static long vfs_err_to_abi(long rv) {
     case VFS_ERR_LOOP:        return -ABI_ELOOP;    /* "Too many levels of symbolic links" */
     case VFS_ERR_XDEV:        return -ABI_EXDEV;    /* Phase G: hard links */
     case VFS_ERR_NOTEMPTY:    return -ABI_ENOTEMPTY; /* batch 31: rename */
+    case VFS_ERR_BADF:        return -ABI_EBADF;     /* finding 216 */
     default:                  return rv;            /* already an ABI errno */
     }
 }
@@ -3934,10 +3935,12 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
          * ISDIR, PERM and NOMOUNT all map identically. */
         return vfs_err_to_abi(rc);
     }
-    /* Reject write attempts on a read-only access mode early -- we
-     * still let the file_write path enforce mount-level RO. */
+    /* The access mode is the descriptor's for good: file_read and
+     * file_write refuse what it does not allow (EBADF, finding 216), and
+     * fcntl(F_GETFL) reports it. The mount's read-only state is the
+     * driver's to refuse. */
     (void)access;
-    f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR for F_GETFL */
+    f->o_accmode = flags & 3;    /* O_ACCMODE: O_RDONLY/O_WRONLY/O_RDWR */
 
     /* O_APPEND: start at end of file.
      *
@@ -4809,6 +4812,8 @@ static long sys_ftruncate_fd(int fd, uint64_t len) {
     if (!f) return -ABI_EBADF;
     if (f->kind == FILE_KIND_MEMFD) return memfd_ftruncate(f->memfd, len);
     if (f->kind != FILE_KIND_VFS)   return -ABI_EINVAL;
+    /* not open for writing: EINVAL, as Linux's (finding 216) */
+    if ((f->o_accmode & 3) == 0)    return -ABI_EINVAL;
     return vfs_err_to_abi(vfs_file_truncate(&f->vfs, len));
 }
 
@@ -8679,6 +8684,12 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
     if (len == 0) return -ABI_EINVAL;
     struct file *f = fd_lookup(fd);
     if (!f || f->kind != FILE_KIND_VFS) return -ABI_EBADF;
+    /* WHAT THE DESCRIPTOR MAY DO, as Linux's mmap asks it (finding 216): a
+     * file mapping needs read access, and a shared writable one O_RDWR --
+     * the mapping is the file's contents for everyone who maps it. */
+    if ((f->o_accmode & 3) == 1) return -ABI_EACCES;
+    if ((lflags & LXMAP_SHARED) && (prot & 0x2) && (f->o_accmode & 3) != 2)
+        return -ABI_EACCES;
 
     /* MAP_SHARED must actually SHARE. The copying path below gives every mapper
      * a private copy, which silently breaks cross-process shared memory --
@@ -8742,8 +8753,12 @@ static long linux_mmap_file(uint64_t addr, uint64_t len, uint32_t prot,
                     }
                     file_pos_set(f, save_pos);
                 }
+                /* a descriptor that may not write: mprotect must not make
+                 * the mapping writable later (0x40, VMA_FLAG_NOWRITE) */
                 long b = shm_cache_mmap(sc, addr, alen, prot,
-                                        lx_mmap_flags(lflags), aoff);
+                                        lx_mmap_flags(lflags) |
+                                        ((f->o_accmode & 3) != 2 ? 0x40u : 0u),
+                                        aoff);
 #ifdef CHROMIUM_BOOT
                 {   /* Slice 122: cap raised 200 -> 2000 with a loud tail.
                      * The 200 cap was HIT during the bing-blank forensics and
@@ -15610,6 +15625,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
 #endif
             return memfd_ftruncate(tf->memfd, (uint64_t)a2);   /* allocates pages */
         }
+        /* not open for writing: EINVAL, as Linux's (finding 216) */
+        if (tf && tf->kind == FILE_KIND_VFS && (tf->o_accmode & 3) == 0)
+            return -ABI_EINVAL;
         if (tf && tf->kind == FILE_KIND_VFS && (long)a2 >= 0) {
             /* Slice 6: PERSIST it. Setting tf->vfs.size alone (slice 8's
              * behaviour, kept for memfd above) never reached the inode, so

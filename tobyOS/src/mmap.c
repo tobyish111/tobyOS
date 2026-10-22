@@ -68,6 +68,9 @@ extern struct proc g_proc[];   /* reclaim scans for eviction candidates */
 /* The VMA's physical pages are owned by something else (a memfd) -- munmap must
  * unmap them but MUST NOT pmm_free them (the memfd frees them at close). */
 #define VMA_FLAG_NOFREE    0x20
+/* A shared file mapping from a descriptor that may not write: PROT_WRITE is
+ * refused, now and by a later mprotect (Linux's VM_MAYWRITE, finding 216). */
+#define VMA_FLAG_NOWRITE   0x40
 
 struct mmap_vma {
     uint64_t start;
@@ -1072,6 +1075,15 @@ long sys_mprotect(uint64_t addr, uint64_t len, uint32_t prot) {
 #ifdef CHROMIUM_BOOT
     mprot_ring_note(addr, len, pid, prot);
 #endif
+
+    /* WRITE ON A MAPPING THAT MAY NOT BE WRITTEN: EACCES, before anything
+     * changes, as Linux's (finding 216). */
+    if (prot & VMA_PROT_WRITE)
+        for (int i = 0; i < vt->count; i++) {
+            const struct mmap_vma *v = &vt->entries[i];
+            if (rstart < v->end && rend > v->start && (v->flags & VMA_FLAG_NOWRITE))
+                return -13;
+        }
 
     /* Apply `prot` ONLY to the [rstart,rend) sub-range, SPLITTING any VMA it
      * partially covers. The demand-page handler reads the VMA's prot for a

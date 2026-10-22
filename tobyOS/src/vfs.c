@@ -1937,6 +1937,7 @@ const char *vfs_strerror(int err) {
     case VFS_ERR_PERM:          return "permission denied";
     case VFS_ERR_LOOP:          return "too many levels of symbolic links";
     case VFS_ERR_XDEV:          return "cross-device link";
+    case VFS_ERR_BADF:          return "bad file descriptor";
     default:                    return "unknown error";
     }
 }
