@@ -1548,6 +1548,8 @@ static long sys_term_read(int fd, void *buf, size_t cap) {
 /* Defined further down, next to the other path plumbing. Declared here
  * because the VFS syscalls below are the earliest callers. */
 int resolve_user_path(const char *user_path, char *out, size_t cap);
+int resolve_kernel_path(const char *kstr, char *out, size_t cap);
+static int resolve_path_str(const char *up, long plen, char *out, size_t cap);
 
 /* ---- VFS syscalls (milestone 13) --------------------------------- */
 
@@ -2523,6 +2525,20 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
                      (int)sizeof(up) - 1, 64, up);
         return -ABI_ENAMETOOLONG;
     }
+    return resolve_path_str(up, plen, out, cap);
+}
+
+/* A path already in the kernel -- an AF_UNIX socket's name (finding 193) --
+ * resolved as resolve_user_path resolves a user's. */
+int resolve_kernel_path(const char *kstr, char *out, size_t cap) {
+    if (!kstr) return -ABI_EFAULT;
+    size_t n = strlen(kstr);
+    if (n >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+    return resolve_path_str(kstr, (long)n, out, cap);
+}
+
+/* resolve_user_path's walk, of UP (PLEN bytes, NUL-terminated). */
+static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
     /* an empty path names nothing: ENOENT, as Linux's (EINVAL for a
      * zero-sized buffer, which only the kernel can pass) */
     if (plen == 0) return -ABI_ENOENT;
@@ -3832,6 +3848,11 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
      * the descriptor's, as /proc/PID/fd names a FIFO by it. */
     {
         struct vfs_stat fs;
+        /* a socket's node opens to nothing: ENXIO, as Linux's open says
+         * (finding 193) */
+        if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            (fs.mode & 0170000u) == 0140000u)
+            return -ABI_ENXIO;
         if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
             (fs.mode & 0170000u) == 0010000u) {
             struct file *ff = 0;
@@ -10058,6 +10079,31 @@ static long lx_bind(int fd, uint64_t uaddr, uint32_t alen) {
         long pr = lx_sun_parse(uaddr, alen, nm, sizeof nm, &abs);
         if (pr) return pr;
         if (!nm[0]) return -ABI_EINVAL;             /* autobind unsupported */
+        if (!abs) {
+            /* A NAME IN THE FILESYSTEM IS A NODE, as Linux's bind makes one
+             * (finding 193): the path resolved as any path is, an S_IFSOCK
+             * node made there -- 0777 less the umask, the binder's --
+             * EADDRINUSE when the name is taken, by a socket or anything
+             * else; ENOENT, EACCES as creating a file there would say. The
+             * name was a string in a table: `ls` saw nothing, and "sock"
+             * and "./sock" were different names. */
+            char kp[VFS_PATH_MAX];
+            int rr = resolve_kernel_path(nm, kp, sizeof kp);
+            if (rr) return rr;
+            struct vfs_stat est;
+            if (vfs_stat(kp, &est) == VFS_OK) return -LXE_EADDRINUSE;
+            struct proc *bp = current_proc();
+            uint32_t um = bp ? (bp->umask & 0777u) : 022u;
+            int vr = vfs_mksock(kp, 0777u & ~um);
+            if (vr == VFS_ERR_EXIST) return -LXE_EADDRINUSE;
+            if (vr != VFS_OK) return vfs_err_to_abi(vr);
+            int rc = sock_unix_bind_path(s, kp, nm);
+            if (rc != 0) {
+                (void)vfs_unlink(kp);
+                return rc == -98 ? -LXE_EADDRINUSE : -ABI_EINVAL;
+            }
+            return 0;
+        }
         int rc = sock_unix_bind_name(s, nm, abs);
         if (rc == -98) return -LXE_EADDRINUSE;
         return rc == 0 ? 0 : -ABI_EINVAL;
@@ -10283,6 +10329,28 @@ static long lx_connect(int fd, uint64_t uaddr, uint32_t alen) {
         if (nlen > sizeof(name) - 1) nlen = sizeof(name) - 1;
         memcpy(name, src, nlen);
         name[nlen] = '\0';                        /* strcmp stops at any embedded NUL */
+        if (!abstract && name[0] && !sock_unix_is_x_socket(name)) {
+            /* THROUGH THE NODE, as Linux's connect goes (finding 193): the
+             * path resolved, links followed -- ENOENT when nothing is
+             * there, ECONNREFUSED when it is not a socket or nothing is
+             * listening on it, EACCES without write permission on it. The
+             * in-kernel X server's socket keeps its own way in. */
+            char kp[VFS_PATH_MAX], fin[VFS_PATH_MAX];
+            int rr = resolve_kernel_path(name, kp, sizeof kp);
+            if (rr) return rr;
+            struct vfs_stat nst;
+            int sr = vfs_stat(kp, &nst);
+            const char *node = kp;
+            if (sr == VFS_OK && nst.type == VFS_TYPE_SYMLINK) {
+                sr = vfs_follow_link(kp, fin, sizeof fin);
+                if (sr == VFS_OK) { node = fin; sr = vfs_stat(fin, &nst); }
+            }
+            if (sr != VFS_OK) return vfs_err_to_abi(sr);
+            if ((nst.mode & 0170000u) != 0140000u) return -LXE_ECONNREFUSED;
+            if (vfs_perm_check(node, VFS_WANT_WRITE) != VFS_OK) return -ABI_EACCES;
+            int rc = sock_unix_connect_named(s, node, false);
+            return rc == 0 ? 0 : -LXE_ECONNREFUSED;
+        }
         int rc = sock_unix_connect_named(s, name, abstract);
         return rc == 0 ? 0 : -LXE_ECONNREFUSED;
     }

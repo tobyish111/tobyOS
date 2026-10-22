@@ -803,6 +803,9 @@ struct unix_bind {
     bool  listening;
     bool  abstract;
     char  name[109];
+    /* the name as bind(2) was given it, which getsockname says (a node's
+     * table name is its resolved path -- finding 193) */
+    char  shown[109];
     int   owner;                          /* sock pool index of the bound socket */
     int   backlog[UNIX_BACKLOG_MAX];      /* server ends waiting to be accepted */
     int   nq;
@@ -856,9 +859,32 @@ int sock_unix_bind_name(struct sock *s, const char *name, bool abstract) {
 /* The name this socket is bound to, or NULL if unnamed. Abstract names are
  * returned without their leading NUL; getsockname's caller does not need
  * the distinction here, since we keep one namespace. */
+/* Is NAME the in-kernel X server's socket? (syscall.c's connect asks) */
+bool sock_unix_is_x_socket(const char *name) { return is_x0_socket(name); }
+
 const char *sock_unix_bound_name(const struct sock *s) {
     struct unix_bind *b = unix_bind_of(s);
-    return b ? b->name : 0;
+    if (!b) return 0;
+    return b->shown[0] ? b->shown : b->name;
+}
+
+/* Bind S to the node at KPATH (made by the caller), shown as SHOWN. A
+ * binding still holding KPATH is a socket whose node was unlinked: it stays
+ * bound, as Linux's does, and no name reaches it any more. */
+int sock_unix_bind_path(struct sock *s, const char *kpath, const char *shown) {
+    struct unix_bind *old = unix_bind_find(kpath, false);
+    if (old) old->name[0] = '\0';
+    int rc = sock_unix_bind_name(s, kpath, false);
+    if (rc == 0) {
+        struct unix_bind *b = unix_bind_of(s);
+        if (b && shown) {
+            size_t n = strlen(shown);
+            if (n > sizeof(b->shown) - 1) n = sizeof(b->shown) - 1;
+            memcpy(b->shown, shown, n);
+            b->shown[n] = '\0';
+        }
+    }
+    return rc;
 }
 
 int sock_unix_listen(struct sock *s) {

@@ -403,6 +403,8 @@ int  vfs_mount_lookup(const char *mount_point,
 uint32_t vfs_path_mount_flags(const char *path);
 /* Batch 31: whether two paths resolve through one mount (EXDEV's test). */
 bool vfs_same_mount(const char *a, const char *b);
+/* Batch 32 (finding 193): an AF_UNIX socket's node, S_IFSOCK | MODE. */
+int vfs_mksock(const char *path, uint32_t mode);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 

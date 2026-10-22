@@ -364,6 +364,9 @@ int  sock_unix_connect_named(struct sock *s, const char *name, bool abstract);
  * registry lives in socket.c so struct sock does not change size. */
 int  sock_unix_bind_name(struct sock *s, const char *name, bool abstract);
 const char *sock_unix_bound_name(const struct sock *s);
+/* Finding 193: bind to a filesystem node's resolved path, shown as given. */
+int sock_unix_bind_path(struct sock *s, const char *kpath, const char *shown);
+bool sock_unix_is_x_socket(const char *name);
 int  sock_unix_listen(struct sock *s);
 bool sock_unix_can_accept(const struct sock *s);
 int  sock_unix_accept(struct sock *s, struct sock **out);
