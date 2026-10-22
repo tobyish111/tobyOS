@@ -647,8 +647,17 @@ static int cpx_dir(const struct cpx_opts *o, const char *src, const char *dst,
 
 /* A link, FIFO or device node cannot be written into: an existing DST
  * goes first ("removed 'D'" with -v, before the copy is announced). */
-static void cpx_replace(const struct cpx_opts *o, const char *dst, int dexists) {
-    if (dexists && unlink(dst) == 0 && o->verbose) printf("removed %s\n", su_quoteaf(dst));
+static int cpx_replace(const struct cpx_opts *o, const char *dst, int dexists) {
+    if (!dexists) return 0;
+    /* a failure is said, as GNU's cp says it: it was ignored, and the link
+     * made next said "File exists" (a read-only directory) */
+    if (unlink(dst) != 0) {
+        if (errno == ENOENT) return 0;
+        su_error(0, errno, "cannot remove %s", su_quoteaf(dst));
+        return 1;
+    }
+    if (o->verbose) printf("removed %s\n", su_quoteaf(dst));
+    return 0;
 }
 
 /* Copy SRC to DST. TOP: a command-line operand. 0, or 1 after saying
@@ -909,7 +918,11 @@ static int cpx_copy(const struct cpx_opts *o, const char *src, const char *dst,
             goto done;
         }
         target[n] = 0;
-        cpx_replace(o, dst, dexists && !S_ISDIR(dl.st_mode));
+        if (cpx_replace(o, dst, dexists && !S_ISDIR(dl.st_mode))) {
+            free(target);
+            rc = 1;
+            goto done;
+        }
         cpx_say(o, src, dst, sbk, 0);
         if (symlink(target, dst) != 0) {
             su_error(0, errno, "cannot create symbolic link %s", su_quoteaf(dst));
@@ -919,7 +932,10 @@ static int cpx_copy(const struct cpx_opts *o, const char *src, const char *dst,
         }
         free(target);
     } else if (!S_ISREG(s.st_mode) && o->recursive && !o->copy_contents) {
-        cpx_replace(o, dst, dexists && !S_ISDIR(dl.st_mode));
+        if (cpx_replace(o, dst, dexists && !S_ISDIR(dl.st_mode))) {
+            rc = 1;
+            goto done;
+        }
         cpx_say(o, src, dst, sbk, 0);
         if (S_ISFIFO(s.st_mode) ? mkfifo(dst, s.st_mode & 0777) != 0 : cpx_mknod(dst, &s) != 0) {
             su_error(0, errno, S_ISFIFO(s.st_mode) ? "cannot create fifo %s"
