@@ -157,7 +157,7 @@ static void st_dir(struct sn_sb *out, const struct st_file *f, char pfx, char co
                    const char *spec, int prec) {
     char fmt[64], buf[512], tmp[128];
     const struct stat *st = &f->st;
-    enum { STR, UNS, HEX, OCT } kind = STR;
+    enum { STR, UNS, SGN, HEX, OCT } kind = STR;
     unsigned long long v = 0;
     const char *s = "?";
     if (f->is_fs) {
@@ -237,7 +237,7 @@ static void st_dir(struct sn_sb *out, const struct st_file *f, char pfx, char co
             for (int i = 9; i < prec; i++) strcat(buf, "0");
             s = buf;
         } else {
-            kind = UNS;
+            kind = SGN;             /* before the epoch is negative */
             v = (unsigned long long)(long long)t;
         }
         break;
@@ -258,17 +258,18 @@ static void st_dir(struct sn_sb *out, const struct st_file *f, char pfx, char co
         free(bb);
         return;
     }
-    const char *c = kind == UNS ? "llu" : kind == HEX ? "llx" : "llo";
+    const char *c = kind == UNS ? "llu" : kind == SGN ? "lld" : kind == HEX ? "llx" : "llo";
     char spec2[64];
     size_t n = 0;
     for (const char *q = spec; *q && n + 1 < sizeof spec2; q++) {
-        /* '+', ' ' and "'" mean nothing to an unsigned conversion */
-        if (*q == '+' || *q == ' ' || *q == '\'') continue;
+        /* '+' and ' ' mean nothing to an unsigned conversion, "'" to any */
+        if (((*q == '+' || *q == ' ') && kind != SGN) || *q == '\'') continue;
         spec2[n++] = *q;
     }
     spec2[n] = 0;
     snprintf(fmt, sizeof fmt, "%%%s%s", spec2, c);
-    snprintf(buf, sizeof buf, fmt, v);
+    if (kind == SGN) snprintf(buf, sizeof buf, fmt, (long long)v);
+    else snprintf(buf, sizeof buf, fmt, v);
     sn_puts(out, buf);
 }
 
