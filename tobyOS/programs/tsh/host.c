@@ -965,6 +965,16 @@ static bool host_slot_closed(const struct file *f) {
     return f && f->kind == FILE_KIND_NULL;
 }
 
+/* The spawn's descriptor for the child's fd N: the handle's, or the
+ * shell's own fd N -- or ABI_SPAWN_FD_CLOSED when that is closed. The
+ * number of a closed one named nothing, the kernel refused the spawn, and
+ * `sh -c "cat; echo" <&-` said cat was not an executable (finding 234). */
+static int host_spawn_std(const struct file *f, int n) {
+    if (f) return host_slot_closed(f) ? ABI_SPAWN_FD_CLOSED : VF_FD(&f->vfs);
+    struct stat st;                    /* libtoby's fcntl is a stub */
+    return fstat(n, &st) < 0 ? ABI_SPAWN_FD_CLOSED : n;
+}
+
 int proc_spawn(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
 
@@ -988,9 +998,9 @@ int proc_spawn(const struct proc_spec *spec) {
 
     /* A NULL fd in the spec means "inherit"; the kernel would hand the child
      * the console. Here the standard descriptors already are that. */
-    int fd0 = spec->fd0 ? VF_FD(&spec->fd0->vfs) : 0;
-    int fd1 = spec->fd1 ? VF_FD(&spec->fd1->vfs) : 1;
-    int fd2 = spec->fd2 ? VF_FD(&spec->fd2->vfs) : 2;
+    int fd0 = host_spawn_std(spec->fd0, 0);
+    int fd1 = host_spawn_std(spec->fd1, 1);
+    int fd2 = host_spawn_std(spec->fd2, 2);
 
     /* The child gets the DESCRIPTOR exactly where it is. This used to seek
      * it to ->vfs.pos first, the offset the shell had counted for itself --

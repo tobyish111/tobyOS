@@ -2130,6 +2130,9 @@ struct abi_spawn_req {
 /* fd0/fd1/fd2 sentinels for spawn_req. */
 #define ABI_SPAWN_FD_INHERIT   (-1)
 #define ABI_SPAWN_FD_CONSOLE   (-2)
+/* No descriptor at all: the child's slot is closed, as a forked shell's
+ * child has it after `<&-` (finding 234). */
+#define ABI_SPAWN_FD_CLOSED    (-3)
 
 /* spawn_req.flags: the child starts with SIGINT / SIGQUIT at the default
  * (DFL) or ignored (IGN) whatever the caller has -- posix_spawn's

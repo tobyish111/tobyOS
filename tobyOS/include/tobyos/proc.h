@@ -927,7 +927,7 @@ struct proc_fd_map {
 struct proc_spec {
     const char  *path;
     const char  *name;          /* may be NULL -> derived from path */
-    struct file *fd0;           /* may be NULL -> console */
+    struct file *fd0;           /* may be NULL -> console, or PROC_FD_CLOSED */
     struct file *fd1;
     struct file *fd2;
     /* Slice 39: optional fd 3/4 preopens (NULL = not installed). Chrome's

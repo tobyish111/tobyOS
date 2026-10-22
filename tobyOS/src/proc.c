@@ -478,6 +478,7 @@ static bool install_initial_fds(struct proc *p,
     struct file *src[5] = { fd0, fd1, fd2, fd3, fd4 };
     for (int i = 0; i < 5; i++) {
         struct file *nf;
+        if (src[i] == PROC_FD_CLOSED) continue;     /* left closed (234) */
         if (src[i]) {
             nf = file_clone(src[i]);
         } else if (i < 3) {

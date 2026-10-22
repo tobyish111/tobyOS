@@ -5462,6 +5462,12 @@ void kvec_free(char **arr) {
 static void free_kvec(char **arr) { kvec_free(arr); }
 
 long lx_access_kpath(const char *kpath, int mode);
+/* sys_spawn's reference to a child's fd 0-2, released: not the console's
+ * NULL, nor the marker of a closed one (finding 234). */
+static void spawn_fd_put(struct file *f) {
+    if (f && f != PROC_FD_CLOSED) file_close(f);
+}
+
 static long sys_spawn(const struct abi_spawn_req *req) {
     if (!cap_check(current_proc(), CAP_EXEC, "sys_spawn")) return -ABI_EPERM;
 
@@ -5521,6 +5527,10 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             *out[i] = 0;            /* let spawn_internal install console */
             continue;
         }
+        if (v == ABI_SPAWN_FD_CLOSED) {
+            *out[i] = PROC_FD_CLOSED;   /* the child's slot stays empty (234) */
+            continue;
+        }
         if (v == ABI_SPAWN_FD_INHERIT) {
             v = i;                   /* inherit parent's same-numbered fd */
         }
@@ -5532,9 +5542,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         *out[i] = cl;
     }
     if (failed) {
-        if (f0) file_close(f0);
-        if (f1) file_close(f1);
-        if (f2) file_close(f2);
+        spawn_fd_put(f0);
+        spawn_fd_put(f1);
+        spawn_fd_put(f2);
         free_kvec(kargv); free_kvec(kenvp);
         return -ABI_EBADF;
     }
@@ -5554,9 +5564,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             !(uex = (struct abi_spawn_fd *)kmalloc(sizeof(*uex) *
                                                    kreq.nextra))) {
             kfree(kextra);
-            if (f0) file_close(f0);
-            if (f1) file_close(f1);
-            if (f2) file_close(f2);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
             free_kvec(kargv); free_kvec(kenvp);
             return (kreq.nextra > ABI_SPAWN_EXTRA_MAX || !kreq.extra)
                    ? -ABI_EINVAL : -ABI_ENOMEM;
@@ -5565,9 +5575,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
                            sizeof(uex[0]) * kreq.nextra) != 0) {
             kfree(uex);
             kfree(kextra);
-            if (f0) file_close(f0);
-            if (f1) file_close(f1);
-            if (f2) file_close(f2);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
             free_kvec(kargv); free_kvec(kenvp);
             return -ABI_EFAULT;
         }
@@ -5588,9 +5598,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
         if (failed) {
             for (int i = 0; i < nextra; i++) file_close(kextra[i].f);
             kfree(kextra);
-            if (f0) file_close(f0);
-            if (f1) file_close(f1);
-            if (f2) file_close(f2);
+            spawn_fd_put(f0);
+            spawn_fd_put(f1);
+            spawn_fd_put(f2);
             free_kvec(kargv); free_kvec(kenvp);
             return -ABI_EBADF;
         }
@@ -5623,7 +5633,7 @@ static long sys_spawn(const struct abi_spawn_req *req) {
             cp->ctty_kind = PROC_CTTY_NONE;
             cp->ctty_index = 0;
             cp->ctty_gen = 0;
-            int idx = (f0 && f0->kind == FILE_KIND_PTY_SLAVE)
+            int idx = (f0 && f0 != PROC_FD_CLOSED && f0->kind == FILE_KIND_PTY_SLAVE)
                     ? pty_file_index(f0) : -1;
             if (idx >= 0) (void)pty_make_ctty(cp, idx, false);
         }
@@ -5651,9 +5661,9 @@ static long sys_spawn(const struct abi_spawn_req *req) {
      * while `echo hi | /bin/cat` was fine, because a builtin writer means the
      * shell holds the only write end and closes it itself. The refcount trace
      * read: create w=1, clone w=2, clone w=3, close w=2, close w=1, stop. */
-    if (f0) file_close(f0);
-    if (f1) file_close(f1);
-    if (f2) file_close(f2);
+    spawn_fd_put(f0);
+    spawn_fd_put(f1);
+    spawn_fd_put(f2);
     if (pid < 0) return -ABI_ENOMEM;
     return pid;
 }
