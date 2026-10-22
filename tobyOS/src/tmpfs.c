@@ -108,6 +108,7 @@ struct tmpfs_node {
     size_t        size, cap;
     uint32_t      uid, gid, mode;
     uint64_t      mtime, atime;
+    uint64_t      ctime;                /* the last change (finding 224) */
     /* POSIX: unlink() removes the NAME; the file itself survives until
      * the last open handle closes. Without this, `fd = open(t); unlink(t);
      * read(fd)` -- which is how every mkstemp()/tmpfile() user, GNU bash
@@ -425,7 +426,7 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
     if (end > nd->size) nd->size = end;
     f->pos = end;
     f->size = nd->size;
-    nd->mtime = tmpfs_now_secs();
+    nd->mtime = nd->ctime = tmpfs_now_secs();
     return (long)n;
 }
 
@@ -450,7 +451,7 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
     /* the format bits too: a FIFO is a file whose mode says S_IFIFO
      * (vfs_mkfifo) */
     nd->mode = mode ? (mode & 0177777u) : 0644u;
-    nd->mtime = nd->atime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -473,7 +474,7 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     tcopy(nd->path, norm, sizeof nd->path);
     nd->uid = uid; nd->gid = gid;
     nd->mode = mode ? (mode & 07777u) : 0755u;
-    nd->mtime = nd->atime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -486,6 +487,7 @@ static void tdrop_name(struct tmpfs_mount *m, struct tmpfs_node *nm)
     if (ino != nm) {                      /* an extra name: drop just it */
         memset(nm, 0, sizeof *nm);
         if (ino->nlink) ino->nlink--;
+        ino->ctime = tmpfs_now_secs();
         if (ino->nlink == 0 && ino->open_count == 0) treap(ino);
         return;
     }
@@ -493,6 +495,7 @@ static void tdrop_name(struct tmpfs_mount *m, struct tmpfs_node *nm)
         /* Other names point here BY INDEX, so the slot has to live on --
          * but this name is gone, so hide it from lookups and readdir. */
         ino->nlink--;
+        ino->ctime = tmpfs_now_secs();
         ino->unlinked = true;
         return;
     }
@@ -558,7 +561,7 @@ static int tmpfs_symlink(void *mnt, const char *path, const char *target)
     }
     memcpy(nd->data, target, tl);
     nd->size = tl;
-    nd->mtime = nd->atime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -602,6 +605,7 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     nn->path[sizeof nn->path - 1] = '\0';
     nn->link_to = (uint32_t)tindex(m, ino) + 1u;   /* talloc moved nothing */
     ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
+    ino->ctime  = tmpfs_now_secs();      /* a new link is a change (224) */
     return VFS_OK;
 }
 
@@ -660,6 +664,7 @@ static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
     out->mode  = (nd->mode & 0177777u) | VFS_MODE_VALID;
     out->mtime = nd->mtime;
     out->atime = nd->atime;
+    out->ctime = nd->ctime;
     out->nlink = nd->nlink ? nd->nlink : 1u;
 }
 
@@ -778,6 +783,7 @@ static int tmpfs_chmod(void *mnt, const char *path, uint32_t mode)
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     nd->mode = (nd->mode & 0170000u) | (mode & 07777u);   /* keeps its type */
+    nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -790,6 +796,7 @@ static int tmpfs_chown(void *mnt, const char *path, uint32_t uid, uint32_t gid)
     if (!nd) return VFS_ERR_NOENT;
     if (uid != (uint32_t)-1) nd->uid = uid;
     if (gid != (uint32_t)-1) nd->gid = gid;
+    nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -802,6 +809,7 @@ static int tmpfs_utimes(void *mnt, const char *path, uint64_t mtime,
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     nd->mtime = mtime; nd->atime = atime;
+    nd->ctime = tmpfs_now_secs();        /* setting times is a change (224) */
     return VFS_OK;
 }
 
@@ -821,7 +829,7 @@ static int ttrunc(struct tmpfs_mount *m, struct tmpfs_node *nd, uint64_t len)
             memset(nd->data + from, 0, (size_t)len - from);
     }
     nd->size = (size_t)len;
-    nd->mtime = tmpfs_now_secs();
+    nd->mtime = nd->ctime = tmpfs_now_secs();
     return VFS_OK;
 }
 
@@ -882,6 +890,7 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     tcopy(src->path, nw, sizeof src->path);
     src->path[sizeof src->path - 1] = '\0';
     src->seq = ++m->next_seq;            /* newest where it now is (221) */
+    src->ctime = tmpfs_now_secs();       /* a rename is a change (224) */
     return VFS_OK;
 }
 
