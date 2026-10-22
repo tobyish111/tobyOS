@@ -526,6 +526,10 @@ static nd_t *parse_class(compiled_t *c, const char **pp, int icase) {
     const char *p = *pp;
     int negate = 0;
     if (*p == '^') { negate = 1; p++; }
+    /* "[" or "[^" that ends the pattern: glibc's REG_BADPAT, "Invalid
+     * regular expression" -- one with a body and no "]" is REG_EBRACK
+     * (finding 240) */
+    if (!*p) { c->err = REG_BADPAT; return 0; }
 
     nd_t *node = new_node(c);
     if (!node) return 0;
@@ -1541,20 +1545,21 @@ size_t regerror(int errcode, const regex_t *preg,
                 char *errbuf, size_t errbuf_size) {
     (void)preg;
     static const char *msgs[] = {
+        /* glibc's words, which GNU tools' messages carry (finding 240) */
         "Success",
         "No match",
-        "Invalid regex",
-        "Invalid collation",
-        "Invalid character class",
+        "Invalid regular expression",
+        "Invalid collation character",
+        "Invalid character class name",
         "Trailing backslash",
         "Invalid back reference",
-        "Unmatched [",
-        "Unmatched (",
-        "Unmatched {",
-        "Invalid range in {}",
-        "Invalid range endpoint",
-        "Out of memory",
-        "Invalid repetition",
+        "Unmatched [, [^, [:, [., or [=",
+        "Unmatched ( or \\(",
+        "Unmatched \\{",
+        "Invalid content of \\{\\}",
+        "Invalid range end",
+        "Memory exhausted",
+        "Invalid preceding regular expression",
     };
     const char *msg = (errcode >= 0 && errcode <= 13) ? msgs[errcode] : "Unknown error";
     size_t len = strlen(msg) + 1;
