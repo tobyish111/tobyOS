@@ -1375,7 +1375,10 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         (privileged). su set no supplementary
                                         groups: the target kept the caller's
                                         (finding 203) */
-#define ABI_SYS_NR_MAX          233
+#define ABI_SYS_GETRGID         234  /* () -> the caller's REAL gid, as
+                                        GETRUID is the real uid: libtoby's
+                                        getgid() (finding 206) */
+#define ABI_SYS_NR_MAX          234
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

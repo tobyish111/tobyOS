@@ -6605,9 +6605,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sock_setopt(f->sock, (int)a2, (long)a3);
     }
 
-    case ABI_SYS_GETRUID: {
+    case ABI_SYS_GETRUID: {             /* as the namespace sees it, as GETUID */
         struct proc *p = current_proc();
-        return p ? (long)p->ruid : 0;
+        return p ? (long)userns_cur_uid(p->ruid) : 0;
+    }
+    case ABI_SYS_GETRGID: {             /* finding 206: getgid()'s real gid */
+        struct proc *p = current_proc();
+        return p ? (long)userns_cur_gid(p->rgid) : 0;
     }
 
     case ABI_SYS_TIMES: {
@@ -15193,9 +15197,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     }
     case LX_getppid: return do_syscall(SYS_GETPPID, 0, 0, 0, 0, 0);
     case LX_gettid:  return do_syscall(ABI_SYS_GETTID, 0, 0, 0, 0, 0);
-    case LX_getuid:
+    /* the REAL ids for getuid/getgid (finding 206): they said the
+     * effective ones, as geteuid/getegid do */
+    case LX_getuid:  return do_syscall(ABI_SYS_GETRUID, 0, 0, 0, 0, 0);
     case LX_geteuid: return do_syscall(SYS_GETUID, 0, 0, 0, 0, 0);
-    case LX_getgid:
+    case LX_getgid:  return do_syscall(ABI_SYS_GETRGID, 0, 0, 0, 0, 0);
     case LX_getegid: return do_syscall(SYS_GETGID, 0, 0, 0, 0, 0);
 
     /* setfsuid/setfsgid: tobyOS has a single (root) identity, so there is no

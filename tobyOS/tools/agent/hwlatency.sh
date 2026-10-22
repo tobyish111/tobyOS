@@ -39,7 +39,7 @@ fi
 # after each sync; an Intel RTC's write restarts its divider, so the two
 # agree to milliseconds -- hwclock prints the RTC's time at its own start,
 # a few ms after date's). The mark is a second.
-r=$(bash logs/edremote.sh 'd=$(date -u +%s.%N); h=$(sudo -n hwclock -r --utc); echo "$d|$h"' 2>/dev/null | tr -d '\r')
+r=$(ED_USER=root bash logs/edremote.sh 'd=$(date -u +%s.%N); h=$(hwclock -r --utc); echo "$d|$h"' 2>/dev/null | tr -d '\r')
 hr=$(date -d "${r#*|}" +%s.%N 2>/dev/null)
 dm=$(awk -v a="$hr" -v b="${r%%|*}" 'BEGIN { if (a == "" || b == "") exit; d = (a - b) * 1000; if (d < 0) d = -d; printf "%d", d }')
 if [ -n "$dm" ] && [ "$dm" -le 1000 ]; then

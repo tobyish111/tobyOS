@@ -461,9 +461,13 @@ ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
 
 /* ---- getuid / geteuid / getgid / getegid ------------------------ */
 
-uid_t getuid(void)  { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
+/* THE REAL IDS for getuid/getgid, the effective for geteuid/getegid
+ * (finding 206): all four said the effective ones, so a setuid-root
+ * program could not tell who ran it -- sudo, asking getuid(), let anyone
+ * be root. */
+uid_t getuid(void)  { return (uid_t)toby_sc0(ABI_SYS_GETRUID); }
 uid_t geteuid(void) { return (uid_t)toby_sc0(ABI_SYS_GETUID); }
-gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
+gid_t getgid(void)  { return (gid_t)toby_sc0(ABI_SYS_GETRGID); }
 gid_t getegid(void) { return (gid_t)toby_sc0(ABI_SYS_GETGID); }
 
 /* Slice 14: the native ABI could READ identity but never change it, which is why

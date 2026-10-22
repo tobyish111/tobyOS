@@ -918,19 +918,21 @@ echo @@setuid_spawn
 # execve. It was execve-only until 2026-09-06, so `sudo` worked under
 # `busybox sh -c` (fork+execve) and was dead from tsh -- found on hardware,
 # invisible here because every gate runs as ROOT and root never needs the bit.
-# A setuid-root copy of logname needs no password: it prints the name for the
-# EFFECTIVE uid, so it says "root" exactly when the transition happened.
-# the copy MUST keep the name `logname`: user_moreutils is a multicall
-# binary and dispatches on basename(argv[0]).
+# A setuid-root copy of whoami needs no password: it prints the name of the
+# EFFECTIVE user, so it says "root" exactly when the transition happened.
+# (It was logname, which said so only while getuid returned the effective
+# uid -- batch 32, finding 206; logname is the login's name.) The copy MUST
+# keep the name `whoami`: user_shellutils is a multicall binary and
+# dispatches on basename(argv[0]).
 mkdir -p /tmp/sid
-cp /bin/logname /tmp/sid/logname
-chown 0:0 /tmp/sid/logname 2>/dev/null
-chmod 4755 /tmp/sid/logname
+cp /bin/whoami /tmp/sid/whoami
+chown 0:0 /tmp/sid/whoami 2>/dev/null
+chmod 4755 /tmp/sid/whoami
 # mode AND numeric owner: the transition sets the effective uid to the FILE
 # OWNER, so a copy owned by anyone but root proves nothing.
-ls -ln /tmp/sid/logname | tr -s " " | cut -d" " -f1,3,4
-sudo -u pcall /tmp/sid/logname
-sudo -u pcall tsh -c /tmp/sid/logname
+ls -ln /tmp/sid/whoami | tr -s " " | cut -d" " -f1,3,4
+sudo -u pcall /tmp/sid/whoami
+sudo -u pcall tsh -c /tmp/sid/whoami
 
 echo @@arc_ar
 cd /tmp && printf 'aaa\n' > a.txt && printf 'bbbbbb\n' > b.txt && printf 'c\n' > a-very-long-member-name.txt

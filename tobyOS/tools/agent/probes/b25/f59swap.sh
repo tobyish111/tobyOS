@@ -10,7 +10,7 @@ for try in 1 2 3; do
     [ "$got" = "$want" ] && break
 done
 [ "$got" = "$want" ] || { echo "no intact upload; not swapping"; exit 1; }
-bash logs/edremote.sh 'sudo -n cp /tmp/tsh.new /bin/tsh && sudo -n chmod 755 /bin/tsh && echo swapped' 2>&1 | tr -d '\r'
+ED_USER=root bash logs/edremote.sh 'cp /tmp/tsh.new /bin/tsh && chmod 755 /bin/tsh && echo swapped' 2>&1 | tr -d '\r'
 head -c 3000 /dev/urandom > /c/t/b25/small.bin
 sw=$(md5sum < /c/t/b25/small.bin | cut -c1-32)
 for i in $(seq 1 12); do
@@ -19,5 +19,5 @@ for i in $(seq 1 12); do
     rc=$?
     g=$(bash logs/edremote.sh "md5sum < /tmp/up$i; wc -c < /tmp/up$i" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
     t1=$(date +%s.%N)
-    echo "upload $i rc=$rc: $g $( [ "${g:0:32}" = "$sw" ] && echo OK || echo BAD) ($(echo "$t1 - $t0" | bc)s)"
+    echo "upload $i rc=$rc: $g $( [ "${g:0:32}" = "$sw" ] && echo OK || echo BAD) ($(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.2f", b - a }')s)"
 done

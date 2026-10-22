@@ -313,6 +313,13 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* THE TARGET'S OWN SUPPLEMENTARY GROUPS, as sudo's policy sets them
+     * (initgroups): the command kept the invoker's (findings 203, 206) */
+    if (initgroups(target, (gid_t)tgid) != 0) {
+        fprintf(stderr, "sudo: unable to set supplementary group IDs: %s\n",
+                strerror(errno));
+        return 1;
+    }
     /* GID FIRST. setuid() drops the ability to call setgid(), so doing it
      * the other way round leaves the process running with the invoker's
      * group -- privilege that was supposed to change and did not. */
