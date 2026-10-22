@@ -239,8 +239,24 @@ static inline void invlpg(uint64_t addr) {
 static uint64_t g_pf_total;
 uint64_t page_fault_total(void) { return g_pf_total; }
 
+static bool page_fault_resolve(uint64_t fault_addr, uint64_t error_code,
+                               struct proc *p, bool *major);
+
+/* Each fault resolved is the faulting thread's to count, a swap-in a major
+ * one (finding 205: /proc/PID/stat, getrusage and wait4 said 0). */
 bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
                         struct proc *p) {
+    bool major = false;
+    bool ok = page_fault_resolve(fault_addr, error_code, p, &major);
+    if (ok && p) {
+        if (major) p->maj_flt++;
+        else p->min_flt++;
+    }
+    return ok;
+}
+
+static bool page_fault_resolve(uint64_t fault_addr, uint64_t error_code,
+                               struct proc *p, bool *major) {
     g_pf_total++;
     if (!p) return false;
 
@@ -325,6 +341,7 @@ bool page_fault_handler(uint64_t fault_addr, uint64_t error_code,
                 page_ref_inc(new_phys);
                 invlpg(page_va);
                 g_swapin_count++;
+                *major = true;
                 return true;
             }
             /* Page did not come back -- do not keep the charge. */

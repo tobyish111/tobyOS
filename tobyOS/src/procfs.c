@@ -1287,10 +1287,15 @@ static int gen_pid_stat(int pid, char *buf, size_t cap) {
             APPEND_STR(" "); APPEND_INT(tpgid);                          /*  8 tpgid */
         }
         APPEND_STR(" 0");                    /*  9 flags       */
-        APPEND_STR(" 0");                    /* 10 minflt      */
-        APPEND_STR(" 0");                    /* 11 cminflt     */
-        APPEND_STR(" 0");                    /* 12 majflt      */
-        APPEND_STR(" 0");                    /* 13 cmajflt     */
+        {   /* the thread's own for a task, else the group's (finding 205) */
+            uint64_t mnf, mjf;
+            if (p->is_thread) { mnf = p->min_flt; mjf = p->maj_flt; }
+            else proc_group_faults(p, &mnf, &mjf);
+            APPEND_STR(" "); APPEND_INT((int64_t)mnf);         /* 10 minflt  */
+            APPEND_STR(" "); APPEND_INT((int64_t)p->cmin_flt); /* 11 cminflt */
+            APPEND_STR(" "); APPEND_INT((int64_t)mjf);         /* 12 majflt  */
+            APPEND_STR(" "); APPEND_INT((int64_t)p->cmaj_flt); /* 13 cmajflt */
+        }
         APPEND_STR(" "); APPEND_INT(hz100);  /* 14 utime       */
         APPEND_STR(" "); APPEND_INT(st100);  /* 15 stime       */
         APPEND_STR(" "); APPEND_INT(cut100); /* 16 cutime      */

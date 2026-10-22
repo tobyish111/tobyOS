@@ -794,6 +794,13 @@ struct proc {
      * the times of this thread group's members that have gone. ns. */
     uint64_t        cutime_ns, cstime_ns;
     uint64_t        tg_dead_utime_ns, tg_dead_stime_ns;
+    /* Page faults (finding 205): this thread's, minor (resolved from
+     * memory) and major (a swap-in); the gone threads' of this group; and
+     * the reaped children's, theirs included -- Linux's min_flt, maj_flt
+     * and cmin_flt, cmaj_flt. */
+    uint64_t        min_flt, maj_flt;
+    uint64_t        tg_dead_min_flt, tg_dead_maj_flt;
+    uint64_t        cmin_flt, cmaj_flt;
     uint64_t        syscall_count;
     uint64_t        created_ns;
     uint64_t        user_pages;
@@ -834,6 +841,8 @@ struct proc_exit_info {
     /* The child's user and system time, its own reaped children's added --
      * what wait4 reports in its rusage (Linux: getrusage RUSAGE_BOTH). */
     uint64_t utime_ns, stime_ns;
+    /* ...and its page faults, its children's added (finding 205) */
+    uint64_t min_flt, maj_flt;
     uint64_t syscall_count;
     uint64_t wall_ns;       /* perf_now_ns() delta from proc_wait_info() call */
     char     name[PROC_NAME_MAX];
@@ -843,6 +852,9 @@ struct proc_exit_info {
  * right before the child is reaped. out may be NULL (then it's a
  * plain proc_wait). Returns exit_code or -1. */
 int proc_wait_info(int pid, struct proc_exit_info *out);
+
+/* A thread group's page faults, its gone threads' included (finding 205). */
+void proc_group_faults(const struct proc *p, uint64_t *minf, uint64_t *majf);
 
 /* One proc's user and system time in ns (cpu_ns split by its tick ratio;
  * the slice it is running now included when it is the caller). */

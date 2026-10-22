@@ -13613,16 +13613,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* struct rusage: two timevals (ru_utime, ru_stime) then 14 longs. */
         struct { long us, uu, ss, su; long rest[14]; } ru;
         struct proc *rp = current_proc();
-        uint64_t un = 0, sn = 0;
+        uint64_t un = 0, sn = 0, mnf = 0, mjf = 0;
         long who = (long)(int)a1;
         if (rp) {
-            if (who == 0) proc_group_cputimes(rp, &un, &sn);       /* SELF */
-            else if (who == -1) { un = rp->cutime_ns; sn = rp->cstime_ns; }
-            else if (who == 1) proc_cputimes(rp, &un, &sn);       /* THREAD */
-            else return -ABI_EINVAL;
+            if (who == 0) {                                          /* SELF */
+                proc_group_cputimes(rp, &un, &sn);
+                proc_group_faults(rp, &mnf, &mjf);
+            } else if (who == -1) {                              /* CHILDREN */
+                un = rp->cutime_ns; sn = rp->cstime_ns;
+                mnf = rp->cmin_flt; mjf = rp->cmaj_flt;
+            } else if (who == 1) {                                 /* THREAD */
+                proc_cputimes(rp, &un, &sn);
+                mnf = rp->min_flt; mjf = rp->maj_flt;
+            } else return -ABI_EINVAL;
         }
         for (unsigned i = 0; i < sizeof(ru.rest)/sizeof(ru.rest[0]); i++)
             ru.rest[i] = 0;
+        ru.rest[4] = (long)mnf;              /* ru_minflt (finding 205) */
+        ru.rest[5] = (long)mjf;              /* ru_majflt */
         ru.us = (long)(un / 1000000000ull);
         ru.uu = (long)((un % 1000000000ull) / 1000ull);
         ru.ss = (long)(sn / 1000000000ull);
@@ -14788,6 +14796,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             ru.uu = (long)((xi.utime_ns % 1000000000ull) / 1000ull);
             ru.ss = (long)(xi.stime_ns / 1000000000ull);
             ru.su = (long)((xi.stime_ns % 1000000000ull) / 1000ull);
+            ru.rest[4] = (long)xi.min_flt;   /* ru_minflt (finding 205) */
+            ru.rest[5] = (long)xi.maj_flt;   /* ru_majflt */
             if (copy_to_user((void *)a4, &ru, sizeof ru) != 0)
                 return -ABI_EFAULT;
         }

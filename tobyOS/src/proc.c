@@ -2166,6 +2166,20 @@ void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
     *ut = total - sys;
 }
 
+void proc_group_faults(const struct proc *p, uint64_t *minf, uint64_t *majf) {
+    uint64_t mn = p->tg_dead_min_flt, mj = p->tg_dead_maj_flt;
+    int tgid = p->tgid ? p->tgid : p->pid;
+    for (int i = 0; i < PROC_MAX; i++) {
+        const struct proc *q = &g_proc[i];
+        if (q->state == PROC_UNUSED || q->state == PROC_EMBRYO) continue;
+        if (q != p && (q->tgid ? q->tgid : q->pid) != tgid) continue;
+        mn += q->min_flt;
+        mj += q->maj_flt;
+    }
+    *minf = mn;
+    *majf = mj;
+}
+
 void proc_group_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
     uint64_t u = p->tg_dead_utime_ns, s = p->tg_dead_stime_ns;
     int tgid = p->tgid ? p->tgid : p->pid;
@@ -2192,6 +2206,8 @@ static void proc_fold_thread_times(struct proc *t) {
     proc_cputimes(t, &u, &s);
     l->tg_dead_utime_ns += u;
     l->tg_dead_stime_ns += s;
+    l->tg_dead_min_flt += t->min_flt;            /* finding 205 */
+    l->tg_dead_maj_flt += t->maj_flt;
 }
 
 /* A reaped process's times, its group's and its own reaped children's, go
@@ -2207,6 +2223,10 @@ static void proc_reap_account(struct proc *p) {
     if (!par || par == p || par->state == PROC_UNUSED) return;
     par->cutime_ns += u + p->cutime_ns;
     par->cstime_ns += s + p->cstime_ns;
+    uint64_t mn, mj;                             /* finding 205 */
+    proc_group_faults(p, &mn, &mj);
+    par->cmin_flt += mn + p->cmin_flt;
+    par->cmaj_flt += mj + p->cmaj_flt;
 }
 
 static void proc_reap(struct proc *p) {
@@ -2425,6 +2445,10 @@ int proc_wait_info(int pid, struct proc_exit_info *out) {
             proc_group_cputimes(child, &u, &s);
             out->utime_ns = u + child->cutime_ns;
             out->stime_ns = s + child->cstime_ns;
+            uint64_t mn, mj;                     /* finding 205 */
+            proc_group_faults(child, &mn, &mj);
+            out->min_flt = mn + child->cmin_flt;
+            out->maj_flt = mj + child->cmaj_flt;
         }
         out->syscall_count = child->syscall_count;
         out->wall_ns       = perf_now_ns() - wait_start_ns;
