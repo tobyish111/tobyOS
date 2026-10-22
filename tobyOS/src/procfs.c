@@ -672,7 +672,7 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         APPEND_STR(tmp); \
     } while (0)
 
-    { char cm[16]; APPEND_STR("Name:   "); APPEND_STR(proc_comm(p, cm, sizeof cm)); APPEND_STR("\n"); }
+    { char cm[16]; APPEND_STR("Name:\t"); APPEND_STR(proc_comm(p, cm, sizeof cm)); APPEND_STR("\n"); }
     /* Linux's words, as its /proc/PID/status gives them: "T (stopped)",
      * not the scheduler's "STOPPED" -- a script reading the state letter
      * read S for stopped and B for asleep (logs/b15 stopw). */
@@ -685,7 +685,7 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
         case PROC_TERMINATED: sn = "Z (zombie)"; break;
         default: break;
         }
-        APPEND_STR("State:  "); APPEND_STR(sn); APPEND_STR("\n");
+        APPEND_STR("State:\t"); APPEND_STR(sn); APPEND_STR("\n");
     }
     /* Slice 10: report pids as the READER numbers them, not as the kernel
      * stores them. A process inside a pid namespace reading /proc must see its
@@ -697,12 +697,12 @@ static int gen_pid_status(int pid, char *buf, size_t cap) {
      * absent until now. For a thread it is the leader's (translated) pid. */
     {   int tg = p->is_thread ? p->tgid : p->pid;
         struct proc *ld = proc_lookup(tg);
-        APPEND_STR("Tgid:   "); APPEND_INT(ld ? pid_vnr(ld) : tg);
+        APPEND_STR("Tgid:\t"); APPEND_INT(ld ? pid_vnr(ld) : tg);
         APPEND_STR("\n");
     }
-    APPEND_STR("Pid:    "); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
+    APPEND_STR("Pid:\t"); APPEND_INT(pid_vnr(p));            APPEND_STR("\n");
     /* An orphan (PROC_PPID_ORPHAN) reads as a child of 1, as in Linux. */
-    APPEND_STR("PPid:   ");
+    APPEND_STR("PPid:\t");
     APPEND_INT(p->ppid < 0 ? 1 : pid_vnr_of_kpid(p->ppid));
     APPEND_STR("\n");
     /* VmSize/VmRSS in kB from the maintained user-page counter (real since
@@ -1640,6 +1640,10 @@ static int procfs_close(struct vfs_file *f) {
 static long procfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct procfs_handle *h = f->priv;
     if (!h) return VFS_ERR_INVAL;
+    /* at the FILE's position, which lseek moves (finding 220): the handle's
+     * own cursor did not follow a seek, so bash's `read` -- a chunk, then a
+     * seek back past the line -- saw the first line of a file only */
+    h->pos = f->pos;
     if (h->pos >= h->len) return 0;
     size_t avail = h->len - h->pos;
     if (n > avail) n = avail;

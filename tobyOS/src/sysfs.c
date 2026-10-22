@@ -916,6 +916,7 @@ static int sysfs_close(struct vfs_file *f) {
 static long sysfs_read(struct vfs_file *f, void *buf, size_t n) {
     struct sysfs_file_priv *priv = f->priv;
     if (!priv || !priv->src) return 0;
+    priv->pos = f->pos;              /* the file's, which lseek moves (220) */
     if (priv->pos >= priv->len) return 0;
     size_t avail = priv->len - priv->pos;
     if (n > avail) n = avail;
