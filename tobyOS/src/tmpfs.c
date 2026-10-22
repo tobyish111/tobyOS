@@ -909,7 +909,7 @@ static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
     out->files      = m->max_nodes;
     out->ffree      = m->max_nodes - files;
     out->type_magic = 0x01021994;           /* TMPFS_MAGIC */
-    out->namelen    = VFS_PATH_MAX - 1;
+    out->namelen    = VFS_NAME_MAX - 1;     /* Linux's 255, not the path limit */
     return VFS_OK;
 }
 

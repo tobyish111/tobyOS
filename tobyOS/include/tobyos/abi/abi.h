@@ -73,8 +73,9 @@ extern "C" {
  *  Numeric limits
  * ============================================================ */
 
-/* Maximum path length passed across a syscall (incl. trailing NUL). */
-#define ABI_PATH_MAX        256
+/* Maximum path length passed across a syscall (incl. trailing NUL):
+ * Linux's PATH_MAX (finding 227; it was 256). */
+#define ABI_PATH_MAX        4096
 
 /* Maximum read/write request size honoured by the kernel per call.
  * Larger requests are silently clipped to this. */

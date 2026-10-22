@@ -64,7 +64,7 @@ static volatile uint32_t g_aps_online_count;
 /* Stack size per AP. 16 KiB matches the BSP's interrupt stack -- plenty
  * for "print one line and halt", and gives us headroom for any exception
  * dump if something goes wrong. */
-#define AP_STACK_SIZE (16u * 1024u)
+#define AP_STACK_SIZE (64u * 1024u)    /* 16 KiB before finding 227's 4096-byte paths */
 
 const struct percpu *smp_cpu(uint32_t idx) {
     return idx < g_cpu_count ? &g_percpu[idx] : 0;

@@ -687,16 +687,71 @@ static bool build_user_stack(struct proc *p, size_t pages) {
     return true;
 }
 
+/* ---- kernel stacks (finding 227) ----
+ * At PROC_KSTACK_SZ = 128 KiB a stack is one of the heap's large
+ * allocations, which get a private arena whose virtual range is never
+ * reused once freed (heap.c); a fork-heavy box would walk the heap window.
+ * So a freed stack goes on this list, still mapped, for the next fork. A
+ * stack beyond the list's room is freed as before.
+ *
+ * A stack handed out is all zeros: a fresh one is zeroed, and a returned
+ * one has its used part zeroed before it is listed. So when it comes back,
+ * the first non-zero word from the bottom marks how deep it was used. The
+ * deepest seen is printed when it grows, as Linux's CONFIG_DEBUG_STACK_USAGE
+ * prints its "greatest stack depth". */
+#define KSTACK_CACHE_MAX 256
+static void      *g_kstack_cache[KSTACK_CACHE_MAX];
+static int        g_kstack_cached;
+static size_t     g_kstack_deepest;
+static spinlock_t g_kstack_lock = SPINLOCK_INIT;
+
+void *proc_kstack_alloc(void) {
+    void *base = 0;
+    uint64_t fl = spin_lock_irqsave(&g_kstack_lock);
+    if (g_kstack_cached > 0) base = g_kstack_cache[--g_kstack_cached];
+    spin_unlock_irqrestore(&g_kstack_lock, fl);
+    if (base) return base;                 /* zeroed when it was listed */
+    base = kmalloc(PROC_KSTACK_SZ);
+    if (base) memset(base, 0, PROC_KSTACK_SZ);
+    return base;
+}
+
+void proc_kstack_free(struct proc *p) {
+    void *base = p->kstack_base;
+    p->kstack_base = 0;
+    p->kstack_top  = 0;
+    if (!base) return;
+
+    uint64_t *w = (uint64_t *)base;
+    size_t n = PROC_KSTACK_SZ / sizeof(uint64_t), low = 0;
+    while (low < n && w[low] == 0) low++;
+    size_t used = (n - low) * sizeof(uint64_t);
+    memset(w + low, 0, used);              /* all zeros again */
+
+    bool deeper = false, listed = false;
+    uint64_t fl = spin_lock_irqsave(&g_kstack_lock);
+    if (used > g_kstack_deepest) { g_kstack_deepest = used; deeper = true; }
+    if (g_kstack_cached < KSTACK_CACHE_MAX) {
+        g_kstack_cache[g_kstack_cached++] = base;
+        listed = true;
+    }
+    spin_unlock_irqrestore(&g_kstack_lock, fl);
+    if (!listed) kfree(base);
+    if (deeper)
+        kprintf("[kstack] %s (pid %d) used greatest stack depth: %lu of %lu bytes\n",
+                p->name, p->pid, (unsigned long)used,
+                (unsigned long)PROC_KSTACK_SZ);
+}
+
 /* Allocate + prime a kernel stack. Returns base on success (so the
  * reaper can free it). Initial layout makes the first context_switch
  * land at proc_first_user_entry. */
 static bool build_kstack(struct proc *p) {
-    void *base = kmalloc(PROC_KSTACK_SZ);
+    void *base = proc_kstack_alloc();
     if (!base) {
         kprintf("[proc] OOM allocating kstack (%d bytes)\n", PROC_KSTACK_SZ);
         return false;
     }
-    memset(base, 0, PROC_KSTACK_SZ);
     p->kstack_base = base;
     p->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
 
@@ -1872,9 +1927,7 @@ __attribute__((noreturn)) void proc_exit_group(int code) {
                 continue;      /* leak beats freeing a live thread's stack */
             }
             if (q->is_thread) {
-                if (q->kstack_base) kfree(q->kstack_base);
-                q->kstack_base = 0;
-                q->kstack_top  = 0;
+                proc_kstack_free(q);
                 /* Slice 8: this path frees the slot WITHOUT going through
                  * proc_reap, so it owes the namespace release itself -- a
                  * thread holds its own reference (sys_clone_thread takes one). */
@@ -1963,9 +2016,7 @@ void proc_reap_group_threads(struct proc *p, int code) {
                 continue;
             }
             /* Free the thread's kernel stack */
-            if (q->kstack_base) kfree(q->kstack_base);
-            q->kstack_base = 0;
-            q->kstack_top  = 0;
+            proc_kstack_free(q);
             nsproxy_release(q);       /* slice 8 -- bypasses proc_reap */
             proc_fold_thread_times(q);
             q->state = PROC_UNUSED;
@@ -2361,9 +2412,7 @@ static void proc_reap(struct proc *p) {
             mmap_cleanup_proc(proc_mm_pid(p));
         }
     }
-    if (p->kstack_base) {
-        kfree(p->kstack_base);
-    }
+    proc_kstack_free(p);
 
     /* Slice 8: drop this process's namespace references. Must happen before
      * the memset below, which would otherwise lose the pointers and leak the

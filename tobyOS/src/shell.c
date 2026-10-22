@@ -1647,10 +1647,24 @@ static void shell_putc(char c) {
 void shell_printf(const char *fmt, ...) {
     char buf[512];
 
-    va_list ap;
+    va_list ap, ap2;
     va_start(ap, fmt);
-    kvsnprintf(buf, sizeof(buf), fmt, ap);
+    va_copy(ap2, ap);
+    int n = kvsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    /* Longer than the buffer: formatted again into one that fits. It was
+     * cut at 511 bytes -- `pwd` in a 3769-byte directory (finding 227). */
+    if (n >= (int)sizeof(buf)) {
+        char *big = (char *)kmalloc((size_t)n + 1);
+        if (big) {
+            kvsnprintf(big, (size_t)n + 1, fmt, ap2);
+            va_end(ap2);
+            shell_write(big);
+            kfree(big);
+            return;
+        }
+    }
+    va_end(ap2);
 
     shell_write(buf);
 }

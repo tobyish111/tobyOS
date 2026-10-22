@@ -90,7 +90,7 @@ int thread_create(uint64_t entry, uint64_t arg,
     t->owns_pml4 = false;  /* thread never frees the PML4 */
 
     /* Allocate a kernel stack for this thread */
-    t->kstack_base = kmalloc(PROC_KSTACK_SZ);
+    t->kstack_base = proc_kstack_alloc();
     if (!t->kstack_base) {
         t->state = PROC_UNUSED;
         return -1;
@@ -291,9 +291,7 @@ static void thread_reap_detached(struct proc *leader) {
         if (q->state != PROC_TERMINATED || !q->detached) continue;
         sched_dequeue(q);
         proc_wait_off_cpu(q);          /* yields if we hold the BKL */
-        if (q->kstack_base) kfree(q->kstack_base);
-        q->kstack_base = 0;
-        q->kstack_top  = 0;
+        proc_kstack_free(q);
         q->state = PROC_UNUSED;
     }
 }
@@ -322,9 +320,7 @@ int thread_join(int tid, int *out_code) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
         /* Free kernel stack */
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
         return 0;
     }
@@ -344,9 +340,7 @@ int thread_join(int tid, int *out_code) {
     if (target->state == PROC_TERMINATED) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
     }
 
@@ -368,9 +362,7 @@ int thread_detach(int tid) {
     if (target->state == PROC_TERMINATED) {
         sched_dequeue(target);
         proc_wait_off_cpu(target);
-        if (target->kstack_base) kfree(target->kstack_base);
-        target->kstack_base = 0;
-        target->kstack_top  = 0;
+        proc_kstack_free(target);
         target->state = PROC_UNUSED;
     }
     return 0;

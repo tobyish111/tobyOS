@@ -54,7 +54,19 @@
                                        * out -> clone ENOMEM -> pthread_create
                                        * EAGAIN -> NULL thread handle. */
 #define PROC_NAME_MAX   32
-#define PROC_KSTACK_SZ  (32 * 1024)   /* per-process kernel stack: 32 KiB */
+/* per-process kernel stack: 128 KiB. It was 32, which a syscall's deepest
+ * chain overran once a path buffer was Linux's 4096 bytes (finding 227). */
+#define PROC_KSTACK_SZ  (128 * 1024)
+
+struct proc;
+struct file;
+/* A spawned child's fd 0, 1 or 2 left closed (ABI_SPAWN_FD_CLOSED); a
+ * marker, never a file -- NULL already means the console. */
+#define PROC_FD_CLOSED ((struct file *)1)
+/* A kernel stack of PROC_KSTACK_SZ, zeroed (0 when out of memory), and its
+ * return: proc_kstack_free frees p's and clears kstack_base/kstack_top. */
+void *proc_kstack_alloc(void);
+void  proc_kstack_free(struct proc *p);
 #define PROC_NFDS       1024          /* per-proc file descriptor table size.
                                        * Must match the RLIMIT_NOFILE we report
                                        * (syscall.c) -- Chromium+Mojo+threads

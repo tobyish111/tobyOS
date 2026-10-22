@@ -178,9 +178,8 @@ static __attribute__((noreturn)) void fork_child_entry(void) {
 }
 
 static bool build_fork_kstack(struct proc *child) {
-    void *base = kmalloc(PROC_KSTACK_SZ);
+    void *base = proc_kstack_alloc();      /* zeroed */
     if (!base) return false;
-    memset(base, 0, PROC_KSTACK_SZ);
     child->kstack_base = base;
     child->kstack_top  = (uint8_t *)base + PROC_KSTACK_SZ;
 

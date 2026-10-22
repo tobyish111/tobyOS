@@ -31,8 +31,11 @@
 
 #include <tobyos/types.h>
 
-#define VFS_NAME_MAX 128
-#define VFS_PATH_MAX 256
+/* Linux's limits (finding 227): a name of up to 255 bytes, a path of up
+ * to 4095, each with its NUL. They were 128 and 256: a long path was
+ * ENAMETOOLONG where Linux takes it (tar's, pathchk's, ln's fixtures). */
+#define VFS_NAME_MAX 256
+#define VFS_PATH_MAX 4096
 /* M23D: bumped from 4 -> 8. We can simultaneously hold:
  *   /          ramfs (initrd)
  *   /data      tobyfs (GPT slot 2)

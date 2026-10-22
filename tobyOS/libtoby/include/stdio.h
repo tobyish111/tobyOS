@@ -27,7 +27,7 @@ extern "C" {
 
 #define EOF             (-1)
 #define BUFSIZ          4096
-#define FILENAME_MAX    256
+#define FILENAME_MAX    4096   /* glibc's: Linux's PATH_MAX (finding 227) */
 #define FOPEN_MAX       16
 
 typedef struct __libtoby_FILE FILE;

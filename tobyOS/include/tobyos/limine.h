@@ -16,6 +16,21 @@
 
 /* ---- Memory-map ---- */
 
+/* The boot CPU's stack size (Limine's default is 64 KiB). */
+#define LIMINE_STACK_SIZE_REQUEST \
+    { LIMINE_COMMON_MAGIC, 0x224ef0460a8e8926, 0xe1cb0fc25f46ea3d }
+
+struct limine_stack_size_response {
+    uint64_t revision;
+};
+
+struct limine_stack_size_request {
+    uint64_t id[4];
+    uint64_t revision;
+    struct limine_stack_size_response *response;
+    uint64_t stack_size;
+};
+
 #define LIMINE_MEMMAP_REQUEST \
     { LIMINE_COMMON_MAGIC, 0x67cf3d9d378a806f, 0xe304acdfc50c3c62 }
 

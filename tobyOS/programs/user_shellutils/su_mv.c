@@ -230,6 +230,13 @@ static int mvx_move(const struct mvx_opts *o, const char *src_arg, const char *d
     }
     /* an empty DEST is looked at as GNU looks at it: as "." */
     int dexists = lstat(*dst ? dst : ".", &dl) == 0;
+    /* a DEST that cannot be looked at -- a name too long, a file on the
+     * way to it, a directory not searchable -- is "cannot stat", as GNU's
+     * copy answers a stat failing other than ENOENT (finding 227) */
+    if (!dexists && errno != ENOENT && !o->exchange) {
+        su_error(0, errno, "cannot stat %s", su_quoteaf(dst));
+        goto out;
+    }
 
     if (o->exchange) {
         if (!dexists) {

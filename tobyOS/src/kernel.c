@@ -375,6 +375,17 @@ static volatile struct limine_memmap_request memmap_req = {
     .response = 0
 };
 
+/* The boot CPU's stack: 1 MiB. Boot runs self-tests and package work
+ * with 20-25 KiB frames once paths are Linux's 4096 bytes (finding 227);
+ * Limine's default is 64 KiB. */
+__attribute__((used, section(".limine_reqs")))
+volatile struct limine_stack_size_request stack_req = {
+    .id         = LIMINE_STACK_SIZE_REQUEST,
+    .revision   = 0,
+    .response   = 0,
+    .stack_size = 1024 * 1024
+};
+
 __attribute__((used, section(".limine_reqs")))
 static volatile struct limine_hhdm_request hhdm_req = {
     .id       = LIMINE_HHDM_REQUEST,

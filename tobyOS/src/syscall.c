@@ -228,6 +228,19 @@ static bool user_str_in(char *ks, size_t cap, const char *us) {
     return true;
 }
 
+/* A path string of the caller's that is not looked up -- a symbolic link's
+ * target -- into KS, of ABI_PATH_MAX + 1 bytes: 0, -EFAULT, or
+ * -ENAMETOOLONG for one of PATH_MAX bytes or more, as Linux's getname
+ * answers (finding 227: the native symlink said EFAULT, and the Linux one
+ * cut the target short and made the link). */
+static int user_path_in(char *ks, const char *us) {
+    if (!us) return -ABI_EFAULT;
+    long n = strncpy_from_user(ks, us, ABI_PATH_MAX + 1);
+    if (n < 0) return -ABI_EFAULT;
+    if ((size_t)n >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+    return 0;
+}
+
 /* Translate a VFS_ERR_* code into the ABI errno userspace expects.
  *
  * The two numbering schemes are unrelated, and read()/write() were returning
@@ -2512,15 +2525,98 @@ static int resolve_links_searched(char *kpath, size_t cap, size_t from,
     return 0;
 }
 
+/* A name longer than 255 bytes in PATH: ENAMETOOLONG, as Linux's
+ * filesystems answer it -- to a lookup as to a creation. tmpfs keeps
+ * whole names, so one was made, and listed cut short (finding 227). */
+static bool path_name_too_long(const char *path) {
+    for (const char *s = path; *s; ) {
+        while (*s == '/') s++;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        if ((size_t)(e - s) > VFS_NAME_MAX - 1) return true;
+        s = e;
+    }
+    return false;
+}
+
+/* WHAT LINUX'S WALK OF UP MEETS FIRST, for a path with a name longer than
+ * 255 bytes or one too long to join to where it starts. Linux looks the
+ * names up in order, so a name on the way that is missing, not a directory
+ * or not searchable stops it there -- `nosuch/<256 bytes>` is ENOENT, and
+ * GNU pathchk tells the cases apart by it -- and only a walk that reaches
+ * the long name, or runs past PATH_MAX, is ENAMETOOLONG (finding 227).
+ * BASE: the kernel path a relative UP starts from (0: the cwd). */
+static int walk_first_error(const char *base, const char *up) {
+    struct proc *cp = current_proc();
+    const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+    size_t rl = strlen(root), bl;
+    char buf[ABI_PATH_MAX];
+    if (rl >= sizeof buf) return -ABI_ENAMETOOLONG;
+    memcpy(buf, root, rl);
+    bl = rl;
+    if (up[0] != '/') {
+        const char *from = base;
+        size_t skip = 0;
+        if (!from) from = (cp && cp->cwd[0]) ? cp->cwd : "/";
+        else skip = rl;                    /* a kernel path holds the root */
+        size_t fl = strlen(from);
+        while (fl > skip && from[fl - 1] == '/') fl--;
+        if (fl < skip) fl = skip;
+        if (bl + fl - skip >= sizeof buf) return -ABI_ENAMETOOLONG;
+        memcpy(buf + bl, from + skip, fl - skip);
+        bl += fl - skip;
+    }
+    buf[bl] = '\0';
+    for (const char *s = up; ; ) {
+        while (*s == '/') s++;
+        if (!*s) return -ABI_ENAMETOOLONG;
+        const char *e = s;
+        while (*e && *e != '/') e++;
+        size_t n = (size_t)(e - s);
+        if (n > VFS_NAME_MAX - 1) return -ABI_ENAMETOOLONG;
+        if (n == 1 && s[0] == '.') { s = e; continue; }
+        if (n == 2 && s[0] == '.' && s[1] == '.') {
+            while (bl > rl && buf[bl - 1] != '/') bl--;
+            if (bl > rl) bl--;
+            buf[bl] = '\0';
+            s = e;
+            continue;
+        }
+        if (bl + 1 + n >= sizeof buf) return -ABI_ENAMETOOLONG;
+        buf[bl++] = '/';
+        memcpy(buf + bl, s, n);
+        bl += n;
+        buf[bl] = '\0';
+        if (!*e) return -ABI_ENAMETOOLONG;
+        struct vfs_stat st;
+        int r = vfs_stat(buf, &st);
+        if (r == VFS_OK && st.type == VFS_TYPE_SYMLINK) {
+            /* a link on the way is followed, as Linux's walk follows it --
+             * a dangling one is ENOENT (pathchk's `dang/<300 bytes>`) */
+            char to[ABI_PATH_MAX];
+            if (vfs_follow_link(buf, to, sizeof to) != VFS_OK) return -ABI_ENOENT;
+            size_t tl = strlen(to);
+            memcpy(buf, to, tl + 1);
+            bl = tl;
+            r = vfs_stat(buf, &st);
+        }
+        if (r != VFS_OK) return r == VFS_ERR_NOTDIR ? -ABI_ENOTDIR : -ABI_ENOENT;
+        if (st.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+        if (vfs_perm_check(buf, VFS_WANT_EXEC) != VFS_OK) return -ABI_EACCES;
+        s = e;
+    }
+}
+
 int resolve_user_path(const char *user_path, char *out, size_t cap) {
-    char up[ABI_PATH_MAX];
+    /* Linux's PATH_MAX counts the NUL: 4095 bytes are a path, 4096 are too
+     * many. One byte more than that here, so the copy can tell the two
+     * apart (finding 227). */
+    char up[ABI_PATH_MAX + 1];
     long plen = strncpy_from_user(up, user_path, sizeof(up));
     if (plen < 0) return -ABI_EFAULT;
-    if ((size_t)plen >= sizeof(up) - 1) {
-        /* NAME THE PATH. ABI_PATH_MAX is 256 here and Linux's PATH_MAX is
-         * 4096, so a program that is perfectly well-behaved on Linux can be
-         * refused by this branch -- and the refusal surfaces a long way from
-         * its cause. Chromium maps errno ENAMETOOLONG through MapSystemError()
+    if ((size_t)plen >= ABI_PATH_MAX) {
+        /* NAME THE PATH. A refusal here surfaces a long way from its
+         * cause. Chromium maps errno ENAMETOOLONG through MapSystemError()
          * to net::ERR_FILE_PATH_TOO_LONG and reports it as a NETWORK failure,
          * so a page fails to load with an error naming neither a file nor a
          * path. Without the string there is nothing to connect the two.
@@ -2528,7 +2624,7 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
          * The truncated path IS the diagnosis: it says which subsystem (cache,
          * profile, socket dir) is generating the over-long name. */
         PATHFAIL_LOG("resolve_user_path: ENAMETOOLONG len>=%d first=%.*s\n",
-                     (int)sizeof(up) - 1, 64, up);
+                     (int)ABI_PATH_MAX, 64, up);
         return -ABI_ENAMETOOLONG;
     }
     return resolve_path_str(up, plen, out, cap);
@@ -2560,6 +2656,7 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
             dp->path_was_dot = dot;
         }
     }
+    if (path_name_too_long(up)) return walk_first_error(0, up);
 #ifdef CHROMIUM_BOOT
     /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
      * DIR_ASSETS (resolved via /proc/self/exe) to serve
@@ -2577,6 +2674,7 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
      * (e.g. `busybox ls .` -> opendir(".") -> the cwd) without a special case. */
     char full[ABI_PATH_MAX];
     if (up[0] == '/') {
+        if ((size_t)plen >= sizeof full) return -ABI_ENAMETOOLONG;
         memcpy(full, up, (size_t)plen);
         full[plen] = '\0';
     } else {
@@ -2585,7 +2683,8 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
         size_t clen = strlen(cwd);
         bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
         size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
-        if (need > sizeof(full)) return -ABI_ENAMETOOLONG;
+        /* too long beside the cwd: what the walk would meet first (227) */
+        if (need > sizeof(full)) return walk_first_error(0, up);
         memcpy(full, cwd, clen);
         size_t o = clen;
         if (need_slash) full[o++] = '/';
@@ -2673,15 +2772,22 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
  * relativity test MUST be made on the RAW user string, before that happens. */
 static int resolve_user_path_at(int dirfd, const char *upath,
                                 char *out, size_t cap) {
-    char rawp[ABI_PATH_MAX];
+    char rawp[ABI_PATH_MAX + 1];           /* see resolve_user_path */
     long rl = strncpy_from_user(rawp, upath, sizeof rawp);
     if (rl < 0) return -ABI_EFAULT;
     if (rl > 0 && rawp[0] != '/' && dirfd >= 0) {
         struct file *df = fd_lookup(dirfd);
         if (df && df->kind == FILE_KIND_DIR && df->dirpath) {
+            if (rl >= ABI_PATH_MAX) return -ABI_ENAMETOOLONG;
+            if (path_name_too_long(rawp)) return walk_first_error(df->dirpath, rawp);
             char joined[ABI_PATH_MAX];
             size_t dl = strlen(df->dirpath);
-            if (dl + 1 + (size_t)rl < sizeof(joined)) {
+            /* too long to join: what the walk from the directory meets
+             * first. It went on to resolve the path from the cwd --
+             * another file (finding 227). */
+            if (dl + 1 + (size_t)rl >= sizeof(joined))
+                return walk_first_error(df->dirpath, rawp);
+            {
                 memcpy(joined, df->dirpath, dl);
                 if (dl && joined[dl - 1] != '/') joined[dl++] = '/';
                 memcpy(joined + dl, rawp, (size_t)rl + 1);
@@ -7710,9 +7816,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * including resolving a relative link path against the caller's
          * cwd, which vfs_symlink cannot do for itself (it rejects any path
          * that does not start with '/'). */
-        char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
-        if (!user_str_in(ktarget, sizeof(ktarget),
-                         (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        char ktarget[ABI_PATH_MAX + 1], klink[ABI_PATH_MAX];
+        int tr = user_path_in(ktarget, (const char *)(uintptr_t)a1);
+        if (tr) return tr;
         if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
         int rr = resolve_user_path((const char *)(uintptr_t)a2,
                                    klink, sizeof klink);
@@ -7738,12 +7844,15 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
           rr = trailing_slash_dir((const char *)(uintptr_t)a1, kpath, sizeof kpath);
           if (rr) return rr; }
         if (!buf || bufsz == 0) return -ABI_EFAULT;
-        if (bufsz > sizeof(ktmp)) bufsz = sizeof(ktmp);
         memset(ktmp, 0, sizeof ktmp);          /* slice 86: see LX_readlink */
-        int rc = vfs_readlink(kpath, ktmp, bufsz);
+        /* The whole target, then as much as the buffer holds: a target
+         * that fills it returns its size, so the caller knows to grow it
+         * (finding 227: it read bufsz-1 and returned that). */
+        int rc = vfs_readlink(kpath, ktmp, sizeof ktmp);
         if (rc == VFS_OK) {
             size_t n = 0;
-            while (n < bufsz && ktmp[n]) n++;
+            while (n < sizeof ktmp && ktmp[n]) n++;
+            if (n > bufsz) n = bufsz;
             size_t w = n + 1 > bufsz ? bufsz : n + 1;   /* never past the buffer */
             if (copy_to_user(buf, ktmp, w) != 0) return -ABI_EFAULT;
             return (long)n;
@@ -14933,7 +15042,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         rr = trailing_slash_dir(upath, kpath, sizeof kpath);
         if (rr) return rr;
         if (!ubuf || bufsz == 0) return -ABI_EINVAL;
-        size_t cap = bufsz < sizeof(ktmp) ? bufsz : sizeof(ktmp);
+        /* The whole target is read, and as much as the buffer holds is
+         * returned: Linux returns bufsz when the target fills it, which is
+         * how glibc's realpath knows to grow its buffer (finding 227: this
+         * read bufsz-1 bytes and returned that). */
+        size_t cap = sizeof(ktmp);
         /* Slice 86: ktmp used to be left uninitialised and its length taken
          * with a plain strlen(). vfs_readlink's static-table path always
          * terminates, but the per-mount readlink op (procfs /proc/self/exe,
@@ -15026,9 +15139,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         int is_at = (n == LX_symlinkat);
         const char *utarget = (const char *)a1;
         const char *ulink   = is_at ? (const char *)a3 : (const char *)a2;
-        char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
-        if (strncpy_from_user(ktarget, utarget, sizeof ktarget) < 0)
-            return -ABI_EFAULT;
+        char ktarget[ABI_PATH_MAX + 1], klink[ABI_PATH_MAX];
+        int tr = user_path_in(ktarget, utarget);
+        if (tr) return tr;
         if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
         /* symlinkat's link path is relative to NEWDIRFD; it was the cwd */
         int rr = is_at ? resolve_user_path_at((int)a2, ulink, klink, sizeof klink)

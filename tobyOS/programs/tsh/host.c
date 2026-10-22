@@ -309,13 +309,22 @@ void shell_host_async_signals(void) {
 }
 
 void kprintf(const char *fmt, ...) {
-    char buf[1024];
-    va_list ap;
+    char small[1024], *buf = small, *big = 0;
+    va_list ap, ap2;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_copy(ap2, ap);
+    int n = vsnprintf(small, sizeof small, fmt, ap);
     va_end(ap);
-    if (n < 0) return;
-    if (n > (int)sizeof buf - 1) n = (int)sizeof buf - 1;
+    if (n < 0) { va_end(ap2); return; }
+    /* longer than the buffer: formatted again into one that fits (it was
+     * cut at 1023 bytes -- an error naming a long path; finding 227) */
+    if (n >= (int)sizeof small && (big = (char *)malloc((size_t)n + 1)) != 0) {
+        vsnprintf(big, (size_t)n + 1, fmt, ap2);
+        buf = big;
+    } else if (n > (int)sizeof small - 1) {
+        n = (int)sizeof small - 1;
+    }
+    va_end(ap2);
     /* ...THROUGH THE SHELL'S fd 2, when it has one. A redirection replaces an
      * entry in the shell's own descriptor table, not this process's fd 2, so
      * `{ cmd ; } 2> err.txt` used to leave the shell's diagnostics going to
@@ -328,12 +337,14 @@ void kprintf(const char *fmt, ...) {
             g_diag_nosync = true;
             (void)file_write(diag, buf, (size_t)n);
             g_diag_nosync = false;
+            free(big);
             return;
         }
     }
     /* diagnostics -> stderr (see header), not flushing stdout first (see
      * file_write) */
     (void)host_write_nosync(2, buf, (size_t)n);
+    free(big);
 }
 
 int ksnprintf(char *dst, size_t cap, const char *fmt, ...) {

@@ -66,8 +66,23 @@ static int su_open_read(const char *path, int extra) {
  * locale: su_quote is quote(), su_quotef quotef() (each described below).
  * The result lives in one of a few rotating buffers, so two can appear in
  * one message. */
-static char su_qbuf[4][4096];
-static int su_qslot;
+static char  *su_qbuf[4];
+static size_t su_qcap[4];
+static int    su_qslot;
+
+/* The next of those buffers, made at least NEED bytes. They were 4096
+ * bytes each, which cut a long path short in its message -- a 4095-byte
+ * name lost its tail and its closing quote (finding 227). */
+static char *su_qnext(size_t need) {
+    int k = su_qslot++ & 3;
+    if (su_qcap[k] < need) {
+        char *nb = (char *)realloc(su_qbuf[k], need);
+        if (!nb) su_error(1, 0, "memory exhausted");
+        su_qbuf[k] = nb;
+        su_qcap[k] = need;
+    }
+    return su_qbuf[k];
+}
 
 /* a byte the C locale cannot print: a control byte, DEL, or past 0x7f */
 static int su_unprintable(unsigned char c) { return c < 0x20 || c >= 0x7f; }
@@ -89,10 +104,11 @@ static void su_cesc(char *b, size_t *n, unsigned char c) {
 /* quote(): 'ARG', a quote or a backslash after a backslash, an
  * unprintable byte as C writes it (\t, \001, \303) */
 static const char *su_quote(const char *s) {
-    char *b = su_qbuf[su_qslot++ & 3];
-    size_t cap = sizeof su_qbuf[0] - 16, n = 0;
+    /* at most 4 bytes for each (\ooo), and the quotes */
+    char *b = su_qnext(4 * strlen(s) + 3);
+    size_t n = 0;
     b[n++] = '\'';
-    for (; *s && n < cap; s++) {
+    for (; *s; s++) {
         unsigned char c = (unsigned char)*s;
         if (c == '\'' || c == '\\') { b[n++] = '\\'; b[n++] = (char)c; }
         else if (su_unprintable(c)) su_cesc(b, &n, c);
@@ -112,8 +128,10 @@ static const char *su_quote(const char *s) {
  * 9.7 on every printable punctuation character, quotes, control bytes and
  * UTF-8 (finding 209). */
 static const char *su_quotef(const char *s) {
-    char *b = su_qbuf[su_qslot++ & 3];
-    size_t cap = sizeof su_qbuf[0] - 16, n = 0;
+    /* at most 9 bytes for each: an unprintable byte alone between two
+     * printable ones closes the quote, writes $'\ooo' and reopens it */
+    size_t cap = 9 * strlen(s) + 4, n = 0;
+    char *b = su_qnext(cap);
     int bare = *s != 0, dq = 1, squote = 0, ctrl = 0;
     for (size_t i = 0; s[i]; i++) {
         unsigned char c = (unsigned char)s[i];
@@ -134,13 +152,13 @@ static const char *su_quotef(const char *s) {
     }
     int q = 1;      /* inside single quotes */
     b[n++] = '\'';
-    for (size_t i = 0; s[i] && n < cap; i++) {
+    for (size_t i = 0; s[i]; i++) {
         unsigned char c = (unsigned char)s[i];
         if (su_unprintable(c)) {
             if (q) b[n++] = '\'';
             b[n++] = '$';
             b[n++] = '\'';
-            for (; s[i] && su_unprintable((unsigned char)s[i]) && n < cap; i++)
+            for (; s[i] && su_unprintable((unsigned char)s[i]); i++)
                 su_cesc(b, &n, (unsigned char)s[i]);
             i--;
             b[n++] = '\'';
@@ -167,8 +185,9 @@ static const char *su_quotef(const char *s) {
 static const char *su_quoteaf(const char *s) {
     const char *q = su_quotef(s);
     if (*q == '\'' || *q == '"') return q;
-    char *b = su_qbuf[su_qslot++ & 3];
-    snprintf(b, sizeof su_qbuf[0], "'%s'", s);
+    size_t cap = strlen(s) + 3;
+    char *b = su_qnext(cap);
+    snprintf(b, cap, "'%s'", s);
     return b;
 }
 

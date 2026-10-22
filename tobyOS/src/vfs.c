@@ -1267,8 +1267,20 @@ int vfs_create(const char *path) {
     return vfs_create_mode(path, 00644u);
 }
 
+/* A new name longer than 255 bytes, which Linux's filesystems refuse
+ * (finding 227). The syscalls check every name of a path; this is for the
+ * kernel's own callers, and tmpfs, which would keep it whole. */
+static bool new_name_too_long(const char *path) {
+    size_t n = strlen(path);
+    while (n > 0 && path[n - 1] == '/') n--;
+    size_t e = n;
+    while (n > 0 && path[n - 1] != '/') n--;
+    return e - n > VFS_NAME_MAX - 1;
+}
+
 int vfs_create_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
+    if (new_name_too_long(path)) return VFS_ERR_NAMETOOLONG;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
     /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
@@ -1397,6 +1409,7 @@ int vfs_unlink(const char *path) {
  * what EXDEV exists to say -- coreutils' ln/mv fall back to copying on it. */
 int vfs_link(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return VFS_ERR_INVAL;
+    if (new_name_too_long(newpath)) return VFS_ERR_NAMETOOLONG;
     const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
     const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
     if (!om || !nm) return VFS_ERR_NOMOUNT;
@@ -1459,6 +1472,7 @@ int vfs_statfs(const char *path, struct vfs_statfs *out) {
 
 int vfs_rename(const char *oldpath, const char *newpath) {
     if (!oldpath || !newpath) return VFS_ERR_INVAL;
+    if (new_name_too_long(newpath)) return VFS_ERR_NAMETOOLONG;
     const char *orel; struct vfs_mount *om = resolve(oldpath, &orel);
     const char *nrel; struct vfs_mount *nm = resolve(newpath, &nrel);
     if (!om || !nm) return VFS_ERR_NOMOUNT;
@@ -1569,6 +1583,7 @@ int vfs_rename(const char *oldpath, const char *newpath) {
  * up as an unexplained SIGTRAP and exit 191. */
 int vfs_mkdir_mode(const char *path, uint32_t mode) {
     if (!path) return VFS_ERR_INVAL;
+    if (new_name_too_long(path)) return VFS_ERR_NAMETOOLONG;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
     /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
@@ -1987,6 +2002,7 @@ int vfs_symlink(const char *path, const char *target) {
     if (path[0] != '/') return VFS_ERR_INVAL;
     if (strlen(path) >= VFS_PATH_MAX || strlen(target) >= VFS_PATH_MAX)
         return VFS_ERR_NAMETOOLONG;
+    if (new_name_too_long(path)) return VFS_ERR_NAMETOOLONG;
     if (symlink_find(path)) return VFS_ERR_EXIST;
     /* W+X on the directory the link goes in, as every other creation asks
      * (vfs_create, vfs_mkdir, vfs_link): this asked nothing, so any user
