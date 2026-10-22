@@ -359,6 +359,57 @@ int getgroups(int size, gid_t list[]) {
         toby_sc2(ABI_SYS_GETGROUPS, (long)size, (long)(uintptr_t)list));
 }
 
+/* setgroups(2): privileged, as Linux's (finding 203) */
+int setgroups(size_t size, const gid_t *list) {
+    return (int)__toby_check(
+        toby_sc2(ABI_SYS_SETGROUPS, (long)size, (long)(uintptr_t)list));
+}
+
+/* initgroups(3): GROUP and every /etc/group entry that names USER, as
+ * glibc's -- what a login and su give the account (finding 203) */
+int initgroups(const char *user, gid_t group) {
+    gid_t g[64];
+    size_t n = 0;
+    g[n++] = group;
+    int fd = open("/etc/group", O_RDONLY);
+    if (fd >= 0) {
+        static char buf[16384];
+        ssize_t r, len = 0;
+        while (len < (ssize_t)sizeof buf - 1 &&
+               (r = read(fd, buf + len, sizeof buf - 1 - (size_t)len)) > 0)
+            len += r;
+        close(fd);
+        buf[len > 0 ? len : 0] = '\0';
+        size_t ul = user ? strlen(user) : 0;
+        for (char *s = buf; ul && *s && n < 64; ) {
+            char *e = strchr(s, '\n');
+            if (e) *e = '\0';
+            /* NAME:PASSWORD:GID:MEMBER,MEMBER... */
+            char *c1 = strchr(s, ':'), *c2 = c1 ? strchr(c1 + 1, ':') : 0;
+            char *c3 = c2 ? strchr(c2 + 1, ':') : 0;
+            if (c3 && c2[1] >= '0' && c2[1] <= '9') {
+                gid_t gid = 0;
+                for (char *q = c2 + 1; q < c3 && *q >= '0' && *q <= '9'; q++)
+                    gid = gid * 10 + (gid_t)(*q - '0');
+                for (char *m = c3 + 1; *m; ) {
+                    size_t ml = strcspn(m, ",\r");
+                    if (ml == ul && !strncmp(m, user, ul)) {
+                        size_t k = 0;
+                        while (k < n && g[k] != gid) k++;
+                        if (k == n) g[n++] = gid;
+                        break;
+                    }
+                    m += ml;
+                    if (*m) m++;
+                }
+            }
+            if (!e) break;
+            s = e + 1;
+        }
+    }
+    return setgroups(n, g);
+}
+
 /* lchown(2): a symbolic link itself, where chown follows one */
 int lchown(const char *path, uid_t owner, gid_t group) {
     return (int)__toby_check(

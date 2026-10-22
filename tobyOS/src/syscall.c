@@ -7030,6 +7030,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_lchown((const char *)a1, (uint32_t)a2, (uint32_t)a3);
     case ABI_SYS_GETGROUPS:         /* one implementation: the Linux arm */
         return linux_syscall_impl(115, a1, a2, 0, 0, 0);
+    case ABI_SYS_SETGROUPS:         /* finding 203: su's initgroups */
+        return linux_syscall_impl(116, a1, a2, 0, 0, 0);
     case ABI_SYS_MOUNT:             /* batch 31: mount(8); the Linux arm */
         return linux_syscall_impl(165, a1, a2, a3, a4, a5);
     case ABI_SYS_UMOUNT2:           /* batch 31: umount(8); the Linux arm */

@@ -99,6 +99,10 @@ int main(int argc, char **argv) {
         memset(pw, 0, sizeof pw);
         if (rc != 0) { fprintf(stderr, "su: Authentication failure\n"); return 1; }
     }
+    /* the target's own supplementary groups, as util-linux's su sets them
+     * (initgroups): it kept the caller's -- su from root left 0(root)
+     * 10(wheel) in a user's groups (finding 203) */
+    if (initgroups(t.name, (gid_t)t.gid) != 0) { fprintf(stderr, "su: cannot set groups: %s\n", strerror(errno)); return 1; }
     /* group first: setuid() drops the right to setgid() */
     if (setgid(t.gid) != 0 && t.gid != 0) { fprintf(stderr, "su: cannot set groups: %s\n", strerror(errno)); return 1; }
     if (setuid(t.uid) != 0) { fprintf(stderr, "su: cannot set user id: %s\n", strerror(errno)); return 1; }
