@@ -16,12 +16,15 @@
  * group on a width change, so a decoder that just keeps reading bits goes
  * out of step exactly once and then produces plausible garbage forever.
  *
- * AND THE BOUNDARY IS MEASURED FROM THE END OF THE 3-BYTE HEADER, not
- * from the start of the file. compress(1) tracks its bit position inside
- * a buffer that begins after the header, so the groups start at file byte
- * 3. Counting from byte 0 is off by 24 bits, which is invisible until the
- * first width change and then corrupts everything after it -- small files
- * round-trip perfectly and large ones do not.
+ * AND THE BOUNDARY IS MEASURED FROM WHERE THE CURRENT WIDTH BEGAN: the
+ * first run's from the end of the 3-byte header (file byte 3), each
+ * later one's from the padded end of the run before it -- compress(1)'s
+ * boff, gzip's unlzw starting its bit count again. Counting from byte 0
+ * is off by 24 bits at the first change; counting every run from the
+ * header agrees for the first change only, and both coders here did that,
+ * so they read each other and GNU gzip said "corrupt input" at the second
+ * (finding 246). Small files round-trip whatever the rule; large ones do
+ * not.
  */
 
 #include <toby/lzw.h>
@@ -85,16 +88,17 @@ int lzw_decompress(const uint8_t *in, size_t inlen,
     int n_bits = LZW_INIT_BITS;
     size_t maxcode = ((size_t)1 << n_bits) - 1;
     size_t free_ent = block_mode ? 257 : 256;
-    /* Relative to the first byte after the header, which is where the
-     * group boundaries are measured from. */
-    size_t posbits = 0;
+    /* Relative to the first byte after the header; RUN is where the
+     * current width began, which the group boundaries count from. */
+    size_t posbits = 0, run = 0;
     size_t total_bits = (inlen - 3) * 8;
     long oldcode = -1;
     uint8_t finchar = 0;
 
     for (;;) {
         if (free_ent > maxcode) {
-            posbits = align_up(posbits, (size_t)n_bits * 8);
+            posbits = run + align_up(posbits - run, (size_t)n_bits * 8);
+            run = posbits;
             n_bits++;
             maxcode = (n_bits == maxbits) ? maxmaxcode : (((size_t)1 << n_bits) - 1);
         }
@@ -109,7 +113,8 @@ int lzw_decompress(const uint8_t *in, size_t inlen,
         posbits += (size_t)n_bits;
 
         if (block_mode && code == LZW_CLEAR) {
-            posbits = align_up(posbits, (size_t)n_bits * 8);
+            posbits = run + align_up(posbits - run, (size_t)n_bits * 8);
+            run = posbits;
             n_bits = LZW_INIT_BITS;
             maxcode = ((size_t)1 << n_bits) - 1;
             free_ent = 257;
@@ -238,6 +243,7 @@ int lzw_compress(const uint8_t *in, size_t inlen, int maxbits,
     int n_bits = LZW_INIT_BITS;
     size_t maxcode = ((size_t)1 << n_bits) - 1;
     size_t free_ent = 257;                 /* block mode reserves 256 */
+    size_t run = 24;                       /* where this width began (246) */
 
     if (inlen == 0) {
         free(hcode); free(hkey);
@@ -274,9 +280,10 @@ int lzw_compress(const uint8_t *in, size_t inlen, int maxbits,
         if (free_ent > maxcode && n_bits < maxbits) {
             /* Pad to the group boundary the decoder will skip to. */
             size_t group = (size_t)n_bits * 8;
-            size_t aligned = 24 + align_up(e.bits - 24, group);
+            size_t aligned = run + align_up(e.bits - run, group);
             while (e.bits < aligned)
                 if (put_bits(&e, 0, 1)) { *why = "out of memory"; goto fail; }
+            run = e.bits;
             n_bits++;
             maxcode = (n_bits == maxbits) ? maxmaxcode : (((size_t)1 << n_bits) - 1);
         }
