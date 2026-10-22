@@ -63,80 +63,100 @@ static int su_open_read(const char *path, int extra) {
 /* ---- quoting for messages ------------------------------------------------
  *
  * GNU quotes a name in a message one of two ways, both measured in the C
- * locale. su_quote is quote(): 'NAME', a quote or a backslash in it
- * escaped with a backslash and a control character as an escape.
- * su_quotef is quotef() -- shell-escape style -- used for file names in
- * some messages: bare when nothing in it needs quoting, else '...', or
- * "..." when it holds a single quote. The result lives in one of a few
- * rotating buffers, so two can appear in one message. */
+ * locale: su_quote is quote(), su_quotef quotef() (each described below).
+ * The result lives in one of a few rotating buffers, so two can appear in
+ * one message. */
 static char su_qbuf[4][4096];
 static int su_qslot;
 
+/* a byte the C locale cannot print: a control byte, DEL, or past 0x7f */
+static int su_unprintable(unsigned char c) { return c < 0x20 || c >= 0x7f; }
+
+/* C's escape for an unprintable byte, into B at *N */
+static void su_cesc(char *b, size_t *n, unsigned char c) {
+    static const char named[] = "\aa\bb\ff\nn\rr\tt\vv";
+    const char *p = c ? strchr(named, (char)c) : 0;
+    b[(*n)++] = '\\';
+    if (p && (p - named) % 2 == 0) {
+        b[(*n)++] = p[1];
+    } else {
+        b[(*n)++] = (char)('0' + (c >> 6 & 7));
+        b[(*n)++] = (char)('0' + (c >> 3 & 7));
+        b[(*n)++] = (char)('0' + (c & 7));
+    }
+}
+
+/* quote(): 'ARG', a quote or a backslash after a backslash, an
+ * unprintable byte as C writes it (\t, \001, \303) */
 static const char *su_quote(const char *s) {
     char *b = su_qbuf[su_qslot++ & 3];
-    size_t n = 0, cap = sizeof su_qbuf[0] - 8;
+    size_t cap = sizeof su_qbuf[0] - 16, n = 0;
     b[n++] = '\'';
     for (; *s && n < cap; s++) {
         unsigned char c = (unsigned char)*s;
         if (c == '\'' || c == '\\') { b[n++] = '\\'; b[n++] = (char)c; }
-        else if (c == '\n') { b[n++] = '\\'; b[n++] = 'n'; }
-        else if (c == '\t') { b[n++] = '\\'; b[n++] = 't'; }
-        else if (c < 0x20 || c == 0x7f) {
-            b[n++] = '\\';
-            b[n++] = (char)('0' + ((c >> 6) & 7));
-            b[n++] = (char)('0' + ((c >> 3) & 7));
-            b[n++] = (char)('0' + (c & 7));
-        } else b[n++] = (char)c;
+        else if (su_unprintable(c)) su_cesc(b, &n, c);
+        else b[n++] = (char)c;
     }
     b[n++] = '\'';
     b[n] = 0;
     return b;
 }
 
+/* quotef(): shell-escape style. Bare when every byte is safe in a shell
+ * word (letters, digits, % + , - . / @ ] _ { }, and # or ~ past the
+ * start); in double quotes when it holds a single quote and nothing else
+ * double quotes would not cover (letters, digits, % + , - . / : @ ] _ and
+ * blanks; # ~ at the start); else in single quotes, a single quote as
+ * '\'' and a run of unprintable bytes as $'\n...'. Measured against GNU
+ * 9.7 on every printable punctuation character, quotes, control bytes and
+ * UTF-8 (finding 209). */
 static const char *su_quotef(const char *s) {
     char *b = su_qbuf[su_qslot++ & 3];
-    size_t cap = sizeof su_qbuf[0] - 8;
-    int plain = *s != 0, squote = 0, ctrl = 0;
-    for (const char *p = s; *p; p++) {
-        unsigned char c = (unsigned char)*p;
+    size_t cap = sizeof su_qbuf[0] - 16, n = 0;
+    int bare = *s != 0, dq = 1, squote = 0, ctrl = 0;
+    for (size_t i = 0; s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        int safe = isalnum(c) || strchr("%+,-./@]_{}", c) || ((c == '#' || c == '~') && i);
+        if (!safe) bare = 0;
         if (c == '\'') squote = 1;
-        if (c < 0x20 || c == 0x7f) ctrl = 1;
-        if (!(isalnum(c) || strchr("%+,-./:=@_^", c) || c >= 0x80)) plain = 0;
+        else if (su_unprintable(c)) ctrl = 1;
+        else if (!(isalnum(c) || strchr("%+,-./:@]_ ", c) || ((c == '#' || c == '~') && !i)))
+            dq = 0;
     }
-    if (*s == '~' || *s == '#') plain = 0;
-    size_t n = 0;
-    if (plain) {
+    if (bare) {
         snprintf(b, cap, "%s", s);
         return b;
     }
-    if (ctrl) {
-        /* $'...' for a control character, as GNU's shell-escape style */
-        b[n++] = '\'';
-        for (; *s && n < cap; s++) {
-            unsigned char c = (unsigned char)*s;
-            if (c < 0x20 || c == 0x7f) {
-                n += (size_t)snprintf(b + n, cap - n, "'$'\\%s''",
-                                      c == '\n' ? "n" : c == '\t' ? "t" : "");
-                if (c != '\n' && c != '\t') {
-                    n -= 3;
-                    n += (size_t)snprintf(b + n, cap - n, "%03o''", c);
-                }
-            } else if (c == '\'') {
-                n += (size_t)snprintf(b + n, cap - n, "'\\''");
-            } else b[n++] = (char)c;
-        }
-        b[n++] = '\'';
-        b[n] = 0;
+    if (squote && dq && !ctrl) {
+        snprintf(b, cap, "\"%s\"", s);
         return b;
     }
-    char q = squote ? '"' : '\'';
-    b[n++] = q;
-    for (; *s && n < cap; s++) {
-        if (q == '"' && (*s == '"' || *s == '$' || *s == '`' || *s == '\\'))
+    int q = 1;      /* inside single quotes */
+    b[n++] = '\'';
+    for (size_t i = 0; s[i] && n < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (su_unprintable(c)) {
+            if (q) b[n++] = '\'';
+            b[n++] = '$';
+            b[n++] = '\'';
+            for (; s[i] && su_unprintable((unsigned char)s[i]) && n < cap; i++)
+                su_cesc(b, &n, (unsigned char)s[i]);
+            i--;
+            b[n++] = '\'';
+            q = 0;
+        } else if (c == '\'') {
+            if (q) b[n++] = '\'';
             b[n++] = '\\';
-        b[n++] = *s;
+            b[n++] = '\'';
+            b[n++] = '\'';
+            q = 1;
+        } else {
+            if (!q) { b[n++] = '\''; q = 1; }
+            b[n++] = (char)c;
+        }
     }
-    b[n++] = q;
+    if (q) b[n++] = '\'';
     b[n] = 0;
     return b;
 }
