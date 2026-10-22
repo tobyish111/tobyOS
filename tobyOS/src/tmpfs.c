@@ -372,10 +372,23 @@ static int tmpfs_close(struct vfs_file *f)
     return VFS_OK;
 }
 
+/* A READ MOVES atime, as Linux's relatime has it: to now when atime is not
+ * newer than mtime or ctime, or is a day old. tmpfs never moved it, so a
+ * file read after `touch -a -d 2019-...` still read as 2019 (find
+ * -anewer, finding 242). */
+static void taccessed(struct tmpfs_node *nd)
+{
+    uint64_t now = tmpfs_now_secs();
+    if (nd->atime <= nd->mtime || nd->atime <= nd->ctime ||
+        now >= nd->atime + 86400u)
+        nd->atime = now;
+}
+
 static long tmpfs_read(struct vfs_file *f, void *buf, size_t n)
 {
     struct tmpfs_node *nd = f->priv;
     if (!nd || !nd->used) return VFS_ERR_IO;
+    taccessed(nd);
     if (f->pos >= nd->size) return 0;
     size_t avail = nd->size - f->pos;
     if (n > avail) n = avail;
