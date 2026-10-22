@@ -1253,6 +1253,20 @@ int sys_tgkill(int tgid, int tid, int sig) {
     return 0;
 }
 
+/* A PID NAMESPACE'S INIT TAKES ONLY WHAT IT CATCHES (pid_namespaces(7)):
+ * from inside its namespace a signal it has no handler for is dropped --
+ * SIGKILL too -- and from an ancestor's (which it cannot see) SIGKILL and
+ * SIGSTOP still act. `kill 1` inside `unshare -pf` ended the namespace
+ * (finding 237). The initial namespace's pid 1 is not covered. */
+static bool ns_init_drops(struct proc *sender, struct proc *target, int sig) {
+    if (sig <= 0 || !target || !pid_ns_is_init(target)) return false;
+    struct sigaction *a = sig_actions_of(target);
+    if (a && a[sig].sa_handler != SIG_DFL) return false;
+    bool inside = pid_vnr_in(target->pid_ns, sender->pid) != 0;
+    if (!inside && (sig == SIGKILL || sig == SIGSTOP)) return false;
+    return true;
+}
+
 int sys_kill(int pid, int sig) {
     if (sig < 0 || sig >= SIG_MAX) return -22;
 
@@ -1273,6 +1287,7 @@ int sys_kill(int pid, int sig) {
         if (!kpid) return -3;                        /* not visible => ESRCH */
         struct proc *target = proc_lookup(kpid);
         if (!target) return -3; /* ESRCH */
+        if (ns_init_drops(p, target, sig)) return 0;   /* finding 237 */
         /* PROCESS-directed delivery (2026-08-22): kill(pid) targets the
          * PROCESS, and POSIX says any thread with the signal unblocked may
          * take it. This used to land on the leader's slot unconditionally,
@@ -1316,6 +1331,7 @@ int sys_kill(int pid, int sig) {
                  * container that can signal the host is not a container. The
                  * visibility map is the whole check. */
                 if (!pid_ns_can_see(p, &g_proc[i])) continue;
+                if (ns_init_drops(p, &g_proc[i], sig)) continue;   /* 237 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
                     g_proc[i].sigstate.si_pid[sig] =
@@ -1336,10 +1352,16 @@ int sys_kill(int pid, int sig) {
         for (int i = 1; i < PROC_MAX; i++) {
             if (g_proc[i].state != PROC_UNUSED &&
                 g_proc[i].state != PROC_EMBRYO) {
-                if (g_proc[i].pid == 1) continue;
+                /* pid 1 AS THE CALLER'S NAMESPACE NUMBERS IT -- the
+                 * namespace's init, as Linux's kill_something_info skips
+                 * (task_pid_vnr > 1). Kernel pid 1 was skipped, so inside
+                 * `unshare -pf` kill -9 -- -1 killed the namespace's init
+                 * and with it the namespace (finding 237). */
+                if (pid_vnr_in(p->pid_ns, g_proc[i].pid) <= 1) continue;
                 if (g_proc[i].pid == mytg ||
                     (g_proc[i].is_thread && g_proc[i].tgid == mytg)) continue;
                 if (!pid_ns_can_see(p, &g_proc[i])) continue;   /* slice 10 */
+                if (ns_init_drops(p, &g_proc[i], sig)) continue;  /* 237 */
                 signal_send(&g_proc[i], sig);
                 if (sig > 0) {
                     g_proc[i].sigstate.si_pid[sig] =
@@ -1367,6 +1389,7 @@ int sys_kill(int pid, int sig) {
             int gp = g_proc[i].pgid > 0 ? g_proc[i].pgid : g_proc[i].pid;
             if (gp != pg) continue;
             if (!pid_ns_can_see(p, &g_proc[i])) continue;
+            if (ns_init_drops(p, &g_proc[i], sig)) { any = true; continue; }  /* 237 */
             if (sig > 0) {
                 signal_send(&g_proc[i], sig);
                 g_proc[i].sigstate.si_pid[sig] =
