@@ -261,6 +261,12 @@ static long vfs_err_to_abi(long rv) {
     }
 }
 
+/* A removed working directory (finding 200; defined beside chdir_kpath) */
+static long linux_open_dir_gone(const char *kpath);
+static bool cwd_is_gone(const char *kpath);
+static bool cwd_is_gone_named(const char *kpath);
+static void cwd_gone_stat(struct vfs_stat *vs);
+
 /* Convert a file_read()/file_write() result, WHICH ERROR SPACE IT IS IN
  * DEPENDING ON THE FILE KIND.
  *
@@ -1698,6 +1704,9 @@ static long sys_fs_readdir2(const char *path, struct abi_dirent2 *out,
             vfs_follow_link(kpath, followed, sizeof followed) == VFS_OK)
             memcpy(kpath, followed, strlen(followed) + 1);
     }
+    /* the removed working directory lists nothing, not even "." and "..",
+     * as Linux's (finding 200) */
+    if (cwd_is_gone_named(kpath)) return 0;
     struct vfs_dir d;
     int rc = vfs_opendir(kpath, &d);
     if (rc != VFS_OK) return vfs_err_to_abi(rc);
@@ -2517,6 +2526,17 @@ int resolve_user_path(const char *user_path, char *out, size_t cap) {
      * zero-sized buffer, which only the kernel can pass) */
     if (plen == 0) return -ABI_ENOENT;
     if (cap == 0) return -ABI_EINVAL;
+    {   /* "." or "./" -- what may still name a removed cwd (finding 200) */
+        struct proc *dp = current_proc();
+        if (dp) {
+            bool dot = up[0] != '/';
+            for (const char *s = up; *s && dot; s++)
+                if (*s != '.' && *s != '/') dot = false;
+            for (const char *s = up; *s && dot; s++)
+                if (s[0] == '.' && s[1] == '.') dot = false;
+            dp->path_was_dot = dot;
+        }
+    }
 #ifdef CHROMIUM_BOOT
     /* slice 20: chrome's --dump-dom loads headless_command_resources.pak from
      * DIR_ASSETS (resolved via /proc/self/exe) to serve
@@ -3731,6 +3751,12 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
             if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
             return linux_open_dir(kpath);
         }
+        /* the removed working directory opens -- `ls .` there lists
+         * nothing -- as Linux's (finding 200) */
+        if (cwd_is_gone_named(kpath)) {
+            if (lx_dir_open_refused(flags)) return -ABI_EISDIR;
+            return linux_open_dir_gone(kpath);
+        }
     }
 
     /* Optionally create. Returns EEXIST if O_EXCL set and present. */
@@ -3995,6 +4021,7 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
      * is a floor, not a substitution: a filesystem that really does track
      * subdirectories passes through untouched. */
     if (src->type == VFS_TYPE_DIR && dst->nlink < 2u) dst->nlink = 2u;
+    if (src->nlink == VFS_NLINK_NONE) dst->nlink = 0;    /* finding 200 */
     dst->ino = src->ino;
     dst->dev = (uint64_t)src->dev;
     /* Batch 25 (ABI_SYS_XSTAT): the Linux personality's numbers, so a
@@ -4233,6 +4260,10 @@ static int stat_resolve(const char *kpath, bool follow, char *final,
             }
         }
         int rc = vfs_stat(cur, vs);
+        if (rc == VFS_ERR_NOENT && cwd_is_gone_named(cur)) {
+            cwd_gone_stat(vs);               /* finding 200 */
+            rc = VFS_OK;
+        }
         if (rc != VFS_OK) return rc;
         if (!follow || vs->type != VFS_TYPE_SYMLINK) {
             /* a link whose target ends in '/' ("f/") names a directory:
@@ -4278,6 +4309,11 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
          * makes it since batch 31): it said "a regular file, 0666" */
         struct vfs_stat vs;
         if (vfs_stat(f->dirpath, &vs) == VFS_OK) { fill_abi_stat(&vs, tmp); return; }
+        if (cwd_is_gone(f->dirpath)) {           /* finding 200 */
+            cwd_gone_stat(&vs);
+            fill_abi_stat(&vs, tmp);
+            return;
+        }
         tmp->mode = ABI_S_IFDIR | 0755;
         tmp->nlink = 2;
         return;
@@ -4756,10 +4792,63 @@ static long sys_getcwd(char *out, size_t cap) {
     if (cap > ABI_PATH_MAX) cap = ABI_PATH_MAX;
     struct proc *p = current_proc();
     const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+    /* a removed working directory has no path: ENOENT, as Linux's
+     * getcwd(2) says (finding 200) */
+    if (cwd_is_gone(cwd)) return -ABI_ENOENT;
     size_t n = strlen(cwd);
     if (n + 1 > cap) return -ABI_ERANGE;
     if (copy_to_user(out, cwd, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
+}
+
+/* A WORKING DIRECTORY THAT HAS BEEN REMOVED (finding 200). tobyOS keeps
+ * the cwd as a path, so once its directory is gone there is nothing behind
+ * it; Linux keeps the inode, and in a removed cwd `ls .` lists nothing
+ * (status 0), `stat .` is a directory with no links, getcwd(2) is ENOENT
+ * and making anything there is ENOENT. The directory's identity is noted
+ * when the cwd is set (proc_note_cwd) and these answer from it. */
+void proc_note_cwd(struct proc *p) {
+    if (!p) return;
+    struct vfs_stat st;
+    if (vfs_stat(p->cwd[0] ? p->cwd : "/", &st) != VFS_OK) return;
+    p->cwd_ino = st.ino;
+    p->cwd_mtime = st.mtime;
+    p->cwd_dev = st.dev;
+    p->cwd_mode = st.mode;
+    p->cwd_uid = st.uid;
+    p->cwd_gid = st.gid;
+}
+
+/* Is KPATH the caller's working directory, and is that gone? */
+static bool cwd_is_gone(const char *kpath) {
+    struct proc *p = current_proc();
+    if (!p || !p->cwd[0] || !kpath || strcmp(kpath, p->cwd) != 0) return false;
+    struct vfs_stat st;
+    return vfs_stat(kpath, &st) != VFS_OK;
+}
+
+/* KPATH is the removed cwd AND the caller named it "." -- the one way a
+ * NAME reaches a removed directory on Linux. An absolute path to it, or
+ * ../NAME, is ENOENT there; this answered for them too, and GNU pwd -L
+ * took $PWD as fit (finding 200). */
+static bool cwd_is_gone_named(const char *kpath) {
+    struct proc *p = current_proc();
+    return p && p->path_was_dot && cwd_is_gone(kpath);
+}
+
+/* stat of the removed working directory: what it was, with no links */
+static void cwd_gone_stat(struct vfs_stat *vs) {
+    struct proc *p = current_proc();
+    memset(vs, 0, sizeof *vs);
+    vs->type = VFS_TYPE_DIR;
+    vs->nlink = VFS_NLINK_NONE;
+    if (!p) return;
+    vs->ino = p->cwd_ino;
+    vs->dev = p->cwd_dev;
+    vs->mode = p->cwd_mode ? p->cwd_mode : (VFS_MODE_VALID | 0755u);
+    vs->uid = p->cwd_uid;
+    vs->gid = p->cwd_gid;
+    vs->mtime = vs->atime = p->cwd_mtime;
 }
 
 /* Adopt an ALREADY-RESOLVED kernel path as the cwd.
@@ -4794,6 +4883,12 @@ static long chdir_kpath(const char *kpath) {
     if (n >= ABI_PATH_MAX) n = ABI_PATH_MAX - 1;
     memcpy(p->cwd, kpath, n);
     p->cwd[n] = '\0';
+    p->cwd_ino = st.ino;                 /* finding 200 */
+    p->cwd_mtime = st.mtime;
+    p->cwd_dev = st.dev;
+    p->cwd_mode = st.mode;
+    p->cwd_uid = st.uid;
+    p->cwd_gid = st.gid;
     return 0;
 }
 
@@ -8165,6 +8260,7 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
      * native stat already says; tmpfs counts 1, and busybox's `find -links
      * 1 -type d` matched directories GNU's never does (logs/b15 findbb). */
     if (vs->type == VFS_TYPE_DIR && st.st_nlink < 2u) st.st_nlink = 2u;
+    if (vs->nlink == VFS_NLINK_NONE) st.st_nlink = 0;   /* finding 200 */
     st.st_uid     = userns_cur_uid(vs->uid);   /* slice 11 */
     st.st_gid     = userns_cur_gid(vs->gid);   /* slice 11 */
     st.st_size    = (int64_t)vs->size;
@@ -8207,6 +8303,7 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.nlink     = vs->nlink ? vs->nlink
                               : (vs->type == VFS_TYPE_DIR ? 2u : 1u);
     if (vs->type == VFS_TYPE_DIR && sx.nlink < 2u) sx.nlink = 2u;
+    if (vs->nlink == VFS_NLINK_NONE) sx.nlink = 0;      /* finding 200 */
     sx.uid       = userns_cur_uid(vs->uid);    /* slice 11 */
     sx.gid       = userns_cur_gid(vs->gid);    /* slice 11 */
     sx.mode      = (uint16_t)(typ | perm);
@@ -8251,8 +8348,10 @@ static long lx_emit_fd_stat(struct file *f, int fd, void *ubuf) {
                                                ubuf);
     }
     if (f->kind == FILE_KIND_DIR && f->dirpath) {
-        if (vfs_stat(f->dirpath, &vs) != VFS_OK)
-            vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK) {
+            if (cwd_is_gone(f->dirpath)) cwd_gone_stat(&vs);    /* 200 */
+            else vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        }
     } else if (f->kind == FILE_KIND_VFS) {
         uint64_t ino;
         fd_vfs_stat(f, fd, &vs, &ino);
@@ -8317,8 +8416,10 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
     }
     struct vfs_stat vs;
     if (f->kind == FILE_KIND_DIR && f->dirpath) {
-        if (vfs_stat(f->dirpath, &vs) != VFS_OK)
-            vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        if (vfs_stat(f->dirpath, &vs) != VFS_OK) {
+            if (cwd_is_gone(f->dirpath)) cwd_gone_stat(&vs);    /* 200 */
+            else vs = (struct vfs_stat){ .type = VFS_TYPE_DIR, .mode = 0755 };
+        }
     } else if (f->kind == FILE_KIND_VFS) {
         uint64_t ino;
         fd_vfs_stat(f, fd, &vs, &ino);
@@ -8720,6 +8821,22 @@ static bool umount_target_busy(const char *mnt) {
 /* Open a directory as a Linux getdents64-capable fd (FILE_KIND_DIR). tobyOS
  * has no native directory fd, so we just remember the path; getdents64
  * re-opens via vfs_opendir and resumes after dir_off entries. */
+/* A FILE_KIND_DIR on a directory that is not there to probe (the removed
+ * cwd): getdents64 on it is the end of the directory. */
+static long linux_open_dir_gone(const char *kpath) {
+    struct file *f = (struct file *)kmalloc(sizeof *f);
+    if (!f) return -ABI_ENOMEM;
+    memset(f, 0, sizeof *f);
+    f->kind = FILE_KIND_DIR;
+    size_t n = strlen(kpath) + 1;
+    f->dirpath = (char *)kmalloc(n);
+    if (!f->dirpath) { kfree(f); return -ABI_ENOMEM; }
+    memcpy(f->dirpath, kpath, n);
+    int fd = fd_alloc_into(current_proc(), f);
+    if (fd < 0) { kfree(f->dirpath); kfree(f); return -ABI_EMFILE; }
+    return fd;
+}
+
 static long linux_open_dir(const char *kpath) {
     struct vfs_dir probe;
     /* the opendir's own error: EACCES for a directory without r (finding
@@ -14815,7 +14932,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
         }
         struct vfs_dir d;
-        if (vfs_opendir(f->dirpath, &d) != VFS_OK) return -ABI_ENOENT;
+        if (vfs_opendir(f->dirpath, &d) != VFS_OK) {
+            /* a directory removed while open (or the removed cwd, finding
+             * 200) has no entries left: end of directory, as Linux's */
+            struct vfs_stat gst;
+            if (vfs_stat(f->dirpath, &gst) != VFS_OK) return 0;
+            return -ABI_ENOENT;
+        }
         struct vfs_dirent ent;
         uint32_t emitted = 0;
         size_t   written = 0;

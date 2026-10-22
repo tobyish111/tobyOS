@@ -22,6 +22,44 @@ static int pw_fit(const char *pwd) {
     return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
 }
 
+/* WHEN getcwd(3) FAILS -- a removed working directory, ENOENT -- GNU's pwd
+ * finds the name itself: the entry of ".." with the device and inode of
+ * ".", then the same one level up, to the root. A level whose ".." has no
+ * such entry ends it: "couldn't find directory entry in '..' with matching
+ * i-node", status 1 (measured: coreutils 9.7 in a removed cwd). */
+static void pw_walk(void) {
+    char up[4096] = "..", out[4096] = "", tmp[4096], ent[8192];
+    struct stat cur, par, st;
+    if (stat(".", &cur) != 0) su_error(1, errno, "failed to stat %s", su_quote("."));
+    for (;;) {
+        if (stat(up, &par) != 0) su_error(1, errno, "failed to stat %s", su_quote(up));
+        if (par.st_dev == cur.st_dev && par.st_ino == cur.st_ino) break;   /* the root */
+        DIR *d = opendir(up);
+        if (!d) su_error(1, errno, "cannot open directory %s", su_quote(up));
+        struct dirent *de;
+        int found = 0;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.' && (!de->d_name[1] ||
+                (de->d_name[1] == '.' && !de->d_name[2]))) continue;
+            snprintf(ent, sizeof ent, "%s/%s", up, de->d_name);
+            if (lstat(ent, &st) == 0 && st.st_dev == cur.st_dev && st.st_ino == cur.st_ino) {
+                snprintf(tmp, sizeof tmp, "/%s%s", de->d_name, out);
+                memcpy(out, tmp, strlen(tmp) + 1);
+                found = 1;
+                break;
+            }
+        }
+        closedir(d);
+        if (!found)
+            su_error(1, 0, "couldn't find directory entry in %s with matching i-node",
+                     su_quote(up));
+        cur = par;
+        if (strlen(up) + 4 >= sizeof up) su_error(1, ENAMETOOLONG, "%s", su_quote(up));
+        strcat(up, "/..");
+    }
+    puts(out[0] ? out : "/");
+}
+
 static int do_pwd(int argc, char **argv) {
     static const struct su_option longs[] = {
         { "logical", SU_NO_ARG, 0, 'L' }, { "physical", SU_NO_ARG, 0, 'P' },
@@ -53,7 +91,10 @@ static int do_pwd(int argc, char **argv) {
         if (pw_fit(pwd)) { puts(pwd); return 0; }
     }
     char buf[4096];
-    if (!getcwd(buf, sizeof buf)) su_error(1, errno, "cannot get current directory");
+    if (!getcwd(buf, sizeof buf)) {
+        pw_walk();
+        return 0;
+    }
     puts(buf);
     return 0;
 }

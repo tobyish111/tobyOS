@@ -172,6 +172,15 @@ struct proc {
      * relative path is passed to SYS_OPEN / SYS_STAT / etc. Empty
      * string means "/". */
     char            cwd[ABI_PATH_MAX];
+    /* The last path this process's syscall resolved was "." or "./": the
+     * only names that reach a removed cwd (finding 200). */
+    bool            path_was_dot;
+    /* WHAT THE WORKING DIRECTORY WAS when it was set (finding 200): its
+     * identity, mode, owner and times, which stat(".") answers once the
+     * directory has been removed, as Linux's inode outlives its name.
+     * Struct grew: CLEAN BUILD required. */
+    uint64_t        cwd_ino, cwd_mtime;
+    uint32_t        cwd_dev, cwd_mode, cwd_uid, cwd_gid;
 
     /* User entry point + initial RSP -- read once by proc_first_user_entry
      * the first time this process is scheduled in. */
@@ -1226,6 +1235,9 @@ void poll_forget_proc(struct proc *p);
  * sources, then park on it, and an event in between is not lost. BKL-held. */
 uint64_t poll_event_seq(void);
 void poll_wait_block_since(uint64_t seen);
+/* Record P's working directory's identity from P->cwd (finding 200;
+ * syscall.c). Called where a cwd is set. */
+void proc_note_cwd(struct proc *p);
 
 /* Set the calling thread's TLS base (loaded into FS.base). */
 void thread_set_tls(uint64_t base);

@@ -103,6 +103,10 @@
 #define VFS_MODE_SETGID  02000u
 #define VFS_MODE_STICKY  01000u
 #define VFS_MODE_VALID   0x10000u
+/* struct vfs_stat's nlink for a node that has NO links left -- a removed
+ * working directory (finding 200): the stat emitters report 0, where a
+ * plain 0 means "not kept" and becomes 1 or 2 */
+#define VFS_NLINK_NONE   0xFFFFFFFFu
 
 enum vfs_type {
     VFS_TYPE_FILE    = 1,

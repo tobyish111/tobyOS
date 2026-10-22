@@ -1025,6 +1025,12 @@ static int spawn_body(const char *path, const char *name,
             if (cn >= ABI_PATH_MAX) cn = ABI_PATH_MAX - 1;
             memcpy(p->cwd, parent->cwd, cn);
             p->cwd[cn] = '\0';
+            p->cwd_ino = parent->cwd_ino;     /* the same directory */
+            p->cwd_mtime = parent->cwd_mtime;
+            p->cwd_dev = parent->cwd_dev;
+            p->cwd_mode = parent->cwd_mode;
+            p->cwd_uid = parent->cwd_uid;
+            p->cwd_gid = parent->cwd_gid;
         } else {
             p->caps = CAP_GROUP_ALL;
             p->sandbox_root[0] = '\0';

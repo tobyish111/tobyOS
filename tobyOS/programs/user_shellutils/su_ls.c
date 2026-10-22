@@ -1132,8 +1132,12 @@ static void ls_dir(const char *path, const char *shown, int top) {
     }
     /* . AND .. ARE ENTRIES, as Linux's readdir always gives them; tobyOS's
      * gives neither (a finding of its own: native tools would recurse into
-     * them), so -a adds them, first, as Linux lists them */
-    if (ls.all == 2 && dots != 3) {
+     * them), so -a adds them, first, as Linux lists them -- unless the
+     * directory has been removed (no links), where Linux's readdir gives
+     * nothing at all, dots included (finding 200) */
+    struct stat dst;
+    int gone = stat(path, &dst) == 0 && S_ISDIR(dst.st_mode) && dst.st_nlink == 0;
+    if (ls.all == 2 && dots != 3 && !gone) {
         size_t before = n;
         if (!(dots & 1) && !ls_hidden(".")) ls_add(path, ".", DT_DIR, &v, &n, &cap);
         if (!(dots & 2) && !ls_hidden("..")) ls_add(path, "..", DT_DIR, &v, &n, &cap);
