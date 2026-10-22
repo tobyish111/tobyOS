@@ -3184,9 +3184,30 @@ static long evdev_ioctl(unsigned dev, unsigned long req, unsigned long arg) {
  * created /x at the root the moment the root became writable). */
 static long sys_open_resolved(const char *kpath, int flags, int mode);
 
+/* A PATH ENDING IN '/' NAMES A DIRECTORY for open too (finding 218): an
+ * existing non-directory is ENOTDIR -- `cat g/` read the file g -- a link
+ * is followed to what it names, and a name that does not exist is EISDIR
+ * to O_CREAT, as Linux's open says. URAW is the caller's string, KPATH
+ * what it resolved to. */
+static int open_trailing_slash(const char *uraw, char *kpath, size_t cap, int flags) {
+    int rr = trailing_slash_dir(uraw, kpath, cap);
+    if (rr || !(flags & ABI_O_CREAT)) return rr;
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    struct vfs_stat st;
+    if (n >= 2 && raw[n - 1] == '/' && vfs_stat(kpath, &st) != VFS_OK)
+        return -ABI_EISDIR;
+    return 0;
+}
+
 static long sys_open(const char *path, int flags, int mode) {
     char kpath[ABI_PATH_MAX];
     int rr = resolve_user_path(path, kpath, sizeof(kpath));
+    if (rr) return rr;
+    rr = open_trailing_slash(path, kpath, sizeof kpath, flags);
     if (rr) return rr;
     return sys_open_resolved(kpath, flags, mode);
 }
@@ -12865,6 +12886,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 }
             }
 #endif
+        }
+        if (got_kp) {                       /* "f/" (finding 218) */
+            int sr = open_trailing_slash((const char *)a2, kpath, sizeof kpath, (int)a3);
+            if (sr) return sr;
         }
         long ofd = got_kp ? sys_open_resolved(kpath, (int)a3, (int)a4)
                           : do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
