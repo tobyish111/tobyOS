@@ -28,7 +28,9 @@
  * bit5 THE SIZE CAP BITES. Write past `size=` and require ENOSPC. An in-memory
  *      filesystem with no limit lets any process take the machine down, so an
  *      unenforced cap is not a missing feature, it is a hazard. This is the
- *      bit that carries the test.
+ *      bit that carries the test. The mount asks for size=16m: the default
+ *      is half of RAM, as Linux's (batch 32, finding 231), which no test
+ *      can fill.
  * bit6 the cap is the one that was ASKED FOR: mounting with size=64k must fail
  *      near 64 KiB, not at the 16 MiB default. Reading a number back from a
  *      config file proves the file remembers it; this proves the mount honours
@@ -111,7 +113,7 @@ int main(void)
      * mount covered the directory rather than merging with it. */
     { int e; (void)write_file(MP "/underneath", "x", 1, &e); }
 
-    if (mount("tmpfs", MP, "tmpfs", 0, NULL) != 0) {
+    if (mount("tmpfs", MP, "tmpfs", 0, "size=16m") != 0) {
         no("mount(tmpfs, " MP ") errno=%d", errno);
         printf("tmpfs: BITS=0x%x (want 0xff)\n", g_bits);
         return g_bits;
@@ -256,7 +258,7 @@ int main(void)
                    "ENOSPC (%d)", e, total, ENOSPC);
             else
                 ok(32, "size cap ENFORCED: ENOSPC after %ld bytes on the "
-                       "default mount", total);
+                       "16 MiB mount", total);
             unlink(MP "/big");
         }
     }

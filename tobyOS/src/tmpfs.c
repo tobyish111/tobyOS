@@ -30,9 +30,10 @@
  * filesystem with no limit is a way for any process to consume all of RAM and
  * take the machine down -- `cat /dev/zero > /tmp/x` is enough. Linux caps
  * tmpfs at half of RAM by default for exactly this reason. The cap here is per
- * mount, defaults to TMPFS_DEFAULT_BYTES, and is settable by the standard
- * `size=` mount option; exceeding it is ENOSPC, which is a state callers
- * already handle.
+ * mount, defaults to half of RAM as Linux's (it was 16 MiB, which a large
+ * archive unpacked into /tmp ran out of -- finding 231), and is settable by
+ * the standard `size=` mount option; exceeding it is ENOSPC, which is a
+ * state callers already handle.
  *
  * `size=` IS PARSED rather than accepted and ignored. A mount that silently
  * gives you a different size than you asked for is the same class of lie as a
@@ -45,6 +46,7 @@
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
 #include <tobyos/proc.h>       /* a link's owner: the caller (tmpfs_symlink) */
+#include <tobyos/pmm.h>        /* the default size: half of RAM (finding 231) */
 
 /* Same source tobyfs uses for a wall-clock timestamp (see tfs_now_secs). */
 static uint64_t tmpfs_now_secs(void) {
@@ -84,7 +86,13 @@ static const char *tfind_opt(const char *hay, const char *needle)
 }
 
 #define TMPFS_MAX_MOUNTS      8
-#define TMPFS_DEFAULT_BYTES  (16u * 1024u * 1024u)
+#define TMPFS_DEFAULT_BYTES  (16u * 1024u * 1024u)   /* the least default */
+
+/* A mount's size when size= does not say: half of RAM, as Linux's. */
+static size_t tmpfs_default_bytes(void) {
+    size_t half = pmm_total_pages() / 2 * 4096u;
+    return half > TMPFS_DEFAULT_BYTES ? half : TMPFS_DEFAULT_BYTES;
+}
 #define TMPFS_MIN_GROW       512u
 
 /* THE NODE TABLE GROWS, a chunk at a time, up to the mount's node limit.
@@ -93,7 +101,7 @@ static const char *tfind_opt(const char *hay, const char *needle)
  * audit). A chunk never moves once it is allocated -- an open file holds its
  * node by ADDRESS and a hard link holds its owner by INDEX -- so growing adds
  * a chunk and never copies one. The limit is Linux's `nr_inodes=` option; by
- * default one node per KiB of the byte budget (16384 for the default 16 MiB),
+ * default one node per KiB of the byte budget (16384 for 16 MiB),
  * and never fewer than the 512 the fixed table had. */
 #define TMPFS_CHUNK_NODES    128u
 #define TMPFS_MIN_NODES      512u
@@ -1003,8 +1011,8 @@ int tmpfs_mount_at(const char *path, const char *opts)
         if (!g_tmpfs[i].used) m = &g_tmpfs[i];
     if (!m) return VFS_ERR_NOSPC;
 
-    size_t max_bytes = want ? want : TMPFS_DEFAULT_BYTES;
     size_t max_nodes = want_nodes;
+    size_t max_bytes = want ? want : tmpfs_default_bytes();
     if (!max_nodes) {
         max_nodes = max_bytes / TMPFS_BYTES_PER_NODE;
         if (max_nodes < TMPFS_MIN_NODES)   max_nodes = TMPFS_MIN_NODES;

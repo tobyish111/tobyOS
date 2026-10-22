@@ -48,8 +48,10 @@ int main(void) {
         printf("stat: tmp magic=0x%lx blocks=%ld bfree=%ld ffree=%ld\n",
                (long)s.f_type, (long)s.f_blocks,
                (long)s.f_bfree, (long)s.f_ffree);
+        /* a budget, as Linux's: half of RAM by default (it was 16 MiB, and
+         * this asked for at most 65536 blocks; finding 231) */
         if (r == 0 && s.f_type == 0x01021994 && s.f_blocks > 0 &&
-            s.f_blocks <= (1 << 16) && s.f_bfree <= s.f_blocks)
+            s.f_bfree <= s.f_blocks)
             bits |= 2;
     }
 
