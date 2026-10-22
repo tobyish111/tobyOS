@@ -3186,15 +3186,14 @@ static bool open_dir_path(char *kpath, bool nofollow) {
 /* THE MODE A PROCESS'S NEW FILE OR DIRECTORY GETS: the mode it asked for
  * less its umask (POSIX open, creat, mknod, mkdir). Every file used to be
  * 0644 whatever was asked -- `umask 000; > f` was 0644 where Linux gives
- * 0666, `umask 077; > f` 0644 for 0600 (logs/b14 r2). A NATIVE caller's
- * mode 0 means "unspecified" (the GUI programs and the in-kernel
- * personalities pass it) and takes DEFLT, 0666 for a file and 0777 for a
- * directory -- 0644 and 0755 under the usual umask, the old defaults; a
- * Linux program's 0 is a real 0000. */
-static uint32_t sys_creation_mode(int mode, uint32_t deflt) {
+ * 0666, `umask 077; > f` 0644 for 0600 (logs/b14 r2). A mode of 0 is a
+ * real 0000 for every caller, as on Linux: a NATIVE caller's 0 meant
+ * "unspecified" and took 0666 or 0777, so the native `mkdir -m 0 d` made
+ * 0755 (finding 199). The GUI programs that passed 0 for "the default"
+ * pass 0666 and 0777 now. */
+static uint32_t sys_creation_mode(int mode) {
     struct proc *p = current_proc();
     uint32_t m = (uint32_t)mode & 07777u;
-    if (m == 0 && !(p && p->personality == ABI_PERS_LINUX)) m = deflt;
     if (p) m &= ~(p->umask & 0777u);
     return m;
 }
@@ -3741,7 +3740,7 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
         int sr = vfs_stat(kpath, &st);
         if (sr == VFS_OK && want_excl) return -ABI_EEXIST;
         if (sr == VFS_ERR_NOENT) {
-            int cr = vfs_create_mode(kpath, sys_creation_mode(mode, 0666u));
+            int cr = vfs_create_mode(kpath, sys_creation_mode(mode));
             /* Slice 61c: map the REAL failure. The old blanket EACCES made
              * a FULL /data volume report "Permission denied" -- chrome's
              * shared-memory allocator logged 64k of those while the actual
@@ -4704,13 +4703,9 @@ static long sys_mkdir(const char *path, int mode) {
     if (rr) return rr;
     /* Slice 86: honour the requested mode. A caller that asks for a private
      * directory and then verifies it (chrome's ProcessSingleton CHECKs for
-     * exactly 0700) must not be told 0755. Mode 0 means "unspecified" from
-     * in-kernel callers, which keep the old default. */
-    /* Linux slice 1: apply the process umask. POSIX clears the umask bits
-     * from the requested mode. A native caller's mode 0 is "unspecified"
-     * and means 0777 less the umask -- 0755 under pid 0's 0022, the old
-     * default; a Linux program's 0 is a real 0000 (sys_creation_mode). */
-    uint32_t m = sys_creation_mode(mode, 0777u);
+     * exactly 0700) must not be told 0755. Linux slice 1: less the process
+     * umask, as POSIX has it; 0 is a real 0000 (sys_creation_mode). */
+    uint32_t m = sys_creation_mode(mode);
     /* Linux slice 1: an ALREADY-EXISTING path is EEXIST, even on a read-only
      * mount. The VFS checks writability before existence, so mkdir("/") --
      * which is on the read-only ramfs -- used to report EROFS. That broke
@@ -6886,7 +6881,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         char kpath[ABI_PATH_MAX];
         int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
         if (rr) return rr;
-        int fr = vfs_mkfifo(kpath, sys_creation_mode((int)a2, 0666u));
+        int fr = vfs_mkfifo(kpath, sys_creation_mode((int)a2));
         return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
     }
     case ABI_SYS_LSTAT:
@@ -13236,13 +13231,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint32_t fmt = mode & 0170000u;
         /* S_IFIFO is a FIFO (vfs_mkfifo): mkfifo(3) is mknod with it */
         if (fmt == 0010000u) {
-            int fr = vfs_mkfifo(kpath, sys_creation_mode((int)(mode & 07777u), 0666u));
+            int fr = vfs_mkfifo(kpath, sys_creation_mode((int)(mode & 07777u)));
             return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
         }
         if (fmt != 0 && fmt != 0100000u) return -ABI_EPERM;
         struct vfs_stat ms;
         if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
-        int cr = vfs_create_mode(kpath, sys_creation_mode((int)(mode & 07777u), 0666u));
+        int cr = vfs_create_mode(kpath, sys_creation_mode((int)(mode & 07777u)));
         if (cr != VFS_OK) return vfs_err_to_abi(cr);
         return 0;
     }

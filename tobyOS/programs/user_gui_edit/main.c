@@ -200,7 +200,7 @@ static int save_file(void){
           tobylog_write(ABI_SLOG_LEVEL_WARN,"edit",l); }
         return 0;
     }
-    long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0);
+    long ffd=sys_open(g_filename,O_WRONLY|O_CREAT|O_TRUNC,0666);
     if(ffd<0){
         set_message(save_reason(ffd),COL_MSG_ERR);
         /* Also to the kernel log: on real hardware that is the only record

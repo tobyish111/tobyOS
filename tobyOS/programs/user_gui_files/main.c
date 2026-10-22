@@ -285,7 +285,7 @@ static int uniquify(char *dst,usize cap,const char *dir,const char *base){
 static int copy_bytes(const char *src,const char *dst,const char **why){
     long sfd=sys_open(src,O_RDONLY,0);
     if(sfd<0){ *why="Source no longer exists"; return 0; }
-    long dfd=sys_open(dst,O_WRONLY|O_CREAT|O_TRUNC,0);
+    long dfd=sys_open(dst,O_WRONLY|O_CREAT|O_TRUNC,0666);
     if(dfd<0){ sys_close((int)sfd); *why="Create failed (read-only folder?)"; return 0; }
     int err=0;
     for(;;){
@@ -355,9 +355,9 @@ static void do_create(int is_dir,const char *name){
     char full[256]; path_join(full,sizeof(full),g_path,name);
     if(file_exists(full)){ set_status("A file with that name already exists"); return; }
     if(is_dir){
-        set_status(sys_mkdir(full,0)==0?"Folder created":"mkdir failed");
+        set_status(sys_mkdir(full,0777)==0?"Folder created":"mkdir failed");
     } else {
-        long fd=sys_open(full,O_WRONLY|O_CREAT|O_TRUNC,0);
+        long fd=sys_open(full,O_WRONLY|O_CREAT|O_TRUNC,0666);
         if(fd<0){ set_status("Create failed (read-only folder?)"); return; }
         sys_close((int)fd);
         set_status2("Created: ",name);
