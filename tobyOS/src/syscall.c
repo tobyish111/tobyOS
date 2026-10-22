@@ -2742,6 +2742,20 @@ static int trailing_slash_dir(const char *uraw, char *kpath, size_t cap) {
     return st.type == VFS_TYPE_DIR ? 0 : -ABI_ENOTDIR;
 }
 
+/* A LINK'S NEW NAME ENDING IN '/' (finding 223): Linux's link and symlink
+ * say EEXIST when something has the name and ENOENT when nothing does --
+ * the walk cleaned the slash away, and `ln a x/` made x. */
+static int new_name_slash(const char *uraw, const char *kpath) {
+    char raw[ABI_PATH_MAX];
+    long rl = strncpy_from_user(raw, uraw, sizeof raw);
+    if (rl < 2) return 0;
+    raw[sizeof raw - 1] = 0;
+    size_t n = strlen(raw);
+    if (n < 2 || raw[n - 1] != '/') return 0;
+    struct vfs_stat st;
+    return vfs_stat(kpath, &st) == VFS_OK ? -ABI_EEXIST : -ABI_ENOENT;
+}
+
 /* ---- Track B graphics: the Linux framebuffer device /dev/fb0 -----------
  *
  * A genuine Linux fbdev: open("/dev/fb0") -> FILE_KIND_FB; FBIOGET_VSCREENINFO
@@ -6595,6 +6609,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
          * (finding 188), ENAMETOOLONG -- not always ENOENT */
         if (orr != 0) return orr;
         if (nrr != 0) return nrr;
+        /* "f/" and "x/" as Linux's (finding 223) */
+        orr = trailing_slash_dir((const char *)a1, kold, sizeof kold);
+        if (orr != 0) return orr;
+        nrr = new_name_slash((const char *)a2, knew);
+        if (nrr != 0) return nrr;
         long lr = vfs_link(kold, knew);
         if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
         return vfs_err_to_abi(lr);
@@ -7691,8 +7710,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
         if (!user_str_in(ktarget, sizeof(ktarget),
                          (const char *)(uintptr_t)a1)) return -ABI_EFAULT;
+        if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
         int rr = resolve_user_path((const char *)(uintptr_t)a2,
                                    klink, sizeof klink);
+        if (rr) return rr;
+        rr = new_name_slash((const char *)(uintptr_t)a2, klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
         /* every error as itself: a directory without write permission is
@@ -13464,6 +13486,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * (finding 188), ENAMETOOLONG -- not always ENOENT */
         if (orr != 0) return orr;
         if (nrr != 0) return nrr;
+        /* "f/" and "x/" as Linux's (finding 223) */
+        orr = trailing_slash_dir(at ? (const char *)a2 : (const char *)a1, kold, sizeof kold);
+        if (orr != 0) return orr;
+        nrr = new_name_slash(at ? (const char *)a4 : (const char *)a2, knew);
+        if (nrr != 0) return nrr;
         long lr = vfs_link(kold, knew);
         if (lr == VFS_ERR_ROFS) return -ABI_EPERM;
         return vfs_err_to_abi(lr);
@@ -14997,9 +15024,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         char ktarget[ABI_PATH_MAX], klink[ABI_PATH_MAX];
         if (strncpy_from_user(ktarget, utarget, sizeof ktarget) < 0)
             return -ABI_EFAULT;
+        if (!ktarget[0]) return -ABI_ENOENT;     /* as Linux's (223) */
         /* symlinkat's link path is relative to NEWDIRFD; it was the cwd */
         int rr = is_at ? resolve_user_path_at((int)a2, ulink, klink, sizeof klink)
                        : resolve_user_path(ulink, klink, sizeof klink);
+        if (rr) return rr;
+        rr = new_name_slash(ulink, klink);
         if (rr) return rr;
         int rc = vfs_symlink(klink, ktarget);
         /* every error as itself -- EACCES, EROFS, ENOENT were EIO */
