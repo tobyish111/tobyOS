@@ -3013,30 +3013,35 @@ static void tar_close_read(void) {
 
 /* ---- --totals, --checkpoint ------------------------------------------------- */
 
-/* GNU's human-readable byte count: "10KiB", "1.5MiB" */
-static void tar_human(char *buf, size_t cap, double v, const char *unit_suffix) {
+/* GNU's human-readable count of NUM/DEN: "10KiB", "1.5MiB", rounded up
+ * (gnulib human_readable's default). In integers: this program is built
+ * without SSE and libtoby's printf with it, so a double given to %f came
+ * out 0 -- "(0KiB)" (finding 230). */
+static void tar_human(char *buf, size_t cap, unsigned __int128 num, uintmax_t den,
+                      const char *unit_suffix) {
     static const char *u[] = { "", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei" };
+    unsigned __int128 n = num, d = den ? den : 1;
     int i = 0;
-    while (v >= 1024 && i < 6) { v /= 1024; i++; }
-    if (i == 0) snprintf(buf, cap, "%.0f%s%s", v, "", unit_suffix[0] == 'B' ? "B" : unit_suffix);
-    else if (v < 10) {
-        double r = (double)(long)(v * 10 + 0.999999) / 10;
-        if (r >= 10) snprintf(buf, cap, "%.0f%s%s", r, u[i], unit_suffix);
-        else snprintf(buf, cap, "%.1f%s%s", r, u[i], unit_suffix);
+    while (n >= d * 1024 && i < 6) { d *= 1024; i++; }
+    if (i == 0) {
+        snprintf(buf, cap, "%ju%s", (uintmax_t)((n + d - 1) / d), unit_suffix);
+    } else if (n < d * 10) {
+        uintmax_t t = (uintmax_t)((n * 10 + d - 1) / d);      /* tenths, up */
+        if (t >= 100) snprintf(buf, cap, "%ju%s%s", t / 10, u[i], unit_suffix);
+        else snprintf(buf, cap, "%ju.%ju%s%s", t / 10, t % 10, u[i], unit_suffix);
     } else {
-        double r = (double)(long)(v + 0.999999);
-        snprintf(buf, cap, "%.0f%s%s", r, u[i], unit_suffix);
+        snprintf(buf, cap, "%ju%s%s", (uintmax_t)((n + d - 1) / d), u[i], unit_suffix);
     }
 }
 
 static void tar_print_totals(int writing, uintmax_t bytes) {
     struct timeval now;
     gettimeofday(&now, 0);
-    double secs = (double)(now.tv_sec - tar_ar.start.tv_sec) +
-                  (double)(now.tv_usec - tar_ar.start.tv_usec) / 1e6;
+    int64_t us = (int64_t)(now.tv_sec - tar_ar.start.tv_sec) * 1000000 +
+                 (int64_t)(now.tv_usec - tar_ar.start.tv_usec);
     char h[32], r[32];
-    tar_human(h, sizeof h, (double)bytes, "B");
-    if (secs > 0) tar_human(r, sizeof r, (double)bytes / secs, "B/s");
+    tar_human(h, sizeof h, bytes, 1, "B");
+    if (us > 0) tar_human(r, sizeof r, (unsigned __int128)bytes * 1000000, (uintmax_t)us, "B/s");
     else snprintf(r, sizeof r, "? B/s");
     /* "10KiB": the B is part of the unit only with a prefix */
     size_t hl = strlen(h);
