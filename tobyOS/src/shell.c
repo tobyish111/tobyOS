@@ -19840,6 +19840,8 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
  * so the trap sees the status the `.` came in with; $? is 1 after it
  * (logs/s12c/dot-rs-*.bash). */
 static int g_shell_prev_status;      /* defined with exit/return, below */
+static int g_return_prev_status;     /* the RETURN trap's $? (finding 30) */
+static bool g_return_pending;
 
 static void shell_dot_failed(int status_in) {
     shell_set_status(status_in);
@@ -19926,12 +19928,19 @@ static void cmd_dot(int argc, char **argv) {
     argv[1] = resolved;
     if (argc <= 2) {
         g_source_depth++;                  /* `return` is legal in here */
+        g_return_pending = false;
+        /* the file starts with the caller's $?, as bash's does */
+        shell_set_status(status_in);
         int st1 = shell_syn_absorb(shell_run_script_path(argv[1], false));
         g_source_depth--;
         g_diag_source = saved_src;
         g_diag_in_fn = saved_in_fn;
-        shell_set_status(st1);
+        /* the trap sees $? as `return` found it, then $? is the file's
+         * status (finding 30) */
+        shell_set_status(g_return_pending ? g_return_prev_status : st1);
+        g_return_pending = false;
         shell_run_return_trap();       /* a sourced script finished */
+        shell_set_status(st1);
         return;
     }
 
@@ -19942,11 +19951,14 @@ static void cmd_dot(int argc, char **argv) {
         return;
     }
     g_source_depth++;                      /* `return` is legal in here */
+    g_return_pending = false;
+    shell_set_status(status_in);           /* the caller's $?, as bash's */
     int st = shell_syn_absorb(shell_run_script_path(argv[1], false));
     g_source_depth--;
     g_diag_source = saved_src;
     g_diag_in_fn = saved_in_fn;
-    shell_set_status(st);
+    shell_set_status(g_return_pending ? g_return_prev_status : st);   /* finding 30 */
+    g_return_pending = false;
     shell_run_return_trap();           /* a sourced script finished */
     shell_restore_params_from_frame(&frame);
     shell_set_status(st);
@@ -20235,6 +20247,13 @@ static void cmd_continue(int argc, char **argv) {
 /* The line of the last `return` that ran: the RETURN trap's line_number
  * when a function returns by it (shell_run_function). */
 static unsigned long g_return_line;
+/* WHAT THE RETURN TRAP SEES: $? as it was when `return` ran -- the last
+ * command's status, not the return value, which becomes $? only after the
+ * trap (bash 5.2: `f() { false; return 3; }` traps with 1, then $? is 3; a
+ * sourced `return 3` the same). G_RETURN_PENDING says a `return` is on its
+ * way out; the function call or the `.` it leaves takes it (finding 30). */
+static int g_return_prev_status;
+static bool g_return_pending;
 
 static void cmd_return(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
@@ -20270,6 +20289,8 @@ static void cmd_return(int argc, char **argv) {
     g_shell_flow = SHELL_FLOW_RETURN;
     g_shell_flow_status = st;
     g_return_line = g_shell_lineno;
+    g_return_prev_status = g_shell_prev_status;
+    g_return_pending = true;
     shell_set_status(st);
 }
 
@@ -38370,7 +38391,8 @@ static int shell_run_function(struct shell_simple *cmd) {
             enum shell_flow fl = g_shell_flow;
             int fls = g_shell_flow_status;
             if (fl == SHELL_FLOW_RETURN) {
-                shell_set_status(fls);
+                /* the trap's $? is the status `return` found (finding 30) */
+                shell_set_status(g_return_pending ? g_return_prev_status : fls);
                 g_shell_flow = SHELL_FLOW_NONE;
             }
             if (g_shell_flow == SHELL_FLOW_NONE) {
@@ -38432,6 +38454,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
     }
+    g_return_pending = false;            /* this call took its `return` */
     /* Before the depth drops: undo anything this frame localised. `return`
      * from the middle of a function reaches here too, which is the whole
      * reason the unwind is here rather than at the end of the body. */
