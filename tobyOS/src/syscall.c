@@ -1964,8 +1964,10 @@ static long lx_do_setpgid(long a1, long a2) {
     /* Only yourself or your own child, within your session. */
     if (t != me && t->ppid != me->pid) return -ABI_EPERM;
     if (t->session_id != me->session_id) return -ABI_EPERM;
-    long pg = (a2 == 0) ? t->pid : a2;
-    if (pg < 0) return -ABI_EINVAL;
+    if (a2 < 0) return -ABI_EINVAL;
+    /* the group by the caller's number for it (finding 226) */
+    long pg = (a2 == 0) ? t->pid : pid_knr((int)a2);
+    if (pg == 0) return -ABI_EPERM;          /* no such group to join */
     if (pg != t->pid) {
         /* Joining a group: it must exist in this session. */
         extern struct proc g_proc[];
@@ -1985,11 +1987,12 @@ static long lx_do_setpgid(long a1, long a2) {
 static long lx_do_getpgid(long a1) {
     struct proc *me = current_proc();
     if (!me) return -ABI_ESRCH;
-    if (a1 == 0) return proc_pgid_of(me);
+    /* the caller's number for the group, as /proc says it (finding 226) */
+    if (a1 == 0) return pid_vnr_of_kpid(proc_pgid_of(me));
     int tk = pid_knr((int)a1);
     struct proc *t = tk ? proc_lookup(tk) : 0;
     if (!t) return -ABI_ESRCH;
-    return proc_pgid_of(t);
+    return pid_vnr_of_kpid(proc_pgid_of(t));
 }
 
 static long sys_getgid(void) {
@@ -14908,9 +14911,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return do_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
     }
     case 124: {                         /* getsid(pid) */
-        struct proc *t = a1 ? proc_lookup((int)a1) : current_proc();
+        /* in the caller's numbers, both ways (finding 226) */
+        int tk = a1 ? pid_knr((int)a1) : 0;
+        struct proc *t = a1 ? (tk ? proc_lookup(tk) : 0) : current_proc();
         if (!t) return -ABI_ESRCH;
-        return t->sid;
+        return t->sid > 0 ? pid_vnr_of_kpid(t->sid) : t->sid;
     }
 
     /* ---- readlink (B20): backs readlink(/proc/self/exe), realpath, etc. ---- */

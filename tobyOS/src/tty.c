@@ -3,6 +3,7 @@
  * input source is the shared keyboard ring (kbd_trygetc), its echo sink is
  * kputc (console + serial). */
 
+#include <tobyos/nsproxy.h>   /* pid_knr, pid_vnr_of_kpid (226) */
 #include <tobyos/tty.h>
 #include <tobyos/keyboard.h>
 #include <tobyos/console.h>
@@ -309,6 +310,7 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
             struct proc *p = current_proc();
             pg = p ? (p->pgid > 0 ? p->pgid : p->pid) : 1;
         }
+        pg = pid_vnr_of_kpid(pg);         /* the caller's number (226) */
         if (copy_to_user((void *)arg, &pg, sizeof(pg)) != 0)
             return -ABI_EFAULT;
         return 0;
@@ -319,7 +321,11 @@ long tty_console_ioctl(unsigned long cmd, unsigned long arg) {
         int pg = 0;
         if (copy_from_user(&pg, (const void *)arg, sizeof(pg)) != 0)
             return -ABI_EFAULT;
-        if (pg > 0) signal_set_foreground(pg);
+        if (pg > 0) {                     /* the caller's number (226) */
+            int kp = pid_knr(pg);
+            if (!kp) return -ABI_EPERM;
+            signal_set_foreground(kp);
+        }
         return 0;
     }
 

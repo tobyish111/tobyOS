@@ -16,6 +16,7 @@
  * out of the queue and surface as EINTR_RET).
  */
 
+#include <tobyos/nsproxy.h>   /* pid_knr, pid_vnr_of_kpid (226) */
 #include <tobyos/pty.h>
 #include <tobyos/file.h>
 #include <tobyos/proc.h>
@@ -921,13 +922,19 @@ long pty_ioctl(struct file *f, unsigned long cmd, unsigned long arg) {
         return 0;
     }
     case TTY_TIOCGPGRP: {
-        int pg = t->pgrp;
+        /* the caller's number for the group (finding 226) */
+        int pg = t->pgrp > 0 ? pid_vnr_of_kpid(t->pgrp) : t->pgrp;
         if (copy_to_user((void *)arg, &pg, sizeof(pg)) != 0) return -ABI_EFAULT;
         return 0;
     }
     case TTY_TIOCSPGRP: {
         int pg;
         if (copy_from_user(&pg, (const void *)arg, sizeof(pg)) != 0) return -ABI_EFAULT;
+        if (pg > 0) {                     /* the caller's number (226) */
+            int kp = pid_knr(pg);
+            if (!kp) return -ABI_EPERM;
+            pg = kp;
+        }
         t->pgrp = pg;
         return 0;
     }

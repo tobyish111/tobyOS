@@ -1352,8 +1352,13 @@ int sys_kill(int pid, int sig) {
         /* kill(-pgid): the whole process group. This branch DID NOT EXIST
          * -- a negative pid fell through every arm and returned 0, so
          * `kill -- -$!` reported success while signalling nobody. ESRCH
-         * when the group has no member the caller can see, like Linux. */
-        int pg = -pid;
+         * when the group has no member the caller can see, like Linux.
+         * THE GROUP BY THE CALLER'S NUMBER for it (finding 226): pgids are
+         * kernel pids underneath, which /proc and getpgid translate -- an
+         * untranslated -PGID inside a pid namespace named some OTHER group
+         * (unshare's own took kill's fixture's SIGUSR1). */
+        int pg = pid_knr(-pid);
+        if (!pg) return -3;                         /* not visible: ESRCH */
         extern struct proc g_proc[];
         bool any = false;
         for (int i = 1; i < PROC_MAX; i++) {
