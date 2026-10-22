@@ -115,6 +115,9 @@ struct tmpfs_node {
      * nothing, because unlink freed the data out from under the fd. */
     int           open_count;
     bool          unlinked;
+    /* Its creation number (a rename renumbers it): readdir lists a
+     * directory's children newest first, as Linux's tmpfs (finding 221). */
+    uint64_t      seq;
     /* Hard links. A tmpfs node is keyed by its PATH, so a second name for
      * the same bytes needs one level of indirection: `link_to` is 0 for an
      * entry that owns its data, or (owner index + 1) for an extra name.
@@ -134,6 +137,7 @@ struct tmpfs_mount {
     bool                reported_full;  /* census printed once, not per create */
     uint32_t            root_mode; /* the mount root's permissions (mode=) */
     uint64_t            root_time; /* when it was mounted: the root's times */
+    uint64_t            next_seq;  /* the next node's creation number */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
@@ -438,6 +442,7 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
     if (!nd) return VFS_ERR_NOSPC;
     memset(nd, 0, sizeof *nd);
     nd->used = true;
+    nd->seq = ++m->next_seq;
     nd->type = VFS_TYPE_FILE;
     nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
@@ -462,6 +467,7 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     if (!nd) return VFS_ERR_NOSPC;
     memset(nd, 0, sizeof *nd);
     nd->used = true;
+    nd->seq = ++m->next_seq;
     nd->type = VFS_TYPE_DIR;
     nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
@@ -537,6 +543,7 @@ static int tmpfs_symlink(void *mnt, const char *path, const char *target)
     if (!nd) return VFS_ERR_NOSPC;
     memset(nd, 0, sizeof *nd);
     nd->used = true;
+    nd->seq = ++m->next_seq;
     nd->type = VFS_TYPE_SYMLINK;
     nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
@@ -589,6 +596,7 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     if (!nn) return VFS_ERR_NOSPC;
     memset(nn, 0, sizeof *nn);
     nn->used = true;
+    nn->seq = ++m->next_seq;
     nn->type = ino->type;
     tcopy(nn->path, nw, sizeof nn->path);
     nn->path[sizeof nn->path - 1] = '\0';
@@ -667,7 +675,14 @@ static int tmpfs_fstat(struct vfs_file *f, struct vfs_stat *out)
     return VFS_OK;
 }
 
-struct tmpfs_dirh { struct tmpfs_mount *m; char dir[VFS_PATH_MAX]; size_t i; };
+/* A directory handle: the children's slots as opendir found them, newest
+ * first (finding 221), and how far readdir has come. */
+struct tmpfs_dirh {
+    struct tmpfs_mount *m;
+    char dir[VFS_PATH_MAX];
+    size_t i, n;
+    size_t *slot;
+};
 
 static int tmpfs_opendir(void *mnt, const char *path, struct vfs_dir *out)
 {
@@ -681,15 +696,43 @@ static int tmpfs_opendir(void *mnt, const char *path, struct vfs_dir *out)
     }
     struct tmpfs_dirh *dh = kmalloc(sizeof *dh);
     if (!dh) return VFS_ERR_NOMEM;
-    dh->m = m; dh->i = 0;
+    dh->m = m; dh->i = 0; dh->n = 0; dh->slot = 0;
     tcopy(dh->dir, norm, sizeof dh->dir);
     dh->dir[sizeof dh->dir - 1] = '\0';
+    size_t cnt = 0;
+    for (size_t i = 0; i < m->nnodes; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (nd->used && !nd->unlinked && tchild_of(dh->dir, nd->path)) cnt++;
+    }
+    if (cnt) {
+        dh->slot = kmalloc(cnt * sizeof *dh->slot);
+        if (!dh->slot) { kfree(dh); return VFS_ERR_NOMEM; }
+        for (size_t i = 0; i < m->nnodes && dh->n < cnt; i++) {
+            struct tmpfs_node *nd = tnode(m, i);
+            if (nd->used && !nd->unlinked && tchild_of(dh->dir, nd->path))
+                dh->slot[dh->n++] = i;
+        }
+        /* newest first: by creation number, descending (insertion sort --
+         * a directory's children, already nearly in slot order) */
+        for (size_t a = 1; a < dh->n; a++) {
+            size_t v = dh->slot[a];
+            uint64_t sv = tnode(m, v)->seq;
+            size_t c = a;
+            while (c > 0 && tnode(m, dh->slot[c - 1])->seq < sv) {
+                dh->slot[c] = dh->slot[c - 1];
+                c--;
+            }
+            dh->slot[c] = v;
+        }
+    }
     out->priv = dh;
     return VFS_OK;
 }
 
 static int tmpfs_closedir(struct vfs_dir *d)
 {
+    struct tmpfs_dirh *dh = d->priv;
+    if (dh && dh->slot) kfree(dh->slot);
     if (d->priv) kfree(d->priv);
     d->priv = NULL;
     return VFS_OK;
@@ -699,11 +742,14 @@ static int tmpfs_readdir(struct vfs_dir *d, struct vfs_dirent *out)
 {
     struct tmpfs_dirh *dh = d->priv;
     if (!dh) return VFS_ERR_INVAL;
-    for (; dh->i < dh->m->nnodes; dh->i++) {
-        struct tmpfs_node *nd = tnode(dh->m, dh->i);
+    for (; dh->i < dh->n; dh->i++) {
+        size_t sl = dh->slot[dh->i];
+        if (sl >= dh->m->nnodes) continue;
+        struct tmpfs_node *nd = tnode(dh->m, sl);
         /* `unlinked` means the NAME is gone; the slot only survives to
          * keep open handles valid. Listing it made `ls` show files that
-         * unlink() had already removed. */
+         * unlink() had already removed. A slot removed since opendir is
+         * skipped the same way (and one reused is not its child). */
         if (!nd->used || nd->unlinked) continue;
         const char *name = tchild_of(dh->dir, nd->path);
         if (!name) continue;
@@ -835,6 +881,7 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     }
     tcopy(src->path, nw, sizeof src->path);
     src->path[sizeof src->path - 1] = '\0';
+    src->seq = ++m->next_seq;            /* newest where it now is (221) */
     return VFS_OK;
 }
 
