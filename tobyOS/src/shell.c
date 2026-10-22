@@ -22720,7 +22720,10 @@ static void cmd_printf(int argc, char **argv) {
                  * Measured against bash 5.2: `printf '%()T' 0` and
                  * `printf '%(%X)T' 0` are byte-identical, and neither carries
                  * the date. */
-                if (civil_strftime(tbuf, sizeof tbuf, dn ? dfmt : "%X", &ct) == 0)
+                /* in bash's 128 bytes: a time that does not fit (with its
+                 * NUL) is no text at all, as bash's strftime into its
+                 * timebuf[128] gives (Oils 1036) */
+                if (civil_strftime(tbuf, 128, dn ? dfmt : "%X", &ct) == 0)
                     tbuf[0] = '\0';
                 int slen = (int)strlen(tbuf);
                 /* `%10.5(%Y-%m-%d)T` is `     2019-`: the precision cuts
