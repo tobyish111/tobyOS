@@ -2618,7 +2618,11 @@ int ext4_mount(const char *mount_point, struct blk_dev *dev) {
     if (!fs) return VFS_ERR_INVAL;
 
     int rc = vfs_mount(mount_point, &ext4_ops, fs);
-    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
+    if (rc == VFS_OK && dev->name) {
+        char sp[48];                   /* its /dev node's path (finding 198) */
+        extern bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
+        vfs_mount_set_source(mount_point, devfs_blk_path(dev, sp, sizeof sp) ? sp : dev->name);
+    }
     if (rc != VFS_OK) {
         kprintf("[ext4] vfs_mount('%s') failed: %d\n", mount_point, rc);
         ext4_free(fs);

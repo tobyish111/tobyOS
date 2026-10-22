@@ -157,6 +157,9 @@ enum file_kind {
     /* /dev/rtc0, the RTC as Linux's rtc-cmos gives it: RTC_RD_TIME and
      * RTC_SET_TIME; one opener at a time (finding 157's write-back). */
     FILE_KIND_RTC        = 27,
+    /* /dev/sda and the rest (finding 198): a disk or partition's bytes,
+     * read and written a sector at a time underneath. */
+    FILE_KIND_BLKDEV     = 28,
 };
 
 struct eventfd;
@@ -165,6 +168,7 @@ struct shm_cache;
 struct timerfd;
 struct signalfd;
 struct nsfd;
+struct blk_dev;
 
 struct file {
     enum file_kind  kind;
@@ -194,6 +198,10 @@ struct file {
     struct window  *win;
     /* For TERM (milestone 13). */
     struct term_session *term;
+    /* For FILE_KIND_BLKDEV: the device and the offset (finding 198).
+     * Struct grew: CLEAN BUILD required. */
+    struct blk_dev *blkdev;
+    uint64_t        blk_pos;
     /* For FILE_KIND_DIR (Track B/B3 getdents64): kmalloc'd absolute path
      * of the directory + how many entries have already been returned, so
      * each getdents64 re-opens and resumes. */

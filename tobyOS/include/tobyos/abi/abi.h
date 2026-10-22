@@ -145,6 +145,7 @@ extern "C" {
 #define ABI_EINTR            4   /* interrupted system call */
 #define ABI_ENOTEMPTY       39   /* directory not empty (rmdir) */
 #define ABI_ENOLCK          37   /* no record locks available (table full) */
+#define ABI_ENOTBLK         15   /* block device required (mount of a file, batch 32) */
 #define ABI_ENODEV          19   /* no such device / unknown filesystem type */
 #define ABI_ENODATA         61   /* no such extended attribute (Linux ENODATA) */
 #define ABI_ENOTSUP         95   /* operation not supported (EOPNOTSUPP) */

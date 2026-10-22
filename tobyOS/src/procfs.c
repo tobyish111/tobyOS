@@ -1519,6 +1519,10 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
     else if (strcmp(rel, "mounts") == 0)  { len = gen_mounts(buf, sizeof(buf)); }
     else if (strcmp(rel, "filesystems") == 0) { len = gen_filesystems(buf, sizeof(buf)); }
     else if (strcmp(rel, "devices") == 0) { len = gen_devices(buf, sizeof(buf)); }
+    else if (strcmp(rel, "partitions") == 0) {     /* finding 198 */
+        extern size_t devfs_partitions(char *buf, size_t cap);
+        len = (int)devfs_partitions(buf, sizeof(buf));
+    }
     else {
         /* Try /proc/<pid>/<file> */
         if (rel[0] >= '0' && rel[0] <= '9') {
@@ -2002,8 +2006,10 @@ static int procfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                                          /* slice 6 */
                                          "filesystems", "devices",
                                          /* native-parity batch */
-                                         "modules", "vmstat" };
-        const int nglobals = 12;
+                                         "modules", "vmstat",
+                                         /* batch 32 (finding 198) */
+                                         "partitions" };
+        const int nglobals = 13;
         if (dh->index < nglobals) {
             memset(out->name, 0, VFS_NAME_MAX);
             size_t nl = strlen(globals[dh->index]);

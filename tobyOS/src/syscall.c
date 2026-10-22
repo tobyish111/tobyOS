@@ -77,6 +77,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/page_fault.h>   /* get_pte / PTE_* -- deadlocked-thread stack walk */
 #include <tobyos/devtest.h>
 #include <tobyos/blk.h>
+#include <tobyos/devfs.h>   /* the disks' nodes (finding 198) */
 #include <tobyos/provision.h>
 #include <tobyos/arp.h>        /* ABI_SYS_ARP */
 #include <tobyos/display.h>
@@ -3414,6 +3415,30 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
          * remap a child's stdio before execve; without it chrome's children
          * bailed with _exit(127) ("GPU process exited unexpectedly:
          * exit_code=32512"). Ubiquitous in Unix programs generally. */
+        /* A DISK OR PARTITION'S NODE (finding 198): root's and the disk
+         * group's, 0660, as the VFS's check of devfs's stat says; its
+         * bytes as a file. */
+        {
+            struct blk_dev *bd = devfs_blk_by_path(kpath, 0, 0);
+            if (bd) {
+                int acc = flags & ABI_O_ACCMODE;
+                int want = acc == ABI_O_RDONLY ? VFS_WANT_READ
+                         : acc == ABI_O_WRONLY ? VFS_WANT_WRITE
+                         : VFS_WANT_READ | VFS_WANT_WRITE;
+                int pc = vfs_perm_check(kpath, want);
+                if (pc != VFS_OK) return vfs_err_to_abi(pc);
+                struct file *f = (struct file *)kmalloc(sizeof(*f));
+                if (!f) return -ABI_ENOMEM;
+                memset(f, 0, sizeof(*f));
+                f->kind = FILE_KIND_BLKDEV;
+                f->blkdev = bd;
+                f->o_accmode = acc;
+                int fd = fd_alloc_into(current_proc(), f);
+                if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+                file_set_open_path(f, kpath);
+                return fd;
+            }
+        }
         if (strcmp(dev, "null") == 0 || strcmp(dev, "zero") == 0) {
             struct file *f = (struct file *)kmalloc(sizeof(*f));
             if (!f) return -ABI_ENOMEM;
@@ -3953,6 +3978,17 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     default:
         break;
     }
+    if (f->kind == FILE_KIND_BLKDEV) {          /* finding 198 */
+        int64_t bsz = f->blkdev ? (int64_t)(f->blkdev->sector_count * BLK_SECTOR_SIZE) : 0;
+        int64_t bp = whence == ABI_SEEK_SET ? off
+                   : whence == ABI_SEEK_CUR ? (int64_t)f->blk_pos + off
+                   : whence == ABI_SEEK_END ? bsz + off : -1;
+        if (whence != ABI_SEEK_SET && whence != ABI_SEEK_CUR && whence != ABI_SEEK_END)
+            return -ABI_EINVAL;
+        if (bp < 0) return -ABI_EINVAL;
+        f->blk_pos = (uint64_t)bp;
+        return bp;
+    }
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
     int64_t cur  = (int64_t)file_pos_get(f);
     int64_t size = (int64_t)f->vfs.size;
@@ -4113,6 +4149,7 @@ static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_sta
         out->rdev_major = maj;
         out->rdev_minor = min;
     }
+    if ((mode & ABI_S_IFMT) == ABI_S_IFBLK) out->gid = userns_cur_gid(6);   /* 198 */
     uint32_t pu, pg;
     uint64_t pt[3];
     if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
@@ -4333,6 +4370,13 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
     if (sm) {
         tmp->mode = sm;
         tmp->nlink = 1;
+        if ((sm & ABI_S_IFMT) == ABI_S_IFBLK) {          /* a disk (198) */
+            tmp->rdev_major = mj;
+            tmp->rdev_minor = mn;
+            tmp->gid = userns_cur_gid(6);
+            tmp->blksize = 4096;
+            return;
+        }
         if ((sm & ABI_S_IFMT) != ABI_S_IFCHR) {
             struct proc *p = current_proc();
             tmp->uid = userns_cur_uid(p ? (uint32_t)p->uid : 0);
@@ -8088,12 +8132,15 @@ static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
     uint32_t dm = devfs_node_mode(kpath, &maj, &min);
     struct lx_stat st;
     memset(&st, 0, sizeof st);
-    st.st_mode    = 0x2000u | (dm & 0xFFFu);      /* S_IFCHR | its perms */
+    /* the node's own format -- a character device, or a disk's block one
+     * (finding 198), which is the disk group's */
+    st.st_mode    = (dm & 0xF000u) | (dm & 0xFFFu);
     st.st_dev     = 6;
     st.st_ino     = lx_ino_hash(kpath);
     st.st_nlink   = 1;
     st.st_rdev    = lx_makedev(maj, min);
     st.st_blksize = 4096;
+    if ((dm & 0xF000u) == 0x6000u) st.st_gid = userns_cur_gid(6);
     {   uint32_t pu, pg;
         uint64_t pt[3];
         if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
@@ -8164,6 +8211,7 @@ static uint32_t lx_fd_special_mode(struct file *f, uint32_t *maj,
     }
     case FILE_KIND_CONSOLE:   return devfs_node_mode("/dev/console", maj, min);
     case FILE_KIND_RTC:       return devfs_node_mode("/dev/rtc0", maj, min);
+    case FILE_KIND_BLKDEV:    return devfs_node_mode(f->open_path, maj, min);   /* 198 */
     case FILE_KIND_PTY_MASTER: return devfs_node_mode("/dev/ptmx", maj, min);
     case FILE_KIND_PTY_SLAVE: {
         int idx = pty_file_index(f);
@@ -8181,10 +8229,14 @@ static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
     memset(&st, 0, sizeof st);
     uint32_t fmt = mode & 0xF000u;
     st.st_mode    = mode;
-    st.st_dev     = (fmt == 0x2000u) ? 6 : 12;    /* devtmpfs-ish / pipefs-ish */
+    /* a block node is devtmpfs's as a character one is (finding 198) */
+    st.st_dev     = (fmt == 0x2000u || fmt == 0x6000u) ? 6 : 12;
     st.st_ino     = ino ? ino : 1;
     st.st_nlink   = 1;
-    if (fmt == 0x2000u) {
+    if (fmt == 0x6000u) {                 /* a disk: root's and disk's */
+        st.st_rdev = lx_makedev(maj, min);
+        st.st_gid = userns_cur_gid(6);
+    } else if (fmt == 0x2000u) {
         st.st_rdev = lx_makedev(maj, min);
         uint32_t pu, pg;
         uint64_t pt[3];
@@ -8394,9 +8446,11 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
         if (sm) {
             struct proc *sp = current_proc();
             bool chr = (sm & 0xF000u) == 0x2000u;
+            bool blk = (sm & 0xF000u) == 0x6000u;     /* a disk (198) */
             struct vfs_stat cvs = { .type = VFS_TYPE_FILE, .size = 0,
                                     .mode = sm & 0xFFFu };
-            if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+            if (blk) cvs.gid = 6;
+            else if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
             {   uint64_t pt[3];                 /* a pty slave's (finding 190) */
                 if (chr && pts_node_times(0, f, &cvs.uid, &cvs.gid, pt)) {
                     cvs.atime = pt[0]; cvs.mtime = pt[1]; cvs.ctime = pt[2];
@@ -8406,7 +8460,7 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
             if (src == 0 && ubuf) {
                 uint16_t m = (uint16_t)sm;
                 (void)copy_to_user((uint8_t *)ubuf + 0x1c, &m, sizeof m);
-                if (chr) {
+                if (chr || blk) {
                     (void)copy_to_user((uint8_t *)ubuf + 0x80, &mj, sizeof mj);
                     (void)copy_to_user((uint8_t *)ubuf + 0x84, &mn, sizeof mn);
                 }
@@ -8987,6 +9041,7 @@ static short file_poll_ready(struct file *f) {
     case FILE_KIND_DEVNULL:                  /* bit-bucket + entropy devices: */
     case FILE_KIND_DEVZERO:                  /* never block in either direction */
     case FILE_KIND_DEVRANDOM:
+    case FILE_KIND_BLKDEV:                   /* a disk, as a file is (198) */
         r |= LXP_POLLIN | LXP_POLLOUT;
         break;
     case FILE_KIND_CONSOLE:                  /* B22: real TTY input readiness */
@@ -11477,6 +11532,18 @@ long lx_access_kpath(const char *kpath, int mode) {
      * command is "Permission denied", 126, on Linux. */
     {
         uint32_t dm = dev_synth_mode(kpath);
+        if (dm && (dm & 0xF000u) == 0x6000u) {
+            /* a disk's node is root's and the disk group's, 0660, and
+             * access asks of it what it asks of a file (finding 198) */
+            struct vfs_stat bst = { .type = VFS_TYPE_FILE, .uid = 0, .gid = 6,
+                                    .mode = VFS_MODE_VALID | (dm & 07777u) };
+            int want = 0;
+            if ((unsigned)mode & 4) want |= VFS_WANT_READ;
+            if ((unsigned)mode & 2) want |= VFS_WANT_WRITE;
+            if ((unsigned)mode & 1) want |= VFS_WANT_EXEC;
+            if (!want) return 0;
+            return vfs_perm_check_st(&bst, want) == VFS_OK ? 0 : -ABI_EACCES;
+        }
         if (dm) {
             if (!((unsigned)mode & LX_X_OK)) return 0;
             return (dm & 0111u) ? 0 : -ABI_EACCES;
@@ -13713,8 +13780,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             return -ABI_ENODEV;
         }
 
-        struct blk_dev *dev = blk_find(ksrc);
+        /* THE SOURCE BY ITS /dev NODE, as Linux's mount(2) takes it --
+         * /dev/sda1, or a link to one -- or by the driver's own name, as
+         * before (finding 198). A source that is there but no disk is
+         * ENOTBLK. */
+        struct blk_dev *dev = devfs_blk_by_path(ksrc, 0, 0);
         if (!dev) {
+            char lt[VFS_PATH_MAX];
+            struct vfs_stat lst;
+            if (vfs_stat(ksrc, &lst) == VFS_OK && lst.type == VFS_TYPE_SYMLINK &&
+                vfs_follow_link(ksrc, lt, sizeof lt) == VFS_OK)
+                dev = devfs_blk_by_path(lt, 0, 0);
+        }
+        if (!dev) dev = blk_find(ksrc);
+        if (!dev) {
+            struct vfs_stat nst;
+            if (vfs_stat_follow(ksrc, &nst) == VFS_OK) return -ABI_ENOTBLK;
             kprintf("[mount] no block device '%s'\n", ksrc);
             return -ABI_ENOENT;
         }
@@ -15962,7 +16043,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                  * verified working end-to-end and this is not its slice, but
                  * it is noted in the handoff.) */
                 struct vfs_stat dvs = { .type = VFS_TYPE_FILE, .size = 0,
-                                        .uid = 0, .gid = 0,
+                                        .uid = 0,
+                                        .gid = ((dm & 0xF000u) == 0x6000u) ? 6u : 0u,
                                         .mode = dm & 0xFFFu };
                 {   uint64_t pt[3];             /* a pty slave's (finding 190) */
                     if (pts_node_times(kpath, 0, &dvs.uid, &dvs.gid, pt)) {
@@ -15972,7 +16054,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                 long src = linux_emit_statx(&dvs, lx_ino_hash(kpath),
                                             (void *)a5);
                 if (src == 0 && a5) {
-                    uint16_t m = (uint16_t)(0x2000u | (dm & 0xFFFu));
+                    uint16_t m = (uint16_t)((dm & 0xF000u) | (dm & 0xFFFu));
                     uint32_t rmaj = 0, rmin = 0;      /* the node's own */
                     (void)devfs_node_mode(kpath, &rmaj, &rmin);
                     (void)copy_to_user((uint8_t *)a5 + 0x1c, &m, sizeof m);

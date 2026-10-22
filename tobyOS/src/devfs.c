@@ -42,10 +42,13 @@
 #include <tobyos/linux_drm.h>
 #include <tobyos/snd_pcm.h>
 #include <tobyos/devfs.h>
+#include <tobyos/blk.h>
 
 #define DEV_S_IFDIR 0x4000u
 #define DEV_S_IFCHR 0x2000u
+#define DEV_S_IFBLK 0x6000u
 #define DEV_S_IFLNK 0xA000u
+#define DEV_GID_DISK 6u             /* the disk group, as on Linux */
 
 enum dev_avail { AV_ALWAYS = 0, AV_DRM, AV_SND };
 
@@ -145,6 +148,127 @@ static bool devfs_pts_index(const char *rel, int *idx) {
     return true;
 }
 
+/* THE DISKS AND THEIR PARTITIONS, under Linux's names (finding 198). /dev
+ * had none: /proc/mounts named a disk filesystem's source by the driver's
+ * own name ("ide0:master.p1"), and nothing that wants a device path --
+ * mount by device, lsblk, dd -- had one. An ATA, AHCI or USB disk is
+ * sd<letter> in the order the disks registered, a virtio disk vd<letter>,
+ * an NVMe namespace nvme<H>n<N>; a partition is its disk's name and its
+ * number (nvme0n1p1 for NVMe). The majors and minors are Linux's: sd 8
+ * and vd 253, 16 minors a disk; NVMe 259, in the order met. The nodes are
+ * root's and the disk group's, 0660. */
+enum { DB_SD, DB_VD, DB_NVME };
+
+static int devfs_blk_kind(const struct blk_dev *d) {
+    const struct blk_dev *disk = d->parent ? d->parent : d;
+    const char *n = disk->name ? disk->name : "";
+    if (strncmp(n, "nvme", 4) == 0) return DB_NVME;
+    if (strncmp(n, "virtio", 6) == 0 || strncmp(n, "vd", 2) == 0) return DB_VD;
+    return DB_SD;
+}
+
+static bool devfs_blk_ident(const struct blk_dev *d, char *out, size_t cap,
+                            uint32_t *maj, uint32_t *min) {
+    if (!d || d->gone) return false;
+    if (d->class != BLK_CLASS_DISK && d->class != BLK_CLASS_PARTITION) return false;
+    const struct blk_dev *disk = (d->class == BLK_CLASS_PARTITION) ? d->parent : d;
+    if (!disk || !disk->name) return false;
+    int kind = devfs_blk_kind(d);
+    size_t cnt = blk_count();
+    int idx = -1, k = 0;
+    for (size_t i = 0; i < cnt; i++) {
+        struct blk_dev *x = blk_get(i);
+        if (!x || x->class != BLK_CLASS_DISK || devfs_blk_kind(x) != kind) continue;
+        if (x == disk) { idx = k; break; }
+        k++;
+    }
+    if (idx < 0) return false;
+    char base[32];
+    if (kind == DB_NVME) {
+        unsigned h = 0, ns = 1;
+        const char *p = disk->name + 4;
+        while (*p >= '0' && *p <= '9') h = h * 10 + (unsigned)(*p++ - '0');
+        if (*p == ':') p++;
+        if (*p == 'n') p++;
+        if (*p >= '0' && *p <= '9') {
+            ns = 0;
+            while (*p >= '0' && *p <= '9') ns = ns * 10 + (unsigned)(*p++ - '0');
+        }
+        ksnprintf(base, sizeof base, "nvme%un%u", h, ns);
+    } else {
+        if (idx >= 26) return false;
+        ksnprintf(base, sizeof base, "%s%c", kind == DB_VD ? "vd" : "sd", 'a' + idx);
+    }
+    uint32_t part = (d->class == BLK_CLASS_PARTITION) ? d->partition_index : 0;
+    if (part) ksnprintf(out, cap, "%s%s%u", base, kind == DB_NVME ? "p" : "", part);
+    else      ksnprintf(out, cap, "%s", base);
+    uint32_t a, b;
+    if (kind == DB_NVME) {
+        b = 0;
+        for (size_t i = 0; i < cnt; i++) {
+            struct blk_dev *x = blk_get(i);
+            if (!x || x->gone) continue;
+            if (x->class != BLK_CLASS_DISK && x->class != BLK_CLASS_PARTITION) continue;
+            if (devfs_blk_kind(x) != DB_NVME) continue;
+            if (x == d) break;
+            b++;
+        }
+        a = 259;
+    } else {
+        a = (kind == DB_VD) ? 253 : 8;
+        b = (uint32_t)idx * 16 + part;
+    }
+    if (maj) *maj = a;
+    if (min) *min = b;
+    return true;
+}
+
+bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap) {
+    char n[32];
+    if (!devfs_blk_ident(d, n, sizeof n, 0, 0)) return false;
+    ksnprintf(out, cap, "/dev/%s", n);
+    return true;
+}
+
+static struct blk_dev *devfs_blk_by_rel(const char *rel, uint32_t *maj, uint32_t *min) {
+    if (!rel || !rel[0]) return 0;
+    for (const char *q = rel; *q; q++) if (*q == '/') return 0;
+    size_t cnt = blk_count();
+    for (size_t i = 0; i < cnt; i++) {
+        struct blk_dev *x = blk_get(i);
+        char n[32];
+        if (x && devfs_blk_ident(x, n, sizeof n, maj, min) && strcmp(n, rel) == 0)
+            return x;
+    }
+    return 0;
+}
+
+struct blk_dev *devfs_blk_by_path(const char *kpath, uint32_t *maj, uint32_t *min) {
+    if (!kpath || strncmp(kpath, "/dev/", 5) != 0) return 0;
+    return devfs_blk_by_rel(kpath + 5, maj, min);
+}
+
+/* Linux's /proc/partitions: a header, a blank line, then each disk and
+ * partition -- major, minor, its size in 1 KiB blocks, its name. */
+size_t devfs_partitions(char *buf, size_t cap) {
+    size_t off = 0;
+    if (!buf || cap == 0) return 0;
+    int w = ksnprintf(buf, cap, "major minor  #blocks  name\n\n");
+    if (w > 0) off = (size_t)w < cap ? (size_t)w : cap - 1;
+    size_t cnt = blk_count();
+    for (size_t i = 0; i < cnt && off + 1 < cap; i++) {
+        struct blk_dev *x = blk_get(i);
+        char n[32];
+        uint32_t a, b;
+        if (!x || !devfs_blk_ident(x, n, sizeof n, &a, &b)) continue;
+        w = ksnprintf(buf + off, cap - off, "%4u  %7u %10llu %s\n", a, b,
+                      (unsigned long long)(x->sector_count / 2), n);
+        if (w <= 0) break;
+        off += (size_t)w < cap - off ? (size_t)w : cap - off - 1;
+    }
+    return off;
+}
+
 static const struct devfs_ent *devfs_find(const char *rel) {
     for (unsigned i = 0; i < DEVFS_N; i++)
         if (strcmp(g_devfs[i].path, rel) == 0)
@@ -170,6 +294,10 @@ static bool devfs_lookup(const char *rel, uint32_t *mode, uint32_t *maj,
         *mode = DEV_S_IFCHR | 0620; *maj = 4; *min = (uint32_t)idx;
         return true;
     }
+    if (devfs_blk_by_rel(rel, maj, min)) {             /* finding 198 */
+        *mode = DEV_S_IFBLK | 0660;
+        return true;
+    }
     return false;
 }
 
@@ -179,7 +307,8 @@ uint32_t devfs_node_mode(const char *kpath, uint32_t *maj, uint32_t *min) {
     if (!kpath || strncmp(kpath, "/dev/", 5) != 0) return 0;
     uint32_t mode, a, b;
     if (!devfs_lookup(kpath + 5, &mode, &a, &b)) return 0;
-    if ((mode & 0xF000u) != DEV_S_IFCHR) return 0;     /* nodes only */
+    if ((mode & 0xF000u) != DEV_S_IFCHR &&
+        (mode & 0xF000u) != DEV_S_IFBLK) return 0;      /* nodes only */
     if (maj) *maj = a;
     if (min) *min = b;
     return mode;
@@ -206,6 +335,7 @@ static int devfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                 ((mode & 0xF000u) == DEV_S_IFLNK) ? VFS_TYPE_SYMLINK :
                                                     VFS_TYPE_FILE;
     out->mode = mode | VFS_MODE_VALID;       /* S_IFCHR stays in the mode */
+    if ((mode & 0xF000u) == DEV_S_IFBLK) out->gid = DEV_GID_DISK;   /* 198 */
     if (out->type == VFS_TYPE_SYMLINK) {
         const struct devfs_ent *e = devfs_find(devfs_rel(path));
         out->size = (e && e->target) ? strlen(e->target) : 0;
@@ -286,6 +416,18 @@ static int devfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
                 char nb[8];
                 ksnprintf(nb, sizeof nb, "tty%d", n);
                 devfs_fill(out, nb, DEV_S_IFCHR | 0620);
+                d->index++;
+                return VFS_OK;
+            }
+        }
+    }
+    if (dir[0] == '\0') {                          /* the disks (198) */
+        size_t cnt = blk_count();
+        for (size_t i = 0; i < cnt; i++) {
+            char nb[32];
+            if (!devfs_blk_ident(blk_get(i), nb, sizeof nb, 0, 0)) continue;
+            if (idx++ == d->index) {
+                devfs_fill(out, nb, DEV_S_IFBLK | 0660);
                 d->index++;
                 return VFS_OK;
             }

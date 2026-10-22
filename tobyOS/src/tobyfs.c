@@ -2257,7 +2257,11 @@ int tobyfs_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     int rc = vfs_mount(mount_point, &tobyfs_ops, fs);
-    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
+    if (rc == VFS_OK && dev->name) {
+        char sp[48];                   /* its /dev node's path (finding 198) */
+        extern bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
+        vfs_mount_set_source(mount_point, devfs_blk_path(dev, sp, sizeof sp) ? sp : dev->name);
+    }
     if (rc != VFS_OK) {
         kprintf("[tobyfs] vfs_mount('%s') failed: %d\n", mount_point, rc);
         kfree(fs->ibitmap); kfree(fs->dbm_win); kfree(fs->dbm_free); if (fs->ino_gen) kfree(fs->ino_gen); kfree(fs);

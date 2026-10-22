@@ -32,6 +32,7 @@
 #include <tobyos/mmap.h>   /* memfd_* (FILE_KIND_MEMFD) */
 #include <tobyos/klibc.h>
 #include <tobyos/rng.h>   /* getrandom + /dev/urandom entropy */
+#include <tobyos/blk.h>   /* FILE_KIND_BLKDEV (finding 198) */
 #include <tobyos/cpu.h>
 #include <tobyos/sched.h>
 #include <tobyos/proc.h>   /* current_proc -- [efd] Mojo-notification trace */
@@ -676,6 +677,37 @@ static void file_pos_store(struct file *f) {
     if (o) o->pos = f->vfs.pos;
 }
 
+/* A DISK'S BYTES AS A FILE (finding 198): N bytes at F->blk_pos, a sector
+ * at a time through a bounce buffer, so any offset and length work; short
+ * at the device's end, 0 past it. WRITE says which way. */
+static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
+    struct blk_dev *d = f->blkdev;
+    if (!d || d->gone) return -ABI_EIO;
+    uint64_t size = d->sector_count * (uint64_t)BLK_SECTOR_SIZE;
+    if (f->blk_pos >= size) return write ? -ABI_ENOSPC : 0;
+    if (n > size - f->blk_pos) n = (size_t)(size - f->blk_pos);
+    uint8_t sec[BLK_SECTOR_SIZE];
+    size_t done = 0;
+    while (done < n) {
+        uint64_t pos = f->blk_pos + done;
+        uint64_t lba = pos / BLK_SECTOR_SIZE;
+        size_t in = (size_t)(pos % BLK_SECTOR_SIZE);
+        size_t take = BLK_SECTOR_SIZE - in;
+        if (take > n - done) take = n - done;
+        if (blk_read(d, lba, 1, sec) < 0) break;
+        if (write) {
+            memcpy(sec + in, (const uint8_t *)buf + done, take);
+            if (blk_write(d, lba, 1, sec) < 0) break;
+        } else {
+            memcpy((uint8_t *)buf + done, sec + in, take);
+        }
+        done += take;
+    }
+    if (done == 0 && n) return -ABI_EIO;
+    f->blk_pos += done;
+    return (long)done;
+}
+
 long file_read(struct file *f, void *buf, size_t n) {
     if (!f || !buf) return -1;
     if (n == 0) return 0;
@@ -699,6 +731,8 @@ long file_read(struct file *f, void *buf, size_t n) {
     }
     case FILE_KIND_DEVNULL:
         return 0;                                  /* always EOF */
+    case FILE_KIND_BLKDEV:
+        return blkdev_rw(f, buf, n, false);
     case FILE_KIND_DIR:
         /* read(2) on a directory is EISDIR, as on Linux -- it fell to the
          * default's -1, which userland reads as EPERM: bash's `read x < dir`
@@ -808,6 +842,8 @@ long file_write(struct file *f, const void *buf, size_t n) {
         return (long)n;                            /* swallow everything */
     case FILE_KIND_DEVFULL:
         return -ABI_ENOSPC;                        /* slice 6: always full */
+    case FILE_KIND_BLKDEV:
+        return blkdev_rw(f, (void *)buf, n, true);
     case FILE_KIND_DEVRANDOM:
         rng_mix(buf, n);                           /* writes seed the pool */
         return (long)n;

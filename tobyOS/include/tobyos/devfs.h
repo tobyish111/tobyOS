@@ -13,4 +13,13 @@ int devfs_init(void);
  * also what `ls /dev` lists and what stat/chdir see through the VFS. */
 uint32_t devfs_node_mode(const char *kpath, uint32_t *maj, uint32_t *min);
 
+/* Finding 198: the disks and partitions under Linux's names. D's node path
+ * ("/dev/sda1") into OUT; false for what has none (a wrapper, a device
+ * gone). The device at /dev/NAME (MAJ/MIN may be 0), or 0. */
+struct blk_dev;
+bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
+struct blk_dev *devfs_blk_by_path(const char *kpath, uint32_t *maj, uint32_t *min);
+/* /proc/partitions, Linux's table, into BUF; its length */
+size_t devfs_partitions(char *buf, size_t cap);
+
 #endif

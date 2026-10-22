@@ -1,5 +1,6 @@
 root:x:0:
 tty:x:5:
+disk:x:6:
 wheel:x:10:root,toby
 crew:x:20:root
 outcast:x:30:

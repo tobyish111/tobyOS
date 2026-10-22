@@ -2042,7 +2042,11 @@ int fat32_mount(const char *mount_point, struct blk_dev *dev) {
     }
 
     rc = vfs_mount(mount_point, &fat32_ops, fs);
-    if (rc == VFS_OK && dev->name) vfs_mount_set_source(mount_point, dev->name);
+    if (rc == VFS_OK && dev->name) {
+        char sp[48];                   /* its /dev node's path (finding 198) */
+        extern bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
+        vfs_mount_set_source(mount_point, devfs_blk_path(dev, sp, sizeof sp) ? sp : dev->name);
+    }
     if (rc != VFS_OK) {
         kprintf("[fat32] vfs_mount('%s') failed: %d\n", mount_point, rc);
         kfree(fs->clus_buf);
