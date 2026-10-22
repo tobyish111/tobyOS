@@ -6833,6 +6833,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         char kpath[ABI_PATH_MAX];
         {   int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
             if (rr != 0) return rr;            /* EACCES too (finding 188) */
+            rr = statfs_follow(kpath, sizeof kpath);       /* finding 244 */
+            if (rr != 0) return rr;
         }
         struct vfs_stat st;
         int src = vfs_stat(kpath, &st);
@@ -16301,6 +16303,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (n == LX_statfs) {
             int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
             if (rr != 0) return rr;            /* EACCES too (finding 188) */
+            rr = statfs_follow(kpath, sizeof kpath);       /* finding 244 */
+            if (rr != 0) return rr;
         } else {
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;

@@ -1083,6 +1083,16 @@ static size_t tmpfs_parse_num(const char *opts, const char *key, bool *zero)
     case 'k': case 'K': v *= 1024u;                     p++; break;
     case 'm': case 'M': v *= 1024u * 1024u;             p++; break;
     case 'g': case 'G': v *= 1024u * 1024u * 1024u;     p++; break;
+    /* and t, p, e, and a percentage of RAM for size=, as Linux's tmpfs
+     * takes them (size=1t was EINVAL; finding 244) */
+    case 't': case 'T': v <<= 40;                       p++; break;
+    case 'p': case 'P': v <<= 50;                       p++; break;
+    case 'e': case 'E': v <<= 60;                       p++; break;
+    case '%':
+        if (key[0] != 's') return (size_t)-1;      /* nr_inodes= has no % */
+        v = (size_t)(pmm_total_pages() / 100u * v) * 4096u;
+        p++;
+        break;
     default: break;
     }
     if (*p && *p != ',') return (size_t)-1;
