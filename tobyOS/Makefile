@@ -3046,8 +3046,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_hello/user_hello.elf    $(INITRD_STAGE)/bin/hello
 	cp programs/systest/systest.elf          $(INITRD_STAGE)/bin/systest
 	cp programs/user_bad/user_bad.elf        $(INITRD_STAGE)/bin/bad
-	cp programs/user_echo/user_echo.elf      $(INITRD_STAGE)/bin/echo
-	cp programs/user_cat/user_cat.elf        $(INITRD_STAGE)/bin/cat
 	cp programs/user_long/user_long.elf      $(INITRD_STAGE)/bin/long_task
 	cp programs/user_netecho/user_netecho.elf $(INITRD_STAGE)/bin/netecho
 	cp programs/user_gui_demo/user_gui_demo.elf   $(INITRD_STAGE)/bin/gui_demo
@@ -3219,7 +3217,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 # bash -- and system(), popen() and every #!/bin/sh script went through it.
 	@ln -f $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh" 2>/dev/null || \
 	    cp $(INITRD_STAGE)/bin/tsh "$(INITRD_STAGE)/bin/sh"
-	cp programs/id/id.elf                           $(INITRD_STAGE)/bin/id
 	cp programs/newgrp/newgrp.elf                   $(INITRD_STAGE)/bin/newgrp
 	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
 	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
@@ -3251,41 +3248,20 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp programs/user_svcctl/user_svcctl.elf         $(INITRD_STAGE)/bin/svcctl
 	cp programs/user_ps/user_ps.elf                 $(INITRD_STAGE)/bin/ps
 	cp programs/user_top/user_top.elf               $(INITRD_STAGE)/bin/top
-	cp programs/user_find/user_find.elf             $(INITRD_STAGE)/bin/find
-	cp programs/user_tee/user_tee.elf               $(INITRD_STAGE)/bin/tee
 	cp programs/user_setsid/user_setsid.elf         $(INITRD_STAGE)/bin/setsid
-	cp programs/user_chmod/user_chmod.elf           $(INITRD_STAGE)/bin/chmod
 	cp programs/user_vncpasswd/user_vncpasswd.elf   $(INITRD_STAGE)/bin/vncpasswd
-	cp programs/user_df/user_df.elf                 $(INITRD_STAGE)/bin/df
-	cp programs/user_mkdir/user_mkdir.elf           $(INITRD_STAGE)/bin/mkdir
-	cp programs/user_kill/user_kill.elf             $(INITRD_STAGE)/bin/kill
-	cp programs/user_tail/user_tail.elf             $(INITRD_STAGE)/bin/tail
 	cp programs/user_coreutil/user_coreutil.elf     $(INITRD_STAGE)/bin/coreutil
 	cp programs/user_admin/user_admin.elf           $(INITRD_STAGE)/bin/user_admin
 	cp programs/user_ssh/user_ssh.elf               $(INITRD_STAGE)/bin/user_ssh
 	cp programs/user_utillinux/user_utillinux.elf   $(INITRD_STAGE)/bin/user_util
 	cp programs/user_e2fs/user_e2fs.elf             $(INITRD_STAGE)/bin/user_e2fs
-	cp programs/user_gzip/user_gzip.elf             $(INITRD_STAGE)/bin/gzip
-	cp programs/user_diffutils/user_diffutils.elf   $(INITRD_STAGE)/bin/diff
-	@# diff/cmp, one binary dispatched on argv[0]
-	@for ap in cmp sdiff diff3; do \
-	    ln -f $(INITRD_STAGE)/bin/diff "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
-	      cp $(INITRD_STAGE)/bin/diff "$(INITRD_STAGE)/bin/$$ap"; \
-	done
-	cp programs/user_bzip2/user_bzip2.elf          $(INITRD_STAGE)/bin/bzip2
-	@# bzip2 family, one binary dispatched on argv[0]
-	@for ap in bunzip2 bzcat; do \
-	    ln -f $(INITRD_STAGE)/bin/bzip2 "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
-	      cp $(INITRD_STAGE)/bin/bzip2 "$(INITRD_STAGE)/bin/$$ap"; \
-	done
+	cp programs/user_gzip/user_gzip.elf             $(INITRD_STAGE)/bin/compress
 	cp programs/user_zutils/user_zutils.elf        $(INITRD_STAGE)/bin/zgrep
 	cp programs/user_sed/user_sed.elf              $(INITRD_STAGE)/bin/sed
 	cp programs/user_procnet/user_procnet.elf      $(INITRD_STAGE)/bin/vmstat
 	cp programs/user_power/user_power.elf          $(INITRD_STAGE)/bin/shutdown
 	cp programs/user_patch/user_patch.elf          $(INITRD_STAGE)/bin/patch
 	cp programs/user_locate/user_locate.elf        $(INITRD_STAGE)/bin/locate
-	cp programs/user_ln/user_ln.elf                $(INITRD_STAGE)/bin/ln
-	cp programs/user_tar/user_tar.elf               $(INITRD_STAGE)/bin/tar
 	cp programs/user_zstd/user_zstd.elf             $(INITRD_STAGE)/bin/zstd
 	cp programs/user_zip/user_zip.elf               $(INITRD_STAGE)/bin/zip
 	cp programs/user_dig/user_dig.elf               $(INITRD_STAGE)/bin/dig
@@ -3319,7 +3295,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# ---- native-parity batch (2026-09-04): the 46 busybox-only utilities ----
 	cp programs/user_archive/user_archive.elf      $(INITRD_STAGE)/bin/archive
 	@# archive family, one binary dispatched on argv[0]
-	@for ap in ar cpio xz unxz xzcat; do \
+	@for ap in ar cpio; do \
 	    ln -f $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/archive "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3361,7 +3337,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
 	           cksum truncate install mkfifo date touch sort script hwclock \
            arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv; do \
+           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3384,10 +3360,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    ln -f $(INITRD_STAGE)/bin/zgrep "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/zgrep "$(INITRD_STAGE)/bin/$$ap"; \
 	done
-	@# gzip family, one binary dispatched on argv[0]
-	@for ap in gunzip zcat gzcat uncompress compress; do \
-	    ln -f $(INITRD_STAGE)/bin/gzip "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
-	      cp $(INITRD_STAGE)/bin/gzip "$(INITRD_STAGE)/bin/$$ap"; \
+	@# the LZW names stay the old gzip binary's (gzip itself is
+	@# user_shellutils', finding 197), one binary dispatched on argv[0]
+	@for ap in gzcat uncompress; do \
+	    ln -f $(INITRD_STAGE)/bin/compress "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
+	      cp $(INITRD_STAGE)/bin/compress "$(INITRD_STAGE)/bin/$$ap"; \
 	done
 	@# ext2/3/4 inspection tools, one binary dispatched on argv[0]
 	@for ap in dumpe2fs e2fsck debugfs badblocks resize2fs; do \
@@ -3448,9 +3425,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	@# that dispatches on argv[0] -- the same way busybox is installed below.
 	@# HARD links: ramfs shares bytes for tar typeflag 1 and ignores
 	@# typeflag 2, so a symlink would not resolve.
-	@for ap in tsort fmt join pathchk dir vdir dircolors csplit pr numfmt \
-	           chcon runcon pinky ptx stdbuf basenc sha224sum sha384sum b2sum \
-	           sha256sum sha512sum md5sum sha1sum base64 base32; do \
+	@for ap in           \
+	                    \
+	                ; do \
 	    ln -f $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/coreutil "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -3493,6 +3470,8 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/m36/Tobyfile                            $(INITRD_STAGE)/m36/Tobyfile
 	cp $(PORTS_SBASE_DIR)/echo.elf                    $(INITRD_STAGE)/bin/p_echo
 	cp $(PORTS_SBASE_DIR)/cat.elf                     $(INITRD_STAGE)/bin/p_cat
+	@# a standalone sleep, for a fixture that copies one to name a process
+	cp $(PORTS_SBASE_DIR)/sleep.elf                   $(INITRD_STAGE)/bin/p_sleep
 	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/p_wc
 	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/p_head
 	cp $(PORTS_SBASE_DIR)/ls.elf                      $(INITRD_STAGE)/bin/p_ls
@@ -3501,19 +3480,10 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 # p_ prefix and no plain entry, so `grep` was simply not a command that
 # existed. echo/cat/ls keep the prefix because other programs own those.
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/grep
-	cp $(PORTS_SBASE_DIR)/wc.elf                      $(INITRD_STAGE)/bin/wc
-	cp $(PORTS_SBASE_DIR)/head.elf                    $(INITRD_STAGE)/bin/head
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/egrep
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/fgrep
 	@# grep dispatches on argv[0]; rgrep is grep -r
 	cp $(PORTS_SBASE_DIR)/grep.elf                    $(INITRD_STAGE)/bin/rgrep
-	cp $(PORTS_SBASE_DIR)/basename.elf                  $(INITRD_STAGE)/bin/basename
-	cp $(PORTS_SBASE_DIR)/dirname.elf                   $(INITRD_STAGE)/bin/dirname
-	cp $(PORTS_SBASE_DIR)/sleep.elf                     $(INITRD_STAGE)/bin/sleep
-	cp $(PORTS_SBASE_DIR)/tee.elf                       $(INITRD_STAGE)/bin/tee
-	cp $(PORTS_SBASE_DIR)/expr.elf                      $(INITRD_STAGE)/bin/expr
-	cp $(PORTS_SBASE_DIR)/tr.elf                        $(INITRD_STAGE)/bin/tr
-	cp $(PORTS_SBASE_DIR)/cut.elf                       $(INITRD_STAGE)/bin/cut
 	cp programs/awk/awk.elf                           $(INITRD_STAGE)/bin/awk
 	cp $(LDTOBY_SO)                                   $(INITRD_STAGE)/lib/ld-toby.so
 	cp $(LIBTOBY_SO)                                  $(INITRD_STAGE)/lib/libtoby.so
@@ -4178,6 +4148,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/sigtest bin/mctest bin/reclaimtest bin/tobycc bin/tobybuild bin/selfhosttest \
     bin/lua bin/make bin/less bin/more bin/curl bin/tcc bin/as \
 	    bin/p_echo bin/p_cat bin/p_wc bin/p_head bin/p_ls bin/p_grep      \
+	    bin/p_sleep                                                       \
 	    bin/grep bin/wc bin/head bin/egrep bin/fgrep bin/rgrep                      \
 	    bin/mkdir bin/rm bin/cp bin/mv bin/touch bin/chmod bin/date       \
 	    etc/coreutils_test.sh etc/coreutils_extra.sh etc/accounts_test.sh  \
@@ -4220,6 +4191,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/paste bin/rev bin/shuf bin/split bin/readlink bin/realpath      \
 	    bin/mktemp bin/groups bin/hostname bin/chown bin/killall           \
 	    bin/mount bin/umount                                               \
+	    bin/mknod bin/chroot                                               \
 	    bin/hd bin/dnsdomainname bin/nisdomainname bin/ypdomainname        \
 	    bin/zstd bin/unzstd bin/zstdcat                                    \
 	    bin/zip bin/unzip                                  \

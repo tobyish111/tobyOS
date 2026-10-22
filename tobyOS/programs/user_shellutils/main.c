@@ -153,6 +153,50 @@ static char *first_line(char *s) {
 #include "su_rm.c"
 #include "su_cp.c"
 #include "su_mv.c"
+#include "su_sm_common.c"
+#include "su_md5sum.c"
+#include "su_base64.c"
+#include "su_dircolors.c"
+#include "su_dir.c"
+#include "su_fileops.c"
+#include "su_echo.c"
+#include "su_cat.c"
+#include "su_tee.c"
+#include "su_mkdir.c"
+#include "su_mknod.c"
+#include "su_chroot.c"
+#include "su_chmod.c"
+#include "su_ln.c"
+#include "su_kill.c"
+#include "su_id.c"
+#include "su_df.c"
+#include "su_pinky.c"
+#include "su_stdbuf.c"
+#include "su_chcon.c"
+#include "su_runcon.c"
+#include "su_txio.c"
+#include "su_head.c"
+#include "su_tail.c"
+#include "su_wc.c"
+#include "su_cut.c"
+#include "su_tr.c"
+#include "su_basename.c"
+#include "su_sleep.c"
+#include "su_expr.c"
+#include "su_find.c"
+#include "su_fmt.c"
+#include "su_pr.c"
+#include "su_join.c"
+#include "su_tsort.c"
+#include "su_numfmt.c"
+#include "su_csplit.c"
+#include "su_ptx.c"
+#include "su_pathchk.c"
+#include "su_diff.c"
+#include "su_gzip.c"
+#include "su_bzip2.c"
+#include "su_xz.c"
+#include "su_tar.c"
 
 /* ---------------------------------------------------------------- main */
 
@@ -243,6 +287,66 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "rm"))        return do_rm(argc, argv);
     if (!strcmp(base, "cp"))        return do_cp(argc, argv);
     if (!strcmp(base, "mv"))        return do_mv(argc, argv);
+    if (!strcmp(base, "md5sum"))    return do_md5sum(argc, argv);
+    if (!strcmp(base, "sha1sum"))   return do_sha1sum(argc, argv);
+    if (!strcmp(base, "sha224sum")) return do_sha224sum(argc, argv);
+    if (!strcmp(base, "sha256sum")) return do_sha256sum(argc, argv);
+    if (!strcmp(base, "sha384sum")) return do_sha384sum(argc, argv);
+    if (!strcmp(base, "sha512sum")) return do_sha512sum(argc, argv);
+    if (!strcmp(base, "b2sum"))     return do_b2sum(argc, argv);
+    if (!strcmp(base, "base64"))    return do_base64(argc, argv);
+    if (!strcmp(base, "base32"))    return do_base32(argc, argv);
+    if (!strcmp(base, "basenc"))    return do_basenc(argc, argv);
+    if (!strcmp(base, "dircolors")) return do_dircolors(argc, argv);
+    if (!strcmp(base, "dir"))       return do_dir(argc, argv);
+    if (!strcmp(base, "vdir"))      return do_vdir(argc, argv);
+    if (!strcmp(base, "echo"))      return do_echo(argc, argv);
+    if (!strcmp(base, "cat"))       return do_cat(argc, argv);
+    if (!strcmp(base, "tee"))       return do_tee(argc, argv);
+    if (!strcmp(base, "mkdir"))     return do_mkdir(argc, argv);
+    if (!strcmp(base, "mknod"))     return do_mknod(argc, argv);
+    if (!strcmp(base, "chroot"))    return do_chroot(argc, argv);
+    if (!strcmp(base, "chmod"))     return do_chmod(argc, argv);
+    if (!strcmp(base, "ln"))        return do_ln(argc, argv);
+    if (!strcmp(base, "kill"))      return do_kill(argc, argv);
+    if (!strcmp(base, "id"))        return do_id(argc, argv);
+    if (!strcmp(base, "df"))        return do_df(argc, argv);
+    if (!strcmp(base, "pinky"))     return do_pinky(argc, argv);
+    if (!strcmp(base, "stdbuf"))    return do_stdbuf(argc, argv);
+    if (!strcmp(base, "chcon"))     return do_chcon(argc, argv);
+    if (!strcmp(base, "runcon"))    return do_runcon(argc, argv);
+    if (!strcmp(base, "head"))      return do_head(argc, argv);
+    if (!strcmp(base, "tail"))      return do_tail(argc, argv);
+    if (!strcmp(base, "wc"))        return do_wc(argc, argv);
+    if (!strcmp(base, "cut"))       return do_cut(argc, argv);
+    if (!strcmp(base, "tr"))        return do_tr(argc, argv);
+    if (!strcmp(base, "basename"))  return do_basename(argc, argv);
+    if (!strcmp(base, "dirname"))   return do_dirname(argc, argv);
+    if (!strcmp(base, "sleep"))     return do_sleep(argc, argv);
+    if (!strcmp(base, "expr"))      return do_expr(argc, argv);
+    if (!strcmp(base, "find"))      return do_find(argc, argv);
+    if (!strcmp(base, "fmt"))       return do_fmt(argc, argv);
+    if (!strcmp(base, "pr"))        return do_pr(argc, argv);
+    if (!strcmp(base, "join"))      return do_join(argc, argv);
+    if (!strcmp(base, "tsort"))     return do_tsort(argc, argv);
+    if (!strcmp(base, "numfmt"))    return do_numfmt(argc, argv);
+    if (!strcmp(base, "csplit"))    return do_csplit(argc, argv);
+    if (!strcmp(base, "ptx"))       return do_ptx(argc, argv);
+    if (!strcmp(base, "pathchk"))   return do_pathchk(argc, argv);
+    if (!strcmp(base, "diff"))      return do_diff(argc, argv);
+    if (!strcmp(base, "cmp"))       return do_cmp(argc, argv);
+    if (!strcmp(base, "sdiff"))     return do_sdiff(argc, argv);
+    if (!strcmp(base, "diff3"))     return do_diff3(argc, argv);
+    if (!strcmp(base, "gzip"))      return do_gzip(argc, argv);
+    if (!strcmp(base, "gunzip"))    return do_gzip(argc, argv);
+    if (!strcmp(base, "zcat"))      return do_gzip(argc, argv);
+    if (!strcmp(base, "bzip2"))     return do_bzip2(argc, argv);
+    if (!strcmp(base, "bunzip2"))   return do_bzip2(argc, argv);
+    if (!strcmp(base, "bzcat"))     return do_bzip2(argc, argv);
+    if (!strcmp(base, "xz"))        return do_xz(argc, argv);
+    if (!strcmp(base, "unxz"))      return do_xz(argc, argv);
+    if (!strcmp(base, "xzcat"))     return do_xz(argc, argv);
+    if (!strcmp(base, "tar"))       return do_tar(argc, argv);
 
     fprintf(stderr, "%s: unknown applet\n", base);
     return 1;
