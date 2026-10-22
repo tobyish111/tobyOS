@@ -336,6 +336,10 @@ static int devfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                                                     VFS_TYPE_FILE;
     out->mode = mode | VFS_MODE_VALID;       /* S_IFCHR stays in the mode */
     if ((mode & 0xF000u) == DEV_S_IFBLK) out->gid = DEV_GID_DISK;   /* 198 */
+    {   /* made at boot, as devtmpfs's are (finding 202; src/syscall.c) */
+        extern uint64_t dev_boot_time(void);
+        out->atime = out->mtime = out->ctime = dev_boot_time();
+    }
     if (out->type == VFS_TYPE_SYMLINK) {
         const struct devfs_ent *e = devfs_find(devfs_rel(path));
         out->size = (e && e->target) ? strlen(e->target) : 0;

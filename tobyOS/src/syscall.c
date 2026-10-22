@@ -4118,6 +4118,17 @@ static void dev_synth_stat(uint32_t mode, struct abi_stat *out)
     out->blksize = 4096;              /* as linux_emit_special_stat */
 }
 
+/* WHEN /dev's NODES WERE MADE (finding 202): devtmpfs stamps each node as
+ * the kernel creates it, at boot, so stat and ls -l say the boot instant --
+ * tobyOS's said 1970. The wall clock less the uptime, in nanoseconds so two
+ * reads agree; it moves with the clock as /proc/stat's btime does. */
+uint64_t dev_boot_time(void) {
+    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
+    uint64_t mono = perf_now_ns();
+    uint64_t now  = lx_realtime_ns(mono);
+    return (now > mono) ? (now - mono) / 1000000000ull : 0;
+}
+
 /* A PTY SLAVE'S OWNER AND TIMES, by its name (/dev/pts/N) or an open
  * slave descriptor (finding 190): what the pair keeps (pty.c), as Linux's
  * devpts gives them -- the device nodes said root and 1970, and GNU who's
@@ -4150,6 +4161,7 @@ static void dev_synth_stat_path(const char *kpath, uint32_t mode, struct abi_sta
         out->rdev_minor = min;
     }
     if ((mode & ABI_S_IFMT) == ABI_S_IFBLK) out->gid = userns_cur_gid(6);   /* 198 */
+    out->atime = out->mtime = out->ctime = dev_boot_time();      /* 202 */
     uint32_t pu, pg;
     uint64_t pt[3];
     if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
@@ -4375,6 +4387,7 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
             tmp->rdev_minor = mn;
             tmp->gid = userns_cur_gid(6);
             tmp->blksize = 4096;
+            tmp->atime = tmp->mtime = tmp->ctime = dev_boot_time();   /* 202 */
             return;
         }
         if ((sm & ABI_S_IFMT) != ABI_S_IFCHR) {
@@ -4384,6 +4397,7 @@ static void native_fd_stat(struct file *f, struct abi_stat *tmp) {
         } else {
             tmp->rdev_major = mj;
             tmp->rdev_minor = mn;
+            tmp->atime = tmp->mtime = tmp->ctime = dev_boot_time();   /* 202 */
             uint32_t pu, pg;
             uint64_t pt[3];
             if (pts_node_times(0, f, &pu, &pg, pt)) {
@@ -8141,6 +8155,7 @@ static long linux_emit_devnode_stat(const char *kpath, void *ubuf) {
     st.st_rdev    = lx_makedev(maj, min);
     st.st_blksize = 4096;
     if ((dm & 0xF000u) == 0x6000u) st.st_gid = userns_cur_gid(6);
+    st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();   /* 202 */
     {   uint32_t pu, pg;
         uint64_t pt[3];
         if (pts_node_times(kpath, 0, &pu, &pg, pt)) {
@@ -8236,8 +8251,10 @@ static long linux_emit_special_stat(uint32_t mode, uint32_t maj, uint32_t min,
     if (fmt == 0x6000u) {                 /* a disk: root's and disk's */
         st.st_rdev = lx_makedev(maj, min);
         st.st_gid = userns_cur_gid(6);
+        st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();
     } else if (fmt == 0x2000u) {
         st.st_rdev = lx_makedev(maj, min);
+        st.st_atime = st.st_mtime = st.st_ctime = (int64_t)dev_boot_time();
         uint32_t pu, pg;
         uint64_t pt[3];
         if (pts_node_times(0, f, &pu, &pg, pt)) {
@@ -8451,6 +8468,8 @@ static long lx_emit_fd_statx(struct file *f, int fd, void *ubuf) {
                                     .mode = sm & 0xFFFu };
             if (blk) cvs.gid = 6;
             else if (!chr && sp) { cvs.uid = sp->uid; cvs.gid = sp->gid; }
+            if (chr || blk)                           /* 202 */
+                cvs.atime = cvs.mtime = cvs.ctime = dev_boot_time();
             {   uint64_t pt[3];                 /* a pty slave's (finding 190) */
                 if (chr && pts_node_times(0, f, &cvs.uid, &cvs.gid, pt)) {
                     cvs.atime = pt[0]; cvs.mtime = pt[1]; cvs.ctime = pt[2];
@@ -16046,6 +16065,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                         .uid = 0,
                                         .gid = ((dm & 0xF000u) == 0x6000u) ? 6u : 0u,
                                         .mode = dm & 0xFFFu };
+                dvs.atime = dvs.mtime = dvs.ctime = dev_boot_time();   /* 202 */
                 {   uint64_t pt[3];             /* a pty slave's (finding 190) */
                     if (pts_node_times(kpath, 0, &dvs.uid, &dvs.gid, pt)) {
                         dvs.atime = pt[0]; dvs.mtime = pt[1]; dvs.ctime = pt[2];
