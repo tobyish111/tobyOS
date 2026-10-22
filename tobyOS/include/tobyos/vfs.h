@@ -48,9 +48,10 @@
  * pivot_roots then mounts its own /proc, /sys, /dev, /dev/pts and /tmp needs
  * five slots of its own on top of the three the boot namespace already uses
  * (/, /proc, /data). At 8 that wall would have been hit by slice 16's container
- * runtime rather than by anything diagnosable. Costs ~288 bytes per extra slot
- * per namespace. */
-#define VFS_MAX_MOUNTS 16
+ * runtime rather than by anything diagnosable. Costs a path's worth (4 KiB)
+ * per extra slot per namespace. 16 was hit too: boot holds 10, and a fixture
+ * mounting six more in a namespace got ENOMEM (finding 233). */
+#define VFS_MAX_MOUNTS 64
 
 /* Slice 9: mount PROPAGATION type, per mount (Linux MS_PRIVATE/SHARED/SLAVE/
  * UNBINDABLE). PRIVATE is 0 so it stays the default for every mount that

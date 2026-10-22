@@ -14058,6 +14058,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
                                             sizeof kopts);
             int rc = tmpfs_mount_at(ktgt, kopts[0] ? kopts : 0);
             if (rc != VFS_OK) return vfs_err_to_abi(rc);
+            /* the name it was mounted as, which /proc/mounts and df show
+             * ("tmpfs" stood in for every one; Linux's says what was given) */
+            if (ksrc[0]) (void)vfs_mount_set_source(ktgt, ksrc);
             if (vflags) {
                 const struct vfs_ops *vops = 0; void *vdata = 0;
                 if (vfs_mount_lookup(ktgt, &vops, &vdata) == VFS_OK)

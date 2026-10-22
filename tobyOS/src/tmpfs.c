@@ -85,7 +85,7 @@ static const char *tfind_opt(const char *hay, const char *needle)
     return 0;
 }
 
-#define TMPFS_MAX_MOUNTS      8
+#define TMPFS_MAX_MOUNTS      64    /* 8 for the uptime, never freed (233) */
 #define TMPFS_DEFAULT_BYTES  (16u * 1024u * 1024u)   /* the least default */
 
 /* A mount's size when size= does not say: half of RAM, as Linux's. */
@@ -144,6 +144,8 @@ struct tmpfs_mount {
     size_t              bytes;     /* data bytes currently held */
     size_t              max_bytes;
     bool                reported_full;  /* census printed once, not per create */
+    bool                no_byte_limit;  /* size=0: none, statfs says 0 (233) */
+    bool                no_node_limit;  /* nr_inodes=0: likewise */
     uint32_t            root_mode; /* the mount root's permissions (mode=) */
     uint64_t            root_time; /* when it was mounted: the root's times */
     uint64_t            next_seq;  /* the next node's creation number */
@@ -167,7 +169,7 @@ static size_t tindex(struct tmpfs_mount *m, const struct tmpfs_node *nd)
 }
 
 /* The mount a node lives in, found by address: struct vfs_file carries the
- * node, not the mount. Cheap (8 mounts) and keeps vfs_file unchanged. */
+ * node, not the mount. Cheap (a few mounts) and keeps vfs_file unchanged. */
 static struct tmpfs_mount *tmount_of(const struct tmpfs_node *nd)
 {
     for (size_t i = 0; i < TMPFS_MAX_MOUNTS; i++)
@@ -915,9 +917,41 @@ static int tmpfs_statfs(void *mnt, struct vfs_statfs *out)
     out->bfree      = (m->max_bytes > m->bytes)
                           ? (m->max_bytes - m->bytes) / 4096 : 0;
     out->files      = m->max_nodes;
-    out->ffree      = m->max_nodes - files;
+    out->ffree      = m->max_nodes > files + 1 ? m->max_nodes - files - 1 : 0;
+    /* no limit: Linux's statfs says 0 of each */
+    if (m->no_byte_limit) out->blocks = out->bfree = 0;
+    if (m->no_node_limit) out->files = out->ffree = 0;
     out->type_magic = 0x01021994;           /* TMPFS_MAGIC */
     out->namelen    = VFS_NAME_MAX - 1;     /* Linux's 255, not the path limit */
+    return VFS_OK;
+}
+
+/* UNMOUNTED: every file's bytes and the node table go back, and the slot is
+ * free for the next mount. There was no umount op -- a tmpfs once mounted
+ * kept its slot and its memory for good, and after eight mounts since boot
+ * every tmpfs mount was ENOSPC (finding 233). The VFS calls this only for
+ * the last mount of it in any namespace. A file still open in it keeps the
+ * whole of it, as an open file keeps Linux's superblock. */
+static int tmpfs_umount(void *mnt)
+{
+    struct tmpfs_mount *m = mnt;
+    if (!m || !m->used) return VFS_OK;
+    for (size_t i = 0; i < m->nnodes; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (nd->used && nd->open_count > 0) {
+            kprintf("[tmpfs] unmounted with '%s' open: its memory is kept\n",
+                    nd->path);
+            return VFS_OK;
+        }
+    }
+    for (size_t i = 0; i < m->nnodes; i++) {
+        struct tmpfs_node *nd = tnode(m, i);
+        if (nd->used && nd->data) kfree(nd->data);
+    }
+    for (size_t c = 0; c < m->nnodes / TMPFS_CHUNK_NODES; c++)
+        kfree(m->chunks[c]);
+    kfree(m->chunks);
+    memset(m, 0, sizeof *m);
     return VFS_OK;
 }
 
@@ -943,7 +977,7 @@ static const struct vfs_ops tmpfs_ops = {
     .link      = tmpfs_link,
     .symlink   = tmpfs_symlink,
     .readlink  = tmpfs_readlink,
-    .umount    = 0,
+    .umount    = tmpfs_umount,
     .statfs    = tmpfs_statfs,   /* Phase H */
     .fstat     = tmpfs_fstat,
 };
@@ -952,9 +986,11 @@ static const struct vfs_ops tmpfs_ops = {
  * count or a k/m/g suffix, as mount(8) does. Returns 0 if absent, (size_t)-1
  * if present but unparseable -- the caller REFUSES rather than falling back to
  * the default, because silently giving a different size than was asked for is
- * the lie this whole file is trying not to tell. */
-static size_t tmpfs_parse_num(const char *opts, const char *key)
+ * the lie this whole file is trying not to tell. A value of 0 is NO LIMIT, as
+ * Linux's tmpfs reads it: *ZERO says so, and the return is 0 (233). */
+static size_t tmpfs_parse_num(const char *opts, const char *key, bool *zero)
 {
+    *zero = false;
     if (!opts) return 0;
     const char *p = tfind_opt(opts, key);
     if (!p) return 0;
@@ -969,18 +1005,20 @@ static size_t tmpfs_parse_num(const char *opts, const char *key)
     default: break;
     }
     if (*p && *p != ',') return (size_t)-1;
-    return v ? v : (size_t)-1;
+    if (!v) *zero = true;
+    return v;
 }
 
 int tmpfs_mount_at(const char *path, const char *opts)
 {
-    size_t want = tmpfs_parse_num(opts, "size=");
+    bool size0, nodes0;
+    size_t want = tmpfs_parse_num(opts, "size=", &size0);
     if (want == (size_t)-1) {
         kprintf("[tmpfs] unparseable size= option -- refusing rather than "
                 "mounting a different size than asked for\n");
         return VFS_ERR_INVAL;
     }
-    size_t want_nodes = tmpfs_parse_num(opts, "nr_inodes=");
+    size_t want_nodes = tmpfs_parse_num(opts, "nr_inodes=", &nodes0);
     if (want_nodes == (size_t)-1 || want_nodes > TMPFS_LIMIT_NODES) {
         kprintf("[tmpfs] unparseable or too large nr_inodes= option -- "
                 "refusing rather than mounting a different limit than asked "
@@ -1011,8 +1049,9 @@ int tmpfs_mount_at(const char *path, const char *opts)
         if (!g_tmpfs[i].used) m = &g_tmpfs[i];
     if (!m) return VFS_ERR_NOSPC;
 
-    size_t max_nodes = want_nodes;
     size_t max_bytes = want ? want : tmpfs_default_bytes();
+    if (size0) max_bytes = (size_t)-1 / 2;          /* no limit (233) */
+    size_t max_nodes = nodes0 ? TMPFS_LIMIT_NODES : want_nodes;
     if (!max_nodes) {
         max_nodes = max_bytes / TMPFS_BYTES_PER_NODE;
         if (max_nodes < TMPFS_MIN_NODES)   max_nodes = TMPFS_MIN_NODES;
@@ -1029,6 +1068,8 @@ int tmpfs_mount_at(const char *path, const char *opts)
     m->max_bytes = max_bytes;
     m->root_mode = root_mode;
     m->root_time = tmpfs_now_secs();
+    m->no_byte_limit = size0;
+    m->no_node_limit = nodes0;
     m->used = true;
 
     int rc = vfs_mount(path, &tmpfs_ops, m);
