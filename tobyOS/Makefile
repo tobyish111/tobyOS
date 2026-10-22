@@ -3017,6 +3017,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	rm -rf $(INITRD_STAGE)
 	mkdir -p $(INITRD_STAGE)/bin $(INITRD_STAGE)/etc $(INITRD_STAGE)/repo $(INITRD_STAGE)/lib \
 	         $(INITRD_STAGE)/system/keys $(INITRD_STAGE)/m36
+	@# the FHS's mount points and homes (finding 217)
+	mkdir -p $(INITRD_STAGE)/mnt $(INITRD_STAGE)/media $(INITRD_STAGE)/srv \
+	         $(INITRD_STAGE)/home $(INITRD_STAGE)/root
 	cp initrd/etc/motd                       $(INITRD_STAGE)/etc/motd
 	cp initrd/etc/anim.html                  $(INITRD_STAGE)/etc/anim.html
 	cp initrd/etc/webgl.html                 $(INITRD_STAGE)/etc/webgl.html
@@ -4284,6 +4287,11 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar \
 	    etc/oilspec/bin
+	@# the FHS's mount points and homes, as Linux's modes (finding 217)
+	cd $(INITRD_STAGE) && tar --format=ustar --mode=0755 --owner=0 --group=0 \
+	    --numeric-owner --no-recursion -rf ../initrd.tar mnt media srv home \
+	  && tar --format=ustar --mode=0700 --owner=0 --group=0 \
+	    --numeric-owner --no-recursion -rf ../initrd.tar root
 # busybox applets on PATH. Runs LAST, and both halves of that matter:
 #   - AFTER every other bin/ has been staged, so the "already taken"
 #     test sees the real binaries. Done earlier it reported 0 collisions
