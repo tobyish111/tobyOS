@@ -163,7 +163,8 @@ static int devfs_blk_kind(const struct blk_dev *d) {
     const struct blk_dev *disk = d->parent ? d->parent : d;
     const char *n = disk->name ? disk->name : "";
     if (strncmp(n, "nvme", 4) == 0) return DB_NVME;
-    if (strncmp(n, "virtio", 6) == 0 || strncmp(n, "vd", 2) == 0) return DB_VD;
+    if (strncmp(n, "virtio", 6) == 0 || strncmp(n, "vd", 2) == 0 ||
+        strncmp(n, "vblk", 4) == 0) return DB_VD;     /* virtio_blk's "vblk0" */
     return DB_SD;
 }
 
@@ -255,16 +256,24 @@ size_t devfs_partitions(char *buf, size_t cap) {
     if (!buf || cap == 0) return 0;
     int w = ksnprintf(buf, cap, "major minor  #blocks  name\n\n");
     if (w > 0) off = (size_t)w < cap ? (size_t)w : cap - 1;
+    /* Each disk, then its own partitions, as Linux lists them: the
+     * registry holds every disk before the first partition. */
     size_t cnt = blk_count();
     for (size_t i = 0; i < cnt && off + 1 < cap; i++) {
-        struct blk_dev *x = blk_get(i);
-        char n[32];
-        uint32_t a, b;
-        if (!x || !devfs_blk_ident(x, n, sizeof n, &a, &b)) continue;
-        w = ksnprintf(buf + off, cap - off, "%4u  %7u %10llu %s\n", a, b,
-                      (unsigned long long)(x->sector_count / 2), n);
-        if (w <= 0) break;
-        off += (size_t)w < cap - off ? (size_t)w : cap - off - 1;
+        struct blk_dev *disk = blk_get(i);
+        if (!disk || disk->class != BLK_CLASS_DISK) continue;
+        for (size_t j = i; j < cnt && off + 1 < cap; j++) {
+            struct blk_dev *x = blk_get(j);
+            char n[32];
+            uint32_t a, b;
+            if (!x || (x != disk && (x->class != BLK_CLASS_PARTITION ||
+                                     x->parent != disk))) continue;
+            if (!devfs_blk_ident(x, n, sizeof n, &a, &b)) continue;
+            w = ksnprintf(buf + off, cap - off, "%4u  %7u %10llu %s\n", a, b,
+                          (unsigned long long)(x->sector_count / 2), n);
+            if (w <= 0) break;
+            off += (size_t)w < cap - off ? (size_t)w : cap - off - 1;
+        }
     }
     return off;
 }
