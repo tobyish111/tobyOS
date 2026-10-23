@@ -2670,6 +2670,28 @@ int resolve_kernel_path(const char *kstr, char *out, size_t cap) {
     return resolve_path_str(kstr, (long)n, out, cap);
 }
 
+/* THE WORKING DIRECTORY AS A RELATIVE NAME STARTS FROM IT (finding 250).
+ * The cwd is kept as its directory's real path -- chdir stores the
+ * resolved name, a chroot's prefix included -- and inside a chroot a
+ * relative name starts from it as the root sees it: the cwd less the
+ * root's prefix. That prefix was added to the whole cwd again, so in a
+ * chroot every relative name missed and getcwd said the host's path. A
+ * cwd chroot(2) left outside the new root (it does not move the cwd, on
+ * Linux either) keeps its real path: names from it are not prefixed, and
+ * `..` from it climbs past the jail, as on Linux. *OUTSIDE says which. */
+static const char *cwd_view(struct proc *p, bool *outside) {
+    *outside = false;
+    const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+    if (!p || !p->fs_root[0]) return cwd;
+    size_t rl = strlen(p->fs_root);
+    if (strncmp(cwd, p->fs_root, rl) == 0) {
+        if (cwd[rl] == '\0') return "/";
+        if (cwd[rl] == '/') return cwd + rl;
+    }
+    *outside = true;
+    return cwd;
+}
+
 /* resolve_user_path's walk, of UP (PLEN bytes, NUL-terminated). */
 static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
     /* an empty path names nothing: ENOENT, as Linux's (EINVAL for a
@@ -2704,13 +2726,15 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
      * path_lexical_clean, so a bare "." / "./foo" cwd-relative path Just Works
      * (e.g. `busybox ls .` -> opendir(".") -> the cwd) without a special case. */
     char full[ABI_PATH_MAX];
+    bool outside = false;                 /* a cwd outside the chroot (250) */
+    const char *vcwd = "/";
     if (up[0] == '/') {
         if ((size_t)plen >= sizeof full) return -ABI_ENAMETOOLONG;
         memcpy(full, up, (size_t)plen);
         full[plen] = '\0';
     } else {
         struct proc *p = current_proc();
-        const char *cwd = (p && p->cwd[0]) ? p->cwd : "/";
+        const char *cwd = vcwd = cwd_view(p, &outside);
         size_t clen = strlen(cwd);
         bool need_slash = (clen == 0 || cwd[clen - 1] != '/');
         size_t need = clen + (need_slash ? 1 : 0) + (size_t)plen + 1;
@@ -2724,7 +2748,7 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
     }
     if (path_has_dotdot(up)) {                     /* see path_walk_physical */
         struct proc *cp = current_proc();
-        const char *root = (cp && cp->fs_root[0]) ? cp->fs_root : "";
+        const char *root = (cp && cp->fs_root[0] && !outside) ? cp->fs_root : "";
         int wr = path_walk_physical(root, full, out, cap);
         /* A WORKING DIRECTORY THAT WAS REMOVED STILL HAS A "..": Linux's
          * walk climbs from the directory it holds, whose parent link
@@ -2760,7 +2784,7 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
          * insertion point covers open/stat/exec/mkdir/... rather than needing
          * a check per syscall. */
         struct proc *cp = current_proc();
-        if (cp && cp->fs_root[0]) {
+        if (cp && cp->fs_root[0] && !outside) {
             char joined[ABI_PATH_MAX];
             size_t rl = strlen(cp->fs_root);
             size_t ol = strlen(out);
@@ -2778,13 +2802,11 @@ static int resolve_path_str(const char *up, long plen, char *out, size_t cap) {
             memcpy(out, joined, jl + 1);
         }
         /* where the walk starts: the root, or the working directory */
-        size_t rootl = (cp && cp->fs_root[0]) ? strlen(cp->fs_root) : 0;
+        size_t rootl = (cp && cp->fs_root[0] && !outside) ? strlen(cp->fs_root) : 0;
         size_t from = rootl;
         if (up[0] != '/') {
-            struct proc *wp = current_proc();
-            const char *cwd = (wp && wp->cwd[0]) ? wp->cwd : "/";
-            size_t cl = strlen(cwd);
-            while (cl > 1 && cwd[cl - 1] == '/') cl--;
+            size_t cl = strlen(vcwd);
+            while (cl > 1 && vcwd[cl - 1] == '/') cl--;
             if (cl > 1) from += cl;
         }
         return resolve_links_searched(out, cap, from, rootl);
@@ -5056,9 +5078,18 @@ static long sys_getcwd(char *out, size_t cap) {
     /* a removed working directory has no path: ENOENT, as Linux's
      * getcwd(2) says (finding 200) */
     if (cwd_is_gone(cwd)) return -ABI_ENOENT;
-    size_t n = strlen(cwd);
+    /* in a chroot, the path from its root; a cwd outside the root is
+     * "(unreachable)" and its real path, Linux's answer (finding 250) */
+    bool outside;
+    const char *view = cwd_view(p, &outside);
+    char ub[ABI_PATH_MAX + 16];
+    if (outside) {
+        ksnprintf(ub, sizeof ub, "(unreachable)%s", cwd);
+        view = ub;
+    }
+    size_t n = strlen(view);
     if (n + 1 > cap) return -ABI_ERANGE;
-    if (copy_to_user(out, cwd, n + 1) != 0) return -ABI_EFAULT;
+    if (copy_to_user(out, view, n + 1) != 0) return -ABI_EFAULT;
     return (long)n;
 }
 
