@@ -718,16 +718,16 @@ bool usb_msc_probe(struct usb_device *dev,
             m->name, (unsigned long long)m->block_count, m->block_size,
             (unsigned long long)((m->block_count * m->block_size) >> 20));
 
-    /* Scan for GPT partitions on the new disk. partition_scan_disk
-     * silently returns -1 for raw (non-GPT) media, which is fine for
+    /* Scan for GPT or MBR partitions on the new disk. partition_scan_disk
+     * silently returns -1 for raw media with no table, which is fine for
      * single-FS USB sticks. The kernel boot path will look at /usb
      * directly for the FAT32 mount in that case. */
     int parts = partition_scan_disk(&m->blk);
     if (parts > 0) {
-        kprintf("[usb-msc] '%s': %d GPT partition(s) registered\n",
+        kprintf("[usb-msc] '%s': %d partition(s) registered\n",
                 m->name, parts);
     } else {
-        kprintf("[usb-msc] '%s': no GPT (raw filesystem assumed)\n",
+        kprintf("[usb-msc] '%s': no partition table (raw filesystem assumed)\n",
                 m->name);
     }
 

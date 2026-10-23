@@ -4355,6 +4355,7 @@ void _start(void) {
             struct blk_dev *p;
             while (!fat_mounted &&
                    (p = blk_iter_next(&it, BLK_CLASS_PARTITION)) != NULL) {
+                if (!blk_boot_may_mount(p)) continue;
                 if (!fat32_probe(p)) continue;
                 int rc = fat32_mount("/fat", p);
                 if (rc == VFS_OK) {
@@ -4504,6 +4505,7 @@ void _start(void) {
             struct blk_dev *p;
             while (!usb_mounted &&
                    (p = blk_iter_next(&it, BLK_CLASS_PARTITION)) != NULL) {
+                if (!blk_boot_may_mount(p)) continue;
                 if (!p->parent || !p->parent->name) continue;
                 const char *pn = p->parent->name;
                 if (pn[0] != 'u' || pn[1] != 's' || pn[2] != 'b') continue;
@@ -4642,6 +4644,7 @@ void _start(void) {
                     while (!remount_ok &&
                            (p = blk_iter_next(&itp, BLK_CLASS_PARTITION)) !=
                                NULL) {
+                        if (!blk_boot_may_mount(p)) continue;
                         if (!p->parent || !p->parent->name) continue;
                         const char *pn = p->parent->name;
                         if (pn[0] != 'u' || pn[1] != 's' || pn[2] != 'b')
@@ -4724,6 +4727,7 @@ void _start(void) {
             struct blk_dev *p;
             while (!ext_mounted &&
                    (p = blk_iter_next(&it, BLK_CLASS_PARTITION)) != NULL) {
+                if (!blk_boot_may_mount(p)) continue;
                 if (!ext4_probe(p)) continue;
                 int rc = ext4_mount("/ext", p);
                 if (rc == VFS_OK) {

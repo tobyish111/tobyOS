@@ -49,6 +49,7 @@ static int bootlog_try_mount_usb_fat(void) {
     size_t it = 0;
     struct blk_dev *p;
     while ((p = blk_iter_next(&it, BLK_CLASS_PARTITION)) != NULL) {
+        if (!blk_boot_may_mount(p)) continue;
         if (!p->parent || !p->parent->name) continue;
         const char *pn = p->parent->name;
         if (pn[0] != 'u' || pn[1] != 's' || pn[2] != 'b') continue;

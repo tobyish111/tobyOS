@@ -27,6 +27,10 @@
  *   4. Return the count of partitions registered (0+) or -1 if the
  *      disk has no GPT at all.
  *
+ *   5. A disk with no protective MBR may carry a DOS (MBR) table
+ *      instead: its primary, extended and logical partitions are
+ *      registered under Linux's numbers (mbr_scan_disk, finding 248).
+ *
  * Idempotency
  * -----------
  *
@@ -355,6 +359,146 @@ static int load_gpt_header(struct blk_dev *disk, struct gpt_header *hdr) {
     return 1;
 }
 
+/* ---- MBR (msdos) tables (finding 248) ------------------------------ *
+ *
+ * A disk whose LBA 0 ends in 55 AA without a 0xEE entry carries a DOS
+ * partition table -- or is a FAT volume with no table, whose boot sector
+ * ends the same way. As Linux does, the four entries' boot flags tell
+ * them apart: a table's are 0x00 or 0x80, and anything else there is boot
+ * code. The partitions are numbered as Linux numbers them: primary slots
+ * 1-4 where they stand (an empty slot leaves its number unused), then the
+ * logical partitions of each extended one from 5, in the order of its
+ * chain of extended boot records. An extended partition is a node of its
+ * first two sectors only, so nothing takes the container for a
+ * filesystem. A partition starting past the disk's end is left out; one
+ * running past it is cut at the end. */
+
+#define MBR_ENTRY_OFF   446
+#define MBR_MAX_PARTNO  15     /* sd's 16 minors a disk, the disk's own first */
+#define MBR_MAX_LINKS   100    /* EBRs followed before a loop is assumed */
+
+struct mbr_ent {
+    uint8_t  boot, type;
+    uint32_t start, count;
+};
+
+static void mbr_entry(const uint8_t *sec, int i, struct mbr_ent *e) {
+    const uint8_t *p = sec + MBR_ENTRY_OFF + i * 16;
+    e->boot  = p[0];
+    e->type  = p[4];
+    e->start = (uint32_t)p[8]  | (uint32_t)p[9] << 8 |
+               (uint32_t)p[10] << 16 | (uint32_t)p[11] << 24;
+    e->count = (uint32_t)p[12] | (uint32_t)p[13] << 8 |
+               (uint32_t)p[14] << 16 | (uint32_t)p[15] << 24;
+}
+
+static bool mbr_extended(uint8_t type) {
+    return type == 0x05 || type == 0x0F || type == 0x85;
+}
+
+static bool mbr_signed(const uint8_t *sec) {
+    return ((uint16_t)sec[MBR_SIGNATURE_OFF] |
+            (uint16_t)sec[MBR_SIGNATURE_OFF + 1] << 8) == MBR_SIGNATURE_VAL;
+}
+
+/* Register partition NO of DISK. Returns 1 when it is there afterwards. */
+static int mbr_add(struct blk_dev *disk, uint32_t no, uint64_t start,
+                   uint64_t count, uint8_t type) {
+    const char *dn = disk->name ? disk->name : "?";
+    if (no > MBR_MAX_PARTNO || count == 0) return 0;
+    if (start >= disk->sector_count) {
+        kprintf("[part] %s: p%u starts past the disk's end -- skipped\n",
+                dn, (unsigned)no);
+        return 0;
+    }
+    if (start + count > disk->sector_count) {
+        kprintf("[part] %s: p%u runs past the disk's end -- cut at it\n",
+                dn, (unsigned)no);
+        count = disk->sector_count - start;
+    }
+    char scratch[64];
+    make_partition_name(disk->name, no, scratch, sizeof(scratch));
+    if (partition_already_registered(scratch)) return 1;
+    size_t nlen = strlen(scratch);
+    char *name = kmalloc(nlen + 1);
+    if (!name) return 0;
+    memcpy(name, scratch, nlen + 1);
+    struct blk_dev *part = blk_partition_wrap(disk, start, count, name, no, 0, "");
+    if (!part) {
+        kfree(name);
+        return 0;
+    }
+    part->scheme   = BLK_SCHEME_MBR;
+    part->mbr_type = type;
+    blk_register(part);
+    kprintf("[part] %s: MBR p%u -> %s, type 0x%02x, LBA %lu (%lu sectors)\n",
+            dn, (unsigned)no, name, (unsigned)type,
+            (unsigned long)start, (unsigned long)count);
+    return 1;
+}
+
+/* The logical partitions of the extended partition at FIRST (COUNT
+ * sectors), numbered from *NO. Each EBR's data entries are relative to
+ * that EBR; its link to the next EBR is relative to FIRST. Entries 3 and
+ * 4 of an EBR are often garbage, so they count only when they fit. */
+static int mbr_logicals(struct blk_dev *disk, uint64_t first, uint64_t count,
+                        uint32_t *no) {
+    uint8_t sec[BLK_SECTOR_SIZE];
+    uint64_t here = first, here_size = count;
+    int n = 0;
+    for (int links = 0; links < MBR_MAX_LINKS && *no <= MBR_MAX_PARTNO; links++) {
+        if (here >= disk->sector_count || blk_read(disk, here, 1, sec) != 0) break;
+        if (!mbr_signed(sec)) break;
+        struct mbr_ent e[4];
+        for (int i = 0; i < 4; i++) mbr_entry(sec, i, &e[i]);
+        for (int i = 0; i < 4 && *no <= MBR_MAX_PARTNO; i++) {
+            if (e[i].count == 0 || mbr_extended(e[i].type)) continue;
+            if (i >= 2 && ((uint64_t)e[i].start + e[i].count > here_size ||
+                           here + e[i].start + e[i].count > first + count)) continue;
+            n += mbr_add(disk, *no, here + e[i].start, e[i].count, e[i].type);
+            (*no)++;
+        }
+        int link = -1;
+        for (int i = 0; i < 4; i++)
+            if (e[i].count && mbr_extended(e[i].type)) { link = i; break; }
+        if (link < 0) break;
+        here = first + e[link].start;
+        here_size = e[link].count;
+    }
+    return n;
+}
+
+/* A DOS table on DISK: the partitions registered (0+), or -1 when LBA 0
+ * holds no table. */
+static int mbr_scan_disk(struct blk_dev *disk) {
+    uint8_t sec[BLK_SECTOR_SIZE];
+    if (blk_read(disk, 0, 1, sec) != 0 || !mbr_signed(sec)) return -1;
+    struct mbr_ent e[4];
+    for (int i = 0; i < 4; i++) {
+        mbr_entry(sec, i, &e[i]);
+        if (e[i].boot != 0x00 && e[i].boot != 0x80) return -1;
+    }
+    const char *dn = disk->name ? disk->name : "?";
+    int n = 0;
+    /* The primaries first, then the logicals: the registry's order is
+     * /proc/partitions' order, and Linux lists a disk's partitions by
+     * number. */
+    for (int i = 0; i < 4; i++) {
+        if (e[i].count == 0) continue;
+        uint64_t count = e[i].count;
+        if (mbr_extended(e[i].type) && count > 2) count = 2;
+        n += mbr_add(disk, (uint32_t)i + 1, e[i].start, count, e[i].type);
+    }
+    uint32_t logical = 5;
+    for (int i = 0; i < 4; i++)
+        if (e[i].count && mbr_extended(e[i].type))
+            n += mbr_logicals(disk, e[i].start, e[i].count, &logical);
+    if (n) kprintf("[part] %s: MBR table -- registered %d partition(s)\n", dn, n);
+    else   kprintf("[part] %s: 55 AA with no partition entries (an empty "
+                   "table, or a filesystem with none)\n", dn);
+    return n;
+}
+
 /* ---- public API --------------------------------------------------- */
 
 int partition_scan_disk(struct blk_dev *disk) {
@@ -362,7 +506,7 @@ int partition_scan_disk(struct blk_dev *disk) {
     if (disk->sector_count < 34) return -1;   /* GPT minimum: 1+1+32 */
 
     if (!check_protective_mbr(disk)) {
-        return -1;     /* no protective MBR -- not a GPT disk */
+        return mbr_scan_disk(disk);     /* a DOS table, or no table at all */
     }
 
     struct gpt_header hdr;

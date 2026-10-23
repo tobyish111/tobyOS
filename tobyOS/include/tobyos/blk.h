@@ -69,6 +69,13 @@ enum blk_dev_class {
     BLK_CLASS_WRAPPER   = 3,
 };
 
+/* The table a partition came from (finding 248). GPT is 0, so every
+ * partition made before MBR tables were read keeps its meaning. */
+enum blk_part_scheme {
+    BLK_SCHEME_GPT = 0,
+    BLK_SCHEME_MBR = 1,
+};
+
 struct blk_dev {
     const char         *name;
     const struct blk_ops *ops;
@@ -89,6 +96,8 @@ struct blk_dev {
     uint32_t            partition_index; /* 1-based GPT slot index (partition only) */
     uint8_t             type_guid[BLK_GUID_BYTES];   /* GPT type GUID */
     char                partition_label[BLK_PART_LABEL_MAX];
+    uint8_t             scheme;          /* enum blk_part_scheme (partition only) */
+    uint8_t             mbr_type;        /* the MBR entry's type byte (MBR only) */
 
     /* ---- M26E additions: removable-storage lifecycle ----
      *
@@ -159,6 +168,15 @@ struct blk_dev *blk_get(size_t idx);
  *         partition_scan_disk(d);
  *     } */
 struct blk_dev *blk_iter_next(size_t *cookie, enum blk_dev_class class);
+
+/* May boot mount D by itself (/fat, /usb, /ext, the boot log's stick)?
+ * Not a partition of an MBR table: those are nodes in /dev and mount by
+ * hand, as on Linux, but they are most often another system's media, and
+ * boot never wrote to them before tables of that kind were read (finding
+ * 248). */
+static inline bool blk_boot_may_mount(const struct blk_dev *d) {
+    return d->scheme != BLK_SCHEME_MBR;
+}
 
 /* Convenience: first DISK / first PARTITION -- preferred over
  * blk_get_first() once partitions exist, because blk_get_first()
