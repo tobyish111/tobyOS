@@ -1379,7 +1379,14 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
 #define ABI_SYS_GETRGID         234  /* () -> the caller's REAL gid, as
                                         GETRUID is the real uid: libtoby's
                                         getgid() (finding 206) */
-#define ABI_SYS_NR_MAX          234
+#define ABI_SYS_CHROOT          235  /* (path) -> 0|-E: chroot(2), the Linux
+                                        personality's, in Linux's order of
+                                        answers (finding 214) */
+#define ABI_SYS_MKNOD           236  /* (dirfd, path, mode, dev) -> 0|-E:
+                                        mknodat(2), Linux's dev_t; a device
+                                        node keeps its numbers and opens the
+                                        device they name (finding 214) */
+#define ABI_SYS_NR_MAX          236
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

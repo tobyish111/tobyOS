@@ -310,6 +310,41 @@ static bool devfs_lookup(const char *rel, uint32_t *mode, uint32_t *maj,
     return false;
 }
 
+/* The /dev name of the device numbered MAJ:MIN of format FMT (S_IFCHR or
+ * S_IFBLK): what a device node made elsewhere opens (finding 214). False
+ * when no device has those numbers -- ENXIO, as Linux says. */
+bool devfs_path_by_rdev(uint32_t fmt, uint32_t maj, uint32_t min,
+                        char *out, size_t cap) {
+    for (unsigned i = 0; i < DEVFS_N; i++) {
+        const struct devfs_ent *e = &g_devfs[i];
+        if ((e->mode & 0xF000u) != fmt || e->maj != maj || e->min != min) continue;
+        if (!devfs_present(e)) continue;
+        ksnprintf(out, cap, "/dev/%s", e->path);
+        return true;
+    }
+    char n[32];
+    int idx;
+    if (fmt == DEV_S_IFCHR && maj == 4) {
+        ksnprintf(n, sizeof n, "tty%u", min);
+        if (devfs_vt_index(n, &idx)) { ksnprintf(out, cap, "/dev/%s", n); return true; }
+    }
+    if (fmt == DEV_S_IFCHR && maj == 136 && min < 10000 && pty_slave_live((int)min)) {
+        ksnprintf(out, cap, "/dev/pts/%u", min);
+        return true;
+    }
+    if (fmt == DEV_S_IFBLK) {
+        size_t cnt = blk_count();
+        for (size_t i = 0; i < cnt; i++) {
+            uint32_t a, b;
+            if (devfs_blk_ident(blk_get(i), n, sizeof n, &a, &b) && a == maj && b == min) {
+                ksnprintf(out, cap, "/dev/%s", n);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* ---- the answer syscall.c asks (dev_synth_mode) ----------------------- */
 
 uint32_t devfs_node_mode(const char *kpath, uint32_t *maj, uint32_t *min) {
@@ -345,6 +380,10 @@ static int devfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
                                                     VFS_TYPE_FILE;
     out->mode = mode | VFS_MODE_VALID;       /* S_IFCHR stays in the mode */
     if ((mode & 0xF000u) == DEV_S_IFBLK) out->gid = DEV_GID_DISK;   /* 198 */
+    if ((mode & 0xF000u) == DEV_S_IFCHR || (mode & 0xF000u) == DEV_S_IFBLK) {
+        out->rmaj = a;                       /* 214 */
+        out->rmin = b;
+    }
     {   /* made at boot, as devtmpfs's are (finding 202; src/syscall.c) */
         extern uint64_t dev_boot_time(void);
         out->atime = out->mtime = out->ctime = dev_boot_time();

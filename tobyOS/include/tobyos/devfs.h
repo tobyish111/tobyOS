@@ -21,5 +21,9 @@ bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
 struct blk_dev *devfs_blk_by_path(const char *kpath, uint32_t *maj, uint32_t *min);
 /* /proc/partitions, Linux's table, into BUF; its length */
 size_t devfs_partitions(char *buf, size_t cap);
+/* Finding 214: the /dev path of the device of format FMT (0020000 or
+ * 0060000) numbered MAJ:MIN, into OUT; false when there is none. */
+bool devfs_path_by_rdev(uint32_t fmt, uint32_t maj, uint32_t min,
+                        char *out, size_t cap);
 
 #endif

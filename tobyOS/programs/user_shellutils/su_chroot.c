@@ -24,12 +24,9 @@
  *     is neither a name nor a number, empty items skipped).
  *   - Then chdir("/") unless --skip-chdir, and the command.
  *
- * tobyOS: the native ABI has no chroot. NEWROOT is checked as chroot(2)
- * checks it (resolve, a directory, searchable), then an unprivileged
- * caller is refused as Linux refuses one; root is told "Function not
- * implemented" unless ABI_SYS_CHROOT exists. The supplementary groups go
- * through libtoby's setgroups (ABI_SYS_SETGROUPS). There was no chroot
- * before. */
+ * tobyOS: libtoby's chroot is the kernel's (ABI_SYS_CHROOT, finding 214),
+ * in Linux's order of answers. The supplementary groups go through
+ * libtoby's setgroups (ABI_SYS_SETGROUPS). There was no chroot before. */
 
 #include "su_fileops.c"
 #ifdef SU_HOST
@@ -37,34 +34,8 @@
 #include <pwd.h>
 #endif
 
-#ifndef SU_HOST
-#ifdef ABI_SYS_CHROOT
-static long cr_sc2(long n, long a, long b) {
-    long r;
-    __asm__ volatile("syscall" : "=a"(r) : "0"(n), "D"(a), "S"(b) : "rcx", "r11", "memory");
-    return r;
-}
-#endif
-#endif
-
 static int cr_chroot(const char *dir) {
-#ifdef SU_HOST
     return chroot(dir);
-#else
-    struct stat st;
-    if (stat(dir, &st) != 0) return -1;
-    if (!S_ISDIR(st.st_mode)) { errno = ENOTDIR; return -1; }
-    if (access(dir, X_OK) != 0) return -1;
-    if (geteuid() != 0) { errno = EPERM; return -1; }
-#ifdef ABI_SYS_CHROOT
-    long r = cr_sc2(ABI_SYS_CHROOT, (long)dir, 0);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return 0;
-#else
-    errno = ENOSYS;
-    return -1;
-#endif
-#endif
 }
 
 static int cr_setgroups(size_t n, const gid_t *list) {

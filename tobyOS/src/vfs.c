@@ -1366,6 +1366,22 @@ int vfs_mksock(const char *path, uint32_t mode) {
     return VFS_OK;
 }
 
+int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min) {
+    uint32_t fmt = mode & 0170000u;
+    if (fmt != 0020000u && fmt != 0060000u) return VFS_ERR_INVAL;
+    struct vfs_stat st;
+    if (vfs_stat(path, &st) == VFS_OK) return VFS_ERR_EXIST;
+    const char *rel;
+    struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return VFS_ERR_NOMOUNT;
+    if (!m->ops->setrdev) return VFS_ERR_NOTPERM;
+    int rc = vfs_create_mode(path, (mode & 07777u) | fmt);
+    if (rc != VFS_OK) return rc;
+    rc = m->ops->setrdev(m->data, rel, maj, min);
+    if (rc != VFS_OK) (void)vfs_unlink(path);
+    return rc;
+}
+
 /* Defined with the symlink table further down; declared here because
  * vfs_unlink needs it and the table's struct is not visible yet. */
 static int symlink_table_remove(const char *path);

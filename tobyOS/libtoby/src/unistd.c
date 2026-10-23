@@ -276,6 +276,21 @@ int mkfifo(const char *path, mode_t mode) {
                                       (long)mode));
 }
 
+/* mknod(2) and mknodat(2), the kernel's in Linux's order of answers: a
+ * device node for root alone, as on Linux (finding 214; there was none) */
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev) {
+    return (int)__toby_check(toby_sc4(ABI_SYS_MKNOD, dirfd, (long)(uintptr_t)path,
+                                      (long)mode, (long)dev));
+}
+int mknod(const char *path, mode_t mode, dev_t dev) {
+    return mknodat(-100, path, mode, dev);           /* AT_FDCWD */
+}
+
+/* chroot(2), the kernel's (finding 214; there was none) */
+int chroot(const char *path) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_CHROOT, (long)(uintptr_t)path));
+}
+
 /* The link itself, S_IFLNK; stat() follows it. There was no lstat, and
  * stat called a link a regular file, so nothing native could see one. */
 int lstat(const char *path, struct stat *out) {

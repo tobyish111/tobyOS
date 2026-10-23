@@ -136,6 +136,7 @@ struct tmpfs_node {
     uint32_t      nlink;                /* names pointing at this owner */
     uint32_t      nent;                 /* a directory's entries (238) */
     size_t        pages;                /* its size's pages, charged (243) */
+    uint32_t      rmaj, rmin;           /* a device node's numbers (214) */
 };
 
 /* The pages of N bytes, which Linux's tmpfs charges a file (243) */
@@ -748,6 +749,24 @@ static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
     out->atime = nd->atime;
     out->ctime = nd->ctime;
     out->nlink = nd->nlink ? nd->nlink : 1u;
+    out->rmaj  = nd->rmaj;
+    out->rmin  = nd->rmin;
+}
+
+/* A device node's numbers, on the node mknod has just made (finding 214):
+ * tmpfs keeps them, as Linux's does, and open finds the device by them. */
+static int tmpfs_setrdev(void *mnt, const char *path, uint32_t maj, uint32_t min)
+{
+    struct tmpfs_mount *m = mnt;
+    char norm[VFS_PATH_MAX];
+    if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
+    struct tmpfs_node *nd = tfind(m, norm);
+    if (!nd) return VFS_ERR_NOENT;
+    uint32_t fmt = nd->mode & 0170000u;
+    if (fmt != 0020000u && fmt != 0060000u) return VFS_ERR_INVAL;
+    nd->rmaj = maj;
+    nd->rmin = min;
+    return VFS_OK;
 }
 
 /* The open file's stat, through the node it holds -- renamed or unlinked
@@ -1061,6 +1080,7 @@ static const struct vfs_ops tmpfs_ops = {
     .umount    = tmpfs_umount,
     .statfs    = tmpfs_statfs,   /* Phase H */
     .fstat     = tmpfs_fstat,
+    .setrdev   = tmpfs_setrdev,  /* finding 214 */
 };
 
 /* Parse a numeric mount option, `size=` or `nr_inodes=`. Accepts a plain

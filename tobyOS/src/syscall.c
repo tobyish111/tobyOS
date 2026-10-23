@@ -4053,6 +4053,22 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
         if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
             (fs.mode & 0170000u) == 0140000u)
             return -ABI_ENXIO;
+        /* A DEVICE NODE OUTSIDE /dev (finding 214) opens the device its
+         * numbers name, as Linux's open does -- 1:3 is null wherever the
+         * node is: EACCES on a nodev mount, ENXIO when no device has the
+         * numbers. The node's own permissions were asked above; O_TRUNC
+         * means nothing to a device. */
+        if (strncmp(kpath, "/dev/", 5) != 0 &&
+            vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
+            ((fs.mode & 0170000u) == 0020000u || (fs.mode & 0170000u) == 0060000u)) {
+            if (vfs_path_mount_flags(kpath) & VFS_MNT_NODEV) return -ABI_EACCES;
+            char dp[48];
+            if (!devfs_path_by_rdev(fs.mode & 0170000u, fs.rmaj, fs.rmin, dp, sizeof dp))
+                return -ABI_ENXIO;
+            if (depth >= 8) return -ABI_ELOOP;
+            return sys_open_resolved_at(dp, flags & ~(ABI_O_CREAT | ABI_O_EXCL | ABI_O_TRUNC),
+                                        mode, depth + 1);
+        }
         if (vfs_stat_follow(kpath, &fs) == VFS_OK && fs.type == VFS_TYPE_FILE &&
             (fs.mode & 0170000u) == 0010000u) {
             struct file *ff = 0;
@@ -4291,6 +4307,10 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
      * shred rounds a file up to it, and cp and stat %o read it (512 made
      * `shred f` of a 2-byte file 512 bytes where Linux makes it 4096) */
     dst->blksize = 4096;
+    if (typ == ABI_S_IFCHR || typ == ABI_S_IFBLK) {     /* a node (214) */
+        dst->rdev_major = src->rmaj;
+        dst->rdev_minor = src->rmin;
+    }
 }
 _Static_assert(offsetof(struct abi_stat, ctime) == ABI_STAT_V1_SIZE,
                "SYS_STAT/FSTAT/LSTAT write the struct up to ctime");
@@ -6681,6 +6701,98 @@ static long sys_waitpid(int vpid, int *status_out, int flags) {
     return vpid;
 }
 
+/* ---- chroot(2) and mknod(2), for both ABIs (finding 214) ----------------
+ *
+ * In Linux's order of answers. The Linux personality checked the
+ * capability first, so an unprivileged chroot of a missing path said EPERM
+ * where Linux says ENOENT; the native ABI had neither call, and its chroot
+ * and mknod commands imitated the order in userland -- root's chroot was
+ * "Function not implemented", root's mknod of a device EPERM. */
+
+/* The directory KPATH is in (its last '/' and before; "/" for a name at the
+ * root) into OUT. */
+static void kpath_parent(const char *kpath, char *out, size_t cap) {
+    size_t n = strlen(kpath), cut = 0;
+    while (n > 1 && kpath[n - 1] == '/') n--;
+    for (size_t i = 0; i < n; i++) if (kpath[i] == '/') cut = i;
+    if (cut == 0) cut = 1;
+    if (cut >= cap) cut = cap - 1;
+    memcpy(out, kpath, cut);
+    out[cut] = '\0';
+}
+
+/* chroot(UPATH): the path's errors first -- ENOENT, ENOTDIR, EACCES for a
+ * component or the directory itself that may not be searched -- and only
+ * then EPERM for a caller without CAP_SYS_CHROOT. */
+static long sys_chroot_user(const char *upath) {
+    struct proc *cp = current_proc();
+    if (!cp) return -ABI_EPERM;
+    char knew[ABI_PATH_MAX];
+    int rr = resolve_user_path(upath, knew, sizeof knew);
+    if (rr != 0) return rr;                   /* EACCES too (finding 188) */
+    struct vfs_stat st;
+    int sr = vfs_stat_follow(knew, &st);
+    if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    if (st.type != VFS_TYPE_DIR)         return -ABI_ENOTDIR;
+    int pc = vfs_perm_check(knew, VFS_WANT_EXEC);
+    if (pc != VFS_OK)                    return vfs_err_to_abi(pc);
+    /* Slice 11: CAP_SYS_CHROOT. No ownership requirement, because chroot
+     * changes only the CALLER's own path resolution -- it grants no
+     * authority over anything outside the caller. */
+    if (!userns_capable(LCAP_SYS_CHROOT)) return -ABI_EPERM;
+    size_t n = strlen(knew);
+    if (n >= sizeof(cp->fs_root))        return -ABI_ENAMETOOLONG;
+    /* "/" means "no chroot": storing it would double every prefix. */
+    if (n == 1 && knew[0] == '/') cp->fs_root[0] = '\0';
+    else { memcpy(cp->fs_root, knew, n); cp->fs_root[n] = '\0'; }
+    kprintf("[chroot] pid=%d root='%s'\n", cp->pid,
+            cp->fs_root[0] ? cp->fs_root : "/");
+    return 0;
+}
+
+/* mknodat(DIRFD, UPATH, MODE, DEV), DEV as Linux encodes one: a type that is
+ * not a file's, a FIFO's, a socket's or a device's is EINVAL (a
+ * directory's EPERM) before the path is looked at; then the path's errors,
+ * EEXIST, the directory's write permission (EACCES); then a device for a
+ * caller without CAP_MKNOD -- which only the initial user namespace gives,
+ * as Linux's capable() asks -- is EPERM. A device node keeps its numbers
+ * (vfs_mknod_dev); a filesystem that keeps none says EPERM. */
+static long sys_mknod_user(int dirfd, const char *upath, uint32_t mode, uint64_t dev) {
+    uint32_t fmt = mode & 0170000u;
+    switch (fmt) {
+    case 0: case 0100000u: case 0020000u: case 0060000u:
+    case 0010000u: case 0140000u: break;
+    case 0040000u: return -ABI_EPERM;
+    default:       return -ABI_EINVAL;
+    }
+    char kpath[ABI_PATH_MAX], par[ABI_PATH_MAX];
+    int rr = resolve_user_path_at(dirfd, upath, kpath, sizeof kpath);
+    if (rr != 0) return rr;                   /* EACCES too (finding 188) */
+    kpath_parent(kpath, par, sizeof par);
+    struct vfs_stat ps, ms;
+    int sr = vfs_stat_follow(par, &ps);
+    if (sr != VFS_OK) return sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    if (ps.type != VFS_TYPE_DIR) return -ABI_ENOTDIR;
+    if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
+    int pc = vfs_perm_check(par, VFS_WANT_WRITE | VFS_WANT_EXEC);
+    if (pc != VFS_OK) return vfs_err_to_abi(pc);
+    bool device = fmt == 0020000u || fmt == 0060000u;
+    struct proc *p = current_proc();
+    if (device && !(userns_is_initial(p) && userns_capable(LCAP_MKNOD)))
+        return -ABI_EPERM;
+    uint32_t perm = sys_creation_mode((int)(mode & 07777u));
+    int cr;
+    if (fmt == 0010000u)      cr = vfs_mkfifo(kpath, perm);
+    else if (fmt == 0140000u) cr = vfs_mksock(kpath, perm);
+    else if (device) {
+        /* Linux's dev_t: 12 bits of major over 20 of minor, split */
+        uint32_t maj = (uint32_t)(((dev >> 8) & 0xfffu) | ((dev >> 32) & ~0xfffu));
+        uint32_t min = (uint32_t)((dev & 0xffu) | ((dev >> 12) & ~0xffu));
+        cr = vfs_mknod_dev(kpath, fmt | perm, maj, min);
+    } else                    cr = vfs_create_mode(kpath, perm);
+    return cr == VFS_OK ? 0 : vfs_err_to_abi(cr);
+}
+
 static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     (void)a4; (void)a5;
     switch (num) {
@@ -6841,6 +6953,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         struct proc *p = current_proc();
         return p ? (long)userns_cur_gid(p->rgid) : 0;
     }
+    case ABI_SYS_CHROOT:                /* finding 214 */
+        return sys_chroot_user((const char *)a1);
+    case ABI_SYS_MKNOD:                 /* finding 214 */
+        return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
 
     case ABI_SYS_TIMES: {
         struct proc *p = current_proc();
@@ -8616,6 +8732,8 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_mtime   = (int64_t)vs->mtime;
     st.st_atime   = (int64_t)vs->atime;
     st.st_ctime   = (int64_t)vs->ctime;
+    if (typ == 0x2000u || typ == 0x6000u)              /* a node (214) */
+        st.st_rdev = lx_makedev(vs->rmaj, vs->rmin);
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
     return 0;
 }
@@ -8659,6 +8777,10 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.atime.sec = (int64_t)vs->atime;
     sx.ctime.sec = (int64_t)vs->ctime;
     sx.btime.sec = (int64_t)vs->ctime;       /* no separate birth time */
+    if (typ == 0x2000u || typ == 0x6000u) {            /* a node (214) */
+        sx.rdev_major = vs->rmaj;
+        sx.rdev_minor = vs->rmin;
+    }
     sx.dev_minor = 1;
     {
         uint32_t maj, min;
@@ -13762,27 +13884,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
      * unprivileged caller gets for device nodes on Linux, and the one
      * tar/rsync already know to downgrade to a warning. The file's mode is
      * the one asked for less the umask, as open's is. */
-    case LX_mknod: case LX_mknodat: {
-        bool at = (n == LX_mknodat);
-        const char *upath = (const char *)(at ? a2 : a1);
-        uint32_t mode = (uint32_t)(at ? a3 : a2);
-        char kpath[ABI_PATH_MAX];
-        long rr = at ? resolve_user_path_at((int)a1, upath, kpath, sizeof kpath)
-                     : resolve_user_path(upath, kpath, sizeof kpath);
-        if (rr != 0) return rr;                /* EACCES too (finding 188) */
-        uint32_t fmt = mode & 0170000u;
-        /* S_IFIFO is a FIFO (vfs_mkfifo): mkfifo(3) is mknod with it */
-        if (fmt == 0010000u) {
-            int fr = vfs_mkfifo(kpath, sys_creation_mode((int)(mode & 07777u)));
-            return fr == VFS_OK ? 0 : vfs_err_to_abi(fr);
-        }
-        if (fmt != 0 && fmt != 0100000u) return -ABI_EPERM;
-        struct vfs_stat ms;
-        if (vfs_stat(kpath, &ms) == VFS_OK) return -ABI_EEXIST;
-        int cr = vfs_create_mode(kpath, sys_creation_mode((int)(mode & 07777u)));
-        if (cr != VFS_OK) return vfs_err_to_abi(cr);
-        return 0;
-    }
+    case LX_mknod:                      /* Linux's order of answers (214) */
+        return sys_mknod_user(-100, (const char *)a1, (uint32_t)a2, (uint64_t)a3);
+    case LX_mknodat:
+        return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
 
     /* The utime family: utime(132), utimes(235), futimesat(261),
      * utimensat(280). busybox `touch` walks utimensat -> futimesat -> utimes
@@ -14223,28 +14328,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* chroot(2). Sets the per-process filesystem root applied in
      * resolve_user_path(); see the fs_root note in proc.h for why this is NOT
      * folded into the cap sandbox_root. */
-    case LX_chroot: {
-        struct proc *cp = current_proc();
-        /* Slice 11: CAP_SYS_CHROOT. No ownership requirement, because chroot
-         * changes only the CALLER's own path resolution -- it grants no
-         * authority over anything outside the caller. */
-        if (!cp || !userns_capable(LCAP_SYS_CHROOT)) return -ABI_EPERM;
-        char knew[ABI_PATH_MAX];
-        {   int rr_ = resolve_user_path((const char *)a1, knew, sizeof knew);
-            if (rr_ != 0) return rr_;          /* EACCES too (finding 188) */
-        }
-        struct vfs_stat st;
-        if (vfs_stat(knew, &st) != VFS_OK) return -ABI_ENOENT;
-        if (st.type != VFS_TYPE_DIR)         return -ABI_ENOTDIR;
-        size_t n = strlen(knew);
-        if (n >= sizeof(cp->fs_root))        return -ABI_ENAMETOOLONG;
-        /* "/" means "no chroot": storing it would double every prefix. */
-        if (n == 1 && knew[0] == '/') cp->fs_root[0] = '\0';
-        else { memcpy(cp->fs_root, knew, n); cp->fs_root[n] = '\0'; }
-        kprintf("[chroot] pid=%d root='%s'\n", cp->pid,
-                cp->fs_root[0] ? cp->fs_root : "/");
-        return 0;
-    }
+    case LX_chroot:                     /* Linux's order of answers (214) */
+        return sys_chroot_user((const char *)a1);
 
     /* pivot_root(new_root, put_old) -- IMPLEMENTED IN SLICE 9.
      *

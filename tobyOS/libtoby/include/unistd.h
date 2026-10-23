@@ -55,6 +55,7 @@ int     chown  (const char *path, uid_t owner, gid_t group);
 int     lchown (const char *path, uid_t owner, gid_t group);
 int     getgroups(int size, gid_t list[]);
 int     setgroups(size_t size, const gid_t *list);
+int     chroot(const char *path);                   /* finding 214 */
 int     initgroups(const char *user, gid_t group);
 int     rename (const char *oldpath, const char *newpath);
 int     link   (const char *oldpath, const char *newpath);

@@ -170,6 +170,9 @@ struct vfs_stat {
      * ino is 0 rather than treating unknown as equal. */
     uint64_t      ino;
     uint32_t      dev;         /* which mount; 0 = unknown */
+    /* A device node's numbers, when the mode says S_IFCHR or S_IFBLK
+     * (finding 214): devfs's own nodes, or one mknod made elsewhere. */
+    uint32_t      rmaj, rmin;
 };
 
 struct vfs_dirent {
@@ -269,6 +272,11 @@ struct vfs_ops {
      * is still itself. NULL => the caller falls back to the path the file
      * was opened by. See vfs_fstat. */
     int  (*fstat)   (struct vfs_file *f, struct vfs_stat *out);
+    /* (optional) A device node's numbers, set on a node just created with
+     * S_IFCHR or S_IFBLK in its mode (vfs_mknod_dev, finding 214). NULL:
+     * the filesystem keeps no device nodes, and mknod of one is EPERM, as
+     * Linux's vfat says. */
+    int  (*setrdev) (void *mnt, const char *path, uint32_t maj, uint32_t min);
     /* The filesystem's TYPE as Linux names it ("tmpfs", "proc", "ext4"):
      * /proc/mounts' third field, mountinfo's, mount(8)'s "type". Every
      * mount said "tobyos" (batch 31). NULL: "tobyos". */
@@ -411,6 +419,9 @@ uint32_t vfs_path_mount_flags(const char *path);
 bool vfs_same_mount(const char *a, const char *b);
 /* Batch 32 (finding 193): an AF_UNIX socket's node, S_IFSOCK | MODE. */
 int vfs_mksock(const char *path, uint32_t mode);
+/* Finding 214: a device node, MODE's format S_IFCHR or S_IFBLK, numbers
+ * MAJ:MIN. VFS_ERR_NOTPERM on a filesystem that keeps no device nodes. */
+int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 

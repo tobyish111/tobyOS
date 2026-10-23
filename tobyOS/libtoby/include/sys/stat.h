@@ -90,6 +90,9 @@ int stat (const char *path, struct stat *out);
 int fstat(int fd,           struct stat *out);
 int lstat(const char *path, struct stat *out);   /* the link itself */
 int mkfifo(const char *path, mode_t mode);        /* a named pipe */
+/* finding 214: a file, a FIFO, a socket or (root only) a device node */
+int mknod(const char *path, mode_t mode, dev_t dev);
+int mknodat(int dirfd, const char *path, mode_t mode, dev_t dev);
 int mkdir(const char *path, mode_t mode);
 mode_t umask(mode_t mask);
 

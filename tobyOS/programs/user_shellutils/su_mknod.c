@@ -24,23 +24,11 @@
  *     A failure is "mknod: NAME: ERR".
  *   - -Z and --context as mkdir's: nothing, or a warning for a CTX.
  *
- * tobyOS: libtoby has no mknod and the native ABI no device-node call,
- * so a b or c is what Linux says to anyone without CAP_MKNOD -- "Operation
- * not permitted" -- unless a later ABI defines ABI_SYS_MKNOD; a p is
- * mkfifo(). There was no mknod before. */
+ * tobyOS: libtoby's mknod is the kernel's (ABI_SYS_MKNOD, finding 214),
+ * in Linux's order of answers; root's b or c is a node that opens the
+ * device its numbers name. A p is mkfifo(). There was no mknod before. */
 
 #include "su_fileops.c"
-
-#ifndef SU_HOST
-#ifdef ABI_SYS_MKNOD
-static long mkn_sc3(long n, long a, long b, long c) {
-    long r;
-    __asm__ volatile("syscall" : "=a"(r) : "0"(n), "D"(a), "S"(b), "d"(c)
-                     : "rcx", "r11", "memory");
-    return r;
-}
-#endif
-#endif
 
 /* MAJOR or MINOR as GNU reads one: 0, or -1 when it is not a number */
 static int mkn_number(const char *s, unsigned long long *out) {
@@ -78,34 +66,7 @@ static int mkn_device(const char *name, mode_t mode, unsigned long long maj,
     unsigned long long dev = ((maj & 0xfffff000ULL) << 32) | ((maj & 0xfffULL) << 8) |
                              ((min & 0xffffff00ULL) << 12) | (min & 0xffULL);
     if (dev > 0xffffffffULL) { errno = EINVAL; return -1; }
-#ifdef SU_HOST
     return mknod(name, mode, (dev_t)dev);
-#elif defined(ABI_SYS_MKNOD)
-    long r = mkn_sc3(ABI_SYS_MKNOD, (long)name, (long)mode, (long)dev);
-    if (r < 0) { errno = (int)-r; return -1; }
-    return 0;
-#else
-    /* no device nodes natively: what Linux says to an unprivileged caller,
-     * after the checks of the name a creation makes */
-    struct stat st;
-    if (lstat(name, &st) == 0) { errno = EEXIST; return -1; }
-    if (errno != ENOENT) return -1;
-    /* the directory it would go in: there, and writable, else its error */
-    size_t n = strlen(name);
-    while (n > 1 && name[n - 1] == '/') n--;
-    while (n > 0 && name[n - 1] != '/') n--;
-    char *dir = (char *)malloc(n + 2);
-    if (!dir) su_error(1, ENOMEM, "memory exhausted");
-    if (n == 0) strcpy(dir, ".");
-    else { memcpy(dir, name, n); dir[n] = 0; }
-    int rc = stat(dir, &st) != 0 ? -1 : !S_ISDIR(st.st_mode) ? (errno = ENOTDIR, -1)
-           : access(dir, W_OK | X_OK) != 0 ? -1 : (errno = EPERM, -1);
-    int e = errno;
-    free(dir);
-    errno = e;
-    (void)mode;
-    return rc;
-#endif
 }
 
 static int do_mknod(int argc, char **argv) {
