@@ -6793,6 +6793,60 @@ static long sys_mknod_user(int dirfd, const char *upath, uint32_t mode, uint64_t
     return cr == VFS_OK ? 0 : vfs_err_to_abi(cr);
 }
 
+/* ---- a descriptor's status flags (finding 235) ---------------------------
+ *
+ * As Linux's file keeps them: what open was given, less the flags that act
+ * only at open time (O_CREAT, O_EXCL, O_NOCTTY, O_TRUNC) and O_CLOEXEC (the
+ * descriptor's, not the file's), and O_LARGEFILE, which every open on a
+ * 64-bit kernel sets -- O_NOFOLLOW, O_DIRECTORY and the sync flags read
+ * back. F_SETFL changes O_APPEND, O_NONBLOCK, O_ASYNC, O_DIRECT and
+ * O_NOATIME, and nothing else. F_GETFL said the access mode alone, O_APPEND
+ * and O_NONBLOCK for some kinds, a pipe's write end O_RDONLY, and F_SETFL
+ * of O_APPEND was dropped (the next write went to the old position). */
+#define FL_OPEN_ONLY   (0100u | 0200u | 0400u | 01000u | 02000000u)
+#define FL_LARGEFILE   0100000u
+#define FL_APPEND      02000u
+#define FL_NONBLOCK    04000u
+#define FL_SETTABLE    (FL_APPEND | FL_NONBLOCK | 020000u | 040000u | 01000000u)
+
+/* FD was just made by open(2) with FLAGS: its status, and FD_CLOEXEC */
+static void fd_note_open(long fd, long flags) {
+    struct file *f = fd >= 0 ? fd_lookup((int)fd) : 0;
+    if (!f) return;
+    f->fl_status = ((uint32_t)flags & ~(FL_OPEN_ONLY | 3u)) | FL_LARGEFILE;
+    if (flags & 02000000L) fd_cloexec_set(current_proc(), (int)fd, 1);
+}
+
+/* F_GETFL of FF */
+static long fcntl_getfl(struct file *ff) {
+    uint32_t acc = (uint32_t)ff->o_accmode & 3u;
+    bool pipe = ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+                ff->kind == FILE_KIND_PIPE_RW;
+    if (ff->kind == FILE_KIND_PIPE_R) acc = 0;
+    else if (ff->kind == FILE_KIND_PIPE_W) acc = 1;
+    else if (ff->kind == FILE_KIND_PIPE_RW) acc = 2;
+    bool app = ff->kind == FILE_KIND_VFS ? ff->vfs.append
+                                         : (ff->fl_status & FL_APPEND) != 0;
+    bool nb = (ff->kind == FILE_KIND_SOCKET && ff->sock) ? ff->sock->nonblock
+            : pipe ? ff->pipe_nonblock : (ff->fl_status & FL_NONBLOCK) != 0;
+    return (long)(acc | (ff->fl_status & ~(FL_APPEND | FL_NONBLOCK)) |
+                  (app ? FL_APPEND : 0u) | (nb ? FL_NONBLOCK : 0u));
+}
+
+/* F_SETFL of FF to V: the settable bits, and the kinds that act on them */
+static void fcntl_setfl(struct file *ff, uint32_t v) {
+    v &= FL_SETTABLE;
+    ff->fl_status = (ff->fl_status & ~FL_SETTABLE) | v;
+    if (ff->kind == FILE_KIND_VFS) ff->vfs.append = (v & FL_APPEND) != 0;
+    if (ff->kind == FILE_KIND_SOCKET && ff->sock)
+        ff->sock->nonblock = (v & FL_NONBLOCK) != 0;
+    /* a pipe's O_NONBLOCK: reads and writes that would wait are EAGAIN
+     * (file.c) */
+    if (ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
+        ff->kind == FILE_KIND_PIPE_RW)
+        ff->pipe_nonblock = (v & FL_NONBLOCK) != 0;
+}
+
 static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     (void)a4; (void)a5;
     switch (num) {
@@ -6957,6 +7011,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_chroot_user((const char *)a1);
     case ABI_SYS_MKNOD:                 /* finding 214 */
         return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
+    case ABI_SYS_FCNTL:                 /* finding 235: LX_fcntl, 72 */
+        return linux_syscall_impl(72, a1, a2, a3, 0, 0);
 
     case ABI_SYS_TIMES: {
         struct proc *p = current_proc();
@@ -7402,8 +7458,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     }
     case SYS_WAITPID:
         return sys_waitpid((int)a1, (int *)a2, (int)a3);
-    case SYS_OPEN:
-        return sys_open((const char *)a1, (int)a2, (int)a3);
+    case SYS_OPEN: {
+        long ofd = sys_open((const char *)a1, (int)a2, (int)a3);
+        fd_note_open(ofd, a2);               /* F_GETFL, O_CLOEXEC (235) */
+        return ofd;
+    }
     case SYS_LSEEK:
         return sys_lseek((int)a1, (int64_t)a2, (int)a3);
     case SYS_STAT:
@@ -13158,14 +13217,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (open_dir_path(kpath, (a2 & LX_O_NOFOLLOW) != 0)) {
                 if (lx_dir_open_refused((long)a2)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
-                if (dfd >= 0 && (a2 & LX_O_CLOEXEC))
-                    fd_cloexec_set(current_proc(), (int)dfd, 1);
+                fd_note_open(dfd, a2);       /* status, O_CLOEXEC (235) */
                 return dfd;
             }
         }
-        long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);
-        if (ofd >= 0 && (a2 & LX_O_CLOEXEC))
-            fd_cloexec_set(current_proc(), (int)ofd, 1);
+        long ofd = do_syscall(SYS_OPEN, a1, a2, a3, 0, 0);   /* notes it */
 #ifdef CHROMIUM_BOOT
         /* [lopen] path->fd, so [libmap]'s per-mapping fd can be resolved to a
          * FILE PATH offline (match a [libmap] fd=N line to the most recent
@@ -13198,8 +13254,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (open_dir_path(kpath, (a3 & LX_O_NOFOLLOW) != 0)) {
                 if (lx_dir_open_refused((long)a3)) return -ABI_EISDIR;
                 long dfd = linux_open_dir(kpath);
-                if (dfd >= 0 && (a3 & LX_O_CLOEXEC))
-                    fd_cloexec_set(current_proc(), (int)dfd, 1);
+                fd_note_open(dfd, a3);       /* status, O_CLOEXEC (235) */
                 return dfd;
             }
 #ifdef CHROMIUM_BOOT
@@ -13225,8 +13280,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         long ofd = got_kp ? sys_open_resolved(kpath, (int)a3, (int)a4)
                           : do_syscall(SYS_OPEN, a2, a3, a4, 0, 0);
-        if (ofd >= 0 && (a3 & LX_O_CLOEXEC))
-            fd_cloexec_set(current_proc(), (int)ofd, 1);
+        fd_note_open(ofd, a3);               /* status, O_CLOEXEC (235) */
 #ifdef CHROMIUM_BOOT
         if (ofd >= 0 && got_kp) {
             static int lo = 0;
@@ -16931,39 +16985,20 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
     /* Known-optional: libc/busybox probe these and fall back cleanly on
      * -ENOSYS. Handled explicitly (quietly) so they don't spam the log. */
     case LX_fcntl: {            /* (fd, cmd, arg) */
+        /* F_GETFL and F_SETFL: the status flags as Linux's file keeps them
+         * (fcntl_getfl, finding 235). The access mode was the first answer
+         * here: Chromium's PlatformSharedMemoryRegion::Create CHECKs that a
+         * writable region's dup reports O_RDWR, and the old blanket 0 made
+         * every fd look O_RDONLY (base::ImmediateCrash). */
         if ((int)a2 == 3 /* F_GETFL */) {
-            /* Return the fd's access mode. Chromium's shared-memory
-             * PlatformSharedMemoryRegion::Create dups the region fd and CHECKs
-             * fcntl(F_GETFL) reports the expected mode (O_RDWR for a writable
-             * region); the old blanket-0 made every fd look O_RDONLY, so the
-             * writable-region check failed -> base::ImmediateCrash. Status flags
-             * (O_APPEND/O_NONBLOCK) aren't tracked; the access mode is what the
-             * check reads. */
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
-            /* O_NONBLOCK IS tracked for sockets now, and it must read back:
-             * the standard way to go non-blocking is F_GETFL, OR the bit in,
-             * F_SETFL -- if F_GETFL never reports it, code that checks its own
-             * work (or re-derives flags later) sees a blocking socket. */
-            if (ff->kind == FILE_KIND_SOCKET && ff->sock && ff->sock->nonblock)
-                return ff->o_accmode | SOCK_NONBLOCK;
-            if (ff->kind == FILE_KIND_VFS && ff->vfs.append)
-                return ff->o_accmode | ABI_O_APPEND;   /* tracked since 2026-10-01 */
-            if ((ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
-                 ff->kind == FILE_KIND_PIPE_RW) && ff->pipe_nonblock)
-                return ff->o_accmode | ABI_O_NONBLOCK;
-            return ff->o_accmode;
+            return fcntl_getfl(ff);
         }
         if ((int)a2 == 4 /* F_SETFL */) {
             struct file *ff = fd_lookup((int)a1);
             if (!ff) return -ABI_EBADF;
-            if (ff->kind == FILE_KIND_SOCKET && ff->sock)
-                ff->sock->nonblock = ((unsigned long)a3 & SOCK_NONBLOCK) != 0;
-            /* a pipe's O_NONBLOCK: reads and writes that would wait are
-             * EAGAIN (file.c) -- it was accepted and dropped */
-            if (ff->kind == FILE_KIND_PIPE_R || ff->kind == FILE_KIND_PIPE_W ||
-                ff->kind == FILE_KIND_PIPE_RW)
-                ff->pipe_nonblock = ((unsigned long)a3 & ABI_O_NONBLOCK) != 0;
+            fcntl_setfl(ff, (uint32_t)a3);
             return 0;
         }
         if ((int)a2 == 1033 /* F_ADD_SEALS */) {
@@ -17079,7 +17114,24 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * of. It also made the conformance oracle wrong on three cases where
          * tsh had the right answer all along. */
         if (!fd_lookup((int)a1)) return -ABI_EBADF;
-        return 0;               /* record locks &c: best-effort no-op */
+        /* A COMMAND LINUX HAS, still answered 0 (owners, signals, leases,
+         * notifications, write hints) -- and F_GETPIPE_SZ/F_SETPIPE_SZ, a
+         * pipe's capacity, which is fixed here. Any other is EINVAL, as
+         * Linux's (finding 235): it was 0, "done". */
+        switch ((int)a2) {
+        case 1031: case 1032: {          /* F_SETPIPE_SZ, F_GETPIPE_SZ */
+            struct file *pf = fd_lookup((int)a1);
+            if (pf->kind != FILE_KIND_PIPE_R && pf->kind != FILE_KIND_PIPE_W &&
+                pf->kind != FILE_KIND_PIPE_RW) return -ABI_EBADF;
+            return (long)PIPE_BUF_SZ;          /* 65536, as Linux's default */
+        }
+        case 8: case 9: case 10: case 11: case 15: case 16:
+        case 1024: case 1025: case 1026: case 1029:
+        case 1035: case 1036: case 1037: case 1038:
+            return 0;
+        default:
+            return -ABI_EINVAL;
+        }
     }
     /* ---- the kernel copy family (2026-08-22): sendfile was an honest
      * ENOSYS and copy_file_range/splice were census gaps -- but coreutils

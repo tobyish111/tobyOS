@@ -250,14 +250,12 @@ static int sh_file(const char *name) {
     int is_stdout = !strcmp(name, "-");
     if (is_stdout) {
         fd = 1;
-#ifdef SU_HOST
-        /* (the native ABI has no F_GETFL to ask with) */
+        /* (natively too since finding 235: libtoby's fcntl was a stub) */
         int fl = fcntl(1, F_GETFL);
         if (fl >= 0 && (fl & O_APPEND)) {
             su_error(0, 0, "%s: cannot shred append-only file descriptor", su_quotef(name));
             return 1;
         }
-#endif
     } else {
         fd = open(name, O_WRONLY | O_NOCTTY);
         if (fd < 0 && errno == EACCES && sh.force && chmod(name, S_IWUSR) == 0)

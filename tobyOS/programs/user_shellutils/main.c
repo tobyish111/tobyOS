@@ -43,13 +43,6 @@
 #include <regex.h>
 #include <limits.h>
 
-/* The native open has no non-blocking flag: where GNU opens O_NONBLOCK
- * (sync, truncate) so a FIFO with no reader cannot hang it, this open
- * blocks as a plain one. */
-#ifndef O_NONBLOCK
-#define O_NONBLOCK 0
-#endif
-
 #ifndef SU_HOST
 #include <tobyos/abi/abi.h>
 #endif

@@ -373,6 +373,11 @@ struct file *file_clone(struct file *src) {
     if (!f) return 0;
     memset(f, 0, sizeof(*f));
     f->kind = src->kind;
+    /* a duplicate of ANY kind keeps the access mode and the status flags
+     * (finding 235): only a file's mode was copied, so a dup of /dev/null
+     * or of a disk said O_RDONLY to F_GETFL */
+    f->o_accmode = src->o_accmode;
+    f->fl_status = src->fl_status;
     switch (src->kind) {
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:

@@ -237,6 +237,12 @@ struct file {
      * O_RDWR via F_GETFL -- a blanket-0 fcntl made it look read-only and
      * ImmediateCrash'd. Copied across dup() in file_clone. */
     int o_accmode;
+    /* The status flags, Linux's bits, as Linux's file keeps them (finding
+     * 235): what open was given less what acts only at open time, and
+     * O_LARGEFILE; F_SETFL changes the settable ones. O_APPEND and
+     * O_NONBLOCK of the kinds that act on them live in vfs.append,
+     * pipe_nonblock and the socket; fcntl_getfl reads those. */
+    uint32_t fl_status;
     /* For FILE_KIND_INOTIFY: the instance index in inotify.c's table. */
     int inotify_id;
     /* The canonical path this handle was opened by (2026-08-22), kmalloc'd

@@ -1386,7 +1386,11 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         mknodat(2), Linux's dev_t; a device
                                         node keeps its numbers and opens the
                                         device they name (finding 214) */
-#define ABI_SYS_NR_MAX          236
+#define ABI_SYS_FCNTL           237  /* (fd, cmd, arg) -> the answer|-E:
+                                        fcntl(2), the Linux personality's --
+                                        Linux's commands and flags; libtoby's
+                                        fcntl was a stub (finding 235) */
+#define ABI_SYS_NR_MAX          237
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

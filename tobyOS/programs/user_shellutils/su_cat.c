@@ -24,10 +24,10 @@
  *   - stdin, once read, is closed at the end: a failure is "cat: closing
  *     standard input: ERR".
  *
- * tobyOS: libtoby has no fcntl, so whether standard output appends comes
- * from /proc/self/fdinfo/1's "flags:" (the kernel keeps O_APPEND there);
- * a directory is opened as Linux opens one (su_open_read). The old cat
- * (programs/user_cat) had -n alone. */
+ * tobyOS: whether standard output appends is fcntl(F_GETFL)'s, as GNU
+ * asks (libtoby's fcntl was a stub until finding 235, and the answer came
+ * from /proc/self/fdinfo/1); a directory is opened as Linux opens one
+ * (su_open_read). The old cat (programs/user_cat) had -n alone. */
 
 #include "su_fileops.c"
 
@@ -118,18 +118,10 @@ static void ct_byte(unsigned char c) {
     }
 }
 
-/* whether standard output appends, as fcntl(F_GETFL) would say */
+/* whether standard output appends */
 static int ct_out_appends(void) {
-#ifdef SU_HOST
     int fl = fcntl(1, F_GETFL);
     return fl >= 0 && (fl & O_APPEND);
-#else
-    char buf[512];
-    if (slurp("/proc/self/fdinfo/1", buf, sizeof buf) < 0) return 0;
-    const char *f = strstr(buf, "flags:");
-    if (!f) return 0;
-    return (strtoul(f + 6, 0, 8) & 02000) != 0;
-#endif
 }
 
 /* 0, or 1 after saying why FILE was not copied */

@@ -10,6 +10,7 @@
  */
 
 #include "libtoby_internal.h"
+#include <stdarg.h>
 #include <string.h>
 
 /* ---- File descriptor operations ---- */
@@ -170,10 +171,17 @@ int isatty(int fd) {
     return (fd >= 0 && fd <= 2) ? 1 : 0;
 }
 
-__attribute__((weak))
+/* fcntl(2), the kernel's (finding 235): it was a weak stub that said 0 to
+ * every command -- F_GETFL nothing, F_SETFD a no-op, F_DUPFD "fd 0". The
+ * third argument is read whether or not the command takes one, as every
+ * libc on x86-64 reads it: an int, a flag word, or a struct flock's
+ * address all fit the register. */
 int fcntl(int fd, int cmd, ...) {
-    (void)fd; (void)cmd;
-    return 0;
+    va_list ap;
+    va_start(ap, cmd);
+    long arg = va_arg(ap, long);
+    va_end(ap);
+    return (int)__toby_check(toby_sc3(ABI_SYS_FCNTL, fd, cmd, arg));
 }
 
 __attribute__((weak))
