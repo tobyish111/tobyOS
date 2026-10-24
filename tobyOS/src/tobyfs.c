@@ -1481,7 +1481,8 @@ static int tobyfs_create(void *mnt, const char *path,
  * Modelled on tobyfs_create, with the target string written into the inode's
  * first data block and node.size set to its length -- so readlink is just a
  * short read and no new on-disk structure exists to version. */
-static int tobyfs_symlink(void *mnt, const char *path, const char *target) {
+static int tobyfs_symlink(void *mnt, const char *path, const char *target,
+                          uint32_t uid, uint32_t gid) {
     struct tobyfs *fs = (struct tobyfs *)mnt;
     char parent[VFS_PATH_MAX], leaf[TFS_NAME_MAX + 1];
     size_t tlen = strlen(target);
@@ -1509,6 +1510,8 @@ static int tobyfs_symlink(void *mnt, const char *path, const char *target) {
     node.size  = (uint32_t)tlen;
     node.mtime = tfs_now_secs();
     node.mode  = 00777u | TFS_MODE_VALID;     /* links are always lrwxrwxrwx */
+    node.uid   = uid;                         /* the VFS's (finding 251): */
+    node.gid   = gid;                         /* every link was root's */
 
     uint32_t blk;
     rc = alloc_data_block(fs, &blk);

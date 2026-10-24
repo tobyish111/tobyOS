@@ -243,7 +243,10 @@ struct vfs_ops {
      * when NULL, vfs_symlink() falls back to the legacy in-RAM table (which is
      * global, capped, and lost on reboot -- fine for the read-only initrd,
      * useless for a real rootfs). */
-    int  (*symlink) (void *mnt, const char *path, const char *target);
+    /* UID and GID are the link's owner, the VFS's to decide as for create
+     * (a set-group-ID directory's group, finding 251) */
+    int  (*symlink) (void *mnt, const char *path, const char *target,
+                     uint32_t uid, uint32_t gid);
     /* M26E (optional). Called by vfs_unmount AFTER the slot is removed
      * from the mount table. Drivers free their per-mount state here
      * (cluster buffers, FS scratch, etc). NULL => the VFS just drops

@@ -2091,7 +2091,14 @@ int vfs_symlink(const char *path, const char *target) {
         struct vfs_mount *m = resolve(path, &rel);
         if (m && m->ops && m->ops->symlink) {
             if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
-            return m->ops->symlink(m->data, rel, target);
+            /* the creator's, or a set-group-ID directory's group, as any
+             * new node (finding 251: tobyfs made every link root's) */
+            char par[VFS_PATH_MAX];
+            bool sgid;
+            bool have_par = parent_path(path, par, sizeof(par)) == VFS_OK;
+            uint32_t gid = new_entry_gid(have_par ? par : 0, &sgid);
+            return m->ops->symlink(m->data, rel, target,
+                                   (uint32_t)current_uid(), gid);
         }
     }
 

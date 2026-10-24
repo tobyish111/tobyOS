@@ -45,7 +45,6 @@
 #include <tobyos/heap.h>
 #include <tobyos/printk.h>
 #include <tobyos/klibc.h>
-#include <tobyos/proc.h>       /* a link's owner: the caller (tmpfs_symlink) */
 #include <tobyos/pmm.h>        /* the default size: half of RAM (finding 231) */
 #include <tobyos/xattr.h>      /* a node's attributes (finding 225) */
 #include <tobyos/abi/abi.h>
@@ -616,7 +615,8 @@ static int tmpfs_unlink(void *mnt, const char *path)
  * had no symlink op, so a link made in /tmp went to the VFS's RAM table:
  * readlink found it, but `ls` never listed it, stat said it did not exist,
  * and `rm -rf` of its directory left it behind (logs/b15 lk). */
-static int tmpfs_symlink(void *mnt, const char *path, const char *target)
+static int tmpfs_symlink(void *mnt, const char *path, const char *target,
+                         uint32_t uid, uint32_t gid)
 {
     struct tmpfs_mount *m = mnt;
     char norm[VFS_PATH_MAX];
@@ -634,9 +634,8 @@ static int tmpfs_symlink(void *mnt, const char *path, const char *target)
     nd->type = VFS_TYPE_SYMLINK;
     nd->nlink = 1;
     tcopy(nd->path, norm, sizeof nd->path);
-    struct proc *cp = current_proc();
-    nd->uid = cp ? (uint32_t)cp->uid : 0;
-    nd->gid = cp ? (uint32_t)cp->gid : 0;
+    nd->uid = uid;                  /* the VFS's, as create's (finding 251) */
+    nd->gid = gid;
     nd->mode = 0777u;
     int rc = tgrow(m, nd, tl ? tl : 1);
     if (rc != VFS_OK) {
