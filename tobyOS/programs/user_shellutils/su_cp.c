@@ -18,8 +18,11 @@
  *   - A new file's mode is the source's less the umask, its set-id and
  *     sticky bits dropped (a directory keeps sticky); -p/--preserve keep
  *     mode, ownership (silently not, for someone who may not give it) and
- *     times, "links" keeps hard links within one cp, "xattr" is nothing
- *     here (there are none) and "context" is refused at once ("cannot
+ *     times, "links" keeps hard links within one cp, "xattr" copies the
+ *     extended attributes (finding 215: they were never copied; -a and
+ *     "all" copy them too, saying nothing of one that cannot be set,
+ *     where xattr named outright says "setting attributes for 'D'") and
+ *     "context" is refused at once ("cannot
  *     preserve security context without an SELinux-enabled kernel")
  *     unless it came only from -a or "all". An existing file keeps its
  *     mode without -p; --no-preserve=mode gives a new one 0666 (0777 for
@@ -69,6 +72,7 @@
  * own), wrote "cp: cannot open", and stopped at 1024-byte paths. */
 
 #include <sys/time.h>
+#include <sys/xattr.h>          /* --preserve=xattr (finding 215) */
 #ifdef SU_HOST
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -88,6 +92,7 @@ struct cpx_opts {
     int backup;
     const char *suffix;
     int p_mode, p_owner, p_time, p_links;
+    int p_xattr, p_xattr_req;   /* copy them; one that fails is an error */
     int default_mode;       /* --no-preserve=mode: 0666/0777 less the umask */
     int parents, one_fs, attr_only, copy_contents, sparse, reflink;
     int debug, verbose, stdin_tty;
@@ -344,6 +349,49 @@ static void cpx_say(const struct cpx_opts *o, const char *src, const char *dst,
 
 /* ---- attributes ----------------------------------------------------------------- */
 
+/* SRC's extended attributes onto DST (finding 215: none were copied), the
+ * security context left to --preserve=context. One that cannot be set
+ * stops the copying of DST's: an error ("setting attributes for 'DST'",
+ * status 1) when xattr was named in --preserve, nothing under -a. Done
+ * before the mode, which may leave DST unwritable even to its owner. */
+static int cpx_xattrs(const struct cpx_opts *o, const char *src, const char *dst) {
+    if (!o->p_xattr) return 0;
+    ssize_t n = listxattr(src, 0, 0);
+    if (n <= 0) return 0;
+    char *names = cpx_alloc((size_t)n);
+    n = listxattr(src, names, (size_t)n);
+    int rc = 0;
+    /* a copy already made read-only (a 0444 source) is its owner's to give
+     * attributes all the same, as GNU's is: writable for the moment, then
+     * its mode back */
+    struct stat dsb;
+    int unlocked = 0;
+    if (stat(dst, &dsb) == 0 && dsb.st_uid == geteuid() && !(dsb.st_mode & S_IWUSR) &&
+        chmod(dst, (dsb.st_mode | S_IWUSR) & 07777) == 0)
+        unlocked = 1;
+    for (ssize_t i = 0; n > 0 && i < n; i += (ssize_t)strlen(names + i) + 1) {
+        const char *nm = names + i;
+        if (!strcmp(nm, "security.selinux")) continue;
+        ssize_t vl = getxattr(src, nm, 0, 0);
+        if (vl < 0) continue;
+        char *v = cpx_alloc((size_t)vl);
+        vl = getxattr(src, nm, v, (size_t)vl);
+        int bad = vl < 0 || setxattr(dst, nm, v, (size_t)vl, 0) != 0;
+        int e = errno;
+        free(v);
+        if (bad) {
+            if (o->p_xattr_req) {
+                su_error(0, e, "setting attributes for %s", su_quoteaf(dst));
+                rc = 1;
+            }
+            break;
+        }
+    }
+    if (unlocked) (void)chmod(dst, dsb.st_mode & 07777);
+    free(names);
+    return rc;
+}
+
 /* What -p keeps, for DST made from S. LINK: DST is a symbolic link. NEW:
  * DST was made here (so it gets a mode even without -p). */
 static int cpx_attrs(const struct cpx_opts *o, const char *dst, const struct stat *s,
@@ -555,7 +603,8 @@ static int cpx_regular(const struct cpx_opts *o, const char *src, const char *ds
         rc = 1;
     }
     if (rc) return 1;
-    return cpx_attrs(o, dst, s, 0, is_new);
+    rc = cpx_xattrs(o, src, dst);
+    return cpx_attrs(o, dst, s, 0, is_new) | rc;
 }
 
 /* the entries of directory SRC by inode, as GNU's cp takes them (ties in
@@ -631,6 +680,7 @@ static int cpx_dir(const struct cpx_opts *o, const char *src, const char *dst,
             free(v);
         }
     }
+    rc |= cpx_xattrs(o, src, dst);
     if (is_new || o->p_mode || o->p_owner || o->p_time)
         rc |= cpx_attrs(o, dst, s, 0, is_new);
     return rc;
@@ -934,7 +984,8 @@ static int cpx_copy(const struct cpx_opts *o, const char *src, const char *dst,
                      su_quoteaf(dst));
             rc = 1;
         } else {
-            rc = cpx_attrs(o, dst, &s, 0, 1);
+            rc = cpx_xattrs(o, src, dst);
+            rc |= cpx_attrs(o, dst, &s, 0, 1);
         }
     } else {
         rc = cpx_regular(o, src, dst, &s, dexists, &dl, sbk);
@@ -1096,6 +1147,7 @@ static int do_cp(int argc, char **argv) {
             o.recursive = 1;
             o.deref = CPX_DEREF_NEVER;
             o.p_mode = o.p_owner = o.p_time = o.p_links = 1;
+            o.p_xattr = 1;
             o.default_mode = 0;
             break;
         case ATTR_ONLY_OPT: o.attr_only = 1; break;
@@ -1139,6 +1191,12 @@ static int do_cp(int argc, char **argv) {
             if (bits & 2) o.p_time = on;
             if (bits & 4) o.p_owner = on;
             if (bits & 8) o.p_links = on;
+            if (bits & 32) {
+                o.p_xattr = on;
+                /* named outright, a failure is an error; through "all"
+                 * it is not (measured, logs/b33/cpxattr-wsl.out) */
+                o.p_xattr_req = on && (bits != 63 || strstr(su_optarg, "xattr"));
+            }
             /* "all" asks for a context only if one can be had; naming it
              * asks for it outright */
             if (bits & 16) {
