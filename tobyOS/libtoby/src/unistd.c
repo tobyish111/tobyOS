@@ -233,8 +233,8 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
     u->st_mode = (mode_t)k->mode;
     u->st_uid  = (uid_t)k->uid;
     u->st_gid  = (gid_t)k->gid;
-    u->st_mtime = (time_t)k->mtime;
-    u->st_atime = (time_t)k->atime;
+    u->st_mtim.tv_sec = (time_t)k->mtime; u->st_mtim.tv_nsec = (long)k->mtime_ns;
+    u->st_atim.tv_sec = (time_t)k->atime; u->st_atim.tv_nsec = (long)k->atime_ns;
     u->st_nlink = (nlink_t)k->nlink;
     u->st_ino   = (ino_t)k->ino;
     /* the mount's number split as the Linux personality splits it, 12 bits
@@ -242,7 +242,7 @@ static int abi_stat_to_user(const struct abi_stat *k, struct stat *u) {
      * agree; 0 stays 0, "no answer" */
     u->st_dev   = k->dev ? (dev_t)makedev((unsigned)(k->dev >> 20) & 0xfffu,
                                           (unsigned)k->dev & 0xfffffu) : 0;
-    u->st_ctime   = (time_t)k->ctime;
+    u->st_ctim.tv_sec = (time_t)k->ctime; u->st_ctim.tv_nsec = (long)k->ctime_ns;
     u->st_blocks  = (blkcnt_t)k->blocks;
     u->st_blksize = (blksize_t)k->blksize;
     u->st_rdev    = (k->rdev_major || k->rdev_minor)

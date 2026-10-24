@@ -1581,11 +1581,7 @@ static void dfu_header_line(const char *mark, const struct dfu_file *f, int unif
             s = 0; ns = 0;
         } else {
             s = (int64_t)f->st.st_mtime;
-#ifdef SU_HOST
             ns = f->st.st_mtim.tv_nsec;
-#else
-            ns = 0;
-#endif
         }
         struct tx_tm tm;
         tx_tz_local(tx_tz_cur(), s, ns, &tm);

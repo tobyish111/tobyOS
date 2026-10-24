@@ -21866,14 +21866,18 @@ static int test_binary(const char *a, const char *op, const char *b, bool *err) 
                 return (sa.ino == sb.ino && sa.dev == sb.dev) ? 0 : 1;
             return strcmp(pa, pb) == 0 ? 0 : 1;
         }
+        /* the modification times to the nanosecond, as bash compares
+         * them (finding 239: whole seconds) */
+        int cmp = sa.mtime != sb.mtime ? (sa.mtime > sb.mtime ? 1 : -1)
+                : sa.mtime_ns != sb.mtime_ns ? (sa.mtime_ns > sb.mtime_ns ? 1 : -1) : 0;
         if (strcmp(op, "-nt") == 0) {
             if (oka && !okb) return 0;
             if (!oka) return 1;
-            return sa.mtime > sb.mtime ? 0 : 1;
+            return cmp > 0 ? 0 : 1;
         }
         if (okb && !oka) return 0;
         if (!okb) return 1;
-        return sa.mtime < sb.mtime ? 0 : 1;          /* -ot */
+        return cmp < 0 ? 0 : 1;                      /* -ot */
     }
 
     long va = 0, vb = 0;

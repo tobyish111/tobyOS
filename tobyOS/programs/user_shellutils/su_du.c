@@ -289,7 +289,8 @@ static int du_walk(const char *path, int level, uint64_t rootdev, struct du_size
     else me.n = (uint64_t)st.st_blocks * 512;
     if (du_time >= 0) {
         me.t = du_time == 0 ? st.st_mtime : du_time == 1 ? st.st_atime : st.st_ctime;
-        me.tns = 0;
+        me.tns = du_time == 0 ? st.st_mtim.tv_nsec : du_time == 1 ? st.st_atim.tv_nsec
+                                                                 : st.st_ctim.tv_nsec;
     }
     uint64_t subdirs = 0;
     if (isdir) {

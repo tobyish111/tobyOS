@@ -4315,6 +4315,9 @@ static void fill_abi_stat(const struct vfs_stat *src, struct abi_stat *dst) {
         dst->rdev_major = src->rmaj;
         dst->rdev_minor = src->rmin;
     }
+    dst->mtime_ns = src->mtime_ns;                       /* finding 239 */
+    dst->atime_ns = src->atime_ns;
+    dst->ctime_ns = src->ctime_ns;
 }
 _Static_assert(offsetof(struct abi_stat, ctime) == ABI_STAT_V1_SIZE,
                "SYS_STAT/FSTAT/LSTAT write the struct up to ctime");
@@ -4953,8 +4956,9 @@ static long sys_utimes_native(const char *path, uint64_t mtime, uint64_t atime) 
  * ABI_UTIME_NOW or ABI_UTIME_OMIT means now or leave it; !HAVE: now for
  * both), Linux's rules: a link is followed unless NOFOLLOW; an explicit time
  * needs the owner (or root) -- EPERM; now needs the owner or write
- * permission -- EACCES; a read-only mount EROFS. The disk keeps whole
- * seconds; the ns go. A filesystem that keeps no times at all (the initrd's
+ * permission -- EACCES; a read-only mount EROFS. A filesystem that keeps
+ * nanoseconds gets them (tmpfs, finding 239); one that keeps whole seconds
+ * gets those. A filesystem that keeps no times at all (the initrd's
  * ramfs) says yes, as the Linux personality always has.
  *
  * It was two half-answers: SYS_UTIMES, unsigned with -1 for now, so 1969
@@ -4998,11 +5002,17 @@ static long do_utimensat(const char *kpath, bool have, int64_t a_s, long a_ns,
         else bits = mode & 7u;
         if (!(bits & 2u)) return -ABI_EACCES;
     }
+    /* to the nanosecond, the clock's and the caller's (finding 239): the
+     * nanoseconds were dropped, every time a whole second */
     extern uint64_t lx_realtime_ns(uint64_t mono_ns);
-    int64_t now = (int64_t)(lx_realtime_ns(perf_now_ns()) / 1000000000ull);
+    uint64_t now_ns = lx_realtime_ns(perf_now_ns());
+    int64_t now = (int64_t)(now_ns / 1000000000ull);
+    uint32_t now_frac = (uint32_t)(now_ns % 1000000000ull);
     int64_t na = a_omit ? (int64_t)vs.atime : a_now ? now : a_s;
     int64_t nm = m_omit ? (int64_t)vs.mtime : m_now ? now : m_s;
-    int rc = vfs_utimes(path, (uint64_t)nm, (uint64_t)na);
+    uint32_t na_ns = a_omit ? vs.atime_ns : a_now ? now_frac : (uint32_t)a_ns;
+    uint32_t nm_ns = m_omit ? vs.mtime_ns : m_now ? now_frac : (uint32_t)m_ns;
+    int rc = vfs_utimens(path, (uint64_t)nm, nm_ns, (uint64_t)na, na_ns);
     if (rc == VFS_ERR_ROFS) return 0;          /* keeps no times (ramfs) */
     return vfs_err_to_abi(rc);
 }
@@ -8846,6 +8856,10 @@ static long linux_emit_stat(const struct vfs_stat *vs, uint64_t ino, void *ubuf)
     st.st_mtime   = (int64_t)vs->mtime;
     st.st_atime   = (int64_t)vs->atime;
     st.st_ctime   = (int64_t)vs->ctime;
+    /* ...and their nanoseconds, where the filesystem keeps them (239) */
+    st.st_mtime_nsec = vs->mtime_ns;
+    st.st_atime_nsec = vs->atime_ns;
+    st.st_ctime_nsec = vs->ctime_ns;
     if (typ == 0x2000u || typ == 0x6000u)              /* a node (214) */
         st.st_rdev = lx_makedev(vs->rmaj, vs->rmin);
     if (copy_to_user(ubuf, &st, sizeof st) != 0) return -ABI_EFAULT;
@@ -8891,6 +8905,9 @@ static long linux_emit_statx(const struct vfs_stat *vs, uint64_t ino, void *ubuf
     sx.atime.sec = (int64_t)vs->atime;
     sx.ctime.sec = (int64_t)vs->ctime;
     sx.btime.sec = (int64_t)vs->ctime;       /* no separate birth time */
+    sx.mtime.nsec = vs->mtime_ns;            /* finding 239 */
+    sx.atime.nsec = vs->atime_ns;
+    sx.ctime.nsec = sx.btime.nsec = vs->ctime_ns;
     if (typ == 0x2000u || typ == 0x6000u) {            /* a node (214) */
         sx.rdev_major = vs->rmaj;
         sx.rdev_minor = vs->rmin;

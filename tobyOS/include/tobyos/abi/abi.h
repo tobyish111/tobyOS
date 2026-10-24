@@ -2115,6 +2115,11 @@ struct abi_stat {
     uint32_t blksize;    /* the I/O block size */
     uint32_t rdev_major; /* a device node's numbers; 0 for anything else */
     uint32_t rdev_minor;
+    /* finding 239: the nanoseconds past mtime's, atime's and ctime's
+     * second, where the filesystem keeps them (tmpfs); 0 where not */
+    uint32_t mtime_ns;
+    uint32_t atime_ns;
+    uint32_t ctime_ns;
     uint32_t _pad;
 };
 #define ABI_STAT_V1_SIZE 56  /* sizeof the struct up to and excluding ctime */

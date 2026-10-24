@@ -753,6 +753,11 @@ static int bm_utimes(void *mnt, const char *path, uint64_t mt, uint64_t at) {
     struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
     BM_FWD(b->ops->utimes(b->data, r, mt, at));
 }
+static int bm_utimens(void *mnt, const char *path, uint64_t mt, uint32_t mns,
+                      uint64_t at, uint32_t ans) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->utimens(b->data, r, mt, mns, at, ans));
+}
 static int bm_truncate(void *mnt, const char *path, uint64_t len) {
     struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
     BM_FWD(b->ops->truncate(b->data, r, len));
@@ -839,6 +844,7 @@ int vfs_bind(const char *target, const char *source, uint32_t flags) {
     b->wops.chmod    = o->chmod    ? bm_chmod    : 0;
     b->wops.chown    = o->chown    ? bm_chown    : 0;
     b->wops.utimes   = o->utimes   ? bm_utimes   : 0;
+    b->wops.utimens  = o->utimens  ? bm_utimens  : 0;
     b->wops.truncate = o->truncate ? bm_truncate : 0;
     b->wops.readlink = o->readlink ? bm_readlink : 0;
     b->wops.symlink  = o->symlink  ? bm_symlink  : 0;
@@ -861,13 +867,22 @@ int vfs_bind(const char *target, const char *source, uint32_t flags) {
 /* Linux slice 2: the mount flags a path resolves through. Defined here rather
  * than beside vfs_mount_flags() because it needs the static resolver above. */
 int vfs_utimes(const char *path, uint64_t mtime, uint64_t atime) {
+    return vfs_utimens(path, mtime, 0, atime, 0);
+}
+
+/* ...to the nanosecond, for a filesystem that keeps them (->utimens,
+ * finding 239); utimes for one that keeps whole seconds */
+int vfs_utimens(const char *path, uint64_t mtime, uint32_t mtime_ns,
+                uint64_t atime, uint32_t atime_ns) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
     if (m->flags & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
-    if (!m->ops->utimes) return VFS_ERR_ROFS;   /* fs cannot store times */
+    if (!m->ops->utimes && !m->ops->utimens) return VFS_ERR_ROFS;   /* no times */
     if (!cap_check_path(current_proc(), path, CAP_FILE_WRITE, "vfs_utimes"))
         return VFS_ERR_PERM;
+    if (m->ops->utimens)
+        return m->ops->utimens(m->data, rel, mtime, mtime_ns, atime, atime_ns);
     return m->ops->utimes(m->data, rel, mtime, atime);
 }
 

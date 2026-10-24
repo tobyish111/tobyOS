@@ -190,13 +190,8 @@ static void cpx_mode9(mode_t m, char *o) {
 }
 
 static void cpx_times(const struct stat *st, struct timespec ts[2]) {
-#ifdef SU_HOST
-    ts[0] = st->st_atim;
+    ts[0] = st->st_atim;       /* to the nanosecond, both builds (239) */
     ts[1] = st->st_mtim;
-#else
-    ts[0].tv_sec = st->st_atime; ts[0].tv_nsec = 0;
-    ts[1].tv_sec = st->st_mtime; ts[1].tv_nsec = 0;
-#endif
 }
 
 /* -u: is D older than S? (equal is not) */
@@ -422,15 +417,10 @@ static int cpx_link(const char *src, const char *dst, int follow) {
 #endif
 }
 
-/* a device node or socket -- root only on Linux; there is no mknod here */
+/* a device node or socket -- root only, as Linux's (libtoby's mknod is
+ * the kernel's since finding 214; this said EPERM to everyone) */
 static int cpx_mknod(const char *dst, const struct stat *s) {
-#ifdef SU_HOST
     return mknod(dst, s->st_mode & (S_IFMT | 0777), s->st_rdev);
-#else
-    (void)dst; (void)s;
-    errno = EPERM;
-    return -1;
-#endif
 }
 
 static int cpx_allzero(const char *b, size_t n) {

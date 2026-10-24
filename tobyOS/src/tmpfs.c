@@ -49,11 +49,28 @@
 #include <tobyos/xattr.h>      /* a node's attributes (finding 225) */
 #include <tobyos/abi/abi.h>
 
-/* Same source tobyfs uses for a wall-clock timestamp (see tfs_now_secs). */
-static uint64_t tmpfs_now_secs(void) {
+/* A time, as Linux's tmpfs keeps one: seconds since 1970 (as signed; a
+ * time before 1970 is negative) and the nanoseconds past them (finding
+ * 239: whole seconds, so `touch -d @N.5` and `stat %y` lost the fraction
+ * and `find -newer` could not order two files of one second). Kept apart,
+ * as a timespec is, so every date a whole-second time could hold still
+ * fits. */
+struct tts { uint64_t s; uint32_t ns; };
+#define TNS 1000000000ull
+
+/* Now -- the same source tobyfs uses for a wall-clock timestamp (see
+ * tfs_now_secs) */
+static struct tts tmpfs_now(void) {
     extern uint64_t lx_realtime_ns(uint64_t mono_ns);
     extern uint64_t perf_now_ns(void);
-    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+    uint64_t n = lx_realtime_ns(perf_now_ns());
+    struct tts t = { n / TNS, (uint32_t)(n % TNS) };
+    return t;
+}
+
+/* A before B? (the seconds signed) */
+static bool tts_le(struct tts a, struct tts b) {
+    return (int64_t)a.s < (int64_t)b.s || (a.s == b.s && a.ns <= b.ns);
 }
 
 /* klibc deliberately provides only strlen/strcmp/strncmp and the mem* family,
@@ -116,8 +133,8 @@ struct tmpfs_node {
     uint8_t      *data;                 /* NULL for a directory              */
     size_t        size, cap;
     uint32_t      uid, gid, mode;
-    uint64_t      mtime, atime;
-    uint64_t      ctime;                /* the last change (finding 224) */
+    struct tts    mtime, atime;         /* to the nanosecond (239) */
+    struct tts    ctime;                /* the last change (finding 224) */
     /* POSIX: unlink() removes the NAME; the file itself survives until
      * the last open handle closes. Without this, `fd = open(t); unlink(t);
      * read(fd)` -- which is how every mkstemp()/tmpfile() user, GNU bash
@@ -160,8 +177,8 @@ struct tmpfs_mount {
     bool                no_byte_limit;  /* size=0: none, statfs says 0 (233) */
     bool                no_node_limit;  /* nr_inodes=0: likewise */
     uint32_t            root_mode; /* the mount root's permissions (mode=) */
-    uint64_t            root_time; /* when it was mounted: the root's times */
-    uint64_t            root_mtime;/* its last entry change, 0 for none (238) */
+    struct tts          root_time; /* when it was mounted: the root's times */
+    struct tts          root_mtime;/* its last entry change, 0 for none (238) */
     uint32_t            root_nent; /* the root's entries (238) */
     uint64_t            next_seq;  /* the next node's creation number */
     struct xa_list     *root_xattrs; /* the root's attributes (225) */
@@ -391,9 +408,10 @@ static int tmpfs_close(struct vfs_file *f)
  * -anewer, finding 242). */
 static void taccessed(struct tmpfs_node *nd)
 {
-    uint64_t now = tmpfs_now_secs();
-    if (nd->atime <= nd->mtime || nd->atime <= nd->ctime ||
-        now >= nd->atime + 86400u)
+    struct tts now = tmpfs_now();
+    struct tts day = { nd->atime.s + 86400u, nd->atime.ns };
+    if (tts_le(nd->atime, nd->mtime) || tts_le(nd->atime, nd->ctime) ||
+        tts_le(day, now))
         nd->atime = now;
 }
 
@@ -480,7 +498,7 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
     if (end > nd->size) nd->size = end;
     f->pos = end;
     f->size = nd->size;
-    nd->mtime = nd->ctime = tmpfs_now_secs();
+    nd->mtime = nd->ctime = tmpfs_now();
     return (long)n;
 }
 
@@ -490,7 +508,7 @@ static long tmpfs_write(struct vfs_file *f, const void *buf, size_t n)
  * Linux's says the time its last entry was made (finding 238). */
 static void tparent_touch(struct tmpfs_mount *m, const char *norm, int delta)
 {
-    uint64_t now = tmpfs_now_secs();
+    struct tts now = tmpfs_now();
     const char *slash = trchr(norm, '/');
     if (!slash) {
         m->root_mtime = now;
@@ -531,7 +549,7 @@ static int tmpfs_create(void *mnt, const char *path, uint32_t uid,
     /* the format bits too: a FIFO is a file whose mode says S_IFIFO
      * (vfs_mkfifo) */
     nd->mode = mode ? (mode & 0177777u) : 0644u;
-    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now();
     tparent_touch(m, norm, 1);
     return VFS_OK;
 }
@@ -555,7 +573,7 @@ static int tmpfs_mkdir(void *mnt, const char *path, uint32_t uid,
     tcopy(nd->path, norm, sizeof nd->path);
     nd->uid = uid; nd->gid = gid;
     nd->mode = mode ? (mode & 07777u) : 0755u;
-    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now();
     tparent_touch(m, norm, 1);
     return VFS_OK;
 }
@@ -569,7 +587,7 @@ static void tdrop_name(struct tmpfs_mount *m, struct tmpfs_node *nm)
     if (ino != nm) {                      /* an extra name: drop just it */
         memset(nm, 0, sizeof *nm);
         if (ino->nlink) ino->nlink--;
-        ino->ctime = tmpfs_now_secs();
+        ino->ctime = tmpfs_now();
         if (ino->nlink == 0 && ino->open_count == 0) treap(ino);
         return;
     }
@@ -577,7 +595,7 @@ static void tdrop_name(struct tmpfs_mount *m, struct tmpfs_node *nm)
         /* Other names point here BY INDEX, so the slot has to live on --
          * but this name is gone, so hide it from lookups and readdir. */
         ino->nlink--;
-        ino->ctime = tmpfs_now_secs();
+        ino->ctime = tmpfs_now();
         ino->unlinked = true;
         return;
     }
@@ -644,7 +662,7 @@ static int tmpfs_symlink(void *mnt, const char *path, const char *target,
     }
     memcpy(nd->data, target, tl);
     nd->size = tl;
-    nd->mtime = nd->atime = nd->ctime = tmpfs_now_secs();
+    nd->mtime = nd->atime = nd->ctime = tmpfs_now();
     tparent_touch(m, norm, 1);
     return VFS_OK;
 }
@@ -689,7 +707,7 @@ static int tmpfs_link(void *mnt, const char *oldpath, const char *newpath)
     nn->path[sizeof nn->path - 1] = '\0';
     nn->link_to = (uint32_t)tindex(m, ino) + 1u;   /* talloc moved nothing */
     ino->nlink  = (ino->nlink ? ino->nlink : 1u) + 1u;
-    ino->ctime  = tmpfs_now_secs();      /* a new link is a change (224) */
+    ino->ctime  = tmpfs_now();      /* a new link is a change (224) */
     tparent_touch(m, nw, 1);
     return VFS_OK;
 }
@@ -713,8 +731,11 @@ static int tmpfs_stat(void *mnt, const char *path, struct vfs_stat *out)
         out->mode = m->root_mode | VFS_MODE_VALID;
         /* its times are the mount's, as Linux's tmpfs root has (they
          * were 0, so `ls -ld /tmp` said Jan 1 1970) */
-        out->atime = m->root_time;
-        out->mtime = out->ctime = m->root_mtime ? m->root_mtime : m->root_time;
+        struct tts rm = (m->root_mtime.s || m->root_mtime.ns) ? m->root_mtime
+                                                               : m->root_time;
+        out->atime = m->root_time.s; out->atime_ns = m->root_time.ns;
+        out->mtime = out->ctime = rm.s;
+        out->mtime_ns = out->ctime_ns = rm.ns;
         out->size = TDIR_SIZE(m->root_nent);
         out->ino  = m->max_nodes + 1u;             /* past every node's */
         out->dev  = dev;
@@ -749,9 +770,9 @@ static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
      * ramfs (whose stat does set the flag) worked. tmpfs_open set it and
      * tmpfs_stat did not, so the two disagreed about the same file. */
     out->mode  = (nd->mode & 0177777u) | VFS_MODE_VALID;
-    out->mtime = nd->mtime;
-    out->atime = nd->atime;
-    out->ctime = nd->ctime;
+    out->mtime = nd->mtime.s; out->mtime_ns = nd->mtime.ns;
+    out->atime = nd->atime.s; out->atime_ns = nd->atime.ns;
+    out->ctime = nd->ctime.s; out->ctime_ns = nd->ctime.ns;
     out->nlink = nd->nlink ? nd->nlink : 1u;
     out->rmaj  = nd->rmaj;
     out->rmin  = nd->rmin;
@@ -776,7 +797,7 @@ static long tmpfs_xattr(void *mnt, const char *path, int op, const char *name,
     }
     long r = xa_list_op(head, op, name, buf, sz, flags);
     if (r == 0 && nd && (op == XA_SET || op == XA_REMOVE))
-        nd->ctime = tmpfs_now_secs();
+        nd->ctime = tmpfs_now();
     return r;
 }
 
@@ -911,7 +932,7 @@ static int tmpfs_chmod(void *mnt, const char *path, uint32_t mode)
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
     nd->mode = (nd->mode & 0170000u) | (mode & 07777u);   /* keeps its type */
-    nd->ctime = tmpfs_now_secs();
+    nd->ctime = tmpfs_now();
     return VFS_OK;
 }
 
@@ -924,21 +945,28 @@ static int tmpfs_chown(void *mnt, const char *path, uint32_t uid, uint32_t gid)
     if (!nd) return VFS_ERR_NOENT;
     if (uid != (uint32_t)-1) nd->uid = uid;
     if (gid != (uint32_t)-1) nd->gid = gid;
-    nd->ctime = tmpfs_now_secs();
+    nd->ctime = tmpfs_now();
     return VFS_OK;
 }
 
-static int tmpfs_utimes(void *mnt, const char *path, uint64_t mtime,
-                        uint64_t atime)
+static int tmpfs_utimens(void *mnt, const char *path, uint64_t mtime,
+                         uint32_t mtime_ns, uint64_t atime, uint32_t atime_ns)
 {
     struct tmpfs_mount *m = mnt;
     char norm[VFS_PATH_MAX];
     if (!tnorm(path, norm, sizeof norm)) return VFS_ERR_INVAL;
     struct tmpfs_node *nd = tfind(m, norm);
     if (!nd) return VFS_ERR_NOENT;
-    nd->mtime = mtime; nd->atime = atime;
-    nd->ctime = tmpfs_now_secs();        /* setting times is a change (224) */
+    nd->mtime.s = mtime; nd->mtime.ns = mtime_ns;
+    nd->atime.s = atime; nd->atime.ns = atime_ns;
+    nd->ctime = tmpfs_now();        /* setting times is a change (224) */
     return VFS_OK;
+}
+
+static int tmpfs_utimes(void *mnt, const char *path, uint64_t mtime,
+                        uint64_t atime)
+{
+    return tmpfs_utimens(mnt, path, mtime, 0, atime, 0);
 }
 
 static int ttrunc(struct tmpfs_mount *m, struct tmpfs_node *nd, uint64_t len)
@@ -961,7 +989,7 @@ static int ttrunc(struct tmpfs_mount *m, struct tmpfs_node *nd, uint64_t len)
         m->pages -= nd->pages - TPAGES(len);
         nd->pages = TPAGES(len);
     }
-    nd->mtime = nd->ctime = tmpfs_now_secs();
+    nd->mtime = nd->ctime = tmpfs_now();
     return VFS_OK;
 }
 
@@ -1024,7 +1052,7 @@ static int tmpfs_rename(void *mnt, const char *oldpath, const char *newpath)
     tcopy(src->path, nw, sizeof src->path);
     src->path[sizeof src->path - 1] = '\0';
     src->seq = ++m->next_seq;            /* newest where it now is (221) */
-    src->ctime = tmpfs_now_secs();       /* a rename is a change (224) */
+    src->ctime = tmpfs_now();       /* a rename is a change (224) */
     tparent_touch(m, o, -1);
     tparent_touch(m, nw, replaced ? 0 : 1);
     return VFS_OK;
@@ -1101,6 +1129,7 @@ static const struct vfs_ops tmpfs_ops = {
     .chmod     = tmpfs_chmod,
     .chown     = tmpfs_chown,
     .utimes    = tmpfs_utimes,
+    .utimens   = tmpfs_utimens,       /* finding 239 */
     .truncate  = tmpfs_truncate,
     .ftruncate = tmpfs_ftruncate,
     .link      = tmpfs_link,
@@ -1209,7 +1238,7 @@ int tmpfs_mount_at(const char *path, const char *opts)
     m->pages = 0;
     m->max_bytes = max_bytes;
     m->root_mode = root_mode;
-    m->root_time = tmpfs_now_secs();
+    m->root_time = tmpfs_now();
     m->no_byte_limit = size0;
     m->no_node_limit = nodes0;
     m->used = true;

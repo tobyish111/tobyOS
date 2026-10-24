@@ -202,7 +202,7 @@ static int do_date(int argc, char **argv) {
         struct stat st;
         if (stat(ref, &st) != 0) su_error(1, errno, "%s", su_quotef(ref));
         s = (int64_t)st.st_mtime;
-        ns = 0;
+        ns = st.st_mtim.tv_nsec;
     } else if (datestr) {
         if (!tx_parse_date(datestr, now_s, now_ns, &s, &ns))
             su_error(1, 0, "invalid date %s", su_quote(datestr));

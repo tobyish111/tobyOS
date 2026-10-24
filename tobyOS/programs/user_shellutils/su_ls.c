@@ -474,13 +474,11 @@ static void ls_time_of(const struct stat *st, int64_t *sec, long *nsec) {
     case LT_B: *sec = (int64_t)st->st_ctime; break;   /* no birth time here */
     default: *sec = (int64_t)st->st_mtime;
     }
-#ifdef SU_HOST
-    switch (ls.timetype) {
+    switch (ls.timetype) {     /* the nanoseconds: libtoby's too (239) */
     case LT_C: case LT_B: *nsec = st->st_ctim.tv_nsec; break;
     case LT_A: *nsec = st->st_atim.tv_nsec; break;
     default: *nsec = st->st_mtim.tv_nsec;
     }
-#endif
 }
 
 static int ls_isdirish(const struct ls_ent *e) {

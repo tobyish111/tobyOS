@@ -1307,16 +1307,10 @@ static fd_i128 fd_day_start;         /* GNU's cur_day_start: now - a day, or tod
 
 static fd_i128 fd_ns(int64_t s, long ns) { return (fd_i128)s * FD_NS + ns; }
 
-#ifdef SU_HOST
+/* to the nanosecond: libtoby's stat has them too (finding 239) */
 #define FD_ATIM(st) fd_ns((st)->st_atim.tv_sec, (st)->st_atim.tv_nsec)
 #define FD_MTIM(st) fd_ns((st)->st_mtim.tv_sec, (st)->st_mtim.tv_nsec)
 #define FD_CTIM(st) fd_ns((st)->st_ctim.tv_sec, (st)->st_ctim.tv_nsec)
-#else
-/* the native stat has whole seconds */
-#define FD_ATIM(st) fd_ns((int64_t)(st)->st_atime, 0)
-#define FD_MTIM(st) fd_ns((int64_t)(st)->st_mtime, 0)
-#define FD_CTIM(st) fd_ns((int64_t)(st)->st_ctime, 0)
-#endif
 
 static int64_t fd_sec_of(fd_i128 t) {
     int64_t s = (int64_t)(t / FD_NS);

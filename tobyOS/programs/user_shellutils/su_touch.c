@@ -132,8 +132,8 @@ static int do_touch(int argc, char **argv) {
         struct stat st;
         int r = nofollow ? lstat(ref, &st) : stat(ref, &st);
         if (r != 0) su_error(1, errno, "failed to get attributes of %s", su_quoteaf(ref));
-        ts[0].tv_sec = st.st_atime; ts[0].tv_nsec = 0;
-        ts[1].tv_sec = st.st_mtime; ts[1].tv_nsec = 0;
+        ts[0] = st.st_atim;      /* to the nanosecond (finding 239) */
+        ts[1] = st.st_mtim;
         explicit_time = 1;
         if (datestr) {
             for (int k = 0; k < 2; k++) {

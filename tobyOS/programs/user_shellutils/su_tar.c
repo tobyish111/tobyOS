@@ -29,12 +29,14 @@
  * nanosecond times -- the first three are done here (the user and group
  * databases read from /etc/passwd and /etc/group), a device node cannot
  * be made ("Cannot mknod: Operation not permitted", what GNU says to a
- * user), times are whole seconds, holes are found by reading (there is no
- * SEEK_DATA), and local time is UTC. */
+ * user), holes are found by reading (there is no SEEK_DATA), and local
+ * time is UTC. Times are to the nanosecond on both since finding 239 --
+ * libtoby's stat has them -- and a device node is made for root since
+ * finding 214 (libtoby's mknod). */
 
 #include <sys/time.h>
-#ifdef SU_HOST
 #include <sys/sysmacros.h>
+#ifdef SU_HOST
 #include <pwd.h>
 #include <grp.h>
 #endif
@@ -1004,11 +1006,7 @@ static void tar_parse_date_opt(const char *opt, const char *arg, intmax_t *sec, 
             tar_usage_error("Date sample file not found");
         }
         *sec = (intmax_t)st.st_mtime;
-#ifdef SU_HOST
         *ns = st.st_mtim.tv_nsec;
-#else
-        *ns = 0;
-#endif
         return;
     }
     if (!tar_get_date(arg, sec, ns)) {
@@ -3678,11 +3676,7 @@ static void tar_apply_mtime(intmax_t *s, long *ns) {
 static void tar_stat_times(const struct stat *st, intmax_t *m, long *mn, intmax_t *a, long *an,
                            intmax_t *c, long *cn) {
     *m = (intmax_t)st->st_mtime; *a = (intmax_t)st->st_atime; *c = (intmax_t)st->st_ctime;
-#ifdef SU_HOST
     *mn = st->st_mtim.tv_nsec; *an = st->st_atim.tv_nsec; *cn = st->st_ctim.tv_nsec;
-#else
-    *mn = 0; *an = 0; *cn = 0;
-#endif
 }
 
 /* the long listing of one member: "-rw-r--r-- u/g  SIZE DATE NAME" */
@@ -3844,10 +3838,7 @@ static int tar_dump_data(const char *path, int fd, uintmax_t size, const struct 
     struct stat st1;
     if (fd >= 0 && fstat(fd, &st1) == 0) {
         if (st1.st_size != st0->st_size || st1.st_mtime != st0->st_mtime
-#ifdef SU_HOST
-            || st1.st_ctim.tv_sec != st0->st_ctim.tv_sec || st1.st_ctim.tv_nsec != st0->st_ctim.tv_nsec
-#endif
-           ) {
+            || st1.st_ctim.tv_sec != st0->st_ctim.tv_sec || st1.st_ctim.tv_nsec != st0->st_ctim.tv_nsec) {
             if (tar_warning_on(TW_FILE_CHANGED))
                 tar_warn("%s: file changed as we read it", tar_qc(path));
             if (tar_status < TAR_EXIT_DIFFER) tar_status = TAR_EXIT_DIFFER;
@@ -5863,10 +5854,7 @@ static int tar_x_prepare(const char *name, struct tar_member *m, int kind) {
     case TAR_OLD_KEEP_NEWER:
         if (kind != TAR_X_DIR) {
             intmax_t mt = (intmax_t)st.st_mtime;
-            long mns = 0;
-#ifdef SU_HOST
-            mns = st.st_mtim.tv_nsec;
-#endif
+            long mns = st.st_mtim.tv_nsec;
             if (mt > m->mtime || (mt == m->mtime && mns >= m->mtime_ns)) {
                 if (tar_warning_on(TW_IGNORE_NEWER))
                     tar_warn("Current %s is newer or same age", tar_q(name));
@@ -6289,13 +6277,8 @@ static int tar_extract_one(struct tar_member *m) {
         int rc;
         if (type == '6') rc = mkfifo(name, tar_x_mode(m->mode));
         else {
-#ifdef SU_HOST
             rc = mknod(name, tar_x_mode(m->mode) | (type == '3' ? S_IFCHR : S_IFBLK),
                        makedev(m->devmaj, m->devmin));
-#else
-            errno = EPERM;
-            rc = -1;
-#endif
         }
         if (rc != 0) {
             int e = errno;

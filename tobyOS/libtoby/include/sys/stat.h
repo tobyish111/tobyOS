@@ -11,6 +11,7 @@
 
 #include <sys/types.h>
 #include <stdint.h>
+#include <time.h>   /* struct timespec, as POSIX has sys/stat.h give it */
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,9 +66,12 @@ struct stat {
      * in struct vfs_stat all along and struct abi_stat had nowhere to put
      * them, so no native program could read a file's date -- which is why
      * `touch -m` had no existing atime to preserve. 0 means the filesystem
-     * has no answer (fstat on a pipe, say), not 1970. */
-    time_t st_mtime;
-    time_t st_atime;
+     * has no answer (fstat on a pipe, say), not 1970.
+     * Finding 239: to the nanosecond, POSIX's timespecs, where the
+     * filesystem keeps them (tmpfs); st_mtime and the rest are their
+     * seconds, as glibc spells them. */
+    struct timespec st_mtim;
+    struct timespec st_atim;
     /* 2026-09-08. st_nlink was absent, so `ls -l` printed a synthetic
      * count; st_ino/st_dev were absent, so `test -ef` compared paths and
      * answered "different" for two hard links to one file. 0 for ino/dev
@@ -80,11 +84,14 @@ struct stat {
      * node's numbers (major() and minor(), <sys/sysmacros.h>). The
      * kernel's answers through ABI_SYS_XSTAT, the Linux personality's
      * numbers. */
-    time_t    st_ctime;
+    struct timespec st_ctim;
     blkcnt_t  st_blocks;
     blksize_t st_blksize;
     dev_t     st_rdev;
 };
+#define st_mtime st_mtim.tv_sec
+#define st_atime st_atim.tv_sec
+#define st_ctime st_ctim.tv_sec
 
 int stat (const char *path, struct stat *out);
 int fstat(int fd,           struct stat *out);
@@ -105,7 +112,6 @@ mode_t umask(mode_t mask);
 #endif
 #define UTIME_NOW           ((1L << 30) - 1L)
 #define UTIME_OMIT          ((1L << 30) - 2L)
-#include <time.h>   /* struct timespec, as POSIX has sys/stat.h give it */
 int utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
 
 #ifdef __cplusplus

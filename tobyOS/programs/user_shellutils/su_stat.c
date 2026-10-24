@@ -122,7 +122,7 @@ static const char *st_idname(const char *db, unsigned long id, char *out, size_t
 }
 
 /* "YYYY-MM-DD HH:MM:SS.000000000 +0000" for T, UTC */
-static void st_time(time_t t, char *out, size_t cap) {
+static void st_time(time_t t, long ns, char *out, size_t cap) {
     long long s = (long long)t;
     long long days = s >= 0 ? s / 86400 : -((-s + 86399) / 86400);
     long long rem = s - days * 86400;
@@ -137,8 +137,8 @@ static void st_time(time_t t, char *out, size_t cap) {
     long long d = doy - (153 * mp + 2) / 5 + 1;
     long long m = mp < 10 ? mp + 3 : mp - 9;
     if (m <= 2) y++;
-    snprintf(out, cap, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld.000000000 +0000",
-             y, m, d, rem / 3600, rem / 60 % 60, rem % 60);
+    snprintf(out, cap, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld.%09ld +0000",
+             y, m, d, rem / 3600, rem / 60 % 60, rem % 60, ns);
 }
 
 struct st_file {
@@ -226,14 +226,18 @@ static void st_dir(struct sn_sb *out, const struct st_file *f, char pfx, char co
     case 'U': s = st_idname("/etc/passwd", st->st_uid, tmp, sizeof tmp); break;
     case 'w': s = "-"; break;
     case 'W': kind = UNS; v = 0; break;
-    case 'x': st_time(st->st_atime, tmp, sizeof tmp); s = tmp; break;
-    case 'y': st_time(st->st_mtime, tmp, sizeof tmp); s = tmp; break;
-    case 'z': st_time(st->st_ctime, tmp, sizeof tmp); s = tmp; break;
+    /* to the nanosecond (finding 239: it printed .000000000 always) */
+    case 'x': st_time(st->st_atime, st->st_atim.tv_nsec, tmp, sizeof tmp); s = tmp; break;
+    case 'y': st_time(st->st_mtime, st->st_mtim.tv_nsec, tmp, sizeof tmp); s = tmp; break;
+    case 'z': st_time(st->st_ctime, st->st_ctim.tv_nsec, tmp, sizeof tmp); s = tmp; break;
     case 'X': case 'Y': case 'Z': {
         time_t t = conv == 'X' ? st->st_atime : conv == 'Y' ? st->st_mtime : st->st_ctime;
+        long tn = conv == 'X' ? st->st_atim.tv_nsec : conv == 'Y' ? st->st_mtim.tv_nsec
+                                                     : st->st_ctim.tv_nsec;
         if (prec > 0) {
-            snprintf(buf, sizeof buf, "%lld.%.*s", (long long)t, prec > 9 ? 9 : prec,
-                     "000000000");
+            char frac[16];
+            snprintf(frac, sizeof frac, "%09ld", tn);
+            snprintf(buf, sizeof buf, "%lld.%.*s", (long long)t, prec > 9 ? 9 : prec, frac);
             for (int i = 9; i < prec; i++) strcat(buf, "0");
             s = buf;
         } else {

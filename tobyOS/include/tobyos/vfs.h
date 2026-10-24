@@ -158,6 +158,9 @@ struct vfs_stat {
     uint64_t      mtime;       /* last data modification */
     uint64_t      atime;       /* last access (best effort) */
     uint64_t      ctime;       /* last inode change */
+    /* ...and the nanoseconds past each second, for a filesystem that keeps
+     * them (finding 239: tmpfs); 0 for one that keeps whole seconds */
+    uint32_t      mtime_ns, atime_ns, ctime_ns;
     /* INODE IDENTITY. 0 = "this filesystem has no answer", which is the
      * honest report for a node-per-path filesystem and is what every
      * driver except tobyfs gives today.
@@ -288,6 +291,10 @@ struct vfs_ops {
      * NULL: the VFS's path store holds them (src/xattr.c). */
     long (*xattr)   (void *mnt, const char *path, int op, const char *name,
                      void *buf, size_t sz, int flags);
+    /* (optional) utimes to the nanosecond (finding 239). NULL: utimes, the
+     * nanoseconds dropped, as a filesystem with coarser times drops them. */
+    int  (*utimens) (void *mnt, const char *path, uint64_t mtime, uint32_t mtime_ns,
+                     uint64_t atime, uint32_t atime_ns);
     /* The filesystem's TYPE as Linux names it ("tmpfs", "proc", "ext4"):
      * /proc/mounts' third field, mountinfo's, mount(8)'s "type". Every
      * mount said "tobyos" (batch 31). NULL: "tobyos". */
@@ -407,6 +414,9 @@ int  vfs_mount_flags(const char *mount_point, const struct vfs_ops *ops,
 /* Linux slice 6: set a path's timestamps (epoch seconds). VFS_ERR_ROFS if the
  * filesystem has no ->utimes, so callers can tell "stored" from "ignored". */
 int  vfs_utimes(const char *path, uint64_t mtime, uint64_t atime);
+/* Finding 239: the same to the nanosecond, where the filesystem keeps them */
+int  vfs_utimens(const char *path, uint64_t mtime, uint32_t mtime_ns,
+                 uint64_t atime, uint32_t atime_ns);
 
 /* Linux slice 6: set a path's length. VFS_ERR_ROFS if unsupported. */
 int  vfs_truncate(const char *path, uint64_t length);

@@ -786,7 +786,12 @@ static int host_vstat(const struct stat *stp, struct vfs_stat *out) {
     out->dev   = (uint32_t)stp->st_dev;
     out->mtime = (uint64_t)stp->st_mtime;
     out->atime = (uint64_t)stp->st_atime;
-    out->ctime = (uint64_t)stp->st_mtime;
+    out->ctime = (uint64_t)stp->st_ctime;      /* it was st_mtime */
+    /* to the nanosecond (finding 239): test -nt of two files written in
+     * one second is decided by them, as bash's */
+    out->mtime_ns = (uint32_t)stp->st_mtim.tv_nsec;
+    out->atime_ns = (uint32_t)stp->st_atim.tv_nsec;
+    out->ctime_ns = (uint32_t)stp->st_ctim.tv_nsec;
     return VFS_OK;
 }
 
