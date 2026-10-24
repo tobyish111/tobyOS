@@ -1556,12 +1556,16 @@ static int procfs_open(void *mnt, const char *path, struct vfs_file *out) {
                 else if (strcmp(sub, "stat") == 0)
                     len = gen_pid_stat(pid, buf, sizeof(buf));
                 else if (strcmp(sub, "comm") == 0) {         /* finding 208 */
-                    /* the name, cut to TASK_COMM_LEN - 1 bytes, as Linux's */
+                    /* the executable's name, cut to TASK_COMM_LEN - 1 bytes,
+                     * as stat and status say it (proc_comm): this file
+                     * said the spawner's label -- an SSH session's shell
+                     * was "tsh-ssh" where Linux's is "bash" (finding 213) */
                     struct proc *cp = proc_lookup(pid);
                     if (!cp) return VFS_ERR_NOENT;
-                    size_t cl = strlen(cp->name);
-                    if (cl > 15) cl = 15;
-                    memcpy(buf, cp->name, cl);
+                    char cb[16];
+                    const char *cn = proc_comm(cp, cb, sizeof cb);
+                    size_t cl = strlen(cn);
+                    memcpy(buf, cn, cl);
                     buf[cl] = '\n';
                     len = (int)cl + 1;
                 }

@@ -59,7 +59,17 @@ struct user {
     int  uid;
     int  gid;
     char password_hash[USER_PWHASH_MAX];
+    /* /etc/shadow's aging fields, in days (finding 213): the last change
+     * (days since 1970; 0 = expired, must change), the least and most
+     * days between changes, the warning days, the inactive days after it
+     * expires, the account's expiry date. -1 is an empty field. */
+    int64_t lastchg, minage, maxage, warn, inactive, expire;
 };
+
+/* The aging an account gets when it is made: a change today, 0 99999 7,
+ * as shadow-utils' login.defs gives */
+#define USER_AGE_MAX_DEFAULT  99999
+#define USER_AGE_WARN_DEFAULT 7
 
 /* Boot-time entry. Must be called AFTER /data is mounted (otherwise we
  * stay with defaults and save() can't reach disk). Idempotent. */
@@ -91,6 +101,22 @@ bool users_check_password(const char *username, const char *password);
 
 /* Set (or clear) the password for username. Returns 0 on success. */
 int users_set_password(const char *username, const char *password);
+
+/* Finding 213: the shadow operations passwd and chpasswd make, by name.
+ * Each returns 0, or -1 (no such account), -2 (an unlock that would
+ * leave no password). The caller decides who may (ABI_SYS_SHADOW). */
+enum users_shadow_op {
+    USERS_SH_LOCK, USERS_SH_UNLOCK, USERS_SH_DELETE, USERS_SH_EXPIRE,
+    USERS_SH_SETHASH,             /* ARG: a hash made elsewhere, verbatim */
+};
+int users_shadow_op(const char *username, int op, const char *arg);
+/* The aging fields -- each of MIN MAX WARN INACTIVE not -2 is set (-1
+ * empties it) -- and the account's state: 0 no password, 1 one, 2 locked */
+int users_shadow_age(const char *username, int64_t minage, int64_t maxage,
+                     int64_t warn, int64_t inactive);
+int users_shadow_get(const char *username, struct user *out, int *state);
+/* Today, in days since 1970: what a change records */
+int64_t users_today(void);
 /* Remove an account from the table (2026-09-04, for userdel). 0, or -1 if
  * absent. Root (uid 0) cannot be removed. Caller persists with users_save(). */
 int users_del(const char *username);

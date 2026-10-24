@@ -207,6 +207,7 @@ C_SRCS := src/kernel.c \
           src/flock.c \
           src/ptimer.c \
           src/xattr.c \
+          src/shacrypt.c \
           src/sysvipc.c \
           src/vdso.c \
           src/pipe.c \

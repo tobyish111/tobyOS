@@ -1396,7 +1396,31 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         fremovexattr) and A-D its arguments;
                                         a set's D is size | flags << 32
                                         (finding 225) */
-#define ABI_SYS_NR_MAX          238
+#define ABI_SYS_SHADOW          239  /* (op, name, arg) -> 0|-E: an account's
+                                        aging and password state, what
+                                        shadow-utils' passwd and chpasswd
+                                        change (finding 213): ABI_SHADOW_* */
+#define ABI_SYS_NR_MAX          239
+
+#define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
+                                 account's own user */
+#define ABI_SHADOW_AGE     1  /* arg: struct abi_shadow *in -- minage,
+                                 maxage, warn, inactive; -2 leaves one,
+                                 -1 empties it; root */
+#define ABI_SHADOW_LOCK    2  /* a '!' before the hash; root */
+#define ABI_SHADOW_UNLOCK  3  /* off again; -EINVAL if no password would be
+                                 left; root */
+#define ABI_SHADOW_DELETE  4  /* no password; root */
+#define ABI_SHADOW_EXPIRE  5  /* the last change 0: change it at login */
+#define ABI_SHADOW_SETHASH 6  /* arg: a hash made elsewhere, kept as it is
+                                 (chpasswd -e); root */
+
+struct abi_shadow {
+    int64_t lastchg;          /* days since 1970; -1 empty, 0 expired */
+    int64_t minage, maxage, warn, inactive, expire;   /* days; -1 empty */
+    int32_t state;            /* 0 no password, 1 a password, 2 locked */
+    int32_t _pad;
+};
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

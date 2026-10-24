@@ -6989,6 +6989,49 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return src == 0 ? 0 : -ABI_EIO;
     }
 
+    case ABI_SYS_SHADOW: {
+        /* (op, name, arg): the account's aging and password state, as
+         * shadow-utils keeps them in /etc/shadow (finding 213). Changes are
+         * root's -- the initial namespace's, as the table is the machine's;
+         * the state is root's or the account's own user's to read. */
+        struct proc *me = current_proc();
+        if (!me) return -ABI_EPERM;
+        char user[64];
+        if (!user_str_in(user, sizeof(user), (const char *)a2)) return -ABI_EFAULT;
+        if (!user[0]) return -ABI_EINVAL;
+        bool root = me->uid == 0 && userns_is_initial(me);
+        if (a1 == ABI_SHADOW_GET) {
+            struct user u;
+            int state;
+            if (users_shadow_get(user, &u, &state) != 0) return -ABI_ENOENT;
+            if (!root && u.uid != me->uid) return -ABI_EPERM;
+            struct abi_shadow out;
+            memset(&out, 0, sizeof out);
+            out.lastchg = u.lastchg; out.minage = u.minage; out.maxage = u.maxage;
+            out.warn = u.warn; out.inactive = u.inactive; out.expire = u.expire;
+            out.state = state;
+            return copy_to_user((void *)(uintptr_t)a3, &out, sizeof out) ? -ABI_EFAULT : 0;
+        }
+        if (!root) return -ABI_EPERM;
+        int r;
+        if (a1 == ABI_SHADOW_AGE) {
+            struct abi_shadow in;
+            if (copy_from_user(&in, (const void *)(uintptr_t)a3, sizeof in)) return -ABI_EFAULT;
+            r = users_shadow_age(user, in.minage, in.maxage, in.warn, in.inactive);
+        } else if (a1 == ABI_SHADOW_SETHASH) {
+            char h[USER_PWHASH_MAX];
+            if (!user_str_in(h, sizeof h, (const char *)a3)) return -ABI_EFAULT;
+            r = users_shadow_op(user, USERS_SH_SETHASH, h);
+        } else {
+            static const int ops[] = { [ABI_SHADOW_LOCK] = USERS_SH_LOCK,
+                [ABI_SHADOW_UNLOCK] = USERS_SH_UNLOCK, [ABI_SHADOW_DELETE] = USERS_SH_DELETE,
+                [ABI_SHADOW_EXPIRE] = USERS_SH_EXPIRE };
+            if (a1 < ABI_SHADOW_LOCK || a1 > ABI_SHADOW_EXPIRE) return -ABI_EINVAL;
+            r = users_shadow_op(user, ops[a1], 0);
+        }
+        return r == 0 ? 0 : r == -2 ? -ABI_EINVAL : -ABI_ENOENT;
+    }
+
     case ABI_SYS_SOCKOPT: {
         /* native sockets live in the file table: the socket table's index is
          * NOT the fd (the first cut indexed it by fd and got EBADF) */
