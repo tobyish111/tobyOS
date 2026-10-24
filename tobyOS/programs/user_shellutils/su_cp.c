@@ -535,8 +535,9 @@ static int cpx_regular(const struct cpx_opts *o, const char *src, const char *ds
     if (o->reflink == CPX_RL_ALWAYS && !o->attr_only) {
         if (o->debug)
             printf("copy offload: unknown, reflink: unsupported, sparse detection: unknown\n");
-        /* GNU's words for EOPNOTSUPP, whatever this libc calls it */
-        su_error(0, 0, "failed to clone %s from %s: Operation not supported",
+        /* EOPNOTSUPP in this libc's words, as every error (utilgate turns
+         * glibc's "Operation not supported" into musl's, finding 225) */
+        su_error(0, EOPNOTSUPP, "failed to clone %s from %s",
                  su_quoteaf(dst), su_quoteaf(src));
         close(in);
         close(out);

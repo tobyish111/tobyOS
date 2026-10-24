@@ -4,6 +4,7 @@
  * The allocator lives in malloc.c (finding 107 rewrote it). */
 
 #include <stdlib.h>
+#include <stdio.h>              /* exit's fflush (finding 225) */
 #include <string.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -33,6 +34,9 @@ void __toby_run_atexit(void) {
 
 void exit(int code) {
     __toby_run_atexit();
+    /* every stream's output, as glibc's exit writes it -- _exit's syscall
+     * did it too, but not for a program on glibc's rules (finding 225) */
+    fflush(NULL);
     _exit(code);
 }
 

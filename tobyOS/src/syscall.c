@@ -56,7 +56,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/rtnetlink.h> /* SIOC* interface ioctls (slice 12 cut 4) */
 #include <tobyos/seccomp.h>   /* seccomp-bpf (slice 13) */
 #include <tobyos/flock.h>     /* POSIX record locks + flock (2026-08-22) */
-#include <tobyos/xattr.h>     /* extended attributes, user.* (Phase E) */
+#include <tobyos/xattr.h>     /* extended attributes (Phase E; finding 225) */
 #include <tobyos/sysvipc.h>   /* SysV sem + msg (Phase H) */
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
@@ -1984,6 +1984,8 @@ static long lx_do_setid(bool is_uid, long id);
 /* Declared here (defined with the Linux table below) because the native
  * dispatcher forwards ABI_SYS_IOCTL into it -- one tty/pty ioctl surface. */
 static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5);
+/* ...and the xattr calls into theirs (ABI_SYS_XATTR, finding 225) */
+static long lx_xattr(long n, long a1, long a2, long a3, long a4, long a5);
 
 /* Process groups, shared by BOTH ABIs for the same drift-avoidance reason
  * as lx_do_setid. Until this existed LX_setpgid was a stub that RETURNED 0
@@ -7013,6 +7015,13 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_mknod_user((int)a1, (const char *)a2, (uint32_t)a3, (uint64_t)a4);
     case ABI_SYS_FCNTL:                 /* finding 235: LX_fcntl, 72 */
         return linux_syscall_impl(72, a1, a2, a3, 0, 0);
+    case ABI_SYS_XATTR: {               /* finding 225: (lxnr, a, b, c, d) */
+        if (a1 < 188 || a1 > 199) return -ABI_EINVAL;
+        if (a1 <= 190)                  /* a set: size | flags << 32 */
+            return lx_xattr(a1, a2, a3, a4, (long)((uint64_t)a5 & 0xffffffffu),
+                            (long)((uint64_t)a5 >> 32));
+        return lx_xattr(a1, a2, a3, a4, a5, 0);
+    }
 
     case ABI_SYS_TIMES: {
         struct proc *p = current_proc();
@@ -13066,6 +13075,197 @@ static long lx_membarrier(int cmd, unsigned int flags)
     }
 }
 
+/* ---- extended attributes: Linux's rules (finding 225) --------------------
+ *
+ * What a caller may do with a name is decided here, before the filesystem
+ * (vfs_xattr) is asked, in the order Linux's VFS and security hooks ask it,
+ * for a kernel with SELinux built in and no policy loaded -- the oracle's
+ * (WSL 6.6), measured by logs/b33/xattrprobe: trusted.* needs CAP_SYS_ADMIN
+ * (a get without it is ENODATA, a list leaves it out); user.* is a regular
+ * file's or a directory's (EPERM on a link, ENODATA to read one), and a
+ * sticky directory's only for its owner; both then need the file's own
+ * permission. security.selinux is its owner's to set (or CAP_FOWNER's),
+ * any other security.* name CAP_SYS_ADMIN's, and anyone may read them;
+ * security.capability and the ACL names must hold a value of their kind
+ * (EINVAL), and ACLs are not kept (ENOTSUP for a good one); an unknown
+ * namespace is ENOTSUP, after the file's permission. The first store took
+ * user.* alone: chcon's security.selinux was ENOTSUP for everyone. */
+static bool xa_prefix(const char *name, const char *pfx) {
+    return strncmp(name, pfx, strlen(pfx)) == 0;
+}
+
+/* a struct vfs_cap_data, revision 2 (20 bytes) or 3 (24) */
+static bool xa_valid_caps(const uint8_t *v, size_t sz) {
+    if (sz < 4) return false;
+    uint32_t magic = (uint32_t)v[0] | (uint32_t)v[1] << 8 |
+                     (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
+    uint32_t rev = magic & 0xFF000000u;
+    return (rev == 0x02000000u && sz == 20) || (rev == 0x03000000u && sz == 24);
+}
+
+/* a posix_acl_xattr: version 2, then 8-byte entries */
+static bool xa_valid_acl(const uint8_t *v, size_t sz) {
+    if (sz < 4 || (sz - 4) % 8) return false;
+    return v[0] == 2 && v[1] == 0 && v[2] == 0 && v[3] == 0;
+}
+
+/* OP (XA_GET, XA_SET, XA_REMOVE) of NAME on the node ST at KPATH, VAL/SZ
+ * the value to set: 0, or the errno */
+static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
+                         const char *name, const uint8_t *val, size_t sz) {
+    struct proc *p = current_proc();
+    bool write = op != XA_GET;
+    bool admin = userns_is_initial(p) && userns_capable(LCAP_SYS_ADMIN);
+    bool owner = p && (uint32_t)p->uid == st->uid;
+    uint32_t fmt = st->mode & 0170000u;
+    bool reg = st->type == VFS_TYPE_FILE && (fmt == 0 || fmt == 0100000u);
+    bool dir = st->type == VFS_TYPE_DIR;
+    if (xa_prefix(name, "security.")) {
+        if (!write) return 0;
+        if (strcmp(name, "security.capability") == 0) {
+            if (op == XA_SET && !xa_valid_caps(val, sz)) return -ABI_EINVAL;
+            return userns_capable(LCAP_SETFCAP) ? 0 : -ABI_EPERM;
+        }
+        if (strcmp(name, "security.selinux") == 0)
+            return (owner || userns_capable(LCAP_FOWNER)) ? 0 : -ABI_EPERM;
+        return admin ? 0 : -ABI_EPERM;
+    }
+    if (xa_prefix(name, "system.")) {
+        bool acl = strcmp(name, "system.posix_acl_access") == 0 ||
+                   strcmp(name, "system.posix_acl_default") == 0;
+        if (!acl) return -ABI_ENOTSUP;
+        if (!write) return -ABI_ENODATA;           /* no ACL is kept */
+        if (op == XA_SET && !xa_valid_acl(val, sz)) return -ABI_EINVAL;
+        if (!(owner || userns_capable(LCAP_FOWNER))) return -ABI_EPERM;
+        return -ABI_ENOTSUP;
+    }
+    if (xa_prefix(name, "trusted.")) {
+        if (!admin) return write ? -ABI_EPERM : -ABI_ENODATA;
+    } else if (xa_prefix(name, "user.")) {
+        if (!reg && !dir) return write ? -ABI_EPERM : -ABI_ENODATA;
+        if (dir && (st->mode & 01000u) && write && !owner &&
+            !userns_capable(LCAP_FOWNER)) return -ABI_EPERM;
+    }
+    int pc = vfs_perm_check_st(st, write ? VFS_WANT_WRITE : VFS_WANT_READ);
+    if (pc != VFS_OK) return vfs_err_to_abi(pc);
+    (void)kpath;
+    if (!xa_prefix(name, "trusted.") && !xa_prefix(name, "user."))
+        return -ABI_ENOTSUP;                       /* no such namespace */
+    return 0;
+}
+
+/* The twelve calls: N the Linux number, the arguments as Linux takes them */
+static long lx_xattr(long n, long a1, long a2, long a3, long a4, long a5) {
+    enum { LXA_SET = 188, LXA_GET = 191, LXA_LIST = 194, LXA_REMOVE = 197 };
+    int form = (int)((n - LXA_SET) % 3);           /* 0 plain, 1 l*, 2 f* */
+    long base = n - form;
+    int op = base == LXA_SET ? XA_SET : base == LXA_GET ? XA_GET
+           : base == LXA_LIST ? XA_LIST : XA_REMOVE;
+    char xname[XATTR_NAME_MAX + 2];       /* room to see a 256th byte */
+    uint8_t *val = 0;
+    size_t sz = op == XA_LIST ? (size_t)a3 : (size_t)a4;
+    /* setxattr and removexattr read the name (and the value, the flags)
+     * before the path; getxattr after it -- Linux's order */
+    bool early = op == XA_SET || op == XA_REMOVE;
+    if (op == XA_SET && ((int)a5 & ~(XA_CREATE | XA_REPLACE))) return -ABI_EINVAL;
+    long name_err = 0;                             /* get's: after the path */
+    xname[0] = 0;
+    if (op != XA_LIST) {
+        long xnl = strncpy_from_user(xname, (const char *)a2, sizeof xname);
+        if (xnl < 0) return -ABI_EFAULT;
+        if (xnl == 0 || (size_t)xnl > XATTR_NAME_MAX) name_err = -ABI_ERANGE;
+        if (early && name_err) return name_err;
+    }
+    if (op == XA_SET) {
+        if (sz > XATTR_SIZE_MAX) return -ABI_E2BIG;
+        if (sz) {
+            val = kmalloc(sz);
+            if (!val) return -ABI_ENOMEM;
+            if (copy_from_user(val, (const void *)(uintptr_t)a3, sz)) {
+                kfree(val);
+                return -ABI_EFAULT;
+            }
+        }
+    }
+    long r;
+    char kpath[ABI_PATH_MAX];
+    if (form == 2) {
+        struct file *xf = fd_lookup((int)a1);
+        const char *fp = xf ? xf->open_path : 0;
+        if (xf && !fp && xf->kind == FILE_KIND_DIR) fp = xf->dirpath;
+        if (!xf) r = -ABI_EBADF;
+        else if (!fp) r = -ABI_ENOTSUP;            /* pathless kind (pipe, socket) */
+        else if (strlen(fp) >= sizeof kpath) r = -ABI_ENAMETOOLONG;
+        else { memcpy(kpath, fp, strlen(fp) + 1); r = 0; }
+    } else {
+        r = resolve_user_path((const char *)a1, kpath, sizeof kpath);
+        if (r == 0 && form == 0) {                 /* follow a final link */
+            struct vfs_stat ls;
+            for (int hops = 0; r == 0 && vfs_stat(kpath, &ls) == VFS_OK &&
+                               ls.type == VFS_TYPE_SYMLINK; hops++) {
+                char nx[ABI_PATH_MAX];
+                int fr;
+                if (hops >= 40) r = -ABI_ELOOP;
+                /* a dangling link names nothing: ENOENT, as chdir says */
+                else if ((fr = vfs_follow_link(kpath, nx, sizeof nx)) != VFS_OK)
+                    r = fr == VFS_ERR_LOOP ? -ABI_ELOOP : -ABI_ENOENT;
+                else memcpy(kpath, nx, strlen(nx) + 1);
+            }
+        }
+    }
+    struct vfs_stat st;
+    if (r == 0) {
+        int sr = vfs_stat(kpath, &st);
+        if (sr != VFS_OK) r = sr == VFS_ERR_NOENT ? -ABI_ENOENT : vfs_err_to_abi(sr);
+    }
+    if (r == 0 && name_err) r = name_err;
+    if (r == 0 && op != XA_LIST) r = xattr_policy(kpath, &st, op, xname, val, sz);
+    if (r != 0) { if (val) kfree(val); return r; }
+
+    if (op == XA_SET) {
+        r = vfs_xattr(kpath, XA_SET, xname, val, sz, (int)a5);
+        if (val) kfree(val);
+        return r;
+    }
+    if (op == XA_REMOVE) return vfs_xattr(kpath, XA_REMOVE, xname, 0, 0, 0);
+    if (op == XA_GET) {
+        if (sz == 0) return vfs_xattr(kpath, XA_GET, xname, 0, 0, 0);
+        if (sz > XATTR_SIZE_MAX) sz = XATTR_SIZE_MAX;
+        uint8_t *gb = kmalloc(sz);
+        if (!gb) return -ABI_ENOMEM;
+        long gr = vfs_xattr(kpath, XA_GET, xname, gb, sz, 0);
+        if (gr > 0 && copy_to_user((void *)(uintptr_t)a3, gb, (size_t)gr)) gr = -ABI_EFAULT;
+        kfree(gb);
+        return gr;
+    }
+    /* the list: every name the caller may see -- trusted.* for
+     * CAP_SYS_ADMIN alone -- its size when SZ is 0 */
+    long need = vfs_xattr(kpath, XA_LIST, 0, 0, 0, 0);
+    if (need < 0) return need == -ABI_ENOTSUP ? 0 : need;
+    if (need == 0) return 0;
+    char *lb = kmalloc((size_t)need);
+    if (!lb) return -ABI_ENOMEM;
+    long got = vfs_xattr(kpath, XA_LIST, 0, lb, (size_t)need, 0);
+    if (got < 0) { kfree(lb); return got; }
+    struct proc *p = current_proc();
+    bool admin = userns_is_initial(p) && userns_capable(LCAP_SYS_ADMIN);
+    size_t keep = 0;
+    for (long o = 0; o < got; ) {
+        size_t l = strlen(lb + o) + 1;
+        if (admin || !xa_prefix(lb + o, "trusted.")) {
+            memmove(lb + keep, lb + o, l);
+            keep += l;
+        }
+        o += (long)l;
+    }
+    if (keep > XATTR_LIST_MAX) r = -ABI_E2BIG;
+    else if (sz == 0) r = (long)keep;
+    else if (sz < keep) r = -ABI_ERANGE;
+    else r = copy_to_user((void *)(uintptr_t)a2, lb, keep) ? -ABI_EFAULT : (long)keep;
+    kfree(lb);
+    return r;
+}
+
 static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long a5) {
     {
         uint32_t i = g_lx_recent_i++ % LX_RECENT;
@@ -13867,77 +14067,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return (long)old;
     }
 
-    /* ---- extended attributes (Phase E, 2026-08-22) ----------------------
-     * Twelve entry points, one store (src/xattr.c), user.* namespace. The
-     * l* forms behave as the plain ones (the resolver follows symlinks;
-     * symlink-own attributes are not modelled). The f* forms resolve the
-     * descriptor through its stamped open_path -- exactly the calls cp -a
-     * makes (fgetxattr/flistxattr on the source fd, fsetxattr on the
-     * destination fd), which is what forced open_path to exist. */
+    /* ---- extended attributes (Phase E; Linux's rules, finding 225) ------
+     * Twelve entry points over vfs_xattr: the plain forms follow a final
+     * link, the l* forms take the link itself, the f* forms the open
+     * file's path -- the calls cp -a makes (fgetxattr/flistxattr on the
+     * source fd, fsetxattr on the destination fd). Which names a caller may
+     * touch is xattr_policy's, asked before the filesystem as Linux's VFS
+     * and security hooks ask it. */
     case LX_setxattr: case LX_lsetxattr: case LX_fsetxattr:
     case LX_getxattr: case LX_lgetxattr: case LX_fgetxattr:
     case LX_listxattr: case LX_llistxattr: case LX_flistxattr:
-    case LX_removexattr: case LX_lremovexattr: case LX_fremovexattr: {
-        bool fd_form = (n == LX_fsetxattr || n == LX_fgetxattr ||
-                        n == LX_flistxattr || n == LX_fremovexattr);
-        char kpath[ABI_PATH_MAX];
-        if (fd_form) {
-            struct file *xf = fd_lookup((int)a1);
-            if (!xf) return -ABI_EBADF;
-            const char *p = xf->open_path;
-            if (!p && xf->kind == FILE_KIND_DIR) p = xf->dirpath;
-            if (!p) return -ABI_ENOTSUP;    /* pathless kind (pipe, socket) */
-            size_t pl = strlen(p);
-            if (pl >= sizeof kpath) return -ABI_ENAMETOOLONG;
-            memcpy(kpath, p, pl + 1);
-        } else {
-            int rr = resolve_user_path((const char *)a1, kpath, sizeof kpath);
-            if (rr != 0) return rr;            /* EACCES too (finding 188) */
-            struct vfs_stat xs;
-            if (vfs_stat(kpath, &xs) != VFS_OK) return -ABI_ENOENT;
-        }
-        /* list takes (path, buf, size) -- no name argument. */
-        if (n == LX_listxattr || n == LX_llistxattr || n == LX_flistxattr) {
-            size_t sz = (size_t)a3;
-            if (sz == 0) return xattr_list(kpath, 0, 0);
-            char lbuf[512];
-            if (sz > sizeof lbuf) sz = sizeof lbuf;
-            long lr = xattr_list(kpath, lbuf, sz);
-            if (lr > 0 && copy_to_user((void *)(uintptr_t)a2, lbuf, (size_t)lr))
-                return -ABI_EFAULT;
-            return lr;
-        }
-        char xname[64];
-        long xnl = strncpy_from_user(xname, (const char *)a2, sizeof xname);
-        if (xnl < 0) return -ABI_EFAULT;
-        if ((size_t)xnl >= sizeof xname - 1) return -ABI_ERANGE;
-        if (n == LX_removexattr || n == LX_lremovexattr || n == LX_fremovexattr)
-            return xattr_remove(kpath, xname);
-        if (n == LX_setxattr || n == LX_lsetxattr || n == LX_fsetxattr) {
-            size_t sz = (size_t)a4;
-            uint8_t val[256];
-            if (sz > sizeof val) return -ABI_E2BIG;
-            if (sz && copy_from_user(val, (const void *)(uintptr_t)a3, sz))
-                return -ABI_EFAULT;
-            return xattr_set(kpath, xname, val, sz, (int)a5);
-        }
-        /* the get forms */
-        size_t sz = (size_t)a4;
-        if (sz == 0) return xattr_get(kpath, xname, 0, 0);   /* size probe */
-        uint8_t val[256];
-        if (sz > sizeof val) sz = sizeof val;   /* store caps values at 256 */
-        long gr = xattr_get(kpath, xname, val, sz);
-        if (gr > 0 && copy_to_user((void *)(uintptr_t)a3, val, (size_t)gr))
-            return -ABI_EFAULT;
-        return gr;
-    }
+    case LX_removexattr: case LX_lremovexattr: case LX_fremovexattr:
+        return lx_xattr(n, a1, a2, a3, a4, a5);
 
-    /* mknod(2)/mknodat(2). S_IFREG (or fmt 0, which POSIX defines as
-     * "regular") really creates the file; FIFOs and device nodes have no
-     * VFS representation, so those return EPERM -- the same errno an
-     * unprivileged caller gets for device nodes on Linux, and the one
-     * tar/rsync already know to downgrade to a warning. The file's mode is
-     * the one asked for less the umask, as open's is. */
+    /* mknod(2)/mknodat(2): sys_mknod_user, Linux's order of answers -- a
+     * file, a FIFO, a socket, or (CAP_MKNOD) a device node that opens the
+     * device its numbers name (finding 214). */
     case LX_mknod:                      /* Linux's order of answers (214) */
         return sys_mknod_user(-100, (const char *)a1, (uint32_t)a2, (uint64_t)a3);
     case LX_mknodat:

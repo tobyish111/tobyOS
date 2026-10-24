@@ -71,6 +71,10 @@ extern int errno;
  * strerror. */
 #define EOVERFLOW       75
 #define ENODATA         61      /* no data: GNU stat's %C without SELinux */
+/* finding 225: an attribute namespace no filesystem keeps (Linux's 95;
+ * strerror's words are musl's, "Not supported") */
+#define EOPNOTSUPP      95
+#define ENOTSUP         EOPNOTSUPP
 
 /* GNU-flavoured strerror_r returns the message pointer. */
 const char *strerror(int err);

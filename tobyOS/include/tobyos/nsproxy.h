@@ -370,5 +370,7 @@ struct net_dev *net_ctx_dev(void);
 #define LCAP_SYS_CHROOT 18
 #define LCAP_SYS_ADMIN  21
 #define LCAP_MKNOD      27
+#define LCAP_FOWNER     3
+#define LCAP_SETFCAP    31
 
 #endif /* TOBYOS_NSPROXY_H */

@@ -277,6 +277,12 @@ struct vfs_ops {
      * the filesystem keeps no device nodes, and mknod of one is EPERM, as
      * Linux's vfat says. */
     int  (*setrdev) (void *mnt, const char *path, uint32_t maj, uint32_t min);
+    /* (optional) Extended attributes kept with the filesystem's nodes, as
+     * Linux's tmpfs keeps them (finding 225): enum xa_op on PATH -- the
+     * node itself, a final link not followed -- as xa_list_op answers.
+     * NULL: the VFS's path store holds them (src/xattr.c). */
+    long (*xattr)   (void *mnt, const char *path, int op, const char *name,
+                     void *buf, size_t sz, int flags);
     /* The filesystem's TYPE as Linux names it ("tmpfs", "proc", "ext4"):
      * /proc/mounts' third field, mountinfo's, mount(8)'s "type". Every
      * mount said "tobyos" (batch 31). NULL: "tobyos". */
@@ -422,6 +428,12 @@ int vfs_mksock(const char *path, uint32_t mode);
 /* Finding 214: a device node, MODE's format S_IFCHR or S_IFBLK, numbers
  * MAJ:MIN. VFS_ERR_NOTPERM on a filesystem that keeps no device nodes. */
 int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min);
+/* Finding 225: an extended-attribute operation (enum xa_op) on PATH, the
+ * node itself: the filesystem's ->xattr, else the path store; ENOTSUP
+ * where Linux keeps none (proc, sysfs, devtmpfs, cgroup2, vfat, cifs).
+ * Returns what xa_list_op does -- an ABI-negative errno, not a VFS one. */
+long vfs_xattr(const char *path, int op, const char *name, void *buf,
+               size_t sz, int flags);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 

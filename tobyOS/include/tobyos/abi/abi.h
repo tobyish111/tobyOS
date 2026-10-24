@@ -1390,7 +1390,13 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         fcntl(2), the Linux personality's --
                                         Linux's commands and flags; libtoby's
                                         fcntl was a stub (finding 235) */
-#define ABI_SYS_NR_MAX          237
+#define ABI_SYS_XATTR           238  /* (lxnr, a, b, c, d) -> the answer|-E:
+                                        the twelve xattr calls, LXNR Linux's
+                                        number (188 setxattr .. 199
+                                        fremovexattr) and A-D its arguments;
+                                        a set's D is size | flags << 32
+                                        (finding 225) */
+#define ABI_SYS_NR_MAX          238
 
 #define ABI_UTIME_NOW           ((1L << 30) - 1L)   /* Linux's values */
 #define ABI_UTIME_OMIT          ((1L << 30) - 2L)

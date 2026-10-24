@@ -29,7 +29,7 @@ for n in rmdir yes tac seq whoami which uname free sync stat du xargs nohup \
          timeout watch dd printenv nice pgrep pkill tty stty cksum truncate \
          install mkfifo date touch sort script hwclock \
          arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-         shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do
+         shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon getfattr setfattr head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do
     ln -sf /tmp/suhost/shellutils /tmp/suhost/bin/$n
 done
 echo "suhost: built /tmp/suhost/shellutils"

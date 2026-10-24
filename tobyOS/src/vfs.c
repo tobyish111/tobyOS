@@ -21,6 +21,8 @@
 #include <tobyos/slog.h>
 #include <tobyos/perf.h>
 #include <tobyos/nsproxy.h>   /* ns_inum_alloc, NS_INUM_INIT_MNT (slice 9) */
+#include <tobyos/xattr.h>     /* vfs_xattr's path store (finding 225) */
+#include <tobyos/abi/abi.h>   /* ...whose answers are ABI errnos */
 
 struct vfs_mount {
     char                  point[VFS_PATH_MAX];   /* "/", "/data", ... no trailing '/' (except root) */
@@ -1380,6 +1382,22 @@ int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min) {
     rc = m->ops->setrdev(m->data, rel, maj, min);
     if (rc != VFS_OK) (void)vfs_unlink(path);
     return rc;
+}
+
+long vfs_xattr(const char *path, int op, const char *name, void *buf,
+               size_t sz, int flags) {
+    const char *rel;
+    struct vfs_mount *m = resolve(path, &rel);
+    if (!m) return -ABI_ENOENT;
+    if ((op == XA_SET || op == XA_REMOVE) && (m->flags & VFS_MNT_RDONLY))
+        return -ABI_EROFS;
+    if (m->ops->xattr) return m->ops->xattr(m->data, rel, op, name, buf, sz, flags);
+    static const char *const none[] = { "proc", "sysfs", "devtmpfs", "cgroup2",
+                                        "vfat", "cifs" };
+    const char *fs = m->ops->fsname ? m->ops->fsname : "tobyos";
+    for (unsigned i = 0; i < sizeof none / sizeof none[0]; i++)
+        if (strcmp(fs, none[i]) == 0) return -ABI_ENOTSUP;
+    return xattr_store(path, op, name, buf, sz, flags);
 }
 
 /* Defined with the symlink table further down; declared here because

@@ -167,6 +167,7 @@ static char *first_line(char *s) {
 #include "su_stdbuf.c"
 #include "su_chcon.c"
 #include "su_runcon.c"
+#include "su_attr.c"
 #include "su_txio.c"
 #include "su_head.c"
 #include "su_tail.c"
@@ -198,6 +199,11 @@ int main(int argc, char **argv) {
     for (const char *p = base; *p; p++) if (*p == '/') base = p + 1;
     prog = base;
     su_set_name(argv[0]);
+#ifndef SU_HOST
+    /* GNU's commands, on glibc's buffering: output waits as theirs does
+     * (diff -l's own lines after pr's pages; finding 225) */
+    __toby_stdio_like_glibc();
+#endif
 
     if (!strcmp(base, "rmdir"))   return do_rmdir(argc, argv);
     if (!strcmp(base, "yes"))     return do_yes(argc, argv);
@@ -308,6 +314,8 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "stdbuf"))    return do_stdbuf(argc, argv);
     if (!strcmp(base, "chcon"))     return do_chcon(argc, argv);
     if (!strcmp(base, "runcon"))    return do_runcon(argc, argv);
+    if (!strcmp(base, "getfattr"))  return do_getfattr(argc, argv);
+    if (!strcmp(base, "setfattr"))  return do_setfattr(argc, argv);
     if (!strcmp(base, "head"))      return do_head(argc, argv);
     if (!strcmp(base, "tail"))      return do_tail(argc, argv);
     if (!strcmp(base, "wc"))        return do_wc(argc, argv);

@@ -3340,7 +3340,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
 	           cksum truncate install mkfifo date touch sort script hwclock \
            arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
+           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon getfattr setfattr head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -4225,6 +4225,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/user_e2fs bin/dumpe2fs bin/e2fsck bin/debugfs bin/badblocks bin/resize2fs    \
 	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
 	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
+	    bin/getfattr bin/setfattr                                         \
 	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
 	    bin/sha224sum bin/sha384sum bin/sha256sum bin/sha512sum \
 	    bin/md5sum bin/sha1sum bin/base64 bin/base32                                       \

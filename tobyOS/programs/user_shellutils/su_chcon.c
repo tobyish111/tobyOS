@@ -27,26 +27,20 @@
  * name of it). -v says "changing security context of 'F'" before each.
  * The status is 1 when anything failed.
  *
- * ON TOBYOS the kernel keeps only user.* attributes: it refuses to set a
- * security.* one (ENOTSUP) and has none to give (ENODATA), and libtoby
- * has no xattr calls -- so a set there answers ENOTSUP and a get ENODATA,
- * exactly as the kernel would, once the file is known to exist: "failed
- * to change context of 'f' to 'x': Operation not supported".
+ * On tobyOS the kernel keeps security.* attributes as a kernel with
+ * SELinux built in and no policy loaded keeps them -- the file's owner may
+ * set security.selinux -- and libtoby has the xattr calls (finding 225),
+ * so chcon is the same code natively as on Linux. Until then the native
+ * one answered ENOTSUP to every change and ENODATA to every read.
  *
  * The old chcon refused everything with "SELinux is not enabled". */
 
-#ifdef SU_HOST
 #include <sys/xattr.h>
-#endif
 
 #define SY_CCATTR "security.selinux"
-#ifndef ENOTSUP
-#define ENOTSUP 95          /* Linux's number; libtoby's errno.h has no name for it */
-#endif
 
 /* the context of PATH into a malloc'd string, or 0 and errno */
 static char *sy_ccget(const char *path, int follow) {
-#ifdef SU_HOST
     for (;;) {
         ssize_t n = follow ? getxattr(path, SY_CCATTR, 0, 0) : lgetxattr(path, SY_CCATTR, 0, 0);
         if (n < 0) return 0;
@@ -61,25 +55,11 @@ static char *sy_ccget(const char *path, int follow) {
         b[m] = 0;
         return b;
     }
-#else
-    struct stat st;
-    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return 0;
-    errno = ENODATA;
-    return 0;
-#endif
 }
 
 static int sy_ccset(const char *path, const char *ctx, int follow) {
-#ifdef SU_HOST
     size_t n = strlen(ctx) + 1;
     return follow ? setxattr(path, SY_CCATTR, ctx, n, 0) : lsetxattr(path, SY_CCATTR, ctx, n, 0);
-#else
-    (void)ctx;
-    struct stat st;
-    if ((follow ? stat(path, &st) : lstat(path, &st)) != 0) return -1;
-    errno = ENOTSUP;
-    return -1;
-#endif
 }
 
 static struct {

@@ -43,7 +43,11 @@ static inline long raw_sc6(long n, long a, long b, long c, long d, long e,
  * coalesced. exit() and _exit() are syscalls too, so nothing printed is
  * lost at exit. */
 #define STDIO_SYNC() \
-    do { if (__builtin_expect(__toby_stdio_pending, 0)) __toby_stdio_flush_all(); } while (0)
+    do { if (__builtin_expect(__toby_stdio_pending, 0) && __toby_stdio_eager) \
+             __toby_stdio_flush_all(); } while (0)
+/* (A program that asked for glibc's rules -- __toby_stdio_like_glibc, the
+ * GNU-shaped commands -- is left alone: its output waits as glibc's would,
+ * and exit() writes it out; finding 225.) */
 
 long toby_sc_raw0(long n)                         { return raw_sc6(n, 0, 0, 0, 0, 0, 0); }
 long toby_sc_raw3(long n, long a, long b, long c) { return raw_sc6(n, a, b, c, 0, 0, 0); }

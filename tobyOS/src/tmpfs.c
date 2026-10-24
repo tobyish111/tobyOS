@@ -47,6 +47,8 @@
 #include <tobyos/klibc.h>
 #include <tobyos/proc.h>       /* a link's owner: the caller (tmpfs_symlink) */
 #include <tobyos/pmm.h>        /* the default size: half of RAM (finding 231) */
+#include <tobyos/xattr.h>      /* a node's attributes (finding 225) */
+#include <tobyos/abi/abi.h>
 
 /* Same source tobyfs uses for a wall-clock timestamp (see tfs_now_secs). */
 static uint64_t tmpfs_now_secs(void) {
@@ -137,6 +139,7 @@ struct tmpfs_node {
     uint32_t      nent;                 /* a directory's entries (238) */
     size_t        pages;                /* its size's pages, charged (243) */
     uint32_t      rmaj, rmin;           /* a device node's numbers (214) */
+    struct xa_list *xattrs;             /* its attributes, the owner's (225) */
 };
 
 /* The pages of N bytes, which Linux's tmpfs charges a file (243) */
@@ -162,6 +165,7 @@ struct tmpfs_mount {
     uint64_t            root_mtime;/* its last entry change, 0 for none (238) */
     uint32_t            root_nent; /* the root's entries (238) */
     uint64_t            next_seq;  /* the next node's creation number */
+    struct xa_list     *root_xattrs; /* the root's attributes (225) */
 };
 
 static struct tmpfs_mount g_tmpfs[TMPFS_MAX_MOUNTS];
@@ -260,6 +264,7 @@ static void treap(struct tmpfs_node *nd)
     if (m && nd->data) m->bytes -= nd->cap;
     if (m) m->pages -= nd->pages;
     if (nd->data) kfree(nd->data);
+    xa_list_free(&nd->xattrs);             /* they die with the node (225) */
     memset(nd, 0, sizeof *nd);
 }
 
@@ -753,6 +758,29 @@ static void tnode_stat(struct tmpfs_mount *m, struct tmpfs_node *nd,
     out->rmin  = nd->rmin;
 }
 
+/* Extended attributes on the node, as Linux's tmpfs keeps them (finding
+ * 225): the owner's list, so hard links share it and a rename keeps it,
+ * and treap frees it with the node. PATH is the node itself -- a link is
+ * not followed (lsetxattr's). A change is a change of the inode: ctime. */
+static long tmpfs_xattr(void *mnt, const char *path, int op, const char *name,
+                        void *buf, size_t sz, int flags)
+{
+    struct tmpfs_mount *m = mnt;
+    char norm[VFS_PATH_MAX];
+    if (!tnorm(path, norm, sizeof norm)) return -ABI_EINVAL;
+    struct tmpfs_node *nd = 0;
+    struct xa_list **head = &m->root_xattrs;
+    if (*norm) {
+        nd = tfind(m, norm);
+        if (!nd) return -ABI_ENOENT;
+        head = &nd->xattrs;
+    }
+    long r = xa_list_op(head, op, name, buf, sz, flags);
+    if (r == 0 && nd && (op == XA_SET || op == XA_REMOVE))
+        nd->ctime = tmpfs_now_secs();
+    return r;
+}
+
 /* A device node's numbers, on the node mknod has just made (finding 214):
  * tmpfs keeps them, as Linux's does, and open finds the device by them. */
 static int tmpfs_setrdev(void *mnt, const char *path, uint32_t maj, uint32_t min)
@@ -1047,7 +1075,9 @@ static int tmpfs_umount(void *mnt)
     for (size_t i = 0; i < m->nnodes; i++) {
         struct tmpfs_node *nd = tnode(m, i);
         if (nd->used && nd->data) kfree(nd->data);
+        if (nd->used) xa_list_free(&nd->xattrs);
     }
+    xa_list_free(&m->root_xattrs);
     for (size_t c = 0; c < m->nnodes / TMPFS_CHUNK_NODES; c++)
         kfree(m->chunks[c]);
     kfree(m->chunks);
@@ -1081,6 +1111,7 @@ static const struct vfs_ops tmpfs_ops = {
     .statfs    = tmpfs_statfs,   /* Phase H */
     .fstat     = tmpfs_fstat,
     .setrdev   = tmpfs_setrdev,  /* finding 214 */
+    .xattr     = tmpfs_xattr,    /* finding 225 */
 };
 
 /* Parse a numeric mount option, `size=` or `nr_inodes=`. Accepts a plain

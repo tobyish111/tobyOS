@@ -562,6 +562,16 @@ static int g_streams_lock;
 /* Set when any stream may hold unwritten output; the syscall trampolines
  * test it (see syscall.c). Cleared by a complete flush. */
 volatile int __toby_stdio_pending;
+/* 1: every syscall writes out pending output first (K5), for the native
+ * userland written against unbuffered stdio. 0: glibc's rules, for a
+ * program that asks (__toby_stdio_like_glibc) -- output waits in its
+ * buffer until it fills, a line ends on a terminal, fflush, or exit; a
+ * read from a terminal-buffered input stream writes out the line-buffered
+ * ones. GNU diff -l's own lines come after pr's pages that way, and the
+ * eager rule put them first (finding 225). */
+int __toby_stdio_eager = 1;
+
+void __toby_stdio_like_glibc(void) { __toby_stdio_eager = 0; }
 /* Set by pthread_create: from then on streams are locked. */
 volatile int __toby_stdio_threaded;
 
@@ -625,6 +635,19 @@ void __toby_stdio_flush_all(void) {
     if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
 }
 
+/* glibc's flush before a read from a line-buffered or unbuffered input
+ * stream: every line-buffered output stream's pending bytes */
+static void flush_linebuffered(void) {
+    if (__toby_stdio_threaded) spin_lock_bounded(&g_streams_lock);
+    for (FILE *f = g_streams; f; f = f->next) {
+        if (f->dir != 2 || f->mode != _IOLBF) continue;
+        if (!ftrylock_(f)) continue;
+        stream_flush_out(f);
+        funlock_(f);
+    }
+    if (__toby_stdio_threaded) spin_unlock(&g_streams_lock);
+}
+
 /* The public raw helper (abort/assert paths): what is pending goes first. */
 long __toby_raw_write(int fd, const void *buf, size_t n) {
     __toby_stdio_flush_all();
@@ -666,7 +689,8 @@ static int stream_write(FILE *f, const char *s, size_t n) {
     stream_decide_mode(f);
     stream_get_buf(f);
     if (f->mode == _IONBF || !f->buf) {
-        __toby_stdio_flush_all();           /* keep program order across fds */
+        if (__toby_stdio_eager)
+            __toby_stdio_flush_all();       /* keep program order across fds */
         if (raw_write_all(f->fd, s, n) < 0) { f->err = 1; return EOF; }
         return 0;
     }
@@ -694,7 +718,11 @@ static long stream_fill(FILE *f) {
     size_t want = f->cap;
     if (f->mode == _IONBF || !f->buf) { dst = &f->one; want = 1; }
     /* toby_sc3, not the raw form: output pending on ANY stream goes out
-     * before this process can block for input (a prompt, a coprocess). */
+     * before this process can block for input (a prompt, a coprocess) --
+     * under glibc's rules the line-buffered streams, for a read of a
+     * line-buffered or unbuffered stream (a terminal) */
+    if (!__toby_stdio_eager && (f->mode == _IOLBF || f->mode == _IONBF))
+        flush_linebuffered();
     long r = toby_sc3(ABI_SYS_READ, f->fd, (long)(uintptr_t)dst, (long)want);
     if (r <= 0) {
         /* a failed read leaves errno saying why, as the write side does

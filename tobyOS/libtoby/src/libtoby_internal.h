@@ -32,6 +32,7 @@ long toby_sc_raw3(long n, long a, long b, long c);
  * makes before entering the kernel when there is any. */
 extern volatile int __toby_stdio_pending;
 extern volatile int __toby_stdio_threaded;
+extern int __toby_stdio_eager;          /* 0: glibc's rules (finding 225) */
 void __toby_stdio_flush_all(void);
 
 /* If rv looks like a -ABI_E* code (rv in [-4095, -1]), set errno and

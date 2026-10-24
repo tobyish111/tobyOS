@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/xattr.h>
 #include <errno.h>
 #include <stdarg.h>
 #include "libtoby_internal.h"
@@ -289,6 +290,56 @@ int mknod(const char *path, mode_t mode, dev_t dev) {
 /* chroot(2), the kernel's (finding 214; there was none) */
 int chroot(const char *path) {
     return (int)__toby_check(toby_sc1(ABI_SYS_CHROOT, (long)(uintptr_t)path));
+}
+
+/* The twelve extended-attribute calls (finding 225; there were none):
+ * ABI_SYS_XATTR carries Linux's number for each -- 188 setxattr, then
+ * lsetxattr, fsetxattr, getxattr (191), lgetxattr, fgetxattr, listxattr
+ * (194), llistxattr, flistxattr, removexattr (197), lremovexattr,
+ * fremovexattr -- and a set's flags above its size. */
+static long xa_call(long nr, long a, long b, long c, long d) {
+    return __toby_check(toby_sc5(ABI_SYS_XATTR, nr, a, b, c, d));
+}
+static long xa_set(long nr, long target, const char *name, const void *value,
+                   size_t size, int flags) {
+    return xa_call(nr, target, (long)(uintptr_t)name, (long)(uintptr_t)value,
+                   (long)((uint64_t)size | (uint64_t)(uint32_t)flags << 32));
+}
+int setxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(188, (long)(uintptr_t)path, name, value, size, flags);
+}
+int lsetxattr(const char *path, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(189, (long)(uintptr_t)path, name, value, size, flags);
+}
+int fsetxattr(int fd, const char *name, const void *value, size_t size, int flags) {
+    return (int)xa_set(190, fd, name, value, size, flags);
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+    return xa_call(191, (long)(uintptr_t)path, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+    return xa_call(192, (long)(uintptr_t)path, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t fgetxattr(int fd, const char *name, void *value, size_t size) {
+    return xa_call(193, fd, (long)(uintptr_t)name, (long)(uintptr_t)value, (long)size);
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+    return xa_call(194, (long)(uintptr_t)path, (long)(uintptr_t)list, (long)size, 0);
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+    return xa_call(195, (long)(uintptr_t)path, (long)(uintptr_t)list, (long)size, 0);
+}
+ssize_t flistxattr(int fd, char *list, size_t size) {
+    return xa_call(196, fd, (long)(uintptr_t)list, (long)size, 0);
+}
+int removexattr(const char *path, const char *name) {
+    return (int)xa_call(197, (long)(uintptr_t)path, (long)(uintptr_t)name, 0, 0);
+}
+int lremovexattr(const char *path, const char *name) {
+    return (int)xa_call(198, (long)(uintptr_t)path, (long)(uintptr_t)name, 0, 0);
+}
+int fremovexattr(int fd, const char *name) {
+    return (int)xa_call(199, fd, (long)(uintptr_t)name, 0, 0);
 }
 
 /* The link itself, S_IFLNK; stat() follows it. There was no lstat, and

@@ -69,6 +69,10 @@ int    fclose  (FILE *f);
 size_t fread   (void *buf, size_t sz, size_t n, FILE *f);
 size_t fwrite  (const void *buf, size_t sz, size_t n, FILE *f);
 int    fflush  (FILE *f);
+/* libtoby: write pending output out only as glibc does -- full buffer, a
+ * line's end on a terminal, fflush, exit -- not before every system call,
+ * as the rest of the native userland has it (finding 225) */
+void   __toby_stdio_like_glibc(void);
 int    fseek   (FILE *f, long off, int whence);
 long   ftell   (FILE *f);
 void   rewind  (FILE *f);
