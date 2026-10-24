@@ -195,6 +195,56 @@ bool cow_copy_page(uint64_t old_phys, uint64_t *pte) {
     return true;
 }
 
+/* Finding 256: ptrace's POKE and process_vm_writev wrote through to whatever
+ * frame T mapped -- after a fork, the frame the parent still held, so a
+ * write into the child landed in the parent; and with an initrd program's
+ * text shared by every process running it (finding 247), a breakpoint would
+ * have landed in all of them. A shared frame is copied out first, the
+ * entry swapped by compare-and-exchange (T may fault on it meanwhile), and
+ * every other CPU's TLB flushed: T may be running on one. */
+uint64_t vmm_frame_for_write(struct proc *t, uint64_t va, bool force) {
+    if (!t || !t->cr3) return 0;
+    uint64_t *pte = get_pte(t->cr3, va & ~(uint64_t)(PAGE_SIZE - 1));
+    if (!pte) return 0;
+    uint64_t hhdm = vmm_hhdm_offset();
+    for (;;) {
+        uint64_t old = __atomic_load_n(pte, __ATOMIC_ACQUIRE);
+        if (!(old & PTE_PRESENT) || !(old & PTE_USER)) return 0;
+        uint64_t phys = old & PTE_ADDR_MASK;
+        if (old & PTE_SHARED) return phys;     /* MAP_SHARED: everyone's */
+        bool cow = (old & PTE_COW) != 0;
+        if (old & PTE_WRITABLE) return phys;   /* private and writable */
+        if (!cow && !force) return 0;          /* T could not write it */
+        if (page_ref_get(phys) <= 1) {
+            if (!cow) return phys;             /* private, read-only: POKE */
+            /* T's alone: writable now, as T's own write would make it */
+            uint64_t nw = (old | PTE_WRITABLE) & ~PTE_COW;
+            if (!__atomic_compare_exchange_n(pte, &old, nw, false,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                continue;
+            tlb_shootdown_remote();
+            return phys;
+        }
+        uint64_t np = pmm_alloc_page();
+        if (!np) return 0;
+        memcpy((void *)(np + hhdm), (void *)(phys + hhdm), PAGE_SIZE);
+        page_ref_inc(np);
+        /* a CoW page was T's to write: writable now; a read-only one stays
+         * read-only, only private */
+        uint64_t nw = cow ? (((old & ~PTE_ADDR_MASK) | np | PTE_WRITABLE) & ~PTE_COW)
+                          : ((old & ~PTE_ADDR_MASK) | np);
+        if (!__atomic_compare_exchange_n(pte, &old, nw, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            page_ref_dec(np);
+            pmm_free_page(np);
+            continue;
+        }
+        if (page_ref_dec_old(phys) <= 1) pmm_free_page(phys);
+        tlb_shootdown_remote();
+        return np;
+    }
+}
+
 /* ---- VMA helpers ---- */
 
 struct vm_space *vm_space_for_proc(struct proc *p) {

@@ -54,6 +54,7 @@
 #include <tobyos/klibc.h>
 #include <tobyos/uaccess.h>
 #include <tobyos/isr.h>     /* struct regs: the exception-stop frame */
+#include <tobyos/page_fault.h>   /* vmm_frame_for_write (finding 256) */
 
 /* Linux request numbers. */
 #define PT_TRACEME       0
@@ -255,12 +256,12 @@ static int peek_word(struct proc *t, uint64_t va, uint64_t *out)
 
 static int poke_word(struct proc *t, uint64_t va, uint64_t val)
 {
+    /* through a frame of T's own: a shared one (after a fork, or an initrd
+     * program's text) is copied out first (finding 256) */
     const uint8_t *b = (const uint8_t *)&val;
     for (int i = 0; i < 8; i++) {
         uint64_t a = va + (uint64_t)i;
-        uint64_t s2 = vmm_set_editor_root(t->cr3);
-        uint64_t ph = vmm_translate(a & ~(uint64_t)(PAGE_SIZE - 1));
-        vmm_set_editor_root(s2);
+        uint64_t ph = vmm_frame_for_write(t, a, true);
         if (!ph) return -1;
         *((uint8_t *)pmm_phys_to_virt(ph) + (a & (PAGE_SIZE - 1))) = b[i];
     }

@@ -13078,9 +13078,17 @@ static long lx_process_vm_rw(int pid, uint64_t liov_u, unsigned long liovcnt,
         uint64_t n = lrem < rrem ? lrem : rrem;
         if (n > page_left) n = page_left;
 
-        uint64_t saved = vmm_set_editor_root(tcr3);
-        uint64_t rphys = vmm_translate(rva & ~(uint64_t)(PAGE_SIZE - 1));
-        vmm_set_editor_root(saved);
+        uint64_t rphys;
+        if (write) {
+            /* a page of the target's own, and one it could write itself
+             * (finding 256: through to a frame its parent still held, and
+             * into read-only pages) */
+            rphys = vmm_frame_for_write(tgt, rva, false);
+        } else {
+            uint64_t saved = vmm_set_editor_root(tcr3);
+            rphys = vmm_translate(rva & ~(uint64_t)(PAGE_SIZE - 1));
+            vmm_set_editor_root(saved);
+        }
         if (!rphys) break;            /* unmapped: a partial transfer is legal */
         uint8_t *rk = (uint8_t *)pmm_phys_to_virt(rphys) +
                       (rva & (PAGE_SIZE - 1));

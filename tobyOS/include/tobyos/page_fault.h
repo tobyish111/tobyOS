@@ -84,6 +84,13 @@ uint64_t *get_pte(uint64_t cr3, uint64_t virt_addr);
 /* Allocate a new page, copy 4KB from old_phys, update *new_pte. */
 bool cow_copy_page(uint64_t old_phys, uint64_t *pte);
 
+/* The frame behind user address VA of T, safe to write through from
+ * outside T (finding 256): a frame another address space still holds is
+ * copied into T's alone first. FORCE is ptrace's POKE (Linux's FOLL_FORCE:
+ * a read-only page too, kept read-only); without it -- process_vm_writev --
+ * a page T itself could not write is refused. 0 for no such page. */
+uint64_t vmm_frame_for_write(struct proc *t, uint64_t va, bool force);
+
 /* Get the vm_space for a given process. */
 struct vm_space *vm_space_for_proc(struct proc *p);
 
