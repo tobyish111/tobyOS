@@ -366,9 +366,16 @@ static void ck_unescape(char *s) {
     *w = 0;
 }
 
-/* LINE: its algorithm, BLAKE2b bits, digest and file name; 0, or -1 */
+/* LINE: its algorithm, BLAKE2b bits, digest and file name; 0, or -1.
+ * md5sum -c's reading of a line (finding 215: cksum's was stricter than
+ * GNU's): blanks before it and a '\' marking escaped names, a tag with or
+ * without a space before its '(' and blanks either side of the '=' after
+ * the last ')', and an untagged digest followed by two characters (a
+ * space and ' ' or '*') or by one space -- whichever *LAYOUT (-1 until
+ * the first such line) says the list uses. */
 static int ck_parse_line(const struct ck_opts *o, char *line, int *algo, int *bits,
-                         uint8_t *dig, char **name) {
+                         uint8_t *dig, char **name, int *layout) {
+    while (*line == ' ' || *line == '\t') line++;
     int esc = line[0] == '\\';
     if (esc) line++;
     /* tagged: ALGO[-BITS] (NAME) = DIGEST */
@@ -384,15 +391,20 @@ static int ck_parse_line(const struct ck_opts *o, char *line, int *algo, int *bi
             b = (int)v;
             p = e;
         }
-        if (p[0] != ' ' || p[1] != '(') continue;
+        if (*p == ' ') p++;
+        if (*p != '(') continue;
         if (o->algo >= 0 && o->algo != a) return -1;
-        p += 2;
-        char *close = strstr(p, ") = ");
+        p++;
+        /* the name ends at the last ')': a name may hold one */
+        char *close = 0;
+        for (char *q = p; *q; q++) if (*q == ')') close = q;
         if (!close) return -1;
-        /* the last ") = ": a name may hold one */
-        for (char *q = close; (q = strstr(q + 1, ") = ")); ) close = q;
+        char *dg = close + 1;
+        while (*dg == ' ' || *dg == '\t') dg++;
+        if (*dg != '=') return -1;
+        dg++;
+        while (*dg == ' ' || *dg == '\t') dg++;
         *close = 0;
-        char *dg = close + 4;
         int nb = a == CK_BLAKE2B ? (b ? b / 8 : 64) : ck_bytes[a];
         if (ck_parse_digest(dg, strlen(dg), nb, dig) != 0) return -1;
         if (esc) ck_unescape(p);
@@ -404,14 +416,20 @@ static int ck_parse_line(const struct ck_opts *o, char *line, int *algo, int *bi
     /* untagged: DIGEST  NAME (or DIGEST *NAME), and only with -a */
     if (o->algo < 0 || CK_LEGACY(o->algo)) return -1;
     char *p = line;
-    while (*p == ' ' || *p == '\t') p++;
     char *sp = p;
-    while (*sp && *sp != ' ') sp++;
-    if (!*sp || (sp[1] != ' ' && sp[1] != '*')) return -1;
+    while (*sp && *sp != ' ' && *sp != '\t') sp++;
+    if (!*sp) return -1;                       /* no blank after it */
     int a = o->algo;
     int nb = a == CK_BLAKE2B ? (o->b2bits ? o->b2bits / 8 : 64) : ck_bytes[a];
     if (ck_parse_digest(p, (size_t)(sp - p), nb, dig) != 0) return -1;
-    char *nm = sp + 2;
+    char *nm = sp + 1;
+    if (!nm[0] || !nm[1] || (nm[0] != ' ' && nm[0] != '*')) {
+        if (*layout == 0) return -1;           /* the list said two */
+        *layout = 1;
+    } else if (*layout != 1) {
+        *layout = 0;
+        nm++;
+    }
     if (!*nm) return -1;
     if (esc) ck_unescape(nm);
     *algo = a;
@@ -430,14 +448,18 @@ static int ck_check_file(const struct ck_opts *o, const char *list) {
     const char *last_tag = o->algo >= 0 ? ck_tags[o->algo] : 0;
     ssize_t len;
     char end = o->zero ? '\0' : '\n';
+    int layout = -1, verified = 0;
     while ((len = getline(&line, &cap, f)) >= 0) {
         lineno++;
         if (len && line[len - 1] == '\n') line[--len] = 0;
         if (len && line[len - 1] == '\r') line[--len] = 0;
+        /* an empty line and a '#' one are passed over, as md5sum -c's are,
+         * --strict or not (finding 215) */
+        if (len == 0 || line[0] == '#') continue;
         int algo, bits;
         uint8_t want[64];
         char *name;
-        if (ck_parse_line(o, line, &algo, &bits, want, &name) != 0) {
+        if (ck_parse_line(o, line, &algo, &bits, want, &name, &layout) != 0) {
             bad_fmt++;
             if (o->warn)
                 su_error(0, 0, "%s: %ld: improperly formatted %s checksum line",
@@ -461,7 +483,7 @@ static int ck_check_file(const struct ck_opts *o, const char *list) {
         char ename[8192];
         int esc = ck_escape(name, ename, sizeof ename);
         if (n < 0) {
-            if (o->ignore_missing && e == ENOENT) { good--; continue; }
+            if (o->ignore_missing && e == ENOENT) continue;   /* a well-formed line all the same */
             unread++;
             if (!o->status) {
                 su_error(0, e, "%s", su_quotef(name));
@@ -472,6 +494,7 @@ static int ck_check_file(const struct ck_opts *o, const char *list) {
         int nb = algo == CK_BLAKE2B ? (bits ? bits / 8 : 64) : ck_bytes[algo];
         int ok = memcmp(got, want, (size_t)nb) == 0;
         if (!ok) mismatch++;
+        verified++;
         if (!o->status && (!ok || !o->quiet))
             printf("%s%s: %s%c", esc ? "\\" : "", ename, ok ? "OK" : "FAILED", end);
     }
@@ -491,8 +514,12 @@ static int ck_check_file(const struct ck_opts *o, const char *list) {
         if (mismatch)
             su_error(0, 0, "WARNING: %d computed checksum%s did NOT match", mismatch,
                      mismatch == 1 ? "" : "s");
+        /* --ignore-missing and nothing there at all (finding 215) */
+        if (o->ignore_missing && !verified)
+            su_error(0, 0, "%s: no file was verified", su_quotef(list));
     }
-    if (mismatch || unread || (o->strict && bad_fmt)) rc = 1;
+    if (mismatch || unread || (o->strict && bad_fmt) || (o->ignore_missing && !verified))
+        rc = 1;
     return rc;
 }
 
@@ -602,6 +629,13 @@ static int do_cksum(int argc, char **argv) {
         su_try_help(1);
     }
     if (!check && o.algo < 0) o.algo = CK_CRC;
+    /* what GNU refuses before reading a list (finding 215) */
+    if (check && o.algo >= 0 && CK_LEGACY(o.algo))
+        su_error(1, 0, "--check is not supported with --algorithm={bsd,sysv,crc,crc32b}");
+    if (check && o.zero) {
+        su_error(0, 0, "the --zero option is not supported when verifying checksums");
+        su_try_help(1);
+    }
     int rc = 0;
     if (check) {
         if (su_optind == argc) rc |= ck_check_file(&o, "-");
