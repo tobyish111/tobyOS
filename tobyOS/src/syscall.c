@@ -4234,7 +4234,15 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     }
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
     int64_t cur  = (int64_t)file_pos_get(f);
+    /* the file's size NOW, as Linux's i_size: what another descriptor
+     * appended or cut off counts (finding 258: the size this descriptor
+     * was opened with, so SEEK_END missed every other writer's bytes) */
     int64_t size = (int64_t)f->vfs.size;
+    if (whence >= ABI_SEEK_END && whence <= 4) {   /* only these ask it */
+        struct vfs_stat cs;
+        if (vfs_fstat(&f->vfs, &cs) == VFS_OK && cs.type == VFS_TYPE_FILE)
+            size = (int64_t)cs.size;
+    }
     int64_t newp;
     switch (whence) {
     case ABI_SEEK_SET: newp = off;        break;
