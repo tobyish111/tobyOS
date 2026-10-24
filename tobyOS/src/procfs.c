@@ -1731,6 +1731,17 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
 
+    /* /proc/self itself is a link to the reader's pid, as procfs_readlink
+     * and readdir say (finding 254: stat took it through subst_self and
+     * called it the directory, so lstat, `readlink /proc/self` and `ls -l`
+     * saw no link); what is under it is substituted below */
+    if (strcmp(path, "/self") == 0) {
+        out->type = VFS_TYPE_SYMLINK;
+        out->size = 0;
+        out->uid = 0; out->gid = 0; out->mode = 0777u | VFS_MODE_VALID;
+        return VFS_OK;
+    }
+
     char normbuf[ABI_PATH_MAX];
     subst_self(path, normbuf, sizeof(normbuf));
     const char *rel = normbuf + 1;
