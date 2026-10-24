@@ -15,6 +15,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/xattr.h>
+#include <sys/statfs.h>
+#include <stdio.h>
 #include <errno.h>
 #include <stdarg.h>
 #include "libtoby_internal.h"
@@ -290,6 +292,120 @@ int mknod(const char *path, mode_t mode, dev_t dev) {
 /* chroot(2), the kernel's (finding 214; there was none) */
 int chroot(const char *path) {
     return (int)__toby_check(toby_sc1(ABI_SYS_CHROOT, (long)(uintptr_t)path));
+}
+
+/* statfs(2) and fstatfs(2) in Linux's struct statfs, the Linux arms'
+ * answers (finding 215; there were none) */
+int statfs(const char *path, struct statfs *buf) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_LXSTATFS, 0, (long)(uintptr_t)path,
+                                      (long)(uintptr_t)buf));
+}
+int fstatfs(int fd, struct statfs *buf) {
+    return (int)__toby_check(toby_sc3(ABI_SYS_LXSTATFS, 1, fd, (long)(uintptr_t)buf));
+}
+
+/* fsync(2) and fdatasync(2), the kernel's (finding 215: shred synced the
+ * whole cache, there being no fsync) */
+int fsync(int fd) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_FSYNC, fd, 0));
+}
+int fdatasync(int fd) {
+    return (int)__toby_check(toby_sc2(ABI_SYS_FSYNC, fd, 1));
+}
+
+/* ---- pathconf, fpathconf (finding 215) -----------------------------------
+ *
+ * glibc's answers, measured (logs/b33/pathconfprobe-wsl.out): the
+ * terminal and path limits are constants that never look at the file
+ * (MAX_CANON and MAX_INPUT 255, PATH_MAX and PIPE_BUF 4096, NO_TRUNC 1,
+ * VDISABLE 0; SYNC_IO, PRIO_IO, SOCK_MAXBUF, the two REC_ sizes with no
+ * minimum and SYMLINK_MAX -1, errno untouched). CHOWN_RESTRICTED and
+ * 2_SYMLINKS are 1 for a file that exists, ASYNC_IO 1 for a regular file
+ * or a block device and -1 otherwise. The rest are the filesystem's:
+ * NAME_MAX its longest name, REC_MIN_XFER_SIZE, REC_XFER_ALIGN and
+ * ALLOC_SIZE_MIN its block size, and by its type -- ext2 and ext3 32000
+ * links, ext4 65000, both 64 bits of file size; anything else 127 links
+ * and 32 bits (tmpfs, proc, sysfs, 9p measured; glibc's table names a
+ * few more types, none of them a filesystem tobyOS has). A file that
+ * cannot be looked at is its errno (ENOENT, EBADF); an unknown NAME is
+ * EINVAL. */
+
+struct pc_target { const char *path; int fd; };
+
+static int pc_statfs(const struct pc_target *t, struct statfs *sf) {
+    return t->path ? statfs(t->path, sf) : fstatfs(t->fd, sf);
+}
+static int pc_stat(const struct pc_target *t, struct stat *st) {
+    return t->path ? stat(t->path, st) : fstat(t->fd, st);
+}
+
+/* ext2 and ext3 share ext4's magic: the type in /proc/self/mounts of the
+ * mount the file is on says which (its mount point's device is the
+ * file's), as glibc tells them apart */
+static long pc_ext_link_max(const struct pc_target *t) {
+    struct stat me, ms;
+    if (pc_stat(t, &me) != 0) return 32000;
+    FILE *m = fopen("/proc/self/mounts", "r");
+    if (!m) return 32000;
+    long r = 32000;
+    char line[1024];
+    while (fgets(line, sizeof line, m)) {
+        char *f[3] = { 0, 0, 0 };
+        char *p = line;
+        for (int i = 0; i < 3; i++) {
+            while (*p == ' ') p++;
+            f[i] = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            if (*p) *p++ = 0;
+        }
+        if (!f[2] || strncmp(f[2], "ext", 3) != 0) continue;
+        if (stat(f[1], &ms) == 0 && ms.st_dev == me.st_dev)
+            r = strcmp(f[2], "ext4") == 0 ? 65000 : 32000;
+    }
+    fclose(m);
+    return r;
+}
+
+static long pc_query(const struct pc_target *t, int name) {
+    struct statfs sf;
+    struct stat st;
+    switch (name) {
+    case _PC_MAX_CANON: case _PC_MAX_INPUT: return 255;
+    case _PC_PATH_MAX: case _PC_PIPE_BUF:   return 4096;
+    case _PC_NO_TRUNC:                      return 1;
+    case _PC_VDISABLE:                      return 0;
+    case _PC_SYNC_IO: case _PC_PRIO_IO: case _PC_SOCK_MAXBUF:
+    case _PC_REC_INCR_XFER_SIZE: case _PC_REC_MAX_XFER_SIZE:
+    case _PC_SYMLINK_MAX:
+        return -1;
+    case _PC_CHOWN_RESTRICTED: case _PC_2_SYMLINKS:
+        return pc_stat(t, &st) == 0 ? 1 : -1;
+    case _PC_ASYNC_IO:
+        if (pc_stat(t, &st) != 0) return -1;
+        return (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode)) ? 1 : -1;
+    case _PC_LINK_MAX: case _PC_NAME_MAX: case _PC_FILESIZEBITS:
+    case _PC_REC_MIN_XFER_SIZE: case _PC_REC_XFER_ALIGN: case _PC_ALLOC_SIZE_MIN:
+        if (pc_statfs(t, &sf) != 0) return -1;
+        if (name == _PC_NAME_MAX) return sf.f_namelen;
+        if (name == _PC_FILESIZEBITS) return sf.f_type == 0xEF53 ? 64 : 32;
+        if (name == _PC_LINK_MAX)
+            return sf.f_type == 0xEF53 ? pc_ext_link_max(t) : 127;
+        return sf.f_bsize;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+}
+
+long pathconf(const char *path, int name) {
+    struct pc_target t = { path, -1 };
+    if (!path) { errno = EFAULT; return -1; }
+    return pc_query(&t, name);
+}
+
+long fpathconf(int fd, int name) {
+    struct pc_target t = { 0, fd };
+    return pc_query(&t, name);
 }
 
 /* unshare(2), the kernel's (finding 241; there was none): <sched.h> */

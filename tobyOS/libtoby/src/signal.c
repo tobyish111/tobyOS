@@ -47,6 +47,14 @@ int kill(pid_t pid, int sig) {
     return (int)__toby_check(toby_sc2(ABI_SYS_KILL, (long)pid, (long)sig));
 }
 
+/* sigqueue(3), the kernel's: the value travels with the signal, si_code
+ * SI_QUEUE (finding 215; there was none, and kill -q's value went) */
+int sigqueue(pid_t pid, int sig, const union sigval value) {
+    uint64_t v = 0;
+    __builtin_memcpy(&v, &value, sizeof value);
+    return (int)__toby_check(toby_sc3(ABI_SYS_SIGQUEUE, (long)pid, (long)sig, (long)v));
+}
+
 int raise(int sig) {
     return kill(getpid(), sig);
 }

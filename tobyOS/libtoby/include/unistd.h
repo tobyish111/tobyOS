@@ -23,6 +23,10 @@ extern "C" {
 #define SEEK_SET       0
 #define SEEK_CUR       1
 #define SEEK_END       2
+/* finding 215: the next data at or after the offset, and the next hole --
+ * the whole file is data on a filesystem that keeps no holes */
+#define SEEK_DATA      3
+#define SEEK_HOLE      4
 
 ssize_t read   (int fd, void *buf, size_t n);
 ssize_t write  (int fd, const void *buf, size_t n);
@@ -56,6 +60,33 @@ int     lchown (const char *path, uid_t owner, gid_t group);
 int     getgroups(int size, gid_t list[]);
 int     setgroups(size_t size, const gid_t *list);
 int     chroot(const char *path);                   /* finding 214 */
+/* finding 215: a file's own data to its disk, and the limits pathconf
+ * reports (glibc's numbers, by filesystem type) */
+int     fsync(int fd);
+int     fdatasync(int fd);
+long    pathconf(const char *path, int name);
+long    fpathconf(int fd, int name);
+#define _PC_LINK_MAX            0
+#define _PC_MAX_CANON           1
+#define _PC_MAX_INPUT           2
+#define _PC_NAME_MAX            3
+#define _PC_PATH_MAX            4
+#define _PC_PIPE_BUF            5
+#define _PC_CHOWN_RESTRICTED    6
+#define _PC_NO_TRUNC            7
+#define _PC_VDISABLE            8
+#define _PC_SYNC_IO             9
+#define _PC_ASYNC_IO            10
+#define _PC_PRIO_IO             11
+#define _PC_SOCK_MAXBUF         12
+#define _PC_FILESIZEBITS        13
+#define _PC_REC_INCR_XFER_SIZE  14
+#define _PC_REC_MAX_XFER_SIZE   15
+#define _PC_REC_MIN_XFER_SIZE   16
+#define _PC_REC_XFER_ALIGN      17
+#define _PC_ALLOC_SIZE_MIN      18
+#define _PC_SYMLINK_MAX         19
+#define _PC_2_SYMLINKS          20
 int     initgroups(const char *user, gid_t group);
 int     rename (const char *oldpath, const char *newpath);
 int     link   (const char *oldpath, const char *newpath);

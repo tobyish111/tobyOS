@@ -1405,7 +1405,18 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         personality has had since slice 8,
                                         for tobyOS's unshare(1) (finding
                                         241) */
-#define ABI_SYS_NR_MAX          240
+#define ABI_SYS_SIGQUEUE        241  /* (pid, sig, value) -> 0|-E: sigqueue(3),
+                                        the signal delivered with SI_QUEUE
+                                        and VALUE (finding 215) */
+#define ABI_SYS_LXSTATFS        242  /* (which, path|fd, struct statfs *) ->
+                                        0|-E: statfs(2) (WHICH 0) or
+                                        fstatfs(2) (1) in Linux's struct
+                                        statfs, the Linux arms' (finding
+                                        215) */
+#define ABI_SYS_FSYNC           243  /* (fd, datasync) -> 0|-E: fsync(2),
+                                        fdatasync(2) when DATASYNC (finding
+                                        215: shred synced every file) */
+#define ABI_SYS_NR_MAX          243
 
 #define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
                                  account's own user */

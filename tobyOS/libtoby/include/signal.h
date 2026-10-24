@@ -49,6 +49,13 @@ typedef unsigned long sigset_t;
  * kernel's <tobyos/signal.h> layout (tobyOS's own ABI, not Linux-binary). */
 #define SI_USER    0
 #define SI_KERNEL  0x80
+#define SI_QUEUE   (-1)     /* sigqueue (finding 215) */
+
+/* sigqueue's value (finding 215) */
+union sigval {
+    int   sival_int;
+    void *sival_ptr;
+};
 
 typedef struct {
     int          si_signo;
@@ -56,8 +63,15 @@ typedef struct {
     int          si_pid;
     unsigned int si_uid;
     void        *si_addr;
-    int          si_status;
-    int          _si_pad;
+    /* si_value shares si_status's bytes, as in Linux's union: SIGCHLD has
+     * the one, a sigqueue'd signal (si_code SI_QUEUE) the other */
+    union {
+        struct {
+            int  si_status;
+            int  _si_pad;
+        };
+        union sigval si_value;
+    };
 } siginfo_t;
 
 typedef struct {
@@ -86,6 +100,8 @@ struct sigaction {
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int kill(pid_t pid, int sig);
+/* kill(PID, SIG) with VALUE in the siginfo it arrives with (finding 215) */
+int sigqueue(pid_t pid, int sig, const union sigval value);
 int raise(int sig);
 
 int sigemptyset(sigset_t *set);

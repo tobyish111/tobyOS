@@ -4248,6 +4248,18 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     case ABI_SEEK_SET: newp = off;        break;
     case ABI_SEEK_CUR: newp = cur + off;  break;
     case ABI_SEEK_END: newp = size + off; break;
+    /* SEEK_DATA and SEEK_HOLE (finding 215), as Linux answers them for a
+     * filesystem that keeps no holes (generic_file_llseek): the whole file
+     * is data, its end the one hole; at or past the end -- a negative
+     * offset too -- there is neither, ENXIO */
+    case 3:
+        if ((uint64_t)off >= (uint64_t)size) return -ABI_ENXIO;
+        newp = off;
+        break;
+    case 4:
+        if ((uint64_t)off >= (uint64_t)size) return -ABI_ENXIO;
+        newp = size;
+        break;
     default: return -ABI_EINVAL;
     }
     if (newp < 0) return -ABI_EINVAL;
@@ -7009,6 +7021,21 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return src == 0 ? 0 : -ABI_EIO;
     }
 
+    case ABI_SYS_SIGQUEUE:
+        /* (pid, sig, value): sigqueue(3) -- the signal delivered with
+         * SI_QUEUE and the value in its siginfo (finding 215) */
+        return signal_queue((int)a1, (int)a2, SI_QUEUE, (uint64_t)a3);
+    case ABI_SYS_LXSTATFS:
+        /* (which, path|fd, buf): statfs(2) or fstatfs(2) as the Linux
+         * personality answers them, in Linux's struct statfs (finding 215:
+         * libtoby had neither) */
+        if (a1 == 0) return linux_syscall_impl(137, a2, a3, 0, 0, 0);
+        if (a1 == 1) return linux_syscall_impl(138, a2, a3, 0, 0, 0);
+        return -ABI_EINVAL;
+    case ABI_SYS_FSYNC:
+        /* (fd, datasync): fsync(2) / fdatasync(2), the Linux arms (finding
+         * 215: shred asked for the whole cache, libtoby having no fsync) */
+        return linux_syscall_impl(a2 ? 75 : 74, a1, 0, 0, 0, 0);
     case ABI_SYS_UNSHARE:
         /* (flags): unshare(2) for a native program -- the namespaces the
          * Linux personality's has made since slice 8, under the same rules
@@ -15144,7 +15171,14 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * durability could mean. */
         struct file *f = fd_lookup((int)a1);
         if (!f) return -ABI_EBADF;
-        if (f->kind != FILE_KIND_VFS) return 0;   /* pipes, sockets, memfd */
+        /* a directory, a memfd and a disk have nothing more to write; what
+         * has no sync of its own at all -- a pipe, a socket, a terminal,
+         * /dev/null -- is EINVAL, as Linux's (finding 215: every one was
+         * 0) */
+        if (f->kind == FILE_KIND_DIR || f->kind == FILE_KIND_MEMFD ||
+            f->kind == FILE_KIND_BLKDEV)
+            return 0;
+        if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;
         return vfs_err_to_abi(vfs_file_sync(&f->vfs));
     }
     case LX_flock: {                /* real since 2026-08-22 (src/flock.c).
@@ -16743,6 +16777,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             if (rr != 0) return rr;            /* EACCES too (finding 188) */
             rr = statfs_follow(kpath, sizeof kpath);       /* finding 244 */
             if (rr != 0) return rr;
+            /* a name that is not there is ENOENT, as the native statfs
+             * says: vfs_statfs answers for anything inside a mount
+             * (finding 215: statfs("/nonexistent") succeeded) */
+            struct vfs_stat est;
+            int esr = vfs_stat(kpath, &est);
+            if (esr != VFS_OK) return vfs_err_to_abi(esr);
         } else {
             struct file *f = fd_lookup((int)a1);
             if (!f) return -ABI_EBADF;
@@ -17541,11 +17581,22 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return -ABI_EINTR;
 
     case 129: {                        /* rt_sigqueueinfo(pid, sig, *info) */
-        /* glibc's sigqueue(3). The sival payload is not carried (there is
-         * no per-signal queue depth in this kernel -- one pending bit per
-         * signal), but delivery, targeting and sender identity are real,
-         * which is what the callers in this tree act on. */
-        return sys_kill((int)a1, (int)a2);
+        /* glibc's sigqueue(3): the caller's si_code and si_value travel
+         * with the signal (finding 215: they were dropped, and it was a
+         * kill). Linux's rule on the code: one that is not negative, or is
+         * SI_TKILL's, would pass for the kernel's or tgkill's own, so only
+         * a process signalling itself may give it (EPERM otherwise). The
+         * pending signal keeps one siginfo -- this kernel queues no second
+         * instance of a signal already pending. */
+        uint8_t ib[48];
+        if (!a3 || copy_from_user(ib, (const void *)(uintptr_t)a3, sizeof ib) != 0)
+            return -ABI_EFAULT;
+        int code = *(const int32_t *)(ib + 8);
+        uint64_t value = *(const uint64_t *)(ib + 24);
+        struct proc *qp = current_proc();
+        if ((code >= 0 || code == SI_TKILL) && (!qp || pid_vnr(qp) != (int)a1))
+            return -ABI_EPERM;
+        return signal_queue((int)a1, (int)a2, code, value);
     }
 
     default: {

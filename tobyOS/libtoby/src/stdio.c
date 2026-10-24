@@ -556,6 +556,52 @@ FILE *stdin  = &g_stdin;
 FILE *stdout = &g_stdout;
 FILE *stderr = &g_stderr;
 
+/* _STDBUF_I, _STDBUF_O and _STDBUF_E, read before main as GNU's libstdbuf
+ * reads them where stdbuf(1) preloads it (finding 215: stdbuf set them
+ * and no libtoby program looked). Measured on libstdbuf
+ * (logs/b33/stdbufprobe-wsl.out): a value that starts with 0 is
+ * unbuffered and one that starts with L line-buffered; anything else must
+ * be a whole decimal number (blanks and a sign first, a '-' wrapping it
+ * round), a buffer of that many bytes. A bad value is "invalid buffering
+ * mode V for stdout", one malloc refuses "failed to allocate a N byte
+ * stdio buffer"; either way the stream keeps its own buffering. */
+static void stdbuf_one(FILE *f, const char *env, const char *name) {
+    const char *v = getenv(env);
+    if (!v) return;
+    if (v[0] == '0') { setvbuf(f, 0, _IONBF, 0); return; }
+    if (v[0] == 'L') { setvbuf(f, 0, _IOLBF, 0); return; }
+    const char *p = v;
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r')) p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') neg = *p++ == '-';
+    uint64_t n = 0;
+    int digits = 0, over = 0;
+    for (; *p >= '0' && *p <= '9'; p++, digits++) {
+        unsigned d = (unsigned)(*p - '0');
+        if (n > (UINT64_MAX - d) / 10) over = 1;
+        else n = n * 10 + d;
+    }
+    if (over) n = UINT64_MAX;
+    else if (neg) n = (uint64_t)0 - n;
+    if (!digits || *p || n == 0) {
+        fprintf(stderr, "invalid buffering mode %s for %s\n", v, name);
+        return;
+    }
+    char *buf = n <= (uint64_t)SIZE_MAX ? (char *)malloc((size_t)n) : 0;
+    if (!buf) {
+        fprintf(stderr, "failed to allocate a %llu byte stdio buffer\n",
+                (unsigned long long)n);
+        return;
+    }
+    if (setvbuf(f, buf, _IOFBF, (size_t)n) != 0) free(buf);
+}
+
+void __toby_stdio_stdbuf(void) {
+    stdbuf_one(stdin, "_STDBUF_I", "stdin");
+    stdbuf_one(stdout, "_STDBUF_O", "stdout");
+    stdbuf_one(stderr, "_STDBUF_E", "stderr");
+}
+
 static struct __libtoby_FILE *g_streams = &g_stdin;
 static int g_streams_lock;
 
@@ -1061,6 +1107,66 @@ FILE *fopen(const char *path, const char *mode) {
     if (fd < 0) return 0;
     FILE *f = stream_new(fd, -1);
     if (!f) { close(fd); return 0; }
+    return f;
+}
+
+/* fdopen(3): a stream on the open descriptor FD (finding 215; there was
+ * none, and diff closed its descriptor and opened the file again). MODE
+ * is fopen's; the descriptor's own access must allow it (EINVAL), "a"
+ * turns on its append mode, and nothing is created or truncated. */
+FILE *fdopen(int fd, const char *mode) {
+    int flags = mode ? fopen_mode_to_flags(mode) : -1;
+    if (flags < 0) { errno = EINVAL; return 0; }
+    int cur = fcntl(fd, F_GETFL);
+    if (cur < 0) return 0;                          /* EBADF */
+    int want = flags & O_ACCMODE, have = cur & O_ACCMODE;
+    if (have != O_RDWR && want != have) { errno = EINVAL; return 0; }
+    if ((flags & O_APPEND) && !(cur & O_APPEND) &&
+        fcntl(fd, F_SETFL, cur | O_APPEND) < 0)
+        return 0;
+    return stream_new(fd, -1);
+}
+
+/* freopen(3): F moved onto PATH in place (finding 215; there was none, and
+ * uniq kept its own). What F holds is written out, PATH opened as fopen
+ * would and put on F's own descriptor number, so a reopened stdout is
+ * still 1. When PATH cannot be opened F is closed, as POSIX has it. A
+ * null PATH opens F's own file again in MODE. */
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+    if (!f) { errno = EINVAL; return 0; }
+    int flags = mode ? fopen_mode_to_flags(mode) : -1;
+    flock_(f);
+    if (f->dir == 2) (void)stream_flush_out(f);
+    else             stream_drop_read(f);
+    int oldfd = f->fd;
+    char self[32];
+    if (!path && oldfd >= 0) {
+        snprintf(self, sizeof self, "/proc/self/fd/%d", oldfd);
+        path = self;
+    }
+    int nfd = -1;
+    if (flags < 0) errno = EINVAL;
+    else if (!path) errno = EBADF;
+    else nfd = open(path, flags, 0666);
+    if (nfd >= 0 && oldfd >= 0 && nfd != oldfd) {
+        if (dup2(nfd, oldfd) < 0) { int e = errno; close(nfd); nfd = -1; errno = e; }
+        else { close(nfd); nfd = oldfd; }
+    }
+    if (nfd < 0) {
+        int e = errno;
+        if (oldfd >= 0) close(oldfd);
+        f->fd = -1;
+        f->err = 1;
+        funlock_(f);
+        errno = e;
+        return 0;
+    }
+    f->fd = nfd;
+    f->pushback = -1;
+    f->eof = f->err = 0;
+    f->dir = 0;
+    f->rpos = f->rlen = f->wlen = 0;
+    funlock_(f);
     return f;
 }
 

@@ -160,6 +160,30 @@ int main(void) {
            (double)(t1 - t0) / CLOCKS_PER_SEC, (double)(t2 - t1) / CLOCKS_PER_SEC);
     bad = tb_malloc_check(g_starts, g_nstarts);
     if (bad) return fail("heap check after churn", -1);
+
+    /* MAPPED chunks (finding 215): 64 MiB and up are a map of their own --
+     * written at both ends, grown by realloc with the bytes kept, zero
+     * from calloc without being touched, and gone on free, the heap's
+     * regions untouched by any of it */
+    {
+        size_t big = (size_t)100 << 20;
+        unsigned char *m = tb_malloc(big);
+        if (!m || ((uintptr_t)m & 15)) return fail("mapped malloc", -1);
+        m[0] = 0x5a; m[big - 1] = 0xa5;
+        unsigned char *m2 = tb_realloc(m, big * 2);
+        if (!m2 || m2[0] != 0x5a || m2[big - 1] != 0xa5) return fail("mapped realloc", -1);
+        m2[big * 2 - 1] = 1;
+        tb_free(m2);
+        unsigned char *z = tb_calloc(1, (size_t)80 << 20);
+        if (!z || z[0] || z[(40 << 20)] || z[(80 << 20) - 1]) return fail("mapped calloc", -1);
+        tb_free(z);
+        unsigned char *s = tb_malloc(4096);              /* the heap goes on */
+        unsigned char *g = tb_realloc(s, (size_t)70 << 20);
+        if (!g) return fail("heap chunk realloc'd to a map", -1);
+        tb_free(g);
+        if (tb_malloc_check(g_starts, g_nstarts)) return fail("heap check after maps", -1);
+        puts("mapped: 100 MiB, realloc to 200 MiB, calloc 80 MiB, heap to map: ok");
+    }
     puts("mallochost: PASS");
     return 0;
 }

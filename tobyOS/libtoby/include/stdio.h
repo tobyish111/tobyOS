@@ -65,6 +65,10 @@ ssize_t getline (char **linep, size_t *capp, FILE *f);
 
 /* ---- file streams ------------------------------------------------- */
 FILE  *fopen   (const char *path, const char *mode);
+/* finding 215: a stream on an open descriptor, and a stream moved onto
+ * another file in place */
+FILE  *fdopen  (int fd, const char *mode);
+FILE  *freopen (const char *path, const char *mode, FILE *f);
 int    fclose  (FILE *f);
 size_t fread   (void *buf, size_t sz, size_t n, FILE *f);
 size_t fwrite  (const void *buf, size_t sz, size_t n, FILE *f);

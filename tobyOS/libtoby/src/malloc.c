@@ -38,6 +38,13 @@
  *   in use -- so no merge walks off it. A region that continues the last
  *   one exactly takes the old fence as its first header and merges back.
  *
+ *   MAPPED chunks (finding 215): a request of TC_MAP_MIN or more, or one
+ *   the heap cannot grow for, is an anonymous mmap of its own, as glibc's
+ *   are -- pages the kernel gives only when they are touched, so a 4 GiB
+ *   buffer that is never filled costs nothing (stdbuf -o 4G: malloc said
+ *   no where Linux's says yes). Such a chunk is marked MAPPED, belongs to
+ *   no region and no bin, and is unmapped by free.
+ *
  * Thread safety: unlocked, as it was. */
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +52,7 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/mman.h>
 #ifndef LIBTOBY_MALLOC_HOST
 #include "libtoby_internal.h"
 #endif
@@ -55,7 +63,9 @@
 #define GROW_CHUNK   ((size_t)64 * 1024)
 #define INUSE        ((size_t)1)
 #define PREV_INUSE   ((size_t)2)
+#define MAPPED       ((size_t)4)       /* a chunk of its own mmap (215) */
 #define FLAGS        ((size_t)15)
+#define TC_MAP_MIN   ((size_t)64 << 20) /* 64 MiB and up: mmap first */
 #define MAGIC_USED   ((void *)0xA110CA7EDF00DFACULL)
 
 #define NSMALL       64u            /* payload 16..1024 */
@@ -212,13 +222,33 @@ static void *use(struct chunk *c, size_t need) {
     return payload_of(c);
 }
 
+/* A MAPPED chunk of NEED bytes, or 0 */
+static void *map_chunk(size_t need) {
+    size_t len = round_up(need + HDR, 4096);
+    void *m = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return 0;
+    struct chunk *c = (struct chunk *)m;
+    c->head = (len - HDR) | INUSE | MAPPED;
+    c->link = MAGIC_USED;
+    return payload_of(c);
+}
+
 void *malloc(size_t n) {
     if (n > ((size_t)-1 >> 2)) { errno = ENOMEM; return 0; }
     size_t need = round_up(n ? n : 1, ALIGN);
     if (need < MIN_PAYLOAD) need = MIN_PAYLOAD;
+    if (need >= TC_MAP_MIN) {
+        void *m = map_chunk(need);
+        if (m) return m;
+    }
     struct chunk *c = bin_take(need);
     if (!c) {
-        if (heap_grow(need) != 0) { errno = ENOMEM; return 0; }
+        if (heap_grow(need) != 0) {
+            void *m = map_chunk(need);         /* the heap is out: a map */
+            if (m) return m;
+            errno = ENOMEM;
+            return 0;
+        }
         c = bin_take(need);
         if (!c) { errno = ENOMEM; return 0; }
     }
@@ -243,6 +273,10 @@ void free(void *p) {
     if (c->link != MAGIC_USED || !(c->head & INUSE))
         bad_pointer("[libtoby] free(): double free or corruption\n");
     c->link = 0;
+    if (c->head & MAPPED) {
+        munmap(c, csize(c) + HDR);
+        return;
+    }
     c->head &= ~INUSE;
     release(c);
 }
@@ -258,6 +292,14 @@ void *realloc(void *p, size_t n) {
     size_t want = round_up(n, ALIGN);
     if (want < MIN_PAYLOAD) want = MIN_PAYLOAD;
 
+    if (c->head & MAPPED) {                       /* its own map: kept, or moved */
+        if (want <= cur) return p;
+        void *q = malloc(n);
+        if (!q) return 0;
+        memcpy(q, p, cur);
+        free(p);
+        return q;
+    }
     if (want <= cur) {                            /* shrink in place */
         if (cur >= want + HDR + MIN_PAYLOAD) {
             struct chunk *rest = (struct chunk *)(payload_of(c) + want);
@@ -304,7 +346,9 @@ void *calloc(size_t nmemb, size_t sz) {
     }
     size_t bytes = nmemb * sz;
     void *p = malloc(bytes);
-    if (p) memset(p, 0, bytes);
+    /* a fresh map is zero already: touching it all would make it real */
+    if (p && !(((struct chunk *)((char *)p - HDR))->head & MAPPED))
+        memset(p, 0, bytes);
     return p;
 }
 

@@ -41,6 +41,7 @@ static int g_foreground_pid = 0;
 #define LXSI_CODE    8          /* int  si_code                              */
 #define LXSI_PID    16          /* _kill: pid_t si_pid (kill/raise origin)   */
 #define LXSI_UID    20          /* _kill: uid_t si_uid                       */
+#define LXSI_VALUE  24          /* _rt: union sigval si_value (finding 215)  */
 #define LXSI_ADDR   16          /* _sigfault: void *si_addr (fault address)  */
 
 /* ucontext_t: uc_mcontext.gregs[] starts at offset 40 (after uc_flags,
@@ -111,6 +112,7 @@ void signal_init_proc(struct signal_state *ss) {
         ss->si_pid[i] = 0;
         ss->si_uid[i] = 0;
         ss->si_code[i] = 0;
+        ss->si_value[i] = 0;
     }
     ss->mask     = 0;
     ss->pending  = 0;
@@ -563,6 +565,8 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         } else {
             *(int32_t  *)(ib + LXSI_PID) = p->sigstate.si_pid[sig];
             *(uint32_t *)(ib + LXSI_UID) = p->sigstate.si_uid[sig];
+            if (si_code < 0 && si_code != SI_TKILL)     /* a queued one */
+                *(uint64_t *)(ib + LXSI_VALUE) = p->sigstate.si_value[sig];
         }
 
         uint64_t *g = (uint64_t *)(ub + LXUC_GREGS);
@@ -592,6 +596,8 @@ static bool sig_emit_info_uctx(struct proc *p, int sig, int si_code,
         .si_status = 0,
         ._pad      = 0,
     };
+    if (!is_fault && si_code < 0 && si_code != SI_TKILL)   /* queued (215) */
+        info.si_value = p->sigstate.si_value[sig];
     ucontext_t uctx;
     memset(&uctx, 0, sizeof(uctx));
     uctx.uc_sigmask = p->sigstate.mask;
@@ -1267,7 +1273,22 @@ static bool ns_init_drops(struct proc *sender, struct proc *target, int sig) {
     return true;
 }
 
+static int kill_as(int pid, int sig, bool queued, int qcode, uint64_t qvalue);
+
 int sys_kill(int pid, int sig) {
+    return kill_as(pid, sig, false, 0, 0);
+}
+
+/* sigqueue(3) and rt_sigqueueinfo(2): kill(PID, SIG) to one process, with
+ * CODE (SI_QUEUE, or the caller's own negative code) and VALUE in the
+ * siginfo it is delivered with (finding 215: the value went, and the code
+ * said SI_USER) */
+int signal_queue(int pid, int sig, int code, uint64_t value) {
+    if (pid <= 0) return -3;                         /* one process: ESRCH */
+    return kill_as(pid, sig, true, code, value);
+}
+
+static int kill_as(int pid, int sig, bool queued, int qcode, uint64_t qvalue) {
     if (sig < 0 || sig >= SIG_MAX) return -22;
 
     struct proc *p = current_proc();
@@ -1312,6 +1333,8 @@ int sys_kill(int pid, int sig) {
         if (sig > 0) {
             target->sigstate.si_pid[sig] = pid_vnr_in(target->pid_ns, p->pid);
             target->sigstate.si_uid[sig] = p->uid;
+            target->sigstate.si_value[sig] = queued ? qvalue : 0;
+            if (queued) target->sigstate.si_code[sig] = (int8_t)qcode;
         }
     } else if (pid == 0) {
         /* kill(0, sig): the CALLER'S PROCESS GROUP. The old "simplified:

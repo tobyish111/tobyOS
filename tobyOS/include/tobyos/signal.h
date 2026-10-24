@@ -166,6 +166,7 @@ struct sigaction {
 #define SI_USER    0       /* kill()/raise()/tty-generated */
 #define SI_KERNEL  0x80    /* kernel-synthesized */
 #define SI_TKILL  (-6)     /* tkill/tgkill-generated (Linux) */
+#define SI_QUEUE  (-1)     /* sigqueue(3) (finding 215) */
 
 /* Synchronous-fault si_code values (Linux x86-64). Reported in the
  * siginfo_t a SIGSEGV/SIGFPE/SIGILL handler receives. */
@@ -183,8 +184,15 @@ typedef struct {
     int          si_pid;     /* sending pid (0 == kernel/tty)        */
     unsigned int si_uid;     /* sending uid                          */
     void        *si_addr;    /* fault address (unused for now, 0)    */
-    int          si_status;  /* exit/signal status (unused for now)  */
-    int          _pad;
+    /* sigqueue's value shares si_status's bytes, as in Linux's union
+     * (finding 215): one is meant for SIGCHLD, the other SI_QUEUE */
+    union {
+        struct {
+            int  si_status;  /* exit/signal status (unused for now)  */
+            int  _pad;
+        };
+        uint64_t si_value;   /* SI_QUEUE: union sigval              */
+    };
 } siginfo_t;
 
 /* Minimal machine context. Register slots are populated from the saved
@@ -224,6 +232,9 @@ struct signal_state {
      * for. Found live: the threaded-setuid broadcast's handler ran and
      * did nothing, forever (2026-08-22). */
     int8_t           si_code[SIG_MAX];
+    /* sigqueue's value (union sigval) per pending signal, for SI_QUEUE
+     * (finding 215: rt_sigqueueinfo was kill, and the value went) */
+    uint64_t         si_value[SIG_MAX];
 };
 
 /* errno-ish return value for interrupted blocking primitives */
@@ -357,6 +368,9 @@ void sys_sigrestorer(uint64_t addr);
 /* kill: send signal to process (process-directed: may deliver to any
  * group member with the signal unblocked) */
 int sys_kill(int pid, int sig);
+/* Finding 215: sigqueue(3) / rt_sigqueueinfo(2) -- kill(PID, SIG) with
+ * siginfo's si_code CODE and si_value VALUE */
+int signal_queue(int pid, int sig, int code, uint64_t value);
 
 /* tkill/tgkill: thread-directed, never retargeted; tgid > 0 is verified
  * against the target's group, tgid <= 0 skips the check (tkill). */

@@ -76,6 +76,13 @@ void __libtoby_init(int argc, char **argv, char **envp) {
      * pointer to a heap-owned copy, leaving the stack array alone. */
     environ = envp;
 
+    /* stdbuf(1)'s settings, as GNU's libstdbuf applies them before main
+     * (finding 215) */
+    {
+        extern void __toby_stdio_stdbuf(void);
+        __toby_stdio_stdbuf();
+    }
+
     /* C++ static constructors (weak no-op for C programs). Runs after
      * environ is live so constructors may getenv(). */
     if (__init_array_start && __init_array_end) {
