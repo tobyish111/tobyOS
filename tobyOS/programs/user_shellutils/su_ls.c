@@ -1313,9 +1313,8 @@ static int do_ls(int argc, char **argv) {
     ls.width = 80;
     ls.total_unit = 1024;
     ls.first_out = 1;
+    int quoting_given = 0;      /* a quoting option was given: no QUOTING_STYLE */
     {
-        const char *q = getenv("QUOTING_STYLE");
-        if (q && *q) ls_set_quoting(q, 1);
         const char *c = getenv("COLUMNS");
         if (c && *c) {
             char *e;
@@ -1341,7 +1340,7 @@ static int do_ls(int argc, char **argv) {
         switch (c) {
         case 'a': ls.all = 2; break;
         case 'A': ls.all = 1; break;
-        case 'b': ls.quoting = LQ_ESCAPE; break;
+        case 'b': ls.quoting = LQ_ESCAPE; quoting_given = 1; break;
         case 'B': ls.ignore_backups = 1; break;
         case 'c': ls.timetype = LT_C; break;
         case 'u': ls.timetype = LT_A; break;
@@ -1381,13 +1380,13 @@ static int do_ls(int argc, char **argv) {
         case 'x': ls.fmt = LF_ACROSS; break;
         case '1': if (ls.fmt != LF_LONG) ls.fmt = LF_ONE; break;
         case 'n': ls.numeric = 1; ls.fmt = LF_LONG; break;
-        case 'N': ls.quoting = LQ_LITERAL; break;
+        case 'N': ls.quoting = LQ_LITERAL; quoting_given = 1; break;
         case 'p': ls.ind = LI_SLASH; ind_given = 1; break;
         case O_FILETYPE: ls.ind = LI_FILETYPE; ind_given = 1; break;
         case 'q': ls.qmark = 1; break;
         case O_SHOWCTL: ls.qmark = 0; break;
-        case 'Q': ls.quoting = LQ_C; break;
-        case O_QSTYLE: ls_set_quoting(su_optarg, 0); break;
+        case 'Q': ls.quoting = LQ_C; quoting_given = 1; break;
+        case O_QSTYLE: ls_set_quoting(su_optarg, 0); quoting_given = 1; break;
         case 'r': ls.reverse = 1; break;
         case 'R': ls.recursive = 1; break;
         case 's': ls.blocks = 1; break;
@@ -1482,7 +1481,17 @@ static int do_ls(int argc, char **argv) {
             break;
         }
         case O_TIMESTYLE: time_style = su_optarg; break;
-        case O_ZERO: ls.zero = 1; break;
+        case O_ZERO:
+            /* where it stands, as GNU's: one per line unless long, literal
+             * names, control characters shown -- what came before it gives
+             * way, what comes after it does not (finding 215: applied once
+             * every option was read, so `--zero -Q` lost its -Q) */
+            ls.zero = 1;
+            if (ls.fmt != LF_LONG) ls.fmt = LF_ONE;
+            ls.quoting = LQ_LITERAL;
+            ls.qmark = 0;
+            quoting_given = 1;
+            break;
         case SU_HELP_OPT:
             printf("Usage: %s [OPTION]... [FILE]...\n"
                    "List the FILEs (the current directory if there are none), each directory's\n"
@@ -1567,7 +1576,17 @@ static int do_ls(int argc, char **argv) {
     }
     (void)fulltime;
     if (ls.timetype != LT_M && !ls.sort_given && ls.fmt != LF_LONG) ls.sort = LS_TIME;
-    if (ls.zero) { ls.fmt = ls.fmt == LF_LONG ? LF_LONG : LF_ONE; ls.quoting = LQ_LITERAL; }
+    if (ls.zero && ls.dired) {
+        su_error(0, 0, "--dired and --zero are incompatible");
+        return 2;
+    }
+    /* QUOTING_STYLE only when no option chose a quoting -- an empty one is
+     * warned about as any other bad one (finding 215: read before the
+     * options, it warned under -Q, and an empty one said nothing) */
+    if (!quoting_given) {
+        const char *q = getenv("QUOTING_STYLE");
+        if (q) ls_set_quoting(q, 1);
+    }
     ls.color = color_mode;
     if (ls.color) {
         ls_color_init();
