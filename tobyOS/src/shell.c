@@ -45690,14 +45690,17 @@ static bool shell_try_compound_pipeline(const char *src) {
             if (jc_fg) {
                 (void)proc_set_pgid(0, jc_leader);
                 shell_child_tty_job_signals();
-                /* ...and an element that is one simple command BECOMES its
-                 * program, as bash's child execs it: the job's processes
-                 * are the programs, which die of ^C themselves -- the stage
-                 * that spawned one and waited exited 130, and the shell saw
-                 * no SIGINT to answer with its newline (ttyparity 19) */
-                g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
-                                                       stages[i] + strlen(stages[i]));
             }
+            /* ...and an element that is one simple command BECOMES its
+             * program, as bash's child execs it: the job's processes are the
+             * programs, which die of ^C themselves -- the stage that spawned
+             * one and waited exited 130, and the shell saw no SIGINT to
+             * answer with its newline (ttyparity 19). Under job control only
+             * at first; everywhere since finding 212 -- a three-stage
+             * pipeline was six processes, a forked tsh holding each program,
+             * where bash's is three (`ps` showed tsh three times). */
+            g_bg_exec_ok = shell_bg_text_is_simple(stages[i],
+                                                   stages[i] + strlen(stages[i]));
             g_in_pipeline_stage = true;
             g_simple_stage_adj = stage_simple[i] ? 1 : 0;
             /* a stage that reads a pipe: an async command in it keeps that
