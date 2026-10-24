@@ -826,14 +826,18 @@ install-img: $(INSTALL_IMG)
 # explicitly, and --shortstat (content, not the stat cache) decides.
 KBUILD_ID := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(if $(shell git -c core.autocrlf=true diff --shortstat HEAD -- src include 2>/dev/null),-dirty,)
 KBUILD_ID_H := build/kbuild_id.h
+# The kernel's version string, as uname -v gives Linux's ("#1 SMP ..."):
+# the date of the commit it is built from, in UTC, Linux's format -- the
+# version field was empty (finding 253).
+KBUILD_DATE := $(shell TZ=UTC0 git log -1 --date=format-local:'%a %b %e %H:%M:%S UTC %Y' --format=%cd 2>/dev/null || echo unknown)
 .PHONY: kbuild-id-force
 kbuild-id-force:
 $(KBUILD_ID_H): kbuild-id-force
 	@mkdir -p build
-	@printf '#define TOBYOS_BUILD_ID "%s"\n' '$(KBUILD_ID)' > $@.tmp
+	@printf '#define TOBYOS_BUILD_ID "%s"\n#define TOBYOS_BUILD_DATE "%s"\n' '$(KBUILD_ID)' '$(KBUILD_DATE)' > $@.tmp
 	@cmp -s $@.tmp $@ || mv $@.tmp $@
 	@rm -f $@.tmp
-src/procfs.o src/kernel.o: $(KBUILD_ID_H)
+src/procfs.o src/kernel.o src/syscall.o: $(KBUILD_ID_H)
 
 src/%.o: src/%.c $(HEADERS) Makefile
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -c $< -o $@

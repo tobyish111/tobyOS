@@ -115,6 +115,7 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/smp.h>
 #include <tobyos/pe.h>
 #include <tobyos/kfont.h>   /* C14b: kernel TrueType text for the GDI shims */
+#include "../build/kbuild_id.h"   /* TOBYOS_BUILD_DATE: uname's version (253) */
 
 extern void syscall_entry(void);
 
@@ -16840,8 +16841,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * own hostname here and nowhere else is involved. */
         char u[6 * 65];
         memset(u, 0, sizeof u);
-        const char *vals[6] = { "Linux", uts_nodename(), "5.0.0-tobyos",
-                                "#1 tobyOS Linux-ABI", "x86_64",
+        /* the release and version /proc/sys/kernel says (finding 253): this
+         * said 5.0.0-tobyos and "#1 tobyOS Linux-ABI" where the files said
+         * 6.1.0-tobyos and nothing */
+        const char *vals[6] = { "Linux", uts_nodename(), "6.1.0-tobyos",
+                                "#1 SMP " TOBYOS_BUILD_DATE, "x86_64",
                                 uts_domainname() };
         for (int i = 0; i < 6; i++) {
             size_t l = strlen(vals[i]);

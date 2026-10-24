@@ -927,6 +927,9 @@ static int gen_sys(const char *rest, char *buf, size_t cap) {
         memcpy(buf, s, sl); buf[sl] = 0; return (int)sl; } while (0)
     if (strcmp(rest, "kernel/ostype") == 0)    SYS_OUT("Linux\n");
     if (strcmp(rest, "kernel/osrelease") == 0) SYS_OUT("6.1.0-tobyos\n");
+    /* uname -v: Linux's "#1 SMP" and the build's date (finding 253; the
+     * file was missing, and uname's version field empty) */
+    if (strcmp(rest, "kernel/version") == 0) SYS_OUT("#1 SMP " TOBYOS_BUILD_DATE "\n");
     if (strcmp(rest, "kernel/hostname") == 0) {
         const char *hn = uts_nodename();
         char t[80]; size_t l = strlen(hn); if (l > 76) l = 76;
