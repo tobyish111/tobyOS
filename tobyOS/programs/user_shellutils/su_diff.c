@@ -2930,8 +2930,7 @@ static void dfu_sdiff_edit(int kind, const struct dfu_file *f0, const struct dfu
     char *tmpl = dfu_join(tdir, "sdiffXXXXXX");
     int fd = mkstemp(tmpl);
     if (fd < 0) dfu_err(2, errno, "%s", dfu_qf(tmpl));
-    close(fd);                  /* (libtoby has no fdopen) */
-    FILE *t = fopen(tmpl, "w");
+    FILE *t = fdopen(fd, "w");  /* libtoby's too (finding 215) */
     if (!t) dfu_err(2, errno, "%s", dfu_qf(tmpl));
     if (kind == 'd' && c->del) { fprintf(t, "--- %s ", n0); dfu_range_s(t, c->l0, c->l0 + c->del); fputc('\n', t); }
     if (kind == 'b' || kind == 'd' || kind == 'l') dfu_put_lines(t, f0, c->l0, c->l0 + c->del);

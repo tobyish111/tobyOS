@@ -188,11 +188,7 @@ static int sh_write_pass(int fd, const char *name, uint32_t pat, uintmax_t size,
         }
         done += (uintmax_t)w;
     }
-#ifdef SU_HOST
-    fsync(fd);
-#else
-    (void)sc0(ABI_SYS_SYNC);  /* libtoby has no fsync: the whole cache */
-#endif
+    fsync(fd);                /* this file's, on both builds (finding 215) */
     return 0;
 }
 

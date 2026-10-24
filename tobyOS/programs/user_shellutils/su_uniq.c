@@ -222,11 +222,9 @@ static int do_uniq(int argc, char **argv) {
         if (!f) su_error(1, errno, "%s", su_quotef(in));
     }
     if (strcmp(out, "-")) {
-        /* OUTPUT is stdout from here on (libtoby has no freopen) */
-        int ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (ofd < 0) su_error(1, errno, "%s", su_quotef(out));
-        fflush(stdout);
-        if (ofd != 1) { dup2(ofd, 1); close(ofd); }
+        /* OUTPUT is stdout from here on, as GNU's freopen puts it (libtoby
+         * has one since finding 215) */
+        if (!freopen(out, "w", stdout)) su_error(1, errno, "%s", su_quotef(out));
     }
 
     /* run by run: FIRST is the run's first line, RUN its length */

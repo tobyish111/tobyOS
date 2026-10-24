@@ -16,16 +16,15 @@
  * "failed to run command 'X': strerror", 127 when it does not exist, 126
  * when it cannot be run.
  *
- * WHAT IS NOT DONE: GNU's stdbuf makes the buffering happen by adding its
+ * HOW IT TAKES: GNU's stdbuf makes the buffering happen by adding its
  * libstdbuf.so to LD_PRELOAD, so the command's C library calls setvbuf
  * before main. A native tobyOS program is linked statically with libtoby
- * and loads nothing: the buffering of COMMAND changes only if its own C
- * library reads _STDBUF_* at startup, which libtoby does not. So LD_PRELOAD
- * is left alone (a library that is not there would only make every
- * dynamically linked Linux program warn), and what libstdbuf itself would
- * print in the child ("failed to allocate a N byte stdio buffer" for a
- * size malloc refuses, "invalid buffering mode X for stdout" for a bad
- * inherited _STDBUF_*) is not printed.
+ * and loads nothing, so libtoby reads _STDBUF_* itself at startup, as
+ * libstdbuf would, its words included ("invalid buffering mode X for
+ * stdout", "failed to allocate a N byte stdio buffer"; finding 215 --
+ * until then the buffering of COMMAND never changed). LD_PRELOAD is left
+ * alone: a library that is not there would only make every dynamically
+ * linked Linux program warn, so a Linux COMMAND keeps its own buffering.
  *
  * The old stdbuf skipped its options, said buffering could not be changed,
  * and ran the command. */

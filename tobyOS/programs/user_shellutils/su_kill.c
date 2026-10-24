@@ -186,15 +186,13 @@ static int sy_kqueue, sy_kvalue;
 /* 0 sent, else errno */
 static int sy_ksend(long pid, int sig) {
     int r;
-#ifdef SU_HOST
+    /* -q's VALUE travels with the signal on both builds: libtoby's
+     * sigqueue is the kernel's (finding 215; it was kill, the value lost) */
     if (sy_kqueue) {
         union sigval sv;
         sv.sival_int = sy_kvalue;
         r = sigqueue((pid_t)pid, sig, sv);
     } else
-#endif
-        /* tobyOS has no sigqueue: -q's VALUE cannot travel, the signal
-         * still does */
         r = kill((pid_t)pid, sig);
     return r == 0 ? 0 : errno;
 }
