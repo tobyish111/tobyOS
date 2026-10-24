@@ -13045,8 +13045,12 @@ static long lx_process_vm_rw(int pid, uint64_t liov_u, unsigned long liovcnt,
     if (!tgt || tgt->state == PROC_UNUSED || tgt->state == PROC_EMBRYO)
         return -ABI_ESRCH;
 
-    if (me->uid != 0 && me->uid != tgt->uid &&
-        !userns_capable(LCAP_SYS_ADMIN))
+    /* ptrace_may_access's rule: the same user, host root, or CAP_SYS_PTRACE
+     * over the target's user namespace. Finding 257: any CAP_SYS_ADMIN was
+     * enough -- and every process holds it in its own `unshare -U`, which
+     * let anyone read and rewrite root's processes. */
+    if (!(userns_is_initial(me) && me->uid == 0) && me->uid != tgt->uid &&
+        !userns_capable_over(LCAP_SYS_PTRACE, tgt->user_ns))
         return -ABI_EPERM;
 
     /* A thread shares its leader's address space; the mm owner is where the
@@ -13180,6 +13184,13 @@ static bool xa_valid_acl(const uint8_t *v, size_t sz) {
     return v[0] == 2 && v[1] == 0 && v[2] == 0 && v[3] == 0;
 }
 
+/* CAP over the file ST: the caller's namespace must name its owner and
+ * group (finding 257: the bare capability, which `unshare -U` hands to
+ * anyone, set security.capability on root's files) */
+static bool fowner_cap(int cap, const struct vfs_stat *st) {
+    return userns_capable_wrt_ids(cap, st->uid, st->gid);
+}
+
 /* OP (XA_GET, XA_SET, XA_REMOVE) of NAME on the node ST at KPATH, VAL/SZ
  * the value to set: 0, or the errno */
 static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
@@ -13195,10 +13206,10 @@ static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
         if (!write) return 0;
         if (strcmp(name, "security.capability") == 0) {
             if (op == XA_SET && !xa_valid_caps(val, sz)) return -ABI_EINVAL;
-            return userns_capable(LCAP_SETFCAP) ? 0 : -ABI_EPERM;
+            return fowner_cap(LCAP_SETFCAP, st) ? 0 : -ABI_EPERM;
         }
         if (strcmp(name, "security.selinux") == 0)
-            return (owner || userns_capable(LCAP_FOWNER)) ? 0 : -ABI_EPERM;
+            return (owner || fowner_cap(LCAP_FOWNER, st)) ? 0 : -ABI_EPERM;
         return admin ? 0 : -ABI_EPERM;
     }
     if (xa_prefix(name, "system.")) {
@@ -13207,7 +13218,7 @@ static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
         if (!acl) return -ABI_ENOTSUP;
         if (!write) return -ABI_ENODATA;           /* no ACL is kept */
         if (op == XA_SET && !xa_valid_acl(val, sz)) return -ABI_EINVAL;
-        if (!(owner || userns_capable(LCAP_FOWNER))) return -ABI_EPERM;
+        if (!(owner || fowner_cap(LCAP_FOWNER, st))) return -ABI_EPERM;
         return -ABI_ENOTSUP;
     }
     if (xa_prefix(name, "trusted.")) {
@@ -13215,7 +13226,7 @@ static long xattr_policy(const char *kpath, const struct vfs_stat *st, int op,
     } else if (xa_prefix(name, "user.")) {
         if (!reg && !dir) return write ? -ABI_EPERM : -ABI_ENODATA;
         if (dir && (st->mode & 01000u) && write && !owner &&
-            !userns_capable(LCAP_FOWNER)) return -ABI_EPERM;
+            !fowner_cap(LCAP_FOWNER, st)) return -ABI_EPERM;
     }
     int pc = vfs_perm_check_st(st, write ? VFS_WANT_WRITE : VFS_WANT_READ);
     if (pc != VFS_OK) return vfs_err_to_abi(pc);
@@ -16325,7 +16336,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
          * this, so it must NOT be restricted to AF_INET fds. */
         if (f->kind == FILE_KIND_SOCKET && f->sock)
             return rtnl_sock_ioctl(f->sock->net_ns,
-                                   userns_capable(LCAP_NET_ADMIN),
+                                   userns_capable_over(LCAP_NET_ADMIN,
+                                       net_ns_owner(f->sock->net_ns)),   /* 257 */
                                    (unsigned long)a2, (unsigned long)a3);
         return -ABI_ENOTTY;
     }

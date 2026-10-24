@@ -460,6 +460,29 @@ bool userns_covers(void *anc, void *nsp) {
     }
 }
 
+/* CAP in the caller's user namespace, and that namespace OWNER_NS or one
+ * above it: what acting on an object OWNER_NS owns takes (Linux's
+ * ns_capable(owner, CAP)). Finding 257: the bare capability was asked,
+ * and every process holds all of them in its own `unshare -U`. */
+bool userns_capable_over(int cap, void *owner_ns) {
+    struct proc *me = current_proc();
+    if (!me) return true;                     /* kernel context */
+    return userns_capable(cap) && userns_covers(me->user_ns, owner_ns);
+}
+
+/* CAP over a file owned by KUID:KGID: the capability in the caller's
+ * namespace, and both ids named there (Linux's capable_wrt_inode_uidgid)
+ * -- a namespace's root holds nothing over a file of someone it has no
+ * name for */
+bool userns_capable_wrt_ids(int cap, uint32_t kuid, uint32_t kgid) {
+    struct proc *me = current_proc();
+    if (!me) return true;
+    struct user_ns *ns = proc_userns(me);
+    return userns_capable(cap) &&
+           map_k2v_raw(ns, true, kuid) != 0xFFFFFFFFu &&
+           map_k2v_raw(ns, false, kgid) != 0xFFFFFFFFu;
+}
+
 /* May the caller make a user namespace inside its own? Only when that one
  * has names for the caller's uid and gid (Linux's create_user_ns: EPERM
  * otherwise) -- the new namespace's owner must be someone there. */

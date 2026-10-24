@@ -1404,7 +1404,8 @@ long sock_netlink_send(struct sock *s, const void *kbuf, size_t n) {
      * answering for the namespace it was created in. Same rule as every other
      * network operation here (net_ns_has_network). */
     size_t used = rtnl_process(s->net_ns, s->nl_pid,
-                               userns_capable(LCAP_NET_ADMIN),
+                               userns_capable_over(LCAP_NET_ADMIN,
+                                                   net_ns_owner(s->net_ns)),
                                kbuf, n, out, NL_REPLY_CAP);
 
     if (used) sock_deliver(s, 0, 0, out, used);

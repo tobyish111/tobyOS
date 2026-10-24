@@ -376,7 +376,12 @@ long nsproxy_apply_clone_flags(struct proc *child, uint32_t flags) {
         mount_ns_put(old);
     }
     if (want & CLONE_NEWNET) {            /* slice 12 */
+        /* owned by the CHILD's user namespace -- borrowed for the call, as
+         * the mount namespace above (finding 257) */
+        void *save_un = me->user_ns;
+        me->user_ns = child->user_ns;
         void *ns = net_ns_create();
+        me->user_ns = save_un;
         if (!ns) return -ABI_ENOMEM;
         void *old = child->net_ns;
         child->net_ns = ns;

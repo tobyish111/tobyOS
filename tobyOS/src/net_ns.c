@@ -43,6 +43,11 @@
 struct net_ns {
     int      refs;
     uint64_t inum;
+    /* the user namespace that owns it (a reference; NULL the initial one):
+     * configuring it takes CAP_NET_ADMIN there or above, as Linux's
+     * (finding 257: any caller's NET_ADMIN configured the namespace its
+     * socket was in -- after an unprivileged `unshare -U`, the host's) */
+    void    *owner_user_ns;
     /* ---- cut 2 ----
      * The namespace's interface. ONE device is enough for a container: a veth
      * end. Deliberately NOT a refactor of net.c's `g_net_devs` -- the INITIAL
@@ -178,6 +183,9 @@ void *net_ns_create(void) {
     memset(ns, 0, sizeof(*ns));
     ns->refs = 1;
     ns->inum = ns_inum_alloc();
+    { struct proc *cp = current_proc();          /* finding 257 */
+      ns->owner_user_ns = cp ? cp->user_ns : 0;
+      user_ns_get(ns->owner_user_ns); }
     /* 1, not 3: a fresh namespace has no lo and no eth0 to leave room for.
      * REPORTING A LOOPBACK IT DOES NOT HAVE WOULD BE THE FABRICATION -- this
      * stack has no loopback anywhere (cut 1's founding measurement), so a new
@@ -214,10 +222,12 @@ void net_ns_put(void *p) {
      * exactly what Linux reports for the surviving half of a torn-down pair. */
     for (size_t i = 0; i < ns->ndev; i++)
         if (ns->ifs[i].dev) netns_veth_release(ns->ifs[i].dev);
+    user_ns_put(ns->owner_user_ns);
     kfree(ns);
 }
 
 uint64_t net_ns_inum(void *p) { return as_nns(p)->inum; }
+void *net_ns_owner(void *p) { return as_nns(p)->owner_user_ns; }
 
 /* THE enforcement predicate, and the only one.
  *

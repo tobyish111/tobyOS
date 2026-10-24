@@ -272,6 +272,10 @@ bool userns_setgroups_allowed(struct proc *p);
 bool userns_may_setgroups(struct proc *p);
 bool userns_may_create(void);
 bool userns_covers(void *anc, void *ns);   /* ANC is NS or above it */
+/* Finding 257: a capability over an object's owning namespace, and over a
+ * file's ids */
+bool userns_capable_over(int cap, void *owner_ns);
+bool userns_capable_wrt_ids(int cap, uint32_t kuid, uint32_t kgid);
 
 /* Which user namespace owns a mount namespace (vfs.c). NULL == initial. */
 void *mount_ns_owner(void *mnt_ns);
@@ -289,6 +293,7 @@ void    *net_ns_create(void);
 void     net_ns_get(void *ns);
 void     net_ns_put(void *ns);
 uint64_t net_ns_inum(void *ns);
+void    *net_ns_owner(void *ns);   /* finding 257: NULL = the initial user ns */
 bool     net_ns_is_initial(struct proc *p);
 /* May a socket created in `sock_ns` touch a real interface? Asked of the
  * SOCKET's namespace, not the caller's, so a socket predating an unshare keeps
@@ -374,6 +379,7 @@ struct net_dev *net_ctx_dev(void);
 #define LCAP_SETUID     7
 #define LCAP_NET_ADMIN  12
 #define LCAP_SYS_CHROOT 18
+#define LCAP_SYS_PTRACE 19   /* finding 257 */
 #define LCAP_SYS_ADMIN  21
 #define LCAP_MKNOD      27
 #define LCAP_FOWNER     3
