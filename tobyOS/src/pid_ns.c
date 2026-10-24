@@ -47,6 +47,11 @@ struct pid_ns {
      * (kslot), not its kpid; k_of_v by the vpid, holding the kpid. */
     int32_t         v_of_k[PROC_MAX];
     int32_t         k_of_v[PROC_MAX];
+    /* the user namespace that owns it (a reference; NULL the initial one):
+     * whoever mounts a proc of it must hold CAP_SYS_ADMIN there or above,
+     * as Linux's (finding 241: the root of an `unshare -r` mounted a proc
+     * of the initial pid namespace) */
+    void           *owner_user_ns;
 };
 
 /* The initial pid namespace. Deliberately has NO maps: level 0 is the IDENTITY
@@ -78,10 +83,12 @@ static inline struct pid_ns *proc_pidns(struct proc *p) {
  * refcounting
  * =================================================================== */
 
-void *pid_ns_create(void *parent_ns) {
+void *pid_ns_create(void *parent_ns, void *owner_user_ns) {
     struct pid_ns *ns = kmalloc(sizeof(*ns));
     if (!ns) return 0;
     memset(ns, 0, sizeof(*ns));
+    ns->owner_user_ns = owner_user_ns;
+    user_ns_get(owner_user_ns);
     struct pid_ns *par = as_ns(parent_ns);
     ns->refs   = 1;
     ns->inum   = ns_inum_alloc();
@@ -113,12 +120,15 @@ void pid_ns_put(void *p) {
          * cascade. Loop rather than recurse: nesting depth is unbounded from
          * userspace, and a recursive put would be a stack-depth attack. */
         struct pid_ns *par = ns->parent;
+        user_ns_put(ns->owner_user_ns);
         kfree(ns);
         ns = par;
     }
 }
 
 uint64_t pid_ns_inum(void *p) { return as_ns(p)->inum; }
+
+void *pid_ns_owner(void *p) { return as_ns(p)->owner_user_ns; }
 
 /* ===================================================================
  * translation
@@ -264,7 +274,7 @@ long pid_ns_place_child(struct proc *child, struct proc *parent,
 
     if (clone_flags & CLONE_NEWPID) {
         struct pid_ns *base = parent ? proc_pidns(parent) : &g_init_pid_ns;
-        void *fresh = pid_ns_create(base);
+        void *fresh = pid_ns_create(base, child->user_ns);
         if (!fresh) return -ABI_ENOMEM;
         /* Drop the reference memcpy'd from the parent before overwriting. */
         pid_ns_put(child->pid_ns);

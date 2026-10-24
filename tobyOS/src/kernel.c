@@ -9847,8 +9847,10 @@ void _start(void) {
              * `-p -f` this is not blocked by the vfork gap. Two-sided and
              * FUNCTIONAL: the marker must be reachable through the bind INSIDE
              * the namespace and unreachable through it outside. */
+            /* (/bbmnt made first: Linux binds only onto a name that exists,
+             * and this leaned on binding onto any name until finding 241) */
             { "/bin/busybox", "sh",
-              "/bin/busybox touch /data/bbm && "
+              "/bin/busybox touch /data/bbm && /bin/busybox mkdir -p /bbmnt && "
               "M=$(/bin/busybox readlink /proc/self/ns/mnt) && "
               "I=$(/bin/busybox unshare -m /bin/busybox sh -c "
               "'/bin/busybox mount -o bind /data /bbmnt >/dev/null 2>&1; "
@@ -9856,7 +9858,7 @@ void _start(void) {
               "echo \"[NSMNT] outer=$M inner=$I\" && "
               "[ -n \"$I\" ] && [ \"$M\" != \"$I\" ] && "
               "! /bin/busybox test -f /bbmnt/bbm && "
-              "/bin/busybox rm -f /data/bbm",
+              "/bin/busybox rmdir /bbmnt && /bin/busybox rm -f /data/bbm",
               0, "busybox unshare -m isolates mounts" },
 
             /* NO `unshare -f` CASE HERE, ON PURPOSE.

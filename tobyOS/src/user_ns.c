@@ -117,13 +117,18 @@ void *user_ns_create(void) {
     ns->owner_kuid = me ? me->uid : 0;
     ns->owner_kgid = me ? me->gid : 0;
     /* Frozen NOW, before the caller's capabilities are widened -- see the field
-     * comment for why this cannot be recomputed later. */
-    ns->creator_was_root = (!me || me->uid == 0);
+     * comment for why this cannot be recomputed later. In a namespace below
+     * the initial one, "root" is CAP_SETUID there: what root of an `unshare
+     * -r` holds, and what lets it map its own 0 onward. */
+    ns->creator_was_root = (!me || (par->level == 0 ? me->uid == 0
+                                    : (me->lcap_eff & (1ull << LCAP_SETUID)) != 0));
     /* Linux: until uid_map is written, EVERY id reports as the overflow id.
      * n_umap == 0 means exactly that (see userns_k2v), so there is nothing to
      * initialise -- and no accidental identity mapping, which would have handed
-     * the namespace the host's id space. */
-    ns->setgroups_allowed = true;
+     * the namespace the host's id space. setgroups is the parent's: a
+     * namespace made inside one that denied it denies it too (Linux copies
+     * the flag), or the deny could be undone by nesting. */
+    ns->setgroups_allowed = par->setgroups_allowed;
     return ns;
 }
 
@@ -239,11 +244,28 @@ bool userns_owns_mnt_ns(struct proc *p) {
  * /proc/PID/{uid_map,gid_map,setgroups}
  * =================================================================== */
 
+/* KID as namespace NS numbers it, (uint32_t)-1 when NS has no name for it --
+ * what Linux's from_kuid() gives a map's reader */
+static uint32_t map_k2v_raw(struct user_ns *ns, bool want_uid, uint32_t kid) {
+    if (ns->level == 0) return kid;
+    const struct id_extent *e = want_uid ? ns->umap : ns->gmap;
+    int n = want_uid ? ns->n_umap : ns->n_gmap;
+    for (int i = 0; i < n; i++)
+        if (kid >= e[i].lower && kid - e[i].lower < e[i].count)
+            return e[i].first + (kid - e[i].lower);
+    return 0xFFFFFFFFu;
+}
+
 int userns_render_map(struct proc *p, bool want_uid, char *buf, size_t cap) {
     struct user_ns *ns = proc_userns(p);
     const struct id_extent *e = want_uid ? ns->umap : ns->gmap;
     int n = want_uid ? ns->n_umap : ns->n_gmap;
     size_t off = 0;
+    /* The lower ids are kept as the kernel's (finding 241) and shown as the
+     * READER's namespace numbers them -- its parent's, when the reader is in
+     * the namespace itself: what Linux's uid_m_show does. */
+    struct user_ns *rd = proc_userns(current_proc());
+    if (rd == ns) rd = ns->parent ? ns->parent : &g_init_user_ns;
 
     /* The initial namespace's map is the whole id space, which is what Linux
      * shows for pid 1: "         0          0 4294967295". */
@@ -256,12 +278,14 @@ int userns_render_map(struct proc *p, bool want_uid, char *buf, size_t cap) {
     }
     for (int i = 0; i < n; i++) {
         char line[64]; size_t li = 0;
+        /* "%10u %10u %10u\n", Linux's columns (finding 241: unpadded) */
         #define PUTU(v) do { char t[16]; int tl = 0; uint32_t x = (v); \
             if (!x) t[tl++] = '0'; \
             while (x) { t[tl++] = (char)('0' + x % 10); x /= 10; } \
+            for (int pd = tl; pd < 10; pd++) line[li++] = ' '; \
             while (tl) line[li++] = t[--tl]; } while (0)
         PUTU(e[i].first); line[li++] = ' ';
-        PUTU(e[i].lower); line[li++] = ' ';
+        PUTU(map_k2v_raw(rd, want_uid, e[i].lower)); line[li++] = ' ';
         PUTU(e[i].count); line[li++] = '\n';
         #undef PUTU
         if (off + li >= cap) break;
@@ -344,6 +368,27 @@ long userns_write_map(struct proc *target, bool want_uid,
     }
     if (n == 0) return -ABI_EINVAL;
 
+    /* Each lower range is the PARENT namespace's numbers (finding 241: they
+     * were taken as the kernel's, so the root of an `unshare -r` writing
+     * "4242 0 1" for a namespace of its own named host uid 0). Kept as the
+     * kernel's ids from here on; a range the parent has no single extent
+     * for is EPERM, as Linux's map_id_range_down. */
+    if (ns->parent) {
+        struct user_ns *par = ns->parent;
+        const struct id_extent *pe = want_uid ? par->umap : par->gmap;
+        int pn = want_uid ? par->n_umap : par->n_gmap;
+        for (int i = 0; i < n; i++) {
+            int j;
+            for (j = 0; j < pn; j++)
+                if (tmp[i].lower >= pe[j].first &&
+                    (uint64_t)tmp[i].lower + tmp[i].count <=
+                    (uint64_t)pe[j].first + pe[j].count)
+                    break;
+            if (j == pn) return -ABI_EPERM;
+            tmp[i].lower = pe[j].lower + (tmp[i].lower - pe[j].first);
+        }
+    }
+
     /* Privilege check -- against the PARENT namespace, via the flag frozen at
      * creation. NOT userns_capable(): that reports capabilities in the NEW
      * namespace, which every creator has, and using it here would let any
@@ -374,15 +419,18 @@ long userns_write_setgroups(struct proc *target, const char *buf, size_t len) {
     if (!target) return -ABI_EINVAL;
     struct user_ns *ns = proc_userns(target);
     if (ns->level == 0) return -ABI_EPERM;
-    /* Once gid_map is set, setgroups cannot be re-allowed: that would reopen
-     * the hole denying it was meant to close. */
+    /* Linux's two rules (finding 241: the second was the other way round):
+     * once denied, setgroups is never allowed again -- that would reopen the
+     * hole denying it closed, in this namespace or one made inside it; and
+     * it cannot be denied after gid_map is written, when what the map was
+     * allowed to say depended on it. */
     if (len >= 4 && strncmp(buf, "deny", 4) == 0) {
+        if (ns->n_gmap != 0) return -ABI_EPERM;
         ns->setgroups_allowed = false;
         return (long)len;
     }
     if (len >= 5 && strncmp(buf, "allow", 5) == 0) {
-        if (ns->n_gmap != 0) return -ABI_EPERM;
-        ns->setgroups_allowed = true;
+        if (!ns->setgroups_allowed) return -ABI_EPERM;
         return (long)len;
     }
     return -ABI_EINVAL;
@@ -390,4 +438,35 @@ long userns_write_setgroups(struct proc *target, const char *buf, size_t len) {
 
 bool userns_setgroups_allowed(struct proc *p) {
     return proc_userns(p)->setgroups_allowed;
+}
+
+/* May P's namespace hand out supplementary groups at all? Linux's
+ * userns_may_setgroups: once gid_map is written, and while setgroups is
+ * allowed (finding 241: setgroups(2) asked only "is the host uid 0") */
+bool userns_may_setgroups(struct proc *p) {
+    struct user_ns *ns = proc_userns(p);
+    if (ns->level == 0) return true;
+    return ns->n_gmap != 0 && ns->setgroups_allowed;
+}
+
+/* Is ANC the user namespace NS, or one it was made inside? What reaching
+ * an object NS owns takes, capability in hand (Linux's ns_capable walks
+ * the same line) -- NULL is the initial namespace, above every other. */
+bool userns_covers(void *anc, void *nsp) {
+    struct user_ns *a = as_uns(anc);
+    for (struct user_ns *ns = as_uns(nsp); ; ns = ns->parent ? ns->parent : &g_init_user_ns) {
+        if (ns == a) return true;
+        if (ns == &g_init_user_ns) return false;
+    }
+}
+
+/* May the caller make a user namespace inside its own? Only when that one
+ * has names for the caller's uid and gid (Linux's create_user_ns: EPERM
+ * otherwise) -- the new namespace's owner must be someone there. */
+bool userns_may_create(void) {
+    struct proc *me = current_proc();
+    struct user_ns *ns = proc_userns(me);
+    if (!me || ns->level == 0) return true;
+    return map_k2v_raw(ns, true, (uint32_t)me->uid) != 0xFFFFFFFFu &&
+           map_k2v_raw(ns, false, (uint32_t)me->gid) != 0xFFFFFFFFu;
 }

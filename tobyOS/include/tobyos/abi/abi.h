@@ -1400,7 +1400,12 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
                                         aging and password state, what
                                         shadow-utils' passwd and chpasswd
                                         change (finding 213): ABI_SHADOW_* */
-#define ABI_SYS_NR_MAX          239
+#define ABI_SYS_UNSHARE         240  /* (flags) -> 0|-E: unshare(2), Linux's
+                                        CLONE_NEW* bits -- what the Linux
+                                        personality has had since slice 8,
+                                        for tobyOS's unshare(1) (finding
+                                        241) */
+#define ABI_SYS_NR_MAX          240
 
 #define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
                                  account's own user */

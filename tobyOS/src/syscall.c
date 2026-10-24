@@ -304,6 +304,7 @@ static long vfs_err_to_abi(long rv) {
     case VFS_ERR_XDEV:        return -ABI_EXDEV;    /* Phase G: hard links */
     case VFS_ERR_NOTEMPTY:    return -ABI_ENOTEMPTY; /* batch 31: rename */
     case VFS_ERR_BADF:        return -ABI_EBADF;     /* finding 216 */
+    case VFS_ERR_BUSY:        return -ABI_EBUSY;     /* finding 241 */
     default:                  return rv;            /* already an ABI errno */
     }
 }
@@ -6990,6 +6991,11 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return src == 0 ? 0 : -ABI_EIO;
     }
 
+    case ABI_SYS_UNSHARE:
+        /* (flags): unshare(2) for a native program -- the namespaces the
+         * Linux personality's has made since slice 8, under the same rules
+         * (ns_unshare), for tobyOS's unshare(1) (finding 241) */
+        return ns_unshare((uint32_t)a1);
     case ABI_SYS_SHADOW: {
         /* (op, name, arg): the account's aging and password state, as
          * shadow-utils keeps them in /etc/shadow (finding 213). Changes are
@@ -14288,15 +14294,28 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         struct proc *cp = current_proc();
         int cnt = (int)a1;
         if (!cp) return -ABI_EPERM;
-        if (cp->uid != 0) return -ABI_EPERM;  /* privileged operation */
+        /* Linux's may_setgroups (finding 241: only "is the host uid 0"):
+         * CAP_SETGID in the caller's namespace, and that namespace's gid_map
+         * written with setgroups allowed. The ids are the namespace's,
+         * translated -- one it has no name for is EINVAL -- and checked all
+         * before any is kept. */
+        if (userns_is_initial(cp) ? cp->uid != 0
+                                  : !(userns_capable(LCAP_SETGID) &&
+                                      userns_may_setgroups(cp)))
+            return -ABI_EPERM;
         if (cnt < 0 || cnt > PROC_NGROUPS_MAX) return -ABI_EINVAL;
+        int kg[PROC_NGROUPS_MAX];
         for (int i = 0; i < cnt; i++) {
             uint32_t g = 0;
+            bool gok = false;
             if (!a2 || copy_from_user(&g, (const void *)(uintptr_t)
                                       (a2 + (uint64_t)i * 4), 4) != 0)
                 return -ABI_EFAULT;
-            cp->groups[i] = (int)g;
+            uint32_t k = userns_v2k_gid(g, &gok);
+            if (!gok) return -ABI_EINVAL;
+            kg[i] = (int)k;
         }
+        for (int i = 0; i < cnt; i++) cp->groups[i] = kg[i];
         cp->ngroups = cnt;
         return 0;
     }
@@ -14405,11 +14424,10 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (msflags & 0x4u)  vflags |= VFS_MNT_NODEV;    /* MS_NODEV  */
         if (msflags & 0x8u)  vflags |= VFS_MNT_NOEXEC;   /* MS_NOEXEC */
 
-        /* MS_BIND: make an existing subtree visible at a second point. We have
-         * no per-mount subtree redirection, so a bind is honest only when the
-         * source is itself a mount point -- we re-register that mount's ops
-         * and data at the new location. Anything else would need path
-         * rewriting the VFS cannot express, so refuse rather than pretend. */
+        /* MS_BIND: make an existing subtree, or a file, visible at a second
+         * point (vfs_bind; finding 241 -- only a mount's root could be). Both
+         * ends must exist, and be both directories or neither (ENOTDIR); a
+         * source that is a link is what it names. */
         if (msflags & 0x1000u) {                          /* MS_BIND */
             char kbind[ABI_PATH_MAX];
             {   int rr_ = resolve_user_path((const char *)a1, kbind, sizeof kbind);
@@ -14419,10 +14437,16 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
              * is stored and never enforced is the same class of lie as a no-op
              * syscall returning success, so the refusal is real and tested. */
             if (vfs_mount_is_unbindable(kbind)) return -ABI_EINVAL;
-            const struct vfs_ops *bops = 0; void *bdata = 0;
-            if (vfs_mount_lookup(kbind, &bops, &bdata) != VFS_OK)
-                return -ABI_EINVAL;
-            int rc = vfs_mount_flags(ktgt, bops, bdata, vflags);
+            struct vfs_stat bs, ts;
+            if (vfs_stat(kbind, &bs) == VFS_OK && bs.type == VFS_TYPE_SYMLINK) {
+                char nx[ABI_PATH_MAX];
+                if (vfs_follow_link(kbind, nx, sizeof nx) != VFS_OK) return -ABI_ENOENT;
+                memcpy(kbind, nx, strlen(nx) + 1);
+            }
+            if (vfs_stat(kbind, &bs) != VFS_OK) return -ABI_ENOENT;
+            if (vfs_stat_follow(ktgt, &ts) != VFS_OK) return -ABI_ENOENT;
+            if ((bs.type == VFS_TYPE_DIR) != (ts.type == VFS_TYPE_DIR)) return -ABI_ENOTDIR;
+            int rc = vfs_bind(ktgt, kbind, vflags);
             return (rc == VFS_OK) ? 0 : vfs_err_to_abi(rc);
         }
 
@@ -14463,6 +14487,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         }
         if (strcmp(kfs, "proc")    == 0 || strcmp(kfs, "cgroup2") == 0 ||
             strcmp(kfs, "sysfs")   == 0) {
+            /* A proc shows the caller's pid namespace: mounting one takes
+             * CAP_SYS_ADMIN over the user namespace that owns it, as
+             * Linux's (finding 241) -- the root of an `unshare -r` may not
+             * mount one of the initial pid namespace, the first child of an
+             * `unshare -rpf` may of its own. */
+            if (kfs[0] == 'p' && !userns_covers(mp->user_ns, pid_ns_owner(mp->pid_ns)))
+                return -ABI_EPERM;
             int rc = (kfs[0] == 'p') ? procfs_mount_at(ktgt)
                    : (kfs[0] == 's') ? sysfs_mount_at(ktgt)
                                      : cgroup_mount_at(ktgt);
@@ -14983,6 +15014,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         if (rr) return rr;
         rr = resolve_user_path_at((int)a3, (const char *)a4, kn, sizeof kn);
         if (rr) return rr;
+        /* A MOUNT POINT IS BUSY (finding 241): Linux's EXDEV compares the
+         * mounts the two names' DIRECTORIES are on, so `mv tgt tgt.x` of a
+         * bind's mount point is EBUSY there -- here the mount point's own
+         * path resolved into the bind, said EXDEV, and mv copied the bind's
+         * contents out and removed them from its source. */
+        if (strcmp(ko, "/") && vfs_mount_lookup(ko, 0, 0) == VFS_OK) return -ABI_EBUSY;
+        if (strcmp(kn, "/") && vfs_mount_lookup(kn, 0, 0) == VFS_OK) return -ABI_EBUSY;
         /* two filesystems are EXDEV before anything the flags ask, as
          * Linux's: mv's NOREPLACE try onto another disk must learn to copy
          * (it said EEXIST, and mv reported the wrong failure) */

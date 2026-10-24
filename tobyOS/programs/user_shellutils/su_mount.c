@@ -591,6 +591,12 @@ static int mt_mount_one(struct mt_ctx *x, const char *src, const char *tgt,
     case EROFS:
         su_error(0, 0, "%s: cannot mount %s read-only.", ctgt, ksrc);
         break;
+    case ENOTDIR:               /* a bind whose two ends differ (finding 241) */
+        if (stat(ctgt, &ss) == 0 && !S_ISDIR(ss.st_mode))
+            su_error(0, 0, "%s: mount point is not a directory.", ctgt);
+        else
+            su_error(0, 0, "%s: mount() failed: %s.", ctgt, strerror(e));
+        break;
     default:
         su_error(0, 0, "%s: mount(2) system call failed: %s.", ctgt, strerror(e));
         break;

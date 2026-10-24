@@ -292,6 +292,11 @@ int chroot(const char *path) {
     return (int)__toby_check(toby_sc1(ABI_SYS_CHROOT, (long)(uintptr_t)path));
 }
 
+/* unshare(2), the kernel's (finding 241; there was none): <sched.h> */
+int unshare(int flags) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_UNSHARE, (long)(unsigned)flags));
+}
+
 /* The twelve extended-attribute calls (finding 225; there were none):
  * ABI_SYS_XATTR carries Linux's number for each -- 188 setxattr, then
  * lsetxattr, fsetxattr, getxattr (191), lgetxattr, fgetxattr, listxattr

@@ -220,7 +220,8 @@ void pid_ns_kill_members(struct proc *p);
 int  pid_ns_reaper_kpid(struct proc *dead);
 
 /* Lifecycle hooks used by nsproxy.c's generic dispatch. */
-void    *pid_ns_create(void *parent_ns);
+void    *pid_ns_create(void *parent_ns, void *owner_user_ns);
+void    *pid_ns_owner(void *pid_ns);     /* finding 241: NULL = initial */
 void     pid_ns_get(void *ns);
 void     pid_ns_put(void *ns);
 uint64_t pid_ns_inum(void *ns);
@@ -266,6 +267,11 @@ long userns_write_map(struct proc *target, bool want_uid,
                       const char *buf, size_t len);
 long userns_write_setgroups(struct proc *target, const char *buf, size_t len);
 bool userns_setgroups_allowed(struct proc *p);
+/* Finding 241: setgroups(2) only once gid_map is written and setgroups is
+ * allowed; a user namespace only by a caller its own namespace has ids for */
+bool userns_may_setgroups(struct proc *p);
+bool userns_may_create(void);
+bool userns_covers(void *anc, void *ns);   /* ANC is NS or above it */
 
 /* Which user namespace owns a mount namespace (vfs.c). NULL == initial. */
 void *mount_ns_owner(void *mnt_ns);

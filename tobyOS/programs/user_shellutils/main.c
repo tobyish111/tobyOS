@@ -168,6 +168,7 @@ static char *first_line(char *s) {
 #include "su_chcon.c"
 #include "su_runcon.c"
 #include "su_attr.c"
+#include "su_unshare.c"
 #include "su_txio.c"
 #include "su_head.c"
 #include "su_tail.c"
@@ -316,6 +317,7 @@ int main(int argc, char **argv) {
     if (!strcmp(base, "runcon"))    return do_runcon(argc, argv);
     if (!strcmp(base, "getfattr"))  return do_getfattr(argc, argv);
     if (!strcmp(base, "setfattr"))  return do_setfattr(argc, argv);
+    if (!strcmp(base, "unshare"))   return do_unshare(argc, argv);
     if (!strcmp(base, "head"))      return do_head(argc, argv);
     if (!strcmp(base, "tail"))      return do_tail(argc, argv);
     if (!strcmp(base, "wc"))        return do_wc(argc, argv);

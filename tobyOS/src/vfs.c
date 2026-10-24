@@ -192,11 +192,13 @@ static void ns_remove_raw(struct mount_ns *ns, const char *norm) {
  * This also closes a PRE-EXISTING hazard: slice 5's MS_BIND already registers a
  * second table entry sharing one (ops,data), so unmounting either end called
  * ops->umount(data) and left the other pointing at torn-down state. */
+static bool bind_holds(const struct vfs_ops *ops, void *data);   /* below */
+
 static bool data_still_referenced(const struct vfs_ops *ops, void *data) {
     for (struct mount_ns *ns = g_mnt_ns_list; ns; ns = ns->next)
         for (size_t i = 0; i < ns->count; i++)
             if (ns->m[i].ops == ops && ns->m[i].data == data) return true;
-    return false;
+    return bind_holds(ops, data);          /* a bind of a subtree (241) */
 }
 
 /* Propagate a new mount at `norm` outward from `origin`. Returns the peer group
@@ -655,6 +657,205 @@ static struct vfs_mount *resolve(const char *path, const char **relative) {
     if (rel[0] == 0) rel = "/";
     *relative = rel;
     return best;
+}
+
+/* ---- a bind mount of a subtree or a file (finding 241) --------------------
+ *
+ * A bind whose source is a mount's root re-registers that mount's ops and
+ * data at the target, as it always has. Any other source -- a directory
+ * inside a filesystem, or a file -- is a mount of its own whose ops put the
+ * source's path in that filesystem before each path they are given and
+ * hand it on: /tgt/x is the source filesystem's src/sub/x, and /tgt itself
+ * (a file bind's whole point) is src/sub. Its open and opendir give the
+ * handle the source filesystem's ops and data, so whatever is done through
+ * a handle goes straight there. The source filesystem stays alive while a
+ * bind of it does (data_still_referenced), as Linux's superblock does. The
+ * VFS resolves by path prefix and could express neither: `mount --bind
+ * ./pw /etc/passwd` was EINVAL (id's and pinky's namespace cases). */
+struct bind_mnt {
+    struct bind_mnt      *next;
+    const struct vfs_ops *ops;      /* the source filesystem's */
+    void                 *data;
+    char                 *root;     /* the source, as resolve gives it there */
+    bool                  live;
+    struct vfs_ops        wops;     /* this bind's ops */
+};
+static struct bind_mnt *g_binds;
+
+static bool bind_holds(const struct vfs_ops *ops, void *data) {
+    for (struct bind_mnt *b = g_binds; b; b = b->next)
+        if (b->live && b->ops == ops && b->data == data) return true;
+    return false;
+}
+
+static struct bind_mnt *bind_of(const struct vfs_mount *m) {
+    for (struct bind_mnt *b = g_binds; b; b = b->next)
+        if (m->data == (void *)b && m->ops == &b->wops) return b;
+    return 0;
+}
+
+/* the source filesystem's path for REL under the bind, into BUF */
+static const char *bm_rel(struct bind_mnt *b, const char *rel, char *buf, size_t cap) {
+    if (!rel || !rel[0] || (rel[0] == '/' && !rel[1])) return b->root;
+    size_t rl = strlen(b->root), l = strlen(rel);
+    if (rl + l + 1 > cap) return 0;
+    memcpy(buf, b->root, rl);
+    memcpy(buf + rl, rel, l + 1);
+    return buf;
+}
+#define BM_REL(b, rel, buf) bm_rel((b), (rel), (buf), sizeof(buf))
+#define BM_FWD(call)        do { if (!r) return VFS_ERR_NAMETOOLONG; return (call); } while (0)
+
+static int bm_open(void *mnt, const char *path, struct vfs_file *out) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    out->ops = b->ops;                 /* the handle is the source's */
+    out->mnt = b->data;
+    BM_FWD(b->ops->open(b->data, r, out));
+}
+static int bm_create(void *mnt, const char *path, uint32_t uid, uint32_t gid, uint32_t mode) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->create(b->data, r, uid, gid, mode));
+}
+static int bm_unlink(void *mnt, const char *path) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->unlink(b->data, r));
+}
+static int bm_rename(void *mnt, const char *op, const char *np) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX], q[VFS_PATH_MAX];
+    const char *r = BM_REL(b, op, p), *r2 = BM_REL(b, np, q);
+    if (!r2) return VFS_ERR_NAMETOOLONG;
+    BM_FWD(b->ops->rename(b->data, r, r2));
+}
+static int bm_mkdir(void *mnt, const char *path, uint32_t uid, uint32_t gid, uint32_t mode) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->mkdir(b->data, r, uid, gid, mode));
+}
+static int bm_opendir(void *mnt, const char *path, struct vfs_dir *out) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    out->ops = b->ops;                 /* the handle is the source's, and */
+    out->mnt = b->data;
+    out->vrel = 0;                     /* vfs_mount_child's check is not its */
+    BM_FWD(b->ops->opendir(b->data, r, out));
+}
+static int bm_stat(void *mnt, const char *path, struct vfs_stat *out) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->stat(b->data, r, out));
+}
+static int bm_chmod(void *mnt, const char *path, uint32_t mode) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->chmod(b->data, r, mode));
+}
+static int bm_chown(void *mnt, const char *path, uint32_t uid, uint32_t gid) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->chown(b->data, r, uid, gid));
+}
+static int bm_utimes(void *mnt, const char *path, uint64_t mt, uint64_t at) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->utimes(b->data, r, mt, at));
+}
+static int bm_truncate(void *mnt, const char *path, uint64_t len) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->truncate(b->data, r, len));
+}
+static int bm_readlink(void *mnt, const char *path, char *buf, size_t sz) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->readlink(b->data, r, buf, sz));
+}
+static int bm_symlink(void *mnt, const char *path, const char *tgt, uint32_t uid, uint32_t gid) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->symlink(b->data, r, tgt, uid, gid));
+}
+static int bm_link(void *mnt, const char *op, const char *np) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX], q[VFS_PATH_MAX];
+    const char *r = BM_REL(b, op, p), *r2 = BM_REL(b, np, q);
+    if (!r2) return VFS_ERR_NAMETOOLONG;
+    BM_FWD(b->ops->link(b->data, r, r2));
+}
+static int bm_statfs(void *mnt, struct vfs_statfs *out) {
+    struct bind_mnt *b = mnt;
+    return b->ops->statfs(b->data, out);
+}
+static int bm_sync(void *mnt) {
+    struct bind_mnt *b = mnt;
+    return b->ops->sync(b->data);
+}
+static int bm_setrdev(void *mnt, const char *path, uint32_t maj, uint32_t min) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    BM_FWD(b->ops->setrdev(b->data, r, maj, min));
+}
+static long bm_xattr(void *mnt, const char *path, int op, const char *name,
+                     void *buf, size_t sz, int flags) {
+    struct bind_mnt *b = mnt; char p[VFS_PATH_MAX]; const char *r = BM_REL(b, path, p);
+    if (!r) return -ABI_ENAMETOOLONG;
+    return b->ops->xattr(b->data, r, op, name, buf, sz, flags);
+}
+/* the bind's last reference is gone: so is the hold on the source, which
+ * is torn down now if nothing else has it */
+static int bm_umount(void *mnt) {
+    struct bind_mnt *b = mnt;
+    b->live = false;
+    if (b->ops->umount && !data_still_referenced(b->ops, b->data))
+        return b->ops->umount(b->data);
+    return VFS_OK;
+}
+
+int vfs_bind(const char *target, const char *source, uint32_t flags) {
+    const char *rel;
+    struct vfs_mount *m = resolve(source, &rel);
+    if (!m) return VFS_ERR_NOENT;
+    struct bind_mnt *sb = bind_of(m);         /* a bind of a bind: its source */
+    if (!sb && rel[0] == '/' && !rel[1]) {    /* a mount's root: as before */
+        char src[sizeof m->source];
+        memcpy(src, m->source, sizeof src);
+        int rc = vfs_mount_flags(target, m->ops, m->data, flags);
+        if (rc == VFS_OK && src[0]) (void)vfs_mount_set_source(target, src);
+        return rc;
+    }
+    char full[VFS_PATH_MAX];
+    const char *srel = sb ? bm_rel(sb, rel, full, sizeof full) : rel;
+    if (!srel) return VFS_ERR_NAMETOOLONG;
+    struct bind_mnt *b = kmalloc(sizeof *b);
+    size_t n = strlen(srel);
+    while (n > 1 && srel[n - 1] == '/') n--;
+    char *root = b ? kmalloc(n + 1) : 0;
+    if (!b || !root) { if (b) kfree(b); return VFS_ERR_NOMEM; }
+    memcpy(root, srel, n);
+    root[n] = '\0';
+    memset(b, 0, sizeof *b);
+    b->ops = sb ? sb->ops : m->ops;
+    b->data = sb ? sb->data : m->data;
+    b->root = root;
+    b->live = true;
+    /* the source's ops, those that take a path put through the bind */
+    b->wops = *b->ops;
+    const struct vfs_ops *o = b->ops;
+    b->wops.open     = o->open     ? bm_open     : 0;
+    b->wops.create   = o->create   ? bm_create   : 0;
+    b->wops.unlink   = o->unlink   ? bm_unlink   : 0;
+    b->wops.rename   = o->rename   ? bm_rename   : 0;
+    b->wops.mkdir    = o->mkdir    ? bm_mkdir    : 0;
+    b->wops.opendir  = o->opendir  ? bm_opendir  : 0;
+    b->wops.stat     = o->stat     ? bm_stat     : 0;
+    b->wops.chmod    = o->chmod    ? bm_chmod    : 0;
+    b->wops.chown    = o->chown    ? bm_chown    : 0;
+    b->wops.utimes   = o->utimes   ? bm_utimes   : 0;
+    b->wops.truncate = o->truncate ? bm_truncate : 0;
+    b->wops.readlink = o->readlink ? bm_readlink : 0;
+    b->wops.symlink  = o->symlink  ? bm_symlink  : 0;
+    b->wops.link     = o->link     ? bm_link     : 0;
+    b->wops.statfs   = o->statfs   ? bm_statfs   : 0;
+    b->wops.sync     = o->sync     ? bm_sync     : 0;
+    b->wops.setrdev  = o->setrdev  ? bm_setrdev  : 0;
+    b->wops.xattr    = o->xattr    ? bm_xattr    : 0;
+    b->wops.umount   = bm_umount;
+    char src[sizeof m->source];
+    memcpy(src, m->source, sizeof src);
+    int rc = vfs_mount_flags(target, &b->wops, b, flags);
+    if (rc != VFS_OK) { kfree(root); kfree(b); return rc; }
+    b->next = g_binds;
+    g_binds = b;
+    if (src[0]) (void)vfs_mount_set_source(target, src);
+    return VFS_OK;
 }
 
 /* Linux slice 2: the mount flags a path resolves through. Defined here rather
@@ -1153,7 +1354,8 @@ static uint32_t vfs_anon_dev_of(const struct vfs_ops *ops, void *data) {
 }
 
 static uint32_t vfs_anon_dev(const struct vfs_mount *m) {
-    return vfs_anon_dev_of(m->ops, m->data);
+    struct bind_mnt *b = bind_of(m);          /* a bind is its source's (241) */
+    return b ? vfs_anon_dev_of(b->ops, b->data) : vfs_anon_dev_of(m->ops, m->data);
 }
 
 /* AN OPEN FILE IS THE FILE ITS NAME IS. fstat reported a regular file with
@@ -1408,6 +1610,10 @@ int vfs_unlink(const char *path) {
     if (!path) return VFS_ERR_INVAL;
     const char *rel; struct vfs_mount *m = resolve(path, &rel);
     if (!m) return VFS_ERR_NOMOUNT;
+    /* A MOUNT POINT IS BUSY (finding 241): its name resolves to the mount's
+     * root -- a bind's to its SOURCE, which `rm f2` of a file bind would
+     * have removed. Linux says EBUSY. */
+    if (rel[0] == '/' && !rel[1] && m->point_len > 1) return VFS_ERR_BUSY;
     /* Linux slice 5: a read-only mount refuses mutation. VFS_MNT_RDONLY was
      * defined in slice 2 and passed through by mount(2), but nothing enforced
      * it -- a flag that is accepted and ignored is the same class of lie as a
@@ -1532,6 +1738,9 @@ int vfs_rename(const char *oldpath, const char *newpath) {
      * it -- a flag that is accepted and ignored is the same class of lie as a
      * no-op syscall that reports success. */
     if ((om->flags | nm->flags) & VFS_MNT_RDONLY) return VFS_ERR_ROFS;
+    /* either name a mount point: EBUSY, before EXDEV, as Linux (241) */
+    if ((orel[0] == '/' && !orel[1] && om->point_len > 1) ||
+        (nrel[0] == '/' && !nrel[1] && nm->point_len > 1)) return VFS_ERR_BUSY;
     /* Cross-mount rename. This said VFS_ERR_INVAL with a comment naming
      * EXDEV as what it meant -- so callers got EINVAL, which reads as "you
      * asked for something nonsensical" rather than "use a copy instead".
@@ -2011,6 +2220,7 @@ const char *vfs_strerror(int err) {
     case VFS_ERR_LOOP:          return "too many levels of symbolic links";
     case VFS_ERR_XDEV:          return "cross-device link";
     case VFS_ERR_BADF:          return "bad file descriptor";
+    case VFS_ERR_BUSY:          return "device or resource busy";
     default:                    return "unknown error";
     }
 }

@@ -122,6 +122,8 @@ enum vfs_type {
 #define VFS_ERR_LOOP      -13 /* too many symlink hops */
 #define VFS_ERR_XDEV      -15 /* hard link across mounts -> EXDEV (Phase G) */
 #define VFS_ERR_NOTEMPTY  -16 /* a directory with entries -> ENOTEMPTY (batch 31) */
+#define VFS_ERR_BUSY      -18 /* a mount point, which unlink, rmdir and rename
+                               * may not take -> EBUSY (finding 241) */
 #define VFS_ERR_BADF      -17 /* a descriptor not open for the access asked ->
                                * EBADF (finding 216) */
 
@@ -437,6 +439,9 @@ int vfs_mknod_dev(const char *path, uint32_t mode, uint32_t maj, uint32_t min);
  * Returns what xa_list_op does -- an ABI-negative errno, not a VFS one. */
 long vfs_xattr(const char *path, int op, const char *name, void *buf,
                size_t sz, int flags);
+/* Finding 241: bind SOURCE -- a mount's root, a directory inside one, or a
+ * file -- at TARGET, with FLAGS (VFS_MNT_*). */
+int vfs_bind(const char *target, const char *source, uint32_t flags);
 bool vfs_is_mounted(void);
 void vfs_dump_mounts(void);
 

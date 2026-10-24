@@ -3229,7 +3229,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	cp initrd/etc/passwd                            $(INITRD_STAGE)/etc/passwd
 	cp initrd/etc/group                             $(INITRD_STAGE)/etc/group
 	@# the files databases getent, hostname and the resolver read (batch 31)
-	for f in hosts services protocols rpc networks; do \
+	for f in hosts services protocols rpc networks nsswitch.conf; do \
 	    cp initrd/etc/$$f $(INITRD_STAGE)/etc/$$f; done
 	cp programs/shparity/shparity.elf               $(INITRD_STAGE)/bin/shparity
 	cp programs/tjoinchurn/tjoinchurn.elf           $(INITRD_STAGE)/bin/tjoinchurn
@@ -3345,7 +3345,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	           nohup timeout watch dd printenv nice pgrep pkill tty stty \
 	           cksum truncate install mkfifo date touch sort script hwclock \
            arch nproc hostid logname link unlink pwd sum factor test "[" printf chgrp \
-           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon getfattr setfattr head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
+           shred uniq who users uptime true false ls env readlink realpath mktemp getent groups hostname domainname dnsdomainname nisdomainname ypdomainname chown killall mount umount od hexdump hd comm expand unexpand fold nl paste rev shuf split rm cp mv md5sum sha1sum sha224sum sha256sum sha384sum sha512sum b2sum base64 base32 basenc dircolors dir vdir echo cat tee mkdir mknod chroot chmod ln kill id df pinky stdbuf chcon runcon getfattr setfattr unshare head tail wc cut tr basename dirname sleep expr find fmt pr join tsort numfmt csplit ptx pathchk diff cmp sdiff diff3 gzip gunzip zcat bzip2 bunzip2 bzcat xz unxz xzcat tar; do \
 	    ln -f $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap" 2>/dev/null || \
 	      cp $(INITRD_STAGE)/bin/rmdir "$(INITRD_STAGE)/bin/$$ap"; \
 	done
@@ -4230,7 +4230,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/user_e2fs bin/dumpe2fs bin/e2fsck bin/debugfs bin/badblocks bin/resize2fs    \
 	    bin/coreutil bin/tsort bin/fmt bin/join bin/pathchk bin/dir       \
 	    bin/vdir bin/dircolors bin/csplit bin/pr bin/numfmt bin/chcon     \
-	    bin/getfattr bin/setfattr                                         \
+	    bin/getfattr bin/setfattr bin/unshare                             \
 	    bin/runcon bin/pinky bin/ptx bin/stdbuf bin/basenc bin/b2sum      \
 	    bin/sha224sum bin/sha384sum bin/sha256sum bin/sha512sum \
 	    bin/md5sum bin/sha1sum bin/base64 bin/base32                                       \
@@ -4265,7 +4265,7 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    etc/motd etc/anim.html etc/webgl.html etc/input.html etc/input2.html etc/fonttest.html etc/audiotone.html etc/start.html etc/egl_vendor.json etc/drvmatch.conf etc/drvmatch.conf.test etc/lua_selftest.lua \
 	    etc/resolv.conf etc/fonts/fonts.conf \
 	    etc/passwd etc/group \
-	    etc/hosts etc/services etc/protocols etc/rpc etc/networks \
+	    etc/hosts etc/services etc/protocols etc/rpc etc/networks etc/nsswitch.conf \
 	    m36/m36_part2.c m36/m36_sample.c m36/Tobyfile \
 	    etc/shparity/*.sh \
 	    etc/ttyparity/*.txt \
