@@ -1179,7 +1179,11 @@ static int spawn_body(const char *path, const char *name,
     /* ---- 1. read the ELF off the VFS ---- */
     void  *image      = 0;
     size_t image_size = 0;
-    int rc = vfs_read_all(path, &image, &image_size);
+    /* borrowed from the initrd where it lies there, as execve's (finding
+     * 247: a copy of the whole file first, then of each segment) -- and
+     * an image the initrd holds is what the shared text is kept for */
+    int    img_borrowed = 0;
+    int rc = vfs_read_all_ref(path, &image, &image_size, &img_borrowed);
     if (rc != VFS_OK) {
         kprintf("[proc] cannot read '%s': %s\n", path, vfs_strerror(rc));
         close_all_fds(p);
@@ -1200,7 +1204,7 @@ static int spawn_body(const char *path, const char *name,
         int sb = binfmt_shebang(image, image_size, interp, sizeof interp,
                                 optarg, sizeof optarg);
         if (sb != 0) {
-            kfree(image);
+            if (!img_borrowed) kfree(image);
             close_all_fds(p);
             nsproxy_release(p);   /* 207 */
             memset(p, 0, sizeof(*p));
@@ -1233,7 +1237,7 @@ static int spawn_body(const char *path, const char *name,
     /* ---- 2. allocate fresh PML4 ---- */
     uint64_t pml4 = vmm_create_user_pml4();
     if (pml4 == 0) {
-        kfree(image);
+        if (!img_borrowed) kfree(image);
         close_all_fds(p);
         nsproxy_release(p);   /* 207 */
         memset(p, 0, sizeof(*p));
@@ -1289,7 +1293,7 @@ static int spawn_body(const char *path, const char *name,
   if (is_pe) {
     /* ---- Windows PE/COFF image (Track C) ---- */
     int prc = pe_load_user(image, image_size, argc, argv, &pe_info);
-    kfree(image);
+    if (!img_borrowed) kfree(image);
     ok = (prc == 0);
     if (ok) {
         p->personality = ABI_PERS_WIN32;
@@ -1363,7 +1367,7 @@ static int spawn_body(const char *path, const char *name,
     uint64_t t_elf = perf_rdtsc();
     ok = elf_load_user_at(image, image_size, prog_load_base, &prog_info);
     perf_zone_end(PERF_Z_ELF_LOAD, t_elf);
-    kfree(image);                  /* segments now live in their own frames */
+    if (!img_borrowed) kfree(image);                  /* segments now live in their own frames */
 
     /* Track B: latch the ABI personality. A binary runs through the Linux
      * syscall translation layer if it's branded ELFOSABI_LINUX *or* (B10)
@@ -1433,8 +1437,11 @@ static int spawn_body(const char *path, const char *name,
     size_t interp_image_size = 0;
     if (ok && has_interp) {
         /* vfs_read_all uses kernel mappings, so it works regardless of
-         * the active CR3. */
-        int irc = vfs_read_all(interp_path, &interp_image, &interp_image_size);
+         * the active CR3; borrowed from the initrd where it lies there
+         * (finding 247) */
+        int interp_borrowed = 0;
+        int irc = vfs_read_all_ref(interp_path, &interp_image, &interp_image_size,
+                                   &interp_borrowed);
         if (irc != VFS_OK) {
             kprintf("[proc] PT_INTERP='%s' missing from VFS: %s\n",
                     interp_path, vfs_strerror(irc));
@@ -1442,7 +1449,7 @@ static int spawn_body(const char *path, const char *name,
         } else {
             ok = elf_load_user_at(interp_image, interp_image_size,
                                   interp_load_base, &interp_info);
-            kfree(interp_image);
+            if (!interp_borrowed) kfree(interp_image);
             if (!ok) {
                 kprintf("[proc] failed loading interpreter '%s'\n",
                         interp_path);

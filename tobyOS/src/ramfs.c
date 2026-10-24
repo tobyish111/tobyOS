@@ -497,6 +497,17 @@ static int ramfs_close(struct vfs_file *f) {
 
 /* Slice 112: hand out the open file's payload pointer (see ramfs.h).
  * The node was validated by ramfs_open; the tar bytes never move. */
+/* Do [P, P+N) lie in the initrd module itself -- bytes that never change
+ * for the life of the boot? An unowned node's data does (a write moves it
+ * to a buffer of its own); the shared text of an initrd program (finding
+ * 247) is kept only for such an image. */
+bool ramfs_is_resident(const void *p, size_t n) {
+    const uint8_t *b = (const uint8_t *)g_mount.image;
+    const uint8_t *q = (const uint8_t *)p;
+    return b && q >= b && n <= g_mount.image_size &&
+           (size_t)(q - b) <= g_mount.image_size - n;
+}
+
 int ramfs_file_data(struct vfs_file *f, const void **data, size_t *size) {
     struct ramfs_node *nd = f ? (struct ramfs_node *)f->priv : 0;
     if (!nd || nd->type != VFS_TYPE_FILE) return VFS_ERR_INVAL;

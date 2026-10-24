@@ -46,5 +46,8 @@ size_t ramfs_node_count(void);
  * it must NEVER be kfree'd. */
 extern const struct vfs_ops ramfs_ops;
 int ramfs_file_data(struct vfs_file *f, const void **data, size_t *size);
+/* Finding 247: are [p, p+n) the initrd module itself (bytes that never
+ * change)? */
+bool ramfs_is_resident(const void *p, size_t n);
 
 #endif /* TOBYOS_RAMFS_H */

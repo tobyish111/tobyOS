@@ -1841,13 +1841,17 @@ reread:;
 #endif
         void *interp_image = NULL;
         size_t interp_size = 0;
-        int irc = vfs_read_all(interp_path, &interp_image, &interp_size);
+        /* borrowed from the initrd where it lies there, as the program is
+         * (finding 247: the loader's text is shared too) */
+        int interp_borrowed = 0;
+        int irc = vfs_read_all_ref(interp_path, &interp_image, &interp_size,
+                                   &interp_borrowed);
         if (irc != 0) {
             ok = false;
         } else {
             ok = elf_load_user_at(interp_image, interp_size,
                                   interp_load_base, &interp_info);
-            kfree(interp_image);
+            if (!interp_borrowed) kfree(interp_image);
         }
 #ifdef CHROMIUM_BOOT
         xt_interp = perf_now_ns() - xt_interp;

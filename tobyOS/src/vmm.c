@@ -652,9 +652,21 @@ bool vmm_protect(uint64_t virt, size_t bytes, uint32_t flags) {
              * refcounted copy-out and THEN grants write. */
             uint64_t prev = pt[i];
             uint64_t nf = leaf_flags;
+            uint64_t cow_add = 0;
             if (prev & PTE_COW_SW) nf &= ~PTE_RW;
+            else if ((nf & PTE_RW) && !(prev & PTE_SHARED_SW) &&
+                     v < 0x0000800000000000ULL &&
+                     page_ref_get(prev & PTE_ADDR_MASK) > 1) {
+                /* A private frame others still hold -- an initrd program's
+                 * text, shared by every process running it (finding 247) --
+                 * is made writable the CoW way: read-only and CoW-marked, so
+                 * the first write copies it out. Granting write here would
+                 * have let one process's store land in all of them. */
+                nf &= ~PTE_RW;
+                cow_add = PTE_COW_SW;
+            }
             pt[i] = (prev & (PTE_ADDR_MASK | PTE_SHARED_SW | PTE_COW_SW |
-                             PTE_DEMAND_SW | PTE_SWAP_SW)) | nf;
+                             PTE_DEMAND_SW | PTE_SWAP_SW)) | nf | cow_add;
             invlpg(v);
 #ifdef CHROMIUM_BOOT
             if (v < 0x0000800000000000ULL)
