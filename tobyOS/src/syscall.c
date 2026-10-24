@@ -5070,14 +5070,10 @@ static long sys_mkdir(const char *path, int mode) {
         kprintf("[mkdir] '%s' mode=0x%x rc=%d -> readback 0x%x\n", kpath, m, rc,
                 sr == VFS_OK ? (vs.mode & 07777u) : 0); } }
 #endif
-    switch (rc) {
-    case VFS_OK:         return 0;
-    case VFS_ERR_EXIST:  return -ABI_EEXIST;
-    case VFS_ERR_ROFS:   return -ABI_EROFS;
-    case VFS_ERR_NOENT:  return -ABI_ENOENT;
-    case VFS_ERR_PERM:   return -ABI_EACCES;
-    default:             return -ABI_EACCES;
-    }
+    /* every error as itself (finding 252): the rest were EACCES -- a name
+     * past tobyfs's 55 bytes said "Permission denied", where Linux says
+     * ENAMETOOLONG, and a full disk or a file on the way did the same */
+    return vfs_err_to_abi(rc);
 }
 
 /* ---- memory: brk ----------------------------------------------- */
