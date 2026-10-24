@@ -1739,6 +1739,23 @@ int vfs_statfs(const char *path, struct vfs_statfs *out) {
     out->bsize   = 4096;
     out->namelen = 255;
     if (m->ops->statfs) return m->ops->statfs(m->data, out);
+    /* A filesystem with no statfs of its own still has Linux's magic
+     * number: stat -f, df -T and glibc's pathconf go by it (finding 259:
+     * proc, sysfs, devtmpfs and cgroup2 said 0). /dev/pts, a devpts mount
+     * of its own on Linux, is devfs's here. */
+    {
+        static const struct { const char *name; uint32_t magic; } mg[] = {
+            { "proc", 0x9fa0u }, { "sysfs", 0x62656572u },
+            { "devtmpfs", 0x01021994u }, { "cgroup2", 0x63677270u },
+            { "cifs", 0xff534d42u },
+        };
+        const char *fs = m->ops->fsname;
+        for (size_t i = 0; fs && i < sizeof mg / sizeof mg[0]; i++)
+            if (strcmp(fs, mg[i].name) == 0) out->type_magic = mg[i].magic;
+        if (fs && strcmp(fs, "devtmpfs") == 0 && rel &&
+            strncmp(rel, "/pts", 4) == 0 && (rel[4] == 0 || rel[4] == '/'))
+            out->type_magic = 0x1cd1u;               /* DEVPTS_SUPER_MAGIC */
+    }
     return VFS_OK;
 }
 
