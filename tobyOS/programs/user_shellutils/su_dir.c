@@ -6,18 +6,16 @@
  * defaults are softer than options would be:
  *   - the escape quoting yields to a valid QUOTING_STYLE (QUOTING_STYLE=c
  *     dir quotes as c), and an invalid one -- the empty string too -- is
- *     warned of and ignored;
+ *     warned of and ignored, as ls warns: only when no option chose the
+ *     quoting (logs/b34/dirqs-wsl.out);
  *   - vdir's long format is only what is used when no option chose a
  *     format: `vdir -1`, `vdir -C`, `vdir -x`, `vdir -m`, `vdir --format=X`
  *     and `vdir --zero` (one per line) are not long, where `ls -l -1` is.
- * So dir runs ls with -C and (unless QUOTING_STYLE says otherwise) -b put
- * before its own arguments, and vdir with -l only when none of its
- * arguments is one of those format options. The name it was run as stays
- * argv[0], so messages and --help say dir or vdir. */
-
-static const char *const sm_dir_styles[] = {
-    "literal", "shell", "shell-always", "shell-escape", "shell-escape-always",
-    "c", "c-maybe", "escape", "locale", "clocale", 0 };
+ * So dir runs ls with -C put before its own arguments, and vdir with -l
+ * only when none of its arguments is one of those format options; the
+ * escapes are ls's default quoting for both (ls_default_escape), not a -b,
+ * which would hide QUOTING_STYLE's warning (finding 263). The name it was
+ * run as stays argv[0], so messages and --help say dir or vdir. */
 
 /* ls's long options, to know which take an argument when looking
  * through vdir's: (name, takes an argument, sets the format) */
@@ -78,24 +76,15 @@ static int sm_dir_format_given(int argc, char **argv) {
 }
 
 static int sm_dir_run(int argc, char **argv, int vdir) {
-    int escape = 1;
-    const char *q = getenv("QUOTING_STYLE");
-    if (q) {
-        for (int i = 0; sm_dir_styles[i]; i++) if (!strcmp(q, sm_dir_styles[i])) escape = 0;
-        /* do_ls passes over an empty one in silence; GNU's warns */
-        if (!*q)
-            su_error(0, 0, "ignoring invalid value of environment variable QUOTING_STYLE: %s",
-                     su_quote(q));
-    }
-    char **nv = (char **)malloc((size_t)(argc + 3) * sizeof *nv);
+    char **nv = (char **)malloc((size_t)(argc + 2) * sizeof *nv);
     if (!nv) su_error(2, ENOMEM, "memory exhausted");
     int k = 0;
     nv[k++] = argv[0];
     if (!vdir) nv[k++] = (char *)"-C";
     else if (!sm_dir_format_given(argc, argv)) nv[k++] = (char *)"-l";
-    if (escape) nv[k++] = (char *)"-b";
     for (int i = 1; i < argc; i++) nv[k++] = argv[i];
     nv[k] = 0;
+    ls_default_escape = 1;
     return do_ls(k, nv);
 }
 

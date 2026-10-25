@@ -90,6 +90,11 @@ static struct {
     int tfmt_custom;        /* --time-style=+FORMAT */
 } ls;
 
+/* dir and vdir (su_dir.c) quote with -b's escapes by default: a default,
+ * not an option, so QUOTING_STYLE still applies -- and is warned of when
+ * bad -- unless an option of their caller's chose the quoting (finding 263) */
+static int ls_default_escape;
+
 /* ---- names and ids ---------------------------------------------------- */
 
 struct ls_idname { unsigned long id; char name[64]; struct ls_idname *next; };
@@ -1308,7 +1313,7 @@ static int do_ls(int argc, char **argv) {
     memset(&ls, 0, sizeof ls);
     int tty = isatty(1);
     ls.fmt = tty ? LF_COLS : LF_ONE;
-    ls.quoting = tty ? LQ_SHELL_ESC : LQ_LITERAL;
+    ls.quoting = ls_default_escape ? LQ_ESCAPE : tty ? LQ_SHELL_ESC : LQ_LITERAL;
     ls.tabsize = 8;
     ls.width = 80;
     ls.total_unit = 1024;
