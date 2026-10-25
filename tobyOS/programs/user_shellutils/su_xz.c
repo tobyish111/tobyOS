@@ -1176,6 +1176,16 @@ static uint64_t cz_x_enc_mem(const struct cz_x_filter *f, int n) {
         uint64_t sons = dict + 1;
         if (bt) sons *= 2;
         m += (hs + sons) * 4 + size + 300000;
+        /* the rest of the coder, to the byte as xz -M judges it (bisected,
+         * logs/b34/xzmem.py): LZMA2's 48264 bytes more, LZMA1's 65704 fewer
+         * than LZMA2's -- this sum matched -vv's MiB alone */
+        m += f[i].id == CZ_X_F_LZMA2 ? 48264 : 48264 - 65704;
+    }
+    /* each filter before it: a branch converter 1024 bytes, delta 352
+     * (xzmemflt.py) */
+    for (int i = 0; i < n; i++) {
+        if (f[i].id == CZ_X_F_LZMA2 || f[i].id == CZ_X_F_LZMA1) continue;
+        m += f[i].id == CZ_X_F_DELTA ? 352 : 1024;
     }
     return m;
 }
@@ -2280,10 +2290,13 @@ static struct {
     struct cz_x_filter chain[4];
     int nchain, chain_kind;     /* 0 the preset, 1 options, 2 --filters */
     long threads;
+    int threads_plus;        /* -T+1: threaded with one thread */
     uint64_t block_size;
     uint64_t blist[256];
     int nblist;
     uint64_t memlimit_c, memlimit_d;
+    uint64_t memlimit_mt;    /* 0: the machine's default (a quarter of RAM) */
+    int no_adjust;
     int exit_status;
     int flush_timeout;
     const char *files_from;
@@ -2304,6 +2317,9 @@ static struct {
     int tot_all_sizes, tot_minver;
     int ninputs;
 } cz_xz;
+
+/* single-threaded mode: -T1 (not -T+1) */
+#define CZ_X_SINGLE() (cz_xz.threads == 1 && !cz_xz.threads_plus)
 
 static void cz_x_error(const char *name, const char *msg) {
     fflush(stdout);
@@ -2328,6 +2344,229 @@ static void cz_x_fatal(const char *msg) {
     fflush(stdout);
     if (cz_xz.quiet < 2) fprintf(stderr, "%s: %s\n", cz_xz.prog, msg);
     exit(1);
+}
+
+/* ---- memory: the machine, the limits, what an encoder needs ----
+ *
+ * As xz 5.8 has them (logs/b34/xzmem*.py, measured against it in WSL).
+ * The machine's RAM and processor threads are its own: MemTotal and the
+ * "processor" lines of /proc on tobyOS, sysconf on the host. */
+
+static uint64_t cz_x_physmem(void) {
+    static uint64_t ram;
+    if (ram) return ram;
+#ifdef SU_HOST
+    long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && psz > 0) ram = (uint64_t)pages * (uint64_t)psz;
+#else
+    FILE *f = fopen("/proc/meminfo", "r");
+    char line[256];
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            unsigned long long kb;
+            if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) { ram = (uint64_t)kb * 1024; break; }
+        }
+        fclose(f);
+    }
+#endif
+    return ram;
+}
+
+static uint64_t cz_x_ncpu(void) {
+#ifdef SU_HOST
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? (uint64_t)n : 1;
+#else
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    uint64_t n = 0;
+    char line[256];
+    if (f) {
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "processor", 9)) n++;
+        fclose(f);
+    }
+    return n ? n : 1;
+#endif
+}
+
+/* the threaded decompressor's limit by default, and -T0's: a quarter of RAM */
+static uint64_t cz_x_quarter_ram(void) { return cz_x_physmem() / 4; }
+
+/* the threaded decompressor's limit in force: its own or the default, no
+ * more than the decompressor's limit (--info-memory shows that) */
+static uint64_t cz_x_mt_limit(void) {
+    uint64_t v = cz_xz.memlimit_mt ? cz_xz.memlimit_mt : cz_x_quarter_ram();
+    if (cz_xz.memlimit_d && cz_xz.memlimit_d < v) v = cz_xz.memlimit_d;
+    return v;
+}
+
+/* a limit as a notice says it: MiB rounded up; as "The limit is" says it,
+ * in bytes under 1 MiB */
+static void cz_x_lim_mib(uint64_t v, char *buf, size_t cap) {
+    snprintf(buf, cap, "%llu MiB", (unsigned long long)cz_x_mib_up(v));
+}
+static void cz_x_lim_str(uint64_t v, char *buf, size_t cap) {
+    if (v < (1u << 20)) snprintf(buf, cap, "%llu B", (unsigned long long)v);
+    else cz_x_lim_mib(v, buf, cap);
+}
+
+static uint64_t cz_x_num(const char *name, const char *s, uint64_t min, uint64_t max);
+
+/* a memory limit as xz takes one: "max", a share of RAM ("70%", 1 to 100,
+ * rounded down), or a size */
+static uint64_t cz_x_limit(const char *name, const char *s) {
+    if (!strcmp(s, "max")) return UINT64_MAX;
+    size_t l = strlen(s);
+    if (l && s[l - 1] == '%') {
+        char body[256], nm[64];
+        snprintf(body, sizeof body, "%.*s", (int)(l - 1), s);
+        snprintf(nm, sizeof nm, "%s%%", name);
+        uint64_t p = cz_x_num(nm, body, 1, 100);
+        return cz_x_physmem() * p / 100;
+    }
+    return cz_x_num(name, s, 0, UINT64_MAX);
+}
+
+static void cz_x_info_memory(void) {
+    uint64_t ram = cz_x_physmem(), mt = cz_x_mt_limit(), t0 = cz_x_quarter_ram();
+    if (cz_xz.robot) {
+        printf("%llu\t%llu\t%llu\t%llu\t%llu\t%llu\n", (unsigned long long)ram,
+               (unsigned long long)cz_xz.memlimit_c, (unsigned long long)cz_xz.memlimit_d,
+               (unsigned long long)mt, (unsigned long long)t0,
+               (unsigned long long)cz_x_ncpu());
+        return;
+    }
+    char b[5][64];
+    uint64_t v[5] = { ram, cz_xz.memlimit_c, cz_xz.memlimit_d, mt, t0 };
+    for (int i = 0; i < 5; i++) {
+        if (i > 0 && (v[i] == 0 || v[i] == UINT64_MAX)) snprintf(b[i], sizeof b[i], "Disabled");
+        else snprintf(b[i], sizeof b[i], "%llu MiB (%llu B)",
+                      (unsigned long long)cz_x_mib_up(v[i]), (unsigned long long)v[i]);
+    }
+    printf("Hardware information:\n"
+           "  Amount of physical memory (RAM):  %s\n"
+           "  Number of processor threads:      %llu\n\n"
+           "Memory usage limits:\n"
+           "  Compression:                      %s\n"
+           "  Decompression:                    %s\n"
+           "  Multi-threaded decompression:     %s\n"
+           "  Default for -T0:                  %s\n",
+           b[0], (unsigned long long)cz_x_ncpu(), b[1], b[2], b[3], b[4]);
+}
+
+static uint64_t cz_x_enc_mem(const struct cz_x_filter *f, int n);
+
+/* the threaded encoder's block: --block-size's, else three dictionaries,
+ * at least 1 MiB */
+static uint64_t cz_x_mt_block(const struct cz_x_filter *f, int nf) {
+    if (cz_xz.block_size) return cz_xz.block_size;
+    uint64_t b = (uint64_t)f[nf - 1].dict * 3;
+    return b < (1u << 20) ? 1u << 20 : b;
+}
+
+/* the threaded encoder's memory with N threads, as xz counts it (bisected,
+ * logs/b34/xzmemmt.py and xzmemblk.py): 33336 bytes, and for each thread
+ * the single-threaded encoder's, its block, and two buffers of the block's
+ * bound -- the block, 3 bytes a 64 KiB chunk and 429 more, to 4 bytes */
+static uint64_t cz_x_mt_mem(const struct cz_x_filter *f, int nf, uint64_t n) {
+    uint64_t b = cz_x_mt_block(f, nf);
+    uint64_t bound = (b + 3 * ((b + 65535) / 65536) + 429 + 3) & ~(uint64_t)3;
+    return 33336 + n * (cz_x_enc_mem(f, nf) + b + 2 * bound);
+}
+
+static void cz_x_mem_too_low(uint64_t need) __attribute__((noreturn));
+static void cz_x_mem_too_low(uint64_t need) {
+    fflush(stdout);
+    char lim[64];
+    cz_x_lim_str(cz_xz.memlimit_c, lim, sizeof lim);
+    if (cz_xz.quiet < 2) {
+        fprintf(stderr, "%s: Memory usage limit is too low for the given filter setup.\n", cz_xz.prog);
+        fprintf(stderr, "%s: %llu MiB of memory is required. The limit is %s.\n", cz_xz.prog,
+                (unsigned long long)cz_x_mib_up(need), lim);
+    }
+    exit(1);
+}
+
+static void cz_x_chain_str(const struct cz_x_filter *f, int n, int full, char *buf, size_t cap);
+static uint64_t cz_x_chain_mem(const struct cz_x_filter *f, int n);
+static void cz_x_effective_chain(struct cz_x_filter *f, int *nf);
+
+/* compression's memory, set up once before any file as xz's is: -vv's
+ * lines; then, over the limit (-M, --memlimit-compress; -T0's own quarter
+ * of RAM when none is set), fewer threads (said at -vv), single-threaded
+ * mode, and a dictionary smaller by 1 MiB at a time from its whole MiB --
+ * none of the last two with --no-adjust or a raw stream -- or the error.
+ * A dictionary made smaller is kept as the chain from then on. */
+static void cz_x_mem_setup(void) {
+    struct cz_x_filter f[4];
+    int nf;
+    cz_x_effective_chain(f, &nf);
+    int mt = cz_xz.format == CZ_X_FMT_XZ && !CZ_X_SINGLE();
+    uint64_t n = cz_xz.threads == 0 ? cz_x_ncpu() : (uint64_t)cz_xz.threads;
+    uint64_t limit = cz_xz.memlimit_c ? cz_xz.memlimit_c : UINT64_MAX;
+    uint64_t use = mt ? cz_x_mt_mem(f, nf, n) : cz_x_enc_mem(f, nf);
+    char lim[64], mib[64];
+    cz_x_lim_mib(limit, mib, sizeof mib);
+    if (cz_xz.verbose >= 2 && cz_xz.quiet < 1) {
+        char s[512];
+        cz_x_chain_str(f, nf, 1, s, sizeof s);
+        fprintf(stderr, "%s: Filter chain: %s\n", cz_xz.prog, s);
+        if (mt) fprintf(stderr, "%s: Using up to %llu threads.\n", cz_xz.prog, (unsigned long long)n);
+        if (cz_xz.memlimit_c && cz_xz.memlimit_c != UINT64_MAX) {   /* "max" is none */
+            cz_x_lim_str(limit, lim, sizeof lim);
+            fprintf(stderr, "%s: %llu MiB of memory is required. The limit is %s.\n", cz_xz.prog,
+                    (unsigned long long)cz_x_mib_up(use), lim);
+        } else {
+            fprintf(stderr, "%s: %llu MiB of memory is required. The limiter is disabled.\n",
+                    cz_xz.prog, (unsigned long long)cz_x_mib_up(use));
+        }
+        fprintf(stderr, "%s: Decompression will need %llu MiB of memory.\n", cz_xz.prog,
+                (unsigned long long)cz_x_mib_up(cz_x_chain_mem(f, nf)));
+    }
+    if (mt) {
+        int soft = cz_xz.threads == 0 && !cz_xz.memlimit_c;
+        uint64_t hold = soft ? cz_x_quarter_ram() : limit;
+        if (use > hold) {
+            uint64_t k = n;
+            while (k > 1 && cz_x_mt_mem(f, nf, k) > hold) k--;
+            if (cz_x_mt_mem(f, nf, k) <= hold || soft) {
+                if (k != n && cz_xz.verbose >= 2 && cz_xz.quiet < 1) {
+                    char h[64];
+                    cz_x_lim_mib(hold, h, sizeof h);
+                    fprintf(stderr, "%s: Reduced the number of threads from %llu to %llu to not "
+                            "exceed the memory usage limit of %s\n", cz_xz.prog,
+                            (unsigned long long)n, (unsigned long long)k, h);
+                }
+                return;
+            }
+            if (cz_xz.no_adjust) cz_x_mem_too_low(cz_x_mt_mem(f, nf, 1));
+            if (cz_xz.quiet < 1)
+                fprintf(stderr, "%s: Switching to single-threaded mode to not exceed the memory "
+                        "usage limit of %s\n", cz_xz.prog, mib);
+            cz_xz.threads = 1;
+            cz_xz.threads_plus = 0;
+            use = cz_x_enc_mem(f, nf);
+        } else {
+            return;
+        }
+    }
+    if (use <= limit) return;
+    if (cz_xz.no_adjust || cz_xz.format == CZ_X_FMT_RAW) cz_x_mem_too_low(use);
+    struct cz_x_filter *lz = &f[nf - 1];
+    uint32_t orig = lz->dict, d = orig & ~((1u << 20) - 1);
+    while (d >= (1u << 20)) {
+        lz->dict = d;
+        use = cz_x_enc_mem(f, nf);
+        if (use <= limit) break;
+        d -= 1u << 20;
+    }
+    if (d < (1u << 20)) cz_x_mem_too_low(use);
+    if (cz_xz.quiet < 1)
+        fprintf(stderr, "%s: Adjusted LZMA%d dictionary size from %u MiB to %u MiB to not exceed "
+                "the memory usage limit of %s\n", cz_xz.prog, lz->id == CZ_X_F_LZMA1 ? 1 : 2,
+                orig >> 20, d >> 20, mib);
+    memcpy(cz_xz.chain, f, sizeof cz_xz.chain);
+    cz_xz.nchain = nf;
 }
 
 static void cz_x_try_help(void) __attribute__((noreturn));
@@ -2509,11 +2748,14 @@ static int cz_x_do_compress(int ifd) {
     } else {
         struct cz_x_xzw w = {&o, cz_xz.check, 0, 0, 0};
         cz_x_xz_header(&w);
-        /* the threaded layout (the default, -T0 and -T2 up): blocks of
-         * three dictionaries or 1 MiB, each with its sizes in its header;
-         * -T1: one block, no sizes */
+        /* the threaded layout (the default, -T0, -T+1 and -T2 up): blocks
+         * of three dictionaries or 1 MiB, each with its sizes in its
+         * header; -T1: one block -- or --block-size's blocks -- with no
+         * sizes, the single-threaded coder knowing none ahead (measured:
+         * xz 5.8 -T1 --block-size=1000 writes 5172 bytes of 5000 random,
+         * 12-byte headers) */
         uint32_t dict = f[nf - 1].dict;
-        int sizes = cz_xz.threads != 1 || cz_xz.block_size;
+        int sizes = !CZ_X_SINGLE();
         uint64_t bs = cz_xz.block_size ? cz_xz.block_size : sizes ? (uint64_t)dict * 3 : (uint64_t)n;
         if (!cz_xz.block_size && sizes && bs < (1u << 20)) bs = 1u << 20;
         uint64_t reserve = bs;
@@ -2599,8 +2841,7 @@ static int cz_x_do_decompress_in(struct cz_in *pin, int fmt) {
              * decoder is refused: its base, under 1 MiB; the limit in
              * bytes below 1 MiB, else in MiB rounded up */
             char lim[64];
-            if (cz_xz.memlimit_d < (1u << 20)) snprintf(lim, sizeof lim, "%llu B", (unsigned long long)cz_xz.memlimit_d);
-            else snprintf(lim, sizeof lim, "%llu MiB", (unsigned long long)cz_x_mib_up(cz_xz.memlimit_d));
+            cz_x_lim_str(cz_xz.memlimit_d, lim, sizeof lim);
             fprintf(stderr, "%s: 1 MiB of memory is required. The limit is %s.\n", cz_xz.prog, lim);
         }
         return -1;
@@ -2964,6 +3205,7 @@ static void cz_x_one(const char *name) {
 static uint64_t cz_x_num(const char *name, const char *s, uint64_t min, uint64_t max) {
     const char *p = s;
     char m[256];
+    while (*p == ' ' || *p == '\t') p++;    /* blanks before it are passed over */
     if (*p == '\0' || *p < '0' || *p > '9') {
         snprintf(m, sizeof m, "%s: Value is not a non-negative decimal integer", s);
         cz_x_fatal(m);
@@ -3380,24 +3622,22 @@ static int cz_x_main(int argc, char **argv) {
             }
             break;
         }
-        case CZ_X_O_MEMC: cz_xz.memlimit_c = cz_x_num("memlimit-compress", su_optarg, 0, UINT64_MAX); break;
-        case CZ_X_O_MEMD: cz_xz.memlimit_d = cz_x_num("memlimit-decompress", su_optarg, 0, UINT64_MAX); break;
-        case CZ_X_O_MEMMT: break;
-        case 'M': {
-            size_t l = strlen(su_optarg);
-            if (l && su_optarg[l - 1] == '%') {
-                /* a share of RAM: tobyOS has no answer here, and none is set */
-                break;
-            }
-            uint64_t v = cz_x_num("memlimit", su_optarg, 0, UINT64_MAX);
-            cz_xz.memlimit_c = cz_xz.memlimit_d = v;
+        case CZ_X_O_MEMC: cz_xz.memlimit_c = cz_x_limit("memlimit-compress", su_optarg); break;
+        case CZ_X_O_MEMD: cz_xz.memlimit_d = cz_x_limit("memlimit-decompress", su_optarg); break;
+        case CZ_X_O_MEMMT: cz_xz.memlimit_mt = cz_x_limit("memlimit-mt-decompress", su_optarg); break;
+        case 'M':
+            cz_xz.memlimit_c = cz_xz.memlimit_d = cz_xz.memlimit_mt = cz_x_limit("memlimit", su_optarg);
             break;
-        }
-        case CZ_X_O_NOADJ: break;
+        case CZ_X_O_NOADJ: cz_xz.no_adjust = 1; break;
         case 'T': {
-            uint64_t v = cz_x_num("threads", su_optarg, 0, UINT64_MAX);
+            /* "+N": the threaded mode even with one thread (its layout,
+             * its memory) -- measured, as xz 5.8's */
+            const char *t = su_optarg;
+            int plus = *t == '+';
+            uint64_t v = cz_x_num("threads", t + plus, 0, UINT64_MAX);
             if (v > 16384) cz_x_fatal("Value of the option 'threads' must be in the range [0, 16384]");
             cz_xz.threads = (long)v;
+            cz_xz.threads_plus = plus && v == 1;
             break;
         }
         case CZ_X_O_FLUSH:
@@ -3437,9 +3677,7 @@ static int cz_x_main(int argc, char **argv) {
         case 'Q': cz_xz.no_warn = 1; break;
         case CZ_X_O_ROBOT: cz_xz.robot = 1; break;
         case CZ_X_O_INFOMEM:
-            printf("Hardware information:\n  Amount of physical memory (RAM):  (unknown)\n"
-                   "  Number of processor threads:      1\n\nMemory usage limits:\n"
-                   "  Compression:                      Disabled\n  Decompression:                    Disabled\n");
+            cz_x_info_memory();
             return 0;
         case 'h': cz_x_help(0); return 0;
         case 'H': cz_x_help(1); return 0;
@@ -3474,26 +3712,16 @@ static int cz_x_main(int argc, char **argv) {
         }
     }
     if (cz_xz.mode == CZ_X_M_COMPRESS) cz_x_validate_chain();
-    if (cz_xz.mode == CZ_X_M_COMPRESS && cz_xz.flush_timeout && cz_xz.threads != 1 && cz_xz.format == CZ_X_FMT_XZ) {
+    if (cz_xz.mode == CZ_X_M_COMPRESS && cz_xz.flush_timeout && !CZ_X_SINGLE() && cz_xz.format == CZ_X_FMT_XZ) {
         if (cz_xz.quiet < 1) fprintf(stderr, "%s: Switching to single-threaded mode due to --flush-timeout\n", cz_xz.prog);
         cz_xz.threads = 1;
+        cz_xz.threads_plus = 0;
     }
+    /* the memory is set up first, then --robot refused (measured: the
+     * notices and the limit's error come before the refusal) */
+    if (cz_xz.mode == CZ_X_M_COMPRESS) cz_x_mem_setup();
     if (cz_xz.robot && (cz_xz.mode == CZ_X_M_COMPRESS || cz_xz.mode == CZ_X_M_DECOMPRESS || cz_xz.mode == CZ_X_M_TEST))
         cz_x_fatal("Compression and decompression with --robot are not supported yet.");
-    if (cz_xz.verbose >= 2 && cz_xz.mode == CZ_X_M_COMPRESS) {
-        struct cz_x_filter f[4];
-        int nf;
-        cz_x_effective_chain(f, &nf);
-        char s[512];
-        cz_x_chain_str(f, nf, 1, s, sizeof s);
-        if (cz_xz.quiet < 1) fprintf(stderr, "%s: Filter chain: %s\n", cz_xz.prog, s);
-        if (cz_xz.quiet < 1 && cz_xz.threads == 1)
-            fprintf(stderr, "%s: %llu MiB of memory is required. The limiter is disabled.\n", cz_xz.prog,
-                    (unsigned long long)cz_x_mib_up(cz_x_enc_mem(f, nf)));
-        if (cz_xz.quiet < 1)
-            fprintf(stderr, "%s: Decompression will need %llu MiB of memory.\n", cz_xz.prog,
-                    (unsigned long long)cz_x_mib_up(cz_x_chain_mem(f, nf)));
-    }
     if (cz_xz.mode == CZ_X_M_LIST && cz_xz.files_given == 0 && nfiles == 0) {
         cz_x_error(0, "--list does not support reading from standard input");
         return cz_xz.exit_status;
