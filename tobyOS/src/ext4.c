@@ -3189,6 +3189,7 @@ static int ext4_open(void *mnt, const char *path, struct vfs_file *out) {
     out->priv = fp;
     out->size = (size_t)fp->file_size;
     out->pos  = 0;
+    out->ino  = ino;          /* the file's own inode number (finding 273) */
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
     out->uid  = ext4_inode_uid(&in);
@@ -3988,6 +3989,10 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     t = ext4_time_get(in.i_ctime, in.i_ctime_extra, EXT4_HAS_EXTRA(&in, i_ctime_extra));
     out->ctime = (uint64_t)t.s; out->ctime_ns = t.ns;
     out->nlink = in.i_links_count;
+    /* every file's own number, as Linux's st_ino: with none, two files on
+     * one volume were one to every tool that compares them -- `cat a >> b`
+     * said "input file is output file" (finding 273) */
+    out->ino = ino;
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
     return VFS_OK;
