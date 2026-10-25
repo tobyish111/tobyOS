@@ -14633,7 +14633,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         switch (which) {
         case FS_TOBY: rc = tobyfs_mount(ktgt, dev); break;
         case FS_EXT2: rc = ext2_mount(ktgt, dev);   break;
-        case FS_EXT4: rc = ext4_mount(ktgt, dev);   break;
+        case FS_EXT4:                   /* read-only asked: as the driver's (271) */
+            rc = ext4_mount_ro(ktgt, dev, (vflags & VFS_MNT_RDONLY) != 0);
+            break;
         default:      rc = fat32_mount(ktgt, dev);  break;
         }
         if (rc != VFS_OK) return vfs_err_to_abi(rc);
