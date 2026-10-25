@@ -1865,6 +1865,56 @@ static int ext4_create(void *mnt, const char *path,
     return txn_finish(fs, do_create(fs, path, uid, gid, mode));
 }
 
+/* An entry of a directory other than "." and "..": the directory is not
+ * empty, and the walk stops. */
+static int dir_any_entry(void *user, uint32_t ino, uint8_t ft,
+                         const char *name, uint8_t len) {
+    (void)ft;
+    if (ino == 0) return VFS_OK;
+    if ((len == 1 && name[0] == '.') || (len == 2 && name[0] == '.' && name[1] == '.'))
+        return VFS_OK;
+    *(bool *)user = true;
+    return VFS_ERR_NOENT;
+}
+
+/* rmdir: an empty directory's entry goes from its parent, the parent loses
+ * the link its ".." was, and the directory's blocks and inode are freed --
+ * mkdir undone. A directory with entries is VFS_ERR_INVAL, which rmdir(2)
+ * reports as ENOTEMPTY. The VFS's unlink comes here for both (sys_unlink
+ * refuses a directory before it; rmdir_path a file); the driver said
+ * EISDIR, so no directory on an ext4 volume could be removed (`rm -rf`
+ * left them all; finding 255's probe). */
+static int do_rmdir(struct ext4 *fs, uint32_t parent_ino, const char *leaf,
+                    uint32_t ino) {
+    struct ext4_inode in;
+    int rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    if ((in.i_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) return VFS_ERR_NOTDIR;
+    bool full = false;
+    rc = dir_walk(fs, &in, dir_any_entry, &full);
+    if (rc != VFS_OK) return rc;
+    if (full) return VFS_ERR_INVAL;
+
+    rc = dir_remove_entry(fs, parent_ino, leaf);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode parent;
+    if (read_inode(fs, parent_ino, &parent) == VFS_OK) {
+        if (parent.i_links_count > 2) parent.i_links_count--;
+        write_inode(fs, parent_ino, &parent);
+    }
+    inode_free_data(fs, &in);
+    in.i_links_count = 0;
+    in.i_size_lo = 0;
+    in.i_size_hi = 0;
+    struct ext4_time now = ext4_now();
+    ext4_stamp(&in, E4_CTIME, now);
+    in.i_dtime = (uint32_t)now.s;
+    rc = write_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    adj_used_dirs(fs, (ino - 1) / fs->inodes_per_group, -1);
+    return ext4_free_inode(fs, ino);      /* flushes the GDT and superblock */
+}
+
 static int do_unlink(struct ext4 *fs, const char *path) {
     uint32_t parent_ino;
     char leaf[VFS_NAME_MAX];
@@ -1874,7 +1924,7 @@ static int do_unlink(struct ext4 *fs, const char *path) {
     uint32_t ino; uint8_t ftype;
     rc = path_to_inode(fs, path, &ino, &ftype);
     if (rc != VFS_OK) return rc;
-    if (ftype == EXT4_FT_DIR) return VFS_ERR_ISDIR;
+    if (ftype == EXT4_FT_DIR) return do_rmdir(fs, parent_ino, leaf, ino);
 
     struct ext4_inode in;
     rc = read_inode(fs, ino, &in);
