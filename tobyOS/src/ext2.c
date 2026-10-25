@@ -148,7 +148,10 @@ static int read_inode(struct ext2 *fs, uint32_t ino, struct ext4_inode *out) {
     uint64_t blk = itab + byte_off / fs->block_size;
     uint32_t off = (uint32_t)(byte_off % fs->block_size);
 
-    return read_block_partial(fs, blk, off, sizeof(*out), out);
+    /* the 128-byte core alone, as this driver has always kept it; the
+     * large inode's fields are ext4.c's (finding 255) */
+    memset(out, 0, sizeof(*out));
+    return read_block_partial(fs, blk, off, EXT4_GOOD_OLD_INODE_SIZE, out);
 }
 
 static int write_inode(struct ext2 *fs, uint32_t ino, const struct ext4_inode *in) {
@@ -164,7 +167,7 @@ static int write_inode(struct ext2 *fs, uint32_t ino, const struct ext4_inode *i
 
     int rc = read_block(fs, blk, fs->blk_buf);
     if (rc != VFS_OK) return rc;
-    memcpy(fs->blk_buf + off, in, sizeof(*in));
+    memcpy(fs->blk_buf + off, in, EXT4_GOOD_OLD_INODE_SIZE);
     return write_block(fs, blk, fs->blk_buf);
 }
 

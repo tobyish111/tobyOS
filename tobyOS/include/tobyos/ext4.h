@@ -190,9 +190,12 @@ _Static_assert(sizeof(struct ext4_group_desc_64) == 64,
                "ext4 64-byte group descriptor");
 
 /* ---- inode (128 or 256 bytes) --------------------------------- */
-/* We only read the first 128 bytes -- the extra ext4 fields beyond
- * that (i_file_acl_high, i_extra_isize, ...) aren't needed for RO
- * traversal. */
+/* The 128-byte core, then -- in an inode larger than that -- the fields
+ * i_extra_isize says it has: the nanoseconds of each time (finding 255),
+ * a creation time. Past them the inode holds extended attributes, so only
+ * what i_extra_isize covers is ever read or written (ext4.c); ext2.c keeps
+ * to the core. */
+#define EXT4_GOOD_OLD_INODE_SIZE 128u
 
 struct ext4_inode {
     uint16_t i_mode;
@@ -213,9 +216,22 @@ struct ext4_inode {
     uint32_t i_size_hi;            /* file sz high 32 bits */
     uint32_t i_obso_faddr;
     uint8_t  i_osd2[12];
+    /* the large inode's: 0 where the inode is the old 128 bytes, or where
+     * its i_extra_isize stops short of them */
+    uint16_t i_extra_isize;        /* bytes of these past the core */
+    uint16_t i_checksum_hi;
+    uint32_t i_ctime_extra;        /* nanoseconds << 2 | seconds' bits 32-33 */
+    uint32_t i_mtime_extra;
+    uint32_t i_atime_extra;
+    uint32_t i_crtime;             /* creation time (statx's btime) */
+    uint32_t i_crtime_extra;
+    uint32_t i_version_hi;
+    uint32_t i_projid;
 };
-_Static_assert(sizeof(struct ext4_inode) == 128,
+_Static_assert(__builtin_offsetof(struct ext4_inode, i_extra_isize) == 128,
                "ext4 inode core must be 128 bytes");
+_Static_assert(sizeof(struct ext4_inode) == 160,
+               "ext4 inode core + 32 bytes of extra fields");
 
 /* ---- extent tree ---------------------------------------------- */
 

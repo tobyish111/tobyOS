@@ -97,6 +97,7 @@ struct ext4 {
     uint32_t sectors_per_block;   /* block_size / 512 */
     uint64_t total_blocks;
     uint32_t inode_size;          /* 128 or 256 */
+    uint16_t want_extra_isize;    /* a new inode's i_extra_isize: 0 for 128 */
     uint32_t inodes_per_group;
     uint32_t blocks_per_group;
     uint32_t first_ino;           /* usually 11 for ext4 */
@@ -237,7 +238,77 @@ static void ext4_inode_set_gid(struct ext4_inode *in, uint32_t gid) {
     osd2_set_half(in, EXT4_OSD2_GID_HIGH, gid >> 16);
 }
 
-static uint64_t ext4_now_secs(void);
+
+/* How many of the large inode's bytes past the 128-byte core an inode has
+ * and this driver keeps: its i_extra_isize, within the inode's room and
+ * the fields struct ext4_inode knows. One that claims more room than the
+ * inode has is taken to have none. */
+static uint32_t ext4_inode_extra_len(const struct ext4 *fs,
+                                     const struct ext4_inode *in) {
+    if (fs->inode_size <= EXT4_GOOD_OLD_INODE_SIZE) return 0;
+    uint32_t n = in->i_extra_isize;
+    uint32_t known = (uint32_t)sizeof(*in) - EXT4_GOOD_OLD_INODE_SIZE;
+    if (n > fs->inode_size - EXT4_GOOD_OLD_INODE_SIZE) return 0;
+    return n < known ? n : known;
+}
+
+/* ---- times (finding 255) ----
+ * A time is the low 32 bits of its seconds in the core and, where the
+ * inode has the field, an _extra word: the nanoseconds above two bits that
+ * are the seconds' bits 32 and 33. Without the word the 32 bits are signed
+ * (1901 to 2038); with it they run on to 2446. A time outside what the
+ * inode can hold is held at the nearer end, with no nanoseconds. */
+struct ext4_time { int64_t s; uint32_t ns; };
+
+static struct ext4_time ext4_now(void) {
+    extern uint64_t file_time_ns(void);     /* Linux's coarse clock */
+    uint64_t n = file_time_ns();
+    struct ext4_time t = { (int64_t)(n / 1000000000ull),
+                           (uint32_t)(n % 1000000000ull) };
+    return t;
+}
+
+/* whether the inode has FIELD, one of the 4-byte words past the core */
+#define EXT4_HAS_EXTRA(in, field)                                         \
+    ((in)->i_extra_isize >= __builtin_offsetof(struct ext4_inode, field) + 4u \
+                            - EXT4_GOOD_OLD_INODE_SIZE)
+
+static void ext4_time_put(uint32_t *lo, uint32_t *extra, bool has,
+                          struct ext4_time t) {
+    int64_t min = INT32_MIN;
+    int64_t max = has ? (int64_t)INT32_MAX + (3ll << 32) : INT32_MAX;
+    if (t.s <= min) { t.s = min; t.ns = 0; }
+    if (t.s >= max) { t.s = max; t.ns = 0; }
+    if (t.ns >= 1000000000u) t.ns = 0;
+    *lo = (uint32_t)t.s;
+    if (has)
+        *extra = (t.ns << 2) |
+                 ((uint32_t)((t.s - (int64_t)(int32_t)(uint32_t)t.s) >> 32) & 3u);
+}
+
+static struct ext4_time ext4_time_get(uint32_t lo, uint32_t extra, bool has) {
+    struct ext4_time t = { (int32_t)lo, 0 };
+    if (has) {
+        t.s += (int64_t)(extra & 3u) << 32;
+        t.ns = extra >> 2;
+        if (t.ns >= 1000000000u) t.ns = 0;
+    }
+    return t;
+}
+
+enum { E4_ATIME = 1, E4_MTIME = 2, E4_CTIME = 4, E4_CRTIME = 8 };
+
+static void ext4_stamp(struct ext4_inode *in, int which, struct ext4_time t) {
+    if (which & E4_ATIME)
+        ext4_time_put(&in->i_atime, &in->i_atime_extra, EXT4_HAS_EXTRA(in, i_atime_extra), t);
+    if (which & E4_MTIME)
+        ext4_time_put(&in->i_mtime, &in->i_mtime_extra, EXT4_HAS_EXTRA(in, i_mtime_extra), t);
+    if (which & E4_CTIME)
+        ext4_time_put(&in->i_ctime, &in->i_ctime_extra, EXT4_HAS_EXTRA(in, i_ctime_extra), t);
+    if ((which & E4_CRTIME) && EXT4_HAS_EXTRA(in, i_crtime))
+        ext4_time_put(&in->i_crtime, &in->i_crtime_extra,
+                      EXT4_HAS_EXTRA(in, i_crtime_extra), t);
+}
 
 static int read_inode(struct ext4 *fs, uint32_t ino, struct ext4_inode *out) {
     if (ino == 0) return VFS_ERR_INVAL;
@@ -250,9 +321,17 @@ static int read_inode(struct ext4 *fs, uint32_t ino, struct ext4_inode *out) {
     uint64_t blk = itab + byte_off_in_group / fs->block_size;
     uint32_t off = (uint32_t)(byte_off_in_group % fs->block_size);
 
-    /* The on-disk inode is `inode_size` bytes; we only ever consume
-     * the first sizeof(struct ext4_inode) = 128 bytes. */
-    return read_block_partial(fs, blk, off, sizeof(*out), out);
+    /* The on-disk inode is `inode_size` bytes: the core, then the fields
+     * its i_extra_isize covers (ext4_inode_extra_len), then attributes,
+     * which stay on the disk. A field it does not cover reads as 0. */
+    memset(out, 0, sizeof(*out));
+    uint32_t n = fs->inode_size < sizeof(*out) ? fs->inode_size : (uint32_t)sizeof(*out);
+    int rc = read_block_partial(fs, blk, off, n, out);
+    if (rc != VFS_OK) return rc;
+    uint32_t keep = ext4_inode_extra_len(fs, out);
+    memset((uint8_t *)out + EXT4_GOOD_OLD_INODE_SIZE + keep, 0,
+           sizeof(*out) - EXT4_GOOD_OLD_INODE_SIZE - keep);
+    return VFS_OK;
 }
 
 /* ================================================================
@@ -346,10 +425,13 @@ static int flush_gdt(struct ext4 *fs) {
     return VFS_OK;
 }
 
-/* Write inode `ino` back: read-modify-write its slot so the ext4 extra
- * fields beyond the 128-byte core are preserved. */
-static int write_inode(struct ext4 *fs, uint32_t ino,
-                       const struct ext4_inode *in) {
+/* Write inode `ino` back: read-modify-write its slot -- the core and the
+ * extra fields its i_extra_isize covers; what lies past them (in-inode
+ * attributes) is preserved. FRESH is a new inode: its whole slot is
+ * zeroed first, so nothing of the slot's last tenant (its attributes) is
+ * taken to be the new file's. */
+static int write_inode_slot(struct ext4 *fs, uint32_t ino,
+                            const struct ext4_inode *in, bool fresh) {
     if (ino == 0) return VFS_ERR_INVAL;
     uint32_t group = (ino - 1) / fs->inodes_per_group;
     uint32_t idx   = (ino - 1) % fs->inodes_per_group;
@@ -362,8 +444,15 @@ static int write_inode(struct ext4 *fs, uint32_t ino,
 
     int rc = read_block(fs, blk, fs->blk_buf);
     if (rc != VFS_OK) return rc;
-    memcpy(fs->blk_buf + off, in, sizeof(*in));
+    if (fresh) memset(fs->blk_buf + off, 0, fs->inode_size);
+    memcpy(fs->blk_buf + off, in,
+           EXT4_GOOD_OLD_INODE_SIZE + ext4_inode_extra_len(fs, in));
     return write_block(fs, blk, fs->blk_buf);
+}
+
+static int write_inode(struct ext4 *fs, uint32_t ino,
+                       const struct ext4_inode *in) {
+    return write_inode_slot(fs, ino, in, false);
 }
 
 /* ---- group descriptor bitmap accessors ---- */
@@ -1039,6 +1128,12 @@ static int dir_add_entry(struct ext4 *fs, uint32_t dir_ino,
                 memcpy((char *)ne + 8, name, nlen);
                 rc = write_block(fs, phys, blk);
                 kfree(blk);
+                /* an entry added changes the directory: its mtime and
+                 * ctime, as Linux's (finding 255) */
+                if (rc == VFS_OK) {
+                    ext4_stamp(&dir, E4_MTIME | E4_CTIME, ext4_now());
+                    rc = write_inode(fs, dir_ino, &dir);
+                }
                 return rc;
             }
             off += rec_len;
@@ -1062,6 +1157,7 @@ static int dir_add_entry(struct ext4 *fs, uint32_t dir_ino,
     if (rc != VFS_OK) return rc;
 
     dir.i_size_lo += fs->block_size;       /* i_blocks already bumped by alloc */
+    ext4_stamp(&dir, E4_MTIME | E4_CTIME, ext4_now());
     return write_inode(fs, dir_ino, &dir);
 }
 
@@ -1107,6 +1203,10 @@ static int dir_remove_entry(struct ext4 *fs, uint32_t dir_ino,
                         de->inode = 0;
                     rc = write_block(fs, phys, blk);
                     kfree(blk);
+                    if (rc == VFS_OK) {     /* as dir_add_entry's */
+                        ext4_stamp(&dir, E4_MTIME | E4_CTIME, ext4_now());
+                        rc = write_inode(fs, dir_ino, &dir);
+                    }
                     return rc;
                 }
             }
@@ -1549,7 +1649,7 @@ static void ext4_release_inode(struct ext4 *fs, uint32_t ino) {
     inode_free_data(fs, &in);
     in.i_size_lo = 0;
     in.i_size_hi = 0;
-    in.i_dtime   = (uint32_t)ext4_now_secs();
+    in.i_dtime   = (uint32_t)ext4_now().s;
     int rc = write_inode(fs, ino, &in);
     if (rc == VFS_OK) rc = ext4_free_inode(fs, ino);
     (void)txn_finish(fs, rc);
@@ -1712,9 +1812,7 @@ static long ext4_write(struct vfs_file *f, const void *buf, size_t n) {
             /* A write is a modification, and this driver never said so:
              * every file on an ext4 volume kept mtime 0 no matter how
              * often it changed. */
-            uint32_t now = (uint32_t)ext4_now_secs();
-            fp->in.i_mtime = now;
-            fp->in.i_ctime = now;
+            ext4_stamp(&fp->in, E4_MTIME | E4_CTIME, ext4_now());
             rc = write_inode(fs, fp->inode_no, &fp->in);
         }
         rc = txn_finish(fs, rc);
@@ -1745,14 +1843,15 @@ static int do_create(struct ext4 *fs, const char *path,
     in.i_mode  = EXT4_S_IFREG | (uint16_t)(mode & 0xFFF);
     ext4_inode_set_uid(&in, uid);
     ext4_inode_set_gid(&in, gid);
-    /* Born now, not at the epoch. */
-    in.i_atime = in.i_ctime = in.i_mtime =
-        (uint32_t)ext4_now_secs();
+    /* Born now, not at the epoch -- to the nanosecond where the inode has
+     * room for the large fields, as Linux gives a new inode them */
+    in.i_extra_isize = fs->want_extra_isize;
+    ext4_stamp(&in, E4_ATIME | E4_MTIME | E4_CTIME | E4_CRTIME, ext4_now());
     in.i_links_count = 1;
     in.i_flags = EXT4_EXTENTS_FL;
     init_extent_header(&in);
 
-    rc = write_inode(fs, new_ino, &in);
+    rc = write_inode_slot(fs, new_ino, &in, true);
     if (rc != VFS_OK) { ext4_free_inode(fs, new_ino); return rc; }
     rc = dir_add_entry(fs, parent_ino, leaf, new_ino, EXT4_FT_REG_FILE);
     if (rc != VFS_OK) { ext4_free_inode(fs, new_ino); return rc; }
@@ -1785,6 +1884,7 @@ static int do_unlink(struct ext4 *fs, const char *path) {
     if (rc != VFS_OK) return rc;
 
     if (in.i_links_count > 0) in.i_links_count--;
+    ext4_stamp(&in, E4_CTIME, ext4_now());      /* a link gone, as Linux's */
     if (in.i_links_count == 0) {
         struct ext4_openref *r = oref_find(fs, ino);
         if (r) {
@@ -1799,7 +1899,7 @@ static int do_unlink(struct ext4 *fs, const char *path) {
         inode_free_data(fs, &in);
         in.i_size_lo = 0;
         in.i_size_hi = 0;
-        in.i_dtime   = (uint32_t)ext4_now_secs();
+        in.i_dtime   = (uint32_t)ext4_now().s;
         write_inode(fs, ino, &in);
         ext4_free_inode(fs, ino);
     } else {
@@ -1845,7 +1945,7 @@ static int do_link(struct ext4 *fs, const char *oldpath,
     if (rc != VFS_OK) return rc;
 
     in.i_links_count++;
-    in.i_ctime = (uint32_t)ext4_now_secs();
+    ext4_stamp(&in, E4_CTIME, ext4_now());
     return write_inode(fs, ino, &in);
 }
 
@@ -1885,7 +1985,14 @@ static int do_rename(struct ext4 *fs, const char *oldpath,
     }
     rc = dir_add_entry(fs, np_ino, np_leaf, src_ino, src_ft);
     if (rc != VFS_OK) return rc;
-    return dir_remove_entry(fs, op_ino, op_leaf);
+    rc = dir_remove_entry(fs, op_ino, op_leaf);
+    if (rc != VFS_OK) return rc;
+    /* the inode moved is changed too: its ctime, as Linux's (finding 255) */
+    struct ext4_inode in;
+    rc = read_inode(fs, src_ino, &in);
+    if (rc != VFS_OK) return rc;
+    ext4_stamp(&in, E4_CTIME, ext4_now());
+    return write_inode(fs, src_ino, &in);
 }
 
 static int ext4_rename(void *mnt, const char *oldpath, const char *newpath) {
@@ -1943,9 +2050,9 @@ static int do_mkdir(struct ext4 *fs, const char *path,
     in.i_mode  = EXT4_S_IFDIR | (uint16_t)(mode & 0xFFF);
     ext4_inode_set_uid(&in, uid);
     ext4_inode_set_gid(&in, gid);
-    /* Born now, not at the epoch. */
-    in.i_atime = in.i_ctime = in.i_mtime =
-        (uint32_t)ext4_now_secs();
+    /* Born now, not at the epoch (see do_create) */
+    in.i_extra_isize = fs->want_extra_isize;
+    ext4_stamp(&in, E4_ATIME | E4_MTIME | E4_CTIME | E4_CRTIME, ext4_now());
     in.i_links_count = 2;            /* self + "." */
     in.i_flags = EXT4_EXTENTS_FL;
     init_extent_header(&in);
@@ -1967,7 +2074,7 @@ static int do_mkdir(struct ext4 *fs, const char *path,
     kfree(blk);
     if (rc != VFS_OK) { ext4_free_inode(fs, new_ino); return rc; }
 
-    rc = write_inode(fs, new_ino, &in);
+    rc = write_inode_slot(fs, new_ino, &in, true);
     if (rc != VFS_OK) { ext4_free_inode(fs, new_ino); return rc; }
     rc = dir_add_entry(fs, parent_ino, leaf, new_ino, EXT4_FT_DIR);
     if (rc != VFS_OK) { ext4_free_inode(fs, new_ino); return rc; }
@@ -2112,11 +2219,6 @@ static int ext4_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
  * quietly misbehave against a filesystem that drops the metadata.
  * ================================================================ */
 
-static uint64_t ext4_now_secs(void) {
-    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
-    extern uint64_t perf_now_ns(void);
-    return lx_realtime_ns(perf_now_ns()) / 1000000000ull;
-}
 
 
 /* ee_len carries an "uninitialised" flag in its top bit; the length is the
@@ -2265,9 +2367,7 @@ static int ext4_do_truncate(struct ext4 *fs, uint32_t ino,
     if (rc == VFS_OK) {
         in->i_size_lo = (uint32_t)(len & 0xFFFFFFFFu);
         in->i_size_hi = (uint32_t)(len >> 32);
-        uint32_t now  = (uint32_t)ext4_now_secs();
-        in->i_mtime = now;
-        in->i_ctime = now;
+        ext4_stamp(in, E4_MTIME | E4_CTIME, ext4_now());
         rc = write_inode(fs, ino, in);
     }
     return txn_finish(fs, rc);
@@ -2317,7 +2417,7 @@ static int ext4_meta_update(struct ext4 *fs, const char *path,
     if (rc != VFS_OK) return rc;
 
     apply(&in, a, b);
-    if (stamp_ctime) in.i_ctime = (uint32_t)ext4_now_secs();
+    if (stamp_ctime) ext4_stamp(&in, E4_CTIME, ext4_now());
 
     txn_begin(fs);
     rc = write_inode(fs, ino, &in);
@@ -2334,11 +2434,6 @@ static void apply_chown(struct ext4_inode *in, uint64_t uid, uint64_t gid) {
     if ((uint32_t)uid != (uint32_t)-1) ext4_inode_set_uid(in, (uint32_t)uid);
     if ((uint32_t)gid != (uint32_t)-1) ext4_inode_set_gid(in, (uint32_t)gid);
 }
-static void apply_utimes(struct ext4_inode *in, uint64_t mtime,
-                         uint64_t atime) {
-    in->i_mtime = (uint32_t)mtime;
-    in->i_atime = (uint32_t)atime;
-}
 
 static int ext4_chmod(void *mnt, const char *path, uint32_t mode) {
     return ext4_meta_update((struct ext4 *)mnt, path, apply_chmod,
@@ -2349,12 +2444,29 @@ static int ext4_chown(void *mnt, const char *path, uint32_t uid,
     return ext4_meta_update((struct ext4 *)mnt, path, apply_chown,
                             uid, gid, true);
 }
+static int ext4_utimens(void *mnt, const char *path, uint64_t mtime,
+                        uint32_t mtime_ns, uint64_t atime, uint32_t atime_ns) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    struct ext4_time m = { (int64_t)mtime, mtime_ns };
+    struct ext4_time a = { (int64_t)atime, atime_ns };
+    ext4_stamp(&in, E4_MTIME, m);
+    ext4_stamp(&in, E4_ATIME, a);
+    /* setting a time is a change: ctime to now, as Linux's (finding 255;
+     * it was left alone) */
+    ext4_stamp(&in, E4_CTIME, ext4_now());
+    txn_begin(fs);
+    rc = write_inode(fs, ino, &in);
+    return txn_finish(fs, rc);
+}
 static int ext4_utimes(void *mnt, const char *path, uint64_t mtime,
                        uint64_t atime) {
-    /* utimes sets the two times the caller named; ctime is not one of
-     * them, so it is deliberately left alone. */
-    return ext4_meta_update((struct ext4 *)mnt, path, apply_utimes,
-                            mtime, atime, false);
+    return ext4_utimens(mnt, path, mtime, 0, atime, 0);
 }
 
 static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
@@ -2380,8 +2492,15 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     /* The timestamps were never reported, so every file on an ext4 volume
      * looked like it was last modified at the epoch -- which makes `make`
      * rebuild everything, every time, and `find -newer` useless. */
-    out->mtime = in.i_mtime;
-    out->atime = in.i_atime;
+    struct ext4_time t;
+    t = ext4_time_get(in.i_mtime, in.i_mtime_extra, EXT4_HAS_EXTRA(&in, i_mtime_extra));
+    out->mtime = (uint64_t)t.s; out->mtime_ns = t.ns;
+    t = ext4_time_get(in.i_atime, in.i_atime_extra, EXT4_HAS_EXTRA(&in, i_atime_extra));
+    out->atime = (uint64_t)t.s; out->atime_ns = t.ns;
+    /* ...and the change time, which was never reported at all (%Z said
+     * the epoch for every file) */
+    t = ext4_time_get(in.i_ctime, in.i_ctime_extra, EXT4_HAS_EXTRA(&in, i_ctime_extra));
+    out->ctime = (uint64_t)t.s; out->ctime_ns = t.ns;
     out->nlink = in.i_links_count;
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
@@ -2417,6 +2536,7 @@ static const struct vfs_ops ext4_ops = {
     .chmod     = ext4_chmod,
     .chown     = ext4_chown,
     .utimes    = ext4_utimes,
+    .utimens   = ext4_utimens,  /* finding 255 */
     .truncate  = ext4_truncate,
     .ftruncate = ext4_ftruncate,
     .link      = ext4_link,
@@ -2507,6 +2627,16 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
     fs->blocks_per_group = sb->s_blocks_per_group;
     fs->first_ino        = (sb->s_rev_level >= 1) ? sb->s_first_ino : 11;
     fs->inode_size       = (sb->s_rev_level >= 1) ? sb->s_inode_size : 128;
+    /* a new inode's large fields: what the volume asks for, as Linux's
+     * ext4 gives (32 bytes when it says nothing), within the inode's room */
+    if (fs->inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
+        uint32_t w = sb->s_want_extra_isize ? sb->s_want_extra_isize : 32u;
+        uint32_t room = fs->inode_size - EXT4_GOOD_OLD_INODE_SIZE;
+        uint32_t known = (uint32_t)sizeof(struct ext4_inode) - EXT4_GOOD_OLD_INODE_SIZE;
+        if (w > room) w = room;
+        if (w > known) w = known;
+        fs->want_extra_isize = (uint16_t)w;
+    }
     fs->feature_incompat = sb->s_feature_incompat;
     fs->desc_size        = sb->s_desc_size;
     if (fs->desc_size < 32) fs->desc_size = 32;
@@ -2724,6 +2854,8 @@ int ext4_format_ex(struct blk_dev *dev, int with_journal) {
     sb->s_rev_level           = 1;
     sb->s_first_ino           = 11;
     sb->s_inode_size          = EXT4FMT_ISIZE;
+    sb->s_min_extra_isize     = 32;     /* the large inode's fields (255) */
+    sb->s_want_extra_isize    = 32;
     sb->s_feature_incompat    = EXT4_FEATURE_INCOMPAT_FILETYPE |
                                 EXT4_FEATURE_INCOMPAT_EXTENTS;
     if (with_journal) {
@@ -2779,6 +2911,11 @@ int ext4_format_ex(struct blk_dev *dev, int with_journal) {
         root->i_size_lo     = EXT4FMT_BS;
         root->i_blocks_lo   = EXT4FMT_BS / 512;
         root->i_flags       = EXT4_EXTENTS_FL;
+        /* born when the volume is, to the nanosecond, as mke2fs's root
+         * (it had no times: 1970) */
+        struct ext4_time born = ext4_now();
+        root->i_extra_isize = 32;
+        ext4_stamp(root, E4_ATIME | E4_MTIME | E4_CTIME | E4_CRTIME, born);
         struct ext4_extent_header *reh =
             (struct ext4_extent_header *)&root->i_block[0];
         reh->eh_magic   = EXT4_EXT_MAGIC;
@@ -2802,6 +2939,8 @@ int ext4_format_ex(struct blk_dev *dev, int with_journal) {
             ji->i_size_lo     = journal_blocks * EXT4FMT_BS;
             ji->i_blocks_lo   = journal_blocks * (EXT4FMT_BS / 512);
             ji->i_flags       = EXT4_EXTENTS_FL;
+            ji->i_extra_isize = 32;
+            ext4_stamp(ji, E4_ATIME | E4_MTIME | E4_CTIME | E4_CRTIME, born);
             struct ext4_extent_header *jeh =
                 (struct ext4_extent_header *)&ji->i_block[0];
             jeh->eh_magic   = EXT4_EXT_MAGIC;
