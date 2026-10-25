@@ -362,6 +362,19 @@ static int fm_pr_vanishes(const struct fm_pr_line *l) {
     return fm_pr_trunc && l->n && fm_pr_clump(l->s[0], 0, out, &len, &spaces) > fm_pr_cw;
 }
 
+/* a line that stores nothing in a column: one that vanishes, or -- down
+ * a page, unnumbered -- one of backspaces alone (each dropped at the
+ * line's start; across, or with -n, it is a line, measured) */
+static int fm_pr_stores_nothing(const struct fm_pr_line *l) {
+    if (fm_pr_vanishes(l)) return 1;
+    if (fm_pr.across || fm_pr.number) return 0;
+    char out[8];
+    int len, spaces;
+    for (size_t i = 0; i < l->n; i++)
+        if (fm_pr_clump(l->s[i], 0, out, &len, &spaces) != -2) return 0;
+    return 1;
+}
+
 /* LINE as text of width CW. WITH_NUMBER: the number NUM first (and the
  * margin before it when MARGIN). Returns the input column it ended at, or
  * -1 when it vanishes (nothing was written). */
@@ -372,9 +385,12 @@ static int fm_pr_text(const struct fm_pr_line *l, int cw, int margin, int multi,
     int ip = 0;
     char out[8];
     int len, spaces;
-    /* a column's line -- even an empty one, or one that vanishes -- first
-     * writes the spaces that lead to it, as a run of their own */
-    if (multi) fm_pr_move();
+    /* a column's line -- even an empty one, or one that vanishes down a
+     * page -- first writes the spaces that lead to it, as a run of their
+     * own; across, one that vanishes writes nothing, so the row ends
+     * before it ("x" alone, not "x" and a column of padding -- measured,
+     * logs/b34/prwide.py) */
+    if (multi && !(fm_pr.across && fm_pr_vanishes(l))) fm_pr_move();
     fm_pr_cell_op = fm_pr_op;
     if (fm_pr_vanishes(l)) return -1;
     if (margin) fm_pr_put_margin(multi);
@@ -519,13 +535,24 @@ static void fm_pr_col_done(int c, int ip, int merge_nw, int empty) {
     if (empty) {
         /* an empty line puts the count back where its column began --
          * once the separator after it is out (its number's spaces go out
-         * with that, or not at all at the line's end) */
-        fm_pr_reset_op = fm_pr_cell_op;
+         * with that, or not at all at the line's end); unnumbered, back to
+         * nothing, the next column counting from the separator alone
+         * (logs/b34/prc3.py: "", "" then a third column at 1) */
+        fm_pr_reset_op = fm_pr.number ? fm_pr_cell_op : (c == 0 ? fm_pr.margin : 0);
+        /* ...but with no separator to go out (-s alone beside -w) a
+         * numbered one counts on: its number's spaces join the next
+         * number's, which tab as if it ran on (prjoin.py: -3 -J -s -w 25
+         * -n, two empty lines then "h") */
+        if (fm_pr.number && !*fm_pr_sep) fm_pr_reset_op = -1;
         return;
     }
-    /* likewise once the separator is out: the spaces a column ends in go
-     * out as counted where they are, and are not counted after */
-    fm_pr_reset_op = (c == 0 ? fm_pr.margin : 0) + ip - fm_pr_pend;
+    /* a column whose text ends in spaces counts on: they go out before the
+     * separator, and the next column is counted from where they end
+     * (prc3.py: "ab  " "ab  " puts the third at 10, not 5) */
+    if (fm_pr_pend > 0) return;
+    /* likewise once the separator is out -- counted from the column's own
+     * start, its text and the spaces it ends in */
+    fm_pr_reset_op = (c == 0 ? fm_pr.margin : 0) + ip;
 }
 
 /* what goes between two columns: the padding of the one before (cut
@@ -538,6 +565,11 @@ static void fm_pr_between(int prev_ip, int sep) {
             if (*p == ' ') fm_pr_spaces(1);
             else fm_pr_putc(*p);
         }
+    } else {
+        /* ...but not the room it takes: the next column is where it
+         * belongs (-S'|': "a\t     |b", the "|" before the line that
+         * vanished gone and b at its column -- measured, prwide.py) */
+        fm_pr_spaces((int)strlen(fm_pr_sep));
     }
     if (fm_pr_reset_op >= 0) {
         fm_pr_op = fm_pr_reset_op + (sep ? (int)strlen(fm_pr_sep) : 0) - fm_pr_pend;
@@ -594,6 +626,13 @@ static void fm_pr_print_page(size_t n, uintmax_t page, int ended_ff, int full) {
                     ix[k++] = start + r;
                     start += lens[c];
                 }
+            }
+            /* across, a row whose every line vanishes is no row: nothing
+             * of it is written, not even its newline -- measured */
+            if (fm_pr.across) {
+                int c = 0;
+                while (c < k && fm_pr_vanishes(&fm_pr_lines[ix[c]])) c++;
+                if (c == k) continue;
             }
             fm_pr_put_margin(1);
             fm_pr_reset_op = -1;
@@ -694,7 +733,16 @@ static void fm_pr_one_file(const char *name) {
         size_t n = 0;
         while (n < want && in->st == FM_PR_OPEN) {
             fm_pr_room(n);
-            if (fm_pr_get_line(in, &fm_pr_lines[n])) n++;
+            if (!fm_pr_get_line(in, &fm_pr_lines[n])) continue;
+            /* in columns, a last line with no newline that stores
+             * nothing (fm_pr_stores_nothing) is no line at all: no row,
+             * no column's padding before it (one column prints it: an
+             * empty line for the backspaces; measured, logs/b34/prwide.py
+             * and prtail.py) */
+            if (fm_pr_ncols > 1 && fm_pr_lines[n].term == EOF &&
+                fm_pr_stores_nothing(&fm_pr_lines[n]))
+                continue;
+            n++;
         }
         if (n == want) fm_pr_after_full(in);
         if (n == 0 && in->st == FM_PR_DONE) { count = page; break; }
@@ -727,7 +775,12 @@ static void fm_pr_merge(char **names, int n) {
     struct fm_pr_line *lines = (struct fm_pr_line *)calloc((size_t)n + 1, sizeof *lines);
     int *have = (int *)calloc((size_t)n + 1, sizeof *have);
     int *show = (int *)calloc((size_t)n + 1, sizeof *show);
-    if (!ins || !lines || !have || !show) su_error(1, ENOMEM, "memory exhausted");
+    /* what GNU knows of each file's end: only what a read of it has met
+     * (this looks ahead); a file it still reads in a row is "read" */
+    int *gdone = (int *)calloc((size_t)n + 1, sizeof *gdone);
+    int *read_now = (int *)calloc((size_t)n + 1, sizeof *read_now);
+    if (!ins || !lines || !have || !show || !gdone || !read_now)
+        su_error(1, ENOMEM, "memory exhausted");
     int k = 0;
     for (int i = 0; i < n; i++) {
         struct fm_pr_in *in = fm_pr_open(names[i]);
@@ -765,6 +818,10 @@ static void fm_pr_merge(char **names, int n) {
                 if (!have[i])
                     for (int j = 0; j < k; j++) if (ins[j]->st == FM_PR_OPEN) show[i] = 1;
             }
+            for (int i = 0; i < k; i++) {
+                read_now[i] = !gdone[i];
+                if (read_now[i] && ins[i]->st == FM_PR_DONE) gdone[i] = 1;
+            }
             if (!printing && fm_pr.number) {
                 if (have[0]) fm_pr_lineno++;
                 if (first_open && ins[0]->st == FM_PR_DONE) { fm_pr_lineno++; first_open = 0; }
@@ -799,6 +856,23 @@ static void fm_pr_merge(char **names, int n) {
                 } else if (have[i]) {
                     ip = fm_pr_text(&lines[i], fm_pr_cw, 0, fm_pr_ncols > 1, 0, 0);
                     if (ip < 0) ip = 0;
+                    /* A LAST LINE WITH NO NEWLINE ends as a line does when
+                     * it is followed: the spaces it ends in are written,
+                     * not dropped ("x " stays "x "), and with -n the next
+                     * number follows it in the row, the count going on
+                     * from it ("    1\tx    2\t...q", then 3) -- the
+                     * columns after it where they belong (measured,
+                     * logs/b34/prmerge.py) */
+                    int later = 0;
+                    for (int j = i + 1; j < k; j++) if (read_now[j]) later = 1;
+                    if (lines[i].term == EOF && later) {
+                        fm_pr_move();
+                        if (fm_pr.number) {
+                            fm_pr_put_number(fm_pr_lineno, fm_pr_ncols > 1);
+                            fm_pr_lineno++;
+                            ip += fm_pr_nw;
+                        }
+                    }
                 } else if (i > 0 && fm_pr_ncols > 1) {
                     fm_pr_move();        /* an empty column is written out */
                 }
@@ -831,6 +905,8 @@ out:
     free(lines);
     free(have);
     free(show);
+    free(gdone);
+    free(read_now);
 }
 
 /* ---- the options --------------------------------------------------------------- */
