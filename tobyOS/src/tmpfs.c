@@ -61,9 +61,8 @@ struct tts { uint64_t s; uint32_t ns; };
 /* Now -- the same source tobyfs uses for a wall-clock timestamp (see
  * tfs_now_secs) */
 static struct tts tmpfs_now(void) {
-    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
-    extern uint64_t perf_now_ns(void);
-    uint64_t n = lx_realtime_ns(perf_now_ns());
+    extern uint64_t file_time_ns(void);     /* Linux's coarse clock (255) */
+    uint64_t n = file_time_ns();
     struct tts t = { n / TNS, (uint32_t)(n % TNS) };
     return t;
 }

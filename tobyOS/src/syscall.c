@@ -4962,8 +4962,8 @@ static long sys_utimes_native(const char *path, uint64_t mtime, uint64_t atime) 
     if (rr) return rr;
     uint64_t now = 0;
     if (mtime == (uint64_t)-1 || atime == (uint64_t)-1) {
-        extern uint64_t lx_realtime_ns(uint64_t mono_ns);
-        now = lx_realtime_ns(perf_now_ns()) / 1000000000ull;
+        extern uint64_t file_time_ns(void);
+        now = file_time_ns() / 1000000000ull;
     }
     if (mtime == (uint64_t)-1) mtime = now;
     if (atime == (uint64_t)-1) atime = now;
@@ -5024,8 +5024,8 @@ static long do_utimensat(const char *kpath, bool have, int64_t a_s, long a_ns,
     }
     /* to the nanosecond, the clock's and the caller's (finding 239): the
      * nanoseconds were dropped, every time a whole second */
-    extern uint64_t lx_realtime_ns(uint64_t mono_ns);
-    uint64_t now_ns = lx_realtime_ns(perf_now_ns());
+    extern uint64_t file_time_ns(void);
+    uint64_t now_ns = file_time_ns();
     int64_t now = (int64_t)(now_ns / 1000000000ull);
     uint32_t now_frac = (uint32_t)(now_ns % 1000000000ull);
     int64_t na = a_omit ? (int64_t)vs.atime : a_now ? now : a_s;
@@ -9704,6 +9704,19 @@ uint64_t lx_realtime_ns(uint64_t mono_ns) {
         b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
     }
     return b + mono_ns;
+}
+
+/* THE TIME A FILE IS STAMPED WITH: the wall clock as of the last 4 ms tick,
+ * as Linux's filesystems take theirs (its coarse clock, CONFIG_HZ=250:
+ * 2000 files made in a loop on WSL's tmpfs had three mtimes, 4 ms apart,
+ * logs/b34/ext4times). So the steps of one operation, which Linux takes in
+ * one tick -- touch's create and its utimensat -- leave equal times, where
+ * the nanosecond clock left a new file's atime, mtime and ctime all
+ * different. tmpfs, ext4 and utimensat's UTIME_NOW read it. */
+#define FILE_TIME_TICK_NS 4000000ull
+uint64_t file_time_ns(void) {
+    uint64_t mono = perf_now_ns();
+    return lx_realtime_ns(mono - mono % FILE_TIME_TICK_NS);
 }
 
 /* Setting the wall clock, as Linux's settimeofday paths judge it (measured
