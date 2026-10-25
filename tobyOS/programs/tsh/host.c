@@ -1148,6 +1148,53 @@ int host_input_ready(struct file *f, long timeout_ms) {
     }
 }
 
+/* Mark close-on-exec every descriptor of this process but the NKEEP in
+ * KEEP; the ones marked are returned (malloc'd, *NOUT of them) for the
+ * caller to unmark should its exec fail. /proc/self/fd names them; without
+ * it (a chroot with no /proc) every number below PROC_NFDS is asked. */
+static int *host_cloexec_rest(const int *keep, int nkeep, int *nout) {
+    int cap = 16, n = 0, nc = 0;
+    int *cand = (int *)malloc((size_t)cap * sizeof *cand);
+    *nout = 0;
+    if (!cand) return 0;
+    DIR *d = opendir("/proc/self/fd");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != 0) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+            if (nc == cap) {
+                int *g = (int *)realloc(cand, (size_t)(cap *= 2) * sizeof *cand);
+                if (!g) break;
+                cand = g;
+            }
+            cand[nc++] = atoi(e->d_name);
+        }
+        closedir(d);                /* its own descriptor is gone by now */
+    }
+    int all = !d;
+    int mcap = all ? 64 : (nc ? nc : 1);
+    int *marked = (int *)malloc((size_t)mcap * sizeof *marked);
+    if (!marked) { free(cand); return 0; }
+    for (int k = 0; all ? k < PROC_NFDS : k < nc; k++) {
+        int fd = all ? k : cand[k];
+        int skip = 0;
+        for (int j = 0; j < nkeep && !skip; j++) skip = keep[j] == fd;
+        if (skip) continue;
+        int fl = fcntl(fd, F_GETFD);
+        if (fl < 0 || (fl & FD_CLOEXEC)) continue;
+        if (fcntl(fd, F_SETFD, fl | FD_CLOEXEC) < 0) continue;
+        if (n == mcap) {
+            int *g = (int *)realloc(marked, (size_t)(mcap *= 2) * sizeof *marked);
+            if (!g) { (void)fcntl(fd, F_SETFD, fl); continue; }
+            marked = g;
+        }
+        marked[n++] = fd;
+    }
+    free(cand);
+    *nout = n;
+    return marked;
+}
+
 int proc_exec_in_place(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
     /* Descriptors go over where they are -- see proc_spawn.
@@ -1171,7 +1218,9 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     int n = nx + 3;
     int *tgt = (int *)malloc((size_t)n * sizeof *tgt);
     int *src = (int *)malloc((size_t)n * sizeof *src);
-    if (!tgt || !src) { free(tgt); free(src); return -1; }
+    int *keep = (int *)malloc((size_t)n * sizeof *keep);     /* what the program has */
+    int nkeep = 0;
+    if (!tgt || !src || !keep) { free(tgt); free(src); free(keep); return -1; }
     int top = 2;
     for (int i = 0; i < n; i++) {
         struct file *f;
@@ -1188,17 +1237,17 @@ int proc_exec_in_place(const struct proc_spec *spec) {
         else if (f) src[i] = VF_FD(&f->vfs);
         else src[i] = t;                         /* none: as it is */
         if (src[i] < -1 || (src[i] < 0 && !host_slot_closed(f))) {
-            if (i >= nx) { free(tgt); free(src); return -1; }
+            if (i >= nx) { free(tgt); free(src); free(keep); return -1; }
             tgt[i] = -1;                         /* an extra with no fd */
-        }
+        } else if (src[i] != -1) keep[nkeep++] = t;
         if (src[i] == tgt[i]) tgt[i] = -1;       /* already in place */
         if (tgt[i] > top) top = tgt[i];
         if (src[i] > top) top = src[i];
     }
-    if (top + 1 + n >= 1024) { free(tgt); free(src); return -1; }
+    if (top + 1 + n >= 1024) { free(tgt); free(src); free(keep); return -1; }
     for (int i = 0; i < n; i++)
         if (tgt[i] >= 0 && src[i] >= 0 && dup2(src[i], top + 1 + i) < 0) {
-            free(tgt); free(src);
+            free(tgt); free(src); free(keep);
             return -1;
         }
     for (int i = 0; i < n; i++) {
@@ -1211,9 +1260,27 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     free(tgt);
     free(src);
 
+    /* AND NOTHING ELSE GOES OVER. proc_spawn's child has a table built for
+     * it -- 0-2 and the extras; this is the shell's own table, and every
+     * other descriptor in it went to the program too: a pipe's end at the
+     * number it was made at, $( )'s pipe. `ls /proc/self/fd | cat` listed
+     * the pipe to cat twice (1 and 4), and a background child of a stage
+     * held the substitution's pipe, so `$( ... | at now + 5 sec | head -1 )`
+     * returned only once the job had run, too late for atrm (finding 262).
+     * bash's child has 0-2 alone. Marked close-on-exec, not closed: a failed
+     * exec falls back to the spawn, which still needs them, and they are
+     * unmarked again. */
+    int nmarked = 0;
+    int *marked = host_cloexec_rest(keep, nkeep, &nmarked);
+    free(keep);
+
     char **argv = host_strvec(spec->argv, spec->argc);
     char **envp = host_strvec(spec->envp, spec->envp ? spec->envc : 0);
-    if (!argv || !envp) { free(argv); free(envp); return -1; }
+    if (!argv || !envp) {
+        for (int i = 0; i < nmarked; i++) (void)fcntl(marked[i], F_SETFD, 0);
+        free(marked); free(argv); free(envp);
+        return -1;
+    }
     /* INT and QUIT as the shell asked (proc_spec.sig_default/sig_ignore),
      * as proc_spawn's flags give them; exec keeps an ignore and resets a
      * handler, so these are what the program starts with. */
@@ -1227,6 +1294,8 @@ int proc_exec_in_place(const struct proc_spec *spec) {
     int saved = errno;
     for (int s = SIGINT; s <= SIGQUIT; s++)     /* the exec failed: put back */
         if (put[s]) host_sig_put(s, was[s]);
+    for (int i = 0; i < nmarked; i++) (void)fcntl(marked[i], F_SETFD, 0);
+    free(marked);
     free(argv); free(envp);         /* only reached when the exec failed */
     errno = saved;
     return -1;
