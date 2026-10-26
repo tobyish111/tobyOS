@@ -287,6 +287,7 @@ static void builtin_ls(struct term_session *s, int argc, char **argv) {
     struct vfs_dirent ent;
     int shown = 0;
     while (vfs_readdir(&d, &ent) == VFS_OK) {
+        vfs_dirent_fill(path, &ent);      /* its size: a stat, where needed (277) */
         if (ent.type == VFS_TYPE_DIR) {
             term_printf(s, "  %s/\r\n", ent.name);
         } else {

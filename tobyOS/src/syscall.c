@@ -1645,8 +1645,14 @@ static long sys_fs_readdir(const char *path, struct vfs_dirent_user *out,
     struct vfs_dirent ent;
     int written = 0;
     int index   = 0;
+    /* where the last window ended, without reading the way there
+     * (finding 277) */
+    if (offset > 0) index = (int)vfs_seekdir(&d, (size_t)offset);
     while (written < cap && vfs_readdir(&d, &ent) == VFS_OK) {
         if (index++ < offset) continue;
+        /* this listing gives size, owner and mode: a driver that reads only
+         * the directory leaves them to a stat (finding 277) */
+        vfs_dirent_fill(kpath, &ent);
         /* Copy via a kernel staging buffer so a partial iteration
          * can't leave bad data in user memory. */
         struct vfs_dirent_user u;
@@ -1789,6 +1795,10 @@ static long sys_fs_readdir2(const char *path, struct abi_dirent2 *out,
         written++;
     }
     struct vfs_dirent ent;
+    /* the window's first entry, passed to without reading the way there
+     * where the driver can (finding 277: each call opened the directory
+     * again and read every entry before it) */
+    if (offset > index) index += (int)vfs_seekdir(&d, (size_t)(offset - index));
     while (written < cap && vfs_readdir(&d, &ent) == VFS_OK) {
         if (index++ < offset) continue;
         memset(&u, 0, sizeof u);
@@ -1797,7 +1807,10 @@ static long sys_fs_readdir2(const char *path, struct abi_dirent2 *out,
             u.name[i] = ent.name[i];
         u.name[i] = '\0';
         u.type = vfs_entry_dt(ent.type, ent.mode);
-        u.ino = readdir_join(child, sizeof child, kpath, ent.name)
+        /* the inode the entry names, where the directory says it: a stat
+         * of each name was a lookup of it (finding 277) */
+        u.ino = ent.ino ? ent.ino
+              : readdir_join(child, sizeof child, kpath, ent.name)
               ? readdir_ino(child, false) : 0;
         if (copy_to_user(&out[written], &u, sizeof u) != 0) {
             vfs_closedir(&d);
@@ -15899,9 +15912,9 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             emitted++;
         }
         /* Skip the entries already returned by earlier getdents64 calls. */
-        {
-            uint32_t skip = f->dir_off > 2 ? f->dir_off - 2 : 0, idx = 0;
-            while (idx < skip && vfs_readdir(&d, &ent) == VFS_OK) idx++;
+        {   /* without reading the way there where the driver can (277) */
+            uint32_t skip = f->dir_off > 2 ? f->dir_off - 2 : 0;
+            if (skip) (void)vfs_seekdir(&d, skip);
         }
         while (!toosmall && f->dir_off + emitted >= 2 &&
                vfs_readdir(&d, &ent) == VFS_OK) {
@@ -15914,7 +15927,8 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
             struct lx_dirent64 de;
             memset(&de, 0, reclen);
-            de.d_ino    = readdir_join(child, sizeof child, f->dirpath, ent.name)
+            de.d_ino    = ent.ino ? ent.ino     /* the entry's own (277) */
+                        : readdir_join(child, sizeof child, f->dirpath, ent.name)
                         ? readdir_ino(child, true)
                         : (uint64_t)(f->dir_off + emitted + 1);
             de.d_off    = (int64_t)(f->dir_off + emitted + 1);

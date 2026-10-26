@@ -915,6 +915,10 @@ int vfs_closedir(struct vfs_dir *d) {
     return VFS_OK;
 }
 
+/* the kernel's fills a bare entry by a stat (finding 277); this build's
+ * entries come from readdir(3) and the shell asks no more of them */
+void vfs_dirent_fill(const char *dir, struct vfs_dirent *e) { (void)dir; (void)e; }
+
 const char *vfs_strerror(int err) {
     switch (err) {
         case VFS_OK:                 return "ok";

@@ -14583,6 +14583,9 @@ static void cmd_ls(int argc, char **argv) {
     size_t shown = 0;
     while (vfs_readdir(&d, &ent) == VFS_OK) {
         char perms[11];
+        /* size, owner and mode by a stat, from a driver that gives only
+         * the directory's own (finding 277) */
+        vfs_dirent_fill(path, &ent);
         mode_to_string(ent.mode, ent.type, perms);
         if (long_form) {
             const struct user *u = users_lookup_by_uid((int)ent.uid);

@@ -1326,16 +1326,50 @@ int vfs_closedir(struct vfs_dir *d) {
 
 int vfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     if (!d || !d->ops || !out) return VFS_ERR_INVAL;
+    /* every field a driver leaves alone reads 0 -- ino above all, which
+     * callers take as the entry's when it is not (finding 277) */
+    memset(out, 0, sizeof *out);
     if (d->xpos == 0) {
         int rc = d->ops->readdir(d, out);
         if (rc == VFS_OK) return rc;
         d->xpos = 1;                    /* the driver is done: mount points */
     }
+    memset(out, 0, sizeof *out);
     if (vfs_mount_child(d, d->xpos - 1, out)) {
         d->xpos++;
         return VFS_OK;
     }
     return VFS_ERR_NOENT;
+}
+
+size_t vfs_seekdir(struct vfs_dir *d, size_t n) {
+    if (!d || !d->ops) return 0;
+    size_t done = 0;
+    if (d->xpos == 0 && d->ops->seekdir && n) {
+        long k = d->ops->seekdir(d, n);
+        if (k > 0) done = (size_t)k;
+        if (done < n) d->xpos = 1;      /* the driver is done: mount points */
+    }
+    struct vfs_dirent e;
+    while (done < n && vfs_readdir(d, &e) == VFS_OK) done++;
+    return done;
+}
+
+void vfs_dirent_fill(const char *dir, struct vfs_dirent *e) {
+    if (!dir || !e || (e->mode & VFS_MODE_VALID)) return;
+    char p[VFS_PATH_MAX];
+    size_t dl = strlen(dir), nl = strlen(e->name);
+    bool slash = !(dl && dir[dl - 1] == '/');
+    if (dl + (slash ? 1 : 0) + nl + 1 > sizeof p) return;
+    memcpy(p, dir, dl);
+    if (slash) p[dl++] = '/';
+    memcpy(p + dl, e->name, nl + 1);
+    struct vfs_stat st;
+    if (vfs_stat(p, &st) != VFS_OK) return;
+    e->size = st.type == VFS_TYPE_DIR ? 0 : st.size;
+    e->uid  = st.uid;
+    e->gid  = st.gid;
+    if (st.mode & VFS_MODE_VALID) e->mode = st.mode;
 }
 
 /* A FILESYSTEM WITH NO DEVICE NUMBER GETS ONE OF ITS OWN. Only tobyfs and

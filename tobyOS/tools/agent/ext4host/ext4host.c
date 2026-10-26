@@ -18,6 +18,15 @@
  *   wseq P N BS          (P opened once, N writes of BS bytes from where
  *                         it ends, closed: as dd bs=BS appends)
  *   ls P                 (P's entries counted, as a readdir gives them)
+ *   lsw P W              (P listed as READDIR2 does: a handle a window of
+ *                         W names, each passing those before; counted)
+ *   statall P W          (lsw, and each name stat'ed, as find does)
+ *   (manifest lists each directory a window of 5 to 9 names at a time,
+ *    each window a handle of its own that seeks past the ones before, as
+ *    READDIR2)
+ *   seekls P N           (a handle on P passes N entries, then reads the
+ *                         rest: N plus the rest counted)
+ *   echo TEXT            ("> echo TEXT rc=0": a marker in the output)
  *   io                   (the device reads and writes since the last
  *                         `io`, and their sectors; then zeroed)
  *   manifest             (every name under /, sorted: path, type, mode,
@@ -183,24 +192,101 @@ static int name_cmp(const void *a, const void *b)
     return strcmp(((const struct name *)a)->s, ((const struct name *)b)->s);
 }
 
-static void manifest(const char *dir)
+/* Pass N entries of D: the driver's seekdir (finding 277), or -- built
+ * with -DEXT4HOST_NOSEEK, for a driver without one -- N readdirs, as the
+ * VFS does for it */
+static long h_seekdir(struct vfs_dir *d, size_t n)
+{
+#ifdef EXT4HOST_NOSEEK
+    struct vfs_dirent e;
+    size_t k = 0;
+    while (k < n && ext4_readdir(d, &e) == VFS_OK) k++;
+    return (long)k;
+#else
+    return ext4_seekdir(d, n);
+#endif
+}
+
+/* A fresh handle on P passes N entries (the driver's seekdir), then reads
+ * to the end: N passed plus the rest in *COUNT, which is P's entries if
+ * the place it passed to was where the Nth entry is (finding 277) */
+static int do_seekls(const char *p, size_t n, unsigned long long *count)
 {
     struct vfs_dir d;
     memset(&d, 0, sizeof d);
     d.mnt = g_mnt;
-    if (ext4_opendir(g_mnt, dir, &d) != VFS_OK) {
-        printf("%s opendir-failed\n", dir);
-        return;
+    int rc = ext4_opendir(g_mnt, p, &d);
+    if (rc != VFS_OK) return rc;
+    *count = (unsigned long long)h_seekdir(&d, n);
+    struct vfs_dirent e;
+    while (ext4_readdir(&d, &e) == VFS_OK) (*count)++;
+    ext4_closedir(&d);
+    return VFS_OK;
+}
+
+/* P listed as READDIR2 lists it, W names a window, each window a handle
+ * of its own; with STAT, each name stat'ed as well, as find does. The
+ * names found (and stat'ed) in *COUNT. */
+static int do_lsw(const char *p, size_t w, bool stat_each, unsigned long long *count)
+{
+    *count = 0;
+    size_t n = 0;
+    for (bool more = true; more; ) {
+        struct vfs_dir d;
+        memset(&d, 0, sizeof d);
+        d.mnt = g_mnt;
+        int rc = ext4_opendir(g_mnt, p, &d);
+        if (rc != VFS_OK) return rc;
+        if (n && h_seekdir(&d, n) != (long)n) more = false;
+        struct vfs_dirent e;
+        size_t got = 0;
+        while (more && got < w && ext4_readdir(&d, &e) == VFS_OK) {
+            got++;
+            n++;
+            if (!stat_each) { (*count)++; continue; }
+            char c[VFS_PATH_MAX];
+            struct vfs_stat st;
+            snprintf(c, sizeof c, "%s/%s", p, e.name);
+            if (ext4_stat(g_mnt, c, &st) == VFS_OK) (*count)++;
+        }
+        if (got < w) more = false;
+        ext4_closedir(&d);
     }
+    return VFS_OK;
+}
+
+/* DIR's names as READDIR2 gives them (finding 277): a handle opened for
+ * each window, which passes over what the windows before it gave
+ * (ext4_seekdir, from a place a handle closed at). The window is 5 to 9
+ * names, another for each listing, so a listing passes to places an
+ * earlier one kept -- not only to the ones it has just kept itself. */
+static unsigned g_listings;
+static void manifest(const char *dir)
+{
     struct name *v = 0;
     size_t n = 0, cap = 0;
-    struct vfs_dirent e;
-    while (ext4_readdir(&d, &e) == VFS_OK) {
-        if (n == cap) { cap = cap ? cap * 2 : 16; v = realloc(v, cap * sizeof *v); }
-        snprintf(v[n++].s, VFS_NAME_MAX, "%s", e.name);
+    int w = 5 + (int)(g_listings++ % 5);
+    for (bool more = true; more; ) {
+        struct vfs_dir d;
+        memset(&d, 0, sizeof d);
+        d.mnt = g_mnt;
+        if (ext4_opendir(g_mnt, dir, &d) != VFS_OK) {
+            printf("%s opendir-failed\n", dir);
+            free(v);
+            return;
+        }
+        if (n && h_seekdir(&d, n) != (long)n) more = false;
+        struct vfs_dirent e;
+        int got = 0;
+        while (more && got < w && ext4_readdir(&d, &e) == VFS_OK) {
+            if (n == cap) { cap = cap ? cap * 2 : 16; v = realloc(v, cap * sizeof *v); }
+            snprintf(v[n++].s, VFS_NAME_MAX, "%s", e.name);
+            got++;
+        }
+        if (got < w) more = false;
+        ext4_closedir(&d);
     }
-    ext4_closedir(&d);
-    qsort(v, n, sizeof *v, name_cmp);
+    if (n) qsort(v, n, sizeof *v, name_cmp);   /* an empty directory: v is NULL */
     for (size_t i = 0; i < n; i++) {
         char p[VFS_PATH_MAX];
         snprintf(p, sizeof p, "%s%s%s", dir, strcmp(dir, "/") ? "/" : "", v[i].s);
@@ -476,6 +562,19 @@ int main(int argc, char **argv)
             rc = do_wseq(a, x, y);
         } else if (!strcmp(op, "ls")) {
             rc = do_ls(a, &x);
+            printf("> %s rc=%d entries=%llu\n", line, rc, x);
+            continue;
+        } else if (!strcmp(op, "seekls")) {
+            sscanf(line, "%*s %*s %llu", &y);
+            rc = do_seekls(a, (size_t)y, &x);
+            printf("> %s rc=%d entries=%llu\n", line, rc, x);
+            continue;
+        } else if (!strcmp(op, "echo")) {        /* a marker in the output */
+            printf("> %s rc=0\n", line);
+            continue;
+        } else if (!strcmp(op, "lsw") || !strcmp(op, "statall")) {
+            sscanf(line, "%*s %*s %llu", &y);
+            rc = do_lsw(a, y ? (size_t)y : 64, op[0] == 's', &x);
             printf("> %s rc=%d entries=%llu\n", line, rc, x);
             continue;
         } else if (!strcmp(op, "io")) {

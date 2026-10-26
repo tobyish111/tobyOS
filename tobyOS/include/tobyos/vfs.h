@@ -187,6 +187,13 @@ struct vfs_dirent {
     uint32_t      uid;
     uint32_t      gid;
     uint32_t      mode;
+    /* The entry's inode, as the directory itself says it (finding 277):
+     * Linux's d_ino, taken from the entry, never by a stat of the name.
+     * 0 = the driver gives none, and readdir's callers stat the name. A
+     * driver that reads only the directory -- ext4's, as Linux's readdir
+     * does -- leaves size, uid and gid 0 and mode without VFS_MODE_VALID,
+     * its format bits alone; vfs_dirent_fill stats for the rest. */
+    uint64_t      ino;
 };
 
 /* Forward decls; concrete layout is opaque to callers and lives in
@@ -217,6 +224,13 @@ struct vfs_ops {
     int  (*opendir) (void *mnt, const char *path, struct vfs_dir *out);
     int  (*closedir)(struct vfs_dir *d);
     int  (*readdir) (struct vfs_dir *d, struct vfs_dirent *out);
+    /* (optional) Pass over the next N entries readdir would give, as N
+     * readdirs would, without giving them; returns how many it passed
+     * (fewer at the directory's end). For the callers that open a
+     * directory again for each window of a listing -- READDIR2,
+     * getdents64 -- so a driver that knows where the Nth entry is need
+     * not read its way there (finding 277). NULL: vfs_seekdir reads. */
+    long (*seekdir) (struct vfs_dir *d, size_t n);
     int  (*stat)    (void *mnt, const char *path, struct vfs_stat *out);
     /* Optional. If NULL, vfs_chmod / vfs_chown return VFS_ERR_ROFS. */
     int  (*chmod)   (void *mnt, const char *path, uint32_t mode);
@@ -549,6 +563,14 @@ int  vfs_mkdir   (const char *path);
 int  vfs_opendir (const char *path, struct vfs_dir *out);
 int  vfs_closedir(struct vfs_dir *d);
 int  vfs_readdir (struct vfs_dir *d, struct vfs_dirent *out);
+/* Pass over N entries, as N vfs_readdirs would (the driver's ->seekdir
+ * where it has one). Returns how many it passed. */
+size_t vfs_seekdir(struct vfs_dir *d, size_t n);
+/* E, an entry of directory DIR: where its driver gave only what the
+ * directory holds (mode without VFS_MODE_VALID, see struct vfs_dirent),
+ * its size, owner and mode from a stat of DIR/E->name -- for the
+ * listings that print them. */
+void vfs_dirent_fill(const char *dir, struct vfs_dirent *e);
 int  vfs_stat    (const char *path, struct vfs_stat *out);
 
 /* Permission management (milestone 15). Both require either uid 0 or

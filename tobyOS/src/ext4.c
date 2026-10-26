@@ -178,6 +178,23 @@ struct ext4 {
     uint32_t j_sequence;          /* sequence to stamp on the next transaction */
     struct ext4_txn *txn;         /* active transaction, or NULL (writes direct) */
 
+    /* Where a listing stopped (finding 277): READDIR2 and getdents64 open
+     * the directory again for each window, and a window starts where the
+     * last one ended, so each handle's place is kept when it closes and
+     * the next one passes straight to it (ext4_seekdir). Good while no
+     * directory changes: DIR_GEN moves with every entry added or removed
+     * (and every write around the driver), and a hint of another
+     * generation is not used. */
+#define EXT4_DIR_HINTS 8
+    struct ext4_dirhint {
+        uint32_t ino;             /* 0 = free */
+        uint64_t gen;
+        size_t   index;           /* entries before the place */
+        uint32_t lblk, off;       /* the place */
+        uint64_t used;
+    } dirhints[EXT4_DIR_HINTS];
+    uint64_t dir_gen, hint_tick;
+
     /* Open handles per inode, so unlink() can defer the release to the
      * last close the way POSIX requires. See oref_get() below. */
     struct ext4_openref {
@@ -201,11 +218,21 @@ struct ext4_filepriv {
     uint64_t          file_size;
 };
 
-/* Per-handle state for an open directory. Fully materialised on
- * opendir, mirroring the tobyfs / fat32 pattern. */
+/* Per-handle state for an open directory: where its next entry is, the
+ * directory read a block at a time as readdir goes. It was read whole at
+ * opendir, with every child's inode -- for each 64-entry window of a
+ * listing, so /big's 3398 names on the box's USB stick took 10 s a call
+ * under the big kernel lock (finding 277). */
 struct ext4_diriter {
-    struct vfs_dirent *ents;
-    size_t             count;
+    struct ext4      *fs;
+    uint32_t          ino;
+    struct ext4_inode in;
+    uint32_t          nblocks;
+    uint32_t          lblk, off;      /* the next entry */
+    size_t            index;          /* entries given or passed so far */
+    uint64_t          gen;            /* fs->dir_gen at opendir */
+    uint8_t          *blk;            /* block LBLK, when blk_ok */
+    bool              blk_ok;
 };
 
 /* ---- low-level helpers ---- */
@@ -327,6 +354,7 @@ static void e4c_watch(void *ctx, struct blk_dev *disk, uint64_t lba, uint64_t co
     uint64_t lo = fs->disk_off, hi = lo + fs->total_blocks * fs->sectors_per_block;
     uint64_t a = lba > lo ? lba : lo, b = lba + count < hi ? lba + count : hi;
     if (a >= b) return;
+    fs->dir_gen++;                   /* a directory block may be among them */
     for (uint64_t blk = (a - lo) / fs->sectors_per_block;
          blk * fs->sectors_per_block < b - lo; blk++)
         e4c_drop(fs, blk);
@@ -2109,6 +2137,9 @@ static int lookup_one_cb(void *user, uint32_t ino, uint8_t ftype,
     return VFS_OK;
 }
 
+static int dir_find(struct ext4 *fs, const struct ext4_inode *dir, const char *name,
+                    uint32_t *ino, uint8_t *type);
+
 /* Find the inode number for `path` (absolute, '/'-separated). On
  * success returns VFS_OK and fills *out_ino / *out_type with the
  * EXT4_FT_* file_type of the final component. */
@@ -2138,14 +2169,8 @@ static int path_to_inode(struct ext4 *fs, const char *path,
         if ((dir.i_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) {
             return VFS_ERR_NOTDIR;
         }
-        struct lookup_one_ctx ctx = { .want = comp, .out_ino = 0,
-                                       .out_type = 0, .found = false };
-        rc = dir_walk(fs, &dir, lookup_one_cb, &ctx);
+        rc = dir_find(fs, &dir, comp, &cur, &type);
         if (rc != VFS_OK) return rc;
-        if (!ctx.found) return VFS_ERR_NOENT;
-
-        cur  = ctx.out_ino;
-        type = ctx.out_type;
         path += i;
         while (*path == '/') path++;
     }
@@ -2245,6 +2270,7 @@ static bool dir_may_index(const struct ext4 *fs, const struct ext4_inode *dir);
 static int dir_add_entry(struct ext4 *fs, uint32_t dir_ino,
                          const char *name, uint32_t child_ino,
                          uint8_t file_type) {
+    fs->dir_gen++;                   /* a listing's place may move (277) */
     struct ext4_inode dir;
     int rc = read_inode(fs, dir_ino, &dir);
     if (rc != VFS_OK) return rc;
@@ -2334,6 +2360,7 @@ static int dir_add_entry(struct ext4 *fs, uint32_t dir_ino,
  * previous entry, or zero the inode for the first slot). */
 static int dir_remove_entry(struct ext4 *fs, uint32_t dir_ino,
                             const char *name) {
+    fs->dir_gen++;                   /* a listing's place may move (277) */
     struct ext4_inode dir;
     int rc = read_inode(fs, dir_ino, &dir);
     if (rc != VFS_OK) return rc;
@@ -2603,6 +2630,92 @@ static int dx_probe(struct ext4 *fs, const struct ext4_inode *dir, uint32_t hash
         if (rc != VFS_OK) return rc;
         n->coff = DX_NODE_COUNT_OFF;
     }
+}
+
+/* NAME in DIR by its htree index (finding 277): the leaf its hash leads to,
+ * then each leaf after it whose range starts at the same hash -- a hash
+ * that a split left on both sides -- as Linux's lookup reads them. A
+ * lookup walked every block of the directory: in one of 3000 names, 47
+ * reads a name. VFS_ERR_NOENT if NAME is not there; VFS_ERR_IO if the
+ * index cannot be read, and the caller walks the directory, as Linux
+ * falls back to a linear search. */
+static int dx_find(struct ext4 *fs, const struct ext4_inode *dir, const char *name,
+                   uint32_t *ino, uint8_t *type) {
+    struct dx_frame fr[4];
+    uint8_t *bufs = kmalloc((size_t)fs->block_size * 5);
+    if (!bufs) return VFS_ERR_NOMEM;
+    for (int i = 0; i < 4; i++) fr[i].buf = bufs + (size_t)i * fs->block_size;
+    uint8_t *leaf = bufs + (size_t)4 * fs->block_size;
+    int depth = 0;
+    uint8_t version = 0;
+    uint32_t nlen = (uint32_t)strlen(name), hash = 0;
+    int rc = dx_probe(fs, dir, 0, fr, &depth, &version);
+    if (rc == VFS_OK) {
+        hash = dx_hash(fs, name, (int)nlen, version);
+        rc = dx_probe(fs, dir, hash, fr, &depth, &version);
+    }
+    while (rc == VFS_OK) {
+        struct dx_frame *f = &fr[depth - 1];
+        uint64_t phys = 0;
+        rc = inode_block_map(fs, dir, dx_block_of(f->buf, f->coff, f->at), &phys);
+        if (rc == VFS_OK && !phys) rc = VFS_ERR_IO;
+        if (rc == VFS_OK) rc = read_block(fs, phys, leaf);
+        if (rc != VFS_OK) break;
+        uint32_t off = 0, end = dir_leaf_end(fs, leaf);
+        bool found = false;
+        while (off + 8 <= end) {
+            const struct ext4_dir_entry_2 *de = (const struct ext4_dir_entry_2 *)(leaf + off);
+            if (de->rec_len < 8 || off + de->rec_len > fs->block_size) { rc = VFS_ERR_IO; break; }
+            if (de->inode && de->name_len == nlen && memcmp(de->name, name, nlen) == 0) {
+                *ino  = de->inode;
+                *type = de->file_type;
+                found = true;
+                break;
+            }
+            off += de->rec_len;
+        }
+        if (rc != VFS_OK || found) break;
+        /* the next leaf, if its range goes on from this hash */
+        int lv = depth - 1;
+        while (lv >= 0 && fr[lv].at + 1u >= dx_get16(fr[lv].buf, fr[lv].coff + 2)) lv--;
+        if (lv < 0) { rc = VFS_ERR_NOENT; break; }
+        fr[lv].at++;
+        if ((dx_hash_of(fr[lv].buf, fr[lv].coff, fr[lv].at) & ~1u) != hash) {
+            rc = VFS_ERR_NOENT;
+            break;
+        }
+        for (int k = lv + 1; k < depth && rc == VFS_OK; k++) {
+            uint64_t np = 0;
+            fr[k].lblk = dx_block_of(fr[k - 1].buf, fr[k - 1].coff, fr[k - 1].at);
+            rc = inode_block_map(fs, dir, fr[k].lblk, &np);
+            if (rc == VFS_OK && !np) rc = VFS_ERR_IO;
+            if (rc == VFS_OK) rc = read_block(fs, np, fr[k].buf);
+            fr[k].phys = np;
+            fr[k].coff = DX_NODE_COUNT_OFF;
+            fr[k].at   = 0;
+        }
+    }
+    kfree(bufs);
+    return rc;
+}
+
+/* NAME's inode and entry type in DIR: by the htree index where DIR has
+ * one, else -- and where the index cannot be read -- by a walk of DIR */
+static int dir_find(struct ext4 *fs, const struct ext4_inode *dir, const char *name,
+                    uint32_t *ino, uint8_t *type) {
+    bool dots = name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]));
+    if (!dots && dir_is_dx(fs, dir)) {      /* "." and ".." are in block 0 */
+        int rc = dx_find(fs, dir, name, ino, type);
+        if (rc != VFS_ERR_IO) return rc;
+    }
+    struct lookup_one_ctx ctx = { .want = name, .out_ino = 0,
+                                   .out_type = 0, .found = false };
+    int rc = dir_walk(fs, dir, lookup_one_cb, &ctx);
+    if (rc != VFS_OK) return rc;
+    if (!ctx.found) return VFS_ERR_NOENT;
+    *ino  = ctx.out_ino;
+    *type = ctx.out_type;
+    return VFS_OK;
 }
 
 /* a new block at the directory's end, for a leaf or an index node */
@@ -3850,63 +3963,40 @@ static int ext4_mkdir(void *mnt, const char *path,
 
 /* ---- opendir / readdir / closedir ---- */
 
-struct collect_ctx {
-    struct ext4       *fs;
-    struct vfs_dirent *out;
-    size_t             cap;
-    size_t             count;
-    int                err;
-};
-
-static int collect_cb(void *user, uint32_t ino, uint8_t ftype,
-                      const char *name, uint8_t nlen) {
-    struct collect_ctx *ctx = (struct collect_ctx *)user;
-
-    /* Skip "." and "..". The VFS contract is to expose only real
-     * children; the ramfs / fat32 / tobyfs drivers all behave the
-     * same way. */
-    if (nlen == 1 && name[0] == '.') return VFS_OK;
-    if (nlen == 2 && name[0] == '.' && name[1] == '.') return VFS_OK;
-
-    if (ctx->count >= ctx->cap) {
-        size_t new_cap = ctx->cap ? ctx->cap * 2 : 16;
-        struct vfs_dirent *grown =
-            kmalloc(new_cap * sizeof(struct vfs_dirent));
-        if (!grown) { ctx->err = VFS_ERR_NOMEM; return VFS_ERR_NOMEM; }
-        if (ctx->count) memcpy(grown, ctx->out,
-                                ctx->count * sizeof(struct vfs_dirent));
-        if (ctx->out) kfree(ctx->out);
-        ctx->out = grown;
-        ctx->cap = new_cap;
+/* The next live entry of IT's directory but "." and ".." (the VFS lists
+ * a directory's children; READDIR2 and getdents64 add the dots), *DE its
+ * place in IT->blk; IT moves past it. */
+static int diriter_next(struct ext4 *fs, struct ext4_diriter *it,
+                        const struct ext4_dir_entry_2 **de_out) {
+    for (;;) {
+        if (!it->blk_ok) {
+            if (it->lblk >= it->nblocks) return VFS_ERR_NOENT;
+            uint64_t phys = 0;
+            int rc = inode_block_map(fs, &it->in, it->lblk, &phys);
+            if (rc != VFS_OK) return rc;
+            if (phys == 0) { it->lblk++; it->off = 0; continue; }   /* a hole */
+            rc = read_block(fs, phys, it->blk);
+            if (rc != VFS_OK) return rc;
+            it->blk_ok = true;
+        }
+        if (it->off + 8 > fs->block_size) {
+            it->lblk++;
+            it->off = 0;
+            it->blk_ok = false;
+            continue;
+        }
+        const struct ext4_dir_entry_2 *de =
+            (const struct ext4_dir_entry_2 *)(it->blk + it->off);
+        if (de->rec_len < 8 || it->off + de->rec_len > fs->block_size) return VFS_ERR_IO;
+        it->off += de->rec_len;
+        if (de->inode == 0 || de->name_len == 0) continue;    /* free, a tail, an index */
+        if ((de->name_len == 1 && de->name[0] == '.') ||
+            (de->name_len == 2 && de->name[0] == '.' && de->name[1] == '.'))
+            continue;
+        it->index++;
+        *de_out = de;
+        return VFS_OK;
     }
-
-    /* Look up the child inode so we can fill in size + mode. Cheap
-     * enough at opendir time -- our test directories have a handful
-     * of entries each. */
-    struct ext4_inode child;
-    int rc = read_inode(ctx->fs, ino, &child);
-    if (rc != VFS_OK) { ctx->err = rc; return rc; }
-
-    struct vfs_dirent *e = &ctx->out[ctx->count++];
-    memset(e, 0, sizeof(*e));
-    size_t cp = nlen < VFS_NAME_MAX - 1 ? nlen : VFS_NAME_MAX - 1;
-    memcpy(e->name, name, cp);
-    e->name[cp] = 0;
-
-    if (ftype == EXT4_FT_DIR ||
-        (child.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
-        e->type = VFS_TYPE_DIR;
-        e->size = 0;
-    } else {
-        e->type = VFS_TYPE_FILE;
-        e->size = (size_t)(((uint64_t)child.i_size_hi << 32) |
-                           child.i_size_lo);
-    }
-    e->uid  = child.i_uid;
-    e->gid  = child.i_gid;
-    e->mode = child.i_mode & VFS_MODE_PERMS;
-    if (child.i_mode != 0) e->mode |= VFS_MODE_VALID;
-    return VFS_OK;
 }
 
 static int ext4_opendir(void *mnt, const char *path, struct vfs_dir *out) {
@@ -3920,41 +4010,116 @@ static int ext4_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     if (rc != VFS_OK) return rc;
     if ((dir.i_mode & EXT4_S_IFMT) != EXT4_S_IFDIR) return VFS_ERR_NOTDIR;
 
-    struct collect_ctx ctx = { .fs = fs, .out = NULL, .cap = 0,
-                                .count = 0, .err = VFS_OK };
-    rc = dir_walk(fs, &dir, collect_cb, &ctx);
-    if (rc != VFS_OK || ctx.err != VFS_OK) {
-        if (ctx.out) kfree(ctx.out);
-        return rc != VFS_OK ? rc : ctx.err;
-    }
-
     struct ext4_diriter *it = kcalloc(1, sizeof(*it));
-    if (!it) {
-        if (ctx.out) kfree(ctx.out);
-        return VFS_ERR_NOMEM;
-    }
-    it->ents  = ctx.out;
-    it->count = ctx.count;
+    if (!it) return VFS_ERR_NOMEM;
+    it->blk = kmalloc(fs->block_size);
+    if (!it->blk) { kfree(it); return VFS_ERR_NOMEM; }
+    uint64_t size = ((uint64_t)dir.i_size_hi << 32) | dir.i_size_lo;
+    it->fs      = fs;
+    it->ino     = ino;
+    it->in      = dir;
+    it->nblocks = (uint32_t)((size + fs->block_size - 1) / fs->block_size);
+    it->gen     = fs->dir_gen;
 
     out->priv  = it;
     out->index = 0;
     return VFS_OK;
 }
 
+/* The handle's place, kept for the next handle that wants it -- unless the
+ * directory changed under it */
 static int ext4_closedir(struct vfs_dir *d) {
     if (d && d->priv) {
         struct ext4_diriter *it = (struct ext4_diriter *)d->priv;
-        if (it->ents) kfree(it->ents);
+        struct ext4 *fs = it->fs;
+        if (it->index && it->gen == fs->dir_gen) {
+            struct ext4_dirhint *h = &fs->dirhints[0];
+            for (int i = 0; i < EXT4_DIR_HINTS; i++) {
+                struct ext4_dirhint *c = &fs->dirhints[i];
+                if (c->ino == it->ino && c->index == it->index) { h = c; break; }
+                if (c->used < h->used) h = c;
+            }
+            h->ino   = it->ino;
+            h->gen   = fs->dir_gen;
+            h->index = it->index;
+            h->lblk  = it->lblk;
+            h->off   = it->off;
+            h->used  = ++fs->hint_tick;
+        }
+        kfree(it->blk);
         kfree(it);
         d->priv = NULL;
     }
     return VFS_OK;
 }
 
+/* Pass N entries: from the furthest place a handle on this directory
+ * closed at that is no further than where N leads, then read the rest */
+static long ext4_seekdir(struct vfs_dir *d, size_t n) {
+    struct ext4_diriter *it = (struct ext4_diriter *)d->priv;
+    if (!it) return 0;
+    struct ext4 *fs = it->fs;
+    size_t start = it->index, want = it->index + n;
+    struct ext4_dirhint *best = NULL;
+    if (it->gen == fs->dir_gen) {
+        for (int i = 0; i < EXT4_DIR_HINTS; i++) {
+            struct ext4_dirhint *h = &fs->dirhints[i];
+            if (h->ino == it->ino && h->gen == fs->dir_gen && h->index > it->index &&
+                h->index <= want && (!best || h->index > best->index))
+                best = h;
+        }
+    }
+    if (best) {
+        it->index  = best->index;
+        it->lblk   = best->lblk;
+        it->off    = best->off;
+        it->blk_ok = false;
+        best->used = ++fs->hint_tick;
+    }
+    const struct ext4_dir_entry_2 *de;
+    while (it->index < want && diriter_next(fs, it, &de) == VFS_OK) { }
+    return (long)(it->index - start);
+}
+
+/* An entry as the directory says it: its name, inode and type -- from the
+ * entry's file_type where the volume keeps it (the filetype feature, which
+ * every ext4 has), not from the child's inode (finding 277). Size, owner
+ * and permissions are the inode's and are not read: vfs_dirent_fill gets
+ * them for the listings that print them. */
 static int ext4_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     struct ext4_diriter *it = (struct ext4_diriter *)d->priv;
-    if (!it || d->index >= it->count) return VFS_ERR_NOENT;
-    *out = it->ents[d->index++];
+    if (!it) return VFS_ERR_NOENT;
+    struct ext4 *fs = it->fs;
+    const struct ext4_dir_entry_2 *de;
+    int rc = diriter_next(fs, it, &de);
+    if (rc != VFS_OK) return rc;
+    memset(out, 0, sizeof(*out));
+    size_t cp = de->name_len < VFS_NAME_MAX - 1 ? de->name_len : VFS_NAME_MAX - 1;
+    memcpy(out->name, de->name, cp);
+    out->name[cp] = 0;
+    out->ino = de->inode;
+    uint8_t ft = (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_FILETYPE) ? de->file_type : 0;
+    uint16_t fmt;
+    switch (ft) {
+    case EXT4_FT_REG_FILE: fmt = EXT4_S_IFREG; break;
+    case EXT4_FT_DIR:      fmt = EXT4_S_IFDIR; break;
+    case 3:                fmt = 0x2000u; break;        /* a character device */
+    case 4:                fmt = 0x6000u; break;        /* a block device */
+    case 5:                fmt = 0x1000u; break;        /* a FIFO */
+    case 6:                fmt = 0xC000u; break;        /* a socket */
+    case EXT4_FT_SYMLINK:  fmt = EXT4_S_IFLNK; break;
+    default: {                       /* no type in the entry: the inode's */
+        uint32_t child = de->inode;
+        struct ext4_inode cin;
+        rc = read_inode(fs, child, &cin);
+        if (rc != VFS_OK) return rc;
+        fmt = cin.i_mode & EXT4_S_IFMT;
+        break;
+    }
+    }
+    out->type = fmt == EXT4_S_IFDIR ? VFS_TYPE_DIR
+              : fmt == EXT4_S_IFLNK ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
+    out->mode = fmt;                 /* the format alone: no VFS_MODE_VALID */
     return VFS_OK;
 }
 
@@ -4194,6 +4359,7 @@ static const struct vfs_ops ext4_ops = {
     .opendir  = ext4_opendir,
     .closedir = ext4_closedir,
     .readdir  = ext4_readdir,
+    .seekdir  = ext4_seekdir,   /* finding 277 */
     .stat      = ext4_stat,
     .chmod     = ext4_chmod,
     .chown     = ext4_chown,
