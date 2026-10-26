@@ -107,6 +107,49 @@ struct blk_dev *blk_get_first(void) {
     return g_count > 0 ? g_devs[0] : 0;
 }
 
+/* ---- writes that go around a cache (finding 278; see blk.h) ---- */
+
+#define BLK_MAX_WATCHES 16
+static struct { blk_write_watch_fn fn; void *ctx; } g_watch[BLK_MAX_WATCHES];
+
+bool blk_watch_add(blk_write_watch_fn fn, void *ctx) {
+    for (int i = 0; i < BLK_MAX_WATCHES; i++) {
+        if (!g_watch[i].fn) {
+            g_watch[i].fn  = fn;
+            g_watch[i].ctx = ctx;
+            return true;
+        }
+    }
+    kprintf("[blk] WARN: write-watch table full (%d)\n", BLK_MAX_WATCHES);
+    return false;
+}
+
+void blk_watch_remove(blk_write_watch_fn fn, void *ctx) {
+    for (int i = 0; i < BLK_MAX_WATCHES; i++)
+        if (g_watch[i].fn == fn && g_watch[i].ctx == ctx) {
+            g_watch[i].fn  = 0;
+            g_watch[i].ctx = 0;
+        }
+}
+
+struct blk_dev *blk_disk_of(struct blk_dev *dev, uint64_t *off) {
+    uint64_t o = 0;
+    while (dev && dev->parent && dev->class != BLK_CLASS_DISK) {
+        o  += dev->offset_lba;
+        dev = dev->parent;
+    }
+    if (off) *off = o;
+    return dev;
+}
+
+void blk_notify_write(struct blk_dev *dev, uint64_t lba, uint64_t count) {
+    uint64_t off;
+    struct blk_dev *disk = blk_disk_of(dev, &off);
+    if (!disk || !count) return;
+    for (int i = 0; i < BLK_MAX_WATCHES; i++)
+        if (g_watch[i].fn) g_watch[i].fn(g_watch[i].ctx, disk, off + lba, count);
+}
+
 struct blk_dev *blk_find(const char *name) {
     if (!name) return 0;
     for (size_t i = 0; i < g_count; i++) {

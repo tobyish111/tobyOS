@@ -254,6 +254,27 @@ struct blk_dev *blk_partition_wrap(struct blk_dev *parent,
                                    const uint8_t type_guid[BLK_GUID_BYTES],
                                    const char *label);
 
+/* ---- writes that go around a cache (finding 278) ----
+ *
+ * A filesystem that keeps blocks of its device in memory must hear of a
+ * write that reaches the device some other way -- a disk written as a
+ * file, /dev/sdb or /dev/sdb1 (blkdev_rw) -- or it reads back what it
+ * held, not what the device now has. Linux keeps the two in one page
+ * cache for the device; here the writer tells each watcher, which drops
+ * what it held of the range. A range is given on the DISK under the
+ * device (a partition's parent, its offset added), so a write to the
+ * whole disk reaches a watcher of a partition on it, and the reverse. */
+typedef void (*blk_write_watch_fn)(void *ctx, struct blk_dev *disk,
+                                   uint64_t lba, uint64_t count);
+bool blk_watch_add(blk_write_watch_fn fn, void *ctx);
+void blk_watch_remove(blk_write_watch_fn fn, void *ctx);
+/* COUNT sectors at LBA of DEV were written past any cache: tell the
+ * watchers. */
+void blk_notify_write(struct blk_dev *dev, uint64_t lba, uint64_t count);
+/* The disk DEV lies on (DEV itself for a disk), *OFF set to where DEV's
+ * sector 0 is on it. */
+struct blk_dev *blk_disk_of(struct blk_dev *dev, uint64_t *off);
+
 /* M26E: mark a disk + every partition that lives on it as no longer
  * backed by hardware. After this returns, blk_read/blk_write on any of
  * those records short-circuit to -1 (EIO shape) without touching the

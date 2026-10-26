@@ -732,6 +732,9 @@ static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
                 single = true;
                 continue;
             }
+            /* a mounted filesystem's cache drops what it held of the range
+             * (finding 278) */
+            if (write) blk_notify_write(d, lba, cnt);
             done += (size_t)cnt * BLK_SECTOR_SIZE;
             continue;
         }
@@ -741,6 +744,7 @@ static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
         if (write) {
             memcpy(sec + in, b + done, take);
             if (blk_write(d, lba, 1, sec) < 0) break;
+            blk_notify_write(d, lba, 1);
         } else {
             memcpy(b + done, sec + in, take);
         }

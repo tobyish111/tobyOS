@@ -90,8 +90,45 @@ static int g_jbd_crash_phase = JBD2_CRASH_NONE;
  * exceeding it is reported, never silently ignored. */
 #define EXT4_MAX_OPEN_INODES 64
 
+/* ---- the block cache (finding 278) ----
+ * The driver read every block from the device, every time: one create in
+ * a directory of 3000 names was 56 reads, a readdir of it 3049 -- on the
+ * box's USB stick, seconds each. Blocks read or written are kept here, up
+ * to E4C_BYTES a mount, the least recently used going first.
+ *
+ * WRITE-THROUGH: a write still reaches the device before the call
+ * returns, and the cache takes the copy after it has. So a crash leaves
+ * exactly what it left with no cache -- the volume marked not clean while
+ * mounted read-write, every change already on the device -- and nothing
+ * the cache holds is newer than the device. A write that goes around the
+ * driver (the disk written as a file: /dev/sdb1, or /dev/sdb) drops what
+ * the cache held of it (blk_notify_write -> e4c_watch). Dropped and freed
+ * at the umount. */
+#define E4C_BYTES (8u << 20)
+
+struct e4c_ent {
+    uint64_t        blk;
+    struct e4c_ent *hnext;              /* the hash chain */
+    struct e4c_ent *prev, *next;        /* the LRU list, or the free list */
+    uint8_t        *data;
+};
+
+struct e4cache {
+    struct e4c_ent  *ents;              /* max of them */
+    struct e4c_ent **hash;              /* hmask + 1 chains */
+    struct e4c_ent  *head, *tail;       /* in use, most recent first */
+    struct e4c_ent  *free;              /* not in use */
+    uint32_t         max, hmask;
+    uint64_t         hits, misses;
+};
+
 struct ext4 {
     struct blk_dev *dev;
+    /* the disk DEV lies on and where (the cache's watch, finding 278) */
+    struct blk_dev *disk;
+    uint64_t        disk_off;
+    struct e4cache  bc;
+    uint64_t        dev_reads, dev_writes;   /* blocks, for the umount's line */
 
     uint32_t block_size;          /* 1024, 2048, 4096 */
     uint32_t sectors_per_block;   /* block_size / 512 */
@@ -181,16 +218,154 @@ static struct ext4_txn_ent *txn_find(struct ext4 *fs, uint64_t blk) {
     return NULL;
 }
 
+/* ---- the block cache (finding 278; see struct e4cache) ---- */
+
+static uint32_t e4c_slot(const struct e4cache *c, uint64_t blk) {
+    return (uint32_t)((blk * 0x9E3779B97F4A7C15ull) >> 40) & c->hmask;
+}
+
+static bool e4c_init(struct ext4 *fs) {
+    struct e4cache *c = &fs->bc;
+    c->max = E4C_BYTES / fs->block_size;
+    uint32_t h = 1;
+    while (h < c->max) h <<= 1;
+    c->hmask = h - 1;
+    c->ents = kcalloc(c->max, sizeof(*c->ents));
+    c->hash = kcalloc(h, sizeof(*c->hash));
+    if (!c->ents || !c->hash) return false;
+    for (uint32_t i = 0; i < c->max; i++) {
+        c->ents[i].next = c->free;
+        c->free = &c->ents[i];
+    }
+    return true;
+}
+
+static void e4c_unlink(struct e4cache *c, struct e4c_ent *e) {
+    if (e->prev) e->prev->next = e->next; else c->head = e->next;
+    if (e->next) e->next->prev = e->prev; else c->tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void e4c_front(struct e4cache *c, struct e4c_ent *e) {
+    e->prev = NULL;
+    e->next = c->head;
+    if (c->head) c->head->prev = e; else c->tail = e;
+    c->head = e;
+}
+
+static void e4c_unhash(struct e4cache *c, struct e4c_ent *e) {
+    struct e4c_ent **pp = &c->hash[e4c_slot(c, e->blk)];
+    while (*pp && *pp != e) pp = &(*pp)->hnext;
+    if (*pp) *pp = e->hnext;
+    e->hnext = NULL;
+}
+
+static struct e4c_ent *e4c_find(struct ext4 *fs, uint64_t blk) {
+    struct e4cache *c = &fs->bc;
+    if (!c->hash) return NULL;
+    for (struct e4c_ent *e = c->hash[e4c_slot(c, blk)]; e; e = e->hnext)
+        if (e->blk == blk) return e;
+    return NULL;
+}
+
+/* BLK now holds DATA on the device: keep a copy. Out of memory, the copy
+ * is not kept -- the device has it. */
+static void e4c_put(struct ext4 *fs, uint64_t blk, const void *data) {
+    struct e4cache *c = &fs->bc;
+    if (!c->hash) return;
+    struct e4c_ent *e = e4c_find(fs, blk);
+    if (e) {
+        e4c_unlink(c, e);
+    } else {
+        if (c->free) {
+            e = c->free;
+            c->free = e->next;
+            e->next = NULL;
+        } else {
+            e = c->tail;                    /* the least recently used */
+            if (!e) return;
+            e4c_unlink(c, e);
+            e4c_unhash(c, e);
+        }
+        if (!e->data) e->data = kmalloc(fs->block_size);
+        if (!e->data) { e->next = c->free; c->free = e; return; }
+        e->blk = blk;
+        uint32_t s = e4c_slot(c, blk);
+        e->hnext = c->hash[s];
+        c->hash[s] = e;
+    }
+    memcpy(e->data, data, fs->block_size);
+    e4c_front(c, e);
+}
+
+/* BLK is no longer known: what the device holds is the truth */
+static void e4c_drop(struct ext4 *fs, uint64_t blk) {
+    struct e4cache *c = &fs->bc;
+    struct e4c_ent *e = e4c_find(fs, blk);
+    if (!e) return;
+    e4c_unlink(c, e);
+    e4c_unhash(c, e);
+    e->next = c->free;
+    c->free = e;
+}
+
+static void e4c_free(struct ext4 *fs) {
+    struct e4cache *c = &fs->bc;
+    if (c->ents)
+        for (uint32_t i = 0; i < c->max; i++)
+            if (c->ents[i].data) kfree(c->ents[i].data);
+    if (c->ents) kfree(c->ents);
+    if (c->hash) kfree(c->hash);
+    memset(c, 0, sizeof(*c));
+}
+
+/* A write that went around the driver, on DISK: drop each block of the
+ * volume it touched */
+static void e4c_watch(void *ctx, struct blk_dev *disk, uint64_t lba, uint64_t count) {
+    struct ext4 *fs = (struct ext4 *)ctx;
+    if (disk != fs->disk) return;
+    uint64_t lo = fs->disk_off, hi = lo + fs->total_blocks * fs->sectors_per_block;
+    uint64_t a = lba > lo ? lba : lo, b = lba + count < hi ? lba + count : hi;
+    if (a >= b) return;
+    for (uint64_t blk = (a - lo) / fs->sectors_per_block;
+         blk * fs->sectors_per_block < b - lo; blk++)
+        e4c_drop(fs, blk);
+}
+
 static int read_block(struct ext4 *fs, uint64_t blk, void *buf) {
     if (blk >= fs->total_blocks) return VFS_ERR_INVAL;
     /* Read-your-writes: a block staged in the open transaction reflects
      * the not-yet-committed contents. */
     struct ext4_txn_ent *e = txn_find(fs, blk);
     if (e) { memcpy(buf, e->data, fs->block_size); return VFS_OK; }
+    struct e4c_ent *ce = e4c_find(fs, blk);
+    if (ce) {
+        memcpy(buf, ce->data, fs->block_size);
+        e4c_unlink(&fs->bc, ce);
+        e4c_front(&fs->bc, ce);
+        fs->bc.hits++;
+        return VFS_OK;
+    }
     uint64_t lba = blk * fs->sectors_per_block;
+    fs->dev_reads++;
     if (blk_read(fs->dev, lba, fs->sectors_per_block, buf) != 0) {
         return VFS_ERR_IO;
     }
+    fs->bc.misses++;
+    e4c_put(fs, blk, buf);
+    return VFS_OK;
+}
+
+/* BLK written to the device with DATA, around write_block (the journal's
+ * checkpoint and replay): the cache takes the copy, or drops its own if
+ * the write failed */
+static int dev_write_block(struct ext4 *fs, uint64_t blk, const void *data) {
+    fs->dev_writes++;
+    if (blk_write(fs->dev, blk * fs->sectors_per_block, fs->sectors_per_block, data) != 0) {
+        e4c_drop(fs, blk);
+        return VFS_ERR_IO;
+    }
+    e4c_put(fs, blk, data);
     return VFS_OK;
 }
 
@@ -550,10 +725,7 @@ static int txn_stage(struct ext4 *fs, uint64_t blk, const void *buf) {
 static int write_block(struct ext4 *fs, uint64_t blk, const void *buf) {
     if (blk >= fs->total_blocks) return VFS_ERR_INVAL;
     if (fs->txn) return txn_stage(fs, blk, buf);
-    uint64_t lba = blk * fs->sectors_per_block;
-    if (blk_write(fs->dev, lba, fs->sectors_per_block, buf) != 0)
-        return VFS_ERR_IO;
-    return VFS_OK;
+    return dev_write_block(fs, blk, buf);       /* through, then the cache's */
 }
 
 /* Write back the cached 1024-byte superblock (free counts, state). The
@@ -583,6 +755,7 @@ static int flush_superblock(struct ext4 *fs) {
         kfree(tmp);
         return rc;
     }
+    e4c_drop(fs, 1024u / fs->block_size);    /* the block it sits in */
     if (blk_write(fs->dev, 2, 2, fs->sb_buf) != 0) return VFS_ERR_IO;
     return VFS_OK;
 }
@@ -593,6 +766,7 @@ static int flush_superblock(struct ext4 *fs) {
 static int flush_superblock_direct(struct ext4 *fs) {
     if (!fs->sb_buf) return VFS_OK;
     sb_csum_set(fs);
+    e4c_drop(fs, 1024u / fs->block_size);
     if (blk_write(fs->dev, 2, 2, fs->sb_buf) != 0) return VFS_ERR_IO;
     return VFS_OK;
 }
@@ -2786,6 +2960,7 @@ static int jraw_read(struct ext4 *fs, uint32_t rel, void *buf) {
 }
 static int jraw_write(struct ext4 *fs, uint32_t rel, const void *buf) {
     uint64_t lba = (fs->j_phys_first + rel) * fs->sectors_per_block;
+    e4c_drop(fs, fs->j_phys_first + rel);
     return blk_write(fs->dev, lba, fs->sectors_per_block, buf) == 0
                ? VFS_OK : VFS_ERR_IO;
 }
@@ -2923,9 +3098,7 @@ static int jbd2_checkpoint(struct ext4 *fs, struct ext4_txn *t) {
     for (int i = 0; i < t->n; i++) {
         if (g_jbd_crash_phase == JBD2_CRASH_MID_CHECKPOINT && i >= half)
             return VFS_OK;                    /* model a crash partway */
-        uint64_t lba = t->ents[i].blk * fs->sectors_per_block;
-        if (blk_write(fs->dev, lba, fs->sectors_per_block,
-                      t->ents[i].data) != 0)
+        if (dev_write_block(fs, t->ents[i].blk, t->ents[i].data) != VFS_OK)
             return VFS_ERR_IO;
     }
     return VFS_OK;
@@ -2945,12 +3118,8 @@ static int txn_commit(struct ext4 *fs) {
         /* No journal: flush staged blocks straight home (legacy, non-
          * atomic). We never stage without a journal, but stay correct. */
         rc = VFS_OK;
-        for (int i = 0; i < t->n && rc == VFS_OK; i++) {
-            uint64_t lba = t->ents[i].blk * fs->sectors_per_block;
-            if (blk_write(fs->dev, lba, fs->sectors_per_block,
-                          t->ents[i].data) != 0)
-                rc = VFS_ERR_IO;
-        }
+        for (int i = 0; i < t->n && rc == VFS_OK; i++)
+            rc = dev_write_block(fs, t->ents[i].blk, t->ents[i].data);
         goto done;
     }
 
@@ -3045,8 +3214,8 @@ static int jbd2_recover(struct ext4 *fs) {
             if (jraw_read(fs, rel + 1 + idx, dblk) == VFS_OK) {
                 if (flags & JBD2_FLAG_ESCAPE)
                     *(uint32_t *)dblk = be32(JBD2_MAGIC_NUMBER);
-                uint64_t lba = (uint64_t)home * fs->sectors_per_block;
-                if (blk_write(fs->dev, lba, fs->sectors_per_block, dblk) == 0)
+                if (home < fs->total_blocks &&
+                    dev_write_block(fs, home, dblk) == VFS_OK)
                     replayed++;
             }
             idx++;
@@ -4067,6 +4236,8 @@ int ext4_probe(struct blk_dev *dev) {
  * this way -- only an fs that was never vfs_mount'd, or after unmount). */
 static void ext4_free(struct ext4 *fs) {
     if (!fs) return;
+    blk_watch_remove(e4c_watch, fs);
+    e4c_free(fs);
     if (fs->blk_buf)  kfree(fs->blk_buf);
     if (fs->blk_buf2) kfree(fs->blk_buf2);
     if (fs->gdt_buf)  kfree(fs->gdt_buf);
@@ -4189,11 +4360,15 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
     fs->blk_buf2 = kmalloc(fs->block_size);
     fs->gdt_buf  = kmalloc(gdt_blocks * fs->block_size);
     fs->sb_buf   = kmalloc(1024);
-    if (!fs->blk_buf || !fs->blk_buf2 || !fs->gdt_buf || !fs->sb_buf) {
+    if (!fs->blk_buf || !fs->blk_buf2 || !fs->gdt_buf || !fs->sb_buf ||
+        !e4c_init(fs)) {
         kfree(sb_raw);
         ext4_free(fs);
         return NULL;
     }
+    /* a write to the disk as a file drops what the cache held of it */
+    fs->disk = blk_disk_of(dev, &fs->disk_off);
+    (void)blk_watch_add(e4c_watch, fs);
     memcpy(fs->sb_buf, sb_raw, 1024);      /* cache SB for write-back */
     kfree(sb_raw);                          /* done with the temp SB read buffer */
 
@@ -4348,6 +4523,10 @@ static int ext4_umount(void *mnt) {
         (void)flush_superblock_direct(fs);
     }
     (void)ext4_sync(fs);
+    kprintf("[ext4] umount %s: cache %lu hits, %lu misses; device %lu block reads, "
+            "%lu block writes\n", fs->dev && fs->dev->name ? fs->dev->name : "(anon)",
+            (unsigned long)fs->bc.hits, (unsigned long)fs->bc.misses,
+            (unsigned long)fs->dev_reads, (unsigned long)fs->dev_writes);
     ext4_free(fs);
     return VFS_OK;
 }

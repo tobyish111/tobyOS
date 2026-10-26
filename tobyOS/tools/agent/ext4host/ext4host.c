@@ -15,6 +15,11 @@
  *                         at OFF and closed)
  *   trunc P LEN          rename A B          link A B
  *   chmod P MODE         chown P UID GID     utime P MTIME ATIME
+ *   wseq P N BS          (P opened once, N writes of BS bytes from where
+ *                         it ends, closed: as dd bs=BS appends)
+ *   ls P                 (P's entries counted, as a readdir gives them)
+ *   io                   (the device reads and writes since the last
+ *                         `io`, and their sectors; then zeroed)
  *   manifest             (every name under /, sorted: path, type, mode,
  *                         uid, gid, links, size, the contents' CRC-32)
  *   verify               (every checksum on the volume, and every htree
@@ -34,10 +39,12 @@
 /* ---- the kernel around the driver ---- */
 
 static int g_fd;
+static unsigned long long g_rd, g_rd_sec, g_wr, g_wr_sec;   /* `io` (finding 278) */
 
 static int img_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *b)
 {
     (void)d;
+    g_rd++; g_rd_sec += n;
     ssize_t want = (ssize_t)n * BLK_SECTOR_SIZE;
     return pread(g_fd, b, (size_t)want, (off_t)(lba * BLK_SECTOR_SIZE)) == want ? 0 : -1;
 }
@@ -45,12 +52,22 @@ static int img_read(struct blk_dev *d, uint64_t lba, uint32_t n, void *b)
 static int img_write(struct blk_dev *d, uint64_t lba, uint32_t n, const void *b)
 {
     (void)d;
+    g_wr++; g_wr_sec += n;
     ssize_t want = (ssize_t)n * BLK_SECTOR_SIZE;
     return pwrite(g_fd, b, (size_t)want, (off_t)(lba * BLK_SECTOR_SIZE)) == want ? 0 : -1;
 }
 
 static const struct blk_ops g_img_ops = { .read = img_read, .write = img_write };
 static struct blk_dev g_dev = { .name = "img", .ops = &g_img_ops };
+
+/* the block layer's write watch (finding 278): one image, no other writer */
+bool blk_watch_add(blk_write_watch_fn fn, void *ctx) { (void)fn; (void)ctx; return true; }
+void blk_watch_remove(blk_write_watch_fn fn, void *ctx) { (void)fn; (void)ctx; }
+struct blk_dev *blk_disk_of(struct blk_dev *dev, uint64_t *off)
+{
+    if (off) *off = 0;
+    return dev;
+}
 
 struct proc *current_proc(void) { return 0; }
 void cgroup_io_charge(struct proc *p, bool w, uint64_t n) { (void)p; (void)w; (void)n; }
@@ -122,6 +139,42 @@ static int do_write(const char *p, uint64_t off, uint64_t len, uint32_t seed)
     ext4_close(&f);
     if (got < 0) return (int)got;
     return got == (long)len ? VFS_OK : VFS_ERR_IO;
+}
+
+/* P opened once and N writes of BS bytes from its end, as `dd bs=BS`
+ * appends */
+static int do_wseq(const char *p, uint64_t n, uint64_t bs)
+{
+    struct vfs_file f;
+    memset(&f, 0, sizeof f);
+    f.ops = &ext4_ops;
+    f.mnt = g_mnt;
+    int rc = ext4_open(g_mnt, p, &f);
+    if (rc != VFS_OK) return rc;
+    uint8_t *buf = malloc(bs ? bs : 1);
+    f.pos = f.size;
+    for (uint64_t k = 0; k < n && rc == VFS_OK; k++) {
+        for (uint64_t i = 0; i < bs; i++) buf[i] = pat(7, f.pos + i);
+        long got = ext4_write(&f, buf, (size_t)bs);
+        if (got != (long)bs) rc = got < 0 ? (int)got : VFS_ERR_IO;
+    }
+    free(buf);
+    ext4_close(&f);
+    return rc;
+}
+
+static int do_ls(const char *p, unsigned long long *count)
+{
+    struct vfs_dir d;
+    memset(&d, 0, sizeof d);
+    d.mnt = g_mnt;
+    int rc = ext4_opendir(g_mnt, p, &d);
+    if (rc != VFS_OK) return rc;
+    struct vfs_dirent e;
+    *count = 0;
+    while (ext4_readdir(&d, &e) == VFS_OK) (*count)++;
+    ext4_closedir(&d);
+    return VFS_OK;
 }
 
 struct name { char s[VFS_NAME_MAX]; };
@@ -418,6 +471,18 @@ int main(int argc, char **argv)
         } else if (!strcmp(op, "utime")) {
             sscanf(line, "%*s %*s %llu %llu", &x, &y);
             rc = ext4_utimens(g_mnt, a, x, 0, y, 0);
+        } else if (!strcmp(op, "wseq")) {
+            sscanf(line, "%*s %*s %llu %llu", &x, &y);
+            rc = do_wseq(a, x, y);
+        } else if (!strcmp(op, "ls")) {
+            rc = do_ls(a, &x);
+            printf("> %s rc=%d entries=%llu\n", line, rc, x);
+            continue;
+        } else if (!strcmp(op, "io")) {
+            printf("> io reads=%llu (%llu sectors) writes=%llu (%llu sectors)\n",
+                   g_rd, g_rd_sec, g_wr, g_wr_sec);
+            g_rd = g_rd_sec = g_wr = g_wr_sec = 0;
+            continue;
         } else if (!strcmp(op, "manifest")) {
             manifest("/");
             continue;
