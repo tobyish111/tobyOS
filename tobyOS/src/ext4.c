@@ -1364,6 +1364,28 @@ static void inode_blocks_add(const struct ext4 *fs, struct ext4_inode *in, int64
     osd2_set_half(in, 0, (uint32_t)(v >> 32));
 }
 
+/* ---- symbolic links (finding 275) ----
+ * A link's target is where Linux's ext4 keeps it: one shorter than the
+ * 60 bytes of i_block (its NUL included) in i_block itself -- a "fast"
+ * link, with no block of its own, so i_blocks counts none but an
+ * attribute block's -- and a longer one in the link's first data block,
+ * mapped by extents or by block pointers as the inode says. */
+static uint64_t inode_xattr_blk(const struct ext4_inode *in) {
+    return in->i_file_acl_lo | ((uint64_t)osd2_half(in, 2) << 32);
+}
+
+static bool inode_is_link(const struct ext4_inode *in) {
+    return (in->i_mode & EXT4_S_IFMT) == EXT4_S_IFLNK;
+}
+
+static bool link_is_fast(const struct ext4 *fs, const struct ext4_inode *in) {
+    if (!inode_is_link(in)) return false;
+    uint64_t sectors = in->i_blocks_lo | ((uint64_t)osd2_half(in, 0) << 32);
+    if (in->i_flags & EXT4_HUGE_FILE_FL) sectors *= fs->block_size / 512;
+    uint64_t ea = inode_xattr_blk(in) ? fs->block_size / 512 : 0;
+    return sectors <= ea;
+}
+
 /* Where a file's next block should be: after the extent nearest LBLK, as
  * Linux's goal is; else the start of the inode's flex group (a regular
  * file's: the group after it), as Linux's. */
@@ -2013,9 +2035,18 @@ static void xattr_block_release(struct ext4 *fs, struct ext4_inode *in) {
 /* Free everything an inode holds: its data, its tree or indirect blocks,
  * its share of an attribute block. */
 static void inode_free_data(struct ext4 *fs, uint32_t ino, struct ext4_inode *in) {
-    (void)inode_trim_from(fs, ino, in, 0);
+    /* A fast link's i_block is its target's bytes, not a map: it has no
+     * block to give back. They were read as block numbers and freed --
+     * Linux's link to "h" freed block 104 (finding 275). */
+    bool fast = link_is_fast(fs, in);
+    if (!fast) (void)inode_trim_from(fs, ino, in, 0);
     xattr_block_release(fs, in);
-    inode_blocks_recount(fs, in);
+    if (fast) {
+        in->i_blocks_lo = 0;
+        osd2_set_half(in, 0, 0);
+    } else {
+        inode_blocks_recount(fs, in);
+    }
 }
 
 /* ---- read bytes from an inode ---- */
@@ -4301,7 +4332,10 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     if (rc != VFS_OK) return rc;
 
     memset(out, 0, sizeof(*out));
-    out->type = (in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    /* a link is a link -- lstat's S_IFLNK, its size the target's length --
+     * not a file that cannot be opened (finding 275) */
+    out->type = (in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR ? VFS_TYPE_DIR
+              : inode_is_link(&in) ? VFS_TYPE_SYMLINK : VFS_TYPE_FILE;
     /* a directory's too -- its blocks' bytes, as the inode and Linux's stat
      * say (finding 272: 0, so `ls -l` said 0 where Linux says 4096) */
     out->size = (size_t)(((uint64_t)in.i_size_hi << 32) | in.i_size_lo);
@@ -4327,6 +4361,99 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     out->mode = in.i_mode & VFS_MODE_PERMS;
     if (in.i_mode != 0) out->mode |= VFS_MODE_VALID;
     return VFS_OK;
+}
+
+/* readlink(2) on ext4 (finding 275): the target, from i_block for a fast
+ * link, else from the link's first block */
+static int ext4_readlink(void *mnt, const char *path, char *buf, size_t bufsz) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    if (!bufsz) return VFS_ERR_INVAL;
+    uint32_t ino; uint8_t ftype;
+    int rc = path_to_inode(fs, path, &ino, &ftype);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    rc = read_inode(fs, ino, &in);
+    if (rc != VFS_OK) return rc;
+    if (!inode_is_link(&in)) return VFS_ERR_INVAL;
+    uint64_t len = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
+    size_t n = len < bufsz - 1 ? (size_t)len : bufsz - 1;
+    if (link_is_fast(fs, &in)) {
+        if (len >= sizeof(in.i_block)) return VFS_ERR_IO;
+        memcpy(buf, in.i_block, n);
+    } else {
+        long got = inode_read(fs, &in, len, 0, buf, n);
+        if (got < 0) return (int)got;
+        n = (size_t)got;
+    }
+    buf[n] = '\0';
+    return VFS_OK;
+}
+
+/* symlink(2) on ext4 (finding 275), as Linux's makes one: a target shorter
+ * than i_block's 60 bytes with its NUL goes in i_block, the inode with no
+ * extent tree and no block; a longer one -- up to a block less its NUL --
+ * in a block of its own, mapped as a file's is. Owner as the VFS says,
+ * mode 0777, every sum kept (write_inode_slot's, the directory's). */
+static int do_symlink(struct ext4 *fs, const char *path, const char *target,
+                      uint32_t uid, uint32_t gid) {
+    size_t tl = strlen(target);
+    if (tl == 0) return VFS_ERR_NOENT;                  /* Linux: ENOENT */
+    if (tl + 1 > fs->block_size) return VFS_ERR_NAMETOOLONG;
+    uint32_t parent_ino;
+    char leaf[VFS_NAME_MAX];
+    int rc = path_parent(fs, path, &parent_ino, leaf, sizeof(leaf));
+    if (rc != VFS_OK) return rc;
+    uint32_t ino; uint8_t ftype;
+    if (path_to_inode(fs, path, &ino, &ftype) == VFS_OK) return VFS_ERR_EXIST;
+
+    uint32_t new_ino;
+    rc = ext4_alloc_inode(fs, (parent_ino - 1) / fs->inodes_per_group, &new_ino);
+    if (rc != VFS_OK) return rc;
+    struct ext4_inode in;
+    memset(&in, 0, sizeof(in));
+    in.i_mode = EXT4_S_IFLNK | 0777u;
+    ext4_inode_set_uid(&in, uid);
+    ext4_inode_set_gid(&in, gid);
+    in.i_extra_isize = fs->want_extra_isize;
+    ext4_stamp(&in, E4_ATIME | E4_MTIME | E4_CTIME | E4_CRTIME, ext4_now());
+    in.i_links_count = 1;
+    in.i_size_lo = (uint32_t)tl;
+    bool fast = tl + 1 <= sizeof(in.i_block);
+    if (fast) {
+        memcpy(in.i_block, target, tl);
+    } else if (fs->feature_incompat & EXT4_FEATURE_INCOMPAT_EXTENTS) {
+        in.i_flags = EXT4_EXTENTS_FL;
+        init_extent_header(&in);
+    }
+    rc = write_inode_slot(fs, new_ino, &in, true);
+    if (rc == VFS_OK && !fast) {
+        uint64_t phys = 0;
+        bool fresh = false;
+        rc = inode_block_map_alloc(fs, new_ino, &in, 0, 1, &phys, &fresh);
+        if (rc == VFS_OK && !phys) rc = VFS_ERR_IO;
+        uint8_t *b = rc == VFS_OK ? kcalloc(1, fs->block_size) : NULL;
+        if (rc == VFS_OK && !b) rc = VFS_ERR_NOMEM;
+        if (rc == VFS_OK) {
+            memcpy(b, target, tl);
+            rc = write_block(fs, phys, b);
+        }
+        if (b) kfree(b);
+        if (rc == VFS_OK) rc = write_inode(fs, new_ino, &in);
+    }
+    if (rc == VFS_OK) rc = dir_add_entry(fs, parent_ino, leaf, new_ino, EXT4_FT_SYMLINK);
+    if (rc != VFS_OK) {
+        inode_free_data(fs, new_ino, &in);
+        ext4_free_inode(fs, new_ino);
+    }
+    return rc;
+}
+
+static int ext4_symlink(void *mnt, const char *path, const char *target,
+                        uint32_t uid, uint32_t gid) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    if (fs->rdonly) return VFS_ERR_ROFS;
+    txn_begin(fs);
+    return txn_finish(fs, do_symlink(fs, path, target, uid, gid));
 }
 
 /* fsync(2): the block cache is WRITE-BACK, so a successful write is not
@@ -4365,6 +4492,8 @@ static const struct vfs_ops ext4_ops = {
     .truncate  = ext4_truncate,
     .ftruncate = ext4_ftruncate,
     .link      = ext4_link,
+    .readlink  = ext4_readlink,  /* finding 275 */
+    .symlink   = ext4_symlink,
     .statfs    = ext4_statfs,   /* Phase H */
     .sync      = ext4_sync,
     .umount    = ext4_umount,   /* finding 271 */

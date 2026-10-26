@@ -15,6 +15,7 @@
  *                         at OFF and closed)
  *   trunc P LEN          rename A B          link A B
  *   chmod P MODE         chown P UID GID     utime P MTIME ATIME
+ *   symlink P TARGET     (a symbolic link P to TARGET, no blanks in it)
  *   wseq P N BS          (P opened once, N writes of BS bytes from where
  *                         it ends, closed: as dd bs=BS appends)
  *   ls P                 (P's entries counted, as a readdir gives them)
@@ -297,6 +298,13 @@ static void manifest(const char *dir)
             manifest(p);
             continue;
         }
+        if (st.type == VFS_TYPE_SYMLINK) {             /* its target (finding 275) */
+            static char t[VFS_PATH_MAX];
+            if (ext4_readlink(g_mnt, p, t, sizeof t) != VFS_OK) strcpy(t, "readlink-failed");
+            printf("%s l %o %u %u %u %zu %s\n", p, st.mode & 07777, st.uid, st.gid, st.nlink,
+                   (size_t)st.size, t);
+            continue;
+        }
         struct vfs_file f;
         memset(&f, 0, sizeof f);
         f.ops = &ext4_ops;
@@ -548,6 +556,9 @@ int main(int argc, char **argv)
         } else if (!strcmp(op, "link")) {
             sscanf(line, "%*s %*s %1023s", b);
             rc = ext4_link(g_mnt, a, b);
+        } else if (!strcmp(op, "symlink")) {          /* symlink P TARGET (275) */
+            sscanf(line, "%*s %*s %1023s", b);
+            rc = ext4_symlink(g_mnt, a, b, 0, 0);
         } else if (!strcmp(op, "chmod")) {
             sscanf(line, "%*s %*s %llo", &x);
             rc = ext4_chmod(g_mnt, a, (uint32_t)x);
