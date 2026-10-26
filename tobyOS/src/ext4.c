@@ -3129,11 +3129,15 @@ static int jmap(struct ext4 *fs, uint32_t rel, uint64_t *phys) {
 
 /* Raw journal-block I/O: rel 0 is the journal superblock, rel >= j_first
  * are log blocks. These bypass transaction staging (they ARE the commit
- * machinery) and go straight to the device. */
+ * machinery) and go straight to the device. The journal superblock is
+ * read through the block cache, which keeps the copy each write leaves:
+ * every commit rewrites it, and reading it from the device first was one
+ * more command a commit (finding 278). Log blocks are not kept. */
 static int jraw_read(struct ext4 *fs, uint32_t rel, void *buf) {
     uint64_t phys;
     int rc = jmap(fs, rel, &phys);
     if (rc != VFS_OK) return rc;
+    if (rel == 0) return read_block(fs, phys, buf);
     return blk_read(fs->dev, phys * fs->sectors_per_block, fs->sectors_per_block, buf) == 0
                ? VFS_OK : VFS_ERR_IO;
 }
@@ -3142,8 +3146,42 @@ static int jraw_write(struct ext4 *fs, uint32_t rel, const void *buf) {
     int rc = jmap(fs, rel, &phys);
     if (rc != VFS_OK) return rc;
     e4c_drop(fs, phys);
-    return blk_write(fs->dev, phys * fs->sectors_per_block, fs->sectors_per_block, buf) == 0
-               ? VFS_OK : VFS_ERR_IO;
+    if (blk_write(fs->dev, phys * fs->sectors_per_block, fs->sectors_per_block, buf) != 0)
+        return VFS_ERR_IO;
+    if (rel == 0) e4c_put(fs, phys, buf);
+    return VFS_OK;
+}
+
+/* Log blocks gathered into one request while their places on the device
+ * follow on (the journal inode's blocks are one run as mkfs makes them),
+ * up to 64 KiB: a descriptor and the blocks it names go to the device as
+ * one command, not one each (finding 278). The bytes and their order on
+ * the medium are what single writes made. */
+struct jrun {
+    uint8_t *buf;
+    uint32_t cap, cnt;
+    uint64_t phys0;
+};
+static int jrun_flush(struct ext4 *fs, struct jrun *r) {
+    if (!r->cnt) return VFS_OK;
+    for (uint32_t i = 0; i < r->cnt; i++) e4c_drop(fs, r->phys0 + i);
+    int rc = blk_write(fs->dev, r->phys0 * fs->sectors_per_block,
+                       r->cnt * fs->sectors_per_block, r->buf) == 0 ? VFS_OK : VFS_ERR_IO;
+    r->cnt = 0;
+    return rc;
+}
+static int jrun_add(struct ext4 *fs, struct jrun *r, uint32_t rel, const void *data) {
+    uint64_t phys;
+    int rc = jmap(fs, rel, &phys);
+    if (rc != VFS_OK) return rc;
+    if (r->cnt && (phys != r->phys0 + r->cnt || r->cnt == r->cap)) {
+        rc = jrun_flush(fs, r);
+        if (rc != VFS_OK) return rc;
+    }
+    if (!r->cnt) r->phys0 = phys;
+    memcpy(r->buf + (size_t)r->cnt * fs->block_size, data, fs->block_size);
+    r->cnt++;
+    return VFS_OK;
 }
 
 /* the log block after REL, the log wrapping at its end to its first */
@@ -3320,9 +3358,14 @@ static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
     if ((uint64_t)fs->j_first + ndesc + n + 1 > fs->j_blocks) return VFS_ERR_NOSPC;
 
     uint8_t *blk = kmalloc(fs->block_size), *dat = kmalloc(fs->block_size);
-    if (!blk || !dat) {
+    struct jrun run = { 0, 65536u / fs->block_size, 0, 0 };
+    if (run.cap > ndesc + n) run.cap = ndesc + n;   /* no more than this log's */
+    run.buf = kmalloc((size_t)run.cap * fs->block_size);
+    if (!run.buf) { run.cap = 1; run.buf = kmalloc(fs->block_size); }
+    if (!blk || !dat || !run.buf) {
         if (blk) kfree(blk);
         if (dat) kfree(dat);
+        if (run.buf) kfree(run.buf);
         return VFS_ERR_NOMEM;
     }
     int rc = VFS_OK;
@@ -3351,16 +3394,18 @@ static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
             if (k == 0) { memcpy(blk + off, fs->j_uuid, 16); off += 16; }
         }
         if (fs->j_csum) jput32(blk + fs->block_size - 4, jtail_csum(fs, blk));
-        rc = jraw_write(fs, rel, blk);
+        rc = jrun_add(fs, &run, rel, blk);
         rel = jnext(fs, rel);
         for (uint32_t k = 0; k < cnt && rc == VFS_OK; k++) {
             memcpy(dat, t->ents[i + k].data, fs->block_size);
             if (jget32(dat) == JBD2_MAGIC_NUMBER) memset(dat, 0, 4);  /* escaped */
-            rc = jraw_write(fs, rel, dat);
+            rc = jrun_add(fs, &run, rel, dat);
             rel = jnext(fs, rel);
         }
         i += cnt;
     }
+    if (rc == VFS_OK) rc = jrun_flush(fs, &run);  /* all of it before the commit block */
+    kfree(run.buf);
 
     if (rc == VFS_OK && g_jbd_crash_phase != JBD2_CRASH_BEFORE_COMMIT) {
         memset(blk, 0, fs->block_size);
