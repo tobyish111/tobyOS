@@ -171,11 +171,9 @@ static size_t         g_msc_count = 0;
 
 /* ============================================================== */
 /* DMA scratch allocator: one shared 4 KiB page, kept zero-init'd.  */
-/* Pre-cluster (4 KiB) is the largest data phase any FS layer will   */
-/* hand us today, so we pin a single page per device once + reuse.   */
+/* (The CBW/CSW page; each device's data buffer is msc_dma below.)  */
 /* ============================================================== */
 
-#define USB_MSC_DATA_BUF_SZ 4096u
 struct dma_buf {
     void    *virt;
     uint64_t phys;
@@ -191,15 +189,47 @@ static bool alloc_dma_page(struct dma_buf *out) {
 }
 
 /* ============================================================== */
-/* Per-device data buffer (one cluster).                            */
+/* Per-device data buffer: a command's whole data phase.            */
 /* ============================================================== */
+
+/* 64 KiB, one bulk TRB's worth: physically contiguous and aligned to
+ * 64 KiB, as xHCI asks of a TRB's buffer (no 64 KiB boundary inside it).
+ * It was one 4 KiB page, so a SCSI command moved 8 sectors at most and a
+ * large read cost a command, three bulk transfers and their waits each
+ * 4 KiB (finding 276). Linux's usb-storage sends up to 240 sectors a
+ * command; 128 here. One page if no aligned run can be had. */
+#define USB_MSC_DATA_BUF_MAX (64u * 1024u)
 
 struct msc_dma {
     void    *virt;
     uint64_t phys;
+    uint32_t size;
 };
 
 static struct msc_dma g_data_buf[USB_MSC_MAX_DEVICES];
+
+static bool alloc_data_buf(struct msc_dma *out) {
+    const size_t want = USB_MSC_DATA_BUF_MAX / 4096u;      /* 16 pages */
+    uint64_t run = pmm_alloc_pages(2 * want - 1);          /* holds an aligned 16 */
+    if (run) {
+        uint64_t base = (run + USB_MSC_DATA_BUF_MAX - 1) & ~(uint64_t)(USB_MSC_DATA_BUF_MAX - 1);
+        size_t head = (size_t)((base - run) / 4096u);
+        if (head) pmm_free_pages_range(run, head);
+        size_t tail = 2 * want - 1 - head - want;
+        if (tail) pmm_free_pages_range(base + USB_MSC_DATA_BUF_MAX, tail);
+        out->virt = pmm_phys_to_virt(base);
+        out->phys = base;
+        out->size = USB_MSC_DATA_BUF_MAX;
+        memset(out->virt, 0, USB_MSC_DATA_BUF_MAX);
+        return true;
+    }
+    struct dma_buf pg;
+    if (!alloc_dma_page(&pg)) return false;
+    out->virt = pg.virt;
+    out->phys = pg.phys;
+    out->size = 4096u;
+    return true;
+}
 
 /* ============================================================== */
 /* Low-level CBW / CSW helpers                                     */
@@ -395,8 +425,8 @@ static int msc_read(struct blk_dev *dev, uint64_t lba, uint32_t count,
     if (lba + count > m->block_count) { m->stats.reads_eio++; return -1; }
 
     uint8_t *out = (uint8_t *)buf;
-    /* Largest CBW we use is one cluster = 4 KiB / m->block_size sectors. */
-    uint32_t max_per_cbw = USB_MSC_DATA_BUF_SZ / m->block_size;
+    /* the most sectors a command takes: the data buffer's */
+    uint32_t max_per_cbw = g_data_buf[m - g_msc].size / m->block_size;
     if (max_per_cbw == 0) max_per_cbw = 1;
 
     while (count > 0) {
@@ -431,7 +461,7 @@ static int msc_write(struct blk_dev *dev, uint64_t lba, uint32_t count,
     if (lba + count > m->block_count) { m->stats.writes_eio++; return -1; }
 
     const uint8_t *in = (const uint8_t *)buf;
-    uint32_t max_per_cbw = USB_MSC_DATA_BUF_SZ / m->block_size;
+    uint32_t max_per_cbw = g_data_buf[m - g_msc].size / m->block_size;
     if (max_per_cbw == 0) max_per_cbw = 1;
 
     while (count > 0) {
@@ -585,8 +615,7 @@ bool usb_msc_probe(struct usb_device *dev,
         m->csw_phys = cbw_csw.phys + 64;
     }
 
-    if (!g_data_buf[midx].virt &&
-        !alloc_dma_page((struct dma_buf *)&g_data_buf[midx])) {
+    if (!g_data_buf[midx].virt && !alloc_data_buf(&g_data_buf[midx])) {
         kprintf("[usb-msc] OOM for data buffer\n");
         return false;
     }

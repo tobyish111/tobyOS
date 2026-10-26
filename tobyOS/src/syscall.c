@@ -607,8 +607,11 @@ static long sys_read(int fd, void *buf, size_t len) {
     if (len <= SYS_MAX_RW) return sys_read_one(fd, buf, len);
     struct file *f = fd_lookup(fd);
     if (!f) return -ABI_EBADF;
+    /* a disk too, as Linux's block device gives a read all it asks for:
+     * `dd if=/dev/sdb1 bs=1M` said "0+N records in" (finding 276) */
     if (f->kind != FILE_KIND_VFS && f->kind != FILE_KIND_DEVZERO &&
-        f->kind != FILE_KIND_DEVFULL && f->kind != FILE_KIND_DEVRANDOM)
+        f->kind != FILE_KIND_DEVFULL && f->kind != FILE_KIND_DEVRANDOM &&
+        f->kind != FILE_KIND_BLKDEV)
         return sys_read_one(fd, buf, SYS_MAX_RW);
     size_t done = 0;
     while (done < len) {

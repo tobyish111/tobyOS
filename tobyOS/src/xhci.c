@@ -52,6 +52,7 @@
 #include <tobyos/irq.h>
 #include <tobyos/apic.h>
 #include <tobyos/spinlock.h>
+#include <tobyos/perf.h>   /* perf_now_ns: the bulk wait (finding 276) */
 
 /* ============================================================== */
 /* Capability + Operational + Runtime + Doorbell register offsets */
@@ -1103,11 +1104,29 @@ bool xhci_bulk_xfer_sync(struct usb_device *dev, uint8_t dci,
     /* 5-second timeout. QEMU usb-storage completes well under 1ms;
      * real flash on the slowest LS-translated path tops out around
      * a few hundred ms per 512-byte sector. 5s is generous and any
-     * longer the device is just dead. */
-    for (int i = 0; i < 5000; i++) {
-        xhci_poll();
-        if (g_bulk_complete[dev->slot_id][dci]) break;
-        pit_sleep_ms(1);
+     * longer the device is just dead.
+     *
+     * The event ring is polled without a pause between looks (a few
+     * PAUSEs): it slept a whole millisecond after each look, so a
+     * transfer that took 100 us cost one, and a SCSI command -- three
+     * transfers -- 3 ms whatever its size; the box's stick read at
+     * 168 KB/s a sector at a time (finding 276). Timed on the TSC, as
+     * pit_sleep_ms is; with no TSC yet, the old millisecond steps. */
+    uint64_t t0 = perf_now_ns();
+    if (t0) {
+        uint64_t end = t0 + 5000ull * 1000000ull;
+        for (;;) {
+            xhci_poll();
+            if (g_bulk_complete[dev->slot_id][dci]) break;
+            if (perf_now_ns() >= end) break;
+            for (int k = 0; k < 16; k++) __asm__ volatile ("pause" ::: "memory");
+        }
+    } else {
+        for (int i = 0; i < 5000; i++) {
+            xhci_poll();
+            if (g_bulk_complete[dev->slot_id][dci]) break;
+            pit_sleep_ms(1);
+        }
     }
     if (!g_bulk_complete[dev->slot_id][dci]) {
         kprintf("[xhci] bulk timeout slot=%u DCI=%u (%u B)\n",
