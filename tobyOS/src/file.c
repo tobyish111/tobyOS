@@ -512,6 +512,16 @@ struct file *file_clone(struct file *src) {
          * so a clone just remembers which device it reads. */
         f->dir_off = src->dir_off;
         break;
+    case FILE_KIND_BLKDEV:
+        /* A disk's descriptor duplicated or inherited is the same open
+         * file: its device, and one offset that each copy moves, as
+         * Linux's (finding 279). With no case here the copy had no device,
+         * and `( dd ) < /dev/sdb1` read EIO. */
+        if (!src->vfs_refs) { kfree(f); return 0; }
+        f->blkdev   = src->blkdev;
+        f->vfs_refs = src->vfs_refs;
+        (*f->vfs_refs)++;
+        break;
     case FILE_KIND_DRM:
         /* Slice 104: dir_off holds the DRM char-device MINOR (renderD128
          * -> 128, card0 -> 0), and the whole device is global state, so a
@@ -634,6 +644,9 @@ void file_close(struct file *f) {
     case FILE_KIND_MEMFD:
         memfd_unref(f->memfd);   /* frees pages+object at the last ref */
         break;
+    case FILE_KIND_BLKDEV:       /* the description goes with its last copy */
+        if (f->vfs_refs && --(*f->vfs_refs) == 0) kfree(f->vfs_refs);
+        break;
     case FILE_KIND_CONSOLE:
     case FILE_KIND_NULL:
         break;
@@ -645,9 +658,11 @@ void file_close(struct file *f) {
 /* ---- shared offset (see struct vfs_ofd in file.h) ------------------------ */
 
 static struct vfs_ofd *file_ofd(struct file *f) {
-    /* Only VFS handles carry a description; refs is the first member, so the
-     * pointer the rest of the kernel knows as `int *vfs_refs` IS the struct. */
-    if (!f || f->kind != FILE_KIND_VFS || !f->vfs_refs) return 0;
+    /* Only VFS handles and disks carry a description; refs is the first
+     * member, so the pointer the rest of the kernel knows as `int *vfs_refs`
+     * IS the struct. */
+    if (!f || (f->kind != FILE_KIND_VFS && f->kind != FILE_KIND_BLKDEV) ||
+        !f->vfs_refs) return 0;
     return (struct vfs_ofd *)(void *)f->vfs_refs;
 }
 
@@ -682,21 +697,22 @@ static void file_pos_store(struct file *f) {
     if (o) o->pos = f->vfs.pos;
 }
 
-/* A DISK'S BYTES AS A FILE (finding 198): N bytes at F->blk_pos, a sector
- * at a time through a bounce buffer, so any offset and length work; short
- * at the device's end, 0 past it. WRITE says which way. */
+/* A DISK'S BYTES AS A FILE (finding 198): N bytes at the description's
+ * offset, a sector at a time through a bounce buffer, so any offset and
+ * length work; short at the device's end, 0 past it. WRITE says which way. */
 static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
     struct blk_dev *d = f->blkdev;
     if (!d || d->gone) return -ABI_EIO;
     /* the open's access mode, as a file's (finding 216): EBADF */
     if ((f->o_accmode & 3) == (write ? 0 : 1)) return -ABI_EBADF;
     uint64_t size = d->sector_count * (uint64_t)BLK_SECTOR_SIZE;
-    if (f->blk_pos >= size) return write ? -ABI_ENOSPC : 0;
-    if (n > size - f->blk_pos) n = (size_t)(size - f->blk_pos);
+    uint64_t at = file_pos_get(f);
+    if (at >= size) return write ? -ABI_ENOSPC : 0;
+    if (n > size - at) n = (size_t)(size - at);
     uint8_t sec[BLK_SECTOR_SIZE];
     size_t done = 0;
     while (done < n) {
-        uint64_t pos = f->blk_pos + done;
+        uint64_t pos = at + done;
         uint64_t lba = pos / BLK_SECTOR_SIZE;
         size_t in = (size_t)(pos % BLK_SECTOR_SIZE);
         size_t take = BLK_SECTOR_SIZE - in;
@@ -711,7 +727,7 @@ static long blkdev_rw(struct file *f, void *buf, size_t n, bool write) {
         done += take;
     }
     if (done == 0 && n) return -ABI_EIO;
-    f->blk_pos += done;
+    file_pos_set(f, (size_t)(at + done));
     return (long)done;
 }
 

@@ -826,7 +826,9 @@ static int gen_pid_fdinfo(int pid, int fd, char *buf, size_t cap) {
     if (!tab || fd < 0 || fd >= PROC_NFDS || !tab[fd]) return -1;
     struct file *f = tab[fd];
 
-    uint64_t pos = (f->kind == FILE_KIND_VFS) ? (uint64_t)file_pos_get(f) : 0;
+    /* a file's, and a disk's (finding 279: 0 where Linux's says 12288) */
+    uint64_t pos = (f->kind == FILE_KIND_VFS || f->kind == FILE_KIND_BLKDEV)
+                 ? (uint64_t)file_pos_get(f) : 0;
     /* Linux prints the open flags in OCTAL with a leading 0. We keep the
      * access mode and O_APPEND on the descriptor, so that is what goes out -- the value is
      * right as far as it goes, and no bit is invented to pad it. */

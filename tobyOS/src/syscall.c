@@ -3653,8 +3653,15 @@ static long sys_open_resolved_at(const char *kpath, int flags, int mode,
                 f->kind = FILE_KIND_BLKDEV;
                 f->blkdev = bd;
                 f->o_accmode = acc;
+                /* the open file description, its offset what dup and fork
+                 * share (finding 279) */
+                struct vfs_ofd *ofd = (struct vfs_ofd *)kmalloc(sizeof *ofd);
+                if (!ofd) { kfree(f); return -ABI_ENOMEM; }
+                ofd->refs = 1;
+                ofd->pos  = 0;
+                f->vfs_refs = &ofd->refs;
                 int fd = fd_alloc_into(current_proc(), f);
-                if (fd < 0) { kfree(f); return -ABI_EMFILE; }
+                if (fd < 0) { kfree(ofd); kfree(f); return -ABI_EMFILE; }
                 file_set_open_path(f, kpath);
                 return fd;
             }
@@ -4224,12 +4231,12 @@ static long sys_lseek(int fd, int64_t off, int whence) {
     if (f->kind == FILE_KIND_BLKDEV) {          /* finding 198 */
         int64_t bsz = f->blkdev ? (int64_t)(f->blkdev->sector_count * BLK_SECTOR_SIZE) : 0;
         int64_t bp = whence == ABI_SEEK_SET ? off
-                   : whence == ABI_SEEK_CUR ? (int64_t)f->blk_pos + off
+                   : whence == ABI_SEEK_CUR ? (int64_t)file_pos_get(f) + off
                    : whence == ABI_SEEK_END ? bsz + off : -1;
         if (whence != ABI_SEEK_SET && whence != ABI_SEEK_CUR && whence != ABI_SEEK_END)
             return -ABI_EINVAL;
         if (bp < 0) return -ABI_EINVAL;
-        f->blk_pos = (uint64_t)bp;
+        file_pos_set(f, (size_t)bp);   /* the description's (finding 279) */
         return bp;
     }
     if (f->kind != FILE_KIND_VFS) return -ABI_EINVAL;

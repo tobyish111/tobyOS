@@ -181,7 +181,8 @@ struct file {
     struct vfs_file vfs;
     /* Milestone 25A: side-allocated open-file-description refcount so
      * dup()/dup2() can hand multiple struct files to the same underlying
-     * vfs_file. NULL for non-VFS kinds. The pointed-at counter starts at
+     * vfs_file. NULL for kinds other than VFS and BLKDEV (a disk's
+     * description holds its offset alone). The pointed-at counter starts at
      * 1 in sys_open, +1 per clone, -1 per close; the underlying handle's
      * ops->close is invoked exactly once, when the count reaches zero. */
     int            *vfs_refs;
@@ -198,10 +199,11 @@ struct file {
     struct window  *win;
     /* For TERM (milestone 13). */
     struct term_session *term;
-    /* For FILE_KIND_BLKDEV: the device and the offset (finding 198).
-     * Struct grew: CLEAN BUILD required. */
+    /* For FILE_KIND_BLKDEV: the device (finding 198). Its offset is the
+     * open file description's, vfs_refs's struct vfs_ofd, as a file's is:
+     * dup and fork share it (finding 279). Struct changed: CLEAN BUILD
+     * required. */
     struct blk_dev *blkdev;
-    uint64_t        blk_pos;
     /* For FILE_KIND_DIR (Track B/B3 getdents64): kmalloc'd absolute path
      * of the directory + how many entries have already been returned, so
      * each getdents64 re-opens and resumes. */
