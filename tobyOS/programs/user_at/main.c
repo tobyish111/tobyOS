@@ -436,15 +436,16 @@ static int cmd_atrm(int argc, char **argv) {
         int id = atoi(argv[i]);
         char path[256];
         job_path(id, path, sizeof path);
-        /* another user's job is not this user's to remove (finding 267) */
+        /* another user's job is not this user's to remove (finding 267);
+         * both refusals in at 3.2's words (logs/b36/atlinux-wsl.out) */
         struct stat st;
         if (stat(path, &st) == 0 && getuid() != 0 && st.st_uid != getuid()) {
-            fprintf(stderr, "atrm: Not owner of job %d\n", id);
+            fprintf(stderr, "%d: Not owner\n", id);
             rc = 1;
             continue;
         }
         if (unlink(path) != 0) {
-            fprintf(stderr, "atrm: cannot find job %d\n", id);
+            fprintf(stderr, "Cannot find jobid %d\n", id);
             rc = 1;
         } else {
             removed++;
