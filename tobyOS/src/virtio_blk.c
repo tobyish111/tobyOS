@@ -172,9 +172,12 @@ struct vblk_dev {
     struct blk_ops     ops;
 };
 
-static struct vblk_dev g_vblk;
-static bool            g_vblk_bound;
-static unsigned        g_vblk_index;
+/* Each virtio disk its own state, named vblk0, vblk1, ... in the order
+ * they bind (/dev's vda, vdb, ...). There was one: a second disk was
+ * "already bound -- ignoring" (finding 268). */
+#define VBLK_MAX 8
+static struct vblk_dev g_vblk[VBLK_MAX];
+static unsigned        g_vblk_count;
 
 /* ---- MMIO helpers --------------------------------------------- */
 
@@ -424,9 +427,9 @@ static int vblk_write_op(struct blk_dev *bd, uint64_t lba, uint32_t count,
 /* ---- PCI probe ----------------------------------------------- */
 
 static int virtio_blk_probe(struct pci_dev *dev) {
-    if (g_vblk_bound) {
-        kprintf("[virtio-blk] already bound -- ignoring %02x:%02x.%x\n",
-                dev->bus, dev->slot, dev->fn);
+    if (g_vblk_count >= VBLK_MAX) {
+        kprintf("[virtio-blk] %u disks bound already -- ignoring %02x:%02x.%x\n",
+                (unsigned)VBLK_MAX, dev->bus, dev->slot, dev->fn);
         return -1;
     }
 
@@ -443,7 +446,7 @@ static int virtio_blk_probe(struct pci_dev *dev) {
         return -2;
     }
 
-    struct vblk_dev *d = &g_vblk;
+    struct vblk_dev *d = &g_vblk[g_vblk_count];  /* taken once it registers */
     memset(d, 0, sizeof(*d));
     d->notify_mult = notify_mult;
 
@@ -524,7 +527,7 @@ static int virtio_blk_probe(struct pci_dev *dev) {
 
     /* Register with the blk subsystem. The name pattern matches what
      * other block drivers use ("vblk0", "vblk1", ...). */
-    ksnprintf(d->name, sizeof(d->name), "vblk%u", g_vblk_index++);
+    ksnprintf(d->name, sizeof(d->name), "vblk%u", g_vblk_count);
     d->ops.read    = vblk_read_op;
     d->ops.write   = d->read_only ? NULL : vblk_write_op;
     d->blk.name         = d->name;
@@ -534,7 +537,7 @@ static int virtio_blk_probe(struct pci_dev *dev) {
     d->blk.class        = BLK_CLASS_DISK;
     blk_register(&d->blk);
 
-    g_vblk_bound = true;
+    g_vblk_count++;
 
     kprintf("[virtio-blk] %s: capacity=%lu sectors (%lu MiB) "
             "blk_size=%u%s\n",
@@ -571,14 +574,14 @@ void virtio_blk_register(void) {
     pci_register_driver(&virtio_blk_driver);
 }
 
-/* Lightweight introspection used by hwinfo / m35b_selftest. NULL if
- * no virtio-blk has been bound. */
+/* Lightweight introspection used by hwinfo / m35b_selftest: the first
+ * virtio disk bound. NULL if none has been. */
 const char *virtio_blk_name(void) {
-    return g_vblk_bound ? g_vblk.name : NULL;
+    return g_vblk_count ? g_vblk[0].name : NULL;
 }
 uint64_t virtio_blk_capacity_lba(void) {
-    return g_vblk_bound ? g_vblk.capacity_lba : 0;
+    return g_vblk_count ? g_vblk[0].capacity_lba : 0;
 }
 bool virtio_blk_present(void) {
-    return g_vblk_bound;
+    return g_vblk_count != 0;
 }
