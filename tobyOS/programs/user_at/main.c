@@ -205,6 +205,17 @@ static void run_later(int id, time_t when) {
     pid_t pid = fork();
     if (pid != 0) return;                    /* parent (and any error) returns */
 
+    /* Detached, as atd is from whoever ran at: a session of its own, and
+     * none of at's caller's descriptors -- holding at's stdout and stderr,
+     * the runner kept `... | at now + 1 min | sed` from ending until the
+     * job had run (finding 267's test). */
+    setsid();
+    int nul = open("/dev/null", O_RDWR);
+    if (nul >= 0) {
+        dup2(nul, 0); dup2(nul, 1); dup2(nul, 2);
+        if (nul > 2) close(nul);
+    }
+
     char path[256], outp[280];
     job_path(id, path, sizeof path);
     snprintf(outp, sizeof outp, "%s.out", path);
@@ -220,12 +231,23 @@ static void run_later(int id, time_t when) {
     struct stat st;
     if (stat(path, &st) != 0) _exit(0);
 
-    int fd = open(outp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    /* The job and its output are opened here, with at's group, which is
+     * what may reach into the spool; the shell is given the job on its
+     * standard input, as Linux's atd gives it -- it runs as the user who
+     * queued it, without at's group, and could not open the job by its
+     * path (finding 267). Running, the job is no longer queued: atq
+     * lists what waits. */
+    int jfd = open(path, O_RDONLY);
+    if (jfd < 0) _exit(0);
+    int fd = open(outp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
-    char *av[4];
+    dup2(jfd, 0);
+    if (jfd > 0) close(jfd);
+    unlink(path);
+    if (setgid(getgid()) != 0) _exit(126);
+    char *av[2];
     av[0] = (char *)"tsh";
-    av[1] = path;
-    av[2] = NULL;
+    av[1] = NULL;
     execv(AT_SHELL, av);
     _exit(127);
 }
@@ -316,11 +338,38 @@ static int cmd_at(int argc, char **argv, int is_batch) {
     return 0;
 }
 
-struct jobinfo { int id; time_t when; char queue; };
+struct jobinfo { int id; time_t when; char queue; uid_t owner; };
 
+/* The name /etc/passwd gives UID, into OUT; else the number */
+static void owner_name(uid_t uid, char *out, size_t cap) {
+    snprintf(out, cap, "%u", (unsigned)uid);
+    FILE *f = fopen("/etc/passwd", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        char *c1 = strchr(line, ':');
+        char *c2 = c1 ? strchr(c1 + 1, ':') : NULL;
+        if (!c2) continue;
+        char *end;
+        unsigned long id = strtoul(c2 + 1, &end, 10);
+        if (end == c2 + 1 || *end != ':' || id != (unsigned long)uid) continue;
+        *c1 = 0;
+        snprintf(out, cap, "%s", line);
+        break;
+    }
+    fclose(f);
+}
+
+/* NAME's job, if the caller may see it: root sees every job, a user his
+ * own -- a job is its file's owner's, as Linux's at keeps them (finding
+ * 267: atq said "root" of every job and listed them for anyone) */
 static int read_job(const char *name, struct jobinfo *ji) {
     char path[280];
     snprintf(path, sizeof path, "%s/%s", AT_SPOOL, name);
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (getuid() != 0 && st.st_uid != getuid()) return 0;
+    ji->owner = st.st_uid;
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char line[256];
@@ -372,7 +421,9 @@ static int cmd_atq(int argc, char **argv) {
         if (localtime_r(&jobs[i].when, &tmv))
             strftime(stamp, sizeof stamp, "%a %b %e %H:%M:%S %Y", &tmv);
         else snprintf(stamp, sizeof stamp, "%ld", (long)jobs[i].when);
-        printf("%d\t%s %c root\n", jobs[i].id, stamp, jobs[i].queue);
+        char who[64];
+        owner_name(jobs[i].owner, who, sizeof who);
+        printf("%d\t%s %c %s\n", jobs[i].id, stamp, jobs[i].queue, who);
     }
     return 0;
 }
@@ -385,6 +436,13 @@ static int cmd_atrm(int argc, char **argv) {
         int id = atoi(argv[i]);
         char path[256];
         job_path(id, path, sizeof path);
+        /* another user's job is not this user's to remove (finding 267) */
+        struct stat st;
+        if (stat(path, &st) == 0 && getuid() != 0 && st.st_uid != getuid()) {
+            fprintf(stderr, "atrm: Not owner of job %d\n", id);
+            rc = 1;
+            continue;
+        }
         if (unlink(path) != 0) {
             fprintf(stderr, "atrm: cannot find job %d\n", id);
             rc = 1;

@@ -1771,6 +1771,13 @@ reread:;
                 kprintf("[execve] nosuid mount: ignoring set-id bits on '%s'\n",
                         kpath);
         }
+        /* The saved ids are the effective ones after any execve, as
+         * execve(2) says: a set-group-ID program that gives its group up
+         * with setgid(getgid()) before exec'ing another -- at's job runner,
+         * finding 267 -- must not leave that program able to take it back.
+         * They kept what they had. */
+        p->suid = p->uid;
+        p->sgid = p->gid;
     }
 
     /* Destroy the old user-half mappings and rebuild the address space.

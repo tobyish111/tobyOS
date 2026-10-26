@@ -157,6 +157,14 @@ void utmp_init(void) {
         (void)vfs_symlink("/var/run", "/run");
         (void)vfs_mkdir_mode("/var/tmp", 01777u);
         (void)vfs_mkdir_mode("/var/log", 0755u);
+        /* at's spool, as Linux's at keeps one (finding 267): the daemon
+         * group's, sticky, which at (set-group-ID daemon) writes for any
+         * user -- each job file its user's, removable by none but its
+         * owner and root. There was none, and /var is root's 0755, so a
+         * user but root could not queue a job. */
+        (void)vfs_mkdir_mode("/var/spool", 0755u);
+        if (vfs_mkdir_mode("/var/spool/at", 01770u) == VFS_OK)
+            (void)vfs_chown("/var/spool/at", 0, 1);   /* root:daemon */
     }
     kprintf("[boot] /run: %s, /var: %s\n",
             rc == VFS_OK ? "tmpfs" : "MOUNT FAILED",

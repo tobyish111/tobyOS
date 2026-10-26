@@ -4205,7 +4205,6 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	    bin/zip bin/unzip                                  \
 	    bin/dig bin/host bin/timesyncd                      \
 	    bin/strip bin/cc bin/mkfs bin/domainname            \
-	    bin/at bin/batch bin/atq bin/atrm                   \
 	       bin/archive bin/ar bin/cpio bin/xz bin/unxz bin/xzcat \
 	       bin/ed \
 	       bin/crontab \
@@ -4246,6 +4245,9 @@ $(INITRD_TAR): $(PROGRAMS) $(LDSOCACHE_BIN) programs/linux-hello/linux-hello.elf
 	  && tar --format=ustar --mode=4755 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    bin/sudo bin/su                                                   \
+	  && tar --format=ustar --mode=2755 \
+	    --owner=0 --group=1 --numeric-owner -rf ../initrd.tar             \
+	    bin/at bin/batch bin/atq bin/atrm                                 \
 	  && tar --format=ustar --mode=0644 \
 	    --owner=0 --group=0 --numeric-owner -rf ../initrd.tar             \
 	    etc/c19b.lua etc/c20.lua etc/c21.lua                          \
