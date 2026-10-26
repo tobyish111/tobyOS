@@ -27,6 +27,8 @@
  *    READDIR2)
  *   seekls P N           (a handle on P passes N entries, then reads the
  *                         rest: N plus the rest counted)
+ *   cat P                (P read to its end, as a reader would)
+ *   atime P              (P's atime, as stat says it)
  *   echo TEXT            ("> echo TEXT rc=0": a marker in the output)
  *   io                   (the device reads and writes since the last
  *                         `io`, and their sectors; then zeroed)
@@ -574,6 +576,25 @@ int main(int argc, char **argv)
         } else if (!strcmp(op, "ls")) {
             rc = do_ls(a, &x);
             printf("> %s rc=%d entries=%llu\n", line, rc, x);
+            continue;
+        } else if (!strcmp(op, "cat")) {         /* P read to its end (266) */
+            struct vfs_file f;
+            memset(&f, 0, sizeof f);
+            f.ops = &ext4_ops;
+            f.mnt = g_mnt;
+            rc = ext4_open(g_mnt, a, &f);
+            if (rc == VFS_OK) {
+                static uint8_t cb[65536];
+                long got;
+                while ((got = ext4_read(&f, cb, sizeof cb)) > 0) { }
+                if (got < 0) rc = (int)got;
+                ext4_close(&f);
+            }
+        } else if (!strcmp(op, "atime")) {       /* P's atime, as stat says it */
+            struct vfs_stat st;
+            rc = ext4_stat(g_mnt, a, &st);
+            printf("> %s rc=%d atime=%llu.%09u\n", line, rc,
+                   (unsigned long long)st.atime, st.atime_ns);
             continue;
         } else if (!strcmp(op, "seekls")) {
             sscanf(line, "%*s %*s %llu", &y);

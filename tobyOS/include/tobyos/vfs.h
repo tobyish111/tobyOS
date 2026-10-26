@@ -377,6 +377,11 @@ struct vfs_file {
      * file_write() does it for the rest from what the description knows.
      * Sits in sysprot's padding: sizeof(struct vfs_file) does not move. */
     bool                  append;
+    /* The flags (VFS_MNT_*) of the mount the file was opened through, set
+     * by vfs_open: read-only, noatime and the rest, which a driver needs
+     * to decide whether a read may write atime (finding 266). In the same
+     * padding. */
+    uint8_t               mnt_flags;
 };
 
 struct vfs_dir {
@@ -392,6 +397,8 @@ struct vfs_dir {
     const char           *vpath;
     const char           *vrel;
     size_t                xpos;
+    /* the mount's VFS_MNT_* flags, as vfs_file's (finding 266) */
+    uint32_t              mnt_flags;
 };
 
 /* ---- mount table ----
@@ -415,6 +422,13 @@ int  vfs_mount(const char *mount_point, const struct vfs_ops *ops, void *mount_d
 #define VFS_MNT_NODEV    0x2u   /* ignore device nodes                     */
 #define VFS_MNT_NOEXEC   0x4u   /* refuse to execute anything here         */
 #define VFS_MNT_RDONLY   0x8u   /* refuse writes                           */
+/* When a read moves atime (finding 266), as Linux's MS_NOATIME,
+ * MS_NODIRATIME and MS_STRICTATIME say; none of them is relatime, Linux's
+ * default. The driver sees them on each handle (vfs_file.mnt_flags,
+ * vfs_dir.mnt_flags), and so never writes a read-only mount. */
+#define VFS_MNT_NOATIME     0x10u
+#define VFS_MNT_NODIRATIME  0x20u
+#define VFS_MNT_STRICTATIME 0x40u
 
 /* As vfs_mount(), but records mount flags. vfs_mount() is exactly this with
  * flags == 0, so all 13 existing callers keep their current behaviour. */

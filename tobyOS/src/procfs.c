@@ -469,7 +469,13 @@ static bool mounts_put_opts(struct mounts_ctx *c, uint32_t flags) {
            ((flags & VFS_MNT_NOSUID) ? mounts_put(c, ",nosuid") : true) &&
            ((flags & VFS_MNT_NODEV)  ? mounts_put(c, ",nodev")  : true) &&
            ((flags & VFS_MNT_NOEXEC) ? mounts_put(c, ",noexec") : true) &&
-           mounts_put(c, ",relatime");
+           /* the atime rule, in Linux's words and order (finding 266):
+            * noatime, nodiratime, then relatime -- the default -- unless
+            * noatime or strictatime */
+           ((flags & VFS_MNT_NOATIME) ? mounts_put(c, ",noatime") : true) &&
+           ((flags & VFS_MNT_NODIRATIME) ? mounts_put(c, ",nodiratime") : true) &&
+           ((flags & (VFS_MNT_NOATIME | VFS_MNT_STRICTATIME)) ? true
+                                                             : mounts_put(c, ",relatime"));
 }
 
 static const char *mounts_type(const struct vfs_mount_info *mi) {

@@ -1151,6 +1151,7 @@ int vfs_open_access(const char *path, struct vfs_file *out, int want) {
      * (a662c750): vfs_write_all's handle appended "zz" to tmpfs's 2-byte
      * file, 4 bytes where every other driver's file has 2 (finding 269). */
     out->append  = false;
+    out->mnt_flags = (uint8_t)m->flags;   /* finding 266 */
     /* Milestone 34E: stamp protected-prefix bit on the handle so
      * vfs_write can re-check WITHOUT having to remember the path. */
     out->sysprot = sysprot_is_protected(path);
@@ -1251,6 +1252,7 @@ int vfs_opendir(const char *path, struct vfs_dir *out) {
     out->vpath = path;
     out->vrel  = rel;
     out->xpos  = 0;
+    out->mnt_flags = m->flags;           /* finding 266 */
     if (!m->ops->opendir) return VFS_ERR_INVAL;
     return m->ops->opendir(m->data, rel, out);
 }

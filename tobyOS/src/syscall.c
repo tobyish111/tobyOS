@@ -14524,12 +14524,18 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             }
         }
         /* Linux MS_* -> our VFS_MNT_*. Only the ones with teeth are carried;
-         * the rest (MS_RELATIME &c.) are accepted and ignored. */
+         * the rest are accepted and ignored. MS_RELATIME is the default,
+         * a mount without the other two (finding 266: when a read moves
+         * atime -- they were ignored too). */
         uint32_t vflags = 0;
         if (msflags & 0x1u)  vflags |= VFS_MNT_RDONLY;   /* MS_RDONLY */
         if (msflags & 0x2u)  vflags |= VFS_MNT_NOSUID;   /* MS_NOSUID */
         if (msflags & 0x4u)  vflags |= VFS_MNT_NODEV;    /* MS_NODEV  */
         if (msflags & 0x8u)  vflags |= VFS_MNT_NOEXEC;   /* MS_NOEXEC */
+        if (msflags & 0x400u) vflags |= VFS_MNT_NOATIME;        /* MS_NOATIME */
+        if (msflags & 0x800u) vflags |= VFS_MNT_NODIRATIME;     /* MS_NODIRATIME */
+        if ((msflags & 0x1000000u) && !(msflags & 0x400u))
+            vflags |= VFS_MNT_STRICTATIME;                      /* MS_STRICTATIME */
 
         /* MS_BIND: make an existing subtree, or a file, visible at a second
          * point (vfs_bind; finding 241 -- only a mount's root could be). Both

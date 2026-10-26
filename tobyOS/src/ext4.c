@@ -233,6 +233,8 @@ struct ext4_diriter {
     uint64_t          gen;            /* fs->dir_gen at opendir */
     uint8_t          *blk;            /* block LBLK, when blk_ok */
     bool              blk_ok;
+    uint32_t          mflags;         /* the mount's (finding 266) */
+    bool              read;           /* its atime seen to, once a handle */
 };
 
 /* ---- low-level helpers ---- */
@@ -3545,6 +3547,37 @@ static int fp_refresh(struct ext4 *fs, struct ext4_filepriv *fp) {
     return VFS_OK;
 }
 
+static bool ext4_time_le(struct ext4_time a, struct ext4_time b) {
+    return a.s < b.s || (a.s == b.s && a.ns <= b.ns);
+}
+
+/* A READ MOVES atime as Linux's does (finding 266; tmpfs's, finding 242):
+ * never on a read-only mount or volume, nor with noatime (nor, for a
+ * directory, nodiratime); with strictatime, to now; else -- relatime,
+ * the default -- only when atime is no newer than mtime or ctime, or is a
+ * day old. It never moved. IN is INO's inode as it is now; written back
+ * when atime moves. */
+static void ext4_accessed(struct ext4 *fs, uint32_t ino, struct ext4_inode *in,
+                          uint32_t mflags, bool dir) {
+    if (fs->rdonly || (mflags & (VFS_MNT_RDONLY | VFS_MNT_NOATIME))) return;
+    if (dir && (mflags & VFS_MNT_NODIRATIME)) return;
+    struct ext4_time now = ext4_now();
+    struct ext4_time a = ext4_time_get(in->i_atime, in->i_atime_extra,
+                                       EXT4_HAS_EXTRA(in, i_atime_extra));
+    if (!(mflags & VFS_MNT_STRICTATIME)) {
+        struct ext4_time m = ext4_time_get(in->i_mtime, in->i_mtime_extra,
+                                           EXT4_HAS_EXTRA(in, i_mtime_extra));
+        struct ext4_time c = ext4_time_get(in->i_ctime, in->i_ctime_extra,
+                                           EXT4_HAS_EXTRA(in, i_ctime_extra));
+        if (!ext4_time_le(a, m) && !ext4_time_le(a, c) && now.s - a.s < 86400)
+            return;
+    }
+    if (a.s == now.s && a.ns == now.ns) return;
+    ext4_stamp(in, E4_ATIME, now);
+    txn_begin(fs);
+    (void)txn_finish(fs, write_inode(fs, ino, in));
+}
+
 static long ext4_read(struct vfs_file *f, void *buf, size_t n) {
     struct ext4 *fs = (struct ext4 *)f->mnt;
     struct ext4_filepriv *fp = (struct ext4_filepriv *)f->priv;
@@ -3554,6 +3587,7 @@ static long ext4_read(struct vfs_file *f, void *buf, size_t n) {
     f->size = (size_t)fp->file_size;
     long got = inode_read(fs, &fp->in, fp->file_size, f->pos, buf, n);
     if (got > 0) f->pos += (size_t)got;
+    if (got >= 0) ext4_accessed(fs, fp->inode_no, &fp->in, f->mnt_flags, false);
     return got;
 }
 
@@ -4051,6 +4085,7 @@ static int ext4_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     it->in      = dir;
     it->nblocks = (uint32_t)((size + fs->block_size - 1) / fs->block_size);
     it->gen     = fs->dir_gen;
+    it->mflags  = out->mnt_flags;
 
     out->priv  = it;
     out->index = 0;
@@ -4084,12 +4119,23 @@ static int ext4_closedir(struct vfs_dir *d) {
     return VFS_OK;
 }
 
+/* A listing reads the directory: its atime as a read's moves it (finding
+ * 266), once a handle -- as Linux's getdents does each call */
+static void diriter_accessed(struct ext4 *fs, struct ext4_diriter *it) {
+    if (it->read) return;
+    it->read = true;
+    struct ext4_inode cur;
+    if (read_inode(fs, it->ino, &cur) == VFS_OK)
+        ext4_accessed(fs, it->ino, &cur, it->mflags, true);
+}
+
 /* Pass N entries: from the furthest place a handle on this directory
  * closed at that is no further than where N leads, then read the rest */
 static long ext4_seekdir(struct vfs_dir *d, size_t n) {
     struct ext4_diriter *it = (struct ext4_diriter *)d->priv;
     if (!it) return 0;
     struct ext4 *fs = it->fs;
+    diriter_accessed(fs, it);
     size_t start = it->index, want = it->index + n;
     struct ext4_dirhint *best = NULL;
     if (it->gen == fs->dir_gen) {
@@ -4121,6 +4167,7 @@ static int ext4_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
     struct ext4_diriter *it = (struct ext4_diriter *)d->priv;
     if (!it) return VFS_ERR_NOENT;
     struct ext4 *fs = it->fs;
+    diriter_accessed(fs, it);
     const struct ext4_dir_entry_2 *de;
     int rc = diriter_next(fs, it, &de);
     if (rc != VFS_OK) return rc;
