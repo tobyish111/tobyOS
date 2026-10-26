@@ -254,6 +254,11 @@ struct file {
      * to attach to, and glibc's fexecve fallback (/proc/self/fd/N) resolved
      * to nothing. NOT an inode identity -- unlink/rename do not chase it. */
     char *open_path;
+    /* When /proc/PID/fd/N first said this descriptor was there (finding
+     * 270): its link's times, as Linux's are its inode's, made at that
+     * first look and kept. 0 = not looked at yet. Struct grew: CLEAN
+     * BUILD required. */
+    uint64_t proc_seen_ns;
 };
 
 /* eventfd flags (Linux ABI) */

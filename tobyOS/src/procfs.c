@@ -1735,6 +1735,28 @@ static long procfs_write(struct vfs_file *f, const void *buf, size_t n) {
     return rc;
 }
 
+/* A /proc/PID/fd link's permissions, as Linux's: read-x for a descriptor
+ * open for reading, write-x for writing, both for both (finding 270). The
+ * kind says it where the open recorded no access mode: a pipe's end, a
+ * socket, the console, and the event objects Linux opens O_RDWR. */
+static uint32_t fd_link_mode(const struct file *f) {
+    int acc;
+    switch (f->kind) {
+    case FILE_KIND_PIPE_R:   acc = 0; break;
+    case FILE_KIND_PIPE_W:   acc = 1; break;
+    case FILE_KIND_PIPE_RW:
+    case FILE_KIND_SOCKET:
+    case FILE_KIND_CONSOLE:
+    case FILE_KIND_EVENTFD:
+    case FILE_KIND_TIMERFD:
+    case FILE_KIND_SIGNALFD:
+    case FILE_KIND_EPOLL:    acc = 2; break;
+    case FILE_KIND_INOTIFY:  acc = 0; break;
+    default:                 acc = f->o_accmode & 3; break;
+    }
+    return acc == 0 ? 0500u : acc == 1 ? 0300u : 0700u;
+}
+
 static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
     if (!path || path[0] != '/') return VFS_ERR_NOENT;
@@ -1884,15 +1906,31 @@ static int procfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
             int pid = procfs_kpid(rel);   /* slice 10 */
             struct proc *p = proc_lookup(pid);
             if (!p) return VFS_ERR_NOENT;
+            /* the process's, dr-x------ and l?wx------, as Linux's: they
+             * were root's, the link lrwxrwxrwx, 0 bytes, 1970 (270) */
+            out->uid = (uint32_t)p->uid;
+            out->gid = (uint32_t)p->gid;
             if (strcmp(s + 1, "fd") == 0) {        /* the fd directory */
                 out->type = VFS_TYPE_DIR;
-                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                out->size = 0;
+                out->mode = 0500u | VFS_MODE_VALID;
                 return VFS_OK;
             }
             int fd = parse_int(s + 4);             /* fd/<n> */
-            if (fd >= 0 && fd < PROC_NFDS && p->fds[fd]) {
+            struct file **tab = proc_fds(p);
+            if (fd >= 0 && fd < PROC_NFDS && tab && tab[fd]) {
+                struct file *f = tab[fd];
                 out->type = VFS_TYPE_SYMLINK;
-                out->size = 0; out->uid = 0; out->gid = 0; out->mode = 0;
+                out->size = 64;                    /* Linux's, whatever the target */
+                out->mode = fd_link_mode(f) | VFS_MODE_VALID;
+                /* dated when first looked at, and kept: Linux's inode's */
+                if (!f->proc_seen_ns) {
+                    extern uint64_t file_time_ns(void);
+                    f->proc_seen_ns = file_time_ns();
+                }
+                out->atime = out->mtime = out->ctime = f->proc_seen_ns / 1000000000ull;
+                out->atime_ns = out->mtime_ns = out->ctime_ns =
+                    (uint32_t)(f->proc_seen_ns % 1000000000ull);
                 return VFS_OK;
             }
             return VFS_ERR_NOENT;
