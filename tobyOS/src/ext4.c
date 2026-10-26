@@ -4301,13 +4301,10 @@ static int ext4_stat(void *mnt, const char *path, struct vfs_stat *out) {
     if (rc != VFS_OK) return rc;
 
     memset(out, 0, sizeof(*out));
-    if ((in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR) {
-        out->type = VFS_TYPE_DIR;
-        out->size = 0;
-    } else {
-        out->type = VFS_TYPE_FILE;
-        out->size = (size_t)(((uint64_t)in.i_size_hi << 32) | in.i_size_lo);
-    }
+    out->type = (in.i_mode & EXT4_S_IFMT) == EXT4_S_IFDIR ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+    /* a directory's too -- its blocks' bytes, as the inode and Linux's stat
+     * say (finding 272: 0, so `ls -l` said 0 where Linux says 4096) */
+    out->size = (size_t)(((uint64_t)in.i_size_hi << 32) | in.i_size_lo);
     out->uid  = ext4_inode_uid(&in);
     out->gid  = ext4_inode_gid(&in);
     /* The timestamps were never reported, so every file on an ext4 volume

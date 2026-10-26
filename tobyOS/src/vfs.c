@@ -1366,7 +1366,7 @@ void vfs_dirent_fill(const char *dir, struct vfs_dirent *e) {
     memcpy(p + dl, e->name, nl + 1);
     struct vfs_stat st;
     if (vfs_stat(p, &st) != VFS_OK) return;
-    e->size = st.type == VFS_TYPE_DIR ? 0 : st.size;
+    e->size = st.size;              /* a directory's as its stat says (272) */
     e->uid  = st.uid;
     e->gid  = st.gid;
     if (st.mode & VFS_MODE_VALID) e->mode = st.mode;
