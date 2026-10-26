@@ -172,10 +172,16 @@ struct ext4 {
 
     /* ---- JBD2 write-ahead journal ---- */
     bool     has_journal;         /* journal present AND we can drive it */
-    uint64_t j_phys_first;        /* physical block of journal block 0 (j SB) */
+    struct ext4_inode j_inode;    /* the journal's inode: where its blocks are */
     uint32_t j_blocks;            /* journal length in fs blocks (s_maxlen) */
     uint32_t j_first;             /* first usable log block (s_first, usually 1) */
     uint32_t j_sequence;          /* sequence to stamp on the next transaction */
+    /* a Linux-made journal's (finding 274): 64-bit block numbers, CRC-32C
+     * v3 sums from the seed of its UUID; and NEEDS_RECOVERY set this mount */
+    bool     j_64bit, j_csum;
+    uint8_t  j_uuid[16];
+    uint32_t j_csum_seed;
+    bool     j_dirty;
     struct ext4_txn *txn;         /* active transaction, or NULL (writes direct) */
 
     /* Where a listing stopped (finding 277): READDIR2 and getdents64 open
@@ -3074,41 +3080,178 @@ out:
 }
 
 /* ================================================================
- * JBD2 write-ahead journalling.
+ * JBD2 write-ahead journalling -- tobyOS's own journals and Linux's
+ * (finding 274).
  *
- * Each atomic filesystem operation opens a transaction (txn_begin),
- * stages every block it touches, then commits (txn_commit):
+ * The journal is jbd2's: a circular log of block images in the journal
+ * inode's blocks, its superblock in the first. tobyOS's own formatter
+ * makes the classic one (8-byte block tags, no sums). A volume Linux
+ * made has 64-bit block numbers and CRC-32C sums (CSUM_V3): of the
+ * journal superblock, of each descriptor and revoke block (a 4-byte tail),
+ * of each commit block, and of each logged block (in its 16-byte tag).
+ * Every one is checked on recovery and written by this driver as Linux
+ * writes it; a journal with a feature it does not know (CSUM_V2, async
+ * commit, fast commits) is not driven.
  *
- *   1. mark the on-disk journal dirty (superblock s_start = first log
- *      block, s_sequence = this txn's id; set ext4 NEEDS_RECOVERY).
- *   2. write the log: [descriptor][data..][commit].
- *   3. checkpoint: copy each staged block to its home location.
- *   4. mark the journal clean (s_start = 0; clear NEEDS_RECOVERY).
- *
- * A crash anywhere is healed on the next mount by jbd2_recover():
- *   - crash before the commit block -> no valid commit -> discard
- *     (the operation atomically did not happen);
- *   - crash after the commit block (or mid-checkpoint) -> replay the
- *     whole logged set to its homes (the operation atomically happened).
- * Replay is idempotent, so replaying an already-checkpointed txn is a
- * no-op. The journal is reset to empty after every checkpoint, so at most
- * one transaction is ever outstanding -- transactions always start at the
- * first log block, which removes all the circular-buffer bookkeeping.
+ * Each atomic operation opens a transaction (txn_begin), stages every
+ * block it touches, then commits it (txn_commit) as one transaction --
+ * Linux puts many operations in one; one at a time is as valid a log:
+ *   1. the journal superblock: s_start = the first log block, s_sequence
+ *      = this transaction's (and, the first time in a mount, the volume
+ *      marked NEEDS_RECOVERY, as Linux's is while mounted read-write);
+ *   2. the log: descriptor block(s) naming each block's home, the blocks
+ *      (one whose first word is jbd2's magic number escaped), and the
+ *      commit block; then the device flushed;
+ *   3. the checkpoint: each block to its home.
+ * At the umount the journal is emptied (s_start 0) and NEEDS_RECOVERY
+ * cleared. A crash anywhere is healed by recovery at the next mount --
+ * this driver's (jbd2_recover) or Linux's, which reads this log as its
+ * own:
+ *   - before the commit block: the transaction is not replayed (the
+ *     operation did not happen);
+ *   - after it: replayed whole (again, if it had been checkpointed:
+ *     replay writes the same bytes).
+ * Each transaction starts at the log's first block, its predecessor
+ * checkpointed before it began; so the log never wraps, and no block
+ * logged by an older transaction can be replayed over a newer one -- no
+ * revoke record is needed for tobyOS's own transactions. Linux's are read:
+ * a block revoked in a transaction is not replayed from it or an older one.
  * ================================================================ */
+
+/* Journal block REL's place on the device, through the journal inode's
+ * map (extents or block pointers, as Linux's is) */
+static int jmap(struct ext4 *fs, uint32_t rel, uint64_t *phys) {
+    if (rel >= fs->j_blocks) return VFS_ERR_INVAL;
+    int rc = inode_block_map(fs, &fs->j_inode, rel, phys);
+    if (rc == VFS_OK && !*phys) rc = VFS_ERR_IO;
+    return rc;
+}
 
 /* Raw journal-block I/O: rel 0 is the journal superblock, rel >= j_first
  * are log blocks. These bypass transaction staging (they ARE the commit
  * machinery) and go straight to the device. */
 static int jraw_read(struct ext4 *fs, uint32_t rel, void *buf) {
-    uint64_t lba = (fs->j_phys_first + rel) * fs->sectors_per_block;
-    return blk_read(fs->dev, lba, fs->sectors_per_block, buf) == 0
+    uint64_t phys;
+    int rc = jmap(fs, rel, &phys);
+    if (rc != VFS_OK) return rc;
+    return blk_read(fs->dev, phys * fs->sectors_per_block, fs->sectors_per_block, buf) == 0
                ? VFS_OK : VFS_ERR_IO;
 }
 static int jraw_write(struct ext4 *fs, uint32_t rel, const void *buf) {
-    uint64_t lba = (fs->j_phys_first + rel) * fs->sectors_per_block;
-    e4c_drop(fs, fs->j_phys_first + rel);
-    return blk_write(fs->dev, lba, fs->sectors_per_block, buf) == 0
+    uint64_t phys;
+    int rc = jmap(fs, rel, &phys);
+    if (rc != VFS_OK) return rc;
+    e4c_drop(fs, phys);
+    return blk_write(fs->dev, phys * fs->sectors_per_block, fs->sectors_per_block, buf) == 0
                ? VFS_OK : VFS_ERR_IO;
+}
+
+/* the log block after REL, the log wrapping at its end to its first */
+static uint32_t jnext(const struct ext4 *fs, uint32_t rel) {
+    return rel + 1 >= fs->j_blocks ? fs->j_first : rel + 1;
+}
+
+static uint32_t jget32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return be32(v); }
+static void jput32(uint8_t *p, uint32_t v) { v = be32(v); memcpy(p, &v, 4); }
+
+/* the journal superblock's sum: its 1024 bytes, s_checksum taken as zero */
+#define JSB_CSUM_OFF 0xFCu
+static uint32_t jsb_csum(uint8_t *jsb) {
+    uint32_t saved;
+    memcpy(&saved, jsb + JSB_CSUM_OFF, 4);
+    memset(jsb + JSB_CSUM_OFF, 0, 4);
+    uint32_t c = crc32c(~0u, jsb, 1024);
+    memcpy(jsb + JSB_CSUM_OFF, &saved, 4);
+    return c;
+}
+
+/* A descriptor or revoke block's sum, in its last four bytes: the block
+ * with them taken as zero, from the journal's seed */
+static uint32_t jtail_csum(const struct ext4 *fs, const uint8_t *blk) {
+    uint32_t c = crc32c(fs->j_csum_seed, blk, fs->block_size - 4);
+    return crc32c(c, g_zero4, 4);
+}
+static bool jtail_ok(const struct ext4 *fs, const uint8_t *blk) {
+    return !fs->j_csum || jget32(blk + fs->block_size - 4) == jtail_csum(fs, blk);
+}
+
+/* A commit block's sum, in its first h_chksum word (0x10): the block with
+ * that word taken as zero */
+#define JCOMMIT_CSUM_OFF 0x10u
+static uint32_t jcommit_csum(const struct ext4 *fs, uint8_t *blk) {
+    uint32_t saved;
+    memcpy(&saved, blk + JCOMMIT_CSUM_OFF, 4);
+    memset(blk + JCOMMIT_CSUM_OFF, 0, 4);
+    uint32_t c = crc32c(fs->j_csum_seed, blk, fs->block_size);
+    memcpy(blk + JCOMMIT_CSUM_OFF, &saved, 4);
+    return c;
+}
+
+/* A logged block's sum, in its tag: the transaction's sequence (as stored,
+ * big-endian), then the block as the log holds it */
+static uint32_t jdata_csum(const struct ext4 *fs, uint32_t seq, const uint8_t *data) {
+    uint32_t bseq = be32(seq);
+    return crc32c(crc32c(fs->j_csum_seed, &bseq, 4), data, fs->block_size);
+}
+
+/* A block tag: 16 bytes with v3 sums (number, flags, number's high half,
+ * sum); else 8 -- number, 16-bit sum, 16-bit flags -- and 12 with 64-bit
+ * numbers (the high half last) */
+struct jtag { uint64_t blk; uint32_t flags; uint32_t csum; };
+
+static uint32_t jtag_bytes(const struct ext4 *fs) {
+    return fs->j_csum ? 16u : (fs->j_64bit ? 12u : 8u);
+}
+
+static void jtag_get(const struct ext4 *fs, const uint8_t *p, struct jtag *t) {
+    t->blk = jget32(p);
+    uint32_t hi = 0;
+    if (fs->j_csum) {
+        t->flags = jget32(p + 4);
+        hi       = jget32(p + 8);
+        t->csum  = jget32(p + 12);
+    } else {
+        uint16_t c, f;
+        memcpy(&c, p + 4, 2);
+        memcpy(&f, p + 6, 2);
+        t->csum  = be16(c);
+        t->flags = be16(f);
+        if (fs->j_64bit) hi = jget32(p + 8);
+    }
+    if (fs->j_64bit) t->blk |= (uint64_t)hi << 32;
+}
+
+static void jtag_put(const struct ext4 *fs, uint8_t *p, const struct jtag *t) {
+    jput32(p, (uint32_t)t->blk);
+    if (fs->j_csum) {
+        jput32(p + 4, t->flags);
+        jput32(p + 8, (uint32_t)(t->blk >> 32));
+        jput32(p + 12, t->csum);
+    } else {
+        uint16_t c = be16((uint16_t)t->csum), f = be16((uint16_t)t->flags);
+        memcpy(p + 4, &c, 2);
+        memcpy(p + 6, &f, 2);
+        if (fs->j_64bit) jput32(p + 8, (uint32_t)(t->blk >> 32));
+    }
+}
+
+/* The tags of descriptor block BLK, through CB(ctx, index, tag); stops at
+ * the tag marked last or where the room ends. Returns how many. */
+static uint32_t jtags_walk(const struct ext4 *fs, const uint8_t *blk,
+                           void (*cb)(void *ctx, uint32_t i, const struct jtag *t),
+                           void *ctx) {
+    uint32_t tb = jtag_bytes(fs), end = fs->block_size - (fs->j_csum ? 4u : 0u);
+    uint32_t off = sizeof(jbd2_header_t), n = 0;
+    while (off + tb <= end) {
+        struct jtag t;
+        jtag_get(fs, blk + off, &t);
+        off += tb;
+        if (!(t.flags & JBD2_FLAG_SAME_UUID)) off += 16;
+        if (cb) cb(ctx, n, &t);
+        n++;
+        if (t.flags & JBD2_FLAG_LAST_TAG) break;
+    }
+    return n;
 }
 
 /* Open a transaction. With no (drivable) journal this is a no-op and
@@ -3136,105 +3279,103 @@ static void txn_abort(struct ext4 *fs) {
     txn_free(t);
 }
 
-/* Set the on-disk journal state. start_rel == 0 marks the log clean;
- * start_rel == j_first marks it dirty (a transaction may need recovery).
- * Also mirror the state into the ext4 NEEDS_RECOVERY incompat bit and
- * push the superblock straight to disk. */
-static int jbd2_set_state(struct ext4 *fs, uint32_t start_rel,
-                          uint32_t seq, bool recover_bit) {
+/* The journal superblock: where the log starts (0 = empty) and the
+ * sequence expected there; its sum made again. */
+static int jsb_update(struct ext4 *fs, uint32_t start, uint32_t seq) {
     uint8_t *jsb = kmalloc(fs->block_size);
     if (!jsb) return VFS_ERR_NOMEM;
     int rc = jraw_read(fs, 0, jsb);
-    if (rc != VFS_OK) { kfree(jsb); return rc; }
-    jbd2_superblock_t *s = (jbd2_superblock_t *)jsb;
-    s->s_start    = be32(start_rel);
-    s->s_sequence = be32(seq);
-    rc = jraw_write(fs, 0, jsb);
-    kfree(jsb);
-    if (rc != VFS_OK) return rc;
-
-    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
-    if (sb) {
-        if (recover_bit) sb->s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
-        else             sb->s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
-        fs->feature_incompat = sb->s_feature_incompat;
-        rc = flush_superblock_direct(fs);
+    if (rc == VFS_OK) {
+        jbd2_superblock_t *s = (jbd2_superblock_t *)jsb;
+        s->s_start    = be32(start);
+        s->s_sequence = be32(seq);
+        if (fs->j_csum) jput32(jsb + JSB_CSUM_OFF, jsb_csum(jsb));
+        rc = jraw_write(fs, 0, jsb);
     }
+    kfree(jsb);
     return rc;
 }
 
-/* Count the block tags in a descriptor block (mirrors the write layout:
- * 8-byte tag, plus a 16-byte UUID after any tag without SAME_UUID). */
-static uint32_t jbd2_count_tags(struct ext4 *fs, const uint8_t *desc) {
-    uint32_t off = sizeof(jbd2_header_t), n = 0;
-    while (off + sizeof(jbd2_block_tag_t) <= fs->block_size) {
-        const jbd2_block_tag_t *tag = (const jbd2_block_tag_t *)(desc + off);
-        uint16_t flags = be16(tag->t_flags);
-        off += sizeof(*tag);
-        if (!(flags & JBD2_FLAG_SAME_UUID)) off += 16;
-        n++;
-        if (flags & JBD2_FLAG_LAST_TAG) break;
-    }
-    return n;
+/* The volume's NEEDS_RECOVERY: set while a mount may have a transaction in
+ * the log, cleared when the log is empty */
+static int jrecover_flag(struct ext4 *fs, bool on) {
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    if (!sb) return VFS_OK;
+    if (on) sb->s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
+    else    sb->s_feature_incompat &= ~EXT4_FEATURE_INCOMPAT_RECOVER;
+    fs->feature_incompat = sb->s_feature_incompat;
+    sb->s_wtime = (uint32_t)ext4_now().s;      /* written now, as Linux stamps it */
+    return flush_superblock_direct(fs);
 }
 
-/* Write the log records for transaction `t`: one descriptor block listing
- * every home block, the data blocks themselves, then a commit block. */
+/* Write the log of transaction T, sequence SEQ, from the log's first
+ * block: descriptor blocks, each followed by the blocks its tags name,
+ * then the commit block. */
 static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
-    uint32_t n = (uint32_t)t->n;
-    if ((uint64_t)fs->j_first + n + 1 >= fs->j_blocks) return VFS_ERR_NOSPC;
+    uint32_t n = (uint32_t)t->n, tb = jtag_bytes(fs);
+    uint32_t room = fs->block_size - (uint32_t)sizeof(jbd2_header_t) - 16u -
+                    (fs->j_csum ? 4u : 0u);
+    uint32_t per = room / tb;                  /* tags a descriptor holds */
+    uint32_t ndesc = (n + per - 1) / per;
+    if ((uint64_t)fs->j_first + ndesc + n + 1 > fs->j_blocks) return VFS_ERR_NOSPC;
 
-    uint8_t *blk = kmalloc(fs->block_size);
-    if (!blk) return VFS_ERR_NOMEM;
+    uint8_t *blk = kmalloc(fs->block_size), *dat = kmalloc(fs->block_size);
+    if (!blk || !dat) {
+        if (blk) kfree(blk);
+        if (dat) kfree(dat);
+        return VFS_ERR_NOMEM;
+    }
     int rc = VFS_OK;
-
-    /* --- descriptor block at j_first --- */
-    memset(blk, 0, fs->block_size);
-    jbd2_header_t *dh = (jbd2_header_t *)blk;
-    dh->h_magic     = be32(JBD2_MAGIC_NUMBER);
-    dh->h_blocktype = be32(JBD2_DESCRIPTOR_BLOCK);
-    dh->h_sequence  = be32(seq);
-    uint32_t off = sizeof(jbd2_header_t);
-    for (uint32_t i = 0; i < n; i++) {
-        if (off + sizeof(jbd2_block_tag_t) + 16 > fs->block_size) {
-            rc = VFS_ERR_NOSPC; goto out;     /* too many tags for one block */
+    uint32_t rel = fs->j_first;
+    for (uint32_t i = 0; i < n && rc == VFS_OK; ) {
+        uint32_t cnt = n - i < per ? n - i : per;
+        memset(blk, 0, fs->block_size);
+        jbd2_header_t *dh = (jbd2_header_t *)blk;
+        dh->h_magic     = be32(JBD2_MAGIC_NUMBER);
+        dh->h_blocktype = be32(JBD2_DESCRIPTOR_BLOCK);
+        dh->h_sequence  = be32(seq);
+        uint32_t off = sizeof(jbd2_header_t);
+        for (uint32_t k = 0; k < cnt; k++) {
+            const uint8_t *d = t->ents[i + k].data;
+            struct jtag tg = { t->ents[i + k].blk, 0, 0 };
+            if (k) tg.flags |= JBD2_FLAG_SAME_UUID;
+            if (k + 1 == cnt) tg.flags |= JBD2_FLAG_LAST_TAG;
+            memcpy(dat, d, fs->block_size);
+            if (jget32(dat) == JBD2_MAGIC_NUMBER) {
+                tg.flags |= JBD2_FLAG_ESCAPE;     /* first word collides with magic */
+                memset(dat, 0, 4);
+            }
+            if (fs->j_csum) tg.csum = jdata_csum(fs, seq, dat);
+            jtag_put(fs, blk + off, &tg);
+            off += tb;
+            if (k == 0) { memcpy(blk + off, fs->j_uuid, 16); off += 16; }
         }
-        jbd2_block_tag_t *tag = (jbd2_block_tag_t *)(blk + off);
-        uint16_t flags = 0;
-        if (i + 1 == n) flags |= JBD2_FLAG_LAST_TAG;
-        if (i > 0)      flags |= JBD2_FLAG_SAME_UUID;
-        if (be32(*(const uint32_t *)t->ents[i].data) == JBD2_MAGIC_NUMBER)
-            flags |= JBD2_FLAG_ESCAPE;        /* first word collides with magic */
-        tag->t_blocknr  = be32((uint32_t)t->ents[i].blk);
-        tag->t_checksum = 0;
-        tag->t_flags    = be16(flags);
-        off += sizeof(*tag);
-        if (i == 0) { memset(blk + off, 0, 16); off += 16; }   /* journal UUID */
-    }
-    rc = jraw_write(fs, fs->j_first, blk);
-    if (rc != VFS_OK) goto out;
-
-    /* --- data blocks at j_first+1 .. j_first+n --- */
-    for (uint32_t i = 0; i < n; i++) {
-        memcpy(blk, t->ents[i].data, fs->block_size);
-        if (be32(*(uint32_t *)blk) == JBD2_MAGIC_NUMBER)
-            *(uint32_t *)blk = 0;             /* escape: zero the magic word */
-        rc = jraw_write(fs, fs->j_first + 1 + i, blk);
-        if (rc != VFS_OK) goto out;
+        if (fs->j_csum) jput32(blk + fs->block_size - 4, jtail_csum(fs, blk));
+        rc = jraw_write(fs, rel, blk);
+        rel = jnext(fs, rel);
+        for (uint32_t k = 0; k < cnt && rc == VFS_OK; k++) {
+            memcpy(dat, t->ents[i + k].data, fs->block_size);
+            if (jget32(dat) == JBD2_MAGIC_NUMBER) memset(dat, 0, 4);  /* escaped */
+            rc = jraw_write(fs, rel, dat);
+            rel = jnext(fs, rel);
+        }
+        i += cnt;
     }
 
-    if (g_jbd_crash_phase == JBD2_CRASH_BEFORE_COMMIT) goto out;  /* no commit */
-
-    /* --- commit block at j_first+n+1 --- */
-    memset(blk, 0, fs->block_size);
-    jbd2_commit_header_t *ch = (jbd2_commit_header_t *)blk;
-    ch->h.h_magic     = be32(JBD2_MAGIC_NUMBER);
-    ch->h.h_blocktype = be32(JBD2_COMMIT_BLOCK);
-    ch->h.h_sequence  = be32(seq);
-    rc = jraw_write(fs, fs->j_first + 1 + n, blk);
-
-out:
+    if (rc == VFS_OK && g_jbd_crash_phase != JBD2_CRASH_BEFORE_COMMIT) {
+        memset(blk, 0, fs->block_size);
+        jbd2_commit_header_t *ch = (jbd2_commit_header_t *)blk;
+        ch->h.h_magic     = be32(JBD2_MAGIC_NUMBER);
+        ch->h.h_blocktype = be32(JBD2_COMMIT_BLOCK);
+        ch->h.h_sequence  = be32(seq);
+        struct ext4_time now = ext4_now();
+        ch->h_commit_sec  = __builtin_bswap64((uint64_t)now.s);
+        ch->h_commit_nsec = be32(now.ns);
+        if (fs->j_csum) jput32(blk + JCOMMIT_CSUM_OFF, jcommit_csum(fs, blk));
+        rc = jraw_write(fs, rel, blk);
+    }
     kfree(blk);
+    kfree(dat);
     return rc;
 }
 
@@ -3270,16 +3411,18 @@ static int txn_commit(struct ext4 *fs) {
     }
 
     uint32_t seq = fs->j_sequence;
-    rc = jbd2_set_state(fs, fs->j_first, seq, true);     /* mark dirty */
+    rc = VFS_OK;
+    if (!fs->j_dirty) {                         /* the first in this mount */
+        rc = jrecover_flag(fs, true);
+        if (rc == VFS_OK) fs->j_dirty = true;
+    }
+    if (rc == VFS_OK) rc = jsb_update(fs, fs->j_first, seq);
+    if (rc == VFS_OK) rc = jbd2_write_log(fs, t, seq);
     if (rc != VFS_OK) goto done;
-    rc = jbd2_write_log(fs, t, seq);
-    if (rc != VFS_OK) goto done;
+    (void)blk_flush(fs->dev);          /* the log on the medium before its homes */
     if (g_jbd_crash_phase == JBD2_CRASH_BEFORE_COMMIT ||
         g_jbd_crash_phase == JBD2_CRASH_AFTER_COMMIT) { rc = VFS_OK; goto done; }
     rc = jbd2_checkpoint(fs, t);
-    if (rc != VFS_OK) goto done;
-    if (g_jbd_crash_phase == JBD2_CRASH_MID_CHECKPOINT) { rc = VFS_OK; goto done; }
-    rc = jbd2_set_state(fs, 0, seq + 1, false);          /* mark clean */
     if (rc == VFS_OK) fs->j_sequence = seq + 1;
 
 done:
@@ -3295,82 +3438,151 @@ static int txn_finish(struct ext4 *fs, int rc) {
     return txn_commit(fs);
 }
 
-/* Scan the log from the journal superblock's s_start and replay every
- * transaction that has a matching commit block. Idempotent: safe to run
- * on a partially-checkpointed or already-recovered journal. */
-static int jbd2_recover(struct ext4 *fs) {
-    uint8_t *jsb = kmalloc(fs->block_size);
-    if (!jsb) return VFS_ERR_NOMEM;
-    int rc = jraw_read(fs, 0, jsb);
-    if (rc != VFS_OK) { kfree(jsb); return rc; }
-    jbd2_superblock_t *s = (jbd2_superblock_t *)jsb;
-    uint32_t start = be32(s->s_start);
-    uint32_t seq   = be32(s->s_sequence);
-    kfree(jsb);
-    if (start == 0) { fs->j_sequence = seq; return VFS_OK; }   /* clean */
+/* ---- recovery, as Linux's: three passes over the log from s_start ----
+ * scan: to the last transaction whose commit block is there (and whose
+ *       descriptor, revoke and commit sums hold);
+ * revoke: every revoke record of those transactions;
+ * replay: each logged block of those transactions to its home -- but one
+ *       revoked in its own transaction or a later one -- its sum checked. */
+enum { JPASS_SCAN, JPASS_REVOKE, JPASS_REPLAY };
 
+struct jrevoke { uint64_t blk; uint32_t seq; };
+struct jrecover {
+    struct ext4    *fs;
+    uint32_t        last;           /* the last committed sequence */
+    bool            any;            /* there is one */
+    struct jrevoke *rv;
+    uint32_t        nrv, caprv;
+    uint32_t        replayed, bad;
+    /* replay of one descriptor's tags */
+    uint32_t        seq, data_rel;
+    uint8_t        *dblk;
+};
+
+static void jrevoke_add(struct jrecover *r, uint64_t blk, uint32_t seq) {
+    for (uint32_t i = 0; i < r->nrv; i++)
+        if (r->rv[i].blk == blk) {
+            if ((int32_t)(seq - r->rv[i].seq) > 0) r->rv[i].seq = seq;
+            return;
+        }
+    if (r->nrv == r->caprv) {
+        uint32_t nc = r->caprv ? r->caprv * 2 : 64;
+        struct jrevoke *nv = kmalloc((size_t)nc * sizeof(*nv));
+        if (!nv) return;
+        if (r->nrv) memcpy(nv, r->rv, (size_t)r->nrv * sizeof(*nv));
+        if (r->rv) kfree(r->rv);
+        r->rv = nv;
+        r->caprv = nc;
+    }
+    r->rv[r->nrv].blk = blk;
+    r->rv[r->nrv].seq = seq;
+    r->nrv++;
+}
+
+static bool jrevoked(const struct jrecover *r, uint64_t blk, uint32_t seq) {
+    for (uint32_t i = 0; i < r->nrv; i++)
+        if (r->rv[i].blk == blk) return (int32_t)(r->rv[i].seq - seq) >= 0;
+    return false;
+}
+
+static void jreplay_tag(void *ctx, uint32_t i, const struct jtag *t) {
+    struct jrecover *r = (struct jrecover *)ctx;
+    struct ext4 *fs = r->fs;
+    uint32_t rel = r->data_rel;
+    for (uint32_t k = 0; k < i; k++) rel = jnext(fs, rel);
+    if (jrevoked(r, t->blk, r->seq)) return;
+    if (jraw_read(fs, rel, r->dblk) != VFS_OK) { r->bad++; return; }
+    if (fs->j_csum && jdata_csum(fs, r->seq, r->dblk) != t->csum) {
+        kprintf("[ext4] journal: bad sum on block %llu of transaction %u -- not replayed\n",
+                (unsigned long long)t->blk, (unsigned)r->seq);
+        r->bad++;
+        return;
+    }
+    if (t->flags & JBD2_FLAG_ESCAPE) jput32(r->dblk, JBD2_MAGIC_NUMBER);
+    if (t->blk < fs->total_blocks && dev_write_block(fs, t->blk, r->dblk) == VFS_OK)
+        r->replayed++;
+}
+
+/* One pass over the log from START (sequence SEQ); the scan sets r->last */
+static int jbd2_pass(struct ext4 *fs, int pass, uint32_t start, uint32_t seq,
+                     struct jrecover *r, uint8_t *blk) {
+    uint32_t rel = start, expect = seq, seen = 0;
+    while (seen < fs->j_blocks) {
+        if (pass != JPASS_SCAN && (!r->any || (int32_t)(expect - r->last) > 0)) break;
+        if (jraw_read(fs, rel, blk) != VFS_OK) break;
+        jbd2_header_t *h = (jbd2_header_t *)blk;
+        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER || be32(h->h_sequence) != expect) break;
+        uint32_t type = be32(h->h_blocktype);
+        if (type == JBD2_DESCRIPTOR_BLOCK) {
+            if (pass == JPASS_SCAN && !jtail_ok(fs, blk)) break;
+            uint32_t nd = jtags_walk(fs, blk, NULL, NULL);
+            if (pass == JPASS_REPLAY) {
+                r->seq = expect;
+                r->data_rel = jnext(fs, rel);
+                (void)jtags_walk(fs, blk, jreplay_tag, r);
+            }
+            rel = jnext(fs, rel);
+            for (uint32_t k = 0; k < nd; k++) rel = jnext(fs, rel);
+            seen += 1 + nd;
+        } else if (type == JBD2_REVOKE_BLOCK) {
+            if (pass == JPASS_SCAN && !jtail_ok(fs, blk)) break;
+            if (pass == JPASS_REVOKE) {
+                uint32_t used = jget32(blk + sizeof(jbd2_header_t));
+                uint32_t rs = fs->j_64bit ? 8u : 4u;
+                uint32_t end = fs->block_size - (fs->j_csum ? 4u : 0u);
+                if (used > end) used = end;
+                for (uint32_t off = (uint32_t)sizeof(jbd2_revoke_header_t);
+                     off + rs <= used; off += rs) {
+                    uint64_t b = jget32(blk + off);
+                    if (fs->j_64bit) b = (b << 32) | jget32(blk + off + 4);
+                    jrevoke_add(r, b, expect);
+                }
+            }
+            rel = jnext(fs, rel);
+            seen++;
+        } else if (type == JBD2_COMMIT_BLOCK) {
+            if (pass == JPASS_SCAN) {
+                if (fs->j_csum && jget32(blk + JCOMMIT_CSUM_OFF) != jcommit_csum(fs, blk))
+                    break;                     /* not committed: the log ends */
+                r->last = expect;
+                r->any = true;
+            }
+            expect++;
+            rel = jnext(fs, rel);
+            seen++;
+        } else {
+            break;
+        }
+    }
+    return VFS_OK;
+}
+
+static int jbd2_recover(struct ext4 *fs) {
     uint8_t *blk = kmalloc(fs->block_size);
     if (!blk) return VFS_ERR_NOMEM;
+    int rc = jraw_read(fs, 0, blk);
+    if (rc != VFS_OK) { kfree(blk); return rc; }
+    jbd2_superblock_t *s = (jbd2_superblock_t *)blk;
+    uint32_t start = be32(s->s_start);
+    uint32_t seq   = be32(s->s_sequence);
+    if (start == 0) { fs->j_sequence = seq; kfree(blk); return VFS_OK; }   /* clean */
+    if (start < fs->j_first || start >= fs->j_blocks) { kfree(blk); return VFS_ERR_IO; }
 
-    /* Pass 1: find the highest sequence whose commit block is present. */
-    uint32_t rel = start, expect = seq, last_committed = seq - 1;
-    while (rel < fs->j_blocks) {
-        if (jraw_read(fs, rel, blk) != VFS_OK) break;
-        jbd2_header_t *h = (jbd2_header_t *)blk;
-        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER) break;
-        if (be32(h->h_blocktype) != JBD2_DESCRIPTOR_BLOCK) break;
-        if (be32(h->h_sequence) != expect) break;
-        uint32_t m = jbd2_count_tags(fs, blk);
-        uint32_t commit_rel = rel + 1 + m;
-        if (commit_rel >= fs->j_blocks) break;
-        if (jraw_read(fs, commit_rel, blk) != VFS_OK) break;
-        jbd2_header_t *c = (jbd2_header_t *)blk;
-        if (be32(c->h_magic) == JBD2_MAGIC_NUMBER &&
-            be32(c->h_blocktype) == JBD2_COMMIT_BLOCK &&
-            be32(c->h_sequence) == expect) {
-            last_committed = expect;
-            rel = commit_rel + 1;
-            expect++;
-        } else {
-            break;                        /* incomplete transaction: stop */
-        }
-    }
-
-    /* Pass 2: replay each committed transaction's data blocks to home.
-     * (No revoke pass: our writer never emits revoke records.) */
-    uint32_t replayed = 0;
-    rel = start; expect = seq;
-    uint8_t *dblk = kmalloc(fs->block_size);
-    if (!dblk) { kfree(blk); return VFS_ERR_NOMEM; }
-    while (expect <= last_committed && rel < fs->j_blocks) {
-        if (jraw_read(fs, rel, blk) != VFS_OK) break;
-        jbd2_header_t *h = (jbd2_header_t *)blk;
-        if (be32(h->h_magic) != JBD2_MAGIC_NUMBER ||
-            be32(h->h_blocktype) != JBD2_DESCRIPTOR_BLOCK ||
-            be32(h->h_sequence) != expect) break;
-        uint32_t off = sizeof(jbd2_header_t), idx = 0;
-        bool last = false;
-        while (!last && off + sizeof(jbd2_block_tag_t) <= fs->block_size) {
-            jbd2_block_tag_t *tag = (jbd2_block_tag_t *)(blk + off);
-            uint16_t flags = be16(tag->t_flags);
-            uint32_t home  = be32(tag->t_blocknr);
-            off += sizeof(*tag);
-            if (!(flags & JBD2_FLAG_SAME_UUID)) off += 16;
-            last = (flags & JBD2_FLAG_LAST_TAG) != 0;
-            if (jraw_read(fs, rel + 1 + idx, dblk) == VFS_OK) {
-                if (flags & JBD2_FLAG_ESCAPE)
-                    *(uint32_t *)dblk = be32(JBD2_MAGIC_NUMBER);
-                if (home < fs->total_blocks &&
-                    dev_write_block(fs, home, dblk) == VFS_OK)
-                    replayed++;
-            }
-            idx++;
-        }
-        rel = rel + 1 + idx + 1;          /* descriptor + data + commit */
-        expect++;
-    }
-    kfree(dblk);
+    struct jrecover r;
+    memset(&r, 0, sizeof r);
+    r.fs = fs;
+    r.dblk = kmalloc(fs->block_size);
+    if (!r.dblk) { kfree(blk); return VFS_ERR_NOMEM; }
+    (void)jbd2_pass(fs, JPASS_SCAN, start, seq, &r, blk);
+    (void)jbd2_pass(fs, JPASS_REVOKE, start, seq, &r, blk);
+    (void)jbd2_pass(fs, JPASS_REPLAY, start, seq, &r, blk);
+    kfree(r.dblk);
+    if (r.rv) kfree(r.rv);
     kfree(blk);
+    if (r.bad) {
+        kprintf("[ext4] journal recovery FAILED: %u block(s) not replayed\n", r.bad);
+        return VFS_ERR_IO;             /* as Linux's: the mount refused */
+    }
 
     /* Recovery may have rewritten the ext4 SB / GDT; refresh our caches
      * from disk before we clear the recovery flags (which write the SB). */
@@ -3382,29 +3594,22 @@ static int jbd2_recover(struct ext4 *fs) {
                        fs->gdt_buf + i * fs->block_size) != VFS_OK)
             return VFS_ERR_IO;
 
-    fs->j_sequence = last_committed + 1;
-    rc = jbd2_set_state(fs, 0, fs->j_sequence, false);     /* journal clean */
-    kprintf("[ext4] journal recovery: replayed %u block(s), seq %u..%u\n",
-            replayed, (unsigned)seq, (unsigned)last_committed);
+    /* the next transaction's sequence: past the first one not committed,
+     * whose blocks may be in the log, as Linux's recovery leaves it */
+    fs->j_sequence = (r.any ? r.last + 1 : seq) + 1;
+    rc = jsb_update(fs, 0, fs->j_sequence);                /* journal empty */
+    if (rc == VFS_OK) rc = jrecover_flag(fs, false);
+    kprintf("[ext4] journal recovery: replayed %u block(s), seq %u..%u, %u revoked\n",
+            r.replayed, (unsigned)seq, (unsigned)(r.any ? r.last : seq - 1), r.nrv);
     return rc;
 }
 
-/* Locate the journal inode's (single, contiguous, depth-0) extent so we
- * can address log blocks physically. Returns false if the journal isn't
- * laid out the simple way we can drive. */
+/* The journal's inode and the log's length; and whether this driver can
+ * drive the journal (*DRIVABLE), from its superblock JSB. */
 static bool journal_locate(struct ext4 *fs, uint32_t jinum) {
-    struct ext4_inode ji;
-    if (read_inode(fs, jinum, &ji) != VFS_OK) return false;
-    if (!(ji.i_flags & EXT4_EXTENTS_FL)) return false;
-    struct ext4_extent_header *eh = (struct ext4_extent_header *)&ji.i_block[0];
-    if (eh->eh_magic != EXT4_EXT_MAGIC || eh->eh_depth != 0 ||
-        eh->eh_entries != 1) return false;
-    struct ext4_extent *e = (struct ext4_extent *)(eh + 1);
-    if (e->ee_block != 0) return false;
-    uint16_t len = e->ee_len;
-    if (len > 32768) len = (uint16_t)(len - 32768);
-    fs->j_phys_first = ((uint64_t)e->ee_start_hi << 32) | e->ee_start_lo;
-    fs->j_blocks     = len;
+    if (read_inode(fs, jinum, &fs->j_inode) != VFS_OK) return false;
+    uint64_t size = ((uint64_t)fs->j_inode.i_size_hi << 32) | fs->j_inode.i_size_lo;
+    fs->j_blocks = (uint32_t)(size / fs->block_size);
     return fs->j_blocks >= 4;     /* superblock + at least desc/data/commit */
 }
 
@@ -4742,17 +4947,38 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
             jbd2_superblock_t *js = (jbd2_superblock_t *)jsb;
             uint32_t jmagic    = be32(js->s_header.h_magic);
             uint32_t jtype     = be32(js->s_header.h_blocktype);
-            uint32_t jincompat = be32(js->s_feature_incompat);
+            bool     v2        = jtype == JBD2_SUPERBLOCK_V2;
+            uint32_t jincompat = v2 ? be32(js->s_feature_incompat) : 0;
+            uint32_t jcompat   = v2 ? be32(js->s_feature_compat) : 0;
             uint32_t jbsize    = be32(js->s_blocksize);
             uint32_t jstart    = be32(js->s_start);
+            uint32_t jmaxlen   = be32(js->s_maxlen);
+            uint32_t jfirst    = be32(js->s_first);
+            /* tobyOS's classic journal, and Linux's: 64-bit numbers, v3
+             * sums (finding 274); not CSUM_V2, async commit, fast commits
+             * or the v1 commit sum */
             bool drivable =
                 jmagic == JBD2_MAGIC_NUMBER &&
-                (jtype == JBD2_SUPERBLOCK_V2 || jtype == JBD2_SUPERBLOCK_V1) &&
+                (v2 || jtype == JBD2_SUPERBLOCK_V1) &&
                 jbsize == fs->block_size &&
-                (jincompat & ~JBD2_INCOMPAT_SUPPORTED) == 0;
+                (jincompat & ~JBD2_INCOMPAT_SUPPORTED) == 0 &&
+                !(jcompat & JBD2_FEATURE_COMPAT_CHECKSUM) &&
+                jmaxlen >= 4 && jmaxlen <= fs->j_blocks &&
+                jfirst < jmaxlen;
             if (drivable) {
-                fs->j_first    = be32(js->s_first);
-                if (fs->j_first == 0) fs->j_first = 1;
+                fs->j_64bit = (jincompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
+                fs->j_csum  = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+                memcpy(fs->j_uuid, js->s_uuid, 16);
+                fs->j_csum_seed = crc32c(~0u, fs->j_uuid, 16);
+                if (fs->j_csum && (js->s_checksum_type != JBD2_CRC32C_CHKSUM ||
+                                   be32(js->s_checksum) != jsb_csum(jsb))) {
+                    kprintf("[ext4] journal superblock checksum invalid\n");
+                    drivable = false;
+                }
+            }
+            if (drivable) {
+                fs->j_blocks   = jmaxlen;
+                fs->j_first    = jfirst ? jfirst : 1;
                 fs->j_sequence = be32(js->s_sequence);
                 fs->has_journal = true;
                 kfree(jsb); jsb = NULL;
@@ -4856,6 +5082,12 @@ static int ext4_umount(void *mnt) {
     if (!fs) return VFS_OK;
     for (size_t i = 0; i < EXT4_MAX_OPEN_INODES; i++)
         if (fs->openrefs[i].refs > 0) return VFS_OK;
+    /* the log empty, NEEDS_RECOVERY cleared: what a clean umount leaves,
+     * as Linux's (finding 274) */
+    if (fs->has_journal && fs->j_dirty) {
+        if (jsb_update(fs, 0, fs->j_sequence) == VFS_OK) (void)jrecover_flag(fs, false);
+        fs->j_dirty = false;
+    }
     if (fs->state_cleared) {
         struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
         sb->s_state = fs->state_at_mount;

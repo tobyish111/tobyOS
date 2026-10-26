@@ -30,6 +30,10 @@
  *   cat P                (P read to its end, as a reader would)
  *   atime P              (P's atime, as stat says it)
  *   echo TEXT            ("> echo TEXT rc=0": a marker in the output)
+ *   crash N              (the next operation's commit stops at phase N --
+ *                         1 before the commit block, 2 after it, 3 halfway
+ *                         through the checkpoint -- and the run ends there,
+ *                         no umount: a power cut, finding 274)
  *   io                   (the device reads and writes since the last
  *                         `io`, and their sectors; then zeroed)
  *   manifest             (every name under /, sorted: path, type, mode,
@@ -530,6 +534,7 @@ int main(int argc, char **argv)
     if (rc != VFS_OK) return 1;
 
     char line[4 * VFS_PATH_MAX];
+    int crash = 0;          /* `crash N`: the next operation's commit stops there */
     while (fgets(line, sizeof line, stdin)) {
         line[strcspn(line, "\n")] = 0;
         if (!line[0] || line[0] == '#') continue;
@@ -614,6 +619,11 @@ int main(int argc, char **argv)
                    g_rd, g_rd_sec, g_wr, g_wr_sec);
             g_rd = g_rd_sec = g_wr = g_wr_sec = 0;
             continue;
+        } else if (!strcmp(op, "crash")) {
+            sscanf(line, "%*s %d", &crash);
+            g_jbd_crash_phase = crash;
+            printf("> %s rc=0\n", line);
+            continue;
         } else if (!strcmp(op, "manifest")) {
             manifest("/");
             continue;
@@ -630,6 +640,10 @@ int main(int argc, char **argv)
             continue;
         }
         printf("> %s rc=%d\n", line, rc);
+        if (crash) {        /* the power goes: no umount, nothing more written */
+            printf("> crashed after it (phase %d)\n", crash);
+            break;
+        }
     }
     fsync(g_fd);
     close(g_fd);
