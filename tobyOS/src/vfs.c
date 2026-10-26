@@ -1145,6 +1145,12 @@ int vfs_open_access(const char *path, struct vfs_file *out, int want) {
     out->gid     = 0;
     out->mode    = 0;
     out->ino     = 0;    /* driver open hook may set a stable inode number */
+    out->ino_gen = 0;
+    /* Not O_APPEND unless the opener says so (sys_open sets it after this).
+     * It was left as the caller's stack had it since the field came in
+     * (a662c750): vfs_write_all's handle appended "zz" to tmpfs's 2-byte
+     * file, 4 bytes where every other driver's file has 2 (finding 269). */
+    out->append  = false;
     /* Milestone 34E: stamp protected-prefix bit on the handle so
      * vfs_write can re-check WITHOUT having to remember the path. */
     out->sysprot = sysprot_is_protected(path);
