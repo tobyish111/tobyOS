@@ -32228,10 +32228,19 @@ static int shell_brace_word(const char *w, size_t wlen, struct shell_sb *out,
 rescan:
     have = false;
     {
-        bool sq = false, dq = false;
+        /* `$'...'` honours `\'`; a plain `'...'` has no escapes. Read the
+         * naive way, `{p,$'q\'r'}s` closed its quote at the backslash, the
+         * `'` before `}` opened one that never ended, and the group was
+         * never found -- while `$'\'{a,b}'` ended its quote early and
+         * expanded braces that are inside it. */
+        bool sq = false, sq_ansi = false, dq = false;
         for (size_t i = from; i < wlen; i++) {
             char c = w[i];
-            if (sq) { if (c == '\'') sq = false; continue; }
+            if (sq) {
+                if (sq_ansi && c == '\\' && i + 1 < wlen) { i++; continue; }
+                if (c == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
             /* `${...}` is a parameter, `$(...)` and backquotes a command;
              * their own braces are somebody else's problem -- in double
              * quotes too, where an inner `"` would otherwise look like the
@@ -32245,6 +32254,9 @@ rescan:
                 if (c == '"') dq = false;
                 continue;
             }
+            if (c == '$' && i + 1 < wlen && w[i + 1] == '\'') {
+                sq = true; sq_ansi = true; i++; continue;
+            }
             if (c == '\'') { sq = true; continue; }
             if (c == '"')  { dq = true; continue; }
             if (c == '\\' && i + 1 < wlen) { i++; continue; }
@@ -32256,14 +32268,21 @@ rescan:
                 continue;
             /* Find the matching `}`. */
             int nest = 0;
-            bool isq = false, idq = false;
+            bool isq = false, isq_ansi = false, idq = false;
             for (size_t j = i; j < wlen; j++) {
                 char d = w[j];
-                if (isq) { if (d == '\'') isq = false; continue; }
+                if (isq) {
+                    if (isq_ansi && d == '\\' && j + 1 < wlen) { j++; continue; }
+                    if (d == '\'') { isq = false; isq_ansi = false; }
+                    continue;
+                }
                 if (idq) {
                     if (d == '\\' && j + 1 < wlen) { j++; continue; }
                     if (d == '"') idq = false;
                     continue;
+                }
+                if (d == '$' && j + 1 < wlen && w[j + 1] == '\'') {
+                    isq = true; isq_ansi = true; j++; continue;
                 }
                 if (d == '\'') { isq = true; continue; }
                 if (d == '"')  { idq = true; continue; }
@@ -32301,14 +32320,21 @@ rescan:
         size_t end = blen;
         {
             int nest = 0;
-            bool sq = false, dq = false;
+            bool sq = false, sq_ansi = false, dq = false;
             for (size_t i = start; i < blen; i++) {
                 char c = body[i];
-                if (sq) { if (c == '\'') sq = false; continue; }
+                if (sq) {
+                    if (sq_ansi && c == '\\' && i + 1 < blen) { i++; continue; }
+                    if (c == '\'') { sq = false; sq_ansi = false; }
+                    continue;
+                }
                 if (dq) {
                     if (c == '\\' && i + 1 < blen) { i++; continue; }
                     if (c == '"') dq = false;
                     continue;
+                }
+                if (c == '$' && i + 1 < blen && body[i + 1] == '\'') {
+                    sq = true; sq_ansi = true; i++; continue;
                 }
                 if (c == '\'') { sq = true; continue; }
                 if (c == '"')  { dq = true; continue; }
@@ -32344,14 +32370,19 @@ rescan:
 /* True if `src` has an unquoted `{` worth looking at, so the common line
  * pays one scan and no allocation. */
 static bool shell_has_brace(const char *src) {
-    bool sq = false, dq = false;
+    bool sq = false, sq_ansi = false, dq = false;
     for (const char *p = src; *p; p++) {
-        if (sq) { if (*p == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') { sq = false; sq_ansi = false; }
+            continue;
+        }
         if (dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') dq = false;
             continue;
         }
+        if (*p == '$' && p[1] == '\'') { sq = true; sq_ansi = true; p++; continue; }
         if (*p == '\'') { sq = true; continue; }
         if (*p == '"')  { dq = true; continue; }
         if (*p == '\\' && p[1]) { p++; continue; }
@@ -32439,11 +32470,14 @@ static int shell_redir_brace_words_n(const char *w, size_t wlen) {
     SH_SB(bx);
     if (shell_brace_word(w, wlen, &bx, 0) < 0 || !bx.p) return 1;
     int n = 1;
-    bool sq = false, dq = false;
+    bool sq = false, sq_ansi = false, dq = false;
     for (size_t i = 0; i < bx.len; i++) {
         char c = bx.p[i];
-        if (c == '\\' && !sq && i + 1 < bx.len) { i++; continue; }
-        if (c == '\'' && !dq) sq = !sq;
+        if (c == '\\' && (!sq || sq_ansi) && i + 1 < bx.len) { i++; continue; }
+        if (c == '$' && !sq && !dq && i + 1 < bx.len && bx.p[i + 1] == '\'') {
+            sq = true; sq_ansi = true; i++; continue;
+        }
+        if (c == '\'' && !dq) { sq = !sq; sq_ansi = false; }
         else if (c == '"' && !sq) dq = !dq;
         else if (c == ' ' && !sq && !dq) n++;
     }
@@ -32504,9 +32538,14 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
             continue;
         }
         const char *w = p;
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         while (*p) {
-            if (sq) { if (*p == '\'') sq = false; p++; continue; }
+            if (sq) {
+                if (sq_ansi && *p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '\'') { sq = false; sq_ansi = false; }
+                p++;
+                continue;
+            }
             /* A substitution is part of the word it sits in, blanks and
              * operators and all -- quoted or not. */
             if (shell_brace_subst_at(p, src_end)) {
@@ -32519,6 +32558,7 @@ static int shell_expand_braces_line(const char *src, struct shell_sb *out) {
                 p++;
                 continue;
             }
+            if (*p == '$' && p[1] == '\'') { sq = true; sq_ansi = true; p += 2; continue; }
             if (*p == '\'') { sq = true; p++; continue; }
             if (*p == '"')  { dq = true; p++; continue; }
             if (*p == '\\' && p[1]) { p += 2; continue; }
@@ -32732,14 +32772,23 @@ static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
     const char *body = *pp + 2;            /* past the `<(` */
     const char *q = body;
     int depth = 1;
-    bool sq = false, dq = false;
+    /* `$'...'` honours `\'`, and outside quotes a backslash quotes the next
+     * byte: `<(echo $'ps\'ub')` and `<(echo a\)b)` ended early and were
+     * "unterminated" -- the script stopped there. */
+    bool sq = false, sq_ansi = false, dq = false;
     for (; *q; q++) {
-        if (sq) { if (*q == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+            if (*q == '\'') { sq = false; sq_ansi = false; }
+            continue;
+        }
         if (dq) {
             if (*q == '\\' && q[1]) { q++; continue; }
             if (*q == '\"') dq = false;
             continue;
         }
+        if (*q == '\\' && q[1]) { q++; continue; }
+        if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
         if (*q == '\'') { sq = true; continue; }
         if (*q == '\"')  { dq = true; continue; }
         if (*q == '(') { depth++; continue; }
@@ -41163,16 +41212,28 @@ static int shell_dbr_copy_subst(const char **pp, struct shell_dbr_scratch *sc) {
     char open_ch = p[1], close_ch = (p[1] == '(') ? ')' : '}';
     if (shell_dbr_put2(sc, *p++) < 0) return -1;       /* the $ */
     int depth = 0;
-    bool sq = false, dq = false;
+    bool sq = false, sq_ansi = false, dq = false;
     while (*p) {
         char c = *p++;
         if (shell_dbr_put2(sc, c) < 0) return -1;
-        if (sq) { if (c == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && c == '\\' && *p) {
+                if (shell_dbr_put2(sc, *p++) < 0) return -1;
+                continue;
+            }
+            if (c == '\'') { sq = false; sq_ansi = false; }
+            continue;
+        }
         if (c == '\\' && *p) {
             if (shell_dbr_put2(sc, *p++) < 0) return -1;
             continue;
         }
         if (dq) { if (c == '"') dq = false; continue; }
+        if (c == '$' && *p == '\'') {
+            if (shell_dbr_put2(sc, *p++) < 0) return -1;
+            sq = true; sq_ansi = true;
+            continue;
+        }
         if (c == '\'') { sq = true; continue; }
         if (c == '"') { dq = true; continue; }
         if (c == open_ch) depth++;
@@ -41885,17 +41946,25 @@ static bool shell_try_dbracket_command(const char *src) {
         return false;
     s += 2;
 
-    /* Find the `]]` that closes it, ignoring one inside quotes. */
+    /* Find the `]]` that closes it, ignoring one inside quotes. `$'...'`
+     * honours `\'`: read the naive way, `[[ $z == $'a\'b' ]]` ended its
+     * quote at the backslash and the last `'` opened one that swallowed
+     * the `]]` -- "expected ']]'", and the script ended there. */
     const char *end = 0;
     {
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         for (const char *q = s; *q; q++) {
-            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (sq) {
+                if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
             if (dq) {
                 if (*q == '\\' && q[1]) { q++; continue; }
                 if (*q == '"') dq = false;
                 continue;
             }
+            if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"')  { dq = true; continue; }
             if (*q == '\\' && q[1]) { q++; continue; }
@@ -42053,18 +42122,26 @@ static bool shell_try_arith_command(const char *src) {
     s += 2;
 
     /* Find the `))` that closes it. A nested `(` inside the expression is
-     * ordinary grouping and must not be mistaken for the end. */
+     * ordinary grouping and must not be mistaken for the end. `$'...'`
+     * honours `\'`: `(( n = $(printf %s $'1\'' | wc -c) ))` ended its quote
+     * at the backslash, the next `'` hid the `))`, and the line went to the
+     * subshell parser ("expected ')'"). */
     const char *end = 0;
     {
         int depth = 0;
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         for (const char *q = s; *q; q++) {
-            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (sq) {
+                if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
             if (dq) {
                 if (*q == '\\' && q[1]) { q++; continue; }
                 if (*q == '"') dq = false;
                 continue;
             }
+            if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"')  { dq = true; continue; }
             if (*q == '(') { depth++; continue; }
@@ -42777,15 +42854,23 @@ static bool shell_try_arith_for_command(const char *src) {
     const char *open = s + 2;
     const char *end = 0;
     {
+        /* `$'...'` honours `\'` -- in all three of this command's walkers;
+         * read the naive way, `i<$(printf %s $'2\''|wc -c)` hid the `))`
+         * ("expected '))'"). */
         int depth = 0;
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         for (const char *q = open; *q; q++) {
-            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (sq) {
+                if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
             if (dq) {
                 if (*q == '\\' && q[1]) { q++; continue; }
                 if (*q == '"') dq = false;
                 continue;
             }
+            if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"') { dq = true; continue; }
             if (*q == '(') { depth++; continue; }
@@ -42815,10 +42900,20 @@ static bool shell_try_arith_for_command(const char *src) {
     int nexpr = 1;
     {
         int depth = 0;
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         for (char *q = head; *q && nexpr < 3; q++) {
-            if (sq) { if (*q == '\'') sq = false; continue; }
-            if (dq) { if (*q == '"') dq = false; continue; }
+            if (sq) {
+                if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
+            if (dq) {
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '"') dq = false;
+                continue;
+            }
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"') { dq = true; continue; }
             if (*q == '(') depth++;
@@ -42851,14 +42946,20 @@ static bool shell_try_arith_for_command(const char *src) {
     } else if (shell_group_open_at(after)) {
         body_start = after + 1;
         int depth = 1;
-        bool sq = false, dq = false;
+        bool sq = false, sq_ansi = false, dq = false;
         for (const char *q = body_start; *q; q++) {
-            if (sq) { if (*q == '\'') sq = false; continue; }
+            if (sq) {
+                if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') { sq = false; sq_ansi = false; }
+                continue;
+            }
             if (dq) {
                 if (*q == '\\' && q[1]) { q++; continue; }
                 if (*q == '"') dq = false;
                 continue;
             }
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '$' && q[1] == '\'') { sq = true; sq_ansi = true; q++; continue; }
             if (*q == '\'') { sq = true; continue; }
             if (*q == '"') { dq = true; continue; }
             if (shell_group_open_at(q)) { depth++; continue; }
@@ -43425,9 +43526,25 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
          * `--@(help` and `verbose)`, so neither alternative matched and the
          * clause fell through to `*)`. The parse was fine; only the split
          * was wrong, which is why it looked like a matcher bug. */
+        /* ...nor one a backslash quotes, nor one in a `$'...'`, which
+         * honours `\'`: `$'a\''|zz` was cut at the bar inside the quote
+         * the naive reading left open, and matched nothing. */
+        bool in_sq_ansi = false;
         while (*p) {
-            if (in_sq) { if (*p == '\'') in_sq = false; p++; continue; }
-            if (in_dq) { if (*p == '"')  in_dq = false; p++; continue; }
+            if (in_sq) {
+                if (in_sq_ansi && *p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
+                p++;
+                continue;
+            }
+            if (in_dq) {
+                if (*p == '\\' && p[1]) { p += 2; continue; }
+                if (*p == '"')  in_dq = false;
+                p++;
+                continue;
+            }
+            if (*p == '\\' && p[1]) { p += 2; continue; }
+            if (*p == '$' && p[1] == '\'') { in_sq = true; in_sq_ansi = true; p += 2; continue; }
             if (*p == '\'') { in_sq = true; p++; continue; }
             if (*p == '"')  { in_dq = true; p++; continue; }
             if (*p == '(') { eg++; p++; continue; }
