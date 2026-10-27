@@ -18027,15 +18027,14 @@ procsub_word:;
          * `]` (parse_matched_pair), so the `&` and `|` there are arithmetic.
          * The scanner cut the line at them -- `a[5&3]=hello` became a
          * background job `a[5` and a command `3]=hello` (Oils 0517 0518). */
+        /* ...and its quotes are quotes: `A[']']=10` closed at the quoted
+         * `]`, the `'` after it opened a string, and the reader ran to the
+         * end of the file (bash's quotearray.tests). sa_skip_subscript is
+         * the matched-pair walk the evaluator uses. */
         if (d == '[' && nest == 0 && st->cmd_pos && !st->dbracket && p > w &&
             shell_name_is_valid(w, (size_t)(p - w))) {
-            int bd = 0;
-            const char *q = p;
-            for (; *q && *q != '\n'; q++) {
-                if (*q == '[') bd++;
-                else if (*q == ']' && --bd == 0) break;
-            }
-            if (bd == 0 && *q == ']') { p = q + 1; continue; }
+            size_t rk = sa_skip_subscript(p);
+            if (p[rk] == ']') { p += rk + 1; continue; }
         }
         if (nest > 0 && nest - 1 < (int)sizeof st->nest_kind &&
             st->nest_kind[nest - 1] == 'c') {
