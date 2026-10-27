@@ -41465,8 +41465,12 @@ static int shell_dbr_word(const char **pp, struct shell_dbr_scratch *sc,
              * expanded on its own so its result can be marked literal. */
             any_q = true;
             if (shell_dbr_flush(sc) < 0) return -1;
+            /* `$"..."` is "..." here (the C locale translates nothing), as
+             * the tokenizer makes it outside [[ ]]: handed on with its `$`,
+             * `[[ $"ab" == ab ]]` compared something else and was false.
+             * `$'...'` keeps it -- the expander decodes that form. */
             if (c == '$') {
-                if (shell_dbr_put2(sc, c) < 0) return -1;
+                if (p[1] == '\'' && shell_dbr_put2(sc, c) < 0) return -1;
                 p++;
             }
             char qc = *p;
