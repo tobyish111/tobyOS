@@ -14126,6 +14126,13 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
         }
 #endif
         pit_sleep_ms(5);
+        /* A WAIT THAT HAS BLOCKED LOOKS AT EVERY JOB (shell_jobs_after_wait:
+         * bash's waitchld reaps as it waits). The look by SIGCHLD count
+         * alone missed a child whose SIGCHLD an earlier look had spent while
+         * it was not yet reapable: `echo x & wait -n $!` polled a zombie
+         * forever (finding 292; Oils 0463 and shparity 167, each once in
+         * batch 37's gate run). */
+        shell_jobs_after_wait();
     }
 }
 
