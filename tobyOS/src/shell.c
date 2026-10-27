@@ -2674,10 +2674,15 @@ static void shell_jobs_cleanup(void) {}
 /* Does TEXT hold a $( ) or a <( ) / >( ) -- not $(( )) -- outside single
  * quotes? What bash's parser would have to read. */
 static bool shell_text_has_comsub(const char *t) {
-    bool sq = false;
+    bool sq = false, sq_ansi = false;     /* `$'...'` honours `\'` */
     for (; t && *t; t++) {
-        if (sq) { if (*t == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && *t == '\\' && t[1]) { t++; continue; }
+            if (*t == '\'') sq = sq_ansi = false;
+            continue;
+        }
         if (*t == '\\' && t[1]) { t++; continue; }
+        if (*t == '$' && t[1] == '\'') { sq = sq_ansi = true; t++; continue; }
         if (*t == '\'') { sq = true; continue; }
         if (*t == '$' && t[1] == '(' && t[2] != '(') return true;
         if ((*t == '<' || *t == '>') && t[1] == '(') return true;
@@ -16365,9 +16370,18 @@ static int shell_line_find_heredocs(const char *line,
     int ntop = 0;
     if (!top) return 0;
 
+    /* `$'...'` honours `\'`, and a backslash outside quotes quotes the next
+     * byte: read the naive way, `echo $'a\'' <<EOF` or `echo \' <<EOF`
+     * left a quote open over the operator, no body was collected, and the
+     * body's lines ran as commands. */
+    bool in_ansi = false;
     for (const char *p = line; *p && found + ntop < max; p++) {
         if (in_single) {
-            if (*p == '\'') in_single = false;
+            if (in_ansi && *p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '\'') in_single = in_ansi = false;
             continue;
         }
         if (in_double) {
@@ -16379,6 +16393,15 @@ static int shell_line_find_heredocs(const char *line,
             /* a `$( )` in the string is a command like any other:
              * `echo "[$(cat <<A) $(cat <<B)]"` owes two bodies */
             if (!(*p == '$' && p[1] == '(' && p[2] != '(')) continue;
+        }
+        if (!in_double && *p == '\\' && p[1]) {
+            p++;
+            continue;
+        }
+        if (!in_double && *p == '$' && p[1] == '\'') {
+            in_single = in_ansi = true;
+            p++;
+            continue;
         }
         if (!in_double && *p == '\'') {
             in_single = true;
@@ -17324,16 +17347,23 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
          * The result is a WORD: a filename the command will open. */
         if (p[1] == '(') {
             int depth = 0;
-            bool sq = false, dq = false;
+            bool sq = false, sq_ansi = false, dq = false;
             const char *q = p + 1;
             const char *close = 0;
             for (; *q; q++) {
-                if (sq) { if (*q == '\'') sq = false; continue; }
+                /* `$'...'` honours `\'`; a backslash quotes outside quotes */
+                if (sq) {
+                    if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                    if (*q == '\'') sq = sq_ansi = false;
+                    continue;
+                }
                 if (dq) {
                     if (*q == '\\' && q[1]) { q++; continue; }
                     if (*q == '\"') dq = false;
                     continue;
                 }
+                if (*q == '\\' && q[1]) { q++; continue; }
+                if (*q == '$' && q[1] == '\'') { sq = sq_ansi = true; q++; continue; }
                 if (*q == '\'') { sq = true; continue; }
                 if (*q == '\"')  { dq = true; continue; }
                 if (*q == '(') { depth++; continue; }
@@ -17394,16 +17424,21 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         st->coproc_kw = 0;
         if ((st->cmd_pos || arith_for) && p[1] == '(') {
             int depth = 0;
-            bool sq = false, dq = false;
+            bool sq = false, sq_ansi = false, dq = false;
             const char *q = p + 2;
             const char *close = 0;
             for (; *q; q++) {
-                if (sq) { if (*q == '\'') sq = false; continue; }
+                if (sq) {
+                    if (sq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                    if (*q == '\'') sq = sq_ansi = false;
+                    continue;
+                }
                 if (dq) {
                     if (*q == '\\' && q[1]) { q++; continue; }
                     if (*q == '"') dq = false;
                     continue;
                 }
+                if (*q == '$' && q[1] == '\'') { sq = sq_ansi = true; q++; continue; }
                 if (*q == '\'') { sq = true; continue; }
                 if (*q == '"')  { dq = true; continue; }
                 if (*q == '(') { depth++; continue; }
@@ -26870,14 +26905,19 @@ static const char *shell_capture_is_file_read(const char *cmd) {
     /* One word and nothing after it. A `;`, a newline or an operator means
      * this is a list, and bash runs it. */
     const char *w = p;
-    bool sq = false, dq = false;
+    bool sq = false, sq_ansi = false, dq = false;   /* `$'...'`: \' inside */
     for (; *p; p++) {
-        if (sq) { if (*p == '\'') sq = false; continue; }
+        if (sq) {
+            if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
+            if (*p == '\'') sq = sq_ansi = false;
+            continue;
+        }
         if (dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '\"') dq = false;
             continue;
         }
+        if (*p == '$' && p[1] == '\'') { sq = sq_ansi = true; p++; continue; }
         if (*p == '\'') { sq = true; continue; }
         if (*p == '\"')  { dq = true; continue; }
         if (is_space(*p)) break;
@@ -33941,6 +33981,12 @@ static size_t shell_assign_prefix_len_raw(const char *w) {
         int d = 0;
         for (; *p; p++) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            if (*p == '$' && p[1] == '\'') {      /* `$'...'`: \' inside */
+                for (p += 2; *p && *p != '\''; p++)
+                    if (*p == '\\' && p[1]) p++;
+                if (!*p) return 0;
+                continue;
+            }
             if (*p == '\'' || *p == '`') {
                 char q = *p;
                 for (p++; *p && *p != q; p++) {}
@@ -43911,16 +43957,21 @@ static bool shell_try_function_definition(const char *src) {
      * matter, and only the group was accepted. */
     if (*s == '(') {
         int pdepth = 0;
-        bool psq = false, pdq = false;
+        bool psq = false, psq_ansi = false, pdq = false;   /* `$'...'`: \' */
         const char *q = s;
         for (; *q; q++) {
-            if (psq) { if (*q == '\'') psq = false; continue; }
+            if (psq) {
+                if (psq_ansi && *q == '\\' && q[1]) { q++; continue; }
+                if (*q == '\'') psq = psq_ansi = false;
+                continue;
+            }
             if (pdq) {
                 if (*q == '\\' && q[1]) { q++; continue; }
                 if (*q == '"') pdq = false;
                 continue;
             }
             if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '$' && q[1] == '\'') { psq = psq_ansi = true; q++; continue; }
             if (*q == '\'') { psq = true; continue; }
             if (*q == '"')  { pdq = true; continue; }
             if (*q == '(') { pdepth++; continue; }
@@ -44536,11 +44587,12 @@ static bool shell_text_is_one_subshell(const char *text) {
     const char *s = shell_skip_blanks(text);
     if (*s != '(' || s[1] == '(') return false;
     int depth = 1;
-    bool in_single = false, in_double = false;
+    bool in_single = false, in_ansi = false, in_double = false;
     const char *p = s + 1;
     for (; *p; p++) {
         if (in_single) {
-            if (*p == '\'') in_single = false;
+            if (in_ansi && *p == '\\' && p[1]) { p++; continue; }   /* `$'\''` */
+            if (*p == '\'') in_single = in_ansi = false;
             continue;
         }
         if (in_double) {
@@ -44549,6 +44601,7 @@ static bool shell_text_is_one_subshell(const char *text) {
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '\'') { in_single = in_ansi = true; p++; continue; }
         if (*p == '\'') { in_single = true; continue; }
         if (*p == '"') { in_double = true; continue; }
         if (*p == '(') { depth++; continue; }
@@ -44593,10 +44646,15 @@ static bool shell_try_subshell_command(const char *src) {
     const char *body_end = 0;
     int depth = 1;
     bool in_single = false;
+    bool in_ansi = false;      /* the single quote is `$'...'`: \' inside */
     bool in_double = false;
     for (const char *p = body_start; *p; p++) {
         if (in_single) {
-            if (*p == '\'') in_single = false;
+            if (in_ansi && *p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '\'') in_single = in_ansi = false;
             continue;
         }
         if (in_double) {
@@ -44608,6 +44666,13 @@ static bool shell_try_subshell_command(const char *src) {
             continue;
         }
         if (*p == '\\' && p[1]) {
+            p++;
+            continue;
+        }
+        /* `( echo $')\'' )` closed its quote at the backslash and found no
+         * `)` after it: "subshell: expected ')'" ended the script. */
+        if (*p == '$' && p[1] == '\'') {
+            in_single = in_ansi = true;
             p++;
             continue;
         }
@@ -44867,10 +44932,15 @@ static bool shell_try_group_command(const char *src) {
     const char *body_end = 0;
     int depth = 1;
     bool in_single = false;
+    bool in_ansi = false;      /* the single quote is `$'...'`: \' inside */
     bool in_double = false;
     for (const char *p = body_start; *p; p++) {
         if (in_single) {
-            if (*p == '\'') in_single = false;
+            if (in_ansi && *p == '\\' && p[1]) {
+                p++;
+                continue;
+            }
+            if (*p == '\'') in_single = in_ansi = false;
             continue;
         }
         if (in_double) {
@@ -44879,6 +44949,18 @@ static bool shell_try_group_command(const char *src) {
                 continue;
             }
             if (*p == '"') in_double = false;
+            continue;
+        }
+        /* A backslash quotes a brace (`{ echo \}; }`), and `$'...'` honours
+         * `\'`: `{ echo $'}\''; }` ended its quote at the backslash, and
+         * "group: expected '}'" ended the script. */
+        if (*p == '\\' && p[1]) {
+            p++;
+            continue;
+        }
+        if (*p == '$' && p[1] == '\'') {
+            in_single = in_ansi = true;
+            p++;
             continue;
         }
         if (*p == '\'') {

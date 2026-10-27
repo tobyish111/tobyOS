@@ -188,6 +188,15 @@ static size_t sa_skip_subscript(const char *p) {
         if (c == '`') { backq = true; i++; continue; }
         if (c == '[') { count++; i++; continue; }
         if (c == ']') { if (--count == 0) break; i++; continue; }
+        /* `$'...'` honours `\'`: `m[$'x\'y']=v` found no `]`, the subscript
+         * went through the word's ordinary quote removal and the key came
+         * out `xy` */
+        if (c == '$' && p[i + 1] == '\'') {
+            i += 2;
+            while (p[i] && p[i] != '\'') { if (p[i] == '\\' && p[i + 1]) i++; i++; }
+            if (p[i]) i++;
+            continue;
+        }
         if (c == '\'') {
             i++;
             while (p[i] && p[i] != '\'') i++;

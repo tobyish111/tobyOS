@@ -53,3 +53,23 @@ echo $(echo $(echo $'d\'p'))
 f() { echo $'f\'n'; }; f
 for w in $'a\'b' c; do echo "[$w]"; done
 a=($'e\'f' g); echo ${#a[@]} "${a[0]}"
+echo "== ( ) { } and the rest of the scans"
+( echo $')\'' )
+{ echo $'}\''; }
+{ echo \}; }
+g() ( echo $'g)\'' ); g
+h() { echo $'}h\''; }; h
+v=$( echo $')\'' ); echo "$v"
+echo $'a\'' $(echo x)
+w=$(< /dev/null); echo "[$w]"
+declare -A m; m[$'k\'']=v; declare -p m
+cat <<EOF; echo $'h\'d'
+body
+EOF
+echo $'q\'' <<EOF
+ignored body
+EOF
+echo \' <<EOF
+ignored too
+EOF
+echo end
