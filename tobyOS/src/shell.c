@@ -16978,6 +16978,11 @@ static const char *shell_hd_word(const char *p, char *d, size_t n, bool *tabs) {
     *tabs = false;
     if (*q == '-') { *tabs = true; q++; }
     while (*q == ' ' || *q == '\t') q++;
+    /* ALREADY COLLECTED (SHELL_HD_TAG): the reader took the body before the
+     * line got here -- a `<( )` or one-line `$( )` on the line it read --
+     * so there is no body to look for. Waiting for one ate the `)` and the
+     * rest of the script. */
+    if (*q == SHELL_HD_TAG) return 0;
     while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != ';' &&
            *q != '&' && *q != '|' && *q != '<' && *q != '>' && *q != '(' &&
            *q != ')') {
@@ -17015,6 +17020,15 @@ static const char *shell_hd_body_end(const char *p, const char *delim, bool tabs
         size_t ll = (size_t)(e - l);
         if (SH_CR_BLANK && ll > 0 && l[ll - 1] == '\r') ll--;
         if (ll == dl && memcmp(l, delim, dl) == 0) return e;
+        /* `EOF)` or `EOF )` inside the substitution: bash ends the body at
+         * the delimiter there (warning that it wanted `EOF') and the `)`
+         * closes the substitution (comsub-eof.tests) -- what follows the
+         * word is scanned again */
+        if (ll > dl && memcmp(l, delim, dl) == 0) {
+            const char *r = l + dl;
+            while (r < l + ll && (*r == ' ' || *r == '\t')) r++;
+            if (r < l + ll && *r == ')') return l + dl;
+        }
         if (!*e) return 0;
         p = e + 1;
     }
@@ -27760,6 +27774,10 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
                 if (cmd && pos + 1 >= cmd_cap) return -1;
                 CS_TAKE();
             }
+            /* `EOF )`: the delimiter ends the line the command sees, as
+             * bash's does -- the blanks before the `)` are not the body's */
+            if (*p && *p != '\n')
+                while (*p == ' ' || *p == '\t') p++;
             hd_pend = false;
             continue;
         }

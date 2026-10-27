@@ -93,4 +93,20 @@ echo "[$x]"
 echo $(echo $((1<<3)) $(( 2 << 1 )))
 x=$(echo $((4<<1))
 ); echo "[$x]"
+read -r l < <( c <<EOF
+in a procsub
+EOF
+); echo "[$l]"
+while IFS= read -r l; do echo "ps: $l"; done < <(c <<'EOF'
+it's quoted
+EOF
+)
+e=$(c <<EOF
+contents
+EOF)
+echo "[$e]"
+foo=$(c <<EOF
+hi
+EOF )
+echo "[$foo]"
 echo end
