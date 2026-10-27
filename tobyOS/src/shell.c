@@ -4203,6 +4203,10 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         return -1;
     }
     if (xt_cap) shell_xt_decl_literal(name, append, xtd.p ? xtd.p : "");
+    /* The attributes (-i -l -u) are read BEFORE a scalar of the name is
+     * replaced, which takes its flags with it: `typeset -i x; x=([0]=7+11)`
+     * stored 7+11 where bash stores 18 (appendop.tests). */
+    unsigned at = shell_value_attrs(name);
     if (!append) {
         /* AN ARRAY LITERAL REPLACES A SCALAR OF THE SAME NAME.
          *
@@ -4228,8 +4232,7 @@ static int sh_array_assign_literal(const char *name, const char *paren,
     if (assoc) return sh_array_literal_commit(tmp, name, append);
     /* Phase two (sh_litq): the array as it will be -- emptied for `=` --
      * then each element in order, through its attributes (-i -l -u), read
-     * before the empty array replaces the old one. */
-    unsigned at = shell_value_attrs(name);
+     * before the empty array replaces the old one (above). */
     if (sh_array_literal_commit(tmp, name, append) < 0) {
         sh_litq_free(&q);
         return -1;
