@@ -16800,6 +16800,21 @@ static void shell_strip_comment(char *s) { shell_strip_comment_from(s, false); }
 
 static const char *shell_hd_word(const char *p, char *d, size_t n, bool *tabs);
 static const char *shell_hd_body_end(const char *p, const char *delim, bool tabs);
+
+/* Does the `#` at P start a word -- at S, or after a blank or an operator
+ * byte that no backslash quotes? `: \ # x` and `: \;# x` are mid-word:
+ * taken for comments, they hid the `)` that closes `$(: \ # x)` and the
+ * reader ran to the end of the file (bash's comsub1.sub). */
+static bool shell_hash_word_start(const char *s, const char *p) {
+    if (p <= s) return true;
+    char b = p[-1];
+    if (!(is_space(b) || b == ';' || b == '|' || b == '&' || b == '('))
+        return false;
+    size_t k = 0;
+    for (const char *q = p - 1; q > s && q[-1] == '\\'; q--) k++;
+    return (k & 1u) == 0;
+}
+
 static void shell_strip_comment_from(char *s, bool mid_word) {
     bool in_sq = false, in_dq = false, sq_ansi = false;
     /* A here-document's body inside a `$( )` is text: `x=$(cat <<EOF`,
@@ -16905,8 +16920,7 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
             if (!shaped && *p != '#') assign_pos = false;
         }
         if (*p == '#' && ((p == s && !mid_word) ||
-                          (p > s && (is_space(p[-1]) || p[-1] == ';' ||
-                          p[-1] == '&' || p[-1] == '|' || p[-1] == '(')))) {
+                          (p > s && shell_hash_word_start(s, p)))) {
             /* TO ITS NEWLINE, where the text holds lines (a `$( )` keeps
              * them): what follows the newline is shell text again. */
             char *nl = p;
@@ -17162,8 +17176,7 @@ static int shell_line_incomplete(const char *s) {
          *     )"
          *
          * was never complete, and every following line was glued onto it. */
-        if (*p == '#' && (p == s || is_space(p[-1]) || p[-1] == ';' ||
-                          p[-1] == '&' || p[-1] == '|' || p[-1] == '(')) {
+        if (*p == '#' && shell_hash_word_start(s, p)) {
             while (p[1] && p[1] != '\n') p++;
             continue;
         }
@@ -18077,8 +18090,7 @@ procsub_word:;
         }
         if (nest > 0 && d == '#' && nest - 1 < (int)sizeof st->nest_kind &&
             st->nest_kind[nest - 1] == 'c' &&
-            (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '(' ||
-             p[-1] == ';' || p[-1] == '|' || p[-1] == '&')) {
+            shell_hash_word_start(st->start ? st->start : w, p)) {
             /* A COMMENT INSIDE `$( )` or `<( )` runs to the end of its line,
              * as one outside does: its text is not shell.
              *
@@ -27784,9 +27796,7 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
         /* A COMMENT runs to the end of its line, copied as it is: its
          * apostrophe opens nothing -- `"$(echo g # it's` and `)"` on the
          * next line was a "bad command substitution" (see the scanner's). */
-        if (*p == '#' && (p == sub_start || p[-1] == ' ' || p[-1] == '\t' ||
-                          p[-1] == '\n' || p[-1] == ';' || p[-1] == '|' ||
-                          p[-1] == '&' || p[-1] == '(')) {
+        if (*p == '#' && shell_hash_word_start(sub_start, p)) {
             while (*p && *p != '\n') {
                 if (cmd && pos + 1 >= cmd_cap) return -1;
                 CS_TAKE();

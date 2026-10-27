@@ -15,4 +15,9 @@ z=$(echo e#f); echo "$z"
 n=$(v=abc; echo ${#v}); echo "$n"
 echo "$(echo g # it's
 )"
+: $(: \ # not a comment)
+echo "after escaped blank"
+: $(: \;# not a comment )
+echo "after escaped semicolon"
+v=$(echo a\ #b); echo "[$v]"
 echo end
