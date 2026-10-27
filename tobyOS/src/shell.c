@@ -16795,8 +16795,15 @@ static int shell_collect_heredoc(char **pp, const char *delim,
 static void shell_strip_comment_from(char *s, bool mid_word);
 static void shell_strip_comment(char *s) { shell_strip_comment_from(s, false); }
 
+static const char *shell_hd_word(const char *p, char *d, size_t n, bool *tabs);
+static const char *shell_hd_body_end(const char *p, const char *delim, bool tabs);
 static void shell_strip_comment_from(char *s, bool mid_word) {
     bool in_sq = false, in_dq = false, sq_ansi = false;
+    /* A here-document's body inside a `$( )` is text: `x=$(cat <<EOF`,
+     * `# not a comment`, `EOF`, `)` lost everything from the `#` on, and
+     * the substitution never closed (see the scanner's hd_state). */
+    char hdd[128];
+    bool hd_pend = false, hd_tabs = false;
     bool assign_pos = !mid_word;     /* still in a command's assignments */
     /* WHERE A `#` IS AN OPERATOR, NOT A COMMENT: inside arithmetic -- $(( )),
      * (( )), and parentheses nested in them -- and inside ${ }, the text
@@ -16829,6 +16836,24 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
             if (*p == ')' && nk > 0 && SC_TOP() != 'v') { nk--; continue; }
             if (*p == '}' && nk > 0 && SC_TOP() == 'v') { nk--; continue; }
             if (*p == '#' && (SC_TOP() == 'a' || SC_TOP() == 'v')) continue;
+            if (SC_TOP() == 'c' && p[0] == '<' && p[1] == '<' && p[2] != '<' &&
+                (p == s || p[-1] != '<')) {
+                bool tabs = false;
+                const char *after = shell_hd_word(p, hdd, sizeof hdd, &tabs);
+                if (after) {
+                    hd_pend = true;
+                    hd_tabs = tabs;
+                    p = (char *)after - 1;
+                    continue;
+                }
+            }
+            if (*p == '\n' && hd_pend) {
+                const char *e = shell_hd_body_end(p + 1, hdd, hd_tabs);
+                hd_pend = false;
+                if (!e) return;               /* the body runs to the end */
+                p = (char *)e - 1;
+                continue;
+            }
         }
         if (in_sq) {
             if (sq_ansi && *p == '\\' && p[1]) { p++; continue; }
@@ -16879,8 +16904,17 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
         if (*p == '#' && ((p == s && !mid_word) ||
                           (p > s && (is_space(p[-1]) || p[-1] == ';' ||
                           p[-1] == '&' || p[-1] == '|' || p[-1] == '(')))) {
-            *p = '\0';
-            return;
+            /* TO ITS NEWLINE, where the text holds lines (a `$( )` keeps
+             * them): what follows the newline is shell text again. */
+            char *nl = p;
+            while (*nl && *nl != '\n') nl++;
+            if (!*nl) {
+                *p = '\0';
+                return;
+            }
+            memmove(p, nl, strlen(nl) + 1);
+            assign_pos = true;                /* what the \n at p does */
+            continue;
         }
     }
 #undef SC_PUSH
@@ -16931,6 +16965,58 @@ static void shell_normalise_separators(char *s) {
     *w = '\0';
 }
 
+/* The delimiter of the `<<` at P, its quotes removed, into D (cap N), and
+ * *tabs for `<<-` -- the word shell_line_find_heredocs reads, for the
+ * scans that only need to know where a body ends. Returns the byte after
+ * the word, or 0 when there is none. */
+static const char *shell_hd_word(const char *p, char *d, size_t n, bool *tabs) {
+    const char *q = p + 2;
+    size_t k = 0;
+    *tabs = false;
+    if (*q == '-') { *tabs = true; q++; }
+    while (*q == ' ' || *q == '\t') q++;
+    while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != ';' &&
+           *q != '&' && *q != '|' && *q != '<' && *q != '>' && *q != '(' &&
+           *q != ')') {
+        char qc = 0;
+        bool esc = false;          /* "..." and $'...' take `\x` as x */
+        if (*q == '$' && (q[1] == '\'' || q[1] == '"')) { q++; esc = true; }
+        if (*q == '\'' || *q == '"') { qc = *q++; esc = esc || qc == '"'; }
+        if (qc) {
+            while (*q && *q != qc) {
+                if (esc && *q == '\\' && q[1]) q++;
+                if (k + 1 < n) d[k++] = *q;
+                q++;
+            }
+            if (*q == qc) q++;
+            continue;
+        }
+        if (*q == '\\' && q[1]) q++;
+        if (k + 1 < n) d[k++] = *q;
+        q++;
+    }
+    d[k] = '\0';
+    return k ? q : 0;
+}
+
+/* From P, the start of a here-document body line, where the line that is
+ * DELIM (after leading tabs, for `<<-`) ends -- its newline or the end of
+ * the text -- or 0 when the text ends first. */
+static const char *shell_hd_body_end(const char *p, const char *delim, bool tabs) {
+    size_t dl = strlen(delim);
+    for (;;) {
+        const char *e = p;
+        while (*e && *e != '\n') e++;
+        const char *l = p;
+        if (tabs) while (l < e && *l == '\t') l++;
+        size_t ll = (size_t)(e - l);
+        if (SH_CR_BLANK && ll > 0 && l[ll - 1] == '\r') ll--;
+        if (ll == dl && memcmp(l, delim, dl) == 0) return e;
+        if (!*e) return 0;
+        p = e + 1;
+    }
+}
+
 /* Does `s` leave a logical line INCOMPLETE?
  *
  * Two ways it can: a quote opened and never closed, or a trailing backslash
@@ -16964,6 +17050,9 @@ static int shell_line_incomplete(const char *s) {
      * reader glued every following line onto this one. What is inside `$( )`
      * is a COMMAND with its own quotes; they are suspended and restored. */
     bool sq_at[16], dq_at[16];
+    bool ar_at[16];            /* the level is `$(( ))`: `<<` is a shift */
+    char hdd[128];             /* a here-document's delimiter in a `$( )` */
+    bool hd_pend = false, hd_tabs = false;
     int nest = 0;
     for (const char *p = s; *p; p++) {
         esc = false;
@@ -16977,6 +17066,7 @@ static int shell_line_incomplete(const char *s) {
             if (*p == '$' && p[1] == '(' && nest < 16) {
                 sq_at[nest] = in_sq;
                 dq_at[nest] = in_dq;
+                ar_at[nest] = (p[2] == '(');
                 nest++;
                 in_sq = false;
                 in_dq = false;
@@ -17004,10 +17094,33 @@ static int shell_line_incomplete(const char *s) {
         if (*p == '$' && p[1] == '(' && nest < 16) {
             sq_at[nest] = in_sq;
             dq_at[nest] = in_dq;
+            ar_at[nest] = (p[2] == '(');
             nest++;
             in_sq = false;
             in_dq = false;
             p++;
+            continue;
+        }
+        /* A HERE-DOCUMENT INSIDE `$( )` (the scanner's hd_state): from the
+         * next newline its body is text, to the line that is its
+         * delimiter -- the line is incomplete until that line comes. Not in
+         * `$(( ))`, where `<<` is a shift, nor `<<<`. */
+        if (nest > 0 && nest <= 16 && !ar_at[nest - 1] && p[0] == '<' &&
+            p[1] == '<' && p[2] != '<' && p > s && p[-1] != '<') {
+            bool tabs = false;
+            const char *after = shell_hd_word(p, hdd, sizeof hdd, &tabs);
+            if (after) {
+                hd_pend = true;
+                hd_tabs = tabs;
+                p = after - 1;
+                continue;
+            }
+        }
+        if (*p == '\n' && hd_pend) {
+            const char *e = shell_hd_body_end(p + 1, hdd, hd_tabs);
+            if (!e) return 1;                   /* the body is still owed */
+            hd_pend = false;
+            p = e - 1;
             continue;
         }
         if (*p == ')' && nest > 0) {
@@ -17103,6 +17216,18 @@ struct shell_scan {
      * context and accepted it. */
     bool in_array_lit;
     int  array_lit_depth;
+    /* A HERE-DOCUMENT INSIDE A `$( )` THAT RUNS OVER LINES: its body is
+     * the substitution's text, not shell syntax -- `x=$(cat <<EOF`,
+     * `it's here`, `EOF`, `)` -- and its apostrophe opened a string the
+     * reader hunted for to the end of the file. hd_state: 1, an operator
+     * seen on this line (the body starts at the next newline); 2, inside
+     * the body until a line that is hd_delim. One delimiter is kept --
+     * the last; the bodies of one line follow each other, and skipping to
+     * the last delimiter skips them all. Top-level and compound here-
+     * documents are collected by the readers before this sees them. */
+    unsigned char hd_state;
+    bool hd_tabs;                       /* `<<-` */
+    char hd_delim[128];
     bool bad_semi;      /* a `;;` outside any `case` */
     bool bad_rparen;    /* a `)` that closes nothing and is not a pattern */
     /* A list-closing keyword -- then do else elif fi done -- where the list
@@ -17180,6 +17305,9 @@ static void shell_scan_init(struct shell_scan *st) {
     st->decl_util = false;
     st->case_depth = 0;
     st->cont_op = false;
+    st->hd_state = 0;
+    st->hd_tabs = false;
+    st->hd_delim[0] = '\0';
     st->nest = 0;
     st->in_sq = false;
     st->in_sq_ansi = false;
@@ -17251,6 +17379,16 @@ static bool shell_scan_incomplete(const struct shell_scan *st) {
 
 static bool shell_word_eq(const char *w, size_t n, const char *lit) {
     return strlen(lit) == n && strncmp(w, lit, n) == 0;
+}
+
+/* From P, the start of a here-document body line, past the line that is
+ * st->hd_delim (shell_hd_body_end): hd_state back to 0 -- or the end of
+ * the text, the body still open (2). */
+static const char *shell_scan_hd_body(struct shell_scan *st, const char *p) {
+    const char *e = shell_hd_body_end(p, st->hd_delim, st->hd_tabs);
+    if (e) { st->hd_state = 0; return e; }
+    st->hd_state = 2;
+    return p + strlen(p);
 }
 
 /* Advance `st` over exactly one token starting at *pp, which must point at a
@@ -17899,6 +18037,28 @@ procsub_word:;
             }
             if (bd == 0 && *q == ']') { p = q + 1; continue; }
         }
+        if (nest > 0 && nest - 1 < (int)sizeof st->nest_kind &&
+            st->nest_kind[nest - 1] == 'c') {
+            /* A HERE-DOCUMENT OPERATOR INSIDE `$( )` and its body (see
+             * hd_state). Not `<<<`, a here-string; arithmetic's `<<` is in
+             * an 'a' level, not here. */
+            if (d == '<' && p[1] == '<' && p[2] != '<' && p[-1] != '<') {
+                bool tabs = false;
+                const char *after = shell_hd_word(p, st->hd_delim,
+                                                  sizeof st->hd_delim, &tabs);
+                if (after) {
+                    st->hd_tabs = tabs;
+                    st->hd_state = 1;
+                    p = after;
+                    continue;
+                }
+            }
+            if (d == '\n' && st->hd_state == 1) {
+                p = shell_scan_hd_body(st, p + 1);
+                if (st->hd_state == 2) break;   /* the text ends in the body */
+                continue;
+            }
+        }
         if (nest > 0 && d == '#' && nest - 1 < (int)sizeof st->nest_kind &&
             st->nest_kind[nest - 1] == 'c' &&
             (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '(' ||
@@ -18290,13 +18450,26 @@ static char *shell_quote_tail_end(char *s, bool sq, bool sq_ansi) {
  * same answer. */
 static void shell_scan_line(struct shell_scan *st, const char *s) {
     const char *p = s;
+    /* a here-document body inside a `$( )`, run on from an earlier line
+     * (see hd_state): its lines are text */
+    if (st->hd_state == 2) {
+        p = shell_scan_hd_body(st, p);
+        if (st->hd_state == 2) return;
+    }
     st->start = s;
     st->cmd_pos = true;
     st->prev_word_cmd = false;
     st->assign_prefix = false;
     st->redir = false;
     while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || (SH_CR_BLANK && *p == '\r')) {
+            if (*p == '\n' && st->hd_state == 1) {
+                p = shell_scan_hd_body(st, p + 1);
+                if (st->hd_state == 2) return;
+                continue;
+            }
+            p++;
+        }
         if (!*p) break;
         const char *before = p;
         /* THE EMPTY LIST (see bad_kw). Judged here, around the token, because
@@ -18328,7 +18501,10 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
         if (opener)        st->list_empty = true;
         else if (!neutral) st->list_empty = false;
         if (p <= before) p = before + 1;      /* belt and braces */
+        if (st->hd_state == 2) return;        /* the text ended in a body */
     }
+    /* an operator on this line: its body is the lines that follow */
+    if (st->hd_state == 1) st->hd_state = 2;
 }
 
 /* Does the text end in an ODD number of backslashes -- a line continuation
@@ -19405,9 +19581,14 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                  * Only the part AFTER the string closes on this line is shell
                  * text again, so only that part can hold a comment -- and a
                  * `#` directly after the closing quote is mid-word. */
-                bool in_q = (scan.in_sq || scan.in_dq);
-                char *qclose = in_q ? shell_quote_tail_end(nl, scan.in_sq,
-                                                           scan.in_sq_ansi) : 0;
+                /* ...and so is a line of a here-document body inside a
+                 * `$( )` (hd_state): kept as it stands, indentation, blank
+                 * lines, `#` lines and all. */
+                bool in_hd = (scan.hd_state == 2);
+                bool in_q = (scan.in_sq || scan.in_dq) || in_hd;
+                char *qclose = in_q && !in_hd
+                                   ? shell_quote_tail_end(nl, scan.in_sq,
+                                                          scan.in_sq_ansi) : 0;
                 if (in_q) {
                     if (qclose) {
                         shell_strip_comment_from(qclose, true);
@@ -27484,6 +27665,13 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
      * the rest of the script with it. Same rule as shell_line_incomplete. */
     bool sq_ansi = false;
     bool sq_at[16], dq_at[16];
+    /* A HERE-DOCUMENT IN THE SUBSTITUTION: its body is copied as text, to
+     * the line that is its delimiter -- `$(cat <<EOF`, `it's`, `EOF`, `)`
+     * read the body's apostrophe as a quote ("bad command substitution").
+     * ar_cur: this level is `$(( ))`, where `<<` is a shift. */
+    bool ar_at[16], ar_cur = false;
+    char hd_delim[128];
+    bool hd_pend = false, hd_tabs = false;
     while (*p) {
         if (in_sq) {
             if (sq_ansi && *p == '\\' && p[1]) {
@@ -27505,7 +27693,10 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
                 continue;
             }
             if (p[0] == '$' && p[1] == '(') {
-                if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
+                if (depth < 16) {
+                    sq_at[depth] = in_sq; dq_at[depth] = in_dq; ar_at[depth] = ar_cur;
+                }
+                ar_cur = ar_cur || p[2] == '(';
                 in_sq = false;
                 in_dq = false;
                 depth++;
@@ -27541,6 +27732,30 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             CS_TAKE();
             continue;
         }
+        if (!ar_cur && p[0] == '<' && p[1] == '<' && p[2] != '<' &&
+            p > sub_start && p[-1] != '<') {
+            bool tabs = false;
+            const char *after = shell_hd_word(p, hd_delim, sizeof hd_delim, &tabs);
+            if (after) {
+                hd_pend = true;
+                hd_tabs = tabs;
+                while (p < after) {
+                    if (cmd && pos + 1 >= cmd_cap) return -1;
+                    CS_TAKE();
+                }
+                continue;
+            }
+        }
+        if (*p == '\n' && hd_pend) {
+            const char *e = shell_hd_body_end(p + 1, hd_delim, hd_tabs);
+            if (!e) return -1;                 /* the body never ends */
+            while (p < e) {
+                if (cmd && pos + 1 >= cmd_cap) return -1;
+                CS_TAKE();
+            }
+            hd_pend = false;
+            continue;
+        }
         /* A COMMENT runs to the end of its line, copied as it is: its
          * apostrophe opens nothing -- `"$(echo g # it's` and `)"` on the
          * next line was a "bad command substitution" (see the scanner's). */
@@ -27566,7 +27781,10 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             continue;
         }
         if (p[0] == '$' && p[1] == '(') {
-            if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
+            if (depth < 16) {
+                sq_at[depth] = in_sq; dq_at[depth] = in_dq; ar_at[depth] = ar_cur;
+            }
+            ar_cur = ar_cur || p[2] == '(';
             depth++;
             if (cmd && pos + 2 >= cmd_cap) return -1;
             CS_TAKE();
@@ -27621,7 +27839,9 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
          * `$(` was counted, while every `)` decremented, so `$( (echo x) )`
          * ended at the subshell's own paren and left a stray `)` in the word. */
         if (*p == '(') {
-            if (depth < 16) { sq_at[depth] = in_sq; dq_at[depth] = in_dq; }
+            if (depth < 16) {
+                sq_at[depth] = in_sq; dq_at[depth] = in_dq; ar_at[depth] = ar_cur;
+            }
             depth++;
             if (cmd && pos + 1 >= cmd_cap) return -1;
             CS_TAKE();
@@ -27632,6 +27852,7 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             if (depth > 0 && depth < 16) {
                 in_sq = sq_at[depth];        /* back to the quote it suspended */
                 in_dq = dq_at[depth];
+                ar_cur = ar_at[depth];
             }
             if (depth == 0) {
                 p++;
@@ -40674,6 +40895,14 @@ static const char *shell_find_loop_do(const char *start, const char **after) {
             if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
         }
+        /* A `$( )` IS ONE WORD here, read by its own rules
+         * (shell_parse_command_subst) -- a here-document body in it is
+         * text: `y=$(cat <<\EOF`, `won't`, `EOF`, `)` inside an `if` left
+         * the apostrophe open and the `fi` was never found. */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *q = p;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
@@ -40730,6 +40959,11 @@ static const char *shell_find_matching_done(const char *start,
             if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
             if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
+        }
+        /* a `$( )` is one word, read by its own rules (see shell_find_if_fi) */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *cq = p;
+            if (shell_parse_command_subst(&cq, 0, 0) == 0) { p = cq - 1; continue; }
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
@@ -40797,6 +41031,11 @@ static const char *shell_find_kw_sep(const char *start, const char *kw,
             if (*p == '\'') { sq = false; sq_ansi = false; }
             continue;
         }
+        /* a `$( )` is one word, read by its own rules (see shell_find_if_fi) */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *q = p;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+        }
         if (dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') dq = false;
@@ -40853,6 +41092,14 @@ static const char *shell_find_if_fi(const char *start, const char **after) {
             if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
         }
+        /* A `$( )` IS ONE WORD here, read by its own rules
+         * (shell_parse_command_subst) -- a here-document body in it is
+         * text: `y=$(cat <<\EOF`, `won't`, `EOF`, `)` inside an `if` left
+         * the apostrophe open and the `fi` was never found. */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *q = p;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
@@ -40893,6 +41140,14 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
             if (in_sq_ansi && *p == '\\' && p[1]) { p++; continue; }
             if (*p == '\'') { in_sq = false; in_sq_ansi = false; }
             continue;
+        }
+        /* A `$( )` IS ONE WORD here, read by its own rules
+         * (shell_parse_command_subst) -- a here-document body in it is
+         * text: `y=$(cat <<\EOF`, `won't`, `EOF`, `)` inside an `if` left
+         * the apostrophe open and the `fi` was never found. */
+        if (*p == '$' && p[1] == '(' && p[2] != '(') {
+            const char *q = p;
+            if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
@@ -43762,6 +44017,12 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
  * backslash. An unterminated span returns the byte before `end`. */
 static const char *shell_case_skip_quoted(const char *q, const char *end) {
     if (*q == '\\') return (q + 1 < end) ? q + 1 : q;
+    /* ...and a `$( )` is one word, read by its own rules: a here-document
+     * body in it is text (see shell_find_if_fi) */
+    if (*q == '$' && q + 2 < end && q[1] == '(' && q[2] != '(') {
+        const char *cq = q;
+        if (shell_parse_command_subst(&cq, 0, 0) == 0 && cq <= end) return cq - 1;
+    }
     bool ansi = false;
     char qc = 0;
     if (*q == '$' && q + 1 < end && q[1] == '\'') { ansi = true; qc = '\''; q++; }
