@@ -16514,6 +16514,31 @@ static int shell_line_find_heredocs(const char *line,
         SH_SB(dw);
         bool oom = false;
         while (shell_heredoc_delim_char(*p)) {
+            /* `$'...'` is quoted and its escapes are decoded -- bash's
+             * `<<$'A\tB'` ends at a line `A<TAB>B` -- and `$"..."` is quoted
+             * as "..." is; the `$` was kept as part of the word, and the
+             * reader ran to the end of the file. */
+            if (*p == '$' && p[1] == '\'') {
+                sp->quoted = true;
+                p += 2;
+                while (*p && *p != '\'') {
+                    char eb[16];
+                    int en = 1;
+                    if (*p == '\\' && p[1]) {
+                        p++;
+                        en = shell_ansic_escape(&p, eb);
+                    } else {
+                        eb[0] = *p++;
+                    }
+                    for (int k = 0; k < en; k++)
+                        if (sb_putc(&dw, eb[k]) < 0) { oom = true; break; }
+                    if (oom) break;
+                }
+                if (oom) break;
+                if (*p == '\'') p++;
+                continue;
+            }
+            if (*p == '$' && p[1] == '"') p++;
             if (*p == '\'' || *p == '"') {
                 char q = *p++;
                 sp->quoted = true;
@@ -16522,6 +16547,17 @@ static int shell_line_find_heredocs(const char *line,
                 }
                 if (oom) break;
                 if (*p == q) p++;
+                continue;
+            }
+            /* A BACKSLASH QUOTES TOO: `<<\EOF` and `<<E\OF` are the word EOF,
+             * quoted, so the body is not expanded (bash, POSIX's quote
+             * removal on the delimiter). The backslash was kept, the reader
+             * hunted for a line `\EOF` to the end of the file, and expanded
+             * what it took. */
+            if (*p == '\\' && p[1]) {
+                sp->quoted = true;
+                p++;
+                if (sb_putc(&dw, *p++) < 0) { oom = true; break; }
                 continue;
             }
             if (sb_putc(&dw, *p++) < 0) { oom = true; break; }
@@ -33050,11 +33086,23 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
 
         if (literal_word) {
             literal_word = false;
-            bool lsq = false, ldq = false;
+            bool lsq = false, ldq = false, lansi = false;
             while (*p && (lsq || ldq ||
                           (!is_space(*p) && !shell_operator_char(*p)))) {
                 if (lsq) {
-                    if (*p == '\'') { lsq = false; p++; continue; }
+                    /* `<<$'E\'F'`: the delimiter is E'F (see
+                     * shell_line_find_heredocs), its quote honours `\'` */
+                    if (lansi && *p == '\\' && p[1]) {
+                        if (sb_putc(&wb, *p++) < 0 || sb_putc(&wb, *p++) < 0) {
+                            kprintf(SH_PFX_SHELL "word too long\n");
+                            return -1;
+                        }
+                        got = true;
+                        continue;
+                    }
+                    if (*p == '\'') { lsq = lansi = false; p++; continue; }
+                } else if (!ldq && *p == '$' && p[1] == '\'') {
+                    lsq = lansi = true; p += 2; continue;
                 } else if (ldq) {
                     if (*p == '"') { ldq = false; p++; continue; }
                 } else if (*p == '\'') { lsq = true; p++; continue; }
