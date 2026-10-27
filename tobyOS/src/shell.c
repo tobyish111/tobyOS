@@ -21590,7 +21590,9 @@ static void cmd_type(int argc, char **argv) {
                  * names the file standing behind it. */
                 else if (*c == 'f') f_f = true;
                 else {
+                    /* bash's builtin_usage after the error (type.tests) */
                     kprintf("type: -%c: invalid option\n", *c);
+                    kprintf_raw("type: usage: type [-afptP] name [name ...]\n");
                     shell_set_status(2);
                     return;
                 }
@@ -21601,11 +21603,9 @@ static void cmd_type(int argc, char **argv) {
         first = i; break;
     }
     shell_set_status(0);
-    if (first >= argc) {
-        shell_printf("usage: type [-atpP] NAME [NAME...]\n");
-        shell_set_status(1);
-        return;
-    }
+    /* NO NAME IS NO ERROR: bash's `type` says nothing and returns 0. tsh
+     * printed a usage of its own words on stdout, status 1. */
+    if (first >= argc) return;
 
     for (int i = first; i < argc; i++) {
         const char *name = argv[i];
