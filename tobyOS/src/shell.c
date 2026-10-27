@@ -22045,6 +22045,11 @@ static int test_unary(const char *op, const char *operand) {
     }
 
     char op2 = op[1];
+    /* AN EMPTY NAME NAMES NO FILE (stat("") is ENOENT): canonicalized, ""
+     * was the current directory, so `[ -d "" ]`, `-e`, `-r`, `-w`, `-x`,
+     * `-s`, `-O` and `-G` were all true -- and `[ -d "$dir" ]` took the
+     * wrong branch for an unset dir (bash's test.tests). */
+    if (!operand[0]) return 1;
     char resolved[VFS_PATH_MAX];
     if (shell_canonicalize_path(operand, resolved, sizeof(resolved)) < 0)
         return 1;
