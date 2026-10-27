@@ -17024,7 +17024,19 @@ static int shell_line_incomplete(const char *s) {
         }
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
-        if (*p == '#' && (p == s || is_space(p[-1]))) break;   /* comment */
+        /* A COMMENT ENDS AT ITS NEWLINE, not at the end of the text: the
+         * reader asks again of the lines joined so far, and a `#` inside a
+         * `"$( )"` ended the scan with the string still open --
+         *
+         *     echo "$(echo g # its
+         *     )"
+         *
+         * was never complete, and every following line was glued onto it. */
+        if (*p == '#' && (p == s || is_space(p[-1]) || p[-1] == ';' ||
+                          p[-1] == '&' || p[-1] == '|' || p[-1] == '(')) {
+            while (p[1] && p[1] != '\n') p++;
+            continue;
+        }
     }
     if (in_sq || in_dq) return 1;
     /* A substitution left open keeps whatever quote it suspended open too:
@@ -17886,6 +17898,22 @@ procsub_word:;
                 else if (*q == ']' && --bd == 0) break;
             }
             if (bd == 0 && *q == ']') { p = q + 1; continue; }
+        }
+        if (nest > 0 && d == '#' && nest - 1 < (int)sizeof st->nest_kind &&
+            st->nest_kind[nest - 1] == 'c' &&
+            (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\n' || p[-1] == '(' ||
+             p[-1] == ';' || p[-1] == '|' || p[-1] == '&')) {
+            /* A COMMENT INSIDE `$( )` or `<( )` runs to the end of its line,
+             * as one outside does: its text is not shell.
+             *
+             *     x=$(echo a # it's a comment
+             *     )
+             *
+             * Read as words, the apostrophe opened a string that never
+             * closed, and the reader ran to the end of the file. Not in
+             * `${ }` (`${#x}`) or `$(( ))`, whose kinds are not 'c'. */
+            while (*p && *p != '\n') p++;
+            continue;
         }
         if (nest > 0) {
             /* A `case` PATTERN'S `)` IS NOT A NESTING PAREN.
@@ -27511,6 +27539,18 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
             if (cmd && pos + 2 >= cmd_cap) return -1;
             CS_TAKE();
             CS_TAKE();
+            continue;
+        }
+        /* A COMMENT runs to the end of its line, copied as it is: its
+         * apostrophe opens nothing -- `"$(echo g # it's` and `)"` on the
+         * next line was a "bad command substitution" (see the scanner's). */
+        if (*p == '#' && (p == sub_start || p[-1] == ' ' || p[-1] == '\t' ||
+                          p[-1] == '\n' || p[-1] == ';' || p[-1] == '|' ||
+                          p[-1] == '&' || p[-1] == '(')) {
+            while (*p && *p != '\n') {
+                if (cmd && pos + 1 >= cmd_cap) return -1;
+                CS_TAKE();
+            }
             continue;
         }
         if (*p == '\'') {
