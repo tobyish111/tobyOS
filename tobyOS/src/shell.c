@@ -1501,6 +1501,7 @@ static const char *g_bsub_unit;
 static int g_bsub_unit_kind;
 static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
+static int sh_drop_empty_at_quotes(const char *w, struct shell_sb *out);
 static int shell_word_tilde(struct shell_sb *wb);
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
@@ -3594,6 +3595,11 @@ static bool sh_ifs_is_sep(char c) {
  * elements, not zero. Returns -1 on error. */
 static int sh_array_store_expanded(const char *name, const char *ex,
                                    bool split, bool keep_empty, long *next) {
+    /* the quotes of a "@" expansion that produced nothing are no quoted
+     * null here either: a=(${x+"$@" "$@"}) with no parameters is empty */
+    SH_SB(exd);
+    if (sh_drop_empty_at_quotes(ex, &exd) < 0) return -1;
+    ex = exd.p;
     /* A field is a piece of `ex`, so ex's length always holds one. It was a
      * 512-byte array that cut every longer element short without a word. */
     SH_SB(fieldb);
@@ -3636,9 +3642,10 @@ static int sh_array_store_expanded(const char *name, const char *ex,
         }
         /* Marks and no text at all: every expansion in the word produced
          * nothing. No element -- unless a quoted null was written, which is
-         * one empty element, exactly as on the argv side. */
+         * one empty element, exactly as on the argv side -- the quotes of
+         * a ${x+WORD}'s word included, a=(${x+"$@"''}) */
         if (marks > 0 && real == 0) {
-            if (keep_empty && shell_word_has_quoted_null(ex)) {
+            if (shell_word_has_quoted_null(ex)) {
                 if (sh_array_set(name, (*next)++, "") < 0) return -1;
             }
             return 0;
@@ -28590,6 +28597,39 @@ static int sh_put_join_value(struct shell_sb *b, const char *value) {
     return sb_puts(b, value);
 }
 
+/* The expanded WORD of a ${x-WORD} or ${x+WORD} taken, into the word
+ * (finding 297). Two things bash does that the plain copy did not:
+ *
+ *     set --; x=x
+ *     n "${x+"$@"}"             bash: 1 (one empty word)    tsh: 0
+ *     set -- p q
+ *     n "$@${x+"$@"}"           bash: <p> <qp> <q>           tsh: 4 words
+ *
+ * Inside double quotes the substitution is a string, and a WORD whose "@"
+ * expansions all produced nothing is the empty string -- one empty element,
+ * not none (only "$@" itself, written in the double quotes, vanishes). And
+ * the WORD was built on its own, so its first field mark took no notice of
+ * a "@" expansion before it in the word: that seam joins (S3). */
+static int sh_put_param_word(struct shell_sb *b, const char *ew) {
+    const char *firstm = 0;
+    bool only_marks = true;
+    for (const char *q = ew; *q; q++) {
+        if (*q == SHELL_DATA_ESC && q[1]) { q++; only_marks = false; continue; }
+        if (*q == SHELL_ARG_MARK) { if (!firstm) firstm = q; continue; }
+        if (*q != SHELL_ARG_JOIN && *q != SHELL_NOSPLIT_MARK) only_marks = false;
+    }
+    if (!firstm) return sb_puts(b, ew);
+    if (g_dq_depth > 0 && only_marks) {
+        if (sh_put_lead_mark(b) < 0) return -1;
+        return sb_putc(b, SHELL_EMPTY_ELEM);
+    }
+    if (!sh_sb_has_argmark(b)) return sb_puts(b, ew);
+    if (sb_putmem(b, ew, (size_t)(firstm - ew)) < 0 ||
+        sb_putc(b, SHELL_ARG_JOIN) < 0)
+        return -1;
+    return sb_puts(b, firstm + 1);
+}
+
 static int shell_append_positional_join(struct shell_sb *b,
                                         bool star) {
     if (!star) {                                /* "$@" -- one word each */
@@ -31777,7 +31817,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_WORD_TILDE();
         if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
-        return sb_puts(b, ewb.p);
+        return sh_put_param_word(b, ewb.p);
     case '=':
         if (!missing)
             return is_join ? sh_put_join_value(b, value)
@@ -31844,11 +31884,17 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         shell_set_status(1);
         return -1;
     case '+':
-        if (missing) return 0;
+        /* "${@+x}" and "${@:+x}" with no parameters are "$@" -- no word at
+         * all (bash: 0), where an unset scalar's is the empty string; the
+         * array spelling, "${e[@]+x}", already said so
+         * (shell_expand_array_test_op) */
+        if (missing)
+            return (!is_set && name[0] == '@' && !name[1])
+                       ? sh_put_lead_mark(b) : 0;
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
         SH_WORD_TILDE();
         if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
-        return sb_puts(b, ewb.p);
+        return sh_put_param_word(b, ewb.p);
     default:
         return -1;
     }
@@ -36466,6 +36512,56 @@ static bool shell_word_has_quoted_null(const char *w) {
     return false;
 }
 
+/* A "@" EXPANSION THAT PRODUCED NOTHING TAKES ITS QUOTES WITH IT (finding
+ * 297). bash keeps an empty field for a quoted null, and the quotes of a
+ * "$@" with no parameters are not one -- in the word of a ${x+WORD} as
+ * much as at the top level:
+ *
+ *     set --; x=x
+ *     n ${x+"$@" "$@"}      bash: 0      tsh: 2
+ *     n ${x+a "$@"}         bash: 1      tsh: 2
+ *
+ * Once the marks are resolved a "$@"'s two quote marks stand side by side,
+ * and the splitter read them as `""`. A quoted span holding only field
+ * marks -- an AM or a JOIN with no element after it, every expansion in it
+ * empty -- loses its quote marks here; the field marks stay, so a seam
+ * still joins and a field still starts where it did. */
+static int sh_drop_empty_at_quotes(const char *w, struct shell_sb *out) {
+    sb_truncate(out, 0);
+    bool open = false, only_marks = false;
+    size_t open_at = 0, marks = 0;
+    for (const char *q = w; *q; q++) {
+        if (*q == SHELL_DATA_ESC && q[1]) {
+            if (sb_putc(out, *q) < 0 || sb_putc(out, q[1]) < 0) return -1;
+            q++;
+            only_marks = false;
+            continue;
+        }
+        if (*q == SHELL_NOSPLIT_MARK) {
+            if (!open) {
+                open = true;
+                only_marks = true;
+                marks = 0;
+                open_at = out->len;
+            } else {
+                open = false;
+                if (only_marks && marks > 0) {
+                    memmove(out->p + open_at, out->p + open_at + 1,
+                            out->len - open_at - 1);
+                    out->len--;
+                    out->p[out->len] = '\0';
+                    continue;
+                }
+            }
+        } else if (open) {
+            if (*q == SHELL_ARG_MARK || *q == SHELL_ARG_JOIN) marks++;
+            else only_marks = false;
+        }
+        if (sb_putc(out, *q) < 0) return -1;
+    }
+    return 0;
+}
+
 static int shell_split_add(struct shell_pipeline *pl, struct shell_simple *cur,
                            const char *word, bool quoted);
 static int shell_add_marked_words(struct shell_pipeline *pl,
@@ -36477,6 +36573,15 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
         first++;
     }
     if (!*first) return 0;                       /* no marker: normal path */
+
+    SH_SB(dropped);
+    if (sh_drop_empty_at_quotes(word, &dropped) < 0) return -1;
+    word = dropped.p;
+    first = word;
+    while (*first != SHELL_ARG_MARK) {
+        if (*first == SHELL_DATA_ESC && first[1]) first++;
+        first++;
+    }
 
     size_t prefix_len = (size_t)(first - word);
     SH_SB(tmp);
@@ -36577,8 +36682,10 @@ static int shell_add_marked_words(struct shell_pipeline *pl,
             emitted++;
         }
     }
-    /* Nothing came out, but a quoted null was written: one empty field. */
-    if (emitted == 0 && quoted && shell_word_has_quoted_null(word)) {
+    /* Nothing came out, but a quoted null was written: one empty field --
+     * quotes in the word of a ${x+WORD} as well, which do not make the
+     * word `quoted` (`${x+"$@"''}`: bash 1). */
+    if (emitted == 0 && shell_word_has_quoted_null(word)) {
         char *saved = 0;
         if (shell_pipeline_save_word(pl, "", &saved) < 0) return -1;
         if (shell_add_one_arg(pl, cur, saved, true) < 0) return -1;
