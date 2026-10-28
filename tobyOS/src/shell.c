@@ -17776,9 +17776,22 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
              * that opens a command nesting, as `$(` does. */
             goto procsub_word;
         }
+        const char *op = p;
         while (*p == '<' || *p == '>' || *p == '&' || *p == '-') p++;
-        st->redir = true; st->prev_word_cmd = false;
-        st->no_sep = true;   /* a filename must follow */
+        /* `N>&-` AND `N<&-` ARE WHOLE: the `-` is the target, and the line
+         * may end after it (finding 300). Taken for an operator still
+         * waiting for its filename, it had the reader join the next line
+         * to it with a blank inside a compound --
+         *
+         *     {
+         *         : 4>&-              ran `: 4>&- echo c >&4`: nothing
+         *         echo c >&4          printed, "4: Bad file descriptor"
+         *     }
+         *
+         * -- where bash closes fd 4 for the `:` alone (redir7.sub). */
+        bool closes = p - op >= 2 && p[-1] == '-' && p[-2] == '&';
+        st->redir = !closes; st->prev_word_cmd = false;
+        st->no_sep = !closes;   /* a filename must follow */
         *pp = p;
         return;
     }
