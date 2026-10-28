@@ -19963,7 +19963,22 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     return last;
 }
 
+static struct file *shell_magic_fd_file(const char *path);
 static int shell_run_script_path(const char *path_arg, bool run_exit_trap) {
+    /* `echo cmd | . /dev/stdin`: the pipe end is in tsh's fd table, not at
+     * the process's fd 0, so opening the path read the terminal and hung
+     * (finding 291). bash's `.` there reads the pipe. */
+    struct file *mf = shell_magic_fd_file(path_arg);
+    if (mf) {
+        SH_SB(text);
+        for (;;) {
+            char chunk[1024];
+            long got = file_read(mf, chunk, sizeof chunk);
+            if (got <= 0) break;
+            if (sb_putmem(&text, chunk, (size_t)got) < 0) return 1;
+        }
+        return shell_run_script_text(text.p, run_exit_trap);
+    }
     char path[VFS_PATH_MAX];
     if (shell_resolve_path_arg(path_arg, path, sizeof(path), "sh") < 0) return 1;
     void *buf = 0;
@@ -37755,6 +37770,21 @@ static struct file *shell_builtin_fd(int n) {
     if (g_builtin_fds && n < g_builtin_fds->n && g_builtin_fds->fd[n])
         return g_builtin_fds->fd[n];
     return n < g_shell_fd_cap ? g_shell_fd[n] : 0;
+}
+
+/* The shell's own descriptor that /dev/stdin, /dev/fd/N (and the rest of
+ * test_magic_fd's names) mean for a builtin, or 0 when the process's own
+ * descriptor is the one -- then the path itself is read. fd 0 is chosen
+ * as `read` chooses it: the builtin's redirection, the pipe, the shell's. */
+static struct file *shell_magic_fd_file(const char *path) {
+    int n = test_magic_fd(path);
+    if (n < 0) return 0;
+    struct file *f = 0;
+    if (g_builtin_fds && n < g_builtin_fds->n) f = g_builtin_fds->fd[n];
+    if (!f && n == 0) f = g_shell_in;
+    if (!f && n < g_shell_fd_cap) f = g_shell_fd[n];
+    if (f && f->kind == FILE_KIND_NULL) return 0;
+    return f;
 }
 
 /* Collect the descriptors above 2 that a command has open, as the child-fd
