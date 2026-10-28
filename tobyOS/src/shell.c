@@ -21879,6 +21879,26 @@ static bool test_is_int(const char *s, long *out) {
  * "test: X: integer expression expected" (it was "syntax error near"). */
 static const char *s_test_badint;
 
+/* WHAT WENT WRONG, in bash's words, kept where the parser first found
+ * it: tsh said "syntax error near 'X'" for all of these (finding 291).
+ *   UNARY    "X: unary operator expected"    two arguments, X not one
+ *   BINARY   "X: binary operator expected"   three, X (the middle) not one
+ *   ARG      "argument expected"             an operator or `(` at the end
+ *   PAREN    "`)' expected[, found X]"        a group not closed -- `[`'s
+ *            own `]` is what it finds there
+ *   EXTRA    "syntax error: `X' unexpected"  left over, X starting `-`
+ *   TOOMANY  "too many arguments"            left over, anything else */
+enum { TEST_E_NONE, TEST_E_UNARY, TEST_E_BINARY, TEST_E_ARG, TEST_E_PAREN,
+       TEST_E_EXTRA, TEST_E_TOOMANY };
+static int s_test_ek;
+static const char *s_test_etok;
+static bool s_test_bracket;
+static void test_err(int kind, const char *tok) {
+    if (s_test_ek != TEST_E_NONE) return;
+    s_test_ek = kind;
+    s_test_etok = tok;
+}
+
 /* WHY THIS IS A PARSER AND NOT A CHAIN OF strcmp()s
  *
  * `test` has no grammar you can read off its arguments left to right: the
@@ -22272,7 +22292,11 @@ struct test_parse {
 static int test_expr(struct test_parse *tp);
 
 static int test_term(struct test_parse *tp) {
-    if (tp->pos >= tp->ac) { tp->err = true; return 1; }
+    if (tp->pos >= tp->ac) {
+        test_err(TEST_E_ARG, 0);
+        tp->err = true;
+        return 1;
+    }
     const char *a = tp->av[tp->pos];
 
     if (strcmp(a, "!") == 0) {
@@ -22285,6 +22309,8 @@ static int test_term(struct test_parse *tp) {
         int r = test_expr(tp);
         if (tp->err) return 1;
         if (tp->pos >= tp->ac || strcmp(tp->av[tp->pos], ")") != 0) {
+            test_err(TEST_E_PAREN, tp->pos < tp->ac ? tp->av[tp->pos]
+                                   : s_test_bracket ? "]" : 0);
             tp->err = true;
             return 1;
         }
@@ -22333,7 +22359,12 @@ static int test_expr(struct test_parse *tp) {
 static int test_parse_all(int argc, char **argv) {
     struct test_parse tp = { argv, argc, 0, false };
     int r = test_expr(&tp);
-    if (tp.err || tp.pos != tp.ac) return -1;
+    if (tp.err) return -1;
+    if (tp.pos != tp.ac) {
+        const char *left = tp.av[tp.pos];
+        test_err(left[0] == '-' ? TEST_E_EXTRA : TEST_E_TOOMANY, left);
+        return -1;
+    }
     return r;
 }
 
@@ -22342,6 +22373,7 @@ static int test_parse_all(int argc, char **argv) {
 static int test_two(char **a) {
     if (strcmp(a[0], "!") == 0) return test_one(a[1]) == 0 ? 1 : 0;
     if (test_is_unary_op(a[0])) return test_unary(a[0], a[1]);
+    test_err(TEST_E_UNARY, a[0]);
     return -1;                       /* caller reports the syntax error */
 }
 
@@ -22363,12 +22395,16 @@ static int test_three(char **a) {
         return r < 0 ? -1 : (r == 0 ? 1 : 0);
     }
     if (strcmp(a[0], "(") == 0 && strcmp(a[2], ")") == 0) return test_one(a[1]);
+    test_err(TEST_E_BINARY, a[1]);
     return -1;
 }
 
 static void cmd_test(int argc, char **argv) {
     bool bracket = (argc > 0 && strcmp(argv[0], "[") == 0);
     s_test_badint = 0;
+    s_test_ek = TEST_E_NONE;
+    s_test_etok = 0;
+    s_test_bracket = bracket;
     int end = argc;
     if (bracket) {
         if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) {
@@ -22414,12 +22450,24 @@ static void cmd_test(int argc, char **argv) {
     }
 
     if (r < 0) {
+        const char *who = bracket ? "[" : "test";
+        const char *t = s_test_etok ? s_test_etok : "";
         if (s_test_badint)
-            kprintf("%s: %s: integer expression expected\n", bracket ? "[" : "test",
-                    s_test_badint);
+            kprintf("%s: %s: integer expression expected\n", who, s_test_badint);
+        else if (s_test_ek == TEST_E_UNARY)
+            kprintf("%s: %s: unary operator expected\n", who, t);
+        else if (s_test_ek == TEST_E_BINARY)
+            kprintf("%s: %s: binary operator expected\n", who, t);
+        else if (s_test_ek == TEST_E_ARG)
+            kprintf("%s: argument expected\n", who);
+        else if (s_test_ek == TEST_E_PAREN && s_test_etok)
+            kprintf("%s: `)' expected, found %s\n", who, t);
+        else if (s_test_ek == TEST_E_PAREN)
+            kprintf("%s: `)' expected\n", who);
+        else if (s_test_ek == TEST_E_EXTRA)
+            kprintf("%s: syntax error: `%s' unexpected\n", who, t);
         else
-            kprintf("%s: syntax error near '%s'\n", bracket ? "[" : "test",
-                    n > 0 ? a[n - 1] : "");
+            kprintf("%s: too many arguments\n", who);
         shell_set_status(2);
         return;
     }
