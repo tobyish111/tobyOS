@@ -22209,8 +22209,18 @@ static int test_unary(const char *op, const char *operand) {
     if (op2 == 'u') return (st.mode & 04000u) ? 0 : 1;
     if (op2 == 'g') return (st.mode & 02000u) ? 0 : 1;
     if (op2 == 'k') return (st.mode & 01000u) ? 0 : 1;
-    if (op2 == 'N') return 1;
-    if (op2 == 'G' || op2 == 'O') return 0;
+    /* -N: modified since last read -- the mtime later than the atime, to
+     * the nanosecond, as bash's; -O and -G: owned by the effective user
+     * and group (the group alone, not the supplementary ones). They were
+     * false and true for every file (test.tests; finding 291). */
+    if (op2 == 'N')
+        return (st.mtime > st.atime ||
+                (st.mtime == st.atime && st.mtime_ns > st.atime_ns)) ? 0 : 1;
+    if (op2 == 'O' || op2 == 'G') {
+        struct proc *me = current_proc();
+        uint32_t id = me ? (uint32_t)(op2 == 'O' ? me->uid : me->gid) : 0u;
+        return (op2 == 'O' ? st.uid : st.gid) == id ? 0 : 1;
+    }
     if (op2 == 'r') return test_access_ok(&st, 4u) ? 0 : 1;
     if (op2 == 'w') return test_access_ok(&st, 2u) ? 0 : 1;
     if (op2 == 'x') return test_access_ok(&st, 1u) ? 0 : 1;
