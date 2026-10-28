@@ -33160,9 +33160,26 @@ static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
  * substitution produced. Consumes the whole construct, parens balanced and
  * quotes respected, starts the command, and appends the path to the word
  * buffer -- token text is a pointer INTO that buffer, never a copy. */
+static int shell_procsub_run_at(const char **pp, bool input,
+                                char *path, size_t cap);
 static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
                                   const char **pp, bool input,
                                   struct shell_words *words) {
+    char path[32];
+    if (shell_procsub_run_at(pp, input, path, sizeof path) < 0) return -1;
+    char *start = words_store(words, path, strlen(path));
+    if (!start) return -1;
+    /* Quoted: the path is a finished word. Nothing in it should be split on
+     * IFS or matched against the filesystem. */
+    return shell_emit_token(tok, ntok, SH_TOK_WORD, start, true);
+}
+
+/* The `<(cmd)` or `>(cmd)` at *pp: its body read to the matching `)`,
+ * the command started, its /dev/fd path in `path`, *pp past the `)`. A
+ * word's own start (shell_tokenize_procsub) and its middle -- `f=<(cmd)`,
+ * `a<(cmd)b`, which bash expands in place -- both come here. */
+static int shell_procsub_run_at(const char **pp, bool input,
+                                char *path, size_t cap) {
     const char *body = *pp + 2;            /* past the `<(` */
     const char *q = body;
     int depth = 1;
@@ -33198,16 +33215,9 @@ static int shell_tokenize_procsub(struct shell_tokv *tok, int *ntok,
     memcpy(text, body, blen);
     text[blen] = '\0';
 
-    char path[32];
-    bool ok = shell_procsub_make(text, input, path, sizeof path);
+    bool ok = shell_procsub_make(text, input, path, cap);
     kfree(text);
     if (!ok) return -1;
-
-    char *start = words_store(words, path, strlen(path));
-    if (!start) return -1;
-    /* Quoted: the path is a finished word. Nothing in it should be split on
-     * IFS or matched against the filesystem. */
-    if (shell_emit_token(tok, ntok, SH_TOK_WORD, start, true) < 0) return -1;
     *pp = q + 1;
     return 0;
 }
@@ -33492,8 +33502,27 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          * and a `|`, and neither ends the word. */
         int eg_depth = 0;
         while (*p && (sub_depth > 0 || eg_depth > 0 ||
-                      (!is_space(*p) && !shell_operator_char(*p)))) {
+                      (!is_space(*p) && !shell_operator_char(*p)) ||
+                      ((*p == '<' || *p == '>') && p[1] == '(' &&
+                       p > raw_word_start))) {
             got = true;
+            /* `<(cmd)` INSIDE A WORD IS EXPANDED THERE: `f=<(cmd)` assigns
+             * the path and `a<(cmd)b` is one word, as bash's lexer reads
+             * them. tsh ended the word at the `<`, so `f=<(cmd)` was the
+             * assignment `f=` and then a command named /dev/fd/63
+             * (finding 291). At a word's start the token is the path. */
+            if ((*p == '<' || *p == '>') && p[1] == '(' &&
+                sub_depth == 0 && eg_depth == 0) {
+                SH_LIT_CLOSE();
+                char ppath[32];
+                if (shell_procsub_run_at(&p, *p == '<', ppath, sizeof ppath) < 0)
+                    return -1;
+                if (sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0 ||
+                    sb_puts(&wb, ppath) < 0 ||
+                    sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0)
+                    return -1;
+                continue;
+            }
             /* A SUBSCRIPT IN ASSIGNMENT POSITION IS PART OF THE WORD,
              * SPACES AND ALL.
              *
