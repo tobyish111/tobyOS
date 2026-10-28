@@ -17433,6 +17433,13 @@ static const char *shell_scan_hd_body(struct shell_scan *st, const char *p) {
  * backticks, so nothing inside them can be mistaken for structure. */
 static void shell_scan_token(struct shell_scan *st, const char **pp) {
     const char *p = *pp;
+    /* THE TEXT'S START, for the looks back a byte (`=(` is an array
+     * literal, `name (`): shell_scan_line sets it, and the walkers that
+     * call this directly -- the list splitter among them -- never did, so
+     * there `foo=(for x)` was a subshell whose `for` stayed open and
+     * `foo=(for x); echo "${foo[@]}"` ran as one unsplit line, its echo
+     * expanded before the assignment (finding 291). */
+    if (!st->start) st->start = p;
     char c = *p;
     bool was_func_hdr = st->func_hdr;
     st->func_hdr = false;
@@ -17829,7 +17836,9 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
         }
         p++;
         st->paren++;
-        st->cmd_pos = true; st->prev_word_cmd = false; st->redir = false;
+        /* an array literal's `(` starts words, not a command */
+        st->cmd_pos = !(st->in_array_lit && st->paren == st->array_lit_depth);
+        st->prev_word_cmd = false; st->redir = false;
         st->assign_prefix = false; st->decl_util = false;
         st->no_sep = true;
         st->cmd_seen = false;          /* `( ; )` needs a command too */
@@ -18214,6 +18223,15 @@ procsub_word:;
      * either: the word's head was already counted on its own line. */
     if (resumed_quote) return;
 
+    /* AN ARRAY LITERAL'S WORDS ARE WORDS, reserved or not: bash's
+     * `foo=(for case if then else)` has five elements, where tsh opened a
+     * `for` it never closed ("unterminated compound"; finding 291). */
+    if (st->in_array_lit && st->paren == st->array_lit_depth) {
+        st->cmd_pos = false; st->prev_word_cmd = false;
+        st->no_sep = false;
+        return;
+    }
+
     /* After `coproc` the word is a NAME or the command; after `coproc NAME`
      * a compound command may start. tsh had no `coproc` here: `coproc NAMED
      * { read x; echo "$x"; }` was cut at its first `;` (logs/b12 p80). */
@@ -18519,7 +18537,8 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
          * a word in command position, outside quotes, nesting and `[[ ]]`,
          * can be a reserved word at all. */
         bool plain = st->cmd_pos && !st->assign_prefix && !st->dbracket &&
-                     st->nest == 0 && !st->in_sq && !st->in_dq;
+                     st->nest == 0 && !st->in_sq && !st->in_dq &&
+                     !(st->in_array_lit && st->paren == st->array_lit_depth);
         size_t wn = 0;
         while (before[wn] && !shell_sep_or_blank(before[wn])) wn++;
 #define KW(lit) (plain && shell_word_eq(before, wn, lit))
