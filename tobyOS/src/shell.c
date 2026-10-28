@@ -16371,6 +16371,83 @@ struct shell_heredoc_spec {
 
 static int shell_parse_command_subst(const char **pp, char *cmd, size_t cmd_cap);
 
+/* THE WALKERS' ONE RULE FOR `${ }`: the `}` that closes the `${` at P, as
+ * the expander finds it (shell_expand_var) -- strings inside it are its
+ * own, a `$( )` or `${ }` in it is one unit, a backslash quotes, and a bare
+ * `{` does not nest (bash closes at the first `}`). A `'` quotes, except
+ * under `set -o posix` when the `${` is inside double quotes (IN_DQ).
+ * The walkers that read ahead of the parser (the keyword searches, the
+ * subshell's `)` search) took the `"` inside "${x//"'"/}" for the end of
+ * the outer string, and the `'` after it opened one that never closed
+ * (finding 291). 0 when it never closes. */
+static const char *shell_dq_unit_end(const char *p);
+static const char *shell_brace_unit_end(const char *p, bool in_dq) {
+    bool sq = false, sqa = false, dq = false;
+    for (p += 2; *p; p++) {
+        char c = *p;
+        if (sq) {
+            if (sqa && c == '\\' && p[1]) { p++; continue; }
+            if (c == '\'') sq = sqa = false;
+            continue;
+        }
+        if (dq) {
+            if (c == '\\' && p[1]) { p++; continue; }
+            if (c == '"') { dq = false; continue; }
+            if (c == '$' || c == '`') {
+                const char *e = shell_dq_unit_end(p);
+                if (e) p = e;
+            }
+            continue;
+        }
+        if (c == '\\' && p[1]) { p++; continue; }
+        if (c == '"') { dq = true; continue; }
+        bool sq_plain = g_opt_posix && in_dq;
+        if (c == '$' && p[1] == '\'' && !sq_plain) { sq = sqa = true; p++; continue; }
+        if (c == '\'' && !sq_plain) { sq = true; continue; }
+        if (c == '$' && p[1] == '{') {
+            const char *e = shell_brace_unit_end(p, in_dq);
+            if (!e) return 0;
+            p = e;
+            continue;
+        }
+        if ((c == '$' && p[1] == '(') || c == '`') {
+            const char *e = shell_dq_unit_end(p);
+            if (!e) return 0;
+            p = e;
+            continue;
+        }
+        if (c == '}') return p;
+    }
+    return 0;
+}
+
+/* The LAST byte of the `$( )`, `$(( ))`, `${ }` or `...` that starts at P
+ * inside double quotes -- each has quotes of its own -- or 0 when P starts
+ * none of them, or it never closes. */
+static const char *shell_dq_unit_end(const char *p) {
+    if (p[0] == '$' && p[1] == '{') return shell_brace_unit_end(p, true);
+    if (p[0] == '$' && p[1] == '(' && p[2] == '(') {
+        int d = 0;
+        for (const char *q = p + 1; *q; q++) {
+            if (*q == '(') d++;
+            else if (*q == ')' && --d == 0) return q;
+        }
+        return 0;
+    }
+    if (p[0] == '$' && p[1] == '(') {
+        const char *q = p;
+        return shell_parse_command_subst(&q, 0, 0) == 0 ? q - 1 : 0;
+    }
+    if (p[0] == '`') {
+        for (const char *q = p + 1; *q; q++) {
+            if (*q == '\\' && q[1]) { q++; continue; }
+            if (*q == '`') return q;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /* Find EVERY here-document operator on `line`, in the order their bodies
  * follow the line. Returns how many were found.
  *
@@ -16913,6 +16990,13 @@ static void shell_strip_comment_from(char *s, bool mid_word) {
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            /* a "$( )" or "${ }" is a unit: posix mode's
+             * "${IFS+"'"x ~ x'}'x"'}"x}" #' lost its quoted `#'` as a
+             * comment (posixexp2.tests 28; shell_dq_unit_end) */
+            {
+                const char *e = shell_dq_unit_end(p);
+                if (e) { p = (char *)e; continue; }
+            }
             if (*p == '"') in_dq = false;
             continue;
         }
@@ -17115,6 +17199,7 @@ static int shell_line_incomplete(const char *s) {
      * is a COMMAND with its own quotes; they are suspended and restored. */
     bool sq_at[16], dq_at[16];
     bool ar_at[16];            /* the level is `$(( ))`: `<<` is a shift */
+    bool v_at[16];             /* the level is `${ }`, not `$( )` */
     char hdd[128];             /* a here-document's delimiter in a `$( )` */
     bool hd_pend = false, hd_tabs = false;
     int nest = 0;
@@ -17127,10 +17212,15 @@ static int shell_line_incomplete(const char *s) {
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
-            if (*p == '$' && p[1] == '(' && nest < 16) {
+            /* `$( )` and `${ }` inside the quotes have quotes of their own
+             * -- the scanner's rule: "'${test//"'"/}'" read its inner `"`
+             * as the outer one's end and glued the next line on (quote1.sub;
+             * finding 291) */
+            if (*p == '$' && (p[1] == '(' || p[1] == '{') && nest < 16) {
                 sq_at[nest] = in_sq;
                 dq_at[nest] = in_dq;
-                ar_at[nest] = (p[2] == '(');
+                ar_at[nest] = (p[1] == '(' && p[2] == '(');
+                v_at[nest] = (p[1] == '{');
                 nest++;
                 in_sq = false;
                 in_dq = false;
@@ -17166,16 +17256,40 @@ static int shell_line_incomplete(const char *s) {
             p++;                                /* escapes the next character */
             continue;
         }
-        if (*p == '$' && p[1] == '(' && nest < 16) {
+        if (*p == '$' && (p[1] == '(' || p[1] == '{') && nest < 16) {
             sq_at[nest] = in_sq;
             dq_at[nest] = in_dq;
-            ar_at[nest] = (p[2] == '(');
+            ar_at[nest] = (p[1] == '(' && p[2] == '(');
+            v_at[nest] = (p[1] == '{');
             nest++;
             in_sq = false;
             in_dq = false;
             p++;
             continue;
         }
+        /* inside `${ }` a `(` and a `{` are bytes and the first `}` ends
+         * it (as the scanner reads it); `set -o posix` makes a `'` there a
+         * byte too when the `${` is in double quotes */
+        bool in_v = nest > 0 && nest <= 16 && v_at[nest - 1];
+        /* a `...` in it is a unit: "${HOME:`echo }`}" is not closed by
+         * the `}` inside the backquotes (new-exp.tests) */
+        if (in_v && *p == '`') {
+            p++;
+            while (*p && *p != '`') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) break;
+            continue;
+        }
+        if (in_v && *p == '}') {
+            nest--;
+            in_sq = sq_at[nest];
+            in_dq = dq_at[nest];
+            continue;
+        }
+        if (in_v && (*p == '(' || *p == ')' || *p == '{')) continue;
+        if (in_v && g_opt_posix && dq_at[nest - 1] && *p == '\'') continue;
         /* A HERE-DOCUMENT INSIDE `$( )` (the scanner's hd_state): from the
          * next newline its body is text, to the line that is its
          * delimiter -- the line is incomplete until that line comes. Not in
@@ -18005,6 +18119,24 @@ procsub_word:;
                 p += 2;
                 continue;
             }
+            /* ...AND SO IS `${ }`: its word has quotes of its own, a `"`
+             * there opens a string inside the expansion -- bash's
+             * "'${test//"'"/}'" -- where reading on to the next `"` closed
+             * the outer one, and the `'` after it then swallowed the lines
+             * that followed (quote1.sub; finding 291). The `}` gives the
+             * outer state back. */
+            if (d == '$' && p[1] == '{') {
+                if (nest < (int)sizeof st->nest_kind) {
+                    st->nest_kind[nest] = 'v';
+                    st->nest_sq[nest] = sq;
+                    st->nest_dq[nest] = dq;
+                }
+                sq = false;
+                dq = false;
+                nest++;
+                p += 2;
+                continue;
+            }
             /* A BACKTICK INSIDE DOUBLE QUOTES IS A SEPARATE LEXICAL WORLD.
              *
              *     echo "123 `[[ $(echo \\" > $file) ]]` 456"
@@ -18043,10 +18175,16 @@ procsub_word:;
             continue;
         }
         if (d == '\\' && p[1]) { p += 2; continue; }
-        if (d == '$' && p[1] == '\'') {
+        /* `set -o posix`: in a `${ }` inside double quotes a single quote
+         * is an ordinary byte, matched or not -- "${IFS+'}'z}" ends at the
+         * first `}` (bash's POSIX mode; posixexp2.tests) */
+        bool sq_plain = g_opt_posix && nest > 0 &&
+                        nest - 1 < (int)sizeof st->nest_kind &&
+                        st->nest_kind[nest - 1] == 'v' && st->nest_dq[nest - 1];
+        if (d == '$' && p[1] == '\'' && !sq_plain) {
             sq = true; sq_ansi = true; p += 2; continue;
         }
-        if (d == '\'') { sq = true; p++; continue; }
+        if (d == '\'' && !sq_plain) { sq = true; p++; continue; }
         if (d == '"')  { dq = true; p++; continue; }
         if (d == '`') {
             if (nest > 0 && st->nest_kind[nest - 1] == 'b') {
@@ -18212,7 +18350,11 @@ procsub_word:;
              * file ("unterminated compound"). Braces still nest. */
             bool in_v = (nest - 1 < (int)sizeof st->nest_kind &&
                          st->nest_kind[nest - 1] == 'v');
-            if (in_v && (d == '(' || d == ')')) {
+            /* ...and so is a `{`: bash closes a `${ }` at its first `}`,
+             * so `${IFS+a{b}c}` is `a{b` then `c}` -- counting the `{`
+             * kept the expansion open and the reader ran to the end of
+             * the file (posixexp2.tests 15) */
+            if (in_v && (d == '(' || d == ')' || d == '{')) {
                 p++;
                 continue;
             }
@@ -18224,7 +18366,7 @@ procsub_word:;
                 /* Leaving the substitution restores the quote state it
                  * suspended -- see the note where it was pushed. */
                 if (nest >= 0 && nest < (int)sizeof st->nest_kind &&
-                    st->nest_kind[nest] == 'c') {
+                    (st->nest_kind[nest] == 'c' || st->nest_kind[nest] == 'v')) {
                     sq = st->nest_sq[nest];
                     dq = st->nest_dq[nest];
                 }
@@ -28884,6 +29026,10 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
                     if (shell_expand_backtick(&p, out) < 0) return -1;
                     continue;
                 }
+                /* a backslash-newline is a line continuation here as in
+                 * the tokenizer's quotes, both bytes gone: `${IFS+foo
+                 * "b\<newline>ar" baz}` is bar (posixexp2.tests 32 34) */
+                if (*p == '\\' && p[1] == '\n') { p += 2; continue; }
                 /* Inside double quotes a backslash only escapes these four. */
                 if (*p == '\\' && (p[1] == '"' || p[1] == '\\' ||
                                    p[1] == '$'  || p[1] == '`')) p++;
@@ -32284,6 +32430,32 @@ static bool shell_operator_char(char c) {
     return c == ';' || c == '&' || c == '|' || c == '<' || c == '>';
 }
 
+/* Do the first N bytes of a `${ }` expression name a parameter and then a
+ * pattern-removal operator, `#` `##` `%` `%%`? (A leading `#` is the
+ * length's.) */
+static bool sh_brace_pat_removal(const char *e, size_t n) {
+    size_t i = 0;
+    if (i < n && (e[i] == '#' || e[i] == '!') && i + 1 < n) i++;
+    if (i < n && (shell_var_start(e[i]))) {
+        while (i < n && shell_var_char(e[i])) i++;
+    } else if (i < n && ((e[i] >= '0' && e[i] <= '9') || e[i] == '@' ||
+                         e[i] == '*' || e[i] == '#' || e[i] == '?' ||
+                         e[i] == '$' || e[i] == '!' || e[i] == '-')) {
+        i++;
+    } else {
+        return false;
+    }
+    if (i < n && e[i] == '[') {              /* bounded: e is still filling */
+        int d = 0;
+        for (; i < n; i++) {
+            if (e[i] == '[') d++;
+            else if (e[i] == ']' && --d == 0) { i++; break; }
+        }
+        if (d != 0) return false;
+    }
+    return i < n && (e[i] == '#' || e[i] == '%');
+}
+
 static int shell_expand_var(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
     if (*p != '$') return sb_putc(b, *p++);
@@ -32412,12 +32584,19 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
                 continue;
             }
             if (c == '\\' && p[1]) { expr[n++] = *p++; expr[n++] = *p++; continue; }
-            if (c == '$' && p[1] == '\'') {
+            /* `set -o posix` inside double quotes: a single quote here is
+             * an ordinary byte and cannot hide a `}` -- "${IFS+'}'z}" is
+             * `'` then the text ''z}' -- unless the operator removes a
+             * pattern, where it still quotes (bash's POSIX mode;
+             * posixexp2.tests; finding 291) */
+            bool sq_plain = g_opt_posix && g_dq_depth > 0 &&
+                            !sh_brace_pat_removal(expr, n);
+            if (c == '$' && p[1] == '\'' && !sq_plain) {
                 sq = true; sq_ansi = true;
                 expr[n++] = *p++; expr[n++] = *p++;
                 continue;
             }
-            if (c == '\'') { sq = true; expr[n++] = *p++; continue; }
+            if (c == '\'' && !sq_plain) { sq = true; expr[n++] = *p++; continue; }
             if (c == '"')  { dq = true; expr[n++] = *p++; continue; }
             if (c == '`') {
                 expr[n++] = *p++;
@@ -41268,6 +41447,11 @@ static const char *shell_find_loop_do(const char *start, const char **after) {
             const char *q = p;
             if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
         }
+        /* ...and so is a `${ }` (shell_brace_unit_end) */
+        if (*p == '$' && p[1] == '{') {
+            const char *be = shell_brace_unit_end(p, in_dq);
+            if (be) { p = be; continue; }
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
@@ -41329,6 +41513,11 @@ static const char *shell_find_matching_done(const char *start,
         if (*p == '$' && p[1] == '(' && p[2] != '(') {
             const char *cq = p;
             if (shell_parse_command_subst(&cq, 0, 0) == 0) { p = cq - 1; continue; }
+        }
+        /* ...and so is a `${ }` (shell_brace_unit_end) */
+        if (*p == '$' && p[1] == '{') {
+            const char *be = shell_brace_unit_end(p, in_dq);
+            if (be) { p = be; continue; }
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
@@ -41405,6 +41594,11 @@ static const char *shell_find_kw_sep(const char *start, const char *kw,
             const char *q = p;
             if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
         }
+        /* ...and so is a `${ }` (shell_brace_unit_end) */
+        if (*p == '$' && p[1] == '{') {
+            const char *be = shell_brace_unit_end(p, dq);
+            if (be) { p = be; continue; }
+        }
         if (dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') dq = false;
@@ -41470,6 +41664,11 @@ static const char *shell_find_if_fi(const char *start, const char **after) {
             const char *q = p;
             if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
         }
+        /* ...and so is a `${ }` (shell_brace_unit_end) */
+        if (*p == '$' && p[1] == '{') {
+            const char *be = shell_brace_unit_end(p, in_dq);
+            if (be) { p = be; continue; }
+        }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
             if (*p == '"') in_dq = false;
@@ -41518,6 +41717,11 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
         if (*p == '$' && p[1] == '(' && p[2] != '(') {
             const char *q = p;
             if (shell_parse_command_subst(&q, 0, 0) == 0) { p = q - 1; continue; }
+        }
+        /* ...and so is a `${ }` (shell_brace_unit_end) */
+        if (*p == '$' && p[1] == '{') {
+            const char *be = shell_brace_unit_end(p, in_dq);
+            if (be) { p = be; continue; }
         }
         if (in_dq) {
             if (*p == '\\' && p[1]) { p++; continue; }
@@ -45366,10 +45570,18 @@ static bool shell_text_is_one_subshell(const char *text) {
         }
         if (in_double) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            {   /* a "$( )" or "${ }" is a unit (shell_dq_unit_end) */
+                const char *e = shell_dq_unit_end(p);
+                if (e) { p = e; continue; }
+            }
             if (*p == '"') in_double = false;
             continue;
         }
         if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && p[1] == '{') {
+            const char *e = shell_brace_unit_end(p, false);
+            if (e) { p = e; continue; }
+        }
         if (*p == '$' && p[1] == '\'') { in_single = in_ansi = true; p++; continue; }
         if (*p == '\'') { in_single = true; continue; }
         if (*p == '"') { in_double = true; continue; }
@@ -45431,12 +45643,23 @@ static bool shell_try_subshell_command(const char *src) {
                 p++;
                 continue;
             }
+            /* a "$( )" or "${ }" is a unit with quotes of its own: posix
+             * mode's (echo "${IFS+"'"x ~ x'}'x") was "expected ')'"
+             * (posixexp2.tests 28; finding 291) */
+            {
+                const char *e = shell_dq_unit_end(p);
+                if (e) { p = e; continue; }
+            }
             if (*p == '"') in_double = false;
             continue;
         }
         if (*p == '\\' && p[1]) {
             p++;
             continue;
+        }
+        if (*p == '$' && p[1] == '{') {
+            const char *e = shell_brace_unit_end(p, false);
+            if (e) { p = e; continue; }
         }
         /* `( echo $')\'' )` closed its quote at the backslash and found no
          * `)` after it: "subshell: expected ')'" ended the script. */
