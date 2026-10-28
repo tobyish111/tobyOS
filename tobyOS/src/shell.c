@@ -34709,6 +34709,8 @@ static bool shell_class_match(const char *name, size_t n, uint32_t c) {
         { "cntrl",  u < 0x20 || u == 0x7F },
         { "punct",  print && c != ' ' && !upper && !lower && !digit },
         { "xdigit", digit || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F') },
+        /* bash's own thirteenth: below 0x80 (posixpat.tests) */
+        { "ascii",  true },
     };
     for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
         if (strlen(t[i].nm) == n && strncmp(t[i].nm, name, n) == 0)
@@ -34752,6 +34754,80 @@ static size_t sh_pat_char(const char *p, const char *pend, uint32_t *cp,
     if (buf) memcpy(buf, raw, n);
     if (bl) *bl = n;
     return (size_t)(q - p);
+}
+
+/* COLLATING SYMBOLS AND EQUIVALENCE CLASSES (POSIX XBD 9.3.5): `[.x.]`
+ * names one collating element -- a character, or a name from the
+ * portable character set's table (XBD 6.1) -- and `[=x=]` the class of
+ * them that sort alike, which in the C locale is the character alone.
+ * tsh read the brackets and dots as members, so [[.a.]] and [[=b=]]
+ * matched nothing (bash's posixpat.tests; finding 291). */
+static const struct { const char *nm; unsigned char ch; } sh_coll_names[] = {
+    { "NUL", 0 }, { "SOH", 1 }, { "STX", 2 }, { "ETX", 3 }, { "EOT", 4 },
+    { "ENQ", 5 }, { "ACK", 6 }, { "alert", 7 }, { "BEL", 7 },
+    { "backspace", 8 }, { "tab", 9 }, { "newline", 10 },
+    { "vertical-tab", 11 }, { "form-feed", 12 }, { "carriage-return", 13 },
+    { "SO", 14 }, { "SI", 15 }, { "DLE", 16 }, { "DC1", 17 }, { "DC2", 18 },
+    { "DC3", 19 }, { "DC4", 20 }, { "NAK", 21 }, { "SYN", 22 }, { "ETB", 23 },
+    { "CAN", 24 }, { "EM", 25 }, { "SUB", 26 }, { "ESC", 27 }, { "IS4", 28 },
+    { "IS3", 29 }, { "IS2", 30 }, { "IS1", 31 }, { "space", ' ' },
+    { "exclamation-mark", '!' }, { "quotation-mark", '"' },
+    { "number-sign", '#' }, { "dollar-sign", '$' }, { "percent-sign", '%' },
+    { "ampersand", '&' }, { "apostrophe", '\'' },
+    { "left-parenthesis", '(' }, { "right-parenthesis", ')' },
+    { "asterisk", '*' }, { "plus-sign", '+' }, { "comma", ',' },
+    { "hyphen", '-' }, { "hyphen-minus", '-' }, { "period", '.' },
+    { "full-stop", '.' }, { "slash", '/' }, { "solidus", '/' },
+    { "zero", '0' }, { "one", '1' }, { "two", '2' }, { "three", '3' },
+    { "four", '4' }, { "five", '5' }, { "six", '6' }, { "seven", '7' },
+    { "eight", '8' }, { "nine", '9' }, { "colon", ':' }, { "semicolon", ';' },
+    { "less-than-sign", '<' }, { "equals-sign", '=' },
+    { "greater-than-sign", '>' }, { "question-mark", '?' },
+    { "commercial-at", '@' }, { "left-square-bracket", '[' },
+    { "backslash", '\\' }, { "reverse-solidus", '\\' },
+    { "right-square-bracket", ']' }, { "circumflex", '^' },
+    { "circumflex-accent", '^' }, { "underscore", '_' }, { "low-line", '_' },
+    { "grave-accent", '`' }, { "left-brace", '{' },
+    { "left-curly-bracket", '{' }, { "vertical-line", '|' },
+    { "right-brace", '}' }, { "right-curly-bracket", '}' }, { "tilde", '~' },
+    { "DEL", 127 },
+};
+
+/* The length of the `[.name.]` or `[=name=]` at q, brackets included, or
+ * 0 when q is not one or it never closes. The name has a character at
+ * least: `[.].]` is the symbol `]`. */
+static size_t sh_brk_sym_len(const char *q) {
+    if (q[0] != '[' || (q[1] != '.' && q[1] != '=')) return 0;
+    char d = q[1];
+    for (const char *e = q + 3; *e; e++)
+        if (e[0] == d && e[1] == ']') return (size_t)(e + 2 - q);
+    return 0;
+}
+
+/* The character the k-byte symbol at q names, in *cp; false for a name
+ * that is none -- `[.yyz.]` matches nothing and leaves a range it ends
+ * empty, as in bash. */
+static bool sh_brk_sym_char(const char *q, size_t k, uint32_t *cp) {
+    const char *nm = q + 2, *ne = q + k - 2;
+    size_t bl = 0;
+    if (sh_pat_char(nm, ne, cp, 0, &bl) == (size_t)(ne - nm)) return true;
+    size_t n = (size_t)(ne - nm);
+    for (size_t i = 0; i < sizeof sh_coll_names / sizeof sh_coll_names[0]; i++)
+        if (strlen(sh_coll_names[i].nm) == n &&
+            strncmp(sh_coll_names[i].nm, nm, n) == 0) {
+            *cp = sh_coll_names[i].ch;
+            return true;
+        }
+    return false;
+}
+
+/* The bytes of a range's END at q: a symbol, an escaped byte, or one
+ * character. */
+static size_t sh_brk_hi_len(const char *q, const char *qend) {
+    size_t k = sh_brk_sym_len(q);
+    if (k) return k;
+    uint32_t cp;
+    return sh_pat_char(q, qend, &cp, 0, 0);
 }
 
 static bool shell_glob_bracket(const char **pp, uint32_t c) {
@@ -34807,16 +34883,29 @@ static bool shell_glob_bracket(const char **pp, uint32_t c) {
             continue;
         }
         {
-            uint32_t lo;
-            size_t ln = sh_pat_char(p, pend, &lo, 0, 0);
-            if (p[ln] == '-' && p[ln + 1] && p[ln + 1] != ']') {
-                uint32_t hi;
-                size_t hn = sh_pat_char(p + ln + 1, pend, &hi, 0, 0);
-                if (lo <= c && c <= hi) matched = true;
-                p += ln + 1 + hn;
+            /* a member: one character, or a collating symbol, or an
+             * equivalence class -- which is never a range's start */
+            uint32_t lo = 0;
+            bool lok = true, equiv = false;
+            size_t ln = sh_brk_sym_len(p);
+            if (ln) {
+                equiv = (p[1] == '=');
+                lok = sh_brk_sym_char(p, ln, &lo);
+            } else {
+                ln = sh_pat_char(p, pend, &lo, 0, 0);
+            }
+            if (!equiv && p[ln] == '-' && p[ln + 1] && p[ln + 1] != ']') {
+                const char *h = p + ln + 1;
+                size_t hn = sh_brk_hi_len(h, pend);
+                uint32_t hi = 0;
+                bool hok = true;
+                if (sh_brk_sym_len(h)) hok = sh_brk_sym_char(h, hn, &hi);
+                else sh_pat_char(h, pend, &hi, 0, 0);
+                if (lok && hok && lo <= c && c <= hi) matched = true;
+                p = h + hn;
                 continue;
             }
-            if (lo == c) matched = true;
+            if (lok && lo == c) matched = true;
             p += ln;
         }
     }
@@ -35111,8 +35200,23 @@ static const char *shell_glob_bracket_end(const char *p) {
             q += 2;
             continue;
         }
-        if (q[1] == '-' && q[2] && q[2] != ']') { q += 3; continue; }
-        q++;
+        /* a collating symbol or an equivalence class, and a range from a
+         * symbol or to one, step for step as shell_glob_bracket reads
+         * them -- `[a-[.z.]]` ends at its last `]` */
+        {
+            size_t k = sh_brk_sym_len(q);
+            size_t lk = k ? k : 1;
+            bool equiv = k && q[1] == '=';
+            if (!equiv && q[lk] == '-' && q[lk + 1] && q[lk + 1] != ']') {
+                const char *h = q + lk + 1;
+                size_t hk = sh_brk_sym_len(h);
+                if (!hk) hk = ((*h == '\\' || *h == SHELL_GLOB_ESC ||
+                                *h == SHELL_DATA_ESC) && h[1]) ? 2 : 1;
+                q = h + hk;
+                continue;
+            }
+            q += lk;
+        }
     }
     return 0;
 }
