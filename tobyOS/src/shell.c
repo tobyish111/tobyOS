@@ -4677,13 +4677,19 @@ static int env_set_kv(const char *kv_in) {
 
         const char *add = kv_in + klen + 1;
         struct sh_array *arr = sh_array_find(nm);
-        const char *old_val = arr ? sh_array_get(nm, 0) : env_get(nm);
+        /* an associative array's element 0 is the KEY "0", as for `a=x`
+         * below: `declare -A a; a+=z` appended to the key "" (appendop1.sub;
+         * finding 291) */
+        bool akey = arr && sh_array_is_assoc(nm);
+        const char *old_val = !arr ? env_get(nm)
+                            : akey ? sh_array_get_key(nm, "0") : sh_array_get(nm, 0);
         {
             SH_SB(sum);
             int ar = shell_attr_append(shell_value_attrs(nm), old_val, add, &sum);
             if (ar < 0) return -1;
             if (ar > 0) {
-                if (arr) return sh_array_set(nm, 0, sum.p) == 0 ? 0 : -1;
+                if (arr) return (akey ? sh_array_set_key(nm, "0", sum.p)
+                                      : sh_array_set(nm, 0, sum.p)) == 0 ? 0 : -1;
                 SH_SB(rb);
                 if (sb_puts(&rb, nm) < 0 || sb_putc(&rb, '=') < 0 ||
                     sb_puts(&rb, sum.p) < 0) return -1;
@@ -4697,7 +4703,8 @@ static int env_set_kv(const char *kv_in) {
             if (!joined) return -1;
             if (ol) memcpy(joined, old_val, ol);
             memcpy(joined + ol, add, al + 1);
-            int rc = sh_array_set(nm, 0, joined);
+            int rc = akey ? sh_array_set_key(nm, "0", joined)
+                          : sh_array_set(nm, 0, joined);
             kfree(joined);
             return rc == 0 ? 0 : -1;
         }
