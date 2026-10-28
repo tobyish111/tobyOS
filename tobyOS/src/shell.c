@@ -17150,6 +17150,17 @@ static int shell_line_incomplete(const char *s) {
             if (*p == '"') in_dq = false;
             continue;
         }
+        /* a `...` is one unit, no quote in it the reader's: the scanner's
+         * rule (quote.tests: `recho `echo "(\\")"``) */
+        if (*p == '`') {
+            p++;
+            while (*p && *p != '`') {
+                if (*p == '\\' && p[1]) p++;
+                p++;
+            }
+            if (!*p) return 1;                  /* the backquote still open */
+            continue;
+        }
         if (*p == '\\') {
             if (!p[1]) { esc = true; break; }   /* trailing backslash */
             p++;                                /* escapes the next character */
@@ -18016,6 +18027,18 @@ procsub_word:;
                 continue;
             }
             if (d == '"') dq = false;
+            p++;
+            continue;
+        }
+        /* INSIDE BACKQUOTES THE READER TRACKS NO QUOTES: bash reads `...`
+         * to its unescaped closing backquote, a backslash taking the byte
+         * after it, and the quotes are the inner command's. Tracked here,
+         * `recho `echo "(\\")"`` read "(\\")" as a string left open and
+         * glued the next two lines on (quote.tests; finding 291). */
+        if (nest > 0 && nest - 1 < (int)sizeof st->nest_kind &&
+            st->nest_kind[nest - 1] == 'b') {
+            if (d == '\\' && p[1]) { p += 2; continue; }
+            if (d == '`') { nest--; p++; continue; }
             p++;
             continue;
         }
@@ -28095,6 +28118,13 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
      * backslash is retained. */
     const bool dq = (g_dq_depth > 0);
     while (*p && *p != '`') {
+        /* A BACKSLASH-NEWLINE IS A LINE CONTINUATION here, both bytes
+         * gone, whatever quotes the command inside has: the quotes in
+         * `...` are the inner command's, not the reader's, so
+         * `echo 'foo\<newline>bar'` in backquotes is foobar in bash, where
+         * tsh kept the pair and printed `foo\ bar` (quote.tests; finding
+         * 291). $( ) is parsed as a command and keeps it. */
+        if (*p == '\\' && p[1] == '\n') { p += 2; continue; }
         if (*p == '\\' && (p[1] == '$' || p[1] == '`' || p[1] == '\\' ||
                             (dq && p[1] == '"'))) {
             p++;                          /* removed: the next byte is data */
