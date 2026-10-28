@@ -2117,12 +2117,41 @@ uint8_t xhci_attach_root_port(uint8_t port_id) {
     return s;
 }
 
+/* A root port's change bits set with no event behind them (finding
+ * 304): a bit latched while another is still set raises no event of its
+ * own, so nothing would ever look at that port again. Once a second,
+ * after draining the event ring, look at every root port; one with a
+ * change bit set and no work pending is cleared and serviced as if its
+ * event had come. 21 register reads a second on the EliteDesk. */
+static void xhci_scan_root_ports(void) {
+    static uint64_t next_ns;
+    uint64_t now = perf_now_ns();
+    if (now < next_ns) return;
+    next_ns = now + 1000000000ull;
+
+    xhci_poll();
+    for (uint8_t p = 1; p <= g_xhci.max_ports && p <= 32u; p++) {
+        uint32_t bit = 1u << (p - 1u);
+        if (__atomic_load_n(&g_xhci.port_change_pending,
+                            __ATOMIC_ACQUIRE) & bit) continue;
+        uint32_t sc = portsc_read((uint8_t)(p - 1u));
+        if (!(sc & PORTSC_RW1C_MASK)) continue;
+        portsc_write((uint8_t)(p - 1u), PORTSC_RW1C_MASK);
+        kprintf("[xhci] port %u: change bits %02x with no event "
+                "(PORTSC=0x%08x)\n", p,
+                (unsigned)((sc & PORTSC_RW1C_MASK) >> 17), sc);
+        __atomic_fetch_or(&g_xhci.port_change_pending, bit,
+                          __ATOMIC_ACQ_REL);
+    }
+}
+
 /* Service deferred port-change work. Called from the kernel idle
  * loop; cheap when port_change_pending == 0. Walks every bit set in
  * the bitmap, atomically clearing it before processing so a fresh
  * change arriving mid-service triggers a follow-up pass. */
 void xhci_service_port_changes(void) {
     if (!g_xhci.bound) return;
+    xhci_scan_root_ports();
     uint32_t pending;
     /* Snapshot + clear under cli to avoid losing a bit set by a
      * concurrent xhci_irq_handler. */
@@ -2576,6 +2605,35 @@ static int xhci_probe(struct pci_dev *dev) {
                 "device is routed to EHCI by the firmware and is invisible "
                 "here -- use a USB-3 stick in a blue port)",
                 connected ? list : "");
+    }
+
+    /* Change bits latched before anything handled them (finding 304).
+     * The xHC posts a Port Status Change Event when a port's change bits
+     * go from none set to some set, and this driver clears them only
+     * while handling such an event. Bits latched at power-up or by the
+     * routing switch above were never handled -- on the EliteDesk WRC on
+     * all six SuperSpeed ports and CSC on the two with sticks -- so those
+     * ports posted no event for the rest of the boot, and a stick pulled
+     * and plugged back went unseen. The walk above has acted on every
+     * port's connect status: drain what it raised, then clear every
+     * change bit, so that each later change is an edge the xHC reports. */
+    xhci_poll();
+    {
+        char list[192]; size_t lo = 0; list[0] = 0;
+        for (uint8_t p = 0; p < g_xhci.max_ports; p++) {
+            uint32_t sc = portsc_read(p);
+            if (!(sc & PORTSC_RW1C_MASK)) continue;
+            portsc_write(p, PORTSC_RW1C_MASK);
+            if (lo < sizeof(list) - 16)
+                lo += (size_t)ksnprintf(list + lo, sizeof(list) - lo,
+                                        "%s%u:%02x", lo ? "," : "", p + 1u,
+                                        (unsigned)((sc & PORTSC_RW1C_MASK)
+                                                   >> 17));
+        }
+        if (lo)
+            kprintf("[xhci] change bits latched at start, cleared -- %s "
+                    "(port:bits; CSC 01 PEC 02 WRC 04 OCC 08 PRC 10 "
+                    "PLC 20 CEC 40)\n", list);
     }
 
     /* Try MSI-X first (xHCI 1.1 mandates it on the primary
