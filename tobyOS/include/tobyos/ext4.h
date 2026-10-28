@@ -375,4 +375,11 @@ int ext4_self_test(void);
  * under -DEXT4_JOURNAL_SELFTEST. */
 int ext4_journal_self_test(void);
 
+/* The mount's vfs_ops and the device under a mount of it, as the other
+ * block filesystems give them (provision_dev_mounted: an ext4 mount was
+ * not seen, so a mounted ext4 volume read as unmounted). */
+struct vfs_ops;
+const struct vfs_ops *ext4_ops_addr(void);
+struct blk_dev *ext4_blkdev_of(void *mnt);
+
 #endif /* TOBYOS_EXT4_H */

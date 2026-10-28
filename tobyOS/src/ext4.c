@@ -4796,6 +4796,13 @@ static const struct vfs_ops ext4_ops = {
     .umount    = ext4_umount,   /* finding 271 */
 };
 
+const struct vfs_ops *ext4_ops_addr(void) { return &ext4_ops; }
+
+struct blk_dev *ext4_blkdev_of(void *mnt) {
+    struct ext4 *fs = (struct ext4 *)mnt;
+    return fs ? fs->dev : 0;
+}
+
 /* ---- probe + mount entry points ---- */
 
 /* Read just the SB; check magic + that the block size is sane and

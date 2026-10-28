@@ -32,6 +32,7 @@
 #include <tobyos/tobyfs.h>
 #include <tobyos/fat32.h>
 #include <tobyos/ext2.h>
+#include <tobyos/ext4.h>
 #include <tobyos/vfs.h>
 #include <tobyos/bcache.h>
 #include <tobyos/heap.h>
@@ -69,6 +70,9 @@ static struct blk_dev *mount_backing_dev(const struct vfs_ops *ops,
     if (ops == tobyfs_ops_addr()) return tobyfs_blkdev_of(mount_data);
     if (ops == &fat32_ops)        return fat32_blkdev_of(mount_data);
     if (ops == &ext2_ops)         return ext2_blkdev_of(mount_data);
+    /* ext4 is block-backed too: a mounted ext4 volume read as unmounted,
+     * open to the provisioning guard and to a replugged disk's rescan */
+    if (ops == ext4_ops_addr())   return ext4_blkdev_of(mount_data);
     return 0;
 }
 
