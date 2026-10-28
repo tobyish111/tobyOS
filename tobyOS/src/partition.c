@@ -38,7 +38,10 @@
  *   registering a new partition we check the registry for a name
  *   collision (same disk + same partition index produces the same
  *   "<disk>.pN" string). On collision we silently skip -- the caller
- *   already has the device, no need for a second wrapper.
+ *   already has the device, no need for a second wrapper. A collision
+ *   with an entry that went with its disk (a stick pulled, written
+ *   elsewhere, plugged back) is not one: that entry takes the table the
+ *   disk has NOW (partition_existing, finding 281).
  *
  * What we DELIBERATELY DO NOT IMPLEMENT here
  * ------------------------------------------
@@ -57,6 +60,7 @@
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+#include <tobyos/provision.h>
 
 /* ---- well-known type GUIDs (mixed-endian on-disk form) ----------- *
  *
@@ -203,9 +207,45 @@ static void make_partition_name(const char *disk_name, uint32_t idx,
     out[w] = 0;
 }
 
-/* Return 1 if a partition with this name is already registered. */
-static int partition_already_registered(const char *name) {
-    return blk_find(name) != 0;
+/* A partition named NAME already registered, against the table DISK has
+ * now: 1 when it is live (a rescan: counted, as before), or when it went
+ * with this disk and now takes this table's geometry -- START, COUNT, its
+ * number, type and label -- and is live again; 0 when there is none, or
+ * when the one there still has a filesystem mounted from the medium that
+ * went. That mount keeps the dead device, as Linux's does; the old entry
+ * is renamed aside, so a new one is registered under the name.
+ *
+ * The rescan of a stick plugged back found "usb0.p1" in the registry and
+ * counted it found -- still marked gone, with the OLD table's geometry --
+ * so the box had sda and no sda1 (finding 281). Linux reads a replugged
+ * disk's table afresh. */
+static int partition_existing(struct blk_dev *disk, const char *name,
+                              uint64_t start, uint64_t count, uint32_t no,
+                              const uint8_t *guid, const char *label,
+                              uint8_t scheme, uint8_t mbr_type) {
+    struct blk_dev *old = blk_find(name);
+    if (!old) return 0;
+    if (!old->gone) return 1;
+    const char *dn = disk->name ? disk->name : "?";
+    if (old->parent == disk && old->class == BLK_CLASS_PARTITION &&
+        !provision_dev_mounted(old, 0) &&
+        blk_partition_rewrap(old, start, count, no, guid, label) == 0) {
+        old->scheme = scheme;
+        old->mbr_type = mbr_type;
+        old->gone = false;                       /* last: walkers check it */
+        kprintf("[part] %s: %s back, LBA %lu (%lu sectors)\n", dn, name,
+                (unsigned long)start, (unsigned long)old->sector_count);
+        return 1;
+    }
+    size_t nl = strlen(name);
+    char *aside = kmalloc(nl + 6);
+    if (!aside) return 1;                        /* keep the old one */
+    memcpy(aside, name, nl);
+    memcpy(aside + nl, "~gone", 6);
+    old->name = aside;
+    kprintf("[part] %s: %s still mounted from the medium that went -- "
+            "kept as %s\n", dn, name, aside);
+    return 0;
 }
 
 /* ---- protective MBR check ----------------------------------------- *
@@ -418,7 +458,9 @@ static int mbr_add(struct blk_dev *disk, uint32_t no, uint64_t start,
     }
     char scratch[64];
     make_partition_name(disk->name, no, scratch, sizeof(scratch));
-    if (partition_already_registered(scratch)) return 1;
+    if (partition_existing(disk, scratch, start, count, no, 0, "",
+                           BLK_SCHEME_MBR, type))
+        return 1;
     size_t nlen = strlen(scratch);
     char *name = kmalloc(nlen + 1);
     if (!name) return 0;
@@ -556,7 +598,8 @@ int partition_scan_disk(struct blk_dev *disk) {
          * registry; allocate a small heap buffer for it. */
         char  scratch[64];
         make_partition_name(disk->name, i + 1, scratch, sizeof(scratch));
-        if (partition_already_registered(scratch)) {
+        if (partition_existing(disk, scratch, e.starting_lba, span, i + 1,
+                               e.type_guid, label, BLK_SCHEME_GPT, 0)) {
             registered++;     /* already there -- count as "found" */
             continue;
         }

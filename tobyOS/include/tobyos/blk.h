@@ -254,6 +254,13 @@ struct blk_dev *blk_partition_wrap(struct blk_dev *parent,
                                    const uint8_t type_guid[BLK_GUID_BYTES],
                                    const char *label);
 
+/* Finding 281: a partition entry that went with its disk takes the
+ * geometry of the table the disk has now. 0, or -1 when it cannot. */
+int blk_partition_rewrap(struct blk_dev *d, uint64_t offset_lba,
+                         uint64_t size_lba, uint32_t partition_index,
+                         const uint8_t type_guid[BLK_GUID_BYTES],
+                         const char *label);
+
 /* ---- writes that go around a cache (finding 278) ----
  *
  * A filesystem that keeps blocks of its device in memory must hear of a
