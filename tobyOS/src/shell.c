@@ -30469,10 +30469,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                  * there `!` is the KEYS operator, which the array branch
                  * below owns. Falling through is how that stays true. */
                 const char *rb = 0;
-                int d = 0;
-                for (const char *q = rest; *q; q++) {
-                    if (*q == '[') d++;
-                    else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
+                {
+                    size_t k = sa_skip_subscript(rest);   /* its quotes too */
+                    if (rest[k] == ']') rb = rest + k;
                 }
                 size_t slen = rb ? (size_t)(rb - rest - 1) : 0;
                 if (rb && slen == 0) {          /* ${!a[]}: see below */
@@ -30672,13 +30671,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * tested `aexpr[strlen-1] == ']'`, so every sliced form missed
              * the array branch entirely and fell through to the scalar path
              * as "bad substitution". */
+            /* ...through the subscript's quotes: "${A[']']}" and
+             * "${A["]"]}" read the key `]` in bash, where the first `]`
+             * cut the subscript to `'` -- "bad substitution" (finding 288,
+             * the read side) */
             const char *rb = 0;
             {
-                int d = 0;
-                for (const char *q = lb; *q; q++) {
-                    if (*q == '[') d++;
-                    else if (*q == ']') { d--; if (d == 0) { rb = q; break; } }
-                }
+                size_t k = sa_skip_subscript(lb);
+                if (lb[k] == ']') rb = lb + k;
             }
             if (rb) {
                 SH_SB(nmb);
