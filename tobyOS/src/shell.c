@@ -11405,6 +11405,15 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         if (on && g_optdefs[i].var == &g_opt_emacs) g_opt_vi = false;
         if (on && g_optdefs[i].var == &g_opt_vi) g_opt_emacs = false;
         if (on && g_optdefs[i].var == &g_opt_monitor) g_jc_level = g_subshell_depth;
+        /* `set -o posix` sets POSIXLY_CORRECT (to y, when it is not set
+         * already) and `set +o posix` unsets it, as bash's does; a shell
+         * started as `sh` is in posix mode without it */
+        if (g_optdefs[i].var == &g_opt_posix) {
+            bool have = env_find("POSIXLY_CORRECT", 15) >= 0;
+            if (on && !have) (void)env_set("POSIXLY_CORRECT", "y");
+            else if (!on && have) (void)env_unset("POSIXLY_CORRECT");
+            g_opt_posix = on;
+        }
         return true;
     }
     return false;
@@ -24882,6 +24891,18 @@ static void shell_hist_truncate_file(long keep) {
 static void shell_path_var_written(const char *key, size_t klen);
 static void shell_hist_var_written(const char *key, size_t klen) {
     shell_path_var_written(key, klen);
+    /* POSIXLY_CORRECT IS THE MODE: set (to anything, "" too) it turns posix
+     * mode on, unset it turns it off -- a function's `local` going with
+     * its scope -- as bash's sv_strict_posix does. tsh ignored it
+     * (appendop2.sub; finding 291). */
+    if (klen == 15 && strncmp(key, "POSIXLY_CORRECT", 15) == 0) {
+        bool on = env_find("POSIXLY_CORRECT", 15) >= 0;
+        if (g_opt_posix != on) {
+            g_opt_posix = on;
+            shell_optvars_refresh();
+        }
+        return;
+    }
     bool hsize = (klen == 8 && strncmp(key, "HISTSIZE", 8) == 0);
     bool fsize = (klen == 12 && strncmp(key, "HISTFILESIZE", 12) == 0);
     if (!hsize && !fsize) return;
@@ -40288,9 +40309,11 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
              * posix`, and bash is the oracle here. `exec` still hands its
              * prefix to the program it launches, because the assignment is
              * live while the builtin runs -- what changes is only whether the
-             * shell keeps it afterwards. */
+             * shell keeps it afterwards. Under posix mode it is kept: `x=9
+             * eval :` leaves x=9 there, where tsh dropped it in either mode
+             * (appendop2.sub; finding 291). */
             return shell_run_builtin(&exec_cmd, special, cmd->argv, assignc,
-                                     false);
+                                     g_opt_posix);
         }
         /* A variable assignment PREFIXED to a command applies to that command
          * only -- `PREF=x show` must be visible inside `show` and gone after.
@@ -48829,7 +48852,13 @@ void shell_logout_hosted(void) {
  * host.c turns this on when argv[0]'s basename is "sh", exactly as bash does
  * for its own `sh` link. tsh is a strict superset of the POSIX shell, so the
  * mode changes what `set -o` reports, not what runs. */
-void shell_set_posix_hosted(bool on) { g_opt_posix = on; }
+/* Started as `sh` or with --posix: posix mode, and POSIXLY_CORRECT=y (not
+ * exported) when it is not set already, as bash 5.2 starts. */
+void shell_set_posix_hosted(bool on) {
+    g_opt_posix = on;
+    if (on && env_find("POSIXLY_CORRECT", 15) < 0)
+        (void)env_set("POSIXLY_CORRECT", "y");
+}
 
 /* host.c knows the stack /bin/tsh runs on; see g_stack_floor. */
 void shell_set_stack_floor_hosted(unsigned long floor) {
