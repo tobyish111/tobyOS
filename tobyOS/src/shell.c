@@ -42485,6 +42485,15 @@ static int shell_dbr_word(const char **pp, struct shell_dbr_scratch *sc,
                 if (*p == '\\' && p[1]) {
                     if (shell_dbr_put2(sc, *p) < 0) return -1;
                     p++;
+                } else if (qc == '"' && (*p == '$' || *p == '`')) {
+                    /* A `${ }`, `$( )` or backquote inside the double quotes
+                     * has quotes of its own: `[[ "${u:-"a b"}" == "a b" ]]`
+                     * ended its span at the inner `"` -- "conditional
+                     * binary operator expected" (finding 303, the rule 291
+                     * gave the readers ahead of the parser). */
+                    const char *e = shell_dq_unit_end(p);
+                    for (; e && p < e; p++)
+                        if (shell_dbr_put2(sc, *p) < 0) return -1;
                 }
                 if (shell_dbr_put2(sc, *p) < 0) return -1;
                 p++;
