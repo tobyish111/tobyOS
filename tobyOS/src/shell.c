@@ -18263,7 +18263,10 @@ procsub_word:;
     if (st->dbracket) {
         bool closing = (n == 2 && w[0] == ']' && w[1] == ']');
         if (closing) st->dbracket = false;
-        st->cmd_pos = false; st->prev_word_cmd = false;
+        /* after the `]]` a reserved word may follow with no `;` -- bash's
+         * grammar takes `if [[ x ]] then ... fi` (cond.tests; finding
+         * 291) -- so the word after it is in command position */
+        st->cmd_pos = closing; st->prev_word_cmd = false;
         /* INSIDE THE CONDITIONAL THERE IS NO COMMAND BOUNDARY, so joining the
          * next physical line must not insert a `;`:
          *
@@ -18349,7 +18352,9 @@ procsub_word:;
             st->brace--;
             if (body && st->compound > 0) st->compound--;
         }
-        st->cmd_pos = false; st->prev_word_cmd = false;
+        /* a reserved word may follow a group's `}` with no `;` (bash's
+         * reserved_word_acceptable): `do { ...; } done` (finding 291) */
+        st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = false;
         st->cmd_seen = true;            /* a closed group is a command */
         return;
@@ -18396,7 +18401,9 @@ procsub_word:;
             if (st->case_depth > 0) st->case_depth--;
             st->case_pat = false;
         }
-        st->cmd_pos = false; st->prev_word_cmd = false;
+        /* ...and a reserved word may follow one with no `;`: `done
+         * done`, `fi fi`, `done esac` (finding 291) */
+        st->cmd_pos = true; st->prev_word_cmd = false;
         st->no_sep = false;             /* fi/done/esac END a command */
         st->cmd_seen = true;            /* ...and they ARE one */
         return;
@@ -40934,8 +40941,14 @@ static bool shell_is_word_end(char c) {
  * Returns a pointer to the keyword text and, in *after, just past it. A
  * terminator is `;` `;;` `&` `&&` `|` `||` or the `}` / `)` that closes a
  * group or subshell -- see shell_find_kw_sep for why the brackets count. */
-static const char *shell_sep_keyword(const char *p, const char **after) {
-    if (*p != ';' && *p != '&' && *p != '|' && *p != '}' && *p != ')') return 0;
+static bool shell_case_cmd_pos(const char *start, const char *p);
+static bool shell_blank_cmd_pos(const char *start, const char *p);
+static const char *shell_sep_keyword(const char *start, const char *p,
+                                     const char **after) {
+    bool blank_sep = (*p == ' ' || *p == '\t') && shell_blank_cmd_pos(start, p);
+    if (*p != ';' && *p != '&' && *p != '|' && *p != '}' && *p != ')' &&
+        !blank_sep)
+        return 0;
     const char *q = p + 1;
     if ((*p == ';' || *p == '&' || *p == '|') && *q == *p) q++;
     if (*p == '}' || *p == ')') {
@@ -41016,7 +41029,7 @@ static const char *shell_find_loop_do(const char *start, const char **after) {
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
-        const char *kw = shell_sep_keyword(p, &kend);
+        const char *kw = shell_sep_keyword(start, p, &kend);
         if (!kw) continue;
         if (shell_kw_is(kw, kend, "while") || shell_kw_is(kw, kend, "until") ||
             shell_kw_is(kw, kend, "for")   || shell_kw_is(kw, kend, "select") ||
@@ -41078,7 +41091,11 @@ static const char *shell_find_matching_done(const char *start,
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"') { in_dq = true; continue; }
 
-        if (*p != ';' && *p != '&' && *p != '|') continue;
+        /* ...or the blank after a compound's end: `done done`, `}
+         * done`, `[[ x ]] done`, `then if` (shell_blank_cmd_pos) */
+        if (*p != ';' && *p != '&' && *p != '|' &&
+            !((*p == ' ' || *p == '\t') && shell_blank_cmd_pos(start, p)))
+            continue;
         const char *q = p + 1;
         if (*q == *p) q++;                       /* `;;`, `&&`, `||` */
         while (*q == ' ' || *q == '\t') q++;
@@ -41148,7 +41165,8 @@ static const char *shell_find_kw_sep(const char *start, const char *kw,
         }
         if (*p == '\'') { sq = true; continue; }
         if (*p == '"')  { dq = true; continue; }
-        if (*p != ';' && *p != '&' && *p != '|' && *p != '}' && *p != ')')
+        if (*p != ';' && *p != '&' && *p != '|' && *p != '}' && *p != ')' &&
+            !((*p == ' ' || *p == '\t') && shell_blank_cmd_pos(start, p)))
             continue;
 
         const char *cut = p;
@@ -41213,7 +41231,7 @@ static const char *shell_find_if_fi(const char *start, const char **after) {
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
-        const char *kw = shell_sep_keyword(p, &kend);
+        const char *kw = shell_sep_keyword(start, p, &kend);
         if (!kw) continue;
         if (shell_kw_is(kw, kend, "if")) { depth++; p = kend - 1; continue; }
         if (shell_kw_is(kw, kend, "fi")) {
@@ -41262,7 +41280,7 @@ static const char *shell_find_elif_else(const char *start, const char *fi_at,
         if (*p == '\'') { in_sq = true; continue; }
         if (*p == '"')  { in_dq = true; continue; }
         const char *kend = 0;
-        const char *kw = shell_sep_keyword(p, &kend);
+        const char *kw = shell_sep_keyword(start, p, &kend);
         if (!kw) continue;
         if (shell_kw_is(kw, kend, "if")) { depth++; p = kend - 1; continue; }
         if (shell_kw_is(kw, kend, "fi")) {
@@ -43872,12 +43890,16 @@ static bool shell_word_boundary_before(const char *start, const char *p) {
  * echo in bash; counting them nested a case that was never opened ("case:
  * expected 'esac'", status 2) or closed this one early (logs/b12 p118).
  * Command position: the start of the text, or after a newline, `;`, `&`,
- * `|`, `(`, `)` or `{`, or after then, do, else, elif, `!` or time. */
+ * `|`, `(`, `)` or `{`, or after then, do, else, elif, `!` or time, or
+ * after the end of a compound (shell_closer_word_at). */
+static bool shell_closer_word_at(const char *start, const char *w, size_t n);
 static bool shell_case_cmd_pos(const char *start, const char *p) {
     const char *b = p;
     while (b > start && (b[-1] == ' ' || b[-1] == '\t')) b--;
     if (b == start) return true;
     char c = b[-1];
+    /* an array literal's `=(` or `+=(` opens words, not a command */
+    if (c == '(' && b - 1 > start && b[-2] == '=') return false;
     if (c == '\n' || (SH_CR_BLANK && c == '\r') || c == ';' || c == '&' || c == '|' ||
         c == '(' || c == ')' || c == '{')
         return true;
@@ -43891,7 +43913,49 @@ static bool shell_case_cmd_pos(const char *start, const char *p) {
     };
     for (int i = 0; kw[i]; i++)
         if (strlen(kw[i]) == n && strncmp(w, kw[i], n) == 0) return true;
+    return shell_closer_word_at(start, w, n);
+}
+
+/* Is the n-byte word at w the END of a compound command -- a `]]`, or a
+ * done, fi, esac or `}` that is itself where a command may start? bash
+ * takes a reserved word right after one with no `;` between
+ * (reserved_word_acceptable): `if [[ x ]] then`, `case k in x) for i in
+ * 1; do :; done esac`, `for ...; do ...; done done` (finding 291). */
+static bool shell_closer_word_at(const char *start, const char *w, size_t n) {
+    if (n == 2 && w[0] == ']' && w[1] == ']') {
+        /* only a `]]` that closes a `[[` opened where a command starts --
+         * `echo ]] esac` is an echo of two words */
+        for (const char *o = w - 1; o >= start + 1; o--)
+            if (o[-1] == '[' && o[0] == '[' &&
+                (o[1] == ' ' || o[1] == '\t') &&
+                shell_case_cmd_pos(start, o - 1) &&
+                (o - 1 == start || is_space(o[-2]) || o[-2] == ';' ||
+                 o[-2] == '(' || o[-2] == '&' || o[-2] == '|'))
+                return true;
+        return false;
+    }
+    if ((n == 4 && strncmp(w, "done", 4) == 0) ||
+        (n == 2 && strncmp(w, "fi", 2) == 0) ||
+        (n == 4 && strncmp(w, "esac", 4) == 0) ||
+        (n == 1 && w[0] == '}'))
+        return shell_case_cmd_pos(start, w);
     return false;
+}
+
+/* Is p (a blank) followed, past its blanks, by a word where a command may
+ * start (shell_case_cmd_pos)? The keyword searches take that place as they
+ * take a `;`. They knew only the separators, so a reserved word after
+ * then, do, else, `{` or a compound's end was text: `if a; then if b;
+ * then c; fi; fi` on one line lost its inner `if`, and `[[ x ]] then`,
+ * `} done`, `done esac` were not found (finding 291). */
+static bool shell_blank_cmd_pos(const char *start, const char *p) {
+    /* The searches start just past a keyword (`then`, `do`, ...) or at a
+     * command's first word, so blanks at the start lead to a command too:
+     * the body after `then` in `then if b; ...` begins " if". */
+    const char *q = p;
+    while (*q == ' ' || *q == '\t') q++;
+    if (q == p || !*q) return false;
+    return shell_case_cmd_pos(start, q);
 }
 
 static bool shell_word_boundary_after(const char *p) {
