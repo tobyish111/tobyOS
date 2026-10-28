@@ -1503,6 +1503,11 @@ static void shell_strip_nosplit_inplace(char *s);
 static bool shell_word_has_quoted_null(const char *w);
 static int sh_drop_empty_at_quotes(const char *w, struct shell_sb *out);
 static int shell_word_tilde(struct shell_sb *wb);
+/* A here-document body is being expanded (shell_hd_expand). bash reads the
+ * body as if it were in double quotes, so the single quotes of a
+ * ${x-WORD} there are bytes -- `${x+'b'}` is 'b' (finding 301). A command
+ * substitution, or a pattern word, is a context of its own and clears it. */
+static bool g_hd_body;
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
 static bool shell_glob_meta(char c);
@@ -6582,11 +6587,48 @@ static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
  * tsh dropped the rest of the line (and of a function), and ${u:?} ended
  * the shell. The expansion's own verdict on the line is taken back here;
  * the caller fails the command (SH_RD_FAILED). */
+/* A HERE-DOCUMENT'S TEXT IS ONE STRING, so the marks the expansion left
+ * in it are resolved here (finding 301): each "@" expansion's elements
+ * joined by a space, its first mark and an empty element's body dropped,
+ * quote marks and glob escapes -- a ${x-"WORD"}'s -- gone.
+ *
+ *     set -- a b; cat <<EOF         bash: <a b>
+ *     <$@>                          tsh:  <\001a\001b>
+ *     EOF
+ *
+ * Nothing resolved them, and the bytes reached the reader. A data byte
+ * that collides with a mark keeps its escape for the reader of the text. */
+static void sh_hd_resolve_marks(struct shell_sb *x) {
+    char *w = x->p;
+    bool first = true;
+    for (const char *r = x->p; *r; r++) {
+        if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
+        if (*r == SHELL_GLOB_ESC && r[1]) continue;     /* keep the byte */
+        if (*r == SHELL_NOSPLIT_MARK || *r == SHELL_EMPTY_ELEM ||
+            *r == SHELL_ARG_JOIN) continue;
+        if (*r == SHELL_ARG_MARK) {
+            if (first) { first = false; continue; }
+            *w++ = ' ';
+            continue;
+        }
+        *w++ = *r;
+    }
+    *w = '\0';
+    x->len = (size_t)(w - x->p);
+}
+
 static int shell_hd_expand(const char *body, struct shell_sb *x) {
     enum shell_flow flow = g_shell_flow;
     int flow_status = g_shell_flow_status;
     bool soft = g_bad_subst_soft;
-    if (shell_expand_literal_quotes(body, x) == 0) return 0;
+    bool saved_hd = g_hd_body;
+    g_hd_body = true;
+    int xrc = shell_expand_literal_quotes(body, x);
+    g_hd_body = saved_hd;
+    if (xrc == 0) {
+        sh_hd_resolve_marks(x);
+        return 0;
+    }
     g_bad_subst_soft = soft;
     g_shell_flow = flow;
     g_shell_flow_status = flow_status;
@@ -28249,12 +28291,14 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
     SH_SB(out);
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
-    bool saved_dqw = g_dq_word;
+    bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
     g_dq_depth = 0;
     g_dq_word = false;
+    g_hd_body = false;
     int crc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
+    g_hd_body = saved_hd;
     if (crc < 0) return -1;
     return sb_put_data_n(b, out.p, out.len);
 }
@@ -28326,12 +28370,14 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     /* The body is a fresh script. Whatever quotes enclose the backticks do not
      * enclose the commands inside them. */
     int saved_dq = g_dq_depth;
-    bool saved_dqw = g_dq_word;
+    bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
     g_dq_depth = 0;
     g_dq_word = false;
+    g_hd_body = false;
     int rc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
+    g_hd_body = saved_hd;
     if (rc < 0) return -1;
     return sb_putmem(b, out.p, out.len);
 }
@@ -29181,7 +29227,7 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
      *
      * Unquoted, both are syntax. See g_dq_depth. */
     g_value_word = true;
-    return shell_expand_word_ex(word, out, true, g_dq_depth == 0);
+    return shell_expand_word_ex(word, out, true, g_dq_depth == 0 && !g_hd_body);
 }
 
 /* A here-document body line, or the inside of $(( )): $ and ` still expand,
@@ -29202,12 +29248,14 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
  * 112, logs/b18 patdq). */
 static int shell_expand_pat_word(const char *w, struct shell_sb *out) {
     int saved = g_dq_depth;
-    bool saved_dqw = g_dq_word;
+    bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
     if (saved > 0) g_dq_word = true;
     g_dq_depth = 0;
+    g_hd_body = false;
     int rc = shell_expand_word_ex(w, out, true, true);
     g_dq_depth = saved;
     g_dq_word = saved_dqw;
+    g_hd_body = saved_hd;
     return rc;
 }
 
@@ -37084,6 +37132,14 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 const char *rw = shell_redir_word(pl, &tok[*io], &r_amb);
                 if (!rw && !r_amb) return -1;          /* reported */
                 if (rw) tok[*io].text = (char *)rw;
+            }
+            /* A here-string is one string: "@" elements join with a space,
+             * as in an assignment (finding 301) -- `cat <<< "$@"` wrote the
+             * field marks, and `read v <<< "$@"` read `ab`. */
+            if (t == SH_TOK_HERESTRING && shell_word_has_argmark(tok[*io].text)) {
+                SH_SB(hj);
+                if (shell_argmarks_to_spaces(tok[*io].text, &hj) < 0) return -1;
+                memcpy(tok[*io].text, hj.p, hj.len + 1);
             }
             shell_strip_nosplit_inplace(tok[*io].text);
             if (r_amb) {
