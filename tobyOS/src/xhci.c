@@ -358,6 +358,15 @@ static struct {
      * loop calls xhci_service_port_changes() which does the work in
      * normal context. Bit `i` covers root port `i+1`. */
     volatile uint32_t   port_change_pending;
+
+    /* The change bits each root port's events carried, taken with its
+     * pending bit (finding 305). The connect status alone cannot show a
+     * device that went and another that came before the service ran:
+     * CCS reads 1 both times. A CSC here on a port that is connected
+     * and still has a slot means the slot's device is gone. Entry `i`
+     * is root port `i+1`, as the bitmap's bits; ports past 32 have no
+     * bit and none of this. */
+    volatile uint32_t   port_change_bits[32];
 } g_xhci;
 
 /* ============================================================== */
@@ -2140,6 +2149,8 @@ static void xhci_scan_root_ports(void) {
         kprintf("[xhci] port %u: change bits %02x with no event "
                 "(PORTSC=0x%08x)\n", p,
                 (unsigned)((sc & PORTSC_RW1C_MASK) >> 17), sc);
+        __atomic_fetch_or(&g_xhci.port_change_bits[p - 1u],
+                          sc & PORTSC_RW1C_MASK, __ATOMIC_ACQ_REL);
         __atomic_fetch_or(&g_xhci.port_change_pending, bit,
                           __ATOMIC_ACQ_REL);
     }
@@ -2152,35 +2163,39 @@ static void xhci_scan_root_ports(void) {
 void xhci_service_port_changes(void) {
     if (!g_xhci.bound) return;
     xhci_scan_root_ports();
-    uint32_t pending;
-    /* Snapshot + clear under cli to avoid losing a bit set by a
-     * concurrent xhci_irq_handler. */
-    uint64_t flags;
-    __asm__ __volatile__("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
-    pending = g_xhci.port_change_pending;
-    g_xhci.port_change_pending = 0;
-    __asm__ __volatile__("push %0; popfq" :: "r"(flags) : "memory");
-
+    /* Take and clear in one step: the drain that sets bits runs on any
+     * CPU, so a cli here would not stop one landing between a read and
+     * a clear. */
+    uint32_t pending = __atomic_exchange_n(&g_xhci.port_change_pending,
+                                           0u, __ATOMIC_ACQ_REL);
     if (!pending) return;
 
-    for (uint8_t p = 1; p <= g_xhci.max_ports; p++) {
+    for (uint8_t p = 1; p <= g_xhci.max_ports && p <= 32u; p++) {
         if (!(pending & (1u << (p - 1u)))) continue;
+        uint32_t seen = __atomic_exchange_n(&g_xhci.port_change_bits[p - 1u],
+                                            0u, __ATOMIC_ACQ_REL);
         uint32_t portsc = portsc_read((uint8_t)(p - 1u));
         bool ccs = (portsc & PORTSC_CCS) != 0;
         uint8_t cur_slot = xhci_slot_for_root_port(p);
+        if (cur_slot && (!ccs || (seen & PORTSC_CSC))) {
+            /* Cable yanked -- tear the slot down. With CCS back at 1
+             * and a CSC seen, the port was empty in between and a
+             * device came since (finding 305): the slot's device is
+             * gone, so this one is enumerated afresh below. */
+            kprintf("[xhci] hot-detach root port %u (slot %u)%s\n",
+                    p, cur_slot,
+                    ccs ? " -- connected again since" : "");
+            (void)xhci_detach_slot(cur_slot);
+            cur_slot = 0;
+        }
         if (ccs && !cur_slot) {
             /* Cable just inserted -- bring the device up. */
             kprintf("[xhci] hot-attach root port %u (PORTSC=0x%08x)\n",
                     p, portsc);
             (void)xhci_attach_root_port(p);
-        } else if (!ccs && cur_slot) {
-            /* Cable just yanked -- tear the slot down. */
-            kprintf("[xhci] hot-detach root port %u (slot %u)\n",
-                    p, cur_slot);
-            (void)xhci_detach_slot(cur_slot);
         }
-        /* ccs && cur_slot -- already addressed, just a transient
-         * change (e.g. PEC after PED toggle); nothing to do.
+        /* ccs && cur_slot with no CSC -- already addressed, just a
+         * transient change (e.g. PEC after PED toggle); nothing to do.
          * !ccs && !cur_slot -- empty port saw a glitch; ignore. */
     }
 }
@@ -2263,12 +2278,17 @@ void xhci_poll(void) {
              * Enable/Disable Slot synchronously from MSI context would
              * deadlock our own xhci_cmd spin. */
             uint8_t port = (uint8_t)((e->param_lo >> 24) & 0xFFu);
-            if (port >= 1 && port <= g_xhci.max_ports) {
+            if (port >= 1 && port <= g_xhci.max_ports && port <= 32u) {
+                uint32_t sc = portsc_read(port - 1u);
                 portsc_write(port - 1u, PORTSC_RW1C_MASK);
-                /* Mark the deferred service work; xhci_service_port_changes
-                 * checks the bit, drains any work, and atomically resets
-                 * it. The OR is safe under the cli around xhci_poll(). */
-                g_xhci.port_change_pending |= (1u << (port - 1u));
+                /* Keep what changed (a CSC is a device gone, finding
+                 * 305), then mark the deferred service work, which takes
+                 * both. Atomic: this drain runs on every CPU, and the
+                 * service's take is not under this lock. */
+                __atomic_fetch_or(&g_xhci.port_change_bits[port - 1u],
+                                  sc & PORTSC_RW1C_MASK, __ATOMIC_ACQ_REL);
+                __atomic_fetch_or(&g_xhci.port_change_pending,
+                                  1u << (port - 1u), __ATOMIC_ACQ_REL);
             }
         }
         /* (Other event types -- bandwidth request, MFINDEX wrap, etc. --
@@ -2634,6 +2654,13 @@ static int xhci_probe(struct pci_dev *dev) {
             kprintf("[xhci] change bits latched at start, cleared -- %s "
                     "(port:bits; CSC 01 PEC 02 WRC 04 OCC 08 PRC 10 "
                     "PLC 20 CEC 40)\n", list);
+        /* The walk's own events carried those bits too; a boot CSC kept
+         * there would read as a device gone and come (finding 305). The
+         * pending bits stay: a port the walk missed still gets looked
+         * at by its connect status. */
+        for (int i = 0; i < 32; i++)
+            __atomic_store_n(&g_xhci.port_change_bits[i], 0u,
+                             __ATOMIC_RELEASE);
     }
 
     /* Try MSI-X first (xHCI 1.1 mandates it on the primary
