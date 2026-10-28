@@ -51,6 +51,10 @@
 #include <tobyos/heap.h>
 #include <tobyos/klibc.h>
 #include <tobyos/printk.h>
+#ifndef EXT4_HOST
+#include <tobyos/proc.h>      /* the commit worker (finding 278) */
+#include <tobyos/sched.h>
+#endif
 
 /* JBD2 stores every multi-byte field big-endian; we run little-endian. */
 static inline uint16_t be16(uint16_t x) { return __builtin_bswap16(x); }
@@ -60,17 +64,40 @@ static inline uint32_t be32(uint32_t x) { return __builtin_bswap32(x); }
 
 /* One staged block write inside the active transaction: its home block
  * number plus a full-block snapshot of the bytes to commit there. */
-struct ext4_txn_ent { uint64_t blk; uint8_t *data; };
+struct ext4_txn_ent {
+    uint64_t blk;
+    uint8_t *data;
+    uint32_t op;         /* the operation that last kept an undo copy of it */
+};
 
-/* An in-progress atomic operation. Every write_block() during the op is
- * captured here instead of hitting the disk; on txn_commit() the whole
- * set is logged to the journal, committed, then checkpointed to the home
- * locations. The entries array grows on demand. */
+/* An operation's copy of a block an EARLIER operation of the transaction
+ * staged, taken before it first changes it: put back if it fails. */
+struct ext4_txn_undo { int idx; uint8_t *old; };
+
+/* The RUNNING transaction. Every write_block() is captured here instead of
+ * hitting the disk; on txn_commit() the whole set is logged to the
+ * journal, committed, then checkpointed to the home locations. The entries
+ * array grows on demand.
+ *
+ * IT SPANS OPERATIONS (finding 278), as Linux's jbd2 running transaction
+ * does: each operation joins it, and it is committed when it is 5 s old
+ * (Linux's commit=5), fills the log, or is asked for -- fsync, sync,
+ * syncfs, umount. It was one transaction an operation, each one a log
+ * write, a device flush and every block home: 1 KiB written a time was 3
+ * MB in 60 s on the box's stick. An operation is still atomic by itself:
+ * one that fails puts back what it changed (OP_N0, UNDO) and leaves the
+ * operations before it in the transaction. */
 struct ext4_txn {
     struct ext4_txn_ent *ents;
     int    n;
     int    cap;
     bool   nomem;        /* a staging allocation failed -> abort the op */
+    uint64_t start_ns;   /* when its first operation began */
+    int      depth;      /* txn_begin nesting of the operation in it, 0 between */
+    int      op_n0;      /* entries before the current operation */
+    uint32_t op;         /* the current operation's number */
+    struct ext4_txn_undo *undo;
+    int      nundo, capundo;
 };
 
 /* Crash-injection knob for the journal self-test. 0 == disabled; when
@@ -159,6 +186,7 @@ struct ext4 {
     uint32_t incompat_bad;
     uint32_t ro_compat_bad;
     bool     rdonly;              /* mounted read-only */
+    bool     commit_each;         /* no commit worker sees it: each op commits */
     bool     state_cleared;       /* marked not clean while mounted (no journal) */
     uint16_t state_at_mount;
 
@@ -738,6 +766,25 @@ static int read_inode(struct ext4 *fs, uint32_t ino, struct ext4_inode *out) {
 static int txn_stage(struct ext4 *fs, uint64_t blk, const void *buf) {
     struct ext4_txn *t = fs->txn;
     struct ext4_txn_ent *e = txn_find(fs, blk);
+    /* an earlier operation's block, changed by this one for the first
+     * time: keep what it was, so a failure can put it back */
+    if (e && t->depth > 0 && (int)(e - t->ents) < t->op_n0 && e->op != t->op) {
+        if (t->nundo == t->capundo) {
+            int ncap = t->capundo ? t->capundo * 2 : 8;
+            struct ext4_txn_undo *nu = kmalloc((size_t)ncap * sizeof(*nu));
+            if (!nu) { t->nomem = true; return VFS_ERR_NOMEM; }
+            if (t->nundo) memcpy(nu, t->undo, (size_t)t->nundo * sizeof(*nu));
+            if (t->undo) kfree(t->undo);
+            t->undo = nu; t->capundo = ncap;
+        }
+        uint8_t *old = kmalloc(fs->block_size);
+        if (!old) { t->nomem = true; return VFS_ERR_NOMEM; }
+        memcpy(old, e->data, fs->block_size);
+        t->undo[t->nundo].idx = (int)(e - t->ents);
+        t->undo[t->nundo].old = old;
+        t->nundo++;
+        e->op = t->op;
+    }
     if (!e) {
         if (t->n == t->cap) {
             int ncap = t->cap ? t->cap * 2 : 16;
@@ -750,6 +797,7 @@ static int txn_stage(struct ext4 *fs, uint64_t blk, const void *buf) {
         }
         e = &t->ents[t->n];
         e->blk = blk;
+        e->op = t->op;
         e->data = kmalloc(fs->block_size);
         if (!e->data) { t->nomem = true; return VFS_ERR_NOMEM; }
         t->n++;
@@ -3296,9 +3344,52 @@ static uint32_t jtags_walk(const struct ext4 *fs, const uint8_t *blk,
  * writes fall through to the disk as before -- zero behaviour change on
  * non-journalled images. If the txn allocation fails we also fall back to
  * direct writes (safe, just not atomic). */
+#define EXT4_COMMIT_NS   5000000000ull   /* Linux's commit=5 */
+#define EXT4_TXN_MAX     1024            /* txn_find walks the entries */
+#define EXT4_OP_ROOM     80              /* a write chunk and its metadata */
+static int txn_commit(struct ext4 *fs);
+extern uint64_t perf_now_ns(void);
+static void e4_worker_ensure(struct ext4 *fs);
+
+/* Is the running transaction to be committed before another operation
+ * joins it? When it is old, when the next operation might not fit in the
+ * log beside it, and on every operation while the journal self-test's
+ * crash knob is set (the crash is to come at THAT operation's commit). */
+static bool txn_due(struct ext4 *fs, const struct ext4_txn *t) {
+    if (g_jbd_crash_phase != JBD2_CRASH_NONE || fs->commit_each) return true;
+    uint32_t room = fs->j_blocks > fs->j_first ? fs->j_blocks - fs->j_first : 0;
+    uint32_t n = (uint32_t)t->n;
+    if (n >= EXT4_TXN_MAX || n >= room / 4 || n + EXT4_OP_ROOM >= room) return true;
+    return perf_now_ns() - t->start_ns >= EXT4_COMMIT_NS;
+}
+
+static void txn_undo_free(struct ext4_txn *t) {
+    for (int i = 0; i < t->nundo; i++) kfree(t->undo[i].old);
+    t->nundo = 0;
+}
+
+/* An operation begins: it joins the running transaction -- after
+ * committing it, when that is due -- or opens one. A begin inside an
+ * operation (an operation made of others) only nests. */
 static void txn_begin(struct ext4 *fs) {
-    if (!fs->has_journal || fs->txn) return;
-    fs->txn = kcalloc(1, sizeof(struct ext4_txn));
+    if (!fs->has_journal) return;
+    struct ext4_txn *t = fs->txn;
+    if (t && t->depth > 0) { t->depth++; return; }
+    if (t && t->n && txn_due(fs, t)) {
+        (void)txn_commit(fs);
+        t = fs->txn;
+    }
+    if (!t) {
+        t = kcalloc(1, sizeof(struct ext4_txn));
+        if (!t) return;                    /* writes go direct: see above */
+        t->start_ns = perf_now_ns();
+        fs->txn = t;
+    }
+    t->depth = 1;
+    t->op_n0 = t->n;
+    t->op++;
+    txn_undo_free(t);
+    t->nomem = false;
 }
 
 static void txn_free(struct ext4_txn *t) {
@@ -3306,7 +3397,24 @@ static void txn_free(struct ext4_txn *t) {
     for (int i = 0; i < t->n; i++)
         if (t->ents[i].data) kfree(t->ents[i].data);
     if (t->ents) kfree(t->ents);
+    txn_undo_free(t);
+    if (t->undo) kfree(t->undo);
     kfree(t);
+}
+
+/* The operation in the transaction failed: what it staged comes out --
+ * the blocks it was the first to stage, and its changes to the others --
+ * and the operations before it stay. */
+static void txn_op_rollback(struct ext4 *fs, struct ext4_txn *t) {
+    for (int i = t->nundo - 1; i >= 0; i--) {
+        struct ext4_txn_undo *u = &t->undo[i];
+        memcpy(t->ents[u->idx].data, u->old, fs->block_size);
+    }
+    txn_undo_free(t);
+    for (int i = t->op_n0; i < t->n; i++)
+        if (t->ents[i].data) kfree(t->ents[i].data);
+    t->n = t->op_n0;
+    t->nomem = false;
 }
 
 /* Throw away a transaction without touching the disk (operation failed
@@ -3475,12 +3583,38 @@ done:
     return rc;
 }
 
-/* Close a transaction opened by txn_begin: commit on success, discard on
- * failure. If no journal was active, just return the operation's rc. */
+/* An operation ends: its changes stay in the running transaction, which
+ * is committed now only when that is due (txn_due) -- or, on a failure,
+ * they come out of it (txn_op_rollback). If no journal was active, just
+ * return the operation's rc. */
 static int txn_finish(struct ext4 *fs, int rc) {
-    if (!fs->txn) return rc;
-    if (rc != VFS_OK) { txn_abort(fs); return rc; }
-    return txn_commit(fs);
+    struct ext4_txn *t = fs->txn;
+    if (!t) return rc;
+    if (t->depth > 1) { t->depth--; return rc; }
+    t->depth = 0;
+    if (rc != VFS_OK || t->nomem) {
+        txn_op_rollback(fs, t);
+        if (t->n == 0) txn_abort(fs);
+        return rc != VFS_OK ? rc : VFS_ERR_NOMEM;
+    }
+    txn_undo_free(t);
+    if (t->n == 0) { txn_abort(fs); return rc; }
+    if (txn_due(fs, t)) return txn_commit(fs);
+    e4_worker_ensure(fs);              /* it is left running: someone commits it */
+    return rc;
+}
+
+/* Commit whatever the running transaction holds (fsync, sync, umount, the
+ * commit worker). Not inside an operation. */
+static int txn_commit_running(struct ext4 *fs) {
+    if (!fs->txn || fs->txn->depth > 0) return VFS_OK;
+    if (fs->txn->n == 0) { txn_abort(fs); return VFS_OK; }
+    int rc = txn_commit(fs);
+    if (rc != VFS_OK)
+        kprintf("[ext4] %s: commit failed (%d): the last %s's changes are lost\n",
+                fs->dev && fs->dev->name ? fs->dev->name : "(anon)", rc,
+                "transaction");
+    return rc;
 }
 
 /* ---- recovery, as Linux's: three passes over the log from s_start ----
@@ -4757,12 +4891,82 @@ static int ext4_symlink(void *mnt, const char *path, const char *target,
  * yet on the medium. Without this, fsync() returned 0 while the bytes sat
  * in RAM -- which is the difference between "saved" and "saved until you
  * unplug it". */
+/* ---- the commit worker (finding 278) ----
+ * Linux's jbd2 thread: once a second it commits each mount's running
+ * transaction that has been open EXT4_COMMIT_NS, so what was written is on
+ * the medium within about five seconds even when nothing else comes. It
+ * takes the BKL as an operation does (every ext4 operation runs whole
+ * under it: no block driver lets it go mid-request), so it never meets
+ * one half done. Started the first time a transaction is left running --
+ * in a system call, never in early boot. A mount it cannot list commits
+ * every operation itself (commit_each). */
+#define E4_JFS_MAX 8
+static struct ext4 *g_e4_jfs[E4_JFS_MAX];
+static int g_e4_commit_pid;             /* 0 not yet, -1 could not */
+
+static void e4_jfs_forget(struct ext4 *fs) {
+    for (int i = 0; i < E4_JFS_MAX; i++)
+        if (g_e4_jfs[i] == fs) g_e4_jfs[i] = 0;
+}
+
+static void e4_jfs_note(struct ext4 *fs) {
+    if (!fs->has_journal || fs->rdonly) return;
+    for (int i = 0; i < E4_JFS_MAX; i++)
+        if (!g_e4_jfs[i]) { g_e4_jfs[i] = fs; return; }
+    fs->commit_each = true;
+}
+
+#ifndef EXT4_HOST
+static void e4_commit_worker(void) {
+    if (!bkl_held()) bkl_enter();
+    for (;;) {
+        for (int i = 0; i < E4_JFS_MAX; i++) {
+            struct ext4 *fs = g_e4_jfs[i];
+            if (fs && fs->txn && fs->txn->depth == 0 && fs->txn->n &&
+                perf_now_ns() - fs->txn->start_ns >= EXT4_COMMIT_NS)
+                (void)txn_commit_running(fs);
+        }
+        /* a second parked, as sys_nanosleep parks: the sweep in
+         * sched_yield wakes it at the deadline */
+        struct proc *sp = current_proc();
+        uint64_t end = perf_now_ns() + 1000000000ull;
+        if (sp) { sp->sleep_deadline_ns = end; sp->state = PROC_BLOCKED; }
+        bkl_exit();
+        while ((!sp || __atomic_load_n(&sp->sleep_deadline_ns, __ATOMIC_ACQUIRE)) &&
+               perf_now_ns() < end)
+            sched_yield();
+        if (sp) {
+            sp->sleep_deadline_ns = 0;
+            if (sp->state == PROC_BLOCKED) sp->state = PROC_RUNNING;
+        }
+        bkl_enter();
+    }
+}
+#endif
+
+static void e4_worker_ensure(struct ext4 *fs) {
+#ifndef EXT4_HOST
+    if (g_e4_commit_pid == 0) {
+        int pid = proc_create_kernel(e4_commit_worker, "jbd2");
+        g_e4_commit_pid = pid > 0 ? pid : -1;
+    }
+    if (g_e4_commit_pid < 0) fs->commit_each = true;
+#else
+    (void)fs;
+#endif
+}
+
 static int ext4_sync(void *mnt) {
     struct ext4 *fs = (struct ext4 *)mnt;
     if (!fs || !fs->dev) return VFS_OK;
+    /* fsync, sync and syncfs commit the running transaction: what they
+     * promise is on the medium is still only in memory until then
+     * (finding 278). Linux's commits the whole transaction too. */
+    int crc = txn_commit_running(fs);
     extern void bcache_sync(struct blk_dev *dev);
     bcache_sync(fs->dev);
-    return blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+    int frc = blk_flush(fs->dev) == 0 ? VFS_OK : VFS_ERR_IO;
+    return crc != VFS_OK ? crc : frc;
 }
 
 static int ext4_umount(void *mnt);
@@ -4830,8 +5034,14 @@ int ext4_probe(struct blk_dev *dev) {
 /* Free a mounted fs's heap state (buffers + struct). Used by failure
  * paths and the self-test teardown (a live VFS mount must NOT be freed
  * this way -- only an fs that was never vfs_mount'd, or after unmount). */
+static void e4_jfs_forget(struct ext4 *fs);
 static void ext4_free(struct ext4 *fs) {
     if (!fs) return;
+    /* off the commit worker's list, and a transaction still running is
+     * dropped -- the power-cut path frees a mount without its umount
+     * (finding 278) */
+    e4_jfs_forget(fs);
+    if (fs->txn) { txn_free(fs->txn); fs->txn = NULL; }
     blk_watch_remove(e4c_watch, fs);
     e4c_free(fs);
     if (fs->blk_buf)  kfree(fs->blk_buf);
@@ -5098,6 +5308,7 @@ int ext4_mount_ro(const char *mount_point, struct blk_dev *dev, bool rdonly) {
     }
 
     int rc = vfs_mount_flags(mount_point, &ext4_ops, fs, rdonly ? VFS_MNT_RDONLY : 0);
+    if (rc == VFS_OK) e4_jfs_note(fs);      /* the commit worker's (finding 278) */
     if (rc == VFS_OK && dev->name) {
         char sp[48];                   /* its /dev node's path (finding 198) */
         extern bool devfs_blk_path(const struct blk_dev *d, char *out, size_t cap);
@@ -5134,6 +5345,10 @@ static int ext4_umount(void *mnt) {
     if (!fs) return VFS_OK;
     for (size_t i = 0; i < EXT4_MAX_OPEN_INODES; i++)
         if (fs->openrefs[i].refs > 0) return VFS_OK;
+    /* the running transaction first (finding 278), and no commit worker
+     * looks at this mount again */
+    (void)txn_commit_running(fs);
+    e4_jfs_forget(fs);
     /* the log empty, NEEDS_RECOVERY cleared: what a clean umount leaves,
      * as Linux's (finding 274) */
     if (fs->has_journal && fs->j_dirty) {
@@ -5584,6 +5799,9 @@ static bool e4jt_exists(struct ext4 *fs, const char *path) {
  * discard the in-memory fs and remount (which recovers). */
 static struct ext4 *e4jt_crash_create(struct blk_dev *dev, struct ext4 *fs,
                                       const char *path, int phase) {
+    /* what the steps before left in the running transaction goes to the
+     * disk first (finding 278): the crash is to come at THIS create */
+    (void)txn_commit_running(fs);
     g_jbd_crash_phase = phase;
     (void)ext4_create(fs, path, 0, 0, 0644);    /* commit halts at `phase` */
     g_jbd_crash_phase = JBD2_CRASH_NONE;
@@ -5599,6 +5817,7 @@ static struct ext4 *e4jt_crash_rewrite(struct blk_dev *dev, struct ext4 *fs,
     if (ext4_open(fs, "/keep", &f) == VFS_OK) {
         f.mnt = fs; f.pos = 0;
         e4st_fill(scratch, n, seed);
+        (void)txn_commit_running(fs);          /* as e4jt_crash_create */
         g_jbd_crash_phase = phase;
         ext4_write(&f, scratch, n);
         g_jbd_crash_phase = JBD2_CRASH_NONE;

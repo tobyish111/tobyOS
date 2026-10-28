@@ -43,11 +43,24 @@
  *                         functions against what is stored)
  *   umount
  * Each command prints "> LINE rc=N"; the driver's messages go to stderr. */
+/* no kernel here: the commit worker is not built, and a transaction is
+ * committed when an operation finds it due, at sync, umount or crash */
+#define EXT4_HOST 1
+#include <time.h>
+#include <stdint.h>
+uint64_t perf_now_ns(void);
 #include "../../../src/ext4.c"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+
+/* the monotonic clock the running transaction's age is read on */
+uint64_t perf_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -621,6 +634,10 @@ int main(int argc, char **argv)
             continue;
         } else if (!strcmp(op, "crash")) {
             sscanf(line, "%*s %d", &crash);
+            /* the operations before it are committed first -- they share
+             * the running transaction now (finding 278) -- so the crash
+             * comes at the NEXT operation's own commit, as it always did */
+            if (g_mnt) (void)txn_commit_running((struct ext4 *)g_mnt);
             g_jbd_crash_phase = crash;
             printf("> %s rc=0\n", line);
             continue;

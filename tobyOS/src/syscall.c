@@ -5327,6 +5327,17 @@ bool proc_wait_interrupted(struct proc *self) {
            caught != 0;
 }
 
+/* sync(2) and syncfs(2): every mounted filesystem's own sync first -- ext4
+ * commits its running transaction there, which a block-cache flush never
+ * reached (finding 278) -- then the devices. */
+static bool sync_mount_cb(const char *mp, const struct vfs_ops *ops,
+                          void *data, void *cookie) {
+    (void)mp; (void)cookie;
+    if (ops && ops->sync) (void)ops->sync(data);
+    return true;
+}
+static void sync_all_mounts(void) { vfs_iter_mounts(sync_mount_cb, 0); }
+
 static long sys_nanosleep(uint64_t ns) {
     /* Resolution is set by the timer tick (~10 ms on QEMU) -- good enough
      * for the uses libc has in M25A (sleep, usleep).
@@ -7326,6 +7337,7 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case ABI_SYS_SYNC: {
         /* Not privileged: flushing writes is not a privileged act. */
         extern void bcache_sync(struct blk_dev *dev);
+        sync_all_mounts();          /* each filesystem's own (finding 278) */
         bcache_sync(NULL);          /* NULL == every device */
         return 0;
     }
@@ -7463,6 +7475,9 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         unsigned action = (unsigned)a1;
         kprintf("[power] pid %d requested action %u\n",
                 current_proc() ? current_proc()->pid : -1, action);
+        /* every filesystem's own sync before the power goes: ext4's running
+         * transaction is in memory until it is committed (finding 278) */
+        sync_all_mounts();
         switch (action) {
         case ABI_POWER_OFF:    acpi_shutdown();   /* noreturn */ break;
         case ABI_POWER_REBOOT: acpi_reboot();     /* noreturn */ break;
@@ -14599,6 +14614,7 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         /* bcache.h is not included here; mirror the local-extern idiom
          * reg_sync_disks() already uses further down this file. */
         extern void bcache_sync(struct blk_dev *dev);
+        sync_all_mounts();          /* each filesystem's own (finding 278) */
         size_t nd = blk_count();
         for (size_t i = 0; i < nd; i++) {
             struct blk_dev *d = blk_get(i);
