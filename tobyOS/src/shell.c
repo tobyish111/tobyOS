@@ -4169,6 +4169,8 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
  * words' own expansions cannot see; `=` then REPLACES the array with it and
  * `+=` merges it in. A scalar of the same name goes at the same moment,
  * not before: `w=W; w=("$w" q)` reads W. */
+static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
+                             bool is_array);
 static int sh_array_assign_literal(const char *name, const char *paren,
                                    bool append) {
     const char *p = paren;
@@ -4227,7 +4229,15 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         const char *real = env_deref_name_ex(name, &tgt, false);
         if (!real || !*real) real = name;
         int si = env_find(real, strlen(real));
-        if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) env_remove_at(si);
+        if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) {
+            env_remove_at(si);
+            /* ...but not its attributes: they are the NAME's, and the
+             * array keeps them, so `typeset -i x; x=(1); x+=(3+4)` adds 7
+             * (bash's appendop.tests; finding 289). An array's attributes
+             * live on a holder entry, as declare -ai leaves them. */
+            if (at & SHVAR_VALUE_ATTRS)
+                shell_decl_attrs(real, at & SHVAR_VALUE_ATTRS, 0, true);
+        }
     }
     if (assoc) return sh_array_literal_commit(tmp, name, append);
     /* Phase two (sh_litq): the array as it will be -- emptied for `=` --
