@@ -552,6 +552,8 @@ long sys_fork(void) {
     child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
     child->cmin_flt = child->cmaj_flt = 0;
     child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv   = 0;
     /* Slice 8: the memcpy copied the parent's namespace POINTERS, which is the
      * correct inheritance -- but each one now has a second user, so take the
@@ -971,6 +973,8 @@ long sys_fork_share(void) {
     child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
     child->cmin_flt = child->cmaj_flt = 0;
     child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;
@@ -1212,6 +1216,8 @@ long sys_clone_thread(uint64_t flags, uint64_t stack, uint64_t ptid,
     child->tg_dead_min_flt = child->tg_dead_maj_flt = 0;
     child->cmin_flt = child->cmaj_flt = 0;
     child->tg_dead_utime_ns = child->tg_dead_stime_ns = 0;
+    child->rep_utime_ns = child->rep_stime_ns = 0;
+    child->tg_rep_utime_ns = child->tg_rep_stime_ns = 0;
     child->sysprot_priv    = 0;
     child->cursys          = -1;   /* slice 113: see sys_fork */
     child->cursys_nat      = -1;

@@ -2263,6 +2263,45 @@ void proc_reap_orphans(void) {
     }
 }
 
+static void u64_store_max(uint64_t *at, uint64_t v) {
+    uint64_t cur = __atomic_load_n(at, __ATOMIC_RELAXED);
+    while (cur < v &&
+           !__atomic_compare_exchange_n(at, &cur, v, false, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED))
+        ;
+}
+
+/* NEITHER TIME MAY GO DOWN. The split below follows the tick ratio, and a
+ * tick that lands in user mode lowers the system share of a total that has
+ * hardly grown: one reading's stime came out a tick's worth BELOW the one
+ * before, and tsh's `time`, subtracting the two, printed
+ * "sys 18446744073.70" -- 2^64 ns (posixpipe, batch 37; logs/b38/
+ * cputmono.c counts the falls). Linux's cputime_adjust keeps the last
+ * pair it gave and moves the new split so that neither is below it, the
+ * total still the sum. Readers race only to the larger pair (a store of
+ * the maximum), and a reading whose total is older than the last report
+ * answers that report. */
+static void cputime_monotonic(uint64_t total, uint64_t *ut, uint64_t *st,
+                              uint64_t *rep_u, uint64_t *rep_s) {
+    uint64_t pu = __atomic_load_n(rep_u, __ATOMIC_RELAXED);
+    uint64_t ps = __atomic_load_n(rep_s, __ATOMIC_RELAXED);
+    uint64_t u = *ut, s = *st;
+    if (pu + ps > total) {
+        u = pu;
+        s = ps;
+    } else if (s < ps) {
+        s = ps;
+        u = total - ps;                 /* >= pu: total >= pu + ps */
+    } else if (u < pu) {
+        u = pu;
+        s = total - pu;                 /* >= ps, likewise */
+    }
+    u64_store_max(rep_u, u);
+    u64_store_max(rep_s, s);
+    *ut = u;
+    *st = s;
+}
+
 /* Free everything owned by a TERMINATED process and recycle the slot. */
 void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
     uint64_t total = p->cpu_ns;
@@ -2279,6 +2318,10 @@ void proc_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
     }
     *st = sys;
     *ut = total - sys;
+    /* the last report is a memo, not the proc's state: written through
+     * the const pointer, as every reader must see it */
+    struct proc *mp = (struct proc *)p;
+    cputime_monotonic(total, ut, st, &mp->rep_utime_ns, &mp->rep_stime_ns);
 }
 
 void proc_group_faults(const struct proc *p, uint64_t *minf, uint64_t *majf) {
@@ -2307,6 +2350,15 @@ void proc_group_cputimes(const struct proc *p, uint64_t *ut, uint64_t *st) {
         u += qu;
         s += qs;
     }
+    /* the group's sum moves as its members' splits do, and a member that
+     * goes moves its time from its slot to the dead totals: kept
+     * monotonic the same way, on the leader */
+    struct proc *ld = (struct proc *)p;
+    if (p->tgid && p->tgid != p->pid) {
+        struct proc *l = proc_lookup(p->tgid);
+        if (l && l->state != PROC_UNUSED) ld = l;
+    }
+    cputime_monotonic(u + s, &u, &s, &ld->tg_rep_utime_ns, &ld->tg_rep_stime_ns);
     *ut = u;
     *st = s;
 }

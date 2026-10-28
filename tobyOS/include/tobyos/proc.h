@@ -836,6 +836,14 @@ struct proc {
         uint8_t  kind, cpu, qcpu, state, on_cpu, on_rq;
     } sched_trace[8];
     uint32_t        sched_trace_i;
+
+    /* The user and system time last REPORTED, this thread's and (on the
+     * group leader) its thread group's: proc_cputimes' tick-ratio split
+     * moves with every tick, and a reading may never be less than one
+     * already given out (Linux's cputime_adjust keeps the same pair).
+     * Zero in a new proc, as the rest of the accounting is. */
+    uint64_t        rep_utime_ns, rep_stime_ns;
+    uint64_t        tg_rep_utime_ns, tg_rep_stime_ns;
 };
 
 /* ---- Milestone 19: time a child's exit --------------------------- *
