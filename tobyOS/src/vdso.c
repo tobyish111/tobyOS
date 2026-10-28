@@ -138,18 +138,28 @@ void vdso_init(void) {
 void vdso_refresh(void) {
     if (!g_vvar) return;
     extern uint64_t perf_boot_tsc(void);
-    extern uint64_t lx_realtime_offset_ns(void);
+    extern void lx_realtime_params(uint64_t *base, uint64_t *t0, uint64_t *t1,
+                                   int64_t *rate);
     uint32_t khz = perf_tsc_khz();
     uint64_t bt  = perf_boot_tsc();
-    uint64_t ep  = lx_realtime_offset_ns();
+    /* the base and the slew, not their sum at this instant: a slew moves
+     * that sum every tick, and the page would step where the clock slews
+     * (finding 280) */
+    uint64_t ep, t0, t1;
+    int64_t rate;
+    lx_realtime_params(&ep, &t0, &t1, &rate);
     if (g_vvar->tsc_khz == khz && g_vvar->boot_tsc == bt &&
-        g_vvar->epoch_base_ns == ep)
+        g_vvar->epoch_base_ns == ep && g_vvar->slew_t0 == t0 &&
+        g_vvar->slew_t1 == t1 && g_vvar->slew_rate == rate)
         return;
     g_vvar->seq++;                                   /* odd: writer active */
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     g_vvar->tsc_khz       = khz;
     g_vvar->boot_tsc      = bt;
     g_vvar->epoch_base_ns = ep;
+    g_vvar->slew_t0       = t0;
+    g_vvar->slew_t1       = t1;
+    g_vvar->slew_rate     = rate;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     g_vvar->seq++;                                   /* even: stable */
 }

@@ -1416,7 +1416,14 @@ struct abi_arp_entry { uint32_t ip_be; uint8_t mac[6]; uint8_t valid; uint8_t _p
 #define ABI_SYS_FSYNC           243  /* (fd, datasync) -> 0|-E: fsync(2),
                                         fdatasync(2) when DATASYNC (finding
                                         215: shred synced every file) */
-#define ABI_SYS_NR_MAX          243
+#define ABI_SYS_ADJTIMEX        244  /* (struct timex *, Linux's x86-64
+                                        layout) -> clock state|-E:
+                                        adjtimex(2) -- a single-shot or NTP
+                                        offset SLEWED at 500 ppm, never a
+                                        jump; ADJ_SETOFFSET steps.
+                                        CAP_SYS_TIME to change anything
+                                        (EPERM). (finding 280) */
+#define ABI_SYS_NR_MAX          244
 
 #define ABI_SHADOW_GET     0  /* arg: struct abi_shadow *out; root, or the
                                  account's own user */

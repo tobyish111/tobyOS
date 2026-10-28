@@ -34,7 +34,10 @@ struct vdso_data {
     u32 seq;            /* odd = writer active; retry */
     u32 tsc_khz;        /* 0 = not calibrated: always fall back */
     u64 boot_tsc;
-    u64 epoch_base_ns;  /* CLOCK_REALTIME - CLOCK_MONOTONIC; 0 = no RTC */
+    u64 epoch_base_ns;  /* CLOCK_REALTIME - CLOCK_MONOTONIC before any
+                           slew; 0 = no RTC */
+    u64 slew_t0, slew_t1;   /* a slew from t0 to t1 (monotonic ns), */
+    i64 slew_rate;          /* rate ppb fast or slow (finding 280) */
 };
 
 struct ts { i64 sec; i64 nsec; };
@@ -78,6 +81,8 @@ static int read_clock(int clk, u64 *out) {
         u32 khz = d->tsc_khz;
         u64 bt  = d->boot_tsc;
         u64 ep  = d->epoch_base_ns;
+        u64 t0  = d->slew_t0, t1 = d->slew_t1;
+        i64 rate = d->slew_rate;
         __asm__ volatile("" ::: "memory");
         if (d->seq != s0) continue;
         if (khz == 0) return -1;
@@ -85,16 +90,25 @@ static int read_clock(int clk, u64 *out) {
          * after 2^64/1e6 cycles (~72 min at 4.3 GHz) */
         u64 dt = rdtsc_ordered() - bt;
         u64 mono = (dt / khz) * 1000000ull + (dt % khz) * 1000000ull / khz;
+        /* the slew so far: it moves monotonic and realtime together, as
+         * Linux's does -- the kernel's lx_mono_ns and lx_realtime_ns */
+        i64 adj = 0;
+        if (t0 && mono > t0) {
+            u64 dm = (mono < t1 ? mono : t1) - t0;
+            adj = rate * (i64)dm / 1000000000LL;
+        }
         switch (clk) {
-        case CLK_MONOTONIC:
         case CLK_MONOTONIC_RAW:
+            *out = mono;
+            return 0;
+        case CLK_MONOTONIC:
         case CLK_MONOTONIC_COARSE:
         case CLK_BOOTTIME:
-            *out = mono;
+            *out = mono + (u64)adj;
             return 0;
         case CLK_REALTIME:
         case CLK_REALTIME_COARSE:
-            *out = mono + ep;
+            *out = ep ? mono + ep + (u64)adj : mono;
             return 0;
         default:
             return -1;

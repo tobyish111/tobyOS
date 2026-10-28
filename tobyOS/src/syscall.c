@@ -19,6 +19,7 @@
  * /bin/echo, /bin/cat) all use the new signature.
  */
 
+#include <tobyos/spinlock.h>
 #include <tobyos/rlimit.h>
 #include <tobyos/syscall.h>
 #include <tobyos/kmath.h>      /* C20: kernel libm for the float-return shims */
@@ -116,6 +117,10 @@ int  proc_wait_or_ptrace(int pid);        /* src/proc.c */
 #include <tobyos/pe.h>
 #include <tobyos/kfont.h>   /* C14b: kernel TrueType text for the GDI shims */
 #include "../build/kbuild_id.h"   /* TOBYOS_BUILD_DATE: uname's version (253) */
+
+/* the slewed CLOCK_MONOTONIC (finding 280), defined with the wall clock */
+uint64_t lx_mono_ns(uint64_t raw);
+uint64_t lx_mono_sleep_raw(uint64_t d);
 
 extern void syscall_entry(void);
 
@@ -7358,7 +7363,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         extern uint64_t lx_realtime_ns(uint64_t mono_ns);
         uint64_t mono = perf_now_ns();
         if ((int)a1 == ABI_CLOCK_REALTIME)  return (long)lx_realtime_ns(mono);
-        if ((int)a1 == ABI_CLOCK_MONOTONIC) return (long)mono;
+        /* slewed with realtime, as Linux's CLOCK_MONOTONIC (finding 280) */
+        if ((int)a1 == ABI_CLOCK_MONOTONIC) return (long)lx_mono_ns(mono);
         return -ABI_EINVAL;
     }
 
@@ -7603,6 +7609,10 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
         return sys_utimensat_native((const char *)a1, (const void *)a2, (int)a3);
     case ABI_SYS_CLOCK_SETTIME:     /* as Linux's clock_settime (finding 157) */
         return lx_clock_settime((int)a1, (const void *)a2);
+    case ABI_SYS_ADJTIMEX: {        /* as Linux's adjtimex (finding 280) */
+        extern long lx_adjtimex(void *utx);
+        return lx_adjtimex((void *)a1);
+    }
     case ABI_SYS_GETNICE: return nice_get((int)a1, (int)a2);
     case ABI_SYS_SETNICE: return nice_set((int)a1, (int)a2, (long)(int)a3);
     case ABI_SYS_XSTAT:
@@ -7634,7 +7644,8 @@ static long do_syscall(long num, long a1, long a2, long a3, long a4, long a5) {
     case SYS_CHDIR:         return sys_chdir((const char *)a1);
     case SYS_GETENV:
         return sys_getenv((const char *)a1, (char *)a2, (size_t)a3);
-    case SYS_NANOSLEEP:     return sys_nanosleep((uint64_t)a1);
+    /* the duration is CLOCK_MONOTONIC's, slewed (finding 280) */
+    case SYS_NANOSLEEP:     return sys_nanosleep(lx_mono_sleep_raw((uint64_t)a1));
     case SYS_CLOCK_MS:      return sys_clock_ms();
     case SYS_ABI_VERSION:   return sys_abi_version();
 
@@ -8497,6 +8508,7 @@ enum {
     LX_getsockopt = 55, LX_accept4 = 288,
     LX_gettimeofday = 96, LX_sysinfo = 99, LX_getresuid = 118,
     LX_settimeofday = 164, LX_clock_settime = 227,
+    LX_adjtimex = 159, LX_clock_adjtime = 305,   /* finding 280 */
     LX_getresgid = 120, LX_statfs = 137, LX_fstatfs = 138,
     LX_getpriority = 140, LX_setpriority = 141,
     LX_sched_setaffinity = 203, LX_sched_getaffinity = 204,
@@ -9715,18 +9727,163 @@ struct lx_pollfd { int fd; short events; short revents; };  /* 8 bytes, Linux AB
  * other end -- never jumps. 0 means not anchored yet; the clock is read from
  * the lock-free time fast path, so the anchor is read and written whole. */
 static uint64_t g_epoch_base_ns;           /* unix_ns - mono_ns */
-uint64_t lx_realtime_ns(uint64_t mono_ns) {
+
+/* SLEWING (finding 280): adjtime(3) and adjtimex(2) move the wall clock by
+ * an offset GRADUALLY -- at 500 ppm, as Linux's single-shot adjustment does
+ * -- so it never jumps, backward least of all. timesyncd stepped the clock
+ * for any offset of 50 ms or more, and a step back inside a timed wait made
+ * the wait read 310 ms where 360 had passed (utilgate's sleep_waits on the
+ * box). Between T0 and T1 (monotonic ns) the clock runs RATE ppb fast or
+ * slow; after T1 it has absorbed the whole offset, RATE * (T1 - T0) / 1e9.
+ * The vDSO computes the same function of the same fields (vdso_refresh);
+ * SEQ is odd while a writer changes them. */
+static struct {
+    uint32_t seq;
+    uint64_t t0, t1;
+    int64_t  rate;
+} g_slew;
+static spinlock_t g_slew_lock = SPINLOCK_INIT;
+#define LX_SLEW_PPB 500000LL
+
+static int64_t lx_slew_adj(uint64_t mono, uint64_t t0, uint64_t t1, int64_t rate) {
+    if (!t0 || mono <= t0) return 0;
+    uint64_t dm = (mono < t1 ? mono : t1) - t0;
+    return rate * (int64_t)dm / 1000000000LL;
+}
+
+static uint64_t lx_epoch_base(uint64_t mono_ns);
+
+/* The wall clock's parameters for the vDSO's data page, one consistent
+ * reading: the base (realtime - monotonic before any slew; 0 = no RTC)
+ * and the slew. The page computes lx_realtime_ns from exactly these. */
+void lx_realtime_params(uint64_t *base, uint64_t *t0, uint64_t *t1,
+                        int64_t *rate) {
+    uint64_t mono = perf_now_ns();
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        *base = lx_epoch_base(mono);
+        *t0 = g_slew.t0; *t1 = g_slew.t1; *rate = g_slew.rate;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+}
+
+/* The slew now: one consistent reading. */
+void lx_slew_snapshot(uint64_t *t0, uint64_t *t1, int64_t *rate) {
+    uint32_t s;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        *t0 = g_slew.t0; *t1 = g_slew.t1; *rate = g_slew.rate;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+}
+
+static uint64_t lx_epoch_base(uint64_t mono_ns) {
     uint64_t b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
     if (b == 0) {
         uint64_t secs = rtc_unix_time();
-        if (secs == 0) return mono_ns;     /* no RTC: monotonic is all we have */
+        if (secs == 0) return 0;           /* no RTC: monotonic is all we have */
         uint64_t want = secs * 1000000000ull - mono_ns, unset = 0;
         if (want == 0) want = 1;
         (void)__atomic_compare_exchange_n(&g_epoch_base_ns, &unset, want, false,
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
         b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
     }
-    return b + mono_ns;
+    return b;
+}
+
+uint64_t lx_realtime_ns(uint64_t mono_ns) {
+    uint32_t s;
+    uint64_t b;
+    int64_t adj;
+    do {
+        s = __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE);
+        b = lx_epoch_base(mono_ns);
+        adj = lx_slew_adj(mono_ns, g_slew.t0, g_slew.t1, g_slew.rate);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while ((s & 1) || s != __atomic_load_n(&g_slew.seq, __ATOMIC_ACQUIRE));
+    if (b == 0) return mono_ns;
+    return b + mono_ns + (uint64_t)adj;
+}
+
+/* CLOCK_MONOTONIC as Linux keeps it: the raw clock plus the slew so far.
+ * An adjtime slew moves monotonic WITH realtime -- realtime - monotonic
+ * stays as it was (Linux under adjtime, logs/b38/slewtest-wsl.txt) -- and
+ * only CLOCK_MONOTONIC_RAW is the hardware's. */
+uint64_t lx_mono_ns(uint64_t raw) {
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    return raw + (uint64_t)lx_slew_adj(raw, t0, t1, rate);
+}
+
+/* The raw nanoseconds from now until CLOCK_MONOTONIC has moved D: a sleep
+ * counts the slewed clock, as Linux's hrtimers do, so it is never short on
+ * it or on the wall clock -- a slew that ran the clock slow made a raw
+ * 360 ms read 359.8. The inverse of lx_mono_ns, piece by piece: before the
+ * slew, during it (at 1 + rate), after it. */
+uint64_t lx_mono_sleep_raw(uint64_t d) {
+    uint64_t raw = perf_now_ns();
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    if (!t0) return d;
+    int64_t total = lx_slew_adj(t1, t0, t1, rate);
+    uint64_t target = raw + (uint64_t)lx_slew_adj(raw, t0, t1, rate) + d;
+    uint64_t r;
+    if (target <= t0) {
+        r = target;
+    } else if (target < t1 + (uint64_t)total) {
+        /* t0 + delta * 1e9 / (1e9 + rate), without the 128-bit product:
+         * delta - delta * rate / (1e9 + rate), and a nanosecond up */
+        int64_t delta = (int64_t)(target - t0);
+        r = t0 + (uint64_t)(delta - delta * rate / (1000000000LL + rate)) + 1;
+    } else {
+        r = target - (uint64_t)total;
+    }
+    return r > raw ? r - raw : 0;
+}
+
+/* Fold the slew so far into the base and stop it (a writer, the lock held,
+ * SEQ odd): the clock reads the same before and after. */
+static void lx_slew_fold_locked(uint64_t mono) {
+    int64_t adj = lx_slew_adj(mono, g_slew.t0, g_slew.t1, g_slew.rate);
+    uint64_t b = __atomic_load_n(&g_epoch_base_ns, __ATOMIC_ACQUIRE);
+    if (b) __atomic_store_n(&g_epoch_base_ns, b + (uint64_t)adj, __ATOMIC_RELEASE);
+    g_slew.t0 = g_slew.t1 = 0;
+    g_slew.rate = 0;
+}
+
+/* What a slew still has to move the clock by (ns, signed). */
+static int64_t lx_slew_left(uint64_t mono) {
+    uint64_t t0, t1;
+    int64_t rate;
+    lx_slew_snapshot(&t0, &t1, &rate);
+    if (!t0) return 0;
+    int64_t total = lx_slew_adj(t1, t0, t1, rate);
+    return total - lx_slew_adj(mono, t0, t1, rate);
+}
+
+/* Start slewing the clock by OFFSET ns from now, replacing any slew still
+ * running (adjtime(3): the new delta replaces the old). The time the
+ * remaining one had not yet moved is left unmoved, as there. */
+static void lx_slew_start(int64_t offset) {
+    uint64_t mono = perf_now_ns();
+    (void)lx_epoch_base(mono);                     /* anchored first */
+    uint64_t fl = spin_lock_irqsave(&g_slew_lock);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    lx_slew_fold_locked(mono);
+    if (offset != 0) {
+        uint64_t mag = offset < 0 ? (uint64_t)-offset : (uint64_t)offset;
+        g_slew.t0 = mono ? mono : 1;
+        g_slew.t1 = g_slew.t0 + mag * (1000000000ull / (uint64_t)LX_SLEW_PPB);
+        g_slew.rate = offset < 0 ? -LX_SLEW_PPB : LX_SLEW_PPB;
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_slew_lock, fl);
+    { extern void vdso_refresh(void); vdso_refresh(); }
 }
 
 /* THE TIME A FILE IS STAMPED WITH: the wall clock as of the last 4 ms tick,
@@ -9774,7 +9931,16 @@ static long lx_realtime_set(int64_t sec, int64_t nsec) {
     uint64_t base = want - mono;
     if (base == 0) base = 1;
     uint64_t was = lx_realtime_ns(mono);
+    /* a step ends any slew (Linux: setting the time clears the offset) */
+    uint64_t fl = spin_lock_irqsave(&g_slew_lock);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    g_slew.t0 = g_slew.t1 = 0;
+    g_slew.rate = 0;
     __atomic_store_n(&g_epoch_base_ns, base, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __atomic_store_n(&g_slew.seq, g_slew.seq + 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&g_slew_lock, fl);
     struct proc *p = current_proc();
     int64_t step_ms = (int64_t)(want - was) / 1000000;
     kprintf("[time] clock set to %lld.%09lld by pid %d (step %lld ms)\n",
@@ -9786,6 +9952,117 @@ static long lx_realtime_set(int64_t sec, int64_t nsec) {
         utmp_refresh();
     }
     return 0;
+}
+
+/* adjtimex(2) (finding 280): struct timex as x86-64 Linux lays it out, 208
+ * bytes. The clock-changing modes need CAP_SYS_TIME; reading never does.
+ *   ADJ_OFFSET_SINGLESHOT  adjtime(3): slew by `offset` us at 500 ppm; the
+ *                          one replaced comes back in `offset`
+ *   ADJ_OFFSET_SS_READ     what is still to be slewed, changing nothing
+ *   ADJ_OFFSET             the NTP offset (ns with ADJ_NANO), slewed the
+ *                          same way here -- no PLL -- and clamped to Linux's
+ *                          MAXPHASE, 0.5 s
+ *   ADJ_SETOFFSET          a step by `time` (us, or ns with ADJ_NANO)
+ * The rest -- frequency, errors, status, time constant, tick -- is kept and
+ * given back, STA_UNSYNC until a caller clears it (TIME_ERROR, 5, then). */
+struct lx_timex {
+    int32_t modes, pad0;
+    int64_t offset, freq, maxerror, esterror;
+    int32_t status, pad1;
+    int64_t constant, precision, tolerance;
+    int64_t time_sec, time_usec;
+    int64_t tick, ppsfreq, jitter;
+    int32_t shift, pad2;
+    int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+    int32_t tai;
+    int32_t pad3[11];
+};
+_Static_assert(sizeof(struct lx_timex) == 208, "struct timex is 208 bytes");
+#define LX_ADJ_OFFSET            0x0001
+#define LX_ADJ_FREQUENCY         0x0002
+#define LX_ADJ_MAXERROR          0x0004
+#define LX_ADJ_ESTERROR          0x0008
+#define LX_ADJ_STATUS            0x0010
+#define LX_ADJ_TIMECONST         0x0020
+#define LX_ADJ_SETOFFSET         0x0100
+#define LX_ADJ_MICRO             0x1000
+#define LX_ADJ_NANO              0x2000
+#define LX_ADJ_TICK              0x4000
+#define LX_ADJ_OFFSET_SINGLESHOT 0x8001
+#define LX_ADJ_OFFSET_SS_READ    0xa001
+#define LX_STA_UNSYNC            0x0040
+#define LX_STA_NANO              0x2000
+static struct {
+    int32_t status;
+    int64_t freq, maxerror, esterror, constant, tick;
+} g_ntp = { LX_STA_UNSYNC, 0, 16000000, 16000000, 2, 10000 };
+
+long lx_adjtimex(void *utx) {
+    struct lx_timex tx;
+    if (!utx || copy_from_user(&tx, utx, sizeof tx) != 0) return -ABI_EFAULT;
+    int modes = tx.modes;
+    bool ss_read = (modes & 0xffff) == LX_ADJ_OFFSET_SS_READ;
+    if (modes && !ss_read && !lx_may_set_time()) return -ABI_EPERM;
+    uint64_t mono = perf_now_ns();
+    int64_t left = lx_slew_left(mono);
+    if (ss_read) {
+        tx.offset = left / 1000;
+    } else if ((modes & LX_ADJ_OFFSET_SINGLESHOT) == LX_ADJ_OFFSET_SINGLESHOT) {
+        lx_slew_start(tx.offset * 1000);
+        tx.offset = left / 1000;                  /* the delta it replaced */
+    } else {
+        if (modes & LX_ADJ_NANO)  g_ntp.status |= LX_STA_NANO;
+        if (modes & LX_ADJ_MICRO) g_ntp.status &= ~LX_STA_NANO;
+        bool nano = (g_ntp.status & LX_STA_NANO) != 0;
+        if (modes & LX_ADJ_TICK) {
+            if (tx.tick < 9000 || tx.tick > 11000) return -ABI_EINVAL;
+            g_ntp.tick = tx.tick;
+        }
+        if (modes & LX_ADJ_SETOFFSET) {
+            int64_t sub = tx.time_usec;
+            if (sub < 0 || sub >= (nano ? 1000000000LL : 1000000LL))
+                return -ABI_EINVAL;
+            int64_t d = tx.time_sec * 1000000000LL + (nano ? sub : sub * 1000);
+            int64_t now = (int64_t)lx_realtime_ns(perf_now_ns());
+            int64_t want = now + d;
+            if (want < 0) return -ABI_EINVAL;
+            long r = lx_realtime_set(want / 1000000000LL, want % 1000000000LL);
+            if (r) return r;
+            left = 0;
+        }
+        if (modes & LX_ADJ_STATUS)    g_ntp.status = (g_ntp.status & LX_STA_NANO) |
+                                                     (tx.status & ~LX_STA_NANO);
+        if (modes & LX_ADJ_FREQUENCY) g_ntp.freq = tx.freq;
+        if (modes & LX_ADJ_MAXERROR)  g_ntp.maxerror = tx.maxerror;
+        if (modes & LX_ADJ_ESTERROR)  g_ntp.esterror = tx.esterror;
+        if (modes & LX_ADJ_TIMECONST) g_ntp.constant = tx.constant;
+        if (modes & LX_ADJ_OFFSET) {
+            int64_t off = nano ? tx.offset : tx.offset * 1000;
+            if (off > 500000000LL)  off = 500000000LL;      /* MAXPHASE */
+            if (off < -500000000LL) off = -500000000LL;
+            lx_slew_start(off);
+            left = off;
+        }
+        tx.offset = nano ? left : left / 1000;
+    }
+    bool nano = (g_ntp.status & LX_STA_NANO) != 0;
+    uint64_t rt = lx_realtime_ns(perf_now_ns());
+    tx.freq = g_ntp.freq;
+    tx.maxerror = g_ntp.maxerror;
+    tx.esterror = g_ntp.esterror;
+    tx.status = g_ntp.status;
+    tx.constant = g_ntp.constant;
+    tx.precision = 1;
+    tx.tolerance = 32768000;                      /* 500 ppm, scaled by 2^16 */
+    tx.time_sec = (int64_t)(rt / 1000000000ull);
+    tx.time_usec = (int64_t)(rt % 1000000000ull) / (nano ? 1 : 1000);
+    tx.tick = g_ntp.tick;
+    tx.ppsfreq = tx.jitter = 0;
+    tx.shift = 0;
+    tx.stabil = tx.jitcnt = tx.calcnt = tx.errcnt = tx.stbcnt = 0;
+    tx.tai = 0;
+    if (copy_to_user(utx, &tx, sizeof tx) != 0) return -ABI_EFAULT;
+    return (g_ntp.status & LX_STA_UNSYNC) ? 5 /* TIME_ERROR */ : 0 /* TIME_OK */;
 }
 
 /* clock_settime(2): only CLOCK_REALTIME is settable; the id is judged
@@ -9945,8 +10222,10 @@ static int linux_fast_time_syscall(long num, long a1, long a2, long *out) {
         switch ((int)a1) {
         case 0: case 5: case 8:                 /* CLOCK_REALTIME family */
             val = lx_realtime_ns(mono); break;
+        case 1: case 6: case 7: case 9:          /* MONOTONIC / BOOTTIME: */
+            val = lx_mono_ns(mono); break;       /* slewed (finding 280) */
         case 2: case 3:                          /* PROCESS/THREAD_CPUTIME */
-        case 1: case 4: case 6: case 7: case 9:  /* MONOTONIC / BOOTTIME */
+        case 4:                                  /* MONOTONIC_RAW */
             val = mono; break;
         default:
             return 0;                            /* unknown id: normal path -> EINVAL */
@@ -13819,6 +14098,11 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         return lx_settimeofday((const void *)a1, (const void *)a2);
     case LX_clock_settime:         /* (clockid, tp) -- finding 157 */
         return lx_clock_settime((int)a1, (const void *)a2);
+    case LX_adjtimex:              /* (struct timex *) -- finding 280 */
+        return lx_adjtimex((void *)a1);
+    case LX_clock_adjtime:         /* (clockid, struct timex *) */
+        if ((int)a1 != 0) return -ABI_EINVAL;   /* CLOCK_REALTIME only */
+        return lx_adjtimex((void *)a2);
 
     /* ---- B13: poll / select / epoll (readiness multiplexing) ---- */
     case LX_poll:                  /* poll(fds, nfds, timeout_ms) */
@@ -16531,7 +16815,13 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
         uint64_t t = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
         uint64_t ns = t;
         if ((int)a2 & 1) {                 /* TIMER_ABSTIME */
-            uint64_t now = perf_now_ns();
+            /* the deadline is on the CLOCK named: realtime's on the wall
+             * clock (it was compared with the monotonic one), the others'
+             * on the slewed monotonic clock; SYS_NANOSLEEP takes the
+             * difference as a CLOCK_MONOTONIC duration (finding 280) */
+            uint64_t raw = perf_now_ns();
+            uint64_t now = ((int)a1 == 0 || (int)a1 == 8) ? lx_realtime_ns(raw)
+                                                          : lx_mono_ns(raw);
             ns = (t > now) ? (t - now) : 0;
         }
         return do_syscall(SYS_NANOSLEEP, (long)ns, 0, 0, 0, 0);
@@ -16583,10 +16873,12 @@ static long linux_syscall_impl(long n, long a1, long a2, long a3, long a4, long 
             val = mono;
             break;
         case 1:  /* CLOCK_MONOTONIC       */
-        case 4:  /* CLOCK_MONOTONIC_RAW   */
         case 6:  /* CLOCK_MONOTONIC_COARSE*/
         case 7:  /* CLOCK_BOOTTIME        */
         case 9:  /* CLOCK_BOOTTIME_ALARM  */
+            val = lx_mono_ns(mono);         /* slewed, as Linux's (finding 280) */
+            break;
+        case 4:  /* CLOCK_MONOTONIC_RAW   */
             val = mono;
             break;
         default:

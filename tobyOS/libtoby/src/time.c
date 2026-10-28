@@ -21,6 +21,7 @@
 
 #include <time.h>
 #include <sys/time.h>
+#include <sys/timex.h>     /* adjtimex, adjtime (finding 280) */
 #include <sys/stat.h>      /* utimensat, AT_FDCWD (batch 26) */
 #include <string.h>
 #include <errno.h>
@@ -125,6 +126,35 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz) {
     if (tv->tv_usec < 0 || tv->tv_usec >= 1000000) { errno = EINVAL; return -1; }
     struct timespec t = { tv->tv_sec, tv->tv_usec * 1000L };
     return clock_settime(CLOCK_REALTIME, &t);
+}
+
+/* adjtimex(2), the kernel's (ABI_SYS_ADJTIMEX): its return value is the
+ * clock state, TIME_OK or TIME_ERROR (finding 280). */
+int adjtimex(struct timex *tx) {
+    return (int)__toby_check(toby_sc1(ABI_SYS_ADJTIMEX, (long)(uintptr_t)tx));
+}
+
+/* adjtime(3) over adjtimex's single-shot mode, as glibc's: the new delta
+ * replaces the old, which comes back in OLDDELTA. */
+int adjtime(const struct timeval *delta, struct timeval *olddelta) {
+    struct timex tx;
+    memset(&tx, 0, sizeof tx);
+    if (delta) {
+        if (delta->tv_usec <= -1000000 || delta->tv_usec >= 1000000) {
+            errno = EINVAL;
+            return -1;
+        }
+        tx.modes = ADJ_OFFSET_SINGLESHOT;
+        tx.offset = (long)delta->tv_sec * 1000000L + delta->tv_usec;
+    } else {
+        tx.modes = ADJ_OFFSET_SS_READ;
+    }
+    if (adjtimex(&tx) < 0) return -1;
+    if (olddelta) {
+        olddelta->tv_sec = tx.offset / 1000000L;
+        olddelta->tv_usec = tx.offset % 1000000L;
+    }
+    return 0;
 }
 
 int nanosleep(const struct timespec *req, struct timespec *rem) {

@@ -25,7 +25,14 @@ struct vdso_data {
     uint32_t seq;            /* seqlock: odd = writer active */
     uint32_t tsc_khz;
     uint64_t boot_tsc;
-    uint64_t epoch_base_ns;  /* CLOCK_REALTIME - MONOTONIC; 0 = no RTC */
+    uint64_t epoch_base_ns;  /* CLOCK_REALTIME - MONOTONIC before any slew;
+                                0 = no RTC */
+    /* A slew (adjtime/adjtimex, finding 280): from slew_t0 to slew_t1
+     * (monotonic ns; t0 0 = none) realtime runs slew_rate ppb fast or
+     * slow, and after t1 it is rate * (t1 - t0) / 1e9 on -- the kernel's
+     * lx_realtime_ns, computed the same way. */
+    uint64_t slew_t0, slew_t1;
+    int64_t  slew_rate;
 };
 
 /* Stage the embedded blob into physical pages + allocate the data page.

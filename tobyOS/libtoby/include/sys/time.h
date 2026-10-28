@@ -25,6 +25,11 @@ struct timezone {
 int gettimeofday(struct timeval *tv, struct timezone *tz);
 int settimeofday(const struct timeval *tv, const struct timezone *tz);   /* root only */
 
+/* adjtime(3): slew the clock by DELTA (root only), the adjustment still
+ * outstanding before it in OLDDELTA; DELTA null only reads that. Over
+ * adjtimex's single-shot mode, as glibc's (finding 280). */
+int adjtime(const struct timeval *delta, struct timeval *olddelta);
+
 /* utimes(2). times[0] = atime, times[1] = mtime; NULL means "now", which
  * is touch(1)'s default and the only form it needs. Added 2026-08-24 --
  * before it, the native ABI had no way to set a timestamp at all, so

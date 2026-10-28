@@ -13,13 +13,15 @@
  *     it is not the answer to this request) -- and takes a reply only from
  *     a synchronized server (leap indicator not 3, stratum 1..15);
  *   - computes the offset ((T2 - T1) + (T3 - T4)) / 2 and, when it is
- *     STEP_MS or more, steps the clock with clock_settime (smaller ones it
- *     leaves: there is no slewing adjtimex here), saying so as timesyncd
- *     does ("Initial clock synchronization to ...");
+ *     STEP_MS (0.4 s, systemd-timesyncd's) or more, steps the clock with
+ *     clock_settime, saying so as timesyncd does ("Initial clock
+ *     synchronization to ..."); a smaller one it SLEWS through adjtimex,
+ *     at 500 ppm, so the clock never jumps (finding 280) -- and either way
+ *     marks the clock synchronized there (STA_UNSYNC off);
  *   - asks again every POLL_S seconds (timesyncd's longest poll, 2048 s);
  *   - after each sync, sets the RTC from the system clock. On Linux the
  *     kernel does that, every 11 minutes once timesyncd's adjtimex marks
- *     the clock synchronized; there is no adjtimex here, so timesyncd writes
+ *     the clock synchronized; this kernel does not, so timesyncd writes
  *     it through /dev/rtc0 as hwclock --systohc does, and says so when the
  *     RTC was a second or more off ("RTC set from the system clock"). The
  *     RTC keeps UTC. Without this the next boot started from the RTC's
@@ -37,6 +39,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/timex.h>
 #include <toby/net.h>
 
 #define NTP_PORT      123
@@ -44,7 +47,7 @@
 #define RETRY_S       10              /* no network yet, or no answer ... */
 #define RETRY_MAX_S   320             /* ... doubling to this */
 #define POLL_S        2048
-#define STEP_MS       50
+#define STEP_MS       400             /* systemd-timesyncd's: smaller is slewed */
 #define REPLY_MS      3000
 
 typedef unsigned char      u8;
@@ -194,8 +197,25 @@ static void fmt_time(i64 ns, char *out, size_t cap) {
     strftime(out, cap, "%a %Y-%m-%d %H:%M:%S UTC", &tm);
 }
 
-/* One exchange with SERVER. 1 when the clock was checked (and stepped if
- * it was off), 0 when there was no usable answer. */
+/* Tell the kernel the clock is synchronized (STA_UNSYNC off) and, when
+ * OFFSET is not 0, slew it by OFFSET ns -- adjtimex's ADJ_OFFSET, ns with
+ * ADJ_NANO, as systemd-timesyncd sets it. 0, or -1 with errno. */
+static int mark_synced(i64 offset) {
+    struct timex tx;
+    memset(&tx, 0, sizeof tx);
+    tx.modes = ADJ_STATUS | ADJ_NANO | ADJ_MAXERROR | ADJ_ESTERROR;
+    tx.status = STA_PLL;
+    tx.maxerror = 0;
+    tx.esterror = 0;
+    if (offset) {
+        tx.modes |= ADJ_OFFSET;
+        tx.offset = (long)offset;
+    }
+    return adjtimex(&tx) < 0 ? -1 : 0;
+}
+
+/* One exchange with SERVER. 1 when the clock was checked (and stepped or
+ * slewed if it was off), 0 when there was no usable answer. */
 static int sync_once(const char *server, int *first) {
     u32 ip = 0;
     if (toby_dns_resolve(server, &ip) < 0) return 0;
@@ -252,8 +272,18 @@ static int sync_once(const char *server, int *first) {
         fmt_time(want, when, sizeof when);
         fprintf(stderr, "timesyncd: %s clock synchronization to %s (offset %+lld ms, delay %lld ms).\n",
                 *first ? "Initial" : "Stepped", when, offset / 1000000LL, delay / 1000000LL);
-    } else if (*first) {
-        fprintf(stderr, "timesyncd: Clock is %+lld ms off; left as it is.\n", offset / 1000000LL);
+        mark_synced(0);
+    } else {
+        /* a small offset is SLEWED, as systemd-timesyncd hands it to the
+         * kernel's adjtimex: the clock never jumps, backward least of all
+         * (finding 280: a step back inside a timed wait made it read
+         * short). */
+        if (mark_synced(offset) != 0) {
+            fprintf(stderr, "timesyncd: Failed to adjust the clock: %s\n", strerror(errno));
+            return 0;
+        }
+        if (*first)
+            fprintf(stderr, "timesyncd: Clock is %+lld ms off; slewing it.\n", offset / 1000000LL);
     }
     *first = 0;
     rtc_writeback();
