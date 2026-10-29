@@ -30641,19 +30641,22 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     return rc;
 }
 
-/* ${@OP} and ${*OP}, OP one of # % / ^ , @: THE OPERATOR APPLIES TO EACH
+/* ${@OP} and ${*OP}, OP one of # % / ^ , ~ @: THE OPERATOR APPLIES TO EACH
  * POSITIONAL PARAMETER, exactly as ${a[@]OP} does to each element:
  *
  *     set -- 1a 2a 3a; argv.py ${@%a}      bash: ['1', '2', '3']
  *
  * tsh applied it to the joined text, so only the end of the last one moved
  * (Oils 2385 2389 2500). They go through the array path on a scratch array
- * of the parameters (one per nesting level). Returns 1 when handled. */
+ * of the parameters (one per nesting level). Returns 1 when handled.
+ * `~` was left out, so ${*~} toggled the joined text's first character and
+ * ${@~} none at all, where bash toggles each parameter's (finding 307). */
 static int g_posargs_depth;
 static int shell_expand_posargs_op(const char *expr, struct shell_sb *b, int *rc) {
     if (!((expr[0] == '@' || expr[0] == '*') && expr[1] &&
           (expr[1] == '#' || expr[1] == '%' || expr[1] == '/' ||
-           expr[1] == '^' || expr[1] == ',' || expr[1] == '@'))) return 0;
+           expr[1] == '^' || expr[1] == ',' || expr[1] == '~' ||
+           expr[1] == '@'))) return 0;
     char tmp[32];
     ksnprintf(tmp, sizeof tmp, "SHELL_POSARGS_%d", g_posargs_depth);
     sh_array_unset_literal(tmp);
