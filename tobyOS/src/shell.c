@@ -9658,6 +9658,14 @@ static void cmd_local(int argc, char **argv) {
             }
             shell_decl_attrs(name, l_attr_on, l_attr_off, l_array);
         }
+        /* an array's -x on a holder before its value, as declare's (309) */
+        if ((l_export || l_unexport) && env_find(name, klen) < 0 &&
+            (l_array || sh_array_find(name) ||
+             (has_value && argv[i][env_key_len(argv[i]) + 1] == '(')) &&
+            env_set_attr_holder(name) == 0) {
+            int ax = env_find(name, klen);
+            if (ax >= 0) g_env_flags[ax] |= SHVAR_ARRAY;
+        }
         if (has_value) {
             g_decl_paren_array = l_array || sh_array_find(name) != 0;
             if (env_set_kv(argv[i]) < 0) shell_set_status(1);
@@ -9671,7 +9679,12 @@ static void cmd_local(int argc, char **argv) {
             if (!l_nameref) (void)env_set_attr_holder(name);
         }
         if (l_array) {
-            if (!env_get(name)) (void)env_set_attr_holder(name);
+            /* a holder only where there is no entry: an empty array has no
+             * element 0 to read, and remaking its entry marked `local -a
+             * m=()` unassigned again -- `declare -a m` (309) */
+            if (env_find(name, strlen(name)) < 0 &&
+                env_set_attr_holder(name) == 0 && has_value)
+                sh_array_clear_novalue(name);       /* it was assigned */
             int aidx = env_find(name, strlen(name));
             if (aidx >= 0) g_env_flags[aidx] |= SHVAR_ARRAY;
         }
@@ -10897,6 +10910,16 @@ static void cmd_declare(int argc, char **argv) {
          * printed e=() (Oils 2397). */
         if (set_array && has_value && !sh_array_find(name))
             (void)sh_array_create(name);
+        /* AN ARRAY HAS NO ENTRY OF ITS OWN, so its -x goes on a holder made
+         * before the value, as -i's does above: `declare -x a=(1 2)` lost
+         * -x -- declare -p said `-a` where bash says `-ax` (finding 309). */
+        if ((set_export || clear_export) && env_find(name, klen) < 0 &&
+            (set_array || sh_array_find(name) ||
+             (has_value && argv[i][env_key_len(argv[i]) + 1] == '(')) &&
+            env_set_attr_holder(name) == 0) {
+            int ax = env_find(name, klen);
+            if (ax >= 0) g_env_flags[ax] |= SHVAR_ARRAY;
+        }
         if (has_value) {
             g_readonly_hit = false;
             g_decl_paren_array = set_array || sh_array_find(name) != 0;
