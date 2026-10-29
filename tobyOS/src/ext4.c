@@ -5543,6 +5543,17 @@ int ext4_mount_ro(const char *mount_point, struct blk_dev *dev, bool rdonly) {
         ext4_free(fs);
         return VFS_ERR_INVAL;
     }
+    /* NEEDS_RECOVERY FROM THE READ-WRITE MOUNT ON, as Linux sets it, before
+     * any transaction (finding 311). It was set at the mount's first
+     * commit -- after that transaction had staged its copy of the
+     * superblock, flag clear, which its checkpoint then put home: from
+     * there on the volume said nothing needed recovery while the log held
+     * transactions, and Linux's kernel throws such a log away ("JBD2:
+     * Clearing recovery information on journal"), a committed change with
+     * it (logs/b40/jflag.sh). */
+    if (!rdonly && fs->has_journal && !fs->j_dirty &&
+        jrecover_flag(fs, true) == VFS_OK)
+        fs->j_dirty = true;
     /* the orphans the last mount left, as Linux's mount settles them
      * (finding 310); a volume whose record cannot be read stays readable */
     if (!rdonly && orphan_mount(fs) != VFS_OK) {
