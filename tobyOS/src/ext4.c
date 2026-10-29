@@ -214,6 +214,11 @@ struct ext4 {
      * 313): a crc32_be of every log block of the transaction before its
      * commit block, in that block */
     bool     j_v1sum;
+    /* FAST_COMMIT (finding 314): of the journal's last j_nfc blocks, the
+     * fast-commit area is those from j_fc_first, one past their first; the
+     * log is the blocks before them */
+    bool     j_fast;
+    uint32_t j_nfc, j_fc_first;
     uint8_t  j_uuid[16];
     uint32_t j_csum_seed;
     bool     j_dirty;
@@ -3171,8 +3176,9 @@ out:
  * commit (ASYNC_COMMIT, 313) changes nothing on disk: Linux may write the
  * commit block before the transaction's other blocks, and a sum that
  * then does not hold ends the log -- this driver's own commit block goes
- * after them, as a journal of either kind allows. A journal with a feature
- * this driver does not know (fast commits) is not driven.
+ * after them, as a journal of either kind allows. Fast commits (FAST_COMMIT,
+ * finding 314) are replayed after the log: see fc_replay. A journal with a
+ * feature this driver does not know is not driven.
  *
  * Each atomic operation opens a transaction (txn_begin), stages every
  * block it touches, then commits it (txn_commit) as one transaction --
@@ -3202,7 +3208,8 @@ out:
 /* Journal block REL's place on the device, through the journal inode's
  * map (extents or block pointers, as Linux's is) */
 static int jmap(struct ext4 *fs, uint32_t rel, uint64_t *phys) {
-    if (rel >= fs->j_blocks) return VFS_ERR_INVAL;
+    /* the log's blocks, and the fast-commit area's after them (314) */
+    if (rel >= fs->j_blocks + (fs->j_fast ? fs->j_nfc : 0u)) return VFS_ERR_INVAL;
     int rc = inode_block_map(fs, &fs->j_inode, rel, phys);
     if (rc == VFS_OK && !*phys) rc = VFS_ERR_IO;
     return rc;
@@ -3801,6 +3808,364 @@ static int jbd2_pass(struct ext4 *fs, int pass, uint32_t start, uint32_t seq,
     return VFS_OK;
 }
 
+/* ---- FAST COMMITS (the open item "jbd2 fast commits", finding 314) ----
+ *
+ * A volume with fast_commit (mkfs.ext4 -O fast_commit) keeps a fast-commit
+ * area at the journal's end: its last s_num_fc_blocks blocks (256 when 0),
+ * which the log does not reach. An fsync between two full commits writes
+ * there instead of a transaction: what changed, as records of the state it
+ * left -- each a little-endian 16-bit tag and 16-bit length, then the
+ * value (logs/b40/fcparse.py reads Linux's):
+ *   HEAD (9)       features, tid: first in the area
+ *   INODE (6)      inode number, then the inode as it is (its first
+ *                  128 + i_extra_isize bytes)
+ *   ADD_RANGE (1)  inode number, then an extent: those logical blocks are
+ *                  those physical ones
+ *   DEL_RANGE (2)  inode number, logical block, length: those unmapped
+ *   CREAT (3), LINK (4), UNLINK (5)   parent, inode, then the name
+ *   PAD (7)        nothing; TAIL (8) tid, and a CRC-32C from 0 of every
+ *                  byte of this fast commit before it -- found by trying
+ *                  the inputs against four Linux wrote -- ending this
+ *                  fast commit, padded to the end of its block
+ * The fast commits that apply are those of the transaction after the last
+ * full one, the area's first opening with a HEAD of that tid, each to the
+ * first whose TAIL does not hold. Older ones stay in the area -- it is not
+ * cleared at a full commit -- under their own tids, and do not apply. The
+ * recovery replays them after the log, as Linux's mount does (e2fsprogs
+ * 1.47.2's e2fsck gives up on these: "Invalid argument while recovering
+ * journal"): an inode's fields but its block map; its map's ranges, the
+ * blocks claimed or given back; names put in and taken out, a link count
+ * moving with each LINK and UNLINK; and at the end an inode left with no
+ * link deleted, the others' i_blocks counted again from their maps. A new
+ * directory makes a full commit, not a fast one (logs/b40/fcmk.sh). This
+ * driver writes no fast commits: its own are full ones, which a fast-commit
+ * journal takes as Linux's own full commits. */
+enum { FC_ADD_RANGE = 1, FC_DEL_RANGE, FC_CREAT, FC_LINK, FC_UNLINK, FC_INODE,
+       FC_PAD, FC_TAIL, FC_HEAD };
+#define FC_MAX_TOUCHED 1024
+#define FC_MAX_EXT     2048
+
+struct fc_state {
+    uint32_t touched[FC_MAX_TOUCHED];
+    uint32_t ntouched;
+    unsigned tags;
+};
+
+static void fc_touch(struct fc_state *st, uint32_t ino) {
+    for (uint32_t i = 0; i < st->ntouched; i++) if (st->touched[i] == ino) return;
+    if (st->ntouched < FC_MAX_TOUCHED) st->touched[st->ntouched++] = ino;
+}
+
+/* block BLK in use, whatever its bitmap says (a fast commit's blocks were
+ * taken in Linux's memory, not yet on disk) */
+static int fc_claim_block(struct ext4 *fs, uint64_t blk) {
+    if (blk < fs->first_data_block || blk >= fs->total_blocks) return VFS_ERR_IO;
+    uint32_t rel = (uint32_t)(blk - fs->first_data_block);
+    uint32_t g = rel / fs->blocks_per_group, bit = rel % fs->blocks_per_group;
+    uint8_t *bmp = kmalloc(fs->block_size);
+    if (!bmp) return VFS_ERR_NOMEM;
+    int rc = read_block_bitmap(fs, g, bmp);
+    uint32_t got;
+    if (rc == VFS_OK && !bit_test(bmp, bit)) rc = take_block(fs, g, bmp, bit, &got);
+    kfree(bmp);
+    return rc;
+}
+
+/* inode INO in use, as ext4_alloc_inode marks the one it picks */
+static int fc_claim_inode(struct ext4 *fs, uint32_t ino) {
+    uint32_t g = (ino - 1) / fs->inodes_per_group, bit = (ino - 1) % fs->inodes_per_group;
+    uint8_t *bmp = kmalloc(fs->block_size);
+    if (!bmp) return VFS_ERR_NOMEM;
+    int rc = read_inode_bitmap(fs, g, bmp);
+    if (rc != VFS_OK || bit_test(bmp, bit)) { kfree(bmp); return rc; }
+    bit_set(bmp, bit);
+    if (group_flags(fs, g) & EXT4_BG_BLOCK_UNINIT) {
+        uint8_t *bb = kmalloc(fs->block_size);
+        if (!bb) { kfree(bmp); return VFS_ERR_NOMEM; }
+        block_bitmap_synth(fs, g, bb);
+        rc = write_block_bitmap(fs, g, bb);
+        kfree(bb);
+    }
+    if (rc == VFS_OK) rc = write_inode_bitmap(fs, g, bmp);
+    kfree(bmp);
+    if (rc != VFS_OK) return rc;
+    if (fs_uninit_bg(fs) && bit >= fs->inodes_per_group - group_itable_unused(fs, g))
+        group_itable_unused_set(fs, g, fs->inodes_per_group - bit - 1);
+    adj_free_inodes(fs, g, -1);
+    flush_group(fs, g);
+    return flush_superblock(fs);
+}
+
+static void fc_root_init(struct ext4_inode *in) {
+    struct ext4_extent_header *h = (struct ext4_extent_header *)in->i_block;
+    memset(in->i_block, 0, sizeof in->i_block);
+    h->eh_magic = EXT4_EXT_MAGIC;
+    h->eh_max = (uint16_t)((sizeof in->i_block - sizeof *h) / 12);
+}
+
+/* Inode INO's logical blocks [LBLK, LBLK+LEN) mapped to PHYS on (PHYS 0:
+ * unmapped), as an ADD_RANGE or DEL_RANGE says: its extents gathered, the
+ * range cut out of them -- blocks it no longer maps given back -- the new
+ * range's blocks claimed and put in, and the tree built again from the
+ * list. */
+static int fc_map(struct ext4 *fs, uint32_t ino, uint32_t lblk, uint64_t len,
+                  uint64_t phys, bool unwritten) {
+    struct ext4_inode in;
+    if (read_inode(fs, ino, &in) != VFS_OK) return VFS_ERR_IO;
+    if (!(in.i_flags & EXT4_EXTENTS_FL)) return VFS_ERR_INVAL;
+    struct ext4_extent_header *h = (struct ext4_extent_header *)in.i_block;
+    if (h->eh_magic != EXT4_EXT_MAGIC) fc_root_init(&in);
+    struct ext4_extent *v = kmalloc(FC_MAX_EXT * sizeof *v);
+    struct ext4_extent *out = kmalloc(FC_MAX_EXT * sizeof *out);
+    if (!v || !out) { if (v) kfree(v); if (out) kfree(out); return VFS_ERR_NOMEM; }
+    uint64_t idx[16];
+    int nb = 0;
+    int n = ext_gather(fs, (const uint8_t *)in.i_block, EXT_MAX_LEVELS, v, FC_MAX_EXT, idx, &nb);
+    int rc = n < 0 ? VFS_ERR_IO : VFS_OK;
+    int no = 0;
+    uint64_t end = (uint64_t)lblk + len;
+    for (int i = 0; i < n && rc == VFS_OK; i++) {
+        uint64_t a = v[i].ee_block, l = extent_len_of(&v[i]), s = extent_start(&v[i]);
+        bool u = extent_unwritten(&v[i]);
+        uint64_t b = a + l;
+        if (b <= lblk || a >= end) { out[no++] = v[i]; continue; }
+        if (a < lblk) {                        /* the part before the range */
+            extent_set(&out[no], (uint32_t)a, (uint32_t)(lblk - a), s, u);
+            no++;
+        }
+        uint64_t oa = a > lblk ? a : lblk, ob = b < end ? b : end;
+        uint64_t old = s + (oa - a);           /* the overlap, given back unless */
+        if (!phys || old != phys + (oa - lblk))   /* the new range maps it so */
+            free_run(fs, old, (uint32_t)(ob - oa));
+        if (b > end) {                         /* the part after it */
+            extent_set(&out[no], (uint32_t)end, (uint32_t)(b - end), s + (end - a), u);
+            no++;
+        }
+        if (no >= FC_MAX_EXT - 4) rc = VFS_ERR_NOSPC;
+    }
+    for (uint64_t k = 0; phys && k < len && rc == VFS_OK; k++)
+        rc = fc_claim_block(fs, phys + k);
+    for (uint64_t k = 0; phys && k < len && rc == VFS_OK; ) {
+        uint64_t piece = len - k, cap = unwritten ? 32767u : 32768u;
+        if (piece > cap) piece = cap;
+        if (no >= FC_MAX_EXT) { rc = VFS_ERR_NOSPC; break; }
+        extent_set(&out[no++], (uint32_t)(lblk + k), (uint32_t)piece, phys + k, unwritten);
+        k += piece;
+    }
+    if (rc == VFS_OK) {
+        for (int i = 0; i < nb; i++) (void)ext4_free_block(fs, (uint32_t)idx[i]);
+        fc_root_init(&in);
+        for (int i = 1; i < no; i++)               /* by logical block */
+            for (int j = i; j > 0 && out[j - 1].ee_block > out[j].ee_block; j--) {
+                struct ext4_extent t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
+            }
+        for (int i = 0; i < no && rc == VFS_OK; i++) rc = ext_insert(fs, ino, &in, &out[i]);
+    }
+    if (rc == VFS_OK) rc = write_inode(fs, ino, &in);
+    kfree(v);
+    kfree(out);
+    return rc;
+}
+
+static uint8_t fc_ftype(uint16_t mode) {
+    switch (mode & EXT4_S_IFMT) {
+    case 0x8000: return 1;  case 0x4000: return 2;  case 0x2000: return 3;
+    case 0x6000: return 4;  case 0x1000: return 5;  case 0xC000: return 6;
+    case 0xA000: return 7;  default:     return 0;
+    }
+}
+
+/* One record of a fast commit that holds. */
+static int fc_apply(struct ext4 *fs, struct fc_state *st, uint16_t tag,
+                    const uint8_t *v, uint16_t len) {
+    uint32_t a = 0, b = 0, c = 0;
+    if (len >= 4) memcpy(&a, v, 4);
+    if (len >= 8) memcpy(&b, v + 4, 4);
+    if (len >= 12) memcpy(&c, v + 8, 4);
+    if (tag == FC_INODE) {
+        if (len < 4 + EXT4_GOOD_OLD_INODE_SIZE || a < EXT4_ROOT_INODE || a > fs->total_inodes)
+            return VFS_ERR_IO;
+        struct ext4_inode in, raw;
+        if (read_inode(fs, a, &in) != VFS_OK) return VFS_ERR_IO;
+        memset(&raw, 0, sizeof raw);
+        uint32_t rl = len - 4u;
+        if (rl > sizeof raw) rl = sizeof raw;
+        memcpy(&raw, v + 4, rl);
+        bool fresh = !in.i_mode;
+        /* all but the block map, which its ranges build; a fast link's
+         * target, and an inode with no extents, are in i_block itself */
+        size_t ib = __builtin_offsetof(struct ext4_inode, i_block);
+        size_t ig = __builtin_offsetof(struct ext4_inode, i_generation);
+        bool own_map = (raw.i_flags & EXT4_EXTENTS_FL) &&
+                       !((raw.i_mode & EXT4_S_IFMT) == EXT4_S_IFLNK && raw.i_size_lo < 60);
+        memcpy(&in, &raw, ib);
+        memcpy((uint8_t *)&in + ig, (uint8_t *)&raw + ig, rl - ig);
+        if (!own_map) memcpy(in.i_block, raw.i_block, sizeof in.i_block);
+        else if (fresh || ((struct ext4_extent_header *)in.i_block)->eh_magic != EXT4_EXT_MAGIC)
+            fc_root_init(&in);
+        int rc = write_inode(fs, a, &in);
+        if (rc == VFS_OK) rc = fc_claim_inode(fs, a);
+        fc_touch(st, a);
+        return rc;
+    }
+    if (tag == FC_ADD_RANGE) {
+        if (len < 16) return VFS_ERR_IO;
+        struct ext4_extent e;
+        memcpy(&e, v + 4, 12);
+        fc_touch(st, a);
+        return fc_map(fs, a, e.ee_block, extent_len_of(&e), extent_start(&e),
+                      extent_unwritten(&e));
+    }
+    if (tag == FC_DEL_RANGE) {
+        if (len < 12) return VFS_ERR_IO;
+        fc_touch(st, a);
+        return fc_map(fs, a, b, c, 0, false);
+    }
+    if (tag == FC_CREAT || tag == FC_LINK || tag == FC_UNLINK) {
+        if (len < 9 || len - 8 >= VFS_NAME_MAX) return VFS_ERR_IO;
+        char name[VFS_NAME_MAX];
+        memcpy(name, v + 8, len - 8u);
+        name[len - 8] = '\0';
+        struct ext4_inode dir, in;
+        if (read_inode(fs, a, &dir) != VFS_OK || read_inode(fs, b, &in) != VFS_OK)
+            return VFS_ERR_IO;
+        uint32_t there = 0; uint8_t ty = 0;
+        bool has = dir_find(fs, &dir, name, &there, &ty) == VFS_OK;
+        int rc = VFS_OK;
+        fc_touch(st, b);
+        if (tag == FC_UNLINK) {
+            if (!has || there != b) return VFS_OK;        /* gone already */
+            rc = dir_remove_entry(fs, a, name);
+            if (rc == VFS_OK && in.i_links_count) {
+                in.i_links_count--;
+                rc = write_inode(fs, b, &in);
+            }
+            return rc;
+        }
+        if (has) return VFS_OK;                         /* there already */
+        rc = dir_add_entry(fs, a, name, b, fc_ftype(in.i_mode));
+        if (rc == VFS_OK && tag == FC_LINK) {
+            if (read_inode(fs, b, &in) != VFS_OK) return VFS_ERR_IO;
+            in.i_links_count++;
+            rc = write_inode(fs, b, &in);
+        }
+        return rc;
+    }
+    return VFS_OK;                                       /* HEAD, PAD, TAIL */
+}
+
+/* At the end: each inode the fast commits touched, deleted when no link is
+ * left, else its i_blocks counted again from its map as it now is. */
+static int fc_settle(struct ext4 *fs, struct fc_state *st) {
+    for (uint32_t i = 0; i < st->ntouched; i++) {
+        uint32_t ino = st->touched[i];
+        struct ext4_inode in;
+        if (read_inode(fs, ino, &in) != VFS_OK) return VFS_ERR_IO;
+        if (!in.i_mode) continue;
+        if (in.i_links_count == 0) {
+            inode_free_data(fs, ino, &in);
+            in.i_size_lo = 0;
+            in.i_size_hi = 0;
+            in.i_dtime = (uint32_t)ext4_now().s;
+            int rc = write_inode(fs, ino, &in);
+            if (rc == VFS_OK) rc = ext4_free_inode(fs, ino);
+            if (rc != VFS_OK) return rc;
+            continue;
+        }
+        if (!(in.i_flags & EXT4_EXTENTS_FL) ||
+            ((in.i_mode & EXT4_S_IFMT) == EXT4_S_IFLNK && link_is_fast(fs, &in)))
+            continue;
+        struct ext4_extent *v = kmalloc(FC_MAX_EXT * sizeof *v);
+        if (!v) return VFS_ERR_NOMEM;
+        uint64_t idx[16];
+        int nb = 0;
+        int n = ext_gather(fs, (const uint8_t *)in.i_block, EXT_MAX_LEVELS, v, FC_MAX_EXT, idx, &nb);
+        uint64_t blocks = (uint64_t)(nb > 0 ? nb : 0) + (inode_xattr_blk(&in) ? 1u : 0u);
+        for (int k = 0; k < n; k++) blocks += extent_len_of(&v[k]);
+        kfree(v);
+        if (n < 0) return VFS_ERR_IO;
+        in.i_blocks_lo = 0;
+        osd2_set_half(&in, 0, 0);
+        inode_blocks_add(fs, &in, (int64_t)blocks);
+        if (write_inode(fs, ino, &in) != VFS_OK) return VFS_ERR_IO;
+    }
+    return VFS_OK;
+}
+
+/* The fast commits after the log's last full transaction (its tid EXPECT),
+ * replayed: the area read a block at a time, each fast commit's records
+ * checked against its TAIL before any is applied. */
+static int fc_replay(struct ext4 *fs, uint32_t expect) {
+    size_t cap = (size_t)(fs->j_nfc - 1u) * fs->block_size;
+    uint8_t *area = kmalloc(cap);
+    struct fc_state *st = kmalloc(sizeof *st);
+    if (!area || !st) { if (area) kfree(area); if (st) kfree(st); return VFS_ERR_NOMEM; }
+    memset(st, 0, sizeof *st);
+    size_t have = 0, off = 0, start = 0, good = 0;
+    unsigned nfc = 0;
+    uint32_t crc = 0;
+    bool head = false;
+    int rc = VFS_OK;
+    for (;;) {
+        while (have < off + 4 && have < cap) {
+            if (jraw_read(fs, fs->j_fc_first + (uint32_t)(have / fs->block_size),
+                          area + have) != VFS_OK) { rc = VFS_ERR_IO; break; }
+            have += fs->block_size;
+        }
+        if (rc != VFS_OK || off + 4 > have) break;
+        uint16_t tag, len;
+        memcpy(&tag, area + off, 2);
+        memcpy(&len, area + off + 2, 2);
+        while (have < off + 4 + len && have < cap) {
+            if (jraw_read(fs, fs->j_fc_first + (uint32_t)(have / fs->block_size),
+                          area + have) != VFS_OK) { rc = VFS_ERR_IO; break; }
+            have += fs->block_size;
+        }
+        if (rc != VFS_OK || off + 4 + len > have || tag < FC_ADD_RANGE || tag > FC_HEAD)
+            break;
+        uint32_t tid = 0;
+        if (len >= 4) memcpy(&tid, area + off + 4, 4);
+        if (!head) {                            /* the area opens with HEAD */
+            uint32_t ht = 0;
+            if (tag != FC_HEAD || len < 8) break;
+            memcpy(&ht, area + off + 8, 4);
+            if (ht != expect) break;
+            head = true;
+        }
+        if (tag == FC_TAIL) {
+            uint32_t want = 0;
+            if (len < 8) break;
+            memcpy(&want, area + off + 8, 4);
+            crc = crc32c(crc, area + off, 8);       /* tag, length, tid */
+            if (tid != expect || crc != want) break;
+            good = off + 4 + len;               /* this fast commit holds */
+            nfc++;
+            crc = 0;
+            start = good;
+        } else {
+            crc = crc32c(crc, area + off, 4u + len);
+        }
+        off += 4u + len;
+    }
+    (void)start;
+    /* the records of those that hold, in order */
+    for (off = 0; rc == VFS_OK && off + 4 <= good; ) {
+        uint16_t tag, len;
+        memcpy(&tag, area + off, 2);
+        memcpy(&len, area + off + 2, 2);
+        rc = fc_apply(fs, st, tag, area + off + 4, len);
+        if (tag != FC_PAD && tag != FC_TAIL && tag != FC_HEAD) st->tags++;
+        off += 4u + len;
+    }
+    if (rc == VFS_OK && nfc) rc = fc_settle(fs, st);
+    if (nfc || rc != VFS_OK)
+        kprintf("[ext4] fast commit replay: %u fast commit(s) of tid %u, %u record(s)%s\n",
+                nfc, (unsigned)expect, st->tags, rc == VFS_OK ? "" : " -- FAILED");
+    kfree(area);
+    kfree(st);
+    return rc;
+}
+
 static int jbd2_recover(struct ext4 *fs) {
     uint8_t *blk = kmalloc(fs->block_size);
     if (!blk) return VFS_ERR_NOMEM;
@@ -3838,8 +4203,15 @@ static int jbd2_recover(struct ext4 *fs) {
                        fs->gdt_buf + i * fs->block_size) != VFS_OK)
             return VFS_ERR_IO;
 
+    /* then the fast commits after the last full transaction (314) */
+    if (fs->j_fast) {
+        rc = fc_replay(fs, r.any ? r.last + 1 : seq);
+        if (rc != VFS_OK) return rc;
+    }
+
     /* the next transaction's sequence: past the first one not committed,
-     * whose blocks may be in the log, as Linux's recovery leaves it */
+     * whose blocks may be in the log, as Linux's recovery leaves it -- a
+     * fast commit's tid among them */
     fs->j_sequence = (r.any ? r.last + 1 : seq) + 1;
     rc = jsb_update(fs, 0, fs->j_sequence);                /* journal empty */
     if (rc == VFS_OK) rc = jrecover_flag(fs, false);
@@ -5534,7 +5906,7 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
             uint32_t jfirst    = be32(js->s_first);
             /* tobyOS's classic journal, and Linux's: 64-bit numbers, v3
              * sums (finding 274) and v2's (312), the v1 commit sum and
-             * async commit (313); not fast commits */
+             * async commit (313), fast commits (314) */
             bool drivable =
                 jmagic == JBD2_MAGIC_NUMBER &&
                 (v2 || jtype == JBD2_SUPERBLOCK_V1) &&
@@ -5548,6 +5920,21 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
                 fs->j_csum  = fs->j_csum3 ||
                               (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
                 fs->j_v1sum = !fs->j_csum && (jcompat & JBD2_FEATURE_COMPAT_CHECKSUM);
+                /* the fast-commit area, the journal's last blocks (314) */
+                fs->j_fast = (jincompat & JBD2_FEATURE_INCOMPAT_FAST_COMMIT) != 0;
+                if (fs->j_fast) {
+                    uint32_t nfc = be32(js->s_num_fc_blks);
+                    if (!nfc) nfc = 256;                /* Linux's default */
+                    if (nfc + jfirst + 4 > jmaxlen) {
+                        drivable = false;
+                    } else {
+                        /* the log ends before block maxlen - nfc, the
+                         * area starts after it: Linux's dump puts the
+                         * first fast commit one past (logs/b40/fcparse.py) */
+                        fs->j_nfc = nfc;
+                        fs->j_fc_first = jmaxlen - nfc + 1;
+                    }
+                }
                 memcpy(fs->j_uuid, js->s_uuid, 16);
                 fs->j_csum_seed = crc32c(~0u, fs->j_uuid, 16);
                 if (fs->j_csum && (js->s_checksum_type != JBD2_CRC32C_CHKSUM ||
@@ -5557,7 +5944,7 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
                 }
             }
             if (drivable) {
-                fs->j_blocks   = jmaxlen;
+                fs->j_blocks   = fs->j_fast ? jmaxlen - fs->j_nfc : jmaxlen;   /* the log's end */
                 fs->j_first    = jfirst ? jfirst : 1;
                 fs->j_sequence = be32(js->s_sequence);
                 fs->has_journal = true;
