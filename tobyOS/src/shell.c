@@ -1508,6 +1508,8 @@ static int shell_word_tilde(struct shell_sb *wb);
  * ${x-WORD} there are bytes -- `${x+'b'}` is 'b' (finding 301). A command
  * substitution, or a pattern word, is a context of its own and clears it. */
 static bool g_hd_body;
+/* ...and whether that body holds an "@" expansion (sh_hd_has_at, 302). */
+static bool g_hd_at;
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
 static bool shell_glob_meta(char c);
@@ -5097,6 +5099,32 @@ static int sb_put_sep(struct shell_sb *b, const struct sh_sep *s) {
     return s->n ? sb_putmem(b, s->c, s->n) : 0;
 }
 
+/* WHAT A "$*" OR "${a[*]}" JOIN PUTS BETWEEN WORDS IN A HERE-DOCUMENT
+ * (finding 302). IFS's first character everywhere else; in a body bash's
+ * answer is the expansion's FORM's, measured on 5.2 (logs/b40/hdforms.sh,
+ * hdtrig.sh, IFS=:):
+ *   SH_JOIN_HD_SPACE  a space: $* and ${*}, every ${*:o:l} ${*#p} ${*%p}
+ *                     ${*@Q} (and @U @u @L @E @K @k @a @A), the same
+ *                     forms of ${a[*]}, and ${!a[*]};
+ *   SH_JOIN_HD_AT     IFS's, but a space when the body holds an "@"
+ *                     expansion anywhere (g_hd_at): the pattern
+ *                     substitutions (/ // /# /%) and the case changes
+ *                     ^ ^^ , ,, ~ ~~ of $* and ${a[*]}, and ${!p*};
+ *   SH_JOIN_IFS       IFS's always: a plain ${a[*]}.
+ * A null IFS is nothing for the last two, "@" or not (h4). tsh joined them
+ * all with IFS's first character. */
+enum { SH_JOIN_IFS, SH_JOIN_HD_SPACE, SH_JOIN_HD_AT };
+static void sh_sep_join(struct sh_sep *s, int kind) {
+    const char *ifs = env_get("IFS");
+    if (g_hd_body && (kind == SH_JOIN_HD_SPACE ||
+                      (kind == SH_JOIN_HD_AT && g_hd_at && !(ifs && !*ifs)))) {
+        s->c[0] = ' ';
+        s->n = 1;
+        return;
+    }
+    sh_sep_from_ifs(s, ifs);
+}
+
 /* FIELD SPLITTING BY CHARACTER (batch 13). bash finds a separator one
  * CHARACTER at a time: in UTF-8 a multibyte character separates when it is
  * one of IFS's characters, and a single byte -- ASCII, or one that starts
@@ -6617,14 +6645,58 @@ static void sh_hd_resolve_marks(struct shell_sb *x) {
     x->len = (size_t)(w - x->p);
 }
 
+/* DOES A HERE-DOCUMENT BODY HOLD AN "@" EXPANSION -- $@, ${@...} but not
+ * ${#@}, ${NAME[@]...}, ${!NAME@}, ${!NAME[@]} -- at any depth of ${ }
+ * words, outside $( ) and backquotes (finding 302)? A literal @ or a \$@ is
+ * none. bash joins some "$*"-style expansions of a body that has one with
+ * a space (sh_sep_join's SH_JOIN_HD_AT; logs/b40/hdtrig.sh). */
+static bool sh_hd_name_char(char c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9');
+}
+static bool sh_hd_has_at(const char *s) {
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '`') {
+            for (p++; *p && *p != '`'; p++) if (*p == '\\' && p[1]) p++;
+            if (!*p) return false;
+            continue;
+        }
+        if (*p != '$') continue;
+        if (p[1] == '@') return true;
+        if (p[1] == '(') {                  /* $( ) and $(( )), skipped whole */
+            int depth = 0;
+            for (p++; *p; p++) {
+                if (*p == '\\' && p[1]) { p++; continue; }
+                if (*p == '(') depth++;
+                else if (*p == ')' && --depth == 0) break;
+            }
+            if (!*p) return false;
+            continue;
+        }
+        if (p[1] != '{') continue;
+        const char *q = p + 2;
+        if (*q == '#' && q[1] != '}') continue;      /* ${#...}, a length */
+        bool bang = *q == '!';
+        if (bang) q++;
+        if (*q == '@') return true;
+        while (sh_hd_name_char(*q)) q++;
+        if (bang && *q == '@') return true;          /* ${!pre@} */
+        if (q[0] == '[' && q[1] == '@' && q[2] == ']') return true;
+    }
+    return false;
+}
+
 static int shell_hd_expand(const char *body, struct shell_sb *x) {
     enum shell_flow flow = g_shell_flow;
     int flow_status = g_shell_flow_status;
     bool soft = g_bad_subst_soft;
-    bool saved_hd = g_hd_body;
+    bool saved_hd = g_hd_body, saved_at = g_hd_at;
     g_hd_body = true;
+    g_hd_at = sh_hd_has_at(body);
     int xrc = shell_expand_literal_quotes(body, x);
     g_hd_body = saved_hd;
+    g_hd_at = saved_at;
     if (xrc == 0) {
         sh_hd_resolve_marks(x);
         return 0;
@@ -28717,7 +28789,7 @@ static int shell_append_positional_join(struct shell_sb *b,
     }
     const char *ifs = env_get("IFS");
     struct sh_sep sep;
-    sh_sep_from_ifs(&sep, ifs);
+    sh_sep_join(&sep, SH_JOIN_HD_SPACE);
 
     /* IFS SET AND EMPTY, UNQUOTED: `$*` yields one field per parameter, the
      * same as `$@`.
@@ -28729,8 +28801,10 @@ static int shell_append_positional_join(struct shell_sb *b,
      * Joining with no separator and leaving it at that produced the quoted
      * answer for both. bash and dash agree on this, which is why the corpus
      * files it as POSIX even though it reads like a quirk. Quoted, the join is
-     * still correct -- g_dq_depth is what tells the two apart. */
-    if (ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx) {
+     * still correct -- g_dq_depth is what tells the two apart. A
+     * here-document body is quoted text, though its depth is 0 (302). */
+    if (ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx &&
+        !g_hd_body) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
@@ -28766,7 +28840,7 @@ static int shell_append_array_join(struct shell_sb *b,
     int n = a ? a->n : 0;
     const char *ifs = env_get("IFS");
     struct sh_sep sep;
-    sh_sep_from_ifs(&sep, ifs);
+    sh_sep_join(&sep, indices ? SH_JOIN_HD_SPACE : SH_JOIN_IFS);
 
     if (!star) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -28794,7 +28868,8 @@ static int shell_append_array_join(struct shell_sb *b,
      * (bash; Oils 2731) -- run together only in an assignment. ${!a[*]}
      * there is bash's own: the subscripts as ONE word, joined by a space
      * (Oils 2733). */
-    bool null_unquoted = ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx;
+    bool null_unquoted = ifs && !*ifs && g_dq_depth == 0 &&
+                         !g_tok_word_assign_ctx && !g_hd_body;
     if (null_unquoted && indices) { sep.c[0] = ' '; sep.n = 1; }
     else if (null_unquoted) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -28866,7 +28941,7 @@ static int shell_append_array_slice(struct shell_sb *b,
 
     const char *ifs = env_get("IFS");
     struct sh_sep sep;
-    sh_sep_from_ifs(&sep, ifs);
+    sh_sep_join(&sep, SH_JOIN_HD_SPACE);
 
     if (!star) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -29633,7 +29708,7 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
 
     const char *ifs = env_get("IFS");
     struct sh_sep sep;
-    sh_sep_from_ifs(&sep, ifs);
+    sh_sep_join(&sep, SH_JOIN_HD_AT);
 
     int rc = 0;
     if (!star && sh_put_lead_mark(b) < 0) rc = -1;
@@ -30032,7 +30107,7 @@ static int shell_expand_array_kv(const char *nm, bool words, bool star,
     if (!arr || arr->n == 0) return 0;
     if (words) {
         struct sh_sep sep;
-        sh_sep_from_ifs(&sep, env_get("IFS"));
+        sh_sep_join(&sep, SH_JOIN_HD_SPACE);
         if (!star && sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < arr->n; i++) {
             for (int half = 0; half < 2; half++) {
@@ -30272,7 +30347,7 @@ static int shell_expand_substring(const char *name, const char *spec,
         long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
         if (end > n) end = n;
         struct sh_sep sep;
-        sh_sep_from_ifs(&sep, env_get("IFS"));
+        sh_sep_join(&sep, SH_JOIN_HD_SPACE);
         if (!star && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
@@ -31130,7 +31205,11 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         if (at_a && shell_expand_at_transform(nm, 'a', &attrs) < 0)
                             return -1;
                         struct sh_sep sep;
-                        sh_sep_from_ifs(&sep, env_get("IFS"));
+                        /* a substitution or a case change: IFS's in a here-document too,
+                         * unless the body has an "@" expansion (302) */
+                        bool hd_at = suffix[0] == '/' || suffix[0] == '^' ||
+                                     suffix[0] == ',' || suffix[0] == '~';
+                        sh_sep_join(&sep, hd_at ? SH_JOIN_HD_AT : SH_JOIN_HD_SPACE);
                         if (!star && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
