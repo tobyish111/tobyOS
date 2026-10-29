@@ -207,6 +207,9 @@ struct ext4 {
     /* a Linux-made journal's (finding 274): 64-bit block numbers, CRC-32C
      * v3 sums from the seed of its UUID; and NEEDS_RECOVERY set this mount */
     bool     j_64bit, j_csum;
+    /* j_csum's tags: v3's 16 bytes and whole sum, or v2's 8 or 12 and the
+     * sum's low 16 bits (the open item "jbd2 CSUM_V2", finding 312) */
+    bool     j_csum3;
     uint8_t  j_uuid[16];
     uint32_t j_csum_seed;
     bool     j_dirty;
@@ -3142,8 +3145,10 @@ out:
  * journal superblock, of each descriptor and revoke block (a 4-byte tail),
  * of each commit block, and of each logged block (in its 16-byte tag).
  * Every one is checked on recovery and written by this driver as Linux
- * writes it; a journal with a feature it does not know (CSUM_V2, async
- * commit, fast commits) is not driven.
+ * writes it. v2 sums (CSUM_V2, finding 312) are v3's but in the short
+ * block tag, which holds the low 16 bits of the block's sum. A journal
+ * with a feature this driver does not know (async commit, fast commits,
+ * the v1 commit sum) is not driven.
  *
  * Each atomic operation opens a transaction (txn_begin), stages every
  * block it touches, then commits it (txn_commit) as one transaction --
@@ -3286,17 +3291,21 @@ static uint32_t jdata_csum(const struct ext4 *fs, uint32_t seq, const uint8_t *d
 
 /* A block tag: 16 bytes with v3 sums (number, flags, number's high half,
  * sum); else 8 -- number, 16-bit sum, 16-bit flags -- and 12 with 64-bit
- * numbers (the high half last) */
+ * numbers (the high half last). v2 sums use the short tag, its 16 bits
+ * the low half of v3's sum, and 2 bytes more after it -- 14 bytes, or 10
+ * without 64-bit numbers (a descriptor e2fsprogs' debugfs wrote, read
+ * byte by byte: logs/b40/jv2.sh; finding 312). */
 struct jtag { uint64_t blk; uint32_t flags; uint32_t csum; };
 
 static uint32_t jtag_bytes(const struct ext4 *fs) {
-    return fs->j_csum ? 16u : (fs->j_64bit ? 12u : 8u);
+    if (fs->j_csum3) return 16u;
+    return (fs->j_64bit ? 12u : 8u) + (fs->j_csum ? 2u : 0u);
 }
 
 static void jtag_get(const struct ext4 *fs, const uint8_t *p, struct jtag *t) {
     t->blk = jget32(p);
     uint32_t hi = 0;
-    if (fs->j_csum) {
+    if (fs->j_csum3) {
         t->flags = jget32(p + 4);
         hi       = jget32(p + 8);
         t->csum  = jget32(p + 12);
@@ -3313,7 +3322,7 @@ static void jtag_get(const struct ext4 *fs, const uint8_t *p, struct jtag *t) {
 
 static void jtag_put(const struct ext4 *fs, uint8_t *p, const struct jtag *t) {
     jput32(p, (uint32_t)t->blk);
-    if (fs->j_csum) {
+    if (fs->j_csum3) {
         jput32(p + 4, t->flags);
         jput32(p + 8, (uint32_t)(t->blk >> 32));
         jput32(p + 12, t->csum);
@@ -3675,7 +3684,8 @@ static void jreplay_tag(void *ctx, uint32_t i, const struct jtag *t) {
     for (uint32_t k = 0; k < i; k++) rel = jnext(fs, rel);
     if (jrevoked(r, t->blk, r->seq)) return;
     if (jraw_read(fs, rel, r->dblk) != VFS_OK) { r->bad++; return; }
-    if (fs->j_csum && jdata_csum(fs, r->seq, r->dblk) != t->csum) {
+    if (fs->j_csum &&
+        (jdata_csum(fs, r->seq, r->dblk) & (fs->j_csum3 ? ~0u : 0xFFFFu)) != t->csum) {
         kprintf("[ext4] journal: bad sum on block %llu of transaction %u -- not replayed\n",
                 (unsigned long long)t->blk, (unsigned)r->seq);
         r->bad++;
@@ -5472,8 +5482,8 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
             uint32_t jmaxlen   = be32(js->s_maxlen);
             uint32_t jfirst    = be32(js->s_first);
             /* tobyOS's classic journal, and Linux's: 64-bit numbers, v3
-             * sums (finding 274); not CSUM_V2, async commit, fast commits
-             * or the v1 commit sum */
+             * sums (finding 274) and v2's (312); not async commit, fast
+             * commits or the v1 commit sum */
             bool drivable =
                 jmagic == JBD2_MAGIC_NUMBER &&
                 (v2 || jtype == JBD2_SUPERBLOCK_V1) &&
@@ -5484,7 +5494,9 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
                 jfirst < jmaxlen;
             if (drivable) {
                 fs->j_64bit = (jincompat & JBD2_FEATURE_INCOMPAT_64BIT) != 0;
-                fs->j_csum  = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+                fs->j_csum3 = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
+                fs->j_csum  = fs->j_csum3 ||
+                              (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
                 memcpy(fs->j_uuid, js->s_uuid, 16);
                 fs->j_csum_seed = crc32c(~0u, fs->j_uuid, 16);
                 if (fs->j_csum && (js->s_checksum_type != JBD2_CRC32C_CHKSUM ||

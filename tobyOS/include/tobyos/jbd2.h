@@ -63,6 +63,7 @@
 
 #define JBD2_INCOMPAT_SUPPORTED  (JBD2_FEATURE_INCOMPAT_REVOKE | \
                                   JBD2_FEATURE_INCOMPAT_64BIT  | \
+                                  JBD2_FEATURE_INCOMPAT_CSUM_V2 | \
                                   JBD2_FEATURE_INCOMPAT_CSUM_V3)
 
 #pragma pack(push, 1)
