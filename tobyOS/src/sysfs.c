@@ -477,11 +477,15 @@ static void sysfs_populate_pci(void) {
  * it actually used. Faking Linux's split would mean inventing a second
  * bus that does not exist.
  *
- * SNAPSHOT, not a live view: nodes are built once at sysfs_init, which
- * runs long after pci_bind_drivers has enumerated the boot-time USB
- * topology. A device hot-plugged later attaches to usbreg but does NOT
- * appear here -- the node table is append-only. Same limitation the PCI
- * tree has; called out because for USB it is much easier to hit.
+ * A LIVE VIEW of the bus (finding 306). These nodes were once built at
+ * sysfs_init into the append-only node table, so a device pulled stayed
+ * listed and one plugged in later never appeared -- harmless only while
+ * the xHCI driver saw no hot-plug at all (304, 305). Linux's directory
+ * follows the bus, and so does this one: nothing under /bus/usb/devices
+ * is a node. Every lookup, read and listing there is answered from the
+ * usbreg row as it is now (copied under its lock), so a device leaves
+ * with its row and arrives under its own port path, with the number the
+ * bus gave it.
  */
 static const char *usb_speed_mbps(uint8_t code) {
     /* Linux's `speed` attribute is the signalling rate in Mbit/s as a
@@ -496,141 +500,125 @@ static const char *usb_speed_mbps(uint8_t code) {
     }
 }
 
-static void sysfs_populate_usb(void) {
-    sysfs_add_dir("/bus/usb");
-    sysfs_add_dir("/bus/usb/devices");
+#define USB_DEV_DIR "/bus/usb/devices"
 
-    size_t made = 0, skipped_full = 0;
+/* A device directory's attributes, in the order they are listed. */
+static const char *const usb_attrs[] = {
+    "idVendor", "idProduct", "bDeviceClass", "bDeviceSubClass",
+    "bDeviceProtocol", "busnum", "speed", "devnum", "version", "bcdDevice",
+    "bMaxPacketSize0", "bNumConfigurations", "manufacturer", "product",
+    "serial", "uevent",
+};
+#define USB_NATTRS ((int)(sizeof usb_attrs / sizeof usb_attrs[0]))
+
+/* Linux's port-path name: hub_depth nibbles of the xHCI route string
+ * spell the port taken at each tier below the root. */
+static void usb_dev_name(const struct usbreg_entry *e, char *name, size_t cap) {
+    int dl = ksnprintf(name, cap, "1-%u", (unsigned)e->port_id);
+    for (unsigned t = 0; t < e->hub_depth && dl > 0 && (size_t)dl < cap; t++)
+        dl += ksnprintf(name + dl, cap - (size_t)dl, ".%u",
+                        (unsigned)((e->route_string >> (t * 4)) & 0xFu));
+}
+
+/* The device on the bus now whose directory is NAME (len bytes). */
+static bool usb_dev_find(const char *name, size_t len, struct usbreg_entry *out) {
+    char n[32];
     for (size_t i = 0; i < USBREG_MAX; i++) {
-        const struct usbreg_entry *e = usbreg_get(i);
-        if (!e) continue;                        /* FREE row */
-        if (e->status == USBREG_STATUS_GONE) continue;  /* detached */
+        if (!usbreg_copy_live(i, out)) continue;
+        usb_dev_name(out, n, sizeof n);
+        if (strlen(n) == len && memcmp(n, name, len) == 0) return true;
+    }
+    return false;
+}
 
-        /* Each device costs 1 dir + up to 16 files. */
-        if (g_sysfs_count + 18 >= SYSFS_MAX_NODES) { skipped_full++; continue; }
-
-        /* Linux port-path name. hub_depth nibbles of the xHCI route
-         * string spell the port taken at each tier below the root. */
-        char dir[VFS_PATH_MAX], path[VFS_PATH_MAX], val[64];
-        int dl = ksnprintf(dir, sizeof dir, "/bus/usb/devices/1-%u",
-                           (unsigned)e->port_id);
-        for (unsigned t = 0; t < e->hub_depth && dl > 0 &&
-                             (size_t)dl < sizeof dir; t++) {
-            dl += ksnprintf(dir + dl, sizeof dir - (size_t)dl, ".%u",
-                            (unsigned)((e->route_string >> (t * 4)) & 0xFu));
-        }
-        sysfs_add_dir(dir);
-
-        ksnprintf(path, sizeof path, "%s/idVendor", dir);
-        ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->vendor);
-        sysfs_add_fixed(path, val);
-
-        ksnprintf(path, sizeof path, "%s/idProduct", dir);
-        ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->product);
-        sysfs_add_fixed(path, val);
-
-        ksnprintf(path, sizeof path, "%s/bDeviceClass", dir);
-        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_class);
-        sysfs_add_fixed(path, val);
-
-        ksnprintf(path, sizeof path, "%s/bDeviceSubClass", dir);
-        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_subclass);
-        sysfs_add_fixed(path, val);
-
-        ksnprintf(path, sizeof path, "%s/bDeviceProtocol", dir);
-        ksnprintf(val, sizeof val, "%02x\n", (unsigned)e->dev_protocol);
-        sysfs_add_fixed(path, val);
-
-        ksnprintf(path, sizeof path, "%s/busnum", dir);
-        sysfs_add_fixed(path, "1\n");
-
-        const char *spd = usb_speed_mbps(e->speed);
-        if (spd) {
-            ksnprintf(path, sizeof path, "%s/speed", dir);
-            ksnprintf(val, sizeof val, "%s\n", spd);
-            sysfs_add_fixed(path, val);
-        }
-
-        /* Everything below comes from the full device descriptor, which
-         * only exists once usbreg_record_details has run. Without it the
-         * fields would all read zero, and a bcdUSB of 0.00 is a lie
-         * where an absent file is the truth. */
-        if (e->have_details) {
-            ksnprintf(path, sizeof path, "%s/devnum", dir);
-            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->bus_address);
-            sysfs_add_fixed(path, val);
-
-            /* Linux renders bcdUSB space-padded to width 2: " 2.00". */
-            ksnprintf(path, sizeof path, "%s/version", dir);
-            ksnprintf(val, sizeof val, "%s%x.%02x\n",
-                      (e->bcd_usb >> 8) < 0x10 ? " " : "",
-                      (unsigned)(e->bcd_usb >> 8),
-                      (unsigned)(e->bcd_usb & 0xFFu));
-            sysfs_add_fixed(path, val);
-
-            ksnprintf(path, sizeof path, "%s/bcdDevice", dir);
-            ksnprintf(val, sizeof val, "%04x\n", (unsigned)e->bcd_device);
-            sysfs_add_fixed(path, val);
-
-            ksnprintf(path, sizeof path, "%s/bMaxPacketSize0", dir);
-            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->max_packet0);
-            sysfs_add_fixed(path, val);
-
-            ksnprintf(path, sizeof path, "%s/bNumConfigurations", dir);
-            ksnprintf(val, sizeof val, "%u\n", (unsigned)e->num_configs);
-            sysfs_add_fixed(path, val);
-
-            /* String descriptors. An empty string means the device has
-             * no such index (or the fetch failed) -- Linux omits the
-             * attribute in exactly that case, and so do we. */
-            if (e->manufacturer[0]) {
-                ksnprintf(path, sizeof path, "%s/manufacturer", dir);
-                ksnprintf(val, sizeof val, "%s\n", e->manufacturer);
-                sysfs_add_fixed(path, val);
-            }
-            if (e->prod_name[0]) {
-                ksnprintf(path, sizeof path, "%s/product", dir);
-                ksnprintf(val, sizeof val, "%s\n", e->prod_name);
-                sysfs_add_fixed(path, val);
-            }
-            if (e->serial[0]) {
-                ksnprintf(path, sizeof path, "%s/serial", dir);
-                ksnprintf(val, sizeof val, "%s\n", e->serial);
-                sysfs_add_fixed(path, val);
-            }
-        }
-
+/* Attribute A of device E rendered into buf: its length, or -1 when the
+ * device has none. Everything past `speed` comes from the full device
+ * descriptor, which only exists once usbreg_record_details has run;
+ * without it the fields would all read zero, and a bcdUSB of 0.00 is a
+ * lie where an absent file is the truth. An empty string descriptor
+ * means the device has no such index (or the fetch failed) -- Linux
+ * omits the attribute in exactly that case, and so do we. */
+static int usb_attr_render(const struct usbreg_entry *e, int a,
+                           char *buf, size_t cap) {
+    const char *at = usb_attrs[a];
+    const char *spd = usb_speed_mbps(e->speed);
+    if (!strcmp(at, "idVendor"))  return ksnprintf(buf, cap, "%04x\n", (unsigned)e->vendor);
+    if (!strcmp(at, "idProduct")) return ksnprintf(buf, cap, "%04x\n", (unsigned)e->product);
+    if (!strcmp(at, "bDeviceClass"))    return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_class);
+    if (!strcmp(at, "bDeviceSubClass")) return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_subclass);
+    if (!strcmp(at, "bDeviceProtocol")) return ksnprintf(buf, cap, "%02x\n", (unsigned)e->dev_protocol);
+    if (!strcmp(at, "busnum")) return ksnprintf(buf, cap, "1\n");
+    if (!strcmp(at, "speed"))  return spd ? ksnprintf(buf, cap, "%s\n", spd) : -1;
+    if (!strcmp(at, "uevent")) {
         /* uevent, in Linux's spelling for a usb_device. MAJOR/MINOR/
          * DEVNAME are deliberately absent: there is no /dev/bus/usb node
          * to name. PRODUCT is vid/pid/bcdDevice, TYPE is the class
          * triple in DECIMAL. */
-        {
-            char ue[SYSFS_BUF_SIZE];
-            ksnprintf(ue, sizeof ue,
-                      "DEVTYPE=usb_device\n"
-                      "DRIVER=%s\n"
-                      "PRODUCT=%x/%x/%x\n"
-                      "TYPE=%u/%u/%u\n"
-                      "BUSNUM=001\n"
-                      "DEVNUM=%03u\n",
-                      e->driver[0] ? e->driver : "(none)",
-                      (unsigned)e->vendor, (unsigned)e->product,
-                      (unsigned)e->bcd_device,
-                      (unsigned)e->dev_class, (unsigned)e->dev_subclass,
-                      (unsigned)e->dev_protocol,
-                      (unsigned)e->bus_address);
-            ksnprintf(path, sizeof path, "%s/uevent", dir);
-            sysfs_add_fixed(path, ue);
-        }
+        return ksnprintf(buf, cap,
+                         "DEVTYPE=usb_device\n"
+                         "DRIVER=%s\n"
+                         "PRODUCT=%x/%x/%x\n"
+                         "TYPE=%u/%u/%u\n"
+                         "BUSNUM=001\n"
+                         "DEVNUM=%03u\n",
+                         e->driver[0] ? e->driver : "(none)",
+                         (unsigned)e->vendor, (unsigned)e->product,
+                         (unsigned)e->bcd_device,
+                         (unsigned)e->dev_class, (unsigned)e->dev_subclass,
+                         (unsigned)e->dev_protocol,
+                         (unsigned)e->bus_address);
+    }
+    if (!e->have_details) return -1;
+    if (!strcmp(at, "devnum")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->bus_address);
+    /* Linux renders bcdUSB space-padded to width 2: " 2.00". */
+    if (!strcmp(at, "version"))
+        return ksnprintf(buf, cap, "%s%x.%02x\n",
+                         (e->bcd_usb >> 8) < 0x10 ? " " : "",
+                         (unsigned)(e->bcd_usb >> 8),
+                         (unsigned)(e->bcd_usb & 0xFFu));
+    if (!strcmp(at, "bcdDevice"))       return ksnprintf(buf, cap, "%04x\n", (unsigned)e->bcd_device);
+    if (!strcmp(at, "bMaxPacketSize0")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->max_packet0);
+    if (!strcmp(at, "bNumConfigurations")) return ksnprintf(buf, cap, "%u\n", (unsigned)e->num_configs);
+    const char *s = !strcmp(at, "manufacturer") ? e->manufacturer :
+                    !strcmp(at, "product")      ? e->prod_name :
+                    !strcmp(at, "serial")       ? e->serial : "";
+    return s[0] ? ksnprintf(buf, cap, "%s\n", s) : -1;
+}
 
-        made++;
+/* The first '/' in s, or NULL (klibc has no strchr). */
+static const char *usb_slash(const char *s) {
+    for (; *s; s++) if (*s == '/') return s;
+    return 0;
+}
+
+/* PATH under /bus/usb/devices: 0 when it is not; 1 for a device's
+ * directory; 2 for one of its attributes (*attr, rendered into buf, its
+ * length in *len); -1 for a name no device on the bus has now. */
+static int usb_path(const char *path, struct usbreg_entry *e, int *attr,
+                    char *buf, size_t cap, size_t *len) {
+    size_t dl = sizeof USB_DEV_DIR - 1;
+    if (strncmp(path, USB_DEV_DIR, dl) != 0 || path[dl] != '/') return 0;
+    const char *name = path + dl + 1;
+    const char *slash = usb_slash(name);
+    size_t nlen = slash ? (size_t)(slash - name) : strlen(name);
+    if (nlen == 0 || !usb_dev_find(name, nlen, e)) return -1;
+    if (!slash || !slash[1]) return 1;
+    for (int a = 0; a < USB_NATTRS; a++) {
+        if (strcmp(slash + 1, usb_attrs[a]) != 0) continue;
+        int n = usb_attr_render(e, a, buf, cap);
+        if (n < 0) return -1;
+        *attr = a;
+        *len = (size_t)n < cap ? (size_t)n : cap - 1;
+        return 2;
     }
-    if (skipped_full) {
-        kprintf("[sysfs] WARN: node table full -- %lu USB device(s) NOT "
-                "exposed\n", (unsigned long)skipped_full);
-    }
+    return -1;
+}
+
+static void sysfs_populate_usb(void) {
+    sysfs_add_dir("/bus/usb");
+    sysfs_add_dir(USB_DEV_DIR);
     kprintf("[sysfs] /sys/bus/usb/devices: %lu device(s) exposed\n",
-            (unsigned long)made);
+            (unsigned long)usbreg_count_active());
 }
 
 /* Add a file whose bytes are BINARY kernel memory, served in place. The
@@ -877,15 +865,24 @@ static struct sysfs_node *sysfs_find(const char *path) {
 
 static int sysfs_open(void *mnt, const char *path, struct vfs_file *out) {
     (void)mnt;
-    struct sysfs_node *n = sysfs_find(path);
-    if (!n) return VFS_ERR_NOENT;
-    if (n->type == VFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    struct sysfs_node *n = u ? 0 : sysfs_find(path);
+    if (u < 0 || (!u && !n)) return VFS_ERR_NOENT;
+    if (u == 1 || (n && n->type == VFS_TYPE_DIR)) return VFS_ERR_ISDIR;
 
     struct sysfs_file_priv *priv = kmalloc(sizeof(*priv));
     if (!priv) return VFS_ERR_NOMEM;
     memset(priv, 0, sizeof(*priv));
 
-    if (n->generate) {
+    if (u == 2) {
+        /* the attribute as the bus has it at open, held for this handle */
+        memcpy(priv->buf, ubuf, ulen);
+        priv->len = ulen;
+        priv->src = (const uint8_t *)priv->buf;
+    } else if (n->generate) {
         int len = n->generate(priv->buf, SYSFS_BUF_SIZE);
         priv->len = (size_t)(len > 0 ? len : 0);
         priv->src = (const uint8_t *)priv->buf;
@@ -943,6 +940,19 @@ static uint32_t sysfs_default_mode(const struct sysfs_node *n) {
 
 static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
     (void)mnt;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    if (u < 0) return VFS_ERR_NOENT;
+    if (u) {
+        out->type = u == 1 ? VFS_TYPE_DIR : VFS_TYPE_FILE;
+        out->size = u == 1 ? 0 : ulen;
+        out->uid = 0;
+        out->gid = 0;
+        out->mode = (u == 1 ? 00555u : 00444u) | VFS_MODE_VALID;
+        return VFS_OK;
+    }
     struct sysfs_node *n = sysfs_find(path);
     if (!n) return VFS_ERR_NOENT;
     out->type = n->type;
@@ -964,8 +974,14 @@ static int sysfs_stat(void *mnt, const char *path, struct vfs_stat *out) {
 
 static int sysfs_opendir(void *mnt, const char *path, struct vfs_dir *out) {
     (void)mnt;
-    struct sysfs_node *n = sysfs_find(path);
-    if (!n && strcmp(path, "/") != 0) return VFS_ERR_NOENT;
+    struct usbreg_entry ue;
+    int ua; size_t ulen;
+    char ubuf[SYSFS_BUF_SIZE];
+    int u = usb_path(path, &ue, &ua, ubuf, sizeof ubuf, &ulen);
+    if (u < 0) return VFS_ERR_NOENT;
+    if (u == 2) return VFS_ERR_NOTDIR;
+    struct sysfs_node *n = u ? 0 : sysfs_find(path);
+    if (!u && !n && strcmp(path, "/") != 0) return VFS_ERR_NOENT;
     out->index = 0;
     out->priv = (void *)(uintptr_t)(path[0] ? (uintptr_t)path : (uintptr_t)"/");
     return VFS_OK;
@@ -1016,6 +1032,41 @@ static int sysfs_readdir(struct vfs_dir *d, struct vfs_dirent *out) {
             return VFS_OK;
         }
         idx++;
+    }
+
+    /* /bus/usb/devices and a device's directory: the bus as it is now,
+     * after any nodes (there are none) */
+    size_t dl = sizeof USB_DEV_DIR - 1;
+    if (strncmp(parent, USB_DEV_DIR, dl) != 0 ||
+        (parent[dl] != '\0' && parent[dl] != '/')) return VFS_ERR_NOENT;
+    struct usbreg_entry e;
+    char name[32], tmp[SYSFS_BUF_SIZE];
+    if (parent[dl] == '\0') {
+        for (size_t i = 0; i < USBREG_MAX; i++) {
+            if (!usbreg_copy_live(i, &e)) continue;
+            if (idx++ != d->index) continue;
+            usb_dev_name(&e, name, sizeof name);
+            memcpy(out->name, name, strlen(name) + 1);
+            out->type = VFS_TYPE_DIR;
+            out->mode = 00555u | VFS_MODE_VALID;
+            out->size = 0; out->uid = 0; out->gid = 0;
+            d->index++;
+            return VFS_OK;
+        }
+        return VFS_ERR_NOENT;
+    }
+    const char *dev = parent + dl + 1;
+    if (usb_slash(dev) || !usb_dev_find(dev, strlen(dev), &e))
+        return VFS_ERR_NOENT;
+    for (int a = 0; a < USB_NATTRS; a++) {
+        if (usb_attr_render(&e, a, tmp, sizeof tmp) < 0) continue;
+        if (idx++ != d->index) continue;
+        memcpy(out->name, usb_attrs[a], strlen(usb_attrs[a]) + 1);
+        out->type = VFS_TYPE_FILE;
+        out->mode = 00444u | VFS_MODE_VALID;
+        out->size = 0; out->uid = 0; out->gid = 0;
+        d->index++;
+        return VFS_OK;
     }
     return VFS_ERR_NOENT;
 }

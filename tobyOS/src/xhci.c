@@ -2093,6 +2093,10 @@ bool xhci_detach_slot(uint8_t slot_id) {
      *    it during the command completion). */
     g_xhci.dcbaa[slot_id] = 0;
     memset(st, 0, sizeof(*st));
+    /* ... and from the registry: its row was left BOUND, so every reader
+     * of the bus -- /sys/bus/usb/devices first -- went on listing a
+     * device that had gone (finding 306) */
+    usbreg_record_detach(slot_id);
 
     /* 5. Notify userland. */
     hotplug_post_detach(ABI_DEVT_BUS_USB, slot_id, hub_depth, hub_port, info);

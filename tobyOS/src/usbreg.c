@@ -285,6 +285,16 @@ const struct usbreg_entry *usbreg_get(size_t idx) {
     return &g_table[idx];
 }
 
+bool usbreg_copy_live(size_t idx, struct usbreg_entry *out) {
+    if (!g_inited || idx >= USBREG_MAX || !out) return false;
+    uint64_t f = spin_lock_irqsave(&g_lock);
+    enum usbreg_status st = g_table[idx].status;
+    bool live = st != USBREG_STATUS_FREE && st != USBREG_STATUS_GONE;
+    if (live) *out = g_table[idx];
+    spin_unlock_irqrestore(&g_lock, f);
+    return live;
+}
+
 const struct usbreg_entry *usbreg_find(uint8_t slot_id) {
     if (!g_inited) return NULL;
     uint64_t f = spin_lock_irqsave(&g_lock);

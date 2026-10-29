@@ -144,6 +144,10 @@ void usbreg_record_probe_failed(uint8_t slot_id, const char *driver);
 size_t usbreg_count(void);                          /* incl. GONE rows */
 size_t usbreg_count_active(void);                   /* excl. GONE rows */
 const struct usbreg_entry *usbreg_get(size_t idx);  /* NULL on OOB     */
+/* Row idx copied under the table's lock, for a reader that may run while
+ * a device comes or goes (/sys/bus/usb/devices, finding 306). false for a
+ * FREE or GONE row: a device that is no longer on the bus. */
+bool usbreg_copy_live(size_t idx, struct usbreg_entry *out);
 
 /* Lookup by slot id; NULL if not present. */
 const struct usbreg_entry *usbreg_find(uint8_t slot_id);
