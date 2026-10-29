@@ -236,6 +236,10 @@ struct ext4 {
         int      refs;
         bool     orphan;          /* the last NAME went away while open */
     } openrefs[EXT4_MAX_OPEN_INODES];
+
+    /* where such an inode is recorded (finding 310): the orphan file's
+     * inode and generation, or 0 for the classic s_last_orphan list */
+    uint32_t orph_ino, orph_gen;
 };
 
 /* Per-handle state for an open file. The inode is snapshotted at open
@@ -3792,6 +3796,234 @@ static bool journal_locate(struct ext4 *fs, uint32_t jinum) {
     return fs->j_blocks >= 4;     /* superblock + at least desc/data/commit */
 }
 
+/* ---- ORPHANS: inodes whose last name went while they were open -------
+ *
+ * (finding 310, the open item "orphan_present".) A file unlinked while it
+ * is open keeps its blocks until the last close; if the machine stops
+ * first, the next mount must free them. ext4 records such an inode in one
+ * of two places, and Linux's mount processes both:
+ *   - the classic list: the superblock's s_last_orphan names the last
+ *     one, and each orphan's i_dtime the one before it;
+ *   - the orphan file (COMPAT_ORPHAN_FILE, mkfs.ext4's default since
+ *     e2fsprogs 1.47): an inode, s_orphan_file_inum, whose blocks are
+ *     arrays of 32-bit inode numbers (0 for none) ending in an 8-byte
+ *     tail, magic 0x0b10ca04 then a CRC-32C of the volume's seed, the
+ *     orphan file's inode number and generation, the block's PHYSICAL
+ *     number (64 bits) and the block before the tail -- found by trying
+ *     the inputs against the sums Linux wrote (logs/b40/orphcsum.py; 32
+ *     of 32 blocks on a 4 KiB and a 1 KiB volume). RO_COMPAT_ORPHAN_PRESENT
+ *     says it may hold entries: Linux sets it while the volume is mounted
+ *     read-write and clears it at a clean umount.
+ * An orphan with no link left is deleted; one with links was being
+ * truncated, and is cut to its size.
+ *
+ * This driver kept neither: ORPHAN_PRESENT was a feature it "could not
+ * keep", so every volume Linux left uncleanly mounted read-only here and
+ * its orphans stayed allocated; and its own name-less open inodes were
+ * recorded nowhere, so after a crash Linux found blocks no file owned. */
+#define EXT4_ORPHAN_MAGIC 0x0b10ca04u
+
+static uint32_t orph_csum(struct ext4 *fs, uint64_t pblk, const uint8_t *blk) {
+    uint32_t c = inode_seed(fs, fs->orph_ino, fs->orph_gen);
+    c = crc32c(c, &pblk, 8);
+    return crc32c(c, blk, fs->block_size - 8);
+}
+
+static int orph_block_get(struct ext4 *fs, const struct ext4_inode *oin,
+                          uint32_t lblk, uint64_t *pblk, uint8_t *buf) {
+    if (inode_block_map(fs, oin, lblk, pblk) != VFS_OK || !*pblk)
+        return VFS_ERR_IO;
+    return read_block(fs, *pblk, buf);
+}
+
+static int orph_block_put(struct ext4 *fs, uint64_t pblk, uint8_t *buf) {
+    uint32_t *tail = (uint32_t *)(buf + fs->block_size - 8);
+    tail[0] = EXT4_ORPHAN_MAGIC;
+    tail[1] = fs->csum ? orph_csum(fs, pblk, buf) : 0;
+    return write_block(fs, pblk, buf);
+}
+
+static bool orph_block_ok(struct ext4 *fs, uint64_t pblk, const uint8_t *buf) {
+    const uint32_t *tail = (const uint32_t *)(buf + fs->block_size - 8);
+    return tail[0] == EXT4_ORPHAN_MAGIC &&
+           (!fs->csum || tail[1] == orph_csum(fs, pblk, buf));
+}
+
+/* Find INO in the orphan file and put NEW there (INO 0: a free entry,
+ * NEW an orphan's number; INO an orphan's, NEW 0: taken out). 1 when it
+ * was done, 0 when there was no such entry. */
+static int orph_file_swap(struct ext4 *fs, uint32_t ino, uint32_t new_ino) {
+    struct ext4_inode oin;
+    if (!fs->orph_ino || read_inode(fs, fs->orph_ino, &oin) != VFS_OK) return 0;
+    uint64_t size = ((uint64_t)oin.i_size_hi << 32) | oin.i_size_lo;
+    uint32_t nblk = (uint32_t)(size / fs->block_size);
+    uint32_t per = (fs->block_size - 8) / 4;
+    uint8_t *buf = kmalloc(fs->block_size);
+    if (!buf) return VFS_ERR_NOMEM;
+    int rc = 0;
+    for (uint32_t b = 0; b < nblk && rc == 0; b++) {
+        uint64_t pblk;
+        if (orph_block_get(fs, &oin, b, &pblk, buf) != VFS_OK ||
+            !orph_block_ok(fs, pblk, buf))
+            continue;
+        uint32_t *e = (uint32_t *)buf;
+        for (uint32_t i = 0; i < per; i++) {
+            if (e[i] != ino) continue;
+            e[i] = new_ino;
+            rc = orph_block_put(fs, pblk, buf) == VFS_OK ? 1 : VFS_ERR_IO;
+            break;
+        }
+    }
+    kfree(buf);
+    return rc;
+}
+
+/* Record INO, open and now name-less, as an orphan: in the orphan file,
+ * or -- without one, or with it full, as Linux falls back -- at the head
+ * of the classic list. IN is INO's inode, written back. */
+static int orphan_add(struct ext4 *fs, uint32_t ino, struct ext4_inode *in) {
+    if (fs->orph_ino) {
+        int r = orph_file_swap(fs, 0, ino);
+        if (r < 0) return r;
+        if (r == 1) return write_inode(fs, ino, in);
+    }
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    in->i_dtime = sb->s_last_orphan;
+    int rc = write_inode(fs, ino, in);
+    if (rc != VFS_OK) return rc;
+    sb->s_last_orphan = ino;
+    return flush_superblock(fs);
+}
+
+/* Take INO out of whichever record holds it. */
+static void orphan_del(struct ext4 *fs, uint32_t ino, struct ext4_inode *in) {
+    if (fs->orph_ino && orph_file_swap(fs, ino, 0) == 1) return;
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    if (sb->s_last_orphan == ino) {
+        sb->s_last_orphan = in->i_dtime;
+        (void)flush_superblock(fs);
+        return;
+    }
+    uint32_t prev = sb->s_last_orphan;
+    for (uint32_t n = 0; prev && n < fs->total_inodes; n++) {
+        struct ext4_inode pin;
+        if (read_inode(fs, prev, &pin) != VFS_OK) return;
+        if (pin.i_dtime == ino) {
+            pin.i_dtime = in->i_dtime;
+            (void)write_inode(fs, prev, &pin);
+            return;
+        }
+        prev = pin.i_dtime;
+    }
+}
+
+/* One orphan found at the mount: deleted, or cut to its size. Its own
+ * transaction. 1 deleted, 2 truncated, 0 nothing to do, <0 an error. */
+static int orphan_settle(struct ext4 *fs, uint32_t ino) {
+    if (ino < EXT4_ROOT_INODE || ino > fs->total_inodes) return 0;
+    struct ext4_inode in;
+    if (read_inode(fs, ino, &in) != VFS_OK) return VFS_ERR_IO;
+    if (!in.i_mode) return 0;                        /* already free */
+    txn_begin(fs);
+    int rc, what;
+    if (in.i_links_count == 0) {
+        inode_free_data(fs, ino, &in);
+        in.i_size_lo = 0;
+        in.i_size_hi = 0;
+        in.i_dtime = (uint32_t)ext4_now().s;
+        rc = write_inode(fs, ino, &in);
+        if (rc == VFS_OK) rc = ext4_free_inode(fs, ino);
+        what = 1;
+    } else {
+        uint64_t size = ((uint64_t)in.i_size_hi << 32) | in.i_size_lo;
+        rc = inode_trim_from(fs, ino, &in, (uint32_t)((size + fs->block_size - 1) /
+                                                       fs->block_size));
+        in.i_dtime = 0;
+        if (rc == VFS_OK) rc = write_inode(fs, ino, &in);
+        what = 2;
+    }
+    rc = txn_finish(fs, rc);
+    return rc == VFS_OK ? what : rc;
+}
+
+/* At a read-write mount: every orphan in the classic list and, when
+ * ORPHAN_PRESENT says it may hold some, in the orphan file -- then
+ * ORPHAN_PRESENT set for the mount, as Linux's is (cleared at umount,
+ * orphan_umount). A bad orphan block refuses the mount. */
+static int orphan_mount(struct ext4 *fs) {
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    unsigned del = 0, trunc = 0;
+    uint32_t ino = sb->s_last_orphan;
+    for (uint32_t n = 0; ino && n < fs->total_inodes; n++) {
+        struct ext4_inode in;
+        if (read_inode(fs, ino, &in) != VFS_OK) break;
+        uint32_t next = in.i_dtime;
+        int r = orphan_settle(fs, ino);
+        if (r < 0) return r;
+        del += r == 1; trunc += r == 2;
+        ino = next;
+    }
+    if (sb->s_last_orphan) {
+        txn_begin(fs);
+        sb->s_last_orphan = 0;
+        if (txn_finish(fs, flush_superblock(fs)) != VFS_OK) return VFS_ERR_IO;
+    }
+    if (fs->orph_ino && (sb->s_feature_ro_compat & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT)) {
+        struct ext4_inode oin;
+        if (read_inode(fs, fs->orph_ino, &oin) != VFS_OK) return VFS_ERR_IO;
+        uint64_t size = ((uint64_t)oin.i_size_hi << 32) | oin.i_size_lo;
+        uint32_t nblk = (uint32_t)(size / fs->block_size);
+        uint32_t per = (fs->block_size - 8) / 4;
+        uint8_t *buf = kmalloc(fs->block_size);
+        if (!buf) return VFS_ERR_NOMEM;
+        for (uint32_t b = 0; b < nblk; b++) {
+            uint64_t pblk;
+            if (orph_block_get(fs, &oin, b, &pblk, buf) != VFS_OK ||
+                !orph_block_ok(fs, pblk, buf)) {
+                kprintf("[ext4] orphan file block %u: bad magic or checksum\n", b);
+                kfree(buf);
+                return VFS_ERR_IO;
+            }
+            for (uint32_t i = 0; i < per; i++) {
+                uint32_t o = ((uint32_t *)buf)[i];
+                if (!o) continue;
+                int r = orphan_settle(fs, o);
+                if (r < 0) { kfree(buf); return r; }
+                del += r == 1; trunc += r == 2;
+                /* read again: the settle wrote other blocks through the
+                 * cache, and this one may share it */
+                txn_begin(fs);
+                int w = orph_block_get(fs, &oin, b, &pblk, buf);
+                if (w == VFS_OK) {
+                    ((uint32_t *)buf)[i] = 0;
+                    w = orph_block_put(fs, pblk, buf);
+                }
+                if (txn_finish(fs, w) != VFS_OK) { kfree(buf); return VFS_ERR_IO; }
+            }
+        }
+        kfree(buf);
+    }
+    if (txn_commit_running(fs) != VFS_OK) return VFS_ERR_IO;
+    if (del)   kprintf("[ext4] %u orphan inode%s deleted\n", del, del == 1 ? "" : "s");
+    if (trunc) kprintf("[ext4] %u truncate%s cleaned up\n", trunc, trunc == 1 ? "" : "s");
+    if (fs->orph_ino && !(sb->s_feature_ro_compat & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT)) {
+        sb->s_feature_ro_compat |= EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+        (void)flush_superblock_direct(fs);
+    }
+    return VFS_OK;
+}
+
+/* At a clean umount: ORPHAN_PRESENT off when no orphan is left -- a
+ * volume with one still open stays marked (it is not unmounted cleanly). */
+static void orphan_umount(struct ext4 *fs) {
+    struct ext4_super_block *sb = (struct ext4_super_block *)fs->sb_buf;
+    if (!(sb->s_feature_ro_compat & EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT)) return;
+    for (size_t i = 0; i < EXT4_MAX_OPEN_INODES; i++)
+        if (fs->openrefs[i].refs > 0 && fs->openrefs[i].orphan) return;
+    sb->s_feature_ro_compat &= ~EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT;
+    (void)flush_superblock_direct(fs);
+}
+
 /* ---- vfs_ops ---- */
 
 /* ---- open-handle references, so unlink can defer the release --------
@@ -3840,8 +4072,13 @@ static int oref_get(struct ext4 *fs, uint32_t ino) {
 static void ext4_release_inode(struct ext4 *fs, uint32_t ino) {
     struct ext4_inode in;
     if (read_inode(fs, ino, &in) != VFS_OK) return;
-    if (in.i_links_count != 0) return;         /* re-linked in the meantime */
     txn_begin(fs);
+    orphan_del(fs, ino, &in);                  /* finding 310 */
+    if (in.i_links_count != 0) {               /* re-linked in the meantime */
+        in.i_dtime = 0;
+        (void)txn_finish(fs, write_inode(fs, ino, &in));
+        return;
+    }
     inode_free_data(fs, ino, &in);
     in.i_size_lo = 0;
     in.i_size_hi = 0;
@@ -4188,9 +4425,12 @@ static int do_unlink(struct ext4 *fs, const char *path) {
              * already happened above -- but the bytes belong to those
              * handles until the last of them closes. Persist the zero
              * link count and leave the data alone; oref_put() finishes
-             * the job. */
+             * the job -- and record it as an orphan, so the next mount
+             * (Linux's or this driver's) finishes it after a crash
+             * (finding 310). */
             r->orphan = true;
-            return write_inode(fs, ino, &in);
+            if (fs->rdonly) return write_inode(fs, ino, &in);
+            return orphan_add(fs, ino, &in);
         }
         inode_free_data(fs, ino, &in);
         in.i_size_lo = 0;
@@ -5143,7 +5383,8 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
         ~(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER | EXT4_FEATURE_RO_COMPAT_LARGE_FILE |
           EXT4_FEATURE_RO_COMPAT_HUGE_FILE | EXT4_FEATURE_RO_COMPAT_GDT_CSUM |
           EXT4_FEATURE_RO_COMPAT_DIR_NLINK | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE |
-          EXT4_FEATURE_RO_COMPAT_METADATA_CSUM);
+          EXT4_FEATURE_RO_COMPAT_METADATA_CSUM |
+          EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT);       /* finding 310 */
     fs->desc_size        = sb->s_desc_size;
     if (fs->desc_size < 32) fs->desc_size = 32;
     fs->desc_64bit = fs->feat_64bit && fs->desc_size >= 64;
@@ -5195,6 +5436,20 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
                 (unsigned)root.i_mode);
         ext4_free(fs);
         return NULL;
+    }
+
+    /* the orphan file, when the volume has one (finding 310): a regular
+     * file of whole blocks, or the classic list is used */
+    {
+        const struct ext4_super_block *s = (const struct ext4_super_block *)fs->sb_buf;
+        struct ext4_inode oi;
+        if ((s->s_feature_compat & EXT4_FEATURE_COMPAT_ORPHAN_FILE) &&
+            s->s_orphan_file_inum && read_inode(fs, s->s_orphan_file_inum, &oi) == VFS_OK &&
+            (oi.i_mode & EXT4_S_IFMT) == EXT4_S_IFREG &&
+            oi.i_size_lo % fs->block_size == 0) {
+            fs->orph_ino = s->s_orphan_file_inum;
+            fs->orph_gen = oi.i_generation;
+        }
     }
 
     /* ---- JBD2 journal: detect, validate, recover ---- */
@@ -5288,6 +5543,12 @@ int ext4_mount_ro(const char *mount_point, struct blk_dev *dev, bool rdonly) {
         ext4_free(fs);
         return VFS_ERR_INVAL;
     }
+    /* the orphans the last mount left, as Linux's mount settles them
+     * (finding 310); a volume whose record cannot be read stays readable */
+    if (!rdonly && orphan_mount(fs) != VFS_OK) {
+        kprintf("[ext4] orphan cleanup failed: mounting read-only\n");
+        rdonly = true;
+    }
     fs->rdonly = rdonly;
     if (!rdonly) {
         /* Mounted read-write: counted, dated -- and, with no journal this
@@ -5349,6 +5610,7 @@ static int ext4_umount(void *mnt) {
      * looks at this mount again */
     (void)txn_commit_running(fs);
     e4_jfs_forget(fs);
+    if (!fs->rdonly) orphan_umount(fs);          /* finding 310 */
     /* the log empty, NEEDS_RECOVERY cleared: what a clean umount leaves,
      * as Linux's (finding 274) */
     if (fs->has_journal && fs->j_dirty) {
