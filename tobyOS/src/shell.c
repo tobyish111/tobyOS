@@ -30157,6 +30157,206 @@ static int shell_expand_array_kv(const char *nm, bool words, bool star,
     return sb_put_data_str(b, kv.p ? kv.p : "");
 }
 
+/* NAME's attribute letters, as ${NAME@a} and @A give them. They come from
+ * the flag table and the ARRAY table together: `assoc` lives on the array
+ * record, not on the name's flags. */
+static void sh_attr_letters(const char *name, char at[12]) {
+    size_t an = 0;
+    int vidx = env_find(name, strlen(name));
+    unsigned f = (vidx >= 0) ? (unsigned)g_env_flags[vidx] : 0u;
+    struct sh_array *arr = sh_array_find(name);
+    if (arr && arr->assoc)             at[an++] = 'A';
+    else if ((f & SHVAR_ARRAY) || arr) at[an++] = 'a';
+    if (f & SHVAR_INTEGER)             at[an++] = 'i';
+    if (f & SHVAR_NAMEREF)             at[an++] = 'n';
+    if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
+    if (f & SHVAR_EXPORTED)            at[an++] = 'x';
+    if (f & SHVAR_LOWER)               at[an++] = 'l';
+    if (f & SHVAR_UPPER)               at[an++] = 'u';
+    at[an] = '\0';
+}
+
+/* @A -- bash's ASSIGNMENT STATEMENT for NAME, in every form (finding 308;
+ * logs/b40/atA.sh, atA2.sh, atA3.sh, measured on bash 5.2):
+ *
+ *     declare -i x=1   ${x@A}        declare -i x='1'
+ *     declare -i n     ${n@A}        declare -i n          no value
+ *     a=(x 'y z')      ${a[1]@A}     declare -a a='y z'    an element
+ *                      ${a[@]@A}     declare -a a=([0]="x" [1]="y z")
+ *     set -- p 'q r'   ${@@A}        set -- 'p' 'q r'
+ *     unset u          ${u@A} ${1@A} nothing
+ *
+ * tsh printed `x='1'` for a name with attributes and nothing for one with
+ * no value, and its own scratch names for the rest: SHELL_ELEM_0='y z',
+ * `SHELL_ARRAY_ELEM='x' SHELL_ARRAY_ELEM='y z'`, `1='p'`.
+ *
+ * The text for NAME with value V (an element's for ${a[i]@A}; NULL for
+ * none) into OUT, plain: nothing for a special parameter, or for a name
+ * with neither attributes nor a value. */
+static int sh_at_A_text(const char *name, const char *v, struct shell_sb *out) {
+    if (!shell_name_is_valid(name, strlen(name))) return 0;
+    char at[12];
+    sh_attr_letters(name, at);
+    if (at[0]) {
+        if (sb_puts(out, "declare -") < 0 || sb_puts(out, at) < 0 ||
+            sb_putc(out, ' ') < 0)
+            return -1;
+    } else if (!v) {
+        return 0;
+    }
+    if (sb_puts(out, name) < 0) return -1;
+    if (v && (sb_putc(out, '=') < 0 || shell_quote_ansic(v, out) < 0))
+        return -1;
+    return 0;
+}
+
+static int sh_at_A_stmt(const char *name, const char *v, struct shell_sb *b) {
+    SH_SB(out);
+    if (sh_at_A_text(name, v, &out) < 0) return -1;
+    return out.len ? sb_put_data_str(b, out.p) : 0;
+}
+
+static bool sh_ifs_has(const char *ifs, char c) {
+    for (; *ifs; ifs++) if (*ifs == c) return true;
+    return false;
+}
+
+static bool sh_ifs_blank(const char *ifs, char c) {
+    return (c == ' ' || c == '\t' || c == '\n') && sh_ifs_has(ifs, c);
+}
+
+/* One word of an "@"-form @A: after a mark from the second word on, kept
+ * when empty. */
+static int sh_at_A_word(struct shell_sb *b, int *words, const char *s) {
+    if (*words > 0 && sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+    size_t before = b->len;
+    if (sb_put_data_str(b, s) < 0 || sh_join_empty_elem(b, before) < 0)
+        return -1;
+    (*words)++;
+    return 0;
+}
+
+/* "${@@A}" and "${a[@]@A}" AS WORDS, as bash makes them: the statement's
+ * leading words, LEAD (`set -- `, `declare -FLAGS `), are split as unquoted
+ * text is, by IFS -- by blanks when IFS is null or unset -- and the last
+ * piece runs on into the first value; every value after it is a word of its
+ * own, and no value is split. VALS is N strings, each ended by a NUL.
+ *     IFS default  <set><--><'p'><'q r'>     IFS=:   <set -- 'p'><'q r'>
+ *     IFS=' -'     <set><><'p'><'q r'> */
+static int sh_at_A_words(struct shell_sb *b, const char *lead,
+                         const char *vals, int n) {
+    const char *ifs = env_get("IFS");
+    if (!ifs || !*ifs) ifs = " \t\n";
+    if (sh_put_lead_mark(b) < 0) return -1;
+    int words = 0;
+    SH_SB(cur);
+    if (sb_set(&cur, "") < 0) return -1;
+    const char *p = lead;
+    while (*p && sh_ifs_blank(ifs, *p)) p++;
+    while (*p) {
+        if (!sh_ifs_has(ifs, *p)) {
+            if (sb_putc(&cur, *p++) < 0) return -1;
+            continue;
+        }
+        if (sh_at_A_word(b, &words, cur.p) < 0 || sb_set(&cur, "") < 0)
+            return -1;
+        while (*p && sh_ifs_blank(ifs, *p)) p++;
+        if (*p && sh_ifs_has(ifs, *p) && !sh_ifs_blank(ifs, *p)) {
+            p++;
+            while (*p && sh_ifs_blank(ifs, *p)) p++;
+        }
+    }
+    const char *v = vals;
+    for (int i = 0; i < n; i++, v += strlen(v) + 1) {
+        if (i == 0) {
+            if (sb_puts(&cur, v) < 0 || sh_at_A_word(b, &words, cur.p) < 0)
+                return -1;
+        } else if (sh_at_A_word(b, &words, v) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void sh_at_A_sink(const char *s, void *ctx) {
+    (void)sb_puts((struct shell_sb *)ctx, s);
+}
+
+/* ${a[@]@A} and ${a[*]@A}: declare -p's line for the array, once -- not a
+ * statement per element. A scalar's is its ${v@A}. An unset name is no
+ * word, "${u[*]@A}" one empty one (atA3.sh e4). */
+static int sh_at_A_array(const char *nm, bool star, struct shell_sb *b) {
+    int vidx = env_find(nm, strlen(nm));
+    unsigned f = (vidx >= 0) ? (unsigned)g_env_flags[vidx] : 0u;
+    SH_SB(st);
+    if (sb_set(&st, "") < 0) return -1;
+    if (sh_array_find(nm) || (f & SHVAR_ARRAY)) {
+        shell_write_fn_t so = g_shell_out;
+        void *sc = g_shell_out_ctx;
+        g_shell_out = sh_at_A_sink;
+        g_shell_out_ctx = &st;
+        bool ok = shell_declare_print(nm);
+        g_shell_out = so;
+        g_shell_out_ctx = sc;
+        if (!ok) st.len = 0;
+        while (st.len && st.p[st.len - 1] == '\n') st.len--;
+        st.p[st.len] = '\0';
+    } else {
+        SH_SB(val);
+        bool is_set = false, vj = false;
+        if (shell_parameter_value(nm, &val, &is_set, &vj) < 0 ||
+            sh_at_A_text(nm, is_set ? val.p : 0, &st) < 0)
+            return -1;
+    }
+    if (!st.len) return star ? 0 : sh_put_lead_mark(b);
+    if (star) return sb_put_data_str(b, st.p);
+    /* the lead is `declare -FLAGS `, through the blank before the name */
+    size_t ll = 0;
+    if (strncmp(st.p, "declare ", 8) == 0) {
+        ll = 8;
+        while (st.p[ll] && st.p[ll] != ' ') ll++;
+        if (st.p[ll] == ' ') ll++;
+    }
+    SH_SB(lead);
+    if (sb_putmem(&lead, st.p, ll) < 0) return -1;
+    return sh_at_A_words(b, lead.p ? lead.p : "", st.p + ll, 1);
+}
+
+/* ${@@A} ${*@A} and ${@@a} ${*@a}: the parameters' statement, `set --`
+ * and each quoted; and their attributes, which are none -- an empty word
+ * each (atA.sh a6). They went to the array path, which gave a scratch
+ * array's `SHELL_ARRAY_ELEM='p'` and `a a`. */
+static int sh_posargs_at(bool star, char op, struct shell_sb *b) {
+    int n = g_positional_count;
+    struct sh_sep sep;
+    sh_sep_join(&sep, SH_JOIN_HD_SPACE);
+    if (op == 'a') {
+        if (!star && sh_put_lead_mark(b) < 0) return -1;
+        for (int i = 0; i < n; i++) {
+            if (i > 0 && (star ? sb_put_sep(b, &sep)
+                               : sb_putc(b, SHELL_ARG_MARK)) < 0)
+                return -1;
+            if (!star && sh_join_empty_elem(b, b->len) < 0) return -1;
+        }
+        return 0;
+    }
+    if (n == 0) return star ? 0 : sh_put_lead_mark(b);
+    SH_SB(vals);
+    SH_SB(one);
+    if (sb_puts(&one, "set -- ") < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        size_t at = vals.len;
+        const char *p = g_positional[i] ? g_positional[i] : "";
+        if (shell_quote_ansic(p, &vals) < 0 || sb_putmem(&vals, "", 1) < 0)
+            return -1;
+        if ((i > 0 && sb_put_sep(&one, &sep) < 0) ||
+            sb_puts(&one, vals.p + at) < 0)
+            return -1;
+    }
+    if (star) return sb_put_data_str(b, one.p);
+    return sh_at_A_words(b, "set -- ", vals.p, n);
+}
+
 static int shell_expand_at_transform(const char *name, char opch,
                                      struct shell_sb *b) {
     SH_SB(value);
@@ -30165,33 +30365,10 @@ static int shell_expand_at_transform(const char *name, char opch,
     SH_SB(out);
 
     if (opch == 'a' || opch == 'A') {
-        /* The letters come from the flag table and the ARRAY table together:
-         * `assoc` lives on the array record, not on the name's flags. */
-        char at[8];
-        size_t an = 0;
-        int vidx = env_find(name, strlen(name));
-        unsigned f = (vidx >= 0) ? (unsigned)g_env_flags[vidx] : 0u;
-        struct sh_array *arr = sh_array_find(name);
-        if (arr && arr->assoc)             at[an++] = 'A';
-        else if ((f & SHVAR_ARRAY) || arr) at[an++] = 'a';
-        if (f & SHVAR_INTEGER)             at[an++] = 'i';
-        if (f & SHVAR_NAMEREF)             at[an++] = 'n';
-        if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
-        if (f & SHVAR_EXPORTED)            at[an++] = 'x';
-        if (f & SHVAR_LOWER)               at[an++] = 'l';
-        if (f & SHVAR_UPPER)               at[an++] = 'u';
-        at[an] = '\0';
+        char at[12];
+        sh_attr_letters(name, at);
         if (opch == 'a') return sb_put_data_str(b, at);
-        /* @A -- the assignment statement. bash prints NOTHING for a name
-         * that is not set, and prefixes `declare -a`/`-A` for an array. */
-        if (!is_set) return 0;
-        if (at[0] == 'a' || at[0] == 'A') {
-            const char *dp = (at[0] == 'A') ? "declare -A " : "declare -a ";
-            if (sb_puts(&out, dp) < 0) return -1;
-        }
-        if (sb_puts(&out, name) < 0 || sb_putc(&out, '=') < 0) return -1;
-        if (shell_quote_ansic(value.p, &out) < 0) return -1;
-        return sb_put_data_str(b, out.p);
+        return sh_at_A_stmt(name, is_set ? value.p : 0, b);
     }
 
     switch (opch) {
@@ -30500,6 +30677,9 @@ static int shell_expand_element_op(const char *nm, const char *sub,
         if (!v && idx == 0 && !sh_array_find(nm)) v = env_get(nm);
     }
     bool had = (v != 0);
+    /* ${a[i]@A}: the array's statement with this element's value, not the
+     * scratch copy's (finding 308) */
+    if (strcmp(suffix, "@A") == 0) return sh_at_A_stmt(nm, v, b);
     SH_SB(old);
     if (had && sb_set(&old, v) < 0) return -1;
 
@@ -30732,6 +30912,17 @@ static int shell_expand_posargs_op(const char *expr, struct shell_sb *b, int *rc
           (expr[1] == '#' || expr[1] == '%' || expr[1] == '/' ||
            expr[1] == '^' || expr[1] == ',' || expr[1] == '~' ||
            expr[1] == '@'))) return 0;
+    /* @K and @k of the parameters are their @Q; @A and @a their own
+     * (sh_posargs_at, finding 308) -- the scratch array has neither keys
+     * nor the parameters' statement */
+    if (expr[1] == '@' && (expr[2] == 'K' || expr[2] == 'k') && !expr[3]) {
+        char q[4] = { expr[0], '@', 'Q', '\0' };
+        return shell_expand_posargs_op(q, b, rc);
+    }
+    if (expr[1] == '@' && (expr[2] == 'A' || expr[2] == 'a') && !expr[3]) {
+        *rc = sh_posargs_at(expr[0] == '*', expr[2], b);
+        return 1;
+    }
     char tmp[32];
     ksnprintf(tmp, sizeof tmp, "SHELL_POSARGS_%d", g_posargs_depth);
     sh_array_unset_literal(tmp);
@@ -31195,6 +31386,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         struct sh_array *arr = sh_array_find(nm);
                         int an = arr ? arr->n : 0;
                         bool star = (sub[0] == '*');
+                        if (strcmp(suffix, "@A") == 0)          /* 308 */
+                            return sh_at_A_array(nm, star, b);
                         if (strcmp(suffix, "@K") == 0 || strcmp(suffix, "@k") == 0)
                             return shell_expand_array_kv(nm, suffix[1] == 'k',
                                                          star, b);
