@@ -60,9 +60,12 @@
 
 /* s_checksum_type: CRC-32C, the v3 sums' */
 #define JBD2_CRC32C_CHKSUM  4u
+/* a commit block's h_chksum_type for the v1 sum: CRC-32 (crc32_be) */
+#define JBD2_CRC32_CHKSUM   1u
 
 #define JBD2_INCOMPAT_SUPPORTED  (JBD2_FEATURE_INCOMPAT_REVOKE | \
                                   JBD2_FEATURE_INCOMPAT_64BIT  | \
+                                  JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT | \
                                   JBD2_FEATURE_INCOMPAT_CSUM_V2 | \
                                   JBD2_FEATURE_INCOMPAT_CSUM_V3)
 

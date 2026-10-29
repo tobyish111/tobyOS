@@ -210,6 +210,10 @@ struct ext4 {
     /* j_csum's tags: v3's 16 bytes and whole sum, or v2's 8 or 12 and the
      * sum's low 16 bits (the open item "jbd2 CSUM_V2", finding 312) */
     bool     j_csum3;
+    /* the v1 commit sum (COMPAT_CHECKSUM without v2 or v3 sums, finding
+     * 313): a crc32_be of every log block of the transaction before its
+     * commit block, in that block */
+    bool     j_v1sum;
     uint8_t  j_uuid[16];
     uint32_t j_csum_seed;
     bool     j_dirty;
@@ -514,6 +518,9 @@ static void ext4_inode_set_gid(struct ext4_inode *in, uint32_t gid) {
  * `verify`). */
 static uint32_t g_crc32c_tab[256];
 static uint16_t g_crc16_tab[256];
+/* and the journal's v1 commit sum's (finding 313): CRC-32 most significant
+ * bit first, polynomial 0x04C11DB7 -- crc32_be */
+static uint32_t g_crc32be_tab[256];
 static bool     g_crc_tabs;
 
 static void crc_tabs_init(void) {
@@ -526,8 +533,18 @@ static void crc_tabs_init(void) {
         }
         g_crc32c_tab[i] = c;
         g_crc16_tab[i]  = h;
+        uint32_t b = i << 24;
+        for (int k = 0; k < 8; k++)
+            b = (b << 1) ^ (0x04C11DB7u & (0u - (b >> 31)));
+        g_crc32be_tab[i] = b;
     }
     g_crc_tabs = true;
+}
+
+static uint32_t crc32be(uint32_t crc, const void *buf, size_t n) {
+    const uint8_t *p = (const uint8_t *)buf;
+    while (n--) crc = (crc << 8) ^ g_crc32be_tab[((crc >> 24) ^ *p++) & 0xFFu];
+    return crc;
 }
 
 static uint32_t crc32c(uint32_t crc, const void *buf, size_t n) {
@@ -3146,9 +3163,16 @@ out:
  * of each commit block, and of each logged block (in its 16-byte tag).
  * Every one is checked on recovery and written by this driver as Linux
  * writes it. v2 sums (CSUM_V2, finding 312) are v3's but in the short
- * block tag, which holds the low 16 bits of the block's sum. A journal
- * with a feature this driver does not know (async commit, fast commits,
- * the v1 commit sum) is not driven.
+ * block tag, which holds the low 16 bits of the block's sum. Without v2
+ * or v3 sums Linux's journal_checksum gives the v1 commit sum
+ * (COMPAT_CHECKSUM, finding 313): in the commit block, a crc32_be from
+ * ~0 of every log block of the transaction before it -- each descriptor
+ * and each logged block as the log holds it, a revoke block not. Async
+ * commit (ASYNC_COMMIT, 313) changes nothing on disk: Linux may write the
+ * commit block before the transaction's other blocks, and a sum that
+ * then does not hold ends the log -- this driver's own commit block goes
+ * after them, as a journal of either kind allows. A journal with a feature
+ * this driver does not know (fast commits) is not driven.
  *
  * Each atomic operation opens a transaction (txn_begin), stages every
  * block it touches, then commits it (txn_commit) as one transaction --
@@ -3491,6 +3515,7 @@ static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
     }
     int rc = VFS_OK;
     uint32_t rel = fs->j_first;
+    uint32_t v1 = ~0u;                         /* the v1 commit sum (313) */
     for (uint32_t i = 0; i < n && rc == VFS_OK; ) {
         uint32_t cnt = n - i < per ? n - i : per;
         memset(blk, 0, fs->block_size);
@@ -3515,11 +3540,13 @@ static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
             if (k == 0) { memcpy(blk + off, fs->j_uuid, 16); off += 16; }
         }
         if (fs->j_csum) jput32(blk + fs->block_size - 4, jtail_csum(fs, blk));
+        if (fs->j_v1sum) v1 = crc32be(v1, blk, fs->block_size);
         rc = jrun_add(fs, &run, rel, blk);
         rel = jnext(fs, rel);
         for (uint32_t k = 0; k < cnt && rc == VFS_OK; k++) {
             memcpy(dat, t->ents[i + k].data, fs->block_size);
             if (jget32(dat) == JBD2_MAGIC_NUMBER) memset(dat, 0, 4);  /* escaped */
+            if (fs->j_v1sum) v1 = crc32be(v1, dat, fs->block_size);
             rc = jrun_add(fs, &run, rel, dat);
             rel = jnext(fs, rel);
         }
@@ -3538,6 +3565,11 @@ static int jbd2_write_log(struct ext4 *fs, struct ext4_txn *t, uint32_t seq) {
         ch->h_commit_sec  = __builtin_bswap64((uint64_t)now.s);
         ch->h_commit_nsec = be32(now.ns);
         if (fs->j_csum) jput32(blk + JCOMMIT_CSUM_OFF, jcommit_csum(fs, blk));
+        else if (fs->j_v1sum) {
+            ch->h_chksum_type = JBD2_CRC32_CHKSUM;
+            ch->h_chksum_size = 4;
+            jput32(blk + JCOMMIT_CSUM_OFF, v1);
+        }
         rc = jraw_write(fs, rel, blk);
     }
     kfree(blk);
@@ -3700,6 +3732,7 @@ static void jreplay_tag(void *ctx, uint32_t i, const struct jtag *t) {
 static int jbd2_pass(struct ext4 *fs, int pass, uint32_t start, uint32_t seq,
                      struct jrecover *r, uint8_t *blk) {
     uint32_t rel = start, expect = seq, seen = 0;
+    uint32_t v1 = ~0u;                 /* this transaction's v1 sum so far */
     while (seen < fs->j_blocks) {
         if (pass != JPASS_SCAN && (!r->any || (int32_t)(expect - r->last) > 0)) break;
         if (jraw_read(fs, rel, blk) != VFS_OK) break;
@@ -3709,6 +3742,13 @@ static int jbd2_pass(struct ext4 *fs, int pass, uint32_t start, uint32_t seq,
         if (type == JBD2_DESCRIPTOR_BLOCK) {
             if (pass == JPASS_SCAN && !jtail_ok(fs, blk)) break;
             uint32_t nd = jtags_walk(fs, blk, NULL, NULL);
+            if (pass == JPASS_SCAN && fs->j_v1sum) {
+                v1 = crc32be(v1, blk, fs->block_size);
+                uint32_t d = jnext(fs, rel);
+                for (uint32_t k = 0; k < nd; k++, d = jnext(fs, d))
+                    if (jraw_read(fs, d, r->dblk) == VFS_OK)
+                        v1 = crc32be(v1, r->dblk, fs->block_size);
+            }
             if (pass == JPASS_REPLAY) {
                 r->seq = expect;
                 r->data_rel = jnext(fs, rel);
@@ -3737,6 +3777,17 @@ static int jbd2_pass(struct ext4 *fs, int pass, uint32_t start, uint32_t seq,
             if (pass == JPASS_SCAN) {
                 if (fs->j_csum && jget32(blk + JCOMMIT_CSUM_OFF) != jcommit_csum(fs, blk))
                     break;                     /* not committed: the log ends */
+                /* a v1 sum that does not hold: the transaction's blocks are
+                 * not all there (an async commit's block can reach the disk
+                 * before them) -- the log ends before it, as Linux's */
+                const jbd2_commit_header_t *ch = (const jbd2_commit_header_t *)blk;
+                if (fs->j_v1sum && ch->h_chksum_type == JBD2_CRC32_CHKSUM &&
+                    ch->h_chksum_size == 4 && jget32(blk + JCOMMIT_CSUM_OFF) != v1) {
+                    kprintf("[ext4] journal: transaction %u's commit sum does not hold "
+                            "-- the log ends before it\n", (unsigned)expect);
+                    break;
+                }
+                v1 = ~0u;
                 r->last = expect;
                 r->any = true;
             }
@@ -5482,14 +5533,13 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
             uint32_t jmaxlen   = be32(js->s_maxlen);
             uint32_t jfirst    = be32(js->s_first);
             /* tobyOS's classic journal, and Linux's: 64-bit numbers, v3
-             * sums (finding 274) and v2's (312); not async commit, fast
-             * commits or the v1 commit sum */
+             * sums (finding 274) and v2's (312), the v1 commit sum and
+             * async commit (313); not fast commits */
             bool drivable =
                 jmagic == JBD2_MAGIC_NUMBER &&
                 (v2 || jtype == JBD2_SUPERBLOCK_V1) &&
                 jbsize == fs->block_size &&
                 (jincompat & ~JBD2_INCOMPAT_SUPPORTED) == 0 &&
-                !(jcompat & JBD2_FEATURE_COMPAT_CHECKSUM) &&
                 jmaxlen >= 4 && jmaxlen <= fs->j_blocks &&
                 jfirst < jmaxlen;
             if (drivable) {
@@ -5497,6 +5547,7 @@ static struct ext4 *ext4_setup(struct blk_dev *dev) {
                 fs->j_csum3 = (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0;
                 fs->j_csum  = fs->j_csum3 ||
                               (jincompat & JBD2_FEATURE_INCOMPAT_CSUM_V2) != 0;
+                fs->j_v1sum = !fs->j_csum && (jcompat & JBD2_FEATURE_COMPAT_CHECKSUM);
                 memcpy(fs->j_uuid, js->s_uuid, 16);
                 fs->j_csum_seed = crc32c(~0u, fs->j_uuid, 16);
                 if (fs->j_csum && (js->s_checksum_type != JBD2_CRC32C_CHKSUM ||
