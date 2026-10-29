@@ -29729,7 +29729,6 @@ static int shell_expand_name_prefix(const char *prefix, bool star,
     }
     sv_sort(&names);
 
-    const char *ifs = env_get("IFS");
     struct sh_sep sep;
     sh_sep_join(&sep, SH_JOIN_HD_AT);
 
