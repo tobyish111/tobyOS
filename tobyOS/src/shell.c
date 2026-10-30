@@ -4837,7 +4837,15 @@ static int env_set_kv(const char *kv_in) {
                 const char *nv = kv_in + klen + 1;
                 if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF) &&
                     !g_env[rx][klen + 1] && !shell_valid_nameref_value(nv)) {
-                    kprintf("`%s': not a valid identifier\n", nv);
+                    /* under the builtin that assigns, as bash's builtin_error
+                     * -- "printf: `/'", "((: `0'", "getopts: `?'" -- and
+                     * bare for an assignment or an expansion (bash's
+                     * nameref11.sub; logs/b41) */
+                    if (g_this_cmd_name)
+                        kprintf("%s: `%s': not a valid identifier\n",
+                                g_this_cmd_name, nv);
+                    else
+                        kprintf("`%s': not a valid identifier\n", nv);
                     g_assign_fail_hit = true;
                     return -1;
                 }
