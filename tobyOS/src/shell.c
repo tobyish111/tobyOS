@@ -14621,8 +14621,16 @@ static void cmd_cd(int argc, char **argv) {
         return;
     }
     if (argc <= 1) {
+        /* bash: HOME unset is "cd: HOME not set", status 1, and an empty
+         * HOME leaves the directory as it is, status 0 -- tsh went to /
+         * for both (errors.tests; logs/b42 errs2 f7) */
         target = env_get("HOME");
-        if (!target || !*target) target = "/";
+        if (!target) {
+            kprintf("%s: HOME not set\n", g_cd_who);
+            shell_set_status(1);
+            return;
+        }
+        if (!*target) return;
     } else if (strcmp(argv[1], "-") == 0) {
         target = env_get("OLDPWD");
         if (!target || !*target) {
