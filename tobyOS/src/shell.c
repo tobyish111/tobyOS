@@ -36804,6 +36804,7 @@ struct shell_globstar {
     struct shell_simple   *cur;
     int matches;
     bool overflow;
+    bool trail_slash;           /* the pattern ends in `/`: directories only */
 };
 
 /* `comps` is the pattern split on `/`; `ci` is the component to match next.
@@ -36827,12 +36828,76 @@ static int shell_globstar_emit(struct shell_globstar *g, const char *path) {
     return 0;
 }
 
+/* `**` AS THE LAST COMPONENT: every file and directory under `dirpath`, at
+ * any depth -- `ls lib/**` lists lib/glob/glob.o -- or, with the pattern
+ * ending in `/`, every directory, each with its `/`. `zero` adds the
+ * directory itself first, as bash's zero-length match: 1 as written, with
+ * its `/` (`lib/`), 2 without one, for a directory a glob found (`**` /y/**
+ * gives x/y). tsh matched nothing, and the word went to the flat globber as
+ * a `*` (bash's globstar.tests; logs/b41 gstar). Dot names only with
+ * dotglob, as `*`'s. */
+/* Is the entry at PATH a directory for a trailing `/`, a link to one too
+ * (bash's `** /` lists c/ for c -> a, and does not go into it)? The
+ * kernel's VFS has lstat only, so there a link is none. */
+static bool shell_glob_dir_or_link(const char *path, int type) {
+    if (type == VFS_TYPE_DIR) return true;
+    /* any other entry is asked: the hosted readdir calls a link a file */
+    struct vfs_stat st;
+    return vfs_stat(path, &st) == VFS_OK && st.type == VFS_TYPE_DIR;
+}
+
+static int shell_globstar_all(struct shell_globstar *g, const char *dirpath,
+                              const char *shown, int depth, int zero) {
+    /* (an empty one -- `**` after `**`, at the top -- names nothing) */
+    if (zero && *shown) {
+        char z[VFS_PATH_MAX];
+        size_t sl = strlen(shown);
+        if (sl + 1 > sizeof z) return 0;
+        memcpy(z, shown, sl + 1);
+        if (zero == 2 && !g->trail_slash && sl > 1 && z[sl - 1] == '/')
+            z[sl - 1] = '\0';
+        if (shell_globstar_emit(g, z) < 0) return -1;
+    }
+    if (depth >= SH_GLOB_DEPTH_MAX) return 0;
+    struct vfs_dir d;
+    if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
+    struct vfs_dirent ent;
+    while (vfs_readdir(&d, &ent) == VFS_OK) {
+        if (!shell_glob_dot_ok(ent.name, "*")) continue;
+        bool isdir = ent.type == VFS_TYPE_DIR;
+        char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX], name[VFS_PATH_MAX];
+        int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
+        if (g->trail_slash && !shell_glob_dir_or_link(sub, ent.type)) continue;
+        int m = ksnprintf(subshown, sizeof subshown, "%s%s/", shown, ent.name);
+        int k = ksnprintf(name, sizeof name, "%s%s%s", shown, ent.name,
+                          g->trail_slash ? "/" : "");
+        if (n <= 0 || (size_t)n >= sizeof sub || m <= 0 ||
+            (size_t)m >= sizeof subshown || k <= 0 || (size_t)k >= sizeof name)
+            continue;
+        if (shell_globstar_emit(g, name) < 0 ||
+            (isdir && shell_globstar_all(g, sub, subshown, depth + 1, 0) < 0)) {
+            vfs_closedir(&d);
+            return -1;
+        }
+    }
+    vfs_closedir(&d);
+    return 0;
+}
+
 /* Match the remaining components against everything under `dirpath`, at any
  * depth including zero -- which is what makes `** /x` find `./x` as well as
  * `a/b/x`. */
 static int shell_globstar_star(struct shell_globstar *g, const char *dirpath,
                                const char *shown, char comps[][VFS_PATH_MAX],
                                int ncomp, int ci, int depth) {
+    if (ci + 1 >= ncomp) {
+        /* the directory itself: as written when every component before
+         * the `**` was, without its `/` when a glob found it */
+        int zero = ci == 0 ? 0 : 1;
+        for (int k = 0; k < ci && zero; k++)
+            if (shell_has_glob(comps[k])) zero = 2;
+        return shell_globstar_all(g, dirpath, shown, depth, zero);
+    }
     /* Zero levels: the components after `**` match right here. */
     if (shell_globstar_walk(g, dirpath, shown, comps, ncomp, ci + 1, depth) < 0)
         return -1;
@@ -36842,7 +36907,7 @@ static int shell_globstar_star(struct shell_globstar *g, const char *dirpath,
     if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
     struct vfs_dirent ent;
     while (vfs_readdir(&d, &ent) == VFS_OK) {
-        if (ent.name[0] == '.') continue;          /* `**` skips dotfiles */
+        if (!shell_glob_dot_ok(ent.name, "*")) continue;  /* dotglob's */
         if (ent.type != VFS_TYPE_DIR) continue;
         char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
         int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
@@ -36883,8 +36948,12 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
         int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
         if (n <= 0 || (size_t)n >= sizeof sub) continue;
         if (last) {
-            int m = ksnprintf(subshown, sizeof subshown, "%s%s", shown,
-                              ent.name);
+            /* a pattern ending in `/` takes directories, and shows each
+             * with its `/`: `** /foo* /` is bar/foo/ foo/ (bash's
+             * globstar1.sub) */
+            if (g->trail_slash && !shell_glob_dir_or_link(sub, ent.type)) continue;
+            int m = ksnprintf(subshown, sizeof subshown, "%s%s%s", shown,
+                              ent.name, g->trail_slash ? "/" : "");
             if (m <= 0 || (size_t)m >= sizeof subshown) continue;
             if (shell_globstar_emit(g, subshown) < 0) {
                 vfs_closedir(&d);
@@ -36940,6 +37009,10 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
     g.cur = cur;
     g.matches = 0;
     g.overflow = false;
+    {
+        size_t wl = strlen(word);
+        g.trail_slash = wl > 1 && word[wl - 1] == '/';
+    }
 
     int first_arg = cur->argc;
     char root[VFS_PATH_MAX];
