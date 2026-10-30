@@ -33511,6 +33511,52 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             SH_SB(repl);
             if (shell_expand_pat_word(rep, &repl) < 0)
                 return -1;
+            /* PATSUB_REPLACEMENT (bash 5.2's default): an UNQUOTED `&` in
+             * the replacement is the text the pattern matched; a quoted
+             * one, or one an unquoted backslash escapes, is an `&`; and in
+             * the unquoted text -- an expansion's too -- `\\` is `\` and
+             * `\&` is `&`. tsh had the option and never read it (bash's
+             * new-exp16.sub; logs/b42 patsub). The replacement becomes
+             * pieces with the match between them: rtpl, NUL-separated. */
+            SH_SB(rtpl);
+            int nrm = -1;                       /* matches in the template */
+            if (g_shopt_misc[33]) {
+                bool in_q = false, any = false;
+                for (const char *q = repl.p; *q; q++)
+                    if (*q == '&') { any = true; break; }
+                for (const char *q = repl.p; any && *q; q++) {
+                    char c = *q;
+                    if (nrm < 0) nrm = 0;
+                    if (c == SHELL_NOSPLIT_MARK) { in_q = !in_q; continue; }
+                    /* a backslash an unquoted EXPANSION gave arrives
+                     * glob-escaped, and escapes a following & or \ as a
+                     * written one would (r2='x\&y'; ${v/p/$r2} is x&y) */
+                    if (!in_q && c == SHELL_GLOB_ESC && q[1] == '\\') {
+                        const char *nx = q + 2;
+                        char nc = (*nx == SHELL_GLOB_ESC || *nx == SHELL_DATA_ESC)
+                                      ? nx[1] : *nx;
+                        if (nc == '&' || nc == '\\') {
+                            if (sb_putc(&rtpl, nc) < 0) return -1;
+                            q = (*nx == SHELL_GLOB_ESC || *nx == SHELL_DATA_ESC) ? nx + 1 : nx;
+                            continue;
+                        }
+                    }
+                    if ((c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) && q[1]) {
+                        if (sb_putc(&rtpl, *++q) < 0) return -1;
+                        continue;
+                    }
+                    if (!in_q && c == '\\' && (q[1] == '\\' || q[1] == '&')) {
+                        if (sb_putc(&rtpl, *++q) < 0) return -1;
+                        continue;
+                    }
+                    if (!in_q && c == '&') {
+                        if (sb_putc(&rtpl, '\0') < 0) return -1;
+                        nrm++;
+                        continue;
+                    }
+                    if (sb_putc(&rtpl, c) < 0) return -1;
+                }
+            }
             shell_strip_nosplit_inplace(repl.p);
             size_t rlen = strlen(repl.p);
 
@@ -33588,8 +33634,21 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     }
                 }
                 bool oom = false;
-                if (matched) {
+                if (matched && nrm >= 0) {
+                    /* the template, the matched text at each `&` */
+                    const char *tp = rtpl.p ? rtpl.p : "";
+                    for (int m = 0; m <= nrm && !oom; m++) {
+                        size_t tl = strlen(tp);
+                        if (sb_putmem(&out, tp, tl) < 0) oom = true;
+                        if (m < nrm && !oom &&
+                            sb_putmem(&out, SH_VB(i), (size_t)(SH_VB(i + mlen) - SH_VB(i))) < 0)
+                            oom = true;
+                        tp += tl + 1;
+                    }
+                } else if (matched) {
                     if (sb_putmem(&out, repl.p, rlen) < 0) oom = true;
+                }
+                if (matched) {
                     done_one = true;
                     if (mlen == 0) {           /* empty match: do not spin */
                         if (!oom && i < vlen &&
