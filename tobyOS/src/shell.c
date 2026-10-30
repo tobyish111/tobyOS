@@ -9371,6 +9371,27 @@ static void shell_local_unbind(struct shell_local_save *sv) {
     sv->dead = true;
 }
 
+/* The GLOBAL binding of `name`: the oldest local of the name saved it, or,
+ * with none, the entry is it. Its value and flags; false when there is no
+ * global of the name. */
+static bool shell_global_binding(const char *name, const char **val,
+                                 unsigned *flags) {
+    size_t nl = strlen(name);
+    for (int i = 0; i < g_localc; i++)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0) {
+            if (!g_locals[i].existed || !g_locals[i].kv) return false;
+            *val = g_locals[i].kv + nl + 1;
+            *flags = g_locals[i].flags;
+            return true;
+        }
+    int ix = env_find(name, nl);
+    if (ix < 0) return false;
+    *val = g_env[ix] + nl + 1;
+    *flags = g_env_flags[ix];
+    return true;
+}
+
 /* Did the frame at `depth` -- its body, a file it sourced, an eval in it --
  * make `name` local? */
 static bool shell_locals_have(const char *name, int depth) {
@@ -10974,7 +10995,25 @@ static void cmd_declare(int argc, char **argv) {
         bool plus_n_on = clear_nameref &&
             (attr_on || attr_off || set_export || clear_export || set_readonly ||
              set_array || argv[i][env_key_len(argv[i])] == '=');
-        if (!nref && (!clear_nameref || plus_n_on)) {
+        if (!nref && (!clear_nameref || plus_n_on) && set_global && g_fn_depth > 0) {
+            /* -g in a function resolves the name as the GLOBAL scope has
+             * it: `declare -g ref=(X)` writes what a global reference names,
+             * not what a local ref of the same name does (bash's
+             * nameref20.sub; logs/b41 nref17) */
+            size_t nl = env_key_len(argv[i]);
+            nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            SH_SB(rn);
+            const char *gv = 0;
+            unsigned gf = 0;
+            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 &&
+                shell_global_binding(rn.p, &gv, &gf) && (gf & SHVAR_NAMEREF) &&
+                *gv && shell_name_is_valid(gv, strlen(gv)) &&
+                sb_set(&rearg, gv) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                ras.slot = &argv[i];
+                ras.orig = argv[i];
+                argv[i] = rearg.p;
+            }
+        } else if (!nref && (!clear_nameref || plus_n_on)) {
             size_t nl = env_key_len(argv[i]);
             nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(rn);
