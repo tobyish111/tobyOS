@@ -12283,6 +12283,15 @@ static int shell_getopts_set_name(const char *name, char value) {
     return env_set(name, buf);
 }
 
+/* NAME bound to `value`: 0, or getopts' status when it cannot be -- 2 for a
+ * readonly NAME, 1 for any other refusal, as "`?': not a valid identifier"
+ * through a reference with no target (bash; logs/b41 nref11 l4). */
+static int shell_getopts_bind(const char *name, char value) {
+    g_readonly_hit = false;
+    if (shell_getopts_set_name(name, value) == 0) return 0;
+    return g_readonly_hit ? 2 : 1;
+}
+
 /* OPTIND as getopts reads it: its number, 1 when unset or not a number. */
 static int shell_getopts_optind_value(void) {
     int v = 1;
@@ -12463,16 +12472,17 @@ static void cmd_getopts_in(int argc, char **argv) {
             optind++;
             ci = 1;
         }
-        if (shell_getopts_set_name(name, '?') < 0) rc = 2;
-        if (silent) {
+        /* bash's getopt: "$0: illegal option -- x", with no line -- said
+         * before NAME is set, so it comes first when NAME cannot be (bash's
+         * nameref11.sub) */
+        if (!silent && loud)
+            kprintf_raw("%s: illegal option -- %c\n",
+                        g_param0 ? g_param0 : "tsh", opt);
+        rc = shell_getopts_bind(name, '?');
+        if (silent)
             (void)shell_getopts_set_char("OPTARG", opt);
-        } else {
-            /* bash's getopt: "$0: illegal option -- x", with no line. */
-            if (loud)
-                kprintf_raw("%s: illegal option -- %c\n",
-                            g_param0 ? g_param0 : "tsh", opt);
+        else
             shell_getopts_drop_optarg();
-        }
         shell_getopts_leave(optind, ci);
         shell_set_status(rc);
         return;
@@ -12480,12 +12490,12 @@ static void cmd_getopts_in(int argc, char **argv) {
 
     if (spec[1] == ':') {
         if (arg[ci] != '\0') {
-            if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+            rc = shell_getopts_bind(name, opt);
             (void)env_set("OPTARG", &arg[ci]);
             optind++;
             ci = 1;
         } else if (optind < arg_count) {
-            if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+            rc = shell_getopts_bind(name, opt);
             (void)env_set("OPTARG", args[optind] ? args[optind] : "");
             optind += 2;
             ci = 1;
@@ -12493,13 +12503,13 @@ static void cmd_getopts_in(int argc, char **argv) {
             optind++;
             ci = 1;
             if (silent) {
-                if (shell_getopts_set_name(name, ':') < 0) rc = 2;
+                rc = shell_getopts_bind(name, ':');
                 (void)shell_getopts_set_char("OPTARG", opt);
             } else {
                 if (loud)
                     kprintf_raw("%s: option requires an argument -- %c\n",
                                 g_param0 ? g_param0 : "tsh", opt);
-                if (shell_getopts_set_name(name, '?') < 0) rc = 2;
+                rc = shell_getopts_bind(name, '?');
                 shell_getopts_drop_optarg();
             }
         }
@@ -12512,7 +12522,7 @@ static void cmd_getopts_in(int argc, char **argv) {
         optind++;
         ci = 1;
     }
-    if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+    rc = shell_getopts_bind(name, opt);
     shell_getopts_novalue_optarg();
     shell_getopts_leave(optind, ci);
     shell_set_status(rc);
