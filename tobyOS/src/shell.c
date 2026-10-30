@@ -12012,6 +12012,27 @@ static void shell_getopts_leave(int optind, int ci) {
     g_getopts.stale = false;
 }
 
+/* OPTARG TAKEN AWAY -- at the end of the options, and with a message for a
+ * bad option or a missing argument: the variable itself, an array and a
+ * nameref too (not its target), and a readonly one, its mark with it, all
+ * quietly. tsh's unset said "cannot unset: readonly variable" and kept it,
+ * and kept an array (bash; logs/b41 gopts5 p1 p2 p4 p5, gopts6 q1 q4 q5;
+ * bash's getopts10.sub). */
+static void shell_getopts_drop_optarg(void) {
+    shell_readonly_unmark("OPTARG", 6);
+    sh_array_unset_literal("OPTARG");
+    int i = env_find("OPTARG", 6);
+    if (i >= 0) env_remove_at(i);
+}
+
+/* OPTARG after an option with no argument: DECLARED, NO VALUE -- written
+ * through a nameref, and a readonly one says so and keeps its value. tsh
+ * removed it (bash: `declare -- OPTARG`; logs/b41 gopts5 p3, gopts6 q2
+ * q3). */
+static void shell_getopts_novalue_optarg(void) {
+    (void)env_set_attr_holder("OPTARG");
+}
+
 /* Are getopts' own messages on? Unless OPTERR is set to something whose
  * leading number -- C's atoi of it -- is 0: "0", "00", "-0", " 0", "abc"
  * and "0x1" are quiet; unset, "", "2", "1abc" and "08" are not. It is read
@@ -12028,7 +12049,7 @@ static bool shell_getopts_opterr(void) {
 
 static void shell_getopts_finish_end(const char *name, int optind) {
     (void)shell_getopts_set_name(name, '?');
-    (void)env_unset("OPTARG");
+    shell_getopts_drop_optarg();
     shell_getopts_leave(optind, 1);
     shell_set_status(1);
 }
@@ -12140,6 +12161,10 @@ static void cmd_getopts_in(int argc, char **argv) {
 
     char opt = arg[ci++];
     const char *spec = shell_getopts_find(optstring, opt);
+    /* THE STATUS IS NAME'S: a NAME getopts cannot set (readonly) is status
+     * 2; an OPTARG or OPTIND it cannot set says so and changes nothing. tsh
+     * gave 1 for any of them, and a `while getopts` over a readonly OPTIND
+     * ended at once (bash; logs/b41 gopts2 h4 h5, gopts3 k8). */
     int rc = 0;
 
     if (!spec) {
@@ -12147,50 +12172,48 @@ static void cmd_getopts_in(int argc, char **argv) {
             optind++;
             ci = 1;
         }
-        if (shell_getopts_set_name(name, '?') < 0) rc = 1;
+        if (shell_getopts_set_name(name, '?') < 0) rc = 2;
         if (silent) {
-            if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
+            (void)shell_getopts_set_char("OPTARG", opt);
         } else {
             /* bash's getopt: "$0: illegal option -- x", with no line. */
             if (loud)
                 kprintf_raw("%s: illegal option -- %c\n",
                             g_param0 ? g_param0 : "tsh", opt);
-            if (env_unset("OPTARG") < 0) rc = 1;
+            shell_getopts_drop_optarg();
         }
         shell_getopts_leave(optind, ci);
-        shell_set_status(rc ? 1 : 0);
+        shell_set_status(rc);
         return;
     }
 
     if (spec[1] == ':') {
         if (arg[ci] != '\0') {
-            if (shell_getopts_set_char(name, opt) < 0) rc = 1;
-            if (env_set("OPTARG", &arg[ci]) < 0) rc = 1;
+            if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+            (void)env_set("OPTARG", &arg[ci]);
             optind++;
             ci = 1;
         } else if (optind < arg_count) {
-            if (shell_getopts_set_char(name, opt) < 0) rc = 1;
-            if (env_set("OPTARG", args[optind] ? args[optind] : "") < 0) {
-                rc = 1;
-            }
+            if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+            (void)env_set("OPTARG", args[optind] ? args[optind] : "");
             optind += 2;
             ci = 1;
         } else {
             optind++;
             ci = 1;
             if (silent) {
-                if (shell_getopts_set_name(name, ':') < 0) rc = 1;
-                if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
+                if (shell_getopts_set_name(name, ':') < 0) rc = 2;
+                (void)shell_getopts_set_char("OPTARG", opt);
             } else {
                 if (loud)
                     kprintf_raw("%s: option requires an argument -- %c\n",
                                 g_param0 ? g_param0 : "tsh", opt);
-                if (shell_getopts_set_name(name, '?') < 0) rc = 1;
-                if (env_unset("OPTARG") < 0) rc = 1;
+                if (shell_getopts_set_name(name, '?') < 0) rc = 2;
+                shell_getopts_drop_optarg();
             }
         }
         shell_getopts_leave(optind, ci);
-        shell_set_status(rc ? 1 : 0);
+        shell_set_status(rc);
         return;
     }
 
@@ -12198,10 +12221,10 @@ static void cmd_getopts_in(int argc, char **argv) {
         optind++;
         ci = 1;
     }
-    if (shell_getopts_set_char(name, opt) < 0) rc = 1;
-    if (env_unset("OPTARG") < 0) rc = 1;
+    if (shell_getopts_set_char(name, opt) < 0) rc = 2;
+    shell_getopts_novalue_optarg();
     shell_getopts_leave(optind, ci);
-    shell_set_status(rc ? 1 : 0);
+    shell_set_status(rc);
 }
 
 /* IFS WHITESPACE IS NOT THE SAME AS AN IFS DELIMITER, and `read` treated them
