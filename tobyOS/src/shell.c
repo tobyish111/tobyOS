@@ -33930,6 +33930,25 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             return -1;
         }
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
+        /* the WORD is an assignment's value, and with IFS set to null its
+         * fields join with nothing: `IFS=''; : ${z=$*}` with `a "b c"` is
+         * "ab c", where tsh joined them with spaces (bash's array24.sub;
+         * logs/b42 arr2 b3 b4) */
+        {
+            const char *ifs = env_get("IFS");
+            if (ifs && !*ifs && shell_word_has_argmark(ewb.p)) {
+                SH_SB(jw);
+                for (const char *q = ewb.p; *q; q++) {
+                    if (*q == SHELL_DATA_ESC && q[1]) {
+                        (void)sb_putc(&jw, *q++);
+                        (void)sb_putc(&jw, *q);
+                        continue;
+                    }
+                    if (*q != SHELL_ARG_MARK) (void)sb_putc(&jw, *q);
+                }
+                if (sb_set(&ewb, jw.p ? jw.p : "") < 0) return -1;
+            }
+        }
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         /* THE VARIABLE GETS THE VALUE, AND THE EXPANSION IS THE VARIABLE.
