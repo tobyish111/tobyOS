@@ -39648,9 +39648,34 @@ static const char *shell_redir_word(struct shell_pipeline *pl,
     if (!tmp) return 0;
     shell_simple_init(tmp, &pl->words);
     const char *res = 0;
-    if (shell_add_arg_ex(pl, tmp, t->text, t->quoted, t->expanded, false) >= 0) {
-        if (tmp->argc == 1) res = tmp->argv[0];
-        else *ambiguous = true;
+    /* A NON-INTERACTIVE SHELL IN POSIX MODE NEITHER SPLITS NOR GLOBS IT:
+     * `cat < a.x*` opens "a.x*", f=' a ' writes " a ", "$@" joins with a
+     * blank -- only an expansion to nothing is still ambiguous (bash's
+     * new-exp2.sub; logs/b42 nexp10 q1 q2, nexp11). tsh did both. */
+    bool posix_word = g_opt_posix && !g_interactive;
+    bool og = g_opt_noglob;
+    if (posix_word) g_opt_noglob = true;
+    int arc = shell_add_arg_ex(pl, tmp, t->text, t->quoted, t->expanded, false);
+    g_opt_noglob = og;
+    if (arc >= 0) {
+        if (tmp->argc == 0) {
+            *ambiguous = true;
+        } else if (posix_word && !(t->raw && t->raw[0] == '~' && tmp->argc == 1)) {
+            SH_SB(pw);
+            char *saved = 0;
+            if (shell_argmarks_to_spaces(t->text, &pw) == 0) {
+                if (pw.p) {
+                    shell_strip_nosplit_inplace(pw.p);
+                    shell_strip_glob_escapes(pw.p);
+                }
+                if (shell_pipeline_save_word(pl, pw.p ? pw.p : "", &saved) == 0)
+                    res = saved;
+            }
+        } else if (tmp->argc == 1) {
+            res = tmp->argv[0];
+        } else {
+            *ambiguous = true;
+        }
     }
     kfree(tmp);
     return res;
