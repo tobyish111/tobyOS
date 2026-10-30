@@ -7990,6 +7990,18 @@ static struct sh_array *sh_array_create(const char *name) {
     SH_SB(tgt);
     const char *real = env_deref_name_ex(name, &tgt, false);
     if (real && *real) name = real;
+    /* A REFERENCE TO AN ELEMENT names no array to make: `declare -n
+     * ref=XXX[0]; mapfile ref` is bash's "mapfile: `XXX[0]': not a valid
+     * identifier", under the builtin's name, and nothing is made -- tsh made
+     * an array called "XXX[0]" (bash's nameref18.sub; logs/b41 nref15). */
+    for (const char *c = name; *c; c++)
+        if (*c == '[') {
+            if (g_this_cmd_name)
+                kprintf("%s: `%s': not a valid identifier\n", g_this_cmd_name, name);
+            else
+                kprintf("`%s': not a valid identifier\n", name);
+            return 0;
+        }
     /* AN ARRAY MADE UNDER A REFERENCE WITH NO TARGET makes it an array:
      * "warning: r: removing nameref attribute" -- r=(1 2), mapfile r, read
      * -a r, coproc r. tsh kept -n over the new array, so declare -p and
@@ -48421,6 +48433,10 @@ static void shell_coproc_dispose(void) {
         SH_SB(ct);
         const char *cn = env_deref_name_ex(g_coproc.name, &ct, false);
         if (!cn || !*cn) cn = g_coproc.name;
+        /* ...a reference to an element, which made no array, goes itself
+         * (bash: ${!ref} is then "invalid indirect expansion") */
+        for (const char *c = cn; *c; c++)
+            if (*c == '[') { cn = g_coproc.name; break; }
         size_t nl = strlen(cn);
         if (shell_readonly_key(cn, nl)) {
             kprintf("%s: cannot unset: readonly variable\n", cn);
@@ -48612,14 +48628,17 @@ static bool shell_try_coproc(const char *src) {
     } else {
         char nb[24];
         sh_array_unset(name.p);
-        ksnprintf(nb, sizeof nb, "%d", rfd);
-        (void)sh_array_set(name.p, 0, nb);
-        ksnprintf(nb, sizeof nb, "%d", wfd);
-        (void)sh_array_set(name.p, 1, nb);
-        SH_SB(pv);
-        if (sb_puts(&pv, name.p) == 0 && sb_puts(&pv, "_PID") == 0) {
-            ksnprintf(nb, sizeof nb, "%d", pid);
-            (void)env_set(pv.p, nb);
+        /* made once, so a NAME that can be no array says so once */
+        if (sh_array_create(name.p)) {
+            ksnprintf(nb, sizeof nb, "%d", rfd);
+            (void)sh_array_set(name.p, 0, nb);
+            ksnprintf(nb, sizeof nb, "%d", wfd);
+            (void)sh_array_set(name.p, 1, nb);
+            SH_SB(pv);
+            if (sb_puts(&pv, name.p) == 0 && sb_puts(&pv, "_PID") == 0) {
+                ksnprintf(nb, sizeof nb, "%d", pid);
+                (void)env_set(pv.p, nb);
+            }
         }
     }
     {
