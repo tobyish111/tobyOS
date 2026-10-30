@@ -11174,6 +11174,14 @@ static void cmd_declare(int argc, char **argv) {
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
          * The other attributes go on afterwards (see the nameref note below),
          * but this one has to lead. */
+        /* -a or -A of a reference with no target makes it the array,
+         * quietly: `declare -n foo; declare -a foo` is `declare -a foo`
+         * (bash's nameref12.sub; logs/b41 nref15) */
+        if (set_array && !nref) {
+            int fx = env_find(name, klen);
+            if (fx >= 0 && (g_env_flags[fx] & SHVAR_NAMEREF) && !g_env[fx][klen + 1])
+                g_env_flags[fx] &= ~(unsigned char)SHVAR_NAMEREF;
+        }
         if (set_array && shell_decl_convert(name, set_assoc, argv[0]) < 0) {
             shell_set_status(1);
             continue;
