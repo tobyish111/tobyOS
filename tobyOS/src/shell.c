@@ -22808,6 +22808,13 @@ static void cmd_return(int argc, char **argv) {
     if (g_fn_depth <= 0 && g_source_depth <= 0) {
         kprintf("return: can only `return' from a function or sourced script\n");
         shell_set_status(2);
+        /* ...an error of a special builtin, which ends a non-interactive
+         * shell in posix mode, status 2: `bash -o posix -c 'return; echo
+         * after'` says nothing more (errors.tests; logs/b42 errs2 f12) */
+        if (g_opt_posix && !g_interactive && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = 2;
+        }
         return;
     }
     /* a bad operand is reported and the function STILL returns, with 2 */
