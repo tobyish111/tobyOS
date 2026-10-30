@@ -435,6 +435,22 @@ static void sa_readtok(struct sarith *s) {
         c = (unsigned char)*--cp;
         if (c == '[') {
             size_t k = sa_skip_subscript(cp);
+            /* under assoc_expand_once an associative array's subscript was
+             * expanded once already and is taken as it is: no quote in it
+             * is one -- `let "++a[80's]"` is the key 80's, where tsh found
+             * no `]` (bash's assoc9.sub; logs/b42 t7) */
+            if (shell_assoc_expand_once()) {
+                char *nm = sa_strdup(s->tp, (size_t)(cp - s->tp));
+                bool as = nm && sh_array_is_assoc(nm);
+                if (nm) SARITH_FREE(nm);
+                if (as) {
+                    int d = 0;
+                    for (k = 0; cp[k]; k++) {
+                        if (cp[k] == '[') d++;
+                        else if (cp[k] == ']' && --d == 0) break;
+                    }
+                }
+            }
             if (cp[k] == ']') {
                 cp += k + 1;
                 c = (unsigned char)*cp;

@@ -1569,6 +1569,7 @@ static int   sh_subscript_read_index(const char *nm, const char *sub,
                                     long *out);
 static bool  sh_subscript_eval(const char *sub, const char *name,
                                bool for_write, long *out);
+static bool shell_assoc_expand_once(void);
 /* Arithmetic is bash's evaluator (B10): see shell_arith.inc, and
  * shell_arith_eval for how the shell's variables reach it. */
 #include "shell_arith.inc"
@@ -4551,6 +4552,10 @@ static bool shell_kv_scalar_paren(const char *kv, const char *val);
  * assignment WORD arrives with its subscript already expanded and must not
  * be expanded twice. */
 static bool g_assign_expand_sub;
+/* ...unless the key is to be taken AS IT IS: assoc_expand_once's read and
+ * printf -v into an associative array (shell_set_named). */
+static bool g_assign_key_literal;
+static bool shell_assoc_expand_once(void);
 
 static bool shell_nameref_elem_target(const char *name, struct shell_sb *out);
 
@@ -4610,7 +4615,7 @@ static int sh_try_array_assignment(const char *kv) {
          * evaluated (sh_subscript_assign_index). */
         SH_SB(subx);
         if (sh_array_is_assoc(name)) {
-            const char *k = sh_ar_assoc_key(sub, &subx);
+            const char *k = g_assign_key_literal ? sub : sh_ar_assoc_key(sub, &subx);
             if (!k) return -1;
             sub = k;
         }
@@ -5217,6 +5222,28 @@ static bool shell_array_ref_text_ok(const char *w, size_t len) {
     return false;
 }
 
+/* ...and declare's check of one under assoc_expand_once: the subscript ends
+ * at its FIRST `]`, quotes and nesting no matter, and that `]` ends the word
+ * -- `declare A[x[y]=1` is the key x[y, `declare A[p[q]r]=1` "not a valid
+ * identifier" (bash's assoc9.sub; logs/b42 t5). */
+static bool shell_array_ref_once_ok(const char *w, size_t len) {
+    size_t b = 0;
+    while (b < len && w[b] != '[') b++;
+    for (size_t i = b + 1; i < len; i++)
+        if (w[i] == ']') return i == len - 1 && i > b + 1;
+    return false;
+}
+
+/* Is NAME[...]'s key to be taken as it is -- assoc_expand_once, and NAME an
+ * associative array? */
+static bool shell_elem_key_literal(const char *w) {
+    if (!shell_assoc_expand_once()) return false;
+    size_t b = 0;
+    while (w[b] && w[b] != '[') b++;
+    SH_SB(bn);
+    return w[b] == '[' && sb_putmem(&bn, w, b) == 0 && sh_array_is_assoc(bn.p);
+}
+
 /* Assign VAL to NAME the way `read`, `printf -v` and the like do: NAME may
  * be an ELEMENT, `a[i]` or `A[key]`, whose subscript is expanded now (bash's
  * valid_array_reference + assign_array_element). -2: not a name. */
@@ -5225,10 +5252,18 @@ static int shell_set_named(const char *name, const char *val) {
     while (name[b] && name[b] != '[') b++;
     bool elem = name[b] == '[' && nl > b + 1 && name[nl - 1] == ']';
     if (!shell_name_is_valid(name, elem ? b : nl)) return -2;
-    if (elem && !shell_array_ref_text_ok(name, nl)) return -2;
+    /* UNDER assoc_expand_once AN ASSOCIATIVE KEY IS TAKEN AS IT IS -- the
+     * text between the first `[` and the last `]`, not expanded again and
+     * not scanned for quotes: `read A[$k]` with k="80's" or k='$v' sets those
+     * keys, where tsh set 80s and the value of v (bash's assoc9.sub,
+     * assoc18.sub; logs/b42 akeys k2 k4) */
+    bool once = elem && shell_elem_key_literal(name);
+    if (elem && !once && !shell_array_ref_text_ok(name, nl)) return -2;
     if (elem) g_assign_expand_sub = true;
+    g_assign_key_literal = once;
     int rc = env_set(name, val);
     g_assign_expand_sub = false;
+    g_assign_key_literal = false;
     return rc;
 }
 
@@ -8653,6 +8688,37 @@ static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx) {
     return kx->p;
 }
 
+/* UNDER assoc_expand_once AN ARITHMETIC KEY HAS ITS QUOTES REMOVED AND IS
+ * NOT EXPANDED AGAIN: `$(( A['x'] ))` is the key x, `A[\$k]` the key $k,
+ * and `A[$x]` with x='$(cmd)' the key $(cmd) -- the command not run; a lone
+ * quote stays, `let "++a[80's]"` the key 80's (bash's assoc9.sub; logs/b42
+ * t7 t8). tsh expanded the key again. */
+static const char *sh_ar_key_once(const char *sub, struct shell_sb *o) {
+    sb_truncate(o, 0);
+    for (const char *p = sub; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; if (sb_putc(o, *p) < 0) return 0; continue; }
+        if (*p == '\'' || *p == '"') {
+            const char *e = p + 1;
+            while (*e && *e != *p) { if (*p == '"' && *e == '\\' && e[1]) e++; e++; }
+            if (*e) {
+                for (const char *q = p + 1; q < e; q++) {
+                    if (*p == '"' && *q == '\\' && q + 1 < e &&
+                        (q[1] == '$' || q[1] == '`' || q[1] == '"' || q[1] == '\\'))
+                        q++;
+                    if (sb_putc(o, *q) < 0) return 0;
+                }
+                p = e;
+                continue;
+            }
+        }
+        if (sb_putc(o, *p) < 0) return 0;
+    }
+    if (!o->p && sb_puts(o, "") < 0) return 0;
+    shell_strip_glob_escapes(o->p);
+    o->len = strlen(o->p);
+    return o->p;
+}
+
 static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
                      bool *set, long *ind) {
     (void)ctx;
@@ -8681,7 +8747,8 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
         else v = sv;
     } else if (arr && arr->assoc) {
         SH_SB(kx);
-        const char *key = sh_ar_assoc_key(sub, &kx);
+        const char *key = shell_assoc_expand_once() ? sh_ar_key_once(sub, &kx)
+                                                    : sh_ar_assoc_key(sub, &kx);
         if (!key) return SARITH_CB_FAIL;
         v = sh_array_get_key(name, key);
         if (v) {
@@ -8734,7 +8801,8 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
     }
     if (arr && arr->assoc) {
         SH_SB(kx);
-        const char *key = sh_ar_assoc_key(sub, &kx);
+        const char *key = shell_assoc_expand_once() ? sh_ar_key_once(sub, &kx)
+                                                    : sh_ar_assoc_key(sub, &kx);
         if (!key) return SARITH_CB_FAIL;
         return sh_array_set_key(name, key, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
     }
@@ -9936,7 +10004,11 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
         return false;
     }
     g_assign_fail_hit = false;
-    return env_set_kv(word) >= 0;
+    /* (under assoc_expand_once the key is taken as it is, as read's is) */
+    g_assign_key_literal = shell_elem_key_literal(word);
+    int rc = env_set_kv(word);
+    g_assign_key_literal = false;
+    return rc >= 0;
 }
 
 /* The `[` of an element operand `NAME[SUB]` (with or without a value), or
@@ -10099,7 +10171,9 @@ static void cmd_local(int argc, char **argv) {
         else klen = strlen(argv[i]);
         {
             const char *lb = shell_decl_element_lb(argv[i], klen);
-            if (lb && !shell_array_ref_text_ok(argv[i], klen)) {
+            if (lb && (shell_elem_key_literal(argv[i])
+                ? !shell_array_ref_once_ok(argv[i], klen)
+                : !shell_array_ref_text_ok(argv[i], klen))) {
                 kprintf("local: `%s': not a valid identifier\n", argv[i]);
                 shell_set_status(1);
                 continue;
@@ -10289,6 +10363,8 @@ static bool g_shopt_misc[64] = {
     [11] = true, [12] = true, [13] = true, [17] = true, [33] = true,
     [35] = true, [37] = true,
 };
+/* assoc_expand_once (its slot in the table below) */
+static bool shell_assoc_expand_once(void) { return g_shopt_misc[25]; }
 /* WIRED: with `set -e` on, a command substitution inherits errexit and stops
  * at its first failure. `echo $(echo one; false; echo two)` prints `one`
  * with it and `one two` without. Off by default, as in bash. */
@@ -11467,7 +11543,9 @@ static void cmd_declare(int argc, char **argv) {
             /* the expanded word's subscript must close where bash's does
              * (shell_array_ref_text_ok): `declare A[8's]=d` is "`A[8's]=d':
              * not a valid identifier" (logs/b42 akeys k5, asub q11 q12) */
-            if (lb && !shell_array_ref_text_ok(argv[i], klen)) {
+            if (lb && (shell_elem_key_literal(argv[i])
+                ? !shell_array_ref_once_ok(argv[i], klen)
+                : !shell_array_ref_text_ok(argv[i], klen))) {
                 kprintf("%s: `%s': not a valid identifier\n", argv[0], argv[i]);
                 shell_set_status(1);
                 continue;
@@ -24741,7 +24819,8 @@ static void cmd_printf(int argc, char **argv) {
         while (vname[vnl] && vname[vnl] != '[') vnl++;
         bool velem = vname[vnl] == '[' && vname[strlen(vname) - 1] == ']';
         if (!shell_name_is_valid(vname, velem ? vnl : strlen(vname)) ||
-            (velem && !shell_array_ref_text_ok(vname, strlen(vname)))) {
+            (velem && !shell_elem_key_literal(vname) &&
+             !shell_array_ref_text_ok(vname, strlen(vname)))) {
             kprintf("printf: `%s': not a valid identifier\n", vname);
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
             return;
