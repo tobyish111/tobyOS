@@ -11800,7 +11800,12 @@ static void cmd_unset(int argc, char **argv) {
             while (argv[i][bl] && argv[i][bl] != '[') bl++;
             if (sb_putmem(&nmbb, argv[i], bl) < 0) continue;
             const char *nmb = nmbb.p;
-            if (bl && shell_readonly_key(nmb, bl)) {
+            /* (a readonly REFERENCE is unset through, its target's mark
+             * decides -- `declare -rn foo0=bar; unset foo0` unsets bar;
+             * only `unset -n foo0` is refused: bash's nameref17.sub,
+             * logs/b41 nref18 u2) */
+            if (bl && shell_readonly_key(nmb, bl) &&
+                !(!ref_only && !argv[i][bl] && shell_is_nameref(nmb))) {
                 kprintf("unset: %s: cannot unset: readonly variable\n", nmb);
                 shell_set_status(1);
                 continue;
