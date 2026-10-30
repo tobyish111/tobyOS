@@ -35432,11 +35432,37 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             }
             if (*p == '(' && wb.len > 0 && wb.p[wb.len - 1] == '=' &&
                 (prefix_ok || decl_util_cmd)) {
+                /* The list ends at ITS `)`: not one escaped, quoted or
+                 * backquoted -- `B=( [\)]=rp [\]]=rb )` and `F=([")"]=x
+                 * ["\""]=y)` ended at the inner `)`, and the rest ran as a
+                 * command or was "unmatched double quote" (bash's
+                 * assoc9.sub, assoc11.sub; logs/b42 asub q1 q2 q5 q6). */
                 int depth = 0;
                 do {
-                    if (*p == '(') depth++;
-                    else if (*p == ')') depth--;
-                    if (sb_putc(&wb,*p) < 0)
+                    char c = *p;
+                    const char *e = 0;          /* the end of a span to copy */
+                    if (c == '\\' && p[1]) {
+                        e = p + 2;
+                    } else if (c == '$' && p[1] == '\'') {
+                        for (e = p + 2; *e && *e != '\''; e++)
+                            if (*e == '\\' && e[1]) e++;
+                        if (*e) e++;
+                    } else if (c == '\'') {
+                        for (e = p + 1; *e && *e != '\''; e++) {}
+                        if (*e) e++;
+                    } else if (c == '"' || c == '`') {
+                        for (e = p + 1; *e && *e != c; e++)
+                            if (*e == '\\' && e[1]) e++;
+                        if (*e) e++;
+                    }
+                    if (e) {
+                        if (sb_putmem(&wb, p, (size_t)(e - p)) < 0) return -1;
+                        p = e;
+                        continue;
+                    }
+                    if (c == '(') depth++;
+                    else if (c == ')') depth--;
+                    if (sb_putc(&wb, c) < 0)
                         return -1;
                     p++;
                 } while (*p && depth > 0);
