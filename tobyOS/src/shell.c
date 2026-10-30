@@ -10414,9 +10414,13 @@ static bool shell_declare_print(const char *name) {
         }
     }
     int idx = env_find(name, klen);
-    struct sh_array *arr = sh_array_find(name);
     unsigned f = (idx >= 0) ? (unsigned)g_env_flags[idx] : 0u;
-    bool is_arr = (arr != 0) || (f & SHVAR_ARRAY);
+    /* A REFERENCE PRINTS ITSELF -- `declare -n r="a"` -- and not what it
+     * names: sh_array_find follows it, and a reference to an array printed
+     * that array under the reference's name, `declare -an r=(...)` (bash;
+     * logs/b41 nref2 b3, bash's nameref10.sub). */
+    struct sh_array *arr = (f & SHVAR_NAMEREF) ? 0 : sh_array_find(name);
+    bool is_arr = (arr != 0) || ((f & SHVAR_ARRAY) && !(f & SHVAR_NAMEREF));
     if (idx < 0 && !arr) {
         /* Marked readonly but never given a value (S4): bash prints the
          * attribute alone -- `readonly -a e; declare -p e` is
