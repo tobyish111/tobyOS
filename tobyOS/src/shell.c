@@ -6167,6 +6167,17 @@ static int shell_function_set(const char *name, const char *body) {
         kprintf("`%s': is a special builtin\n", name);
         return -2;
     }
+    /* ...and a name has to be a NAME there: `function !! ()` is "`!!': not
+     * a valid identifier", and a non-interactive shell ends, status 2
+     * (bash's errors.tests; logs/b42 errs2 f13). tsh defined it. */
+    if (g_opt_posix && !shell_name_is_valid(name, strlen(name))) {
+        kprintf("`%s': not a valid identifier\n", name);
+        if (!g_interactive && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = 2;
+        }
+        return -2;
+    }
     {
         int ro = shell_function_find(name);
         if (ro >= 0 && g_functions[ro].readonly) {             /* S4 */
