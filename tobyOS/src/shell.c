@@ -32356,7 +32356,17 @@ struct shell_elem_frame {
 static struct shell_elem_frame *g_elem_frames;
 static int g_elem_depth;
 
+/* ${!REF...}: bash names the expansion "!REF" in its messages -- "!r:
+ * msg", "!r: unbound variable", "!r: 1+: syntax error..." -- where tsh
+ * named the target (bash's new-exp; logs/b42 nexp4). That holds at the
+ * level of real ${...} nesting the target is expanded at (g_bpe_level);
+ * a ${...} in the operator's word is deeper and names itself. */
+static const char *g_indir_disp;
+static int g_indir_level = -1;
+static int g_bpe_level;
+
 static const char *shell_param_display(const char *name) {
+    if (g_indir_disp && g_indir_level == g_bpe_level) return g_indir_disp;
     for (struct shell_elem_frame *f = g_elem_frames; f; f = f->up)
         if (strcmp(f->scratch, name) == 0) return f->display;
     return name;
@@ -32637,8 +32647,31 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
     if (strncmp(expr, "SHELL_ELEM_", 11) != 0 &&
         strncmp(expr, "SHELL_ARRAY_ELEM", 16) != 0)
         g_bsub_text = expr;
+    /* a scratch expansion is its caller's level (g_indir_disp) */
+    bool real = strncmp(expr, "SHELL_ELEM_", 11) != 0 &&
+                strncmp(expr, "SHELL_ARRAY_ELEM", 16) != 0 &&
+                strncmp(expr, "SHELL_POSARGS_", 14) != 0 &&
+                strncmp(expr, "SHELL_INDIR_", 12) != 0;
+    if (real) g_bpe_level++;
     int rc = shell_expand_braced_parameter_in(expr, b);
+    if (real) g_bpe_level--;
     g_bsub_text = saved;
+    return rc;
+}
+
+/* Expand the target of ${!REF...} -- EXPR, at the next level for a real
+ * name or this one for a scratch -- with REF's messages ("!REF") in force. */
+static int shell_expand_indir_target(const char *rname, const char *expr,
+                                     bool scratch, struct shell_sb *b) {
+    SH_SB(disp);
+    if (sb_putc(&disp, '!') < 0 || sb_puts(&disp, rname) < 0) return -1;
+    const char *od = g_indir_disp;
+    int ol = g_indir_level;
+    g_indir_disp = disp.p;
+    g_indir_level = g_bpe_level + (scratch ? 0 : 1);
+    int rc = shell_expand_braced_parameter(expr, b);
+    g_indir_disp = od;
+    g_indir_level = ol;
     return rc;
 }
 
@@ -32705,6 +32738,10 @@ static bool shell_var_has_value(const char *nm) {
 /* set -u on an array reference: "NAME[SUB]: unbound variable", or the
  * bare NAME, and the expansion fails (shell_arith_unbound's rules). */
 static int shell_unbound_ref(const char *nm, const char *sub, size_t slen) {
+    if (g_indir_disp && g_indir_level == g_bpe_level) {
+        shell_arith_unbound(g_indir_disp);
+        return -1;
+    }
     SH_SB(m);
     if (sb_puts(&m, nm) < 0) return -1;
     if (sub && (sb_putc(&m, '[') < 0 || sb_putmem(&m, sub, slen) < 0 ||
@@ -32972,11 +33009,26 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                  * 2433). The tests then see an unset parameter, and `=` is
                  * "invalid indirect expansion" (there is nothing to assign
                  * through). */
+                /* ...and so does an unset POSITIONAL parameter: ${!9:-d} is
+                 * d, ${!9} and ${!9@Q} nothing, where tsh said "9: invalid
+                 * indirect expansion". Under set -u anything but a test is
+                 * "!REF: unbound variable" (bash's new-exp; logs/b42 nexp3
+                 * z7, nexp4 w9-w13, nexp5 v4 v5). */
                 if (!ref_set) {
                     int ri = env_find(rname.p, strlen(rname.p));
-                    if (sh_array_find(rname.p) || ri >= 0) {
-                        if (!*rest) return 0;
+                    bool posn = rname.p[0] >= '0' && rname.p[0] <= '9';
+                    if (sh_array_find(rname.p) || ri >= 0 || posn) {
                         const char *t = rest[0] == ':' ? rest + 1 : rest;
+                        if (g_opt_nounset &&
+                            !(*rest && (*t == '-' || *t == '=' || *t == '?' ||
+                                        *t == '+'))) {
+                            SH_SB(ud);
+                            if (sb_putc(&ud, '!') < 0 || sb_puts(&ud, rname.p) < 0)
+                                return -1;
+                            shell_arith_unbound(ud.p);
+                            return -1;
+                        }
+                        if (!*rest) return 0;
                         if (*t == '=') {
                             kprintf(SH_PFX_SHELL "!%s: invalid indirect expansion\n",
                                     rname.p);
@@ -32989,7 +33041,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             if (sb_puts(&ue, "SHELL_INDIR_UNSET") < 0 ||
                                 sb_puts(&ue, rest) < 0)
                                 return -1;
-                            return shell_expand_braced_parameter(ue.p, b);
+                            return shell_expand_indir_target(rname.p, ue.p,
+                                                             true, b);
                         }
                         return 0;
                     }
@@ -33013,7 +33066,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                 if (sb_putmem(&nexpr, refval.p, refval.len) < 0 ||
                     sb_puts(&nexpr, rest) < 0)
                     return -1;
-                return shell_expand_braced_parameter(nexpr.p, b);
+                return shell_expand_indir_target(rname.p, nexpr.p, false, b);
             }
         }
     }
