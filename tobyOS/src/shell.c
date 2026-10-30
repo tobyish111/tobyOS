@@ -9696,6 +9696,16 @@ static int shell_local_list_pre(const char *val, bool assoc, struct shell_sb *ou
     return out->p ? 0 : -1;
 }
 
+/* Is the binding of `name` a CALLER's local -- the newest live local of the
+ * name made below `depth`? */
+static bool shell_local_of_caller(const char *name, int depth) {
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0)
+            return g_locals[i].depth < depth;
+    return false;
+}
+
 /* Put back the scalar a local hid (the second half of the restore). */
 static void shell_path_var_written(const char *key, size_t klen);
 static void shell_readonly_unmark(const char *key, size_t klen);
@@ -10300,7 +10310,15 @@ static void cmd_local(int argc, char **argv) {
          * 1 and the variable stays what it was. tsh pushed the local first,
          * so `local -a r=(9)` failed AND left an empty r shadowing the
          * readonly one for the rest of the function. */
-        if (shell_readonly_key(name, klen)) {
+        /* ...but a readonly LOCAL OF A CALLER is that caller's: this
+         * function's local of the name is its own and writable, and the
+         * caller's comes back readonly at the return (shell_locals_push
+         * notes it). `b() { local -r x=0; a; }` with `a() { local x=1; }`
+         * was "local: x: readonly variable" (bash's varenv19.sub; logs/b42
+         * venv1 n7 n8). */
+        bool ro_caller = shell_readonly_key(name, klen) &&
+                         shell_local_of_caller(name, g_script_depth);
+        if (shell_readonly_key(name, klen) && !ro_caller) {
             /* a compound value: bash's own declare of it reports first,
              * under the command it last named (see cmd_declare) */
             size_t vk = env_key_len(argv[i]);
@@ -10372,6 +10390,7 @@ static void cmd_local(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+        if (ro_caller && !already) shell_readonly_unmark(name, klen);
         /* a new local over a reference the function did not make is a
          * plain variable: `local ref=Y` of a global reference ref is ref=Y,
          * where tsh wrote Y through it (bash's nameref20.sub; logs/b41
@@ -11873,8 +11892,10 @@ static void cmd_declare(int argc, char **argv) {
          * shell_local_list_pre and shell_local_of_caller) */
         SH_SB(prelist);
         bool pre = false;
+        bool ro_caller = make_local && shell_readonly_key(name, klen) &&
+                         shell_local_of_caller(name, g_script_depth);
         if (make_local && !shell_local_declared_here(name, g_script_depth) &&
-            has_value && !d_append && !nref && !shell_readonly_key(name, klen)) {
+            has_value && !d_append && !nref && (!shell_readonly_key(name, klen) || ro_caller)) {
             const char *pv = argv[i] + env_key_len(argv[i]) + 1;
             if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
                 bool pa = set_assoc;
@@ -11887,7 +11908,7 @@ static void cmd_declare(int argc, char **argv) {
             }
         }
         if (make_local && !shell_local_declared_here(name, g_script_depth)) {
-            if (shell_readonly_key(name, klen)) {
+            if (shell_readonly_key(name, klen) && !ro_caller) {
                 /* A COMPOUND VALUE IS DECLARED FIRST, by bash itself
                  * (expand_declaration_argument), as its words are
                  * expanded: in a function that makes the local, which the
@@ -11915,6 +11936,7 @@ static void cmd_declare(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            if (ro_caller) shell_readonly_unmark(name, klen);
             /* a fresh local starts with no value (bash, without
              * localvar_inherit) -- unless a prefix binding gives it one */
             if (!has_value && !inherit) {
