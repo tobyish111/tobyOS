@@ -10985,6 +10985,16 @@ static void cmd_declare(int argc, char **argv) {
          *
          * tsh made all of these references (Oils 1865). A name or an
          * element (`a[1]`, `a[@]`) is a name. */
+        /* -n OVER A READONLY VARIABLE is refused, "declare: RO: readonly
+         * variable", status 1: tsh made a readonly variable a reference,
+         * and its readonly mark then went to what it named (bash's
+         * nameref11.sub; logs/b41 nref11) -- a fresh local is not it */
+        if (nref && shell_readonly_key(name, klen) &&
+            !(make_local && !shell_local_declared_here(name, g_script_depth))) {
+            shell_readonly_print_error(name, klen, argv[0]);
+            shell_set_status(1);
+            continue;
+        }
         if (nref) {
             const char *nv = 0;
             if (has_value && !d_append) {
@@ -10996,7 +11006,13 @@ static void cmd_declare(int argc, char **argv) {
             }
             if (nv) {
                 bool ok = true;
-                if (!*nv) {
+                if (!*nv && !has_value) {
+                    /* the value it has is checked as a value given is:
+                     * `r=""; declare -n r` (bash's nameref11.sub) */
+                    kprintf("%s: `': invalid variable name for name reference\n",
+                            argv[0]);
+                    ok = false;
+                } else if (!*nv) {
                     if (has_value) {
                         kprintf("%s: `': not a valid identifier\n", argv[0]);
                         ok = false;
