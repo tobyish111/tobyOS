@@ -375,6 +375,18 @@ static void shell_kfree_ptr(void *pp) {
     *p = 0;
 }
 
+/* An argv word swapped for one of a builtin's own while a loop iteration
+ * runs, put back when the variable goes out of scope (cleanup attribute):
+ * the caller owns argv and frees what it put there. */
+struct shell_argv_swap {
+    char **slot;
+    char *orig;
+};
+static void shell_argv_swap_put(struct shell_argv_swap *s) {
+    if (s->slot) *s->slot = s->orig;
+    s->slot = 0;
+}
+
 /* ---- WORD STORAGE THAT NEVER MOVES --------------------------------------
  *
  * The tokenizer hands out `char *` to finished words, and argv is built from
@@ -10197,6 +10209,26 @@ static void cmd_export(int argc, char **argv) {
         return;
     }
     for (int i = start; i < argc; i++) {
+        /* A REFERENCE IS EXPORTED, or not, AS ITS TARGET: `export r`,
+         * `export r=7`, `export -n r` act on the variable at the end of r's
+         * chain, as declare -x does (finding 322). tsh marked r. */
+        SH_SB(rearg);
+        struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
+        {
+            size_t nl = env_key_len(argv[i]);
+            nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            SH_SB(rn);
+            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 && shell_is_nameref(rn.p)) {
+                SH_SB(tg);
+                const char *real = env_deref_name_ex(rn.p, &tg, false);
+                if (real && real != rn.p && !g_nameref_circular &&
+                    sb_set(&rearg, real) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                    ras.slot = &argv[i];
+                    ras.orig = argv[i];
+                    argv[i] = rearg.p;
+                }
+            }
+        }
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
         if (unexport && shell_name_is_valid(argv[i], nlen)) {
@@ -10796,15 +10828,41 @@ static void cmd_declare(int argc, char **argv) {
     }
 
     for (; i < argc; i++) {
+        /* IN A FUNCTION, `declare` and `typeset` MAKE LOCALS, as `local`
+         * does -- unless -g. tsh's declare always wrote the variable it
+         * could see, so `f() { declare v=in; }` changed the caller's v. */
+        bool make_local = (g_fn_depth > 0) && !set_global;
+        /* AN EXISTING REFERENCE PASSES declare's WORK ON to the variable at
+         * the end of its chain -- `declare -i r`, -x, +x, -a, -A, -l, -u, a
+         * value -- unless this declare makes or unmakes it a reference. In
+         * a function only a reference of the function's own does: there
+         * `declare -i r` of a global reference makes a local r, and of its
+         * own reference a local of the target. tsh put the attributes on the
+         * reference (bash; logs/b41 nref4 nref5, bash's nameref10.sub). The
+         * word is NAME's target with the rest of it, for this name only. */
+        SH_SB(rearg);
+        struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
+        if (!set_nameref && !clear_nameref) {
+            size_t nl = env_key_len(argv[i]);
+            nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            SH_SB(rn);
+            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 && shell_is_nameref(rn.p) &&
+                (!make_local || shell_local_declared_here(rn.p, g_script_depth))) {
+                SH_SB(tg);
+                const char *real = env_deref_name_ex(rn.p, &tg, false);
+                if (real && real != rn.p && !g_nameref_circular &&
+                    sb_set(&rearg, real) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                    ras.slot = &argv[i];
+                    ras.orig = argv[i];
+                    argv[i] = rearg.p;
+                }
+            }
+        }
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
         bool d_append = has_value && klen > 1 && argv[i][klen - 1] == '+';
         if (has_value) klen = env_assign_name_len(argv[i]);  /* `d+=v` */
         else klen = strlen(argv[i]);
-        /* IN A FUNCTION, `declare` and `typeset` MAKE LOCALS, as `local`
-         * does -- unless -g. tsh's declare always wrote the variable it
-         * could see, so `f() { declare v=in; }` changed the caller's v. */
-        bool make_local = (g_fn_depth > 0) && !set_global;
         {
             const char *lb = shell_decl_element_lb(argv[i], klen);
             if (lb) {
@@ -10931,6 +10989,12 @@ static void cmd_declare(int argc, char **argv) {
                 int ox = env_find(name, klen);
                 if (ox >= 0) env_remove_at(ox);
             }
+            /* ...and a reference the caller has is not this local's: in a
+             * function `declare -x r=9` of a global reference r makes a
+             * plain local r, where tsh wrote 9 through r (bash; logs/b41
+             * nref5 e3). The push above keeps the flag for the return. */
+            int rx = env_find(name, klen);
+            if (rx >= 0 && !set_nameref) g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
         }
 
         /* BEFORE the assignment: the literal parser asks whether the array is
