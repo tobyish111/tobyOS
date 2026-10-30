@@ -34196,6 +34196,15 @@ static int shell_arith_expand(const char *expr, struct shell_sb *out) {
                 (void)shell_arith_dequote(seg.p);
                 seg.len = strlen(seg.p);
                 if (shell_expand_literal_quotes(seg.p, &xs) != 0) return -1;
+                /* `$@`'s fields join with a space, as in any string: `set
+                 * -- '1+2 '; echo $(( $@ ))` kept the field mark and was
+                 * "operand expected" (bash's array17.sub; logs/b42 arr2 b5) */
+                if (shell_word_has_argmark(xs.p)) {
+                    SH_SB(jx);
+                    if (shell_argmarks_to_spaces(xs.p, &jx) < 0 ||
+                        sb_set(&xs, jx.p ? jx.p : "") < 0)
+                        return -1;
+                }
                 if (sb_puts(out, xs.p) < 0) return -1;
                 sb_truncate(&seg, 0);
             }
