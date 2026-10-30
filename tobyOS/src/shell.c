@@ -9065,12 +9065,28 @@ static int sh_subscript_read_index(const char *nm, const char *sub, long *out) {
 /* A subscript's VALUE, as bash's array code computes it: the text expanded,
  * then evaluated as arithmetic with no command name in its errors
  * (array_expand_index). Negative values are the caller's to interpret. */
+static int sh_subscript_value_as(const char *sub, const char *cmdname,
+                                 long *outv);
 static int sh_subscript_value(const char *sub, long *outv) {
+    return sh_subscript_value_as(sub, 0, outv);
+}
+
+/* ...with CMDNAME before its errors: a slice's offset and length name the
+ * parameter, "x: 1+: syntax error..." (bash's new-exp; logs/b42 nexp2). */
+static int sh_subscript_value_as(const char *sub, const char *cmdname,
+                                 long *outv) {
     if (!sub || !*sub) return SARITH_FAILED;
     SH_SB(expanded);
     const char *src = sub;
+    /* an expansion inside that failed has said so: `${x:$((1+))}` is one
+     * error, where tsh went on to evaluate the text as written and gave a
+     * second (logs/b42 nexp5 v6) */
+    bool soft0 = g_bad_subst_soft;
+    enum shell_flow flow0 = g_shell_flow;
     if (shell_expand_literal_quotes(sub, &expanded) == 0)
         src = expanded.p;
+    else if ((g_bad_subst_soft && !soft0) || g_shell_flow != flow0)
+        return SARITH_ERROR;
     /* A DOUBLE-QUOTED SUBSCRIPT IS STILL ARITHMETIC. bash removes the
      * quotes and evaluates what is left, so `${a["k1"]}` reads the
      * variable k1 exactly as `${a[k1]}` does and `${a["1"]}` is index 1.
@@ -9104,7 +9120,7 @@ static int sh_subscript_value(const char *sub, long *outv) {
         }
     }
     long v = 0;
-    int k = shell_arith_eval(src, 0, &v);
+    int k = shell_arith_eval(src, cmdname, &v);
     if (k != SARITH_OK) return k;
     *outv = v;
     return SARITH_OK;
@@ -32214,6 +32230,8 @@ static char *sh_slice_colon(char *s) {
     return 0;
 }
 
+static const char *shell_param_display(const char *name);
+
 static int shell_expand_substring(const char *name, const char *spec,
                                   struct shell_sb *b) {
     if (!spec || !*spec) {
@@ -32231,16 +32249,17 @@ static int shell_expand_substring(const char *name, const char *spec,
      * and a scalar is not one, so every negative number came back -1:
      * `${foo: -4:3}` was "g" and `${foo:3:-2}` "def" (bash: def, de --
      * Oils 2479 2481 2482). An empty part is 0; an error is the
-     * expansion's (status 1, line dropped). */
+     * expansion's (status 1, line dropped), and names the parameter. */
     {
-        int k = sh_subscript_value(sbuf.p, &off);
+        const char *disp = shell_param_display(name);
+        int k = sh_subscript_value_as(sbuf.p, disp, &off);
         if (k == SARITH_ERROR || k == SARITH_UNBOUND) {
             if (k == SARITH_ERROR) g_bad_subst_soft = true;
             return -1;
         }
         if (k != SARITH_OK) off = 0;
         if (have_len) {
-            k = sh_subscript_value(split + 1, &cnt);
+            k = sh_subscript_value_as(split + 1, disp, &cnt);
             if (k == SARITH_ERROR || k == SARITH_UNBOUND) {
                 if (k == SARITH_ERROR) g_bad_subst_soft = true;
                 return -1;
@@ -33187,12 +33206,31 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         char *colon = sh_slice_colon(spec.p);
                         if (colon) *colon = '\0';
                         long off = 0, cnt = -1;
-                        if (sh_array_is_assoc(nm)) {
+                        /* An error in the offset or the length drops the
+                         * line and names the array, "a[@]: 1+: syntax
+                         * error..."; tsh said it and went on with 0
+                         * (bash's new-exp; logs/b42 nexp2 y6 y7). */
+                        SH_SB(sdisp);
+                        if (g_indir_disp && g_indir_level == g_bpe_level) {
+                            if (sb_puts(&sdisp, g_indir_disp) < 0) return -1;
+                        } else if (sb_puts(&sdisp, nm) < 0 ||
+                                   sb_putc(&sdisp, '[') < 0 ||
+                                   sb_putc(&sdisp, sub[0]) < 0 ||
+                                   sb_putc(&sdisp, ']') < 0) {
+                            return -1;
+                        }
+                        int ok = sh_subscript_value_as(spec.p, sdisp.p, &off);
+                        if (ok == SARITH_ERROR || ok == SARITH_UNBOUND) {
+                            if (ok == SARITH_ERROR) g_bad_subst_soft = true;
+                            return -1;
+                        }
+                        bool assoc_sl = sh_array_is_assoc(nm);
+                        if (assoc_sl) {
                             /* no subscripts to count back from: the number
                              * as it is (shell_append_array_slice) */
-                            if (sh_subscript_value(spec.p, &off) != SARITH_OK)
+                            if (ok != SARITH_OK)
                                 off = 0;
-                        } else if (sh_subscript_value(spec.p, &off) != SARITH_OK) {
+                        } else if (ok != SARITH_OK) {
                             off = 0;
                         } else if (off < 0) {
                             /* bash's verify_substring_values, in its own
@@ -33207,8 +33245,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             long o2 = (long)((unsigned long)off + (unsigned long)len);
                             off = (o2 > len || o2 < 0) ? -1 : o2;
                         }
-                        if (colon && !sh_subscript_eval(colon + 1, nm, false, &cnt))
-                            cnt = -1;
+                        if (colon) {
+                            ok = sh_subscript_value_as(colon + 1, sdisp.p, &cnt);
+                            if (ok == SARITH_ERROR || ok == SARITH_UNBOUND) {
+                                if (ok == SARITH_ERROR) g_bad_subst_soft = true;
+                                return -1;
+                            }
+                            if (ok != SARITH_OK) cnt = -1;
+                        }
                         /* An EMPTY length is 0, not "the rest": bash's
                          * `${a[@]::}` and `${a[@]:0:}` are nothing (Oils
                          * 2496). */
