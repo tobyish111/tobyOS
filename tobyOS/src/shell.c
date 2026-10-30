@@ -32232,6 +32232,15 @@ static char *sh_slice_colon(char *s) {
 
 static const char *shell_param_display(const char *name);
 
+/* A slice's LENGTH, as written, that ends before its offset: status 1 and
+ * the line dropped. */
+static int sh_slice_len_error(const char *len_text) {
+    kprintf(SH_PFX_SHELL "%s: substring expression < 0\n", len_text);
+    shell_set_status(1);
+    g_bad_subst_soft = true;
+    return -1;
+}
+
 static int shell_expand_substring(const char *name, const char *spec,
                                   struct shell_sb *b) {
     if (!spec || !*spec) {
@@ -32268,11 +32277,20 @@ static int shell_expand_substring(const char *name, const char *spec,
         }
     }
 
+    /* AN OFFSET OUTSIDE THE VALUE IS NOTHING, and only then is a negative
+     * LENGTH looked at: an error for the parameters (bash's new-exp;
+     * logs/b42 nexp2 y1, nexp7 t7) and for a value whose end lands before
+     * its offset. tsh took a negative offset past the start as 0 and a
+     * negative length as one counted back. */
     if (strcmp(name, "@") == 0 || strcmp(name, "*") == 0) {
         bool star = (name[0] == '*');
         long n = (long)g_positional_count + 1;      /* +1 for $0 */
-        if (off < 0) { off = n + off; if (off < 0) off = 0; }
-        long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
+        if (off < 0) off = n + off;
+        if (off < 0 || off > n)
+            return star ? 0 : sh_put_lead_mark(b);
+        if (have_len && cnt < 0)
+            return sh_slice_len_error(split + 1);
+        long end = !have_len ? n : off + cnt;
         if (end > n) end = n;
         struct sh_sep sep;
         sh_sep_join(&sep, SH_JOIN_HD_SPACE);
@@ -32302,15 +32320,15 @@ static int shell_expand_substring(const char *name, const char *spec,
     SH_SB(value);
     bool is_set = false, vjoin = false;
     if (shell_parameter_value(name, &value, &is_set, &vjoin) < 0) return -1;
-    (void)is_set;                   /* an unset parameter slices to empty */
+    if (!is_set) return 0;          /* an unset parameter slices to empty */
     /* in CHARACTERS (an escaped byte is one; a multibyte one in UTF-8) */
     bool u8 = shell_utf8();
     long n = sh_char_count(value.p, value.len, u8);
-    if (off < 0) { off = n + off; if (off < 0) off = 0; }
-    if (off > n) off = n;
+    if (off < 0) off = n + off;
+    if (off < 0 || off > n) return 0;
     long end = !have_len ? n : (cnt < 0 ? n + cnt : off + cnt);
+    if (end < off) return sh_slice_len_error(split + 1);
     if (end > n) end = n;
-    if (end < off) end = off;
     size_t boff = sh_char_off(value.p, value.len, off, u8);
     size_t bend = boff + sh_char_off(value.p + boff, value.len - boff, end - off, u8);
     return vjoin
@@ -33260,6 +33278,24 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             const char *lq = colon + 1;
                             while (*lq == ' ' || *lq == '\t') lq++;
                             if (!*lq) cnt = 0;
+                        }
+                        /* A NEGATIVE LENGTH IS AN ERROR, "LEN: substring
+                         * expression < 0", once the offset is inside: an
+                         * indexed array's below its top + 1, an associative
+                         * one's up to its count (bash's new-exp; logs/b42
+                         * nexp7). tsh counted it back from the top. */
+                        if (colon && cnt < 0 && ok == SARITH_OK) {
+                            struct sh_array *sa = sh_array_find(nm);
+                            bool inside;
+                            if (assoc_sl) {
+                                inside = off <= (long)(sa ? sa->n : 0);
+                            } else {
+                                long top = sa ? sh_array_max_idx(sa) : -1;
+                                inside = off >= 0 && off <= top;
+                            }
+                            if (!inside)
+                                return shell_append_array_slice(b, nm, star, 0, 0);
+                            return sh_slice_len_error(colon + 1);
                         }
                         return shell_append_array_slice(b, nm,
                                                         star, off, cnt);
