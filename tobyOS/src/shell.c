@@ -32406,6 +32406,17 @@ static int shell_expand_element_op(const char *nm, const char *sub,
     } else {
         (void)env_unset(scratch);
     }
+    /* the scratch carries the array's -i -l -u, so `${A[k]=foo}` of a
+     * declare -Au A stores and gives FOO, and ${n[1]=4+3} of an -ai n 7
+     * (bash's array29.sub, array30.sub; logs/b42 arr2 b6) */
+    {
+        unsigned at = shell_value_attrs(nm);
+        if (at) {
+            if (!had) (void)env_set_attr_holder(scratch);
+            int sx = env_find(scratch, strlen(scratch));
+            if (sx >= 0) g_env_flags[sx] |= (unsigned char)at;
+        }
+    }
     SH_SB(ex);
     if (sb_puts(&ex, scratch) < 0 || sb_puts(&ex, suffix) < 0) {
         (void)env_unset(scratch);
@@ -32480,6 +32491,10 @@ static int shell_expand_array_test_op(struct shell_sb *b, const char *nm,
     }
     bool use_value = is_set && !is_null;
 
+    /* an ASSOCIATIVE array's @ or * is a key to assign: `declare -A B;
+     * ${B[@]:=foo}` sets B["@"] (bash's array30.sub; logs/b42 arr2 b7) */
+    if (opc == '=' && !use_value && sh_array_is_assoc(nm))
+        return shell_expand_element_op(nm, star ? "*" : "@", 1, suffix, b);
     if (opc == '=' && !use_value) {
         kprintf("%s[%c]: bad array subscript\n", nm, star ? '*' : '@');
         g_bad_subst_soft = true;
@@ -33950,7 +33965,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                 }
                 return -1;
             }
-            return sb_put_data_str(b, plain.p);
+            /* ...and what it gives is the VARIABLE now, its attributes
+             * applied: `${A[k]=foo}` of a declare -Au A is FOO, and
+             * `${n=4+3}` of an integer n is 7 (bash's array29.sub,
+             * array30.sub; logs/b42 arr2 b6) */
+            {
+                const char *nv = (shell_value_attrs(name) != 0) ? env_get(name) : 0;
+                return sb_put_data_str(b, nv ? nv : plain.p);
+            }
         }
     case '?':
         if (!missing)
