@@ -11918,6 +11918,18 @@ static void cmd_declare(int argc, char **argv) {
          * does -- unless -g. tsh's declare always wrote the variable it
          * could see, so `f() { declare v=in; }` changed the caller's v. */
         bool make_local = (g_fn_depth > 0) && !set_global;
+        /* -x of a global keeps a prefix assignment's binding, as export
+         * does: `FOO='$$' declare -x FOO` leaves FOO exported (bash's
+         * builtins.tests; logs/b42 blt1 b3) -- tsh dropped it */
+        if (set_export && !make_local) {
+            size_t xl = env_key_len(argv[i]);
+            xl = argv[i][xl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            SH_SB(xn);
+            if (sb_putmem(&xn, argv[i], xl) == 0) {
+                struct shell_prefix_one *tb = shell_tempenv_find(xn.p, 0);
+                if (tb) tb->keep = true;
+            }
+        }
         /* -g OF A NAME A LOCAL HIDES does the GLOBAL variable's work: `g=glob;
          * f() { local g=loc; declare -g g=new; }` sets the global and leaves
          * the local; tsh wrote the local (bash; logs/b41 nref17 t3). The
