@@ -9396,6 +9396,10 @@ struct shell_prefix_one {
     bool  was_exported;
     unsigned char prev_flags;   /* the old entry's flags, when `had` */
     bool  dead;                 /* removed by `unset`; see g_tempenv */
+    /* EXPORTED while it was bound: the binding outlives the command --
+     * `f() { export x; }; x=4 f` leaves x=4, exported (bash's varenv2.sub;
+     * logs/b42 venv1 n11 n12). tsh put the old x back. */
+    bool  keep;
     unsigned long seq;          /* g_scope_seq when it was bound */
     /* A reference with no target, bound as a plain variable for the
      * command; its entry, -n and all, is put back after (see
@@ -10975,6 +10979,15 @@ static void cmd_export(int argc, char **argv) {
         }
         size_t klen = env_key_len(argv[i]);
         size_t nlen = env_assign_name_len(argv[i]);   /* `e+=foo` -> `e` */
+        /* a prefix assignment's binding exported is kept (see
+         * shell_prefix_one.keep) */
+        if (!unexport) {
+            SH_SB(tn);
+            if (sb_putmem(&tn, argv[i], nlen) == 0) {
+                struct shell_prefix_one *tb = shell_tempenv_find(tn.p, 0);
+                if (tb) tb->keep = true;
+            }
+        }
         if (unexport && shell_name_is_valid(argv[i], nlen)) {
             shell_xt_decl_assign(argv[i], klen);
             if (argv[i][klen] == '=' && env_set_kv(argv[i]) < 0) {
@@ -41165,6 +41178,7 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
         o->had  = (old != 0);
         o->prev = old ? shell_strdup(old) : 0;
         o->dead = false;
+        o->keep = false;
         o->seq  = g_scope_seq + 1;
         if (!o->ref_plain) {
             o->prev_flags = 0;
@@ -41200,7 +41214,7 @@ static void shell_prefix_restore(struct shell_prefix_save *sv) {
         struct shell_prefix_one *o = &sv->v[i];
         /* `unset` removed it (shell_unset_dynamic), or a local of the same
          * scope took it over: what it hid is already back. */
-        if (o->dead) {
+        if (o->dead || o->keep) {
             kfree(o->prev);
             kfree(o->name);
             continue;
