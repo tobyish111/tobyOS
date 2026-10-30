@@ -4557,6 +4557,8 @@ static bool g_assign_expand_sub;
 static bool g_assign_key_literal;
 static bool shell_assoc_expand_once(void);
 static bool shell_word_written_arrref(const char *w);
+/* Set while [[ ]] asks test_unary: its word was expanded once already. */
+static bool g_test_from_dbr;
 
 static bool shell_nameref_elem_target(const char *name, struct shell_sb *out);
 
@@ -23599,6 +23601,14 @@ static int test_unary(const char *op, const char *operand) {
             if (sh_array_is_assoc(nm)) {
                 /* the key is a word, expanded now: test -v 'A[$k]' asks
                  * about A's key $k (bash; Oils 0214) */
+                /* ...but in [[ ]] the word was expanded once already and
+                 * the key is what it says -- `[[ -v A[$k] ]]` with k='$v'
+                 * asks about the key $v -- and test's word must be one
+                 * bash's check passes, `test -v "A[a]b]"` false (bash's
+                 * assoc9.sub; logs/b42 akeys k9 k10, areparse r12) */
+                if (g_test_from_dbr || shell_elem_key_literal(operand))
+                    return sh_array_get_key(nm, sub) ? 0 : 1;
+                if (!shell_array_ref_text_ok(operand, strlen(operand))) return 1;
                 SH_SB(kx);
                 const char *k = sh_ar_assoc_key(sub, &kx);
                 return sh_array_get_key(nm, k ? k : sub) ? 0 : 1;
@@ -44671,7 +44681,10 @@ static int shell_dbr_primary(struct shell_dbr *d) {
             const char *v = shell_dbr_val(d, at);
             if (d->xerr) return 0;
             if (g_opt_xtrace) shell_xt_cond(inv, t, v, 0, false);
-            return test_unary(t, v) == 0;
+            g_test_from_dbr = true;
+            int ur = test_unary(t, v);
+            g_test_from_dbr = false;
+            return ur == 0;
         }
     }
     if (d->lit[d->pos] && test_is_unary_op(t) && d->pos + 1 < d->n) {
@@ -44700,7 +44713,10 @@ static int shell_dbr_primary(struct shell_dbr *d) {
             const char *v = shell_dbr_val(d, at);
             if (d->xerr) return 0;
             if (g_opt_xtrace) shell_xt_cond(inv, t, v, 0, false);
-            return test_unary(t, v) == 0;
+            g_test_from_dbr = true;
+            int ur = test_unary(t, v);
+            g_test_from_dbr = false;
+            return ur == 0;
         }
     }
 
