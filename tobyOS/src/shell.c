@@ -11609,6 +11609,7 @@ static void cmd_declare(int argc, char **argv) {
     bool func_mode = false;    /* -f or -F: this is about FUNCTIONS */
     bool set_trace = false, clear_trace = false;   /* -t / +t */
     bool func_names = false;   /* -F: names only, no bodies */
+    char func_bad = '\0';      /* the first -a -A -i -n, refused with -f */
     int i = 1;
     for (; i < argc; i++) {
         char sign = argv[i][0];
@@ -11647,6 +11648,9 @@ static void cmd_declare(int argc, char **argv) {
             case 'I': if (on) set_inherit = true; break;
             default:  bad = *f; break;
             }
+            if (on && !func_bad && (*f == 'a' || *f == 'A' || *f == 'i' ||
+                                    *f == 'n'))
+                func_bad = *f;
         }
         if (bad) {
             /* AN UNKNOWN OPTION IS A USAGE ERROR, STATUS 2 -- not a name.
@@ -11676,6 +11680,14 @@ static void cmd_declare(int argc, char **argv) {
      * that name does not count, which is what `func2=x; declare -f func2`
      * turns on. */
     if (func_mode) {
+        /* -a -A -i -n mean nothing for a function: "-a: invalid option",
+         * status 1, no usage line (bash's errors.tests; logs/b42 errs2 f3).
+         * tsh listed the functions. */
+        if (func_bad) {
+            kprintf("%s: -%c: invalid option\n", argv[0], func_bad);
+            shell_set_status(1);
+            return;
+        }
         if (i >= argc) {
             /* Sorted by name. bash's order is plain byte order -- `__ec`
              * before `_ab` before `add` -- not definition order. */
@@ -11714,16 +11726,39 @@ static void cmd_declare(int argc, char **argv) {
         }
         bool missing = false;
         for (; i < argc; i++) {
+            /* NAME=VALUE cannot define one, and the builtin stops there,
+             * status 1 (bash's errors.tests; logs/b42 errs2 f4) -- tsh
+             * failed it without a word and went on */
+            {
+                const char *eq = argv[i];
+                while (*eq && *eq != '=') eq++;
+                if (*eq) {
+                    kprintf("%s: cannot use `-f' to make functions\n", argv[0]);
+                    shell_set_status(1);
+                    return;
+                }
+            }
             const struct shell_function *fn = shell_function_lookup(argv[i]);
             if (!fn) { missing = true; continue; }
             /* `declare -fx NAME` / `+fx` set the attribute and print nothing,
-             * and so do -ft / +ft (the trace attribute) */
-            if (set_export || clear_export || set_trace || clear_trace) {
+             * and so do -ft / +ft (the trace attribute), -fr, and any other
+             * attribute letter; +r of a readonly function is "NAME: readonly
+             * function", status 1. tsh printed the function for -fr, +r, -l
+             * and -u (bash's errors.tests; logs/b42 errs2 f2 f3). */
+            if (set_export || clear_export || set_trace || clear_trace ||
+                set_readonly || clear_readonly || attr_on || attr_off) {
                 int fi = shell_function_find(argv[i]);
+                if (fi >= 0 && clear_readonly && g_functions[fi].readonly) {
+                    kprintf("%s: %s: readonly function\n", argv[0], argv[i]);
+                    missing = true;
+                    continue;
+                }
                 if (fi >= 0 && (set_export || clear_export))
                     g_functions[fi].exported = set_export;
                 if (fi >= 0 && (set_trace || clear_trace))
                     g_functions[fi].traced = set_trace;
+                if (fi >= 0 && set_readonly)
+                    g_functions[fi].readonly = true;
                 continue;
             }
             /* under `shopt -s extdebug`, `declare -F NAME` gives the line
