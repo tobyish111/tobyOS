@@ -3299,6 +3299,7 @@ static void shell_dynvar_assign(int dv, const char *val) {
 
 static void shell_optvars_refresh(void);
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
+static const char *shell_skip_dollar_group(const char *p);
 static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
 static void shell_global_exchange(int si);
 static bool shell_nameref_names_self(const char *v, const char *name);
@@ -4044,10 +4045,34 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         if (elem[0] == '[') {
             /* THE `]` THAT CLOSES THE `[`: a key may index the array itself,
              * `[a[0]]=10` (Oils 0245), and the first `]` cut it short. */
+            /* ...and not one quoted, escaped or in a `$(...)`: `["a]b"]=1`,
+             * `[c\]d]=2`, `["bar[bie"]=doll` and `[$(echo ])]=v` are keys,
+             * which tsh stored as bare words (bash's assoc6.sub,
+             * assoc9.sub, assoc11.sub; logs/b42 asub q3 q4 q7 q9) */
             char *rb = 0;
             {
                 int bd = 0;
                 for (char *q = elem; *q; q++) {
+                    if (*q == '\\' && q[1]) { q++; continue; }
+                    if (*q == '$' && (q[1] == '(' || q[1] == '{')) {
+                        const char *e = shell_skip_dollar_group(q);
+                        if (!e) break;
+                        q = elem + (e - elem) - 1;
+                        continue;
+                    }
+                    if (*q == '$' && q[1] == '\'') {
+                        for (q += 2; *q && *q != '\''; q++)
+                            if (*q == '\\' && q[1]) q++;
+                        if (!*q) break;
+                        continue;
+                    }
+                    if (*q == '\'' || *q == '"' || *q == '`') {
+                        char qc = *q;
+                        for (q++; *q && *q != qc; q++)
+                            if (qc != '\'' && *q == '\\' && q[1]) q++;
+                        if (!*q) break;
+                        continue;
+                    }
                     if (*q == '[') bd++;
                     else if (*q == ']' && --bd == 0) { rb = q; break; }
                 }
