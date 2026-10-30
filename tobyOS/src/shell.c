@@ -9078,10 +9078,19 @@ static bool sh_array_is_assoc(const char *name) {
  * left with no keys, `declare -p` printed `[]="1"` -- and a scalar's value
  * was dropped (Oils 0251 0253). */
 static int sh_array_absorb_scalar(const char *name);
-static int shell_decl_convert(const char *name, bool assoc, const char *label) {
+/* PRE, when not 0, says the refusal first under the command bash's own
+ * declare of a compound value reports under, as the readonly refusal does:
+ * `f() { declare -A w+=([0]=X); }` over an indexed w is "f: w: cannot
+ * convert ..." and then "declare: w: ..." (bash's varenv14.sub; logs/b42
+ * linherit i9). */
+static int shell_decl_convert(const char *name, bool assoc, const char *label,
+                              const char *pre) {
     struct sh_array *a = sh_array_find(name);
     if (a) {
         if (assoc && !a->assoc) {
+            if (pre)
+                kprintf("%s: %s: cannot convert indexed to associative array\n",
+                        pre, name);
             kprintf("%s: %s: cannot convert indexed to associative array\n",
                     label, name);
             return -1;
@@ -9702,6 +9711,48 @@ static int shell_local_list_pre(const char *val, bool assoc, struct shell_sb *ou
     return out->p ? 0 : -1;
 }
 
+/* A LOCAL THAT INHERITS -- `local -I NAME`, `declare -I NAME` in a function,
+ * or any new local under `shopt -s localvar_inherit` -- starts as a copy of
+ * the variable it hides: its value and its attributes but -n, its elements.
+ * tsh took -I and the option and started the local empty (bash's
+ * varenv14.sub, varenv17.sub; logs/b42 linherit). SI is the record the push
+ * just made. False when there was nothing to inherit: the local is then an
+ * ordinary new one, declared with no value. */
+static bool shell_local_inherit(int si) {
+    struct shell_local_save *sv = &g_locals[si];
+    size_t nl = strlen(sv->name);
+    bool got = false;
+    if (sv->existed && sv->kv && !(sv->flags & SHVAR_NAMEREF)) {
+        got = true;
+        int ix = env_find(sv->name, nl);
+        if (ix >= 0) env_remove_at(ix);
+        (void)env_set_attr_holder(sv->name);
+        ix = env_find(sv->name, nl);
+        if (ix >= 0) {
+            char *blob = shell_strdup(sv->kv);
+            if (blob) {
+                kfree(g_env[ix]);
+                g_env[ix] = blob;
+            }
+            g_env_flags[ix] = sv->flags;
+        }
+    }
+    if (sv->arr_existed && sv->arr_saved) {
+        got = true;
+        sh_array_unset_literal(sv->name);
+        struct sh_array *cp = (struct sh_array *)kmalloc(sizeof *cp);
+        if (cp && (sh_array_copy_into(cp, sv->arr_saved) < 0 ||
+                   sh_array_table_add(cp) < 0)) {
+            sh_array_contents_free(cp);
+            kfree(cp);
+        }
+    }
+    return got;
+}
+
+/* Does a new local inherit (see shell_local_inherit)? */
+static bool shell_localvar_inherit(void);
+
 /* Is the binding of `name` a CALLER's local -- the newest live local of the
  * name made below `depth`? */
 static bool shell_local_of_caller(const char *name, int depth) {
@@ -10230,6 +10281,7 @@ static void cmd_local(int argc, char **argv) {
      * not there (logs/b13 q16 q18). -g, -f and -F are declare's business. */
     bool l_array = false, l_assoc = false, l_nameref = false;
     bool l_export = false, l_unexport = false, l_readonly = false;
+    bool l_inherit = false;                 /* -I */
     unsigned l_attr_on = 0, l_attr_off = 0;
     int first = 1;
     for (; first < argc; first++) {
@@ -10250,7 +10302,8 @@ static void cmd_local(int argc, char **argv) {
             case 'u': if (on) l_attr_on |= SHVAR_UPPER;   else l_attr_off |= SHVAR_UPPER;   break;
             case 'x': if (on) l_export = true; else l_unexport = true; break;
             case 'r': if (on) l_readonly = true; break;
-            case 'p': case 't': case 'I': break;
+            case 'I': if (on) l_inherit = true; break;
+            case 'p': case 't': break;
             case 'g': case 'f': case 'F': {
                 char *a0 = argv[0];
                 argv[0] = (char *)"local";
@@ -10412,7 +10465,9 @@ static void cmd_local(int argc, char **argv) {
         if (has_value && !l_append && !l_nameref && !already) {
             const char *pv = argv[i] + env_key_len(argv[i]) + 1;
             if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
-                bool pa = l_assoc;
+                /* (a local that inherits an associative array is one) */
+                bool pa = l_assoc || ((l_inherit || shell_localvar_inherit()) &&
+                                      sh_array_is_assoc(name));
                 if (shell_local_list_pre(pv, pa, &prelist) < 0) {
                     shell_set_status(1);
                     if (g_shell_flow != SHELL_FLOW_NONE) return;
@@ -10426,6 +10481,10 @@ static void cmd_local(int argc, char **argv) {
             continue;
         }
         if (ro_caller && !already) shell_readonly_unmark(name, klen);
+        /* -I, or localvar_inherit: the local starts as what it hides */
+        if (!already && !l_nameref && (l_inherit || shell_localvar_inherit()) &&
+            shell_local_inherit(g_localc - 1))
+            inherit = true;
         /* a new local over a reference the function did not make is a
          * plain variable: `local ref=Y` of a global reference ref is ref=Y,
          * where tsh wrote Y through it (bash's nameref20.sub; logs/b41
@@ -10477,6 +10536,17 @@ static void cmd_local(int argc, char **argv) {
             (void)env_set_attr_holder(name);
         }
         if (l_array) {
+            /* a scalar the local inherited is element 0 of the array it is
+             * made: `s=X; f() { local -a s; }` under localvar_inherit is
+             * s=([0]="X"), where -a went on the scalar and hid it (bash's
+             * varenv14.sub; logs/b42 linherit) */
+            {
+                int sx = env_find(name, strlen(name));
+                if (sx >= 0 && !(g_env_flags[sx] & (SHVAR_ARRAY | SHVAR_NOVALUE |
+                                                    SHVAR_NAMEREF)) &&
+                    !sh_array_find(name))
+                    (void)sh_array_absorb_scalar(name);
+            }
             /* a holder only where there is no entry: an empty array has no
              * element 0 to read, and remaking its entry marked `local -a
              * m=()` unassigned again -- `declare -a m` (309) */
@@ -10535,6 +10605,8 @@ static bool g_shopt_misc[64] = {
 };
 /* assoc_expand_once (its slot in the table below) */
 static bool shell_assoc_expand_once(void) { return g_shopt_misc[25]; }
+/* localvar_inherit (its slot in the table below) */
+static bool shell_localvar_inherit(void) { return g_shopt_misc[19]; }
 /* WIRED: with `set -e` on, a command substitution inherits errexit and stops
  * at its first failure. `echo $(echo one; false; echo two)` prints `one`
  * with it and `one two` without. Off by default, as in bash. */
@@ -11386,6 +11458,7 @@ static void cmd_declare(int argc, char **argv) {
     bool set_array = false;
     bool set_assoc = false;
     bool set_global = false;   /* -g: never a local, even in a function */
+    bool set_inherit = false;  /* -I: a new local starts as what it hides */
     unsigned attr_on = 0, attr_off = 0;   /* -i -l -u (+i +l +u) */
     bool print_mode = false;
     bool any_opt = false;      /* any option letter at all was given */
@@ -11427,7 +11500,7 @@ static void cmd_declare(int argc, char **argv) {
             case 'l': if (on) attr_on |= SHVAR_LOWER;   else attr_off |= SHVAR_LOWER;   break;
             case 'u': if (on) attr_on |= SHVAR_UPPER;   else attr_off |= SHVAR_UPPER;   break;
             case 't': if (on) set_trace = true; else clear_trace = true; break;
-            case 'I': break;
+            case 'I': if (on) set_inherit = true; break;
             default:  bad = *f; break;
             }
         }
@@ -11942,7 +12015,8 @@ static void cmd_declare(int argc, char **argv) {
             has_value && !d_append && !nref && (!shell_readonly_key(name, klen) || ro_caller)) {
             const char *pv = argv[i] + env_key_len(argv[i]) + 1;
             if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
-                bool pa = set_assoc;
+                bool pa = set_assoc || ((set_inherit || shell_localvar_inherit()) &&
+                                        sh_array_is_assoc(name));
                 if (shell_local_list_pre(pv, pa, &prelist) < 0) {
                     shell_set_status(1);
                     if (g_shell_flow != SHELL_FLOW_NONE) return;
@@ -11981,6 +12055,11 @@ static void cmd_declare(int argc, char **argv) {
                 continue;
             }
             if (ro_caller) shell_readonly_unmark(name, klen);
+            /* -I, or localvar_inherit: the local starts as what it hides
+             * (shell_local_inherit) */
+            if (!nref && (set_inherit || shell_localvar_inherit()) &&
+                shell_local_inherit(g_localc - 1))
+                inherit = true;
             /* a fresh local starts with no value (bash, without
              * localvar_inherit) -- unless a prefix binding gives it one */
             if (!has_value && !inherit) {
@@ -12011,7 +12090,10 @@ static void cmd_declare(int argc, char **argv) {
             if (fx >= 0 && (g_env_flags[fx] & SHVAR_NAMEREF) && !g_env[fx][klen + 1])
                 g_env_flags[fx] &= ~(unsigned char)SHVAR_NAMEREF;
         }
-        if (set_array && shell_decl_convert(name, set_assoc, argv[0]) < 0) {
+        if (set_array &&
+            shell_decl_convert(name, set_assoc, argv[0],
+                               (has_value && argv[i][env_key_len(argv[i]) + 1] == '(')
+                                   ? g_decl_cmd_name : 0) < 0) {
             shell_set_status(1);
             continue;
         }
