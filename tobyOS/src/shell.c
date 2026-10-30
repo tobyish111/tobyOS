@@ -35846,7 +35846,21 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          *
          * (tools/agent/probes/prefix-visibility.sh). The command itself sees
          * them -- its frame applies them -- but its words do not. */
-        if (!(prefix_ok && g_tok_word_assign_src)) g_tokpfx_n = g_tokpfx_base;
+        /* ...but under `set -k` an assignment word ANYWHERE is one of the
+         * command's, and sees those before it, as a prefix word does: with
+         * $ECHO empty, `HOME=/a/b/c $ECHO a=$HOME` sets a to /a/b/c. Any
+         * other word still sees none of them, for its own expansion only.
+         * tsh dropped them at the first word that was no assignment (bash's
+         * varenv.tests; logs/b42 setk). */
+        int kw_hidden = -1;
+        if (g_opt_keyword && !decl_util_cmd) {
+            if (!g_tok_word_assign_src) {
+                kw_hidden = g_tokpfx_n;
+                g_tokpfx_n = g_tokpfx_base;
+            }
+        } else if (!(prefix_ok && g_tok_word_assign_src)) {
+            g_tokpfx_n = g_tokpfx_base;
+        }
         /* LITERAL TEXT IS NEVER A FIELD DELIMITER. POSIX 2.6.5 splits the
          * RESULTS of expansion, never the characters that were written down:
          *
@@ -36298,6 +36312,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         }
         SH_LIT_CLOSE();
 #undef SH_LIT_CLOSE
+        if (kw_hidden >= 0) g_tokpfx_n = kw_hidden;         /* set -k: see above */
 
         if (got) {
             /* The finished word moves to storage that never moves again --
@@ -36312,7 +36327,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              * g_tokpfx. `prefix_ok` is the same command-position rule the
              * rest of the shell runs on: a word that is not an assignment
              * ends the prefix, and a separator starts a new one. */
-            if (prefix_ok && g_tok_word_assign_src) {
+            if ((prefix_ok || (g_opt_keyword && !decl_util_cmd)) &&
+                g_tok_word_assign_src) {
                 if (g_tokpfx_n >= g_tokpfx_cap) {
                     int ncap = g_tokpfx_cap ? g_tokpfx_cap * 2 : 8;
                     char **nt = (char **)kmalloc((size_t)ncap * sizeof(char *));
