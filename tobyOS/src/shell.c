@@ -10873,7 +10873,14 @@ static void cmd_declare(int argc, char **argv) {
          * word is NAME's target with the rest of it, for this name only. */
         SH_SB(rearg);
         struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
-        if (!nref && !clear_nameref) {
+        /* `declare +n -i foo=7+4`: +n takes the attribute off foo, and the
+         * -i and the value go to what foo named, as any other attribute
+         * does; +n alone is foo's (bash; logs/b41 nref9 i2 i3, bash's
+         * nameref19.sub). */
+        bool plus_n_on = clear_nameref &&
+            (attr_on || attr_off || set_export || clear_export || set_readonly ||
+             set_array || argv[i][env_key_len(argv[i])] == '=');
+        if (!nref && (!clear_nameref || plus_n_on)) {
             size_t nl = env_key_len(argv[i]);
             nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(rn);
@@ -10883,6 +10890,10 @@ static void cmd_declare(int argc, char **argv) {
                 const char *real = env_deref_name_ex(rn.p, &tg, false);
                 if (real && real != rn.p && !g_nameref_circular &&
                     sb_set(&rearg, real) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                    if (clear_nameref) {
+                        int fx = env_find(rn.p, nl);
+                        if (fx >= 0) g_env_flags[fx] &= ~(unsigned char)SHVAR_NAMEREF;
+                    }
                     ras.slot = &argv[i];
                     ras.orig = argv[i];
                     argv[i] = rearg.p;
@@ -11161,7 +11172,10 @@ static void cmd_declare(int argc, char **argv) {
                 }
                 continue;
             }
-        } else if (!env_get(name)) {
+        } else if (env_find(name, klen) < 0 && !env_get(name)) {
+            /* (a reference has an entry of its own: env_get reads through
+             * it, and `declare +n foo` of a reference to an unset bar made
+             * bar -- bash; logs/b41 nref9 i2) */
             if (env_set_attr_holder(name) < 0) { shell_set_status(1); continue; }
         }
         /* READONLY IS ON THE NAME, scalar or array. It was marked only
