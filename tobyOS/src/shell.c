@@ -11297,6 +11297,7 @@ static int shell_dyn_list_names(const char **names, int n, bool with_cell) {
 
 /* Print one `declare` line. Returns false when the name is not set at all,
  * which is the caller's cue to report it and set status 1. */
+static bool g_declare_as_readonly;     /* see shell_declare_print */
 static bool shell_declare_print(const char *name) {
     size_t klen = strlen(name);
     /* THE DYNAMIC VARIABLES PRINT AS bash's DO, with the value they have
@@ -11337,7 +11338,8 @@ static bool shell_declare_print(const char *name) {
          * attribute alone -- `readonly -a e; declare -p e` is
          * `declare -r e`. */
         if (shell_readonly_find(name, klen) >= 0) {
-            shell_printf("declare -r %s\n", name);
+            shell_printf(g_declare_as_readonly ? "readonly %s\n" : "declare -r %s\n",
+                         name);
             return true;
         }
         return false;
@@ -11356,14 +11358,28 @@ static bool shell_declare_print(const char *name) {
     if (f & SHVAR_LOWER)    fl[fn++] = 'l';    /* bash: after x, c l u */
     if (f & SHVAR_UPPER)    fl[fn++] = 'u';
     fl[fn] = '\0';
+    /* POSIX MODE'S readonly LISTING is `readonly -a a=(...)`, `readonly
+     * x="1"`: the word readonly and the attributes but r (bash's
+     * array.tests; logs/b42 rolist) -- g_declare_as_readonly */
+    char lead[24];
+    if (g_declare_as_readonly) {
+        size_t o = 0;
+        for (size_t k = 0; k < fn; k++)
+            if (fl[k] != 'r') fl[o++] = fl[k];
+        fl[o] = '\0';
+        fn = o;
+        ksnprintf(lead, sizeof lead, "readonly%s%s", fn ? " -" : "", fn ? fl : "");
+    } else {
+        ksnprintf(lead, sizeof lead, "declare -%s", fn ? fl : "-");
+    }
     /* Declared, no value: the attributes alone (`declare -- x`,
      * `declare -a a`) -- until an array has a record of its own, which
      * `a=()` gives it (`declare -a a=()`). */
     if ((f & SHVAR_NOVALUE) && (!arr || arr->n == 0)) {
-        shell_printf("declare -%s %s\n", fn ? fl : "-", name);
+        shell_printf("%s %s\n", lead, name);
         return true;
     }
-    shell_printf("declare -%s %s=", fn ? fl : "-", name);
+    shell_printf("%s %s=", lead, name);
 
     if (is_arr) {
         int n = arr ? arr->n : 0;
@@ -12314,13 +12330,41 @@ static void cmd_readonly(int argc, char **argv) {
             return;
         }
         (void)opt_p;
+        /* SORTED, as bash lists variables, and -a or -A lists only the
+         * readonly arrays of that kind: `readonly -a` printed every
+         * readonly name, SHELLOPTS and UID among them, in the order they
+         * were marked; in posix mode the form is `readonly -a a=(...)`
+         * (bash's array.tests; logs/b42 rolist) */
+        const char **ln __attribute__((cleanup(shell_kfree_ptr))) =
+            (const char **)kmalloc((size_t)(g_nreadonly + 1) * sizeof *ln);
+        if (!ln) { shell_set_status(1); return; }
+        int n = 0;
         for (int i = 0; i < g_nreadonly; i++) {
             if (!g_readonly[i]) continue;
+            if (opt_a || opt_A) {
+                const char *nm = g_readonly[i];
+                int ix = env_find(nm, strlen(nm));
+                struct sh_array *ar = sh_array_find(nm);
+                bool assoc = ar && ar->assoc;
+                bool isarr = ar || (ix >= 0 && (g_env_flags[ix] & SHVAR_ARRAY));
+                if (!isarr || (opt_A && !assoc) || (opt_a && !opt_A && assoc))
+                    continue;
+            }
+            ln[n++] = g_readonly[i];
+        }
+        for (int a = 1; a < n; a++) {
+            const char *v = ln[a];
+            int b = a - 1;
+            while (b >= 0 && strcmp(ln[b], v) > 0) { ln[b + 1] = ln[b]; b--; }
+            ln[b + 1] = v;
+        }
+        g_declare_as_readonly = g_opt_posix;
+        for (int a = 0; a < n; a++)
             /* bash's reinput form -- `declare -r x="1"`, `declare -ar
              * r=(...)`, `declare -r e` for one that is marked but unset. */
-            if (!shell_declare_print(g_readonly[i]))
-                shell_printf("declare -r %s\n", g_readonly[i]);
-        }
+            if (!shell_declare_print(ln[a]))
+                shell_printf(g_opt_posix ? "readonly %s\n" : "declare -r %s\n", ln[a]);
+        g_declare_as_readonly = false;
         return;
     }
 
