@@ -36026,14 +36026,17 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         int explicit_fd = -1;
         const char *redir_p = p;
         if (shell_is_digit(*redir_p)) {
-            int n = 0;
+            /* ...that fits an int: `1111111111111111111111</dev/stdin` is a
+             * command of that name (bash's new-exp; logs/b42 nexp x5),
+             * where tsh's count overflowed into some descriptor */
+            long n = 0;
             const char *d = redir_p;
             while (shell_is_digit(*d)) {
-                n = n * 10 + (*d - '0');
+                if (n <= 0x7fffffffL) n = n * 10 + (*d - '0');
                 d++;
             }
-            if (*d == '<' || *d == '>') {
-                explicit_fd = n;
+            if ((*d == '<' || *d == '>') && n <= 0x7fffffffL) {
+                explicit_fd = (int)n;
                 p = d;
             }
         } else if (*redir_p == '{' && shell_var_start(redir_p[1])) {
