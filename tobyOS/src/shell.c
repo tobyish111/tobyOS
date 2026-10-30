@@ -22604,6 +22604,17 @@ static void cmd_exit(int argc, char **argv) {
     if (g_script_depth > 0 || g_subshell_depth > 0)
 #endif
     {
+        /* THE EXIT TRAP RUNS WHERE exit IS CALLED: in a function, the
+         * function's frame is the one it sees -- $FUNCNAME, the function's
+         * locals -- and it is then spent. tsh unwound to the top first, so
+         * the trap's $FUNCNAME was "" and its locals the caller's (bash's
+         * varenv22.sub; logs/b42 trapfn). */
+        if (g_fn_depth > 0 && !g_trap_running && shell_trap_live(0) &&
+            *shell_trap_live(0)) {
+            st = shell_run_exit_trap(st);
+            shell_trap_unset(0);
+            shell_set_status(st);
+        }
         g_shell_flow = SHELL_FLOW_EXIT;
         g_shell_flow_status = st;
     }
