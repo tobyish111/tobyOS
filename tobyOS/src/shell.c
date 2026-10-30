@@ -29337,10 +29337,34 @@ static void shell_alias_restore(struct shell_alias_save *sv) {
  * The WHOLE FILE, as bash reads it. This used to stop at the capture buffer,
  * so `x=$(<f)` on a 274 KB file gave a truncated value with no message at
  * all. A NUL is dropped, not kept, for the reason the spill reader gives. */
+static int shell_tokenize(const char *src, struct shell_token **out_tok,
+                          int *out_ntok, struct shell_words *words);
+static const char *shell_redir_word(struct shell_pipeline *pl,
+                                    const struct shell_token *t,
+                                    bool *ambiguous);
 static int shell_capture_read_file(const char *word, struct shell_sb *out) {
+    /* THE WORD IS A REDIRECTION'S: brace-expanded, split and globbed, and
+     * then one word -- `$(< a.x*)` reads the one match; two, `a{1,2}`, and
+     * $f holding 'a b' or nothing are "WORD: ambiguous redirect", WORD as
+     * written (bash's new-exp; logs/b42 nexp8). tsh only expanded it. */
+    SH_SB(line);
+    if (sb_puts(&line, "< ") < 0 || sb_puts(&line, word) < 0) return -1;
+    struct shell_token *tok = 0;
+    SH_WORDS(words);
+    int ntok = 0;
+    if (shell_tokenize(line.p, &tok, &ntok, &words) < 0) return -1;
+    if (ntok < 2 || tok[1].type != SH_TOK_WORD) return -1;
+    struct shell_pipeline *pl = shell_pipeline_new();
+    if (!pl) return -1;
+    bool amb = false;
     SH_SB(path);
-    if (shell_expand_word_ex(word, &path, true, true) < 0) return -1;
-    shell_strip_nosplit_inplace(path.p);
+    const char *rw = shell_redir_word(pl, &tok[1], &amb);
+    int prc = rw ? sb_set(&path, rw) : -1;
+    shell_pipeline_free(pl);
+    if (amb)
+        kprintf(SH_PFX_SHELL "%s: ambiguous redirect\n",
+                tok[1].raw ? tok[1].raw : word);
+    if (prc < 0) return -1;
     struct file *f = shell_open_vfs_file(path.p, false, false, "shell");
     if (!f) return -1;
     sb_truncate(out, 0);
