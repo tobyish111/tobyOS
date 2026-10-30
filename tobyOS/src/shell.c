@@ -36155,6 +36155,26 @@ static bool shell_kv_scalar_paren(const char *kv, const char *val) {
  * as bash's skipsubscript does -- `A[']']=7` is an assignment to the key
  * `]`. The plain scan ended the subscript at the quoted `]`, called the
  * word a command, and tsh then ran it as one (shparity 227b). */
+/* Past a `$(...)` or `${...}` at P (P at the `$`), its quotes and escapes
+ * skipped and its own groups counted; 0 when it is not closed. */
+static const char *shell_skip_dollar_group(const char *p) {
+    char open = p[1], close = open == '(' ? ')' : '}';
+    int d = 0;
+    for (p++; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char q = *p;
+            for (p++; *p && *p != q; p++)
+                if (q != '\'' && *p == '\\' && p[1]) p++;
+            if (!*p) return 0;
+            continue;
+        }
+        if (*p == open) d++;
+        else if (*p == close && --d == 0) return p + 1;
+    }
+    return 0;
+}
+
 static size_t shell_assign_prefix_len_raw(const char *w) {
     const char *p = w;
     if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
@@ -36166,6 +36186,15 @@ static size_t shell_assign_prefix_len_raw(const char *w) {
         int d = 0;
         for (; *p; p++) {
             if (*p == '\\' && p[1]) { p++; continue; }
+            /* a `$(...)` or `${...}` is skipped whole: `K[$(echo ])]=def`
+             * is an assignment, which tsh ran as a command (bash's
+             * assoc5.sub; logs/b42 asub q10 q14) */
+            if (*p == '$' && (p[1] == '(' || p[1] == '{')) {
+                const char *e = shell_skip_dollar_group(p);
+                if (!e) return 0;
+                p = e - 1;
+                continue;
+            }
             if (*p == '$' && p[1] == '\'') {      /* `$'...'`: \' inside */
                 for (p += 2; *p && *p != '\''; p++)
                     if (*p == '\\' && p[1]) p++;
