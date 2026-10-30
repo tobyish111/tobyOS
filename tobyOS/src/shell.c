@@ -11171,7 +11171,12 @@ static void cmd_declare(int argc, char **argv) {
         }
         if (has_value) {
             g_readonly_hit = false;
-            g_decl_paren_array = set_array || sh_array_find(name) != 0;
+            /* ...a NAME only declared an array is one too: `declare -a c;
+             * declare c='(1 2)'` is c=(1 2), as bash's (logs/b41 nref9 i6) */
+            int pax = env_find(name, klen);
+            g_decl_paren_array = set_array || sh_array_find(name) != 0 ||
+                (pax >= 0 && (g_env_flags[pax] & SHVAR_ARRAY) &&
+                 !(g_env_flags[pax] & SHVAR_NAMEREF));
             int dsrc = env_set_kv(argv[i]);
             g_decl_paren_array = false;
             if (dsrc < 0) {
