@@ -9446,7 +9446,11 @@ static void shell_local_restore_scalar(const struct shell_local_save *sv) {
     shell_path_var_written(sv->name, klen);     /* a local PATH ends */
     /*     f() { local -r x=1; }; f; x=2; echo $x      bash: 2
      * tsh: "x: readonly variable" -- the mark outlived the local. */
+    /* ...and a global made readonly while the local hid it (declare -gr
+     * past a local, shell_global_exchange) is readonly when it comes back
+     * (logs/b42 declg g8) */
     if (!sv->was_readonly) shell_readonly_unmark(sv->name, klen);
+    else (void)shell_readonly_mark(sv->name, klen);
     int idx = env_find(sv->name, klen);
     if (sv->existed) {
         char *blob = shell_strdup(sv->kv);
@@ -11268,6 +11272,31 @@ static void cmd_declare(int argc, char **argv) {
          * does -- unless -g. tsh's declare always wrote the variable it
          * could see, so `f() { declare v=in; }` changed the caller's v. */
         bool make_local = (g_fn_depth > 0) && !set_global;
+        /* -g OF A NAME A LOCAL HIDES does the GLOBAL variable's work: `g=glob;
+         * f() { local g=loc; declare -g g=new; }` sets the global and leaves
+         * the local; tsh wrote the local (bash; logs/b41 nref17 t3). The
+         * global binding is swapped in for this word (shell_global_exchange),
+         * so a global reference is followed as at the top level. */
+        struct shell_circ_swap gsw __attribute__((cleanup(shell_circ_swap_put))) = { -1, false };
+        if (set_global && g_fn_depth > 0) {
+            size_t gl = env_key_len(argv[i]);
+            gl = argv[i][gl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            /* (not an element operand: `declare -g g[1]=B` past a local
+             * leaves the global as it is, bash; declg g7) */
+            size_t bl = 0;
+            while (bl < gl && argv[i][bl] != '[') bl++;
+            SH_SB(gn);
+            if (bl > 0 && bl == gl && shell_name_is_valid(argv[i], bl) &&
+                sb_putmem(&gn, argv[i], bl) == 0) {
+                int gs = shell_local_oldest(gn.p);
+                if (gs >= 0) {
+                    gsw.si = gs;
+                    gsw.was = g_circ_busy;
+                    shell_global_exchange(gs);
+                    g_circ_busy = true;
+                }
+            }
+        }
         /* AN EXISTING REFERENCE PASSES declare's WORK ON to the variable at
          * the end of its chain -- `declare -i r`, -x, +x, -a, -A, -l, -u, a
          * value -- unless this declare makes or unmakes it a reference. In
@@ -11285,7 +11314,8 @@ static void cmd_declare(int argc, char **argv) {
         bool plus_n_on = clear_nameref &&
             (attr_on || attr_off || set_export || clear_export || set_readonly ||
              set_array || argv[i][env_key_len(argv[i])] == '=');
-        if (!nref && (!clear_nameref || plus_n_on) && set_global && g_fn_depth > 0) {
+        if (gsw.si < 0 && !nref && (!clear_nameref || plus_n_on) && set_global &&
+            g_fn_depth > 0) {
             /* -g in a function resolves the name as the GLOBAL scope has
              * it: `declare -g ref=(X)` writes what a global reference names,
              * not what a local ref of the same name does (bash's
