@@ -32790,6 +32790,19 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * this `!`. It has to be tested before anything else here: the
              * only thing separating it from an indirection with a transform
              * (${!ref@Q}) is that the `@` ends the expression. */
+            /* ...whose prefix is a NAME, and which ends at its `*` or `@`:
+             * `${!1*}`, `${!@*}` and `${!_Q* }` are bad substitutions,
+             * where tsh listed nothing or tried an indirection (bash's
+             * new-exp3.sub; logs/b42 nexp x6 x7) */
+            if ((rest[0] == '@' || rest[0] == '*') && rest[1] == '\0' &&
+                !shell_var_start(rname.p[0])) {
+                shell_bad_subst(false);
+                return -1;
+            }
+            if (rest[0] == '*' && rest[1] != '\0') {
+                shell_bad_subst(false);
+                return -1;
+            }
             if ((rest[0] == '@' || rest[0] == '*') && rest[1] == '\0')
                 return shell_expand_name_prefix(rname.p, rest[0] == '*',
                                                 b);
