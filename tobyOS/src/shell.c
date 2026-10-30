@@ -32467,8 +32467,10 @@ static int shell_expand_element_op(const char *nm, const char *sub,
                                    size_t slen, const char *suffix,
                                    struct shell_sb *b) {
     /* ${a[0]@a}: the ARRAY's attributes, not the scratch copy's (Oils 2436
-     * 2437) */
-    if (strcmp(suffix, "@a") == 0 && sh_array_find(nm))
+     * 2437) -- and a scalar's, all of them: `declare -rl V; ${V[0]@a}` is
+     * rl, where the scratch carried only the l (logs/b42 nexp10 q3) */
+    if (strcmp(suffix, "@a") == 0 &&
+        (sh_array_find(nm) || env_find(nm, strlen(nm)) >= 0))
         return shell_expand_at_transform(nm, 'a', b);
     SH_SB(subbuf);
     if (sb_putmem(&subbuf, sub, slen) < 0) return -1;
@@ -33364,6 +33366,16 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         bool at_a = strcmp(suffix, "@a") == 0;
                         if (at_a && shell_expand_at_transform(nm, 'a', &attrs) < 0)
                             return -1;
+                        /* ...and once for a name declared and never given a
+                         * value, which has no elements: `declare -rl V;
+                         * ${V[@]@a}` is rl, `declare -A m; ${m[@]@a}` A
+                         * (bash's new-exp13.sub; logs/b42 nexp10 q3,
+                         * nexp12) -- where tsh gave nothing */
+                        if (at_a && !shell_var_has_value(nm) &&
+                            (arr || env_find(nm, strlen(nm)) >= 0)) {
+                            if (!star && sh_put_lead_mark(b) < 0) return -1;
+                            return sb_put_data_str(b, attrs.p ? attrs.p : "");
+                        }
                         struct sh_sep sep;
                         /* a substitution or a case change: IFS's in a here-document too,
                          * unless the body has an "@" expansion (302) */
