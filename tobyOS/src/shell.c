@@ -46759,10 +46759,16 @@ static bool shell_try_for_command(const char *src) {
                 last = 1;
                 goto done;
             }
-        } else if (env_set(name, items->argv[i]) < 0) {
-            kprintf("for: failed to set '%s'\n", name);
-            last = 1;
-            goto done;
+        } else {
+            /* a readonly name has been named ("VAR: readonly variable"),
+             * and that is all bash says (errors.tests; logs/b42 errs2 f6) */
+            g_readonly_hit = false;
+            if (env_set(name, items->argv[i]) < 0) {
+                if (!g_readonly_hit)
+                    kprintf("for: failed to set '%s'\n", name);
+                last = 1;
+                goto done;
+            }
         }
         unsigned long ln_save = g_shell_lineno;
         if (body_line) g_shell_lineno = body_line;
