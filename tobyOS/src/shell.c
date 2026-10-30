@@ -4219,6 +4219,13 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             if (shell_expand_word_ex(elem, &kx, true, true) < 0)
                 return -1;
             if (shell_argmarks_to_spaces(kx.p, &kj) < 0) return -1;
+            /* ...with the expander's escape marks off, as [k]=v's are
+             * (351): `A=(\\ 2 \; 3)` stored the keys $'\004\\' and
+             * $'\004;' (bash's assoc11.sub, assoc15.sub; logs/b42 apair) */
+            if (kj.p) {
+                shell_strip_glob_escapes(kj.p);
+                kj.len = strlen(kj.p);
+            }
             sh_xt_lit_note(0, kj.p, false);
             if (!pend_key) {
                 if (sb_set(&pend, kj.p) < 0) return -1;
