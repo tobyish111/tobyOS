@@ -3288,6 +3288,7 @@ static void shell_optvars_refresh(void);
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
 static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
 static void shell_global_exchange(int si);
+static bool shell_nameref_names_self(const char *v, const char *name);
 struct sh_array;
 static struct sh_array *shell_local_saved_array(int si);
 static bool g_circ_busy;
@@ -9496,6 +9497,15 @@ static void shell_circ_swap_put(struct shell_circ_swap *s) {
     shell_global_exchange(s->si);
 }
 
+/* Does a reference's value V name the reference NAME itself -- NAME, or an
+ * element of it? `declare -n a='a[0]'` is a self reference, refused at the
+ * top level and warned of in a function, as `a=a` is (bash's
+ * nameref15.sub; logs/b42 circ1 c1 c4). */
+static bool shell_nameref_names_self(const char *v, const char *name) {
+    size_t n = strlen(name);
+    return strncmp(v, name, n) == 0 && (v[n] == 0 || v[n] == '[');
+}
+
 /* The oldest live local of NAME -- the record holding the global binding --
  * as an index into g_locals, or -1. */
 static int shell_local_oldest(const char *name) {
@@ -10019,9 +10029,10 @@ static void cmd_local(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
-            if (nv && has_value && strcmp(nv, name) == 0) {
+            if (nv && has_value && shell_nameref_names_self(nv, name)) {
                 kprintf("local: warning: %s: circular name reference\n", name);
-                kprintf("warning: %s: circular name reference\n", name);
+                if (!shell_readonly_key(name, klen))
+                    kprintf("warning: %s: circular name reference\n", name);
             }
         }
 
@@ -11422,7 +11433,7 @@ static void cmd_declare(int argc, char **argv) {
                     kprintf("%s: `%s': invalid variable name for name "
                             "reference\n", argv[0], nv);
                     ok = false;
-                } else if (has_value && strcmp(nv, name) == 0) {
+                } else if (has_value && shell_nameref_names_self(nv, name)) {
                     /* "disallow self references at global scope, warn at
                      * function scope" (bash, declare.def): in a function the
                      * name may resolve to the caller's variable. Two
@@ -11430,7 +11441,10 @@ static void cmd_declare(int argc, char **argv) {
                     if (g_fn_depth > 0) {
                         kprintf("%s: warning: %s: circular name reference\n",
                                 argv[0], name);
-                        kprintf("warning: %s: circular name reference\n", name);
+                        /* the assignment's, which a readonly global
+                         * refuses first (logs/b42 circ1 c18) */
+                        if (!shell_readonly_key(name, klen))
+                            kprintf("warning: %s: circular name reference\n", name);
                     } else {
                         kprintf("%s: %s: nameref variable self references not "
                                 "allowed\n", argv[0], name);
