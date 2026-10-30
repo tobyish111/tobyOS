@@ -4556,6 +4556,7 @@ static bool g_assign_expand_sub;
  * printf -v into an associative array (shell_set_named). */
 static bool g_assign_key_literal;
 static bool shell_assoc_expand_once(void);
+static bool shell_word_written_arrref(const char *w);
 
 static bool shell_nameref_elem_target(const char *name, struct shell_sb *out);
 
@@ -12419,9 +12420,24 @@ static void cmd_unset(int argc, char **argv) {
                 }
                 /* the KEY is a word: `unset -v 'd["$k"]'` expands it, quotes
                  * and all (bash; Oils 1348) -- it was looked up as written */
+                /* ...but a word WRITTEN as an array reference, `unset -v
+                 * D[$k]` or `D["$k"]`, has its key expanded once, there --
+                 * it is taken as it is now, as under assoc_expand_once; tsh
+                 * expanded it again, and a key of ` was "bad substitution"
+                 * and one of '$v' unset v's value. Any other word is checked
+                 * as bash checks it first (shell_array_ref_text_ok) --
+                 * `unset "A[8's]"` is "not a valid identifier" (bash's
+                 * assoc9.sub; logs/b42 akeys k6-k8) */
                 if (arr && arr->assoc) {
+                    bool lit = shell_word_written_arrref(argv[i]) ||
+                               shell_elem_key_literal(argv[i]);
+                    if (!lit && !shell_array_ref_text_ok(argv[i], al)) {
+                        kprintf("unset: `%s': not a valid identifier\n", argv[i]);
+                        shell_set_status(1);
+                        continue;
+                    }
                     SH_SB(kx);
-                    const char *key = sh_ar_assoc_key(sub, &kx);
+                    const char *key = lit ? sub : sh_ar_assoc_key(sub, &kx);
                     if (key) sh_array_unset_key(arr, key);
                     continue;
                 }
@@ -27898,6 +27914,12 @@ struct shell_simple {
     const char **scalar_paren;
     int nscalar_paren;
     int scalar_paren_cap;
+    /* Words WRITTEN as an array reference, NAME[...] unquoted to its last
+     * `]` -- bash's W_ARRAYREF: unset takes such a word's key as it is
+     * (shell_word_written_arrref). By pointer, as above. */
+    const char **arrref;
+    int narrref;
+    int arrref_cap;
     /* The COMMAND word -- the first that was not written as an assignment
      * -- once it has been added: where it is, and whether it was written
      * out (no expansion). See shell_assign_ctx. */
@@ -36431,6 +36453,65 @@ static int shell_note_scalar_paren(struct shell_simple *cur, const char *raw,
     return 0;
 }
 
+/* After a word token went into `cur` as argv[before..]: when it was written
+ * as an array reference -- a NAME, a `[`, and the `]` that closes it ending
+ * the word, quotes, escapes and substitutions inside skipped -- note each
+ * resulting word (see shell_word_written_arrref). */
+static int shell_note_arrref(struct shell_simple *cur, const char *raw,
+                             int before) {
+    if (!raw) return 0;
+    const char *p = raw;
+    if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
+        return 0;
+    while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+           (*p >= '0' && *p <= '9') || *p == '_')
+        p++;
+    if (*p != '[') return 0;
+    int d = 0;
+    for (; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '$' && (p[1] == '(' || p[1] == '{')) {
+            const char *e = shell_skip_dollar_group(p);
+            if (!e) return 0;
+            p = e - 1;
+            continue;
+        }
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            char q = *p;
+            for (p++; *p && *p != q; p++)
+                if (q != '\'' && *p == '\\' && p[1]) p++;
+            if (!*p) return 0;
+            continue;
+        }
+        if (*p == '[') d++;
+        else if (*p == ']' && --d == 0) break;
+    }
+    if (*p != ']' || p[1]) return 0;
+    for (int k = before; k < cur->argc; k++) {
+        if (cur->narrref >= cur->arrref_cap) {
+            int ncap = cur->arrref_cap ? cur->arrref_cap * 2 : 4;
+            const char **na = cur->arena
+                ? (const char **)words_alloc(cur->arena, (size_t)ncap * sizeof *na) : 0;
+            if (!na) return -1;
+            if (cur->narrref)
+                memcpy(na, cur->arrref, (size_t)cur->narrref * sizeof *na);
+            cur->arrref = na;
+            cur->arrref_cap = ncap;
+        }
+        cur->arrref[cur->narrref++] = cur->argv[k];
+    }
+    return 0;
+}
+
+/* Was the running command's word W written as an array reference? */
+static bool shell_word_written_arrref(const char *w) {
+    const struct shell_simple *c = g_assign_cmd;
+    if (!c) return false;
+    for (int i = 0; i < c->narrref; i++)
+        if (c->arrref[i] == w) return true;
+    return false;
+}
+
 /* A new, zeroed redirection slot at the end of the command's list. */
 static struct shell_redir *shell_simple_redir_new(struct shell_simple *s) {
     if (s->redir_count >= s->redir_cap) {
@@ -38987,6 +39068,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
             cur->cmd_word_index = before;
         }
         if (shell_note_scalar_paren(cur, tok[*io].raw, before) < 0) return -1;
+        if (shell_note_arrref(cur, tok[*io].raw, before) < 0) return -1;
         (*io)++;
     }
 
