@@ -22316,6 +22316,11 @@ static void cmd_sh(int argc, char **argv) {
     shell_set_status(st);
 }
 
+static const char *g_dot_who = ".";    /* the name `.` was called by */
+/* `command` is running a builtin: an error of a special builtin does not
+ * end a posix-mode shell under it (cmd_command) */
+static int g_command_builtin_depth;
+
 static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
     bool has_slash = false;
     for (const char *p = arg; *p; p++) {
@@ -22349,7 +22354,14 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
         if (vfs_stat(out, &st) == VFS_OK && st.type != VFS_TYPE_DIR) return 0;
         p = *end ? end + 1 : end;
     }
-    /* Not on PATH: the working directory is the fallback, not the first try. */
+    /* Not on PATH: the working directory is the fallback, not the first try
+     * -- except in posix mode, where there is none: ".: NAME: file not
+     * found" (bash's builtins7.sub; logs/b42 blt1 b1) */
+    if (g_opt_posix) {
+        kprintf("%s: %s: file not found\n", g_dot_who, arg);
+        shell_set_status(1);
+        return -1;
+    }
     if (shell_canonicalize_path(arg, out, cap) >= 0) {
         struct vfs_stat st;
         if (vfs_stat(out, &st) == VFS_OK) return 0;
@@ -22372,6 +22384,14 @@ static void shell_dot_failed(int status_in) {
     shell_set_status(status_in);
     shell_run_return_trap();
     shell_set_status(1);
+    /* posix mode: a special builtin's error ends a non-interactive shell,
+     * status 1, unless `command` ran it (bash's source5.sub, builtins7.sub;
+     * logs/b42 blt1 b1) -- tsh went on */
+    if (g_opt_posix && !g_interactive && g_command_builtin_depth == 0 &&
+        g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = 1;
+    }
 }
 
 /* A SYNTAX ERROR IN A SOURCED FILE ENDS THE FILE, NOT THE SCRIPT: bash's `.`
@@ -22425,7 +22445,10 @@ static void cmd_dot(int argc, char **argv) {
             }
     }
     char resolved[VFS_PATH_MAX];
-    if (shell_find_dot_script(argv[1], resolved, sizeof(resolved)) < 0) {
+    g_dot_who = argv[0];
+    int fdrc = shell_find_dot_script(argv[1], resolved, sizeof(resolved));
+    g_dot_who = ".";
+    if (fdrc < 0) {
         shell_dot_failed(status_in);
         return;
     }
@@ -23704,7 +23727,9 @@ static void cmd_command(int argc, char **argv) {
             COMMAND_P_RESTORE();
             g_last_builtin = g_this_builtin;
             g_this_builtin = c->fn;
+            g_command_builtin_depth++;
             shell_call_builtin(c, argc - i, &argv[i]);
+            g_command_builtin_depth--;
             return;
         }
     }
