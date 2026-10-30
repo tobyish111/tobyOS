@@ -48079,7 +48079,15 @@ static bool shell_try_function_definition(const char *src) {
     }
     {
         g_fndef_whole = body_whole;
+        /* bash runs a definition on the line it ends on: a refusal says
+         * "line 6: func: readonly function" for one written over lines
+         * 3-6, where tsh named its first (bash's errors.tests; logs/b42
+         * errs2 f1) */
+        unsigned long def_line = g_shell_lineno;
+        unsigned long end_line = shell_lineno_at(body_end);
+        if (end_line > 0) g_shell_lineno = end_line;
         int frc = shell_function_set(name, body);
+        g_shell_lineno = def_line;
         if (frc < 0) {
             kfree(body);
             if (frc == -1) kprintf("function: failed to define '%s'\n", name);
