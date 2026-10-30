@@ -11393,7 +11393,13 @@ static void cmd_declare(int argc, char **argv) {
          * another declare passes it on to its target (finding 320). */
         if (set_readonly) {
             SH_SB(rot);
+            int tx = env_find(name, klen);
             if (nref) (void)shell_readonly_mark(name, klen);
+            /* declare -r of a reference with no target marks the
+             * reference itself, where readonly says "`'" (bash's
+             * nameref17.sub; logs/b41 nref18 u4) */
+            else if (tx >= 0 && (g_env_flags[tx] & SHVAR_NAMEREF) && !g_env[tx][klen + 1])
+                (void)shell_readonly_mark(name, klen);
             else if (shell_readonly_target(argv[0], name, klen, &rot))
                 (void)shell_readonly_mark(rot.p, strlen(rot.p));
         }
