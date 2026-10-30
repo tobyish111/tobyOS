@@ -30849,6 +30849,9 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
                                    bool dq_syntax, bool sq_syntax,
                                    bool value_word);
 
+static int shell_procsub_run_at(const char **pp, bool input,
+                                char *path, size_t cap);
+
 /* Set by shell_expand_param_word for the ONE expansion it asks for: the
  * word of ${x-W} ${x+W} ${x=W} ${x?W}, a value -- not a pattern, whose
  * quoted spans the marks have to keep saying are quoted. */
@@ -30961,6 +30964,21 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
             }
             if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0) return -1;
             if (*p == '\'') p++;
+            continue;
+        }
+        /* `<(cmd)` AND `>(cmd)` IN AN EXPANSION'S WORD, unquoted, run as
+         * they do in a command's: `cat ${u:-<(echo a)}` reads a's output and
+         * `x=${u:-<(echo d)}` holds the /dev/fd path (bash's new-exp1.sub;
+         * logs/b42 nexp10 q12 q13). tsh kept the text, which split in two. */
+        if (value_word && g_dq_depth == 0 && !g_dq_word &&
+            (*p == '<' || *p == '>') && p[1] == '(') {
+            char ppath[32];
+            if (shell_procsub_run_at(&p, *p == '<', ppath, sizeof ppath) < 0)
+                return -1;
+            if (sb_putc(out, SHELL_NOSPLIT_MARK) < 0 ||
+                sb_puts(out, ppath) < 0 ||
+                sb_putc(out, SHELL_NOSPLIT_MARK) < 0)
+                return -1;
             continue;
         }
         if (dq_syntax && *p == '"') {            /* expands, quotes removed */
