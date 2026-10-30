@@ -39531,8 +39531,12 @@ static int shell_apply_redirs(struct shell_simple *cmd,
                 char num[16];
                 ksnprintf(num, sizeof num, "%d", fd);
                 if (shell_fdvar_is_elem(r->fdvar) ? shell_set_named(r->fdvar, num) < 0
-                                          : env_set(r->fdvar, num) < 0)
+                                          : env_set(r->fdvar, num) < 0) {
+                    /* after the assignment's own word, bash's (bash's
+                     * nameref11.sub; logs/b41) */
+                    kprintf("%s: cannot assign fd to variable\n", r->fdvar);
                     return -1;
+                }
                 vr.fdvar = 0;
                 vr.fd = fd;
                 r = &vr;
