@@ -9821,6 +9821,14 @@ static void cmd_local(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+        /* a new local over a reference the function did not make is a
+         * plain variable: `local ref=Y` of a global reference ref is ref=Y,
+         * where tsh wrote Y through it (bash's nameref20.sub; logs/b41
+         * nref17), as declare's (322) */
+        if (!already && !l_nameref) {
+            int rx = env_find(name, klen);
+            if (rx >= 0) g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
+        }
         if (l_assoc) (void)sh_array_make_assoc(name);
         /* `local -n r=x` rebinds; see the same note in declare. */
         if (l_nameref && has_value) {
