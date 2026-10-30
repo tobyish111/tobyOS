@@ -12999,6 +12999,25 @@ static void cmd_unset(int argc, char **argv) {
                     sh_array_unset_idx(arr, ix);
                     continue;
                 }
+                /* AN ARRAY ONLY DECLARED (`declare -a AA`) has no elements:
+                 * a negative index is "[-2]: bad array subscript" as for an
+                 * empty one, any other unsets nothing -- tsh took it for a
+                 * scalar, "AA: not an array variable" (bash's errors.tests;
+                 * logs/b42 errs2 f5) */
+                {
+                    int dx = env_find(nm, strlen(nm));
+                    if (!arr && dx >= 0 && (g_env_flags[dx] & SHVAR_ARRAY)) {
+                        long di = 0;
+                        int dk = sh_subscript_value(sub, &di);
+                        if (dk == SARITH_OK && di < 0) {
+                            kprintf("unset: [%s]: bad array subscript\n", sub);
+                            shell_set_status(1);
+                        } else if (dk != SARITH_OK) {
+                            shell_set_status(1);
+                        }
+                        continue;
+                    }
+                }
                 /* A SCALAR, set or only declared: element 0 is the whole
                  * variable, any other "NAME: not an array variable",
                  * status 1 (bash's unbind_array_element; Oils 1347). */
