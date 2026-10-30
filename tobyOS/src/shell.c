@@ -4557,6 +4557,7 @@ static bool g_assign_expand_sub;
 static bool g_assign_key_literal;
 static bool shell_assoc_expand_once(void);
 static bool shell_word_written_arrref(const char *w);
+static void sh_array_clear_novalue(const char *name);
 /* Set while [[ ]] asks test_unary: its word was expanded once already. */
 static bool g_test_from_dbr;
 
@@ -4664,6 +4665,10 @@ static int sh_try_array_assignment(const char *kv) {
             shell_readonly_print_error(name, strlen(name), "shell");
             return -1;
         }
+        /* AN ELEMENT ASSIGNED IS THE ARRAY ASSIGNED: emptied again by unset
+         * it is `declare -A A=()`, where tsh printed the `declare -A A` of
+         * one only ever declared (bash's assoc17.sub, assoc18.sub; logs/b42
+         * aempty e2 e3 e6 e7 e9) -- once the subscript is good (below) */
         /* AN ASSOCIATIVE SUBSCRIPT IS A LITERAL STRING, not arithmetic.
          * `m[alpha]=1` must not try to evaluate `alpha` as a variable, and
          * `m[two words]` is one key. Only `declare -A` puts an array in this
@@ -4673,6 +4678,7 @@ static int sh_try_array_assignment(const char *kv) {
              * sits ABOVE the store's definition (env_set_kv is early), so the
              * type is still incomplete here. */
             if (sh_array_is_assoc(name)) {
+                sh_array_clear_novalue(name);
                 if (append) {
                     /* Any length: the join was a 512-byte array, and a
                      * longer one fell through to the SCALAR path. */
@@ -4687,6 +4693,7 @@ static int sh_try_array_assignment(const char *kv) {
         }
         long idx = 0;
         if (sh_subscript_assign_index(name, sub, &idx) < 0) return -1;
+        sh_array_clear_novalue(name);
         if (sh_array_absorb_scalar(name) < 0) return -1;
         {
             unsigned at = shell_value_attrs(name);
@@ -11669,8 +11676,13 @@ static void cmd_declare(int argc, char **argv) {
             if (has_value && !d_append) {
                 nv = argv[i] + env_key_len(argv[i]) + 1;
             } else if (!has_value) {
+                /* (an array's entry holds its attributes, not a value: the
+                 * array is refused below -- `declare -a a; a[0]=z; declare -n
+                 * a` is "reference variable cannot be an array", bash's
+                 * nameref22.sub) */
                 int ox = env_find(name, klen);
-                if (ox >= 0 && !(g_env_flags[ox] & (SHVAR_NOVALUE | SHVAR_NAMEREF)))
+                if (ox >= 0 &&
+                    !(g_env_flags[ox] & (SHVAR_NOVALUE | SHVAR_NAMEREF | SHVAR_ARRAY)))
                     nv = g_env[ox] + klen + 1;
             }
             if (nv) {
