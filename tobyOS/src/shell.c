@@ -33581,6 +33581,14 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
     if (g_opt_nounset && !at_or_star && shell_dynvar_index(name, strlen(name)) < 0) {
         const char *t = op[0] == ':' ? op + 1 : op;
         bool tests = *op && (*t == '-' || *t == '=' || *t == '?' || *t == '+');
+        /* @a and @A of an array with elements are the array's, whether or
+         * not it has the element 0 a value would be: `set -u; a=([1]=x);
+         * ${a@a}` is a, not "a: unbound variable" (bash's new-exp15.sub;
+         * logs/b42 nexp10 q5 q8 q11). An empty array is still unbound. */
+        if (!tests && (strcmp(op, "@a") == 0 || strcmp(op, "@A") == 0)) {
+            struct sh_array *ua = sh_array_find(name);
+            if (ua && ua->n > 0) tests = true;
+        }
         if (!tests) {
             SH_SB(probe);
             bool pset = false, pjoin = false;
