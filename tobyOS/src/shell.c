@@ -9033,6 +9033,10 @@ struct shell_prefix_one {
     unsigned char prev_flags;   /* the old entry's flags, when `had` */
     bool  dead;                 /* removed by `unset`; see g_tempenv */
     unsigned long seq;          /* g_scope_seq when it was bound */
+    /* A reference with no target, bound as a plain variable for the
+     * command; its entry, -n and all, is put back after (see
+     * shell_prefix_capture). */
+    bool  ref_plain;
 };
 
 struct shell_prefix_save {
@@ -38441,6 +38445,35 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
         *out_envc = 0;
         return e;
     }
+    /* A REFERENCE'S PREFIX IS ITS TARGET'S: `ref=7 printenv var` gives the
+     * child var=7, and `xr+= printenv xr` leaves an exported reference's own
+     * value, "var", where tsh's child saw ref=7 and xr=foo (bash; logs/b41
+     * nref14, bash's nameref14.sub). Each such word is rewritten to name the
+     * target; one with no target stays as written. */
+    SH_WORDS(rw);
+    char **ra __attribute__((cleanup(shell_kfree_ptr))) = 0;
+    for (int i = 0; i < assignc; i++) {
+        size_t nl = env_assign_name_len(assignv[i]);
+        SH_SB(rn);
+        if (nl == 0 || sb_putmem(&rn, assignv[i], nl) < 0 || !shell_is_nameref(rn.p))
+            continue;
+        SH_SB(tg);
+        const char *real = env_deref_name_ex(rn.p, &tg, false);
+        if (!real || real == rn.p || g_nameref_circular ||
+            !shell_name_is_valid(real, strlen(real)))
+            continue;
+        if (!ra) {
+            ra = (char **)kmalloc((size_t)assignc * sizeof *ra);
+            if (!ra) return sh_env_oom();
+            memcpy(ra, assignv, (size_t)assignc * sizeof *ra);
+        }
+        SH_SB(w);
+        if (sb_puts(&w, real) < 0 || sb_puts(&w, assignv[i] + nl) < 0)
+            return sh_env_oom();
+        ra[i] = (char *)words_store(&rw, w.p, w.len);
+        if (!ra[i]) return sh_env_oom();
+    }
+    if (ra) assignv = ra;
     /* THE LIVE BINDINGS THAT HIDE OTHERS, sorted by name. */
     int nb = 0, nbcap = g_localc;
     for (int i = 0; i < g_tempenvc; i++) nbcap += g_tempenv[i]->count;
@@ -38856,11 +38889,15 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
             continue;
         }
         if (exported) {
-            size_t klen = env_key_len(assignv[i]);
+            size_t klen = env_assign_name_len(assignv[i]);
             SH_SB(nmb);
             if (klen > 0 && sb_putmem(&nmb, assignv[i], klen) == 0) {
-                const char *nm = nmb.p;
-                int idx = env_find(nm, klen);
+                /* what a reference names is what the command's environment
+                 * gets: `ref=7 printenv var` is 7 (bash; logs/b41 nref14) */
+                SH_SB(tg);
+                const char *nm = env_deref_name_ex(nmb.p, &tg, false);
+                if (!nm || g_nameref_circular) nm = nmb.p;
+                int idx = env_find(nm, strlen(nm));
                 if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
             }
         }
@@ -39958,14 +39995,44 @@ static void shell_prefix_capture(struct shell_prefix_save *sv,
         memcpy(name, assignv[i], klen);
         name[klen] = '\0';
         struct shell_prefix_one *o = &sv->v[sv->count++];
+        o->ref_plain = false;
+        /* A REFERENCE'S PREFIX BINDS WHAT IT NAMES for the command, and the
+         * reference stays as it was: `ref=xxx declare -p ref var` shows
+         * declare -x var="xxx" and, after, var unset again. tsh saved and
+         * put back the reference -- after the command `ref` was gone -- and
+         * exported it, not var. One with no target binds the plain name: `r=/
+         * f` gives f an r of "/", unchecked, and the reference comes back
+         * after (bash; logs/b41 nref14, bash's nameref14.sub nameref11.sub). */
+        {
+            int ni = env_find(name, klen);
+            if (ni >= 0 && (g_env_flags[ni] & SHVAR_NAMEREF)) {
+                if (!g_env[ni][klen + 1]) {
+                    o->ref_plain = true;
+                    o->prev_flags = g_env_flags[ni];
+                    g_env_flags[ni] &= ~(unsigned char)(SHVAR_NAMEREF | SHVAR_NOVALUE);
+                } else {
+                    SH_SB(tg);
+                    const char *real = env_deref_name_ex(name, &tg, false);
+                    if (real && real != name && !g_nameref_circular &&
+                        shell_name_is_valid(real, strlen(real))) {
+                        char *tn = shell_strdup(real);
+                        if (tn) {
+                            kfree(name);
+                            name = tn;
+                            klen = strlen(tn);
+                        }
+                    }
+                }
+            }
+        }
         o->name = name;
         const char *old = env_get(name);
         o->had  = (old != 0);
         o->prev = old ? shell_strdup(old) : 0;
         o->dead = false;
         o->seq  = g_scope_seq + 1;
-        o->prev_flags = 0;
-        {
+        if (!o->ref_plain) {
+            o->prev_flags = 0;
             int pi = env_find(name, klen);
             if (pi >= 0) o->prev_flags = g_env_flags[pi];
         }
@@ -40008,6 +40075,19 @@ static void shell_prefix_restore(struct shell_prefix_save *sv) {
          * nothing to put back -- and trying said "readonly variable" a
          * second time. */
         if (shell_readonly_key(o->name, strlen(o->name))) {
+            kfree(o->prev);
+            kfree(o->name);
+            continue;
+        }
+        /* a reference with no target comes back as it was */
+        if (o->ref_plain) {
+            size_t rl = strlen(o->name);
+            int ri = env_find(o->name, rl);
+            if (ri >= 0) env_remove_at(ri);
+            if (env_set_attr_holder(o->name) == 0) {
+                ri = env_find(o->name, rl);
+                if (ri >= 0) g_env_flags[ri] = o->prev_flags;
+            }
             kfree(o->prev);
             kfree(o->name);
             continue;
