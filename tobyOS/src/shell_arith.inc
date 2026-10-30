@@ -444,8 +444,11 @@ static void sa_readtok(struct sarith *s) {
                 bool as = nm && sh_array_is_assoc(nm);
                 if (nm) SARITH_FREE(nm);
                 if (as) {
+                    /* (an escaped bracket, as the expansion of $k leaves
+                     * one, is no bracket: `(( A[$k]=2 ))` with k=']') */
                     int d = 0;
                     for (k = 0; cp[k]; k++) {
+                        if (cp[k] == '\\' && cp[k + 1]) { k++; continue; }
                         if (cp[k] == '[') d++;
                         else if (cp[k] == ']' && --d == 0) break;
                     }

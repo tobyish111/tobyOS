@@ -5358,7 +5358,12 @@ static int shell_set_named(const char *name, const char *val) {
      * keys, where tsh set 80s and the value of v (bash's assoc9.sub,
      * assoc18.sub; logs/b42 akeys k2 k4) */
     bool once = elem && shell_elem_key_literal(name);
-    if (elem && !once && !shell_array_ref_text_ok(name, nl)) return -2;
+    /* (under assoc_expand_once a word not WRITTEN as an array reference --
+     * `read "A[$k]"` -- is still checked: with k=']' it is "`A[]]': not a
+     * valid identifier" (bash's array27.sub; logs/b42 arr3)) */
+    if (elem && (!once || !shell_word_written_arrref(name)) &&
+        !shell_array_ref_text_ok(name, nl))
+        return -2;
     if (elem) g_assign_expand_sub = true;
     g_assign_key_literal = once;
     int rc = env_set(name, val);
@@ -25375,7 +25380,8 @@ static void cmd_printf(int argc, char **argv) {
         while (vname[vnl] && vname[vnl] != '[') vnl++;
         bool velem = vname[vnl] == '[' && vname[strlen(vname) - 1] == ']';
         if (!shell_name_is_valid(vname, velem ? vnl : strlen(vname)) ||
-            (velem && !shell_elem_key_literal(vname) &&
+            (velem && (!shell_elem_key_literal(vname) ||
+                       !shell_word_written_arrref(vname)) &&
              !shell_array_ref_text_ok(vname, strlen(vname)))) {
             kprintf("printf: `%s': not a valid identifier\n", vname);
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
