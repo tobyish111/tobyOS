@@ -14847,9 +14847,12 @@ static bool shell_echo_escape(const char *s) {
 
 static void cmd_echo(int argc, char **argv) {
     bool newline = true;
-    bool escapes = false;
+    /* `shopt -s xpg_echo`: escapes by default, -E still turns them off --
+     * and in posix mode no option at all (bash's builtins2.sub; logs/b42
+     * blt1 b5). The option was there and nothing read it. */
+    bool escapes = g_shopt_xpg_echo;
     int i = 1;
-    while (i < argc) {
+    while (i < argc && !(g_shopt_xpg_echo && g_opt_posix)) {
         if (argv[i][0] != '-') break;
         /* A LONE `-` IS AN ARGUMENT, not an empty option bundle. The flag loop
          * below has no characters to reject, so it accepted `-` and swallowed
