@@ -9651,6 +9651,51 @@ static bool shell_local_declared_here(const char *name, int depth) {
     return false;
 }
 
+/* A NEW LOCAL'S LIST IS EXPANDED BEFORE THE LOCAL IS MADE, where the
+ * caller's variable of the name is still the one seen: `local -a arr=(
+ * "${arr[@]}" )` copies the caller's arr. tsh made the local first and the
+ * list expanded the empty local -- arr=() (bash's varenv18.sub; logs/b42
+ * venv1 n5). The list VAL is expanded into a scratch array now and handed
+ * back in OUT as a list of its elements, each quoted, for the local to take
+ * with its attributes. 0, or -1 when the expansion failed (reported). */
+static void sh_quote_single(struct shell_sb *o, const char *s) {
+    (void)sb_putc(o, '\'');
+    for (; *s; s++) {
+        if (*s == '\'') (void)sb_puts(o, "'\\''");
+        else (void)sb_putc(o, *s);
+    }
+    (void)sb_putc(o, '\'');
+}
+static int shell_local_list_pre(const char *val, bool assoc, struct shell_sb *out) {
+    static unsigned pre_seq;
+    char tmp[32];
+    ksnprintf(tmp, sizeof tmp, "%cpre%u", SH_ARRAY_TMP_MARK, pre_seq++);
+    if (assoc ? sh_array_make_assoc(tmp) < 0 : !sh_array_create(tmp)) return -1;
+    if (sh_array_assign_literal(tmp, val, false) < 0) {
+        sh_array_unset_literal(tmp);
+        return -1;
+    }
+    struct sh_array *a = sh_array_find_literal(tmp);
+    sb_truncate(out, 0);
+    (void)sb_putc(out, '(');
+    for (int i = 0; a && i < a->n; i++) {
+        (void)sb_putc(out, '[');
+        if (a->e[i].key) {
+            sh_quote_single(out, a->e[i].key);
+        } else {
+            char nb[24];
+            ksnprintf(nb, sizeof nb, "%ld", a->e[i].idx);
+            (void)sb_puts(out, nb);
+        }
+        (void)sb_puts(out, "]=");
+        sh_quote_single(out, a->e[i].val ? a->e[i].val : "");
+        (void)sb_putc(out, ' ');
+    }
+    (void)sb_putc(out, ')');
+    sh_array_unset_literal(tmp);
+    return out->p ? 0 : -1;
+}
+
 /* Put back the scalar a local hid (the second half of the restore). */
 static void shell_path_var_written(const char *key, size_t klen);
 static void shell_readonly_unmark(const char *key, size_t klen);
@@ -10308,6 +10353,21 @@ static void cmd_local(int argc, char **argv) {
 
         bool already = shell_local_declared_here(name, g_script_depth);
         bool inherit = !already && !has_value && shell_local_inherits(name);
+        /* a new local's written list is expanded first (shell_local_list_pre) */
+        SH_SB(prelist);
+        bool pre = false;
+        if (has_value && !l_append && !l_nameref && !already) {
+            const char *pv = argv[i] + env_key_len(argv[i]) + 1;
+            if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
+                bool pa = l_assoc;
+                if (shell_local_list_pre(pv, pa, &prelist) < 0) {
+                    shell_set_status(1);
+                    if (g_shell_flow != SHELL_FLOW_NONE) return;
+                    continue;
+                }
+                pre = true;
+            }
+        }
         if (!already && shell_locals_push(name, g_script_depth) < 0) {
             shell_set_status(1);
             continue;
@@ -10344,7 +10404,11 @@ static void cmd_local(int argc, char **argv) {
         }
         if (has_value) {
             g_decl_paren_array = l_array || sh_array_find(name) != 0;
-            if (env_set_kv(argv[i]) < 0) shell_set_status(1);
+            SH_SB(prekv);
+            if (pre && (sb_puts(&prekv, name) < 0 || sb_putc(&prekv, '=') < 0 ||
+                        sb_puts(&prekv, prelist.p) < 0))
+                pre = false;
+            if (env_set_kv(pre ? prekv.p : argv[i]) < 0) shell_set_status(1);
             g_decl_paren_array = false;
         } else if (!already && !l_attr_on && !inherit) {
             /* `local x` DECLARES x, without a value: `declare -p x` is
@@ -11804,6 +11868,24 @@ static void cmd_declare(int argc, char **argv) {
             }
         }
 
+        /* (a new local's written list is expanded before the local is
+         * made, and a caller's readonly local is the caller's: as local's,
+         * shell_local_list_pre and shell_local_of_caller) */
+        SH_SB(prelist);
+        bool pre = false;
+        if (make_local && !shell_local_declared_here(name, g_script_depth) &&
+            has_value && !d_append && !nref && !shell_readonly_key(name, klen)) {
+            const char *pv = argv[i] + env_key_len(argv[i]) + 1;
+            if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
+                bool pa = set_assoc;
+                if (shell_local_list_pre(pv, pa, &prelist) < 0) {
+                    shell_set_status(1);
+                    if (g_shell_flow != SHELL_FLOW_NONE) return;
+                    continue;
+                }
+                pre = true;
+            }
+        }
         if (make_local && !shell_local_declared_here(name, g_script_depth)) {
             if (shell_readonly_key(name, klen)) {
                 /* A COMPOUND VALUE IS DECLARED FIRST, by bash itself
@@ -11945,7 +12027,11 @@ static void cmd_declare(int argc, char **argv) {
                     g_readonly_tgt_word = argv[i];
                 }
             }
-            int dsrc = env_set_kv(argv[i]);
+            SH_SB(prekv);
+            if (pre && (sb_puts(&prekv, name) < 0 || sb_putc(&prekv, '=') < 0 ||
+                        sb_puts(&prekv, prelist.p) < 0))
+                pre = false;
+            int dsrc = env_set_kv(pre ? prekv.p : argv[i]);
             g_readonly_label = 0;
             g_readonly_as_word = g_readonly_tgt_word = 0;
             g_decl_paren_array = false;
