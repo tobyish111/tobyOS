@@ -4743,6 +4743,20 @@ static int env_set_kv(const char *kv_in) {
         if (!shell_name_is_valid(nm, nlen)) return -1;
 
         const char *add = kv_in + klen + 1;
+        /* += THROUGH A REFERENCE TO AN ELEMENT is that element's +=, with
+         * its array's attributes: `declare -ai a=(4); declare -n b='a[0]';
+         * b+=1` is 5 -- tsh appended the text, 41 (bash's nameref23.sub;
+         * logs/b41 nref16 r1 r2) */
+        {
+            SH_SB(et);
+            if (shell_nameref_elem_target(nm, &et)) {
+                SH_SB(rb);
+                if (sb_puts(&rb, et.p) < 0 || sb_puts(&rb, "+=") < 0 ||
+                    sb_puts(&rb, add) < 0)
+                    return -1;
+                return env_set_kv(rb.p);
+            }
+        }
         struct sh_array *arr = sh_array_find(nm);
         /* an associative array's element 0 is the KEY "0", as for `a=x`
          * below: `declare -A a; a+=z` appended to the key "" (appendop1.sub;
