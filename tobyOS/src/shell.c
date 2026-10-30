@@ -3289,6 +3289,7 @@ static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
 static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
 static void shell_global_exchange(int si);
 static bool shell_nameref_names_self(const char *v, const char *name);
+static int shell_local_oldest(const char *name);
 struct sh_array;
 static struct sh_array *shell_local_saved_array(int si);
 static bool g_circ_busy;
@@ -4967,6 +4968,35 @@ static int env_set_kv(const char *kv_in) {
                 }
             }
             if (real != nm && strcmp(real, nm) != 0) {
+                /* A REFERENCE THAT COMES TO AN ELEMENT OF ITSELF -- its value,
+                 * or a chain back -- is, for a function's local reference,
+                 * one to the GLOBAL `a[0]` (shell_nameref_circ), which names
+                 * nothing: "`a[0]': not a valid identifier", an assignment
+                 * error, the line dropped; tsh printed it and went on. At the
+                 * top level it is bash's "warning: a: removing nameref
+                 * attribute", and the element is a's own: `declare -n a=b;
+                 * declare -n b='a[1]'; a=foo` is a=([1]="foo") (bash's
+                 * nameref15.sub; logs/b42 circ1 c1 c3, nref19 d4, nref20). */
+                if (!g_env_attr_only && shell_nameref_names_self(real, nm) &&
+                    real[klen] == '[') {
+                    if (g_fn_depth > 0 && shell_local_oldest(nm) >= 0) {
+                        if (g_this_cmd_name)
+                            kprintf("%s: `%s': not a valid identifier\n",
+                                    g_this_cmd_name, real);
+                        else
+                            kprintf("`%s': not a valid identifier\n", real);
+                        g_assign_fail_hit = true;
+                        return -1;
+                    }
+                    kprintf("warning: %s: removing nameref attribute\n", nm);
+                    int ox = env_find(nm, klen);
+                    if (ox >= 0) env_remove_at(ox);
+                    SH_SB(eb);
+                    if (sb_puts(&eb, real) < 0 || sb_putc(&eb, '=') < 0 ||
+                        sb_puts(&eb, kv_in + klen + 1) < 0)
+                        return -1;
+                    return env_set_kv(eb.p);
+                }
                 /* The value is any length. It was a 256-byte array, and a
                  * longer value set the REFERENCE ITSELF, not its target. */
                 SH_SB(rebuilt);
