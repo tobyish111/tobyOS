@@ -5925,6 +5925,22 @@ static void shell_move_params_to_frame(struct shell_param_frame *f) {
     g_positional_count = 0;
 }
 
+/* `set` gave the positional parameters new values outside any function
+ * (bash's ARGS_SETBLTIN): a script sourced with arguments keeps what it set
+ * (cmd_dot). Cleared when such a source starts and when it ends. */
+static bool g_dollar_set;
+
+/* Forget a frame's saved parameters: the current ones stay. */
+static void shell_drop_param_frame(struct shell_param_frame *f) {
+    if (f->param0) kfree(f->param0);
+    for (int i = 0; i < f->positional_count; i++)
+        if (f->positional[i]) kfree(f->positional[i]);
+    kfree(f->positional);
+    f->param0 = 0;
+    f->positional = 0;
+    f->positional_count = 0;
+}
+
 static void shell_restore_params_from_frame(struct shell_param_frame *f) {
     shell_free_current_params();
     g_param0 = f->param0;
@@ -13521,6 +13537,7 @@ static void cmd_set_in(int argc, char **argv) {
     }
 
     if (first > 1 && strcmp(argv[first - 1], "--") == 0) {
+        if (g_fn_depth == 0) g_dollar_set = true;
         if (shell_set_positional_params(argc - first, &argv[first]) < 0) {
             kprintf("set: positional parameter table full\n");
             shell_set_status(1);
@@ -13540,6 +13557,7 @@ static void cmd_set_in(int argc, char **argv) {
     }
 
     if (!all_assignments) {
+        if (g_fn_depth == 0) g_dollar_set = true;
         if (shell_set_positional_params(argc - first, &argv[first]) < 0) {
             kprintf("set: positional parameter table full\n");
             shell_set_status(1);
@@ -22466,6 +22484,7 @@ static void cmd_dot(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    g_dollar_set = false;
     g_source_depth++;                      /* `return` is legal in here */
     g_return_pending = false;
     shell_set_status(status_in);           /* the caller's $?, as bash's */
@@ -22476,7 +22495,12 @@ static void cmd_dot(int argc, char **argv) {
     shell_set_status(g_return_pending ? g_return_prev_status : st);   /* finding 30 */
     g_return_pending = false;
     shell_run_return_trap();           /* a sourced script finished */
-    shell_restore_params_from_frame(&frame);
+    /* ...and the caller's parameters come back, unless the script gave
+     * them new values with `set`: `. f x y z` where f says `set -- m n o
+     * p` leaves m n o p (bash's builtins.tests; logs/b42 blt1 b4, blt2) */
+    if (g_dollar_set) shell_drop_param_frame(&frame);
+    else shell_restore_params_from_frame(&frame);
+    g_dollar_set = false;
     shell_set_status(st);
 }
 
