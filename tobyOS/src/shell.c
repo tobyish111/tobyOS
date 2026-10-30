@@ -4014,6 +4014,15 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                     if ((q == '"' || ansi) && *p == '\\' && p[1] &&
                         n + 2 < elem_cap)
                         elem[n++] = *p++;
+                    /* a ${...} or $(...) inside "..." is copied whole, its
+                     * own quotes in it (see the list reader) */
+                    else if (q == '"' && *p == '$' && (p[1] == '{' || p[1] == '(')) {
+                        const char *g = shell_skip_dollar_group(p);
+                        if (g) {
+                            while (p < g && n + 2 < elem_cap) SH_LIT_COPY();
+                            continue;
+                        }
+                    }
                     SH_LIT_COPY();
                 }
                 if (*p == q && n + 1 < elem_cap) elem[n++] = *p++;
@@ -36230,8 +36239,17 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         for (e = p + 1; *e && *e != '\''; e++) {}
                         if (*e) e++;
                     } else if (c == '"' || c == '`') {
-                        for (e = p + 1; *e && *e != c; e++)
-                            if (*e == '\\' && e[1]) e++;
+                        /* (inside "...", a ${...} or $(...) is its own,
+                         * quotes and all: `("${a[@]/#/"-i '"}")` --
+                         * bash's array6.sub; logs/b42 arr2 b10) */
+                        for (e = p + 1; *e && *e != c; e++) {
+                            if (*e == '\\' && e[1]) { e++; continue; }
+                            if (c == '"' && *e == '$' && (e[1] == '{' || e[1] == '(')) {
+                                const char *g = shell_skip_dollar_group(e);
+                                if (!g) break;
+                                e = g - 1;
+                            }
+                        }
                         if (*e) e++;
                     }
                     /* (a raw marker byte of the script goes in as data, as
