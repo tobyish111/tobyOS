@@ -4669,6 +4669,16 @@ static int sh_try_array_assignment(const char *kv) {
          * it is `declare -A A=()`, where tsh printed the `declare -A A` of
          * one only ever declared (bash's assoc17.sub, assoc18.sub; logs/b42
          * aempty e2 e3 e6 e7 e9) -- once the subscript is good (below) */
+        /* `@` or `*` IS NO INDEX of an indexed array: `ia[@]=x` is bash's
+         * "ia[@]: bad array subscript", an assignment error; tsh's
+         * arithmetic said "@: syntax error: operand expected" (bash's
+         * assoc13.sub; logs/b42 aidx) */
+        if (!sh_array_is_assoc(name) && (sub[0] == '@' || sub[0] == '*') &&
+            !sub[1]) {
+            kprintf("%s[%s]: bad array subscript\n", name, sub);
+            g_assign_fail_hit = true;
+            return -1;
+        }
         /* AN ASSOCIATIVE SUBSCRIPT IS A LITERAL STRING, not arithmetic.
          * `m[alpha]=1` must not try to evaluate `alpha` as a variable, and
          * `m[two words]` is one key. Only `declare -A` puts an array in this
