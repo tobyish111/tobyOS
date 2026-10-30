@@ -11428,6 +11428,25 @@ static void cmd_declare(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+        /* -n's += JOINS THE REFERENCE'S OWN VALUE, and a join that names the
+         * reference is a self reference: `typeset -n ref=re ref+=f` is
+         * "ref: nameref variable self references not allowed" -- bash says
+         * it bare -- status 1, ref still re. tsh made ref name itself
+         * (bash's nameref15.sub; logs/b42 nref19 d1). */
+        if (nref && has_value && d_append && g_fn_depth == 0) {
+            int ox = env_find(name, klen);
+            if (ox >= 0 && (g_env_flags[ox] & SHVAR_NAMEREF)) {
+                SH_SB(jv);
+                if (sb_puts(&jv, g_env[ox] + klen + 1) == 0 &&
+                    sb_puts(&jv, argv[i] + env_key_len(argv[i]) + 1) == 0 &&
+                    shell_nameref_names_self(jv.p, name)) {
+                    kprintf("%s: nameref variable self references not allowed\n",
+                            name);
+                    shell_set_status(1);
+                    continue;
+                }
+            }
+        }
         if (nref) {
             const char *nv = 0;
             if (has_value && !d_append) {
