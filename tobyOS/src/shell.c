@@ -12835,6 +12835,16 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
             else if (!on && have) (void)env_unset("POSIXLY_CORRECT");
             g_opt_posix = on;
         }
+        /* `set -o ignoreeof` is IGNOREEOF=10, over any value it had, and
+         * `set +o ignoreeof` unsets it; the option is on while IGNOREEOF is
+         * set (shell_hist_var_written), as bash's sv_ignoreeof has it. tsh's
+         * option and variable were strangers (bash's varenv.tests,
+         * varenv21.sub; logs/b42 localdash o1-o3) */
+        if (g_optdefs[i].var == &g_opt_ignoreeof) {
+            if (on) (void)env_set("IGNOREEOF", "10");
+            else if (env_find("IGNOREEOF", 9) >= 0) (void)env_unset("IGNOREEOF");
+            g_opt_ignoreeof = on;
+        }
         return true;
     }
     return false;
@@ -26616,6 +26626,12 @@ static void shell_hist_var_written(const char *key, size_t klen) {
             g_opt_posix = on;
             shell_optvars_refresh();
         }
+        return;
+    }
+    /* ...and IGNOREEOF set or unset is ignoreeof on or off (see
+     * shell_set_opt_by_name) */
+    if (klen == 9 && strncmp(key, "IGNOREEOF", 9) == 0) {
+        g_opt_ignoreeof = env_find("IGNOREEOF", 9) >= 0;
         return;
     }
     bool hsize = (klen == 8 && strncmp(key, "HISTSIZE", 8) == 0);
