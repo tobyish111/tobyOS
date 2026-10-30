@@ -3956,6 +3956,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
     const size_t elem_cap = elemb.cap;
     SH_SB(pend);               /* an associative literal's dangling KEY */
     bool pend_key = false;
+    bool pend_bad = false;     /* ...and it is null: its pair is dropped */
     bool saw_keyed = false;    /* a [k]=v element turns pairing OFF */
     for (;;) {
         /* `;` separates too: the reader joins continued physical lines
@@ -4228,12 +4229,27 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             }
             sh_xt_lit_note(0, kj.p, false);
             if (!pend_key) {
+                /* A NULL KEY is bash's "WORD: bad array subscript", the
+                 * word as written -- '' when the list is a declaration's
+                 * argument, which bash quotes again -- and its pair is
+                 * dropped; tsh stored the key "" (logs/b42 apair p8 p9) */
+                pend_bad = !kj.p || !*kj.p;
+                if (pend_bad) {
+                    bool decl = g_this_cmd_name &&
+                        (strcmp(g_this_cmd_name, "declare") == 0 ||
+                         strcmp(g_this_cmd_name, "typeset") == 0 ||
+                         strcmp(g_this_cmd_name, "local") == 0 ||
+                         strcmp(g_this_cmd_name, "readonly") == 0 ||
+                         strcmp(g_this_cmd_name, "export") == 0);
+                    kprintf("%s: bad array subscript\n", decl ? "''" : elem);
+                }
                 if (sb_set(&pend, kj.p) < 0) return -1;
                 pend_key = true;
                 continue;
             }
-            if (sh_array_set_key(dst, pend.p, kj.p) < 0) return -1;
             pend_key = false;
+            if (pend_bad) continue;
+            if (sh_array_set_key(dst, pend.p, kj.p) < 0) return -1;
             continue;
         }
         {
@@ -4276,7 +4292,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         }
     }
     /* An odd number of bare words leaves the last KEY holding "". */
-    if (pend_key && sh_array_set_key(dst, pend.p, "") < 0) return -1;
+    if (pend_key && !pend_bad && sh_array_set_key(dst, pend.p, "") < 0) return -1;
     *nextp = next;
     return 0;
 }
