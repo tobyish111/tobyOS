@@ -44501,7 +44501,27 @@ static bool shell_try_for_command(const char *src) {
         if (g_opt_xtrace && xt_head.p) shell_xt_head(xt_head.p, xt_ws, xt_we, 0);
         shell_run_debug_trap();
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
-        if (env_set(name, items->argv[i]) < 0) {
+        /* A REFERENCE AS THE LOOP'S VARIABLE IS REBOUND to each word, not
+         * written through: `declare -n v=v1; for v in v1 v2` makes v name
+         * v1, then v2. A word that names no variable ends the loop, "`1':
+         * not a valid identifier", status 1. tsh assigned the words to v1
+         * (bash; logs/b41 nref7 g1-g4, bash's nameref5.sub). */
+        if (shell_is_nameref(name)) {
+            if (!shell_valid_nameref_value(items->argv[i])) {
+                kprintf("`%s': not a valid identifier\n", items->argv[i]);
+                last = 1;
+                goto done;
+            }
+            int rx = env_find(name, strlen(name));
+            g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
+            int rrc = env_set(name, items->argv[i]);
+            rx = env_find(name, strlen(name));
+            if (rx >= 0) g_env_flags[rx] |= SHVAR_NAMEREF;
+            if (rrc < 0) {
+                last = 1;
+                goto done;
+            }
+        } else if (env_set(name, items->argv[i]) < 0) {
             kprintf("for: failed to set '%s'\n", name);
             last = 1;
             goto done;
