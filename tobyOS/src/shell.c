@@ -10839,6 +10839,7 @@ static void cmd_declare(int argc, char **argv) {
     }
 
     for (; i < argc; i++) {
+        bool nref = set_nameref;     /* -n, for this name (see below) */
         /* IN A FUNCTION, `declare` and `typeset` MAKE LOCALS, as `local`
          * does -- unless -g. tsh's declare always wrote the variable it
          * could see, so `f() { declare v=in; }` changed the caller's v. */
@@ -10853,7 +10854,7 @@ static void cmd_declare(int argc, char **argv) {
          * word is NAME's target with the rest of it, for this name only. */
         SH_SB(rearg);
         struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
-        if (!set_nameref && !clear_nameref) {
+        if (!nref && !clear_nameref) {
             size_t nl = env_key_len(argv[i]);
             nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(rn);
@@ -10876,6 +10877,17 @@ static void cmd_declare(int argc, char **argv) {
         else klen = strlen(argv[i]);
         {
             const char *lb = shell_decl_element_lb(argv[i], klen);
+            /* A REFERENCE CANNOT BE AN ARRAY: `declare -n x[3]=x` is "x[3]:
+             * reference variable cannot be an array", status 1, and so is
+             * -n over a name that is an array (below). tsh made x[3] and
+             * the array's element 0 (bash; logs/b41 nref7 g5 g7, bash's
+             * nameref6.sub). */
+            if (lb && nref) {
+                kprintf("%s: %.*s: reference variable cannot be an array\n",
+                        argv[0], (int)klen, argv[i]);
+                shell_set_status(1);
+                continue;
+            }
             if (lb) {
                 if (!shell_decl_element(argv[i], klen, lb, has_value, d_append,
                                         make_local, set_assoc, attr_on, attr_off,
@@ -10912,7 +10924,7 @@ static void cmd_declare(int argc, char **argv) {
          *
          * tsh made all of these references (Oils 1865). A name or an
          * element (`a[1]`, `a[@]`) is a name. */
-        if (set_nameref) {
+        if (nref) {
             const char *nv = 0;
             if (has_value && !d_append) {
                 nv = argv[i] + env_key_len(argv[i]) + 1;
@@ -10939,6 +10951,16 @@ static void cmd_declare(int argc, char **argv) {
                             (void)env_set_attr_holder(name);
                         }
                     }
+                } else if (has_value && nv[0] == '(' &&
+                           !shell_kv_scalar_paren(argv[i], nv)) {
+                    /* a WRITTEN `(...)` is an array, and the array is made:
+                     * `declare -n a=(1 2)` is "a: reference variable cannot
+                     * be an array", status 1, and a=(1 2) (bash; logs/b41
+                     * nref9 i5, bash's nameref22.sub) */
+                    kprintf("%s: %s: reference variable cannot be an array\n",
+                            argv[0], name);
+                    shell_set_status(1);
+                    nref = false;
                 } else if (!shell_valid_nameref_value(nv)) {
                     kprintf("%s: `%s': invalid variable name for name "
                             "reference\n", argv[0], nv);
@@ -10962,6 +10984,20 @@ static void cmd_declare(int argc, char **argv) {
                     shell_set_status(1);
                     continue;
                 }
+            }
+        }
+        /* ...after the name is checked, -n over an array (a name about to
+         * be a fresh local of this function is none) */
+        if (nref &&
+            !(make_local && !shell_local_declared_here(name, g_script_depth))) {
+            int ax = env_find(name, klen);
+            if (sh_array_find_literal(name) ||
+                (ax >= 0 && (g_env_flags[ax] & SHVAR_ARRAY) &&
+                 !(g_env_flags[ax] & SHVAR_NAMEREF))) {
+                kprintf("%s: %s: reference variable cannot be an array\n",
+                        argv[0], name);
+                shell_set_status(1);
+                continue;
             }
         }
 
@@ -11005,7 +11041,7 @@ static void cmd_declare(int argc, char **argv) {
              * plain local r, where tsh wrote 9 through r (bash; logs/b41
              * nref5 e3). The push above keeps the flag for the return. */
             int rx = env_find(name, klen);
-            if (rx >= 0 && !set_nameref) g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
+            if (rx >= 0 && !nref) g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
         }
 
         /* BEFORE the assignment: the literal parser asks whether the array is
@@ -11027,9 +11063,16 @@ static void cmd_declare(int argc, char **argv) {
          * name is already one, that assignment went to the OLD target and the
          * rebind never happened: `ref` still pointed at x and x had been
          * overwritten with the string `y`. */
-        if (set_nameref && has_value) {
+        if (nref && has_value) {
             int pre = env_find(name, klen);
             if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_NAMEREF;
+        }
+        /* ...and a reference holds a NAME: -i -l -u go, so `declare -i x=1;
+         * declare -n x=y` stores y, not y's value 42, and `declare +n x`
+         * leaves x="y" (bash; logs/b41 nref7 g6, bash's nameref6.sub) */
+        if (nref) {
+            int pre = env_find(name, klen);
+            if (pre >= 0) g_env_flags[pre] &= ~(unsigned char)SHVAR_VALUE_ATTRS;
         }
 
         /* -i -l -u go on BEFORE the value: `declare -i x=1+2` stores 3. */
@@ -11087,7 +11130,7 @@ static void cmd_declare(int argc, char **argv) {
          * another declare passes it on to its target (finding 320). */
         if (set_readonly) {
             SH_SB(rot);
-            if (set_nameref) (void)shell_readonly_mark(name, klen);
+            if (nref) (void)shell_readonly_mark(name, klen);
             else if (shell_readonly_target(argv[0], name, klen, &rot))
                 (void)shell_readonly_mark(rot.p, strlen(rot.p));
         }
@@ -11099,7 +11142,7 @@ static void cmd_declare(int argc, char **argv) {
          * name being referred to and setting it must not go through the
          * reference that does not exist yet. */
         if (set_array)     g_env_flags[idx] |= SHVAR_ARRAY;
-        if (set_nameref)   g_env_flags[idx] |= SHVAR_NAMEREF;
+        if (nref)   g_env_flags[idx] |= SHVAR_NAMEREF;
         if (clear_nameref) g_env_flags[idx] &= ~(unsigned char)SHVAR_NAMEREF;
         /* `set -a` exports every variable an assignment creates, and a
          * declaration utility makes assignments like any other. */
