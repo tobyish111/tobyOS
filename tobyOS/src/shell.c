@@ -4827,6 +4827,21 @@ static int env_set_kv(const char *kv_in) {
                 g_assign_fail_hit = true;
                 return -1;
             }
+            /* A REFERENCE WITH NO TARGET TAKES THE VALUE AS ONE, and it must
+             * name a variable: `declare -n r; r=12345` is "`12345': not a
+             * valid identifier", status 1, the line discarded as for any
+             * failed assignment, and r stays a reference with no target.
+             * tsh stored 12345 (bash; logs/b41 nref10 j1 j3). */
+            if (real == nm && !g_env_attr_only) {
+                int rx = env_find(nm, klen);
+                const char *nv = kv_in + klen + 1;
+                if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF) &&
+                    !g_env[rx][klen + 1] && !shell_valid_nameref_value(nv)) {
+                    kprintf("`%s': not a valid identifier\n", nv);
+                    g_assign_fail_hit = true;
+                    return -1;
+                }
+            }
             if (real != nm && strcmp(real, nm) != 0) {
                 /* The value is any length. It was a 256-byte array, and a
                  * longer value set the REFERENCE ITSELF, not its target. */
@@ -9723,7 +9738,11 @@ static void cmd_local(int argc, char **argv) {
              * It was removed outright, so nothing knew it was local. */
             int idx = env_find(name, klen);
             if (idx >= 0) env_remove_at(idx);
-            if (!l_nameref) (void)env_set_attr_holder(name);
+            /* ...a reference too: `local -n l` is `declare -n l`, a
+             * reference with no target -- with no entry its -n had
+             * nowhere to go, and `l=x` made a plain l (bash; logs/b41
+             * nref10 j3) */
+            (void)env_set_attr_holder(name);
         }
         if (l_array) {
             /* a holder only where there is no entry: an empty array has no
@@ -11094,6 +11113,27 @@ static void cmd_declare(int argc, char **argv) {
             env_set_attr_holder(name) == 0) {
             int ax = env_find(name, klen);
             if (ax >= 0) g_env_flags[ax] |= SHVAR_ARRAY;
+        }
+        /* declare's own word for a reference with no target that is given
+         * no name: at the top "declare: `12345': not a valid identifier"
+         * and the reference is gone; in the function that made it "`12345':
+         * invalid variable name for name reference" and it stays (bash;
+         * logs/b41 nref9 i1, nref10 j2, bash's nameref13.sub) */
+        if (has_value && !nref && !d_append) {
+            int rx = env_find(name, klen);
+            const char *nv = argv[i] + env_key_len(argv[i]) + 1;
+            if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF) &&
+                !g_env[rx][klen + 1] && !shell_valid_nameref_value(nv)) {
+                if (make_local) {
+                    kprintf("%s: `%s': invalid variable name for name reference\n",
+                            argv[0], nv);
+                } else {
+                    kprintf("%s: `%s': not a valid identifier\n", argv[0], nv);
+                    env_remove_at(rx);
+                }
+                shell_set_status(1);
+                continue;
+            }
         }
         if (has_value) {
             g_readonly_hit = false;
