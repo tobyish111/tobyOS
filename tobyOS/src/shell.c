@@ -9800,6 +9800,18 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
         int ix = env_find(base, bl);
         if (ix >= 0) env_remove_at(ix);
     }
+    /* AN ELEMENT OPERAND OF A REFERENCE is the reference's own: `declare -n
+     * x=arr; declare -a x[1]=one` is "warning: x: removing nameref
+     * attribute" and x=([1]="one"), arr untouched -- with no target too,
+     * and for declare x[1]=v and -A. tsh wrote arr[1], or said "`': not a
+     * valid identifier" (bash's nameref15.sub; logs/b42 nref19 d6-d9). */
+    if (!make_local) {
+        int rx = env_find(base, bl);
+        if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF)) {
+            kprintf("warning: %s: removing nameref attribute\n", base);
+            env_remove_at(rx);
+        }
+    }
     if (assoc && sh_array_make_assoc(base) < 0) return false;
     if (!sh_array_find(base)) {
         if (env_get(base)) {
