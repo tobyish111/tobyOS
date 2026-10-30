@@ -4169,8 +4169,15 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
              *     declare -A a=([j]=1 2 3 4)   ->  keys ['j'] vals ['1']
              *
              * so a [k]=v element seen earlier turns pairing off rather
-             * than letting `2 3 4` invent three more entries. */
-            if (saw_keyed) continue;
+             * than letting `2 3 4` invent three more entries -- and says
+             * so, "chaff: four: must use subscript when assigning
+             * associative array", which tsh did not (bash's assoc.tests;
+             * logs/b41 assoc2 y1) */
+            if (saw_keyed) {
+                kprintf("%s: %s: must use subscript when assigning associative "
+                        "array\n", name, elem);
+                continue;
+            }
             SH_SB(kx);
             SH_SB(kj);
             if (shell_expand_word_ex(elem, &kx, true, true) < 0)
