@@ -23502,19 +23502,30 @@ static void cmd_command(int argc, char **argv) {
     bool locate = false;
     bool use_default_path = false;
     int i = 1;
+    /* bash's options, "pvV" combined as they like and `--` ending them;
+     * any other letter is "command: -i: invalid option" and the usage
+     * line, status 2 -- tsh ran a command called -i (errors.tests;
+     * logs/b42 errs2 f10) */
     while (i < argc && argv[i][0] == '-' && argv[i][1]) {
-        if (strcmp(argv[i], "-v") == 0) { locate = true; i++; }
-        else if (strcmp(argv[i], "-V") == 0) { verbose = true; i++; }
-        else if (strcmp(argv[i], "-p") == 0) {
-            if (g_restricted) {
-                kprintf("command: -p: restricted\n");
-                shell_set_status(1);
-                return;
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
+        for (const char *c = argv[i] + 1; *c; c++) {
+            if (*c == 'v') { locate = true; continue; }
+            if (*c == 'V') { verbose = true; continue; }
+            if (*c == 'p') {
+                if (g_restricted) {
+                    kprintf("command: -p: restricted\n");
+                    shell_set_status(1);
+                    return;
+                }
+                use_default_path = true;
+                continue;
             }
-            use_default_path = true;
-            i++;
+            kprintf("command: -%c: invalid option\n", *c);
+            kprintf_raw("command: usage: command [-pVv] command [arg ...]\n");
+            shell_set_status(2);
+            return;
         }
-        else break;
+        i++;
     }
     if (i >= argc) {
         shell_set_status(0);
