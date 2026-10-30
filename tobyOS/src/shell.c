@@ -10782,6 +10782,7 @@ static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
     bool clear_readonly = false;          /* +r: refused for a readonly name */
+    bool clear_array = false;             /* +a, +A: refused for an array */
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
     bool set_assoc = false;
@@ -10811,11 +10812,11 @@ static void cmd_declare(int argc, char **argv) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
             case 'r': if (on) set_readonly = true; else clear_readonly = true; break;
             case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
-            case 'a': if (on) set_array = true; break;
+            case 'a': if (on) set_array = true; else clear_array = true; break;
             /* -A is ASSOCIATIVE, and that is a different type from -a:
              * its subscripts are literal strings rather than arithmetic.
              * They shared a case while neither did anything. */
-            case 'A': if (on) { set_array = true; set_assoc = true; } break;
+            case 'A': if (on) { set_array = true; set_assoc = true; } else clear_array = true; break;
             case 'p': if (on) print_mode = true; break;
             /* `-f` and `-F` were PARSED AND THEN DROPPED -- they sat in the
              * ignore list with -i/-u/-l, so `declare -F` fell through to the
@@ -11138,6 +11139,18 @@ static void cmd_declare(int argc, char **argv) {
                               g_env[rro][klen + 1];
         bool ref_no_target = rro >= 0 && (g_env_flags[rro] & SHVAR_NAMEREF) &&
                              !g_env[rro][klen + 1];
+        /* +a or +A OF AN ARRAY: bash's "cannot destroy array variables in
+         * this way", status 1; tsh said nothing (bash's assoc.tests;
+         * logs/b41 assoc2 y2) */
+        if (clear_array &&
+            (sh_array_find(name) ||
+             (rro >= 0 && (g_env_flags[rro] & SHVAR_ARRAY) &&
+              !(g_env_flags[rro] & SHVAR_NAMEREF)))) {
+            kprintf("%s: %s: cannot destroy array variables in this way\n",
+                    argv[0], name);
+            shell_set_status(1);
+            continue;
+        }
         if (((clear_readonly && !ref_no_target) || (clear_nameref && ref_has_target)) &&
             shell_readonly_key(name, klen)) {
             shell_readonly_print_error(name, klen, argv[0]);
