@@ -10983,6 +10983,13 @@ static void cmd_shopt_in(int argc, char **argv) {
             }
         }
     }
+    /* -s with -u: bash refuses both, status 1 (errors.tests; logs/b42
+     * errs2 f9) -- tsh unset the option */
+    if (set && unset) {
+        kprintf("shopt: cannot set and unset shell options simultaneously\n");
+        shell_set_status(1);
+        return;
+    }
 
     /* `-o` ADDRESSES THE `set -o` OPTIONS. It was parsed and then ignored, so
      * `shopt -o nounset` looked up `nounset` in the SHOPT table, did not find
