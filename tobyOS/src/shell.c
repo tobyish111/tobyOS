@@ -4280,6 +4280,11 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         if (!real || !*real) real = name;
         int si = env_find(real, strlen(real));
         if (si >= 0 && !(g_env_flags[si] & SHVAR_ARRAY)) {
+            /* a reference with no target becomes the array, and says so --
+             * as sh_array_create does for mapfile and read -a (bash;
+             * logs/b41 nref12 m1) */
+            if ((g_env_flags[si] & SHVAR_NAMEREF) && !g_env[si][strlen(real) + 1])
+                kprintf("warning: %s: removing nameref attribute\n", real);
             env_remove_at(si);
             /* ...but not its attributes: they are the NAME's, and the
              * array keeps them, so `typeset -i x; x=(1); x+=(3+4)` adds 7
@@ -4489,6 +4494,18 @@ static int sh_try_array_assignment(const char *kv) {
             sub = k;
         }
         if (!shell_name_is_valid(name, strlen(name))) return 0;
+        /* AN ELEMENT OF A REFERENCE WITH NO TARGET names nothing: bash's
+         * "`': not a valid identifier", an assignment error -- tsh made the
+         * reference an array with an empty element 0 (logs/b41 nref12 m4) */
+        {
+            size_t nl = strlen(name);
+            int rx = env_find(name, nl);
+            if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF) && !g_env[rx][nl + 1]) {
+                kprintf("`': not a valid identifier\n");
+                g_assign_fail_hit = true;
+                return -1;
+            }
+        }
         if (!expand_sub && shell_nameref_elem_write(name, true) < 0) return -1;
         /* A LIST IS NO MEMBER'S VALUE: `a[-1]+=(4 5)` is bash's "a[-1]:
          * cannot assign list to array member", status 1 and the rest of
@@ -7973,6 +7990,22 @@ static struct sh_array *sh_array_create(const char *name) {
     SH_SB(tgt);
     const char *real = env_deref_name_ex(name, &tgt, false);
     if (real && *real) name = real;
+    /* AN ARRAY MADE UNDER A REFERENCE WITH NO TARGET makes it an array:
+     * "warning: r: removing nameref attribute" -- r=(1 2), mapfile r, read
+     * -a r, coproc r. tsh kept -n over the new array, so declare -p and
+     * every read saw the reference (bash; logs/b41 nref12 m1-m3, bash's
+     * nameref11.sub). */
+    {
+        size_t nl = strlen(name);
+        int rx = env_find(name, nl);
+        if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF) && !g_env[rx][nl + 1]) {
+            kprintf("warning: %s: removing nameref attribute\n", name);
+            /* ...its entry goes, as an array literal's scalar does: a
+             * scalar of the name wins every read, and `echo $r` of the
+             * coprocess's array was "" (bash: 63) */
+            env_remove_at(rx);
+        }
+    }
     a = (struct sh_array *)kmalloc(sizeof *a);
     if (!a) return 0;
     memset(a, 0, sizeof *a);
