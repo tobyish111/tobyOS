@@ -10820,7 +10820,9 @@ static void cmd_declare(int argc, char **argv) {
             if (kl == 0 || sb_putmem(&nmb, argv[i], kl) < 0) continue;
             const char *nm = nmb.p;
             if (!shell_declare_print(nm)) {
-                kprintf("declare: %s: not found\n", nm);
+                /* named as it was called: `typeset -p x` is "typeset: x:
+                 * not found" (bash; logs/b41 gopts6 q1) */
+                kprintf("%s: %s: not found\n", argv[0], nm);
                 shell_set_status(1);
             }
         }
