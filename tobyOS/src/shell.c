@@ -9508,6 +9508,8 @@ static struct shell_prefix_one *shell_tempenv_find(const char *name, int *level)
     return 0;
 }
 
+static void shell_opts_snapshot(struct shell_sb *out);
+static void shell_opts_restore(const char *list);
 struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
     unsigned long seq;    /* g_scope_seq when it was made */
@@ -9930,6 +9932,16 @@ static bool shell_locals_have(const char *name, int depth) {
 static void shell_locals_pop(int depth) {
     while (g_localc > 0 && g_locals[g_localc - 1].depth >= depth) {
         struct shell_local_save *sv = &g_locals[--g_localc];
+        /* `local -`: each `set -o` option that differs from the list noted
+         * (kv, ":name:...:") is set back, as `set -o`/`set +o` would */
+        if (sv->name && strcmp(sv->name, "-") == 0) {
+            if (sv->kv && !sv->dead) shell_opts_restore(sv->kv);
+            kfree(sv->name);
+            kfree(sv->kv);
+            sv->name = 0;
+            sv->kv = 0;
+            continue;
+        }
         if (sv->dead) {
             /* a callee unset it: the outer value is already back, and
              * whatever was assigned since belongs to the outer scope */
@@ -10168,9 +10180,12 @@ static void cmd_local(int argc, char **argv) {
                 (const char **)kmalloc((size_t)(g_localc + 1) * sizeof *ln);
             if (!ln) { shell_set_status(1); return; }
             int n = 0;
+            /* `local -` is listed first, as itself (see below) */
+            if (shell_local_declared_here("-", g_script_depth))
+                shell_printf("local -\n");
             for (int i = 0; i < g_localc; i++) {
                 if (g_locals[i].depth != g_script_depth || !g_locals[i].name ||
-                    g_locals[i].dead)
+                    g_locals[i].dead || strcmp(g_locals[i].name, "-") == 0)
                     continue;
                 bool dup = false;
                 for (int k = 0; k < n; k++)
@@ -10252,6 +10267,22 @@ static void cmd_local(int argc, char **argv) {
         }
     }
     for (int i = first; i < argc; i++) {
+        /* `local -` MAKES THE SHELL'S OPTIONS LOCAL: the `set -o` ones on
+         * now are noted, and the function's return sets each one that
+         * differs back -- shopt's are not among them. tsh said "`-': not a
+         * valid identifier" (bash's varenv21.sub; logs/b42 localdash). */
+        if (strcmp(argv[i], "-") == 0) {
+            if (!shell_local_declared_here("-", g_script_depth) &&
+                shell_locals_push("-", g_script_depth) == 0) {
+                SH_SB(on);
+                shell_opts_snapshot(&on);
+                struct shell_local_save *sv = &g_locals[g_localc - 1];
+                kfree(sv->kv);
+                sv->kv = shell_strdup(on.p ? on.p : ":");
+                sv->existed = false;
+            }
+            continue;
+        }
         /* THE FUNCTION'S OWN REFERENCE passes local's work on to its target,
          * as declare's does: `local -n ref=var; local -i ref=([1]=)` makes
          * a local -i array var. A reference the function did not make is
@@ -12848,6 +12879,32 @@ static bool shell_set_opt_by_name(const char *name, bool on) {
         return true;
     }
     return false;
+}
+
+/* `local -`'s note of the `set -o` options on, ":name:...:", and the
+ * setting back of each one that differs from it (cmd_local,
+ * shell_locals_pop). */
+static void shell_opts_snapshot(struct shell_sb *out) {
+    (void)sb_puts(out, ":");
+    for (size_t k = 0; k < SHELL_NOPTDEFS; k++)
+        if (*g_optdefs[k].var) {
+            (void)sb_puts(out, g_optdefs[k].name);
+            (void)sb_putc(out, ':');
+        }
+}
+
+static void shell_opts_restore(const char *list) {
+    for (size_t k = 0; k < SHELL_NOPTDEFS; k++) {
+        const char *nm = g_optdefs[k].name;
+        size_t nl = strlen(nm);
+        bool was = false;
+        for (const char *q = list; *q; q++)
+            if (*q == ':' && strncmp(q + 1, nm, nl) == 0 && q[1 + nl] == ':') {
+                was = true;
+                break;
+            }
+        if (*g_optdefs[k].var != was) (void)shell_set_opt_by_name(nm, was);
+    }
 }
 
 /* Is a `set -o` option currently on? Used by `test -o NAME`. */
