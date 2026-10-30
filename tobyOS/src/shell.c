@@ -3313,6 +3313,7 @@ static const char *shell_skip_dollar_group(const char *p);
 static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
 static void shell_global_exchange(int si);
 static bool shell_nameref_names_self(const char *v, const char *name);
+static void sh_assoc_size_like(const char *tmp, const char *name);
 static int shell_local_oldest(const char *name);
 struct sh_array;
 static struct sh_array *shell_local_saved_array(int si);
@@ -4386,6 +4387,11 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         sh_array_unset_literal(tmp);
         return -1;
     }
+    /* ...a table of the size of the one it replaces: bash's list
+     * assignment keeps the old table's bucket count (an array converted
+     * from a scalar has 128, shell_decl_convert), and the order its keys
+     * list in is that table's (bash's varenv11.sub; logs/b42 t15) */
+    if (assoc) sh_assoc_size_like(tmp, name);
     struct sh_litq q = { 0, 0, 0 };
     SH_SB(xtd);                         /* see g_xtd and sh_xt_lit_note */
     struct shell_sb *xtd_saved = g_xt_litd;
@@ -9120,6 +9126,12 @@ static int shell_decl_convert(const char *name, bool assoc, const char *label,
         return -1;
     if (sh_array_make_assoc(name) < 0) return -1;
     if (scalar) {
+        /* bash's convert_var_to_assoc makes its table at the hash
+         * library's default size, 128 buckets, where `declare -A` makes
+         * 1024: the keys list in that table's order (see
+         * sh_assoc_nbuckets; bash's varenv11.sub; logs/b42 t15) */
+        struct sh_array *ca = sh_array_find(name);
+        if (ca && ca->n == 0) ca->nbuckets = 128;
         if (sh_array_set_key(name, "0", old.p) < 0) return -1;
         si = env_find(name, strlen(name));
         if (si >= 0) env_remove_at(si);
@@ -9144,6 +9156,13 @@ static int shell_decl_convert(const char *name, bool assoc, const char *label,
  * (sh_bash_hash). */
 static unsigned sh_assoc_nbuckets(const struct sh_array *a) {
     return a->nbuckets > 0 ? (unsigned)a->nbuckets : 1024u;
+}
+
+/* The empty table TMP made the size of NAME's (sh_array_assign_literal). */
+static void sh_assoc_size_like(const char *tmp, const char *name) {
+    struct sh_array *da = sh_array_find(name);
+    struct sh_array *ta = sh_array_find_literal(tmp);
+    if (da && ta && ta->n == 0) ta->nbuckets = da->nbuckets;
 }
 
 /* bash's hash_rehash into NB buckets: old buckets in order, each list from
