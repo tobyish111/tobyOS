@@ -10148,6 +10148,7 @@ static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
     g_env_flags[ix] = (unsigned char)((g_env_flags[ix] & ~off) | on);
 }
 
+static bool g_decl_elem_array;         /* declare's -a, for shell_decl_element */
 static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
                                bool has_value, bool append, bool make_local,
                                bool assoc, unsigned attr_on, unsigned attr_off,
@@ -10160,6 +10161,7 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
         return false;
     }
     const char *base = baseb.p;
+    bool was_there = env_find(base, bl) >= 0 || sh_array_find(base) != 0;
     if (make_local && !shell_local_declared_here(base, g_script_depth)) {
         if (shell_locals_push(base, g_script_depth) < 0) return false;
         int ix = env_find(base, bl);
@@ -10192,6 +10194,26 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
     if (!has_value) return true;
     const char *val = word + nlen + (append ? 2 : 1);
     size_t vl = strlen(val);
+    /* A QUOTED `(...)` -- one a quote or an expansion made -- is a list for
+     * the whole NAME under -a, the subscript let go: `declare -a
+     * e[10]='(test)'` is e=([0]="test"). Without -a it is the element's
+     * value, and over a name that was not there bash warns that the form
+     * is deprecated (bash's array.tests, array19.sub; logs/b42 arr1 a4 a5).
+     * tsh gave the element the text every time. */
+    if (vl >= 2 && val[0] == '(' && val[vl - 1] == ')' &&
+        shell_kv_scalar_paren(word, val)) {
+        if (g_decl_elem_array) {
+            SH_SB(lk);
+            if (sb_puts(&lk, base) < 0 || sb_puts(&lk, append ? "+=" : "=") < 0 ||
+                sb_puts(&lk, val) < 0)
+                return false;
+            g_assign_fail_hit = false;
+            return env_set_kv(lk.p) >= 0;
+        }
+        if (!was_there)
+            kprintf("warning: %s: quoted compound array assignment deprecated\n",
+                    word);
+    }
     /* a `(...)` that came from a quote or an expansion is just a value */
     if (vl >= 2 && val[0] == '(' && val[vl - 1] == ')' &&
         !shell_kv_scalar_paren(word, val)) {
@@ -11851,9 +11873,12 @@ static void cmd_declare(int argc, char **argv) {
                 continue;
             }
             if (lb) {
-                if (!shell_decl_element(argv[i], klen, lb, has_value, d_append,
-                                        make_local, set_assoc, attr_on, attr_off,
-                                        argv[0])) {
+                g_decl_elem_array = set_array;
+                bool dok = shell_decl_element(argv[i], klen, lb, has_value, d_append,
+                                              make_local, set_assoc, attr_on, attr_off,
+                                              argv[0]);
+                g_decl_elem_array = false;
+                if (!dok) {
                     if (g_shell_flow != SHELL_FLOW_NONE) return;
                     shell_set_status(1);
                     continue;
