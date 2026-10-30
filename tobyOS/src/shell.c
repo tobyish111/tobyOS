@@ -11052,6 +11052,14 @@ static void cmd_declare(int argc, char **argv) {
          * variable", status 1: tsh made a readonly variable a reference,
          * and its readonly mark then went to what it named (bash's
          * nameref11.sub; logs/b41 nref11) -- a fresh local is not it */
+        /* -n WITH -i AND A VALUE: the value is a number before it is a
+         * name, and a number names nothing -- bash makes nothing, says
+         * nothing, status 1; tsh made `declare -in d="1"` (bash's
+         * nameref23.sub; logs/b41 nref16 r3) */
+        if (nref && (attr_on & SHVAR_INTEGER) && has_value) {
+            shell_set_status(1);
+            continue;
+        }
         if (nref && shell_readonly_key(name, klen) &&
             !(make_local && !shell_local_declared_here(name, g_script_depth))) {
             shell_readonly_print_error(name, klen, argv[0]);
