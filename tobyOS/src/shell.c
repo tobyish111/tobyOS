@@ -3368,6 +3368,15 @@ static const char *env_get(const char *key) {
                 long ix = 0;
                 if (!sh_subscript_eval(esub, enm, true, &ix)) return "";
                 const char *v = sh_array_get(enm, ix);
+                /* element 0 of a scalar is the scalar: `b=4; declare -n
+                 * f='b[0]'; echo $f` is 4 -- it read "" (bash; logs/b41
+                 * nref1 a9, bash's nameref4.sub) */
+                if (!v && ix == 0 && !sh_array_find(enm)) {
+                    size_t el = strlen(enm);
+                    int sx = env_find(enm, el);
+                    if (sx >= 0 && !(g_env_flags[sx] & (SHVAR_NAMEREF | SHVAR_NOVALUE)))
+                        v = g_env[sx] + el + 1;
+                }
                 return v ? v : "";
             }
         }
@@ -31366,12 +31375,48 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                     if (ea && ea->assoc) v = sh_array_get_key(rname.p, sub.p);
                     else if (sh_subscript_eval(sub.p, rname.p, false, &aidx))
                         v = sh_array_get(rname.p, aidx);
+                    /* element 0 of a scalar is the scalar, through a
+                     * reference too: `t=v; declare -n r=t; ${!r[0]}` is $v
+                     * (bash; logs/b41 nref1 a2, bash's nameref1.sub) */
+                    if (!v && !ea && aidx == 0) v = env_get(rname.p);
                     if (v) {
                         if (sb_set(&refval, v) < 0) return -1;
                         ref_set = true;
                     }
                     have_ref = true;
                     rest = rb + 1;
+                    /* AN ELEMENT THAT IS NOT SET, OF A VARIABLE THAT IS,
+                     * expands to nothing, as the plain form below does --
+                     * `x=y; ${!x[1]}` is empty; only a name that is no
+                     * variable at all, through a reference too, is
+                     * "NAME[SUB]: invalid indirect expansion". tsh said
+                     * "x: invalid indirect expansion" for both (bash;
+                     * logs/b41 nref6 f1 f3). */
+                    if (!ref_set) {
+                        if (!ea && !env_get(rname.p)) {
+                            kprintf(SH_PFX_SHELL "%s[%s]: invalid indirect "
+                                    "expansion\n", rname.p, sub.p);
+                            g_bad_subst_soft = true;
+                            return -1;
+                        }
+                        if (!*rest) return 0;
+                        const char *t = rest[0] == ':' ? rest + 1 : rest;
+                        if (*t == '=') {
+                            kprintf(SH_PFX_SHELL "!%s: invalid indirect expansion\n",
+                                    rname.p);
+                            g_bad_subst_soft = true;
+                            return -1;
+                        }
+                        if (*t == '-' || *t == '+' || *t == '?') {
+                            SH_SB(ue);
+                            (void)env_unset("SHELL_INDIR_UNSET");
+                            if (sb_puts(&ue, "SHELL_INDIR_UNSET") < 0 ||
+                                sb_puts(&ue, rest) < 0)
+                                return -1;
+                            return shell_expand_braced_parameter(ue.p, b);
+                        }
+                        return 0;
+                    }
                 }
             } else {
                 /* ${!ref} ON A NAMEREF IS THE NAME IT REFERS TO: bash
