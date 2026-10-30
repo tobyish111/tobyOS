@@ -546,8 +546,18 @@ static unsigned long g_nofork_gen;   /* ...the one whose command may exec */
  * may; a subshell running in place may not -- it would take its parent
  * with it -- and neither may the kernel shell. */
 static bool g_replace_ok;
-static int g_getopts_last_optind;
-static int g_getopts_char_index;
+/* getopts' PLACE: the word it is at (1-based), the character in that word,
+ * and the number OPTIND held after getopts wrote it -- read back, so a
+ * readonly OPTIND it could not write still matches and the scan goes on
+ * from its own place, as bash's does (logs/b41 gopts3 k8). `stale`: OPTIND
+ * was written since, and the next getopts starts from its value. */
+struct shell_getopts_place {
+    int  optind;
+    int  char_index;
+    int  last_optind;
+    bool stale;
+};
+static struct shell_getopts_place g_getopts = { 1, 1, 0, true };
 static bool g_getopts_internal_optind_write;
 static struct file *g_shell_fd_base[SHELL_FD_BASE];
 static struct file **g_shell_fd = g_shell_fd_base;
@@ -2996,8 +3006,7 @@ static void shell_getopts_note_external_optind_write(const char *key,
                                                      size_t klen) {
     if (g_getopts_internal_optind_write) return;
     if (!shell_key_eq(key, klen, "OPTIND")) return;
-    g_getopts_last_optind = 0;
-    g_getopts_char_index = 1;
+    g_getopts.stale = true;
 }
 
 /* Walk the table looking for `key` (NUL-terminated) and return its
@@ -9243,7 +9252,18 @@ static void shell_local_unbind(struct shell_local_save *sv) {
         }
     }
     shell_local_restore_scalar(sv);
+    /* an unset OPTIND starts getopts over, a caller's local one too (bash;
+     * logs/b41 gopts2 h9) -- the restore above writes the table directly */
+    if (strcmp(sv->name, "OPTIND") == 0) g_getopts.stale = true;
     sv->dead = true;
+}
+
+/* Did the frame at `depth` -- its body, a file it sourced, an eval in it --
+ * make `name` local? */
+static bool shell_locals_have(const char *name, int depth) {
+    for (int i = g_localc - 1; i >= 0 && g_locals[i].depth >= depth; i--)
+        if (g_locals[i].name && strcmp(g_locals[i].name, name) == 0) return true;
+    return false;
 }
 
 /* Undo every localisation made at `depth`, newest first. */
@@ -11972,12 +11992,30 @@ static int shell_getopts_set_name(const char *name, char value) {
     return env_set(name, buf);
 }
 
+/* OPTIND as getopts reads it: its number, 1 when unset or not a number. */
+static int shell_getopts_optind_value(void) {
+    int v = 1;
+    const char *s = env_get("OPTIND");
+    if (!s || parse_int(s, &v) < 0) v = 1;
+    return v;
+}
+
+/* Leave OPTIND at `optind` and getopts' place at character `ci` of that
+ * word. A readonly OPTIND says so and keeps its value; the place moves on
+ * all the same, and getopts' status is not the write's (bash; logs/b41
+ * gopts2 h6). */
+static void shell_getopts_leave(int optind, int ci) {
+    (void)shell_getopts_set_int("OPTIND", optind);
+    g_getopts.optind = optind;
+    g_getopts.char_index = ci;
+    g_getopts.last_optind = shell_getopts_optind_value();
+    g_getopts.stale = false;
+}
+
 static void shell_getopts_finish_end(const char *name, int optind) {
     (void)shell_getopts_set_name(name, '?');
     (void)env_unset("OPTARG");
-    (void)shell_getopts_set_int("OPTIND", optind);
-    g_getopts_last_optind = optind;
-    g_getopts_char_index = 1;
+    shell_getopts_leave(optind, 1);
     shell_set_status(1);
 }
 
@@ -12020,60 +12058,64 @@ static void cmd_getopts_in(int argc, char **argv) {
     int arg_count = (argc > 3) ? (argc - 3) : g_positional_count;
     char **args = (argc > 3) ? &argv[3] : g_positional;
 
-    int optind = 1;
-    const char *optind_env = env_get("OPTIND");
-    if (optind_env && parse_int(optind_env, &optind) < 0) optind = 1;
-    if (optind < 1) optind = 1;
-    if (optind != g_getopts_last_optind) {
-        g_getopts_char_index = 1;
+    /* WHERE TO START: getopts' own place, unless OPTIND was written since or
+     * holds another number than getopts left in it -- then OPTIND's word,
+     * from its first option. */
+    int val = shell_getopts_optind_value();
+    if (g_getopts.stale || val != g_getopts.last_optind) {
+        g_getopts.optind = val < 1 ? 1 : val;
+        g_getopts.char_index = 1;
     }
-    if (g_getopts_char_index < 1) g_getopts_char_index = 1;
+    int optind = g_getopts.optind;
+    int ci = g_getopts.char_index < 1 ? 1 : g_getopts.char_index;
 
-    const char *arg = 0;
-    for (;;) {
-        if (optind > arg_count) {
-            /* A STALE OPTIND REWINDS TO 1; ONE PAST THE END DOES NOT.
-             *
-             *     set -- -h -c foo x y z ; while getopts ...; done
-             *     echo $OPTIND                     -> 4, stopped at `x`
-             *     set -- ; while getopts ...; done
-             *     echo $OPTIND                     -> 1, rewound
-             *
-             * The second loop starts with OPTIND=4 against no arguments at
-             * all, which cannot mean anything, so bash starts the scan over.
-             * A loop that simply consumed its last option leaves OPTIND one
-             * past the end, and the caller wants that number -- `getopts` in
-             * a function that was called with `-c bar` must report 3.
-             *
-             * That rule is bash's sh_getopt: past the end, OPTIND becomes
-             * argc -- $#+1 -- which is 1 only when there are no arguments.
-             * A second loop over ONE argument ends at 2 (Oils 0895). */
-            shell_getopts_finish_end(name, arg_count + 1);
-            return;
-        }
-        arg = args[optind - 1] ? args[optind - 1] : "";
+    if (optind > arg_count) {
+        /* A STALE OPTIND REWINDS TO 1; ONE PAST THE END DOES NOT.
+         *
+         *     set -- -h -c foo x y z ; while getopts ...; done
+         *     echo $OPTIND                     -> 4, stopped at `x`
+         *     set -- ; while getopts ...; done
+         *     echo $OPTIND                     -> 1, rewound
+         *
+         * The second loop starts with OPTIND=4 against no arguments at
+         * all, which cannot mean anything, so bash starts the scan over.
+         * A loop that simply consumed its last option leaves OPTIND one
+         * past the end, and the caller wants that number -- `getopts` in
+         * a function that was called with `-c bar` must report 3.
+         *
+         * That rule is bash's sh_getopt: past the end, OPTIND becomes
+         * argc -- $#+1 -- which is 1 only when there are no arguments.
+         * A second loop over ONE argument ends at 2 (Oils 0895). */
+        shell_getopts_finish_end(name, arg_count + 1);
+        return;
+    }
+    const char *arg = args[optind - 1] ? args[optind - 1] : "";
+    /* A PLACE AT OR PAST THE END OF ITS WORD STARTS THAT WORD OVER. Only a
+     * place left by other words gets there -- `( getopts pq x -pq )` in a
+     * loop over `-abcde` starts at the loop's character -- and tsh read
+     * past the word's end for it; bash reads the word again from its first
+     * option (logs/b41 gopts3 k6). Inside the word, the next character is
+     * read, whatever the word is. */
+    if (ci > 1 && (size_t)ci >= strlen(arg)) ci = 1;
+    if (ci == 1) {
         if (strcmp(arg, "--") == 0) {
-            optind++;
-            shell_getopts_finish_end(name, optind);
+            shell_getopts_finish_end(name, optind + 1);
             return;
         }
         if (arg[0] != '-' || arg[1] == '\0') {
             shell_getopts_finish_end(name, optind);
             return;
         }
-        if (arg[g_getopts_char_index] != '\0') break;
-        optind++;
-        g_getopts_char_index = 1;
     }
 
-    char opt = arg[g_getopts_char_index++];
+    char opt = arg[ci++];
     const char *spec = shell_getopts_find(optstring, opt);
     int rc = 0;
 
     if (!spec) {
-        if (arg[g_getopts_char_index] == '\0') {
+        if (arg[ci] == '\0') {
             optind++;
-            g_getopts_char_index = 1;
+            ci = 1;
         }
         if (shell_getopts_set_name(name, '?') < 0) rc = 1;
         if (silent) {
@@ -12084,28 +12126,27 @@ static void cmd_getopts_in(int argc, char **argv) {
                         g_param0 ? g_param0 : "tsh", opt);
             if (env_unset("OPTARG") < 0) rc = 1;
         }
-        if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
-        g_getopts_last_optind = optind;
+        shell_getopts_leave(optind, ci);
         shell_set_status(rc ? 1 : 0);
         return;
     }
 
     if (spec[1] == ':') {
-        if (arg[g_getopts_char_index] != '\0') {
+        if (arg[ci] != '\0') {
             if (shell_getopts_set_char(name, opt) < 0) rc = 1;
-            if (env_set("OPTARG", &arg[g_getopts_char_index]) < 0) rc = 1;
+            if (env_set("OPTARG", &arg[ci]) < 0) rc = 1;
             optind++;
-            g_getopts_char_index = 1;
+            ci = 1;
         } else if (optind < arg_count) {
             if (shell_getopts_set_char(name, opt) < 0) rc = 1;
             if (env_set("OPTARG", args[optind] ? args[optind] : "") < 0) {
                 rc = 1;
             }
             optind += 2;
-            g_getopts_char_index = 1;
+            ci = 1;
         } else {
             optind++;
-            g_getopts_char_index = 1;
+            ci = 1;
             if (silent) {
                 if (shell_getopts_set_name(name, ':') < 0) rc = 1;
                 if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
@@ -12116,20 +12157,18 @@ static void cmd_getopts_in(int argc, char **argv) {
                 if (env_unset("OPTARG") < 0) rc = 1;
             }
         }
-        if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
-        g_getopts_last_optind = optind;
+        shell_getopts_leave(optind, ci);
         shell_set_status(rc ? 1 : 0);
         return;
     }
 
-    if (arg[g_getopts_char_index] == '\0') {
+    if (arg[ci] == '\0') {
         optind++;
-        g_getopts_char_index = 1;
+        ci = 1;
     }
     if (shell_getopts_set_char(name, opt) < 0) rc = 1;
     if (env_unset("OPTARG") < 0) rc = 1;
-    if (shell_getopts_set_int("OPTIND", optind) < 0) rc = 1;
-    g_getopts_last_optind = optind;
+    shell_getopts_leave(optind, ci);
     shell_set_status(rc ? 1 : 0);
 }
 
@@ -38214,8 +38253,7 @@ struct shell_env_frame {
     char **env;
     unsigned char *flags;
     int envc;
-    int getopts_last_optind;
-    int getopts_char_index;
+    struct shell_getopts_place getopts;
 };
 
 static void shell_env_frame_clear(struct shell_env_frame *frame) {
@@ -38255,8 +38293,7 @@ static int shell_env_frame_capture(struct shell_env_frame *frame) {
     }
     frame->envc = g_envc;
     frame->env[g_envc] = 0;
-    frame->getopts_last_optind = g_getopts_last_optind;
-    frame->getopts_char_index = g_getopts_char_index;
+    frame->getopts = g_getopts;
     return 0;
 }
 
@@ -38275,8 +38312,7 @@ static void shell_env_frame_restore(struct shell_env_frame *frame) {
         frame->env[i] = 0;
     }
     g_env[g_envc] = 0;
-    g_getopts_last_optind = frame->getopts_last_optind;
-    g_getopts_char_index = frame->getopts_char_index;
+    g_getopts = frame->getopts;
     frame->envc = 0;
 }
 
@@ -39756,6 +39792,13 @@ static int shell_run_function(struct shell_simple *cmd) {
     int local_depth = g_script_depth;
     int saved_fn_local_depth = g_fn_local_depth;
     g_fn_local_depth = local_depth;
+    /* getopts' place as the caller has it: a function that makes OPTIND
+     * local gives it back at its return, so `f -ab` called from a loop over
+     * `-xyz` after `y` goes on at `z`. tsh's local gave back OPTIND's number
+     * only, and the caller started its word over and looped for good (bash's
+     * getopts8.sub; logs/b41 gopts g1). The place is the one at the call,
+     * not at the `local` (gopts3 k1). */
+    struct shell_getopts_place gp_call = g_getopts;
     /* Re-queue the here-documents the definition swallowed, so the body's
      * `<<EOF` finds its text on THIS call and every later one. Saved and
      * restored around the call because the caller may have a queue of its own
@@ -39900,7 +39943,9 @@ static int shell_run_function(struct shell_simple *cmd) {
     /* Before the depth drops: undo anything this frame localised. `return`
      * from the middle of a function reaches here too, which is the whole
      * reason the unwind is here rather than at the end of the body. */
+    bool optind_local = shell_locals_have("OPTIND", local_depth);
     shell_locals_pop(local_depth);
+    if (optind_local) g_getopts = gp_call;
     g_fn_local_depth = saved_fn_local_depth;
     g_script_depth--;
     shell_restore_params_from_frame(&frame);
@@ -49178,8 +49223,7 @@ void shell_init(void) {
      * libtoby-linked child sees a meaningful environ at exec. */
     for (int i = 0; i < g_shell_fd_cap; i++) g_shell_fd[i] = 0;
     env_init_defaults();
-    g_getopts_last_optind = 1;
-    g_getopts_char_index = 1;
+    g_getopts = (struct shell_getopts_place){ 1, 1, 0, true };
     shell_trap_clear_all();
     g_shell_start_secs = shell_wall_secs();
     if (shell_set_param0("tobysh") < 0) kprintf(SH_PFX_SHELL "failed to set $0\n");
@@ -50025,8 +50069,7 @@ void shell_init_hosted(const char *argv0) {
     }
 #endif
 
-    g_getopts_last_optind = 1;
-    g_getopts_char_index  = 1;
+    g_getopts = (struct shell_getopts_place){ 1, 1, 0, true };
     shell_trap_clear_all();
     (void)shell_set_param0(argv0 ? argv0 : "tsh");
     {
