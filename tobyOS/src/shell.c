@@ -9618,6 +9618,29 @@ static void cmd_local(int argc, char **argv) {
         }
     }
     for (int i = first; i < argc; i++) {
+        /* THE FUNCTION'S OWN REFERENCE passes local's work on to its target,
+         * as declare's does: `local -n ref=var; local -i ref=([1]=)` makes
+         * a local -i array var. A reference the function did not make is
+         * hidden by a new local, as before (finding 322; logs/b41 nref9
+         * i4, bash's nameref21.sub). */
+        SH_SB(rearg);
+        struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
+        if (!l_nameref) {
+            size_t nl = env_key_len(argv[i]);
+            nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
+            SH_SB(rn);
+            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 && shell_is_nameref(rn.p) &&
+                shell_local_declared_here(rn.p, g_script_depth)) {
+                SH_SB(tg);
+                const char *real = env_deref_name_ex(rn.p, &tg, false);
+                if (real && real != rn.p && !g_nameref_circular &&
+                    sb_set(&rearg, real) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                    ras.slot = &argv[i];
+                    ras.orig = argv[i];
+                    argv[i] = rearg.p;
+                }
+            }
+        }
         size_t klen = env_key_len(argv[i]);
         bool has_value = (klen > 0 && argv[i][klen] == '=');
         bool l_append = has_value && klen > 1 && argv[i][klen - 1] == '+';
