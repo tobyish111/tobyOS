@@ -9073,6 +9073,15 @@ static int shell_decl_convert(const char *name, bool assoc, const char *label) {
     int si = env_find(name, strlen(name));
     bool scalar = si >= 0 &&
         !(g_env_flags[si] & (SHVAR_NOVALUE | SHVAR_ARRAY | SHVAR_NAMEREF));
+    /* ...an indexed array only DECLARED, with no record yet, as well:
+     * `declare -a a; declare -A a` is refused too, a stays -a (bash's
+     * assoc10.sub; logs/b42 aconv c1 c3) */
+    if (assoc && si >= 0 && (g_env_flags[si] & SHVAR_ARRAY) &&
+        !(g_env_flags[si] & SHVAR_NAMEREF)) {
+        kprintf("%s: %s: cannot convert indexed to associative array\n",
+                label, name);
+        return -1;
+    }
     if (!assoc) return scalar ? sh_array_absorb_scalar(name) : 0;
     SH_SB(old);
     if (scalar && sb_puts(&old, env_get(name) ? env_get(name) : "") < 0)
