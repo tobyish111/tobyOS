@@ -15462,7 +15462,7 @@ static void shell_wait_next(char **ids, int nids, const char *pvar) {
             if (pvar) {
                 char nb[24];
                 ksnprintf(nb, sizeof nb, "%d", pid);
-                (void)env_set(pvar, nb);
+                (void)shell_set_named(pvar, nb);
             }
             shell_set_status(shell_wait_job(got));
             return;
@@ -15541,12 +15541,21 @@ static void cmd_wait_in(int argc, char **argv) {
         first++;
     }
     if (pvar) {
-        if (!shell_name_is_valid(pvar, strlen(pvar))) {
+        /* AN ELEMENT IS A NAME, as for read: `wait -p A[$k]`, its key as
+         * read's would be (shell_set_named); tsh refused it, "wait:
+         * `A[]]': not a valid identifier" (bash's assoc18.sub; logs/b42
+         * await) */
+        size_t pl = strlen(pvar), pb = 0;
+        while (pvar[pb] && pvar[pb] != '[') pb++;
+        bool pel = pvar[pb] == '[' && pl > pb + 1 && pvar[pl - 1] == ']';
+        if (!shell_name_is_valid(pvar, pel ? pb : pl) ||
+            (pel && !shell_elem_key_literal(pvar) &&
+             !shell_array_ref_text_ok(pvar, pl))) {
             kprintf("wait: `%s': not a valid identifier\n", pvar);
             shell_set_status(1);
             return;
         }
-        (void)env_unset(pvar);         /* bash: unset before any answer */
+        if (!pel) (void)env_unset(pvar);    /* bash: unset before any answer */
     }
     if (opt_n) {
         shell_wait_next(argv + first, argc - first, pvar);
@@ -15658,7 +15667,7 @@ static void cmd_wait_in(int argc, char **argv) {
         if (pvar) {
             char nb[24];
             ksnprintf(nb, sizeof nb, "%d", pid);
-            (void)env_set(pvar, nb);
+            (void)shell_set_named(pvar, nb);
         }
     }
     shell_set_status(rc);
