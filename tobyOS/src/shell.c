@@ -4771,7 +4771,11 @@ static int sh_try_array_assignment(const char *kv) {
         return sh_array_set(name, idx, val) == 0 ? 1 : 0;
     }
 
-    if (val[0] == '(' && !shell_kv_scalar_paren(kv, val)) {
+    /* (a list is the value WHOLE: one that goes on past its `)` is a
+     * string -- `typeset -i a; a=(4*3)/2` is 6, where tsh took the list
+     * (4*3) and dropped the rest, 12; bash's array4.sub, logs/b42 arr2) */
+    if (val[0] == '(' && val[strlen(val) - 1] == ')' &&
+        !shell_kv_scalar_paren(kv, val)) {
         {
             SH_SB(lnm);
             if (sb_putmem(&lnm, kv, keylen) < 0) return -1;
