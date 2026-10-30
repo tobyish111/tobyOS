@@ -24301,9 +24301,18 @@ static int test_unary(const char *op, const char *operand) {
         SH_SB(subb);
         if (sh_split_subscript(operand, strlen(operand), &nmb, &subb)) {
             const char *nm = nmb.p, *sub = subb.p;
+            /* [@] and [*]: an indexed array with an element; for an
+             * associative one the KEY @ or * (bash 5.2); a set scalar, which
+             * is its own element 0 -- tsh called A[@] set for any assoc A
+             * with keys and a scalar's unset (bash's builtins5.sub; logs/b42
+             * blt1 b6) */
             if (sub[0] && !sub[1] && (sub[0] == '@' || sub[0] == '*')) {
                 struct sh_array *ar = sh_array_find(nm);
-                return (ar && ar->n > 0) ? 0 : 1;
+                if (ar && ar->assoc) return sh_array_get_key(nm, sub) ? 0 : 1;
+                if (ar) return ar->n > 0 ? 0 : 1;
+                int sx = env_find(nm, strlen(nm));
+                return (sx >= 0 && !(g_env_flags[sx] & (SHVAR_NOVALUE | SHVAR_ARRAY)))
+                           ? 0 : 1;
             }
             if (sh_array_is_assoc(nm)) {
                 /* the key is a word, expanded now: test -v 'A[$k]' asks
