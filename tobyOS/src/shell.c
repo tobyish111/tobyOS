@@ -4047,6 +4047,14 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                  * there (Oils 0237). */
                 if (!sh_array_is_assoc(dst) && shell_word_tilde(&vx) < 0)
                     return -1;
+                /* THE EXPANDER'S ESCAPE MARKS COME OFF a key and a value, as
+                 * an assignment's do: `foo=([bar\"bie]=doll)` stored the key
+                 * $'bar\004"bie', and `a=([0]=bar\"bie)` the value (bash's
+                 * assoc6.sub; logs/b41 assoc1) */
+                if (vx.p) {
+                    shell_strip_glob_escapes(vx.p);
+                    vx.len = strlen(vx.p);
+                }
                 if (sh_array_is_assoc(dst)) {
                     SH_SB(kraw);
                     SH_SB(kx);
@@ -4054,6 +4062,10 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                         return -1;
                     if (shell_argmarks_to_spaces(kraw.p, &kx) < 0)
                         return -1;
+                    if (kx.p) {
+                        shell_strip_glob_escapes(kx.p);
+                        kx.len = strlen(kx.p);
+                    }
                     sh_xt_lit_note(kx.p, vx.p, eplus);
                     /* `[k]+=v` IS HONOURED IN AN APPENDING LITERAL AND
                      * IGNORED IN A REPLACING ONE. Measured against bash
