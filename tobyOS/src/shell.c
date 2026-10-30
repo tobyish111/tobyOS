@@ -5186,6 +5186,37 @@ static int env_set(const char *key, const char *val) {
     return rc;
 }
 
+/* IS AN EXPANDED WORD NAME[SUB] AN ELEMENT, as bash's valid_array_reference
+ * reads it: the subscript ends at the `]` that closes the `[` -- a quoted
+ * span ('...', "...", `...`) and a backslash's character skipped, a `[`
+ * inside counted -- and that `]` ends the word. `A[8's]`, `A[a]b]`,
+ * `A[\]` and `A[[a]` are not, and read, printf -v and declare say "not a
+ * valid identifier" where tsh set the keys 8s, a]b, \ and [a (bash's
+ * assoc5.sub, assoc9.sub; logs/b42 akeys k1 k3 k5, areparse). LEN is the
+ * word's name part. */
+static bool shell_array_ref_text_ok(const char *w, size_t len) {
+    size_t b = 0;
+    while (b < len && w[b] != '[') b++;
+    if (b == 0 || b >= len || !shell_name_is_valid(w, b)) return false;
+    int d = 0;
+    for (size_t i = b; i < len; i++) {
+        char c = w[i];
+        if (c == '\\') {
+            if (++i >= len) return false;
+            continue;
+        }
+        if (c == '\'' || c == '"' || c == '`') {
+            for (i++; i < len && w[i] != c; i++)
+                if (c != '\'' && w[i] == '\\') i++;
+            if (i >= len) return false;
+            continue;
+        }
+        if (c == '[') d++;
+        else if (c == ']' && --d == 0) return i == len - 1;
+    }
+    return false;
+}
+
 /* Assign VAL to NAME the way `read`, `printf -v` and the like do: NAME may
  * be an ELEMENT, `a[i]` or `A[key]`, whose subscript is expanded now (bash's
  * valid_array_reference + assign_array_element). -2: not a name. */
@@ -5194,6 +5225,7 @@ static int shell_set_named(const char *name, const char *val) {
     while (name[b] && name[b] != '[') b++;
     bool elem = name[b] == '[' && nl > b + 1 && name[nl - 1] == ']';
     if (!shell_name_is_valid(name, elem ? b : nl)) return -2;
+    if (elem && !shell_array_ref_text_ok(name, nl)) return -2;
     if (elem) g_assign_expand_sub = true;
     int rc = env_set(name, val);
     g_assign_expand_sub = false;
@@ -10067,6 +10099,11 @@ static void cmd_local(int argc, char **argv) {
         else klen = strlen(argv[i]);
         {
             const char *lb = shell_decl_element_lb(argv[i], klen);
+            if (lb && !shell_array_ref_text_ok(argv[i], klen)) {
+                kprintf("local: `%s': not a valid identifier\n", argv[i]);
+                shell_set_status(1);
+                continue;
+            }
             if (lb) {
                 if (!shell_decl_element(argv[i], klen, lb, has_value, l_append,
                                         true, l_assoc, l_attr_on, 0, "local")) {
@@ -11427,6 +11464,14 @@ static void cmd_declare(int argc, char **argv) {
              * -n over a name that is an array (below). tsh made x[3] and
              * the array's element 0 (bash; logs/b41 nref7 g5 g7, bash's
              * nameref6.sub). */
+            /* the expanded word's subscript must close where bash's does
+             * (shell_array_ref_text_ok): `declare A[8's]=d` is "`A[8's]=d':
+             * not a valid identifier" (logs/b42 akeys k5, asub q11 q12) */
+            if (lb && !shell_array_ref_text_ok(argv[i], klen)) {
+                kprintf("%s: `%s': not a valid identifier\n", argv[0], argv[i]);
+                shell_set_status(1);
+                continue;
+            }
             if (lb && nref) {
                 kprintf("%s: %.*s: reference variable cannot be an array\n",
                         argv[0], (int)klen, argv[i]);
@@ -13323,7 +13368,7 @@ static int shell_read_set(const char *name, const char *val) {
     int r = shell_set_named(name, val);
     if (r == -2) {
         kprintf("read: `%s': not a valid identifier\n", name);
-        return 1;
+        return 2;                       /* and read goes no further */
     }
     if (r < 0) {
         /* a refusal that said why -- readonly, a bad subscript, a
@@ -13338,8 +13383,11 @@ static int shell_read_set(const char *name, const char *val) {
 
 static int shell_read_assign_empty(int argc, char **argv, int first) {
     int rc = 0;
-    for (int i = first; i < argc; i++)
-        if (shell_read_set(argv[i], "") != 0) rc = 1;
+    for (int i = first; i < argc; i++) {
+        int r = shell_read_set(argv[i], "");
+        if (r == 2) return 1;
+        if (r != 0) rc = 1;
+    }
     return rc;
 }
 
@@ -13417,7 +13465,11 @@ static int shell_read_assign_fields(int argc, char **argv, int first,
                 val = lastb.p;
             }
         }
-        if (shell_read_set(argv[i], val) != 0) rc = 1;
+        /* A NAME THAT IS NONE ENDS read, as bash's: `read A[$(echo X)]`
+         * said so of both its words (logs/b42 areparse r8) */
+        int r = shell_read_set(argv[i], val);
+        if (r == 2) return 1;
+        if (r != 0) rc = 1;
     }
     return rc;
 }
@@ -24688,7 +24740,8 @@ static void cmd_printf(int argc, char **argv) {
         size_t vnl = 0;
         while (vname[vnl] && vname[vnl] != '[') vnl++;
         bool velem = vname[vnl] == '[' && vname[strlen(vname) - 1] == ']';
-        if (!shell_name_is_valid(vname, velem ? vnl : strlen(vname))) {
+        if (!shell_name_is_valid(vname, velem ? vnl : strlen(vname)) ||
+            (velem && !shell_array_ref_text_ok(vname, strlen(vname)))) {
             kprintf("printf: `%s': not a valid identifier\n", vname);
             shell_set_status(2);     /* bash: a bad -v name is a usage error */
             return;
