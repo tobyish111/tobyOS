@@ -10526,6 +10526,33 @@ static bool shell_valid_nameref_value(const char *v) {
     return k > 1 && v[n + k] == ']' && v[n + k + 1] == '\0';
 }
 
+/* READONLY THROUGH A REFERENCE: `readonly ref` and `declare -r ref` make
+ * the variable at the end of ref's chain readonly, not ref -- tsh marked
+ * the reference, and the target stayed writable. A reference to an element,
+ * or to nothing, is "`a[1]': not a valid identifier", with no change to the
+ * status (bash; logs/b41 nref3, bash's nameref2.sub). The name to mark goes
+ * in `out`; false when there is none. */
+static bool shell_readonly_target(const char *bi, const char *name, size_t klen,
+                                  struct shell_sb *out) {
+    if (sb_putmem(out, name, klen) < 0) return false;
+    int ix = env_find(name, klen);
+    if (ix < 0 || !(g_env_flags[ix] & SHVAR_NAMEREF)) return true;
+    SH_SB(nm);
+    if (sb_set(&nm, out->p) < 0) return false;
+    const char *real = env_deref_name_ex(nm.p, out, false);
+    if (!real || g_nameref_circular) return false;
+    if (real == nm.p) {             /* to nothing, or to no name at all */
+        kprintf("%s: `%s': not a valid identifier\n", bi, g_env[ix] + klen + 1);
+        return false;
+    }
+    for (const char *c = real; *c; c++)
+        if (*c == '[') {
+            kprintf("%s: `%s': not a valid identifier\n", bi, real);
+            return false;
+        }
+    return true;
+}
+
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
@@ -10977,8 +11004,14 @@ static void cmd_declare(int argc, char **argv) {
         }
         /* READONLY IS ON THE NAME, scalar or array. It was marked only
          * when a scalar entry existed, so `typeset -ar a=(1 2)` -- an array
-         * has none -- stayed writable (Oils 0400). */
-        if (set_readonly) (void)shell_readonly_mark(name, klen);
+         * has none -- stayed writable (Oils 0400). A reference made by
+         * another declare passes it on to its target (finding 320). */
+        if (set_readonly) {
+            SH_SB(rot);
+            if (set_nameref) (void)shell_readonly_mark(name, klen);
+            else if (shell_readonly_target(argv[0], name, klen, &rot))
+                (void)shell_readonly_mark(rot.p, strlen(rot.p));
+        }
         int idx = env_find(name, klen);
         if (idx < 0) continue;
         if (set_export)   g_env_flags[idx] |= SHVAR_EXPORTED;
@@ -11004,6 +11037,7 @@ static void cmd_declare(int argc, char **argv) {
 static void cmd_readonly(int argc, char **argv) {
     shell_set_status(0);
     bool opt_a = false, opt_A = false, opt_f = false, opt_p = false;
+    bool opt_n = false;
     int first = 1;
     while (first < argc && argv[first][0] == '-' && argv[first][1]) {
         if (strcmp(argv[first], "--") == 0) { first++; break; }
@@ -11013,6 +11047,7 @@ static void cmd_readonly(int argc, char **argv) {
             else if (*q == 'A') opt_A = true;
             else if (*q == 'f') opt_f = true;
             else if (*q == 'p') opt_p = true;
+            else if (*q == 'n') opt_n = true;
             else { ok = false; break; }
         }
         if (!ok) {
@@ -11092,8 +11127,15 @@ static void cmd_readonly(int argc, char **argv) {
          * `declare -r NAME` (Oils 0459). It made an empty assoc array. */
 
         /* Marked under the NAME, not `r+`: the append form must make the
-         * same variable read-only that it just wrote. */
-        if (shell_readonly_mark(argv[i], nlen) < 0) shell_set_status(1);
+         * same variable read-only that it just wrote -- or, for a
+         * reference, the variable it names (finding 320). -n marks nothing
+         * and only assigns: bash takes it, as export -n, to take the
+         * attribute away, which readonly cannot do (logs/b41 nref3 c1 c2). */
+        if (opt_n) continue;
+        SH_SB(rot);
+        if (shell_readonly_target("readonly", argv[i], nlen, &rot) &&
+            shell_readonly_mark(rot.p, strlen(rot.p)) < 0)
+            shell_set_status(1);
     }
     (void)opt_a;
 }
