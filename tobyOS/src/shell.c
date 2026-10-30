@@ -48323,15 +48323,26 @@ static bool shell_tok_is_bang(const char *s) {
  * ends are closed if they are still the ones the coprocess was given. */
 static void shell_coproc_dispose(void) {
     if (g_coproc.name) {
+        /* NAME_PID goes, readonly or not, and NAME through a reference --
+         * the reference stays -- or, readonly, says so: "RO: cannot unset:
+         * readonly variable". tsh removed a reference itself, kept a
+         * readonly NAME_PID, and said nothing (bash's nameref11.sub;
+         * logs/b41 nref12 m3). */
         SH_SB(pv);
         if (sb_puts(&pv, g_coproc.name) == 0 && sb_puts(&pv, "_PID") == 0) {
             int ix = env_find(pv.p, pv.len);
-            if (ix >= 0 && !shell_readonly_key(pv.p, pv.len)) env_remove_at(ix);
+            if (ix >= 0) env_remove_at(ix);
+            shell_readonly_unmark(pv.p, pv.len);
         }
-        size_t nl = strlen(g_coproc.name);
-        if (!shell_readonly_key(g_coproc.name, nl)) {
-            sh_array_unset(g_coproc.name);
-            int ix = env_find(g_coproc.name, nl);
+        SH_SB(ct);
+        const char *cn = env_deref_name_ex(g_coproc.name, &ct, false);
+        if (!cn || !*cn) cn = g_coproc.name;
+        size_t nl = strlen(cn);
+        if (shell_readonly_key(cn, nl)) {
+            kprintf("%s: cannot unset: readonly variable\n", cn);
+        } else {
+            sh_array_unset_literal(cn);
+            int ix = env_find(cn, nl);
             if (ix >= 0) env_remove_at(ix);
         }
         kfree(g_coproc.name);
