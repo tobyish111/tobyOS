@@ -3505,6 +3505,12 @@ static bool shell_nameref_elem_target(const char *name, struct shell_sb *out) {
     return false;
 }
 
+/* Is NAME a reference (declare -n) itself? */
+static bool shell_is_nameref(const char *name) {
+    int ix = env_find(name, strlen(name));
+    return ix >= 0 && (g_env_flags[ix] & SHVAR_NAMEREF);
+}
+
 /* Drop entry at index `idx` (free its blob, shift the tail down). */
 static void env_remove_at(int idx) {
     if (idx < 0 || idx >= g_envc) return;
@@ -11321,6 +11327,10 @@ done:
  * (logs/b12 fn1). */
 static bool g_funcname_gone;
 
+/* Set while unset works on a nameref's target: there an element of a
+ * scalar other than 0 goes quietly (see cmd_unset). */
+static bool g_unset_through_ref;
+
 static void cmd_unset(int argc, char **argv) {
     shell_set_status(0);
     /* OPTIONS AS bash TAKES THEM: -f, -v and -n, together or apart, up to
@@ -11371,10 +11381,20 @@ static void cmd_unset(int argc, char **argv) {
             if (shell_nameref_elem_target(argv[i], &eltgt)) {
                 int prev = g_last_status;
                 char *sv[2] = { argv[0], eltgt.p };
+                bool was = g_unset_through_ref;
+                g_unset_through_ref = true;
                 cmd_unset(2, sv);
+                g_unset_through_ref = was;
                 if (prev != 0 && g_last_status == 0) shell_set_status(prev);
                 continue;
             }
+        }
+        /* `unset -n NAME` OF A NAME THAT IS NO REFERENCE DOES NOTHING: it
+         * removes a reference only. tsh removed the variable (bash; logs/b41
+         * nref2 b6). */
+        if (ref_only) {
+            int ni = env_find(argv[i], strlen(argv[i]));
+            if (ni < 0 || !(g_env_flags[ni] & SHVAR_NAMEREF)) continue;
         }
         /* A READONLY NAME CANNOT BE UNSET, whole or by element (S4): bash
          * says so and returns 1; tsh dropped `r[0]` and then `r`. */
@@ -11461,13 +11481,19 @@ static void cmd_unset(int argc, char **argv) {
                     }
                     if (si == 0) {
                         (void)env_unset(nm);
-                    } else {
+                    } else if (!g_unset_through_ref) {
+                        /* ...but through a reference to `x[1]` nothing
+                         * happens and nothing is said (bash; logs/b41
+                         * nref2 b1) */
                         kprintf("unset: %s: not an array variable\n", nm);
                         shell_set_status(1);
                     }
                     continue;
                 }
-            } else if (sh_array_find(argv[i])) {
+            } else if (!shell_is_nameref(argv[i]) && sh_array_find(argv[i])) {
+                /* (A reference's array is its target's, and goes below as
+                 * that one's unset, readonly check and all -- this took it
+                 * through the reference and emptied a readonly array.) */
                 /* DIRSTACK unset is DIRSTACK no longer: bash's dynamic
                  * variable is gone, and pushd/popd stop writing one
                  * (logs/b13 q11). The flag was there; nothing set it. */
@@ -11493,15 +11519,26 @@ static void cmd_unset(int argc, char **argv) {
          *
          * `unset -n r` is the spelling that removes the reference
          * itself. tsh dropped `r` and left `y` standing, so the name
-         * the caller meant to clear survived. */
+         * the caller meant to clear survived.
+         *
+         * THE TARGET GOES AS `unset -v TARGET` WOULD TAKE IT, AND THE
+         * REFERENCE STAYS: a readonly target, scalar or array, is refused,
+         * status 1 -- tsh emptied a readonly array -- a caller's local
+         * goes and the outer one shows, a name that is only a function is
+         * left alone. tsh removed the reference too (bash; logs/b41 nref1
+         * a5 a6, nref2 b2-b7; bash's nameref3.sub, nameref10.sub). */
         if (!ref_only) {
             SH_SB(tgt);
             const char *real = env_deref_name_ex(argv[i], &tgt, false);
             if (real && *real && real != argv[i] &&
                 strcmp(real, argv[i]) != 0) {
-                if (sh_array_find_literal(real)) sh_array_unset_literal(real);
-                (void)env_unset(real);
-                (void)env_unset(argv[i]);
+                int prev = g_last_status;
+                char *sv[3] = { argv[0], (char *)"-v", (char *)real };
+                bool was = g_unset_through_ref;
+                g_unset_through_ref = true;
+                cmd_unset(3, sv);
+                g_unset_through_ref = was;
+                if (prev != 0 && g_last_status == 0) shell_set_status(prev);
                 continue;
             }
         }
