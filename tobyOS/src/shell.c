@@ -10743,6 +10743,7 @@ static bool shell_readonly_target(const char *bi, const char *name, size_t klen,
 static void cmd_declare(int argc, char **argv) {
     shell_set_status(0);
     bool set_export = false, clear_export = false, set_readonly = false;
+    bool clear_readonly = false;          /* +r: refused for a readonly name */
     bool set_nameref = false, clear_nameref = false;
     bool set_array = false;
     bool set_assoc = false;
@@ -10770,7 +10771,7 @@ static void cmd_declare(int argc, char **argv) {
         for (const char *f = argv[i] + 1; *f && !bad; f++) {
             switch (*f) {
             case 'x': if (on) set_export = true; else clear_export = true; break;
-            case 'r': if (on) set_readonly = true; break;
+            case 'r': if (on) set_readonly = true; else clear_readonly = true; break;
             case 'n': if (on) set_nameref = true; else clear_nameref = true; break;
             case 'a': if (on) set_array = true; break;
             /* -A is ASSOCIATIVE, and that is a different type from -a:
@@ -11026,7 +11027,8 @@ static void cmd_declare(int argc, char **argv) {
             nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(rn);
             if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 && shell_is_nameref(rn.p) &&
-                (!make_local || shell_local_declared_here(rn.p, g_script_depth))) {
+                (!make_local || shell_local_declared_here(rn.p, g_script_depth)) &&
+                !(clear_nameref && shell_readonly_key(rn.p, nl))) {
                 SH_SB(tg);
                 const char *real = env_deref_name_ex(rn.p, &tg, false);
                 if (real && real != rn.p && !g_nameref_circular &&
@@ -11084,6 +11086,26 @@ static void cmd_declare(int argc, char **argv) {
             continue;
         }
         const char *name = nameb.p;
+
+        /* +r OF A READONLY NAME IS REFUSED, "declare: x: readonly
+         * variable", status 1 -- through a reference, its target's -- and so
+         * is +n of a readonly reference. tsh took +r for a no-op and +n off
+         * a readonly reference (bash; logs/b41 nref18, bash's
+         * nameref17.sub). */
+        /* (a reference with no target names nothing to make writable:
+         * +r is a no-op there, and its +n is taken -- `declare -rn foo5;
+         * declare +n foo5` leaves `declare -r foo5`, bash) */
+        int rro = env_find(name, klen);
+        bool ref_has_target = rro >= 0 && (g_env_flags[rro] & SHVAR_NAMEREF) &&
+                              g_env[rro][klen + 1];
+        bool ref_no_target = rro >= 0 && (g_env_flags[rro] & SHVAR_NAMEREF) &&
+                             !g_env[rro][klen + 1];
+        if (((clear_readonly && !ref_no_target) || (clear_nameref && ref_has_target)) &&
+            shell_readonly_key(name, klen)) {
+            shell_readonly_print_error(name, klen, argv[0]);
+            shell_set_status(1);
+            continue;
+        }
 
         /* A REFERENCE MUST NAME A VARIABLE (bash's declare.def), and
          * nothing is made when it does not -- status 1:
