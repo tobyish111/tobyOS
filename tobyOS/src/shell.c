@@ -31919,9 +31919,8 @@ static int shell_expand_element_op(const char *nm, const char *sub,
     if (assoc) {
         /* The key is a word, exactly as in a plain ${m[k]}. */
         SH_SB(kx);
-        if (shell_expand_word_ex(subbuf.p, &kx, true, true) < 0 ||
-            shell_argmarks_to_spaces(kx.p, &key) < 0)
-            return -1;
+        const char *kk = sh_ar_assoc_key(subbuf.p, &kx);
+        if (!kk || sb_set(&key, kk) < 0) return -1;
         v = sh_array_get_key(nm, key.p);
     } else {
         if (sh_subscript_read_index(nm, subbuf.p, &idx) < 0) return -1;
@@ -32761,13 +32760,13 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                              * lookup asked for the four characters
                              * `\"aa\"` and found nothing. Storing and reading the
                              * same literal did not round-trip. */
+                            /* ...its escapes too: `${m[\]]}` is the key `]`,
+                             * where the glob escape stayed on it and nothing
+                             * was found (bash's assoc5.sub; logs/b42 asub
+                             * q13) -- sh_ar_assoc_key, as every other key */
                             SH_SB(kx);
-                            SH_SB(kj);
-                            if (shell_expand_word_ex(kbuf.p, &kx,
-                                                     true, true) >= 0 &&
-                                shell_argmarks_to_spaces(kx.p, &kj) >= 0) {
-                                if (sb_set(&kbuf, kj.p) < 0) return -1;
-                            }
+                            const char *kk = sh_ar_assoc_key(kbuf.p, &kx);
+                            if (kk && sb_set(&kbuf, kk) < 0) return -1;
                             const char *v = sh_array_get_key(nm, kbuf.p);
                             if (count) {
                                 if (g_opt_nounset && !shell_var_has_value(nm))
