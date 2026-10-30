@@ -3931,6 +3931,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';') p++;
         if (*p == ')' || *p == '\0') break;
         size_t n = 0;
+        int sub_depth = 0;        /* inside the `[...]` the element began with */
         bool quoted = false;      /* saw a quote: an empty result is REAL */
         /* THE QUOTES STAY IN. They used to be stripped here, which meant
          * the element never reached an expander -- `a=($v)` stored the two
@@ -3968,8 +3969,22 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                 size_t used = sh_copy_balanced(p, elem, &n, elem_cap);
                 if (used) { p += used; continue; }
             }
-            if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' ||
-                *p == ')') break;
+            /* ...nor one inside the subscript an element starts with:
+             * `([x y]=z)` is the key "x y" -- tsh broke the element at the
+             * blank, key "[x", value "y]=z" (bash's assoc.tests; logs/b41
+             * assoc2 y4). A `)` still ends the literal. */
+            if (*p == '[' && (n == 0 || sub_depth > 0)) {
+                sub_depth++;
+                elem[n++] = *p++;
+                continue;
+            }
+            if (*p == ']' && sub_depth > 0) {
+                sub_depth--;
+                elem[n++] = *p++;
+                continue;
+            }
+            if (*p == ')' || (sub_depth == 0 &&
+                (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';'))) break;
             elem[n++] = *p++;
         }
         elem[n] = '\0';
