@@ -12447,6 +12447,34 @@ static void cmd_unset(int argc, char **argv) {
                     continue;
             }
         }
+        /* AN UNSET LOCAL OF THE FUNCTION RUNNING STAYS ITS LOCAL, declared,
+         * with no value and no attribute: `f() { local v=x; unset v;
+         * declare -p v; }` is `declare -- v`, and a v=2 after it is still
+         * the local's. tsh removed it, "declare: v: not found". One that
+         * took over a prefix assignment's binding keeps its -x (bash's
+         * varenv20.sub; logs/b42 venv1 n3 n4, t10). */
+        if (!ref_only && g_fn_local_depth > 0 && shell_name_is_valid(argv[i], strlen(argv[i])) &&
+            !shell_is_nameref(argv[i]) && !shell_readonly_key(argv[i], strlen(argv[i])) &&
+            strcmp(argv[i], "OPTIND") != 0 &&
+            shell_dynvar_index(argv[i], strlen(argv[i])) < 0) {
+            int li = -1;
+            for (int k = g_localc - 1; k >= 0; k--)
+                if (!g_locals[k].dead && g_locals[k].name &&
+                    strcmp(g_locals[k].name, argv[i]) == 0) { li = k; break; }
+            if (li >= 0 && g_locals[li].depth >= g_fn_local_depth) {
+                size_t al = strlen(argv[i]);
+                int ex = env_find(argv[i], al);
+                unsigned char keep = (ex >= 0 && g_locals[li].owner)
+                    ? (g_env_flags[ex] & SHVAR_EXPORTED) : 0;
+                if (ex >= 0) env_remove_at(ex);
+                sh_array_unset_literal(argv[i]);
+                if (env_set_attr_holder(argv[i]) == 0) {
+                    ex = env_find(argv[i], al);
+                    if (ex >= 0) g_env_flags[ex] = (unsigned char)(SHVAR_NOVALUE | keep);
+                }
+                continue;
+            }
+        }
         /* `unset a[1]` drops ONE element and leaves the rest numbered as they
          * were -- it does not renumber, which is why the store is sparse.
          * `unset a` drops the whole array. Both are checked before the scalar
