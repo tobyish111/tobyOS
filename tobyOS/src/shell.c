@@ -367,6 +367,15 @@ static int sb_put_data_str(struct shell_sb *b, const char *sv) {
     return sv ? sb_put_data_n(b, sv, strlen(sv)) : 0;
 }
 
+/* A CHARACTER OF THE SCRIPT ITSELF into a word: one that is an in-band
+ * marker's byte -- a raw ^A..^F in the text -- is data too, escaped as
+ * sb_put_data_n escapes an expansion's. tsh took a raw ^A for an argument
+ * mark and the byte was gone: `v=^A^A` was one byte, `a=( ^A )` empty
+ * (bash's assoc15.sub; logs/b42 rawctl). */
+static int sb_put_script_c(struct shell_sb *b, char c) {
+    return sb_put_data_n(b, &c, 1);
+}
+
 /* For `__attribute__((cleanup(shell_kfree_ptr)))` on a heap pointer: frees
  * it when the variable goes out of scope, on every return path. */
 static void shell_kfree_ptr(void *pp) {
@@ -3952,10 +3961,21 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
     /* An element's text is a piece of the literal, so the literal's length
      * always holds one; it was 512 bytes, and a longer element was cut
      * short without a word. */
+    /* (twice that: a raw marker byte of the script goes in escaped, below) */
     SH_SB(elemb);
-    if (sb_grow(&elemb, strlen(p) + 1) < 0) return -1;
+    if (sb_grow(&elemb, 2 * strlen(p) + 1) < 0) return -1;
     char *elem = elemb.p;
     const size_t elem_cap = elemb.cap;
+/* A RAW MARKER BYTE OF THE SCRIPT -- ^A..^F in the literal's text -- is
+ * data, escaped as sb_put_script_c escapes one in a word; tsh's expander
+ * took a raw ^A for an argument mark: `a=( ^A )` was empty (bash's
+ * assoc15.sub; logs/b42 rawctl b3 b8). */
+#define SH_LIT_COPY()                                                        \
+    do {                                                                     \
+        if (*p >= SHELL_ARG_MARK && *p <= SHELL_ARG_JOIN)                    \
+            elem[n++] = SHELL_DATA_ESC;                                      \
+        elem[n++] = *p++;                                                    \
+    } while (0)
     SH_SB(pend);               /* an associative literal's dangling KEY */
     bool pend_key = false;
     bool pend_bad = false;     /* ...and it is null: its pair is dropped */
@@ -3993,14 +4013,16 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                     if ((q == '"' || ansi) && *p == '\\' && p[1] &&
                         n + 2 < elem_cap)
                         elem[n++] = *p++;
-                    elem[n++] = *p++;
+                    SH_LIT_COPY();
                 }
                 if (*p == q && n + 1 < elem_cap) elem[n++] = *p++;
                 continue;
             }
             if (*p == '\\' && p[1] && n + 2 < elem_cap) {
-                elem[n++] = *p++;
-                elem[n++] = *p++;
+                /* (an escaped marker byte is that byte, as data) */
+                if (p[1] >= SHELL_ARG_MARK && p[1] <= SHELL_ARG_JOIN) p++;
+                else elem[n++] = *p++;
+                SH_LIT_COPY();
                 continue;
             }
             /* A blank inside $(...) ${...} or `...` is NOT a boundary. */
@@ -4024,7 +4046,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             }
             if (*p == ')' || (sub_depth == 0 &&
                 (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';'))) break;
-            elem[n++] = *p++;
+            SH_LIT_COPY();
         }
         elem[n] = '\0';
         /* An empty element is only noise when it came from SEPARATORS --
@@ -4321,6 +4343,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
     if (pend_key && !pend_bad && sh_array_set_key(dst, pend.p, "") < 0) return -1;
     *nextp = next;
     return 0;
+#undef SH_LIT_COPY
 }
 
 /* `name=(...)` and `name+=(...)`.
@@ -35684,14 +35707,16 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                             if (*e == '\\' && e[1]) e++;
                         if (*e) e++;
                     }
+                    /* (a raw marker byte of the script goes in as data, as
+                     * in any word: sb_put_script_c) */
                     if (e) {
-                        if (sb_putmem(&wb, p, (size_t)(e - p)) < 0) return -1;
+                        if (sb_put_data_n(&wb, p, (size_t)(e - p)) < 0) return -1;
                         p = e;
                         continue;
                     }
                     if (c == '(') depth++;
                     else if (c == ')') depth--;
-                    if (sb_putc(&wb, c) < 0)
+                    if (sb_put_script_c(&wb, c) < 0)
                         return -1;
                     p++;
                 } while (*p && depth > 0);
@@ -35777,7 +35802,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         /* Ordinary characters after the NUL are consumed and dropped
                          * too -- the word ended at the NUL. */
                         if (!stop_nul &&
-                            sb_putc(&wb,*p) < 0)
+                            sb_put_script_c(&wb, *p) < 0)
                             return -1;
                         p++;
                     }
@@ -35796,7 +35821,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 size_t sq_start = wb.len;
                 while (*p && *p != '\'') {
-                    if (sb_putc(&wb,*p++) < 0) {
+                    if (sb_put_script_c(&wb, *p++) < 0) {
                         kprintf(SH_PFX_SHELL "word too long\n");
                         return -1;
                     }
@@ -35843,7 +35868,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                             continue;
                         }
                         p++;
-                        if (sb_putc(&wb,*p++) < 0) {
+                        if (sb_put_script_c(&wb, *p++) < 0) {
                             kprintf(SH_PFX_SHELL "word too long\n");
                             return -1;
                         }
@@ -35853,7 +35878,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         if (shell_expand_backtick(&p, &wb) < 0) return -1;
                         g_tok_word_expanded = true;
                     } else {
-                        if (sb_putc(&wb,*p++) < 0) {
+                        if (sb_put_script_c(&wb, *p++) < 0) {
                             kprintf(SH_PFX_SHELL "word too long\n");
                             return -1;
                         }
@@ -35888,7 +35913,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                     kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
-                if (sb_putc(&wb,*p++) < 0) {
+                if (sb_put_script_c(&wb, *p++) < 0) {
                     kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
@@ -35914,7 +35939,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 lit_open = true;
             }
-            if (sb_putc(&wb,*p++) < 0) {
+            if (sb_put_script_c(&wb, *p++) < 0) {
                 kprintf(SH_PFX_SHELL "word too long\n");
                 return -1;
             }
