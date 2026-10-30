@@ -2957,10 +2957,23 @@ static const char *g_decl_cmd_name;
 /* The builtin a refused write of a readonly name is reported under, while
  * declare assigns: "declare: x: readonly variable" (env_set_kv). */
 static const char *g_readonly_label;
+/* ...and, for a word declare rewrote through a reference, the word as it
+ * was written and as it was rewritten: a refusal of the target is reported
+ * under the reference, "declare: r: readonly variable" (bash; logs/b42
+ * rdmsg m1 m3 m5 m7). */
+static const char *g_readonly_as_word;
+static const char *g_readonly_tgt_word;
 
+static size_t env_assign_name_len(const char *kv);
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
     SH_SB(nameb);                       /* any length: it was cut at 63 */
+    if (label && g_readonly_as_word && g_readonly_tgt_word && key &&
+        env_assign_name_len(g_readonly_tgt_word) == klen &&
+        memcmp(g_readonly_tgt_word, key, klen) == 0) {
+        key = g_readonly_as_word;
+        klen = env_assign_name_len(g_readonly_as_word);
+    }
     if (key && klen > 0) (void)sb_putmem(&nameb, key, klen);
     const char *name = nameb.p;
     g_readonly_hit = true;
@@ -11697,9 +11710,16 @@ static void cmd_declare(int argc, char **argv) {
             /* a scalar value refused for a readonly name is reported under
              * the builtin, "declare: x: readonly variable" (bash; logs/b41
              * v1) -- a compound one keeps its own two (logs/s35) */
-            if (argv[i][env_key_len(argv[i]) + 1] != '(') g_readonly_label = argv[0];
+            if (argv[i][env_key_len(argv[i]) + 1] != '(') {
+                g_readonly_label = argv[0];
+                if (ras.slot) {
+                    g_readonly_as_word = ras.orig;
+                    g_readonly_tgt_word = argv[i];
+                }
+            }
             int dsrc = env_set_kv(argv[i]);
             g_readonly_label = 0;
+            g_readonly_as_word = g_readonly_tgt_word = 0;
             g_decl_paren_array = false;
             if (dsrc < 0) {
                 shell_set_status(1);
