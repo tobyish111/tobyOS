@@ -3286,6 +3286,11 @@ static void shell_dynvar_assign(int dv, const char *val) {
 
 static void shell_optvars_refresh(void);
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
+static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
+static void shell_global_exchange(int si);
+struct sh_array;
+static struct sh_array *shell_local_saved_array(int si);
+static bool g_circ_busy;
 static const char *env_get(const char *key) {
     if (!key) return 0;
     size_t klen = strlen(key);
@@ -3300,6 +3305,22 @@ static const char *env_get(const char *key) {
     {
         int dv = shell_dynvar_index(key, klen);
         if (dv >= 0) return shell_dynvar_value(dv);
+    }
+    /* a local reference back to itself reads the GLOBAL variable (see
+     * shell_nameref_circ) */
+    {
+        SH_SB(ln);
+        int cs = shell_nameref_circ(key, klen, &ln);
+        if (cs >= 0) {
+            kprintf("warning: %s: circular name reference\n", key);
+            bool was = g_circ_busy;
+            shell_global_exchange(cs);
+            g_circ_busy = true;
+            const char *r = env_get(ln.p);
+            g_circ_busy = was;
+            shell_global_exchange(cs);
+            return r;
+        }
     }
     int idx = env_find(key, klen);
     if (idx < 0) {
@@ -4738,6 +4759,32 @@ static int shell_attr_append(unsigned attrs, const char *old, const char *add,
 
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
+    /* a local reference back to itself writes the GLOBAL variable, an
+     * element and += too (see shell_nameref_circ) */
+    {
+        size_t bn = 0;
+        while ((kv_in[bn] >= 'a' && kv_in[bn] <= 'z') ||
+               (kv_in[bn] >= 'A' && kv_in[bn] <= 'Z') || kv_in[bn] == '_' ||
+               (bn > 0 && kv_in[bn] >= '0' && kv_in[bn] <= '9'))
+            bn++;
+        SH_SB(ln);
+        int cs = (bn > 0 && (kv_in[bn] == '=' || kv_in[bn] == '[' ||
+                             (kv_in[bn] == '+' && kv_in[bn + 1] == '=')))
+                     ? shell_nameref_circ(kv_in, bn, &ln) : -1;
+        if (cs >= 0) {
+            kprintf("warning: %.*s: circular name reference\n", (int)bn, kv_in);
+            SH_SB(rk);
+            if (sb_puts(&rk, ln.p) < 0 || sb_puts(&rk, kv_in + bn) < 0)
+                return -1;
+            bool was = g_circ_busy;
+            shell_global_exchange(cs);
+            g_circ_busy = true;
+            int rc = env_set_kv(rk.p);
+            g_circ_busy = was;
+            shell_global_exchange(cs);
+            return rc;
+        }
+    }
     {
         int ar = sh_try_array_assignment(kv_in);
         if (ar > 0) return 0;
@@ -7990,6 +8037,15 @@ static struct sh_array *sh_array_find(const char *name) {
      *
      * Read-only: resolving the is-it-really-a-reference question belongs
      * to a write, and a lookup is not one. */
+    /* A local reference back to itself is the GLOBAL array: the oldest
+     * local of the name holds it while the local lives (see
+     * shell_nameref_circ). Writes come through env_set_kv, which swaps it
+     * in; reads take it where it is. */
+    {
+        SH_SB(ln);
+        int cs = shell_nameref_circ(name, strlen(name), &ln);
+        if (cs >= 0) return shell_local_saved_array(cs);
+    }
     SH_SB(target);
     const char *real = env_deref_name_ex(name, &target, false);
     if (!real || !*real) real = name;
@@ -9430,6 +9486,122 @@ static bool shell_global_binding(const char *name, const char **val,
     return true;
 }
 
+/* An exchange made for one word of a builtin (shell_global_exchange), undone
+ * when that word's turn ends: a cleanup variable. */
+struct shell_circ_swap { int si; bool was; };
+static void shell_global_exchange(int si);
+static void shell_circ_swap_put(struct shell_circ_swap *s) {
+    if (s->si < 0) return;
+    g_circ_busy = s->was;
+    shell_global_exchange(s->si);
+}
+
+/* The oldest live local of NAME -- the record holding the global binding --
+ * as an index into g_locals, or -1. */
+static int shell_local_oldest(const char *name) {
+    for (int i = 0; i < g_localc; i++)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+static struct sh_array *shell_local_saved_array(int si) {
+    return g_locals[si].arr_existed ? g_locals[si].arr_saved : 0;
+}
+
+/* A REFERENCE THAT COMES BACK TO WHERE IT STARTED -- it names itself, or a
+ * chain of them leads back to the variable asked for -- is bash's "warning:
+ * NAME: circular name reference" at each use; and in a function, where the
+ * variable it lands on is a local, it stands for the GLOBAL variable of that
+ * name, past a caller's local of it too:
+ *
+ *     f() { typeset -n v=$1; v=inside; }; v=global; f v; echo $v   inside
+ *
+ * tsh wrote the reference's own value, or failed after 16 hops (bash's
+ * nameref8.sub and nameref15.sub; logs/b42 circ1). The record of the
+ * oldest local of the name landed on, which holds that global, and the
+ * name in LANDED; -1 when NAME is no such reference. */
+static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed) {
+    if (g_circ_busy || g_fn_depth <= 0 || g_localc == 0) return -1;
+    int ix = env_find(name, nl);
+    if (ix < 0 || !(g_env_flags[ix] & SHVAR_NAMEREF)) return -1;
+    SH_SB(cur);
+    if (sb_putmem(&cur, name, nl) < 0) return -1;
+    for (int hops = 0; hops < 16; hops++) {
+        const char *t = g_env[ix] + cur.len + 1;
+        size_t tl = strlen(t);
+        if (!tl || !shell_name_is_valid(t, tl)) return -1;
+        if ((tl == nl && memcmp(t, name, nl) == 0) || strcmp(t, cur.p) == 0) {
+            if (sb_set(landed, t) < 0) return -1;
+            return shell_local_oldest(landed->p);
+        }
+        SH_SB(tc);
+        if (sb_set(&tc, t) < 0 || sb_set(&cur, tc.p) < 0) return -1;
+        ix = env_find(cur.p, cur.len);
+        if (ix < 0 || !(g_env_flags[ix] & SHVAR_NAMEREF)) return -1;
+    }
+    return -1;
+}
+
+/* The live binding of a name and the one record SI saved -- the global, for
+ * the oldest local of the name -- exchanged: the scalar entry and its flags,
+ * the array, the readonly mark. Done twice, it is undone. */
+static void shell_global_exchange(int si) {
+    struct shell_local_save *sv = &g_locals[si];
+    const char *name = sv->name;
+    size_t nl = strlen(name);
+    int idx = env_find(name, nl);
+    char *live = idx >= 0 ? g_env[idx] : 0;
+    unsigned char lf = idx >= 0 ? g_env_flags[idx] : 0;
+    if (sv->existed && sv->kv) {
+        if (idx >= 0) {
+            g_env[idx] = sv->kv;
+            g_env_flags[idx] = sv->flags;
+        } else {
+            if (!env_reserve(g_envc + 1)) return;
+            g_env_flags[g_envc] = sv->flags;
+            g_env[g_envc++] = sv->kv;
+            g_env[g_envc] = 0;
+        }
+    } else if (idx >= 0) {
+        for (int i = idx; i < g_envc - 1; i++) {        /* out, not freed */
+            g_env[i] = g_env[i + 1];
+            g_env_flags[i] = g_env_flags[i + 1];
+        }
+        g_envc--;
+        g_env[g_envc] = 0;
+        g_env_flags[g_envc] = 0;
+    }
+    sv->kv = live;
+    sv->flags = lf;
+    sv->existed = live != 0;
+    struct sh_array *la = sh_array_find_literal(name);
+    struct sh_array *ga = sv->arr_existed ? sv->arr_saved : 0;
+    int ai = -1;
+    for (int i = 0; la && i < g_narrays; i++)
+        if (g_arrays[i] == la) ai = i;
+    if (ai >= 0 && ga) {
+        g_arrays[ai] = ga;                      /* in its place */
+    } else if (ai >= 0) {
+        for (int i = ai; i < g_narrays - 1; i++) g_arrays[i] = g_arrays[i + 1];
+        g_narrays--;
+    } else if (ga && sh_array_table_add(ga) < 0) {
+        sh_array_contents_free(ga);
+        kfree(ga);
+    }
+    if (!sv->arr_existed && sv->arr_saved) {     /* an unused copy */
+        sh_array_contents_free(sv->arr_saved);
+        kfree(sv->arr_saved);
+    }
+    sv->arr_saved = la;
+    sv->arr_existed = la != 0;
+    bool ro = shell_readonly_key(name, nl);
+    if (sv->was_readonly && !ro) (void)shell_readonly_mark(name, nl);
+    else if (!sv->was_readonly && ro) shell_readonly_unmark(name, nl);
+    sv->was_readonly = ro;
+}
+
 /* Did the frame at `depth` -- its body, a file it sourced, an eval in it --
  * make `name` local? */
 static bool shell_locals_have(const char *name, int depth) {
@@ -10403,11 +10575,28 @@ static void cmd_export(int argc, char **argv) {
          * chain, as declare -x does (finding 322). tsh marked r. */
         SH_SB(rearg);
         struct shell_argv_swap ras __attribute__((cleanup(shell_argv_swap_put))) = { 0, 0 };
+        struct shell_circ_swap cws __attribute__((cleanup(shell_circ_swap_put))) = { -1, false };
         {
             size_t nl = env_key_len(argv[i]);
             nl = argv[i][nl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(rn);
-            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 && shell_is_nameref(rn.p)) {
+            SH_SB(ln);
+            int cs = -1;
+            if (nl > 0 && sb_putmem(&rn, argv[i], nl) == 0 &&
+                (cs = shell_nameref_circ(rn.p, nl, &ln)) >= 0) {
+                /* a local reference back to itself exports the GLOBAL
+                 * variable (logs/b42 circ1 c16) */
+                kprintf("warning: %s: circular name reference\n", rn.p);
+                if (sb_set(&rearg, ln.p) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
+                    ras.slot = &argv[i];
+                    ras.orig = argv[i];
+                    argv[i] = rearg.p;
+                    cws.si = cs;
+                    cws.was = g_circ_busy;
+                    shell_global_exchange(cs);
+                    g_circ_busy = true;
+                }
+            } else if (nl > 0 && shell_is_nameref(rn.p)) {
                 SH_SB(tg);
                 const char *real = env_deref_name_ex(rn.p, &tg, false);
                 if (real && real != rn.p && !g_nameref_circular &&
@@ -12012,6 +12201,20 @@ static void cmd_unset(int argc, char **argv) {
          * goes and the outer one shows, a name that is only a function is
          * left alone. tsh removed the reference too (bash; logs/b41 nref1
          * a5 a6, nref2 b2-b7; bash's nameref3.sub, nameref10.sub). */
+        /* ...but a local reference back to itself is unset ITSELF: it stays
+         * a local, without the attribute or a value, and the global it
+         * stands for stays too (bash; logs/b42 circ1 c12) */
+        if (!ref_only) {
+            SH_SB(ln);
+            size_t al = strlen(argv[i]);
+            if (shell_nameref_circ(argv[i], al, &ln) >= 0) {
+                kprintf("warning: %s: circular name reference\n", argv[i]);
+                int cx = env_find(argv[i], al);
+                if (cx >= 0) env_remove_at(cx);
+                (void)env_set_attr_holder(argv[i]);
+                continue;
+            }
+        }
         if (!ref_only) {
             SH_SB(tgt);
             const char *real = env_deref_name_ex(argv[i], &tgt, false);
