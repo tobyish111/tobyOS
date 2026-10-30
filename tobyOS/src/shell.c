@@ -22579,6 +22579,25 @@ static int shell_status_arg(int argc, char **argv, int def, const char *label,
 
 static int g_shell_break_depth;
 
+/* A COUNT OF 0 OR LESS: "loop count out of range", status 1, and every
+ * loop of this level left -- break or continue alike; a function's loops,
+ * not its caller's (bash's errors.tests; logs/b42 errs1). tsh called it
+ * "numeric argument required" and ended the script with 128, which is
+ * what a count that is not a number still does. */
+static bool shell_loop_count_nonpos(const char *arg) {
+    int m = 0;
+    if (arg[0] == '-' && arg[1]) return parse_int(arg + 1, &m) == 0;
+    return parse_int(arg, &m) == 0 && m == 0;
+}
+
+static void shell_loop_count_range(const char *who, const char *arg) {
+    kprintf("%s: %s: loop count out of range\n", who, arg);
+    shell_set_status(1);
+    g_shell_break_depth = g_shell_loop_depth;
+    g_shell_flow = SHELL_FLOW_BREAK;
+    g_shell_flow_status = 1;
+}
+
 static void cmd_break(int argc, char **argv) {
     /* TOO MANY ARGUMENTS ends the whole command, loop and all (bash's
      * no_args: DISCARD) -- `continue 1 2 3` in a loop does not go round
@@ -22609,6 +22628,8 @@ static void cmd_break(int argc, char **argv) {
         return;
     }
     int n = 1;
+    if (argc == 2 && shell_loop_count_nonpos(argv[1]))
+        return shell_loop_count_range("break", argv[1]);
     if (argc == 2 && (parse_int(argv[1], &n) < 0 || n <= 0)) {
         /* A bad argument to a SPECIAL BUILTIN aborts the script. Returning 2
          * and carrying on left `while true; do echo hi; break $x; done` with
@@ -22654,6 +22675,8 @@ static void cmd_continue(int argc, char **argv) {
         return;
     }
     int n = 1;
+    if (argc == 2 && shell_loop_count_nonpos(argv[1]))
+        return shell_loop_count_range("continue", argv[1]);
     if (argc == 2 && (parse_int(argv[1], &n) < 0 || n <= 0)) {
         kprintf("continue: %s: numeric argument required\n", argv[1]);
         shell_set_status(128);
