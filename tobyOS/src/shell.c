@@ -12039,6 +12039,21 @@ static void cmd_getopts_in(int argc, char **argv);
  * 1 (Oils 0887). tsh refused before parsing, status 2, OPTIND untouched.
  * The parse runs on a scratch name that is dropped afterwards. */
 static void cmd_getopts(int argc, char **argv) {
+    /* getopts TAKES NO OPTIONS: `--` ends them and a lone `-` is an
+     * optstring; any other first word that starts with `-` is "-X: invalid
+     * option", X its second character (`--x` is "--"), then the usage line,
+     * status 2. tsh took `-a` for the optstring (bash; logs/b41 gopts g8,
+     * gopts2 h7). */
+    if (argc >= 2 && argv[1] && argv[1][0] == '-' && argv[1][1]) {
+        if (strcmp(argv[1], "--") != 0) {
+            kprintf("getopts: -%c: invalid option\n", argv[1][1]);
+            sh_builtin_usage("getopts");
+            shell_set_status(2);
+            return;
+        }
+        argv++;                    /* cmd_getopts_in reads from argv[1] */
+        argc--;
+    }
     if (argc >= 3 && argv[2] && !shell_name_is_valid(argv[2], strlen(argv[2]))) {
         const char *bad = argv[2];
         argv[2] = (char *)"TSH_GETOPTS_NAME";
@@ -12055,7 +12070,7 @@ static void cmd_getopts(int argc, char **argv) {
 static void cmd_getopts_in(int argc, char **argv) {
     shell_set_status(0);
     if (argc < 3) {
-        kprintf_raw("usage: getopts optstring NAME [ARG...]\n");
+        sh_builtin_usage("getopts");          /* bash's line, no prefix */
         shell_set_status(2);
         return;
     }
