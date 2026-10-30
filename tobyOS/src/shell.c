@@ -4690,7 +4690,10 @@ static int sh_try_array_assignment(const char *kv) {
         }
         /* A READONLY ARRAY'S ELEMENTS ARE READONLY TOO (S4): `r[0]=9`,
          * `r[1]+=x`, `m[k]=w`. They all went through. */
-        if (shell_readonly_key(name, strlen(name))) {
+        /* (an indexed one's subscript is judged first: `c[-2]=4` of an
+         * empty readonly c is "c[-2]: bad array subscript", bash's
+         * array.tests; logs/b42 arr1 -- below) */
+        if (sh_array_is_assoc(name) && shell_readonly_key(name, strlen(name))) {
             shell_readonly_print_error(name, strlen(name), "shell");
             return -1;
         }
@@ -4732,6 +4735,10 @@ static int sh_try_array_assignment(const char *kv) {
         }
         long idx = 0;
         if (sh_subscript_assign_index(name, sub, &idx) < 0) return -1;
+        if (shell_readonly_key(name, strlen(name))) {
+            shell_readonly_print_error(name, strlen(name), "shell");
+            return -1;
+        }
         sh_array_clear_novalue(name);
         if (sh_array_absorb_scalar(name) < 0) return -1;
         {
