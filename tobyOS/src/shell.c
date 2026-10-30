@@ -22361,6 +22361,15 @@ static void cmd_dot(int argc, char **argv) {
     shell_set_status(0);
     /* `--` ends the options (bash; Oils 0852): `. -- file` sources file */
     if (argc >= 2 && strcmp(argv[1], "--") == 0) { argc--; argv++; }
+    /* ...and it has no others: `. -i /dev/tty` is ".: -i: invalid option"
+     * and the usage line, status 2, where tsh looked for a file "-i"
+     * (bash's errors.tests; logs/b42 errs2 f8) */
+    else if (argc >= 2 && argv[1][0] == '-' && argv[1][1]) {
+        kprintf("%s: -%c: invalid option\n", argv[0], argv[1][1]);
+        kprintf_raw("%s: usage: %s filename [arguments]\n", argv[0], argv[0]);
+        shell_set_status(2);
+        return;
+    }
     if (argc < 2) {
         /* by the name it was called by (bash: "source: usage: source ...") */
         kprintf("%s: filename argument required\n", argv[0]);
