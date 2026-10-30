@@ -4721,6 +4721,18 @@ static int sh_try_array_assignment(const char *kv) {
              * type is still incomplete here. */
             if (sh_array_is_assoc(name)) {
                 sh_array_clear_novalue(name);
+                /* the array's -i -l -u, as an indexed element's: `declare
+                 * -Au U; U[@]=x` is X, where tsh stored x (bash's
+                 * array.tests; logs/b42 arr1 a6) */
+                {
+                    unsigned at = shell_value_attrs(name);
+                    SH_SB(tv);
+                    int ar = append ? shell_attr_append(at, sh_array_get_key(name, sub),
+                                                        val, &tv)
+                                    : shell_attr_value(at, val, &tv);
+                    if (ar < 0) return -1;
+                    if (ar > 0) return sh_array_set_key(name, sub, tv.p) == 0 ? 1 : 0;
+                }
                 if (append) {
                     /* Any length: the join was a 512-byte array, and a
                      * longer one fell through to the SCALAR path. */
@@ -4865,7 +4877,18 @@ static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *ou
 /* `+=` on an integer variable ADDS: `declare -i i=1; i+=' 2 '` is 3. */
 static int shell_attr_append(unsigned attrs, const char *old, const char *add,
                              struct shell_sb *out) {
-    if (!(attrs & SHVAR_INTEGER)) return 0;
+    /* -l and -u fold the JOINED value: `declare -Au U=([k]=low); U[k]+=y`
+     * is LOWY, where only -i was handled here and the fold was skipped,
+     * LOWy (bash; logs/b42 array-element-attrs) */
+    if (!(attrs & SHVAR_INTEGER)) {
+        if (!(attrs & (SHVAR_LOWER | SHVAR_UPPER))) return 0;
+        SH_SB(j);
+        if (sb_puts(&j, old ? old : "") < 0 || sb_puts(&j, add ? add : "") < 0)
+            return -1;
+        int ar = shell_attr_value(attrs & (SHVAR_LOWER | SHVAR_UPPER), j.p, out);
+        if (ar == 0) return sb_set(out, j.p) < 0 ? -1 : 1;
+        return ar;
+    }
     long a = 0, b = 0;
     if (old && *old && shell_arith_eval(old, 0, &a) != SARITH_OK) return -1;
     if (shell_arith_eval(add ? add : "", 0, &b) != SARITH_OK) {
@@ -5035,6 +5058,14 @@ static int env_set_kv(const char *kv_in) {
                     return -1;
                 }
                 const char *v = kv_in + klen + 1;
+                /* ...with the array's -i -l -u: `typeset -i a; a=(5+3);
+                 * a=(4*3)/2` is 6 (bash's array4.sub; logs/b42 arr2) */
+                SH_SB(e0);
+                {
+                    int ar = shell_attr_value(shell_value_attrs(nm), v, &e0);
+                    if (ar < 0) return -1;
+                    if (ar > 0) v = e0.p;
+                }
                 int rc = sh_array_is_assoc(nm) ? sh_array_set_key(nm, "0", v)
                                                : sh_array_set(nm, 0, v);
                 if (rc < 0) return -1;
