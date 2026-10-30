@@ -2954,6 +2954,9 @@ static bool g_assign_fail_hit;
  * declare of a compound assignment reports under (shell_run_single). */
 static const char *g_this_cmd_name;
 static const char *g_decl_cmd_name;
+/* The builtin a refused write of a readonly name is reported under, while
+ * declare assigns: "declare: x: readonly variable" (env_set_kv). */
+static const char *g_readonly_label;
 
 static void shell_readonly_print_error(const char *key, size_t klen,
                                        const char *label) {
@@ -4900,7 +4903,8 @@ static int env_set_kv(const char *kv_in) {
      * in bash; tsh refused it as a write (logs/b12 p52, Oils 0385). */
     if (shell_readonly_key(kv_in, klen) &&
         !(g_env_attr_only && env_find(kv_in, klen) < 0)) {
-        shell_readonly_print_error(kv_in, klen, "shell");
+        shell_readonly_print_error(kv_in, klen,
+                                   g_readonly_label ? g_readonly_label : "shell");
         return -1;
     }
     {
@@ -11349,7 +11353,12 @@ static void cmd_declare(int argc, char **argv) {
             g_decl_paren_array = set_array || sh_array_find(name) != 0 ||
                 (pax >= 0 && (g_env_flags[pax] & SHVAR_ARRAY) &&
                  !(g_env_flags[pax] & SHVAR_NAMEREF));
+            /* a scalar value refused for a readonly name is reported under
+             * the builtin, "declare: x: readonly variable" (bash; logs/b41
+             * v1) -- a compound one keeps its own two (logs/s35) */
+            if (argv[i][env_key_len(argv[i]) + 1] != '(') g_readonly_label = argv[0];
             int dsrc = env_set_kv(argv[i]);
+            g_readonly_label = 0;
             g_decl_paren_array = false;
             if (dsrc < 0) {
                 shell_set_status(1);
