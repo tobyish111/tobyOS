@@ -12012,6 +12012,20 @@ static void shell_getopts_leave(int optind, int ci) {
     g_getopts.stale = false;
 }
 
+/* Are getopts' own messages on? Unless OPTERR is set to something whose
+ * leading number -- C's atoi of it -- is 0: "0", "00", "-0", " 0", "abc"
+ * and "0x1" are quiet; unset, "", "2", "1abc" and "08" are not. It is read
+ * when getopts runs, so a local OPTERR or an `OPTERR=0 getopts` counts
+ * (bash; logs/b41 gopts g5 g6, gopts2 h1 h2). */
+static bool shell_getopts_opterr(void) {
+    const char *v = env_get("OPTERR");
+    if (!v || !*v) return true;
+    while (*v == ' ' || (*v >= '\t' && *v <= '\r')) v++;
+    if (*v == '+' || *v == '-') v++;
+    while (*v == '0') v++;
+    return *v >= '1' && *v <= '9';
+}
+
 static void shell_getopts_finish_end(const char *name, int optind) {
     (void)shell_getopts_set_name(name, '?');
     (void)env_unset("OPTARG");
@@ -12055,6 +12069,7 @@ static void cmd_getopts_in(int argc, char **argv) {
     }
 
     bool silent = optstring[0] == ':';
+    bool loud = !silent && shell_getopts_opterr();
     int arg_count = (argc > 3) ? (argc - 3) : g_positional_count;
     char **args = (argc > 3) ? &argv[3] : g_positional;
 
@@ -12122,8 +12137,9 @@ static void cmd_getopts_in(int argc, char **argv) {
             if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
         } else {
             /* bash's getopt: "$0: illegal option -- x", with no line. */
-            kprintf_raw("%s: illegal option -- %c\n",
-                        g_param0 ? g_param0 : "tsh", opt);
+            if (loud)
+                kprintf_raw("%s: illegal option -- %c\n",
+                            g_param0 ? g_param0 : "tsh", opt);
             if (env_unset("OPTARG") < 0) rc = 1;
         }
         shell_getopts_leave(optind, ci);
@@ -12151,8 +12167,9 @@ static void cmd_getopts_in(int argc, char **argv) {
                 if (shell_getopts_set_name(name, ':') < 0) rc = 1;
                 if (shell_getopts_set_char("OPTARG", opt) < 0) rc = 1;
             } else {
-                kprintf_raw("%s: option requires an argument -- %c\n",
-                            g_param0 ? g_param0 : "tsh", opt);
+                if (loud)
+                    kprintf_raw("%s: option requires an argument -- %c\n",
+                                g_param0 ? g_param0 : "tsh", opt);
                 if (shell_getopts_set_name(name, '?') < 0) rc = 1;
                 if (env_unset("OPTARG") < 0) rc = 1;
             }
