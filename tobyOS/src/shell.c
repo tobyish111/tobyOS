@@ -8761,12 +8761,27 @@ static int sh_subscript_value(const char *sub, long *out);
  * ENDS with status 1 (FORCE_EOF) and a prompt drops the line. tsh's
  * expansions printed the message and went on to the next command. NAME is
  * 0 when an inner evaluation has already said it. */
+/* THE STATUS AN EXPANSION ERROR THAT ENDS THE SHELL LEAVES -- ${x:?}, set
+ * -u, a bad @ transform: 1, but 127 out of the -c string's own reader,
+ * through eval and `.` too (bash's FORCE_EOF there; new-exp, logs/b42
+ * nexp9). A subshell of it still exits 1. tsh exited 1. */
+static bool g_c_string_run;
+/* ...and so does its subshell that is a SIMPLE command run in the
+ * background or in a pipeline (`f &`, `echo ${x:?} | cat`); a ( ), a
+ * compound command there and a $( ) are their own top level, 1
+ * (g_own_toplevel; nexp9 r7 r8). */
+static int g_own_toplevel;
+static int shell_fatal_status(void) {
+    return (g_c_string_run && g_own_toplevel == 0 && g_comsub_level == 0)
+               ? 127 : 1;
+}
+
 static void shell_arith_unbound(const char *name) {
     if (name) kprintf("%s: unbound variable\n", name);
     shell_set_status(1);
     if (g_shell_flow == SHELL_FLOW_NONE) {
         g_shell_flow = g_interactive ? SHELL_FLOW_DISCARD : SHELL_FLOW_EXIT;
-        g_shell_flow_status = 1;
+        g_shell_flow_status = shell_fatal_status();
     }
 }
 
@@ -32694,7 +32709,7 @@ static void shell_bad_subst(bool fatal) {
     if (fatal) {
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = g_interactive ? SHELL_FLOW_DISCARD : SHELL_FLOW_EXIT;
-            g_shell_flow_status = 1;
+            g_shell_flow_status = shell_fatal_status();
         }
     } else {
         g_bad_subst_soft = true;
@@ -34271,7 +34286,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
          * printed not-reached. */
         if (!g_interactive || g_subshell_depth > 0) {
             g_shell_flow = SHELL_FLOW_EXIT;
-            g_shell_flow_status = 1;
+            g_shell_flow_status = shell_fatal_status();
         }
         shell_set_status(1);
         return -1;
@@ -40635,7 +40650,9 @@ static int shell_apply_assignments_ex(char **assignv, int assignc,
                     g_shell_flow = ((g_opt_errexit || (g_opt_posix && !g_interactive))
                                     && g_readonly_hit)
                                        ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
-                    g_shell_flow_status = 1;
+                    g_shell_flow_status =
+                        (g_opt_posix && !g_interactive && g_readonly_hit)
+                            ? shell_fatal_status() : 1;
                 }
                 return 1;
             }
@@ -42373,6 +42390,7 @@ extern void _exit(int status);
 
 static const char *shell_find_pipe_at(const char *s);
 static bool shell_stage_is_compound(const char *s);
+static bool shell_text_own_toplevel(const char *s);
 static void shell_stages_free(char **st, int n);
 static char *shell_dup_segment(const char *start, const char *end);
 
@@ -42694,6 +42712,7 @@ static void shell_async_child_body(const char *text, bool async_ign,
      * `echo $BASH_SUBSHELL &` prints 1 */
     g_subshell_depth++;
     g_simple_stage_adj = 0;
+    if (shell_text_own_toplevel(text)) g_own_toplevel++;  /* for good */
     /* ONE simple external may replace this process -- see
      * shell_bg_text_is_simple and proc_exec_in_place. */
     g_bg_exec_ok = shell_bg_text_is_simple(text, text + strlen(text));
@@ -48732,6 +48751,7 @@ static bool shell_try_subshell_command(const char *src) {
     }
 
     if (!merge) g_subshell_depth++;    /* merged: the async fork counted it */
+    g_own_toplevel++;
     g_shell_flow = SHELL_FLOW_NONE;
     g_shell_flow_status = 0;
     g_shell_loop_depth = 0;
@@ -48776,6 +48796,7 @@ static bool shell_try_subshell_command(const char *src) {
 #endif
 
     g_subshell_depth--;
+    g_own_toplevel--;
     if (io_active) shell_restore_io_frame(&io_frame);
     shell_subshell_frame_restore(&state);
     shell_set_status(rc);
@@ -49416,6 +49437,16 @@ static bool shell_stage_is_compound(const char *s) {
            shell_group_open_at(s) || *s == '(';
 }
 
+/* A compound command -- and [[ ]], (( )), select -- in the background or
+ * a pipeline is a top level of its own for shell_fatal_status, as bash's
+ * execute_in_subshell is. */
+static bool shell_text_own_toplevel(const char *s) {
+    if (shell_stage_is_compound(s)) return true;
+    s = shell_skip_blanks(s);
+    return (s[0] == '[' && s[1] == '[') ||
+           shell_starts_with_word(s, "select");
+}
+
 /* ---- backgrounding, before the line is expanded --------------------- *
  *
  *     echo ${bar=2} &
@@ -49700,6 +49731,8 @@ static bool shell_try_compound_pipeline(const char *src) {
         int saved_flow_status = g_shell_flow_status;
         int saved_loop_depth = g_shell_loop_depth;
         g_subshell_depth++;
+        bool own_top = shell_text_own_toplevel(stages[i]);
+        if (own_top) g_own_toplevel++;
         g_shell_flow = SHELL_FLOW_NONE;
         g_shell_flow_status = 0;
         g_shell_loop_depth = 0;
@@ -49864,6 +49897,7 @@ static bool shell_try_compound_pipeline(const char *src) {
 #endif
 
         g_subshell_depth--;
+        if (own_top) g_own_toplevel--;
         g_shell_flow = saved_flow;
         g_shell_flow_status = saved_flow_status;
         g_shell_loop_depth = saved_loop_depth;
@@ -52611,6 +52645,7 @@ int shell_run_line_hosted(const char *text) {
     else g_reader_syn_iname = "-c";
     if (!g_interactive) g_reader_c_main = true;
     if (!g_interactive) g_reader_nofork_scope = true;   /* bash's ONESHOT */
+    if (!g_interactive) g_c_string_run = true;          /* shell_fatal_status */
     /* AN INTERACTIVE SHELL'S EXIT TRAP RUNS WHEN IT EXITS -- here, once
      * `exit` has said so, or at EOF (shell_exit_trap_hosted) -- not after
      * every line it reads: it ran at the end of each one, and never at ^D
