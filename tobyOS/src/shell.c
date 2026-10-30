@@ -23101,6 +23101,21 @@ static void shell_int_revert(void) {
 
 static void cmd_trap(int argc, char **argv) {
     shell_set_status(0);
+    /* -l and -p are its options: any other letter in the option words is
+     * "trap: -s: invalid option" and the usage line, status 2 -- tsh took
+     * `trap -p -s NOSIG`'s -s for a signal (bash's errors.tests; logs/b42
+     * errs2 f11) */
+    for (int a = 1; a < argc; a++) {
+        const char *w = argv[a];
+        if (w[0] != '-' || !w[1] || strcmp(w, "--") == 0) break;
+        for (const char *c = w + 1; *c; c++) {
+            if (*c == 'l' || *c == 'p') continue;
+            kprintf("trap: -%c: invalid option\n", *c);
+            kprintf_raw("trap: usage: trap [-lp] [[arg] signal_spec ...]\n");
+            shell_set_status(2);
+            return;
+        }
+    }
     /* `trap -- ACTION COND...`: the separator is accepted and ignored. It was
      * taken as the ACTION, so the real action became a condition and the
      * whole call failed with "bad condition 'echo hi'". */
