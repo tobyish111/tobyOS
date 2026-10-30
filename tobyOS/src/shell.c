@@ -11950,6 +11950,10 @@ static void cmd_declare(int argc, char **argv) {
             int rx = env_find(name, klen);
             if (rx >= 0 && !nref) g_env_flags[rx] &= ~(unsigned char)SHVAR_NAMEREF;
         }
+        /* An array that has a record and no entry WAS ASSIGNED -- one only
+         * declared has an entry, marked no-value -- asked before this
+         * declare makes anything of its own (-A makes a record) */
+        bool pre_assigned = env_find(name, klen) < 0 && sh_array_find(name) != 0;
 
         /* BEFORE the assignment: the literal parser asks whether the array is
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
@@ -12003,12 +12007,18 @@ static void cmd_declare(int argc, char **argv) {
         /* AN ARRAY HAS NO ENTRY OF ITS OWN, so its -x goes on a holder made
          * before the value, as -i's does above: `declare -x a=(1 2)` lost
          * -x -- declare -p said `-a` where bash says `-ax` (finding 309). */
+        /* (an array that HAS a record and no entry was assigned -- one only
+         * declared has an entry, marked no-value -- so its holder is no
+         * declaration: `declare -a q=(); declare -x q` is `declare -ax
+         * q=()`, bash's varenv7.sub; logs/b42 t9) */
+        bool had_rec = pre_assigned;
         if ((set_export || clear_export) && env_find(name, klen) < 0 &&
             (set_array || sh_array_find(name) ||
              (has_value && argv[i][env_key_len(argv[i]) + 1] == '(')) &&
             env_set_attr_holder(name) == 0) {
             int ax = env_find(name, klen);
             if (ax >= 0) g_env_flags[ax] |= SHVAR_ARRAY;
+            if (ax >= 0 && had_rec) g_env_flags[ax] &= ~(unsigned char)SHVAR_NOVALUE;
         }
         /* declare's own word for a reference with no target that is given
          * no name: at the top "declare: `12345': not a valid identifier"
@@ -12082,7 +12092,12 @@ static void cmd_declare(int argc, char **argv) {
             /* (a reference has an entry of its own: env_get reads through
              * it, and `declare +n foo` of a reference to an unset bar made
              * bar -- bash; logs/b41 nref9 i2) */
+            bool rec = pre_assigned;                 /* assigned: see above */
             if (env_set_attr_holder(name) < 0) { shell_set_status(1); continue; }
+            int hx = env_find(name, klen);
+            if (rec && hx >= 0)
+                g_env_flags[hx] = (unsigned char)((g_env_flags[hx] & ~SHVAR_NOVALUE) |
+                                                  SHVAR_ARRAY);
         }
         /* READONLY IS ON THE NAME, scalar or array. It was marked only
          * when a scalar entry existed, so `typeset -ar a=(1 2)` -- an array
