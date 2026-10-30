@@ -34013,7 +34013,12 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             return is_join ? sh_put_join_value(b, value)
                            : sb_put_data_str(b, value);
         if (!shell_var_start(name[0])) {
-            kprintf(SH_PFX_SHELL "cannot assign to special parameter\n");
+            /* bash's "$6: cannot assign in this way", an expansion error:
+             * status 1, the rest of the line dropped (new-exp.tests;
+             * logs/b42 nexp x3) */
+            kprintf(SH_PFX_SHELL "$%s: cannot assign in this way\n", name);
+            shell_set_status(1);
+            g_bad_subst_soft = true;
             return -1;
         }
         if (shell_expand_param_word(word, &ewb) < 0) return -1;
