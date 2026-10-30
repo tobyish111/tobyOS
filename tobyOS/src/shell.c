@@ -11773,7 +11773,14 @@ static void cmd_declare(int argc, char **argv) {
                 }
             }
             const struct shell_function *fn = shell_function_lookup(argv[i]);
-            if (!fn) { missing = true; continue; }
+            if (!fn) {
+                /* -p says so: "declare: f1: not found" (bash's
+                 * builtins6.sub; logs/b42 blt1 b2) */
+                if (print_mode && !func_names)
+                    kprintf("%s: %s: not found\n", argv[0], argv[i]);
+                missing = true;
+                continue;
+            }
             /* `declare -fx NAME` / `+fx` set the attribute and print nothing,
              * and so do -ft / +ft (the trace attribute), -fr, and any other
              * attribute letter; +r of a readonly function is "NAME: readonly
