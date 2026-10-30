@@ -39768,6 +39768,14 @@ static char **sh_env_oom(void) {
     return 0;
 }
 
+/* ENVIRONMENT STRINGS WHOSE NAME IS NO SHELL NAME -- `v[0]=help`, `a-b=c`
+ * -- are no variables, and pass through to every child as they came:
+ * `env 'v[0]=help' tsh -c 'printenv "v[0]"'` prints help. tsh took one for
+ * an element assignment and the string was gone (bash's varenv13.sub;
+ * logs/b42 envpass). Kept from the import (shell_init). */
+static char **g_env_passthru;
+static int g_env_npassthru;
+
 static char **shell_build_env_overlay(char **assignv, int assignc,
                                       int *out_envc) {
     if (g_spawn_clean_env) {                    /* `exec -c` */
@@ -40024,7 +40032,7 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
     for (int i = 0; i < nx; i++)
         if (!xs[i].kv) extra += xs[i].nlen + 1 + strlen(xs[i].val) + 1;
 
-    size_t slots = (size_t)nx + (size_t)nf + 2;
+    size_t slots = (size_t)nx + (size_t)nf + (size_t)g_env_npassthru + 2;
     char **out_env = (char **)kmalloc(slots * sizeof(char *) + extra);
     if (!out_env) {
         for (int k = 0; k < nf; k++) kfree(fxs[k]);
@@ -40032,6 +40040,7 @@ static char **shell_build_env_overlay(char **assignv, int assignc,
     }
     char *pool = (char *)(out_env + slots);
     int n = 0;
+    for (int k = 0; k < g_env_npassthru; k++) out_env[n++] = g_env_passthru[k];
     for (int i = 0; i < nx; i++) {
         if (xs[i].kv) { out_env[n++] = (char *)xs[i].kv; continue; }
         size_t vl = strlen(xs[i].val);
@@ -51954,6 +51963,28 @@ void shell_init_hosted(const char *argv0) {
         for (char **e = environ; e && *e; e++) {
             /* an exported FUNCTION is imported as one, below */
             if (shell_env_is_function(*e)) continue;
+            /* a string whose name is none passes through (g_env_passthru) */
+            {
+                const char *eq = *e;
+                while (*eq && *eq != '=') eq++;
+                if (*eq == '=' && !shell_name_is_valid(*e, (size_t)(eq - *e))) {
+                    char **np = (char **)kmalloc((size_t)(g_env_npassthru + 1) *
+                                                 sizeof(char *));
+                    char *cp = shell_strdup(*e);
+                    if (np && cp) {
+                        if (g_env_npassthru)
+                            memcpy(np, g_env_passthru,
+                                   (size_t)g_env_npassthru * sizeof(char *));
+                        kfree(g_env_passthru);
+                        g_env_passthru = np;
+                        g_env_passthru[g_env_npassthru++] = cp;
+                    } else {
+                        kfree(np);
+                        kfree(cp);
+                    }
+                    continue;
+                }
+            }
             if (env_set_kv(*e) != 0) continue;
             size_t klen = env_key_len(*e);
             int idx = env_find(*e, klen);
