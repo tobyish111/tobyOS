@@ -36805,6 +36805,7 @@ struct shell_globstar {
     int matches;
     bool overflow;
     bool trail_slash;           /* the pattern ends in `/`: directories only */
+    bool zero_glob;             /* it ended in a run of `**` (see below) */
 };
 
 /* `comps` is the pattern split on `/`; `ci` is the component to match next.
@@ -36893,7 +36894,7 @@ static int shell_globstar_star(struct shell_globstar *g, const char *dirpath,
     if (ci + 1 >= ncomp) {
         /* the directory itself: as written when every component before
          * the `**` was, without its `/` when a glob found it */
-        int zero = ci == 0 ? 0 : 1;
+        int zero = ci == 0 ? 0 : g->zero_glob ? 2 : 1;
         for (int k = 0; k < ci && zero; k++)
             if (shell_has_glob(comps[k])) zero = 2;
         return shell_globstar_all(g, dirpath, shown, depth, zero);
@@ -37013,6 +37014,25 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
         size_t wl = strlen(word);
         g.trail_slash = wl > 1 && word[wl - 1] == '/';
     }
+    /* A RUN OF `**` IS ONE `**`: `** /**` lists each path once, as bash's
+     * -- and a run that ends the pattern shows the directory itself
+     * without its `/`, `a/** /**` giving a where `a/**` gives a/ (bash's
+     * globstar2.sub). Paths reached by more than one route otherwise stay,
+     * as bash keeps them: `** /a/**` has a/a/a under both a and a/a ("same
+     * as ksh93", that test says); tsh dropped every second copy. */
+    g.zero_glob = false;
+    if (g_shopt_globstar) {
+        int w = 0;
+        for (int r = 0; r < ncomp; r++) {
+            if (w > 0 && strcmp(comps[r], "**") == 0 && strcmp(comps[w - 1], "**") == 0) {
+                if (r == ncomp - 1) g.zero_glob = true;
+                continue;
+            }
+            if (w != r) memcpy(comps[w], comps[r], strlen(comps[r]) + 1);
+            w++;
+        }
+        ncomp = w;
+    }
 
     int first_arg = cur->argc;
     char root[VFS_PATH_MAX];
@@ -37027,11 +37047,8 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
         return -1;
     if (g.matches == 0) return 0;
 
-    /* THE SAME NAME CAN BE REACHED TWICE. A pattern with two `**`
-     * components walks the tree once per `**`, so a file two levels down
-     * arrives by more than one route;
-     * bash reports each path once. Sorting first puts the duplicates next to
-     * each other, which is also the order the results have to come out in. */
+    /* Sorted, as every glob's results are. A path reached twice -- `** /a/**`
+     * -- stays twice, as in bash (see the run of `**` above). */
     for (int a = first_arg + 1; a < cur->argc; a++) {
         char *key = cur->argv[a];
         int b = a - 1;
@@ -37041,14 +37058,7 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
         }
         cur->argv[b + 1] = key;
     }
-    int w = first_arg;
-    for (int a = first_arg; a < cur->argc; a++) {
-        if (a > first_arg && strcmp(cur->argv[a], cur->argv[w - 1]) == 0)
-            continue;
-        cur->argv[w++] = cur->argv[a];
-    }
-    cur->argc = w;
-    return w - first_arg;
+    return cur->argc - first_arg;
 }
 
 
