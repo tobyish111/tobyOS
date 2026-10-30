@@ -20677,11 +20677,13 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             break;
         }
         /* A DISCARD threw away the rest of THAT logical line and nothing
-         * more: the script goes on, and the status it left is 1. */
+         * more: the script goes on, and the status it left is 1 -- or the
+         * one the discard asked for, 2 for a ${v:=w} that cannot assign */
         if (g_shell_flow == SHELL_FLOW_DISCARD) {
+            int ds = g_shell_flow_status ? g_shell_flow_status : 1;
             g_shell_flow = SHELL_FLOW_NONE;
             g_shell_flow_status = 0;
-            shell_set_status(1);
+            shell_set_status(ds);
         }
         last = g_last_status;
         if (g_shell_flow == SHELL_FLOW_EXIT) {
@@ -32633,8 +32635,22 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             if (shell_strip_nosplit(&plain, ewb.p) < 0) return -1;
             shell_strip_glob_escapes(plain.p);
             plain.len = strlen(plain.p);
+            g_assign_fail_hit = false;
+            g_readonly_hit = false;
             if (env_set(name, plain.p) < 0) {
-                kprintf(SH_PFX_SHELL "failed to assign '%s'\n", name);
+                /* a refusal that has said so already says nothing more:
+                 * `declare -n r; : ${r:=/}` is bash's one message (bash's
+                 * nameref11.sub) -- and it is an expansion error, which
+                 * drops the rest of the line, status 2; tsh ran on with
+                 * status 0 (logs/b41 o1 o2) */
+                if (!g_assign_fail_hit && !g_readonly_hit)
+                    kprintf(SH_PFX_SHELL "failed to assign '%s'\n", name);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    /* (set -e ends the shell with 1, as bash's) */
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = g_opt_errexit ? 1 : 2;
+                }
                 return -1;
             }
             return sb_put_data_str(b, plain.p);
