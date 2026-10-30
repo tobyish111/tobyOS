@@ -23681,8 +23681,12 @@ static int test_unary(const char *op, const char *operand) {
             return sh_array_get(nm, ix) ? 0 : 1;
         }
         {
+            /* (an array's entry holds its attributes, not a value: element
+             * 0 decides, below -- `typeset -A A; A[a]=1; [ -v A ]` is false,
+             * bash's builtins5.sub; logs/b42 testv) */
             int vx = env_find(operand, strlen(operand));
-            if (vx >= 0 && !(g_env_flags[vx] & SHVAR_NOVALUE)) return 0;
+            if (vx >= 0 && !(g_env_flags[vx] & (SHVAR_NOVALUE | SHVAR_ARRAY)))
+                return 0;
             /* a dynamic variable always has a value: asking computes it,
              * as bash's find_variable runs the getter (logs/b12 p87) */
             int dv = shell_dynvar_index(operand, strlen(operand));
