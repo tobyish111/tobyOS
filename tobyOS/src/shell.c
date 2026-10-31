@@ -33276,9 +33276,13 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
      * growable: none of them has a length limit in bash. */
     /* bash's want_indir: what follows the `!` names a parameter -- a name,
      * a digit, or # ? @ * -- else this is $! itself (shell_parse_braced_name) */
+    /* ...but in POSIX mode `#` and `?` after it are operators on $! itself:
+     * `${!?}` with no job is "!: parameter not set", `${!#}` empty (bash's
+     * posixexp2.sub run as sh; logs/b42 px4 r1) -- finding 475 */
     if (expr[0] == '!' && expr[1] && !length_mode &&
         (shell_var_start(expr[1]) || (expr[1] >= '0' && expr[1] <= '9') ||
-         expr[1] == '#' || expr[1] == '?' || expr[1] == '@' || expr[1] == '*')) {
+         ((expr[1] == '#' || expr[1] == '?') && !g_opt_posix) ||
+         expr[1] == '@' || expr[1] == '*')) {
         size_t inlen = 0;
         if (shell_parse_braced_name(expr + 1, &inlen) == 0) {
             const char *rest = expr + 1 + inlen;
