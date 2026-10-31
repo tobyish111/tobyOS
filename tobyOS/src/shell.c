@@ -37856,7 +37856,10 @@ static void shell_strip_glob_escapes(char *s) {
 static bool shell_has_glob(const char *s) {
     if (!s) return false;
     for (; *s; s++) {
-        if ((*s == SHELL_GLOB_ESC || *s == SHELL_DATA_ESC) && s[1]) {
+        /* (a plain backslash -- an unquoted expansion's -- quotes the byte
+         * after it too: $v with v='a\?' is no pattern, and stays a\?, where
+         * tsh globbed it to a? -- bash's glob4.sub; logs/b42 gl1 h1) */
+        if ((*s == SHELL_GLOB_ESC || *s == SHELL_DATA_ESC || *s == '\\') && s[1]) {
             s++;
             continue;
         }
