@@ -11265,6 +11265,11 @@ static void cmd_shopt_in(int argc, char **argv) {
             if (o->slot == &g_shopt_misc[21] || o->slot == &g_shopt_misc[24])
                 continue;
             *o->slot = set;
+            /* extdebug sets functrace and errtrace with it, either way
+             * (bash's shopt_set_debug_mode; logs/b42 db5 o1) */
+            if (o->slot == &g_shopt_misc[10]) {
+                g_opt_functrace = g_opt_errtrace = set;
+            }
         } else {
             if (!quiet) {
                 if (print) shell_shopt_print_reinput(o);
