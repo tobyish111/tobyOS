@@ -30814,6 +30814,21 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
         cmd.p[cpos++] = *p++;
     }
     if (*p != '`') {
+        /* AN UNCLOSED BACKQUOTE ENDING ITS WORD IS A CHARACTER: bash's
+         * {Z..a} makes the word ` and prints it, where tsh said "no
+         * closing" -- with text after it in the word, as in -{z..A}-, it
+         * is the error below (bash's braces.tests; logs/b42 br1 b1) --
+         * finding 509 */
+        {
+            const char *r = *pp + 1;    /* only the word's marks after it */
+            while (*r && (unsigned char)*r < 0x08) r++;
+            if (!*r || *r == ' ' || *r == '\t' || *r == '\n' || *r == ';' ||
+                *r == '&' || *r == '|' || *r == '<' || *r == '>') {
+                if (sb_putc(b, '`') < 0) return -1;
+                *pp = *pp + 1;
+                return 0;
+            }
+        }
         /* bash's expansion error, status 1 and the line dropped: "bad
          * substitution: no closing "`" in `-", from the backquote to the
          * word's end -- as a brace range through '`' makes one (Oils
@@ -36285,7 +36300,13 @@ static int shell_brace_range(const char *body, size_t blen,
         sb_truncate(&piece, 0);
         if (sb_putmem(&piece, pre, prelen) < 0) return -1;
         if (alpha) {
-            if (sb_putc(&piece, (char)v) < 0) return -1;
+            /* the punctuation between Z and a goes in as it is -- a
+             * backquote alone is a character (shell_expand_backtick) --
+             * but a backslash, which quote removal leaves nothing of, is
+             * an empty word, as bash makes it (finding 509) */
+            const char *t = v == '\\' ? "''" : 0;
+            if (t ? sb_puts(&piece, t) < 0 : sb_putc(&piece, (char)v) < 0)
+                return -1;
         } else if (width > 0) {
             char digits[32];
             unsigned long av = v < 0 ? (unsigned long)0 - (unsigned long)v
