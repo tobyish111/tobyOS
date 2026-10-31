@@ -1301,6 +1301,7 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
         unsigned long at = st->lineno;
         size_t dl = bsyn_strlen(h->delim);
         bool found = false;
+        bool eof_closed = false;             /* "EOF)" ended it in a $( ) */
         struct bsyn_buf line = {0, 0, 0};
         struct bsyn_buf doc = {0, 0, 0};     /* the tree's copy of the body */
         for (;;) {
@@ -1353,6 +1354,7 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
                     bsyn_push_string(st, l + dl, ll - dl, true, false, 0);
                     found = true;
                     closes = true;
+                    eof_closed = true;
                 }
             }
             if (closes) break;
@@ -1361,7 +1363,9 @@ static void bsyn_gather_heredocs(struct bsyn *st) {
         if (h->node) h->node->body = bsn_strn(st, doc.p ? doc.p : "", doc.len);
         bsyn_buf_free(&doc);
         bsyn_buf_free(&line);
-        if (!found && !st->oom) {
+        /* ...and a document "EOF)" ends is still one the end of the input
+         * delimited: bash warns for it too (heredoc3.sub; logs/b42 hd1 h3) */
+        if ((!found || eof_closed) && !st->oom) {
             struct bsyn_buf w = {0, 0, 0};
             bsyn_puts(st, &w, "here-document at line ");
             bsyn_put_ulong(st, &w, at);
