@@ -881,6 +881,10 @@ static int            g_fndef_lm_n;
 /* The line of the body's `{` or `(` -- bash's function_bstart, its
  * line_number while the body runs (logs/b12 p94 p105). 0: unknown. */
 static unsigned long  g_fndef_body_ln;
+/* Defining the exported functions the environment brought (see
+ * shell_import_env_functions) */
+static bool g_fn_importing;
+static bool g_c_string_run;
 
 static void shell_fndef_drop_map(void) {
     kfree(g_fndef_lm_off);
@@ -1300,6 +1304,10 @@ struct shell_function {
     bool  *heredoc_expand;                          /* see shell_heredoc */
     int    nheredoc;
     char  *src;          /* the file it was defined in, 0 for -c (S12) */
+    /* BASH_SOURCE's word for it when no file says: bash's "environment"
+     * for one imported or defined under -c, "main" for one from standard
+     * input or a terminal (logs/b42 db3 m1-m3, db4 n4) */
+    const char *src_label;
     /* WHERE EACH LINE OF THE BODY IS, from the definition: lm_line[i] is
      * the source line from body offset lm_off[i] on. A call runs the body
      * with this map, so $LINENO -- and a diagnostic -- name the line in the
@@ -6374,6 +6382,8 @@ static int shell_function_set(const char *name, const char *body) {
     if (fresh) g_functions[idx].seq = ++g_fn_seq;
     if (g_functions[idx].src) kfree(g_functions[idx].src);
     g_functions[idx].src = g_diag_source ? shell_strdup(g_diag_source) : 0;
+    g_functions[idx].src_label =
+        (g_fn_importing || g_c_string_run) ? "environment" : "main";
 
     /* ...and the line map the definer captured (see shell_fndef_capture_map),
      * which belongs to this body and no other. */
@@ -12030,7 +12040,8 @@ static void cmd_declare(int argc, char **argv) {
             if (func_names && g_shopt_misc[10])
                 shell_printf("%s %lu %s\n", fn->name,
                              fn->lm_n > 0 ? fn->lm_line[0] : 0ul,
-                             fn->src ? fn->src : "main");
+                             fn->src ? fn->src
+                             : fn->src_label ? fn->src_label : "main");
             else if (func_names) shell_printf("%s\n", fn->name);
             else            shell_declare_print_function(fn);
         }
@@ -43822,7 +43833,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_diag_in_fn = true;
         shell_hd_pin_text(run_body, +1);
         shell_callframe_push(run_name, g_shell_lineno,
-                             run_src, run_src != 0, false);
+                             run_src ? run_src : fn->src_label, run_src != 0, false);
         /* THE TRAPS A FUNCTION DOES NOT INHERIT ARE TAKEN AWAY for its body
          * and put back after -- unless it set its own -- as bash's
          * execute_function does: DEBUG and RETURN, unless `set -T` or
@@ -54322,7 +54333,9 @@ static void shell_import_env_functions(void) {
              * carry here-documents after them */
             char *copy = shell_strdup(text.p);
             if (copy) {
+                g_fn_importing = true;          /* "environment" */
                 (void)shell_run_script_text(copy, false);
+                g_fn_importing = false;
                 kfree(copy);
             }
         }
