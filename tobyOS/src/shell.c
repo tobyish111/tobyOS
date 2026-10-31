@@ -23518,15 +23518,27 @@ static void cmd_times(int argc, char **argv) {
     shell_set_status(0);
 }
 
+/* S is UPPER, ignoring the case of S's letters */
+static bool sh_eq_upper_ci(const char *s, const char *upper) {
+    for (; *s && *upper; s++, upper++) {
+        char c = (*s >= 'a' && *s <= 'z') ? (char)(*s - 'a' + 'A') : *s;
+        if (c != *upper) return false;
+    }
+    return !*s && !*upper;
+}
+
 static int shell_trap_parse_condition(const char *s, int *out_sig) {
     if (!s || !*s || !out_sig) return -1;
-    if (strcmp(s, "0") == 0 || strcmp(s, "EXIT") == 0) {
+    /* the shell's own conditions in any case, as the signals' names are:
+     * `trap - debug` -- tsh said "bad condition 'debug'" (bash's
+     * trap.tests; logs/b42 tp1) -- finding 512 */
+    if (strcmp(s, "0") == 0 || sh_eq_upper_ci(s, "EXIT")) {
         *out_sig = 0;
         return 0;
     }
-    if (strcmp(s, "DEBUG") == 0) { *out_sig = SHELL_TRAP_DEBUG; return 0; }
-    if (strcmp(s, "RETURN") == 0) { *out_sig = SHELL_TRAP_RETURN; return 0; }
-    if (strcmp(s, "ERR") == 0) {
+    if (sh_eq_upper_ci(s, "DEBUG")) { *out_sig = SHELL_TRAP_DEBUG; return 0; }
+    if (sh_eq_upper_ci(s, "RETURN")) { *out_sig = SHELL_TRAP_RETURN; return 0; }
+    if (sh_eq_upper_ci(s, "ERR")) {
         *out_sig = SHELL_TRAP_ERR;
         return 0;
     }
