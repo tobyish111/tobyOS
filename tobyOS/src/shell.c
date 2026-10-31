@@ -36471,8 +36471,11 @@ rescan:
             if (r < 0) return -1;
             if (r == 1) return 0;
             /* Neither a list nor a range: the braces are ordinary
-             * characters, and a later group may still expand. */
-            from = close + 1;
+             * characters, and a later group may still expand -- one
+             * inside them too: `a-{b{d,e}}-c` is a-{bd}-c a-{be}-c, where
+             * tsh searched on from the `}` (bash's braces.tests; logs/b42
+             * br1 b2) -- finding 510 */
+            from = open + 1;
             goto rescan;
         }
         any_comma = true;
