@@ -40311,8 +40311,10 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 if (both && shell_add_redir(cur, SH_RD_DUP_OUT, 2, 0, 0, 1) < 0)
                     return -1;
             }
+            /* (not a move's close of its source: `{v}<&$fd0-` closes $fd0,
+             * not $v -- bash's vredir5.sub; logs/b42 rd2 v1 v3) */
             for (int ri = rbefore; ri < cur->redir_count; ri++)
-                cur->redir[ri].fdvar = fdvar;
+                if (!cur->redir[ri].move_src) cur->redir[ri].fdvar = fdvar;
             (*io)++;
             continue;
         }
