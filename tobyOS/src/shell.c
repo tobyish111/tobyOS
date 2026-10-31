@@ -4597,6 +4597,7 @@ static bool g_decl_paren_array;             /* declare -a/-A, or an array */
 struct shell_simple;
 static const struct shell_simple *g_assign_cmd;   /* the command running */
 static bool shell_kv_scalar_paren(const char *kv, const char *val);
+static bool shell_kv_written_list(const char *kv);
 
 /* Set for ONE assignment whose text was never expanded -- a write through
  * a nameref, `printf -v`, `read`: an associative subscript there is a WORD
@@ -11330,8 +11331,10 @@ static void cmd_export(int argc, char **argv) {
                 shell_set_status(1);
                 /* A COMPOUND value refused ends the line, in a function
                  * too: export makes no locals, so bash's assignment of it
-                 * fails as a statement's does (logs/b17 rodecl). */
-                if (g_readonly_hit && argv[i][klen + 1] == '(') {
+                 * fails as a statement's does (logs/b17 rodecl) -- one
+                 * written so, as readonly's (488). */
+                if (g_readonly_hit && argv[i][klen + 1] == '(' &&
+                    shell_kv_written_list(argv[i])) {
                     if (g_shell_flow == SHELL_FLOW_NONE) {
                         g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
                                                      : SHELL_FLOW_DISCARD;
@@ -12651,8 +12654,12 @@ static void cmd_readonly(int argc, char **argv) {
             if (env_set_kv(argv[i]) < 0) {
                 shell_set_status(1);
                 /* a COMPOUND value refused ends the line, as export's
-                 * does (logs/b17 rodecl) */
-                if (g_readonly_hit && argv[i][klen + 1] == '(') {
+                 * does (logs/b17 rodecl) -- one WRITTEN so: a quoted
+                 * `'a=(3)'` is the builtin's argument, status 1 and the
+                 * line goes on (bash's attr.tests; logs/b42 at2 b3) --
+                 * finding 488 */
+                if (g_readonly_hit && argv[i][klen + 1] == '(' &&
+                    shell_kv_written_list(argv[i])) {
                     if (g_shell_flow == SHELL_FLOW_NONE) {
                         g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
                                                      : SHELL_FLOW_DISCARD;
@@ -38024,6 +38031,16 @@ static int shell_simple_mark_noassign(struct shell_simple *s, int i) {
     }
     s->arg_noassign[i >> 3] |= (unsigned char)(1u << (i & 7));
     return 0;
+}
+
+/* Was the assignment word KV written as a list, `NAME=(...)` -- not a
+ * quoted one whose value begins with `(` (a scalar_paren word)? */
+static bool shell_kv_written_list(const char *kv) {
+    const struct shell_simple *c = g_assign_cmd;
+    if (c)
+        for (int i = 0; i < c->nscalar_paren; i++)
+            if (c->scalar_paren[i] == kv) return false;
+    return true;
 }
 
 static bool shell_kv_scalar_paren(const char *kv, const char *val) {
