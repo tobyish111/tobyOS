@@ -28985,11 +28985,14 @@ static void shell_callstack_sync(void) {
         (void)sh_array_set("BASH_LINENO", i, nb);
         (void)sh_array_set("BASH_SOURCE", i, g_main_source ? g_main_source : "");
     }
-    if (depth > 0 && !g_funcname_gone)
-        (void)sh_array_set("FUNCNAME", depth, "main");
-    if (depth > 0 || g_main_source) {
+    /* the script's own frame, "main" at line 0 -- none under -c, nor for
+     * standard input or a terminal, where tsh put "main" and a 0 under
+     * every stack (logs/b42 db3 m1-m3, db4 n1) */
+    if (g_main_source) {
+        if (depth > 0 && !g_funcname_gone)
+            (void)sh_array_set("FUNCNAME", depth, "main");
         (void)sh_array_set("BASH_LINENO", depth, "0");
-        if (g_main_source) (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
+        (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
     }
 }
 
