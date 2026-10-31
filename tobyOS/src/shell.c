@@ -36987,20 +36987,21 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 SH_LIT_CLOSE();
                 word_quoted = true;
                 p++;
-                if (!*p) {
-                    kprintf(SH_PFX_SHELL "trailing escape\n");
-                    return -1;
-                }
+                /* ...and one that ENDS THE INPUT is itself: `eval 'printf
+                 * %s a\'` prints a\, and so does a backquoted command that
+                 * ends in one (bash's comsub2.sub; logs/b42 cms1 m1) -- tsh
+                 * said "trailing escape" */
+                char ec = *p ? *p++ : '\\';
                 /* AN ESCAPED METACHARACTER KEEPS ITS MARKER so the globber
                  * treats it as an ordinary character -- `echo [\\[z]` has to
                  * match a file actually named `[`. The escape comes off again
                  * where the word becomes an argument. */
-                if ((shell_glob_meta(*p) || *p == '=') &&
+                if ((shell_glob_meta(ec) || ec == '=') &&
                     sb_putc(&wb,SHELL_GLOB_ESC) < 0) {
                     kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
-                if (sb_put_script_c(&wb, *p++) < 0) {
+                if (sb_put_script_c(&wb, ec) < 0) {
                     kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
                 }
