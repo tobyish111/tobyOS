@@ -33498,7 +33498,23 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
      * after the first is the PARAMETER `#`; only a name, `*`, `@` or a digit
      * makes it a length. */
     bool length_mode = false;
-    if (expr[0] == '#' && expr[1] != '\0' && expr[1] != '-' &&
+    /* `${#` AND ONE MORE BYTE is a length -- of $? or $- for those -- or,
+     * for an operator with nothing to work on, a bad substitution:
+     * `${#?}` is 1 and `${#/}` `${#%}` `${#=}` `${#+}` `${#^}` are bash's
+     * errors, where tsh gave $# for each (bash's more-exp.tests; logs/b42
+     * mx1 m1) -- finding 501. With a word after it the operator is $#'s. */
+    if (expr[0] == '#' && expr[1] && !expr[2]) {
+        char c1 = expr[1];
+        if (c1 == '?' || c1 == '-') {
+            length_mode = true;
+            expr++;
+        } else if (c1 == '=' || c1 == '+' || c1 == '/' || c1 == '%' ||
+                   c1 == '^' || c1 == ',') {
+            shell_bad_subst(false);
+            return -1;
+        }
+    }
+    if (!length_mode && expr[0] == '#' && expr[1] != '\0' && expr[1] != '-' &&
         expr[1] != '=' && expr[1] != '?' && expr[1] != '+') {
         /* ...and only when NOTHING FOLLOWS the parameter:
          *
