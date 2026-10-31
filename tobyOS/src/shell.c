@@ -24052,7 +24052,10 @@ static void cmd_command(int argc, char **argv) {
         bool any_found = false;
         for (; i < argc; i++) {
             bool found = false;
-            int aidx = shell_alias_find(argv[i]);
+            /* an alias only where aliases expand, as type has it: with
+             * expand_aliases off `command -v m` finds nothing (bash's
+             * type.tests; logs/b42 ty1) -- finding 514 */
+            int aidx = g_opt_expand_aliases ? shell_alias_find(argv[i]) : -1;
             if (aidx >= 0) {
                 if (verbose) {
                     /* bash's wording -- see cmd_type. */
