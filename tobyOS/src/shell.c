@@ -1617,6 +1617,7 @@ static void shell_putc_raw(char c);
 static int shell_case_unquote(struct shell_sb *pb);
 static char *shell_unquoted_newline(char *s);
 static void shell_run_alias_text(const char *src, const char *ex);
+static void shell_run_alias_rest(void);
 /* The line the reader hands execute_line_text next has had its alias pass
  * (finding 469); consumed there. */
 static bool g_alias_line_done;
@@ -22195,6 +22196,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             g_alias_line_done = alias_done;
             execute_line_text(line);
             g_nofork_pending = false;
+            shell_run_alias_rest();             /* finding 474 */
             /* `set -t` (onecmd): bash's reader_loop stops after the command
              * that is running when it is set -- in a script; -c and `.`
              * read their text otherwise (logs/b13 q26) */
@@ -52210,12 +52212,24 @@ static void execute_line_text(const char *src) {
  * the top level. Eval runs inside a line, where that split is not made, so
  * `alias z='unalias z<newline>n=3'; eval z` ran `unalias z n=3` (finding
  * 467). */
+/* The lines of an alias's text that eval's line started and the alias
+ * then removed (unalias, inside its own text): bash's parser goes on
+ * reading them as input only after the command that ran eval, so
+ * `eval z; echo x` with z='unalias z<newline>echo y' prints x, then y
+ * (finding 474). Run by the reader after its unit (shell_run_alias_rest). */
+static struct shell_sb g_alias_rest;
+
 static void shell_run_alias_text(const char *src, const char *ex) {
     if (!ex || ex == src || shell_text_has_newline(src) ||
         !shell_text_has_newline(ex)) {
         execute_line_text(ex ? ex : src);
         return;
     }
+    SH_SB(own);                              /* the alias the line starts */
+    const char *w = shell_skip_blanks(src), *we = w;
+    while (shell_alias_name_char(*we)) we++;
+    bool owned = sb_putmem(&own, w, (size_t)(we - w)) == 0 && own.p &&
+                 shell_alias_value(own.p);
     char *p = (char *)ex;                    /* the caller's buffer */
     while (p && *p) {
         char *nl = shell_unquoted_newline(p);
@@ -52223,7 +52237,37 @@ static void shell_run_alias_text(const char *src, const char *ex) {
         if (*shell_skip_blanks(p)) execute_line_text(p);
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
+        if (owned && p && *p && !shell_alias_value(own.p)) {
+            shell_sb_ready(&g_alias_rest);
+            if (sb_puts(&g_alias_rest, p) < 0 ||
+                sb_putc(&g_alias_rest, '\n') < 0)
+                shell_set_status(2);
+            break;
+        }
     }
+}
+
+/* Lines left by shell_run_alias_text, after the reader's unit: already
+ * through their alias pass, so not given another. */
+static void shell_run_alias_rest(void) {
+    if (!g_alias_rest.len) return;
+    char *rest = shell_strdup(g_alias_rest.p);  /* taken: more may queue */
+    sb_truncate(&g_alias_rest, 0);
+    if (!rest) {
+        shell_set_status(2);
+        return;
+    }
+    char *p = rest;
+    while (p && *p && g_shell_flow == SHELL_FLOW_NONE) {
+        char *nl = shell_unquoted_newline(p);
+        if (nl) *nl = '\0';
+        if (*shell_skip_blanks(p)) {
+            g_alias_line_done = true;
+            execute_line_text(p);
+        }
+        p = nl ? nl + 1 : 0;
+    }
+    kfree(rest);
 }
 
 static char g_heredoc_cmd[LINE_MAX];
