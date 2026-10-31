@@ -1603,6 +1603,16 @@ static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
 /* ANSI-C quoting, shared by `printf %q`, `declare -p` and bare `set`.
  * Defined beside cmd_printf, used here as well -- see shell_ansi_render. */
 static bool shell_q_needs_ansi(const char *s);
+static int shell_quote_ansic(const char *v, struct shell_sb *out);
+/* NAME as an error message shows it: as it is, or as bash's $'...' when it
+ * holds a byte that is no printable character -- "$'a\tb': command not
+ * found", and cd's -- where tsh wrote the bytes (bash's unicode3.sub;
+ * logs/b42 in1 i3) -- finding 497 */
+static const char *shell_msg_name(const char *name, struct shell_sb *buf) {
+    if (!name || !shell_q_needs_ansi(name)) return name;
+    sb_truncate(buf, 0);
+    return shell_quote_ansic(name, buf) == 0 && buf->p ? buf->p : name;
+}
 static int  shell_ansi_render(const char *s, bool emit);
 /* Used by `local` and `declare` above the points where they are defined. */
 static bool shell_declare_print(const char *name);
@@ -14990,7 +15000,9 @@ static void cmd_cd(int argc, char **argv) {
     /* bash's words (S12): "cd: DIR: No such file or directory", the operand
      * as typed and the C library's text. */
     if (rc != VFS_OK) {
-        kprintf("%s: %s: %s\n", g_cd_who, target, shell_errno_text(rc));
+        SH_SB(tq);
+        kprintf("%s: %s: %s\n", g_cd_who, shell_msg_name(target, &tq),
+                shell_errno_text(rc));
         shell_set_status(1);
         return;
     }
@@ -29350,8 +29362,10 @@ static int shell_report_unrunnable(const char *as_typed, int status) {
     /* With PATH unset or empty nothing is searched: the name was tried
      * here and is not -- bash's file_error, "No such file or directory". */
     if (!slash && !g_resolve_nopath) {
+        SH_SB(nq);
         if (g_spawn_for) kprintf("%s: %s: not found\n", g_spawn_for, as_typed);
-        else kprintf(SH_PFX_TSH "%s: command not found\n", as_typed);
+        else kprintf(SH_PFX_TSH "%s: command not found\n",
+                     shell_msg_name(as_typed, &nq));
         return 127;
     }
     kprintf(SH_PFX_TSH "%s: %s\n", as_typed,
