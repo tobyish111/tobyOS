@@ -27707,6 +27707,19 @@ static int shell_history_resolve(const char *spec, int def_index) {
  *     fc [-e editor] [first [last]]
  * There is no editor to hand off to, so the editing form is refused rather
  * than silently behaving like -s, which would run the wrong thing. */
+/* fc's word for a SPEC that names no entry, as bash's: a number is "history
+ * specification out of range", anything else "no command found" -- tsh
+ * said "no such history entry" for both (bash's history.tests; logs/b42
+ * hs2) -- finding 525 */
+static void shell_fc_not_found(const char *spec) {
+    const char *s = spec ? spec : "";
+    if (*s == '-') s++;
+    bool num = *s != '\0';
+    for (const char *q = s; *q; q++) if (*q < '0' || *q > '9') num = false;
+    kprintf(num ? "fc: history specification out of range\n"
+                : "fc: no command found\n");
+}
+
 static void cmd_fc_in(int argc, char **argv);
 static void cmd_fc(int argc, char **argv) {
     /* The fc command itself is not part of the range it operates on --
@@ -27780,7 +27793,7 @@ static void cmd_fc_in(int argc, char **argv) {
         }
         int idx = shell_history_resolve(first, newest);
         if (idx < 0) {
-            kprintf("fc: no such history entry\n");
+            shell_fc_not_found(first);
             shell_set_status(1);
             return;
         }
@@ -27816,7 +27829,7 @@ static void cmd_fc_in(int argc, char **argv) {
                                                     : newest);
     int last  = shell_history_resolve(last_s, list ? newest : first);
     if (first < 0 || last < 0) {
-        kprintf("fc: no such history entry\n");
+        shell_fc_not_found(first < 0 ? first_s : last_s);
         shell_set_status(1);
         return;
     }
