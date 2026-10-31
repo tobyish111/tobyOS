@@ -34986,7 +34986,18 @@ static int shell_arith_subst_eval(char *expr, struct shell_sb *b) {
          * error came out as 2 and, inside `[[ ]]`, as a syntax error that
          * ended the script. (An unbound variable under set -u has ended the
          * script already: shell_arith_unbound.) */
-        if (k != SARITH_UNBOUND) g_bad_subst_soft = true;
+        /* ...and a POSIX-mode shell that is not interactive exits on it:
+         * 127 under -c, 1 from a script (bash's posixexp2.sub run as sh;
+         * logs/b42 px6) -- finding 481 */
+        if (k != SARITH_UNBOUND && g_opt_posix && !g_interactive) {
+            shell_set_status(1);
+            if (g_shell_flow == SHELL_FLOW_NONE) {
+                g_shell_flow = SHELL_FLOW_EXIT;
+                g_shell_flow_status = shell_fatal_status();
+            }
+        } else if (k != SARITH_UNBOUND) {
+            g_bad_subst_soft = true;
+        }
         return -1;
     }
     return sb_put_long(b, v);
