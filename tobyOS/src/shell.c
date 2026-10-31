@@ -28064,8 +28064,16 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         char *buf = bufb.p;
         kprintf_raw("%s\n", buf);          /* the command, echoed bare */
         if (v->own) shell_history_pop();
+        /* ...recorded without the newline a here-document's entry ends in */
+        for (size_t bl = strlen(buf); bl && buf[bl - 1] == '\n'; ) buf[--bl] = '\0';
         shell_history_add(buf);
-        execute_line_text(buf);
+        /* THE COMMAND IS READ AS SHELL INPUT, as a trap's action is, under
+         * the name "fc" -- bash's "fc: line N: syntax error" -- and over
+         * lines through the reader, so a here-document's body is one: tsh
+         * ran the entry as one line, `cat <<!` and its body's words cat's
+         * operands (bash's history1.sub; logs/b42 fc1 f8, fc8) -- finding
+         * 552 */
+        shell_trap_text(buf, "fc", false);
         return;
     }
 
