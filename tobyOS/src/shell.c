@@ -37510,7 +37510,11 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                  * syntax error where bash prints nothing at all. */
                 bool funcdef = (*q == '(' &&
                                 *shell_skip_blanks(q + 1) == ')');
-                const char *av = (funcdef || !may_expand ||
+                /* A quote or backslash right after the name continues the
+                 * word, which is then a quoted one and no alias: `ec"x"`
+                 * is the command ecx (finding 472). */
+                bool quoted_on = (*p == '\'' || *p == '"' || *p == '\\');
+                const char *av = (funcdef || quoted_on || !may_expand ||
                                   shell_alias_already_used(name))
                                      ? 0 : shell_alias_value(name);
                 if (av) {
