@@ -38173,6 +38173,30 @@ static bool shell_glob_bracket(const char **pp, uint32_t c) {
  * wrapper over it.
  */
 
+/* A BRACKET EXPRESSION INSIDE A GROUP RUNS TO ITS `]`, parens and bars and
+ * all, as bash's glob_patscan reads it -- and one with no `]` leaves the
+ * group open, so the pattern is no extglob at all: `!([*)*` and
+ * `+(a|b[)*` match nothing and stay as written, `case '*(a|b[)' in
+ * *(a|b[))` matches (bash's extglob.tests; logs/b42 eg1). tsh counted the
+ * `)` in `[)` as the group's. Returns the `]`, or 0. */
+static const char *eg_bracket_close(const char *p, const char *pend) {
+    const char *q = p + 1;
+    if (q < pend && (*q == '!' || *q == '^')) q++;
+    if (q < pend && *q == ']') q++;
+    for (; q < pend; q++) {
+        if ((*q == '\\' || *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) &&
+            q + 1 < pend) { q++; continue; }
+        if (*q == '[' && q + 1 < pend && (q[1] == ':' || q[1] == '.' || q[1] == '=')) {
+            char k = q[1];
+            const char *e = q + 2;
+            while (e + 1 < pend && !(e[0] == k && e[1] == ']')) e++;
+            if (e + 1 < pend) { q = e + 1; continue; }
+        }
+        if (*q == ']') return q;
+    }
+    return 0;
+}
+
 /* The `)` that closes the group `p` opens, or 0. `p` points at the `(`. */
 static const char *eg_close_paren(const char *p, const char *pend) {
     int depth = 0;
@@ -38180,6 +38204,12 @@ static const char *eg_close_paren(const char *p, const char *pend) {
         /* escape-aware: a marked byte is DATA, never grouping. */
         if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
             p + 1 < pend) { p++; continue; }
+        if (*p == '[' && depth > 0) {
+            const char *b = eg_bracket_close(p, pend);
+            if (!b) return 0;
+            p = b;
+            continue;
+        }
         if (*p == '(') depth++;
         else if (*p == ')') { if (--depth == 0) return p; }
     }
@@ -38193,6 +38223,10 @@ static const char *eg_next_alt(const char *p, const char *end) {
         /* escape-aware: a marked `|` is a literal bar, not a separator. */
         if ((*p == '\\' || *p == SHELL_GLOB_ESC || *p == SHELL_DATA_ESC) &&
             p + 1 < end) { p++; continue; }
+        if (*p == '[') {
+            const char *b = eg_bracket_close(p, end);
+            if (b) { p = b; continue; }
+        }
         if (*p == '(') depth++;
         else if (*p == ')') depth--;
         else if (*p == '|' && depth == 0) return p;
