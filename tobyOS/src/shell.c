@@ -29504,6 +29504,10 @@ struct shell_token {
     /* The word as WRITTEN, for messages that quote it (`$file: ambiguous
      * redirect`). Only the main word path sets it; 0 elsewhere. */
     const char *raw;
+    /* How many bytes of the text came before the first quoted or expanded
+     * part -- written as they are -- or -1 (see shell_add_one_arg's
+     * tilde). */
+    long qoff;
 };
 
 struct shell_redir {
@@ -36558,6 +36562,7 @@ struct shell_tokv {
 };
 
 static const char *g_tok_word_raw;      /* see shell_token.raw */
+static long g_tok_word_qoff = -1;       /* ...and shell_token.qoff */
 
 static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
                                enum shell_tok_type type, char *text,
@@ -36582,6 +36587,8 @@ static int shell_emit_token_fd(struct shell_tokv *tok, int *ntok,
     g_tok_fdvar = 0;
     t->raw = g_tok_word_raw;
     g_tok_word_raw = 0;
+    t->qoff = g_tok_word_qoff;
+    g_tok_word_qoff = -1;
     (*ntok)++;
     return 0;
 }
@@ -37707,7 +37714,17 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          * protect quoted spans -- the marker is a toggle, so nesting is well
          * defined. */
         bool lit_open = false;
-#define SH_LIT_CLOSE() do { if (lit_open) { \
+        /* Each call is at a quote, an escape or an expansion -- or the
+         * word's end: the first says where the written prefix ends
+         * (shell_token.qoff), the marks not counted. */
+        long word_qoff = -1;
+#define SH_LIT_CLOSE() do { \
+        if (word_qoff < 0) { \
+            word_qoff = 0; \
+            for (size_t qk = 0; qk < wb.len; qk++) \
+                if (wb.p[qk] != SHELL_NOSPLIT_MARK) word_qoff++; \
+        } \
+        if (lit_open) { \
         if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) \
             return -1; lit_open = false; } } while (0)
         /* Depth of an assignment-position subscript, if we are inside one.
@@ -38166,6 +38183,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
             if (!start) return -1;
             g_tok_word_raw = words_store(words, raw_word_start,
                                          (size_t)(p - raw_word_start));
+            g_tok_word_qoff = word_qoff;
             if (shell_emit_token(tok, &ntok, SH_TOK_WORD, start, word_quoted) < 0) return -1;
             /* A PREFIX ASSIGNMENT IS IN FORCE FOR THE WORDS AFTER IT. See
              * g_tokpfx. `prefix_ok` is the same command-position rule the
@@ -40566,10 +40584,27 @@ static size_t shell_word_assign_eq(const char *w) {
  * (shell_assign_ctx): 1 or 0 while it runs, -1 elsewhere -- where the
  * word's shape alone decides, as it always did. */
 static int g_arg_assign_ctx = -1;
+/* The word's shell_token.qoff while its first field is added, else -1. */
+static long g_arg_tilde_qoff = -1;
+
+/* IN A WORD WITH A QUOTED PART, A TILDE AT OFF EXPANDS WHEN ITS PREFIX WAS
+ * WRITTEN UNQUOTED: the prefix and the `/` that ends it -- or a `:`, in an
+ * assignment -- before QOFF, the word's first quoted or expanded byte.
+ * bash's `~/"foo"` is $HOME/foo, `~"/foo"` and `"~"/foo` stay; tsh
+ * expanded no tilde in a word quoted anywhere (bash's tilde.tests;
+ * logs/b42 jb1 t1). */
+static bool sh_tilde_unquoted(const char *word, size_t off, long qoff, bool colon) {
+    if (qoff < 0) return false;
+    size_t j = off + 1;
+    while (word[j] && word[j] != '/' && !(colon && word[j] == ':')) j++;
+    return word[j] && (long)j < qoff;
+}
 
 static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur,
                              const char *word, bool quoted) {
     if (shell_simple_argv_room(cur) < 0) return -1;
+    long tq = g_arg_tilde_qoff;         /* the first field's, once */
+    g_arg_tilde_qoff = -1;
 
     /* A TILDE THAT WAS WRITTEN IN THE WORD EXPANDS; ONE THAT ARRIVED FROM AN
      * EXPANSION IS DATA -- and the no-split marks already say which is which,
@@ -40688,9 +40723,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
         if (g_shopt_nullglob) return 0;
     }
 
-    if (!quoted) {
+    if (!quoted || tq >= 0) {
         char *expanded = 0;
-        int trc = g_arg_from_expansion
+        int trc = g_arg_from_expansion ||
+                  (quoted && !sh_tilde_unquoted(word, 0, tq, false))
                     ? 0
                     : shell_expand_tilde_word(pl, word, &expanded);
         if (trc < 0) {
@@ -40698,6 +40734,8 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             return -1;
         }
         if (trc > 0) {
+            /* the quoted rest's escapes come off, as below */
+            if (quoted) shell_strip_glob_escapes(expanded);
             cur->argv[cur->argc++] = expanded;
             return 0;
         }
@@ -40726,7 +40764,8 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             if (sb_putmem(&asg, q, klen + 1) < 0) return -1;
             q += klen + 1;
             while (*q) {
-                if (*q == '~') {
+                if (*q == '~' &&
+                    (!quoted || sh_tilde_unquoted(word, (size_t)(q - word), tq, true))) {
                     const char *seg_end = q;
                     while (*seg_end && *seg_end != ':') seg_end++;
                     char seg[VFS_PATH_MAX];
@@ -41397,7 +41436,9 @@ static const char *shell_redir_word(struct shell_pipeline *pl,
     bool posix_word = g_opt_posix && !g_interactive;
     bool og = g_opt_noglob;
     if (posix_word) g_opt_noglob = true;
+    g_arg_tilde_qoff = t->qoff;
     int arc = shell_add_arg_ex(pl, tmp, t->text, t->quoted, t->expanded, false);
+    g_arg_tilde_qoff = -1;
     g_opt_noglob = og;
     if (arc >= 0) {
         if (tmp->argc == 0) {
@@ -41708,10 +41749,11 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         bool asrc = tok[*io].assign_src ||
             (tok[*io].raw ? shell_assign_prefix_len_raw(tok[*io].raw)
                           : shell_assign_prefix_len(tok[*io].text)) > 0;
-        if (shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
-                             tok[*io].expanded, asrc) < 0) {
-            return -1;
-        }
+        g_arg_tilde_qoff = tok[*io].qoff;
+        int aarc = shell_add_arg_ex(pl, cur, tok[*io].text, tok[*io].quoted,
+                                    tok[*io].expanded, asrc);
+        g_arg_tilde_qoff = -1;
+        if (aarc < 0) return -1;
         /* A WORD THAT WAS NOT WRITTEN AS AN ASSIGNMENT IS NOT ONE, whatever
          * it expands to. bash decides on the word as written, and only an
          * unquoted NAME before the `=` makes one:
@@ -48473,8 +48515,11 @@ static bool shell_try_for_command(const char *src) {
             if (tok[i].type != SH_TOK_WORD) continue;
             /* a word of the list is never an assignment, whatever its
              * shape: `for i in foo=*` globs (logs/b12 p113) */
-            if (shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
-                                 tok[i].expanded, false) < 0) {
+            g_arg_tilde_qoff = tok[i].qoff;
+            int farc = shell_add_arg_ex(wl, items, tok[i].text, tok[i].quoted,
+                                        tok[i].expanded, false);
+            g_arg_tilde_qoff = -1;
+            if (farc < 0) {
                 shell_pipeline_free(wl); kfree(items);
                 if (io_active) shell_restore_io_frame(&io_frame);
                 kfree(list); kfree(body);
