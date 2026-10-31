@@ -48754,6 +48754,28 @@ static int shell_expand_case_word(const char *src, struct shell_sb *out) {
         SH_SB(joined);
         if (shell_argmarks_to_spaces(tok[i].text, &joined) < 0) return -1;
         shell_strip_nosplit_inplace(joined.p);
+        /* A TILDE STARTING THE WORD EXPANDS: `case ~ in $HOME)` matches --
+         * tsh compared the `~` (bash's tilde.tests; logs/b42 tl4) --
+         * finding 505. Only one written unquoted, to its `/`. */
+        const char *r = shell_skip_blanks(src);
+        if (r[0] == '~' && joined.p && joined.p[0] == '~') {
+            size_t j = 1;
+            bool plain = true;
+            while (r[j] && r[j] != '/' && !is_space(r[j]) && r[j] != ';') {
+                char c = r[j++];
+                if (c == '\'' || c == '"' || c == '\\' || c == '$' ||
+                    c == '`')
+                    plain = false;
+            }
+            SH_SB(home);
+            int tr = plain && strncmp(joined.p, r, j) == 0
+                         ? shell_tilde_prefix_home(r + 1, j - 1, &home) : 0;
+            if (tr < 0) return -1;
+            if (tr > 0) {
+                if (sb_puts(&home, joined.p + j) < 0) return -1;
+                return sb_set(out, home.p ? home.p : "");
+            }
+        }
         return sb_set(out, joined.p);
     }
     sb_truncate(out, 0);
