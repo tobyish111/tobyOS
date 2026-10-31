@@ -1617,6 +1617,9 @@ static void shell_putc_raw(char c);
 static int shell_case_unquote(struct shell_sb *pb);
 static char *shell_unquoted_newline(char *s);
 static void shell_run_alias_text(const char *src, const char *ex);
+/* The line the reader hands execute_line_text next has had its alias pass
+ * (finding 469); consumed there. */
+static bool g_alias_line_done;
 static const char *shell_expand_aliases(const char *src, struct shell_sb *buf);
 static const char *shell_expand_aliases_nested(const char *src,
                                                struct shell_sb *buf);
@@ -21711,6 +21714,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         size_t accum_cap = 0;
 
         bool hd_failed = false;
+        bool alias_done = false;
 
         /* First, join physical lines into one LOGICAL line: a trailing
          * backslash continues, and so does an unclosed quote. Done before the
@@ -21718,6 +21722,26 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
          * be mistaken for the end of a construct. */
         {
             int inc = shell_line_incomplete(line);
+            /* AN ALIAS CAN OPEN A QUOTE THAT THE LINE CLOSES: with `alias
+             * say="echo 'a:"`, `say b'` is the whole command echo 'a: b', as
+             * bash expands aliases while it reads. A line that leaves a
+             * quote open by itself is expanded here, and taken as expanded
+             * when that closes it; it then runs without a second pass
+             * (g_alias_line_done) -- tsh joined the next lines into the
+             * quote (finding 469). */
+            if (inc == 1 && (g_interactive || g_opt_expand_aliases)) {
+                SH_SB(xb);
+                const char *ex = shell_expand_aliases(line, &xb);
+                size_t xl = ex ? strlen(ex) : 0;
+                if (ex && ex != line && shell_line_incomplete(ex) == 0 &&
+                    shell_accum_room(&accum, &accum_cap, xl + 1)) {
+                    memcpy(accum, ex, xl + 1);
+                    line = accum;
+                    shell_lmap_reset(accum, line_first);
+                    alias_done = true;
+                    inc = 0;
+                }
+            }
             /* THE SCRIPT ENDING IN A BACKSLASH: the continuation runs into
              * the end, and the backslash goes -- `echo AAA\` as the script's
              * last bytes prints AAA (bash's parser1.sub; logs/b42 prs1). In
@@ -22162,11 +22186,13 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         if (eval_mode) {
             /* Aliases, as cmd_eval's one-line path expands them. */
             SH_SB(abuf);
-            shell_run_alias_text(line, shell_expand_aliases(line, &abuf));
+            shell_run_alias_text(line, alias_done ? line :
+                                       shell_expand_aliases(line, &abuf));
         } else {
             /* the text's LAST unit: nothing at all after it, not even a
              * blank line (bash: *bash_input.location.string == '\0') */
             g_nofork_pending = nofork_scope && *p == '\0';
+            g_alias_line_done = alias_done;
             execute_line_text(line);
             g_nofork_pending = false;
             /* `set -t` (onecmd): bash's reader_loop stops after the command
@@ -52043,7 +52069,10 @@ static void execute_line_text(const char *src) {
     SH_SB(abuf);
     const char *line_src = src;
     {
-        const char *expanded = shell_expand_aliases(src ? src : "", &abuf);
+        /* the reader expanded this line already (finding 469) */
+        const char *expanded = (g_alias_line_done && src) ? src
+                             : shell_expand_aliases(src ? src : "", &abuf);
+        g_alias_line_done = false;
         if (expanded) {
             /* THE MAP IS KEYED ON A BUFFER, and this is where the buffer
              * changes. An alias pass that changed nothing produces an
