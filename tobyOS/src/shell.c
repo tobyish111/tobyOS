@@ -47897,14 +47897,46 @@ static bool shell_try_case_command(const char *src) {
     s = shell_skip_blanks(s + 4);
     shell_bashcmd_set(src, strlen(src), SHPR_CASE_HEAD);
     unsigned long case_ln = g_shell_lineno;      /* see g_bash_lnum (p102) */
+    /* `in` after the WORD: `case in in in) ...` matches the word in, where
+     * the first `in` was taken for the keyword (bash's comsub-posix5.sub;
+     * logs/b42 cms3 q3) -- and a quoted `"x in"` is the word too */
+    const char *wend = s;
+    while (*wend && !is_space(*wend) && *wend != ';') {
+        if (*wend == '\\' && wend[1]) { wend += 2; continue; }
+        if (*wend == '$' && (wend[1] == '(' || wend[1] == '{' || wend[1] == '[')) {
+            wend += sh_arith_dollar_span(wend);
+            continue;
+        }
+        if (*wend == '`') {
+            wend++;
+            while (*wend && *wend != '`') wend += (*wend == '\\' && wend[1]) ? 2 : 1;
+            if (*wend) wend++;
+            continue;
+        }
+        if (*wend == '\'' || *wend == '"') {
+            char qc = *wend++;
+            while (*wend && *wend != qc) {
+                if (qc == '"' && *wend == '\\' && wend[1]) wend++;
+                else if (qc == '"' && *wend == '$' &&
+                         (wend[1] == '(' || wend[1] == '{' || wend[1] == '[')) {
+                    wend += sh_arith_dollar_span(wend);
+                    continue;
+                }
+                wend++;
+            }
+            if (*wend) wend++;
+            continue;
+        }
+        wend++;
+    }
     if (g_opt_xtrace) {                /* `+ case $v in`: the word as written */
-        const char *xin = shell_find_word_marker(s, "in");
+        const char *xin = shell_find_word_marker(wend, "in");
         if (xin) shell_xt_head("case ", s, xin, " in");
     }
     shell_run_debug_trap();            /* the case head fires once (1189) */
     if (g_shell_flow != SHELL_FLOW_NONE) return true;
 
-    const char *in_at = shell_find_word_marker(s, "in");
+    const char *in_at = shell_find_word_marker(wend, "in");
     if (!in_at) {
         kprintf("case: expected 'in'\n");
         shell_parse_error();
