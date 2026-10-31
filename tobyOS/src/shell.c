@@ -7026,8 +7026,9 @@ static bool shell_reading_user(void) {
            g_capture_depth == 0 && g_source_depth == 0 && !g_trap_running &&
            !g_err_trap_running && !g_debug_trap_running;
 }
-static void shell_run_debug_trap(void) {
-    if (g_debug_trap_running) return;
+/* Returns the action's status, 0 when none ran (finding 518). */
+static int shell_run_debug_trap(void) {
+    if (g_debug_trap_running) return 0;
     /* A function that does not inherit the trap runs without it: the call
      * takes it away for the body and puts it back (shell_run_function), as
      * bash's execute_function does -- so it is simply not set in there. */
@@ -7036,11 +7037,11 @@ static void shell_run_debug_trap(void) {
      * pipeline's stages are accounted for by the parent, once per stage,
      * before it starts them (`false | false | false` is three firings on
      * the same line). */
-    if ((g_capture_depth > 0 && !g_opt_functrace) || g_in_pipeline_stage) return;
+    if ((g_capture_depth > 0 && !g_opt_functrace) || g_in_pipeline_stage) return 0;
     const char *act = shell_trap_live(SHELL_TRAP_DEBUG);
-    if (!act || !*act) return;
+    if (!act || !*act) return 0;
     char *action = shell_strdup(act);
-    if (!action) return;
+    if (!action) return 0;
     int saved_status = g_last_status;
     unsigned long saved_line = g_shell_lineno;
     bool was_running = g_trap_running;
@@ -7050,6 +7051,7 @@ static void shell_run_debug_trap(void) {
      * RETURN trap's does not */
     shell_jobs_notify(g_shell_lineno, SHELL_NOTIFY_READ);
     shell_trap_text(action, "debug trap", false);
+    int trc = g_last_status;
     g_trap_running = was_running;
     g_debug_trap_running = false;
     g_shell_lineno = saved_line;
@@ -7062,6 +7064,7 @@ static void shell_run_debug_trap(void) {
     }
     if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(saved_status);
     kfree(action);
+    return trc;
 }
 
 /* The RETURN trap, after a function or a sourced script finishes. */
@@ -51375,14 +51378,18 @@ static bool shell_try_compound_pipeline(const char *src) {
      * per pipeline element (`false | false | false` is three lines, 1194),
      * and it must run while stdout is still the shell's -- inside the loop
      * below it is already the next stage's pipe. */
+    bool dskip = false;
     for (int i = 0; i < n; i++) {
         if (!stage_simple[i]) continue;
         unsigned long ln = shell_lineno_at(src + stage_off[i]);
         if (ln) g_shell_lineno = ln;
         shell_bashcmd_set(stages[i], strlen(stages[i]), SHPR_COMMAND);
-        shell_run_debug_trap();
+        if (shell_run_debug_trap() != 0 && g_shopt_misc[10]) dskip = true;
     }
-    if (g_shell_flow != SHELL_FLOW_NONE) { shell_stages_free(stages, nst); return true; }
+    if (g_shell_flow != SHELL_FLOW_NONE || dskip) {      /* 518 */
+        shell_stages_free(stages, nst);
+        return true;
+    }
 #ifdef SHELL_HOSTED
     /* UNDER JOB CONTROL A FOREGROUND PIPELINE IS ONE JOB: its elements are
      * a process group of their own -- the first one's -- which owns the
@@ -52854,8 +52861,16 @@ static void execute_line_text_inner(const char *src) {
             /* THE DEBUG TRAP, before the command -- once per pipeline stage,
              * which is what bash's per-element firing looks like from
              * outside (1194). $LINENO is the command's own line here. */
-            for (int s = 0; s < plp->count; s++) shell_run_debug_trap();
-            if (g_shell_flow != SHELL_FLOW_NONE) { shell_pipeline_free(plp); return; }
+            /* UNDER extdebug A TRAP THAT FAILS SKIPS THE COMMAND: `x=2`
+             * after a DEBUG trap returning 2 leaves x as it was -- tsh ran
+             * it (bash's dbg-support2.tests; logs/b42 db1) -- finding 518 */
+            bool dskip = false;
+            for (int s = 0; s < plp->count; s++)
+                if (shell_run_debug_trap() != 0 && g_shopt_misc[10]) dskip = true;
+            if (g_shell_flow != SHELL_FLOW_NONE || dskip) {
+                shell_pipeline_free(plp);
+                return;
+            }
             /* THE TRACE, as bash prints it (shell_xtrace.inc): each stage's
              * assignments a line each, then its words, quoted as input --
              * no diagnostic prefix, which kprintf in /bin/tsh would add. */
