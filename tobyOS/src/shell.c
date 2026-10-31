@@ -11369,6 +11369,20 @@ static void cmd_export(int argc, char **argv) {
                 shell_set_status(1);
                 continue;
             }
+            /* a name with `=` or `/` in it cannot go into the environment:
+             * "export: foo=bar: cannot export", 1 -- tsh exported it, and a
+             * child took `/bin/echo` for the function (bash's
+             * exportfunc3.sub; logs/b42 ef1) -- finding 511 */
+            if (!unexport) {
+                bool bad = false;
+                for (const char *q = argv[i]; *q && !bad; q++)
+                    bad = (*q == '=' || *q == '/');
+                if (bad) {
+                    kprintf("export: %s: cannot export\n", argv[i]);
+                    shell_set_status(1);
+                    continue;
+                }
+            }
             g_functions[fi].exported = !unexport;
         }
         return;
