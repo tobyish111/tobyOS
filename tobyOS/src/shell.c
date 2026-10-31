@@ -48848,6 +48848,36 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
         SH_SB(pat);
         if (shell_copy_segment_sb(&pat, start, end) == 0) {
             bool was_quoted = (end > start);
+            /* A TILDE STARTING A PATTERN EXPANDS, as a case word's does:
+             * `case $SHELL in ~/bash)` is $HOME/bash, the home literal in
+             * the pattern -- tsh compared the `~` (bash's tilde2.tests;
+             * logs/b42 tl1 t2) -- finding 500 */
+            if (pat.p && pat.p[0] == '~') {
+                size_t j = 1;
+                bool plain = true;
+                while (pat.p[j] && pat.p[j] != '/') {
+                    char c = pat.p[j++];
+                    if (c == '\'' || c == '"' || c == '\\' || c == '$' ||
+                        c == '`' || shell_glob_meta(c))
+                        plain = false;
+                }
+                SH_SB(home);
+                int tr = plain ? shell_tilde_prefix_home(pat.p + 1, j - 1, &home)
+                               : 0;
+                if (tr < 0) return false;
+                if (tr > 0) {
+                    SH_SB(np);
+                    for (const char *h = home.p; h && *h; h++)
+                        if (((shell_glob_meta(*h) || *h == '\\' ||
+                              *h == '$' || *h == '`' || *h == '\'' ||
+                              *h == '"') && sb_putc(&np, '\\') < 0) ||
+                            sb_putc(&np, *h) < 0)
+                            return false;
+                    if (sb_puts(&np, pat.p + j) < 0 ||
+                        sb_set(&pat, np.p ? np.p : "") < 0)
+                        return false;
+                }
+            }
             /* A CASE PATTERN IS EXPANDED, and the pattern is what comes out:
              *
              *     pat='[ab].py'
