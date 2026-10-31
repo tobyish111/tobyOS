@@ -38297,6 +38297,14 @@ static bool eg_match_star(const char *ls, const char *le,
 /* `pat` points at the operator; `lp` at the `(`. Returns true/false in
  * `*out` when this is a well-formed group, and false as the return value
  * when it is not one (so the caller treats the character literally). */
+/* A FILE NAME'S LEADING PERIOD, while a pathname component is matched
+ * (shell_glob_match_name): the name's start when it begins with `.` and
+ * that dot must be matched by a `.` in the pattern -- no `?`, `*` or
+ * bracket takes it, inside an extglob group too, and a `!( )` does not
+ * match it at all (bash's FNM_PERIOD; extglob.tests, extglob6.sub,
+ * extglob7.sub; logs/b42 eg1). 0 when no such rule is in force. */
+static const char *g_glob_period_at;
+
 static bool eg_try(char op, const char *lp, const char *pend,
                    const char *name, const char *nend, bool *out) {
     const char *rp = eg_close_paren(lp, pend);
@@ -38305,6 +38313,7 @@ static bool eg_try(char op, const char *lp, const char *pend,
     const char *rest = rp + 1;
 
     if (op == '*') { *out = eg_match_star(ls, le, rest, pend, name, nend); return true; }
+    if (op == '!' && name == g_glob_period_at) { *out = false; return true; }
     if (op == '!') {
         /* Any split whose prefix the list does NOT match, and whose
          * remainder matches the rest of the pattern. */
@@ -38393,6 +38402,9 @@ static bool shell_glob_match_r(const char *pat, const char *pend,
                     eg_close_paren(pat + 1, pend)) break;
                 pat++;
             }
+            /* (a leading period is not a star's to take: g_glob_period_at) */
+            if (name == g_glob_period_at)
+                return pat < pend && shell_glob_match_r(pat, pend, name, nend);
             if (pat >= pend) return true;
             /* every CHARACTER boundary: a star never splits one */
             for (const char *n = name; ; n += sh_cl(n, nend, g_glob_u8)) {
@@ -38403,6 +38415,8 @@ static bool shell_glob_match_r(const char *pat, const char *pend,
         if (name >= nend) return false;
         uint32_t nc;
         size_t nl = sh_mbdec(name, nend, g_glob_u8, &nc);
+        if ((*pat == '?' || *pat == '[') && name == g_glob_period_at)
+            return false;
         if (*pat == '?') {                      /* one character */
             pat++;
             name += nl;
@@ -38434,6 +38448,22 @@ static bool shell_glob_match_r(const char *pat, const char *pend,
 static bool shell_glob_match(const char *pat, const char *name) {
     if (!pat || !name) return false;
     return shell_glob_match_e(pat, pat + strlen(pat), name, name + strlen(name));
+}
+
+/* A pathname component's match: its leading period is the pattern's to
+ * match explicitly (g_glob_period_at) -- unless dotglob or a set GLOBIGNORE
+ * says otherwise, which they never do for `.` and `..`. */
+static bool g_globignore_dot;          /* with GLOBIGNORE's notes, below */
+static bool shell_glob_match_name(const char *pat, const char *name) {
+    bool dots = name[0] == '.' &&
+                (!name[1] || (name[1] == '.' && !name[2]));
+    const char *saved = g_glob_period_at;
+    g_glob_period_at = (name[0] == '.' &&
+                        (dots || (!g_shopt_dotglob && !g_globignore_dot)))
+                           ? name : 0;
+    bool r = shell_glob_match(pat, name);
+    g_glob_period_at = saved;
+    return r;
 }
 
 /* Where the bracket expression opening at `p` ends (one past its `]`), or 0
@@ -38655,6 +38685,13 @@ static bool shell_glob_dot_ok(const char *name, const char *comp) {
     const char *gi = env_get("GLOBIGNORE");
     if (!gi) g_globignore_dot = false;
     else if (*gi) g_globignore_dot = true;
+    /* an extglob group in front may hold the dot in one of its
+     * alternatives, `@(.foo|*)`, or be followed by it, `*(bar).foo`: the
+     * match decides (shell_glob_match_name) */
+    if (g_shopt_extglob && comp[1] == '(' &&
+        (comp[0] == '?' || comp[0] == '*' || comp[0] == '+' ||
+         comp[0] == '@' || comp[0] == '!'))
+        return true;
     if (!g_shopt_dotglob && !g_globignore_dot) return false;
     return !(name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
 }
@@ -38918,7 +38955,7 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
     int dots = 0;
     while (shell_glob_next(&d, &ent, &dots) == VFS_OK) {
         if (!shell_glob_dot_ok(ent.name, comps[ci])) continue;
-        if (!shell_glob_match(comps[ci], ent.name)) continue;
+        if (!shell_glob_match_name(comps[ci], ent.name)) continue;
         char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
         int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, ent.name);
         if (n <= 0 || (size_t)n >= sizeof sub) continue;
@@ -39101,7 +39138,7 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,                    
          * dotglob is on or GLOBIGNORE is set, when only `.` and `..` stay
          * hidden. dotglob was a table entry the globber never read. */
         if (!shell_glob_dot_ok(ent.name, pattern)) continue;
-        if (!shell_glob_match(pattern, ent.name)) continue;
+        if (!shell_glob_match_name(pattern, ent.name)) continue;
         if (shell_simple_argv_room(cur) < 0) {
             vfs_closedir(&d);
             return -1;
