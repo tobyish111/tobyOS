@@ -4377,6 +4377,13 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
  * not before: `w=W; w=("$w" q)` reads W. */
 static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
                              bool is_array);
+/* A local's list expanded ahead of the local (shell_local_list_pre) is
+ * traced once, under the local's name, `+ la=('1' '2')`: the scratch
+ * array's assignment takes the name (g_xt_lit_name), and the local's own
+ * from the expanded list is not traced (g_xt_lit_skip) -- 378 traced
+ * both, the first as the scratch name (finding 464). */
+static const char *g_xt_lit_name;
+static bool g_xt_lit_skip;
 static int sh_array_assign_literal(const char *name, const char *paren,
                                    bool append) {
     const char *p = paren;
@@ -4405,7 +4412,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
     struct sh_litq q = { 0, 0, 0 };
     SH_SB(xtd);                         /* see g_xtd and sh_xt_lit_note */
     struct shell_sb *xtd_saved = g_xt_litd;
-    bool xt_cap = g_xtd.pending && g_xtd.level == g_xtrace_level;
+    bool xt_cap = g_xtd.pending && g_xtd.level == g_xtrace_level &&
+                  !g_xt_lit_skip;
     g_xt_litd = xt_cap ? &xtd : 0;
     int frc = sh_array_literal_fill(tmp, name, p, append, next,
                                     assoc ? 0 : &q);
@@ -4415,7 +4423,8 @@ static int sh_array_assign_literal(const char *name, const char *paren,
         sh_array_unset_literal(tmp);
         return -1;
     }
-    if (xt_cap) shell_xt_decl_literal(name, append, xtd.p ? xtd.p : "");
+    if (xt_cap) shell_xt_decl_literal(g_xt_lit_name ? g_xt_lit_name : name,
+                                      append, xtd.p ? xtd.p : "");
     /* The attributes (-i -l -u) are read BEFORE a scalar of the name is
      * replaced, which takes its flags with it: `typeset -i x; x=([0]=7+11)`
      * stored 7+11 where bash stores 18 (appendop.tests). */
@@ -9815,12 +9824,17 @@ static void sh_quote_single(struct shell_sb *o, const char *s) {
     }
     (void)sb_putc(o, '\'');
 }
-static int shell_local_list_pre(const char *val, bool assoc, struct shell_sb *out) {
+static int shell_local_list_pre(const char *name, const char *val, bool assoc,
+                                struct shell_sb *out) {
     static unsigned pre_seq;
     char tmp[32];
     ksnprintf(tmp, sizeof tmp, "%cpre%u", SH_ARRAY_TMP_MARK, pre_seq++);
     if (assoc ? sh_array_make_assoc(tmp) < 0 : !sh_array_create(tmp)) return -1;
-    if (sh_array_assign_literal(tmp, val, false) < 0) {
+    const char *xt_name = g_xt_lit_name;
+    g_xt_lit_name = name;                    /* traced as the local's */
+    int arc = sh_array_assign_literal(tmp, val, false);
+    g_xt_lit_name = xt_name;
+    if (arc < 0) {
         sh_array_unset_literal(tmp);
         return -1;
     }
@@ -10624,7 +10638,7 @@ static void cmd_local(int argc, char **argv) {
                 /* (a local that inherits an associative array is one) */
                 bool pa = l_assoc || ((l_inherit || shell_localvar_inherit()) &&
                                       sh_array_is_assoc(name));
-                if (shell_local_list_pre(pv, pa, &prelist) < 0) {
+                if (shell_local_list_pre(name, pv, pa, &prelist) < 0) {
                     shell_set_status(1);
                     if (g_shell_flow != SHELL_FLOW_NONE) return;
                     continue;
@@ -10677,7 +10691,9 @@ static void cmd_local(int argc, char **argv) {
             if (pre && (sb_puts(&prekv, name) < 0 || sb_putc(&prekv, '=') < 0 ||
                         sb_puts(&prekv, prelist.p) < 0))
                 pre = false;
+            g_xt_lit_skip = pre;             /* traced as written, above */
             if (env_set_kv(pre ? prekv.p : argv[i]) < 0) shell_set_status(1);
+            g_xt_lit_skip = false;
             g_decl_paren_array = false;
         } else if (!already && !l_attr_on && !inherit) {
             /* `local x` DECLARES x, without a value: `declare -p x` is
@@ -12261,7 +12277,7 @@ static void cmd_declare(int argc, char **argv) {
             if (pv[0] == '(' && !shell_kv_scalar_paren(argv[i], pv)) {
                 bool pa = set_assoc || ((set_inherit || shell_localvar_inherit()) &&
                                         sh_array_is_assoc(name));
-                if (shell_local_list_pre(pv, pa, &prelist) < 0) {
+                if (shell_local_list_pre(name, pv, pa, &prelist) < 0) {
                     shell_set_status(1);
                     if (g_shell_flow != SHELL_FLOW_NONE) return;
                     continue;
@@ -12433,7 +12449,9 @@ static void cmd_declare(int argc, char **argv) {
             if (pre && (sb_puts(&prekv, name) < 0 || sb_putc(&prekv, '=') < 0 ||
                         sb_puts(&prekv, prelist.p) < 0))
                 pre = false;
+            g_xt_lit_skip = pre;             /* traced as written (local's) */
             int dsrc = env_set_kv(pre ? prekv.p : argv[i]);
+            g_xt_lit_skip = false;
             g_readonly_label = 0;
             g_readonly_as_word = g_readonly_tgt_word = 0;
             g_decl_paren_array = false;
