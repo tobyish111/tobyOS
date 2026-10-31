@@ -18694,6 +18694,10 @@ static void shell_heredoc_specs_free(struct shell_heredoc_spec *hd, int n) {
 
 static bool shell_heredoc_line_matches(const char *line, const char *delim,
                                        bool strip_tabs) {
+    /* under <<- the line as it stands first: a quoted delimiter may begin
+     * with a tab, `<<-'	END'`, and its own line matches before the tabs go
+     * (bash's heredoc3.sub; logs/b42 hd1 h5) */
+    if (strip_tabs && strcmp(line, delim) == 0) return true;
     if (strip_tabs) {
         while (*line == '\t') line++;
     }
