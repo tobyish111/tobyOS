@@ -4819,7 +4819,10 @@ static int sh_try_array_assignment(const char *kv) {
             const char *rn = env_deref_name_ex(nm, &rtgt, false);
             if (!rn || !*rn) rn = nm;
             if (shell_readonly_key(rn, strlen(rn))) {
-                shell_readonly_print_error(rn, strlen(rn), "shell");
+                /* (a builtin's own list is refused in its name, 489) */
+                shell_readonly_print_error(rn, strlen(rn),
+                                           g_readonly_label ? g_readonly_label
+                                                            : "shell");
                 return -1;
             }
         }
@@ -12651,7 +12654,17 @@ static void cmd_readonly(int argc, char **argv) {
             }
             shell_xt_decl_assign(argv[i], klen);
             g_readonly_hit = false;
-            if (env_set_kv(argv[i]) < 0) {
+            /* -a or -A: a quoted list is a list, `readonly -a 'd=(4)'` the
+             * array d=(4), and its refusal is the builtin's, "readonly: d:
+             * readonly variable" -- tsh set the string "(4)" (bash's
+             * attr.tests; logs/b42 at1 a2, at2 b4 b6) -- finding 489 */
+            bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
+            g_decl_paren_array = opt_a || opt_A;
+            if (qlist) g_readonly_label = argv[0];
+            int rsrc = env_set_kv(argv[i]);
+            g_decl_paren_array = false;
+            g_readonly_label = 0;
+            if (rsrc < 0) {
                 shell_set_status(1);
                 /* a COMPOUND value refused ends the line, as export's
                  * does (logs/b17 rodecl) -- one WRITTEN so: a quoted
