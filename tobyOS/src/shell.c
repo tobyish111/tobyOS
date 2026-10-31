@@ -42497,7 +42497,9 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
          * succeed, whatever it thinks -- `echo hi > /dev/full` is status 1 --
          * and says so, as bash's does: "echo: write error: Bad file
          * descriptor" after `exec >&-` or a moved stdout (logs/b12 p42). */
-        if (g_shell_out_failed && rc == 0) {
+        /* (bash's help does not check: `help >&-` is silent, status 0 --
+         * redir6.sub; logs/b42 rd3 w2) */
+        if (g_shell_out_failed && rc == 0 && strcmp(c->name, "help") != 0) {
             kprintf("%s: write error: %s\n", c->name,
                     g_shell_out_why ? g_shell_out_why : "Input/output error");
             rc = 1;
