@@ -6824,6 +6824,18 @@ bool shell_owns_pid(int pid) {
     return g_shell_pid >= 0 && pid == g_shell_pid;
 }
 
+/* A CHLD TRAP RUNS ONCE FOR EACH CHILD, as bash's run_sigchld_trap runs it
+ * for every child waitchld reaped: three that end during a `wait` are
+ * three runs, a two-stage pipeline two -- tsh's pending flag made one of
+ * each batch, the kernel's SIGCHLDs merging (bash's trap.tests; logs/b42
+ * jb1 g1). host.c counts each child it reaps, or sees stop or continue,
+ * while the trap is set (shell_chld_reaped_hosted); the runs made are
+ * g_chld_trap_done. */
+#ifdef SHELL_HOSTED
+static volatile unsigned g_chld_trap_n;
+static unsigned g_chld_trap_done;
+#endif
+
 void shell_deliver_signal(int sig) {
     if (sig > 0 && sig < SIG_MAX) g_pending_signals[sig] = 1;
 }
@@ -7007,6 +7019,16 @@ static void shell_check_pending_signals(void) {
     shell_kernel_breathe();
 #endif
     for (int i = 1; i < SIG_MAX; i++) {
+#ifdef SHELL_HOSTED
+        if (i == SIGCHLD) {                 /* see g_chld_trap_n */
+            g_pending_signals[i] = 0;
+            unsigned c = g_chld_trap_n;
+            int n = (int)(c - g_chld_trap_done);
+            g_chld_trap_done = c;
+            while (n-- > 0 && g_shell_flow == SHELL_FLOW_NONE) shell_run_trap(i);
+            continue;
+        }
+#endif
         if (g_pending_signals[i]) {
             g_pending_signals[i] = 0;
             shell_run_trap(i);
@@ -7843,6 +7865,9 @@ static void shell_sig_put(int sig, void (*h)(int)) {
 bool shell_chld_trapped_hosted(void) {
     const char *t = shell_trap_live(SIGCHLD);
     return t && *t;
+}
+void shell_chld_reaped_hosted(void) {
+    if (shell_chld_trapped_hosted()) g_chld_trap_n++;
 }
 
 static void shell_trap_sync_kernel(int sig) {

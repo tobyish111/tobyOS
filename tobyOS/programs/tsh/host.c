@@ -1311,7 +1311,11 @@ static int g_last_term_sig;
 
 int proc_last_term_sig(void) { return g_last_term_sig; }
 
+/* Each child reaped, stopped or continued, for a CHLD trap's runs. */
+extern void shell_chld_reaped_hosted(void);
+
 static int host_reaped(int status) {
+    shell_chld_reaped_hosted();
     g_last_term_sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     return WEXITSTATUS(status);
 }
@@ -1435,6 +1439,7 @@ int proc_wait_fg(int pid, int *stop_sig) {
             continue;
         }
         if (WIFSTOPPED(st)) {
+            shell_chld_reaped_hosted();
             if (stop_sig) *stop_sig = WSTOPSIG(st);
             return 0;
         }
@@ -1470,6 +1475,7 @@ int proc_try_reap_state(int pid, int *code, int *stopsig, bool untraced) {
     pid_t r = waitpid(pid, &st, WNOHANG | (untraced ? WUNTRACED | WCONTINUED : 0));
     if (r == 0) return 0;
     if (r < 0) return -1;
+    if (WIFSTOPPED(st) || WIFCONTINUED(st)) shell_chld_reaped_hosted();
     if (WIFSTOPPED(st)) {
         if (stopsig) *stopsig = WSTOPSIG(st);
         return 2;
