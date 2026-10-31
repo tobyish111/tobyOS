@@ -16029,6 +16029,16 @@ static void shell_fg_bg(int argc, char **argv, bool fg) {
             return;
         }
     }
+    /* IN A COMMAND SUBSTITUTION THERE IS NO JOB TO START: bash's fg and bg
+     * say "no current jobs", status 1, whatever the operand -- while
+     * `jobs` there still lists the shell's. tsh's fg printed the job and
+     * then "command not found", its bg "already in background" (bash's
+     * jobs7.sub; logs/b42 jb1 j1, jb2 k3) */
+    if (g_comsub_level > 0) {
+        kprintf("%s: no current jobs\n", who);
+        shell_set_status(1);
+        return;
+    }
     if (fg) {
         shell_set_status(shell_fg_bg_one(first < argc ? argv[first] : 0, true));
         return;
