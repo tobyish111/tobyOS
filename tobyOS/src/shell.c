@@ -31254,6 +31254,13 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
             if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
+        /* ...and with extquote off, a ${x-WORD} word inside "..." takes it
+         * so too (logs/b42 px4 r2) -- finding 477 */
+        if (*p == '$' && p[1] == '\'' && value_word && !g_shopt_misc[11] &&
+            (g_dq_depth > 0 || g_dq_word)) {
+            if (sb_putc(out, *p++) < 0) return -1;
+            continue;
+        }
         /* `$'...'` IS ANSI-C QUOTING, and it is recognised inside a `${...}`
          * word even where a plain `'...'` is not:
          *
