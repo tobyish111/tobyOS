@@ -26389,6 +26389,7 @@ static void sh_dynarr_rebuild(struct sh_array *a) {
     g_dynarr_busy = false;
 }
 
+static int sh_restricted_hash_path(const char *path, const char *pfx);
 /* An element assigned: an alias defined, or a command remembered with no
  * hits -- a bad alias name is reported and the status is left alone. */
 static int sh_dynarr_assign(struct sh_array *a, const char *key,
@@ -26401,6 +26402,8 @@ static int sh_dynarr_assign(struct sh_array *a, const char *key,
         }
         if (shell_alias_set(key, val) < 0) return -1;
     } else {
+        /* restricted: refused as hash -p is, the status left alone (515) */
+        if (sh_restricted_hash_path(val, "")) return 0;
         phash_insert(key, val, 0, false);
     }
     sh_dynarr_rebuild(a);
@@ -26476,6 +26479,41 @@ static void hash_printable(struct shell_sb *b, const char *s) {
 static void sh_builtin_usage(const char *name);
 static void shell_help_topic(const char *name);
 
+/* IN A RESTRICTED SHELL A REMEMBERED PATH is one with no `/` that the
+ * PATH search finds: `hash -p sh a` with no sh on PATH is "hash: sh: not
+ * found", status 1, and `BASH_CMDS[a]=sh` "sh: not found" -- nothing is
+ * remembered; one with a `/` is "PATH: restricted". tsh remembered both,
+ * and ran ./sh for `a` (bash's rsh1.sub, rsh2.sub; logs/b42 rs1 rs2) --
+ * finding 515. 0: it may be remembered; 1: refused, said so with PFX. */
+static int sh_restricted_hash_path(const char *path, const char *pfx) {
+    if (!g_restricted || !path) return 0;
+    for (const char *c = path; *c; c++)
+        if (*c == '/') {
+            kprintf("%s%s: restricted\n", pfx, path);
+            return 1;
+        }
+    size_t nlen = strlen(path);
+    const char *pv = env_get("PATH");
+    const char *cur = (pv && *pv) ? pv : "/bin";
+    char buf[VFS_PATH_MAX];
+    while (*cur) {
+        const char *colon = cur;
+        while (*colon && *colon != ':') colon++;
+        size_t plen = (size_t)(colon - cur);
+        if (plen > 0) {
+            const char *cand = path_join(cur, plen, path, nlen, buf, sizeof buf);
+            struct vfs_stat st;
+            if (cand && vfs_stat(cand, &st) == VFS_OK &&
+                st.type == VFS_TYPE_FILE && test_access_ok(&st, 1u))
+                return 0;
+        }
+        cur = colon;
+        if (*cur == ':') cur++;
+    }
+    kprintf("%s%s: not found\n", pfx, path);
+    return 1;
+}
+
 static void cmd_hash(int argc, char **argv) {
     if (!g_opt_hashall) {
         kprintf("hash: hashing disabled\n");
@@ -26493,13 +26531,9 @@ static void cmd_hash(int argc, char **argv) {
         case 'l': portable = true; break;
         case 'p':
             pathname = g.optarg;
-            if (g_restricted && pathname) {
-                for (const char *c = pathname; *c; c++)
-                    if (*c == '/') {
-                        kprintf("hash: %s: restricted\n", pathname);
-                        shell_set_status(1);
-                        return;
-                    }
+            if (sh_restricted_hash_path(pathname, "hash: ")) {
+                shell_set_status(1);
+                return;
             }
             break;
         case 'r': expunge = true; break;
