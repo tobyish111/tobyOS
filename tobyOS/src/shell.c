@@ -31513,7 +31513,8 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
 static int shell_expand_pat_word(const char *w, struct shell_sb *out) {
     int saved = g_dq_depth;
     bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
-    if (saved > 0) g_dq_word = true;
+    /* a here-document's text is double-quoted too (finding 478) */
+    if (saved > 0 || saved_hd) g_dq_word = true;
     g_dq_depth = 0;
     g_hd_body = false;
     int rc = shell_expand_word_ex(w, out, true, true);
@@ -35343,6 +35344,68 @@ static bool sh_brace_pat_removal(const char *e, size_t n) {
     return i < n && (e[i] == '#' || e[i] == '%');
 }
 
+/* What the next byte of a `${ }` expression whose first N bytes are E
+ * belongs to: 0 the parameter's name, 1 the word of a pattern operator
+ * (# % / ^ ,), 2 any other word -- or a subscript still open. */
+static int sh_brace_word_kind(const char *e, size_t n) {
+    size_t i = 0;
+    if (i < n && (e[i] == '#' || e[i] == '!')) i++;
+    size_t at = i;
+    while (i < n) {                     /* a quoted span is in the name too */
+        if (e[i] == '\'' || (e[i] == '$' && i + 1 < n && e[i + 1] == '\'')) {
+            bool ansi = e[i] == '$';
+            i += ansi ? 2 : 1;
+            while (i < n && e[i] != '\'') i += (ansi && e[i] == '\\') ? 2 : 1;
+            if (i >= n) return 0;
+            i++;
+        } else if (shell_var_char(e[i])) {
+            i++;
+        } else {
+            break;
+        }
+    }
+    if (i >= n) return 0;
+    if (i == at && (e[i] == '@' || e[i] == '*' || e[i] == '#' ||
+                    e[i] == '?' || e[i] == '$' || e[i] == '!' || e[i] == '-'))
+        i++;
+    if (i < n && e[i] == '[') {
+        int d = 0;
+        for (; i < n; i++) {
+            if (e[i] == '[') d++;
+            else if (e[i] == ']' && --d == 0) { i++; break; }
+        }
+        if (d != 0) return 2;
+    }
+    if (i >= n) return 0;
+    char op = e[i];
+    return (op == '#' || op == '%' || op == '/' || op == '^' || op == ',')
+               ? 1 : 2;
+}
+
+/* The text of `$'...'` from *PP (just past the `$'`) decoded into O, *PP
+ * left past the closing quote; a NUL ends the text, as in a word. */
+static int sh_ansic_decode_to(const char **pp, struct shell_sb *o) {
+    const char *p = *pp;
+    bool nul = false;
+    while (*p && *p != '\'') {
+        char ub[16];
+        int k = 1;
+        if (*p == '\\' && p[1]) {
+            p++;
+            k = shell_ansic_escape(&p, ub);
+        } else {
+            ub[0] = *p++;
+        }
+        for (int j = 0; j < k && !nul; j++) {
+            if (!ub[j]) nul = true;
+            else if (sb_putc(o, ub[j]) < 0) return -1;
+        }
+    }
+    if (*p == '\'') p++;
+    *pp = p;
+    return 0;
+}
+
 static int shell_expand_var(const char **pp, struct shell_sb *b) {
     const char *p = *pp;
     if (*p != '$') return sb_putc(b, *p++);
@@ -35478,6 +35541,28 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
              * posixexp2.tests; finding 291) */
             bool sq_plain = g_opt_posix && g_dq_depth > 0 &&
                             !sh_brace_pat_removal(expr, n);
+            /* A NAME WRITTEN `$'...'` IN DOUBLE QUOTES IS ITS DECODED TEXT
+             * when extquote is on, as bash's parser puts it there --
+             * `"${$'x1'%t}"` is x1's, and in a pattern word (g_dq_word)
+             * too, a here-document's included; elsewhere the name is no
+             * name. tsh said "bad substitution" (bash's posixexp7.sub;
+             * logs/b42 px3 q3) -- finding 478. */
+            if (c == '$' && p[1] == '\'' && !sq_plain && csp == 1 &&
+                g_shopt_misc[11] && !g_hd_body &&
+                (g_dq_depth > 0 || g_dq_word) &&
+                sh_brace_word_kind(expr, n) == 0) {
+                const char *q = p + 2;
+                SH_SB(dec);
+                if (sh_ansic_decode_to(&q, &dec) < 0) return -1;
+                if (n + dec.len + 2 >= expr_cap) {
+                    kprintf(SH_PFX_SHELL "${...} too long\n");
+                    return -1;
+                }
+                memcpy(expr + n, dec.p ? dec.p : "", dec.len);
+                n += dec.len;
+                p = q;
+                continue;
+            }
             if (c == '$' && p[1] == '\'' && !sq_plain) {
                 sq = true; sq_ansi = true;
                 expr[n++] = *p++; expr[n++] = *p++;
