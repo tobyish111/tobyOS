@@ -37278,6 +37278,25 @@ static void shell_alias_pop_to(int depth) {
     while (g_alias_depth > depth) kfree(g_alias_active[--g_alias_depth]);
 }
 
+/* The quote S leaves open at its end: `'`, `"`, 'a' for `$'`, or 0. */
+static char shell_text_open_quote(const char *s) {
+    char q = 0;
+    for (; *s; s++) {
+        if (q == '\'') {
+            if (*s == '\'') q = 0;
+            continue;
+        }
+        if (*s == '\\' && s[1]) { s++; continue; }
+        if (q) {
+            if (*s == (q == 'a' ? '\'' : q)) q = 0;
+            continue;
+        }
+        if (*s == '$' && s[1] == '\'') { q = 'a'; s++; continue; }
+        if (*s == '\'' || *s == '"') q = *s;
+    }
+    return q;
+}
+
 /* Where a case command's word (PAT false) ends -- at a blank or an operator
  * -- or its pattern list (PAT true) -- at the `)` that closes it, extglob
  * parens counted -- from P; quotes, `\x`, `$( )`, `${ }`, `$[ ]` and
@@ -37499,6 +37518,7 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                     /* Expand the replacement NOW, with this name marked
                      * active, then carry on through the rest of the line with
                      * the outer set restored. One pass, correct scoping. */
+                    char oq;
                     {
                         int depth0 = g_alias_depth;
                         if (!shell_alias_push(name)) return -1;
@@ -37510,8 +37530,26 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                         if (rc < 0) return -1;
                         if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
                             return -1;
+                        oq = shell_text_open_quote(sub_buf.p ? sub_buf.p : "");
                     }
                     *changed = true;
+                    /* A replacement that leaves a quote open has the text
+                     * after it inside that quote, through its close, where
+                     * nothing is a command word: `alias say="echo 'a: "`
+                     * then `say e'` is echo 'a: e' when e is an alias too
+                     * (finding 470). */
+                    if (oq) {
+                        char cq = oq == 'a' ? '\'' : oq;
+                        while (*p && *p != cq) {
+                            if (*p == '\\' && p[1] && oq != '\'' &&
+                                sb_putc(out, *p++) < 0)
+                                return -1;
+                            if (sb_putc(out, *p++) < 0) return -1;
+                        }
+                        if (*p && sb_putc(out, *p++) < 0) return -1;
+                        at_cmd = false;
+                        continue;
+                    }
                     /* POSIX: a replacement ending in a blank means the NEXT
                      * word is checked for aliases too -- which is what makes
                      * `alias sudo='sudo '` expand what follows it. */
