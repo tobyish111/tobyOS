@@ -27707,10 +27707,30 @@ static int shell_history_resolve(const char *spec, int def_index) {
  *     fc [-e editor] [first [last]]
  * There is no editor to hand off to, so the editing form is refused rather
  * than silently behaving like -s, which would run the wrong thing. */
+static void cmd_fc_in(int argc, char **argv);
 static void cmd_fc(int argc, char **argv) {
-    /* The fc command itself is not part of the range it operates on. */
-    shell_history_pop();
+    /* The fc command itself is not part of the range it operates on --
+     * when it is in the history at all: HISTIGNORE='fc*' keeps it out, and
+     * tsh took the newest real entry each time. A listing leaves it in the
+     * list, only out of its range; re-executing replaces it (bash's
+     * history.tests; logs/b42 hs1) -- finding 522 */
+    bool own = g_hist_line_added && !g_hist_line_pushed && g_hist_count > 0;
+    bool list = false;
+    for (int k = 1; k < argc && argv[k][0] == '-' && argv[k][1] &&
+                    !(argv[k][1] >= '0' && argv[k][1] <= '9'); k++)
+        for (const char *f = argv[k] + 1; *f; f++) if (*f == 'l') list = true;
+    char *hidden = 0;
+    if (own && !list) {
+        shell_history_pop();
+    } else if (own) {
+        hidden = g_hist[--g_hist_count];
+        g_hist[g_hist_count] = 0;
+    }
+    cmd_fc_in(argc, argv);
+    if (hidden) g_hist[g_hist_count++] = hidden;
+}
 
+static void cmd_fc_in(int argc, char **argv) {
     bool list = false, no_numbers = false, reverse = false, subst = false;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
