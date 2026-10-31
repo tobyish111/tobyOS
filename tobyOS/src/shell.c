@@ -11004,7 +11004,9 @@ static void cmd_shopt_in(int argc, char **argv) {
             case 'p': print = true; break;
             case 'o': setopts = true; break;
             default:
+                /* ...and bash's usage line (shopt.tests; logs/b42 sho1) */
                 kprintf("shopt: -%c: invalid option\n", *c);
+                kprintf_raw("shopt: usage: shopt [-pqsu] [-o] [optname ...]\n");
                 shell_set_status(2);
                 return;
             }
