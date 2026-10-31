@@ -31245,6 +31245,15 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
 
     while (*p) {
         bool escaped = false;           /* the byte below already carries one */
+        /* A HERE-DOCUMENT'S TEXT TAKES `$'` AS TWO BYTES, as double quotes
+         * do -- and so does a ${x-WORD} word in it: `$'not'` stays as
+         * written. Only a pattern's word decodes it (g_hd_body is off
+         * there). tsh decoded it everywhere (bash's posixexp7.sub; logs/b42
+         * px3 q2) -- finding 476. */
+        if (*p == '$' && p[1] == '\'' && g_hd_body) {
+            if (sb_putc(out, *p++) < 0) return -1;
+            continue;
+        }
         /* `$'...'` IS ANSI-C QUOTING, and it is recognised inside a `${...}`
          * word even where a plain `'...'` is not:
          *
