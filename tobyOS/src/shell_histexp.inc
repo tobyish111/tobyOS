@@ -869,11 +869,19 @@ int shell_line_incomplete_text(const char *s);
  * whose expansion fails is reported and DROPPED, newline and all: bash
  * reads the next one under the same line number, so it is not counted and
  * the lines after it are numbered one less (logs/b13 q29 case 11). An
- * empty OUT is a command that was all dropped lines. A here-document's
- * body is the lines after the command, and is never expanded. */
+ * empty OUT is a command that was all dropped lines. A HERE-DOCUMENT'S
+ * BODY IS NEVER EXPANDED: the lines after the command -- or, for one that
+ * a line of a command still open starts, `{ cat <<EOF` or `$( cat <<EOF`,
+ * the unit's next lines through its delimiter's, which tsh expanded, and
+ * a `!!` there pulled in the whole last command (bash's histexp7.sub;
+ * logs/b42 hx1 hx2). CODE is the unit without those, for the quote a
+ * line starts in. */
 static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used) {
     size_t pos = 0;
     sb_truncate(out, 0);
+    SH_SB(code);
+    struct shell_heredoc_spec hd[8];
+    int nhd = 0, hdi = 0;
     unsigned long ln0 = g_shell_lineno;
     g_shell_lineno++;                   /* the line being read, for a report */
     for (;;) {
@@ -882,7 +890,23 @@ static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used)
         bool nl = src[pos + ln] == '\n';
         SH_SB(phys);
         if (sb_putmem(&phys, src + pos, ln) < 0 || sb_puts(&phys, "") < 0) break;
-        char qs = out->len ? shell_hist_open_quote(out->p) : 0;
+        if (hdi < nhd) {
+            /* a body line, as it is */
+            pos += ln + (nl ? 1 : 0);
+            if (sb_puts(out, phys.p) < 0) break;
+            if (shell_heredoc_line_matches(phys.p, hd[hdi].delim, hd[hdi].strip_tabs) &&
+                ++hdi == nhd) {
+                shell_heredoc_specs_free(hd, nhd);
+                nhd = hdi = 0;
+            }
+            g_shell_lineno++;
+            bool more = nl && src[pos] &&
+                        (hdi < nhd || shell_line_incomplete_text(out->p));
+            if (nl && sb_putc(out, '\n') < 0) break;
+            if (!more) break;
+            continue;
+        }
+        char qs = code.len ? shell_hist_open_quote(code.p) : 0;
         SH_SB(xl);
         int r = shell_hist_preprocess(phys.p, qs, &xl);
         pos += ln + (nl ? 1 : 0);
@@ -890,12 +914,23 @@ static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used)
             if (!out->len || !nl || !src[pos]) break;
             continue;                   /* the command goes on without it */
         }
-        if (sb_puts(out, r > 0 ? (xl.p ? xl.p : "") : phys.p) < 0) break;
+        const char *use = r > 0 ? (xl.p ? xl.p : "") : phys.p;
+        if (sb_puts(out, use) < 0 || sb_puts(&code, use) < 0) break;
         g_shell_lineno++;
         bool more = nl && src[pos] && shell_line_incomplete_text(out->p);
-        if (nl && sb_putc(out, '\n') < 0) break;
+        if (more && !qs) {
+            nhd = shell_line_find_heredocs(use, hd, 8);
+            /* ...and one in a `$(` the line leaves open, which that
+             * finder reads only when the `)` comes */
+            const char *open = 0;
+            for (const char *s = use; nhd == 0 && *s; s++)
+                if (s[0] == '$' && s[1] == '(' && s[2] != '(') open = s + 2;
+            if (nhd == 0 && open) nhd = shell_line_find_heredocs(open, hd, 8);
+        }
+        if (nl && (sb_putc(out, '\n') < 0 || sb_putc(&code, '\n') < 0)) break;
         if (!more) break;
     }
+    shell_heredoc_specs_free(hd, nhd);
     g_shell_lineno = ln0;
     *used = pos;
 }
