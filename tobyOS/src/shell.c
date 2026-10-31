@@ -4989,8 +4989,17 @@ static int shell_attr_append(unsigned attrs, const char *old, const char *add,
     return sb_set(out, nb) < 0 ? -1 : 1;
 }
 
+static bool g_funcname_gone;
 static int env_set_kv(const char *kv_in) {
     if (!kv_in) return -1;
+    /* AN ASSIGNMENT TO FUNCNAME HAS NO EFFECT, in a function or out of one,
+     * until it is unset: `FUNCNAME=7; echo $FUNCNAME` is empty -- tsh set
+     * it (bash's func.tests; logs/b42 mx1 m3) -- finding 503 */
+    if (!g_funcname_gone && !g_env_attr_only &&
+        strncmp(kv_in, "FUNCNAME", 8) == 0 &&
+        (kv_in[8] == '=' || kv_in[8] == '[' ||
+         (kv_in[8] == '+' && kv_in[9] == '=')))
+        return 0;
     /* a local reference back to itself writes the GLOBAL variable, an
      * element and += too (see shell_nameref_circ) */
     {
