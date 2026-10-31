@@ -48215,6 +48215,13 @@ static bool shell_try_case_command(const char *src) {
     const char *wend = s;
     while (*wend && !is_space(*wend) && *wend != ';') {
         if (*wend == '\\' && wend[1]) { wend += 2; continue; }
+        /* `$'...'` takes `\'` (finding 465) */
+        if (*wend == '$' && wend[1] == '\'') {
+            wend += 2;
+            while (*wend && *wend != '\'') wend += (*wend == '\\' && wend[1]) ? 2 : 1;
+            if (*wend) wend++;
+            continue;
+        }
         if (*wend == '$' && (wend[1] == '(' || wend[1] == '{' || wend[1] == '[')) {
             wend += sh_arith_dollar_span(wend);
             continue;
