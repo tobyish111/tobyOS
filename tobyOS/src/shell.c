@@ -37958,9 +37958,18 @@ static size_t sh_pat_char(const char *p, const char *pend, uint32_t *cp,
     /* a backslash before a byte the expander escaped -- `\` then \001 from
      * an unquoted $p -- quotes that byte, not its mark (bash's case3.sub;
      * logs/b42 cs1 k1) */
-    if (esc && *p == '\\' && (*q == SHELL_DATA_ESC || *q == SHELL_GLOB_ESC) &&
-        q + 1 < pend)
+    if (esc && *p == '\\' && *q == SHELL_DATA_ESC && q + 1 < pend)
         q++;
+    /* ...but before a QUOTED one -- a backslash from $v ahead of a written
+     * `\*` -- the backslash is a backslash, and the quoted byte its own:
+     * `$v\*b*` with v='a\' takes a\*b, not a*b (bash's glob8.sub; logs/b42
+     * gl1 h4) */
+    if (esc && *p == '\\' && *q == SHELL_GLOB_ESC) {
+        *cp = '\\';
+        if (buf) buf[0] = '\\';
+        if (bl) *bl = 1;
+        return 1;
+    }
     size_t lead = (size_t)(q - p);
     raw[n++] = *q++;
     unsigned char c0 = (unsigned char)raw[0];
