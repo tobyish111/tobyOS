@@ -51964,10 +51964,24 @@ static void execute_line_text_inner(const char *src) {
         if (shell_starts_with_word(q, "time")) {
             const char *rest = shell_skip_blanks(q + 4);
             bool posix_fmt = false;
-            if (rest[0] == '-' && rest[1] == 'p' &&
-                (rest[2] == ' ' || rest[2] == '\t' || rest[2] == '\0')) {
-                rest = shell_skip_blanks(rest + 2);
-                posix_fmt = true;
+            /* bash's timespec: `time`, then `-p`, then `--` (which also
+             * asks for the POSIX form) -- and a `time` after those is the
+             * same timing, one report: `time time -p echo` reports once,
+             * POSIX. tsh timed each and ran `--` as a command (bash's
+             * posixpipe.tests; logs/b42 in1 i4) -- finding 492 */
+            for (;;) {
+                if (rest[0] == '-' && rest[1] == 'p' &&
+                    (rest[2] == ' ' || rest[2] == '\t' || rest[2] == '\0')) {
+                    rest = shell_skip_blanks(rest + 2);
+                    posix_fmt = true;
+                }
+                if (rest[0] == '-' && rest[1] == '-' &&
+                    (rest[2] == ' ' || rest[2] == '\t' || rest[2] == '\0')) {
+                    rest = shell_skip_blanks(rest + 2);
+                    posix_fmt = true;
+                }
+                if (!shell_starts_with_word(rest, "time")) break;
+                rest = shell_skip_blanks(rest + 4);
             }
             /* bash's time_command: the wall clock, and the shell's and its
              * children's user and system time, before and after. */
