@@ -19394,6 +19394,7 @@ struct shell_scan {
      * documents are collected by the readers before this sees them. */
     unsigned char hd_state;
     bool hd_tabs;                       /* `<<-` */
+    bool hd_quoted;                     /* its delimiter quoted: no joins */
     char hd_delim[128];
     bool bad_semi;      /* a `;;` outside any `case` */
     bool bad_rparen;    /* a `)` that closes nothing and is not a pattern */
@@ -19474,6 +19475,7 @@ static void shell_scan_init(struct shell_scan *st) {
     st->cont_op = false;
     st->hd_state = 0;
     st->hd_tabs = false;
+    st->hd_quoted = false;
     st->hd_delim[0] = '\0';
     st->nest = 0;
     st->in_sq = false;
@@ -20272,6 +20274,10 @@ procsub_word:;
                                                   sizeof st->hd_delim, &tabs);
                 if (after) {
                     st->hd_tabs = tabs;
+                    st->hd_quoted = false;
+                    for (const char *hq = p + 2; hq < after; hq++)
+                        if (*hq == '\'' || *hq == '"' || *hq == '\\')
+                            st->hd_quoted = true;
                     st->hd_state = 1;
                     p = after;
                     continue;
@@ -21910,7 +21916,10 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                  * backslash is a literal byte and not a continuation;
                  * inside DOUBLE quotes backslash-newline still vanishes. */
                 bool continued = false;
-                if (!scan.in_sq) {
+                /* ...nor in the body of a here-document with a quoted
+                 * delimiter inside `$( )`: `d \` is a line of it, kept
+                 * (bash's comsub4.sub; logs/b42 cms1 m2) */
+                if (!scan.in_sq && !(scan.hd_state == 2 && scan.hd_quoted)) {
                     size_t bs = 0;
                     while (bs < alen && accum[alen - 1 - bs] == '\\') bs++;
                     if (bs & 1u) {
