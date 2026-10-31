@@ -46558,12 +46558,49 @@ static int shell_dbr_regex(const char *subj, const char *pat) {
     char *ere = (char *)kmalloc(2 * n + 1);
     if (!ere) return -1;
     char *w = ere;
+    /* INSIDE A BRACKET EXPRESSION A QUOTED BYTE IS ITSELF: a backslash
+     * there is a member in ERE, so `[[ '\' =~ ["."] ]]` matched where bash
+     * (quoting only outside brackets) does not, and `[']']`, `['[=d=]']`
+     * meant something else (bash's cond-regexp2.sub; logs/b42 cnd1) --
+     * finding 487. The bracket runs to its `]` by ERE's rules: one first,
+     * or after the `^`, is a member; [. .] [= =] [: :] are elements. */
+    bool inbr = false;
+    char cls = 0;                       /* inside [. .], [= =] or [: :] */
+    char *brs = 0;                      /* where the bracket's members start */
     for (const char *q = pat; *q; q++) {
+        bool quoted = false;
         if ((*q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) && q[1]) {
             q++;
-            if (shell_dbr_ere_special(*q)) *w++ = '\\';
+            quoted = true;
         }
-        *w++ = *q;
+        char c = *q;
+        if (inbr) {
+            const char *nx = q + 1;
+            if ((*nx == SHELL_GLOB_ESC || *nx == SHELL_DATA_ESC) && nx[1]) nx++;
+            if (cls) {
+                if (c == cls && *nx == ']') {
+                    cls = 0;
+                    *w++ = c;
+                    c = ']';
+                    q = nx;
+                }
+            } else if (c == '[' && (*nx == '.' || *nx == '=' || *nx == ':')) {
+                cls = *nx;
+                *w++ = c;
+                c = *nx;
+                q = nx;
+            } else if (c == ']' && w > brs && !(w == brs + 1 && *brs == '^')) {
+                inbr = false;
+            }
+            *w++ = c;
+            continue;
+        }
+        if (quoted && shell_dbr_ere_special(c)) *w++ = '\\';
+        *w++ = c;
+        if (!quoted && c == '[') {
+            inbr = true;
+            brs = w;
+        }
     }
     *w = '\0';
 
