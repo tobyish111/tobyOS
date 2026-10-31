@@ -13514,10 +13514,15 @@ static bool shell_opt_state_by_name(const char *name, bool *out) {
     return false;
 }
 
+static void shell_history_enable_load(void);
 static bool shell_set_opt_by_name(const char *name, bool on) {
     for (size_t i = 0; i < SHELL_NOPTDEFS; i++) {
         if (strcmp(name, g_optdefs[i].name) != 0) continue;
+        bool was = *g_optdefs[i].var;
         *g_optdefs[i].var = on;
+        /* history on: $HISTFILE read (521) */
+        if (on && !was && g_optdefs[i].var == &g_opt_history)
+            shell_history_enable_load();
         /* the line-editing modes are one at a time: turning one ON turns
          * the other off; turning one off leaves the other alone */
         if (on && g_optdefs[i].var == &g_opt_emacs) g_opt_vi = false;
@@ -27554,6 +27559,19 @@ static long shell_hist_read(const char *path, long from) {
     }
     kfree(buf);
     return line;
+}
+
+/* `set -o history` TURNING HISTORY ON READS $HISTFILE when this session has
+ * no lines yet, as bash's does: with HISTFILE=history.list, `history`
+ * after it lists the file's lines -- tsh's list stayed empty, and bash's
+ * history and histexp tests diverged from their first listing (logs/b42
+ * hs1) -- finding 521. */
+static void shell_history_enable_load(void) {
+    if (g_hist_session != 0) return;
+    char path[VFS_PATH_MAX];
+    if (!shell_hist_file(0, path, sizeof path)) return;
+    long n = shell_hist_read(path, 0);
+    if (n >= 0) g_hist_in_file = n;
 }
 
 /* The whole list, one entry a line (readline's write_history), into a file
