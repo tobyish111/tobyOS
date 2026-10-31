@@ -43738,6 +43738,14 @@ static int shell_run_function(struct shell_simple *cmd) {
     if (optind_local) g_getopts = gp_call;
     g_fn_local_depth = saved_fn_local_depth;
     g_script_depth--;
+    /* $0 IS NOT A FUNCTION'S to put back: one the body set through
+     * BASH_ARGV0 stays -- tsh restored the caller's (bash's dynvar.tests;
+     * logs/b42 dv1) -- finding 516 */
+    {
+        char *t = frame.param0;
+        frame.param0 = g_param0;
+        g_param0 = t;
+    }
     shell_restore_params_from_frame(&frame);
     if (io_active) shell_restore_io_frame(&io_frame);
     return rc;
