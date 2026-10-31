@@ -37252,10 +37252,55 @@ static void shell_alias_pop_to(int depth) {
     while (g_alias_depth > depth) kfree(g_alias_active[--g_alias_depth]);
 }
 
+/* Where a case command's word (PAT false) ends -- at a blank or an operator
+ * -- or its pattern list (PAT true) -- at the `)` that closes it, extglob
+ * parens counted -- from P; quotes, `\x`, `$( )`, `${ }`, `$[ ]` and
+ * backquotes are passed over whole. */
+static const char *shell_alias_case_span(const char *p, bool pat) {
+    int depth = 0;
+    while (*p) {
+        char c = *p;
+        if (c == '\\' && p[1]) { p += 2; continue; }
+        if (c == '$' && (p[1] == '(' || p[1] == '{' || p[1] == '[')) {
+            p += sh_arith_dollar_span(p);
+            continue;
+        }
+        if (c == '$' && p[1] == '\'') {          /* `$'...'` takes `\'` */
+            p += 2;
+            while (*p && *p != '\'') p += (*p == '\\' && p[1]) ? 2 : 1;
+            if (*p) p++;
+            continue;
+        }
+        if (c == '\'' || c == '"' || c == '`') {
+            p++;
+            while (*p && *p != c)
+                p += (*p == '\\' && p[1] && c != '\'') ? 2 : 1;
+            if (*p) p++;
+            continue;
+        }
+        if (pat) {
+            if (c == '(') depth++;
+            else if (c == ')' && depth-- == 0) return p;
+        } else if (is_space(c) || c == ';' || c == '|' || c == '&' ||
+                   c == '<' || c == '>' || c == '(' || c == ')') {
+            return p;
+        }
+        p++;
+    }
+    return p;
+}
+
 static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                                      bool *changed) {
     const char *p = src ? src : "";
     bool at_cmd = true;
+    /* A CASE COMMAND'S WORD AND PATTERNS ARE NOT COMMAND WORDS: `pat)` on
+     * the line after `in`, or after `;;`, or as `(pat)`, is a pattern and
+     * stays one when pat is an alias. cs_depth counts the case commands
+     * open; cs_mode is where the innermost one is (an outer one is always
+     * in a body) -- finding 468. */
+    enum { CS_NONE, CS_WORD, CS_IN, CS_PAT, CS_BODY };
+    int cs_depth = 0, cs_mode = CS_NONE;
     *changed = false;
     sb_truncate(out, 0);
 
@@ -37270,9 +37315,48 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
             continue;
         }
 
+        if (cs_depth > 0 && cs_mode != CS_BODY) {
+            /* the reader joins a case's lines with `; ` */
+            if (*p == ';' && cs_mode != CS_WORD) {
+                if (sb_putc(out, *p++) < 0) return -1;
+                continue;
+            }
+            const char *e = shell_alias_case_span(p, false);
+            bool esac = (e - p == 4 && strncmp(p, "esac", 4) == 0);
+            if (cs_mode == CS_PAT && !esac) {
+                if (*p == '(' && sb_putc(out, *p++) < 0) return -1;
+                e = shell_alias_case_span(p, true);
+                if (*e == ')') e++;
+                cs_mode = CS_BODY;
+                at_cmd = true;
+            } else if (cs_mode == CS_WORD) {
+                cs_mode = CS_IN;
+                at_cmd = false;
+            } else if (cs_mode == CS_IN && e - p == 2 &&
+                       strncmp(p, "in", 2) == 0) {
+                cs_mode = CS_PAT;
+                at_cmd = false;
+            } else {                    /* esac, or no case after all */
+                cs_mode = --cs_depth > 0 ? CS_BODY : CS_NONE;
+                at_cmd = false;
+            }
+            if (e == p) e++;
+            if (sb_putmem(out, p, (size_t)(e - p)) < 0) return -1;
+            p = e;
+            continue;
+        }
+
         if (*p == ';') {
             at_cmd = true;
             if (sb_putc(out, *p++) < 0) return -1;
+            /* `;;`, `;&` and `;;&` end a case's body: a pattern follows */
+            if (cs_depth > 0 && (*p == ';' || *p == '&')) {
+                if (*p == ';' && p[1] == '&' && sb_putc(out, *p++) < 0)
+                    return -1;
+                if (sb_putc(out, *p++) < 0) return -1;
+                cs_mode = CS_PAT;
+                at_cmd = false;
+            }
             continue;
         }
         if (*p == '&') {
@@ -37408,6 +37492,16 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                     at_cmd = (avlen > 0 && (av[avlen - 1] == ' ' ||
                                             av[avlen - 1] == '\t'));
                     continue;
+                }
+                /* the reserved words that open and close a case */
+                bool word_end = !*p || is_space(*p) || *p == ';' ||
+                                *p == '&' || *p == '|' || *p == ')';
+                if (word_end && strcmp(name, "case") == 0) {
+                    cs_depth++;
+                    cs_mode = CS_WORD;
+                } else if (word_end && cs_depth > 0 &&
+                           strcmp(name, "esac") == 0) {
+                    cs_mode = --cs_depth > 0 ? CS_BODY : CS_NONE;
                 }
             }
             if (sb_putmem(out, start, n) < 0) return -1;
