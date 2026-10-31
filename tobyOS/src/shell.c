@@ -2870,6 +2870,9 @@ static int   g_nreadonly;            /* slots, used or free */
 #define SHVAR_LOWER     0x40u
 #define SHVAR_UPPER     0x80u
 #define SHVAR_VALUE_ATTRS (SHVAR_INTEGER | SHVAR_LOWER | SHVAR_UPPER)
+/* -c is LOWER and UPPER together, which -l and -u never leave set; +c is
+ * this, past the flag byte, so it takes only that pair away (508) */
+#define SHVAR_CAP_OFF   0x100u
 static unsigned char *g_env_flags;   /* g_env_cap entries */
 
 /* Room for `want` variables. False only when memory ran out. */
@@ -4958,16 +4961,22 @@ static int shell_attr_value(unsigned attrs, const char *val, struct shell_sb *ou
         ksnprintf(nb, sizeof nb, "%ld", v);
         return sb_set(out, nb) < 0 ? -1 : 1;
     }
-    /* -l and -u map every character, multibyte ones too (sh_case1) */
+    /* -l and -u map every character, multibyte ones too (sh_case1); -c --
+     * both bits, which -l and -u never leave set together -- capitalizes:
+     * the first character upper, the rest lower (bash's casemod.tests;
+     * logs/b42 cm1) -- finding 508 */
     if (attrs & (SHVAR_LOWER | SHVAR_UPPER)) {
         const char *v = val ? val : "";
         const char *e = v + strlen(v);
         bool u8 = shell_utf8();
-        int op = (attrs & SHVAR_LOWER) ? 2 : 1;
+        bool cap = (attrs & SHVAR_LOWER) && (attrs & SHVAR_UPPER);
+        int op = cap ? 1 : (attrs & SHVAR_LOWER) ? 2 : 1;
         SH_SB(m);
         int rc = 0;
-        for (const char *q = v; q < e && rc == 0; )
+        for (const char *q = v; q < e && rc == 0; ) {
             q += sh_case_put(&m, q, e, op, u8, &rc);
+            if (cap) op = 2;
+        }
         if (rc < 0 || sb_set(out, m.p ? m.p : "") < 0) return -1;
         return 1;
     }
@@ -10376,8 +10385,14 @@ static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
         if (ix < 0) return;
         if (is_array) g_env_flags[ix] |= SHVAR_ARRAY;
     }
-    if (on & SHVAR_LOWER) off |= SHVAR_UPPER;
-    if (on & SHVAR_UPPER) off |= SHVAR_LOWER;
+    /* +c takes capitalizing away and nothing else: an -l or -u stays */
+    if (off & SHVAR_CAP_OFF) {
+        unsigned cb = SHVAR_LOWER | SHVAR_UPPER;
+        if ((g_env_flags[ix] & cb) == cb) off |= cb;
+        off &= ~SHVAR_CAP_OFF;
+    }
+    if ((on & SHVAR_LOWER) && !(on & SHVAR_UPPER)) off |= SHVAR_UPPER;
+    if ((on & SHVAR_UPPER) && !(on & SHVAR_LOWER)) off |= SHVAR_LOWER;
     g_env_flags[ix] = (unsigned char)((g_env_flags[ix] & ~off) | on);
 }
 
@@ -10581,6 +10596,11 @@ static void cmd_local(int argc, char **argv) {
             case 'i': if (on) l_attr_on |= SHVAR_INTEGER; else l_attr_off |= SHVAR_INTEGER; break;
             case 'l': if (on) l_attr_on |= SHVAR_LOWER;   else l_attr_off |= SHVAR_LOWER;   break;
             case 'u': if (on) l_attr_on |= SHVAR_UPPER;   else l_attr_off |= SHVAR_UPPER;   break;
+            case 'c': {                 /* capitalize (508) */
+                unsigned cb = SHVAR_LOWER | SHVAR_UPPER;
+                if (on) l_attr_on |= cb; else l_attr_off |= SHVAR_CAP_OFF;
+                break;
+            }
             case 'x': if (on) l_export = true; else l_unexport = true; break;
             case 'r': if (on) l_readonly = true; break;
             case 'I': if (on) l_inherit = true; break;
@@ -11675,8 +11695,9 @@ static bool shell_declare_print(const char *name) {
     if (f & SHVAR_NAMEREF)  fl[fn++] = 'n';
     if (shell_readonly_find(name, klen) >= 0) fl[fn++] = 'r';
     if (f & SHVAR_EXPORTED) fl[fn++] = 'x';
-    if (f & SHVAR_LOWER)    fl[fn++] = 'l';    /* bash: after x, c l u */
-    if (f & SHVAR_UPPER)    fl[fn++] = 'u';
+    if ((f & SHVAR_LOWER) && (f & SHVAR_UPPER)) fl[fn++] = 'c';   /* 508 */
+    else if (f & SHVAR_LOWER) fl[fn++] = 'l';  /* bash: after x, c l u */
+    else if (f & SHVAR_UPPER) fl[fn++] = 'u';
     fl[fn] = '\0';
     /* POSIX MODE'S readonly LISTING is `readonly -a a=(...)`, `readonly
      * x="1"`: the word readonly and the attributes but r (bash's
@@ -11855,6 +11876,11 @@ static void cmd_declare(int argc, char **argv) {
             case 'i': if (on) attr_on |= SHVAR_INTEGER; else attr_off |= SHVAR_INTEGER; break;
             case 'l': if (on) attr_on |= SHVAR_LOWER;   else attr_off |= SHVAR_LOWER;   break;
             case 'u': if (on) attr_on |= SHVAR_UPPER;   else attr_off |= SHVAR_UPPER;   break;
+            case 'c': {                 /* capitalize: both bits (508) */
+                unsigned cb = SHVAR_LOWER | SHVAR_UPPER;
+                if (on) attr_on |= cb; else attr_off |= SHVAR_CAP_OFF;
+                break;
+            }
             case 't': if (on) set_trace = true; else clear_trace = true; break;
             case 'I': if (on) set_inherit = true; break;
             default:  bad = *f; break;
@@ -32604,8 +32630,9 @@ static void sh_attr_letters(const char *name, char at[12]) {
     if (f & SHVAR_NAMEREF)             at[an++] = 'n';
     if (shell_readonly_find(name, strlen(name)) >= 0) at[an++] = 'r';
     if (f & SHVAR_EXPORTED)            at[an++] = 'x';
-    if (f & SHVAR_LOWER)               at[an++] = 'l';
-    if (f & SHVAR_UPPER)               at[an++] = 'u';
+    if ((f & SHVAR_LOWER) && (f & SHVAR_UPPER)) at[an++] = 'c';   /* 508 */
+    else if (f & SHVAR_LOWER)          at[an++] = 'l';
+    else if (f & SHVAR_UPPER)          at[an++] = 'u';
     at[an] = '\0';
 }
 
