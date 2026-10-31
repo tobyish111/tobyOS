@@ -5086,7 +5086,13 @@ static int env_set_kv(const char *kv_in) {
                 (sh_array_find(nm) || declared_arr)) {
                 if (declared_arr) sh_array_clear_novalue(nm);
                 if (shell_readonly_key(nm, klen)) {
-                    shell_readonly_print_error(nm, klen, "shell");
+                    /* `declare a=7` on a readonly array is declare's
+                     * refusal, "declare: a: readonly variable", as it is
+                     * for a scalar (logs/b42 at1 a1) -- finding 491 */
+                    shell_readonly_print_error(nm, klen,
+                                               g_readonly_label
+                                                   ? g_readonly_label
+                                                   : "shell");
                     return -1;
                 }
                 const char *v = kv_in + klen + 1;
