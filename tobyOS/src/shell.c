@@ -7169,12 +7169,14 @@ static int shell_expand_literal_quotes(const char *word, struct shell_sb *out);
  *     EOF
  *
  * Nothing resolved them, and the bytes reached the reader. A data byte
- * that collides with a mark keeps its escape for the reader of the text. */
+ * that collides with a mark is itself there, its escape gone (502). */
 static void sh_hd_resolve_marks(struct shell_sb *x) {
     char *w = x->p;
     bool first = true;
     for (const char *r = x->p; *r; r++) {
-        if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *r++; *w++ = *r; continue; }
+        /* an escaped byte is the byte: `$x` holding \001 reached cat as
+         * \004\001 (502) */
+        if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *++r; continue; }
         if (*r == SHELL_GLOB_ESC && r[1]) continue;     /* keep the byte */
         if (*r == SHELL_NOSPLIT_MARK || *r == SHELL_EMPTY_ELEM ||
             *r == SHELL_ARG_JOIN) continue;
@@ -31677,6 +31679,14 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
         if (lit_ifs_data && !escaped && sh_ifs_is_sep(*p) &&
             sb_putc(out, SHELL_DATA_ESC) < 0)
             return -1;
+        /* a here-document's own byte that is one of the in-band marks --
+         * a written \001 -- is data, or it went as a field mark (bash's
+         * nquote5.sub; logs/b42 mx1 m2) -- finding 502 */
+        if (g_hd_body && !escaped && (unsigned char)*p < 0x08) {
+            if (sb_put_data_n(out, p, 1) < 0) return -1;
+            p++;
+            continue;
+        }
         if (sb_putc(out, *p++) < 0) return -1;
     }
     return 0;
