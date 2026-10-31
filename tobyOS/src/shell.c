@@ -27745,6 +27745,7 @@ static void cmd_fc(int argc, char **argv) {
 
 static void cmd_fc_in(int argc, char **argv) {
     bool list = false, no_numbers = false, reverse = false, subst = false;
+    const char *editor = 0;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
         /* `fc -l -1` -- a leading `-` followed by digits is a negative
@@ -27757,9 +27758,18 @@ static void cmd_fc_in(int argc, char **argv) {
             case 'r': reverse = true; break;
             case 's': subst = true; break;
             case 'e':
-                kprintf("fc: no editor available; use -l or -s\n");
-                shell_set_status(1);
-                return;
+                /* -e ENAME: the rest of the bundle, or the next word */
+                if (f[1]) editor = f + 1;
+                else if (i + 1 < argc) editor = argv[++i];
+                else {
+                    kprintf("fc: -e: option requires an argument\n");
+                    kprintf_raw("fc: usage: fc [-e ename] [-lnr] [first] [last] "
+                                "or fc -s [pat=rep] [command]\n");
+                    shell_set_status(2);
+                    return;
+                }
+                f += strlen(f) - 1;
+                break;
             default:
                 /* bash's words and usage (logs/b42 hs1) -- finding 523 */
                 kprintf("fc: -%c: invalid option\n", *f);
@@ -27834,8 +27844,70 @@ static void cmd_fc_in(int argc, char **argv) {
         return;
     }
     if (!list) {
-        kprintf("fc: no editor available; use -l or -s\n");
-        shell_set_status(1);
+        /* fc [-e ENAME] [first [last]]: the lines into a file, ENAME --
+         * else $FCEDIT, $EDITOR, vi -- run on it, and then what the file
+         * holds echoed and run, each line a history entry; an editor that
+         * fails runs nothing. tsh refused: "no editor available" (bash's
+         * history.tests: `fc -e cat`; logs/b42 hs2) -- finding 526 */
+        const char *ed = editor;
+        if (!ed || !*ed) ed = env_get("FCEDIT");
+        if (!ed || !*ed) ed = env_get("EDITOR");
+        if (!ed || !*ed) ed = "vi";
+        const char *td = env_get("TMPDIR");
+        if (!td || !*td) td = "/tmp";
+        char path[VFS_PATH_MAX];
+        ksnprintf(path, sizeof path, "%s/tsh-fc.%d", td, shell_dynvar_pid());
+        SH_SB(fb);
+        int lo = first < last ? first : last, hi = first < last ? last : first;
+        for (int k = reverse ? hi : lo; reverse ? k >= lo : k <= hi;
+             k += reverse ? -1 : 1)
+            if (sb_puts(&fb, g_hist[k]) < 0 || sb_putc(&fb, '\n') < 0) {
+                shell_set_status(1);
+                return;
+            }
+        (void)vfs_create_mode(path, shell_new_file_mode(0600u));
+        if (vfs_write_all(path, fb.p, fb.len) != VFS_OK) {
+            kprintf("fc: %s: cannot open temp file\n", path);
+            shell_set_status(1);
+            return;
+        }
+        SH_SB(cmd);
+        if (sb_puts(&cmd, ed) < 0 || sb_putc(&cmd, ' ') < 0 ||
+            sb_puts(&cmd, path) < 0) {
+            (void)vfs_unlink(path);
+            shell_set_status(1);
+            return;
+        }
+        execute_line_text(cmd.p);
+        if (g_last_status != 0 || g_shell_flow != SHELL_FLOW_NONE) {
+            (void)vfs_unlink(path);
+            return;
+        }
+        void *rb = 0;
+        size_t rsz = 0;
+        int rrc = vfs_read_all(path, &rb, &rsz);
+        (void)vfs_unlink(path);
+        if (rrc != VFS_OK) {
+            shell_set_status(1);
+            return;
+        }
+        SH_SB(text);
+        int trc = sb_putmem(&text, (const char *)rb, rsz);
+        kfree(rb);
+        if (trc < 0) { shell_set_status(1); return; }
+        for (char *ln = text.p; ln && *ln; ) {
+            char *nl = ln;
+            while (*nl && *nl != '\n') nl++;
+            char keep = *nl;
+            *nl = '\0';
+            if (*shell_skip_blanks(ln)) {
+                kprintf_raw("%s\n", ln);            /* echoed, as -s does */
+                shell_history_add(ln);
+                execute_line_text(ln);
+            }
+            if (g_shell_flow != SHELL_FLOW_NONE || !keep) break;
+            ln = nl + 1;
+        }
         return;
     }
     if (first > last) { int t = first; first = last; last = t; }
