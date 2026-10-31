@@ -22038,6 +22038,13 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                  * delimiter 8 to the end of the file (bash's
                  * comsub-posix2.sub; logs/b42 cms4) */
                 if (ikind == 'a') hd_from = nl + strlen(nl);
+                /* ...and one inside a `$( )` is the substitution's text, read
+                 * when it runs, where `EOF)` ends it: collected here, the
+                 * body ran to the end of the file looking for a line EOF
+                 * (bash's comsub-eof5.sub; logs/b42 hd3) */
+                for (int k = scan.nest - 1; k >= 0; k--)
+                    if (k < (int)sizeof scan.nest_kind && scan.nest_kind[k] == 'c')
+                        hd_from = nl + strlen(nl);
                 char *hd_before2 = p;
                 if (!shell_collect_line_heredocs(nl, hd_from, &p, &tnl)) {
                     hd_failed = true;
