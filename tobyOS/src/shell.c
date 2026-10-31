@@ -25368,12 +25368,14 @@ static bool printf_is_blank(char c) { return c == ' ' || c == '\t'; }
 
 /* bash's sh_invalidnum: an operand that starts 0 and a digit is an
  * "invalid octal number", one that starts 0x an "invalid hex number", any
- * other "invalid number" (logs/b13 q53). */
+ * other "invalid number" (logs/b13 q53). caller says the same. */
+static const char *sh_invalidnum_what(const char *s) {
+    return (s[0] == '0' && s[1] >= '0' && s[1] <= '9') ? "invalid octal number"
+         : (s[0] == '0' && s[1] == 'x') ? "invalid hex number"
+         : "invalid number";
+}
 static void printf_invalid_num(const char *s) {
-    const char *what = (s[0] == '0' && s[1] >= '0' && s[1] <= '9') ? "invalid octal number"
-                     : (s[0] == '0' && s[1] == 'x') ? "invalid hex number"
-                     : "invalid number";
-    kprintf("printf: %s: %s\n", s, what);
+    kprintf("printf: %s: %s\n", s, sh_invalidnum_what(s));
 }
 
 /* The unsigned view of the last operand printf_arg_int parsed. %u wants the
@@ -29090,19 +29092,28 @@ static void shell_callframe_pop(void) {
 static void cmd_caller(int argc, char **argv) {
     int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
     if (depth <= 0 && !g_main_source) { shell_set_status(1); return; }
-    int want = 0;
-    if (argc > 1) {
-        for (const char *q = argv[1]; *q; q++) {
-            if (*q < '0' || *q > '9') { want = -1; break; }
-            want = want * 10 + (*q - '0');
-        }
-        if (want < 0) {
-            kprintf("caller: %s: invalid frame number\n", argv[1]);
-            shell_set_status(1);
+    int ai = 1;
+    /* no options -- "-X: invalid option" by its first letter -- and N is
+     * legal_number's, else sh_invalidnum's words; the usage line after
+     * either, status 2. tsh said "invalid frame number", status 1, to
+     * "foo", "+0" and " 0" alike (logs/b42 db1 c2, db2 c4 c6) */
+    if (argc > ai && argv[ai][0] == '-' && argv[ai][1]) {
+        if (strcmp(argv[ai], "--") != 0) {
+            kprintf("caller: -%c: invalid option\n", argv[ai][1]);
+            sh_builtin_usage("caller");
+            shell_set_status(2);
             return;
         }
+        ai++;
     }
-    if (argc <= 1) {
+    long long want = 0;
+    if (argc > ai && !sh_legal_number(argv[ai], &want)) {
+        kprintf("caller: %s: %s\n", argv[ai], sh_invalidnum_what(argv[ai]));
+        sh_builtin_usage("caller");
+        shell_set_status(2);
+        return;
+    }
+    if (argc <= ai) {
         const char *file = depth >= 2 ? g_callframes[depth - 2].src
                          : depth == 1 ? g_main_source : 0;
         unsigned long line = depth > 0 ? g_callframes[depth - 1].line : 0;
@@ -29112,7 +29123,7 @@ static void cmd_caller(int argc, char **argv) {
     }
     /* FUNCNAME[N+1] and BASH_SOURCE[N+1]: a frame below N's, or the
      * script's own */
-    if (want + 1 > depth || (want + 1 == depth && !g_main_source)) {
+    if (want < 0 || want + 1 > depth || (want + 1 == depth && !g_main_source)) {
         shell_set_status(1);
         return;
     }
