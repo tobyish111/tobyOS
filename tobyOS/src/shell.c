@@ -4496,7 +4496,22 @@ static int sh_array_assign_literal(const char *name, const char *paren,
                 shell_set_status(1);
                 continue;
             }
-            if (sh_subscript_value(e->key, &ix) != SARITH_OK) {
+            /* a subscript whose arithmetic fails has said so: the list
+             * stops there, what came before it assigned, and the rest of
+             * the line goes, status 1 -- `a=( x [1+]=foo y )` is a=(x).
+             * tsh failed the whole list, said "failed to set" too, and
+             * ran on (bash's exp8.sub; logs/b42 in3) -- finding 494 */
+            int sk = sh_subscript_value(e->key, &ix);
+            if (sk == SARITH_ERROR) {
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                break;
+            }
+            if (sk != SARITH_OK) {
                 rc = -1;
                 break;
             }
