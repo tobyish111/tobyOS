@@ -43613,7 +43613,15 @@ static int shell_run_function(struct shell_simple *cmd) {
         struct shell_lmap_saved lm_sv;
         bool lm_in = shell_lmap_enter_body(fn->lm_off, fn->lm_line, fn->lm_n,
                                            run_body, &lm_sv);
-        if (traced) shell_run_debug_trap();
+        /* the body's own DEBUG trap, as it starts, is on the body's first
+         * line -- the `{` -- not the call's: bash's func2[43] where tsh
+         * said [47] (bash's trap.tests; logs/b42 tp1) -- finding 513 */
+        if (traced) {
+            unsigned long tl = g_shell_lineno;
+            if (body_start_ln) g_shell_lineno = body_start_ln;
+            shell_run_debug_trap();
+            g_shell_lineno = tl;
+        }
         if (g_shell_flow == SHELL_FLOW_NONE) execute_line_text(run_body);
         if (g_traps[SHELL_TRAP_RETURN]) {
             /* $? is the function's status in it; a `return` already
