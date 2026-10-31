@@ -31045,6 +31045,15 @@ static int sh_put_param_word(struct shell_sb *b, const char *ew) {
     return sb_puts(b, firstm + 1);
 }
 
+/* A "*" join that is fields instead: unquoted under a null IFS, outside an
+ * assignment and a here-document -- $* and ${a[*]} there are a field per
+ * element (finding 493 for their operators). */
+static bool sh_star_fields(void) {
+    const char *ifs = env_get("IFS");
+    return ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx &&
+           !g_hd_body;
+}
+
 static int shell_append_positional_join(struct shell_sb *b,
                                         bool star) {
     if (!star) {                                /* "$@" -- one word each */
@@ -32869,7 +32878,8 @@ static int shell_expand_substring(const char *name, const char *spec,
         if (end > n) end = n;
         struct sh_sep sep;
         sh_sep_join(&sep, SH_JOIN_HD_SPACE);
-        if (!star && sh_put_lead_mark(b) < 0)
+        bool sf = star && sh_star_fields();         /* (493) */
+        if ((!star || sf) && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
         for (long i = off; i < end; i++) {
@@ -32877,7 +32887,7 @@ static int shell_expand_substring(const char *name, const char *spec,
                                      : g_positional[i - 1];
             if (!v) continue;
             if (!first) {
-                if (!star) {
+                if (!star || sf) {
                     if (sb_putc(b, SHELL_ARG_MARK) < 0)
                         return -1;
                 } else if (sb_put_sep(b, &sep) < 0) {
@@ -33959,7 +33969,11 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         bool hd_at = suffix[0] == '/' || suffix[0] == '^' ||
                                      suffix[0] == ',' || suffix[0] == '~';
                         sh_sep_join(&sep, hd_at ? SH_JOIN_HD_AT : SH_JOIN_HD_SPACE);
-                        if (!star && sh_put_lead_mark(b) < 0)
+                        /* ${a[*]OP} and ${*OP} unquoted under a null IFS: a
+                         * field each, as ${a[*]} and $* are there (bash's
+                         * exp10.sub; logs/b42 in1 i5, in2) -- finding 493 */
+                        bool sf = star && sh_star_fields();
+                        if ((!star || sf) && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
                             /* Looked up again every time round: the operator
@@ -33968,7 +33982,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             arr = sh_array_find(nm);
                             if (!arr || i >= arr->n) break;
                             if (i > 0) {
-                                if (!star) {
+                                if (!star || sf) {
                                     if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
                                 } else if (sb_put_sep(b, &sep) < 0) {
                                     return -1;
