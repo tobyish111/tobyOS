@@ -37869,6 +37869,13 @@ static size_t sh_pat_char(const char *p, const char *pend, uint32_t *cp,
     bool esc = (*q == '\\' || *q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) &&
                q + 1 < pend;
     if (esc) q++;
+    /* a backslash before a byte the expander escaped -- `\` then \001 from
+     * an unquoted $p -- quotes that byte, not its mark (bash's case3.sub;
+     * logs/b42 cs1 k1) */
+    if (esc && *p == '\\' && (*q == SHELL_DATA_ESC || *q == SHELL_GLOB_ESC) &&
+        q + 1 < pend)
+        q++;
+    size_t lead = (size_t)(q - p);
     raw[n++] = *q++;
     unsigned char c0 = (unsigned char)raw[0];
     size_t want = 1;
@@ -37884,7 +37891,7 @@ static size_t sh_pat_char(const char *p, const char *pend, uint32_t *cp,
     }
     size_t got = sh_mbdec(raw, raw + n, g_glob_u8, cp);
     if (got < n) {                      /* not one character: just the byte */
-        q = p + (esc ? 2 : 1);
+        q = p + lead + 1;
         n = 1;
         *cp = c0;
     }
