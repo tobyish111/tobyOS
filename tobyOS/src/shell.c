@@ -40014,7 +40014,10 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
     SH_SB(tw);
     if (shell_has_nosplit(word)) {
         size_t eq0 = shell_word_assign_eq(word);
-        if (eq0 != (size_t)-1) {
+        /* ...but in POSIX mode only an assignment's: `echo foo=~:~` is
+         * foo=~:~ there (bash's tilde3.sub; logs/b42 tl1 t3) -- finding
+         * 499 */
+        if (eq0 != (size_t)-1 && !(g_opt_posix && g_arg_assign_ctx == 0)) {
             const char *hm = env_get("HOME");
             if (!hm || !*hm) hm = "/";
             bool prot = false, seg_start = false, seen_eq = false;
@@ -40143,7 +40146,8 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
             size_t vl = strlen(v);
             arr_literal = vl >= 2 && v[0] == '(' && v[vl - 1] == ')';
         }
-        if (assign_word && !g_arg_from_expansion && !arr_literal) {
+        if (assign_word && !g_arg_from_expansion && !arr_literal &&
+            !(g_opt_posix && g_arg_assign_ctx == 0)) {      /* (499) */
             SH_SB(asg);
             bool changed = false;
             const char *q = word;
