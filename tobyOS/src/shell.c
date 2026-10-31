@@ -22875,6 +22875,29 @@ static void shell_callframe_push(const char *name, unsigned long line,
                                  const char *src, bool src_real, bool source);
 static void shell_callframe_pop(void);
 
+/* What else a `.` sets up for its file and puts back after. */
+struct shell_dot_frame {
+    char *debug;            /* the DEBUG trap set aside, or 0 */
+};
+static void shell_dot_enter(struct shell_dot_frame *df) {
+    /* WITHOUT functrace IT RUNS WITHOUT THE DEBUG TRAP, which comes back
+     * after it -- and after its RETURN trap -- unless the file set one of
+     * its own, as bash's source does; tsh ran the trap in the file
+     * (bash's dbg-support.tests; logs/b42 db1 s3-s5, db2 r1-r3) */
+    df->debug = 0;
+    if (!g_opt_functrace && g_traps[SHELL_TRAP_DEBUG] &&
+        g_traps[SHELL_TRAP_DEBUG][0]) {
+        df->debug = g_traps[SHELL_TRAP_DEBUG];
+        g_traps[SHELL_TRAP_DEBUG] = 0;
+    }
+}
+static void shell_dot_debug_back(struct shell_dot_frame *df) {
+    if (!df->debug) return;
+    if (!g_traps[SHELL_TRAP_DEBUG]) g_traps[SHELL_TRAP_DEBUG] = df->debug;
+    else kfree(df->debug);
+    df->debug = 0;
+}
+
 static void cmd_dot(int argc, char **argv) {
     /* The dispatcher pre-set $? to 0; this is what it replaced. */
     int status_in = g_shell_prev_status;
@@ -22947,8 +22970,10 @@ static void cmd_dot(int argc, char **argv) {
     g_diag_source = src_name;
     g_diag_in_fn = false;
     argv[1] = resolved;
+    struct shell_dot_frame df;
     if (argc <= 2) {
         shell_callframe_push("source", g_shell_lineno, src_name, true, true);
+        shell_dot_enter(&df);
         g_source_depth++;                  /* `return` is legal in here */
         g_return_pending = false;
         /* the file starts with the caller's $?, as bash's does */
@@ -22965,6 +22990,7 @@ static void cmd_dot(int argc, char **argv) {
          * db3 r4) */
         shell_callframe_pop();
         shell_run_return_trap();       /* a sourced script finished */
+        shell_dot_debug_back(&df);
         shell_set_status(st1);
         return;
     }
@@ -22976,6 +23002,7 @@ static void cmd_dot(int argc, char **argv) {
         return;
     }
     shell_callframe_push("source", g_shell_lineno, src_name, true, true);
+    shell_dot_enter(&df);
     g_dollar_set = false;
     g_source_depth++;                      /* `return` is legal in here */
     g_return_pending = false;
@@ -22988,6 +23015,7 @@ static void cmd_dot(int argc, char **argv) {
     g_return_pending = false;
     shell_callframe_pop();
     shell_run_return_trap();           /* a sourced script finished */
+    shell_dot_debug_back(&df);
     /* ...and the caller's parameters come back, unless the script gave
      * them new values with `set`: `. f x y z` where f says `set -- m n o
      * p` leaves m n o p (bash's builtins.tests; logs/b42 blt1 b4, blt2) */
