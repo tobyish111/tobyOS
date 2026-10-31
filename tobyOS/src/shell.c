@@ -19109,6 +19109,11 @@ static const char *shell_hd_word(const char *p, char *d, size_t n, bool *tabs) {
             if (*q == qc) q++;
             continue;
         }
+        /* a backslash ending the text continues the line, it is not the
+         * delimiter's: `<<\EOT\` + `4` is <<\EOT4 (bash's comsub4.sub;
+         * logs/b42 cms2) -- it was read as part of the word, so the line
+         * looked open rather than continued */
+        if (*q == '\\' && !q[1]) break;
         if (*q == '\\' && q[1]) q++;
         if (k + 1 < n) d[k++] = *q;
         q++;
