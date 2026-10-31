@@ -37881,7 +37881,11 @@ static bool shell_has_glob(const char *s) {
             if (*q == '!' || *q == '^') q++;
             if (*q == ']') q++;
             for (; *q; q++) {
-                if ((*q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC) && q[1]) { q++; continue; }
+                if ((*q == SHELL_GLOB_ESC || *q == SHELL_DATA_ESC || *q == '\\') &&
+                    q[1]) { q++; continue; }
+                /* a bare `/` is no bracket's: `[qwe/qwe]` is a name, which
+                 * nullglob keeps (bash's glob7.sub; logs/b42 gl1 h3) */
+                if (*q == '/') break;
                 if (*q == ']') return true;
             }
             continue;
