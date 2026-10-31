@@ -11036,9 +11036,11 @@ static void cmd_shopt_in(int argc, char **argv) {
         for (; i < argc; i++) {
             bool on = false;
             if (!shell_opt_state_by_name(argv[i], &on)) {
-                if (!quiet)
-                    kprintf("shopt: %s: invalid shell option name\n", argv[i]);
-                st = 1;
+                /* a `set -o` name: "invalid option name", set's words, -q
+                 * or not -- and setting or unsetting one is still status 0
+                 * (bash's shopt.tests; logs/b42 sho1) */
+                kprintf("shopt: %s: invalid option name\n", argv[i]);
+                if (!set && !unset) st = 1;
                 continue;
             }
             if (set || unset) {
@@ -11071,7 +11073,9 @@ static void cmd_shopt_in(int argc, char **argv) {
     for (; i < argc; i++) {
         struct shell_shopt *o = shell_shopt_find(argv[i]);
         if (!o) {
-            if (!quiet) kprintf("shopt: %s: invalid shell option name\n", argv[i]);
+            /* -q quiets the states, not the error (bash's shopt.tests;
+             * logs/b42 sho1) */
+            kprintf("shopt: %s: invalid shell option name\n", argv[i]);
             status = 1;
             continue;
         }
