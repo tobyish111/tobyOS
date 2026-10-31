@@ -27955,16 +27955,12 @@ static void cmd_fc(int argc, char **argv) {
      * when it is in the history at all: HISTIGNORE='fc*' keeps it out, and
      * tsh took the newest real entry each time. A listing leaves it in the
      * list, only out of its range; re-executing replaces it (bash's
-     * history.tests; logs/b42 hs1) -- finding 522 */
+     * history.tests; logs/b42 hs1) -- finding 522. AN fc THAT FAILS KEEPS
+     * ITS LINE, as bash's: the line goes once -s has found its command or
+     * -e starts to edit, an editor that fails or an empty list too; tsh
+     * took it out before it looked (bash's history5.sub; logs/b42 fc1 f1,
+     * fc3 k2, fc5 x3 x4) -- finding 550 */
     bool own = g_hist_line_added && !g_hist_line_pushed && g_hist_count > 0;
-    bool list = false;
-    for (int k = 1; k < argc && argv[k][0] == '-' && argv[k][1] &&
-                    !(argv[k][1] >= '0' && argv[k][1] <= '9'); k++)
-        for (const char *f = argv[k] + 1; *f; f++) if (*f == 'l') list = true;
-    if (own && !list) {
-        shell_history_pop();
-        own = false;
-    }
     struct shell_fc_view v = { own, g_hist_count - (own ? 2 : 1) };
     cmd_fc_in(argc, argv, &v);
 }
@@ -28061,6 +28057,7 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         }
         char *buf = bufb.p;
         kprintf_raw("%s\n", buf);          /* the command, echoed bare */
+        if (v->own) shell_history_pop();
         shell_history_add(buf);
         execute_line_text(buf);
         return;
@@ -28077,7 +28074,9 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     int last = last_s ? shell_fc_resolve(last_s, v, list, false)
                : !list ? first
                : first == g_hist_count - 1 ? first : newest;
-    if (first < 0 || last < 0) {
+    /* An edit with nothing before fc's line edits nothing. */
+    bool none = !list && !first_s && newest < 0;
+    if (!none && (first < 0 || last < 0)) {
         shell_fc_not_found(first < 0 ? first : last);
         shell_set_status(1);
         return;
@@ -28085,7 +28084,7 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     /* A RANGE WRITTEN HIGH TO LOW GOES HIGH TO LOW, listed or edited, as
      * bash's: `fc -l 4 2` lists 4 3 2 -- tsh went low to high unless -r
      * (bash's history5.sub; logs/b42 fc1 f2, fc6 y1 y2) -- finding 548 */
-    if (first > last) {
+    if (!none && first > last) {
         int t = first; first = last; last = t;
         reverse = true;
     }
@@ -28103,9 +28102,10 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         if (!td || !*td) td = "/tmp";
         char path[VFS_PATH_MAX];
         ksnprintf(path, sizeof path, "%s/tsh-fc.%d", td, shell_dynvar_pid());
+        if (v->own) shell_history_pop();
         SH_SB(fb);
-        for (int k = reverse ? last : first; reverse ? k >= first : k <= last;
-             k += reverse ? -1 : 1)
+        for (int k = reverse ? last : first;
+             !none && (reverse ? k >= first : k <= last); k += reverse ? -1 : 1)
             if (sb_puts(&fb, g_hist[k]) < 0 || sb_putc(&fb, '\n') < 0) {
                 shell_set_status(1);
                 return;
