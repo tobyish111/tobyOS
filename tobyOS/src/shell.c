@@ -51444,6 +51444,11 @@ static bool shell_try_compound_pipeline(const char *src) {
          * loop outside it. */
         enum shell_flow saved_flow = g_shell_flow;
         int saved_flow_status = g_shell_flow_status;
+        /* lastpipe's last stage runs in the shell: its `exit` is the
+         * shell's -- `exit 142 | exit 14` ends the script, status 14 (bash's
+         * lastpipe1.sub; logs/b42 lp1) -- finding 517 */
+        bool lp_exit = false;
+        int lp_exit_status = 0;
         int saved_loop_depth = g_shell_loop_depth;
         g_subshell_depth++;
         bool own_top = shell_text_own_toplevel(stages[i]);
@@ -51597,7 +51602,11 @@ static bool shell_try_compound_pipeline(const char *src) {
             g_simple_stage_adj = saved_adj;
             g_in_pipeline_stage = saved_ps;
             last = g_last_status;
-            if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
+            if (g_shell_flow == SHELL_FLOW_EXIT) {
+                last = g_shell_flow_status;
+                lp_exit = true;
+                lp_exit_status = g_shell_flow_status;
+            }
             if (last != 0) failed = last;
             if (pst) pst[i] = last;
         }
@@ -51615,6 +51624,10 @@ static bool shell_try_compound_pipeline(const char *src) {
         if (own_top) g_own_toplevel--;
         g_shell_flow = saved_flow;
         g_shell_flow_status = saved_flow_status;
+        if (lp_exit && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = lp_exit_status;
+        }
         g_shell_loop_depth = saved_loop_depth;
 
         g_shell_fd[0] = saved0;
