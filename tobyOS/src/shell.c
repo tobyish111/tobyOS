@@ -19997,7 +19997,13 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
     }
     if (c == ')') {
         p++;
-        if (st->paren > 0) {
+        /* A PATTERN'S `)` FIRST, inside a ( ) as anywhere: `( case foo in
+         * foo ) echo a;; esac; )` closed the subshell at the pattern, and
+         * the `;` after esac split the line (bash's comsub-posix6.sub;
+         * logs/b42 cms5 cms6) */
+        if (st->case_pat) {
+            st->cmd_pos = true;
+        } else if (st->paren > 0) {
             if (st->in_array_lit && st->paren == st->array_lit_depth) {
                 st->in_array_lit = false;
                 st->array_lit_depth = 0;
@@ -20012,10 +20018,6 @@ static void shell_scan_token(struct shell_scan *st, const char **pp) {
              * front of its `||`. Without this the leading-operator check
              * below called every such line a syntax error. */
             st->cmd_seen = true;
-        } else if (st->case_pat) {
-            /* An unbalanced `)` ends a CASE PATTERN, and a command follows it:
-             * `case $x in a) echo hi;; esac`. */
-            st->cmd_pos = true;
         } else {
             /* A CASE ITEM MUST END WITH `;;`.
              *
