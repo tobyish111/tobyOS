@@ -38957,6 +38957,37 @@ static int shell_globstar_walk(struct shell_globstar *g, const char *dirpath,
         return shell_globstar_star(g, dirpath, shown, comps, ncomp, ci, depth);
 
     bool last = (ci + 1 >= ncomp);
+    /* A COMPONENT WITH NO PATTERN IN IT is a name, taken as it is (its
+     * escapes off), not matched against the listing -- which has no `.` or
+     * `..` to match: `* /.` (no blank) is readable/. and searchable/.
+     * (bash's glob6.sub; logs/b42 gl1 h5). Not found so, the listing decides
+     * (a directory that can be listed but not searched). */
+    if (!shell_has_glob(comps[ci])) {
+        char lit[VFS_PATH_MAX];
+        memcpy(lit, comps[ci], strlen(comps[ci]) + 1);
+        shell_glob_dequote_path(lit);
+        bool dotname = lit[0] == '.' && (!lit[1] || (lit[1] == '.' && !lit[2]));
+        char sub[VFS_PATH_MAX], subshown[VFS_PATH_MAX];
+        int n = ksnprintf(sub, sizeof sub, "%s/%s", dirpath, lit);
+        struct vfs_stat lst;
+        bool there = n > 0 && (size_t)n < sizeof sub &&
+                     (dotname || vfs_stat(sub, &lst) == VFS_OK);
+        if (there) {
+            bool isdir = dotname || lst.type == VFS_TYPE_DIR;
+            if (last) {
+                if (g->trail_slash && !isdir) return 0;
+                int m = ksnprintf(subshown, sizeof subshown, "%s%s%s", shown,
+                                  lit, g->trail_slash ? "/" : "");
+                if (m <= 0 || (size_t)m >= sizeof subshown) return 0;
+                return shell_globstar_emit(g, subshown) < 0 ? -1 : 0;
+            }
+            if (!isdir) return 0;
+            int m = ksnprintf(subshown, sizeof subshown, "%s%s/", shown, lit);
+            if (m <= 0 || (size_t)m >= sizeof subshown) return 0;
+            return shell_globstar_walk(g, sub, subshown, comps, ncomp, ci + 1,
+                                       depth);
+        }
+    }
     struct vfs_dir d;
     if (vfs_opendir(dirpath, &d) != VFS_OK) return 0;
     struct vfs_dirent ent;
