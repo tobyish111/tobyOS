@@ -33048,6 +33048,7 @@ static bool g_glob_nocase;
 /* The locale of the match in progress: UTF-8 or bytes (shell_glob_begin). */
 static bool g_glob_u8;
 static void shell_glob_begin(void);
+static void shell_glob_begin_text(const char *pat, const char *s);
 static void shell_glob_end(void);
 static bool shell_glob_cp_eq(uint32_t pc, uint32_t nc);
 
@@ -34423,8 +34424,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             bool saved_nocase = g_glob_nocase;
             g_glob_nocase = g_shopt_misc[3];          /* nocasematch */
             /* positions and lengths are CHARACTERS (sh_bnd); vlen and i
-             * below count them, and sh_bnd_at turns one into a byte */
-            shell_glob_begin();
+             * below count them, and sh_bnd_at turns one into a byte --
+             * bytes when either is no text (496) */
+            shell_glob_begin_text(pattern, value);
             struct sh_bnd bd;
             if (sh_bnd_make(&bd, value, vlen, g_glob_u8) < 0) {
                 shell_glob_end();
@@ -34635,8 +34637,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
              * pattern can only match one prefix or suffix length. */
             size_t vlen = valb.len;
             const char *vend = value + vlen;
-            /* prefixes and suffixes a CHARACTER at a time (sh_bnd) */
-            shell_glob_begin();
+            /* prefixes and suffixes a CHARACTER at a time (sh_bnd) --
+             * bytes when either is no text (496) */
+            shell_glob_begin_text(pattern, value);
             struct sh_bnd bd;
             if (sh_bnd_make(&bd, value, vlen, g_glob_u8) < 0) {
                 shell_glob_end();
@@ -38891,6 +38894,29 @@ static void shell_glob_begin(void) {
 }
 static void shell_glob_end(void) { g_glob_depth--; }
 
+/* Is S valid UTF-8 text throughout? */
+static bool sh_text_valid_u8(const char *s) {
+    const char *e = s + strlen(s);
+    for (const char *q = s; q < e; ) {
+        size_t n = sh_cl(q, e, true);
+        if (n == 1 && (unsigned char)*q >= 0x80) return false;
+        q += n;
+    }
+    return true;
+}
+
+/* shell_glob_begin for a match of PAT against S: bash matches BYTES when
+ * either is no valid text in a UTF-8 locale -- `case $euro in *$o202*)`
+ * with o202 a lone continuation byte is a match, and `${euro##*$o202}`
+ * leaves the last byte. tsh matched characters, where the byte is none
+ * (bash's intl3.sub; logs/b42 in1 i1) -- finding 496 */
+static void shell_glob_begin_text(const char *pat, const char *s) {
+    shell_glob_begin();
+    if (g_glob_depth == 1 && g_glob_u8 &&
+        (!sh_text_valid_u8(pat ? pat : "") || !sh_text_valid_u8(s ? s : "")))
+        g_glob_u8 = false;
+}
+
 /* Zero or more repetitions of the alternation in [ls,le), then [rest,pend).
  * Shared by `*(...)` and, after one forced repetition, by `+(...)`. */
 static bool eg_match_star(const char *ls, const char *le,
@@ -39067,7 +39093,11 @@ static bool shell_glob_match_r(const char *pat, const char *pend,
 
 static bool shell_glob_match(const char *pat, const char *name) {
     if (!pat || !name) return false;
-    return shell_glob_match_e(pat, pat + strlen(pat), name, name + strlen(name));
+    shell_glob_begin_text(pat, name);
+    bool r = shell_glob_match_e(pat, pat + strlen(pat), name,
+                                name + strlen(name));
+    shell_glob_end();
+    return r;
 }
 
 /* A pathname component's match: its leading period is the pattern's to
