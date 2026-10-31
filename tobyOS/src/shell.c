@@ -513,6 +513,8 @@ static bool g_syntax_fatal;
  * action is not read by the check, and runs with the old checks. */
 static int g_syn_checked;
 static int g_last_bg_pid;
+static int g_procsub_last;              /* with the process substitutions */
+static int g_procsub_last_status;
 /* Set in a background child whose text is ONE simple command: the external
  * it runs may REPLACE this process rather than be spawned and waited on. */
 static bool g_bg_exec_ok;
@@ -16585,7 +16587,23 @@ static void cmd_wait_in(int argc, char **argv) {
             pid = 0;
             (void)parse_int(argv[i], &pid);
             int code = 0;
-            if (!shell_bgstat_find(pid, &code)) {
+            bool found = shell_bgstat_find(pid, &code);
+#ifdef SHELL_HOSTED
+            /* the last process substitution, $!: its status, waited for
+             * now if it has not been reaped (finding 519) */
+            if (!found && pid > 0 && pid == g_procsub_last) {
+                if (g_procsub_last_status < 0) {
+                    extern int proc_wait(int pid);
+                    int c = proc_wait(pid);
+                    if (c >= 0) g_procsub_last_status = c;
+                }
+                if (g_procsub_last_status >= 0) {
+                    code = g_procsub_last_status;
+                    found = true;
+                }
+            }
+#endif
+            if (!found) {
                 kprintf("wait: pid %d is not a child of this shell\n", pid);
                 rc = 127;
                 continue;
@@ -35490,6 +35508,10 @@ struct shell_procsub {
 };
 static struct shell_procsub *g_procsub;
 static int g_procsub_n;
+/* The last substitution's process -- $! -- and, once reaped, its status
+ * for `wait "$!"` (-1: not yet; finding 519) */
+static int g_procsub_last;
+static int g_procsub_last_status = -1;
 
 static int shell_procsub_mark(void) { return g_procsub_n; }
 
@@ -35513,7 +35535,11 @@ static void shell_procsub_reap(void) {
     int w = 0;
     for (int i = 0; i < g_procsub_unreaped_n; i++) {
         int pid = g_procsub_unreaped[i];
-        if (proc_try_reap(pid, 0) == 0) g_procsub_unreaped[w++] = pid;
+        int code = 0;
+        int rr = proc_try_reap(pid, &code);
+        if (rr == 0) g_procsub_unreaped[w++] = pid;
+        else if (rr == 1 && pid == g_procsub_last)
+            g_procsub_last_status = code;                     /* 519 */
     }
     g_procsub_unreaped_n = w;
 }
@@ -35726,6 +35752,12 @@ static bool shell_procsub_make(const char *text, bool input,
     ps->fd    = want;
     ps->pid   = pid;
     ps->input = input;
+    /* THE SUBSTITUTION'S PROCESS IS $!, and `wait "$!"` its status: `cat
+     * <(exit 123); wait "$!"` is 123 -- tsh left $! alone and wait had
+     * nothing to take (bash's procsub1.sub; logs/b42 ps1) -- finding 519 */
+    g_last_bg_pid = pid;
+    g_procsub_last = pid;
+    g_procsub_last_status = -1;
     int n = ksnprintf(out, cap, "/dev/fd/%d", want);
     return n > 0 && (size_t)n < cap;
 }
