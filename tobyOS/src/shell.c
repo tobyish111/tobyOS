@@ -41733,7 +41733,16 @@ static int shell_apply_redirs(struct shell_simple *cmd,
                 long n = -1;
                 bool ok = false;
                 if (v && *v) n = shell_parse_long_value(v, &ok);
-                if (!ok || n < 0 || n >= SHELL_FD_LIMIT) {
+                /* bash: NAME unset is "NAME: ambiguous redirect", status 1;
+                 * a value that is not a number closes nothing, quietly
+                 * (vredir3.sub; logs/b42 rd1 r4) */
+                if (!v) {
+                    kprintf("%s: ambiguous redirect\n", r->fdvar);
+                    shell_set_status(1);
+                    return -1;
+                }
+                if (!ok) continue;
+                if (n < 0 || n >= SHELL_FD_LIMIT) {
                     kprintf("%s: %s: bad file descriptor\n", label,
                             v ? v : r->fdvar);
                     shell_set_status(1);
