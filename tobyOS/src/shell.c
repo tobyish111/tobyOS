@@ -33047,6 +33047,37 @@ static int shell_expand_array_test_op(struct shell_sb *b, const char *nm,
  * element or per-element operator runs on a scratch name. */
 static const char *g_bsub_text;
 
+static int sh_brace_disp(const char *e, struct shell_sb *d);
+
+/* TEXT AS BASH'S PARSER LEAVES IT, for the message: each `${ }` in it
+ * with its `$'...'` translated (sh_brace_disp) -- finding 479. */
+static int sh_bsub_disp_text(const char *t, struct shell_sb *d) {
+    int changed = 0;
+    for (size_t i = 0; t[i]; ) {
+        if (t[i] == '\\' && t[i + 1]) {
+            if (sb_putmem(d, t + i, 2) < 0) return -1;
+            i += 2;
+            continue;
+        }
+        if (t[i] == '$' && t[i + 1] == '{') {
+            size_t k = sh_arith_dollar_span(t + i);
+            bool closed = k >= 3 && t[i + k - 1] == '}';
+            SH_SB(body);
+            if (sb_putmem(&body, t + i + 2, k - 2 - (closed ? 1 : 0)) < 0 ||
+                sb_puts(d, "${") < 0)
+                return -1;
+            int r = sh_brace_disp(body.p ? body.p : "", d);
+            if (r < 0 || (closed && sb_putc(d, '}') < 0)) return -1;
+            if (r > 0) changed = 1;
+            i += k;
+            continue;
+        }
+        if (sb_putc(d, t[i]) < 0) return -1;
+        i++;
+    }
+    return changed;
+}
+
 /* Report a bad substitution as bash does (measured,
  * tools/agent/probes/bad-subst.sh): status 1 and the rest of the line
  * dropped (expand_wdesc_error) -- or, for an unknown `@` transform,
@@ -33101,11 +33132,15 @@ static size_t sh_bsub_unit_len(const char *u, int kind) {
 static void shell_bad_subst(bool fatal) {
     if (g_bsub_unit) {
         SH_SB(u);
+        SH_SB(ud);
         if (sb_putmem(&u, g_bsub_unit,
                       sh_bsub_unit_len(g_bsub_unit, g_bsub_unit_kind)) == 0)
-            kprintf("%s: bad substitution\n", u.p);
+            kprintf("%s: bad substitution\n",
+                    sh_bsub_disp_text(u.p ? u.p : "", &ud) > 0 ? ud.p : u.p);
     } else if (g_bsub_text) {
-        kprintf("${%s}: bad substitution\n", g_bsub_text);
+        SH_SB(td);
+        kprintf("${%s}: bad substitution\n",
+                sh_brace_disp(g_bsub_text, &td) > 0 ? td.p : g_bsub_text);
     } else {
         kprintf(SH_PFX_SHELL "bad substitution\n");
     }
@@ -35404,6 +35439,64 @@ static int sh_ansic_decode_to(const char **pp, struct shell_sb *o) {
     if (*p == '\'') p++;
     *pp = p;
     return 0;
+}
+
+/* A `${ }` EXPRESSION'S TEXT AS BASH'S PARSER LEAVES IT, for the "bad
+ * substitution" message: bash translates `$'...'` as it reads the braces
+ * -- quoted ('...') in a pattern operator's word, and anywhere outside
+ * double quotes; as it decodes in "..." for a name or another word when
+ * extquote is on; left as written in a here-document or with extquote
+ * off. Only this level's: a nested ${ } has its own. True when it
+ * differs from E (finding 479). */
+static int sh_brace_disp(const char *e, struct shell_sb *d) {
+    bool unq = g_dq_depth == 0 && !g_dq_word && !g_hd_body;
+    bool dqx = !g_hd_body && (g_dq_depth > 0 || g_dq_word) &&
+               g_shopt_misc[11];
+    bool changed = false, dq = false;
+    size_t i = 0;
+    while (e[i]) {
+        char c = e[i];
+        if (c == '\\' && e[i + 1]) {
+            if (sb_putmem(d, e + i, 2) < 0) return -1;
+            i += 2;
+            continue;
+        }
+        if (c == '$' && (e[i + 1] == '{' || e[i + 1] == '(')) {
+            size_t k = sh_arith_dollar_span(e + i);
+            if (sb_putmem(d, e + i, k) < 0) return -1;
+            i += k;
+            continue;
+        }
+        if (!dq && c == '$' && e[i + 1] == '\'') {
+            int kind = sh_brace_word_kind(e, i);
+            const char *q = e + i + 2;
+            SH_SB(dec);
+            if (sh_ansic_decode_to(&q, &dec) < 0) return -1;
+            if (kind == 1 || unq) {
+                sh_quote_single(d, dec.p ? dec.p : "");
+                changed = true;
+            } else if (dqx) {
+                if (sb_puts(d, dec.p ? dec.p : "") < 0) return -1;
+                changed = true;
+            } else if (sb_putmem(d, e + i, (size_t)(q - (e + i))) < 0) {
+                return -1;
+            }
+            i = (size_t)(q - e);
+            continue;
+        }
+        if (!dq && c == '\'') {
+            size_t k = i + 1;
+            while (e[k] && e[k] != '\'') k++;
+            if (e[k]) k++;
+            if (sb_putmem(d, e + i, k - i) < 0) return -1;
+            i = k;
+            continue;
+        }
+        if (c == '"') dq = !dq;
+        if (sb_putc(d, c) < 0) return -1;
+        i++;
+    }
+    return changed ? 1 : 0;
 }
 
 static int shell_expand_var(const char **pp, struct shell_sb *b) {
