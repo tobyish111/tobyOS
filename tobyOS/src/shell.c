@@ -1543,6 +1543,7 @@ static bool g_hd_body;
 static bool g_hd_at;
 /* ...and PATHNAME EXPANSION, which lives 17k lines below with the globber. */
 static bool shell_has_glob(const char *s);
+static void shell_glob_dequote_path(char *s);
 static bool shell_glob_meta(char c);
 static bool g_shopt_nullglob, g_shopt_failglob;   /* defined with the shopt table */
 static int  sh_array_glob_field(const char *name, const char *field,
@@ -39010,6 +39011,13 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
             size_t n = (size_t)(q - p);
             if (n + 1 > VFS_PATH_MAX) return 0;
             memcpy(comps[ncomp], p, n);
+            /* `\/` is a slash: the backslash before it goes (bash's
+             * glob5.sub; logs/b42 gl1 h2) */
+            if (*q == '/' && n > 0) {
+                size_t bs = 0;
+                while (bs < n && comps[ncomp][n - 1 - bs] == '\\') bs++;
+                if (bs & 1u) n--;
+            }
             comps[ncomp][n] = '\0';
             if (g_shopt_globstar && strcmp(comps[ncomp], "**") == 0)
                 have_star = true;
@@ -39080,6 +39088,20 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
 }
 
 
+/* A PATH PART OF A PATTERN AS A PATH: the escape marks off, and a plain
+ * backslash -- one an unquoted expansion gave -- quoting the byte after it,
+ * so `./t\mp/a/b/*` looks in ./tmp/a/b and shows it so, as bash's glob
+ * dequotes the directory it opens (glob5.sub; logs/b42 gl1 h2). */
+static void shell_glob_dequote_path(char *s) {
+    if (!s) return;
+    char *w = s;
+    for (const char *r = s; *r; r++) {
+        if ((*r == SHELL_GLOB_ESC || *r == SHELL_DATA_ESC || *r == '\\') && r[1]) r++;
+        *w++ = *r;
+    }
+    *w = '\0';
+}
+
 static int shell_expand_glob_word(struct shell_pipeline *pl,                                  struct shell_simple *cur,
                                   const char *word) {
     const char *last_slash = 0;
@@ -39117,8 +39139,8 @@ static int shell_expand_glob_word(struct shell_pipeline *pl,                    
      * as literal marker bytes; the same goes for the prefix that is pasted
      * back in front of every match. Only `pattern` keeps them, because only
      * `pattern` is matched. */
-    shell_strip_glob_escapes(dir_arg);
-    shell_strip_glob_escapes(display_prefix);
+    shell_glob_dequote_path(dir_arg);
+    shell_glob_dequote_path(display_prefix);
 
     char dir_path[VFS_PATH_MAX];
     if (shell_canonicalize_path(dir_arg, dir_path, sizeof(dir_path)) < 0) {
