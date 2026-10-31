@@ -881,6 +881,9 @@ static int            g_fndef_lm_n;
 /* The line of the body's `{` or `(` -- bash's function_bstart, its
  * line_number while the body runs (logs/b12 p94 p105). 0: unknown. */
 static unsigned long  g_fndef_body_ln;
+/* The line the definition's name is on, when the definer has moved
+ * $LINENO on (see struct shell_function's def_ln). 0: $LINENO. */
+static unsigned long  g_fndef_name_ln;
 /* Defining the exported functions the environment brought (see
  * shell_import_env_functions) */
 static bool g_fn_importing;
@@ -1312,6 +1315,10 @@ struct shell_function {
      * for one imported or defined under -c, "main" for one from standard
      * input or a terminal (logs/b42 db3 m1-m3, db4 n4) */
     const char *src_label;
+    /* the line its NAME is on -- `declare -F` under extdebug: bash's 2
+     * for `a()` on line 2 with its `{` on 3, where tsh said the body's
+     * first line (logs/b42 db2 l1, db3 v1) */
+    unsigned long def_ln;
     /* WHERE EACH LINE OF THE BODY IS, from the definition: lm_line[i] is
      * the source line from body offset lm_off[i] on. A call runs the body
      * with this map, so $LINENO -- and a diagnostic -- name the line in the
@@ -6395,6 +6402,9 @@ static int shell_function_set(const char *name, const char *body) {
         g_functions[idx].src_label = dlabel ? dlabel
             : (g_fn_importing || g_c_string_run) ? "environment" : "main";
     }
+    g_functions[idx].def_ln = g_fn_importing ? 0
+                            : g_fndef_name_ln ? g_fndef_name_ln : g_shell_lineno;
+    g_fndef_name_ln = 0;
 
     /* ...and the line map the definer captured (see shell_fndef_capture_map),
      * which belongs to this body and no other. */
@@ -12067,7 +12077,7 @@ static void cmd_declare(int argc, char **argv) {
              * (bash; Oils 0379) -- "main" when no file says */
             if (func_names && g_shopt_misc[10])
                 shell_printf("%s %lu %s\n", fn->name,
-                             fn->lm_n > 0 ? fn->lm_line[0] : 0ul,
+                             fn->def_ln,
                              fn->src ? fn->src
                              : fn->src_label ? fn->src_label : "main");
             else if (func_names) shell_printf("%s\n", fn->name);
@@ -50061,6 +50071,7 @@ static bool shell_try_function_definition(const char *src) {
         unsigned long def_line = g_shell_lineno;
         unsigned long end_line = shell_lineno_at(body_end);
         if (end_line > 0) g_shell_lineno = end_line;
+        g_fndef_name_ln = def_line;
         int frc = shell_function_set(name, body);
         g_shell_lineno = def_line;
         if (frc < 0) {
@@ -54523,7 +54534,7 @@ static void shell_import_env_functions(void) {
              * carry here-documents after them */
             char *copy = shell_strdup(text.p);
             if (copy) {
-                g_fn_importing = true;          /* "environment" */
+                g_fn_importing = true;          /* "environment", line 0 */
                 (void)shell_run_script_text(copy, false);
                 g_fn_importing = false;
                 kfree(copy);
