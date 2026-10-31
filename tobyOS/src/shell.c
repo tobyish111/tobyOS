@@ -27748,7 +27748,10 @@ static void cmd_fc_in(int argc, char **argv) {
                 shell_set_status(1);
                 return;
             default:
-                kprintf("fc: bad option '-%c'\n", *f);
+                /* bash's words and usage (logs/b42 hs1) -- finding 523 */
+                kprintf("fc: -%c: invalid option\n", *f);
+                kprintf_raw("fc: usage: fc [-e ename] [-lnr] [first] [last] "
+                            "or fc -s [pat=rep] [command]\n");
                 shell_set_status(2);
                 return;
             }
