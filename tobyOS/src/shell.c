@@ -13249,6 +13249,27 @@ static void cmd_unset(int argc, char **argv) {
          * the name was set -- its -1 means READONLY -- so asking it whether
          * anything was removed does not work, and the obvious
          * `if (env_unset(...) < 0)` version of this silently never fired. */
+        /* A WORD THAT IS NEITHER A NAME NOR A NAME[...] -- `a[x` or `y]`,
+         * the halves of a split key -- is "not a valid identifier", status
+         * 1, under -v; without it only a function of that name goes (bash's
+         * quotearray5.sub; logs/b42 qa2 v2 v4) -- finding 486 */
+        {
+            size_t al = strlen(argv[i]);
+            SH_SB(rn);
+            SH_SB(rs);
+            bool ok = shell_name_is_valid(argv[i], al) ||
+                      (sh_split_subscript(argv[i], al, &rn, &rs) &&
+                       shell_name_is_valid(rn.p, rn.len));
+            if (!ok) {
+                if (vars_only) {
+                    kprintf("unset: `%s': not a valid identifier\n", argv[i]);
+                    shell_set_status(1);
+                } else if (shell_function_find(argv[i]) >= 0) {
+                    shell_function_unset(argv[i]);
+                }
+                continue;
+            }
+        }
         {
             bool had_var = (env_find(argv[i], strlen(argv[i])) >= 0);
             if (env_unset(argv[i]) < 0) shell_set_status(1);
