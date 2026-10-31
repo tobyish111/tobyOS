@@ -1616,6 +1616,7 @@ int vfs_open_input(const char *path, struct vfs_file *out);    /* host.c */
 static void shell_putc_raw(char c);
 static int shell_case_unquote(struct shell_sb *pb);
 static char *shell_unquoted_newline(char *s);
+static void shell_run_alias_text(const char *src, const char *ex);
 static const char *shell_expand_aliases(const char *src, struct shell_sb *buf);
 static const char *shell_expand_aliases_nested(const char *src,
                                                struct shell_sb *buf);
@@ -22161,8 +22162,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         if (eval_mode) {
             /* Aliases, as cmd_eval's one-line path expands them. */
             SH_SB(abuf);
-            const char *ex = shell_expand_aliases(line, &abuf);
-            execute_line_text(ex ? ex : line);
+            shell_run_alias_text(line, shell_expand_aliases(line, &abuf));
         } else {
             /* the text's LAST unit: nothing at all after it, not even a
              * blank line (bash: *bash_input.location.string == '\0') */
@@ -23557,11 +23557,8 @@ static void cmd_eval(int argc, char **argv) {
              * defined the alias and then failed to find /bin/sayhi. POSIX says
              * eval's argument is parsed as shell INPUT, which includes alias
              * substitution. */
-            const char *line = p;
             SH_SB(abuf);
-            const char *ex = shell_expand_aliases(p, &abuf);
-            if (ex) line = ex;
-            execute_line_text(line);
+            shell_run_alias_text(p, shell_expand_aliases(p, &abuf));
         }
         if (g_shell_flow != SHELL_FLOW_NONE) break;
         p = nl ? nl + 1 : 0;
@@ -52025,6 +52022,27 @@ static void execute_line_text(const char *src) {
     }
     shell_procsub_release(psub);
     g_exec_line_depth--;
+}
+
+/* A line of eval's text, SRC, as its alias pass left it (EX): newlines the
+ * pass put in are separate commands, as execute_line_text splits them at
+ * the top level. Eval runs inside a line, where that split is not made, so
+ * `alias z='unalias z<newline>n=3'; eval z` ran `unalias z n=3` (finding
+ * 467). */
+static void shell_run_alias_text(const char *src, const char *ex) {
+    if (!ex || ex == src || shell_text_has_newline(src) ||
+        !shell_text_has_newline(ex)) {
+        execute_line_text(ex ? ex : src);
+        return;
+    }
+    char *p = (char *)ex;                    /* the caller's buffer */
+    while (p && *p) {
+        char *nl = shell_unquoted_newline(p);
+        if (nl) *nl = '\0';
+        if (*shell_skip_blanks(p)) execute_line_text(p);
+        if (g_shell_flow != SHELL_FLOW_NONE) break;
+        p = nl ? nl + 1 : 0;
+    }
 }
 
 static char g_heredoc_cmd[LINE_MAX];
