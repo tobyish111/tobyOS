@@ -41395,6 +41395,14 @@ struct shell_fd_state {
     bool owned_base[SHELL_FD_BASE];
 };
 
+#ifdef SHELL_HOSTED
+/* WHILE A COMMAND'S REDIRECTIONS ARE APPLIED, fd 2 as they have left it so
+ * far: a later one's failure is reported there, as bash reports it --
+ * `echo x 2>&1 >&$bad | grep Bad` reads the message (bash's redir11.sub,
+ * vredir.tests; logs/b42 rd2 v5). shell_current_diag_file. */
+static struct file *g_rd_diag;
+#endif
+
 /* Frees the heap arrays, if any, and nothing else -- the files are closed
  * (or handed on) by the code that owns them. Idempotent, and harmless on a
  * zeroed struct: every `struct shell_fd_state` local carries it as a
@@ -41688,14 +41696,34 @@ static void shell_coproc_fdchk(int fd) {
     (void)sh_array_set(g_coproc.name, 1, nb);
 }
 
+static int shell_apply_redirs_in(struct shell_simple *cmd,
+                                 struct shell_fd_state *st,
+                                 const char *label);
 static int shell_apply_redirs(struct shell_simple *cmd,
                               struct shell_fd_state *st,
                               const char *label) {
+#ifdef SHELL_HOSTED
+    struct file *saved_diag = g_rd_diag;
+    int rc = shell_apply_redirs_in(cmd, st, label);
+    g_rd_diag = saved_diag;
+    return rc;
+#else
+    return shell_apply_redirs_in(cmd, st, label);
+#endif
+}
+
+static int shell_apply_redirs_in(struct shell_simple *cmd,
+                                 struct shell_fd_state *st,
+                                 const char *label) {
     if (!cmd || !st) return -1;
     int pending_var = -1;               /* see shell_fd_commit_var */
     for (int i = 0; i < cmd->redir_count; i++) {
         shell_fd_commit_var(st, pending_var);
         pending_var = -1;
+#ifdef SHELL_HOSTED
+        g_rd_diag = (st->n > 2 && st->fd[2] && st->fd[2]->kind != FILE_KIND_NULL)
+                        ? st->fd[2] : 0;
+#endif
         struct shell_redir *r = &cmd->redir[i];
         if (r->op == SH_RD_AMBIG) {
             kprintf("%s: ambiguous redirect\n", r->path ? r->path : "");
@@ -42012,7 +42040,9 @@ static void shell_fd_moves_settle(struct shell_simple *cmd) {
  * found" going to the terminal while the script counted the lines it thought
  * it had captured. host.c asks this for the file to write to. */
 struct file *shell_current_diag_file(void);
-struct file *shell_current_diag_file(void) { return g_shell_fd[2]; }
+struct file *shell_current_diag_file(void) {
+    return g_rd_diag ? g_rd_diag : g_shell_fd[2];
+}
 #endif
 
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
