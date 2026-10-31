@@ -29081,8 +29081,15 @@ static void shell_callframe_pop(void) {
     shell_callstack_sync();
 }
 
+/* bash's caller reads the three arrays: no operand is "LINE FILE",
+ * BASH_LINENO[0] and BASH_SOURCE[1] -- "NULL" for one not there, so a
+ * script's top says "0 NULL" -- and N is "LINE NAME FILE", BASH_LINENO[N],
+ * FUNCNAME[N+1] and BASH_SOURCE[N+1], status 1 when they are not there.
+ * tsh said "LINE main" and "LINE NAME main", NAME the frame's own
+ * (bash's dbg-support.tests; logs/b42 db1 c1 c3, db2 c5). */
 static void cmd_caller(int argc, char **argv) {
-    if (g_callframe_n <= 0) { shell_set_status(1); return; }
+    int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
+    if (depth <= 0 && !g_main_source) { shell_set_status(1); return; }
     int want = 0;
     if (argc > 1) {
         for (const char *q = argv[1]; *q; q++) {
@@ -29095,13 +29102,30 @@ static void cmd_caller(int argc, char **argv) {
             return;
         }
     }
-    int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
-    if (want >= depth) { shell_set_status(1); return; }
+    if (argc <= 1) {
+        const char *file = depth >= 2 ? g_callframes[depth - 2].src
+                         : depth == 1 ? g_main_source : 0;
+        unsigned long line = depth > 0 ? g_callframes[depth - 1].line : 0;
+        shell_printf("%lu %s\n", line, file ? file : "NULL");
+        shell_set_status(0);
+        return;
+    }
+    /* FUNCNAME[N+1] and BASH_SOURCE[N+1]: a frame below N's, or the
+     * script's own */
+    if (want + 1 > depth || (want + 1 == depth && !g_main_source)) {
+        shell_set_status(1);
+        return;
+    }
     const struct callframe *f = &g_callframes[depth - 1 - want];
-    if (argc > 1)
-        shell_printf("%lu %s main\n", f->line, f->name ? f->name : "main");
-    else
-        shell_printf("%lu main\n", f->line);
+    const char *name, *file;
+    if (want + 1 < depth) {
+        name = g_callframes[depth - 2 - want].name;
+        file = g_callframes[depth - 2 - want].src;
+    } else {
+        name = "main";
+        file = g_main_source;
+    }
+    shell_printf("%lu %s %s\n", f->line, name ? name : "", file ? file : "");
     shell_set_status(0);
 }
 
