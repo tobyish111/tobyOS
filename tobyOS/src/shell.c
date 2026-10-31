@@ -22851,6 +22851,11 @@ static int shell_syn_absorb(int st) {
     return 2;
 }
 
+/* The file is a frame: see struct callframe. */
+static void shell_callframe_push(const char *name, unsigned long line,
+                                 const char *src, bool src_real, bool source);
+static void shell_callframe_pop(void);
+
 static void cmd_dot(int argc, char **argv) {
     /* The dispatcher pre-set $? to 0; this is what it replaced. */
     int status_in = g_shell_prev_status;
@@ -22921,6 +22926,7 @@ static void cmd_dot(int argc, char **argv) {
     g_diag_in_fn = false;
     argv[1] = resolved;
     if (argc <= 2) {
+        shell_callframe_push("source", g_shell_lineno, src_name, true, true);
         g_source_depth++;                  /* `return` is legal in here */
         g_return_pending = false;
         /* the file starts with the caller's $?, as bash's does */
@@ -22933,6 +22939,9 @@ static void cmd_dot(int argc, char **argv) {
          * status (finding 30) */
         shell_set_status(g_return_pending ? g_return_prev_status : st1);
         g_return_pending = false;
+        /* the frame goes first: the trap runs in the caller's (logs/b42
+         * db3 r4) */
+        shell_callframe_pop();
         shell_run_return_trap();       /* a sourced script finished */
         shell_set_status(st1);
         return;
@@ -22944,6 +22953,7 @@ static void cmd_dot(int argc, char **argv) {
         shell_set_status(1);
         return;
     }
+    shell_callframe_push("source", g_shell_lineno, src_name, true, true);
     g_dollar_set = false;
     g_source_depth++;                      /* `return` is legal in here */
     g_return_pending = false;
@@ -22954,6 +22964,7 @@ static void cmd_dot(int argc, char **argv) {
     g_diag_in_fn = saved_in_fn;
     shell_set_status(g_return_pending ? g_return_prev_status : st);   /* finding 30 */
     g_return_pending = false;
+    shell_callframe_pop();
     shell_run_return_trap();           /* a sourced script finished */
     /* ...and the caller's parameters come back, unless the script gave
      * them new values with `set`: `. f x y z` where f says `set -- m n o
@@ -28928,7 +28939,17 @@ static void cmd_enable(int argc, char **argv) {
  * the true answer for how these scripts run rather than a placeholder. */
 /* Growable: it kept 16 frames, so `caller` in a deeper call answered for
  * the wrong one. A frame that cannot be stored is still counted. */
-struct callframe { unsigned long line; const char *name; };
+/* A `.` or `source` is a frame too, as bash's is: FUNCNAME "source",
+ * BASH_SOURCE the file, BASH_LINENO the line of the `.` (bash's
+ * dbg-support.tests; logs/b42 db1 s1). SRC is the frame's BASH_SOURCE --
+ * the file a function was defined in, or its label (src_real false). */
+struct callframe {
+    unsigned long line;
+    const char *name;
+    const char *src;
+    bool src_real;
+    bool source;
+};
 static struct callframe *g_callframes;
 static int g_callframe_cap;
 static int g_callframe_n;
@@ -28953,6 +28974,11 @@ static const char *g_main_source;       /* the script being run, or 0 */
 static void shell_callstack_sync(void) {
     int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
     if (depth < 0) depth = 0;
+    /* ...and at a sourced file's top, frames or no: it is visible in a
+     * FUNCTION only (bash's variable_context; logs/b42 db1 s1) */
+    int nfn = 0;
+    for (int i = 0; i < depth; i++)
+        if (!g_callframes[i].source) nfn++;
     sh_array_unset_literal("FUNCNAME");
     sh_array_unset_literal("BASH_LINENO");
     sh_array_unset_literal("BASH_SOURCE");
@@ -28971,7 +28997,7 @@ static void shell_callstack_sync(void) {
                 fx = env_find("FUNCNAME", 8);
             if (fx >= 0) {
                 g_env_flags[fx] |= SHVAR_ARRAY;
-                if (depth == 0) g_env_flags[fx] |= SHVAR_NOVALUE;
+                if (nfn == 0) g_env_flags[fx] |= SHVAR_NOVALUE;
                 else g_env_flags[fx] &= ~(unsigned char)SHVAR_NOVALUE;
             }
         }
@@ -28979,24 +29005,25 @@ static void shell_callstack_sync(void) {
     char nb[24];
     for (int i = 0; i < depth; i++) {
         const struct callframe *f = &g_callframes[depth - 1 - i];
-        if (!g_funcname_gone)
+        if (!g_funcname_gone && nfn > 0)
             (void)sh_array_set("FUNCNAME", i, f->name ? f->name : "");
         ksnprintf(nb, sizeof nb, "%lu", f->line);
         (void)sh_array_set("BASH_LINENO", i, nb);
-        (void)sh_array_set("BASH_SOURCE", i, g_main_source ? g_main_source : "");
+        (void)sh_array_set("BASH_SOURCE", i, f->src ? f->src : "");
     }
     /* the script's own frame, "main" at line 0 -- none under -c, nor for
      * standard input or a terminal, where tsh put "main" and a 0 under
      * every stack (logs/b42 db3 m1-m3, db4 n1) */
     if (g_main_source) {
-        if (depth > 0 && !g_funcname_gone)
+        if (nfn > 0 && !g_funcname_gone)
             (void)sh_array_set("FUNCNAME", depth, "main");
         (void)sh_array_set("BASH_LINENO", depth, "0");
         (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
     }
 }
 
-static void shell_callframe_push(const char *name, unsigned long line) {
+static void shell_callframe_push(const char *name, unsigned long line,
+                                 const char *src, bool src_real, bool source) {
     if (g_callframe_n >= g_callframe_cap) {
         int ncap = g_callframe_cap ? g_callframe_cap * 2 : 16;
         struct callframe *nf =
@@ -29010,6 +29037,9 @@ static void shell_callframe_push(const char *name, unsigned long line) {
     }
     g_callframes[g_callframe_n].line = line;
     g_callframes[g_callframe_n].name = name;
+    g_callframes[g_callframe_n].src = src;
+    g_callframes[g_callframe_n].src_real = src_real;
+    g_callframes[g_callframe_n].source = source;
     g_callframe_n++;
     shell_callstack_sync();
 }
@@ -43791,7 +43821,8 @@ static int shell_run_function(struct shell_simple *cmd) {
         g_diag_fn_source = run_src;
         g_diag_in_fn = true;
         shell_hd_pin_text(run_body, +1);
-        shell_callframe_push(run_name, g_shell_lineno);
+        shell_callframe_push(run_name, g_shell_lineno,
+                             run_src, run_src != 0, false);
         /* THE TRAPS A FUNCTION DOES NOT INHERIT ARE TAKEN AWAY for its body
          * and put back after -- unless it set its own -- as bash's
          * execute_function does: DEBUG and RETURN, unless `set -T` or
