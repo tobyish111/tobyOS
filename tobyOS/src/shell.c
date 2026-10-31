@@ -11173,7 +11173,8 @@ static void shell_print_exported_functions(void) {
  *
  * tsh walked its table in the order the variables were made, and printed a
  * variable that has no value as `OLDPWD=""` (logs/b13 q13). */
-static void shell_print_exported_sorted(void) {
+/* KIND 'a' or 'A': only the exported arrays of that kind (490). */
+static void shell_print_exported_sorted(int kind) {
     const char **names __attribute__((cleanup(shell_kfree_ptr))) =
         (const char **)kmalloc((size_t)(g_envc + 1) * sizeof *names);
     if (!names) return;
@@ -11184,6 +11185,10 @@ static void shell_print_exported_sorted(void) {
         size_t kl = env_key_len(g_env[i]);
         if (kl == 0 || !shell_name_is_valid(g_env[i], kl)) continue;
         const char *k = words_store(&keys, g_env[i], kl);
+        if (k && kind) {
+            const struct sh_array *ar = sh_array_find(k);
+            if (!ar || (kind == 'A') != ar->assoc) continue;
+        }
         if (k && !shell_name_only_in_tempenv(k)) names[n++] = k;
     }
     for (int a = 1; a < n; a++) {
@@ -11206,7 +11211,7 @@ static void cmd_export(int argc, char **argv) {
     if (argc <= 1 || (argc == 2 && strcmp(argv[1], "-p") == 0)) {
         /* Only exported names. `export` with no arguments is defined to list
          * the exported ones; it used to list the whole variable table. */
-        shell_print_exported_sorted();
+        shell_print_exported_sorted(0);
         return;
     }
     /* OPTIONS: -p lists, -n takes the export attribute AWAY (the value
@@ -11214,12 +11219,20 @@ static void cmd_export(int argc, char **argv) {
      * called `-n` not a valid identifier (Oils 1316-1318). */
     int start = 1;
     bool unexport = false, funcs = false, list = false;
+    /* -a and -A too, as bash takes them: `export -a r='(7)'` is the
+     * exported array r=(7), `export -A s=([k]=v)` an associative one, and
+     * a bare `export -a` lists the exported indexed arrays -- tsh called
+     * them invalid options (bash's attr2.sub; logs/b42 at1 a3) -- finding
+     * 490 */
+    bool opt_a = false, opt_A = false;
     for (; start < argc && argv[start][0] == '-' && argv[start][1]; start++) {
         if (strcmp(argv[start], "--") == 0) { start++; break; }
         for (const char *q = argv[start] + 1; *q; q++) {
             if (*q == 'n') unexport = true;
             else if (*q == 'f') funcs = true;
             else if (*q == 'p') list = true;
+            else if (*q == 'a') opt_a = true;
+            else if (*q == 'A') opt_A = true;
             else {
                 kprintf("export: -%c: invalid option\n", *q);
                 kprintf_raw("export: usage: export [-fn] [name[=value] ...] or "
@@ -11229,8 +11242,8 @@ static void cmd_export(int argc, char **argv) {
             }
         }
     }
-    if (start >= argc && list) {
-        shell_print_exported_sorted();
+    if (start >= argc && (list || ((opt_a || opt_A) && !funcs))) {
+        shell_print_exported_sorted(opt_A ? 'A' : opt_a ? 'a' : 0);
         return;
     }
     if (funcs) {
@@ -11326,7 +11339,23 @@ static void cmd_export(int argc, char **argv) {
         if (argv[i][klen] == '=') {
             g_readonly_hit = false;
             shell_xt_decl_assign(argv[i], klen);
-            if (env_set_kv(argv[i]) < 0) {
+            /* -A makes the name associative first, as readonly -A does;
+             * -a or -A take a quoted list as one (489, 490) */
+            if (opt_A && !shell_readonly_key(argv[i], nlen)) {
+                SH_SB(anm);
+                if (sb_putmem(&anm, argv[i], nlen) == 0 &&
+                    !sh_array_is_assoc(anm.p)) {
+                    sh_array_unset(anm.p);
+                    (void)sh_array_make_assoc(anm.p);
+                }
+            }
+            bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
+            g_decl_paren_array = opt_a || opt_A;
+            if (qlist) g_readonly_label = argv[0];
+            int esrc = env_set_kv(argv[i]);
+            g_decl_paren_array = false;
+            g_readonly_label = 0;
+            if (esrc < 0) {
                 /* a readonly name has said so in bash's words already --
                  * "PATH: readonly variable" -- and that is all bash says */
                 if (!g_readonly_hit)
@@ -11367,6 +11396,16 @@ static void cmd_export(int argc, char **argv) {
             }
         }
         int idx = env_find(argv[i], nlen);
+        /* an array the assignment made has no entry yet: the attribute
+         * needs one, as `export NAME` gives it below (490) */
+        if (idx < 0 && argv[i][klen] == '=') {
+            SH_SB(enm);
+            if (sb_putmem(&enm, argv[i], nlen) == 0 && sh_array_find(enm.p) &&
+                env_set_attr_holder(enm.p) == 0) {
+                idx = env_find(enm.p, nlen);
+                if (idx >= 0) g_env_flags[idx] |= SHVAR_ARRAY;
+            }
+        }
         if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
     }
 }
