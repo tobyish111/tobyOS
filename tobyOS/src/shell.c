@@ -52186,6 +52186,10 @@ static void execute_line_text(const char *src) {
     int psub = shell_procsub_mark();
     if (line_src == abuf.p && !shell_text_has_newline(src) &&
         shell_text_has_newline(abuf.p)) {
+        /* none of an alias's lines is a -c string's last command, the
+         * one that may exec: the first took the shell's place and the
+         * others never ran (finding 473) */
+        g_nofork_pending = false;
         char *p = abuf.p;
         while (p && *p) {
             char *nl = shell_unquoted_newline(p);
