@@ -3958,6 +3958,29 @@ static int sh_array_literal_fill(const char *dst, const char *name,
     return sh_array_literal_fill_ex(dst, name, p, append, &next, false, q);
 }
 
+/* Does the text V, as written, have an unquoted `~` at its start or after
+ * an unquoted `:` -- where an assignment's value tilde-expands? (495) */
+static bool sh_raw_tilde_start(const char *v) {
+    bool seg = true;
+    for (const char *p = v; *p; p++) {
+        if (seg && *p == '~') return true;
+        seg = false;
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'') {
+            while (p[1] && p[1] != '\'') p++;
+            if (p[1]) p++;
+            continue;
+        }
+        if (*p == '"') {
+            while (p[1] && p[1] != '"') p += (p[1] == '\\' && p[2]) ? 2 : 1;
+            if (p[1]) p++;
+            continue;
+        }
+        if (*p == ':') seg = true;
+    }
+    return false;
+}
+
 /* `plain_only`: every word is an ordinary element, even one that looks
  * like `[k]=v` -- the words a brace expansion made of one. `*nextp` is the
  * index the next ordinary element takes, and comes back advanced. */
@@ -4161,7 +4184,12 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                  * after each `:` -- shell_word_tilde owns that rule. Not in
                  * an associative literal: bash 5.2 leaves `([h]=~)` alone
                  * there (Oils 0237). */
-                if (!sh_array_is_assoc(dst) && shell_word_tilde(&vx) < 0)
+                /* ...an UNQUOTED `~` only, as written: `[1]="~"` and `[1]='~'`
+                 * stay `~` -- tsh's pass ran on the expanded text, the
+                 * quotes gone (bash's unicode1.sub; logs/b42 in1 i2) --
+                 * finding 495 */
+                if (!sh_array_is_assoc(dst) && sh_raw_tilde_start(v) &&
+                    shell_word_tilde(&vx) < 0)
                     return -1;
                 /* THE EXPANDER'S ESCAPE MARKS COME OFF a key and a value, as
                  * an assignment's do: `foo=([bar\"bie]=doll)` stored the key
