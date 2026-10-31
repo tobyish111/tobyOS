@@ -33145,7 +33145,9 @@ static void shell_bad_subst(bool fatal) {
         kprintf(SH_PFX_SHELL "bad substitution\n");
     }
     shell_set_status(1);
-    if (fatal) {
+    /* a POSIX-mode shell that is not interactive exits on one: 127 under
+     * -c, 1 from a script, a subshell alone (logs/b42 px5) -- finding 480 */
+    if (fatal || (g_opt_posix && !g_interactive)) {
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = g_interactive ? SHELL_FLOW_DISCARD : SHELL_FLOW_EXIT;
             g_shell_flow_status = shell_fatal_status();
