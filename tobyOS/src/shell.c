@@ -48037,8 +48037,25 @@ static bool shell_try_case_command(const char *src) {
         if (!hit) {
             bool saved_nocase = g_glob_nocase;
             g_glob_nocase = g_shopt_misc[3];            /* nocasematch */
+            bool soft0 = g_bad_subst_soft;
             hit = shell_case_pattern_match(pats, word);
             g_glob_nocase = saved_nocase;
+            /* AN EXPANSION ERROR IN A PATTERN ends the case, status 1, and
+             * the rest of the line goes with it: `case 1 in $((xx++)) )`
+             * of a readonly xx runs no clause (bash's case.tests; logs/b42
+             * cs1 k6) -- tsh went on to `*)` */
+            if (!soft0 && g_bad_subst_soft) {
+                kfree(pats);
+                kfree(body_text);
+                g_bad_subst_soft = false;
+                shell_set_status(1);
+                if (g_shell_flow == SHELL_FLOW_NONE) {
+                    g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT
+                                                 : SHELL_FLOW_DISCARD;
+                    g_shell_flow_status = 1;
+                }
+                return true;
+            }
         }
         kfree(pats);
         fall = false;
