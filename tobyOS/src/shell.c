@@ -10861,6 +10861,7 @@ static void shell_shopt_print_reinput(const struct shell_shopt *o) {
 
 static bool shell_opt_state_by_name(const char *name, bool *out);
 static void shell_print_options(bool reinput);
+static void shell_print_options_only(bool reinput, int only);
 static bool shell_set_opt_by_name(const char *name, bool on);
 
 /* `shopt [-suqp] [NAME...]`
@@ -11026,7 +11027,8 @@ static void cmd_shopt_in(int argc, char **argv) {
      * state of. `-p` was ignored too -- see the reinput printer above. */
     if (setopts) {
         if (i >= argc) {                   /* no names: the whole listing */
-            if (!quiet) shell_print_options(print);
+            /* ...or with -s or -u, the options on or off alone */
+            if (!quiet) shell_print_options_only(print, set ? 1 : unset ? 0 : -1);
             shell_set_status(0);
             return;
         }
@@ -13194,9 +13196,17 @@ static bool shell_set_opt(char c, bool on) {
 
 /* `set -o` (table) and `set +o` (reinput form), bash's lines exactly --
  * "%-15s\ton" and "set -o name" -- and now bash's whole table. */
+static void shell_print_options_only(bool reinput, int only);
 static void shell_print_options(bool reinput) {
+    shell_print_options_only(reinput, -1);
+}
+
+/* ...those that are on (ONLY 1) or off (0) alone, or all (-1): `shopt -s
+ * -o` and `shopt -u -o` with no names (bash's shopt.tests; logs/b42 sho1) */
+static void shell_print_options_only(bool reinput, int only) {
     for (size_t i = 0; i < SHELL_NOPTDEFS; i++) {
         bool on = *g_optdefs[i].var;
+        if (only >= 0 && on != (only == 1)) continue;
         if (reinput)
             shell_printf("set %co %s\n", on ? '-' : '+', g_optdefs[i].name);
         else
