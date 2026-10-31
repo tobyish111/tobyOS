@@ -886,6 +886,9 @@ static unsigned long  g_fndef_body_ln;
 static bool g_fn_importing;
 static bool g_c_string_run;
 static const char *shell_def_source(const char **label);
+static void sh_bargv_init(bool any_depth);
+static bool sh_bargv_push(int n, char *const *args);
+static void sh_bargv_pop(void);
 
 static void shell_fndef_drop_map(void) {
     kfree(g_fndef_lm_off);
@@ -11269,6 +11272,9 @@ static void cmd_shopt_in(int argc, char **argv) {
              * (bash's shopt_set_debug_mode; logs/b42 db5 o1) */
             if (o->slot == &g_shopt_misc[10]) {
                 g_opt_functrace = g_opt_errtrace = set;
+                /* ...and on, takes the script's frame for BASH_ARGV: the
+                 * arguments there are now (logs/b42 db2 e1 e2) */
+                if (set) sh_bargv_init(true);
             }
         } else {
             if (!quiet) {
@@ -22891,9 +22897,13 @@ static void shell_callframe_pop(void);
 
 /* What else a `.` sets up for its file and puts back after. */
 struct shell_dot_frame {
+    bool argv_pushed;       /* BASH_ARGV has its frame */
     char *debug;            /* the DEBUG trap set aside, or 0 */
 };
-static void shell_dot_enter(struct shell_dot_frame *df) {
+static void shell_dot_enter(struct shell_dot_frame *df, int nargs, char **args) {
+    /* under extdebug the file is a frame of BASH_ARGV: its arguments, or
+     * its name as given when it has none (logs/b42 db1 a2) */
+    df->argv_pushed = g_shopt_misc[10] && sh_bargv_push(nargs, args);
     /* WITHOUT functrace IT RUNS WITHOUT THE DEBUG TRAP, which comes back
      * after it -- and after its RETURN trap -- unless the file set one of
      * its own, as bash's source does; tsh ran the trap in the file
@@ -22983,11 +22993,12 @@ static void cmd_dot(int argc, char **argv) {
     bool saved_in_fn = g_diag_in_fn;
     g_diag_source = src_name;
     g_diag_in_fn = false;
+    char *dot_arg = argv[1];
     argv[1] = resolved;
     struct shell_dot_frame df;
     if (argc <= 2) {
         shell_callframe_push("source", g_shell_lineno, src_name, true, true);
-        shell_dot_enter(&df);
+        shell_dot_enter(&df, 1, &dot_arg);
         g_source_depth++;                  /* `return` is legal in here */
         g_return_pending = false;
         /* the file starts with the caller's $?, as bash's does */
@@ -23000,6 +23011,7 @@ static void cmd_dot(int argc, char **argv) {
          * status (finding 30) */
         shell_set_status(g_return_pending ? g_return_prev_status : st1);
         g_return_pending = false;
+        if (df.argv_pushed) sh_bargv_pop();
         /* the frame goes first: the trap runs in the caller's (logs/b42
          * db3 r4) */
         shell_callframe_pop();
@@ -23016,7 +23028,7 @@ static void cmd_dot(int argc, char **argv) {
         return;
     }
     shell_callframe_push("source", g_shell_lineno, src_name, true, true);
-    shell_dot_enter(&df);
+    shell_dot_enter(&df, argc - 2, &argv[2]);
     g_dollar_set = false;
     g_source_depth++;                      /* `return` is legal in here */
     g_return_pending = false;
@@ -23027,6 +23039,7 @@ static void cmd_dot(int argc, char **argv) {
     g_diag_in_fn = saved_in_fn;
     shell_set_status(g_return_pending ? g_return_prev_status : st);   /* finding 30 */
     g_return_pending = false;
+    if (df.argv_pushed) sh_bargv_pop();
     shell_callframe_pop();
     shell_run_return_trap();           /* a sourced script finished */
     shell_dot_debug_back(&df);
@@ -26429,8 +26442,8 @@ static void sh_array_clear_elems(struct sh_array *a) {
  * tsh held ([0]="0") and () from the start. Once is "BASH_ARGC has an
  * element": nothing else pushes one without extdebug, and a subshell
  * running in place gets its arrays back with them. */
-static void sh_dynarr_argv(void) {
-    if (g_fn_depth != 0) return;
+static void sh_bargv_init(bool any_depth) {
+    if (g_fn_depth != 0 && !any_depth) return;
     struct sh_array *ac = sh_array_find_literal("BASH_ARGC");
     struct sh_array *av = sh_array_find_literal("BASH_ARGV");
     if (!ac || !av || ac->dyn != SH_DYN_ARGV || av->dyn != SH_DYN_ARGV || ac->n > 0)
@@ -26441,6 +26454,76 @@ static void sh_dynarr_argv(void) {
     sh_array_clear_elems(av);
     for (int i = 0; i < g_positional_count; i++)
         sh_array_put_idx(av, i, g_positional[g_positional_count - 1 - i]);
+}
+static void sh_dynarr_argv(void) { sh_bargv_init(false); }
+
+/* A's elements from DROP on, after NADD new ones -- ADD's, last first --
+ * numbered from 0. False when there is no room. */
+static bool sh_array_refront(struct sh_array *a, int drop, int nadd,
+                             char *const *add) {
+    sh_array_touch(a);
+    if (drop > a->n) drop = a->n;
+    int keep = a->n - drop;
+    struct sh_arr_elem *ne =
+        (struct sh_arr_elem *)kmalloc((size_t)(keep + nadd + 1) * sizeof *ne);
+    if (!ne) return false;
+    for (int i = 0; i < nadd; i++) {
+        const char *v = add[nadd - 1 - i];
+        ne[i].idx = i;
+        ne[i].key = 0;
+        ne[i].val = shell_strdup(v ? v : "");
+        if (!ne[i].val) {
+            for (int j = 0; j < i; j++) kfree(ne[j].val);
+            kfree(ne);
+            return false;
+        }
+    }
+    for (int i = 0; i < drop; i++) {
+        kfree(a->e[i].key);
+        kfree(a->e[i].val);
+    }
+    for (int i = 0; i < keep; i++) {
+        ne[nadd + i] = a->e[drop + i];
+        ne[nadd + i].idx = nadd + i;
+    }
+    kfree(a->e);
+    a->e = ne;
+    a->n = keep + nadd;
+    a->cap = keep + nadd + 1;
+    return true;
+}
+
+/* UNDER extdebug A FUNCTION OR A SOURCED FILE IS A FRAME OF THEM TOO: its
+ * count goes on the front of BASH_ARGC and its arguments, last first, on
+ * the front of BASH_ARGV, and off again at its end (bash's push_args):
+ *
+ *     shopt -s extdebug; g() { echo ${BASH_ARGV[*]}; }; f() { g 3 z; }; f 1 x
+ *         bash: z 3 x 1
+ *
+ * tsh pushed nothing, so they held the script's frame or were empty
+ * (bash's dbg-support3.sub; logs/b42 db1 a1 a2). */
+static bool sh_bargv_push(int n, char *const *args) {
+    struct sh_array *ac = sh_array_find_literal("BASH_ARGC");
+    struct sh_array *av = sh_array_find_literal("BASH_ARGV");
+    if (!ac || !av || ac->assoc || av->assoc) return false;
+    char nb[24];
+    ksnprintf(nb, sizeof nb, "%d", n);
+    char *one[1] = { nb };
+    if (!sh_array_refront(av, 0, n, args)) return false;
+    if (!sh_array_refront(ac, 0, 1, one)) {
+        (void)sh_array_refront(av, n, 0, 0);
+        return false;
+    }
+    return true;
+}
+static void sh_bargv_pop(void) {
+    struct sh_array *ac = sh_array_find_literal("BASH_ARGC");
+    struct sh_array *av = sh_array_find_literal("BASH_ARGV");
+    if (!ac || !av || ac->assoc || av->assoc || ac->n == 0) return;
+    long long n = 0;
+    if (!sh_legal_number(ac->e[0].val, &n) || n < 0) n = 0;
+    (void)sh_array_refront(ac, 1, 0, 0);
+    (void)sh_array_refront(av, n > av->n ? av->n : (int)n, 0, 0);
 }
 
 static void sh_dynarr_rebuild(struct sh_array *a) {
@@ -43936,6 +44019,10 @@ static int shell_run_function(struct shell_simple *cmd) {
         shell_hd_pin_text(run_body, +1);
         shell_callframe_push(run_name, g_shell_lineno,
                              run_src ? run_src : fn->src_label, run_src != 0, false);
+        /* under extdebug the arguments go on BASH_ARGV, and come off at
+         * the return only if they went on (logs/b42 db1 a1, db2 e2 e3) */
+        bool argv_pushed = g_shopt_misc[10] &&
+                           sh_bargv_push(cmd->argc - 1, &cmd->argv[1]);
         /* THE TRAPS A FUNCTION DOES NOT INHERIT ARE TAKEN AWAY for its body
          * and put back after -- unless it set its own -- as bash's
          * execute_function does: DEBUG and RETURN, unless `set -T` or
@@ -44016,6 +44103,7 @@ static int shell_run_function(struct shell_simple *cmd) {
         }
         g_shell_lineno = call_line;
         g_bash_lnum = bl_save;
+        if (argv_pushed) sh_bargv_pop();
         shell_callframe_pop();
         shell_hd_pin_text(run_body, -1);
         g_diag_fn_source = saved_src;
