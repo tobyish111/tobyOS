@@ -46436,6 +46436,29 @@ static const char *shell_dbr_val(struct shell_dbr *d, int i) {
     return st;
 }
 
+/* Operand I of an arithmetic comparison (ARITH), or its value: one written
+ * NAME[SUB] is the text (( )) would evaluate, its subscript expanded once
+ * and quoted (shell_arith_expand) -- a key holding `]` or `$( )` is the
+ * key. tsh expanded the word and the evaluator read the key again: `]`
+ * ended it and the `$( )` ran (bash's quotearray1.sub; logs/b42 qa1 u1)
+ * -- finding 483. */
+static const char *shell_dbr_arith_text(struct shell_dbr *d, int i,
+                                        bool arith, struct shell_sb *x) {
+    const char *r = (i >= 0 && i < d->n) ? d->raw[i] : "";
+    const char *q = r;
+    if (arith && shell_var_start(*q)) {
+        while (shell_var_char(*q)) q++;
+        if (*q == '[') {
+            if (shell_arith_expand(r, x) != 0) {
+                d->xerr = true;
+                return "";
+            }
+            return x->p ? x->p : "";
+        }
+    }
+    return shell_dbr_val(d, i);
+}
+
 /* Operand I as the trace shows it: a pattern with its quoted characters
  * backslashed, anything else its value. */
 static const char *shell_dbr_disp(struct shell_dbr *d, int i) {
@@ -46666,8 +46689,13 @@ static int shell_dbr_primary(struct shell_dbr *d) {
     int rhs_index = d->pos + 1;
     d->pos += 2;
     if (d->skip) return 0;
-    const char *a = shell_dbr_val(d, ai);
-    const char *b = shell_dbr_val(d, rhs_index);
+    bool arith = strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
+                 strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
+                 strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0;
+    SH_SB(ax);
+    SH_SB(bx);
+    const char *a = shell_dbr_arith_text(d, ai, arith, &ax);
+    const char *b = shell_dbr_arith_text(d, rhs_index, arith, &bx);
     if (d->xerr) return 0;
     if (g_opt_xtrace)
         shell_xt_cond(inv, op, a, patrhs ? shell_dbr_disp(d, rhs_index) : b, true);
@@ -46707,9 +46735,7 @@ static int shell_dbr_primary(struct shell_dbr *d) {
      * says so -- "[[: ..." -- and the test is false. tsh compared them as
      * plain integers and called anything else a syntax error, which ended
      * the script. `[` keeps the integer rule (test_binary). */
-    if (strcmp(op, "-eq") == 0 || strcmp(op, "-ne") == 0 ||
-        strcmp(op, "-lt") == 0 || strcmp(op, "-le") == 0 ||
-        strcmp(op, "-gt") == 0 || strcmp(op, "-ge") == 0) {
+    if (arith) {
         long va = 0, vb = 0;
         if (shell_arith_eval(a, "[[", &va) != SARITH_OK) return 0;
         if (shell_arith_eval(b, "[[", &vb) != SARITH_OK) return 0;
