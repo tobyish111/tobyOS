@@ -29748,8 +29748,15 @@ static void shell_capture_body(const char *cmd, bool forked) {
      * what that option means: the substitution's subshell runs WITH errexit
      * and stops at its first failure. The parent still does not inherit the
      * failure -- the flow flag is absorbed below. */
-    bool inherit_ee = g_shopt_inherit_errexit;
-    if (!inherit_ee) g_errexit_off++;
+    /* (and posix mode inherits it: `set -o posix; set -e; z=$(false; echo
+     * x)` ends the shell, bash's set-e1.sub) */
+    bool inherit_ee = g_shopt_inherit_errexit || g_opt_posix;
+    /* ...switched off as bash does it, as the OPTION, so a `set -e` inside
+     * the substitution turns it on again: `x=$(set -e; false; echo bad)`
+     * stops at the false (bash's set-e.tests; logs/b42 px2). A counter
+     * kept it off whatever the body said. */
+    bool ee_saved = g_opt_errexit;
+    if (!inherit_ee) g_opt_errexit = false;
     g_comsub_level++;
     /* A SUBSTITUTION CONTAINS A COMMAND LIST, NOT A LINE.
      *
@@ -29830,7 +29837,7 @@ static void shell_capture_body(const char *cmd, bool forked) {
             }
         }
     }
-    if (!inherit_ee) g_errexit_off--;
+    if (!inherit_ee) g_opt_errexit = ee_saved;
     g_comsub_level--;
     if (!sub_frame) shell_alias_restore(&saved_aliases);
 
