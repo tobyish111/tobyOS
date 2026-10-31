@@ -13347,14 +13347,12 @@ static void shell_set_quote(const char *v) {
      * forces `$'...'`, and everything else stays with the single quotes
      * below. `zz=$'one\ntwo'` is what bash's `set` prints. */
     if (shell_q_needs_ansi(p)) { (void)shell_ansi_render(p, true); return; }
-    bool need = false;
-    for (const char *q = p; *q && !need; q++)
-        if (!((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z') ||
-              (*q >= '0' && *q <= '9') || *q == '_' || *q == '.' ||
-              *q == '/' || *q == '-' || *q == ':' || *q == '+' ||
-              *q == ',' || *q == '=' || *q == '@' || *q == '%'))
-            need = true;
-    if (!need) { shell_printf("%s", p); return; }
+    /* quoted only where bash's sh_contains_shell_metas says, so `ab#cd`
+     * and `a~` stay bare -- a `#` or `~` means something only where a word
+     * starts -- and a lone ' is \' (bash's posix2.tests; logs/b42 px1 p1).
+     * tsh quoted anything outside a set of plain characters. */
+    if (!sh_contains_shell_metas(p)) { shell_printf("%s", p); return; }
+    if (p[0] == '\'' && !p[1]) { shell_printf("\\'"); return; }
     shell_printf("'");
     for (; *p; p++) {
         if (*p == '\'') shell_printf("'\\\''");   /* close, escaped quote, reopen */
