@@ -40216,8 +40216,15 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 const char *dt = tok[*io].text;
                 size_t dl = strlen(dt);
                 /* `M-` moves only as WRITTEN: bash's lexer makes the move
-                 * operator, and `>&$z` with z=7- is the file "7-" (p110) */
-                bool mv = !tok[*io].expanded && dl >= 2 && dt[dl - 1] == '-';
+                 * operator, and `>&$z` with z=7- is the file "7-" (p110) --
+                 * but a `-` written after an expansion is the operator's:
+                 * `{stdin}<&$fd0-` moves $fd0 (bash's vredir5.sub; logs/b42
+                 * rd2), where tsh called it ambiguous */
+                const char *drw = tok[*io].raw;
+                size_t drl = drw ? strlen(drw) : 0;
+                bool raw_dash = drl >= 2 && drw[drl - 1] == '-' && drw[drl - 2] != '\\';
+                bool mv = (!tok[*io].expanded || raw_dash) && dl >= 2 &&
+                          dt[dl - 1] == '-';
                 for (size_t q = 0; mv && q + 1 < dl; q++)
                     if (dt[q] < '0' || dt[q] > '9') mv = false;
                 if (strcmp(dt, "-") == 0) {
