@@ -21666,6 +21666,18 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
          * be mistaken for the end of a construct. */
         {
             int inc = shell_line_incomplete(line);
+            /* THE SCRIPT ENDING IN A BACKSLASH: the continuation runs into
+             * the end, and the backslash goes -- `echo AAA\` as the script's
+             * last bytes prints AAA (bash's parser1.sub; logs/b42 prs1). In
+             * a string -- eval, -c, a substitution, a sourced file, which
+             * bash reads whole -- it is a literal. */
+            if (inc == 2 && !*p && hist_reader && !syn_string && !comsub_lines) {
+                size_t ll = strlen(line);
+                size_t bs = 0;
+                while (bs < ll && line[ll - 1 - bs] == '\\') bs++;
+                if (bs & 1u) line[ll - 1] = '\0';
+                inc = 0;
+            }
             if (inc) {
                 size_t llen = strlen(line);
                 if (!shell_accum_room(&accum, &accum_cap, llen + 1)) {
