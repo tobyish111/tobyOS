@@ -885,6 +885,7 @@ static unsigned long  g_fndef_body_ln;
  * shell_import_env_functions) */
 static bool g_fn_importing;
 static bool g_c_string_run;
+static const char *shell_def_source(const char **label);
 
 static void shell_fndef_drop_map(void) {
     kfree(g_fndef_lm_off);
@@ -6381,9 +6382,16 @@ static int shell_function_set(const char *name, const char *body) {
     g_functions[idx].whole = whole;
     if (fresh) g_functions[idx].seq = ++g_fn_seq;
     if (g_functions[idx].src) kfree(g_functions[idx].src);
-    g_functions[idx].src = g_diag_source ? shell_strdup(g_diag_source) : 0;
-    g_functions[idx].src_label =
-        (g_fn_importing || g_c_string_run) ? "environment" : "main";
+    {
+        /* its file is BASH_SOURCE[0] where it is defined: inside a running
+         * function that function's -- `mk() { made() { :; }; }` from a
+         * sourced file makes `made` the sourced file's (logs/b42 db3 v2) */
+        const char *dlabel = 0;
+        const char *dfile = shell_def_source(&dlabel);
+        g_functions[idx].src = dfile ? shell_strdup(dfile) : 0;
+        g_functions[idx].src_label = dlabel ? dlabel
+            : (g_fn_importing || g_c_string_run) ? "environment" : "main";
+    }
 
     /* ...and the line map the definer captured (see shell_fndef_capture_map),
      * which belongs to this body and no other. */
@@ -29031,6 +29039,20 @@ static void shell_callstack_sync(void) {
         (void)sh_array_set("BASH_LINENO", depth, "0");
         (void)sh_array_set("BASH_SOURCE", depth, g_main_source);
     }
+}
+
+/* BASH_SOURCE[0] for a definition: the innermost frame's -- its file, or
+ * its label in *LABEL -- else the file being read, 0 under -c. */
+static const char *shell_def_source(const char **label) {
+    *label = 0;
+    int depth = g_callframe_n < g_callframe_cap ? g_callframe_n : g_callframe_cap;
+    if (depth > 0) {
+        const struct callframe *f = &g_callframes[depth - 1];
+        if (f->src_real) return f->src;
+        *label = f->src;
+        return 0;
+    }
+    return g_diag_source;
 }
 
 static void shell_callframe_push(const char *name, unsigned long line,
