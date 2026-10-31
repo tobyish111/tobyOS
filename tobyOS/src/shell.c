@@ -775,10 +775,16 @@ static bool shell_accum_room(char **acc, size_t *cap, size_t need) {
  * translates a pointer through every layer that contains it, innermost
  * first, until it lands in the mapped buffer. Pushed and popped around the
  * execute call, so a layer never outlives its buffer. */
-#define SHELL_LMAP_LAYERS 24
-static struct { const char *copy; size_t len; const char *orig; }
-    g_lmap_layer[SHELL_LMAP_LAYERS];
-static int g_lmap_layers;
+/* NO FIXED DEPTH: the stack held 24 layers, and a function 30 calls deep
+ * had its body's layers dropped, so a command in it reported the body's
+ * first line -- FUNCNEST's "maximum function nesting level exceeded" at
+ * depth 100 named line 19 for bash's 23 (bash's func4.sub; logs/b42 fn1,
+ * fn3..fn100) -- finding 506. A layer that could not be noted (no
+ * memory, no text) is an empty one, so the stack stays balanced and no
+ * stale entry is read. */
+struct sh_lmap_layer { const char *copy; size_t len; const char *orig; };
+static struct sh_lmap_layer *g_lmap_layer;
+static int g_lmap_layers, g_lmap_layer_cap;
 
 static void shell_lmap_push_copy(const char *copy, const char *orig) {
     /* The copier drops leading blanks and separators; the original still
@@ -787,14 +793,24 @@ static void shell_lmap_push_copy(const char *copy, const char *orig) {
      * early. */
     while (copy && (*copy == ' ' || *copy == '\t' || *copy == ';' || *copy == '\n')) copy++;
     while (orig && (*orig == ' ' || *orig == '\t' || *orig == ';' || *orig == '\n')) orig++;
-    if (!copy || !orig || g_lmap_layers >= SHELL_LMAP_LAYERS) {
-        g_lmap_layers++;               /* keep push/pop balanced */
-        return;
+    if (g_lmap_layers >= g_lmap_layer_cap) {
+        int ncap = g_lmap_layer_cap ? g_lmap_layer_cap * 2 : 32;
+        struct sh_lmap_layer *nl =
+            (struct sh_lmap_layer *)kmalloc((size_t)ncap * sizeof *nl);
+        if (!nl) {
+            g_lmap_layers++;           /* keep push/pop balanced */
+            return;
+        }
+        if (g_lmap_layer_cap)
+            memcpy(nl, g_lmap_layer, (size_t)g_lmap_layer_cap * sizeof *nl);
+        if (g_lmap_layer) kfree(g_lmap_layer);
+        g_lmap_layer = nl;
+        g_lmap_layer_cap = ncap;
     }
-    g_lmap_layer[g_lmap_layers].copy = copy;
-    g_lmap_layer[g_lmap_layers].len  = strlen(copy);
-    g_lmap_layer[g_lmap_layers].orig = orig;
-    g_lmap_layers++;
+    struct sh_lmap_layer *l = &g_lmap_layer[g_lmap_layers++];
+    l->copy = (copy && orig) ? copy : 0;
+    l->len  = (copy && orig) ? strlen(copy) : 0;
+    l->orig = (copy && orig) ? orig : 0;
 }
 
 static void shell_lmap_pop_copy(void) {
@@ -802,13 +818,13 @@ static void shell_lmap_pop_copy(void) {
 }
 
 static const char *shell_lmap_translate(const char *p) {
-    for (int hops = 0; p && hops < SHELL_LMAP_LAYERS; hops++) {
+    int top = g_lmap_layers < g_lmap_layer_cap ? g_lmap_layers
+                                               : g_lmap_layer_cap;
+    for (int hops = 0; p && hops <= top; hops++) {
         bool moved = false;
-        int top = g_lmap_layers < SHELL_LMAP_LAYERS ? g_lmap_layers
-                                                    : SHELL_LMAP_LAYERS;
         for (int i = top - 1; i >= 0; i--) {
             const char *c = g_lmap_layer[i].copy;
-            if (p >= c && p <= c + g_lmap_layer[i].len) {
+            if (c && p >= c && p <= c + g_lmap_layer[i].len) {
                 p = g_lmap_layer[i].orig + (p - c);
                 moved = true;
                 break;
