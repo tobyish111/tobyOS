@@ -22820,7 +22820,7 @@ static int shell_find_dot_script(const char *arg, char *out, size_t cap) {
     }
     if (shell_canonicalize_path(arg, out, cap) >= 0) {
         struct vfs_stat st;
-        if (vfs_stat(out, &st) == VFS_OK) return 0;
+        if (vfs_stat(out, &st) == VFS_OK) return 1;     /* see cmd_dot */
     }
     kprintf("%s: %s\n", arg, shell_errno_text(VFS_ERR_NOENT));
     shell_set_status(1);
@@ -22937,8 +22937,11 @@ static void cmd_dot(int argc, char **argv) {
      * slash, else where the PATH search found it. */
     bool slash = false;
     for (const char *c = argv[1]; *c && !slash; c++) slash = (*c == '/');
+    /* ...and one the working directory gave, by the name it was given:
+     * bash's "x.sub: line 1:" and BASH_SOURCE "x.sub" for `. x.sub`, where
+     * tsh said the whole path (logs/b42 db2 p1, db4 n3) */
     char *src_name __attribute__((cleanup(shell_kfree_ptr))) =
-        shell_strdup(slash ? argv[1] : resolved);
+        shell_strdup(slash || fdrc == 1 ? argv[1] : resolved);
     const char *saved_src = g_diag_source;
     bool saved_in_fn = g_diag_in_fn;
     g_diag_source = src_name;
