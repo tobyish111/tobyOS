@@ -49349,11 +49349,21 @@ static bool shell_try_function_definition(const char *src) {
         if (*q == ')') {
             /* Wrap the subshell text in a group so the stored body is a
              * command the normal executor already understands. */
+            /* ...WITH ITS REDIRECTIONS: `f() ( echo c >&2 ) 2>/dev/null`
+             * sends c nowhere, and `type f` shows `( ... ) 2> /dev/null`
+             * -- tsh dropped what followed the `)` (bash's func2.sub;
+             * logs/b42 mx1 m4) -- finding 504 */
+            const char *rd = shell_skip_blanks(q + 1);
+            const char *rd0 = rd;
+            while (*rd0 >= '0' && *rd0 <= '9') rd0++;
+            bool redir = *rd0 == '<' || *rd0 == '>' ||
+                         (*rd0 == '&' && rd0[1] == '>');
             SH_SB(body);
             SH_SB(fnameb);
             if (sb_puts(&body, "( ") < 0 ||
                 sb_putmem(&body, s + 1, (size_t)(q - (s + 1))) < 0 ||
                 sb_puts(&body, " )") < 0 ||
+                (redir && (sb_putc(&body, ' ') < 0 || sb_puts(&body, rd) < 0)) ||
                 sb_putmem(&fnameb, name_start, name_len) < 0) {
                 shell_set_status(2);
                 return true;
