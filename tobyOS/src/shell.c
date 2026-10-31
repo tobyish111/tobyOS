@@ -49722,9 +49722,22 @@ static const char *shell_find_pipe_at(const char *s) {
                 shell_starts_with_word(p, "while") ||
                 shell_starts_with_word(p, "until") ||
                 shell_starts_with_word(p, "case")) { compound++; continue; }
+            if (shell_starts_with_word(p, "esac")) {
+                /* ...only one that closes: not the case's WORD (`case esac
+                 * in`) nor a pattern behind `|` or `(` -- `case esac in
+                 * foo|esac) ;;` cut at that `|` into a pipeline (bash's
+                 * posix2.tests; logs/b42 px1 p5) */
+                const char *b = p;
+                while (b > start && (b[-1] == ' ' || b[-1] == '\t')) b--;
+                bool pattern = b > start && (b[-1] == '|' || b[-1] == '(');
+                bool subject = b - start >= 4 &&
+                               strncmp(b - 4, "case", 4) == 0 &&
+                               shell_word_boundary_before(start, b - 4);
+                if (!pattern && !subject && compound > 0) compound--;
+                continue;
+            }
             if (shell_starts_with_word(p, "fi")   ||
-                shell_starts_with_word(p, "done") ||
-                shell_starts_with_word(p, "esac")) {
+                shell_starts_with_word(p, "done")) {
                 if (compound > 0) compound--;
                 continue;
             }
