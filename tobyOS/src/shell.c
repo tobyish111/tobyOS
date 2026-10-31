@@ -27897,17 +27897,29 @@ struct shell_fc_view { bool own; int newest; };
  * that entry; -N, fc's own number less N; 0, the newest entry before fc's
  * line; -0, fc's line itself, in a listing only (bash's history5.sub;
  * logs/b42 fc1 f2, fc2 g5 g6) -- tsh took fc's line out of the list and
- * found neither -- finding 546 */
+ * found neither -- finding 546. A NUMBER OUTSIDE THE LIST IS MOVED INTO
+ * IT, as bash's: -N before the oldest is the oldest; N before the oldest
+ * or past the newest is the oldest for a range's FIRST, else the newest --
+ * and so is the newest's own number. tsh said "history specification out
+ * of range" (bash's history5.sub; logs/b42 fc1 f5 f7, fc2 g1-g4, fc7) --
+ * finding 547 */
 static int shell_fc_resolve(const char *spec, const struct shell_fc_view *v,
-                            bool listing) {
+                            bool listing, bool first) {
     bool neg = (spec[0] == '-');
     int n = 0;
     if (parse_int(neg ? spec + 1 : spec, &n) == 0) {
         if (n == 0 && neg) return listing ? g_hist_count - 1 : SH_FC_RANGE;
         if (n == 0) return v->newest >= 0 ? v->newest : SH_FC_RANGE;
         long own_idx = v->own ? g_hist_count - 1 : g_hist_count;
-        long idx = neg ? own_idx - n : (long)n - (long)g_hist_base - 1;
-        if (idx < 0 || idx > v->newest) return SH_FC_RANGE;
+        long idx;
+        if (neg) {
+            idx = own_idx - n;
+            if (idx < 0) idx = 0;
+        } else {
+            idx = (long)n - (long)g_hist_base - 1;
+            if (idx < 0 || idx >= v->newest) idx = first ? 0 : v->newest;
+        }
+        if (idx < 0 || idx >= g_hist_count) return SH_FC_RANGE;
         return (int)idx;
     }
     size_t len = strlen(spec);
@@ -28011,7 +28023,7 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         }
         /* ...and one that names nothing is "no command found", whatever
          * it is: -0 too */
-        int idx = first ? shell_fc_resolve(first, v, false) : newest;
+        int idx = first ? shell_fc_resolve(first, v, false, false) : newest;
         if (idx < 0) {
             shell_fc_not_found(SH_FC_NONE);
             shell_set_status(1);
@@ -28047,11 +28059,11 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     const char *last_s  = (i < argc) ? argv[i++] : 0;
     /* A listing with nothing before fc's line lists that line. */
     if (list && newest < 0) newest = g_hist_count - 1;
-    int first = first_s ? shell_fc_resolve(first_s, v, list)
+    int first = first_s ? shell_fc_resolve(first_s, v, list, true)
                         : list ? (newest >= 15 ? newest - 15 : 0) : newest;
     /* A listing's last is the newest entry before fc's line -- or, from -0,
      * that line too. */
-    int last = last_s ? shell_fc_resolve(last_s, v, list)
+    int last = last_s ? shell_fc_resolve(last_s, v, list, false)
                : !list ? first
                : first == g_hist_count - 1 ? first : newest;
     if (first < 0 || last < 0) {
