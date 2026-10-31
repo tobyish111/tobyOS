@@ -46975,6 +46975,12 @@ static bool shell_try_for_command(const char *src) {
         if (!implicit_at) {
             while (*ls && *ls != ';' && *ls != '\n') {
                 if (*ls == '\\' && ls[1]) { ls += 2; continue; }
+                if (*ls == '$' && ls[1] == '\'') {     /* takes `\'` (466) */
+                    ls += 2;
+                    while (*ls && *ls != '\'') ls += (*ls == '\\' && ls[1]) ? 2 : 1;
+                    if (*ls) ls++;
+                    continue;
+                }
                 if (*ls == '$' && (ls[1] == '(' || ls[1] == '{' || ls[1] == '[')) {
                     ls += sh_arith_dollar_span(ls);
                     continue;
