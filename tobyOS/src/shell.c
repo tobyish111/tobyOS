@@ -31292,6 +31292,11 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
                 return -1;
             continue;
         }
+        /* `$"..."` -- bash's translated string, here the string itself -- is
+         * a double-quoted span: `${x#$"no	"}` removes the quoted text, in
+         * double quotes and here-documents too (bash's heredoc6.sub;
+         * logs/b42 hd2 d1). tsh read a `$` and a quoted string. */
+        if (dq_syntax && *p == '$' && p[1] == '"') p++;
         if (dq_syntax && *p == '"') {            /* expands, quotes removed */
             p++;
             /* QUOTES INSIDE QUOTES PROTECT NOTHING MORE: in "${1+"$@"}" the
