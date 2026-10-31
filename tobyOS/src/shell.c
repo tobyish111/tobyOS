@@ -27768,10 +27768,14 @@ static void cmd_fc_in(int argc, char **argv) {
     int newest = g_hist_count - 1;
 
     if (subst) {
-        const char *old_new = 0;
+        /* EVERY PAT=REP before the command, in order, each replacing EVERY
+         * match: `fc -s a=x` on `echo aa ab ac` runs `echo xx xb xc`, and
+         * `fc -s x=4 b=8` takes both -- tsh took one pair and its first
+         * match (bash's history.tests; logs/b42 hs2) -- finding 524 */
         const char *first = 0;
+        int pairs_from = i, pairs_to = i;
         for (int a = i; a < argc; a++) {
-            if (!old_new && shell_word_has(argv[a], '=')) old_new = argv[a];
+            if (!first && shell_word_has(argv[a], '=')) pairs_to = a + 1;
             else if (!first) first = argv[a];
         }
         int idx = shell_history_resolve(first, newest);
@@ -27781,24 +27785,23 @@ static void cmd_fc_in(int argc, char **argv) {
             return;
         }
         SH_SB(bufb);                /* the whole entry: it was cut at 511 */
-        const char *src = g_hist[idx];
-        if (old_new) {
+        if (sb_puts(&bufb, g_hist[idx]) < 0) { shell_set_status(1); return; }
+        for (int a = pairs_from; a < pairs_to; a++) {
+            const char *old_new = argv[a];
             size_t klen = 0;
             while (old_new[klen] && old_new[klen] != '=') klen++;
+            if (!klen) continue;
             const char *rep = old_new + klen + 1;
-            bool done = false;
-            for (const char *q = src; *q; ) {
-                if (!done && klen && strncmp(q, old_new, klen) == 0) {
-                    if (sb_puts(&bufb, rep) < 0) { shell_set_status(1); return; }
+            SH_SB(nx);
+            for (const char *q = bufb.p ? bufb.p : ""; *q; ) {
+                if (strncmp(q, old_new, klen) == 0) {
+                    if (sb_puts(&nx, rep) < 0) { shell_set_status(1); return; }
                     q += klen;
-                    done = true;
                     continue;
                 }
-                if (sb_putc(&bufb, *q++) < 0) { shell_set_status(1); return; }
+                if (sb_putc(&nx, *q++) < 0) { shell_set_status(1); return; }
             }
-        } else if (sb_puts(&bufb, src) < 0) {
-            shell_set_status(1);
-            return;
+            if (sb_set(&bufb, nx.p ? nx.p : "") < 0) { shell_set_status(1); return; }
         }
         char *buf = bufb.p;
         kprintf_raw("%s\n", buf);          /* the command, echoed bare */
