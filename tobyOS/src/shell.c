@@ -46686,7 +46686,35 @@ static bool shell_try_for_command(const char *src) {
         do_at = s;
         do_end = s + 2;
     } else {
-        do_at = shell_find_loop_do(s, &do_end);
+        /* THE LIST IS WORDS, to its `;` or newline: `for for in for; do`
+         * took the list's `for` for a loop of its own and never found the
+         * `do` (bash's posix2syntax.sub; logs/b42 prs1) */
+        const char *ls = s;
+        if (!implicit_at) {
+            while (*ls && *ls != ';' && *ls != '\n') {
+                if (*ls == '\\' && ls[1]) { ls += 2; continue; }
+                if (*ls == '$' && (ls[1] == '(' || ls[1] == '{' || ls[1] == '[')) {
+                    ls += sh_arith_dollar_span(ls);
+                    continue;
+                }
+                if (*ls == '`' || *ls == '\'' || *ls == '"') {
+                    char qc = *ls++;
+                    while (*ls && *ls != qc) {
+                        if (qc != '\'' && *ls == '\\' && ls[1]) ls++;
+                        else if (qc == '"' && *ls == '$' &&
+                                 (ls[1] == '(' || ls[1] == '{' || ls[1] == '[')) {
+                            ls += sh_arith_dollar_span(ls);
+                            continue;
+                        }
+                        ls++;
+                    }
+                    if (*ls) ls++;
+                    continue;
+                }
+                ls++;
+            }
+        }
+        do_at = shell_find_loop_do(ls, &do_end);
     }
     (void)do_marker;
     if (!do_at) {
