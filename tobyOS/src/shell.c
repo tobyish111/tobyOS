@@ -659,6 +659,8 @@ static void shell_hist_var_written(const char *key, size_t klen);
 static void shell_history_add_raw(const char *raw, const char *raw_base,
                                   const char *from, const char *to,
                                   bool heredoc);
+static void shell_fc_echo_unit(const char *raw, const char *raw_base,
+                               const char *from, const char *to);
 static bool shell_hist_expanding(void);           /* shell_histexp.inc */
 static void shell_hist_unit(const char *src, struct shell_sb *out, size_t *used);
 
@@ -21253,6 +21255,9 @@ static bool g_reader_eval_resetline;
 /* Set by shell_run_script_hosted for the reader of the script /bin/tsh was
  * started on -- the one reader that records history (see hist_reader). */
 static bool g_reader_main_script;
+/* ...and by fc -e for the reader of the file the editor left: it records
+ * history as the main script's does, and echoes each command as read. */
+static bool g_reader_fc_file;
 /* The next reader is -c's string (shell_run_line_hosted). */
 static bool g_reader_c_main;
 
@@ -21941,7 +21946,9 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
      * A unit that spans lines is recorded with its newlines -- bash joins
      * most of them with "; " (its cmdhist rules), which this does not
      * reproduce. */
-    bool hist_reader = g_reader_main_script && !eval_mode;
+    bool fc_file = g_reader_fc_file && !eval_mode;
+    g_reader_fc_file = false;
+    bool hist_reader = (g_reader_main_script || fc_file) && !eval_mode;
     bool counts_cmds = (g_reader_main_script || g_reader_repl_count) && !eval_mode;
     bool c_main = g_reader_c_main && !eval_mode;
     g_reader_c_main = false;
@@ -22052,7 +22059,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                 continue;
             }
         }
-        if (hist_reader && g_opt_history && !hist_raw) {
+        if (hist_reader && (g_opt_history || fc_file) && !hist_raw) {
             hist_raw = shell_strdup(p);
             hist_raw_base = p;
         }
@@ -22072,6 +22079,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         if (*line == '#' && hist_reader)
             shell_history_add_raw(hist_raw, hist_raw_base, line_start, p, false);
         if (*line == '\0' || *line == '#') {
+            if (fc_file) shell_fc_echo_unit(hist_raw, hist_raw_base, line_start, p);
             if (comsub_lines) g_shell_lineno--;      /* not in bash's text */
             continue;
         }
@@ -22529,6 +22537,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
          * FIRST of however many the reader joined: `case $LINENO in` on line 1
          * of a four-line construct is line 1, not the `esac`. The counter is
          * put back afterwards so the next line still follows on. */
+        if (fc_file) shell_fc_echo_unit(hist_raw, hist_raw_base, line_start, p);
         if (hist_reader)
             shell_history_add_raw(hist_raw, hist_raw_base, line_start, p,
                                   unit_heredoc);
@@ -27628,6 +27637,21 @@ static void shell_history_add_raw(const char *raw, const char *raw_base,
     shell_history_add(t.p);
 }
 
+/* fc -e's file echoes each command as it is read, to standard error, as
+ * bash's does: [from, to) as written, read from the untouched copy. */
+static void shell_fc_echo_unit(const char *raw, const char *raw_base,
+                               const char *from, const char *to) {
+    if (!raw || from < raw_base || to < from) return;
+    const char *s = raw + (from - raw_base);
+    size_t n = (size_t)(to - from);
+    while (n > 0 && (s[n - 1] == '\n' || (SH_CR_BLANK && s[n - 1] == '\r'))) n--;
+    for (size_t off = 0; off < n; off += 512) {
+        size_t k = n - off < 512 ? n - off : 512;
+        kprintf_raw("%.*s", (int)k, s + off);
+    }
+    kprintf_raw("\n");
+}
+
 #include "shell_histexp.inc"
 
 /* Drop the newest entry (bash_delete_last_history). `fc` uses this to take
@@ -28141,36 +28165,31 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
             shell_set_status(1);
             return;
         }
-        execute_line_text(cmd.p);
+        /* the editor's command read as -s's is, a level down (`++ cat`) */
+        shell_trap_text(cmd.p, "fc", false);
         if (g_last_status != 0 || g_shell_flow != SHELL_FLOW_NONE) {
             (void)vfs_unlink(path);
             return;
         }
-        void *rb = 0;
-        size_t rsz = 0;
-        int rrc = vfs_read_all(path, &rb, &rsz);
+        /* THE FILE RUNS AS A SCRIPT, as bash's: each command echoed as it
+         * is read and recorded as the main script's are -- a command over
+         * lines one entry, history expansion and all -- its errors naming
+         * the file. tsh ran it a line at a time, so a here-document's body
+         * lines were commands of their own and a compound over lines was
+         * cut (logs/b42 fc3 k3, fc4 e1 e2) -- finding 554 */
+        const char *saved_src = g_diag_source;
+        bool saved_in_fn = g_diag_in_fn;
+        g_diag_source = path;
+        g_diag_in_fn = false;
+        g_reader_fc_file = true;
+        g_source_depth++;
+        int st = shell_syn_absorb(shell_run_script_path(path, false));
+        g_source_depth--;
+        g_reader_fc_file = false;
+        g_diag_source = saved_src;
+        g_diag_in_fn = saved_in_fn;
         (void)vfs_unlink(path);
-        if (rrc != VFS_OK) {
-            shell_set_status(1);
-            return;
-        }
-        SH_SB(text);
-        int trc = sb_putmem(&text, (const char *)rb, rsz);
-        kfree(rb);
-        if (trc < 0) { shell_set_status(1); return; }
-        for (char *ln = text.p; ln && *ln; ) {
-            char *nl = ln;
-            while (*nl && *nl != '\n') nl++;
-            char keep = *nl;
-            *nl = '\0';
-            if (*shell_skip_blanks(ln)) {
-                kprintf_raw("%s\n", ln);            /* echoed, as -s does */
-                shell_history_add(ln);
-                execute_line_text(ln);
-            }
-            if (g_shell_flow != SHELL_FLOW_NONE || !keep) break;
-            ln = nl + 1;
-        }
+        if (g_shell_flow == SHELL_FLOW_NONE) shell_set_status(st);
         return;
     }
     /* bash's listing byte layout is TAB THEN A SPACE before the text --
