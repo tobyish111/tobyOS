@@ -40280,10 +40280,16 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                                             -1) < 0) return -1;
                     }
                 } else {
+                    /* the word as written goes along, for the message a
+                     * closed target gets on the default descriptor */
+                    int dflt = (t == SH_TOK_DUP_IN) ? 0 : 1;
+                    const char *written = tok[*io].raw ? tok[*io].raw
+                                                       : tok[*io].text;
                     if (shell_add_redir(cur,
                                         t == SH_TOK_DUP_IN ? SH_RD_DUP_IN
                                                            : SH_RD_DUP_OUT,
-                                        fd, 0, 0, target) < 0) return -1;
+                                        fd, fd == dflt && !fdvar ? written : 0,
+                                        0, target) < 0) return -1;
                 }
             } else {
                 bool both = (t == SH_TOK_REDIR_BOTH ||
@@ -41898,7 +41904,19 @@ static int shell_apply_redirs(struct shell_simple *cmd,
                     kprintf_raw("%s: redirection error: cannot duplicate fd: "
                                 "Bad file descriptor\n",
                                 g_param0 ? g_param0 : "tsh");
-                kprintf(SH_PFX_TSH "%d: Bad file descriptor\n", r->target_fd);
+                /* named as bash's redirection_error names it: the word as
+                 * written on the default descriptor -- `>&$a` is "$a: Bad
+                 * file descriptor" -- else the descriptor redirected, `2>&$a`
+                 * "2" (bash's redir11.sub, vredir.tests; logs/b42 rd1 r1).
+                 * tsh named the target's number. A move names its target. */
+                if (r->path)
+                    kprintf(SH_PFX_TSH "%s: Bad file descriptor\n", r->path);
+                else
+                    kprintf(SH_PFX_TSH "%d: Bad file descriptor\n",
+                            (i + 1 < cmd->redir_count &&
+                             cmd->redir[i + 1].op == SH_RD_CLOSE &&
+                             cmd->redir[i + 1].move_src)
+                                ? r->target_fd : r->fd);
                 shell_set_status(1);
                 return -1;
             }
