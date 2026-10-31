@@ -43275,6 +43275,20 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
 #endif
         return 1;
     }
+    /* IN POSIX MODE A SPECIAL BUILTIN'S ASSIGNMENT OUTLIVES THE CALL that
+     * gave its name a prefix binding: `g() { var=20 return 5; }; var=31 g`
+     * leaves var 20, where a plain `var=22` in g is undone -- tsh undid
+     * both (bash's func3.sub; logs/b42 fn2 p1) -- finding 507 */
+    if (assignc > 0 && persist_assignments && g_opt_posix) {
+        for (int ai = 0; ai < assignc; ai++) {
+            size_t nl = env_assign_name_len(assignv[ai]);
+            SH_SB(an);
+            if (nl > 0 && sb_putmem(&an, assignv[ai], nl) == 0) {
+                struct shell_prefix_one *tb = shell_tempenv_find(an.p, 0);
+                if (tb) tb->keep = true;
+            }
+        }
+    }
     if (fds.fd[1]) {
         g_shell_out_failed = false;
         shell_set_output(shell_file_output, fds.fd[1]);
