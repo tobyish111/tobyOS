@@ -9124,6 +9124,7 @@ static int sh_subscript_read_index(const char *nm, const char *sub, long *out) {
  * (array_expand_index). Negative values are the caller's to interpret. */
 static int sh_subscript_value_as(const char *sub, const char *cmdname,
                                  long *outv);
+static int shell_arith_expand(const char *expr, struct shell_sb *out);
 static int sh_subscript_value(const char *sub, long *outv) {
     return sh_subscript_value_as(sub, 0, outv);
 }
@@ -9140,6 +9141,21 @@ static int sh_subscript_value_as(const char *sub, const char *cmdname,
      * second (logs/b42 nexp5 v6) */
     bool soft0 = g_bad_subst_soft;
     enum shell_flow flow0 = g_shell_flow;
+    /* A SUBSCRIPT IN IT IS EXPANDED ONCE AND QUOTED, as (( )) has it: with
+     * k=']', `${s:A[%]:A[$k]}` is A's `]` element -- tsh expanded the text
+     * whole and the evaluator met `A[]]` (bash's quotearray.tests;
+     * logs/b42 qa1 u6) -- finding 484 */
+    bool nested = false;
+    for (const char *q = sub; *q && !nested; q++) nested = (*q == '[');
+    if (nested) {
+        if (shell_arith_expand(sub, &expanded) != 0)
+            return ((g_bad_subst_soft && !soft0) || g_shell_flow != flow0)
+                       ? SARITH_ERROR : SARITH_FAILED;
+        long nv = 0;
+        int nk = shell_arith_eval(expanded.p, cmdname, &nv);
+        if (nk == SARITH_OK) *outv = nv;
+        return nk;
+    }
     if (shell_expand_literal_quotes(sub, &expanded) == 0)
         src = expanded.p;
     else if ((g_bad_subst_soft && !soft0) || g_shell_flow != flow0)
