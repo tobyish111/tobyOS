@@ -28067,6 +28067,10 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         /* ...recorded without the newline a here-document's entry ends in */
         for (size_t bl = strlen(buf); bl && buf[bl - 1] == '\n'; ) buf[--bl] = '\0';
         shell_history_add(buf);
+        /* ...and it is not a line the shell read: an fc in it does not take
+         * the entry just made for its own line -- `fc -s 'fc -l'` lists
+         * through that entry, as bash's (logs/b42 fc5 x5) -- finding 553 */
+        g_hist_line_added = false;
         /* THE COMMAND IS READ AS SHELL INPUT, as a trap's action is, under
          * the name "fc" -- bash's "fc: line N: syntax error" -- and over
          * lines through the reader, so a here-document's body is one: tsh
