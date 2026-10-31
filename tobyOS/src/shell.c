@@ -13057,7 +13057,10 @@ static void cmd_readarray(int argc, char **argv) {
                  * a C string, and bash's own output for `-d ''` without -t
                  * carries it -- so that combination is the one place this
                  * differs, noted rather than silently wrong. */
-                if (delim) {
+                /* ...one that was there: the last line of input with none
+                 * after it is stored as it is -- tsh gave it a newline
+                 * (bash's mapfile.tests; logs/b42 mf1) -- finding 520 */
+                if (delim && rr != 1) {
                     if (sb_putc(&linesb, delim) < 0) {
                         shell_set_status(1);
                         break;
