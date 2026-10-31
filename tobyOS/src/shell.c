@@ -6680,6 +6680,8 @@ static void shell_trap_clear_caught(void) {
     for (int i = 0; i <= SHELL_TRAP_LAST; i++) {
         bool ignored = (i > 0 && i < SIG_MAX && g_traps[i] && !g_traps[i][0]);
         if (i == SHELL_TRAP_ERR && g_opt_errtrace) continue;   /* set -E */
+        if ((i == SHELL_TRAP_DEBUG || i == SHELL_TRAP_RETURN) && g_opt_functrace)
+            continue;                                          /* set -T */
         if (!ignored) shell_trap_unset(i);
     }
 }
@@ -6725,6 +6727,11 @@ static int shell_trap_enter_child(struct shell_trap_frame *frame) {
         bool ignored = (i > 0 && i < SIG_MAX && !g_traps[i][0]);
         /* errtrace: the ERR trap goes on working inside */
         if (i == SHELL_TRAP_ERR && g_opt_errtrace) continue;
+        /* functrace: DEBUG and RETURN do -- in a $( ) and a ( ), as in a
+         * function; tsh's were shown only (bash's dbg-support.tests;
+         * logs/b42 db1 t1, db2 x1, db5 o2) */
+        if ((i == SHELL_TRAP_DEBUG || i == SHELL_TRAP_RETURN) && g_opt_functrace)
+            continue;
         if (!ignored) g_trap_shown[i] = true;
     }
     return 0;
@@ -7089,7 +7096,9 @@ static int shell_run_debug_trap(void) {
 
 /* The RETURN trap, after a function or a sourced script finishes. */
 static void shell_run_return_trap(void) {
-    if (g_trap_running || g_in_pipeline_stage || g_capture_depth > 0) return;
+    if (g_trap_running || g_in_pipeline_stage ||
+        (g_capture_depth > 0 && !g_opt_functrace))
+        return;
     const char *act = shell_trap_live(SHELL_TRAP_RETURN);
     if (!act || !*act) return;
     char *action = shell_strdup(act);
