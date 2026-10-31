@@ -27885,25 +27885,35 @@ static void shell_hist_var_written(const char *key, size_t klen) {
     }
 }
 
-/* Map a history number (or a negative offset, or a prefix string) to a ring
- * index; -1 if it names nothing. */
-static int shell_history_resolve(const char *spec, int def_index) {
-    if (!spec || !*spec) return def_index;
-    /* parse_int rejects a leading '-', but a negative offset is exactly how
-     * `fc -l -1` names the previous command, so handle the sign here. */
+/* fc's view of the list: OWN, its own line is the newest entry (HISTIGNORE
+ * can keep it out); NEWEST, the newest entry that is not that line, -1 for
+ * none. */
+struct shell_fc_view { bool own; int newest; };
+#define SH_FC_NONE  (-1)        /* "no command found" */
+#define SH_FC_RANGE (-2)        /* "history specification out of range" */
+
+/* fc's operand to an index of g_hist, as bash's fc reads one: a prefix
+ * string, the newest entry before fc's line that starts with it; a number,
+ * that entry; -N, fc's own number less N; 0, the newest entry before fc's
+ * line; -0, fc's line itself, in a listing only (bash's history5.sub;
+ * logs/b42 fc1 f2, fc2 g5 g6) -- tsh took fc's line out of the list and
+ * found neither -- finding 546 */
+static int shell_fc_resolve(const char *spec, const struct shell_fc_view *v,
+                            bool listing) {
     bool neg = (spec[0] == '-');
-    int v = 0;
-    if (parse_int(neg ? spec + 1 : spec, &v) == 0) {
-        long idx = neg ? (long)g_hist_count - v
-                       : (long)v - (long)g_hist_base - 1;
-        if (idx < 0 || idx >= g_hist_count) return -1;
+    int n = 0;
+    if (parse_int(neg ? spec + 1 : spec, &n) == 0) {
+        if (n == 0 && neg) return listing ? g_hist_count - 1 : SH_FC_RANGE;
+        if (n == 0) return v->newest >= 0 ? v->newest : SH_FC_RANGE;
+        long own_idx = v->own ? g_hist_count - 1 : g_hist_count;
+        long idx = neg ? own_idx - n : (long)n - (long)g_hist_base - 1;
+        if (idx < 0 || idx > v->newest) return SH_FC_RANGE;
         return (int)idx;
     }
-    size_t n = strlen(spec);
-    for (int i = g_hist_count - 1; i >= 0; i--) {
-        if (strncmp(g_hist[i], spec, n) == 0) return i;
-    }
-    return -1;
+    size_t len = strlen(spec);
+    for (int i = v->newest; i >= 0; i--)
+        if (strncmp(g_hist[i], spec, len) == 0) return i;
+    return SH_FC_NONE;
 }
 
 /* POSIX `fc`:
@@ -27912,20 +27922,16 @@ static int shell_history_resolve(const char *spec, int def_index) {
  *     fc [-e editor] [first [last]]
  * There is no editor to hand off to, so the editing form is refused rather
  * than silently behaving like -s, which would run the wrong thing. */
-/* fc's word for a SPEC that names no entry, as bash's: a number is "history
- * specification out of range", anything else "no command found" -- tsh
- * said "no such history entry" for both (bash's history.tests; logs/b42
- * hs2) -- finding 525 */
-static void shell_fc_not_found(const char *spec) {
-    const char *s = spec ? spec : "";
-    if (*s == '-') s++;
-    bool num = *s != '\0';
-    for (const char *q = s; *q; q++) if (*q < '0' || *q > '9') num = false;
-    kprintf(num ? "fc: history specification out of range\n"
-                : "fc: no command found\n");
+/* fc's word for an operand that names no entry, as bash's: SH_FC_RANGE is
+ * "history specification out of range", SH_FC_NONE "no command found" --
+ * tsh said "no such history entry" for both (bash's history.tests;
+ * logs/b42 hs2) -- finding 525 */
+static void shell_fc_not_found(int why) {
+    kprintf(why == SH_FC_RANGE ? "fc: history specification out of range\n"
+                               : "fc: no command found\n");
 }
 
-static void cmd_fc_in(int argc, char **argv);
+static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v);
 static void cmd_fc(int argc, char **argv) {
     /* The fc command itself is not part of the range it operates on --
      * when it is in the history at all: HISTIGNORE='fc*' keeps it out, and
@@ -27937,18 +27943,15 @@ static void cmd_fc(int argc, char **argv) {
     for (int k = 1; k < argc && argv[k][0] == '-' && argv[k][1] &&
                     !(argv[k][1] >= '0' && argv[k][1] <= '9'); k++)
         for (const char *f = argv[k] + 1; *f; f++) if (*f == 'l') list = true;
-    char *hidden = 0;
     if (own && !list) {
         shell_history_pop();
-    } else if (own) {
-        hidden = g_hist[--g_hist_count];
-        g_hist[g_hist_count] = 0;
+        own = false;
     }
-    cmd_fc_in(argc, argv);
-    if (hidden) g_hist[g_hist_count++] = hidden;
+    struct shell_fc_view v = { own, g_hist_count - (own ? 2 : 1) };
+    cmd_fc_in(argc, argv, &v);
 }
 
-static void cmd_fc_in(int argc, char **argv) {
+static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     bool list = false, no_numbers = false, reverse = false, subst = false;
     const char *editor = 0;
     int i = 1;
@@ -27993,7 +27996,7 @@ static void cmd_fc_in(int argc, char **argv) {
         return;
     }
 
-    int newest = g_hist_count - 1;
+    int newest = v->newest;
 
     if (subst) {
         /* EVERY PAT=REP before the command, in order, each replacing EVERY
@@ -28006,9 +28009,11 @@ static void cmd_fc_in(int argc, char **argv) {
             if (!first && shell_word_has(argv[a], '=')) pairs_to = a + 1;
             else if (!first) first = argv[a];
         }
-        int idx = shell_history_resolve(first, newest);
+        /* ...and one that names nothing is "no command found", whatever
+         * it is: -0 too */
+        int idx = first ? shell_fc_resolve(first, v, false) : newest;
         if (idx < 0) {
-            shell_fc_not_found(first);
+            shell_fc_not_found(SH_FC_NONE);
             shell_set_status(1);
             return;
         }
@@ -28040,11 +28045,17 @@ static void cmd_fc_in(int argc, char **argv) {
 
     const char *first_s = (i < argc) ? argv[i++] : 0;
     const char *last_s  = (i < argc) ? argv[i++] : 0;
-    int first = shell_history_resolve(first_s, list ? (newest >= 15 ? newest - 15 : 0)
-                                                    : newest);
-    int last  = shell_history_resolve(last_s, list ? newest : first);
+    /* A listing with nothing before fc's line lists that line. */
+    if (list && newest < 0) newest = g_hist_count - 1;
+    int first = first_s ? shell_fc_resolve(first_s, v, list)
+                        : list ? (newest >= 15 ? newest - 15 : 0) : newest;
+    /* A listing's last is the newest entry before fc's line -- or, from -0,
+     * that line too. */
+    int last = last_s ? shell_fc_resolve(last_s, v, list)
+               : !list ? first
+               : first == g_hist_count - 1 ? first : newest;
     if (first < 0 || last < 0) {
-        shell_fc_not_found(first < 0 ? first_s : last_s);
+        shell_fc_not_found(first < 0 ? first : last);
         shell_set_status(1);
         return;
     }
