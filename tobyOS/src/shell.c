@@ -53157,6 +53157,31 @@ static void execute_line_text_inner(const char *src) {
     }
 
     shell_bashcmd_set(src, strlen(src), SHPR_COMMAND);
+    /* THE DEBUG TRAP RUNS BEFORE THE WORDS ARE EXPANDED: bash's
+     * `trap 'echo D >&2' DEBUG; echo $(echo X >&2)` says D, then X -- tsh,
+     * expanding as it tokenizes, said X first, and a trap that skips the
+     * command under extdebug skipped it after its $( ) had run (bash's
+     * dbg-support.tests; logs/b42 db6 q1 q2). One pipeline: once per
+     * stage, as below; a list keeps the firing below. */
+    bool dbg_before = false;
+    {
+        enum shell_list_link lk;
+        int ol;
+        const char *b = shell_skip_blanks(src);
+        if (*b && !shell_find_list_sep(src, &lk, &ol) && !shell_find_bg_at(src)) {
+            int nst = 0;
+            for (const char *q = src; q; ) {
+                const char *s = shell_find_pipe_at(q);
+                nst++;
+                q = s ? s + (s[1] == '&' ? 2 : 1) : 0;
+            }
+            bool dskip = false;
+            for (int s = 0; s < nst; s++)
+                if (shell_run_debug_trap() != 0 && g_shopt_misc[10]) dskip = true;
+            if (g_shell_flow != SHELL_FLOW_NONE || dskip) return;   /* 518 */
+            dbg_before = true;
+        }
+    }
     if (shell_tokenize(src, &tok, &ntok, &words) < 0) {
         if (g_bad_subst_soft) {
             /* An EXPANSION error: bash's jump_to_top_level(DISCARD). The
@@ -53275,7 +53300,7 @@ static void execute_line_text_inner(const char *src) {
              * after a DEBUG trap returning 2 leaves x as it was -- tsh ran
              * it (bash's dbg-support2.tests; logs/b42 db1) -- finding 518 */
             bool dskip = false;
-            for (int s = 0; s < plp->count; s++)
+            for (int s = 0; s < plp->count && !dbg_before; s++)
                 if (shell_run_debug_trap() != 0 && g_shopt_misc[10]) dskip = true;
             if (g_shell_flow != SHELL_FLOW_NONE || dskip) {
                 shell_pipeline_free(plp);
