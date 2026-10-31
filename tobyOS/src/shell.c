@@ -16206,9 +16206,8 @@ static int shell_job_poll_procs(struct job *j) {
             jobs_set_current(j->id);
         }
     } else if (running && j->stopped) {
-        j->stopped = false;
+        j->stopped = false;             /* it keeps its place: see below */
         j->seen = false;
-        jobs_reset_current();
     }
     return 0;
 }
@@ -16293,9 +16292,8 @@ static int shell_job_poll_now(struct job *j) {
     int code = 0, ss = 0;
     /* A STOP, AND A CONTINUE, ARE CHANGES OF STATE TOO -- seen under job
      * control only, as bash's waitchld asks with WUNTRACED|WCONTINUED only
-     * then. A job that stops becomes the current job; one continued from
-     * outside gives the choice back (set_job_status_and_cleanup). tsh knew
-     * of no stop but its own ^Z: `jobs` said Running of a stopped job. */
+     * then. A job that stops becomes the current job. tsh knew of no stop
+     * but its own ^Z: `jobs` said Running of a stopped job. */
     int r = shell_try_reap_state(j->pid, &code, &ss, shell_job_control());
     if (r == 2) {
         if (!j->stopped) {
@@ -16306,11 +16304,13 @@ static int shell_job_poll_now(struct job *j) {
         }
         return 0;
     }
+    /* ...but a job continued keeps its place: `kill -CONT %3` of the
+     * current job leaves it `+` in bash, and tsh gave `+` to another job
+     * stopped (bash's jobs.tests; logs/b42 jb1 j3, jb2 k1) */
     if (r == 3) {
         if (j->stopped) {
             j->stopped = false;
             j->seen = false;
-            jobs_reset_current();
         }
         return 0;
     }
