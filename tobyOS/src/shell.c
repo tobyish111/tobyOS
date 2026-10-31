@@ -46097,7 +46097,21 @@ static int shell_dbr_word(const char **pp, struct shell_dbr_scratch *sc,
     while (*p) {
         char c = *p;
         if ((c == ' ' || c == '\t' || c == '\n') && re_depth == 0) break;
-        /* ...and they end a word they are glued to. Not inside an
+        /* `<(` AND `>(` ARE PART OF THE WORD through their `)`, as bash's
+         * lexer reads a process substitution: `[[ ix[7<(4+2)] -le 0 ]]` has
+         * the operand ix[7<(4+2)] -- tsh ended the word at the `<` and
+         * called the test a syntax error (bash's quotearray1.sub; logs/b42
+         * qa1 u2) -- finding 482 */
+        if ((c == '<' || c == '>') && p[1] == '(' && eg_depth == 0 &&
+            re_depth == 0) {
+            size_t k = sh_arith_dollar_span(p);
+            any_u = true;
+            for (size_t j = 0; j < k; j++)
+                if (shell_dbr_put2(sc, p[j]) < 0) return -1;
+            p += k;
+            continue;
+        }
+        /* Operators end a word they are glued to. Not inside an
          * extglob or regex group, where `|` is alternation; and on the
          * right of `=~` a `|` is the regex's at any depth (bash's lexer,
          * PST_REGEXP). */
