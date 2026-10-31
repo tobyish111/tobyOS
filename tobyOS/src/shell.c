@@ -28071,6 +28071,13 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         shell_set_status(1);
         return;
     }
+    /* A RANGE WRITTEN HIGH TO LOW GOES HIGH TO LOW, listed or edited, as
+     * bash's: `fc -l 4 2` lists 4 3 2 -- tsh went low to high unless -r
+     * (bash's history5.sub; logs/b42 fc1 f2, fc6 y1 y2) -- finding 548 */
+    if (first > last) {
+        int t = first; first = last; last = t;
+        reverse = true;
+    }
     if (!list) {
         /* fc [-e ENAME] [first [last]]: the lines into a file, ENAME --
          * else $FCEDIT, $EDITOR, vi -- run on it, and then what the file
@@ -28086,8 +28093,7 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         char path[VFS_PATH_MAX];
         ksnprintf(path, sizeof path, "%s/tsh-fc.%d", td, shell_dynvar_pid());
         SH_SB(fb);
-        int lo = first < last ? first : last, hi = first < last ? last : first;
-        for (int k = reverse ? hi : lo; reverse ? k >= lo : k <= hi;
+        for (int k = reverse ? last : first; reverse ? k >= first : k <= last;
              k += reverse ? -1 : 1)
             if (sb_puts(&fb, g_hist[k]) < 0 || sb_putc(&fb, '\n') < 0) {
                 shell_set_status(1);
@@ -28138,7 +28144,6 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         }
         return;
     }
-    if (first > last) { int t = first; first = last; last = t; }
     /* bash's listing byte layout is TAB THEN A SPACE before the text --
      * measured on the interactive gate's pty, one byte per line of diff. */
     /* A LISTING IS OUTPUT: stdout, as bash's (S12) -- it went to fd 2. */
