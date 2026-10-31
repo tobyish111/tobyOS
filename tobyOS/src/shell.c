@@ -32034,7 +32034,16 @@ static int shell_tilde_prefix_home(const char *pre, size_t plen,
  * same rule an assignment's value follows -- and the word of a `-`/`=`/`+`
  * expansion is expanded as if it were one. `~user` resolves through
  * /etc/passwd now that the repo ships one; an unknown name stays literal. */
+static int shell_word_tilde_ex(struct shell_sb *wb, bool colons);
 static int shell_word_tilde(struct shell_sb *wb) {
+    return shell_word_tilde_ex(wb, true);
+}
+
+/* ...the start only, without COLONS: the word of a `${x:=WORD}` that is a
+ * command's argument, not an assignment's value -- `: ${P:=~/a:~/b}` is
+ * $HOME/a:~/b in bash, where tsh expanded both (bash's tilde2.tests;
+ * logs/b42 tl1 t1) -- finding 498 */
+static int shell_word_tilde_ex(struct shell_sb *wb, bool colons) {
     const char *w = wb->p;
     SH_SB(out);
     bool seg_start = true;
@@ -32051,7 +32060,7 @@ static int shell_word_tilde(struct shell_sb *wb) {
             }
         }
         if (sb_putc(&out, w[i]) < 0) return -1;
-        seg_start = (w[i] == ':');
+        seg_start = colons && (w[i] == ':');
     }
     return sb_set(wb, out.p);
 }
@@ -34828,7 +34837,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
  * substitution sits inside double quotes. tsh expanded none of the four. */
 #define SH_WORD_TILDE()                                                       \
     do {                                                                      \
-        if (g_dq_depth == 0 && shell_word_tilde(&ewb) < 0) return -1;         \
+        if (g_dq_depth == 0 &&                                                \
+            shell_word_tilde_ex(&ewb, g_tok_word_assign_ctx) < 0)             \
+            return -1;                                                        \
     } while (0)
 
 #define SH_JOIN_WORD_MARKS()                                                  \
