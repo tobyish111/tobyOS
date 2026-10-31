@@ -27970,6 +27970,9 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     const char *editor = 0;
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
+        /* `--` ends the options, as bash's -- tsh said "--: invalid
+         * option" (logs/b42 fc5 x8) -- finding 551 */
+        if (strcmp(argv[i], "--") == 0) { i++; break; }
         /* `fc -l -1` -- a leading `-` followed by digits is a negative
          * history offset, an operand, not a bundle of option letters --
          * when digits are all there is: `-1z` is options, bash's "-1:
@@ -28007,6 +28010,9 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
             }
         }
     }
+    /* ...and `-e -` is -s, as bash's (and the older fc's): tsh ran a
+     * command called `-` (logs/b42 fc5 x7) -- finding 551 */
+    if (editor && strcmp(editor, "-") == 0) subst = true;
 
     if (g_hist_count == 0) {
         if (list) { shell_set_status(0); return; }
