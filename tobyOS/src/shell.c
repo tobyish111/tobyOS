@@ -37519,6 +37519,7 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                      * active, then carry on through the rest of the line with
                      * the outer set restored. One pass, correct scoping. */
                     char oq;
+                    size_t ebs = 0;              /* backslashes it ends in */
                     {
                         int depth0 = g_alias_depth;
                         if (!shell_alias_push(name)) return -1;
@@ -37531,6 +37532,9 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                         if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
                             return -1;
                         oq = shell_text_open_quote(sub_buf.p ? sub_buf.p : "");
+                        while (ebs < sub_buf.len &&
+                               sub_buf.p[sub_buf.len - 1 - ebs] == '\\')
+                            ebs++;
                     }
                     *changed = true;
                     /* A replacement that leaves a quote open has the text
@@ -37550,6 +37554,14 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                         at_cmd = false;
                         continue;
                     }
+                    /* The replacement ends a token, as the name did: an
+                     * operator right after the name stays one -- `one>&2`
+                     * with one='echo 1' is echo 1 >&2, where the text joined
+                     * made `1>&2` a redirection (finding 471). One that
+                     * ends in a backslash quotes the byte after it. */
+                    if (*p && !is_space(*p) && !(ebs & 1u) &&
+                        sb_putc(out, ' ') < 0)
+                        return -1;
                     /* POSIX: a replacement ending in a blank means the NEXT
                      * word is checked for aliases too -- which is what makes
                      * `alias sudo='sudo '` expand what follows it. */
