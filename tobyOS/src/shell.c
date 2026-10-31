@@ -12913,6 +12913,26 @@ static bool g_funcname_gone;
  * scalar other than 0 goes quietly (see cmd_unset). */
 static bool g_unset_through_ref;
 
+/* BASH_COMPAT as a level, `5.1` or `51` being 51; unset, empty or no level
+ * of two digits is the shell's own, 52 (finding 485). */
+static int shell_compat_level(void) {
+    const char *v = env_get("BASH_COMPAT");
+    if (!v || !*v) return 52;
+    int n = 0, digits = 0;
+    bool dot = false;
+    for (const char *q = v; *q; q++) {
+        if (*q >= '0' && *q <= '9') {
+            n = n * 10 + (*q - '0');
+            digits++;
+        } else if (*q == '.' && !dot && digits == 1) {
+            dot = true;
+        } else {
+            return 52;
+        }
+    }
+    return digits == 2 ? n : 52;
+}
+
 static void cmd_unset(int argc, char **argv) {
     shell_set_status(0);
     /* OPTIONS AS bash TAKES THEM: -f, -v and -n, together or apart, up to
@@ -13046,6 +13066,18 @@ static void cmd_unset(int argc, char **argv) {
             if (sh_split_subscript(argv[i], al, &nmb, &subb)) {
                 const char *nm = nmb.p, *sub = subb.p;
                 struct sh_array *arr = sh_array_find(nm);
+                /* UNDER BASH_COMPAT 5.1 OR LOWER `unset a[@]` and `a[*]`
+                 * remove the whole variable, indexed or associative (bash's
+                 * quotearray3.sub; logs/b42 qa2 v1) -- finding 485 */
+                if (arr && sub[0] && !sub[1] &&
+                    (sub[0] == '@' || sub[0] == '*') &&
+                    shell_compat_level() <= 51) {
+                    sh_array_unset(nm);
+                    int hx = env_find(nm, strlen(nm));
+                    if (hx >= 0 && !(g_env_flags[hx] & SHVAR_NAMEREF))
+                        env_remove_at(hx);
+                    continue;
+                }
                 /* `unset a[@]` and `unset a[*]` empty an INDEXED array --
                  * every element, the array itself kept. tsh fell through
                  * to sh_subscript_eval("@"), which is not a number, so
