@@ -18785,6 +18785,34 @@ static int shell_collect_heredoc(char **pp, const char *delim,
         if (*p) *p++ = '\0';
         if ((SH_CR_BLANK && saved == '\r') && *p == '\n') p++;
 
+        /* AN UNQUOTED BODY'S BACKSLASH-NEWLINE JOINS ITS LINES before the
+         * delimiter is looked for: `EO\` then `F` is the line EOF, and ends
+         * the document (bash's heredoc.tests; logs/b42 hd1) */
+        SH_SB(joined);
+        if (!quoted) {
+            size_t jl = strlen(line_start);
+            size_t bs = 0;
+            while (bs < jl && line_start[jl - 1 - bs] == '\\') bs++;
+            if ((bs & 1u) && *p) {
+                if (sb_putmem(&joined, line_start, jl - 1) < 0) return -1;
+                for (;;) {
+                    char *ns = p;
+                    while (*p && *p != '\n' && !(SH_CR_BLANK && *p == '\r')) p++;
+                    char sv = *p;
+                    if (*p) *p++ = '\0';
+                    if ((SH_CR_BLANK && sv == '\r') && *p == '\n') p++;
+                    size_t nl2 = strlen(ns);
+                    size_t b2 = 0;
+                    while (b2 < nl2 && ns[nl2 - 1 - b2] == '\\') b2++;
+                    bool more = (b2 & 1u) && *p;
+                    if (sb_putmem(&joined, ns, more ? nl2 - 1 : nl2) < 0) return -1;
+                    if (!more) break;
+                }
+                if (sb_puts(&joined, "") < 0) return -1;
+                line_start = joined.p ? joined.p : (char *)"";
+            }
+        }
+
         const char *match_line = line_start;
         if (shell_heredoc_line_matches(match_line, delim, strip_tabs)) {
             *pp = p;
