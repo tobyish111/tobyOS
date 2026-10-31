@@ -27902,12 +27902,18 @@ struct shell_fc_view { bool own; int newest; };
  * or past the newest is the oldest for a range's FIRST, else the newest --
  * and so is the newest's own number. tsh said "history specification out
  * of range" (bash's history5.sub; logs/b42 fc1 f5 f7, fc2 g1-g4, fc7) --
- * finding 547 */
+ * finding 547. AN OPERAND IS A NUMBER WHEN IT STARTS WITH A DIGIT, after
+ * its `-`, and the number is its leading digits: `1x` is 1 and `0x1` 0,
+ * while `+1` and ` 1` are strings to look for -- tsh took only an operand
+ * all digits for a number (logs/b42 fc5 x8) -- finding 549 */
 static int shell_fc_resolve(const char *spec, const struct shell_fc_view *v,
                             bool listing, bool first) {
     bool neg = (spec[0] == '-');
-    int n = 0;
-    if (parse_int(neg ? spec + 1 : spec, &n) == 0) {
+    const char *d = neg ? spec + 1 : spec;
+    if (*d >= '0' && *d <= '9') {
+        long n = 0;
+        for (; *d >= '0' && *d <= '9'; d++)
+            if (n < 1000000000L) n = n * 10 + (*d - '0');
         if (n == 0 && neg) return listing ? g_hist_count - 1 : SH_FC_RANGE;
         if (n == 0) return v->newest >= 0 ? v->newest : SH_FC_RANGE;
         long own_idx = v->own ? g_hist_count - 1 : g_hist_count;
@@ -27969,8 +27975,13 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
     int i = 1;
     for (; i < argc && argv[i][0] == '-' && argv[i][1] != '\0'; i++) {
         /* `fc -l -1` -- a leading `-` followed by digits is a negative
-         * history offset, an operand, not a bundle of option letters. */
-        if (argv[i][1] >= '0' && argv[i][1] <= '9') break;
+         * history offset, an operand, not a bundle of option letters --
+         * when digits are all there is: `-1z` is options, bash's "-1:
+         * invalid option" (logs/b42 fc5 x8) -- finding 549 */
+        bool offset = true;
+        for (const char *q = argv[i] + 1; *q && offset; q++)
+            offset = *q >= '0' && *q <= '9';
+        if (offset) break;
         for (const char *f = argv[i] + 1; *f; f++) {
             switch (*f) {
             case 'l': list = true; break;
