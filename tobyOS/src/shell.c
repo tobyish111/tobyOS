@@ -21987,6 +21987,11 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                 char *tnl = 0;
                 const char *hd_from = in_q ? (qclose ? qclose : nl + strlen(nl))
                                            : nl;
+                /* ...but a line of an open `$((` is arithmetic, where `<<`
+                 * is a shift: `echo $((` / `1 << 8` / `))` hunted for a
+                 * delimiter 8 to the end of the file (bash's
+                 * comsub-posix2.sub; logs/b42 cms4) */
+                if (ikind == 'a') hd_from = nl + strlen(nl);
                 char *hd_before2 = p;
                 if (!shell_collect_line_heredocs(nl, hd_from, &p, &tnl)) {
                     hd_failed = true;
