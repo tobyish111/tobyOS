@@ -28087,7 +28087,11 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         }
         char *buf = bufb.p;
         kprintf_raw("%s\n", buf);          /* the command, echoed bare */
-        if (v->own) shell_history_pop();
+        /* ...in place of the newest entry: fc's own line, or, where
+         * HISTIGNORE or ignorespace kept that out, the entry before it,
+         * which bash takes out all the same; tsh kept it and put the
+         * command after it (logs/b42 fc11 h1 h2 h6 h10) -- finding 556 */
+        shell_history_pop();
         /* ...recorded without the newline a here-document's entry ends in */
         for (size_t bl = strlen(buf); bl && buf[bl - 1] == '\n'; ) buf[--bl] = '\0';
         shell_history_add(buf);
