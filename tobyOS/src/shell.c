@@ -38429,6 +38429,42 @@ static char shell_text_open_quote(const char *s) {
     return q;
 }
 
+/* Whether S ends inside an arithmetic `((` or `$((` it opened: the ( )
+ * depth outside each open one is kept, and it closes when the depth is
+ * back there. Quoted parens are text, but for a `$(` in double quotes. */
+static bool shell_text_open_arith(const char *s) {
+    int outer[32], n = 0, depth = 0;
+    bool dq = false;
+    for (; *s; s++) {
+        if (*s == '\\' && s[1]) { s++; continue; }
+        if (!dq && (*s == '\'' || (*s == '$' && s[1] == '\''))) {
+            bool ansi = (*s == '$');             /* $'...' takes \' */
+            s += ansi ? 2 : 1;
+            while (*s && *s != '\'') s += (ansi && *s == '\\' && s[1]) ? 2 : 1;
+            if (!*s) break;
+            continue;
+        }
+        if (*s == '"') { dq = !dq; continue; }
+        bool dol = (*s == '$' && s[1] == '(');
+        if (dol || (*s == '(' && !dq)) {
+            if (dol) s++;
+            if (s[1] == '(') {
+                if (n < 32) outer[n++] = depth;
+                depth += 2;
+                s++;
+            } else {
+                depth++;
+            }
+            continue;
+        }
+        if (*s == ')' && depth > 0) {
+            depth--;
+            while (n > 0 && depth <= outer[n - 1]) n--;
+        }
+    }
+    return n > 0;
+}
+
 /* Where a case command's word (PAT false) ends -- at a blank or an operator
  * -- or its pattern list (PAT true) -- at the `)` that closes it, extglob
  * parens counted -- from P; quotes, `\x`, `$( )`, `${ }`, `$[ ]` and
@@ -38655,6 +38691,7 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                      * active, then carry on through the rest of the line with
                      * the outer set restored. One pass, correct scoping. */
                     char oq;
+                    bool oa;                     /* it leaves (( open */
                     size_t ebs = 0;              /* backslashes it ends in */
                     {
                         int depth0 = g_alias_depth;
@@ -38668,6 +38705,7 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                         if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
                             return -1;
                         oq = shell_text_open_quote(sub_buf.p ? sub_buf.p : "");
+                        oa = shell_text_open_arith(sub_buf.p ? sub_buf.p : "");
                         while (ebs < sub_buf.len &&
                                sub_buf.p[sub_buf.len - 1 - ebs] == '\\')
                             ebs++;
@@ -38694,8 +38732,14 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                      * operator right after the name stays one -- `one>&2`
                      * with one='echo 1' is echo 1 >&2, where the text joined
                      * made `1>&2` a redirection (finding 471). One that
-                     * ends in a backslash quotes the byte after it. */
-                    if (*p && !is_space(*p) && !(ebs & 1u) &&
+                     * ends in a backslash quotes the byte after it. One
+                     * that leaves an arithmetic `((` or `$((` open is no
+                     * token there: the text after the name goes on with
+                     * the expression -- `m)` with m='echo $(( 4+3 )' is
+                     * 7, where the blank made `) )` close a $( ( ) )
+                     * (bash's comsub6.sub; logs/b42 cs7, cs8) -- finding
+                     * 555 */
+                    if (*p && !is_space(*p) && !(ebs & 1u) && !oa &&
                         sb_putc(out, ' ') < 0)
                         return -1;
                     /* POSIX: a replacement ending in a blank means the NEXT
