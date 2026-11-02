@@ -1559,6 +1559,10 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
                                 bool dq_syntax, bool sq_syntax);
 static bool g_expand_literal_ifs_data;      /* see shell_expand_word_ex */
 static bool g_tok_word_assign_ctx;          /* see its definition */
+static bool g_tok_word_decl_ctx;            /* ...and g_tok_word_assign_ctx's */
+enum { SH_STAR_FIELDS, SH_STAR_Q, SH_STAR_U, SH_STAR_HD, SH_STAR_DQ };
+static int g_star_ov = -1;                  /* see sh_star_ctx */
+static bool g_star_case;                    /* ...a case word's or [[ ]]'s */
 static void shell_bad_subst(bool fatal);
 /* THE TEXT bash NAMES IN "TEXT: bad substitution": the string its expansion
  * pass was working through when it met the bad ${...} -- the whole word
@@ -31332,13 +31336,19 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     SH_SB(out);
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
     bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
+    int saved_ov = g_star_ov;
+    bool saved_case = g_star_case;
     g_dq_depth = 0;
     g_dq_word = false;
     g_hd_body = false;
+    g_star_ov = -1;
+    g_star_case = false;
     int crc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
+    g_star_ov = saved_ov;
+    g_star_case = saved_case;
     if (crc < 0) return -1;
     return sb_put_data_n(b, out.p, out.len);
 }
@@ -31426,13 +31436,19 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
      * enclose the commands inside them. */
     int saved_dq = g_dq_depth;
     bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
+    int saved_ov = g_star_ov;
+    bool saved_case = g_star_case;
     g_dq_depth = 0;
     g_dq_word = false;
     g_hd_body = false;
+    g_star_ov = -1;
+    g_star_case = false;
     int rc = shell_capture_command(cmd.p, &out);
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
+    g_star_ov = saved_ov;
+    g_star_case = saved_case;
     if (rc < 0) return -1;
     return sb_putmem(b, out.p, out.len);
 }
@@ -31744,13 +31760,64 @@ static int sh_put_param_word(struct shell_sb *b, const char *ew) {
     return sb_puts(b, firstm + 1);
 }
 
-/* A "*" join that is fields instead: unquoted under a null IFS, outside an
- * assignment and a here-document -- $* and ${a[*]} there are a field per
- * element (finding 493 for their operators). */
-static bool sh_star_fields(void) {
+/* WHAT A "*" EXPANSION JOINS WITH UNDER A NULL IFS is the place's (bash
+ * 5.2.15, measured: logs/b43 ifs1-ifs4):
+ *   SH_STAR_FIELDS  a word that splits -- an argument, a list's element, a
+ *                   for word: $* and ${a[*]} are a field each, and an
+ *                   array's removal one field joined by spaces;
+ *   SH_STAR_Q       an assignment's value, a case word, [[ ]]'s words, a
+ *                   here-string, the word of ${v=W} and a pattern's or a
+ *                   replacement's: each "*" form runs its words together;
+ *   SH_STAR_U       the word of ${v-W} or ${v+W} in one of those, and a
+ *                   declaration builtin's NAME=VALUE: $* and ${*OP},
+ *                   slices, ${!a[*]} and removals join with a space,
+ *                   ${a[*]} and its / ^ , ~ forms with nothing;
+ *   SH_STAR_HD      a here-document's body (sh_sep_join, finding 302);
+ *   SH_STAR_DQ      inside double quotes: IFS's first character.
+ * A place that is not the word's own sets g_star_ov for the expansion it
+ * asks for; a command substitution's commands are words of their own. */
+static int sh_star_ctx(void) {
+    if (g_dq_depth > 0) return SH_STAR_DQ;
+    if (g_hd_body) return SH_STAR_HD;
+    if (g_star_ov >= 0) return g_star_ov;
+    if (g_tok_word_assign_ctx)
+        return g_tok_word_decl_ctx ? SH_STAR_U : SH_STAR_Q;
+    return SH_STAR_FIELDS;
+}
+
+static bool sh_ifs_null(void) {
     const char *ifs = env_get("IFS");
-    return ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx &&
-           !g_hd_body;
+    return ifs && !*ifs;
+}
+
+/* A "*" join that is fields instead: unquoted under a null IFS where the
+ * word splits -- $* and ${a[*]} there are a field per element (finding 493
+ * for their operators). */
+static bool sh_star_fields(void) {
+    return sh_ifs_null() && sh_star_ctx() == SH_STAR_FIELDS;
+}
+
+/* ...and one that is a space: $* and its forms in SH_STAR_U (finding 558) */
+static bool sh_star_space(void) {
+    return sh_ifs_null() && sh_star_ctx() == SH_STAR_U;
+}
+
+/* bash's quoting byte, a ^A, in front of each space B holds from FROM on:
+ * what its removal over an array leaves inside an element (finding 557).
+ * An escaped byte is data and stays as it is. */
+static int sh_ctlesc_blanks(struct shell_sb *b, size_t from) {
+    SH_SB(t);
+    for (size_t i = from; i < b->len; i++) {
+        char c = b->p[i];
+        if ((c == SHELL_DATA_ESC || c == SHELL_GLOB_ESC) && i + 1 < b->len) {
+            if (sb_putc(&t, c) < 0 || sb_putc(&t, b->p[++i]) < 0) return -1;
+            continue;
+        }
+        if (c == ' ' && sb_put_data_n(&t, "\x01", 1) < 0) return -1;
+        if (sb_putc(&t, c) < 0) return -1;
+    }
+    sb_truncate(b, from);
+    return t.len ? sb_putmem(b, t.p, t.len) : 0;
 }
 
 static int shell_append_positional_join(struct shell_sb *b,
@@ -31779,7 +31846,6 @@ static int shell_append_positional_join(struct shell_sb *b,
         }
         return 0;
     }
-    const char *ifs = env_get("IFS");
     struct sh_sep sep;
     sh_sep_join(&sep, SH_JOIN_HD_SPACE);
 
@@ -31795,8 +31861,7 @@ static int shell_append_positional_join(struct shell_sb *b,
      * files it as POSIX even though it reads like a quirk. Quoted, the join is
      * still correct -- g_dq_depth is what tells the two apart. A
      * here-document body is quoted text, though its depth is 0 (302). */
-    if (ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx &&
-        !g_hd_body) {
+    if (sh_star_fields()) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < g_positional_count; i++) {
             if (i > 0 && sb_putc(b, SHELL_ARG_MARK) < 0)
@@ -31830,7 +31895,6 @@ static int shell_append_array_join(struct shell_sb *b,
                                    const char *name, bool star, bool indices) {
     struct sh_array *a = sh_array_find(name);
     int n = a ? a->n : 0;
-    const char *ifs = env_get("IFS");
     struct sh_sep sep;
     sh_sep_join(&sep, indices ? SH_JOIN_HD_SPACE : SH_JOIN_IFS);
 
@@ -31860,8 +31924,7 @@ static int shell_append_array_join(struct shell_sb *b,
      * (bash; Oils 2731) -- run together only in an assignment. ${!a[*]}
      * there is bash's own: the subscripts as ONE word, joined by a space
      * (Oils 2733). */
-    bool null_unquoted = ifs && !*ifs && g_dq_depth == 0 &&
-                         !g_tok_word_assign_ctx && !g_hd_body;
+    bool null_unquoted = sh_star_fields();
     if (null_unquoted && indices) { sep.c[0] = ' '; sep.n = 1; }
     else if (null_unquoted) {
         if (sh_put_lead_mark(b) < 0) return -1;
@@ -31931,7 +31994,6 @@ static int shell_append_array_slice(struct shell_sb *b,
     long end = (cnt < 0) ? n : off + cnt;
     if (end > n) end = n;
 
-    const char *ifs = env_get("IFS");
     struct sh_sep sep;
     sh_sep_join(&sep, SH_JOIN_HD_SPACE);
 
@@ -31951,7 +32013,7 @@ static int shell_append_array_slice(struct shell_sb *b,
     }
     bool first = true;
     /* unquoted under a null IFS: a field each, as ${a[*]} itself */
-    bool fields = ifs && !*ifs && g_dq_depth == 0 && !g_tok_word_assign_ctx;
+    bool fields = sh_star_fields();
     if (fields && sh_put_lead_mark(b) < 0) return -1;
     for (long i = off; i < end; i++) {
         if (!first) {
@@ -34707,7 +34769,34 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                          * field each, as ${a[*]} and $* are there (bash's
                          * exp10.sub; logs/b42 in1 i5, in2) -- finding 493 */
                         bool sf = star && sh_star_fields();
-                        if ((!star || sf) && sh_put_lead_mark(b) < 0)
+                        /* AN ARRAY'S REMOVAL -- # or % with a pattern, ## or
+                         * %% with or without one -- outside double quotes
+                         * and a body, under a null IFS, is ONE word: the
+                         * elements joined by a space, and the spaces inside
+                         * an element each led by a ^A, bash's own quoting
+                         * byte, which nothing takes off there. An argument
+                         * of it is one field. Only ${a[*]#p} in an
+                         * assignment, a case word, [[ ]] or a here-string
+                         * runs them together instead. With IFS set, [@]'s
+                         * joins with IFS's first character where no split
+                         * follows (a case word's with a space). tsh made a
+                         * field of each element, or joined them with
+                         * nothing (bash's exp10.sub; logs/b43 ifs1, ifs4,
+                         * p8-p11) -- finding 557. The positional
+                         * parameters' are $*'s. */
+                        bool posargs = strncmp(nm, "SHELL_POSARGS_", 14) == 0;
+                        bool removal = (suffix[0] == '#' || suffix[0] == '%') &&
+                                       suffix[1] != '\0';
+                        int sc = sh_star_ctx();
+                        bool rj = false, ij = false;
+                        if (removal && sc != SH_STAR_DQ && sc != SH_STAR_HD) {
+                            if (sh_ifs_null())
+                                rj = !posargs && !(star && sc == SH_STAR_Q);
+                            else
+                                ij = !star && sc != SH_STAR_FIELDS && !g_star_case;
+                        }
+                        if (ij) sh_sep_from_ifs(&sep, env_get("IFS"));
+                        if ((!star || sf) && !rj && !ij && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
                             /* Looked up again every time round: the operator
@@ -34716,7 +34805,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             arr = sh_array_find(nm);
                             if (!arr || i >= arr->n) break;
                             if (i > 0) {
-                                if (!star || sf) {
+                                if (rj) {
+                                    if (sb_putc(b, ' ') < 0) return -1;
+                                } else if ((!star || sf) && !ij) {
                                     if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
                                 } else if (sb_put_sep(b, &sep) < 0) {
                                     return -1;
@@ -34741,7 +34832,8 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             }
                             size_t before = b->len;
                             if (shell_expand_braced_parameter(sub_expr.p, b) < 0 ||
-                                (!star && sh_join_empty_elem(b, before) < 0)) {
+                                (!star && !rj && !ij && sh_join_empty_elem(b, before) < 0) ||
+                                (rj && sh_ctlesc_blanks(b, before) < 0)) {
                                 (void)env_unset("SHELL_ARRAY_ELEM");
                                 return -1;
                             }
@@ -37445,6 +37537,7 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
      * as a prefix, and a later `"[$B]"` read nothing. Plain `B=$A` and
      * `B=$((2+3))` worked because they do not re-enter the tokenizer. */
     bool saved_assign_src = g_tok_word_assign_src;
+    int saved_star_ov = g_star_ov;
     bool saved_expanded = g_tok_word_expanded;
     const char *saved_fdvar = g_tok_fdvar;
     const char *saved_bsub = g_bsub_unit;     /* points into this read */
@@ -37456,6 +37549,7 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     g_tokpfx_n = saved_tokpfx;
     g_tokpfx_base = saved_base;
     g_tok_word_assign_src = saved_assign_src;
+    g_star_ov = saved_star_ov;
     g_tok_word_expanded = saved_expanded;
     g_tok_fdvar = saved_fdvar;
     *out_tok = tv.v;
