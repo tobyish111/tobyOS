@@ -9151,6 +9151,18 @@ static const char *sh_ar_key_once(const char *sub, struct shell_sb *o) {
     return o->p;
 }
 
+/* An associative key in arithmetic: expanded as a word, or under
+ * assoc_expand_once its quotes removed (sh_ar_key_once) -- except in let,
+ * whose words were expanded as its arguments: there the key is the text
+ * as it stands, `let 'a[" "]=1'` the key `" "` quotes and all (bash's
+ * array25.sub; logs/b43 let1 l6) -- finding 572. */
+static const char *sh_ar_key_for(void *ctx, const char *sub, struct shell_sb *kx) {
+    if (!shell_assoc_expand_once()) return sh_ar_assoc_key(sub, kx);
+    const char *cmd = (const char *)ctx;
+    if (cmd && strcmp(cmd, "let") == 0) return sub;
+    return sh_ar_key_once(sub, kx);
+}
+
 /* A SUBSCRIPT THAT DOES NOT EVALUATE has said so, and the line goes, in
  * let and (( )) as in $(( )) and an assignment -- bash's array_expand_index
  * DISCARD; `let "i['2']=6"; echo rc` echoed nothing there, where tsh went
@@ -9193,8 +9205,7 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
         else v = sv;
     } else if (arr && arr->assoc) {
         SH_SB(kx);
-        const char *key = shell_assoc_expand_once() ? sh_ar_key_once(sub, &kx)
-                                                    : sh_ar_assoc_key(sub, &kx);
+        const char *key = sh_ar_key_for(ctx, sub, &kx);
         if (!key) return SARITH_CB_FAIL;
         v = sh_array_get_key(name, key);
         if (v) {
@@ -9247,8 +9258,7 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
     }
     if (arr && arr->assoc) {
         SH_SB(kx);
-        const char *key = shell_assoc_expand_once() ? sh_ar_key_once(sub, &kx)
-                                                    : sh_ar_assoc_key(sub, &kx);
+        const char *key = sh_ar_key_for(ctx, sub, &kx);
         if (!key) return SARITH_CB_FAIL;
         return sh_array_set_key(name, key, val) < 0 ? SARITH_CB_FAIL : SARITH_CB_OK;
     }
