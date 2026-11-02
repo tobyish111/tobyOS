@@ -10788,6 +10788,11 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
             base = baseb.p;
             bl = baseb.len;
             was_there = env_find(base, bl) >= 0 || sh_array_find(base) != 0;
+        } else if (rx >= 0 && !sh_array_find(base) &&
+                   !(g_env_flags[rx] & (SHVAR_ARRAY | SHVAR_NAMEREF))) {
+            /* ...and of its own scalar is that element alone: `local x=s;
+             * local -a x[1]=one` is x=([1]="one") (finding 576) */
+            env_remove_at(rx);
         }
     }
     if (make_local && !shell_local_declared_here(base, g_script_depth)) {
@@ -11219,6 +11224,7 @@ static void cmd_local(int argc, char **argv) {
             (void)env_set_attr_holder(name);
         }
         if (l_array) {
+            bool dropped = false;           /* (576, below) */
             /* a scalar the local inherited is element 0 of the array it is
              * made: `s=X; f() { local -a s; }` under localvar_inherit is
              * s=([0]="X"), where -a went on the scalar and hid it (bash's
@@ -11227,14 +11233,19 @@ static void cmd_local(int argc, char **argv) {
                 int sx = env_find(name, strlen(name));
                 if (sx >= 0 && !(g_env_flags[sx] & (SHVAR_ARRAY | SHVAR_NOVALUE |
                                                     SHVAR_NAMEREF)) &&
-                    !sh_array_find(name))
-                    (void)sh_array_absorb_scalar(name);
+                    !sh_array_find(name)) {
+                    /* ...but one this function made local before goes:
+                     * `local x=s; local -a x` is x=() in bash, where tsh made
+                     * it ([0]="s") (logs/b43 p24) -- finding 576 */
+                    if (already) { env_remove_at(sx); dropped = true; }
+                    else (void)sh_array_absorb_scalar(name);
+                }
             }
             /* a holder only where there is no entry: an empty array has no
              * element 0 to read, and remaking its entry marked `local -a
              * m=()` unassigned again -- `declare -a m` (309) */
             if (env_find(name, strlen(name)) < 0 &&
-                env_set_attr_holder(name) == 0 && has_value)
+                env_set_attr_holder(name) == 0 && (has_value || dropped))
                 sh_array_clear_novalue(name);       /* it was assigned */
             int aidx = env_find(name, strlen(name));
             if (aidx >= 0) g_env_flags[aidx] |= SHVAR_ARRAY;
