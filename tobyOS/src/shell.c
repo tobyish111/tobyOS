@@ -44995,6 +44995,19 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
 #endif
     g_builtin_fds = old_bfds;
     int rc = g_last_status;
+#ifdef SHELL_HOSTED
+    /* (the write error below goes to the builtin's fd 2 as redirected --
+     * `echo foo 2>&1 >&3 | grep` sees it -- so it is said while that is in
+     * place; tsh said it after, on its own stderr (logs/b42 rd4 x5;
+     * logs/b43 rdx1 x5-x8) -- finding 583) */
+    if (fds.fd[1] && g_shell_out_failed && rc == 0 && strcmp(c->name, "help") != 0) {
+        kprintf("%s: write error: %s\n", c->name,
+                g_shell_out_why ? g_shell_out_why : "Input/output error");
+        rc = 1;
+        shell_set_status(1);
+        g_shell_out_failed = false;
+    }
+#endif
     g_shell_fd[2] = old_diag;
     g_shell_in = old_in;
     if (restore_env) {
