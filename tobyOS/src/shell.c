@@ -56216,6 +56216,15 @@ int shell_run_line_hosted(const char *text) {
     return rc;
 }
 
+/* WHERE A SCRIPT ON STANDARD INPUT GOES ON FROM: the file the shell's fd 0
+ * names once `exec 0<file` has replaced it, 0 for the process's own. bash
+ * reads such a script from its fd 0 a command at a time, so `exec 0<
+ * redir2.sub` makes the rest of the script redir2.sub's; tsh read on in
+ * the first file (bash's redir1.sub; logs/b43 rdx4) -- finding 591 */
+struct file *shell_stdin_file_hosted(void) {
+    return g_shell_fd_cap > 0 ? g_shell_fd[0] : 0;
+}
+
 /* ONE COMMAND OF A SCRIPT READ FROM STANDARD INPUT -- `cmd | tsh`, `tsh <
  * file` -- which bash reads as its main script, a command at a time: the
  * lines counted from the start of the input (LINES came before this

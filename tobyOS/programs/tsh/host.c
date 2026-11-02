@@ -1587,6 +1587,7 @@ extern bool shell_eof_refused_hosted(void);
 extern void shell_exit_jobs_hosted(void);
 extern int  shell_exit_trap_hosted(int status);
 extern int  shell_run_stdin_unit_hosted(const char *text, unsigned long lines);
+extern struct file *shell_stdin_file_hosted(void);
 extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
 extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
@@ -2081,7 +2082,10 @@ int main(int argc, char **argv) {
         for (;;) {
             char c;
             g_tsh_async_ok = interactive;
-            long r = read(0, &c, 1);
+            /* (from the shell's fd 0 once exec has moved it: see
+             * shell_stdin_file_hosted) */
+            struct file *sf = interactive ? 0 : shell_stdin_file_hosted();
+            long r = sf ? file_read(sf, &c, 1) : read(0, &c, 1);
             g_tsh_async_ok = 0;
             /* ^C while waiting for input: throw the half-typed line away
              * and start a fresh prompt, which is what every shell does.
