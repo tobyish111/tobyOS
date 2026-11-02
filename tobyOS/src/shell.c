@@ -4403,7 +4403,15 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         {
             SH_SB(ex);
             g_expand_literal_ifs_data = true;   /* its written text never splits */
-            if (shell_expand_word_ex(elem, &ex, true, true) < 0)
+            /* AN ELEMENT IS A WORD THAT SPLITS, not an assignment's value:
+             * under a null IFS `l=( $* )` is a field per parameter, as an
+             * argument's $* is -- tsh gave one, the parameters run together
+             * (logs/b43 ifs2 m7, ifs3 k7) -- finding 561 */
+            int sov = g_star_ov;
+            g_star_ov = SH_STAR_FIELDS;
+            int xrc = shell_expand_word_ex(elem, &ex, true, true);
+            g_star_ov = sov;
+            if (xrc < 0)
                 return -1;
             /* A leading `~` on an UNQUOTED element expands, the same way
              * the ordinary word path does it after expansion. `a=(~/src)`
@@ -37565,6 +37573,11 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
      * as a prefix, and a later `"[$B]"` read nothing. Plain `B=$A` and
      * `B=$((2+3))` worked because they do not re-enter the tokenizer. */
     bool saved_assign_src = g_tok_word_assign_src;
+    /* (and the word's place: left at the last word's, an assignment's, a
+     * list expanded after the read took its elements for assignments --
+     * `l=( $* )` under a null IFS was one element -- finding 561) */
+    bool saved_assign_ctx = g_tok_word_assign_ctx;
+    bool saved_decl_ctx = g_tok_word_decl_ctx;
     int saved_star_ov = g_star_ov;
     bool saved_expanded = g_tok_word_expanded;
     const char *saved_fdvar = g_tok_fdvar;
@@ -37577,6 +37590,8 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     g_tokpfx_n = saved_tokpfx;
     g_tokpfx_base = saved_base;
     g_tok_word_assign_src = saved_assign_src;
+    g_tok_word_assign_ctx = saved_assign_ctx;
+    g_tok_word_decl_ctx = saved_decl_ctx;
     g_star_ov = saved_star_ov;
     g_tok_word_expanded = saved_expanded;
     g_tok_fdvar = saved_fdvar;
