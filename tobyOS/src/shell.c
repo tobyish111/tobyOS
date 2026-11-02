@@ -10009,6 +10009,8 @@ static struct shell_prefix_one *shell_tempenv_find(const char *name, int *level)
 
 static void shell_opts_snapshot(struct shell_sb *out);
 static void shell_opts_restore(const char *list);
+static struct shell_prefix_one *shell_tempenv_export_target(const char *name);
+static void shell_local_mark_propagate(const char *name);
 struct shell_local_save {
     int   depth;          /* g_script_depth at which this was localised */
     unsigned long seq;    /* g_scope_seq when it was made */
@@ -10016,6 +10018,10 @@ struct shell_local_save {
     /* The prefix binding this local took over (see shell_locals_push), or
      * 0 -- see shell_prefix_save.scope. */
     struct shell_prefix_one *owner;
+    /* ...and exported since -- by export, declare -x, local -x, export -n
+     * after or not: what it holds at the return is passed down (see
+     * shell_locals_pop; finding 575) */
+    bool  propagate;
     char *name;           /* variable name, NUL-terminated */
     /* An ARRAY of the same name is part of the same variable and must be
      * scoped with it -- arrays live in their own table, so saving only the
@@ -10071,6 +10077,7 @@ static int shell_locals_push(const char *name, int depth) {
     sv->seq = ++g_scope_seq;
     sv->dead = false;
     sv->owner = tb;
+    sv->propagate = false;
     sv->was_readonly = shell_readonly_key(name, strlen(name));
 
     size_t klen = strlen(name);
@@ -10575,6 +10582,26 @@ static void shell_locals_pop(int depth) {
             sv->kv = 0;
             continue;
         }
+        /* A LOCAL MADE OVER ITS OWN CALL'S PREFIX BINDING AND EXPORTED IS
+         * PASSED DOWN, as bash passes down a variable of the call's
+         * temporary environment an export marked: `f() { local w; export w;
+         * }; w=3 f` leaves w=3, exported, and `local w=5` leaves 5 -- also
+         * over a global, which it replaces, an array, a readonly mark, and
+         * after an export -n. A local only exported because the binding was
+         * goes as any local does. tsh put back what the binding hid
+         * (logs/b42 t13; logs/b43 var1 v7-v13, var2, p23) -- finding 575 */
+        if (sv->owner && sv->propagate) {
+            if (sv->arr_saved) {
+                sh_array_contents_free(sv->arr_saved);
+                kfree(sv->arr_saved);
+                sv->arr_saved = 0;
+            }
+            kfree(sv->name);
+            kfree(sv->kv);
+            sv->name = 0;
+            sv->kv = 0;
+            continue;
+        }
         /* Drop whatever the function built, then put the caller's array back
          * (if it had one). Mirrors the scalar restore below. */
         sh_array_unset_literal(sv->name);
@@ -10607,6 +10634,42 @@ static void shell_locals_pop(int depth) {
         sv->name = 0;
         sv->kv = 0;
     }
+}
+
+/* THE PREFIX BINDING AN EXPORT OF NAME REACHES, or 0: the innermost live
+ * one -- unless a local of NAME made since hides it, whose export is its
+ * own: `g() { local w; export w; }; f() { g; }; w=3 f` leaves no w after f
+ * in bash, where tsh kept f's binding (logs/b43 var1 v14) -- finding 575 */
+static struct shell_prefix_one *shell_tempenv_export_target(const char *name) {
+    struct shell_prefix_one *tb = shell_tempenv_find(name, 0);
+    if (!tb) return 0;
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0)
+            return g_locals[i].seq > tb->seq ? 0 : tb;
+    return tb;
+}
+
+/* An export of NAME in the function that made it a local over the call's
+ * own prefix binding marks that local to be passed down (finding 575). */
+static void shell_local_mark_propagate(const char *name) {
+    for (int i = g_localc - 1; i >= 0; i--)
+        if (!g_locals[i].dead && g_locals[i].name &&
+            strcmp(g_locals[i].name, name) == 0) {
+            const struct shell_prefix_one *o = g_locals[i].owner;
+            if (!o || g_locals[i].depth != g_script_depth) return;
+            /* ...the FUNCTION CALL's binding only: a builtin's own prefix
+             * in the function, `var=value declare -x var`, leaves the
+             * caller's var as it was (bash's varenv12.sub) */
+            for (int t = 0; t < g_tempenvc; t++) {
+                const struct shell_prefix_save *ps = g_tempenv[t];
+                if (o >= ps->v && o < ps->v + ps->count) {
+                    if (ps->fncall) g_locals[i].propagate = true;
+                    return;
+                }
+            }
+            return;
+        }
 }
 
 /* The dynamic part of `unset NAME` (see g_scope_seq). True when it removed
@@ -10694,6 +10757,7 @@ static void shell_decl_attrs(const char *name, unsigned on, unsigned off,
     if ((on & SHVAR_LOWER) && !(on & SHVAR_UPPER)) off |= SHVAR_UPPER;
     if ((on & SHVAR_UPPER) && !(on & SHVAR_LOWER)) off |= SHVAR_LOWER;
     g_env_flags[ix] = (unsigned char)((g_env_flags[ix] & ~off) | on);
+    if (on & SHVAR_EXPORTED) shell_local_mark_propagate(name);    /* (575) */
 }
 
 static bool g_decl_elem_array;         /* declare's -a, for shell_decl_element */
@@ -11189,6 +11253,7 @@ static void cmd_local(int argc, char **argv) {
                 if (l_export) g_env_flags[xi] |= SHVAR_EXPORTED;
                 else g_env_flags[xi] &= ~(unsigned char)SHVAR_EXPORTED;
             }
+            if (l_export) shell_local_mark_propagate(name);     /* (575) */
         }
         if (l_readonly) (void)shell_readonly_mark(name, klen);
     }
@@ -11756,8 +11821,9 @@ static void cmd_export(int argc, char **argv) {
         if (!unexport) {
             SH_SB(tn);
             if (sb_putmem(&tn, argv[i], nlen) == 0) {
-                struct shell_prefix_one *tb = shell_tempenv_find(tn.p, 0);
+                struct shell_prefix_one *tb = shell_tempenv_export_target(tn.p);
                 if (tb) tb->keep = true;
+                shell_local_mark_propagate(tn.p);
             }
         }
         if (unexport && shell_name_is_valid(argv[i], nlen)) {
@@ -12476,7 +12542,7 @@ static void cmd_declare(int argc, char **argv) {
             xl = argv[i][xl] == '=' ? env_assign_name_len(argv[i]) : strlen(argv[i]);
             SH_SB(xn);
             if (sb_putmem(&xn, argv[i], xl) == 0) {
-                struct shell_prefix_one *tb = shell_tempenv_find(xn.p, 0);
+                struct shell_prefix_one *tb = shell_tempenv_export_target(xn.p);
                 if (tb) tb->keep = true;
             }
         }
@@ -13032,6 +13098,7 @@ static void cmd_declare(int argc, char **argv) {
         if (idx < 0) continue;
         if (set_export)   g_env_flags[idx] |= SHVAR_EXPORTED;
         if (clear_export) g_env_flags[idx] &= ~(unsigned)SHVAR_EXPORTED;
+        if (set_export) shell_local_mark_propagate(name);       /* (575) */
         /* The attribute goes on AFTER the value, because the value is the
          * name being referred to and setting it must not go through the
          * reference that does not exist yet. */
