@@ -21561,6 +21561,91 @@ static void shell_scan_line(struct shell_scan *st, const char *s) {
     if (st->hd_state == 1) st->hd_state = 2;
 }
 
+/* The text ends inside a $( ) and owes a here-document from before it
+ * (see the reader: the body waits for the $( ) to close). */
+static bool sh_hd_waits_comsub(const char *s) {
+    struct shell_scan st;
+    shell_scan_init(&st);
+    shell_scan_line(&st, s);
+    bool open_c = false;
+    for (int k = 0; k < st.nest && k < (int)sizeof st.nest_kind; k++)
+        if (st.nest_kind[k] == 'c') open_c = true;
+    if (!open_c) return false;
+    /* the operators BEFORE the $( ) left open, not one inside it --
+     * `cat <( cat <<'EOF'` owes its body to the substitution (bash's
+     * histexp7.sub) */
+    const char *cut = 0;
+    char q = 0;
+    for (const char *p = s; *p && !cut; p++) {
+        if (q) {
+            if (*p == '\\' && q == '"' && p[1]) p++;
+            else if (*p == q) q = 0;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'' || *p == '"') { q = *p; continue; }
+        if ((*p == '$' || *p == '<' || *p == '>') && p[1] == '(' && p[2] != '(') {
+            int depth = 0;
+            char iq = 0;
+            const char *e = p + 1;
+            for (; *e; e++) {
+                if (iq) {
+                    if (*e == '\\' && iq == '"' && e[1]) e++;
+                    else if (*e == iq) iq = 0;
+                    continue;
+                }
+                if (*e == '\\' && e[1]) { e++; continue; }
+                if (*e == '\'' || *e == '"') { iq = *e; continue; }
+                if (*e == '(') depth++;
+                else if (*e == ')' && --depth == 0) break;
+            }
+            if (!*e) cut = p;
+            else p = e;
+        }
+    }
+    if (!cut) return false;
+    size_t n0 = (size_t)(cut - s);
+    char *pre = (char *)kmalloc(n0 + 1);
+    if (!pre) return false;
+    memcpy(pre, s, n0);
+    pre[n0] = '\0';
+    struct shell_heredoc_spec hd[4];
+    int n = shell_line_find_heredocs(pre, hd, 4);
+    shell_heredoc_specs_free(hd, n);
+    kfree(pre);
+    return n > 0;
+}
+
+/* When the reader puts here-document tags into its joined line, the line
+ * map follows the tagged copy, each offset moved past the tags before it:
+ * the joined lines lost their numbers there, and a $( ) over lines after
+ * `cat <<EOF &&` ran its commands as line 1 on (logs/b43 hd5, hd6) --
+ * finding 593. */
+static void shell_lmap_follow_tags(const char *orig, const char *tagged) {
+    if (!g_lmap_base || g_lmap_base != orig || !tagged) return;
+    size_t i = 0, j = 0;
+    int n = 0;
+    while (n < g_lmap_n) {
+        if (g_lmap_off[n] <= i) {           /* (a tag at a line's start is its) */
+            g_lmap_off[n] = j;
+            n++;
+            continue;
+        }
+        if (!orig[i]) break;
+        if (tagged[j] == SHELL_HD_TAG && orig[i] != SHELL_HD_TAG) {
+            j++;
+            while (tagged[j] && tagged[j] != SHELL_HD_TAG) j++;
+            if (tagged[j]) j++;
+            continue;
+        }
+        i++;
+        j++;
+    }
+    for (; n < g_lmap_n; n++) g_lmap_off[n] = j + (g_lmap_off[n] - i);
+    g_lmap_base = tagged;
+    g_lmap_limit = strlen(tagged) + 1;
+}
+
 /* Does the text end in an ODD number of backslashes -- a line continuation
  * still owed? (An even number is escaped backslashes.) */
 static bool shell_text_ends_in_continuation(const char *t, size_t n) {
@@ -22502,6 +22587,14 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                 if (bs & 1u) line[ll - 1] = '\0';
                 inc = 0;
             }
+            /* A LINE THAT OWES A HERE-DOCUMENT AND ENDS INSIDE A $( ) runs
+             * on, as an open quote does, through the line that closes it:
+             * bash reads the $( ) whole, and the body is the lines after
+             * that -- with `cat <<EOF && grep $(`, ` foobar`, `EOF`, `echo x)
+             * *.c`, foobar and EOF are the $( )'s commands and cat's body
+             * the next line; tsh read the body from the line after the first
+             * (bash's heredoc7.sub; logs/b43 hd5 h1-h3) -- finding 593 */
+            if (inc == 0 && sh_hd_waits_comsub(line)) inc = 1;
             if (inc) {
                 size_t llen = strlen(line);
                 if (!shell_accum_room(&accum, &accum_cap, llen + 1)) {
@@ -22550,6 +22643,7 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                     alen += nlen;
                     accum[alen] = '\0';
                     inc = shell_line_incomplete(accum);
+                    if (inc == 0 && sh_hd_waits_comsub(accum)) inc = 1;
                 }
                 if (bad) {
                     kfree(accum);
@@ -22603,7 +22697,10 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         if (!shell_collect_line_heredocs(line, line, &p, &hd_tline))
             hd_failed = true;
         for (char *q = hd_before; q < p; q++) if (!*q) g_shell_lineno++;
-        if (hd_tline) line = hd_tline;
+        if (hd_tline) {
+            if (accum && line == accum) shell_lmap_follow_tags(accum, hd_tline);
+            line = hd_tline;
+        }
         bool unit_heredoc = (hd_tline != 0);
 
         struct shell_scan scan;
