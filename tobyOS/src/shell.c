@@ -41197,11 +41197,15 @@ static int shell_expand_globstar_word(struct shell_pipeline *pl,
             if (n + 1 > VFS_PATH_MAX) return 0;
             memcpy(comps[ncomp], p, n);
             /* `\/` is a slash: the backslash before it goes (bash's
-             * glob5.sub; logs/b42 gl1 h2) */
+             * glob5.sub; logs/b42 gl1 h2) -- from a component that is no
+             * pattern: one that is keeps it, and `./tm[p]\/a/b/c` matches
+             * nothing, where tsh found ./tmp/a/b/c (bash's glob5.sub;
+             * logs/b43 glb2) -- finding 581 */
             if (*q == '/' && n > 0) {
                 size_t bs = 0;
                 while (bs < n && comps[ncomp][n - 1 - bs] == '\\') bs++;
-                if (bs & 1u) n--;
+                comps[ncomp][n] = '\0';
+                if ((bs & 1u) && !shell_has_glob(comps[ncomp])) n--;
             }
             comps[ncomp][n] = '\0';
             if (g_shopt_globstar && strcmp(comps[ncomp], "**") == 0)
