@@ -6413,6 +6413,12 @@ static int shell_function_set(const char *name, const char *body) {
      * `set -o posix` it refuses, in its own words. */
     if (g_opt_posix && shell_special_builtin_name(name)) {
         kprintf("`%s': is a special builtin\n", name);
+        /* ...and a non-interactive shell ends, status 2, as for a name
+         * that is no name below (logs/b43 rdx3 e10) -- finding 588 */
+        if (!g_interactive && g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = 2;
+        }
         return -2;
     }
     /* ...and a name has to be a NAME there: `function !! ()` is "`!!': not
