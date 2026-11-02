@@ -30351,8 +30351,11 @@ static int shell_report_unrunnable(const char *as_typed, int status) {
     bool slash = false;
     for (const char *c = as_typed; *c && !slash; c++) slash = (*c == '/');
     /* With PATH unset or empty nothing is searched: the name was tried
-     * here and is not -- bash's file_error, "No such file or directory". */
-    if (!slash && !g_resolve_nopath) {
+     * here and is not -- bash's file_error, "No such file or directory".
+     * So is a remembered relative path that is gone: `hash -p sh a; a` is
+     * "sh: No such file or directory" in bash, 127, where tsh said "command
+     * not found" (logs/b42 rs2 s3; logs/b43 glb1 r1 r2 r5) -- finding 580 */
+    if (!slash && !g_resolve_nopath && !g_resolve_hashed) {
         SH_SB(nq);
         if (g_spawn_for) kprintf("%s: %s: not found\n", g_spawn_for, as_typed);
         else kprintf(SH_PFX_TSH "%s: command not found\n",
