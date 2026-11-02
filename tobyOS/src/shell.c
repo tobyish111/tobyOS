@@ -22609,6 +22609,43 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
         struct shell_scan scan;
         shell_scan_init(&scan);
         shell_scan_line(&scan, line);
+        /* ...AND IN POSIX MODE AN ALIAS CAN CLOSE A $( ) THE LINE OPENS: with
+         * `alias short='echo ok 8 )'`, `echo $( short` is the whole command,
+         * as bash reads a $( )'s aliases with the line there; tsh joined the
+         * next lines into it (bash's comsub5.sub; logs/b43 al6 a4) --
+         * finding 592 */
+        /* ...AND AN ALIAS CAN OPEN A COMPOUND: with `alias DO='{ '`, `DO`
+         * is the first line of a group that `echo x; DONE` closes, bash
+         * reading each line's aliases as it reads the line. A first line
+         * that its aliases leave open is taken expanded, and each line the
+         * compound scan then joins to it has its aliases taken where a
+         * command starts (alias_mode); tsh ran `{` alone, "group: expected
+         * '}'" (logs/b43 al7, al6 a5) -- finding 592 */
+        bool alias_mode = false;
+        if (!alias_done && !hd_failed && !scan.bad_paren &&
+            (g_interactive || g_opt_expand_aliases) &&
+            (g_opt_posix || !shell_scan_incomplete(&scan))) {
+            bool raw_open = shell_scan_incomplete(&scan);
+            SH_SB(xb);
+            const char *ex = shell_expand_aliases(line, &xb);
+            if (ex && ex != line && shell_line_incomplete(ex) == 0) {
+                struct shell_scan s2;
+                shell_scan_init(&s2);
+                shell_scan_line(&s2, ex);
+                size_t xl = strlen(ex);
+                bool take = raw_open ? !shell_scan_incomplete(&s2)
+                                     : shell_scan_incomplete(&s2) && !s2.bad_paren &&
+                                       s2.nest == 0;
+                if (take && shell_accum_room(&accum, &accum_cap, xl + 1)) {
+                    memcpy(accum, ex, xl + 1);
+                    line = accum;
+                    shell_lmap_reset(accum, line_first);
+                    alias_done = true;
+                    alias_mode = !raw_open;
+                    scan = s2;
+                }
+            }
+        }
         /* A first line with a `(` that cannot be there is not the start of a
          * longer unit: it runs alone and shell_line_syntax_ok says why --
          * "unexpected token `('" at THAT line, as bash does, instead of the
@@ -22846,6 +22883,16 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
                 for (char *q = hd_before2; q < p; q++) if (!*q) hd_lines++;
                 if (tnl) unit_heredoc = true;
                 const char *app = tnl ? tnl : nl;
+                /* (alias_mode: this line's aliases, where a command starts
+                 * on it -- see above) */
+                SH_SB(axb);
+                if (alias_mode && !in_q && scan.nest == 0 &&
+                    !shell_scan_in_arith(&scan) &&
+                    (scan.cmd_pos || sep[0] == ';') &&
+                    !scan.case_pat && !scan.case_word) {
+                    const char *ex = shell_expand_aliases(app, &axb);
+                    if (ex) app = ex;
+                }
                 size_t seplen = strlen(sep), nllen = strlen(app);
                 if (!shell_accum_room(&accum, &accum_cap,
                                       alen + seplen + nllen + 1)) {
@@ -22937,6 +22984,18 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
             SH_SB(abuf);
             shell_run_alias_text(line, alias_done ? line :
                                        shell_expand_aliases(line, &abuf));
+        } else if (comsub_lines && g_exec_line_depth > 0 && !alias_done &&
+                   (g_interactive || g_opt_expand_aliases)) {
+            /* A $( ) OVER LINES TAKES ITS ALIASES AS IT RUNS, a command at a
+             * time, as the one-line one does in shell_capture_body: inside
+             * the line that runs it, execute_line_text makes no pass, so
+             * `got=$(DO<newline>echo ok 9; DONE)` was "DO: command not
+             * found" (bash's comsub5.sub; logs/b43 al6 a5) -- finding 592 */
+            SH_SB(abuf);
+            g_nofork_pending = nofork_scope && *p == '\0';
+            shell_run_alias_text(line, shell_expand_aliases_nested(line, &abuf));
+            g_nofork_pending = false;
+            shell_run_alias_rest();
         } else {
             /* the text's LAST unit: nothing at all after it, not even a
              * blank line (bash: *bash_input.location.string == '\0') */
@@ -39413,9 +39472,74 @@ static const char *shell_alias_case_span(const char *p, bool pat) {
     return p;
 }
 
+/* A $( )'S ALIASES ARE TAKEN ONCE: when bash parses it in posix mode -- the
+ * line's pass, below, goes into it wherever it is, in double quotes and in
+ * an assignment's value too -- and when it runs otherwise (shell_capture_body
+ * and, over lines, the reader). tsh went into an unquoted one in both modes
+ * and again when it ran, so `alias say='echo S' echo='echo E'` made `echo
+ * $(say c)` "E E S c"; and in posix mode it went into no other, so `"$(
+ * switch foo in foo) ...;; esac )"` with switch=case, or an alias whose
+ * text closes the $( ), were syntax errors (bash's comsub5.sub; logs/b43
+ * al6) -- finding 592. In the posix pass a name the recursion rule keeps
+ * from expanding is written `\name`, so the pass when it runs cannot take
+ * it again. */
+static int g_alias_cs_depth;
+static int shell_expand_aliases_run(const char **pp, struct shell_sb *out,
+                                    bool *changed, bool comsub);
+
+/* At `$(`: the substitution's text through its `)`, expanded in posix mode,
+ * as it is otherwise. */
+static int sh_alias_comsub(const char **pp, struct shell_sb *out, bool *changed) {
+    const char *p = *pp;
+    if (!g_opt_posix) {
+        const char *q = p;
+        if (shell_parse_command_subst(&q, 0, 0) < 0) q = p + strlen(p);
+        if (sb_putmem(out, p, (size_t)(q - p)) < 0) return -1;
+        *pp = q;
+        return 0;
+    }
+    if (sb_putmem(out, p, 2) < 0) return -1;
+    p += 2;
+    g_alias_cs_depth++;
+    int rc = shell_expand_aliases_run(&p, out, changed, true);
+    g_alias_cs_depth--;
+    *pp = p;
+    return rc;
+}
+
+/* The parens a replacement's text leaves open (> 0) or closes (< 0), and in
+ * *LOW the most it closes on the way. */
+static int sh_alias_paren_delta(const char *s, int *low) {
+    int d = 0;
+    *low = 0;
+    for (; *s; s++) {
+        if (*s == '\\' && s[1]) { s++; continue; }
+        if (*s == '\'' || *s == '"') {
+            char q = *s++;
+            while (*s && *s != q) s += (*s == '\\' && s[1] && q == '"') ? 2 : 1;
+            if (!*s) break;
+            continue;
+        }
+        if (*s == '(') d++;
+        else if (*s == ')' && --d < *low) *low = d;
+    }
+    return d;
+}
+
 static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                                      bool *changed) {
     const char *p = src ? src : "";
+    *changed = false;
+    sb_truncate(out, 0);
+    return shell_expand_aliases_run(&p, out, changed, false);
+}
+
+/* COMSUB: the text is a $( )'s, from after its `(`; the pass stops after
+ * the `)` that closes it, *pp there. */
+static int shell_expand_aliases_run(const char **pp, struct shell_sb *out,
+                                    bool *changed, bool comsub) {
+    const char *p = *pp;
+    int depth = 0;                      /* COMSUB: the parens open in it */
     bool at_cmd = true;
     /* A CASE COMMAND'S WORD AND PATTERNS ARE NOT COMMAND WORDS: `pat)` on
      * the line after `in`, or after `;;`, or as `(pat)`, is a pattern and
@@ -39424,12 +39548,16 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
      * in a body) -- finding 468. */
     enum { CS_NONE, CS_WORD, CS_IN, CS_PAT, CS_BODY };
     int cs_depth = 0, cs_mode = CS_NONE;
-    *changed = false;
-    sb_truncate(out, 0);
 
     while (*p) {
         if (*p == '#') {
+            if (comsub) {                       /* to its line's end */
+                while (*p && *p != '\n')
+                    if (sb_putc(out, *p++) < 0) return -1;
+                continue;
+            }
             if (sb_puts(out, p) < 0) return -1;
+            p += strlen(p);
             break;
         }
 
@@ -39510,13 +39638,22 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
          * "/bin/echo_: failed to launch". */
         if (*p == '(' || *p == '{') {
             at_cmd = true;
+            if (*p == '(') depth++;
             if (sb_putc(out, *p++) < 0) return -1;
             continue;
         }
         if (*p == '$' && p[1] == '(' && p[2] != '(') {
-            at_cmd = true;
+            if (sh_alias_comsub(&p, out, changed) < 0) return -1;
+            at_cmd = false;
+            continue;
+        }
+        if (comsub && *p == ')') {
             if (sb_putc(out, *p++) < 0) return -1;
-            if (sb_putc(out, *p++) < 0) return -1;
+            if (depth-- == 0) {                 /* the $( )'s own */
+                *pp = p;
+                return 0;
+            }
+            at_cmd = false;
             continue;
         }
 
@@ -39551,15 +39688,23 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                        (*a >= '0' && *a <= '9') || *a == '_') a++;
                 if (*a == '=') {
                     /* Copy through the end of the assignment word, minding
-                     * quotes so that `FOO='a b' cmd` keeps its space. */
+                     * quotes so that `FOO='a b' cmd` keeps its space -- and
+                     * a $( ) whole, its blanks too (sh_alias_comsub) */
                     bool sq = false, dq = false;
-                    while (*a && (sq || dq || !is_space(*a))) {
-                        if (*a == '\'' && !dq) sq = !sq;
-                        else if (*a == '"' && !sq) dq = !dq;
-                        a++;
-                    }
-                    while (p < a)
+                    while (*p && (sq || dq || !is_space(*p))) {
+                        if (!sq && *p == '\\' && p[1]) {
+                            if (sb_putmem(out, p, 2) < 0) return -1;
+                            p += 2;
+                            continue;
+                        }
+                        if (!sq && p[0] == '$' && p[1] == '(' && p[2] != '(') {
+                            if (sh_alias_comsub(&p, out, changed) < 0) return -1;
+                            continue;
+                        }
+                        if (*p == '\'' && !dq) sq = !sq;
+                        else if (*p == '"' && !sq) dq = !dq;
                         if (sb_putc(out, *p++) < 0) return -1;
+                    }
                     continue;                             /* at_cmd survives */
                 }
             }
@@ -39603,6 +39748,8 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                     char oq;
                     bool oa;                     /* it leaves (( open */
                     size_t ebs = 0;              /* backslashes it ends in */
+                    bool closes = false;         /* it ends the $( ) */
+                    bool is_case = false;
                     {
                         int depth0 = g_alias_depth;
                         if (!shell_alias_push(name)) return -1;
@@ -39614,13 +39761,41 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                         if (rc < 0) return -1;
                         if (sb_putmem(out, sub_buf.p, sub_buf.len) < 0)
                             return -1;
-                        oq = shell_text_open_quote(sub_buf.p ? sub_buf.p : "");
-                        oa = shell_text_open_arith(sub_buf.p ? sub_buf.p : "");
+                        const char *sv = sub_buf.p ? sub_buf.p : "";
+                        oq = shell_text_open_quote(sv);
+                        oa = shell_text_open_arith(sv);
                         while (ebs < sub_buf.len &&
                                sub_buf.p[sub_buf.len - 1 - ebs] == '\\')
                             ebs++;
+                        /* (a $( )'s parens, as the text after the name
+                         * meets them: `alias short='echo ok 8 )'` closes
+                         * it, `alias nest='('` opens one) */
+                        if (comsub) {
+                            int low;
+                            int dd = sh_alias_paren_delta(sv, &low);
+                            if (depth + low < 0) closes = true;
+                            else depth += dd;
+                        }
+                        /* (and `case` through an alias opens one, so the
+                         * `)` of its patterns are not the $( )'s) */
+                        const char *cw = shell_skip_blanks(sv);
+                        size_t cl = strlen(cw);
+                        while (cl && is_space(cw[cl - 1])) cl--;
+                        is_case = cl == 4 && strncmp(cw, "case", 4) == 0;
                     }
                     *changed = true;
+                    if (closes) {
+                        *pp = p;
+                        return 0;
+                    }
+                    if (is_case) {
+                        cs_depth++;
+                        cs_mode = CS_WORD;
+                        if (*p && !is_space(*p) && sb_putc(out, ' ') < 0)
+                            return -1;
+                        at_cmd = false;
+                        continue;
+                    }
                     /* A replacement that leaves a quote open has the text
                      * after it inside that quote, through its close, where
                      * nothing is a command word: `alias say="echo 'a: "`
@@ -39669,6 +39844,12 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                            strcmp(name, "esac") == 0) {
                     cs_mode = --cs_depth > 0 ? CS_BODY : CS_NONE;
                 }
+                /* (posix, in a $( ): a name its own expansion stops, made
+                 * `\name` -- see g_alias_cs_depth) */
+                if (g_opt_posix && g_alias_cs_depth > 0 && may_expand &&
+                    !funcdef && !quoted_on && shell_alias_already_used(name) &&
+                    shell_alias_value(name) && sb_putc(out, '\\') < 0)
+                    return -1;
             }
             if (sb_putmem(out, start, n) < 0) return -1;
             at_cmd = false;
@@ -39683,6 +39864,13 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
                 if (*p == '\\' && quote == '"' && p[1]) {
                     if (sb_putc(out, *p++) < 0) return -1;
                 }
+                /* (a $( ) in double quotes: its text, as posix mode reads
+                 * it -- see sh_alias_comsub) */
+                else if (quote == '"' && g_opt_posix && p[0] == '$' &&
+                         p[1] == '(' && p[2] != '(') {
+                    if (sh_alias_comsub(&p, out, changed) < 0) return -1;
+                    continue;
+                }
                 if (sb_putc(out, *p++) < 0) return -1;
             }
             if (*p && sb_putc(out, *p++) < 0) return -1;
@@ -39692,6 +39880,7 @@ static int shell_expand_aliases_once(const char *src, struct shell_sb *out,
         at_cmd = false;
         if (sb_putc(out, *p++) < 0) return -1;
     }
+    *pp = p;
     return 0;
 }
 
