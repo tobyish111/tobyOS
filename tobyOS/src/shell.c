@@ -22195,6 +22195,13 @@ static void shell_syn_close(struct shell_syn *s) {
 #define SHELL_SYN_SKIP    1      /* do not run it, read on (a discarded line) */
 #define SHELL_SYN_STOP    2      /* stop reading: a syntax error */
 
+/* fc -e's file: the line the reader is at, for shell_syn_upto. A command of
+ * it that does not parse is echoed and recorded, as the commands that do
+ * are, before its error is said: bash reads it first -- `if then` echoed
+ * and in the list; tsh stopped before it (logs/b42 fc4 e3) -- finding 597 */
+static const char *g_syn_fc_line;
+static void shell_history_add(const char *cmdline);
+
 /* Check every command that starts before offset UPTO. */
 static int shell_syn_upto(struct shell_syn *s, size_t upto) {
     int verdict = SHELL_SYN_RUN;
@@ -22204,6 +22211,14 @@ static int shell_syn_upto(struct shell_syn *s, size_t upto) {
         bsyn_set_leak(s->h, g_syn_leak);
         int k = bsyn_next(s->h, &r);
         g_syn_leak = bsyn_get_leak(s->h);
+        if (g_syn_fc_line && k == BSYN_ERROR) {
+            const char *b = g_syn_fc_line, *e = b;
+            while (*e && *e != '\n') e++;
+            shell_fc_echo_unit(b, b, b, e);
+            SH_SB(hl);
+            if (sb_putmem(&hl, b, (size_t)(e - b)) == 0 && hl.p) shell_history_add(hl.p);
+            g_syn_fc_line = 0;
+        }
         bool exited = false;
         if (k != BSYN_SKIP) exited = shell_syn_print(&r, s->iname, s->repl);
         if (exited) {
@@ -22505,7 +22520,9 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
          * stops the reader with bash's words, and one whose array literal
          * did not parse is dropped up to where bash reads on. */
         if (syn.h) {
+            if (fc_file) g_syn_fc_line = line_start;
             int v = shell_syn_upto(&syn, (size_t)(line_start - text) + 1);
+            g_syn_fc_line = 0;
             if (v == SHELL_SYN_STOP) {
                 last = g_last_status;
                 if (g_shell_flow == SHELL_FLOW_EXIT) last = g_shell_flow_status;
