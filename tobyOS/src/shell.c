@@ -9093,8 +9093,25 @@ static int shell_expand_word_ex(const char *word, struct shell_sb *out,
 static int shell_argmarks_to_spaces(const char *s, struct shell_sb *out);
 static void shell_strip_glob_escapes(char *s);
 static void shell_report_error_errexit(void);
+/* A SUBSCRIPT'S RAW ^A..^F ARE DATA, escaped before the subscript is
+ * expanded as a word, as the tokenizer escapes them in one: `B[^A]=v` set
+ * the key "" (the expander took the ^A for a field mark) and `a[1^A]=v`
+ * element 1, where bash keys ^A and calls 1^A an invalid arithmetic
+ * operator (logs/b43 ctl1 c5, ctl2 d1 d6) -- finding 570. */
+static const char *sh_sub_data(const char *sub, struct shell_sb *o) {
+    bool raw = false;
+    for (const char *p = sub; *p && !raw; p++)
+        raw = *p >= SHELL_ARG_MARK && *p <= SHELL_ARG_JOIN;
+    if (!raw) return sub;
+    for (const char *p = sub; *p; p++)
+        if (sb_put_script_c(o, *p) < 0) return sub;
+    return o->p ? o->p : sub;
+}
+
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx) {
     SH_SB(kraw);
+    SH_SB(sd);
+    sub = sh_sub_data(sub, &sd);
     if (shell_expand_word_ex(sub, &kraw, true, true) < 0) return 0;
     if (shell_argmarks_to_spaces(kraw.p ? kraw.p : "", kx) < 0) return 0;
     if (!kx->p) return "";
@@ -9400,6 +9417,8 @@ static int sh_subscript_value_as(const char *sub, const char *cmdname,
                                  long *outv) {
     if (!sub || !*sub) return SARITH_FAILED;
     SH_SB(expanded);
+    SH_SB(sd);
+    sub = sh_sub_data(sub, &sd);               /* (570) */
     const char *src = sub;
     /* an expansion inside that failed has said so: `${x:$((1+))}` is one
      * error, where tsh went on to evaluate the text as written and gave a
@@ -38338,7 +38357,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         SH_LIT_CLOSE();
                         if (sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0) return -1;
                         size_t raw_start = wb.len;
-                        if (sb_putmem(&wb, p, rk + 1) < 0) return -1;
+                        /* (a raw ^A..^F in it is data, as in the rest of
+                         * the word: copied raw it was a field mark, and
+                         * `B[^A]=v` keyed "" -- finding 570) */
+                        for (size_t z = 0; z <= rk; z++)
+                            if (sb_put_script_c(&wb, p[z]) < 0) return -1;
                         if (shell_escape_glob_range(&wb, raw_start) < 0)
                             return -1;
                         if (sb_putc(&wb, SHELL_NOSPLIT_MARK) < 0) return -1;
