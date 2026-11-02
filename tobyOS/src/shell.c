@@ -31737,6 +31737,11 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     g_star_ov = saved_ov;
     g_star_case = saved_case;
     if (crc < 0) return -1;
+    /* ...AND ITS STATUS IS $? FROM HERE ON, as bash's: `false; echo
+     * "$(true) $?"` prints 0, `f $(exit 5)` starts f with $? 5 -- tsh kept
+     * the last command's until the next one ran (logs/b43 qst1) -- finding
+     * 589 */
+    g_last_status = g_capture_last_status;
     return sb_put_data_n(b, out.p, out.len);
 }
 
@@ -31837,6 +31842,7 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     g_star_ov = saved_ov;
     g_star_case = saved_case;
     if (rc < 0) return -1;
+    g_last_status = g_capture_last_status;      /* as for $( ), above */
     return sb_putmem(b, out.p, out.len);
 }
 
@@ -33435,7 +33441,18 @@ static int shell_prompt_put(struct shell_sb *out, const char *s,
 }
 
 
+static int shell_expand_prompt_in(const char *ps, struct shell_sb *b);
+/* A $( ) in a prompt leaves $? as it was, where one in a command's words
+ * sets it (shell_expand_command_subst): `PS1='$(exit 7)> '` and then
+ * `false; echo $?` is 1 in bash (logs/b43 ps1q.txt) */
 static int shell_expand_prompt(const char *ps, struct shell_sb *b) {
+    int saved = g_last_status;
+    int rc = shell_expand_prompt_in(ps, b);
+    g_last_status = saved;
+    return rc;
+}
+
+static int shell_expand_prompt_in(const char *ps, struct shell_sb *b) {
     SH_SB(dec);
     char scratch[128];
 
