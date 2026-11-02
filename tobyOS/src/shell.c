@@ -38087,6 +38087,9 @@ static int shell_tokenize_outer(const char *src, struct shell_tokv *tok,
 /* *out_tok receives the array -- in `words`, as long-lived as the text. It
  * is never NULL on success, so an empty line can still be indexed as
  * before. */
+struct sh_rdx;                           /* see sh_rdx_enter */
+static struct sh_rdx *g_rdx_live;
+static void sh_rdx_unwind(struct sh_rdx *live0);
 static int shell_tokenize(const char *src, struct shell_token **out_tok,
                           int *out_ntok, struct shell_words *words) {
     struct shell_tokv tv = { 0, 0, words };
@@ -38117,7 +38120,9 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     const char *saved_bsub = g_bsub_unit;     /* points into this read */
     int saved_bsub_kind = g_bsub_unit_kind;
     g_tokpfx_base = g_tokpfx_n;
+    struct sh_rdx *rdx_live0 = g_rdx_live;
     int rc_outer = shell_tokenize_outer(src, &tv, out_ntok, words);
+    sh_rdx_unwind(rdx_live0);
     g_bsub_unit = saved_bsub;
     g_bsub_unit_kind = saved_bsub_kind;
     g_tokpfx_n = saved_tokpfx;
@@ -38215,6 +38220,160 @@ static int shell_procsub_run_at(const char **pp, bool input,
 }
 static size_t shell_assign_prefix_len(const char *w);
 static size_t shell_assign_prefix_len_raw(const char *w);
+/* A REDIRECTION'S WORD IS EXPANDED AS ITS REDIRECTION IS APPLIED, after the
+ * command's redirections before it: in `echo foo 2>/dev/null >&$(f)`, f's
+ * own stderr goes to /dev/null, and in `>out 2>&1 2>$(g)` to out. tsh's
+ * reader expands a word as it reads it, before any redirection, so a
+ * command substitution there wrote to the shell's stderr (logs/b43 rdx1
+ * x1-x4) -- finding 582. For such a word -- a redirection's, with a $( )
+ * or `...` in it -- the reader works out where the command's earlier
+ * redirections leave descriptors 1 and 2, and puts that in fd 2's place
+ * (g_shell_fd[2]) for the word's expansion. A file it opens for that is
+ * opened as the redirection itself would open it, and a truncating `>`
+ * becomes an append, so the file is truncated once, as bash opens it once;
+ * under noclobber nothing is opened ahead. */
+struct sh_rdx_fd { int shell_fd; struct file *f; bool closed; };
+struct sh_rdx {
+    bool on; struct file *saved2; struct file *own[2]; struct file *fd2;
+    struct sh_rdx *prev;        /* g_rdx_live's stack: shell_tokenize unwinds it */
+};
+static struct sh_rdx *g_rdx_live;
+static struct file *shell_closed_file_make(void);
+
+static bool sh_rdx_word_has_comsub(const char *p) {
+    char q = 0;
+    for (; *p; p++) {
+        if (q) {
+            if (*p == '\\' && q == '"' && p[1]) { p++; continue; }
+            if (*p == q) q = 0;
+            else if (q == '"' && ((*p == '$' && p[1] == '(' && p[2] != '(') || *p == '`'))
+                return true;
+            continue;
+        }
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (*p == '\'' || *p == '"') { q = *p; continue; }
+        if (*p == '`') return true;
+        if (*p == '$' && p[1] == '(') {
+            if (p[2] != '(') return true;
+            const char *g = shell_skip_dollar_group(p);
+            if (!g) return false;
+            p = g - 1;
+            continue;
+        }
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';' || *p == '|' ||
+            *p == '&' || *p == '<' || *p == '>' || *p == '(' || *p == ')')
+            return false;
+    }
+    return false;
+}
+
+/* A token's text with the reader's marks off. */
+static void sh_rdx_plain(const char *t, struct shell_sb *o) {
+    for (; t && *t; t++) {
+        if (*t == SHELL_DATA_ESC && t[1]) { (void)sb_putc(o, *++t); continue; }
+        if (*t >= SHELL_ARG_MARK && *t <= SHELL_ARG_JOIN) continue;
+        (void)sb_putc(o, *t);
+    }
+}
+
+static bool sh_rdx_digits(const char *s) {
+    if (!*s) return false;
+    for (; *s; s++) if (*s < '0' || *s > '9') return false;
+    return true;
+}
+
+static void sh_rdx_enter(struct shell_token *v, int last, struct sh_rdx *x) {
+    memset(x, 0, sizeof *x);
+    if (g_opt_noclobber) return;
+    int k = last;
+    while (k > 0 && v[k - 1].type != SH_TOK_SEMI && v[k - 1].type != SH_TOK_BG &&
+           v[k - 1].type != SH_TOK_PIPE && v[k - 1].type != SH_TOK_AND_IF &&
+           v[k - 1].type != SH_TOK_OR_IF)
+        k--;
+    struct sh_rdx_fd t[3] = { { 0, 0, false }, { 1, 0, false }, { 2, 0, false } };
+    bool moved = false;
+    for (int i = k; i + 1 <= last && i < last; i++) {
+        enum shell_tok_type ty = v[i].type;
+        if (ty == SH_TOK_WORD) continue;
+        if (i + 1 >= last + 1 || v[i + 1].type != SH_TOK_WORD) continue;
+        SH_SB(w);
+        sh_rdx_plain(v[i + 1].text, &w);
+        const char *word = w.p ? w.p : "";
+        int fd = v[i].fd;
+        if (ty == SH_TOK_REDIR_OUT || ty == SH_TOK_REDIR_APPEND ||
+            ty == SH_TOK_REDIR_CLOBBER || ty == SH_TOK_REDIR_BOTH ||
+            ty == SH_TOK_REDIR_BOTH_APPEND ||
+            (ty == SH_TOK_DUP_OUT && fd < 0 && !sh_rdx_digits(word) &&
+             strcmp(word, "-") != 0)) {
+            bool both = ty == SH_TOK_REDIR_BOTH || ty == SH_TOK_REDIR_BOTH_APPEND ||
+                        ty == SH_TOK_DUP_OUT;
+            if (fd < 0) fd = 1;
+            if (!both && fd != 1 && fd != 2) { i++; continue; }
+            bool append = ty == SH_TOK_REDIR_APPEND || ty == SH_TOK_REDIR_BOTH_APPEND;
+            struct file *f = shell_open_vfs_file(word, true, append, "shell");
+            if (!f) { i++; continue; }
+            /* opened now: the redirection itself appends to it */
+            if (ty == SH_TOK_REDIR_OUT || ty == SH_TOK_REDIR_CLOBBER)
+                v[i].type = SH_TOK_REDIR_APPEND;
+            else if (ty == SH_TOK_REDIR_BOTH || ty == SH_TOK_DUP_OUT)
+                v[i].type = SH_TOK_REDIR_BOTH_APPEND;
+            int slot = x->own[0] ? 1 : 0;
+            if (x->own[slot]) { file_close(f); i++; continue; }
+            x->own[slot] = f;
+            moved = true;
+            if (both || fd == 1) t[1] = (struct sh_rdx_fd){ -1, f, false };
+            if (both || fd == 2) t[2] = (struct sh_rdx_fd){ -1, f, false };
+        } else if (ty == SH_TOK_DUP_OUT) {
+            if (fd < 0) fd = 1;
+            if (fd != 1 && fd != 2) { i++; continue; }
+            moved = true;
+            if (strcmp(word, "-") == 0) {
+                t[fd] = (struct sh_rdx_fd){ -1, 0, true };
+            } else {
+                size_t wl = strlen(word);
+                if (wl && word[wl - 1] == '-') w.p[--wl] = '\0';
+                long m = 0;
+                for (const char *c = word; *c; c++) m = m * 10 + (*c - '0');
+                if (m == 1 || m == 2) t[fd] = t[m];
+                else t[fd] = (struct sh_rdx_fd){ (int)m, 0, false };
+            }
+        }
+        i++;
+    }
+    if (!moved) return;
+    struct file *n2 = 0;
+    if (t[2].closed) n2 = shell_closed_file_make();
+    else if (t[2].f) n2 = t[2].f;
+    else if (t[2].shell_fd >= 0 && t[2].shell_fd != 2 &&
+             t[2].shell_fd < g_shell_fd_cap)
+        n2 = g_shell_fd[t[2].shell_fd];
+    if (!n2) return;
+    x->on = true;
+    x->saved2 = g_shell_fd[2];
+    if (t[2].closed) x->fd2 = n2;
+    g_shell_fd[2] = n2;
+}
+
+static void sh_rdx_leave(struct sh_rdx *x) {
+    if (x->on) g_shell_fd[2] = x->saved2;
+    for (int i = 0; i < 2; i++)
+        if (x->own[i]) file_close(x->own[i]);
+    if (x->fd2) kfree(x->fd2);
+    x->on = false;
+    x->own[0] = x->own[1] = x->fd2 = 0;
+}
+
+/* Every record a read left behind -- it failed in the middle of the word --
+ * undone, down to LIVE0 (shell_tokenize). */
+static void sh_rdx_unwind(struct sh_rdx *live0) {
+    while (g_rdx_live && g_rdx_live != live0) {
+        struct sh_rdx *x = g_rdx_live;
+        g_rdx_live = x->prev;
+        sh_rdx_leave(x);
+        kfree(x);
+    }
+}
+
 static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                                 int *out_ntok, struct shell_words *words) {
     int ntok = 0;
@@ -38478,6 +38637,18 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         int word_star_ov = g_star_ov;
         if (herestr_word) g_star_ov = SH_STAR_Q;
         herestr_word = false;
+        /* (a redirection's word with a $( ) in it: see sh_rdx_enter) */
+        struct sh_rdx *rdx = 0;
+        if (ntok > 0 && tok->v[ntok - 1].type != SH_TOK_WORD &&
+            tok->v[ntok - 1].type >= SH_TOK_REDIR_IN &&
+            tok->v[ntok - 1].type != SH_TOK_HEREDOC &&
+            tok->v[ntok - 1].type != SH_TOK_HEREDOC_TABS &&
+            sh_rdx_word_has_comsub(p) &&
+            (rdx = (struct sh_rdx *)kmalloc(sizeof *rdx)) != 0) {
+            sh_rdx_enter(tok->v, ntok - 1, rdx);
+            rdx->prev = g_rdx_live;
+            g_rdx_live = rdx;
+        }
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
          * nothing else on the line: bash expands the command word and the
@@ -38984,6 +39155,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
 #undef SH_LIT_CLOSE
         if (kw_hidden >= 0) g_tokpfx_n = kw_hidden;         /* set -k: see above */
         g_star_ov = word_star_ov;
+        if (rdx) {
+            g_rdx_live = rdx->prev;
+            sh_rdx_leave(rdx);
+            kfree(rdx);
+        }
 
         if (got) {
             /* The finished word moves to storage that never moves again --
