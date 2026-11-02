@@ -28079,8 +28079,14 @@ static bool shell_hist_ignored(const char *line) {
  * again (ignoredups), one a HISTIGNORE pattern matches; erasedups takes
  * every earlier copy of the line out before it goes in. tsh read neither
  * variable (finding 15; logs/b17 a4). */
+/* The command fc -s or -e runs is recorded with history off too, as bash's
+ * is (cmd_fc_in) -- finding 598. */
+static bool g_hist_force;
+
 static void shell_history_add(const char *cmdline) {
-    if (!g_opt_history) return;
+    /* (with history off the flag is left as the last line read with it on
+     * left it: whether that line went in, which fc -e asks) */
+    if (!g_opt_history && !g_hist_force) return;
     g_hist_line_added = false;
     if (!cmdline) return;
     const char *t = shell_skip_blanks(cmdline);
@@ -28185,7 +28191,8 @@ static int shell_hist_join(const char *s, size_t n, struct shell_sb *out) {
 static void shell_history_add_raw(const char *raw, const char *raw_base,
                                   const char *from, const char *to,
                                   bool heredoc) {
-    if (!raw || !g_opt_history || from < raw_base || to < from) return;
+    if (!raw || (!g_opt_history && !g_hist_force) || from < raw_base || to < from)
+        return;
     const char *s = raw + (from - raw_base);
     size_t n = (size_t)(to - from);
     while (n > 0 && (s[n - 1] == '\n' || (SH_CR_BLANK && s[n - 1] == '\r'))) n--;
@@ -28545,9 +28552,21 @@ static void cmd_fc(int argc, char **argv) {
      * -e starts to edit, an editor that fails or an empty list too; tsh
      * took it out before it looked (bash's history5.sub; logs/b42 fc1 f1,
      * fc3 k2, fc5 x3 x4) -- finding 550 */
-    bool own = g_hist_line_added && !g_hist_line_pushed && g_hist_count > 0;
+    /* WITH HISTORY OFF fc's line is not in the list, whatever the flag says:
+     * it is the last line read with history on's (shell_history_add). bash
+     * counts from the newest entry then -- `set +o history; fc -s b=c` runs
+     * `set +o history` -- and records the command fc runs all the same; and
+     * -e takes the newest entry out first when that last line went in,
+     * counting its offsets as they were (fc11 h3 h9 h13-h16; logs/b43
+     * fch2) -- tsh took that line for fc's own and recorded nothing --
+     * finding 598 */
+    bool own = g_opt_history && g_hist_line_added && !g_hist_line_pushed &&
+               g_hist_count > 0;
     struct shell_fc_view v = { own, g_hist_count - (own ? 2 : 1) };
+    bool saved_force = g_hist_force;
+    if (!g_opt_history) g_hist_force = true;
     cmd_fc_in(argc, argv, &v);
+    g_hist_force = saved_force;
 }
 
 static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
@@ -28710,6 +28729,13 @@ static void cmd_fc_in(int argc, char **argv, struct shell_fc_view *v) {
         char path[VFS_PATH_MAX];
         ksnprintf(path, sizeof path, "%s/tsh-fc.%d", td, shell_dynvar_pid());
         if (v->own) shell_history_pop();
+        else if (!g_opt_history && g_hist_line_added && g_hist_count > 1) {
+            /* (history off: see cmd_fc -- the range as counted, kept to
+             * what is left) */
+            shell_history_pop();
+            if (first > g_hist_count - 1) first = g_hist_count - 1;
+            if (last > g_hist_count - 1) last = g_hist_count - 1;
+        }
         SH_SB(fb);
         for (int k = reverse ? last : first;
              !none && (reverse ? k >= first : k <= last); k += reverse ? -1 : 1)
