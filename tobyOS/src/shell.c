@@ -4042,6 +4042,15 @@ static bool sh_raw_tilde_start(const char *v) {
     return false;
 }
 
+/* Is the command running a declaration builtin -- declare, typeset, local,
+ * readonly, export? (finding 568) */
+static bool sh_decl_builtin_now(void) {
+    const char *c = g_this_cmd_name;
+    return c && (strcmp(c, "declare") == 0 || strcmp(c, "typeset") == 0 ||
+                 strcmp(c, "local") == 0 || strcmp(c, "readonly") == 0 ||
+                 strcmp(c, "export") == 0);
+}
+
 /* `plain_only`: every word is an ordinary element, even one that looks
  * like `[k]=v` -- the words a brace expansion made of one. `*nextp` is the
  * index the next ordinary element takes, and comes back advanced. */
@@ -4052,11 +4061,19 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
     /* An element's text is a piece of the literal, so the literal's length
      * always holds one; it was 512 bytes, and a longer element was cut
      * short without a word. */
-    /* (twice that: a raw marker byte of the script goes in escaped, below) */
+    /* (four times that: a raw marker byte of the script goes in escaped, and
+     * a raw ^A may go in twice, below) */
     SH_SB(elemb);
-    if (sb_grow(&elemb, 2 * strlen(p) + 1) < 0) return -1;
+    if (sb_grow(&elemb, 4 * strlen(p) + 1) < 0) return -1;
     char *elem = elemb.p;
     const size_t elem_cap = elemb.cap;
+    /* A RAW ^A IN A DECLARATION'S ASSOCIATIVE LIST IS TWO: `declare -A
+     * A=( [^A]=^A^A )` has the key ^A^A and the value of four, in [k]=v and
+     * the pair form, unquoted or in double quotes -- not in single quotes,
+     * not from $'\001', not in a list a plain assignment gives, nor an
+     * indexed one (bash's assoc15.sub; logs/b42 rawctl b4, logs/b43 ctl1
+     * c4-c7, ctl2 d3-d5) -- finding 568 */
+    bool dbl1 = sh_array_is_assoc(dst) && sh_decl_builtin_now();
 /* A RAW MARKER BYTE OF THE SCRIPT -- ^A..^F in the literal's text -- is
  * data, escaped as sb_put_script_c escapes one in a word; tsh's expander
  * took a raw ^A for an argument mark: `a=( ^A )` was empty (bash's
@@ -4066,6 +4083,15 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
         if (*p >= SHELL_ARG_MARK && *p <= SHELL_ARG_JOIN)                    \
             elem[n++] = SHELL_DATA_ESC;                                      \
         elem[n++] = *p++;                                                    \
+    } while (0)
+/* ...and where a ^A is two (dbl1) */
+#define SH_LIT_COPY_D()                                                      \
+    do {                                                                     \
+        if (dbl1 && *p == '\x01') {                                          \
+            elem[n++] = SHELL_DATA_ESC;                                      \
+            elem[n++] = '\x01';                                              \
+        }                                                                    \
+        SH_LIT_COPY();                                                       \
     } while (0)
     SH_SB(pend);               /* an associative literal's dangling KEY */
     bool pend_key = false;
@@ -4113,7 +4139,8 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                             continue;
                         }
                     }
-                    SH_LIT_COPY();
+                    if (q == '"') SH_LIT_COPY_D();
+                    else SH_LIT_COPY();
                 }
                 if (*p == q && n + 1 < elem_cap) elem[n++] = *p++;
                 continue;
@@ -4146,7 +4173,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
             }
             if (*p == ')' || (sub_depth == 0 &&
                 (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';'))) break;
-            SH_LIT_COPY();
+            SH_LIT_COPY_D();
         }
         elem[n] = '\0';
         /* An empty element is only noise when it came from SEPARATORS --
@@ -4376,8 +4403,33 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
              * associative array", which tsh did not (bash's assoc.tests;
              * logs/b41 assoc2 y1) */
             if (saw_keyed) {
-                kprintf("%s: %s: must use subscript when assigning associative "
-                        "array\n", name, elem);
+                /* the word as written, the expander's escapes off -- and
+                 * one with a ^A in it single-quoted, each ^A two more, as
+                 * bash names it (logs/b43 ctl2 d3; tsh showed the escape
+                 * bytes) -- finding 568 */
+                SH_SB(ew);
+                bool ctl = false;
+                for (const char *r = elem; *r; r++) {
+                    char c = *r;
+                    if (c == SHELL_DATA_ESC && r[1]) c = *++r;
+                    if (c == '\x01') {
+                        ctl = true;
+                        if (sb_putc(&ew, c) < 0) return -1;
+                    }
+                    if (sb_putc(&ew, c) < 0) return -1;
+                }
+                if (ctl) {
+                    kprintf("%s: '%s': must use subscript when assigning "
+                            "associative array\n", name, ew.p);
+                } else {
+                    SH_SB(pw);
+                    for (const char *r = elem; *r; r++) {
+                        if (*r == SHELL_DATA_ESC && r[1]) r++;
+                        if (sb_putc(&pw, *r) < 0) return -1;
+                    }
+                    kprintf("%s: %s: must use subscript when assigning "
+                            "associative array\n", name, pw.p ? pw.p : "");
+                }
                 continue;
             }
             SH_SB(kx);
@@ -4468,6 +4520,7 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
     if (pend_key && !pend_bad && sh_array_set_key(dst, pend.p, "") < 0) return -1;
     *nextp = next;
     return 0;
+#undef SH_LIT_COPY_D
 #undef SH_LIT_COPY
 }
 
