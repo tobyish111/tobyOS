@@ -32424,6 +32424,52 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
      *     "${Unset:-"a b c"}"   ->   a b c    double quotes are still syntax
      *
      * Unquoted, both are syntax. See g_dq_depth. */
+    /* IN DOUBLE QUOTES AND IN A HERE-DOCUMENT THE WORD'S DOUBLE QUOTES COME
+     * OFF FIRST, and what is left is expanded: `"$"x` is $x, and in a body,
+     * where no $"..." was translated, `$"def"` is $def -- nothing -- and
+     * `$"$HOME"` is $$ then HOME. Quotes inside $( ), ${ } and `...` are
+     * theirs, a backslash's byte is its own, and in double quotes a $"..."
+     * is the string the parser translated. tsh took them as quotes, so the
+     * body's `${u:-$"def"}` was def (logs/hw-b42 hd2 d2; logs/b43 ansi1 h1,
+     * p13, p14) -- finding 564. */
+    SH_SB(uq);
+    if (g_dq_depth > 0 || g_hd_body) {
+        bool inq = false;
+        for (const char *p = word; *p; ) {
+            if (*p == '\\' && p[1]) {
+                if (sb_putmem(&uq, p, 2) < 0) return -1;
+                p += 2;
+                continue;
+            }
+            if (*p == '$' && (p[1] == '(' || p[1] == '{')) {
+                const char *g = shell_skip_dollar_group(p);
+                if (g) {
+                    if (sb_putmem(&uq, p, (size_t)(g - p)) < 0) return -1;
+                    p = g;
+                    continue;
+                }
+            }
+            if (*p == '`') {
+                const char *q = p + 1;
+                while (*q && *q != '`') q += (*q == '\\' && q[1]) ? 2 : 1;
+                if (*q) q++;
+                if (sb_putmem(&uq, p, (size_t)(q - p)) < 0) return -1;
+                p = q;
+                continue;
+            }
+            if (!g_hd_body && !inq && *p == '$' && p[1] == '"') {
+                const char *q = p + 2;
+                while (*q && *q != '"') q += (*q == '\\' && q[1]) ? 2 : 1;
+                if (*q) q++;
+                if (sb_putmem(&uq, p, (size_t)(q - p)) < 0) return -1;
+                p = q;
+                continue;
+            }
+            if (*p == '"') { inq = !inq; p++; continue; }
+            if (sb_putc(&uq, *p++) < 0) return -1;
+        }
+        word = uq.p ? uq.p : "";
+    }
     g_value_word = true;
     return shell_expand_word_ex(word, out, true, g_dq_depth == 0 && !g_hd_body);
 }
