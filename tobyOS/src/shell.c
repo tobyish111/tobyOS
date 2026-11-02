@@ -22084,20 +22084,22 @@ static bool shell_errexit_now(void) {
  * "NAME: line N: warning: TEXT"; at a prompt just "NAME: TEXT". Under
  * set -e bash exits on its first parser_error, before the echo of the line
  * -- true is returned when that happened. */
+#ifdef SHELL_HOSTED
+/* The NAME bash's parser_error starts with (see shell_syn_print). */
+static const char *shell_syn_name(bool repl) {
+    if (repl) return g_diag_progname ? g_diag_progname : "tsh";
+    if (g_diag_in_fn) return g_diag_fn_source ? g_diag_fn_source : "environment";
+    if (g_diag_source) return g_diag_source;
+    return g_param0 ? g_param0 : "tsh";
+}
+#endif
+
 static bool shell_syn_print(const struct bsyn_result *r, const char *iname, bool repl) {
     bool errexit = shell_errexit_now();
     for (int i = 0; i < r->nmsg; i++) {
         const struct bsyn_msg *m = &r->msg[i];
 #ifdef SHELL_HOSTED
-        const char *name;
-        if (repl)
-            name = g_diag_progname ? g_diag_progname : "tsh";
-        else if (g_diag_in_fn)
-            name = g_diag_fn_source ? g_diag_fn_source : "environment";
-        else if (g_diag_source)
-            name = g_diag_source;
-        else
-            name = g_param0 ? g_param0 : "tsh";
+        const char *name = shell_syn_name(repl);
         SH_SB(out);
         (void)sb_puts(&out, name);
         (void)sb_puts(&out, ": ");
@@ -31868,6 +31870,24 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     SH_SB(cmd);
     if (sb_grow(&cmd, strlen(*pp) + 1) < 0) return -1;
     if (shell_parse_command_subst(pp, cmd.p, cmd.cap) < 0) {
+#ifdef SHELL_HOSTED
+        /* A HERE-DOCUMENT'S BODY IS READ AS IT IS EXPANDED, and a $( ) in
+         * it that never closes is bash's parser error for that text, on the
+         * line its reader has reached -- the body's delimiter: "NAME:
+         * command substitution: line 3: unexpected EOF while looking for
+         * matching `)'" for `$(seq 10` (bash's comsub-eof6.sub; logs/b43
+         * hd5 h4 h5) -- finding 594 */
+        if (g_hd_body) {
+            /* (the command's line, then one for each newline its reader
+             * meets after the `$(`, and one more for the read at the end) */
+            unsigned long ln = g_shell_lineno + 1;
+            for (const char *c = *pp; *c; c++) if (*c == '\n') ln++;
+            kprintf_raw("%s: command substitution: line %lu: unexpected EOF "
+                        "while looking for matching `)'\n", shell_syn_name(false),
+                        ln);
+            return -1;
+        }
+#endif
         kprintf(SH_PFX_SHELL "bad command substitution\n");
         return -1;
     }
