@@ -44256,6 +44256,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
          * ordinary redirection on it. */
         struct shell_redir vr;
         int var_fd = -1;
+        struct file *pre = 0;
         if (r->fdvar) {
             vr = *r;
             if (r->op == SH_RD_CLOSE) {
@@ -44310,6 +44311,18 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
                             r->fdvar);
                     return -1;
                 }
+                /* bash opens the file before it gives the name its number:
+                 * `exec {v}>f` with v readonly still makes f, and
+                 * `exec {v}<nosuch` leaves v as it was (vredir.tests;
+                 * logs/b43 rdx2) -- finding 584 */
+                if (r->op == SH_RD_OPEN_IN || r->op == SH_RD_OPEN_OUT ||
+                    r->op == SH_RD_OPEN_APPEND || r->op == SH_RD_OPEN_RW) {
+                    pre = r->op == SH_RD_OPEN_RW
+                              ? shell_open_vfs_file_rw(r->path, label)
+                              : shell_open_vfs_file(r->path, r->op != SH_RD_OPEN_IN,
+                                                    r->op == SH_RD_OPEN_APPEND, label);
+                    if (!pre) return -1;
+                }
                 char num[16];
                 ksnprintf(num, sizeof num, "%d", fd);
                 if (shell_fdvar_is_elem(r->fdvar) ? shell_set_named(r->fdvar, num) < 0
@@ -44317,6 +44330,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
                     /* after the assignment's own word, bash's (bash's
                      * nameref11.sub; logs/b41) */
                     kprintf("%s: cannot assign fd to variable\n", r->fdvar);
+                    if (pre) file_close(pre);
                     return -1;
                 }
                 vr.fdvar = 0;
@@ -44328,11 +44342,12 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
         pending_var = var_fd;
         if (r->fd < 0 || r->fd >= SHELL_FD_LIMIT) {
             kprintf("%s: bad file descriptor %d\n", label, r->fd);
+            if (pre) file_close(pre);
             return -1;
         }
 
         if (r->op == SH_RD_OPEN_IN) {
-            struct file *f = shell_open_vfs_file(r->path, false, false, label);
+            struct file *f = pre ? pre : shell_open_vfs_file(r->path, false, false, label);
             if (!f) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
@@ -44341,7 +44356,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
             continue;
         }
         if (r->op == SH_RD_OPEN_RW) {
-            struct file *f = shell_open_vfs_file_rw(r->path, label);
+            struct file *f = pre ? pre : shell_open_vfs_file_rw(r->path, label);
             if (!f) return -1;
             if (shell_fd_state_replace(st, r->fd, f, true) < 0) {
                 file_close(f);
@@ -44394,7 +44409,7 @@ static int shell_apply_redirs_in(struct shell_simple *cmd,
                     }
                 }
             }
-            struct file *f = shell_open_vfs_file(r->path, true,
+            struct file *f = pre ? pre : shell_open_vfs_file(r->path, true,
                                                  r->op == SH_RD_OPEN_APPEND,
                                                  label);
             if (!f) return -1;
