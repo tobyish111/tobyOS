@@ -9151,6 +9151,20 @@ static const char *sh_ar_key_once(const char *sub, struct shell_sb *o) {
     return o->p;
 }
 
+/* A SUBSCRIPT THAT DOES NOT EVALUATE has said so, and the line goes, in
+ * let and (( )) as in $(( )) and an assignment -- bash's array_expand_index
+ * DISCARD; `let "i['2']=6"; echo rc` echoed nothing there, where tsh went
+ * on with status 1. A plain arithmetic error is let's own (logs/b43 let1
+ * l4, p20) -- finding 571. */
+static int sh_ar_sub_failed(void) {
+    shell_set_status(1);
+    if (g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_DISCARD;
+        g_shell_flow_status = 1;
+    }
+    return SARITH_CB_FAIL;
+}
+
 static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
                      bool *set, long *ind) {
     (void)ctx;
@@ -9195,7 +9209,7 @@ static int sh_ar_get(void *ctx, const char *name, const char *sub, char **val,
         long i = 0;
         int k = sh_subscript_value(sub, &i);
         if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
-        if (k != SARITH_OK) return SARITH_CB_FAIL;
+        if (k != SARITH_OK) return sh_ar_sub_failed();
         if (i < 0 && arr) i = sh_count_back(sh_array_max_idx(arr), i);
         if (i < 0) {
             kprintf("%s: bad array subscript\n", name);
@@ -9242,7 +9256,7 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
     if (i < 0) {
         int k = sh_subscript_value(sub, &i);
         if (k == SARITH_UNBOUND) return SARITH_CB_FATAL;
-        if (k != SARITH_OK) return SARITH_CB_FAIL;
+        if (k != SARITH_OK) return sh_ar_sub_failed();
         if (i < 0 && arr) i = sh_count_back(sh_array_max_idx(arr), i);
         if (i < 0) {
             kprintf("%s[%s]: bad array subscript\n", name, sub);
