@@ -37911,6 +37911,11 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          * its first word and ran `b[2` as a command (Oils 0169). */
         g_tok_word_assign_src = shell_assign_prefix_len_raw(p) > 0;
         g_tok_word_assign_ctx = g_tok_word_assign_src && (prefix_ok || decl_util_cmd);
+        /* ...a declaration builtin's NAME=VALUE is expanded as a word that
+         * does not split, not as an assignment: under a null IFS its $*
+         * joins with a space -- `declare y=$*` with a "b c" d is "a b c d",
+         * `y=$*` "ab cd" (logs/b43 ifs2 m8, ifs3 k2) -- finding 559 */
+        g_tok_word_decl_ctx = g_tok_word_assign_src && !prefix_ok && decl_util_cmd;
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
          * nothing else on the line: bash expands the command word and the
