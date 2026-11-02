@@ -3374,6 +3374,12 @@ static void shell_optvars_refresh(void);
 static const char *sh_ar_assoc_key(const char *sub, struct shell_sb *kx);
 static const char *shell_skip_dollar_group(const char *p);
 static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
+static unsigned g_circ_count;                   /* see sh_circ_warn */
+static void sh_circ_warn(const char *name);
+static bool sh_circ_self(const char *name, size_t nl);
+static bool sh_circ_through_global(const char *name, size_t nl);
+static int sh_circ_form_count(const char *e, struct shell_sb *name);
+static bool shell_var_char(char c);
 static void shell_global_exchange(int si);
 static bool shell_nameref_names_self(const char *v, const char *name);
 static void sh_assoc_size_like(const char *tmp, const char *name);
@@ -3402,7 +3408,7 @@ static const char *env_get(const char *key) {
         SH_SB(ln);
         int cs = shell_nameref_circ(key, klen, &ln);
         if (cs >= 0) {
-            kprintf("warning: %s: circular name reference\n", key);
+            sh_circ_warn(key);
             bool was = g_circ_busy;
             shell_global_exchange(cs);
             g_circ_busy = true;
@@ -5143,7 +5149,16 @@ static int env_set_kv(const char *kv_in) {
                              (kv_in[bn] == '+' && kv_in[bn + 1] == '=')))
                      ? shell_nameref_circ(kv_in, bn, &ln) : -1;
         if (cs >= 0) {
-            kprintf("warning: %.*s: circular name reference\n", (int)bn, kv_in);
+            /* (bash's count: an element's write looks the name up once more,
+             * and a write through a chain back to the name not at all --
+             * logs/b43 circcount*.txt, p21; finding 573) */
+            if (sh_circ_self(kv_in, bn) || !sh_circ_through_global(kv_in, bn)) {
+                SH_SB(wn);
+                (void)sb_putmem(&wn, kv_in, bn);
+                sh_circ_warn(wn.p ? wn.p : "");
+                if (kv_in[bn] == '[' && sh_circ_self(kv_in, bn))
+                    sh_circ_warn(wn.p ? wn.p : "");
+            }
             SH_SB(rk);
             if (sb_puts(&rk, ln.p) < 0 || sb_puts(&rk, kv_in + bn) < 0)
                 return -1;
@@ -9251,6 +9266,9 @@ static int sh_ar_set(void *ctx, const char *name, const char *sub, long ind,
     }
     if (!sub) {
         int rc;
+        /* (an arithmetic assignment to a reference to itself looks it up
+         * once more in bash, and says so -- finding 573) */
+        if (sh_circ_self(name, strlen(name))) sh_circ_warn(name);
         if (arr) rc = arr->assoc ? sh_array_set_key(name, "0", val)
                                  : sh_array_set(name, 0, val);
         else rc = env_set(name, val);       /* says "readonly variable" */
@@ -10354,6 +10372,79 @@ static int shell_local_oldest(const char *name) {
 
 static struct sh_array *shell_local_saved_array(int si) {
     return g_locals[si].arr_existed ? g_locals[si].arr_saved : 0;
+}
+
+/* bash's "warning: NAME: circular name reference", counted: bash says it
+ * once for each lookup of the name, and how many lookups a use makes is
+ * bash's own (finding 573, below). */
+static unsigned g_circ_count;
+static void sh_circ_warn(const char *name) {
+    kprintf("warning: %s: circular name reference\n", name);
+    g_circ_count++;
+}
+
+/* NAME is a function's local reference to itself, `typeset -n v=v` -- the
+ * case whose uses bash counts as sh_circ_form_count has it (a chain that
+ * comes back through another reference warns its own way). */
+static int shell_nameref_circ(const char *name, size_t nl, struct shell_sb *landed);
+static bool sh_circ_self(const char *name, size_t nl) {
+    SH_SB(ln);
+    if (shell_nameref_circ(name, nl, &ln) < 0) return false;
+    int ix = env_find(name, nl);
+    return ix >= 0 && strlen(g_env[ix] + nl + 1) == nl &&
+           memcmp(g_env[ix] + nl + 1, name, nl) == 0;
+}
+
+/* NAME's chain back to itself passes through a reference no function made
+ * local -- `declare -n w=v; f() { local -n v=w; v=X; }` -- where bash's
+ * write warns not at all (logs/b43 p21; a chain of locals warns, circ1 c13). */
+static bool sh_circ_through_global(const char *name, size_t nl) {
+    SH_SB(cur);
+    if (sb_putmem(&cur, name, nl) < 0) return false;
+    for (int hops = 0; hops < 16; hops++) {
+        int ix = env_find(cur.p, cur.len);
+        if (ix < 0 || !(g_env_flags[ix] & SHVAR_NAMEREF)) return false;
+        const char *t = g_env[ix] + cur.len + 1;
+        if (strlen(t) == nl && memcmp(t, name, nl) == 0) return false;
+        SH_SB(tc);
+        if (sb_set(&tc, t) < 0 || sb_set(&cur, tc.p) < 0) return false;
+        if (shell_local_oldest(cur.p) < 0) return true;
+    }
+    return false;
+}
+
+/* HOW MANY TIMES bash WARNS for one ${ } of a reference to itself, by the
+ * expression's form (bash 5.2.15's lookups, measured: logs/b43 circ2,
+ * circcount*.txt): a plain read, its length, and the - + = ? words 1; a
+ * pattern, case, substring or @ operator 3; an element 2, its length 1;
+ * [@] and [*] 2, with an operator 3. 0 when EXPR's name is no such
+ * reference, or for ${!...}, which counts as tsh does. The name in NAME. */
+static int sh_circ_form_count(const char *e, struct shell_sb *name) {
+    bool len = false;
+    if (*e == '!') return 0;
+    if (*e == '#' && e[1] && e[1] != '}') { len = true; e++; }
+    size_t n = 0;
+    while (shell_var_char(e[n])) n++;
+    if (!n || (e[0] >= '0' && e[0] <= '9')) return 0;
+    if (!sh_circ_self(e, n)) return 0;
+    if (sb_putmem(name, e, n) < 0) return 0;
+    const char *s = e + n;
+    if (*s == '[') {
+        bool all = (s[1] == '@' || s[1] == '*') && s[2] == ']';
+        int d = 0;
+        for (; *s; s++) {
+            if (*s == '[') d++;
+            else if (*s == ']' && --d == 0) { s++; break; }
+        }
+        if (len) return 1;
+        if (!all) return 2;
+        return *s ? 3 : 2;
+    }
+    if (len || !*s) return 1;
+    const char *o = s + (*s == ':' && (s[1] == '-' || s[1] == '+' ||
+                                       s[1] == '=' || s[1] == '?'));
+    if (*o == '-' || *o == '+' || *o == '=' || *o == '?') return 1;
+    return 3;
 }
 
 /* A REFERENCE THAT COMES BACK TO WHERE IT STARTED -- it names itself, or a
@@ -11621,7 +11712,7 @@ static void cmd_export(int argc, char **argv) {
                 (cs = shell_nameref_circ(rn.p, nl, &ln)) >= 0) {
                 /* a local reference back to itself exports the GLOBAL
                  * variable (logs/b42 circ1 c16) */
-                kprintf("warning: %s: circular name reference\n", rn.p);
+                sh_circ_warn(rn.p);
                 if (sb_set(&rearg, ln.p) == 0 && sb_puts(&rearg, argv[i] + nl) == 0) {
                     ras.slot = &argv[i];
                     ras.orig = argv[i];
@@ -12349,6 +12440,14 @@ static void cmd_declare(int argc, char **argv) {
 
     for (; i < argc; i++) {
         bool nref = set_nameref;     /* -n, for this name (see below) */
+        /* (-r or -x of a reference to itself, no value: bash looks it up
+         * twice and says so each time -- finding 573) */
+        if ((set_readonly || set_export) && !set_nameref &&
+            argv[i][env_key_len(argv[i])] != '=' &&
+            sh_circ_self(argv[i], strlen(argv[i]))) {
+            sh_circ_warn(argv[i]);
+            sh_circ_warn(argv[i]);
+        }
         /* IN A FUNCTION, `declare` and `typeset` MAKE LOCALS, as `local`
          * does -- unless -g. tsh's declare always wrote the variable it
          * could see, so `f() { declare v=in; }` changed the caller's v. */
@@ -13023,6 +13122,16 @@ static void cmd_readonly(int argc, char **argv) {
             shell_set_status(1);
             continue;
         }
+        /* (a reference to itself named with no value: bash looks it up
+         * once and says so -- and the GLOBAL variable it stands for is the
+         * one made readonly, which it stays after the function: the record
+         * holding it keeps the mark -- finding 573) */
+        if (argv[i][klen] != '=' && sh_circ_self(argv[i], nlen)) {
+            sh_circ_warn(argv[i]);
+            SH_SB(ln);
+            int cs = shell_nameref_circ(argv[i], nlen, &ln);
+            if (cs >= 0) g_locals[cs].was_readonly = true;
+        }
 
         if (argv[i][klen] == '=') {
             if (opt_A && !shell_readonly_key(argv[i], nlen)) {
@@ -13412,6 +13521,16 @@ static void cmd_unset(int argc, char **argv) {
             while (argv[i][bl] && argv[i][bl] != '[') bl++;
             if (sb_putmem(&nmbb, argv[i], bl) < 0) continue;
             const char *nmb = nmbb.p;
+            /* (an element of a reference to itself: bash looks the name up
+             * more than tsh does -- three times over a scalar, twice over an
+             * array -- saying so each time -- finding
+             * 573) */
+            if (bl && argv[i][bl] == '[' && !ref_only && sh_circ_self(nmb, bl)) {
+                SH_SB(ln);
+                int cs = shell_nameref_circ(nmb, bl, &ln);
+                int more = (cs >= 0 && g_locals[cs].arr_existed) ? 2 : 3;
+                for (int w = 0; w < more; w++) sh_circ_warn(nmb);
+            }
             /* (a readonly REFERENCE is unset through, its target's mark
              * decides -- `declare -rn foo0=bar; unset foo0` unsets bar;
              * only `unset -n foo0` is refused: bash's nameref17.sub,
@@ -13621,7 +13740,9 @@ static void cmd_unset(int argc, char **argv) {
             SH_SB(ln);
             size_t al = strlen(argv[i]);
             if (shell_nameref_circ(argv[i], al, &ln) >= 0) {
-                kprintf("warning: %s: circular name reference\n", argv[i]);
+                /* (twice, bash's lookups -- finding 573) */
+                sh_circ_warn(argv[i]);
+                sh_circ_warn(argv[i]);
                 int cx = env_find(argv[i], al);
                 if (cx >= 0) env_remove_at(cx);
                 (void)env_set_attr_holder(argv[i]);
@@ -25077,6 +25198,18 @@ static int test_unary(const char *op, const char *operand) {
      * element. A bare NAME on an array means element 0, which is why
      * `a=(); [[ -v a ]]` is false in bash while `a=(1)` is true. */
     if (strcmp(op, "-v") == 0) {
+        /* (bash looks a reference to itself up once here, twice for an
+         * element, and says so each time -- finding 573) */
+        {
+            size_t on = 0;
+            while (shell_var_char(operand[on])) on++;
+            if (on && sh_circ_self(operand, on)) {
+                SH_SB(cn);
+                (void)sb_putmem(&cn, operand, on);
+                sh_circ_warn(cn.p ? cn.p : "");
+                if (operand[on] == '[') sh_circ_warn(cn.p ? cn.p : "");
+            }
+        }
         SH_SB(nmb);
         SH_SB(subb);
         if (sh_split_subscript(operand, strlen(operand), &nmb, &subb)) {
@@ -34359,8 +34492,19 @@ static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
                 strncmp(expr, "SHELL_POSARGS_", 14) != 0 &&
                 strncmp(expr, "SHELL_INDIR_", 12) != 0;
     if (real) g_bpe_level++;
+    unsigned cc0 = g_circ_count;
+    static int topup_depth;             /* the outermost ${ } counts */
+    topup_depth++;
     int rc = shell_expand_braced_parameter_in(expr, b);
-    if (real) g_bpe_level--;
+    topup_depth--;
+    if (real) {
+        g_bpe_level--;
+        /* bash's warnings for a reference to itself, as many as its lookups
+         * of the name for this form (sh_circ_form_count; finding 573) */
+        SH_SB(cn);
+        int k = topup_depth == 0 ? sh_circ_form_count(expr, &cn) : 0;
+        while (k > 0 && g_circ_count - cc0 < (unsigned)k) sh_circ_warn(cn.p);
+    }
     g_bsub_text = saved;
     return rc;
 }
@@ -34681,7 +34825,10 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                 int ni = env_find(rname.p, rname.len);
                 if (ni >= 0 && (g_env_flags[ni] & SHVAR_NAMEREF)) {
                     const char *t = g_env[ni] + rname.len + 1;
-                    if (!*t) {
+                    /* ...and so is a function's reference to itself, which
+                     * names no reference bash can turn round (logs/b43
+                     * circ2 w18) -- finding 573 */
+                    if (!*t || sh_circ_self(rname.p, rname.len)) {
                         kprintf(SH_PFX_SHELL "%s: invalid indirect expansion\n",
                                 rname.p);
                         g_bad_subst_soft = true;
