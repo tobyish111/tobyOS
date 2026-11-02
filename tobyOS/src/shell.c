@@ -41543,7 +41543,16 @@ static int shell_add_one_arg(struct shell_pipeline *pl, struct shell_simple *cur
          *
          * failglob wins when both are set, which is bash's order. */
         if (g_shopt_failglob) {
-            kprintf(SH_PFX_SHELL "no match: %s\n", word);
+            /* the pattern as written, its quoting gone: `x\*[ab]` is "no
+             * match: x*[ab]", where tsh's message had its escape bytes in
+             * it (logs/b43 glb1 g4, p26) -- finding 577 */
+            SH_SB(nw);
+            if (sb_puts(&nw, word) == 0 && nw.p) {
+                shell_strip_nosplit_inplace(nw.p);
+                kprintf(SH_PFX_SHELL "no match: %s\n", nw.p);
+            } else {
+                kprintf(SH_PFX_SHELL "no match: %s\n", word);
+            }
             /* STATUS 1, NOT 2. bash does not run the command and leaves 1;
              * a bare -1 here reaches the tokenizer's failure path and
              * becomes the generic syntax-error 2. g_bad_subst_soft is the
