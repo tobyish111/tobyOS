@@ -1588,6 +1588,7 @@ extern void shell_exit_jobs_hosted(void);
 extern int  shell_exit_trap_hosted(int status);
 extern int  shell_run_stdin_unit_hosted(const char *text, unsigned long lines);
 extern struct file *shell_stdin_file_hosted(void);
+extern int  shell_run_line_hosted_at(const char *text, unsigned long lines);
 extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
 extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
@@ -2221,7 +2222,7 @@ int main(int argc, char **argv) {
                 (void)!write(2, d0, strlen(d0));
             }
         }
-        last = interactive ? shell_run_line_hosted(accum)
+        last = interactive ? shell_run_line_hosted_at(accum, unit_line ? unit_line - 1 : 0)
                            : shell_run_stdin_unit_hosted(accum, unit_line ? unit_line - 1 : 0);
         /* ^C that landed DURING the command, rather than at the prompt.
          * The tty echoed "^C" with no newline of its own and the read loop

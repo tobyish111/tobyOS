@@ -22347,6 +22347,9 @@ static bool g_reader_comsub_lines;
  * hosted). */
 static bool g_reader_stdin_unit;
 static unsigned long g_reader_stdin_line;
+/* the lines before this text, g_reader_stdin_line, as a stdin unit's but
+ * nothing else of one: a line typed at the prompt, PROMPT_COMMAND */
+static bool g_reader_line_base_on;
 
 static int shell_run_script_text_in(char *text, bool run_exit_trap);
 
@@ -22367,8 +22370,9 @@ static int shell_run_script_text_in(char *text, bool run_exit_trap) {
     bool syn_base_set = g_reader_syn_base_set;
     unsigned long syn_base = g_reader_syn_base;
     bool comsub_lines = g_reader_comsub_lines;
-    bool stdin_unit = g_reader_stdin_unit;
+    bool stdin_unit = g_reader_stdin_unit || g_reader_line_base_on;
     g_reader_stdin_unit = false;
+    g_reader_line_base_on = false;
     bool nofork_scope = g_reader_nofork_scope;
     g_reader_nofork_scope = false;
     g_reader_syn_iname = 0;
@@ -56476,6 +56480,22 @@ const char *shell_decode_prompt_hosted(const char *ps) {
     kfree(last);
     last = d;
     return d;
+}
+
+/* A LINE TYPED AT AN INTERACTIVE SHELL IS NUMBERED ON FROM THE ONES BEFORE
+ * IT, as bash counts every line it reads: the second line's $LINENO is 2
+ * and a function called there has BASH_LINENO 2 -- tsh began each at 1
+ * (logs/b42 db3 m3; logs/b43 iln1) -- finding 595. LINES: lines read before
+ * this one. */
+int shell_run_line_hosted(const char *text);
+int shell_run_line_hosted_at(const char *text, unsigned long lines) {
+    if (g_interactive) {
+        g_reader_line_base_on = true;
+        g_reader_stdin_line = lines;
+    }
+    int rc = shell_run_line_hosted(text);
+    g_reader_line_base_on = false;
+    return rc;
 }
 
 int shell_run_line_hosted(const char *text) {
