@@ -10710,6 +10710,22 @@ static bool shell_decl_element(const char *word, size_t nlen, const char *lb,
     }
     const char *base = baseb.p;
     bool was_there = env_find(base, bl) >= 0 || sh_array_find(base) != 0;
+    if (make_local && shell_local_declared_here(base, g_script_depth)) {
+        int rx = env_find(base, bl);
+        /* AN ELEMENT OF THE FUNCTION'S OWN REFERENCE makes the reference's
+         * TARGET a fresh local and is assigned there: `f() { local -n x=arr;
+         * local -a x[1]=one; }` leaves the global arr as it was, and in f
+         * arr is ([1]="one"). tsh wrote the global's element (logs/b42
+         * nref20 e7; logs/b43 nref21, p24) -- finding 574 */
+        if (rx >= 0 && (g_env_flags[rx] & SHVAR_NAMEREF)) {
+            const char *t = g_env[rx] + bl + 1;
+            if (!*t || !shell_name_is_valid(t, strlen(t))) return true;
+            if (sb_set(&baseb, t) < 0) return false;
+            base = baseb.p;
+            bl = baseb.len;
+            was_there = env_find(base, bl) >= 0 || sh_array_find(base) != 0;
+        }
+    }
     if (make_local && !shell_local_declared_here(base, g_script_depth)) {
         if (shell_locals_push(base, g_script_depth) < 0) return false;
         int ix = env_find(base, bl);
