@@ -31931,7 +31931,10 @@ static int shell_append_array_join(struct shell_sb *b,
      * (Oils 2733), and in the word of ${A-W} in an assignment too
      * (finding 558). */
     bool null_unquoted = sh_star_fields();
+    /* (a case word's ${A-W} joins ${a[*]} itself with a space, logs/b43
+     * ifs3 k3) */
     if ((null_unquoted || sh_star_space()) && indices) { sep.c[0] = ' '; sep.n = 1; }
+    else if (sh_star_space() && g_star_case) { sep.c[0] = ' '; sep.n = 1; }
     else if (null_unquoted) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < n; i++) {
@@ -34820,7 +34823,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         if (ij) sh_sep_from_ifs(&sep, env_get("IFS"));
                         /* ...and $*'s forms in the word of ${A-W} in an
                          * assignment are joined by a space (finding 558) */
-                        if (star && posargs && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
+                        if (star && (posargs || g_star_case) && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
                         if ((!star || sf) && !rj && !ij && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
@@ -37678,6 +37681,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
      * decl_util flag; this is the tokenizer's half of it. */
     bool decl_util_cmd = false;
     bool literal_word = false;      /* the next word is a here-doc delimiter */
+    bool herestr_word = false;      /* ...a here-string (finding 560) */
     g_capture_last_status = 0;
 
     while (*p) {
@@ -37839,6 +37843,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
              * terminator. */
             if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS)
                 literal_word = true;
+            herestr_word = t == SH_TOK_HERESTRING;
             p++;
             continue;
         }
@@ -37916,6 +37921,13 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
          * joins with a space -- `declare y=$*` with a "b c" d is "a b c d",
          * `y=$*` "ab cd" (logs/b43 ifs2 m8, ifs3 k2) -- finding 559 */
         g_tok_word_decl_ctx = g_tok_word_assign_src && !prefix_ok && decl_util_cmd;
+        /* A HERE-STRING'S WORD IS ONE STRING: under a null IFS its "*" forms
+         * run together, `cat <<< $*` with a "b c" d is "ab cd" -- tsh gave
+         * "a b c d", its fields joined (logs/b43 ifs3 k4) -- finding 560.
+         * Its "@" forms still join with a space (finding 301). */
+        int word_star_ov = g_star_ov;
+        if (herestr_word) g_star_ov = SH_STAR_Q;
+        herestr_word = false;
         /* THE PREFIX IS FOR THE PREFIX. Its bindings are visible to the
          * assignment words after them (`A=q B=$A env` gives B=q) and to
          * nothing else on the line: bash expands the command word and the
@@ -38413,6 +38425,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         SH_LIT_CLOSE();
 #undef SH_LIT_CLOSE
         if (kw_hidden >= 0) g_tokpfx_n = kw_hidden;         /* set -k: see above */
+        g_star_ov = word_star_ov;
 
         if (got) {
             /* The finished word moves to storage that never moves again --
@@ -47615,7 +47628,16 @@ static const char *shell_dbr_val(struct shell_dbr *d, int i) {
     const char *p = d->raw[i];
     bool any_q = false, any_u = false;
     char *st = 0, *ds = 0;
-    if (shell_dbr_word(&p, sc, d->rp[i], d->rr[i], &any_q, &any_u) == 0) {
+    /* [[ ]]'s words are strings: "*" forms run together under a null IFS,
+     * as a case word's do (sh_star_ctx, g_star_case; finding 560) */
+    int ov = g_star_ov;
+    bool cw = g_star_case;
+    g_star_ov = SH_STAR_Q;
+    g_star_case = true;
+    int wrc = shell_dbr_word(&p, sc, d->rp[i], d->rr[i], &any_q, &any_u);
+    g_star_ov = ov;
+    g_star_case = cw;
+    if (wrc == 0) {
         bool keep = d->rr[i] || (d->rp[i] && any_u);
         if (!keep && sc->out.p) shell_strip_glob_escapes(sc->out.p);
         st = shell_dbr_store(d, sc->out.p ? sc->out.p : "");
@@ -49644,7 +49666,17 @@ static int shell_expand_case_word(const char *src, struct shell_sb *out) {
     struct shell_token *tok = 0;
     SH_WORDS(words);
     int ntok = 0;
-    if (shell_tokenize(src, &tok, &ntok, &words) < 0) return -1;
+    /* A CASE WORD IS ONE STRING: under a null IFS its "*" forms run
+     * together, `case $* in` with a "b c" d is "ab cd" -- tsh joined the
+     * fields with spaces (logs/b43 ifs3 k3) -- finding 560 */
+    int ov = g_star_ov;
+    bool cw = g_star_case;
+    g_star_ov = SH_STAR_Q;
+    g_star_case = true;
+    int trc = shell_tokenize(src, &tok, &ntok, &words);
+    g_star_ov = ov;
+    g_star_case = cw;
+    if (trc < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
         /* THE FIELDS OF A "$@" JOIN WITH A SPACE, as they do anywhere no
