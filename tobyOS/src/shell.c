@@ -56498,6 +56498,56 @@ int shell_run_line_hosted_at(const char *text, unsigned long lines) {
     return rc;
 }
 
+/* PROMPT_COMMAND, before each primary prompt of an interactive shell
+ * (bash's execute_prompt_command): each element of it, an array's in turn,
+ * run in this shell with the last command's $?, which it then leaves as it
+ * was; its $LINENO the lines read so far. tsh had none (logs/b43 iln1 i5-i7)
+ * -- finding 596. */
+void shell_prompt_command_hosted(unsigned long lines) {
+    if (!g_interactive) return;
+    SH_SB(texts);                       /* the elements, NUL-separated */
+    size_t n = 0;
+    struct sh_array *pa = sh_array_find("PROMPT_COMMAND");
+    if (pa) {
+        for (int i = 0; i < pa->n; i++) {
+            const char *e = pa->e[i].val ? pa->e[i].val : "";
+            if (sb_putmem(&texts, e, strlen(e) + 1) < 0) return;
+            n++;
+        }
+    } else {
+        const char *v = env_get("PROMPT_COMMAND");
+        if (!v || sb_putmem(&texts, v, strlen(v) + 1) < 0) return;
+        n = 1;
+    }
+    int saved = g_last_status;
+    const char *t = texts.p;
+    for (size_t k = 0; k < n && t; k++) {
+        size_t tl = strlen(t);
+        if (*shell_skip_blanks(t)) {
+            char *copy = shell_strdup(t);
+            if (!copy) break;
+            g_last_status = saved;
+            g_reader_syn_string = true;
+            g_reader_syn_repl = true;
+            g_reader_line_base_on = true;
+            g_reader_stdin_line = lines ? lines - 1 : 0;
+            (void)shell_run_script_text(copy, false);
+            g_reader_line_base_on = false;
+            kfree(copy);
+            if (g_shell_flow != SHELL_FLOW_NONE) break;
+        }
+        t += tl + 1;
+    }
+    if (g_shell_flow == SHELL_FLOW_EXIT)          /* `exit` in it: the trap */
+        (void)shell_run_exit_trap(g_shell_flow_status);
+    else if (g_shell_flow != SHELL_FLOW_NONE) {   /* ^C, an expansion error */
+        g_shell_flow = SHELL_FLOW_NONE;
+        g_shell_flow_status = 0;
+    }
+    if (g_shell_flow == SHELL_FLOW_NONE) g_last_status = saved;
+    (void)shell_take_interrupt();
+}
+
 int shell_run_line_hosted(const char *text) {
     if (!text) return 0;
     char *copy = shell_strdup(text);

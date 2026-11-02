@@ -1589,6 +1589,7 @@ extern int  shell_exit_trap_hosted(int status);
 extern int  shell_run_stdin_unit_hosted(const char *text, unsigned long lines);
 extern struct file *shell_stdin_file_hosted(void);
 extern int  shell_run_line_hosted_at(const char *text, unsigned long lines);
+extern void shell_prompt_command_hosted(unsigned long lines);
 extern bool shell_is_login_hosted(void);
 extern bool shell_hist_active_hosted(void);
 extern const char *shell_hist_line_hosted(const char *line, const char *accum, int *rc);
@@ -2027,6 +2028,16 @@ int main(int argc, char **argv) {
         if (g_tsh_sighup) tsh_hangup_exit();
         /* bash announces finished background jobs right before a prompt. */
         if (!cont) shell_notify_jobs_hosted();
+        if (!cont && interactive) {
+            shell_prompt_command_hosted(lines_read);
+            {
+                int pst;
+                if (shell_wants_exit_hosted(&pst)) {
+                    shell_exit_jobs_hosted();
+                    return pst;
+                }
+            }
+        }
         const char *ps = shell_get_var_hosted(cont ? "PS2" : "PS1");
         if (!ps) ps = cont ? "> " : "tsh$ ";
         ps = shell_decode_prompt_hosted(ps);    /* bash's decode_prompt_string */
