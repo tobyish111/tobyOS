@@ -53594,19 +53594,41 @@ static unsigned long shell_simple_cmd_lineno(const char *src) {
      * one it ends on -- `x=1 y=$(echo a<newline>echo b) z=$LINENO` is 1, and
      * tsh read the next word too and said 2 (logs/b12 p107 p108, WSL bash). */
     if (shell_text_assign_word(p, q)) {
-        unsigned long ln = shell_lineno_at(q - 1);
+        /* (the character that ends it, as for a second word below: `x=1\`
+         * and ` cmd` on the next line is that line's) */
+        unsigned long ln = *q ? shell_lineno_at(q) : 0;
+        if (!ln) ln = shell_lineno_at(q - 1);
         return ln ? ln : shell_lineno_at(p);
     }
     const char *last = q - 1;
     const char *r = q;
-    while (*r == ' ' || *r == '\t') r++;
+    while (*r == ' ' || *r == '\t' || (r[0] == '\\' && r[1] == '\n'))
+        r += *r == '\\' ? 2 : 1;
     if (*r == '(') return shell_lineno_at(p);          /* `name ()` */
     if (*r && *r != '\n' && !(SH_CR_BLANK && *r == '\r')) {
         const char *r0 = r;
         shell_scan_token(&st, &r);
-        if (r > r0) last = r - 1;
+        if (r > r0) {
+            last = r - 1;
+            /* bash's lexer reads on to the character that ends the word,
+             * and a backslash-newline before it goes too: after
+             * `cmd $(x)\<newline>   foo` the line is the second -- tsh
+             * stopped at the word (comsub-posix.tests; logs/b42 cms3 q1)
+             * -- finding 590. The reader has joined such lines already,
+             * the join in the line map: the ending character is the next
+             * line's first. */
+            while (r[0] == '\\' && r[1] == '\n') r += 2;
+            unsigned long ln = *r ? shell_lineno_at(r) : 0;
+            if (!ln) ln = shell_lineno_at(last);
+            return ln ? ln : shell_lineno_at(p);
+        }
     }
-    unsigned long ln = shell_lineno_at(last);
+    /* No second word: the line of what bash's lookahead read instead -- the
+     * newline, the operator, the end -- which after a continuation is the
+     * next line's: `nosuch \` and an empty line, or `nosuch\` and `;echo`,
+     * are line 2 (logs/b43 ln1 l4 l9). */
+    unsigned long ln = shell_lineno_at(r);
+    if (!ln) ln = shell_lineno_at(last);
     return ln ? ln : shell_lineno_at(p);
 }
 
