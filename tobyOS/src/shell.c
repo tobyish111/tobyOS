@@ -1806,6 +1806,9 @@ struct job {
     int  owner;                /* the shell process that started it: in a
                                 * forked subshell the copy is not its child
                                 * -- see shell_job_foreign */
+    bool settling;             /* `kill` has signalled it to death: the
+                                * reader's next line waits for its SIGCHLD --
+                                * see shell_jobs_settle_read */
 #else
     bool dying;                /* `kill` has signalled it to death: the next
                                 * look lets it finish dying -- see
@@ -2153,6 +2156,7 @@ static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
         struct proc *me = current_proc();
         j->owner = me ? me->pid : 0;
     }
+    j->settling = false;
 #else
     j->dying = false;
 #endif
@@ -2682,6 +2686,32 @@ static void shell_jobs_cleanup(void) {
  * Measured in WSL bash (logs/b12 p93 p99-p106): tsh noticed only after a
  * line and after a program, so a job killed before a ( ), a pipeline or a
  * $( ) was reported a line late. LINE is the line the report names. */
+/* A JOB `kill` HAS SIGNALLED TO DEATH HAS DIED BY THE TIME THE READER TAKES
+ * ITS NEXT LINE: under set -m, `kill %1 %2 %3` and `wait` on the next line
+ * is three "Terminated" in bash, 20 runs in 20 -- bash's reader and its
+ * looks make the system calls in which the kernel runs the dying jobs and
+ * delivers their SIGCHLD; tsh, its script read whole, makes none there, and
+ * reported one of the three or two (logs/b42 knrep*; logs/b43 knrep-p8) --
+ * finding 600. Such a look waits for their SIGCHLD, a millisecond apart, a
+ * tenth of a second at most; a look within a line -- `kill %1; wait` --
+ * still sees only what SIGCHLD has told it (Oils 0945, finding 44). */
+static void shell_jobs_settle_read(void) {
+    bool any = false;
+    for (int i = 0; i < JOB_MAX; i++) {
+        struct job *j = g_jobs[i];
+        if (!j->id || j->dead) j->settling = false;
+        if (j->settling) any = true;
+    }
+    for (int k = 0; any && k < 100; k++) {
+        shell_jobs_learn(false);
+        any = false;
+        for (int i = 0; i < JOB_MAX; i++)
+            if (g_jobs[i]->id && g_jobs[i]->settling && !g_jobs[i]->dead) any = true;
+        if (any) pit_sleep_ms(1);
+    }
+    for (int i = 0; i < JOB_MAX; i++) g_jobs[i]->settling = false;
+}
+
 #define SHELL_NOTIFY_READ   0
 #define SHELL_NOTIFY_WAITED 1
 static void shell_jobs_notify(unsigned long line, int how) {
@@ -2693,6 +2723,7 @@ static void shell_jobs_notify(unsigned long line, int how) {
         shell_jobs_learn(true);
     if (g_interactive || g_capture_depth > 0) return;
     if (how == SHELL_NOTIFY_READ) shell_coproc_reap();
+    if (how == SHELL_NOTIFY_READ) shell_jobs_settle_read();
     shell_jobs_learn(how == SHELL_NOTIFY_WAITED);
     unsigned long saved_line = g_shell_lineno;
     if (line) g_shell_lineno = line;
@@ -16596,7 +16627,6 @@ static int shell_job_poll_procs(struct job *j) {
 
 static int shell_job_poll_now(struct job *j);
 
-#ifndef SHELL_HOSTED
 /* DOES SIG END PROCESS PID, as it stands: SIGKILL, or a signal whose
  * default action ends a process that it neither ignores, catches nor
  * blocks. Every signal's default is to end the process except SIGCHLD,
@@ -16610,6 +16640,7 @@ static bool shell_signal_default_ends(int sig) {
         return sig > 0 && sig < SIG_MAX;
     }
 }
+#ifndef SHELL_HOSTED
 /* proc_signal_default: is process PID alive, and does it take SIG's default
  * action -- not blocking, ignoring or catching it? */
 static bool proc_signal_default(int pid, int sig) {
@@ -27580,6 +27611,9 @@ static void cmd_kill(int argc, char **argv) {
             }
 #ifndef SHELL_HOSTED
             jb->dying = ends;                      /* see shell_job_settle */
+#else
+            jb->settling = sig > 0 && (!was_stopped || cont || sig == SIGKILL) &&
+                           shell_signal_default_ends(sig);
 #endif
             if (cont) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
