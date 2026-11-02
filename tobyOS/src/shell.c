@@ -1698,8 +1698,19 @@ static int shell_enter_io_frame(struct shell_simple *cmd, const char *label,
                                 struct shell_io_frame *frame);
 static void shell_restore_io_frame(struct shell_io_frame *frame);
 
+/* A BUILTIN'S STATUS IS THE ONE IT SETS. A $( ) writes $? straight
+ * (shell_expand_command_subst, finding 589) and says so in g_status_subst;
+ * every status set here clears it. A builtin that expands a $( ) of its
+ * own -- `declare -a a=( "$(false)" )`, the list's words being declare's
+ * to expand -- and sets nothing after it ends with what it set itself,
+ * g_status_own (shell_run_builtin): bash's declare returns 0 there, and
+ * under set -e goes on (Oils 1526; logs/b43 os1526*) -- finding 602. */
+static int g_status_own;
+static bool g_status_subst;
 static void shell_set_status(int status) {
     g_last_status = status;
+    g_status_own = status;
+    g_status_subst = false;
 }
 
 /* A SYNTAX ERROR ENDS A SCRIPT, NOT A TERMINAL SESSION.
@@ -31987,7 +31998,9 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     g_hd_body = false;
     g_star_ov = -1;
     g_star_case = false;
+    int own = g_status_own;            /* its commands' are not the builtin's */
     int crc = shell_capture_command(cmd.p, &out);
+    g_status_own = own;
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
@@ -31997,8 +32010,9 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     /* ...AND ITS STATUS IS $? FROM HERE ON, as bash's: `false; echo
      * "$(true) $?"` prints 0, `f $(exit 5)` starts f with $? 5 -- tsh kept
      * the last command's until the next one ran (logs/b43 qst1) -- finding
-     * 589 */
+     * 589 -- but not a builtin's own (see shell_set_status) */
     g_last_status = g_capture_last_status;
+    g_status_subst = true;
     return sb_put_data_n(b, out.p, out.len);
 }
 
@@ -32092,7 +32106,9 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     g_hd_body = false;
     g_star_ov = -1;
     g_star_case = false;
+    int own = g_status_own;
     int rc = shell_capture_command(cmd.p, &out);
+    g_status_own = own;
     g_dq_depth = saved_dq;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
@@ -32100,6 +32116,7 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     g_star_case = saved_case;
     if (rc < 0) return -1;
     g_last_status = g_capture_last_status;      /* as for $( ), above */
+    g_status_subst = true;
     return sb_putmem(b, out.p, out.len);
 }
 
@@ -45435,6 +45452,8 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
     g_builtin_fds = &fds;
     g_this_builtin = c->fn;
     shell_call_builtin(c, cmd->argc, cmd->argv);
+    /* a $( ) it expanded itself, and no status set after it: its own */
+    if (g_status_subst) shell_set_status(g_status_own);
 #ifdef SHELL_HOSTED
     /* One write per builtin, like bash's flush at the end of each one (S2;
      * see kputc in programs/tsh/host.c). */
