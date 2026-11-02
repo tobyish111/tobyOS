@@ -37373,6 +37373,8 @@ static bool shell_is_digit(char c) {
  * which is after every tokenizer it started has already run. */
 static bool shell_glob_meta(char c);
 static int shell_escape_glob_range(struct shell_sb *b, size_t from);
+static bool sh_wb_in_bracket(const char *b, size_t n);
+static int sh_escape_bracket_slashes(struct shell_sb *b, size_t from);
 
 /* ---- BRACE EXPANSION ------------------------------------------------ *
  *
@@ -38827,7 +38829,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         p++;
                     }
                 }
-                if (shell_escape_glob_range(&wb,ansi_start) < 0) return -1;
+                if (shell_escape_glob_range(&wb,ansi_start) < 0 ||
+                    sh_escape_bracket_slashes(&wb, ansi_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p == '\'') p++;
                 continue;
@@ -38846,7 +38849,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                         return -1;
                     }
                 }
-                if (shell_escape_glob_range(&wb,sq_start) < 0) return -1;
+                if (shell_escape_glob_range(&wb,sq_start) < 0 ||
+                    sh_escape_bracket_slashes(&wb, sq_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '\'') {
                     kprintf(SH_PFX_SHELL "unmatched single quote\n");
@@ -38907,7 +38911,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                 g_dq_depth--;
                 g_bsub_unit = bsub_word;
                 g_bsub_unit_kind = SH_BSUB_WORD;
-                if (shell_escape_glob_range(&wb,dq_start) < 0) return -1;
+                if (shell_escape_glob_range(&wb,dq_start) < 0 ||
+                    sh_escape_bracket_slashes(&wb, dq_start) < 0) return -1;
                 if (sb_putc(&wb,SHELL_NOSPLIT_MARK) < 0) return -1;
                 if (*p != '"') {
                     kprintf(SH_PFX_SHELL "unmatched double quote\n");
@@ -38929,7 +38934,8 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
                  * treats it as an ordinary character -- `echo [\\[z]` has to
                  * match a file actually named `[`. The escape comes off again
                  * where the word becomes an argument. */
-                if ((shell_glob_meta(ec) || ec == '=') &&
+                if ((shell_glob_meta(ec) || ec == '=' ||
+                     (ec == '/' && sh_wb_in_bracket(wb.p, wb.len))) &&  /* (578) */
                     sb_putc(&wb,SHELL_GLOB_ESC) < 0) {
                     kprintf(SH_PFX_SHELL "word too long\n");
                     return -1;
@@ -39899,6 +39905,50 @@ static int shell_escape_glob_range(struct shell_sb *b, size_t from) {
     b->len += extra;
     buf[b->len] = '\0';
     return 0;
+}
+
+/* Is the word built so far -- B's first N bytes -- inside an open bracket
+ * expression, an unescaped `[` that no `]` has closed yet? */
+static bool sh_wb_in_bracket(const char *b, size_t n) {
+    bool in = false;
+    size_t open_at = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = b[i];
+        if ((c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) && i + 1 < n) { i++; continue; }
+        if (c == SHELL_NOSPLIT_MARK) continue;
+        if (!in && c == '[') { in = true; open_at = i; continue; }
+        if (in && c == ']') {
+            size_t j = open_at + 1;             /* `[]...]` and `[!]...]` */
+            while (j < i && b[j] == SHELL_NOSPLIT_MARK) j++;
+            if (j < i && (b[j] == '!' || b[j] == '^')) j++;
+            while (j < i && b[j] == SHELL_NOSPLIT_MARK) j++;
+            if (j == i) continue;
+            in = false;
+        }
+    }
+    return in;
+}
+
+/* A `/` QUOTED OR ESCAPED INSIDE A BRACKET KEEPS AN ESCAPE: `[qwe\/qwe]` and
+ * `[qwe"/"]` are bracket expressions -- ones no file name matches, so
+ * nullglob takes them away and failglob fails -- where a bare `/` ends the
+ * bracket and the word is a name. tsh dropped the escape, and the word was
+ * the bare-slash one (bash's glob7.sub; logs/b42 gl1 h3; logs/b43 glb1) --
+ * finding 578. From FROM on, B's span is the quoted text. */
+static int sh_escape_bracket_slashes(struct shell_sb *b, size_t from) {
+    if (!sh_wb_in_bracket(b->p, from)) return 0;
+    SH_SB(t);
+    for (size_t i = from; i < b->len; i++) {
+        char c = b->p[i];
+        if ((c == SHELL_GLOB_ESC || c == SHELL_DATA_ESC) && i + 1 < b->len) {
+            if (sb_putc(&t, c) < 0 || sb_putc(&t, b->p[++i]) < 0) return -1;
+            continue;
+        }
+        if (c == '/' && sb_putc(&t, SHELL_GLOB_ESC) < 0) return -1;
+        if (sb_putc(&t, c) < 0) return -1;
+    }
+    sb_truncate(b, from);
+    return t.len ? sb_putmem(b, t.p, t.len) : 0;
 }
 
 /* Undo it: one backslash before a metacharacter goes away. */
