@@ -44896,6 +44896,18 @@ static void shell_prefix_restore(struct shell_prefix_save *sv) {
     sv->count = 0;
 }
 
+/* posix mode: a special builtin whose redirection fails ends a
+ * non-interactive shell, status 1 -- `: </nosuch`, `set -- a </nosuch`,
+ * `exec 5</nosuch`, one an eval runs too; not `command :` or `command
+ * exec`, whose redirections are command's (logs/b43 rdx3 e6 e9) -- tsh went
+ * on -- finding 587 */
+static void shell_special_redir_failed(void) {
+    if (g_opt_posix && !g_interactive && g_shell_flow == SHELL_FLOW_NONE) {
+        g_shell_flow = SHELL_FLOW_EXIT;
+        g_shell_flow_status = 1;
+    }
+}
+
 static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
                              char **assignv, int assignc,
                              bool persist_assignments) {
@@ -44930,6 +44942,7 @@ static int shell_run_builtin(struct shell_simple *cmd, const struct cmd *c,
 #ifndef SHELL_HOSTED
         shell_diag_pop(&diag_save);
 #endif
+        if (shell_special_builtin_name(c->name)) shell_special_redir_failed();
         return 1;
     }
     if (assignc > 0 && !persist_assignments) {
@@ -46398,6 +46411,7 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
             shell_fd_state_init_from_defaults(&fds);
             if (shell_apply_redirs(cmd, &fds, "exec") < 0) {
                 shell_fd_state_close_owned(&fds);
+                if (!via_command) shell_special_redir_failed();
                 return 1;
             }
             if (!shell_fd_table_reserve(fds.n - 1)) {
