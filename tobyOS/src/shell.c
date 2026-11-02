@@ -9257,6 +9257,18 @@ static int shell_arith_eval(const char *expr, const char *cmdname, long *out) {
     char *msg = 0;
     long v = 0;
     int k = sarith_eval(expr, &env, &v, &msg);
+    /* THE TEXT AS bash's PARSER LEAVES IT: a $'...' is '...' there, where
+     * tsh's message showed the marks its expander wraps the span in, and
+     * the escape before a ^A it decoded -- `$(( $'12' + 1 ))` was
+     * "^B12^B + 1 : syntax error" (logs/b43 ctl2 d1, p18) -- finding 569 */
+    if (k == SARITH_ERROR && msg) {
+        char *w = msg;
+        for (const char *r = msg; *r; r++) {
+            if (*r == SHELL_DATA_ESC && r[1]) { *w++ = *++r; continue; }
+            *w++ = *r == SHELL_NOSPLIT_MARK ? '\'' : *r;
+        }
+        *w = '\0';
+    }
     if (k == SARITH_ERROR && msg)
         kprintf("%s%s%s\n", cmdname ? cmdname : "", cmdname ? ": " : "", msg);
     else if (k == SARITH_UNBOUND)
