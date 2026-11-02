@@ -30453,11 +30453,17 @@ static int shell_explain_spawn_failure(const char *path, const char *as_typed,
  * caller frees it. */
 static char **shell_script_argv(const char *path, int argc, char **argv,
                                 int *out_n) {
-    char **out = (char **)kmalloc((size_t)(argc + 3) * sizeof(char *));
+    char **out = (char **)kmalloc((size_t)(argc + 5) * sizeof(char *));
     *out_n = 0;
     if (!out) return 0;
     int n = 0;
     out[n++] = (char *)"/bin/tsh";
+    /* THE SCRIPT STARTS AS A FRESH SHELL BUT FOR globskipdots, which it
+     * keeps from this one: bash's shopt1.sub, a #!-less script's `shopt`
+     * after `shopt -u globskipdots` says off, where tsh's said on
+     * (logs/b43 glb1 s1-s5) -- finding 579 */
+    out[n++] = (char *)(g_shopt_misc[37] ? "-O" : "+O");
+    out[n++] = (char *)"globskipdots";
     out[n++] = (char *)path;
     for (int i = 1; i < argc; i++) out[n++] = argv[i];
     out[n] = 0;
