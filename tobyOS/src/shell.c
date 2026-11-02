@@ -35747,9 +35747,11 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
  * A quoted span arrives wrapped in no-split markers, so a `~` that is still
  * the FIRST byte was unquoted; and g_dq_depth is what says whether the whole
  * substitution sits inside double quotes. tsh expanded none of the four. */
+/* ...nor in a here-document's: bash leaves `${zz:-~}` there as ~ (logs/b43
+ * p14) -- finding 565 */
 #define SH_WORD_TILDE()                                                       \
     do {                                                                      \
-        if (g_dq_depth == 0 &&                                                \
+        if (g_dq_depth == 0 && !g_hd_body &&                                  \
             shell_word_tilde_ex(&ewb, g_tok_word_assign_ctx) < 0)             \
             return -1;                                                        \
     } while (0)
