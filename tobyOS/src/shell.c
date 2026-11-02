@@ -55903,6 +55903,16 @@ void shell_startup_files_hosted(int login, bool interactive, bool norc,
     } else if (!g_opt_privileged) {
         shell_source_env_file("ENV");
     }
+    /* ...AND THEN THE HISTORY FILE, as bash's interactive shell reads it
+     * once its startup files have run: ^R and ^P find its lines (bash's
+     * history4.sub; logs/b43 hst4 k1 k2) -- finding 599. Only a HISTFILE
+     * that is set and not empty: unset, tsh's default would be readline's
+     * ~/.history, where bash's is ~/.bash_history. */
+    const char *hf = env_get("HISTFILE");
+    if (g_opt_history && hf && *hf) {
+        shell_hist_var_written("HISTSIZE", 8);  /* the bound it keeps to */
+        shell_history_enable_load();
+    }
 }
 
 /* A login shell that exits -- at EOF when interactive, or by `exit` --

@@ -2050,9 +2050,17 @@ int main(int argc, char **argv) {
          * a pipe, a file, `echo cmd | tsh` -- keeps the plain reader below,
          * because there is no cursor to move there and putting a non-tty
          * into raw mode would break it. */
-        if (!noediting && tsh_lineedit_available()) {
+        /* ...AND AN INTERACTIVE SHELL READING A PIPE EDITS ITS LINES TOO, as
+         * bash's readline does with -i: `^R left ^O`, `^P ^P ^O` over keys
+         * piped in (bash's history4.sub) -- the editor drawing nothing until
+         * a line is accepted, then the prompt and the line, the plain
+         * reader's echo (tsh_readline_pipe) -- finding 599 */
+        bool le_tty = !noediting && tsh_lineedit_available();
+        bool le_pipe = !le_tty && !noediting && interactive;
+        if (le_tty || le_pipe) {
             g_tsh_le_async = interactive;     /* around its reads alone */
-            long r = tsh_readline(ps, &line, &line_cap);
+            long r = le_tty ? tsh_readline(ps, &line, &line_cap)
+                            : tsh_readline_pipe(ps, &line, &line_cap);
             g_tsh_le_async = 0;
             if (r == TSH_LE_INTR) {
                 /* The editor's ^C is a byte it read in raw mode, not the
@@ -2081,6 +2089,7 @@ int main(int argc, char **argv) {
                     shell_exit_jobs_hosted();
                     return st;
                 }
+                if (le_pipe) at_eof = 1;     /* the input ended in a command */
                 n = 0;
             } else {
                 n = (size_t)r;

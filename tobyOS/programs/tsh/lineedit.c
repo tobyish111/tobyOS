@@ -90,7 +90,12 @@ enum { LC_OTHER, LC_INSERT, LC_KILL_F, LC_KILL_B, LC_YANK };
 /* EVERYTHING THE EDITOR DRAWS GOES TO STANDARD ERROR -- bash sets readline's
  * output stream to stderr (bashline.c), so `tsh -i >file` still shows the
  * prompt and the line being typed. */
-static void out(const char *s, size_t n) { (void)!write(2, s, n); }
+/* ...and over a pipe it draws nothing as it goes: an interactive shell
+ * reading a pipe edits its lines as bash's readline does there (^R, ^O,
+ * ^P), and what shows is the prompt and the line it accepted, once, the
+ * echo the plain reader gave (tsh_readline_pipe). */
+static bool g_le_pipe;
+static void out(const char *s, size_t n) { if (!g_le_pipe) (void)!write(2, s, n); }
 static void outs(const char *s) { out(s, strlen(s)); }
 static void bell(void) { out("\a", 1); }
 
@@ -582,13 +587,17 @@ static int isearch(struct le *s, int dir) {
         int c = read_key();
         if (c < 0) { rc = 0; break; }
         if (c == 3 || c == 7) { rc = c == 3 ? -1 : 0; break; }
+        /* ESC and ^J end the search on the line found, to be edited; Return
+         * runs it -- readline's isearch-terminators: `^R one` then a
+         * newline leaves `echo one` there, and the ^P after it walks back
+         * from that entry (logs/b43 hst4 k4) */
         if (c == 27 || c == 13 || c == 10) {
             if (found >= 0) {
                 set_line(s, shell_history_get_hosted(found));
                 s->hist = found;
                 le_set_orig(s);
             }
-            rc = (c == 13 || c == 10) ? 1 : 0;
+            rc = c == 13 ? 1 : 0;
             break;
         }
         int again = 0;
@@ -610,7 +619,18 @@ static int isearch(struct le *s, int dir) {
             q[qn++] = (char)c;
             q[qn] = 0;
         } else {
-            continue;
+            /* ANY OTHER CONTROL KEY ENDS THE SEARCH AND IS THEN ITSELF, on
+             * the line found, as readline's: `^R left ^O` runs the line
+             * with "left" in it and fetches the next -- tsh dropped the ^O
+             * (bash's history4.sub) -- finding 599 */
+            if (found >= 0) {
+                set_line(s, shell_history_get_hosted(found));
+                s->hist = found;
+                le_set_orig(s);
+            }
+            g_pushback = c;
+            rc = 0;
+            break;
         }
 
         int count = shell_history_count_hosted();
@@ -1152,7 +1172,7 @@ static void char_search(struct le *s, int dir) {
 
 /* operate-and-get-next (^O): the line runs, and the next prompt starts on
  * the history line after it */
-static int g_next_hist = -1;
+static long g_next_hist = -1;
 
 /* ---- vi ------------------------------------------------------------------ */
 
@@ -1856,21 +1876,46 @@ static void le_echo_intr(void) {
     if (g_le_echoctl) outs("^C");
 }
 
+static long le_readline(const char *prompt, char **bufp, size_t *capp, bool tty);
+
 long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
+    return le_readline(prompt, bufp, capp, true);
+}
+
+/* The editor over a pipe (see g_le_pipe): no terminal to set, nothing drawn
+ * while the keys are read, and the prompt and the line accepted shown once
+ * at the end -- the bytes the plain reader's echo gave. */
+long tsh_readline_pipe(const char *prompt, char **bufp, size_t *capp) {
+    g_le_pipe = true;
+    long r = le_readline(prompt, bufp, capp, false);
+    g_le_pipe = false;
+    const char *p = prompt ? prompt : "";
+    (void)!write(2, p, strlen(p));          /* at the end of input too */
+    if (r >= 0) {
+        (void)!write(2, *bufp, (size_t)r);
+        (void)!write(2, "\n", 1);
+    }
+    return r;
+}
+
+static long le_readline(const char *prompt, char **bufp, size_t *capp, bool tty) {
     struct termios orig, raw;
     if (!bufp || !capp) return TSH_LE_EOF;
-    if (tcgetattr(0, &orig) != 0) return TSH_LE_EOF;
-    g_le_echoctl = (orig.c_lflag & ECHOCTL) != 0;
-    raw = orig;
-    /* ICANON off so every keystroke arrives; ECHO off because we paint the
-     * line ourselves; ISIG off because ^C belongs to the editor while a line
-     * is being typed. All restored before returning, so a COMMAND runs under
-     * a normal tty and job control still routes ^C/^Z to the foreground job. */
-    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG);
-    raw.c_iflag &= (tcflag_t)~(IXON | ICRNL);
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(0, TCSANOW, &raw) != 0) return TSH_LE_EOF;
+    if (tty) {
+        if (tcgetattr(0, &orig) != 0) return TSH_LE_EOF;
+        g_le_echoctl = (orig.c_lflag & ECHOCTL) != 0;
+        raw = orig;
+        /* ICANON off so every keystroke arrives; ECHO off because we paint
+         * the line ourselves; ISIG off because ^C belongs to the editor while
+         * a line is being typed. All restored before returning, so a COMMAND
+         * runs under a normal tty and job control still routes ^C/^Z to the
+         * foreground job. */
+        raw.c_lflag &= (tcflag_t)~(ICANON | ECHO | ISIG);
+        raw.c_iflag &= (tcflag_t)~(IXON | ICRNL);
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(0, TCSANOW, &raw) != 0) return TSH_LE_EOF;
+    }
 
     struct le s;
     memset(&s, 0, sizeof s);
@@ -1879,7 +1924,7 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
     s.buf = *bufp;
     s.cap = *capp;
     s.u8 = shell_utf8_hosted();
-    if (!le_room(&s, 0)) { (void)tcsetattr(0, TCSANOW, &orig); return TSH_LE_EOF; }
+    if (!le_room(&s, 0)) { if (tty) (void)tcsetattr(0, TCSANOW, &orig); return TSH_LE_EOF; }
     s.prompt = prompt ? prompt : "";
     s.plen = strlen(s.prompt);
     s.hist = shell_history_count_hosted();
@@ -1888,9 +1933,12 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
     s.vcmd = false;
     g_pushback = -1;
     /* ^O left the history line after the one it ran for this prompt */
-    if (g_next_hist >= 0 && g_next_hist < s.hist) {
-        s.hist = g_next_hist;
-        set_line(&s, shell_history_get_hosted(g_next_hist));
+    /* (a history NUMBER: the line ^O ran may have pushed the oldest entry
+     * out under HISTSIZE, and the index would then be one past it) */
+    long nh = g_next_hist >= 0 ? g_next_hist - (long)shell_history_base_hosted() : -1;
+    if (nh >= 0 && nh < s.hist) {
+        s.hist = (int)nh;
+        set_line(&s, shell_history_get_hosted((int)nh));
     }
     g_next_hist = -1;
     le_set_orig(&s);
@@ -2049,7 +2097,8 @@ long tsh_readline(const char *prompt, char **bufp, size_t *capp) {
         if (c == 7)  { bell(); continue; }               /* ^G */
         if (c == 15) {                                  /* ^O */
             int count = shell_history_count_hosted();
-            g_next_hist = s.hist < count ? s.hist + 1 : -1;
+            g_next_hist = s.hist < count
+                              ? (long)shell_history_base_hosted() + s.hist + 1 : -1;
             le_below(&s);
             ret = (long)s.len;
             break;
@@ -2174,6 +2223,6 @@ done:
     le_undo_clear(&s);
     free(s.undo);
     g_recording = false;
-    (void)tcsetattr(0, TCSANOW, &orig);
+    if (tty) (void)tcsetattr(0, TCSANOW, &orig);
     return ret;
 }

@@ -27,4 +27,9 @@ int  tsh_lineedit_available(void);
 /* *BUFP (malloc'd, *CAPP bytes, either may be 0/NULL) grows as the line
  * does; the caller keeps it between calls and frees it. */
 long tsh_readline(const char *prompt, char **bufp, size_t *capp);
+
+/* The same editor over input that is no terminal -- an interactive shell
+ * reading a pipe, as bash's readline edits there -- drawing nothing until
+ * the line is accepted, then the prompt and the line on stderr. */
+long tsh_readline_pipe(const char *prompt, char **bufp, size_t *capp);
 #endif
