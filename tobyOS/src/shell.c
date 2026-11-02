@@ -14803,11 +14803,13 @@ static int shell_read_line_from_file(struct file *in, bool raw,
     for (;;) {
         if (maxchars >= 0 && nch >= maxchars) { escaped = false; break; }
         /* `read -t`: the line's deadline (g_rl_deadline_ns) -- each byte
-         * waits only for what is left of it */
+         * waits only for what is left of it, and once it has passed no
+         * byte is read, there or not: bash's timer stops the read where
+         * it is (logs/b43 rd5 t2) */
         if (g_rl_deadline_ns) {
             uint64_t now = perf_now_ns();
-            long left = now >= g_rl_deadline_ns ? 0
-                      : (long)((g_rl_deadline_ns - now + 999999ull) / 1000000ull);
+            if (now >= g_rl_deadline_ns) { timed_out = true; break; }
+            long left = (long)((g_rl_deadline_ns - now + 999999ull) / 1000000ull);
             if (!shell_read_wait_ready(in, left)) { timed_out = true; break; }
         }
         char c = 0;
@@ -15052,6 +15054,7 @@ static void cmd_read(int argc, char **argv) {
     long maxchars = -1;
     bool exact = false;                 /* -N: delimiter is data, no split */
     long timeout_ms = -1;               /* -t: <0 none, 0 poll, >0 wait   */
+    long timeout_us = 0;
     int use_fd = -1;
     const char *array_name = 0;
     const char *prompt = 0;
@@ -15115,15 +15118,22 @@ static void cmd_read(int argc, char **argv) {
                 for (; *q; q++) {
                     if (*q == '.' && !dot) { dot = true; continue; }
                     if (*q < '0' || *q > '9') { ok = false; break; }
-                    if (!dot) whole = whole * 10 + (*q - '0');
-                    else if (fdiv < 1000) { frac = frac * 10 + (*q - '0'); fdiv *= 10; }
+                    if (!dot) {
+                        whole = whole * 10 + (*q - '0');
+                        if (whole > 1000000000L) whole = 1000000000L;
+                    } else if (fdiv < 1000000) { frac = frac * 10 + (*q - '0'); fdiv *= 10; }
                 }
                 if (!ok) {
                     kprintf("read: %s: invalid timeout specification\n", arg);
                     shell_set_status(1);
                     return;
                 }
-                timeout_ms = whole * 1000 + (fdiv > 1 ? frac * (1000 / fdiv) : 0);
+                /* in microseconds, as bash's: `-t 0.00001` is a wait that
+                 * runs out, not -t 0's look at the input -- tsh kept three
+                 * digits and polled (read7.sub; logs/b43 rd5) -- finding
+                 * 585 */
+                timeout_us = whole * 1000000 + (fdiv > 1 ? frac * (1000000 / fdiv) : 0);
+                timeout_ms = timeout_us ? (timeout_us + 999) / 1000 : 0;
                 break;
             }
             case 'u': {
@@ -15184,6 +15194,7 @@ static void cmd_read(int argc, char **argv) {
     }
 
     if (timeout_ms >= 0) {
+        uint64_t t0 = perf_now_ns();
         int ready = shell_read_wait_ready(in, timeout_ms);
         if (timeout_ms == 0) {
             /* bash: read nothing, report whether input is available */
@@ -15201,8 +15212,9 @@ static void cmd_read(int argc, char **argv) {
         /* THE TIMEOUT IS FOR THE WHOLE LINE, not its first byte: with
          * `{ printf ab; sleep 3; echo c; } | read -t 1 x` bash gives up at
          * one second with x=ab and 142; tsh waited for the newline and
-         * said x=abc, 0 (shell_read_line_from_file) */
-        g_rl_deadline_ns = perf_now_ns() + (uint64_t)timeout_ms * 1000000ull;
+         * said x=abc, 0 (shell_read_line_from_file). It runs from before
+         * the first wait, as bash's timer does. */
+        g_rl_deadline_ns = t0 + (uint64_t)timeout_us * 1000ull;
     }
 
     SH_SB(linesb);
