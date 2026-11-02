@@ -1562,6 +1562,7 @@ static bool g_tok_word_assign_ctx;          /* see its definition */
 static bool g_tok_word_decl_ctx;            /* ...and g_tok_word_assign_ctx's */
 enum { SH_STAR_FIELDS, SH_STAR_Q, SH_STAR_U, SH_STAR_HD, SH_STAR_DQ };
 static int g_star_ov = -1;                  /* see sh_star_ctx */
+static const char *g_tok_word_src;          /* the word read, as written */
 static bool g_star_case;                    /* ...a case word's or [[ ]]'s */
 static void shell_bad_subst(bool fatal);
 /* THE TEXT bash NAMES IN "TEXT: bad substitution": the string its expansion
@@ -32178,8 +32179,10 @@ static int shell_expand_word_ex_in(const char *word, struct shell_sb *out,
             continue;
         }
         /* ...and with extquote off, a ${x-WORD} word inside "..." takes it
-         * so too (logs/b42 px4 r2) -- finding 477 */
-        if (*p == '$' && p[1] == '\'' && value_word && !g_shopt_misc[11] &&
+         * so too (logs/b42 px4 r2) -- finding 477 -- and in posix mode
+         * (logs/b43 ansi1 q10) -- finding 563 */
+        if (*p == '$' && p[1] == '\'' && value_word &&
+            (!g_shopt_misc[11] || g_opt_posix) &&
             (g_dq_depth > 0 || g_dq_word)) {
             if (sb_putc(out, *p++) < 0) return -1;
             continue;
@@ -34119,6 +34122,60 @@ static void shell_bad_subst(bool fatal) {
     }
 }
 
+/* bash's "no closing `}'": its second read of a ${ } (finding 563), named
+ * as shell_bad_subst names the text, and an expansion error the same way. */
+static void shell_bad_subst_noclose(void) {
+    SH_SB(u);
+    SH_SB(ud);
+    const char *t = "";
+    /* the shell word the expansion is in, quotes and all, where "bad
+     * substitution" names the inside of the quotes */
+    const char *w = g_tok_word_src ? g_tok_word_src : g_bsub_unit;
+    int wk = g_tok_word_src ? SH_BSUB_WORD : g_bsub_unit_kind;
+    if (w && sb_putmem(&u, w, sh_bsub_unit_len(w, wk)) == 0)
+        t = sh_bsub_disp_text(u.p ? u.p : "", &ud) > 0 ? ud.p : (u.p ? u.p : "");
+    kprintf("bad substitution: no closing `}' in %s\n", t);
+    shell_set_status(1);
+    if (g_opt_posix && !g_interactive) {
+        if (g_shell_flow == SHELL_FLOW_NONE) {
+            g_shell_flow = SHELL_FLOW_EXIT;
+            g_shell_flow_status = shell_fatal_status();
+        }
+    } else {
+        g_bad_subst_soft = true;
+    }
+}
+
+/* The second read of a ${ }'s text E (N bytes) bash gives it in double
+ * quotes once a value word's $'...' is in it: where its `}` is -- quotes
+ * pair, a backslash escapes, `...`, $( ) and ${ } are stepped over. The
+ * index of a `}` that comes first, N when there is none, -1 when a quote
+ * is not closed (finding 563). */
+static const char *shell_skip_dollar_group(const char *p);
+static long sh_brace_rescan(const char *e, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        char c = e[i];
+        if (c == '\\') { i += 2; continue; }
+        if (c == '\'' || c == '"' || c == '`') {
+            size_t j = i + 1;
+            while (j < n && e[j] != c) j += (c != '\'' && e[j] == '\\') ? 2 : 1;
+            if (j >= n) return -1;
+            i = j + 1;
+            continue;
+        }
+        if (c == '$' && i + 1 < n && (e[i + 1] == '{' || e[i + 1] == '(')) {
+            const char *g = shell_skip_dollar_group(e + i);
+            if (!g || (size_t)(g - e) > n) return -1;
+            i = (size_t)(g - e);
+            continue;
+        }
+        if (c == '}') return (long)i;
+        i++;
+    }
+    return (long)n;
+}
+
 static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b);
 
 static int shell_expand_braced_parameter(const char *expr, struct shell_sb *b) {
@@ -35878,6 +35935,14 @@ static size_t sh_arith_dollar_span(const char *p) {
     int d = 1;
     while (p[i] && d) {
         if (p[i] == '\\' && p[i + 1]) { i += 2; continue; }
+        /* a $'...' honours \' (the span named in shell_bad_subst_noclose ran
+         * on past `"${zz-$'it\'s'}"`, finding 563) */
+        if (p[i] == '$' && p[i + 1] == '\'') {
+            i += 2;
+            while (p[i] && p[i] != '\'') i += (p[i] == '\\' && p[i + 1]) ? 2 : 1;
+            if (p[i]) i++;
+            continue;
+        }
         if (p[i] == '\'') {
             i++;
             while (p[i] && p[i] != '\'') i++;
@@ -36647,6 +36712,7 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
          * Without it `"${x//$'\''/_}"` closed the quote at the escaped one,
          * ran on past the `}`, and reported "unterminated ${...}". */
         bool sq = false, dq = false, sq_ansi = false;
+        bool rescan = false;            /* sh_brace_rescan: finding 563 */
         while (*p && csp > 0) {
             char c = *p;
             if (n + 2 >= expr_cap) {
@@ -36697,6 +36763,33 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
                 p = q;
                 continue;
             }
+            /* ...AND IN A VALUE WORD -- of - + = ? -- TOO, as text of the
+             * expression: bash reads the expression again for its `}`, its
+             * quotes pairing, so `"${zz-$'it\'s'}"` is "bad substitution: no
+             * closing `}' in "${zz-it's}"", a decoded `}` closes it, and a
+             * decoded `$HOME` or `\\` is the word's own. With extquote off
+             * the `$'...'` stays as written and is read again the same way.
+             * tsh gave <it's> (logs/b42 px4 r2, logs/b43 ansi1, p15) --
+             * finding 563. */
+            if (c == '$' && p[1] == '\'' && !sq_plain && csp == 1 &&
+                !g_opt_posix && !g_hd_body &&
+                (g_dq_depth > 0 || g_dq_word) &&
+                sh_brace_word_kind(expr, n) == 2) {
+                rescan = true;
+                if (g_shopt_misc[11]) {
+                    const char *q = p + 2;
+                    SH_SB(dec);
+                    if (sh_ansic_decode_to(&q, &dec) < 0) return -1;
+                    if (n + dec.len + 2 >= expr_cap) {
+                        kprintf(SH_PFX_SHELL "${...} too long\n");
+                        return -1;
+                    }
+                    memcpy(expr + n, dec.p ? dec.p : "", dec.len);
+                    n += dec.len;
+                    p = q;
+                    continue;
+                }
+            }
             if (c == '$' && p[1] == '\'' && !sq_plain) {
                 sq = true; sq_ansi = true;
                 expr[n++] = *p++; expr[n++] = *p++;
@@ -36739,6 +36832,21 @@ static int shell_expand_var(const char **pp, struct shell_sb *b) {
         }
         expr[n] = '\0';
         *pp = p;
+        if (rescan) {
+            long cut = sh_brace_rescan(expr, n);
+            if (cut < 0) {
+                shell_bad_subst_noclose();
+                return -1;
+            }
+            if ((size_t)cut < n) {
+                /* the rest is text after the expansion, with the brace
+                 * that closed the source's: `"${zz-$'q\x7dr'}"` is qr} */
+                expr[cut] = '\0';
+                if (shell_expand_braced_parameter(expr, b) < 0) return -1;
+                if (sb_put_data_str(b, expr + cut + 1) < 0) return -1;
+                return sb_putc(b, '}');
+            }
+        }
         return shell_expand_braced_parameter(expr, b);
     }
     if (!shell_var_start(*p)) {
@@ -37579,6 +37687,7 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     bool saved_assign_ctx = g_tok_word_assign_ctx;
     bool saved_decl_ctx = g_tok_word_decl_ctx;
     int saved_star_ov = g_star_ov;
+    const char *saved_word_src = g_tok_word_src;
     bool saved_expanded = g_tok_word_expanded;
     const char *saved_fdvar = g_tok_fdvar;
     const char *saved_bsub = g_bsub_unit;     /* points into this read */
@@ -37593,6 +37702,7 @@ static int shell_tokenize(const char *src, struct shell_token **out_tok,
     g_tok_word_assign_ctx = saved_assign_ctx;
     g_tok_word_decl_ctx = saved_decl_ctx;
     g_star_ov = saved_star_ov;
+    g_tok_word_src = saved_word_src;
     g_tok_word_expanded = saved_expanded;
     g_tok_fdvar = saved_fdvar;
     *out_tok = tv.v;
@@ -37915,6 +38025,7 @@ static int shell_tokenize_inner(const char *src, struct shell_tokv *tok,
         }
         bool word_quoted = false;
         const char *raw_word_start = p;      /* shell_token.raw */
+        g_tok_word_src = p;                  /* shell_bad_subst_noclose */
         /* an ASSIGNMENT's value is expanded on its own, and is what a bad
          * substitution in it names (`x=${a[]}` names `${a[]}`); a
          * declaration utility's operand is a word like any other */
