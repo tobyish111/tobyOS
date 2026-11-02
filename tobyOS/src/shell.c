@@ -31871,6 +31871,11 @@ static int shell_append_positional_join(struct shell_sb *b,
         }
         return 0;
     }
+    /* ...and where no split follows but the word is not quoted -- the word
+     * of ${A-W} in an assignment, a declaration's value -- a space:
+     * `IFS=; y=${A-$*}` with a "b c" d is "a b c d" (bash's array24.sub;
+     * logs/b42 t17, logs/b43 ifs1 n8) -- finding 558 */
+    if (sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
 
     for (int i = 0; i < g_positional_count; i++) {
         if (i > 0 && sb_put_sep(b, &sep) < 0) return -1;
@@ -31923,9 +31928,10 @@ static int shell_append_array_join(struct shell_sb *b,
     /* ${a[*]} UNQUOTED UNDER A NULL IFS is a field per element, as $* is
      * (bash; Oils 2731) -- run together only in an assignment. ${!a[*]}
      * there is bash's own: the subscripts as ONE word, joined by a space
-     * (Oils 2733). */
+     * (Oils 2733), and in the word of ${A-W} in an assignment too
+     * (finding 558). */
     bool null_unquoted = sh_star_fields();
-    if (null_unquoted && indices) { sep.c[0] = ' '; sep.n = 1; }
+    if ((null_unquoted || sh_star_space()) && indices) { sep.c[0] = ' '; sep.n = 1; }
     else if (null_unquoted) {
         if (sh_put_lead_mark(b) < 0) return -1;
         for (int i = 0; i < n; i++) {
@@ -32012,8 +32018,10 @@ static int shell_append_array_slice(struct shell_sb *b,
         return 0;
     }
     bool first = true;
-    /* unquoted under a null IFS: a field each, as ${a[*]} itself */
+    /* unquoted under a null IFS: a field each, as ${a[*]} itself -- and a
+     * space in the word of ${A-W} in an assignment (finding 558) */
     bool fields = sh_star_fields();
+    if (sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
     if (fields && sh_put_lead_mark(b) < 0) return -1;
     for (long i = off; i < end; i++) {
         if (!first) {
@@ -32404,6 +32412,19 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
      * Unquoted, both are syntax. See g_dq_depth. */
     g_value_word = true;
     return shell_expand_word_ex(word, out, true, g_dq_depth == 0 && !g_hd_body);
+}
+
+/* The word of ${v-W} ${v+W} (Q false) or ${v=W} (Q true): an expansion
+ * of its own, and the place its "*" forms join by (sh_star_ctx) -- the
+ * first's is SH_STAR_U where the expansion sits in a word that does not
+ * split, the second's always SH_STAR_Q (findings 558, 562). */
+static int sh_param_word_star(const char *word, struct shell_sb *out, bool q) {
+    int ov = g_star_ov, sc = sh_star_ctx();
+    if (q) g_star_ov = SH_STAR_Q;
+    else if (sc == SH_STAR_Q || sc == SH_STAR_U) g_star_ov = SH_STAR_U;
+    int rc = shell_expand_param_word(word, out);
+    g_star_ov = ov;
+    return rc;
 }
 
 /* A here-document body line, or the inside of $(( )): $ and ` still expand,
@@ -33658,6 +33679,7 @@ static int shell_expand_substring(const char *name, const char *spec,
         struct sh_sep sep;
         sh_sep_join(&sep, SH_JOIN_HD_SPACE);
         bool sf = star && sh_star_fields();         /* (493) */
+        if (star && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }   /* (558) */
         if ((!star || sf) && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
@@ -34796,6 +34818,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                                 ij = !star && sc != SH_STAR_FIELDS && !g_star_case;
                         }
                         if (ij) sh_sep_from_ifs(&sep, env_get("IFS"));
+                        /* ...and $*'s forms in the word of ${A-W} in an
+                         * assignment are joined by a space (finding 558) */
+                        if (star && posargs && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
                         if ((!star || sf) && !rj && !ij && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
@@ -35617,7 +35642,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                            : sb_put_data_str(b, value);
         /* the word's own fields stay fields: "${1+"$@"}" is "$@" -- only
          * `=` joins them, its word being a value (logs/b12/p36) */
-        if (shell_expand_param_word(word, &ewb) < 0) return -1;
+        if (sh_param_word_star(word, &ewb, false) < 0) return -1;
         SH_WORD_TILDE();
         if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
         return sh_put_param_word(b, ewb.p);
@@ -35739,7 +35764,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
         if (missing)
             return (!is_set && name[0] == '@' && !name[1])
                        ? sh_put_lead_mark(b) : 0;
-        if (shell_expand_param_word(word, &ewb) < 0) return -1;
+        if (sh_param_word_star(word, &ewb, false) < 0) return -1;
         SH_WORD_TILDE();
         if (g_dq_depth == 0 && shell_glob_escape_marked(&ewb) < 0) return -1;
         return sh_put_param_word(b, ewb.p);
