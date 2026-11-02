@@ -3875,9 +3875,12 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 }
                 if (globbed == 0 && g_shopt_nullglob) globbed = -2;
             }
-            shell_strip_nosplit_inplace(field);
             /* a glob escape -- the quoted part of a ${x-WORD}
-             * (shell_glob_escape_marked) -- has done its work */
+             * (shell_glob_escape_marked) -- has done its work. Taken off
+             * while the data escapes still stand: after the strip below a
+             * ^C that was data, `a=( $'a\003b' )` or a raw one, looked like
+             * an escape and went (logs/b42 rawctl b3, logs/b43 ctl1 c1 c11,
+             * ctl2 d7) -- finding 566 */
             {
                 char *w = field;
                 for (const char *r = field; *r; r++) {
@@ -3887,6 +3890,7 @@ static int sh_array_store_expanded(const char *name, const char *ex,
                 }
                 *w = '\0';
             }
+            shell_strip_nosplit_inplace(field);
             if (globbed > 0) {
                 any = true;
             } else if (globbed == 0 &&
