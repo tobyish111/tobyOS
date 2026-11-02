@@ -4310,6 +4310,18 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                         shell_argmarks_to_spaces(kraw.p, &kx) < 0)
                         return -1;
                     shell_strip_glob_escapes(kx.p);
+                    /* A ^A IN AN INDEXED LIST'S SUBSCRIPT IS bash's quoting
+                     * byte, and goes before the arithmetic reads it:
+                     * `a=( [$'x\001y']=foo )` is [0] (xy, 0) and `[1^A]`
+                     * [1], where tsh said "invalid arithmetic operator";
+                     * a ^B stays an error (bash's exp8.sub; logs/b42 in1
+                     * i6, logs/b43 ctl1 c13 c14, ctl2 d2) -- finding 567 */
+                    if (kx.p) {
+                        char *w = kx.p;
+                        for (const char *r = kx.p; *r; r++)
+                            if (*r != '\x01') *w++ = *r;
+                        *w = '\0';
+                    }
                     sh_xt_lit_note(kx.p, vx.p, eplus);
                     if (sh_litq_add(q, kx.p, vx.p, eplus) < 0) return -1;
                 } else {
