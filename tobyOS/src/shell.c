@@ -46366,9 +46366,34 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
          * `exec -- 3>&1` is the same command. It missed this branch (two
          * words), went to cmd_exec, and the redirection lasted only for a
          * builtin that did nothing -- so the next `>&3` found fd 3 closed. */
-        if (strcmp(exec_cmd.argv[0], "exec") == 0 && cmd->redir_count > 0 &&
-            (exec_cmd.argc == 1 ||
-             (exec_cmd.argc == 2 && strcmp(exec_cmd.argv[1], "--") == 0))) {
+        /* `command exec 2>f` IS THAT exec: its redirections stay in the
+         * shell, as bash's -- after any number of `command` words, -p and
+         * `--` among them -- where `builtin exec`'s are a builtin's; and
+         * a function of the name is called instead, exec's outside posix
+         * mode and command's in any (redir.tests; logs/b43 rdx3 e1-e8) --
+         * tsh undid command exec's at its end and ran the builtin over a
+         * function exec -- finding 586 */
+        int xw = 0;
+        bool via_command = false;
+        while (xw < exec_cmd.argc && strcmp(exec_cmd.argv[xw], "command") == 0 &&
+               !shell_function_lookup("command")) {
+            int o = xw + 1;
+            bool okopt = true;
+            while (okopt && o < exec_cmd.argc && exec_cmd.argv[o][0] == '-' &&
+                   exec_cmd.argv[o][1]) {
+                if (strcmp(exec_cmd.argv[o], "--") == 0) { o++; break; }
+                for (const char *q = exec_cmd.argv[o] + 1; *q; q++)
+                    if (*q != 'p' || g_restricted) okopt = false;
+                if (okopt) o++;
+            }
+            if (!okopt) break;
+            xw = o;
+            via_command = true;
+        }
+        int xn = exec_cmd.argc - xw;
+        if (xn > 0 && strcmp(exec_cmd.argv[xw], "exec") == 0 && cmd->redir_count > 0 &&
+            (xn == 1 || (xn == 2 && strcmp(exec_cmd.argv[xw + 1], "--") == 0)) &&
+            (via_command || g_opt_posix || !shell_function_lookup("exec"))) {
             SH_FD_STATE(fds);
             shell_fd_state_init_from_defaults(&fds);
             if (shell_apply_redirs(cmd, &fds, "exec") < 0) {
