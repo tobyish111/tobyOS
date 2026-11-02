@@ -32461,7 +32461,12 @@ static int shell_expand_pat_word(const char *w, struct shell_sb *out) {
     if (saved > 0 || saved_hd) g_dq_word = true;
     g_dq_depth = 0;
     g_hd_body = false;
+    /* ...and it is one word: its "*" forms run their words together under a
+     * null IFS (sh_star_ctx; finding 562) */
+    int ov = g_star_ov;
+    g_star_ov = SH_STAR_Q;
     int rc = shell_expand_word_ex(w, out, true, true);
+    g_star_ov = ov;
     g_dq_depth = saved;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
@@ -35169,6 +35174,15 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             SH_SB(repl);
             if (shell_expand_pat_word(rep, &repl) < 0)
                 return -1;
+            /* THE REPLACEMENT IS ONE STRING: a "$@" in it joins with a
+             * space -- tsh left the field marks in it, and `y=${v/v/$@}`
+             * under a null IFS stored them (logs/b43 p11) -- finding 562 */
+            if (shell_word_has_argmark(repl.p)) {
+                SH_SB(rj);
+                if (shell_argmarks_to_spaces(repl.p, &rj) < 0 ||
+                    sb_set(&repl, rj.p ? rj.p : "") < 0)
+                    return -1;
+            }
             /* PATSUB_REPLACEMENT (bash 5.2's default): an UNQUOTED `&` in
              * the replacement is the text the pattern matched; a quoted
              * one, or one an unquoted backslash escapes, is an `&`; and in
@@ -35670,26 +35684,12 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
             g_bad_subst_soft = true;
             return -1;
         }
-        if (shell_expand_param_word(word, &ewb) < 0) return -1;
         /* the WORD is an assignment's value, and with IFS set to null its
-         * fields join with nothing: `IFS=''; : ${z=$*}` with `a "b c"` is
+         * "*" forms join with nothing: `IFS=''; : ${z=$*}` with `a "b c"` is
          * "ab c", where tsh joined them with spaces (bash's array24.sub;
-         * logs/b42 arr2 b3 b4) */
-        {
-            const char *ifs = env_get("IFS");
-            if (ifs && !*ifs && shell_word_has_argmark(ewb.p)) {
-                SH_SB(jw);
-                for (const char *q = ewb.p; *q; q++) {
-                    if (*q == SHELL_DATA_ESC && q[1]) {
-                        (void)sb_putc(&jw, *q++);
-                        (void)sb_putc(&jw, *q);
-                        continue;
-                    }
-                    if (*q != SHELL_ARG_MARK) (void)sb_putc(&jw, *q);
-                }
-                if (sb_set(&ewb, jw.p ? jw.p : "") < 0) return -1;
-            }
-        }
+         * logs/b42 arr2 b3 b4) -- and its "@" ones with a space, as in any
+         * value (sh_star_ctx; finding 562) */
+        if (sh_param_word_star(word, &ewb, true) < 0) return -1;
         SH_JOIN_WORD_MARKS();
         SH_WORD_TILDE();
         /* THE VARIABLE GETS THE VALUE, AND THE EXPANSION IS THE VARIABLE.
