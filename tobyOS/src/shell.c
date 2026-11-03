@@ -31572,6 +31572,14 @@ static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
     bool warned_nul = false;
     for (;;) {
         char chunk[4096];
+        /* A FATAL SIGNAL THE EXIT TRAP WAITS FOR ENDS THE SHELL HERE, not
+         * after the command the substitution is part of: `echo $( kill
+         * -TERM $$; echo e5-cs )` is the trap and 143 in bash, every run.
+         * file_read acts on one that interrupts it; one that came while
+         * this side was between reads made none fail, the child was gone
+         * before proc_wait, and the echo ran first -- e5-cs, now and then
+         * (shparity 283 in the closing gate; logs/b43 e5rep*). */
+        shell_termsig_check();
         long n = file_read(r, chunk, sizeof chunk);
         if (n == -4) continue;          /* EINTR: the child's SIGCHLD */
         if (n <= 0) break;
@@ -31593,6 +31601,7 @@ static int shell_capture_forked(const char *cmd, struct shell_sb *out) {
     shell_wce_begin(&wce);
     int st = proc_wait(pid);
     shell_wce_end(&wce, proc_last_term_sig() == SIGINT);
+    shell_termsig_check();              /* one the last read took, as above */
     g_capture_last_status = st < 0 ? 1 : st;
     while (out->len > 0 && out->p[out->len - 1] == '\n')
         sb_truncate(out, out->len - 1);
