@@ -1817,9 +1817,6 @@ struct job {
     int  owner;                /* the shell process that started it: in a
                                 * forked subshell the copy is not its child
                                 * -- see shell_job_foreign */
-    bool settling;             /* `kill` has signalled it to death: the
-                                * reader's next line waits for its SIGCHLD --
-                                * see shell_jobs_settle_read */
 #else
     bool dying;                /* `kill` has signalled it to death: the next
                                 * look lets it finish dying -- see
@@ -2167,7 +2164,6 @@ static int jobs_add_procs(const int *pids, const char *const *cmds, int n,
         struct proc *me = current_proc();
         j->owner = me ? me->pid : 0;
     }
-    j->settling = false;
 #else
     j->dying = false;
 #endif
@@ -2697,37 +2693,6 @@ static void shell_jobs_cleanup(void) {
  * Measured in WSL bash (logs/b12 p93 p99-p106): tsh noticed only after a
  * line and after a program, so a job killed before a ( ), a pipeline or a
  * $( ) was reported a line late. LINE is the line the report names. */
-/* A JOB `kill` HAS SIGNALLED TO DEATH HAS DIED BY THE TIME THE READER TAKES
- * ITS NEXT LINE: under set -m, `kill %1 %2 %3` and `wait` on the next line
- * is three "Terminated" in bash, 20 runs in 20 -- bash's reader and its
- * looks make the system calls in which the kernel runs the dying jobs and
- * delivers their SIGCHLD; tsh, its script read whole, makes none there, and
- * reported one of the three or two (logs/b42 knrep*; logs/b43 knrep-p8) --
- * finding 600. Such a look waits for their SIGCHLD, a millisecond apart, a
- * tenth of a second at most; a look within a line -- `kill %1; wait` --
- * still sees only what SIGCHLD has told it (Oils 0945, finding 44).
- * THE TENTH OF A SECOND IS THE CLOCK'S: a hundred polls of pit_sleep_ms(1)
- * were seconds in QEMU, whose sleeps end on its coarse ticks, and a job
- * that ignored the signal sat them all out (finding 603). */
-static void shell_jobs_settle_read(void) {
-    bool any = false;
-    for (int i = 0; i < JOB_MAX; i++) {
-        struct job *j = g_jobs[i];
-        if (!j->id || j->dead) j->settling = false;
-        if (j->settling) any = true;
-    }
-    uint64_t until = any ? perf_now_ns() + 100000000ull : 0;
-    while (any) {
-        shell_jobs_learn(false);
-        any = false;
-        for (int i = 0; i < JOB_MAX; i++)
-            if (g_jobs[i]->id && g_jobs[i]->settling && !g_jobs[i]->dead) any = true;
-        if (!any || perf_now_ns() >= until) break;
-        pit_sleep_ms(1);
-    }
-    for (int i = 0; i < JOB_MAX; i++) g_jobs[i]->settling = false;
-}
-
 #define SHELL_NOTIFY_READ   0
 #define SHELL_NOTIFY_WAITED 1
 static void shell_jobs_notify(unsigned long line, int how) {
@@ -2739,7 +2704,6 @@ static void shell_jobs_notify(unsigned long line, int how) {
         shell_jobs_learn(true);
     if (g_interactive || g_capture_depth > 0) return;
     if (how == SHELL_NOTIFY_READ) shell_coproc_reap();
-    if (how == SHELL_NOTIFY_READ) shell_jobs_settle_read();
     shell_jobs_learn(how == SHELL_NOTIFY_WAITED);
     unsigned long saved_line = g_shell_lineno;
     if (line) g_shell_lineno = line;
@@ -16643,6 +16607,7 @@ static int shell_job_poll_procs(struct job *j) {
 
 static int shell_job_poll_now(struct job *j);
 
+#ifndef SHELL_HOSTED
 /* DOES SIG END PROCESS PID, as it stands: SIGKILL, or a signal whose
  * default action ends a process that it neither ignores, catches nor
  * blocks. Every signal's default is to end the process except SIGCHLD,
@@ -16656,7 +16621,6 @@ static bool shell_signal_default_ends(int sig) {
         return sig > 0 && sig < SIG_MAX;
     }
 }
-#ifndef SHELL_HOSTED
 /* proc_signal_default: is process PID alive, and does it take SIG's default
  * action -- not blocking, ignoring or catching it? */
 static bool proc_signal_default(int pid, int sig) {
@@ -16671,58 +16635,7 @@ static bool shell_signal_ends(int pid, int sig) {
     if (sig != SIGKILL && !shell_signal_default_ends(sig)) return false;
     return proc_signal_default(pid, sig);
 }
-#else
-/* /bin/tsh asks the kernel what `ps` would: /proc/PID/status, whose
- * SigBlk, SigIgn and SigCgt are hex masks in Linux's numbering, bit N-1
- * for signal N. An asynchronous command without job control ignores INT
- * and QUIT (shell_spec_sigs); `( trap '' TERM; sleep 9 ) &` ignores TERM.
- * A process that is gone or cannot be read takes nothing. */
-static const char *shell_status_field(const char *st, const char *key) {
-    size_t kl = strlen(key);
-    for (const char *l = st; *l; ) {
-        if (strncmp(l, key, kl) == 0) {
-            l += kl;
-            while (*l == ' ' || *l == '\t') l++;
-            return l;
-        }
-        while (*l && *l != '\n') l++;
-        if (*l) l++;
-    }
-    return 0;
-}
-static bool shell_status_mask_has(const char *st, const char *key, int sig) {
-    const char *p = shell_status_field(st, key);
-    if (!p) return false;
-    uint64_t v = 0;
-    for (;; p++) {
-        int d = *p >= '0' && *p <= '9' ? *p - '0'
-              : *p >= 'a' && *p <= 'f' ? *p - 'a' + 10
-              : *p >= 'A' && *p <= 'F' ? *p - 'A' + 10 : -1;
-        if (d < 0) break;
-        v = v << 4 | (uint64_t)d;
-    }
-    return (v >> (sig - 1)) & 1;
-}
-static bool shell_signal_ends(int pid, int sig) {
-    if (sig != SIGKILL && !shell_signal_default_ends(sig)) return false;
-    char path[32], st[2048];
-    ksnprintf(path, sizeof path, "/proc/%d/status", pid);
-    struct vfs_file f;
-    if (vfs_open(path, &f) != VFS_OK) return false;
-    long n = vfs_read(&f, st, (long)sizeof st - 1);
-    vfs_close(&f);
-    if (n <= 0) return false;
-    st[n] = '\0';
-    const char *s = shell_status_field(st, "State:");
-    if (s && (*s == 'Z' || *s == 'X')) return false;
-    if (sig == SIGKILL) return true;
-    return !shell_status_mask_has(st, "SigBlk:", sig) &&
-           !shell_status_mask_has(st, "SigIgn:", sig) &&
-           !shell_status_mask_has(st, "SigCgt:", sig);
-}
-#endif
 
-#ifndef SHELL_HOSTED
 /* A JOB `kill` HAS SIGNALLED TO DEATH IS DEAD AT THE NEXT LOOK. The kernel
  * shell has no SIGCHLD to be told by (/bin/tsh's shell_jobs_learn): it
  * looks synchronously, and fast enough to look before the process has
@@ -27642,6 +27555,7 @@ static void cmd_kill(int argc, char **argv) {
              * stopped one takes it only once continued -- bash continues a
              * stopped job it TERMs or HUPs -- or for SIGKILL). */
             bool cont = was_stopped && (sig == SIGTERM || sig == SIGHUP);
+#ifndef SHELL_HOSTED
             bool ends = sig > 0 && (!was_stopped || cont || sig == SIGKILL);
             if (jb->nproc > 1 && jb->proc) {
                 for (int k = 0; ends && k < jb->nproc; k++)
@@ -27650,6 +27564,7 @@ static void cmd_kill(int argc, char **argv) {
             } else if (ends) {
                 ends = shell_signal_ends(jb->pid, sig);
             }
+#endif
             if (!jb->jc && jb->nproc > 1 && jb->proc) {
                 bool any = false;
                 for (int k = 0; k < jb->nproc; k++) {
@@ -27676,11 +27591,6 @@ static void cmd_kill(int argc, char **argv) {
             }
 #ifndef SHELL_HOSTED
             jb->dying = ends;                      /* see shell_job_settle */
-#else
-            /* not one that ignores it: `sleep 3 & kill -INT %1`, no job
-             * control, leaves the sleep running, and the next line waited
-             * for its death (fxall 276) -- finding 603 */
-            jb->settling = ends;
 #endif
             if (cont) {
                 if (signal_send_to_pid_checked(-jb->pid, SIGCONT) != 0)
