@@ -1564,6 +1564,12 @@ enum { SH_STAR_FIELDS, SH_STAR_Q, SH_STAR_U, SH_STAR_HD, SH_STAR_DQ };
 static int g_star_ov = -1;                  /* see sh_star_ctx */
 static const char *g_tok_word_src;          /* the word read, as written */
 static bool g_star_case;                    /* ...a case word's or [[ ]]'s */
+/* bash's no-split state as a $( ) started under it holds it (sh_star_leak):
+ * g_star_leak is this run's, g_star_gov the one a word of ${v-W} ${v=W}
+ * takes for its own $( )s (-1: none) */
+static bool g_star_leak;
+static int g_star_gov = -1;
+static bool sh_star_g(void);
 static void shell_bad_subst(bool fatal);
 /* THE TEXT bash NAMES IN "TEXT: bad substitution": the string its expansion
  * pass was working through when it met the bad ${...} -- the whole word
@@ -30278,6 +30284,11 @@ struct shell_simple {
     bool cmd_word_set;
     bool cmd_word_literal;
     int cmd_word_index;
+    /* An assignment before the command word whose value was written with a
+     * $, ` or ~, and a here-string: what clears bash's no-split flag for
+     * the rest of a $( )'s run (sh_star_leak_reset, finding 610). */
+    bool assign_resets;
+    bool herestr;
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -31964,6 +31975,11 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
      * parsed so, and do not. */
     shell_jobs_notify(g_shell_lineno + 1, SHELL_NOTIFY_READ);
     SH_SB(out);
+    /* ...but with bash's no-split flag as the word here has it (610) */
+    bool saved_leak = g_star_leak;
+    int saved_gov = g_star_gov;
+    g_star_leak = sh_star_g();
+    g_star_gov = -1;
     int saved_dq = g_dq_depth;                  /* fresh script, fresh context */
     bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
     int saved_ov = g_star_ov;
@@ -31981,6 +31997,8 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     g_hd_body = saved_hd;
     g_star_ov = saved_ov;
     g_star_case = saved_case;
+    g_star_leak = saved_leak;
+    g_star_gov = saved_gov;
     if (crc < 0) return -1;
     /* ...AND ITS STATUS IS $? FROM HERE ON, as bash's: `false; echo
      * "$(true) $?"` prints 0, `f $(exit 5)` starts f with $? 5 -- tsh kept
@@ -32072,6 +32090,10 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     SH_SB(out);
     /* The body is a fresh script. Whatever quotes enclose the backticks do not
      * enclose the commands inside them. */
+    bool saved_leak = g_star_leak;              /* (as for $( ), 610) */
+    int saved_gov = g_star_gov;
+    g_star_leak = sh_star_g();
+    g_star_gov = -1;
     int saved_dq = g_dq_depth;
     bool saved_dqw = g_dq_word, saved_hd = g_hd_body;
     int saved_ov = g_star_ov;
@@ -32089,6 +32111,8 @@ static int shell_expand_backtick(const char **pp, struct shell_sb *b) {
     g_hd_body = saved_hd;
     g_star_ov = saved_ov;
     g_star_case = saved_case;
+    g_star_leak = saved_leak;
+    g_star_gov = saved_gov;
     if (rc < 0) return -1;
     g_last_status = g_capture_last_status;      /* as for $( ), above */
     g_status_subst = true;
@@ -32418,7 +32442,7 @@ static int sh_put_param_word(struct shell_sb *b, const char *ew) {
  *   SH_STAR_DQ      inside double quotes: IFS's first character.
  * A place that is not the word's own sets g_star_ov for the expansion it
  * asks for; a command substitution's commands are words of their own. */
-static int sh_star_ctx(void) {
+static int sh_star_ctx_base(void) {
     if (g_dq_depth > 0) return SH_STAR_DQ;
     if (g_hd_body) return SH_STAR_HD;
     if (g_star_ov >= 0) return g_star_ov;
@@ -32430,6 +32454,104 @@ static int sh_star_ctx(void) {
 static bool sh_ifs_null(void) {
     const char *ifs = env_get("IFS");
     return ifs && !*ifs;
+}
+
+/* A $( ) STARTED WHILE bash EXPANDS A WORD THAT DOES NOT SPLIT RUNS ITS
+ * COMMANDS IN THAT WORD'S STATE. bash 5.2.15 keeps "this word is not split"
+ * in one flag the whole process shares, and a command substitution's child
+ * starts with the flag as it was -- so in
+ *
+ *     set -- a 'b c' d; IFS=
+ *     x=$(printf '<%s>' $*)            bash: <ab cd>   (outside it <a><b c><d>)
+ *
+ * every unquoted "*" form of the substitution's commands runs its words
+ * together, as the assignment's own $* would (logs/b44 csl*.sh). What has
+ * the flag on, measured: an assignment's value (x=, x+=, a[i]=, alone or
+ * before a command), a here-string, a case word or pattern, [[ ]]'s words,
+ * the word of ${v=W}, a pattern or a replacement, and the word of ${v-W}
+ * or ${v+W} where that ${ } is inside double quotes; off: a declaration
+ * builtin's NAME=VALUE (which keeps what the run has), an array's list,
+ * the word of an unquoted ${v-W} ${v+W}, arithmetic, a for word and a
+ * here-document's body. It stays on in everything the substitution runs --
+ * a function, eval, a subshell, a $( ) inside -- until the run expands one
+ * of the words that set it and clear it after (sh_star_leak_reset). Only a
+ * null IFS shows it: with IFS set the join is IFS's and the split follows.
+ * tsh ran each substitution as a fresh script -- finding 610.
+ *
+ * In the run, then: an argument's, a list element's or a for word's "*"
+ * forms, and a declaration's NAME=VALUE, take an assignment's join
+ * (SH_STAR_Q, nothing between the words). */
+/* (the flag as the word being expanded has it: the run's, or off in the
+ * word of an unquoted ${v-W} ${v+W}; where a word sets it on, its "*"
+ * forms have their own place already -- g_star_ov or the quotes) */
+static bool sh_star_leak_on(void) {
+    return g_star_gov == 0 ? false : g_star_leak;
+}
+
+static int sh_star_ctx(void) {
+    int c = sh_star_ctx_base();
+    if (sh_star_leak_on() && sh_ifs_null() &&
+        (c == SH_STAR_FIELDS || (c == SH_STAR_U && g_star_ov < 0)))
+        return SH_STAR_Q;
+    return c;
+}
+
+/* ...and where the word splits, ${*OP} and ${*:o:l} -- the positional
+ * parameters' operator forms, not ${a[*]OP}'s and not the @ transforms --
+ * then split again at each run of spaces, spaces only:
+ *
+ *     x=$(printf '<%s>' ${*%x})        with ax 'b cx' dx: <ab><cd>
+ *
+ * (logs/b44 csl2 n1 n4, csl3 e1 e3). */
+static bool sh_star_leak_split(void) {
+    return sh_star_leak_on() && sh_ifs_null() &&
+           sh_star_ctx_base() == SH_STAR_FIELDS;
+}
+
+/* The flag a $( ) started here runs with (see sh_star_ctx). */
+static bool sh_star_g(void) {
+    if (g_star_gov >= 0) return g_star_gov != 0;
+    if (g_hd_body) return g_star_leak;
+    if (g_star_ov == SH_STAR_Q) return true;
+    if (g_star_ov >= 0) return g_star_leak;
+    if (g_tok_word_assign_ctx && !g_tok_word_decl_ctx) return true;
+    return g_star_leak;
+}
+
+/* bash clears the flag when it has expanded an assignment whose value was
+ * written with a $, a ` or a ~ (one without needs no expansion), any
+ * assignment before a command, a here-string for a command run in the
+ * shell itself, a case word, and [[ ]]'s words (logs/b44 csl4, csl5,
+ * csl6): the rest of the run is an ordinary script's. */
+static void sh_star_leak_reset(void) {
+    g_star_leak = false;
+}
+
+/* Rewrite B from FROM on -- the run-together words of a ${*OP} -- as
+ * fields split at each run of spaces (sh_star_leak_split): a lead mark,
+ * then a field mark for each run. Escaped bytes are data. */
+static int sh_put_lead_mark(struct shell_sb *b);
+static int sh_star_leak_split_at(struct shell_sb *b, size_t from) {
+    SH_SB(t);
+    if (b->len > from && sb_putmem(&t, b->p + from, b->len - from) < 0) return -1;
+    sb_truncate(b, from);
+    if (sh_put_lead_mark(b) < 0) return -1;
+    bool sp = false;
+    for (size_t i = 0; i < t.len; i++) {
+        char c = t.p[i];
+        if (c == ' ') { sp = true; continue; }
+        if (sp) {
+            if (sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+            sp = false;
+        }
+        if ((c == SHELL_DATA_ESC || c == SHELL_GLOB_ESC) && i + 1 < t.len) {
+            if (sb_putc(b, c) < 0 || sb_putc(b, t.p[++i]) < 0) return -1;
+            continue;
+        }
+        if (sb_putc(b, c) < 0) return -1;
+    }
+    if (sp && sb_putc(b, SHELL_ARG_MARK) < 0) return -1;
+    return 0;
 }
 
 /* A "*" join that is fields instead: unquoted under a null IFS where the
@@ -33112,11 +33234,15 @@ static int shell_expand_param_word(const char *word, struct shell_sb *out) {
  * first's is SH_STAR_U where the expansion sits in a word that does not
  * split, the second's always SH_STAR_Q (findings 558, 562). */
 static int sh_param_word_star(const char *word, struct shell_sb *out, bool q) {
-    int ov = g_star_ov, sc = sh_star_ctx();
+    int ov = g_star_ov, sc = sh_star_ctx_base(), gov = g_star_gov;
     if (q) g_star_ov = SH_STAR_Q;
     else if (sc == SH_STAR_Q || sc == SH_STAR_U) g_star_ov = SH_STAR_U;
+    /* bash's no-split flag in the word (finding 610): on for ${v=W}, and
+     * for ${v-W} ${v+W} only where the ${ } is inside double quotes */
+    g_star_gov = (q || g_dq_depth > 0) ? 1 : 0;
     int rc = shell_expand_param_word(word, out);
     g_star_ov = ov;
+    g_star_gov = gov;
     return rc;
 }
 
@@ -33145,10 +33271,12 @@ static int shell_expand_pat_word(const char *w, struct shell_sb *out) {
     g_hd_body = false;
     /* ...and it is one word: its "*" forms run their words together under a
      * null IFS (sh_star_ctx; finding 562) */
-    int ov = g_star_ov;
+    int ov = g_star_ov, gov = g_star_gov;
     g_star_ov = SH_STAR_Q;
+    g_star_gov = 1;                     /* ...with bash's no-split flag (610) */
     int rc = shell_expand_word_ex(w, out, true, true);
     g_star_ov = ov;
+    g_star_gov = gov;
     g_dq_depth = saved;
     g_dq_word = saved_dqw;
     g_hd_body = saved_hd;
@@ -34194,6 +34322,8 @@ static int sh_posargs_at(bool star, char op, struct shell_sb *b) {
             sb_puts(&one, vals.p + at) < 0)
             return -1;
     }
+    if (star && sh_star_leak_split())
+        return sh_at_A_words(b, "set -- ", one.p + 7, 1);
     if (star) return sb_put_data_str(b, one.p);
     return sh_at_A_words(b, "set -- ", vals.p, n);
 }
@@ -34389,6 +34519,8 @@ static int shell_expand_substring(const char *name, const char *spec,
         sh_sep_join(&sep, SH_JOIN_HD_SPACE);
         bool sf = star && sh_star_fields();         /* (493) */
         if (star && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }   /* (558) */
+        size_t leak_from = b->len;
+        bool leak_split = star && sh_star_leak_split();
         if ((!star || sf) && sh_put_lead_mark(b) < 0)
             return -1;
         bool first = true;
@@ -34409,6 +34541,7 @@ static int shell_expand_substring(const char *name, const char *spec,
             if (sb_put_data_str(b, v) < 0) return -1;
             if (!star && sh_join_empty_elem(b, before) < 0) return -1;
         }
+        if (leak_split) return sh_star_leak_split_at(b, leak_from);  /* (610) */
         return 0;
     }
 
@@ -35598,6 +35731,7 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                         /* ...and $*'s forms in the word of ${A-W} in an
                          * assignment are joined by a space (finding 558) */
                         if (star && (posargs || g_star_case) && sh_star_space()) { sep.c[0] = ' '; sep.n = 1; }
+                        size_t leak_from = b->len;
                         if ((!star || sf) && !rj && !ij && sh_put_lead_mark(b) < 0)
                             return -1;
                         for (int i = 0; i < an; i++) {
@@ -35641,6 +35775,9 @@ static int shell_expand_braced_parameter_in(const char *expr, struct shell_sb *b
                             }
                         }
                         (void)env_unset("SHELL_ARRAY_ELEM");
+                        /* (a $( ) of an assignment's: split at its spaces) */
+                        if (star && posargs && suffix[0] != '@' && sh_star_leak_split())
+                            return sh_star_leak_split_at(b, leak_from);
                         return 0;
                     }
                     if (slen == 1 && (sub[0] == '@' || sub[0] == '*') &&
@@ -40309,6 +40446,29 @@ static size_t shell_assign_prefix_len_raw(const char *w) {
     return *p == '=' ? (size_t)(p - w) + 1 : 0;
 }
 
+/* Was the VALUE of assignment word W, as written, given a $, a ` or a ~ --
+ * one bash must expand, which clears its no-split flag after (finding 610)?
+ * Quotes and backslashes alone are not: `y="q"` and `y=\q` leave it, and
+ * so does `y=$'q'` (translated as it is read), but `y='$z'` does not
+ * (logs/b44 csl5 r1, csl6 s1). */
+static bool sh_assign_value_expands(const char *w) {
+    size_t n = shell_assign_prefix_len_raw(w);
+    if (n == 0) return false;
+    /* (an array's list is not: `a=($z)` and `a+=($z)` leave it, csl5 r1 s1) */
+    if (w[n] == '(') return false;
+    for (const char *p = w + n; *p; p++) {
+        if (*p == '$' && p[1] == '\'') {
+            for (p += 2; *p && *p != '\''; p++)
+                if (*p == '\\' && p[1]) p++;
+            if (!*p) break;
+            continue;
+        }
+        if (*p == '$' && p[1] == '"') continue;
+        if (*p == '$' || *p == '`' || *p == '~') return true;
+    }
+    return false;
+}
+
 static size_t shell_assign_prefix_len(const char *w) {
     const char *p = w;
     if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || *p == '_'))
@@ -43058,6 +43218,7 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
                 kfree(hs);
                 if (src_rc < 0) return -1;
                 cur->stdin_text = saved;
+                cur->herestr = true;                    /* (610) */
                 if (shell_add_redir(cur, SH_RD_HEREDOC, fd, 0, saved,
                                     -1) < 0) return -1;
             } else if (t == SH_TOK_HEREDOC || t == SH_TOK_HEREDOC_TABS) {
@@ -43267,6 +43428,9 @@ static int shell_parse_pipeline(struct shell_token *tok, int ntok, int *io,
         if (!asrc)
             for (int k = before; k < cur->argc; k++)
                 if (shell_simple_mark_noassign(cur, k) < 0) return -1;
+        if (!cur->cmd_word_set && asrc && tok[*io].raw &&
+            sh_assign_value_expands(tok[*io].raw))
+            cur->assign_resets = true;
         if (!cur->cmd_word_set && !asrc && cur->argc > before) {
             cur->cmd_word_set = true;
             cur->cmd_word_literal = !tok[*io].expanded;
@@ -46727,6 +46891,17 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
            shell_is_assignment_word(cmd->argv[assignc])) {
         assignc++;
     }
+    /* bash clears its no-split flag here (finding 610): after the words
+     * of any command with assignments before it, after an assignment
+     * alone whose value had to be expanded, and for a here-string given
+     * to a command it runs itself -- a builtin or a function (for any
+     * other the child expands it) */
+    if (assignc > 0 && (assignc < cmd->argc || cmd->assign_resets))
+        sh_star_leak_reset();
+    if (cmd->herestr && assignc < cmd->argc &&
+        (shell_function_lookup(cmd->argv[assignc]) ||
+         shell_cmd_lookup(cmd->argv[assignc])))
+        sh_star_leak_reset();
 
     if (assignc == cmd->argc) {
         /* An assignment-only command takes the status of the LAST COMMAND
@@ -49455,6 +49630,7 @@ static bool shell_try_dbracket_command(const char *src) {
     const char *bad_msg = d->msg;
     bool xerr = d->xerr;
     shell_dbr_free(d);
+    sh_star_leak_reset();           /* (bash clears its no-split flag, 610) */
     /* AN OPERAND'S EXPANSION FAILED as it was evaluated: reported there;
      * as above, the line is discarded with status 1 -- unless the
      * expansion ended the shell itself (`${v?}`). */
@@ -50950,6 +51126,7 @@ static int shell_expand_case_word(const char *src, struct shell_sb *out) {
     int trc = shell_tokenize(src, &tok, &ntok, &words);
     g_star_ov = ov;
     g_star_case = cw;
+    sh_star_leak_reset();           /* (bash clears its no-split flag, 610) */
     if (trc < 0) return -1;
     for (int i = 0; i < ntok; i++) {
         if (tok[i].type != SH_TOK_WORD) continue;
@@ -51156,7 +51333,12 @@ static bool shell_case_pattern_match(const char *patterns, const char *word) {
              * backslash handling, which the expander would consume. */
             if (shell_word_has(pat.p, '$') || shell_word_has(pat.p, '`')) {
                 SH_SB(xp);
-                if (shell_expand_word_ex(pat.p, &xp, true, true) == 0) {
+                /* (its $( )s run with bash's no-split flag, 610) */
+                int gov = g_star_gov;
+                g_star_gov = 1;
+                int xrc = shell_expand_word_ex(pat.p, &xp, true, true);
+                g_star_gov = gov;
+                if (xrc == 0) {
                     sb_truncate(&pat, 0);
                     bool prot = false;
                     for (const char *q = xp.p; *q; q++) {
