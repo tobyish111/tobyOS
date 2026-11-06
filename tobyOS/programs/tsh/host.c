@@ -392,8 +392,50 @@ void  kfree(void *p)               { free(p); }
  * it with lseek rather than letting the kernel fd's own offset decide.
  */
 
-#define VF_FD(vf)      ((int)(long)(vf)->priv)
-#define VF_SET(vf, fd) ((vf)->priv = (void *)(long)(fd))
+/* A DESCRIPTOR IS A CELL every handle on it shares -- the handle and its
+ * file_clone()s -- so the number can change under all of them at once: the
+ * shell's descriptor N sits at this process's N, as bash's do, and a
+ * listing of /proc/$$/fd shows the shell's own table (host_fd_sync,
+ * finding 618). The cells at 3 and up are found by number (g_reg). */
+struct hcell {
+    int fd;             /* -1: released (host_file_release) or closed */
+    int refs;           /* the handles that name it */
+};
+#define HOST_NREG 1024
+static struct hcell *g_reg[HOST_NREG];
+static struct hcell g_dead_cell = { -1, 1 << 30 };   /* a closed vfs_file's */
+
+static void hcell_reg(struct hcell *c) {
+    if (c->fd >= 3 && c->fd < HOST_NREG) g_reg[c->fd] = c;
+}
+static void hcell_unreg(struct hcell *c) {
+    if (c->fd >= 3 && c->fd < HOST_NREG && g_reg[c->fd] == c) g_reg[c->fd] = 0;
+}
+static bool hf_set(struct vfs_file *vf, int fd) {
+    struct hcell *c = (struct hcell *)calloc(1, sizeof *c);
+    if (!c) return false;
+    c->fd = fd;
+    c->refs = 1;
+    hcell_reg(c);
+    vf->priv = c;
+    return true;
+}
+static int hf_fd(const struct vfs_file *vf) {
+    const struct hcell *c = (const struct hcell *)vf->priv;
+    return c ? c->fd : 0;
+}
+#define VF_FD(vf)      hf_fd(vf)
+
+/* Move the cell to real descriptor WANT (free, or this cell's already). */
+static int hcell_move(struct hcell *c, int want) {
+    if (c->fd == want) return want;
+    if (dup2(c->fd, want) < 0) return -1;
+    if (c->fd > 2) close(c->fd);
+    hcell_unreg(c);
+    c->fd = want;
+    hcell_reg(c);
+    return want;
+}
 
 static struct file *hf_make(int fd) {
     struct file *f = calloc(1, sizeof *f);
@@ -402,7 +444,7 @@ static struct file *hf_make(int fd) {
     f->vfs_refs = malloc(sizeof(int));
     if (!f->vfs_refs) { free(f); return 0; }
     *f->vfs_refs = 1;
-    VF_SET(&f->vfs, fd);
+    if (!hf_set(&f->vfs, fd)) { free(f->vfs_refs); free(f); return 0; }
     return f;
 }
 
@@ -412,6 +454,8 @@ struct file *file_clone(struct file *src) {
     if (!f) return 0;
     *f = *src;
     if (f->vfs_refs) (*f->vfs_refs)++;
+    if (f->kind == FILE_KIND_VFS && f->vfs.priv)
+        ((struct hcell *)f->vfs.priv)->refs++;
     return f;
 }
 
@@ -419,15 +463,33 @@ void file_close(struct file *f) {
     if (!f) return;
     if (f->kind == FILE_KIND_VFS) {
         bool last = !f->vfs_refs || --(*f->vfs_refs) == 0;
-        if (last) {
-            int fd = VF_FD(&f->vfs);
+        struct hcell *c = (struct hcell *)f->vfs.priv;
+        if (c && c != &g_dead_cell && --c->refs == 0) {
             /* 0/1/2 are this process's own standard descriptors: closing one
              * because a redirect went out of scope would silence the shell. */
-            if (fd > 2) close(fd);
-            free(f->vfs_refs);
+            if (c->fd > 2) close(c->fd);
+            hcell_unreg(c);
+            free(c);
         }
+        if (last) free(f->vfs_refs);
     }
     free(f);
+}
+
+/* AN EXTERNAL COMMAND'S OWN REDIRECTIONS ARE ITS OWN: bash opens them in
+ * the child, so the shell never holds them -- `ls /proc/$$/fd > f` lists
+ * 0 1 2 255 in bash, and tsh showed the file it had opened for ls as 3.
+ * Once the child has its copy, the shell's goes; the handle names no
+ * descriptor after (finding 618). */
+void host_file_release(struct file *f) {
+    if (!f || f->kind != FILE_KIND_VFS) return;
+    struct hcell *c = (struct hcell *)f->vfs.priv;
+    /* (only a descriptor the command alone has: `cat f >&3`'s handle is a
+     * clone of slot 3's, and the shell goes on writing to it) */
+    if (!c || c == &g_dead_cell || c->fd <= 2 || c->refs > 1) return;
+    close(c->fd);
+    hcell_unreg(c);
+    c->fd = -1;
 }
 
 /* Pipes and the standard descriptors have no meaningful offset; only real
@@ -649,7 +711,7 @@ int vfs_open(const char *path, struct vfs_file *out) {
     if (fd < 0 && errno != EINTR) fd = host_open(path, O_RDONLY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
-    VF_SET(out, fd);
+    if (!hf_set(out, fd)) { close(fd); return VFS_ERR_NOMEM; }
     struct stat st;
     out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
     out->mode = 0644;
@@ -665,7 +727,7 @@ int vfs_open_output(const char *path, struct vfs_file *out) {
     int fd = host_open(path, O_WRONLY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
-    VF_SET(out, fd);
+    if (!hf_set(out, fd)) { close(fd); return VFS_ERR_NOMEM; }
     struct stat st;
     out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
     out->mode = 0644;
@@ -700,7 +762,7 @@ int vfs_open_input(const char *path, struct vfs_file *out) {
         int fd = host_open(path, O_RDONLY, 0);
         if (fd >= 0) {
             memset(out, 0, sizeof *out);
-            VF_SET(out, fd);
+            if (!hf_set(out, fd)) { close(fd); return VFS_ERR_NOMEM; }
             struct stat st;
             out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
             out->mode = 0644;
@@ -712,7 +774,7 @@ int vfs_open_input(const char *path, struct vfs_file *out) {
     int fd = host_open(path, O_RDONLY | O_DIRECTORY, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
-    VF_SET(out, fd);
+    if (!hf_set(out, fd)) { close(fd); return VFS_ERR_NOMEM; }
     out->size = 0;
     out->mode = 0644;
     return VFS_OK;
@@ -723,7 +785,7 @@ int vfs_open_append(const char *path, struct vfs_file *out) {
     int fd = host_open(path, O_WRONLY | O_APPEND, 0);
     if (fd < 0) return errno_to_vfs();
     memset(out, 0, sizeof *out);
-    VF_SET(out, fd);
+    if (!hf_set(out, fd)) { close(fd); return VFS_ERR_NOMEM; }
     struct stat st;
     out->size = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
     out->mode = 0644;
@@ -732,8 +794,13 @@ int vfs_open_append(const char *path, struct vfs_file *out) {
 
 int vfs_close(struct vfs_file *f) {
     if (!f) return VFS_ERR_INVAL;
-    if (VF_FD(f) >= 0) close(VF_FD(f));
-    VF_SET(f, -1);
+    struct hcell *c = (struct hcell *)f->priv;
+    if (c && c != &g_dead_cell) {
+        if (c->fd >= 0) close(c->fd);
+        hcell_unreg(c);
+        free(c);
+    }
+    f->priv = &g_dead_cell;
     return VFS_OK;
 }
 
@@ -984,8 +1051,11 @@ static int host_spawn_std(const struct file *f, int n) {
     return fstat(n, &st) < 0 ? ABI_SPAWN_FD_CLOSED : n;
 }
 
+void host_fd_sync(void);
+
 int proc_spawn(const struct proc_spec *spec) {
     if (!spec || !spec->path) return -1;
+    host_fd_sync();             /* the shell's table, as the child sees it (618) */
 
     /* ...AND A CLOSED ONE STAYS CLOSED. The kernel's spawn hands a child
      * either a descriptor or the console, never nothing, and a closed
@@ -1115,15 +1185,134 @@ int host_file_vstat(struct file *f, struct vfs_stat *out) {
     return host_vstat(&st, out);
 }
 
+/* Real descriptors that are copies made for the listing's sake (see
+ * host_fd_sync): a slot whose file another slot already has, or the copy
+ * bash keeps of a 0, 1 or 2 a redirection has replaced. Nothing reads or
+ * writes through them. */
+static bool g_mir[HOST_NREG];
+
+/* The lowest descriptor from FROM up that is not open, AVOID aside. */
+static int host_free_fd(int from, int avoid) {
+    for (int n = from; n < HOST_NREG; n++) {
+        if (n == avoid) continue;
+        struct stat st;
+        if (fstat(n, &st) < 0 && errno == EBADF) return n;
+    }
+    return -1;
+}
+
+/* Make real descriptor N free: a cell there goes to the lowest free one
+ * from FROM up, a copy of ours is closed. false: something else of this
+ * process holds N. */
+static bool host_fd_clear(int n, int from) {
+    if (n < 3 || n >= HOST_NREG) return false;
+    if (g_mir[n]) { close(n); g_mir[n] = false; return true; }
+    struct hcell *e = g_reg[n];
+    if (e) {
+        int to = host_free_fd(from, n);
+        return to >= 0 && hcell_move(e, to) == to;
+    }
+    struct stat st;
+    return fstat(n, &st) < 0;
+}
+
 int host_file_move_fd(struct file *f, int want) {
     if (!f || want < 0) return -1;
-    int cur = VF_FD(&f->vfs);
-    if (cur < 0) return -1;
-    if (cur == want) return want;
-    if (dup2(cur, want) < 0) return -1;
-    close(cur);
-    VF_SET(&f->vfs, want);
-    return want;
+    struct hcell *c = (struct hcell *)f->vfs.priv;
+    if (!c || c == &g_dead_cell || c->fd < 0) return -1;
+    if (c->fd == want) return want;
+    /* (whatever of the shell's holds WANT moves out of the way first;
+     * dup2 would have closed it under its handles -- 618) */
+    if (want >= 3 && want < HOST_NREG && (g_reg[want] || g_mir[want]))
+        (void)host_fd_clear(want, 3);
+    return hcell_move(c, want);
+}
+
+/* THE SHELL'S DESCRIPTORS ARE THIS PROCESS'S, AT THEIR OWN NUMBERS, as a
+ * child sees them in /proc/$$/fd -- bash 5.2.15's, measured (logs/b44
+ * fd1-fd3):
+ *
+ *     exec 5>f; exec {v}>g; coproc cat     0 1 10 2 255 5 60 63
+ *     { ls /proc/$$/fd; } 7>/dev/null      0 1 2 255 7
+ *     f 2>/dev/null </dev/null             0 1 10 11 2 255
+ *
+ * A slot of 3 or more is its file's descriptor (or a copy, where another
+ * slot or a standard descriptor has the file), and each 0, 1 or 2 a
+ * redirection of a running command has replaced is kept, as bash keeps it,
+ * from 10 up. tsh's numbers were whatever open() had handed out, its
+ * table's numbers in no descriptor at all (`exec 5>f` was 3, a coproc 3
+ * and 6). Made before anything can look: before each child starts. The
+ * shell's own 0-2 stay its own -- its stdin reader and stdio read and write
+ * them -- and a $( ) runs in the shell itself, whose $$ is the parent's,
+ * so there the table stays as it was (finding 618). */
+extern int shell_host_fd_slots(struct file ***tab);
+extern bool shell_host_fd_frozen(void);
+extern int shell_host_fd_saved(struct file **set, struct file **old, int *std,
+                               int max);
+
+static struct hcell *host_slot_cell(struct file *f) {
+    if (!f || f->kind != FILE_KIND_VFS) return 0;
+    struct hcell *c = (struct hcell *)f->vfs.priv;
+    if (!c || c == &g_dead_cell || c->fd < 0) return 0;
+    return c;
+}
+
+void host_fd_sync(void) {
+    if (shell_host_fd_frozen()) return;
+    for (int n = 3; n < HOST_NREG; n++)          /* the copies, made again */
+        if (g_mir[n]) { close(n); g_mir[n] = false; }
+    struct file **tab = 0;
+    int ns = shell_host_fd_slots(&tab);
+    if (ns > HOST_NREG) ns = HOST_NREG;
+    for (int n = 3; n < ns; n++) {
+        struct hcell *c = host_slot_cell(tab[n]);
+        if (!c || c->fd == n) continue;
+        /* a copy where the file is a standard descriptor's, or sits in
+         * another slot that has it */
+        bool copy = c->fd <= 2 ||
+                    (c->fd < ns && host_slot_cell(tab[c->fd]) == c);
+        if (!host_fd_clear(n, 10)) continue;   /* not ours to take */
+        if (copy) {
+            if (dup2(c->fd, n) == n) g_mir[n] = true;
+        } else {
+            (void)hcell_move(c, n);
+        }
+    }
+    /* bash's saved copies, from 10 up, in the order bash makes them. The
+     * shell's own 0-2 stay where they are, so the number goes to the file
+     * the redirection gave -- its own descriptor, moved there, where it is
+     * no slot's -- and the old one is copied there otherwise: the numbers
+     * are bash's, the 0-2 they stand beside are tsh's. */
+    struct file *set[16], *old[16];
+    int std[16];
+    int k = shell_host_fd_saved(set, old, std, 16);
+    for (int i = 0; i < k; i++) {
+        int to = host_free_fd(10, -1);
+        if (to < 0) break;
+        struct hcell *c = host_slot_cell(set[i]);
+        bool slotted = c && c->fd >= 3 && c->fd < ns && host_slot_cell(tab[c->fd]) == c;
+        if (c && c->fd >= 10 && !slotted) continue;      /* there already */
+        if (c && c->fd >= 3 && !slotted) {
+            (void)hcell_move(c, to);
+            continue;
+        }
+        struct hcell *oc = host_slot_cell(old[i]);
+        int from = oc ? oc->fd : std[i];
+        if (from >= 0 && dup2(from, to) == to) g_mir[to] = true;
+    }
+}
+
+/* bash runs a script from its descriptor 255 (and its children have none
+ * of it): /proc/$$/fd lists 255 for every script. The script's text is
+ * read whole here; the descriptor is held for the listing (618). */
+void host_hold_script_fd(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    if (fd != 255) {
+        if (dup2(fd, 255) != 255) { close(fd); return; }
+        close(fd);
+    }
+    (void)fcntl(255, F_SETFD, FD_CLOEXEC);
 }
 
 /* `read -t`: is there input on this descriptor, or would a read return EOF at
@@ -1965,6 +2154,7 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (script) {
+        host_hold_script_fd(script);                    /* (618) */
         int rc = shell_run_script_hosted(script);
         shell_exit_jobs_hosted();
         return rc;

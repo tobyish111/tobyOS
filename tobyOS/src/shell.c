@@ -30902,6 +30902,11 @@ static const char *shell_prefix_path(char **assigns, int assignc,
 static bool g_spawn_put_command_name;
 static void shell_env_put_command_name(char **envp, int *envc,
                                        const char *path);
+/* ...and the command's own redirections, which the shell lets go once the
+ * child has them (shell_fd_state_release_owned, finding 618). Read once. */
+struct shell_fd_state;
+static struct shell_fd_state *g_spawn_release;
+static void shell_fd_state_release_owned(struct shell_fd_state *st);
 static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            char **argv, bool background,
                                            const char *profile,
@@ -30913,6 +30918,8 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
                                            int nextra) {
     bool put_name = g_spawn_put_command_name;
     g_spawn_put_command_name = false;
+    struct shell_fd_state *rel = g_spawn_release;
+    g_spawn_release = 0;
     /* AN EMPTY COMMAND NAME IS "command not found", status 127 -- bash's
      * answer for `"$SH" -c x` with $SH unset. resolve_program("") walked
      * PATH, joined "" onto each directory, landed on the directory itself
@@ -31014,6 +31021,7 @@ static int shell_spawn_program_profile_fds(const char *path_arg, int argc,
         }
     }
     g_shell_fd[2] = spawn_diag_saved;
+    if (rel) shell_fd_state_release_owned(rel);         /* (618) */
 
     if (background) {
         g_last_bg_pid = pid;
@@ -31412,7 +31420,9 @@ void shell_host_forked(void);                    /* host.c: the child's pid */
  * program inside and exited 143, where bash's job is "Terminated" itself
  * (ttyparity 18). With a TERM trap set the trap keeps its handler, and
  * what `trap - TERM` would go back to becomes the default. */
+void host_fd_sync(void);                         /* host.c (finding 618) */
 static int shell_fork(void) {
+    host_fd_sync();             /* the table as the child's commands list it */
     int pid = fork();
     if (pid == 0) {
         shell_host_forked();
@@ -44952,7 +44962,48 @@ struct shell_io_frame {
     bool owned_base[SHELL_FD_BASE];
     struct shell_simple *cmd;       /* whose redirections these are */
     int line_depth;                 /* g_exec_line_depth it was installed at */
+    struct shell_io_frame *up;      /* the one installed before it (g_io_frames) */
+    unsigned std_replaced;          /* bit I: it gave 0, 1 or 2 another file */
+    struct file *std_set[3];        /* ...that one */
 };
+
+/* The frames in force, newest first: what bash has saved copies of, for
+ * the host's listing of the shell's descriptors (finding 618). */
+static struct shell_io_frame *g_io_frames;
+
+#ifdef SHELL_HOSTED
+/* The host's questions about the shell's table (host.c host_fd_sync). */
+int shell_host_fd_slots(struct file ***tab);
+int shell_host_fd_slots(struct file ***tab) {
+    *tab = g_shell_fd;
+    return g_shell_fd_cap;
+}
+bool shell_host_fd_frozen(void);
+bool shell_host_fd_frozen(void) { return g_comsub_level > 0; }
+int host_file_fd(struct file *f);
+/* Where bash holds a saved copy: each 0, 1 or 2 a frame in force gave
+ * another file while it was open, oldest frame first -- SET[k] the file the
+ * frame put there, OLD[k] the one it replaced, STD[k] which. */
+int shell_host_fd_saved(struct file **set, struct file **old, int *std, int max);
+int shell_host_fd_saved(struct file **set, struct file **old, int *std, int max) {
+    struct shell_io_frame *v[64];
+    int nv = 0;
+    for (struct shell_io_frame *f = g_io_frames; f && nv < 64; f = f->up) v[nv++] = f;
+    int k = 0;
+    for (int j = nv - 1; j >= 0; j--)
+        for (int i = 0; i < 3 && k < max; i++) {
+            struct shell_io_frame *f = v[j];
+            if (!(f->std_replaced & (1u << i))) continue;
+            struct file *o = f->old_fd[i];
+            if (o && o->kind == FILE_KIND_NULL) continue;    /* was closed */
+            set[k] = f->std_set[i];
+            old[k] = o;
+            std[k] = i;
+            k++;
+        }
+    return k;
+}
+#endif
 
 /* A FORKED CHILD'S COMMAND KEEPS ITS REDIRECTIONS FOR THE EXIT TRAP. bash's
  * subshell applies the command's own redirections for good, not undoably
@@ -44978,6 +45029,20 @@ static void shell_fd_state_close_owned(struct shell_fd_state *st) {
         st->owned[i] = false;
     }
     shell_fd_state_free(st);
+}
+
+#ifdef SHELL_HOSTED
+void host_file_release(struct file *f);                  /* host.c */
+#endif
+/* The child has the command's own descriptors now: the shell's go, as
+ * bash's never were (finding 618). The handles stay for the close. */
+static void shell_fd_state_release_owned(struct shell_fd_state *st) {
+#ifdef SHELL_HOSTED
+    for (int i = 0; st && i < st->n; i++)
+        if (st->owned[i]) host_file_release(st->fd[i]);
+#else
+    (void)st;
+#endif
 }
 
 /* Make `fds` the shell's table, remembering the old one in `frame`. The
@@ -45008,7 +45073,21 @@ static int shell_io_frame_install(struct shell_io_frame *frame,
         if (i < fds->n) fds->owned[i] = false;
     }
     frame->line_depth = g_exec_line_depth;
+    frame->up = g_io_frames;                    /* (618) */
+    g_io_frames = frame;
+    frame->std_replaced = 0;
+    for (int i = 0; i < 3 && i < n; i++) {
+        frame->std_set[i] = g_shell_fd[i];
+        if (g_shell_fd[i] != frame->old_fd[i]) frame->std_replaced |= 1u << i;
+    }
     return 0;
+}
+
+/* (and out of the stack again: the frame and any installed after it that
+ * never came off -- 618) */
+static void shell_io_frame_unlink(struct shell_io_frame *frame) {
+    for (struct shell_io_frame *f = g_io_frames; f; f = f->up)
+        if (f == frame) { g_io_frames = frame->up; return; }
 }
 
 static struct file *shell_closed_file_make(void) {
@@ -45501,6 +45580,7 @@ struct file *shell_current_diag_file(void) {
 
 static void shell_restore_io_frame(struct shell_io_frame *frame) {
     if (!frame || !frame->old_fd) return;
+    shell_io_frame_unlink(frame);
     if (g_io_keep_depth > 0 && frame->line_depth == g_io_keep_depth) {
         /* kept: the table stays as the frame made it, and owns its files */
         if (frame->old_fd != frame->old_base) kfree(frame->old_fd);
@@ -47519,6 +47599,7 @@ static int shell_run_single_in(struct shell_simple *cmd, bool background) {
     int nxfd = shell_fd_state_extra(&fds, xfd, fds.n + g_procsub_n);
     g_spawn_temp_path = shell_prefix_path(cmd->argv, assignc, envp, envc);
     g_spawn_put_command_name = true;
+    g_spawn_release = &fds;
     int rc = shell_spawn_program_profile_fds(exec_cmd.argv[0], exec_cmd.argc,
                                              exec_cmd.argv, background,
                                              /*profile=*/0,
