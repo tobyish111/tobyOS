@@ -4822,8 +4822,10 @@ struct shell_simple;
 static const struct shell_simple *g_assign_cmd;   /* the command running */
 static bool shell_kv_scalar_paren(const char *kv, const char *val);
 static bool shell_kv_decl_assoc(const char *kv);
+static bool shell_kv_decl_index(const char *kv);
 static bool sh_decl_late_conflict(const char *kv, bool makes_local);
-static int sh_decl_late_pre(int argc, char **argv, int from, bool makes_local);
+static int sh_decl_late_pre(int argc, char **argv, int from, bool makes_local,
+                            bool drops);
 static int *sh_decl_order(int argc, char **argv, int from, int *nlists);
 static bool shell_kv_written_list(const char *kv);
 
@@ -11081,7 +11083,7 @@ static void cmd_local(int argc, char **argv) {
     }
     /* (a list after a late -A is associative, this name only -- 612) */
     const bool l_base_array = l_array, l_base_assoc = l_assoc;
-    if (sh_decl_late_pre(argc, argv, first, true) < 0) return;
+    if (sh_decl_late_pre(argc, argv, first, true, g_fn_depth <= 0) < 0) return;
     /* (the written lists first -- 615) */
     int nlists = 0;
     int *ord __attribute__((cleanup(shell_kfree_ptr))) =
@@ -11093,7 +11095,12 @@ static void cmd_local(int argc, char **argv) {
         bool late_a = shell_kv_decl_assoc(argv[i]);
         l_array = l_base_array || late_a;
         l_assoc = l_base_assoc || late_a;
-        if (late_a && sh_decl_late_conflict(argv[i], true)) continue;
+        /* (said already; with -A local's own, the word goes on to its
+         * refusal below -- 623) */
+        const bool late_i = shell_kv_decl_index(argv[i]);
+        if ((late_a || late_i) && sh_decl_late_conflict(argv[i], true) &&
+            !(late_a ? l_base_assoc : l_base_array))
+            continue;
         /* `local -` MAKES THE SHELL'S OPTIONS LOCAL: the `set -o` ones on
          * now are noted, and the function's return sets each one that
          * differs back -- shopt's are not among them. tsh said "`-': not a
@@ -11232,6 +11239,28 @@ static void cmd_local(int argc, char **argv) {
         }
 
         bool already = shell_local_declared_here(name, g_script_depth);
+        /* -A OF THE FUNCTION'S OWN INDEXED ARRAY IS REFUSED, as declare's
+         * (shell_decl_convert): "local: u: cannot convert indexed to
+         * associative array", status 1, u as it was -- tsh made it
+         * associative in place (bash; logs/b44 rg2 b4, rg8) -- 623; and -a
+         * of its own associative one the other way round, which tsh passed
+         * over (rg8 l2) */
+        if (l_assoc && already) {
+            struct sh_array *xa = sh_array_find(name);
+            int xs = env_find(name, klen);
+            if ((xa && !xa->assoc) ||
+                (!xa && xs >= 0 && (g_env_flags[xs] & SHVAR_ARRAY) &&
+                 !(g_env_flags[xs] & SHVAR_NAMEREF))) {
+                kprintf("local: %s: cannot convert indexed to associative array\n",
+                        name);
+                shell_set_status(1);
+                continue;
+            }
+        } else if (l_array && already && sh_array_is_assoc(name)) {
+            kprintf("local: %s: cannot convert associative to indexed array\n", name);
+            shell_set_status(1);
+            continue;
+        }
         bool inherit = !already && !has_value && shell_local_inherits(name);
         /* a new local's written list is expanded first (shell_local_list_pre) */
         SH_SB(prelist);
@@ -11875,7 +11904,7 @@ static void cmd_export(int argc, char **argv) {
         }
         return;
     }
-    if (sh_decl_late_pre(argc, argv, start, false) < 0) return;      /* (612) */
+    if (sh_decl_late_pre(argc, argv, start, false, true) < 0) return;  /* (612, 623) */
     /* (the written lists first -- 615) */
     int nlists = 0;
     int *ord __attribute__((cleanup(shell_kfree_ptr))) =
@@ -12646,7 +12675,8 @@ static void cmd_declare(int argc, char **argv) {
      * also given, the list made and then -a's "cannot convert associative
      * to indexed array" */
     const bool base_array = set_array, base_assoc = set_assoc;
-    if (sh_decl_late_pre(argc, argv, i, (g_fn_depth > 0) && !set_global) < 0)
+    if (sh_decl_late_pre(argc, argv, i, (g_fn_depth > 0) && !set_global,
+                         g_fn_depth <= 0) < 0)
         return;
     const char *late_conv = 0;
     int late_conv_at = -1;
@@ -12672,8 +12702,12 @@ static void cmd_declare(int argc, char **argv) {
         bool late_a = shell_kv_decl_assoc(argv[i]);
         set_array = base_array || late_a;
         set_assoc = base_assoc || late_a;
-        if (late_a && sh_decl_late_conflict(argv[i], (g_fn_depth > 0) && !set_global))
-            continue;                               /* (said already) */
+        /* (said already: the word is dropped -- unless -A is the builtin's
+         * own, when it goes on to the refusal in declare's name, its first
+         * line not said twice -- 623) */
+        const bool late_said = (late_a || shell_kv_decl_index(argv[i])) &&
+            sh_decl_late_conflict(argv[i], (g_fn_depth > 0) && !set_global);
+        if (late_said && !(late_a ? base_assoc : base_array)) continue;
         if (late_a && base_array && !base_assoc && sb_set(&late_nm, "") == 0 &&
             sb_putmem(&late_nm, argv[i], env_assign_name_len(argv[i])) == 0) {
             late_conv = late_nm.p;
@@ -13102,7 +13136,8 @@ static void cmd_declare(int argc, char **argv) {
         }
         if (set_array &&
             shell_decl_convert(name, set_assoc, argv[0],
-                               (has_value && argv[i][env_key_len(argv[i]) + 1] == '(')
+                               (has_value && !late_said &&
+                                argv[i][env_key_len(argv[i]) + 1] == '(')
                                    ? g_decl_cmd_name : 0) < 0) {
             shell_set_status(1);
             continue;
@@ -13355,7 +13390,8 @@ static void cmd_readonly(int argc, char **argv) {
         return;
     }
 
-    if (!opt_f && sh_decl_late_pre(argc, argv, first, false) < 0) return;  /* (612) */
+    if (!opt_f && sh_decl_late_pre(argc, argv, first, false, true) < 0)
+        return;                                          /* (612, 623) */
     /* (the written lists first -- 615) */
     int nlists = 0;
     int *ord __attribute__((cleanup(shell_kfree_ptr))) =
@@ -30451,6 +30487,12 @@ struct shell_simple {
     int ndecl_assoc;
     int decl_assoc_cap;
     bool late_A;
+    /* ...and one after an `-a` word with no -A before it: made indexed, so
+     * over an associative array it is refused there too (623) */
+    const char **decl_index;
+    int ndecl_index;
+    int decl_index_cap;
+    bool late_a_idx;
     const char *stdin_path;
     const char *stdin_text;
     const char *stdout_path;
@@ -40786,29 +40828,36 @@ static int shell_note_decl_assoc(struct shell_simple *cur, const char *raw,
         !sh_decl_name(cur->argv[cur->cmd_word_index]))
         return 0;
     if (raw[0] == '-') {
-        bool has_a = false, plain = true;
+        bool has_A = false, has_a = false, plain = true;
         for (const char *q = raw; *q; q++) {
-            if (*q == 'A') has_a = true;
+            if (*q == 'A') has_A = true;
+            if (*q == 'a') has_a = true;
             if (*q == '\'' || *q == '"' || *q == '\\' || *q == '$' || *q == '`')
                 plain = false;
         }
-        if (has_a && plain) cur->late_A = true;
+        if (has_A && plain) cur->late_A = true;
+        if (has_a && plain) cur->late_a_idx = true;              /* (623) */
         return 0;
     }
     size_t rl = shell_assign_prefix_len_raw(raw);
-    if (!cur->late_A || rl == 0 || raw[rl] != '(' || before >= cur->argc)
+    if (!(cur->late_A || cur->late_a_idx) || rl == 0 || raw[rl] != '(' ||
+        before >= cur->argc)
         return 0;
-    if (cur->ndecl_assoc >= cur->decl_assoc_cap) {
-        int ncap = cur->decl_assoc_cap ? cur->decl_assoc_cap * 2 : 4;
+    /* (-A's list is associative, -a's indexed; with both, -A's -- the -a
+     * refusal is then the builtin's: logs/b44 rg12 w3) */
+    const char ***lp = cur->late_A ? &cur->decl_assoc : &cur->decl_index;
+    int *np = cur->late_A ? &cur->ndecl_assoc : &cur->ndecl_index;
+    int *cp = cur->late_A ? &cur->decl_assoc_cap : &cur->decl_index_cap;
+    if (*np >= *cp) {
+        int ncap = *cp ? *cp * 2 : 4;
         const char **na = cur->arena
             ? (const char **)words_alloc(cur->arena, (size_t)ncap * sizeof *na) : 0;
         if (!na) return -1;
-        if (cur->ndecl_assoc)
-            memcpy(na, cur->decl_assoc, (size_t)cur->ndecl_assoc * sizeof *na);
-        cur->decl_assoc = na;
-        cur->decl_assoc_cap = ncap;
+        if (*np) memcpy(na, *lp, (size_t)*np * sizeof *na);
+        *lp = na;
+        *cp = ncap;
     }
-    cur->decl_assoc[cur->ndecl_assoc++] = cur->argv[before];
+    (*lp)[(*np)++] = cur->argv[before];
     return 0;
 }
 
@@ -40821,21 +40870,38 @@ static bool shell_kv_decl_assoc(const char *kv) {
     return false;
 }
 
+/* ...an indexed one's, after an -a (623) */
+static bool shell_kv_decl_index(const char *kv) {
+    const struct shell_simple *c = g_assign_cmd;
+    if (!c) return false;
+    for (int i = 0; i < c->ndecl_index; i++)
+        if (c->decl_index[i] == kv) return true;
+    return false;
+}
+
 /* bash makes such a list as it expands the command's words, before the
  * builtin runs: over an INDEXED array that is "U: cannot convert indexed
  * to associative array" -- under the name it expands under (a function's,
- * while this is its first command), and then the builtin runs without the
- * word; with no such name the rest of the line is dropped, status 1, set
- * -e or not (logs/b44 dla2 e1, dla3 f1-f5). A list that makes a new
- * local meets no array. MAKES_LOCAL: the builtin makes locals here. */
+ * while this is its first command; eval's, `.`'s), and then the builtin
+ * runs without the word, or with it when -A is one of its own options,
+ * which refuses it again in its own name (b1 b4 b9); or the rest of the
+ * line is dropped, status 1, set -e or not (sh_decl_late_pre; logs/b44
+ * dla2 e1, dla3 f1-f5, rg2 rg4 rg5). A list that makes a new local meets
+ * no array. MAKES_LOCAL: the builtin makes locals here. */
 static bool sh_decl_late_conflict(const char *kv, bool makes_local) {
-    if (!shell_kv_decl_assoc(kv)) return false;
+    bool as = shell_kv_decl_assoc(kv);
+    if (!as && !shell_kv_decl_index(kv)) return false;
     size_t nl = env_assign_name_len(kv);
     SH_SB(nm);
     if (nl == 0 || sb_putmem(&nm, kv, nl) < 0) return false;
     if (makes_local && !shell_local_declared_here(nm.p, g_script_depth))
         return false;
     struct sh_array *a = sh_array_find(nm.p);
+    /* (an -a list over an ASSOCIATIVE array the other way round: "A:
+     * cannot convert associative to indexed array", by the same rules --
+     * tsh made the list into it, readonly's and export's too: A=([1]="2")
+     * -- logs/b44 rg11 rg12, 623) */
+    if (!as) return a && a->assoc;
     if (a) return !a->assoc;
     int si = env_find(nm.p, nl);
     return si >= 0 && (g_env_flags[si] & SHVAR_ARRAY) &&
@@ -40867,17 +40933,28 @@ static int *sh_decl_order(int argc, char **argv, int from, int *nlists) {
     return o;
 }
 
-/* The refusals, before the builtin's own work: -1 when the line is done. */
-static int sh_decl_late_pre(int argc, char **argv, int from, bool makes_local) {
+/* The refusals, before the builtin's own work: -1 when the line is done.
+ * WHETHER IT DROPS is not the name it is said under but where it runs and
+ * which builtin: outside a function the rest of the line goes (an eval's
+ * or a `.`'s text, which then return 1), in one declare, typeset and local
+ * go on to the builtin; readonly's and export's drop wherever they run --
+ * tsh dropped on no name alone, so `eval 'declare -A a=(...)'` over an
+ * indexed a went on and a function's line after `:` stopped (bash's
+ * varenv4.sub, Oils 0251; logs/b44 rg2 rg4 rg5) -- finding 623. DROPS:
+ * this builtin's refusal ends the line here. */
+static int sh_decl_late_pre(int argc, char **argv, int from, bool makes_local,
+                            bool drops) {
     for (int k = from; k < argc; k++) {
         if (!sh_decl_late_conflict(argv[k], makes_local)) continue;
         int nl = (int)env_assign_name_len(argv[k]);
-        if (g_decl_cmd_name) {
-            kprintf("%s: %.*s: cannot convert indexed to associative array\n",
-                    g_decl_cmd_name, nl, argv[k]);
-            continue;
-        }
-        kprintf("%.*s: cannot convert indexed to associative array\n", nl, argv[k]);
+        const char *what = shell_kv_decl_assoc(argv[k])
+            ? "indexed to associative" : "associative to indexed";
+        if (g_decl_cmd_name)
+            kprintf("%s: %.*s: cannot convert %s array\n",
+                    g_decl_cmd_name, nl, argv[k], what);
+        else
+            kprintf("%.*s: cannot convert %s array\n", nl, argv[k], what);
+        if (!drops) continue;
         shell_set_status(1);
         if (g_shell_flow == SHELL_FLOW_NONE) {
             g_shell_flow = SHELL_FLOW_DISCARD;
