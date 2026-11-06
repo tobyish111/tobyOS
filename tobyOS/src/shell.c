@@ -34322,6 +34322,13 @@ static int sh_posargs_at(bool star, char op, struct shell_sb *b) {
             sb_puts(&one, vals.p + at) < 0)
             return -1;
     }
+    /* UNQUOTED UNDER A NULL IFS ${*@A} IS THE "@" FORM'S WORDS: `set`,
+     * `--`, then each value -- `set -- a 'b c'` with IFS= is <set><--><'a'>
+     * <'b c'>, where tsh gave the statement as one word (logs/b44 csl6
+     * s4) -- finding 611. In a $( ) under bash's no-split flag the values
+     * run together, one word after `set` and `--` (610). */
+    if (star && sh_star_fields())
+        return sh_at_A_words(b, "set -- ", vals.p, n);
     if (star && sh_star_leak_split())
         return sh_at_A_words(b, "set -- ", one.p + 7, 1);
     if (star) return sb_put_data_str(b, one.p);
