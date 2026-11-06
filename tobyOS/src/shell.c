@@ -4366,10 +4366,20 @@ static int sh_array_literal_fill_ex(const char *dst, const char *name,
                      * [1], where tsh said "invalid arithmetic operator";
                      * a ^B stays an error (bash's exp8.sub; logs/b42 in1
                      * i6, logs/b43 ctl1 c13 c14, ctl2 d2) -- finding 567 */
-                    if (kx.p) {
+                    /* ...AS AN ESCAPE: a ^A and the byte after it are that
+                     * byte, a ^A at the end goes -- but a subscript that is
+                     * a ^A ALONE is the byte itself to the arithmetic:
+                     * `U=( [^A]=x )` and `[^A^A]` are "^A: syntax error:
+                     * operand expected (error token is "^A")", the line
+                     * dropped, where tsh took every ^A away and said
+                     * "[]=x: bad array subscript" (logs/b44 dla d16, dlx
+                     * g1-g14, dlx3 k1 k2) -- finding 613 */
+                    if (kx.p && strcmp(kx.p, "\x01") != 0) {
                         char *w = kx.p;
-                        for (const char *r = kx.p; *r; r++)
-                            if (*r != '\x01') *w++ = *r;
+                        for (const char *r = kx.p; *r; r++) {
+                            if (*r != '\x01') { *w++ = *r; continue; }
+                            if (r[1]) *w++ = *++r;
+                        }
                         *w = '\0';
                     }
                     sh_xt_lit_note(kx.p, vx.p, eplus);
