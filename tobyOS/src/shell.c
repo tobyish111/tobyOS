@@ -1755,6 +1755,20 @@ void shell_write(const char *s) {
     }
 }
 
+/* N copies of C, written in pieces: PRINTF'S PADDING. A byte at a time it was
+ * a write of its own where the output is a $( )'s spill file --
+ * `printf "%*s" 300000 ""` took 977 ms to stdout and 2.4 s in a $( ) in
+ * QEMU, where bash takes 20 and 65 (logs/b44 pf1) -- finding 617. */
+static void shell_put_pad(char c, int n) {
+    char buf[257];
+    if (n <= 0) return;
+    int m = n < 256 ? n : 256;
+    memset(buf, c, (size_t)m);
+    buf[m] = '\0';
+    while (n >= 256) { shell_write(buf); n -= 256; }
+    if (n > 0) { buf[n] = '\0'; shell_write(buf); }
+}
+
 static void shell_putc(char c) {
     char s[2] = { c, '\0' };
     if (g_shell_out) g_shell_out(s, g_shell_out_ctx);
@@ -26747,26 +26761,26 @@ static void cmd_printf(int argc, char **argv) {
                  * the formatted time, as for %s (Oils 1034) */
                 if (prec >= 0 && slen > prec) slen = prec;
                 int pad = width > slen ? width - slen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left) shell_put_pad(' ', pad);
                 for (int i = 0; i < slen; i++) shell_putc(tbuf[i]);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 'q') {
                 /* `%q` was not a conversion at all: the chain fell through
                  * and the two bytes `%q` were printed. */
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int slen = shell_q_render(s, false);
                 int pad = width > slen ? width - slen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left) shell_put_pad(' ', pad);
                 (void)shell_q_render(s, true);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 's') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int slen = (int)strlen(s);
                 if (prec >= 0 && slen > prec) slen = prec;
                 int pad = width > slen ? width - slen : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left) shell_put_pad(' ', pad);
                 for (int i = 0; i < slen; i++) shell_putc(s[i]);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 'u') {
                 /* Two's complement, not "absolute value without a sign":
                  * `printf '%u' -42` is 18446744073709551574 everywhere. Read
@@ -26783,10 +26797,10 @@ static void cmd_printf(int argc, char **argv) {
                     uv /= 10ul;
                 }
                 int pad = width > blen ? width - blen : 0;
-                if (!left && !zero_pad) for (int k = 0; k < pad; k++) shell_putc(' ');
-                if (!left && zero_pad)  for (int k = 0; k < pad; k++) shell_putc('0');
+                if (!left && !zero_pad) shell_put_pad(' ', pad);
+                if (!left && zero_pad)  shell_put_pad('0', pad);
                 while (blen > 0) shell_putc(buf[--blen]);
-                if (left) for (int k = 0; k < pad; k++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 'd' || spec == 'i') {
                 long v = printf_arg_int(argc, argv, &argi);
                 printf_erange_warn(g_printf_erange_s);
@@ -26809,12 +26823,12 @@ static void cmd_printf(int argc, char **argv) {
                 if (prec >= 0) zero_pad = false;
                 numlen += zeros;
                 int pad = width > numlen ? width - numlen : 0;
-                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left && !zero_pad) shell_put_pad(' ', pad);
                 if (sign) shell_putc(sign);
-                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                if (!left && zero_pad) shell_put_pad('0', pad);
                 for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 'f' || spec == 'F' || spec == 'e' ||
                        spec == 'E' || spec == 'g' || spec == 'G' ||
                        spec == 'a' || spec == 'A') {
@@ -26853,19 +26867,19 @@ static void cmd_printf(int argc, char **argv) {
                     int blen2 = (int)bt.len;
                     if (prec >= 0 && blen2 > prec) blen2 = prec;
                     int pad = width > blen2 ? width - blen2 : 0;
-                    if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                    if (!left) shell_put_pad(' ', pad);
                     for (int i = 0; i < blen2; i++) shell_putc(bt.p[i]);
-                    if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                    if (left) shell_put_pad(' ', pad);
                 }
                 if (g_printf_stop) break;              /* and abandon the format */
             } else if (spec == 'c') {
                 const char *s = printf_arg_str(argc, argv, &argi);
                 int pad = width > 1 ? width - 1 : 0;
-                if (!left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left) shell_put_pad(' ', pad);
                 /* an empty operand is a NUL byte, as bash writes it */
                 if (s[0]) shell_putc(s[0]);
                 else shell_putc_raw(0);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else if (spec == 'o' || spec == 'x' || spec == 'X') {
                 /* bash reads these with strtoumax: 18446744073709551615 is
                  * ffffffffffffffff, where the signed view had saturated it
@@ -26897,12 +26911,12 @@ static void cmd_printf(int argc, char **argv) {
                 if (prec >= 0) zero_pad = false;
                 int numlen = blen + zeros + prelen;
                 int pad = width > numlen ? width - numlen : 0;
-                if (!left && !zero_pad) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (!left && !zero_pad) shell_put_pad(' ', pad);
                 for (int i = 0; i < prelen; i++) shell_putc(pre[i]);
-                if (!left && zero_pad) for (int i = 0; i < pad; i++) shell_putc('0');
+                if (!left && zero_pad) shell_put_pad('0', pad);
                 for (int i = 0; i < zeros; i++) shell_putc('0');
                 while (blen > 0) shell_putc(buf[--blen]);
-                if (left) for (int i = 0; i < pad; i++) shell_putc(' ');
+                if (left) shell_put_pad(' ', pad);
             } else {
                 shell_putc('%');
                 if (spec) shell_putc(spec);
