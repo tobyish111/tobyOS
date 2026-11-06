@@ -4810,6 +4810,7 @@ static bool shell_kv_scalar_paren(const char *kv, const char *val);
 static bool shell_kv_decl_assoc(const char *kv);
 static bool sh_decl_late_conflict(const char *kv, bool makes_local);
 static int sh_decl_late_pre(int argc, char **argv, int from, bool makes_local);
+static int *sh_decl_order(int argc, char **argv, int from, int *nlists);
 static bool shell_kv_written_list(const char *kv);
 
 /* Set for ONE assignment whose text was never expanded -- a write through
@@ -11067,7 +11068,14 @@ static void cmd_local(int argc, char **argv) {
     /* (a list after a late -A is associative, this name only -- 612) */
     const bool l_base_array = l_array, l_base_assoc = l_assoc;
     if (sh_decl_late_pre(argc, argv, first, true) < 0) return;
-    for (int i = first; i < argc; i++) {
+    /* (the written lists first -- 615) */
+    int nlists = 0;
+    int *ord __attribute__((cleanup(shell_kfree_ptr))) =
+        sh_decl_order(argc, argv, first, &nlists);
+    if (!ord) { shell_set_status(1); return; }
+    for (int k = 0; k < argc - first; k++) {
+        if (k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        int i = ord[k];
         bool late_a = shell_kv_decl_assoc(argv[i]);
         l_array = l_base_array || late_a;
         l_assoc = l_base_assoc || late_a;
@@ -11854,7 +11862,14 @@ static void cmd_export(int argc, char **argv) {
         return;
     }
     if (sh_decl_late_pre(argc, argv, start, false) < 0) return;      /* (612) */
-    for (int i = start; i < argc; i++) {
+    /* (the written lists first -- 615) */
+    int nlists = 0;
+    int *ord __attribute__((cleanup(shell_kfree_ptr))) =
+        sh_decl_order(argc, argv, start, &nlists);
+    if (!ord) { shell_set_status(1); return; }
+    for (int k = 0; k < argc - start; k++) {
+        if (k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        int i = ord[k];
         /* A REFERENCE IS EXPORTED, or not, AS ITS TARGET: `export r`,
          * `export r=7`, `export -n r` act on the variable at the end of r's
          * chain, as declare -x does (finding 322). tsh marked r. */
@@ -12620,23 +12635,36 @@ static void cmd_declare(int argc, char **argv) {
     if (sh_decl_late_pre(argc, argv, i, (g_fn_depth > 0) && !set_global) < 0)
         return;
     const char *late_conv = 0;
+    int late_conv_at = -1;
     SH_SB(late_nm);
-    for (; i <= argc; i++) {
-        if (late_conv) {
+    /* (the written lists first -- 615 -- and -a's refusal of one of them
+     * where the builtin reaches its word) */
+    int nlists = 0;
+    int *ord __attribute__((cleanup(shell_kfree_ptr))) =
+        sh_decl_order(argc, argv, i, &nlists);
+    if (!ord) { shell_set_status(1); return; }
+    const int i0 = i;
+    for (int k = 0; k <= argc - i0; k++) {
+        if (k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        int ni = k < argc - i0 ? ord[k] : argc;
+        if (late_conv && k >= nlists && ni > late_conv_at) {
             kprintf("%s: %s: cannot convert associative to indexed array\n",
                     argv[0], late_conv);
             shell_set_status(1);
             late_conv = 0;
         }
-        if (i == argc) break;
+        if (k == argc - i0) break;
+        i = ni;
         bool late_a = shell_kv_decl_assoc(argv[i]);
         set_array = base_array || late_a;
         set_assoc = base_assoc || late_a;
         if (late_a && sh_decl_late_conflict(argv[i], (g_fn_depth > 0) && !set_global))
             continue;                               /* (said already) */
         if (late_a && base_array && !base_assoc && sb_set(&late_nm, "") == 0 &&
-            sb_putmem(&late_nm, argv[i], env_assign_name_len(argv[i])) == 0)
+            sb_putmem(&late_nm, argv[i], env_assign_name_len(argv[i])) == 0) {
             late_conv = late_nm.p;
+            late_conv_at = i;
+        }
         bool nref = set_nameref;     /* -n, for this name (see below) */
         /* (-r or -x of a reference to itself, no value: bash looks it up
          * twice and says so each time -- finding 573) */
@@ -13314,7 +13342,14 @@ static void cmd_readonly(int argc, char **argv) {
     }
 
     if (!opt_f && sh_decl_late_pre(argc, argv, first, false) < 0) return;  /* (612) */
-    for (int i = first; i < argc; i++) {
+    /* (the written lists first -- 615) */
+    int nlists = 0;
+    int *ord __attribute__((cleanup(shell_kfree_ptr))) =
+        sh_decl_order(argc, argv, first, &nlists);
+    if (!ord) { shell_set_status(1); return; }
+    for (int k = 0; k < argc - first; k++) {
+        if (!opt_f && k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        int i = opt_f ? first + k : ord[k];
         if (opt_f) {
             if (!shell_function_set_readonly(argv[i])) {
                 kprintf("readonly: %s: not a function\n", argv[i]);
@@ -40719,6 +40754,31 @@ static bool sh_decl_late_conflict(const char *kv, bool makes_local) {
     int si = env_find(nm.p, nl);
     return si >= 0 && (g_env_flags[si] & SHVAR_ARRAY) &&
            !(g_env_flags[si] & SHVAR_NAMEREF);
+}
+
+/* bash MAKES A DECLARATION'S WRITTEN LISTS AS IT EXPANDS ITS WORDS, before
+ * the builtin assigns anything: `declare a=1 U=( [a]=x )` reads a unset and
+ * makes [0], `declare c=3 V=( [c+=1]=z )` leaves c 3 and V [1], and a list
+ * that fails drops the line before any other word is assigned -- tsh
+ * assigned the words in order (logs/b44 dord o1-o6, dla2 e2) -- finding
+ * 615. The order to take ARGV[FROM..ARGC) in: the lists, then the rest,
+ * each in its own order, *NLISTS the lists; 0 when memory ran out. A list
+ * that failed has dropped the line: the builtin goes no further. */
+static int *sh_decl_order(int argc, char **argv, int from, int *nlists) {
+    int n = argc - from;
+    int *o = (int *)kmalloc((size_t)(n > 0 ? n : 1) * sizeof *o);
+    if (!o) return 0;
+    int k = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int j = from; j < argc; j++) {
+            size_t kl = env_key_len(argv[j]);
+            bool list = argv[j][kl] == '=' && argv[j][kl + 1] == '(' &&
+                        shell_kv_written_list(argv[j]);
+            if (list == (pass == 0)) o[k++] = j;
+        }
+        if (pass == 0 && nlists) *nlists = k;
+    }
+    return o;
 }
 
 /* The refusals, before the builtin's own work: -1 when the line is done. */
