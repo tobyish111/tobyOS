@@ -32092,6 +32092,37 @@ static int shell_parse_command_subst(const char **pp, char *cmd,
 /* THE COMMAND TEXT IS SIZED FROM THE SOURCE, not from LINE_MAX: it is a
  * substring of what follows `$(`, so that length always holds it. A 512-byte
  * array made any `$( )` longer than that a "bad command substitution". */
+/* Does a $( )'s text hold a $'...' inside a double-quoted ${ } -- the
+ * place bash's reader puts the string it stands for raw? (finding 616) */
+static bool sh_comsub_dq_ansic(const char *s) {
+    bool dq = false;
+    int br = 0;                         /* ${ opened inside the quotes */
+    for (const char *p = s; *p; p++) {
+        if (*p == '\\' && p[1]) { p++; continue; }
+        if (!dq && *p == '\'') {
+            while (p[1] && p[1] != '\'') p++;
+            if (p[1]) p++;
+            continue;
+        }
+        if (br > 0 && *p == '$' && p[1] == '\'') return true;
+        if (!dq && *p == '$' && p[1] == '\'') {
+            for (p += 2; *p && *p != '\''; p++)
+                if (*p == '\\' && p[1]) p++;
+            if (!*p) break;
+            continue;
+        }
+        if (*p == '"') { if (br == 0) dq = !dq; continue; }
+        if (dq && *p == '$' && p[1] == '{') { br++; p++; continue; }
+        if (br > 0 && *p == '}') br--;
+    }
+    return false;
+}
+
+static char *shell_print_comsub_body(const char *body);
+static bool shell_syn_check_string(const char *text, const char *iname,
+                                   unsigned long line_before, bool builtin,
+                                   bool *checked);
+
 static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
     SH_SB(cmd);
     if (sb_grow(&cmd, strlen(*pp) + 1) < 0) return -1;
@@ -32116,6 +32147,37 @@ static int shell_expand_command_subst(const char **pp, struct shell_sb *b) {
 #endif
         kprintf(SH_PFX_SHELL "bad command substitution\n");
         return -1;
+    }
+    /* bash RUNS THE TEXT ITS READER KEPT, and there a $'...' inside a
+     * double-quoted ${ } is the string it stands for, raw -- not quoted
+     * again: `x=$(echo "${zz-$'o\'k'}")` runs `echo "${zz-o'k}"`, whose
+     * quote is open, so the text is read whole and none of it runs:
+     * "command substitution: line 2: unexpected EOF while looking for
+     * matching `''", the rest of the line dropped with status 1 (under set
+     * -e the shell ends, 2) -- a function's line too. tsh ran the text as
+     * written and said its expansion's "bad substitution" (logs/b44 q9
+     * q1-q14, q9b p1-p8) -- finding 616. */
+    if (sh_comsub_dq_ansic(cmd.p)) {
+        char *pr = shell_print_comsub_body(cmd.p);
+        if (pr) {
+            bool checked = false;
+            bool ok = shell_syn_check_string(pr, "command substitution",
+                                             g_shell_lineno, false, &checked);
+            if (!ok) {
+                kfree(pr);
+                /* (the check took it for the script's own syntax error,
+                 * which ends a script: it is the line's expansion error) */
+                g_parse_error = false;
+                g_syntax_fatal = false;
+                g_shell_flow = g_opt_errexit ? SHELL_FLOW_EXIT : SHELL_FLOW_DISCARD;
+                g_shell_flow_status = g_opt_errexit ? 2 : 1;
+                shell_set_status(g_opt_errexit ? 2 : 1);
+                return -1;
+            }
+            int sr = sb_set(&cmd, pr);
+            kfree(pr);
+            if (sr < 0) return -1;
+        }
     }
     /* bash parses the text again as it expands it (xparse_dolparen), and
      * its reader counts a line and notifies before it takes it -- one past
