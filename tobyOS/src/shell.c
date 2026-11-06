@@ -9578,6 +9578,29 @@ static bool sh_array_is_assoc(const char *name) {
     return a && a->assoc;
 }
 
+/* Has NAME no value -- no array, no entry or one only declared -- before a
+ * declaration builtin makes anything of it? (finding 614) */
+static bool sh_decl_name_new(const char *name, size_t klen) {
+    if (sh_array_find(name)) return false;
+    int x = env_find(name, klen);
+    return x < 0 || (g_env_flags[x] & SHVAR_NOVALUE);
+}
+
+/* ...and a list given to it that failed at its first element (an
+ * arithmetic error in the subscript) leaves it ONLY DECLARED -- `declare
+ * U=( [1+]=x )` is `declare -a U`, no value, where tsh had U=(); its
+ * attributes are the list's own declare's, so export's and readonly's -x
+ * and -r do not go on (logs/b44 dlx g1-g14, dlx2, dlx3) -- finding 614 */
+static void sh_decl_list_failed(const char *name, size_t klen) {
+    struct sh_array *fa = sh_array_find(name);
+    if (!fa || fa->n != 0) return;
+    sh_array_unset(name);
+    if (env_set_attr_holder(name) == 0) {
+        int hx = env_find(name, klen);
+        if (hx >= 0) g_env_flags[hx] |= SHVAR_ARRAY | SHVAR_NOVALUE;
+    }
+}
+
 /* `declare -a NAME` / `declare -A NAME` ON A VARIABLE THAT EXISTS, as bash's
  * declare_internal (tools/agent/probes/literal-declare-edges.sh):
  *
@@ -11920,9 +11943,20 @@ static void cmd_export(int argc, char **argv) {
             bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
             g_decl_paren_array = opt_a || opt_A || la;
             if (qlist) g_readonly_label = argv[0];
+            SH_SB(enm);
+            bool e_new = sb_putmem(&enm, argv[i], nlen) == 0 &&
+                         sh_decl_name_new(enm.p, nlen);
             int esrc = env_set_kv(argv[i]);
             g_decl_paren_array = false;
             g_readonly_label = 0;
+            /* (a new name's list that failed: declared only, no -x, the
+             * line dropped -- 614) */
+            if (g_shell_flow != SHELL_FLOW_NONE && e_new && argv[i][klen + 1] == '(') {
+                sh_decl_list_failed(enm.p, nlen);
+                int ux = env_find(enm.p, nlen);
+                if (ux >= 0) g_env_flags[ux] &= ~(unsigned char)SHVAR_EXPORTED;
+                return;
+            }
             if (esrc < 0) {
                 /* a readonly name has said so in bash's words already --
                  * "PATH: readonly variable" -- and that is all bash says */
@@ -13010,6 +13044,7 @@ static void cmd_declare(int argc, char **argv) {
          * declared has an entry, marked no-value -- asked before this
          * declare makes anything of its own (-A makes a record) */
         bool pre_assigned = env_find(name, klen) < 0 && sh_array_find(name) != 0;
+        bool was_new = sh_decl_name_new(name, klen);            /* (614) */
 
         /* BEFORE the assignment: the literal parser asks whether the array is
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
@@ -13128,6 +13163,15 @@ static void cmd_declare(int argc, char **argv) {
             g_readonly_label = 0;
             g_readonly_as_word = g_readonly_tgt_word = 0;
             g_decl_paren_array = false;
+            /* A NEW NAME WHOSE LIST FAILED AT ITS FIRST ELEMENT IS ONLY
+             * DECLARED: `declare U=( [1+]=x )` leaves `declare -a U`, no
+             * value, where tsh had an empty array, U=() -- an element
+             * before the failure is kept, an array that was there is
+             * emptied (logs/b44 dlx2 h1 h4 h5 h8, dlx3 k4-k8) -- finding
+             * 614. (A failed list drops the line: it is that, or a refusal.) */
+            if ((dsrc < 0 || g_shell_flow != SHELL_FLOW_NONE) && was_new &&
+                argv[i][env_key_len(argv[i]) + 1] == '(')
+                sh_decl_list_failed(name, klen);
             if (dsrc < 0) {
                 shell_set_status(1);
                 /* A COMPOUND value `NAME=(...)` refused for a readonly NAME
@@ -13322,9 +13366,18 @@ static void cmd_readonly(int argc, char **argv) {
             bool qlist = (opt_a || opt_A) && !shell_kv_written_list(argv[i]);
             g_decl_paren_array = opt_a || opt_A || la;
             if (qlist) g_readonly_label = argv[0];
+            SH_SB(rnm);
+            bool r_new = sb_putmem(&rnm, argv[i], nlen) == 0 &&
+                         sh_decl_name_new(rnm.p, nlen);
             int rsrc = env_set_kv(argv[i]);
             g_decl_paren_array = false;
             g_readonly_label = 0;
+            /* (a new name's list that failed: declared only, not readonly,
+             * the line dropped -- 614) */
+            if (g_shell_flow != SHELL_FLOW_NONE && r_new && argv[i][klen + 1] == '(') {
+                sh_decl_list_failed(rnm.p, nlen);
+                return;
+            }
             if (rsrc < 0) {
                 shell_set_status(1);
                 /* a COMPOUND value refused ends the line, as export's
