@@ -9603,7 +9603,8 @@ static bool sh_decl_name_new(const char *name, size_t klen) {
     return x < 0 || (g_env_flags[x] & SHVAR_NOVALUE);
 }
 
-/* ...and a list given to it that failed at its first element (an
+/* ...and a WRITTEN list given to it (not a quoted "(...)" value -- 624)
+ * that failed at its first element (an
  * arithmetic error in the subscript) leaves it ONLY DECLARED -- `declare
  * U=( [1+]=x )` is `declare -a U`, no value, where tsh had U=(); its
  * attributes are the list's own declare's, so export's and readonly's -x
@@ -11911,7 +11912,7 @@ static void cmd_export(int argc, char **argv) {
         sh_decl_order(argc, argv, start, &nlists);
     if (!ord) { shell_set_status(1); return; }
     for (int k = 0; k < argc - start; k++) {
-        if (k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        if (k > 0 && g_shell_flow != SHELL_FLOW_NONE) return;   /* (615, 624) */
         int i = ord[k];
         /* A REFERENCE IS EXPORTED, or not, AS ITS TARGET: `export r`,
          * `export r=7`, `export -n r` act on the variable at the end of r's
@@ -12009,11 +12010,21 @@ static void cmd_export(int argc, char **argv) {
             g_readonly_label = 0;
             /* (a new name's list that failed: declared only, no -x, the
              * line dropped -- 614) */
-            if (g_shell_flow != SHELL_FLOW_NONE && e_new && argv[i][klen + 1] == '(') {
+            if (g_shell_flow != SHELL_FLOW_NONE && e_new && argv[i][klen + 1] == '(' &&
+                !qlist) {                                       /* (624) */
                 sh_decl_list_failed(enm.p, nlen);
                 int ux = env_find(enm.p, nlen);
                 if (ux >= 0) g_env_flags[ux] &= ~(unsigned char)SHVAR_EXPORTED;
                 return;
+            }
+            /* (a quoted one export's -a took: the array it made first stays,
+             * empty -- `export -a U="( [1+]=x )"` is U=() and -x, as
+             * readonly's -- 624) */
+            if (g_shell_flow != SHELL_FLOW_NONE && e_new && qlist &&
+                !sh_array_find(enm.p)) {
+                struct sh_array *ea = sh_array_create(enm.p);
+                if (ea) sh_array_touch(ea);
+                sh_array_clear_novalue(enm.p);
             }
             if (esrc < 0) {
                 /* a readonly name has said so in bash's words already --
@@ -12063,7 +12074,11 @@ static void cmd_export(int argc, char **argv) {
             if (sb_putmem(&enm, argv[i], nlen) == 0 && sh_array_find(enm.p) &&
                 env_set_attr_holder(enm.p) == 0) {
                 idx = env_find(enm.p, nlen);
-                if (idx >= 0) g_env_flags[idx] |= SHVAR_ARRAY;
+                /* (with a value: an empty one is `export -a U="()"`'s U=(),
+                 * not a U only declared -- 624) */
+                if (idx >= 0)
+                    g_env_flags[idx] = (unsigned char)((g_env_flags[idx] | SHVAR_ARRAY) &
+                                                       ~SHVAR_NOVALUE);
             }
         }
         if (idx >= 0) g_env_flags[idx] |= SHVAR_EXPORTED;
@@ -12689,7 +12704,10 @@ static void cmd_declare(int argc, char **argv) {
     if (!ord) { shell_set_status(1); return; }
     const int i0 = i;
     for (int k = 0; k <= argc - i0; k++) {
-        if (k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        /* (a word that failed ends the builtin: a list's at its expansion,
+         * 615; a quoted one's as it is assigned, `declare -a U="( [1+]=x )"
+         * V=1` leaving V unset -- 624) */
+        if (k > 0 && g_shell_flow != SHELL_FLOW_NONE) return;
         int ni = k < argc - i0 ? ord[k] : argc;
         if (late_conv && k >= nlists && ni > late_conv_at) {
             kprintf("%s: %s: cannot convert associative to indexed array\n",
@@ -13121,6 +13139,9 @@ static void cmd_declare(int argc, char **argv) {
          * declare makes anything of its own (-A makes a record) */
         bool pre_assigned = env_find(name, klen) < 0 && sh_array_find(name) != 0;
         bool was_new = sh_decl_name_new(name, klen);            /* (614) */
+        /* (...one only declared already: -a makes no empty array of it --
+         * 624) */
+        bool was_decl = was_new && env_find(name, klen) >= 0;
 
         /* BEFORE the assignment: the literal parser asks whether the array is
          * associative to decide if `[k1]=v1` is a string key or arithmetic.
@@ -13245,10 +13266,17 @@ static void cmd_declare(int argc, char **argv) {
              * value, where tsh had an empty array, U=() -- an element
              * before the failure is kept, an array that was there is
              * emptied (logs/b44 dlx2 h1 h4 h5 h8, dlx3 k4-k8) -- finding
-             * 614. (A failed list drops the line: it is that, or a refusal.) */
+             * 614. (A failed list drops the line: it is that, or a refusal.)
+             * A WRITTEN list only, the one bash makes as it expands the
+             * words: a quoted `declare -a U="( [1+]=x )"` the builtin
+             * makes itself leaves U=(), the array its -a made first,
+             * readonly's and export's -r and -x on it -- with no -a of its
+             * own, over a U only declared -a, U stays so (bash's
+             * array19.sub; logs/b44 rg6 q1-q10, rg8) -- 624. */
             if ((dsrc < 0 || g_shell_flow != SHELL_FLOW_NONE) && was_new &&
-                argv[i][env_key_len(argv[i]) + 1] == '(')
-                sh_decl_list_failed(name, klen);
+                argv[i][env_key_len(argv[i]) + 1] == '(' &&
+                (shell_kv_written_list(argv[i]) || !set_array || was_decl))
+                sh_decl_list_failed(name, klen);                 /* (624) */
             if (dsrc < 0) {
                 shell_set_status(1);
                 /* A COMPOUND value `NAME=(...)` refused for a readonly NAME
@@ -13398,7 +13426,7 @@ static void cmd_readonly(int argc, char **argv) {
         sh_decl_order(argc, argv, first, &nlists);
     if (!ord) { shell_set_status(1); return; }
     for (int k = 0; k < argc - first; k++) {
-        if (!opt_f && k > 0 && k <= nlists && g_shell_flow != SHELL_FLOW_NONE) return;
+        if (!opt_f && k > 0 && g_shell_flow != SHELL_FLOW_NONE) return;  /* (615, 624) */
         int i = opt_f ? first + k : ord[k];
         if (opt_f) {
             if (!shell_function_set_readonly(argv[i])) {
@@ -13459,7 +13487,8 @@ static void cmd_readonly(int argc, char **argv) {
             g_readonly_label = 0;
             /* (a new name's list that failed: declared only, not readonly,
              * the line dropped -- 614) */
-            if (g_shell_flow != SHELL_FLOW_NONE && r_new && argv[i][klen + 1] == '(') {
+            if (g_shell_flow != SHELL_FLOW_NONE && r_new && argv[i][klen + 1] == '(' &&
+                !qlist) {                                       /* (624) */
                 sh_decl_list_failed(rnm.p, nlen);
                 return;
             }
