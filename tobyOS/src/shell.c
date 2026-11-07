@@ -51280,6 +51280,12 @@ static bool shell_try_arith_for_command(const char *src) {
         io_active = true;
     }
     bool set_last = true;
+    /* AN EXPRESSION'S OWN ERROR is a failure set -e does not act on and the
+     * ERR trap does not see: `set -e; for (( i=1+; i<2; i++ )); do :;
+     * done; echo $?` says 1 and goes on in bash, where tsh exited (logs/b44
+     * ev4 y7; logs/b45 td3 f1-f7) -- finding 621. A subscript's error is
+     * the top level's DISCARD (619), not this. */
+    bool arith_err = false;
     long v = 0;
     unsigned long head_line = g_shell_lineno;
     struct shell_heredoc_mark hd_mark;         /* see shell_heredoc_mark */
@@ -51288,7 +51294,7 @@ static bool shell_try_arith_for_command(const char *src) {
     shell_run_debug_trap();                     /* init (1191) */
     if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
     if (!shell_arith_for_eval(exprs[0], &v)) {
-        last = 1;
+        last = 1; arith_err = true;
         goto done;
     }
     for (long iter = 0; iter < SHELL_LOOP_ITER_MAX; iter++) {
@@ -51298,7 +51304,7 @@ static bool shell_try_arith_for_command(const char *src) {
         shell_run_debug_trap();                 /* the condition */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[1], &v)) {
-                last = 1;
+                last = 1; arith_err = true;
             goto done;
         }
         shell_jobs_cleanup();                   /* bash's REAP (p97) */
@@ -51336,7 +51342,7 @@ static bool shell_try_arith_for_command(const char *src) {
         shell_run_debug_trap();                 /* the step */
         if (g_shell_flow != SHELL_FLOW_NONE) { set_last = false; goto done; }
         if (!shell_arith_for_eval(exprs[2], &v)) {
-                last = 1;
+                last = 1; arith_err = true;
             goto done;
         }
     }
@@ -51347,6 +51353,7 @@ done:
     if (io_active) shell_restore_io_frame(&io_frame);
     kfree(body);
     if (set_last) shell_set_status(last);
+    if (arith_err && g_shell_flow == SHELL_FLOW_NONE) g_status_exempt = true;
     return true;
 }
 
